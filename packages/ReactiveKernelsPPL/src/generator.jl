@@ -118,6 +118,12 @@ function _predictor_statements(plan::StructuralPlan)
         if any(b -> b.kind === OffsetTerm, shape.blocks)
             push!(terms, offset_name(pred.name))
         end
+        # A latent term contributes the per-cell latent VECTOR directly
+        # (identity design): `lp = theta` on its own, or added to fixed-effect
+        # design/offset terms for a random-intercept-plus-covariates predictor.
+        for b in shape.blocks
+            b.kind === LatentTerm && push!(terms, b.column)
+        end
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
         rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
@@ -404,6 +410,25 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         push!(stmts, :($node::Float64 = $(_sampled_prior_expr(p))))
         push!(terms, node)
     end
+    # Per-cell latent (plate) parameters: one plate over the block, summing the
+    # shared-prior log-density across cells (the same plate-sum shape as a
+    # population-prior coefficient block, generalized to any standard family).
+    # Every value the cell reads is threaded as a plate PORT (the latent vector
+    # plus each scalar prior arg) — captured free names are rejected by the
+    # `@kernel` plate expander, exactly as the Gaussian-likelihood scale is
+    # threaded.
+    for p in plan.plate_parameters
+        node = Symbol(:_ppl_prior_, p.name)
+        pw = Symbol(:_ppl_pw_prior_, p.name)
+        inputs = Any[p.name]
+        tv = _dovar(1)
+        argvals = Any[_thread_ref!(inputs, v) for v in values(p.args)]
+        cell = _family_logpdf_expr(p.family, argvals, tv)
+        p.support_override === nothing || (cell = :($cell + log(2)))
+        append!(stmts, _plate_sum_stmts(pw, node, inputs, cell))
+        push!(terms, node)
+    end
+    # Sequential-recurrence (scan) latents: setup + recurrence density.
     scanstmts, scannodes = _scan_prior_statements(plan, layout)
     append!(stmts, scanstmts)
     append!(terms, scannodes)
@@ -418,9 +443,11 @@ end
 # Half-Normal/half-Cauchy (the only overrides) renormalize by exactly
 # +log(2) (symmetry at 0). `gamma` takes rate, so the contract's scale
 # inverts.
-# `<family>(remapped args…).logpdf(x)` for a variate expression `x`. Shared by
-# scalar priors and the scan (setup + recurrence) density. `gamma` takes rate,
-# so the contract's scale inverts.
+# Shared `<family>(remapped args…).logpdf(x)` for a variate expression `x` (a
+# scalar parameter name, a plate do-var, or a scan setup/recurrence read). Args
+# are literals (inlined) or parameter/assignment/threaded refs. Shared by scalar
+# priors, per-cell plate priors, and the scan density. `gamma` takes rate, so
+# the contract's scale inverts.
 function _family_logpdf_expr(family::Symbol, a, x)
     if family === :normal
         mu, s = a
@@ -448,6 +475,9 @@ function _family_logpdf_expr(family::Symbol, a, x)
     end
 end
 
+# Scalar prior log-density per family via distribution-kernel endpoints
+# (Distributions.jl semantics). Half-Normal/half-Cauchy (the only overrides)
+# renormalize by exactly +log(2) (symmetry at 0).
 function _sampled_prior_expr(p::SampledParameter)
     base = _family_logpdf_expr(p.family, [v for v in values(p.args)], p.name)
     p.support_override === nothing && return base

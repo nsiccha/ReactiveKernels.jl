@@ -176,7 +176,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
-    sample, det, scans, plate_ctx = _partition_statements(ast, data)
+    sample, det, plate_ctx, plate_specs, scans = _partition_statements(ast, data)
+    plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     normal_priors = Set{Symbol}(s.lhs for s in sample
@@ -201,10 +202,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     structural = _structural_defs(det, data, canonmap, normal_priors,
         prior_names)
     vecdefs = Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :vector)
-    taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names)
+    taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names,
+        plate_names)
     ctx = (; data, detmap = canonmap, prior_names, normal_priors, detshape,
-        vecdefs, structural, absorbed = Set{Symbol}(), synth = Ref(0),
-        synth_derived = VectorAssignmentSpec[], taken,
+        vecdefs, structural, plate_names, absorbed = Set{Symbol}(),
+        synth = Ref(0), synth_derived = VectorAssignmentSpec[], taken,
         scan_states = Set{Symbol}(s.state for s in scans))
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
@@ -228,6 +230,9 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     end
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors)
     params, paramsyms = _lower_parameters(sample, coefuse, ctx)
+    plate_parameters = PlateParameter[
+        _lower_plate_parameter(nm, rhs, rng, coefuse)
+        for (nm, rhs, rng, _) in plate_specs]
     used_locs = Set{Symbol}(r.predictor for r in responses)
     skip = _absorbed_skip(det, canonmap, responses, paramsyms, ctx.absorbed,
         used_locs)
@@ -251,12 +256,22 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         end
     end
     _check_plate_bares(plate_ctx, data, Set{Symbol}(p.name for p in predictors),
-        Set{Symbol}(d.name for d in derived), _factor_coefs(coefuse, predictors))
+        Set{Symbol}(d.name for d in derived), _factor_coefs(coefuse, predictors),
+        plate_names)
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
-        levelmaps = levelmaps, scans = scans)
+        levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans)
     validate_structure(plan)
     return plan
+end
+
+# A per-cell latent declaration reuses the scalar-parameter distribution
+# parsing (family, args, HalfNormal/truncated → :positive) and rides the
+# plate's range.
+function _lower_plate_parameter(name::Symbol, rhs, range, coefuse)
+    sp = _lower_parameter(name, rhs, coefuse)
+    return PlateParameter(sp.name, sp.family, sp.args, sp.support_override,
+        range, sp.label)
 end
 
 # Shape inference + canonicalization (data-free, Julia-truthful). Shapes:
@@ -580,7 +595,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     seelines = Dict{Symbol,Int}()
     seen_doc = false
     line = 0
-    args, plate_ctx = _expand_plates(ast.args, data)
+    args, plate_ctx, plate_params = _expand_plates(ast.args, data)
     for arg in args
         if arg isa LineNumberNode
             line = arg.line
@@ -625,7 +640,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             _reject_statement(st)
         end
     end
-    return sample, det, scans, plate_ctx
+    return sample, det, plate_ctx, plate_params, scans
 end
 
 # Pre-pass: expand top-level `@plate for i in R ... end` blocks into
@@ -637,6 +652,7 @@ end
 function _expand_plates(args, data::Set{Symbol})
     expanded = Any[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int}},Int}[]
     line = 0
     for arg in args
         if arg isa LineNumberNode
@@ -650,17 +666,18 @@ function _expand_plates(args, data::Set{Symbol})
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
             end
-            stmts, stx = _desugar_plate(arg, pl, data)
+            stmts, stx, prm = _desugar_plate(arg, pl, data)
             for st in stmts
                 pl > 0 && push!(expanded, LineNumberNode(pl))
                 push!(expanded, st)
             end
             append!(ctx, stx)
+            append!(params, prm)
             continue
         end
         push!(expanded, arg)
     end
-    return expanded, ctx
+    return expanded, ctx, params
 end
 
 function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
@@ -682,18 +699,27 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     cells = Any[a for a in body.args if !(a isa LineNumberNode)]
     isempty(cells) && _sfail("`@plate` body is empty")
     # Names bound by `=` anywhere in this plate (cell locals, excluded
-    # from the bare-vector check even on forward reference).
+    # from the bare-vector check even on forward reference) — a bare LHS
+    # (`t = ...`) or an i-indexed LHS (`theta[i] = ...`).
     plate_defs = Set{Symbol}()
     for c in cells
-        c isa Expr && c.head === :(=) && length(c.args) == 2 &&
-            c.args[1] isa Symbol && push!(plate_defs, c.args[1])
+        c isa Expr && c.head === :(=) && length(c.args) == 2 || continue
+        lc = c.args[1]
+        if lc isa Symbol
+            push!(plate_defs, lc)
+        elseif lc isa Expr && lc.head === :ref && length(lc.args) == 2 &&
+                lc.args[1] isa Symbol && lc.args[2] === ivar
+            push!(plate_defs, lc.args[1])
+        end
     end
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int}},Int}[]
     for c in cells
-        push!(out, _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx)...)
+        push!(out, _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx,
+            params)...)
     end
-    return out, ctx
+    return out, ctx, params
 end
 
 # Plate ranges mirror the response ranges: literal `a:b` (validated via
@@ -715,7 +741,7 @@ end
 # (`y[i] ~ OBJ`) become `y .~ OBJ.` (or `y[a:b] .~ OBJ.` under a literal
 # range); deterministic cells strip to top level (visible model-wide —
 # documented looseness: desugared locals leak like any top-level det).
-function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx)
+function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params)
     c isa Expr || _sfail("cells hold `~` observations and `=` " *
                          "assignments only")
     if c.head === :macrocall && !isempty(c.args) &&
@@ -726,41 +752,72 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx)
         _sfail("cells are scalar (`~`); broadcast (`.~`) at top level")
     end
     if _is_sample(c)
-        return [_desugar_cell_sample(c, ivar, rkind, line, data, plate_defs,
-            ctx)]
+        return _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs,
+            ctx, params)
     end
-    if c.head === :(=) && length(c.args) == 2 && c.args[1] isa Symbol
-        lhs = c.args[1]
-        lhs in data && _sfail("cell assignment `$lhs = ...` redefines " *
+    if c.head === :(=) && length(c.args) == 2
+        # A deterministic cell binds a bare local (`t = expr`) or an i-indexed
+        # column (`theta[i] = f(...[i])`); both strip `[i]` refs to a
+        # whole-vector top-level assignment.
+        lc = c.args[1]
+        col = if lc isa Symbol
+            lc
+        elseif lc isa Expr && lc.head === :ref && length(lc.args) == 2 &&
+                lc.args[1] isa Symbol && lc.args[2] === ivar
+            lc.args[1]
+        else
+            _sfail("cell assignment LHS is a bare local (`t = ...`) or an " *
+                   "`$ivar`-indexed column (`theta[$ivar] = ...`), got " *
+                   "$(repr(lc))")
+        end
+        col in data && _sfail("cell assignment `$col = ...` redefines " *
                               "bound data")
         bares = _cell_bares(c.args[2], ivar)
         setdiff!(bares, plate_defs)
-        push!(ctx, (lhs, line, bares))
-        return [Expr(:(=), lhs, _strip_cell(c.args[2], ivar))]
+        push!(ctx, (col, line, bares))
+        return [Expr(:(=), col, _strip_cell(c.args[2], ivar))]
     end
     return _sfail("cells hold `~` observations and `=` assignments only")
 end
 
-function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx)
+# A cell `~` statement is EITHER a per-cell latent parameter declaration
+# (`theta[i] ~ Normal(mu, tau)` — a non-data indexed LHS, scalar undotted
+# distribution, shared-scalar args) or an observation on a sliced data column
+# (`y[i] ~ Normal.(mu[i], s)` — dotted object). Returns the spliced top-level
+# statement(s); a per-cell parameter records its spec in `params` and emits no
+# top-level statement.
+function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx, params)
     lhs = c.args[2]
-    lhs isa Symbol && _sfail("per-cell sampled `$lhs` is deferred " *
-                             "(per-cell sampled arrays land after " *
-                             "observations; write shared priors outside " *
-                             "the plate)")
+    lhs isa Symbol && _sfail("bare per-cell sample `$lhs ~ ...` does not " *
+                             "lower — index the latent (`$lhs[$ivar] ~ ...`) " *
+                             "for a per-cell parameter, or write a shared " *
+                             "prior outside the plate")
     (lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
         lhs.args[1] isa Symbol && lhs.args[2] === ivar) ||
         _cell_lhs_error(lhs, ivar)
     col = lhs.args[1]
-    col in data || _sfail("per-cell sampled `$col[$ivar]` is deferred " *
-                          "(per-cell sampled arrays land after " *
-                          "observations; write shared priors outside " *
-                          "the plate)")
-    bares = _cell_bares(c.args[3], ivar)
+    obj = c.args[3]
+    if col ∉ data
+        # Per-cell latent PARAMETER: a scalar (undotted) distribution. Its args
+        # are shared across cells (a captured scalar) or per-cell (`eta[$ivar]`,
+        # a varying prior mean/scale); the `[$ivar]` strip and the bare-vector
+        # check enforce the index discipline, exactly like an observation cell.
+        obj isa Expr && obj.head === :. && _sfail(
+            "per-cell latent `$col[$ivar] ~ ...` takes a scalar (undotted) " *
+            "distribution (`$col[$ivar] ~ Normal(mu, tau)` / " *
+            "`$col[$ivar] ~ Normal(eta[$ivar], tau)`), got the dotted $(repr(obj))")
+        bares = _cell_bares(obj, ivar)
+        setdiff!(bares, plate_defs)
+        push!(ctx, (col, line, bares))
+        push!(params, (col, _strip_cell(obj, ivar), _plate_param_range(col, rkind),
+            line))
+        return Expr[]
+    end
+    bares = _cell_bares(obj, ivar)
     setdiff!(bares, plate_defs)
     push!(ctx, (col, line, bares))
-    obj = c.args[3]
-    # Cells mirror top-level spelling exactly (dots as written — the
-    # desugar strips refs, never invents dots): the object must already
+    # Observation cells mirror top-level spelling exactly (dots as written —
+    # the desugar strips refs, never invents dots): the object must already
     # be dotted, pairing scalar `~` (the cell) with a pre-dotted object.
     obj isa Expr && obj.head === :. || _sfail(
         "cell objects are dotted distribution calls " *
@@ -769,14 +826,19 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx)
     if rkind[1] === :coloncall
         # Literal ranges validate through the slice-A `y[a:b]` path
         # (start-1, literal endpoints, bind-time cover check).
-        return Expr(:call, :.~, Expr(:ref, col, rkind[2]), obj)
+        return Expr[Expr(:call, :.~, Expr(:ref, col, rkind[2]), obj)]
     end
     rcol = rkind[2]
     rcol === col || _sfail("plate over `$(rkind[1])($rcol)` cannot " *
                            "sample `$col[$ivar]` (one response column " *
                            "per range)")
-    return Expr(:call, :.~, col, obj)
+    return Expr[Expr(:call, :.~, col, obj)]
 end
+
+# The per-cell latent's size follows the plate range: a literal `1:N` rides as
+# a UnitRange (validated to cover 1:n_obs at bind), eachindex/axes ⇒ n_obs.
+_plate_param_range(name::Symbol, rkind) =
+    rkind[1] === :coloncall ? _lower_lhs_range(name, rkind[2]) : nothing
 
 function _cell_lhs_error(lhs, ivar)
     lhs isa Expr && lhs.head === :ref || return _sfail(
@@ -851,9 +913,12 @@ end
 # Post-analysis whole-vector check: bare cell symbols denoting vectors
 # (data, predictors, derived, factor coefs) needed `[i]`. Runs after the
 # main loop, when predictors and derived are known.
-function _check_plate_bares(ctx, data, prednames, derivedkeys, factorcoefs)
+function _check_plate_bares(ctx, data, prednames, derivedkeys, factorcoefs,
+        plate_names = Set{Symbol}())
     isempty(ctx) && return nothing
-    vecs = union(data, prednames, derivedkeys, factorcoefs)
+    # A per-cell latent VECTOR read bare in an observation cell also needs
+    # `[i]` (it is a vector like data/predictors/derived).
+    vecs = union(data, prednames, derivedkeys, factorcoefs, plate_names)
     for (lhs, line, bares) in ctx
         at = line > 0 ? " (line $line)" : ""
         for b in sort!(collect(bares))
@@ -1073,11 +1138,10 @@ function _unwrap_trivia(st::Expr)
             continue
         end
         m === Symbol("@plate") && _sfail(
-            "@plate needs per-cell IR support beyond slice 1 " *
-            "(shapes copied from StanBlocks; vector responses broadcast " *
-            "with `.~` — `y .~ Normal.(mu, sigma)` over data)")
+            "`@plate` is only admitted at model top level (nested plates " *
+            "do not lower)")
         m === Symbol("@scan") && _sfail(
-            "@scan must be a top-level model statement (a `@scan begin … end` " *
+            "`@scan` must be a top-level model statement (a `@scan begin … end` " *
             "block), not nested inside another macro or statement")
         m === Symbol("@.") && _sfail("explicit broadcast (`@.`) does not " *
                                      "lower — write the dots out " *
@@ -1687,6 +1751,20 @@ end
 
 function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
+    # A per-cell latent VECTOR is the whole location via a LatentTerm predictor
+    # (`lp = theta`, identity design; the latent's prior lives on its
+    # PlateParameter, so no coefficient use is recorded). Two spellings: a bare
+    # latent (`y[i] ~ Normal.(theta[i], s)`) or a deterministic transform of one
+    # (`theta[i] = mu .+ tau .* z[i]` then `y[i] ~ Normal.(theta[i], s)` — the
+    # non-centered / latent-transform shape, emitted as a derived column and
+    # referenced directly). A derived location with NO latent stays a design
+    # predictor; mixed latent+fixed BARE-expression locations are a later slice.
+    if loc isa Symbol && loc in ctx.plate_names
+        return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
+    end
+    if loc isa Symbol && haskey(ctx.detmap, loc) && _derived_reads_latent(loc, ctx)
+        return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
+    end
     if loc isa Symbol
         # A scan-state latent vector is a direct per-observation location: the
         # response mean IS the carried state (no linear predictor). Admitted
@@ -1707,6 +1785,7 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         _sfail("response $lhs location is a literal — use an intercept-only " *
                "predictor (`eta = a`)")
     else
+        _reject_plate_in_predictor(lhs, loc, ctx)
         pname = Symbol(lhs, "_eta")
         haskey(ctx.detmap, pname) && _sfail(
             "derived predictor name $pname collides with your definition — " *
@@ -1719,17 +1798,61 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
     return pname
 end
 
+# Build the LatentTerm location predictor over `col` (a plate parameter or a
+# derived column that reads one); the generator emits `lp = col`.
+function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
+    pname = Symbol(lhs, "_loc")
+    (haskey(ctx.detmap, pname) || pname in ctx.plate_names) && _sfail(
+        "latent-location predictor name $pname collides with your " *
+        "definition — rename it")
+    term = TermSpec(LatentTerm, [col], NamedTuple(), col, Symbol(col, "_lat"))
+    push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
+    pred_idx[pname] = length(predictors)
+    return pname
+end
+
+# Does a derived column transitively read a per-cell latent (plate parameter)?
+# If so, its value is a latent transform (e.g. non-centered `mu .+ tau .* z`),
+# not a design predictor — it stays a derived column used directly as the LP.
+function _derived_reads_latent(name::Symbol, ctx)
+    haskey(ctx.detmap, name) || return name in ctx.plate_names
+    seen = Set{Symbol}((name,))
+    stack = collect(_value_symbols(ctx.detmap[name]))
+    while !isempty(stack)
+        s = pop!(stack)
+        s in seen && continue
+        push!(seen, s)
+        s in ctx.plate_names && return true
+        haskey(ctx.detmap, s) && append!(stack, _value_symbols(ctx.detmap[s]))
+    end
+    return false
+end
+
 function _lower_location_symbol_error(lhs, loc, ctx)
     loc in ctx.data && _sfail("response $lhs location is the data column " *
                               "$loc — locations must be predictors with " *
                               "estimated coefficients (wrap: " *
                               "`eta = a .+ b .* $loc`)")
     loc in ctx.prior_names && _sfail(
-        "response $lhs location is the bare parameter $loc " *
-        "(per-observation latents need per-cell IR support — planned; " *
-        "population-GLM responses take predictors)")
+        "response $lhs location is the bare scalar parameter $loc — a " *
+        "per-observation latent is a per-cell parameter (`@plate for i ...; " *
+        "$loc[i] ~ Normal(mu, tau); y[i] ~ Normal.($loc[i], s); end`); a " *
+        "scalar parameter cannot vary per observation")
     return _sfail("response $lhs location $loc is not a predictor " *
                   "definition (`$loc = ...` affine in data)")
+end
+
+# A per-cell latent is a bare whole location in slice-1; a latent buried in a
+# predictor expression (mixed latent + fixed effects) is a later increment.
+function _reject_plate_in_predictor(lhs, loc, ctx)
+    for s in _value_symbols(loc)
+        s in ctx.plate_names && _sfail(
+            "response $lhs location $(repr(loc)) combines the per-cell latent " *
+            "$s with other predictor structure — a latent is a bare location " *
+            "in slice-1 (`y[i] ~ Normal.($s[i], s)`); mixed latent + " *
+            "fixed-effect predictors are planned")
+    end
+    return nothing
 end
 
 function _record_coefuses!(coefuse, pname, uses, lhs)
@@ -2062,7 +2185,9 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
     levelmaps = LevelMap[]
     for pred in predictors
         for t in pred.terms
-            t.kind === OffsetTerm && continue
+            # Offsets carry no coefficient; latent terms carry a PlateParameter
+            # whose prior lives on the plate parameter, not as a coefficient.
+            (t.kind === OffsetTerm || t.kind === LatentTerm) && continue
             addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
             use = _find_use(coefuse, pred.name, addr)
             use === nothing && _sfail("internal: no coefficient use for " *

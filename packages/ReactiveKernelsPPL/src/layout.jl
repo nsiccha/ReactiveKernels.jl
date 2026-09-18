@@ -76,6 +76,16 @@ function assign_layout(plan::StructuralPlan)
             LayoutEntry(:sampled, nothing, p.name, [p.name], offset, 1, transform))
         offset += 1
     end
+    for p in plan.plate_parameters
+        support = support_of(p.family, p.support_override)
+        transform =
+            support === :real ? :identity :
+            support === :positive ? :exp : :logistic
+        size = p.range === nothing ? plan.n_obs : length(p.range)
+        push!(entries,
+            LayoutEntry(:plate, nothing, p.name, [p.name], offset, size, transform))
+        offset += size
+    end
     # Sequential-recurrence latents: one identity array slice per scan. The
     # length T is the loop bound — a literal Int, or `n_obs` when the bound is a
     # data length name (the canonical observation-indexed state-space case).
@@ -107,6 +117,10 @@ function coordinate_names(layout::LayoutTable)
             for label in e.labels
                 push!(names, Symbol(string(e.predictor) * "." * string(label)))
             end
+        elseif e.kind === :plate
+            for i in 1:e.size
+                push!(names, Symbol(string(e.name) * "." * string(i)))
+            end
         elseif e.kind === :scan
             for label in e.labels
                 push!(names, Symbol(string(e.name) * "." * string(label)))
@@ -133,6 +147,9 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :coefficient
             push!(pairs, e.predictor => Vector{Float64}(seg))
+        elseif e.kind === :plate
+            v = [_constrain_value(Val(e.transform), Float64(x)) for x in seg]
+            push!(pairs, e.name => v)
         elseif e.kind === :scan
             push!(pairs, e.name => Vector{Float64}(seg))
         else
@@ -160,6 +177,17 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] predictor $(e.predictor) length mismatch"),
             )
             u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
+        elseif e.kind === :plate
+            haskey(nt, e.name) || throw(
+                ContractValidationError("[layout] missing plate parameter $(e.name)"),
+            )
+            v = nt[e.name]
+            length(v) == e.size || throw(
+                ContractValidationError("[layout] plate parameter $(e.name) length mismatch"),
+            )
+            for (k, x) in enumerate(v)
+                u[e.offset + k - 1] = _unconstrain_value(Val(e.transform), Float64(x))
+            end
         elseif e.kind === :scan
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing scan state $(e.name)"),
@@ -247,6 +275,9 @@ function transform_statements(e::LayoutEntry)
         return Expr[:($(e.name)::AbstractVector{Float64} =
             view(unconstrained, $lo:$hi))]
     end
+    if e.kind === :plate
+        return _plate_transform_statements(e)
+    end
     o = e.offset
     coord = coordinate_read(o)
     if e.transform === :identity
@@ -270,16 +301,57 @@ function transform_statements(e::LayoutEntry)
     end
 end
 
+# Per-cell latent (plate) block: the scalar transform edges, broadcast over
+# the block view (identical operations to the host constrain/logjac path, so
+# in-graph and host agree bit-for-bit). Bidirectional forward+inverse edges
+# match the coefficient/scalar `@ppl` shape so the planner resolves either
+# direction.
+function _plate_transform_statements(e::LayoutEntry)
+    lo = e.offset
+    hi = e.offset + e.size - 1
+    view_read = :(view(unconstrained, $lo:$hi))
+    if e.transform === :identity
+        return Expr[:($(e.name)::AbstractVector{Float64} = $view_read)]
+    elseif e.transform === :exp
+        u = Symbol(:_ppl_log_, e.name)
+        return Expr[
+            :($u::AbstractVector{Float64} = $view_read),
+            :($(e.name)::AbstractVector{Float64} = exp.($u)),
+            :($u::AbstractVector{Float64} = log.($(e.name))),
+        ]
+    elseif e.transform === :logistic
+        u = Symbol(:_ppl_logit_, e.name)
+        return Expr[
+            :($u::AbstractVector{Float64} = $view_read),
+            :($(e.name)::AbstractVector{Float64} = 1 ./ (1 .+ exp.(-$u))),
+            :($u::AbstractVector{Float64} = log.($(e.name)) .- log1p.(-$(e.name))),
+        ]
+    else
+        throw(ContractValidationError("[layout] unknown transform $(e.transform)"))
+    end
+end
+
 """
     jacobian_term(entry) -> Union{Nothing,Expr}
 
 This entry's log-Jacobian contribution (`nothing` for identity): the
-unconstrained value for `:exp`, `log(x) + log1p(-x)` for `:logistic`.
+unconstrained value for `:exp`, `log(x) + log1p(-x)` for `:logistic`. A
+per-cell latent (plate) block contributes the SUM over its cells.
 """
 function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing
     if e.kind === :coefficient
         throw(ContractValidationError("[layout] non-identity coefficient block"))
+    end
+    if e.kind === :plate
+        if e.transform === :exp
+            u = Symbol(:_ppl_log_, e.name)
+            return :(sum($u))
+        elseif e.transform === :logistic
+            return :(sum(log.($(e.name)) .+ log1p.(-$(e.name))))
+        else
+            throw(ContractValidationError("[layout] unknown transform $(e.transform)"))
+        end
     end
     if e.transform === :exp
         u = Symbol(:_ppl_log_, e.name)
