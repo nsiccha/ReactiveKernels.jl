@@ -61,12 +61,15 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
 ## Reactant
 
 On the focused gate's finite BridgeStan-valid probes, the exact authored graph
-compiles and executes through the public Reactant boundary on both query
-shapes — the all-bound query and the traced-stream query — with primal parity
-to the native density (machine precision). Per-axis support, including the
-compiled-gradient axis, is recorded by the structured gate's per-model
-accounting (`benchmark/structured_gate.jl`) against the reference `.stan` via
-BridgeStan (`propto = false`, `jacobian = true`).
+compiles and executes through the public Reactant boundary on the **all-bound
+query** — data bound, only the unconstrained vector traced — with primal and
+compiled-gradient parity to the native density and to the reference `.stan`
+(machine precision; `propto = false`, `jacobian = true`). The
+**traced-stream query** (raw data ports left free and traced) is an explicit
+UNSUPPORTED boundary at this pin: integer data ports (`ii`, `jj`, `y`, `I`)
+do not lower as traced streams (traced-boolean `TypeError`; complete
+diagnostic retained by the gate). Per-axis support is recorded by the
+structured gate's per-model accounting (`benchmark/structured_gate.jl`).
 
 Run the walkthrough from the repository root:
 
