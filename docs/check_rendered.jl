@@ -336,6 +336,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "2pl-latent-reg-irt.md" => 1,
         "hier-2pl.md" => 1,
         "gpcm-latent-reg-irt.md" => 1,
+        "grsm-latent-reg-irt.md" => 1,
         "glmm1.md" => 1,
         "bym2-offset-only.md" => 1,
         "bones.md" => 1,
@@ -344,12 +345,14 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "sir.md" => 1,
         "one-comp-mm-elim-abs.md" => 1,
         "soil-incubation.md" => 1,
+        "hmm-drive-1.md" => 1,
         "mnist-logistic.md" => 2,
         "online-stats.md" => 1,
         "gp-regr.md" => 1,
         "gp-pois-regr.md" => 1,
         "accel-gp.md" => 1,
         "hierarchical-gp.md" => 1,
+        "kronecker-gp.md" => 1,
     )
     expected_source_examples = Dict(
         "reactivehmc-corpus.md" => 5,
