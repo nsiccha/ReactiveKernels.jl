@@ -11,6 +11,7 @@ end
 include("test_problems.jl")
 include("test_reference.jl")
 include("test_controller.jl")
+include("test_kernels.jl")
 include("test_agreement.jl")
 include("test_guards.jl")
 include("test_enzyme.jl")

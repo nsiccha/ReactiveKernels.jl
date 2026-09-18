@@ -28,6 +28,7 @@ export initial_dt, ReactantTsit5Config, compile_ode_solve
 include("tableau.jl")
 include("controller.jl")
 include("step.jl")
+include("kernels.jl")
 include("dense.jl")
 include("solve.jl")
 include("reactant.jl")
