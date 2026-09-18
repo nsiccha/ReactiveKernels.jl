@@ -237,10 +237,13 @@ end
         @test all(m -> _number_or_reason(get(m, cell, nothing)), values(models))
     end
     # Unlike the historical batch-1 run, this receipt IS ordinary-AE certified: the strict
-    # validator must report zero issues.
+    # validator must report zero issues. NOTE: expected_keys must be the EXACT ordered
+    # meta.args sequence (collect(Set) order is hash-nondeterministic across sessions and
+    # broke CI with "meta.args must equal the exact requested key sequence").
     issues = All80Receipt.validate_batch(path;
-        expected_keys = collect(expected), phases = ("native", "reactant"),
-        batch = "irt")
+        expected_keys = ["irt_2pl-irt_2pl", "fims_Aus_Jpn_irt-2pl_latent_reg_irt",
+            "sat-hier_2pl", "timssAusTwn_irt-gpcm_latent_reg_irt"],
+        phases = ("native", "reactant"), batch = "irt")
     @test isempty(issues)
     summary_text = sprint(show, RKD.render_all80_irt_summary(path))
     @test occursin("Certified ordinary-AE run", summary_text)
