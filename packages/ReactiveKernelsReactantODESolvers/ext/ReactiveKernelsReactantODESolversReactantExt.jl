@@ -31,15 +31,18 @@
 #   (`stablehlo.dynamic_pad` untranslatable); a compound `(a < b) & (c < d)`
 #   cond fails analysis under either scheme ("no known iteration count");
 #   a select-on-IV saturating counter segfaults the Binomial reverse
-#   transform (`reverseBinomial`/`popCache`). Early exit is therefore a
-#   per-iteration freeze, not a second clause or a saturated counter.
-#   Measured freeze cost (strato2, 2026-09-18, Reactant 0.2.285; 2-state
-#   decay converging in 53 native attempts): maxiters=150 executes in
-#   0.20 ms, maxiters=2000 in 0.72 ms — ~0.28 µs per frozen iteration,
-#   bitwise-identical values at both bounds. Execution wall time scales
-#   with the bound, not the difficulty; status semantics are unchanged
-#   (exhaustion still reports from the unreached `t1`), and compile time
-#   is bound-independent (same program shape, new constants).
+#   transform (`reverseBinomial`/`popCache`). The reverse-compatible loop
+#   shape is therefore a per-iteration freeze, not a second clause or a
+#   saturated counter — but ONLY the reverse path needs it. Primal
+#   `@trace while` lowers a compound `(n < max) & (t < t1)` cond and
+#   exits early (probed minimal), so `early_exit=true` (the default) runs
+#   no frozen iterations at all. Measured freeze cost (strato2,
+#   2026-09-18, Reactant 0.2.285; 2-state decay converging in ~60 native
+#   attempts): maxiters=80 executes in 0.10 ms, maxiters=1000 in 0.55 ms
+#   — execution wall time of the freeze shape scales with the bound, not
+#   the difficulty. Both shapes produce bitwise-identical values (locked
+#   by the agreement test); status semantics are unchanged (exhaustion
+#   still reports from the unreached `t1`).
 # - never place complementary comparisons (`x <= c` and `x > c`) on one
 #   traced value that can be NaN: the optimizer derives one from the
 #   other, wrong for NaN. Test `isnan` explicitly instead.
@@ -52,7 +55,7 @@ import Reactant
 const RKRO = ReactiveKernelsReactantODESolvers
 
 function RKRO.traceable_ode_closure(f, cfg::RKRO.ReactantTsit5Config,
-        u0_example::AbstractVector, p_example)
+        u0_example::AbstractVector, p_example; early_exit::Bool=true)
     T = typeof(cfg.t0)
     eltype(u0_example) == T ||
         throw(ArgumentError("u0 element type $(eltype(u0_example)) must match config type $T"))
@@ -115,18 +118,27 @@ function RKRO.traceable_ode_closure(f, cfg::RKRO.ReactantTsit5Config,
         k1 = f(u0, p, t)
         out = ntuple(_ -> u0 .* zero_T, nsave)
 
-        # Single-comparison condition over a pure `+1` counter and a
-        # constant bound — the only `@trace while` shape whose
-        # Binomial-checkpointed reverse Enzyme lowers: a compound
-        # `(a < b) & (c < d)` cond fails analysis ("no known iteration
+        # Loop shape by consumer; the two bodies below are INTENTIONALLY
+        # identical (a shared step closure capturing traced values breaks
+        # `@trace while` operand/block-arg matching — probed). The only
+        # difference is the condition. The agreement test locks both shapes
+        # to bitwise-identical values, so any future divergence fails loudly.
+        #
+        # The primal exits early on a compound `(n < max) & (t < t1)`
+        # condition (probed: lowers and exits in primal Reactant).
+        # Reverse-through-while cannot use that shape: the only `@trace
+        # while` form whose Binomial-checkpointed reverse Enzyme lowers is
+        # a single comparison over a pure `+1` counter and a constant
+        # bound — a compound cond fails analysis ("no known iteration
         # count"), and a select-on-IV saturating counter segfaults the
-        # Binomial reverse transform (`reverseBinomial`/`popCache`; minimal
-        # repro filed upstream). Early exit is therefore a per-iteration
-        # `active` freeze: once `t` reaches `t1` every update below
-        # becomes an exact no-op while the counter runs out the bound.
-        # Costs up to `maxiters` no-op iterations per solve; values are
-        # bitwise identical to early exit.
-        Reactant.@trace checkpointing = ckpt track_numbers = false while n_iter < maxiters_tr
+        # Binomial reverse transform (`reverseBinomial`/`popCache`;
+        # minimal repro filed upstream). The freeze variant therefore keeps
+        # the single-comparison cond and turns arrival at `t1` into a
+        # per-iteration no-op freeze, at up to `maxiters` wasted iterations
+        # per solve. Status semantics are unchanged (exhaustion still
+        # reports from the unreached `t1`).
+        if early_exit
+            Reactant.@trace checkpointing = ckpt track_numbers = false while (n_iter < maxiters_tr) & (tdir * (t1 - t) > zero_T)
             active = tdir * (t1 - t) > zero_T
             dt_use = ifelse(tdir * (t + dt - t1) > zero_T, t1 - t, dt)
             # Finite dummy step when frozen: `dt_use` is 0 there, and the
@@ -166,6 +178,49 @@ function RKRO.traceable_ode_closure(f, cfg::RKRO.ReactantTsit5Config,
             qold = ifelse(active, qold_next, qold)
             n_iter = n_iter + one_tr
             bad = ifelse(active, bad_next, bad)
+            end
+        else
+            Reactant.@trace checkpointing = ckpt track_numbers = false while n_iter < maxiters_tr
+            active = tdir * (t1 - t) > zero_T
+            dt_use = ifelse(tdir * (t + dt - t1) > zero_T, t1 - t, dt)
+            # Finite dummy step when frozen: `dt_use` is 0 there, and the
+            # dense fraction `(ts - t) / dt_use` would be Inf/NaN. The
+            # primal discards it via the freeze selects, but reverse-mode
+            # forms 0 * non-finite partials into live shadows (NaN
+            # gradients). Every update from the dummy is discarded below.
+            dt_step = ifelse(active, dt_use, one_tr)
+            taken_u, taken_k, taken_EEst = kstep(f, u, k1, p, t,
+                dt_step, tab, atol, rtol, inv_n)
+            taken = (u=taken_u, k=taken_k, EEst=taken_EEst)
+            EEst = taken.EEst
+            accept = EEst <= one_tr
+            q, q11 = RKRO.pi_factors(EEst, qold)
+            dt_next = min(
+                ifelse(accept, RKRO.pi_accept_dt(dt_use, q),
+                    RKRO.pi_reject_dt(dt_use, q11)), dtmax)
+            u_next = ifelse.(accept, taken.u, u)
+            k1_next = ifelse.(accept, taken.k[7], k1)
+            t_next = ifelse(accept, t + dt_use, t)
+            qold_next = ifelse(accept, max(EEst, qoldinit_tr), qold)
+            # A rejected step with finite EEst > 1 is ordinary; a NaN
+            # estimate latches `bad` (every float is <= 1, > 1, or NaN).
+            # Spelled `isnan`-first deliberately: placing both `EEst <= 1`
+            # and `EEst > 1` lets the optimizer derive one comparison from
+            # the other, which is wrong for NaN (probed: identical NaN
+            # input reads `(<=, >)` as `(false, true)` in one program and
+            # `(true, false)` in another).
+            bad_next = ifelse(accept, bad, ifelse(isnan(EEst), one_tr, bad))
+            t_new = t + dt_use
+            out = RKRO._emit_saveat_cols(out, saveat_tup, u, taken.k, t,
+                dt_step, min(t, t_new), max(t, t_new), accept & active, dense)
+            u = ifelse.(active, u_next, u)
+            k1 = ifelse.(active, k1_next, k1)
+            t = ifelse(active, t_next, t)
+            dt = ifelse(active, dt_next, dt)
+            qold = ifelse(active, qold_next, qold)
+            n_iter = n_iter + one_tr
+            bad = ifelse(active, bad_next, bad)
+            end
         end
         reached = tdir * (t1 - t) <= zero_T
         status = ifelse(bad > half_tr, two_tr,

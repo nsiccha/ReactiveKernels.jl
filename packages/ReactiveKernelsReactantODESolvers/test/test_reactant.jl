@@ -139,8 +139,10 @@ function compile_reactant_gradient(closure, u0, p, which)
 end
 
 @testset "compiled endpoint gradient" begin
+    # Reverse-through-while requires the freeze shape (single-comparison
+    # cond); the primal early-exit cond fails Binomial analysis.
     closure = RKRO.traceable_ode_closure(decay_traceable, DECAY_R_CFG,
-        DECAY_R_U0, DECAY_R_P)
+        DECAY_R_U0, DECAY_R_P; early_exit=false)
     grad_compiled = compile_reactant_gradient(closure, DECAY_R_U0, DECAY_R_P,
         1)
     dp_ad, du0_ad = grad_compiled(TR(DECAY_R_U0), TR(DECAY_R_P),
@@ -156,8 +158,10 @@ end
 end
 
 @testset "compiled saveat gradient" begin
+    # Reverse-through-while requires the freeze shape (single-comparison
+    # cond); the primal early-exit cond fails Binomial analysis.
     closure = RKRO.traceable_ode_closure(decay_traceable, DECAY_R_CFG,
-        DECAY_R_U0, DECAY_R_P)
+        DECAY_R_U0, DECAY_R_P; early_exit=false)
     grad_compiled = compile_reactant_gradient(closure, DECAY_R_U0, DECAY_R_P,
         2)
     dp_ad, du0_ad = grad_compiled(TR(DECAY_R_U0), TR(DECAY_R_P),
@@ -200,4 +204,25 @@ end
     @test max_abs_diff([endpoint], [DECAY_R_U0]) <
           agreement_bar(1e-10, 1e-8, 2.0)
     @test size(smat) == (2, 2)
+end
+
+@testset "early-exit and freeze shapes agree bit-for-bit" begin
+    # The two loop shapes share step semantics by construction (identical
+    # bodies); frozen iterations are exact no-ops, so skipping them must
+    # not change a single bit. Any future divergence fails here loudly.
+    early = Reactant.compile(
+        RKRO.traceable_ode_closure(decay_traceable, DECAY_R_CFG, DECAY_R_U0,
+            DECAY_R_P; early_exit=true),
+        (TR(DECAY_R_U0), TR(DECAY_R_P)))
+    frozen = Reactant.compile(
+        RKRO.traceable_ode_closure(decay_traceable, DECAY_R_CFG, DECAY_R_U0,
+            DECAY_R_P; early_exit=false),
+        (TR(DECAY_R_U0), TR(DECAY_R_P)))
+    for (u0, p) in ((DECAY_R_U0, DECAY_R_P), ([2.5, 0.25], [1.0, 2.0]))
+        e_end, e_cols, e_stat = early(TR(u0), TR(p))
+        f_end, f_cols, f_stat = frozen(TR(u0), TR(p))
+        @test Array(e_end) == Array(f_end)
+        @test Float64(e_stat) == Float64(f_stat)
+        @test all(map((a, b) -> Array(a) == Array(b), e_cols, f_cols))
+    end
 end
