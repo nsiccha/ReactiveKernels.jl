@@ -89,6 +89,9 @@ end
         (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
     @test :log in admitted_functions()
     @test :sum in admitted_functions()
+    ops, fns = admitted_elementwise()
+    @test Symbol(".+") in ops && Symbol(".*") in ops && Symbol(".==") in ops
+    @test :log in fns && :exp in fns
     @test supports_term(:factor)
     @test !supports_term(:zscale)
     @test !supports_term(:hsgp)
@@ -172,6 +175,20 @@ end
         LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :tau, nothing,
             _none_evidence(), :y_resp)
     @test validate_plan(ok) === nothing
+    bad = _gaussian_plan()
+    bad.parameters[1] =
+        SampledParameter(:tau, :normal, (arg1 = 2.0, arg2 = 1.0), :positive, :tau)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _gaussian_plan()
+    bad.parameters[1] =
+        SampledParameter(:mu0, :normal, (arg1 = 0.0, arg2 = 1.0), nothing, :mu0)
+    push!(bad.parameters,
+        SampledParameter(:tau, :cauchy, (arg1 = :mu0, arg2 = 1.0), :positive, :tau))
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _gaussian_plan()
+    bad.parameters[1] =
+        SampledParameter(:tau, :flat, (;), :positive, :tau)
+    @test_throws ContractValidationError validate_plan(bad)
 end
 
 @testset "name tables and topo order" begin
@@ -305,4 +322,84 @@ end
         LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
             ResponseEvidence(:interval_censored, 0.0, 10.0), :y_resp)
     @test_throws ContractValidationError validate_plan(bad)
+    bad = _poisson_plan()
+    bad.responses[1] =
+        LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta, nothing, nothing,
+            ResponseEvidence(:truncated, nothing, 4.5), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _poisson_plan()
+    bad.columns[:b] = fill(4.0, 9)
+    bad.responses[1] =
+        LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta, nothing, nothing,
+            ResponseEvidence(:truncated, nothing, :b), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    ok = _poisson_plan()
+    ok.responses[1] =
+        LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta, nothing, nothing,
+            ResponseEvidence(:truncated, nothing, 4.0), :y_resp)
+    @test validate_plan(ok) === nothing
+end
+
+_unbind(p::StructuralPlan) = StructuralPlan(p.responses, p.predictors,
+    p.population_priors, p.parameters, p.assignments,
+    Dict{Symbol,AbstractVector}(), 0)
+
+@testset "unbound plans and bind_data" begin
+    u = _unbind(_gaussian_plan())
+    @test !isbound(u)
+    @test validate_structure(u) === nothing
+    @test validate_plan(u) === nothing
+    @test_throws ContractValidationError validate_data(u)
+    # A structural defect still fails unbound.
+    bad = _unbind(_bernoulli_plan())
+    bad.responses[1] =
+        LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta, nothing, nothing,
+            ResponseEvidence(:truncated, 0.0, 1.0), :y_resp)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Bind happy path: same plan, roles inferred.
+    cols = _columns(9)
+    b = bind_data(u, cols)
+    @test isbound(b)
+    @test b.n_obs == 9
+    @test validate_plan(b) === nothing
+    @test b.roles[:y] === :response
+    @test b.roles[:x] === :predictor
+    @test b.roles[:g] === :data
+    # Rebind replaces columns.
+    b2 = bind_data(b, _columns(6))
+    @test b2.n_obs == 6
+    @test validate_plan(b2) === nothing
+    # Bind errors fail closed.
+    @test_throws ContractValidationError bind_data(u, Dict{Symbol,AbstractVector}())
+    ragged = _columns(9)
+    ragged[:x] = [1.0, 2.0]
+    @test_throws ContractValidationError bind_data(u, ragged)
+    missing = _columns(9)
+    delete!(missing, :x)
+    @test_throws ContractValidationError bind_data(u, missing)
+    @test_throws ContractValidationError bind_data(u, _columns(9);
+        roles = Dict(:y => :nonsense))
+    @test_throws ContractValidationError bind_data(u, _columns(9);
+        roles = Dict(:nope => :data))
+end
+
+@testset "role inference" begin
+    u = _unbind(_gaussian_plan())
+    u.responses[1] =
+        LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, :w,
+            ResponseEvidence(:truncated, :lo, 5.0), :y_resp)
+    cols = _columns(9)
+    cols[:w] = ones(9)
+    cols[:lo] = zeros(9)
+    b = bind_data(u, cols)
+    @test b.roles[:y] === :response
+    @test b.roles[:x] === :predictor
+    @test b.roles[:w] === :weight
+    @test b.roles[:lo] === :evidence
+    @test b.roles[:g] === :data
+    # Explicit roles override inference.
+    b2 = bind_data(u, cols; roles = Dict(:x => :data, :g => :predictor))
+    @test b2.roles[:x] === :data
+    @test b2.roles[:g] === :predictor
+    @test b2.roles[:y] === :response
 end

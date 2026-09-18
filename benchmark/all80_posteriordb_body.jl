@@ -374,10 +374,10 @@ isempty(_req_duplicates) ||
     error("all80 native: duplicate model key(s) requested: $(join(_req_duplicates, ", "))")
 _unknown = [k for k in _req if !haskey(RK, k)]
 isempty(_unknown) || error("all80: unknown registry key(s) requested: $(join(_unknown, ", "))")
-# Default sweep = the frozen 82 ONLY (BATCH1_KEYS excluded); the batch-1 additions run solely when
-# requested by explicit key (RK_ALL80_BATCH mode), so an empty-ARGS full sweep reproduces the
-# immutable 82-row checkpoint rather than 86.
-targets = isempty(_req) ? sort(collect(setdiff(keys(RK), All80Registry.BATCH1_KEYS))) : _req
+# Default sweep = the frozen 82 ONLY (BATCH_KEYS excluded); incremental-batch additions run solely
+# when requested by explicit key (RK_ALL80_BATCH mode), so an empty-ARGS full sweep reproduces the
+# immutable 82-row checkpoint rather than 90.
+targets = isempty(_req) ? sort(collect(setdiff(keys(RK), All80Registry.BATCH_KEYS))) : _req
 retry_requested = get(ENV, "RK_ALL80_RETRY", "") == "1"
 retry_requested && isempty(_req) &&
     error("RK_ALL80_RETRY=1 requires explicit model keys; refusing to replay all 82 implicitly")

@@ -123,3 +123,32 @@ end
     @test length(empty_nt.sigma) == 0
     @test_throws ContractValidationError restore_draws(built.layout, U[1:2, :])
 end
+
+# Compiled-caller shape (world-age regression): build + prepare + evaluate
+# must work from inside a compiled function — sampler loops are compiled
+# callers, and top-level-only tests never see "method too new".
+function _query_nested(u)
+    plan = _query_plan()
+    built = build_kernel(plan)
+    q = prepare_sampler(built, plan, u; backend = _QUERY_BACKEND)
+    g = Vector{Float64}(undef, length(u))
+    val, grad = sampler_value_and_gradient!(q, g, Vector{Float64}(u))
+    return q(u), val, grad
+end
+
+function _query_nested_call(q, u)
+    return q(u)
+end
+
+@testset "compiled callers (world age)" begin
+    u = [0.5, -0.25, 0.1]
+    plan = _query_plan()
+    built = build_kernel(plan)
+    q = prepare_sampler(built, plan, u; backend = _QUERY_BACKEND)
+    ref = q(u)
+    nval, ngrad_val, ngrad = _query_nested(u)
+    @test nval ≈ ref
+    @test ngrad_val ≈ ref
+    @test isapprox(ngrad, _query_findiff(q, u); rtol = 1e-5, atol = 1e-7)
+    @test _query_nested_call(q, u) ≈ ref
+end

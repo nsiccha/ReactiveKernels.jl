@@ -254,3 +254,50 @@ function render_all80_batch1_speedup_plot(path = _ALL80_BATCH1_PATH)
             "matched-workload verdict. Same observed-load + per-side-support caveats as the 82; the " *
             "same-T distinction (native-adaptive-T vs Reactant T=4 is capability, not matched-T) holds.")
 end
+
+# ---- IRT incremental additions (todo 0wsjovm) — SEPARATE receipt, rendered ALONGSIDE --------------
+# Same shape as batch-1 (own path, own ids, honest note when absent), but the saved run IS
+# ordinary-AE certified (both phases backend-recorded + loaded-module certified), and all four
+# models are matched observation-level workloads on every side (no sufficient-statistic shortcut).
+function render_all80_irt_coverage_plot(path = _ALL80_IRT_PATH)
+    isfile(path) || return _all80_plot_note(
+        "IRT incremental additions: receipt not present yet — awaiting the focused 4-model run.")
+    rows = _all80_reactant_coverage_rows(_all80_models(path))
+    isempty(rows) && return _all80_plot_note("IRT: no models recorded yet.")
+    spec = data(rows) *
+        mapping(:operation => "Reactant operation", :count => "IRT models";
+            color = :outcome => "Outcome") *
+        visual(BarPlot)
+    _all80_fig(spec * config(width = 420, height = 240,
+            title = "IRT batch Reactant lowering coverage (certified)",
+            scales = scales(Y = (; zero = true)));
+        id = "all80-irt-coverage",
+        title = "IRT coverage — what lowered",
+        description = "The IRT additions, rendered from the SEPARATE " *
+            "all80-irt-v1.toml — a UNION alongside the frozen 82, never merged into it. Certified " *
+            "ordinary-AE run (both phases backend-recorded + loaded-module certified, one run id). " *
+            "Registered against the existing upstream Turing + posteriordb Stan comparators (no new " *
+            "Turing translation).")
+end
+
+function render_all80_irt_speedup_plot(path = _ALL80_IRT_PATH)
+    isfile(path) || return _all80_plot_note(
+        "IRT single-eval speedup: receipt not present yet — awaiting the focused 4-model run.")
+    rows = _all80_speedup_rows(_all80_models(path))
+    isempty(rows) && return _all80_plot_note("IRT: no numerically-gated single-evaluation rows yet.")
+    spec = data(rows) *
+        mapping(:dim => "Model dimension", :speedup => "log₂(comparator / RK)   ·   >0 ⇒ RK faster";
+            color = :metric => "Evaluation", col = :comparator => "Comparator",
+            marker = :workload => "Workload") *
+        visual(Scatter)
+    _all80_fig(spec * config(width = 360, height = 300,
+            title = "IRT batch additions vs reference Stan and upstream Turing (certified)",
+            scales = scales(X = (; scale = log10)));
+        id = "all80-irt-speedup",
+        title = "IRT batch additions — single-eval speed (certified, directional)",
+        description = "Each point is one IRT addition, from the SEPARATE " *
+            "all80-irt-v1.toml (a union with the frozen 82, not merged; certified ordinary-AE run). " *
+            "Matched observation-level workloads on all sides — no workload-mismatch series. Same " *
+            "observed-load + per-side-support caveats as the 82; the same-T distinction " *
+            "(native-adaptive-T vs Reactant T=4 is capability, not matched-T) holds.")
+end
