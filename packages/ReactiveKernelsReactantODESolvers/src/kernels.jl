@@ -81,16 +81,16 @@ end
 
 # Functional evaluation of the same graph for the native path. The stateful
 # prepared executor is Enzyme-hostile (see the boundary note above), so the
-# native driver executes the `lower`ed plan body instead: `lower` turns the
-# plan into straight-line code over `(__ops__, ports...)`, and the generator
-# below bakes the ops in as constants and drops `__ops__`, yielding a plain
-# Julia function with static dispatch — which is why plain Enzyme reverse
-# works through it. Generated (not `eval`ed) so the product is always fresh:
-# no `__init__`, no precompilation staleness, no load order. The ops tuple
-# has no public accessor, so it comes from the private `_lower_with_ops` —
-# pinned by the ReactiveKernels compat entry, guarded by the parity tests and
-# the fail-fast signature check below, and filed as a core snag requesting a
-# public functional-lowering surface.
+# native driver executes the lowered plan body instead: `lower_with_ops`
+# turns the plan into straight-line code over `(__ops__, ports...)` plus the
+# ops tuple, and the generator below bakes the ops in as constants and drops
+# `__ops__`, yielding a plain Julia function with static dispatch — which is
+# why plain Enzyme reverse works through it. Generated (not `eval`ed) so the
+# product is always fresh: no `__init__`, no precompilation staleness, no
+# load order. The (ast, ops, recipes) triple comes from the public
+# `lower_with_ops`; its contract (`first(triple) == lower(p)`) is locked by
+# the core regression suite, and the kernel parity tests bind this path to
+# the prepared executor bit-for-bit.
 const TSIT5_STAGE_PORTS = (:f, :uprev, :k1, :p, :t, :dt, :tab, :atol, :rtol,
     :inv_n)
 
@@ -125,17 +125,7 @@ kernel; Enzyme-clean. Valid inputs only (no validation branches).
         rtol, inv_n)
     spec_plan = plan(tsit5_stage; have=TSIT5_STAGE_PORTS,
         want=(:u, :kk, :EEst))
-    lowered, ops, _ = ReactiveKernels._lower_with_ops(spec_plan;
-        inline_embedded=false)
-    sig = lowered.args[1]
-    sig.args[1] === :__ops__ ||
-        error("lower() signature changed shape: $sig")
-    names = map(sig.args[2:end]) do a
-        a isa Symbol ? a : (a isa Expr && a.head === :(::) ? a.args[1] :
-            error("lower() signature changed shape: $sig"))
-    end
-    Tuple(names) == TSIT5_STAGE_PORTS ||
-        error("lower() port order changed: $names")
+    lowered, ops, _ = ReactiveKernels.lower_with_ops(spec_plan)
     body = _bake_stage_ops!(deepcopy(lowered.args[2]), ops)
     body
 end
