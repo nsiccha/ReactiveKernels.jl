@@ -122,7 +122,10 @@ using LogExpFunctions: logsumexp, logaddexp
             newg = vec(mapslices(logsumexp, transitioned; dims = 1)) .+ emit
             (newg, logsumexp(newg))
         end
-    likelihood::Float64 = forward[end]
+    # Final marginal via a 0/1 mask-weighted sum — no scalar indexing of the
+    # traced scan output (see hmm_drive_1).
+    last_weight::Vector{Float64} = vcat(zeros(n - 1), [1.0])
+    likelihood::Float64 = sum(forward .* last_weight)
 
     posterior::Float64 = prior + likelihood + log_jacobian
     return posterior

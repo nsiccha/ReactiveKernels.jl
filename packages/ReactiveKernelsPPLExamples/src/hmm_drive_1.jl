@@ -125,7 +125,11 @@ using LogExpFunctions: logsumexp, logaddexp
             newg = vec(mapslices(logsumexp, transitioned; dims = 1)) .+ emit
             (newg, logsumexp(newg))
         end
-    likelihood::Float64 = forward[end]
+    # The final marginal is the scan's last per-step output; a 0/1 mask-weighted
+    # sum selects it without scalar-indexing the traced scan output (an `end`
+    # index does not resolve inside the traced scan closure).
+    last_weight::Vector{Float64} = vcat(zeros(n - 1), [1.0])
+    likelihood::Float64 = sum(forward .* last_weight)
 
     posterior::Float64 = prior + likelihood + log_jacobian
     return posterior

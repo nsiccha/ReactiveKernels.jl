@@ -66,15 +66,14 @@ The natural forward recursion **lowers through Reactant**, and the two query
 boundaries are measured separately (`benchmark/structured_gate.jl`, axes 3a/3b):
 the public **all-bound** query (raw `u`/`v`/`alpha`/`tau`/`rho` bound) compiles
 and matches the native density exactly, with the compiler specializing the
-recurrence for the query shape. The **traced-stream** query (the same graph
-with the data ports free and traced) also matches native exactly. On the
-ReactiveKernels pin of this tree both boundaries compile with the recurrence
-unrolled (measured `stablehlo.while` count 0 with a non-empty HLO byte-size
-control; no carry-loop claim is asserted for either shape). Upstream
-ReactiveKernels `main` @ `90acd41c` landed the traced `eachrow` while-lowering
-after this pin; once this tree carries it, the traced-stream boundary lowers as
-a single carry loop and the gate's count becomes an assertion. The counts are
-read from `repr(Reactant.@code_hlo ...)` — the same surface the repository's
+recurrence for the query shape (its emitted HLO contains no `stablehlo.while`
+region; the specialization is recorded with a byte-size control, and no
+carry-loop claim is made for it). The **traced-stream** query (the same graph
+with the data ports free and traced) also matches native exactly and, on the
+current pin carrying ReactiveKernels `90acd41c`, lowers as a **single
+`stablehlo.while` carry loop** (~99 KB of HLO, asserted by the gate — the
+earlier pin unrolled it into a ~9.6 MB module). The counts are read from
+`repr(Reactant.@code_hlo ...)` — the same surface the repository's
 authored-scan tests assert on — because `module_string` is empty on the pinned
 Reactant and a count against it would be vacuous.
 
@@ -84,9 +83,12 @@ analysis (`EnzymeRuntimeActivityError`) under both the ordinary and
 Const-annotated configurations, while the same graph's components, the same
 priors without the scan, and a three-prior scan control all pass, and
 `Enzyme.set_runtime_activity` matches BridgeStan's gradient. The
-Reactant-compiled gradient is measured in its own isolated process (no native
-gradient work of any mode beforehand); see the gate's per-axis entries for its
-independently reached outcome and exact diagnostics. The runtime-activity
+Reactant-compiled gradient is an explicit UNSUPPORTED axis at this pin on both
+query shapes, each measured in its own isolated process (no native gradient
+work of any mode beforehand): the all-bound shape's unrolled module is
+intractable for the EnzymeMLIR reverse pass, and the single-while traced-stream
+shape currently fails the reverse pass itself (`operand #0 does not dominate
+this use`); complete diagnostics are retained by the gate.
 result and the same-process compile observations are kept as separate,
 explicitly labeled facts in `benchmark/structured_gate_diagnostics.jl` — no
 order-dependence or cache explanation is claimed. The gate pins the documented

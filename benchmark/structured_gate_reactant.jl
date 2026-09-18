@@ -21,6 +21,7 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
             println("  [$axis] UNSUPPORTED (measured at this pin; diagnostic retained)"); flush(stdout)
         end
     end
+    vn = kb(q)   # native reference value, shared by both Reactant primal axes
 
     # ---- [3a] Reactant primal of the public ALL-BOUND query vs native ----
     # The HLO shape of THIS query is measured and reported without claiming a
@@ -32,7 +33,7 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
     # next to every count as the positive control (bytes=0 → no shape claim).
     function _axis_3a()
         kbc = Reactant.compile(kb, (rq,); sync = true)
-        vc = Float64(kbc(rq)); vn = kb(q)
+        vc = Float64(kbc(rq))
         rp = _relv(vc, vn)
         @assert isfinite(vc) && rp < RPRIMAL_TOL "$name: Reactant primal rel=$rp ≥ $RPRIMAL_TOL"
         bound_hlo = repr(Reactant.@code_hlo optimize = false kb(rq))
@@ -75,8 +76,9 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
         traced_hlo = repr(Reactant.@code_hlo optimize = false kb_free(traced...))
         traced_while = count("stablehlo.while", traced_hlo)
         traced_bytes = length(codeunits(traced_hlo))
-        _axis!(name, "PASS Reactant primal (traced-stream query) rel=$(round(rt; sigdigits=4)) (1 probe); stablehlo.while=$traced_while, hlo_bytes=$traced_bytes (@code_hlo; measured, not asserted)")
-        println("  [3b] Reactant primal (traced streams) rel=$(round(rt; sigdigits=4))  (< $RPRIMAL_TOL; 1 probe) PASS; stablehlo.while=$traced_while, hlo_bytes=$traced_bytes (@code_hlo; measured, not asserted)"); flush(stdout)
+        @assert traced_while == 1 "$name: traced-stream scan expected exactly 1 stablehlo.while (RK 90acd41c while-lowering), got $traced_while"
+        _axis!(name, "PASS Reactant primal (traced-stream query) rel=$(round(rt; sigdigits=4)) (1 probe); stablehlo.while=$traced_while, hlo_bytes=$traced_bytes (@code_hlo; single-while carry loop asserted, RK 90acd41c)")
+        println("  [3b] Reactant primal (traced streams) rel=$(round(rt; sigdigits=4))  (< $RPRIMAL_TOL; 1 probe) PASS; stablehlo.while=$traced_while, hlo_bytes=$traced_bytes (@code_hlo; single-while asserted)"); flush(stdout)
     end
     if int_ports || reactant_primal === :measure
         int_ports ? _axis_3b() : _measured(3, _axis_3b)
@@ -98,20 +100,38 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
     # reactant_grad === :pin_boundary records the unrolled-scan boundary and
     # attempts only opt-in; :assert hard-asserts the compiled gradient on the
     # bound-data query (IRT-lane recipe, scan-free graphs).
+    # AT THIS PIN (90acd41c in-tree) the traced-stream scan compiles as a
+    # single stablehlo.while (99,130 bytes vs the 9.6 MB unrolled module), so
+    # the HMM compiled gradient is re-measured on THAT shape: prepared AD over
+    # the free-data kernel with active = :unconstrained, compared against
+    # Stan's unconstrained gradient. The all-bound gradient stays off the
+    # default path (its module is still unrolled, 8.1 MB).
     if reactant_grad === :pin_boundary
-        if get(ENV, "STRUCTURED_REACTANT_GRAD", "0") != "1"
-            _axis!(name, "UNSUPPORTED Reactant gradient at this pin: unrolled scan module (see axes 3a/3b byte sizes) killed the EnzymeMLIR reverse compile with an external SIGTERM (retained gate log, kb-run-compact.X7biXF, 2026-09-18); opt-in attempt via STRUCTURED_REACTANT_GRAD=1, hard re-measure after RK 90acd41c lands in-tree")
-            println("  [4] Reactant grad  UNSUPPORTED (documented unrolled-scan pin boundary; diagnostic retained)"); flush(stdout)
-            return
-        end
+        _axis!(name, "UNSUPPORTED Reactant gradient (all-bound query): unrolled scan module (8.1 MB, 0 whiles) killed the EnzymeMLIR reverse compile with an external SIGTERM at the earlier pin; re-measured on the traced-stream single-while shape below")
+        println("  [4a] Reactant grad (all-bound) UNSUPPORTED (unrolled pin boundary; re-measured below on traced-stream shape)"); flush(stdout)
     end
     begin
         grad_result = try
-            prep = prepare_ad(kb, AE, q; active = :unconstrained)
-            gb = Reactant.to_rarray(similar(q))
-            gc = Reactant.compile(ReactiveKernels.ad_value_and_gradient!, (prep, gb, rq);
-                                  sync = true)
-            _, rg = gc(prep, gb, rq)
+            local prep, gc, rg
+            if reactant_grad === :pin_boundary
+                # traced-stream shape: free-data kernel, active = unconstrained
+                local data_bnd = bind(_GATE_DATA[])
+                local kb_free = prepare(build(); have, want = :posterior)
+                local traced_args = (rq,
+                    (Reactant.to_rarray(getfield(data_bnd, f)) for f in Base.tail(have))...)
+                prep = prepare_ad(kb_free, AE, q, traced_args[2:end]...;
+                                  active = :unconstrained)
+                gb = Reactant.to_rarray(similar(q))
+                gc = Reactant.compile(ReactiveKernels.ad_value_and_gradient!,
+                    (prep, gb, traced_args...); sync = true)
+                _, rg = gc(prep, gb, traced_args...)
+            else
+                prep = prepare_ad(kb, AE, q; active = :unconstrained)
+                gb = Reactant.to_rarray(similar(q))
+                gc = Reactant.compile(ReactiveKernels.ad_value_and_gradient!, (prep, gb, rq);
+                                      sync = true)
+                _, rg = gc(prep, gb, rq)
+            end
             gh = Array{Float64}(rg)
             gs = sgrad(sm, q)
             @assert all(isfinite, gh) "$name: Reactant gradient not finite"
@@ -120,7 +140,7 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
             "PASS Reactant gradient rel=$(round(rgr; sigdigits=4)) (1 probe)"
         catch err
             text = _retain(name, 4, err)
-            if reactant_grad === :measure
+            if reactant_grad in (:measure, :pin_boundary)
                 "UNSUPPORTED Reactant gradient: compile/execute failed at this pin; complete diagnostic retained"
             elseif occursin(_GAP_NEEDLE, text)
                 "UNSUPPORTED Reactant gradient: documented $_GAP_SNAG failure; complete diagnostic retained"
