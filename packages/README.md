@@ -13,6 +13,7 @@ ReactiveKernels
 ├── ReactiveKernelsCompatibilityExamples
 ├── ReactiveKernelsNUTSExamples
 ├── ReactiveKernelsStreamingStats
+├── ReactiveKernelsReactantODESolvers
 └── ReactiveKernelsHMCDiagnostics
     ├── ReactiveKernelsNUTSExamples
     └── ReactiveKernelsStreamingStats
@@ -27,6 +28,9 @@ The general kernel-example package owns the distribution gallery, bijectors,
 fixed-step HMC, and runnable core walkthrough. Batching remains a separate
 package because its public boundary includes DifferentiationInterface cache
 semantics. Compatibility examples are isolated from current authoring examples.
+The Reactant ODE solvers package is a self-contained adaptive-Tsit5
+implementation written in Reactant-traceable form; it is solver support, not
+PosteriorDB support, until independently proven and separately reviewed.
 
 Julia 1.10 is still supported, so its package manager ignores `[sources]` and
 does not provide the newer workspace mechanism. Materialize the local paths
