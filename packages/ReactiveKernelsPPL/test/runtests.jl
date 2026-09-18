@@ -7,6 +7,7 @@ include("test_preprocessing.jl")
 include("test_generator.jl")
 include("test_query.jl")
 include("test_surface.jl")
+include("test_report.jl")
 
 @testset "package skeleton" begin
     @test isdefined(ReactiveKernelsPPL, :ReactiveKernels)
