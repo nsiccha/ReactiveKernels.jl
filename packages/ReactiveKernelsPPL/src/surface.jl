@@ -664,14 +664,33 @@ function _reject_target(rhs, lhs)
 end
 
 # ── Submodel expansion (StanBlocks-style reusable submodels) ─────────────
-# Runs before partitioning. Every `latent ~ sm(args...)` whose plain-`~` RHS
-# call head resolves in `mod` to an `RKPPLSubmodel` is rewritten into inline
-# statements: the submodel's positional args bind to the call arguments, its
-# own `~`/`=` names are namespaced under the LHS (`latent_…`), and its trailing
-# return expression becomes `latent = <return>`. The result lowers exactly like
-# a hand-inlined model (the submodel is transparent). A `~` whose head is a
-# distribution or unknown name passes through untouched — the ordinary
-# vocabulary screen still applies downstream.
+# Runs before partitioning. Every plain-`~` statement whose RHS call head
+# resolves in `mod` to an `RKPPLSubmodel` is rewritten into inline statements;
+# the submodel's positional args bind to the call arguments and its own `~`/`=`
+# names are namespaced under the LHS, so the result lowers exactly like a
+# hand-inlined model (the submodel is transparent). Two kinds, read from the
+# submodel's RETURN:
+#   • latent (`latent ~ sm(a,b)`, `latent` NOT data) — returns a VALUE
+#     expression; every local is namespaced (`latent_…`) and a trailing
+#     `latent = <return>` binds the LHS.
+#   • observation stream (`y ~ sm(a,b)`, `y` a data column) — returns a bare
+#     `slot` that is the LHS of an internal `slot .~ family.(...)` response;
+#     the slot maps to the data column (`y .~ family.(y_…)`), the rest is
+#     namespaced under `y`, and there is NO trailing binding (the response IS
+#     the binding).
+#
+# Admitting plain `~` on a data LHS is a SHAPE-COMPATIBILITY rule (dots follow
+# the callee, not the LHS), NOT a submodel type-exception: a data column is
+# vector-shaped, so it accepts only a VECTORIZED callee whose logpdf consumes
+# the whole column — a stream submodel. A scalar callee (`y ~ Normal(...)`)
+# stays incompatible and is rejected downstream (`.~` required), and a latent
+# submodel on a data LHS is likewise incompatible. Two shapes are deliberately
+# left for later and NOT handled here: a scalar-observation LHS + scalar callee
+# (plain `~`, once scalar data columns exist) and an elementwise per-row
+# submodel broadcast as `y .~ sm.(x, g)`.
+#
+# A `~` whose head is a distribution or unknown name passes through untouched —
+# the ordinary vocabulary/response screen still applies downstream.
 
 """Return the [`RKPPLSubmodel`](@ref) a call RHS names in `mod`, or nothing."""
 function _resolve_submodel(rhs, mod::Module)
@@ -683,8 +702,9 @@ function _resolve_submodel(rhs, mod::Module)
     return val isa RKPPLSubmodel ? val : nothing
 end
 
-# A top-level statement that is a plain `~` whose RHS resolves to a submodel.
-function _stmt_is_submodel_call(arg, data::Set{Symbol}, mod::Module)
+# A top-level statement that is a plain `~` whose RHS resolves to a submodel
+# (pure predicate; the latent/stream compatibility check happens on expansion).
+function _stmt_is_submodel_call(arg, mod::Module)
     arg isa Expr || return false
     st = try
         _unwrap_trivia(arg)
@@ -693,21 +713,16 @@ function _stmt_is_submodel_call(arg, data::Set{Symbol}, mod::Module)
     end
     st isa Expr && _is_sample(st) || return false
     _resolve_submodel(st.args[3], mod) === nothing && return false
-    lhs = st.args[2]
-    lhs isa Symbol || return false
-    lhs in data && _sfail("observation-stream submodels (`$lhs ~ sm(...)` " *
-        "with `$lhs` a data column) are the next slice; this slice supports " *
-        "latent submodels (`latent ~ sm(...)`, `latent` not data)")
-    return true
+    return st.args[2] isa Symbol
 end
 
 function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module)
-    any(_stmt_is_submodel_call(a, data, mod) for a in ast.args) || return ast
+    any(_stmt_is_submodel_call(a, mod) for a in ast.args) || return ast
     out = Any[]
     for arg in ast.args
-        if _stmt_is_submodel_call(arg, data, mod)
+        if _stmt_is_submodel_call(arg, mod)
             st = _unwrap_trivia(arg)
-            append!(out, _expand_one_submodel(st.args[2], st.args[3], mod))
+            append!(out, _expand_one_submodel(st.args[2], st.args[3], mod, data))
         else
             push!(out, arg)
         end
@@ -756,7 +771,20 @@ _subst(ex, ::AbstractDict) = ex
 _subst(ex::Expr, map::AbstractDict) =
     Expr(ex.head, Any[_subst(a, map) for a in ex.args]...)
 
-function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module)
+# A stream submodel returns a bare `slot` Symbol that is the LHS of exactly one
+# internal `.~` response statement. Returns that statement, or `nothing` for a
+# latent submodel (value return / non-response slot).
+function _stream_response(sm::RKPPLSubmodel, stmts, ret)
+    ret isa Symbol || return nothing
+    hits = findall(st -> _is_broadcast_sample(st) && st.args[2] === ret, stmts)
+    isempty(hits) && return nothing
+    length(hits) == 1 || _sfail("stream submodel `$(sm.name)`: return `$ret` " *
+        "names more than one `.~` response")
+    return stmts[first(hits)]
+end
+
+function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
+                              data::Set{Symbol})
     sm = _resolve_submodel(callexpr, mod)::RKPPLSubmodel
     callargs = callexpr.args[2:end]
     length(callargs) == length(sm.argnames) || _sfail(
@@ -764,6 +792,20 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module)
         "$(Tuple(sm.argnames)), got $(length(callargs)) at `$lhs ~ " *
         "$(sm.name)(...)`")
     stmts, ret = _submodel_body_parts(sm)
+    stream = _stream_response(sm, stmts, ret) !== nothing
+    # Shape compatibility (dots follow the callee): a data column is
+    # vector-shaped, so it admits only a vectorized (stream) callee; a non-data
+    # LHS binds a latent value.
+    if lhs in data
+        stream || _sfail("`$lhs` is a data column, so `$(sm.name)` must be an " *
+            "observation-stream submodel: end its body by returning a `slot` " *
+            "that is the LHS of an internal `slot .~ family.(...)` response. " *
+            "`$(sm.name)` returns a value (latent) — use a non-data LHS.")
+    else
+        stream && _sfail("`$(sm.name)` is an observation-stream submodel (it " *
+            "returns the `.~` response slot `$ret`); bind it to a DATA column " *
+            "(`<data> ~ $(sm.name)(...)`), not the non-data name `$lhs`.")
+    end
     argset = Set{Symbol}(sm.argnames)
     submap = Dict{Symbol,Any}()
     for (a, v) in zip(sm.argnames, callargs)
@@ -775,14 +817,18 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module)
             "argument and a local statement — rename the local")
         haskey(submap, nm) && _sfail("submodel `$(sm.name)`: `$nm` is " *
             "assigned twice")
-        submap[nm] = _ns(lhs, nm)
+        # The stream response slot binds to the data LHS; all other locals are
+        # namespaced under the LHS.
+        submap[nm] = (stream && nm === ret) ? lhs : _ns(lhs, nm)
     end
     out = Any[]
     for st in stmts
         _reject_nested_submodel(sm, st)
         push!(out, _subst(st, submap))
     end
-    push!(out, Expr(:(=), lhs, _subst(ret, submap)))
+    # Latent: bind the LHS to the return value. Stream: the response IS the
+    # binding (the data LHS is already bound), so no trailing assignment.
+    stream || push!(out, Expr(:(=), lhs, _subst(ret, submap)))
     return out
 end
 
@@ -1094,10 +1140,12 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :PoissonLog && _sfail("response $lhs: write " *
                                   "`Poisson.(exp.(eta))`")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
-                  "(admitted: Normal, Bernoulli, Poisson). Latent submodels " *
-                  "resolve as `latent ~ $fam(...)` when `$fam` is a defined " *
-                  "RKPPLSubmodel in scope; observation-stream submodels " *
-                  "(`$lhs .~ $fam(...)`) are a follow-up slice.")
+                  "(admitted: Normal, Bernoulli, Poisson). When `$fam` is a " *
+                  "defined RKPPLSubmodel, a latent uses `latent ~ $fam(...)` " *
+                  "and an observation stream uses plain `$lhs ~ $fam(...)` " *
+                  "(the whole-column vectorized callee); an elementwise " *
+                  "per-row submodel broadcast `$lhs .~ $fam.(...)` is a " *
+                  "follow-up slice.")
 end
 
 function _lower_link_arg(lhs, arg, wrap)
