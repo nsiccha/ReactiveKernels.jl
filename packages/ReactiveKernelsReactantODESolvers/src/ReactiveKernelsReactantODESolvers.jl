@@ -24,6 +24,7 @@ using ReactiveKernels
 
 export Tsit5, Tsit5Solution, solve_ode
 export initial_dt, ReactantTsit5Config, compile_ode_solve
+export compile_backsolve_gradient
 
 include("tableau.jl")
 include("controller.jl")

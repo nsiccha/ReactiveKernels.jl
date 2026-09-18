@@ -138,6 +138,16 @@ function compile_reactant_gradient(closure, u0, p, which)
         (TR(u0), TR(p), TR(zero.(u0)), TR(zero.(p))))
 end
 
+function compile_reactant_gradient(closure, u0, ::Nothing, which)
+    pick = which == 1 ? (ys -> ys[1]) : (ys -> ys[2])
+    outer = (u0i, du0i) -> begin
+        Enzyme.autodiff(Enzyme.Reverse, a -> sum(pick(closure(a))),
+            Enzyme.Active, Enzyme.Duplicated(u0i, du0i))
+        du0i
+    end
+    Reactant.compile(outer, (TR(u0), TR(zero.(u0))))
+end
+
 @testset "compiled endpoint gradient" begin
     # Reverse-through-while requires the freeze shape (single-comparison
     # cond); the primal early-exit cond fails Binomial analysis.
@@ -172,6 +182,87 @@ end
         DECAY_R_P) atol = 1e-6
     @test Array(du0_ad) ≈ central_gradient(x -> sum(solved(x, DECAY_R_P)[2]),
         DECAY_R_U0) atol = 1e-6
+end
+
+@testset "backsolve endpoint gradient" begin
+    # Forward compiled solve records the trajectory; the pullback re-solves
+    # the augmented adjoint ODE backward in a second early-exit compiled
+    # program — no differentiation through the adaptive while loop, no freeze
+    # shape anywhere in this path.
+    grad = compile_backsolve_gradient(decay_traceable, DECAY_R_U0, DECAY_R_P,
+        Tsit5(), DECAY_R_CFG; loss=:endpoint)
+    du0_ad, dp_ad = grad(DECAY_R_U0, DECAY_R_P)
+    solved = compile_ode_solve(decay_traceable, DECAY_R_U0, DECAY_R_P, Tsit5(),
+        DECAY_R_CFG)
+    @test dp_ad ≈ central_gradient(
+        p -> sum(first(solved(DECAY_R_U0, p))), DECAY_R_P) atol = 1e-6
+    @test du0_ad ≈ central_gradient(
+        x -> sum(first(solved(x, DECAY_R_P))), DECAY_R_U0) atol = 1e-6
+    # Analytic cross-check (exact): L = Σ u0_i e^{-p_i t1}.
+    t1 = DECAY_R_TSPAN[2]
+    @test du0_ad ≈ exp.(-DECAY_R_P .* t1) atol = 1e-6
+    @test dp_ad ≈ -t1 .* DECAY_R_U0 .* exp.(-DECAY_R_P .* t1) atol = 1e-6
+end
+
+@testset "backsolve saveat gradient" begin
+    # Multi-segment backward journey with an adjoint jump at each saveat
+    # point (sum loss).
+    grad = compile_backsolve_gradient(decay_traceable, DECAY_R_U0, DECAY_R_P,
+        Tsit5(), DECAY_R_CFG; loss=:saveat)
+    du0_ad, dp_ad = grad(DECAY_R_U0, DECAY_R_P)
+    solved = compile_ode_solve(decay_traceable, DECAY_R_U0, DECAY_R_P, Tsit5(),
+        DECAY_R_CFG)
+    @test dp_ad ≈ central_gradient(p -> sum(solved(DECAY_R_U0, p)[2]),
+        DECAY_R_P) atol = 1e-6
+    @test du0_ad ≈ central_gradient(x -> sum(solved(x, DECAY_R_P)[2]),
+        DECAY_R_U0) atol = 1e-6
+    # Analytic cross-check (exact): L = Σ_j Σ_i u0_i e^{-p_i s_j}.
+    n = length(DECAY_R_U0)
+    @test du0_ad ≈ [sum(exp(-DECAY_R_P[i] * s) for s in DECAY_R_SAVEAT)
+        for i in 1:n] atol = 1e-6
+    @test dp_ad ≈ [-DECAY_R_U0[i] *
+        sum(s * exp(-DECAY_R_P[i] * s) for s in DECAY_R_SAVEAT) for i in 1:n] atol = 1e-6
+end
+
+@testset "backsolve endpoint gradient without parameters" begin
+    # Nonlinear RHS, parameters closed over: no μ block, `grad_p === nothing`.
+    cfg = ReactantTsit5Config(LOTKA_TSPAN; abstol=1e-10, reltol=1e-8, dt=0.01,
+        maxiters=5000, saveat=[5.0])
+    grad = compile_backsolve_gradient(lotka_traceable, LOTKA_U0, nothing,
+        Tsit5(), cfg; loss=:endpoint)
+    du0_ad, dp_ad = grad(LOTKA_U0)
+    @test dp_ad === nothing
+    solved = compile_ode_solve(lotka_traceable, LOTKA_U0, nothing, Tsit5(),
+        cfg)
+    @test du0_ad ≈ central_gradient(x -> sum(first(solved(x))), LOTKA_U0) atol = 1e-6
+end
+
+@testset "backsolve saveat gradient without parameters" begin
+    # Multi-segment saveat journey on a nonlinear non-toy system, no μ block.
+    # Reference: the freeze-shape through-while gradient on the same loss —
+    # an independent AD path over the identical forward program. The bar is
+    # the repo's tolerance-scaled convention: backsolve re-solves rather
+    # than differentiating the trajectory, so optimise-vs-discretise error
+    # at the ~1e-6 level is expected (measured 2.5e-6 here; central
+    # differences agree with the freeze reference to 3e-8, confirming the
+    # backsolve value rather than the test bar).
+    cfg = ReactantTsit5Config(LOTKA_TSPAN; abstol=1e-10, reltol=1e-8, dt=0.01,
+        maxiters=5000, saveat=[3.0, 6.0])
+    grad = compile_backsolve_gradient(lotka_traceable, LOTKA_U0, nothing,
+        Tsit5(), cfg; loss=:saveat)
+    du0_ad, dp_ad = grad(LOTKA_U0)
+    @test dp_ad === nothing
+    closure = RKRO.traceable_ode_closure(lotka_traceable, cfg, LOTKA_U0,
+        nothing; early_exit=false)
+    grad_frozen = compile_reactant_gradient(closure, LOTKA_U0, nothing, 2)
+    du0_fz = Array(grad_frozen(TR(LOTKA_U0), TR(zero.(LOTKA_U0))))
+    bar = agreement_bar(1e-10, 1e-8, maximum(abs, du0_fz))
+    @test max_abs_diff([du0_ad], [du0_fz]) < bar
+end
+
+@testset "backsolve loss validation" begin
+    @test_throws ArgumentError compile_backsolve_gradient(decay_traceable,
+        DECAY_R_U0, DECAY_R_P, Tsit5(), DECAY_R_CFG; loss=:bogus)
 end
 
 @testset "compiled status flags" begin

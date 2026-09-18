@@ -8,8 +8,11 @@ This is a self-contained example subpackage. It owns an explicit adaptive
 Tsit5 implementation whose adaptive control is written in Reactant-traceable
 form: fixed-shape buffers, traceable control flow, no scalar indexing into
 traced arrays, no host-side branching on tensor values, and no
-`runtime_activity`/priming workaround. Ordinary reverse-mode gradients
-(`AutoEnzyme(mode=Enzyme.Reverse)`) through the solve are part of acceptance.
+`runtime_activity`/priming workaround. Gradients are delivered by a
+backsolve-style adjoint (`compile_backsolve_gradient`): a second
+early-exit compiled program re-solves the augmented `[u; λ; μ]` system
+backward in reverse time. Direct differentiation through the adaptive
+solve is not supported.
 
 Nothing here is PosteriorDB support until the solver itself is independently
 proven and separately reviewed.
@@ -20,7 +23,7 @@ proven and separately reviewed.
 2. Native explicit adaptive Tsit5, validated against OrdinaryDiffEq references
    on Lotka–Volterra, Van der Pol with non-small μ, and at least one larger
    non-toy nonstiff system.
-3. Reactant lowering of the adaptive solve plus ordinary reverse gradients.
+3. Reactant lowering of the adaptive solve plus backsolve adjoint gradients.
 4. Refactor so the tableau/stage/update structure is explicit and can be
    driven from the repository's standard RK-kernel formulation.
 5. Parent review package; no landing without a fresh exact-tip user GO.
@@ -33,27 +36,40 @@ error estimate — is expressed once as a standard `@kernel` graph
 both hot paths; there is no separate step implementation beside it:
 
 - Native (`solve_ode` via `tsit5_step`): the `lower`ed plan body evaluated
-  functionally, so plain-Enzyme reverse works through the solve. Prepared
-  kernels cannot serve here: the stateful executor breaks Enzyme
+  functionally (plain-Enzyme reverse works through the native solve, but
+  the supported compiled gradient path is the backsolve adjoint).
+  Prepared kernels cannot serve here: the stateful executor breaks Enzyme
   (`IllegalTypeAnalysisException` on its `Union{Missing,Bool}` restart
   bookkeeping, plus mutation discipline), and the contract forbids working
   around it.
 - Traced (the Reactant ext): the prepared kernel itself, called per step.
-  Prepared calls lower through Reactant — primal and reverse — via the core
-  traced-slot machinery.
+  Prepared calls lower through Reactant via the core traced-slot
+  machinery. The traced path differentiates only the loop-free RHS VJP
+  inside the step (for the backsolve adjoint); through-solve reverse is
+  not supported.
 
 `test_kernels.jl` proves the two executors bit-for-bit identical across RHS
 shapes, parameter shapes, and float types. The adaptive loop
 (accept/reject, PI control, guards) is driver-level code in both paths:
 kernels express straight-line dataflow, not data-dependent control.
 
-One structural cost, measured honestly: the traced loop always runs
-`maxiters` iterations (per-iteration freeze instead of early exit — the only
-loop shape whose checkpointed reverse Enzyme lowers). Values are
-bitwise-identical to early exit; execution wall time scales with the bound
-(~0.28 µs per frozen iteration on a 2-state problem: 0.20 ms at
-maxiters=150 vs 0.72 ms at maxiters=2000, strato2 2026-09-18);
-status/exhaustion semantics are unchanged.
+Reverse behavior: gradients come from the backsolve adjoint
+(`compile_backsolve_gradient`), not from differentiating through the
+adaptive loop. Both directions run the early-exit primal: the forward
+solve exits on `(n < maxiters) & (t < t1)`, and each backward segment
+re-solves the augmented `[u; λ; μ]` system in reverse time with the same
+early-exit shape. The only `Enzyme.autodiff` differentiates the loop-free
+RHS once per stage evaluation (a vector-Jacobian product lowered to
+straight-line code). Supported losses are `:endpoint` (one backward
+segment `t1 → t0`) and `:saveat` (one segment per saveat interval, the
+adjoint jumping by `1` at each saveat point). Because continuous
+backsolve is not discretisation differentiation, saveat gradients agree
+with references up to a tolerance-scaled bar, not bit-for-bit. The
+legacy `early_exit=false` freeze shape survives only as a
+diagnostic/reference path for the agreement gates — it is not a
+supported gradient recipe (primal values are bitwise-identical, but
+execution wall time scales with the bound: ~0.28 µs per frozen iteration
+on a 2-state problem, strato2 2026-09-18).
 
 ## Out of scope until separately authorized
 

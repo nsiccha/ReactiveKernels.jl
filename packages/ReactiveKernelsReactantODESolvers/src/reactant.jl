@@ -105,18 +105,61 @@ branches on traced values. Hyperparameters (`dt_init`, tolerances,
 `maxiters`, saveat times) are compile-time constants; the adaptive
 step-size sequence itself is computed inside the program.
 
-Gradient recipe: differentiate a scalar loss over the compiled solve with
-plain `Enzyme.autodiff(::Reverse, ...)` *inside* a second compiled function;
-Reactant's Enzyme overlay lowers the pullback into the program. Build that
-closure with `early_exit=false` (Binomial-checkpointed reverse requires the
-single-comparison freeze shape). See the test suite for the exact
-composition.
+Gradient path: [`compile_backsolve_gradient`](@ref) is the supported
+way to differentiate this solve. It re-solves the augmented adjoint ODE
+backward in backward early-exit compiled programs; the only
+`Enzyme.autodiff` differentiates the loop-free RHS once per stage
+evaluation, so nothing differentiates through the adaptive while loop.
+
+Direct differentiation through the solve with
+`Enzyme.autodiff(::Reverse, ...)` is NOT supported. The interim
+`early_exit=false` freeze recipe cannot lower checkpointed reverse
+through the data-dependent early-exit loop at solver scale (see
+[`traceable_ode_closure`](@ref)), and the freeze shape wastes bound
+iterations at runtime. `early_exit=false` survives only as a
+diagnostic/reference path exercised by the test-suite agreement gates.
 """
 function compile_ode_solve end
 
 function compile_ode_solve(args...; kwargs...)
     throw(ArgumentError(
         "compile_ode_solve requires Reactant.jl to be loaded " *
+        "(the Reactant extension is inactive)"))
+end
+
+"""
+    compile_backsolve_gradient(f, u0_example, p_example, ::Tsit5,
+                               config::ReactantTsit5Config; loss=:endpoint)
+
+Compile a backsolve-style adjoint gradient for the fixed-shape solve
+described by `config` (requires Reactant.jl; implemented by the package
+extension). `u0_example` fixes the state dimension and element type;
+`p_example` is either `nothing` or an example parameter vector, as in
+[`compile_ode_solve`](@ref).
+
+`loss` selects the scalar loss over the compiled forward solve:
+
+- `:endpoint`: `sum(endpoint)`, one backward segment `t1 → t0`;
+- `:saveat`: `sum(saveat_matrix)`, one backward segment per saveat interval
+  with the adjoint jumping by `1` at each saveat point.
+
+Returns a callable: `grad(u0)` (or `grad(u0, p)`) runs the forward compiled
+solve, then re-solves the augmented `[u; λ; μ]` adjoint system backward in
+compiled reverse-time programs, and returns `(grad_u0, grad_p)` with plain
+Julia values (`grad_p === nothing` when `p_example === nothing`).
+
+Both directions run the early-exit primal loop. The only
+`Enzyme.autodiff` in this path differentiates the loop-free RHS `f` once
+per stage evaluation (a vector-Jacobian product lowered to straight-line
+code inside the step); nothing differentiates through the adaptive while
+loop, so the legacy freeze shape is never needed. A non-successful forward or
+backward solve throws an `ErrorException` (there is no trajectory to adjoin).
+"""
+function compile_backsolve_gradient end
+
+function compile_backsolve_gradient(args...; kwargs...)
+    throw(ArgumentError(
+        "compile_backsolve_gradient requires Reactant.jl to be loaded " *
         "(the Reactant extension is inactive)"))
 end
 
@@ -129,10 +172,13 @@ Build the raw traced closure compiled by [`compile_ode_solve`](@ref)
 Exposed for IR inspection (`Reactant.@code_hlo`) and custom compilation.
 
 Keyword `early_exit` (default `true`): the primal loop exits on `(n <
-maxiters) & (t < t1)`. Pass `early_exit=false` for the reverse-compatible
-freeze shape (single-comparison cond, runs out the bound) when the closure
-will be differentiated through; both shapes produce bitwise-identical
-values.
+maxiters) & (t < t1)`. `early_exit=false` selects the legacy freeze
+shape (single-comparison cond, runs out the bound). It is kept as a
+diagnostic/reference path for the test-suite agreement gates only — it
+is NOT a supported gradient recipe. Checkpointed reverse through the
+adaptive loop does not lower at solver scale under any Enzyme scheme,
+so differentiate with [`compile_backsolve_gradient`](@ref). Both
+shapes produce bitwise-identical values.
 """
 function traceable_ode_closure end
 
