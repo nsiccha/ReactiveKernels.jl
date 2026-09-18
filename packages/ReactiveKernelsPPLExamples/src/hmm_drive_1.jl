@@ -92,28 +92,35 @@ using LogExpFunctions: logsumexp, logaddexp
         normal(0.0, 1.0).logpdf(phi1) + normal(3.0, 1.0).logpdf(phi2) +
         normal(0.0, 1.0).logpdf(lam1) + normal(3.0, 1.0).logpdf(lam2)
 
-    # Forward algorithm. gamma[1, k] = N(u₁|φₖ,τ) + N(v₁|λₖ,ρ) (per-state
-    # emission, no initial distribution); for t ≥ 2,
+    # Forward algorithm, valid for every N ≥ 1 allowed by Stan's data contract.
+    # gamma[1, k] = N(u₁|φₖ,τ) + N(v₁|λₖ,ρ) (per-state emission, no initial
+    # distribution); for t ≥ 2,
     #   gamma[t, k] = logsumexp_i(gamma[t-1, i] + logtheta[i, k]) + emitₖ(uₜ, vₜ).
-    # The observation stream `obs = [u v]` is raw host data, so the scan iterates
-    # its rows as host per-step (uₜ, vₜ) and the K-vector belief state is the
-    # only traced carry. The two normal emission log-densities are inlined
-    # (matching Stan's `normal_lpdf`) as a whole-vector expression over the K
-    # states, so nothing scalar-indexes a traced array inside the loop.
+    # The scan runs over ALL N observation rows — never an empty tail, so N = 1
+    # is a first-class case — with an identity-in-log-space first transition:
+    # the raw streams are widened in-graph with a 0/1 mask column (first row 0,
+    # later rows 1) and the carry is seeded with the uniform initial log mass
+    # [-log K, -log K]. At t = 1 the masked transition contributes nothing and
+    # logsumexp(seed) = 0, so gamma[1] is exactly Stan's bare emission vector;
+    # every later row applies the real transition. The two normal emission
+    # log-densities are inlined (matching Stan's `normal_lpdf`) as whole-vector
+    # expressions over the K states, so nothing scalar-indexes a traced array
+    # inside the loop.
     obs::Matrix{Float64} = hcat(u, v)
+    n::Int = size(obs, 1)
+    first_mask::Vector{Float64} = vcat([0.0], ones(n - 1))
+    scan_rows::Matrix{Float64} = hcat(obs, first_mask)
     c_u::Float64 = -0.5 * log(2π) - log(tau)
     c_v::Float64 = -0.5 * log(2π) - log(rho)
-    emit1::Vector{Float64} =
-        c_u .- 0.5 .* ((u[1] .- phi) ./ tau) .^ 2 .+
-        c_v .- 0.5 .* ((v[1] .- lambda) ./ rho) .^ 2
-    tail::Matrix{Float64} = obs[2:size(obs, 1), :]
+    logk::Float64 = log(2.0)
+    uniform_log_mass::Vector{Float64} = [-logk, -logk]
     forward::Vector{Float64} =
-        scan(eachrow(tail), Ref(logtheta), Ref(phi), Ref(lambda),
+        scan(eachrow(scan_rows), Ref(logtheta), Ref(phi), Ref(lambda),
              Ref(c_u), Ref(c_v), Ref(tau), Ref(rho);
-             init = emit1) do carry, row, lt, ph, la, cu, cv, t, r
+             init = uniform_log_mass) do carry, row, lt, ph, la, cu, cv, t, r
             emit = cu .- 0.5 .* ((row[1] .- ph) ./ t) .^ 2 .+
                    cv .- 0.5 .* ((row[2] .- la) ./ r) .^ 2
-            transitioned = carry .+ lt
+            transitioned = carry .+ row[3] .* lt
             newg = vec(mapslices(logsumexp, transitioned; dims = 1)) .+ emit
             (newg, logsumexp(newg))
         end

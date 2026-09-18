@@ -10,9 +10,16 @@ and `ordered` emission means `phi`, `lambda`. The likelihood is the
 **forward-algorithm marginal** over the latent state path, an irreducibly
 sequential K-vector recursion, authored inline with the
 [`scan` primitive](scan.md): the carry is the per-state log-belief vector, the
-iterated sequence is the bound two-stream observation matrix
-(`scan(eachrow(tail), …)`), and the step updates
-`gamma[k] = logsumexp_j(gamma[j] + logtheta[j,k]) + emit_k(u_t, v_t)`. The
+iterated sequence is the bound two-stream observation matrix widened with a
+0/1 first-step mask column (`scan(eachrow(scan_rows), …)`), and the step updates
+`gamma[k] = logsumexp_j(gamma[j] + mask_t·logtheta[j,k]) + emit_k(u_t, v_t)`
+(the compiled module's `stablehlo.while` count is measured per query shape —
+see the Reactant section — not asserted from other models).
+The masked first step is the identity in log space (the carry is seeded with
+the uniform initial log mass, so `logsumexp(seed) = 0`), which reproduces
+Stan's bare first-emission vector exactly and keeps the graph valid for every
+`N ≥ 1` in the model's data contract — `N = 1` included — without any special
+case. The
 transition rows use the Stan 2.39 inverse-ILR simplex transform and the
 emission means the `ordered` transform, both with their exact
 change-of-variables Jacobians; the transit prior reuses the shared Dirichlet
@@ -28,7 +35,7 @@ The complete runnable source is
 \gamma_{1k} &= \log N(u_1 \mid \phi_k, \tau) + \log N(v_1 \mid \lambda_k, \rho),\\
 \gamma_{tk} &= \log\sum_j \exp\!\big(\gamma_{t-1,j} + \log\theta_{jk}\big)
               + \log N(u_t \mid \phi_k, \tau) + \log N(v_t \mid \lambda_k, \rho),\\
-\ell &= \log\sum_k \gamma_{Tk}, \qquad
+\ell &= \log\sum_k \exp(\gamma_{Nk}), \qquad
 \theta_k \sim \operatorname{Dirichlet}(\alpha_k),\quad
 \phi_1, \lambda_1 \sim N(0,1),\quad \phi_2, \lambda_2 \sim N(3,1).
 \end{aligned}
@@ -37,8 +44,9 @@ The complete runnable source is
 ```text
 unconstrained ──► simplex rows (inverse-ILR) ──► theta1, theta2 ──► logtheta
              ├─► ordered phi, lambda ──────────► emission means
-u, v ──► obs = [u v] ──► tail rows ──► scan(carry = K-vector log-belief)
-                                          │  (stablehlo.while, no unrolling)
+u, v ──► scan_rows = [u v mask] ──► scan(carry = K-vector log-belief)
+                                          │  (compiled HLO shape measured per
+                                          │   query; valid for every N ≥ 1)
 log prior + log Jacobian + forward log-likelihood ──► unconstrained log density
 ```
 
@@ -54,27 +62,31 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
 
 ## Reactant
 
-The natural forward recursion **lowers through Reactant**: the `scan` carry
-threads the K-vector log-belief state, every per-step quantity is a
-whole-vector expression over the shared parameter vectors, and the compiled
-primal matches the native density exactly on the full real data
-(`benchmark/structured_gate.jl`, axis 3).
+The natural forward recursion **lowers through Reactant**, and the two query
+boundaries are measured separately (`benchmark/structured_gate.jl`, axes 3a/3b):
+the public **all-bound** query (raw `u`/`v`/`alpha`/`tau`/`rho` bound) compiles
+and matches the native density exactly, with the compiler specializing the
+recurrence for the query shape — its emitted HLO contains no
+`stablehlo.while` region, and no carry-loop claim is made for it. The
+**traced-stream** query (the same graph with the data ports free and traced)
+also matches native exactly and its compiled HLO is asserted to contain the
+`stablehlo.while` carry loop — the recurrence lowers as one loop on that
+boundary.
 
-The **native plain-Enzyme gradient** axis carries a documented upstream
-limitation (snag `scan-prior-enzym-d67d4ac1`): combining this authored `scan`
-with the model's four-plus distribution-endpoint prior terms trips Enzyme's
-*static* activity analysis — plain `Enzyme.Reverse` fails
-`EnzymeRuntimeActivityError`, while the same graph's components, the same
+The **native plain-Enzyme reverse gradient** is a documented UNSUPPORTED axis
+(snag `scan-prior-enzym-d67d4ac1`): it fails Enzyme's *static* activity
+analysis (`EnzymeRuntimeActivityError`) under both the ordinary and
+Const-annotated configurations, while the same graph's components, the same
 priors without the scan, and a three-prior scan control all pass, and
-`Enzyme.set_runtime_activity(Reverse)` matches BridgeStan's gradient to
-~2e-11 relative. The Reactant **primal** and the Reactant-compiled
-**gradient** both pass in `benchmark/structured_gate.jl` (the compiled
-gradient matches Stan to ~2e-11); the compiled gradient is order-sensitive —
-on a first trace it can hit the same static-activity error, and exercising the
-runtime-activity native axis first lets the identical compile+execute succeed —
-so the gate pins that exact order and reports the sensitivity. The gate also
-asserts the documented native failure signature itself, so neither a
-regression nor a quiet fix can hide.
+`Enzyme.set_runtime_activity` matches BridgeStan's gradient. The
+Reactant-compiled gradient is measured in its own isolated process (no native
+gradient work of any mode beforehand); see the gate's per-axis entries for its
+independently reached outcome and exact diagnostics. The runtime-activity
+result and the same-process compile observations are kept as separate,
+explicitly labeled facts in `benchmark/structured_gate_diagnostics.jl` — no
+order-dependence or cache explanation is claimed. The gate pins the documented
+failure signatures on the standard axes so neither a regression nor a quiet fix
+can hide.
 
 Run the walkthrough from the repository root:
 

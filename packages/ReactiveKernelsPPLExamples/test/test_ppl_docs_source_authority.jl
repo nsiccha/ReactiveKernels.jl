@@ -25,6 +25,8 @@ const PPL_SOURCE_CASES = (
      :MVNORMAL_REGRESSION_SOURCE, :evaluate_mvnormal_regression_source),
     ("bound-regression.md", "bound_regression.jl", BoundRegressionExample,
      :BOUND_REGRESSION_SOURCE, :evaluate_bound_regression_source),
+    ("hmm-drive-1.md", "hmm_drive_1.jl", HmmDrive1Example,
+     :HMM_DRIVE_1_SOURCE, :evaluate_hmm_drive_1_source),
 )
 
 # One displayed/executed authority kernel per registered case: a file carrying
