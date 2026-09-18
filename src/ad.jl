@@ -295,6 +295,14 @@ end
     :(getfield(args, $I), ($(contexts...),))
 end
 
+# A native (non-traced) prepared-AD call inside a Reactant trace never reaches
+# native Enzyme: Reactant's autodiff overlay intercepts the call with all-native
+# arguments and the staged derivative comes back a silent zero gradient, while
+# the value stays correct. Every native call boundary checks its already-split
+# point here; the Reactant extension implements the in-trace refusal, and this
+# fallback keeps the core independent of the weak dependency.
+_ad_trace_sanity(point, contexts) = nothing
+
 function _ad_resolve(resolver, args::Tuple, kwargs::NamedTuple)
     resolver(args...; kwargs...)
 end
@@ -557,11 +565,13 @@ function ad_gradient(spec::KernelSpec,
     if !isempty(bound)
         _ad_reject_bound_keywords(NamedTuple(kwargs))
         call, point, contexts, _, _ = _ad_call(kernel, args, active)
+        _ad_trace_sanity(point, contexts)
         return DifferentiationInterface.gradient(call, backend, point, contexts...)
     end
     resolver = _ad_resolver(spec)
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
     call, point, contexts, _, _ = _ad_call(kernel, resolved, active)
+    _ad_trace_sanity(point, contexts)
     DifferentiationInterface.gradient(call, backend, point, contexts...)
 end
 
@@ -572,6 +582,7 @@ function ad_gradient(kernel::PreparedKernel,
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
     call, point, contexts, _, _ = _ad_call(kernel, args, active)
+    _ad_trace_sanity(point, contexts)
     DifferentiationInterface.gradient(call, backend, point, contexts...)
 end
 
@@ -581,7 +592,10 @@ function _ad_prepared_arguments(
     length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
         "values; got $(length(resolved))"))
-    _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    point, contexts =
+        _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    _ad_trace_sanity(point, contexts)
+    point, contexts
 end
 
 function ad_gradient(prepared::PreparedADKernel, args...; kwargs...)
@@ -635,6 +649,7 @@ function ad_pullback(spec::KernelSpec,
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
     call, point, contexts, _, _ =
         _ad_call(kernel, resolved, active; scalar_output = false)
+    _ad_trace_sanity(point, contexts)
     only(DifferentiationInterface.pullback(
         call, backend, point, (seed,), contexts...))
 end
@@ -647,6 +662,7 @@ function ad_pullback(kernel::PreparedKernel,
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
     call, point, contexts, _, _ =
         _ad_call(kernel, args, active; scalar_output = false)
+    _ad_trace_sanity(point, contexts)
     only(DifferentiationInterface.pullback(
         call, backend, point, (seed,), contexts...))
 end
@@ -657,7 +673,10 @@ function _ad_prepared_arguments(
     length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
         "values; got $(length(resolved))"))
-    _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    point, contexts =
+        _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    _ad_trace_sanity(point, contexts)
+    point, contexts
 end
 
 function ad_pullback(prepared::PreparedADPullback, seed, args...; kwargs...)
