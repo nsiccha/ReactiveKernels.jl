@@ -1,12 +1,16 @@
 # Program generator: StructuralPlan → self-contained `@kernel` program.
 #
-# Emission order per program: preprocessing recipes (data-only, folded by
-# `bound=`) → layout transforms (unconstrained → constrained) → scalar
-# assignments in topo order → linear predictors → per-response fused
-# likelihoods → prior terms → canonical `prior`/`likelihood`/`log_jacobian`/
-# `posterior` nodes. Likelihoods are whole-vector fused forms (§4a), never
-# per-cell plates. The `@kernel` def is evaluated in the dedicated
-# `PPLGeneratedModels` scope (counter-suffixed binding per build).
+# Emission order per program: layout transforms (unconstrained →
+# constrained) → scalar + derived assignments in topo order → preprocessing
+# recipes (data-only, folded by `bound=`) → linear predictors →
+# per-response plate likelihoods over distribution-kernel endpoints → prior
+# terms → canonical `prior`/`likelihood`/`log_jacobian`/`posterior` nodes.
+# Recipes sit after assignments because design/offset blocks may reference
+# derived-column locals; folding is input-driven, so position changes
+# nothing for data-only recipes. Plates compile to allocation-free loops
+# with shared work hoisted; constraining stays hand-rolled (no bijectors).
+# The `@kernel` def is evaluated in the dedicated `PPLGeneratedModels` scope
+# (counter-suffixed binding per build).
 
 """
     build_kernel(plan) -> (; spec, layout)
@@ -18,6 +22,8 @@ with `have=(:unconstrained, data…)`); `layout` is its
 """
 function build_kernel(plan::StructuralPlan)
     validate_plan(plan)
+    isbound(plan) || throw(ContractValidationError(
+        "[generator] build_kernel requires a bound plan (bind_data first)"))
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
@@ -32,12 +38,14 @@ Pure (no eval): the generator tests inspect and evaluate it.
 """
 function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
     validate_plan(plan)
+    isbound(plan) || throw(ContractValidationError(
+        "[generator] kernel_expr requires a bound plan (bind_data first)"))
     stmts = Expr[]
-    append!(stmts, preprocessing_recipes(plan))
     for e in layout.entries
         append!(stmts, transform_statements(e))
     end
     append!(stmts, _assignment_statements(plan))
+    append!(stmts, preprocessing_recipes(plan))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _likelihood_statements(plan))
     append!(stmts, _prior_statements(plan))
@@ -60,7 +68,14 @@ _data_arg(name::Symbol, col::AbstractVector) =
 # ANY consumer session with no LOAD_PATH dependence. One counter-suffixed
 # binding per build; slice-1 scale makes interning harmless.
 module PPLGeneratedModels
-using ReactiveKernels, SpecialFunctions, LogExpFunctions
+using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
+    beta, inverse_gamma
+# Selective (explicit imports win over any re-export chain, so no `using`
+# ambiguity if ReactiveKernels ever exports these too): the only Statistics
+# names in the assignment allowlist.
+using Statistics: mean, std, var
 end
 
 const _MODEL_COUNTER = Ref(0)
@@ -76,11 +91,15 @@ function _eval_kernel_def(def::Expr)
     return Core.eval(PPLGeneratedModels, name)
 end
 
-# Scalar assignments in topo order (params already constrained above, so
-# every scalar name resolves). Unannotated: Int temporaries (e.g. `length`)
+# Scalar + derived assignments in topo order (params already constrained
+# above, so every scalar name resolves; derived columns resolve as locals
+# for the recipes below). Unannotated: Int temporaries (e.g. `length`)
 # must not meet a Float64 assertion.
 function _assignment_statements(plan::StructuralPlan)
-    by_name = Dict{Symbol,AssignmentSpec}(a.name => a for a in plan.assignments)
+    by_name = Dict{Symbol,Any}(a.name => a for a in plan.assignments)
+    for d in plan.derived
+        by_name[d.name] = d
+    end
     return Expr[:($(name) = $(by_name[name].expr))
         for name in topological_order(plan) if haskey(by_name, name)]
 end
@@ -121,164 +140,169 @@ function _likelihood_statements(plan::StructuralPlan)
     return stmts
 end
 
-# One fused whole-vector likelihood node per response (plus a shared lambda
-# node for Poisson+evidence). Triples 2 and 3 (Bernoulli-logit) lower
-# identically; the triple only selects the form.
+# One plate likelihood per response (pointwise plate + scalar sum node).
+# Triples 2 and 3 (Bernoulli-logit) lower identically; the triple only
+# selects the form.
 function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     node = _lik_name(r.label)
-    y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    pw = _pw_name(r.label)
     if r.family === GaussianFam
-        return Expr[:($node::Float64 = $(_gaussian_body(r, y, lp)))]
+        return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliLogitFam
-        return Expr[:($node::Float64 = $(_bernoulli_body(r, y, lp)))]
+        return _bernoulli_plate_stmts(r, plan, node, pw)
     else
-        return _poisson_stmts(r, node, y, lp)
+        return _poisson_plate_stmts(r, plan, node, pw)
     end
 end
 
 _predictor(plan::StructuralPlan, name::Symbol) =
     only(p for p in plan.predictors if p.name === name)
 
-_scale_expr(r::LikelihoodSpec) = r.scale # Symbol ref or Real literal, both spliceable
+_dovar(i::Int) = Symbol(:_ppl_c, i)
+_pw_name(label::Symbol) = Symbol(:_ppl_pw_, label)
 
-function _gaussian_body(r::LikelihoodSpec, y::Symbol, lp::Symbol)
-    s = _scale_expr(r)
-    base = if r.weights === nothing
-        :(-0.5 * (length($y) * log(2 * pi) + 2 * length($y) * log($s) +
-            sum(($y .- $lp) .^ 2) / $s ^ 2))
-    else
-        w = r.weights
-        :(-0.5 * (sum($w) * log(2 * pi) + 2 * sum($w) * log($s) +
-            sum($w .* ($y .- $lp) .^ 2) / $s ^ 2))
+# `pointwise = plate(inputs...) do dovars...; cell; end` + scalar sum node.
+# A plate must be a whole recipe RHS (never nested under `sum`), and the
+# do-block body carries a LineNumberNode or the cell types as Any. Response
+# `y` and predictor `lp` are always inputs 1-2 (`_ppl_c1/_ppl_c2`).
+function _plate_sum_stmts(pointwise::Symbol, node::Symbol, inputs::Vector{Any}, cell::Expr)
+    dovars = [_dovar(i) for i in eachindex(inputs)]
+    body = Expr(:block, LineNumberNode(0, :generator), cell)
+    lambda = Expr(:(->), Expr(:tuple, dovars...), body)
+    doex = Expr(:do, Expr(:call, :plate, inputs...), lambda)
+    return Expr[:($pointwise = $doex), :($node::Float64 = sum($pointwise))]
+end
+
+# Thread a Symbol ref as a plate input (returning its do-var); Real
+# literals inline (`as_int` for Poisson bounds — validated integer-valued).
+function _thread_ref!(inputs::Vector{Any}, ref, as_int::Bool = false)
+    if ref isa Symbol
+        push!(inputs, ref)
+        return _dovar(length(inputs))
     end
-    kind = r.evidence.kind
+    return as_int ? Int(ref) : Float64(ref)
+end
+
+# Thread Symbol bounds (do-vars), inline Real bounds; nothing stays nothing.
+function _thread_bounds!(inputs::Vector{Any}, ev::ResponseEvidence, as_int::Bool)
+    lb = ev.lower === nothing ? nothing : _thread_ref!(inputs, ev.lower, as_int)
+    ub = ev.upper === nothing ? nothing : _thread_ref!(inputs, ev.upper, as_int)
+    return (lb, ub)
+end
+
+function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    inputs = Any[y, lp]
+    yv, lpv = _dovar(1), _dovar(2)
+    sref = _thread_ref!(inputs, r.scale)
+    lb, ub = _thread_bounds!(inputs, r.evidence, false)
+    base = :(normal($lpv, $sref).logpdf($yv))
+    cell = _gaussian_cell(r.evidence.kind, base, yv, lb, ub, lpv, sref)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
+end
+
+function _gaussian_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, lpv::Symbol, sref)
     kind === :none && return base
-    kind === :truncated &&
-        return :($base - sum($(_weighted_cells(r, _gaussian_trunc_cells(r, y, lp, s)))))
-    kind === :censored &&
-        return :(sum($(_weighted_cells(r, _gaussian_cens_cells(r, y, lp, s)))))
-    return :(sum($(_weighted_cells(r, _gaussian_ival_cells(r, y, lp, s)))))
-end
-
-# Φ(bound) vector over rows via Φ(z) = 0.5*erfc(-z/√2), or nothing when that
-# side is unbounded. Bounds cross as literals or columns; both splice
-# uniformly. Missing sides are statically omitted (the generator knows).
-function _phi_expr(bound, y::Symbol, lp::Symbol, s)
-    bound === nothing && return nothing
-    b = _bound_value(bound)
-    return :(0.5 .* erfc.((.-($b .- $lp)) ./ $s ./ sqrt(2)))
-end
-
-_bound_value(bound::Real) = Float64(bound)
-_bound_value(bound::Symbol) = bound
-
-_weighted_cells(r::LikelihoodSpec, cells) =
-    r.weights === nothing ? cells : :($(r.weights) .* $cells)
-
-function _gaussian_trunc_cells(r::LikelihoodSpec, y::Symbol, lp::Symbol, s)
-    ev = r.evidence
-    phi_lb = _phi_expr(ev.lower, y, lp, s)
-    phi_ub = _phi_expr(ev.upper, y, lp, s)
-    phi_lb === nothing && phi_ub === nothing && return :(0.0)
-    phi_lb === nothing && return :(log.($phi_ub))
-    phi_ub === nothing && return :(log.(1.0 .- $phi_lb))
-    return :(log.($phi_ub .- $phi_lb))
-end
-
-_gaussian_base_cell(y::Symbol, lp::Symbol, s) =
-    :(-0.5 * log(2 * pi) .- log($s) .- 0.5 .* (($y .- $lp) ./ $s) .^ 2)
-
-function _gaussian_cens_cells(r::LikelihoodSpec, y::Symbol, lp::Symbol, s)
-    ev = r.evidence
-    base_cell = _gaussian_base_cell(y, lp, s)
-    phi_lb = _phi_expr(ev.lower, y, lp, s)
-    phi_ub = _phi_expr(ev.upper, y, lp, s)
-    phi_lb === nothing && phi_ub === nothing && return base_cell
-    phi_lb === nothing &&
-        return :(ifelse.($y .> $(_bound_value(ev.upper)), log1p.(-$phi_ub), $base_cell))
-    phi_ub === nothing &&
-        return :(ifelse.($y .< $(_bound_value(ev.lower)), log.($phi_lb), $base_cell))
-    lb = _bound_value(ev.lower)
-    ub = _bound_value(ev.upper)
-    return :(ifelse.($y .< $lb, log.($phi_lb),
-        ifelse.($y .> $ub, log1p.(-$phi_ub), $base_cell)))
-end
-
-function _gaussian_ival_cells(r::LikelihoodSpec, y::Symbol, lp::Symbol, s)
-    # Response is the lower endpoint; contribution = log(Φ_u - Φ_d).
-    phi_d = :(0.5 .* erfc.((.-($y .- $lp)) ./ $s ./ sqrt(2)))
-    phi_u = _phi_expr(r.evidence.upper, y, lp, s)
-    return :(log.($phi_u .- $phi_d))
-end
-
-function _bernoulli_body(r::LikelihoodSpec, y::Symbol, lp::Symbol)
-    cells = :($y .* $lp .- log1pexp.($lp))
-    r.weights === nothing && return :(sum($cells))
-    return :(sum($(r.weights) .* $cells))
-end
-
-function _poisson_stmts(r::LikelihoodSpec, node::Symbol, y::Symbol, lp::Symbol)
-    base_cell = :($y .* $lp .- exp.($lp) .- loggamma.($y .+ 1.0))
-    base = r.weights === nothing ? :(sum($base_cell)) :
-        :(sum($(r.weights) .* $base_cell))
-    r.evidence.kind === :none &&
-        return Expr[:($node::Float64 = $base)]
-    lam = Symbol(:_ppl_lambda_, r.label)
-    lam_stmt = :($lam = exp.($lp))
-    body = if r.evidence.kind === :truncated
-        :($base - sum($(_weighted_cells(r, _poisson_trunc_cells(r, y, lam)))))
-    elseif r.evidence.kind === :interval_censored
-        :($(_sum_expr(r, _poisson_ival_cells(r, y, lam))))
-    else
-        :($(_sum_expr(r, _poisson_cens_cells(r, y, lp, lam))))
+    nccdf(b) = :(normal($lpv, $sref).cdf($b))
+    if kind === :truncated
+        corr = if lb === nothing && ub === nothing
+            return base
+        elseif lb === nothing
+            :(log($(nccdf(ub))))
+        elseif ub === nothing
+            :(log(1.0 - $(nccdf(lb))))
+        else
+            :(log($(nccdf(ub)) - $(nccdf(lb))))
+        end
+        return :($base - $corr)
+    elseif kind === :censored
+        if lb === nothing && ub === nothing
+            return base
+        elseif lb === nothing
+            return :(ifelse($yv > $ub, log1p(-$(nccdf(ub))), $base))
+        elseif ub === nothing
+            return :(ifelse($yv < $lb, log($(nccdf(lb))), $base))
+        else
+            return :(ifelse($yv < $lb, log($(nccdf(lb))),
+                ifelse($yv > $ub, log1p(-$(nccdf(ub))), $base)))
+        end
+    else # :interval_censored
+        return :(log($(nccdf(ub)) - $(nccdf(yv))))
     end
-    return Expr[lam_stmt, :($node::Float64 = $body)]
 end
 
-_sum_expr(r::LikelihoodSpec, cells) = :(sum($(_weighted_cells(r, cells))))
-
-# Poisson CDF via the regularized upper gamma (DistributionKernels
-# precedent): P(k,λ) = last(gamma_inc(k+1, λ)), guarded for k < 0.
-function _poisson_cdf_expr(k, lam::Symbol)
-    return :(ifelse.($k .< 0, 0.0,
-        last.(gamma_inc.(max.($k, 0) .+ 1.0, $lam))))
+function _bernoulli_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    inputs = Any[y, lp]
+    yv, etav = _dovar(1), _dovar(2)
+    col = plan.columns[y]
+    # Validated Bool-or-0/1-Int; the endpoint takes Bool.
+    yref = eltype(col) === Bool ? yv : :($yv != 0)
+    cell = :(bernoulli(; logit = $etav).logpdf($yref))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
 end
 
-function _poisson_trunc_cells(r::LikelihoodSpec, y::Symbol, lam::Symbol)
-    ev = r.evidence
-    pu = ev.upper === nothing ? nothing :
-        _poisson_cdf_expr(_bound_value(ev.upper), lam)
-    pl = ev.lower === nothing ? nothing :
-        _poisson_cdf_expr(_bound_value(ev.lower), lam)
-    pu === nothing && pl === nothing && return :(0.0)
-    pu === nothing && return :(log.(1.0 .- $pl))
-    pl === nothing && return :(log.($pu))
-    return :(log.($pu .- $pl))
+function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    inputs = Any[y, lp]
+    yv, etav = _dovar(1), _dovar(2)
+    lb, ub = _thread_bounds!(inputs, r.evidence, true)
+    base = :(poisson(; log_rate = $etav).logpdf($yv))
+    cell = _poisson_cell(r.evidence.kind, base, yv, lb, ub, etav)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
 end
 
-function _poisson_ival_cells(r::LikelihoodSpec, y::Symbol, lam::Symbol)
-    pu = _poisson_cdf_expr(_bound_value(r.evidence.upper), lam)
-    pd = _poisson_cdf_expr(y, lam)
-    return :(log.($pu .- $pd))
-end
+# Lower-side cdf argument for the inclusive discrete cdf: the mass below
+# lb is F(lb - 1), so truncated/censored low arms and interval cells shift
+# their lower argument by one. Int literals fold; do-vars convert via Int
+# (cdf takes Int, which also hardens non-Int Integer columns). The kernel's
+# `observed >= 0` guard maps -1 to 0.0, so no clamp is needed.
+_poisson_below(b::Int) = b - 1
+_poisson_below(b::Symbol) = :(Int($b) - 1)
 
-function _poisson_cens_cells(r::LikelihoodSpec, y::Symbol, lp::Symbol, lam::Symbol)
-    ev = r.evidence
-    base_cell = :($y .* $lp .- exp.($lp) .- loggamma.($y .+ 1.0))
-    pu = ev.upper === nothing ? nothing :
-        _poisson_cdf_expr(_bound_value(ev.upper), lam)
-    pl = ev.lower === nothing ? nothing :
-        _poisson_cdf_expr(_bound_value(ev.lower), lam)
-    pu === nothing && pl === nothing && return base_cell
-    pu === nothing &&
-        return :(ifelse.($y .< $(_bound_value(ev.lower)), log.($pl), $base_cell))
-    pl === nothing &&
-        return :(ifelse.($y .> $(_bound_value(ev.upper)), log1p.(-$pu), $base_cell))
-    lb = _bound_value(ev.lower)
-    ub = _bound_value(ev.upper)
-    return :(ifelse.($y .< $lb, log.($pl),
-        ifelse.($y .> $ub, log1p.(-$pu), $base_cell)))
+function _poisson_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, etav::Symbol)
+    kind === :none && return base
+    pcdf(b) = :(poisson(; log_rate = $etav).cdf($b))
+    if kind === :truncated
+        corr = if lb === nothing && ub === nothing
+            return base
+        elseif lb === nothing
+            :(log($(pcdf(ub))))
+        elseif ub === nothing
+            :(log(1.0 - $(pcdf(_poisson_below(lb)))))
+        else
+            :(log($(pcdf(ub)) - $(pcdf(_poisson_below(lb)))))
+        end
+        return :($base - $corr)
+    elseif kind === :censored
+        if lb === nothing && ub === nothing
+            return base
+        elseif lb === nothing
+            return :(ifelse($yv > $ub, log1p(-$(pcdf(ub))), $base))
+        elseif ub === nothing
+            return :(ifelse($yv < $lb, log($(pcdf(_poisson_below(lb)))), $base))
+        else
+            return :(ifelse($yv < $lb, log($(pcdf(_poisson_below(lb)))),
+                ifelse($yv > $ub, log1p(-$(pcdf(ub))), $base)))
+        end
+    else # :interval_censored
+        return :(log($(pcdf(ub)) - $(pcdf(_poisson_below(yv)))))
+    end
 end
 
 function _prior_statements(plan::StructuralPlan)
@@ -288,14 +312,16 @@ function _prior_statements(plan::StructuralPlan)
         shape = design_shape(pred, plan.columns)
         shape.width == 0 && continue
         node = Symbol(:_ppl_prior_, pred.name)
+        pw = Symbol(:_ppl_pw_prior_, pred.name)
         loc, sca = coefficient_priors(shape, plan.population_priors)
-        locvec = Expr(:vect, loc...)
-        scavec = Expr(:vect, sca...)
+        mut = Symbol(:_ppl_prmu_, pred.name)
+        sdt = Symbol(:_ppl_prsd_, pred.name)
+        push!(stmts, :($mut = Float64[$(loc...)]))
+        push!(stmts, :($sdt = Float64[$(sca...)]))
         coef = block_name(pred.name)
-        push!(stmts,
-            :($node::Float64 = -0.5 * (length($coef) * log(2 * pi) +
-                2 * sum(log.($scavec)) +
-                sum((($coef .- $locvec) ./ $scavec) .^ 2))))
+        cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
+        cell = :(normal($mv, $sv).logpdf($cv))
+        append!(stmts, _plate_sum_stmts(pw, node, Any[coef, mut, sdt], cell))
         push!(terms, node)
     end
     for p in plan.parameters
@@ -308,35 +334,36 @@ function _prior_statements(plan::StructuralPlan)
     return stmts
 end
 
-# Scalar prior log-density per family (Distributions.jl semantics). Args are
-# literals (baked as-is) or parameter/assignment refs (emitted earlier in
-# topo order). Half-Normal/half-Cauchy (the only overrides) renormalize by
-# exactly +log(2) (symmetry at 0).
+# Scalar prior log-density per family via distribution-kernel endpoints
+# (Distributions.jl semantics). Args are literals (inlined) or
+# parameter/assignment refs (body locals, fine in scalar position).
+# Half-Normal/half-Cauchy (the only overrides) renormalize by exactly
+# +log(2) (symmetry at 0). `gamma` takes rate, so the contract's scale
+# inverts.
 function _sampled_prior_expr(p::SampledParameter)
     x = p.name
     a = [v for v in values(p.args)]
     base = if p.family === :normal
         mu, s = a
-        :(-0.5 * log(2 * pi) - log($s) - 0.5 * (($x - $mu) / $s) ^ 2)
+        :(normal($mu, $s).logpdf($x))
     elseif p.family === :cauchy
         mu, s = a
-        :(-log(pi) - log($s) - log(1 + (($x - $mu) / $s) ^ 2))
+        :(cauchy($mu, $s).logpdf($x))
     elseif p.family === :exponential
         (th,) = a
-        :(-log($th) - $x / $th)
+        :(exponential($th).logpdf($x))
     elseif p.family === :gamma
         al, th = a
-        :(-loggamma($al) - $al * log($th) + ($al - 1) * log($x) - $x / $th)
+        :(gamma($al, 1 / $th).logpdf($x))
     elseif p.family === :lognormal
         mu, s = a
-        :(-log($x) - 0.5 * log(2 * pi) - log($s) - 0.5 * ((log($x) - $mu) / $s) ^ 2)
+        :(lognormal($mu, $s).logpdf($x))
     elseif p.family === :beta
         al, be = a
-        :(-(loggamma($al) + loggamma($be) - loggamma($al + $be)) +
-            ($al - 1) * log($x) + ($be - 1) * log1p(-$x))
+        :(beta($al, $be).logpdf($x))
     elseif p.family === :inverse_gamma
         al, th = a
-        :($al * log($th) - loggamma($al) - ($al + 1) * log($x) - $th / $x)
+        :(inverse_gamma($al, $th).logpdf($x))
     else # :flat
         :(0.0)
     end

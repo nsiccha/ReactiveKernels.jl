@@ -52,6 +52,8 @@ then sampled parameters in `plan.parameters` order (pinned, deterministic).
 Assumes `validate_plan` passed.
 """
 function assign_layout(plan::StructuralPlan)
+    isbound(plan) || throw(ContractValidationError(
+        "[layout] assign_layout requires a bound plan (bind_data first)"))
     entries = LayoutEntry[]
     offset = 1
     for pred in plan.predictors

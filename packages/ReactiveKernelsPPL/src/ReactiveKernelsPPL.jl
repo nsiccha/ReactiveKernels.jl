@@ -20,9 +20,12 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam
 export LinkFunction, IdentityLink, LogitLink, LogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
-export PopulationPrior, SampledParameter, AssignmentSpec, StructuralPlan
-export ContractValidationError, validate_plan, topological_order
-export admitted_families, admitted_terms, admitted_functions, supports_term
+export PopulationPrior, SampledParameter, AssignmentSpec, VectorAssignmentSpec
+export StructuralPlan
+export ContractValidationError, validate_plan, validate_structure, validate_data
+export topological_order, isbound, bind_data, COLUMN_ROLES
+export admitted_families, admitted_terms, admitted_functions, admitted_elementwise
+export supports_term
 export block_name
 export build_kernel, kernel_expr
 export DesignShape, DesignBlock, design_shape, coefficient_priors
@@ -34,6 +37,7 @@ export preprocessing_recipes
 export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
+export RKPPLModel, lower_rkppl, @rkppl, SurfaceLoweringError
 
 include("contract.jl")
 include("design.jl")
@@ -41,5 +45,6 @@ include("layout.jl")
 include("preprocessing.jl")
 include("generator.jl")
 include("query.jl")
+include("surface.jl")
 
 end # module ReactiveKernelsPPL

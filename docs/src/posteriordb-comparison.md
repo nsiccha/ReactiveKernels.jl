@@ -260,3 +260,47 @@ Main.ReactiveKernelsDocs.render_all80_batch1_coverage_plot()
 ```@eval
 Main.ReactiveKernelsDocs.render_all80_batch1_speedup_plot()
 ```
+
+## IRT incremental additions
+
+Four item-response-theory posteriordb models — `irt_2pl` (2PL, 20 items × 100 persons),
+`2pl_latent_reg_irt` (2PL with latent regression), `hier_2pl` (hierarchical 2PL), and
+`gpcm_latent_reg_irt` (generalized partial-credit with latent regression) — are registered
+against their **existing** upstream Turing `make_model` (pinned DPPL `6378673`,
+`posteriordb_models.jl` SHA256 `a7ef985b…`) and reference posteriordb Stan. There is **no new
+Turing translation**: the comparators already existed, so this is a pure RK-side addition.
+
+They are measured into a **separate** receipt (`all80-irt-v1.toml`) — a **union** rendered
+alongside the immutable 82-row checkpoint above, never merged into it. Unlike the historical
+batch-1 run, this measurement is ordinary-AE certified: both phases recorded backend
+configuration and loaded-module certification under one run id. The frozen-82 default sweep
+excludes these four, so its receipt is byte-for-byte unchanged.
+
+**Declared Turing offsets (`off_tu = Stan − Turing`), derived from source and gate-verified
+(measured == declared):** all four are **0** — every Stan density is untruncated (no `lccdf`
+anywhere in the four `.stan` files) and the Turing side matches term-by-term (zero-contributing
+`Flat`/`FlatPos` plus manual untruncated densities, replicated covariate adjustments, identical
+Bernoulli/PCM likelihoods).
+
+The RK graphs' own value/gradient parity against reference Stan (BridgeStan, `propto=false`,
+`jacobian=true`) is separately certified at identity parameter order by
+`packages/ReactiveKernelsPPLExamples/test/acceptance_irt_four_axis.jl`. All sides do
+observation-level work — there is no workload-mismatch series in this batch. Same observed-load
+timing provenance and per-side-support caveats as the 82 apply; no separate quiet-window timing
+pass was run.
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_irt_summary()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_irt_tables()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_irt_coverage_plot()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_irt_speedup_plot()
+```
