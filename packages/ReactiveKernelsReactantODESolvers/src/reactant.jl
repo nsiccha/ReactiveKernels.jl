@@ -105,7 +105,9 @@ branches on traced values. Hyperparameters (`dt_init`, tolerances,
 `maxiters`, saveat times) are compile-time constants; the adaptive
 step-size sequence itself is computed inside the program.
 
-Gradient recipe: differentiate a scalar loss over the compiled solve with
+Gradient recipe: prefer [`compile_backsolve_gradient`](@ref), which
+re-solves the adjoint ODE backward in a second early-exit compiled program
+(no differentiation through the adaptive loop). The manual alternative is
 plain `Enzyme.autodiff(::Reverse, ...)` *inside* a second compiled function;
 Reactant's Enzyme overlay lowers the pullback into the program. Build that
 closure with `early_exit=false` (Binomial-checkpointed reverse requires the
@@ -117,6 +119,42 @@ function compile_ode_solve end
 function compile_ode_solve(args...; kwargs...)
     throw(ArgumentError(
         "compile_ode_solve requires Reactant.jl to be loaded " *
+        "(the Reactant extension is inactive)"))
+end
+
+"""
+    compile_backsolve_gradient(f, u0_example, p_example, ::Tsit5,
+                               config::ReactantTsit5Config; loss=:endpoint)
+
+Compile a backsolve-style adjoint gradient for the fixed-shape solve
+described by `config` (requires Reactant.jl; implemented by the package
+extension). `u0_example` fixes the state dimension and element type;
+`p_example` is either `nothing` or an example parameter vector, as in
+[`compile_ode_solve`](@ref).
+
+`loss` selects the scalar loss over the compiled forward solve:
+
+- `:endpoint`: `sum(endpoint)`, one backward segment `t1 → t0`;
+- `:saveat`: `sum(saveat_matrix)`, one backward segment per saveat interval
+  with the adjoint jumping by `1` at each saveat point.
+
+Returns a callable: `grad(u0)` (or `grad(u0, p)`) runs the forward compiled
+solve, then re-solves the augmented `[u; λ; μ]` adjoint system backward in
+compiled reverse-time programs, and returns `(grad_u0, grad_p)` with plain
+Julia values (`grad_p === nothing` when `p_example === nothing`).
+
+Both directions run the early-exit primal loop. The only
+`Enzyme.autodiff` in this path differentiates the loop-free RHS `f` once
+per stage evaluation (a vector-Jacobian product lowered to straight-line
+code inside the step); nothing differentiates through the adaptive while
+loop, so the freeze shape is never needed. A non-successful forward or
+backward solve throws an `ErrorException` (there is no trajectory to adjoin).
+"""
+function compile_backsolve_gradient end
+
+function compile_backsolve_gradient(args...; kwargs...)
+    throw(ArgumentError(
+        "compile_backsolve_gradient requires Reactant.jl to be loaded " *
         "(the Reactant extension is inactive)"))
 end
 

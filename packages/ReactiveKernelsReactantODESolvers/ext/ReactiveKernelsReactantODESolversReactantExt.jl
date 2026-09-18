@@ -245,4 +245,96 @@ function RKRO.compile_ode_solve(f, u0_example::AbstractVector,
     p_example === nothing ? (u0,) -> solved(u0) : (u0, p) -> solved(u0, p)
 end
 
+# Augmented backsolve RHS over `w = [u; λ; μ]`: the state re-solves `f`
+# backward in time, the adjoint integrates `dλ/dt = -Jᵀλ`, and the parameter
+# quadrature `dμ/dt = -(λᵀf_p)` so `μ(t0) = dL/dp`. The VJP pair comes from
+# one `Enzyme.autodiff` over the loop-free RHS per stage evaluation (lowered
+# to straight-line code inside the step by Reactant's Enzyme overlay — the
+# same closure-in-autodiff pattern the through-while recipe uses, probed
+# minimal inside a `@trace while` body before building on it). Nothing here
+# differentiates through the adaptive loop. Reached through
+# `Reactant.Enzyme` (identical to the `Enzyme` module object), so the
+# extension needs no new dependency.
+function _backsolve_rhs(f, n::Int, m::Int, ::Type{T}) where {T<:AbstractFloat}
+    zT = zero(T)
+    sdot = (uu, pp, ll, tt) -> sum(f(uu, pp, tt) .* ll)
+    sdot_nop = (uu, ll, tt) -> sum(f(uu, nothing, tt) .* ll)
+    r1 = 1:n
+    r2 = (n + 1):(2n)
+    EA = Reactant.Enzyme
+    function aug(w, p, t)
+        u = w[r1]
+        lam = w[r2]
+        fwd = f(u, p, t)
+        jtu = u .* zT
+        if m == 0
+            # Concrete branch: `m` is a closure constant, never traced.
+            EA.autodiff(EA.Reverse, EA.Const(sdot_nop), EA.Active,
+                EA.Duplicated(u, jtu), EA.Const(lam), EA.Const(t))
+            vcat(fwd, .-jtu)
+        else
+            jtp = p .* zT
+            EA.autodiff(EA.Reverse, EA.Const(sdot), EA.Active,
+                EA.Duplicated(u, jtu), EA.Duplicated(p, jtp),
+                EA.Const(lam), EA.Const(t))
+            vcat(fwd, .-jtu, .-jtp)
+        end
+    end
+    aug
+end
+
+function RKRO.compile_backsolve_gradient(f, u0_example::AbstractVector,
+        p_example, ::RKRO.Tsit5, cfg::RKRO.ReactantTsit5Config;
+        loss::Symbol=:endpoint)
+    loss === :endpoint || loss === :saveat ||
+        throw(ArgumentError("loss must be :endpoint or :saveat, got $loss"))
+    T = typeof(cfg.t0)
+    n = length(u0_example)
+    m = p_example === nothing ? 0 : length(p_example)
+    forward = RKRO.compile_ode_solve(f, u0_example, p_example, RKRO.Tsit5(),
+        cfg)
+    aug = _backsolve_rhs(f, n, m, T)
+    w_example = zeros(T, 2n + m)
+    # Backward journey, latest first: `:endpoint` re-solves `t1 → t0` in one
+    # segment with `λ(t1) = 1`; `:saveat` walks `t1 → … → t0` segment by
+    # segment and jumps `λ` by `1` at each saveat point (sum loss). Every
+    # segment is an early-exit primal; each compiles one interior saveat time
+    # (a driver requirement), a midpoint column that is discarded.
+    bounds = loss === :endpoint ? [cfg.t1, cfg.t0] :
+        reverse!([cfg.t0; cfg.saveat; cfg.t1])
+    nseg = length(bounds) - 1
+    segs = map(1:nseg) do i
+        a, b = bounds[i], bounds[i + 1]
+        lo, hi = minmax(a, b)
+        mid = (lo + hi) / 2
+        lo < mid < hi || throw(ArgumentError(
+            "backsolve segment ($a → $b) admits no interior saveat time"))
+        bcfg = RKRO.ReactantTsit5Config((a, b); abstol=cfg.abstol,
+            reltol=cfg.reltol, dt=cfg.dt_init, dtmax=cfg.dtmax,
+            maxiters=cfg.maxiters, saveat=[mid])
+        seg = RKRO.compile_ode_solve(aug, w_example, p_example, RKRO.Tsit5(),
+            bcfg)
+        (seg, loss === :saveat && i < nseg)
+    end
+    gr2 = (n + 1):(2n)
+    gr3 = (2n + 1):(2n + m)
+    function run(u0v, pv)
+        ep, _, fst = pv === nothing ? forward(u0v) : forward(u0v, pv)
+        fst == 0 || error("backsolve gradient needs a successful forward " *
+                          "solve, got status $fst (t1 not reached)")
+        w = vcat(ep, loss === :endpoint ? ones(T, n) : zeros(T, n),
+            zeros(T, m))
+        for (seg, jump) in segs
+            wend, _, bst = pv === nothing ? seg(w) : seg(w, pv)
+            bst == 0 || error("backsolve gradient: a backward segment " *
+                              "failed with status $bst")
+            w = wend
+            jump && (w[gr2] .+= one(T))
+        end
+        (w[gr2], m == 0 ? nothing : w[gr3])
+    end
+    p_example === nothing ? (u0v,) -> run(u0v, nothing) :
+        (u0v, pv) -> run(u0v, pv)
+end
+
 end # module ReactiveKernelsReactantODESolversReactantExt
