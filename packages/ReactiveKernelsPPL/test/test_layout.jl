@@ -19,8 +19,7 @@ function _layout_plan()
         TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
                 :intercept),
             TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term),
-            TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 1), :g,
-                :g_term)],
+            TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term)],
         :mu)]
     priors = PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
         PopulationPrior(:mu, :x, 0.0, 2.0),
@@ -31,29 +30,34 @@ function _layout_plan()
     ]
     resps = LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu,
         :sigma, nothing, ResponseEvidence(:none, nothing, nothing), :y_resp)]
-    plan = StructuralPlan(resps, preds, priors, params, AssignmentSpec[], cols, n)
+    maps = LevelMap[LevelMap(:mu, :g, [2, 3], :levels, (2, :end))]
+    plan = StructuralPlan(resps, preds, priors, params, AssignmentSpec[], cols,
+        n; levelmaps = maps)
     validate_plan(plan)
     return plan
 end
 
 @testset "design shapes" begin
     plan = _layout_plan()
-    shape = design_shape(plan.predictors[1], plan.columns)
+    shape = design_shape(plan.predictors[1], plan.columns;
+        levelmaps = plan.levelmaps)
     @test shape.predictor === :mu
-    @test shape.width == 4 # intercept + x + 2 contrasts (3 levels, ref 1)
+    @test shape.width == 4 # intercept + x + 2 mapped levels ([2, 3] subset)
     @test [b.width for b in shape.blocks] == [1, 1, 2]
-    @test shape.blocks[3].levels == [1, 2, 3]
+    @test shape.blocks[3].levels == [2, 3]
     @test shape.blocks[3].labels == [:g_2, :g_3]
     loc, sca = coefficient_priors(shape, plan.population_priors)
     @test loc == [0.0, 0.0, 0.0, 0.0]
     @test sca == [1.0, 2.0, 0.5, 0.5]
-    # ref = 2 drops level 2 instead.
+    # Explicit index subset maps levels 1 and 3 instead.
     pred2 = PredictorSpec(:mu, IdentityLink,
-        TermSpec[TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 2),
-            :g, :g_term)],
+        TermSpec[TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term)],
         :mu)
-    shape2 = design_shape(pred2, plan.columns)
+    maps2 = LevelMap[LevelMap(:mu, :g, [1, 3], :levels, [1, 3])]
+    shape2 = design_shape(pred2, plan.columns; levelmaps = maps2)
     @test shape2.blocks[1].labels == [:g_1, :g_3]
+    # Factor terms without a map are loud.
+    @test_throws ContractValidationError design_shape(pred2, plan.columns)
     # Duplicate coefficient labels are loud.
     preddup = PredictorSpec(:mu, IdentityLink,
         TermSpec[TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x1),

@@ -183,6 +183,114 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+function _gen_binomial_plan(y, trials)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    tr = if trials isa AbstractVector
+        cols[:n] = trials
+        :n
+    else
+        trials
+    end
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BinomialLogitFam, LogitLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp, tr, nothing)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_binomial(cols, nvec, coef)
+    eta = coef[1] .+ coef[2] .* cols[:x]
+    p = 1 ./ (1 .+ exp.(-eta))
+    ll = sum(logpdf.(Binomial.(nvec, p), cols[:y]))
+    pr = logpdf(Normal(0, 1), coef[1]) + logpdf(Normal(0, 2), coef[2])
+    return (; ll, pr)
+end
+
+@testset "binomial values and gradient" begin
+    y = [1, 0, 2, 1, 3, 2]
+    for trials in ([3, 2, 4, 3, 5, 4], 5)
+        plan = _gen_binomial_plan(y, trials)
+        built = build_kernel(plan)
+        u = [0.25, 0.5]
+        nt = constrain(built.layout, u)
+        nvec = trials isa AbstractVector ? trials : fill(trials, 6)
+        ref = _ref_binomial(plan.columns, nvec, Vector(nt.eta))
+        @test _query(built.spec, plan, :posterior, u) ≈ ref.ll + ref.pr
+    end
+    plan = _gen_binomial_plan(y, [3, 2, 4, 3, 5, 4])
+    built = build_kernel(plan)
+    _check_gradient(built.spec, plan, [0.25, 0.5])
+end
+
+function _gen_nb2_plan()
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 1, 3, 2]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(NegativeBinomial2Fam, LogLink, :y, :eta,
+            :phi, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[SampledParameter(:phi, :exponential, (arg1 = 1.0,),
+            nothing, :phi)],
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_nb2(cols, coef, phi)
+    mu = exp.(coef[1] .+ coef[2] .* cols[:x])
+    ll = sum(logpdf.(NegativeBinomial.(phi, phi ./ (phi .+ mu)), cols[:y]))
+    pr = logpdf(Normal(0, 1), coef[1]) + logpdf(Normal(0, 2), coef[2]) +
+        logpdf(Exponential(1), phi)
+    return (; ll, pr)
+end
+
+@testset "nb2 values and gradient" begin
+    plan = _gen_nb2_plan()
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    ref = _ref_nb2(plan.columns, Vector(nt.eta), nt.phi)
+    @test _query(built.spec, plan, :posterior, u) ≈ ref.ll + ref.pr + u[3]
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_gamma_plan()
+    cols, n = _gen_columns()
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(GammaLogFam, LogLink, :y, :eta,
+            :alpha, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[SampledParameter(:alpha, :exponential, (arg1 = 1.0,),
+            nothing, :alpha)],
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_gamma(cols, coef, alpha)
+    mu = exp.(coef[1] .+ coef[2] .* cols[:x])
+    ll = sum(logpdf.(Gamma.(alpha, mu ./ alpha), cols[:y]))
+    pr = logpdf(Normal(0, 1), coef[1]) + logpdf(Normal(0, 2), coef[2]) +
+        logpdf(Exponential(1), alpha)
+    return (; ll, pr)
+end
+
+@testset "gamma values and gradient" begin
+    plan = _gen_gamma_plan()
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    ref = _ref_gamma(plan.columns, Vector(nt.eta), nt.alpha)
+    @test _query(built.spec, plan, :posterior, u) ≈ ref.ll + ref.pr + u[3]
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "factor values (int and string groupings)" begin
     for g in ([1, 2, 1, 3, 2, 3], ["a", "b", "a", "c", "b", "c"])
         cols, n = _gen_columns()
@@ -190,9 +298,10 @@ end
         pred = PredictorSpec(:mu, IdentityLink,
             TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
                     :Intercept, :intercept),
-                TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 1),
-                    :g, :g_term)],
+                TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term)],
             :mu)
+        levs = sort(unique(g))
+        maps = LevelMap[LevelMap(:mu, :g, levs[2:end], :levels, (2, :end))]
         plan = StructuralPlan(
             LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu,
                 :sigma, nothing, _none_evidence(), :y_resp)],
@@ -201,7 +310,7 @@ end
                 PopulationPrior(:mu, :g, 0.0, 0.5)],
             SampledParameter[SampledParameter(:sigma, :exponential,
                 (arg1 = 1.0,), nothing, :sigma)],
-            AssignmentSpec[], cols, n)
+            AssignmentSpec[], cols, n; levelmaps = maps)
         built = build_kernel(plan)
         u = [0.3, 0.1, -0.2, 0.0]
         nt = constrain(built.layout, u)
