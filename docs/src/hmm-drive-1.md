@@ -66,12 +66,17 @@ The natural forward recursion **lowers through Reactant**, and the two query
 boundaries are measured separately (`benchmark/structured_gate.jl`, axes 3a/3b):
 the public **all-bound** query (raw `u`/`v`/`alpha`/`tau`/`rho` bound) compiles
 and matches the native density exactly, with the compiler specializing the
-recurrence for the query shape — its emitted HLO contains no
-`stablehlo.while` region, and no carry-loop claim is made for it. The
-**traced-stream** query (the same graph with the data ports free and traced)
-also matches native exactly and its compiled HLO is asserted to contain the
-`stablehlo.while` carry loop — the recurrence lowers as one loop on that
-boundary.
+recurrence for the query shape. The **traced-stream** query (the same graph
+with the data ports free and traced) also matches native exactly. On the
+ReactiveKernels pin of this tree both boundaries compile with the recurrence
+unrolled (measured `stablehlo.while` count 0 with a non-empty HLO byte-size
+control; no carry-loop claim is asserted for either shape). Upstream
+ReactiveKernels `main` @ `90acd41c` landed the traced `eachrow` while-lowering
+after this pin; once this tree carries it, the traced-stream boundary lowers as
+a single carry loop and the gate's count becomes an assertion. The counts are
+read from `repr(Reactant.@code_hlo ...)` — the same surface the repository's
+authored-scan tests assert on — because `module_string` is empty on the pinned
+Reactant and a count against it would be vacuous.
 
 The **native plain-Enzyme reverse gradient** is a documented UNSUPPORTED axis
 (snag `scan-prior-enzym-d67d4ac1`): it fails Enzyme's *static* activity

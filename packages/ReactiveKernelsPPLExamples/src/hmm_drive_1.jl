@@ -13,8 +13,9 @@ export HMM_DRIVE_1_SOURCE, evaluate_hmm_drive_1_source
 # two observation streams (`u` = 1/speed, `v` = hoop distance), fixed emission
 # standard deviations `tau`, `rho`. The likelihood is the sequential
 # forward-algorithm marginal over the latent state path — a stateful K-vector
-# recursion, authored with `scan` over a K-vector belief-state carry (lowering
-# to a `stablehlo.while` carry loop). The Stan `generated quantities` block is a
+# recursion, authored with `scan` over a K-vector belief-state carry (its
+# compiled HLO shape is query-dependent and measured in the structured gate). The
+# Stan `generated quantities` block is a
 # Viterbi decode of the most-likely path; it does not enter `target`, so
 # BridgeStan's `log_density` (propto=false, jacobian=true) — which this graph
 # reproduces — does not include it, and it is omitted here.
@@ -187,8 +188,9 @@ Build the posteriordb `hmm_drive_1` model as a declarative
 on two observation streams, `simplex` transition rows, `ordered` emission means,
 and fixed emission standard deviations. The marginal likelihood is the
 sequential forward algorithm, authored with a `scan` over a K-vector
-belief-state carry (lowering to a `stablehlo.while` carry loop); the transition
-simplexes use the Stan 2.39 inverse-ILR transform and the emission means the
+belief-state carry (its compiled HLO shape is query-dependent and measured in
+the structured gate); the transition simplexes use the Stan 2.39 inverse-ILR
+transform and the emission means the
 `ordered` transform, both with their exact change-of-variables Jacobians. The
 transit prior reuses the shared Dirichlet endpoint and the emission-mean priors
 the shared Normal endpoint. Named nodes for the constrained `parameters`, the
