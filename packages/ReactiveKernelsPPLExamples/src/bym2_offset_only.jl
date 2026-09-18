@@ -56,10 +56,6 @@ using LogExpFunctions: logistic, log1pexp
     parameters = (; beta0, sigma, rho, theta, phi)
     (parameters, log_jacobian::Float64) =
         ((; beta0, sigma, rho, theta, phi), u_sigma - log1pexp(-u_rho) - log1pexp(u_rho))
-    (beta0::Float64, sigma::Float64, rho::Float64,
-     theta::AbstractVector{Float64}, phi::AbstractVector{Float64}) =
-        (parameters.beta0, parameters.sigma, parameters.rho,
-         parameters.theta, parameters.phi)
 
     # Transformed data: log_E = log(E) (bound → folds by partial evaluation).
     log_E = plate(E) do e

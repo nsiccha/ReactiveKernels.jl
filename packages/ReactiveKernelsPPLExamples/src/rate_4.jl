@@ -24,7 +24,6 @@ using LogExpFunctions: logistic, log1pexp
     jacp::Float64 = -log1pexp(-up) - log1pexp(up)
     log_jacobian::Float64 = jac + jacp
     parameters = (; theta, thetaprior)
-    (theta::Float64, thetaprior::Float64) = (parameters.theta, parameters.thetaprior)
     # theta ~ Beta(1,1), thetaprior ~ Beta(1,1) (prior-only, no likelihood term).
     prior::Float64 = beta(1.0, 1.0).logpdf(theta) + beta(1.0, 1.0).logpdf(thetaprior)
     likelihood::Float64 = binomial(n, theta).logpdf(k)

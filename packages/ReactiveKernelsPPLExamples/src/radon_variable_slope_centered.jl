@@ -78,10 +78,6 @@ using LogExpFunctions: logistic, log1pexp
     (parameters, log_jacobian::Float64) =
         ((; alpha, beta, mu_beta, sigma_beta, sigma_y),
          log_sigma_beta + log_sigma_y)
-    (alpha::Float64, beta::AbstractVector{Float64}, mu_beta::Float64,
-     sigma_beta::Float64, sigma_y::Float64) =
-        (parameters.alpha, parameters.beta, parameters.mu_beta,
-         parameters.sigma_beta, parameters.sigma_y)
 
     # Priors (all proper): alpha ~ Normal(0, 10), mu_beta ~ Normal(0, 10),
     # sigma_beta ~ Normal(0, 1), sigma_y ~ Normal(0, 1) (half-normal = plain
