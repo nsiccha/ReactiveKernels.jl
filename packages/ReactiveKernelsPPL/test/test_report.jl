@@ -26,6 +26,19 @@ _report_demo_data() = Dict{Symbol,AbstractVector}(
     :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
     :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0])
 
+const _REPORT_FACTOR_SURFACE = """
+@rkppl begin
+    c[levels(g)] .~ Normal.(0.0, 2.0)
+    sigma ~ Exponential(1.0)
+    mu = c[g]
+    y .~ Normal.(mu, sigma)
+end
+"""
+
+_report_factor_data() = Dict{Symbol,AbstractVector}(
+    :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
+    :g => [1, 2, 1, 3, 2, 3])
+
 const _REPORT_U = [0.5, -0.25, 0.1]
 # Peer's old-spelling value (brief 2026-09-18T13-50-37-077-124g6vh Layer 4).
 const _REPORT_POSTERIOR = "posterior(u) = -15.886646898631646"
@@ -45,6 +58,17 @@ const _REPORT_POSTERIOR = "posterior(u) = -15.886646898631646"
     # Bit-for-bit vs the peer's old-spelling oracle: same IR, same kernel.
     @test occursin(_REPORT_POSTERIOR, md)
     @test occursin("gradient cross-check: AD vs central differences", md)
+    @test occursin("PASS", md)
+end
+
+@testset "report levels demo" begin
+    md = transpile_report(_REPORT_FACTOR_SURFACE, _report_factor_data();
+        meta = (; model = "demo-factor"), backend = _GEN_BACKEND)
+    @test occursin("c[levels(g)] .~ Normal.(0.0, 2.0)", md)
+    @test occursin(
+        "levelmaps   = [(mu, g, values [1, 2, 3], source levels, subset :)]",
+        md)
+    @test occursin("(finite)", md)
     @test occursin("PASS", md)
 end
 

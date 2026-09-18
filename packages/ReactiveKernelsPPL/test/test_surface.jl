@@ -29,7 +29,13 @@ _plans_equal(a::StructuralPlan, b::StructuralPlan) =
     all(_assigns_equal.(a.assignments, b.assignments)) &&
     length(a.derived) == length(b.derived) &&
     all(_deriveds_equal.(a.derived, b.derived)) &&
+    length(a.levelmaps) == length(b.levelmaps) &&
+    all(_maps_equal.(a.levelmaps, b.levelmaps)) &&
     a.columns == b.columns && a.n_obs === b.n_obs && a.roles == b.roles
+
+_maps_equal(a::LevelMap, b::LevelMap) =
+    a.predictor === b.predictor && a.column === b.column &&
+    a.values == b.values && a.source === b.source && a.subset == b.subset
 
 _resps_equal(a::LikelihoodSpec, b::LikelihoodSpec) =
     a.family === b.family && a.link === b.link && a.response === b.response &&
@@ -67,9 +73,10 @@ _deriveds_equal(a::VectorAssignmentSpec, b::VectorAssignmentSpec) =
 
 _unexp(responses, predictors, priors, params = SampledParameter[],
         assigns = AssignmentSpec[],
-        derived = VectorAssignmentSpec[]) = StructuralPlan(responses,
+        derived = VectorAssignmentSpec[],
+        maps = LevelMap[]) = StructuralPlan(responses,
     predictors, priors, params, assigns, Dict{Symbol,AbstractVector}(), 0;
-    derived = derived)
+    derived = derived, levelmaps = maps)
 
 @testset "surface roundtrip gaussian end to end" begin
     m = @rkppl begin
@@ -146,25 +153,22 @@ end
         PopulationPrior[PopulationPrior(:eta, :Intercept, 0.0, 5.0),
             PopulationPrior(:eta, :x, 0.0, 1.0)])
     @test _plans_equal(got, want)
-    # Factor + offset + literal scale.
+    # Factor (full-rank, no intercept) + offset + literal scale.
     got = lower_rkppl(quote
-        a ~ Normal(0, 1)
-        c ~ Normal(0, 2)
-        mu = a .+ c[g] .+ o
+        c[levels(g)] .~ Normal.(0, 2)
+        mu = c[g] .+ o
         y .~ Normal.(mu, 1.5)
     end, (:y, :g, :o))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, 1.5,
             nothing, _none_evidence(), :y_resp)],
         PredictorSpec[PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
-                    :Intercept, :intercept),
-                TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 1),
-                    :g, :g_term),
+            TermSpec[TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term),
                 TermSpec(OffsetTerm, [:o], NamedTuple(), :o, :o_off)],
             :mu)],
-        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :g, 0.0, 2.0)])
+        PopulationPrior[PopulationPrior(:mu, :g, 0.0, 2.0)],
+        SampledParameter[], AssignmentSpec[], VectorAssignmentSpec[],
+        LevelMap[LevelMap(:mu, :g, [], :levels, Colon())])
     @test _plans_equal(got, want)
     # Weighted response (object-first HOF, Distributions.jl argument order).
     got = lower_rkppl(quote
@@ -397,38 +401,142 @@ end
         logpdf(Exponential(1), si)
     @test _query(built.spec, bound, :posterior, u) ≈ base - corr + pr + u[3]
     _check_gradient(built.spec, bound, u)
-    # treatment(g, ref) pins the reference level; bare g stays ref 1.
+    # treatment() vocabulary is removed (BRM-specific); factor use is bare.
+    for bad in (:(c[treatment(g, 3)]), :(c[treatment(g)]),
+            :(c[treatment(g, 0)]), :(c[sumcode(g)]), :(c[g, 1]))
+        @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            Expr(:(=), :mu, Expr(:call, :.+, :a, bad)),
+            Expr(:call, :.~, :y, :(Normal.(mu, 1.0)))), (:y, :x, :g))
+    end
+end
+
+@testset "surface levels priors" begin
+    # Subset + intercept: identified; the map carries the (2, :end) selector.
     got = lower_rkppl(quote
-        mu = a .+ c[treatment(g, 3)]
-        y .~ Normal.(mu, 1.0)
+        a ~ Normal(0, 1)
+        c[levels(g)[2:end]] .~ Normal.(0, 2)
+        mu = a .+ c[g]
+        y .~ Normal.(mu, 1.5)
     end, (:y, :x, :g))
-    @test _terms_equal(got.predictors[1].terms[2],
-        TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 3), :g,
-            :g_term))
+    @test length(got.levelmaps) == 1 &&
+        _maps_equal(got.levelmaps[1], LevelMap(:mu, :g, [], :levels, (2, :end)))
     @test got.population_priors ==
         PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :g, 0.0, 1.0)]
-    got = lower_rkppl(quote
-        mu = a .+ c[treatment(g)]
-        y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :g))
-    @test got.predictors[1].terms[2].options == (contrasts = :treatment, ref = 1)
+            PopulationPrior(:mu, :g, 0.0, 2.0)]
+    # Intercept + full cover: the identifiability gate.
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ c[treatment(g, 0)]
-        y .~ Normal.(mu, 1.0)
+        a ~ Normal(0, 1)
+        c[levels(g)] .~ Normal.(0, 2)
+        mu = a .+ c[g]
+        y .~ Normal.(mu, 1.5)
     end, (:y, :x, :g))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ c[treatment(g, r)]
-        y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :g))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ c[treatment(gg, 3)]
-        y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :g))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ c[sumcode(g)]
-        y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :g))
+    # Scalar prior for a vector coefficient: migration error. Missing prior:
+    # required error (no default sizes the block).
+    for stmts in ((:(c ~ Normal(0, 2)),), (:($(Expr(:call, :~,
+            :c, :(Normal.(0, 2))))),), ())
+        block = Expr(:block, stmts...,
+            :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
+        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g))
+    end
+    # Levels column must match the use column; levels() takes one data column.
+    for lhs in (:(c[levels(h)]), :(c[unique(g)]), :(c[sort(g)]),
+            :(c[levels()]), :(c[levels(g, 1)]), :(c[levels(x)]),
+            :(c[f(g)]), :(y[levels(g)]))
+        block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
+            :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
+        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :x, :g, :h))
+    end
+    # Scalar tilde over a levels ref is crossed spelling.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :~, :(c[levels(g)]), :(Normal(0, 2))),
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    # Subset violations: unbound/start-0/empty/non-literal selections.
+    for sub in (:(1:n), :(0:2), :(3:2), :([]), :([1.5]), :([true]),
+            :([i]), :(1:2:6), :(eachindex(g)))
+        lhs = Expr(:ref, :c, Expr(:ref, :(levels(g)), sub))
+        block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
+            :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
+        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g))
+    end
+    # Valid subsets lower with their selectors.
+    for (sub, want) in ((:(2:3), 2:3), (:([1, 3]), [1, 3]))
+        lhs = Expr(:ref, :c, Expr(:ref, :(levels(g)), sub))
+        block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
+            :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
+        got = lower_rkppl(block, (:y, :g))
+        @test got.levelmaps[1].subset == want
+    end
+    # Outside-chained subsets go inside instead (one way).
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :.~,
+            Expr(:ref, Expr(:ref, :c, :(levels(g))),
+                Expr(:call, :(:), 2, :end)),
+            :(Normal.(0, 2))),
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    # Non-dotted prior object over a levels ref: broadcast it.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :.~, :(c[levels(g)]), :(Normal(0, 2))),
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    # Non-literal broadcast args are not per-level priors.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :.~, :(c[levels(g)]), :(Normal.(m, 2))),
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    # Levels prior on a non-factor coefficient; unused levels prior.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :.~, :(a[levels(g)]), :(Normal.(0, 1))),
+        :(mu = a .+ c[g]),
+        Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
+        :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :.~, :(z[levels(g)]), :(Normal.(0, 1))),
+        :(mu = c[g]),
+        Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
+        :(y .~ Normal.(mu, 1.5))), (:y, :g))
+end
+
+@testset "surface full-rank factor end to end" begin
+    # No intercept + full cover: one coefficient per observed level.
+    m = @rkppl begin
+        c[levels(g)] .~ Normal.(0, 2)
+        s ~ Exponential(1)
+        mu = c[g]
+        y .~ Normal.(mu, s)
+    end
+    cols, _ = _gen_columns()
+    bound = m(; y = cols[:y], g = cols[:g])
+    @test bound.levelmaps[1].values == [1, 2, 3]
+    built = build_kernel(bound)
+    u = [0.2, -0.1, 0.3, 0.0]
+    nt = constrain(built.layout, u)
+    mu = Vector(nt.mu)[cols[:g]]
+    si = nt.s
+    ll = sum(logpdf.(Normal.(mu, si), cols[:y]))
+    pr = sum(logpdf.(Normal(0, 2), Vector(nt.mu))) +
+        logpdf(Exponential(1), si)
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[4]
+    _check_gradient(built.spec, bound, u)
+    # Subset + intercept: reference rows ride the intercept.
+    m2 = @rkppl begin
+        a ~ Normal(0, 1)
+        c[levels(g)[2:end]] .~ Normal.(0, 2)
+        s ~ Exponential(1)
+        mu = a .+ c[g]
+        y .~ Normal.(mu, s)
+    end
+    bound2 = m2(; y = cols[:y], g = cols[:g])
+    @test bound2.levelmaps[1].values == [2, 3]
+    built2 = build_kernel(bound2)
+    u2 = [0.5, 0.2, -0.1, 0.0]
+    nt2 = constrain(built2.layout, u2)
+    coef = Dict(1 => 0.0, 2 => nt2.mu[2], 3 => nt2.mu[3])
+    mu2 = [nt2.mu[1] + coef[g] for g in cols[:g]]
+    si2 = nt2.s
+    ll2 = sum(logpdf.(Normal.(mu2, si2), cols[:y]))
+    pr2 = logpdf(Normal(0, 1), nt2.mu[1]) +
+        sum(logpdf.(Normal(0, 2), Vector(nt2.mu)[2:3])) +
+        logpdf(Exponential(1), si2)
+    @test _query(built2.spec, bound2, :posterior, u2) ≈ ll2 + pr2 + u2[4]
+    _check_gradient(built2.spec, bound2, u2)
 end
 
 @testset "surface derived columns" begin

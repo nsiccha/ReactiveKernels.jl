@@ -158,6 +158,8 @@ function lower_rkppl(ast, data_names)::StructuralPlan
     coefuse = Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}()
     for s in sample
         if s.broadcast
+            # Broadcast coefficient priors lower with their factor term.
+            s.levels !== nothing && continue
             s.lhs in data || _sfail("`.~` broadcasts over a data column " *
                                     "— $(s.lhs) is not data (scalar " *
                                     "parameters use `~`)")
@@ -170,7 +172,7 @@ function lower_rkppl(ast, data_names)::StructuralPlan
                    "scalar-only")
         end
     end
-    priors = _lower_coefficient_priors(sample, coefuse, predictors)
+    priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors)
     params, paramsyms = _lower_parameters(sample, coefuse, ctx)
     used_locs = Set{Symbol}(r.predictor for r in responses)
     skip = _absorbed_skip(det, canonmap, responses, paramsyms, ctx.absorbed,
@@ -195,7 +197,8 @@ function lower_rkppl(ast, data_names)::StructuralPlan
         end
     end
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
-        Dict{Symbol,AbstractVector}(), 0; derived = derived)
+        Dict{Symbol,AbstractVector}(), 0; derived = derived,
+        levelmaps = levelmaps)
     validate_structure(plan)
     return plan
 end
@@ -390,7 +393,7 @@ end
 # definition like `m = log` never reads as referencing data).
 const _KNOWN_VALUE_FNS = union(Set{Symbol}(ASSIGNMENT_FNS),
     Set{Symbol}(ELEMENTWISE_OPS), Set{Symbol}(ELEMENTWISE_FNS),
-    Set{Symbol}((:ifelse, :treatment)))
+    Set{Symbol}((:ifelse,)))
 
 # Structural definitions: anything transitively referencing a coefficient
 # candidate (a Normal-priored sampled name or a free name — data, det, and
@@ -451,8 +454,8 @@ function _reject_unknown_calls(where, rhs)
                 "$where uses dotted operator `$fn`, which is not in " *
                 "the slice-1 elementwise vocabulary")
             fn === :treatment && _sfail(
-                "$where calls `treatment`, which only lowers as a " *
-                "factor index (`c[treatment(g, ref)]`)")
+                "$where calls `treatment`, which was removed " *
+                "(BRM-specific contrasts)")
             fn === :ifelse && _sfail(
                 "$where calls undotted `ifelse` — use elementwise " *
                 "`ifelse.(condition, x, y)`")
@@ -537,10 +540,10 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         if _is_sample(st) || _is_broadcast_sample(st)
             bc = _is_broadcast_sample(st)
             tilde = bc ? "`.~`" : "`~`"
-            lhs, rng = _sample_lhs(st.args[2], bc, tilde)
+            lhs, rng, levs = _sample_lhs(st.args[2], bc, tilde, data)
             _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[3], lhs)
-            push!(sample, SampleStmt(lhs, st.args[3], bc, rng))
+            push!(sample, SampleStmt(lhs, st.args[3], bc, rng, levs))
         elseif st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol
             lhs = st.args[1]
             lhs === :target && _sfail("no `target` in rkppl models " *
@@ -574,24 +577,110 @@ _is_sample(st::Expr) =
 _is_broadcast_sample(st::Expr) =
     st.head === :call && length(st.args) == 3 && st.args[1] === :.~
 
-# Sampling-statement LHS: a bare Symbol, or (`.~` only) a one-dimensional
-# range ref `y[R]`. Returns `(column, range)` with `range === nothing`
-# for bare and self-covering (`eachindex`/`axes`) forms.
-_sample_lhs(lhs::Symbol, bc, tilde) = (lhs, nothing)
-function _sample_lhs(lhs, bc, tilde)
-    lhs isa Expr || _sfail("$tilde left-hand side must be a bare Symbol " *
-                           "or a range ref (`y[1:N]`, `y[eachindex(y)]`), " *
-                           "got $(repr(lhs))")
+# Sampling-statement LHS: a bare Symbol, a one-dimensional range ref
+# `y[R]` (`.~` only), or a levels ref `c[levels(g)]` / `c[levels(g)][S]`
+# (`.~` only). Returns `(column, range, levels)` with at most one of
+# `range` / `levels` set.
+_sample_lhs(lhs::Symbol, bc, tilde, data) = (lhs, nothing, nothing)
+function _sample_lhs(lhs, bc, tilde, data)
+    lhs isa Expr || _sfail("$tilde left-hand side must be a bare Symbol, " *
+                           "a range ref (`y[1:N]`), or a levels ref " *
+                           "(`c[levels(g)]`), got $(repr(lhs))")
     lhs.head === :. && _sfail("dotted left-hand side $(repr(lhs)) does " *
                               "not lower (nested targets are out of scope)")
-    if lhs.head !== :ref || length(lhs.args) != 2 || !(lhs.args[1] isa Symbol)
-        _sfail("$tilde left-hand side must be a bare Symbol or a " *
-               "one-dimensional range ref (`y[1:N]`), got $(repr(lhs))")
+    lhs.head === :ref && length(lhs.args) == 2 || _sfail(
+        "$tilde left-hand side must be a bare Symbol or a one-dimensional " *
+        "ref (`y[1:N]`, `c[levels(g)]`), got $(repr(lhs))")
+    target, index = lhs.args
+    # Chained outside subset (`c[levels(g)][2:end]`): one way to write it —
+    # the subset goes inside (`c[levels(g)[2:end]]`).
+    target isa Expr && _sfail("$tilde subset goes inside the levels " *
+                              "expression (`c[levels(g)[2:end]]`), got " *
+                              "$(repr(lhs))")
+    target isa Symbol || _sfail("$tilde left-hand side must be a bare " *
+                                "Symbol or a one-dimensional ref, got " *
+                                "$(repr(lhs))")
+    # `c[levels(g)[S]]`: subset selection over the levels.
+    if index isa Expr && index.head === :ref
+        bc || _sfail("sized prior `$(target)[levels(...)[...]]` is a " *
+                     "vector — use `.~`, not `~`")
+        target in data && _sfail("`levels` sizes coefficient priors, not " *
+                                 "responses ($target is data)")
+        gcol, sub = _levels_subset_index(target, index, data)
+        return target, nothing, (gcol, sub)
     end
-    bc || _sfail("sliced response `$(lhs.args[1])[...]` is a vector — " *
+    if _is_levels_call(index)
+        bc || _sfail("sized prior `$(target)[levels(...)]` is a vector — " *
+                     "use `.~`, not `~`")
+        target in data && _sfail("`levels` sizes coefficient priors, not " *
+                                 "responses ($target is data)")
+        gcol = _levels_column(target, index, data)
+        return target, nothing, (gcol, Colon())
+    end
+    bc || _sfail("sliced response `$target[...]` is a vector — " *
                  "use `.~`, not `~`")
-    col = lhs.args[1]
-    return col, _lower_lhs_range(col, lhs.args[2])
+    return target, _lower_lhs_range(target, index), nothing
+end
+
+# The `levels(g)[S]` index of a subset prior: returns `(g, subset)`.
+function _levels_subset_index(col::Symbol, index::Expr, data::Set{Symbol})
+    length(index.args) == 2 && _is_levels_call(index.args[1]) ||
+        _sfail("coefficient $col: subsets select over `levels` " *
+               "(`$col[levels(g)[2:end]]`), got $(repr(index))")
+    gcol = _levels_column(col, index.args[1], data)
+    return gcol, _lower_levels_subset(col, gcol, index.args[2])
+end
+
+_is_levels_call(x) =
+    x isa Expr && x.head === :call && !isempty(x.args) &&
+    x.args[1] isa Symbol && x.args[1] in (:levels, :unique, :sort)
+
+function _levels_column(col::Symbol, call::Expr, data::Set{Symbol})
+    fn = call.args[1]
+    fn === :levels || _sfail("coefficient $col: write `levels(...)`, not " *
+                             "`$fn(...)` (the levels function is `levels`)")
+    length(call.args) == 2 ||
+        _sfail("coefficient $col: `levels` takes exactly one grouping " *
+               "column, got $(repr(call))")
+    gcol = call.args[2]
+    gcol isa Symbol || _sfail("coefficient $col: `levels` takes a bare " *
+                              "grouping column, got $(repr(gcol))")
+    gcol in data || _sfail("coefficient $col: `levels($gcol)` needs a " *
+                           "data grouping column — $gcol is not data")
+    return gcol
+end
+
+# Subset selections over `levels(g)`: `2:end`, literal `a:b`, or literal
+# `[i, j]` (full cover is the bare `c[levels(g)]` — no `[:]` sugar).
+# Returns the LevelMap subset value.
+function _lower_levels_subset(col::Symbol, gcol::Symbol, s)
+    if s isa Expr && s.head === :call && !isempty(s.args) && s.args[1] === :(:)
+        length(s.args) == 3 || _sfail("coefficient $col: level subsets " *
+                                      "are `a:b` or `a:end`, got $(repr(s))")
+        lo, hi = s.args[2], s.args[3]
+        lo isa Integer && !(lo isa Bool) && lo >= 1 || _sfail(
+            "coefficient $col: subset must start at a literal 1-based " *
+            "position, got $(repr(lo))")
+        hi isa Integer && !(hi isa Bool) && return _subset_range(col, lo, hi)
+        hi === :end && return (Int(lo), :end)
+        return _sfail("coefficient $col: subset endpoint must be a " *
+                      "literal or `end`, got $(repr(hi))")
+    end
+    if s isa Expr && s.head === :vect
+        all(a -> a isa Integer && !(a isa Bool) && a >= 1, s.args) ||
+            _sfail("coefficient $col: level index lists take literal " *
+                   "1-based positions, got $(repr(s))")
+        !isempty(s.args) ||
+            _sfail("coefficient $col: level index list is empty")
+        return Int.(s.args)
+    end
+    return _sfail("coefficient $col: level subsets are `[2:end]`, " *
+                  "`[a:b]`, or `[[i, j]]`, got $(repr(s))")
+end
+
+function _subset_range(col::Symbol, lo::Integer, hi::Integer)
+    lo <= hi || _sfail("coefficient $col: level range $lo:$hi is empty")
+    return UnitRange(Int(lo), Int(hi))
 end
 
 function _lower_lhs_range(col::Symbol, r)
@@ -638,15 +727,18 @@ end
 
 """One `~` / `.~` statement: scalar (`~`) or elementwise (`.~`) density.
 `range` carries a literal `y[1:N]` response range (`nothing` = whole
-column: bare LHS, `eachindex`, `axes`)."""
+column: bare LHS, `eachindex`, `axes`). `levels` carries a
+`(grouping column, subset)` pair for `c[levels(g)]` broadcast priors
+(`nothing` otherwise)."""
 struct SampleStmt
     lhs::Symbol
     rhs::Any
     broadcast::Bool
     range::Union{Nothing,UnitRange{Int}}
+    levels::Any
 end
 SampleStmt(lhs::Symbol, rhs, broadcast::Bool) =
-    SampleStmt(lhs, rhs, broadcast, nothing)
+    SampleStmt(lhs, rhs, broadcast, nothing, nothing)
 
 _is_doc_macro(m) =
     m === Symbol("@doc") || (m isa GlobalRef && m.name === Symbol("@doc"))
@@ -1341,57 +1433,48 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
     haskey(ctx.detmap, base) && _sfail("predictor $pname: $base is a " *
                                        "computed assignment, not a sampled " *
                                        "coefficient vector")
-    col, ref = _factor_index(pname, idx, ctx)
-    return TermSpec(FactorTerm, [col], (contrasts = :treatment, ref = ref),
-        col, Symbol(col, "_term")), (base, col, sign)
+    col = _factor_index(pname, idx, ctx)
+    return TermSpec(FactorTerm, [col], NamedTuple(), col,
+        Symbol(col, "_term")), (base, col, sign)
 end
 
-# Bare `c[g]` is treatment/ref-1 sugar; `c[treatment(g, ref)]` pins the
-# reference level (R `contr.treatment` tradition). The `treatment` head is
-# AST vocabulary only — it is never called.
+# Factor use is always bare `c[g]` over a raw data grouping column; the
+# coefficient's `c[levels(g)]` broadcast prior sizes the full-rank block.
+# The `treatment(g, ref)` vocabulary was BRM-specific contrasts machinery
+# and is removed (F2: full-rank, no reference dropping).
 function _factor_index(pname, idx, ctx)
-    idx isa Symbol || return _treatment_index(pname, idx, ctx)
+    idx isa Symbol || _sfail("predictor $pname: factor index must be a " *
+                             "bare data column (`c[g]`) — " *
+                             _treatment_removed(idx))
     idx in ctx.vecdefs && _sfail("predictor $pname: factor over the " *
                                  "derived column $idx needs pre-evaluation " *
                                  "level knowledge — factors take raw " *
                                  "grouping columns in slice 1")
     idx in ctx.data || _sfail("predictor $pname: factor index $idx must " *
                               "be a data column")
-    return idx, 1
+    return idx
 end
 
-function _treatment_index(pname, idx, ctx)
+function _treatment_removed(idx)
     idx isa Expr && idx.head === :call && !isempty(idx.args) &&
-        idx.args[1] === :treatment || _sfail(
-            "predictor $pname: factor index must be a bare data column or " *
-            "`treatment(group, ref)`, got $(repr(idx))")
-    args = _plain_args(idx, "`treatment`")
-    (length(args) == 1 || length(args) == 2) ||
-        _sfail("predictor $pname: `treatment` takes " *
-               "`treatment(group[, ref])`")
-    g = args[1]
-    g isa Symbol && g in ctx.vecdefs && _sfail(
-        "predictor $pname: factor over the derived column $g needs " *
-        "pre-evaluation level knowledge — factors take raw grouping " *
-        "columns in slice 1")
-    g isa Symbol && g in ctx.data || _sfail(
-        "predictor $pname: `treatment` group must be a bare data column, " *
-        "got $(repr(g))")
-    length(args) == 1 && return g, 1
-    ref = args[2]
-    ref isa Integer && !(ref isa Bool) && ref >= 1 || _sfail(
-        "predictor $pname: `treatment` ref must be a literal 1-based level " *
-        "index, got $(repr(ref))")
-    return g, Int(ref)
+        idx.args[1] === :treatment &&
+        return "`treatment` was removed (BRM-specific contrasts); size " *
+               "the vector with a broadcast prior " *
+               "(`c[levels(g)] .~ ...`) and index a subset for " *
+               "identified models"
+    return "got $(repr(idx))"
 end
 
 # Coefficient priors: recovered by name from `coef ~ Normal(lit, lit)`
-# statements; missing priors default to Normal(0, 1) (emitter convention).
+# statements; missing scalar priors default to Normal(0, 1) (emitter
+# convention). Factor coefficients instead take broadcast priors
+# (`c[levels(g)] .~ Normal.(lit, lit)`), which also size the block —
+# required, never defaulted — and each one emits its LevelMap.
 # Plan order follows predictors, addressees in term order.
 function _lower_coefficient_priors(sample, coefuse, predictors)
     stated = Dict{Symbol,Any}()
     for s in sample
-        haskey(coefuse, s.lhs) && (stated[s.lhs] = s.rhs)
+        haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
     end
     for (name, uses) in coefuse
         preds = unique!(map(first, copy(uses)))
@@ -1405,6 +1488,7 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
                                     "coefficient per column")
     end
     priors = PopulationPrior[]
+    levelmaps = LevelMap[]
     for pred in predictors
         for t in pred.terms
             t.kind === OffsetTerm && continue
@@ -1414,16 +1498,81 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
                                       "($(pred.name), $addr)")
             name = use[1]
             sign = use[3]
+            if t.kind === FactorTerm
+                push!(priors, _lower_factor_prior(pred, t, name, sign,
+                    stated, levelmaps))
+                continue
+            end
             if !haskey(stated, name)
                 push!(priors, PopulationPrior(pred.name, addr, 0.0, 1.0))
                 continue
             end
-            rhs = stated[name]
-            loc, scale = _coefficient_normal(name, rhs, pred.name, addr)
+            s = stated[name]
+            s.levels !== nothing && _sfail("coefficient $name takes a " *
+                                           "scalar prior (`$name ~ Normal`), " *
+                                           "not a levels prior — it is used " *
+                                           "as $(t.kind), not a factor")
+            loc, scale = _coefficient_normal(name, s.rhs, pred.name, addr)
             push!(priors, PopulationPrior(pred.name, addr, sign * loc, scale))
         end
     end
-    return priors
+    _check_identified(predictors, levelmaps)
+    return priors, levelmaps
+end
+
+function _lower_factor_prior(pred, t, name, sign, stated, levelmaps)
+    col = only(t.columns)
+    haskey(stated, name) || _sfail("factor coefficient $name over $col " *
+                                   "needs an explicit broadcast prior " *
+                                   "(`$name[levels($col)] .~ Normal.(0, 1)`) " *
+                                   "— the prior sizes the coefficient vector")
+    s = stated[name]
+    s.levels === nothing && _sfail("coefficient $name is vector-valued " *
+                                   "(factor over $col) — scalar priors " *
+                                   "cannot size it; write " *
+                                   "`$name[levels($col)] .~ Normal.(0, 1)`")
+    gcol, subset = s.levels
+    gcol === col || _sfail("coefficient $name: levels column $gcol " *
+                           "differs from use column $col")
+    loc, scale = _coefficient_broadcast_normal(name, s.rhs, pred.name, col)
+    push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
+    return PopulationPrior(pred.name, col, sign * loc, scale)
+end
+
+# Dotted coefficient priors peel to one shared (location, scale): broadcast
+# args must be literals (per-level priors are not in slice 1).
+function _coefficient_broadcast_normal(name, rhs, pname, col)
+    rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
+        rhs.args[1] === :Normal && rhs.args[2] isa Expr &&
+        rhs.args[2].head === :tuple || _sfail(
+            "coefficient $name of predictor $pname needs a broadcast " *
+            "`Normal.(literal, literal)` prior, got $(repr(rhs))")
+    args = rhs.args[2].args
+    length(args) == 2 || _sfail("coefficient $name of predictor $pname " *
+                                "needs `Normal.(location, scale)`")
+    loc, scale = args
+    loc isa Real || _sfail("coefficient $name prior location must be a " *
+                           "literal (per-level priors are not in slice 1)")
+    scale isa Real || _sfail("coefficient $name prior scale must be a " *
+                             "literal (per-level priors are not in slice 1)")
+    return Float64(loc), Float64(scale)
+end
+
+# Surface-side identifiability gate (the contract validator repeats it for
+# hand-built plans): intercept + full-cover factor is unidentified.
+function _check_identified(predictors, levelmaps)
+    for pred in predictors
+        any(t -> t.kind === InterceptTerm, pred.terms) || continue
+        for t in pred.terms
+            t.kind === FactorTerm || continue
+            m = _find_levelmap(levelmaps, pred.name, only(t.columns))
+            m !== nothing && m.subset === Colon() && _sfail(
+                "predictor $(pred.name) is unidentified: intercept + " *
+                "full-cover factor over $(only(t.columns)) (drop the " *
+                "intercept or index a strict subset of levels)")
+        end
+    end
+    return nothing
 end
 
 function _find_use(coefuse, pname, addr)
@@ -1466,6 +1615,9 @@ function _lower_parameters(sample, coefuse, ctx)
     for s in sample
         s.lhs in ctx.data && continue
         haskey(coefuse, s.lhs) && continue
+        s.levels !== nothing && _sfail("levels prior `$(s.lhs)[...]` is " *
+                                       "never used in a predictor — size " *
+                                       "only vectors the model indexes")
         p = _lower_parameter(s.lhs, s.rhs, coefuse)
         push!(params, p)
         for v in values(p.args)

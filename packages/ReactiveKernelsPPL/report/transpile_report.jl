@@ -89,6 +89,11 @@ _render_ast(ast::Expr) = "@rkppl " * sprint(Base.show_unquoted, ast)
 # ------------------------------------------------------------ plan summary
 
 _show_cols(cols) = "[" * join(string.(cols), ", ") * "]"
+_show_vals(vals) = "[" * join(repr.(vals), ", ") * "]"
+_show_subset(s::Colon) = ":"
+_show_subset(s::UnitRange) = string(s)
+_show_subset(s::Vector) = "[" * join(string.(s), ", ") * "]"
+_show_subset(s::Tuple) = "($(s[1]), :end)"
 _show_expr(e::Expr) = sprint(Base.show_unquoted, e)
 _show_expr(e) = repr(e)
 
@@ -107,6 +112,9 @@ function _show_plan(plan::StructuralPlan)
     smps = ["($(p.name), $(p.family), $(_show_args(p.args)))" for p in plan.parameters]
     as = ["($(a.name) = $(_show_expr(a.expr)))" for a in plan.assignments]
     ds = ["($(d.name) = $(_show_expr(d.expr)))" for d in plan.derived]
+    ms = ["($(m.predictor), $(m.column), values $(_show_vals(m.values)), " *
+          "source $(m.source), subset $(_show_subset(m.subset)))"
+        for m in plan.levelmaps]
     return join([
         "n_obs = $(plan.n_obs)",
         "responses   = [$(join(rs, ", "))]",
@@ -115,6 +123,7 @@ function _show_plan(plan::StructuralPlan)
         "parameters  = [$(join(smps, ", "))]",
         "assignments = [$(join(as, ", "))]",
         "derived     = [$(join(ds, ", "))]",
+        "levelmaps   = [$(join(ms, ", "))]",
         "roles       = $(plan.roles)",
     ], "\n")
 end

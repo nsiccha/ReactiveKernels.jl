@@ -190,9 +190,10 @@ end
         pred = PredictorSpec(:mu, IdentityLink,
             TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
                     :Intercept, :intercept),
-                TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 1),
-                    :g, :g_term)],
+                TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term)],
             :mu)
+        levs = sort(unique(g))
+        maps = LevelMap[LevelMap(:mu, :g, levs[2:end], :levels, (2, :end))]
         plan = StructuralPlan(
             LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu,
                 :sigma, nothing, _none_evidence(), :y_resp)],
@@ -201,7 +202,7 @@ end
                 PopulationPrior(:mu, :g, 0.0, 0.5)],
             SampledParameter[SampledParameter(:sigma, :exponential,
                 (arg1 = 1.0,), nothing, :sigma)],
-            AssignmentSpec[], cols, n)
+            AssignmentSpec[], cols, n; levelmaps = maps)
         built = build_kernel(plan)
         u = [0.3, 0.1, -0.2, 0.0]
         nt = constrain(built.layout, u)

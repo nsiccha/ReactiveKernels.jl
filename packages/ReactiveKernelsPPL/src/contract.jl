@@ -94,8 +94,10 @@ LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
 
 One additive predictor term: structure only, never materialized designs
 (D5a). `addressee` is the prior address (source column or `:Intercept`),
-never a per-contrast label. Factor `options` are
-`(contrasts=:treatment, ref=<1-based index into sort-ordered levels>)`.
+never a per-level label. Terms take no options: factor sizing lives in
+the plan's [`LevelMap`](@ref)s (full-rank over exactly the mapped
+levels; no contrasts, no reference dropping — that machinery was
+BRM-specific and is gone).
 """
 struct TermSpec
     kind::TermKind
@@ -118,8 +120,10 @@ end
 
 Normal-only population prior (slice 1) addressed by
 `(predictor, column|:Intercept)`. A factor source column address applies one
-shared Normal across its K-1 contrasts. The emitter fills `Normal(0,1)`
-defaults so coverage is complete by construction.
+shared Normal across its full-rank level block (one coefficient per mapped
+level). The emitter fills `Normal(0,1)` defaults so coverage is complete by
+construction — except factor coefficients, whose broadcast prior also sizes
+the block and is therefore required, never defaulted.
 """
 struct PopulationPrior
     predictor::Symbol
@@ -187,6 +191,24 @@ VectorAssignmentSpec(name::Symbol, expr::Union{Expr,Symbol}) =
     VectorAssignmentSpec(name, expr, name)
 
 """
+    LevelMap(predictor, column, values, source, subset)
+
+Ordered level values sizing one full-rank factor term: `values` is the
+coefficient position↔level mapping (binder-evaluated from the grouping
+column, `[]` pre-bind). `source` is the levels function (`:levels`
+only). `subset` selects from `sort(unique(column))`: `:` (full cover),
+a literal `UnitRange{Int}`, a literal `Vector{Int}` of positions, or
+`(lo, :end)`. Keyed by `(predictor, column)` — one map per factor term.
+"""
+struct LevelMap
+    predictor::Symbol
+    column::ColumnRef
+    values::Vector
+    source::Symbol
+    subset::Union{Colon,UnitRange{Int},Vector{Int},Tuple{Int,Symbol}}
+end
+
+"""
     StructuralPlan(responses, predictors, population_priors, parameters,
                    assignments, derived, columns, n_obs)
 
@@ -194,7 +216,7 @@ Complete emitter→thin-layer input. `columns` maps RAW-column names to plain
 vectors (derived columns are never bound — they compute in-graph from
 `derived`); `parameters`, `assignments`, and `derived` share one name table
 (duplicates rejected). N≥1 independent responses; shared predictor Symbols
-allowed.
+allowed. `levelmaps` sizes every factor term (binder-evaluated values).
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -206,14 +228,15 @@ struct StructuralPlan
     columns::Dict{Symbol,AbstractVector}
     n_obs::Int
     roles::Dict{Symbol,Symbol}
+    levelmaps::Vector{LevelMap}
 end
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
 const COLUMN_ROLES = (:response, :predictor, :weight, :evidence, :data)
 
-# Compatibility constructor: 8-arg positional construction (pre-roles,
-# pre-derived) keeps working with empty roles/derived; the
+# Compatibility constructor: 7-arg positional construction (pre-roles,
+# pre-derived, pre-levelmaps) keeps working with empties; the
 # emitter/serializer path is unaffected.
 function StructuralPlan(
         responses::Vector{LikelihoodSpec},
@@ -224,9 +247,10 @@ function StructuralPlan(
         columns::Dict{Symbol,AbstractVector},
         n_obs::Int;
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
-        derived::Vector{VectorAssignmentSpec} = VectorAssignmentSpec[])
+        derived::Vector{VectorAssignmentSpec} = VectorAssignmentSpec[],
+        levelmaps::Vector{LevelMap} = LevelMap[])
     return StructuralPlan(responses, predictors, population_priors,
-        parameters, assignments, derived, columns, n_obs, roles)
+        parameters, assignments, derived, columns, n_obs, roles, levelmaps)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -347,6 +371,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_parameters(plan)
     _validate_topo_order(plan)
     _validate_predictors(plan)
+    _validate_levelmaps(plan)
     _validate_priors(plan)
     _validate_responses(plan)
     return nothing
@@ -362,6 +387,7 @@ function validate_data(plan::StructuralPlan)
     _validate_assignments_data(plan)
     _validate_vector_data(plan)
     _validate_predictor_columns(plan)
+    _validate_levelmaps_data(plan)
     _validate_response_data(plan)
     return nothing
 end
@@ -890,12 +916,10 @@ function _validate_predictors(plan::StructuralPlan)
 end
 
 function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    t.options == NamedTuple() ||
+        _fail(t.label, "terms take no options (slice 1: factor sizing " *
+                       "lives in LevelMap)")
     if t.kind === FactorTerm
-        o = t.options
-        get(o, :contrasts, nothing) === :treatment ||
-            _fail(t.label, "factor contrasts must be :treatment (slice 1)")
-        ref = get(o, :ref, nothing)
-        ref isa Int || _fail(t.label, "factor ref must be a 1-based level index")
         length(t.columns) == 1 ||
             _fail(t.label, "factor term takes exactly one grouping column")
         for c in t.columns
@@ -904,8 +928,6 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
                 "level knowledge — factors take raw grouping columns in slice 1")
         end
     else
-        t.options == NamedTuple() ||
-            _fail(t.label, "non-factor terms take no options (slice 1)")
         if t.kind === ContinuousTerm || t.kind === OffsetTerm
             length(t.columns) == 1 ||
                 _fail(t.label, "term takes exactly one column")
@@ -931,20 +953,9 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
         haskey(plan.columns, c) || _is_derived(plan, c) ||
             _fail(t.label, "term references missing column $c")
     end
-    if t.kind === FactorTerm
-        ref = get(t.options, :ref, nothing)
-        col = plan.columns[only(t.columns)]
-        levels =
-            try
-                _grouping_levels(col)
-            catch err
-                _fail(t.label, "grouping column levels not orderable ($err)")
-            end
-        1 <= ref <= length(levels) || _fail(
-            t.label,
-            "factor ref $ref out of range (1:$(length(levels)) observed levels)",
-        )
-    elseif t.kind === ContinuousTerm || t.kind === OffsetTerm
+    # FactorTerm: column presence is checked by the loop above; level
+    # coverage is a LevelMap concern (_validate_levelmaps_data).
+    if t.kind === ContinuousTerm || t.kind === OffsetTerm
         c = only(t.columns)
         # Derived columns are length-n by construction; their eltype is
         # unknown statically (in-graph Julia errors are loud).
@@ -968,6 +979,136 @@ function _grouping_levels(col::AbstractVector)
         return sort!(unique!(string.(col)))
     end
     return sort(unique(col))
+end
+
+# One map per factor term, keyed (predictor, column); duplicate keys mean
+# two factor terms over one column in one predictor (unidentified sums —
+# merge them).
+_map_key(m::LevelMap) = (m.predictor, m.column)
+
+function _validate_levelmaps(plan::StructuralPlan)
+    keys = _map_key.(plan.levelmaps)
+    length(unique(keys)) == length(keys) ||
+        _fail(:plan, "duplicate LevelMap keys (one map per factor term)")
+    for pred in plan.predictors
+        for t in pred.terms
+            t.kind === FactorTerm || continue
+            col = only(t.columns)
+            nm = count(m -> m.predictor === pred.name && m.column === col,
+                plan.levelmaps)
+            nm == 1 || _fail(t.label,
+                "factor term over $col in predictor $(pred.name) has no " *
+                "LevelMap (surface: size it with a `c[levels($col)]` prior)")
+        end
+        if any(t -> t.kind === InterceptTerm, pred.terms)
+            for t in pred.terms
+                t.kind === FactorTerm || continue
+                m = _find_levelmap(plan.levelmaps, pred.name, only(t.columns))
+                m !== nothing && m.subset === Colon() && _fail(pred.label,
+                    "predictor $(pred.name) is unidentified: intercept + " *
+                    "full-cover factor over $(only(t.columns)) (drop the " *
+                    "intercept or index a strict subset of levels)")
+            end
+        end
+    end
+    for m in plan.levelmaps
+        m.source === :levels ||
+            _fail(:plan, "LevelMap source must be :levels (only admitted " *
+                         "levels function), got $(repr(m.source))")
+        _validate_subset_shape(m)
+    end
+    return nothing
+end
+
+function _find_levelmap(maps::Vector{LevelMap}, pred::Symbol, col::Symbol)
+    idx = findfirst(m -> m.predictor === pred && m.column === col, maps)
+    return idx === nothing ? nothing : maps[idx]
+end
+
+function _validate_subset_shape(m::LevelMap)
+    s = m.subset
+    s === Colon() && return nothing
+    s isa UnitRange{Int} ||
+        s isa Vector{Int} ||
+        (s isa Tuple && length(s) == 2 && s[1] isa Int && s[2] === :end) ||
+        return _fail(:plan, "LevelMap subset must be `:`, a UnitRange, " *
+                            "a Vector{Int}, or (lo, :end) — got $(repr(s))")
+    if s isa UnitRange{Int}
+        first(s) >= 1 && first(s) <= last(s) ||
+            return _fail(:plan, "LevelMap range $(repr(s)) is empty or " *
+                                "starts below 1")
+    elseif s isa Vector{Int}
+        !isempty(s) && all(>=(1), s) ||
+            return _fail(:plan, "LevelMap index list must be non-empty " *
+                                "1-based positions — got $(repr(s))")
+    else
+        s[1] >= 1 ||
+            return _fail(:plan, "LevelMap (lo, :end) needs lo ≥ 1 — " *
+                                "got $(repr(s))")
+    end
+    return nothing
+end
+
+# Binder evaluation: sort-ordered uniques, then the subset selection
+# (bounds-checked against the observed count).
+function _eval_levelmaps(levelmaps::Vector{LevelMap},
+        columns::Dict{Symbol,AbstractVector})
+    out = LevelMap[]
+    for m in levelmaps
+        haskey(columns, m.column) ||
+            _fail(:plan, "LevelMap addresses missing column $(m.column)")
+        levels =
+            try
+                _grouping_levels(columns[m.column])
+            catch err
+                _fail(:plan, "grouping column $(m.column) levels not " *
+                             "orderable ($err)")
+            end
+        push!(out, LevelMap(m.predictor, m.column,
+            _apply_subset(levels, m), m.source, m.subset))
+    end
+    return out
+end
+
+function _apply_subset(levels::Vector, m::LevelMap)
+    K = length(levels)
+    s = m.subset
+    vals = if s === Colon()
+        levels
+    elseif s isa UnitRange{Int}
+        last(s) <= K || _fail(:plan,
+            "LevelMap range $(repr(s)) exceeds $K observed levels of " *
+            "$(m.column)")
+        levels[s]
+    elseif s isa Vector{Int}
+        all(i -> 1 <= i <= K, s) || _fail(:plan,
+            "LevelMap indices $(repr(s)) exceed $K observed levels of " *
+            "$(m.column)")
+        levels[s]
+    else
+        lo = s[1]::Int
+        lo <= K || _fail(:plan,
+            "LevelMap ($(lo), :end) exceeds $K observed levels of " *
+            "$(m.column)")
+        levels[lo:end]
+    end
+    length(unique(vals)) == length(vals) ||
+        _fail(:plan, "LevelMap selects duplicate positions of " *
+                     "$(m.column) — got $(repr(vals))")
+    return collect(vals)
+end
+
+function _validate_levelmaps_data(plan::StructuralPlan)
+    # Rows whose codes fall outside the mapped levels contribute 0 (the
+    # subset is explicit on the page — e.g. reference rows under an
+    # intercept); unobserved mapped levels are allowed like any
+    # zero-variance column. The one failure is unfilled values.
+    for m in plan.levelmaps
+        isempty(m.values) && _fail(:plan,
+            "LevelMap for ($(m.predictor), $(m.column)) has no evaluated " *
+            "values (bind_data fills these — hand-built bound plans must too)")
+    end
+    return nothing
 end
 
 function _validate_priors(plan::StructuralPlan)
@@ -1209,9 +1350,11 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     end
     merged = merge(inferred, roles)
     n = length(first(values(columns)))
+    maps = _eval_levelmaps(plan.levelmaps, columns)
     bound = StructuralPlan(plan.responses, plan.predictors,
         plan.population_priors, plan.parameters, plan.assignments,
-        columns, n; roles = merged, derived = plan.derived)
+        columns, n; roles = merged, derived = plan.derived,
+        levelmaps = maps)
     validate_data(bound)
     return bound
 end

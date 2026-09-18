@@ -57,7 +57,7 @@ function assign_layout(plan::StructuralPlan)
     entries = LayoutEntry[]
     offset = 1
     for pred in plan.predictors
-        shape = design_shape(pred, plan.columns)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
         labels = Symbol[]
         for b in shape.blocks
             append!(labels, b.labels)

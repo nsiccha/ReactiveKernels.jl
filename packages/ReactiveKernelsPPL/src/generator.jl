@@ -109,7 +109,7 @@ _lp_name(pred::PredictorSpec) = Symbol(:_ppl_lp_, pred.name)
 function _predictor_statements(plan::StructuralPlan)
     stmts = Expr[]
     for pred in plan.predictors
-        shape = design_shape(pred, plan.columns)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
         lp = _lp_name(pred)
         terms = Any[]
         if shape.width > 0
@@ -309,7 +309,7 @@ function _prior_statements(plan::StructuralPlan)
     stmts = Expr[]
     terms = Any[]
     for pred in plan.predictors
-        shape = design_shape(pred, plan.columns)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
         shape.width == 0 && continue
         node = Symbol(:_ppl_prior_, pred.name)
         pw = Symbol(:_ppl_pw_prior_, pred.name)
