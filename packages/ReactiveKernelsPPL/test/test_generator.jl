@@ -501,3 +501,92 @@ end
     @test _query(bb.spec, b, :posterior, v) ≈
         _query(built.spec, plan, :posterior, v)
 end
+
+@testset "scan: centered AR(1) end to end" begin
+    m = @rkppl begin
+        phi ~ Normal(0, 1)
+        s ~ Exponential(1)
+        sigma ~ Exponential(1)
+        @scan begin
+            h[1] ~ Normal(0, 1)
+            for t in 2:T
+                h[t] ~ Normal(phi * h[t - 1], s)
+            end
+        end
+        y .~ Normal.(h, sigma)
+    end
+    ydata = [0.3, -0.1, 0.5, 0.2, -0.4]
+    plan = m(; y = ydata)
+    built = build_kernel(plan)
+    @test built.layout.total == 8            # phi, s, sigma, h[1..5]
+
+    # independent Distributions.jl oracle (per-step loop, never the plate form)
+    function ar1_oracle(u, y)
+        T = length(y)
+        phi = u[1]; s = exp(u[2]); sigma = exp(u[3]); h = u[4:(4 + T - 1)]
+        lp = logpdf(Normal(0, 1), phi) + logpdf(Exponential(1), s) +
+             logpdf(Exponential(1), sigma) + logpdf(Normal(0, 1), h[1])
+        for t in 2:T
+            lp += logpdf(Normal(phi * h[t - 1], s), h[t])
+        end
+        lp += sum(logpdf(Normal(h[t], sigma), y[t]) for t in 1:T)
+        return lp + u[2] + u[3]              # + log-Jacobian (s, sigma :exp)
+    end
+
+    for u in ([0.2, -0.3, -0.1, 0.1, -0.2, 0.3, 0.0, 0.15],
+              [-0.5, 0.4, 0.2, -0.3, 0.1, 0.0, 0.25, -0.1])
+        @test _query(built.spec, plan, :posterior, u) ≈ ar1_oracle(u, ydata)
+        _check_gradient(built.spec, plan, u)
+    end
+
+    # AR(2): two seeds, two lags — the recurrence reads h[t-1] and h[t-2]
+    m2 = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        s ~ Exponential(1)
+        sigma ~ Exponential(1)
+        @scan begin
+            h[1] ~ Normal(0, 1)
+            h[2] ~ Normal(0, 1)
+            for t in 3:T
+                h[t] ~ Normal(a * h[t - 1] + b * h[t - 2], s)
+            end
+        end
+        y .~ Normal.(h, sigma)
+    end
+    y2 = [0.1, -0.2, 0.3, 0.0, -0.1, 0.25]
+    p2 = m2(; y = y2)
+    b2 = build_kernel(p2)
+    @test b2.layout.total == 4 + length(y2)   # a, b, s, sigma, h[1..6]
+    function ar2_oracle(u, y)
+        T = length(y)
+        a = u[1]; b = u[2]; s = exp(u[3]); sigma = exp(u[4]); h = u[5:(5 + T - 1)]
+        lp = logpdf(Normal(0, 1), a) + logpdf(Normal(0, 1), b) +
+             logpdf(Exponential(1), s) + logpdf(Exponential(1), sigma) +
+             logpdf(Normal(0, 1), h[1]) + logpdf(Normal(0, 1), h[2])
+        for t in 3:T
+            lp += logpdf(Normal(a * h[t - 1] + b * h[t - 2], s), h[t])
+        end
+        lp += sum(logpdf(Normal(h[t], sigma), y[t]) for t in 1:T)
+        return lp + u[3] + u[4]
+    end
+    u2 = [0.3, -0.2, -0.1, 0.0, 0.1, -0.1, 0.2, 0.05, -0.15, 0.1]
+    @test _query(b2.spec, p2, :posterior, u2) ≈ ar2_oracle(u2, y2)
+    _check_gradient(b2.spec, p2, u2)
+
+    # non-centered recurrence is rejected at emission (slice 1)
+    mnc = @rkppl begin
+        phi ~ Normal(0, 1)
+        s ~ Exponential(1)
+        sigma ~ Exponential(1)
+        @scan begin
+            h[1] ~ Normal(0, 1)
+            for t in 2:T
+                eps ~ Normal(0, 1)
+                h[t] = phi * h[t - 1] + s * eps
+            end
+        end
+        y .~ Normal.(h, sigma)
+    end
+    @test_throws ContractValidationError build_kernel(mnc(; y = ydata))
+end
