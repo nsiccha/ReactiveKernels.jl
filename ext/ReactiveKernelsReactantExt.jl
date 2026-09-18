@@ -473,6 +473,26 @@ function Reactant.traced_type_inner(
     T
 end
 
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels.GraphReplicatedKernel,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels.GraphReplicatedKernel}
+    T
+end
+
+function ReactiveKernels._replicated_backend_call(
+        k::ReactiveKernels.GraphReplicatedKernel{B}, args) where {B}
+    names = Tuple(k.inputs[index].name for index in B)
+    fallback = ReactiveKernels._replica(k.target, names)
+    ReactiveKernels._replica_call(
+        fallback, args, getfield(args, first(B)))
+end
+
 # The batched AD wrapper is immutable compiler metadata for the same reason:
 # its scalar `PreparedADKernel` stays a host constant while only the batched
 # HAVE boundary is traced. Its execution method lowers the replica map to one

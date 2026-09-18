@@ -61,15 +61,14 @@ planner still performs HAVE/WANT selection and structural CSE. It rejects
 effectful recipes, and lifting also assumes pure straight-line semantics: hidden
 mutation or state carried between calls is not a batchable contract.
 
-Native execution validates ranks and equal batch lengths, evaluates independent
-positions, and stacks the requested outputs. This necessarily allocates output
-containers and copies array-valued slices; it is not the allocation-free
-reducing contract of a likelihood `plate`. In the current typed replica
-lowering, a recipe depending only on shared ports is still evaluated once per
-position because it remains inside the scalar kernel. When such invariant work
-dominates, precompute it once outside the position batch and pass the result as
-a shared HAVE today; graph-level invariant hoisting is a separate optimization
-boundary, not part of the current contract.
+Native graph lowering validates ranks and equal batch lengths, evaluates
+recipes that depend only on shared ports once, then evaluates position-dependent
+recipes once per position. It stacks requested outputs and copies array-valued
+slices, so it is not the allocation-free reducing contract of a likelihood
+`plate`. Authored plates, scans, embedded prepared kernels, and other composite
+compiler operations retain the complete scalar-callable fallback; that fallback
+currently re-evaluates shared-only recipes at every position. When fallback
+invariant work dominates, precompute it once and pass the result as shared HAVE.
 
 With Reactant, `@compile batched(positions, shared...)` lowers the same map to a
 backend batch primitive. A scalar kernel that compiles under Reactant therefore
