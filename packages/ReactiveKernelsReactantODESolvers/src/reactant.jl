@@ -107,8 +107,10 @@ step-size sequence itself is computed inside the program.
 
 Gradient recipe: differentiate a scalar loss over the compiled solve with
 plain `Enzyme.autodiff(::Reverse, ...)` *inside* a second compiled function;
-Reactant's Enzyme overlay lowers the pullback into the program. See the
-test suite for the exact composition.
+Reactant's Enzyme overlay lowers the pullback into the program. Build that
+closure with `early_exit=false` (Binomial-checkpointed reverse requires the
+single-comparison freeze shape). See the test suite for the exact
+composition.
 """
 function compile_ode_solve end
 
@@ -125,6 +127,12 @@ Build the raw traced closure compiled by [`compile_ode_solve`](@ref)
 (requires Reactant.jl; implemented by the package extension). Takes traced
 `(u0,)` or `(u0, p)` and returns traced `(endpoint, saveat_flat, status)`.
 Exposed for IR inspection (`Reactant.@code_hlo`) and custom compilation.
+
+Keyword `early_exit` (default `true`): the primal loop exits on `(n <
+maxiters) & (t < t1)`. Pass `early_exit=false` for the reverse-compatible
+freeze shape (single-comparison cond, runs out the bound) when the closure
+will be differentiated through; both shapes produce bitwise-identical
+values.
 """
 function traceable_ode_closure end
 
