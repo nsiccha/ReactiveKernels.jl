@@ -99,6 +99,7 @@ site_pages = [
             "Approximate GP (HSGP, distributional)" => "accel-gp.md",
             "BRM motorcycle (partial HSGP coordinates)" => "brm-hsgp.md",
             "Hierarchical GP" => "hierarchical-gp.md",
+            "Kronecker-structured GP (grid)" => "kronecker-gp.md",
             "Basketball-drive HMM (hmm_drive_1)" => "hmm-drive-1.md",
         ],
         "Declarative @ppl front-end + Gibbs (experimental)" => "ppl-front-end.md",

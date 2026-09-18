@@ -137,6 +137,7 @@ include("soil_incubation.jl")
 include("hmm_drive_1.jl")
 include("hmm_drive_0.jl")
 include("grsm_latent_reg_irt.jl")
+include("kronecker_gp.jl")
 
 export PPLWorkflow
 
@@ -289,5 +290,6 @@ export SoilIncubationExample
 export HmmDrive1Example
 export HmmDrive0Example
 export GrsmLatentRegIrtExample
+export KroneckerGpExample
 
 end # module ReactiveKernelsPPLExamples

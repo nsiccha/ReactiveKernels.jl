@@ -6,8 +6,21 @@
 # in the per-axis accounting.
 
 function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
-                        mod_data = nothing, reactant_grad = :pin_boundary)
+                        mod_data = nothing, reactant_grad = :pin_boundary,
+                        reactant_primal = :assert)
     q = pts[1]; rq = Reactant.to_rarray(q)
+
+    # Record an axis as UNSUPPORTED (complete exception + backtrace retained)
+    # instead of crashing the gate, when the caller opts into measured mode.
+    function _measured(axis, f)
+        try
+            f()
+        catch err
+            _retain(name, axis, err)
+            _axis!(name, "UNSUPPORTED Reactant axis [$axis]: compile/execute failed at this pin; complete diagnostic retained")
+            println("  [$axis] UNSUPPORTED (measured at this pin; diagnostic retained)"); flush(stdout)
+        end
+    end
 
     # ---- [3a] Reactant primal of the public ALL-BOUND query vs native ----
     # The HLO shape of THIS query is measured and reported without claiming a
@@ -17,15 +30,18 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
     # asserts on — because `module_string` is empty on the pinned Reactant
     # (0.2.285) and a count against it is vacuous; the HLO byte size is recorded
     # next to every count as the positive control (bytes=0 → no shape claim).
-    kbc = Reactant.compile(kb, (rq,); sync = true)
-    vc = Float64(kbc(rq)); vn = kb(q)
-    rp = _relv(vc, vn)
-    @assert isfinite(vc) && rp < RPRIMAL_TOL "$name: Reactant primal rel=$rp ≥ $RPRIMAL_TOL"
-    bound_hlo = repr(Reactant.@code_hlo optimize = false kb(rq))
-    bound_while = count("stablehlo.while", bound_hlo)
-    bound_bytes = length(codeunits(bound_hlo))
-    _axis!(name, "PASS Reactant primal (all-bound query) rel=$(round(rp; sigdigits=4)) (1 probe); stablehlo.while=$bound_while, hlo_bytes=$bound_bytes (@code_hlo; compiler-specialized shape, no carry-loop claim)")
-    println("  [3a] Reactant primal (all-bound) rel=$(round(rp; sigdigits=4))  (< $RPRIMAL_TOL; 1 probe) PASS; stablehlo.while=$bound_while, hlo_bytes=$bound_bytes (@code_hlo; reported)"); flush(stdout)
+    function _axis_3a()
+        kbc = Reactant.compile(kb, (rq,); sync = true)
+        vc = Float64(kbc(rq)); vn = kb(q)
+        rp = _relv(vc, vn)
+        @assert isfinite(vc) && rp < RPRIMAL_TOL "$name: Reactant primal rel=$rp ≥ $RPRIMAL_TOL"
+        bound_hlo = repr(Reactant.@code_hlo optimize = false kb(rq))
+        bound_while = count("stablehlo.while", bound_hlo)
+        bound_bytes = length(codeunits(bound_hlo))
+        _axis!(name, "PASS Reactant primal (all-bound query) rel=$(round(rp; sigdigits=4)) (1 probe); stablehlo.while=$bound_while, hlo_bytes=$bound_bytes (@code_hlo; compiler-specialized shape, no carry-loop claim)")
+        println("  [3a] Reactant primal (all-bound) rel=$(round(rp; sigdigits=4))  (< $RPRIMAL_TOL; 1 probe) PASS; stablehlo.while=$bound_while, hlo_bytes=$bound_bytes (@code_hlo; reported)"); flush(stdout)
+    end
+    reactant_primal === :assert ? _axis_3a() : _measured(3, _axis_3a)
 
     # ---- [3b] traced-stream query: measure the HLO shape on this boundary ----
     # MEASURED, not assumed: the while count is recorded per axis from
@@ -42,7 +58,12 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
     # compiled-gradient axis [4] on that same query.
     int_ports = any(f -> data[String(f)] isa AbstractVector{Int} ||
                            data[String(f)] isa Int, Base.tail(have))
-    if !int_ports
+    function _axis_3b()
+        if int_ports
+        _axis!(name, "UNSUPPORTED Reactant traced-stream query at this pin: integer data ports (ii/jj/y/I) do not lower as traced streams (traced-boolean TypeError; retained diagnostic)")
+        println("  [3b] traced streams UNSUPPORTED (traced-integer ports at this pin; diagnostic retained)"); flush(stdout)
+            return
+        end
         data_bnd = bind(_GATE_DATA[])
         kb_free = prepare(build(); have, want = :posterior)
         traced = (Reactant.to_rarray(q),
@@ -56,9 +77,11 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
         traced_bytes = length(codeunits(traced_hlo))
         _axis!(name, "PASS Reactant primal (traced-stream query) rel=$(round(rt; sigdigits=4)) (1 probe); stablehlo.while=$traced_while, hlo_bytes=$traced_bytes (@code_hlo; measured, not asserted)")
         println("  [3b] Reactant primal (traced streams) rel=$(round(rt; sigdigits=4))  (< $RPRIMAL_TOL; 1 probe) PASS; stablehlo.while=$traced_while, hlo_bytes=$traced_bytes (@code_hlo; measured, not asserted)"); flush(stdout)
+    end
+    if int_ports || reactant_primal === :measure
+        int_ports ? _axis_3b() : _measured(3, _axis_3b)
     else
-        _axis!(name, "UNSUPPORTED Reactant traced-stream query at this pin: integer data ports (ii/jj/y/I) do not lower as traced streams (traced-boolean TypeError; retained diagnostic)")
-        println("  [3b] traced streams UNSUPPORTED (traced-integer ports at this pin; diagnostic retained)"); flush(stdout)
+        _axis_3b()
     end
 
     # ---- [4] Reactant gradient vs Stan (fresh process; no priming here) ----
@@ -97,7 +120,9 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
             "PASS Reactant gradient rel=$(round(rgr; sigdigits=4)) (1 probe)"
         catch err
             text = _retain(name, 4, err)
-            if occursin(_GAP_NEEDLE, text)
+            if reactant_grad === :measure
+                "UNSUPPORTED Reactant gradient: compile/execute failed at this pin; complete diagnostic retained"
+            elseif occursin(_GAP_NEEDLE, text)
                 "UNSUPPORTED Reactant gradient: documented $_GAP_SNAG failure; complete diagnostic retained"
             else
                 rethrow(err)

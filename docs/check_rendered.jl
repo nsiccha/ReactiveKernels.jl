@@ -352,6 +352,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "gp-pois-regr.md" => 1,
         "accel-gp.md" => 1,
         "hierarchical-gp.md" => 1,
+        "kronecker-gp.md" => 1,
     )
     expected_source_examples = Dict(
         "reactivehmc-corpus.md" => 5,

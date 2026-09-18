@@ -141,7 +141,7 @@ end
 
 function gate(name; build, have, bind, n_bind, scale = 0.3, seed = 468,
               do_reactant = true, boundary_point = nothing, mod_data = nothing,
-              reactant_grad = :pin_boundary)
+              reactant_grad = :pin_boundary, reactant_primal = :assert)
     println("\n########## $name ##########"); flush(stdout)
     push!(_AXES, name => String[])
     # First graph use happens HERE, inside an ordinary function, then again per
@@ -189,6 +189,8 @@ function gate(name; build, have, bind, n_bind, scale = 0.3, seed = 468,
             text = _retain(name, 2, err)
             if occursin(_GAP_NEEDLE, text)
                 "UNSUPPORTED gradient: documented $_GAP_SNAG failure reproduces; complete diagnostic retained"
+            elseif occursin("EnzymeNoDerivativeError", text)
+                "UNSUPPORTED gradient: Enzyme has no derivative rule for a primitive in this graph (EnzymeNoDerivativeError; complete diagnostic retained)"
             else
                 rethrow(err)
             end
@@ -233,7 +235,7 @@ function gate(name; build, have, bind, n_bind, scale = 0.3, seed = 468,
 
     do_reactant &&
         _reactant_axes(name, build, kb, sm, pts, have, bind, data, mod_data,
-                       reactant_grad)
+                       reactant_grad, reactant_primal)
     return
 end
 
@@ -243,7 +245,8 @@ else
     _reactant_axes(args...) = nothing
 end
 
-const KNOWN_MODELS = ("hmm_drive_1", "hmm_drive_0", "grsm_latent_reg_irt")
+const KNOWN_MODELS = ("hmm_drive_1", "hmm_drive_0", "grsm_latent_reg_irt",
+                      "kronecker_gp")
 const SEL = strip.(split(get(ENV, "STRUCTURED_MODELS", join(KNOWN_MODELS, ',')), ','))
 isempty(SEL) && error("STRUCTURED_MODELS selected no models")
 length(unique(SEL)) == length(SEL) ||
@@ -304,6 +307,26 @@ _want("grsm_latent_reg_irt") && gate("science_irt-grsm_latent_reg_irt";
             "\"W\":$(_mat_json(_mat(d["W"])))"], ",") * "}"
     end)
 _want("grsm_latent_reg_irt") && push!(_RAN, "grsm_latent_reg_irt")
+
+# kronecker_gp — Kronecker-structured GP over a 2-D grid: RBF margin ×
+# correlation margin (LKJ(2) Cholesky factor), each exactly diagonalized
+# in-graph. The Reactant axes run in MEASURED mode: dense symmetric
+# eigendecomposition lowering through Reactant/EnzymeMLIR is not established
+# at this pin, and the per-axis outcome (PASS or UNSUPPORTED with retained
+# diagnostics) is recorded, never asserted in advance.
+_want("kronecker_gp") && gate("synthetic_grid_RBF_kernels-kronecker_gp";
+    build = () -> PE.KroneckerGpExample.build_kronecker_gp_graph(),
+    have = (:unconstrained, :x1, :y),
+    bind = d -> (x1 = Float64.(d["x1"]), y = _mat(d["y"])),
+    n_bind = (d, n) -> (x1 = Float64.(d["x1"]), y = _mat(d["y"])[:, 1:n]),
+    scale = 0.1, do_reactant = DO_REACTANT,
+    reactant_grad = :measure, reactant_primal = :measure,
+    mod_data = (d, n) -> begin
+        "{" * join(["\"n1\":$n", "\"n2\":$(Int(d["n2"]))",
+            "\"x1\":$(_vec_json(d["x1"]))",
+            "\"y\":$(_mat_json(_mat(d["y"])[:, 1:n]))"], ",") * "}"
+    end)
+_want("kronecker_gp") && push!(_RAN, "kronecker_gp")
 
 # Executed set must equal the selection, exactly once each.
 const _EXPECTED = filter(m -> m in SEL, KNOWN_MODELS)

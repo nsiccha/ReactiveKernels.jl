@@ -128,6 +128,9 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "brm-hsgp.md",
         "manual-derivative-rules.md",
         "hmm-drive-1.md",
+        # The Kronecker GP page owns its exact native-Enzyme/Reactant boundary
+        # disclosure (dense eigendecomposition gradient axes) the same way.
+        "kronecker-gp.md",
         "mnist-reactant.md",
         "ppl-ad.md",
         "probprog-mcmc.md",

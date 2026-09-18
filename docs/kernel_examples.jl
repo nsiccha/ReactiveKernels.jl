@@ -621,6 +621,17 @@ function setup_grsm_latent_reg_irt!(mod::Module)
     nothing
 end
 
+function setup_kronecker_gp!(mod::Module)
+    if !isdefined(mod, :KroneckerGpExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: KroneckerGpExample))
+    end
+    # Bind the grid locations x1 and the observation matrix y; the squared-
+    # distance matrix, both margin eigendecompositions, and the LKJ-Cholesky
+    # transform are derived in-graph.
+    Core.eval(mod, :(using .KroneckerGpExample: KRON_X1, KRON_Y))
+    nothing
+end
+
 function setup_glmm1!(mod::Module)
     if !isdefined(mod, :GLMM1ModelExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: GLMM1ModelExample))
@@ -1226,6 +1237,7 @@ const EXPECTED_PPL_EXAMPLES = (
     :hier_2pl_posterior,
     :gpcm_latent_reg_irt_posterior,
     :grsm_latent_reg_irt_posterior,
+    :kronecker_gp_posterior,
     :glmm1_model_posterior,
     :bym2_offset_only_posterior,
     :bones_model_posterior,
