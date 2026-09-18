@@ -28,6 +28,7 @@ const _MATRIX_CORE_TESTS = (
     "test_brm_hsgp.jl",
     "test_runtests_selector.jl",
     "test_stateless.jl",
+    "test_lower_with_ops.jl",
     "test_partial_evaluation.jl",
     "test_inner_plate_partial_evaluation.jl",
     "test_ad.jl",
