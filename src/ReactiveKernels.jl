@@ -56,7 +56,7 @@ export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
 export prepare_ad_pullback, ad_pullback
 export ad_value_and_pullback, ad_value_and_pullback!
 export compile_ad_gradient, compile_ad_value_and_gradient
-export lower, lower_batched, replica, plate_body, scan_body, transform, compile
+export lower, lower_with_ops, lower_batched, replica, plate_body, scan_body, transform, compile
 export prepare_batched, vectorize
 export batched_ports, scalar_kernel
 export explain, code_expr, inputs, outputs, valtype
