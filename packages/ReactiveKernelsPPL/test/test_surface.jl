@@ -31,7 +31,16 @@ _plans_equal(a::StructuralPlan, b::StructuralPlan) =
     all(_deriveds_equal.(a.derived, b.derived)) &&
     length(a.levelmaps) == length(b.levelmaps) &&
     all(_maps_equal.(a.levelmaps, b.levelmaps)) &&
+    length(a.plate_parameters) == length(b.plate_parameters) &&
+    all(_pparams_equal.(a.plate_parameters, b.plate_parameters)) &&
     a.columns == b.columns && a.n_obs === b.n_obs && a.roles == b.roles
+
+_pparams_equal(a::PlateParameter, b::PlateParameter) =
+    a.name === b.name && a.family === b.family &&
+    Tuple(keys(a.args)) == Tuple(keys(b.args)) &&
+    all(air -> air[1] === air[2], zip(values(a.args), values(b.args))) &&
+    a.support_override === b.support_override && a.range == b.range &&
+    a.label === b.label
 
 _maps_equal(a::LevelMap, b::LevelMap) =
     a.predictor === b.predictor && a.column === b.column &&
@@ -1252,4 +1261,103 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         Expr(:macrocall, Symbol("@scan"), LineNumberNode(1),
             Expr(:block, :(y .~ Normal.(mu, s))))), Dn)
+end
+
+# Slice: `@plate` per-cell sampling — `theta[i] ~ Normal(mu, tau)` declares a
+# per-cell latent (a PlateParameter), read as the response location.
+_re_surface(R) = Expr(:block,
+    :(mu ~ Normal(0, 5)), :(sigma ~ Exponential(1)), :(tau ~ Exponential(1)),
+    Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
+        Expr(:for, Expr(:(=), :i, R),
+            Expr(:block, LineNumberNode(6),
+                :(theta[i] ~ Normal(mu, tau)),
+                :(y[i] ~ Normal.(theta[i], sigma))))))
+
+@testset "surface plate per-cell sampling" begin
+    cols, n = _gen_columns()
+    plan = lower_rkppl(_re_surface(:(eachindex(y))), (:y, :x))
+    # A per-cell latent parameter + a LatentTerm location predictor.
+    @test length(plan.plate_parameters) == 1
+    pp = plan.plate_parameters[1]
+    @test pp.name === :theta && pp.family === :normal &&
+        Tuple(keys(pp.args)) == (:arg1, :arg2) &&
+        collect(values(pp.args)) == [:mu, :tau] && pp.range === nothing
+    @test Set(p.name for p in plan.parameters) == Set([:mu, :sigma, :tau])
+    loc = only(plan.predictors)
+    @test loc.name === :y_loc && length(loc.terms) == 1 &&
+        loc.terms[1].kind === LatentTerm && loc.terms[1].columns == [:theta]
+    @test only(plan.responses).predictor === :y_loc
+    @test only(plan.responses).scale === :sigma
+    # Hand-built plan equality.
+    hand = _unexp(
+        LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :y_loc,
+            :sigma, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:y_loc, IdentityLink,
+            TermSpec[TermSpec(LatentTerm, [:theta], NamedTuple(), :theta,
+                :theta_lat)], :y_loc)],
+        PopulationPrior[],
+        SampledParameter[
+            SampledParameter(:mu, :normal, (arg1 = 0, arg2 = 5), nothing, :mu),
+            SampledParameter(:sigma, :exponential, (arg1 = 1,), nothing, :sigma),
+            SampledParameter(:tau, :exponential, (arg1 = 1,), nothing, :tau)])
+    hand = StructuralPlan(hand.responses, hand.predictors, hand.population_priors,
+        hand.parameters, hand.assignments, Dict{Symbol,AbstractVector}(), 0;
+        plate_parameters = PlateParameter[
+            PlateParameter(:theta, :normal, (arg1 = :mu, arg2 = :tau), nothing)])
+    @test _plans_equal(plan, hand)
+    # eachindex/axes plates are plan-identical.
+    @test _plans_equal(lower_rkppl(_re_surface(:(axes(y, 1))), (:y, :x)), plan)
+    # Literal range rides on the plate parameter and the response.
+    lit = lower_rkppl(_re_surface(:(1:6)), (:y, :x))
+    @test lit.plate_parameters[1].range == 1:6
+    @test lit.responses[1].range == 1:6
+    # Values match a Distributions.jl oracle end to end.
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    u = [0.3, -0.2, 0.1, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]
+    nt = constrain(built.layout, u)
+    mu, sigma, tau, theta = nt.mu, nt.sigma, nt.tau, Vector(nt.theta)
+    ll = sum(logpdf.(Normal.(theta, sigma), cols[:y]))
+    pr = logpdf(Normal(0, 5), mu) + logpdf(Exponential(1), sigma) +
+        logpdf(Exponential(1), tau) + sum(logpdf.(Normal(mu, tau), theta))
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2] + u[3]
+    # HalfNormal per-cell latent lowers to a :positive plate parameter.
+    hn = lower_rkppl(Expr(:block,
+        :(sigma ~ Exponential(1)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(b[i] ~ HalfNormal(1)),
+                    :(y[i] ~ Normal.(b[i], sigma)))))), (:y,))
+    @test hn.plate_parameters[1].support_override === :positive
+end
+
+@testset "surface plate per-cell sampling failures" begin
+    Dn = (:y, :x)
+    # Dotted object for a per-cell latent declaration (must be scalar/undotted).
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(theta[i] ~ Normal.(0, 1)),
+                    :(y[i] ~ Normal.(theta[i], 1)))))), Dn)
+    # Bare per-cell sample (must index the latent, or move the prior out).
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(theta ~ Normal(0, 1)),
+                    :(y[i] ~ Normal.(theta, 1)))))), Dn)
+    # Per-cell prior arg cannot be `[i]`-indexed in slice-1 (shared scalars).
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        :(sigma ~ Exponential(1)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(theta[i] ~ Normal(x[i], 1)),
+                    :(y[i] ~ Normal.(theta[i], sigma)))))), Dn)
+    # A latent buried in a predictor expression (mixed latent + fixed) defers.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        :(sigma ~ Exponential(1)), :(b ~ Normal(0, 1)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(theta[i] ~ Normal(0, 1)),
+                    :(y[i] ~ Normal.(theta[i] .+ b .* x[i], sigma)))))), Dn)
 end
