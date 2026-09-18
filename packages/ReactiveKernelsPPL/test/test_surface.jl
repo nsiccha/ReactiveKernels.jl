@@ -319,6 +319,108 @@ end
     end, (:y, 42))
 end
 
+@testset "surface one-sided bounds and factor refs" begin
+    # ±Inf normalizes to a missing side (Distributions.jl one-sided spelling).
+    got = lower_rkppl(quote
+        mu = a + b * x
+        y ~ truncated(Normal(mu, s), -Inf, 4)
+        s ~ Exponential(1)
+    end, (:y, :x))
+    @test got.responses[1].evidence == ResponseEvidence(:truncated, nothing, 4)
+    got = lower_rkppl(quote
+        mu = a + b * x
+        y ~ truncated(Normal(mu, s), 0, Inf)
+        s ~ Exponential(1)
+    end, (:y, :x))
+    @test got.responses[1].evidence ==
+        ResponseEvidence(:truncated, 0, nothing)
+    # Emitter-built ASTs carry actual ±Inf floats, not Symbols.
+    _swap999(ex, v) = ex isa Expr ?
+        Expr(ex.head, (_swap999(a, v) for a in ex.args)...) :
+        (ex == -999 ? v : ex)
+    ast = _swap999(quote
+        mu = a + b * x
+        y ~ censored(Normal(mu, s), -999, 4)
+        s ~ Exponential(1)
+    end, -Inf)
+    got = lower_rkppl(ast, (:y, :x))
+    @test got.responses[1].evidence == ResponseEvidence(:censored, nothing, 4)
+    ast = _swap999(quote
+        mu = a + b * x
+        y ~ censored(Normal(mu, s), 0, -999)
+        s ~ Exponential(1)
+    end, Inf)
+    got = lower_rkppl(ast, (:y, :x))
+    @test got.responses[1].evidence ==
+        ResponseEvidence(:censored, 0, nothing)
+    # Crossed infinities are degenerate, not missing.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a + b * x
+        y ~ truncated(Normal(mu, s), Inf, 4)
+        s ~ Exponential(1)
+    end, (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a + b * x
+        y ~ truncated(Normal(mu, s), 0, -Inf)
+        s ~ Exponential(1)
+    end, (:y, :x))
+    # One-sided surface evidence binds, builds, and values end to end.
+    m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        s ~ Exponential(1)
+        mu = a + b * x
+        y ~ truncated(Normal(mu, s), -Inf, 4.0)
+    end
+    cols, _ = _gen_columns()
+    bound = m(; y = cols[:y], x = cols[:x])
+    @test bound.responses[1].evidence ==
+        ResponseEvidence(:truncated, nothing, 4.0)
+    built = build_kernel(bound)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    si = nt.s
+    base = sum(logpdf.(Normal.(mu, si), cols[:y]))
+    corr = sum(log.(cdf.(Normal.(mu, si), 4.0)))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Exponential(1), si)
+    @test _query(built.spec, bound, :posterior, u) ≈ base - corr + pr + u[3]
+    _check_gradient(built.spec, bound, u)
+    # treatment(g, ref) pins the reference level; bare g stays ref 1.
+    got = lower_rkppl(quote
+        mu = a + c[treatment(g, 3)]
+        y ~ Normal(mu, 1.0)
+    end, (:y, :x, :g))
+    @test _terms_equal(got.predictors[1].terms[2],
+        TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 3), :g,
+            :g_term))
+    @test got.population_priors ==
+        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
+            PopulationPrior(:mu, :g, 0.0, 1.0)]
+    got = lower_rkppl(quote
+        mu = a + c[treatment(g)]
+        y ~ Normal(mu, 1.0)
+    end, (:y, :x, :g))
+    @test got.predictors[1].terms[2].options == (contrasts = :treatment, ref = 1)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a + c[treatment(g, 0)]
+        y ~ Normal(mu, 1.0)
+    end, (:y, :x, :g))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a + c[treatment(g, r)]
+        y ~ Normal(mu, 1.0)
+    end, (:y, :x, :g))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a + c[treatment(gg, 3)]
+        y ~ Normal(mu, 1.0)
+    end, (:y, :x, :g))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a + c[sumcode(g)]
+        y ~ Normal(mu, 1.0)
+    end, (:y, :x, :g))
+end
+
 @testset "surface error paths" begin
     Dn = (:y, :x)
     # Control flow, target, reserved macros.
