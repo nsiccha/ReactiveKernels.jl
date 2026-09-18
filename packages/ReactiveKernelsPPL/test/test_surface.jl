@@ -703,7 +703,8 @@ end
 
 @testset "surface error paths" begin
     Dn = (:y, :x)
-    # Control flow, target, reserved macros.
+    # Control flow, target, reserved macros (@plate admitted since slice B;
+    # @scan still reserved).
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         for i in 1:3
@@ -716,8 +717,8 @@ end
         target += 1.0
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        @plate for i in 1:3
-            y[i] ~ Normal.(mu, 1.0)
+        @plate begin
+            y .~ Normal.(mu, 1.0)
         end
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -1065,4 +1066,190 @@ _ranged_ast(lhs) = Expr(:block,
             p.assignments, p.columns, p.n_obs; derived = p.derived)
     end
     @test_throws ContractValidationError validate_structure(off)
+end
+
+# Slice B: `@plate for i in R` desugar — observations + deterministic
+# cells lower to the same plans as their top-level spellings.
+_plate_gauss(R) = Expr(:block,
+    :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+    :(mu = a .+ b .* x),
+    Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
+        Expr(:for, Expr(:(=), :i, R),
+            Expr(:block, LineNumberNode(6),
+                :(y[i] ~ Normal.(mu[i], s))))))
+
+@testset "surface plate" begin
+    cols, n = _gen_columns()
+    bare = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(mu = a .+ b .* x), :(y .~ Normal.(mu, s))), (:y, :x))
+    # eachindex/axes plates are plan-identical to bare `.~`.
+    for R in (:(eachindex(y)), :(axes(y, 1)))
+        @test _plans_equal(lower_rkppl(_plate_gauss(R), (:y, :x)), bare)
+    end
+    # Literal-range plates carry the range like `y[1:N]`.
+    lit = lower_rkppl(_plate_gauss(:(1:6)), (:y, :x))
+    @test lit.responses[1].range == 1:6
+    ranged = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(mu = a .+ b .* x),
+            Expr(:call, :.~, :(y[1:6]), :(Normal.(mu, s)))), (:y, :x))
+    @test _plans_equal(lit, ranged)
+    # Deterministic cells: predictor-via-cell ≡ top-level predictor.
+    cell = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(4),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, LineNumberNode(5),
+                        :(t = a .+ b .* x[i]),
+                        :(y[i] ~ Normal.(t, s)))))), (:y, :x))
+    top = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(t = a .+ b .* x), :(y .~ Normal.(t, s))), (:y, :x))
+    @test _plans_equal(cell, top)
+    # Values agree end to end.
+    u = [0.5, -0.25, 0.1]
+    bb, pb = bind_data(bare, cols), bind_data(
+        lower_rkppl(_plate_gauss(:(eachindex(y))), (:y, :x)), cols)
+    @test _query(build_kernel(pb).spec, pb, :posterior, u) ==
+        _query(build_kernel(bb).spec, bb, :posterior, u)
+    # Scalar cell objects are rejected (dots as written, like top level).
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(mu = a .+ b .* x),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, LineNumberNode(6),
+                        :(y[i] ~ Normal(mu[i], s)))))), (:y, :x))
+    # Dotted wrappers strip through the desugar.
+    wrap = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(mu = a .+ b .* x),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, LineNumberNode(6),
+                        :(y[i] ~ truncated.(Normal.(mu[i], s), 0, 10)))))),
+        (:y, :x))
+    wraptop = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(mu = a .+ b .* x),
+            :(y .~ truncated.(Normal.(mu, s), 0, 10))), (:y, :x))
+    @test _plans_equal(wrap, wraptop)
+end
+
+@testset "surface plate failures" begin
+    Dn = (:y, :x, :g)
+    # Shape violations: non-for plate, multi-index, values-iteration,
+    # bad ranges, empty body, nested plates, non-statement cells.
+    badloops = Any[
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:block, :(y .~ Normal.(mu, s)))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for,
+                Expr(:block, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:(=), :j, :(eachindex(y)))),
+                Expr(:block, :(y[i] ~ Normal.(mu[i], s))))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :d, :doses),
+                Expr(:block, :(y[d] ~ Normal(mu[d], s))))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(1:n)),
+                Expr(:block, :(y[i] ~ Normal.(mu[i], s))))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(axes(y, 2))),
+                Expr(:block, :(y[i] ~ Normal.(mu[i], s))))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))), Expr(:block))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
+                        Expr(:for, Expr(:(=), :j, :(eachindex(y))),
+                            Expr(:block, :(y[j] ~ Normal.(mu[j], s)))))))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(for j in 1:3
+                    y[j] ~ Normal.(mu[j], s)
+                end)))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(if a > 0
+                    y[i] ~ Normal.(mu[i], s)
+                end)))),
+    ]
+    for bad in badloops
+        @test_throws SurfaceLoweringError lower_rkppl(
+            Expr(:block, :(mu = a .+ b .* x), bad), Dn)
+    end
+    # Cell violations: broadcast, cross/lag index, bare loop var,
+    # scalar cells, non-data sampled, bare priors, factor indexing.
+    badcells = Any[
+        :(y[i] .~ Normal.(mu[i], s)),
+        :(y[j] ~ Normal.(mu[j], s)),
+        :(y[i] ~ Normal.(x[i - 1], s)),
+        :(y[i] ~ Normal.(i, s)),
+        :(y[3] ~ Normal.(mu[3], s)),
+        :(z[i] ~ Normal.(0, 1)),
+        :(s ~ Exponential(1)),
+        :(y[i] ~ Normal.(c[g[i]], s)),
+        :(y[i, 1] ~ Normal.(mu[i], s)),
+    ]
+    for bad in badcells
+        @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+                :(mu = a .+ b .* x),
+                Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                    Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                        Expr(:block, bad)))), Dn)
+    end
+    # Bare whole vectors in cells (data, predictor, derived).
+    for bad in (:(y[i] ~ Normal.(x, s)), :(y[i] ~ Normal.(mu, s)))
+        @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+                :(mu = a .+ b .* x),
+                Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                    Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                        Expr(:block, bad)))), Dn)
+    end
+    # The predictor case names the fix (it would lower silently).
+    err = try
+        lower_rkppl(Expr(:block,
+                :(mu = a .+ b .* x),
+                Expr(:macrocall, Symbol("@plate"), LineNumberNode(9),
+                    Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                        Expr(:block, :(y[i] ~ Normal.(mu, s)))))), Dn)
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError &&
+        occursin("reads a whole vector", err.message) &&
+        occursin("line 9", err.message)
+    # Cross-column ranges; write violations; ownership across forms.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(mu = a .+ b .* x),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                Expr(:for, Expr(:(=), :i, :(eachindex(x))),
+                    Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))), Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, :(a = x[i]))))), Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, :(x = x[i]))))), Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(y .~ Normal.(mu, s)),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))), Dn)
+    # Docstrings on plates do not lower; @scan stays reserved.
+    plate = Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
+        Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+            Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))
+    doc = Expr(:macrocall, Symbol("@doc"), LineNumberNode(1), "docs", plate)
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block, doc), Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:macrocall, Symbol("@scan"), LineNumberNode(1),
+            Expr(:block, :(y .~ Normal.(mu, s))))), Dn)
 end

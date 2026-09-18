@@ -5,7 +5,8 @@
 # statements, deterministic `=`, `model(; data...)` binding) under the
 # standing constraints: Distributions.jl constructors (never Stan lowercase),
 # immutable single-assignment top level, no control flow, no `target`,
-# `@plate`/`@scan` reserved. Broadcasting is EXPLICIT (no implied
+# `@plate` observations + deterministic cells (desugar; sampled cells
+# deferred), `@scan` reserved. Broadcasting is EXPLICIT (no implied
 # vectorization anywhere): vector math is dotted (`mu = a .+ b .* x` —
 # undotted scalar/vector `+` is a `MethodError` in Julia too), and vector
 # responses use the Turing dotted tilde (`y .~ Normal.(mu, sigma)`).
@@ -123,7 +124,7 @@ function lower_rkppl(ast, data_names)::StructuralPlan
     end
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
-    sample, det = _partition_statements(ast, data)
+    sample, det, plate_ctx = _partition_statements(ast, data)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     normal_priors = Set{Symbol}(s.lhs for s in sample
@@ -196,6 +197,8 @@ function lower_rkppl(ast, data_names)::StructuralPlan
                                         "column (predictor $(d.label))")
         end
     end
+    _check_plate_bares(plate_ctx, data, Set{Symbol}(p.name for p in predictors),
+        Set{Symbol}(d.name for d in derived), _factor_coefs(coefuse, predictors))
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
         levelmaps = levelmaps)
@@ -523,7 +526,8 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     seelines = Dict{Symbol,Int}()
     seen_doc = false
     line = 0
-    for arg in ast.args
+    args, plate_ctx = _expand_plates(ast.args, data)
+    for arg in args
         if arg isa LineNumberNode
             line = arg.line
             continue
@@ -556,7 +560,254 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             _reject_statement(st)
         end
     end
-    return sample, det
+    return sample, det, plate_ctx
+end
+
+# Pre-pass: expand top-level `@plate for i in R ... end` blocks into
+# spliced top-level statements (desugar slice: observations +
+# deterministic cells; per-cell sampled arrays deferred). Spliced
+# statements carry the plate's line for claim messages. Also returns the
+# plate context: `(lhs, line, bare-symbols)` per spliced statement for
+# the post-analysis whole-vector check.
+function _expand_plates(args, data::Set{Symbol})
+    expanded = Any[]
+    ctx = Tuple{Symbol,Int,Set{Symbol}}[]
+    line = 0
+    for arg in args
+        if arg isa LineNumberNode
+            line = arg.line
+            push!(expanded, arg)
+            continue
+        end
+        if arg isa Expr && arg.head === :macrocall && !isempty(arg.args) &&
+                arg.args[1] === Symbol("@plate")
+            pl = line
+            if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
+                pl = arg.args[2].line
+            end
+            stmts, stx = _desugar_plate(arg, pl, data)
+            for st in stmts
+                pl > 0 && push!(expanded, LineNumberNode(pl))
+                push!(expanded, st)
+            end
+            append!(ctx, stx)
+            continue
+        end
+        push!(expanded, arg)
+    end
+    return expanded, ctx
+end
+
+function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
+    (length(st.args) == 3 && st.args[3] isa Expr &&
+        st.args[3].head === :for) ||
+        _sfail("`@plate` takes `@plate for i in R ... end` exactly")
+    loop = st.args[3]
+    asg = loop.args[1]
+    asg isa Expr && asg.head === :block &&
+        _sfail("`@plate` takes one loop variable (multi-index plates " *
+               "are planned)")
+    (asg isa Expr && asg.head === :(=) && length(asg.args) == 2 &&
+        asg.args[1] isa Symbol) ||
+        _sfail("`@plate` loop must be `for i in R`")
+    ivar = asg.args[1]
+    R = asg.args[2]
+    rkind = _plate_range_kind(R)
+    body = loop.args[2]
+    cells = Any[a for a in body.args if !(a isa LineNumberNode)]
+    isempty(cells) && _sfail("`@plate` body is empty")
+    # Names bound by `=` anywhere in this plate (cell locals, excluded
+    # from the bare-vector check even on forward reference).
+    plate_defs = Set{Symbol}()
+    for c in cells
+        c isa Expr && c.head === :(=) && length(c.args) == 2 &&
+            c.args[1] isa Symbol && push!(plate_defs, c.args[1])
+    end
+    out = Expr[]
+    ctx = Tuple{Symbol,Int,Set{Symbol}}[]
+    for c in cells
+        push!(out, _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx)...)
+    end
+    return out, ctx
+end
+
+# Plate ranges mirror the response ranges: literal `a:b` (validated via
+# the desugared `y[a:b]` form), `eachindex(v)`, `axes(v, 1)`.
+function _plate_range_kind(R)
+    R isa Expr && R.head === :call && !isempty(R.args) || return _sfail(
+        "`@plate` range must be `1:N`, `eachindex(v)`, or `axes(v, 1)` — " *
+        "got $(repr(R)) (values-iteration is planned)")
+    R.args[1] === :(:) && return (:coloncall, R)
+    R.args[1] === :eachindex && length(R.args) == 2 &&
+        R.args[2] isa Symbol && return (:eachindex, R.args[2])
+    R.args[1] === :axes && length(R.args) == 3 && R.args[2] isa Symbol &&
+        R.args[3] == 1 && return (:axes, R.args[2])
+    return _sfail("`@plate` range must be `1:N`, `eachindex(v)`, or " *
+                  "`axes(v, 1)` — got $(repr(R))")
+end
+
+# One cell statement → spliced top-level statement(s). Observations
+# (`y[i] ~ OBJ`) become `y .~ OBJ.` (or `y[a:b] .~ OBJ.` under a literal
+# range); deterministic cells strip to top level (visible model-wide —
+# documented looseness: desugared locals leak like any top-level det).
+function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx)
+    c isa Expr || _sfail("cells hold `~` observations and `=` " *
+                         "assignments only")
+    if c.head === :macrocall && !isempty(c.args) &&
+            c.args[1] === Symbol("@plate")
+        _sfail("nested `@plate` blocks do not lower")
+    end
+    if _is_broadcast_sample(c)
+        _sfail("cells are scalar (`~`); broadcast (`.~`) at top level")
+    end
+    if _is_sample(c)
+        return [_desugar_cell_sample(c, ivar, rkind, line, data, plate_defs,
+            ctx)]
+    end
+    if c.head === :(=) && length(c.args) == 2 && c.args[1] isa Symbol
+        lhs = c.args[1]
+        lhs in data && _sfail("cell assignment `$lhs = ...` redefines " *
+                              "bound data")
+        bares = _cell_bares(c.args[2], ivar)
+        setdiff!(bares, plate_defs)
+        push!(ctx, (lhs, line, bares))
+        return [Expr(:(=), lhs, _strip_cell(c.args[2], ivar))]
+    end
+    return _sfail("cells hold `~` observations and `=` assignments only")
+end
+
+function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx)
+    lhs = c.args[2]
+    lhs isa Symbol && _sfail("per-cell sampled `$lhs` is deferred " *
+                             "(per-cell sampled arrays land after " *
+                             "observations; write shared priors outside " *
+                             "the plate)")
+    (lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
+        lhs.args[1] isa Symbol && lhs.args[2] === ivar) ||
+        _cell_lhs_error(lhs, ivar)
+    col = lhs.args[1]
+    col in data || _sfail("per-cell sampled `$col[$ivar]` is deferred " *
+                          "(per-cell sampled arrays land after " *
+                          "observations; write shared priors outside " *
+                          "the plate)")
+    bares = _cell_bares(c.args[3], ivar)
+    setdiff!(bares, plate_defs)
+    push!(ctx, (col, line, bares))
+    obj = c.args[3]
+    # Cells mirror top-level spelling exactly (dots as written — the
+    # desugar strips refs, never invents dots): the object must already
+    # be dotted, pairing scalar `~` (the cell) with a pre-dotted object.
+    obj isa Expr && obj.head === :. || _sfail(
+        "cell objects are dotted distribution calls " *
+        "(`y[$ivar] ~ Normal.(mu[$ivar], s)`), got $(repr(obj))")
+    obj = _strip_cell(obj, ivar)
+    if rkind[1] === :coloncall
+        # Literal ranges validate through the slice-A `y[a:b]` path
+        # (start-1, literal endpoints, bind-time cover check).
+        return Expr(:call, :.~, Expr(:ref, col, rkind[2]), obj)
+    end
+    rcol = rkind[2]
+    rcol === col || _sfail("plate over `$(rkind[1])($rcol)` cannot " *
+                           "sample `$col[$ivar]` (one response column " *
+                           "per range)")
+    return Expr(:call, :.~, col, obj)
+end
+
+function _cell_lhs_error(lhs, ivar)
+    lhs isa Expr && lhs.head === :ref || return _sfail(
+        "cell responses sample `name[$ivar]` exactly — got $(repr(lhs))")
+    length(lhs.args) == 2 || return _sfail(
+        "one-dimensional cell refs only (`v[$ivar]`)")
+    lhs.args[1] isa Symbol || return _sfail(
+        "cell refs index a bare column (`v[$ivar]`)")
+    idx = lhs.args[2]
+    idx isa Expr && idx.head === :ref && return _sfail(
+        "factor indexing inside plates is not in slice B")
+    return _sfail("cell reads index the loop variable exactly " *
+                  "(`v[$ivar]`) — got $(repr(lhs)) (cross-index reads " *
+                  "need `@scan`, reserved)")
+end
+
+# Value-position symbols of a cell expression, validating the loop-variable
+# discipline on the way: refs are exactly `v[i]`, and `i` appears only as
+# an index. Function heads and kw names are positions, not refs.
+function _cell_bares(ex, ivar)
+    bares = Set{Symbol}()
+    _cell_bares!(ex, ivar, bares)
+    return bares
+end
+
+function _cell_bares!(ex::Symbol, ivar, bares)
+    ex === ivar && _sfail("loop variable `$ivar` appears only as an " *
+                          "index (`v[$ivar]`)")
+    push!(bares, ex)
+    return nothing
+end
+_cell_bares!(ex, ivar, bares) = nothing
+function _cell_bares!(ex::Expr, ivar, bares)
+    if ex.head === :ref
+        (length(ex.args) == 2 && ex.args[1] isa Symbol &&
+            ex.args[2] === ivar) || _cell_lhs_error(ex, ivar)
+        return nothing
+    end
+    if ex.head === :call
+        for a in ex.args[2:end]
+            _cell_bares!(a, ivar, bares)
+        end
+        return nothing
+    end
+    if ex.head === :.
+        start = length(ex.args) >= 1 && ex.args[1] isa Symbol ? 2 : 1
+        for a in ex.args[start:end]
+            _cell_bares!(a, ivar, bares)
+        end
+        return nothing
+    end
+    if ex.head === :kw
+        for a in ex.args[2:end]
+            _cell_bares!(a, ivar, bares)
+        end
+        return nothing
+    end
+    for a in ex.args
+        _cell_bares!(a, ivar, bares)
+    end
+    return nothing
+end
+
+# Strip exact `v[i]` refs to whole columns (validation ran first).
+_strip_cell(ex, ivar) = ex
+_strip_cell(s::Symbol, ivar) = s
+function _strip_cell(ex::Expr, ivar)
+    ex.head === :ref && return ex.args[1]
+    return Expr(ex.head, (_strip_cell(a, ivar) for a in ex.args)...)
+end
+
+# Post-analysis whole-vector check: bare cell symbols denoting vectors
+# (data, predictors, derived, factor coefs) needed `[i]`. Runs after the
+# main loop, when predictors and derived are known.
+function _check_plate_bares(ctx, data, prednames, derivedkeys, factorcoefs)
+    isempty(ctx) && return nothing
+    vecs = union(data, prednames, derivedkeys, factorcoefs)
+    for (lhs, line, bares) in ctx
+        at = line > 0 ? " (line $line)" : ""
+        for b in sort!(collect(bares))
+            b in vecs && _sfail("`@plate`$at: bare `$b` reads a whole " *
+                                "vector in a cell — index it (`$b[i]`)")
+        end
+    end
+    return nothing
+end
+
+function _factor_coefs(coefuse, predictors)
+    out = Set{Symbol}()
+    for pred in predictors, t in pred.terms
+        t.kind === FactorTerm || continue
+        for (nm, uses) in coefuse, u in uses
+            u[1] === pred.name && u[2] in t.columns && push!(out, nm)
+        end
+    end
+    return out
 end
 
 function _claim!(seen::Set{Symbol}, seelines::Dict{Symbol,Int}, nm::Symbol,
@@ -756,10 +1007,12 @@ function _unwrap_trivia(st::Expr)
             st = st.args[end]
             continue
         end
-        (m === Symbol("@plate") || m === Symbol("@scan")) && _sfail(
-            "$m needs per-cell/sequential IR support beyond slice 1 " *
-            "(shapes copied from StanBlocks; vector responses broadcast " *
-            "with `.~` — `y .~ Normal.(mu, sigma)` over data)")
+        m === Symbol("@plate") && _sfail(
+            "`@plate` is only admitted at model top level (nested plates " *
+            "do not lower)")
+        m === Symbol("@scan") && _sfail(
+            "`@scan` needs sequential IR support beyond slice B " *
+            "(shape copied from StanBlocks; independent cells use `@plate`)")
         m === Symbol("@.") && _sfail("explicit broadcast (`@.`) does not " *
                                      "lower — write the dots out " *
                                      "(`mu = a .+ b .* x`)")
@@ -865,6 +1118,9 @@ function _reject_statement(st::Expr)
     elseif head in (:function, :macro, :return, :local, :global, :struct,
         :module, :import, :using, :export)
         return _sfail("`$head` does not lower at model level")
+    elseif head === :macrocall && !isempty(st.args) &&
+            st.args[1] === Symbol("@plate")
+        return _sfail("docstrings on `@plate` blocks do not lower")
     end
     return _sfail("unsupported model statement $(repr(st)) " *
                   "(only `~`, `.~`, `=` and reserved macros lower)")
