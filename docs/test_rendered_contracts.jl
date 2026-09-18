@@ -84,9 +84,11 @@ $aov_root
             source_dir, report_path, contracts, github_actions = false,
         )
 
-        @test length(advisories) == 7
+        # The fixture source carries a raw markdown table; after the
+        # raw-markdown-table lint was retired (decision `17uqwf3`) it produces no
+        # advisory, so the count drops from 7 to 6 and that kind is gone.
+        @test length(advisories) == 6
         @test Set(advisory.contract_kind for advisory in advisories) == Set((
-            "raw-markdown-table-count",
             "executable-panel-count",
             "sortable-table-count",
             "aov-panel-count",
