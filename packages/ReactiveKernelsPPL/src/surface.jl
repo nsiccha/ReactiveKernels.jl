@@ -5,11 +5,18 @@
 # statements, deterministic `=`, `model(; data...)` binding) under the
 # standing constraints: Distributions.jl constructors (never Stan lowercase),
 # immutable single-assignment top level, no control flow, no `target`,
-# `@plate`/`@scan` reserved. Response-vs-parameter classification needs data
-# names (a bare `lhs ~ Normal(...)` is shape-identical either way — the
-# eight-schools indistinguishability), so the macro only captures; lowering
-# runs at bind time with `data_names`. The BRM emitter targets the same
-# `lower_rkppl(ast, data_names)` entry point with ASTs (no text seam).
+# `@plate`/`@scan` reserved. Broadcasting is EXPLICIT (no implied
+# vectorization anywhere): vector math is dotted (`mu = a .+ b .* x` —
+# undotted scalar/vector `+` is a `MethodError` in Julia too), and vector
+# responses use the Turing dotted tilde (`y .~ Normal.(mu, sigma)`).
+# `=` binds values with Julia semantics; predictor locations inline
+# deterministic structure and recover affine terms, so naming a
+# subexpression never changes legality. Response-vs-parameter
+# classification needs data names (a bare `lhs ~ Normal(...)` is
+# shape-identical either way — the eight-schools indistinguishability), so
+# the macro only captures; lowering runs at bind time with `data_names`.
+# The BRM emitter targets the same `lower_rkppl(ast, data_names)` entry
+# point with ASTs (no text seam).
 
 """
     SurfaceLoweringError <: Exception
@@ -101,10 +108,12 @@ end
     lower_rkppl(ast, data_names) -> StructuralPlan
 
 Lower a captured `@rkppl` block AST to a data-free (unbound) plan.
-`data_names` classifies every `~` LHS: in-data is a response, otherwise a
-prior (sampled parameter or, when the name sits in a predictor coefficient
-position, a population prior). Runs `validate_structure` before returning.
-The BRM emitter calls this entry point directly with ASTs.
+`data_names` classifies every `~` / `.~` LHS: data under `.~` is a
+response, non-data under `~` is a prior (sampled parameter or, when the
+name sits in a predictor coefficient position, a population prior); the
+crossed spellings fail closed (`~` is scalar-only, `.~` broadcasts over
+data). Runs `validate_structure` before returning. The BRM emitter calls
+this entry point directly with ASTs.
 """
 function lower_rkppl(ast, data_names)::StructuralPlan
     data = Set{Symbol}()
@@ -116,40 +125,73 @@ function lower_rkppl(ast, data_names)::StructuralPlan
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     sample, det = _partition_statements(ast, data)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
-    prior_names = Set{Symbol}(lhs for (lhs, _) in sample if lhs ∉ data)
-    vectors = _classify_vectors(det)
-    # Predictor roots are structure, not columns: a likelihood location
-    # (`y ~ Normal(mu, ...)`) names its predictor definition, which inlines
-    # (scalar path) instead of classifying vector. Without this, predictor
-    # chaining (`t = mu + c*x`) silently treats `mu` as data.
-    setdiff!(vectors, _location_roots(sample, data, detmap))
-    ctx = (; data, detmap, prior_names, vectors, consumed = Set{Symbol}())
+    prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
+    normal_priors = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && _is_normal_call(s.rhs))
+    # Shape every definition (data-free: data ⇒ vector, sampled ⇒ scalar,
+    # det-refs recurse with memo; cycles error downstream), then
+    # canonicalize each RHS in dependency order (Julia-valid undotted
+    # scalar-array ops take dotted-canonical form; Julia-invalid vector
+    # combinations fail here naming the definition). Everything downstream
+    # sees canonical RHSs.
+    detshape = _def_shapes(det, data, detmap)
+    canonmap = Dict{Symbol,Any}()
+    for nm in _det_topo_order(det, detmap)
+        rhs = detmap[nm]
+        _reject_unknown_calls("definition `$nm = $(repr(rhs))`", rhs)
+        canonmap[nm] = _canonical_expr(rhs, data, detshape,
+            "definition `$nm = $(repr(rhs))`")
+    end
+    # Structural definitions inline into predictors: anything transitively
+    # referencing a coefficient candidate (Normal-priored or free name).
+    # All other vector definitions stay symbolic as named locals.
+    structural = _structural_defs(det, data, canonmap, normal_priors,
+        prior_names)
+    vecdefs = Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :vector)
+    taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names)
+    ctx = (; data, detmap = canonmap, prior_names, normal_priors, detshape,
+        vecdefs, structural, absorbed = Set{Symbol}(), synth = Ref(0),
+        synth_derived = VectorAssignmentSpec[], taken)
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
     pred_idx = Dict{Symbol,Int}()
     coefuse = Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}()
-    for (lhs, rhs) in sample
-        lhs ∉ data && continue
-        push!(responses,
-            _lower_response(lhs, rhs, ctx, predictors, pred_idx, coefuse))
+    for s in sample
+        if s.broadcast
+            s.lhs in data || _sfail("`.~` broadcasts over a data column " *
+                                    "— $(s.lhs) is not data (scalar " *
+                                    "parameters use `~`)")
+            push!(responses,
+                _lower_response(s.lhs, s.rhs, ctx, predictors, pred_idx,
+                    coefuse))
+        elseif s.lhs in data
+            _sfail("$(s.lhs) is data — vector responses broadcast with " *
+                   "`.~` (`$(s.lhs) .~ Normal.(mu, sigma)`); `~` is " *
+                   "scalar-only")
+        end
     end
     priors = _lower_coefficient_priors(sample, coefuse, predictors)
-    params = _lower_parameters(sample, coefuse, ctx)
-    used_locs = Set{Symbol}()
-    for r in responses
-        push!(used_locs, r.predictor)
-    end
+    params, paramsyms = _lower_parameters(sample, coefuse, ctx)
+    used_locs = Set{Symbol}(r.predictor for r in responses)
+    skip = _absorbed_skip(det, canonmap, responses, paramsyms, ctx.absorbed,
+        used_locs)
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
-    for (nm, rhs) in det
-        nm in used_locs && continue
-        nm in ctx.consumed && _sfail("$nm is already inlined into a " *
-                                     "predictor — remove the standalone `$nm = ...` " *
-                                     "definition")
-        if nm in vectors
-            push!(derived, _lower_vector_assignment(nm, rhs, coefuse, vectors))
+    for (nm, _) in det
+        nm in skip && continue
+        rhs = canonmap[nm]
+        if detshape[nm] === :vector
+            push!(derived, _lower_vector_assignment(nm, rhs, coefuse))
         else
             push!(assigns, _lower_assignment(nm, rhs, coefuse))
+        end
+    end
+    append!(derived, ctx.synth_derived)
+    for d in ctx.synth_derived
+        for s in _value_symbols(d.expr)
+            haskey(coefuse, s) && _sfail("$s is a predictor coefficient " *
+                                        "and cannot appear in an extracted " *
+                                        "column (predictor $(d.label))")
         end
     end
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
@@ -158,97 +200,321 @@ function lower_rkppl(ast, data_names)::StructuralPlan
     return plan
 end
 
-# Scalar/vector classification (fixpoint over deterministic definitions): a
-# definition routes vector iff its RHS uses dotted/broadcast spelling or
-# references another vector definition in value position (not inside a
-# reduction). Bare data references do NOT route vector: undotted structure
-# (`mu = a + b*x`) inlines into predictors on the scalar path, and
-# genuinely row-varying undotted uses fail with guidance at surface
-# (inlined into a predictor) or at bind (row-varying outside a reduction).
-# Validation owns the shape rules; this only routes.
-function _classify_vectors(det)
-    vectors = Set{Symbol}()
+# Shape inference + canonicalization (data-free, Julia-truthful). Shapes:
+# data columns are vectors, sampled/det names resolve by position and memo,
+# dotted forms are vectors, reductions are scalars, undotted scalar-array
+# combinations follow Julia exactly (`2*v`, `v*2`, `v/2`, `-v` are vectors;
+# `a+x`, `x*z`, `s/x`, `x^2`, `x>1`, `log(x)` are `:invalid` — Julia
+# `MethodError`s, reported with the dotted fix). Canonicalization rewrites
+# the Julia-valid undotted scalar-array ops (`*`, `/`) to dotted-canonical
+# form (Base implements them by broadcast — behavior-preserving); every
+# other head passes through. Unknown call heads do not shape-route here
+# (the vocabulary screen rejects them first); their shape follows their
+# arguments so the downstream error names the function.
+function _def_shapes(det, data::Set{Symbol}, detmap)
+    memo = Dict{Symbol,Symbol}()
+    for (nm, _) in det
+        memo[nm] = _shape_of(detmap[nm], data, detmap, memo, Set{Symbol}())
+    end
+    return memo
+end
+
+function _shape_of(ex, data, detmap, memo, active::Set{Symbol})
+    ex isa Symbol || return _shape_of_expr(ex, data, detmap, memo, active)
+    ex in data && return :vector
+    haskey(detmap, ex) || return :scalar
+    haskey(memo, ex) && return memo[ex]
+    ex in active && return :scalar  # cyclic: errors downstream
+    push!(active, ex)
+    sh = _shape_of(detmap[ex], data, detmap, memo, active)
+    pop!(active)
+    memo[ex] = sh
+    return sh
+end
+
+function _shape_of_expr(ex, data, detmap, memo, active)
+    ex isa LineNumberNode && return :scalar
+    ex isa Expr || return :scalar
+    head = ex.head
+    head === :. && return :vector
+    head === :ref && return :scalar
+    head === :call || return :scalar  # exotic heads: downstream rejects
+    isempty(ex.args) && return :scalar
+    fn = ex.args[1]
+    fn isa Symbol || return :scalar  # anonymous calls: downstream rejects
+    fn in REDUCTION_FNS && return :scalar
+    fn in ELEMENTWISE_OPS && return :vector
+    argshapes = [_shape_of(a, data, detmap, memo, active)
+        for a in ex.args[2:end]]
+    return _shape_of_call(fn, argshapes)
+end
+
+# Single rule table for undotted `:call` shapes over argument shapes.
+function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
+    :invalid in argshapes && return :invalid
+    nvec = count(==(:vector), argshapes)
+    if fn === :+ || fn === :-
+        length(argshapes) == 1 && return only(argshapes)
+        return nvec == 0 ? :scalar : :invalid
+    elseif fn === :*
+        length(argshapes) == 2 || return nvec == 0 ? :scalar : :invalid
+        nvec == 0 && return :scalar
+        nvec == 1 && return :vector
+        return :invalid
+    elseif fn === :/
+        length(argshapes) == 2 || return nvec == 0 ? :scalar : :invalid
+        nvec == 0 && return :scalar
+        argshapes[1] === :vector && argshapes[2] === :scalar && return :vector
+        return :invalid
+    elseif fn === :(===) || fn === :(!==)
+        return :scalar  # egal is defined over arrays (Bool result)
+    elseif fn === :^ || _is_plain_comparison(fn) || fn === :ifelse ||
+            fn in ASSIGNMENT_FNS
+        return nvec == 0 ? :scalar : :invalid
+    end
+    return nvec == 0 ? :scalar : :vector  # unknown heads: follow the args
+end
+
+_is_plain_comparison(fn::Symbol) =
+    fn === :< || fn === :> || fn === :(==) || fn === :(!=) ||
+    fn === :(<=) || fn === :(>=)
+
+function _canonical_expr(ex, data, detshape, where)
+    ex isa Symbol && return ex
+    ex isa Expr || return ex
+    ex.head === :parameters && _sfail("$where takes positional " *
+                                      "arguments only (no keywords)")
+    ex.head === :call || return ex
+    isempty(ex.args) && return ex
+    fn = ex.args[1]
+    fn isa Symbol || return ex
+    fn in REDUCTION_FNS && return ex  # args validated downstream
+    args = [_canonical_expr(a, data, detshape, where) for a in ex.args[2:end]]
+    argshapes = [_canon_shape(a, data, detshape) for a in args]
+    if :invalid in argshapes
+        return Expr(ex.head, ex.args[1], args...)  # broken ref: raises at its own def
+    end
+    _shape_of_call(fn, argshapes) === :invalid &&
+        _sfail(_julia_mismatch_msg(fn, where, ex))
+    if (fn === :* || fn === :/) && length(args) == 2
+        if fn === :* && (argshapes[1] === :vector) != (argshapes[2] === :vector)
+            return Expr(:call, :.*, args...)
+        elseif fn === :/ && argshapes[1] === :vector &&
+                argshapes[2] === :scalar
+            return Expr(:call, :./, args...)
+        end
+    end
+    if fn === :- && length(args) == 1 && argshapes[1] === :vector
+        # Unary minus over vectors has no derived-column vocabulary slot;
+        # the dotted form is equivalent and admitted.
+        return Expr(:call, :.-, args...)
+    end
+    return Expr(ex.head, ex.args[1], args...)
+end
+
+function _canon_shape(ex, data, detshape)
+    ex isa Symbol || return _canon_shape_expr(ex, data, detshape)
+    ex in data && return :vector
+    return get(detshape, ex, :scalar)
+end
+
+function _canon_shape_expr(ex, data, detshape)
+    ex isa Expr || return :scalar
+    head = ex.head
+    head === :. && return :vector
+    head === :ref && return :scalar
+    head === :call || return :scalar
+    isempty(ex.args) && return :scalar
+    fn = ex.args[1]
+    fn isa Symbol || return :scalar
+    fn in REDUCTION_FNS && return :scalar
+    fn in ELEMENTWISE_OPS && return :vector
+    return _shape_of_call(fn,
+        [_canon_shape(a, data, detshape) for a in ex.args[2:end]])
+end
+
+function _julia_mismatch_msg(fn::Symbol, where, ex)
+    fix = if fn === :+ || fn === :-
+        "as in Julia, `$fn` over a vector needs dots " *
+        "(`a .+ b .* x`); implied broadcasting is not in the surface"
+    elseif fn === :* && length(ex.args) != 3
+        "n-ary `*` with a vector operand does not lower — parenthesize " *
+        "binary products"
+    elseif fn === :*
+        "as in Julia, `*` over two vectors is not elementwise — write " *
+        "the interaction dotted (`x .* z`)"
+    elseif fn === :/
+        "as in Julia, `/` over a vector needs dots (`x ./ s`)"
+    elseif fn === :^
+        "as in Julia, `^` over a vector needs dots (`x .^ 2`)"
+    elseif _is_plain_comparison(fn)
+        "as in Julia, `$fn` over a vector needs dots (`x .$fn y`)"
+    elseif fn === :ifelse
+        "use elementwise `ifelse.(condition, x, y)`"
+    else
+        "as in Julia, `$fn` over a vector needs dots (`$fn.(x)`)"
+    end
+    return "$where combines vectors without dots: `$(repr(ex))` — $fix"
+end
+
+_is_normal_call(rhs) =
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+    rhs.args[1] === :Normal
+
+# Dependency order over deterministic definitions (callee before caller;
+# cycles and unknown refs keep source order — cycles error downstream).
+function _det_topo_order(det, detmap)
+    detkeys = Set{Symbol}(nm for (nm, _) in det)
+    order = Symbol[]
+    done = Set{Symbol}()
+    active = Set{Symbol}()
+    function visit(nm)
+        nm in done && return nothing
+        nm in active && return nothing
+        push!(active, nm)
+        for s in _symbols_in(detmap[nm])
+            s in detkeys && s != nm && visit(s)
+        end
+        pop!(active)
+        push!(done, nm)
+        push!(order, nm)
+        return nothing
+    end
+    for (nm, _) in det
+        visit(nm)
+    end
+    return order
+end
+
+# Known value-level call heads (excluded from free-name detection so a
+# definition like `m = log` never reads as referencing data).
+const _KNOWN_VALUE_FNS = union(Set{Symbol}(ASSIGNMENT_FNS),
+    Set{Symbol}(ELEMENTWISE_OPS), Set{Symbol}(ELEMENTWISE_FNS),
+    Set{Symbol}((:ifelse, :treatment)))
+
+# Structural definitions: anything transitively referencing a coefficient
+# candidate (a Normal-priored sampled name or a free name — data, det, and
+# other sampled names excluded). Structural definitions inline into
+# predictors; every other definition keeps its binding as a kernel local.
+function _structural_defs(det, data, canonmap, normal_priors, prior_names)
+    detkeys = Set{Symbol}(nm for (nm, _) in det)
+    structural = Set{Symbol}()
+    for (nm, _) in det
+        refs = _value_symbols(canonmap[nm])
+        if any(s -> s in normal_priors ||
+                _is_free_name(s, data, detkeys, prior_names), refs)
+            push!(structural, nm)
+        end
+    end
     changed = true
     while changed
         changed = false
-        for (nm, rhs) in det
-            nm in vectors && continue
-            if _is_vector_form(rhs, vectors)
-                push!(vectors, nm)
+        for (nm, _) in det
+            nm in structural && continue
+            if any(s -> s in structural, _value_symbols(canonmap[nm]))
+                push!(structural, nm)
                 changed = true
             end
         end
     end
-    return vectors
+    return structural
 end
 
-function _is_vector_form(ex, vectors::Set{Symbol})
-    return _vector_form_value(ex, vectors, false)
+function _is_free_name(s::Symbol, data, detkeys, prior_names)
+    s in data && return false
+    s in detkeys && return false
+    s in prior_names && return false
+    s in _KNOWN_VALUE_FNS && return false
+    return true
 end
 
-function _vector_form_value(ex, vectors, in_reduction::Bool)
-    ex isa Symbol && return !in_reduction && ex in vectors
-    ex isa Expr || return false
-    head = ex.head
-    head === :. && return true
-    head === :call || return any(
-        a -> _vector_form_value(a, vectors, in_reduction), ex.args)
-    isempty(ex.args) && return false
-    fn = ex.args[1]
-    fn isa Symbol && startswith(string(fn), ".") && return true
-    if fn isa Symbol && fn in REDUCTION_FNS
-        return any(a -> _vector_form_value(a, vectors, true),
-            ex.args[2:end])
+# Top-down unknown-head screen (vocabulary layer runs before shape and
+# structure layers, so the error names the function, not its fallout).
+# Factor references are skipped (the factor machinery owns that position).
+# Heads that only lower inside `.~` responses, never as values (`exp` is
+# excluded: undotted it is admitted scalar math, dotted admitted
+# elementwise math — only the Poisson-link position is response-only, and
+# that position never reaches this screen).
+const _RESPONSE_ONLY_FNS =
+    (:weighted, :truncated, :censored, :interval_censored, :logistic)
+const _DIST_VALUE_FNS =
+    (:Normal, :Cauchy, :Exponential, :Gamma, :LogNormal, :Beta,
+        :InverseGamma, :Bernoulli, :Poisson, :HalfNormal, :HalfCauchy, :Flat)
+
+function _reject_unknown_calls(where, rhs)
+    rhs isa Expr || return nothing
+    rhs.head === :ref && return nothing
+    if rhs.head === :call && !isempty(rhs.args)
+        fn = rhs.args[1]
+        if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS
+            startswith(string(fn), ".") && _sfail(
+                "$where uses dotted operator `$fn`, which is not in " *
+                "the slice-1 elementwise vocabulary")
+            fn === :treatment && _sfail(
+                "$where calls `treatment`, which only lowers as a " *
+                "factor index (`c[treatment(g, ref)]`)")
+            fn === :ifelse && _sfail(
+                "$where calls undotted `ifelse` — use elementwise " *
+                "`ifelse.(condition, x, y)`")
+            fn in _RESPONSE_ONLY_FNS && _sfail(
+                "$where calls `$fn`, which only lowers in `.~` " *
+                "responses, not as a value")
+            fn in _DIST_VALUE_FNS && _sfail(
+                "$where calls `$fn`, which lowers only under `~`/`.~`, " *
+                "not as a value")
+            _sfail("$where calls `$fn`, which is not in the slice-1 " *
+                   "value vocabulary — arbitrary Julia functions are " *
+                   "planned (no-@deffun-ceremony direction) but need " *
+                   "IR/contract growth")
+        end
+    elseif rhs.head === :.
+        length(rhs.args) == 2 && rhs.args[1] isa Symbol &&
+            rhs.args[2] isa Expr && rhs.args[2].head === :tuple ||
+            return nothing  # malformed dotted: downstream rejects
+        f = rhs.args[1]
+        # (`exp.` is both the Poisson link and admitted elementwise math,
+        # so only `logistic.` guides here.)
+        f === :logistic && _sfail(
+            "$where calls `logistic.`, which only lowers as a `.~` link " *
+            "(`Bernoulli.(logistic.(eta))`)")
+        f === :ifelse || f in ELEMENTWISE_FNS || _sfail(
+            "$where calls `$f.`, which is not in the slice-1 value " *
+            "vocabulary — arbitrary Julia functions are planned " *
+            "(no-@deffun-ceremony direction) but need IR/contract growth")
     end
-    return any(a -> _vector_form_value(a, vectors, in_reduction),
-        ex.args[2:end])
-end
-
-# Likelihood-location roots: deterministic definitions named directly as a
-# response location. Non-throwing light peel mirroring `_lower_response`
-# (`_peel_weighted` / `_peel_evidence` / `_lower_response_base`); malformed
-# responses return nothing and error later in the real lowering.
-function _location_roots(sample, data::Set{Symbol}, detmap)
-    roots = Set{Symbol}()
-    for (lhs, rhs) in sample
-        lhs in data || continue
-        rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || continue
-        loc = _location_root(rhs)
-        loc isa Symbol && haskey(detmap, loc) && push!(roots, loc)
-    end
-    return roots
-end
-
-function _location_root(rhs::Expr)
-    head = rhs.args[1]
-    if head === :weighted && length(rhs.args) == 3
-        inner = rhs.args[2]
-        return inner isa Expr && inner.head === :call ? _location_root(inner) :
-               nothing
-    elseif (head === :truncated || head === :censored) && length(rhs.args) == 4
-        inner = rhs.args[2]
-        return inner isa Expr && inner.head === :call ? _location_root(inner) :
-               nothing
-    elseif head === :interval_censored && length(rhs.args) == 3
-        inner = rhs.args[2]
-        return inner isa Expr && inner.head === :call ? _location_root(inner) :
-               nothing
-    elseif head === :Normal && length(rhs.args) == 3
-        return rhs.args[2]
-    elseif (head === :Bernoulli || head === :Poisson) && length(rhs.args) == 2
-        wrap = rhs.args[2]
-        wrap isa Expr && wrap.head === :call && length(wrap.args) == 2 &&
-            wrap.args[1] === (head === :Bernoulli ? :logistic : :exp) ||
-            return nothing
-        return wrap.args[2]
+    for a in rhs.args
+        _reject_unknown_calls(where, a)
     end
     return nothing
+end
+
+# Emission skip set: locations never emit; absorbed definitions emit only
+# while a non-skipped definition (or a response scale / parameter
+# argument) still names them. Fixpoint: skipping cascades through
+# absorbed-only reference chains (chained intermediates vanish entirely).
+function _absorbed_skip(det, canonmap, responses, paramsyms, absorbed,
+        used_locs)
+    skip = Set{Symbol}(used_locs)
+    while true
+        refs = Set{Symbol}(paramsyms)
+        for r in responses
+            r.scale isa Symbol && push!(refs, r.scale)
+        end
+        for (nm, _) in det
+            nm in skip && continue
+            union!(refs, _value_symbols(canonmap[nm]))
+        end
+        newskip = union(skip, Set{Symbol}(nm for (nm, _) in det
+            if nm in absorbed && nm ∉ refs))
+        newskip == skip && return skip
+        skip = newskip
+    end
 end
 
 # Top-level statements: skip line numbers and one leading docstring-to-be
 # (ignored in slice 1); everything else must be an Expr.
 function _partition_statements(ast::Expr, data::Set{Symbol})
-    sample = Pair{Symbol,Any}[]
+    sample = SampleStmt[]
     det = Pair{Symbol,Any}[]
     seen = Set{Symbol}()
     seen_doc = false
@@ -259,17 +525,19 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             continue
         end
         arg isa Expr || _sfail("stray literal $(repr(arg)) at model level " *
-                               "(only `~`, `=` and reserved macros lower)")
+                               "(only `~`, `.~`, `=` and reserved macros lower)")
         arg.head === :block &&
             _sfail("nested `begin` blocks do not lower — flatten the block")
         st = _unwrap_trivia(arg)
-        if _is_sample(st)
+        if _is_sample(st) || _is_broadcast_sample(st)
+            bc = _is_broadcast_sample(st)
+            tilde = bc ? "`.~`" : "`~`"
             lhs = st.args[2]
-            lhs isa Symbol || _sfail("`~` left-hand side must be a bare " *
+            lhs isa Symbol || _sfail("$tilde left-hand side must be a bare " *
                                      "Symbol, got $(repr(lhs))")
             _claim!(seen, lhs)
             _reject_target(st.args[3], lhs)
-            push!(sample, lhs => st.args[3])
+            push!(sample, SampleStmt(lhs, st.args[3], bc))
         elseif st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol
             lhs = st.args[1]
             lhs === :target && _sfail("no `target` in rkppl models " *
@@ -293,6 +561,16 @@ _claim!(seen::Set{Symbol}, nm::Symbol) =
 _is_sample(st::Expr) =
     st.head === :call && length(st.args) == 3 && st.args[1] === :~
 
+_is_broadcast_sample(st::Expr) =
+    st.head === :call && length(st.args) == 3 && st.args[1] === :.~
+
+"""One `~` / `.~` statement: scalar (`~`) or elementwise (`.~`) density."""
+struct SampleStmt
+    lhs::Symbol
+    rhs::Any
+    broadcast::Bool
+end
+
 _is_doc_macro(m) =
     m === Symbol("@doc") || (m isa GlobalRef && m.name === Symbol("@doc"))
 
@@ -311,11 +589,11 @@ function _unwrap_trivia(st::Expr)
         end
         (m === Symbol("@plate") || m === Symbol("@scan")) && _sfail(
             "$m needs per-cell/sequential IR support beyond slice 1 " *
-            "(shapes copied from StanBlocks; likelihood plates are implicit " *
-            "— just write `y ~ Normal(mu, sigma)` over data)")
-        m === Symbol("@.") && _sfail("explicit broadcast (`@.`) spelling is " *
-                                     "undecided — write the predictor undotted " *
-                                     "(`mu = a + b*x + c[g]`)")
+            "(shapes copied from StanBlocks; vector responses broadcast " *
+            "with `.~` — `y .~ Normal.(mu, sigma)` over data)")
+        m === Symbol("@.") && _sfail("explicit broadcast (`@.`) does not " *
+                                     "lower — write the dots out " *
+                                     "(`mu = a .+ b .* x`)")
         (m in (Symbol("@views"), Symbol("@inbounds"), Symbol("@simd"),
             Symbol("@fastmath"))) || _sfail("cannot expand macro $m at " *
                                             "lowering (user-macro transparency is a planned gap)")
@@ -328,8 +606,39 @@ end
 
 function _reject_target(rhs, lhs)
     _symbols_in(rhs, Set{Symbol}([:target])) &&
-        _sfail("no `target` in rkppl models (density comes only from `~`; " *
-               "statement for $lhs mentions `target`)")
+        _sfail("no `target` in rkppl models (density comes only from " *
+               "`~`/`.~`; statement for $lhs mentions `target`)")
+    return nothing
+end
+
+# Value-position symbols (call heads and dotted function names excluded):
+# coefficient-discipline scans must not mistake `log` in `log.(z)` for a
+# coefficient named `log`.
+function _value_symbols(ex)
+    out = Set{Symbol}()
+    _value_symbols!(out, ex)
+    return out
+end
+function _value_symbols!(out::Set{Symbol}, ex)
+    ex isa Symbol && return push!(out, ex)
+    ex isa Expr || return nothing
+    if ex.head === :call && !isempty(ex.args)
+        for a in ex.args[2:end]
+            _value_symbols!(out, a)
+        end
+        return nothing
+    end
+    if ex.head === :.
+        length(ex.args) == 2 && ex.args[2] isa Expr &&
+            ex.args[2].head === :tuple || return nothing
+        for a in ex.args[2].args
+            _value_symbols!(out, a)
+        end
+        return nothing
+    end
+    for a in ex.args
+        _value_symbols!(out, a)
+    end
     return nothing
 end
 
@@ -360,22 +669,24 @@ function _reject_statement(st::Expr)
     head = st.head
     if head === :call && !isempty(st.args) && st.args[1] === :~
         return _sfail("`~` takes `lhs ~ distribution`, got $(repr(st))")
+    elseif head === :call && !isempty(st.args) && st.args[1] === :.~
+        return _sfail("`.~` takes `lhs .~ distribution`, got $(repr(st))")
     elseif head === :call
         fn = isempty(st.args) ? "?" : repr(first(st.args))
         return _sfail("bare call `$fn(...)` at model level does nothing — " *
-                      "did you mean `y = ...` or `y ~ ...`?")
+                      "did you mean `y = ...`, `y ~ ...` or `y .~ ...`?")
     elseif head === :(=)
         return _sfail("model assignment binds a bare Symbol only, got " *
                       "$(repr(st)) (index/function assignment needs the " *
                       "arbitrary-Julia-function direction — planned)")
     elseif head in (:for, :while)
         return _sfail("control flow is not allowed at model level " *
-                      "(StanBlocks rule) — use a vectorized form; " *
+                      "(StanBlocks rule) — use an elementwise form; " *
                       "deterministic-function escape is planned")
     elseif head in (:if, :elseif, :comprehension, :generator,
         :typed_comprehension, :&&, :||)
         return _sfail("branching/comprehensions are not allowed at model " *
-                      "level (StanBlocks rule) — use a vectorized form")
+                      "level (StanBlocks rule) — use an elementwise form")
     elseif head === :(::)
         return _sfail("type/shape annotations (`$(repr(st))`) are a later " *
                       "slice (prior-predictive shapes) — write bare names")
@@ -387,7 +698,7 @@ function _reject_statement(st::Expr)
         return _sfail("`$head` does not lower at model level")
     end
     return _sfail("unsupported model statement $(repr(st)) " *
-                  "(only `~`, `=` and reserved macros lower)")
+                  "(only `~`, `.~`, `=` and reserved macros lower)")
 end
 
 # Plain positional call args (keyword calls never lower: positional only).
@@ -400,28 +711,104 @@ function _plain_args(rhs::Expr, what)
 end
 
 function _lower_response(lhs, rhs, ctx, predictors, pred_idx, coefuse)
-    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || _sfail(
-        "response $lhs needs a distribution call, got $(repr(rhs))")
-    weights, rhs = _peel_weighted(lhs, rhs, ctx)
-    evidence, rhs = _peel_evidence(lhs, rhs, ctx)
+    call = _dot2call_response(lhs, rhs)
+    weights, call = _peel_weighted(lhs, call, ctx)
+    evidence, call = _peel_evidence(lhs, call, ctx)
     family, lik_link, pred_link, loc, scale =
-        _lower_response_base(lhs, rhs, ctx)
+        _lower_response_base(lhs, call, ctx)
     pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
         evidence, Symbol(lhs, "_resp"))
 end
 
+# `.~` takes a dotted distribution object (`Normal.(mu, sigma)`); convert
+# the distribution spine to call form and reuse the peeling machinery
+# (which reports the same object-form errors, now against dotted input).
+# Only spine positions convert (nested objects, links); locations, scales,
+# bounds, and weights pass through untouched (inline predictor dots are
+# the analysis's business, not the peeler's).
+const _DOT_WRAPPERS = (:weighted, :truncated, :censored, :interval_censored)
+
+function _dot2call_response(lhs, rhs)
+    rhs isa Expr && rhs.head === :. ||
+        return _dot2call_object_error(lhs, rhs)
+    length(rhs.args) == 2 && rhs.args[1] isa Symbol &&
+        rhs.args[2] isa Expr && rhs.args[2].head === :tuple ||
+        _sfail("response $lhs: malformed dotted object $(repr(rhs)) " *
+               "(`Normal.(mu, sigma)` — no field access, no keywords)")
+    targs = rhs.args[2].args
+    any(a -> a isa Expr && a.head === :parameters, targs) && _sfail(
+        "response $lhs: dotted objects take positional arguments " *
+        "only (no keywords)")
+    f = rhs.args[1]
+    return Expr(:call, f, _dot2call_spine_args(lhs, f, targs)...)
+end
+
+function _dot2call_object_error(lhs, rhs)
+    if rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+            rhs.args[1] isa Symbol && rhs.args[1] in
+            (:Normal, :Bernoulli, :Poisson, :weighted, :truncated, :censored,
+                :interval_censored)
+        _sfail("response $lhs: broadcast the object " *
+               "(`$(rhs.args[1]).(...)` — `.~` is elementwise)")
+    end
+    return _sfail("response $lhs needs a dotted distribution object " *
+                  "(`Normal.(mu, sigma)`), got $(repr(rhs))")
+end
+
+function _dot2call_spine_args(lhs, f, targs)
+    return Any[_dot2call_spine_arg(lhs, f, i, a)
+        for (i, a) in enumerate(targs)]
+end
+
+function _dot2call_spine_arg(lhs, f, i, a)
+    if f in _DOT_WRAPPERS && i == 1
+        return _dot2call_nested_object(lhs, a)
+    elseif (f === :Bernoulli || f === :Poisson) && i == 1
+        return _dot2call_nested_link(lhs, a, f)
+    end
+    return a
+end
+
+function _dot2call_nested_object(lhs, a)
+    a isa Expr && a.head === :. && length(a.args) == 2 &&
+        a.args[1] isa Symbol && a.args[2] isa Expr &&
+        a.args[2].head === :tuple ||
+        _sfail("response $lhs: broadcast the object " *
+               "(`Normal.(...)` — `.~` is elementwise at every level)")
+    targs = a.args[2].args
+    any(x -> x isa Expr && x.head === :parameters, targs) && _sfail(
+        "response $lhs: dotted objects take positional arguments " *
+        "only (no keywords)")
+    f = a.args[1]
+    return Expr(:call, f, _dot2call_spine_args(lhs, f, targs)...)
+end
+
+function _dot2call_nested_link(lhs, a, base)
+    want = base === :Bernoulli ? :logistic : :exp
+    a isa Expr && a.head === :. && length(a.args) == 2 &&
+        a.args[1] isa Symbol && a.args[2] isa Expr &&
+        a.args[2].head === :tuple ||
+        _sfail("response $lhs: broadcast the link " *
+               "(`$want.(eta)` — `.~` is elementwise at every level)")
+    targs = a.args[2].args
+    any(x -> x isa Expr && x.head === :parameters, targs) && _sfail(
+        "response $lhs: dotted objects take positional arguments " *
+        "only (no keywords)")
+    return Expr(:call, a.args[1], targs...)
+end
+
 function _peel_weighted(lhs, rhs::Expr, ctx)
     rhs.args[1] === :weighted || return nothing, rhs
     args = _plain_args(rhs, "`weighted`")
     length(args) == 2 || _sfail("`weighted` takes the object form " *
-                                "`weighted(Normal(mu, sigma), w)`")
+                                "`weighted.(Normal.(mu, sigma), w)`")
     dist, w = args
     dist isa Expr && dist.head === :call || _sfail(
         "`weighted` wraps a distribution object " *
-        "(`weighted(Normal(mu, sigma), w)`), got $(repr(dist))")
-    w isa Symbol && w in ctx.vectors && _sfail(
+        "(`weighted.(Normal.(mu, sigma), w)`), got $(repr(dist))")
+    w isa Symbol && w in ctx.vecdefs && _sfail(
         "`weighted` weights column $w is derived — slice-1 binds weights " *
         "raw (derived weights need shape metadata — planned)")
     w isa Symbol && w in ctx.data || _sfail("`weighted` weights must be a " *
@@ -438,7 +825,7 @@ function _peel_evidence(lhs, rhs::Expr, ctx)
         # (the IR carries lower = nothing), so no `lo` argument exists.
         args = _plain_args(rhs, "`interval_censored`")
         length(args) == 2 || _sfail("`interval_censored` takes " *
-                                    "`interval_censored(Normal(mu, sigma), hi)`")
+                                    "`interval_censored.(Normal.(mu, sigma), hi)`")
         dist, hi = args
         dist isa Expr && dist.head === :call || _sfail(
             "`interval_censored` wraps a distribution object, got " *
@@ -449,11 +836,11 @@ function _peel_evidence(lhs, rhs::Expr, ctx)
     end
     args = _plain_args(rhs, "`$head`")
     length(args) == 3 || _sfail("use the Distributions.jl object form " *
-                                "`$head(Normal(...), lo, hi)`, got $(repr(rhs))")
+                                "`$head.(Normal.(...), lo, hi)`, got $(repr(rhs))")
     obj, lo, hi = args
     obj isa Expr && obj.head === :call || _sfail(
         "`$head` wraps a distribution object " *
-        "(`$head(Normal(...), lo, hi)`), got $(repr(obj))")
+        "(`$head.(Normal.(...), lo, hi)`), got $(repr(obj))")
     ev = ResponseEvidence(head, _bound(lhs, lo, :lower, ctx),
         _bound(lhs, hi, :upper, ctx))
     return ev, obj
@@ -475,7 +862,7 @@ function _bound(lhs, b, side::Symbol, ctx)
         return _bound_infinite(lhs, -Inf, side)
     end
     b isa Symbol && b in ctx.data && return b
-    b isa Symbol && b in ctx.vectors && _sfail(
+    b isa Symbol && b in ctx.vecdefs && _sfail(
         "response $lhs bound $b is a derived column — slice-1 binds " *
         "evidence bounds raw (derived bounds need shape metadata — planned)")
     return _sfail("response $lhs bound $(repr(b)) must be a literal or a " *
@@ -492,32 +879,32 @@ function _bound_infinite(lhs, v::Real, side::Symbol)
 end
 
 const _RESPONSE_BASE_MSG =
-    "response distribution must be `Normal(mu, sigma)`, " *
-    "`Bernoulli(logistic(eta))` or `Poisson(exp(eta))`"
+    "response distribution must be `Normal.(mu, sigma)`, " *
+    "`Bernoulli.(logistic.(eta))` or `Poisson.(exp.(eta))`"
 
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
                                  "got $(repr(rhs))")
     fam = rhs.args[1]
     fam === :weighted &&
-        _sfail("`weighted(...)` goes outermost: " *
-               "`y ~ weighted(Normal(mu, sigma), w)`")
+        _sfail("`weighted.(...)` goes outermost: " *
+               "`y .~ weighted.(Normal.(mu, sigma), w)`")
     fam in (:Normal, :Bernoulli, :Poisson) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
-                                    "`Normal(mu, sigma)`")
+                                    "`Normal.(mu, sigma)`")
         return GaussianFam, IdentityLink, IdentityLink, args[1],
-        _lower_scale(lhs, args[2])
+        _lower_scale(lhs, args[2], ctx)
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
-                                    "`Bernoulli(logistic(eta))`")
+                                    "`Bernoulli.(logistic.(eta))`")
         return BernoulliLogitFam, LogitLink, IdentityLink,
         _lower_link_arg(lhs, args[1], :logistic), nothing
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
-                                    "`Poisson(exp(eta))`")
+                                    "`Poisson.(exp.(eta))`")
         return PoissonLogFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), nothing
     end
@@ -528,8 +915,9 @@ function _lower_response_base_error(lhs, rhs, fam)
         "response $lhs: use Distributions.jl constructors " *
         "(`Normal`, not `normal`)")
     fam === :BernoulliLogit && _sfail("response $lhs: write " *
-                                      "`Bernoulli(logistic(eta))`")
-    fam === :PoissonLog && _sfail("response $lhs: write `Poisson(exp(eta))`")
+                                      "`Bernoulli.(logistic.(eta))`")
+    fam === :PoissonLog && _sfail("response $lhs: write " *
+                                  "`Poisson.(exp.(eta))`")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, Bernoulli, Poisson). " *
                   "If `$fam` is a submodel, `y ~ sm(...)` calls need " *
@@ -540,17 +928,22 @@ function _lower_link_arg(lhs, arg, wrap)
     arg isa Expr && arg.head === :call && !isempty(arg.args) &&
         arg.args[1] === wrap ||
         _sfail("response $lhs: write `$wrap` around the predictor " *
-               "(`Bernoulli(logistic(eta))` / `Poisson(exp(eta))`)")
+               "(`Bernoulli.(logistic.(eta))` / `Poisson.(exp.(eta))`)")
     args = _plain_args(arg, "`$wrap`")
     length(args) == 1 ||
         _sfail("response $lhs: `$wrap` takes exactly the predictor")
     return args[1]
 end
 
-function _lower_scale(lhs, s)
+function _lower_scale(lhs, s, ctx)
     s isa Real && return s
     s === :Inf && return Inf
-    s isa Symbol && return s
+    if s isa Symbol
+        (s in ctx.data || s in ctx.vecdefs) && _sfail(
+            "response $lhs scale $s varies by observation — " *
+            "per-observation scales need plate plumbing (planned)")
+        return s
+    end
     return _sfail("response $lhs scale must be a bare parameter/assignment " *
                   "name or a literal (bind expressions via an assignment " *
                   "first), got $(repr(s))")
@@ -589,7 +982,8 @@ end
 function _lower_location_symbol_error(lhs, loc, ctx)
     loc in ctx.data && _sfail("response $lhs location is the data column " *
                               "$loc — locations must be predictors with " *
-                              "estimated coefficients (wrap: `eta = a + b*$loc`)")
+                              "estimated coefficients (wrap: " *
+                              "`eta = a .+ b .* $loc`)")
     loc in ctx.prior_names && _sfail(
         "response $lhs location is the bare parameter $loc " *
         "(per-observation latents need per-cell IR support — planned; " *
@@ -610,13 +1004,19 @@ function _record_coefuses!(coefuse, pname, uses, lhs)
     return nothing
 end
 
-# Predictor analysis: expand deterministic refs (inlining), split the affine
-# sum, classify each summand. Returns (terms, uses) with
-# uses :: Vector{(coef name, addressee, sign)}.
+# Predictor analysis: inline deterministic structure (scalars always;
+# vectors only when structural — coefficient-holding), canonicalize the
+# expanded location, split the affine sum, classify each summand. Returns
+# (terms, uses) with uses :: Vector{(coef name, addressee, sign)}.
+# Anonymous non-affine vector substructure auto-extracts to synthetic
+# derived locals, so naming a subexpression never changes legality.
 function _analyze_predictor(pname, rhs, ctx, lhs)
-    expanded = _expand_dets(rhs, ctx, Set{Symbol}([pname]), pname)
+    where = "predictor $pname"
+    expanded = _inline_structure(rhs, ctx, Set{Symbol}([pname]), where)
+    _reject_unknown_calls(where, expanded)
+    canon = _canonical_expr(expanded, ctx.data, ctx.detshape, where)
     out = Tuple{Int,Any}[]
-    _collect_signed!(out, expanded, 1, pname)
+    _collect_signed!(out, canon, 1, pname)
     terms = TermSpec[]
     uses = Tuple{Symbol,Symbol,Int}[]
     addr_owner = Dict{Symbol,Symbol}()
@@ -638,37 +1038,37 @@ function _analyze_predictor(pname, rhs, ctx, lhs)
     return terms, uses
 end
 
-function _expand_dets(ex, ctx, visited::Set{Symbol}, pname)
-    ex isa Symbol || return _expand_expr(ex, ctx, visited, pname)
-    ex in ctx.vectors && return ex
+function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
+    ex isa Symbol || return _inline_structure_expr(ex, ctx, visited, where)
     haskey(ctx.detmap, ex) || return ex
-    ex in visited && _sfail("predictor $pname: cyclic definition through $ex")
-    push!(ctx.consumed, ex)
-    push!(visited, ex)
-    out = _expand_dets(ctx.detmap[ex], ctx, visited, pname)
-    pop!(visited)
-    return out
+    if ex in ctx.structural || ctx.detshape[ex] !== :vector
+        ex in visited && _sfail("$where: cyclic definition through $ex")
+        push!(ctx.absorbed, ex)
+        push!(visited, ex)
+        out = _inline_structure(ctx.detmap[ex], ctx, visited, where)
+        pop!(visited)
+        return out
+    end
+    return ex
 end
-function _expand_expr(ex, ctx, visited, pname)
+function _inline_structure_expr(ex, ctx, visited, where)
     ex isa Expr || return ex
-    return Expr(ex.head, (_expand_dets(a, ctx, visited, pname)
+    return Expr(ex.head, (_inline_structure(a, ctx, visited, where)
                           for a in ex.args)...)
 end
 
 function _collect_signed!(out, ex, sign::Int, pname)
     if ex isa Expr && ex.head === :call && !isempty(ex.args)
         fn = ex.args[1]
-        fn isa Symbol && startswith(string(fn), ".") &&
-            _sfail("predictor $pname: dotted/broadcast spelling is " *
-                   "undecided — write the predictor undotted " *
-                   "(`mu = a + b*x + c[g]`)")
-        if fn === :+
-            length(ex.args) == 2 && return _collect_signed!(out, ex.args[2], sign, pname)
+        if fn === :+ || fn === :.+
+            if length(ex.args) == 2
+                return _collect_signed!(out, ex.args[2], sign, pname)
+            end
             for a in ex.args[2:end]
                 _collect_signed!(out, a, sign, pname)
             end
             return nothing
-        elseif fn === :-
+        elseif fn === :- || fn === :.-
             if length(ex.args) == 2
                 return _collect_signed!(out, ex.args[2], -sign, pname)
             elseif length(ex.args) == 3
@@ -688,63 +1088,142 @@ function _classify_summand(pname, core, sign::Int, ctx)
     core isa Symbol && return _classify_symbol(pname, core, sign, ctx)
     core isa Expr || _sfail("predictor $pname: $(repr(core)) is not affine " *
                             "in data (terms are bare coefficients, " *
-                            "`coefficient * column`, `coefficients[column]`, " *
-                            "and bare columns)")
+                            "`coefficient .* column`, " *
+                            "`coefficients[column]`, and bare columns)")
     head = core.head
     head === :ref && return _classify_ref(pname, core, sign, ctx)
-    if head === :call && !isempty(core.args) && core.args[1] === :*
+    if head === :call && !isempty(core.args) && core.args[1] === :.*
         return _classify_product(pname, core, sign, ctx)
     end
     head === :macrocall && _sfail("predictor $pname: macros do not lower " *
                                   "inside predictor expressions")
-    head === :. && _sfail("predictor $pname: dotted/broadcast spelling is " *
-                          "undecided — write the predictor undotted")
-    return _sfail("predictor $pname: $(repr(core)) is not affine in data " *
-                  "(terms are bare coefficients, `coefficient * column`, " *
-                  "`coefficients[column]`, and bare columns)")
+    if _canon_shape(core, ctx.data, ctx.detshape) === :vector
+        return _extract_summand(pname, core, sign, ctx)
+    end
+    detkeys = Set{Symbol}(keys(ctx.detmap))
+    coefrefs = Symbol[s for s in _value_symbols(core)
+        if s in ctx.normal_priors ||
+            _is_free_name(s, ctx.data, detkeys, ctx.prior_names)]
+    length(coefrefs) > 1 && _sfail("predictor $pname: $(repr(core)) is " *
+                                   "nonlinear in coefficients")
+    length(coefrefs) == 1 && _sfail(
+        "predictor $pname: $(repr(core)) computes over the coefficient " *
+        "$(only(coefrefs)) — computed coefficients are not in slice 1")
+    return _sfail("predictor $pname: $(repr(core)) is a scalar, not a " *
+                  "term — scalar parameters are not identified " *
+                  "separately from the intercept (bind the value to a " *
+                  "column, `w = s .+ x`, or fold it into an intercept " *
+                  "prior location)")
 end
 
 function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
-    (core in ctx.data || core in ctx.vectors) &&
+    (core in ctx.data || core in ctx.vecdefs) &&
         return TermSpec(OffsetTerm, [core], NamedTuple(),
         core, Symbol(core, "_off")), nothing
     haskey(ctx.detmap, core) && _sfail("predictor $pname: $core is a " *
-                                       "computed assignment, not a sampled " *
+                                       "computed scalar, not a sampled " *
                                        "coefficient (computed coefficients " *
                                        "are not in slice 1)")
+    core in ctx.prior_names && core ∉ ctx.normal_priors &&
+        _sfail("predictor $pname: $core is a scalar parameter, not a " *
+               "term — scalar parameters are not identified separately " *
+               "from the intercept (bind the value to a column, " *
+               "`w = $core .+ x`, or fold it into an intercept prior " *
+               "location)")
     return TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
         :intercept), (core, :Intercept, sign)
 end
 
-function _classify_product(pname, core::Expr, sign::Int, ctx)
-    length(core.args) == 3 || _sfail("predictor $pname: only binary " *
-                                     "`coefficient * column` products lower " *
-                                     "in slice 1, got $(repr(core))")
-    s1, a = _strip_sign(core.args[2])
-    s2, b = _strip_sign(core.args[3])
-    inner = sign * s1 * s2
-    a isa Symbol || _sfail("predictor $pname: $(repr(core)) is not affine " *
-                           "in data")
-    b isa Symbol || _sfail("predictor $pname: $(repr(core)) is not affine " *
-                           "in data")
-    kinds = (_summand_kind(a, ctx), _summand_kind(b, ctx))
-    if kinds == (:data, :data) || kinds == (:derived, :derived) ||
-            kinds == (:data, :derived) || kinds == (:derived, :data)
-        _sfail("predictor $pname: $a * $b multiplies two columns — " *
-               "derive the interaction column first (`z = $a .* $b`)")
-    elseif kinds == (:coef, :coef)
-        _sfail("predictor $pname: $a * $b is nonlinear in coefficients")
-    elseif kinds == (:number, :number)
-        _sfail("predictor $pname: literal $a * $b is not a term — fold " *
-               "constants into an intercept coefficient")
-    elseif :number in kinds
-        _sfail("predictor $pname: literal scaling in $(repr(core)) is not " *
-               "a term — scale the column or the prior instead")
-    elseif :det in kinds
-        _sfail("predictor $pname: computed assignments do not lower as " *
-               "coefficients (computed coefficients are not in slice 1)")
+# Anonymous non-affine vector substructure becomes a synthetic derived
+# local (offset term over it); the sign folds into the extracted column.
+function _extract_summand(pname, core::Expr, sign::Int, ctx)
+    e = sign < 0 ? Expr(:call, :.-, core) : core
+    nm = _extract_column(pname, e, ctx)
+    return TermSpec(OffsetTerm, [nm], NamedTuple(), nm,
+        Symbol(nm, "_off")), nothing
+end
+
+function _extract_column(pname, e::Expr, ctx)
+    while true
+        ctx.synth[] += 1
+        nm = Symbol(:_rkppl_synth_, ctx.synth[])
+        nm in ctx.taken && continue
+        push!(ctx.taken, nm)
+        push!(ctx.synth_derived, VectorAssignmentSpec(nm, e, nm))
+        return nm
     end
-    coef, col = kinds[1] === :coef ? (a, b) : (b, a)
+end
+
+function _classify_product(pname, core::Expr, sign::Int, ctx)
+    inner = sign
+    coefs = Symbol[]
+    values = Any[]
+    stripped = Any[]
+    for f in core.args[2:end]
+        s, g = _strip_sign(f)
+        inner *= s
+        push!(stripped, g)
+        if g isa Symbol
+            k = _summand_kind(g, ctx)
+            if k === :coef
+                push!(coefs, g)
+            elseif k === :data || k === :local
+                push!(values, g)
+            elseif k === :number
+                _sfail("predictor $pname: literal scaling in " *
+                       "$(repr(core)) is not a term — scale the column " *
+                       "or the prior instead")
+            elseif k === :param
+                _sfail("predictor $pname: $(repr(core)) scales by the " *
+                       "parameter $g — computed coefficients are not " *
+                       "in slice 1")
+            else
+                _sfail("predictor $pname: computed assignments do not " *
+                       "lower as coefficients (computed coefficients " *
+                       "are not in slice 1)")
+            end
+        elseif g isa Number
+            _sfail("predictor $pname: literal scaling in $(repr(core)) " *
+                   "is not a term — scale the column or the prior instead")
+        elseif _canon_shape(g, ctx.data, ctx.detshape) === :vector
+            push!(values, g)
+        else
+            _sfail("predictor $pname: $(repr(core)) scales by the " *
+                   "computed scalar $(repr(g)) — computed coefficients " *
+                   "are not in slice 1")
+        end
+    end
+    length(coefs) > 1 && _sfail("predictor $pname: $(repr(core)) is " *
+                                "nonlinear in coefficients")
+    if isempty(coefs)
+        # Pure value product (interaction): extract whole (signs folded
+        # in), offset term over it.
+        e = length(stripped) == 1 ? only(stripped) :
+            Expr(:call, :.*, stripped...)
+        inner < 0 && (e = Expr(:call, :.-, e))
+        if e isa Symbol
+            return TermSpec(OffsetTerm, [e], NamedTuple(), e,
+                Symbol(e, "_off")), nothing
+        end
+        nm = _extract_column(pname, e, ctx)
+        return TermSpec(OffsetTerm, [nm], NamedTuple(), nm,
+            Symbol(nm, "_off")), nothing
+    end
+    coef = only(coefs)
+    if length(values) == 1 && values[1] isa Symbol
+        col = values[1]
+        return TermSpec(ContinuousTerm, [col], NamedTuple(), col,
+            Symbol(col, "_term")), (coef, col, inner)
+    end
+    if isempty(values)
+        # Degenerate `.*(coef)`: the coefficient stands alone.
+        return TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+            :Intercept, :intercept), (coef, :Intercept, inner)
+    end
+    # Coefficient times interaction: extract the value part, scale it.
+    rest = length(values) == 1 ? values[1] :
+        Expr(:call, :.*, values...)
+    col = _extract_column(pname, rest, ctx)
     return TermSpec(ContinuousTerm, [col], NamedTuple(), col,
         Symbol(col, "_term")), (coef, col, inner)
 end
@@ -752,7 +1231,7 @@ end
 function _strip_sign(ex)
     sign = 1
     while ex isa Expr && ex.head === :call && length(ex.args) == 2 &&
-            ex.args[1] === :-
+            (ex.args[1] === :- || ex.args[1] === :.-)
         sign = -sign
         ex = ex.args[2]
     end
@@ -761,8 +1240,9 @@ end
 
 function _summand_kind(s::Symbol, ctx)
     s in ctx.data && return :data
-    s in ctx.vectors && return :derived
+    s in ctx.vecdefs && return :local
     haskey(ctx.detmap, s) && return :det
+    s in ctx.prior_names && s ∉ ctx.normal_priors && return :param
     return :coef
 end
 function _summand_kind(n::Number, ctx)
@@ -794,7 +1274,7 @@ end
 # AST vocabulary only — it is never called.
 function _factor_index(pname, idx, ctx)
     idx isa Symbol || return _treatment_index(pname, idx, ctx)
-    idx in ctx.vectors && _sfail("predictor $pname: factor over the " *
+    idx in ctx.vecdefs && _sfail("predictor $pname: factor over the " *
                                  "derived column $idx needs pre-evaluation " *
                                  "level knowledge — factors take raw " *
                                  "grouping columns in slice 1")
@@ -813,7 +1293,7 @@ function _treatment_index(pname, idx, ctx)
         _sfail("predictor $pname: `treatment` takes " *
                "`treatment(group[, ref])`")
     g = args[1]
-    g isa Symbol && g in ctx.vectors && _sfail(
+    g isa Symbol && g in ctx.vecdefs && _sfail(
         "predictor $pname: factor over the derived column $g needs " *
         "pre-evaluation level knowledge — factors take raw grouping " *
         "columns in slice 1")
@@ -833,8 +1313,8 @@ end
 # Plan order follows predictors, addressees in term order.
 function _lower_coefficient_priors(sample, coefuse, predictors)
     stated = Dict{Symbol,Any}()
-    for (lhs, rhs) in sample
-        haskey(coefuse, lhs) && (stated[lhs] = rhs)
+    for s in sample
+        haskey(coefuse, s.lhs) && (stated[s.lhs] = s.rhs)
     end
     for (name, uses) in coefuse
         preds = unique!(map(first, copy(uses)))
@@ -905,12 +1385,17 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
 
 function _lower_parameters(sample, coefuse, ctx)
     params = SampledParameter[]
-    for (lhs, rhs) in sample
-        lhs in ctx.data && continue
-        haskey(coefuse, lhs) && continue
-        push!(params, _lower_parameter(lhs, rhs, coefuse))
+    syms = Set{Symbol}()
+    for s in sample
+        s.lhs in ctx.data && continue
+        haskey(coefuse, s.lhs) && continue
+        p = _lower_parameter(s.lhs, s.rhs, coefuse)
+        push!(params, p)
+        for v in values(p.args)
+            v isa Symbol && push!(syms, v)
+        end
     end
-    return params
+    return params, syms
 end
 
 function _lower_parameter(lhs, rhs, coefuse)
@@ -1003,22 +1488,22 @@ function _lower_truncated_param(lhs, rhs, coefuse)
 end
 
 function _lower_assignment(nm, rhs, coefuse)
-    for s in _symbols_in(rhs)
+    for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by assignment " *
                                      "$nm")
     end
-    _reject_assignment_calls(nm, rhs)
     rhs isa Expr || rhs isa Symbol || rhs isa Real ||
         _sfail("assignment $nm must be an expression, name or literal, " *
                "got $(repr(rhs))")
     return AssignmentSpec(nm, rhs, nm)
 end
 
-# Vector shape rules belong to validation (contract v3); lowering routes by
-# classification, checks coefficient discipline, and types the node.
-function _lower_vector_assignment(nm, rhs, coefuse, vectors::Set{Symbol})
-    for s in _symbols_in(rhs)
+# Vector shape rules belong to validation (contract v3); lowering checks
+# coefficient discipline and types the node (vocabulary and Julia-shape
+# screens ran at the definition pre-pass).
+function _lower_vector_assignment(nm, rhs, coefuse)
+    for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by derived " *
                                      "column $nm")
@@ -1026,80 +1511,5 @@ function _lower_vector_assignment(nm, rhs, coefuse, vectors::Set{Symbol})
     rhs isa Expr || rhs isa Symbol ||
         _sfail("derived column $nm must be an expression or column alias, " *
                "got $(repr(rhs))")
-    _reject_derived_calls(nm, rhs, vectors)
     return VectorAssignmentSpec(nm, rhs, nm)
-end
-
-# Surface vocabulary screen for derived columns, mirroring
-# `_reject_assignment_calls`: unknown call heads fail here with author-facing
-# guidance; shapes, nesting, and name resolution stay with validation.
-# Undotted calls over derived columns fail here too: vector structure does
-# not inline, so a non-root definition over a derived column must be dotted
-# (or the combination belongs directly in the predictor).
-function _reject_derived_calls(nm, rhs, vectors::Set{Symbol})
-    return _reject_derived_calls!(nm, rhs, vectors, false)
-end
-
-function _reject_derived_calls!(nm, rhs, vectors, in_reduction::Bool)
-    rhs isa Expr || return nothing
-    if rhs.head === :call && !isempty(rhs.args)
-        fn = rhs.args[1]
-        if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS
-            startswith(string(fn), ".") && _sfail(
-                "derived column $nm uses dotted operator `$fn`, which is " *
-                "not in the slice-1 elementwise vocabulary")
-            _sfail("derived column $nm calls `$fn`, which is not in the " *
-                   "slice-1 elementwise vocabulary — arbitrary Julia " *
-                   "functions are planned (no-@deffun-ceremony direction) " *
-                   "but need IR/contract growth")
-        end
-        if fn isa Symbol && fn in REDUCTION_FNS
-            for a in rhs.args[2:end]
-                _reject_derived_calls!(nm, a, vectors, true)
-            end
-            return nothing
-        end
-        if !in_reduction && fn isa Symbol && fn ∉ ELEMENTWISE_OPS
-            for a in rhs.args[2:end]
-                a isa Symbol && a in vectors && _sfail(
-                    "derived column $nm references derived column $a " *
-                    "inside undotted `$(repr(rhs))` — vector structure " *
-                    "does not inline: use dotted spelling or write the " *
-                    "combination directly in the predictor")
-            end
-        end
-    elseif rhs.head === :.
-        length(rhs.args) == 2 && rhs.args[1] isa Symbol &&
-            rhs.args[2] isa Expr && rhs.args[2].head === :tuple || return nothing
-        f = rhs.args[1]
-        f === :ifelse || f in ELEMENTWISE_FNS || _sfail(
-            "derived column $nm calls `$f.`, which is not in the slice-1 " *
-            "elementwise vocabulary — arbitrary Julia functions are " *
-            "planned (no-@deffun-ceremony direction) but need " *
-            "IR/contract growth")
-    end
-    for a in rhs.args
-        _reject_derived_calls!(nm, a, vectors, in_reduction)
-    end
-    return nothing
-end
-
-# Unknown call heads fail here (with the planned-direction pointer) so the
-# allowlist error never has to guess; argument shapes stay with validation.
-function _reject_assignment_calls(nm, rhs)
-    rhs isa Expr || return nothing
-    if rhs.head === :call && !isempty(rhs.args)
-        fn = rhs.args[1]
-        fn isa Symbol && startswith(string(fn), ".") &&
-            _sfail("assignment $nm: dotted/broadcast spelling is " *
-                   "undecided — slice-1 assignments are scalar")
-        fn isa Symbol && fn ∉ ASSIGNMENT_FNS && _sfail(
-            "assignment $nm calls `$fn`, which is not in the slice-1 " *
-            "assignment vocabulary — arbitrary Julia functions are planned " *
-            "(no-@deffun-ceremony direction) but need IR/contract growth")
-    end
-    for a in rhs.args
-        _reject_assignment_calls(nm, a)
-    end
-    return nothing
 end
