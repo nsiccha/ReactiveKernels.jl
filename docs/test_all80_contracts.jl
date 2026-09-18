@@ -1,6 +1,9 @@
 # Fail-closed rendered contract for the published native all-82 checkpoint.
 using Test
-import TOML
+import TOML, Markdown
+import Base64
+include(joinpath(@__DIR__, "..", "benchmark", "all80_receipt.jl"))
+using .All80Receipt
 # make.jl includes this file at Main top level while the table builders live in
 # ReactiveKernelsDocs (via Base.include); import them explicitly so the contract
 # holds under make.jl's own load order, not just inside the module.
@@ -92,4 +95,93 @@ end
     @test isempty([r for r in rows if r.model == "earnings-earn_height"])            # omitted from speedup ranking
     @test isempty([r for r in hmc_rows(models) if r.model == "earnings-earn_height"]) # omitted from reactant-HMC ranking
     @test !isempty([r for r in hmc_rows(models) if r.model == "ok_model"])            # non-quarantined kept
+end
+
+# Batch-1 incremental render (todo 1x4pytu): the batch-1 plot fns satisfy the Documenter @eval
+# contract (Markdown.MD) against a SYNTHETIC batch-1 receipt, mark diamonds as the workload-mismatch
+# series, SURFACE (not rank) a failed reactant cell, degrade to a note when the receipt is absent, and
+# read the batch-1 path — never the frozen-82 path (which stays untouched).
+@testset "batch-1 incremental render contract (synthetic receipt)" begin
+    RKD = ReactiveKernelsDocs
+    bm(dim; failed = false) = begin
+        m = Dict{String,Any}("dim" => dim, "family" => "batch1",
+            "primal_rk" => 100.0, "gradient_rk" => 200.0, "hmc_rk_native" => 10.0,
+            "primal_stan" => 150.0, "gradient_stan" => 400.0,
+            "primal_turing" => 160.0, "gradient_turing" => 420.0,
+            "primal_rk_reactant" => 90.0, "gradient_rk_reactant" => 180.0, "hmc_rk_reactant" => 8.0,
+            "parity_pass" => true, "turing_support_ok" => true, "hmc_transitions" => 1000)
+        failed && (m["gradient_rk_reactant"] = "gradient @compile: MethodError …")
+        m
+    end
+    receipt = Dict("schema" => "all80-benchmark-v1", "generated_at" => "synthetic",
+        "models" => Dict("diamonds-diamonds" => bm(9), "dogs-dogs_nonhierarchical" => bm(4),
+            "ovarian-logistic_regression_rhs" => bm(50), "normal_5-normal_mixture_k" => bm(3; failed = true)))
+    path = tempname() * ".toml"; open(path, "w") do io; TOML.print(io, receipt; sorted = true); end
+    # @eval contract: both plot fns return Markdown.MD against a real receipt, and a note when absent.
+    @test RKD.render_all80_batch1_coverage_plot(path) isa Markdown.MD
+    @test RKD.render_all80_batch1_speedup_plot(path) isa Markdown.MD
+    @test RKD.render_all80_batch1_coverage_plot(tempname() * ".toml") isa Markdown.MD
+    # data contract: 4 present; diamonds is the workload-mismatch series.
+    models = RKD._all80_models(path)
+    @test length(models) == 4
+    @test "diamonds-diamonds" in RKD._ALL80_WORKLOAD_MISMATCH
+    dia = [r for r in RKD._all80_speedup_rows(models) if r.model == "diamonds-diamonds"]
+    @test !isempty(dia) && all(r -> occursin("Mb", r.workload) || occursin("mismatch", r.workload), dia)
+    # a failed reactant cell is SURFACED in coverage, not ranked.
+    cov = RKD._all80_reactant_coverage_rows(models)
+    @test any(r -> r.operation == "gradient" && r.outcome == "failed (diagnostic recorded)", cov)
+    # path isolation.
+    @test RKD._ALL80_BATCH1_PATH != RKD._ALL80_BENCHMARK_PATH
+end
+
+@testset "batch-1 REAL receipt contract and honest certification status" begin
+    RKD = ReactiveKernelsDocs
+    path = RKD._ALL80_BATCH1_PATH
+    @test isfile(path)
+    receipt = TOML.parsefile(path)
+    expected = Set((
+        "diamonds-diamonds", "dogs-dogs_nonhierarchical",
+        "ovarian-logistic_regression_rhs", "normal_5-normal_mixture_k"))
+    @test Set(keys(get(receipt, "models", Dict()))) == expected
+    models = RKD._all80_models(path)
+    @test all(m -> !haskey(m, "error"), values(models))
+    @test all(m -> get(m, "parity_pass", false) === true, values(models))
+    for cell in ("primal_rk", "gradient_rk", "hmc_rk_native",
+                 "primal_rk_reactant", "gradient_rk_reactant",
+                 "hmc_rk_reactant")
+        @test all(m -> _number_or_reason(get(m, cell, nothing)), values(models))
+    end
+    # The saved historical run is deliberately NOT publication-certified under the new gate:
+    # Reactant producer provenance and per-model input identities are absent, and its native
+    # producer predated the ordinary-backend/configuration field. Do not rewrite those facts.
+    issues = All80Receipt.validate_batch(path;
+        expected_keys = collect(expected), phases = ("native", "reactant"),
+        batch = "batch1")
+    @test any(issue -> occursin("reactant process-start provenance", issue), issues)
+    @test any(issue -> occursin("native input/query identity", issue), issues)
+    @test any(issue -> occursin("ordinary reverse", issue), issues)
+    summary_text = sprint(show, RKD.render_all80_batch1_summary(path))
+    @test occursin("not certified as ordinary-AE publication evidence", summary_text)
+    @test occursin("Reactant phase provenance absent", summary_text)
+    tables_text = sprint(show, RKD.render_all80_batch1_tables(path))
+    @test occursin("Historical batch-1 primal", tables_text)
+    @test occursin("Historical batch-1 HMC", tables_text)
+    @test occursin("Recorded transitions", tables_text)
+    @test occursin("Reactant: 4", tables_text)
+    @test occursin("not a matched-T claim", tables_text)
+    function plot_text(node)
+        html = node.content isa AbstractString ? node.content : node.content[1].content
+        payload = only(match(
+            r"data-rk-exec-payload=\"([^\"]+)", html).captures)
+        String(Base64.base64decode(payload))
+    end
+    plots_text = plot_text(RKD.render_all80_batch1_coverage_plot(path)) *
+        plot_text(RKD.render_all80_batch1_speedup_plot(path))
+    @test occursin("uncertified", plots_text)
+    # The real renderer still uses its own path and marks Diamonds a workload mismatch.
+    @test path != RKD._ALL80_BENCHMARK_PATH
+    dia = [r for r in RKD._all80_speedup_rows(models)
+           if r.model == "diamonds-diamonds"]
+    @test !isempty(dia) &&
+        all(r -> occursin("mismatch", r.workload) || occursin("Mb", r.workload), dia)
 end

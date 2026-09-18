@@ -1,0 +1,39 @@
+generated_at = "2026-09-09T02:23:31.512"
+phase = "reactant"
+schema = "all80-benchmark-v1"
+
+[models.diamonds-diamonds]
+gradient_rk_reactant = 64699.50000000001
+hmc_reactant_transitions = 4
+hmc_rk_reactant = 611.061875
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+primal_rk_reactant = 43945.50000000001
+
+[models.dogs-dogs_nonhierarchical]
+gradient_rk_reactant = 1.433618e6
+hmc_reactant_transitions = 4
+hmc_rk_reactant = 622.7285
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+primal_rk_reactant = 1.89151e6
+
+[models.normal_5-normal_mixture_k]
+gradient_rk_reactant = 93309.00000000001
+hmc_reactant_transitions = 4
+hmc_rk_reactant = 943.39225
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+primal_rk_reactant = 60243.50000000001
+
+[models.ovarian-logistic_regression_rhs]
+gradient_rk_reactant = 68254.0
+hmc_reactant_transitions = 4
+hmc_rk_reactant = 1469.6337500000002
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+primal_rk_reactant = 44932.0
