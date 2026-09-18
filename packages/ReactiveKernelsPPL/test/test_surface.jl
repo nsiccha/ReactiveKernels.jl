@@ -871,8 +871,9 @@ end
     end, (:y, :x))
     # Macro-shape errors fire at expansion (parsed+evaled at runtime so the
     # throw is catchable here instead of at file parse; eval wraps the
-    # expansion throw in LoadError).
-    for bad in ("@rkppl sm(a) = a", "@rkppl 42", "@rkppl (y = yv) 42")
+    # expansion throw in LoadError). A well-formed submodel definition is now
+    # valid (see the "surface submodels" testset); a malformed one still throws.
+    for bad in ("@rkppl sm(1) = begin a end", "@rkppl 42", "@rkppl (y = yv) 42")
         err = try
             eval(Meta.parse(bad))
             nothing
@@ -881,4 +882,127 @@ end
         end
         @test err isa LoadError && err.error isa SurfaceLoweringError
     end
+end
+
+# ── Reusable submodels (StanBlocks-style) ────────────────────────────────
+# Module-level submodel bindings (resolution is by module binding, like
+# StanBlocks `@slic`): a use site `latent ~ sm(args...)` expands inline,
+# namespacing the submodel's own `~`/`=` names under the LHS, so it lowers
+# exactly like a hand-inlined program (transparent) and is reusable across
+# models.
+@rkppl sub_scale(rate) = begin
+    r ~ Exponential(rate)
+    r
+end
+@rkppl sub_shift(loc, sc) = begin
+    z ~ Normal(0, 1)
+    loc + sc * z
+end
+@rkppl sub_nested(rate) = begin
+    s ~ sub_scale(rate)
+    s
+end
+@rkppl sub_noret(rate) = begin
+    r ~ Exponential(rate)
+    q ~ Normal(0, 1)
+end
+
+@testset "surface submodels" begin
+    # Definition capture.
+    @test sub_scale isa RKPPLSubmodel
+    @test sub_scale.name === :sub_scale
+    @test sub_scale.argnames == [:rate]
+    @test sub_shift.argnames == [:loc, :sc]
+
+    # A latent submodel lowers exactly like the hand-inlined program.
+    got = lower_rkppl(quote
+        a ~ Normal(0, 5)
+        sig ~ sub_scale(1.0)
+        eta = a .+ b .* x
+        y .~ Normal.(eta, sig)
+    end, (:y, :x); mod = @__MODULE__)
+    want = lower_rkppl(quote
+        a ~ Normal(0, 5)
+        sig_r ~ Exponential(1.0)
+        sig = sig_r
+        eta = a .+ b .* x
+        y .~ Normal.(eta, sig)
+    end, (:y, :x))
+    @test _plans_equal(got, want)
+
+    # Namespacing under the LHS: the submodel local `r` becomes `sig_r`.
+    @test any(p -> p.name === :sig_r, got.parameters)
+    @test !any(p -> p.name === :r, got.parameters)
+
+    # The same submodel used twice → per-use-site namespacing, no collision.
+    two = lower_rkppl(quote
+        s1 ~ sub_scale(1.0)
+        s2 ~ sub_scale(2.0)
+        eta = a .+ b .* x
+        y .~ Normal.(eta, s1)
+    end, (:y, :x); mod = @__MODULE__)
+    @test any(p -> p.name === :s1_r, two.parameters)
+    @test any(p -> p.name === :s2_r, two.parameters)
+
+    # End-to-end: the submodel program binds, builds and queries identically
+    # to the hand-inlined program (equal plans ⇒ equal kernel/value/gradient).
+    cols, _ = _gen_columns()
+    ms = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        sigma ~ sub_scale(1)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, sigma)
+    end
+    mi = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        sigma_r ~ Exponential(1)
+        sigma = sigma_r
+        mu = a .+ b .* x
+        y .~ Normal.(mu, sigma)
+    end
+    bs = ms(; y = cols[:y], x = cols[:x])
+    bi = mi(; y = cols[:y], x = cols[:x])
+    @test _plans_equal(bs, bi)
+    built = build_kernel(bs)
+    u = [0.5, -0.25, 0.1]
+    @test _query(built.spec, bs, :posterior, u) ≈
+          _query(build_kernel(bi).spec, bi, :posterior, u)
+    _check_gradient(built.spec, bs, u)
+
+    # Fail-closed: arity mismatch.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        sig ~ sub_scale(1.0, 2.0)
+        eta = a .+ b .* x
+        y .~ Normal.(eta, sig)
+    end, (:y, :x); mod = @__MODULE__)
+
+    # Fail-closed: observation-stream form (data on the LHS) is the next slice.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y ~ sub_scale(1.0)
+    end, (:y, :x); mod = @__MODULE__)
+
+    # Fail-closed: nested submodel call (single-level this slice).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        sig ~ sub_nested(1.0)
+        eta = a .+ b .* x
+        y .~ Normal.(eta, sig)
+    end, (:y, :x); mod = @__MODULE__)
+
+    # Fail-closed: a submodel body with no trailing return expression.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        sig ~ sub_noret(1.0)
+        eta = a .+ b .* x
+        y .~ Normal.(eta, sig)
+    end, (:y, :x); mod = @__MODULE__)
+
+    # Without a submodel binding in scope, `latent ~ foo(...)` stays an
+    # ordinary (unknown-distribution) parameter error — no submodel capture.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        sig ~ not_a_submodel(1.0)
+        eta = a .+ b .* x
+        y .~ Normal.(eta, sig)
+    end, (:y, :x); mod = @__MODULE__)
 end

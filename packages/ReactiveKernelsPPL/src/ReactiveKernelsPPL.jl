@@ -37,7 +37,7 @@ export preprocessing_recipes
 export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
-export RKPPLModel, lower_rkppl, @rkppl, SurfaceLoweringError
+export RKPPLModel, RKPPLSubmodel, lower_rkppl, @rkppl, SurfaceLoweringError
 
 include("contract.jl")
 include("design.jl")
