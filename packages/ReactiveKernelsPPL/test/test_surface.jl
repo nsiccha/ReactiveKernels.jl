@@ -1346,12 +1346,12 @@ end
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta ~ Normal(0, 1)),
                     :(y[i] ~ Normal.(theta, 1)))))), Dn)
-    # Per-cell prior arg cannot be `[i]`-indexed in slice-1 (shared scalars).
+    # A whole-vector per-cell prior arg must be indexed (`x[i]`, not bare `x`).
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
-        :(sigma ~ Exponential(1)),
+        :(tau ~ Exponential(1)), :(sigma ~ Exponential(1)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
-                Expr(:block, :(theta[i] ~ Normal(x[i], 1)),
+                Expr(:block, :(theta[i] ~ Normal(x, tau)),
                     :(y[i] ~ Normal.(theta[i], sigma)))))), Dn)
     # A latent buried in a predictor expression (mixed latent + fixed) defers.
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
@@ -1405,4 +1405,39 @@ end
         :(mu = a .+ b .* x), :(y .~ Normal.(mu, s))), (:y, :x))
     @test _plans_equal(a, bare)
     @test all(t.kind !== LatentTerm for p in a.predictors for t in p.terms)
+end
+
+# Per-cell prior args: a per-cell latent's prior mean/scale may be per-cell —
+# a raw data column (`Normal(x[i], tau)`) or a derived column — giving the
+# varying-intercept shape without a separate transform cell.
+@testset "surface plate per-cell prior args" begin
+    cols, n = _gen_columns()
+    # Raw-data per-cell mean.
+    ast = Expr(:block,
+        :(tau ~ Exponential(1)), :(sigma ~ Exponential(1)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(theta[i] ~ Normal(x[i], tau)),
+                    :(y[i] ~ Normal.(theta[i], sigma))))))
+    plan = lower_rkppl(ast, (:y, :x))
+    pp = only(plan.plate_parameters)
+    @test collect(values(pp.args)) == [:x, :tau]     # per-cell x, shared tau
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    u = [-0.1, -0.2, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]  # logtau, logsigma, theta[1:6]
+    nt = constrain(built.layout, u)
+    tau, sigma, theta = nt.tau, nt.sigma, Vector(nt.theta)
+    ll = sum(logpdf.(Normal.(theta, sigma), cols[:y]))
+    pr = logpdf(Exponential(1), tau) + logpdf(Exponential(1), sigma) +
+        sum(logpdf.(Normal.(cols[:x], tau), theta))
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[1] + u[2]
+    _check_gradient(built.spec, bound, u)
+    # An unknown per-cell prior-arg name fails at bind.
+    bad = lower_rkppl(Expr(:block,
+        :(tau ~ Exponential(1)), :(sigma ~ Exponential(1)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(theta[i] ~ Normal(nope[i], tau)),
+                    :(y[i] ~ Normal.(theta[i], sigma)))))), (:y, :x))
+    @test_throws ContractValidationError bind_data(bad, cols)
 end

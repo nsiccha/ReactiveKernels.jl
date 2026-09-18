@@ -733,13 +733,19 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx, param
     col = lhs.args[1]
     obj = c.args[3]
     if col ∉ data
-        # Per-cell latent PARAMETER: a scalar (undotted) distribution whose
-        # args are shared across cells (captured scalars, never `[i]`-indexed).
+        # Per-cell latent PARAMETER: a scalar (undotted) distribution. Its args
+        # are shared across cells (a captured scalar) or per-cell (`eta[$ivar]`,
+        # a varying prior mean/scale); the `[$ivar]` strip and the bare-vector
+        # check enforce the index discipline, exactly like an observation cell.
         obj isa Expr && obj.head === :. && _sfail(
             "per-cell latent `$col[$ivar] ~ ...` takes a scalar (undotted) " *
-            "distribution over shared args (`$col[$ivar] ~ Normal(mu, tau)`), " *
-            "got the dotted $(repr(obj))")
-        push!(params, (col, obj, _plate_param_range(col, rkind), line))
+            "distribution (`$col[$ivar] ~ Normal(mu, tau)` / " *
+            "`$col[$ivar] ~ Normal(eta[$ivar], tau)`), got the dotted $(repr(obj))")
+        bares = _cell_bares(obj, ivar)
+        setdiff!(bares, plate_defs)
+        push!(ctx, (col, line, bares))
+        push!(params, (col, _strip_cell(obj, ivar), _plate_param_range(col, rkind),
+            line))
         return Expr[]
     end
     bares = _cell_bares(obj, ivar)

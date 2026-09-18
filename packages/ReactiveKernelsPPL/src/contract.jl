@@ -435,7 +435,17 @@ end
 # A literal plate range covers 1:n_obs exactly (the size the latent vector
 # packs), mirroring the response-range cover check.
 function _validate_plate_parameters_data(plan::StructuralPlan)
+    scalarnames = _union_names(plan)
+    derivednames = Set{Symbol}(d.name for d in plan.derived)
     for p in plan.plate_parameters
+        # A per-cell prior arg that is neither a scalar name nor a derived
+        # column must be a bound raw data column (validated now that data is
+        # attached); anything else is a genuine unknown name.
+        for (k, v) in pairs(p.args)
+            v isa Symbol || continue
+            (v in scalarnames || v in derivednames || haskey(plan.columns, v)) ||
+                _fail(p.label, "arg $k references unknown name $v")
+        end
         p.range === nothing && continue
         last(p.range) == plan.n_obs || _fail(p.label,
             "plate range $(p.range) covers $(length(p.range)) cells " *
@@ -895,13 +905,13 @@ function _validate_support_override(label, family::Symbol,
     return nothing
 end
 
-# Per-cell latent (plate) parameters: same family/arity/arg/support grammar as
-# scalar SampledParameters (args SHARED across cells: literals or scalar
-# parameter/assignment names — never a latent vector). `range` is `nothing`
-# (whole-column, size n_obs) or a literal UnitRange (validated to cover
-# 1:n_obs at bind, mirroring response ranges).
+# Per-cell latent (plate) parameters: same family/arity/support grammar as
+# scalar SampledParameters. Prior args are either SHARED across cells (a
+# literal or a scalar parameter/assignment name) or PER-CELL (a derived column,
+# giving a varying prior mean/scale — the varying-intercept shape); never
+# another latent vector. `range` is `nothing` (whole-column, size n_obs) or a
+# literal UnitRange (validated to cover 1:n_obs at bind, mirroring responses).
 function _validate_plate_parameters(plan::StructuralPlan)
-    scalarnames = _union_names(plan)
     for p in plan.plate_parameters
         haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
             "plate family $(p.family) not in the slice-1 set " *
@@ -917,10 +927,13 @@ function _validate_plate_parameters(plan::StructuralPlan)
         for (k, v) in pairs(p.args)
             v isa Number && continue
             v isa Symbol || _fail(p.label,
-                "arg $k must be a literal or a scalar parameter/assignment name")
-            v in scalarnames || _fail(p.label,
-                "arg $k references unknown scalar name $v (a per-cell latent's " *
-                "prior args are shared scalars)")
+                "arg $k must be a literal, a scalar parameter/assignment name, " *
+                "or a per-cell column (data or derived)")
+            _is_plate_param(plan, v) && _fail(p.label,
+                "arg $k is the latent vector $v — a per-cell latent's prior args " *
+                "are shared scalars or per-cell columns, never another latent")
+            # scalar (shared) and derived (per-cell) resolve structurally; a raw
+            # data-column arg (per-cell) resolves at bind, like any data ref.
         end
         _validate_support_override(p.label, p.family, p.support_override, p.args)
         if p.range !== nothing
@@ -957,17 +970,17 @@ function topological_order(plan::StructuralPlan)
         end
         deps[p.name] = refs
     end
-    # Per-cell latent (plate) parameters: shared prior args reference scalar
-    # names only (a latent VECTOR arg would be nonsensical as a scalar prior
-    # location/scale). They constrain in the layout transforms like scalar
-    # params, so ordering only guards cycles and downstream references.
+    # Per-cell latent (plate) parameters: prior args are shared scalars,
+    # per-cell derived columns, or raw data columns (never another latent).
+    # They constrain in the layout transforms like scalar params; a
+    # param/assignment/derived arg must be computed before the prior, so it is
+    # a real dependency edge. A raw data-column arg is always available (not a
+    # node) and is validated at bind, so it adds no edge here.
     for p in plan.plate_parameters
         refs = Set{Symbol}()
         for v in values(p.args)
             v isa Symbol || continue
-            v in names ||
-                _fail(p.label, "arg references unknown name $v")
-            push!(refs, v)
+            v in allnames && push!(refs, v)
         end
         deps[p.name] = refs
     end

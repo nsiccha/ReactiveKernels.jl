@@ -460,11 +460,15 @@ end
     # Wrong arity keys.
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :normal, (arg1 = :mu,), nothing)))
-    # Prior arg references an unknown scalar name.
-    @test_throws ContractValidationError validate_structure(
+    # Prior arg references a genuinely unknown name (not scalar/derived/data);
+    # resolved at bind, so it surfaces from validate_data (validate_plan runs it).
+    @test_throws ContractValidationError validate_plan(
         _re_plan(; plate = PlateParameter(:theta, :normal,
             (arg1 = :nope, arg2 = :tau), nothing)))
-    # A latent VECTOR cannot be a scalar prior arg (stays scalar-only).
+    # A raw data column IS an admitted per-cell prior arg (varying mean).
+    @test (validate_plan(_re_plan(; plate = PlateParameter(:theta, :normal,
+        (arg1 = :x, arg2 = :tau), nothing))); true)
+    # A latent VECTOR cannot be a prior arg (never another latent).
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :normal,
             (arg1 = :theta, arg2 = :tau), nothing)))
