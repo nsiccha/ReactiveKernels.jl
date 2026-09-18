@@ -1006,3 +1006,102 @@ end
         y .~ Normal.(eta, sig)
     end, (:y, :x); mod = @__MODULE__)
 end
+
+# ── Observation-stream submodels (slice 2) ───────────────────────────────
+# A stream submodel carries its OWN response + params: it returns a `slot`
+# that is the LHS of an internal `slot .~ family.(...)` response. Invoked with
+# plain `~` on a DATA column (`y ~ sm(...)`) — the whole-column vectorized
+# callee — so the slot binds to the data and the rest namespaces under it. Dots
+# follow the callee: plain `~` outside (vectorized submodel), `.~` inside
+# (scalar family). Admitting plain `~` on a data LHS is a shape-compatibility
+# rule, NOT a submodel type-exception (a scalar callee `y ~ Normal(...)` stays
+# rejected).
+@rkppl obs_gstream(x) = begin
+    a ~ Normal(0, 5)
+    s ~ Exponential(1)
+    eta = a .+ b .* x
+    slot .~ Normal.(eta, s)
+    slot
+end
+@rkppl obs_offstream(off) = begin
+    a ~ Normal(0, 5)
+    s ~ Exponential(1)
+    eta = a .+ off
+    slot .~ Normal.(eta, s)
+    slot
+end
+@rkppl obs_latent(scale) = begin
+    r ~ Exponential(scale)
+    r
+end
+
+@testset "surface observation-stream submodels" begin
+    # A stream lowers exactly like the hand-inlined program (transparent).
+    got = lower_rkppl(quote
+        y ~ obs_gstream(x)
+    end, (:y, :x); mod = @__MODULE__)
+    want = lower_rkppl(quote
+        y_a ~ Normal(0, 5)
+        y_s ~ Exponential(1)
+        y_eta = y_a .+ b .* x
+        y .~ Normal.(y_eta, y_s)
+    end, (:y, :x))
+    @test _plans_equal(got, want)
+
+    # slot→data, locals namespaced under the data column; one response over y.
+    @test length(got.responses) == 1
+    @test got.responses[1].family === GaussianFam
+    @test got.responses[1].response === :y
+    @test got.responses[1].predictor === :y_eta
+    @test got.responses[1].scale === :y_s
+    @test any(p -> p.name === :y_s, got.parameters)
+
+    # One removable node per stream: two independent response streams, each
+    # fully namespaced (add/drop a whole likelihood + its params in one line).
+    two = lower_rkppl(quote
+        y1 ~ obs_offstream(o1)
+        y2 ~ obs_offstream(o2)
+    end, (:y1, :y2, :o1, :o2); mod = @__MODULE__)
+    @test Set(r.response for r in two.responses) == Set([:y1, :y2])
+    @test any(p -> p.name === :y1_s, two.parameters)
+    @test any(p -> p.name === :y2_s, two.parameters)
+
+    # End-to-end: the stream program binds, builds and queries identically to
+    # the hand-inlined program (equal plans ⇒ equal kernel/value/gradient).
+    cols, _ = _gen_columns()
+    ms = @rkppl begin
+        y ~ obs_gstream(x)
+    end
+    mi = @rkppl begin
+        y_a ~ Normal(0, 5)
+        y_s ~ Exponential(1)
+        y_eta = y_a .+ b .* x
+        y .~ Normal.(y_eta, y_s)
+    end
+    bs = ms(; y = cols[:y], x = cols[:x])
+    bi = mi(; y = cols[:y], x = cols[:x])
+    @test _plans_equal(bs, bi)
+    built = build_kernel(bs)
+    u = [0.5, -0.25, 0.1]
+    @test _query(built.spec, bs, :posterior, u) ≈
+          _query(build_kernel(bi).spec, bi, :posterior, u)
+    _check_gradient(built.spec, bs, u)
+
+    # Compatibility rule (NOT a submodel type-exception):
+    # scalar callee on a data LHS still requires dots.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y ~ Normal(mu, 1.0)
+    end, (:y, :x); mod = @__MODULE__)
+
+    # A latent submodel on a data LHS is incompatible (scalar-shaped value).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        y ~ obs_latent(1.0)
+    end, (:y, :x); mod = @__MODULE__)
+
+    # A stream submodel on a non-data LHS is rejected (bind it to data).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        z ~ obs_gstream(x)
+        w .~ Normal.(z, 1.0)
+    end, (:w, :x); mod = @__MODULE__)
+end
