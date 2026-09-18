@@ -1842,7 +1842,8 @@ equivalent to `kernel(public_args...)`.
 
 With `materialize_view_copies`, a bound `SubArray` crosses as an owning copy
 (`collect`) of its elements instead of the prebuilt view. A `SubArray`-typed
-`Constant` operand defeats reverse-mode Enzyme static activity analysis (it
+`Constant` operand defeats static-activity analysis under reverse-mode
+automatic differentiation (it
 unboxes the parent pointer into an active slot), while an owning array with
 identical contents differentiates cleanly (snag plain-enzyme-rev-3dc5d563).
 """
