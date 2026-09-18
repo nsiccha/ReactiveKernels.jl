@@ -131,7 +131,7 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
         _axis!(name, grad_result)
         println("  [4] Reactant grad  ", startswith(grad_result, "PASS") ?
                 "$(split(grad_result)[4]) (< $RGRAD_TOL; 1 probe) PASS" :
-                "UNSUPPORTED (documented $_GAP_SNAG; diagnostic retained)"); flush(stdout)
+                "UNSUPPORTED (see per-axis entry; diagnostic retained)"); flush(stdout)
     end
     return
 end

@@ -198,7 +198,7 @@ function gate(name; build, have, bind, n_bind, scale = 0.3, seed = 468,
         _axis!(name, grad_result)
         println("  [2] native grad    ", startswith(grad_result, "PASS") ?
                 "$(split(grad_result)[3]) (< $GRAD_TOL; $NPTS probes) PASS" :
-                "UNSUPPORTED (documented $_GAP_SNAG; diagnostic retained)"); flush(stdout)
+                "UNSUPPORTED (see per-axis entry; diagnostic retained)"); flush(stdout)
     end
 
     # ---- N controls against the actual .stan with modified data ----
