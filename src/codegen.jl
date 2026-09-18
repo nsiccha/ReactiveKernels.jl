@@ -1224,10 +1224,38 @@ Lower a plan to an ordinary anonymous-function `Expr` of the form
     end
 
 This `Expr` is a first-class artifact: it may be inspected (`code_expr`) and
-rewritten (`transform`) before compilation (gist §9).
+rewritten (`transform`) before compilation (gist §9). Pair it with its
+operation table via [`lower_with_ops`](@ref).
 """
 lower(p::Plan) = first(_lower_with_ops(p; inline_embedded = false))
 _lower_unembedded(p::Plan) = lower(p)
+
+"""
+    lower_with_ops(p::Plan; tensorized=false, inline_embedded=false) -> (ast, ops, recipes)
+
+Lower a plan to an executable straight-line function `Expr` plus the operation
+table it closes over. `ast` is `function (__ops__, ports...) ... end` over the
+plan HAVE ports in order; `ops` is the tuple of callables with `ops[i]`
+evaluating the `__ops__[i]` references in the body; `recipes` is the parallel
+human-readable recipe metadata.
+
+Evaluate functionally with [`compile`](@ref) (or `eval`) and call with the ops
+tuple first:
+
+    ast, ops, _ = lower_with_ops(p)
+    f = compile(ast)
+    f(ops, port_values...)
+
+`lower(p)` is `first(lower_with_ops(p))`. With `tensorized = true` the body
+takes the backend tensorized form over the same operation table; with
+`inline_embedded = true` embedded prepared kernels are spliced as statements
+(the form [`prepare`](@ref) compiles) instead of opaque `__ops__` calls.
+"""
+function lower_with_ops(p::Plan; tensorized::Bool = false,
+                        inline_embedded::Bool = false)
+    _lower_with_ops(
+        p; tensorized = tensorized, inline_embedded = inline_embedded)
+end
 
 function _batched_dependency_analysis(p::Plan, batched)
     graph = p.graph
@@ -1842,7 +1870,8 @@ equivalent to `kernel(public_args...)`.
 
 With `materialize_view_copies`, a bound `SubArray` crosses as an owning copy
 (`collect`) of its elements instead of the prebuilt view. A `SubArray`-typed
-`Constant` operand defeats reverse-mode Enzyme static activity analysis (it
+`Constant` operand defeats static-activity analysis under reverse-mode
+automatic differentiation (it
 unboxes the parent pointer into an active slot), while an owning array with
 identical contents differentiates cleanly (snag plain-enzyme-rev-3dc5d563).
 """
@@ -2558,6 +2587,11 @@ function _recipe_line(r::Recipe)
     ins = join([string(v.name) for v in r.inputs], ", ")
     outs = length(r.outputs) == 1 ? string(r.outputs[1].name) :
            "(" * join([string(v.name) for v in r.outputs], ", ") * ")"
+    # Synthesized tuple unpacks read as field access, not as accessor calls.
+    if length(r.inputs) == 1
+        suffix = _unpack_access_suffix(r.op)
+        suffix !== nothing && return "$outs = $(only(r.inputs).name)$suffix"
+    end
     "$outs = $(_opname(r.op))($ins)"
 end
 

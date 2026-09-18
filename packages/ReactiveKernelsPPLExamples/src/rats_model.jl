@@ -70,12 +70,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     (parameters, log_jacobian::Float64) =
         ((; alpha, beta, mu_alpha, mu_beta, sigma_y, sigma_alpha, sigma_beta),
          log_sigma_y + log_sigma_alpha + log_sigma_beta)
-    (alpha::AbstractVector{Float64}, beta::AbstractVector{Float64},
-     mu_alpha::Float64, mu_beta::Float64, sigma_y::Float64,
-     sigma_alpha::Float64, sigma_beta::Float64) =
-        (parameters.alpha, parameters.beta, parameters.mu_alpha,
-         parameters.mu_beta, parameters.sigma_y, parameters.sigma_alpha,
-         parameters.sigma_beta)
 
     # Population priors: mu_alpha ~ Normal(0, 100), mu_beta ~ Normal(0, 100). The
     # three scales are FLAT improper (only the exp Jacobian above, no density).

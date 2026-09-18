@@ -32,8 +32,6 @@ using LogExpFunctions: logistic
     log_jacobian::Float64 = 0.0
 
     parameters = (; alpha, beta1, beta2)
-    (alpha::Float64, beta1::Float64, beta2::Float64) =
-        (parameters.alpha, parameters.beta1, parameters.beta2)
 
     # Priors: α, β₁, β₂ ~ Normal(0, 100), reusing the shared Normal endpoint.
     alpha_prior::Float64 = normal(0.0, 100.0).logpdf(alpha)

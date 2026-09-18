@@ -72,7 +72,6 @@ using LogExpFunctions: logistic
     log_jacobian::Float64 = 0.0
 
     parameters = (; beta1, beta2)
-    (beta1::Float64, beta2::Float64) = (parameters.beta1, parameters.beta2)
 
     # Explicit uniform priors from the Stan model block:
     #   beta[1] ~ uniform(-100, 0);  beta[2] ~ uniform(0, 100);

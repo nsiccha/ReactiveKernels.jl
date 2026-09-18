@@ -7,6 +7,7 @@ using ReactiveKernelsHMCDiagnostics
 using ReactiveKernelsNUTSExamples
 using ReactiveKernelsPPLExamples
 using ReactiveKernelsStreamingStats
+using ReactiveKernelsReactantODESolvers
 
 # Opt into the standalone nutpie/nuts-rs diagonal-adaptation compiler corpus.
 # It remains an external mathematical example rather than a package API.
@@ -154,6 +155,7 @@ makedocs(
         ReactiveKernelsNUTSExamples,
         ReactiveKernelsStreamingStats,
         ReactiveKernelsHMCDiagnostics,
+        ReactiveKernelsReactantODESolvers,
     ],
     format   = DocumenterVitepress.MarkdownVitepress(
         repo = "github.com/nsiccha/ReactiveKernels.jl",

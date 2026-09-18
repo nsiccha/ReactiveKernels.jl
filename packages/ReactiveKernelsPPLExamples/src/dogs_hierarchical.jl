@@ -92,7 +92,6 @@ using LogExpFunctions: logistic, log1pexp
     # constrain-only producer omits the Jacobian; the joint producer emits it.
     parameters = (; a, b)
     (parameters, log_jacobian::Float64) = ((; a, b), jac_a + jac_b)
-    (a::Float64, b::Float64) = (parameters.a, parameters.b)
 
     # Implicit uniform prior over the declared box [0, 1]² has density 1, so the
     # varying prior term is exactly zero (no dropped constant).

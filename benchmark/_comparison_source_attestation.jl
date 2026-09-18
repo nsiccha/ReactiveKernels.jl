@@ -16,15 +16,15 @@ export SUM_TO_ZERO_MODEL_SOURCE_CURRENT_DELTA
 const COMPARATOR_SOURCE_CURRENT_DELTA =
     "long-form native/bound/nonallocating matrix around byte-preserved Turing/manual baselines plus terminal definition-only guard"
 const EIGHT_SCHOOLS_MODEL_SOURCE_CURRENT_DELTA =
-    "published centered hierarchy and every public boundary are preserved; additive scalar-index-free packed extraction and a single-output Jacobian recipe enable Reactant and nonallocating configurations"
+    "published centered hierarchy and every public boundary are preserved; additive scalar-index-free packed extraction and a single-output Jacobian recipe enable Reactant and nonallocating configurations; the hand-written parameters unpack is removed in favor of automatic tuple-unpack edges"
 const MNIST_COMPARATOR_SOURCE_CURRENT_DELTA =
     "additive two-model native/bound/nonallocating matrix; published Turing/manual AD baselines unchanged; documentation markers plus terminal definition-only include guard"
 const MNIST_MODEL_SOURCE_CURRENT_DELTA =
     "published idiomatic model source is byte-preserved; the additive optimized model uses the same natural each-column plate with the reference-coded categorical object"
 const SUM_TO_ZERO_MODEL_SOURCE_CURRENT_DELTA =
-    "published model body is preserved; scalar-indexed packed extraction and the model_only evaluator/init path are the only current-source deltas"
+    "published model body is preserved; scalar-indexed packed extraction, the model_only evaluator/init path, and automatic tuple-unpack edges (hand-written parameters unpack removed) are the only current-source deltas"
 const EIGHT_SCHOOLS_RECORDED_TO_CURRENT_MODEL_SOURCE_DELTA =
-    "recorded model body is preserved; artifact-backed real data, scalar-indexed packed extraction, and the model_only evaluator/init path are the only recorded-to-current deltas"
+    "recorded model body is preserved; artifact-backed real data, scalar-indexed packed extraction, the model_only evaluator/init path, and automatic tuple-unpack edges (hand-written parameters unpack removed) are the only recorded-to-current deltas"
 const _DOCS_BASELINE_MARKERS = (
     "# DOCS-BASELINE-BEGIN: turing",
     "# DOCS-BASELINE-END: turing",
@@ -181,6 +181,19 @@ function eight_schools_model_source_preserves_published_authority(current, publi
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source(; model_only = true).model\n",
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source().model\n",
         ),
+        # The hand-written `parameters` unpack is gone from the authored
+        # source: automatic tuple-unpack edges reproduce it exactly, so the
+        # prepared graph — and the measured benchmark — is unchanged.
+        (
+            "    # HAVE authority cuts the inverse edges.\n" *
+            "\n" *
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n",
+            "    # HAVE authority cuts the inverse edges.\n" *
+            "    (μ::Float64, τ::Float64, θ::AbstractVector{Float64}) =\n" *
+            "        (parameters.μ, parameters.τ, parameters.θ)\n" *
+            "\n" *
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n",
+        ),
     )
     transformed = current
     for (replacement, original) in replacements
@@ -218,6 +231,19 @@ function eight_schools_model_source_matches_recorded_current(current, recorded)
         (
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source(; model_only = true).model\n",
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source().model\n",
+        ),
+        # The hand-written `parameters` unpack is gone from the authored
+        # source: automatic tuple-unpack edges reproduce it exactly, so the
+        # prepared graph — and the measured benchmark — is unchanged.
+        (
+            "    # HAVE authority cuts the inverse edges.\n" *
+            "\n" *
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n",
+            "    # HAVE authority cuts the inverse edges.\n" *
+            "    (μ::Float64, τ::Float64, θ::AbstractVector{Float64}) =\n" *
+            "        (parameters.μ, parameters.τ, parameters.θ)\n" *
+            "\n" *
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n",
         ),
     )
     transformed = current
@@ -303,6 +329,21 @@ function sum_to_zero_model_source_preserves_published_authority(current, publish
         (
             "    _SUM_TO_ZERO_GRAPH_TEMPLATE[] = evaluate_sum_to_zero_source(; model_only = true).model\n",
             "    _SUM_TO_ZERO_GRAPH_TEMPLATE[] = evaluate_sum_to_zero_source().model\n",
+        ),
+        # The hand-written `parameters` unpack is gone from the authored
+        # source: automatic tuple-unpack edges reproduce it exactly, so the
+        # prepared graph — and the measured benchmark — is unchanged.
+        (
+            "         log_τ + sum_to_zero_log_jacobian)\n" *
+            "\n" *
+            "    K::Int = length(effects_s2z)\n",
+            "         log_τ + sum_to_zero_log_jacobian)\n" *
+            "    (α_s2z::Float64,\n" *
+            "     τ::Float64,\n" *
+            "     effects_s2z::AbstractVector{Float64}) =\n" *
+            "        (parameters.α_s2z, parameters.τ, parameters.effects_s2z)\n" *
+            "\n" *
+            "    K::Int = length(effects_s2z)\n",
         ),
     )
     transformed = current
