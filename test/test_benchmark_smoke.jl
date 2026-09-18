@@ -366,13 +366,18 @@ end
 @testset "incremental producer selection and resume isolation" begin
     native = read(joinpath(_BENCH_DIR, "all80_posteriordb_body.jl"), String)
     reactant = read(joinpath(_BENCH_DIR, "all80_reactant_body.jl"), String)
-    selector = "setdiff(keys(RK), All80Registry.BATCH1_KEYS)"
+    selector = "setdiff(keys(RK), All80Registry.BATCH_KEYS)"
     @test occursin(selector, native) && occursin(selector, reactant)
     registry = read(joinpath(_BENCH_DIR, "all80_registry.jl"), String)
     @test occursin("const BATCH1_KEYS = Set([", registry)
+    @test occursin("const IRT_KEYS = Set([", registry)
+    @test occursin("const BATCH_KEYS = union(BATCH1_KEYS, IRT_KEYS)", registry)
     @test count(key -> occursin("\"$key\"", registry), (
         "diamonds-diamonds", "dogs-dogs_nonhierarchical",
         "ovarian-logistic_regression_rhs", "normal_5-normal_mixture_k")) == 4
+    @test count(key -> occursin("\"$key\"", registry), (
+        "irt_2pl-irt_2pl", "fims_Aus_Jpn_irt-2pl_latent_reg_irt",
+        "sat-hier_2pl", "timssAusTwn_irt-gpcm_latent_reg_irt")) == 4
     @test occursin("count(==(name), _req) > 1", native)
     @test occursin("count(==(name), requested) > 1", reactant)
     @test occursin("All80Receipt.assert_batch_resume!", native)
