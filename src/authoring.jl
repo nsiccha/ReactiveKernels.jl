@@ -1017,6 +1017,33 @@ function _kernel_recipe(ex)
     assignment, metadata
 end
 
+# Julia parses `f(name = value)` as a keyword call, but a downstream macro-generated
+# closure cannot retain that spelling verbatim. Normalize it to the equivalent
+# `f(; name = value)` AST before endpoint and operation lowering so both authoring
+# spellings share one grammar.
+function _kernel_normalize_call_kwargs(ex)
+    ex isa Expr || return ex
+    if ex.head === :call
+        positional = Any[]
+        keywords = Any[]
+        for arg in ex.args
+            if arg isa Expr && arg.head === :kw
+                push!(keywords, arg)
+            else
+                push!(positional, arg)
+            end
+        end
+        if !isempty(keywords)
+            call_args = Any[positional[1], Expr(:parameters, keywords...),
+                            positional[2:end]...]
+            return Expr(:call,
+                (_kernel_normalize_call_kwargs(arg) for arg in call_args)...)
+        end
+    end
+    return Expr(ex.head,
+        (_kernel_normalize_call_kwargs(arg) for arg in ex.args)...)
+end
+
 function _kernel_return_names(ex)
     items = ex isa Expr && ex.head === :tuple ? ex.args : Any[ex]
     names = Symbol[]
@@ -1326,7 +1353,8 @@ function _kernel_plate_cell_locals(body)
     names
 end
 
-function _kernel_authored_plate_expr(rhs, mod)
+function _kernel_authored_plate_expr(rhs, mod,
+                                     caller_locals = Set{Symbol}())
     rhs isa Expr && rhs.head === :do && length(rhs.args) == 2 || return nothing
     call, lambda = rhs.args
     call isa Expr && call.head === :call && !isempty(call.args) || return nothing
@@ -1371,12 +1399,23 @@ function _kernel_authored_plate_expr(rhs, mod)
     length(unique(formals)) == length(formals) || throw(ArgumentError(
         "plate do-block argument names must be unique"))
 
+    # Explicit caller locals that the scalar cell reads are automatically threaded
+    # as scalar plate arguments. This matches the broadcast model: a caller vector
+    # port named directly is a batched axis, while an unthreaded scalar is shared.
+    caller_free = filter!(
+        name -> name in caller_locals && !(name in formals),
+        _kernel_free_ports(scalar_body, Set(caller_locals)),
+    )
+    append!(formals, caller_free)
+    append!(arguments, caller_free)
+
     nested_specs = Dict{Symbol,Any}()
     local_types = Dict{Symbol,Any}()
     materialized = Tuple{Symbol,Any,Any}[]
     cell_locals = _kernel_plate_cell_locals(scalar_body)
     rewritten, inferred = _kernel_constructed_endpoint(
-        scalar_body, mod, Set(formals), nested_specs, local_types;
+        scalar_body, mod, union(Set(formals), caller_locals),
+        nested_specs, local_types;
         context = "inside plate", materialized = materialized,
         cell_locals = cell_locals)
     signature = Tuple{Symbol,Any}[
@@ -1880,7 +1919,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     # Promote genuine RK `@node(expr)` markers into distinct schedulable recipe nodes
     # (identity-aware, collision-free, straight-line-only). A no-op — byte-identical —
     # for bodies with no `@node` (or only foreign `@node`).
-    block = _kernel_lift_nodes(block, mod)
+    block = _kernel_normalize_call_kwargs(_kernel_lift_nodes(block, mod))
     raw_statements = block isa Expr && block.head === :block ? block.args : Any[block]
     statements = _kernel_normalize_return_expressions(raw_statements)
     graph_var = gensym(:kernel_graph)
@@ -1955,7 +1994,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 register!(name, type_expr)
                 push!(outputs, (name, type_expr))
             end
-            plate_expr = _kernel_authored_plate_expr(rhs, mod)
+            plate_expr = _kernel_authored_plate_expr(
+                rhs, mod, Set(Symbol(name) for (name, _) in signature_inputs))
             plate_expr === nothing &&
                 (plate_expr = _kernel_authored_scan_expr(rhs, mod))
             if plate_expr !== nothing
