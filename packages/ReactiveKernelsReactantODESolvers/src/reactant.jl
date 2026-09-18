@@ -105,14 +105,19 @@ branches on traced values. Hyperparameters (`dt_init`, tolerances,
 `maxiters`, saveat times) are compile-time constants; the adaptive
 step-size sequence itself is computed inside the program.
 
-Gradient recipe: prefer [`compile_backsolve_gradient`](@ref), which
-re-solves the adjoint ODE backward in a second early-exit compiled program
-(no differentiation through the adaptive loop). The manual alternative is
-plain `Enzyme.autodiff(::Reverse, ...)` *inside* a second compiled function;
-Reactant's Enzyme overlay lowers the pullback into the program. Build that
-closure with `early_exit=false` (Binomial-checkpointed reverse requires the
-single-comparison freeze shape). See the test suite for the exact
-composition.
+Gradient path: [`compile_backsolve_gradient`](@ref) is the supported
+way to differentiate this solve. It re-solves the augmented adjoint ODE
+backward in backward early-exit compiled programs; the only
+`Enzyme.autodiff` differentiates the loop-free RHS once per stage
+evaluation, so nothing differentiates through the adaptive while loop.
+
+Direct differentiation through the solve with
+`Enzyme.autodiff(::Reverse, ...)` is NOT supported. The interim
+`early_exit=false` freeze recipe cannot lower checkpointed reverse
+through the data-dependent early-exit loop at solver scale (see
+[`traceable_ode_closure`](@ref)), and the freeze shape wastes bound
+iterations at runtime. `early_exit=false` survives only as a
+diagnostic/reference path exercised by the test-suite agreement gates.
 """
 function compile_ode_solve end
 
@@ -147,7 +152,7 @@ Both directions run the early-exit primal loop. The only
 `Enzyme.autodiff` in this path differentiates the loop-free RHS `f` once
 per stage evaluation (a vector-Jacobian product lowered to straight-line
 code inside the step); nothing differentiates through the adaptive while
-loop, so the freeze shape is never needed. A non-successful forward or
+loop, so the legacy freeze shape is never needed. A non-successful forward or
 backward solve throws an `ErrorException` (there is no trajectory to adjoin).
 """
 function compile_backsolve_gradient end
@@ -167,10 +172,13 @@ Build the raw traced closure compiled by [`compile_ode_solve`](@ref)
 Exposed for IR inspection (`Reactant.@code_hlo`) and custom compilation.
 
 Keyword `early_exit` (default `true`): the primal loop exits on `(n <
-maxiters) & (t < t1)`. Pass `early_exit=false` for the reverse-compatible
-freeze shape (single-comparison cond, runs out the bound) when the closure
-will be differentiated through; both shapes produce bitwise-identical
-values.
+maxiters) & (t < t1)`. `early_exit=false` selects the legacy freeze
+shape (single-comparison cond, runs out the bound). It is kept as a
+diagnostic/reference path for the test-suite agreement gates only — it
+is NOT a supported gradient recipe. Checkpointed reverse through the
+adaptive loop does not lower at solver scale under any Enzyme scheme,
+so differentiate with [`compile_backsolve_gradient`](@ref). Both
+shapes produce bitwise-identical values.
 """
 function traceable_ode_closure end
 

@@ -31,15 +31,21 @@
 #   (`stablehlo.dynamic_pad` untranslatable); a compound `(a < b) & (c < d)`
 #   cond fails analysis under either scheme ("no known iteration count");
 #   a select-on-IV saturating counter segfaults the Binomial reverse
-#   transform (`reverseBinomial`/`popCache`). The reverse-compatible loop
-#   shape is therefore a per-iteration freeze, not a second clause or a
-#   saturated counter — but ONLY the reverse path needs it. Primal
-#   `@trace while` lowers a compound `(n < max) & (t < t1)` cond and
-#   exits early (probed minimal), so `early_exit=true` (the default) runs
-#   no frozen iterations at all. Measured freeze cost (strato2,
-#   2026-09-18, Reactant 0.2.285; 2-state decay converging in ~60 native
-#   attempts): maxiters=80 executes in 0.10 ms, maxiters=1000 in 0.55 ms
-#   — execution wall time of the freeze shape scales with the bound, not
+#   transform (`reverseBinomial`/`popCache`). Through-solve reverse
+#   therefore required a per-iteration freeze shape, not a second clause
+#   or a saturated counter — and even the freeze never lowered at solver
+#   scale under any scheme (see the test suite; minimal repro filed
+#   upstream). Through-solve reverse is NOT supported: the supported
+#   gradient path is the backsolve adjoint (`compile_backsolve_gradient`),
+#   which differentiates only the loop-free RHS VJP inside the step.
+#   Primal `@trace while` lowers a compound `(n < max) & (t < t1)` cond
+#   and exits early (probed minimal), so `early_exit=true` (the default)
+#   runs no frozen iterations at all. The legacy `early_exit=false`
+#   shape survives only as a diagnostic/reference path for the
+#   agreement gates. Measured freeze cost (strato2, 2026-09-18,
+#   Reactant 0.2.285; 2-state decay converging in ~60 native attempts):
+#   maxiters=80 executes in 0.10 ms, maxiters=1000 in 0.55 ms —
+#   execution wall time of the freeze shape scales with the bound, not
 #   the difficulty. Both shapes produce bitwise-identical values (locked
 #   by the agreement test); status semantics are unchanged (exhaustion
 #   still reports from the unreached `t1`).
