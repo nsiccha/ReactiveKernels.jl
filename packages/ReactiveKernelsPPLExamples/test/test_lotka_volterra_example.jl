@@ -57,11 +57,12 @@ function _lotka_reference(q)
 end
 
 @testset "PPL graph — lotka_volterra (posteriordb adaptive RK45)" begin
-    # Boundary: for this node only native primal/value is accepted.
-    # Ordinary-Reverse gradient is unsupported pending core snag
-    # plain-enzyme-rev-3dc5d563, and compiled Reactant primal/gradient is
+    # Boundary: native primal/value plus ordinary-Reverse gradient is
+    # accepted, supported via landed core fix 55da875/f8acaa1 for snag
+    # plain-enzyme-rev-3dc5d563; compiled Reactant primal/gradient is
     # unsupported pending the separate Reactant survey — so this file
-    # asserts Reactant stays absent throughout and exercises values only.
+    # asserts Reactant stays absent throughout (values here, gradients in
+    # the default four-model gate).
     modules_before = Set(String(id.name) for id in keys(Base.loaded_modules))
     @test !("Reactant" in modules_before)
 
