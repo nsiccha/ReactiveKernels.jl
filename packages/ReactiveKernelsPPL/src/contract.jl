@@ -243,6 +243,9 @@ The emitter fails closed on `false` (`:zscale`/`:center`/`:standardize`/
 """
 supports_term(name::Symbol) = haskey(TERM_NAMES, name)
 
+"""In-graph coefficient-block name for a predictor (`mu` → `mu_coef`)."""
+block_name(predictor::Symbol) = Symbol(string(predictor) * "_coef")
+
 _fail(label, msg) = throw(ContractValidationError("[$label] $msg"))
 
 """
@@ -293,6 +296,22 @@ function _validate_name_tables(plan::StructuralPlan)
         :plan,
         "parameter/assignment names collide with raw columns: $(join(col_overlap, ", "))",
     )
+    for pn in pnames
+        pn in union(params, assigns) && _fail(
+            :plan,
+            "predictor $pn collides with a parameter/assignment name",
+        )
+        block_name(pn) in union(params, assigns) && _fail(
+            :plan,
+            "parameter/assignment $(block_name(pn)) collides with predictor $pn block name",
+        )
+    end
+    for n in Iterators.flatten((pnames, params, assigns, keys(plan.columns)))
+        startswith(string(n), "_ppl_") && _fail(
+            :plan,
+            "name $n uses the reserved _ppl_ prefix (transform intermediates)",
+        )
+    end
     return nothing
 end
 
