@@ -63,6 +63,10 @@ const PPL_SOURCE_CASES = (
      :HIER_2PL_SOURCE, :evaluate_hier_2pl_source),
     ("gpcm-latent-reg-irt.md", "gpcm_latent_reg_irt.jl", GpcmLatentRegIrtExample,
      :GPCM_LR_SOURCE, :evaluate_gpcm_latent_reg_irt_source),
+    ("grsm-latent-reg-irt.md", "grsm_latent_reg_irt.jl", GrsmLatentRegIrtExample,
+     :GRSM_LR_SOURCE, :evaluate_grsm_latent_reg_irt_source),
+    ("kronecker-gp.md", "kronecker_gp.jl", KroneckerGpExample,
+     :KRON_SOURCE, :evaluate_kronecker_gp_source),
     ("glmm1.md", "glmm1_model.jl", GLMM1ModelExample,
      :GLMM1_SOURCE, :evaluate_glmm1_model_source),
     ("bym2-offset-only.md", "bym2_offset_only.jl", Bym2OffsetOnlyExample,
@@ -80,6 +84,8 @@ const PPL_SOURCE_CASES = (
      :ONE_COMP_MM_ELIM_ABS_SOURCE, :evaluate_one_comp_mm_elim_abs_source),
     ("soil-incubation.md", "soil_incubation.jl", SoilIncubationExample,
      :SOIL_INCUBATION_SOURCE, :evaluate_soil_incubation_source),
+    ("hmm-drive-1.md", "hmm_drive_1.jl", HmmDrive1Example,
+     :HMM_DRIVE_1_SOURCE, :evaluate_hmm_drive_1_source),
 )
 
 # One displayed/executed authority kernel per registered case: a file carrying
@@ -166,6 +172,8 @@ end
         :two_pl_latent_reg_irt_posterior,
         :hier_2pl_posterior,
         :gpcm_latent_reg_irt_posterior,
+        :grsm_latent_reg_irt_posterior,
+        :kronecker_gp_posterior,
         :glmm1_model_posterior,
         :bym2_offset_only_posterior,
         :bones_model_posterior,

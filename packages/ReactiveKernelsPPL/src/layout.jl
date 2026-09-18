@@ -27,11 +27,11 @@ function support_of(family::Symbol, override::Union{Nothing,Symbol})
     return :positive
 end
 
-"""One packed slice: a coefficient block or a scalar latent."""
+"""One packed slice: a coefficient block, a scalar latent, or a scan vector latent."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled
+    kind::Symbol # :coefficient | :sampled | :scan
     predictor::Union{Nothing,Symbol}
-    name::Symbol # block name (`mu_coef`) or parameter name
+    name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
     offset::Int # 1-based packed offset
     size::Int
@@ -86,6 +86,21 @@ function assign_layout(plan::StructuralPlan)
             LayoutEntry(:plate, nothing, p.name, [p.name], offset, size, transform))
         offset += size
     end
+    # Sequential-recurrence latents: one identity array slice per scan. The
+    # length T is the loop bound — a literal Int, or `n_obs` when the bound is a
+    # data length name (the canonical observation-indexed state-space case).
+    # v1 latents have real support (identity transform ⇒ no Jacobian); the
+    # emitter reconstructs the carried state from this slice.
+    for s in plan.scans
+        T = s.hi isa Int ? s.hi : plan.n_obs
+        T >= s.lo || throw(ContractValidationError(
+            "[layout] scan $(s.state) length $(T) < loop start $(s.lo) — " *
+            "the recurrence must run at least once"))
+        labels = Symbol[Symbol(i) for i in 1:T]
+        push!(entries,
+            LayoutEntry(:scan, nothing, s.state, labels, offset, T, :identity))
+        offset += T
+    end
     return LayoutTable(entries, offset - 1)
 end
 
@@ -105,6 +120,10 @@ function coordinate_names(layout::LayoutTable)
         elseif e.kind === :plate
             for i in 1:e.size
                 push!(names, Symbol(string(e.name) * "." * string(i)))
+            end
+        elseif e.kind === :scan
+            for label in e.labels
+                push!(names, Symbol(string(e.name) * "." * string(label)))
             end
         else
             push!(names, e.name)
@@ -131,6 +150,8 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         elseif e.kind === :plate
             v = [_constrain_value(Val(e.transform), Float64(x)) for x in seg]
             push!(pairs, e.name => v)
+        elseif e.kind === :scan
+            push!(pairs, e.name => Vector{Float64}(seg))
         else
             v = _constrain_value(Val(e.transform), Float64(only(seg)))
             push!(pairs, e.name => v)
@@ -167,6 +188,15 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             for (k, x) in enumerate(v)
                 u[e.offset + k - 1] = _unconstrain_value(Val(e.transform), Float64(x))
             end
+        elseif e.kind === :scan
+            haskey(nt, e.name) || throw(
+                ContractValidationError("[layout] missing scan state $(e.name)"),
+            )
+            v = nt[e.name]
+            length(v) == e.size || throw(
+                ContractValidationError("[layout] scan state $(e.name) length mismatch"),
+            )
+            u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
         else
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing parameter $(e.name)"),
@@ -237,7 +267,9 @@ Intermediate unconstrained vars use the reserved `_ppl_log_`/`_ppl_logit_`
 prefix.
 """
 function transform_statements(e::LayoutEntry)
-    if e.kind === :coefficient
+    if e.kind === :coefficient || e.kind === :scan
+        # both are identity array slices read into `e.name` (a coefficient
+        # block name, or a scan-state name the emitter reconstructs from)
         lo = e.offset
         hi = e.offset + e.size - 1
         return Expr[:($(e.name)::AbstractVector{Float64} =

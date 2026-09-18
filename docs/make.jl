@@ -7,6 +7,7 @@ using ReactiveKernelsHMCDiagnostics
 using ReactiveKernelsNUTSExamples
 using ReactiveKernelsPPLExamples
 using ReactiveKernelsStreamingStats
+using ReactiveKernelsReactantODESolvers
 
 # Opt into the standalone nutpie/nuts-rs diagonal-adaptation compiler corpus.
 # It remains an external mathematical example rather than a package API.
@@ -83,6 +84,7 @@ site_pages = [
             "IRT 2PL + latent regression" => "2pl-latent-reg-irt.md",
             "IRT hierarchical 2PL (correlated items)" => "hier-2pl.md",
             "IRT GPCM (ordinal + latent regression)" => "gpcm-latent-reg-irt.md",
+            "IRT rating scale (GRSM + latent regression)" => "grsm-latent-reg-irt.md",
             "GLMM1 (per-site Poisson-log GLMM)" => "glmm1.md",
             "BYM2 (spatial-Poisson convolution)" => "bym2-offset-only.md",
             "Bones (graded-response latent trait)" => "bones.md",
@@ -98,6 +100,8 @@ site_pages = [
             "Approximate GP (HSGP, distributional)" => "accel-gp.md",
             "BRM motorcycle (partial HSGP coordinates)" => "brm-hsgp.md",
             "Hierarchical GP" => "hierarchical-gp.md",
+            "Kronecker-structured GP (grid)" => "kronecker-gp.md",
+            "Basketball-drive HMM (hmm_drive_1)" => "hmm-drive-1.md",
         ],
         "Declarative @ppl front-end + Gibbs (experimental)" => "ppl-front-end.md",
     ],
@@ -151,6 +155,7 @@ makedocs(
         ReactiveKernelsNUTSExamples,
         ReactiveKernelsStreamingStats,
         ReactiveKernelsHMCDiagnostics,
+        ReactiveKernelsReactantODESolvers,
     ],
     format   = DocumenterVitepress.MarkdownVitepress(
         repo = "github.com/nsiccha/ReactiveKernels.jl",

@@ -413,6 +413,19 @@ function setup_normal_mixture_k!(mod::Module)
     nothing
 end
 
+function setup_hmm_drive_1!(mod::Module)
+    if !isdefined(mod, :HmmDrive1Example)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: HmmDrive1Example))
+    end
+    # Bind only the raw data. The displayed PPL assembly imports and reuses the
+    # shared `normal` and `dirichlet` distribution objects directly and authors
+    # the forward-algorithm `scan` inline; no helper evaluator is injected.
+    Core.eval(mod, :(using .HmmDrive1Example:
+        HMM_DRIVE_1_U, HMM_DRIVE_1_V, HMM_DRIVE_1_ALPHA, HMM_DRIVE_1_TAU,
+        HMM_DRIVE_1_RHO))
+    nothing
+end
+
 function setup_dogs_nonhierarchical!(mod::Module)
     if !isdefined(mod, :DogsNonhierarchicalExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: DogsNonhierarchicalExample))
@@ -593,6 +606,29 @@ function setup_gpcm_latent_reg_irt!(mod::Module)
     # structure, the covariate design, and the sum-to-zero map in-graph.
     Core.eval(mod, :(using .GpcmLatentRegIrtExample:
         GPCM_LR_II, GPCM_LR_JJ, GPCM_LR_Y, GPCM_LR_W, GPCM_LR_I))
+    nothing
+end
+
+function setup_grsm_latent_reg_irt!(mod::Module)
+    if !isdefined(mod, :GrsmLatentRegIrtExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GrsmLatentRegIrtExample))
+    end
+    # Bind the raw long-form ii/jj/y (ordinal), the covariate matrix W, and the
+    # item count. The displayed PPL assembly derives the category count, the
+    # covariate design, and both sum-to-zero maps in-graph.
+    Core.eval(mod, :(using .GrsmLatentRegIrtExample:
+        GRSM_LR_II, GRSM_LR_JJ, GRSM_LR_Y, GRSM_LR_W, GRSM_LR_I))
+    nothing
+end
+
+function setup_kronecker_gp!(mod::Module)
+    if !isdefined(mod, :KroneckerGpExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: KroneckerGpExample))
+    end
+    # Bind the grid locations x1 and the observation matrix y; the squared-
+    # distance matrix, both margin eigendecompositions, and the LKJ-Cholesky
+    # transform are derived in-graph.
+    Core.eval(mod, :(using .KroneckerGpExample: KRON_X1, KRON_Y))
     nothing
 end
 
@@ -1200,6 +1236,8 @@ const EXPECTED_PPL_EXAMPLES = (
     :two_pl_latent_reg_irt_posterior,
     :hier_2pl_posterior,
     :gpcm_latent_reg_irt_posterior,
+    :grsm_latent_reg_irt_posterior,
+    :kronecker_gp_posterior,
     :glmm1_model_posterior,
     :bym2_offset_only_posterior,
     :bones_model_posterior,
@@ -1208,6 +1246,7 @@ const EXPECTED_PPL_EXAMPLES = (
     :sir_posterior,
     :one_comp_mm_elim_abs_posterior,
     :soil_incubation_posterior,
+    :hmm_drive_1_density,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 

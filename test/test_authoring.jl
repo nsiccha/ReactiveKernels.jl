@@ -1028,9 +1028,13 @@ end
             y::NamedTuple{(:a,:b),Tuple{Int,Int}} = (a = x, b = a)
             return y
         end
-        @test Set(v.name for v in only(
+        # The pack recipe is one of several: automatic unpack edges (x = y.a,
+        # a = y.b) share the graph, so select the recipe producing `y`.
+        named_tuple_pack = only(filter(
+            r -> any(o -> o.name === :y, r.outputs),
             kernel_graph(named_tuple_assignment).recipes,
-        ).inputs) == Set((:a, :x))
+        ))
+        @test Set(v.name for v in named_tuple_pack.inputs) == Set((:a, :x))
         @test prepare(named_tuple_assignment)(3, 4) == (a = 4, b = 3)
 
         semicolon_named_tuple = @kernel begin
@@ -1039,9 +1043,11 @@ end
             y::NamedTuple{(:a,:b),Tuple{Int,Int}} = (; a = x, b = a)
             return y
         end
-        @test Set(v.name for v in only(
+        semicolon_pack = only(filter(
+            r -> any(o -> o.name === :y, r.outputs),
             kernel_graph(semicolon_named_tuple).recipes,
-        ).inputs) == Set((:a, :x))
+        ))
+        @test Set(v.name for v in semicolon_pack.inputs) == Set((:a, :x))
         @test prepare(semicolon_named_tuple)(3, 4) == (a = 4, b = 3)
 
         destructuring_assignment = @kernel begin
@@ -1351,7 +1357,13 @@ end
             @recipe (cse_key = :repeated_output) y = identity(x)
             return y
         end
-        @test length(kernel_graph(repeated_output).recipes) == 1
+        # Structural CSE still collapses the duplicate authored producers of
+        # `y` to one; the second graph recipe is the automatic `identity`
+        # inverse edge (`x = identity(y)`), which produces `x`, not `y`.
+        @test count(
+            r -> any(o -> o.name === :y, r.outputs),
+            kernel_graph(repeated_output).recipes,
+        ) == 1
         @test !haskey(kernel_graph(repeated_output).aliases, repeated_output.y.id)
         @test prepare(repeated_output)(3) == 3
 

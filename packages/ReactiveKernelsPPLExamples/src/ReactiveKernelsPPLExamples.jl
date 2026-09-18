@@ -133,6 +133,12 @@ include("sir.jl")
 include("one_comp_mm_elim_abs.jl")
 include("soil_incubation.jl")
 
+# posteriordb structured batch: bball-drive HMMs
+include("hmm_drive_1.jl")
+include("hmm_drive_0.jl")
+include("grsm_latent_reg_irt.jl")
+include("kronecker_gp.jl")
+
 export PPLWorkflow
 
 # EXPERIMENTAL, NOT REVIEWED / NOT APPROVED — do NOT build on this.
@@ -279,5 +285,11 @@ export LotkaVolterraExample
 export SIRExample
 export OneCompMMElimAbsExample
 export SoilIncubationExample
+
+# posteriordb structured batch: bball-drive HMMs
+export HmmDrive1Example
+export HmmDrive0Example
+export GrsmLatentRegIrtExample
+export KroneckerGpExample
 
 end # module ReactiveKernelsPPLExamples

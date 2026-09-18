@@ -68,8 +68,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, stud
     # emits it (the log|dsigma/du| = log_sigma change of variables).
     parameters = (; b, Intercept, sigma)
     (parameters, log_jacobian::Float64) = ((; b, Intercept, sigma), log_sigma)
-    (b::AbstractVector{Float64}, Intercept::Float64, sigma::Float64) =
-        (parameters.b, parameters.Intercept, parameters.sigma)
 
     # Priors (all PROPER, propto=false constants included). The half-Student-t on
     # sigma adds the explicit brms normalization `- student_t_lccdf(0 | 3, 0, 10)`

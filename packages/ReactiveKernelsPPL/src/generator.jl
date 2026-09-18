@@ -48,7 +48,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, preprocessing_recipes(plan))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _likelihood_statements(plan))
-    append!(stmts, _prior_statements(plan))
+    append!(stmts, _prior_statements(plan, layout))
     push!(stmts, _log_jacobian_statement(layout))
     push!(stmts, :(posterior::Float64 = prior + likelihood + log_jacobian))
     push!(stmts, :(return posterior))
@@ -164,6 +164,14 @@ end
 _predictor(plan::StructuralPlan, name::Symbol) =
     only(p for p in plan.predictors if p.name === name)
 
+# The per-observation location node feeding a response's likelihood plate: a
+# scan-state latent vector fed directly (its own name — the layout view), or a
+# linear predictor's `_ppl_lp_<name>` node otherwise.
+function _location_node(r::LikelihoodSpec, plan::StructuralPlan)
+    any(s -> s.state === r.predictor, plan.scans) && return r.predictor
+    return _lp_name(_predictor(plan, r.predictor))
+end
+
 _dovar(i::Int) = Symbol(:_ppl_c, i)
 _pw_name(label::Symbol) = Symbol(:_ppl_pw_, label)
 
@@ -198,7 +206,7 @@ end
 
 function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     inputs = Any[y, lp]
     yv, lpv = _dovar(1), _dovar(2)
     sref = _thread_ref!(inputs, r.scale)
@@ -311,7 +319,7 @@ function _poisson_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, etav::Symbo
     end
 end
 
-function _prior_statements(plan::StructuralPlan)
+function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     stmts = Expr[]
     terms = Any[]
     for pred in plan.predictors
@@ -353,6 +361,10 @@ function _prior_statements(plan::StructuralPlan)
         append!(stmts, _plate_sum_stmts(pw, node, inputs, cell))
         push!(terms, node)
     end
+    # Sequential-recurrence (scan) latents: setup + recurrence density.
+    scanstmts, scannodes = _scan_prior_statements(plan, layout)
+    append!(stmts, scanstmts)
+    append!(terms, scannodes)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
     push!(stmts, :(prior::Float64 = $joint))
     return stmts
@@ -364,11 +376,12 @@ end
 # Half-Normal/half-Cauchy (the only overrides) renormalize by exactly
 # +log(2) (symmetry at 0). `gamma` takes rate, so the contract's scale
 # inverts.
-# Shared family log-density expression over a variate `x` (a scalar parameter
-# name, or a plate do-var). Args are literals (inlined) or scalar
-# parameter/assignment refs (body locals — captured, fine in scalar position).
-# `gamma` takes rate, so the contract's scale inverts.
-function _family_logpdf_expr(family::Symbol, a::Vector, x)
+# Shared `<family>(remapped args…).logpdf(x)` for a variate expression `x` (a
+# scalar parameter name, a plate do-var, or a scan setup/recurrence read). Args
+# are literals (inlined) or parameter/assignment/threaded refs. Shared by scalar
+# priors, per-cell plate priors, and the scan density. `gamma` takes rate, so
+# the contract's scale inverts.
+function _family_logpdf_expr(family::Symbol, a, x)
     if family === :normal
         mu, s = a
         :(normal($mu, $s).logpdf($x))
@@ -402,6 +415,128 @@ function _sampled_prior_expr(p::SampledParameter)
     base = _family_logpdf_expr(p.family, [v for v in values(p.args)], p.name)
     p.support_override === nothing && return base
     return :($base + log(2))
+end
+
+# --- Sequential-recurrence (scan) density (slice 1: CENTERED) ---
+
+# Distinct backward lags `state[loopvar-j]` read across a step's dist args.
+function _scan_step_lags(step::ScanStep, state::Symbol, loopvar::Symbol)
+    lags = Set{Int}()
+    walk(ex) = begin
+        ex isa Expr || return
+        if ex.head === :ref && length(ex.args) == 2 && ex.args[1] === state
+            idx = ex.args[2]
+            if idx isa Expr && idx.head === :call && length(idx.args) == 3 &&
+               idx.args[1] === :- && idx.args[2] === loopvar && idx.args[3] isa Int
+                push!(lags, idx.args[3])
+                return
+            end
+        end
+        foreach(walk, ex.args)
+    end
+    step.args === nothing || foreach(walk, step.args)
+    return sort!(collect(lags))
+end
+
+# Replace each `state[loopvar-j]` lag read with its aligned-slice do-var.
+function _subst_scan_lags(ex, state::Symbol, loopvar::Symbol, dovar::Dict{Int,Symbol})
+    ex isa Expr || return ex
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] === state
+        idx = ex.args[2]
+        if idx isa Expr && idx.head === :call && length(idx.args) == 3 &&
+           idx.args[1] === :- && idx.args[2] === loopvar && idx.args[3] isa Int
+            return dovar[idx.args[3]]
+        end
+    end
+    return Expr(ex.head,
+        (_subst_scan_lags(a, state, loopvar, dovar) for a in ex.args)...)
+end
+
+# Value symbols in a (lag-substituted) recurrence arg that must be threaded as
+# plate inputs: captured scalars (params/assignments). Excludes call heads and
+# the already-substituted lag do-vars (`_ppl_c…`).
+function _scan_cell_caps!(caps::Vector{Symbol}, ex)
+    if ex isa Symbol
+        (startswith(string(ex), "_ppl_c") || ex in caps) || push!(caps, ex)
+        return nothing
+    end
+    ex isa Expr || return nothing
+    args = ex.head === :call ? ex.args[2:end] : ex.args
+    for a in args
+        _scan_cell_caps!(caps, a)
+    end
+    return nothing
+end
+
+# Replace symbols per `map` (leaves call heads alone — they never appear in the
+# capture map).
+function _subst_syms(ex, map::Dict{Symbol,Symbol})
+    ex isa Symbol && return get(map, ex, ex)
+    ex isa Expr || return ex
+    return Expr(ex.head, (_subst_syms(a, map) for a in ex.args)...)
+end
+
+# Prior-density statements for every scan plus the total-node names to add to
+# the prior sum. Slice-1 CENTERED only: the recurrence body is exactly one
+# indexed `~` of the carried state (`state[t] ~ dist`); the density is the seed
+# term(s) plus a plate over aligned lagged slices (the recurrence factorizes
+# given the state). Non-centered (reconstruction via RK-core `scan(...)`) is
+# a follow-up.
+function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
+    stmts = Expr[]
+    nodes = Symbol[]
+    for s in plan.scans
+        (length(s.step) == 1 && s.step[1].kind === :sample &&
+         s.step[1].indexed && s.step[1].target === s.state) || throw(
+            ContractValidationError("[generator] scan $(s.state): only centered " *
+                "recurrences (`$(s.state)[$(s.loopvar)] ~ dist`) emit in slice 1 " *
+                "(non-centered reconstruction is planned)"))
+        step = s.step[1]
+        entry = only(e for e in layout.entries
+                     if e.kind === :scan && e.name === s.state)
+        T = entry.size
+        m = length(s.setup)
+        terms = Any[]
+        for (k, f) in enumerate(s.setup)
+            seed = Symbol(:_ppl_scan_seed_, s.state, :_, k)
+            push!(stmts, :($seed::Float64 =
+                $(_family_logpdf_expr(f.family, f.args, :($(s.state)[$k])))))
+            push!(terms, seed)
+        end
+        lags = _scan_step_lags(step, s.state, s.loopvar)
+        inputs = Any[:(view($(s.state), $(m + 1):$T))]     # hcur → do-var _ppl_c1
+        dovar = Dict{Int,Symbol}()
+        for (i, j) in enumerate(lags)
+            push!(inputs, :(view($(s.state), $(m + 1 - j):$(T - j))))
+            dovar[j] = _dovar(i + 1)
+        end
+        # Substitute the lag reads, then thread the recurrence's captured scalars
+        # (params/assignments) as explicit plate inputs — RK requires a plate
+        # cell's distribution args to be caller ports, not lexical captures.
+        lagargs = [_subst_scan_lags(a, s.state, s.loopvar, dovar) for a in step.args]
+        caps = Symbol[]
+        for a in lagargs
+            _scan_cell_caps!(caps, a)
+        end
+        s.loopvar in caps && throw(ContractValidationError(
+            "[generator] scan $(s.state): the recurrence uses the loop index " *
+            "`$(s.loopvar)` directly — not supported in slice 1"))
+        capmap = Dict{Symbol,Symbol}()
+        for c in caps
+            push!(inputs, c)
+            capmap[c] = _dovar(length(inputs))
+        end
+        cellargs = [_subst_syms(a, capmap) for a in lagargs]
+        cell = _family_logpdf_expr(step.family, cellargs, _dovar(1))
+        recnode = Symbol(:_ppl_scan_rec_, s.state)
+        recpw = Symbol(:_ppl_scan_pw_, s.state)
+        append!(stmts, _plate_sum_stmts(recpw, recnode, inputs, cell))
+        push!(terms, recnode)
+        total = Symbol(:_ppl_scan_, s.state)
+        push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms))))
+        push!(nodes, total)
+    end
+    return stmts, nodes
 end
 
 function _log_jacobian_statement(layout::LayoutTable)

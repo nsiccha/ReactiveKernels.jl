@@ -84,9 +84,11 @@ $aov_root
             source_dir, report_path, contracts, github_actions = false,
         )
 
-        @test length(advisories) == 7
+        # The fixture source carries a raw markdown table; after the
+        # raw-markdown-table lint was retired (decision `17uqwf3`) it produces no
+        # advisory, so the count drops from 7 to 6 and that kind is gone.
+        @test length(advisories) == 6
         @test Set(advisory.contract_kind for advisory in advisories) == Set((
-            "raw-markdown-table-count",
             "executable-panel-count",
             "sortable-table-count",
             "aov-panel-count",
@@ -235,5 +237,77 @@ $aov_root
             github_actions = false,
         )
         @test occursin("\"status\": \"fatal\"", read(report_path, String))
+    end
+end
+
+@testset "generated benchmark pages skip frozen panel/table counts" begin
+    mktempdir() do root
+        source_dir = joinpath(root, "src")
+        build_dir = joinpath(root, "build")
+        intermediate_dir = joinpath(build_dir, ".documenter")
+        rendered_dir = joinpath(build_dir, "dev")
+        foreach(mkpath, (source_dir, intermediate_dir, rendered_dir))
+
+        write(joinpath(build_dir, "index.html"), "redirect")
+        write(joinpath(source_dir, "fixture.md"), "# Fixture\n")
+
+        aov_root = """<div class="rk-aov-panel" data-rk-artifact-id="plot:first" data-rk-artifact-kind="aov-panel" data-rk-exec-payload="cGF5bG9hZA=="><ClientOnly><div v-exec-scripts="'cGF5bG9hZA=='"></div></ClientOnly></div>"""
+        artifact_markup = """
+<div class="rk-example" data-rk-artifact-id="example:first" data-rk-artifact-kind="example-panel"></div>
+<div class="rk-example" data-rk-artifact-id="example:second" data-rk-artifact-kind="example-panel"></div>
+<section class="rk-result-table-section" data-rk-artifact-id="table:first" data-rk-artifact-kind="sortable-table"><htmxo-sortable-table></htmxo-sortable-table></section>
+<section class="rk-result-table-section" data-rk-artifact-id="table:second" data-rk-artifact-kind="sortable-table"><htmxo-sortable-table></htmxo-sortable-table></section>
+$aov_root
+"""
+        intermediate_path = joinpath(intermediate_dir, "fixture.md")
+        rendered_path = joinpath(rendered_dir, "fixture.html")
+        write(intermediate_path, artifact_markup)
+        write(rendered_path, "<!DOCTYPE html><html><body>$artifact_markup</body></html>")
+        report_path = joinpath(root, "rendered-docs-advisories.json")
+
+        # Deliberately-wrong frozen counts (99) for a page classified generated:
+        # its AoV/sortable counts legitimately grow, so the frozen-count tripwire
+        # must not fire. Every other contract matches the fixture markup.
+        generated_contracts = (
+            panels = Dict("fixture.md" => 2),
+            source_examples = Dict{String,Int}(),
+            source_interactions = Dict{String,Int}(),
+            sortable_tables = Dict("fixture.md" => 99),
+            aov_panels = Dict("fixture.md" => 99),
+            structural_markers = Dict{String,Tuple}(),
+            body_markers = Dict{String,Tuple}(),
+            generated_pages = Set(("fixture.md",)),
+        )
+        advisories = check_rendered_docs(
+            build_dir, ["Fixture" => "fixture.md"];
+            source_dir, report_path, contracts = generated_contracts,
+            github_actions = false,
+        )
+        kinds = Set(advisory.contract_kind for advisory in advisories)
+        @test !("sortable-table-count" in kinds)
+        @test !("aov-panel-count" in kinds)
+        @test isempty(advisories)
+
+        # The SAME page and markup, but NOT classified generated, still reports
+        # both frozen-count drifts — proving the exemption is what suppressed them.
+        ungenerated_contracts = merge(generated_contracts, (generated_pages = Set{String}(),))
+        drift = check_rendered_docs(
+            build_dir, ["Fixture" => "fixture.md"];
+            source_dir, report_path, contracts = ungenerated_contracts,
+            github_actions = false,
+        )
+        drift_kinds = Set(advisory.contract_kind for advisory in drift)
+        @test "sortable-table-count" in drift_kinds
+        @test "aov-panel-count" in drift_kinds
+
+        # Render INTEGRITY stays fatal for a generated page: a rendered output
+        # that drops a declared stable artifact id is still a hard error.
+        missing_id = replace(artifact_markup, " data-rk-artifact-id=\"plot:first\"" => "")
+        write(rendered_path, "<!DOCTYPE html><html><body>$missing_id</body></html>")
+        @test_throws ErrorException check_rendered_docs(
+            build_dir, ["Fixture" => "fixture.md"];
+            source_dir, report_path, contracts = generated_contracts,
+            github_actions = false,
+        )
     end
 end

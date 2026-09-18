@@ -51,8 +51,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
 
     parameters = (; alpha, beta, sigma)
     (parameters, log_jacobian::Float64) = ((; alpha, beta, sigma), log_sigma)
-    (alpha::Float64, beta::AbstractVector{Float64}, sigma::Float64) =
-        (parameters.alpha, parameters.beta, parameters.sigma)
 
     # Priors: alpha ~ Normal(0,10), betaₖ ~ Normal(0,10), sigma ~ HalfCauchy(0,2.5).
     alpha_prior::Float64 = normal(0.0, 10.0).logpdf(alpha)

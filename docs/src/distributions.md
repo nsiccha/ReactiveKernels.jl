@@ -45,8 +45,9 @@ Main.ReactiveKernelsDocs.execute_example(
 ```
 
 `quantile(p)` follows the explicit inverse edge `inv(standardized, z)`. The graph
-also contains both `log_scale = log(scale)` and `scale = exp(log_scale)`, so a
-caller may start from either representation. Explicit HAVE is authoritative:
+also contains both directions of `log_scale = log(scale)` — the reverse edge
+is provisioned automatically — so a caller may start from either
+representation. Explicit HAVE is authoritative:
 supplying `scale` derives `log_scale`, supplying `log_scale` derives `scale`, and
 supplying both recomputes and validates neither. The next panel prepares all
 three routes into the same `normal.logpdf` and asserts, during the build, that

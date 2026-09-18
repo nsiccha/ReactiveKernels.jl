@@ -143,6 +143,18 @@ const _ARTIFACT_ROOT_CLASSES = (
     (kind = "source-example", class = "rk-source-example"),
 )
 
+# Generated benchmark pages whose interactive AoV panels and sortable tables are
+# emitted by the render_all80_* functions and legitimately GROW as more
+# posteriordb models enter the sweep (observed drifted 3 -> 5 -> 7 across
+# consecutive Docs runs). Their exact per-build panel/table counts are not a
+# stable source snapshot, so a frozen aov-panel-count / sortable-table-count
+# tripwire refiles a presentation advisory on every Docs run. Render INTEGRITY
+# for these pages stays fully enforced by _check_artifact_id_contract (every
+# declared stable artifact id must survive intermediate -> rendered), the
+# log-scale-bar contract, and the payload-witness checks; only the brittle
+# frozen-count comparison is skipped. Override in tests via contracts.generated_pages.
+const _GENERATED_BENCHMARK_PAGES = Set(("posteriordb-comparison.md",))
+
 function _attribute_values(tag, name)
     [match.captures[1] for match in eachmatch(Regex("\\s$name=\"([^\"]*)\""), tag)]
 end
@@ -336,6 +348,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "2pl-latent-reg-irt.md" => 1,
         "hier-2pl.md" => 1,
         "gpcm-latent-reg-irt.md" => 1,
+        "grsm-latent-reg-irt.md" => 1,
         "glmm1.md" => 1,
         "bym2-offset-only.md" => 1,
         "bones.md" => 1,
@@ -344,12 +357,14 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "sir.md" => 1,
         "one-comp-mm-elim-abs.md" => 1,
         "soil-incubation.md" => 1,
+        "hmm-drive-1.md" => 1,
         "mnist-logistic.md" => 2,
         "online-stats.md" => 1,
         "gp-regr.md" => 1,
         "gp-pois-regr.md" => 1,
         "accel-gp.md" => 1,
         "hierarchical-gp.md" => 1,
+        "kronecker-gp.md" => 1,
     )
     expected_source_examples = Dict(
         "reactivehmc-corpus.md" => 5,
@@ -372,7 +387,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "mnist-reactant.md" => 14,
         "nuts.md" => 1,
         "nuts-reactant.md" => 2,
-        "posteriordb-comparison.md" => 3,
     )
     expected_aov_panels = Dict(
         "probprog-mcmc.md" => 1,
@@ -388,10 +402,9 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "mnist-reactant.md" => 14,
         "nuts.md" => 1,
         "nuts-reactant.md" => 1,
-        # The three all-82 posteriordb comparison plots (coverage, speedup,
-        # reactant-HMC) rendered from all80_benchmark_plots.jl — one aov-panel
-        # each; the page's 3 sortable tables are registered above.
-        "posteriordb-comparison.md" => 3,
+        # posteriordb-comparison.md is a generated benchmark page whose AoV
+        # panels and sortable tables grow as models enter the sweep; it is
+        # exempt from these frozen counts via _GENERATED_BENCHMARK_PAGES.
     )
     # The linear-regression, beta-binomial, poisson-gamma, dugongs-growth,
     # arma11, and gaussian-mixture PPL example pages were migrated into the
@@ -658,24 +671,16 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     expected_sortable_tables =
         _contract_override(contracts, :sortable_tables, expected_sortable_tables)
     expected_aov_panels = _contract_override(contracts, :aov_panels, expected_aov_panels)
+    generated_pages = _contract_override(contracts, :generated_pages, _GENERATED_BENCHMARK_PAGES)
     structural_markers = _contract_override(contracts, :structural_markers, structural_markers)
     body_markers = _contract_override(contracts, :body_markers, body_markers)
 
     observed_panels = 0
     all_artifact_ids = String[]
     for source in sources
-        source_body = read(joinpath(source_dir, source), String)
-        raw_table_lines = [
-            line_number for (line_number, line) in enumerate(eachline(IOBuffer(source_body)))
-            if occursin(r"^\s*\|.*\|\s*$", line)
-        ]
-        isempty(raw_table_lines) || _record_advisory!(
-            advisories; page = source, contract_kind = "raw-markdown-table-count",
-            expected = 0, observed = length(raw_table_lines),
-            artifact_ids = ["source-line-$line" for line in raw_table_lines],
-            detail = "prefer source-authoritative AoV/HTMXO renderers",
-        )
-
+        # The raw-markdown-table lint was retired per user decision `17uqwf3`:
+        # authored pages may use markdown tables, and the recurring advisory was
+        # noise. Render integrity is still enforced by the fatal checks below.
         intermediate_path = joinpath(intermediate_dir, source)
         isfile(intermediate_path) ||
             error("DocumenterVitepress intermediate page is missing: $intermediate_path")
@@ -737,19 +742,21 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             expected = expected_interactions, observed = source_interactions, artifact_ids,
         )
 
-        sortable_tables = _occurrences(intermediate, "htmxo-sortable-table")
-        expected_tables = get(expected_sortable_tables, source, 0)
-        sortable_tables == expected_tables || _record_advisory!(
-            advisories; page = source, contract_kind = "sortable-table-count",
-            expected = expected_tables, observed = sortable_tables, artifact_ids,
-        )
+        if !(source in generated_pages)
+            sortable_tables = _occurrences(intermediate, "htmxo-sortable-table")
+            expected_tables = get(expected_sortable_tables, source, 0)
+            sortable_tables == expected_tables || _record_advisory!(
+                advisories; page = source, contract_kind = "sortable-table-count",
+                expected = expected_tables, observed = sortable_tables, artifact_ids,
+            )
 
-        aov_panels = _occurrences(intermediate, "class=\"rk-aov-panel\"")
-        expected_plots = get(expected_aov_panels, source, 0)
-        aov_panels == expected_plots || _record_advisory!(
-            advisories; page = source, contract_kind = "aov-panel-count",
-            expected = expected_plots, observed = aov_panels, artifact_ids,
-        )
+            aov_panels = _occurrences(intermediate, "class=\"rk-aov-panel\"")
+            expected_plots = get(expected_aov_panels, source, 0)
+            aov_panels == expected_plots || _record_advisory!(
+                advisories; page = source, contract_kind = "aov-panel-count",
+                expected = expected_plots, observed = aov_panels, artifact_ids,
+            )
+        end
 
         for marker in get(structural_markers, source, ())
             occursin(marker, intermediate) || _record_advisory!(

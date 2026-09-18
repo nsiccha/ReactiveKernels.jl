@@ -84,7 +84,6 @@ end
 
 @kernel location_scale(standard, location::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
-    scale::Float64 = exp(log_scale)
 
     standardized(x::Float64)::Float64 = (x - location) / scale
     inv(standardized, z::Float64)::Float64 = location + scale * z
@@ -115,7 +114,6 @@ end
 # `scale`/`log_scale` dual HAVE route matches the `location_scale` families.
 @kernel student_t(nu::Float64, location::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
-    scale::Float64 = exp(log_scale)
 
     standardized(x::Float64)::Float64 = (x - location) / scale
     inv(standardized, z::Float64)::Float64 = location + scale * z
@@ -224,7 +222,6 @@ end
 const LOGNORMAL_KERNEL_SOURCE = raw"""
 @kernel lognormal(location::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
-    scale::Float64 = exp(log_scale)
 
     standardized_log(x::Float64)::Float64 = begin
         safe_x::Float64 = ifelse(x > 0, x, 1.0)
@@ -255,7 +252,6 @@ end
 const EXPONENTIAL_KERNEL_SOURCE = raw"""
 @kernel exponential(scale::Float64) = begin
     log_scale::Float64 = log(scale)
-    scale::Float64 = exp(log_scale)
 
     logpdf(x::Float64)::Float64 =
         ifelse(x >= 0, -log_scale - x / scale, -Inf)
@@ -340,7 +336,6 @@ end
 const AR1_KERNEL_SOURCE = raw"""
 @kernel ar1(μ::Float64, ϕ::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
-    scale::Float64 = exp(log_scale)
 
     logpdf(x::Vector{Float64})::Float64 = begin
         centered::Vector{Float64} = x .- μ
@@ -495,7 +490,6 @@ using SpecialFunctions: loggamma, gamma_inc, gamma_inc_inv
 
 @kernel inverse_gamma(shape::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
-    scale::Float64 = exp(log_scale)
 
     logpdf(x::Float64)::Float64 = begin
         valid::Bool = x > 0

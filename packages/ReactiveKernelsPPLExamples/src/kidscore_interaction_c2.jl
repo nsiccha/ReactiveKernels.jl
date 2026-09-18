@@ -77,10 +77,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     parameters = (; beta1, beta2, beta3, beta4, sigma)
     (parameters, log_jacobian::Float64) =
         ((; beta1, beta2, beta3, beta4, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, beta3::Float64, beta4::Float64,
-     sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3, parameters.beta4,
-         parameters.sigma)
 
     # Transformed data: the reference-centered predictors and their interaction
     # c2_mom_hs = mom_hs - 0.5, c2_mom_iq = mom_iq - 100, inter = product.
