@@ -82,6 +82,27 @@ end
     @test_throws DimensionMismatch both(positions, [2.0, 3.0, 4.0])
 end
 
+@testset "graph-native position invariant hoisting" begin
+    @kernel invariant_source(theta::Float64, data::Vector{Float64}) = begin
+        transformed::Vector{Float64} = log.(data)
+        total::Float64 = theta * sum(transformed)
+        pointwise::Vector{Float64} = theta .* transformed
+        return (total, pointwise)
+    end
+
+    kernel = prepare_batched(invariant_source;
+                             batched = :theta, want = (:total, :pointwise))
+    @test kernel isa ReactiveKernels.GraphReplicatedKernel
+    data = collect(1.0:4.0)
+    totals, pointwise = kernel([2.0, 3.0], data)
+    transformed = log.(data)
+    @test totals ≈ [2sum(transformed), 3sum(transformed)]
+    @test pointwise ≈ [2 .* transformed 3 .* transformed]
+    lowered = string(code_expr(kernel))
+    @test occursin("transformed = (__ops__[1])(data)", lowered)
+    @test !occursin("transformed = (__ops__[1])(var\"##theta_position", lowered)
+end
+
 @kernel replica_defaulted(x::Float64, offset::Float64 = 1.0) = begin
     y::Float64 = x + offset
 end

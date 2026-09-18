@@ -64,8 +64,6 @@ using LogExpFunctions: logistic, log1pexp
     # authoritative HAVE boundary (a deterministic query can start from the
     # constrained parameters, e.g. the one-step-ahead volatility forecast).
     parameters = (; mu, alpha0, alpha1, beta1)
-    (mu::Float64, alpha0::Float64, alpha1::Float64, beta1::Float64) =
-        (parameters.mu, parameters.alpha0, parameters.alpha1, parameters.beta1)
 
     # Sequential GARCH(1,1) conditional-sd recursion:
     #   σ₁ = sigma1 (data);  σₜ = sqrt(α0 + α1·(y_{t−1} − μ)² + β1·σ_{t−1}²)  (t ≥ 2).

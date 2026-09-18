@@ -56,10 +56,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     (parameters, log_jacobian::Float64) =
         ((; α_s2z, τ, effects_s2z),
          log_τ + sum_to_zero_log_jacobian)
-    (α_s2z::Float64,
-     τ::Float64,
-     effects_s2z::AbstractVector{Float64}) =
-        (parameters.α_s2z, parameters.τ, parameters.effects_s2z)
 
     K::Int = length(effects_s2z)
 
