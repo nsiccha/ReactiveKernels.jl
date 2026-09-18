@@ -502,3 +502,74 @@ end
     @test _query(bb.spec, b, :posterior, v) ≈
         _query(built.spec, plan, :posterior, v)
 end
+
+# Per-cell latent (plate) parameters: `theta ~ Normal(mu, tau)` sampled once
+# per observation and read as the response location via a LatentTerm predictor
+# (`lp = theta`). References are independent Distributions.jl loops.
+function _gen_re_plan()
+    cols, n = _gen_columns()
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :loc, :sigma,
+            nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:loc, IdentityLink,
+            TermSpec[TermSpec(LatentTerm, [:theta], NamedTuple(), :theta,
+                :theta_lat)], :loc)],
+        PopulationPrior[],
+        SampledParameter[
+            SampledParameter(:mu, :normal, (arg1 = 0.0, arg2 = 5.0), nothing, :mu),
+            SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma),
+            SampledParameter(:tau, :exponential, (arg1 = 1.0,), nothing, :tau)],
+        AssignmentSpec[], cols, n;
+        plate_parameters = PlateParameter[
+            PlateParameter(:theta, :normal, (arg1 = :mu, arg2 = :tau), nothing)])
+    validate_plan(plan)
+    return plan
+end
+
+@testset "plate parameter random-effects values and gradient" begin
+    plan = _gen_re_plan()
+    built = build_kernel(plan)
+    # layout: mu, sigma, tau (3 scalars) + theta (n cells).
+    @test built.layout.total == 3 + plan.n_obs
+    @test coordinate_names(built.layout)[4] == Symbol("theta.1")
+    u = [0.3, -0.2, 0.1, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]
+    nt = constrain(built.layout, u)
+    mu, sigma, tau, theta = nt.mu, nt.sigma, nt.tau, Vector(nt.theta)
+    ll = sum(logpdf.(Normal.(theta, sigma), plan.columns[:y]))
+    pr = logpdf(Normal(0, 5), mu) + logpdf(Exponential(1), sigma) +
+        logpdf(Exponential(1), tau) + sum(logpdf.(Normal(mu, tau), theta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    # log-jacobian: exp for sigma (u[2]) and tau (u[3]); theta is identity.
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[2] + u[3]
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "plate parameter positive-support latent" begin
+    cols, n = _gen_columns()
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :loc, :sigma,
+            nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:loc, IdentityLink,
+            TermSpec[TermSpec(LatentTerm, [:b], NamedTuple(), :b, :b_lat)], :loc)],
+        PopulationPrior[],
+        SampledParameter[SampledParameter(:sigma, :exponential, (arg1 = 1.0,),
+            nothing, :sigma)],
+        AssignmentSpec[], cols, n;
+        plate_parameters = PlateParameter[
+            PlateParameter(:b, :exponential, (arg1 = 1.0,), nothing)])
+    validate_plan(plan)
+    built = build_kernel(plan)
+    @test built.layout.total == 1 + n
+    u = [-0.1, 0.2, -0.3, 0.1, 0.0, 0.4, -0.2]
+    nt = constrain(built.layout, u)
+    b, sigma = Vector(nt.b), nt.sigma
+    # Constrained values are all positive (broadcast exp transform).
+    @test all(>(0), b)
+    ll = sum(logpdf.(Normal.(b, sigma), plan.columns[:y]))
+    pr = logpdf(Exponential(1), sigma) + sum(logpdf.(Exponential(1), b))
+    # log-jacobian: exp for sigma (u[1]) plus each b cell (u[2:end]).
+    lj = u[1] + sum(u[2:end])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + lj
+    _check_gradient(built.spec, plan, u)
+end

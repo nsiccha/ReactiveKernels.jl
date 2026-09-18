@@ -61,6 +61,11 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps)
         return DesignBlock(ContinuousTerm, col, t.addressee, 1, [col], [])
     elseif t.kind === OffsetTerm
         return DesignBlock(OffsetTerm, only(t.columns), t.addressee, 0, Symbol[], [])
+    elseif t.kind === LatentTerm
+        # The latent VECTOR is the whole linear predictor (identity design);
+        # its coefficients live in the PlateParameter layout block, so this
+        # term contributes no design width.
+        return DesignBlock(LatentTerm, only(t.columns), t.addressee, 0, Symbol[], [])
     elseif t.kind === FactorTerm
         col = only(t.columns)
         m = _find_levelmap(levelmaps, pname, col)

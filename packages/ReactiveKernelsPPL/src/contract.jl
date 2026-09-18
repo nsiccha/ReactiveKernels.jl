@@ -41,12 +41,16 @@ inverse-link numerics (R1 counter)."""
     LogLink
 end
 
-"""Slice-1 predictor term kinds (core set; stretch adds variants later)."""
+"""Slice-1 predictor term kinds (core set; stretch adds variants later).
+`LatentTerm` carries a per-cell latent parameter vector (a [`PlateParameter`](@ref))
+as the whole linear predictor (`lp = theta`, identity design) — the
+random-effects / per-observation-latent location."""
 @enum TermKind::UInt8 begin
     InterceptTerm
     ContinuousTerm
     FactorTerm
     OffsetTerm
+    LatentTerm
 end
 
 """
@@ -151,6 +155,37 @@ struct SampledParameter
 end
 
 """
+    PlateParameter(name, family, args, support_override, range, label)
+
+One per-cell latent parameter VECTOR (`@plate` sampling statement, e.g.
+`theta ~ Normal(mu, tau)`): `size` independent draws from `family`, one per
+plate cell, packed as one contiguous block. `family`/`args`/`support_override`
+follow [`SampledParameter`](@ref) exactly (POSITIONAL `(arg1, …)` keys,
+Distributions.jl semantics), except the args are SHARED across cells — literals
+or scalar parameter/assignment names (per-cell vector args are a later
+increment). `range` is `nothing` (size = `n_obs`, the `eachindex`/`axes` /
+bare-plate case) or a literal `UnitRange{Int}` that must cover `1:n_obs` exactly
+(the `1:N` case), mirroring [`LikelihoodSpec`](@ref)'s response range. A
+real-support prior (`normal`/`cauchy`/half-versions) lays out identity (an
+unconstrained block); positive/unit support constrains per element.
+"""
+struct PlateParameter
+    name::ParamName
+    family::Symbol
+    args::NamedTuple
+    support_override::Union{Nothing,Symbol}
+    range::Union{Nothing,UnitRange{Int}}
+    label::Symbol
+end
+"""Provenance/range default to a whole-column (n_obs) plate under the name."""
+PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
+    support_override::Union{Nothing,Symbol}) =
+    PlateParameter(name, family, args, support_override, nothing, name)
+PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
+    support_override::Union{Nothing,Symbol}, range::Union{Nothing,UnitRange{Int}}) =
+    PlateParameter(name, family, args, support_override, range, name)
+
+"""
     AssignmentSpec(name, expr)
 
 One scalar temporary (slice 1): `expr` may reference scalar names and
@@ -229,6 +264,7 @@ struct StructuralPlan
     n_obs::Int
     roles::Dict{Symbol,Symbol}
     levelmaps::Vector{LevelMap}
+    plate_parameters::Vector{PlateParameter}
 end
 
 """Column roles: what a bound column IS (CV travel + program transforms read
@@ -248,9 +284,11 @@ function StructuralPlan(
         n_obs::Int;
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         derived::Vector{VectorAssignmentSpec} = VectorAssignmentSpec[],
-        levelmaps::Vector{LevelMap} = LevelMap[])
+        levelmaps::Vector{LevelMap} = LevelMap[],
+        plate_parameters::Vector{PlateParameter} = PlateParameter[])
     return StructuralPlan(responses, predictors, population_priors,
-        parameters, assignments, derived, columns, n_obs, roles, levelmaps)
+        parameters, assignments, derived, columns, n_obs, roles, levelmaps,
+        plate_parameters)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -369,6 +407,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_assignments_structure(plan)
     _validate_vector_structure(plan)
     _validate_parameters(plan)
+    _validate_plate_parameters(plan)
     _validate_topo_order(plan)
     _validate_predictors(plan)
     _validate_levelmaps(plan)
@@ -389,6 +428,19 @@ function validate_data(plan::StructuralPlan)
     _validate_predictor_columns(plan)
     _validate_levelmaps_data(plan)
     _validate_response_data(plan)
+    _validate_plate_parameters_data(plan)
+    return nothing
+end
+
+# A literal plate range covers 1:n_obs exactly (the size the latent vector
+# packs), mirroring the response-range cover check.
+function _validate_plate_parameters_data(plan::StructuralPlan)
+    for p in plan.plate_parameters
+        p.range === nothing && continue
+        last(p.range) == plan.n_obs || _fail(p.label,
+            "plate range $(p.range) covers $(length(p.range)) cells " *
+            "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
+    end
     return nothing
 end
 
@@ -410,30 +462,36 @@ function _validate_name_tables(plan::StructuralPlan)
     params = [p.name for p in plan.parameters]
     assigns = [a.name for a in plan.assignments]
     deriveds = [d.name for d in plan.derived]
+    plates = [p.name for p in plan.plate_parameters]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
     length(unique(deriveds)) == length(deriveds) ||
         _fail(:plan, "duplicate derived-column names")
+    length(unique(plates)) == length(plates) ||
+        _fail(:plan, "duplicate plate-parameter names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
-        (assigns, deriveds, "assignments and derived columns"))
+        (assigns, deriveds, "assignments and derived columns"),
+        (plates, params, "plate parameters and parameters"),
+        (plates, assigns, "plate parameters and assignments"),
+        (plates, deriveds, "plate parameters and derived columns"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
-    allnames = union(params, assigns, deriveds)
+    allnames = union(params, assigns, deriveds, plates)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived name",
+            "predictor $pn collides with a parameter/assignment/derived/plate name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates))
         _check_name_hygiene(n)
     end
     return nothing
@@ -456,11 +514,12 @@ function _validate_column_names(plan::StructuralPlan)
         n -> haskey(plan.columns, n),
         union([p.name for p in plan.parameters],
             [a.name for a in plan.assignments],
-            [d.name for d in plan.derived]),
+            [d.name for d in plan.derived],
+            [p.name for p in plan.plate_parameters]),
     )
     isempty(col_overlap) || _fail(
         :plan,
-        "parameter/assignment/derived names collide with raw columns: $(join(col_overlap, ", "))",
+        "parameter/assignment/derived/plate names collide with raw columns: $(join(col_overlap, ", "))",
     )
     for n in keys(plan.columns)
         _check_name_hygiene(n)
@@ -535,14 +594,19 @@ end
 _union_names(plan::StructuralPlan) =
     union([p.name for p in plan.parameters], [a.name for a in plan.assignments])
 
-"""Full name table: scalar names plus derived columns (dependency edges and
-bind-time reference checks admit all three; sampled-arg positions stay
-scalar-only via [`_union_names`](@ref))."""
+"""Full name table: scalar names plus derived columns plus per-cell latent
+(plate) parameter VECTORS (dependency edges and bind-time reference checks
+admit all; sampled-arg positions stay scalar-only via [`_union_names`](@ref),
+so a scalar arg can never reference a latent vector)."""
 _all_names(plan::StructuralPlan) =
-    union(_union_names(plan), [d.name for d in plan.derived])
+    union(_union_names(plan), [d.name for d in plan.derived],
+        [p.name for p in plan.plate_parameters])
 
 _is_derived(plan::StructuralPlan, name::Symbol) =
     any(d -> d.name === name, plan.derived)
+
+_is_plate_param(plan::StructuralPlan, name::Symbol) =
+    any(p -> p.name === name, plan.plate_parameters)
 
 # With bound=false (structure), bare Symbols are opaque refs and column
 # checks are skipped — classification needs columns. With bound=true, bare
@@ -806,23 +870,60 @@ function _validate_parameters(plan::StructuralPlan)
             v in names ||
                 _fail(p.label, "arg $k references unknown name $v")
         end
-        ov = p.support_override
-        if ov !== nothing
-            ov === :positive || _fail(
-                p.label,
-                "support override must be :positive, got $ov",
-            )
-            (p.family === :normal || p.family === :cauchy) || _fail(
-                p.label,
-                ":positive override only applies to normal/cauchy " *
-                "(half-Normal/half-Cauchy); got $(p.family)",
-            )
-            loc = first(values(p.args))
-            loc isa Real && loc == 0 || _fail(
-                p.label,
-                ":positive override requires literal zero location " *
-                "(+log(2) is exact only by symmetry at 0); got $(repr(loc))",
-            )
+        _validate_support_override(p.label, p.family, p.support_override, p.args)
+    end
+    return nothing
+end
+
+# Shared support-override rule for scalar and per-cell latent parameters:
+# `:positive` half-truncates a real-support (normal/cauchy) family, and the
+# +log(2) renormalization is exact only for a literal zero location.
+function _validate_support_override(label, family::Symbol,
+        ov::Union{Nothing,Symbol}, args::NamedTuple)
+    ov === nothing && return nothing
+    ov === :positive || _fail(label, "support override must be :positive, got $ov")
+    (family === :normal || family === :cauchy) || _fail(label,
+        ":positive override only applies to normal/cauchy " *
+        "(half-Normal/half-Cauchy); got $family")
+    loc = first(values(args))
+    loc isa Real && loc == 0 || _fail(label,
+        ":positive override requires literal zero location " *
+        "(+log(2) is exact only by symmetry at 0); got $(repr(loc))")
+    return nothing
+end
+
+# Per-cell latent (plate) parameters: same family/arity/arg/support grammar as
+# scalar SampledParameters (args SHARED across cells: literals or scalar
+# parameter/assignment names — never a latent vector). `range` is `nothing`
+# (whole-column, size n_obs) or a literal UnitRange (validated to cover
+# 1:n_obs at bind, mirroring response ranges).
+function _validate_plate_parameters(plan::StructuralPlan)
+    scalarnames = _union_names(plan)
+    for p in plan.plate_parameters
+        haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
+            "plate family $(p.family) not in the slice-1 set " *
+            "($(join(sort!(collect(keys(SAMPLED_ARITY))), ", ")))")
+        p.family === :flat && _fail(p.label,
+            "a per-cell `flat()` latent has no proper prior to draw a cell " *
+            "from — give the plate parameter a proper family")
+        arity = SAMPLED_ARITY[p.family]
+        expected_keys = ntuple(i -> Symbol(:arg, i), arity)
+        Tuple(keys(p.args)) == expected_keys || _fail(p.label,
+            "family $(p.family) takes positional keys $expected_keys, " *
+            "got $(Tuple(keys(p.args)))")
+        for (k, v) in pairs(p.args)
+            v isa Number && continue
+            v isa Symbol || _fail(p.label,
+                "arg $k must be a literal or a scalar parameter/assignment name")
+            v in scalarnames || _fail(p.label,
+                "arg $k references unknown scalar name $v (a per-cell latent's " *
+                "prior args are shared scalars)")
+        end
+        _validate_support_override(p.label, p.family, p.support_override, p.args)
+        if p.range !== nothing
+            r = p.range
+            (first(r) == 1 && last(r) >= 1) || _fail(p.label,
+                "plate range must start at 1 (`1:N`), got $(first(r)):$(last(r))")
         end
     end
     return nothing
@@ -844,6 +945,20 @@ function topological_order(plan::StructuralPlan)
     allnames = _all_names(plan)
     deps = Dict{Symbol,Set{Symbol}}()
     for p in plan.parameters
+        refs = Set{Symbol}()
+        for v in values(p.args)
+            v isa Symbol || continue
+            v in names ||
+                _fail(p.label, "arg references unknown name $v")
+            push!(refs, v)
+        end
+        deps[p.name] = refs
+    end
+    # Per-cell latent (plate) parameters: shared prior args reference scalar
+    # names only (a latent VECTOR arg would be nonsensical as a scalar prior
+    # location/scale). They constrain in the layout transforms like scalar
+    # params, so ordering only guards cycles and downstream references.
+    for p in plan.plate_parameters
         refs = Set{Symbol}()
         for v in values(p.args)
             v isa Symbol || continue
@@ -927,6 +1042,12 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
                 "factor over the derived column $c needs pre-evaluation " *
                 "level knowledge — factors take raw grouping columns in slice 1")
         end
+    elseif t.kind === LatentTerm
+        length(t.columns) == 1 ||
+            _fail(t.label, "latent term takes exactly one plate-parameter name")
+        _is_plate_param(plan, only(t.columns)) || _fail(t.label,
+            "latent term over $(only(t.columns)) needs a matching per-cell " *
+            "latent parameter (a `PlateParameter`)")
     else
         if t.kind === ContinuousTerm || t.kind === OffsetTerm
             length(t.columns) == 1 ||
@@ -949,6 +1070,9 @@ function _validate_predictor_columns(plan::StructuralPlan)
 end
 
 function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    # Latent terms name a per-cell latent VECTOR (a PlateParameter), not a
+    # raw/derived data column; structure validation checked its presence.
+    t.kind === LatentTerm && return nothing
     for c in t.columns
         haskey(plan.columns, c) || _is_derived(plan, c) ||
             _fail(t.label, "term references missing column $c")
@@ -1124,8 +1248,11 @@ function _validate_priors(plan::StructuralPlan)
             _fail(:plan, "prior for $key must be Normal(finite, positive)")
     end
     for pred in plan.predictors
-        addressees =
-            Set{Symbol}(t.addressee for t in pred.terms if t.kind !== OffsetTerm)
+        # Offset terms carry no coefficient; latent terms carry the per-cell
+        # PlateParameter, whose prior lives on the plate parameter itself, not
+        # as a PopulationPrior — neither needs a coefficient prior here.
+        addressees = Set{Symbol}(t.addressee for t in pred.terms
+            if t.kind !== OffsetTerm && t.kind !== LatentTerm)
         any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
         for a in addressees
             (pred.name, a) in seen ||
@@ -1354,7 +1481,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     bound = StructuralPlan(plan.responses, plan.predictors,
         plan.population_priors, plan.parameters, plan.assignments,
         columns, n; roles = merged, derived = plan.derived,
-        levelmaps = maps)
+        levelmaps = maps, plate_parameters = plan.plate_parameters)
     validate_data(bound)
     return bound
 end

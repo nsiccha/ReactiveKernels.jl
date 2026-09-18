@@ -429,3 +429,67 @@ end
     @test b2.roles[:g] === :predictor
     @test b2.roles[:y] === :response
 end
+
+# Per-cell latent (plate) parameters: a latent VECTOR sampled once per cell,
+# read as a response location through a LatentTerm predictor.
+function _re_plan(n = 9; plate = PlateParameter(:theta, :normal,
+        (arg1 = :mu, arg2 = :tau), nothing),
+        term = TermSpec(LatentTerm, [:theta], NamedTuple(), :theta, :theta_lat))
+    cols = _columns(n)
+    StructuralPlan(
+        [LikelihoodSpec(GaussianFam, IdentityLink, :y, :loc, :sigma, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:loc, IdentityLink, [term], :loc)],
+        PopulationPrior[],
+        [SampledParameter(:mu, :normal, (arg1 = 0.0, arg2 = 5.0), nothing, :mu),
+            SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma),
+            SampledParameter(:tau, :exponential, (arg1 = 1.0,), nothing, :tau)],
+        AssignmentSpec[], cols, n; plate_parameters = [plate])
+end
+
+@testset "plate parameters" begin
+    # A valid random-effects plan passes structure + data validation.
+    @test (validate_plan(_re_plan()); true)
+    # Unknown family.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :studentt,
+            (arg1 = :mu, arg2 = :tau), nothing)))
+    # `flat()` per-cell latent has no proper prior to draw a cell from.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :flat, NamedTuple(), nothing)))
+    # Wrong arity keys.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal, (arg1 = :mu,), nothing)))
+    # Prior arg references an unknown scalar name.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :nope, arg2 = :tau), nothing)))
+    # A latent VECTOR cannot be a scalar prior arg (stays scalar-only).
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :theta, arg2 = :tau), nothing)))
+    # :positive override only applies to normal/cauchy.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :exponential, (arg1 = 1.0,),
+            :positive)))
+    # Plate name collides with a scalar parameter.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:mu, :normal, (arg1 = 0.0, arg2 = 1.0),
+            nothing),
+            term = TermSpec(LatentTerm, [:mu], NamedTuple(), :mu, :mu_lat)))
+    # Latent term with no matching plate parameter.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; term = TermSpec(LatentTerm, [:absent], NamedTuple(), :absent,
+            :absent_lat)))
+    # A literal plate range must cover 1:n_obs exactly (checked at bind/data).
+    good = _re_plan(9; plate = PlateParameter(:theta, :normal,
+        (arg1 = :mu, arg2 = :tau), nothing, 1:9))
+    @test (validate_plan(good); true)
+    @test_throws ContractValidationError validate_data(
+        _re_plan(9; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), nothing, 1:8)))
+    # A range not starting at 1 is a structure error.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(9; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), nothing, 2:9)))
+end
