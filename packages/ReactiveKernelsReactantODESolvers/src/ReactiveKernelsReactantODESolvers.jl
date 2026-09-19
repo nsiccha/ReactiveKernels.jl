@@ -23,8 +23,10 @@ using LinearAlgebra
 using ReactiveKernels
 
 export Tsit5, Tsit5Solution, solve_ode
+export FixedNSolution, solve_fixed_n
 export initial_dt, ReactantTsit5Config, compile_ode_solve
 export compile_backsolve_gradient
+export compile_fixedn_solve
 
 include("tableau.jl")
 include("controller.jl")
@@ -32,6 +34,7 @@ include("step.jl")
 include("kernels.jl")
 include("dense.jl")
 include("solve.jl")
+include("fixedn.jl")
 include("reactant.jl")
 
 end # module ReactiveKernelsReactantODESolvers

@@ -251,6 +251,156 @@ function RKRO.compile_ode_solve(f, u0_example::AbstractVector,
     p_example === nothing ? (u0,) -> solved(u0) : (u0, p) -> solved(u0, p)
 end
 
+function RKRO.traceable_fixedn_closure(f, cfg::RKRO.ReactantTsit5Config,
+        u0_example::AbstractVector, p_example)
+    T = typeof(cfg.t0)
+    eltype(u0_example) == T ||
+        throw(ArgumentError("u0 element type $(eltype(u0_example)) must match config type $T"))
+    n = length(u0_example)
+    n >= 1 || throw(ArgumentError("state dimension must be positive"))
+    if p_example !== nothing
+        p_example isa AbstractVector ||
+            throw(ArgumentError("traced parameters must be a vector or nothing"))
+        eltype(p_example) == T || throw(ArgumentError(
+            "parameter element type $(eltype(p_example)) must match config type $T"))
+    end
+    nsave = length(cfg.saveat)
+    nsave >= 1 || throw(ArgumentError(
+        "the compiled solve requires at least one interior saveat point"))
+    N = cfg.maxiters
+    N >= 1 || throw(ArgumentError(
+        "the fixed-N solve needs maxiters >= 1 as its step count, got $N"))
+
+    tab = cfg.tab
+    dense = cfg.dense
+    t0, t1, tdir = cfg.t0, cfg.t1, cfg.tdir
+    atol, rtol = cfg.abstol, cfg.reltol
+    dtmax = cfg.dtmax
+    saveat_tup = Tuple(cfg.saveat)
+    dt_init_signed = tdir * cfg.dt_init
+    one_T, zero_T = one(T), zero(T)
+    two_T = one_T + one_T
+    half_T = one_T / two_T
+    qoldinit_T = T(RKRO.TSIT5_QOLDINIT)
+    guard_T = T(RKRO.TSIT5_FIXEDN_GUARD)
+    kstep = RKRO.prepare_tsit5_stage()
+    inv_n = T(inv(n))
+
+    function body(u0, p)
+        z = sum(u0 .* zero_T)
+        one_tr = z + one_T
+        two_tr = z + two_T
+        half_tr = z + half_T
+        zero_tr = z + zero_T
+        qoldinit_tr = z + qoldinit_T
+        guard_tr = z + guard_T
+        t1_tr = z + t1
+        # No `dtmin`: the traced driver fixes it at 0 (the native
+        # default), like the adaptive traced driver — `stuck` latches
+        # only on genuinely unrepresentable progress.
+        # Constant-foldable traced booleans (the index is concrete, so
+        # plain Julia branches gate whole statements; only value choices
+        # need `ifelse`, and those need traced constants).
+        false_tr = zero_tr > one_tr
+        true_tr = one_tr > zero_tr
+        t = z + t0
+        dt = z + dt_init_signed
+        qold = qoldinit_tr + zero_T
+        u = u0
+        k1 = f(u0, p, t)
+        out = ntuple(_ -> u0 .* zero_T, nsave)
+        subdiv = z + zero_T
+        bad = z + zero_T
+        stuck = z + zero_T
+
+        # Plain `for` over the concrete bound unrolls during tracing: the
+        # program is straight-line solver code with no `while` op, which is
+        # what the through-reverse probe needs. Every step is accepted;
+        # the subdivision trigger and the failure latches are branchless
+        # `ifelse` selects; step `N` lands exactly on `t1`. There are no
+        # emergency retries: a poisoned or guard-exceeding step latches
+        # `bad` and freezes the rest (native would retry — the documented
+        # divergence, confined to solves where native retries).
+        for i in 1:N
+            frozen = (bad > half_tr) | (stuck > half_tr)
+            remaining = t1 - t
+            if i == N
+                dt_use = remaining
+            else
+                steps_left = N - i + 1
+                prop = tdir * min(abs(dt), abs(remaining))
+                trigger = tdir * (t + prop - t1) >= zero_T
+                subdiv = ifelse(trigger, one_tr, subdiv)
+                dt_use = ifelse(subdiv > half_tr, remaining / steps_left,
+                    prop)
+            end
+            no_progress = (t + dt_use) == t
+            if i == N
+                # Landing snap (mirror native): an unrepresentable gap
+                # finishes; the landing never latches `stuck`.
+                snap = no_progress
+            else
+                snap = false_tr
+                stuck = ifelse(no_progress, one_tr, stuck)
+            end
+            # Finite dummy step when frozen or snapped: the dense
+            # fraction `(ts - t) / dt_step` would be Inf/NaN at
+            # `dt_use == 0`, and reverse-mode forms 0 * non-finite
+            # partials into live shadows even for discarded updates.
+            dt_step = ifelse(frozen | no_progress, one_tr, dt_use)
+            taken_u, taken_k, taken_EEst = kstep(f, u, k1, p, t,
+                dt_step, tab, atol, rtol, inv_n)
+            EEst = taken_EEst
+            # isnan-first (complementary comparisons on a possibly-NaN
+            # value miscompile); EEst >= 0 unless NaN.
+            step_bad = ifelse(isnan(EEst), true_tr, EEst > guard_tr)
+            bad = ifelse(frozen, bad, ifelse(step_bad, one_tr, bad))
+            if i == N
+                advance = ifelse(frozen, false_tr,
+                    ifelse(step_bad, false_tr, true_tr))
+            else
+                advance = ifelse(frozen | no_progress,
+                    false_tr, ifelse(step_bad, false_tr, true_tr))
+            end
+            q, _ = RKRO.pi_factors(EEst, qold)
+            dt_next = min(RKRO.pi_accept_dt(dt_use, q), dtmax)
+            t_new = t + dt_use
+            out = RKRO._emit_saveat_cols(out, saveat_tup, u, taken_k, t,
+                dt_step, min(t, t_new), max(t, t_new), advance, dense)
+            u = ifelse.(advance, taken_u, u)
+            k1 = ifelse.(advance, taken_k[7], k1)
+            if i == N
+                t = ifelse(advance, ifelse(snap, t1_tr, t + dt_use), t)
+            else
+                t = ifelse(advance, t + dt_use, t)
+            end
+            dt = ifelse(advance, dt_next, dt)
+            qold = ifelse(advance, max(EEst, qoldinit_tr), qold)
+        end
+        reached = tdir * (t1 - t) <= zero_T
+        status = ifelse(bad > half_tr, two_tr,
+            ifelse(stuck > half_tr, one_tr,
+                ifelse(reached, zero_tr, one_tr)))
+        (u, out, status)
+    end
+
+    p_example === nothing ? (u0,) -> body(u0, nothing) : body
+end
+
+function RKRO.compile_fixedn_solve(f, u0_example::AbstractVector,
+        p_example, ::RKRO.Tsit5, cfg::RKRO.ReactantTsit5Config)
+    closure = RKRO.traceable_fixedn_closure(f, cfg, u0_example, p_example)
+    example_args = p_example === nothing ? (Reactant.to_rarray(u0_example),) :
+        (Reactant.to_rarray(u0_example), Reactant.to_rarray(p_example))
+    thunk = Reactant.compile(closure, example_args)
+    function solved(args...)
+        traced = map(Reactant.to_rarray, args)
+        u_end, cols, status = thunk(traced...)
+        (Array(u_end), hcat(map(Array, cols)...), Int(Float64(status)))
+    end
+    p_example === nothing ? (u0,) -> solved(u0) : (u0, p) -> solved(u0, p)
+end
+
 # Augmented backsolve RHS over `w = [u; λ; μ]`: the state re-solves `f`
 # backward in time, the adjoint integrates `dλ/dt = -Jᵀλ`, and the parameter
 # quadrature `dμ/dt = -(λᵀf_p)` so `μ(t0) = dL/dp`. The VJP pair comes from
