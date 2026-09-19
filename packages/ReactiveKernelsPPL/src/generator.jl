@@ -424,7 +424,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         tv = _dovar(1)
         argvals = Any[_thread_ref!(inputs, v) for v in values(p.args)]
         cell = _family_logpdf_expr(p.family, argvals, tv)
-        p.support_override === nothing || (cell = :($cell + log(2)))
+        corr = _support_correction(p.support_override, argvals)
+        corr === nothing || (cell = :($cell + $corr))
         append!(stmts, _plate_sum_stmts(pw, node, inputs, cell))
         push!(terms, node)
     end
@@ -475,13 +476,31 @@ function _family_logpdf_expr(family::Symbol, a, x)
     end
 end
 
+# The additive support-override correction for a prior log-density (or `nothing`
+# for no override): `:positive` (half-Normal/half-Cauchy) renormalizes by exactly
+# +log(2) (symmetry at literal 0); `(:interval, lo, hi)` (a truncated Normal)
+# renormalizes by -log(cdf(hi) - cdf(lo)) at any location, where `argvals` are the
+# family's (mu, s) argument expressions (literals/refs for a scalar prior, or
+# per-cell do-vars for a plate prior — the CDF endpoints thread identically).
+function _support_correction(ov::SupportOverride, argvals)
+    ov === nothing && return nothing
+    if ov isa Tuple  # (:interval, lo, hi) — truncated Normal
+        lo, hi = ov[2], ov[3]
+        mu, s = argvals[1], argvals[2]
+        return :(-log(normal($mu, $s).cdf($hi) - normal($mu, $s).cdf($lo)))
+    end
+    return :(log(2))  # :positive half
+end
+
 # Scalar prior log-density per family via distribution-kernel endpoints
-# (Distributions.jl semantics). Half-Normal/half-Cauchy (the only overrides)
-# renormalize by exactly +log(2) (symmetry at 0).
+# (Distributions.jl semantics). The support override adds the +log(2) half or
+# the -log(cdf(hi)-cdf(lo)) truncated-interval renormalization (`_support_correction`).
 function _sampled_prior_expr(p::SampledParameter)
-    base = _family_logpdf_expr(p.family, [v for v in values(p.args)], p.name)
-    p.support_override === nothing && return base
-    return :($base + log(2))
+    argvals = [v for v in values(p.args)]
+    base = _family_logpdf_expr(p.family, argvals, p.name)
+    corr = _support_correction(p.support_override, argvals)
+    corr === nothing && return base
+    return :($base + $corr)
 end
 
 # --- Sequential-recurrence (scan) density (slice 1: CENTERED) ---

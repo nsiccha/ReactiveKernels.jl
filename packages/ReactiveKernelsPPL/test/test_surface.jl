@@ -351,6 +351,42 @@ end
         ResponseEvidence(:interval_censored, nothing, :hi)
 end
 
+@testset "surface interval-truncated parameters" begin
+    # A two-sided FINITE truncation lowers to a `(:interval, lo, hi)` support
+    # override at ANY location; the half `truncated(_, 0, Inf)` at zero stays
+    # `:positive`. `z` feeds a per-cell prior mean (a supported shared arg).
+    _plate_z(rhs) = Expr(:block,
+        :(z ~ $rhs),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ Normal(z, 1.0)),
+                    :(y[i] ~ Normal.(theta[i], 1.0))))))
+    got = lower_rkppl(_plate_z(:(truncated(Normal(0.5, 2.0), -1.0, 3.0))), (:y,))
+    p = only(pp for pp in got.parameters if pp.name === :z)
+    @test p.family === :normal
+    @test p.args == (arg1 = 0.5, arg2 = 2.0)
+    @test p.support_override === (:interval, -1.0, 3.0)
+    # A per-cell interval latent rides the plate the same way.
+    plate = lower_rkppl(Expr(:block,
+        :(mu ~ Normal(0, 3)), :(tau ~ HalfNormal(2)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ truncated(Normal(mu, tau), -2.0, 5.0)),
+                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y,))
+    @test only(plate.plate_parameters).support_override === (:interval, -2.0, 5.0)
+    # A finite interval on a non-Normal family is rejected in slice 1.
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _plate_z(:(truncated(Cauchy(0.0, 1.0), -1.0, 2.0))), (:y,))
+    # One-sided finite bounds are not yet lowered (planned).
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _plate_z(:(truncated(Normal(0.0, 1.0), 1.0, Inf))), (:y,))
+    # Reversed bounds are rejected.
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _plate_z(:(truncated(Normal(0.0, 1.0), 3.0, 1.0))), (:y,))
+end
+
 @testset "surface parameters and assignments" begin
     # Flat, half-Normal (both spellings), hierarchical refs, temporaries.
     got = lower_rkppl(quote

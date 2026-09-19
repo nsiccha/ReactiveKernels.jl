@@ -744,6 +744,41 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+# A per-cell latent with a two-sided FINITE truncated-Normal support:
+# `theta[i] ~ truncated(Normal(mu, tau), lo, hi)` constrains each cell to
+# (lo, hi) via an affine-logistic transform and carries the exact
+# -log(cdf(hi)-cdf(lo)) renormalization. Oracle is Distributions.jl `truncated`.
+@testset "plate parameter interval-truncated latent" begin
+    y = [0.3, 1.2, -0.5, 2.1, 0.0, 1.7]
+    n = length(y)
+    lo, hi = -2.0, 5.0
+    expr = Expr(:block,
+        :(mu ~ Normal(0, 3)),
+        :(tau ~ HalfNormal(2)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ truncated(Normal(mu, tau), $lo, $hi)),
+                    :(y[i] ~ Normal.(theta[i], 1.0))))))
+    plan = bind_data(lower_rkppl(expr, (:y,)),
+        Dict{Symbol,AbstractVector}(:y => y))
+    built = build_kernel(plan)
+    @test built.layout.total == 2 + n
+    u = vcat([0.3, 0.2], [0.1, -0.4, 0.7, -0.2, 0.5, 0.0])
+    nt = constrain(built.layout, u)
+    mu, tau, theta = nt.mu, nt.tau, Vector(nt.theta)
+    @test all(t -> lo < t < hi, theta)
+    ll = sum(logpdf.(Normal.(theta, 1.0), y))
+    pr = logpdf(Normal(0, 3), mu) + (logpdf(Normal(0, 2), tau) + log(2)) +
+        sum(logpdf.(truncated(Normal(mu, tau), lo, hi), theta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    # log-jacobian: exp for tau (u[2]) + affine-logistic per theta cell.
+    ljtheta = sum(log(t - lo) + log(hi - t) - log(hi - lo) for t in theta)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[2] + ljtheta
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "scan: centered AR(1) end to end" begin
     m = @rkppl begin
         phi ~ Normal(0, 1)

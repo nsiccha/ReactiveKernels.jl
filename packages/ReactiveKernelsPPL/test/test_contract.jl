@@ -606,6 +606,25 @@ end
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :exponential, (arg1 = 1.0,),
             :positive)))
+    # A two-sided finite (:interval, lo, hi) override on a Normal cell is valid.
+    @test (validate_plan(_re_plan(; plate = PlateParameter(:theta, :normal,
+        (arg1 = :mu, arg2 = :tau), (:interval, -2.0, 5.0)))); true)
+    # :interval is a truncated Normal — a non-Normal family is rejected.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :cauchy,
+            (arg1 = :mu, arg2 = :tau), (:interval, -1.0, 1.0))))
+    # :interval bounds must be finite.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), (:interval, 0.0, Inf))))
+    # :interval lower < upper.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), (:interval, 3.0, 1.0))))
+    # A tuple override whose head is not :interval is rejected.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), (:bogus, 0.0, 1.0))))
     # Plate name collides with a scalar parameter.
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:mu, :normal, (arg1 = 0.0, arg2 = 1.0),

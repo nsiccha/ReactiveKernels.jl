@@ -149,20 +149,34 @@ struct PopulationPrior
 end
 
 """
+    SupportOverride
+
+A latent's support override: `nothing` (infer from the family), the bare
+`Symbol` `:positive` (half-Normal/half-Cauchy truncation of a real-support
+family, exact +log(2) at a literal-zero location), or the tuple
+`(:interval, lo, hi)` (a two-sided finite truncation `truncated(Normal(mu, s),
+lo, hi)` — an affine-logistic constrained transform onto `(lo, hi)` with the
+renormalized truncated density). Shared by scalar [`SampledParameter`](@ref)s
+and per-cell [`PlateParameter`](@ref)s.
+"""
+const SupportOverride = Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64}}
+
+"""
     SampledParameter(name, family, args, support_override, label)
 
 One non-coefficient latent (scalar, slice 1). `args` use POSITIONAL keys
 `(arg1, arg2, …)` in Distributions.jl constructor order with Distributions.jl
 semantics (`Exponential(θ)` = scale θ). Values are literals or
 [`ParamName`](@ref)s (hierarchical OK, cycles rejected). `support_override`
-is `nothing` (infer from family) or `:positive` for half-Normal/half-Cauchy
-style truncations of real-support families.
+is a [`SupportOverride`](@ref): `nothing` (infer from family), `:positive`
+(half-Normal/half-Cauchy), or `(:interval, lo, hi)` (a finite truncated
+interval).
 """
 struct SampledParameter
     name::ParamName
     family::Symbol
     args::NamedTuple
-    support_override::Union{Nothing,Symbol}
+    support_override::SupportOverride
     label::Symbol
 end
 
@@ -185,16 +199,16 @@ struct PlateParameter
     name::ParamName
     family::Symbol
     args::NamedTuple
-    support_override::Union{Nothing,Symbol}
+    support_override::SupportOverride
     range::Union{Nothing,UnitRange{Int}}
     label::Symbol
 end
 """Provenance/range default to a whole-column (n_obs) plate under the name."""
 PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
-    support_override::Union{Nothing,Symbol}) =
+    support_override::SupportOverride) =
     PlateParameter(name, family, args, support_override, nothing, name)
 PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
-    support_override::Union{Nothing,Symbol}, range::Union{Nothing,UnitRange{Int}}) =
+    support_override::SupportOverride, range::Union{Nothing,UnitRange{Int}}) =
     PlateParameter(name, family, args, support_override, range, name)
 
 """
@@ -1013,9 +1027,26 @@ end
 # Shared support-override rule for scalar and per-cell latent parameters:
 # `:positive` half-truncates a real-support (normal/cauchy) family, and the
 # +log(2) renormalization is exact only for a literal zero location.
+# `(:interval, lo, hi)` is a two-sided finite truncation with finite lo < hi;
+# the family must be real-support (a truncated Normal), and the density carries
+# the exact -log(cdf(hi) - cdf(lo)) renormalization at any location.
 function _validate_support_override(label, family::Symbol,
-        ov::Union{Nothing,Symbol}, args::NamedTuple)
+        ov::SupportOverride, args::NamedTuple)
     ov === nothing && return nothing
+    if ov isa Tuple
+        ov[1] === :interval || _fail(label,
+            "tuple support override must be (:interval, lo, hi), got $ov")
+        family === :normal || _fail(label,
+            "an :interval override is a truncated Normal in slice 1 " *
+            "(`truncated(Normal(mu, s), lo, hi)`); got $family")
+        lo, hi = ov[2], ov[3]
+        (isfinite(lo) && isfinite(hi)) || _fail(label,
+            ":interval bounds must be finite (a one-sided or half truncation " *
+            "uses :positive); got ($lo, $hi)")
+        lo < hi || _fail(label,
+            ":interval lower bound must be < upper bound; got ($lo, $hi)")
+        return nothing
+    end
     ov === :positive || _fail(label, "support override must be :positive, got $ov")
     (family === :normal || family === :cauchy) || _fail(label,
         ":positive override only applies to normal/cauchy " *
