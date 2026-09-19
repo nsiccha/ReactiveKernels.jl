@@ -520,6 +520,10 @@ const ASSIGNMENT_FNS = (
     :sum, :mean, :std, :var, :minimum, :maximum, :length,
 )
 
+"""Vector-returning whole-column functions (exact-GP slice): admitted in
+derived columns and predictor locations only; always vector-shaped."""
+const VECTOR_FNS = (:gp_exp_quad_cov, :gp_chol_latent)
+
 """Whole-column reductions (their single argument must be a bare column)."""
 const REDUCTION_FNS = (:sum, :mean, :std, :var, :minimum, :maximum, :length)
 
@@ -544,8 +548,9 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
     RanefGatherTerm)
 
-"""Assignment functions the thin layer can lower (ext handshake predicate)."""
-admitted_functions() = ASSIGNMENT_FNS
+"""Assignment functions the thin layer can lower (ext handshake predicate):
+scalar/reduction vocabulary plus vector-returning whole-column functions."""
+admitted_functions() = (ASSIGNMENT_FNS..., VECTOR_FNS...)
 
 """Elementwise vocabulary the thin layer can lower in derived columns:
 `(dotted operators, dotted math functions)` (ext handshake predicate)."""
@@ -1118,6 +1123,12 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
             _collect_vector_reduction!(refs, ex, plan, label, bound)
             return nothing
         end
+        if fn isa Symbol && fn in VECTOR_FNS
+            for arg in ex.args[2:end]
+                _collect_vector_refs!(refs, arg, plan, label, bound)
+            end
+            return nothing
+        end
         if fn isa Symbol && fn in ASSIGNMENT_FNS
             for arg in ex.args[2:end]
                 _collect_assignment_refs!(refs, arg, plan, label, bound)
@@ -1243,6 +1254,7 @@ function _is_vector_valued(ex, plan::StructuralPlan)
         isempty(ex.args) && return false
         fn = ex.args[1]
         fn in REDUCTION_FNS && return false
+        fn isa Symbol && fn in VECTOR_FNS && return true
         fn isa Symbol && (fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS) &&
             return any(a -> _is_vector_valued(a, plan), ex.args[2:end])
         return false

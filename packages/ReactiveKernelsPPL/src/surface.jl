@@ -349,6 +349,8 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
     elseif fn === :^ || _is_plain_comparison(fn) || fn === :ifelse ||
             fn in ASSIGNMENT_FNS
         return nvec == 0 ? :scalar : :invalid
+    elseif fn in VECTOR_FNS
+        return :vector
     end
     return nvec == 0 ? :scalar : :vector  # unknown heads: follow the args
 end
@@ -525,7 +527,7 @@ function _reject_unknown_calls(where, rhs)
     if rhs.head === :call && !isempty(rhs.args)
         fn = rhs.args[1]
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
-                fn !== :ranef
+                fn ∉ VECTOR_FNS && fn !== :ranef
             startswith(string(fn), ".") && _sfail(
                 "$where uses dotted operator `$fn`, which is not in " *
                 "the slice-1 elementwise vocabulary")
