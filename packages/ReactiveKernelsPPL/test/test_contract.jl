@@ -210,7 +210,8 @@ end
     @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
         BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
         BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
-        BinomialCloglogFam, BetaLogitFam)
+        BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
+        OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam)
     @test admitted_terms() ==
         (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, RanefGatherTerm)
     @test :log in admitted_functions()
@@ -791,4 +792,410 @@ end
     @test_throws ContractValidationError validate_structure(
         _re_plan(9; plate = PlateParameter(:theta, :normal,
             (arg1 = :mu, arg2 = :tau), nothing, 2:9)))
+end
+
+# Leveled families (categorical / ordinal / multinomial): recoded 1..K
+# integer responses, multi-predictor categoricals, ordered/simplex vector
+# parameters, and per-threshold ordinal design.
+function _leveled_columns(n = 9)
+    Dict{Symbol,AbstractVector}(
+        :y => repeat([1, 2, 3], outer = cld(n, 3))[1:n],
+        :x => collect(1.0:n),
+        :w => fill(1.0, n),
+        :d => fill(1.5, n),
+        :z1 => collect(1.0:n),
+        :z2 => reverse(collect(1.0:n)),
+    )
+end
+
+# Leveled builders bind internally (levels/sizes infer at bind — the
+# faithful emitter→layer flow); structural mutants throw from the
+# builder's own bind, data mutants rebuild from the bound plan's fields.
+function _categorical_plan(n = 9; extra = [:mu3], n_levels = nothing,
+        resp = nothing, fam = CategoricalLogitFam, cols = nothing,
+        single = false)
+    cols = cols === nothing ? _leveled_columns(n) : cols
+    preds = single ? PredictorSpec[PredictorSpec(:mu2, IdentityLink, _terms(), :mu2)] :
+        PredictorSpec[PredictorSpec(:mu2, IdentityLink, _terms(), :mu2),
+        PredictorSpec(:mu3, IdentityLink, _terms(), :mu3)]
+    priors = single ? _priors(:mu2) : vcat(_priors(:mu2), _priors(:mu3))
+    r = resp === nothing ? LikelihoodSpec(fam, LogitLink, :y, :mu2, nothing,
+        nothing, _none_evidence(), :y_resp, nothing, nothing;
+        extra_predictors = extra, n_levels = n_levels) : resp
+    unbound = StructuralPlan([r], preds, priors,
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0)
+    return bind_data(unbound, cols)
+end
+
+@testset "categorical contract" begin
+    good = _categorical_plan()
+    @test (validate_plan(good); true)
+    @test good.responses[1].n_levels == 3
+    # K=2 (one non-reference predictor, no tail) over two-level data.
+    cols2 = _leveled_columns(6)
+    cols2[:y] = repeat([1, 2], 3)
+    two = _categorical_plan(6; extra = Symbol[], cols = cols2, single = true)
+    @test (validate_plan(two); true)
+    @test two.responses[1].n_levels == 2
+    # Tail predictors count as used (no unused-predictor failure above).
+    # Unknown tail predictor.
+    @test_throws ContractValidationError _categorical_plan(; extra = [:nope])
+    # Repeated predictor across lead + tail.
+    @test_throws ContractValidationError _categorical_plan(; extra = [:mu2])
+    # Explicit n_levels asserting against the structural K.
+    @test (validate_plan(_categorical_plan(; n_levels = 3)); true)
+    @test_throws ContractValidationError _categorical_plan(; n_levels = 2)
+    # Stray leveled fields fail closed.
+    for kw in (:thresholds, :count_columns, :ordinal_structure,
+            :discrimination, :threshold_columns, :threshold_coefs)
+        val = kw in (:count_columns, :threshold_columns) ? [:x] :
+            kw === :discrimination ? 1.0 :
+            kw === :ordinal_structure ? :cumulative :
+            kw === :threshold_coefs ? :y_beta : :y_cutpoints
+        r = LikelihoodSpec(CategoricalLogitFam, LogitLink, :y, :mu2, nothing,
+            nothing, _none_evidence(), :y_resp, nothing, nothing;
+            extra_predictors = [:mu3], kw => val)
+        @test_throws ContractValidationError _categorical_plan(; resp = r)
+    end
+    # Scale / trials / evidence are not categorical auxiliaries.
+    r = LikelihoodSpec(CategoricalLogitFam, LogitLink, :y, :mu2, :sigma,
+        nothing, _none_evidence(), :y_resp, nothing, nothing;
+        extra_predictors = [:mu3])
+    @test_throws ContractValidationError _categorical_plan(; resp = r)
+    # Non-identity predictor link is not an admitted triple.
+    badpred = PredictorSpec(:mu2, LogitLink, _terms(), :mu2)
+    bad = StructuralPlan(good.responses, [badpred, good.predictors[2]],
+        good.population_priors, good.parameters, good.assignments,
+        good.columns, good.n_obs)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Response must be recoded 1..K integers: floats, gaps, and level
+    # overflow all fail.
+    for (tag, newy) in (("floats", Float64.([1, 2, 3, 2, 1, 3, 1, 2, 3])),
+            ("gap", [1, 3, 3, 1, 3, 3, 1, 3, 3]),
+            ("overflow", [1, 2, 4, 2, 1, 3, 1, 2, 3]))
+        badcols = Dict{Symbol,AbstractVector}(good.columns)
+        badcols[:y] = newy
+        bad = StructuralPlan(good.responses, good.predictors,
+            good.population_priors, good.parameters, good.assignments,
+            badcols, good.n_obs)
+        @test_throws ContractValidationError validate_data(bad)
+    end
+end
+
+function _ordered_plan(n = 9; fam = OrderedLogisticFam, link = LogitLink,
+        structure = nothing, vecfam = :ordered_normal, vecsize = nothing,
+        resp = nothing, terms = _terms(), n_levels = nothing, cols = nothing,
+        vecs = nothing)
+    cols = cols === nothing ? _leveled_columns(n) : cols
+    preds = PredictorSpec[PredictorSpec(:mu, IdentityLink, terms, :mu)]
+    r = resp === nothing ? LikelihoodSpec(fam, link, :y, :mu, nothing,
+        nothing, _none_evidence(), :y_resp, nothing, nothing;
+        thresholds = :y_cutpoints, ordinal_structure = structure,
+        n_levels = n_levels) : resp
+    vecs = vecs === nothing ? VectorParameter[VectorParameter(:y_cutpoints,
+        vecfam, (arg1 = 0.0, arg2 = 1.0), vecsize, :y_cutpoints)] : vecs
+    unbound = StructuralPlan([r], preds, _priors(:mu), SampledParameter[],
+        AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        vector_parameters = vecs)
+    return bind_data(unbound, cols)
+end
+
+@testset "ordered contract" begin
+    good = _ordered_plan()
+    @test (validate_plan(good); true)
+    @test good.responses[1].n_levels == 3
+    @test good.vector_parameters[1].size == 2
+    # Missing thresholds.
+    r = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu, nothing,
+        nothing, _none_evidence(), :y_resp, nothing, nothing)
+    @test_throws ContractValidationError _ordered_plan(;
+        resp = r, vecs = VectorParameter[])
+    # Thresholds must be ordered_normal for OrderedLogistic.
+    @test_throws ContractValidationError _ordered_plan(;
+        vecfam = :vector_normal)
+    @test_throws ContractValidationError _ordered_plan(;
+        vecfam = :simplex_dirichlet)
+    # Explicit sizes assert both ways.
+    @test (validate_plan(_ordered_plan(; vecsize = 2)); true)
+    @test_throws ContractValidationError _ordered_plan(; vecsize = 3)
+    @test (validate_plan(_ordered_plan(; n_levels = 3, vecsize = 2)); true)
+    @test_throws ContractValidationError _ordered_plan(; n_levels = 2,
+        vecsize = 2)
+    # K=1 is uniform: zero thresholds, zero-information likelihood.
+    cols1 = _leveled_columns(6)
+    cols1[:y] = ones(Int, 6)
+    one = _ordered_plan(6; cols = cols1)
+    @test (validate_plan(one); true)
+    @test one.responses[1].n_levels == 1
+    @test one.vector_parameters[1].size == 0
+    # OrderedLogistic takes no ordinal structure.
+    r = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu, nothing,
+        nothing, _none_evidence(), :y_resp, nothing, nothing;
+        thresholds = :y_cutpoints, ordinal_structure = :cumulative)
+    @test_throws ContractValidationError _ordered_plan(; resp = r)
+end
+
+function _ordinal_plan(n = 9; link = LogitLink, structure = :cumulative,
+        vecfam = :ordered_normal, discrimination = nothing,
+        tcols = Symbol[], coefs = nothing, terms = nothing, resp = nothing,
+        cols = nothing)
+    cols = cols === nothing ? _leveled_columns(n) : cols
+    terms = terms === nothing ?
+        [TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)] : terms
+    preds = PredictorSpec[PredictorSpec(:mu, IdentityLink, terms, :mu)]
+    priors = PopulationPrior[PopulationPrior(:mu, :x, 0.0, 2.0)]
+    r = resp === nothing ? LikelihoodSpec(OrdinalFam, link, :y, :mu, nothing,
+        nothing, _none_evidence(), :y_resp, nothing, nothing;
+        thresholds = :y_thresholds, ordinal_structure = structure,
+        discrimination = discrimination, threshold_columns = tcols,
+        threshold_coefs = coefs) : resp
+    vecs = VectorParameter[VectorParameter(:y_thresholds, vecfam,
+        (arg1 = 0.0, arg2 = 1.0), nothing, :y_thresholds)]
+    coefs === nothing || push!(vecs, VectorParameter(coefs, :vector_normal,
+        (arg1 = 0.0, arg2 = 1.0), nothing, coefs))
+    unbound = StructuralPlan([r], preds, priors, SampledParameter[],
+        AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        vector_parameters = vecs)
+    return bind_data(unbound, cols)
+end
+
+@testset "ordinal contract" begin
+    # All six structure × link combinations admit.
+    for link in (LogitLink, ProbitLink, CloglogLink),
+            (structure, vfam) in
+            ((:cumulative, :ordered_normal), (:stopping, :vector_normal))
+        @test (validate_plan(_ordinal_plan(;
+            link = link, structure = structure, vecfam = vfam)); true)
+    end
+    # Missing / unknown structure.
+    r = LikelihoodSpec(OrdinalFam, LogitLink, :y, :mu, nothing,
+        nothing, _none_evidence(), :y_resp, nothing, nothing;
+        thresholds = :y_thresholds)
+    @test_throws ContractValidationError _ordinal_plan(; resp = r)
+    r = LikelihoodSpec(OrdinalFam, LogitLink, :y, :mu, nothing,
+        nothing, _none_evidence(), :y_resp, nothing, nothing;
+        thresholds = :y_thresholds, ordinal_structure = :bogus)
+    @test_throws ContractValidationError _ordinal_plan(; resp = r)
+    # Threshold family must match the structure.
+    @test_throws ContractValidationError _ordinal_plan(;
+        structure = :stopping, vecfam = :ordered_normal)
+    @test_throws ContractValidationError _ordinal_plan(;
+        structure = :cumulative, vecfam = :vector_normal)
+    # A fixed intercept is non-identifiable with the thresholds (SB rule).
+    @test_throws ContractValidationError _ordinal_plan(; terms = _terms())
+    # Discrimination: positive literal or data column only.
+    @test (validate_plan(_ordinal_plan(; discrimination = 2.0)); true)
+    @test (validate_plan(_ordinal_plan(; discrimination = :d)); true)
+    @test_throws ContractValidationError _ordinal_plan(; discrimination = 0.0)
+    @test_throws ContractValidationError _ordinal_plan(; discrimination = -1.0)
+    good = _ordinal_plan(; discrimination = :d)
+    badcols = Dict{Symbol,AbstractVector}(good.columns)
+    badcols[:d] = fill(0.0, 9)
+    bad = StructuralPlan(good.responses, good.predictors,
+        good.population_priors, good.parameters, good.assignments, badcols,
+        good.n_obs; vector_parameters = good.vector_parameters)
+    @test_throws ContractValidationError validate_data(bad)
+    # A sampled parameter is not an admitted discrimination (SB takes
+    # literals and data columns only).
+    @test_throws ContractValidationError _ordinal_plan(; discrimination = :mu)
+    # per_threshold: stopping-only, coefs required exactly with columns.
+    good = _ordinal_plan(; structure = :stopping, vecfam = :vector_normal,
+        tcols = [:z1, :z2], coefs = :y_beta)
+    @test (validate_plan(good); true)
+    @test good.vector_parameters[2].size == 4 # (K−1)×p
+    @test_throws ContractValidationError _ordinal_plan(;
+        structure = :cumulative, tcols = [:z1], coefs = :y_beta)
+    @test_throws ContractValidationError _ordinal_plan(;
+        structure = :stopping, vecfam = :vector_normal, tcols = [:z1])
+    @test_throws ContractValidationError _ordinal_plan(;
+        structure = :stopping, vecfam = :vector_normal, coefs = :y_beta)
+    # Threshold design columns are raw finite numerics.
+    badcols = Dict{Symbol,AbstractVector}(good.columns)
+    badcols[:z1] = fill(Inf, 9)
+    bad = StructuralPlan(good.responses, good.predictors,
+        good.population_priors, good.parameters, good.assignments, badcols,
+        good.n_obs; vector_parameters = good.vector_parameters)
+    @test_throws ContractValidationError validate_data(bad)
+    # Non-identity predictor link is not an admitted ordinal triple.
+    base = _ordinal_plan()
+    badpred = PredictorSpec(:mu, LogitLink, base.predictors[1].terms, :mu)
+    bad = StructuralPlan(base.responses, [badpred], base.population_priors,
+        base.parameters, base.assignments, base.columns, base.n_obs;
+        vector_parameters = base.vector_parameters)
+    @test_throws ContractValidationError validate_structure(bad)
+end
+
+function _multinomial_columns()
+    c1 = [2, 0, 1, 3]
+    c2 = [1, 2, 0, 1]
+    c3 = [0, 1, 2, 0]
+    return Dict{Symbol,AbstractVector}(:c1 => c1, :c2 => c2, :c3 => c3,
+        :N => c1 .+ c2 .+ c3)
+end
+
+function _multinomial_plan(; counts = [:c2, :c3], trials = :N, n_levels = nothing,
+        resp = nothing, vecsize = nothing, alpha = [2.0, 2.0, 2.0],
+        cols = nothing)
+    cols = cols === nothing ? _multinomial_columns() : cols
+    r = resp === nothing ? LikelihoodSpec(MultinomialFam, IdentityLink, :c1,
+        :s, nothing, nothing, _none_evidence(), :y_resp, trials, nothing;
+        count_columns = counts, n_levels = n_levels) : resp
+    vecs = VectorParameter[VectorParameter(:s, :simplex_dirichlet,
+        (arg1 = alpha,), vecsize, :s)]
+    unbound = StructuralPlan([r], PredictorSpec[], PopulationPrior[],
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = vecs)
+    return bind_data(unbound, cols)
+end
+
+@testset "multinomial contract" begin
+    good = _multinomial_plan()
+    @test (validate_plan(good); true)
+    @test good.responses[1].n_levels == 3
+    @test good.vector_parameters[1].size == 3
+    # Literal trials.
+    cols3 = Dict{Symbol,AbstractVector}(:c1 => [2, 0, 1, 0],
+        :c2 => [1, 2, 0, 1], :c3 => [0, 1, 2, 2])
+    @test (validate_plan(_multinomial_plan(; trials = 3, cols = cols3)); true)
+    # Row sums must meet N in every row (Stan errors otherwise).
+    @test_throws ContractValidationError _multinomial_plan(; trials = 2)
+    # Trials required; non-identity link rejected.
+    r = LikelihoodSpec(MultinomialFam, IdentityLink, :c1, :s, nothing,
+        nothing, _none_evidence(), :y_resp, nothing, nothing;
+        count_columns = [:c2, :c3])
+    @test_throws ContractValidationError _multinomial_plan(; resp = r)
+    r = LikelihoodSpec(MultinomialFam, LogitLink, :c1, :s, nothing,
+        nothing, _none_evidence(), :y_resp, :N, nothing;
+        count_columns = [:c2, :c3])
+    @test_throws ContractValidationError _multinomial_plan(; resp = r)
+    # The predictor names the :simplex_dirichlet vector parameter.
+    r = LikelihoodSpec(MultinomialFam, IdentityLink, :c1, :mu, nothing,
+        nothing, _none_evidence(), :y_resp, :N, nothing;
+        count_columns = [:c2, :c3])
+    @test_throws ContractValidationError _multinomial_plan(; resp = r)
+    # Count columns are distinct; n_levels asserts structurally.
+    @test_throws ContractValidationError _multinomial_plan(;
+        counts = [:c2, :c2])
+    @test (validate_plan(_multinomial_plan(; n_levels = 3)); true)
+    @test_throws ContractValidationError _multinomial_plan(; n_levels = 2)
+    # Counts are non-negative integers.
+    badcols = Dict{Symbol,AbstractVector}(good.columns)
+    badcols[:c3] = [0.5, 1, 2, 0]
+    bad = StructuralPlan(good.responses, good.predictors,
+        good.population_priors, good.parameters, good.assignments, badcols,
+        good.n_obs; vector_parameters = good.vector_parameters)
+    @test_throws ContractValidationError validate_data(bad)
+    # K=1: one count column, deterministic 1-simplex.
+    cols1 = Dict{Symbol,AbstractVector}(:c1 => [3, 2], :N => [3, 2])
+    one = _multinomial_plan(; counts = Symbol[], alpha = [1.5], cols = cols1)
+    @test (validate_plan(one); true)
+    @test one.responses[1].n_levels == 1
+    @test one.vector_parameters[1].size == 1
+end
+
+function _categorical_plain_plan(n = 9; resp = nothing, n_levels = nothing,
+        cols = nothing, alpha = [1.0, 1.0, 1.0])
+    cols = cols === nothing ? _leveled_columns(n) : cols
+    r = resp === nothing ? LikelihoodSpec(CategoricalFam, IdentityLink, :y,
+        :s, nothing, nothing, _none_evidence(), :y_resp, nothing, nothing;
+        n_levels = n_levels) : resp
+    vecs = VectorParameter[VectorParameter(:s, :simplex_dirichlet,
+        (arg1 = alpha,), nothing, :s)]
+    unbound = StructuralPlan([r], PredictorSpec[], PopulationPrior[],
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = vecs)
+    return bind_data(unbound, cols)
+end
+
+@testset "categorical-simplex contract" begin
+    good = _categorical_plain_plan()
+    @test (validate_plan(good); true)
+    @test good.responses[1].n_levels == 3
+    @test (validate_plan(_categorical_plain_plan(; n_levels = 3)); true)
+    # K=1 infers from an all-first-level column.
+    cols1 = _leveled_columns(6)
+    cols1[:y] = ones(Int, 6)
+    one = _categorical_plain_plan(6; cols = cols1, alpha = [2.0])
+    @test (validate_plan(one); true)
+    @test one.vector_parameters[1].size == 1
+    # Categorical takes no trials / count columns / thresholds.
+    r = LikelihoodSpec(CategoricalFam, IdentityLink, :y, :s, nothing,
+        nothing, _none_evidence(), :y_resp, :N, nothing)
+    @test_throws ContractValidationError _categorical_plain_plan(; resp = r)
+    r = LikelihoodSpec(CategoricalFam, IdentityLink, :y, :s, nothing,
+        nothing, _none_evidence(), :y_resp, nothing, nothing;
+        count_columns = [:c2])
+    @test_throws ContractValidationError _categorical_plain_plan(; resp = r)
+end
+
+# Rebuild a bound plan with swapped vector parameters (structural mutants
+# that the builders cannot express).
+function _with_vectors(plan::StructuralPlan, vecs::Vector{VectorParameter})
+    return StructuralPlan(plan.responses, plan.predictors,
+        plan.population_priors, plan.parameters, plan.assignments,
+        plan.columns, plan.n_obs; vector_parameters = vecs)
+end
+
+@testset "vector parameters" begin
+    base = _ordered_plan()
+    # Unknown family / bad arity.
+    bad = _with_vectors(base, [VectorParameter(:y_cutpoints, :bogus,
+        (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints)])
+    @test_throws ContractValidationError validate_structure(bad)
+    bad = _with_vectors(base, [VectorParameter(:y_cutpoints, :ordered_normal,
+        (arg1 = 0.0,), nothing, :y_cutpoints)])
+    @test_throws ContractValidationError validate_structure(bad)
+    # Non-literal / non-positive threshold args.
+    bad = _with_vectors(base, [VectorParameter(:y_cutpoints, :ordered_normal,
+        (arg1 = :mu, arg2 = 1.0), nothing, :y_cutpoints)])
+    @test_throws ContractValidationError validate_structure(bad)
+    bad = _with_vectors(base, [VectorParameter(:y_cutpoints, :ordered_normal,
+        (arg1 = 0.0, arg2 = 0.0), nothing, :y_cutpoints)])
+    @test_throws ContractValidationError validate_structure(bad)
+    # Dirichlet: vector concentration, finite positive, size agreement.
+    @test_throws ContractValidationError _multinomial_plan(; alpha = :alpha_col)
+    @test_throws ContractValidationError _multinomial_plan(;
+        alpha = [1.0, 0.0, 2.0])
+    @test_throws ContractValidationError _multinomial_plan(;
+        alpha = [1.0, 1.0])
+    @test_throws ContractValidationError _multinomial_plan(; vecsize = 2)
+    # Unused / duplicate vector parameters.
+    orphan = _with_vectors(base, VectorParameter[
+        VectorParameter(:y_cutpoints, :ordered_normal,
+            (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints),
+        VectorParameter(:stray, :ordered_normal, (arg1 = 0.0, arg2 = 1.0),
+            nothing, :stray),
+    ])
+    @test_throws ContractValidationError validate_structure(orphan)
+    dup = _with_vectors(base, [VectorParameter(:y_cutpoints, :ordered_normal,
+            (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints),
+        VectorParameter(:y_cutpoints, :ordered_normal,
+            (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints)])
+    @test_throws ContractValidationError validate_structure(dup)
+    # A vector name colliding with a scalar parameter.
+    clash = StructuralPlan(base.responses, base.predictors,
+        base.population_priors,
+        [SampledParameter(:y_cutpoints, :normal, (arg1 = 0.0, arg2 = 1.0),
+            nothing, :y_cutpoints)],
+        base.assignments, base.columns, base.n_obs;
+        vector_parameters = base.vector_parameters)
+    @test_throws ContractValidationError validate_structure(clash)
+    # Sharing one thresholds vector across two responses fails closed.
+    r2 = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu, nothing,
+        nothing, _none_evidence(), :y_resp2, nothing, nothing;
+        thresholds = :y_cutpoints, n_levels = 3)
+    shared = StructuralPlan([base.responses[1], r2], base.predictors,
+        base.population_priors, base.parameters, base.assignments,
+        base.columns, base.n_obs;
+        vector_parameters = base.vector_parameters)
+    @test_throws ContractValidationError validate_structure(shared)
+    # Roles: count tails are responses, threshold design is predictor.
+    bound = _multinomial_plan()
+    @test bound.roles[:c1] === :response
+    @test bound.roles[:c2] === :response
+    @test bound.roles[:N] === :trials
+    good = _ordinal_plan(; structure = :stopping, vecfam = :vector_normal,
+        tcols = [:z1, :z2], coefs = :y_beta)
+    @test good.roles[:z1] === :predictor
+    @test good.roles[:z2] === :predictor
 end

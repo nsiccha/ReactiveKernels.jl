@@ -2139,3 +2139,207 @@ end
         _pcs(:(theta[i] ~ not_a_submodel(mu, tau)),
              :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M)
 end
+
+# ── Leveled responses (categorical / ordinal / multinomial) ─────────────
+# `y .~ CategoricalLogit.(eta_2, ..., eta_K)` (reference-coded multi-logit),
+# `y .~ OrderedLogistic.(eta)` (+ implicit ordered cutpoints),
+# `y .~ Ordinal.(Cumulative(), LogitLink(), eta)` (+ implicit thresholds),
+# `c1 .~ Multinomial.(N, s, c2, ..., cK)` and `y .~ Categorical.(s)` over an
+# explicit `s ~ Dirichlet(...)` simplex.
+
+@testset "surface categorical logit" begin
+    ast = Expr(:block,
+        :(eta2 = a2 .+ b2 .* x),
+        :(eta3 = a3 .+ b3 .* x),
+        :(y .~ CategoricalLogit.(eta2, eta3)))
+    plan = lower_rkppl(ast, (:y, :x))
+    r = only(plan.responses)
+    @test r.family === CategoricalLogitFam
+    @test r.link === LogitLink
+    @test r.predictor === :eta2
+    @test r.extra_predictors == [:eta3]
+    @test length(plan.predictors) == 2
+    # Inline etas synthesize indexed predictors.
+    inline = lower_rkppl(Expr(:block,
+            :(a2 ~ Normal(0, 1)), :(b2 ~ Normal(0, 2)),
+            :(a3 ~ Normal(0, 1)), :(b3 ~ Normal(0, 2)),
+            :(y .~ CategoricalLogit.(a2 .+ b2 .* x, a3 .+ b3 .* x))),
+        (:y, :x))
+    ri = only(inline.responses)
+    @test ri.predictor === :y_eta_1
+    @test ri.extra_predictors == [:y_eta_2]
+    # Bind + build + value roundtrip against a softmax oracle.
+    cols = Dict{Symbol,AbstractVector}(:y => [1, 2, 3, 2, 1, 3],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0])
+    bound = bind_data(plan, cols)
+    @test bound.responses[1].n_levels == 3
+    built = build_kernel(bound)
+    u = zeros(built.layout.total)
+    nt = constrain(built.layout, u)
+    etas = [Vector(getproperty(nt, p)) for p in (:eta2, :eta3)]
+    ll = 0.0
+    for (i, y) in enumerate(cols[:y])
+        v = [0.0, etas[1][1] + etas[1][2] * cols[:x][i],
+            etas[2][1] + etas[2][2] * cols[:x][i]]
+        m = maximum(v)
+        ll += logpdf(Categorical(exp.(v .- m) ./ sum(exp.(v .- m))), y)
+    end
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    # Zero etas is not a categorical.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        :(y .~ CategoricalLogit.())), (:y, :x))
+end
+
+@testset "surface ordered logistic" begin
+    ast = Expr(:block,
+        :(eta = a .+ b .* x),
+        :(y .~ OrderedLogistic.(eta)))
+    plan = lower_rkppl(ast, (:y, :x))
+    r = only(plan.responses)
+    @test r.family === OrderedLogisticFam
+    @test r.thresholds === :y_cutpoints
+    v = only(plan.vector_parameters)
+    @test v.name === :y_cutpoints && v.family === :ordered_normal
+    @test v.size === nothing # inferred at bind
+    @test collect(values(v.args)) == [0.0, 1.0]
+    # An explicit `y_cutpoints` definition collides loudly.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(y_cutpoints ~ Normal(0, 1)),
+            :(eta = a .+ b .* x),
+            :(y .~ OrderedLogistic.(eta))), (:y, :x))
+    # Arity is exactly one eta.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(eta = a .+ b .* x),
+            :(y .~ OrderedLogistic.(eta, eta))), (:y, :x))
+    # Bind + value roundtrip.
+    cols = Dict{Symbol,AbstractVector}(:y => [1, 2, 3, 2, 1, 3],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0])
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    u = [0.5, -0.25, 0.1, 0.3]
+    nt = constrain(built.layout, u)
+    b = Vector(nt.eta)
+    eta = b[1] .+ b[2] .* cols[:x]
+    t = Vector(nt.y_cutpoints)
+    σ(z) = 1 / (1 + exp(-z))
+    ll = sum(begin
+            Fhi = yv == 3 ? 1.0 : σ(t[yv] - e)
+            Flo = yv == 1 ? 0.0 : σ(t[yv-1] - e)
+            log(Fhi - Flo)
+        end for (yv, e) in zip(cols[:y], eta))
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+end
+
+@testset "surface ordinal" begin
+    ast = Expr(:block,
+        :(eta = b .* x),
+        :(y .~ Ordinal.(Cumulative(), LogitLink(), eta)))
+    plan = lower_rkppl(ast, (:y, :x))
+    r = only(plan.responses)
+    @test r.family === OrdinalFam
+    @test r.link === LogitLink
+    @test r.ordinal_structure === :cumulative
+    @test r.thresholds === :y_thresholds
+    @test only(plan.vector_parameters).family === :ordered_normal
+    stopping = lower_rkppl(Expr(:block,
+            :(eta = b .* x),
+            :(y .~ Ordinal.(StoppingRatio(), ProbitLink(), eta))), (:y, :x))
+    rs = only(stopping.responses)
+    @test rs.link === ProbitLink && rs.ordinal_structure === :stopping
+    @test only(stopping.vector_parameters).family === :vector_normal
+    clog = lower_rkppl(Expr(:block,
+            :(eta = b .* x),
+            :(y .~ Ordinal.(Cumulative(), CloglogLink(), eta))), (:y, :x))
+    @test only(clog.responses).link === CloglogLink
+    # Tag misspellings, wrong arity, and discrimination/adhoc extras fail.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(eta = b .* x),
+            :(y .~ Ordinal.(Cumulative(), eta))), (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(eta = b .* x),
+            :(y .~ Ordinal.(Cumulative(), LogitLink(), eta, 2.0))), (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(eta = b .* x),
+            :(y .~ Ordinal.(Sequential(), LogitLink(), eta))), (:y, :x))
+    # A fixed intercept is non-identifiable (plan validation agrees).
+    @test_throws ContractValidationError lower_rkppl(Expr(:block,
+            :(eta = a .+ b .* x),
+            :(y .~ Ordinal.(Cumulative(), LogitLink(), eta))), (:y, :x))
+end
+
+@testset "surface multinomial" begin
+    ast = Expr(:block,
+        :(s ~ Dirichlet([2.0, 2.0, 2.0])),
+        :(c1 .~ Multinomial.(N, s, c2, c3)))
+    plan = lower_rkppl(ast, (:c1, :c2, :c3, :N))
+    r = only(plan.responses)
+    @test r.family === MultinomialFam
+    @test r.link === IdentityLink
+    @test r.predictor === :s
+    @test r.count_columns == [:c2, :c3]
+    @test r.trials === :N
+    v = only(plan.vector_parameters)
+    @test v.family === :simplex_dirichlet
+    @test Vector{Float64}(v.args.arg1) == [2.0, 2.0, 2.0]
+    # Symmetric Dirichlet + literal trials + value roundtrip.
+    lit = lower_rkppl(Expr(:block,
+            :(s ~ Dirichlet(3, 1.0)),
+            :(c1 .~ Multinomial.(3, s, c2, c3))), (:c1, :c2, :c3))
+    @test only(lit.vector_parameters).args.arg1 == [1.0, 1.0, 1.0]
+    @test only(lit.responses).trials === 3
+    cols = Dict{Symbol,AbstractVector}(:c1 => [1, 1, 1, 0],
+        :c2 => [1, 1, 0, 2], :c3 => [1, 1, 2, 1])
+    bound = bind_data(lit, cols)
+    built = build_kernel(bound)
+    u = [0.2, 0.1]
+    p = Vector(constrain(built.layout, u).s)
+    ll = sum(logpdf(Multinomial(3, p), [a, b, c])
+        for (a, b, c) in zip(cols[:c1], cols[:c2], cols[:c3]))
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    # An undeclared simplex fails at plan validation (not silently).
+    @test_throws ContractValidationError lower_rkppl(Expr(:block,
+            :(c1 .~ Multinomial.(N, s, c2, c3))), (:c1, :c2, :c3, :N))
+    # Non-symbol probs and missing trials fail at lowering.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(s ~ Dirichlet(3, 1.0)),
+            :(c1 .~ Multinomial.(N, s .+ 1, c2, c3))), (:c1, :c2, :c3, :N))
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(s ~ Dirichlet(3, 1.0)),
+            :(c1 .~ Multinomial.(s))), (:c1, :c2, :c3, :N))
+end
+
+@testset "surface categorical simplex" begin
+    ast = Expr(:block,
+        :(s ~ Dirichlet(3, 1.0)),
+        :(y .~ Categorical.(s)))
+    plan = lower_rkppl(ast, (:y,))
+    r = only(plan.responses)
+    @test r.family === CategoricalFam
+    @test r.predictor === :s
+    @test only(plan.vector_parameters).family === :simplex_dirichlet
+    cols = Dict{Symbol,AbstractVector}(:y => [1, 2, 3, 2, 1])
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    u = [0.2, 0.1]
+    p = Vector(constrain(built.layout, u).s)
+    @test _query(built.spec, bound, :likelihood, u) ≈
+        sum(logpdf(Categorical(p), y) for y in cols[:y])
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(s ~ Dirichlet(3, 1.0)),
+            :(y .~ Categorical.(s, s))), (:y,))
+end
+
+@testset "surface dirichlet failures" begin
+    # Concentrations are literal hyperparameters (vector or symmetric).
+    for rhs in (:(Dirichlet()), :(Dirichlet([1.0, 2.0], 1.0)),
+            :(Dirichlet(alpha)), :(Dirichlet(0, 1.0)), :(Dirichlet([1.0, s])))
+        @test_throws SurfaceLoweringError lower_rkppl(
+            Expr(:block, Expr(:call, :~, :s, rhs),
+                :(y .~ Categorical.(s))), (:y,))
+    end
+    # A Dirichlet cannot shadow a predictor coefficient.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(s ~ Dirichlet(2, 1.0)),
+            :(eta = a .+ s .* x),
+            :(y .~ Normal.(eta, 1.0))), (:y, :x))
+end
