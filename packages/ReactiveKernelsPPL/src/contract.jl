@@ -63,7 +63,9 @@ end
 """Slice-1 predictor term kinds (core set; stretch adds variants later).
 `LatentTerm` carries a per-cell latent parameter vector (a [`PlateParameter`](@ref))
 as the whole linear predictor (`lp = theta`, identity design) — the
-random-effects / per-observation-latent location."""
+random-effects / per-observation-latent location. `ScanSummandTerm` splices a
+sequential-recurrence state into the predictor scaled by a sampled scalar
+coefficient (`u .* beta`, SB's `ar` latent path with its free `popefs` beta)."""
 @enum TermKind::UInt8 begin
     InterceptTerm
     ContinuousTerm
@@ -73,6 +75,7 @@ random-effects / per-observation-latent location."""
     RanefGatherTerm
     SplineSummandTerm
     HSGPSummandTerm
+    ScanSummandTerm
     MonotonicTerm
     MonotonicSummandTerm
 end
@@ -891,15 +894,17 @@ const TERM_NAMES = Dict{Symbol,TermKind}(
     :ranef_gather => RanefGatherTerm,
     :spline_summand => SplineSummandTerm,
     :hsgp_summand => HSGPSummandTerm,
+    :scan_summand => ScanSummandTerm,
     :monotonic => MonotonicTerm,
     :monotonic_summand => MonotonicSummandTerm,
 )
 
 """Allowlisted assignment functions (slice 1: scalar ops + whole-column
-reductions; elementwise math over columns deferred with vector assignments)."""
+reductions; elementwise math over columns deferred with vector assignments;
+the AR(1) slice adds `tanh` for the `phi = tanh(phi_raw)` stationarity map)."""
 const ASSIGNMENT_FNS = (
     :+, :-, :*, :/, :^,
-    :log, :log10, :log1p, :exp, :expm1, :sqrt, :abs,
+    :log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :tanh,
     :sum, :mean, :std, :var, :minimum, :maximum, :length,
 )
 
@@ -930,8 +935,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
-    RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm, MonotonicTerm,
-    MonotonicSummandTerm)
+    RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm, ScanSummandTerm,
+    MonotonicTerm, MonotonicSummandTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate):
 scalar/reduction vocabulary plus vector-returning whole-column functions."""
@@ -1973,6 +1978,19 @@ function _validate_name_tables(plan::StructuralPlan)
     return nothing
 end
 
+# A scan is non-centered when a step writes the carried state deterministically
+# (`state[loopvar] = ...`): the layout slice then holds the iid innovations
+# and the emitter reconstructs the state via the RK-core `scan(...)`
+# carry-fold. Otherwise (every step samples the state) the slice holds the
+# state itself (centered form).
+_is_noncentered_scan(s::ScanSpec) =
+    any(st -> st.kind === :assign && st.indexed, s.step)
+
+# In-graph name of a non-centered scan's innovation slice
+# (`_ppl_scan_z_<state>`). Reserved-prefix validation guarantees no user
+# name collides with it; the state name itself binds the reconstruction.
+_scan_innovation_name(s::ScanSpec) = Symbol(:_ppl_scan_z_, s.state)
+
 # Structural invariants of each sequential recurrence. The surface parser
 # (`parse_scan_block`) already enforces these; this is defense-in-depth for a
 # hand-built plan and the invariants the layout/emitter will rely on.
@@ -2683,6 +2701,10 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
         _validate_hsgp_term(t, pred)
         return nothing
     end
+    if t.kind === ScanSummandTerm
+        _validate_scan_term(t, pred, plan)
+        return nothing
+    end
     t.options == NamedTuple() ||
         _fail(t.label, "terms take no options (slice 1: factor sizing " *
                        "lives in LevelMap)")
@@ -2811,6 +2833,43 @@ function _validate_hsgp_term(t::TermSpec, pred::PredictorSpec)
     return nothing
 end
 
+# A scan summand names its recurrence (`scan_id`) and its sampled scalar
+# coefficient (`coef`) in `options` and carries no columns (the state is
+# sampled, not data); its addressee is its own label (self-addressed: the
+# coefficient's prior lives on the `SampledParameter`, not a population
+# prior). v1 admits Normal coefficients only (SB's `ar` beta is a Normal
+# `popefs` coefficient); centered and non-centered states both read.
+function _validate_scan_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    o = t.options
+    Tuple(keys(o)) == (:scan_id, :coef) ||
+        _fail(t.label, "scan summand options must be exactly " *
+              "`(scan_id, coef)`, got $(Tuple(keys(o)))")
+    o.scan_id isa Symbol ||
+        _fail(t.label, "scan summand scan_id must be a Symbol, " *
+              "got $(repr(o.scan_id))")
+    o.coef isa Symbol ||
+        _fail(t.label, "scan summand coef must be a Symbol, " *
+              "got $(repr(o.coef))")
+    isempty(t.columns) ||
+        _fail(t.label, "scan summand carries no columns (the state is " *
+              "sampled, not data), got $(t.columns)")
+    t.addressee === t.label ||
+        _fail(t.label, "scan summand addressee must be its own label " *
+              "(self-addressed, no population prior), got $(t.addressee)")
+    any(s -> s.state === o.scan_id, plan.scans) ||
+        _fail(t.label, "scan summand addresses unknown scan state " *
+              ":$(o.scan_id) (no such `@scan` block)")
+    i = findfirst(p -> p.name === o.coef, plan.parameters)
+    i === nothing &&
+        _fail(t.label, "scan summand coef :$(o.coef) must name a scalar " *
+              "sampled parameter (`$(o.coef) ~ Normal(...)`)")
+    plan.parameters[i].family === :normal ||
+        _fail(t.label, "scan summand coef :$(o.coef) must be Normal in v1 " *
+              "(SB's `ar` beta is a Normal population coefficient), got " *
+              ":$(plan.parameters[i].family)")
+    return nothing
+end
+
 function _validate_predictor_columns(plan::StructuralPlan)
     for pred in plan.predictors
         for t in pred.terms
@@ -2824,6 +2883,9 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
     # Latent terms name a per-cell latent VECTOR (a PlateParameter), not a
     # raw/derived data column; structure validation checked its presence.
     t.kind === LatentTerm && return nothing
+    # Scan summands name a recurrence + scalar coefficient in `options`, not
+    # columns; structure validation checked both names.
+    t.kind === ScanSummandTerm && return nothing
     for c in t.columns
         haskey(plan.columns, c) || _is_derived(plan, c) ||
             _fail(t.label, "term references missing column $c")
@@ -3039,7 +3101,7 @@ function _validate_priors(plan::StructuralPlan)
         addressees = Set{Symbol}(t.addressee for t in pred.terms
             if t.kind !== OffsetTerm && t.kind !== LatentTerm &&
                t.kind !== RanefGatherTerm && t.kind !== SplineSummandTerm &&
-               t.kind !== HSGPSummandTerm &&
+               t.kind !== HSGPSummandTerm && t.kind !== ScanSummandTerm &&
                t.kind !== MonotonicSummandTerm)
         any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
         for a in addressees

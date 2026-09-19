@@ -368,3 +368,276 @@ end
         Dict{Symbol,AbstractVector}(:y => zeros(3)), 3; scans = [ar1])
     @test_throws ContractValidationError validate_structure(bad)
 end
+
+# A non-centered AR(1) scan (SB-`ar` shape): `Normal(0, 1)` seed, one
+# `Normal(0, 1)` innovation sample, one deterministic carry write.
+_scan_ar_spec() = parse_scan_block(quote
+    u[1] ~ Normal(0, 1)
+    for t in 2:T
+        eps ~ Normal(0, 1)
+        u[t] = phi * u[t - 1] + eps
+    end
+end)
+
+# Hand-built bound plan: `y ~ Normal(a + beta_ar * u, sigma)` with a free
+# Normal `beta_ar` (summand options overridable for rejection tests).
+function _scan_ar_plan(scan; coef = :beta_ar, coef_family = :normal,
+        scan_id = :u, addressee = :scan_mu_u, columns = ColumnRef[],
+        options = nothing)
+    opts = options === nothing ? (scan_id = scan_id, coef = coef) : options
+    terms = TermSpec[
+        TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
+            :intercept),
+        TermSpec(ScanSummandTerm, columns, opts, addressee, :scan_mu_u)]
+    StructuralPlan(
+        [LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
+            ResponseEvidence(:none, nothing, nothing), :y_resp)],
+        [PredictorSpec(:mu, IdentityLink, terms, :mu)],
+        [PopulationPrior(:mu, :Intercept, 0.0, 1.0)],
+        [SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma),
+            SampledParameter(:phi, :normal, (arg1 = 0.0, arg2 = 1.0), nothing,
+                :phi),
+            SampledParameter(coef, coef_family, (arg1 = 0.0, arg2 = 2.0),
+                nothing, coef)],
+        AssignmentSpec[],
+        Dict{Symbol,AbstractVector}(:y => zeros(3)),
+        3;
+        scans = [scan],
+    )
+end
+
+@testset "scan summand: IR validation + design" begin
+    scan = _scan_ar_spec()
+    good = _scan_ar_plan(scan)
+    @test (validate_structure(good); true)
+    # the summand is self-addressed: no PopulationPrior for it (only the
+    # intercept prior is present, and validation passes)
+    @test length(good.population_priors) == 1
+
+    shape = design_shape(only(good.predictors), good.columns;
+        levelmaps = good.levelmaps)
+    @test shape.width == 1             # intercept only; the summand adds none
+    sblock = only(b for b in shape.blocks if b.kind === ScanSummandTerm)
+    @test sblock.width == 0 && isempty(sblock.labels)
+    @test sblock.column === :u
+
+    # hand-built IR emits (contract/generator agreement smoke)
+    @test build_kernel(good).layout.total == 1 + 3 + 3
+
+    bad_opts = [
+        ("unknown scan", (scan_id = :nope, coef = :beta_ar)),
+        ("unknown coef", (scan_id = :u, coef = :nope)),
+        ("wrong keys", (scan_id = :u,)) ,
+        ("swapped keys", (coef = :beta_ar, scan_id = :u)),
+    ]
+    for (what, opts) in bad_opts
+        @test_throws ContractValidationError validate_structure(
+            _scan_ar_plan(scan; options = opts))
+    end
+    # non-Normal coefficient (v1 admits SB's Normal `ar` beta only)
+    @test_throws ContractValidationError validate_structure(
+        _scan_ar_plan(scan; coef_family = :exponential))
+    # a computed scalar is not a sampled coefficient
+    p0 = _scan_ar_plan(scan)
+    params = filter(p -> p.name !== :beta_ar, p0.parameters)
+    p = StructuralPlan(p0.responses, p0.predictors, p0.population_priors,
+        params, [AssignmentSpec(:beta_ar, :(phi * phi), :beta_ar)],
+        p0.columns, p0.n_obs; scans = p0.scans)
+    @test_throws ContractValidationError validate_structure(p)
+    # summands carry no columns and are self-addressed
+    @test_throws ContractValidationError validate_structure(
+        _scan_ar_plan(scan; columns = [:u]))
+    @test_throws ContractValidationError validate_structure(
+        _scan_ar_plan(scan; addressee = :u))
+end
+
+@testset "non-centered layout: innovation slice" begin
+    scan = _scan_ar_spec()
+    lt = assign_layout(_scan_ar_plan(scan))
+    z = only(e for e in lt.entries if e.kind === :scan)
+    @test z.name === :_ppl_scan_z_u
+    @test z.size == 3 && z.transform === :identity
+    @test lt.total == 1 + 3 + 3   # mu_coef + phi/beta_ar/sigma + z[1..3]
+
+    u = collect(1.0:7.0)
+    nt = constrain(lt, u)
+    @test nt._ppl_scan_z_u == u[z.offset:(z.offset + 2)]
+    @test unconstrain(lt, nt) ≈ u
+    @test logjac(lt, u) == u[2]   # only sigma (:exp) contributes
+    names = coordinate_names(lt)
+    @test length(names) == lt.total
+    @test Symbol("_ppl_scan_z_u.1") in names
+
+    # centered and non-centered scans coexist: the centered slice keeps the
+    # state name, the non-centered one takes the innovation name
+    centered = parse_scan_block(quote
+        h[1] ~ Normal(0, 1)
+        for t in 2:T
+            h[t] ~ Normal(phi * h[t - 1], s)
+        end
+    end)
+    mixed = _scan_ar_plan(scan)
+    push!(mixed.scans, centered)
+    push!(mixed.parameters,
+        SampledParameter(:s, :exponential, (arg1 = 1.0,), nothing, :s))
+    lt2 = assign_layout(mixed)
+    kinds = Dict(e.name => e.size for e in lt2.entries if e.kind === :scan)
+    @test kinds == Dict(:_ppl_scan_z_u => 3, :h => 3)
+end
+
+@testset "scan summand: surface spelling + fail-closed" begin
+    plan = lower_rkppl(quote
+        phi_raw ~ Normal(0, 1)
+        beta_ar ~ Normal(0, 2)
+        a ~ Normal(0, 1)
+        sigma ~ Exponential(1)
+        @scan begin
+            u[1] ~ Normal(0, 1)
+            for t in 2:T
+                eps ~ Normal(0, 1)
+                u[t] = phi * u[t - 1] + eps
+            end
+        end
+        phi = tanh(phi_raw)
+        mu = a .+ beta_ar .* u
+        y .~ Normal.(mu, sigma)
+    end, (:y,))
+    terms = only(plan.predictors).terms
+    @test length(terms) == 2
+    st = terms[2]
+    @test st.kind === ScanSummandTerm
+    @test st.options == (scan_id = :u, coef = :beta_ar)
+    @test st.addressee === st.label === :scan_mu_u
+    @test isempty(st.columns)
+    # the coefficient is a sampled scalar, never a population prior
+    @test :beta_ar in [p.name for p in plan.parameters]
+    @test all(pr -> pr.addressee !== :beta_ar, plan.population_priors)
+    @test only(a for a in plan.assignments if a.name === :phi).expr ==
+        :(tanh(phi_raw))
+
+    reject(loc) = @test_throws SurfaceLoweringError lower_rkppl(quote
+        phi_raw ~ Normal(0, 1)
+        beta_ar ~ Normal(0, 2)
+        b ~ Normal(0, 1)
+        a ~ Normal(0, 1)
+        sigma ~ Exponential(1)
+        @scan begin
+            u[1] ~ Normal(0, 1)
+            for t in 2:T
+                eps ~ Normal(0, 1)
+                u[t] = phi * u[t - 1] + eps
+            end
+        end
+        phi = tanh(phi_raw)
+        $(loc)
+        y .~ Normal.(mu, sigma)
+    end, (:x, :y))
+    # bare scan state in a location (LP use needs `coef .* state`)
+    reject(:(mu = a .+ u))
+    # literal scaling (coefficient-free is the dar shape, not ar)
+    reject(:(mu = a .+ 2.0 .* u))
+    # data scaling (interactions are planned)
+    reject(:(mu = a .+ x .* u))
+    # computed-scalar scaling (computed coefficients are out of slice)
+    reject(:(mu = a .+ phi .* u))
+    # coefficient with no `~` statement
+    reject(:(mu = a .+ q .* u))
+    # one name as both a population coefficient and a scan coefficient
+    reject(:(mu = a .+ b .* x .+ b .* u))
+    # subtracted summand (additive only)
+    reject(:(mu = a .- beta_ar .* u))
+    # nested scan read (direct `coef .* state` only)
+    reject(:(mu = a .+ beta_ar .* (u .+ x)))
+    # scan-only predictor (a summand needs a sibling coefficient)
+    reject(:(mu = beta_ar .* u))
+end
+
+@testset "tanh assignment: scalar admitted, dotted rejected" begin
+    plan = lower_rkppl(quote
+        phi_raw ~ Normal(0, 1)
+        a ~ Normal(0, 1)
+        s ~ Normal(phi, 1.0)
+        sigma ~ Exponential(1)
+        phi = tanh(phi_raw)
+        mu = a
+        y .~ Normal.(mu, sigma)
+    end, (:y,))
+    @test only(a for a in plan.assignments if a.name === :phi).expr ==
+        :(tanh(phi_raw))
+    @test (validate_structure(plan); true)
+    # dotted `tanh.` stays fail-closed (scalar vocabulary only in v1)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        sigma ~ Exponential(1)
+        w = tanh.(x)
+        mu = a .+ w
+        y .~ Normal.(mu, sigma)
+    end, (:x, :y))
+end
+
+@testset "non-centered emission: fail-closed shapes" begin
+    # each model parses (the parser admits any step shape) but refuses to emit
+    scan_block(stmts...) = Expr(:macrocall, Symbol("@scan"),
+        LineNumberNode(1), Expr(:block, stmts...))
+    build_block(stmts...) = build_kernel(bind_data(
+        lower_rkppl(Expr(:block,
+            :(phi ~ Normal(0, 1)),
+            :(a ~ Normal(0, 1)),
+            :(b ~ Normal(0, 1)),
+            :(s ~ Exponential(1)),
+            :(sigma ~ Exponential(1)),
+            scan_block(stmts...),
+            :(y .~ Normal.(h, sigma))), (:y,)),
+        Dict{Symbol,AbstractVector}(:y => [0.1, 0.2, 0.3])))
+    # three steps (v1: one innovation sample + one carry write)
+    @test_throws ContractValidationError build_block(
+        :(h[1] ~ Normal(0, 1)),
+        :(for t in 2:T
+            eps ~ Normal(0, 1)
+            eps2 ~ Normal(0, 1)
+            h[t] = phi * h[t - 1] + eps + eps2
+        end))
+    # non-Normal innovation
+    @test_throws ContractValidationError build_block(
+        :(h[1] ~ Normal(0, 1)),
+        :(for t in 2:T
+            eps ~ Exponential(1)
+            h[t] = phi * h[t - 1] + eps
+        end))
+    # non-Normal seed
+    @test_throws ContractValidationError build_block(
+        :(h[1] ~ Exponential(1)),
+        :(for t in 2:T
+            eps ~ Normal(0, 1)
+            h[t] = phi * h[t - 1] + eps
+        end))
+    # AR(2) lag (tuple carry planned)
+    @test_throws ContractValidationError build_block(
+        :(h[1] ~ Normal(0, 1)),
+        :(h[2] ~ Normal(0, 1)),
+        :(for t in 3:T
+            eps ~ Normal(0, 1)
+            h[t] = a * h[t - 1] + b * h[t - 2] + eps
+        end))
+    # carry write before the innovation sample
+    @test_throws ContractValidationError build_block(
+        :(h[1] ~ Normal(0, 1)),
+        :(for t in 2:T
+            h[t] = phi * h[t - 1] + eps
+            eps ~ Normal(0, 1)
+        end))
+    # unknown leaf in the carry write
+    @test_throws ContractValidationError build_block(
+        :(h[1] ~ Normal(0, 1)),
+        :(for t in 2:T
+            eps ~ Normal(0, 1)
+            h[t] = nosuch * h[t - 1] + eps
+        end))
+    # loop-index leaf in the carry write
+    @test_throws ContractValidationError build_block(
+        :(h[1] ~ Normal(0, 1)),
+        :(for t in 2:T
+            eps ~ Normal(0, 1)
+            h[t] = phi * h[t - 1] + eps * t
+        end))
+end

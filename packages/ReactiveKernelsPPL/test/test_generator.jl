@@ -930,7 +930,10 @@ end
     @test _query(b2.spec, p2, :posterior, u2) ≈ ar2_oracle(u2, y2)
     _check_gradient(b2.spec, p2, u2)
 
-    # non-centered recurrence is rejected at emission (slice 1)
+    # non-centered recurrence emits via the RK-core `scan(...)` carry-fold
+    # (AR(1) slice): the layout slice holds the iid innovations, the state
+    # reconstructs in-graph, and the density is the innovation prior. The
+    # scaled step (`s * eps`) exercises multi-`Ref` threading.
     mnc = @rkppl begin
         phi ~ Normal(0, 1)
         s ~ Exponential(1)
@@ -944,7 +947,84 @@ end
         end
         y .~ Normal.(h, sigma)
     end
-    @test_throws ContractValidationError build_kernel(mnc(; y = ydata))
+    pnc = mnc(; y = ydata)
+    bnc = build_kernel(pnc)
+    @test bnc.layout.total == 3 + length(ydata)   # phi, s, sigma, z[1..5]
+    @test only(e for e in bnc.layout.entries if e.kind === :scan).name ===
+        :_ppl_scan_z_h
+    function nc_oracle(u, y)
+        T = length(y)
+        phi = u[1]; s = exp(u[2]); sigma = exp(u[3]); z = u[4:(4 + T - 1)]
+        h = Vector{Float64}(undef, T)
+        h[1] = z[1]
+        for t in 2:T
+            h[t] = phi * h[t - 1] + s * z[t]
+        end
+        lp = logpdf(Normal(0, 1), phi) + logpdf(Exponential(1), s) +
+             logpdf(Exponential(1), sigma) +
+             sum(logpdf(Normal(0, 1), zt) for zt in z) +
+             sum(logpdf(Normal(h[t], sigma), y[t]) for t in 1:T)
+        return lp + u[2] + u[3]
+    end
+    unc = [0.3, -0.2, -0.1, 0.1, 0.25, -0.15, 0.05, -0.3]
+    @test _query(bnc.spec, pnc, :posterior, unc) ≈ nc_oracle(unc, ydata)
+    _check_gradient(bnc.spec, pnc, unc)
+end
+
+@testset "scan: SB-ar latent path end to end (non-centered + LP summand)" begin
+    # SB `_sb_ar1` mirror: `phi_raw ~ std_normal`, `phi = tanh(phi_raw)`,
+    # `epsilon ~ std_normal`, `u[1] = eps[1]`, `u[t] = phi*u[t-1] + eps[t]`,
+    # with the path taking a free Normal beta in the linear predictor.
+    m = @rkppl begin
+        phi_raw ~ Normal(0, 1)
+        beta_ar ~ Normal(0, 2)
+        a ~ Normal(0, 1)
+        sigma ~ Exponential(1)
+        @scan begin
+            u[1] ~ Normal(0, 1)
+            for t in 2:T
+                eps ~ Normal(0, 1)
+                u[t] = phi * u[t - 1] + eps
+            end
+        end
+        phi = tanh(phi_raw)
+        mu = a .+ beta_ar .* u
+        y .~ Normal.(mu, sigma)
+    end
+    ydata = [0.3, -0.1, 0.5, 0.2, -0.4]
+    plan = m(; y = ydata)
+    @test only(plan.predictors).terms[2].kind === ScanSummandTerm
+    built = build_kernel(plan)
+    # mu_coef(a) + phi_raw + beta_ar + sigma + z[1..5]
+    @test built.layout.total == 4 + length(ydata)
+
+    # independent oracle: SB `ar1_recurse` ported line-for-line, priors and
+    # likelihood via Distributions.jl (never the emitted forms)
+    function ar_oracle(u, y)
+        T = length(y)
+        aa = u[1]
+        phi_raw = u[2]; beta = u[3]; lsig = u[4]
+        z = u[5:(5 + T - 1)]
+        phi = tanh(phi_raw)
+        sigma = exp(lsig)
+        uu = Vector{Float64}(undef, T)
+        uu[1] = z[1]
+        for t in 2:T
+            uu[t] = phi * uu[t - 1] + z[t]
+        end
+        mu = aa .+ beta .* uu
+        lp = logpdf(Normal(0, 1), aa) + logpdf(Normal(0, 1), phi_raw) +
+             logpdf(Normal(0, 2), beta) + logpdf(Exponential(1), sigma) +
+             sum(logpdf(Normal(0, 1), zt) for zt in z) +
+             sum(logpdf(Normal(mu[t], sigma), y[t]) for t in 1:T)
+        return lp + lsig
+    end
+
+    for u in ([0.1, 0.3, 0.5, -0.4, 0.2, -0.1, 0.4, 0.0, 0.15],
+              [-0.2, -0.6, 1.1, 0.3, -0.4, 0.2, -0.3, 0.1, 0.0])
+        @test _query(built.spec, plan, :posterior, u) ≈ ar_oracle(u, ydata)
+        _check_gradient(built.spec, plan, u)
+    end
 end
 
 function _gen_bernoulli_probit_plan(y)

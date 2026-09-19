@@ -51,6 +51,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _assignment_statements(plan))
     append!(stmts, preprocessing_recipes(plan))
     append!(stmts, _ranef_statements(plan))
+    append!(stmts, _scan_reconstruction_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _likelihood_statements(plan))
     append!(stmts, _prior_statements(plan, layout))
@@ -159,6 +160,13 @@ function _predictor_statements(plan::StructuralPlan)
             t.kind === RanefGatherTerm &&
                 push!(terms, _ranef_gather_expr(plan, pred, t))
         end
+        # A scan summand contributes its state's direct scaled expression
+        # (`state .* coef`, SB's `ar` latent path with its free beta),
+        # resolved from the TERMS like a gather.
+        for t in pred.terms
+            t.kind === ScanSummandTerm &&
+                push!(terms, _scan_summand_expr(plan, pred, t))
+        end
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
         rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
@@ -238,6 +246,20 @@ function _spline_summand_expr(plan::StructuralPlan, id::Symbol)
         end
     end
     return foldl((a, b) -> :($a .+ $b), parts)
+end
+
+# One scan summand's direct expression (`state .* coef`, explicit dotted
+# form): the in-graph recurrence state scaled by its sampled scalar
+# coefficient. Both names resolve from the term's options (validated
+# up front; the lookups below are loud defense in depth).
+function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
+    o = t.options
+    any(s -> s.state === o.scan_id, plan.scans) || throw(ContractValidationError(
+        "[generator] scan summand in predictor $(pred.name) addresses " *
+        "unknown scan :$(o.scan_id)"))
+    any(p -> p.name === o.coef, plan.parameters) || throw(ContractValidationError(
+        "[generator] scan summand coef :$(o.coef) is not a sampled parameter"))
+    return Expr(:call, :.*, o.scan_id, o.coef)
 end
 
 # Group-index encoder nodes, one per grouped column (`_ppl_gidx_<group>`):
@@ -1371,21 +1393,169 @@ function _subst_syms(ex, map::Dict{Symbol,Symbol})
     return Expr(ex.head, (_subst_syms(a, map) for a in ex.args)...)
 end
 
+# --- Non-centered scan reconstruction (AR(1) slice) ---
+
+# v1 admission for a non-centered scan: exactly one `Normal(0, 1)` seed (the
+# first innovation), exactly two steps (one non-indexed `Normal(0, 1)`
+# innovation sample + the indexed deterministic carry write), lag 1.
+# Returns (innovation_symbol, carry_write_expr); anything else throws
+# `ContractValidationError` naming the admitted shape.
+function _scan_noncentered_form(s::ScanSpec)
+    where = "[generator] scan $(s.state)"
+    _scan_stdnormal_seed(s) || throw(ContractValidationError(
+        "$where: non-centered v1 needs exactly one `Normal(0, 1)` seed " *
+        "(the first innovation)"))
+    length(s.step) == 2 || throw(ContractValidationError(
+        "$where: non-centered v1 needs exactly one innovation sample + " *
+        "one carry write, got $(length(s.step)) steps"))
+    first, second = s.step[1], s.step[2]
+    (first.kind === :sample && !first.indexed) || throw(ContractValidationError(
+        "$where: the innovation sample must precede the carry write " *
+        "(`eps ~ Normal(0, 1)` then `$(s.state)[$(s.loopvar)] = ...`)"))
+    _is_unit_normal(first.family, first.args) || throw(ContractValidationError(
+        "$where: the innovation `$(first.target)` must be `Normal(0, 1)` in v1"))
+    (second.kind === :assign && second.indexed) || throw(ContractValidationError(
+        "$where: the second step must be the deterministic carry write " *
+        "`$(s.state)[$(s.loopvar)] = ...`"))
+    s.maxlag == 1 || throw(ContractValidationError(
+        "$where: non-centered AR(p > 1) needs a tuple carry (planned)"))
+    return first.target, second.expr
+end
+
+_scan_stdnormal_seed(s::ScanSpec) =
+    length(s.setup) == 1 && _is_unit_normal(s.setup[1].family, s.setup[1].args)
+
+_is_unit_normal(family, args) =
+    family === :normal && length(args) == 2 &&
+    args[1] isa Real && args[1] == 0 && args[2] isa Real && args[2] == 1
+
+# Translate a v1 carry-write RHS into the `scan(...)` step body: the lag-1
+# carried read becomes the carry do-var, the bare innovation becomes the
+# step-element do-var, and every other leaf must be a scalar parameter or
+# assignment name (threaded as a `Ref`). Returns (translated_expr,
+# sorted_refs). The contract never inspects step RHSs, so these leaves are
+# the only screen for hand-built plans — everything else fails closed.
+function _scan_step_body(s::ScanSpec, eps::Symbol, ex, scalars)
+    refs = Set{Symbol}()
+    body = _scan_translate_step(ex, s, eps, :_ppl_carry, :_ppl_elem, refs,
+        scalars)
+    return body, sort!(collect(refs))
+end
+
+function _scan_translate_step(ex, s::ScanSpec, eps::Symbol, carry::Symbol,
+        elem::Symbol, refs::Set{Symbol}, scalars)
+    if ex isa Symbol
+        ex === eps && return elem
+        ex === s.loopvar && throw(ContractValidationError(
+            "[generator] scan $(s.state): the carry write uses the loop index " *
+            "`$(s.loopvar)` directly — not supported in v1"))
+        ex === s.state && throw(ContractValidationError(
+            "[generator] scan $(s.state): bare read of the carried state — " *
+            "read the backward lag `$(s.state)[$(s.loopvar) - 1]`"))
+        ex in scalars || throw(ContractValidationError(
+            "[generator] scan $(s.state): step leaf `$(ex)` is not a scalar " *
+            "parameter or assignment (data-varying steps are planned)"))
+        push!(refs, ex)
+        return ex
+    end
+    ex isa Expr || return ex
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] === s.state
+        _scan_assert_lag1(ex.args[2], s)
+        return carry
+    end
+    if ex.head === :ref
+        throw(ContractValidationError(
+            "[generator] scan $(s.state): indexed read `$(ex.args[1])[...]` " *
+            "in the carry write — v1 threads only the carried lag-1"))
+    end
+    args = ex.head === :call ? ex.args[2:end] : ex.args
+    newargs = [_scan_translate_step(a, s, eps, carry, elem, refs, scalars)
+        for a in args]
+    return ex.head === :call ?
+        Expr(:call, ex.args[1], newargs...) : Expr(ex.head, newargs...)
+end
+
+function _scan_assert_lag1(idx, s::ScanSpec)
+    idx isa Expr && idx.head === :call && length(idx.args) == 3 &&
+        idx.args[1] === :- && idx.args[2] === s.loopvar &&
+        idx.args[3] isa Int && idx.args[3] == 1 && return nothing
+    throw(ContractValidationError(
+        "[generator] scan $(s.state): the carry write must read exactly " *
+        "`$(s.state)[$(s.loopvar) - 1]` in v1"))
+end
+
+# Reconstruction statements for every non-centered scan, in plan order:
+# the seed innovation heads the state, the tail folds over the rest —
+#   `rest = scan(view(z, 2:T), Ref(params)...; init = z[1]) do ... end`
+#   `state = vcat(z[1], rest)`
+# The split is load-bearing: a uniform scan from a zero carry would scale
+# the seed (`h[1] = s*z[1]` under `phi*carry + s*eps`), contradicting the
+# declared `Normal(0, 1)` seed — while the split reproduces SB's
+# `ar1_recurse` (`u[1] = eps[1]`) under ANY step formula. Runs before
+# predictors/likelihood (both may read the state); the innovation prior
+# stays in `_scan_prior_statements` (order-free).
+function _scan_reconstruction_statements(plan::StructuralPlan,
+        layout::LayoutTable)
+    stmts = Expr[]
+    scalars = _union_names(plan)
+    for s in plan.scans
+        _is_noncentered_scan(s) || continue
+        eps, expr = _scan_noncentered_form(s)
+        zname = _scan_innovation_name(s)
+        entry = only(e for e in layout.entries
+            if e.kind === :scan && e.name === zname)
+        T = entry.size
+        body, refs = _scan_step_body(s, eps, expr, scalars)
+        next = :_ppl_next
+        lambda = Expr(:->, Expr(:tuple, :_ppl_carry, :_ppl_elem, refs...),
+            Expr(:block, :($next = $body), :(($next, $next))))
+        kw = Expr(:parameters, Expr(:kw, :init, :($(zname)[1])))
+        call = Expr(:call, :scan, kw, :(view($zname, 2:$T)),
+            (:(Ref($r)) for r in refs)...)
+        rest = Symbol(:_ppl_scan_rest_, s.state)
+        push!(stmts, :($rest = $(Expr(:do, call, lambda))))
+        push!(stmts, :($(s.state) = vcat($(zname)[1], $rest)))
+    end
+    return stmts
+end
+
+# The non-centered innovation prior: the iid `Normal(0, 1)` plate-vector
+# prior shape over the `_ppl_scan_z_<state>` slice (one cell per step, same
+# `_plate_sum_stmts` reduction the `PlateParameter` path uses), totalled
+# under the scan-flavored `_ppl_scan_<state>` node.
+function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
+        s::ScanSpec)
+    _scan_noncentered_form(s)    # fail closed unless the v1 shape holds
+    zname = _scan_innovation_name(s)
+    cell = _family_logpdf_expr(:normal, Any[0, 1], _dovar(1))
+    node = Symbol(:_ppl_scan_, s.state)
+    pw = Symbol(:_ppl_scan_pw_, s.state)
+    append!(stmts, _plate_sum_stmts(pw, node, Any[zname], cell))
+    push!(nodes, node)
+    return nothing
+end
+
 # Prior-density statements for every scan plus the total-node names to add to
-# the prior sum. Slice-1 CENTERED only: the recurrence body is exactly one
-# indexed `~` of the carried state (`state[t] ~ dist`); the density is the seed
-# term(s) plus a plate over aligned lagged slices (the recurrence factorizes
-# given the state). Non-centered (reconstruction via RK-core `scan(...)`) is
-# a follow-up.
+# the prior sum. Centered: the recurrence body is exactly one indexed `~` of
+# the carried state (`state[t] ~ dist`); the density is the seed term(s) plus
+# a plate over aligned lagged slices (the recurrence factorizes given the
+# state). Non-centered: the iid-innovation prior over the `_ppl_scan_z_`
+# slice (the plate-vector prior shape), with the state reconstructed in
+# `_scan_reconstruction_statements`.
 function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
     stmts = Expr[]
     nodes = Symbol[]
     for s in plan.scans
+        if _is_noncentered_scan(s)
+            _scan_noncentered_prior!(stmts, nodes, s)
+            continue
+        end
         (length(s.step) == 1 && s.step[1].kind === :sample &&
          s.step[1].indexed && s.step[1].target === s.state) || throw(
             ContractValidationError("[generator] scan $(s.state): only centered " *
-                "recurrences (`$(s.state)[$(s.loopvar)] ~ dist`) emit in slice 1 " *
-                "(non-centered reconstruction is planned)"))
+                "recurrences (`$(s.state)[$(s.loopvar)] ~ dist`) and v1 " *
+                "non-centered recurrences (one innovation sample + one carry " *
+                "write) emit"))
         step = s.step[1]
         entry = only(e for e in layout.entries
                      if e.kind === :scan && e.name === s.state)
