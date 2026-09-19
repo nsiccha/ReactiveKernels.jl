@@ -72,6 +72,7 @@ using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
     beta, inverse_gamma, binomial, negative_binomial2
+using SpecialFunctions: erfc
 # Selective (explicit imports win over any re-export chain, so no `using`
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
 # names in the assignment allowlist.
@@ -169,6 +170,16 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _nb2_plate_stmts(r, plan, node, pw)
     elseif r.family === GammaLogFam
         return _gamma_plate_stmts(r, plan, node, pw)
+    elseif r.family === BernoulliProbitFam
+        return _bernoulli_probit_plate_stmts(r, plan, node, pw)
+    elseif r.family === BernoulliCloglogFam
+        return _bernoulli_cloglog_plate_stmts(r, plan, node, pw)
+    elseif r.family === BinomialProbitFam
+        return _binomial_probit_plate_stmts(r, plan, node, pw)
+    elseif r.family === BinomialCloglogFam
+        return _binomial_cloglog_plate_stmts(r, plan, node, pw)
+    elseif r.family === BetaLogitFam
+        return _beta_plate_stmts(r, plan, node, pw)
     else
         throw(ContractValidationError(
             "[generator] response family $(r.family) has no emitter"))
@@ -388,6 +399,113 @@ function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbo
         cell = :($wv * $cell)
     end
     return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+_prob_name(label::Symbol) = Symbol(:_ppl_p_, label)
+_logitp_name(label::Symbol) = Symbol(:_ppl_logitp_, label)
+_shape_a_name(label::Symbol) = Symbol(:_ppl_a_, label)
+_shape_b_name(label::Symbol) = Symbol(:_ppl_b_, label)
+
+# Bernoulli probit: Phi precompute as pure Base arithmetic (Gamma-pre
+# pattern). Phi is 0.5*erfc(-z/sqrt(2)), exactly the `standard_normal.cdf`
+# formula — inlined rather than broadcast through the endpoint object
+# because Enzyme cannot differentiate the object-broadcast (runtime
+# activity on the const kernel object). Positional-p cell (primary form).
+function _bernoulli_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    p = _prob_name(r.label)
+    pre = :($p = 0.5 .* erfc.(-$lp ./ sqrt(2)))
+    inputs = Any[y, p]
+    yv, pv = _dovar(1), _dovar(2)
+    col = plan.columns[y]
+    yref = eltype(col) === Bool ? yv : :($yv != 0)
+    cell = :(bernoulli($pv).logpdf($yref))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Bernoulli cloglog: pure-arithmetic p precompute, positional-p cell.
+function _bernoulli_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    p = _prob_name(r.label)
+    pre = :($p = 1 .- exp.(-exp.($lp)))
+    inputs = Any[y, p]
+    yv, pv = _dovar(1), _dovar(2)
+    col = plan.columns[y]
+    yref = eltype(col) === Bool ? yv : :($yv != 0)
+    cell = :(bernoulli($pv).logpdf($yref))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Binomial probit/cloglog: precompute p, then logit(p), and reuse the
+# proven logit route — the binomial kernel's p port is unverified, while
+# the (:n, :logit) route is what slice-1 Binomial emits.
+function _binomial_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    p = _prob_name(r.label)
+    logitp = _logitp_name(r.label)
+    inputs = Any[y, logitp]
+    yv, lpv = _dovar(1), _dovar(2)
+    nref = _thread_ref!(inputs, r.trials, true)
+    cell = :(binomial(; n = $nref, logit = $lpv).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[:($p = 0.5 .* erfc.(-$lp ./ sqrt(2))),
+        :($logitp = log.($p) .- log1p.(-$p)),
+        _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+function _binomial_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    p = _prob_name(r.label)
+    logitp = _logitp_name(r.label)
+    inputs = Any[y, logitp]
+    yv, lpv = _dovar(1), _dovar(2)
+    nref = _thread_ref!(inputs, r.trials, true)
+    cell = :(binomial(; n = $nref, logit = $lpv).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[:($p = 1 .- exp.(-exp.($lp))),
+        :($logitp = log.($p) .- log1p.(-$p)),
+        _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Beta mean-concentration: mu/a/b precomputes (Gamma-pre pattern), kappa
+# by name (Symbol) or inlined (literal); cell needs only (y, a, b), so
+# kappa is never a plate input. Positional beta cell (primary form).
+function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    k = r.scale isa Symbol ? r.scale : Float64(r.scale)
+    mu = _mu_name(r.label)
+    a = _shape_a_name(r.label)
+    b = _shape_b_name(r.label)
+    inputs = Any[y, a, b]
+    yv, avv, bvv = _dovar(1), _dovar(2), _dovar(3)
+    cell = :(beta($avv, $bvv).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[:($mu = 1 ./ (1 .+ exp.(-$lp))),
+        :($a = $mu .* $k),
+        :($b = (1 .- $mu) .* $k),
+        _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable)

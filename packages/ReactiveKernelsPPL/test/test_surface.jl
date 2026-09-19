@@ -214,6 +214,135 @@ end
     _check_gradient(built.spec, bound, u3)
 end
 
+@testset "surface roundtrip slice-2 links+beta end to end" begin
+    cols, _ = _gen_columns()
+    # Bernoulli probit.
+    m = @rkppl begin
+        eta = a .+ b .* x
+        y .~ Bernoulli.(probit.(eta))
+    end
+    yb = repeat([false, true], 3)
+    bound = m(; y = yb, x = cols[:x])
+    built = build_kernel(bound)
+    u = [0.25, 0.5]
+    nt = constrain(built.layout, u)
+    eta = nt.eta[1] .+ nt.eta[2] .* cols[:x]
+    ll = sum(logpdf.(Bernoulli.(cdf.(Ref(Normal()), eta)), yb))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    # Bernoulli cloglog.
+    m = @rkppl begin
+        eta = a .+ b .* x
+        y .~ Bernoulli.(cloglog.(eta))
+    end
+    bound = m(; y = yb, x = cols[:x])
+    built = build_kernel(bound)
+    nt = constrain(built.layout, u)
+    eta = nt.eta[1] .+ nt.eta[2] .* cols[:x]
+    ll = sum(logpdf.(Bernoulli.(1 .- exp.(-exp.(eta))), yb))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    # Binomial probit, column trials.
+    m = @rkppl begin
+        mu = a .+ b .* x
+        y .~ Binomial.(n, probit.(mu))
+    end
+    cols[:y] = [1, 0, 2, 1, 3, 2]
+    cols[:n] = [3, 2, 4, 3, 5, 4]
+    bound = m(; y = cols[:y], x = cols[:x], n = cols[:n])
+    built = build_kernel(bound)
+    nt = constrain(built.layout, u)
+    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    ll = sum(logpdf.(Binomial.(cols[:n], cdf.(Ref(Normal()), eta)), cols[:y]))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    # Binomial cloglog, literal trials.
+    m = @rkppl begin
+        mu = a .+ b .* x
+        y .~ Binomial.(5, cloglog.(mu))
+    end
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    nt = constrain(built.layout, u)
+    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    ll = sum(logpdf.(Binomial.(5, 1 .- exp.(-exp.(eta))), cols[:y]))
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    # Beta, logit mu + kappa concentration.
+    m = @rkppl begin
+        kappa ~ Gamma(2.0, 1000.0)
+        mu = a .+ b .* x
+        p .~ Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)
+    end
+    cols[:p] = [0.2, 0.7, 0.4, 0.6, 0.3, 0.8]
+    bound = m(; p = cols[:p], x = cols[:x])
+    built = build_kernel(bound)
+    u3 = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u3)
+    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    mloc = 1 ./ (1 .+ exp.(-eta))
+    ll = sum(logpdf.(Beta.(mloc .* nt.kappa, (1 .- mloc) .* nt.kappa), cols[:p]))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
+        logpdf(Gamma(2.0, 1000.0), nt.kappa)
+    @test _query(built.spec, bound, :posterior, u3) ≈ ll + pr + u3[3]
+    _check_gradient(built.spec, bound, u3)
+end
+
+@testset "slice-2 response failures" begin
+    Dn2 = (:y, :x)
+    Dp2 = (:p, :x)
+    Dn3 = (:y, :x, :n)
+    # Beta: mismatched kappa across the two positions.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        kappa ~ Gamma(2.0, 1000.0)
+        kappa2 ~ Gamma(2.0, 1000.0)
+        mu = a .+ b .* x
+        p .~ Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa2)
+    end, Dp2)
+    # Beta: mismatched mu expressions.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        kappa ~ Gamma(2.0, 1000.0)
+        mu = a .+ b .* x
+        mu2 = a .+ b .* x
+        p .~ Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu2)) .* kappa)
+    end, Dp2)
+    # Beta: mu link is logistic only in slice 2.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        kappa ~ Gamma(2.0, 1000.0)
+        mu = a .+ b .* x
+        p .~ Beta.(probit.(mu) .* kappa, (1 .- probit.(mu)) .* kappa)
+    end, Dp2)
+    # Beta: canonical argument order only.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        kappa ~ Gamma(2.0, 1000.0)
+        mu = a .+ b .* x
+        p .~ Beta.((1 .- logistic.(mu)) .* kappa, logistic.(mu) .* kappa)
+    end, Dp2)
+    # Unknown link wrapper.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ Bernoulli.(foo.(eta))
+    end, Dn2)
+    # Inline cloglog is not a recognized wrapper (surv_disc shape stays out).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ Bernoulli.(1 .- exp.(-exp.(eta)))
+    end, Dn2)
+    # Poisson keeps its exp link.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ Poisson.(probit.(eta))
+    end, Dn2)
+    # Binomial probit still needs trials.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Binomial.(probit.(mu))
+    end, Dn3)
+end
+
 @testset "slice-1 response failures" begin
     Dn2 = (:y, :x)
     Dn3 = (:y, :x, :n)
