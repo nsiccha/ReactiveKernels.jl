@@ -1,11 +1,15 @@
-# In-graph preprocessing recipes (D5a): named data-only nodes.
+# In-graph preprocessing recipes (D5a): named recipe nodes (design/offset
+# recipes are data-only; monotonic contrasts read layout elements).
 #
 # Slice 1 builds one design matrix per predictor plus one offset vector
-# (when offset terms exist) from bound raw columns. All recipe names carry
-# the reserved `_ppl_` prefix, so the contract's reserved-prefix validation
-# guarantees they collide with nothing. Inputs are all bound, so `bound=`
-# partial evaluation folds every recipe to a compile-time constant —
-# exactly the brm_hsgp.jl basis pattern. Assumes `validate_plan` passed.
+# (when offset terms exist) from bound raw columns, plus one monotonic
+# contrast per `mo`/`mo1` term (the only parameter-dependent recipes —
+# everything else folds under `bound=`). All recipe names carry the
+# reserved `_ppl_` prefix, so the contract's reserved-prefix validation
+# guarantees they collide with nothing. Design/offset inputs are all
+# bound, so `bound=` partial evaluation folds those recipes to
+# compile-time constants — exactly the brm_hsgp.jl basis pattern.
+# Assumes `validate_plan` passed.
 
 using LinearAlgebra: Diagonal, Symmetric, eigen, norm, nullspace
 
@@ -241,15 +245,60 @@ design_name(predictor::Symbol) = Symbol(:_ppl_design_, predictor)
 """Offset-vector recipe name for a predictor (`mu` → `_ppl_offset_mu`)."""
 offset_name(predictor::Symbol) = Symbol(:_ppl_offset_, predictor)
 
+"""Monotonic-contrast recipe name for an increments simplex (`s` → `_ppl_mo_s`)."""
+monotonic_name(increments::Symbol) = Symbol(:_ppl_mo_, increments)
+
+# Cumulative-contrast temporary for level j (`_ppl_mo_cum_s_1 == 0.0`,
+# `_ppl_mo_cum_s_j = cum_(j-1) + s_(j-1)`): the in-graph `cumsum([0; incr])`.
+_monotonic_cum_name(increments::Symbol, j::Int) =
+    Symbol(:_ppl_mo_cum_, increments, :_, j)
+
+"""
+    monotonic_recipe(increments, idx, K) -> Vector{Expr}
+
+The SB `_sb_mo` level-gather recipe for one increments simplex:
+`cumsum([0; incr])[idx]` from the bound index column `idx` (integer codes
+1..K), where the K−1 increments are the `_ppl_v_` layout elements of the
+`increments` simplex. Cumulative level temps mirror the `cumsum`
+(`_ppl_mo_cum_s_1 = 0.0`, each later level adds one increment); the gather
+is an indicator sum over levels 2..K (level 1 contributes 0 by
+construction), the vectorized ranef-encoder shape — dotted ops only, so
+the Enzyme reverse pass sees no new surface. Emitted before the
+predictor's design recipe; the LP splice (per-block `mo` term or direct
+`mo1` summand) reads the `_ppl_mo_<s>` contrast.
+"""
+function monotonic_recipe(increments::Symbol, idx::Symbol, K::Int)
+    K >= 2 || throw(ContractValidationError(
+        "[preprocessing] monotonic levels K=$K < 2 " *
+        "(K=1 degenerates emitter-side)"))
+    stmts = Expr[]
+    push!(stmts, :($(_monotonic_cum_name(increments, 1))::Float64 = 0.0))
+    for j in 2:K
+        cum = _monotonic_cum_name(increments, j)
+        prev = _monotonic_cum_name(increments, j - 1)
+        push!(stmts, :($cum::Float64 =
+            $prev + $(_vector_elt_name(increments, j - 1))))
+    end
+    parts = Any[Expr(:call, :.*,
+        Expr(:call, :.==, idx, j), _monotonic_cum_name(increments, j))
+        for j in 2:K]
+    gather = foldl((a, c) -> Expr(:call, :.+, a, c), parts)
+    push!(stmts, Expr(:(=), monotonic_name(increments), gather))
+    return stmts
+end
+
 """
     design_recipe(shape, n_obs) -> Union{Nothing,Expr}
 
 `_ppl_design_<pred> = Float64.(hcat(<blocks…>))`, or `nothing` for a
-width-0 (offset-only) predictor. Blocks: intercept → `ones(n)`, continuous
-→ the bare column, factor → full-rank dummies over mapped levels.
+predictor with no static (data-only) blocks. Blocks: intercept →
+`ones(n)`, continuous → the bare column, factor → full-rank dummies over
+mapped levels. Monotonic blocks contribute no part (their contrast is
+parameter-derived — `hcat` cannot mix data with symbolic columns under
+the Enzyme reverse pass — so the generator splices them per-block
+against their coefficient coordinate instead).
 """
 function design_recipe(shape::DesignShape, n_obs::Int)
-    shape.width == 0 && return nothing
     # Continuous blocks contribute their bare column (a bound port), not a
     # wrapped Expr.
     parts = Any[]
@@ -262,6 +311,7 @@ function design_recipe(shape::DesignShape, n_obs::Int)
             push!(parts, _contrast_expr(b))
         end
     end
+    isempty(parts) && return nothing
     matrix = Expr(:call, :hcat, parts...)
     name = design_name(shape.predictor)
     return :($name = Float64.($matrix))
@@ -287,20 +337,48 @@ end
 """
     preprocessing_recipes(plan) -> Vector{Expr}
 
-All data-only recipes for a plan, in `plan.predictors` order: each
-predictor's design matrix (unless width-0) then its offset vector (unless
-absent).
+All preprocessing recipes for a plan, in `plan.predictors` order: each
+predictor's monotonic contrasts (one level-gather recipe per `mo`/`mo1`
+term — the only parameter-dependent recipes — before anything that reads
+them), then its design matrix (unless it has no static blocks, or the
+predictor splices `mo` columns per-block — the fused matvec is that
+recipe's only reader, so emitting it there would be dead code) and its
+offset vector (unless absent).
 """
 function preprocessing_recipes(plan::StructuralPlan)
     stmts = Expr[]
     for pred in plan.predictors
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
-        recipe = design_recipe(shape, plan.n_obs)
-        recipe !== nothing && push!(stmts, recipe)
+        for t in pred.terms
+            (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) ||
+                continue
+            append!(stmts, monotonic_recipe(t.options.increments,
+                only(t.columns), _monotonic_K(plan, t)))
+        end
+        if !any(b -> b.kind === MonotonicTerm, shape.blocks)
+            recipe = design_recipe(shape, plan.n_obs)
+            recipe !== nothing && push!(stmts, recipe)
+        end
         off = offset_recipe(shape)
         off !== nothing && push!(stmts, off)
     end
     return stmts
+end
+
+# Level count K for a monotonic term: one more than its linked increments
+# simplex's bound size (K−1 increments). The plan is bound here, so the
+# size is concrete; a residual `nothing` is loud defense in depth.
+function _monotonic_K(plan::StructuralPlan, t::TermSpec)
+    i = findfirst(p -> p.name === t.options.increments,
+        plan.vector_parameters)
+    i === nothing && throw(ContractValidationError(
+        "[preprocessing] monotonic increments $(t.options.increments) " *
+        "is not a vector parameter"))
+    m = plan.vector_parameters[i].size
+    m === nothing && throw(ContractValidationError(
+        "[preprocessing] monotonic increments $(t.options.increments) " *
+        "has unresolved size (bind_data infers it)"))
+    return m + 1
 end
 
 # Full-rank dummies over mapped levels:

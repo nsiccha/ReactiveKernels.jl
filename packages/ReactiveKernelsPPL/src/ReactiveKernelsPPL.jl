@@ -25,7 +25,8 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
-    RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm
+    RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm, MonotonicTerm,
+    MonotonicSummandTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec
 export RanefZRecipe, RanefMargin, RanefBucket
@@ -49,7 +50,8 @@ export lkj_chol_constrain, lkj_chol_unconstrain, lkj_chol_logjac
 export lkj_logconst, lkj_corr_cholesky_logpdf
 export positive_bijector, unit_bijector, interval_bijector, BIJECTORS
 export coordinate_read, block_read, transform_statements, jacobian_term
-export design_name, offset_name, design_recipe, offset_recipe
+export design_name, offset_name, monotonic_name, design_recipe, offset_recipe,
+    monotonic_recipe
 export preprocessing_recipes
 export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!

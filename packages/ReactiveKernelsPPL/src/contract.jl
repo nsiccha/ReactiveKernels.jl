@@ -73,6 +73,8 @@ random-effects / per-observation-latent location."""
     RanefGatherTerm
     SplineSummandTerm
     HSGPSummandTerm
+    MonotonicTerm
+    MonotonicSummandTerm
 end
 
 """
@@ -878,8 +880,9 @@ function _hsgp_floors(K::Vector{Int}, fits::Vector{Tuple{Float64,Float64}},
     return iso ? [maximum(per)] : per
 end
 
-"""Slice-1 term-name vocabulary (emitter-side admission keys; `:ranef_gather`
-and `:spline_summand` joined with their slices)."""
+"""Slice-1 term-name vocabulary (emitter-side admission keys; `:ranef_gather`,
+`:spline_summand`, `:monotonic`, and `:monotonic_summand` joined with their
+slices)."""
 const TERM_NAMES = Dict{Symbol,TermKind}(
     :intercept => InterceptTerm,
     :continuous => ContinuousTerm,
@@ -888,6 +891,8 @@ const TERM_NAMES = Dict{Symbol,TermKind}(
     :ranef_gather => RanefGatherTerm,
     :spline_summand => SplineSummandTerm,
     :hsgp_summand => HSGPSummandTerm,
+    :monotonic => MonotonicTerm,
+    :monotonic_summand => MonotonicSummandTerm,
 )
 
 """Allowlisted assignment functions (slice 1: scalar ops + whole-column
@@ -925,7 +930,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
-    RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm)
+    RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm, MonotonicTerm,
+    MonotonicSummandTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate):
 scalar/reduction vocabulary plus vector-returning whole-column functions."""
@@ -2472,9 +2478,11 @@ const VECTOR_ARITY = Dict{Symbol,Tuple{Vararg{Symbol}}}(
 # plus literal-only args (a threshold Normal takes literal location/scale; a
 # Dirichlet takes a literal concentration vector — hierarchical args fail
 # closed). Sizes resolve at bind (`nothing` = infer from the linked leveled
-# response); an explicit size is bounds-checked here and linked-checked in
+# response, or from the concentration length for a monotonic-linked
+# simplex); an explicit size is bounds-checked here and linked-checked in
 # `_validate_responses`. Each vector parameter serves exactly one response
-# (SB allocates per response; sharing fails closed).
+# or one monotonic term (SB allocates per response and per `mo` term;
+# sharing fails closed).
 function _validate_vector_parameters(plan::StructuralPlan)
     for p in plan.vector_parameters
         haskey(VECTOR_ARITY, p.family) || _fail(p.label,
@@ -2510,9 +2518,11 @@ function _validate_vector_parameters(plan::StructuralPlan)
                 "threshold size must be ≥ 0, got $(p.size)")
         end
     end
-    # Linkage: each vector parameter is referenced by exactly one response —
-    # as `thresholds` (ordered families), as `threshold_coefs`
-    # (per-threshold Ordinal), or as the simplex `predictor`.
+    # Linkage: each vector parameter is referenced by exactly one response
+    # (as `thresholds` for ordered families, as `threshold_coefs` for
+    # per-threshold Ordinal, or as the simplex `predictor`) or by exactly
+    # one monotonic term (as its `increments` simplex) — never both, never
+    # shared.
     refs = Dict{Symbol,Vector{Symbol}}(
         p.name => Symbol[] for p in plan.vector_parameters)
     for r in plan.responses
@@ -2531,13 +2541,26 @@ function _validate_vector_parameters(plan::StructuralPlan)
             push!(refs[r.predictor], r.label)
         end
     end
+    for pred in plan.predictors, t in pred.terms
+        (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) || continue
+        incr = _monotonic_options(t)
+        haskey(refs, incr) || _fail(t.label,
+            "monotonic increments $incr is not a vector parameter")
+        p = only(q for q in plan.vector_parameters if q.name === incr)
+        p.family === :simplex_dirichlet || _fail(t.label,
+            "monotonic increments $incr must be a " *
+            ":simplex_dirichlet vector parameter, got $(p.family)")
+        push!(refs[incr], t.label)
+    end
     for p in plan.vector_parameters
         got = refs[p.name]
         isempty(got) && _fail(p.label,
-            "vector parameter $(p.name) unused by any response")
+            "vector parameter $(p.name) unused by any response or " *
+            "monotonic term")
         length(got) == 1 || _fail(p.label,
-            "vector parameter $(p.name) shared by responses " *
-            "$(join(got, ", ")) — one vector parameter per response")
+            "vector parameter $(p.name) shared by " *
+            "$(join(got, ", ")) — one vector parameter per response or " *
+            "monotonic term")
     end
     return nothing
 end
@@ -2648,6 +2671,10 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
         _validate_gather_term(t, pred)
         return nothing
     end
+    if t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm
+        _validate_monotonic_term(t, pred)
+        return nothing
+    end
     if t.kind === SplineSummandTerm
         _validate_spline_term(t, pred)
         return nothing
@@ -2708,6 +2735,40 @@ function _validate_gather_term(t::TermSpec, pred::PredictorSpec)
     t.addressee === t.label ||
         _fail(t.label, "ranef gather addressee must be its own label " *
               "(self-addressed, no population prior), got $(t.addressee)")
+    return nothing
+end
+
+# Monotonic options precondition, shared by term validation and the
+# vector-parameter linkage (which reads `options.increments` before
+# `_validate_predictors` runs, so it must establish the shape itself).
+function _monotonic_options(t::TermSpec)
+    o = t.options
+    Tuple(keys(o)) == (:increments,) ||
+        _fail(t.label, "monotonic term options must be exactly " *
+              "`(increments,)`, got $(Tuple(keys(o)))")
+    o.increments isa Symbol ||
+        _fail(t.label, "monotonic increments must name a simplex vector " *
+              "parameter, got $(repr(o.increments))")
+    return o.increments
+end
+
+# A monotonic term (SB `mo(c)` / `mo1(c)`) carries exactly the bound index
+# column (integer level codes 1..K, checked at bind) and names its
+# increment simplex in `options` (`(increments,)` — a `:simplex_dirichlet`
+# vector parameter, linked in `_validate_vector_parameters`). `mo` takes a
+# free coefficient (addressee is the column, like a continuous term, so a
+# PopulationPrior covers its beta); `mo1` is beta-free and self-addressed
+# (no population prior, like the spline/gather summands).
+function _validate_monotonic_term(t::TermSpec, pred::PredictorSpec)
+    _monotonic_options(t)
+    length(t.columns) == 1 ||
+        _fail(t.label, "monotonic term takes exactly one index column")
+    if t.kind === MonotonicSummandTerm
+        t.addressee === t.label ||
+            _fail(t.label, "monotonic summand addressee must be its own " *
+                  "label (self-addressed, no population prior), got " *
+                  "$(t.addressee)")
+    end
     return nothing
 end
 
@@ -2781,6 +2842,33 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
         eltype(col) <: Real ||
             _fail(t.label, "column $c must be numeric")
     end
+    if t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm
+        _validate_monotonic_columns(t, plan)
+    end
+    return nothing
+end
+
+# Monotonic index data (SB `_sb_mo`'s `<c>_idx`): the emitter binds integer
+# level codes, so the thin layer takes them as-is — a BOUND raw column of
+# integers 1..K, where K − 1 is the linked increments simplex's
+# concentration length (unobserved levels are allowed, like unobserved
+# factor levels; out-of-range codes fail closed).
+function _validate_monotonic_columns(t::TermSpec, plan::StructuralPlan)
+    c = only(t.columns)
+    _is_derived(plan, c) && _fail(t.label,
+        "monotonic index $c must be a bound raw column of level codes " *
+        "(the emitter binds integer codes 1..K, SB's `<c>_idx`)")
+    col = plan.columns[c]
+    (eltype(col) <: Integer && eltype(col) !== Bool) ||
+        _fail(t.label, "monotonic index $c must hold integer level codes " *
+              "1..K, got eltype $(eltype(col))")
+    i = findfirst(p -> p.name === t.options.increments, plan.vector_parameters)
+    i === nothing && _fail(t.label,
+        "internal: monotonic increments $(t.options.increments) unlinked")
+    K = length(plan.vector_parameters[i].args.arg1) + 1
+    all(v -> 1 <= v <= K, col) ||
+        _fail(t.label, "monotonic index $c holds codes outside 1..$K " *
+              "(K − 1 = $(K - 1) is the linked increments simplex size)")
     return nothing
 end
 
@@ -2944,12 +3032,15 @@ function _validate_priors(plan::StructuralPlan)
         # Offset terms carry no coefficient; latent terms carry the per-cell
         # PlateParameter, whose prior lives on the plate parameter itself;
         # gather terms carry a RanefBucket, spline summands a SplineBasis,
-        # and hsgp summands an HSGPBasis, whose geometries are self-priored
-        # — none needs a coefficient prior.
+        # hsgp summands an HSGPBasis, and monotonic summands (mo1) an
+        # increment simplex, whose geometries are self-priored — none needs
+        # a coefficient prior. Monotonic (mo) terms DO take a free
+        # coefficient, so they stay in the addressee set.
         addressees = Set{Symbol}(t.addressee for t in pred.terms
             if t.kind !== OffsetTerm && t.kind !== LatentTerm &&
                t.kind !== RanefGatherTerm && t.kind !== SplineSummandTerm &&
-               t.kind !== HSGPSummandTerm)
+               t.kind !== HSGPSummandTerm &&
+               t.kind !== MonotonicSummandTerm)
         any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
         for a in addressees
             (pred.name, a) in seen ||
@@ -3861,7 +3952,8 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         _kernel_flat_length(only(kbases).subjects, only(kbases).timepoints)
     maps = _eval_levelmaps(plan.levelmaps, columns)
     responses2, vectors2 =
-        _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns)
+        _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
+            plan.predictors)
     bound = StructuralPlan(responses2, plan.predictors,
         plan.population_priors, plan.parameters, plan.assignments,
         columns, n; roles = merged, derived = plan.derived,
@@ -3879,10 +3971,13 @@ end
 # predictor count; Multinomial: count-column count) or from the response
 # column (max(y) for OrderedLogistic/Ordinal/Categorical); vector-param
 # `size === nothing` fills from the linked response (K−1 thresholds, K
-# simplex). Explicit values assert against the inference. Returns new
-# (immutable) vectors; unbound plans keep `nothing`.
+# simplex) or, for a monotonic-linked increments simplex, from its frozen
+# concentration length (K−1 increments for K levels). Explicit values
+# assert against the inference. Returns new (immutable) vectors; unbound
+# plans keep `nothing`.
 function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
-        vectors::Vector{VectorParameter}, columns::Dict{Symbol,AbstractVector})
+        vectors::Vector{VectorParameter}, columns::Dict{Symbol,AbstractVector},
+        predictors::Vector{PredictorSpec} = PredictorSpec[])
     out_r = LikelihoodSpec[]
     for r in responses
         _is_leveled_family(r.family) || (push!(out_r, r); continue)
@@ -3899,6 +3994,12 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         if _is_simplex_family(r.family)
             simplex_link[r.predictor] = r.label
         end
+    end
+    monotonic_link = Dict{Symbol,Symbol}()
+    for pred in predictors, t in pred.terms
+        (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) ||
+            continue
+        monotonic_link[t.options.increments] = t.label
     end
     out_v = VectorParameter[]
     for p in vectors
@@ -3928,6 +4029,15 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "Dirichlet concentration length $(length(p.args.arg1)) " *
                 "disagrees with n_levels $K")
             push!(out_v, VectorParameter(p.name, p.family, p.args, K, p.label))
+        elseif haskey(monotonic_link, p.name)
+            want = length(p.args.arg1)
+            want >= 1 || _fail(p.label,
+                "monotonic increments need ≥ 1 increment " *
+                "(K=1 degenerates emitter-side and never reaches the thin layer)")
+            p.size === nothing || p.size == want || _fail(p.label,
+                "monotonic increments size $(p.size) disagrees with its " *
+                "concentration length $want")
+            push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
         else
             _fail(p.label, "internal: vector parameter unlinked at bind")
         end
