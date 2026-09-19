@@ -582,3 +582,40 @@ end
         @test isfinite(grad_logit(false, logit))
     end
 end
+
+# A backend value alone does not load DifferentiationInterface's backend
+# extension: without `using Enzyme`, `prepare_ad` died inside
+# DifferentiationInterface with a bare `MethodError` on an internal
+# `_prepare_pullback_aux` symbol. Every entry point that hands a caller
+# backend to DifferentiationInterface now names the missing `using` instead.
+struct AutoNotLoadedTestPackage <: DifferentiationInterface.AbstractADType end
+
+@testset "unloaded backend packages fail loudly" begin
+    @test ReactiveKernels._ad_required_packages(AutoEnzyme()) == ["Enzyme"]
+    @test ReactiveKernels._ad_required_packages(AutoForwardDiff()) ==
+        ["ForwardDiff"]
+    @test ReactiveKernels._ad_required_packages(AutoNotLoadedTestPackage()) ==
+        ["NotLoadedTestPackage"]
+
+    @kernel unloaded_backend_objective(q::Float64) = q^2
+    backend = AutoNotLoadedTestPackage()
+    failure = try
+        prepare_ad(unloaded_backend_objective, backend, 2.0;
+            active = :q, want = :unloaded_backend_objective)
+        nothing
+    catch exception
+        exception
+    end
+    @test failure isa ArgumentError
+    @test occursin("using NotLoadedTestPackage", sprint(showerror, failure))
+
+    @test_throws ArgumentError ad_gradient(
+        unloaded_backend_objective, backend, 2.0;
+        active = :q, want = :unloaded_backend_objective)
+    @test_throws ArgumentError prepare_ad_pullback(
+        unloaded_backend_objective, backend, 1.0, 2.0;
+        active = :q, want = :unloaded_backend_objective)
+    @test_throws ArgumentError ad_pullback(
+        unloaded_backend_objective, backend, 1.0, 2.0;
+        active = :q, want = :unloaded_backend_objective)
+end
