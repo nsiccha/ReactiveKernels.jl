@@ -26,7 +26,11 @@ const ColumnRef = Symbol
 """Reference to a sampled parameter or scalar assignment by name."""
 const ParamName = Symbol
 
-"""Slice-1 likelihood families (D3 narrow slice)."""
+"""Slice-1 likelihood families (D3 narrow slice), plus the leveled slice-2
+families (categorical / ordinal / multinomial): reference-coded
+multi-logit categorical, cumulative-logit ordinal with ordered cutpoints,
+general typed ordinal (2 structures × 3 links), shared-simplex multinomial
+over a count matrix, and plain categorical over simplex probabilities."""
 @enum LikelihoodFamily::UInt8 begin
     GaussianFam
     BernoulliLogitFam
@@ -39,6 +43,11 @@ const ParamName = Symbol
     BinomialProbitFam
     BinomialCloglogFam
     BetaLogitFam
+    CategoricalLogitFam
+    OrderedLogisticFam
+    OrdinalFam
+    MultinomialFam
+    CategoricalFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -91,6 +100,39 @@ closed emitter-side. `trials` is the Binomial trial count (Int column or
 Int literal), `nothing` otherwise. `range` carries a literal `y[1:N]`
 response range (`nothing` = whole column: bare `.~`, `eachindex`,
 `axes`); it must cover `1:n_obs` exactly (checked at bind).
+
+Leveled families (categorical / ordinal / multinomial) use the trailing
+fields, built with keywords (`n_levels=`, `thresholds=`,
+`extra_predictors=`, `count_columns=`, `ordinal_structure=`,
+`discrimination=`, `threshold_columns=`); every other family leaves them
+at their defaults:
+
+- `n_levels`: category count K (`nothing` = infer at bind: from the
+  response column for OrderedLogistic/Ordinal/Categorical, structurally
+  — 1 + predictor count — for CategoricalLogit, structurally — column
+  count — for Multinomial).
+- `thresholds`: ordered/vector threshold parameter ([`VectorParameter`](@ref))
+  for OrderedLogistic/Ordinal, `nothing` otherwise.
+- `extra_predictors`: CategoricalLogit non-reference predictors after
+  `predictor` (class order 2..K is `[predictor; extra_predictors...]`,
+  K−1 total); empty otherwise.
+- `count_columns`: Multinomial count columns after `response`
+  (category order 1..K is `[response; count_columns...]`); empty
+  otherwise.
+- `ordinal_structure`: `:cumulative`/`:stopping` for OrdinalFam,
+  `nothing` otherwise.
+- `discrimination`: OrdinalFam scalar-or-column discrimination
+  (`nothing` = 1.0), `nothing` otherwise.
+- `threshold_columns`: OrdinalFam per-threshold design columns
+  (StoppingRatio only), empty otherwise.
+- `threshold_coefs`: the (K−1)×p threshold-coefficient matrix packed as a
+  `:vector_normal` [`VectorParameter`](@ref) (required exactly when
+  `threshold_columns` is non-empty), `nothing` otherwise. Stage-major:
+  stage j occupies entries `(j−1)*p+1 .. j*p`.
+
+Multinomial/Categorical responses name their shared-simplex
+[`VectorParameter`](@ref) in `predictor` (no linear predictor — the
+scan-state precedent).
 """
 struct LikelihoodSpec
     family::LikelihoodFamily
@@ -103,6 +145,14 @@ struct LikelihoodSpec
     label::Symbol
     trials::Union{Nothing,ColumnRef,Int}
     range::Union{Nothing,UnitRange{Int}}
+    n_levels::Union{Nothing,Int}
+    thresholds::Union{Nothing,ParamName}
+    extra_predictors::Vector{Symbol}
+    count_columns::Vector{ColumnRef}
+    ordinal_structure::Union{Nothing,Symbol}
+    discrimination::Union{Nothing,Real,ColumnRef}
+    threshold_columns::Vector{ColumnRef}
+    threshold_coefs::Union{Nothing,ParamName}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
@@ -112,6 +162,23 @@ LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label, range) =
     LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, nothing, range)
+# Full positional (pre-leveled 10-arg) with optional leveled keywords:
+# existing 10-arg call sites keep working (leveled fields default); new
+# leveled call sites pass keywords.
+function LikelihoodSpec(family, link, response, predictor, scale, weights,
+        evidence, label, trials, range; n_levels::Union{Nothing,Int} = nothing,
+        thresholds::Union{Nothing,ParamName} = nothing,
+        extra_predictors::Vector{Symbol} = Symbol[],
+        count_columns::Vector{ColumnRef} = Symbol[],
+        ordinal_structure::Union{Nothing,Symbol} = nothing,
+        discrimination::Union{Nothing,Real,ColumnRef} = nothing,
+        threshold_columns::Vector{ColumnRef} = Symbol[],
+        threshold_coefs::Union{Nothing,ParamName} = nothing)
+    return LikelihoodSpec(family, link, response, predictor, scale, weights,
+        evidence, label, trials, range, n_levels, thresholds,
+        extra_predictors, count_columns, ordinal_structure, discrimination,
+        threshold_columns, threshold_coefs)
+end
 
 """
     TermSpec(kind, columns, options, addressee, label)
@@ -275,6 +342,40 @@ struct RanefBucket
 end
 
 """
+    VectorParameter(name, family, args, size[, label])
+
+One constrained VECTOR parameter for a leveled response (cutpoints,
+thresholds, or a shared simplex), packed as one contiguous block:
+
+- `:ordered_normal` — an ordered cutpoint/threshold vector with an
+  elementwise `Normal(arg1, arg2)` prior (Stan `ordered` semantics: no
+  factorial normalizer) + the ordered-transform Jacobian.
+- `:vector_normal` — a plain (unconstrained, identity-transform) vector
+  with an elementwise `Normal(arg1, arg2)` prior (stopping-ratio stage
+  thresholds).
+- `:simplex_dirichlet` — a simplex with a `Dirichlet(arg1)` prior
+  (`arg1` a literal concentration vector — frozen data, the
+  coefficient-prior precedent) + the stick-breaking Jacobian.
+
+`size` is the constrained length (K−1 for thresholds, K for a simplex;
+`nothing` = infer at bind from the linked leveled response). Args are
+LITERALS only (hierarchical threshold/Dirichlet concentrations fail
+closed — planned). K=1 is uniform: zero-length threshold vectors carry
+no statements/prior/Jacobian, and a 1-simplex is the constant `[1.0]`.
+"""
+struct VectorParameter
+    name::ParamName
+    family::Symbol
+    args::NamedTuple
+    size::Union{Nothing,Int}
+    label::Symbol
+end
+"""Provenance defaults to the parameter's own name."""
+VectorParameter(name::ParamName, family::Symbol, args::NamedTuple,
+    size::Union{Nothing,Int}) =
+    VectorParameter(name, family, args, size, name)
+
+"""
     AssignmentSpec(name, expr)
 
 One scalar temporary (slice 1): `expr` may reference scalar names and
@@ -391,11 +492,13 @@ end
 Complete emitter→thin-layer input. `columns` maps RAW-column names to plain
 vectors (derived columns are never bound — they compute in-graph from
 `derived`); `parameters`, `assignments`, `derived`, each `plate_parameters`
-latent, and each `scans` state share one name table (duplicates rejected).
-N≥1 independent responses; shared predictor Symbols allowed. `levelmaps` sizes
-every factor term (binder-evaluated values); `plate_parameters` carries
-per-cell latents and `scans` sequential-recurrence latents (both
-vector-valued, empty for a plain population-GLM plan).
+latent, each `vector_parameters` latent, and each `scans` state share one
+name table (duplicates rejected). N≥1 independent responses; shared
+predictor Symbols allowed. `levelmaps` sizes every factor term
+(binder-evaluated values); `plate_parameters` carries per-cell latents,
+`vector_parameters` leveled-response latents (cutpoints/thresholds/simplexes),
+`scans` sequential-recurrence latents, and `ranef_buckets` random-effect
+draws blocks (empty for a plain population-GLM plan).
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -411,10 +514,12 @@ struct StructuralPlan
     plate_parameters::Vector{PlateParameter}
     scans::Vector{ScanSpec}
     ranef_buckets::Vector{RanefBucket}
+    vector_parameters::Vector{VectorParameter}
 end
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
-# before `levelmaps`/`scans`/`ranef_buckets` existed keep working with all empty.
+# before `levelmaps`/`scans`/`ranef_buckets`/`vector_parameters` existed keep
+# working with all empty.
 StructuralPlan(
     responses::Vector{LikelihoodSpec},
     predictors::Vector{PredictorSpec},
@@ -427,7 +532,7 @@ StructuralPlan(
     roles::Dict{Symbol,Symbol}) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[],
-        RanefBucket[])
+        RanefBucket[], VectorParameter[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -450,10 +555,11 @@ function StructuralPlan(
         levelmaps::Vector{LevelMap} = LevelMap[],
         plate_parameters::Vector{PlateParameter} = PlateParameter[],
         scans::Vector{ScanSpec} = ScanSpec[],
-        ranef_buckets::Vector{RanefBucket} = RanefBucket[])
+        ranef_buckets::Vector{RanefBucket} = RanefBucket[],
+        vector_parameters::Vector{VectorParameter} = VectorParameter[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, columns, n_obs, roles, levelmaps,
-        plate_parameters, scans, ranef_buckets)
+        plate_parameters, scans, ranef_buckets, vector_parameters)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -462,7 +568,9 @@ isbound(plan::StructuralPlan) = !isempty(plan.columns)
 
 """Admitted (family, likelihood-link, predictor-link) triples (triple pin).
 Triples 2 and 3 lower identically; the triple is admission key + lowering
-selector, never pairwise link equality."""
+selector, never pairwise link equality. Multinomial/Categorical name a
+simplex vector parameter instead of a linear predictor, so they skip the
+triple (the scan-state precedent) and validate on the simplex path."""
 const ADMITTED_TRIPLES = (
     (GaussianFam, IdentityLink, IdentityLink),
     (BernoulliLogitFam, LogitLink, IdentityLink),
@@ -476,6 +584,11 @@ const ADMITTED_TRIPLES = (
     (BinomialProbitFam, ProbitLink, IdentityLink),
     (BinomialCloglogFam, CloglogLink, IdentityLink),
     (BetaLogitFam, LogitLink, IdentityLink),
+    (CategoricalLogitFam, LogitLink, IdentityLink),
+    (OrderedLogisticFam, LogitLink, IdentityLink),
+    (OrdinalFam, LogitLink, IdentityLink),
+    (OrdinalFam, ProbitLink, IdentityLink),
+    (OrdinalFam, CloglogLink, IdentityLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order)."""
@@ -542,7 +655,8 @@ const ELEMENTWISE_FNS = (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs)
 admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
-    BinomialCloglogFam, BetaLogitFam)
+    BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
+    OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -593,6 +707,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_vector_structure(plan)
     _validate_parameters(plan)
     _validate_plate_parameters(plan)
+    _validate_vector_parameters(plan)
     _validate_topo_order(plan)
     _validate_predictors(plan)
     _validate_levelmaps(plan)
@@ -843,6 +958,7 @@ function _validate_name_tables(plan::StructuralPlan)
     deriveds = [d.name for d in plan.derived]
     plates = [p.name for p in plan.plate_parameters]
     scanstates = [s.state for s in plan.scans]
+    vectors = [p.name for p in plan.vector_parameters]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
@@ -852,6 +968,8 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate plate-parameter names")
     length(unique(scanstates)) == length(scanstates) ||
         _fail(:plan, "duplicate scan-state names")
+    length(unique(vectors)) == length(vectors) ||
+        _fail(:plan, "duplicate vector-parameter names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
         (assigns, deriveds, "assignments and derived columns"),
@@ -861,23 +979,28 @@ function _validate_name_tables(plan::StructuralPlan)
         (params, scanstates, "parameters and scan states"),
         (assigns, scanstates, "assignments and scan states"),
         (deriveds, scanstates, "derived columns and scan states"),
-        (plates, scanstates, "plate parameters and scan states"))
+        (plates, scanstates, "plate parameters and scan states"),
+        (vectors, params, "vector parameters and parameters"),
+        (vectors, assigns, "vector parameters and assignments"),
+        (vectors, deriveds, "vector parameters and derived columns"),
+        (vectors, plates, "vector parameters and plate parameters"),
+        (vectors, scanstates, "vector parameters and scan states"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
-    allnames = union(params, assigns, deriveds, plates, scanstates)
+    allnames = union(params, assigns, deriveds, plates, scanstates, vectors)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived/plate/scan name",
+            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived/plate/scan $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate/scan/vector $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors))
         _check_name_hygiene(n)
     end
     return nothing
@@ -1371,6 +1494,93 @@ function _validate_plate_parameters(plan::StructuralPlan)
     return nothing
 end
 
+# Leveled-family predicates (response/trials/link rules are per group).
+_is_ordered_family(f) = f === OrderedLogisticFam || f === OrdinalFam
+_is_simplex_family(f) = f === MultinomialFam || f === CategoricalFam
+_is_leveled_family(f) = f === CategoricalLogitFam || _is_ordered_family(f) ||
+    _is_simplex_family(f)
+
+"""Vector-parameter families and their positional arg keys."""
+const VECTOR_ARITY = Dict{Symbol,Tuple{Vararg{Symbol}}}(
+    :ordered_normal => (:arg1, :arg2),
+    :vector_normal => (:arg1, :arg2),
+    :simplex_dirichlet => (:arg1,),
+)
+
+# Constrained vector (cutpoint/threshold/simplex) parameters: family/arity
+# plus literal-only args (a threshold Normal takes literal location/scale; a
+# Dirichlet takes a literal concentration vector — hierarchical args fail
+# closed). Sizes resolve at bind (`nothing` = infer from the linked leveled
+# response); an explicit size is bounds-checked here and linked-checked in
+# `_validate_responses`. Each vector parameter serves exactly one response
+# (SB allocates per response; sharing fails closed).
+function _validate_vector_parameters(plan::StructuralPlan)
+    for p in plan.vector_parameters
+        haskey(VECTOR_ARITY, p.family) || _fail(p.label,
+            "vector family $(p.family) unknown (admitted: ordered_normal, " *
+            "vector_normal, simplex_dirichlet)")
+        expected = VECTOR_ARITY[p.family]
+        Tuple(keys(p.args)) == expected || _fail(p.label,
+            "family $(p.family) takes positional keys $expected, got " *
+            "$(Tuple(keys(p.args)))")
+        if p.family === :simplex_dirichlet
+            alpha = p.args.arg1
+            alpha isa AbstractVector || _fail(p.label,
+                "simplex_dirichlet takes a literal concentration vector " *
+                "`Dirichlet(alpha)` or symmetric `Dirichlet(K, a)` resolved " *
+                "to a vector; got $(repr(alpha))")
+            all(x -> x isa Real && isfinite(x) && x > 0, alpha) || _fail(
+                p.label,
+                "Dirichlet concentrations must be finite and strictly " *
+                "positive, got $(repr(alpha))")
+            p.size === nothing || p.size == length(alpha) || _fail(p.label,
+                "simplex size $(p.size) disagrees with its concentration " *
+                "length $(length(alpha))")
+            p.size === nothing || p.size >= 1 || _fail(p.label,
+                "simplex size must be ≥ 1, got $(p.size)")
+        else
+            mu, s = p.args.arg1, p.args.arg2
+            (mu isa Real && isfinite(mu)) || _fail(p.label,
+                "threshold location must be a finite literal, got $(repr(mu))")
+            (s isa Real && isfinite(s) && s > 0) || _fail(p.label,
+                "threshold scale must be a finite positive literal, got " *
+                "$(repr(s))")
+            p.size === nothing || p.size >= 0 || _fail(p.label,
+                "threshold size must be ≥ 0, got $(p.size)")
+        end
+    end
+    # Linkage: each vector parameter is referenced by exactly one response —
+    # as `thresholds` (ordered families), as `threshold_coefs`
+    # (per-threshold Ordinal), or as the simplex `predictor`.
+    refs = Dict{Symbol,Vector{Symbol}}(
+        p.name => Symbol[] for p in plan.vector_parameters)
+    for r in plan.responses
+        if r.thresholds !== nothing
+            haskey(refs, r.thresholds) || _fail(r.label,
+                "thresholds parameter $(r.thresholds) is not a vector parameter")
+            push!(refs[r.thresholds], r.label)
+        end
+        if r.threshold_coefs !== nothing
+            haskey(refs, r.threshold_coefs) || _fail(r.label,
+                "threshold_coefs parameter $(r.threshold_coefs) is not a " *
+                "vector parameter")
+            push!(refs[r.threshold_coefs], r.label)
+        end
+        if _is_simplex_family(r.family) && haskey(refs, r.predictor)
+            push!(refs[r.predictor], r.label)
+        end
+    end
+    for p in plan.vector_parameters
+        got = refs[p.name]
+        isempty(got) && _fail(p.label,
+            "vector parameter $(p.name) unused by any response")
+        length(got) == 1 || _fail(p.label,
+            "vector parameter $(p.name) shared by responses " *
+            "$(join(got, ", ")) — one vector parameter per response")
+    end
+    return nothing
+end
+
 """Canonical in-graph node names: reserved across every plan namespace."""
 const RESERVED_NODES = (:prior, :likelihood, :log_jacobian, :posterior, :unconstrained)
 
@@ -1739,6 +1949,217 @@ function _validate_priors(plan::StructuralPlan)
     return nothing
 end
 
+# Non-leveled responses leave every leveled field at its default (fail
+# closed: a stray level field on a Gaussian both means nothing and would
+# silently change nothing — reject it).
+function _validate_unleveled_fields(r::LikelihoodSpec)
+    r.n_levels === nothing ||
+        _fail(r.label, "only leveled families take n_levels")
+    r.thresholds === nothing ||
+        _fail(r.label, "only ordered families take thresholds")
+    isempty(r.extra_predictors) ||
+        _fail(r.label, "only CategoricalLogit takes extra_predictors")
+    isempty(r.count_columns) ||
+        _fail(r.label, "only Multinomial takes count_columns")
+    r.ordinal_structure === nothing ||
+        _fail(r.label, "only Ordinal takes ordinal_structure")
+    r.discrimination === nothing ||
+        _fail(r.label, "only Ordinal takes discrimination")
+    isempty(r.threshold_columns) ||
+        _fail(r.label, "only Ordinal takes threshold_columns")
+    r.threshold_coefs === nothing ||
+        _fail(r.label, "only Ordinal takes threshold_coefs")
+    return nothing
+end
+
+# Leveled-field rules for predictor-addressing families (CategoricalLogit,
+# OrderedLogistic, Ordinal); non-leveled families must leave every leveled
+# field at its default. `used_predictors` gains categorical tail predictors.
+function _validate_leveled_fields(r::LikelihoodSpec, plan::StructuralPlan,
+        pred::PredictorSpec, used_predictors::Set{Symbol})
+    _is_leveled_family(r.family) || return _validate_unleveled_fields(r)
+    r.family === CategoricalLogitFam &&
+        return _validate_categorical_fields(r, plan, used_predictors)
+    return _validate_ordered_fields(r, plan, pred)
+end
+
+function _validate_categorical_fields(r::LikelihoodSpec, plan::StructuralPlan,
+        used_predictors::Set{Symbol})
+    for q in r.extra_predictors
+        any(p -> p.name === q, plan.predictors) ||
+            _fail(r.label, "extra predictor $q is not a plan predictor")
+        push!(used_predictors, q)
+    end
+    all_preds = [r.predictor; r.extra_predictors...]
+    length(unique(all_preds)) == length(all_preds) ||
+        _fail(r.label, "categorical predictors repeat a predictor " *
+            "($(join(all_preds, ", "))) — one linear predictor per non-reference class")
+    k_struct = length(all_preds) + 1
+    r.n_levels === nothing || r.n_levels == k_struct || _fail(r.label,
+        "n_levels $(r.n_levels) disagrees with the $(length(all_preds)) " *
+        "categorical predictors (K = predictors + 1 = $k_struct)")
+    r.thresholds === nothing ||
+        _fail(r.label, "CategoricalLogit takes no thresholds")
+    isempty(r.count_columns) ||
+        _fail(r.label, "CategoricalLogit takes no count_columns")
+    r.ordinal_structure === nothing ||
+        _fail(r.label, "CategoricalLogit takes no ordinal_structure")
+    r.discrimination === nothing ||
+        _fail(r.label, "CategoricalLogit takes no discrimination")
+    isempty(r.threshold_columns) ||
+        _fail(r.label, "CategoricalLogit takes no threshold_columns")
+    r.threshold_coefs === nothing ||
+        _fail(r.label, "CategoricalLogit takes no threshold_coefs")
+    return nothing
+end
+
+function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
+        pred::PredictorSpec)
+    r.thresholds === nothing && _fail(r.label,
+        "an ordered response requires its thresholds vector parameter")
+    tp = only(p for p in plan.vector_parameters if p.name === r.thresholds)
+    want_ordered = r.family === OrderedLogisticFam ||
+        r.ordinal_structure === :cumulative
+    want_plain = r.family === OrdinalFam && r.ordinal_structure === :stopping
+    if r.family === OrdinalFam
+        r.ordinal_structure in (:cumulative, :stopping) || _fail(r.label,
+            "Ordinal takes ordinal_structure :cumulative or :stopping, got " *
+            "$(repr(r.ordinal_structure))")
+        any(t -> t.kind === InterceptTerm, pred.terms) && _fail(r.label,
+            "an Ordinal eta cannot include a fixed intercept — the estimated " *
+            "thresholds already supply the location")
+    else
+        r.ordinal_structure === nothing ||
+            _fail(r.label, "OrderedLogistic takes no ordinal_structure")
+    end
+    want_family = want_ordered ? :ordered_normal : :vector_normal
+    (want_ordered || want_plain) || _fail(r.label,
+        "internal: ordinal structure $(r.ordinal_structure) unresolved")
+    tp.family === want_family || _fail(r.label,
+        "thresholds $(tp.name) is $(tp.family) but this response needs " *
+        "$want_family")
+    if r.n_levels !== nothing && tp.size !== nothing
+        tp.size == r.n_levels - 1 || _fail(r.label,
+            "thresholds size $(tp.size) disagrees with n_levels " *
+            "$(r.n_levels) (thresholds number K−1)")
+    end
+    r.n_levels === nothing || r.n_levels >= 1 || _fail(r.label,
+        "n_levels must be ≥ 1, got $(r.n_levels)")
+    isempty(r.extra_predictors) ||
+        _fail(r.label, "an ordered response takes no extra_predictors")
+    isempty(r.count_columns) ||
+        _fail(r.label, "an ordered response takes no count_columns")
+    _validate_ordinal_extras(r, plan)
+    return nothing
+end
+
+# Ordinal-only extras: discrimination (scalar-or-column, SB-faithful: a
+# literal or a data column, never a sampled parameter — resolved at bind),
+# per-threshold design columns (StoppingRatio only: cumulative
+# category-specific effects can break monotonicity), and their coefficient
+# matrix (a `:vector_normal` vector parameter packing (K−1)×p, required
+# exactly when design columns are present).
+function _validate_ordinal_extras(r::LikelihoodSpec, plan::StructuralPlan)
+    if r.family !== OrdinalFam
+        r.discrimination === nothing ||
+            _fail(r.label, "only Ordinal takes discrimination")
+        isempty(r.threshold_columns) ||
+            _fail(r.label, "only Ordinal takes threshold_columns")
+        r.threshold_coefs === nothing ||
+            _fail(r.label, "only Ordinal takes threshold_coefs")
+        return nothing
+    end
+    d = r.discrimination
+    if d isa Real
+        (isfinite(d) && d > 0) || _fail(r.label,
+            "ordinal discrimination must be finite and strictly positive, " *
+            "got $(repr(d))")
+    elseif d !== nothing && !(d isa Symbol)
+        _fail(r.label, "ordinal discrimination must be a literal or a data " *
+            "column, got $(repr(d))")
+    end
+    if !isempty(r.threshold_columns)
+        r.ordinal_structure === :stopping || _fail(r.label,
+            "per_threshold is supported for StoppingRatio() only; " *
+            "unrestricted cumulative category-specific effects can make " *
+            "cumulative probabilities non-monotone")
+        length(unique(r.threshold_columns)) == length(r.threshold_columns) ||
+            _fail(r.label, "threshold columns repeat a column " *
+                "($(join(r.threshold_columns, ", ")))")
+        r.threshold_coefs === nothing && _fail(r.label,
+            "threshold columns require their threshold_coefs vector parameter")
+        cp = only(p for p in plan.vector_parameters
+            if p.name === r.threshold_coefs)
+        cp.family === :vector_normal || _fail(r.label,
+            "threshold_coefs $(cp.name) must be :vector_normal, got " *
+            "$(cp.family)")
+        if r.n_levels !== nothing && cp.size !== nothing
+            want = (r.n_levels - 1) * length(r.threshold_columns)
+            cp.size == want || _fail(r.label,
+                "threshold_coefs size $(cp.size) disagrees with n_levels " *
+                "$(r.n_levels) × $(length(r.threshold_columns)) columns " *
+                "(packs (K−1)×p = $want)")
+        end
+    elseif r.threshold_coefs !== nothing
+        _fail(r.label, "threshold_coefs without threshold_columns is " *
+            "meaningless — drop it or add the design columns")
+    end
+    return nothing
+end
+
+# Simplex-location responses (no linear predictor): Multinomial names its
+# count tail + trials; Categorical names an Int response. Both name their
+# shared-simplex vector parameter in `predictor`, use IdentityLink (probs
+# are used as-is — no link applies), and skip the triple.
+function _validate_simplex_response(r::LikelihoodSpec, plan::StructuralPlan)
+    r.link === IdentityLink || _fail(r.label,
+        "a simplex response uses IdentityLink (probs are used as-is), got " *
+        "$(r.link)")
+    any(p -> p.name === r.predictor && p.family === :simplex_dirichlet,
+        plan.vector_parameters) || _fail(r.label,
+        "a simplex response names its :simplex_dirichlet vector parameter " *
+        "in `predictor`, got $(r.predictor)")
+    r.thresholds === nothing ||
+        _fail(r.label, "a simplex response takes no thresholds")
+    isempty(r.extra_predictors) ||
+        _fail(r.label, "a simplex response takes no extra_predictors")
+    r.ordinal_structure === nothing ||
+        _fail(r.label, "a simplex response takes no ordinal_structure")
+    r.discrimination === nothing ||
+        _fail(r.label, "a simplex response takes no discrimination")
+    isempty(r.threshold_columns) ||
+        _fail(r.label, "a simplex response takes no threshold_columns")
+    r.threshold_coefs === nothing ||
+        _fail(r.label, "a simplex response takes no threshold_coefs")
+    if r.family === MultinomialFam
+        all_count = [r.response; r.count_columns...]
+        length(unique(all_count)) == length(all_count) ||
+            _fail(r.label, "multinomial count columns repeat a column " *
+                "($(join(all_count, ", ")))")
+        k_struct = length(all_count)
+        r.n_levels === nothing || r.n_levels == k_struct || _fail(r.label,
+            "n_levels $(r.n_levels) disagrees with the $k_struct count " *
+            "columns")
+        r.trials === nothing && _fail(r.label,
+            "Multinomial response requires trials (Int column or literal)")
+    else
+        isempty(r.count_columns) ||
+            _fail(r.label, "Categorical takes no count_columns")
+        r.trials === nothing ||
+            _fail(r.label, "Categorical takes no trials")
+        r.n_levels === nothing || r.n_levels >= 1 || _fail(r.label,
+            "n_levels must be ≥ 1, got $(r.n_levels)")
+    end
+    if r.range !== nothing
+        first(r.range) == 1 || _fail(r.label,
+            "response range must start at 1 (got $(r.range)) — " *
+            "ranges cover eachindex exactly, no partial windows")
+        length(r.range) >= 1 || _fail(r.label,
+            "response range $(r.range) is empty")
+    end
+    return nothing
+end
+
 function _validate_responses(plan::StructuralPlan)
     isempty(plan.responses) && _fail(:plan, "plan has no responses")
     rlabels = [r.label for r in plan.responses]
@@ -1763,6 +2184,16 @@ function _validate_responses(plan::StructuralPlan)
             )
             _validate_scale(r, plan)
             _validate_evidence_structure(r, plan)
+            _validate_unleveled_fields(r)
+            continue
+        end
+        # A simplex-vector location (no linear predictor — the scan-state
+        # precedent): Multinomial/Categorical name their shared-simplex
+        # vector parameter in `predictor`.
+        if _is_simplex_family(r.family)
+            _validate_simplex_response(r, plan)
+            _validate_scale(r, plan)
+            _validate_evidence_structure(r, plan)
             continue
         end
         idx = findfirst(p -> p.name === r.predictor, plan.predictors)
@@ -1773,10 +2204,13 @@ function _validate_responses(plan::StructuralPlan)
         (r.family, r.link, pred.link) in ADMITTED_TRIPLES || _fail(
             r.label,
             "link triple ($(r.family), $(r.link), $(pred.link)) not admitted " *
-            "(slice 1: Gaussian/identity, Bernoulli-logit, Poisson-log spellings)",
+            "(admitted: Gaussian/identity, Bernoulli-logit/probit/cloglog, " *
+            "Poisson-log, Binomial-logit/probit/cloglog, NB2-log, Gamma-log, " *
+            "Beta-logit, Categorical-logit, Ordered-logit, Ordinal spellings)",
         )
         _validate_scale(r, plan)
         _validate_evidence_structure(r, plan)
+        _validate_leveled_fields(r, plan, pred, used_predictors)
         if r.range !== nothing
             first(r.range) == 1 || _fail(r.label,
                 "response range must start at 1 (got $(r.range)) — " *
@@ -1799,6 +2233,7 @@ function _validate_response_data(plan::StructuralPlan)
         _validate_weights(r, plan)
         _validate_trials(r, plan)
         _validate_evidence_data(r, plan)
+        _validate_ordinal_data(r, plan)
     end
     return nothing
 end
@@ -1845,6 +2280,41 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         # finite/+Inf) — fail closed instead of flowing a wrong value.
         (eltype(col) <: Real && all(x -> 0 < x < 1, col)) ||
             _fail(r.label, "Beta response must be numerics strictly inside (0, 1)")
+        return nothing
+    elseif r.family === CategoricalLogitFam || _is_ordered_family(r.family) ||
+            r.family === CategoricalFam
+        # Recoded levels (SB `_brm_response_levels` recodes to contiguous
+        # 1..K via sort(unique)): exact contiguity 1..K, K≥1. K=1 is uniform
+        # (a zero-information likelihood, SB's one-emission rule) — except
+        # CategoricalLogit, whose structural K needs ≥1 non-reference
+        # predictor (a single-level categorical is degenerate and stays
+        # inexpressible).
+        (eltype(col) <: Integer && eltype(col) !== Bool) ||
+            return _fail(r.label, "a leveled response must hold integers 1..K")
+        K = r.n_levels
+        K === nothing && return _fail(r.label,
+            "internal: leveled n_levels unresolved at bind")
+        all(x -> 1 <= x <= K, col) ||
+            return _fail(r.label, "leveled response must hold integers " *
+                "1..$K (recoded levels)")
+        sort(unique(col)) == collect(1:K) ||
+            return _fail(r.label, "leveled response must cover every level " *
+                "1..$K exactly (recoded levels have no gaps)")
+        return nothing
+    elseif r.family === MultinomialFam
+        # The count matrix crosses as K raw columns (lead + tail), each a
+        # non-negative integer column; row sums meet trials in
+        # `_validate_trials`.
+        for c in [r.response; r.count_columns...]
+            _is_derived(plan, c) && return _fail(r.label,
+                "count column $c is derived — slice-2 binds count columns " *
+                "raw (derived counts need shape metadata — planned)")
+            haskey(plan.columns, c) ||
+                return _fail(r.label, "count column $c missing")
+            _is_count_column(plan.columns[c]) ||
+                return _fail(r.label, "count column $c must hold " *
+                    "non-negative integers")
+        end
         return nothing
     else
         return _fail(r.label, "response family $(r.family) has no column rule")
@@ -1916,9 +2386,12 @@ function _validate_scale_data(r::LikelihoodSpec, plan::StructuralPlan)
 end
 
 function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
+    if r.family === MultinomialFam
+        return _validate_multinomial_trials(r, plan)
+    end
     if !_is_binomial_family(r.family)
         r.trials === nothing ||
-            _fail(r.label, "only Binomial responses take trials")
+            _fail(r.label, "only Binomial/Multinomial responses take trials")
         return nothing
     end
     r.trials === nothing && _fail(r.label,
@@ -1945,6 +2418,72 @@ function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "trials column length $(length(col)) ≠ n_obs $(plan.n_obs)")
     all(ycol .<= col) ||
         _fail(r.label, "Binomial response exceeds trials in some row")
+    return nothing
+end
+
+# Multinomial trials: an Int literal or raw Int column, and every row's
+# count sum meets N exactly (Stan's multinomial errors otherwise — fail
+# closed here instead of flowing a wrong value).
+function _validate_multinomial_trials(r::LikelihoodSpec, plan::StructuralPlan)
+    t = r.trials
+    t === nothing && _fail(r.label,
+        "Multinomial response requires trials (Int column or literal)")
+    counts = [r.response; r.count_columns...]
+    rowsums = zeros(Int, plan.n_obs)
+    for c in counts
+        rowsums .+= plan.columns[c]
+    end
+    if t isa Int
+        t >= 0 || _fail(r.label, "Multinomial trials literal must be non-negative")
+        all(rowsums .== t) ||
+            _fail(r.label, "multinomial row counts must sum to trials $t " *
+                "in every row")
+        return nothing
+    end
+    _is_derived(plan, t) && _fail(r.label,
+        "trials column $t is derived — slice-2 binds trials " *
+        "raw (derived trials need shape metadata — planned)")
+    haskey(plan.columns, t) ||
+        _fail(r.label, "trials column $t missing")
+    col = plan.columns[t]
+    (eltype(col) <: Integer && eltype(col) !== Bool) ||
+        _fail(r.label, "trials column must hold integers")
+    all(>=(0), col) ||
+        _fail(r.label, "trials column must be non-negative")
+    all(rowsums .== col) ||
+        _fail(r.label, "multinomial row counts must sum to trials in every row")
+    return nothing
+end
+
+# Ordinal extras at data level: a discrimination column is raw finite
+# positive numerics of length n_obs (a literal validated structurally; a
+# sampled parameter is rejected — SB takes literals and data only), and
+# threshold design columns are raw finite numerics of length n_obs.
+function _validate_ordinal_data(r::LikelihoodSpec, plan::StructuralPlan)
+    r.family === OrdinalFam || return nothing
+    d = r.discrimination
+    if d isa Symbol
+        _is_derived(plan, d) && _fail(r.label,
+            "discrimination column $d is derived — slice-2 binds " *
+            "discrimination raw (derived columns need shape metadata — planned)")
+        haskey(plan.columns, d) || _fail(r.label,
+            "discrimination $d must be a data column (SB takes literals " *
+            "and data columns only — a sampled discrimination is out of slice)")
+        col = plan.columns[d]
+        (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
+            _fail(r.label, "discrimination column $d must be finite " *
+                "positive numerics")
+    end
+    for c in r.threshold_columns
+        _is_derived(plan, c) && _fail(r.label,
+            "threshold column $c is derived — slice-2 binds threshold " *
+            "design raw (derived columns need shape metadata — planned)")
+        haskey(plan.columns, c) ||
+            _fail(r.label, "threshold column $c missing")
+        col = plan.columns[c]
+        (eltype(col) <: Real && all(isfinite, col)) ||
+            _fail(r.label, "threshold column $c must be finite numerics")
+    end
     return nothing
 end
 
@@ -2074,16 +2613,119 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     end
     for r in plan.responses
         haskey(inferred, r.response) && (inferred[r.response] = :response)
+        for c in r.count_columns
+            haskey(inferred, c) && (inferred[c] = :response)
+        end
+        for c in r.threshold_columns
+            haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
+        end
     end
     merged = merge(inferred, roles)
     n = length(first(values(columns)))
     maps = _eval_levelmaps(plan.levelmaps, columns)
-    bound = StructuralPlan(plan.responses, plan.predictors,
+    responses2, vectors2 =
+        _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns)
+    bound = StructuralPlan(responses2, plan.predictors,
         plan.population_priors, plan.parameters, plan.assignments,
         columns, n; roles = merged, derived = plan.derived,
         levelmaps = maps, plate_parameters = plan.plate_parameters,
-        scans = plan.scans, ranef_buckets = plan.ranef_buckets)
+        scans = plan.scans, ranef_buckets = plan.ranef_buckets,
+        vector_parameters = vectors2)
     validate_data(bound)
     return bound
+end
+
+# Bind-time level inference (the LevelMap binder-evaluation precedent):
+# `n_levels === nothing` fills structurally (CategoricalLogit: 1 +
+# predictor count; Multinomial: count-column count) or from the response
+# column (max(y) for OrderedLogistic/Ordinal/Categorical); vector-param
+# `size === nothing` fills from the linked response (K−1 thresholds, K
+# simplex). Explicit values assert against the inference. Returns new
+# (immutable) vectors; unbound plans keep `nothing`.
+function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
+        vectors::Vector{VectorParameter}, columns::Dict{Symbol,AbstractVector})
+    out_r = LikelihoodSpec[]
+    for r in responses
+        _is_leveled_family(r.family) || (push!(out_r, r); continue)
+        K = _infer_response_levels(r, columns)
+        push!(out_r, _with_levels(r, K))
+    end
+    by_label = Dict{Symbol,LikelihoodSpec}(r.label => r for r in out_r)
+    thresh_link = Dict{Symbol,Symbol}()
+    simplex_link = Dict{Symbol,Symbol}()
+    coefs_link = Dict{Symbol,Symbol}()
+    for r in out_r
+        r.thresholds !== nothing && (thresh_link[r.thresholds] = r.label)
+        r.threshold_coefs !== nothing && (coefs_link[r.threshold_coefs] = r.label)
+        if _is_simplex_family(r.family)
+            simplex_link[r.predictor] = r.label
+        end
+    end
+    out_v = VectorParameter[]
+    for p in vectors
+        if haskey(thresh_link, p.name)
+            K = by_label[thresh_link[p.name]].n_levels
+            K === nothing && _fail(p.label, "internal: linked n_levels unresolved")
+            want = K - 1
+            p.size === nothing || p.size == want || _fail(p.label,
+                "thresholds size $(p.size) disagrees with n_levels $K " *
+                "(thresholds number K−1)")
+            push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
+        elseif haskey(coefs_link, p.name)
+            lr = by_label[coefs_link[p.name]]
+            K = lr.n_levels
+            K === nothing && _fail(p.label, "internal: linked n_levels unresolved")
+            want = (K - 1) * length(lr.threshold_columns)
+            p.size === nothing || p.size == want || _fail(p.label,
+                "threshold_coefs size $(p.size) disagrees with n_levels $K " *
+                "× $(length(lr.threshold_columns)) columns (packs (K−1)×p = $want)")
+            push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
+        elseif haskey(simplex_link, p.name)
+            K = by_label[simplex_link[p.name]].n_levels
+            K === nothing && _fail(p.label, "internal: linked n_levels unresolved")
+            p.size === nothing || p.size == K || _fail(p.label,
+                "simplex size $(p.size) disagrees with n_levels $K")
+            length(p.args.arg1) == K || _fail(p.label,
+                "Dirichlet concentration length $(length(p.args.arg1)) " *
+                "disagrees with n_levels $K")
+            push!(out_v, VectorParameter(p.name, p.family, p.args, K, p.label))
+        else
+            _fail(p.label, "internal: vector parameter unlinked at bind")
+        end
+    end
+    return out_r, out_v
+end
+
+function _infer_response_levels(r::LikelihoodSpec, columns::Dict{Symbol,AbstractVector})
+    if r.family === CategoricalLogitFam
+        return 2 + length(r.extra_predictors)
+    elseif r.family === MultinomialFam
+        return 1 + length(r.count_columns)
+    end
+    r.n_levels !== nothing && return r.n_levels
+    haskey(columns, r.response) ||
+        _fail(r.label, "response column $(r.response) missing")
+    col = columns[r.response]
+    (eltype(col) <: Integer && eltype(col) !== Bool && !isempty(col)) ||
+        _fail(r.label, "a leveled response must hold integers 1..K")
+    K = maximum(col)
+    K >= 1 || _fail(r.label, "a leveled response must hold integers 1..K")
+    return K
+end
+
+# Rebuild a response with concrete n_levels (explicit values already
+# asserted structurally; inference fills `nothing`).
+function _with_levels(r::LikelihoodSpec, K::Int)
+    r.n_levels === nothing || r.n_levels == K || _fail(r.label,
+        "n_levels $(r.n_levels) disagrees with the bound data " *
+        "(inferred K = $K)")
+    return LikelihoodSpec(r.family, r.link, r.response, r.predictor,
+        r.scale, r.weights, r.evidence, r.label, r.trials, r.range;
+        n_levels = K, thresholds = r.thresholds,
+        extra_predictors = r.extra_predictors, count_columns = r.count_columns,
+        ordinal_structure = r.ordinal_structure,
+        discrimination = r.discrimination,
+        threshold_columns = r.threshold_columns,
+        threshold_coefs = r.threshold_coefs)
 end
 

@@ -50,16 +50,18 @@ function _entry_transform(family::Symbol, override::SupportOverride)
     return (transform, NaN, NaN)
 end
 
-"""One packed slice: a coefficient block, a scalar latent, or a scan vector latent.
-`lo`/`hi` are the constrained bounds of an `:interval` transform (`NaN` otherwise)."""
+"""One packed slice: a coefficient block, a scalar latent, a scan vector
+latent, a per-cell latent block, or a leveled vector latent (cutpoints,
+thresholds, simplex). `lo`/`hi` are the constrained bounds of an
+`:interval` transform (`NaN` otherwise)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan | :plate
+    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
     offset::Int # 1-based packed offset
     size::Int
-    transform::Symbol # :identity | :exp | :logistic | :interval
+    transform::Symbol # :identity | :exp | :logistic | :interval | :ordered | :simplex
     lo::Float64 # :interval lower bound (else NaN)
     hi::Float64 # :interval upper bound (else NaN)
 end
@@ -78,8 +80,8 @@ end
     assign_layout(plan) -> LayoutTable
 
 Assign packed coordinates: coefficient blocks in `plan.predictors` order,
-then sampled parameters in `plan.parameters` order (pinned, deterministic).
-Assumes `validate_plan` passed.
+then sampled parameters, plate parameters, and vector parameters in plan
+order (pinned, deterministic). Assumes `validate_plan` passed.
 """
 function assign_layout(plan::StructuralPlan)
     isbound(plan) || throw(ContractValidationError(
@@ -112,6 +114,23 @@ function assign_layout(plan::StructuralPlan)
                 lo, hi))
         offset += size
     end
+    for p in plan.vector_parameters
+        p.size === nothing && throw(ContractValidationError(
+            "[layout] vector parameter $(p.name) has unresolved size " *
+            "(bind_data infers it from the linked response)"))
+        transform = p.family === :ordered_normal ? :ordered :
+            p.family === :simplex_dirichlet ? :simplex : :identity
+        # `size` is the PACKED (unconstrained) length: a simplex packs
+        # K−1 stick-breaking logits (a 1-simplex packs zero — Stan's
+        # deterministic `[1.0]`); threshold vectors pack their size.
+        # Constrained length recovers as `_vector_constrained_size`.
+        packed = transform === :simplex ? p.size - 1 : p.size
+        labels = [Symbol(string(p.name) * "." * string(i)) for i in 1:packed]
+        push!(entries,
+            LayoutEntry(:vector, nothing, p.name, labels, offset, packed,
+                transform))
+        offset += packed
+    end
     # Sequential-recurrence latents: one identity array slice per scan. The
     # length T is the loop bound — a literal Int, or `n_obs` when the bound is a
     # data length name (the canonical observation-indexed state-space case).
@@ -128,6 +147,104 @@ function assign_layout(plan::StructuralPlan)
         offset += T
     end
     return LayoutTable(entries, offset - 1)
+end
+
+"""Constrained length of a `:vector` entry: simplex packs K−1 logits
+for K probabilities; threshold vectors pack their size."""
+_vector_constrained_size(e::LayoutEntry) =
+    e.transform === :simplex ? e.size + 1 : e.size
+
+# Scalar logistic (Stan `inv_logit`) and logit, shared by the host
+# simplex edges and their in-graph twins below.
+_ordered_sigma(x::Float64) = 1.0 / (1.0 + exp(-x))
+_simplex_logit(z::Float64) = log(z) - log1p(-z)
+
+"""
+    ordered_constrain(u) -> Vector{Float64}
+
+Host-side ordered transform (Stan `ordered`): `y[1] = u[1]`,
+`y[i] = y[i-1] + exp(u[i])`. The in-graph twin unrolls the identical
+scalar chain.
+"""
+function ordered_constrain(u::AbstractVector{<:Real})
+    y = Vector{Float64}(undef, length(u))
+    for (i, x) in enumerate(u)
+        y[i] = i == 1 ? Float64(x) : y[i-1] + exp(Float64(x))
+    end
+    return y
+end
+
+"""Inverse of [`ordered_constrain`](@ref)."""
+function ordered_unconstrain(y::AbstractVector{<:Real})
+    u = Vector{Float64}(undef, length(y))
+    prev = 0.0
+    for (i, v) in enumerate(y)
+        u[i] = i == 1 ? Float64(v) : log(Float64(v) - prev)
+        prev = Float64(v)
+    end
+    return u
+end
+
+"""Log-Jacobian of [`ordered_constrain`](@ref): `Σ u[2:end]`."""
+function ordered_logjac(u::AbstractVector{<:Real})
+    total = 0.0
+    for (i, x) in enumerate(u)
+        i > 1 && (total += Float64(x))
+    end
+    return total
+end
+
+"""
+    simplex_constrain(u) -> Vector{Float64}
+
+Host-side stick-breaking simplex transform (Stan `simplex_constrain`):
+`z[j] = σ(u[j] + log(K-j))`, `s[j] = remaining[j]*z[j]`,
+`s[K] = remaining[K]`. Empty input constrains to `[1.0]` (Stan's
+deterministic 1-simplex). The in-graph twin unrolls the identical
+scalar chain.
+"""
+function simplex_constrain(u::AbstractVector{<:Real})
+    K = length(u) + 1
+    s = Vector{Float64}(undef, K)
+    K == 1 && (s[1] = 1.0; return s)
+    remaining = 1.0
+    for (j, x) in enumerate(u)
+        z = _ordered_sigma(Float64(x) + log(K - j))
+        s[j] = remaining * z
+        remaining -= s[j]
+    end
+    s[K] = remaining
+    return s
+end
+
+"""Inverse of [`simplex_constrain`](@ref) (Stan `simplex_free`)."""
+function simplex_unconstrain(s::AbstractVector{<:Real})
+    K = length(s)
+    u = Vector{Float64}(undef, max(K - 1, 0))
+    K <= 1 && return u
+    remaining = 1.0
+    for (j, v) in enumerate(s)
+        j >= K && break
+        z = Float64(v) / remaining
+        u[j] = _simplex_logit(z) - log(K - j)
+        remaining -= Float64(v)
+    end
+    return u
+end
+
+"""Log-Jacobian of [`simplex_constrain`](@ref): Stan's
+`Σ [log(remaining) + log(z) + log1p(-z)]` over the K−1 breaks."""
+function simplex_logjac(u::AbstractVector{<:Real})
+    K = length(u) + 1
+    K == 1 && return 0.0
+    total = 0.0
+    remaining = 1.0
+    for (j, x) in enumerate(u)
+        z = _ordered_sigma(Float64(x) + log(K - j))
+        total += log(remaining) + log(z) + log1p(-z)
+        remaining -= remaining * z
+    end
+    return total
 end
 
 """
@@ -147,6 +264,8 @@ function coordinate_names(layout::LayoutTable)
             for i in 1:e.size
                 push!(names, Symbol(string(e.name) * "." * string(i)))
             end
+        elseif e.kind === :vector
+            append!(names, e.labels)
         elseif e.kind === :scan
             for label in e.labels
                 push!(names, Symbol(string(e.name) * "." * string(label)))
@@ -178,6 +297,8 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, e.name => v)
         elseif e.kind === :scan
             push!(pairs, e.name => Vector{Float64}(seg))
+        elseif e.kind === :vector
+            push!(pairs, e.name => _vector_constrain(e, seg))
         else
             v = _constrain_elt(e, Float64(only(seg)))
             push!(pairs, e.name => v)
@@ -223,6 +344,16 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] scan state $(e.name) length mismatch"),
             )
             u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
+        elseif e.kind === :vector
+            haskey(nt, e.name) || throw(
+                ContractValidationError("[layout] missing vector parameter $(e.name)"),
+            )
+            v = nt[e.name]
+            want = _vector_constrained_size(e)
+            length(v) == want || throw(
+                ContractValidationError("[layout] vector parameter $(e.name) length mismatch"),
+            )
+            u[e.offset:(e.offset + e.size - 1)] .= _vector_unconstrain(e, v)
         else
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing parameter $(e.name)"),
@@ -247,12 +378,32 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
     for e in layout.entries
         e.transform === :identity && continue
         seg = u[e.offset:(e.offset + e.size - 1)]
+        if e.kind === :vector
+            # Vector Jacobians couple coordinates (ordered sums, simplex
+            # stick-breaking) — entry-level, never per-coordinate.
+            total += _vector_logjac(e, seg)
+            continue
+        end
         for v in seg
             total += _logjac_elt(e, Float64(v))
         end
     end
     return total
 end
+
+# Entry-level vector edges (host side). The in-graph twins in
+# `_vector_transform_statements`/`jacobian_term` unroll the IDENTICAL
+# scalar chains, so host and graph agree bit-for-bit.
+_vector_constrain(e::LayoutEntry, seg) =
+    e.transform === :identity ? Vector{Float64}(seg) :
+    e.transform === :ordered ? ordered_constrain(seg) :
+    simplex_constrain(seg)
+_vector_unconstrain(e::LayoutEntry, v) =
+    e.transform === :identity ? Vector{Float64}(v) :
+    e.transform === :ordered ? ordered_unconstrain(v) :
+    simplex_unconstrain(v)
+_vector_logjac(e::LayoutEntry, seg) =
+    e.transform === :ordered ? ordered_logjac(seg) : simplex_logjac(seg)
 
 # Host transform values route through the bijector library (the single source
 # of truth shared with the in-graph splices); `:identity` is a genuine no-op.
@@ -317,6 +468,9 @@ function transform_statements(e::LayoutEntry)
     end
     if e.kind === :plate
         return _plate_transform_statements(e)
+    end
+    if e.kind === :vector
+        return _vector_transform_statements(e)
     end
     o = e.offset
     coord = coordinate_read(o)
@@ -391,18 +545,87 @@ function _plate_transform_statements(e::LayoutEntry)
     ]
 end
 
+# Constrained-element / stick-breaking-temporary names for a `:vector`
+# entry: `_ppl_v_<name>_<i>` (elements, shared with the generator's prior
+# and likelihood cells), `_ppl_vz_<name>_<j>` (break fractions),
+# `_ppl_vr_<name>_<j>` (remainders). All `_ppl_`-hygienic.
+_vector_elt_name(name::Symbol, i::Int) = Symbol(:_ppl_v_, name, :_, i)
+_vector_elt(e::LayoutEntry, i::Int) = _vector_elt_name(e.name, i)
+_vector_z(e::LayoutEntry, j::Int) = Symbol(:_ppl_vz_, e.name, :_, j)
+_vector_r(e::LayoutEntry, j::Int) = Symbol(:_ppl_vr_, e.name, :_, j)
+
+# Leveled vector edges: scalar-unrolled twins of the host
+# `ordered_constrain`/`simplex_constrain` (IDENTICAL scalar ops in the
+# IDENTICAL order, so in-graph and host agree bit-for-bit). No vector
+# ever materializes in-graph: downstream prior/likelihood cells read the
+# `_ppl_v_` scalars directly (fully transparent to the planner and the
+# reverse pass — no new Enzyme surface). Empty threshold vectors emit no
+# statements; a 1-simplex emits its constant `[1.0]`.
+function _vector_transform_statements(e::LayoutEntry)
+    if e.transform === :identity
+        return Expr[:($(_vector_elt(e, i))::Float64 =
+            $(coordinate_read(e.offset + i - 1))) for i in 1:e.size]
+    end
+    if e.transform === :ordered
+        stmts = Expr[]
+        for i in 1:e.size
+            t = _vector_elt(e, i)
+            if i == 1
+                push!(stmts, :($t::Float64 = $(coordinate_read(e.offset))))
+            else
+                prev = _vector_elt(e, i - 1)
+                push!(stmts, :($t::Float64 =
+                    $prev + exp($(coordinate_read(e.offset + i - 1)))))
+            end
+        end
+        return stmts
+    end
+    # :simplex — Stan stick-breaking, unrolled.
+    K = e.size + 1
+    stmts = Expr[]
+    K == 1 && return Expr[:($(_vector_elt(e, 1))::Float64 = 1.0)]
+    push!(stmts, :($(_vector_r(e, 1))::Float64 = 1.0))
+    for j in 1:K-1
+        z = _vector_z(e, j)
+        s = _vector_elt(e, j)
+        r = _vector_r(e, j)
+        logK = log(K - j)
+        push!(stmts, :($z::Float64 =
+            1.0 / (1.0 + exp(-($(coordinate_read(e.offset + j - 1)) + $logK)))))
+        push!(stmts, :($s::Float64 = $r * $z))
+        push!(stmts, :($(_vector_r(e, j + 1))::Float64 = $r - $s))
+    end
+    push!(stmts, :($(_vector_elt(e, K))::Float64 = $(_vector_r(e, K))))
+    return stmts
+end
+
 """
     jacobian_term(entry) -> Union{Nothing,Expr}
 
 This entry's log-Jacobian contribution (`nothing` for identity). A scalar
 constrained support splices the bijector's `logjac` endpoint over the same
 coordinate the `constrain` edge reads (shared via structural CSE); a per-cell
-latent (plate) block sums its companion `logjac` plate (`_plate_logjac_name`).
+latent (plate) block sums its companion `logjac` plate (`_plate_logjac_name`);
+a leveled vector entry sums its unrolled twin of the host
+`ordered_logjac`/`simplex_logjac` (shared coordinates via CSE).
 """
 function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing
     if e.kind === :coefficient
         throw(ContractValidationError("[layout] non-identity coefficient block"))
+    end
+    if e.kind === :vector
+        if e.transform === :ordered
+            e.size < 2 && return nothing
+            terms = Any[coordinate_read(e.offset + i - 1) for i in 2:e.size]
+            return foldl((a, b) -> :($a + $b), terms)
+        end
+        # :simplex — Stan's Σ [log(r) + log(z) + log1p(-z)] over the
+        # breaks, reading the `_vector_transform_statements` temps.
+        e.size < 1 && return nothing
+        terms = Any[:(log($(_vector_r(e, j))) + log($(_vector_z(e, j))) +
+            log1p(-$(_vector_z(e, j)))) for j in 1:e.size]
+        return foldl((a, b) -> :($a + $b), terms)
     end
     if e.kind === :plate
         # Interval plates hand-roll the per-cell Jacobian sum (parameterized

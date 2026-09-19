@@ -1108,3 +1108,322 @@ end
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3]
     _check_gradient(built.spec, plan, u)
 end
+
+# Leveled parity references (SB Stan-semantics oracles, written
+# independently of the emitted cells): reference-coded softmax for
+# categorical, Stan's ordered_logistic definition, SB's brm_ordinal
+# composition (2 structures × 3 links), and Distributions.jl oracles
+# for multinomial / categorical / Dirichlet.
+function _leveled_columns()
+    n = 6
+    cols = Dict{Symbol,AbstractVector}(
+        :y => [1, 2, 3, 2, 1, 3],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+    )
+    return cols, n
+end
+
+_softmax_ref(v) = (m = maximum(v); e = exp.(v .- m); e ./ sum(e))
+
+function _gen_categorical_plan()
+    cols, n = _leveled_columns()
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(CategoricalLogitFam, LogitLink, :y,
+            :mu2, nothing, nothing, _none_evidence(), :y_resp, nothing,
+            nothing; extra_predictors = [:mu3])],
+        PredictorSpec[PredictorSpec(:mu2, IdentityLink, _gen_terms(), :mu2),
+            PredictorSpec(:mu3, IdentityLink, _gen_terms(), :mu3)],
+        vcat(_gen_priors(:mu2), _gen_priors(:mu3)),
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0)
+    return bind_data(unbound, cols)
+end
+
+@testset "categorical likelihood parity" begin
+    plan = _gen_categorical_plan()
+    built = build_kernel(plan)
+    @test built.layout.total == 4
+    u = [0.5, -0.25, 0.1, 0.3]
+    nt = constrain(built.layout, u)
+    eta2 = Vector(nt.mu2)[1] .+ Vector(nt.mu2)[2] .* plan.columns[:x]
+    eta3 = Vector(nt.mu3)[1] .+ Vector(nt.mu3)[2] .* plan.columns[:x]
+    ll = sum(logpdf(Categorical(_softmax_ref([0.0, e2, e3])), y)
+        for (y, e2, e3) in zip(plan.columns[:y], eta2, eta3))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    pr = sum(logpdf(Normal(0, 1), b[1]) + logpdf(Normal(0, 2), b[2])
+        for b in (Vector(nt.mu2), Vector(nt.mu3)))
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_ordered_plan()
+    cols, n = _leveled_columns()
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
+            nothing, nothing, _none_evidence(), :y_resp, nothing, nothing;
+            thresholds = :y_cutpoints)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = VectorParameter[VectorParameter(:y_cutpoints,
+        :ordered_normal, (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints)])
+    return bind_data(unbound, cols)
+end
+
+# Stan ordered_logistic: P(y=k) = F(t_k − η) − F(t_{k−1} − η),
+# F logistic, t_0 = −Inf, t_K = +Inf.
+function _ref_ordered_logistic(y, eta, t)
+    σ(z) = 1 / (1 + exp(-z))
+    K = length(t) + 1
+    Fhi = y == K ? 1.0 : σ(t[y] - eta)
+    Flo = y == 1 ? 0.0 : σ(t[y-1] - eta)
+    return log(Fhi - Flo)
+end
+
+@testset "ordered logistic parity" begin
+    plan = _gen_ordered_plan()
+    built = build_kernel(plan)
+    @test built.layout.total == 4 # 2 coefficients + 2 cutpoints
+    u = [0.5, -0.25, 0.1, 0.3]
+    nt = constrain(built.layout, u)
+    b = Vector(nt.mu)
+    eta = b[1] .+ b[2] .* plan.columns[:x]
+    t = Vector(nt.y_cutpoints)
+    ll = sum(_ref_ordered_logistic(y, e, t)
+        for (y, e) in zip(plan.columns[:y], eta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    # Cutpoint prior is elementwise std-normal with NO factorial
+    # normalizer (Stan ordered semantics); the Jacobian is Σ u[2:end].
+    pr = sum(logpdf(Normal(), v) for v in t) +
+        logpdf(Normal(0, 1), b[1]) + logpdf(Normal(0, 2), b[2])
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    @test _query(built.spec, plan, :log_jacobian, u) ≈ u[4]
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[4]
+    _check_gradient(built.spec, plan, u)
+end
+
+# SB brm_ordinal composition (structures × links), written from the
+# Stan-function definitions: cumulative takes adjacent CDF differences,
+# stopping-ratio accumulates per-stage survive/fail terms.
+function _ref_ordinal(y, eta, t, d, structure, link, eff = zeros(length(t)))
+    F(z) = link === LogitLink ? 1 / (1 + exp(-z)) :
+        link === ProbitLink ? cdf(Normal(), z) : -expm1(-exp(z))
+    logF(z) = log(F(z))
+    logCC(z) = link === LogitLink ? logF(-z) :
+        link === ProbitLink ? log(cdf(Normal(), -z)) : -exp(z)
+    K = length(t) + 1
+    if structure === :cumulative
+        if y == 1
+            return logF(d * (t[1] - eta))
+        elseif y == K
+            return logCC(d * (t[K-1] - eta))
+        end
+        return log(exp(logF(d * (t[y] - eta))) -
+            exp(logF(d * (t[y-1] - eta))))
+    end
+    total = 0.0
+    for j in 1:K-1
+        z = d * (t[j] - eta - eff[j])
+        total += j < y ? logCC(z) : j == y ? logF(z) : 0.0
+    end
+    return total
+end
+
+function _gen_ordinal_plan(link, structure; discrimination = 1.5)
+    cols, n = _leveled_columns()
+    terms = TermSpec[TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)]
+    vfam = structure === :cumulative ? :ordered_normal : :vector_normal
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(OrdinalFam, link, :y, :mu, nothing,
+            nothing, _none_evidence(), :y_resp, nothing, nothing;
+            thresholds = :y_thresholds, ordinal_structure = structure,
+            discrimination = discrimination)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, terms, :mu)],
+        PopulationPrior[PopulationPrior(:mu, :x, 0.0, 2.0)],
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = VectorParameter[VectorParameter(:y_thresholds,
+        vfam, (arg1 = 0.0, arg2 = 1.0), nothing, :y_thresholds)])
+    return bind_data(unbound, cols)
+end
+
+@testset "ordinal parity" begin
+    for link in (LogitLink, ProbitLink, CloglogLink),
+            structure in (:cumulative, :stopping)
+        plan = _gen_ordinal_plan(link, structure)
+        built = build_kernel(plan)
+        u = [0.4, -0.2, 0.25]
+        nt = constrain(built.layout, u)
+        b = only(Vector(nt.mu))
+        eta = b .* plan.columns[:x]
+        t = Vector(nt.y_thresholds)
+        ll = sum(_ref_ordinal(y, e, t, 1.5, structure, link)
+            for (y, e) in zip(plan.columns[:y], eta))
+        @test _query(built.spec, plan, :likelihood, u) ≈ ll
+        if (link, structure) in
+                ((LogitLink, :cumulative), (ProbitLink, :stopping))
+            _check_gradient(built.spec, plan, u)
+        end
+    end
+end
+
+function _gen_multinomial_plan()
+    c1 = [2, 0, 1, 3]
+    c2 = [1, 2, 0, 1]
+    c3 = [0, 1, 2, 0]
+    N = c1 .+ c2 .+ c3
+    cols = Dict{Symbol,AbstractVector}(:c1 => c1, :c2 => c2, :c3 => c3,
+        :N => N)
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(MultinomialFam, IdentityLink, :c1, :s,
+            nothing, nothing, _none_evidence(), :y_resp, :N, nothing;
+            count_columns = [:c2, :c3])],
+        PredictorSpec[], PopulationPrior[], SampledParameter[],
+        AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        vector_parameters = VectorParameter[VectorParameter(:s,
+        :simplex_dirichlet, (arg1 = [2.0, 2.0, 2.0],), nothing, :s)])
+    return bind_data(unbound, cols)
+end
+
+@testset "multinomial parity" begin
+    plan = _gen_multinomial_plan()
+    built = build_kernel(plan)
+    @test built.layout.total == 2 # K−1 stick-breaking logits
+    u = [0.4, -0.3]
+    nt = constrain(built.layout, u)
+    p = Vector(nt.s)
+    N = plan.columns[:N]
+    ll = sum(logpdf(Multinomial(n, p), [a, b, c])
+        for (n, a, b, c) in zip(N, plan.columns[:c1], plan.columns[:c2],
+        plan.columns[:c3]))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    pr = logpdf(Dirichlet([2.0, 2.0, 2.0]), p)
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    @test _query(built.spec, plan, :log_jacobian, u) ≈ simplex_logjac(u)
+    _check_gradient(built.spec, plan, u)
+    # A literal N folds identically (same value, computed once).
+    cols3 = Dict{Symbol,AbstractVector}(:c1 => [1, 1, 1, 0],
+        :c2 => [1, 1, 0, 2], :c3 => [1, 1, 2, 1])
+    unbound3 = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(MultinomialFam, IdentityLink, :c1, :s,
+            nothing, nothing, _none_evidence(), :y_resp, 3, nothing;
+            count_columns = [:c2, :c3])],
+        PredictorSpec[], PopulationPrior[], SampledParameter[],
+        AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        vector_parameters = VectorParameter[VectorParameter(:s,
+        :simplex_dirichlet, (arg1 = [2.0, 2.0, 2.0],), nothing, :s)])
+    plan3 = bind_data(unbound3, cols3)
+    built3 = build_kernel(plan3)
+    ll3 = _query(built3.spec, plan3, :likelihood, u)
+    @test ll3 ≈ sum(logpdf(Multinomial(3, p), [a, b, c])
+        for (a, b, c) in zip([1, 1, 1, 0], [1, 1, 0, 2], [1, 1, 2, 1]))
+end
+
+function _gen_categorical_plain_plan()
+    cols, n = _leveled_columns()
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(CategoricalFam, IdentityLink, :y, :s,
+            nothing, nothing, _none_evidence(), :y_resp, nothing, nothing)],
+        PredictorSpec[], PopulationPrior[], SampledParameter[],
+        AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        vector_parameters = VectorParameter[VectorParameter(:s,
+        :simplex_dirichlet, (arg1 = [1.0, 1.0, 1.0],), nothing, :s)])
+    return bind_data(unbound, cols)
+end
+
+@testset "categorical-simplex parity" begin
+    plan = _gen_categorical_plain_plan()
+    built = build_kernel(plan)
+    u = [0.2, 0.1]
+    nt = constrain(built.layout, u)
+    p = Vector(nt.s)
+    ll = sum(logpdf(Categorical(p), y) for y in plan.columns[:y])
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_per_threshold_plan()
+    cols = Dict{Symbol,AbstractVector}(
+        :y => [1, 2, 3, 2, 1, 3],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+        :w => [0.5, 1.0, 1.5, 0.0, 2.0, 1.0],
+        :z1 => [1.0, 0.0, -1.0, 0.5, 0.5, -0.5],
+        :z2 => [0.0, 1.0, 1.0, -1.0, 0.0, 1.0],
+        :d => [0.5, 1.0, 1.5, 2.0, 1.0, 0.8],
+    )
+    terms = TermSpec[TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)]
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(OrdinalFam, LogitLink, :y, :mu, nothing,
+            :w, _none_evidence(), :y_resp, nothing, nothing;
+            thresholds = :y_thresholds, ordinal_structure = :stopping,
+            discrimination = :d, threshold_columns = [:z1, :z2],
+            threshold_coefs = :y_beta)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, terms, :mu)],
+        PopulationPrior[PopulationPrior(:mu, :x, 0.0, 2.0)],
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = VectorParameter[
+            VectorParameter(:y_thresholds, :vector_normal,
+                (arg1 = 0.0, arg2 = 1.0), nothing, :y_thresholds),
+            VectorParameter(:y_beta, :vector_normal, (arg1 = 0.0, arg2 = 1.0),
+                nothing, :y_beta),
+        ])
+    return bind_data(unbound, cols)
+end
+
+@testset "per-threshold ordinal parity" begin
+    plan = _gen_per_threshold_plan()
+    built = build_kernel(plan)
+    @test built.layout.total == 7 # eta + 2 thresholds + 4 coefs
+    u = [0.4, -0.2, 0.25, 0.1, -0.1, 0.05, 0.15]
+    nt = constrain(built.layout, u)
+    b = only(Vector(nt.mu))
+    eta = b .* plan.columns[:x]
+    t = Vector(nt.y_thresholds)
+    beta = Vector(nt.y_beta)
+    # Stage-major pack: stage j occupies beta[(j−1)*p+1 .. j*p].
+    X = hcat(plan.columns[:z1], plan.columns[:z2])
+    E = [sum(X[i, c] * beta[(j-1)*2+c] for c in 1:2)
+        for i in 1:6, j in 1:2]
+    ll = 0.0
+    for (i, y) in enumerate(plan.columns[:y])
+        ll += plan.columns[:w][i] * _ref_ordinal(y, eta[i], t,
+            plan.columns[:d][i], :stopping, LogitLink, E[i, :])
+    end
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "leveled K=1 edges" begin
+    # Ordered K=1: empty cutpoints, zero likelihood/Jacobian, live gradient.
+    cols = Dict{Symbol,AbstractVector}(:y => [1, 1, 1],
+        :x => [0.5, -1.0, 1.0])
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
+            nothing, nothing, _none_evidence(), :y_resp, nothing, nothing;
+            thresholds = :y_cutpoints)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = VectorParameter[VectorParameter(:y_cutpoints,
+        :ordered_normal, (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints)])
+    plan = bind_data(unbound, cols)
+    built = build_kernel(plan)
+    @test built.layout.total == 2
+    u = [0.5, -0.25]
+    @test _query(built.spec, plan, :likelihood, u) == 0.0
+    @test _query(built.spec, plan, :log_jacobian, u) == 0.0
+    _check_gradient(built.spec, plan, u)
+    # Multinomial K=1: a zero-dimensional model with zero likelihood.
+    colsM = Dict{Symbol,AbstractVector}(:c1 => [3, 2], :N => [3, 2])
+    unboundM = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(MultinomialFam, IdentityLink, :c1, :s,
+            nothing, nothing, _none_evidence(), :y_resp, :N, nothing)],
+        PredictorSpec[], PopulationPrior[], SampledParameter[],
+        AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        vector_parameters = VectorParameter[VectorParameter(:s,
+        :simplex_dirichlet, (arg1 = [1.5],), nothing, :s)])
+    planM = bind_data(unboundM, colsM)
+    builtM = build_kernel(planM)
+    @test builtM.layout.total == 0
+    @test _query(builtM.spec, planM, :likelihood, Float64[]) == 0.0
+    @test _query(builtM.spec, planM, :log_jacobian, Float64[]) == 0.0
+end

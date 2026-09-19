@@ -77,7 +77,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
     beta, inverse_gamma, binomial, negative_binomial2,
     gp_exp_quad_cov, gp_chol_latent
-using SpecialFunctions: erfc
+using SpecialFunctions: erfc, loggamma
 # Selective (explicit imports win over any re-export chain, so no `using`
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
 # names in the assignment allowlist.
@@ -200,6 +200,14 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _binomial_cloglog_plate_stmts(r, plan, node, pw)
     elseif r.family === BetaLogitFam
         return _beta_plate_stmts(r, plan, node, pw)
+    elseif r.family === CategoricalLogitFam
+        return _categorical_plate_stmts(r, plan, node, pw)
+    elseif r.family === OrderedLogisticFam || r.family === OrdinalFam
+        return _ordinal_plate_stmts(r, plan, node, pw)
+    elseif r.family === MultinomialFam
+        return _multinomial_plate_stmts(r, plan, node, pw)
+    elseif r.family === CategoricalFam
+        return _categorical_plain_plate_stmts(r, plan, node, pw)
     else
         throw(ContractValidationError(
             "[generator] response family $(r.family) has no emitter"))
@@ -565,6 +573,211 @@ function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
         _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
+# Reference-coded multi-logit categorical (SB `CategoricalLogit`): K−1
+# linear predictors supply the non-reference logits; class 1 is the
+# implicit zero reference. The cell is the `categorical_logit_ref` math
+# in scalar form (per-row logit vectors would need matrix assembly):
+# the observed term selects by `y` (ifelse chain) and the normalizer is
+# a max-shifted log-sum-exp over (0, etas...) — linear-size in K (a
+# nested logaddexp chain would double nodes per level; the max chain is
+# re-embedded per term, so K² worst case — K is small).
+function _categorical_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    preds = [r.predictor; r.extra_predictors...]
+    lps = [_lp_name(_predictor(plan, q)) for q in preds]
+    inputs = Any[r.response, lps...]
+    yv = _dovar(1)
+    etas = [_dovar(i) for i in 2:length(inputs)]
+    K = length(preds) + 1
+    obs = :(0.0)
+    for j in K:-1:2
+        obs = :(ifelse($yv == $j, $(etas[j-1]), $obs))
+    end
+    m = :(0.0)
+    for e in etas
+        m = :(max($m, $e))
+    end
+    sumexp = :(exp(0.0 - $m))
+    for e in etas
+        sumexp = :($sumexp + exp($e - $m))
+    end
+    cell = :($obs - ($m + log($sumexp)))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
+end
+
+# Stable log-logistic (Stan `log_inv_logit`): `z ≥ 0` takes
+# `-log1p(exp(-z))`, `z < 0` takes `z - log1p(exp(z))` — no overflow
+# either tail. Base ops only (transparent to the reverse pass).
+_log_inv_logit(z) = :(ifelse($z >= 0.0, -log1p(exp(-$z)), $z - log1p(exp($z))))
+
+# Ordinal link log-CDF / log-CCDF over a scalar z (SB `brm_ordinal_logcdf`
+# / `brm_ordinal_logccdf`). Probit uses the slice-1 erfc treatment
+# (`0.5*erfc(∓z/√2)` under a log — accurate in moderate ranges; extreme
+# tails round, the accepted slice-1 probit caveat).
+function _ordinal_logF(link::LinkFunction, z)
+    link === LogitLink && return _log_inv_logit(z)
+    link === ProbitLink && return :(log(0.5 * erfc(-$z / sqrt(2))))
+    return :(log(-expm1(-exp($z))))
+end
+function _ordinal_logCC(link::LinkFunction, z)
+    link === LogitLink && return _log_inv_logit(:(-$z))
+    link === ProbitLink && return :(log(0.5 * erfc($z / sqrt(2))))
+    return :(-exp($z))
+end
+
+# Stable log-difference of log-probs (a ≥ b): `a + log1p(-exp(b - a))`.
+_log_diff_exp(a, b) = :($a + log1p(-exp($b - $a)))
+
+# Per-threshold effect column name (stage j of response `label`).
+_eff_name(label::Symbol, j::Int) = Symbol(:_ppl_eff_, label, :_, j)
+
+# Ordered response plate (OrderedLogistic + Ordinal, one uniform path:
+# OrderedLogistic is cumulative-logit with d = 1 and no threshold
+# effects). Threshold scalars thread as broadcast plate inputs; the cell
+# is fully static in structure/link/K. K=1 lowers to a zero cell (SB's
+# zero-information likelihood).
+function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    K = r.n_levels
+    K === nothing && throw(ContractValidationError(
+        "[generator] ordered response $(r.label) has unresolved n_levels " *
+        "(bind_data infers it)"))
+    inputs = Any[y, lp]
+    yv, etav = _dovar(1), _dovar(2)
+    dref = r.discrimination === nothing ? 1.0 : _thread_ref!(inputs, r.discrimination)
+    tnames = [_vector_elt_name(r.thresholds, i) for i in 1:K-1]
+    trefs = [_thread_ref!(inputs, t) for t in tnames]
+    prests = Expr[]
+    erefs = Any[]
+    if !isempty(r.threshold_columns)
+        for j in 1:K-1
+            push!(inputs, _eff_pre!(prests, r, plan, j))
+            push!(erefs, _dovar(length(inputs)))
+        end
+    end
+    structure = r.family === OrderedLogisticFam ? :cumulative : r.ordinal_structure
+    cell = structure === :cumulative ?
+        _ordinal_cumulative_cell(r.link, K, yv, etav, dref, trefs) :
+        _ordinal_stopping_cell(r.link, K, yv, etav, dref, trefs, erefs)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[prests..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Stage-j threshold-effect column (StoppingRatio per_threshold): the
+# broadcast sum `Σ_c col_c .* β[j,c]` over the raw design columns and
+# the packed coefficient scalars (stage-major: stage j occupies
+# `(j-1)*p+1 .. j*p`). Emits the precompute statement and returns its
+# name for threading. Data-only columns fold under `bound=`; the
+# broadcast itself is the Gamma-pre pattern.
+function _eff_pre!(prests::Vector{Expr}, r::LikelihoodSpec, plan::StructuralPlan, j::Int)
+    p = length(r.threshold_columns)
+    coefs = r.threshold_coefs
+    terms = Any[]
+    for (c, col) in enumerate(r.threshold_columns)
+        b = _vector_elt_name(coefs, (j - 1) * p + c)
+        push!(terms, :($col .* $b))
+    end
+    rhs = foldl((a, b) -> :($a .+ $b), terms)
+    name = _eff_name(r.label, j)
+    push!(prests, :($name = $rhs))
+    return name
+end
+
+# Cumulative cell: `y == 1` takes logF, `y == K` takes logCC, interior
+# levels take the stable log-difference. Thresholds are ordered
+# (constrained), so hi ≥ lo and the difference is well-defined.
+function _ordinal_cumulative_cell(link::LinkFunction, K::Int, yv::Symbol,
+        etav::Symbol, dref, trefs::Vector)
+    # K=1 is SB's zero-information likelihood; the cell stays a real
+    # Expr over the (integer) response do-var (`:(0.0)` would quote to
+    # a bare Float64, which the plate builder does not take).
+    K == 1 && return :(0.0 * $yv)
+    first = _ordinal_logF(link, :($dref * ($(trefs[1]) - $etav)))
+    last = _ordinal_logCC(link, :($dref * ($(trefs[K-1]) - $etav)))
+    K == 2 && return :(ifelse($yv == 1, $first, $last))
+    mid = :(0.0)
+    for y in K-1:-1:2
+        hi = _ordinal_logF(link, :($dref * ($(trefs[y]) - $etav)))
+        lo = _ordinal_logF(link, :($dref * ($(trefs[y-1]) - $etav)))
+        mid = :(ifelse($yv == $y, $(_log_diff_exp(hi, lo)), $mid))
+    end
+    return :(ifelse($yv == 1, $first, ifelse($yv == $K, $last, $mid)))
+end
+
+# Stopping-ratio cell (SB `brm_ordinal` structure 2): stage j contributes
+# logCC below `y`, logF at `y`, nothing above. `erefs` holds the
+# per-row effect do-vars (empty without per_threshold — effects are 0).
+function _ordinal_stopping_cell(link::LinkFunction, K::Int, yv::Symbol,
+        etav::Symbol, dref, trefs::Vector, erefs::Vector)
+    # K=1 runs zero stages (SB's zero-information likelihood); see the
+    # cumulative K=1 note on quoting a real Expr.
+    K == 1 && return :(0.0 * $yv)
+    terms = Any[]
+    for j in 1:K-1
+        eff = isempty(erefs) ? 0.0 : erefs[j]
+        z = :($dref * ($(trefs[j]) - $etav - $eff))
+        push!(terms, :(ifelse($yv > $j, $(_ordinal_logCC(link, z)),
+            ifelse($yv == $j, $(_ordinal_logF(link, z)), 0.0))))
+    end
+    return foldl((a, b) -> :($a + $b), terms)
+end
+
+# Shared-simplex multinomial (SB `brm_multinomial` vector[K] method): the
+# count matrix crosses as K raw columns; the simplex parameter threads
+# as K broadcast scalars. The cell is Stan's `multinomial_lpmf` in
+# scalar form — `lgamma(N+1) − Σ lgamma(c+1) + Σ c*log(p)` — with the
+# `0*log(0) = 0` convention guarded per term (Stan treats a zero count
+# at a zero probability as 0, not NaN). A literal N folds its
+# `lgamma(N+1)` host-side (exact same value, computed once).
+function _multinomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    counts = [r.response; r.count_columns...]
+    K = length(counts)
+    inputs = Any[counts...]
+    cvs = [_dovar(i) for i in 1:K]
+    nref = _thread_ref!(inputs, r.trials, true)
+    prefs = [_thread_ref!(inputs, _vector_elt_name(r.predictor, i)) for i in 1:K]
+    lfact = r.trials isa Int ? loggamma(r.trials + 1.0) : :(loggamma($nref + 1.0))
+    cell = :($lfact)
+    for (cv, pv) in zip(cvs, prefs)
+        cell = :($cell - loggamma($cv + 1.0) +
+            ifelse($cv == 0, 0.0, $cv * log($pv)))
+    end
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
+end
+
+# Plain categorical over shared-simplex probabilities (Stan
+# `categorical_lpmf`): the cell selects `log(p[y])` by the observed
+# level (ifelse chain). K=1 lowers to `log(1.0) = 0` uniformly.
+function _categorical_plain_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    K = r.n_levels
+    K === nothing && throw(ContractValidationError(
+        "[generator] categorical response $(r.label) has unresolved n_levels " *
+        "(bind_data infers it)"))
+    inputs = Any[r.response]
+    yv = _dovar(1)
+    prefs = [_thread_ref!(inputs, _vector_elt_name(r.predictor, i)) for i in 1:K]
+    cell = :(log($(prefs[1])))
+    for j in 2:K
+        cell = :(ifelse($yv == $j, log($(prefs[j])), $cell))
+    end
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
+end
+
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     stmts = Expr[]
     terms = Any[]
@@ -587,6 +800,14 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     for p in plan.parameters
         node = Symbol(:_ppl_prior_, p.name)
         push!(stmts, :($node::Float64 = $(_sampled_prior_expr(p))))
+        push!(terms, node)
+    end
+    # Leveled vector latents (cutpoints/thresholds/simplexes/coefficient
+    # packs): unrolled scalar sums over the `_ppl_v_` layout elements
+    # (bound plans carry concrete sizes). Empty packs contribute 0.0.
+    for p in plan.vector_parameters
+        node = Symbol(:_ppl_prior_, p.name)
+        push!(stmts, :($node::Float64 = $(_vector_prior_expr(p))))
         push!(terms, node)
     end
     # Per-cell latent (plate) parameters: one plate over the block, summing the
@@ -680,6 +901,31 @@ function _sampled_prior_expr(p::SampledParameter)
     corr = _support_correction(p.support_override, argvals)
     corr === nothing && return base
     return :($base + $corr)
+end
+
+# Vector-latent prior over the `_ppl_v_` layout elements: elementwise
+# Normal for threshold/coefficient packs (Stan `ordered`/`vector`
+# semantics — no factorial normalizer, matching `_BRMThresholdPrior`),
+# Dirichlet for simplexes (Stan `dirichlet_lpdf`: the log-multivariate-Beta
+# normalizer folds host-side — data-only — plus Σ (α−1)·log(s)).
+function _vector_prior_expr(p::VectorParameter)
+    m = p.size
+    m === nothing && throw(ContractValidationError(
+        "[generator] vector parameter $(p.name) has unresolved size " *
+        "(bind_data infers it)"))
+    elts = [_vector_elt_name(p.name, i) for i in 1:m]
+    if p.family === :simplex_dirichlet
+        alpha = Vector{Float64}(p.args.arg1)
+        normalizer = loggamma(sum(alpha)) - sum(loggamma, alpha)
+        terms = Any[normalizer]
+        for (a, s) in zip(alpha, elts)
+            push!(terms, :($(a - 1.0) * log($s)))
+        end
+        return foldl((x, y) -> :($x + $y), terms)
+    end
+    mu, s = Float64(p.args.arg1), Float64(p.args.arg2)
+    terms = Any[:(normal($mu, $s).logpdf($t)) for t in elts]
+    return foldl((x, y) -> :($x + $y), terms; init = :(0.0))
 end
 
 # --- Sequential-recurrence (scan) density (slice 1: CENTERED) ---
