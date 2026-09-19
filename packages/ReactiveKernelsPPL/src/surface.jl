@@ -1217,12 +1217,15 @@ function _stmt_is_submodel_call(arg, mod::Module)
 end
 
 function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module)
-    any(_stmt_is_submodel_call(a, mod) for a in ast.args) || return ast
+    any(_stmt_is_submodel_call(a, mod) || _plate_has_submodel_cell(a, mod)
+        for a in ast.args) || return ast
     out = Any[]
     for arg in ast.args
         if _stmt_is_submodel_call(arg, mod)
             st = _unwrap_trivia(arg)
             append!(out, _expand_one_submodel(st.args[2], st.args[3], mod, data))
+        elseif _plate_has_submodel_cell(arg, mod)
+            push!(out, _expand_plate_cell_submodels(arg, mod, data))
         else
             push!(out, arg)
         end
@@ -1329,6 +1332,149 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     # Latent: bind the LHS to the return value. Stream: the response IS the
     # binding (the data LHS is already bound), so no trailing assignment.
     stream || push!(out, Expr(:(=), lhs, _subst(ret, submap)))
+    return out
+end
+
+# ── Per-cell submodel promotion inside `@plate` ──────────────────────────
+# A plate cell may embed a submodel, `col[i] ~ sm(args…)`, mirroring StanBlocks'
+# per-cell submodel promotion (a `plate` do-block embedding `lhs ~ submodel(…)`).
+# Runs here, before partitioning, alongside the top-level submodel expansion:
+# each submodel-call cell is inlined into `i`-indexed cell statements, so the
+# submodel's own `~`/`=` names promote PER CELL (namespaced under `col`) and its
+# return binds to `col[i]`. The rewritten plate then flows through the ordinary
+# plate desugar, so a per-cell submodel lowers exactly like the hand-inlined
+# per-cell program (transparent) — a centered latent (`col[i] ~ dist`), a
+# non-centered transform (`z[i] ~ dist; col[i] = f(z[i])`), or a per-cell
+# observation stream (`col` a data column). No new IR: the inlined statements
+# reduce to the per-cell parameter / derived-cell / observation shapes the
+# primitive already supports.
+
+# A plate cell that is a per-cell submodel call `col[i] ~ sm(…)`: returns
+# `(colref, callexpr)` with `colref === Expr(:ref, col, i)`, else nothing. Only a
+# scalar `~` whose LHS is the loop-variable-indexed column and whose RHS head
+# resolves to a submodel qualifies; every other cell passes through untouched to
+# the ordinary cell desugar.
+function _cell_submodel_call(c, ivar::Symbol, mod::Module)
+    c isa Expr && _is_sample(c) || return nothing
+    lhs = c.args[2]
+    (lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
+        lhs.args[1] isa Symbol && lhs.args[2] === ivar) || return nothing
+    _resolve_submodel(c.args[3], mod) === nothing && return nothing
+    return (lhs, c.args[3])
+end
+
+# True for a top-level `@plate for i in R … end` macrocall with at least one
+# per-cell submodel-call cell. Only peeks for submodel cells (the plate's exact
+# structural validation stays in `_desugar_plate`); a malformed plate returns
+# false here and errors later with the canonical message.
+function _plate_has_submodel_cell(arg, mod::Module)
+    arg isa Expr && arg.head === :macrocall && !isempty(arg.args) &&
+        arg.args[1] === Symbol("@plate") || return false
+    loop = arg.args[end]
+    (loop isa Expr && loop.head === :for && length(loop.args) == 2) || return false
+    asg = loop.args[1]
+    (asg isa Expr && asg.head === :(=) && length(asg.args) == 2 &&
+        asg.args[1] isa Symbol) || return false
+    body = loop.args[2]
+    body isa Expr && body.head === :block || return false
+    return any(_cell_submodel_call(c, asg.args[1], mod) !== nothing
+        for c in body.args)
+end
+
+# Rewrite a `@plate` block, replacing each per-cell submodel-call cell with the
+# submodel's inlined `i`-indexed cell statements; other cells pass through.
+function _expand_plate_cell_submodels(pl::Expr, mod::Module, data::Set{Symbol})
+    loop = pl.args[end]::Expr
+    asg = loop.args[1]::Expr
+    ivar = asg.args[1]::Symbol
+    body = loop.args[2]::Expr
+    cells = Any[]
+    for c in body.args
+        call = _cell_submodel_call(c, ivar, mod)
+        call === nothing ? push!(cells, c) :
+            append!(cells, _expand_cell_submodel(call[1], call[2], ivar, mod, data))
+    end
+    newloop = Expr(:for, asg, Expr(:block, cells...))
+    return Expr(:macrocall, pl.args[1:end-1]..., newloop)
+end
+
+_is_dotted_obj(st::Expr) =
+    _is_sample(st) && st.args[3] isa Expr && st.args[3].head === :.
+
+# Inline one per-cell submodel call `col[i] ~ sm(callargs…)` into a sequence of
+# `i`-indexed cell statements. The submodel's own `~`/`=` names are namespaced
+# under `col` and indexed per cell (`col_<nm>[i]`); its positional args bind to
+# the call arguments (written per-cell by the user, e.g. `x[i]`). The RETURN
+# selects what binds to `col[i]`:
+#   • a bare Symbol naming exactly one internal statement → that statement's LHS
+#     binds DIRECTLY to `col[i]` (a clean centered latent `col[i] ~ dist(…)`, a
+#     non-centered derived `col[i] = …`, or an observation slot `col[i] ~
+#     dist.(…)` on a data column), no trailing binding;
+#   • any other return → every internal name namespaces and a trailing
+#     `col[i] = <return>` binds the cell (a compound latent transform).
+# Shape compatibility (dots follow the callee, exactly as at top level): a data
+# column admits only an observation-slot submodel; a non-data column binds a
+# latent. The dotted/undotted distinction is finally enforced by the cell
+# desugar the inlined statements flow through.
+function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
+                               mod::Module, data::Set{Symbol})
+    col = colref.args[1]::Symbol
+    sm = _resolve_submodel(callexpr, mod)::RKPPLSubmodel
+    callargs = callexpr.args[2:end]
+    length(callargs) == length(sm.argnames) || _sfail(
+        "submodel `$(sm.name)` expects $(length(sm.argnames)) argument(s) " *
+        "$(Tuple(sm.argnames)), got $(length(callargs)) at `$col[$ivar] ~ " *
+        "$(sm.name)(...)`")
+    stmts, ret = _submodel_body_parts(sm)
+    # The direct-bound slot: a bare-Symbol return naming exactly one internal
+    # statement, whose LHS binds to `col[i]`.
+    slot = nothing
+    if ret isa Symbol
+        hits = findall(st -> _stmt_lhs(st) === ret, stmts)
+        length(hits) > 1 && _sfail("submodel `$(sm.name)`: return `$ret` names " *
+            "more than one statement")
+        isempty(hits) || (slot = first(hits))
+    end
+    if col in data
+        (slot !== nothing && _is_dotted_obj(stmts[slot])) || _sfail(
+            "`$col` is a data column, so `$(sm.name)` must be a per-cell " *
+            "observation submodel: return a `slot` that is the LHS of an " *
+            "internal `slot ~ family.(...)` dotted response — `$(sm.name)` " *
+            "returns " *
+            (slot === nothing ? "a value" :
+             _is_sample(stmts[slot]) ? "a scalar (latent) distribution" :
+             "a derived assignment") *
+            ", so use a non-data LHS.")
+    elseif slot !== nothing && _is_dotted_obj(stmts[slot])
+        _sfail("`$(sm.name)` is a per-cell observation submodel (its return " *
+            "slot `$ret` is a `~ family.(...)` dotted response); bind it to a " *
+            "DATA column (`<data>[$ivar] ~ $(sm.name)(...)`), not the non-data " *
+            "name `$col`.")
+    end
+    # Build the substitution: args → call args; each internal name → its indexed
+    # namespaced ref, except the direct-bound slot → `col[i]`.
+    argset = Set{Symbol}(sm.argnames)
+    submap = Dict{Symbol,Any}()
+    for (a, v) in zip(sm.argnames, callargs)
+        submap[a] = v
+    end
+    for (k, st) in enumerate(stmts)
+        nm = _stmt_lhs(st)
+        nm in argset && _sfail("submodel `$(sm.name)`: `$nm` is both an " *
+            "argument and a local statement — rename the local")
+        haskey(submap, nm) && _sfail("submodel `$(sm.name)`: `$nm` is " *
+            "assigned twice")
+        submap[nm] = k == slot ? Expr(:ref, col, ivar) :
+            Expr(:ref, _ns(col, nm), ivar)
+    end
+    out = Any[]
+    for st in stmts
+        _reject_nested_submodel(sm, st)
+        push!(out, _subst(st, submap))
+    end
+    # Compound-return latent: bind `col[i]` to the substituted return value.
+    slot === nothing && push!(out, Expr(:(=), Expr(:ref, col, ivar),
+        _subst(ret, submap)))
     return out
 end
 
