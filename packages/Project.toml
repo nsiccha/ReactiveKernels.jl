@@ -1,28 +1,30 @@
 [deps]
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
 ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 ReactiveKernelsBatchingExamples = "00050de8-5ab0-44ad-ad08-8f6b0ddc01dd"
 ReactiveKernelsCompatibilityExamples = "b8c154ef-4cb8-413d-9282-0e653aa014e1"
 ReactiveKernelsDistributionKernels = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
-ReactiveKernelsKernelExamples = "c1a917b0-63b1-4b16-afa9-60dbf16f95f3"
 ReactiveKernelsHMCDiagnostics = "7283f29e-af9b-44bd-b98f-4e6318e8ac2b"
+ReactiveKernelsKernelExamples = "c1a917b0-63b1-4b16-afa9-60dbf16f95f3"
 ReactiveKernelsNUTSExamples = "1bd07bcb-ec6f-4af5-8d58-21805f68d06f"
 ReactiveKernelsPPL = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 ReactiveKernelsPPLExamples = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
-ReactiveKernelsStreamingStats = "fe060097-a659-4245-b1df-751eb37b739a"
 ReactiveKernelsReactantODESolvers = "03eb76aa-2b23-4fab-a762-f0290f039ac9"
+ReactiveKernelsStreamingStats = "fe060097-a659-4245-b1df-751eb37b739a"
 
 [compat]
 ReactiveKernels = "0.1"
 ReactiveKernelsBatchingExamples = "0.1"
 ReactiveKernelsCompatibilityExamples = "0.1"
 ReactiveKernelsDistributionKernels = "0.1"
-ReactiveKernelsKernelExamples = "0.1"
 ReactiveKernelsHMCDiagnostics = "0.1"
+ReactiveKernelsKernelExamples = "0.1"
 ReactiveKernelsNUTSExamples = "0.1"
 ReactiveKernelsPPL = "0.1"
 ReactiveKernelsPPLExamples = "0.1"
-ReactiveKernelsStreamingStats = "0.1"
 ReactiveKernelsReactantODESolvers = "0.1"
+ReactiveKernelsStreamingStats = "0.1"
 julia = "1.10"
 
 [sources.ReactiveKernels]
@@ -37,11 +39,11 @@ path = "ReactiveKernelsCompatibilityExamples"
 [sources.ReactiveKernelsDistributionKernels]
 path = "ReactiveKernelsDistributionKernels"
 
-[sources.ReactiveKernelsKernelExamples]
-path = "ReactiveKernelsKernelExamples"
-
 [sources.ReactiveKernelsHMCDiagnostics]
 path = "ReactiveKernelsHMCDiagnostics"
+
+[sources.ReactiveKernelsKernelExamples]
+path = "ReactiveKernelsKernelExamples"
 
 [sources.ReactiveKernelsNUTSExamples]
 path = "ReactiveKernelsNUTSExamples"
@@ -52,8 +54,8 @@ path = "ReactiveKernelsPPL"
 [sources.ReactiveKernelsPPLExamples]
 path = "ReactiveKernelsPPLExamples"
 
-[sources.ReactiveKernelsStreamingStats]
-path = "ReactiveKernelsStreamingStats"
-
 [sources.ReactiveKernelsReactantODESolvers]
 path = "ReactiveKernelsReactantODESolvers"
+
+[sources.ReactiveKernelsStreamingStats]
+path = "ReactiveKernelsStreamingStats"

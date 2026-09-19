@@ -100,7 +100,8 @@ end
     built = build_kernel(plan)
     @test built.spec isa ReactiveKernels.KernelSpec
     @test built.layout.total == 3
-    # Likelihoods lower to plate calls (Expr(:do)), never fused broadcasts.
+    # Gaussian likelihoods lower to plate calls (Expr(:do)); Bernoulli-logit
+    # and Poisson-log base GLMs fuse to whole-vector reductions instead.
     _has_do(ex::Expr) = ex.head === :do ||
         any(a -> a isa Expr && _has_do(a), ex.args)
     _has_do(_) = false
@@ -181,6 +182,84 @@ end
     pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, plan, u)
+end
+
+_has_call(ex::Expr, fn::Symbol) =
+    (ex.head === :call && !isempty(ex.args) && ex.args[1] === fn) ||
+    any(a -> a isa Expr && _has_call(a, fn), ex.args)
+_has_call(_, ::Symbol) = false
+_has_sym(ex::Expr, s::Symbol) =
+    any(a -> (a isa Symbol && a === s) || (a isa Expr && _has_sym(a, s)),
+        ex.args)
+_has_sym(_, ::Symbol) = false
+
+# Base Bernoulli-logit / Poisson-log lower to a fused whole-vector
+# reduction (`dot` + `sum(f, x)`); literal ranges, weights, and evidence
+# stay on the per-cell plate path. Ranged ≡ bare up to summation order
+# (the cover rule), pinning fused-vs-plate parity on identical densities.
+function _gen_ranged_plan(base::StructuralPlan, range::UnitRange{Int})
+    r = base.responses[1]
+    rr = LikelihoodSpec(r.family, r.link, r.response, r.predictor, r.scale,
+        r.weights, r.evidence, r.label, r.trials, range)
+    plan = StructuralPlan([rr],
+        base.predictors, base.population_priors, base.parameters,
+        base.assignments, base.columns, base.n_obs; roles = base.roles,
+        derived = base.derived, levelmaps = base.levelmaps,
+        plate_parameters = base.plate_parameters, scans = base.scans,
+        ranef_buckets = base.ranef_buckets)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "bernoulli/poisson whole-vector fusion" begin
+    # Base Bernoulli routes fused.
+    plan = _gen_bernoulli_plan(repeat([false, true], 3))
+    built = build_kernel(plan)
+    ex = kernel_expr(plan, built.layout)
+    @test _has_call(ex, :dot)
+    @test !_has_sym(ex, :_ppl_pw_y_resp)
+    # Ranged Bernoulli routes plate and matches the fused density.
+    rplan = _gen_ranged_plan(plan, 1:6)
+    rbuilt = build_kernel(rplan)
+    rex = kernel_expr(rplan, rbuilt.layout)
+    @test !_has_call(rex, :dot)
+    @test _has_sym(rex, :_ppl_pw_y_resp)
+    u = [0.25, 0.5]
+    @test _query(rbuilt.spec, rplan, :posterior, u) ≈
+        _query(built.spec, plan, :posterior, u)
+    _check_gradient(rbuilt.spec, rplan, u)
+    # Base Poisson routes fused.
+    pplan = _gen_poisson_plan()
+    pbuilt = build_kernel(pplan)
+    pex = kernel_expr(pplan, pbuilt.layout)
+    @test _has_call(pex, :dot)
+    @test !_has_sym(pex, :_ppl_pw_y_resp)
+    # Ranged Poisson routes plate and matches the fused density.
+    rpplan = _gen_ranged_plan(pplan, 1:6)
+    rpbuilt = build_kernel(rpplan)
+    rpex = kernel_expr(rpplan, rpbuilt.layout)
+    @test !_has_call(rpex, :dot)
+    @test _has_sym(rpex, :_ppl_pw_y_resp)
+    up = [0.1, -0.2]
+    @test _query(rpbuilt.spec, rpplan, :posterior, up) ≈
+        _query(pbuilt.spec, pplan, :posterior, up)
+    _check_gradient(rpbuilt.spec, rpplan, up)
+    # Weighted Bernoulli stays on the plate path.
+    cols, n = _gen_columns()
+    cols[:y] = repeat([false, true], 3)
+    cols[:w] = [1.0, 2.0, 1.0, 1.0, 2.0, 1.0]
+    wplan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta,
+            nothing, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(wplan)
+    wbuilt = build_kernel(wplan)
+    wex = kernel_expr(wplan, wbuilt.layout)
+    @test !_has_call(wex, :dot)
+    @test _has_sym(wex, :_ppl_pw_y_resp)
+    _check_gradient(wbuilt.spec, wplan, u)
 end
 
 function _gen_binomial_plan(y, trials)

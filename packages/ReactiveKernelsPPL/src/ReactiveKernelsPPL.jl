@@ -14,6 +14,7 @@ BRM–RK backend plan; the emitter→layer input contract lives in
 module ReactiveKernelsPPL
 
 using ReactiveKernels
+import SpecialFunctions
 
 export ColumnRef, ParamName
 export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
