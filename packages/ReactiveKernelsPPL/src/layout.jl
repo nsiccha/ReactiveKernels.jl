@@ -51,11 +51,11 @@ function _entry_transform(family::Symbol, override::SupportOverride)
 end
 
 """One packed slice: a coefficient block, a scalar latent, a scan vector
-latent, a per-cell latent block, or a leveled vector latent (cutpoints,
-thresholds, simplex). `lo`/`hi` are the constrained bounds of an
-`:interval` transform (`NaN` otherwise)."""
+latent, a per-cell latent block, a leveled vector latent (cutpoints,
+thresholds, simplex), or a spline coefficient-vector block. `lo`/`hi`
+are the constrained bounds of an `:interval` transform (`NaN` otherwise)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector
+    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
@@ -130,6 +130,15 @@ function assign_layout(plan::StructuralPlan)
             LayoutEntry(:vector, nothing, p.name, labels, offset, packed,
                 transform))
         offset += packed
+    end
+    # Spline coefficient vectors: one contiguous block per SplineVector
+    # (plate-shaped; priors broadcast over cells). Width is static from k.
+    for v in plan.spline_vectors
+        transform, lo, hi = _entry_transform(v.family, v.support_override)
+        push!(entries,
+            LayoutEntry(:spline, nothing, v.name, [v.name], offset, v.width,
+                transform, lo, hi))
+        offset += v.width
     end
     # Sequential-recurrence latents: one identity array slice per scan. The
     # length T is the loop bound — a literal Int, or `n_obs` when the bound is a
@@ -260,7 +269,7 @@ function coordinate_names(layout::LayoutTable)
             for label in e.labels
                 push!(names, Symbol(string(e.predictor) * "." * string(label)))
             end
-        elseif e.kind === :plate
+        elseif e.kind === :plate || e.kind === :spline
             for i in 1:e.size
                 push!(names, Symbol(string(e.name) * "." * string(i)))
             end
@@ -292,7 +301,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :coefficient
             push!(pairs, e.predictor => Vector{Float64}(seg))
-        elseif e.kind === :plate
+        elseif e.kind === :plate || e.kind === :spline
             v = [_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name => v)
         elseif e.kind === :scan
@@ -324,13 +333,14 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] predictor $(e.predictor) length mismatch"),
             )
             u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
-        elseif e.kind === :plate
+        elseif e.kind === :plate || e.kind === :spline
+            what = e.kind === :plate ? "plate parameter" : "spline vector"
             haskey(nt, e.name) || throw(
-                ContractValidationError("[layout] missing plate parameter $(e.name)"),
+                ContractValidationError("[layout] missing $what $(e.name)"),
             )
             v = nt[e.name]
             length(v) == e.size || throw(
-                ContractValidationError("[layout] plate parameter $(e.name) length mismatch"),
+                ContractValidationError("[layout] $what $(e.name) length mismatch"),
             )
             for (k, x) in enumerate(v)
                 u[e.offset + k - 1] = _unconstrain_elt(e, Float64(x))
@@ -466,7 +476,10 @@ function transform_statements(e::LayoutEntry)
         return Expr[:($(e.name)::AbstractVector{Float64} =
             view(unconstrained, $lo:$hi))]
     end
-    if e.kind === :plate
+    if e.kind === :plate || e.kind === :spline
+        # Spline vectors ride the plate transform path (block + scalar
+        # endpoints); the contract pins their supports to real/positive,
+        # so the :interval arm below is unreachable for them.
         return _plate_transform_statements(e)
     end
     if e.kind === :vector
@@ -627,10 +640,12 @@ function jacobian_term(e::LayoutEntry)
             log1p(-$(_vector_z(e, j)))) for j in 1:e.size]
         return foldl((a, b) -> :($a + $b), terms)
     end
-    if e.kind === :plate
+    if e.kind === :plate || e.kind === :spline
         # Interval plates hand-roll the per-cell Jacobian sum (parameterized
         # bounds, no companion `logjac` plate); every registry transform sums
         # its companion `logjac` plate from `_plate_transform_statements`.
+        # Spline vectors share the shape (their supports never reach
+        # :interval, but the arm stays correct if that ever changes).
         if e.transform === :interval
             blo, bhi = e.lo, e.hi
             return :(sum(log.($(e.name) .- $blo) .+ log.($bhi .- $(e.name)) .-

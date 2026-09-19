@@ -66,6 +66,13 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps)
         # its coefficients live in the PlateParameter layout block, so this
         # term contributes no design width.
         return DesignBlock(LatentTerm, only(t.columns), t.addressee, 0, Symbol[], [])
+    elseif t.kind === SplineSummandTerm
+        # A spline summand is a direct `X*b + Z*(sd*z)` expression over
+        # materialized basis columns and SplineVector layout blocks — no
+        # design-matrix width. The basis id rides in `column` so the
+        # generator can resolve the blocks without re-reading terms.
+        return DesignBlock(SplineSummandTerm, t.options.spline_id,
+            t.addressee, 0, Symbol[], [])
     elseif t.kind === FactorTerm
         col = only(t.columns)
         m = _find_levelmap(levelmaps, pname, col)
