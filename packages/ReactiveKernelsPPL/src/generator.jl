@@ -82,6 +82,7 @@ using SpecialFunctions: erfc
 # names in the assignment allowlist.
 using Statistics: mean, std, var
 using LinearAlgebra: dot
+using LogExpFunctions: log1pexp
 # Bijector objects the generated program splices (constrained-parameter
 # transforms); imported from the enclosing module so the emitted
 # `positive_bijector()` / `unit_bijector()` calls resolve.
@@ -166,6 +167,9 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family === GaussianFam
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliLogitFam
+        # Base GLM case (no evidence, no weights): fused whole-vector reduction.
+        r.evidence.kind === :none && r.weights === nothing &&
+            return _bernoulli_wholevec_stmts(r, plan, node)
         return _bernoulli_plate_stmts(r, plan, node, pw)
     elseif r.family === PoissonLogFam
         # Base GLM case (no evidence, no weights): fused whole-vector reduction
@@ -310,6 +314,20 @@ end
 # `sum(exp, η)` reduces without materialising the intermediate. Gradient stays
 # ordinary Enzyme/Reactant AD — no analytic adjoint.
 _yfloat_name(label::Symbol) = Symbol(:_ppl_yf_, label)
+
+# Fused whole-vector Bernoulli-logit likelihood (base case). Logit-form log-mass
+# `Σ yᵢ·ηᵢ − Σ log1pexp(ηᵢ)` — no data-only normalizer, a plain fused reduction.
+# Value-identical to `Σ bernoulli(; logit=ηᵢ).logpdf(yᵢ)`; same folded-`_ppl_yf`
+# and `sum(f, x)` treatment as the Poisson form. Gradient stays ordinary AD.
+function _bernoulli_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    yf = _yfloat_name(r.label)
+    return Expr[
+        :($yf = Float64.($y)),
+        :($node::Float64 = dot($yf, $lp) - sum(log1pexp, $lp)),
+    ]
+end
 
 function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
     y = r.response
