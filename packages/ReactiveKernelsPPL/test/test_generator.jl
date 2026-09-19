@@ -1427,3 +1427,27 @@ end
     @test _query(builtM.spec, planM, :likelihood, Float64[]) == 0.0
     @test _query(builtM.spec, planM, :log_jacobian, Float64[]) == 0.0
 end
+
+# The parameterized interval_bijector(lo,hi) library entry (todo 0ube9da,
+# decision 16c7aea = B). Endpoints are the affine-logistic ℝ→(lo,hi) map; the
+# host prepares them with bounds `bound=` in, the generator splices them with
+# literal bounds. The consumer :interval refactor lands separately (plate:breadth).
+@testset "interval_bijector library entry" begin
+    lo, hi, u = -2.0, 5.0, 0.3
+    x = lo + (hi - lo) / (1 + exp(-u))
+    lj = log(x - lo) + log(hi - x) - log(hi - lo)
+    # host-prepared endpoints (bounds bound in) match the affine-logistic math
+    @test ReactiveKernelsPPL._prepared_interval_endpoint(lo, hi, :constrain)(u) ≈ x
+    @test ReactiveKernelsPPL._prepared_interval_endpoint(lo, hi, :logjac)(u) ≈ lj
+    @test ReactiveKernelsPPL._prepared_interval_endpoint(lo, hi, :unconstrain)(x) ≈ u
+    @test lo < ReactiveKernelsPPL._prepared_interval_endpoint(lo, hi, :constrain)(u) < hi
+    # graph splice with literal bounds inlines (no runtime call) and evaluates
+    spec = @kernel _itest(unconstrained::Vector{Float64}) = begin
+        q::Float64 = interval_bijector(-2.0, 5.0).constrain(sum(view(unconstrained, 1:1)))
+        qlj::Float64 = interval_bijector(-2.0, 5.0).logjac(sum(view(unconstrained, 1:1)))
+        posterior::Float64 = q + qlj
+    end
+    pl = plan(spec; want = :posterior)
+    @test prepare(pl)([u]) ≈ x + lj
+    @test !occursin("interval_bijector", sprint(show, code_expr(pl)))
+end
