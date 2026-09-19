@@ -300,9 +300,83 @@ function _likelihood_statements(plan::StructuralPlan)
         append!(stmts, _response_likelihood_stmts(r, plan))
         push!(terms, _lik_name(r.label))
     end
+    for kp in plan.kernel_plates
+        kstmts, kterm = _kernel_plate_likelihood(kp, plan)
+        append!(stmts, kstmts)
+        push!(terms, kterm)
+    end
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
     push!(stmts, :(likelihood::Float64 = $joint))
     return stmts
+end
+
+# Panel-kernel likelihood (flat codegen): panel-v1 cell bodies are
+# elementwise, so the subject map dissolves into flat vector ops over the
+# `n_sub*T` block (numerically identical to a per-subject loop for the
+# admitted subset): slice params rewrite to flat column refs (scalar
+# slices to their bind-time T-block expansions), cell assignments emit as
+# flat statements, and the single Gaussian obs lowers as a flat plate
+# reusing the plate-sum machinery. The collected name aliases its flat
+# value (future generated quantities read it).
+function _kernel_plate_likelihood(kp::KernelPlate, plan::StructuralPlan)
+    isbound(plan) ||
+        throw(ContractValidationError("[generator] kernel plates lower " *
+              "from a bound plan (bind_data first)"))
+    kp.subjects isa Int ||
+        throw(ContractValidationError("[generator] kernel plate " *
+              "`$(kp.result)` subjects unresolved (bind_data with dims first)"))
+    flatmap = _kernel_flatmap(kp)
+    stmts = Expr[]
+    for (nm, ex) in _canonicalize_kernel_assignments(kp)
+        push!(stmts, :($nm = $(_rewrite_kernel_refs(ex, flatmap))))
+    end
+    obs = kp.obs
+    obs.family === GaussianFam ||
+        throw(ContractValidationError("[generator] kernel plate " *
+              "`$(kp.result)` obs family $(obs.family) has no emitter " *
+              "(panel v1: Gaussian only)"))
+    inputs = Any[flatmap[obs.response]]
+    rv = _dovar(1)
+    # Location threads as input 2 when symbolic (the `_ppl_lp_` precedent:
+    # computed flat locals ride as plate inputs); literals inline.
+    locv = _thread_ref!(inputs, _kernel_obs_ref(obs.location, flatmap))
+    sref = _thread_ref!(inputs, _kernel_obs_ref(obs.scale, flatmap))
+    cell = :(normal($locv, $sref).logpdf($rv))
+    klabel = Symbol(:kernel_, kp.result)
+    append!(stmts, _plate_sum_stmts(_pw_name(klabel), _lik_name(klabel),
+        inputs, cell))
+    collected = haskey(flatmap, kp.collected) ? flatmap[kp.collected] : kp.collected
+    collected === kp.result ||
+        push!(stmts, :($(kp.result) = $collected))
+    return stmts, _lik_name(klabel)
+end
+
+# Slice params to flat refs: vector slices ride their flat T-blocked
+# column; scalar slices ride the bind-time T-block expansion (or the raw
+# column in all-scalar models, where no expansion exists).
+function _kernel_flatmap(kp::KernelPlate)
+    flatmap = Dict{Symbol,Symbol}()
+    for (col, param, kind) in kp.slices
+        kind in (:vector, :scalar) ||
+            throw(ContractValidationError("[generator] kernel plate " *
+                  "`$(kp.result)` slice `$param` kind unresolved " *
+                  "(bind_data first)"))
+        flatmap[param] =
+            (kind === :vector || kp.timepoints === nothing) ? col :
+            _kexp_name(kp.result, col)
+    end
+    return flatmap
+end
+
+# Obs location/scale through the flatmap (slice params only); cell
+# locals, globals, and literals pass to `_thread_ref!` unchanged.
+_kernel_obs_ref(ref, flatmap::Dict{Symbol,Symbol}) =
+    ref isa Symbol && haskey(flatmap, ref) ? flatmap[ref] : ref
+
+function _rewrite_kernel_refs(ex, flatmap::Dict{Symbol,Symbol})
+    ex isa Symbol && return get(flatmap, ex, ex)
+    ex isa Expr || return ex
+    return Expr(ex.head, (_rewrite_kernel_refs(a, flatmap) for a in ex.args)...)
 end
 
 # One plate likelihood per response (pointwise plate + scalar sum node).

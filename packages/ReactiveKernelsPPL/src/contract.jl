@@ -454,6 +454,55 @@ struct HSGPBasis
 end
 
 """
+    KernelPlate(result, subjects, timepoints, slices, assignments, obs, collected, label)
+
+One panel kernel (BRM `_RKKernelPlan`, panel v1): `result` is the collected
+per-subject name (the plate LHS); `subjects` the subject count (integer
+literal, or a dims-key `Symbol` resolved at bind); `timepoints` the
+per-subject timepoint count (`nothing` for all-scalar models, an integer,
+or a dims-key `Symbol` resolved at bind); `slices` the
+`(data column, cell param, kind)` triples with `kind ∈ (:vector, :scalar,
+:unknown)` (`:unknown` pre-bind — kinds resolve from lengths at bind);
+`assignments` the cell-local `name => expr` pairs in cell order (flat
+elementwise vocabulary); `obs` the single in-cell observation
+`(response, family, location, scale)` with `response` a cell param;
+`collected` the trailing collected cell name. Grouping is ABSENT for
+panel (implicit 1:n subjects — structural, no sentinel).
+"""
+struct KernelPlate
+    result::Symbol
+    subjects::Union{Int,Symbol}
+    timepoints::Union{Nothing,Int,Symbol}
+    slices::Vector{Tuple{Symbol,Symbol,Symbol}}
+    assignments::Vector{Pair{Symbol,Any}}
+    obs::NamedTuple{(:response, :family, :location, :scale)}
+    collected::Symbol
+    label::Symbol
+end
+
+"""Flat length of a resolved kernel plate: `n_sub * T` (`T = 1` all-scalar)."""
+_kernel_flat_length(n_sub::Int, T::Union{Nothing,Int}) =
+    T === nothing ? n_sub : n_sub * T
+
+"""Materialized flat-expansion column for a scalar slice (spline-blocks
+precedent: deterministic bind product, caller collisions fail closed)."""
+_kexp_name(result::Symbol, col::Symbol) = Symbol("$(result)_kexp_$(col)")
+
+"""Columns a kernel plate manages (slice columns + scalar expansions):
+exempt from the uniform-`n_obs` rule, validated under kernel rules.
+Expansions exist only for resolved vector models (`T isa Int`); gating
+on that keeps a stray caller column from hiding behind the exemption."""
+function _kernel_managed_columns(kp::KernelPlate)
+    out = Set{Symbol}()
+    for (col, _, kind) in kp.slices
+        push!(out, col)
+        kind === :scalar && kp.timepoints isa Int &&
+            push!(out, _kexp_name(kp.result, col))
+    end
+    return out
+end
+
+"""
     AssignmentSpec(name, expr)
 
 One scalar temporary (slice 1): `expr` may reference scalar names and
@@ -596,6 +645,7 @@ struct StructuralPlan
     spline_bases::Vector{SplineBasis}
     spline_vectors::Vector{SplineVector}
     hsgp_bases::Vector{HSGPBasis}
+    kernel_plates::Vector{KernelPlate}
 end
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
@@ -614,7 +664,7 @@ StructuralPlan(
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[],
         RanefBucket[], VectorParameter[], SplineBasis[], SplineVector[],
-        HSGPBasis[])
+        HSGPBasis[], KernelPlate[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -641,11 +691,12 @@ function StructuralPlan(
         vector_parameters::Vector{VectorParameter} = VectorParameter[],
         spline_bases::Vector{SplineBasis} = SplineBasis[],
         spline_vectors::Vector{SplineVector} = SplineVector[],
-        hsgp_bases::Vector{HSGPBasis} = HSGPBasis[])
+        hsgp_bases::Vector{HSGPBasis} = HSGPBasis[],
+        kernel_plates::Vector{KernelPlate} = KernelPlate[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, columns, n_obs, roles, levelmaps,
         plate_parameters, scans, ranef_buckets, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases)
+        spline_bases, spline_vectors, hsgp_bases, kernel_plates)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -793,6 +844,20 @@ function _hsgp_all_names(hb::HSGPBasis)
     return Symbol[n.beta, n.sigma, n.rhos...]
 end
 
+# Every model-scope name a kernel plate introduces (cell names become flat
+# model-scope locals at codegen): the result, slice params, and cell-local
+# assignment names. Single source for the global name-table gate.
+function _kernel_all_names(kp::KernelPlate)
+    names = Symbol[kp.result]
+    for (_, p, _) in kp.slices
+        push!(names, p)
+    end
+    for (nm, _) in kp.assignments
+        push!(names, nm)
+    end
+    return names
+end
+
 """
     _hsgp_floors(K, fits, iso) -> Vector{Float64}
 
@@ -909,6 +974,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_predictors(plan)
     _validate_levelmaps(plan)
     _validate_priors(plan)
+    _validate_kernels(plan)
     _validate_responses(plan)
     _validate_ranef_buckets(plan)
     _validate_splines(plan)
@@ -932,6 +998,7 @@ function validate_data(plan::StructuralPlan)
     _validate_ranef_buckets_data(plan)
     _validate_splines_data(plan)
     _validate_hsgp_data(plan)
+    _validate_kernels_data(plan)
     return nothing
 end
 
@@ -1180,8 +1247,14 @@ end
 
 function _validate_columns(plan::StructuralPlan)
     plan.n_obs > 0 || _fail(:plan, "n_obs must be positive, got $(plan.n_obs)")
+    managed = Set{Symbol}()
+    for kp in plan.kernel_plates
+        union!(managed, _kernel_managed_columns(kp))
+    end
     for (name, col) in plan.columns
-        length(col) == plan.n_obs ||
+        # Kernel-managed columns (slices + scalar expansions) carry two
+        # lengths by design — they validate under kernel rules, not here.
+        name in managed || length(col) == plan.n_obs ||
             _fail(name, "column length $(length(col)) ≠ n_obs $(plan.n_obs)")
         !any(ismissing, col) ||
             _fail(name, "column contains missing (slice 1 has no missingness machinery)")
@@ -1385,6 +1458,395 @@ function _validate_hsgp_data(plan::StructuralPlan)
     return nothing
 end
 
+# Panel-kernel (KernelPlate) structure: everything provable without data.
+# Panel v1: at most one plate per model; a plate carries the ONLY
+# likelihood (no top-level responses alongside — BRM routes kernel models
+# away from the GLM flow); grouping is ABSENT (implicit 1:n subjects —
+# structural, no sentinel, pinned here + tests).
+function _validate_kernels(plan::StructuralPlan)
+    plates = plan.kernel_plates
+    length(plates) <= 1 ||
+        _fail(:plan, "panel v1 admits at most one kernel plate per model " *
+              "(got $(length(plates)))")
+    isempty(plates) && return nothing
+    kp = only(plates)
+    isempty(plan.responses) ||
+        _fail(kp.label, "a kernel plate carries the only likelihood " *
+              "(panel v1: no top-level responses alongside `$(kp.result)`)")
+    # Name hygiene + collisions (result, slice params, cell locals) live in
+    # the global `_validate_name_tables` gate via `_kernel_all_names`.
+    _check_name_hygiene(kp.label)
+    if kp.subjects isa Int
+        kp.subjects > 0 ||
+            _fail(kp.label, "subject count must be a positive integer, " *
+                  "got $(kp.subjects)")
+    end
+    if kp.timepoints isa Int
+        kp.timepoints > 0 ||
+            _fail(kp.label, "timepoint count must be a positive integer, " *
+                  "got $(kp.timepoints)")
+    end
+    slices = kp.slices
+    isempty(slices) &&
+        _fail(kp.label, "kernel plate `$(kp.result)` takes at least one slice")
+    cols = [c for (c, _, _) in slices]
+    length(unique(cols)) == length(cols) ||
+        _fail(kp.label, "duplicate slice columns $(cols)")
+    params = [p for (_, p, _) in slices]
+    for (_, _, kind) in slices
+        kind in (:vector, :scalar, :unknown) ||
+            _fail(kp.label, "slice kind must be :vector, :scalar, or " *
+                  ":unknown (pre-bind), got $(repr(kind))")
+    end
+    # Cell assignments in order: each RHS sees slice params + earlier
+    # locals + model-scope scalars only (cross-cell refs fail closed).
+    known = union(Set{Symbol}(params), _union_names(plan))
+    cell_locals = Set{Symbol}()
+    for (nm, ex) in kp.assignments
+        _collect_kernel_cell_refs!(Symbol[], ex, kp, known)
+        push!(known, nm)
+        push!(cell_locals, nm)
+    end
+    # The single in-cell observation (Gaussian-identity v1).
+    obs = kp.obs
+    obs.response in params ||
+        _fail(kp.label, "kernel obs response `$(obs.response)` is not a " *
+              "slice param (responses enter the cell as slices)")
+    obs.family === GaussianFam ||
+        _fail(kp.label, "panel v1 admits a Gaussian in-cell observation " *
+              "only, got $(obs.family)")
+    for (nm, ref) in ((:location, obs.location), (:scale, obs.scale))
+        if ref isa Number && !(ref isa Bool)
+            (isfinite(ref) && (nm === :location || ref > 0)) ||
+                _fail(kp.label, "kernel obs $nm literal must be finite" *
+                      (nm === :scale ? " positive" : "") * ", got $ref")
+        elseif ref isa Symbol
+            ref in known ||
+                _fail(kp.label, "kernel obs $nm `$ref` is neither a cell " *
+                      "name nor a model-level scalar (cross-cell refs " *
+                      "fail closed)")
+        else
+            _fail(kp.label, "kernel obs $nm must be a cell/model name or " *
+                  "a numeric literal, got $(repr(ref))")
+        end
+    end
+    kp.collected in union(Set{Symbol}(params), cell_locals) ||
+        _fail(kp.label, "collected result `$(kp.collected)` is not a cell " *
+              "name (slice param or cell-local assignment)")
+    return nothing
+end
+
+# Kernel cell vocabulary: the derived-column elementwise walker with a
+# cell name environment (slice params + earlier locals + model scalars).
+# Dotted ops/math, undotted arithmetic (canonicalized at bind),
+# `ifelse`, bare names and numeric literals; reductions, whole-column
+# functions, indexing, loops, branches, nested observations, and unknown
+# names fail closed.
+function _collect_kernel_cell_refs!(refs, ex, kp::KernelPlate, known::Set{Symbol})
+    label = kp.label
+    ex isa Number && return nothing
+    ex isa LineNumberNode && return nothing
+    if ex isa Symbol
+        ex in known ||
+            _fail(label, "cell expression references unknown name `$ex` " *
+                  "(slices + earlier cell locals + model-level scalars only)")
+        push!(refs, ex)
+        return nothing
+    end
+    ex isa Expr ||
+        _fail(label, "unsupported literal $(repr(ex)) (numeric literals only)")
+    head = ex.head
+    if head === :call
+        fn = ex.args[1]
+        if fn isa Symbol && fn in ELEMENTWISE_OPS
+            for arg in ex.args[2:end]
+                _collect_kernel_cell_refs!(refs, arg, kp, known)
+            end
+            return nothing
+        end
+        if fn isa Symbol && fn in REDUCTION_FNS
+            # A reduction over a series is cross-timepoint (per-subject
+            # aggregation) — not flat-lowerable in panel v1 (P3 needs real
+            # per-subject loop codegen); over a cell scalar it is
+            # degenerate. Either way it does not lower in a cell.
+            return _fail(label, "reduction `$fn` does not lower in a cell " *
+                                "(series reductions are cross-timepoint — P3)")
+        end
+        if fn isa Symbol && fn in VECTOR_FNS
+            return _fail(label, "whole-column `$fn` does not lower in a " *
+                                "cell (whole-model constructs only)")
+        end
+        if fn isa Symbol && fn in ASSIGNMENT_FNS
+            # Undotted arithmetic is admitted syntactically here (the
+            # emitter passes scalar-context user code verbatim — Ex1's
+            # `ke = CLi / Vci`); bind canonicalizes with slice-kind
+            # provenance (dotify over flat vectors, fail closed over 2+
+            # genuinely-vector operands). Unary +/- stay as-is (valid on
+            # vectors and scalars alike).
+            for arg in ex.args[2:end]
+                _collect_kernel_cell_refs!(refs, arg, kp, known)
+            end
+            return nothing
+        end
+        fn isa Symbol && startswith(string(fn), ".") &&
+            _fail(label, "dotted operator $fn is not in the panel-v1 " *
+                         "cell vocabulary")
+        return _fail(label, "call `$fn` is not in the panel-v1 cell " *
+                            "vocabulary (elementwise + reductions only)")
+    end
+    head === :. && return _collect_kernel_cell_dot!(refs, ex, kp, known)
+    head === :ref &&
+        _fail(label, "indexing does not lower in a cell (flat vectors " *
+                     "keep full length — no `[...]`)")
+    head === :(=) && _fail(label, "nested assignment does not lower in a cell")
+    head === :kw &&
+        _fail(label, "keyword arguments do not lower in a cell")
+    return _fail(label, "unsupported expression head $head in a cell " *
+                        "(elementwise expressions only)")
+end
+
+function _collect_kernel_cell_dot!(refs, ex, kp::KernelPlate, known::Set{Symbol})
+    label = kp.label
+    length(ex.args) == 2 && ex.args[1] isa Symbol && ex.args[2] isa Expr &&
+        ex.args[2].head === :tuple ||
+        return _fail(label, "field access does not lower in a cell " *
+                            "(dotted calls take `f.(...)`)")
+    f = ex.args[1]
+    args = ex.args[2].args
+    if f === :ifelse
+        length(args) == 3 ||
+            _fail(label, "`ifelse` takes `ifelse.(condition, x, y)`")
+        _collect_kernel_cell_condition!(refs, args[1], kp, known)
+        for arg in args[2:end]
+            _collect_kernel_cell_refs!(refs, arg, kp, known)
+        end
+        return nothing
+    end
+    f in ELEMENTWISE_FNS ||
+        _fail(label, "dotted call `$f.(...)` is not in the panel-v1 cell " *
+                     "vocabulary")
+    for arg in args
+        _collect_kernel_cell_refs!(refs, arg, kp, known)
+    end
+    return nothing
+end
+
+# Bind-time cell canonicalization (slice-kind provenance): undotted
+# arithmetic over flat vectors takes dotted-canonical form (the surface
+# `_canonical_expr` precedent — the emitter passes scalar-context user
+# code verbatim, e.g. Ex1's `ke = CLi / Vci`); pure-scalar
+# (global/literal) combos stay as-is; undotted operators over 2+
+# genuinely-vector operands fail closed naming the dotted fix (vector
+# `*`/`/` is meaningless in the cell). Shapes are CELL shapes
+# (:scalar for scalar slices + scalar-shaped locals, :vector for vector
+# slices + vector-shaped locals); derivation (slice/cell vs pure scalar)
+# drives dotify. Idempotent: bind applies it for early errors, the
+# generator re-applies it for hand-bound plans.
+const _KERNEL_UNDOTTED_ARITHMETIC = (:+, :-, :*, :/, :^)
+
+function _kernel_cell_shapes(kp::KernelPlate)
+    shapes = Dict{Symbol,Symbol}()
+    for (_, p, kind) in kp.slices
+        kind in (:vector, :scalar) ||
+            _fail(kp.label, "slice `$p` kind unresolved " *
+                  "(bind_data resolves :unknown from lengths)")
+        shapes[p] = kind
+    end
+    return shapes
+end
+
+function _canonicalize_kernel_assignments(kp::KernelPlate)
+    shapes = _kernel_cell_shapes(kp)
+    out = Pair{Symbol,Any}[]
+    for (nm, ex) in kp.assignments
+        canon, shape = _canonicalize_kernel_cell(ex, kp, shapes)
+        shapes[nm] = shape
+        push!(out, nm => canon)
+    end
+    return out
+end
+
+function _canonicalize_kernel_cell(ex, kp::KernelPlate, shapes::Dict{Symbol,Symbol})
+    label = kp.label
+    ex isa Number && return (ex, :scalar)
+    ex isa LineNumberNode && return (ex, :scalar)
+    ex isa Symbol && return (ex, get(shapes, ex, :scalar))
+    ex isa Expr || _fail(label, "unsupported literal $(repr(ex)) (numeric literals only)")
+    head = ex.head
+    if head === :call
+        isempty(ex.args) && _fail(label, "operator needs operands")
+        fn = ex.args[1]
+        if fn isa Symbol && fn in ELEMENTWISE_OPS
+            cargs = Any[]
+            shape = :scalar
+            for arg in ex.args[2:end]
+                carg, ashape = _canonicalize_kernel_cell(arg, kp, shapes)
+                push!(cargs, carg)
+                ashape === :vector && (shape = :vector)
+            end
+            return (Expr(:call, fn, cargs...), shape)
+        end
+        if fn isa Symbol && fn in _KERNEL_UNDOTTED_ARITHMETIC
+            operands = ex.args[2:end]
+            isempty(operands) && _fail(label, "operator `$fn` needs operands")
+            # Unary +/- stay as-is (valid on vectors and scalars alike).
+            if length(operands) == 1
+                carg, shape = _canonicalize_kernel_cell(only(operands), kp, shapes)
+                return (Expr(:call, fn, carg), shape)
+            end
+            cargs = Any[]
+            nvec = 0
+            derived = false
+            for arg in operands
+                carg, ashape = _canonicalize_kernel_cell(arg, kp, shapes)
+                push!(cargs, carg)
+                ashape === :vector && (nvec += 1)
+                derived |= _kernel_operand_derived(arg, shapes)
+            end
+            nvec >= 2 && _fail(label, "undotted `$fn` over vector series " *
+                                      "does not lower — write the dotted " *
+                                      "form (`$(Symbol(:., fn))`)")
+            shape = nvec >= 1 ? :vector : :scalar
+            derived || return (Expr(:call, fn, cargs...), shape)
+            return (Expr(:call, Symbol(:., fn), cargs...), shape)
+        end
+        if fn isa Symbol && fn in ELEMENTWISE_FNS
+            cargs = Any[]
+            shape = :scalar
+            derived = false
+            for arg in ex.args[2:end]
+                carg, ashape = _canonicalize_kernel_cell(arg, kp, shapes)
+                push!(cargs, carg)
+                ashape === :vector && (shape = :vector)
+                derived |= _kernel_operand_derived(arg, shapes)
+            end
+            derived || return (Expr(:call, fn, cargs...), shape)
+            return (Expr(:., fn, Expr(:tuple, cargs...)), shape)
+        end
+        if fn isa Symbol && fn in REDUCTION_FNS
+            return _fail(label, "reduction `$fn` does not lower in a cell " *
+                                "(series reductions are cross-timepoint — P3)")
+        end
+        return _fail(label, "call `$fn` is not in the panel-v1 cell vocabulary")
+    end
+    if head === :.
+        length(ex.args) == 2 && ex.args[1] isa Symbol && ex.args[2] isa Expr &&
+            ex.args[2].head === :tuple ||
+            _fail(label, "field access does not lower in a cell " *
+                         "(dotted calls take `f.(...)`)")
+        f = ex.args[1]
+        (f === :ifelse || f in ELEMENTWISE_FNS) ||
+            _fail(label, "dotted call `$f.(...)` is not in the panel-v1 " *
+                         "cell vocabulary")
+        f === :ifelse &&
+            length(ex.args[2].args) != 3 &&
+            _fail(label, "`ifelse` takes `ifelse.(condition, x, y)`")
+        cargs = Any[]
+        shape = :scalar
+        for arg in ex.args[2].args
+            carg, ashape = _canonicalize_kernel_cell(arg, kp, shapes)
+            push!(cargs, carg)
+            ashape === :vector && (shape = :vector)
+        end
+        return (Expr(:., f, Expr(:tuple, cargs...)), shape)
+    end
+    return _fail(label, "unsupported expression head $head in a cell " *
+                        "(elementwise expressions only)")
+end
+
+# An operand is slice/cell-derived (a flat vector at codegen) iff it
+# mentions a slice param or cell local; pure global/literal subtrees stay
+# scalar and their undotted operators are kept as-is.
+function _kernel_operand_derived(ex, shapes::Dict{Symbol,Symbol})
+    ex isa Number && return false
+    ex isa LineNumberNode && return false
+    ex isa Symbol && return haskey(shapes, ex)
+    ex isa Expr || return false
+    return any(a -> _kernel_operand_derived(a, shapes), ex.args)
+end
+
+function _collect_kernel_cell_condition!(refs, ex, kp::KernelPlate, known::Set{Symbol})
+    label = kp.label
+    if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+            ex.args[1] in ELEMENTWISE_COMPARISONS
+        return _collect_kernel_cell_refs!(refs, ex, kp, known)
+    end
+    ex isa Symbol || return _fail(label, "`ifelse` condition must be a " *
+                                          "comparison (`x .< y`) or a bare " *
+                                          "cell/model boolean name")
+    ex in known ||
+        _fail(label, "`ifelse` condition `$ex` is not a cell or " *
+                     "model-level name")
+    push!(refs, ex)
+    return nothing
+end
+
+# Kernel bind checks: resolved dims, total kinds, flat-T-blocked lengths,
+# subjects coverage. Runs on bound plans (bind resolves Symbol dims via
+# the `dims` map first; hand-bound plans carry Ints directly).
+function _validate_kernels_data(plan::StructuralPlan)
+    isempty(plan.kernel_plates) && return nothing
+    kp = only(plan.kernel_plates)
+    kp.subjects isa Int ||
+        _fail(kp.label, "subjects dims key `$(kp.subjects)` unresolved " *
+              "(bind_data with dims first)")
+    n_sub = kp.subjects
+    T = kp.timepoints
+    T isa Symbol &&
+        _fail(kp.label, "timepoints dims key `$T` unresolved " *
+              "(bind_data with dims first)")
+    flat = _kernel_flat_length(n_sub, T)
+    plan.n_obs == flat ||
+        _fail(kp.label, "n_obs $(plan.n_obs) ≠ kernel flat length $flat " *
+              "(n_sub=$n_sub$((T === nothing ? "" : ", T=$T")))")
+    if T === nothing
+        all(s -> s[3] === :scalar, kp.slices) ||
+            _fail(kp.label, "a vector slice needs T (bind the " *
+                  "`kernel_T_<result>` dims key)")
+    elseif T > 1
+        any(s -> s[3] === :vector, kp.slices) ||
+            _fail(kp.label, "T=$T bound but no vector slice uses it " *
+                  "(scalar models omit the timepoints dims key)")
+    end
+    # T == 1 with all-scalar slices is the unobservable-kinds case
+    # (recovered scalar by scalar-first inference) — admitted.
+    for (col, param, kind) in kp.slices
+        kind in (:vector, :scalar) ||
+            _fail(kp.label, "slice `$param` kind unresolved " *
+                  "(bind_data resolves :unknown from lengths)")
+        haskey(plan.columns, col) ||
+            _fail(kp.label, "slice column `$col` is not bound")
+        colv = plan.columns[col]
+        eltype(colv) <: Real ||
+            _fail(kp.label, "slice column `$col` must be numeric, " *
+                  "got $(eltype(colv))")
+        all(isfinite, colv) ||
+            _fail(kp.label, "slice column `$col` must be finite")
+        want = kind === :vector ? flat : n_sub
+        length(colv) == want ||
+            _fail(kp.label, "slice `$param` ($kind) column `$col` has " *
+                  "length $(length(colv)), want $want " *
+                  (kind === :vector ? "(n_sub*T flat T-blocked)" :
+                   "(n_sub per-subject)"))
+        if kind === :scalar && T !== nothing
+            # Scalar slices expand to flat T-blocks at bind; a hand-bound
+            # plan must carry the same expansion (verified, not trusted).
+            exp = _kexp_name(kp.result, col)
+            haskey(plan.columns, exp) ||
+                _fail(kp.label, "scalar slice `$param` expansion `$exp` " *
+                      "missing (bind_data materializes flat T-blocks)")
+            expv = plan.columns[exp]
+            length(expv) == flat ||
+                _fail(kp.label, "expansion `$exp` has length " *
+                      "$(length(expv)), want flat $flat")
+            expv == repeat(Vector{Float64}(colv); inner = T) ||
+                _fail(kp.label, "expansion `$exp` is not the flat " *
+                      "T-block repeat of `$col`")
+        end
+    end
+    return nothing
+end
+
 function _validate_name_tables(plan::StructuralPlan)
     pnames = [p.name for p in plan.predictors]
     length(unique(pnames)) == length(pnames) ||
@@ -1403,6 +1865,7 @@ function _validate_name_tables(plan::StructuralPlan)
         if b.kind === :correlated
         for nm in _ranef_corr_names(b)]
     hsgp = Symbol[nm for hb in plan.hsgp_bases for nm in _hsgp_all_names(hb)]
+    kern = Symbol[nm for kp in plan.kernel_plates for nm in _kernel_all_names(kp)]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
@@ -1422,6 +1885,8 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate correlated ranef names")
     length(unique(hsgp)) == length(hsgp) ||
         _fail(:plan, "duplicate hsgp names")
+    length(unique(kern)) == length(kern) ||
+        _fail(:plan, "duplicate kernel-plate names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
         (assigns, deriveds, "assignments and derived columns"),
@@ -1466,24 +1931,34 @@ function _validate_name_tables(plan::StructuralPlan)
         (hsgp, vectors, "hsgp names and vector parameters"),
         (hsgp, svec, "hsgp names and spline vectors"),
         (hsgp, k1, "hsgp names and K=1 ranef names"),
-        (hsgp, corr, "hsgp names and correlated ranef names"))
+        (hsgp, corr, "hsgp names and correlated ranef names"),
+        (kern, params, "kernel-plate names and parameters"),
+        (kern, assigns, "kernel-plate names and assignments"),
+        (kern, deriveds, "kernel-plate names and derived columns"),
+        (kern, plates, "kernel-plate names and plate parameters"),
+        (kern, scanstates, "kernel-plate names and scan states"),
+        (kern, vectors, "kernel-plate names and vector parameters"),
+        (kern, svec, "kernel-plate names and spline vectors"),
+        (kern, k1, "kernel-plate names and K=1 ranef names"),
+        (kern, corr, "kernel-plate names and correlated ranef names"),
+        (kern, hsgp, "kernel-plate names and hsgp names"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
     allnames = union(params, assigns, deriveds, plates, scanstates, vectors,
-        svec, k1, corr, hsgp)
+        svec, k1, corr, hsgp, kern)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/spline/ranef name",
+            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/spline/ranef/kernel name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived/plate/scan/vector/spline/ranef $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate/scan/vector/spline/ranef/kernel $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, k1, corr, hsgp))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, k1, corr, hsgp, kern))
         _check_name_hygiene(n)
     end
     return nothing
@@ -2693,7 +3168,15 @@ function _validate_simplex_response(r::LikelihoodSpec, plan::StructuralPlan)
 end
 
 function _validate_responses(plan::StructuralPlan)
-    isempty(plan.responses) && _fail(:plan, "plan has no responses")
+    # A kernel plate carries the only likelihood (panel v1): zero
+    # top-level responses are admitted iff exactly one kernel plate is
+    # present. Responseless GLM plans still fail.
+    if isempty(plan.responses)
+        # `_validate_kernels` runs before this gate and owns the plate-count
+        # diagnosis; here exactly one kernel plate excuses zero responses.
+        length(plan.kernel_plates) == 1 ||
+            _fail(:plan, "plan has no responses")
+    end
     rlabels = [r.label for r in plan.responses]
     length(unique(rlabels)) == length(rlabels) ||
         _fail(:plan, "duplicate response labels")
@@ -3191,8 +3674,99 @@ function _materialize_splines!(plan::StructuralPlan,
     return out
 end
 
+# Kernel-plate bind resolution (the `_RKKernelSpec` layout contract): dims
+# keys resolve `subjects`/`timepoints` to positive ints; slice kinds infer
+# totally from lengths (`n_sub*T` → :vector, `n_sub` → :scalar — at `T ==
+# 1` the lengths coincide and kinds are unobservable, so all-scalar
+# stands); scalar slices in vector models materialize flat T-block
+# expansions (spline-blocks precedent). Every dims key must be consumed —
+# leftovers fail closed (a typo'd key must not silently reshape the
+# plate). Returns resolved nodes; the input plan is untouched.
+function _resolve_kernels!(plan::StructuralPlan,
+        columns::Dict{Symbol,AbstractVector}, dims::AbstractDict{Symbol,<:Integer})
+    isempty(plan.kernel_plates) && return KernelPlate[]
+    kp = only(plan.kernel_plates)
+    for (k, v) in dims
+        v > 0 ||
+            _fail(kp.label, "dims key `$k` must bind a positive integer, " *
+                  "got $v")
+    end
+    consumed = Set{Symbol}()
+    n_sub = if kp.subjects isa Int
+        kp.subjects
+    else
+        haskey(dims, kp.subjects) ||
+            _fail(kp.label, "subjects dims key `$(kp.subjects)` is not " *
+                  "bound (bind_data `dims` carries it; admitted: an " *
+                  "integer literal or a dims-key name)")
+        push!(consumed, kp.subjects)
+        Int(dims[kp.subjects])
+    end
+    T = if kp.timepoints isa Int
+        kp.timepoints
+    elseif kp.timepoints isa Symbol
+        haskey(dims, kp.timepoints) ||
+            _fail(kp.label, "timepoints dims key `$(kp.timepoints)` is " *
+                  "not bound (bind_data `dims` carries it)")
+        push!(consumed, kp.timepoints)
+        Int(dims[kp.timepoints])
+    else
+        rest = setdiff(Set{Symbol}(keys(dims)), consumed)
+        if isempty(rest)
+            nothing
+        elseif length(rest) == 1
+            tk = only(rest)
+            push!(consumed, tk)
+            Int(dims[tk])
+        else
+            _fail(kp.label, "ambiguous timepoints dims keys " *
+                  "$(sort!(collect(rest))) (one T key besides subjects)")
+        end
+    end
+    leftovers = setdiff(Set{Symbol}(keys(dims)), consumed)
+    isempty(leftovers) ||
+        _fail(kp.label, "dims key(s) $(sort!(collect(leftovers))) not " *
+              "consumed by kernel plate `$(kp.result)` (typo'd key?)")
+    flat = _kernel_flat_length(n_sub, T)
+    slices2 = Tuple{Symbol,Symbol,Symbol}[]
+    for (col, param, _) in kp.slices
+        haskey(columns, col) ||
+            _fail(kp.label, "slice column `$col` is not bound")
+        L = length(columns[col])
+        kind = if T === nothing
+            L == n_sub ||
+                _fail(kp.label, "slice `$param` column `$col` has length " *
+                      "$L ≠ n_sub $n_sub and no T dims key is bound " *
+                      "(vector slices need T: bind `kernel_T_<result>`)")
+            :scalar
+        else
+            # Scalar-first: at T == 1 the lengths coincide and kinds are
+            # unobservable — recovering scalar is numerically identical
+            # (1-element blocks; the inner-1 expansion is identity).
+            L == n_sub ? :scalar :
+                L == n_sub*T ? :vector :
+                _fail(kp.label, "slice `$param` column `$col` has length " *
+                      "$L, neither n_sub $n_sub nor n_sub*T $flat")
+        end
+        push!(slices2, (col, param, kind))
+        if kind === :scalar && T !== nothing
+            exp = _kexp_name(kp.result, col)
+            haskey(columns, exp) &&
+                _fail(kp.label, "column `$exp` is reserved for kernel " *
+                      "plate `$(kp.result)`'s flat expansion of `$col` — " *
+                      "rename the caller-supplied column")
+            columns[exp] = repeat(Vector{Float64}(columns[col]); inner = T)
+        end
+    end
+    resolved0 = KernelPlate(kp.result, n_sub, T, slices2,
+        kp.assignments, kp.obs, kp.collected, kp.label)
+    canon = _canonicalize_kernel_assignments(resolved0)
+    return KernelPlate[KernelPlate(kp.result, n_sub, T, slices2,
+        canon, kp.obs, kp.collected, kp.label)]
+end
+
 """
-    bind_data(plan, columns; roles=Dict()) -> StructuralPlan
+    bind_data(plan, columns; roles=Dict(), dims=Dict()) -> StructuralPlan
 
 Attach `columns` to a structure-only plan (or rebind an already-bound one,
 replacing columns + roles): infer column roles, merge explicit `roles` over
@@ -3201,16 +3775,20 @@ untouched. Inference precedence: response > trials > evidence > weight >
 group > predictor > data; term columns are the only `:predictor` source, so
 assignment/extra columns stay `:data`. Bucket grouping columns upgrade to
 `:group` (grouping dominates predictor use in the label; both facts stay
-visible in terms + buckets).
+visible in terms + buckets). `dims` binds kernel-plate dims keys
+(`subject_count`, `timepoint_count`) to positive integers; every key must
+be consumed.
 """
 function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
-        roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
+        roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
+        dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}())
     validate_structure(plan)
     isempty(columns) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
     columns = Dict{Symbol,AbstractVector}(columns)
     bases = _materialize_splines!(plan, columns)
     hbases = _fit_hsgp_bases(plan, columns)
+    kbases = _resolve_kernels!(plan, columns, dims)
     for (k, v) in roles
         haskey(columns, k) || throw(ContractValidationError(
             "[bind] role for unknown column $k"))
@@ -3249,8 +3827,15 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
             haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
         end
     end
+    for kp in kbases
+        rcol = only(c for (c, p, _) in kp.slices if p === kp.obs.response)
+        haskey(inferred, rcol) && (inferred[rcol] = :response)
+    end
     merged = merge(inferred, roles)
-    n = length(first(values(columns)))
+    # Kernel plans carry two column lengths by design: n_obs is the flat
+    # length (vector models) or n_sub (all-scalar) — never first-column.
+    n = isempty(kbases) ? length(first(values(columns))) :
+        _kernel_flat_length(only(kbases).subjects, only(kbases).timepoints)
     maps = _eval_levelmaps(plan.levelmaps, columns)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns)
@@ -3260,7 +3845,8 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         levelmaps = maps, plate_parameters = plan.plate_parameters,
         scans = plan.scans, ranef_buckets = plan.ranef_buckets,
         vector_parameters = vectors2, spline_bases = bases,
-        spline_vectors = plan.spline_vectors, hsgp_bases = hbases)
+        spline_vectors = plan.spline_vectors, hsgp_bases = hbases,
+        kernel_plates = kbases)
     validate_data(bound)
     return bound
 end
