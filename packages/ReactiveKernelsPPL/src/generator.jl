@@ -855,6 +855,36 @@ _log_diff_exp(a, b) = :($a + log1p(-exp($b - $a)))
 # Per-threshold effect column name (stage j of response `label`).
 _eff_name(label::Symbol, j::Int) = Symbol(:_ppl_eff_, label, :_, j)
 
+# Modeled-scale precompute name (response `label`).
+_disc_name(label::Symbol) = Symbol(:_ppl_disc_, label)
+
+# Ordinal latent scale as a plate do-var: absent inlines 1.0 (the
+# 3-positional form — byte-identical emission), a literal inlines, a data
+# column threads raw, and a log-link predictor threads its `exp`
+# precompute (structural positivity — the Poisson `exp.(lp)` precedent).
+function _ordinal_scale_ref!(inputs::Vector{Any}, prests::Vector{Expr},
+        r::LikelihoodSpec, plan::StructuralPlan)
+    d = r.discrimination
+    d === nothing && return 1.0
+    if d isa Symbol && any(p -> p.name === d, plan.predictors)
+        push!(inputs, _disc_pre!(prests, r, plan, d))
+        return _dovar(length(inputs))
+    end
+    return _thread_ref!(inputs, d)
+end
+
+# Modeled-scale column: `exp` over the scale predictor's lp node (the
+# predictor statements run before the likelihood, so the node exists;
+# validation proved the link is LogLink). Explicit dotted form, evaluated
+# once and threaded like the stage-effect columns.
+function _disc_pre!(prests::Vector{Expr}, r::LikelihoodSpec,
+        plan::StructuralPlan, sname::Symbol)
+    lp = _lp_name(_predictor(plan, sname))
+    name = _disc_name(r.label)
+    push!(prests, :($name = exp.($lp)))
+    return name
+end
+
 # Ordered response plate (OrderedLogistic + Ordinal, one uniform path:
 # OrderedLogistic is cumulative-logit with d = 1 and no threshold
 # effects). Threshold scalars thread as broadcast plate inputs; the cell
@@ -869,10 +899,10 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
         "(bind_data infers it)"))
     inputs = Any[y, lp]
     yv, etav = _dovar(1), _dovar(2)
-    dref = r.discrimination === nothing ? 1.0 : _thread_ref!(inputs, r.discrimination)
+    prests = Expr[]
+    dref = _ordinal_scale_ref!(inputs, prests, r, plan)
     tnames = [_vector_elt_name(r.thresholds, i) for i in 1:K-1]
     trefs = [_thread_ref!(inputs, t) for t in tnames]
-    prests = Expr[]
     erefs = Any[]
     if !isempty(r.threshold_columns)
         for j in 1:K-1

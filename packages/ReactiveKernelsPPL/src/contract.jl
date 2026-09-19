@@ -123,8 +123,11 @@ at their defaults:
   otherwise.
 - `ordinal_structure`: `:cumulative`/`:stopping` for OrdinalFam,
   `nothing` otherwise.
-- `discrimination`: OrdinalFam scalar-or-column discrimination
-  (`nothing` = 1.0), `nothing` otherwise.
+- `discrimination`: OrdinalFam positive latent scale
+  (`nothing` = 1.0), `nothing` otherwise: a positive Real literal, a
+  finite-positive data column, or a modeled scale naming a LogLink plan
+  predictor (positivity is structural via `exp` — the `log(disc)`
+  recipe; any other link fails closed).
 - `threshold_columns`: OrdinalFam per-threshold design columns
   (StoppingRatio only), empty otherwise.
 - `threshold_coefs`: the (K−1)×p threshold-coefficient matrix packed as a
@@ -2987,7 +2990,7 @@ function _validate_leveled_fields(r::LikelihoodSpec, plan::StructuralPlan,
     _is_leveled_family(r.family) || return _validate_unleveled_fields(r)
     r.family === CategoricalLogitFam &&
         return _validate_categorical_fields(r, plan, used_predictors)
-    return _validate_ordered_fields(r, plan, pred)
+    return _validate_ordered_fields(r, plan, pred, used_predictors)
 end
 
 function _validate_categorical_fields(r::LikelihoodSpec, plan::StructuralPlan,
@@ -3021,7 +3024,7 @@ function _validate_categorical_fields(r::LikelihoodSpec, plan::StructuralPlan,
 end
 
 function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
-        pred::PredictorSpec)
+        pred::PredictorSpec, used_predictors::Set{Symbol})
     r.thresholds === nothing && _fail(r.label,
         "an ordered response requires its thresholds vector parameter")
     tp = only(p for p in plan.vector_parameters if p.name === r.thresholds)
@@ -3056,17 +3059,20 @@ function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "an ordered response takes no extra_predictors")
     isempty(r.count_columns) ||
         _fail(r.label, "an ordered response takes no count_columns")
-    _validate_ordinal_extras(r, plan)
+    _validate_ordinal_extras(r, plan, used_predictors)
     return nothing
 end
 
-# Ordinal-only extras: discrimination (scalar-or-column, SB-faithful: a
-# literal or a data column, never a sampled parameter — resolved at bind),
-# per-threshold design columns (StoppingRatio only: cumulative
+# Ordinal-only extras: discrimination (a positive literal, a data
+# column resolved at bind, or a modeled scale naming a LogLink plan
+# predictor — positivity is structural via `exp`, the `log(disc)` recipe;
+# a predictor under any other link, and any other in-graph name, fail
+# closed), per-threshold design columns (StoppingRatio only: cumulative
 # category-specific effects can break monotonicity), and their coefficient
 # matrix (a `:vector_normal` vector parameter packing (K−1)×p, required
 # exactly when design columns are present).
-function _validate_ordinal_extras(r::LikelihoodSpec, plan::StructuralPlan)
+function _validate_ordinal_extras(r::LikelihoodSpec, plan::StructuralPlan,
+        used_predictors::Set{Symbol})
     if r.family !== OrdinalFam
         r.discrimination === nothing ||
             _fail(r.label, "only Ordinal takes discrimination")
@@ -3081,9 +3087,20 @@ function _validate_ordinal_extras(r::LikelihoodSpec, plan::StructuralPlan)
         (isfinite(d) && d > 0) || _fail(r.label,
             "ordinal discrimination must be finite and strictly positive, " *
             "got $(repr(d))")
-    elseif d !== nothing && !(d isa Symbol)
-        _fail(r.label, "ordinal discrimination must be a literal or a data " *
-            "column, got $(repr(d))")
+    elseif d isa Symbol
+        si = findfirst(p -> p.name === d, plan.predictors)
+        if si !== nothing
+            sp = plan.predictors[si]
+            sp.link === LogLink || _fail(r.label,
+                "ordinal discrimination predictor $d must carry LogLink " *
+                "(a modeled scale is positive by construction via exp, " *
+                "got $(sp.link))")
+            push!(used_predictors, d)
+        end
+        # else a data column — resolved at bind.
+    elseif d !== nothing
+        _fail(r.label, "ordinal discrimination must be a positive literal, " *
+            "a data column, or a log-link predictor, got $(repr(d))")
     end
     if !isempty(r.threshold_columns)
         r.ordinal_structure === :stopping || _fail(r.label,
@@ -3472,18 +3489,24 @@ end
 
 # Ordinal extras at data level: a discrimination column is raw finite
 # positive numerics of length n_obs (a literal validated structurally; a
-# sampled parameter is rejected — SB takes literals and data only), and
-# threshold design columns are raw finite numerics of length n_obs.
+# log-link predictor names a modeled scale — structural positivity, no
+# data check; any other in-graph name is rejected), and threshold design
+# columns are raw finite numerics of length n_obs.
 function _validate_ordinal_data(r::LikelihoodSpec, plan::StructuralPlan)
     r.family === OrdinalFam || return nothing
     d = r.discrimination
-    if d isa Symbol
+    if d isa Symbol && any(p -> p.name === d, plan.predictors) &&
+            haskey(plan.columns, d)
+        _fail(r.label, "discrimination $d is both a predictor and a data " *
+            "column — ambiguous (rename one)")
+    end
+    if d isa Symbol && !any(p -> p.name === d, plan.predictors)
         _is_derived(plan, d) && _fail(r.label,
             "discrimination column $d is derived — slice-2 binds " *
             "discrimination raw (derived columns need shape metadata — planned)")
         haskey(plan.columns, d) || _fail(r.label,
-            "discrimination $d must be a data column (SB takes literals " *
-            "and data columns only — a sampled discrimination is out of slice)")
+            "discrimination $d must be a data column or a log-link " *
+            "predictor (a modeled scale)")
         col = plan.columns[d]
         (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
             _fail(r.label, "discrimination column $d must be finite " *
