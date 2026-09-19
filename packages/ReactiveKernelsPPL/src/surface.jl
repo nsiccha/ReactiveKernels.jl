@@ -1970,14 +1970,21 @@ function _lower_scale(lhs, s, ctx)
     s isa Real && return s
     s === :Inf && return Inf
     if s isa Symbol
-        (s in ctx.data || s in ctx.vecdefs) && _sfail(
-            "response $lhs scale $s varies by observation — " *
-            "per-observation scales need plate plumbing (planned)")
+        # A per-observation scale is a RAW data column (the eight-schools known
+        # SE `se[i]`): it threads through the response plate per cell exactly
+        # like a per-obs weight column (the generator's `_thread_ref!`
+        # broadcasts a scalar param and iterates a per-obs column). A DERIVED
+        # column scale still needs shape metadata the plate cannot yet size,
+        # so keep it rejected with an actionable message.
+        s in ctx.vecdefs && _sfail(
+            "response $lhs scale $s is a derived column — a per-observation " *
+            "scale must be a raw data column (bind it raw) or a scalar " *
+            "parameter/assignment name (planned: derived-column scales)")
         return s
     end
     return _sfail("response $lhs scale must be a bare parameter/assignment " *
-                  "name or a literal (bind expressions via an assignment " *
-                  "first), got $(repr(s))")
+                  "name, a per-observation data column, or a literal (bind " *
+                  "expressions via an assignment first), got $(repr(s))")
 end
 
 function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
@@ -2616,31 +2623,60 @@ function _lower_half_param(lhs, rhs, fam, coefuse)
         lhs)
 end
 
-# Slice-1 parameter truncation is half-Normal/half-Cauchy only, matching the
-# `:positive` support override (exact +log(2) by symmetry at literal 0).
+# A literal truncation bound: `Inf`/`-Inf` (as the `:Inf` symbol or a Real
+# infinity) or a finite Real; a name/expression is rejected (bounds are constant,
+# independent of the cell position).
+_truncation_bound(lhs, b) = b === :Inf ? Inf :
+    (b isa Real ? Float64(b) : _sfail(
+        "parameter $lhs: truncation bounds must be literals " *
+        "(a finite Real or Inf), got $(repr(b))"))
+
+# Parameter truncation lowers to a support override: `truncated(Normal(0, s), 0,
+# Inf)` (a half at a literal-zero location) → `:positive` (exact +log(2)), and a
+# two-sided FINITE `truncated(Normal(mu, s), lo, hi)` → `(:interval, lo, hi)` (an
+# affine-logistic constrained transform with the exact -log(cdf(hi)-cdf(lo))
+# renormalization; Normal-only, any location). Bounds are literals.
 function _lower_truncated_param(lhs, rhs, coefuse)
     args = _plain_args(rhs, "`truncated`")
     length(args) == 3 || _sfail("parameter $lhs: use the Distributions.jl " *
-                                "object form `truncated(Normal(0, s), 0, Inf)`")
-    obj, lo, hi = args
+                                "object form `truncated(Normal(mu, s), lo, hi)`")
+    obj, lo_a, hi_a = args
     obj isa Expr && obj.head === :call || _sfail(
         "parameter $lhs: `truncated` wraps a distribution object, got " *
         "$(repr(obj))")
     fam = obj.args[1]
     fam in (:Normal, :Cauchy) || _sfail(
-        "parameter $lhs: slice-1 truncation is half-Normal/half-Cauchy " *
-        "only (`truncated(Normal(0, s), 0, Inf)`)")
+        "parameter $lhs: slice-1 truncation wraps Normal/Cauchy " *
+        "(`truncated(Normal(mu, s), lo, hi)`); got $fam")
     oargs = _plain_args(obj, "`$fam`")
     length(oargs) == 2 || _sfail("parameter $lhs: `$fam` takes two arguments")
-    oargs[1] isa Real && oargs[1] == 0 || _sfail(
-        "parameter $lhs: half-truncation needs literal zero location")
-    lo isa Real && lo == 0 || _sfail("parameter $lhs: half-truncation " *
-                                     "lower bound must be literal 0")
-    (hi === :Inf || (hi isa Real && isinf(hi) && hi > 0)) ||
-        _sfail("parameter $lhs: half-truncation upper bound must be Inf")
     vals = [_lower_param_arg(lhs, a, coefuse) for a in oargs]
-    return SampledParameter(lhs, _PARAM_FAMILIES[fam],
-        (arg1 = vals[1], arg2 = vals[2]), :positive, lhs)
+    base = _PARAM_FAMILIES[fam]
+    lo = _truncation_bound(lhs, lo_a)
+    hi = _truncation_bound(lhs, hi_a)
+    lo < hi || _sfail("parameter $lhs: truncation needs lower < upper, " *
+                      "got ($lo, $hi)")
+    # Half-truncation [0, Inf) at a literal-zero location → the exact +log(2) case.
+    if lo == 0 && isinf(hi) && hi > 0
+        (oargs[1] isa Real && oargs[1] == 0) || _sfail(
+            "parameter $lhs: a `truncated(_, 0, Inf)` half needs a literal zero " *
+            "location (use `HalfNormal(s)`); a non-zero location needs finite " *
+            "bounds (`truncated(Normal(mu, s), lo, hi)`)")
+        return SampledParameter(lhs, base,
+            (arg1 = vals[1], arg2 = vals[2]), :positive, lhs)
+    end
+    # Two-sided FINITE interval → affine-logistic transform + truncated-Normal
+    # renormalization (Normal-only in slice 1). One-sided finite bounds are
+    # planned (they need a one-sided cdf renorm on the exp transform).
+    (isfinite(lo) && isfinite(hi)) || _sfail(
+        "parameter $lhs: one-sided truncation is slice-1 only as `[0, Inf)` at a " *
+        "zero location (`HalfNormal(s)`); use finite bounds " *
+        "(`truncated(Normal(mu, s), lo, hi)`) otherwise")
+    fam === :Normal || _sfail(
+        "parameter $lhs: a finite truncated interval is Normal-only in slice 1 " *
+        "(`truncated(Normal(mu, s), lo, hi)`); got $fam")
+    return SampledParameter(lhs, base,
+        (arg1 = vals[1], arg2 = vals[2]), (:interval, lo, hi), lhs)
 end
 
 function _lower_assignment(nm, rhs, coefuse)

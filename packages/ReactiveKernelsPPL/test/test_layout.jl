@@ -71,7 +71,10 @@ end
     @test support_of(:beta, nothing) === :unit
     @test support_of(:exponential, nothing) === :positive
     @test support_of(:normal, :positive) === :positive
+    @test support_of(:normal, (:interval, -1.0, 2.0)) === :interval
     @test_throws ContractValidationError support_of(:exponential, :positive)
+    # An :interval override needs a real-support family.
+    @test_throws ContractValidationError support_of(:exponential, (:interval, 0.0, 1.0))
     @test_throws ContractValidationError support_of(:nope, nothing)
 end
 
@@ -106,6 +109,16 @@ end
     @test constrain(ulayout, uu).p ≈ x
     @test unconstrain(ulayout, constrain(ulayout, uu)) ≈ uu
     @test logjac(ulayout, uu) ≈ log(x) + log1p(-x)
+    # Interval support exercises the affine-logistic branch (bounds on the entry).
+    ilo, ihi = -2.0, 3.0
+    ilayout = LayoutTable(
+        [LayoutEntry(:sampled, nothing, :q, [:q], 1, 1, :interval, ilo, ihi)], 1)
+    iu = [0.4]
+    xq = ilo + (ihi - ilo) / (1 + exp(-0.4))
+    @test ilo < constrain(ilayout, iu).q < ihi
+    @test constrain(ilayout, iu).q ≈ xq
+    @test unconstrain(ilayout, constrain(ilayout, iu)) ≈ iu
+    @test logjac(ilayout, iu) ≈ log(xq - ilo) + log(ihi - xq) - log(ihi - ilo)
     @test_throws ContractValidationError constrain(layout, [1.0])
 end
 
@@ -133,6 +146,16 @@ end
     ]
     @test jacobian_term(uentry) ==
         :(unit_bijector().logjac(sum(view(unconstrained, 2:2))))
+    # Interval transform: parameterized bounds ⇒ hand-rolled (not a bijector
+    # splice) — affine-logistic forward/inverse edges + bounded jacobian.
+    blo, bhi = -2.0, 3.0
+    ientry = LayoutEntry(:sampled, nothing, :q, [:q], 3, 1, :interval, blo, bhi)
+    @test transform_statements(ientry) == Expr[
+        :(_ppl_int_q::Float64 = sum(view(unconstrained, 3:3))),
+        :(q::Float64 = $blo + ($bhi - $blo) / (1 + exp(-_ppl_int_q))),
+        :(_ppl_int_q::Float64 = log(q - $blo) - log($bhi - q)),
+    ]
+    @test jacobian_term(ientry) == :(log(q - $blo) + log($bhi - q) - log($bhi - $blo))
     @test coordinate_read(3) == :(sum(view(unconstrained, 3:3)))
     @test block_read(2, 4) == :(view(unconstrained, 2:5))
 end

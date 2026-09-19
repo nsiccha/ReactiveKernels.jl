@@ -16,11 +16,18 @@ Inferred unconstrained support (`:real`/`:positive`/`:unit`) for a sampled
 family plus optional `:positive` override (half-Normal/half-Cauchy style).
 Loud on unknown families and inapplicable overrides.
 """
-function support_of(family::Symbol, override::Union{Nothing,Symbol})
+function support_of(family::Symbol, override::SupportOverride)
     haskey(SAMPLED_SUPPORT, family) ||
         throw(ContractValidationError("[layout] sampled family $family unknown"))
     inferred = SAMPLED_SUPPORT[family]
     override === nothing && return inferred
+    if override isa Tuple
+        override[1] === :interval || throw(ContractValidationError(
+            "[layout] tuple support override must be (:interval, lo, hi), got $override"))
+        inferred === :real || throw(ContractValidationError(
+            "[layout] :interval override needs a real-support family"))
+        return :interval
+    end
     override === :positive || throw(
         ContractValidationError("[layout] support override must be :positive, got $override"),
     )
@@ -30,16 +37,36 @@ function support_of(family::Symbol, override::Union{Nothing,Symbol})
     return :positive
 end
 
-"""One packed slice: a coefficient block, a scalar latent, or a scan vector latent."""
+# The transform kind and (for :interval) the constrained bounds a layout entry
+# needs, from a parameter's family + support override.
+function _entry_transform(family::Symbol, override::SupportOverride)
+    support = support_of(family, override)
+    if support === :interval
+        return (:interval, Float64(override[2]), Float64(override[3]))
+    end
+    transform =
+        support === :real ? :identity :
+        support === :positive ? :exp : :logistic
+    return (transform, NaN, NaN)
+end
+
+"""One packed slice: a coefficient block, a scalar latent, or a scan vector latent.
+`lo`/`hi` are the constrained bounds of an `:interval` transform (`NaN` otherwise)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan
+    kind::Symbol # :coefficient | :sampled | :scan | :plate
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
     offset::Int # 1-based packed offset
     size::Int
-    transform::Symbol # :identity | :exp | :logistic
+    transform::Symbol # :identity | :exp | :logistic | :interval
+    lo::Float64 # :interval lower bound (else NaN)
+    hi::Float64 # :interval upper bound (else NaN)
 end
+# Non-interval entries omit the bounds.
+LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
+    labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol) =
+    LayoutEntry(kind, predictor, name, labels, offset, size, transform, NaN, NaN)
 
 """Packed unconstrained layout: ordered entries + total dimension."""
 struct LayoutTable
@@ -71,22 +98,18 @@ function assign_layout(plan::StructuralPlan)
         offset += shape.width
     end
     for p in plan.parameters
-        support = support_of(p.family, p.support_override)
-        transform =
-            support === :real ? :identity :
-            support === :positive ? :exp : :logistic
+        transform, lo, hi = _entry_transform(p.family, p.support_override)
         push!(entries,
-            LayoutEntry(:sampled, nothing, p.name, [p.name], offset, 1, transform))
+            LayoutEntry(:sampled, nothing, p.name, [p.name], offset, 1, transform,
+                lo, hi))
         offset += 1
     end
     for p in plan.plate_parameters
-        support = support_of(p.family, p.support_override)
-        transform =
-            support === :real ? :identity :
-            support === :positive ? :exp : :logistic
+        transform, lo, hi = _entry_transform(p.family, p.support_override)
         size = p.range === nothing ? plan.n_obs : length(p.range)
         push!(entries,
-            LayoutEntry(:plate, nothing, p.name, [p.name], offset, size, transform))
+            LayoutEntry(:plate, nothing, p.name, [p.name], offset, size, transform,
+                lo, hi))
         offset += size
     end
     # Sequential-recurrence latents: one identity array slice per scan. The
@@ -151,12 +174,12 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         if e.kind === :coefficient
             push!(pairs, e.predictor => Vector{Float64}(seg))
         elseif e.kind === :plate
-            v = [_constrain_value(e.transform, Float64(x)) for x in seg]
+            v = [_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name => v)
         elseif e.kind === :scan
             push!(pairs, e.name => Vector{Float64}(seg))
         else
-            v = _constrain_value(e.transform, Float64(only(seg)))
+            v = _constrain_elt(e, Float64(only(seg)))
             push!(pairs, e.name => v)
         end
     end
@@ -189,7 +212,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] plate parameter $(e.name) length mismatch"),
             )
             for (k, x) in enumerate(v)
-                u[e.offset + k - 1] = _unconstrain_value(e.transform, Float64(x))
+                u[e.offset + k - 1] = _unconstrain_elt(e, Float64(x))
             end
         elseif e.kind === :scan
             haskey(nt, e.name) || throw(
@@ -204,7 +227,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing parameter $(e.name)"),
             )
-            u[e.offset] = _unconstrain_value(e.transform, Float64(nt[e.name]))
+            u[e.offset] = _unconstrain_elt(e, Float64(nt[e.name]))
         end
     end
     return u
@@ -225,7 +248,7 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
         e.transform === :identity && continue
         seg = u[e.offset:(e.offset + e.size - 1)]
         for v in seg
-            total += _logjac_value(e.transform, Float64(v))
+            total += _logjac_elt(e, Float64(v))
         end
     end
     return total
@@ -239,6 +262,25 @@ _unconstrain_value(transform::Symbol, x) =
     transform === :identity ? x : _prepared_endpoint(transform, :unconstrain)(x)
 _logjac_value(transform::Symbol, u) =
     transform === :identity ? 0.0 : _prepared_endpoint(transform, :logjac)(u)
+
+# Entry-level constrain/unconstrain/log-Jacobian. `:exp`/`:logistic` route
+# through the bijector library (`_constrain_value(transform::Symbol, …)`, the
+# single source of truth shared with the in-graph splices). An `:interval`
+# transform is PARAMETERIZED by per-entry bounds, so it does not fit the
+# Symbol-keyed parameterless bijector registry (like `:identity`, it lives
+# outside it): it maps ℝ → (lo, hi) via an affine-logistic (`lo + (hi-lo)·σ(u)`)
+# with log-Jacobian `log(x-lo) + log(hi-x) - log(hi-lo)` in the CONSTRAINED
+# value. The in-graph interval edges (below) use the IDENTICAL operations, so
+# host and graph agree bit-for-bit.
+_constrain_elt(e::LayoutEntry, u) = e.transform === :interval ?
+    (e.lo + (e.hi - e.lo) / (1 + exp(-u))) : _constrain_value(e.transform, u)
+_unconstrain_elt(e::LayoutEntry, x) = e.transform === :interval ?
+    (log(x - e.lo) - log(e.hi - x)) : _unconstrain_value(e.transform, x)
+function _logjac_elt(e::LayoutEntry, u)
+    e.transform === :interval || return _logjac_value(e.transform, u)
+    x = e.lo + (e.hi - e.lo) / (1 + exp(-u))
+    return log(x - e.lo) + log(e.hi - x) - log(e.hi - e.lo)
+end
 
 """
     coordinate_read(offset) -> Expr
@@ -279,6 +321,19 @@ function transform_statements(e::LayoutEntry)
     o = e.offset
     coord = coordinate_read(o)
     e.transform === :identity && return Expr[:($(e.name)::Float64 = $coord)]
+    if e.transform === :interval
+        # An :interval transform is parameterized by per-entry bounds, so it is
+        # not in the Symbol-keyed (parameterless) bijector registry — its
+        # forward + inverse edges are hand-rolled here, with the IDENTICAL math
+        # to the host `_*_elt` path so in-graph and host agree bit-for-bit.
+        u = Symbol(:_ppl_int_, e.name)
+        blo, bhi = e.lo, e.hi
+        return Expr[
+            :($u::Float64 = $coord),
+            :($(e.name)::Float64 = $blo + ($bhi - $blo) / (1 + exp(-$u))),
+            :($u::Float64 = log($(e.name) - $blo) - log($bhi - $(e.name))),
+        ]
+    end
     # Constrained supports splice the bijector's `constrain` endpoint; the
     # planner inlines it (no runtime call survives) and shares `coord` with the
     # Jacobian term via structural CSE.
@@ -309,6 +364,22 @@ function _plate_transform_statements(e::LayoutEntry)
     view_read = :(view(unconstrained, $lo:$hi))
     e.transform === :identity &&
         return Expr[:($(e.name)::AbstractVector{Float64} = $view_read)]
+    if e.transform === :interval
+        # Parameterized bounds ⇒ not in the (parameterless) bijector registry;
+        # hand-rolled broadcast edges over the block view, identical math to the
+        # host `_*_elt` path so in-graph and host agree bit-for-bit. Its
+        # `jacobian_term` sums the same expression (below), so no companion
+        # `logjac` plate is emitted.
+        u = Symbol(:_ppl_int_, e.name)
+        blo, bhi = e.lo, e.hi
+        return Expr[
+            :($u::AbstractVector{Float64} = $view_read),
+            :($(e.name)::AbstractVector{Float64} =
+                $blo .+ ($bhi - $blo) ./ (1 .+ exp.(-$u))),
+            :($u::AbstractVector{Float64} =
+                log.($(e.name) .- $blo) .- log.($bhi .- $(e.name))),
+        ]
+    end
     bij = _bijector_name(e.transform)
     cell = Symbol(:_ppl_cell_, e.name)
     ljcells = _plate_logjac_name(e.name)
@@ -333,7 +404,23 @@ function jacobian_term(e::LayoutEntry)
     if e.kind === :coefficient
         throw(ContractValidationError("[layout] non-identity coefficient block"))
     end
-    e.kind === :plate && return :(sum($(_plate_logjac_name(e.name))))
+    if e.kind === :plate
+        # Interval plates hand-roll the per-cell Jacobian sum (parameterized
+        # bounds, no companion `logjac` plate); every registry transform sums
+        # its companion `logjac` plate from `_plate_transform_statements`.
+        if e.transform === :interval
+            blo, bhi = e.lo, e.hi
+            return :(sum(log.($(e.name) .- $blo) .+ log.($bhi .- $(e.name)) .-
+                         log($bhi - $blo)))
+        end
+        return :(sum($(_plate_logjac_name(e.name))))
+    end
+    if e.transform === :interval
+        # Parameterized bounds ⇒ hand-rolled (not in the bijector registry);
+        # uses the constrained `e.name` from the interval constrain edge.
+        blo, bhi = e.lo, e.hi
+        return :(log($(e.name) - $blo) + log($bhi - $(e.name)) - log($bhi - $blo))
+    end
     bij = _bijector_name(e.transform)
     return :($(bij)().logjac($(coordinate_read(e.offset))))
 end

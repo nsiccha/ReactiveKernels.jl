@@ -156,20 +156,34 @@ struct PopulationPrior
 end
 
 """
+    SupportOverride
+
+A latent's support override: `nothing` (infer from the family), the bare
+`Symbol` `:positive` (half-Normal/half-Cauchy truncation of a real-support
+family, exact +log(2) at a literal-zero location), or the tuple
+`(:interval, lo, hi)` (a two-sided finite truncation `truncated(Normal(mu, s),
+lo, hi)` — an affine-logistic constrained transform onto `(lo, hi)` with the
+renormalized truncated density). Shared by scalar [`SampledParameter`](@ref)s
+and per-cell [`PlateParameter`](@ref)s.
+"""
+const SupportOverride = Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64}}
+
+"""
     SampledParameter(name, family, args, support_override, label)
 
 One non-coefficient latent (scalar, slice 1). `args` use POSITIONAL keys
 `(arg1, arg2, …)` in Distributions.jl constructor order with Distributions.jl
 semantics (`Exponential(θ)` = scale θ). Values are literals or
 [`ParamName`](@ref)s (hierarchical OK, cycles rejected). `support_override`
-is `nothing` (infer from family) or `:positive` for half-Normal/half-Cauchy
-style truncations of real-support families.
+is a [`SupportOverride`](@ref): `nothing` (infer from family), `:positive`
+(half-Normal/half-Cauchy), or `(:interval, lo, hi)` (a finite truncated
+interval).
 """
 struct SampledParameter
     name::ParamName
     family::Symbol
     args::NamedTuple
-    support_override::Union{Nothing,Symbol}
+    support_override::SupportOverride
     label::Symbol
 end
 
@@ -192,16 +206,16 @@ struct PlateParameter
     name::ParamName
     family::Symbol
     args::NamedTuple
-    support_override::Union{Nothing,Symbol}
+    support_override::SupportOverride
     range::Union{Nothing,UnitRange{Int}}
     label::Symbol
 end
 """Provenance/range default to a whole-column (n_obs) plate under the name."""
 PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
-    support_override::Union{Nothing,Symbol}) =
+    support_override::SupportOverride) =
     PlateParameter(name, family, args, support_override, nothing, name)
 PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
-    support_override::Union{Nothing,Symbol}, range::Union{Nothing,UnitRange{Int}}) =
+    support_override::SupportOverride, range::Union{Nothing,UnitRange{Int}}) =
     PlateParameter(name, family, args, support_override, range, name)
 
 """
@@ -1027,9 +1041,26 @@ end
 # Shared support-override rule for scalar and per-cell latent parameters:
 # `:positive` half-truncates a real-support (normal/cauchy) family, and the
 # +log(2) renormalization is exact only for a literal zero location.
+# `(:interval, lo, hi)` is a two-sided finite truncation with finite lo < hi;
+# the family must be real-support (a truncated Normal), and the density carries
+# the exact -log(cdf(hi) - cdf(lo)) renormalization at any location.
 function _validate_support_override(label, family::Symbol,
-        ov::Union{Nothing,Symbol}, args::NamedTuple)
+        ov::SupportOverride, args::NamedTuple)
     ov === nothing && return nothing
+    if ov isa Tuple
+        ov[1] === :interval || _fail(label,
+            "tuple support override must be (:interval, lo, hi), got $ov")
+        family === :normal || _fail(label,
+            "an :interval override is a truncated Normal in slice 1 " *
+            "(`truncated(Normal(mu, s), lo, hi)`); got $family")
+        lo, hi = ov[2], ov[3]
+        (isfinite(lo) && isfinite(hi)) || _fail(label,
+            ":interval bounds must be finite (a one-sided or half truncation " *
+            "uses :positive); got ($lo, $hi)")
+        lo < hi || _fail(label,
+            ":interval lower bound must be < upper bound; got ($lo, $hi)")
+        return nothing
+    end
     ov === :positive || _fail(label, "support override must be :positive, got $ov")
     (family === :normal || family === :cauchy) || _fail(label,
         ":positive override only applies to normal/cauchy " *
@@ -1471,6 +1502,7 @@ end
 function _validate_response_data(plan::StructuralPlan)
     for r in plan.responses
         _validate_response_column(r, plan)
+        _validate_scale_data(r, plan)
         _validate_weights(r, plan)
         _validate_trials(r, plan)
         _validate_evidence_data(r, plan)
@@ -1558,8 +1590,36 @@ function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
             _fail(r.label, "scale literal must be finite positive")
         return nothing
     end
+    # A scalar parameter/assignment scale resolves now; a per-observation scale
+    # is a raw data column resolved at bind (see `_validate_scale_data`), so
+    # defer an unknown symbol rather than failing structurally (mirrors how
+    # per-obs weight/trials columns validate only once data is attached).
     s isa Symbol && s in _union_names(plan) && return nothing
+    s isa Symbol && return nothing
     return _fail(r.label, "scale references unknown name $s")
+end
+
+# Data-level per-observation scale check: a scalar parameter/assignment name
+# resolves structurally; a raw data-column scale (the eight-schools known SE)
+# must be finite-positive numerics of length n_obs (a Gaussian/NB2/Gamma scale
+# is strictly positive). A derived column scale is rejected — per-obs scales
+# bind raw (mirrors the weights/trials raw-only rule).
+function _validate_scale_data(r::LikelihoodSpec, plan::StructuralPlan)
+    s = r.scale
+    (s === nothing || s isa Real) && return nothing
+    s isa Symbol || return nothing
+    s in _union_names(plan) && return nothing
+    _is_derived(plan, s) && _fail(r.label,
+        "scale column $s is derived — slice-1 binds per-observation scales " *
+        "raw (derived-column scales need shape metadata — planned)")
+    haskey(plan.columns, s) ||
+        _fail(r.label, "scale references unknown name $s")
+    col = plan.columns[s]
+    (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
+        _fail(r.label, "per-observation scale $s must be finite positive numerics")
+    length(col) == plan.n_obs ||
+        _fail(r.label, "scale column $s length $(length(col)) ≠ n_obs $(plan.n_obs)")
+    return nothing
 end
 
 function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)

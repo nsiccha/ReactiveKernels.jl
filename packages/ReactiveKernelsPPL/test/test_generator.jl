@@ -682,6 +682,103 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+# Eight schools (the canonical parity acceptance case): a per-cell latent
+# `theta[i] ~ Normal(mu, tau)` observed with a PER-OBSERVATION KNOWN SCALE
+# `y[i] ~ Normal(theta[i], se[i])`, where `se` is a raw data column. The
+# response scale threads through the likelihood plate per cell exactly like a
+# per-obs weight. Oracle is an independent Distributions.jl loop.
+@testset "plate parameter eight-schools per-obs known scale" begin
+    y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
+    se = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
+    n = length(y)
+    expr = Expr(:block,
+        :(mu ~ Normal(0, 5)),
+        :(tau ~ HalfNormal(5)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ Normal(mu, tau)),
+                    :(y[i] ~ Normal.(theta[i], se[i]))))))
+    plan0 = lower_rkppl(expr, (:y, :se))
+    # The per-obs scale rides the response as a data-column name, not a scalar.
+    @test plan0.responses[1].scale == :se
+    plan = bind_data(plan0, Dict{Symbol,AbstractVector}(:y => y, :se => se))
+    built = build_kernel(plan)
+    # layout: mu (identity), tau (exp), theta (n identity cells).
+    @test built.layout.total == 2 + n
+    @test coordinate_names(built.layout)[3] == Symbol("theta.1")
+    u = vcat([0.4, 0.3], [0.1, -0.2, 0.05, 0.15, -0.1, 0.0, 0.2, -0.05])
+    nt = constrain(built.layout, u)
+    mu, tau, theta = nt.mu, nt.tau, Vector(nt.theta)
+    ll = sum(logpdf.(Normal.(theta, se), y))
+    pr = logpdf(Normal(0, 5), mu) + (logpdf(Normal(0, 5), tau) + log(2)) +
+        sum(logpdf.(Normal(mu, tau), theta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    # log-jacobian: exp for tau (u[2]) only; mu and theta are identity.
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[2]
+    _check_gradient(built.spec, plan, u)
+end
+
+# The per-observation scale generalizes past Gaussian: an NB2 dispersion `phi`
+# (and, symmetrically, a Gamma shape `alpha`) may also be a per-obs data column.
+# It threads through the NB2 likelihood plate per cell exactly like the scale.
+@testset "NB2 per-observation dispersion column" begin
+    x = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    ycount = [3, 1, 6, 2, 1, 4]
+    phicol = [2.0, 3.0, 1.5, 2.5, 4.0, 1.0]
+    plan0 = lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ NegativeBinomial2.(exp.(mu), phi)
+    end, (:y, :x, :phi))
+    @test only(plan0.responses).scale === :phi
+    plan = bind_data(plan0,
+        Dict{Symbol,AbstractVector}(:y => ycount, :x => x, :phi => phicol))
+    built = build_kernel(plan)
+    u = [0.2, -0.1]
+    nt = constrain(built.layout, u)
+    coef = nt[:mu]
+    mu = exp.(coef[1] .+ coef[2] .* x)
+    ll = sum(logpdf.(NegativeBinomial.(phicol, phicol ./ (phicol .+ mu)), ycount))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    _check_gradient(built.spec, plan, u)
+end
+
+# A per-cell latent with a two-sided FINITE truncated-Normal support:
+# `theta[i] ~ truncated(Normal(mu, tau), lo, hi)` constrains each cell to
+# (lo, hi) via an affine-logistic transform and carries the exact
+# -log(cdf(hi)-cdf(lo)) renormalization. Oracle is Distributions.jl `truncated`.
+@testset "plate parameter interval-truncated latent" begin
+    y = [0.3, 1.2, -0.5, 2.1, 0.0, 1.7]
+    n = length(y)
+    lo, hi = -2.0, 5.0
+    expr = Expr(:block,
+        :(mu ~ Normal(0, 3)),
+        :(tau ~ HalfNormal(2)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ truncated(Normal(mu, tau), $lo, $hi)),
+                    :(y[i] ~ Normal.(theta[i], 1.0))))))
+    plan = bind_data(lower_rkppl(expr, (:y,)),
+        Dict{Symbol,AbstractVector}(:y => y))
+    built = build_kernel(plan)
+    @test built.layout.total == 2 + n
+    u = vcat([0.3, 0.2], [0.1, -0.4, 0.7, -0.2, 0.5, 0.0])
+    nt = constrain(built.layout, u)
+    mu, tau, theta = nt.mu, nt.tau, Vector(nt.theta)
+    @test all(t -> lo < t < hi, theta)
+    ll = sum(logpdf.(Normal.(theta, 1.0), y))
+    pr = logpdf(Normal(0, 3), mu) + (logpdf(Normal(0, 2), tau) + log(2)) +
+        sum(logpdf.(truncated(Normal(mu, tau), lo, hi), theta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    # log-jacobian: exp for tau (u[2]) + affine-logistic per theta cell.
+    ljtheta = sum(log(t - lo) + log(hi - t) - log(hi - lo) for t in theta)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[2] + ljtheta
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "scan: centered AR(1) end to end" begin
     m = @rkppl begin
         phi ~ Normal(0, 1)

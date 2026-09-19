@@ -403,6 +403,26 @@ end
     @test_throws ContractValidationError validate_plan(bad)
 end
 
+@testset "per-observation known scale" begin
+    # A raw data-column scale (the eight-schools known SE) binds and validates.
+    good = _gaussian_plan()
+    good.columns[:se] = collect(1.0:9.0)
+    good.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :se,
+        nothing, _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    # A non-positive scale column is rejected at bind (a scale is strictly > 0).
+    bad = _gaussian_plan()
+    bad.columns[:se] = vcat(0.0, collect(2.0:9.0))
+    bad.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :se,
+        nothing, _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # An unknown scale name (neither scalar parameter nor data column) is caught.
+    bad3 = _gaussian_plan()
+    bad3.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :nope,
+        nothing, _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad3)
+end
+
 @testset "sampled parameters" begin
     bad = _gaussian_plan()
     bad.parameters[1] =
@@ -732,6 +752,25 @@ end
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :exponential, (arg1 = 1.0,),
             :positive)))
+    # A two-sided finite (:interval, lo, hi) override on a Normal cell is valid.
+    @test (validate_plan(_re_plan(; plate = PlateParameter(:theta, :normal,
+        (arg1 = :mu, arg2 = :tau), (:interval, -2.0, 5.0)))); true)
+    # :interval is a truncated Normal — a non-Normal family is rejected.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :cauchy,
+            (arg1 = :mu, arg2 = :tau), (:interval, -1.0, 1.0))))
+    # :interval bounds must be finite.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), (:interval, 0.0, Inf))))
+    # :interval lower < upper.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), (:interval, 3.0, 1.0))))
+    # A tuple override whose head is not :interval is rejected.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), (:bogus, 0.0, 1.0))))
     # Plate name collides with a scalar parameter.
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:mu, :normal, (arg1 = 0.0, arg2 = 1.0),
