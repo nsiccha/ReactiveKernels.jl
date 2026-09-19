@@ -24,6 +24,10 @@ function build_kernel(plan::StructuralPlan)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
+    isempty(plan.ranef_buckets) || throw(ContractValidationError(
+        "[generator] ranef codegen is not Stage A (K=1 geometry lands in " *
+        "Stage B, LKJ-correlated in Stage C) — refusing to silently drop " *
+        "$(length(plan.ranef_buckets)) bucket(s)"))
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)

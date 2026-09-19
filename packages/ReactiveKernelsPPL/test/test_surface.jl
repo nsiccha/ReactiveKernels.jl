@@ -33,7 +33,8 @@ _plans_equal(a::StructuralPlan, b::StructuralPlan) =
     all(_maps_equal.(a.levelmaps, b.levelmaps)) &&
     length(a.plate_parameters) == length(b.plate_parameters) &&
     all(_pparams_equal.(a.plate_parameters, b.plate_parameters)) &&
-    a.columns == b.columns && a.n_obs === b.n_obs && a.roles == b.roles
+    a.columns == b.columns && a.n_obs === b.n_obs && a.roles == b.roles &&
+    _buckets_equal(a.ranef_buckets, b.ranef_buckets)
 
 _pparams_equal(a::PlateParameter, b::PlateParameter) =
     a.name === b.name && a.family === b.family &&
@@ -41,6 +42,25 @@ _pparams_equal(a::PlateParameter, b::PlateParameter) =
     all(air -> air[1] === air[2], zip(values(a.args), values(b.args))) &&
     a.support_override === b.support_override && a.range == b.range &&
     a.label === b.label
+
+_buckets_equal(a::Vector{RanefBucket}, b::Vector{RanefBucket}) =
+    length(a) == length(b) && all(_bucket_equal.(a, b))
+
+_bucket_equal(a::RanefBucket, b::RanefBucket) =
+    a.id === b.id && a.group === b.group && a.kind === b.kind &&
+    _margins_equal(a.margins, b.margins) && a.slices == b.slices &&
+    (a.lkj_eta == b.lkj_eta || (isnan(a.lkj_eta) && isnan(b.lkj_eta))) &&
+    a.label === b.label
+
+_margins_equal(a::Vector{RanefMargin}, b::Vector{RanefMargin}) =
+    length(a) == length(b) && all(_margin_equal.(a, b))
+
+_margin_equal(a::RanefMargin, b::RanefMargin) =
+    a.predictor === b.predictor && a.coefficient === b.coefficient &&
+    _recipe_equal(a.z, b.z)
+
+_recipe_equal(a::RanefZRecipe, b::RanefZRecipe) =
+    a.kind === b.kind && a.column === b.column && a.level == b.level
 
 _maps_equal(a::LevelMap, b::LevelMap) =
     a.predictor === b.predictor && a.column === b.column &&

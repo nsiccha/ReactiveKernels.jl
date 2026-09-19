@@ -61,6 +61,7 @@ random-effects / per-observation-latent location."""
     FactorTerm
     OffsetTerm
     LatentTerm
+    RanefGatherTerm
 end
 
 """
@@ -219,6 +220,61 @@ PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
     PlateParameter(name, family, args, support_override, range, name)
 
 """
+    RanefZRecipe(kind, column, level)
+
+One random-effect design (Z) column recipe: structure only, never a
+materialized vector pre-codegen. `kind` is `:ones` (intercept — `column`
+is `:none`, `level` is `nothing`), `:column` (continuous raw column),
+or `:dummy` (indicator over `column`: `level` is the level VALUE for
+`Int`, exact match for `AbstractString`). The thin layer performs NO
+coding inference — treatment/cell-means decisions arrive as explicit
+`dummy` recipes from the emitter.
+"""
+struct RanefZRecipe
+    kind::Symbol
+    column::Symbol
+    level::Union{Nothing,Int,AbstractString}
+end
+
+"""
+    RanefMargin(predictor, coefficient, z)
+
+One random-effect margin in `ranefcoefnames` order within its target
+slice: `predictor` owns the slice, `coefficient` is the margin address
+(`:Intercept`, a column, or a dummy label), `z` is the [`RanefZRecipe`](@ref)
+for its Z column.
+"""
+struct RanefMargin
+    predictor::Symbol
+    coefficient::Symbol
+    z::RanefZRecipe
+end
+
+"""
+    RanefBucket(id, group, kind, margins, slices, lkj_eta, label)
+
+One shared random-effect draws block (SB mirror): non-centered geometry
+over `K = length(margins)` margins in `G` groups of raw column `group`.
+`id` is `nothing` for a plain `(x|g)` single-slice bucket, else the `|ID|`
+label. `kind` is `:intercept1` (plain single-`1`: log-scale/xi geometry),
+`:slope1` (plain single slope: tau/xi geometry), or `:correlated` (LKJ +
+tau + z_flat; ALL ID buckets, even K=1 — SB's ID path has no K=1 fast
+path). `slices` maps each target predictor to its static column range;
+the ranges partition `1:K` contiguously in body order. `lkj_eta` is the
+LKJ shape (correlated only; `NaN` otherwise). `label` is `:bucket_<suffix>`
+(`<ID>_<group>` or plain `<group>`).
+"""
+struct RanefBucket
+    id::Union{Nothing,Symbol}
+    group::ColumnRef
+    kind::Symbol
+    margins::Vector{RanefMargin}
+    slices::Vector{Tuple{Symbol,UnitRange{Int}}}
+    lkj_eta::Float64
+    label::Symbol
+end
+
+"""
     AssignmentSpec(name, expr)
 
 One scalar temporary (slice 1): `expr` may reference scalar names and
@@ -354,10 +410,11 @@ struct StructuralPlan
     levelmaps::Vector{LevelMap}
     plate_parameters::Vector{PlateParameter}
     scans::Vector{ScanSpec}
+    ranef_buckets::Vector{RanefBucket}
 end
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
-# before `levelmaps`/`scans` existed keep working with both empty.
+# before `levelmaps`/`scans`/`ranef_buckets` existed keep working with all empty.
 StructuralPlan(
     responses::Vector{LikelihoodSpec},
     predictors::Vector{PredictorSpec},
@@ -369,11 +426,13 @@ StructuralPlan(
     n_obs::Int,
     roles::Dict{Symbol,Symbol}) =
     StructuralPlan(responses, predictors, population_priors, parameters,
-        assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[])
+        assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[],
+        RanefBucket[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
-const COLUMN_ROLES = (:response, :predictor, :weight, :evidence, :trials, :data)
+const COLUMN_ROLES =
+    (:response, :predictor, :weight, :evidence, :trials, :group, :data)
 
 # Compatibility constructor: 7-arg positional construction (pre-roles,
 # pre-derived, pre-levelmaps) keeps working with empties; the
@@ -390,10 +449,11 @@ function StructuralPlan(
         derived::Vector{VectorAssignmentSpec} = VectorAssignmentSpec[],
         levelmaps::Vector{LevelMap} = LevelMap[],
         plate_parameters::Vector{PlateParameter} = PlateParameter[],
-        scans::Vector{ScanSpec} = ScanSpec[])
+        scans::Vector{ScanSpec} = ScanSpec[],
+        ranef_buckets::Vector{RanefBucket} = RanefBucket[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, columns, n_obs, roles, levelmaps,
-        plate_parameters, scans)
+        plate_parameters, scans, ranef_buckets)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -442,12 +502,14 @@ const SAMPLED_SUPPORT = Dict{Symbol,Symbol}(
     :beta => :unit,
 )
 
-"""Slice-1 term-name vocabulary (emitter-side admission keys)."""
+"""Slice-1 term-name vocabulary (emitter-side admission keys; `:ranef_gather`
+joined with the ranef slice)."""
 const TERM_NAMES = Dict{Symbol,TermKind}(
     :intercept => InterceptTerm,
     :continuous => ContinuousTerm,
     :factor => FactorTerm,
     :offset => OffsetTerm,
+    :ranef_gather => RanefGatherTerm,
 )
 
 """Allowlisted assignment functions (slice 1: scalar ops + whole-column
@@ -479,7 +541,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialCloglogFam, BetaLogitFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
-admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
+admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
+    RanefGatherTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate)."""
 admitted_functions() = ASSIGNMENT_FNS
@@ -530,6 +593,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_levelmaps(plan)
     _validate_priors(plan)
     _validate_responses(plan)
+    _validate_ranef_buckets(plan)
     return nothing
 end
 
@@ -546,6 +610,145 @@ function validate_data(plan::StructuralPlan)
     _validate_levelmaps_data(plan)
     _validate_response_data(plan)
     _validate_plate_parameters_data(plan)
+    _validate_ranef_buckets_data(plan)
+    return nothing
+end
+
+# Bucket keys, kinds, margins, slices, and gather linkage: everything
+# provable without data. Slice ranges partition 1:K contiguously in body
+# order (SB's static per-target ranges); every slice is gathered at least
+# once (a dangling bucket samples dead parameters).
+function _validate_ranef_buckets(plan::StructuralPlan)
+    buckets = plan.ranef_buckets
+    keys = [(b.id, b.group) for b in buckets]
+    length(unique(keys)) == length(keys) ||
+        _fail(:plan, "duplicate ranef bucket keys (one bucket per (id, group))")
+    labels = [b.label for b in buckets]
+    length(unique(labels)) == length(labels) ||
+        _fail(:plan, "duplicate ranef bucket labels (rename the colliding |ID|)")
+    prednames = Set{Symbol}(p.name for p in plan.predictors)
+    for b in buckets
+        _validate_bucket_shape(b, prednames)
+    end
+    # Gather linkage, jointly over predictors + buckets.
+    gathered = Set{Tuple{Symbol,Union{Nothing,Symbol},Symbol}}()
+    for pred in plan.predictors
+        for t in pred.terms
+            t.kind === RanefGatherTerm || continue
+            o = t.options
+            key = (o.bucket_id, o.bucket_group)
+            key in keys ||
+                _fail(t.label, "gather in predictor $(pred.name) references " *
+                      "unknown bucket $key (no such ranef_bucket)")
+            (pred.name, o.bucket_id, o.bucket_group) in gathered &&
+                _fail(t.label, "duplicate gather of bucket $key in " *
+                      "predictor $(pred.name) (one gather per bucket per predictor)")
+            push!(gathered, (pred.name, o.bucket_id, o.bucket_group))
+            bi = findfirst(k -> k == key, keys)
+            any(s -> s[1] === pred.name, buckets[bi].slices) ||
+                _fail(t.label, "bucket $key carries no slice for " *
+                      "predictor $(pred.name)")
+        end
+    end
+    for b in buckets
+        for (target, _) in b.slices
+            (target, b.id, b.group) in gathered ||
+                _fail(b.label, "bucket $((b.id, b.group)) slice for " *
+                      "predictor $target is never gathered (dangling slice " *
+                      "samples dead parameters — gather it or drop it)")
+        end
+    end
+    return nothing
+end
+
+function _validate_bucket_shape(b::RanefBucket, prednames::Set{Symbol})
+    b.kind in (:intercept1, :slope1, :correlated) ||
+        _fail(b.label, "bucket kind must be :intercept1, :slope1, or " *
+              ":correlated, got $(repr(b.kind))")
+    K = length(b.margins)
+    K >= 1 || _fail(b.label, "bucket has zero margins")
+    for m in b.margins
+        _validate_margin(m, b.label)
+    end
+    targets = [s[1] for s in b.slices]
+    length(unique(targets)) == length(targets) ||
+        _fail(b.label, "bucket lists a target twice (one margin list per target)")
+    for t in targets
+        t in prednames ||
+            _fail(b.label, "bucket slice for unknown predictor $t")
+    end
+    # Ranges partition 1:K contiguously in body order.
+    lo = 1
+    for (t, r) in b.slices
+        first(r) == lo ||
+            _fail(b.label, "slice for $t starts at $(first(r)), want $lo " *
+                  "(slices partition 1:$K contiguously)")
+        lo = last(r) + 1
+    end
+    lo - 1 == K ||
+        _fail(b.label, "slices cover $(lo - 1) margins but the bucket " *
+              "carries $K")
+    for (t, r) in b.slices
+        for i in r
+            b.margins[i].predictor === t ||
+                _fail(b.label, "margin $i belongs to " *
+                      "$(b.margins[i].predictor) but slice $r belongs to $t")
+        end
+    end
+    # Kind dispatch (mirror of SB's plain/ID split): plain single-`1` is
+    # :intercept1, plain single slope is :slope1, everything else —
+    # including ALL ID buckets — is :correlated.
+    want = if b.id !== nothing
+        :correlated
+    elseif K == 1 && _is_ones_margin(first(b.margins))
+        :intercept1
+    elseif K == 1
+        :slope1
+    else
+        :correlated
+    end
+    b.kind === want ||
+        _fail(b.label, "bucket kind $(b.kind) mismatches its margins " *
+              "(want $want)")
+    if want === :correlated
+        isfinite(b.lkj_eta) && b.lkj_eta > 0 ||
+            _fail(b.label, "correlated bucket needs a positive LKJ eta, " *
+                  "got $(b.lkj_eta)")
+    else
+        isnan(b.lkj_eta) ||
+            _fail(b.label, "K=1 plain bucket takes no LKJ eta (no " *
+                  "correlation to parameterize), got $(b.lkj_eta)")
+    end
+    return nothing
+end
+
+_is_ones_margin(m::RanefMargin) =
+    m.z.kind === :ones && m.coefficient === :Intercept
+
+function _validate_margin(m::RanefMargin, label::Symbol)
+    z = m.z
+    z.kind in (:ones, :column, :dummy) ||
+        _fail(label, "margin $(m.predictor).$(m.coefficient): Z recipe " *
+              "kind must be :ones, :column, or :dummy, got $(repr(z.kind))")
+    if z.kind === :ones
+        z.column === :none && z.level === nothing ||
+            _fail(label, "margin $(m.predictor).$(m.coefficient): :ones " *
+                  "recipe carries no column/level")
+        m.coefficient === :Intercept ||
+            _fail(label, "margin $(m.predictor).$(m.coefficient): :ones " *
+                  "recipe addresses :Intercept")
+    elseif z.kind === :column
+        z.level === nothing ||
+            _fail(label, "margin $(m.predictor).$(m.coefficient): :column " *
+                  "recipe carries no level")
+        m.coefficient === z.column ||
+            _fail(label, "margin $(m.predictor).$(m.coefficient): :column " *
+                  "recipe addresses its column $(z.column)")
+    else
+        z.level !== nothing ||
+            _fail(label, "margin $(m.predictor).$(m.coefficient): :dummy " *
+                  "recipe needs a level value")
+    end
     return nothing
 end
 
@@ -567,6 +770,50 @@ function _validate_plate_parameters_data(plan::StructuralPlan)
         last(p.range) == plan.n_obs || _fail(p.label,
             "plate range $(p.range) covers $(length(p.range)) cells " *
             "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
+    end
+    return nothing
+end
+
+# Grouping columns are raw (level knowledge needs values), Z continuous
+# columns mirror the population rule (raw numeric or derived, whose eltype
+# is unknown statically), and dummy levels must be members of the column's
+# grouping levels (Int value / string exact match).
+function _validate_ranef_buckets_data(plan::StructuralPlan)
+    for b in plan.ranef_buckets
+        haskey(plan.columns, b.group) ||
+            _fail(b.label, "grouping column $(b.group) is not bound")
+        _is_derived(plan, b.group) &&
+            _fail(b.label, "grouping column $(b.group) must be raw data " *
+                  "(level knowledge needs bound values)")
+        levels = _grouping_levels(plan.columns[b.group])
+        length(levels) >= 1 ||
+            _fail(b.label, "grouping column $(b.group) has no levels")
+        for m in b.margins
+            _validate_margin_data(m, b.label, plan)
+        end
+    end
+    return nothing
+end
+
+function _validate_margin_data(m::RanefMargin, label::Symbol, plan::StructuralPlan)
+    z = m.z
+    z.kind === :ones && return nothing
+    haskey(plan.columns, z.column) || _is_derived(plan, z.column) ||
+        _fail(label, "margin $(m.predictor).$(m.coefficient): Z column " *
+              "$(z.column) is not bound")
+    if z.kind === :column
+        _is_derived(plan, z.column) && return nothing
+        eltype(plan.columns[z.column]) <: Real ||
+            _fail(label, "margin $(m.predictor).$(m.coefficient): Z column " *
+                  "$(z.column) must be numeric (a categorical slope needs " *
+                  "explicit `dummy($(z.column), k)` recipes)")
+    else
+        _is_derived(plan, z.column) &&
+            _fail(label, "margin $(m.predictor).$(m.coefficient): :dummy " *
+                  "needs a raw column (level membership needs bound values)")
+        z.level in _grouping_levels(plan.columns[z.column]) ||
+            _fail(label, "margin $(m.predictor).$(m.coefficient): dummy " *
+                  "level $(repr(z.level)) is not a level of $(z.column)")
     end
     return nothing
 end
@@ -1214,6 +1461,10 @@ function _validate_predictors(plan::StructuralPlan)
 end
 
 function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    if t.kind === RanefGatherTerm
+        _validate_gather_term(t, pred)
+        return nothing
+    end
     t.options == NamedTuple() ||
         _fail(t.label, "terms take no options (slice 1: factor sizing " *
                        "lives in LevelMap)")
@@ -1244,6 +1495,31 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
     return nothing
 end
 
+# A gather term names its bucket by (id, group) pair in `options` (never a
+# lossy suffix parse) and carries exactly the grouping column; its addressee
+# is its own label (self-addressed: gathers take no PopulationPrior).
+# Bucket linkage (existence, slices, dangling) is checked jointly in
+# `_validate_ranef_buckets`, which sees predictors and buckets together.
+function _validate_gather_term(t::TermSpec, pred::PredictorSpec)
+    o = t.options
+    Tuple(keys(o)) == (:bucket_id, :bucket_group) ||
+        _fail(t.label, "ranef gather options must be exactly " *
+              "`(bucket_id, bucket_group)`, got $(Tuple(keys(o)))")
+    (o.bucket_id === nothing || o.bucket_id isa Symbol) ||
+        _fail(t.label, "gather bucket_id must be a Symbol or nothing, " *
+              "got $(repr(o.bucket_id))")
+    o.bucket_group isa Symbol ||
+        _fail(t.label, "gather bucket_group must be a Symbol, " *
+              "got $(repr(o.bucket_group))")
+    t.columns == ColumnRef[o.bucket_group] ||
+        _fail(t.label, "ranef gather columns must be exactly the grouping " *
+              "column [$(o.bucket_group)], got $(t.columns)")
+    t.addressee === t.label ||
+        _fail(t.label, "ranef gather addressee must be its own label " *
+              "(self-addressed, no population prior), got $(t.addressee)")
+    return nothing
+end
+
 function _validate_predictor_columns(plan::StructuralPlan)
     for pred in plan.predictors
         for t in pred.terms
@@ -1261,6 +1537,9 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
         haskey(plan.columns, c) || _is_derived(plan, c) ||
             _fail(t.label, "term references missing column $c")
     end
+    # Gather terms name the raw grouping column (strings included — the
+    # encoder maps levels to codes); presence above is the whole check.
+    t.kind === RanefGatherTerm && return nothing
     # FactorTerm: column presence is checked by the loop above; level
     # coverage is a LevelMap concern (_validate_levelmaps_data).
     if t.kind === ContinuousTerm || t.kind === OffsetTerm
@@ -1433,10 +1712,12 @@ function _validate_priors(plan::StructuralPlan)
     end
     for pred in plan.predictors
         # Offset terms carry no coefficient; latent terms carry the per-cell
-        # PlateParameter, whose prior lives on the plate parameter itself, not
-        # as a PopulationPrior — neither needs a coefficient prior here.
+        # PlateParameter, whose prior lives on the plate parameter itself;
+        # gather terms carry a RanefBucket, whose geometry is self-priored —
+        # none needs a coefficient prior here.
         addressees = Set{Symbol}(t.addressee for t in pred.terms
-            if t.kind !== OffsetTerm && t.kind !== LatentTerm)
+            if t.kind !== OffsetTerm && t.kind !== LatentTerm &&
+               t.kind !== RanefGatherTerm)
         any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
         for a in addressees
             (pred.name, a) in seen ||
@@ -1731,8 +2012,8 @@ function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
 end
 
 const _ROLE_RANK = Dict{Symbol,Int}(
-    :data => 1, :predictor => 2, :weight => 3, :evidence => 4, :trials => 5,
-    :response => 6,
+    :data => 1, :predictor => 2, :group => 3, :weight => 4, :evidence => 5,
+    :trials => 6, :response => 7,
 )
 
 _upgrade_role!(roles, col, role) =
@@ -1745,8 +2026,10 @@ Attach `columns` to a structure-only plan (or rebind an already-bound one,
 replacing columns + roles): infer column roles, merge explicit `roles` over
 them, and run data validation. Returns a NEW bound plan; the input is
 untouched. Inference precedence: response > trials > evidence > weight >
-predictor > data; term columns are the only `:predictor` source, so
-assignment/extra columns stay `:data`.
+group > predictor > data; term columns are the only `:predictor` source, so
+assignment/extra columns stay `:data`. Bucket grouping columns upgrade to
+`:group` (grouping dominates predictor use in the label; both facts stay
+visible in terms + buckets).
 """
 function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
@@ -1763,6 +2046,9 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     inferred = Dict{Symbol,Symbol}(k => :data for k in keys(columns))
     for pred in plan.predictors, t in pred.terms, c in t.columns
         haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
+    end
+    for b in plan.ranef_buckets
+        haskey(inferred, b.group) && _upgrade_role!(inferred, b.group, :group)
     end
     for r in plan.responses
         r.weights !== nothing && haskey(inferred, r.weights) &&
@@ -1784,7 +2070,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         plan.population_priors, plan.parameters, plan.assignments,
         columns, n; roles = merged, derived = plan.derived,
         levelmaps = maps, plate_parameters = plan.plate_parameters,
-        scans = plan.scans)
+        scans = plan.scans, ranef_buckets = plan.ranef_buckets)
     validate_data(bound)
     return bound
 end

@@ -176,7 +176,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
-    sample, det, plate_ctx, plate_specs, scans = _partition_statements(ast, data)
+    sample, det, plate_ctx, plate_specs, scans, buckets =
+        _partition_statements(ast, data)
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
@@ -207,7 +208,9 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     ctx = (; data, detmap = canonmap, prior_names, normal_priors, detshape,
         vecdefs, structural, plate_names, absorbed = Set{Symbol}(),
         synth = Ref(0), synth_derived = VectorAssignmentSpec[], taken,
-        scan_states = Set{Symbol}(s.state for s in scans))
+        scan_states = Set{Symbol}(s.state for s in scans),
+        buckets = Dict{Tuple{Union{Nothing,Symbol},Symbol},RanefBucket}(
+            (b.id, b.group) => b for b in buckets))
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
     pred_idx = Dict{Symbol,Int}()
@@ -260,7 +263,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         plate_names)
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
-        levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans)
+        levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
+        ranef_buckets = buckets)
     validate_structure(plan)
     return plan
 end
@@ -520,7 +524,8 @@ function _reject_unknown_calls(where, rhs)
     rhs.head === :ref && return nothing
     if rhs.head === :call && !isempty(rhs.args)
         fn = rhs.args[1]
-        if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS
+        if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
+                fn !== :ranef
             startswith(string(fn), ".") && _sfail(
                 "$where uses dotted operator `$fn`, which is not in " *
                 "the slice-1 elementwise vocabulary")
@@ -587,10 +592,179 @@ end
 
 # Top-level statements: skip line numbers and one leading docstring-to-be
 # (ignored in slice 1); everything else must be an Expr.
+# A `ranef_bucket` do-block declares one shared random-effect draws block:
+# `ranef_bucket(:ID, g; eta=1.0) do <target> => [margins...] ... end`
+# (plain: `ranef_bucket(g) do ... end`). Lowers directly to RanefBucket IR
+# (margins reference data columns + predictor names only — no det inlining,
+# so no lowering context needed). Claims the bucket + gather labels up
+# front so user definitions can never collide with Stage-B in-graph names.
+_is_bucket_stmt(st) =
+    st isa Expr && st.head === :do && length(st.args) == 2 &&
+    st.args[1] isa Expr && st.args[1].head === :call &&
+    !isempty(st.args[1].args) && st.args[1].args[1] === :ranef_bucket
+
+function _lower_bucket(st::Expr, line::Int, data::Set{Symbol},
+        seen::Set{Symbol}, seelines::Dict{Symbol,Int},
+        buckets::Vector{RanefBucket})
+    where = line > 0 ? "bucket (line $line)" : "bucket"
+    call = st.args[1]
+    doex = st.args[2]
+    doex isa Expr && doex.head === :(->) && length(doex.args) == 2 ||
+        _sfail("$where takes a `do ... end` block of `target => [...]` lines")
+    doex.args[1] isa Expr && doex.args[1].head === :tuple &&
+        isempty(doex.args[1].args) ||
+        _sfail("$where takes no iteration variables (`do ... end`, not " *
+              "`do x ... end`)")
+    body = doex.args[2]
+    body isa Expr && body.head === :block ||
+        _sfail("$where takes a `do ... end` block of `target => [...]` lines")
+    pos = Any[]
+    eta = 1.0
+    eta_given = false
+    for a in call.args[2:end]
+        if a isa Expr && a.head === :parameters
+            for kw in a.args
+                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
+                    _sfail("$where takes keyword `eta` only")
+                kw.args[1] === :eta ||
+                    _sfail("$where takes keyword `eta` only, got `$(kw.args[1])`")
+                v = kw.args[2]
+                v isa Real && !(v isa Bool) ||
+                    _sfail("$where eta must be a numeric literal, got $(repr(v))")
+                eta = Float64(v)
+                eta_given = true
+            end
+        else
+            push!(pos, a)
+        end
+    end
+    id = nothing
+    group = nothing
+    if length(pos) == 1
+        group = pos[1]
+    elseif length(pos) == 2
+        id, group = pos
+        id isa QuoteNode && id.value isa Symbol ||
+            _sfail("$where quotes its bucket id: got $(repr(id)) — write " *
+                  "`ranef_bucket(:ID, group)` (bare names are data columns)")
+    else
+        _sfail("$where takes `(group)` or `(:ID, group)` positionally")
+    end
+    group isa Symbol ||
+        _sfail("$where grouping must be a bare data column, got $(repr(group))")
+    group in data ||
+        _sfail("$where grouping `$group` is not data")
+    key = (id === nothing ? nothing : id.value, group)
+    any(b -> (b.id, b.group) == key, buckets) &&
+        _sfail("$where duplicates bucket $key (one block per (id, group))")
+    margins = RanefMargin[]
+    slices = Tuple{Symbol,UnitRange{Int}}[]
+    seen_targets = Set{Symbol}()
+    nlines = 0
+    for ln in body.args
+        ln isa LineNumberNode && continue
+        nlines += 1
+        ln isa Expr && ln.head === :call && length(ln.args) == 3 &&
+            ln.args[1] === :(=>) ||
+            _sfail("$where body lines are `target => [margins...]`, got " *
+                  "$(repr(ln))")
+        target, vec = ln.args[2], ln.args[3]
+        target isa Symbol ||
+            _sfail("$where margin target must be a predictor name, got " *
+                  "$(repr(target))")
+        target in seen_targets &&
+            _sfail("$where lists target `$target` twice (one margin list " *
+                  "per target)")
+        push!(seen_targets, target)
+        vec isa Expr && vec.head === :vect ||
+            _sfail("$where margin list for `$target` must be a vector " *
+                  "(`$target => [1]`), even for one margin")
+        isempty(vec.args) &&
+            _sfail("$where margin list for `$target` is empty")
+        lo = length(margins) + 1
+        for e in vec.args
+            push!(margins, _lower_margin_elem(e, target, data, where))
+        end
+        push!(slices, (target, lo:length(margins)))
+    end
+    nlines >= 1 || _sfail("$where needs at least one `target => [...]` line")
+    K = length(margins)
+    kind = if key[1] !== nothing
+        :correlated
+    elseif K == 1 && margins[1].z.kind === :ones
+        :intercept1
+    elseif K == 1
+        :slope1
+    else
+        :correlated
+    end
+    if kind !== :correlated
+        eta_given && _sfail("$where is a K=1 plain bucket (kind $kind) and " *
+              "takes no LKJ eta (no correlation to parameterize)")
+        eta = NaN
+    elseif !(eta > 0)
+        _sfail("$where eta must be positive, got $eta")
+    end
+    suffix = key[1] === nothing ? string(group) : string(key[1]) * "_" * string(group)
+    label = Symbol("bucket_" * suffix)
+    _claim!(seen, seelines, label, line)
+    for (t, _) in slices
+        _claim!(seen, seelines, Symbol("r_$(t)_" * suffix), line)
+    end
+    return RanefBucket(key[1], group, kind, margins, slices, eta, label)
+end
+
+# One margin element: `1` (intercept), a bare data column (continuous Z),
+# or an explicit `dummy(c, k)` indicator (level VALUE for Int, exact match
+# for strings). No coding inference — treatment/cell-means arrive expanded.
+function _lower_margin_elem(e, target::Symbol, data::Set{Symbol}, where)
+    e isa Integer && !(e isa Bool) ||
+        return _lower_margin_symbol(e, target, data, where)
+    e == 1 ||
+        _sfail("$where margin integer must be exactly `1` (intercept); " *
+              "for slopes write the bare column (`$target => [x]`)")
+    return RanefMargin(target, :Intercept, RanefZRecipe(:ones, :none, nothing))
+end
+
+function _lower_margin_symbol(e, target::Symbol, data::Set{Symbol}, where)
+    e isa Symbol || return _lower_margin_dummy(e, target, data, where)
+    e in data ||
+        _sfail("$where margin `$e` for `$target` is not data (margins " *
+              "are `1`, bare data columns, or `dummy(c, k)`)")
+    return RanefMargin(target, e, RanefZRecipe(:column, e, nothing))
+end
+
+function _lower_margin_dummy(e, target::Symbol, data::Set{Symbol}, where)
+    e isa Expr && e.head === :call && length(e.args) == 3 &&
+        e.args[1] === :dummy ||
+        _sfail("$where margin $(repr(e)) for `$target` is not admitted " *
+              "(margins are `1`, bare data columns, or `dummy(c, k)`; " *
+              "interactions are planned)")
+    c, k = e.args[2], e.args[3]
+    c isa Symbol ||
+        _sfail("$where `dummy` column must be a bare data column, got " *
+              "$(repr(c))")
+    c in data ||
+        _sfail("$where `dummy` column `$c` is not data")
+    (k isa Integer && !(k isa Bool)) || k isa AbstractString ||
+        _sfail("$where `dummy` level must be an Int value or string, got " *
+              "$(repr(k))")
+    return RanefMargin(target, Symbol(string(c) * "_dummy_" * string(k)),
+        RanefZRecipe(:dummy, c, k))
+end
+
+_contains_ranef(ex) = ex isa Expr &&
+    (_is_gather_call(ex) || any(_contains_ranef, ex.args))
+
+_is_gather_call(ex) =
+    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+    ex.args[1] === :ranef
+
 function _partition_statements(ast::Expr, data::Set{Symbol})
     sample = SampleStmt[]
     det = Pair{Symbol,Any}[]
     scans = ScanSpec[]
+    buckets = RanefBucket[]
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
     seen_doc = false
@@ -621,10 +795,18 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         arg.head === :block &&
             _sfail("nested `begin` blocks do not lower — flatten the block")
         st = _unwrap_trivia(arg)
+        if _is_bucket_stmt(st)
+            b = _lower_bucket(st, line, data, seen, seelines, buckets)
+            push!(buckets, b)
+            continue
+        end
         if _is_sample(st) || _is_broadcast_sample(st)
             bc = _is_broadcast_sample(st)
             tilde = bc ? "`.~`" : "`~`"
             lhs, rng, levs = _sample_lhs(st.args[2], bc, tilde, data)
+            lhs in (:ranef, :ranef_bucket, :dummy) &&
+                _sfail("`$lhs` is reserved (ranef surface) and cannot be " *
+                       "sampled")
             _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[3], lhs)
             push!(sample, SampleStmt(lhs, st.args[3], bc, rng, levs))
@@ -632,6 +814,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             lhs = st.args[1]
             lhs === :target && _sfail("no `target` in rkppl models " *
                                       "(density comes only from `~`)")
+            lhs in (:ranef, :ranef_bucket, :dummy) &&
+                _sfail("`$lhs` is reserved (ranef surface) and cannot be " *
+                       "redefined")
             lhs in data && _sfail("$lhs is bound data and cannot be redefined")
             _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[2], lhs)
@@ -640,7 +825,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             _reject_statement(st)
         end
     end
-    return sample, det, plate_ctx, plate_params, scans
+    return sample, det, plate_ctx, plate_params, scans, buckets
 end
 
 # Pre-pass: expand top-level `@plate for i in R ... end` blocks into
@@ -2191,6 +2376,14 @@ function _classify_summand(pname, core, sign::Int, ctx)
                             "in data (terms are bare coefficients, " *
                             "`coefficient .* column`, " *
                             "`coefficients[column]`, and bare columns)")
+    if _contains_ranef(core)
+        _is_gather_call(core) ||
+            _sfail("predictor $pname: `ranef()` gathers lower only as " *
+                  "direct additive summands " *
+                  "(`mu = a .+ b .* x .+ ranef(:ID, g)`), not nested in " *
+                  "$(repr(core))")
+        return _classify_gather(pname, core, sign, ctx)
+    end
     head = core.head
     head === :ref && return _classify_ref(pname, core, sign, ctx)
     if head === :call && !isempty(core.args) && core.args[1] === :.*
@@ -2215,6 +2408,48 @@ function _classify_summand(pname, core, sign::Int, ctx)
                   "separately from the intercept (bind the value to a " *
                   "column, `w = s .+ x`, or fold it into an intercept " *
                   "prior location)")
+end
+
+# A `ranef(:ID, g)` / `ranef(g)` gather: the enclosing predictor's slice of
+# the named bucket (SB's `r_<target>_<suffix>` summand). Additive only;
+# linkage (bucket + slice existence) is verified here so the surface error
+# names the predictor; the contract re-checks for hand-built plans.
+function _classify_gather(pname, core::Expr, sign::Int, ctx)
+    where = "predictor $pname"
+    args = core.args[2:end]
+    id = nothing
+    group = nothing
+    if length(args) == 1
+        group = only(args)
+    elseif length(args) == 2
+        id, group = args
+        id isa QuoteNode && id.value isa Symbol ||
+            _sfail("$where quotes its gather bucket id: got $(repr(id)) " *
+                  "— write `ranef(:ID, $group)` (bare names are data columns)")
+        id = id.value
+    else
+        _sfail("$where gather takes `ranef(group)` or `ranef(:ID, group)`")
+    end
+    group isa Symbol ||
+        _sfail("$where gather group must be a bare data column, got " *
+              "$(repr(group))")
+    sign > 0 ||
+        _sfail("$where negates a `ranef()` gather — gathers are additive " *
+              "only (write `.+ ranef(...)`)")
+    key = (id, group)
+    haskey(ctx.buckets, key) ||
+        _sfail("$where gathers unknown bucket $key — declare it with " *
+              "`ranef_bucket($(id === nothing ? "" : ":$id, ")group) do ... end`")
+    b = ctx.buckets[key]
+    any(s -> s[1] === pname, b.slices) ||
+        _sfail("$where gathers bucket $key, which carries no slice for " *
+              "`$pname` (slices name predictors; an inline location lowers " *
+              "as `<resp>_eta` — bind the location to a named definition " *
+              "to gather there)")
+    suffix = id === nothing ? string(group) : string(id) * "_" * string(group)
+    label = Symbol("r_$(pname)_" * suffix)
+    return TermSpec(RanefGatherTerm, [group],
+        (bucket_id = id, bucket_group = group), label, label), nothing
 end
 
 function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
@@ -2424,8 +2659,10 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
     for pred in predictors
         for t in pred.terms
             # Offsets carry no coefficient; latent terms carry a PlateParameter
-            # whose prior lives on the plate parameter, not as a coefficient.
-            (t.kind === OffsetTerm || t.kind === LatentTerm) && continue
+            # whose prior lives on the plate parameter, not as a coefficient;
+            # gather terms carry a RanefBucket, whose geometry is self-priored.
+            (t.kind === OffsetTerm || t.kind === LatentTerm ||
+                t.kind === RanefGatherTerm) && continue
             addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
             use = _find_use(coefuse, pred.name, addr)
             use === nothing && _sfail("internal: no coefficient use for " *
@@ -2680,6 +2917,9 @@ function _lower_truncated_param(lhs, rhs, coefuse)
 end
 
 function _lower_assignment(nm, rhs, coefuse)
+    _contains_ranef(rhs) && _sfail("assignment `$nm` calls `ranef()`, " *
+        "which lowers only as a direct predictor summand " *
+        "(`mu = a .+ b .* x .+ ranef(:ID, g)`), not inside definitions")
     for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by assignment " *
@@ -2695,6 +2935,9 @@ end
 # coefficient discipline and types the node (vocabulary and Julia-shape
 # screens ran at the definition pre-pass).
 function _lower_vector_assignment(nm, rhs, coefuse)
+    _contains_ranef(rhs) && _sfail("derived column `$nm` calls `ranef()`, " *
+        "which lowers only as a direct predictor summand " *
+        "(`mu = a .+ b .* x .+ ranef(:ID, g)`), not inside definitions")
     for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by derived " *
