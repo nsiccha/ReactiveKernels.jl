@@ -116,22 +116,23 @@ end
     @test transform_statements(block) ==
         Expr[:(mu_coef::AbstractVector{Float64} = view(unconstrained, 1:4))]
     @test jacobian_term(block) === nothing
+    # Constrained supports splice the bijector `constrain`/`logjac` endpoints
+    # over the packed coordinate (the planner inlines them, sharing the
+    # coordinate read with the Jacobian term via structural CSE).
     @test transform_statements(sig) == Expr[
-        :(_ppl_log_sigma::Float64 = sum(view(unconstrained, 5:5))),
-        :(sigma::Float64 = exp(_ppl_log_sigma)),
-        :(_ppl_log_sigma::Float64 = log(sigma)),
+        :(sigma::Float64 = positive_bijector().constrain(sum(view(unconstrained, 5:5)))),
     ]
-    @test jacobian_term(sig) == :_ppl_log_sigma
+    @test jacobian_term(sig) ==
+        :(positive_bijector().logjac(sum(view(unconstrained, 5:5))))
     @test transform_statements(nu) ==
         Expr[:(nu::Float64 = sum(view(unconstrained, 6:6)))]
     @test jacobian_term(nu) === nothing
     uentry = LayoutEntry(:sampled, nothing, :p, [:p], 2, 1, :logistic)
     @test transform_statements(uentry) == Expr[
-        :(_ppl_logit_p::Float64 = sum(view(unconstrained, 2:2))),
-        :(p::Float64 = 1 / (1 + exp(-_ppl_logit_p))),
-        :(_ppl_logit_p::Float64 = log(p) - log1p(-p)),
+        :(p::Float64 = unit_bijector().constrain(sum(view(unconstrained, 2:2)))),
     ]
-    @test jacobian_term(uentry) == :(log(p) + log1p(-p))
+    @test jacobian_term(uentry) ==
+        :(unit_bijector().logjac(sum(view(unconstrained, 2:2))))
     @test coordinate_read(3) == :(sum(view(unconstrained, 3:3)))
     @test block_read(2, 4) == :(view(unconstrained, 2:5))
 end
