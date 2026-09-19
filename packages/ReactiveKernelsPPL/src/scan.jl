@@ -2,13 +2,15 @@
 #
 # The RK→BRM thin-layer counterpart of `@plate` (independent cells) for the
 # SEQUENTIAL primitive, shapes copied from StanBlocks `@scan` verbatim (§35).
-# This file is the coordination-independent FRONT END: it parses the annotated
-# `@scan` block AST into a `ScanSpec` IR node. Lowering a `ScanSpec` into the
-# packed unconstrained layout and emitting the RK-core `scan(...)` carry-fold
-# is a later tier (it overlaps `@plate` on the array-valued-sampled layout and
-# is gated on the cross-lane coordination decision), so nothing here mutates
-# `StructuralPlan`, `lower_rkppl`, or the emitter yet — `parse_scan_block` is a
-# pure syntactic function, unit-tested in isolation.
+# This file is the surface FRONT END: it parses the annotated `@scan` block
+# AST into a `ScanSpec` IR node (`parse_scan_block` is a pure syntactic
+# function, unit-tested in isolation). Lowering tiers live with their owners:
+# surface wiring in `surface.jl`, the array-sampled layout slice in
+# `layout.jl`, the centered density + the non-centered `scan(...)`
+# carry-fold reconstruction in `generator.jl`, LP use via `ScanSummandTerm`
+# (the SB-`ar` slice). The cross-lane coordination gate this header once
+# named is resolved (user chose independent+reconcile, scan-lane decision
+# `0bowtxh`); the centered primitive landed on main @ `7fd989c`.
 #
 # Grammar (v1 — one carried array, literal backward lags):
 #   @scan begin

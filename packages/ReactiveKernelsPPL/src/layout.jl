@@ -188,16 +188,19 @@ function assign_layout(plan::StructuralPlan)
     # Sequential-recurrence latents: one identity array slice per scan. The
     # length T is the loop bound — a literal Int, or `n_obs` when the bound is a
     # data length name (the canonical observation-indexed state-space case).
-    # v1 latents have real support (identity transform ⇒ no Jacobian); the
-    # emitter reconstructs the carried state from this slice.
+    # v1 latents have real support (identity transform ⇒ no Jacobian). A
+    # centered slice holds the carried state itself; a non-centered slice
+    # holds the iid innovations under the `_ppl_scan_z_<state>` name while
+    # the state name binds the emitter's `scan(...)` reconstruction.
     for s in plan.scans
         T = s.hi isa Int ? s.hi : plan.n_obs
         T >= s.lo || throw(ContractValidationError(
             "[layout] scan $(s.state) length $(T) < loop start $(s.lo) — " *
             "the recurrence must run at least once"))
         labels = Symbol[Symbol(i) for i in 1:T]
+        nm = _is_noncentered_scan(s) ? _scan_innovation_name(s) : s.state
         push!(entries,
-            LayoutEntry(:scan, nothing, s.state, labels, offset, T, :identity))
+            LayoutEntry(:scan, nothing, nm, labels, offset, T, :identity))
         offset += T
     end
     return LayoutTable(entries, offset - 1)
@@ -751,7 +754,8 @@ which the planner inlines.
 function transform_statements(e::LayoutEntry)
     if e.kind === :coefficient || e.kind === :scan
         # both are identity array slices read into `e.name` (a coefficient
-        # block name, or a scan-state name the emitter reconstructs from)
+        # block name, a scan-state slice, or a non-centered scan's
+        # `_ppl_scan_z_<state>` innovation slice the emitter reconstructs from)
         lo = e.offset
         hi = e.offset + e.size - 1
         return Expr[:($(e.name)::AbstractVector{Float64} =
