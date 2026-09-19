@@ -81,6 +81,7 @@ using SpecialFunctions: erfc
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
 # names in the assignment allowlist.
 using Statistics: mean, std, var
+using LinearAlgebra: dot
 # Bijector objects the generated program splices (constrained-parameter
 # transforms); imported from the enclosing module so the emitted
 # `positive_bijector()` / `unit_bijector()` calls resolve.
@@ -167,6 +168,10 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     elseif r.family === BernoulliLogitFam
         return _bernoulli_plate_stmts(r, plan, node, pw)
     elseif r.family === PoissonLogFam
+        # Base GLM case (no evidence, no weights): fused whole-vector reduction
+        # (faster native + Reactant; the per-cell plate handles evidence/weights).
+        r.evidence.kind === :none && r.weights === nothing &&
+            return _poisson_wholevec_stmts(r, plan, node)
         return _poisson_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
         return _binomial_plate_stmts(r, plan, node, pw)
@@ -293,6 +298,29 @@ function _bernoulli_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::S
         cell = :($wv * $cell)
     end
     return _plate_sum_stmts(pw, node, inputs, cell)
+end
+
+# Fused whole-vector Poisson-log likelihood (base case: no evidence, no
+# weights). Value-identical to `Σ poisson(; log_rate=ηᵢ).logpdf(yᵢ)` for the
+# contract's nonnegative-integer `y`: `Σ yᵢ·ηᵢ − Σ exp(ηᵢ) − C`, with
+# `C = Σ loggamma(yᵢ+1)` baked at generation from the bound response (data-only,
+# never on the gradient tape). `_ppl_yf_<label> = Float64.(y)` is a NAMED
+# recipe so `bound=` folds it to a constant Float vector (no per-eval alloc)
+# AND gives the fused `dot` a Float operand (Reactant `dot_general` type match).
+# `sum(exp, η)` reduces without materialising the intermediate. Gradient stays
+# ordinary Enzyme/Reactant AD — no analytic adjoint.
+_yfloat_name(label::Symbol) = Symbol(:_ppl_yf_, label)
+
+function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    ycol = plan.columns[y]
+    cterm = sum(SpecialFunctions.loggamma(Float64(v) + 1.0) for v in ycol)
+    yf = _yfloat_name(r.label)
+    return Expr[
+        :($yf = Float64.($y)),
+        :($node::Float64 = dot($yf, $lp) - sum(exp, $lp) - $cterm),
+    ]
 end
 
 function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
