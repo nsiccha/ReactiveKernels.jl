@@ -1113,10 +1113,6 @@ end
         y .~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = o
-        y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :o))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b[g, h]
         y .~ Normal.(mu, 1.0)
     end, (:y, :x, :g, :h))
@@ -1305,6 +1301,78 @@ end
         end
         @test err isa LoadError && err.error isa SurfaceLoweringError
     end
+end
+
+@testset "surface offset-only predictors" begin
+    # Bare-data affines lower to all-offset, zero-coefficient predictors
+    # (SBBRMI admits offset-only models; the RK path diverged until now).
+    bare = lower_rkppl(quote
+            mu = z
+            s ~ Exponential(1.0)
+            y .~ Normal.(mu, s)
+        end, (:y, :z))
+    @test [t.kind for t in only(bare.predictors).terms] == [OffsetTerm]
+    @test isempty(bare.population_priors)
+    multi = lower_rkppl(quote
+            mu = .+(z, x)
+            s ~ Exponential(1.0)
+            y .~ Normal.(mu, s)
+        end, (:y, :z, :x))
+    @test [t.kind for t in only(multi.predictors).terms] ==
+        [OffsetTerm, OffsetTerm]
+    derived = lower_rkppl(quote
+            rkd_offset_log_z = log.(z)
+            mu = rkd_offset_log_z
+            s ~ Exponential(1.0)
+            y .~ Normal.(mu, s)
+        end, (:y, :z))
+    @test [t.kind for t in only(derived.predictors).terms] == [OffsetTerm]
+    # Layout: empty coefficient block + the sampled scale.
+    cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5],
+        :z => [0.5, -1.0, 1.5, 0.0])
+    bound = bind_data(bare, cols)
+    layout = assign_layout(bound)
+    @test [e.kind for e in layout.entries] == [:coefficient, :sampled]
+    @test [e.size for e in layout.entries] == [0, 1]
+    @test layout.total == 1
+    # End to end: likelihood over the data affine + gradient.
+    built = build_kernel(bound)
+    u = [0.2]
+    s = exp(u[1])
+    ll = sum(logpdf.(Normal.(cols[:z], s), cols[:y]))
+    pr = logpdf(Exponential(1), s)
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    @test _query(built.spec, bound, :prior, u) ≈ pr
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[1]
+    _check_gradient(built.spec, bound, u)
+    # Multi + derived evaluate over their affines too.
+    mcols = Dict{Symbol,AbstractVector}(:y => cols[:y], :z => cols[:z],
+        :x => [1.0, 0.5, -0.5, 2.0])
+    mbound = bind_data(multi, mcols)
+    mbuilt = build_kernel(mbound)
+    mll = sum(logpdf.(Normal.(mcols[:z] .+ mcols[:x], s), mcols[:y]))
+    @test _query(mbuilt.spec, mbound, :likelihood, u) ≈ mll
+    pcols = Dict{Symbol,AbstractVector}(:y => cols[:y],
+        :z => [0.5, 1.0, 1.5, 2.0])
+    dbound = bind_data(derived, pcols)
+    dbuilt = build_kernel(dbound)
+    dll = sum(logpdf.(Normal.(log.(pcols[:z]), s), pcols[:y]))
+    @test _query(dbuilt.spec, dbound, :likelihood, u) ≈ dll
+    # Other coefficient-free shapes stay fail-closed (message pinned).
+    err = try
+        lower_rkppl(quote
+                mu = ranef(g)
+                y .~ Normal.(mu, 1.0)
+                ranef_bucket(g) do
+                    mu => [1]
+                end
+            end, (:y, :g))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError &&
+        occursin("coefficient-free shape", sprint(showerror, err))
 end
 
 # Slice A: range-explicit response LHS (`y[R] .~ ...`) + single-LHS
