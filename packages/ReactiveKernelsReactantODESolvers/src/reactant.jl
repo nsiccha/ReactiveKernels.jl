@@ -187,3 +187,62 @@ function traceable_ode_closure(args...; kwargs...)
         "traceable_ode_closure requires Reactant.jl to be loaded " *
         "(the Reactant extension is inactive)"))
 end
+
+"""
+    traceable_fixedn_closure(f, config::ReactantTsit5Config, u0_example, p_example)
+
+Build the raw traced fixed-N closure compiled by
+[`compile_fixedn_solve`](@ref) (requires Reactant.jl; implemented by the
+package extension). Takes traced `(u0,)` or `(u0, p)` and returns traced
+`(endpoint, saveat_cols, status)`. The step count is `config.maxiters`
+(which must be `>= 1`).
+
+Unlike the adaptive closure, the loop bound is static, so tracing
+unrolls all `N` steps into straight-line solver code (no `while` op):
+every step is accepted, the subdivision trigger and the failure latches
+are branchless `ifelse` selects, and step `N` lands exactly on `t1`.
+There are no emergency retries — a poisoned or guard-exceeding step
+latches the failure status and freezes the rest — so the traced solve
+diverges from [`solve_fixed_n`](@ref) exactly when native would retry
+(spike entries on hard problems); on guard-clean solves the two agree
+to printing precision. The unrolled shape is the through-reverse probe
+vehicle: there is no adaptive loop left to differentiate through.
+"""
+function traceable_fixedn_closure end
+
+function traceable_fixedn_closure(args...; kwargs...)
+    throw(ArgumentError(
+        "traceable_fixedn_closure requires Reactant.jl to be loaded " *
+        "(the Reactant extension is inactive)"))
+end
+
+"""
+    compile_fixedn_solve(f, u0_example, p_example, ::Tsit5, config::ReactantTsit5Config)
+
+Compile a fixed-shape fixed-N Tsit5 solve with Reactant (requires
+Reactant.jl; implemented by the package extension). `u0_example` fixes
+the state dimension and element type; `p_example` is either `nothing`
+(the RHS closes over concrete parameters) or an example parameter
+vector, traced alongside `u0`. The step count is `config.maxiters`.
+
+Returns a callable: `solved(u0)` (or `solved(u0, p)`) returns
+`(endpoint, saveat_matrix, status)` with plain Julia values, where
+`saveat_matrix` has one column per configured saveat point and `status`
+is `0` (reached `t1`), `1` (stuck: no representable progress;
+`dtmin` is fixed at 0 as in the adaptive traced driver), or `2`
+(poisoned error estimate observed).
+
+The RHS contract matches [`compile_ode_solve`](@ref). Hyperparameters
+are compile-time constants; the compiled program is the unrolled
+fixed-N schedule (see [`traceable_fixedn_closure`](@ref)). Gradient
+path: plain `Enzyme.autodiff(::Reverse, ...)` inside a second compiled
+function over this closure (straight-line reverse, no loop); compare
+against finite differences of the compiled solve.
+"""
+function compile_fixedn_solve end
+
+function compile_fixedn_solve(args...; kwargs...)
+    throw(ArgumentError(
+        "compile_fixedn_solve requires Reactant.jl to be loaded " *
+        "(the Reactant extension is inactive)"))
+end
