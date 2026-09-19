@@ -167,14 +167,20 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family === GaussianFam
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliLogitFam
-        # Base GLM case (no evidence, no weights): fused whole-vector reduction.
+        # Base GLM case (no evidence, no weights, no literal range): fused
+        # whole-vector reduction. Ranged responses stay on the plate path
+        # (the cover rule makes them whole-column today, but the fused sum
+        # must never silently outgrow a future partial range).
         r.evidence.kind === :none && r.weights === nothing &&
+            r.range === nothing &&
             return _bernoulli_wholevec_stmts(r, plan, node)
         return _bernoulli_plate_stmts(r, plan, node, pw)
     elseif r.family === PoissonLogFam
-        # Base GLM case (no evidence, no weights): fused whole-vector reduction
-        # (faster native + Reactant; the per-cell plate handles evidence/weights).
+        # Base GLM case (no evidence, no weights, no literal range): fused
+        # whole-vector reduction (faster native + Reactant; the per-cell
+        # plate handles evidence/weights/ranges).
         r.evidence.kind === :none && r.weights === nothing &&
+            r.range === nothing &&
             return _poisson_wholevec_stmts(r, plan, node)
         return _poisson_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
