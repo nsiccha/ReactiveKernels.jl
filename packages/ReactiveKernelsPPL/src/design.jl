@@ -73,6 +73,13 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps)
         # generator can resolve the blocks without re-reading terms.
         return DesignBlock(SplineSummandTerm, t.options.spline_id,
             t.addressee, 0, Symbol[], [])
+    elseif t.kind === HSGPSummandTerm
+        # An HSGP summand is a direct `PHI * (sqrt_spd .* beta)` expression
+        # over in-graph basis columns and the term's layout blocks (Stage
+        # B) — no design-matrix width. The basis id rides in `column` so
+        # the generator can resolve the basis without re-reading terms.
+        return DesignBlock(HSGPSummandTerm, t.options.hsgp_id,
+            t.addressee, 0, Symbol[], [])
     elseif t.kind === FactorTerm
         col = only(t.columns)
         m = _find_levelmap(levelmaps, pname, col)

@@ -72,6 +72,7 @@ random-effects / per-observation-latent location."""
     LatentTerm
     RanefGatherTerm
     SplineSummandTerm
+    HSGPSummandTerm
 end
 
 """
@@ -430,6 +431,29 @@ struct SplineVector
 end
 
 """
+    HSGPBasis(id, axes, K, c, iso, fits, label)
+
+One Hilbert-space GP basis (SB `_sb_hsgp`): `axes` raw data columns,
+`K` modes per axis, `c` boundary factors per axis (`L =
+c*max|x-mu|`, `c > 1`), `iso` length-scale sharing. `fits` holds the
+bind-time `(mu, L)` per axis (empty pre-bind); the basis itself is
+evaluated in-graph from the raw columns + frozen fits (trig is
+elementwise-expressible — unlike spline eigen, no bind-time
+materialization). `M = prod(K)` basis functions; the term owns
+`beta_raw_<id>` (M-vector), `rho_<id>` (iso scalar) or
+`rho_<id>_1..d` (aniso scalars), `sigma_<id>` (scalar).
+"""
+struct HSGPBasis
+    id::Symbol
+    axes::Vector{Symbol}
+    K::Vector{Int}
+    c::Vector{Float64}
+    iso::Bool
+    fits::Vector{Tuple{Float64,Float64}}
+    label::Symbol
+end
+
+"""
     AssignmentSpec(name, expr)
 
 One scalar temporary (slice 1): `expr` may reference scalar names and
@@ -571,11 +595,12 @@ struct StructuralPlan
     vector_parameters::Vector{VectorParameter}
     spline_bases::Vector{SplineBasis}
     spline_vectors::Vector{SplineVector}
+    hsgp_bases::Vector{HSGPBasis}
 end
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
-# before `levelmaps`/`scans`/`ranef_buckets`/`vector_parameters`/spline nodes
-# existed keep working with all empty.
+# before `levelmaps`/`scans`/`ranef_buckets`/`vector_parameters`/spline/hsgp
+# nodes existed keep working with all empty.
 StructuralPlan(
     responses::Vector{LikelihoodSpec},
     predictors::Vector{PredictorSpec},
@@ -588,7 +613,8 @@ StructuralPlan(
     roles::Dict{Symbol,Symbol}) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[],
-        RanefBucket[], VectorParameter[], SplineBasis[], SplineVector[])
+        RanefBucket[], VectorParameter[], SplineBasis[], SplineVector[],
+        HSGPBasis[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -614,11 +640,12 @@ function StructuralPlan(
         ranef_buckets::Vector{RanefBucket} = RanefBucket[],
         vector_parameters::Vector{VectorParameter} = VectorParameter[],
         spline_bases::Vector{SplineBasis} = SplineBasis[],
-        spline_vectors::Vector{SplineVector} = SplineVector[])
+        spline_vectors::Vector{SplineVector} = SplineVector[],
+        hsgp_bases::Vector{HSGPBasis} = HSGPBasis[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, columns, n_obs, roles, levelmaps,
         plate_parameters, scans, ranef_buckets, vector_parameters,
-        spline_bases, spline_vectors)
+        spline_bases, spline_vectors, hsgp_bases)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -741,6 +768,48 @@ function _spline_vector_specs(id::Symbol, kind::Symbol, k)
     return specs
 end
 
+# HSGP sampled names, derived purely from the basis id (SB `_sb_hsgp`
+# vocabulary, basis-qualified): the standardized coefficients
+# (`beta_raw_<id>`, M-vector), the length scale(s) (`rho_<id>` iso
+# scalar, `rho_<id>_1..d` aniso scalars — d scalars, never a
+# floors-vector), and the marginal scale (`sigma_<id>` scalar).
+# Single source for surface claims, name tables, layout, and the
+# generator (Stage B).
+function _hsgp_names(hb::HSGPBasis)
+    id = hb.id
+    beta = Symbol("beta_raw_", id)
+    sigma = Symbol("sigma_", id)
+    rhos = hb.iso ? [Symbol("rho_", id)] :
+        [Symbol("rho_", id, :_, j) for j in 1:length(hb.axes)]
+    return (beta = beta, rhos = rhos, sigma = sigma)
+end
+
+"""Basis-function count `M = prod(K)` for an [`HSGPBasis`](@ref)."""
+_hsgp_n_basis(hb::HSGPBasis) = prod(hb.K)
+
+# Flat sampled-name list for name tables + claims (beta, rhos, sigma).
+function _hsgp_all_names(hb::HSGPBasis)
+    n = _hsgp_names(hb)
+    return Symbol[n.beta, n.sigma, n.rhos...]
+end
+
+"""
+    _hsgp_floors(K, fits, iso) -> Vector{Float64}
+
+Length-scale floors from bound fits (SB `_brm_hsgp_rho_lower[_s]`
+verbatim): `(4L/pi)*sqrt(log(100)/(K^2-1))` per axis (`K=1` →
+`0.0`, unbounded); iso takes the max. Pure function of fits — no
+storage on the IR (layout calls it on bound fits in Stage B).
+"""
+function _hsgp_floors(K::Vector{Int}, fits::Vector{Tuple{Float64,Float64}},
+        iso::Bool)
+    per = Float64[
+        k == 1 ? 0.0 :
+            (4 * L / pi) * sqrt(log(100.0) / (k * k - 1))
+        for (k, (_, L)) in zip(K, fits)]
+    return iso ? [maximum(per)] : per
+end
+
 """Slice-1 term-name vocabulary (emitter-side admission keys; `:ranef_gather`
 and `:spline_summand` joined with their slices)."""
 const TERM_NAMES = Dict{Symbol,TermKind}(
@@ -750,6 +819,7 @@ const TERM_NAMES = Dict{Symbol,TermKind}(
     :offset => OffsetTerm,
     :ranef_gather => RanefGatherTerm,
     :spline_summand => SplineSummandTerm,
+    :hsgp_summand => HSGPSummandTerm,
 )
 
 """Allowlisted assignment functions (slice 1: scalar ops + whole-column
@@ -787,7 +857,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
-    RanefGatherTerm, SplineSummandTerm)
+    RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate):
 scalar/reduction vocabulary plus vector-returning whole-column functions."""
@@ -842,6 +912,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_responses(plan)
     _validate_ranef_buckets(plan)
     _validate_splines(plan)
+    _validate_hsgp(plan)
     return nothing
 end
 
@@ -860,6 +931,7 @@ function validate_data(plan::StructuralPlan)
     _validate_plate_parameters_data(plan)
     _validate_ranef_buckets_data(plan)
     _validate_splines_data(plan)
+    _validate_hsgp_data(plan)
     return nothing
 end
 
@@ -1232,6 +1304,87 @@ function _validate_splines_data(plan::StructuralPlan)
     return nothing
 end
 
+function _validate_hsgp(plan::StructuralPlan)
+    ids = [hb.id for hb in plan.hsgp_bases]
+    length(unique(ids)) == length(ids) ||
+        _fail(:plan, "duplicate hsgp basis ids")
+    labels = [hb.label for hb in plan.hsgp_bases]
+    length(unique(labels)) == length(labels) ||
+        _fail(:plan, "duplicate hsgp basis labels")
+    for hb in plan.hsgp_bases
+        d = length(hb.axes)
+        d >= 1 ||
+            _fail(:plan, "hsgp :$(hb.id): takes at least one axis column")
+        length(hb.axes) == length(unique(hb.axes)) ||
+            _fail(:plan, "hsgp :$(hb.id): duplicate axis columns $(hb.axes)")
+        length(hb.K) == d ||
+            _fail(:plan, "hsgp :$(hb.id): K has $(length(hb.K)) entries " *
+                  "for $d axes (one mode count per axis)")
+        all(k -> k isa Int && k >= 1, hb.K) ||
+            _fail(:plan, "hsgp :$(hb.id): K must be positive integers, " *
+                  "got $(hb.K)")
+        length(hb.c) == d ||
+            _fail(:plan, "hsgp :$(hb.id): c has $(length(hb.c)) entries " *
+                  "for $d axes (one boundary factor per axis)")
+        all(c -> c isa Real && isfinite(Float64(c)) && Float64(c) > 1,
+            hb.c) ||
+            _fail(:plan, "hsgp :$(hb.id): c must be finite and exceed 1 " *
+                  "(L = c*max|x-mu| must cover the data), got $(hb.c)")
+        hb.iso isa Bool ||
+            _fail(:plan, "hsgp :$(hb.id): iso must be Bool, " *
+                  "got $(repr(hb.iso))")
+        # Fits are bind products (empty pre-bind); a hand-built bound plan
+        # carries one finite (mu, L) per axis with L > 0.
+        isempty(hb.fits) || length(hb.fits) == d ||
+            _fail(:plan, "hsgp :$(hb.id): fits has $(length(hb.fits)) " *
+                  "entries for $d axes (bind fills one (mu, L) per axis)")
+        for (mu, L) in hb.fits
+            isfinite(mu) && isfinite(L) && L > 0 ||
+                _fail(:plan, "hsgp :$(hb.id): fit (mu, L) must be finite " *
+                      "with L > 0, got ($mu, $L)")
+        end
+    end
+    # Basis linkage: every summand names an existing basis; every basis
+    # feeds exactly one summand (one target per basis — a dangling basis
+    # would sample dead parameters, a double use double-counts).
+    uses = Dict{Symbol,Int}(id => 0 for id in ids)
+    for pred in plan.predictors, t in pred.terms
+        t.kind === HSGPSummandTerm || continue
+        haskey(t.options, :hsgp_id) ||
+            _fail(t.label, "hsgp summand carries no hsgp_id option")
+        sid = t.options.hsgp_id
+        haskey(uses, sid) ||
+            _fail(t.label, "hsgp summand addresses unknown basis :$sid")
+        uses[sid] += 1
+    end
+    for (id, n) in uses
+        n == 1 || _fail(:plan,
+            "hsgp :$id is used by $n summands — exactly one " *
+            "(one target per basis)")
+    end
+    return nothing
+end
+
+function _validate_hsgp_data(plan::StructuralPlan)
+    for hb in plan.hsgp_bases
+        for c in hb.axes
+            haskey(plan.columns, c) ||
+                _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
+                      "not bound")
+            _is_derived(plan, c) &&
+                _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
+                      "be raw data (the bind-time fit needs bound values)")
+            eltype(plan.columns[c]) <: Real ||
+                _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
+                      "be numeric, got $(eltype(plan.columns[c]))")
+        end
+        length(hb.fits) == length(hb.axes) ||
+            _fail(hb.label, "hsgp :$(hb.id): fits not filled at bind " *
+                  "(one (mu, L) per axis)")
+    end
+    return nothing
+end
+
 function _validate_name_tables(plan::StructuralPlan)
     pnames = [p.name for p in plan.predictors]
     length(unique(pnames)) == length(pnames) ||
@@ -1249,6 +1402,7 @@ function _validate_name_tables(plan::StructuralPlan)
     corr = Symbol[nm for b in plan.ranef_buckets
         if b.kind === :correlated
         for nm in _ranef_corr_names(b)]
+    hsgp = Symbol[nm for hb in plan.hsgp_bases for nm in _hsgp_all_names(hb)]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
@@ -1266,6 +1420,8 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate K=1 ranef names")
     length(unique(corr)) == length(corr) ||
         _fail(:plan, "duplicate correlated ranef names")
+    length(unique(hsgp)) == length(hsgp) ||
+        _fail(:plan, "duplicate hsgp names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
         (assigns, deriveds, "assignments and derived columns"),
@@ -1301,13 +1457,22 @@ function _validate_name_tables(plan::StructuralPlan)
         (corr, scanstates, "correlated ranef names and scan states"),
         (corr, vectors, "correlated ranef names and vector parameters"),
         (corr, svec, "correlated ranef names and spline vectors"),
-        (corr, k1, "correlated ranef names and K=1 ranef names"))
+        (corr, k1, "correlated ranef names and K=1 ranef names"),
+        (hsgp, params, "hsgp names and parameters"),
+        (hsgp, assigns, "hsgp names and assignments"),
+        (hsgp, deriveds, "hsgp names and derived columns"),
+        (hsgp, plates, "hsgp names and plate parameters"),
+        (hsgp, scanstates, "hsgp names and scan states"),
+        (hsgp, vectors, "hsgp names and vector parameters"),
+        (hsgp, svec, "hsgp names and spline vectors"),
+        (hsgp, k1, "hsgp names and K=1 ranef names"),
+        (hsgp, corr, "hsgp names and correlated ranef names"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
     allnames = union(params, assigns, deriveds, plates, scanstates, vectors,
-        svec, k1, corr)
+        svec, k1, corr, hsgp)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
@@ -1318,7 +1483,7 @@ function _validate_name_tables(plan::StructuralPlan)
             "parameter/assignment/derived/plate/scan/vector/spline/ranef $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, k1, corr))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, k1, corr, hsgp))
         _check_name_hygiene(n)
     end
     return nothing
@@ -2009,6 +2174,10 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
         _validate_spline_term(t, pred)
         return nothing
     end
+    if t.kind === HSGPSummandTerm
+        _validate_hsgp_term(t, pred)
+        return nothing
+    end
     t.options == NamedTuple() ||
         _fail(t.label, "terms take no options (slice 1: factor sizing " *
                        "lives in LevelMap)")
@@ -2082,6 +2251,23 @@ function _validate_spline_term(t::TermSpec, pred::PredictorSpec)
               "materialize at bind), got $(t.columns)")
     t.addressee === t.label ||
         _fail(t.label, "spline summand addressee must be its own label " *
+              "(self-addressed, no population prior), got $(t.addressee)")
+    return nothing
+end
+
+function _validate_hsgp_term(t::TermSpec, pred::PredictorSpec)
+    o = t.options
+    Tuple(keys(o)) == (:hsgp_id,) ||
+        _fail(t.label, "hsgp summand options must be exactly " *
+              "`(hsgp_id,)`, got $(Tuple(keys(o)))")
+    o.hsgp_id isa Symbol ||
+        _fail(t.label, "hsgp summand hsgp_id must be a Symbol, " *
+              "got $(repr(o.hsgp_id))")
+    isempty(t.columns) ||
+        _fail(t.label, "hsgp summand carries no columns (the basis is " *
+              "evaluated in-graph in Stage B), got $(t.columns)")
+    t.addressee === t.label ||
+        _fail(t.label, "hsgp summand addressee must be its own label " *
               "(self-addressed, no population prior), got $(t.addressee)")
     return nothing
 end
@@ -2279,11 +2465,13 @@ function _validate_priors(plan::StructuralPlan)
     for pred in plan.predictors
         # Offset terms carry no coefficient; latent terms carry the per-cell
         # PlateParameter, whose prior lives on the plate parameter itself;
-        # gather terms carry a RanefBucket and spline summands a SplineBasis,
-        # whose geometries are self-priored — none needs a coefficient prior.
+        # gather terms carry a RanefBucket, spline summands a SplineBasis,
+        # and hsgp summands an HSGPBasis, whose geometries are self-priored
+        # — none needs a coefficient prior.
         addressees = Set{Symbol}(t.addressee for t in pred.terms
             if t.kind !== OffsetTerm && t.kind !== LatentTerm &&
-               t.kind !== RanefGatherTerm && t.kind !== SplineSummandTerm)
+               t.kind !== RanefGatherTerm && t.kind !== SplineSummandTerm &&
+               t.kind !== HSGPSummandTerm)
         any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
         for a in addressees
             (pred.name, a) in seen ||
@@ -2921,6 +3109,46 @@ _upgrade_role!(roles, col, role) =
 # the contract's <id>_<block>_<j> names. Caller-supplied columns under a
 # materialized name are rejected (reserved-name exclusivity); the fit's
 # own errors surface as ContractValidationErrors with the [spline] tag.
+# Bind-time HSGP fit (the spline host-side transformed-data mirror):
+# fills each basis's (mu, L) per axis from the RAW bound columns (SB
+# `_brm_fit_hsgp` verbatim: `mu = mean(x)`, `L = c*max|x-mu|`).
+# Degenerate axes (L == 0 — constant columns) and non-finite data
+# fail closed here (bind owns data errors); the basis itself is
+# evaluated in-graph in Stage B from the raw columns + these frozen
+# fits (bind-then-build ordering keeps them consistent across
+# rebinds — the SB DATA-vs-literal concern).
+function _fit_hsgp_bases(plan::StructuralPlan,
+        columns::Dict{Symbol,AbstractVector})
+    isempty(plan.hsgp_bases) && return HSGPBasis[]
+    out = HSGPBasis[]
+    for hb in plan.hsgp_bases
+        fits = Tuple{Float64,Float64}[]
+        for (c, cj) in zip(hb.axes, hb.c)
+            haskey(columns, c) ||
+                _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
+                      "not bound")
+            col = columns[c]
+            eltype(col) <: Real ||
+                _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
+                      "be numeric, got $(eltype(col))")
+            isempty(col) &&
+                _fail(hb.label, "hsgp :$(hb.id): axis column $c is empty")
+            mu = sum(col) / length(col)
+            L = Float64(cj) * maximum(abs.(col .- mu))
+            isfinite(mu) && isfinite(L) ||
+                _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
+                      "non-finite (mu=$mu, L=$L)")
+            L > 0 ||
+                _fail(hb.label, "hsgp :$(hb.id): axis $c is degenerate " *
+                      "(L == 0 — a constant column has no usable domain)")
+            push!(fits, (Float64(mu), L))
+        end
+        push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, fits,
+            hb.label))
+    end
+    return out
+end
+
 function _materialize_splines!(plan::StructuralPlan,
         columns::Dict{Symbol,AbstractVector})
     isempty(plan.spline_bases) && return SplineBasis[]
@@ -2982,6 +3210,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         "[bind] bind_data requires non-empty columns"))
     columns = Dict{Symbol,AbstractVector}(columns)
     bases = _materialize_splines!(plan, columns)
+    hbases = _fit_hsgp_bases(plan, columns)
     for (k, v) in roles
         haskey(columns, k) || throw(ContractValidationError(
             "[bind] role for unknown column $k"))
@@ -2996,6 +3225,9 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         haskey(inferred, b.group) && _upgrade_role!(inferred, b.group, :group)
     end
     for sb in bases, blk in sb.blocks, c in blk.columns
+        haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
+    end
+    for hb in hbases, c in hb.axes
         haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
     end
     for r in plan.responses
@@ -3028,7 +3260,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         levelmaps = maps, plate_parameters = plan.plate_parameters,
         scans = plan.scans, ranef_buckets = plan.ranef_buckets,
         vector_parameters = vectors2, spline_bases = bases,
-        spline_vectors = plan.spline_vectors)
+        spline_vectors = plan.spline_vectors, hsgp_bases = hbases)
     validate_data(bound)
     return bound
 end

@@ -176,8 +176,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
-    sample, det, plate_ctx, plate_specs, scans, buckets, bases, vectors =
-        _partition_statements(ast, data)
+    sample, det, plate_ctx, plate_specs, scans, buckets, bases, vectors,
+    hbases = _partition_statements(ast, data)
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
@@ -213,7 +213,9 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
             (b.id, b.group) => b for b in buckets),
         implicit_vectors = VectorParameter[],
         splines = Dict{Symbol,SplineBasis}(b.id => b for b in bases),
-        spline_uses = Dict{Symbol,Symbol}())
+        spline_uses = Dict{Symbol,Symbol}(),
+        hsgps = Dict{Symbol,HSGPBasis}(b.id => b for b in hbases),
+        hsgp_uses = Dict{Symbol,Symbol}())
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
     pred_idx = Dict{Symbol,Int}()
@@ -273,7 +275,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
         ranef_buckets = buckets,
         vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
-        spline_bases = bases, spline_vectors = vectors)
+        spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases)
     validate_structure(plan)
     return plan
 end
@@ -538,7 +540,8 @@ function _reject_unknown_calls(where, rhs)
     if rhs.head === :call && !isempty(rhs.args)
         fn = rhs.args[1]
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
-                fn ∉ VECTOR_FNS && fn !== :ranef && fn !== :spline
+                fn ∉ VECTOR_FNS && fn !== :ranef && fn !== :spline &&
+                fn !== :hsgp
             startswith(string(fn), ".") && _sfail(
                 "$where uses dotted operator `$fn`, which is not in " *
                 "the slice-1 elementwise vocabulary")
@@ -795,6 +798,13 @@ _is_spline_call(ex) =
     ex isa Expr && ex.head === :call && !isempty(ex.args) &&
     ex.args[1] === :spline
 
+_contains_hsgp(ex) = ex isa Expr &&
+    (_is_hsgp_call(ex) || any(_contains_hsgp, ex.args))
+
+_is_hsgp_call(ex) =
+    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+    ex.args[1] === :hsgp
+
 # A bare `spline_basis(:id, x...; kind=..., k=...)` call declares one
 # spline basis (the first bare-call statement: declarations do work at
 # lowering — they build IR + claim the generated names — so the "bare
@@ -916,6 +926,129 @@ function _lower_basis_k(v, where)
     return Int(v)
 end
 
+# A bare `hsgp_basis(:id, x...; k=..., c=..., iso=...)` call declares
+# one HSGP basis (same bare-call-declaration shape as `spline_basis`).
+# Quoted id, bare raw axes (any count ≥ 1), literal `k` (positive
+# integer or per-axis tuple, default 20), literal `c` (real > 1 or
+# per-axis tuple, default 1.5), literal `iso` Bool (default true).
+# Lowers directly to HSGPBasis IR (fits fill at bind); claims the
+# basis label and the sampled names up front so user definitions can
+# never collide with Stage-B graph names (summand labels ride the
+# spline precedent — unclaimed, predictor-derived).
+_is_hsgp_basis_stmt(st) =
+    st isa Expr && st.head === :call && !isempty(st.args) &&
+    st.args[1] === :hsgp_basis
+
+function _lower_hsgp_basis(st::Expr, line::Int, data::Set{Symbol},
+        seen::Set{Symbol}, seelines::Dict{Symbol,Int},
+        hbases::Vector{HSGPBasis})
+    where = line > 0 ? "hsgp basis (line $line)" : "hsgp basis"
+    pos = Any[]
+    k = nothing
+    c = nothing
+    iso = true
+    for a in st.args[2:end]
+        if a isa Expr && a.head === :parameters
+            for kw in a.args
+                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
+                    _sfail("$where takes keywords `k`/`c`/`iso` only")
+                key = kw.args[1]
+                key === :k || key === :c || key === :iso ||
+                    _sfail("$where takes keywords `k`/`c`/`iso` only, got " *
+                          "`$key`")
+                if key === :k
+                    k = _lower_hsgp_k(kw.args[2], where)
+                elseif key === :c
+                    c = _lower_hsgp_c(kw.args[2], where)
+                else
+                    v = kw.args[2]
+                    v isa Bool ||
+                        _sfail("$where `iso` must be a Bool literal, got " *
+                              "$(repr(v))")
+                    iso = v
+                end
+            end
+        else
+            push!(pos, a)
+        end
+    end
+    length(pos) >= 2 ||
+        _sfail("$where takes `(:id, axis...)` positionally, got " *
+              "($(join(repr.(pos), ", ")))")
+    id, axes = pos[1], pos[2:end]
+    id isa QuoteNode && id.value isa Symbol ||
+        _sfail("$where quotes its basis id: got $(repr(id)) — write " *
+              "`hsgp_basis(:id, x)` (bare names are data columns)")
+    id = id.value
+    any(b -> b.id === id, hbases) &&
+        _sfail("$where duplicates basis :$id (one declaration per id)")
+    for ax in axes
+        ax isa Symbol ||
+            _sfail("$where axes must be bare data columns, got $(repr(ax))")
+        ax in data || _sfail("$where axis `$ax` is not data")
+    end
+    length(axes) == length(unique(axes)) ||
+        _sfail("$where axis columns must be distinct, got $axes")
+    d = length(axes)
+    k = k === nothing ? fill(20, d) : _hsgp_broadcast_opt(k, d, where, :k)
+    c = c === nothing ? fill(1.5, d) : _hsgp_broadcast_opt(c, d, where, :c)
+    label = Symbol("hsgp_", id)
+    _claim!(seen, seelines, label, line)
+    hb = HSGPBasis(id, Vector{Symbol}(axes), k, c, iso,
+        Tuple{Float64,Float64}[], label)
+    for nm in _hsgp_all_names(hb)
+        _claim!(seen, seelines, nm, line)
+    end
+    return hb
+end
+
+function _lower_hsgp_k(v, where)
+    v isa Integer && !(v isa Bool) ||
+        (v isa Expr && v.head === :tuple) ||
+        _sfail("$where `k` must be a literal (a positive integer or a " *
+              "per-axis integer tuple), got $(repr(v))")
+    if v isa Expr
+        all(e -> e isa Integer && !(e isa Bool), v.args) ||
+            _sfail("$where `k` tuple entries must be integer literals, " *
+                  "got $(repr(v))")
+        all(e -> e >= 1, v.args) ||
+            _sfail("$where `k` entries must be positive, got $(repr(v))")
+        return Int[e for e in v.args]
+    end
+    v >= 1 || _sfail("$where `k` must be positive, got $v")
+    return Int(v)
+end
+
+function _lower_hsgp_c(v, where)
+    v isa Real && !(v isa Bool) ||
+        (v isa Expr && v.head === :tuple) ||
+        _sfail("$where `c` must be a literal (a real > 1 or a per-axis " *
+              "tuple), got $(repr(v))")
+    if v isa Expr
+        all(e -> e isa Real && !(e isa Bool), v.args) ||
+            _sfail("$where `c` tuple entries must be real literals, " *
+                  "got $(repr(v))")
+        all(e -> isfinite(Float64(e)) && Float64(e) > 1, v.args) ||
+            _sfail("$where `c` entries must be finite and exceed 1, " *
+                  "got $(repr(v))")
+        return Float64[e for e in v.args]
+    end
+    isfinite(Float64(v)) && Float64(v) > 1 ||
+        _sfail("$where `c` must be finite and exceed 1, got $(repr(v))")
+    return Float64(v)
+end
+
+# Scalar broadcasts per axis (SB `_brm_axis_option` shape); tuples must
+# match the axis count exactly.
+function _hsgp_broadcast_opt(v, d::Int, where, key::Symbol)
+    v isa Vector && length(v) == d && return v
+    v isa Vector &&
+        _sfail("$where `$key` tuple takes one entry per axis ($d), got " *
+              "$(length(v))")
+    T = key === :k ? Int : Float64
+    return fill(T(v), d)
+end
+
 function _partition_statements(ast::Expr, data::Set{Symbol})
     sample = SampleStmt[]
     det = Pair{Symbol,Any}[]
@@ -923,6 +1056,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     buckets = RanefBucket[]
     bases = SplineBasis[]
     vectors = SplineVector[]
+    hbases = HSGPBasis[]
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
     seen_doc = false
@@ -964,6 +1098,11 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             append!(vectors, vs)
             continue
         end
+        if _is_hsgp_basis_stmt(st)
+            hb = _lower_hsgp_basis(st, line, data, seen, seelines, hbases)
+            push!(hbases, hb)
+            continue
+        end
         if _is_sample(st) || _is_broadcast_sample(st)
             bc = _is_broadcast_sample(st)
             tilde = bc ? "`.~`" : "`~`"
@@ -973,6 +1112,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                        "sampled")
             lhs in (:spline, :spline_basis) &&
                 _sfail("`$lhs` is reserved (spline surface) and cannot be " *
+                       "sampled")
+            lhs in (:hsgp, :hsgp_basis) &&
+                _sfail("`$lhs` is reserved (hsgp surface) and cannot be " *
                        "sampled")
             _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[3], lhs)
@@ -987,6 +1129,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             lhs in (:spline, :spline_basis) &&
                 _sfail("`$lhs` is reserved (spline surface) and cannot be " *
                        "redefined")
+            lhs in (:hsgp, :hsgp_basis) &&
+                _sfail("`$lhs` is reserved (hsgp surface) and cannot be " *
+                       "redefined")
             lhs in data && _sfail("$lhs is bound data and cannot be redefined")
             _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[2], lhs)
@@ -996,7 +1141,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         end
     end
     return sample, det, plate_ctx, plate_params, scans, buckets, bases,
-        vectors
+        vectors, hbases
 end
 
 # Pre-pass: expand top-level `@plate for i in R ... end` blocks into
@@ -2681,6 +2826,10 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
         "into $where) calls `spline()`, which lowers only as a direct " *
         "predictor summand (`mu = a .+ b .* x .+ spline(:s_x)`), not " *
         "inside definitions")
+    _contains_hsgp(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
+        "into $where) calls `hsgp()`, which lowers only as a direct " *
+        "predictor summand (`mu = a .+ b .* x .+ hsgp(:h_x)`), not " *
+        "inside definitions")
     if ex in ctx.structural || ctx.detshape[ex] !== :vector
         ex in visited && _sfail("$where: cyclic definition through $ex")
         push!(ctx.absorbed, ex)
@@ -2745,6 +2894,14 @@ function _classify_summand(pname, core, sign::Int, ctx)
                   "(`mu = a .+ b .* x .+ spline(:s_x)`), not nested in " *
                   "$(repr(core))")
         return _classify_spline(pname, core, sign, ctx)
+    end
+    if _contains_hsgp(core)
+        _is_hsgp_call(core) ||
+            _sfail("predictor $pname: `hsgp()` summands lower only as " *
+                  "direct additive summands " *
+                  "(`mu = a .+ b .* x .+ hsgp(:h_x)`), not nested in " *
+                  "$(repr(core))")
+        return _classify_hsgp(pname, core, sign, ctx)
     end
     head = core.head
     head === :ref && return _classify_ref(pname, core, sign, ctx)
@@ -2841,6 +2998,37 @@ function _classify_spline(pname, core::Expr, sign::Int, ctx)
     ctx.spline_uses[id] = pname
     label = Symbol("spline_", pname, "_", id)
     return TermSpec(SplineSummandTerm, ColumnRef[], (spline_id = id,),
+        label, label), nothing
+end
+
+# An `hsgp(:id)` summand: the named basis's direct summand in the
+# enclosing predictor (SB's `PHI * (sqrt_spd .* beta)` shape, Stage B).
+# Additive only, one target per basis (a second use fails here so the
+# surface error names both predictors; the contract re-checks for
+# hand-built plans).
+function _classify_hsgp(pname, core::Expr, sign::Int, ctx)
+    where = "predictor $pname"
+    args = core.args[2:end]
+    length(args) == 1 ||
+        _sfail("$where hsgp summand takes `hsgp(:id)` exactly, got " *
+              "$(repr(core))")
+    id = only(args)
+    id isa QuoteNode && id.value isa Symbol ||
+        _sfail("$where quotes its hsgp id: got $(repr(id)) — write " *
+              "`hsgp(:id)`")
+    id = id.value
+    sign > 0 ||
+        _sfail("$where negates an `hsgp()` summand — summands are " *
+              "additive only (write `.+ hsgp(:$id)`)")
+    haskey(ctx.hsgps, id) ||
+        _sfail("$where uses unknown hsgp :$id — declare it with " *
+              "`hsgp_basis(:$id, x)`")
+    haskey(ctx.hsgp_uses, id) &&
+        _sfail("$where reuses hsgp :$id, which already feeds predictor " *
+              "`$(ctx.hsgp_uses[id])` (one target per basis)")
+    ctx.hsgp_uses[id] = pname
+    label = Symbol("hsgp_", pname, "_", id)
+    return TermSpec(HSGPSummandTerm, ColumnRef[], (hsgp_id = id,),
         label, label), nothing
 end
 
@@ -3053,10 +3241,12 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
             # Offsets carry no coefficient; latent terms carry a PlateParameter
             # whose prior lives on the plate parameter, not as a coefficient;
             # gather terms carry a RanefBucket, whose geometry is self-priored;
-            # spline summands carry SplineVectors, self-priored likewise.
+            # spline summands carry SplineVectors, self-priored likewise;
+            # hsgp summands carry an HSGPBasis, self-priored likewise.
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
                 t.kind === RanefGatherTerm ||
-                t.kind === SplineSummandTerm) && continue
+                t.kind === SplineSummandTerm ||
+                t.kind === HSGPSummandTerm) && continue
             addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
             use = _find_use(coefuse, pred.name, addr)
             use === nothing && _sfail("internal: no coefficient use for " *
@@ -3360,6 +3550,9 @@ function _lower_assignment(nm, rhs, coefuse)
     _contains_spline(rhs) && _sfail("assignment `$nm` calls `spline()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ b .* x .+ spline(:s_x)`), not inside definitions")
+    _contains_hsgp(rhs) && _sfail("assignment `$nm` calls `hsgp()`, " *
+        "which lowers only as a direct predictor summand " *
+        "(`mu = a .+ b .* x .+ hsgp(:h_x)`), not inside definitions")
     for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by assignment " *
@@ -3381,6 +3574,9 @@ function _lower_vector_assignment(nm, rhs, coefuse)
     _contains_spline(rhs) && _sfail("derived column `$nm` calls `spline()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ b .* x .+ spline(:s_x)`), not inside definitions")
+    _contains_hsgp(rhs) && _sfail("derived column `$nm` calls `hsgp()`, " *
+        "which lowers only as a direct predictor summand " *
+        "(`mu = a .+ b .* x .+ hsgp(:h_x)`), not inside definitions")
     for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by derived " *

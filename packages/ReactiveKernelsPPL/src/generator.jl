@@ -24,6 +24,10 @@ function build_kernel(plan::StructuralPlan)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
+    nhsgp = length(plan.hsgp_bases)
+    nhsgp == 0 || throw(ContractValidationError(
+        "[generator] HSGP codegen is Stage B — refusing to silently drop " *
+        "$nhsgp hsgp basis(es)"))
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
