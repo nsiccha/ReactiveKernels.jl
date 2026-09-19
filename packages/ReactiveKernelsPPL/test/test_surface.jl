@@ -1046,11 +1046,14 @@ end
         mu = a .+ b .* x
         y .~ truncated.(Normal(mu, 1.0), 0, 10)
     end, Dn)
-    # Per-observation scales need plate plumbing (planned).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # A RAW data-column per-observation scale (the eight-schools known SE) now
+    # lowers — the response carries the column name and threads it per cell.
+    got_obs_scale = lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Normal.(mu, x)
     end, Dn)
+    @test only(got_obs_scale.responses).scale === :x
+    # A DERIVED-column scale still needs shape metadata (planned): rejected.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         w = x .+ 1
         mu = a .+ b .* x

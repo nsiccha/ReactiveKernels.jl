@@ -257,6 +257,26 @@ end
     @test_throws ContractValidationError validate_plan(bad)
 end
 
+@testset "per-observation known scale" begin
+    # A raw data-column scale (the eight-schools known SE) binds and validates.
+    good = _gaussian_plan()
+    good.columns[:se] = collect(1.0:9.0)
+    good.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :se,
+        nothing, _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    # A non-positive scale column is rejected at bind (a scale is strictly > 0).
+    bad = _gaussian_plan()
+    bad.columns[:se] = vcat(0.0, collect(2.0:9.0))
+    bad.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :se,
+        nothing, _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # An unknown scale name (neither scalar parameter nor data column) is caught.
+    bad3 = _gaussian_plan()
+    bad3.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :nope,
+        nothing, _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad3)
+end
+
 @testset "sampled parameters" begin
     bad = _gaussian_plan()
     bad.parameters[1] =

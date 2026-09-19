@@ -1457,6 +1457,7 @@ end
 function _validate_response_data(plan::StructuralPlan)
     for r in plan.responses
         _validate_response_column(r, plan)
+        _validate_scale_data(r, plan)
         _validate_weights(r, plan)
         _validate_trials(r, plan)
         _validate_evidence_data(r, plan)
@@ -1529,8 +1530,36 @@ function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
             _fail(r.label, "scale literal must be finite positive")
         return nothing
     end
+    # A scalar parameter/assignment scale resolves now; a per-observation scale
+    # is a raw data column resolved at bind (see `_validate_scale_data`), so
+    # defer an unknown symbol rather than failing structurally (mirrors how
+    # per-obs weight/trials columns validate only once data is attached).
     s isa Symbol && s in _union_names(plan) && return nothing
+    s isa Symbol && return nothing
     return _fail(r.label, "scale references unknown name $s")
+end
+
+# Data-level per-observation scale check: a scalar parameter/assignment name
+# resolves structurally; a raw data-column scale (the eight-schools known SE)
+# must be finite-positive numerics of length n_obs (a Gaussian/NB2/Gamma scale
+# is strictly positive). A derived column scale is rejected — per-obs scales
+# bind raw (mirrors the weights/trials raw-only rule).
+function _validate_scale_data(r::LikelihoodSpec, plan::StructuralPlan)
+    s = r.scale
+    (s === nothing || s isa Real) && return nothing
+    s isa Symbol || return nothing
+    s in _union_names(plan) && return nothing
+    _is_derived(plan, s) && _fail(r.label,
+        "scale column $s is derived — slice-1 binds per-observation scales " *
+        "raw (derived-column scales need shape metadata — planned)")
+    haskey(plan.columns, s) ||
+        _fail(r.label, "scale references unknown name $s")
+    col = plan.columns[s]
+    (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
+        _fail(r.label, "per-observation scale $s must be finite positive numerics")
+    length(col) == plan.n_obs ||
+        _fail(r.label, "scale column $s length $(length(col)) ≠ n_obs $(plan.n_obs)")
+    return nothing
 end
 
 function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)

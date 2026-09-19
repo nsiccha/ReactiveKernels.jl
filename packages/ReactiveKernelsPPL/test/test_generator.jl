@@ -682,6 +682,44 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+# Eight schools (the canonical parity acceptance case): a per-cell latent
+# `theta[i] ~ Normal(mu, tau)` observed with a PER-OBSERVATION KNOWN SCALE
+# `y[i] ~ Normal(theta[i], se[i])`, where `se` is a raw data column. The
+# response scale threads through the likelihood plate per cell exactly like a
+# per-obs weight. Oracle is an independent Distributions.jl loop.
+@testset "plate parameter eight-schools per-obs known scale" begin
+    y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
+    se = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
+    n = length(y)
+    expr = Expr(:block,
+        :(mu ~ Normal(0, 5)),
+        :(tau ~ HalfNormal(5)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ Normal(mu, tau)),
+                    :(y[i] ~ Normal.(theta[i], se[i]))))))
+    plan0 = lower_rkppl(expr, (:y, :se))
+    # The per-obs scale rides the response as a data-column name, not a scalar.
+    @test plan0.responses[1].scale == :se
+    plan = bind_data(plan0, Dict{Symbol,AbstractVector}(:y => y, :se => se))
+    built = build_kernel(plan)
+    # layout: mu (identity), tau (exp), theta (n identity cells).
+    @test built.layout.total == 2 + n
+    @test coordinate_names(built.layout)[3] == Symbol("theta.1")
+    u = vcat([0.4, 0.3], [0.1, -0.2, 0.05, 0.15, -0.1, 0.0, 0.2, -0.05])
+    nt = constrain(built.layout, u)
+    mu, tau, theta = nt.mu, nt.tau, Vector(nt.theta)
+    ll = sum(logpdf.(Normal.(theta, se), y))
+    pr = logpdf(Normal(0, 5), mu) + (logpdf(Normal(0, 5), tau) + log(2)) +
+        sum(logpdf.(Normal(mu, tau), theta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    # log-jacobian: exp for tau (u[2]) only; mu and theta are identity.
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[2]
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "scan: centered AR(1) end to end" begin
     m = @rkppl begin
         phi ~ Normal(0, 1)

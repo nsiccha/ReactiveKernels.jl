@@ -1739,14 +1739,21 @@ function _lower_scale(lhs, s, ctx)
     s isa Real && return s
     s === :Inf && return Inf
     if s isa Symbol
-        (s in ctx.data || s in ctx.vecdefs) && _sfail(
-            "response $lhs scale $s varies by observation — " *
-            "per-observation scales need plate plumbing (planned)")
+        # A per-observation scale is a RAW data column (the eight-schools known
+        # SE `se[i]`): it threads through the response plate per cell exactly
+        # like a per-obs weight column (the generator's `_thread_ref!`
+        # broadcasts a scalar param and iterates a per-obs column). A DERIVED
+        # column scale still needs shape metadata the plate cannot yet size,
+        # so keep it rejected with an actionable message.
+        s in ctx.vecdefs && _sfail(
+            "response $lhs scale $s is a derived column — a per-observation " *
+            "scale must be a raw data column (bind it raw) or a scalar " *
+            "parameter/assignment name (planned: derived-column scales)")
         return s
     end
     return _sfail("response $lhs scale must be a bare parameter/assignment " *
-                  "name or a literal (bind expressions via an assignment " *
-                  "first), got $(repr(s))")
+                  "name, a per-observation data column, or a literal (bind " *
+                  "expressions via an assignment first), got $(repr(s))")
 end
 
 function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
