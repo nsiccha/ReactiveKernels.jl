@@ -1821,6 +1821,176 @@ end
     end, (:w, :x); mod = @__MODULE__)
 end
 
+# ── Per-cell submodels inside `@plate` (StanBlocks parity) ────────────────
+# A plate cell may embed a submodel, `col[i] ~ sm(args…)`, mirroring StanBlocks'
+# per-cell submodel promotion: the submodel's own `~`/`=` names promote PER CELL
+# (namespaced under `col`), its positional args bind to the call arguments
+# (written per-cell, e.g. `x[i]`), and its return binds to `col[i]`. It inlines
+# BEFORE the plate desugar, so a per-cell submodel lowers exactly like the
+# hand-inlined per-cell program (transparent) and is reusable across models.
+# Transforms are written dotted (`m .+ t .* z`), the same explicit-broadcast
+# rule a hand-written per-cell derived cell follows.
+@rkppl pcs_centered(m, t) = begin
+    v ~ Normal(m, t)
+    v
+end
+@rkppl pcs_ncp(m, t) = begin
+    z ~ Normal(0, 1)
+    m .+ t .* z
+end
+@rkppl pcs_hn(s) = begin
+    v ~ HalfNormal(s)
+    v
+end
+# Observation stream: own per-cell offset + derived location + dotted obs slot
+# (shared scalar scale), bound to a DATA column.
+@rkppl pcs_obs(m, sc) = begin
+    b ~ Normal(0, 1)
+    q = m .+ b
+    slot ~ Normal.(q, sc)
+    slot
+end
+@rkppl pcs_nested(r) = begin
+    s ~ pcs_centered(0, r)
+    s
+end
+@rkppl pcs_noret(r) = begin
+    a ~ Normal(0, r)
+    b ~ Normal(0, 1)
+end
+
+_pcs(cells...) = Expr(:block,
+    :(mu ~ Normal(0, 5)), :(sigma ~ Exponential(1)), :(tau ~ Exponential(1)),
+    Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
+        Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+            Expr(:block, LineNumberNode(6), cells...))))
+
+@testset "surface plate per-cell submodels" begin
+    cols, n = _gen_columns()
+    M = @__MODULE__
+
+    # ── Centered latent submodel == the hand-written per-cell parameter.
+    sub = lower_rkppl(_pcs(:(theta[i] ~ pcs_centered(mu, tau)),
+                           :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); mod = M)
+    hand = lower_rkppl(_pcs(:(theta[i] ~ Normal(mu, tau)),
+                            :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x))
+    @test _plans_equal(sub, hand)
+    pp = only(sub.plate_parameters)
+    @test pp.name === :theta && pp.family === :normal &&
+        collect(values(pp.args)) == [:mu, :tau]
+    @test only(sub.predictors).terms[1].kind === LatentTerm
+
+    # ── Non-centered latent submodel == the hand-inlined `z`-transform.
+    subn = lower_rkppl(_pcs(:(theta[i] ~ pcs_ncp(mu, tau)),
+                            :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); mod = M)
+    handn = lower_rkppl(_pcs(:(theta_z[i] ~ Normal(0, 1)),
+                             :(theta[i] = mu .+ tau .* theta_z[i]),
+                             :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x))
+    @test _plans_equal(subn, handn)
+    @test [p.name for p in subn.plate_parameters] == [:theta_z]  # namespaced local
+    @test :theta in [d.name for d in subn.derived]
+    @test only(subn.predictors).terms[1].kind === LatentTerm
+    # Value + gradient vs an independent Distributions.jl oracle.
+    bound = bind_data(subn, cols)
+    built = build_kernel(bound)
+    u = [0.3, -0.2, 0.1, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]
+    nt = constrain(built.layout, u)
+    mu, sigma, tau, z = nt.mu, nt.sigma, nt.tau, Vector(nt.theta_z)
+    theta = mu .+ tau .* z
+    ll = sum(logpdf.(Normal.(theta, sigma), cols[:y]))
+    pr = logpdf(Normal(0, 5), mu) + logpdf(Exponential(1), sigma) +
+        logpdf(Exponential(1), tau) + sum(logpdf.(Normal(0, 1), z))
+    @test _query(built.spec, bound, :posterior, u) ≈
+        ll + pr + log(sigma) + log(tau)
+    _check_gradient(built.spec, bound, u)
+
+    # ── Per-cell VARYING prior arg from data (`x[i]` mean) via the submodel.
+    # No `mu` (the mean comes from `x[i]`), so the model is tau + sigma + theta.
+    subv = lower_rkppl(Expr(:block,
+        :(tau ~ Exponential(1)), :(sigma ~ Exponential(1)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(theta[i] ~ pcs_centered(x[i], tau)),
+                    :(y[i] ~ Normal.(theta[i], sigma)))))), (:y, :x); mod = M)
+    @test collect(values(only(subv.plate_parameters).args)) == [:x, :tau]
+    bv = bind_data(subv, cols)
+    builtv = build_kernel(bv)
+    uv = [-0.1, -0.2, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]  # logtau, logsigma, theta[1:6]
+    ntv = constrain(builtv.layout, uv)
+    tauv, sigmav, thetav = ntv.tau, ntv.sigma, Vector(ntv.theta)
+    llv = sum(logpdf.(Normal.(thetav, sigmav), cols[:y]))
+    prv = logpdf(Exponential(1), tauv) + logpdf(Exponential(1), sigmav) +
+        sum(logpdf.(Normal.(cols[:x], tauv), thetav))
+    @test _query(builtv.spec, bv, :posterior, uv) ≈
+        llv + prv + log(tauv) + log(sigmav)
+    _check_gradient(builtv.spec, bv, uv)
+
+    # ── A HalfNormal centered submodel lowers to a `:positive` plate parameter.
+    subh = lower_rkppl(Expr(:block, :(sigma ~ Exponential(1)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(b[i] ~ pcs_hn(1)),
+                    :(y[i] ~ Normal.(b[i], sigma)))))), (:y,); mod = M)
+    @test only(subh.plate_parameters).support_override === :positive
+
+    # ── Two use sites of the same submodel namespace independently (no clash).
+    # Their latents join through a derived cell (a bare multi-latent location is
+    # a separate, pre-existing plate limitation).
+    two = lower_rkppl(_pcs(:(a[i] ~ pcs_ncp(mu, tau)),
+                           :(c[i] ~ pcs_ncp(mu, tau)),
+                           :(s[i] = a[i] .+ c[i]),
+                           :(y[i] ~ Normal.(s[i], sigma))), (:y, :x); mod = M)
+    @test Set(p.name for p in two.plate_parameters) == Set([:a_z, :c_z])
+
+    # ── Observation-stream submodel on a DATA column: own per-cell offset +
+    # derived location + dotted obs slot (shared scalar scale).
+    subo = lower_rkppl(_pcs(:(y[i] ~ pcs_obs(mu, sigma))), (:y, :x); mod = M)
+    @test only(subo.plate_parameters).name === :y_b
+    @test :y_q in [d.name for d in subo.derived]
+    @test only(subo.predictors).terms[1].kind === LatentTerm
+    bo = bind_data(subo, cols)
+    builto = build_kernel(bo)
+    uo = [0.3, -0.2, 0.05, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]  # mu, logsig, logtau, y_b[1:6]
+    nto = constrain(builto.layout, uo)
+    b = Vector(nto.y_b)
+    q = nto.mu .+ b
+    llo = sum(logpdf.(Normal.(q, nto.sigma), cols[:y]))
+    pro = logpdf(Normal(0, 5), nto.mu) + logpdf(Exponential(1), nto.sigma) +
+        logpdf(Exponential(1), nto.tau) + sum(logpdf.(Normal(0, 1), b))
+    @test _query(builto.spec, bo, :posterior, uo) ≈
+        llo + pro + log(nto.sigma) + log(nto.tau)
+    _check_gradient(builto.spec, bo, uo)
+end
+
+@testset "surface plate per-cell submodels failures" begin
+    D = (:y, :x)
+    M = @__MODULE__
+    # Arity mismatch.
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _pcs(:(theta[i] ~ pcs_centered(mu)),
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M)
+    # Nested submodel (single-level this slice).
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _pcs(:(theta[i] ~ pcs_nested(tau)),
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M)
+    # No trailing return expression.
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _pcs(:(theta[i] ~ pcs_noret(tau)),
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M)
+    # An observation submodel bound to a NON-data latent LHS.
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _pcs(:(theta[i] ~ pcs_obs(mu, sigma)),
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M)
+    # A latent submodel bound to a DATA column (needs a dotted observation slot).
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _pcs(:(y[i] ~ pcs_centered(mu, tau))), D; mod = M)
+    # Without a submodel binding in scope, an unknown call head stays an
+    # ordinary per-cell distribution error (no submodel capture).
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _pcs(:(theta[i] ~ not_a_submodel(mu, tau)),
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M)
+end
+
 # Slice A: range-explicit response LHS (`y[R] .~ ...`) + single-LHS
 # ownership. Self-covering forms lower identically to bare `.~`; literal
 # `1:N` rides the plan and is verified at bind.
