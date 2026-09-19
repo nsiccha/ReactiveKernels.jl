@@ -2653,9 +2653,17 @@ function _analyze_predictor(pname, rhs, ctx, lhs)
         end
         push!(terms, term)
     end
-    isempty(uses) && _sfail("predictor $pname has no estimated " *
-                            "coefficients (offsets only) — add an intercept " *
-                            "or coefficient")
+    # Zero-coefficient predictors: bare-data affines (a non-empty all-
+    # offset summand list) are admitted — offset-only models evaluate the
+    # likelihood over the data affine with an empty coefficient layout.
+    # Any other coefficient-free shape (latent/gather/spline-only, or an
+    # empty summand list) stays fail-closed.
+    if isempty(uses) &&
+            !(!isempty(terms) && all(t -> t.kind === OffsetTerm, terms))
+        _sfail("predictor $pname has no estimated coefficients — add an " *
+               "intercept or coefficient (bare-data offset affines are " *
+               "the only coefficient-free shape)")
+    end
     return terms, uses
 end
 
