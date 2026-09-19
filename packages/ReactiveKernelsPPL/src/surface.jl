@@ -276,6 +276,10 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     for r in responses
         push!(used_locs, r.predictor)
         union!(used_locs, r.extra_predictors)
+        # A scale predictor's definition is absorbed like a location's —
+        # never also a derived column.
+        r.scale isa ScalePredictorRef &&
+            push!(used_locs, r.scale.predictor)
     end
     skip = _absorbed_skip(det, canonmap, responses, paramsyms, ctx.absorbed,
         used_locs)
@@ -2452,9 +2456,11 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
         return _lower_leveled_response(lhs, call, range, weights, evidence,
             ctx, predictors, pred_idx, coefuse)
     end
-    family, lik_link, pred_link, loc, scale, trials =
+    family, lik_link, pred_link, loc, scale_raw, trials =
         _lower_response_base(lhs, call, ctx)
     pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
+        coefuse)
+    scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
         evidence, Symbol(lhs, "_resp"), trials, range)
@@ -2826,8 +2832,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
-        return GaussianFam, IdentityLink, IdentityLink, args[1],
-        _lower_scale(lhs, args[2], ctx), nothing
+        return GaussianFam, IdentityLink, IdentityLink, args[1], args[2],
+        nothing
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link)")
@@ -2843,8 +2849,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial2` takes " *
                                     "`NegativeBinomial2.(exp.(eta), phi)`")
         return NegativeBinomial2Fam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp),
-        _lower_scale(lhs, args[2], ctx), nothing
+        _lower_link_arg(lhs, args[1], :exp), args[2], nothing
     elseif fam === :Gamma
         loc, scale = _lower_gamma_args(lhs, args, ctx)
         return GammaLogFam, LogLink, LogLink, loc, scale, nothing
@@ -2891,12 +2896,30 @@ function _lower_gamma_args(lhs, args, ctx)
     _same_aux(a1, a2) || _sfail(
         "response $lhs: both `Gamma` positions must name the same alpha " *
         "(got $(repr(a1)) and $(repr(a2)))")
-    return loc, _lower_scale(lhs, a1, ctx)
+    return loc, a1
 end
 
-_same_aux(a, b) =
-    a isa Symbol && b isa Symbol ? a === b :
-    a isa Real && b isa Real ? a == b : false
+# Both auxiliary positions name the same use: bare names, equal literals,
+# or structurally equal scale-predictor spellings (bare or one
+# `exp.`/`logistic.` wrapper over the same predictor). Anything else —
+# mixed wrappers, distinct predictors — is a mismatch, never a merge.
+function _same_aux(a, b)
+    ka = _aux_key(a)
+    kb = _aux_key(b)
+    return ka !== nothing && ka == kb
+end
+
+function _aux_key(a)
+    a isa Symbol && return (:bare, a)
+    a isa Real && return (:lit, a)
+    if a isa Expr && a.head === :. && length(a.args) == 2 &&
+            a.args[1] isa Symbol && a.args[1] in (:exp, :logistic) &&
+            a.args[2] isa Expr && a.args[2].head === :tuple &&
+            length(a.args[2].args) == 1 && a.args[2].args[1] isa Symbol
+        return (:wrap, a.args[1], a.args[2].args[1])
+    end
+    return nothing
+end
 
 const _BETA_MSG = "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`"
 
@@ -2931,7 +2954,7 @@ function _lower_beta_args(lhs, args, ctx)
         "response $lhs: both `Beta` positions must name the same kappa " *
         "(got $(repr(k1)) and $(repr(k2)))")
     loc = _lower_link_arg(lhs, _dot2call_nested_link(lhs, m1, :Beta), :logistic)
-    return loc, _lower_scale(lhs, k1, ctx)
+    return loc, k1
 end
 
 function _lower_response_base_error(lhs, rhs, fam)
@@ -3032,6 +3055,126 @@ function _lower_scale(lhs, s, ctx)
     return _sfail("response $lhs scale must be a bare parameter/assignment " *
                   "name, a per-observation data column, or a literal (bind " *
                   "expressions via an assignment first), got $(repr(s))")
+end
+
+# Scale use-site lowering (Gaussian sigma, NB2 phi, Gamma alpha, Beta
+# kappa): a scalar scale (parameter/assignment name, raw per-observation
+# data column, literal) passes through `_lower_scale` untouched; a
+# predictor definition feeds the scale slot — bare for an identity-link
+# scale (`Normal.(mu, sigma)`), or under one dotted link wrapper
+# (`Normal.(mu, exp.(sigma))` for log, `logistic.(sigma)` for logit).
+# The wrapper arrives unconverted (the scale position passes the spine
+# converter through), so it matches here in dotted `Expr(:., ...)` form.
+# Undotted wrappers fail closed (scalar `exp(log_sigma)` use-site
+# wrappers are deferred — the LP link spells the transform instead), as
+# do wrappers over anything but a predictor definition.
+function _lower_scale_use(lhs, s, ctx, predictors, pred_idx, coefuse)
+    # Scaleless families (Bernoulli/Poisson/Binomial) carry `nothing`
+    # through untouched.
+    s === nothing && return nothing
+    if s isa Expr && s.head === :.
+        return _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+    end
+    if s isa Expr && s.head === :call && !isempty(s.args) &&
+            s.args[1] isa Symbol && s.args[1] in (:exp, :logistic)
+        return _sfail("response $lhs scale wraps `$(s.args[1])` undotted " *
+                      "(`$(repr(s))`) — scale link wrappers broadcast " *
+                      "(`$(s.args[1]).(predictor)` over a predictor " *
+                      "definition); scalar `exp(log_sigma)` use-site " *
+                      "wrappers are deferred (spell the transform as the " *
+                      "predictor's link instead)")
+    end
+    if s isa Symbol && _is_scale_predictor_def(s, ctx)
+        pname = _lower_scale_predictor(lhs, s, IdentityLink, ctx, predictors,
+            pred_idx, coefuse)
+        return ScalePredictorRef(pname, IdentityLink)
+    end
+    return _lower_scale(lhs, s, ctx)
+end
+
+# A bare scale name feeds the predictor slot when it is a per-observation
+# definition that is not latent-backed: vector-shaped definitions plus
+# bare `coefficients[group]` factor-index refs (ref-shaped, hence
+# scalar-shaped in `detshape`, but per-observation at runtime — the
+# factor-term predictor spelling). Per-cell latents (plate names and
+# derived columns reading one) stay on the scalar path — a plate
+# parameter already threads per cell as a name, and a latent transform
+# is not an affine predictor. Scalar assignments, data gathers
+# (`x[g]`), and literal indexing (`v[1]`) likewise stay scalar-path,
+# exactly as before.
+_is_scale_predictor_def(s::Symbol, ctx) =
+    haskey(ctx.detmap, s) && !(s in ctx.plate_names) &&
+    !_derived_reads_latent(s, ctx) &&
+    (get(ctx.detshape, s, :scalar) === :vector ||
+        _is_factor_index_def(ctx.detmap[s], ctx))
+
+function _is_factor_index_def(rhs, ctx)
+    rhs isa Expr || return false
+    rhs.head === :ref || return false
+    length(rhs.args) == 2 || return false
+    base, idx = rhs.args
+    base isa Symbol || return false
+    idx isa Symbol || return false
+    base in ctx.data && return false
+    return idx in ctx.data
+end
+
+function _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+    f = length(s.args) >= 1 ? s.args[1] : nothing
+    targs = length(s.args) == 2 && s.args[2] isa Expr &&
+            s.args[2].head === :tuple ? s.args[2].args : Any[]
+    if !(f isa Symbol && f in (:exp, :logistic)) || length(targs) != 1
+        return _sfail("response $lhs scale $(repr(s)) is not an admitted " *
+                      "scale use — write a bare parameter/assignment name, " *
+                      "a per-observation data column, a literal, a bare " *
+                      "predictor definition, or one `exp.`/`logistic.` " *
+                      "wrapper over a predictor definition")
+    end
+    inner = only(targs)
+    inner isa Symbol && _is_scale_predictor_def(inner, ctx) || return _sfail(
+        "response $lhs scale $(repr(s)): `$f.` wraps a predictor " *
+        "definition (`$f.(predictor)` with `predictor = ...` affine in " *
+        "data) — got $(repr(inner))")
+    link = f === :exp ? LogLink : LogitLink
+    pname = _lower_scale_predictor(lhs, inner, link, ctx, predictors,
+        pred_idx, coefuse)
+    return ScalePredictorRef(pname, link)
+end
+
+# Analyze (or intern) a scale predictor: exactly the location-predictor
+# treatment (`_lower_location`'s named-definition arm) under the use-site
+# link — affine analysis, coefficient-use recording, one link per
+# predictor. Family admission (Gaussian/NB2/Gamma; Beta deferred) is the
+# contract's gate (`_validate_scale_predictor`), so hand-built plans get
+# the same rule.
+function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
+        pred_idx, coefuse)
+    haskey(pred_idx, name) || haskey(ctx.detmap, name) ||
+        return _lower_scale_predictor_error(lhs, name, ctx)
+    if haskey(pred_idx, name)
+        pred = predictors[pred_idx[name]]
+        pred.link === link || _sfail(
+            "predictor $name is shared by slots needing links " *
+            "$(pred.link) and $link — one link per predictor")
+        return name
+    end
+    terms, uses = _analyze_predictor(name, ctx.detmap[name], ctx, lhs)
+    _record_coefuses!(coefuse, name, uses, lhs)
+    push!(predictors, PredictorSpec(name, link, terms, name))
+    pred_idx[name] = length(predictors)
+    return name
+end
+
+function _lower_scale_predictor_error(lhs, name, ctx)
+    name in ctx.data && _sfail("response $lhs scale predictor $name is a " *
+                              "data column, not a predictor definition " *
+                              "(`$name = ...` affine in data)")
+    name in ctx.prior_names && _sfail(
+        "response $lhs scale predictor $name is a scalar parameter — a " *
+        "predictor-fed scale is a per-observation definition " *
+        "(`$name = ...` affine in data)")
+    return _sfail("response $lhs scale predictor $name is not a predictor " *
+                  "definition (`$name = ...` affine in data)")
 end
 
 function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
