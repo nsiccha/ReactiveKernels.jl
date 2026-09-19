@@ -1,14 +1,13 @@
 # Packed layout + transforms (D5b thin-layer-owned).
 #
-# SCALAR constrained-parameter transforms are provided by the reusable bijector
-# library (`bijectors.jl`, decision 0l3dsru): the in-graph generator splices
-# each bijector's `constrain`/`logjac` endpoints and the host path runs the
-# same prepared endpoints, so in-graph and host evaluation agree by
-# construction (structural), not by hand-kept duplication. `:identity` (real
-# support) is a genuine no-op and stays a direct read in both paths. Per-cell
-# (plate) blocks route their HOST transform through the same library; their
-# in-graph edges are still a hand-rolled broadcast form (extending the bijector
-# splice to the plate graph is a follow-up).
+# Constrained-parameter transforms are provided by the reusable bijector
+# library (`bijectors.jl`, decision 0l3dsru): the host path runs the bijector's
+# prepared endpoints and the in-graph generator splices the same endpoints, so
+# in-graph and host evaluation agree by construction (structural), not by
+# hand-kept duplication. A SCALAR sampled entry splices the endpoints directly;
+# a per-cell (plate) block maps the same scalar endpoints over its cell view via
+# the `plate` primitive (host + graph both). `:identity` (real support) is a
+# genuine no-op and stays a direct read in both paths.
 
 """
     support_of(family, override) -> Symbol
@@ -287,34 +286,38 @@ function transform_statements(e::LayoutEntry)
     return Expr[:($(e.name)::Float64 = $(bij)().constrain($coord))]
 end
 
-# Per-cell latent (plate) block: the scalar transform edges, broadcast over
-# the block view (identical operations to the host constrain/logjac path, so
-# in-graph and host agree bit-for-bit). Bidirectional forward+inverse edges
-# match the coefficient/scalar `@ppl` shape so the planner resolves either
-# direction.
+# The per-cell log-Jacobian vector name a plate block's `jacobian_term` sums.
+_plate_logjac_name(name::Symbol) = Symbol(:_ppl_ljcells_, name)
+
+# `plate(view) do cell; body; end` as an Expr (an allocation-free per-cell loop).
+function _plate_map(view_read, cell::Symbol, body)
+    lambda = Expr(:(->), Expr(:tuple, cell),
+        Expr(:block, LineNumberNode(0, :layout), body))
+    return Expr(:do, Expr(:call, :plate, view_read), lambda)
+end
+
+# Per-cell latent (plate) block: map the SCALAR bijector endpoints over the
+# block view via the `plate` primitive — the same library the scalar and host
+# paths use, so in-graph and host agree by construction rather than by a
+# hand-kept broadcast. `constrain` yields the constrained cell vector; a
+# companion `logjac` plate supplies the per-cell Jacobian this block's
+# `jacobian_term` sums (pruned by have→want when the Jacobian is not wanted).
+# `:identity` (real support) is a direct view read — no transform, no Jacobian.
 function _plate_transform_statements(e::LayoutEntry)
     lo = e.offset
     hi = e.offset + e.size - 1
     view_read = :(view(unconstrained, $lo:$hi))
-    if e.transform === :identity
+    e.transform === :identity &&
         return Expr[:($(e.name)::AbstractVector{Float64} = $view_read)]
-    elseif e.transform === :exp
-        u = Symbol(:_ppl_log_, e.name)
-        return Expr[
-            :($u::AbstractVector{Float64} = $view_read),
-            :($(e.name)::AbstractVector{Float64} = exp.($u)),
-            :($u::AbstractVector{Float64} = log.($(e.name))),
-        ]
-    elseif e.transform === :logistic
-        u = Symbol(:_ppl_logit_, e.name)
-        return Expr[
-            :($u::AbstractVector{Float64} = $view_read),
-            :($(e.name)::AbstractVector{Float64} = 1 ./ (1 .+ exp.(-$u))),
-            :($u::AbstractVector{Float64} = log.($(e.name)) .- log1p.(-$(e.name))),
-        ]
-    else
-        throw(ContractValidationError("[layout] unknown transform $(e.transform)"))
-    end
+    bij = _bijector_name(e.transform)
+    cell = Symbol(:_ppl_cell_, e.name)
+    ljcells = _plate_logjac_name(e.name)
+    return Expr[
+        :($(e.name)::AbstractVector{Float64} =
+            $(_plate_map(view_read, cell, :($(bij)().constrain($cell))))),
+        :($(ljcells)::AbstractVector{Float64} =
+            $(_plate_map(view_read, cell, :($(bij)().logjac($cell))))),
+    ]
 end
 
 """
@@ -323,24 +326,14 @@ end
 This entry's log-Jacobian contribution (`nothing` for identity). A scalar
 constrained support splices the bijector's `logjac` endpoint over the same
 coordinate the `constrain` edge reads (shared via structural CSE); a per-cell
-latent (plate) block contributes the SUM over its cells from its hand-rolled
-broadcast edges.
+latent (plate) block sums its companion `logjac` plate (`_plate_logjac_name`).
 """
 function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing
     if e.kind === :coefficient
         throw(ContractValidationError("[layout] non-identity coefficient block"))
     end
-    if e.kind === :plate
-        if e.transform === :exp
-            u = Symbol(:_ppl_log_, e.name)
-            return :(sum($u))
-        elseif e.transform === :logistic
-            return :(sum(log.($(e.name)) .+ log1p.(-$(e.name))))
-        else
-            throw(ContractValidationError("[layout] unknown transform $(e.transform)"))
-        end
-    end
+    e.kind === :plate && return :(sum($(_plate_logjac_name(e.name))))
     bij = _bijector_name(e.transform)
     return :($(bij)().logjac($(coordinate_read(e.offset))))
 end
