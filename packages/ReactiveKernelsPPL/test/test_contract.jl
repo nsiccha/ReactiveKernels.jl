@@ -213,13 +213,16 @@ end
         BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
-        OffsetTerm, RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm)
+        OffsetTerm, RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm,
+        ScanSummandTerm)
     @test :log in admitted_functions()
     @test :sum in admitted_functions()
+    @test :tanh in admitted_functions()
     ops, fns = admitted_elementwise()
     @test Symbol(".+") in ops && Symbol(".*") in ops && Symbol(".==") in ops
     @test :log in fns && :exp in fns
     @test supports_term(:factor)
+    @test supports_term(:scan_summand)
     @test !supports_term(:zscale)
     @test !supports_term(:hsgp)
 end

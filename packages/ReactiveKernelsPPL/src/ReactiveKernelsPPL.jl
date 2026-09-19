@@ -25,7 +25,7 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
-    RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm
+    RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm, ScanSummandTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec
 export RanefZRecipe, RanefMargin, RanefBucket

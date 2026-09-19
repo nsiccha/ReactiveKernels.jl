@@ -209,6 +209,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         vecdefs, structural, plate_names, absorbed = Set{Symbol}(),
         synth = Ref(0), synth_derived = VectorAssignmentSpec[], taken,
         scan_states = Set{Symbol}(s.state for s in scans),
+        scan_coefs = Set{Symbol}(),
         buckets = Dict{Tuple{Union{Nothing,Symbol},Symbol},RanefBucket}(
             (b.id, b.group) => b for b in buckets),
         implicit_vectors = VectorParameter[],
@@ -235,6 +236,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
                    "`.~` (`$(s.lhs) .~ Normal.(mu, sigma)`); `~` is " *
                    "scalar-only")
         end
+    end
+    for c in ctx.scan_coefs
+        haskey(coefuse, c) && _sfail("$c is both a predictor coefficient " *
+            "and a scan coefficient — scan coefficients are sampled " *
+            "scalars, not population coefficients (rename one)")
     end
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors)
     params, paramsyms, dirichlets = _lower_parameters(sample, coefuse, ctx)
@@ -2995,8 +3001,9 @@ function _analyze_predictor(pname, rhs, ctx, lhs)
     # Zero-coefficient predictors: bare-data affines (a non-empty all-
     # offset summand list) are admitted — offset-only models evaluate the
     # likelihood over the data affine with an empty coefficient layout.
-    # Any other coefficient-free shape (latent/gather/spline-only, or an
-    # empty summand list) stays fail-closed.
+    # Any other coefficient-free shape (latent/gather/spline/hsgp/scan-only,
+    # or an empty summand list) stays fail-closed: a scan summand needs a
+    # sibling coefficient (SB's `ar` always pairs with an intercept).
     if isempty(uses) &&
             !(!isempty(terms) && all(t -> t.kind === OffsetTerm, terms))
         _sfail("predictor $pname has no estimated coefficients — add an " *
@@ -3096,6 +3103,13 @@ function _classify_summand(pname, core, sign::Int, ctx)
                   "(`mu = a .+ b .* x .+ hsgp(:h_x)`), not nested in " *
                   "$(repr(core))")
         return _classify_hsgp(pname, core, sign, ctx)
+    end
+    if _contains_scan(core, ctx.scan_states)
+        _is_scan_product(core) ||
+            _sfail("predictor $pname: scan states lower only as direct " *
+                  "scaled summands (`mu = a .+ b .* u`), not nested in " *
+                  "$(repr(core))")
+        return _classify_scan(pname, core, sign, ctx)
     end
     head = core.head
     head === :ref && return _classify_ref(pname, core, sign, ctx)
@@ -3226,10 +3240,82 @@ function _classify_hsgp(pname, core::Expr, sign::Int, ctx)
         label, label), nothing
 end
 
+# A scan state read anywhere in a summand (bare Symbol leaves; quoted ids
+# such as `spline(:id)` are not reads).
+_contains_scan(ex, states) = ex isa Expr && _contains_scan_go(ex, states)
+
+_contains_scan_go(ex::Expr, states) =
+    any(a -> _contains_scan_arg(a, states), ex.args)
+
+_contains_scan_arg(a, states) =
+    a isa Symbol ? a in states :
+    a isa QuoteNode ? false :
+    a isa Expr ? _contains_scan_go(a, states) : false
+
+_is_scan_product(core) =
+    core isa Expr && core.head === :call && !isempty(core.args) &&
+    core.args[1] === :.*
+
+# A `coef .* state` scaled scan summand (SB's `ar` latent path with its
+# free beta): exactly two factors, one the scan state, the other a bare
+# sampled scalar. Additive only. The coefficient records in `scan_coefs`
+# (checked disjoint from predictor coefficients after lowering) and lowers
+# to a `SampledParameter`, never a population prior.
+function _classify_scan(pname, core::Expr, sign::Int, ctx)
+    where = "predictor $pname"
+    factors = core.args[2:end]
+    length(factors) == 2 ||
+        _sfail("$where scales a scan state with $(length(factors)) " *
+              "factors — write `coef .* state` exactly, got $(repr(core))")
+    stripped = [_strip_sign(f) for f in factors]
+    inner = sign * prod(first, stripped)
+    inner > 0 ||
+        _sfail("$where negates a scan summand — summands are additive " *
+              "only (write `.+ b .* u`)")
+    states = [g for (_, g) in stripped if g isa Symbol && g in ctx.scan_states]
+    if isempty(states)
+        _sfail("$where nests a scan read inside $(repr(core)) — scan " *
+              "states lower only as direct scaled summands " *
+              "(`mu = a .+ b .* u`)")
+    end
+    length(states) == 1 ||
+        _sfail("$where combines two scan states in $(repr(core)) — " *
+              "products of latents are nonlinear (one `coef .* state` " *
+              "summand per scan read)")
+    others = [g for (_, g) in stripped if !(g isa Symbol && g in ctx.scan_states)]
+    coef = only(others)
+    coef isa Symbol ||
+        _sfail("$where scales scan state :$(only(states)) by " *
+              "$(repr(coef)) — scan coefficients are bare sampled " *
+              "scalars (`b .* u`)")
+    coef in ctx.data &&
+        _sfail("$where scales scan state :$(only(states)) by the data " *
+              "column $coef — data-varying (interaction) scalings are planned")
+    (coef in ctx.vecdefs || coef in ctx.plate_names) &&
+        _sfail("$where scales scan state :$(only(states)) by $coef, " *
+              "which is vector-valued — scan coefficients are scalars")
+    haskey(ctx.detmap, coef) &&
+        _sfail("$where scales scan state :$(only(states)) by the " *
+              "computed scalar $coef — computed coefficients are not " *
+              "in slice 1")
+    coef in ctx.prior_names ||
+        _sfail("$where scales scan state :$(only(states)) by $coef, " *
+              "which has no `~` statement — scan coefficients are " *
+              "sampled scalars (`$coef ~ Normal(0, 1)`)")
+    push!(ctx.scan_coefs, coef)
+    label = Symbol("scan_", pname, "_", only(states))
+    return TermSpec(ScanSummandTerm, ColumnRef[],
+        (scan_id = only(states), coef = coef), label, label), nothing
+end
+
 function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     (core in ctx.data || core in ctx.vecdefs) &&
         return TermSpec(OffsetTerm, [core], NamedTuple(),
         core, Symbol(core, "_off")), nothing
+    core in ctx.scan_states && _sfail("predictor $pname: $core is a bare " *
+        "scan state — LP use needs a sampled coefficient (`b .* $core` " *
+        "in an additive position); a bare scan state is only a direct " *
+        "response location (`y .~ Normal.($core, s)`)")
     haskey(ctx.detmap, core) && _sfail("predictor $pname: $core is a " *
                                        "computed scalar, not a sampled " *
                                        "coefficient (computed coefficients " *
@@ -3440,7 +3526,8 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
                 t.kind === RanefGatherTerm ||
                 t.kind === SplineSummandTerm ||
-                t.kind === HSGPSummandTerm) && continue
+                t.kind === HSGPSummandTerm ||
+                t.kind === ScanSummandTerm) && continue
             addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
             use = _find_use(coefuse, pred.name, addr)
             use === nothing && _sfail("internal: no coefficient use for " *
