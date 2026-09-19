@@ -126,11 +126,19 @@ function _predictor_statements(plan::StructuralPlan)
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
         lp = _lp_name(pred)
         terms = Any[]
-        if shape.width > 0
+        if any(b -> b.kind === MonotonicTerm, shape.blocks)
+            append!(terms, _mo_block_terms(plan, shape))
+        elseif shape.width > 0
             push!(terms, :($(design_name(pred.name)) * $(block_name(pred.name))))
         end
         if any(b -> b.kind === OffsetTerm, shape.blocks)
             push!(terms, offset_name(pred.name))
+        end
+        # A monotonic summand (mo1) contributes its contrast directly —
+        # beta-free, the offset-arm shape with a parameter-derived column.
+        for t in pred.terms
+            t.kind === MonotonicSummandTerm &&
+                push!(terms, monotonic_name(t.options.increments))
         end
         # A latent term contributes the per-cell latent VECTOR directly
         # (identity design): `lp = theta` on its own, or added to fixed-effect
@@ -165,6 +173,46 @@ function _predictor_statements(plan::StructuralPlan)
         push!(stmts, :($lp = $rhs))
     end
     return stmts
+end
+
+# Scalar coefficient-coordinate read (`sum(view(coef, k:k))`, the
+# `coordinate_read` shape over a coefficient block rather than the packed
+# vector).
+_coef_coord(coef::Symbol, k::Int) = :(sum(view($coef, $k:$k)))
+
+# Per-block LP terms for a predictor with `mo` columns. The fused
+# `design * coef` matvec cannot cover a monotonic block — its contrast
+# column is parameter-derived, and `hcat` cannot mix data with symbolic
+# columns under the Enzyme reverse pass — so each coefficient-carrying
+# block splices against its own coefficient coordinates (positions follow
+# design order, the layout block's own order): intercept/continuous/
+# monotonic blocks scale one column by one coordinate, factor blocks keep
+# the data-matrix × coefficient-slice matvec. Predictors without `mo`
+# keep the fused form above, untouched.
+function _mo_block_terms(plan::StructuralPlan, shape::DesignShape)
+    coef = block_name(shape.predictor)
+    terms = Any[]
+    k = 1
+    for b in shape.blocks
+        if b.kind === InterceptTerm
+            push!(terms, Expr(:call, :.*, Expr(:call, :ones, plan.n_obs),
+                _coef_coord(coef, k)))
+            k += 1
+        elseif b.kind === ContinuousTerm
+            push!(terms, :($(b.column) .* $(_coef_coord(coef, k))))
+            k += 1
+        elseif b.kind === FactorTerm
+            w = b.width
+            push!(terms, :($(_contrast_expr(b)) *
+                $(:(view($coef, $k:$(k + w - 1))))))
+            k += w
+        elseif b.kind === MonotonicTerm
+            push!(terms,
+                :($(monotonic_name(b.column)) .* $(_coef_coord(coef, k))))
+            k += 1
+        end
+    end
+    return terms
 end
 
 # One basis's direct summand as a scaled-column sum (SB `_sb_s_generic` /
@@ -877,6 +925,36 @@ _log_diff_exp(a, b) = :($a + log1p(-exp($b - $a)))
 # Per-threshold effect column name (stage j of response `label`).
 _eff_name(label::Symbol, j::Int) = Symbol(:_ppl_eff_, label, :_, j)
 
+# Modeled-scale precompute name (response `label`).
+_disc_name(label::Symbol) = Symbol(:_ppl_disc_, label)
+
+# Ordinal latent scale as a plate do-var: absent inlines 1.0 (the
+# 3-positional form — byte-identical emission), a literal inlines, a data
+# column threads raw, and a log-link predictor threads its `exp`
+# precompute (structural positivity — the Poisson `exp.(lp)` precedent).
+function _ordinal_scale_ref!(inputs::Vector{Any}, prests::Vector{Expr},
+        r::LikelihoodSpec, plan::StructuralPlan)
+    d = r.discrimination
+    d === nothing && return 1.0
+    if d isa Symbol && any(p -> p.name === d, plan.predictors)
+        push!(inputs, _disc_pre!(prests, r, plan, d))
+        return _dovar(length(inputs))
+    end
+    return _thread_ref!(inputs, d)
+end
+
+# Modeled-scale column: `exp` over the scale predictor's lp node (the
+# predictor statements run before the likelihood, so the node exists;
+# validation proved the link is LogLink). Explicit dotted form, evaluated
+# once and threaded like the stage-effect columns.
+function _disc_pre!(prests::Vector{Expr}, r::LikelihoodSpec,
+        plan::StructuralPlan, sname::Symbol)
+    lp = _lp_name(_predictor(plan, sname))
+    name = _disc_name(r.label)
+    push!(prests, :($name = exp.($lp)))
+    return name
+end
+
 # Ordered response plate (OrderedLogistic + Ordinal, one uniform path:
 # OrderedLogistic is cumulative-logit with d = 1 and no threshold
 # effects). Threshold scalars thread as broadcast plate inputs; the cell
@@ -891,10 +969,10 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
         "(bind_data infers it)"))
     inputs = Any[y, lp]
     yv, etav = _dovar(1), _dovar(2)
-    dref = r.discrimination === nothing ? 1.0 : _thread_ref!(inputs, r.discrimination)
+    prests = Expr[]
+    dref = _ordinal_scale_ref!(inputs, prests, r, plan)
     tnames = [_vector_elt_name(r.thresholds, i) for i in 1:K-1]
     trefs = [_thread_ref!(inputs, t) for t in tnames]
-    prests = Expr[]
     erefs = Any[]
     if !isempty(r.threshold_columns)
         for j in 1:K-1

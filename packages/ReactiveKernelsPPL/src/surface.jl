@@ -183,6 +183,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     normal_priors = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_normal_call(s.rhs))
+    # Simplex parameters (`s ~ Dirichlet(...)`): the only names a
+    # monotonic term accepts as its increments (checked during response
+    # lowering, before `_lower_parameters` runs).
+    dirichlet_names = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && _is_dirichlet_call(s.rhs))
     # Shape every definition (data-free: data ⇒ vector, sampled ⇒ scalar,
     # det-refs recurse with memo; cycles error downstream), then
     # canonicalize each RHS in dependency order (Julia-valid undotted
@@ -216,7 +221,9 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         splines = Dict{Symbol,SplineBasis}(b.id => b for b in bases),
         spline_uses = Dict{Symbol,Symbol}(),
         hsgps = Dict{Symbol,HSGPBasis}(b.id => b for b in hbases),
-        hsgp_uses = Dict{Symbol,Symbol}())
+        hsgp_uses = Dict{Symbol,Symbol}(),
+        dirichlet_names = dirichlet_names,
+        mo_uses = Dict{Symbol,Symbol}())
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
     pred_idx = Dict{Symbol,Int}()
@@ -548,7 +555,7 @@ function _reject_unknown_calls(where, rhs)
         fn = rhs.args[1]
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
                 fn ∉ VECTOR_FNS && fn !== :ranef && fn !== :spline &&
-                fn !== :hsgp
+                fn !== :hsgp && fn !== :mo && fn !== :mo1
             startswith(string(fn), ".") && _sfail(
                 "$where uses dotted operator `$fn`, which is not in " *
                 "the slice-1 elementwise vocabulary")
@@ -811,6 +818,20 @@ _contains_hsgp(ex) = ex isa Expr &&
 _is_hsgp_call(ex) =
     ex isa Expr && ex.head === :call && !isempty(ex.args) &&
     ex.args[1] === :hsgp
+
+_contains_mo(ex) = ex isa Expr &&
+    (_is_mo_call(ex) || any(_contains_mo, ex.args))
+
+_is_mo_call(ex) =
+    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+    ex.args[1] === :mo
+
+_contains_mo1(ex) = ex isa Expr &&
+    (_is_mo1_call(ex) || any(_contains_mo1, ex.args))
+
+_is_mo1_call(ex) =
+    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+    ex.args[1] === :mo1
 
 # A bare `spline_basis(:id, x...; kind=..., k=...)` call declares one
 # spline basis (the first bare-call statement: declarations do work at
@@ -2999,16 +3020,20 @@ function _analyze_predictor(pname, rhs, ctx, lhs)
         push!(terms, term)
     end
     # Zero-coefficient predictors: bare-data affines (a non-empty all-
-    # offset summand list) are admitted — offset-only models evaluate the
-    # likelihood over the data affine with an empty coefficient layout.
-    # Any other coefficient-free shape (latent/gather/spline/hsgp/scan-only,
-    # or an empty summand list) stays fail-closed: a scan summand needs a
-    # sibling coefficient (SB's `ar` always pairs with an intercept).
-    if isempty(uses) &&
-            !(!isempty(terms) && all(t -> t.kind === OffsetTerm, terms))
+    # offset summand list) and beta-free monotonic (`mo1`) predictors are
+    # admitted — both evaluate the likelihood over a coefficient-free LP
+    # (data for offsets, the increment-simplex contrast for `mo1`) with an
+    # empty coefficient layout. Any other coefficient-free shape
+    # (latent/gather/spline/hsgp/scan-only, or an empty summand list)
+    # stays fail-closed: a scan summand needs a sibling coefficient
+    # (SB's `ar` always pairs with an intercept).
+    if isempty(uses) && !(!isempty(terms) &&
+            all(t -> t.kind === OffsetTerm ||
+                t.kind === MonotonicSummandTerm, terms))
         _sfail("predictor $pname has no estimated coefficients — add an " *
-               "intercept or coefficient (bare-data offset affines are " *
-               "the only coefficient-free shape)")
+               "intercept or coefficient (bare-data offset affines and " *
+               "beta-free `mo1()` predictors are the only " *
+               "coefficient-free shapes)")
     end
     return terms, uses
 end
@@ -3030,6 +3055,13 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
     _contains_hsgp(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
         "into $where) calls `hsgp()`, which lowers only as a direct " *
         "predictor summand (`mu = a .+ b .* x .+ hsgp(:h_x)`), not " *
+        "inside definitions")
+    _contains_mo(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
+        "into $where) calls `mo()`, which lowers only in a predictor " *
+        "(`mu = a .+ b .* mo(c, s)`), not inside definitions")
+    _contains_mo1(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
+        "into $where) calls `mo1()`, which lowers only as a direct " *
+        "predictor summand (`mu = a .+ mo1(c, s)`), not " *
         "inside definitions")
     if ex in ctx.structural || ctx.detshape[ex] !== :vector
         ex in visited && _sfail("$where: cyclic definition through $ex")
@@ -3110,6 +3142,24 @@ function _classify_summand(pname, core, sign::Int, ctx)
                   "scaled summands (`mu = a .+ b .* u`), not nested in " *
                   "$(repr(core))")
         return _classify_scan(pname, core, sign, ctx)
+    end
+    if _contains_mo1(core)
+        _is_mo1_call(core) ||
+            _sfail("predictor $pname: `mo1()` summands lower only as " *
+                  "direct additive summands " *
+                  "(`mu = a .+ mo1(c, s)`), not nested in " *
+                  "$(repr(core))")
+        return _classify_mo1(pname, core, sign, ctx)
+    end
+    if _contains_mo(core)
+        # `mo()` lowers only scaled by one free coefficient — the product
+        # arm below routes to `_classify_mo_product`; any other shape
+        # fails here naming the spelling.
+        core isa Expr && core.head === :call && !isempty(core.args) &&
+            core.args[1] === :.* ||
+            _sfail("predictor $pname: `mo()` takes a free coefficient " *
+                  "(`mu = a .+ b .* mo(c, s)`); beta-free monotonic " *
+                  "summands spell `mo1(c, s)`")
     end
     head = core.head
     head === :ref && return _classify_ref(pname, core, sign, ctx)
@@ -3308,6 +3358,95 @@ function _classify_scan(pname, core::Expr, sign::Int, ctx)
         (scan_id = only(states), coef = coef), label, label), nothing
 end
 
+# Shared `mo(col, s)` / `mo1(col, s)` argument screen: two bare names —
+# the index column (a raw data column of integer level codes 1..K, bound
+# by the emitter — SB's `<c>_idx`) and the increments simplex (a
+# `~ Dirichlet(...)` parameter). Shape-verified here so both classifiers
+# fail with the use-site spelling.
+function _mo_args(pname, core::Expr, ctx, head::Symbol)
+    where = "predictor $pname"
+    args = core.args[2:end]
+    length(args) == 2 ||
+        _sfail("$where `$head()` takes `(index column, increments)` " *
+              "exactly (`$head(c, s)`), got $(repr(core))")
+    col, incr = args
+    col isa Symbol ||
+        _sfail("$where `$head()` index must be a bare data column of " *
+              "level codes, got $(repr(col))")
+    col in ctx.data ||
+        _sfail("$where `$head()` index $col must be a data column " *
+              "(the emitter binds integer codes 1..K)")
+    incr isa Symbol ||
+        _sfail("$where `$head()` increments must name a " *
+              "`~ Dirichlet(...)` simplex parameter, got $(repr(incr))")
+    incr in ctx.dirichlet_names ||
+        _sfail("$where `$head()` increments $incr is not a " *
+              "`~ Dirichlet(...)` simplex parameter")
+    haskey(ctx.mo_uses, incr) &&
+        _sfail("$where reuses increments $incr, which already feed " *
+              "predictor `$(ctx.mo_uses[incr])` (one monotonic term per " *
+              "simplex)")
+    ctx.mo_uses[incr] = pname
+    return col, incr
+end
+
+# A `coef .* mo(col, s)` product: the only `mo()` shape (SB's free-beta
+# monotonic column). Exactly two factors — one coefficient, one `mo()`
+# call — in either order; anything else (unscaled, multi-scaled,
+# interacting, `mo1()`-carrying) fails naming the spelling.
+function _classify_mo_product(pname, core::Expr, sign::Int, ctx)
+    where = "predictor $pname"
+    inner = sign
+    coef = nothing
+    mocall = nothing
+    for f in core.args[2:end]
+        s, g = _strip_sign(f)
+        inner *= s
+        if _is_mo_call(g)
+            mocall === nothing ||
+                _sfail("$where combines two `mo()` calls — one " *
+                      "monotonic column per product " *
+                      "(`b .* mo(c, s)`)")
+            mocall = g
+        elseif _contains_mo(g) || _contains_mo1(g)
+            _sfail("$where nests `$(repr(g))` — `mo()` lowers only as " *
+                  "`coef .* mo(col, s)`")
+        elseif g isa Symbol && _summand_kind(g, ctx) === :coef
+            coef === nothing ||
+                _sfail("$where scales `mo()` by two coefficients — " *
+                      "one coefficient per column")
+            coef = g
+        else
+            _sfail("$where combines `mo()` with $(repr(g)) — `mo()` " *
+                  "lowers only as `coef .* mo(col, s)`")
+        end
+    end
+    mocall === nothing && _sfail("internal: mo product without an `mo()` call")
+    coef === nothing &&
+        _sfail("$where `mo()` takes a free coefficient " *
+              "(`b .* mo(c, s)`); beta-free monotonic summands spell " *
+              "`mo1(c, s)`")
+    col, incr = _mo_args(pname, mocall, ctx, :mo)
+    label = Symbol("mo_", pname, "_", col)
+    return TermSpec(MonotonicTerm, [col], (increments = incr,), col,
+        label), (coef, col, inner)
+end
+
+# A `mo1(col, s)` summand: the named increments' contrast as a direct
+# beta-free summand (SB's `mo1(c)` shape). Additive only, one term per
+# simplex (SB allocates one submodel per term; the contract re-checks
+# for hand-built plans).
+function _classify_mo1(pname, core::Expr, sign::Int, ctx)
+    where = "predictor $pname"
+    sign > 0 ||
+        _sfail("$where negates a `mo1()` summand — summands are " *
+              "additive only (write `.+ mo1(c, s)`)")
+    col, incr = _mo_args(pname, core, ctx, :mo1)
+    label = Symbol("mo1_", pname, "_", col)
+    return TermSpec(MonotonicSummandTerm, [col], (increments = incr,),
+        label, label), nothing
+end
+
 function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     (core in ctx.data || core in ctx.vecdefs) &&
         return TermSpec(OffsetTerm, [core], NamedTuple(),
@@ -3351,6 +3490,9 @@ function _extract_column(pname, e::Expr, ctx)
 end
 
 function _classify_product(pname, core::Expr, sign::Int, ctx)
+    if any(f -> _contains_mo(f) || _contains_mo1(f), core.args[2:end])
+        return _classify_mo_product(pname, core, sign, ctx)
+    end
     inner = sign
     coefs = Symbol[]
     values = Any[]
@@ -3522,12 +3664,15 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
             # whose prior lives on the plate parameter, not as a coefficient;
             # gather terms carry a RanefBucket, whose geometry is self-priored;
             # spline summands carry SplineVectors, self-priored likewise;
-            # hsgp summands carry an HSGPBasis, self-priored likewise.
+            # hsgp summands carry an HSGPBasis, self-priored likewise; and
+            # monotonic summands (mo1) carry an increment simplex, also
+            # self-priored.
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
                 t.kind === RanefGatherTerm ||
                 t.kind === SplineSummandTerm ||
                 t.kind === HSGPSummandTerm ||
-                t.kind === ScanSummandTerm) && continue
+                t.kind === ScanSummandTerm ||
+                t.kind === MonotonicSummandTerm) && continue
             addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
             use = _find_use(coefuse, pred.name, addr)
             use === nothing && _sfail("internal: no coefficient use for " *
@@ -3834,6 +3979,12 @@ function _lower_assignment(nm, rhs, coefuse)
     _contains_hsgp(rhs) && _sfail("assignment `$nm` calls `hsgp()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ b .* x .+ hsgp(:h_x)`), not inside definitions")
+    _contains_mo(rhs) && _sfail("assignment `$nm` calls `mo()`, " *
+        "which lowers only in a predictor (`mu = a .+ b .* mo(c, s)`), " *
+        "not inside definitions")
+    _contains_mo1(rhs) && _sfail("assignment `$nm` calls `mo1()`, " *
+        "which lowers only as a direct predictor summand " *
+        "(`mu = a .+ mo1(c, s)`), not inside definitions")
     for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by assignment " *
@@ -3858,6 +4009,12 @@ function _lower_vector_assignment(nm, rhs, coefuse)
     _contains_hsgp(rhs) && _sfail("derived column `$nm` calls `hsgp()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ b .* x .+ hsgp(:h_x)`), not inside definitions")
+    _contains_mo(rhs) && _sfail("derived column `$nm` calls `mo()`, " *
+        "which lowers only in a predictor (`mu = a .+ b .* mo(c, s)`), " *
+        "not inside definitions")
+    _contains_mo1(rhs) && _sfail("derived column `$nm` calls `mo1()`, " *
+        "which lowers only as a direct predictor summand " *
+        "(`mu = a .+ mo1(c, s)`), not inside definitions")
     for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by derived " *

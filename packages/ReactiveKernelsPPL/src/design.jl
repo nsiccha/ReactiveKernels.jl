@@ -10,9 +10,12 @@
     DesignBlock(kind, column, addressee, width, labels, levels)
 
 One term's design contribution. `labels` are coefficient labels in column
-order (`:Intercept` for intercepts, the column name for continuous terms,
-`col_level` over mapped levels for factors, empty for offsets). `levels`
-is meaningful for factors only (the map's evaluated values).
+order (`:Intercept` for intercepts, the column name for continuous and
+monotonic terms, `col_level` over mapped levels for factors, empty for
+offsets and beta-free summands). `levels` is meaningful for factors only
+(the map's evaluated values). `column` is the data column except for
+spline/hsgp summands (the basis id) and monotonic blocks (the increments
+key naming the contrast recipe).
 """
 struct DesignBlock
     kind::TermKind
@@ -66,6 +69,22 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps)
         # its coefficients live in the PlateParameter layout block, so this
         # term contributes no design width.
         return DesignBlock(LatentTerm, only(t.columns), t.addressee, 0, Symbol[], [])
+    elseif t.kind === MonotonicTerm
+        # A monotonic (mo) column: width 1 with a free coefficient, labeled
+        # by its index column (the continuous precedent). The contrast is
+        # parameter-derived, so it never enters the data-only design
+        # matrix — the generator splices it per-block against its
+        # coefficient coordinate. `column` carries the increments key (the
+        # spline-basis-id precedent), which names the contrast recipe.
+        col = only(t.columns)
+        return DesignBlock(MonotonicTerm, t.options.increments, t.addressee,
+            1, [col], [])
+    elseif t.kind === MonotonicSummandTerm
+        # A monotonic summand (mo1): a direct beta-free contrast splice —
+        # no design-matrix width. `column` carries the increments key, as
+        # for the column shape.
+        return DesignBlock(MonotonicSummandTerm, t.options.increments,
+            t.addressee, 0, Symbol[], [])
     elseif t.kind === SplineSummandTerm
         # A spline summand is a direct `X*b + Z*(sd*z)` expression over
         # materialized basis columns and SplineVector layout blocks — no
