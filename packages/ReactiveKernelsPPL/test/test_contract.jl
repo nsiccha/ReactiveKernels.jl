@@ -212,7 +212,7 @@ end
         BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
         BinomialCloglogFam, BetaLogitFam)
     @test admitted_terms() ==
-        (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
+        (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, RanefGatherTerm)
     @test :log in admitted_functions()
     @test :sum in admitted_functions()
     ops, fns = admitted_elementwise()
