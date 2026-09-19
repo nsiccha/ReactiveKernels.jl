@@ -119,7 +119,8 @@ function assign_layout(plan::StructuralPlan)
     for p in plan.vector_parameters
         p.size === nothing && throw(ContractValidationError(
             "[layout] vector parameter $(p.name) has unresolved size " *
-            "(bind_data infers it from the linked response)"))
+            "(bind_data infers it from the linked response or " *
+            "monotonic term)"))
         transform = p.family === :ordered_normal ? :ordered :
             p.family === :simplex_dirichlet ? :simplex : :identity
         # `size` is the PACKED (unconstrained) length: a simplex packs
@@ -250,11 +251,13 @@ end
 """
     simplex_constrain(u) -> Vector{Float64}
 
-Host-side stick-breaking simplex transform (Stan `simplex_constrain`):
+Host-side stick-breaking simplex transform (thin-layer-owned
+parameterization — NOT Stan's isometric-log-ratio `simplex_constrain`;
+the middle layer owns layout+transforms, the LKJ-factor precedent):
 `z[j] = σ(u[j] + log(K-j))`, `s[j] = remaining[j]*z[j]`,
-`s[K] = remaining[K]`. Empty input constrains to `[1.0]` (Stan's
-deterministic 1-simplex). The in-graph twin unrolls the identical
-scalar chain.
+`s[K] = remaining[K]`. Empty input constrains to `[1.0]` (the
+deterministic 1-simplex, as in Stan). The in-graph twin unrolls the
+identical scalar chain.
 """
 function simplex_constrain(u::AbstractVector{<:Real})
     K = length(u) + 1
@@ -270,7 +273,8 @@ function simplex_constrain(u::AbstractVector{<:Real})
     return s
 end
 
-"""Inverse of [`simplex_constrain`](@ref) (Stan `simplex_free`)."""
+"""Inverse of [`simplex_constrain`](@ref) (stick-breaking, not Stan's ILR
+`simplex_free`)."""
 function simplex_unconstrain(s::AbstractVector{<:Real})
     K = length(s)
     u = Vector{Float64}(undef, max(K - 1, 0))
@@ -285,7 +289,7 @@ function simplex_unconstrain(s::AbstractVector{<:Real})
     return u
 end
 
-"""Log-Jacobian of [`simplex_constrain`](@ref): Stan's
+"""Log-Jacobian of [`simplex_constrain`](@ref):
 `Σ [log(remaining) + log(z) + log1p(-z)]` over the K−1 breaks."""
 function simplex_logjac(u::AbstractVector{<:Real})
     K = length(u) + 1
@@ -874,7 +878,7 @@ function _vector_transform_statements(e::LayoutEntry)
         end
         return stmts
     end
-    # :simplex — Stan stick-breaking, unrolled.
+    # :simplex — stick-breaking, unrolled (thin-layer-owned, not Stan's ILR).
     K = e.size + 1
     stmts = Expr[]
     K == 1 && return Expr[:($(_vector_elt(e, 1))::Float64 = 1.0)]
@@ -979,7 +983,7 @@ function jacobian_term(e::LayoutEntry)
             terms = Any[coordinate_read(e.offset + i - 1) for i in 2:e.size]
             return foldl((a, b) -> :($a + $b), terms)
         end
-        # :simplex — Stan's Σ [log(r) + log(z) + log1p(-z)] over the
+        # :simplex — Σ [log(r) + log(z) + log1p(-z)] over the
         # breaks, reading the `_vector_transform_statements` temps.
         e.size < 1 && return nothing
         terms = Any[:(log($(_vector_r(e, j))) + log($(_vector_z(e, j))) +

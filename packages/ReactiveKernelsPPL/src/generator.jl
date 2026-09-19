@@ -125,11 +125,19 @@ function _predictor_statements(plan::StructuralPlan)
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
         lp = _lp_name(pred)
         terms = Any[]
-        if shape.width > 0
+        if any(b -> b.kind === MonotonicTerm, shape.blocks)
+            append!(terms, _mo_block_terms(plan, shape))
+        elseif shape.width > 0
             push!(terms, :($(design_name(pred.name)) * $(block_name(pred.name))))
         end
         if any(b -> b.kind === OffsetTerm, shape.blocks)
             push!(terms, offset_name(pred.name))
+        end
+        # A monotonic summand (mo1) contributes its contrast directly —
+        # beta-free, the offset-arm shape with a parameter-derived column.
+        for t in pred.terms
+            t.kind === MonotonicSummandTerm &&
+                push!(terms, monotonic_name(t.options.increments))
         end
         # A latent term contributes the per-cell latent VECTOR directly
         # (identity design): `lp = theta` on its own, or added to fixed-effect
@@ -157,6 +165,46 @@ function _predictor_statements(plan::StructuralPlan)
         push!(stmts, :($lp = $rhs))
     end
     return stmts
+end
+
+# Scalar coefficient-coordinate read (`sum(view(coef, k:k))`, the
+# `coordinate_read` shape over a coefficient block rather than the packed
+# vector).
+_coef_coord(coef::Symbol, k::Int) = :(sum(view($coef, $k:$k)))
+
+# Per-block LP terms for a predictor with `mo` columns. The fused
+# `design * coef` matvec cannot cover a monotonic block — its contrast
+# column is parameter-derived, and `hcat` cannot mix data with symbolic
+# columns under the Enzyme reverse pass — so each coefficient-carrying
+# block splices against its own coefficient coordinates (positions follow
+# design order, the layout block's own order): intercept/continuous/
+# monotonic blocks scale one column by one coordinate, factor blocks keep
+# the data-matrix × coefficient-slice matvec. Predictors without `mo`
+# keep the fused form above, untouched.
+function _mo_block_terms(plan::StructuralPlan, shape::DesignShape)
+    coef = block_name(shape.predictor)
+    terms = Any[]
+    k = 1
+    for b in shape.blocks
+        if b.kind === InterceptTerm
+            push!(terms, Expr(:call, :.*, Expr(:call, :ones, plan.n_obs),
+                _coef_coord(coef, k)))
+            k += 1
+        elseif b.kind === ContinuousTerm
+            push!(terms, :($(b.column) .* $(_coef_coord(coef, k))))
+            k += 1
+        elseif b.kind === FactorTerm
+            w = b.width
+            push!(terms, :($(_contrast_expr(b)) *
+                $(:(view($coef, $k:$(k + w - 1))))))
+            k += w
+        elseif b.kind === MonotonicTerm
+            push!(terms,
+                :($(monotonic_name(b.column)) .* $(_coef_coord(coef, k))))
+            k += 1
+        end
+    end
+    return terms
 end
 
 # One basis's direct summand as a scaled-column sum (SB `_sb_s_generic` /
