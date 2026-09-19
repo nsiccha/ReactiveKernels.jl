@@ -385,9 +385,10 @@ function lkj_chol_unconstrain(L::AbstractMatrix{<:Real}, K::Int)
 end
 
 """Log-Jacobian of [`lkj_chol_constrain`](@ref): per-angle Gram factor
-`(i-1-j)*log(sin theta)` (hyperspherical volume element — each row
-is an independent unit vector, so the Gram matrix is block-diagonal
-per row) + logistic `log(pi) + log(s) + log1p(-s)`, summed
+`(i-j)*log(sin theta)` (the correlation-matrix volume element the
+Stan-verbatim `lkj_corr_cholesky_logpdf` is a density against — one
+more log-sin per angle than the hyperspherical sphere-volume
+exponent) + logistic `log(pi) + log(s) + log1p(-s)`, summed
 row-major. The in-graph twin unrolls the identical sum over the
 named theta/sigma temps, so host and graph agree bit-for-bit."""
 function lkj_chol_logjac(u::AbstractVector{<:Real}, K::Int)
@@ -400,7 +401,7 @@ function lkj_chol_logjac(u::AbstractVector{<:Real}, K::Int)
         x = Float64(u[p])
         s = 1.0 / (1.0 + exp(-x))
         th = pi * s
-        total += (i - 1 - j) * log(sin(th)) + log(pi) + log(s) + log1p(-s)
+        total += (i - j) * log(sin(th)) + log(pi) + log(s) + log1p(-s)
     end
     return total
 end
@@ -967,7 +968,7 @@ function jacobian_term(e::LayoutEntry)
         for i in 2:K, j in 1:i-1
             s = _rsg_name(L, i, j)
             t = _rth_name(L, i, j)
-            push!(terms, :($(i - 1 - j) * log(sin($t)) + $LOGPI + log($s) +
+            push!(terms, :($(i - j) * log(sin($t)) + $LOGPI + log($s) +
                 log1p(-$s)))
         end
         return foldl((a, b) -> :($a + $b), terms)

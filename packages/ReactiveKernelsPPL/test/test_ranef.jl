@@ -689,22 +689,16 @@ end
     @test_throws ContractValidationError validate_structure(empty)
 end
 
-# Central-difference 1/2 logdet(J'J) of u -> vec(L): independent of the
-# closed-form hyperspherical volume element (uses only constrain).
-function _lkj_fd_logjac(u, K; h = 1e-6)
-    P = length(u)
-    J = Matrix{Float64}(undef, K * K, P)
-    for p in 1:P
-        up = copy(u)
-        up[p] += h
-        dn = copy(u)
-        dn[p] -= h
-        J[:, p] =
-            (vec(lkj_chol_constrain(up, K)) - vec(lkj_chol_constrain(dn, K))) /
-            (2h)
-    end
-    return 0.5 * log(det(transpose(J) * J))
-end
+# NOTE (F1, 2026-09-19): this testset used to pin `lkj_chol_logjac`
+# against a central-difference 1/2 logdet(J'J) of u -> vec(L) — the
+# hyperspherical sphere-volume Gram factor. That expectation WAS the
+# bug: the Stan-verbatim `lkj_corr_cholesky_logpdf` it pairs with is
+# a density w.r.t. the correlation-matrix (Omega-pullback) volume
+# element, whose Gram exponent is (i-j), one log-sin per angle more
+# (posterior parity vs SBBRMI failed on L.2.1/L.2.2 until the fix).
+# The Jacobian oracle now lives in test_lkj_jacobian.jl (Omega-volume
+# identity + K=2 closed form); this testset keeps roundtrip/shape/
+# fail-closed coverage only.
 
 @testset "ranef LKJ transform" begin
     # Packed-dim inversion + fail-closed on non-triangular lengths.
@@ -729,12 +723,7 @@ end
         end
         @test lkj_chol_unconstrain(L, K) ≈ u
     end
-    # Log-Jacobian vs the finite-difference Gram factor (K>=3 exercises
-    # the nonzero (i-1-j) exponents; K=2 covers the pure-logistic row).
-    for (K, u) in ((2, [0.3]), (3, [0.3, -0.5, 0.7]),
-            (4, [0.3, -0.5, 0.7, 0.1, -0.2, 0.4]))
-        @test lkj_chol_logjac(u, K) ≈ _lkj_fd_logjac(u, K) rtol = 1e-6
-    end
+    # Log-Jacobian oracle: test_lkj_jacobian.jl (see NOTE above).
     @test lkj_chol_logjac(Float64[], 1) == 0.0
     # Fail-closed: length mismatch, non-square, off-hemisphere.
     @test_throws ContractValidationError lkj_chol_constrain([0.1], 3)
@@ -806,9 +795,11 @@ end
     @test nt.b_g[1, 1] ≈ nt.tau_g[1] * nt.z_flat_g[1]
     # Roundtrip ignores the derived b (constrain output feeds unconstrain).
     @test unconstrain(layout, nt) ≈ u
-    # Jacobian: sigma + tau exps + the K=2 theta term, hand-summed.
+    # Jacobian: sigma + tau exps + the K=2 theta term, hand-summed
+    # (the (i-j) = 1 exponent keeps one log-sin term — F1 fix; the old
+    # pure-logistic pin asserted the sphere-volume bug).
     s = 1 / (1 + exp(-u[3]))
-    lkj = log(pi) + log(s) + log1p(-s)
+    lkj = log(sin(pi * s)) + log(pi) + log(s) + log1p(-s)
     @test logjac(layout, u) ≈ u[2] + u[4] + u[5] + lkj
 end
 
@@ -873,7 +864,8 @@ end
         # No +log(2): SB Stan-convention tau (see the generator comment).
         @test _query(built.spec, bound, :prior, u) ≈ pr
         s = 1 / (1 + exp(-u[3]))
-        jac = u[2] + u[4] + u[5] + log(pi) + log(s) + log1p(-s)
+        jac = u[2] + u[4] + u[5] + log(sin(pi * s)) + log(pi) + log(s) +
+            log1p(-s)
         @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
         _check_gradient(built.spec, bound, u)
     end
@@ -913,14 +905,14 @@ end
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
-    # Jacobian: sigma + tau exps + row-2/row-3 theta terms (the row-3
-    # first angle carries the nonzero Gram exponent).
+    # Jacobian: sigma + tau exps + row-2/row-3 theta terms (the
+    # (i-j) Gram exponents: 1, 2, 1 — F1 fix).
     s3 = 1 / (1 + exp(-u[3]))
     s4 = 1 / (1 + exp(-u[4]))
     s5 = 1 / (1 + exp(-u[5]))
-    lj = log(pi) + log(s3) + log1p(-s3) +
-        log(sin(pi * s4)) + log(pi) + log(s4) + log1p(-s4) +
-        log(pi) + log(s5) + log1p(-s5)
+    lj = log(sin(pi * s3)) + log(pi) + log(s3) + log1p(-s3) +
+        2 * log(sin(pi * s4)) + log(pi) + log(s4) + log1p(-s4) +
+        log(sin(pi * s5)) + log(pi) + log(s5) + log1p(-s5)
     jac = u[2] + u[6] + u[7] + u[8] + lj
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
     _check_gradient(built.spec, bound, u)
@@ -1003,7 +995,8 @@ end
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
     s4 = 1 / (1 + exp(-u[4]))
-    jac = u[3] + u[5] + u[6] + log(pi) + log(s4) + log1p(-s4)
+    jac = u[3] + u[5] + u[6] + log(sin(pi * s4)) + log(pi) + log(s4) +
+        log1p(-s4)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
     _check_gradient(built.spec, bound, u)
 end
