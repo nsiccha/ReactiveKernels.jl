@@ -31,6 +31,7 @@ export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, Assig
 export RanefZRecipe, RanefMargin, RanefBucket
 export SplineBasisBlock, SplineBasis, SplineVector
 export HSGPBasis
+export KernelPlate
 export LevelMap
 export StructuralPlan
 export ContractValidationError, validate_plan, validate_structure, validate_data

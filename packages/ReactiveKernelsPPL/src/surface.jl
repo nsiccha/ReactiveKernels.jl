@@ -177,7 +177,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
     sample, det, plate_ctx, plate_specs, scans, buckets, bases, vectors,
-    hbases = _partition_statements(ast, data)
+    hbases, kplates = _partition_statements(ast, data)
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
@@ -275,7 +275,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
         ranef_buckets = buckets,
         vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
-        spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases)
+        spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
+        kernel_plates = kplates)
     validate_structure(plan)
     return plan
 end
@@ -1049,6 +1050,193 @@ function _hsgp_broadcast_opt(v, d::Int, where, key::Symbol)
     return fill(T(v), d)
 end
 
+# Panel-kernel plate statement:
+#   `result ~ plate(cols...; subjects=N) do slices... <cell> end`
+# The cell is a REAL subgraph (assignments + exactly one dotted `.~`
+# observation + a trailing collected name) — NOT desugared to flat
+# top-level statements. `subjects` is an integer literal or a dims-key
+# name resolved at bind; slice columns must be bound data.
+function _is_kernel_plate_stmt(st::Expr)
+    (_is_sample(st) || _is_broadcast_sample(st)) || return false
+    rhs = st.args[3]
+    rhs isa Expr && rhs.head === :do || return false
+    isempty(rhs.args) && return false
+    call = rhs.args[1]
+    return call isa Expr && call.head === :call && !isempty(call.args) &&
+        call.args[1] === :plate
+end
+
+function _lower_kernel_plate(st::Expr, line::Int, data::Set{Symbol},
+        seen::Set{Symbol}, seelines::Dict{Symbol,Int})
+    where = line > 0 ? "kernel plate (line $line)" : "kernel plate"
+    bc = _is_broadcast_sample(st)
+    bc && _sfail("$where carries a scalar `~` (the collected result " *
+                 "name), not `.~`")
+    result = st.args[2]
+    result isa Symbol ||
+        _sfail("$where LHS must be a bare Symbol (the collected " *
+               "per-subject result name), got $(repr(result))")
+    doex = st.args[3]
+    length(doex.args) >= 2 && doex.args[2] isa Expr ||
+        _sfail("$where needs `plate(cols...; subjects=N) do slices... " *
+               "cell end`")
+    call, lam = doex.args[1], doex.args[2]
+    # `plate(cols...; subjects=N)`: exactly the subjects kwarg, then ≥1
+    # bare data columns.
+    subj = nothing
+    cols = Symbol[]
+    for arg in call.args[2:end]
+        if arg isa Expr && arg.head === :parameters
+            for kw in arg.args
+                kw isa Expr && kw.head === :kw && length(kw.args) == 2 &&
+                    kw.args[1] === :subjects ||
+                    _sfail("$where takes exactly one keyword " *
+                           "`subjects=N`, got $(repr(kw))")
+                subj !== nothing &&
+                    _sfail("$where repeats `subjects=`")
+                subj = kw.args[2]
+            end
+        elseif arg isa Symbol
+            push!(cols, arg)
+        else
+            _sfail("$where plate inputs must be bare data columns, got " *
+                   "$(repr(arg))")
+        end
+    end
+    subj === nothing &&
+        _sfail("$where needs `subjects=N` (an integer literal or a " *
+               "dims-key name bound at bind)")
+    subjects = if subj isa Int
+        subj > 0 ||
+            _sfail("$where subject count must be positive, got $subj")
+        subj
+    elseif subj isa Symbol
+        subj
+    else
+        _sfail("$where `subjects` must be an integer literal or a " *
+               "dims-key name, got $(repr(subj))")
+    end
+    isempty(cols) &&
+        _sfail("$where takes at least one slice column")
+    for c in cols
+        c in data ||
+            _sfail("$where slice column `$c` is not bound data " *
+                   "(responses enter the cell as slices)")
+    end
+    # `do slices... cell end`: plain-Symbol params, one per column.
+    lam.head === :-> && length(lam.args) == 2 ||
+        _sfail("$where `do` block must be `do slices... cell end`")
+    ptuple, body = lam.args[1], lam.args[2]
+    params = if ptuple isa Symbol
+        Symbol[ptuple]
+    elseif ptuple isa Expr && ptuple.head === :tuple &&
+            all(p -> p isa Symbol, ptuple.args)
+        Symbol[ptuple.args...]
+    else
+        _sfail("$where cell params must be plain names (one per slice " *
+               "column)")
+    end
+    length(params) == length(cols) ||
+        _sfail("$where has $(length(params)) cell params for " *
+               "$(length(cols)) slice columns (one param per column)")
+    body isa Expr && body.head === :block ||
+        _sfail("$where cell must be a `begin ... end`-style block")
+    # Cell: assignments + exactly one `.~` + trailing collected name.
+    assignments = Pair{Symbol,Any}[]
+    obs_stmt = nothing
+    collected = nothing
+    cell = Any[s for s in body.args if !(s isa LineNumberNode)]
+    isempty(cell) && _sfail("$where cell is empty (need assignments, " *
+                            "one `.~` observation, and a collected name)")
+    for (k, s) in enumerate(cell)
+        last_stmt = k == length(cell)
+        if s isa Symbol
+            last_stmt ||
+                _sfail("$where cell names a bare `$s` mid-cell — only " *
+                       "the trailing statement may be a bare name (the " *
+                       "collected result)")
+            collected = s
+        elseif s isa Expr && s.head === :(=) && length(s.args) == 2 &&
+                s.args[1] isa Symbol
+            push!(assignments, s.args[1] => s.args[2])
+        elseif s isa Expr && s.head === :call && length(s.args) == 3 &&
+                (s.args[1] === :.~ || s.args[1] === :~)
+            s.args[1] === :~ &&
+                _sfail("$where in-cell observation broadcasts " *
+                       "(`yy .~ Normal.(mu, sigma)`); scalar `~` over " *
+                       "vectors is rejected per the explicit-dots ruling")
+            obs_stmt !== nothing &&
+                _sfail("$where cell has more than one `.~` observation " *
+                       "(panel v1 admits exactly one)")
+            obs_stmt = s
+        else
+            _sfail("$where cell statements are `name = ...`, one " *
+                   "`yy .~ Normal.(mu, sigma)`, and a trailing collected " *
+                   "name — got $(repr(s))")
+        end
+    end
+    obs_stmt === nothing &&
+        _sfail("$where cell has no `.~` observation (panel v1 needs " *
+               "exactly one in-cell likelihood)")
+    collected === nothing &&
+        _sfail("$where cell must end with a collected result name (a " *
+               "bare cell name)")
+    obs = _lower_kernel_obs(obs_stmt, params, where)
+    local_names = union(Set{Symbol}(params),
+        Set{Symbol}(nm for (nm, _) in assignments))
+    collected in local_names ||
+        _sfail("$where collected result `$collected` is not a cell " *
+               "name (slice param or cell-local assignment)")
+    # Cell names become flat model-scope locals at codegen: claim them
+    # alongside the result (later model statements reusing them fail as
+    # redefinitions, and vice versa).
+    _claim!(seen, seelines, result, line)
+    for nm in params
+        _claim!(seen, seelines, nm, line)
+    end
+    for (nm, _) in assignments
+        _claim!(seen, seelines, nm, line)
+    end
+    slices = Tuple{Symbol,Symbol,Symbol}[(c, p, :unknown)
+        for (c, p) in zip(cols, params)]
+    return KernelPlate(result, subjects, nothing, slices, assignments,
+        obs, collected, result)
+end
+
+# The single in-cell observation: `yy .~ Normal.(location, scale)` with a
+# slice-param response and name-or-literal location/scale (Gaussian v1).
+function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where)
+    resp = stmt.args[2]
+    resp isa Symbol ||
+        _sfail("$where obs response must be a bare slice param, got " *
+               "$(repr(resp))")
+    resp in params ||
+        _sfail("$where obs response `$resp` is not a slice param " *
+               "(responses enter the cell as slices)")
+    dist = stmt.args[3]
+    (dist isa Expr && dist.head === :.) ||
+        _sfail("$where obs broadcasts (`yy .~ Normal.(mu, sigma)`), " *
+               "got $(repr(dist))")
+    length(dist.args) == 2 && dist.args[1] isa Symbol &&
+        dist.args[2] isa Expr && dist.args[2].head === :tuple ||
+        _sfail("$where obs takes `yy .~ Normal.(location, scale)`, got " *
+               "$(repr(dist))")
+    dist.args[1] === :Normal ||
+        _sfail("$where panel v1 admits a Gaussian in-cell observation " *
+               "only, got `$(dist.args[1]).(...)`")
+    dargs = dist.args[2].args
+    length(dargs) == 2 ||
+        _sfail("$where `Normal.(location, scale)` takes exactly two " *
+               "arguments, got $(length(dargs))")
+    for (nm, ref) in ((:location, dargs[1]), (:scale, dargs[2]))
+        ref isa Symbol || (ref isa Number && !(ref isa Bool)) ||
+            _sfail("$where obs $nm must be a cell/model name or a " *
+                   "numeric literal, got $(repr(ref))")
+    end
+    return (response = resp, family = GaussianFam, location = dargs[1],
+        scale = dargs[2])
+end
+
 function _partition_statements(ast::Expr, data::Set{Symbol})
     sample = SampleStmt[]
     det = Pair{Symbol,Any}[]
@@ -1057,6 +1245,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     bases = SplineBasis[]
     vectors = SplineVector[]
     hbases = HSGPBasis[]
+    kplates = KernelPlate[]
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
     seen_doc = false
@@ -1103,6 +1292,11 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             push!(hbases, hb)
             continue
         end
+        if _is_kernel_plate_stmt(st)
+            kp = _lower_kernel_plate(st, line, data, seen, seelines)
+            push!(kplates, kp)
+            continue
+        end
         if _is_sample(st) || _is_broadcast_sample(st)
             bc = _is_broadcast_sample(st)
             tilde = bc ? "`.~`" : "`~`"
@@ -1141,7 +1335,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         end
     end
     return sample, det, plate_ctx, plate_params, scans, buckets, bases,
-        vectors, hbases
+        vectors, hbases, kplates
 end
 
 # Pre-pass: expand top-level `@plate for i in R ... end` blocks into
