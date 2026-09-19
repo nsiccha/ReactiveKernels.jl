@@ -43,6 +43,8 @@ export LayoutTable, LayoutEntry, assign_layout, coordinate_names
 export constrain, unconstrain, logjac, support_of
 export ordered_constrain, ordered_unconstrain, ordered_logjac
 export simplex_constrain, simplex_unconstrain, simplex_logjac
+export lkj_chol_constrain, lkj_chol_unconstrain, lkj_chol_logjac
+export lkj_logconst, lkj_corr_cholesky_logpdf
 export positive_bijector, unit_bijector, interval_bijector, BIJECTORS
 export coordinate_read, block_read, transform_statements, jacobian_term
 export design_name, offset_name, design_recipe, offset_recipe

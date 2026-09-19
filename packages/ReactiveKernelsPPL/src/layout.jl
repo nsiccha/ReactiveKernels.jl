@@ -52,17 +52,18 @@ end
 
 """One packed slice: a coefficient block, a scalar latent, a scan vector
 latent, a per-cell latent block, a leveled vector latent (cutpoints,
-thresholds, simplex), a spline coefficient-vector block, or a K=1 ranef
-standardized group vector. `lo`/`hi` are the constrained bounds of an
-`:interval` transform (`NaN` otherwise)."""
+thresholds, simplex), a spline coefficient-vector block, a ranef vector
+block (K=1 `xi`, correlated `tau`/`z_flat`), or a correlated-ranef LKJ
+Cholesky factor. `lo`/`hi` are the constrained bounds of an `:interval`
+transform (`NaN` otherwise)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :ranef
+    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :ranef | :ranef_corr
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
     offset::Int # 1-based packed offset
     size::Int
-    transform::Symbol # :identity | :exp | :logistic | :interval | :ordered | :simplex
+    transform::Symbol # :identity | :exp | :logistic | :interval | :ordered | :simplex | :lkj
     lo::Float64 # :interval lower bound (else NaN)
     hi::Float64 # :interval upper bound (else NaN)
 end
@@ -141,13 +142,37 @@ function assign_layout(plan::StructuralPlan)
                 transform, lo, hi))
         offset += v.width
     end
-    # K=1 ranef buckets (Stage B): the scalar scale (`:sampled`, real for
-    # `log_scale`, exp for `tau` — the exp Jacobian is Stan's lower-bound
-    # kernel term, no renormalizer) plus the standardized G-vector `xi`
-    # (`:ranef`, plate-shaped identity block; G from bind levels).
-    # Correlated buckets own no Stage-B entries (Stage C).
+    # Ranef buckets in plan order. K=1 (Stage B): the scalar scale
+    # (`:sampled`, real for `log_scale`, exp for `tau` — the exp
+    # Jacobian is Stan's lower-bound kernel term, no renormalizer)
+    # plus the standardized G-vector `xi` (`:ranef`, plate-shaped
+    # identity block; G from bind levels). Correlated (Stage C, SB
+    # declaration order L/tau/z): the LKJ Cholesky factor (`:ranef_corr`
+    # packing K*(K-1)/2 thetas — K=1 packs zero and constrains to
+    # `[1.0]`), the marginal-scale K-vector `tau` (`:ranef` with `:exp`
+    # — the same Stan kernel semantics as the Stage-B scalar), and the
+    # standardized `z_flat` (`:ranef` identity, K*G column-major).
     for b in plan.ranef_buckets
-        b.kind === :correlated && continue
+        if b.kind === :correlated
+            K = length(b.margins)
+            L, tau, z = _ranef_corr_names(b)
+            P = K * (K - 1) ÷ 2
+            labels = [Symbol(string(L) * "." * string(i)) for i in 1:P]
+            push!(entries,
+                LayoutEntry(:ranef_corr, nothing, L, labels, offset, P,
+                    :lkj))
+            offset += P
+            push!(entries,
+                LayoutEntry(:ranef, nothing, tau, [tau], offset, K,
+                    :exp))
+            offset += K
+            G = length(_grouping_levels(plan.columns[b.group]))
+            push!(entries,
+                LayoutEntry(:ranef, nothing, z, [z], offset, K * G,
+                    :identity))
+            offset += K * G
+            continue
+        end
         scale, xi = _ranef_k1_names(b)
         transform = b.kind === :intercept1 ? :identity : :exp
         push!(entries,
@@ -276,6 +301,177 @@ function simplex_logjac(u::AbstractVector{<:Real})
 end
 
 """
+    _lkj_dim(packed) -> Int
+
+Margin count K from a packed LKJ-theta length (`packed == K*(K-1)/2`;
+0 ⟺ K=1). Loud on non-triangular lengths.
+"""
+function _lkj_dim(packed::Int)
+    packed == 0 && return 1
+    packed > 0 || throw(ContractValidationError(
+        "[layout] LKJ packed length $packed is negative"))
+    K = (1 + isqrt(1 + 8 * packed)) ÷ 2
+    K * (K - 1) ÷ 2 == packed ||
+        throw(ContractValidationError("[layout] LKJ packed length $packed " *
+              "is not triangular (want K*(K-1)/2)"))
+    return K
+end
+
+"""
+    lkj_chol_constrain(u, K) -> Matrix{Float64}
+
+Host-side LKJ Cholesky-factor transform (thin-layer-owned
+parameterization — NOT Stan's partial-correlation vine; contract:
+the middle layer owns layout+transforms). Row 1 is `[1, 0, ...]`;
+row `i >= 2` is a unit vector from `i-1` logistic angles
+`theta = pi*sigma(u)` packed row-major:
+`L[i,j] = cos(theta_j) * prod(sin(theta[1:j-1]))`,
+`L[i,i] = prod(sin(theta))`. Above-diagonal stays zero. The in-graph
+twin unrolls the identical scalar chain (left-assoc products), so
+host and graph agree bit-for-bit. K=1 constrains `[]` to `[1.0]`.
+"""
+function lkj_chol_constrain(u::AbstractVector{<:Real}, K::Int)
+    K >= 1 || throw(ContractValidationError(
+        "[layout] LKJ margin count K=$K < 1"))
+    length(u) == K * (K - 1) ÷ 2 || throw(ContractValidationError(
+        "[layout] LKJ packed length $(length(u)) ≠ $K*$(K-1)/2"))
+    L = zeros(Float64, K, K)
+    L[1, 1] = 1.0
+    p = 0
+    for i in 2:K
+        th = Vector{Float64}(undef, i - 1)
+        for j in 1:i-1
+            p += 1
+            s = 1.0 / (1.0 + exp(-Float64(u[p])))
+            th[j] = pi * s
+        end
+        for j in 1:i-1
+            v = cos(th[j])
+            for m in 1:j-1
+                v *= sin(th[m])
+            end
+            L[i, j] = v
+        end
+        d = 1.0
+        for m in 1:i-1
+            d *= sin(th[m])
+        end
+        L[i, i] = d
+    end
+    return L
+end
+
+"""Inverse of [`lkj_chol_constrain`](@ref): hyperspherical inversion
+per row (`theta_j = atan(hypot(row[j+1:i]), row[j])`), then
+`u = log(theta) - log(pi - theta)`. Loud outside the hemisphere
+(non-positive diagonal) and on non-square input."""
+function lkj_chol_unconstrain(L::AbstractMatrix{<:Real}, K::Int)
+    size(L) == (K, K) || throw(ContractValidationError(
+        "[layout] LKJ factor size $(size(L)) ≠ ($K, $K)"))
+    u = Vector{Float64}(undef, K * (K - 1) ÷ 2)
+    p = 0
+    for i in 2:K
+        Float64(L[i, i]) > 0 || throw(ContractValidationError(
+            "[layout] LKJ factor row $i leaves the hemisphere " *
+            "(non-positive diagonal — not a Cholesky factor)"))
+        for j in 1:i-1
+            p += 1
+            rest = sqrt(sum(Float64(L[i, m])^2 for m in j+1:i))
+            th = atan(rest, Float64(L[i, j]))
+            u[p] = log(th) - log(pi - th)
+        end
+    end
+    return u
+end
+
+"""Log-Jacobian of [`lkj_chol_constrain`](@ref): per-angle Gram factor
+`(i-1-j)*log(sin theta)` (hyperspherical volume element — each row
+is an independent unit vector, so the Gram matrix is block-diagonal
+per row) + logistic `log(pi) + log(s) + log1p(-s)`, summed
+row-major. The in-graph twin unrolls the identical sum over the
+named theta/sigma temps, so host and graph agree bit-for-bit."""
+function lkj_chol_logjac(u::AbstractVector{<:Real}, K::Int)
+    length(u) == K * (K - 1) ÷ 2 || throw(ContractValidationError(
+        "[layout] LKJ packed length $(length(u)) ≠ $K*$(K-1)/2"))
+    total = 0.0
+    p = 0
+    for i in 2:K, j in 1:i-1
+        p += 1
+        x = Float64(u[p])
+        s = 1.0 / (1.0 + exp(-x))
+        th = pi * s
+        total += (i - 1 - j) * log(sin(th)) + log(pi) + log(s) + log1p(-s)
+    end
+    return total
+end
+
+"""
+    lkj_logconst(K, eta) -> Float64
+
+LKJ normalizing constant: verbatim port of Stan's `do_lkj_constant`
+(Lewandowski–Kurowicka–Joe 2009, theorem 5), INCLUDING the
+`eta == 1.0` fast branch — the joint parity case compares against
+Stan's `lkj_corr_cholesky_lpdf` with the same branch taken, so the
+branch dispatch is load-bearing, not cosmetic. K=1 is ±0.0 (== 0.0
+either way — the eta==1.0 branch yields -0.0, exactly as Stan does).
+"""
+function lkj_logconst(K::Int, eta::Real)
+    e = Float64(eta)
+    Km1 = K - 1
+    if e == 1.0
+        denom = 0.0
+        for k in 1:Km1÷2
+            denom += loggamma(2.0 * k)
+        end
+        constant = -denom
+        if K % 2 == 1
+            constant -= 0.25 * (K * K - 1) * log(pi) -
+                0.25 * (Km1 * Km1) * log(2.0) -
+                Km1 * loggamma(0.5 * (K + 1))
+        else
+            constant -= 0.25 * K * (K - 2) * log(pi) +
+                0.25 * (3 * K * K - 4 * K) * log(2.0) +
+                K * loggamma(0.5 * K) - Km1 * loggamma(Float64(K))
+        end
+        return constant
+    end
+    constant = Km1 * loggamma(e + 0.5 * Km1)
+    for k in 1:Km1
+        constant -= 0.5 * k * log(pi) + loggamma(e + 0.5 * (Km1 - k))
+    end
+    return constant
+end
+
+"""
+    lkj_corr_cholesky_logpdf(L, eta) -> Float64
+
+Host-side LKJ Cholesky log-density (Stan `lkj_corr_cholesky_lpdf`,
+propto=false): diagonal sum over rows 2..K plus
+[`lkj_logconst`](@ref). Stan's op order is preserved verbatim
+(per-diagonal `(Km1-k-1)*ld + (2*eta-2)*ld`; the `eta == 1.0`
+single-term branch) so joint parity against Stan holds to 1ulp.
+K=1 is exactly 0.0.
+"""
+function lkj_corr_cholesky_logpdf(L::AbstractMatrix{<:Real}, eta::Real)
+    K = size(L, 1)
+    size(L, 2) == K || throw(ContractValidationError(
+        "[layout] LKJ factor is not square: $(size(L))"))
+    e = Float64(eta)
+    lp = lkj_logconst(K, e)
+    if e == 1.0
+        for k in 0:K-2
+            lp += (K - 1 - k - 1) * log(Float64(L[k+2, k+2]))
+        end
+        return lp
+    end
+    for k in 0:K-2
+        ld = log(Float64(L[k+2, k+2]))
+        lp += (K - 1 - k - 1) * ld + (2 * e - 2) * ld
+    end
+    return lp
+end
+
+"""
     coordinate_names(layout) -> Vector{Symbol}
 
 Flat per-coordinate names (R10 read API): coefficients qualified
@@ -294,6 +490,8 @@ function coordinate_names(layout::LayoutTable)
             end
         elseif e.kind === :vector
             append!(names, e.labels)
+        elseif e.kind === :ranef_corr
+            append!(names, e.labels)
         elseif e.kind === :scan
             for label in e.labels
                 push!(names, Symbol(string(e.name) * "." * string(label)))
@@ -309,8 +507,12 @@ end
     constrain(layout, unconstrained) -> NamedTuple
 
 Host-side constrain: packed vector → `(predictor => Vector, param => scalar,
-…)`. For testing, output mapping, and future prediction; the generator emits
-the in-graph equivalent.
+…)`. A correlated-ranef bucket contributes its Cholesky factor `L` (K×K),
+its scale vector `tau`, its standardized draws `z_flat`, plus the DERIVED
+correlated draws `b_<suffix>` (G×K, SB `(diag_pre_multiply(tau,L)*z)'`
+— output mapping, ignored by [`unconstrain`](@ref)). For testing,
+output mapping, and future prediction; the generator emits the
+in-graph equivalent.
 """
 function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     length(u) == layout.total ||
@@ -327,12 +529,49 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, e.name => Vector{Float64}(seg))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
+        elseif e.kind === :ranef_corr
+            push!(pairs, e.name =>
+                lkj_chol_constrain(Vector{Float64}(seg), _lkj_dim(e.size)))
         else
             v = _constrain_elt(e, Float64(only(seg)))
             push!(pairs, e.name => v)
         end
     end
+    for (bname, b) in _ranef_corr_draws(layout, u)
+        push!(pairs, bname => b)
+    end
     return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
+end
+
+# Derived correlated draws per `:ranef_corr` entry: `b_<suffix>` (G×K),
+# SB `(diag_pre_multiply(tau,L)*z)'` with `z_flat` in SB column-major
+# order. Sibling entries are found by the canonical `_ranef_corr_names`
+# spelling (`L_<s>` → `tau_<s>` / `z_flat_<s>`), never by adjacency,
+# so entry-order changes cannot miswire it.
+function _ranef_corr_draws(layout::LayoutTable, u::AbstractVector{<:Real})
+    out = Pair{Symbol,Matrix{Float64}}[]
+    byname = Dict{Symbol,LayoutEntry}(e.name => e for e in layout.entries)
+    for e in layout.entries
+        e.kind === :ranef_corr || continue
+        sfx = string(e.name)[3:end]
+        tau_e = get(byname, Symbol("tau_", sfx), nothing)
+        z_e = get(byname, Symbol("z_flat_", sfx), nothing)
+        (tau_e === nothing || z_e === nothing) && throw(ContractValidationError(
+            "[layout] LKJ entry $(e.name) has no tau/z_flat siblings " *
+            "(assign_layout always emits the triple)"))
+        K = _lkj_dim(e.size)
+        tau = [_constrain_elt(tau_e, Float64(x)) for x in
+            u[tau_e.offset:(tau_e.offset + tau_e.size - 1)]]
+        zf = [Float64(x) for x in u[z_e.offset:(z_e.offset + z_e.size - 1)]]
+        length(zf) == K * (length(zf) ÷ K) || throw(ContractValidationError(
+            "[layout] z_flat length $(length(zf)) is not a multiple of K=$K"))
+        G = length(zf) ÷ K
+        L = lkj_chol_constrain(
+            Vector{Float64}(u[e.offset:(e.offset + e.size - 1)]), K)
+        zmat = reshape(zf, K, G)
+        push!(out, Symbol("b_", sfx) => Matrix((Diagonal(tau) * L * zmat)'))
+    end
+    return out
 end
 
 """
@@ -354,7 +593,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
         elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef
             what = e.kind === :plate ? "plate parameter" :
-                e.kind === :spline ? "spline vector" : "ranef xi vector"
+                e.kind === :spline ? "spline vector" : "ranef vector"
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing $what $(e.name)"),
             )
@@ -384,6 +623,17 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] vector parameter $(e.name) length mismatch"),
             )
             u[e.offset:(e.offset + e.size - 1)] .= _vector_unconstrain(e, v)
+        elseif e.kind === :ranef_corr
+            haskey(nt, e.name) || throw(
+                ContractValidationError("[layout] missing LKJ factor $(e.name)"),
+            )
+            v = nt[e.name]
+            v isa AbstractMatrix || throw(
+                ContractValidationError("[layout] LKJ factor $(e.name) " *
+                      "must be a K×K matrix, got $(typeof(v))"),
+            )
+            u[e.offset:(e.offset + e.size - 1)] .=
+                lkj_chol_unconstrain(v, _lkj_dim(e.size))
         else
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing parameter $(e.name)"),
@@ -412,6 +662,12 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             # Vector Jacobians couple coordinates (ordered sums, simplex
             # stick-breaking) — entry-level, never per-coordinate.
             total += _vector_logjac(e, seg)
+            continue
+        end
+        if e.kind === :ranef_corr
+            # LKJ thetas couple through the hyperspherical rows —
+            # entry-level, never per-coordinate.
+            total += lkj_chol_logjac(Vector{Float64}(seg), _lkj_dim(e.size))
             continue
         end
         for v in seg
@@ -499,12 +755,15 @@ function transform_statements(e::LayoutEntry)
     if e.kind === :plate || e.kind === :spline || e.kind === :ranef
         # Spline vectors ride the plate transform path (block + scalar
         # endpoints); the contract pins their supports to real/positive,
-        # so the :interval arm below is unreachable for them. Ranef `xi`
-        # vectors ride it too (always `:identity` in Stage B).
+        # so the :interval arm below is unreachable for them. Ranef
+        # vectors ride it too (`xi`/`z_flat` identity, `tau` exp).
         return _plate_transform_statements(e)
     end
     if e.kind === :vector
         return _vector_transform_statements(e)
+    end
+    if e.kind === :ranef_corr
+        return _ranef_corr_transform_statements(e)
     end
     o = e.offset
     coord = coordinate_read(o)
@@ -633,6 +892,55 @@ function _vector_transform_statements(e::LayoutEntry)
     return stmts
 end
 
+# Constrained Cholesky entries / logistic-sigma + theta temps for a
+# `:ranef_corr` entry: `_ppl_rl_<L>_<i>_<j>` (lower triangle incl.
+# diagonal; downstream gather/prior cells read these scalars directly),
+# `_ppl_rsg_<L>_<i>_<j>` (sigma(u)), `_ppl_rth_<L>_<i>_<j>` (theta).
+# All `_ppl_`-hygienic.
+_rl_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rl_, L, :_, i, :_, j)
+_rsg_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rsg_, L, :_, i, :_, j)
+_rth_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rth_, L, :_, i, :_, j)
+
+# LKJ Cholesky edges: scalar-unrolled twin of the host
+# `lkj_chol_constrain` (IDENTICAL scalar ops in the IDENTICAL order —
+# left-assoc products, `pi`/`log(pi)` precomputed host-side literals —
+# so in-graph and host agree bit-for-bit). No matrix ever
+# materializes: the gather reads the `_ppl_rl_` scalars directly
+# (fully transparent to the planner and the reverse pass — no new
+# Enzyme surface). K=1 emits its constant `[1.0]` edge only.
+function _ranef_corr_transform_statements(e::LayoutEntry)
+    K = _lkj_dim(e.size)
+    L = e.name
+    stmts = Expr[:($(_rl_name(L, 1, 1))::Float64 = 1.0)]
+    PI = Float64(pi)
+    p = 0
+    for i in 2:K
+        for j in 1:i-1
+            p += 1
+            coord = coordinate_read(e.offset + p - 1)
+            s = _rsg_name(L, i, j)
+            t = _rth_name(L, i, j)
+            push!(stmts, :($s::Float64 = 1.0 / (1.0 + exp(-$coord))))
+            push!(stmts, :($t::Float64 = $PI * $s))
+        end
+        for j in 1:i-1
+            factors = Any[:(cos($(_rth_name(L, i, j))))]
+            for m in 1:j-1
+                push!(factors, :(sin($(_rth_name(L, i, m)))))
+            end
+            prod = foldl((a, b) -> :($a * $b), factors)
+            push!(stmts, :($(_rl_name(L, i, j))::Float64 = $prod))
+        end
+        dfactors = Any[1.0]
+        for m in 1:i-1
+            push!(dfactors, :(sin($(_rth_name(L, i, m)))))
+        end
+        dprod = foldl((a, b) -> :($a * $b), dfactors)
+        push!(stmts, :($(_rl_name(L, i, i))::Float64 = $dprod))
+    end
+    return stmts
+end
+
 """
     jacobian_term(entry) -> Union{Nothing,Expr}
 
@@ -641,12 +949,28 @@ constrained support splices the bijector's `logjac` endpoint over the same
 coordinate the `constrain` edge reads (shared via structural CSE); a per-cell
 latent (plate) block sums its companion `logjac` plate (`_plate_logjac_name`);
 a leveled vector entry sums its unrolled twin of the host
-`ordered_logjac`/`simplex_logjac` (shared coordinates via CSE).
+`ordered_logjac`/`simplex_logjac` (shared coordinates via CSE); an LKJ
+entry sums its unrolled twin of the host `lkj_chol_logjac` (named
+theta/sigma temps, shared with the constrain edges).
 """
 function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing
     if e.kind === :coefficient
         throw(ContractValidationError("[layout] non-identity coefficient block"))
+    end
+    if e.kind === :ranef_corr
+        K = _lkj_dim(e.size)
+        K == 1 && return nothing
+        L = e.name
+        LOGPI = log(Float64(pi))
+        terms = Any[]
+        for i in 2:K, j in 1:i-1
+            s = _rsg_name(L, i, j)
+            t = _rth_name(L, i, j)
+            push!(terms, :($(i - 1 - j) * log(sin($t)) + $LOGPI + log($s) +
+                log1p(-$s)))
+        end
+        return foldl((a, b) -> :($a + $b), terms)
     end
     if e.kind === :vector
         if e.transform === :ordered
@@ -667,7 +991,7 @@ function jacobian_term(e::LayoutEntry)
         # its companion `logjac` plate from `_plate_transform_statements`.
         # Spline vectors share the shape (their supports never reach
         # :interval, but the arm stays correct if that ever changes), as do
-        # ranef `xi` vectors (always `:identity` in Stage B).
+        # ranef vectors (`xi`/`z_flat` identity, `tau` exp).
         if e.transform === :interval
             blo, bhi = e.lo, e.hi
             return :(sum(log.($(e.name) .- $blo) .+ log.($bhi .- $(e.name)) .-

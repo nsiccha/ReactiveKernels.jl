@@ -150,9 +150,11 @@ end
 Restore named constrained parameters from an unconstrained draws matrix `U`
 (`layout.total` rows × draws columns, e.g. HMC output). Returns a NamedTuple
 with one entry per layout entry — coefficient predictors map to
-`(size × draws)` matrices, sampled parameters to length-`draws` vectors —
-keyed exactly as [`constrain`](@ref). Each column is constrained
-independently through `constrain`, so transforms stay single-sourced.
+`(size × draws)` matrices, sampled parameters to length-`draws` vectors,
+LKJ factors and derived correlated draws (`constrain`'s `L`/`b` matrices)
+to vectors of matrices — keyed exactly as [`constrain`](@ref). Each column
+is constrained independently through `constrain`, so transforms stay
+single-sourced.
 """
 function restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real})
     size(U, 1) == layout.total || throw(ContractValidationError(
@@ -163,9 +165,18 @@ function restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real})
         for e in layout.entries
             if e.kind === :coefficient
                 push!(pairs, e.predictor => Matrix{Float64}(undef, e.size, 0))
+            elseif e.kind === :ranef_corr
+                push!(pairs, e.name => Vector{Matrix{Float64}}(undef, 0))
             else
                 push!(pairs, e.name => Vector{Float64}(undef, 0))
             end
+        end
+        # Derived draws ride at the end, exactly as `constrain` orders them.
+        for e in layout.entries
+            e.kind === :ranef_corr || continue
+            sfx = string(e.name)[3:end]
+            push!(pairs, Symbol("b_", sfx) =>
+                Vector{Matrix{Float64}}(undef, 0))
         end
         return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
     end
@@ -178,6 +189,8 @@ function restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real})
         v = first_nt[k]
         v isa AbstractVector ?
             hcat([Vector{Float64}(nt[k]) for nt in nts]...) :
+            v isa AbstractMatrix ?
+            [Matrix{Float64}(nt[k]) for nt in nts] :
             Float64[nt[k] for nt in nts]
     end
     return NamedTuple{names}(Tuple(cols))
