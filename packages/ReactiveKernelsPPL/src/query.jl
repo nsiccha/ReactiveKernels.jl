@@ -102,6 +102,10 @@ plus a `prepare_ad` gradient with `active = :unconstrained`. `u0` is a
 length-consistent type/shape exemplar (checked against `layout.total`
 before any preparation work); `backend` is any
 `DifferentiationInterface.AbstractADType` (e.g. `AutoEnzyme` reverse mode).
+The backend's package must be loaded in the calling session (`using Enzyme`
+for `AutoEnzyme`); the backend value alone does not load
+DifferentiationInterface's backend extension, and preparation without it
+fails loudly naming the missing `using`.
 """
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
         backend)

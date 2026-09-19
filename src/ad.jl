@@ -343,9 +343,65 @@ function _ad_resolver(spec::KernelSpec)
     _kernel_signature_callable(tuple, spec.call_signature)
 end
 
+# DifferentiationInterface provides each backend's preparation methods through
+# the backend package's own extension (e.g. `using Enzyme` loads
+# `DifferentiationInterfaceEnzymeExt`); constructing the backend value alone —
+# `AutoEnzyme()` needs only ADTypes — is not enough. Without the extension,
+# preparation dies inside DifferentiationInterface with a bare `MethodError`
+# on an internal `_prepare_pullback_aux` / `_prepare_pushforward_aux` symbol,
+# so every entry point that hands a caller backend to DifferentiationInterface
+# checks first and names the missing `using` instead. The backend-type naming
+# rule mirrors DifferentiationInterface's own `required_packages`; a backend
+# shape this cannot derive fails open and DifferentiationInterface speaks.
+function _ad_required_packages(backend::DifferentiationInterface.AbstractADType)
+    packages = String[]
+    _ad_required_packages!(packages, typeof(backend)) || return nothing
+    return packages
+end
+
+function _ad_required_packages!(packages, ::Type{B}) where {B}
+    parameters = B isa DataType ? B.parameters : ()
+    if (nameof(B) === :SecondOrder || nameof(B) === :MixedMode) &&
+            length(parameters) == 2 && parameters[1] isa DataType &&
+            parameters[2] isa DataType
+        return _ad_required_packages!(packages, parameters[1]) &&
+            _ad_required_packages!(packages, parameters[2])
+    elseif nameof(B) === :AutoSparse && length(parameters) == 1 &&
+            parameters[1] isa DataType
+        "SparseMatrixColorings" in packages ||
+            push!(packages, "SparseMatrixColorings")
+        return _ad_required_packages!(packages, parameters[1])
+    end
+    name = String(nameof(B))
+    startswith(name, "Auto") || return false
+    package = name[5:end]
+    isempty(package) && return false
+    package in packages || push!(packages, package)
+    return true
+end
+
+function _ad_require_backend_packages(
+        backend::DifferentiationInterface.AbstractADType)
+    required = _ad_required_packages(backend)
+    required === nothing && return nothing
+    loaded = Set{String}()
+    for loaded_module in values(Base.loaded_modules)
+        push!(loaded, String(nameof(loaded_module)))
+    end
+    missing = filter(package -> !(package in loaded), required)
+    isempty(missing) && return nothing
+    imports = join(missing, ", ")
+    throw(ArgumentError(
+        "AD preparation with backend `$backend` requires the backend " *
+        "package to be loaded (`using $imports`); constructing the " *
+        "backend value alone does not load DifferentiationInterface's " *
+        "backend extension, which provides the preparation methods"))
+end
+
 function _prepare_ad(kernel::PreparedKernel, resolver,
                      backend::DifferentiationInterface.AbstractADType,
                      args::Tuple, kwargs::NamedTuple, active)
+    _ad_require_backend_packages(backend)
     resolved = _ad_resolve(resolver, args, kwargs)
     call, point, contexts, active_index, external_values =
         _ad_call(kernel, resolved, active)
@@ -360,6 +416,7 @@ end
 function _prepare_ad_pullback(kernel::PreparedKernel, resolver,
                               backend::DifferentiationInterface.AbstractADType,
                               seed, args::Tuple, kwargs::NamedTuple, active)
+    _ad_require_backend_packages(backend)
     resolved = _ad_resolve(resolver, args, kwargs)
     call, point, contexts, active_index, external_values =
         _ad_call(kernel, resolved, active; scalar_output = false)
@@ -382,6 +439,11 @@ on every call and passed as `Constant` contexts.
 The ordinary authored call surface is preserved: positional defaults and
 keyword HAVE ports are resolved exactly as they are by `prepare(spec)`. The
 preparation arguments are type/shape exemplars, not frozen data.
+
+The backend's package must be loaded in the calling session (`using Enzyme`
+for `AutoEnzyme`); the backend value alone does not load
+DifferentiationInterface's backend extension, and preparation without it
+fails loudly naming the missing `using`.
 
 A non-empty `bound` NamedTuple runs the [`partial_evaluation`](@ref) pre-pass
 first: the named ports are fixed to the supplied values, their data-only
@@ -412,6 +474,11 @@ end
 Prepare a reusable gradient for a low-level [`PreparedKernel`](@ref) whose
 boundary is already fully selected. Such kernels accept only their positional
 HAVE values and must expose exactly one scalar WANT.
+
+The backend's package must be loaded in the calling session (`using Enzyme`
+for `AutoEnzyme`); the backend value alone does not load
+DifferentiationInterface's backend extension, and preparation without it
+fails loudly naming the missing `using`.
 """
 function prepare_ad(kernel::PreparedKernel,
                     backend::DifferentiationInterface.AbstractADType,
@@ -526,6 +593,11 @@ Prepare a reusable reverse pullback (vector-Jacobian product) for one explicit
 `want` port. `seed` is an exemplar output cotangent. Unlike [`prepare_ad`](@ref),
 the selected WANT may be non-scalar. Exactly one HAVE port is active and all
 other current HAVE values are rebound as `Constant` contexts on every call.
+
+The backend's package must be loaded in the calling session (`using Enzyme`
+for `AutoEnzyme`); the backend value alone does not load
+DifferentiationInterface's backend extension, and preparation without it
+fails loudly naming the missing `using`.
 """
 function prepare_ad_pullback(
         spec::KernelSpec, backend::DifferentiationInterface.AbstractADType,
@@ -557,10 +629,15 @@ form selects an explicit scalar `want` and preserves authored defaults and
 keywords. The low-level `PreparedKernel` form requires an already selected,
 positional, single-scalar boundary. The reusable form uses a
 [`PreparedADKernel`](@ref) returned by [`prepare_ad`](@ref).
+
+The one-shot forms require the backend's package to be loaded in the calling
+session (`using Enzyme` for `AutoEnzyme`); the backend value alone does not
+load DifferentiationInterface's backend extension.
 """
 function ad_gradient(spec::KernelSpec,
                      backend::DifferentiationInterface.AbstractADType,
                      args...; active, want, bound = NamedTuple(), kwargs...)
+    _ad_require_backend_packages(backend)
     kernel = _ad_spec_kernel(spec, want, bound)
     if !isempty(bound)
         _ad_reject_bound_keywords(NamedTuple(kwargs))
@@ -578,6 +655,7 @@ end
 function ad_gradient(kernel::PreparedKernel,
                      backend::DifferentiationInterface.AbstractADType,
                      args...; active, kwargs...)
+    _ad_require_backend_packages(backend)
     isempty(kwargs) || throw(ArgumentError(
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
@@ -640,10 +718,15 @@ Evaluate a reverse pullback for one output cotangent `seed`, returning the
 cotangent of the selected active HAVE port. For a vector-valued WANT this is the
 vector-Jacobian product `J' * seed`; constructing a full Jacobian still requires
 multiple seeds.
+
+The one-shot forms require the backend's package to be loaded in the calling
+session (`using Enzyme` for `AutoEnzyme`); the backend value alone does not
+load DifferentiationInterface's backend extension.
 """
 function ad_pullback(spec::KernelSpec,
                      backend::DifferentiationInterface.AbstractADType,
                      seed, args...; active, want, kwargs...)
+    _ad_require_backend_packages(backend)
     kernel = _ad_spec_kernel(spec, want)
     resolver = _ad_resolver(spec)
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
@@ -657,6 +740,7 @@ end
 function ad_pullback(kernel::PreparedKernel,
                      backend::DifferentiationInterface.AbstractADType,
                      seed, args...; active, kwargs...)
+    _ad_require_backend_packages(backend)
     isempty(kwargs) || throw(ArgumentError(
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
