@@ -15,12 +15,12 @@ include("test_gp.jl")
 include("test_spline.jl")
 include("test_hsgp.jl")
 include("test_kernel.jl")
+include("test_me.jl")
 include("test_monotonic.jl")
 include("test_r2d2.jl")
 include("test_corpus.jl")
 include("test_report.jl")
 include("test_scan.jl")
-include("test_report.jl")
 
 @testset "package skeleton" begin
     @test isdefined(ReactiveKernelsPPL, :ReactiveKernels)

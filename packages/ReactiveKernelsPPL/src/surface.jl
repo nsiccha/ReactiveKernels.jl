@@ -211,7 +211,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # referencing a coefficient candidate (Normal-priored or free name).
     # All other vector definitions stay symbolic as named locals.
     structural = _structural_defs(det, data, canonmap, normal_priors,
-        prior_names)
+        prior_names, plate_names)
     vecdefs = Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :vector)
     taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names,
         plate_names)
@@ -516,16 +516,18 @@ const _KNOWN_VALUE_FNS = union(Set{Symbol}(ASSIGNMENT_FNS),
     Set{Symbol}((:ifelse,)))
 
 # Structural definitions: anything transitively referencing a coefficient
-# candidate (a Normal-priored sampled name or a free name — data, det, and
-# other sampled names excluded). Structural definitions inline into
-# predictors; every other definition keeps its binding as a kernel local.
-function _structural_defs(det, data, canonmap, normal_priors, prior_names)
+# candidate (a Normal-priored sampled name or a free name — data, det,
+# per-cell latents, and other sampled names excluded). Structural
+# definitions inline into predictors; every other definition keeps its
+# binding as a kernel local.
+function _structural_defs(det, data, canonmap, normal_priors, prior_names,
+        plate_names)
     detkeys = Set{Symbol}(nm for (nm, _) in det)
     structural = Set{Symbol}()
     for (nm, _) in det
         refs = _value_symbols(canonmap[nm])
         if any(s -> s in normal_priors ||
-                _is_free_name(s, data, detkeys, prior_names), refs)
+                _is_free_name(s, data, detkeys, prior_names, plate_names), refs)
             push!(structural, nm)
         end
     end
@@ -543,10 +545,11 @@ function _structural_defs(det, data, canonmap, normal_priors, prior_names)
     return structural
 end
 
-function _is_free_name(s::Symbol, data, detkeys, prior_names)
+function _is_free_name(s::Symbol, data, detkeys, prior_names, plate_names)
     s in data && return false
     s in detkeys && return false
     s in prior_names && return false
+    s in plate_names && return false
     s in _KNOWN_VALUE_FNS && return false
     return true
 end
@@ -3040,11 +3043,15 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
     # (`theta[i] = mu .+ tau .* z[i]` then `y[i] ~ Normal.(theta[i], s)` — the
     # non-centered / latent-transform shape, emitted as a derived column and
     # referenced directly). A derived location with NO latent stays a design
-    # predictor; mixed latent+fixed BARE-expression locations are a later slice.
+    # predictor; a latent-reading definition WITH coefficient structure is a
+    # design predictor too (`b .* theta` classifies as a ContinuousTerm over
+    # the latent — the SB `me` mirror), while a bare latent inside a larger
+    # expression fails in `_classify_symbol`.
     if loc isa Symbol && loc in ctx.plate_names
         return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
     end
-    if loc isa Symbol && haskey(ctx.detmap, loc) && _derived_reads_latent(loc, ctx)
+    if loc isa Symbol && haskey(ctx.detmap, loc) && _derived_reads_latent(loc, ctx) &&
+            !_is_design_shaped(loc, ctx)
         return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
     end
     if loc isa Symbol
@@ -3067,7 +3074,9 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         _sfail("response $lhs location is a literal — use an intercept-only " *
                "predictor (`eta = a`)")
     else
-        _reject_plate_in_predictor(lhs, loc, ctx)
+        # Per-cell latents classify inline like data columns: `b .* x_true`
+        # is a ContinuousTerm over the latent (the SB `me` mirror); a bare
+        # latent fails in `_classify_symbol`, never silently.
         # Multi-eta responses (CategoricalLogit) index their synthetic
         # predictors; the single-eta default keeps its established name.
         pname = synth === nothing ? Symbol(lhs, "_eta") : synth
@@ -3093,6 +3102,78 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
     push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
     pred_idx[pname] = length(predictors)
     return pname
+end
+
+# A latent-reading definition is a DESIGN predictor (not a latent transform)
+# when it has coefficient structure (a Normal-priored or free coefficient
+# candidate), reads no scalar parameter (a non-coefficient sampled name
+# like the non-centered `tau` — any such read marks a latent transform),
+# and scales every latent it mentions by a coefficient (the SB `me`
+# `a .+ b .* x_true` shape). Anything else latent-reading stays a
+# LatentTerm location (the conservative pre-me behavior).
+_is_design_shaped(name::Symbol, ctx) =
+    name in ctx.structural && !_det_reads_param(name, ctx) &&
+    _latent_uses_scaled(name, ctx)
+
+# Every per-cell latent mention in the (inlined) definition is scaled by a
+# coefficient (`b .* theta`): the summand split mirrors `_analyze_predictor`
+# (inlining is idempotent — re-running it there re-absorbs the same names).
+function _latent_uses_scaled(name::Symbol, ctx)
+    rhs = _inline_structure(ctx.detmap[name], ctx, Set{Symbol}([name]),
+        "predictor $name")
+    out = Tuple{Int,Any}[]
+    _collect_signed!(out, rhs, 1, name)
+    for (_, core) in out
+        _summand_latent_scaled(core, ctx) || return false
+    end
+    return true
+end
+
+# A summand is latent-scaled when no per-cell latent appears in it except
+# as a factor of a dotted product with a coefficient (`b .* theta`, with
+# data/local/vector factors alongside at most): bare latents, latents
+# under any other operator, and parameter/computed scalings mark a latent
+# transform instead.
+function _summand_latent_scaled(core, ctx)
+    core isa Symbol && return core ∉ ctx.plate_names
+    core isa Expr || return true
+    if core.head === :call && !isempty(core.args) && core.args[1] === :.*
+        any(f -> f isa Symbol && f in ctx.plate_names,
+            core.args[2:end]) || return true
+        coefs = 0
+        for f in core.args[2:end]
+            if f isa Symbol
+                k = _summand_kind(f, ctx)
+                (k === :coef || k === :latent || k === :data ||
+                    k === :local) || return false
+                k === :coef && (coefs += 1)
+            elseif f isa Number
+                return false
+            else
+                _canon_shape(f, ctx.data, ctx.detshape) === :vector ||
+                    return false
+                any(s -> s in ctx.plate_names, _value_symbols(f)) &&
+                    return false
+            end
+        end
+        return coefs >= 1
+    end
+    return all(s -> s ∉ ctx.plate_names, _value_symbols(core))
+end
+
+# Does a definition transitively read a scalar parameter (a sampled name
+# that is NOT a Normal-priored coefficient candidate)?
+function _det_reads_param(name::Symbol, ctx)
+    seen = Set{Symbol}((name,))
+    stack = collect(_value_symbols(ctx.detmap[name]))
+    while !isempty(stack)
+        s = pop!(stack)
+        s in seen && continue
+        push!(seen, s)
+        s in ctx.prior_names && s ∉ ctx.normal_priors && return true
+        haskey(ctx.detmap, s) && append!(stack, _value_symbols(ctx.detmap[s]))
+    end
+    return false
 end
 
 # Does a derived column transitively read a per-cell latent (plate parameter)?
@@ -3124,19 +3205,6 @@ function _lower_location_symbol_error(lhs, loc, ctx)
         "scalar parameter cannot vary per observation")
     return _sfail("response $lhs location $loc is not a predictor " *
                   "definition (`$loc = ...` affine in data)")
-end
-
-# A per-cell latent is a bare whole location in slice-1; a latent buried in a
-# predictor expression (mixed latent + fixed effects) is a later increment.
-function _reject_plate_in_predictor(lhs, loc, ctx)
-    for s in _value_symbols(loc)
-        s in ctx.plate_names && _sfail(
-            "response $lhs location $(repr(loc)) combines the per-cell latent " *
-            "$s with other predictor structure — a latent is a bare location " *
-            "in slice-1 (`y[i] ~ Normal.($s[i], s)`); mixed latent + " *
-            "fixed-effect predictors are planned")
-    end
-    return nothing
 end
 
 function _record_coefuses!(coefuse, pname, uses, lhs)
@@ -3334,7 +3402,7 @@ function _classify_summand(pname, core, sign::Int, ctx)
     detkeys = Set{Symbol}(keys(ctx.detmap))
     coefrefs = Symbol[s for s in _value_symbols(core)
         if s in ctx.normal_priors ||
-            _is_free_name(s, ctx.data, detkeys, ctx.prior_names)]
+            _is_free_name(s, ctx.data, detkeys, ctx.prior_names, ctx.plate_names)]
     length(coefrefs) > 1 && _sfail("predictor $pname: $(repr(core)) is " *
                                    "nonlinear in coefficients")
     length(coefrefs) == 1 && _sfail(
@@ -3611,6 +3679,9 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     (core in ctx.data || core in ctx.vecdefs) &&
         return TermSpec(OffsetTerm, [core], NamedTuple(),
         core, Symbol(core, "_off")), nothing
+    core in ctx.plate_names && _sfail(
+        "predictor $pname: bare latent $core is not a term — scale it " *
+        "by a coefficient (`b .* $core`, the SB `me` mirror)")
     core in ctx.scan_states && _sfail("predictor $pname: $core is a bare " *
         "scan state — LP use needs a sampled coefficient (`b .* $core` " *
         "in an additive position); a bare scan state is only a direct " *
@@ -3665,7 +3736,10 @@ function _classify_product(pname, core::Expr, sign::Int, ctx)
             k = _summand_kind(g, ctx)
             if k === :coef
                 push!(coefs, g)
-            elseif k === :data || k === :local
+            elseif k === :data || k === :local || k === :latent
+                # A per-cell latent scales like a data column (`b .* x_true`
+                # — the SB `me` mirror): the ContinuousTerm below names the
+                # latent vector and the coefficient stays free.
                 push!(values, g)
             elseif k === :number
                 _sfail("predictor $pname: literal scaling in " *
@@ -3741,6 +3815,7 @@ function _summand_kind(s::Symbol, ctx)
     s in ctx.vecdefs && return :local
     haskey(ctx.detmap, s) && return :det
     s in ctx.prior_names && s ∉ ctx.normal_priors && return :param
+    s in ctx.plate_names && return :latent
     return :coef
 end
 function _summand_kind(n::Number, ctx)

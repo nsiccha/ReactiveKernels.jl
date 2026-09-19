@@ -627,10 +627,11 @@ _predictor(plan::StructuralPlan, name::Symbol) =
     only(p for p in plan.predictors if p.name === name)
 
 # The per-observation location node feeding a response's likelihood plate: a
-# scan-state latent vector fed directly (its own name — the layout view), or a
-# linear predictor's `_ppl_lp_<name>` node otherwise.
+# scan-state or per-cell (plate) latent vector fed directly (its own name —
+# the layout view), or a linear predictor's `_ppl_lp_<name>` node otherwise.
 function _location_node(r::LikelihoodSpec, plan::StructuralPlan)
     any(s -> s.state === r.predictor, plan.scans) && return r.predictor
+    _is_plate_param(plan, r.predictor) && return r.predictor
     return _lp_name(_predictor(plan, r.predictor))
 end
 
