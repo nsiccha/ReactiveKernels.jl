@@ -720,6 +720,30 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+# The per-observation scale generalizes past Gaussian: an NB2 dispersion `phi`
+# (and, symmetrically, a Gamma shape `alpha`) may also be a per-obs data column.
+# It threads through the NB2 likelihood plate per cell exactly like the scale.
+@testset "NB2 per-observation dispersion column" begin
+    x = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    ycount = [3, 1, 6, 2, 1, 4]
+    phicol = [2.0, 3.0, 1.5, 2.5, 4.0, 1.0]
+    plan0 = lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ NegativeBinomial2.(exp.(mu), phi)
+    end, (:y, :x, :phi))
+    @test only(plan0.responses).scale === :phi
+    plan = bind_data(plan0,
+        Dict{Symbol,AbstractVector}(:y => ycount, :x => x, :phi => phicol))
+    built = build_kernel(plan)
+    u = [0.2, -0.1]
+    nt = constrain(built.layout, u)
+    coef = nt[:mu]
+    mu = exp.(coef[1] .+ coef[2] .* x)
+    ll = sum(logpdf.(NegativeBinomial.(phicol, phicol ./ (phicol .+ mu)), ycount))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "scan: centered AR(1) end to end" begin
     m = @rkppl begin
         phi ~ Normal(0, 1)
