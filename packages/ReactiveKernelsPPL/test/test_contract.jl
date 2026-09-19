@@ -129,9 +129,88 @@ function _gamma_plan(n = 9)
     )
 end
 
+function _bernoulli_probit_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([false, true], outer = cld(n, 2))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(BernoulliProbitFam, ProbitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        SampledParameter[],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _bernoulli_cloglog_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([0, 1], outer = cld(n, 2))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(BernoulliCloglogFam, CloglogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        SampledParameter[],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _binomial_probit_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([1, 0, 2], outer = cld(n, 3))[1:n]
+    cols[:n] = fill(4, n)
+    StructuralPlan(
+        [LikelihoodSpec(BinomialProbitFam, ProbitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, :n, nothing)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        SampledParameter[],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _binomial_cloglog_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([1, 0, 2], outer = cld(n, 3))[1:n]
+    cols[:n] = fill(4, n)
+    StructuralPlan(
+        [LikelihoodSpec(BinomialCloglogFam, CloglogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, :n, nothing)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        SampledParameter[],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _beta_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([0.2, 0.7, 0.4], outer = cld(n, 3))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, :kappa, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        [SampledParameter(:kappa, :gamma, (arg1 = 2.0, arg2 = 1000.0), nothing, :kappa)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
 @testset "contract admission predicates" begin
     @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
-        BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam)
+        BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
+        BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
+        BinomialCloglogFam, BetaLogitFam)
     @test admitted_terms() ==
         (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
     @test :log in admitted_functions()
@@ -152,6 +231,11 @@ end
     @test validate_plan(_binomial_plan()) === nothing
     @test validate_plan(_nb2_plan()) === nothing
     @test validate_plan(_gamma_plan()) === nothing
+    @test validate_plan(_bernoulli_probit_plan()) === nothing
+    @test validate_plan(_bernoulli_cloglog_plan()) === nothing
+    @test validate_plan(_binomial_probit_plan()) === nothing
+    @test validate_plan(_binomial_cloglog_plan()) === nothing
+    @test validate_plan(_beta_plan()) === nothing
 end
 
 @testset "link triples" begin
@@ -170,6 +254,68 @@ end
     # Binomial + log predictor link is not admitted either.
     bad = _binomial_plan()
     bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Slice-2 triples admit Identity predictor link only.
+    bad = _bernoulli_probit_plan()
+    bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _binomial_cloglog_plan()
+    bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _beta_plan()
+    bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Struct-path link-matching predlinks fail closed (same latent gap as
+    # slice-1 Binomial; the AST path is the real path).
+    bad = _bernoulli_probit_plan()
+    bad.predictors[1] = PredictorSpec(:eta, ProbitLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "slice-2 response validation" begin
+    # Probit/cloglog Binomial requires trials, like logit Binomial.
+    bad = _binomial_probit_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BinomialProbitFam, ProbitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _binomial_cloglog_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BinomialCloglogFam, CloglogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Probit/cloglog Bernoulli takes no trials.
+    bad = _bernoulli_probit_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BernoulliProbitFam, ProbitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, :n, nothing)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Beta requires its concentration kappa.
+    bad = _beta_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Beta response must be strictly inside (0, 1).
+    bad = _beta_plan()
+    bad.columns[:y] = fill(2, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _beta_plan()
+    bad.columns[:y] = fill(0.0, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _beta_plan()
+    bad.columns[:y] = fill(1.0, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _beta_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, :kappa, nothing,
+            ResponseEvidence(:truncated, 0.1, 0.9), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _bernoulli_probit_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BernoulliProbitFam, ProbitLink, :y, :eta, nothing, nothing,
+            ResponseEvidence(:censored, 0, 1), :y_resp)
     @test_throws ContractValidationError validate_plan(bad)
 end
 

@@ -1625,7 +1625,7 @@ function _dot2call_object_error(lhs, rhs)
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol && rhs.args[1] in
             (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
-                :Gamma, :weighted, :truncated, :censored,
+                :Gamma, :Beta, :weighted, :truncated, :censored,
                 :interval_censored)
         _sfail("response $lhs: broadcast the object " *
                "(`$(rhs.args[1]).(...)` — `.~` is elementwise)")
@@ -1669,7 +1669,8 @@ function _dot2call_nested_object(lhs, a)
 end
 
 function _dot2call_nested_link(lhs, a, base)
-    want = (base === :Bernoulli || base === :Binomial) ? :logistic : :exp
+    want = (base === :Bernoulli || base === :Binomial) ? "logistic/probit/cloglog" :
+        base === :Beta ? "logistic" : "exp"
     a isa Expr && a.head === :. && length(a.args) == 2 &&
         a.args[1] isa Symbol && a.args[2] isa Expr &&
         a.args[2].head === :tuple ||
@@ -1763,9 +1764,12 @@ end
 
 const _RESPONSE_BASE_MSG =
     "response distribution must be `Normal.(mu, sigma)`, " *
-    "`Bernoulli.(logistic.(eta))`, `Poisson.(exp.(eta))`, " *
-    "`Binomial.(n, logistic.(mu))`, `NegativeBinomial2.(exp.(eta), phi)` " *
-    "or `Gamma.(alpha, exp.(eta) ./ alpha)`"
+    "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link), " *
+    "`Poisson.(exp.(eta))`, `Binomial.(n, logistic.(mu))` (or " *
+    "`probit`/`cloglog` for the link), " *
+    "`NegativeBinomial2.(exp.(eta), phi)`, " *
+    "`Gamma.(alpha, exp.(eta) ./ alpha)`, or " *
+    "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`"
 
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
@@ -1775,7 +1779,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         _sfail("`weighted.(...)` goes outermost: " *
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
     fam in (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
-        :Gamma) || return _lower_response_base_error(lhs, rhs, fam)
+        :Gamma, :Beta) || return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
@@ -1784,14 +1788,14 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         _lower_scale(lhs, args[2], ctx), nothing
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
-                                    "`Bernoulli.(logistic.(eta))`")
-        return BernoulliLogitFam, LogitLink, IdentityLink,
-        _lower_link_arg(lhs, args[1], :logistic), nothing, nothing
+                                    "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link)")
+        f, l, loc = _lower_bernoulli_link(lhs, args[1])
+        return f, l, IdentityLink, loc, nothing, nothing
     elseif fam === :Binomial
         length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
-                                    "`Binomial.(n, logistic.(mu))`")
-        return BinomialLogitFam, LogitLink, IdentityLink,
-        _lower_link_arg(lhs, args[2], :logistic), nothing,
+                                    "`Binomial.(n, logistic.(mu))` (or `probit`/`cloglog` for the link)")
+        f, l, loc = _lower_binomial_link(lhs, args[2])
+        return f, l, IdentityLink, loc, nothing,
         _lower_trials(lhs, args[1], ctx)
     elseif fam === :NegativeBinomial2
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial2` takes " *
@@ -1802,6 +1806,9 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :Gamma
         loc, scale = _lower_gamma_args(lhs, args, ctx)
         return GammaLogFam, LogLink, LogLink, loc, scale, nothing
+    elseif fam === :Beta
+        loc, scale = _lower_beta_args(lhs, args, ctx)
+        return BetaLogitFam, LogitLink, IdentityLink, loc, scale, nothing
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
@@ -1839,18 +1846,54 @@ function _lower_gamma_args(lhs, args, ctx)
     loc = _lower_link_arg(lhs,
         _dot2call_nested_link(lhs, div.args[2], :Gamma), :exp)
     a2 = div.args[3]
-    _same_gamma_alpha(a1, a2) || _sfail(
+    _same_aux(a1, a2) || _sfail(
         "response $lhs: both `Gamma` positions must name the same alpha " *
         "(got $(repr(a1)) and $(repr(a2)))")
     return loc, _lower_scale(lhs, a1, ctx)
 end
 
-_same_gamma_alpha(a, b) =
+_same_aux(a, b) =
     a isa Symbol && b isa Symbol ? a === b :
     a isa Real && b isa Real ? a == b : false
 
+const _BETA_MSG = "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`"
+
+# Beta mean-concentration shape: both positions share the SAME mu expression
+# (structurally) and the SAME kappa (name or literal, Gamma-precedent check);
+# mu link is logistic only in slice 2. Arguments arrive in `:call` form
+# (dotted operators parse as calls); the nested `logistic.(mu)` stays dotted
+# and converts explicitly, mirroring `_lower_gamma_args`.
+function _lower_beta_args(lhs, args, ctx)
+    length(args) == 2 ||
+        _sfail("response $lhs: `Beta` takes $_BETA_MSG")
+    a1, a2 = args
+    a1 isa Expr && a1.head === :call && length(a1.args) == 3 &&
+        a1.args[1] === Symbol(".*") ||
+        _sfail("response $lhs: `Beta` first position is `mu .* kappa` " *
+               "(`$_BETA_MSG`), got $(repr(a1))")
+    a2 isa Expr && a2.head === :call && length(a2.args) == 3 &&
+        a2.args[1] === Symbol(".*") ||
+        _sfail("response $lhs: `Beta` second position is " *
+               "`(1 .- mu) .* kappa` (`$_BETA_MSG`), got $(repr(a2))")
+    c = a2.args[2]
+    c isa Expr && c.head === :call && length(c.args) == 3 &&
+        c.args[1] === Symbol(".-") && c.args[2] == 1 ||
+        _sfail("response $lhs: `Beta` second position is " *
+               "`(1 .- mu) .* kappa` (`$_BETA_MSG`), got $(repr(a2))")
+    m1, k1 = a1.args[2], a1.args[3]
+    m2, k2 = c.args[3], a2.args[3]
+    m1 == m2 || _sfail("response $lhs: both `Beta` positions must share " *
+                       "the same mu expression " *
+                       "(got $(repr(m1)) and $(repr(m2)))")
+    _same_aux(k1, k2) || _sfail(
+        "response $lhs: both `Beta` positions must name the same kappa " *
+        "(got $(repr(k1)) and $(repr(k2)))")
+    loc = _lower_link_arg(lhs, _dot2call_nested_link(lhs, m1, :Beta), :logistic)
+    return loc, _lower_scale(lhs, k1, ctx)
+end
+
 function _lower_response_base_error(lhs, rhs, fam)
-    fam in (:normal, :bernoulli, :poisson, :binomial, :gamma) && _sfail(
+    fam in (:normal, :bernoulli, :poisson, :binomial, :gamma, :beta) && _sfail(
         "response $lhs: use Distributions.jl constructors " *
         "(`Normal`, not `normal`)")
     fam === :negative_binomial2 && _sfail("response $lhs: use " *
@@ -1866,9 +1909,11 @@ function _lower_response_base_error(lhs, rhs, fam)
         "`NegativeBinomial2.(exp.(eta), phi)`")
     fam === :GammaLog && _sfail("response $lhs: write " *
                                 "`Gamma.(alpha, exp.(eta) ./ alpha)`")
+    fam === :BetaLogit && _sfail("response $lhs: write " *
+                                 _BETA_MSG)
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, Bernoulli, Poisson, Binomial, " *
-                  "NegativeBinomial2, Gamma). When `$fam` is a " *
+                  "NegativeBinomial2, Gamma, Beta). When `$fam` is a " *
                   "defined RKPPLSubmodel, a latent uses `latent ~ $fam(...)` " *
                   "and an observation stream uses plain `$lhs ~ $fam(...)` " *
                   "(the whole-column vectorized callee); an elementwise " *
@@ -1885,6 +1930,40 @@ function _lower_link_arg(lhs, arg, wrap)
     length(args) == 1 ||
         _sfail("response $lhs: `$wrap` takes exactly the predictor")
     return args[1]
+end
+
+# Bernoulli/Binomial link dispatch (logit + slice-2 probit/cloglog). The
+# wrapper arrives converted to `:call` by `_dot2call_nested_link`; unknown
+# wrappers fail here (the spine converter is wrapper-generic).
+const _BERNOULLI_LINKS = Dict{Symbol,Tuple{LikelihoodFamily,LinkFunction}}(
+    :logistic => (BernoulliLogitFam, LogitLink),
+    :probit => (BernoulliProbitFam, ProbitLink),
+    :cloglog => (BernoulliCloglogFam, CloglogLink),
+)
+const _BINOMIAL_LINKS = Dict{Symbol,Tuple{LikelihoodFamily,LinkFunction}}(
+    :logistic => (BinomialLogitFam, LogitLink),
+    :probit => (BinomialProbitFam, ProbitLink),
+    :cloglog => (BinomialCloglogFam, CloglogLink),
+)
+
+function _lower_bernoulli_link(lhs, arg)
+    arg isa Expr && arg.head === :call && !isempty(arg.args) &&
+        haskey(_BERNOULLI_LINKS, arg.args[1]) ||
+        _sfail("response $lhs: `Bernoulli` takes a link wrapper " *
+               "(`logistic.(eta)`, `probit.(eta)`, or `cloglog.(eta)`), " *
+               "got $(repr(arg))")
+    fam, link = _BERNOULLI_LINKS[arg.args[1]]
+    return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
+end
+
+function _lower_binomial_link(lhs, arg)
+    arg isa Expr && arg.head === :call && !isempty(arg.args) &&
+        haskey(_BINOMIAL_LINKS, arg.args[1]) ||
+        _sfail("response $lhs: `Binomial` probability takes a link wrapper " *
+               "(`logistic.(mu)`, `probit.(mu)`, or `cloglog.(mu)`), " *
+               "got $(repr(arg))")
+    fam, link = _BINOMIAL_LINKS[arg.args[1]]
+    return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
 end
 
 function _lower_scale(lhs, s, ctx)

@@ -867,3 +867,165 @@ end
     end
     @test_throws ContractValidationError build_kernel(mnc(; y = ydata))
 end
+
+function _gen_bernoulli_probit_plan(y)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BernoulliProbitFam, ProbitLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "bernoulli probit values and gradient" begin
+    for y in (repeat([false, true], 3), repeat([0, 1], 3))
+        plan = _gen_bernoulli_probit_plan(y)
+        built = build_kernel(plan)
+        u = [0.25, 0.5]
+        nt = constrain(built.layout, u)
+        eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+        ll = sum(logpdf.(Bernoulli.(cdf.(Ref(Normal()), eta)), plan.columns[:y]))
+        pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+        @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    end
+    plan = _gen_bernoulli_probit_plan(repeat([false, true], 3))
+    built = build_kernel(plan)
+    _check_gradient(built.spec, plan, [0.25, 0.5])
+end
+
+function _gen_bernoulli_cloglog_plan(y)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BernoulliCloglogFam, CloglogLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "bernoulli cloglog values and gradient" begin
+    for y in (repeat([false, true], 3), repeat([0, 1], 3))
+        plan = _gen_bernoulli_cloglog_plan(y)
+        built = build_kernel(plan)
+        u = [0.25, 0.5]
+        nt = constrain(built.layout, u)
+        eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+        ll = sum(logpdf.(Bernoulli.(1 .- exp.(-exp.(eta))), plan.columns[:y]))
+        pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+        @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    end
+    plan = _gen_bernoulli_cloglog_plan(repeat([false, true], 3))
+    built = build_kernel(plan)
+    _check_gradient(built.spec, plan, [0.25, 0.5])
+end
+
+function _gen_binomial_probit_plan(y, ntrials)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    cols[:n] = ntrials
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BinomialProbitFam, ProbitLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp, :n, nothing)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "binomial probit values and gradient" begin
+    plan = _gen_binomial_probit_plan([1, 0, 2, 1, 3, 2], [3, 2, 4, 3, 5, 4])
+    built = build_kernel(plan)
+    u = [0.25, 0.5]
+    nt = constrain(built.layout, u)
+    eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+    ll = sum(logpdf.(Binomial.(plan.columns[:n], cdf.(Ref(Normal()), eta)),
+        plan.columns[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_binomial_cloglog_plan(y, ntrials)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    cols[:n] = ntrials
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BinomialCloglogFam, CloglogLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp, :n, nothing)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "binomial cloglog values and gradient" begin
+    plan = _gen_binomial_cloglog_plan([1, 0, 2, 1, 3, 2], [3, 2, 4, 3, 5, 4])
+    built = build_kernel(plan)
+    u = [0.25, 0.5]
+    nt = constrain(built.layout, u)
+    eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+    ll = sum(logpdf.(Binomial.(plan.columns[:n], 1 .- exp.(-exp.(eta))),
+        plan.columns[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_beta_plan(y)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, :kappa,
+            nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[SampledParameter(:kappa, :gamma,
+            (arg1 = 2.0, arg2 = 1000.0), nothing, :kappa)],
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "beta values and gradient" begin
+    plan = _gen_beta_plan([0.2, 0.7, 0.4, 0.6, 0.3, 0.8])
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+    mu = 1 ./ (1 .+ exp.(-eta))
+    k = nt.kappa
+    ll = sum(logpdf.(Beta.(mu .* k, (1 .- mu) .* k), plan.columns[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Gamma(2.0, 1000.0), k)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3]
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "beta weighted values" begin
+    plan = _gen_beta_plan([0.2, 0.7, 0.4, 0.6, 0.3, 0.8])
+    plan.columns[:w] = [1.0, 2.0, 1.0, 2.0, 1.0, 2.0]
+    plan.responses[1] = LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, :kappa,
+        :w, _none_evidence(), :y_resp)
+    validate_plan(plan)
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+    mu = 1 ./ (1 .+ exp.(-eta))
+    k = nt.kappa
+    ll = sum(plan.columns[:w] .*
+        logpdf.(Beta.(mu .* k, (1 .- mu) .* k), plan.columns[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Gamma(2.0, 1000.0), k)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3]
+    _check_gradient(built.spec, plan, u)
+end
