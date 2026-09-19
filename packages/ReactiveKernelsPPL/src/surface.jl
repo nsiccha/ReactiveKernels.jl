@@ -724,7 +724,13 @@ function _lower_bucket(st::Expr, line::Int, data::Set{Symbol},
     for (t, _) in slices
         _claim!(seen, seelines, Symbol("r_$(t)_" * suffix), line)
     end
-    return RanefBucket(key[1], group, kind, margins, slices, eta, label)
+    b = RanefBucket(key[1], group, kind, margins, slices, eta, label)
+    if kind === :intercept1 || kind === :slope1
+        for nm in _ranef_k1_names(b)
+            _claim!(seen, seelines, nm, line)
+        end
+    end
+    return b
 end
 
 # One margin element: `1` (intercept), a bare data column (continuous Z),

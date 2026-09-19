@@ -867,6 +867,28 @@ end
 # provable without data. Slice ranges partition 1:K contiguously in body
 # order (SB's static per-target ranges); every slice is gathered at least
 # once (a dangling bucket samples dead parameters).
+# K=1 bucket suffix (SB `r_<target>_<suffix>` vocabulary): the group for
+# plain buckets, `id_group` for `|ID|` buckets. K=1 kinds are always
+# plain, so their suffix is always the group — but the rule is total.
+_ranef_bucket_suffix(b::RanefBucket) =
+    b.id === nothing ? string(b.group) : string(b.id) * "_" * string(b.group)
+
+# K=1 sampled names, derived purely from the bucket key + kind (SB
+# `ranef_intercept`/`ranef_slope` vocabulary): the scalar scale
+# (`log_scale_<s>` / `tau_<s>`) and the G-vector (`xi_<s>`). Single
+# source for surface claims, name tables, layout, and the generator.
+# Correlated buckets own no Stage-B names (their LKJ/tau/z geometry
+# lands in Stage C).
+function _ranef_k1_names(b::RanefBucket)
+    (b.kind === :intercept1 || b.kind === :slope1) ||
+        _fail(b.label, "bucket kind $(b.kind) owns no K=1 sampled names " *
+              "(LKJ-correlated geometry lands in Stage C)")
+    s = _ranef_bucket_suffix(b)
+    scale = b.kind === :intercept1 ? Symbol("log_scale_", s) :
+        Symbol("tau_", s)
+    return (scale, Symbol("xi_", s))
+end
+
 function _validate_ranef_buckets(plan::StructuralPlan)
     buckets = plan.ranef_buckets
     keys = [(b.id, b.group) for b in buckets]
@@ -1204,6 +1226,9 @@ function _validate_name_tables(plan::StructuralPlan)
     scanstates = [s.state for s in plan.scans]
     vectors = [p.name for p in plan.vector_parameters]
     svec = [v.name for v in plan.spline_vectors]
+    k1 = Symbol[nm for b in plan.ranef_buckets
+        if b.kind === :intercept1 || b.kind === :slope1
+        for nm in _ranef_k1_names(b)]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
@@ -1217,6 +1242,8 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate vector-parameter names")
     length(unique(svec)) == length(svec) ||
         _fail(:plan, "duplicate spline-vector names")
+    length(unique(k1)) == length(k1) ||
+        _fail(:plan, "duplicate K=1 ranef names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
         (assigns, deriveds, "assignments and derived columns"),
@@ -1237,24 +1264,31 @@ function _validate_name_tables(plan::StructuralPlan)
         (svec, deriveds, "spline vectors and derived columns"),
         (svec, plates, "spline vectors and plate parameters"),
         (svec, scanstates, "spline vectors and scan states"),
-        (vectors, svec, "vector parameters and spline vectors"))
+        (vectors, svec, "vector parameters and spline vectors"),
+        (k1, params, "K=1 ranef names and parameters"),
+        (k1, assigns, "K=1 ranef names and assignments"),
+        (k1, deriveds, "K=1 ranef names and derived columns"),
+        (k1, plates, "K=1 ranef names and plate parameters"),
+        (k1, scanstates, "K=1 ranef names and scan states"),
+        (k1, vectors, "K=1 ranef names and vector parameters"),
+        (k1, svec, "K=1 ranef names and spline vectors"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
     allnames = union(params, assigns, deriveds, plates, scanstates, vectors,
-        svec)
+        svec, k1)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/spline name",
+            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/spline/ranef name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived/plate/scan/vector/spline $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate/scan/vector/spline/ranef $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, k1))
         _check_name_hygiene(n)
     end
     return nothing

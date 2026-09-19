@@ -24,10 +24,10 @@ function build_kernel(plan::StructuralPlan)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
-    isempty(plan.ranef_buckets) || throw(ContractValidationError(
-        "[generator] ranef codegen is not Stage A (K=1 geometry lands in " *
-        "Stage B, LKJ-correlated in Stage C) — refusing to silently drop " *
-        "$(length(plan.ranef_buckets)) bucket(s)"))
+    ncorr = count(b -> b.kind === :correlated, plan.ranef_buckets)
+    ncorr == 0 || throw(ContractValidationError(
+        "[generator] LKJ-correlated ranef codegen is Stage C — refusing " *
+        "to silently drop $ncorr correlated bucket(s)"))
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
@@ -50,6 +50,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     end
     append!(stmts, _assignment_statements(plan))
     append!(stmts, preprocessing_recipes(plan))
+    append!(stmts, _ranef_statements(plan))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _likelihood_statements(plan))
     append!(stmts, _prior_statements(plan, layout))
@@ -143,6 +144,13 @@ function _predictor_statements(plan::StructuralPlan)
             b.kind === SplineSummandTerm &&
                 push!(terms, _spline_summand_expr(plan, b.column))
         end
+        # A gather contributes its bucket's direct `r` expression (SB's
+        # `r_<target>_<suffix>` summand), resolved from the TERMS — the
+        # (bucket_id, bucket_group) key does not fit a design block.
+        for t in pred.terms
+            t.kind === RanefGatherTerm &&
+                push!(terms, _ranef_gather_expr(plan, t))
+        end
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
         rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
@@ -182,6 +190,64 @@ function _spline_summand_expr(plan::StructuralPlan, id::Symbol)
         end
     end
     return foldl((a, b) -> :($a .+ $b), parts)
+end
+
+# Group-index encoder nodes, one per grouped column (`_ppl_gidx_<group>`):
+# an in-graph indicator sum over the bind-known `_grouping_levels`
+# order (same helper the data validator uses, so the order agrees by
+# construction). Data-only, hence bound-folded; strings are native-only,
+# exactly like factor contrasts. Correlated buckets get no encoder
+# (their gathers fail loudly at emission; Stage C owns them).
+function _ranef_statements(plan::StructuralPlan)
+    stmts = Expr[]
+    groups = Symbol[]
+    for b in plan.ranef_buckets
+        b.kind === :correlated && continue
+        b.group in groups && continue
+        push!(groups, b.group)
+        levels = _grouping_levels(plan.columns[b.group])
+        parts = Any[Expr(:call, :.*, Expr(:call, :.==, b.group,
+            _level_literal(lv)), j) for (j, lv) in enumerate(levels)]
+        idx = foldl((a, c) -> Expr(:call, :.+, a, c), parts)
+        push!(stmts, Expr(:(=), Symbol(:_ppl_gidx_, b.group), idx))
+    end
+    return stmts
+end
+
+function _gather_bucket(plan::StructuralPlan, t::TermSpec)
+    i = findfirst(b -> b.id === t.options.bucket_id &&
+        b.group === t.options.bucket_group, plan.ranef_buckets)
+    i === nothing && throw(ContractValidationError(
+        "[generator] gather addresses unknown bucket " *
+        "($(t.options.bucket_id), $(t.options.bucket_group))"))
+    return plan.ranef_buckets[i]
+end
+
+# One margin's Z as an rvalue: bare columns stay bare (raw ports and
+# derived locals alike); dummies compare against the bind-known level
+# value. `:ones` never reaches emission (an intercept needs no Z
+# multiply, and slope1 margins are never `:ones` by kind dispatch).
+function _ranef_z_expr(z::RanefZRecipe)
+    z.kind === :column && return z.column
+    z.kind === :dummy &&
+        return Expr(:call, :.==, z.column, _level_literal(z.level))
+    throw(ContractValidationError(
+        "[generator] internal: ones-Z reached gather emission"))
+end
+
+# One bucket's direct `r` summand, SB-literal (`sbimpl.jl`
+# `ranef_intercept`/`ranef_slope`, including association order — no `b`
+# node, the draws stay implicit): intercept
+# `exp(log_scale) * xi[idx]`, slope `tau * (xi[idx] .* Z)`.
+function _ranef_gather_expr(plan::StructuralPlan, t::TermSpec)
+    b = _gather_bucket(plan, t)
+    scale, xi = _ranef_k1_names(b)
+    gathered = Expr(:ref, xi, Symbol(:_ppl_gidx_, b.group))
+    if b.kind === :intercept1
+        return Expr(:call, :*, Expr(:call, :exp, scale), gathered)
+    end
+    Z = _ranef_z_expr(only(b.margins).z)
+    return Expr(:call, :*, scale, Expr(:call, :.*, gathered, Z))
 end
 
 _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
@@ -874,6 +940,25 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         end
         _vector_prior_stmts!(stmts, terms, v.name, v.family, v.args,
             v.support_override)
+    end
+    # K=1 ranef buckets (Stage B, SB `ranef_intercept`/`ranef_slope`):
+    # the scalar scale prior plus the standardized `xi` plate (shared
+    # vector-prior helper). `tau` emits WITHOUT the thin layer's
+    # `+log(2)` half renormalizer: SB's `std_normal(; lower=0)` is Stan
+    # lower-bound kernel semantics (exp Jacobian only, no truncation
+    # normalizer), and Stage-B parity is measured against SB bit-exact.
+    # User-facing `HalfNormal` priors keep the proper-half convention;
+    # bucket-internal `tau` follows SB. Correlated buckets own no
+    # Stage-B priors (Stage C).
+    for b in plan.ranef_buckets
+        b.kind === :correlated && continue
+        scale, xi = _ranef_k1_names(b)
+        snode = Symbol(:_ppl_prior_, scale)
+        scell = _family_logpdf_expr(:normal, Any[0, 1], scale)
+        push!(stmts, :($snode::Float64 = $scell))
+        push!(terms, snode)
+        _vector_prior_stmts!(stmts, terms, xi, :normal, (arg1 = 0, arg2 = 1),
+            nothing)
     end
     # Sequential-recurrence (scan) latents: setup + recurrence density.
     scanstmts, scannodes = _scan_prior_statements(plan, layout)

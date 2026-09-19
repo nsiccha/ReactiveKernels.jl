@@ -52,10 +52,11 @@ end
 
 """One packed slice: a coefficient block, a scalar latent, a scan vector
 latent, a per-cell latent block, a leveled vector latent (cutpoints,
-thresholds, simplex), or a spline coefficient-vector block. `lo`/`hi`
-are the constrained bounds of an `:interval` transform (`NaN` otherwise)."""
+thresholds, simplex), a spline coefficient-vector block, or a K=1 ranef
+standardized group vector. `lo`/`hi` are the constrained bounds of an
+`:interval` transform (`NaN` otherwise)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline
+    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :ranef
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
@@ -139,6 +140,24 @@ function assign_layout(plan::StructuralPlan)
             LayoutEntry(:spline, nothing, v.name, [v.name], offset, v.width,
                 transform, lo, hi))
         offset += v.width
+    end
+    # K=1 ranef buckets (Stage B): the scalar scale (`:sampled`, real for
+    # `log_scale`, exp for `tau` — the exp Jacobian is Stan's lower-bound
+    # kernel term, no renormalizer) plus the standardized G-vector `xi`
+    # (`:ranef`, plate-shaped identity block; G from bind levels).
+    # Correlated buckets own no Stage-B entries (Stage C).
+    for b in plan.ranef_buckets
+        b.kind === :correlated && continue
+        scale, xi = _ranef_k1_names(b)
+        transform = b.kind === :intercept1 ? :identity : :exp
+        push!(entries,
+            LayoutEntry(:sampled, nothing, scale, [scale], offset, 1,
+                transform))
+        offset += 1
+        G = length(_grouping_levels(plan.columns[b.group]))
+        push!(entries,
+            LayoutEntry(:ranef, nothing, xi, [xi], offset, G, :identity))
+        offset += G
     end
     # Sequential-recurrence latents: one identity array slice per scan. The
     # length T is the loop bound — a literal Int, or `n_obs` when the bound is a
@@ -269,7 +288,7 @@ function coordinate_names(layout::LayoutTable)
             for label in e.labels
                 push!(names, Symbol(string(e.predictor) * "." * string(label)))
             end
-        elseif e.kind === :plate || e.kind === :spline
+        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef
             for i in 1:e.size
                 push!(names, Symbol(string(e.name) * "." * string(i)))
             end
@@ -301,7 +320,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :coefficient
             push!(pairs, e.predictor => Vector{Float64}(seg))
-        elseif e.kind === :plate || e.kind === :spline
+        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef
             v = [_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name => v)
         elseif e.kind === :scan
@@ -333,8 +352,9 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] predictor $(e.predictor) length mismatch"),
             )
             u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
-        elseif e.kind === :plate || e.kind === :spline
-            what = e.kind === :plate ? "plate parameter" : "spline vector"
+        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef
+            what = e.kind === :plate ? "plate parameter" :
+                e.kind === :spline ? "spline vector" : "ranef xi vector"
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing $what $(e.name)"),
             )
@@ -476,10 +496,11 @@ function transform_statements(e::LayoutEntry)
         return Expr[:($(e.name)::AbstractVector{Float64} =
             view(unconstrained, $lo:$hi))]
     end
-    if e.kind === :plate || e.kind === :spline
+    if e.kind === :plate || e.kind === :spline || e.kind === :ranef
         # Spline vectors ride the plate transform path (block + scalar
         # endpoints); the contract pins their supports to real/positive,
-        # so the :interval arm below is unreachable for them.
+        # so the :interval arm below is unreachable for them. Ranef `xi`
+        # vectors ride it too (always `:identity` in Stage B).
         return _plate_transform_statements(e)
     end
     if e.kind === :vector
@@ -640,12 +661,13 @@ function jacobian_term(e::LayoutEntry)
             log1p(-$(_vector_z(e, j)))) for j in 1:e.size]
         return foldl((a, b) -> :($a + $b), terms)
     end
-    if e.kind === :plate || e.kind === :spline
+    if e.kind === :plate || e.kind === :spline || e.kind === :ranef
         # Interval plates hand-roll the per-cell Jacobian sum (parameterized
         # bounds, no companion `logjac` plate); every registry transform sums
         # its companion `logjac` plate from `_plate_transform_statements`.
         # Spline vectors share the shape (their supports never reach
-        # :interval, but the arm stays correct if that ever changes).
+        # :interval, but the arm stays correct if that ever changes), as do
+        # ranef `xi` vectors (always `:identity` in Stage B).
         if e.transform === :interval
             blo, bhi = e.lo, e.hi
             return :(sum(log.($(e.name) .- $blo) .+ log.($bhi .- $(e.name)) .-

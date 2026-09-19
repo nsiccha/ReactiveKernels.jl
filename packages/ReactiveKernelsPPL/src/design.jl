@@ -85,6 +85,14 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps)
         labels = [Symbol(string(col) * "_" * string(level)) for level in m.values]
         return DesignBlock(FactorTerm, col, t.addressee, length(labels), labels,
             collect(m.values))
+    elseif t.kind === RanefGatherTerm
+        # A gather is a direct `r` expression over the group index and the
+        # bucket's draws (SB's `r_<target>_<suffix>` summand) — no
+        # design-matrix width. `column` carries the grouping column (the
+        # encoder input); the generator reads the TERMS for the full
+        # (bucket_id, bucket_group) key, which does not fit one Symbol.
+        return DesignBlock(RanefGatherTerm, only(t.columns), t.addressee, 0,
+            Symbol[], [])
     else
         throw(ContractValidationError("[$label] term kind $(t.kind) has no design rule"))
     end
