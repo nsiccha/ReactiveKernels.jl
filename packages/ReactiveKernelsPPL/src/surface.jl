@@ -176,7 +176,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
-    sample, det, plate_ctx, plate_specs, scans, buckets =
+    sample, det, plate_ctx, plate_specs, scans, buckets, bases, vectors =
         _partition_statements(ast, data)
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
@@ -210,7 +210,10 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         synth = Ref(0), synth_derived = VectorAssignmentSpec[], taken,
         scan_states = Set{Symbol}(s.state for s in scans),
         buckets = Dict{Tuple{Union{Nothing,Symbol},Symbol},RanefBucket}(
-            (b.id, b.group) => b for b in buckets))
+            (b.id, b.group) => b for b in buckets),
+        implicit_vectors = VectorParameter[],
+        splines = Dict{Symbol,SplineBasis}(b.id => b for b in bases),
+        spline_uses = Dict{Symbol,Symbol}())
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
     pred_idx = Dict{Symbol,Int}()
@@ -232,11 +235,15 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         end
     end
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors)
-    params, paramsyms = _lower_parameters(sample, coefuse, ctx)
+    params, paramsyms, dirichlets = _lower_parameters(sample, coefuse, ctx)
     plate_parameters = PlateParameter[
         _lower_plate_parameter(nm, rhs, rng, coefuse)
         for (nm, rhs, rng, _) in plate_specs]
-    used_locs = Set{Symbol}(r.predictor for r in responses)
+    used_locs = Set{Symbol}()
+    for r in responses
+        push!(used_locs, r.predictor)
+        union!(used_locs, r.extra_predictors)
+    end
     skip = _absorbed_skip(det, canonmap, responses, paramsyms, ctx.absorbed,
         used_locs)
     assigns = AssignmentSpec[]
@@ -264,7 +271,9 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
         levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
-        ranef_buckets = buckets)
+        ranef_buckets = buckets,
+        vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
+        spline_bases = bases, spline_vectors = vectors)
     validate_structure(plan)
     return plan
 end
@@ -349,6 +358,8 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
     elseif fn === :^ || _is_plain_comparison(fn) || fn === :ifelse ||
             fn in ASSIGNMENT_FNS
         return nvec == 0 ? :scalar : :invalid
+    elseif fn in VECTOR_FNS
+        return :vector
     end
     return nvec == 0 ? :scalar : :vector  # unknown heads: follow the args
 end
@@ -517,7 +528,9 @@ const _RESPONSE_ONLY_FNS =
     (:weighted, :truncated, :censored, :interval_censored, :logistic)
 const _DIST_VALUE_FNS =
     (:Normal, :Cauchy, :Exponential, :Gamma, :LogNormal, :Beta,
-        :InverseGamma, :Bernoulli, :Poisson, :HalfNormal, :HalfCauchy, :Flat)
+        :InverseGamma, :Bernoulli, :Poisson, :HalfNormal, :HalfCauchy, :Flat,
+        :Dirichlet, :CategoricalLogit, :OrderedLogistic, :Ordinal,
+        :Multinomial, :Categorical)
 
 function _reject_unknown_calls(where, rhs)
     rhs isa Expr || return nothing
@@ -525,7 +538,7 @@ function _reject_unknown_calls(where, rhs)
     if rhs.head === :call && !isempty(rhs.args)
         fn = rhs.args[1]
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
-                fn !== :ranef
+                fn ∉ VECTOR_FNS && fn !== :ranef && fn !== :spline
             startswith(string(fn), ".") && _sfail(
                 "$where uses dotted operator `$fn`, which is not in " *
                 "the slice-1 elementwise vocabulary")
@@ -711,7 +724,13 @@ function _lower_bucket(st::Expr, line::Int, data::Set{Symbol},
     for (t, _) in slices
         _claim!(seen, seelines, Symbol("r_$(t)_" * suffix), line)
     end
-    return RanefBucket(key[1], group, kind, margins, slices, eta, label)
+    b = RanefBucket(key[1], group, kind, margins, slices, eta, label)
+    if kind === :intercept1 || kind === :slope1
+        for nm in _ranef_k1_names(b)
+            _claim!(seen, seelines, nm, line)
+        end
+    end
+    return b
 end
 
 # One margin element: `1` (intercept), a bare data column (continuous Z),
@@ -760,11 +779,141 @@ _is_gather_call(ex) =
     ex isa Expr && ex.head === :call && !isempty(ex.args) &&
     ex.args[1] === :ranef
 
+_contains_spline(ex) = ex isa Expr &&
+    (_is_spline_call(ex) || any(_contains_spline, ex.args))
+
+_is_spline_call(ex) =
+    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+    ex.args[1] === :spline
+
+# A bare `spline_basis(:id, x...; kind=..., k=...)` call declares one
+# spline basis (the first bare-call statement: declarations do work at
+# lowering — they build IR + claim the generated names — so the "bare
+# call does nothing" rejection does not apply). Quoted id, bare raw
+# axes (1 → :tps, 2 → :t2 when `kind` is omitted), literal `k`
+# (default 10 / (5, 5)). Lowers directly to SplineBasis IR + the fully
+# determined SplineVector set (contract `_spline_*` rules); claims the
+# basis label, vector names, and materialized basis-column names up
+# front so user definitions can never collide with bind/graph names.
+_is_basis_stmt(st) =
+    st isa Expr && st.head === :call && !isempty(st.args) &&
+    st.args[1] === :spline_basis
+
+function _lower_basis(st::Expr, line::Int, data::Set{Symbol},
+        seen::Set{Symbol}, seelines::Dict{Symbol,Int},
+        bases::Vector{SplineBasis})
+    where = line > 0 ? "spline basis (line $line)" : "spline basis"
+    pos = Any[]
+    kind = nothing
+    kind_given = false
+    k = nothing
+    for a in st.args[2:end]
+        if a isa Expr && a.head === :parameters
+            for kw in a.args
+                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
+                    _sfail("$where takes keywords `kind`/`k` only")
+                key = kw.args[1]
+                key === :kind || key === :k ||
+                    _sfail("$where takes keywords `kind`/`k` only, got " *
+                          "`$key`")
+                if key === :kind
+                    v = kw.args[2]
+                    v isa QuoteNode && v.value isa Symbol ||
+                        _sfail("$where quotes its kind: got $(repr(v)) — " *
+                              "write `kind=:tps` or `kind=:t2`")
+                    v.value === :tps || v.value === :t2 ||
+                        _sfail("$where kind must be `:tps` or `:t2`, got " *
+                              "$(repr(v.value))")
+                    kind = v.value
+                    kind_given = true
+                else
+                    k = _lower_basis_k(kw.args[2], where)
+                end
+            end
+        else
+            push!(pos, a)
+        end
+    end
+    length(pos) >= 2 ||
+        _sfail("$where takes `(:id, axis...)` positionally, got " *
+              "($(join(repr.(pos), ", ")))")
+    id, axes = pos[1], pos[2:end]
+    id isa QuoteNode && id.value isa Symbol ||
+        _sfail("$where quotes its basis id: got $(repr(id)) — write " *
+              "`spline_basis(:id, x)` (bare names are data columns)")
+    id = id.value
+    any(b -> b.id === id, bases) &&
+        _sfail("$where duplicates basis :$id (one declaration per id)")
+    for c in axes
+        c isa Symbol ||
+            _sfail("$where axes must be bare data columns, got $(repr(c))")
+        c in data || _sfail("$where axis `$c` is not data")
+    end
+    length(axes) == 1 || length(axes) == 2 ||
+        _sfail("$where takes one axis (`s(x)`) or two (`t2(x, z)`), got " *
+              "$(length(axes))")
+    kind === nothing && (kind = length(axes) == 1 ? :tps : :t2)
+    if kind_given
+        want = kind === :tps ? 1 : 2
+        spell = want == 1 ? "one axis (`s(x)`)" : "two axes (`t2(x, z)`)"
+        length(axes) == want ||
+            _sfail("$where kind=:$kind takes $spell, got $(length(axes))")
+    end
+    if k === nothing
+        k = kind === :tps ? 10 : (5, 5)
+    elseif kind === :tps
+        k isa Int ||
+            _sfail("$where kind=:tps takes an integer `k`, got $(repr(k))")
+    else
+        k isa Tuple{Int,Int} ||
+            _sfail("$where kind=:t2 takes a `(k1, k2)` integer tuple `k`, " *
+                  "got $(repr(k))")
+    end
+    blocks = [SplineBasisBlock(n, w, Symbol[])
+              for (n, w) in _spline_blocks(kind, k)]
+    label = Symbol("spline_", id)
+    _claim!(seen, seelines, label, line)
+    vectors = SplineVector[]
+    for (vname, vfamily, vargs, vsupport, vwidth) in
+            _spline_vector_specs(id, kind, k)
+        _claim!(seen, seelines, vname, line)
+        push!(vectors, SplineVector(vname, vfamily, vargs, vsupport,
+            vwidth, id, vname))
+    end
+    for (_, cols) in _spline_basis_columns(id, kind, k), c in cols
+        _claim!(seen, seelines, c, line)
+    end
+    return SplineBasis(id, kind, Vector{Symbol}(axes), k, blocks, label),
+        vectors
+end
+
+function _lower_basis_k(v, where)
+    v isa Integer && !(v isa Bool) ||
+        (v isa Expr && v.head === :tuple) ||
+        _sfail("$where `k` must be a literal (an integer for `s`, a " *
+              "`(k1, k2)` integer tuple for `t2`), got $(repr(v))")
+    if v isa Expr
+        length(v.args) == 2 ||
+            _sfail("$where `k` tuple takes exactly two entries, got " *
+                  "$(repr(v))")
+        all(e -> e isa Integer && !(e isa Bool), v.args) ||
+            _sfail("$where `k` tuple entries must be integer literals, " *
+                  "got $(repr(v))")
+        all(e -> e > 2, v.args) ||
+            _sfail("$where `k` entries must exceed 2, got $(repr(v))")
+        return (Int(v.args[1]), Int(v.args[2]))
+    end
+    v > 2 || _sfail("$where `k` must exceed 2, got $v")
+    return Int(v)
+end
+
 function _partition_statements(ast::Expr, data::Set{Symbol})
     sample = SampleStmt[]
     det = Pair{Symbol,Any}[]
     scans = ScanSpec[]
     buckets = RanefBucket[]
+    bases = SplineBasis[]
+    vectors = SplineVector[]
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
     seen_doc = false
@@ -800,12 +949,21 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             push!(buckets, b)
             continue
         end
+        if _is_basis_stmt(st)
+            b, vs = _lower_basis(st, line, data, seen, seelines, bases)
+            push!(bases, b)
+            append!(vectors, vs)
+            continue
+        end
         if _is_sample(st) || _is_broadcast_sample(st)
             bc = _is_broadcast_sample(st)
             tilde = bc ? "`.~`" : "`~`"
             lhs, rng, levs = _sample_lhs(st.args[2], bc, tilde, data)
             lhs in (:ranef, :ranef_bucket, :dummy) &&
                 _sfail("`$lhs` is reserved (ranef surface) and cannot be " *
+                       "sampled")
+            lhs in (:spline, :spline_basis) &&
+                _sfail("`$lhs` is reserved (spline surface) and cannot be " *
                        "sampled")
             _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[3], lhs)
@@ -817,6 +975,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             lhs in (:ranef, :ranef_bucket, :dummy) &&
                 _sfail("`$lhs` is reserved (ranef surface) and cannot be " *
                        "redefined")
+            lhs in (:spline, :spline_basis) &&
+                _sfail("`$lhs` is reserved (spline surface) and cannot be " *
+                       "redefined")
             lhs in data && _sfail("$lhs is bound data and cannot be redefined")
             _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[2], lhs)
@@ -825,7 +986,8 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             _reject_statement(st)
         end
     end
-    return sample, det, plate_ctx, plate_params, scans, buckets
+    return sample, det, plate_ctx, plate_params, scans, buckets, bases,
+        vectors
 end
 
 # Pre-pass: expand top-level `@plate for i in R ... end` blocks into
@@ -1775,12 +1937,169 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     call = _dot2call_response(lhs, rhs)
     weights, call = _peel_weighted(lhs, call, ctx)
     evidence, call = _peel_evidence(lhs, call, ctx)
+    if call.args[1] in (:CategoricalLogit, :OrderedLogistic, :Ordinal,
+            :Multinomial, :Categorical)
+        return _lower_leveled_response(lhs, call, range, weights, evidence,
+            ctx, predictors, pred_idx, coefuse)
+    end
     family, lik_link, pred_link, loc, scale, trials =
         _lower_response_base(lhs, call, ctx)
     pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
         evidence, Symbol(lhs, "_resp"), trials, range)
+end
+
+const _LEVELED_FAMS =
+    (:CategoricalLogit, :OrderedLogistic, :Ordinal, :Multinomial, :Categorical)
+
+function _lower_leveled_response(lhs, call, range, weights, evidence, ctx,
+        predictors, pred_idx, coefuse)
+    fam = call.args[1]
+    label = Symbol(lhs, "_resp")
+    if fam === :CategoricalLogit
+        return _lower_categorical_logit_response(lhs, call, range, weights,
+            evidence, label, ctx, predictors, pred_idx, coefuse)
+    elseif fam === :OrderedLogistic
+        return _lower_ordered_logistic_response(lhs, call, range, weights,
+            evidence, label, ctx, predictors, pred_idx, coefuse)
+    elseif fam === :Ordinal
+        return _lower_ordinal_response(lhs, call, range, weights, evidence,
+            label, ctx, predictors, pred_idx, coefuse)
+    elseif fam === :Multinomial
+        return _lower_multinomial_response(lhs, call, range, weights,
+            evidence, label, ctx)
+    else
+        return _lower_categorical_response(lhs, call, range, weights,
+            evidence, label, ctx)
+    end
+end
+
+# Reference-coded multi-logit categorical:
+# `y .~ CategoricalLogit.(eta_2, ..., eta_K)` — K−1 linear-predictor
+# etas (class 1 is the implicit zero reference). Each eta lowers as an
+# ordinary location (named definitions intern by name; inline etas
+# synthesize indexed predictors).
+function _lower_categorical_logit_response(lhs, call, range, weights,
+        evidence, label, ctx, predictors, pred_idx, coefuse)
+    args = _plain_args(call, "`CategoricalLogit`")
+    isempty(args) && _sfail("response $lhs: `CategoricalLogit` takes the " *
+                            "K−1 non-reference etas " *
+                            "(`y .~ CategoricalLogit.(eta_2, eta_3)` for K=3)")
+    pnames = Symbol[_lower_location(lhs, a, IdentityLink, ctx, predictors,
+        pred_idx, coefuse; synth = Symbol(lhs, "_eta_", j))
+        for (j, a) in enumerate(args)]
+    return LikelihoodSpec(CategoricalLogitFam, LogitLink, lhs, pnames[1],
+        nothing, weights, evidence, label, nothing, range;
+        extra_predictors = pnames[2:end])
+end
+
+# Allocate an implicit SB-mirroring vector parameter (`y_cutpoints` /
+# `y_thresholds`): std-normal elementwise prior, size inferred at bind.
+# Loud on collision with a user definition.
+function _implicit_vector!(ctx, name::Symbol, family::Symbol, lhs::Symbol)
+    name in ctx.taken && _sfail(
+        "implicit $family parameter $name for response $lhs collides " *
+        "with your definition — rename yours")
+    push!(ctx.taken, name)
+    push!(ctx.implicit_vectors,
+        VectorParameter(name, family, (arg1 = 0.0, arg2 = 1.0), nothing, name))
+    return name
+end
+
+# Cumulative-logit ordinal: `y .~ OrderedLogistic.(eta)` + implicit
+# ordered cutpoints (SB's `y_cutpoints::ordered[K-1] ~ std_normal()`).
+function _lower_ordered_logistic_response(lhs, call, range, weights,
+        evidence, label, ctx, predictors, pred_idx, coefuse)
+    args = _plain_args(call, "`OrderedLogistic`")
+    length(args) == 1 || _sfail("response $lhs: `OrderedLogistic` takes " *
+                                "`y .~ OrderedLogistic.(eta)`")
+    pname = _lower_location(lhs, args[1], IdentityLink, ctx, predictors,
+        pred_idx, coefuse)
+    cut = _implicit_vector!(ctx, Symbol(lhs, :_cutpoints), :ordered_normal, lhs)
+    return LikelihoodSpec(OrderedLogisticFam, LogitLink, lhs, pname,
+        nothing, weights, evidence, label, nothing, range; thresholds = cut)
+end
+
+# Ordinal tags (SB's typed composition, mirrored): structure
+# `Cumulative()`/`StoppingRatio()`, link
+# `LogitLink()`/`ProbitLink()`/`CloglogLink()` — nullary calls.
+function _ordinal_tag(lhs, arg, kinds::Tuple{Vararg{Symbol}}, what::String)
+    arg isa Expr && arg.head === :call && length(arg.args) == 1 &&
+        arg.args[1] isa Symbol && arg.args[1] in kinds ||
+        _sfail("response $lhs: ordinal $what is " *
+               join(("`$k()`" for k in kinds), "/") * ", got $(repr(arg))")
+    return arg.args[1]
+end
+
+const _ORDINAL_LINKS = Dict{Symbol,LinkFunction}(
+    :LogitLink => LogitLink,
+    :ProbitLink => ProbitLink,
+    :CloglogLink => CloglogLink,
+)
+
+# General typed ordinal: `y .~ Ordinal.(Cumulative(), LogitLink(), eta)`
+# (+ implicit thresholds — ordered iff cumulative). Discrimination and
+# per-threshold design are plan-level only (the BRM emitter's path):
+# the dotted object takes exactly three positionals.
+function _lower_ordinal_response(lhs, call, range, weights, evidence,
+        label, ctx, predictors, pred_idx, coefuse)
+    args = _plain_args(call, "`Ordinal`")
+    length(args) == 3 || _sfail("response $lhs: `Ordinal` takes " *
+                                "`y .~ Ordinal.(Cumulative(), LogitLink(), eta)` " *
+                                "(structure, link, eta — discrimination and " *
+                                "per-threshold design are plan-level only)")
+    structure = _ordinal_tag(lhs, args[1], (:Cumulative, :StoppingRatio),
+        "structure")
+    linktag = _ordinal_tag(lhs, args[2],
+        (:LogitLink, :ProbitLink, :CloglogLink), "link")
+    pname = _lower_location(lhs, args[3], IdentityLink, ctx, predictors,
+        pred_idx, coefuse)
+    vfam = structure === :Cumulative ? :ordered_normal : :vector_normal
+    thresh = _implicit_vector!(ctx, Symbol(lhs, :_thresholds), vfam, lhs)
+    structure_sym = structure === :Cumulative ? :cumulative : :stopping
+    return LikelihoodSpec(OrdinalFam, _ORDINAL_LINKS[linktag], lhs, pname,
+        nothing, weights, evidence, label, nothing, range;
+        thresholds = thresh, ordinal_structure = structure_sym)
+end
+
+# Shared-simplex multinomial: `c1 .~ Multinomial.(N, s, c2, ..., cK)` —
+# the lead count column (LHS) plus the K−1 tail count columns, trials N
+# (Int literal or column), and the simplex parameter `s`
+# (`s ~ Dirichlet(...)` elsewhere in the model).
+function _lower_multinomial_response(lhs, call, range, weights, evidence,
+        label, ctx)
+    args = _plain_args(call, "`Multinomial`")
+    length(args) >= 2 || _sfail("response $lhs: `Multinomial` takes " *
+                                "`c1 .~ Multinomial.(N, s, c2, ..., cK)` " *
+                                "(trials, simplex, tail count columns)")
+    trials = _lower_trials(lhs, args[1], ctx)
+    s = args[2]
+    s isa Symbol || _sfail("response $lhs: multinomial probs $s must be " *
+                           "a simplex parameter name " *
+                           "(`s ~ Dirichlet(...)` in the model)")
+    tail = args[3:end]
+    for c in tail
+        c isa Symbol || _sfail("response $lhs: multinomial tail column " *
+                               "$(repr(c)) must be a data column name")
+    end
+    return LikelihoodSpec(MultinomialFam, IdentityLink, lhs, s,
+        nothing, weights, evidence, label, trials, range;
+        count_columns = Vector{Symbol}(tail))
+end
+
+# Plain categorical over simplex probabilities: `y .~ Categorical.(s)`.
+function _lower_categorical_response(lhs, call, range, weights, evidence,
+        label, ctx)
+    args = _plain_args(call, "`Categorical`")
+    length(args) == 1 || _sfail("response $lhs: `Categorical` takes " *
+                                "`y .~ Categorical.(s)` (a simplex parameter)")
+    s = only(args)
+    s isa Symbol || _sfail("response $lhs: categorical probs $s must be " *
+                           "a simplex parameter name " *
+                           "(`s ~ Dirichlet(...)` in the model)")
+    return LikelihoodSpec(CategoricalFam, IdentityLink, lhs, s,
+        nothing, weights, evidence, label, nothing, range)
 end
 
 # `.~` takes a dotted distribution object (`Normal.(mu, sigma)`); convert
@@ -1810,7 +2129,8 @@ function _dot2call_object_error(lhs, rhs)
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol && rhs.args[1] in
             (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
-                :Gamma, :Beta, :weighted, :truncated, :censored,
+                :Gamma, :Beta, :CategoricalLogit, :OrderedLogistic, :Ordinal,
+                :Multinomial, :Categorical, :weighted, :truncated, :censored,
                 :interval_censored)
         _sfail("response $lhs: broadcast the object " *
                "(`$(rhs.args[1]).(...)` — `.~` is elementwise)")
@@ -1953,8 +2273,11 @@ const _RESPONSE_BASE_MSG =
     "`Poisson.(exp.(eta))`, `Binomial.(n, logistic.(mu))` (or " *
     "`probit`/`cloglog` for the link), " *
     "`NegativeBinomial2.(exp.(eta), phi)`, " *
-    "`Gamma.(alpha, exp.(eta) ./ alpha)`, or " *
-    "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`"
+    "`Gamma.(alpha, exp.(eta) ./ alpha)`, " *
+    "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`, " *
+    "`CategoricalLogit.(eta_2, ..., eta_K)`, `OrderedLogistic.(eta)`, " *
+    "`Ordinal.(Cumulative(), LogitLink(), eta)`, " *
+    "`Multinomial.(N, s, c2, ..., cK)`, or `Categorical.(s)`"
 
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
@@ -2098,12 +2421,13 @@ function _lower_response_base_error(lhs, rhs, fam)
                                  _BETA_MSG)
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, Bernoulli, Poisson, Binomial, " *
-                  "NegativeBinomial2, Gamma, Beta). When `$fam` is a " *
-                  "defined RKPPLSubmodel, a latent uses `latent ~ $fam(...)` " *
-                  "and an observation stream uses plain `$lhs ~ $fam(...)` " *
-                  "(the whole-column vectorized callee); an elementwise " *
-                  "per-row submodel broadcast `$lhs .~ $fam.(...)` is a " *
-                  "follow-up slice.")
+                  "NegativeBinomial2, Gamma, Beta, CategoricalLogit, " *
+                  "OrderedLogistic, Ordinal, Multinomial, Categorical). " *
+                  "When `$fam` is a defined RKPPLSubmodel, a latent uses " *
+                  "`latent ~ $fam(...)` and an observation stream uses plain " *
+                  "`$lhs ~ $fam(...)` (the whole-column vectorized callee); " *
+                  "an elementwise per-row submodel broadcast " *
+                  "`$lhs .~ $fam.(...)` is a follow-up slice.")
 end
 
 function _lower_link_arg(lhs, arg, wrap)
@@ -2173,7 +2497,7 @@ function _lower_scale(lhs, s, ctx)
 end
 
 function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
-        coefuse)
+        coefuse; synth::Union{Nothing,Symbol} = nothing)
     # A per-cell latent VECTOR is the whole location via a LatentTerm predictor
     # (`lp = theta`, identity design; the latent's prior lives on its
     # PlateParameter, so no coefficient use is recorded). Two spellings: a bare
@@ -2209,8 +2533,10 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
                "predictor (`eta = a`)")
     else
         _reject_plate_in_predictor(lhs, loc, ctx)
-        pname = Symbol(lhs, "_eta")
-        haskey(ctx.detmap, pname) && _sfail(
+        # Multi-eta responses (CategoricalLogit) index their synthetic
+        # predictors; the single-eta default keeps its established name.
+        pname = synth === nothing ? Symbol(lhs, "_eta") : synth
+        (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
             "derived predictor name $pname collides with your definition — " *
             "rename yours")
         terms, uses = _analyze_predictor(pname, loc, ctx, lhs)
@@ -2327,6 +2653,17 @@ end
 function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
     ex isa Symbol || return _inline_structure_expr(ex, ctx, visited, where)
     haskey(ctx.detmap, ex) || return ex
+    # Gather-like atoms never hide in definitions: an inlined alias would
+    # silently become a direct summand, bypassing the lowering screens
+    # (scalar defs always inline; structural vector defs inline too).
+    _contains_ranef(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
+        "into $where) calls `ranef()`, which lowers only as a direct " *
+        "predictor summand (`mu = a .+ b .* x .+ ranef(:ID, g)`), not " *
+        "inside definitions")
+    _contains_spline(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
+        "into $where) calls `spline()`, which lowers only as a direct " *
+        "predictor summand (`mu = a .+ b .* x .+ spline(:s_x)`), not " *
+        "inside definitions")
     if ex in ctx.structural || ctx.detshape[ex] !== :vector
         ex in visited && _sfail("$where: cyclic definition through $ex")
         push!(ctx.absorbed, ex)
@@ -2383,6 +2720,14 @@ function _classify_summand(pname, core, sign::Int, ctx)
                   "(`mu = a .+ b .* x .+ ranef(:ID, g)`), not nested in " *
                   "$(repr(core))")
         return _classify_gather(pname, core, sign, ctx)
+    end
+    if _contains_spline(core)
+        _is_spline_call(core) ||
+            _sfail("predictor $pname: `spline()` summands lower only as " *
+                  "direct additive summands " *
+                  "(`mu = a .+ b .* x .+ spline(:s_x)`), not nested in " *
+                  "$(repr(core))")
+        return _classify_spline(pname, core, sign, ctx)
     end
     head = core.head
     head === :ref && return _classify_ref(pname, core, sign, ctx)
@@ -2450,6 +2795,36 @@ function _classify_gather(pname, core::Expr, sign::Int, ctx)
     label = Symbol("r_$(pname)_" * suffix)
     return TermSpec(RanefGatherTerm, [group],
         (bucket_id = id, bucket_group = group), label, label), nothing
+end
+
+# A `spline(:id)` summand: the named basis's direct summand in the
+# enclosing predictor (SB's `X*b + Z*(sd*z)` shape). Additive only, one
+# target per smooth (a second use fails here so the surface error names
+# both predictors; the contract re-checks for hand-built plans).
+function _classify_spline(pname, core::Expr, sign::Int, ctx)
+    where = "predictor $pname"
+    args = core.args[2:end]
+    length(args) == 1 ||
+        _sfail("$where spline summand takes `spline(:id)` exactly, got " *
+              "$(repr(core))")
+    id = only(args)
+    id isa QuoteNode && id.value isa Symbol ||
+        _sfail("$where quotes its spline id: got $(repr(id)) — write " *
+              "`spline(:id)`")
+    id = id.value
+    sign > 0 ||
+        _sfail("$where negates a `spline()` summand — summands are " *
+              "additive only (write `.+ spline(:$id)`)")
+    haskey(ctx.splines, id) ||
+        _sfail("$where uses unknown spline :$id — declare it with " *
+              "`spline_basis(:$id, x)`")
+    haskey(ctx.spline_uses, id) &&
+        _sfail("$where reuses spline :$id, which already feeds predictor " *
+              "`$(ctx.spline_uses[id])` (one target per smooth)")
+    ctx.spline_uses[id] = pname
+    label = Symbol("spline_", pname, "_", id)
+    return TermSpec(SplineSummandTerm, ColumnRef[], (spline_id = id,),
+        label, label), nothing
 end
 
 function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
@@ -2660,9 +3035,11 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
         for t in pred.terms
             # Offsets carry no coefficient; latent terms carry a PlateParameter
             # whose prior lives on the plate parameter, not as a coefficient;
-            # gather terms carry a RanefBucket, whose geometry is self-priored.
+            # gather terms carry a RanefBucket, whose geometry is self-priored;
+            # spline summands carry SplineVectors, self-priored likewise.
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
-                t.kind === RanefGatherTerm) && continue
+                t.kind === RanefGatherTerm ||
+                t.kind === SplineSummandTerm) && continue
             addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
             use = _find_use(coefuse, pred.name, addr)
             use === nothing && _sfail("internal: no coefficient use for " *
@@ -2783,8 +3160,16 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
 function _lower_parameters(sample, coefuse, ctx)
     params = SampledParameter[]
     syms = Set{Symbol}()
+    vectors = VectorParameter[]
     for s in sample
         s.lhs in ctx.data && continue
+        if _is_dirichlet_call(s.rhs)
+            haskey(coefuse, s.lhs) && _sfail(
+                "$(s.lhs) is a predictor coefficient and cannot also be " *
+                "a Dirichlet parameter")
+            push!(vectors, _lower_dirichlet(s.lhs, s.rhs))
+            continue
+        end
         haskey(coefuse, s.lhs) && continue
         s.levels !== nothing && _sfail("levels prior `$(s.lhs)[...]` is " *
                                        "never used in a predictor — size " *
@@ -2795,7 +3180,42 @@ function _lower_parameters(sample, coefuse, ctx)
             v isa Symbol && push!(syms, v)
         end
     end
-    return params, syms
+    return params, syms, vectors
+end
+
+_is_dirichlet_call(rhs) =
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+    rhs.args[1] === :Dirichlet
+
+# Simplex parameter: `s ~ Dirichlet(alpha)` (a literal concentration
+# vector) or symmetric `s ~ Dirichlet(K, a)` — SB's two constructor
+# forms, resolved here to a frozen concentration vector (concentrations
+# are hyperparameters: data columns and sampled/model-dependent args
+# fail closed — planned).
+function _lower_dirichlet(lhs, rhs)
+    args = _plain_args(rhs, "`Dirichlet`")
+    alpha = if length(args) == 1
+        a = only(args)
+        a isa Expr && a.head === :vect && !isempty(a.args) &&
+            all(x -> x isa Real, a.args) ||
+            _sfail("parameter $lhs: `Dirichlet(alpha)` takes a literal " *
+                   "concentration vector (`Dirichlet([1.0, 2.0])`) or " *
+                   "symmetric `Dirichlet(K, a)`, got $(repr(a))")
+        Vector{Float64}(a.args)
+    elseif length(args) == 2
+        K, a = args
+        (K isa Integer && K >= 1 && a isa Real) ||
+            _sfail("parameter $lhs: symmetric `Dirichlet(K, a)` takes a " *
+                   "positive integer dimension and a real concentration, got " *
+                   "($(repr(K)), $(repr(a)))")
+        fill(Float64(a), Int(K))
+    else
+        _sfail("parameter $lhs: `Dirichlet` takes a concentration vector " *
+               "`Dirichlet(alpha)` or symmetric `Dirichlet(K, a)`, got " *
+               "$(length(args)) arguments")
+    end
+    return VectorParameter(lhs, :simplex_dirichlet, (arg1 = alpha,), nothing,
+        lhs)
 end
 
 function _lower_parameter(lhs, rhs, coefuse)
@@ -2820,9 +3240,9 @@ function _lower_parameter(lhs, rhs, coefuse)
         _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
                "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
                "Beta, InverseGamma, HalfNormal, HalfCauchy, Flat, " *
-               "truncated). If `$fam` is meant as a submodel, define it with " *
-               "`@rkppl $fam(args...) = begin ... end` and make it visible in " *
-               "the lowering module (`mod=`).")
+               "Dirichlet, truncated). If `$fam` is meant as a submodel, " *
+               "define it with `@rkppl $fam(args...) = begin ... end` and " *
+               "make it visible in the lowering module (`mod=`).")
     args = _plain_args(rhs, "`$fam`")
     vals = [_lower_param_arg(lhs, a, coefuse) for a in args]
     argkeys = ntuple(i -> Symbol(:arg, i), length(vals))
@@ -2920,6 +3340,9 @@ function _lower_assignment(nm, rhs, coefuse)
     _contains_ranef(rhs) && _sfail("assignment `$nm` calls `ranef()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ b .* x .+ ranef(:ID, g)`), not inside definitions")
+    _contains_spline(rhs) && _sfail("assignment `$nm` calls `spline()`, " *
+        "which lowers only as a direct predictor summand " *
+        "(`mu = a .+ b .* x .+ spline(:s_x)`), not inside definitions")
     for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by assignment " *
@@ -2938,6 +3361,9 @@ function _lower_vector_assignment(nm, rhs, coefuse)
     _contains_ranef(rhs) && _sfail("derived column `$nm` calls `ranef()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ b .* x .+ ranef(:ID, g)`), not inside definitions")
+    _contains_spline(rhs) && _sfail("derived column `$nm` calls `spline()`, " *
+        "which lowers only as a direct predictor summand " *
+        "(`mu = a .+ b .* x .+ spline(:s_x)`), not inside definitions")
     for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by derived " *

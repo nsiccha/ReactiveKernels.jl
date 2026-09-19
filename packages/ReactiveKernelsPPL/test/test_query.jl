@@ -124,6 +124,39 @@ end
     @test_throws ContractValidationError restore_draws(built.layout, U[1:2, :])
 end
 
+@testset "restore_draws leveled vectors" begin
+    cols = Dict{Symbol,AbstractVector}(:y => [1, 2, 3, 2, 1, 3],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0])
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
+            nothing, nothing, ResponseEvidence(:none, nothing, nothing),
+            :y_resp, nothing, nothing; thresholds = :y_cutpoints)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink,
+            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+                    :Intercept, :intercept),
+                TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)],
+            :mu)],
+        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
+            PopulationPrior(:mu, :x, 0.0, 2.0)],
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = VectorParameter[VectorParameter(:y_cutpoints,
+        :ordered_normal, (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints)])
+    plan = bind_data(unbound, cols)
+    built = build_kernel(plan)
+    U = [0.5 -0.3; -0.25 0.7; 0.1 -0.2; 0.3 0.0]
+    nt = restore_draws(built.layout, U)
+    @test Tuple(keys(nt)) === (:mu, :y_cutpoints)
+    @test size(nt.mu) == (2, 2)
+    @test size(nt.y_cutpoints) == (2, 2)
+    for j in 1:2
+        c = constrain(built.layout, U[:, j])
+        @test nt.mu[:, j] ≈ Vector(c.mu)
+        @test nt.y_cutpoints[:, j] ≈ Vector(c.y_cutpoints)
+    end
+    # Cutpoints restore ordered in every draw.
+    @test all(nt.y_cutpoints[1, :] .< nt.y_cutpoints[2, :])
+end
+
 # Compiled-caller shape (world-age regression): build + prepare + evaluate
 # must work from inside a compiled function — sampler loops are compiled
 # callers, and top-level-only tests never see "method too new".

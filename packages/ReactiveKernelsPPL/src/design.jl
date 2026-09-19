@@ -66,6 +66,13 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps)
         # its coefficients live in the PlateParameter layout block, so this
         # term contributes no design width.
         return DesignBlock(LatentTerm, only(t.columns), t.addressee, 0, Symbol[], [])
+    elseif t.kind === SplineSummandTerm
+        # A spline summand is a direct `X*b + Z*(sd*z)` expression over
+        # materialized basis columns and SplineVector layout blocks — no
+        # design-matrix width. The basis id rides in `column` so the
+        # generator can resolve the blocks without re-reading terms.
+        return DesignBlock(SplineSummandTerm, t.options.spline_id,
+            t.addressee, 0, Symbol[], [])
     elseif t.kind === FactorTerm
         col = only(t.columns)
         m = _find_levelmap(levelmaps, pname, col)
@@ -78,6 +85,14 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps)
         labels = [Symbol(string(col) * "_" * string(level)) for level in m.values]
         return DesignBlock(FactorTerm, col, t.addressee, length(labels), labels,
             collect(m.values))
+    elseif t.kind === RanefGatherTerm
+        # A gather is a direct `r` expression over the group index and the
+        # bucket's draws (SB's `r_<target>_<suffix>` summand) — no
+        # design-matrix width. `column` carries the grouping column (the
+        # encoder input); the generator reads the TERMS for the full
+        # (bucket_id, bucket_group) key, which does not fit one Symbol.
+        return DesignBlock(RanefGatherTerm, only(t.columns), t.addressee, 0,
+            Symbol[], [])
     else
         throw(ContractValidationError("[$label] term kind $(t.kind) has no design rule"))
     end

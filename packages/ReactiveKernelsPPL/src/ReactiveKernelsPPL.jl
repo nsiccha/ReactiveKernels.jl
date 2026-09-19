@@ -15,18 +15,21 @@ module ReactiveKernelsPPL
 
 using ReactiveKernels
 import SpecialFunctions
+using SpecialFunctions: loggamma
 
 export ColumnRef, ParamName
 export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
-    BinomialCloglogFam, BetaLogitFam
+    BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
+    OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
-    RanefGatherTerm
+    RanefGatherTerm, SplineSummandTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
-export PopulationPrior, SampledParameter, PlateParameter, AssignmentSpec, VectorAssignmentSpec
+export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec
 export RanefZRecipe, RanefMargin, RanefBucket
+export SplineBasisBlock, SplineBasis, SplineVector
 export LevelMap
 export StructuralPlan
 export ContractValidationError, validate_plan, validate_structure, validate_data
@@ -38,6 +41,8 @@ export build_kernel, kernel_expr
 export DesignShape, DesignBlock, design_shape, coefficient_priors
 export LayoutTable, LayoutEntry, assign_layout, coordinate_names
 export constrain, unconstrain, logjac, support_of
+export ordered_constrain, ordered_unconstrain, ordered_logjac
+export simplex_constrain, simplex_unconstrain, simplex_logjac
 export positive_bijector, unit_bijector, BIJECTORS
 export coordinate_read, block_read, transform_statements, jacobian_term
 export design_name, offset_name, design_recipe, offset_recipe

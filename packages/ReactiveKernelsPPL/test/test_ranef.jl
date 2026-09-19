@@ -236,6 +236,18 @@ end
                 mu => [1]
             end
         end, (:y, :x, :g))
+    # Gather inside a STRUCTURAL definition (coefficient reference inlines
+    # even vector defs — the statement-level screen must catch it before
+    # absorption silently turns the alias into a direct summand).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            w = ranef(g) .+ b .* x
+            mu = a .+ w
+            y .~ Normal.(mu, sigma)
+            sigma ~ Exponential(1)
+            ranef_bucket(g) do
+                mu => [1]
+            end
+        end, (:y, :x, :g))
     # Reserved names.
     @test_throws SurfaceLoweringError lower_rkppl(quote
             ranef = 1.0
@@ -339,10 +351,11 @@ end
             :s => ["a", "b", "a", "b"], :g => cols[:g]))
 end
 
-@testset "ranef generator arm" begin
+@testset "ranef Stage-B gate" begin
     cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5],
         :x => [0.5, -1.0, 1.5, 0.0], :g => [1, 2, 1, 2])
-    plan = lower_rkppl(quote
+    # K=1 buckets build (intercept + slope); LKJ-correlated still refuses.
+    iplan = lower_rkppl(quote
             a ~ Normal(0, 1)
             mu = a .+ ranef(g)
             y .~ Normal.(mu, 1.5)
@@ -350,6 +363,245 @@ end
                 mu => [1]
             end
         end, (:y, :x, :g))
+    ibuilt = build_kernel(bind_data(iplan, cols))
+    # a + log_scale_g + 2 xi cells.
+    @test ibuilt.layout.total == 4
+    splan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [x]
+            end
+        end, (:y, :x, :g))
+    sbuilt = build_kernel(bind_data(splan, cols))
+    @test sbuilt.layout.total == 4
+    cplan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1, x]
+            end
+        end, (:y, :x, :g))
+    @test_throws ContractValidationError build_kernel(bind_data(cplan, cols))
+    idplan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(:ID, g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(:ID, g) do
+                mu => [1]
+            end
+        end, (:y, :x, :g))
+    # K=1 with |ID| is :correlated (Stage C owns it).
+    @test_throws ContractValidationError build_kernel(bind_data(idplan, cols))
+end
+
+@testset "ranef K=1 names" begin
+    iplan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1]
+            end
+        end, (:y, :x, :g))
+    ib = only(iplan.ranef_buckets)
+    @test ib.kind === :intercept1
+    @test ReactiveKernelsPPL._ranef_k1_names(ib) ===
+        (:log_scale_g, :xi_g)
+    splan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [x]
+            end
+        end, (:y, :x, :g))
+    sb = only(splan.ranef_buckets)
+    @test sb.kind === :slope1
+    @test ReactiveKernelsPPL._ranef_k1_names(sb) === (:tau_g, :xi_g)
+    cplan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1, x]
+            end
+        end, (:y, :x, :g))
+    @test_throws ContractValidationError ReactiveKernelsPPL._ranef_k1_names(
+        only(cplan.ranef_buckets))
+    # Claims: user definitions cannot collide with K=1 names.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 1)
+            tau_g = 1.0
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [x]
+            end
+        end, (:y, :x, :g))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1]
+            end
+            xi_g ~ Normal(0, 1)
+        end, (:y, :x, :g))
+    # Name tables: a hand-built parameter under a K=1 name fails.
+    clash = _rbase(; with_gather = true)
+    push!(clash.parameters, SampledParameter(:log_scale_g, :normal,
+        (arg1 = 0, arg2 = 1), nothing, :log_scale_g))
+    push!(clash.ranef_buckets, RanefBucket(nothing, :g, :intercept1,
+        RanefMargin[RanefMargin(:mu, :Intercept,
+            RanefZRecipe(:ones, :none, nothing))],
+        [(:mu, 1:1)], NaN, :bucket_g))
+    @test_throws ContractValidationError validate_structure(clash)
+end
+
+function _rk1_cols()
+    g = ["b", "a", "c", "a", "b", "c", "a", "b"]
+    y = [0.5, -0.2, 0.8, 0.1, -0.5, 0.3, 0.0, 0.2]
+    return Dict{Symbol,AbstractVector}(:g => g, :y => y), g, y
+end
+
+@testset "ranef K=1 layout" begin
+    cols, _, _ = _rk1_cols()
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [1]
+            end
+        end, (:y, :g))
     bound = bind_data(plan, cols)
-    @test_throws ContractValidationError build_kernel(bound)
+    layout = assign_layout(bound)
+    @test [e.kind for e in layout.entries] ==
+        [:coefficient, :sampled, :sampled, :ranef]
+    @test [e.size for e in layout.entries] == [1, 1, 1, 3]
+    @test [e.transform for e in layout.entries] ==
+        [:identity, :exp, :identity, :identity]
+    @test layout.total == 6
+    @test coordinate_names(layout)[2:3] ==
+        [:sigma, :log_scale_g]
+    u = [0.2, 0.1, -0.3, 0.4, 0.0, -0.1]
+    nt = constrain(layout, u)
+    @test nt.log_scale_g == -0.3 && nt.xi_g == [0.4, 0.0, -0.1]
+    @test unconstrain(layout, nt) ≈ u
+    @test logjac(layout, u) ≈ u[2]
+    # Slope bucket: tau rides :exp (Stan lower-bound Jacobian, no renorm).
+    splan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.0)
+            ranef_bucket(g) do
+                mu => [x]
+            end
+        end, (:y, :x, :g))
+    scols = Dict{Symbol,AbstractVector}(:g => cols[:g], :y => cols[:y],
+        :x => collect(1.0:8.0))
+    slayout = assign_layout(bind_data(splan, scols))
+    @test [e.kind for e in slayout.entries] ==
+        [:coefficient, :sampled, :ranef]
+    @test [e.transform for e in slayout.entries] ==
+        [:identity, :exp, :identity]
+    @test coordinate_names(slayout)[2] === :tau_g
+    us = [0.5, 0.3, 0.1, 0.2, 0.0]
+    @test logjac(slayout, us) ≈ us[2]
+end
+
+# Independent intercept reference: SB `exp(log_scale) * xi[idx]` shape
+# with explicit names/order (no contract helpers — this pins them).
+function _ref_ranef_intercept(bound, nt)
+    idx = [findfirst(==(v), ["a", "b", "c"]) for v in bound.columns[:g]]
+    r = exp(nt.log_scale_g) .* nt.xi_g[idx]
+    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), bound.columns[:y]))
+    pr = logpdf(Normal(0, 5), nt.mu[1]) + logpdf(Exponential(1), nt.sigma) +
+        logpdf(Normal(0, 1), nt.log_scale_g) +
+        sum(logpdf.(Normal(0, 1), nt.xi_g))
+    return (; ll, pr)
+end
+
+@testset "ranef intercept e2e values and gradient" begin
+    cols, _, _ = _rk1_cols()
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [1]
+            end
+        end, (:y, :g))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    u = [0.2, 0.1, -0.3, 0.4, 0.0, -0.1]
+    nt = constrain(built.layout, u)
+    ref = _ref_ranef_intercept(bound, nt)
+    @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
+    @test _query(built.spec, bound, :prior, u) ≈ ref.pr
+    @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + u[2]
+    _check_gradient(built.spec, bound, u)
+end
+
+# Independent slope reference: SB `tau * (xi[idx] .* Z)` association.
+function _ref_ranef_slope(bound, nt, Z)
+    idx = [findfirst(==(v), [1, 2, 3]) for v in bound.columns[:g]]
+    r = nt.tau_g .* (nt.xi_g[idx] .* Z)
+    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), bound.columns[:y]))
+    pr = logpdf(Normal(0, 5), nt.mu[1]) + logpdf(Exponential(1), nt.sigma) +
+        logpdf(Normal(0, 1), nt.tau_g) +
+        sum(logpdf.(Normal(0, 1), nt.xi_g))
+    return (; ll, pr)
+end
+
+@testset "ranef slope e2e values and gradient" begin
+    _, _, y = _rk1_cols()
+    g2 = [2, 1, 3, 1, 2, 3, 1, 2]
+    x2 = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0, 2.0, -1.5]
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [x]
+            end
+        end, (:y, :x, :g))
+    bound = bind_data(plan,
+        Dict{Symbol,AbstractVector}(:g => g2, :y => y, :x => x2))
+    built = build_kernel(bound)
+    u = [0.2, 0.1, -0.2, 0.3, 0.0, -0.1]
+    nt = constrain(built.layout, u)
+    ref = _ref_ranef_slope(bound, nt, x2)
+    @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
+    # No +log(2): SB Stan-convention tau (see the generator comment).
+    @test _query(built.spec, bound, :prior, u) ≈ ref.pr
+    @test _query(built.spec, bound, :posterior, u) ≈
+        ref.ll + ref.pr + u[2] + u[3]
+    _check_gradient(built.spec, bound, u)
+    # Dummy-Z slope: same shape, indicator Z.
+    c3 = [1, 2, 2, 1, 2, 1, 2, 1]
+    dplan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [dummy(c, 2)]
+            end
+        end, (:y, :c, :g))
+    dbound = bind_data(dplan,
+        Dict{Symbol,AbstractVector}(:g => g2, :y => y, :c => c3))
+    dbuilt = build_kernel(dbound)
+    dnt = constrain(dbuilt.layout, u)
+    dref = _ref_ranef_slope(dbound, dnt, Float64.([v == 2 for v in c3]))
+    @test _query(dbuilt.spec, dbound, :likelihood, u) ≈ dref.ll
+    @test _query(dbuilt.spec, dbound, :prior, u) ≈ dref.pr
+    @test _query(dbuilt.spec, dbound, :posterior, u) ≈
+        dref.ll + dref.pr + u[2] + u[3]
 end

@@ -1073,4 +1073,99 @@ docs_example = (;
 )
 """
 
+# Exact-GP latent construct (plain Julia functions, NOT @kernel sources:
+# the PPL splices these calls into generated code like any other Julia
+# call, and Enzyme differentiates the straight-line arithmetic natively).
+# Native path only: Reactant reverse through dense Cholesky gradients is
+# upstream-blocked (EnzymeMLIR), so XLA over these stays unverified until
+# that gap closes. Written traceably (broadcasts/loops, no LAPACK) for that
+# day — the potrf below is pure Julia precisely because Enzyme cannot
+# differentiate LAPACK.
+export gp_exp_quad_cov, gp_chol_latent
+
+"""
+    gp_exp_quad_cov(x, sigma, rho, jitter) -> Matrix{Float64}
+
+Isotropic squared-exponential covariance (Stan `gp_exp_quad_cov` math):
+`K[i,j] = σ² exp(−(xᵢ−xⱼ)² / 2ρ²)`, plus `jitter` on the diagonal.
+`x` is one axis (iso first); `sigma`/`rho` are positive scalars.
+Matrix locations (aniso) and periodic kernels are sequenced and fail
+closed. Validates args (`ArgumentError`, never silent `NaN`s).
+"""
+function gp_exp_quad_cov(x::AbstractVector, sigma::Real, rho::Real,
+        jitter::Real)
+    n = length(x)
+    n >= 1 || throw(ArgumentError(
+        "gp_exp_quad_cov needs at least one location, got n = $n"))
+    sigma > 0 || throw(ArgumentError(
+        "gp_exp_quad_cov sigma must be positive, got $sigma"))
+    rho > 0 || throw(ArgumentError(
+        "gp_exp_quad_cov rho must be positive, got $rho"))
+    isfinite(jitter) && jitter >= 0 || throw(ArgumentError(
+        "gp_exp_quad_cov jitter must be finite and nonnegative, got $jitter"))
+    s2 = Float64(sigma)^2
+    denom = 2 * Float64(rho)^2
+    jit = Float64(jitter)
+    K = Matrix{Float64}(undef, n, n)
+    @inbounds for j_ in 1:n, i in 1:n
+        d = Float64(x[i]) - Float64(x[j_])
+        K[i, j_] = s2 * exp(-d * d / denom) + (i == j_ ? jit : 0.0)
+    end
+    return K
+end
+
+function gp_exp_quad_cov(x::AbstractMatrix, sigma::Real, rho,
+        jitter::Real)
+    throw(ArgumentError(
+        "gp_exp_quad_cov with matrix locations (aniso, one rho per axis) " *
+        "is sequenced after the isotropic slice — pass one axis vector"))
+end
+
+"""
+    gp_chol_latent(K, z) -> Vector{Float64}
+
+Non-centred GP draw: lower-Cholesky-factor `K` (pure-Julia potrf, no
+LAPACK) times the standard-normal vector `z`. Only the lower triangle
+of `K` is read. Square/length checked; a non-positive pivot throws
+`ArgumentError` naming jitter (never a silent `DomainError` from `sqrt`).
+"""
+function gp_chol_latent(K::AbstractMatrix, z::AbstractVector)
+    n = size(K, 1)
+    size(K, 2) == n || throw(ArgumentError(
+        "gp_chol_latent needs a square covariance, got $(size(K))"))
+    length(z) == n || throw(ArgumentError(
+        "gp_chol_latent z has length $(length(z)) for a $n×$n covariance"))
+    L = Matrix{Float64}(K)
+    _gp_potrf!(L)
+    f = Vector{Float64}(undef, n)
+    @inbounds for i in 1:n
+        acc = 0.0
+        for j_ in 1:i
+            acc += L[i, j_] * Float64(z[j_])
+        end
+        f[i] = acc
+    end
+    return f
+end
+
+function _gp_potrf!(L::Matrix{Float64})
+    n = size(L, 1)
+    @inbounds for j_ in 1:n
+        for k in 1:j_-1
+            L[j_, j_] -= L[j_, k] * L[j_, k]
+        end
+        L[j_, j_] > 0 || throw(ArgumentError(
+            "gp_chol_latent covariance is not positive definite " *
+            "(non-positive pivot at $j_ — increase jitter)"))
+        L[j_, j_] = sqrt(L[j_, j_])
+        for i in j_+1:n
+            for k in 1:j_-1
+                L[i, j_] -= L[i, k] * L[j_, k]
+            end
+            L[i, j_] /= L[j_, j_]
+        end
+    end
+    return L
+end
+
 end # module DistributionKernelSources
