@@ -34,6 +34,11 @@ const ParamName = Symbol
     BinomialLogitFam
     NegativeBinomial2Fam
     GammaLogFam
+    BernoulliProbitFam
+    BernoulliCloglogFam
+    BinomialProbitFam
+    BinomialCloglogFam
+    BetaLogitFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -42,6 +47,8 @@ inverse-link numerics (R1 counter)."""
     IdentityLink
     LogitLink
     LogLink
+    ProbitLink
+    CloglogLink
 end
 
 """Slice-1 predictor term kinds (core set; stretch adds variants later).
@@ -390,6 +397,11 @@ const ADMITTED_TRIPLES = (
     (BinomialLogitFam, LogitLink, IdentityLink),
     (NegativeBinomial2Fam, LogLink, LogLink),
     (GammaLogFam, LogLink, LogLink),
+    (BernoulliProbitFam, ProbitLink, IdentityLink),
+    (BernoulliCloglogFam, CloglogLink, IdentityLink),
+    (BinomialProbitFam, ProbitLink, IdentityLink),
+    (BinomialCloglogFam, CloglogLink, IdentityLink),
+    (BetaLogitFam, LogitLink, IdentityLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order)."""
@@ -448,7 +460,9 @@ const ELEMENTWISE_FNS = (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs)
 
 """Families the thin layer can lower (ext handshake predicate)."""
 admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
-    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam)
+    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
+    BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
+    BinomialCloglogFam, BetaLogitFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
@@ -1476,14 +1490,14 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
             "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
     end
     col = plan.columns[r.response]
-    if r.family === BernoulliLogitFam
+    if _is_bernoulli_family(r.family)
         eltype(col) === Bool && return nothing
         eltype(col) <: Integer && all(x -> x == 0 || x == 1, col) && return nothing
         return _fail(r.label, "Bernoulli response must be Bool or 0/1 integers")
     elseif r.family === PoissonLogFam
         eltype(col) <: Integer && all(>=(0), col) && return nothing
         return _fail(r.label, "Poisson response must be non-negative integers")
-    elseif r.family === BinomialLogitFam
+    elseif _is_binomial_family(r.family)
         _is_count_column(col) && return nothing
         return _fail(r.label, "Binomial response must be non-negative integers")
     elseif r.family === NegativeBinomial2Fam
@@ -1500,6 +1514,13 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         (eltype(col) <: Real && all(>(0), col)) ||
             _fail(r.label, "Gamma response must be strictly positive numerics")
         return nothing
+    elseif r.family === BetaLogitFam
+        # Strictly inside (0, 1): the beta kernel guards 0 < x < 1, and at
+        # exactly 0/1 it is wrong for shapes ≤ 1 (says -Inf; truth is
+        # finite/+Inf) — fail closed instead of flowing a wrong value.
+        (eltype(col) <: Real && all(x -> 0 < x < 1, col)) ||
+            _fail(r.label, "Beta response must be numerics strictly inside (0, 1)")
+        return nothing
     else
         return _fail(r.label, "response family $(r.family) has no column rule")
     end
@@ -1510,11 +1531,19 @@ end
 _is_count_column(col) =
     eltype(col) <: Integer && eltype(col) !== Bool && all(>=(0), col)
 
+# Bernoulli/Binomial span three link variants each (logit + slice-2
+# probit/cloglog); response/trials rules are link-independent.
+_is_bernoulli_family(f) =
+    f === BernoulliLogitFam || f === BernoulliProbitFam || f === BernoulliCloglogFam
+_is_binomial_family(f) =
+    f === BinomialLogitFam || f === BinomialProbitFam || f === BinomialCloglogFam
+
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     need = r.family === GaussianFam ? "Gaussian response requires a scale" :
         r.family === NegativeBinomial2Fam ?
         "NB2 response requires a dispersion phi" :
-        r.family === GammaLogFam ? "Gamma response requires a shape alpha" : nothing
+        r.family === GammaLogFam ? "Gamma response requires a shape alpha" :
+        r.family === BetaLogitFam ? "Beta response requires a concentration kappa" : nothing
     if need === nothing
         r.scale === nothing ||
             _fail(r.label, "this response family takes no scale auxiliary")
@@ -1534,7 +1563,7 @@ function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
 end
 
 function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
-    if r.family !== BinomialLogitFam
+    if !_is_binomial_family(r.family)
         r.trials === nothing ||
             _fail(r.label, "only Binomial responses take trials")
         return nothing

@@ -17,8 +17,10 @@ using ReactiveKernels
 
 export ColumnRef, ParamName
 export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
-    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam
-export LinkFunction, IdentityLink, LogitLink, LogLink
+    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
+    BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
+    BinomialCloglogFam, BetaLogitFam
+export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export PopulationPrior, SampledParameter, PlateParameter, AssignmentSpec, VectorAssignmentSpec
