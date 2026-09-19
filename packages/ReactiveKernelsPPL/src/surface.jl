@@ -687,8 +687,12 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     loop = st.args[3]
     asg = loop.args[1]
     asg isa Expr && asg.head === :block &&
-        _sfail("`@plate` takes one loop variable (multi-index plates " *
-               "are planned)")
+        _sfail("`@plate` takes one loop variable — multi-index " *
+               "`@plate for i in …, j in …` does not lower. Crossed/nested " *
+               "group effects use factor terms (`c[levels(g)]`, slice-C " *
+               "`FactorTerm`+`LevelMap`); a shared-prior multi-index grid " *
+               "equals a single-index plate over `n_obs`; multi-index " *
+               "observations need an N-D response this model class lacks")
     (asg isa Expr && asg.head === :(=) && length(asg.args) == 2 &&
         asg.args[1] isa Symbol) ||
         _sfail("`@plate` loop must be `for i in R`")
@@ -746,7 +750,9 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params)
                          "assignments only")
     if c.head === :macrocall && !isempty(c.args) &&
             c.args[1] === Symbol("@plate")
-        _sfail("nested `@plate` blocks do not lower")
+        _sfail("nested `@plate` blocks are not a StanBlocks form — use " *
+               "factor/levels for crossed effects (`c[levels(g)]`), `@scan` " *
+               "for sequential recurrence")
     end
     if _is_broadcast_sample(c)
         _sfail("cells are scalar (`~`); broadcast (`.~`) at top level")

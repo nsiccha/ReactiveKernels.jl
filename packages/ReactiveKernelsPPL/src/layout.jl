@@ -1,10 +1,14 @@
 # Packed layout + transforms (D5b thin-layer-owned).
 #
-# Transform statement shapes copy `@ppl` exactly (forward + inverse edges, no
-# `log(exp(x))` round trips): positive uses the unconstrained value as its
-# Jacobian term, unit-interval uses `log(x) + log1p(-x)` from the constrained
-# value. Host-side numerics use the IDENTICAL operations so in-graph and
-# host evaluation agree bit-for-bit.
+# SCALAR constrained-parameter transforms are provided by the reusable bijector
+# library (`bijectors.jl`, decision 0l3dsru): the in-graph generator splices
+# each bijector's `constrain`/`logjac` endpoints and the host path runs the
+# same prepared endpoints, so in-graph and host evaluation agree by
+# construction (structural), not by hand-kept duplication. `:identity` (real
+# support) is a genuine no-op and stays a direct read in both paths. Per-cell
+# (plate) blocks route their HOST transform through the same library; their
+# in-graph edges are still a hand-rolled broadcast form (extending the bijector
+# splice to the plate graph is a follow-up).
 
 """
     support_of(family, override) -> Symbol
@@ -251,32 +255,30 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
     return total
 end
 
-_constrain_value(::Val{:identity}, u) = u
-_constrain_value(::Val{:exp}, u) = exp(u)
-_constrain_value(::Val{:logistic}, u) = 1 / (1 + exp(-u))
+# Host transform values route through the bijector library (the single source
+# of truth shared with the in-graph splices); `:identity` is a genuine no-op.
+_constrain_value(transform::Symbol, u) =
+    transform === :identity ? u : _prepared_endpoint(transform, :constrain)(u)
+_unconstrain_value(transform::Symbol, x) =
+    transform === :identity ? x : _prepared_endpoint(transform, :unconstrain)(x)
+_logjac_value(transform::Symbol, u) =
+    transform === :identity ? 0.0 : _prepared_endpoint(transform, :logjac)(u)
 
-_unconstrain_value(::Val{:identity}, x) = x
-_unconstrain_value(::Val{:exp}, x) = log(x)
-_unconstrain_value(::Val{:logistic}, x) = log(x) - log1p(-x)
-
-_logjac_value(::Val{:identity}, u) = 0.0
-_logjac_value(::Val{:exp}, u) = u
-function _logjac_value(::Val{:logistic}, u)
-    x = 1 / (1 + exp(-u))
-    return log(x) + log1p(-x)
-end
-
-# Entry-level constrain/unconstrain/log-Jacobian: an :interval transform maps
-# ℝ → (lo, hi) via an affine-logistic (`lo + (hi-lo)·σ(u)`) and its log-Jacobian
-# is `log(x-lo) + log(hi-x) - log(hi-lo)` in the CONSTRAINED value (identical
-# operations to the in-graph terms, so host and graph agree bit-for-bit); every
-# other transform ignores the bounds.
+# Entry-level constrain/unconstrain/log-Jacobian. `:exp`/`:logistic` route
+# through the bijector library (`_constrain_value(transform::Symbol, …)`, the
+# single source of truth shared with the in-graph splices). An `:interval`
+# transform is PARAMETERIZED by per-entry bounds, so it does not fit the
+# Symbol-keyed parameterless bijector registry (like `:identity`, it lives
+# outside it): it maps ℝ → (lo, hi) via an affine-logistic (`lo + (hi-lo)·σ(u)`)
+# with log-Jacobian `log(x-lo) + log(hi-x) - log(hi-lo)` in the CONSTRAINED
+# value. The in-graph interval edges (below) use the IDENTICAL operations, so
+# host and graph agree bit-for-bit.
 _constrain_elt(e::LayoutEntry, u) = e.transform === :interval ?
-    (e.lo + (e.hi - e.lo) / (1 + exp(-u))) : _constrain_value(Val(e.transform), u)
+    (e.lo + (e.hi - e.lo) / (1 + exp(-u))) : _constrain_value(e.transform, u)
 _unconstrain_elt(e::LayoutEntry, x) = e.transform === :interval ?
-    (log(x - e.lo) - log(e.hi - x)) : _unconstrain_value(Val(e.transform), x)
+    (log(x - e.lo) - log(e.hi - x)) : _unconstrain_value(e.transform, x)
 function _logjac_elt(e::LayoutEntry, u)
-    e.transform === :interval || return _logjac_value(Val(e.transform), u)
+    e.transform === :interval || return _logjac_value(e.transform, u)
     x = e.lo + (e.hi - e.lo) / (1 + exp(-u))
     return log(x - e.lo) + log(e.hi - x) - log(e.hi - e.lo)
 end
@@ -300,9 +302,10 @@ block_read(offset::Int, width::Int) =
 """
     transform_statements(entry) -> Vector{Expr}
 
-In-graph forward + inverse edges for one layout entry (`@ppl` shapes).
-Intermediate unconstrained vars use the reserved `_ppl_log_`/`_ppl_logit_`
-prefix.
+In-graph constrain edge(s) for one layout entry. Coefficient/scan slices read a
+`view`; a `:identity` sampled entry reads its scalar coordinate; a constrained
+sampled entry (`:exp`/`:logistic`) splices the bijector's `constrain` endpoint,
+which the planner inlines.
 """
 function transform_statements(e::LayoutEntry)
     if e.kind === :coefficient || e.kind === :scan
@@ -318,23 +321,12 @@ function transform_statements(e::LayoutEntry)
     end
     o = e.offset
     coord = coordinate_read(o)
-    if e.transform === :identity
-        return Expr[:($(e.name)::Float64 = $coord)]
-    elseif e.transform === :exp
-        u = Symbol(:_ppl_log_, e.name)
-        return Expr[
-            :($u::Float64 = $coord),
-            :($(e.name)::Float64 = exp($u)),
-            :($u::Float64 = log($(e.name))),
-        ]
-    elseif e.transform === :logistic
-        u = Symbol(:_ppl_logit_, e.name)
-        return Expr[
-            :($u::Float64 = $coord),
-            :($(e.name)::Float64 = 1 / (1 + exp(-$u))),
-            :($u::Float64 = log($(e.name)) - log1p(-$(e.name))),
-        ]
-    elseif e.transform === :interval
+    e.transform === :identity && return Expr[:($(e.name)::Float64 = $coord)]
+    if e.transform === :interval
+        # An :interval transform is parameterized by per-entry bounds, so it is
+        # not in the Symbol-keyed (parameterless) bijector registry — its
+        # forward + inverse edges are hand-rolled here, with the IDENTICAL math
+        # to the host `_*_elt` path so in-graph and host agree bit-for-bit.
         u = Symbol(:_ppl_int_, e.name)
         blo, bhi = e.lo, e.hi
         return Expr[
@@ -342,9 +334,12 @@ function transform_statements(e::LayoutEntry)
             :($(e.name)::Float64 = $blo + ($bhi - $blo) / (1 + exp(-$u))),
             :($u::Float64 = log($(e.name) - $blo) - log($bhi - $(e.name))),
         ]
-    else
-        throw(ContractValidationError("[layout] unknown transform $(e.transform)"))
     end
+    # Constrained supports splice the bijector's `constrain` endpoint; the
+    # planner inlines it (no runtime call survives) and shares `coord` with the
+    # Jacobian term via structural CSE.
+    bij = _bijector_name(e.transform)
+    return Expr[:($(e.name)::Float64 = $(bij)().constrain($coord))]
 end
 
 # Per-cell latent (plate) block: the scalar transform edges, broadcast over
@@ -390,9 +385,11 @@ end
 """
     jacobian_term(entry) -> Union{Nothing,Expr}
 
-This entry's log-Jacobian contribution (`nothing` for identity): the
-unconstrained value for `:exp`, `log(x) + log1p(-x)` for `:logistic`. A
-per-cell latent (plate) block contributes the SUM over its cells.
+This entry's log-Jacobian contribution (`nothing` for identity). A scalar
+constrained support splices the bijector's `logjac` endpoint over the same
+coordinate the `constrain` edge reads (shared via structural CSE); a per-cell
+latent (plate) block contributes the SUM over its cells from its hand-rolled
+broadcast edges.
 """
 function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing
@@ -413,15 +410,12 @@ function jacobian_term(e::LayoutEntry)
             throw(ContractValidationError("[layout] unknown transform $(e.transform)"))
         end
     end
-    if e.transform === :exp
-        u = Symbol(:_ppl_log_, e.name)
-        return :($u)
-    elseif e.transform === :logistic
-        return :(log($(e.name)) + log1p(-$(e.name)))
-    elseif e.transform === :interval
+    if e.transform === :interval
+        # Parameterized bounds ⇒ hand-rolled (not in the bijector registry);
+        # uses the constrained `e.name` from the interval constrain edge.
         blo, bhi = e.lo, e.hi
         return :(log($(e.name) - $blo) + log($bhi - $(e.name)) - log($bhi - $blo))
-    else
-        throw(ContractValidationError("[layout] unknown transform $(e.transform)"))
     end
+    bij = _bijector_name(e.transform)
+    return :($(bij)().logjac($(coordinate_read(e.offset))))
 end
