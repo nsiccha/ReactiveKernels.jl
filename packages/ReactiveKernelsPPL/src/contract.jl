@@ -71,6 +71,7 @@ random-effects / per-observation-latent location."""
     OffsetTerm
     LatentTerm
     RanefGatherTerm
+    SplineSummandTerm
 end
 
 """
@@ -376,6 +377,59 @@ VectorParameter(name::ParamName, family::Symbol, args::NamedTuple,
     VectorParameter(name, family, args, size, name)
 
 """
+    SplineBasisBlock(name, width, columns)
+
+One fitted basis block (`:fixed`, `:pen`, `:rr`, `:rn`, `:nr`): `width`
+is static from `k` (known at lowering); `columns` holds the materialized
+bound-vector names, filled at bind (empty pre-bind).
+"""
+struct SplineBasisBlock
+    name::Symbol
+    width::Int
+    columns::Vector{Symbol}
+end
+
+"""
+    SplineBasis(id, kind, axes, k, blocks, label)
+
+One spline term's basis recipe (SB mirror): `kind` is `:tps` (`s(x)`,
+one axis) or `:t2` (`t2(x,z)`, two axes); `k` is the basis dimension
+(`Int` for `s`, `(Int,Int)` for `t2`). `blocks` are static in
+name/width (`:fixed`/`:pen` for `s`, `:fixed`/`:rr`/`:rn`/`:nr` for
+`t2`); bind fits the basis from the raw `axes` columns (host-side
+transformed-data mirror — eigen is inexpressible in-graph) and fills
+each block's materialized `columns`. A term feeds exactly one predictor
+(the `spline(:id)` use-site).
+"""
+struct SplineBasis
+    id::Symbol
+    kind::Symbol
+    axes::Vector{Symbol}
+    k::Union{Int,Tuple{Int,Int}}
+    blocks::Vector{SplineBasisBlock}
+    label::Symbol
+end
+
+"""
+    SplineVector(name, family, args, support_override, width, basis, label)
+
+One free spline coefficient block (SB `_sb_s_generic`/`_sb_t2_generic`):
+flat `b_fixed`, standard-normal `b_*_raw`, half-normal `sd` (`:normal`
++ `:positive`). `width` is static from `k`; `basis` is the owning
+[`SplineBasis`](@ref) id. Layout packs each as one contiguous block
+(plate-shaped); priors broadcast over cells.
+"""
+struct SplineVector
+    name::Symbol
+    family::Symbol
+    args::NamedTuple
+    support_override::SupportOverride
+    width::Int
+    basis::Symbol
+    label::Symbol
+end
+
+"""
     AssignmentSpec(name, expr)
 
 One scalar temporary (slice 1): `expr` may reference scalar names and
@@ -515,11 +569,13 @@ struct StructuralPlan
     scans::Vector{ScanSpec}
     ranef_buckets::Vector{RanefBucket}
     vector_parameters::Vector{VectorParameter}
+    spline_bases::Vector{SplineBasis}
+    spline_vectors::Vector{SplineVector}
 end
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
-# before `levelmaps`/`scans`/`ranef_buckets`/`vector_parameters` existed keep
-# working with all empty.
+# before `levelmaps`/`scans`/`ranef_buckets`/`vector_parameters`/spline nodes
+# existed keep working with all empty.
 StructuralPlan(
     responses::Vector{LikelihoodSpec},
     predictors::Vector{PredictorSpec},
@@ -532,7 +588,7 @@ StructuralPlan(
     roles::Dict{Symbol,Symbol}) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[],
-        RanefBucket[], VectorParameter[])
+        RanefBucket[], VectorParameter[], SplineBasis[], SplineVector[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -556,10 +612,13 @@ function StructuralPlan(
         plate_parameters::Vector{PlateParameter} = PlateParameter[],
         scans::Vector{ScanSpec} = ScanSpec[],
         ranef_buckets::Vector{RanefBucket} = RanefBucket[],
-        vector_parameters::Vector{VectorParameter} = VectorParameter[])
+        vector_parameters::Vector{VectorParameter} = VectorParameter[],
+        spline_bases::Vector{SplineBasis} = SplineBasis[],
+        spline_vectors::Vector{SplineVector} = SplineVector[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, columns, n_obs, roles, levelmaps,
-        plate_parameters, scans, ranef_buckets, vector_parameters)
+        plate_parameters, scans, ranef_buckets, vector_parameters,
+        spline_bases, spline_vectors)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -615,14 +674,82 @@ const SAMPLED_SUPPORT = Dict{Symbol,Symbol}(
     :beta => :unit,
 )
 
+# Spline block/width/vector/name rules, derived purely from (kind, k):
+# the single source of truth shared by surface lowering (which builds the
+# nodes) and contract validation (which re-derives and compares). Widths
+# are static — the fit can only confirm them at bind, never change them.
+# Block order is SB's data order (:fixed first, then pen/rr/rn/nr); the t2
+# sd index follows the pen-block position (rr→1, rn→2, nr→3).
+function _spline_blocks(kind::Symbol, k::Union{Int,Tuple{Int,Int}})
+    if kind === :tps
+        k isa Int ||
+            _fail(:plan, "tps spline k must be an Int, got $(repr(k))")
+        return [(:fixed, 2), (:pen, k - 2)]
+    elseif kind === :t2
+        k isa Tuple{Int,Int} ||
+            _fail(:plan, "t2 spline k must be an (Int, Int) tuple, got " *
+                  repr(k))
+        k1, k2 = k
+        return [(:fixed, 3), (:rr, (k1 - 2) * (k2 - 2)),
+            (:rn, (k1 - 2) * 2), (:nr, 2 * (k2 - 2))]
+    end
+    return _fail(:plan, "spline kind must be :tps or :t2, got $(repr(kind))")
+end
+
+_spline_block_names(id::Symbol, block::Symbol, width::Int) =
+    [Symbol("$(id)_$(block)_$j") for j in 1:width]
+
+function _spline_basis_columns(id::Symbol, kind::Symbol, k)
+    return [(name, _spline_block_names(id, name == :fixed ?
+        (kind === :tps ? :Xnull : :Xfixed) : Symbol(:Z, name), w))
+            for (name, w) in _spline_blocks(kind, k)]
+end
+
+# Per-block emission roles + the shared sd-vector name: `(roles, sd)`
+# with roles `(block, coefficient-vector name, sd index or nothing)`.
+# The sd index follows the pen-block position (tps: the one pen block →
+# 1; t2: rr/rn/nr → 1/2/3, SB's `vector[3]` order).
+function _spline_block_roles(id::Symbol, kind::Symbol, k)
+    roles = Tuple{Symbol,Symbol,Union{Nothing,Int}}[]
+    sdpos = 0
+    for (name, _) in _spline_blocks(kind, k)
+        if name === :fixed
+            push!(roles, (name, Symbol("b_$(id)_fixed"), nothing))
+        else
+            sdpos += 1
+            tag = kind === :tps ? :raw : Symbol("$(name)_raw")
+            push!(roles, (name, Symbol("b_$(id)_$tag"), sdpos))
+        end
+    end
+    return roles, Symbol("sd_$id")
+end
+
+function _spline_vector_specs(id::Symbol, kind::Symbol, k)
+    specs = Tuple{Symbol,Symbol,NamedTuple,SupportOverride,Int}[]
+    widths = Dict(first(b) => last(b) for b in _spline_blocks(kind, k))
+    roles, sd = _spline_block_roles(id, kind, k)
+    for (name, coef, sdidx) in roles
+        if sdidx === nothing
+            push!(specs, (coef, :flat, NamedTuple(), nothing, widths[name]))
+        else
+            push!(specs, (coef, :normal, (arg1=0, arg2=1), nothing,
+                widths[name]))
+        end
+    end
+    nsd = kind === :tps ? 1 : 3
+    push!(specs, (sd, :normal, (arg1=0, arg2=1), :positive, nsd))
+    return specs
+end
+
 """Slice-1 term-name vocabulary (emitter-side admission keys; `:ranef_gather`
-joined with the ranef slice)."""
+and `:spline_summand` joined with their slices)."""
 const TERM_NAMES = Dict{Symbol,TermKind}(
     :intercept => InterceptTerm,
     :continuous => ContinuousTerm,
     :factor => FactorTerm,
     :offset => OffsetTerm,
     :ranef_gather => RanefGatherTerm,
+    :spline_summand => SplineSummandTerm,
 )
 
 """Allowlisted assignment functions (slice 1: scalar ops + whole-column
@@ -660,7 +787,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
-    RanefGatherTerm)
+    RanefGatherTerm, SplineSummandTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate):
 scalar/reduction vocabulary plus vector-returning whole-column functions."""
@@ -714,6 +841,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_priors(plan)
     _validate_responses(plan)
     _validate_ranef_buckets(plan)
+    _validate_splines(plan)
     return nothing
 end
 
@@ -731,6 +859,7 @@ function validate_data(plan::StructuralPlan)
     _validate_response_data(plan)
     _validate_plate_parameters_data(plan)
     _validate_ranef_buckets_data(plan)
+    _validate_splines_data(plan)
     return nothing
 end
 
@@ -949,6 +1078,121 @@ function _validate_columns(plan::StructuralPlan)
     return nothing
 end
 
+function _validate_splines(plan::StructuralPlan)
+    ids = [sb.id for sb in plan.spline_bases]
+    length(unique(ids)) == length(ids) ||
+        _fail(:plan, "duplicate spline basis ids")
+    labels = [sb.label for sb in plan.spline_bases]
+    length(unique(labels)) == length(labels) ||
+        _fail(:plan, "duplicate spline basis labels")
+    for sb in plan.spline_bases
+        sb.kind === :tps || sb.kind === :t2 ||
+            _fail(:plan, "spline :$(sb.id): kind must be :tps or :t2, " *
+                  "got $(repr(sb.kind))")
+        if sb.kind === :tps
+            sb.k isa Int ||
+                _fail(:plan, "tps spline :$(sb.id): k must be an Int, " *
+                      "got $(repr(sb.k))")
+            sb.k > 2 ||
+                _fail(:plan, "tps spline :$(sb.id): k must exceed 2, " *
+                      "got $(sb.k)")
+            length(sb.axes) == 1 ||
+                _fail(:plan, "tps spline :$(sb.id): takes exactly one " *
+                      "axis column, got $(sb.axes)")
+        else
+            sb.k isa Tuple{Int,Int} ||
+                _fail(:plan, "t2 spline :$(sb.id): k must be an " *
+                      "(Int, Int) tuple, got $(repr(sb.k))")
+            all(k -> k > 2, sb.k) ||
+                _fail(:plan, "t2 spline :$(sb.id): k entries must " *
+                      "exceed 2, got $(repr(sb.k))")
+            length(sb.axes) == 2 ||
+                _fail(:plan, "t2 spline :$(sb.id): takes exactly two " *
+                      "axis columns, got $(sb.axes)")
+        end
+        want = _spline_blocks(sb.kind, sb.k)
+        got = [(b.name, b.width) for b in sb.blocks]
+        got == want || _fail(:plan,
+            "spline :$(sb.id): blocks are determined by (kind, k) alone " *
+            "— expected $want, got $got")
+        wantvec = _spline_vector_specs(sb.id, sb.kind, sb.k)
+        gotvec = [v.name for v in plan.spline_vectors if v.basis === sb.id]
+        sort!(gotvec)
+        wantnames = sort!([first(s) for s in wantvec])
+        gotvec == wantnames || _fail(:plan,
+            "spline :$(sb.id): spline-vectors must be exactly " *
+            "$wantnames, got $gotvec")
+        byname = Dict{Symbol,SplineVector}(v.name => v
+            for v in plan.spline_vectors if v.basis === sb.id)
+        for (vname, vfamily, vargs, vsupport, vwidth) in wantvec
+            v = byname[vname]
+            (v.family === vfamily && v.args == vargs &&
+             v.support_override === vsupport && v.width == vwidth) ||
+                _fail(:plan, "spline :$(sb.id): vector :$vname must be " *
+                      "$vfamily$(vargs) with support $(repr(vsupport)) " *
+                      "and width $vwidth — the prior structure is part " *
+                      "of the contract, not emitter's choice")
+        end
+        # Materialized <id>_<block>_<j> names are computable pre-bind
+        # (widths are static), so the sampler-scope clash check runs here
+        # rather than at bind. Names are unique across bases by
+        # construction (right-parse _<j> then the fixed block tag is
+        # unambiguous, and ids are unique), so no pairwise check.
+        wantcols = reduce(vcat, (last(b) for b in
+            _spline_basis_columns(sb.id, sb.kind, sb.k)); init=Symbol[])
+        union = _union_names(plan)
+        clash = filter(c -> c in union, wantcols)
+        isempty(clash) || _fail(:plan,
+            "spline :$(sb.id): materialized basis columns $clash collide " *
+            "with parameter/assignment names — rename the spline id")
+    end
+    idset = Set{Symbol}(ids)
+    for v in plan.spline_vectors
+        v.basis in idset ||
+            _fail(:plan, "spline vector :$(v.name) addresses unknown " *
+                  "basis :$(v.basis)")
+    end
+    # Basis linkage: every summand names an existing basis; every basis
+    # feeds exactly one summand (SB: a smooth has one target; a dangling
+    # basis would sample dead parameters, a double use double-counts).
+    uses = Dict{Symbol,Int}(id => 0 for id in ids)
+    for pred in plan.predictors, t in pred.terms
+        t.kind === SplineSummandTerm || continue
+        sid = t.options.spline_id
+        haskey(uses, sid) ||
+            _fail(t.label, "spline summand addresses unknown basis :$sid")
+        uses[sid] += 1
+    end
+    for (id, n) in uses
+        n == 1 || _fail(:plan,
+            "spline :$id is used by $n summands — exactly one " *
+            "(one target per smooth)")
+    end
+    return nothing
+end
+
+function _validate_splines_data(plan::StructuralPlan)
+    for sb in plan.spline_bases
+        for c in sb.axes
+            haskey(plan.columns, c) ||
+                _fail(sb.label, "spline :$(sb.id): axis column $c is " *
+                      "not bound")
+            _is_derived(plan, c) &&
+                _fail(sb.label, "spline :$(sb.id): axis column $c must " *
+                      "be raw data (the bind-time fit needs bound values)")
+            eltype(plan.columns[c]) <: Real ||
+                _fail(sb.label, "spline :$(sb.id): axis column $c must " *
+                      "be numeric, got $(eltype(plan.columns[c]))")
+        end
+        for b in sb.blocks, c in b.columns
+            haskey(plan.columns, c) ||
+                _fail(sb.label, "spline :$(sb.id): materialized basis " *
+                      "column $c (block :$(b.name)) is not bound")
+        end
+    end
+    return nothing
+end
+
 function _validate_name_tables(plan::StructuralPlan)
     pnames = [p.name for p in plan.predictors]
     length(unique(pnames)) == length(pnames) ||
@@ -959,6 +1203,7 @@ function _validate_name_tables(plan::StructuralPlan)
     plates = [p.name for p in plan.plate_parameters]
     scanstates = [s.state for s in plan.scans]
     vectors = [p.name for p in plan.vector_parameters]
+    svec = [v.name for v in plan.spline_vectors]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
@@ -970,6 +1215,8 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate scan-state names")
     length(unique(vectors)) == length(vectors) ||
         _fail(:plan, "duplicate vector-parameter names")
+    length(unique(svec)) == length(svec) ||
+        _fail(:plan, "duplicate spline-vector names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
         (assigns, deriveds, "assignments and derived columns"),
@@ -984,23 +1231,30 @@ function _validate_name_tables(plan::StructuralPlan)
         (vectors, assigns, "vector parameters and assignments"),
         (vectors, deriveds, "vector parameters and derived columns"),
         (vectors, plates, "vector parameters and plate parameters"),
-        (vectors, scanstates, "vector parameters and scan states"))
+        (vectors, scanstates, "vector parameters and scan states"),
+        (svec, params, "spline vectors and parameters"),
+        (svec, assigns, "spline vectors and assignments"),
+        (svec, deriveds, "spline vectors and derived columns"),
+        (svec, plates, "spline vectors and plate parameters"),
+        (svec, scanstates, "spline vectors and scan states"),
+        (vectors, svec, "vector parameters and spline vectors"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
-    allnames = union(params, assigns, deriveds, plates, scanstates, vectors)
+    allnames = union(params, assigns, deriveds, plates, scanstates, vectors,
+        svec)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector name",
+            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/spline name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived/plate/scan/vector $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate/scan/vector/spline $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec))
         _check_name_hygiene(n)
     end
     return nothing
@@ -1687,6 +1941,10 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
         _validate_gather_term(t, pred)
         return nothing
     end
+    if t.kind === SplineSummandTerm
+        _validate_spline_term(t, pred)
+        return nothing
+    end
     t.options == NamedTuple() ||
         _fail(t.label, "terms take no options (slice 1: factor sizing " *
                        "lives in LevelMap)")
@@ -1738,6 +1996,28 @@ function _validate_gather_term(t::TermSpec, pred::PredictorSpec)
               "column [$(o.bucket_group)], got $(t.columns)")
     t.addressee === t.label ||
         _fail(t.label, "ranef gather addressee must be its own label " *
+              "(self-addressed, no population prior), got $(t.addressee)")
+    return nothing
+end
+
+# A spline summand names its basis by id in `options` and carries no
+# columns (basis vectors materialize at bind — unnameable pre-bind); its
+# addressee is its own label (self-addressed: no population prior).
+# Basis linkage (existence, single target, no dangling) is checked jointly
+# in `_validate_splines`, which sees predictors and bases together.
+function _validate_spline_term(t::TermSpec, pred::PredictorSpec)
+    o = t.options
+    Tuple(keys(o)) == (:spline_id,) ||
+        _fail(t.label, "spline summand options must be exactly " *
+              "`(spline_id,)`, got $(Tuple(keys(o)))")
+    o.spline_id isa Symbol ||
+        _fail(t.label, "spline summand spline_id must be a Symbol, " *
+              "got $(repr(o.spline_id))")
+    isempty(t.columns) ||
+        _fail(t.label, "spline summand carries no columns (basis vectors " *
+              "materialize at bind), got $(t.columns)")
+    t.addressee === t.label ||
+        _fail(t.label, "spline summand addressee must be its own label " *
               "(self-addressed, no population prior), got $(t.addressee)")
     return nothing
 end
@@ -1935,11 +2215,11 @@ function _validate_priors(plan::StructuralPlan)
     for pred in plan.predictors
         # Offset terms carry no coefficient; latent terms carry the per-cell
         # PlateParameter, whose prior lives on the plate parameter itself;
-        # gather terms carry a RanefBucket, whose geometry is self-priored —
-        # none needs a coefficient prior here.
+        # gather terms carry a RanefBucket and spline summands a SplineBasis,
+        # whose geometries are self-priored — none needs a coefficient prior.
         addressees = Set{Symbol}(t.addressee for t in pred.terms
             if t.kind !== OffsetTerm && t.kind !== LatentTerm &&
-               t.kind !== RanefGatherTerm)
+               t.kind !== RanefGatherTerm && t.kind !== SplineSummandTerm)
         any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
         for a in addressees
             (pred.name, a) in seen ||
@@ -2570,6 +2850,55 @@ const _ROLE_RANK = Dict{Symbol,Int}(
 _upgrade_role!(roles, col, role) =
     _ROLE_RANK[roles[col]] < _ROLE_RANK[role] && (roles[col] = role)
 
+# Bind-time spline fit (the Stan transformed-data mirror): fit each basis
+# from its raw axis columns (host, full LAPACK — eigen/nullspace are
+# inexpressible in-graph), assert the fitted widths equal the declared
+# static widths, and materialize one bound vector per basis column under
+# the contract's <id>_<block>_<j> names. Caller-supplied columns under a
+# materialized name are rejected (reserved-name exclusivity); the fit's
+# own errors surface as ContractValidationErrors with the [spline] tag.
+function _materialize_splines!(plan::StructuralPlan,
+        columns::Dict{Symbol,AbstractVector})
+    isempty(plan.spline_bases) && return SplineBasis[]
+    out = SplineBasis[]
+    for sb in plan.spline_bases
+        axes = AbstractVector[]
+        for c in sb.axes
+            haskey(columns, c) ||
+                _fail(sb.label, "spline :$(sb.id): axis column $c is " *
+                      "not bound")
+            eltype(columns[c]) <: Real ||
+                _fail(sb.label, "spline :$(sb.id): axis column $c must " *
+                      "be numeric, got $(eltype(columns[c]))")
+            push!(axes, columns[c])
+        end
+        wantcols = _spline_basis_columns(sb.id, sb.kind, sb.k)
+        for (_, cols) in wantcols, c in cols
+            haskey(columns, c) && _fail(sb.label,
+                "column $c is reserved for spline :$(sb.id)'s " *
+                "materialized basis — rename the caller-supplied column")
+        end
+        mats = sb.kind === :tps ?
+            collect(_rk_apply_spline(_rk_fit_spline(axes[1]; k=sb.k),
+                axes[1])) :
+            collect(_rk_apply_t2(_rk_fit_t2(axes[1], axes[2]; k=sb.k),
+                axes[1], axes[2]))
+        blocks = SplineBasisBlock[]
+        for (bi, (name, cols)) in enumerate(wantcols)
+            size(mats[bi], 2) == length(cols) || _fail(sb.label,
+                "spline :$(sb.id): fitted block :$name has width " *
+                "$(size(mats[bi], 2)), declared $(length(cols))")
+            for (j, c) in enumerate(cols)
+                columns[c] = Vector{Float64}(mats[bi][:, j])
+            end
+            push!(blocks, SplineBasisBlock(name, length(cols), cols))
+        end
+        push!(out, SplineBasis(sb.id, sb.kind, sb.axes, sb.k, blocks,
+            sb.label))
+    end
+    return out
+end
+
 """
     bind_data(plan, columns; roles=Dict()) -> StructuralPlan
 
@@ -2588,6 +2917,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     isempty(columns) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
     columns = Dict{Symbol,AbstractVector}(columns)
+    bases = _materialize_splines!(plan, columns)
     for (k, v) in roles
         haskey(columns, k) || throw(ContractValidationError(
             "[bind] role for unknown column $k"))
@@ -2600,6 +2930,9 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     end
     for b in plan.ranef_buckets
         haskey(inferred, b.group) && _upgrade_role!(inferred, b.group, :group)
+    end
+    for sb in bases, blk in sb.blocks, c in blk.columns
+        haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
     end
     for r in plan.responses
         r.weights !== nothing && haskey(inferred, r.weights) &&
@@ -2630,7 +2963,8 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         columns, n; roles = merged, derived = plan.derived,
         levelmaps = maps, plate_parameters = plan.plate_parameters,
         scans = plan.scans, ranef_buckets = plan.ranef_buckets,
-        vector_parameters = vectors2)
+        vector_parameters = vectors2, spline_bases = bases,
+        spline_vectors = plan.spline_vectors)
     validate_data(bound)
     return bound
 end

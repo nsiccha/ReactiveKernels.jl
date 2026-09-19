@@ -25,10 +25,11 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
-    RanefGatherTerm
+    RanefGatherTerm, SplineSummandTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec
 export RanefZRecipe, RanefMargin, RanefBucket
+export SplineBasisBlock, SplineBasis, SplineVector
 export LevelMap
 export StructuralPlan
 export ContractValidationError, validate_plan, validate_structure, validate_data

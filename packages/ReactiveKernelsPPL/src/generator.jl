@@ -136,12 +136,52 @@ function _predictor_statements(plan::StructuralPlan)
         for b in shape.blocks
             b.kind === LatentTerm && push!(terms, b.column)
         end
+        # A spline summand contributes its basis's direct summand expression
+        # (SB's `X*b + Z*(sd*z)` shape over materialized basis columns and
+        # SplineVector layout blocks).
+        for b in shape.blocks
+            b.kind === SplineSummandTerm &&
+                push!(terms, _spline_summand_expr(plan, b.column))
+        end
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
         rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
         push!(stmts, :($lp = $rhs))
     end
     return stmts
+end
+
+# One basis's direct summand as a scaled-column sum (SB `_sb_s_generic` /
+# `_sb_t2_generic`): fixed blocks `X[j] .* b[j]`, pen blocks
+# `Z[j] .* (sd[k] * r[j])`, all joined with `.+`. Reads the BOUND basis's
+# materialized columns (bind asserted widths) and the `_spline_block_roles`
+# vector names (the contract's single source — no re-derivation here).
+function _spline_summand_expr(plan::StructuralPlan, id::Symbol)
+    i = findfirst(b -> b.id === id, plan.spline_bases)
+    i === nothing && throw(ContractValidationError(
+        "[generator] spline summand addresses unknown basis :$id"))
+    sb = plan.spline_bases[i]
+    byblock = Dict{Symbol,SplineBasisBlock}(b.name => b for b in sb.blocks)
+    roles, sd = _spline_block_roles(sb.id, sb.kind, sb.k)
+    parts = Any[]
+    for (block, coef, sdidx) in roles
+        haskey(byblock, block) || throw(ContractValidationError(
+            "[generator] spline :$id basis is missing block :$block"))
+        cols = byblock[block].columns
+        isempty(cols) && throw(ContractValidationError(
+            "[generator] spline :$id block :$block has no materialized " *
+            "columns (bind_data fills these)"))
+        for (j, c) in enumerate(cols)
+            cel = Expr(:call, :.*, c, Expr(:ref, coef, j))
+            if sdidx !== nothing
+                scaled = Expr(:call, :*, Expr(:ref, sd, sdidx),
+                    Expr(:ref, coef, j))
+                cel = Expr(:call, :.*, c, scaled)
+            end
+            push!(parts, cel)
+        end
+    end
+    return foldl((a, b) -> :($a .+ $b), parts)
 end
 
 _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
@@ -818,16 +858,22 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     # `@kernel` plate expander, exactly as the Gaussian-likelihood scale is
     # threaded.
     for p in plan.plate_parameters
-        node = Symbol(:_ppl_prior_, p.name)
-        pw = Symbol(:_ppl_pw_prior_, p.name)
-        inputs = Any[p.name]
-        tv = _dovar(1)
-        argvals = Any[_thread_ref!(inputs, v) for v in values(p.args)]
-        cell = _family_logpdf_expr(p.family, argvals, tv)
-        corr = _support_correction(p.support_override, argvals)
-        corr === nothing || (cell = :($cell + $corr))
-        append!(stmts, _plate_sum_stmts(pw, node, inputs, cell))
-        push!(terms, node)
+        _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
+            p.support_override)
+    end
+    # Spline coefficient vectors: the same plate-prior shape (broadcast the
+    # shared prior over cells). `b_fixed` is flat — a 0.0 node, mirroring a
+    # scalar flat parameter (never a plate: a vacuous cell would leave the
+    # do-var unread).
+    for v in plan.spline_vectors
+        if v.family === :flat
+            node = Symbol(:_ppl_prior_, v.name)
+            push!(stmts, :($node::Float64 = 0.0))
+            push!(terms, node)
+            continue
+        end
+        _vector_prior_stmts!(stmts, terms, v.name, v.family, v.args,
+            v.support_override)
     end
     # Sequential-recurrence (scan) latents: setup + recurrence density.
     scanstmts, scannodes = _scan_prior_statements(plan, layout)
@@ -836,6 +882,27 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
     push!(stmts, :(prior::Float64 = $joint))
     return stmts
+end
+
+# One plate over a latent VECTOR (a plate parameter or a spline vector),
+# summing the shared-prior log-density across cells. Every value the cell
+# reads is threaded as a plate PORT (the vector plus each scalar prior
+# arg) — captured free names are rejected by the `@kernel` plate
+# expander, exactly as the Gaussian-likelihood scale is threaded.
+function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
+        name::Symbol, family::Symbol, args::NamedTuple,
+        support::SupportOverride)
+    node = Symbol(:_ppl_prior_, name)
+    pw = Symbol(:_ppl_pw_prior_, name)
+    inputs = Any[name]
+    tv = _dovar(1)
+    argvals = Any[_thread_ref!(inputs, v) for v in values(args)]
+    cell = _family_logpdf_expr(family, argvals, tv)
+    corr = _support_correction(support, argvals)
+    corr === nothing || (cell = :($cell + $corr))
+    append!(stmts, _plate_sum_stmts(pw, node, inputs, cell))
+    push!(terms, node)
+    return nothing
 end
 
 # Scalar prior log-density per family via distribution-kernel endpoints

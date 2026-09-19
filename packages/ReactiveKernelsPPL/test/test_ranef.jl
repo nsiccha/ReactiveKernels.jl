@@ -236,6 +236,18 @@ end
                 mu => [1]
             end
         end, (:y, :x, :g))
+    # Gather inside a STRUCTURAL definition (coefficient reference inlines
+    # even vector defs — the statement-level screen must catch it before
+    # absorption silently turns the alias into a direct summand).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            w = ranef(g) .+ b .* x
+            mu = a .+ w
+            y .~ Normal.(mu, sigma)
+            sigma ~ Exponential(1)
+            ranef_bucket(g) do
+                mu => [1]
+            end
+        end, (:y, :x, :g))
     # Reserved names.
     @test_throws SurfaceLoweringError lower_rkppl(quote
             ranef = 1.0
