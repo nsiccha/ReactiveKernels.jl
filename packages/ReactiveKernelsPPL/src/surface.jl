@@ -610,7 +610,8 @@ end
 # (plain: `ranef_bucket(g) do ... end`). Lowers directly to RanefBucket IR
 # (margins reference data columns + predictor names only — no det inlining,
 # so no lowering context needed). Claims the bucket + gather labels up
-# front so user definitions can never collide with Stage-B in-graph names.
+# front so user definitions can never collide with in-graph names (K=1
+# scale/xi, correlated L/tau/z).
 _is_bucket_stmt(st) =
     st isa Expr && st.head === :do && length(st.args) == 2 &&
     st.args[1] isa Expr && st.args[1].head === :call &&
@@ -729,6 +730,14 @@ function _lower_bucket(st::Expr, line::Int, data::Set{Symbol},
         for nm in _ranef_k1_names(b)
             _claim!(seen, seelines, nm, line)
         end
+    else
+        for nm in _ranef_corr_names(b)
+            _claim!(seen, seelines, nm, line)
+        end
+        # The derived draws `b_<suffix>` live in `constrain` output only
+        # (never sampled, never in-graph) — claimed so a user definition
+        # can never shadow them there.
+        _claim!(seen, seelines, Symbol("b_" * suffix), line)
     end
     return b
 end

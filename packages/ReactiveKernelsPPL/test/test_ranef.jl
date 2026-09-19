@@ -1,6 +1,9 @@
-# Ranef Stage A: bucket IR + surface lowering + validation (acceptance item 1
-# of the ranef todo). Codegen is NOT Stage A — `build_kernel` fails closed
-# (tested below); K=1 geometry lands in Stage B, LKJ-correlated in Stage C.
+# Ranef stages A–C: bucket IR + surface lowering + validation (Stage A),
+# K=1 codegen (Stage B), LKJ-correlated codegen (Stage C). All three
+# geometries build end to end (tested below).
+
+using LinearAlgebra: det
+using SpecialFunctions: loggamma
 
 function _rbucket(;
         id::Union{Nothing,Symbol} = :ID, group::Symbol = :g,
@@ -351,10 +354,10 @@ end
             :s => ["a", "b", "a", "b"], :g => cols[:g]))
 end
 
-@testset "ranef Stage-B gate" begin
+@testset "ranef Stage-C builds" begin
     cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5],
         :x => [0.5, -1.0, 1.5, 0.0], :g => [1, 2, 1, 2])
-    # K=1 buckets build (intercept + slope); LKJ-correlated still refuses.
+    # K=1 buckets build (intercept + slope); LKJ-correlated builds too.
     iplan = lower_rkppl(quote
             a ~ Normal(0, 1)
             mu = a .+ ranef(g)
@@ -384,7 +387,9 @@ end
                 mu => [1, x]
             end
         end, (:y, :x, :g))
-    @test_throws ContractValidationError build_kernel(bind_data(cplan, cols))
+    cbuilt = build_kernel(bind_data(cplan, cols))
+    # a + 1 theta + 2 tau + 2*2 z cells.
+    @test cbuilt.layout.total == 8
     idplan = lower_rkppl(quote
             a ~ Normal(0, 1)
             mu = a .+ ranef(:ID, g)
@@ -393,8 +398,10 @@ end
                 mu => [1]
             end
         end, (:y, :x, :g))
-    # K=1 with |ID| is :correlated (Stage C owns it).
-    @test_throws ContractValidationError build_kernel(bind_data(idplan, cols))
+    # K=1 with |ID| is :correlated (L packs zero coords).
+    idbuilt = build_kernel(bind_data(idplan, cols))
+    # a + 0 thetas + 1 tau + 2 z cells.
+    @test idbuilt.layout.total == 4
 end
 
 @testset "ranef K=1 names" begin
@@ -604,4 +611,427 @@ end
     @test _query(dbuilt.spec, dbound, :prior, u) ≈ dref.pr
     @test _query(dbuilt.spec, dbound, :posterior, u) ≈
         dref.ll + dref.pr + u[2] + u[3]
+end
+
+@testset "ranef correlated names" begin
+    cplan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1, x]
+            end
+        end, (:y, :x, :g))
+    cb = only(cplan.ranef_buckets)
+    @test cb.kind === :correlated
+    @test ReactiveKernelsPPL._ranef_corr_names(cb) ===
+        (:L_g, :tau_g, :z_flat_g)
+    idplan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(:ID, g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(:ID, g) do
+                mu => [1, x]
+            end
+        end, (:y, :x, :g))
+    @test ReactiveKernelsPPL._ranef_corr_names(only(idplan.ranef_buckets)) ===
+        (:L_ID_g, :tau_ID_g, :z_flat_ID_g)
+    # K=1 kinds own no correlated names.
+    k1plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1]
+            end
+        end, (:y, :x, :g))
+    @test_throws ContractValidationError ReactiveKernelsPPL._ranef_corr_names(
+        only(k1plan.ranef_buckets))
+    # Claims: user definitions cannot collide with correlated names.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 1)
+            L_g = 1.0
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1, x]
+            end
+        end, (:y, :x, :g))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1, x]
+            end
+            z_flat_g ~ Normal(0, 1)
+        end, (:y, :x, :g))
+    # The derived draws are claimed too (constrain-output key).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b_g = 1.0
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1, x]
+            end
+        end, (:y, :x, :g))
+    # Name tables: a hand-built parameter under a correlated name fails.
+    clash = _rbase(; with_gather = true)
+    push!(clash.parameters, SampledParameter(:tau_ID_g, :normal,
+        (arg1 = 0, arg2 = 1), nothing, :tau_ID_g))
+    @test_throws ContractValidationError validate_structure(clash)
+    # Empty slice ranges fail closed (a vacuous gather).
+    empty = _rbase(; with_gather = true)
+    b = only(empty.ranef_buckets)
+    empty.ranef_buckets[1] = RanefBucket(b.id, b.group, b.kind, b.margins,
+        [(:mu, 2:1)], b.lkj_eta, b.label)
+    @test_throws ContractValidationError validate_structure(empty)
+end
+
+# Central-difference 1/2 logdet(J'J) of u -> vec(L): independent of the
+# closed-form hyperspherical volume element (uses only constrain).
+function _lkj_fd_logjac(u, K; h = 1e-6)
+    P = length(u)
+    J = Matrix{Float64}(undef, K * K, P)
+    for p in 1:P
+        up = copy(u)
+        up[p] += h
+        dn = copy(u)
+        dn[p] -= h
+        J[:, p] =
+            (vec(lkj_chol_constrain(up, K)) - vec(lkj_chol_constrain(dn, K))) /
+            (2h)
+    end
+    return 0.5 * log(det(transpose(J) * J))
+end
+
+@testset "ranef LKJ transform" begin
+    # Packed-dim inversion + fail-closed on non-triangular lengths.
+    @test ReactiveKernelsPPL._lkj_dim(0) == 1
+    @test ReactiveKernelsPPL._lkj_dim(1) == 2
+    @test ReactiveKernelsPPL._lkj_dim(3) == 3
+    @test ReactiveKernelsPPL._lkj_dim(6) == 4
+    @test_throws ContractValidationError ReactiveKernelsPPL._lkj_dim(2)
+    @test_throws ContractValidationError ReactiveKernelsPPL._lkj_dim(5)
+    # Roundtrip + Cholesky validity, K = 1..4.
+    for (K, u) in ((1, Float64[]), (2, [0.3]), (3, [0.3, -0.5, 0.7]),
+            (4, [0.3, -0.5, 0.7, 0.1, -0.2, 0.4]))
+        L = lkj_chol_constrain(u, K)
+        @test size(L) == (K, K)
+        @test L[1, 1] == 1.0
+        for i in 1:K, j in i+1:K
+            @test L[i, j] == 0.0
+        end
+        for i in 1:K
+            @test sum(L[i, 1:i] .^ 2) ≈ 1.0
+            @test L[i, i] > 0.0
+        end
+        @test lkj_chol_unconstrain(L, K) ≈ u
+    end
+    # Log-Jacobian vs the finite-difference Gram factor (K>=3 exercises
+    # the nonzero (i-1-j) exponents; K=2 covers the pure-logistic row).
+    for (K, u) in ((2, [0.3]), (3, [0.3, -0.5, 0.7]),
+            (4, [0.3, -0.5, 0.7, 0.1, -0.2, 0.4]))
+        @test lkj_chol_logjac(u, K) ≈ _lkj_fd_logjac(u, K) rtol = 1e-6
+    end
+    @test lkj_chol_logjac(Float64[], 1) == 0.0
+    # Fail-closed: length mismatch, non-square, off-hemisphere.
+    @test_throws ContractValidationError lkj_chol_constrain([0.1], 3)
+    @test_throws ContractValidationError lkj_chol_unconstrain([1.0 0.0], 2)
+    @test_throws ContractValidationError lkj_chol_unconstrain(
+        [1.0 0.0; 0.5 -0.5], 2)
+end
+
+@testset "ranef LKJ constant" begin
+    # K=1 is ±0.0 (Stan's K=1 term: no diagonal, zero constant).
+    @test lkj_logconst(1, 1.0) == 0.0
+    @test lkj_logconst(1, 2.5) == 0.0
+    # K=2 closed form from the Beta integral ∫(1-r²)^{η-1}dr
+    # (independent of the LKJ09-theorem-5 port): hand-evaluated at
+    # half-integer/integer etas where the gammas telescope.
+    @test lkj_logconst(2, 0.5) ≈ -log(pi)
+    @test lkj_logconst(2, 1.0) ≈ -log(2.0)
+    @test lkj_logconst(2, 2.0) ≈ log(0.75)
+    @test lkj_logconst(2, 3.0) ≈ log(0.9375)
+    # K=3/K=4 eta==1.0 branches, hand-evaluated from Stan's formula.
+    @test lkj_logconst(3, 1.0) ≈ log(2.0) - 2 * log(pi)
+    @test lkj_logconst(4, 1.0) ≈ 3 * log(6.0) - 2 * log(pi) - 8 * log(2.0)
+    # lpdf: K=1 exactly zero; K=2 eta==1.0 is the bare constant.
+    @test lkj_corr_cholesky_logpdf(reshape([1.0], 1, 1), 2.0) == 0.0
+    L = lkj_chol_constrain([0.3], 2)
+    @test lkj_corr_cholesky_logpdf(L, 1.0) ≈ -log(2.0)
+    # K=2 general branch: const + (2η-2) log L22.
+    @test lkj_corr_cholesky_logpdf(L, 2.0) ≈ log(0.75) + 2 * log(L[2, 2])
+    @test_throws ContractValidationError lkj_corr_cholesky_logpdf(
+        [1.0 0.0], 1.0)
+end
+
+@testset "ranef correlated layout" begin
+    cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+        :g => [1, 2, 1, 3, 2, 3])
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [1, x]
+            end
+        end, (:y, :x, :g))
+    bound = bind_data(plan, cols)
+    layout = assign_layout(bound)
+    # `a` rides the intercept coefficient; sampled = [sigma, bucket triple].
+    @test [e.kind for e in layout.entries] ==
+        [:coefficient, :sampled, :ranef_corr, :ranef, :ranef]
+    @test [e.name for e in layout.entries] ==
+        [:mu_coef, :sigma, :L_g, :tau_g, :z_flat_g]
+    @test [e.size for e in layout.entries] == [1, 1, 1, 2, 6]
+    @test [e.transform for e in layout.entries] ==
+        [:identity, :exp, :lkj, :exp, :identity]
+    @test layout.total == 11
+    @test coordinate_names(layout)[2] === :sigma
+    @test coordinate_names(layout)[3] == Symbol("L_g.1")
+    @test coordinate_names(layout)[4:5] ==
+        [Symbol("tau_g.1"), Symbol("tau_g.2")]
+    @test coordinate_names(layout)[6] == Symbol("z_flat_g.1")
+    u = collect(range(-0.5, 0.5; length = layout.total))
+    nt = constrain(layout, u)
+    @test size(nt.L_g) == (2, 2)
+    @test nt.tau_g ≈ exp.(u[4:5])
+    @test nt.z_flat_g == u[6:11]
+    # Derived draws: shape + the trivially hand-checkable b[1,1].
+    @test size(nt.b_g) == (3, 2)
+    @test nt.b_g[1, 1] ≈ nt.tau_g[1] * nt.z_flat_g[1]
+    # Roundtrip ignores the derived b (constrain output feeds unconstrain).
+    @test unconstrain(layout, nt) ≈ u
+    # Jacobian: sigma + tau exps + the K=2 theta term, hand-summed.
+    s = 1 / (1 + exp(-u[3]))
+    lkj = log(pi) + log(s) + log1p(-s)
+    @test logjac(layout, u) ≈ u[2] + u[4] + u[5] + lkj
+end
+
+# Independent correlated-gather reference: SB `(diag(tau)*L*z)'` shape
+# with explicit per-margin/per-group loops (never the fused forms),
+# over the global margin subset `js` with Z columns `Zs` (Zs[j] is the
+# j-th GLOBAL margin's column; `:ones` margins pass `ones(n)`).
+function _ref_corr_r(bound, groupcol, L, tau, zflat, Zs, js)
+    K = length(Zs)
+    levels = sort!(unique(bound.columns[groupcol]))
+    idx = [findfirst(==(v), levels) for v in bound.columns[groupcol]]
+    r = zeros(Float64, length(idx))
+    for m in eachindex(idx)
+        g = idx[m]
+        for j in js
+            acc = 0.0
+            for s in 1:j
+                acc += tau[j] * L[j, s] * zflat[s + (g - 1) * K]
+            end
+            r[m] += Zs[j][m] * acc
+        end
+    end
+    return r
+end
+
+# K=2 LKJ from the Beta-integral closed form (independent of the
+# LKJ09-theorem-5 `lkj_logconst` port the emitter inlines).
+function _ref_lkj_k2(L, eta)
+    c = loggamma(eta + 0.5) - loggamma(eta) - 0.5 * log(pi)
+    return c + (2 * eta - 2) * log(L[2, 2])
+end
+
+@testset "ranef correlated e2e values and gradient" begin
+    gv = [1, 2, 1, 3, 2, 3]
+    xv = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    yv = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    cols = Dict{Symbol,AbstractVector}(:g => gv, :x => xv, :y => yv)
+    # Both LKJ emission branches: eta == 1.0 fast path + general.
+    for eta in (1.0, 2.0)
+        plan = lower_rkppl(quote
+                a ~ Normal(0, 5)
+                sigma ~ Exponential(1)
+                mu = a .+ ranef(g)
+                y .~ Normal.(mu, sigma)
+                ranef_bucket(g; eta = $eta) do
+                    mu => [1, x]
+                end
+            end, (:y, :x, :g))
+        bound = bind_data(plan, cols)
+        built = build_kernel(bound)
+        u = collect(range(-0.4, 0.4; length = built.layout.total))
+        nt = constrain(built.layout, u)
+        r = _ref_corr_r(bound, :g, nt.L_g, nt.tau_g, nt.z_flat_g,
+            [ones(6), xv], 1:2)
+        ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
+        pr = logpdf(Normal(0, 5), nt.mu[1]) +
+            logpdf(Exponential(1), nt.sigma) +
+            _ref_lkj_k2(nt.L_g, eta) +
+            sum(logpdf.(Normal(0, 1), nt.tau_g)) +
+            sum(logpdf.(Normal(0, 1), nt.z_flat_g))
+        @test _query(built.spec, bound, :likelihood, u) ≈ ll
+        # No +log(2): SB Stan-convention tau (see the generator comment).
+        @test _query(built.spec, bound, :prior, u) ≈ pr
+        s = 1 / (1 + exp(-u[3]))
+        jac = u[2] + u[4] + u[5] + log(pi) + log(s) + log1p(-s)
+        @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
+        _check_gradient(built.spec, bound, u)
+    end
+end
+
+@testset "ranef K=3 e2e values and gradient" begin
+    gv = [1, 2, 1, 3, 2, 3]
+    x1v = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    x2v = [1.0, 0.5, -0.5, 2.0, -1.5, 0.0]
+    yv = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    cols = Dict{Symbol,AbstractVector}(:g => gv, :x1 => x1v, :x2 => x2v,
+        :y => yv)
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [1, x1, x2]
+            end
+        end, (:y, :x1, :x2, :g))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    # coef + sigma + 3 thetas + 3 tau + 3*3 z cells.
+    @test built.layout.total == 17
+    u = collect(range(-0.4, 0.4; length = built.layout.total))
+    nt = constrain(built.layout, u)
+    r = _ref_corr_r(bound, :g, nt.L_g, nt.tau_g, nt.z_flat_g,
+        [ones(6), x1v, x2v], 1:3)
+    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
+    # K=3 eta==1.0 LKJ, hand-derived from Stan's do_lkj_constant
+    # (const = log2 - 2logpi; diag (3-2)logL22 + 0*logL33).
+    lkj = log(2.0) - 2 * log(pi) + log(nt.L_g[2, 2])
+    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+        logpdf(Exponential(1), nt.sigma) + lkj +
+        sum(logpdf.(Normal(0, 1), nt.tau_g)) +
+        sum(logpdf.(Normal(0, 1), nt.z_flat_g))
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    @test _query(built.spec, bound, :prior, u) ≈ pr
+    # Jacobian: sigma + tau exps + row-2/row-3 theta terms (the row-3
+    # first angle carries the nonzero Gram exponent).
+    s3 = 1 / (1 + exp(-u[3]))
+    s4 = 1 / (1 + exp(-u[4]))
+    s5 = 1 / (1 + exp(-u[5]))
+    lj = log(pi) + log(s3) + log1p(-s3) +
+        log(sin(pi * s4)) + log(pi) + log(s4) + log1p(-s4) +
+        log(pi) + log(s5) + log1p(-s5)
+    jac = u[2] + u[6] + u[7] + u[8] + lj
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "ranef K=1 ID e2e values and gradient" begin
+    gv = [1, 2, 1, 2]
+    xv = [0.5, -1.0, 1.5, 0.0]
+    yv = [1.0, 2.0, 1.5, 2.5]
+    cols = Dict{Symbol,AbstractVector}(:g => gv, :x => xv, :y => yv)
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(:ID, g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(:ID, g) do
+                mu => [x]
+            end
+        end, (:y, :x, :g))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    # coef + sigma + 0 thetas + 1 tau + 2 z cells.
+    @test built.layout.total == 5
+    u = [0.2, 0.1, -0.3, 0.4, -0.1]
+    nt = constrain(built.layout, u)
+    @test nt.L_ID_g == [1.0;;]
+    idx = [findfirst(==(v), [1, 2]) for v in gv]
+    r = nt.tau_ID_g[1] .* (nt.z_flat_ID_g[idx] .* xv)
+    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
+    # No LKJ term: Stan's K=1 LKJ contributes exactly 0.0.
+    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+        logpdf(Exponential(1), nt.sigma) +
+        logpdf(Normal(0, 1), nt.tau_ID_g[1]) +
+        sum(logpdf.(Normal(0, 1), nt.z_flat_ID_g))
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    @test _query(built.spec, bound, :prior, u) ≈ pr
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2] + u[3]
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "ranef multislice ID e2e values and gradient" begin
+    gv = [1, 2, 1, 3, 2, 3]
+    xv = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    y1v = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    y2v = [0.5, 1.5, 1.0, 2.0, 2.5, 1.5]
+    cols = Dict{Symbol,AbstractVector}(:g => gv, :x => xv, :y1 => y1v,
+        :y2 => y2v)
+    plan = lower_rkppl(quote
+            a1 ~ Normal(0, 5)
+            a2 ~ Normal(0, 5)
+            s ~ Exponential(1)
+            mu1 = a1 .+ ranef(:ID, g)
+            mu2 = a2 .+ ranef(:ID, g)
+            y1 .~ Normal.(mu1, s)
+            y2 .~ Normal.(mu2, s)
+            ranef_bucket(:ID, g) do
+                mu1 => [1]
+                mu2 => [x]
+            end
+        end, (:y1, :y2, :x, :g))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    @test [e.kind for e in built.layout.entries] ==
+        [:coefficient, :coefficient, :sampled, :ranef_corr, :ranef, :ranef]
+    # 2 coefs + s + 1 theta + 2 tau + 2*3 z cells.
+    @test built.layout.total == 12
+    u = collect(range(-0.4, 0.4; length = built.layout.total))
+    nt = constrain(built.layout, u)
+    Zs = [ones(6), xv]
+    r1 = _ref_corr_r(bound, :g, nt.L_ID_g, nt.tau_ID_g, nt.z_flat_ID_g,
+        Zs, 1:1)
+    r2 = _ref_corr_r(bound, :g, nt.L_ID_g, nt.tau_ID_g, nt.z_flat_ID_g,
+        Zs, 2:2)
+    ll = sum(logpdf.(Normal.(nt.mu1[1] .+ r1, nt.s), y1v)) +
+        sum(logpdf.(Normal.(nt.mu2[1] .+ r2, nt.s), y2v))
+    pr = logpdf(Normal(0, 5), nt.mu1[1]) + logpdf(Normal(0, 5), nt.mu2[1]) +
+        logpdf(Exponential(1), nt.s) + _ref_lkj_k2(nt.L_ID_g, 1.0) +
+        sum(logpdf.(Normal(0, 1), nt.tau_ID_g)) +
+        sum(logpdf.(Normal(0, 1), nt.z_flat_ID_g))
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    @test _query(built.spec, bound, :prior, u) ≈ pr
+    s4 = 1 / (1 + exp(-u[4]))
+    jac = u[3] + u[5] + u[6] + log(pi) + log(s4) + log1p(-s4)
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "ranef correlated restore_draws" begin
+    cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5],
+        :x => [0.5, -1.0, 1.5, 0.0], :g => [1, 2, 1, 2])
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1, x]
+            end
+        end, (:y, :x, :g))
+    layout = assign_layout(bind_data(plan, cols))
+    U = hcat(collect(range(-0.4, 0.4; length = layout.total)),
+        collect(range(0.4, -0.4; length = layout.total)))
+    draws = restore_draws(layout, U)
+    # LKJ factors + derived draws restore as vectors of matrices.
+    @test draws.L_g isa Vector{Matrix{Float64}}
+    @test draws.b_g isa Vector{Matrix{Float64}}
+    @test size(draws.L_g[1]) == (2, 2)
+    @test size(draws.b_g[2]) == (2, 2)
+    @test draws.L_g[1] ≈ constrain(layout, U[:, 1]).L_g
+    @test draws.b_g[2] ≈ constrain(layout, U[:, 2]).b_g
+    # Empty draws keep the keys, with empty matrix vectors.
+    none = restore_draws(layout, Matrix{Float64}(undef, layout.total, 0))
+    @test Tuple(keys(none)) == Tuple(keys(draws))
+    @test isempty(none.L_g) && isempty(none.b_g)
 end

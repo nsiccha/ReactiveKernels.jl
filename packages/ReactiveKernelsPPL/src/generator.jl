@@ -24,10 +24,6 @@ function build_kernel(plan::StructuralPlan)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
-    ncorr = count(b -> b.kind === :correlated, plan.ranef_buckets)
-    ncorr == 0 || throw(ContractValidationError(
-        "[generator] LKJ-correlated ranef codegen is Stage C — refusing " *
-        "to silently drop $ncorr correlated bucket(s)"))
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
@@ -149,7 +145,7 @@ function _predictor_statements(plan::StructuralPlan)
         # (bucket_id, bucket_group) key does not fit a design block.
         for t in pred.terms
             t.kind === RanefGatherTerm &&
-                push!(terms, _ranef_gather_expr(plan, t))
+                push!(terms, _ranef_gather_expr(plan, pred, t))
         end
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
@@ -196,13 +192,12 @@ end
 # an in-graph indicator sum over the bind-known `_grouping_levels`
 # order (same helper the data validator uses, so the order agrees by
 # construction). Data-only, hence bound-folded; strings are native-only,
-# exactly like factor contrasts. Correlated buckets get no encoder
-# (their gathers fail loudly at emission; Stage C owns them).
+# exactly like factor contrasts. K=1 and correlated buckets on the same
+# group share one encoder (per-group dedup).
 function _ranef_statements(plan::StructuralPlan)
     stmts = Expr[]
     groups = Symbol[]
     for b in plan.ranef_buckets
-        b.kind === :correlated && continue
         b.group in groups && continue
         push!(groups, b.group)
         levels = _grouping_levels(plan.columns[b.group])
@@ -239,8 +234,12 @@ end
 # `ranef_intercept`/`ranef_slope`, including association order — no `b`
 # node, the draws stay implicit): intercept
 # `exp(log_scale) * xi[idx]`, slope `tau * (xi[idx] .* Z)`.
-function _ranef_gather_expr(plan::StructuralPlan, t::TermSpec)
+# Correlated buckets take the K² implicit-draws arm below (this
+# predictor's slice only).
+function _ranef_gather_expr(plan::StructuralPlan, pred::PredictorSpec,
+        t::TermSpec)
     b = _gather_bucket(plan, t)
+    b.kind === :correlated && return _ranef_corr_gather_expr(plan, pred, b)
     scale, xi = _ranef_k1_names(b)
     gathered = Expr(:ref, xi, Symbol(:_ppl_gidx_, b.group))
     if b.kind === :intercept1
@@ -248,6 +247,44 @@ function _ranef_gather_expr(plan::StructuralPlan, t::TermSpec)
     end
     Z = _ranef_z_expr(only(b.margins).z)
     return Expr(:call, :*, scale, Expr(:call, :.*, gathered, Z))
+end
+
+# One correlated bucket's direct `r` summand for one predictor slice
+# (SB `rows_dot_product(Z, b[idx,cols])` with the draws implicit — the
+# Stage-B no-`b`-node precedent): per slice margin j,
+# `Z_j .* sum_s (tau[j]*L[j,s]) .* z_flat[s + (gidx-1)*K]` over
+# `s in 1:j` (L lower-triangular — the `s > j` terms are structural
+# zeros, never emitted). `:ones` Z drops the factor (multiply by 1).
+# K, the slice range, and the `s` bound are all static; tau reads are
+# scalar refs (the coefficient-block precedent) and L reads the named
+# `_ppl_rl_` scalars from the layout edges.
+function _ranef_corr_gather_expr(plan::StructuralPlan, pred::PredictorSpec,
+        b::RanefBucket)
+    si = findfirst(s -> s[1] === pred.name, b.slices)
+    si === nothing && throw(ContractValidationError(
+        "[generator] internal: gather of bucket $((b.id, b.group)) in " *
+        "predictor $(pred.name) has no slice (validate_plan proves this)"))
+    cols = b.slices[si][2]
+    K = length(b.margins)
+    L, tau, z = _ranef_corr_names(b)
+    gidx = Symbol(:_ppl_gidx_, b.group)
+    parts = Any[]
+    for j in cols
+        m = b.margins[j]
+        inner = Any[]
+        for s in 1:j
+            A = :($(Expr(:ref, tau, j)) * $(_rl_name(L, j, s)))
+            idx = :($s .+ ($gidx .- 1) .* $K)
+            push!(inner, :($A .* $(Expr(:ref, z, idx))))
+        end
+        sj = foldl((a, c) -> :($a .+ $c), inner)
+        if m.z.kind === :ones
+            push!(parts, sj)
+        else
+            push!(parts, :($(_ranef_z_expr(m.z)) .* $sj))
+        end
+    end
+    return foldl((a, c) -> :($a .+ $c), parts)
 end
 
 _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
@@ -941,17 +978,28 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         _vector_prior_stmts!(stmts, terms, v.name, v.family, v.args,
             v.support_override)
     end
-    # K=1 ranef buckets (Stage B, SB `ranef_intercept`/`ranef_slope`):
+    # Ranef buckets. K=1 (Stage B, SB `ranef_intercept`/`ranef_slope`):
     # the scalar scale prior plus the standardized `xi` plate (shared
-    # vector-prior helper). `tau` emits WITHOUT the thin layer's
-    # `+log(2)` half renormalizer: SB's `std_normal(; lower=0)` is Stan
-    # lower-bound kernel semantics (exp Jacobian only, no truncation
-    # normalizer), and Stage-B parity is measured against SB bit-exact.
-    # User-facing `HalfNormal` priors keep the proper-half convention;
-    # bucket-internal `tau` follows SB. Correlated buckets own no
-    # Stage-B priors (Stage C).
+    # vector-prior helper). Correlated (Stage C, SB
+    # `ranef_correlated_draws`): the LKJ node plus the `tau`/`z_flat`
+    # plates (shared vector-prior helper). `tau` emits WITHOUT the thin
+    # layer's `+log(2)` half renormalizer in both: SB's
+    # `std_normal(; lower=0)` is Stan lower-bound kernel semantics (exp
+    # Jacobian only, no truncation normalizer). User-facing `HalfNormal`
+    # priors keep the proper-half convention; bucket-internal `tau`
+    # follows SB.
     for b in plan.ranef_buckets
-        b.kind === :correlated && continue
+        if b.kind === :correlated
+            L, tau, z = _ranef_corr_names(b)
+            lnode = Symbol(:_ppl_prior_, L)
+            push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(b))))
+            push!(terms, lnode)
+            _vector_prior_stmts!(stmts, terms, tau, :normal,
+                (arg1 = 0, arg2 = 1), nothing)
+            _vector_prior_stmts!(stmts, terms, z, :normal,
+                (arg1 = 0, arg2 = 1), nothing)
+            continue
+        end
         scale, xi = _ranef_k1_names(b)
         snode = Symbol(:_ppl_prior_, scale)
         scell = _family_logpdf_expr(:normal, Any[0, 1], scale)
@@ -967,6 +1015,34 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
     push!(stmts, :(prior::Float64 = $joint))
     return stmts
+end
+
+# One correlated bucket's LKJ prior node (Stan `lkj_corr_cholesky_lpdf`
+# op order, preserved verbatim from the host
+# `lkj_corr_cholesky_logpdf`: constant literal first, then per-diagonal
+# terms in row order — `(K-i)*log(L[i,i])` at `eta == 1.0`, else
+# `a*log + b*log` with emission-time coefficients). Reads the named
+# `_ppl_rl_` diagonal scalars. K=1 is the `0.0` literal (Stan's K=1 LKJ
+# term is ±0.0 — no diagonal, zero constant).
+function _lkj_prior_expr(b::RanefBucket)
+    K = length(b.margins)
+    L = _ranef_corr_names(b)[1]
+    K == 1 && return :(0.0)
+    eta = b.lkj_eta
+    terms = Any[lkj_logconst(K, eta)]
+    if eta == 1.0
+        for i in 2:K
+            push!(terms, :($(K - i) * log($(_rl_name(L, i, i)))))
+        end
+    else
+        bcoef = 2 * eta - 2
+        for i in 2:K
+            k = i - 2
+            push!(terms, :($(K - 1 - k - 1) * log($(_rl_name(L, i, i))) +
+                $bcoef * log($(_rl_name(L, i, i)))))
+        end
+    end
+    return foldl((a, c) -> :($a + $c), terms)
 end
 
 # One plate over a latent VECTOR (a plate parameter or a spline vector),

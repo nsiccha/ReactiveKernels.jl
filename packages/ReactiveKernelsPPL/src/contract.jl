@@ -877,12 +877,25 @@ _ranef_bucket_suffix(b::RanefBucket) =
 # `ranef_intercept`/`ranef_slope` vocabulary): the scalar scale
 # (`log_scale_<s>` / `tau_<s>`) and the G-vector (`xi_<s>`). Single
 # source for surface claims, name tables, layout, and the generator.
-# Correlated buckets own no Stage-B names (their LKJ/tau/z geometry
-# lands in Stage C).
+# Correlated sampled names, derived purely from the bucket key (SB
+# `ranef_correlated_draws` vocabulary, bucket-qualified): the LKJ
+# Cholesky factor (`L_<s>`, KxK), the marginal-scale vector
+# (`tau_<s>`, K — a VECTOR, unlike the Stage-B scalar), and the
+# standardized draws (`z_flat_<s>`, K*G column-major). Single source
+# for surface claims, name tables, layout, and the generator. K=1 ID
+# buckets own the same three names (`L` packs zero coords).
+function _ranef_corr_names(b::RanefBucket)
+    b.kind === :correlated ||
+        _fail(b.label, "bucket kind $(b.kind) owns no correlated " *
+              "sampled names (K=1 plain geometry has its own names)")
+    s = _ranef_bucket_suffix(b)
+    return (Symbol("L_", s), Symbol("tau_", s), Symbol("z_flat_", s))
+end
+
 function _ranef_k1_names(b::RanefBucket)
     (b.kind === :intercept1 || b.kind === :slope1) ||
         _fail(b.label, "bucket kind $(b.kind) owns no K=1 sampled names " *
-              "(LKJ-correlated geometry lands in Stage C)")
+              "(correlated buckets own L/tau/z names instead)")
     s = _ranef_bucket_suffix(b)
     scale = b.kind === :intercept1 ? Symbol("log_scale_", s) :
         Symbol("tau_", s)
@@ -948,9 +961,13 @@ function _validate_bucket_shape(b::RanefBucket, prednames::Set{Symbol})
         t in prednames ||
             _fail(b.label, "bucket slice for unknown predictor $t")
     end
-    # Ranges partition 1:K contiguously in body order.
+    # Ranges partition 1:K contiguously in body order (and no range is
+    # empty — an empty slice would emit a vacuous gather).
     lo = 1
     for (t, r) in b.slices
+        first(r) <= last(r) ||
+            _fail(b.label, "slice for $t is empty (each slice carries " *
+                  "at least one margin)")
         first(r) == lo ||
             _fail(b.label, "slice for $t starts at $(first(r)), want $lo " *
                   "(slices partition 1:$K contiguously)")
@@ -1229,6 +1246,9 @@ function _validate_name_tables(plan::StructuralPlan)
     k1 = Symbol[nm for b in plan.ranef_buckets
         if b.kind === :intercept1 || b.kind === :slope1
         for nm in _ranef_k1_names(b)]
+    corr = Symbol[nm for b in plan.ranef_buckets
+        if b.kind === :correlated
+        for nm in _ranef_corr_names(b)]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
@@ -1244,6 +1264,8 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate spline-vector names")
     length(unique(k1)) == length(k1) ||
         _fail(:plan, "duplicate K=1 ranef names")
+    length(unique(corr)) == length(corr) ||
+        _fail(:plan, "duplicate correlated ranef names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
         (assigns, deriveds, "assignments and derived columns"),
@@ -1271,13 +1293,21 @@ function _validate_name_tables(plan::StructuralPlan)
         (k1, plates, "K=1 ranef names and plate parameters"),
         (k1, scanstates, "K=1 ranef names and scan states"),
         (k1, vectors, "K=1 ranef names and vector parameters"),
-        (k1, svec, "K=1 ranef names and spline vectors"))
+        (k1, svec, "K=1 ranef names and spline vectors"),
+        (corr, params, "correlated ranef names and parameters"),
+        (corr, assigns, "correlated ranef names and assignments"),
+        (corr, deriveds, "correlated ranef names and derived columns"),
+        (corr, plates, "correlated ranef names and plate parameters"),
+        (corr, scanstates, "correlated ranef names and scan states"),
+        (corr, vectors, "correlated ranef names and vector parameters"),
+        (corr, svec, "correlated ranef names and spline vectors"),
+        (corr, k1, "correlated ranef names and K=1 ranef names"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
     allnames = union(params, assigns, deriveds, plates, scanstates, vectors,
-        svec, k1)
+        svec, k1, corr)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
@@ -1288,7 +1318,7 @@ function _validate_name_tables(plan::StructuralPlan)
             "parameter/assignment/derived/plate/scan/vector/spline/ranef $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, k1))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, k1, corr))
         _check_name_hygiene(n)
     end
     return nothing
