@@ -76,6 +76,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
 # names in the assignment allowlist.
 using Statistics: mean, std, var
+# Bijector objects the generated program splices (constrained-parameter
+# transforms); imported from the enclosing module so the emitted
+# `positive_bijector()` / `unit_bijector()` calls resolve.
+import ..positive_bijector, ..unit_bijector
 end
 
 const _MODEL_COUNTER = Ref(0)

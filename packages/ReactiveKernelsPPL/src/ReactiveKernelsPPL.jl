@@ -33,6 +33,7 @@ export build_kernel, kernel_expr
 export DesignShape, DesignBlock, design_shape, coefficient_priors
 export LayoutTable, LayoutEntry, assign_layout, coordinate_names
 export constrain, unconstrain, logjac, support_of
+export positive_bijector, unit_bijector, BIJECTORS
 export coordinate_read, block_read, transform_statements, jacobian_term
 export design_name, offset_name, design_recipe, offset_recipe
 export preprocessing_recipes
@@ -44,6 +45,7 @@ export ScanSpec, ScanStep, ScanSetup, parse_scan_block
 
 include("contract.jl")
 include("design.jl")
+include("bijectors.jl")
 include("layout.jl")
 include("preprocessing.jl")
 include("generator.jl")
