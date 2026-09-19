@@ -27,11 +27,11 @@ function _prep_plan()
         TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
                 :intercept),
             TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term),
-            TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 1), :g,
-                :g_term),
+            TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term),
             TermSpec(OffsetTerm, [:w], NamedTuple(), :w, :w_term)],
         :mu)
-    shape = design_shape(pred, cols)
+    maps = LevelMap[LevelMap(:mu, :g, [2, 3], :levels, (2, :end))]
+    shape = design_shape(pred, cols; levelmaps = maps)
     return shape, cols, n
 end
 
@@ -61,7 +61,7 @@ end
     @test ex !== nothing
     @test _eval_recipe(ex, cols) == cols[:w]
     noshape = DesignShape(:eta,
-        [DesignBlock(InterceptTerm, nothing, :Intercept, 1, [:Intercept], [], 0)],
+        [DesignBlock(InterceptTerm, nothing, :Intercept, 1, [:Intercept], [])],
         1)
     @test offset_recipe(noshape) === nothing
 end
@@ -70,10 +70,9 @@ end
     cols = Dict{Symbol,AbstractVector}(:g => ["a", "b", "a", "c"])
     shape = design_shape(
         PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(FactorTerm, [:g],
-                    (contrasts = :treatment, ref = 1), :g, :g_term)],
+            TermSpec[TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term)],
             :mu),
-        cols)
+        cols; levelmaps = [LevelMap(:mu, :g, ["b", "c"], :levels, (2, :end))])
     @test shape.blocks[1].labels == [:g_b, :g_c]
     ex = design_recipe(shape, 4)
     got = _eval_recipe(ex, cols)
@@ -81,10 +80,9 @@ end
     syms = Dict{Symbol,AbstractVector}(:g => [:a, :b, :a])
     symshape = design_shape(
         PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(FactorTerm, [:g],
-                    (contrasts = :treatment, ref = 2), :g, :g_term)],
+            TermSpec[TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term)],
             :mu),
-        syms)
+        syms; levelmaps = [LevelMap(:mu, :g, [:a], :levels, [1])])
     @test symshape.blocks[1].labels == [:g_a]
     @test symshape.width == 1
     exs = design_recipe(symshape, 3)

@@ -83,8 +83,134 @@ function _poisson_plan(n = 9)
     )
 end
 
+function _binomial_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([1, 0, 2], outer = cld(n, 3))[1:n]
+    cols[:n] = fill(4, n)
+    StructuralPlan(
+        [LikelihoodSpec(BinomialLogitFam, LogitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, :n, nothing)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        SampledParameter[],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _nb2_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([0, 1, 2], outer = cld(n, 3))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(NegativeBinomial2Fam, LogLink, :y, :eta, :phi, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, LogLink, _terms(), :eta)],
+        _priors(:eta),
+        [SampledParameter(:phi, :exponential, (arg1 = 1.0,), nothing, :phi)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _gamma_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = collect(1.0:n)
+    StructuralPlan(
+        [LikelihoodSpec(GammaLogFam, LogLink, :y, :eta, :alpha, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, LogLink, _terms(), :eta)],
+        _priors(:eta),
+        [SampledParameter(:alpha, :exponential, (arg1 = 1.0,), nothing, :alpha)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _bernoulli_probit_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([false, true], outer = cld(n, 2))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(BernoulliProbitFam, ProbitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        SampledParameter[],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _bernoulli_cloglog_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([0, 1], outer = cld(n, 2))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(BernoulliCloglogFam, CloglogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        SampledParameter[],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _binomial_probit_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([1, 0, 2], outer = cld(n, 3))[1:n]
+    cols[:n] = fill(4, n)
+    StructuralPlan(
+        [LikelihoodSpec(BinomialProbitFam, ProbitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, :n, nothing)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        SampledParameter[],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _binomial_cloglog_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([1, 0, 2], outer = cld(n, 3))[1:n]
+    cols[:n] = fill(4, n)
+    StructuralPlan(
+        [LikelihoodSpec(BinomialCloglogFam, CloglogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, :n, nothing)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        SampledParameter[],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _beta_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([0.2, 0.7, 0.4], outer = cld(n, 3))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, :kappa, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        [SampledParameter(:kappa, :gamma, (arg1 = 2.0, arg2 = 1000.0), nothing, :kappa)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
 @testset "contract admission predicates" begin
-    @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam)
+    @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
+        BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
+        BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
+        BinomialCloglogFam, BetaLogitFam)
     @test admitted_terms() ==
         (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
     @test :log in admitted_functions()
@@ -102,6 +228,14 @@ end
     @test validate_plan(_bernoulli_plan()) === nothing
     @test validate_plan(_bernoulli_logit_predictor_plan()) === nothing
     @test validate_plan(_poisson_plan()) === nothing
+    @test validate_plan(_binomial_plan()) === nothing
+    @test validate_plan(_nb2_plan()) === nothing
+    @test validate_plan(_gamma_plan()) === nothing
+    @test validate_plan(_bernoulli_probit_plan()) === nothing
+    @test validate_plan(_bernoulli_cloglog_plan()) === nothing
+    @test validate_plan(_binomial_probit_plan()) === nothing
+    @test validate_plan(_binomial_cloglog_plan()) === nothing
+    @test validate_plan(_beta_plan()) === nothing
 end
 
 @testset "link triples" begin
@@ -112,6 +246,76 @@ end
     # Poisson + identity predictor link is not admitted either.
     bad = _poisson_plan()
     bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # NB2 + identity predictor link is not admitted either.
+    bad = _nb2_plan()
+    bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Binomial + log predictor link is not admitted either.
+    bad = _binomial_plan()
+    bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Slice-2 triples admit Identity predictor link only.
+    bad = _bernoulli_probit_plan()
+    bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _binomial_cloglog_plan()
+    bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _beta_plan()
+    bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Struct-path link-matching predlinks fail closed (same latent gap as
+    # slice-1 Binomial; the AST path is the real path).
+    bad = _bernoulli_probit_plan()
+    bad.predictors[1] = PredictorSpec(:eta, ProbitLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "slice-2 response validation" begin
+    # Probit/cloglog Binomial requires trials, like logit Binomial.
+    bad = _binomial_probit_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BinomialProbitFam, ProbitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _binomial_cloglog_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BinomialCloglogFam, CloglogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Probit/cloglog Bernoulli takes no trials.
+    bad = _bernoulli_probit_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BernoulliProbitFam, ProbitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, :n, nothing)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Beta requires its concentration kappa.
+    bad = _beta_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Beta response must be strictly inside (0, 1).
+    bad = _beta_plan()
+    bad.columns[:y] = fill(2, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _beta_plan()
+    bad.columns[:y] = fill(0.0, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _beta_plan()
+    bad.columns[:y] = fill(1.0, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _beta_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, :kappa, nothing,
+            ResponseEvidence(:truncated, 0.1, 0.9), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _bernoulli_probit_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BernoulliProbitFam, ProbitLink, :y, :eta, nothing, nothing,
+            ResponseEvidence(:censored, 0, 1), :y_resp)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -145,6 +349,78 @@ end
         LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta, 1.0, nothing,
             _none_evidence(), :y_resp)
     @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "slice-1 response validation" begin
+    # Binomial requires trials.
+    bad = _binomial_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BinomialLogitFam, LogitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Non-Binomial responses take no trials.
+    bad = _poisson_plan()
+    bad.responses[1] =
+        LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, :n, nothing)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Non-integer trials column.
+    bad = _binomial_plan()
+    bad.columns[:n] = fill(2.5, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Response exceeds trials.
+    bad = _binomial_plan()
+    bad.columns[:y] = fill(9, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Bool is not a count column.
+    bad = _binomial_plan()
+    bad.columns[:y] = fill(true, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # NB2/Gamma require their auxiliary.
+    bad = _nb2_plan()
+    bad.responses[1] =
+        LikelihoodSpec(NegativeBinomial2Fam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _gamma_plan()
+    bad.responses[1] =
+        LikelihoodSpec(GammaLogFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Gamma response must be strictly positive.
+    bad = _gamma_plan()
+    bad.columns[:y] = zeros(9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # NB2 rejects non-count response.
+    bad = _nb2_plan()
+    bad.columns[:y] = fill(1.5, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _nb2_plan()
+    bad.responses[1] =
+        LikelihoodSpec(NegativeBinomial2Fam, LogLink, :y, :eta, :phi, nothing,
+            ResponseEvidence(:truncated, 0.0, 9.0), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "per-observation known scale" begin
+    # A raw data-column scale (the eight-schools known SE) binds and validates.
+    good = _gaussian_plan()
+    good.columns[:se] = collect(1.0:9.0)
+    good.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :se,
+        nothing, _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    # A non-positive scale column is rejected at bind (a scale is strictly > 0).
+    bad = _gaussian_plan()
+    bad.columns[:se] = vcat(0.0, collect(2.0:9.0))
+    bad.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :se,
+        nothing, _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # An unknown scale name (neither scalar parameter nor data column) is caught.
+    bad3 = _gaussian_plan()
+    bad3.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :nope,
+        nothing, _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad3)
 end
 
 @testset "sampled parameters" begin
@@ -254,29 +530,55 @@ end
 end
 
 @testset "factors" begin
-    function _factor_plan()
+    # g = repeat 1..3 (n = 9): observed levels [1, 2, 3].
+    _fterm() = TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term)
+    _iterm() = TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
+        :intercept)
+    function _factor_plan(; intercept = true, subset = (2, :end),
+            maps = :one)
         plan = _gaussian_plan()
-        preds = PredictorSpec[PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
-                    :intercept),
-                TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 1),
-                    :g, :g_term)],
-            :mu)]
-        priors = PopulationPrior[
+        terms = intercept ? TermSpec[_iterm(), _fterm()] : TermSpec[_fterm()]
+        preds = PredictorSpec[PredictorSpec(:mu, IdentityLink, terms, :mu)]
+        priors = intercept ? PopulationPrior[
             PopulationPrior(:mu, :Intercept, 0.0, 1.0),
             PopulationPrior(:mu, :g, 0.0, 1.0),
-        ]
+        ] : PopulationPrior[PopulationPrior(:mu, :g, 0.0, 1.0)]
+        vals = subset === Colon() ? [1, 2, 3] :
+            subset isa UnitRange ? [1, 2, 3][subset] :
+            subset isa Vector ? [1, 2, 3][subset] : [2, 3]
+        ms = maps === :one ? LevelMap[LevelMap(:mu, :g, vals, :levels, subset)] :
+            maps === :two ? LevelMap[LevelMap(:mu, :g, vals, :levels, subset),
+                LevelMap(:mu, :g, vals, :levels, subset)] : LevelMap[]
         return StructuralPlan(plan.responses, preds, priors, plan.parameters,
-            plan.assignments, plan.columns, plan.n_obs)
+            plan.assignments, plan.columns, plan.n_obs; levelmaps = ms)
     end
+    # Intercept + strict subset: identified. Full cover alone: identified.
     @test validate_plan(_factor_plan()) === nothing
-    bad = _factor_plan()
-    bad.predictors[1].terms[2] =
-        TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 9), :g, :g_term)
+    @test validate_plan(_factor_plan(; intercept = false,
+        subset = Colon())) === nothing
+    # Intercept + full cover: the identifiability gate.
+    bad = _factor_plan(; subset = Colon())
     @test_throws ContractValidationError validate_plan(bad)
+    # Missing / duplicate maps.
+    @test_throws ContractValidationError validate_plan(_factor_plan(;
+        maps = :none))
+    @test_throws ContractValidationError validate_plan(_factor_plan(;
+        maps = :two))
+    # Non-empty term options are gone with treatment.
     bad = _factor_plan()
-    bad.predictors[1].terms[2] =
-        TermSpec(FactorTerm, [:g], (contrasts = :sum, ref = 1), :g, :g_term)
+    bad.predictors[1].terms[end] =
+        TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 1), :g, :g_term)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Bad sources and subset shapes.
+    for (src, sub) in ((:unique, (2, :end)), (:levels, 0:2),
+            (:levels, Int[]), (:levels, (0, :end)), (:levels, (1, :foo)))
+        bad = _factor_plan()
+        bad.levelmaps[1] = LevelMap(:mu, :g, [2, 3], src, sub)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # Unfilled values on a bound plan.
+    bad = _factor_plan()
+    bad.levelmaps[1] = LevelMap(:mu, :g, [], :levels, (2, :end))
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -402,4 +704,91 @@ end
     @test b2.roles[:x] === :data
     @test b2.roles[:g] === :predictor
     @test b2.roles[:y] === :response
+end
+
+# Per-cell latent (plate) parameters: a latent VECTOR sampled once per cell,
+# read as a response location through a LatentTerm predictor.
+function _re_plan(n = 9; plate = PlateParameter(:theta, :normal,
+        (arg1 = :mu, arg2 = :tau), nothing),
+        term = TermSpec(LatentTerm, [:theta], NamedTuple(), :theta, :theta_lat))
+    cols = _columns(n)
+    StructuralPlan(
+        [LikelihoodSpec(GaussianFam, IdentityLink, :y, :loc, :sigma, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:loc, IdentityLink, [term], :loc)],
+        PopulationPrior[],
+        [SampledParameter(:mu, :normal, (arg1 = 0.0, arg2 = 5.0), nothing, :mu),
+            SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma),
+            SampledParameter(:tau, :exponential, (arg1 = 1.0,), nothing, :tau)],
+        AssignmentSpec[], cols, n; plate_parameters = [plate])
+end
+
+@testset "plate parameters" begin
+    # A valid random-effects plan passes structure + data validation.
+    @test (validate_plan(_re_plan()); true)
+    # Unknown family.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :studentt,
+            (arg1 = :mu, arg2 = :tau), nothing)))
+    # `flat()` per-cell latent has no proper prior to draw a cell from.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :flat, NamedTuple(), nothing)))
+    # Wrong arity keys.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal, (arg1 = :mu,), nothing)))
+    # Prior arg references a genuinely unknown name (not scalar/derived/data);
+    # resolved at bind, so it surfaces from validate_data (validate_plan runs it).
+    @test_throws ContractValidationError validate_plan(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :nope, arg2 = :tau), nothing)))
+    # A raw data column IS an admitted per-cell prior arg (varying mean).
+    @test (validate_plan(_re_plan(; plate = PlateParameter(:theta, :normal,
+        (arg1 = :x, arg2 = :tau), nothing))); true)
+    # A latent VECTOR cannot be a prior arg (never another latent).
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :theta, arg2 = :tau), nothing)))
+    # :positive override only applies to normal/cauchy.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :exponential, (arg1 = 1.0,),
+            :positive)))
+    # A two-sided finite (:interval, lo, hi) override on a Normal cell is valid.
+    @test (validate_plan(_re_plan(; plate = PlateParameter(:theta, :normal,
+        (arg1 = :mu, arg2 = :tau), (:interval, -2.0, 5.0)))); true)
+    # :interval is a truncated Normal — a non-Normal family is rejected.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :cauchy,
+            (arg1 = :mu, arg2 = :tau), (:interval, -1.0, 1.0))))
+    # :interval bounds must be finite.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), (:interval, 0.0, Inf))))
+    # :interval lower < upper.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), (:interval, 3.0, 1.0))))
+    # A tuple override whose head is not :interval is rejected.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), (:bogus, 0.0, 1.0))))
+    # Plate name collides with a scalar parameter.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:mu, :normal, (arg1 = 0.0, arg2 = 1.0),
+            nothing),
+            term = TermSpec(LatentTerm, [:mu], NamedTuple(), :mu, :mu_lat)))
+    # Latent term with no matching plate parameter.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; term = TermSpec(LatentTerm, [:absent], NamedTuple(), :absent,
+            :absent_lat)))
+    # A literal plate range must cover 1:n_obs exactly (checked at bind/data).
+    good = _re_plan(9; plate = PlateParameter(:theta, :normal,
+        (arg1 = :mu, arg2 = :tau), nothing, 1:9))
+    @test (validate_plan(good); true)
+    @test_throws ContractValidationError validate_data(
+        _re_plan(9; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), nothing, 1:8)))
+    # A range not starting at 1 is a structure error.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(9; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), nothing, 2:9)))
 end

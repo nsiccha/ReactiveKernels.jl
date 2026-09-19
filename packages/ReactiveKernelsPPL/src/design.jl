@@ -1,18 +1,18 @@
-# Design-shape analysis: terms + raw columns → widths, labels, levels.
+# Design-shape analysis: terms + bound plan data → widths, labels, levels.
 #
 # Shared by layout assignment (offsets), preprocessing (matrices), and the
 # generator (coefficient identity). Assumes `validate_plan` passed; residual
 # checks here are loud defense in depth. Coefficient labels follow the pinned
-# v2 scheme; BRM contrasts stay positional on the emitter side with the
-# position↔label map in the ext/parity code.
+# v2 scheme; factor levels come from the plan's LevelMap (full-rank over
+# exactly the mapped values).
 
 """
-    DesignBlock(kind, column, addressee, width, labels, levels, ref)
+    DesignBlock(kind, column, addressee, width, labels, levels)
 
 One term's design contribution. `labels` are coefficient labels in column
 order (`:Intercept` for intercepts, the column name for continuous terms,
-`col_level` over non-ref sort-ordered levels for factors, empty for
-offsets). `levels`/`ref` are meaningful for factors only.
+`col_level` over mapped levels for factors, empty for offsets). `levels`
+is meaningful for factors only (the map's evaluated values).
 """
 struct DesignBlock
     kind::TermKind
@@ -21,7 +21,6 @@ struct DesignBlock
     width::Int
     labels::Vector{Symbol}
     levels::Vector
-    ref::Int
 end
 
 """Full design shape of one predictor: ordered blocks + total width."""
@@ -32,16 +31,17 @@ struct DesignShape
 end
 
 """
-    design_shape(pred, columns) -> DesignShape
+    design_shape(pred, columns; levelmaps) -> DesignShape
 
-Analyze one predictor's terms against raw columns. Factor levels are
-`sort(unique(col))` (pinned ordering); contrasts run over non-ref levels in
-sort order with labels `Symbol(col_level)`.
+Analyze one predictor's terms against raw columns. Factor blocks read
+their levels from `levelmaps` (keyed by predictor name + column);
+columns stay the source for continuous/offset terms.
 """
-function design_shape(pred::PredictorSpec, columns::Dict{Symbol,AbstractVector})
+function design_shape(pred::PredictorSpec, columns::Dict{Symbol,AbstractVector};
+        levelmaps::Vector{LevelMap} = LevelMap[])
     blocks = DesignBlock[]
     for t in pred.terms
-        push!(blocks, _term_block(t, columns, pred.label))
+        push!(blocks, _term_block(t, columns, pred.label, pred.name, levelmaps))
     end
     labels = Symbol[]
     for b in blocks
@@ -53,25 +53,31 @@ function design_shape(pred::PredictorSpec, columns::Dict{Symbol,AbstractVector})
     return DesignShape(pred.name, blocks, width)
 end
 
-function _term_block(t::TermSpec, columns, label)
+function _term_block(t::TermSpec, columns, label, pname, levelmaps)
     if t.kind === InterceptTerm
-        return DesignBlock(InterceptTerm, nothing, t.addressee, 1, [:Intercept], [], 0)
+        return DesignBlock(InterceptTerm, nothing, t.addressee, 1, [:Intercept], [])
     elseif t.kind === ContinuousTerm
         col = only(t.columns)
-        return DesignBlock(ContinuousTerm, col, t.addressee, 1, [col], [], 0)
+        return DesignBlock(ContinuousTerm, col, t.addressee, 1, [col], [])
     elseif t.kind === OffsetTerm
-        return DesignBlock(OffsetTerm, only(t.columns), t.addressee, 0, Symbol[], [], 0)
+        return DesignBlock(OffsetTerm, only(t.columns), t.addressee, 0, Symbol[], [])
+    elseif t.kind === LatentTerm
+        # The latent VECTOR is the whole linear predictor (identity design);
+        # its coefficients live in the PlateParameter layout block, so this
+        # term contributes no design width.
+        return DesignBlock(LatentTerm, only(t.columns), t.addressee, 0, Symbol[], [])
     elseif t.kind === FactorTerm
         col = only(t.columns)
-        levels = _grouping_levels(columns[col])
-        ref = t.options.ref
-        labels = Symbol[]
-        for (i, level) in enumerate(levels)
-            i == ref && continue
-            push!(labels, Symbol(string(col) * "_" * string(level)))
-        end
+        m = _find_levelmap(levelmaps, pname, col)
+        m === nothing && throw(ContractValidationError(
+            "[$label] factor term over $col has no LevelMap " *
+            "(validate_levelmaps should have caught this)"))
+        isempty(m.values) && throw(ContractValidationError(
+            "[$label] LevelMap for $col has no evaluated values " *
+            "(bind_data fills these)"))
+        labels = [Symbol(string(col) * "_" * string(level)) for level in m.values]
         return DesignBlock(FactorTerm, col, t.addressee, length(labels), labels,
-            levels, ref)
+            collect(m.values))
     else
         throw(ContractValidationError("[$label] term kind $(t.kind) has no design rule"))
     end

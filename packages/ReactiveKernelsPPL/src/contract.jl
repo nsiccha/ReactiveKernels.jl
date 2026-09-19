@@ -31,6 +31,14 @@ const ParamName = Symbol
     GaussianFam
     BernoulliLogitFam
     PoissonLogFam
+    BinomialLogitFam
+    NegativeBinomial2Fam
+    GammaLogFam
+    BernoulliProbitFam
+    BernoulliCloglogFam
+    BinomialProbitFam
+    BinomialCloglogFam
+    BetaLogitFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -39,14 +47,20 @@ inverse-link numerics (R1 counter)."""
     IdentityLink
     LogitLink
     LogLink
+    ProbitLink
+    CloglogLink
 end
 
-"""Slice-1 predictor term kinds (core set; stretch adds variants later)."""
+"""Slice-1 predictor term kinds (core set; stretch adds variants later).
+`LatentTerm` carries a per-cell latent parameter vector (a [`PlateParameter`](@ref))
+as the whole linear predictor (`lp = theta`, identity design) — the
+random-effects / per-observation-latent location."""
 @enum TermKind::UInt8 begin
     InterceptTerm
     ContinuousTerm
     FactorTerm
     OffsetTerm
+    LatentTerm
 end
 
 """
@@ -64,12 +78,18 @@ struct ResponseEvidence
 end
 
 """
-    LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label)
+    LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, trials[, range]])
 
-One independent response. `scale` is the Gaussian sigma (parameter,
-assignment, or folded literal) and must be `nothing` otherwise. `weights`
-is a frequency/power-objective column (D1); analytic/precision weights fail
-closed emitter-side.
+One independent response. `scale` is the response's scalar auxiliary —
+Gaussian sigma, NB2 dispersion phi, Gamma shape alpha (parameter,
+assignment, or folded literal) — and must be `nothing` otherwise. (One
+slot covers every admitted family; a two-auxiliary family such as Beta
+needs a new field — noted, not built.) `weights` is a
+frequency/power-objective column (D1); analytic/precision weights fail
+closed emitter-side. `trials` is the Binomial trial count (Int column or
+Int literal), `nothing` otherwise. `range` carries a literal `y[1:N]`
+response range (`nothing` = whole column: bare `.~`, `eachindex`,
+`axes`); it must cover `1:n_obs` exactly (checked at bind).
 """
 struct LikelihoodSpec
     family::LikelihoodFamily
@@ -80,15 +100,27 @@ struct LikelihoodSpec
     weights::Union{Nothing,ColumnRef}
     evidence::ResponseEvidence
     label::Symbol
+    trials::Union{Nothing,ColumnRef,Int}
+    range::Union{Nothing,UnitRange{Int}}
 end
+LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
+    label) =
+    LikelihoodSpec(family, link, response, predictor, scale, weights,
+        evidence, label, nothing, nothing)
+LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
+    label, range) =
+    LikelihoodSpec(family, link, response, predictor, scale, weights,
+        evidence, label, nothing, range)
 
 """
     TermSpec(kind, columns, options, addressee, label)
 
 One additive predictor term: structure only, never materialized designs
 (D5a). `addressee` is the prior address (source column or `:Intercept`),
-never a per-contrast label. Factor `options` are
-`(contrasts=:treatment, ref=<1-based index into sort-ordered levels>)`.
+never a per-level label. Terms take no options: factor sizing lives in
+the plan's [`LevelMap`](@ref)s (full-rank over exactly the mapped
+levels; no contrasts, no reference dropping — that machinery was
+BRM-specific and is gone).
 """
 struct TermSpec
     kind::TermKind
@@ -111,8 +143,10 @@ end
 
 Normal-only population prior (slice 1) addressed by
 `(predictor, column|:Intercept)`. A factor source column address applies one
-shared Normal across its K-1 contrasts. The emitter fills `Normal(0,1)`
-defaults so coverage is complete by construction.
+shared Normal across its full-rank level block (one coefficient per mapped
+level). The emitter fills `Normal(0,1)` defaults so coverage is complete by
+construction — except factor coefficients, whose broadcast prior also sizes
+the block and is therefore required, never defaulted.
 """
 struct PopulationPrior
     predictor::Symbol
@@ -122,22 +156,67 @@ struct PopulationPrior
 end
 
 """
+    SupportOverride
+
+A latent's support override: `nothing` (infer from the family), the bare
+`Symbol` `:positive` (half-Normal/half-Cauchy truncation of a real-support
+family, exact +log(2) at a literal-zero location), or the tuple
+`(:interval, lo, hi)` (a two-sided finite truncation `truncated(Normal(mu, s),
+lo, hi)` — an affine-logistic constrained transform onto `(lo, hi)` with the
+renormalized truncated density). Shared by scalar [`SampledParameter`](@ref)s
+and per-cell [`PlateParameter`](@ref)s.
+"""
+const SupportOverride = Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64}}
+
+"""
     SampledParameter(name, family, args, support_override, label)
 
 One non-coefficient latent (scalar, slice 1). `args` use POSITIONAL keys
 `(arg1, arg2, …)` in Distributions.jl constructor order with Distributions.jl
 semantics (`Exponential(θ)` = scale θ). Values are literals or
 [`ParamName`](@ref)s (hierarchical OK, cycles rejected). `support_override`
-is `nothing` (infer from family) or `:positive` for half-Normal/half-Cauchy
-style truncations of real-support families.
+is a [`SupportOverride`](@ref): `nothing` (infer from family), `:positive`
+(half-Normal/half-Cauchy), or `(:interval, lo, hi)` (a finite truncated
+interval).
 """
 struct SampledParameter
     name::ParamName
     family::Symbol
     args::NamedTuple
-    support_override::Union{Nothing,Symbol}
+    support_override::SupportOverride
     label::Symbol
 end
+
+"""
+    PlateParameter(name, family, args, support_override, range, label)
+
+One per-cell latent parameter VECTOR (`@plate` sampling statement, e.g.
+`theta ~ Normal(mu, tau)`): `size` independent draws from `family`, one per
+plate cell, packed as one contiguous block. `family`/`args`/`support_override`
+follow [`SampledParameter`](@ref) exactly (POSITIONAL `(arg1, …)` keys,
+Distributions.jl semantics), except the args are SHARED across cells — literals
+or scalar parameter/assignment names (per-cell vector args are a later
+increment). `range` is `nothing` (size = `n_obs`, the `eachindex`/`axes` /
+bare-plate case) or a literal `UnitRange{Int}` that must cover `1:n_obs` exactly
+(the `1:N` case), mirroring [`LikelihoodSpec`](@ref)'s response range. A
+real-support prior (`normal`/`cauchy`/half-versions) lays out identity (an
+unconstrained block); positive/unit support constrains per element.
+"""
+struct PlateParameter
+    name::ParamName
+    family::Symbol
+    args::NamedTuple
+    support_override::SupportOverride
+    range::Union{Nothing,UnitRange{Int}}
+    label::Symbol
+end
+"""Provenance/range default to a whole-column (n_obs) plate under the name."""
+PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
+    support_override::SupportOverride) =
+    PlateParameter(name, family, args, support_override, nothing, name)
+PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
+    support_override::SupportOverride, range::Union{Nothing,UnitRange{Int}}) =
+    PlateParameter(name, family, args, support_override, range, name)
 
 """
     AssignmentSpec(name, expr)
@@ -179,15 +258,88 @@ end
 VectorAssignmentSpec(name::Symbol, expr::Union{Expr,Symbol}) =
     VectorAssignmentSpec(name, expr, name)
 
+"""One literal-index seed fill of a `@scan` carried array: `state[index] ~ Dist(args…)`.
+`family` is an internal family symbol (see the surface's `_PARAM_FAMILIES`); `args`
+are the positional distribution-argument expressions (literals in a seed fill)."""
+struct ScanSetup
+    index::Int
+    family::Symbol
+    args::Vector{Any}
+end
+
+"""
+    ScanStep(kind, target, indexed, family, args, expr)
+
+One `@scan` recurrence-body statement.
+
+- `kind === :sample` — a `~` statement: the carried array at the loop index
+  (`indexed = true`, `target === state`, centered form) or a fresh per-step local
+  innovation (`indexed = false`, non-centered form). `family`/`args` describe the
+  distribution; `expr` is `nothing`.
+- `kind === :assign` — a `=` statement: the carried array's deterministic write
+  (`indexed = true`) or a per-step deterministic local (`indexed = false`).
+  `expr` is the RHS AST; `family`/`args` are `nothing`.
+"""
+struct ScanStep
+    kind::Symbol
+    target::Symbol
+    indexed::Bool
+    family::Union{Symbol,Nothing}
+    args::Union{Vector{Any},Nothing}
+    expr::Any
+end
+
+"""
+    ScanSpec(state, loopvar, lo, hi, setup, step, maxlag, label)
+
+One sequential recurrence (`@scan begin <setup>; for loopvar in lo:hi … end end`):
+the carried array `state`, the loop variable and range `lo:hi` (`hi` a literal `Int`
+or a data length `Symbol`), the ordered `setup` seed fills, the ordered recurrence
+`step`s, and the maximum backward lag read. `state` is the plan-level latent the
+recurrence produces (the value visible after the block); the per-step locals and
+`loopvar` are scoped to the recurrence and never enter the plan name table.
+"""
+struct ScanSpec
+    state::Symbol
+    loopvar::Symbol
+    lo::Int
+    hi::Union{Symbol,Int}
+    setup::Vector{ScanSetup}
+    step::Vector{ScanStep}
+    maxlag::Int
+    label::Symbol
+end
+
+"""
+    LevelMap(predictor, column, values, source, subset)
+
+Ordered level values sizing one full-rank factor term: `values` is the
+coefficient position↔level mapping (binder-evaluated from the grouping
+column, `[]` pre-bind). `source` is the levels function (`:levels`
+only). `subset` selects from `sort(unique(column))`: `:` (full cover),
+a literal `UnitRange{Int}`, a literal `Vector{Int}` of positions, or
+`(lo, :end)`. Keyed by `(predictor, column)` — one map per factor term.
+"""
+struct LevelMap
+    predictor::Symbol
+    column::ColumnRef
+    values::Vector
+    source::Symbol
+    subset::Union{Colon,UnitRange{Int},Vector{Int},Tuple{Int,Symbol}}
+end
+
 """
     StructuralPlan(responses, predictors, population_priors, parameters,
                    assignments, derived, columns, n_obs)
 
 Complete emitter→thin-layer input. `columns` maps RAW-column names to plain
 vectors (derived columns are never bound — they compute in-graph from
-`derived`); `parameters`, `assignments`, and `derived` share one name table
-(duplicates rejected). N≥1 independent responses; shared predictor Symbols
-allowed.
+`derived`); `parameters`, `assignments`, `derived`, each `plate_parameters`
+latent, and each `scans` state share one name table (duplicates rejected).
+N≥1 independent responses; shared predictor Symbols allowed. `levelmaps` sizes
+every factor term (binder-evaluated values); `plate_parameters` carries
+per-cell latents and `scans` sequential-recurrence latents (both
+vector-valued, empty for a plain population-GLM plan).
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -199,14 +351,32 @@ struct StructuralPlan
     columns::Dict{Symbol,AbstractVector}
     n_obs::Int
     roles::Dict{Symbol,Symbol}
+    levelmaps::Vector{LevelMap}
+    plate_parameters::Vector{PlateParameter}
+    scans::Vector{ScanSpec}
 end
+
+# Pre-extension full-positional constructor (9-arg): callers that built a plan
+# before `levelmaps`/`scans` existed keep working with both empty.
+StructuralPlan(
+    responses::Vector{LikelihoodSpec},
+    predictors::Vector{PredictorSpec},
+    population_priors::Vector{PopulationPrior},
+    parameters::Vector{SampledParameter},
+    assignments::Vector{AssignmentSpec},
+    derived::Vector{VectorAssignmentSpec},
+    columns::Dict{Symbol,AbstractVector},
+    n_obs::Int,
+    roles::Dict{Symbol,Symbol}) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
-const COLUMN_ROLES = (:response, :predictor, :weight, :evidence, :data)
+const COLUMN_ROLES = (:response, :predictor, :weight, :evidence, :trials, :data)
 
-# Compatibility constructor: 8-arg positional construction (pre-roles,
-# pre-derived) keeps working with empty roles/derived; the
+# Compatibility constructor: 7-arg positional construction (pre-roles,
+# pre-derived, pre-levelmaps) keeps working with empties; the
 # emitter/serializer path is unaffected.
 function StructuralPlan(
         responses::Vector{LikelihoodSpec},
@@ -217,9 +387,13 @@ function StructuralPlan(
         columns::Dict{Symbol,AbstractVector},
         n_obs::Int;
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
-        derived::Vector{VectorAssignmentSpec} = VectorAssignmentSpec[])
+        derived::Vector{VectorAssignmentSpec} = VectorAssignmentSpec[],
+        levelmaps::Vector{LevelMap} = LevelMap[],
+        plate_parameters::Vector{PlateParameter} = PlateParameter[],
+        scans::Vector{ScanSpec} = ScanSpec[])
     return StructuralPlan(responses, predictors, population_priors,
-        parameters, assignments, derived, columns, n_obs, roles)
+        parameters, assignments, derived, columns, n_obs, roles, levelmaps,
+        plate_parameters, scans)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -234,6 +408,14 @@ const ADMITTED_TRIPLES = (
     (BernoulliLogitFam, LogitLink, IdentityLink),
     (BernoulliLogitFam, LogitLink, LogitLink),
     (PoissonLogFam, LogLink, LogLink),
+    (BinomialLogitFam, LogitLink, IdentityLink),
+    (NegativeBinomial2Fam, LogLink, LogLink),
+    (GammaLogFam, LogLink, LogLink),
+    (BernoulliProbitFam, ProbitLink, IdentityLink),
+    (BernoulliCloglogFam, CloglogLink, IdentityLink),
+    (BinomialProbitFam, ProbitLink, IdentityLink),
+    (BinomialCloglogFam, CloglogLink, IdentityLink),
+    (BetaLogitFam, LogitLink, IdentityLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order)."""
@@ -291,7 +473,10 @@ const ELEMENTWISE_COMPARISONS = (:.==, :.!=, :.<, :.>, :.<=, :.>=)
 const ELEMENTWISE_FNS = (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs)
 
 """Families the thin layer can lower (ext handshake predicate)."""
-admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam)
+admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
+    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
+    BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
+    BinomialCloglogFam, BetaLogitFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
@@ -335,11 +520,14 @@ end
 unbound plans alike (the macro lowering + emitter-AST path call this)."""
 function validate_structure(plan::StructuralPlan)
     _validate_name_tables(plan)
+    _validate_scans(plan)
     _validate_assignments_structure(plan)
     _validate_vector_structure(plan)
     _validate_parameters(plan)
+    _validate_plate_parameters(plan)
     _validate_topo_order(plan)
     _validate_predictors(plan)
+    _validate_levelmaps(plan)
     _validate_priors(plan)
     _validate_responses(plan)
     return nothing
@@ -355,7 +543,31 @@ function validate_data(plan::StructuralPlan)
     _validate_assignments_data(plan)
     _validate_vector_data(plan)
     _validate_predictor_columns(plan)
+    _validate_levelmaps_data(plan)
     _validate_response_data(plan)
+    _validate_plate_parameters_data(plan)
+    return nothing
+end
+
+# A literal plate range covers 1:n_obs exactly (the size the latent vector
+# packs), mirroring the response-range cover check.
+function _validate_plate_parameters_data(plan::StructuralPlan)
+    scalarnames = _union_names(plan)
+    derivednames = Set{Symbol}(d.name for d in plan.derived)
+    for p in plan.plate_parameters
+        # A per-cell prior arg that is neither a scalar name nor a derived
+        # column must be a bound raw data column (validated now that data is
+        # attached); anything else is a genuine unknown name.
+        for (k, v) in pairs(p.args)
+            v isa Symbol || continue
+            (v in scalarnames || v in derivednames || haskey(plan.columns, v)) ||
+                _fail(p.label, "arg $k references unknown name $v")
+        end
+        p.range === nothing && continue
+        last(p.range) == plan.n_obs || _fail(p.label,
+            "plate range $(p.range) covers $(length(p.range)) cells " *
+            "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
+    end
     return nothing
 end
 
@@ -377,31 +589,70 @@ function _validate_name_tables(plan::StructuralPlan)
     params = [p.name for p in plan.parameters]
     assigns = [a.name for a in plan.assignments]
     deriveds = [d.name for d in plan.derived]
+    plates = [p.name for p in plan.plate_parameters]
+    scanstates = [s.state for s in plan.scans]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
     length(unique(deriveds)) == length(deriveds) ||
         _fail(:plan, "duplicate derived-column names")
+    length(unique(plates)) == length(plates) ||
+        _fail(:plan, "duplicate plate-parameter names")
+    length(unique(scanstates)) == length(scanstates) ||
+        _fail(:plan, "duplicate scan-state names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
-        (assigns, deriveds, "assignments and derived columns"))
+        (assigns, deriveds, "assignments and derived columns"),
+        (plates, params, "plate parameters and parameters"),
+        (plates, assigns, "plate parameters and assignments"),
+        (plates, deriveds, "plate parameters and derived columns"),
+        (params, scanstates, "parameters and scan states"),
+        (assigns, scanstates, "assignments and scan states"),
+        (deriveds, scanstates, "derived columns and scan states"),
+        (plates, scanstates, "plate parameters and scan states"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
-    allnames = union(params, assigns, deriveds)
+    allnames = union(params, assigns, deriveds, plates, scanstates)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived name",
+            "predictor $pn collides with a parameter/assignment/derived/plate/scan name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate/scan $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates))
         _check_name_hygiene(n)
+    end
+    return nothing
+end
+
+# Structural invariants of each sequential recurrence. The surface parser
+# (`parse_scan_block`) already enforces these; this is defense-in-depth for a
+# hand-built plan and the invariants the layout/emitter will rely on.
+function _validate_scans(plan::StructuralPlan)
+    for s in plan.scans
+        s.lo == length(s.setup) + 1 || _fail(s.label,
+            "scan loop start $(s.lo) must be one past the $(length(s.setup)) " *
+            "seed fill(s)")
+        for (k, f) in enumerate(s.setup)
+            f.index == k || _fail(s.label,
+                "scan seed fills must be contiguous 1..$(length(s.setup)); " *
+                "entry $k has index $(f.index)")
+        end
+        s.maxlag >= 1 || _fail(s.label,
+            "a scan must read a backward lag of its carried state (maxlag ≥ 1)")
+        length(s.setup) >= s.maxlag || _fail(s.label,
+            "scan maxlag $(s.maxlag) exceeds the $(length(s.setup)) seeded value(s)")
+        any(st -> st.indexed, s.step) || _fail(s.label,
+            "scan recurrence never writes its carried state $(s.state)")
+        (s.hi isa Int || s.hi isa Symbol) || _fail(s.label,
+            "scan loop bound must be a literal Int or a data length Symbol, " *
+            "got $(repr(s.hi))")
     end
     return nothing
 end
@@ -423,11 +674,12 @@ function _validate_column_names(plan::StructuralPlan)
         n -> haskey(plan.columns, n),
         union([p.name for p in plan.parameters],
             [a.name for a in plan.assignments],
-            [d.name for d in plan.derived]),
+            [d.name for d in plan.derived],
+            [p.name for p in plan.plate_parameters]),
     )
     isempty(col_overlap) || _fail(
         :plan,
-        "parameter/assignment/derived names collide with raw columns: $(join(col_overlap, ", "))",
+        "parameter/assignment/derived/plate names collide with raw columns: $(join(col_overlap, ", "))",
     )
     for n in keys(plan.columns)
         _check_name_hygiene(n)
@@ -502,14 +754,19 @@ end
 _union_names(plan::StructuralPlan) =
     union([p.name for p in plan.parameters], [a.name for a in plan.assignments])
 
-"""Full name table: scalar names plus derived columns (dependency edges and
-bind-time reference checks admit all three; sampled-arg positions stay
-scalar-only via [`_union_names`](@ref))."""
+"""Full name table: scalar names plus derived columns plus per-cell latent
+(plate) parameter VECTORS (dependency edges and bind-time reference checks
+admit all; sampled-arg positions stay scalar-only via [`_union_names`](@ref),
+so a scalar arg can never reference a latent vector)."""
 _all_names(plan::StructuralPlan) =
-    union(_union_names(plan), [d.name for d in plan.derived])
+    union(_union_names(plan), [d.name for d in plan.derived],
+        [p.name for p in plan.plate_parameters])
 
 _is_derived(plan::StructuralPlan, name::Symbol) =
     any(d -> d.name === name, plan.derived)
+
+_is_plate_param(plan::StructuralPlan, name::Symbol) =
+    any(p -> p.name === name, plan.plate_parameters)
 
 # With bound=false (structure), bare Symbols are opaque refs and column
 # checks are skipped — classification needs columns. With bound=true, bare
@@ -588,7 +845,10 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
     if ex isa Symbol
-        if _is_derived(plan, ex) || ex in _union_names(plan)
+        # Per-cell latent (plate) parameters are vectors, so a derived column
+        # may transform one (`theta = mu .+ tau .* z`) — the non-centered shape.
+        if _is_derived(plan, ex) || _is_plate_param(plan, ex) ||
+                ex in _union_names(plan)
             push!(refs, ex)
             return nothing
         end
@@ -773,23 +1033,80 @@ function _validate_parameters(plan::StructuralPlan)
             v in names ||
                 _fail(p.label, "arg $k references unknown name $v")
         end
-        ov = p.support_override
-        if ov !== nothing
-            ov === :positive || _fail(
-                p.label,
-                "support override must be :positive, got $ov",
-            )
-            (p.family === :normal || p.family === :cauchy) || _fail(
-                p.label,
-                ":positive override only applies to normal/cauchy " *
-                "(half-Normal/half-Cauchy); got $(p.family)",
-            )
-            loc = first(values(p.args))
-            loc isa Real && loc == 0 || _fail(
-                p.label,
-                ":positive override requires literal zero location " *
-                "(+log(2) is exact only by symmetry at 0); got $(repr(loc))",
-            )
+        _validate_support_override(p.label, p.family, p.support_override, p.args)
+    end
+    return nothing
+end
+
+# Shared support-override rule for scalar and per-cell latent parameters:
+# `:positive` half-truncates a real-support (normal/cauchy) family, and the
+# +log(2) renormalization is exact only for a literal zero location.
+# `(:interval, lo, hi)` is a two-sided finite truncation with finite lo < hi;
+# the family must be real-support (a truncated Normal), and the density carries
+# the exact -log(cdf(hi) - cdf(lo)) renormalization at any location.
+function _validate_support_override(label, family::Symbol,
+        ov::SupportOverride, args::NamedTuple)
+    ov === nothing && return nothing
+    if ov isa Tuple
+        ov[1] === :interval || _fail(label,
+            "tuple support override must be (:interval, lo, hi), got $ov")
+        family === :normal || _fail(label,
+            "an :interval override is a truncated Normal in slice 1 " *
+            "(`truncated(Normal(mu, s), lo, hi)`); got $family")
+        lo, hi = ov[2], ov[3]
+        (isfinite(lo) && isfinite(hi)) || _fail(label,
+            ":interval bounds must be finite (a one-sided or half truncation " *
+            "uses :positive); got ($lo, $hi)")
+        lo < hi || _fail(label,
+            ":interval lower bound must be < upper bound; got ($lo, $hi)")
+        return nothing
+    end
+    ov === :positive || _fail(label, "support override must be :positive, got $ov")
+    (family === :normal || family === :cauchy) || _fail(label,
+        ":positive override only applies to normal/cauchy " *
+        "(half-Normal/half-Cauchy); got $family")
+    loc = first(values(args))
+    loc isa Real && loc == 0 || _fail(label,
+        ":positive override requires literal zero location " *
+        "(+log(2) is exact only by symmetry at 0); got $(repr(loc))")
+    return nothing
+end
+
+# Per-cell latent (plate) parameters: same family/arity/support grammar as
+# scalar SampledParameters. Prior args are either SHARED across cells (a
+# literal or a scalar parameter/assignment name) or PER-CELL (a derived column,
+# giving a varying prior mean/scale — the varying-intercept shape); never
+# another latent vector. `range` is `nothing` (whole-column, size n_obs) or a
+# literal UnitRange (validated to cover 1:n_obs at bind, mirroring responses).
+function _validate_plate_parameters(plan::StructuralPlan)
+    for p in plan.plate_parameters
+        haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
+            "plate family $(p.family) not in the slice-1 set " *
+            "($(join(sort!(collect(keys(SAMPLED_ARITY))), ", ")))")
+        p.family === :flat && _fail(p.label,
+            "a per-cell `flat()` latent has no proper prior to draw a cell " *
+            "from — give the plate parameter a proper family")
+        arity = SAMPLED_ARITY[p.family]
+        expected_keys = ntuple(i -> Symbol(:arg, i), arity)
+        Tuple(keys(p.args)) == expected_keys || _fail(p.label,
+            "family $(p.family) takes positional keys $expected_keys, " *
+            "got $(Tuple(keys(p.args)))")
+        for (k, v) in pairs(p.args)
+            v isa Number && continue
+            v isa Symbol || _fail(p.label,
+                "arg $k must be a literal, a scalar parameter/assignment name, " *
+                "or a per-cell column (data or derived)")
+            _is_plate_param(plan, v) && _fail(p.label,
+                "arg $k is the latent vector $v — a per-cell latent's prior args " *
+                "are shared scalars or per-cell columns, never another latent")
+            # scalar (shared) and derived (per-cell) resolve structurally; a raw
+            # data-column arg (per-cell) resolves at bind, like any data ref.
+        end
+        _validate_support_override(p.label, p.family, p.support_override, p.args)
+        if p.range !== nothing
+            r = p.range
+            (first(r) == 1 && last(r) >= 1) || _fail(p.label,
+                "plate range must start at 1 (`1:N`), got $(first(r)):$(last(r))")
         end
     end
     return nothing
@@ -817,6 +1134,20 @@ function topological_order(plan::StructuralPlan)
             v in names ||
                 _fail(p.label, "arg references unknown name $v")
             push!(refs, v)
+        end
+        deps[p.name] = refs
+    end
+    # Per-cell latent (plate) parameters: prior args are shared scalars,
+    # per-cell derived columns, or raw data columns (never another latent).
+    # They constrain in the layout transforms like scalar params; a
+    # param/assignment/derived arg must be computed before the prior, so it is
+    # a real dependency edge. A raw data-column arg is always available (not a
+    # node) and is validated at bind, so it adds no edge here.
+    for p in plan.plate_parameters
+        refs = Set{Symbol}()
+        for v in values(p.args)
+            v isa Symbol || continue
+            v in allnames && push!(refs, v)
         end
         deps[p.name] = refs
     end
@@ -883,12 +1214,10 @@ function _validate_predictors(plan::StructuralPlan)
 end
 
 function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    t.options == NamedTuple() ||
+        _fail(t.label, "terms take no options (slice 1: factor sizing " *
+                       "lives in LevelMap)")
     if t.kind === FactorTerm
-        o = t.options
-        get(o, :contrasts, nothing) === :treatment ||
-            _fail(t.label, "factor contrasts must be :treatment (slice 1)")
-        ref = get(o, :ref, nothing)
-        ref isa Int || _fail(t.label, "factor ref must be a 1-based level index")
         length(t.columns) == 1 ||
             _fail(t.label, "factor term takes exactly one grouping column")
         for c in t.columns
@@ -896,9 +1225,14 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
                 "factor over the derived column $c needs pre-evaluation " *
                 "level knowledge — factors take raw grouping columns in slice 1")
         end
+    elseif t.kind === LatentTerm
+        length(t.columns) == 1 ||
+            _fail(t.label, "latent term takes exactly one latent-vector name")
+        c = only(t.columns)
+        (_is_plate_param(plan, c) || _is_derived(plan, c)) || _fail(t.label,
+            "latent term over $c needs a per-cell latent parameter " *
+            "(a `PlateParameter`) or a derived column that transforms one")
     else
-        t.options == NamedTuple() ||
-            _fail(t.label, "non-factor terms take no options (slice 1)")
         if t.kind === ContinuousTerm || t.kind === OffsetTerm
             length(t.columns) == 1 ||
                 _fail(t.label, "term takes exactly one column")
@@ -920,24 +1254,16 @@ function _validate_predictor_columns(plan::StructuralPlan)
 end
 
 function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    # Latent terms name a per-cell latent VECTOR (a PlateParameter), not a
+    # raw/derived data column; structure validation checked its presence.
+    t.kind === LatentTerm && return nothing
     for c in t.columns
         haskey(plan.columns, c) || _is_derived(plan, c) ||
             _fail(t.label, "term references missing column $c")
     end
-    if t.kind === FactorTerm
-        ref = get(t.options, :ref, nothing)
-        col = plan.columns[only(t.columns)]
-        levels =
-            try
-                _grouping_levels(col)
-            catch err
-                _fail(t.label, "grouping column levels not orderable ($err)")
-            end
-        1 <= ref <= length(levels) || _fail(
-            t.label,
-            "factor ref $ref out of range (1:$(length(levels)) observed levels)",
-        )
-    elseif t.kind === ContinuousTerm || t.kind === OffsetTerm
+    # FactorTerm: column presence is checked by the loop above; level
+    # coverage is a LevelMap concern (_validate_levelmaps_data).
+    if t.kind === ContinuousTerm || t.kind === OffsetTerm
         c = only(t.columns)
         # Derived columns are length-n by construction; their eltype is
         # unknown statically (in-graph Julia errors are loud).
@@ -963,6 +1289,136 @@ function _grouping_levels(col::AbstractVector)
     return sort(unique(col))
 end
 
+# One map per factor term, keyed (predictor, column); duplicate keys mean
+# two factor terms over one column in one predictor (unidentified sums —
+# merge them).
+_map_key(m::LevelMap) = (m.predictor, m.column)
+
+function _validate_levelmaps(plan::StructuralPlan)
+    keys = _map_key.(plan.levelmaps)
+    length(unique(keys)) == length(keys) ||
+        _fail(:plan, "duplicate LevelMap keys (one map per factor term)")
+    for pred in plan.predictors
+        for t in pred.terms
+            t.kind === FactorTerm || continue
+            col = only(t.columns)
+            nm = count(m -> m.predictor === pred.name && m.column === col,
+                plan.levelmaps)
+            nm == 1 || _fail(t.label,
+                "factor term over $col in predictor $(pred.name) has no " *
+                "LevelMap (surface: size it with a `c[levels($col)]` prior)")
+        end
+        if any(t -> t.kind === InterceptTerm, pred.terms)
+            for t in pred.terms
+                t.kind === FactorTerm || continue
+                m = _find_levelmap(plan.levelmaps, pred.name, only(t.columns))
+                m !== nothing && m.subset === Colon() && _fail(pred.label,
+                    "predictor $(pred.name) is unidentified: intercept + " *
+                    "full-cover factor over $(only(t.columns)) (drop the " *
+                    "intercept or index a strict subset of levels)")
+            end
+        end
+    end
+    for m in plan.levelmaps
+        m.source === :levels ||
+            _fail(:plan, "LevelMap source must be :levels (only admitted " *
+                         "levels function), got $(repr(m.source))")
+        _validate_subset_shape(m)
+    end
+    return nothing
+end
+
+function _find_levelmap(maps::Vector{LevelMap}, pred::Symbol, col::Symbol)
+    idx = findfirst(m -> m.predictor === pred && m.column === col, maps)
+    return idx === nothing ? nothing : maps[idx]
+end
+
+function _validate_subset_shape(m::LevelMap)
+    s = m.subset
+    s === Colon() && return nothing
+    s isa UnitRange{Int} ||
+        s isa Vector{Int} ||
+        (s isa Tuple && length(s) == 2 && s[1] isa Int && s[2] === :end) ||
+        return _fail(:plan, "LevelMap subset must be `:`, a UnitRange, " *
+                            "a Vector{Int}, or (lo, :end) — got $(repr(s))")
+    if s isa UnitRange{Int}
+        first(s) >= 1 && first(s) <= last(s) ||
+            return _fail(:plan, "LevelMap range $(repr(s)) is empty or " *
+                                "starts below 1")
+    elseif s isa Vector{Int}
+        !isempty(s) && all(>=(1), s) ||
+            return _fail(:plan, "LevelMap index list must be non-empty " *
+                                "1-based positions — got $(repr(s))")
+    else
+        s[1] >= 1 ||
+            return _fail(:plan, "LevelMap (lo, :end) needs lo ≥ 1 — " *
+                                "got $(repr(s))")
+    end
+    return nothing
+end
+
+# Binder evaluation: sort-ordered uniques, then the subset selection
+# (bounds-checked against the observed count).
+function _eval_levelmaps(levelmaps::Vector{LevelMap},
+        columns::Dict{Symbol,AbstractVector})
+    out = LevelMap[]
+    for m in levelmaps
+        haskey(columns, m.column) ||
+            _fail(:plan, "LevelMap addresses missing column $(m.column)")
+        levels =
+            try
+                _grouping_levels(columns[m.column])
+            catch err
+                _fail(:plan, "grouping column $(m.column) levels not " *
+                             "orderable ($err)")
+            end
+        push!(out, LevelMap(m.predictor, m.column,
+            _apply_subset(levels, m), m.source, m.subset))
+    end
+    return out
+end
+
+function _apply_subset(levels::Vector, m::LevelMap)
+    K = length(levels)
+    s = m.subset
+    vals = if s === Colon()
+        levels
+    elseif s isa UnitRange{Int}
+        last(s) <= K || _fail(:plan,
+            "LevelMap range $(repr(s)) exceeds $K observed levels of " *
+            "$(m.column)")
+        levels[s]
+    elseif s isa Vector{Int}
+        all(i -> 1 <= i <= K, s) || _fail(:plan,
+            "LevelMap indices $(repr(s)) exceed $K observed levels of " *
+            "$(m.column)")
+        levels[s]
+    else
+        lo = s[1]::Int
+        lo <= K || _fail(:plan,
+            "LevelMap ($(lo), :end) exceeds $K observed levels of " *
+            "$(m.column)")
+        levels[lo:end]
+    end
+    length(unique(vals)) == length(vals) ||
+        _fail(:plan, "LevelMap selects duplicate positions of " *
+                     "$(m.column) — got $(repr(vals))")
+    return collect(vals)
+end
+
+function _validate_levelmaps_data(plan::StructuralPlan)
+    # Rows whose codes fall outside the mapped levels contribute 0 (the
+    # subset is explicit on the page — e.g. reference rows under an
+    # intercept); unobserved mapped levels are allowed like any
+    # zero-variance column. The one failure is unfilled values.
+    for m in plan.levelmaps
+        isempty(m.values) && _fail(:plan,
+            "LevelMap for ($(m.predictor), $(m.column)) has no evaluated " *
+            "values (bind_data fills these — hand-built bound plans must too)")
+    end
+    return nothing
+end
+
 function _validate_priors(plan::StructuralPlan)
     seen = Set{Tuple{Symbol,Symbol}}()
     for pr in plan.population_priors
@@ -976,8 +1432,11 @@ function _validate_priors(plan::StructuralPlan)
             _fail(:plan, "prior for $key must be Normal(finite, positive)")
     end
     for pred in plan.predictors
-        addressees =
-            Set{Symbol}(t.addressee for t in pred.terms if t.kind !== OffsetTerm)
+        # Offset terms carry no coefficient; latent terms carry the per-cell
+        # PlateParameter, whose prior lives on the plate parameter itself, not
+        # as a PopulationPrior — neither needs a coefficient prior here.
+        addressees = Set{Symbol}(t.addressee for t in pred.terms
+            if t.kind !== OffsetTerm && t.kind !== LatentTerm)
         any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
         for a in addressees
             (pred.name, a) in seen ||
@@ -998,8 +1457,21 @@ function _validate_responses(plan::StructuralPlan)
             "response label collides with a canonical node",
         )
     end
+    scan_states = Set{Symbol}(s.state for s in plan.scans)
     used_predictors = Set{Symbol}()
     for r in plan.responses
+        # A scan-state latent vector location: the mean is the carried state
+        # directly (no linear predictor). Slice 1 admits Gaussian-identity only.
+        if r.predictor in scan_states
+            (r.family === GaussianFam && r.link === IdentityLink) || _fail(
+                r.label,
+                "a scan-state response location ($(r.predictor)) is " *
+                "Gaussian-identity only in slice 1 (got $(r.family)/$(r.link))",
+            )
+            _validate_scale(r, plan)
+            _validate_evidence_structure(r, plan)
+            continue
+        end
         idx = findfirst(p -> p.name === r.predictor, plan.predictors)
         idx === nothing &&
             _fail(r.label, "response addresses unknown predictor $(r.predictor)")
@@ -1012,6 +1484,13 @@ function _validate_responses(plan::StructuralPlan)
         )
         _validate_scale(r, plan)
         _validate_evidence_structure(r, plan)
+        if r.range !== nothing
+            first(r.range) == 1 || _fail(r.label,
+                "response range must start at 1 (got $(r.range)) — " *
+                "ranges cover eachindex exactly, no partial windows")
+            length(r.range) >= 1 || _fail(r.label,
+                "response range $(r.range) is empty")
+        end
     end
     for pred in plan.predictors
         pred.name in used_predictors ||
@@ -1023,7 +1502,9 @@ end
 function _validate_response_data(plan::StructuralPlan)
     for r in plan.responses
         _validate_response_column(r, plan)
+        _validate_scale_data(r, plan)
         _validate_weights(r, plan)
+        _validate_trials(r, plan)
         _validate_evidence_data(r, plan)
     end
     return nothing
@@ -1035,38 +1516,143 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         "responses raw (derived responses need shape metadata — planned)")
     haskey(plan.columns, r.response) ||
         _fail(r.label, "response column $(r.response) missing")
+    if r.range !== nothing
+        last(r.range) == plan.n_obs || _fail(r.label,
+            "response range $(r.range) covers $(length(r.range)) cells " *
+            "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
+    end
     col = plan.columns[r.response]
-    if r.family === BernoulliLogitFam
+    if _is_bernoulli_family(r.family)
         eltype(col) === Bool && return nothing
         eltype(col) <: Integer && all(x -> x == 0 || x == 1, col) && return nothing
         return _fail(r.label, "Bernoulli response must be Bool or 0/1 integers")
     elseif r.family === PoissonLogFam
         eltype(col) <: Integer && all(>=(0), col) && return nothing
         return _fail(r.label, "Poisson response must be non-negative integers")
-    else
+    elseif _is_binomial_family(r.family)
+        _is_count_column(col) && return nothing
+        return _fail(r.label, "Binomial response must be non-negative integers")
+    elseif r.family === NegativeBinomial2Fam
+        _is_count_column(col) && return nothing
+        return _fail(r.label, "NB2 response must be non-negative integers")
+    elseif r.family === GaussianFam
         eltype(col) <: Real ||
             _fail(r.label, "Gaussian response must be numeric")
         return nothing
+    elseif r.family === GammaLogFam
+        # Strictly positive: the gamma kernel guards x > 0, and at exactly
+        # 0 it is wrong for shape ≤ 1 (says -Inf; truth is finite/+Inf) —
+        # fail closed instead of flowing a wrong value.
+        (eltype(col) <: Real && all(>(0), col)) ||
+            _fail(r.label, "Gamma response must be strictly positive numerics")
+        return nothing
+    elseif r.family === BetaLogitFam
+        # Strictly inside (0, 1): the beta kernel guards 0 < x < 1, and at
+        # exactly 0/1 it is wrong for shapes ≤ 1 (says -Inf; truth is
+        # finite/+Inf) — fail closed instead of flowing a wrong value.
+        (eltype(col) <: Real && all(x -> 0 < x < 1, col)) ||
+            _fail(r.label, "Beta response must be numerics strictly inside (0, 1)")
+        return nothing
+    else
+        return _fail(r.label, "response family $(r.family) has no column rule")
     end
 end
 
+# Non-Bool integer column, all non-negative (Binomial/NB2 responses;
+# Bool would pass `<: Integer` and die downstream — exclude it here).
+_is_count_column(col) =
+    eltype(col) <: Integer && eltype(col) !== Bool && all(>=(0), col)
+
+# Bernoulli/Binomial span three link variants each (logit + slice-2
+# probit/cloglog); response/trials rules are link-independent.
+_is_bernoulli_family(f) =
+    f === BernoulliLogitFam || f === BernoulliProbitFam || f === BernoulliCloglogFam
+_is_binomial_family(f) =
+    f === BinomialLogitFam || f === BinomialProbitFam || f === BinomialCloglogFam
+
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
-    if r.family === GaussianFam
-        r.scale === nothing &&
-            _fail(r.label, "Gaussian response requires a scale (parameter or literal)")
-    else
+    need = r.family === GaussianFam ? "Gaussian response requires a scale" :
+        r.family === NegativeBinomial2Fam ?
+        "NB2 response requires a dispersion phi" :
+        r.family === GammaLogFam ? "Gamma response requires a shape alpha" :
+        r.family === BetaLogitFam ? "Beta response requires a concentration kappa" : nothing
+    if need === nothing
         r.scale === nothing ||
-            _fail(r.label, "non-Gaussian response takes no scale")
+            _fail(r.label, "this response family takes no scale auxiliary")
+    else
+        r.scale === nothing &&
+            _fail(r.label, "$need (parameter or literal)")
     end
     s = r.scale
     s === nothing && return nothing
     if s isa Real
         (isfinite(s) && s > 0) ||
-            _fail(r.label, "Gaussian scale literal must be finite positive")
+            _fail(r.label, "scale literal must be finite positive")
         return nothing
     end
+    # A scalar parameter/assignment scale resolves now; a per-observation scale
+    # is a raw data column resolved at bind (see `_validate_scale_data`), so
+    # defer an unknown symbol rather than failing structurally (mirrors how
+    # per-obs weight/trials columns validate only once data is attached).
     s isa Symbol && s in _union_names(plan) && return nothing
+    s isa Symbol && return nothing
     return _fail(r.label, "scale references unknown name $s")
+end
+
+# Data-level per-observation scale check: a scalar parameter/assignment name
+# resolves structurally; a raw data-column scale (the eight-schools known SE)
+# must be finite-positive numerics of length n_obs (a Gaussian/NB2/Gamma scale
+# is strictly positive). A derived column scale is rejected — per-obs scales
+# bind raw (mirrors the weights/trials raw-only rule).
+function _validate_scale_data(r::LikelihoodSpec, plan::StructuralPlan)
+    s = r.scale
+    (s === nothing || s isa Real) && return nothing
+    s isa Symbol || return nothing
+    s in _union_names(plan) && return nothing
+    _is_derived(plan, s) && _fail(r.label,
+        "scale column $s is derived — slice-1 binds per-observation scales " *
+        "raw (derived-column scales need shape metadata — planned)")
+    haskey(plan.columns, s) ||
+        _fail(r.label, "scale references unknown name $s")
+    col = plan.columns[s]
+    (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
+        _fail(r.label, "per-observation scale $s must be finite positive numerics")
+    length(col) == plan.n_obs ||
+        _fail(r.label, "scale column $s length $(length(col)) ≠ n_obs $(plan.n_obs)")
+    return nothing
+end
+
+function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
+    if !_is_binomial_family(r.family)
+        r.trials === nothing ||
+            _fail(r.label, "only Binomial responses take trials")
+        return nothing
+    end
+    r.trials === nothing && _fail(r.label,
+        "Binomial response requires trials (Int column or literal)")
+    ycol = plan.columns[r.response]
+    t = r.trials
+    if t isa Int
+        t >= 0 || _fail(r.label, "Binomial trials literal must be non-negative")
+        all(ycol .<= t) ||
+            _fail(r.label, "Binomial response exceeds trials $t")
+        return nothing
+    end
+    _is_derived(plan, t) && _fail(r.label,
+        "trials column $t is derived — slice-1 binds trials " *
+        "raw (derived trials need shape metadata — planned)")
+    haskey(plan.columns, t) ||
+        _fail(r.label, "trials column $t missing")
+    col = plan.columns[t]
+    (eltype(col) <: Integer && eltype(col) !== Bool) ||
+        _fail(r.label, "trials column must hold integers")
+    all(>=(0), col) ||
+        _fail(r.label, "trials column must be non-negative")
+    length(col) == plan.n_obs ||
+        _fail(r.label, "trials column length $(length(col)) ≠ n_obs $(plan.n_obs)")
+    all(ycol .<= col) ||
+        _fail(r.label, "Binomial response exceeds trials in some row")
+    return nothing
 end
 
 function _validate_weights(r::LikelihoodSpec, plan::StructuralPlan)
@@ -1145,7 +1731,8 @@ function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
 end
 
 const _ROLE_RANK = Dict{Symbol,Int}(
-    :data => 1, :predictor => 2, :weight => 3, :evidence => 4, :response => 5,
+    :data => 1, :predictor => 2, :weight => 3, :evidence => 4, :trials => 5,
+    :response => 6,
 )
 
 _upgrade_role!(roles, col, role) =
@@ -1157,8 +1744,8 @@ _upgrade_role!(roles, col, role) =
 Attach `columns` to a structure-only plan (or rebind an already-bound one,
 replacing columns + roles): infer column roles, merge explicit `roles` over
 them, and run data validation. Returns a NEW bound plan; the input is
-untouched. Inference precedence: response > evidence > weight > predictor
-> data; term columns are the only `:predictor` source, so
+untouched. Inference precedence: response > trials > evidence > weight >
+predictor > data; term columns are the only `:predictor` source, so
 assignment/extra columns stay `:data`.
 """
 function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
@@ -1180,6 +1767,8 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     for r in plan.responses
         r.weights !== nothing && haskey(inferred, r.weights) &&
             _upgrade_role!(inferred, r.weights, :weight)
+        r.trials isa Symbol && haskey(inferred, r.trials) &&
+            _upgrade_role!(inferred, r.trials, :trials)
         for b in (r.evidence.lower, r.evidence.upper)
             b isa Symbol && haskey(inferred, b) &&
                 _upgrade_role!(inferred, b, :evidence)
@@ -1190,9 +1779,12 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     end
     merged = merge(inferred, roles)
     n = length(first(values(columns)))
+    maps = _eval_levelmaps(plan.levelmaps, columns)
     bound = StructuralPlan(plan.responses, plan.predictors,
         plan.population_priors, plan.parameters, plan.assignments,
-        columns, n; roles = merged, derived = plan.derived)
+        columns, n; roles = merged, derived = plan.derived,
+        levelmaps = maps, plate_parameters = plan.plate_parameters,
+        scans = plan.scans)
     validate_data(bound)
     return bound
 end
