@@ -75,7 +75,8 @@ module PPLGeneratedModels
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
-    beta, inverse_gamma, binomial, negative_binomial2
+    beta, inverse_gamma, binomial, negative_binomial2,
+    gp_exp_quad_cov, gp_chol_latent
 using SpecialFunctions: erfc
 # Selective (explicit imports win over any re-export chain, so no `using`
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics

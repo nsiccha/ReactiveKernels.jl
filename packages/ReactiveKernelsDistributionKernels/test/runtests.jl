@@ -2,7 +2,7 @@ using Distributions: Bernoulli, Cauchy, Dirichlet, Exponential, Geometric,
     InverseGamma, Laplace, LKJCholesky, Logistic, LogNormal, MvNormal,
     NegativeBinomial, Normal,
     TDist, Uniform, cdf, logpdf, quantile
-using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky
+using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky, diag
 using LogExpFunctions: log1pexp
 using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, code_expr, explain,
     extract, plan, plate, prepare
@@ -10,7 +10,8 @@ using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     LOCATION_SCALE_SOURCE,
     standard_normal, standard_cauchy, standard_laplace, standard_student_t,
-    standard_logistic, location_scale, student_t,
+    standard_logistic, location_scale, student_t, gp_exp_quad_cov,
+    gp_chol_latent,
     BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE,
     EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE,
     MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE,
@@ -406,6 +407,42 @@ end
         @test occursin("(observed, p)", p_plan)
         @test !occursin("(observed, logit)", p_plan)
     end
+end
+
+@testset "gp exp-quad covariance" begin
+    # Stan gp_exp_quad_cov math: σ²exp(−(xᵢ−xⱼ)²/2ρ²), jitter on the diagonal.
+    x = [0.0, 0.5, 1.5]
+    K = gp_exp_quad_cov(x, 2.0, 1.5, 1e-9)
+    ref = [4 * exp(-(a - b)^2 / (2 * 1.5^2)) + (a == b ? 1e-9 : 0.0)
+           for a in x, b in x]
+    @test K ≈ ref
+    @test K == K' # symmetric
+    @test all(diag(K) .> 4.0) # jitter lifts the unit diagonal (σ²=4)
+    @test_throws ArgumentError gp_exp_quad_cov(Float64[], 1.0, 1.0, 1e-9)
+    @test_throws ArgumentError gp_exp_quad_cov(x, 0.0, 1.0, 1e-9)
+    @test_throws ArgumentError gp_exp_quad_cov(x, 1.0, -2.0, 1e-9)
+    @test_throws ArgumentError gp_exp_quad_cov(x, 1.0, 1.0, -1e-9)
+    @test_throws ArgumentError gp_exp_quad_cov(x, 1.0, 1.0, Inf)
+    # Aniso (matrix locations) is sequenced, fails closed.
+    @test_throws ArgumentError gp_exp_quad_cov([0.0 0.0; 1.0 1.0], 1.0, 1.0,
+        1e-9)
+end
+
+@testset "gp chol latent (pure-Julia potrf)" begin
+    x = collect(0.0:0.5:2.5)
+    K = gp_exp_quad_cov(x, 1.5, 1.0, 1e-6)
+    z = [0.5, -1.0, 0.25, 1.5, -0.75, 0.0]
+    Lref = cholesky(Symmetric(K)).L
+    @test gp_chol_latent(K, z) ≈ Lref * z
+    # potrf factor itself matches LAPACK (white-box: only the lower
+    # triangle is valid out of _gp_potrf!).
+    L = Matrix(K)
+    DistributionKernelSources._gp_potrf!(L)
+    @test LowerTriangular(L) ≈ Lref
+    @test_throws ArgumentError gp_chol_latent(K, z[1:3])
+    @test_throws ArgumentError gp_chol_latent(K[:, 1:3], z)
+    # Non-PD names jitter (never a bare DomainError from sqrt).
+    @test_throws ArgumentError gp_chol_latent(fill(1.0, 3, 3), ones(3))
 end
 
 @testset "negative_binomial2 Stan lpmf parity" begin
