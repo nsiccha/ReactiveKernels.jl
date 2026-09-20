@@ -288,25 +288,31 @@ function monotonic_recipe(increments::Symbol, idx::Symbol, K::Int)
 end
 
 """
-    design_recipe(shape, n_obs) -> Union{Nothing,Expr}
+    design_recipe(shape, n_obs; plates) -> Union{Nothing,Expr}
 
 `_ppl_design_<pred> = Float64.(hcat(<blocks…>))`, or `nothing` for a
-predictor with no static (data-only) blocks. Blocks: intercept →
-`ones(n)`, continuous → the bare column, factor → full-rank dummies over
-mapped levels. Monotonic blocks contribute no part (their contrast is
+width-0 (offset-only) predictor or a predictor with no static (data-only) blocks. Blocks: intercept → `ones(n)`, continuous
+→ the bare column, factor → full-rank dummies over mapped levels. Monotonic blocks contribute no part (their contrast is
 parameter-derived — `hcat` cannot mix data with symbolic columns under
 the Enzyme reverse pass — so the generator splices them per-block
 against their coefficient coordinate instead).
+`plates` names the per-cell latent vectors (a `ContinuousTerm` may scale
+one — the SB `me` mirror): a latent part wraps as `Float64.(col)`, which
+materializes the layout's packed-slice `view` to a dense vector so the
+`hcat` stays homogeneous — a mixed `Vector`/`SubArray` `hcat` lowers
+through a Union-typed path Enzyme cannot differentiate.
 """
-function design_recipe(shape::DesignShape, n_obs::Int)
+function design_recipe(shape::DesignShape, n_obs::Int;
+        plates::AbstractSet{Symbol} = Set{Symbol}())
+    shape.width == 0 && return nothing
     # Continuous blocks contribute their bare column (a bound port), not a
-    # wrapped Expr.
+    # wrapped Expr — except latent columns, which materialize (above).
     parts = Any[]
     for b in shape.blocks
         if b.kind === InterceptTerm
             push!(parts, :(ones($n_obs)))
         elseif b.kind === ContinuousTerm
-            push!(parts, b.column)
+            push!(parts, b.column in plates ? :(Float64.($(b.column))) : b.column)
         elseif b.kind === FactorTerm
             push!(parts, _contrast_expr(b))
         end
@@ -347,6 +353,7 @@ offset vector (unless absent).
 """
 function preprocessing_recipes(plan::StructuralPlan)
     stmts = Expr[]
+    plates = Set{Symbol}(p.name for p in plan.plate_parameters)
     for pred in plan.predictors
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
         for t in pred.terms
@@ -356,7 +363,7 @@ function preprocessing_recipes(plan::StructuralPlan)
                 only(t.columns), _monotonic_K(plan, t)))
         end
         if !any(b -> b.kind === MonotonicTerm, shape.blocks)
-            recipe = design_recipe(shape, plan.n_obs)
+            recipe = design_recipe(shape, plan.n_obs; plates)
             recipe !== nothing && push!(stmts, recipe)
         end
         off = offset_recipe(shape)

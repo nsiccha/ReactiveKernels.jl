@@ -144,7 +144,11 @@ at their defaults:
 
 Multinomial/Categorical responses name their shared-simplex
 [`VectorParameter`](@ref) in `predictor` (no linear predictor — the
-scan-state precedent).
+scan-state precedent). A Gaussian-identity response may likewise name a
+[`PlateParameter`](@ref) in `predictor`: a latent-mean observation
+(`x_obs ~ Normal(x_true, sd)` with scalar constant `sd` — the SB `me`
+mirror).
+
 
 Joint correlated-outcomes responses (`MvNormalCholeskyFam`, SB
 `[y1..yK] ~ MvNormalCholesky([mu1..muK], L)`) use the trailing joint
@@ -226,7 +230,9 @@ One additive predictor term: structure only, never materialized designs
 never a per-level label. Terms take no options: factor sizing lives in
 the plan's [`LevelMap`](@ref)s (full-rank over exactly the mapped
 levels; no contrasts, no reference dropping — that machinery was
-BRM-specific and is gone).
+BRM-specific and is gone). A `ContinuousTerm` may name a per-cell latent
+([`PlateParameter`](@ref)) instead of a data column: the latent vector
+enters the design with a free coefficient (the SB `me` mirror).
 """
 struct TermSpec
     kind::TermKind
@@ -3015,6 +3021,15 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
     # columns; structure validation checked both names.
     t.kind === ScanSummandTerm && return nothing
     for c in t.columns
+        # A per-cell latent enters a design only through a ContinuousTerm
+        # (a free coefficient scaling the latent vector — the SB `me`
+        # mirror); every other term kind over a latent fails closed.
+        if _is_plate_param(plan, c) && t.kind !== RanefGatherTerm
+            t.kind === ContinuousTerm || _fail(t.label,
+                "term over the latent vector $c must be a ContinuousTerm " *
+                "(a free coefficient scaling the latent — got $(t.kind))")
+            continue
+        end
         haskey(plan.columns, c) || _is_derived(plan, c) ||
             _fail(t.label, "term references missing column $c")
     end
@@ -3025,6 +3040,9 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
     # coverage is a LevelMap concern (_validate_levelmaps_data).
     if t.kind === ContinuousTerm || t.kind === OffsetTerm
         c = only(t.columns)
+        # A latent vector is length-n by construction (like a derived
+        # column); its values are parameters, never data eltypes.
+        _is_plate_param(plan, c) && return nothing
         # Derived columns are length-n by construction; their eltype is
         # unknown statically (in-graph Julia errors are loud).
         _is_derived(plan, c) && return nothing
@@ -3701,6 +3719,34 @@ function _validate_responses(plan::StructuralPlan)
                 "a scan-state response location ($(r.predictor)) is " *
                 "Gaussian-identity only in slice 1 (got $(r.family)/$(r.link))",
             )
+            _validate_scale(r, plan)
+            _validate_evidence_structure(r, plan)
+            _validate_unleveled_fields(r)
+            continue
+        end
+        # A per-cell latent location (no linear predictor — the scan-state
+        # precedent): a latent-mean observation `x_obs ~ Normal(x_true, sd)`
+        # with scalar constant `sd` (the SB `me` mirror). Gaussian-identity
+        # only; SB's observation likelihood is never weighted, truncated,
+        # or ranged, so those fields fail closed.
+        if _is_plate_param(plan, r.predictor)
+            (r.family === GaussianFam && r.link === IdentityLink) || _fail(
+                r.label,
+                "a plate-mean response location ($(r.predictor)) is " *
+                "Gaussian-identity only (got $(r.family)/$(r.link))",
+            )
+            r.scale isa Real || _fail(r.label,
+                "a plate-mean observation ($(r.predictor)) takes a scalar " *
+                "constant scale (SB `me` sd — got " *
+                "$(r.scale === nothing ? "nothing" : repr(r.scale)))")
+            r.weights === nothing || _fail(r.label,
+                "a plate-mean observation ($(r.predictor)) takes no weights")
+            r.evidence.kind === :none || _fail(r.label,
+                "a plate-mean observation ($(r.predictor)) takes no " *
+                "censoring/truncation evidence")
+            r.range === nothing || _fail(r.label,
+                "a plate-mean observation ($(r.predictor)) takes no range " *
+                "(the latent covers the whole column)")
             _validate_scale(r, plan)
             _validate_evidence_structure(r, plan)
             _validate_unleveled_fields(r)
