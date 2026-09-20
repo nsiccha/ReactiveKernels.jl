@@ -116,6 +116,7 @@ coefficient (`u .* beta`, SB's `ar` latent path with its free `popefs` beta)."""
     MonotonicTerm
     MonotonicSummandTerm
     VaryingEffectTerm
+    MatrixTerm
 end
 
 """
@@ -780,6 +781,24 @@ struct LevelMap
 end
 
 """
+    DesignMatrix(name, columns, label)
+
+One user-bound design matrix (`X = hcat(1, x1, x2)`): `columns` in hcat
+order, `nothing` marking intercept-ones positions. Data/derived columns
+only (length-n by bind/construction); latent, scan, parameter, and
+nested-matrix names are rejected — the SB `me` mirror stays affine and
+nested `hcat` stays a follow-up. The generator emits each matrix once
+(`X = Float64.(hcat(...))`); [`MatrixTerm`](@ref)s reference it by name
+and splice `X * view(coef, ...)` matvecs. Width is static
+(`length(columns)`); the surface sizes coefficient vectors from it.
+"""
+struct DesignMatrix
+    name::Symbol
+    columns::Vector{Union{Nothing,Symbol}}
+    label::Symbol
+end
+
+"""
     StructuralPlan(responses, predictors, population_priors, parameters,
                    assignments, derived, columns, n_obs)
 
@@ -791,10 +810,11 @@ name table (duplicates rejected). N≥1 independent responses; shared
 predictor Symbols allowed. `levelmaps` sizes every factor term
 (binder-evaluated values); `plate_parameters` carries per-cell latents,
 `vector_parameters` leveled-response latents (cutpoints/thresholds/simplexes),
-`scans` sequential-recurrence latents, and
+`scans` sequential-recurrence latents,
 `varying_draws`/`varying_slices` the generic varying-effect draws
-blocks plus their per-target applications (empty for a plain
-population-GLM plan).
+blocks plus their per-target applications, and `matrices`
+user-bound design matrices referenced by [`MatrixTerm`](@ref)s
+(empty for a plain population-GLM plan).
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -817,6 +837,7 @@ struct StructuralPlan
     hsgp_bases::Vector{HSGPBasis}
     kernel_plates::Vector{KernelPlate}
     r2d2_priors::Vector{R2D2Prior}
+    matrices::Vector{DesignMatrix}
 end
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
@@ -837,7 +858,7 @@ StructuralPlan(
         LevelMap[], ScanSpec[], VaryingDraws[], VaryingSlice[],
         VectorParameter[],
         SplineBasis[], SplineVector[], HSGPBasis[], KernelPlate[],
-        R2D2Prior[])
+        R2D2Prior[], DesignMatrix[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -867,14 +888,26 @@ function StructuralPlan(
         spline_vectors::Vector{SplineVector} = SplineVector[],
         hsgp_bases::Vector{HSGPBasis} = HSGPBasis[],
         kernel_plates::Vector{KernelPlate} = KernelPlate[],
-        r2d2_priors::Vector{R2D2Prior} = R2D2Prior[])
+        r2d2_priors::Vector{R2D2Prior} = R2D2Prior[],
+        matrices::Vector{DesignMatrix} = DesignMatrix[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans, varying_draws,
         varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        kernel_plates, r2d2_priors)
+        kernel_plates, r2d2_priors, matrices)
 end
+
+"""Find a design matrix by name, or `nothing`."""
+function _find_matrix(plan::StructuralPlan, name::Symbol)
+    i = findfirst(m -> m.name === name, plan.matrices)
+    return i === nothing ? nothing : plan.matrices[i]
+end
+
+"""Per-element prior addressees of a design matrix in column order
+(`:Intercept` at intercept positions, the column otherwise)."""
+_matrix_element_addressees(m::DesignMatrix) =
+    Symbol[c === nothing ? :Intercept : c for c in m.columns]
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
 only; [`bind_data`](@ref) attaches data (+ roles). Rebinding replaces."""
@@ -1053,8 +1086,8 @@ function _hsgp_floors(K::Vector{Int}, fits::Vector{Tuple{Float64,Float64}},
 end
 
 """Slice-1 term-name vocabulary (emitter-side admission keys; `:varying_effect`,
-`:spline_summand`, `:monotonic`, and `:monotonic_summand` joined with
-their slices)."""
+`:spline_summand`, `:monotonic`, `:monotonic_summand`, and `:matrix` joined
+with their slices)."""
 const TERM_NAMES = Dict{Symbol,TermKind}(
     :intercept => InterceptTerm,
     :continuous => ContinuousTerm,
@@ -1066,6 +1099,7 @@ const TERM_NAMES = Dict{Symbol,TermKind}(
     :scan_summand => ScanSummandTerm,
     :monotonic => MonotonicTerm,
     :monotonic_summand => MonotonicSummandTerm,
+    :matrix => MatrixTerm,
 )
 
 """Allowlisted assignment functions (slice 1: scalar ops + whole-column
@@ -1106,7 +1140,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
     VaryingEffectTerm, SplineSummandTerm, HSGPSummandTerm,
-    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm)
+    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm, MatrixTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate):
 scalar/reduction vocabulary plus vector-returning whole-column functions."""
@@ -1155,6 +1189,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_plate_parameters(plan)
     _validate_vector_parameters(plan)
     _validate_topo_order(plan)
+    _validate_matrices(plan)
     _validate_predictors(plan)
     _validate_levelmaps(plan)
     _validate_priors(plan)
@@ -2166,6 +2201,7 @@ function _validate_name_tables(plan::StructuralPlan)
         for nm in _varying_corr_names(d)]
     hsgp = Symbol[nm for hb in plan.hsgp_bases for nm in _hsgp_all_names(hb)]
     kern = Symbol[nm for kp in plan.kernel_plates for nm in _kernel_all_names(kp)]
+    mats = Symbol[m.name for m in plan.matrices]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
@@ -2187,6 +2223,8 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate hsgp names")
     length(unique(kern)) == length(kern) ||
         _fail(:plan, "duplicate kernel-plate names")
+    length(unique(mats)) == length(mats) ||
+        _fail(:plan, "duplicate design-matrix names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
         (assigns, deriveds, "assignments and derived columns"),
@@ -2241,24 +2279,35 @@ function _validate_name_tables(plan::StructuralPlan)
         (kern, svec, "kernel-plate names and spline vectors"),
         (kern, vk1, "kernel-plate names and K=1 varying names"),
         (kern, vcorr, "kernel-plate names and correlated varying names"),
-        (kern, hsgp, "kernel-plate names and hsgp names"))
+        (kern, hsgp, "kernel-plate names and hsgp names"),
+        (mats, params, "design-matrix names and parameters"),
+        (mats, assigns, "design-matrix names and assignments"),
+        (mats, deriveds, "design-matrix names and derived columns"),
+        (mats, plates, "design-matrix names and plate parameters"),
+        (mats, scanstates, "design-matrix names and scan states"),
+        (mats, vectors, "design-matrix names and vector parameters"),
+        (mats, svec, "design-matrix names and spline vectors"),
+        (mats, vk1, "design-matrix names and K=1 varying names"),
+        (mats, vcorr, "design-matrix names and correlated varying names"),
+        (mats, hsgp, "design-matrix names and hsgp names"),
+        (mats, kern, "design-matrix names and kernel-plate names"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
     allnames = union(params, assigns, deriveds, plates, scanstates, vectors,
-        svec, vk1, vcorr, hsgp, kern)
+        svec, vk1, vcorr, hsgp, kern, mats)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/spline/varying/kernel name",
+            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/spline/varying/kernel/matrix name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived/plate/scan/vector/spline/varying/kernel $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate/scan/vector/spline/varying/kernel/matrix $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, vk1, vcorr, hsgp, kern))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, vk1, vcorr, hsgp, kern, mats))
         _check_name_hygiene(n)
     end
     return nothing
@@ -3012,6 +3061,49 @@ function _validate_topo_order(plan::StructuralPlan)
     return nothing
 end
 
+function _validate_matrices(plan::StructuralPlan)
+    matnames = Set{Symbol}(m.name for m in plan.matrices)
+    for m in plan.matrices
+        isempty(m.columns) && _fail(m.label,
+            "design matrix $(m.name) has no columns " *
+            "(hcat needs at least one)")
+        seen_cols = Set{Symbol}()
+        n_intercept = 0
+        for c in m.columns
+            if c === nothing
+                n_intercept += 1
+                n_intercept > 1 && _fail(m.label,
+                    "design matrix $(m.name) has two intercept positions " *
+                    "— one coefficient per column")
+                continue
+            end
+            c in seen_cols && _fail(m.label,
+                "design matrix $(m.name) repeats column $c " *
+                "— one coefficient per column")
+            push!(seen_cols, c)
+            c in matnames && _fail(m.label,
+                "design matrix $(m.name) nests matrix $c — nested hcat " *
+                "is not in slice D1 (flatten it)")
+            _is_plate_param(plan, c) && _fail(m.label,
+                "design matrix $(m.name) over the latent vector $c is not " *
+                "in slice D1 (the me mirror stays affine)")
+            any(s -> s.state === c, plan.scans) && _fail(m.label,
+                "design matrix $(m.name) over scan state $c is not in " *
+                "slice D1 (data/derived columns only)")
+            any(p -> p.name === c, plan.parameters) && _fail(m.label,
+                "design matrix $(m.name) over sampled parameter $c is not " *
+                "in slice D1 (data/derived columns only)")
+            any(p -> p.name === c, plan.vector_parameters) && _fail(m.label,
+                "design matrix $(m.name) over vector parameter $c is not " *
+                "in slice D1 (data/derived columns only)")
+            any(a -> a.name === c, plan.assignments) && _fail(m.label,
+                "design matrix $(m.name) over scalar assignment $c is not " *
+                "in slice D1 (data/derived columns only)")
+        end
+    end
+    return nothing
+end
+
 function _validate_predictors(plan::StructuralPlan)
     for pred in plan.predictors
         isempty(pred.terms) &&
@@ -3044,6 +3136,10 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
         _validate_scan_term(t, pred, plan)
         return nothing
     end
+    if t.kind === MatrixTerm
+        _validate_matrix_term(t, pred, plan)
+        return nothing
+    end
     t.options == NamedTuple() ||
         _fail(t.label, "terms take no options (slice 1: factor sizing " *
                        "lives in LevelMap)")
@@ -3071,6 +3167,35 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
                 _fail(t.label, "intercept term takes no columns")
         end
     end
+    return nothing
+end
+
+# A matrix term names its design matrix in `options` (`(matrix,)` — the
+# gather/spline options precedent) and carries exactly the matrix's data
+# columns in order (intercept positions excluded — they take no column);
+# its addressee is the matrix name. Per-element prior coverage (one
+# PopulationPrior row per element addressee) is checked in
+# `_validate_priors`, which expands the matrix.
+function _validate_matrix_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    o = t.options
+    Tuple(keys(o)) == (:matrix,) ||
+        _fail(t.label, "matrix term options must be exactly " *
+              "`(matrix,)`, got $(Tuple(keys(o)))")
+    o.matrix isa Symbol ||
+        _fail(t.label, "matrix term matrix must be a Symbol, " *
+              "got $(repr(o.matrix))")
+    m = _find_matrix(plan, o.matrix)
+    m === nothing &&
+        _fail(t.label, "matrix term addresses unknown design matrix " *
+              ":$(o.matrix)")
+    data_cols = Symbol[c for c in m.columns if c !== nothing]
+    t.columns == data_cols ||
+        _fail(t.label, "matrix term columns must be exactly the " *
+              "design-matrix data columns in order ($(data_cols)), " *
+              "got $(t.columns)")
+    t.addressee === o.matrix ||
+        _fail(t.label, "matrix term addressee must be its matrix " *
+              ":$(o.matrix), got $(t.addressee)")
     return nothing
 end
 
@@ -3253,6 +3378,19 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
         eltype(col) <: Real ||
             _fail(t.label, "column $c must be numeric")
     end
+    # MatrixTerm: same per-data-column numeric rule over its (intercept-
+    # free) columns. Presence rode the loop above; latents fail there
+    # (ContinuousTerm-only); derived columns are length-n by
+    # construction. Length-n itself rides bind (each bound column is
+    # length-checked — the hcat is then safe).
+    if t.kind === MatrixTerm
+        for c in t.columns
+            _is_derived(plan, c) && continue
+            col = plan.columns[c]
+            eltype(col) <: Real ||
+                _fail(t.label, "column $c must be numeric")
+        end
+    end
     if t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm
         _validate_monotonic_columns(t, plan)
     end
@@ -3316,7 +3454,16 @@ function _validate_levelmaps(plan::StructuralPlan)
                 "factor term over $col in predictor $(pred.name) has no " *
                 "LevelMap (surface: size it with a `c[levels($col)]` prior)")
         end
-        if any(t -> t.kind === InterceptTerm, pred.terms)
+        has_intercept = any(t -> t.kind === InterceptTerm, pred.terms)
+        if !has_intercept
+            for t in pred.terms
+                t.kind === MatrixTerm || continue
+                m = _find_matrix(plan, t.options.matrix)
+                m !== nothing && any(isnothing, m.columns) &&
+                    (has_intercept = true; break)
+            end
+        end
+        if has_intercept
             for t in pred.terms
                 t.kind === FactorTerm || continue
                 m = _find_levelmap(plan.levelmaps, pred.name, only(t.columns))
@@ -3455,13 +3602,27 @@ function _validate_priors(plan::StructuralPlan)
         # hsgp summands an HSGPBasis, and monotonic summands (mo1) an
         # increment simplex, whose geometries are self-priored — none needs
         # a coefficient prior. Monotonic (mo) terms DO take a free
-        # coefficient, so they stay in the addressee set.
-        addressees = Set{Symbol}(t.addressee for t in pred.terms
-            if t.kind !== OffsetTerm && t.kind !== LatentTerm &&
-               t.kind !== VaryingEffectTerm &&
-               t.kind !== SplineSummandTerm && t.kind !== HSGPSummandTerm &&
-               t.kind !== ScanSummandTerm &&
-               t.kind !== MonotonicSummandTerm)
+        # coefficient, so they stay in the addressee set. Matrix terms
+        # expand to their per-element addressees (one PopulationPrior row
+        # per matrix column).
+        addressees = Set{Symbol}()
+        for t in pred.terms
+            (t.kind === OffsetTerm || t.kind === LatentTerm ||
+                t.kind === VaryingEffectTerm ||
+                t.kind === SplineSummandTerm ||
+                t.kind === HSGPSummandTerm ||
+                t.kind === ScanSummandTerm ||
+                t.kind === MonotonicSummandTerm) && continue
+            if t.kind === MatrixTerm
+                m = _find_matrix(plan, t.options.matrix)
+                m === nothing && _fail(:plan,
+                    "internal: matrix term $(t.label) addresses unknown " *
+                    "matrix (validate_predictors should have caught this)")
+                union!(addressees, _matrix_element_addressees(m))
+                continue
+            end
+            push!(addressees, t.addressee)
+        end
         any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
         for a in addressees
             (pred.name, a) in seen ||
@@ -3515,7 +3676,18 @@ function _validate_r2d2(plan::StructuralPlan)
                 "literal R2D2 tau must be finite and strictly positive " *
                 "(SB `_sb_r2d2_positive`), got $(repr(rp.tau))")
         end
-        allowed = Set{Symbol}(t.addressee for t in pred.terms)
+        allowed = Set{Symbol}()
+        for t in pred.terms
+            if t.kind === MatrixTerm
+                m = _find_matrix(plan, t.options.matrix)
+                m === nothing && _fail(:plan,
+                    "internal: matrix term $(t.label) addresses unknown " *
+                    "matrix (validate_predictors should have caught this)")
+                union!(allowed, _matrix_element_addressees(m))
+                continue
+            end
+            push!(allowed, t.addressee)
+        end
         any(t -> t.kind === InterceptTerm, pred.terms) &&
             push!(allowed, :Intercept)
         for (addr, (loc, sca)) in rp.overrides
@@ -3536,7 +3708,8 @@ function _validate_r2d2_data(plan::StructuralPlan)
     isempty(plan.r2d2_priors) && return nothing
     for rp in plan.r2d2_priors
         pred = only(p for p in plan.predictors if p.name === rp.predictor)
-        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
         share, _, _, varx =
             r2d2_column_scales(shape, plan.columns, rp.overrides)
         n_shares = isempty(share) ? 0 : maximum(share)
@@ -4689,7 +4862,8 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         varying_draws = draws, varying_slices = plan.varying_slices,
         vector_parameters = vectors2, spline_bases = bases,
         spline_vectors = plan.spline_vectors, hsgp_bases = hbases,
-        kernel_plates = kbases, r2d2_priors = plan.r2d2_priors)
+        kernel_plates = kbases, r2d2_priors = plan.r2d2_priors,
+        matrices = plan.matrices)
     validate_data(bound)
     return bound
 end

@@ -292,7 +292,10 @@ end
 
 `_ppl_design_<pred> = Float64.(hcat(<blocks…>))`, or `nothing` for a
 width-0 (offset-only) predictor or a predictor with no static (data-only) blocks. Blocks: intercept → `ones(n)`, continuous
-→ the bare column, factor → full-rank dummies over mapped levels. Monotonic blocks contribute no part (their contrast is
+→ the bare column, factor → full-rank dummies over mapped levels,
+matrix → one part per element (`ones(n)` at intercept positions, the
+bare column otherwise — matrices hold data/derived columns only, so no
+latent wrap). Monotonic blocks contribute no part (their contrast is
 parameter-derived — `hcat` cannot mix data with symbolic columns under
 the Enzyme reverse pass — so the generator splices them per-block
 against their coefficient coordinate instead).
@@ -315,6 +318,10 @@ function design_recipe(shape::DesignShape, n_obs::Int;
             push!(parts, b.column in plates ? :(Float64.($(b.column))) : b.column)
         elseif b.kind === FactorTerm
             push!(parts, _contrast_expr(b))
+        elseif b.kind === MatrixTerm
+            for e in b.elements
+                push!(parts, e === nothing ? :(ones($n_obs)) : e)
+            end
         end
     end
     isempty(parts) && return nothing
@@ -355,7 +362,8 @@ function preprocessing_recipes(plan::StructuralPlan)
     stmts = Expr[]
     plates = Set{Symbol}(p.name for p in plan.plate_parameters)
     for pred in plan.predictors
-        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
         for t in pred.terms
             (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) ||
                 continue
@@ -397,6 +405,17 @@ function _contrast_expr(b::DesignBlock)
     g = b.column
     perms = :(permutedims($lvlvec))
     return :(Float64.($g .== $perms))
+end
+
+# One matrix block as an in-graph data expression:
+# `Float64.(hcat(ones(n), col, …))` over bound columns (the
+# `_contrast_expr` precedent — pure data, so the Enzyme reverse pass
+# sees a constant). The generator's monotonic path splices one per
+# block against its coefficient slice.
+function _matrix_block_expr(b::DesignBlock, n_obs::Int)
+    @assert b.kind === MatrixTerm
+    parts = Any[e === nothing ? :(ones($n_obs)) : e for e in b.elements]
+    return :(Float64.($(Expr(:call, :hcat, parts...))))
 end
 
 # Grouping levels embed as literals; Symbols need QuoteNode (a bare Symbol
