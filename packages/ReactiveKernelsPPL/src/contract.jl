@@ -30,7 +30,8 @@ const ParamName = Symbol
 families (categorical / ordinal / multinomial): reference-coded
 multi-logit categorical, cumulative-logit ordinal with ordered cutpoints,
 general typed ordinal (2 structures × 3 links), shared-simplex multinomial
-over a count matrix, and plain categorical over simplex probabilities."""
+over a count matrix, plain categorical over simplex probabilities, and the
+joint correlated-outcomes family (per-row MvNormal over a Cholesky factor)."""
 @enum LikelihoodFamily::UInt8 begin
     GaussianFam
     BernoulliLogitFam
@@ -48,6 +49,7 @@ over a count matrix, and plain categorical over simplex probabilities."""
     OrdinalFam
     MultinomialFam
     CategoricalFam
+    MvNormalCholeskyFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -143,6 +145,25 @@ at their defaults:
 Multinomial/Categorical responses name their shared-simplex
 [`VectorParameter`](@ref) in `predictor` (no linear predictor — the
 scan-state precedent).
+
+Joint correlated-outcomes responses (`MvNormalCholeskyFam`, SB
+`[y1..yK] ~ MvNormalCholesky([mu1..muK], L)`) use the trailing joint
+fields, built with keywords (`extra_responses=`, `factor_scales=`,
+`factor_corr=`); every other family leaves them at their defaults:
+
+- `extra_responses`: joint outcome columns after `response`
+  (outcome order 1..K is `[response; extra_responses...]`, K ≥ 1);
+  empty otherwise. Each outcome's mean is an identity-link linear
+  predictor: `predictor` for outcome 1, `extra_predictors` (reused
+  from the CategoricalLogit shape) for outcomes 2..K.
+- `factor_scales`: the joint factor's positive scale vector
+  ([`VectorParameter`](@ref), K scales), `nothing` otherwise.
+- `factor_corr`: the joint factor's LKJ Cholesky factor
+  ([`VectorParameter`](@ref), K×K), `nothing` otherwise.
+
+Joint widths are structural (K = 1 + `length(extra_responses)`):
+no `n_levels`, no bind-time size inference — the factor parameters
+carry concrete sizes validated against K.
 """
 struct LikelihoodSpec
     family::LikelihoodFamily
@@ -163,6 +184,9 @@ struct LikelihoodSpec
     discrimination::Union{Nothing,Real,ColumnRef}
     threshold_columns::Vector{ColumnRef}
     threshold_coefs::Union{Nothing,ParamName}
+    extra_responses::Vector{ColumnRef}
+    factor_scales::Union{Nothing,ParamName}
+    factor_corr::Union{Nothing,ParamName}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
@@ -183,11 +207,15 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         ordinal_structure::Union{Nothing,Symbol} = nothing,
         discrimination::Union{Nothing,Real,ColumnRef} = nothing,
         threshold_columns::Vector{ColumnRef} = Symbol[],
-        threshold_coefs::Union{Nothing,ParamName} = nothing)
+        threshold_coefs::Union{Nothing,ParamName} = nothing,
+        extra_responses::Vector{ColumnRef} = Symbol[],
+        factor_scales::Union{Nothing,ParamName} = nothing,
+        factor_corr::Union{Nothing,ParamName} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
-        threshold_columns, threshold_coefs)
+        threshold_columns, threshold_coefs, extra_responses, factor_scales,
+        factor_corr)
 end
 
 """
@@ -398,12 +426,24 @@ thresholds, or a shared simplex), packed as one contiguous block:
 - `:simplex_dirichlet` — a simplex with a `Dirichlet(arg1)` prior
   (`arg1` a literal concentration vector — frozen data, the
   coefficient-prior precedent) + the stick-breaking Jacobian.
+- `:positive_exponential` — a positive K-vector with an elementwise
+  `Exponential(arg1)` prior (the joint factor's scales; `arg1` a
+  finite positive literal or a scalar parameter/assignment name —
+  sampled scale hyperparameters ride the scalar-prior shape).
+- `:cholesky_corr_lkj` — a K×K LKJ Cholesky factor with an
+  `lkj_corr_cholesky(arg1)` prior (`arg1` the shape hyperparameter,
+  a finite positive literal), packing K(K−1)/2 thetas.
 
 `size` is the constrained length (K−1 for thresholds, K for a simplex;
 `nothing` = infer at bind from the linked leveled response). Args are
 LITERALS only (hierarchical threshold/Dirichlet concentrations fail
-closed — planned). K=1 is uniform: zero-length threshold vectors carry
-no statements/prior/Jacobian, and a 1-simplex is the constant `[1.0]`.
+closed — planned), except an exponential scale, which also admits a
+scalar parameter/assignment name. K=1 is uniform: zero-length
+threshold vectors carry no statements/prior/Jacobian, a 1-simplex is
+the constant `[1.0]`, and a 1×1 LKJ factor packs zero thetas
+(constraining to `[1.0]` with a `0.0` prior node — Stan's K=1 LKJ).
+Joint-factor sizes are STRUCTURAL (`size` = the joint width K,
+concrete — never `nothing`).
 """
 struct VectorParameter
     name::ParamName
@@ -965,7 +1005,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
     BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
-    OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam)
+    OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
+    MvNormalCholeskyFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -2526,7 +2567,12 @@ const VECTOR_ARITY = Dict{Symbol,Tuple{Vararg{Symbol}}}(
     :ordered_normal => (:arg1, :arg2),
     :vector_normal => (:arg1, :arg2),
     :simplex_dirichlet => (:arg1,),
+    :positive_exponential => (:arg1,),
+    :cholesky_corr_lkj => (:arg1,),
 )
+
+"""Joint-factor vector families (the correlated-outcomes factor pieces)."""
+const _JOINT_FACTOR_FAMILIES = (:positive_exponential, :cholesky_corr_lkj)
 
 # Constrained vector (cutpoint/threshold/simplex) parameters: family/arity
 # plus literal-only args (a threshold Normal takes literal location/scale; a
@@ -2541,7 +2587,8 @@ function _validate_vector_parameters(plan::StructuralPlan)
     for p in plan.vector_parameters
         haskey(VECTOR_ARITY, p.family) || _fail(p.label,
             "vector family $(p.family) unknown (admitted: ordered_normal, " *
-            "vector_normal, simplex_dirichlet)")
+            "vector_normal, simplex_dirichlet, positive_exponential, " *
+            "cholesky_corr_lkj)")
         expected = VECTOR_ARITY[p.family]
         Tuple(keys(p.args)) == expected || _fail(p.label,
             "family $(p.family) takes positional keys $expected, got " *
@@ -2561,6 +2608,32 @@ function _validate_vector_parameters(plan::StructuralPlan)
                 "length $(length(alpha))")
             p.size === nothing || p.size >= 1 || _fail(p.label,
                 "simplex size must be ≥ 1, got $(p.size)")
+        elseif p.family === :positive_exponential
+            th = p.args.arg1
+            if th isa Symbol
+                th in _union_names(plan) || _fail(p.label,
+                    "exponential scale $th is not a scalar " *
+                    "parameter/assignment name")
+            else
+                (th isa Real && isfinite(th) && th > 0) || _fail(p.label,
+                    "exponential scale must be a finite positive literal " *
+                    "or a scalar parameter/assignment name, got $(repr(th))")
+            end
+            p.size !== nothing || _fail(p.label,
+                "joint-factor scales need a concrete size (the joint width " *
+                "K — sizes are structural, never inferred)")
+            p.size >= 1 || _fail(p.label,
+                "joint-factor scales size must be ≥ 1, got $(p.size)")
+        elseif p.family === :cholesky_corr_lkj
+            eta = p.args.arg1
+            (eta isa Real && isfinite(eta) && eta > 0) || _fail(p.label,
+                "LKJ shape must be a finite positive literal " *
+                "(a hyperparameter), got $(repr(eta))")
+            p.size !== nothing || _fail(p.label,
+                "joint-factor LKJ Cholesky needs a concrete size (the joint " *
+                "width K — sizes are structural, never inferred)")
+            p.size >= 1 || _fail(p.label,
+                "joint-factor LKJ Cholesky size must be ≥ 1, got $(p.size)")
         else
             mu, s = p.args.arg1, p.args.arg2
             (mu isa Real && isfinite(mu)) || _fail(p.label,
@@ -2574,9 +2647,10 @@ function _validate_vector_parameters(plan::StructuralPlan)
     end
     # Linkage: each vector parameter is referenced by exactly one response
     # (as `thresholds` for ordered families, as `threshold_coefs` for
-    # per-threshold Ordinal, or as the simplex `predictor`), by exactly
-    # one monotonic term (as its `increments` simplex), or by exactly one
-    # R2D2 prior (as its share `phi`) — never shared.
+    # per-threshold Ordinal, as the simplex `predictor`, or as a joint
+    # factor piece), by exactly one monotonic term (as its `increments`
+    # simplex), or by exactly one R2D2 prior (as its share `phi`) —
+    # never shared.
     refs = Dict{Symbol,Vector{Symbol}}(
         p.name => Symbol[] for p in plan.vector_parameters)
     for r in plan.responses
@@ -2593,6 +2667,15 @@ function _validate_vector_parameters(plan::StructuralPlan)
         end
         if _is_simplex_family(r.family) && haskey(refs, r.predictor)
             push!(refs[r.predictor], r.label)
+        end
+        # A joint response links its factor's two pieces explicitly (existence
+        # + family diagnosis belongs to `_validate_joint_response`, which runs
+        # later with the full response context — here only count the edges).
+        if r.family === MvNormalCholeskyFam
+            for f in (r.factor_scales, r.factor_corr)
+                f === nothing && continue
+                haskey(refs, f) && push!(refs[f], r.label)
+            end
         end
     end
     for pred in plan.predictors, t in pred.terms
@@ -2619,11 +2702,11 @@ function _validate_vector_parameters(plan::StructuralPlan)
         got = refs[p.name]
         isempty(got) && _fail(p.label,
             "vector parameter $(p.name) unused by any response, " *
-            "monotonic term, or R2D2 prior")
+            "monotonic term, joint-factor link, or R2D2 prior")
         length(got) == 1 || _fail(p.label,
             "vector parameter $(p.name) shared by " *
             "$(join(got, ", ")) — one vector parameter per response, " *
-            "monotonic term, or R2D2 prior")
+            "monotonic term, joint-factor link, or R2D2 prior")
     end
     return nothing
 end
@@ -3274,6 +3357,12 @@ function _validate_unleveled_fields(r::LikelihoodSpec)
         _fail(r.label, "only Ordinal takes threshold_columns")
     r.threshold_coefs === nothing ||
         _fail(r.label, "only Ordinal takes threshold_coefs")
+    isempty(r.extra_responses) ||
+        _fail(r.label, "only joint MvNormalCholesky takes extra_responses")
+    r.factor_scales === nothing ||
+        _fail(r.label, "only joint MvNormalCholesky takes factor_scales")
+    r.factor_corr === nothing ||
+        _fail(r.label, "only joint MvNormalCholesky takes factor_corr")
     return nothing
 end
 
@@ -3315,6 +3404,12 @@ function _validate_categorical_fields(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "CategoricalLogit takes no threshold_columns")
     r.threshold_coefs === nothing ||
         _fail(r.label, "CategoricalLogit takes no threshold_coefs")
+    isempty(r.extra_responses) ||
+        _fail(r.label, "CategoricalLogit takes no extra_responses")
+    r.factor_scales === nothing ||
+        _fail(r.label, "CategoricalLogit takes no factor_scales")
+    r.factor_corr === nothing ||
+        _fail(r.label, "CategoricalLogit takes no factor_corr")
     return nothing
 end
 
@@ -3354,6 +3449,12 @@ function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "an ordered response takes no extra_predictors")
     isempty(r.count_columns) ||
         _fail(r.label, "an ordered response takes no count_columns")
+    isempty(r.extra_responses) ||
+        _fail(r.label, "an ordered response takes no extra_responses")
+    r.factor_scales === nothing ||
+        _fail(r.label, "an ordered response takes no factor_scales")
+    r.factor_corr === nothing ||
+        _fail(r.label, "an ordered response takes no factor_corr")
     _validate_ordinal_extras(r, plan, used_predictors)
     return nothing
 end
@@ -3450,6 +3551,12 @@ function _validate_simplex_response(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "a simplex response takes no threshold_columns")
     r.threshold_coefs === nothing ||
         _fail(r.label, "a simplex response takes no threshold_coefs")
+    isempty(r.extra_responses) ||
+        _fail(r.label, "a simplex response takes no extra_responses")
+    r.factor_scales === nothing ||
+        _fail(r.label, "a simplex response takes no factor_scales")
+    r.factor_corr === nothing ||
+        _fail(r.label, "a simplex response takes no factor_corr")
     if r.family === MultinomialFam
         all_count = [r.response; r.count_columns...]
         length(unique(all_count)) == length(all_count) ||
@@ -3469,6 +3576,91 @@ function _validate_simplex_response(r::LikelihoodSpec, plan::StructuralPlan)
         r.n_levels === nothing || r.n_levels >= 1 || _fail(r.label,
             "n_levels must be ≥ 1, got $(r.n_levels)")
     end
+    if r.range !== nothing
+        first(r.range) == 1 || _fail(r.label,
+            "response range must start at 1 (got $(r.range)) — " *
+            "ranges cover eachindex exactly, no partial windows")
+        length(r.range) >= 1 || _fail(r.label,
+            "response range $(r.range) is empty")
+    end
+    return nothing
+end
+
+# Joint correlated-outcomes responses (SB
+# `[y1..yK] ~ MvNormalCholesky([mu1..muK], L)`): K outcome columns (lead +
+# tail) with K identity-link mean predictors (lead + `extra_predictors`,
+# reused from the CategoricalLogit shape) and one LKJ factor (scales +
+# Cholesky pieces linked explicitly). Widths are structural (K =
+# 1 + length(extra_responses)) — no `n_levels`, no bind-time inference.
+# Scalar/data-column means route through offset-only predictors
+# emitter-side; row weights stay planned (no SB joint semantics to mirror).
+function _validate_joint_response(r::LikelihoodSpec, plan::StructuralPlan,
+        used_predictors::Set{Symbol})
+    r.link === IdentityLink || _fail(r.label,
+        "a joint response uses IdentityLink (means enter the MvNormal " *
+        "directly — no link applies), got $(r.link)")
+    outcomes = [r.response; r.extra_responses...]
+    length(unique(outcomes)) == length(outcomes) ||
+        _fail(r.label, "joint outcome columns repeat a column " *
+            "($(join(outcomes, ", ")))")
+    K = length(outcomes)
+    preds = [r.predictor; r.extra_predictors...]
+    length(preds) == K || _fail(r.label,
+        "joint response has $K outcomes but $(length(preds)) mean " *
+        "predictors (one identity-link predictor per outcome)")
+    length(unique(preds)) == length(preds) ||
+        _fail(r.label, "joint mean predictors repeat a predictor " *
+            "($(join(preds, ", "))) — one linear predictor per outcome")
+    for q in preds
+        i = findfirst(p -> p.name === q, plan.predictors)
+        i === nothing && _fail(r.label,
+            "joint mean predictor $q is not a plan predictor")
+        plan.predictors[i].link === IdentityLink || _fail(r.label,
+            "joint mean predictor $q must carry IdentityLink (got " *
+            "$(plan.predictors[i].link)) — means enter the MvNormal directly")
+        push!(used_predictors, q)
+    end
+    r.factor_scales === nothing && _fail(r.label,
+        "a joint response requires its factor_scales vector parameter")
+    r.factor_corr === nothing && _fail(r.label,
+        "a joint response requires its factor_corr vector parameter")
+    si = findfirst(p -> p.name === r.factor_scales, plan.vector_parameters)
+    si === nothing && _fail(r.label,
+        "factor_scales $(r.factor_scales) is not a vector parameter")
+    ci = findfirst(p -> p.name === r.factor_corr, plan.vector_parameters)
+    ci === nothing && _fail(r.label,
+        "factor_corr $(r.factor_corr) is not a vector parameter")
+    sp, cp = plan.vector_parameters[si], plan.vector_parameters[ci]
+    sp.family === :positive_exponential || _fail(r.label,
+        "factor_scales $(sp.name) must be :positive_exponential, got " *
+        "$(sp.family)")
+    cp.family === :cholesky_corr_lkj || _fail(r.label,
+        "factor_corr $(cp.name) must be :cholesky_corr_lkj, got " *
+        "$(cp.family)")
+    sp.size == K || _fail(r.label,
+        "factor_scales size $(sp.size) disagrees with the $K joint outcomes")
+    cp.size == K || _fail(r.label,
+        "factor_corr size $(cp.size) disagrees with the $K joint outcomes")
+    r.n_levels === nothing ||
+        _fail(r.label,
+            "a joint response takes no n_levels (widths are structural)")
+    r.thresholds === nothing ||
+        _fail(r.label, "a joint response takes no thresholds")
+    isempty(r.count_columns) ||
+        _fail(r.label, "a joint response takes no count_columns")
+    r.ordinal_structure === nothing ||
+        _fail(r.label, "a joint response takes no ordinal_structure")
+    r.discrimination === nothing ||
+        _fail(r.label, "a joint response takes no discrimination")
+    isempty(r.threshold_columns) ||
+        _fail(r.label, "a joint response takes no threshold_columns")
+    r.threshold_coefs === nothing ||
+        _fail(r.label, "a joint response takes no threshold_coefs")
+    r.trials === nothing ||
+        _fail(r.label, "a joint response takes no trials")
+    r.weights === nothing ||
+        _fail(r.label, "joint responses take no weights " *
+            "(row weights on a joint density are planned)")
     if r.range !== nothing
         first(r.range) == 1 || _fail(r.label,
             "response range must start at 1 (got $(r.range)) — " *
@@ -3519,6 +3711,15 @@ function _validate_responses(plan::StructuralPlan)
         # vector parameter in `predictor`.
         if _is_simplex_family(r.family)
             _validate_simplex_response(r, plan)
+            _validate_scale(r, plan)
+            _validate_evidence_structure(r, plan)
+            continue
+        end
+        # A joint correlated-outcomes response (K outcomes, K mean
+        # predictors, one LKJ factor): validated whole, skipping the
+        # single-predictor triple.
+        if r.family === MvNormalCholeskyFam
+            _validate_joint_response(r, plan, used_predictors)
             _validate_scale(r, plan)
             _validate_evidence_structure(r, plan)
             continue
@@ -3641,6 +3842,20 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
             _is_count_column(plan.columns[c]) ||
                 return _fail(r.label, "count column $c must hold " *
                     "non-negative integers")
+        end
+        return nothing
+    elseif r.family === MvNormalCholeskyFam
+        # The joint outcomes cross as K raw numeric columns (lead + tail),
+        # row-aligned by the uniform-`n_obs` rule (SB packs complete aligned
+        # rows emitter-side; missingness fails closed in `_validate_columns`).
+        for c in [r.response; r.extra_responses...]
+            _is_derived(plan, c) && return _fail(r.label,
+                "joint outcome $c is derived — joint outcomes bind raw " *
+                "(derived outcomes need shape metadata — planned)")
+            haskey(plan.columns, c) ||
+                return _fail(r.label, "joint outcome column $c missing")
+            eltype(plan.columns[c]) <: Real ||
+                return _fail(r.label, "joint outcome $c must be numeric")
         end
         return nothing
     else
@@ -4141,6 +4356,9 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         for c in r.count_columns
             haskey(inferred, c) && (inferred[c] = :response)
         end
+        for c in r.extra_responses
+            haskey(inferred, c) && (inferred[c] = :response)
+        end
         for c in r.threshold_columns
             haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
         end
@@ -4248,6 +4466,12 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "monotonic increments size $(p.size) disagrees with its " *
                 "concentration length $want")
             push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
+        elseif p.family in _JOINT_FACTOR_FAMILIES
+            # Joint-factor sizes are structural (concrete at construction,
+            # validated against the joint width) — bind passes them through.
+            p.size === nothing && _fail(p.label,
+                "internal: joint-factor size unresolved at bind")
+            push!(out_v, p)
         elseif haskey(r2d2_link, p.name)
             want = length(p.args.arg1)
             want >= 1 || _fail(p.label,

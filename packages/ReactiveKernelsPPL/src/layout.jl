@@ -54,11 +54,12 @@ end
 latent, a per-cell latent block, a leveled vector latent (cutpoints,
 thresholds, simplex), a spline coefficient-vector block, a ranef vector
 block (K=1 `xi`, correlated `tau`/`z_flat`), a correlated-ranef LKJ
-Cholesky factor, or an HSGP coefficient-vector block (`beta_raw`). `lo`
-is the constrained lower bound of an `:interval`/`:floored` transform
-(`:interval` also sets `hi`; `NaN` otherwise)."""
+Cholesky factor, a joint-outcomes LKJ Cholesky factor, or an HSGP
+coefficient-vector block (`beta_raw`). `lo` is the constrained lower
+bound of an `:interval`/`:floored` transform (`:interval` also sets
+`hi`; `NaN` otherwise)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :ranef | :ranef_corr | :hsgp
+    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :ranef | :ranef_corr | :cholesky_corr | :hsgp
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
@@ -122,12 +123,28 @@ function assign_layout(plan::StructuralPlan)
             "[layout] vector parameter $(p.name) has unresolved size " *
             "(bind_data infers it from the linked response or " *
             "monotonic term)"))
+        # A joint-outcomes LKJ Cholesky factor packs K(K−1)/2 thetas under
+        # its own kind (K=1 packs zero, constraining to `[1.0]` — the
+        # ranef `:ranef_corr` shape with no tau/z_flat siblings and no
+        # derived draws, so it needs its own kind, not a shared one).
+        if p.family === :cholesky_corr_lkj
+            K = p.size
+            packed = K * (K - 1) ÷ 2
+            labels = [Symbol(string(p.name) * "." * string(i)) for i in 1:packed]
+            push!(entries,
+                LayoutEntry(:cholesky_corr, nothing, p.name, labels, offset,
+                    packed, :lkj))
+            offset += packed
+            continue
+        end
         transform = p.family === :ordered_normal ? :ordered :
-            p.family === :simplex_dirichlet ? :simplex : :identity
+            p.family === :simplex_dirichlet ? :simplex :
+            p.family === :positive_exponential ? :exp : :identity
         # `size` is the PACKED (unconstrained) length: a simplex packs
         # K−1 stick-breaking logits (a 1-simplex packs zero — Stan's
-        # deterministic `[1.0]`); threshold vectors pack their size.
-        # Constrained length recovers as `_vector_constrained_size`.
+        # deterministic `[1.0]`); threshold and positive vectors pack
+        # their size. Constrained length recovers as
+        # `_vector_constrained_size`.
         packed = transform === :simplex ? p.size - 1 : p.size
         labels = [Symbol(string(p.name) * "." * string(i)) for i in 1:packed]
         push!(entries,
@@ -531,7 +548,7 @@ function coordinate_names(layout::LayoutTable)
             end
         elseif e.kind === :vector
             append!(names, e.labels)
-        elseif e.kind === :ranef_corr
+        elseif e.kind === :ranef_corr || e.kind === :cholesky_corr
             append!(names, e.labels)
         elseif e.kind === :scan
             for label in e.labels
@@ -571,7 +588,10 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, e.name => Vector{Float64}(seg))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
-        elseif e.kind === :ranef_corr
+        elseif e.kind === :ranef_corr || e.kind === :cholesky_corr
+            # Both LKJ-factor kinds share the host hyperspherical edges
+            # (name/size-keyed — kind-agnostic); only `:ranef_corr` grows
+            # the derived `b_` draws below.
             push!(pairs, e.name =>
                 lkj_chol_constrain(Vector{Float64}(seg), _lkj_dim(e.size)))
         else
@@ -667,7 +687,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] vector parameter $(e.name) length mismatch"),
             )
             u[e.offset:(e.offset + e.size - 1)] .= _vector_unconstrain(e, v)
-        elseif e.kind === :ranef_corr
+        elseif e.kind === :ranef_corr || e.kind === :cholesky_corr
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing LKJ factor $(e.name)"),
             )
@@ -708,7 +728,7 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             total += _vector_logjac(e, seg)
             continue
         end
-        if e.kind === :ranef_corr
+        if e.kind === :ranef_corr || e.kind === :cholesky_corr
             # LKJ thetas couple through the hyperspherical rows —
             # entry-level, never per-coordinate.
             total += lkj_chol_logjac(Vector{Float64}(seg), _lkj_dim(e.size))
@@ -727,13 +747,17 @@ end
 _vector_constrain(e::LayoutEntry, seg) =
     e.transform === :identity ? Vector{Float64}(seg) :
     e.transform === :ordered ? ordered_constrain(seg) :
+    e.transform === :exp ? [_constrain_value(:exp, Float64(x)) for x in seg] :
     simplex_constrain(seg)
 _vector_unconstrain(e::LayoutEntry, v) =
     e.transform === :identity ? Vector{Float64}(v) :
     e.transform === :ordered ? ordered_unconstrain(v) :
+    e.transform === :exp ? [_unconstrain_value(:exp, Float64(x)) for x in v] :
     simplex_unconstrain(v)
 _vector_logjac(e::LayoutEntry, seg) =
-    e.transform === :ordered ? ordered_logjac(seg) : simplex_logjac(seg)
+    e.transform === :ordered ? ordered_logjac(seg) :
+    e.transform === :exp ? sum(_logjac_value(:exp, Float64(x)) for x in seg) :
+    simplex_logjac(seg)
 
 # Host transform values route through the bijector library (the single source
 # of truth shared with the in-graph splices); `:identity` is a genuine no-op.
@@ -820,7 +844,9 @@ function transform_statements(e::LayoutEntry)
     if e.kind === :vector
         return _vector_transform_statements(e)
     end
-    if e.kind === :ranef_corr
+    if e.kind === :ranef_corr || e.kind === :cholesky_corr
+        # Both LKJ-factor kinds share the scalar-unrolled hyperspherical
+        # twin (name/size-keyed `_ppl_rl_` temps — kind-agnostic).
         return _ranef_corr_transform_statements(e)
     end
     o = e.offset
@@ -929,6 +955,16 @@ function _vector_transform_statements(e::LayoutEntry)
         return Expr[:($(_vector_elt(e, i))::Float64 =
             $(coordinate_read(e.offset + i - 1))) for i in 1:e.size]
     end
+    if e.transform === :exp
+        # Positive small vectors (joint-factor scales): per-element
+        # bijector edges over packed coordinates (the plate `:exp`
+        # shape, unrolled to `_ppl_v_` scalars for the prior and
+        # L-materialization readers).
+        bij = _bijector_name(:exp)
+        return Expr[:($(_vector_elt(e, i))::Float64 =
+            $(bij)().constrain($(coordinate_read(e.offset + i - 1))))
+            for i in 1:e.size]
+    end
     if e.transform === :ordered
         stmts = Expr[]
         for i in 1:e.size
@@ -1028,7 +1064,7 @@ function jacobian_term(e::LayoutEntry)
     if e.kind === :coefficient
         throw(ContractValidationError("[layout] non-identity coefficient block"))
     end
-    if e.kind === :ranef_corr
+    if e.kind === :ranef_corr || e.kind === :cholesky_corr
         K = _lkj_dim(e.size)
         K == 1 && return nothing
         L = e.name
@@ -1046,6 +1082,12 @@ function jacobian_term(e::LayoutEntry)
         if e.transform === :ordered
             e.size < 2 && return nothing
             terms = Any[coordinate_read(e.offset + i - 1) for i in 2:e.size]
+            return foldl((a, b) -> :($a + $b), terms)
+        end
+        if e.transform === :exp
+            # :exp — Σ u (the exp log-Jacobian is the unconstrained value).
+            e.size < 1 && return nothing
+            terms = Any[coordinate_read(e.offset + i - 1) for i in 1:e.size]
             return foldl((a, b) -> :($a + $b), terms)
         end
         # :simplex — Σ [log(r) + log(z) + log1p(-z)] over the

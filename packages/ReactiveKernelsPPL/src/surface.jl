@@ -177,7 +177,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
     sample, det, plate_ctx, plate_specs, scans, buckets, bases, vectors,
-    hbases, kplates, r2d2decls = _partition_statements(ast, data)
+    hbases, kplates, r2d2decls, joints = _partition_statements(ast, data)
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
@@ -188,6 +188,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # lowering, before `_lower_parameters` runs).
     dirichlet_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dirichlet_call(s.rhs))
+    # Covariance-factor declarations (`L ~ LKJCovarianceFactor(...)`): the
+    # only stems a joint response accepts as its factor (checked during
+    # joint lowering, before `_lower_parameters` runs).
+    factor_names = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && _is_lkj_factor_call(s.rhs))
     # Shape every definition (data-free: data ⇒ vector, sampled ⇒ scalar,
     # det-refs recurse with memo; cycles error downstream), then
     # canonicalize each RHS in dependency order (Julia-valid undotted
@@ -243,6 +248,14 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
                    "`.~` (`$(s.lhs) .~ Normal.(mu, sigma)`); `~` is " *
                    "scalar-only")
         end
+    end
+    # Joint correlated-outcomes responses lower after the broadcast
+    # responses (same predictor interning/coefficient recording, before
+    # coefficient priors resolve).
+    for j in joints
+        push!(responses,
+            _lower_joint_response(j, factor_names, ctx, predictors, pred_idx,
+                coefuse))
     end
     for c in ctx.scan_coefs
         haskey(coefuse, c) && _sfail("$c is both a predictor coefficient " *
@@ -1312,6 +1325,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     hbases = HSGPBasis[]
     kplates = KernelPlate[]
     r2d2decls = NamedTuple[]
+    joints = JointSampleStmt[]
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
     seen_doc = false
@@ -1370,6 +1384,19 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         if _is_sample(st) || _is_broadcast_sample(st)
             bc = _is_broadcast_sample(st)
             tilde = bc ? "`.~`" : "`~`"
+            # A vector LHS is the joint correlated-outcomes form (plain `~`
+            # only — row-grouped, never broadcast).
+            if st.args[2] isa Expr && st.args[2].head === :vect
+                bc && _sfail("joint responses use `~`, not `.~` " *
+                             "(`[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)` " *
+                             "— row-grouped, never broadcast)")
+                j = _parse_joint_stmt(st, line, data)
+                for o in j.outcomes
+                    _claim!(seen, seelines, o, line)
+                end
+                push!(joints, j)
+                continue
+            end
             lhs, rng, levs = _sample_lhs(st.args[2], bc, tilde, data)
             lhs in (:ranef, :ranef_bucket, :dummy) &&
                 _sfail("`$lhs` is reserved (ranef surface) and cannot be " *
@@ -1411,7 +1438,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         end
     end
     return sample, det, plate_ctx, plate_params, scans, buckets, bases,
-        vectors, hbases, kplates, r2d2decls
+        vectors, hbases, kplates, r2d2decls, joints
 end
 
 # Pre-pass: expand top-level `@plate for i in R ... end` blocks into
@@ -1780,6 +1807,51 @@ function _sample_lhs(lhs, bc, tilde, data)
     return target, _lower_lhs_range(target, index), nothing
 end
 
+# Joint-response statement: `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`
+# (SB's joint form). Outcomes are bare distinct data symbols; means are
+# one location expression per outcome; the factor names an
+# `LKJCovarianceFactor` declaration. Width/factor linkage checks belong
+# to `_lower_joint_response` + contract validation.
+function _parse_joint_stmt(st::Expr, line::Int, data::Set{Symbol})
+    outs = st.args[2].args
+    isempty(outs) && _sfail("joint response `[]` is empty — name the " *
+                            "outcome data columns " *
+                            "(`[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`)")
+    for o in outs
+        o isa Symbol || _sfail("joint outcomes are bare data columns, " *
+                               "got $(repr(o))")
+        o in data || _sfail("joint outcome $o is not data (joint " *
+                            "responses observe data columns — $o is not " *
+                            "among the bound data names)")
+    end
+    length(unique(outs)) == length(outs) ||
+        _sfail("joint outcomes repeat a column " *
+               "($(join(outs, ", ")))")
+    rhs = st.args[3]
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+        rhs.args[1] === :MvNormalCholesky ||
+        _sfail("a `[y1, y2]` response takes " *
+               "`MvNormalCholesky([mu1, mu2], L)`, got $(repr(rhs))")
+    args = _plain_args(rhs, "`MvNormalCholesky`")
+    length(args) == 2 || _sfail("`MvNormalCholesky` takes ([means], " *
+                                "factor) " *
+                                "(`[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`), " *
+                                "got $(length(args)) arguments")
+    means, factor = args
+    means isa Expr && means.head === :vect &&
+        length(means.args) == length(outs) ||
+        _sfail("joint response [$(join(outs, ", "))] has " *
+               "$(length(outs)) outcomes but $(repr(means)) means " *
+               "(one mean per outcome: `[mu1, mu2]`)")
+    factor isa Symbol || _sfail("joint factor $(repr(factor)) must name " *
+                                "an `LKJCovarianceFactor` declaration " *
+                                "(`L ~ LKJCovarianceFactor(K, Exponential(1.0), eta)` " *
+                                "in the model)")
+    _reject_target(rhs, Symbol(join(outs, "_")))
+    return JointSampleStmt(Vector{Symbol}(outs), Vector{Any}(means.args),
+        factor, line)
+end
+
 # The `levels(g)[S]` index of a subset prior: returns `(g, subset)`.
 function _levels_subset_index(col::Symbol, index::Expr, data::Set{Symbol})
     length(index.args) == 2 && _is_levels_call(index.args[1]) ||
@@ -1897,6 +1969,17 @@ struct SampleStmt
 end
 SampleStmt(lhs::Symbol, rhs, broadcast::Bool) =
     SampleStmt(lhs, rhs, broadcast, nothing, nothing)
+
+"""One joint `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)` statement: K
+outcome columns, K mean expressions, and the factor stem (an
+`LKJCovarianceFactor` declaration elsewhere in the model). Plain `~`
+only — the likelihood groups rows, never broadcasts."""
+struct JointSampleStmt
+    outcomes::Vector{Symbol}
+    means::Vector{Any}
+    factor::Symbol
+    line::Int
+end
 
 _is_doc_macro(m) =
     m === Symbol("@doc") || (m isa GlobalRef && m.name === Symbol("@doc"))
@@ -2526,6 +2609,30 @@ function _lower_categorical_response(lhs, call, range, weights, evidence,
         nothing, weights, evidence, label, nothing, range)
 end
 
+# Joint correlated-outcomes response:
+# `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`. Each mean lowers as an
+# ordinary identity-link location (own predictor per outcome, named
+# definitions interned by name, inline means synthesized per outcome);
+# the factor stem resolves to its two `LKJCovarianceFactor` pieces.
+function _lower_joint_response(j::JointSampleStmt, factor_names::Set{Symbol},
+        ctx, predictors, pred_idx, coefuse)
+    tag = "[$(join(j.outcomes, ", "))]"
+    j.factor in factor_names || _sfail(
+        "joint response $tag factor $(j.factor) must name an " *
+        "`LKJCovarianceFactor` declaration " *
+        "(`L ~ LKJCovarianceFactor(K, Exponential(1.0), eta)` in the model)")
+    pnames = Symbol[_lower_location(o, m, IdentityLink, ctx, predictors,
+        pred_idx, coefuse; synth = Symbol(o, "_joint_", k))
+        for (k, (o, m)) in enumerate(zip(j.outcomes, j.means))]
+    scales, corr = _lkj_factor_names(j.factor)
+    label = Symbol(join(j.outcomes, "_") * "_resp")
+    return LikelihoodSpec(MvNormalCholeskyFam, IdentityLink, j.outcomes[1],
+        pnames[1], nothing, nothing, ResponseEvidence(:none, nothing, nothing),
+        label, nothing, nothing; extra_responses = j.outcomes[2:end],
+        extra_predictors = pnames[2:end], factor_scales = scales,
+        factor_corr = corr)
+end
+
 # `.~` takes a dotted distribution object (`Normal.(mu, sigma)`); convert
 # the distribution spine to call form and reuse the peeling machinery
 # (which reports the same object-form errors, now against dotted input).
@@ -2843,6 +2950,10 @@ function _lower_response_base_error(lhs, rhs, fam)
                                 "`Gamma.(alpha, exp.(eta) ./ alpha)`")
     fam === :BetaLogit && _sfail("response $lhs: write " *
                                  _BETA_MSG)
+    fam === :MvNormalCholesky && _sfail(
+        "response $lhs: `MvNormalCholesky` is joint-only " *
+        "(`[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)` with plain `~` — " *
+        "row-grouped, never broadcast)")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, Bernoulli, Poisson, Binomial, " *
                   "NegativeBinomial2, Gamma, Beta, CategoricalLogit, " *
@@ -3956,6 +4067,16 @@ function _lower_parameters(sample, coefuse, ctx)
             push!(vectors, _lower_dirichlet(s.lhs, s.rhs))
             continue
         end
+        if _is_lkj_factor_call(s.rhs)
+            haskey(coefuse, s.lhs) && _sfail(
+                "$(s.lhs) is a predictor coefficient and cannot also be " *
+                "an LKJCovarianceFactor")
+            sc, cr = _lower_lkj_factor(s.lhs, s.rhs, coefuse, ctx)
+            push!(vectors, sc)
+            push!(vectors, cr)
+            sc.args.arg1 isa Symbol && push!(syms, sc.args.arg1)
+            continue
+        end
         haskey(coefuse, s.lhs) && continue
         s.levels !== nothing && _sfail("levels prior `$(s.lhs)[...]` is " *
                                        "never used in a predictor — size " *
@@ -4004,6 +4125,61 @@ function _lower_dirichlet(lhs, rhs)
         lhs)
 end
 
+_is_lkj_factor_call(rhs) =
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+    rhs.args[1] === :LKJCovarianceFactor
+
+# SB's derived factor-piece names for a stem `L`: `L_scales` (the positive
+# scale vector) and `L_L_corr` (the LKJ Cholesky factor). Single source for
+# the factor allocator and the joint-response linker.
+_lkj_factor_names(stem::Symbol) =
+    (Symbol(stem, :_scales), Symbol(stem, :_L_corr))
+
+# SB's covariance-factor declaration, decomposed:
+# `L ~ LKJCovarianceFactor(K, Exponential(θ), eta)` allocates the factor's
+# two plan nodes — the positive scales vector and the LKJ Cholesky factor
+# (SB's `target_scales` / `target_L_corr`) — which the joint response
+# links explicitly. The `L` factor itself materializes in-graph as
+# `diag_pre_multiply(scales, L_corr)`; the stem binds no plan node.
+# Scale priors are Exponential-only in this slice (SB's default;
+# sampled-θ hyperparameters ride the scalar-prior shape).
+function _lower_lkj_factor(lhs, rhs, coefuse, ctx)
+    args = _plain_args(rhs, "`LKJCovarianceFactor`")
+    length(args) == 3 || _sfail("parameter $lhs: " *
+                                "`LKJCovarianceFactor` takes (K, scale prior, " *
+                                "shape) " *
+                                "(`L ~ LKJCovarianceFactor(2, Exponential(1.0), 2.0)`), " *
+                                "got $(length(args)) arguments")
+    K, prior, shape = args
+    (K isa Integer && !(K isa Bool) && K >= 1) ||
+        _sfail("parameter $lhs: `LKJCovarianceFactor` needs an integer " *
+               "dimension K ≥ 1, got $(repr(K))")
+    prior isa Expr && prior.head === :call && !isempty(prior.args) &&
+        prior.args[1] === :Exponential ||
+        _sfail("parameter $lhs: joint-factor scale prior is " *
+               "`Exponential(θ)` in this slice (SB's default), got " *
+               "$(repr(prior))")
+    pargs = _plain_args(prior, "`Exponential`")
+    length(pargs) == 1 || _sfail("parameter $lhs: `Exponential` takes " *
+                                 "exactly the scale")
+    theta = _lower_param_arg(lhs, only(pargs), coefuse)
+    (shape isa Real && isfinite(shape) && shape > 0) ||
+        _sfail("parameter $lhs: LKJ shape must be a finite positive " *
+               "literal (a hyperparameter), got $(repr(shape))")
+    scales, corr = _lkj_factor_names(lhs)
+    for nm in (scales, corr)
+        nm in ctx.taken && _sfail(
+            "implicit factor piece $nm for $lhs collides " *
+            "with your definition — rename yours")
+        push!(ctx.taken, nm)
+    end
+    Ki = Int(K)
+    return (VectorParameter(scales, :positive_exponential, (arg1 = theta,),
+            Ki, lhs),
+        VectorParameter(corr, :cholesky_corr_lkj, (arg1 = Float64(shape),),
+            Ki, lhs))
+end
+
 function _lower_parameter(lhs, rhs, coefuse)
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || _sfail(
         "parameter $lhs needs a distribution call, got $(repr(rhs))")
@@ -4026,8 +4202,9 @@ function _lower_parameter(lhs, rhs, coefuse)
         _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
                "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
                "Beta, InverseGamma, HalfNormal, HalfCauchy, Flat, " *
-               "Dirichlet, truncated). If `$fam` is meant as a submodel, " *
-               "define it with `@rkppl $fam(args...) = begin ... end` and " *
+               "Dirichlet, LKJCovarianceFactor, truncated). If `$fam` is " *
+               "meant as a submodel, define it with " *
+               "`@rkppl $fam(args...) = begin ... end` and " *
                "make it visible in the lowering module (`mod=`).")
     args = _plain_args(rhs, "`$fam`")
     vals = [_lower_param_arg(lhs, a, coefuse) for a in args]
