@@ -1001,6 +1001,182 @@ end
     _check_gradient(built.spec, bound, u)
 end
 
+function _rderived_cols()
+    xv = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    zv = [1.0, 0.5, -0.5, 2.0, -1.5, 0.25]
+    yv = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    gv = [1, 2, 1, 3, 2, 3]
+    return xv, zv, yv, gv
+end
+
+@testset "ranef derived margin K=1 slope vs baked twin" begin
+    xv, zv, yv, gv = _rderived_cols()
+    wv = xv .* zv
+    dplan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            w = x .* z
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [w]
+            end
+        end, (:y, :x, :z, :g))
+    db = only(dplan.ranef_buckets)
+    @test db.kind === :slope1
+    @test only(db.margins).z == RanefZRecipe(:column, :w, nothing)
+    @test any(d -> d.name === :w, dplan.derived)
+    # Forward reference: bucket before the definition lowers identically
+    # (the partition-time gate admits defined names; shape proves later).
+    fwd = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [w]
+            end
+            w = x .* z
+        end, (:y, :x, :z, :g))
+    @test only(only(fwd.ranef_buckets).margins).z ==
+        RanefZRecipe(:column, :w, nothing)
+    # Emitter-baked twin: `w` arrives as a raw column (option-A shape).
+    tplan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [w]
+            end
+        end, (:y, :w, :g))
+    dbound = bind_data(dplan, Dict{Symbol,AbstractVector}(:y => yv, :x => xv,
+        :z => zv, :g => gv))
+    tbound = bind_data(tplan, Dict{Symbol,AbstractVector}(:y => yv, :w => wv,
+        :g => gv))
+    dbuilt = build_kernel(dbound)
+    tbuilt = build_kernel(tbound)
+    @test dbuilt.layout.total == tbuilt.layout.total
+    @test coordinate_names(dbuilt.layout) == coordinate_names(tbuilt.layout)
+    u = [0.2, 0.1, -0.2, 0.3, 0.0, -0.1]
+    for q in (:likelihood, :prior, :posterior)
+        @test _query(dbuilt.spec, dbound, q, u) ≈
+            _query(tbuilt.spec, tbound, q, u)
+    end
+    _check_gradient(dbuilt.spec, dbound, u)
+end
+
+@testset "ranef derived margin correlated slice vs baked twin" begin
+    xv, zv, yv, gv = _rderived_cols()
+    wv = xv .* zv
+    dplan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            w = x .* z
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [1, w]
+            end
+        end, (:y, :x, :z, :g))
+    db = only(dplan.ranef_buckets)
+    @test db.kind === :correlated
+    @test [m.z.kind for m in db.margins] == [:ones, :column]
+    @test db.margins[2].z.column === :w
+    tplan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [1, w]
+            end
+        end, (:y, :w, :g))
+    dbound = bind_data(dplan, Dict{Symbol,AbstractVector}(:y => yv, :x => xv,
+        :z => zv, :g => gv))
+    tbound = bind_data(tplan, Dict{Symbol,AbstractVector}(:y => yv, :w => wv,
+        :g => gv))
+    dbuilt = build_kernel(dbound)
+    tbuilt = build_kernel(tbound)
+    @test dbuilt.layout.total == 11
+    @test dbuilt.layout.total == tbuilt.layout.total
+    @test coordinate_names(dbuilt.layout) == coordinate_names(tbuilt.layout)
+    u = collect(range(-0.4, 0.4; length = dbuilt.layout.total))
+    for q in (:likelihood, :prior, :posterior)
+        @test _query(dbuilt.spec, dbound, q, u) ≈
+            _query(tbuilt.spec, tbound, q, u)
+    end
+    _check_gradient(dbuilt.spec, dbound, u)
+end
+
+@testset "ranef derived margin failures" begin
+    # Scalar derived local stays rejected (vector-shaped only).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 5)
+            m = mean(x)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, m)
+            ranef_bucket(g) do
+                mu => [m]
+            end
+        end, (:y, :x, :g))
+    # Inline expressions bind via an assignment first.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [x .* z]
+            end
+        end, (:y, :x, :z, :g))
+    # A predictor location inlines and emits no Z column.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [mu]
+            end
+        end, (:y, :x, :g))
+    # Sampled parameters are not Z columns.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 5)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [a]
+            end
+        end, (:y, :x, :g))
+    # Predictor structure absorbed into the LP emits no column either.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 5)
+            b ~ Normal(0, 2)
+            sigma ~ Exponential(1)
+            w = b .* x
+            mu = a .+ w .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [w]
+            end
+        end, (:y, :x, :g))
+    # `dummy` needs a raw column (level membership needs bound values).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            w = x .* z
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [dummy(w, 1)]
+            end
+        end, (:y, :x, :z, :g))
+    # Grouping columns stay raw.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            w = x .* z
+            mu = a .+ ranef(w)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(w) do
+                mu => [1]
+            end
+        end, (:y, :x, :z, :g))
+end
+
 @testset "ranef correlated restore_draws" begin
     cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5],
         :x => [0.5, -1.0, 1.5, 0.0], :g => [1, 2, 1, 2])
