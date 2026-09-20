@@ -22,7 +22,8 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
     BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
-    OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam
+    OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
+    MvNormalCholeskyFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
     RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm, ScanSummandTerm,

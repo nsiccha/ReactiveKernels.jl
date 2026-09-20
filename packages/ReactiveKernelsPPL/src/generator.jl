@@ -615,6 +615,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _multinomial_plate_stmts(r, plan, node, pw)
     elseif r.family === CategoricalFam
         return _categorical_plain_plate_stmts(r, plan, node, pw)
+    elseif r.family === MvNormalCholeskyFam
+        return _mvn_cholesky_plate_stmts(r, plan, node, pw)
     else
         throw(ContractValidationError(
             "[generator] response family $(r.family) has no emitter"))
@@ -1215,6 +1217,76 @@ function _categorical_plain_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     return _plate_sum_stmts(pw, node, inputs, cell)
 end
 
+# Joint correlated-outcomes likelihood (SB's per-row
+# `multi_normal_cholesky(mean_row, L)` with
+# `L = diag_pre_multiply(scales, L_corr)`): one plate over the K outcome
+# columns + K mean LPs sums the per-row density. The row cell is scalar
+# forward substitution over threaded do-vars (the multinomial-cell shape —
+# no matrix, no triangular solve in the cell, so the tensorized plate
+# traces; a core-`mvnormal` splice was probed and fails Reactant primal
+# inside the plate — the in-cell `\` hits scalar indexing in Reactant's
+# `generic_trimatdiv!`, a primal gap distinct from the §7f gradient gap).
+# The L entries materialize as `_ppl_mvn_Le_` scalars (row-scaled layout
+# temps) and thread as shared scalar plate inputs.
+function _mvn_cholesky_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        node::Symbol, pw::Symbol)
+    outcomes = [r.response; r.extra_responses...]
+    preds = [r.predictor; r.extra_predictors...]
+    K = length(outcomes)
+    si = findfirst(p -> p.name === r.factor_scales, plan.vector_parameters)
+    ci = findfirst(p -> p.name === r.factor_corr, plan.vector_parameters)
+    (si === nothing || ci === nothing) && throw(ContractValidationError(
+        "[generator] joint response $(r.label) factor pieces unresolved " *
+        "(validate_plan links them)"))
+    sc, cr = plan.vector_parameters[si], plan.vector_parameters[ci]
+    (sc.size == K && cr.size == K) || throw(ContractValidationError(
+        "[generator] joint response $(r.label) factor sizes disagree " *
+        "with the $K outcomes (validate_plan checks this)"))
+    stmts = Expr[]
+    # L[i,j] = scales[i] * L_corr[i,j] (j ≤ i), one scalar per lower entry.
+    for i in 1:K, j in 1:i
+        push!(stmts, :($(_mvn_L_entry(r.label, i, j))::Float64 =
+            $(_vector_elt_name(sc.name, i)) * $(_rl_name(cr.name, i, j))))
+    end
+    lps = [_lp_name(_predictor(plan, q)) for q in preds]
+    inputs = Any[outcomes...; lps...]
+    yvs = [_dovar(i) for i in 1:K]
+    mvs = [_dovar(K + i) for i in 1:K]
+    Ld = Dict{Tuple{Int,Int},Symbol}()
+    for i in 1:K, j in 1:i
+        Ld[(i, j)] = _thread_ref!(inputs, _mvn_L_entry(r.label, i, j))
+    end
+    cell = _mvn_row_cell(K, yvs, mvs, Ld)
+    append!(stmts, _plate_sum_stmts(pw, node, inputs, cell))
+    return stmts
+end
+
+# In-graph L-entry name for a joint response (`_ppl_mvn_Le_<label>_<i>_<j>`,
+# j ≤ i). All `_ppl_`-hygienic.
+_mvn_L_entry(label::Symbol, i::Int, j::Int) =
+    Symbol(:_ppl_mvn_Le_, label, :_, i, :_, j)
+
+# One joint row's log-density as a single scalar expression: residuals,
+# forward substitution (`z[i] = (d[i] − Σ L[i,j]·z[j]) / L[i,i]`, inlined —
+# K is small), quadratic form, and the row constant. Pointwise-pure: each
+# lane evaluates its row's full `multi_normal_cholesky` log-density.
+function _mvn_row_cell(K::Int, yvs::Vector{Symbol}, mvs::Vector{Symbol},
+        Ld::Dict{Tuple{Int,Int},Symbol})
+    ds = [:( $(yvs[i]) - $(mvs[i]) ) for i in 1:K]
+    zs = Any[]
+    for i in 1:K
+        num = ds[i]
+        for j in 1:i-1
+            num = :( $num - $(Ld[(i, j)]) * $(zs[j]) )
+        end
+        push!(zs, :( ($num) / $(Ld[(i, i)]) ))
+    end
+    quad = foldl((a, z) -> :( $a + $z * $z ), zs; init = :(0.0))
+    logdet = foldl((a, i) -> :( $a + log($(Ld[(i, i)])) ), 1:K; init = :(0.0))
+    row_const = -0.5 * K * log(2 * pi)
+    return :( $row_const - $logdet - 0.5 * $quad )
+end
+
 # R2D2 prior bindings: the location vector stays a literal (SB
 # `beta_loc`), while the scale vector unrolls per design column —
 # literal fallbacks at share 0, `sqrt(phi[k]*R2*tau^2/varx[j])`
@@ -1279,8 +1351,9 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         push!(terms, node)
     end
     # Leveled vector latents (cutpoints/thresholds/simplexes/coefficient
-    # packs): unrolled scalar sums over the `_ppl_v_` layout elements
-    # (bound plans carry concrete sizes). Empty packs contribute 0.0.
+    # packs, joint-factor scales/Cholesky): unrolled scalar sums over the
+    # `_ppl_v_` layout elements (bound plans carry concrete sizes). Empty
+    # packs contribute 0.0.
     for p in plan.vector_parameters
         node = Symbol(:_ppl_prior_, p.name)
         push!(stmts, :($node::Float64 = $(_vector_prior_expr(p))))
@@ -1371,18 +1444,18 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     return stmts
 end
 
-# One correlated bucket's LKJ prior node (Stan `lkj_corr_cholesky_lpdf`
-# op order, preserved verbatim from the host
-# `lkj_corr_cholesky_logpdf`: constant literal first, then per-diagonal
-# terms in row order — `(K-i)*log(L[i,i])` at `eta == 1.0`, else
-# `a*log + b*log` with emission-time coefficients). Reads the named
-# `_ppl_rl_` diagonal scalars. K=1 is the `0.0` literal (Stan's K=1 LKJ
+# Shared LKJ-prior node body (Stan `lkj_corr_cholesky_lpdf` op order,
+# preserved verbatim from the host `lkj_corr_cholesky_logpdf`: constant
+# literal first, then per-diagonal terms in row order — `(K-i)*log(L[i,i])`
+# at `eta == 1.0`, else `a*log + b*log` with emission-time coefficients).
+# Reads the named `_ppl_rl_` diagonal scalars — no matrix materializes, and
+# the scalar-only form keeps the native Enzyme reverse pass on the same
+# straight-line shape as every other prior (the core `lkj_corr_cholesky`
+# object's `(1:K)` range broadcasts fail Enzyme reverse, so the splice
+# stays out of generated code). K=1 is the `0.0` literal (Stan's K=1 LKJ
 # term is ±0.0 — no diagonal, zero constant).
-function _lkj_prior_expr(b::RanefBucket)
-    K = length(b.margins)
-    L = _ranef_corr_names(b)[1]
+function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64)
     K == 1 && return :(0.0)
-    eta = b.lkj_eta
     terms = Any[lkj_logconst(K, eta)]
     if eta == 1.0
         for i in 2:K
@@ -1397,6 +1470,12 @@ function _lkj_prior_expr(b::RanefBucket)
         end
     end
     return foldl((a, c) -> :($a + $c), terms)
+end
+
+# One correlated bucket's LKJ prior node (names/sizes from the bucket).
+function _lkj_prior_expr(b::RanefBucket)
+    return _lkj_prior_terms(_ranef_corr_names(b)[1], length(b.margins),
+        b.lkj_eta)
 end
 
 # One plate over a latent VECTOR (a plate parameter or a spline vector),
@@ -1489,12 +1568,18 @@ end
 # Normal for threshold/coefficient packs (Stan `ordered`/`vector`
 # semantics — no factorial normalizer, matching `_BRMThresholdPrior`),
 # Dirichlet for simplexes (Stan `dirichlet_lpdf`: the log-multivariate-Beta
-# normalizer folds host-side — data-only — plus Σ (α−1)·log(s)).
+# normalizer folds host-side — data-only — plus Σ (α−1)·log(s)),
+# elementwise Exponential for joint-factor scales (a literal scale inlines;
+# a sampled hyperparameter resolves as a body local, the scalar-prior
+# shape), and the shared LKJ node for joint Cholesky factors.
 function _vector_prior_expr(p::VectorParameter)
     m = p.size
     m === nothing && throw(ContractValidationError(
         "[generator] vector parameter $(p.name) has unresolved size " *
         "(bind_data infers it)"))
+    if p.family === :cholesky_corr_lkj
+        return _lkj_prior_terms(p.name, m, Float64(p.args.arg1))
+    end
     elts = [_vector_elt_name(p.name, i) for i in 1:m]
     if p.family === :simplex_dirichlet
         alpha = Vector{Float64}(p.args.arg1)
@@ -1505,9 +1590,20 @@ function _vector_prior_expr(p::VectorParameter)
         end
         return foldl((x, y) -> :($x + $y), terms)
     end
-    mu, s = Float64(p.args.arg1), Float64(p.args.arg2)
-    terms = Any[:(normal($mu, $s).logpdf($t)) for t in elts]
-    return foldl((x, y) -> :($x + $y), terms; init = :(0.0))
+    if p.family === :positive_exponential
+        th = p.args.arg1
+        theta = th isa Symbol ? th : Float64(th)
+        terms = Any[:(exponential($theta).logpdf($t)) for t in elts]
+        return foldl((x, y) -> :($x + $y), terms; init = :(0.0))
+    end
+    if p.family === :ordered_normal || p.family === :vector_normal
+        mu, s = Float64(p.args.arg1), Float64(p.args.arg2)
+        terms = Any[:(normal($mu, $s).logpdf($t)) for t in elts]
+        return foldl((x, y) -> :($x + $y), terms; init = :(0.0))
+    end
+    throw(ContractValidationError(
+        "[generator] vector parameter $(p.name) family $(p.family) " *
+        "has no scalar prior form"))
 end
 
 # --- Sequential-recurrence (scan) density (slice 1: CENTERED) ---
