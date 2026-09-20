@@ -100,7 +100,7 @@ end
 # Floored positive (lo, ∞): offset-exp ℝ → (lo, ∞) — Stan's lower-bound
 # kernel (`real<lower=lo>`, SB `lognormal(0,1; lower=rho_lower)`): the
 # Jacobian is the bare exp term (`u`), with NO truncation renormalizer
-# (the ranef-`tau` precedent). `logjac` reads the UNCONSTRAINED value.
+# (the varying-`tau` precedent). `logjac` reads the UNCONSTRAINED value.
 @kernel floored_bijector(lo::Float64) = begin
     constrain(u::Float64)::Float64 = lo + exp(u)
     inv(constrain, x::Float64)::Float64 = log(x - lo)

@@ -119,14 +119,14 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps)
         labels = [Symbol(string(col) * "_" * string(level)) for level in m.values]
         return DesignBlock(FactorTerm, col, t.addressee, length(labels), labels,
             collect(m.values))
-    elseif t.kind === RanefGatherTerm
-        # A gather is a direct `r` expression over the group index and the
-        # bucket's draws (SB's `r_<target>_<suffix>` summand) — no
-        # design-matrix width. `column` carries the grouping column (the
-        # encoder input); the generator reads the TERMS for the full
-        # (bucket_id, bucket_group) key, which does not fit one Symbol.
-        return DesignBlock(RanefGatherTerm, only(t.columns), t.addressee, 0,
-            Symbol[], [])
+    elseif t.kind === VaryingEffectTerm
+        # A varying effect is a direct `r` expression over the group
+        # index and the draws block's draws (SB's
+        # `r_<target>_<suffix>` summand) — no design-matrix width.
+        # `column` carries the grouping column (the encoder input); the
+        # generator reads the TERMS for the draws label.
+        return DesignBlock(VaryingEffectTerm, only(t.columns), t.addressee,
+            0, Symbol[], [])
     else
         throw(ContractValidationError("[$label] term kind $(t.kind) has no design rule"))
     end
@@ -172,7 +172,7 @@ next share unless its addressee carries an explicit-Normal override.
 Factor blocks fan out per dummy (variances via the
 `brm_cat_variances` `m*(n-m)/(n*(n-1))` formula in level order);
 continuous columns take the sample variance (N−1, the Stan
-`variance()` normalization). Width-0 blocks (offsets, gathers,
+`variance()` normalization). Width-0 blocks (offsets, effects,
 summands) contribute nothing. Monotonic columns fail closed: their
 contrast is parameter-derived, so no data variance exists (no SB
 precedent in the flat mirror).

@@ -26,12 +26,12 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     MvNormalCholeskyFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
-    RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm, ScanSummandTerm,
-    MonotonicTerm, MonotonicSummandTerm
+    VaryingEffectTerm, SplineSummandTerm, HSGPSummandTerm,
+    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export ScalePredictorRef
 export PopulationPrior, R2D2Prior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec
-export RanefZRecipe, RanefMargin, RanefBucket
+export VaryingZRecipe, VaryingMargin, VaryingDraws, VaryingSlice
 export SplineBasisBlock, SplineBasis, SplineVector
 export HSGPBasis
 export KernelPlate

@@ -262,7 +262,7 @@ The SB `_sb_mo` level-gather recipe for one increments simplex:
 `increments` simplex. Cumulative level temps mirror the `cumsum`
 (`_ppl_mo_cum_s_1 = 0.0`, each later level adds one increment); the gather
 is an indicator sum over levels 2..K (level 1 contributes 0 by
-construction), the vectorized ranef-encoder shape — dotted ops only, so
+construction), the vectorized group-encoder shape — dotted ops only, so
 the Enzyme reverse pass sees no new surface. Emitted before the
 predictor's design recipe; the LP splice (per-block `mo` term or direct
 `mo1` summand) reads the `_ppl_mo_<s>` contrast.

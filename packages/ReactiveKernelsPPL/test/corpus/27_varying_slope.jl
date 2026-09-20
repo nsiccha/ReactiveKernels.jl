@@ -2,9 +2,7 @@
 begin
     a ~ Normal(0, 5)
     sigma ~ Exponential(1)
-    mu = a .+ ranef(g)
+    r ~ varying_effect(g, [x])
+    mu = a .+ r
     y .~ Normal.(mu, sigma)
-    ranef_bucket(g) do
-        mu => [x]
-    end
 end
