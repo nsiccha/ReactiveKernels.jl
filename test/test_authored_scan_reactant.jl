@@ -1,4 +1,6 @@
 using ReactiveKernels, Reactant, Test
+import Enzyme
+using DifferentiationInterface: AutoEnzyme
 
 if !isdefined(@__MODULE__, :AuthoredScanFixtures)
     include(joinpath(@__DIR__, "fixtures", "authored_scan.jl"))
@@ -62,4 +64,54 @@ end
     @test Reactant.to_number(compiled1(Reactant.to_rarray(M1), traced_gain)) ≈ k1(M1, 0.5)
     hlo1 = repr(Reactant.@code_hlo optimize = false k1(Reactant.to_rarray(M1), traced_gain))
     @test count("stablehlo.while", hlo1) <= 1
+end
+
+@testset "output-before-update scan with a concrete init keeps one while loop" begin
+    # The running-nadir shape: the body emits the PREVIOUS carry, so the eager
+    # first step returns the concrete host `init` as its output — still a
+    # scalar per-step output, which used to throw at `_scan_output_buffer`.
+    @kernel scmin_nadir(x) = begin
+        out = scan(x; init = 0.0) do carry, c
+            (min(carry, c), carry)
+        end
+        total::Float64 = sum(out)
+        return total
+    end
+    x = [0.5, -1.0, 0.25]
+    traced_x = Reactant.to_rarray(x)
+    for want in (:out, :total)
+        k = prepare(scmin_nadir; want)
+        compiled = Reactant.@compile k(traced_x)
+        actual = compiled(traced_x)
+        host = actual isa Reactant.AbstractConcreteArray ? Array(actual) :
+               Reactant.to_number(actual)
+        @test host ≈ k(x)
+        hlo = repr(Reactant.@code_hlo optimize = false k(traced_x))
+        @test count("stablehlo.while", hlo) == 1
+    end
+    # The reported operation: Reactant-compiled value-and-gradient matches
+    # native reverse Enzyme exactly.
+    prepared = prepare_ad(
+        scmin_nadir, AutoEnzyme(; mode = Enzyme.Reverse), x; active = :x, want = :total)
+    gref = similar(x)
+    vref, gref = ad_value_and_gradient!(prepared, gref, x)
+    compiled_both = compile_ad_value_and_gradient(prepared, traced_x)
+    value, gradient = compiled_both(traced_x)
+    @test Float64(value) ≈ vref
+    @test Array(gradient) ≈ gref
+    # N == 1 runs the eager first step with an empty loop body.
+    x1 = [0.5]
+    k1 = prepare(scmin_nadir; want = :total)
+    compiled1 = Reactant.@compile k1(Reactant.to_rarray(x1))
+    @test Reactant.to_number(compiled1(Reactant.to_rarray(x1))) ≈ k1(x1)
+    # A genuinely non-scalar per-step output stays a loud ArgumentError: native
+    # supports it, the Reactant `while` path does not.
+    @kernel tuplescan_out(x) = begin
+        out = scan(x; init = 0.0) do carry, c
+            (carry + c, (carry, c))
+        end
+        return out
+    end
+    @test prepare(tuplescan_out)(x) isa Vector
+    @test_throws ArgumentError Reactant.@compile prepare(tuplescan_out)(traced_x)
 end
