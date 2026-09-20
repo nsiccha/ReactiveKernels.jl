@@ -125,7 +125,8 @@ _lp_name(pred::PredictorSpec) = Symbol(:_ppl_lp_, pred.name)
 function _predictor_statements(plan::StructuralPlan)
     stmts = Expr[]
     for pred in plan.predictors
-        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
         lp = _lp_name(pred)
         terms = Any[]
         if any(b -> b.kind === MonotonicTerm, shape.blocks)
@@ -195,9 +196,9 @@ _coef_coord(coef::Symbol, k::Int) = :(sum(view($coef, $k:$k)))
 # columns under the Enzyme reverse pass — so each coefficient-carrying
 # block splices against its own coefficient coordinates (positions follow
 # design order, the layout block's own order): intercept/continuous/
-# monotonic blocks scale one column by one coordinate, factor blocks keep
-# the data-matrix × coefficient-slice matvec. Predictors without `mo`
-# keep the fused form above, untouched.
+# monotonic blocks scale one column by one coordinate, factor and matrix
+# blocks keep the data-matrix × coefficient-slice matvec. Predictors
+# without `mo` keep the fused form above, untouched.
 function _mo_block_terms(plan::StructuralPlan, shape::DesignShape)
     coef = block_name(shape.predictor)
     terms = Any[]
@@ -213,6 +214,11 @@ function _mo_block_terms(plan::StructuralPlan, shape::DesignShape)
         elseif b.kind === FactorTerm
             w = b.width
             push!(terms, :($(_contrast_expr(b)) *
+                $(:(view($coef, $k:$(k + w - 1))))))
+            k += w
+        elseif b.kind === MatrixTerm
+            w = b.width
+            push!(terms, :($(_matrix_block_expr(b, plan.n_obs)) *
                 $(:(view($coef, $k:$(k + w - 1))))))
             k += w
         elseif b.kind === MonotonicTerm
@@ -1385,7 +1391,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     stmts = Expr[]
     terms = Any[]
     for pred in plan.predictors
-        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
         shape.width == 0 && continue
         node = Symbol(:_ppl_prior_, pred.name)
         pw = Symbol(:_ppl_pw_prior_, pred.name)

@@ -215,7 +215,8 @@ end
         MvNormalCholeskyFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
-        HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm)
+        HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
+        MatrixTerm)
     @test :log in admitted_functions()
     @test :sum in admitted_functions()
     @test :tanh in admitted_functions()
@@ -649,7 +650,7 @@ end
 
 _unbind(p::StructuralPlan) = StructuralPlan(p.responses, p.predictors,
     p.population_priors, p.parameters, p.assignments,
-    Dict{Symbol,AbstractVector}(), 0)
+    Dict{Symbol,AbstractVector}(), 0; matrices = p.matrices)
 
 @testset "unbound plans and bind_data" begin
     u = _unbind(_gaussian_plan())
