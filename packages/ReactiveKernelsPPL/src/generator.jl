@@ -24,10 +24,6 @@ function build_kernel(plan::StructuralPlan)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
-    nhsgp = length(plan.hsgp_bases)
-    nhsgp == 0 || throw(ContractValidationError(
-        "[generator] HSGP codegen is Stage B — refusing to silently drop " *
-        "$nhsgp hsgp basis(es)"))
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
@@ -51,6 +47,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _assignment_statements(plan))
     append!(stmts, preprocessing_recipes(plan))
     append!(stmts, _ranef_statements(plan))
+    append!(stmts, _hsgp_basis_statements(plan))
     append!(stmts, _scan_reconstruction_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _likelihood_statements(plan))
@@ -153,6 +150,13 @@ function _predictor_statements(plan::StructuralPlan)
             b.kind === SplineSummandTerm &&
                 push!(terms, _spline_summand_expr(plan, b.column))
         end
+        # An HSGP summand contributes its basis's direct `PHI * w`
+        # expression (SB `_sb_hsgp`'s `PHI * (sqrt_spd .* beta_raw)`,
+        # evaluated in-graph by `_hsgp_basis_statements`).
+        for b in shape.blocks
+            b.kind === HSGPSummandTerm &&
+                push!(terms, _hsgp_summand_expr(plan, b.column))
+        end
         # A gather contributes its bucket's direct `r` expression (SB's
         # `r_<target>_<suffix>` summand), resolved from the TERMS — the
         # (bucket_id, bucket_group) key does not fit a design block.
@@ -246,6 +250,118 @@ function _spline_summand_expr(plan::StructuralPlan, id::Symbol)
         end
     end
     return foldl((a, b) -> :($a .+ $b), parts)
+end
+
+# `sqrt(2π)` verbatim from SB `brm_hsgp_sqrt_spd` (the spectral scale).
+const _HSGP_SQRT2PI = 2.5066282746310002
+
+# In-graph HSGP node names for one basis (all `_ppl_`-hygienic): per-axis
+# trig columns, tensor-product columns, the `hcat` basis matrix, the
+# spectral scale, per-basis `sqrt_spd` scalars, their `vect`, the
+# spectral weights, and the predictor summand.
+_hsgp_ax_name(id::Symbol, j::Int, k::Int) = Symbol(:_ppl_hsgp_, id, :_ax, j, :_k, k)
+_hsgp_phi_name(id::Symbol, b::Int) = Symbol(:_ppl_hsgp_, id, :_phi_, b)
+_hsgp_PHI_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_PHI)
+_hsgp_sscale_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_sscale)
+_hsgp_s_name(id::Symbol, b::Int) = Symbol(:_ppl_hsgp_, id, :_s_, b)
+_hsgp_S_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_S)
+_hsgp_w_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_w)
+_hsgp_sum_name(id::Symbol) = Symbol(:_ppl_hsgp_, id)
+
+# One basis's in-graph evaluation (SB `_brm_apply_hsgp` /
+# `brm_hsgp_sqrt_spd` / `_sb_hsgp`, SB op order throughout): per-axis 1D
+# trig columns from the frozen bind fits (`(mu, L)` literals), their
+# tensor-product columns in `CartesianIndices(K)` order, the `hcat` basis
+# matrix, unrolled `sqrt_spd` scalars over the sampled `(rho, sigma)`,
+# and the spec-literal matmul summand `PHI * (S .* beta)`. The basis
+# columns are data-only (bound-folded, the `design_recipe` precedent);
+# the spectral weights stay symbolic. Runs before the predictors (the
+# summand node is the LP splice); the priors stay in `_prior_statements`
+# (order-free).
+function _hsgp_basis_statements(plan::StructuralPlan)
+    stmts = Expr[]
+    for hb in plan.hsgp_bases
+        length(hb.fits) == length(hb.axes) || throw(ContractValidationError(
+            "[generator] hsgp :$(hb.id): fits not filled at bind " *
+            "(bind_data fills one (mu, L) per axis)"))
+        append!(stmts, _hsgp_basis_stmts(hb))
+    end
+    return stmts
+end
+
+function _hsgp_basis_stmts(hb::HSGPBasis)
+    id = hb.id
+    d = length(hb.axes)
+    stmts = Expr[]
+    # Per-axis 1D columns: `PHI[i,k] = inv_sqrt_L * sin(lam_sqrt[k] *
+    # (x[i] - mu + L))` (SB `_brm_apply_hsgp`, element order verbatim).
+    # `lam[k]` is SB's `lambda` literal, `lam_sqrt[k]` its `sqrt`.
+    for (j, axis) in enumerate(hb.axes)
+        mu, L = hb.fits[j]
+        mu, L = Float64(mu), Float64(L)
+        inv_sqrt_L = 1.0 / sqrt(L)
+        for k in 1:hb.K[j]
+            lam_sqrt = sqrt((k * pi / (2.0 * L))^2)
+            col = _hsgp_ax_name(id, j, k)
+            push!(stmts, :($col =
+                $inv_sqrt_L .* sin.($lam_sqrt .* ($axis .- $mu .+ $L))))
+        end
+    end
+    # Tensor-product columns in `CartesianIndices(K)` order (SB's
+    # `enumerate(CartesianIndices(K))`): one axis reuses its column.
+    midcs = collect(CartesianIndices(Tuple(hb.K)))
+    phis = Symbol[]
+    for (b, I) in enumerate(midcs)
+        if d == 1
+            push!(phis, _hsgp_ax_name(id, 1, I[1]))
+        else
+            phi = _hsgp_phi_name(id, b)
+            cols = [_hsgp_ax_name(id, j, I[j]) for j in 1:d]
+            push!(stmts, :($phi = $(foldl((a, c) -> :($a .* $c), cols))))
+            push!(phis, phi)
+        end
+    end
+    push!(stmts, :($(_hsgp_PHI_name(id)) = hcat($(phis...))))
+    # Spectral weights (SB `brm_hsgp_sqrt_spd`): `scale = sigma *
+    # prod(sqrt(rho_j * sqrt(2π)))`, `s[b] = scale * exp(-0.25 *
+    # sum(rho_j^2 * omega2[b,j]))` — left-assoc folds, SB order. Iso
+    # shares one rho across axes; `omega2` is the frozen `lambda`
+    # literal above.
+    names = _hsgp_names(hb)
+    rhos = hb.iso ? fill(names.rhos[1], d) : names.rhos
+    factors = Any[names.sigma]
+    for j in 1:d
+        push!(factors, :(sqrt($(rhos[j]) * $_HSGP_SQRT2PI)))
+    end
+    sscale = _hsgp_sscale_name(id)
+    push!(stmts, :($sscale::Float64 = $(foldl((a, c) -> :($a * $c), factors))))
+    snames = Symbol[]
+    for (b, I) in enumerate(midcs)
+        terms = Any[]
+        for j in 1:d
+            lam = (I[j] * pi / (2.0 * hb.fits[j][2]))^2
+            push!(terms, :($(rhos[j]) * $(rhos[j]) * $lam))
+        end
+        expsum = foldl((a, c) -> :($a + $c), terms)
+        s = _hsgp_s_name(id, b)
+        push!(stmts, :($s::Float64 = $sscale * exp(-0.25 * $expsum)))
+        push!(snames, s)
+    end
+    S = _hsgp_S_name(id)
+    push!(stmts, :($S = $(Expr(:vect, snames...))))
+    w = _hsgp_w_name(id)
+    push!(stmts, :($w = $S .* $(names.beta)))
+    push!(stmts, :($(_hsgp_sum_name(id)) = $(_hsgp_PHI_name(id)) * $w))
+    return stmts
+end
+
+# One HSGP summand's direct expression: the basis's precomputed
+# `_hsgp_basis_statements` node (resolved from the design block's basis
+# id; the lookup below is loud defense in depth).
+function _hsgp_summand_expr(plan::StructuralPlan, id::Symbol)
+    any(hb -> hb.id === id, plan.hsgp_bases) || throw(ContractValidationError(
+        "[generator] hsgp summand addresses unknown basis :$id"))
+    return _hsgp_sum_name(id)
 end
 
 # One scan summand's direct expression (`state .* coef`, explicit dotted
@@ -1224,6 +1340,27 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         push!(terms, snode)
         _vector_prior_stmts!(stmts, terms, xi, :normal, (arg1 = 0, arg2 = 1),
             nothing)
+    end
+    # HSGP bases (SB `_sb_hsgp`/`_sb_hsgp_aniso`): the length scales and
+    # marginal scale as scalar `lognormal(0, 1)` nodes plus the
+    # standardized `beta_raw` plate (shared vector-prior helper). The
+    # floored rhos emit WITHOUT a truncation normalizer: SB's
+    # `lognormal(0,1; lower=rho_lower)` is Stan lower-bound kernel
+    # semantics (offset-exp Jacobian only — the ranef-`tau` precedent).
+    for hb in plan.hsgp_bases
+        names = _hsgp_names(hb)
+        for rho in names.rhos
+            node = Symbol(:_ppl_prior_, rho)
+            cell = _family_logpdf_expr(:lognormal, Any[0, 1], rho)
+            push!(stmts, :($node::Float64 = $cell))
+            push!(terms, node)
+        end
+        snode = Symbol(:_ppl_prior_, names.sigma)
+        scell = _family_logpdf_expr(:lognormal, Any[0, 1], names.sigma)
+        push!(stmts, :($snode::Float64 = $scell))
+        push!(terms, snode)
+        _vector_prior_stmts!(stmts, terms, names.beta, :normal,
+            (arg1 = 0, arg2 = 1), nothing)
     end
     # Sequential-recurrence (scan) latents: setup + recurrence density.
     scanstmts, scannodes = _scan_prior_statements(plan, layout)
