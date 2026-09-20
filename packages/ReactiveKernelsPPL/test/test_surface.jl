@@ -2388,11 +2388,13 @@ end
         y ~ pin_fused(x, b; predictor = y_mu)
     end, (:y, :x); mod = @__MODULE__)
     @test only(noop.predictors).name === :y_mu
-    # Two use sites pin distinct predictors (multi-use stays safe).
+    # Two use sites pin distinct predictors (multi-use stays safe; each
+    # predictor keeps its own coefficient — blocks are per-predictor).
     two = lower_rkppl(quote
-        b ~ Normal(0, 2)
-        y1 ~ pin_fused(x, b; predictor = mu1)
-        y2 ~ pin_fused(x, b; predictor = mu2)
+        b1 ~ Normal(0, 2)
+        b2 ~ Normal(0, 2)
+        y1 ~ pin_fused(x, b1; predictor = mu1)
+        y2 ~ pin_fused(x, b2; predictor = mu2)
     end, (:y1, :y2, :x); mod = @__MODULE__)
     @test Set(p.name for p in two.predictors) == Set([:mu1, :mu2])
     # A pin over a latent location names the latent predictor.
