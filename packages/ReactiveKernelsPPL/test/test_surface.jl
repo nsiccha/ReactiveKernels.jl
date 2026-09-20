@@ -410,10 +410,8 @@ end
         eta = a .+ b .* x
         y .~ gamma.(alpha, exp.(eta) ./ alpha)
     end, Dn2)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ b .* x
-        y .~ BinomialLogit.(n, mu)
-    end, Dn3)
+    # (The fused `BinomialLogit.(n, mu)` head lowers as the decomposed twin —
+    # pinned in "surface fused response heads", not here.)
 end
 
 @testset "surface plan equality" begin
@@ -1054,7 +1052,10 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, Dn)
-    # Distributions must be Distributions.jl (julianic, never Stan).
+    # Distributions must be Distributions.jl (julianic, never Stan):
+    # CamelCase constructors with the link explicit (a link wrapper, or a
+    # fused logit/log head naming the link — the fused heads lower as
+    # decomposed twins, pinned in "surface fused response heads" below).
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ normal.(mu, 1.0)
@@ -1062,10 +1063,6 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Bernoulli.(mu)
-    end, Dn)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ b .* x
-        y .~ BernoulliLogit.(mu)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
@@ -1307,6 +1304,184 @@ end
         end
         @test err isa LoadError && err.error isa SurfaceLoweringError
     end
+end
+
+@testset "surface fused response heads" begin
+    Dn = (:y, :x)
+    _fused_errmsg(f) = try
+        f()
+        ""
+    catch e
+        sprint(showerror, e)
+    end
+    # Each fused family-name head lowers to the identical plan as its
+    # decomposed spelling (HAVE recovery is shared by construction — the
+    # family/link/predictor are pinned twice: by twin equality and directly).
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ BernoulliLogit.(mu)
+    end, Dn)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ Bernoulli.(logistic.(mu))
+    end, Dn)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === BernoulliLogitFam
+    @test only(fused.responses).link === LogitLink
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ PoissonLog.(mu)
+    end, Dn)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ Poisson.(exp.(mu))
+    end, Dn)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === PoissonLogFam
+    @test only(fused.responses).link === LogLink
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ BinomialLogit.(10, mu)
+    end, Dn)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ Binomial.(10, logistic.(mu))
+    end, Dn)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === BinomialLogitFam
+    @test only(fused.responses).link === LogitLink
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        phi ~ Exponential(1.0)
+        mu = a .+ b .* x
+        y .~ NegativeBinomial2Log.(mu, phi)
+    end, Dn)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        phi ~ Exponential(1.0)
+        mu = a .+ b .* x
+        y .~ NegativeBinomial2.(exp.(mu), phi)
+    end, Dn)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === NegativeBinomial2Fam
+    @test only(fused.responses).link === LogLink
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        alpha ~ Exponential(1.0)
+        mu = a .+ b .* x
+        y .~ GammaLog.(alpha, mu)
+    end, Dn)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        alpha ~ Exponential(1.0)
+        mu = a .+ b .* x
+        y .~ Gamma.(alpha, exp.(mu) ./ alpha)
+    end, Dn)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === GammaLogFam
+    @test only(fused.responses).link === LogLink
+    Dp2 = (:p, :x)
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        kappa ~ Gamma(2.0, 1000.0)
+        mu = a .+ b .* x
+        p .~ BetaLogit.(mu, kappa)
+    end, Dp2)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        kappa ~ Gamma(2.0, 1000.0)
+        mu = a .+ b .* x
+        p .~ Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)
+    end, Dp2)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === BetaLogitFam
+    @test only(fused.responses).link === LogitLink
+    # A fused head under `weighted.` desugars like the top-level head (the
+    # rewrite recurses into the wrapper's object position).
+    Wd = (:y, :x, :w)
+    wfused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ weighted.(BernoulliLogit.(mu), w)
+    end, Wd)
+    wdecomp = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ weighted.(Bernoulli.(logistic.(mu)), w)
+    end, Wd)
+    @test _plans_equal(wfused, wdecomp)
+    # Wrong-arity fused heads fail naming the FUSED spelling, never the
+    # decomposed one.
+    @test occursin("`BernoulliLogit` takes `BernoulliLogit.(eta)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ BernoulliLogit.(mu, mu)
+        end, Dn)))
+    @test occursin("`PoissonLog` takes `PoissonLog.(eta)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ PoissonLog.()
+        end, Dn)))
+    @test occursin("`BinomialLogit` takes `BinomialLogit.(n, mu)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ BinomialLogit.(mu)
+        end, Dn)))
+    @test occursin("`NegativeBinomial2Log` takes `NegativeBinomial2Log.(eta, phi)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            phi ~ Exponential(1.0)
+            mu = a .+ b .* x
+            y .~ NegativeBinomial2Log.(mu)
+        end, Dn)))
+    @test occursin("`GammaLog` takes `GammaLog.(alpha, eta)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ GammaLog.(mu)
+        end, Dn)))
+    @test occursin("`BetaLogit` takes `BetaLogit.(mu, kappa)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            p .~ BetaLogit.(mu)
+        end, Dp2)))
+    # Fused heads take positional arguments only, like every dotted object.
+    @test occursin("positional arguments only",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ BernoulliLogit.(mu; foo = 1)
+        end, Dn)))
+    # An unbracketed fused head names the broadcast fix.
+    @test occursin("broadcast the object",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ BernoulliLogit(mu)
+        end, Dn)))
+    # `OrderedLogit` is a near-miss name, not a fused head: it guides to the
+    # admitted `OrderedLogistic` spelling instead of failing generically.
+    @test occursin("OrderedLogistic.(eta)",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ OrderedLogit.(mu)
+        end, Dn)))
 end
 
 @testset "surface offset-only predictors" begin
@@ -2122,6 +2297,223 @@ end
     end, (:w, :x); mod = @__MODULE__)
 end
 
+# ── Fused-GLM stream fixtures for predictor pins ─────────────────────────
+# A fused def carries the affine INSIDE (design + coefficients ride formal
+# positions). Without a pin the location local namespaces under the data
+# LHS (`y_mu`) or an inline compound synthesizes (`y_eta`); a
+# `predictor = ...` use-site pin names the lowered predictor instead (see
+# "surface stream predictor pins").
+@rkppl pin_fused(x1, b1) = begin
+    mu = b1 .* x1
+    slot .~ Bernoulli.(logistic.(mu))
+    slot
+end
+@rkppl pin_inline(x1, b1) = begin
+    slot .~ Bernoulli.(logistic.(b1 .* x1))
+    slot
+end
+@rkppl pin_fusedhead(x1, b1) = begin
+    mu = b1 .* x1
+    slot .~ BernoulliLogit.(mu)
+    slot
+end
+@rkppl pin_cat(x1, b1) = begin
+    slot .~ CategoricalLogit.(b1 .* x1)
+    slot
+end
+@rkppl pin_simplex(sc) = begin
+    slot .~ Categorical.(sc)
+    slot
+end
+@rkppl pin_latloc(sc) = begin
+    slot .~ Normal.(theta, sc)
+    slot
+end
+@rkppl pin_sharedloc(sc) = begin
+    slot .~ Normal.(w, sc)
+    slot
+end
+
+@testset "surface stream predictor pins" begin
+    _pin_errmsg(f) = try
+        f()
+        ""
+    catch e
+        sprint(showerror, e)
+    end
+    # A pin names the lowered predictor: the fused def lowers exactly like
+    # the hand-written decomposed program (same predictor, same coef block).
+    got = lower_rkppl(quote
+        b ~ Normal(0, 2)
+        y ~ pin_fused(x, b; predictor = mu)
+    end, (:y, :x); mod = @__MODULE__)
+    want = lower_rkppl(quote
+        b ~ Normal(0, 2)
+        mu = b .* x
+        y .~ Bernoulli.(logistic.(mu))
+    end, (:y, :x))
+    @test _plans_equal(got, want)
+    @test only(got.predictors).name === :mu
+    @test got.responses[1].predictor === :mu
+    @test all(pr -> pr.predictor === :mu, got.population_priors)
+    @test isempty(got.derived)
+    # An inline-compound fused def pins the same way (no local needed).
+    goti = lower_rkppl(quote
+        b ~ Normal(0, 2)
+        y ~ pin_inline(x, b; predictor = mu)
+    end, (:y, :x); mod = @__MODULE__)
+    @test _plans_equal(goti, want)
+    # A fused head inside a pinned def composes (the fused spelling rides
+    # the pinned predictor).
+    gotfh = lower_rkppl(quote
+        b ~ Normal(0, 2)
+        y ~ pin_fusedhead(x, b; predictor = mu)
+    end, (:y, :x); mod = @__MODULE__)
+    @test _plans_equal(gotfh, want)
+    # Without a pin the default names are unchanged (namespaced local /
+    # synthetic compound).
+    unp = lower_rkppl(quote
+        b ~ Normal(0, 2)
+        y ~ pin_fused(x, b)
+    end, (:y, :x); mod = @__MODULE__)
+    @test only(unp.predictors).name === :y_mu
+    unpi = lower_rkppl(quote
+        b ~ Normal(0, 2)
+        y ~ pin_inline(x, b)
+    end, (:y, :x); mod = @__MODULE__)
+    @test only(unpi.predictors).name === :y_eta
+    # Pinning the name the default would synthesize is a no-op.
+    noop = lower_rkppl(quote
+        b ~ Normal(0, 2)
+        y ~ pin_fused(x, b; predictor = y_mu)
+    end, (:y, :x); mod = @__MODULE__)
+    @test only(noop.predictors).name === :y_mu
+    # Two use sites pin distinct predictors (multi-use stays safe; each
+    # predictor keeps its own coefficient — blocks are per-predictor).
+    two = lower_rkppl(quote
+        b1 ~ Normal(0, 2)
+        b2 ~ Normal(0, 2)
+        y1 ~ pin_fused(x, b1; predictor = mu1)
+        y2 ~ pin_fused(x, b2; predictor = mu2)
+    end, (:y1, :y2, :x); mod = @__MODULE__)
+    @test Set(p.name for p in two.predictors) == Set([:mu1, :mu2])
+    # A pin over a latent location names the latent predictor.
+    gotl = lower_rkppl(quote
+        @plate for i in eachindex(y)
+            theta[i] ~ Normal(0, 1)
+        end
+        s ~ Exponential(1)
+        y ~ pin_latloc(s; predictor = mu)
+    end, (:y,); mod = @__MODULE__)
+    @test only(gotl.predictors).name === :mu
+    @test only(gotl.predictors).terms[1].kind === LatentTerm
+    # End-to-end: the pinned program binds, builds and queries identically
+    # to the decomposed twin — including the posterior label (`mu`, not
+    # `y_mu`).
+    cols, _ = _gen_columns()
+    yb = repeat([false, true], 3)
+    mp = @rkppl begin
+        b ~ Normal(0, 2)
+        y ~ pin_fused(x, b; predictor = mu)
+    end
+    md = @rkppl begin
+        b ~ Normal(0, 2)
+        mu = b .* x
+        y .~ Bernoulli.(logistic.(mu))
+    end
+    bp = mp(; y = yb, x = cols[:x])
+    bd = md(; y = yb, x = cols[:x])
+    @test _plans_equal(bp, bd)
+    builtp = build_kernel(bp)
+    u = [0.5]
+    @test propertynames(constrain(builtp.layout, u)) == (:mu,)
+    @test _query(builtp.spec, bp, :posterior, u) ≈
+        _query(build_kernel(bd).spec, bd, :posterior, u)
+    _check_gradient(builtp.spec, bp, u)
+    # Fail-closed: two responses pinning one predictor name.
+    @test occursin("already pinned by response y1",
+        _pin_errmsg(() -> lower_rkppl(quote
+            b ~ Normal(0, 2)
+            y1 ~ pin_fused(x, b; predictor = mu)
+            y2 ~ pin_fused(x, b; predictor = mu)
+        end, (:y1, :y2, :x); mod = @__MODULE__)))
+    # Fail-closed: one response pinning two predictors.
+    @test occursin("pins two predictors",
+        _pin_errmsg(() -> lower_rkppl(quote
+            b ~ Normal(0, 2)
+            y ~ pin_fused(x, b; predictor = mu1)
+            y ~ pin_inline(x, b; predictor = mu2)
+        end, (:y, :x); mod = @__MODULE__)))
+    # Fail-closed: a pin on a latent (value-returning) call.
+    @test occursin("is a latent submodel",
+        _pin_errmsg(() -> lower_rkppl(quote
+            sig ~ sub_scale(1.0; predictor = mu)
+            mu = a .+ b .* x
+            y .~ Normal.(mu, sig)
+        end, (:y, :x); mod = @__MODULE__)))
+    # Fail-closed: a pin claiming a taken name.
+    @test occursin("already taken",
+        _pin_errmsg(() -> lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 2)
+            mu = a .+ b .* x
+            y ~ pin_fused(x, b; predictor = mu)
+        end, (:y, :x); mod = @__MODULE__)))
+    # Fail-closed: a pin on a multi-predictor (leveled) response.
+    @test occursin("a pin names exactly one predictor",
+        _pin_errmsg(() -> lower_rkppl(quote
+            b ~ Normal(0, 2)
+            y ~ pin_cat(x, b; predictor = mu)
+        end, (:y, :x); mod = @__MODULE__)))
+    # Fail-closed: a pin on a predictorless (simplex) response.
+    @test occursin("lowered no predictor",
+        _pin_errmsg(() -> lower_rkppl(quote
+            s ~ Dirichlet(2, 1.0)
+            y ~ pin_simplex(s; predictor = mu)
+        end, (:y,); mod = @__MODULE__)))
+    # Fail-closed: a non-Symbol pin and an unknown keyword.
+    @test occursin("bare predictor name",
+        _pin_errmsg(() -> lower_rkppl(quote
+            b ~ Normal(0, 2)
+            y ~ pin_fused(x, b; predictor = "mu")
+        end, (:y, :x); mod = @__MODULE__)))
+    @test occursin("takes keyword `predictor` only",
+        _pin_errmsg(() -> lower_rkppl(quote
+            b ~ Normal(0, 2)
+            y ~ pin_fused(x, b; foo = 1)
+        end, (:y, :x); mod = @__MODULE__)))
+    # Fail-closed: a pin cannot fork a shared location (either order, either
+    # claimant shape).
+    @test occursin("cannot fork a shared definition",
+        _pin_errmsg(() -> lower_rkppl(quote
+            w = a .+ b .* x
+            z .~ Normal.(w, 1.0)
+            s ~ Exponential(1)
+            y ~ pin_sharedloc(s; predictor = mu)
+        end, (:z, :y, :x); mod = @__MODULE__)))
+    @test occursin("cannot fork a shared definition",
+        _pin_errmsg(() -> lower_rkppl(quote
+            w = a .+ b .* x
+            s ~ Exponential(1)
+            y ~ pin_sharedloc(s; predictor = mu)
+            z .~ Normal.(w, 1.0)
+        end, (:y, :z, :x); mod = @__MODULE__)))
+    @test occursin("already pinned as",
+        _pin_errmsg(() -> lower_rkppl(quote
+            w = a .+ b .* x
+            s ~ Exponential(1)
+            y1 ~ pin_sharedloc(s; predictor = mu1)
+            y2 ~ pin_sharedloc(s; predictor = mu2)
+        end, (:y1, :y2, :x); mod = @__MODULE__)))
+    # Fail-closed: a pin claiming a synthesized predictor name.
+    @test occursin("already a synthesized predictor",
+        _pin_errmsg(() -> lower_rkppl(quote
+            b ~ Normal(0, 2)
+            z .~ Bernoulli.(logistic.(b .* x))
+            y ~ pin_fused(x, b; predictor = z_eta)
+        end, (:z, :y, :x); mod = @__MODULE__)))
+end
+
 # ── Per-cell submodels inside `@plate` (StanBlocks parity) ────────────────
 # A plate cell may embed a submodel, `col[i] ~ sm(args…)`, mirroring StanBlocks'
 # per-cell submodel promotion: the submodel's own `~`/`=` names promote PER CELL
@@ -2307,6 +2699,10 @@ end
     # A latent submodel bound to a DATA column (needs a dotted observation slot).
     @test_throws SurfaceLoweringError lower_rkppl(
         _pcs(:(y[i] ~ pcs_centered(mu, tau))), D; mod = M)
+    # A `predictor = ...` pin is top-level-only (per-cell predictors lower
+    # through the plate path, not the pinned location path).
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _pcs(:(y[i] ~ pcs_obs(mu, sigma; predictor = mu))), D; mod = M)
     # Without a submodel binding in scope, an unknown call head stays an
     # ordinary per-cell distribution error (no submodel capture).
     @test_throws SurfaceLoweringError lower_rkppl(
