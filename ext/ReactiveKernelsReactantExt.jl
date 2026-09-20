@@ -957,6 +957,18 @@ end
 @inline _scan_output_buffer(::Reactant.TracedRNumber{T}, n::Integer) where {T} =
     Reactant.promote_to(Reactant.TracedRArray, zeros(T, n))
 
+# An output-before-update scan body (e.g. `(min(carry, x), carry)`) returns the
+# CONCRETE `init` as its first-step output: the eager first step runs outside
+# the trace with the host seed, so `out1` is a plain `Float64`, not a
+# `TracedRNumber` — while every later step emits the traced counterpart. That
+# is still a scalar per-step output, so seed the traced buffer from its own
+# type rather than throwing; the fallback below keeps rejecting genuinely
+# non-scalar shapes (arrays, tuples). The output's own type is the authority —
+# never the carry's, which may differ (an `Int` counter or `NamedTuple` carry
+# beside a `Float64` output).
+@inline _scan_output_buffer(out::Number, n::Integer) =
+    Reactant.promote_to(Reactant.TracedRArray, zeros(typeof(out), n))
+
 # Gather one matrix row as a HOST vector of traced scalars. The column count
 # rides as `Val{K}`: the `@trace` body re-traces every captured operand as a
 # tracer, so a value-`K` would turn the `1:K` comprehension range into an
