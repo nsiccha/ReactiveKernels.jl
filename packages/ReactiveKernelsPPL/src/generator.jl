@@ -1215,6 +1215,40 @@ function _categorical_plain_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     return _plate_sum_stmts(pw, node, inputs, cell)
 end
 
+# R2D2 prior bindings: the location vector stays a literal (SB
+# `beta_loc`), while the scale vector unrolls per design column —
+# literal fallbacks at share 0, `sqrt(phi[k]*R2*tau^2/varx[j])`
+# expressions over the in-graph simplex elements + scalars otherwise
+# (SB `brm_r2d2_scale`, unrolled — the share map is static data, so no
+# data-dependent branching enters the graph). All radicands are
+# positive by construction (simplex/logistic/exp transforms +
+# validated varx). The consuming plate-sum shape is unchanged.
+function _r2d2_prior_stmts(rp::R2D2Prior, shape::DesignShape,
+        columns::Dict{Symbol,AbstractVector}, mut::Symbol, sdt::Symbol)
+    share, fallback, loc, varx =
+        r2d2_column_scales(shape, columns, rp.overrides)
+    elts = Any[]
+    for j in eachindex(share)
+        if share[j] == 0
+            push!(elts, fallback[j])
+            continue
+        end
+        ph = _vector_elt_name(rp.phi, share[j])
+        r2 = rp.r2
+        t2 = rp.tau isa Symbol ? :($(rp.tau) * $(rp.tau)) :
+            Float64(rp.tau)^2
+        push!(elts, :(sqrt($ph * $r2 * $t2 / $(varx[j]))))
+    end
+    return Any[:($mut = Float64[$(loc...)]), :($sdt = Float64[$(elts...)])]
+end
+
+_r2d2_for(plan::StructuralPlan, pred::Symbol) = begin
+    for rp in plan.r2d2_priors
+        rp.predictor === pred && return rp
+    end
+    return nothing
+end
+
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     stmts = Expr[]
     terms = Any[]
@@ -1223,11 +1257,16 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         shape.width == 0 && continue
         node = Symbol(:_ppl_prior_, pred.name)
         pw = Symbol(:_ppl_pw_prior_, pred.name)
-        loc, sca = coefficient_priors(shape, plan.population_priors)
         mut = Symbol(:_ppl_prmu_, pred.name)
         sdt = Symbol(:_ppl_prsd_, pred.name)
-        push!(stmts, :($mut = Float64[$(loc...)]))
-        push!(stmts, :($sdt = Float64[$(sca...)]))
+        rp = _r2d2_for(plan, pred.name)
+        if rp === nothing
+            loc, sca = coefficient_priors(shape, plan.population_priors)
+            push!(stmts, :($mut = Float64[$(loc...)]))
+            push!(stmts, :($sdt = Float64[$(sca...)]))
+        else
+            push!(stmts, _r2d2_prior_stmts(rp, shape, plan.columns, mut, sdt)...)
+        end
         coef = block_name(pred.name)
         cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
         cell = :(normal($mv, $sv).logpdf($cv))

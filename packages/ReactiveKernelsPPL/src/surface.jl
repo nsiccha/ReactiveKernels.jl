@@ -177,7 +177,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
     sample, det, plate_ctx, plate_specs, scans, buckets, bases, vectors,
-    hbases, kplates = _partition_statements(ast, data)
+    hbases, kplates, r2d2decls = _partition_statements(ast, data)
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
@@ -249,8 +249,13 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
             "and a scan coefficient — scan coefficients are sampled " *
             "scalars, not population coefficients (rename one)")
     end
-    priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors)
+    r2d2set = Set{Symbol}(d.predictor for d in r2d2decls)
+    priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
+        r2d2set)
+    r2d2s, taus = _lower_r2d2_priors(r2d2decls, sample, coefuse, predictors,
+        levelmaps, taken)
     params, paramsyms, dirichlets = _lower_parameters(sample, coefuse, ctx)
+    append!(params, taus)
     plate_parameters = PlateParameter[
         _lower_plate_parameter(nm, rhs, rng, coefuse)
         for (nm, rhs, rng, _) in plate_specs]
@@ -289,7 +294,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         ranef_buckets = buckets,
         vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
-        kernel_plates = kplates)
+        kernel_plates = kplates, r2d2_priors = r2d2s)
     validate_structure(plan)
     return plan
 end
@@ -846,6 +851,39 @@ _is_basis_stmt(st) =
     st isa Expr && st.head === :call && !isempty(st.args) &&
     st.args[1] === :spline_basis
 
+# A bare `r2d2(mu, R2, phi[, tau])` call declares a flat R2D2 variance
+# decomposition over one predictor (same bare-call-declaration shape as
+# `spline_basis`): positional predictor + R2/phi parameter names, plus
+# an optional tau (sampled-parameter name or positive literal; omitted
+# synthesizes a half-standard-Normal `r2d2_<pred>_tau_bsv`).
+_is_r2d2_stmt(st) =
+    st isa Expr && st.head === :call && !isempty(st.args) &&
+    st.args[1] === :r2d2
+
+function _lower_r2d2_decl(st::Expr, line::Int)
+    where = line > 0 ? "r2d2 (line $line)" : "r2d2"
+    args = [a for a in st.args[2:end]
+        if !(a isa Expr && a.head === :parameters)]
+    any(a -> a isa Expr && a.head === :parameters, st.args[2:end]) &&
+        _sfail("$where takes positional args only " *
+               "(`r2d2(mu, R2, phi[, tau])`), no keywords")
+    length(args) == 3 || length(args) == 4 ||
+        _sfail("$where takes `(predictor, R2, phi[, tau])` — " *
+               "$(length(args)) positional args, got $(repr(st))")
+    pred, r2, phi = args[1:3]
+    pred isa Symbol || _sfail("$where predictor must be a bare " *
+                              "predictor name, got $(repr(pred))")
+    r2 isa Symbol || _sfail("$where R2 must be a bare scalar-Beta " *
+                            "parameter name, got $(repr(r2))")
+    phi isa Symbol || _sfail("$where phi must be a bare " *
+                             "simplex-parameter name, got $(repr(phi))")
+    tau = length(args) == 4 ? args[4] : nothing
+    tau === nothing || tau isa Symbol || tau isa Real ||
+        _sfail("$where tau must be a sampled-parameter name or a " *
+               "positive literal, got $(repr(tau))")
+    return (predictor = pred, r2 = r2, phi = phi, tau = tau, line = line)
+end
+
 function _lower_basis(st::Expr, line::Int, data::Set{Symbol},
         seen::Set{Symbol}, seelines::Dict{Symbol,Int},
         bases::Vector{SplineBasis})
@@ -1273,6 +1311,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     vectors = SplineVector[]
     hbases = HSGPBasis[]
     kplates = KernelPlate[]
+    r2d2decls = NamedTuple[]
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
     seen_doc = false
@@ -1324,6 +1363,10 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             push!(kplates, kp)
             continue
         end
+        if _is_r2d2_stmt(st)
+            push!(r2d2decls, _lower_r2d2_decl(st, line))
+            continue
+        end
         if _is_sample(st) || _is_broadcast_sample(st)
             bc = _is_broadcast_sample(st)
             tilde = bc ? "`.~`" : "`~`"
@@ -1336,6 +1379,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                        "sampled")
             lhs in (:hsgp, :hsgp_basis) &&
                 _sfail("`$lhs` is reserved (hsgp surface) and cannot be " *
+                       "sampled")
+            lhs === :r2d2 &&
+                _sfail("`r2d2` is reserved (r2d2 surface) and cannot be " *
                        "sampled")
             _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[3], lhs)
@@ -1353,6 +1399,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             lhs in (:hsgp, :hsgp_basis) &&
                 _sfail("`$lhs` is reserved (hsgp surface) and cannot be " *
                        "redefined")
+            lhs === :r2d2 &&
+                _sfail("`r2d2` is reserved (r2d2 surface) and cannot be " *
+                       "redefined")
             lhs in data && _sfail("$lhs is bound data and cannot be redefined")
             _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[2], lhs)
@@ -1362,7 +1411,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         end
     end
     return sample, det, plate_ctx, plate_params, scans, buckets, bases,
-        vectors, hbases, kplates
+        vectors, hbases, kplates, r2d2decls
 end
 
 # Pre-pass: expand top-level `@plate for i in R ... end` blocks into
@@ -3640,7 +3689,8 @@ end
 # (`c[levels(g)] .~ Normal.(lit, lit)`), which also size the block —
 # required, never defaulted — and each one emits its LevelMap.
 # Plan order follows predictors, addressees in term order.
-function _lower_coefficient_priors(sample, coefuse, predictors)
+function _lower_coefficient_priors(sample, coefuse, predictors,
+        r2d2::Set{Symbol} = Set{Symbol}())
     stated = Dict{Symbol,Any}()
     for s in sample
         haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
@@ -3659,6 +3709,9 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
     priors = PopulationPrior[]
     levelmaps = LevelMap[]
     for pred in predictors
+        # R2D2 predictors carry their prior mass in the R2D2Prior
+        # (overrides included) — _lower_r2d2_priors, not here.
+        pred.name in r2d2 && continue
         for t in pred.terms
             # Offsets carry no coefficient; latent terms carry a PlateParameter
             # whose prior lives on the plate parameter, not as a coefficient;
@@ -3699,6 +3752,106 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
     end
     _check_identified(predictors, levelmaps)
     return priors, levelmaps
+end
+
+# R2D2 declarations to IR: one R2D2Prior per declared predictor.
+# Stated Normal coefficient priors become share-0 overrides (scalar
+# via _coefficient_normal, factor blocks via the broadcast form);
+# unstated columns join the simplex (factors take a full-cover
+# LevelMap — the identified check fires exactly when that collides
+# with an intercept, same as the PopulationPrior path). Omitted tau
+# synthesizes a half-standard-Normal parameter.
+function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
+        taken)
+    stated = Dict{Symbol,Any}()
+    for s in sample
+        haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
+    end
+    by_pred = Dict{Symbol,PredictorSpec}(p.name => p for p in predictors)
+    seen = Set{Symbol}()
+    out = R2D2Prior[]
+    taus = SampledParameter[]
+    r2d2preds = PredictorSpec[]
+    for d in decls
+        haskey(by_pred, d.predictor) || _sfail(
+            "r2d2 over unknown predictor $(d.predictor) " *
+            "(predictors come from response linear predictors)")
+        d.predictor in seen && _sfail(
+            "duplicate r2d2 declaration for predictor $(d.predictor) " *
+            "(one per predictor)")
+        push!(seen, d.predictor)
+        pred = by_pred[d.predictor]
+        push!(r2d2preds, pred)
+        overrides = Dict{Symbol,Tuple{Float64,Float64}}()
+        for t in pred.terms
+            (t.kind === OffsetTerm || t.kind === LatentTerm ||
+                t.kind === RanefGatherTerm ||
+                t.kind === SplineSummandTerm ||
+                t.kind === HSGPSummandTerm ||
+                t.kind === ScanSummandTerm ||
+                t.kind === MonotonicSummandTerm) && continue
+            addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
+            use = _find_use(coefuse, pred.name, addr)
+            use === nothing && _sfail("internal: no coefficient use for " *
+                                      "($(pred.name), $addr)")
+            t.kind === MonotonicTerm && _sfail(
+                "r2d2 over predictor $(pred.name): monotonic columns " *
+                "are not in the flat slice (the mo contrast is " *
+                "parameter-derived, so no data variance exists)")
+            name = use[1]
+            sign = use[3]
+            if t.kind === FactorTerm
+                ov = _lower_r2d2_factor(pred, t, name, sign, stated,
+                    levelmaps)
+                ov === nothing || (overrides[addr] = ov)
+                continue
+            end
+            haskey(stated, name) || continue
+            s = stated[name]
+            s.levels !== nothing && _sfail("coefficient $name takes a " *
+                                           "scalar prior (`$name ~ Normal`), " *
+                                           "not a levels prior — it is used " *
+                                           "as $(t.kind), not a factor")
+            loc, scale = _coefficient_normal(name, s.rhs, pred.name, addr)
+            overrides[addr] = (sign * loc, scale)
+        end
+        tau = d.tau
+        if tau === nothing
+            tau = Symbol(:r2d2_, d.predictor, :_tau_bsv)
+            tau in taken && _sfail(
+                "r2d2 over $(d.predictor): synthesized tau $tau " *
+                "collides with a model name — pass tau explicitly " *
+                "(`r2d2($(d.predictor), $(d.r2), $(d.phi), mytau)` " *
+                "with `mytau ~ HalfNormal(1)`)")
+            push!(taus, SampledParameter(tau, :normal, (arg1 = 0, arg2 = 1),
+                :positive, tau))
+        end
+        push!(out, R2D2Prior(d.predictor, d.r2, d.phi, tau, overrides))
+    end
+    _check_identified(r2d2preds, levelmaps)
+    return out, taus
+end
+
+# An R2D2 factor: a stated broadcast prior becomes a share-0 override
+# (with its levels subset, as on the PopulationPrior path); an
+# unstated factor joins the simplex under a full-cover LevelMap.
+function _lower_r2d2_factor(pred, t, name, sign, stated, levelmaps)
+    col = only(t.columns)
+    haskey(stated, name) || begin
+        push!(levelmaps, LevelMap(pred.name, col, [], :levels, :))
+        return nothing
+    end
+    s = stated[name]
+    s.levels === nothing && _sfail("coefficient $name is vector-valued " *
+                                   "(factor over $col) — scalar priors " *
+                                   "cannot size it; write " *
+                                   "`$name[levels($col)] .~ Normal.(0, 1)`")
+    gcol, subset = s.levels
+    gcol === col || _sfail("coefficient $name: levels column $gcol " *
+                           "differs from use column $col")
+    loc, scale = _coefficient_broadcast_normal(name, s.rhs, pred.name, col)
+    push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
+    return (sign * loc, scale)
 end
 
 function _lower_factor_prior(pred, t, name, sign, stated, levelmaps)

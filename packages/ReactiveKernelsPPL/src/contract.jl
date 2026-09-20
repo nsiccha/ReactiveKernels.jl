@@ -234,6 +234,38 @@ struct PopulationPrior
 end
 
 """
+    R2D2Prior(predictor, r2, phi, tau, overrides)
+
+Flat whole-predictor R2D2 variance decomposition (SB mirror, the
+`effect(lp,:) ~ r2d2(...)` form — the `sd(...) ~ r2d2(...)` R2D2M2/ICC
+grammar belongs to the hierarchical lane, never here). One per
+predictor at most; a predictor with an `R2D2Prior` carries NO
+[`PopulationPrior`](@ref) rows (coverage moves here).
+
+- `r2` names the scalar `Beta` [`SampledParameter`](@ref).
+- `phi` names the `:simplex_dirichlet` [`VectorParameter`](@ref) whose
+  length is the share count.
+- `tau` is the total scale: a sampled-parameter name (half-Normal) or
+  a positive literal (SB's data `tau_bsv`).
+- `overrides` maps addressees with an explicit Normal prior to their
+  `(location, scale)` — those columns keep their own scale and leave
+  the simplex (the SB share_idx/fallback composition). The intercept
+  is always share 0 (its override, if stated, supplies loc/scale).
+
+Share assignment follows SB exactly: every non-intercept design
+column without an override takes the next share in design-column
+order; the emitter derives
+`scale[j] = sqrt(phi[share] * R2 * tau^2 / varx[j])`.
+"""
+struct R2D2Prior
+    predictor::Symbol
+    r2::Symbol
+    phi::Symbol
+    tau::Union{Symbol,Real}
+    overrides::Dict{Symbol,Tuple{Float64,Float64}}
+end
+
+"""
     SupportOverride
 
 A latent's support override: `nothing` (infer from the family), the bare
@@ -654,6 +686,7 @@ struct StructuralPlan
     spline_vectors::Vector{SplineVector}
     hsgp_bases::Vector{HSGPBasis}
     kernel_plates::Vector{KernelPlate}
+    r2d2_priors::Vector{R2D2Prior}
 end
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
@@ -672,7 +705,7 @@ StructuralPlan(
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[],
         RanefBucket[], VectorParameter[], SplineBasis[], SplineVector[],
-        HSGPBasis[], KernelPlate[])
+        HSGPBasis[], KernelPlate[], R2D2Prior[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -700,11 +733,12 @@ function StructuralPlan(
         spline_bases::Vector{SplineBasis} = SplineBasis[],
         spline_vectors::Vector{SplineVector} = SplineVector[],
         hsgp_bases::Vector{HSGPBasis} = HSGPBasis[],
-        kernel_plates::Vector{KernelPlate} = KernelPlate[])
+        kernel_plates::Vector{KernelPlate} = KernelPlate[],
+        r2d2_priors::Vector{R2D2Prior} = R2D2Prior[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, columns, n_obs, roles, levelmaps,
         plate_parameters, scans, ranef_buckets, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, kernel_plates)
+        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -988,6 +1022,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_predictors(plan)
     _validate_levelmaps(plan)
     _validate_priors(plan)
+    _validate_r2d2(plan)
     _validate_kernels(plan)
     _validate_responses(plan)
     _validate_ranef_buckets(plan)
@@ -1013,6 +1048,7 @@ function validate_data(plan::StructuralPlan)
     _validate_splines_data(plan)
     _validate_hsgp_data(plan)
     _validate_kernels_data(plan)
+    _validate_r2d2_data(plan)
     return nothing
 end
 
@@ -2538,9 +2574,9 @@ function _validate_vector_parameters(plan::StructuralPlan)
     end
     # Linkage: each vector parameter is referenced by exactly one response
     # (as `thresholds` for ordered families, as `threshold_coefs` for
-    # per-threshold Ordinal, or as the simplex `predictor`) or by exactly
-    # one monotonic term (as its `increments` simplex) — never both, never
-    # shared.
+    # per-threshold Ordinal, or as the simplex `predictor`), by exactly
+    # one monotonic term (as its `increments` simplex), or by exactly one
+    # R2D2 prior (as its share `phi`) — never shared.
     refs = Dict{Symbol,Vector{Symbol}}(
         p.name => Symbol[] for p in plan.vector_parameters)
     for r in plan.responses
@@ -2570,15 +2606,24 @@ function _validate_vector_parameters(plan::StructuralPlan)
             ":simplex_dirichlet vector parameter, got $(p.family)")
         push!(refs[incr], t.label)
     end
+    for rp in plan.r2d2_priors
+        haskey(refs, rp.phi) || _fail(rp.predictor,
+            "R2D2 share parameter $(rp.phi) is not a vector parameter")
+        p = only(q for q in plan.vector_parameters if q.name === rp.phi)
+        p.family === :simplex_dirichlet || _fail(rp.predictor,
+            "R2D2 share parameter $(rp.phi) must be a " *
+            ":simplex_dirichlet vector parameter, got $(p.family)")
+        push!(refs[rp.phi], rp.predictor)
+    end
     for p in plan.vector_parameters
         got = refs[p.name]
         isempty(got) && _fail(p.label,
-            "vector parameter $(p.name) unused by any response or " *
-            "monotonic term")
+            "vector parameter $(p.name) unused by any response, " *
+            "monotonic term, or R2D2 prior")
         length(got) == 1 || _fail(p.label,
             "vector parameter $(p.name) shared by " *
-            "$(join(got, ", ")) — one vector parameter per response or " *
-            "monotonic term")
+            "$(join(got, ", ")) — one vector parameter per response, " *
+            "monotonic term, or R2D2 prior")
     end
     return nothing
 end
@@ -3080,9 +3125,14 @@ end
 
 function _validate_priors(plan::StructuralPlan)
     seen = Set{Tuple{Symbol,Symbol}}()
+    r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
     for pr in plan.population_priors
         any(p -> p.name === pr.predictor, plan.predictors) ||
             _fail(:plan, "prior addresses unknown predictor $(pr.predictor)")
+        pr.predictor in r2d2 && _fail(:plan,
+            "predictor $(pr.predictor) carries an R2D2Prior — its prior " *
+            "mass lives there, not in a PopulationPrior row (explicit " *
+            "Normal columns ride the overrides map)")
         key = (pr.predictor, pr.addressee)
         key in seen &&
             _fail(:plan, "duplicate prior for $key")
@@ -3091,6 +3141,8 @@ function _validate_priors(plan::StructuralPlan)
             _fail(:plan, "prior for $key must be Normal(finite, positive)")
     end
     for pred in plan.predictors
+        # R2D2 predictors are covered by _validate_r2d2, not here.
+        pred.name in r2d2 && continue
         # Offset terms carry no coefficient; latent terms carry the per-cell
         # PlateParameter, whose prior lives on the plate parameter itself;
         # gather terms carry a RanefBucket, spline summands a SplineBasis,
@@ -3107,6 +3159,96 @@ function _validate_priors(plan::StructuralPlan)
         for a in addressees
             (pred.name, a) in seen ||
                 _fail(:plan, "no prior for ($(pred.name), $a)")
+        end
+    end
+    return nothing
+end
+
+# R2D2 structural checks: predictor linkage (one per predictor),
+# parameter families (Beta R2, simplex phi, half-Normal-or-literal tau),
+# and override addressees. Share counts need design widths, so they wait
+# for `_validate_r2d2_data`.
+function _validate_r2d2(plan::StructuralPlan)
+    seen = Set{Symbol}()
+    for rp in plan.r2d2_priors
+        pred = nothing
+        for p in plan.predictors
+            p.name === rp.predictor && (pred = p)
+        end
+        pred === nothing && _fail(:plan,
+            "R2D2 prior addresses unknown predictor $(rp.predictor)")
+        rp.predictor in seen && _fail(:plan,
+            "duplicate R2D2 prior for predictor $(rp.predictor) " *
+            "(one per predictor)")
+        push!(seen, rp.predictor)
+        r2 = nothing
+        for p in plan.parameters
+            p.name === rp.r2 && (r2 = p)
+        end
+        r2 === nothing && _fail(rp.predictor,
+            "R2D2 R2 parameter $(rp.r2) is not a sampled parameter")
+        r2.family === :beta || _fail(rp.predictor,
+            "R2D2 R2 parameter $(rp.r2) must be Beta, got $(r2.family)")
+        # phi linkage + family ride _validate_vector_parameters; tau:
+        if rp.tau isa Symbol
+            tau = nothing
+            for p in plan.parameters
+                p.name === rp.tau && (tau = p)
+            end
+            tau === nothing && _fail(rp.predictor,
+                "R2D2 tau $(rp.tau) names neither a sampled parameter " *
+                "nor a literal (data tau_bsv inlines as a literal)")
+            (tau.family === :normal && tau.support_override === :positive) ||
+                _fail(rp.predictor,
+                    "sampled R2D2 tau $(rp.tau) must be half-Normal " *
+                    "(`HalfNormal(s)`), got $(tau.family) with " *
+                    "override $(repr(tau.support_override))")
+        else
+            isfinite(rp.tau) && rp.tau > 0 || _fail(rp.predictor,
+                "literal R2D2 tau must be finite and strictly positive " *
+                "(SB `_sb_r2d2_positive`), got $(repr(rp.tau))")
+        end
+        allowed = Set{Symbol}(t.addressee for t in pred.terms)
+        any(t -> t.kind === InterceptTerm, pred.terms) &&
+            push!(allowed, :Intercept)
+        for (addr, (loc, sca)) in rp.overrides
+            addr in allowed || _fail(rp.predictor,
+                "R2D2 override addresses $addr, not a column of " *
+                "predictor $(rp.predictor)")
+            isfinite(loc) && isfinite(sca) && sca > 0 || _fail(rp.predictor,
+                "R2D2 override for $addr must be Normal(finite, " *
+                "positive), got ($(repr(loc)), $(repr(sca)))")
+        end
+    end
+    return nothing
+end
+
+# R2D2 data checks: the share composition needs design widths + bound
+# columns. Runs at bind (after levelmaps bind, after phi size inference).
+function _validate_r2d2_data(plan::StructuralPlan)
+    isempty(plan.r2d2_priors) && return nothing
+    for rp in plan.r2d2_priors
+        pred = only(p for p in plan.predictors if p.name === rp.predictor)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
+        share, _, _, varx =
+            r2d2_column_scales(shape, plan.columns, rp.overrides)
+        n_shares = isempty(share) ? 0 : maximum(share)
+        n_shares == 0 && _fail(rp.predictor,
+            "R2D2 over predictor $(rp.predictor) decomposes nothing " *
+            "(intercept-only or every column overridden) — the flat " *
+            "slice has no bucket rule to no-op for (that lives in " *
+            "the hierarchical lane)")
+        phi = only(p for p in plan.vector_parameters if p.name === rp.phi)
+        phi.size == n_shares || _fail(rp.predictor,
+            "R2D2 phi $(rp.phi) has $(phi.size) shares but predictor " *
+            "$(rp.predictor) decomposes $n_shares columns")
+        for j in eachindex(share)
+            share[j] == 0 && continue
+            isfinite(varx[j]) && varx[j] > 0 || _fail(rp.predictor,
+                "R2D2 column $j of predictor $(rp.predictor) has " *
+                "non-positive variance $(repr(varx[j])) — a constant " *
+                "column cannot join the simplex (drop it or give it " *
+                "an explicit Normal prior)")
         end
     end
     return nothing
@@ -4015,7 +4157,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     maps = _eval_levelmaps(plan.levelmaps, columns)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
-            plan.predictors)
+            plan.predictors, plan.r2d2_priors)
     bound = StructuralPlan(responses2, plan.predictors,
         plan.population_priors, plan.parameters, plan.assignments,
         columns, n; roles = merged, derived = plan.derived,
@@ -4023,7 +4165,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         scans = plan.scans, ranef_buckets = plan.ranef_buckets,
         vector_parameters = vectors2, spline_bases = bases,
         spline_vectors = plan.spline_vectors, hsgp_bases = hbases,
-        kernel_plates = kbases)
+        kernel_plates = kbases, r2d2_priors = plan.r2d2_priors)
     validate_data(bound)
     return bound
 end
@@ -4033,13 +4175,15 @@ end
 # predictor count; Multinomial: count-column count) or from the response
 # column (max(y) for OrderedLogistic/Ordinal/Categorical); vector-param
 # `size === nothing` fills from the linked response (K−1 thresholds, K
-# simplex) or, for a monotonic-linked increments simplex, from its frozen
-# concentration length (K−1 increments for K levels). Explicit values
-# assert against the inference. Returns new (immutable) vectors; unbound
-# plans keep `nothing`.
+# simplex), from its frozen concentration length for a monotonic-linked
+# increments simplex (K−1 increments for K levels) or an R2D2-linked
+# share simplex (K shares). Explicit values assert against the
+# inference. Returns new (immutable) vectors; unbound plans keep
+# `nothing`.
 function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         vectors::Vector{VectorParameter}, columns::Dict{Symbol,AbstractVector},
-        predictors::Vector{PredictorSpec} = PredictorSpec[])
+        predictors::Vector{PredictorSpec} = PredictorSpec[],
+        r2d2::Vector{R2D2Prior} = R2D2Prior[])
     out_r = LikelihoodSpec[]
     for r in responses
         _is_leveled_family(r.family) || (push!(out_r, r); continue)
@@ -4062,6 +4206,10 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) ||
             continue
         monotonic_link[t.options.increments] = t.label
+    end
+    r2d2_link = Dict{Symbol,Symbol}()
+    for rp in r2d2
+        r2d2_link[rp.phi] = rp.predictor
     end
     out_v = VectorParameter[]
     for p in vectors
@@ -4098,6 +4246,15 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "(K=1 degenerates emitter-side and never reaches the thin layer)")
             p.size === nothing || p.size == want || _fail(p.label,
                 "monotonic increments size $(p.size) disagrees with its " *
+                "concentration length $want")
+            push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
+        elseif haskey(r2d2_link, p.name)
+            want = length(p.args.arg1)
+            want >= 1 || _fail(p.label,
+                "R2D2 shares need ≥ 1 share (an empty concentration " *
+                "decomposes nothing)")
+            p.size === nothing || p.size == want || _fail(p.label,
+                "R2D2 phi size $(p.size) disagrees with its " *
                 "concentration length $want")
             push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
         else

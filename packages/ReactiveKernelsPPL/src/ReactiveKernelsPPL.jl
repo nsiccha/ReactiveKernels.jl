@@ -28,7 +28,7 @@ export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTe
     RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm, ScanSummandTerm,
     MonotonicTerm, MonotonicSummandTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
-export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec
+export PopulationPrior, R2D2Prior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec
 export RanefZRecipe, RanefMargin, RanefBucket
 export SplineBasisBlock, SplineBasis, SplineVector
 export HSGPBasis
