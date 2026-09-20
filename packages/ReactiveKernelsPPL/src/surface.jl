@@ -302,6 +302,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
                                         "column (predictor $(d.label))")
         end
     end
+    _validate_bucket_margins(buckets, data, derived, detshape, used_locs)
     _check_plate_bares(plate_ctx, data, Set{Symbol}(p.name for p in predictors),
         Set{Symbol}(d.name for d in derived), _factor_coefs(coefuse, predictors),
         plate_names)
@@ -649,18 +650,21 @@ end
 # (ignored in slice 1); everything else must be an Expr.
 # A `ranef_bucket` do-block declares one shared random-effect draws block:
 # `ranef_bucket(:ID, g; eta=1.0) do <target> => [margins...] ... end`
-# (plain: `ranef_bucket(g) do ... end`). Lowers directly to RanefBucket IR
-# (margins reference data columns + predictor names only — no det inlining,
-# so no lowering context needed). Claims the bucket + gather labels up
-# front so user definitions can never collide with in-graph names (K=1
-# scale/xi, correlated L/tau/z).
+# (plain: `ranef_bucket(g) do ... end`). Lowers directly to RanefBucket IR.
+# Continuous margins reference data columns or vector-shaped derived
+# locals (`w = x .* z`, then `mu => [w]`); the partition-time gate admits
+# data-or-defined names (`detnames` pre-scan — buckets lower in statement
+# order, before shapes exist, so forward references work) and
+# `_validate_bucket_margins` proves vector shape after lowering. Claims
+# the bucket + gather labels up front so user definitions can never
+# collide with in-graph names (K=1 scale/xi, correlated L/tau/z).
 _is_bucket_stmt(st) =
     st isa Expr && st.head === :do && length(st.args) == 2 &&
     st.args[1] isa Expr && st.args[1].head === :call &&
     !isempty(st.args[1].args) && st.args[1].args[1] === :ranef_bucket
 
 function _lower_bucket(st::Expr, line::Int, data::Set{Symbol},
-        seen::Set{Symbol}, seelines::Dict{Symbol,Int},
+        detnames::Set{Symbol}, seen::Set{Symbol}, seelines::Dict{Symbol,Int},
         buckets::Vector{RanefBucket})
     where = line > 0 ? "bucket (line $line)" : "bucket"
     call = st.args[1]
@@ -739,7 +743,7 @@ function _lower_bucket(st::Expr, line::Int, data::Set{Symbol},
             _sfail("$where margin list for `$target` is empty")
         lo = length(margins) + 1
         for e in vec.args
-            push!(margins, _lower_margin_elem(e, target, data, where))
+            push!(margins, _lower_margin_elem(e, target, data, detnames, where))
         end
         push!(slices, (target, lo:length(margins)))
     end
@@ -784,23 +788,30 @@ function _lower_bucket(st::Expr, line::Int, data::Set{Symbol},
     return b
 end
 
-# One margin element: `1` (intercept), a bare data column (continuous Z),
-# or an explicit `dummy(c, k)` indicator (level VALUE for Int, exact match
-# for strings). No coding inference — treatment/cell-means arrive expanded.
-function _lower_margin_elem(e, target::Symbol, data::Set{Symbol}, where)
+# One margin element: `1` (intercept), a bare data column or vector-shaped
+# derived local (continuous Z), or an explicit `dummy(c, k)` indicator
+# (level VALUE for Int, exact match for strings). No coding inference —
+# treatment/cell-means arrive expanded. Defined (non-data) names pass here
+# and prove vector shape in `_validate_bucket_margins` (scalar derived
+# locals stay rejected there).
+function _lower_margin_elem(e, target::Symbol, data::Set{Symbol},
+        detnames::Set{Symbol}, where)
     e isa Integer && !(e isa Bool) ||
-        return _lower_margin_symbol(e, target, data, where)
+        return _lower_margin_symbol(e, target, data, detnames, where)
     e == 1 ||
         _sfail("$where margin integer must be exactly `1` (intercept); " *
-              "for slopes write the bare column (`$target => [x]`)")
+              "for slopes write the bare column or derived local " *
+              "(`$target => [x]`)")
     return RanefMargin(target, :Intercept, RanefZRecipe(:ones, :none, nothing))
 end
 
-function _lower_margin_symbol(e, target::Symbol, data::Set{Symbol}, where)
+function _lower_margin_symbol(e, target::Symbol, data::Set{Symbol},
+        detnames::Set{Symbol}, where)
     e isa Symbol || return _lower_margin_dummy(e, target, data, where)
-    e in data ||
-        _sfail("$where margin `$e` for `$target` is not data (margins " *
-              "are `1`, bare data columns, or `dummy(c, k)`)")
+    e in data || e in detnames ||
+        _sfail("$where margin `$e` for `$target` is neither bound data " *
+              "nor a model definition (margins are `1`, bare data " *
+              "columns, vector-shaped derived locals, or `dummy(c, k)`)")
     return RanefMargin(target, e, RanefZRecipe(:column, e, nothing))
 end
 
@@ -808,19 +819,69 @@ function _lower_margin_dummy(e, target::Symbol, data::Set{Symbol}, where)
     e isa Expr && e.head === :call && length(e.args) == 3 &&
         e.args[1] === :dummy ||
         _sfail("$where margin $(repr(e)) for `$target` is not admitted " *
-              "(margins are `1`, bare data columns, or `dummy(c, k)`; " *
-              "interactions are planned)")
+              "(margins are `1`, bare data columns, vector-shaped " *
+              "derived locals, or `dummy(c, k)` — bind an inline " *
+              "expression via an assignment first, e.g. `w = x .* z` " *
+              "then `$target => [w]`)")
     c, k = e.args[2], e.args[3]
     c isa Symbol ||
         _sfail("$where `dummy` column must be a bare data column, got " *
               "$(repr(c))")
     c in data ||
-        _sfail("$where `dummy` column `$c` is not data")
+        _sfail("$where `dummy` column `$c` is not data (`dummy` needs a " *
+              "raw column — level membership needs bound values)")
     (k isa Integer && !(k isa Bool)) || k isa AbstractString ||
         _sfail("$where `dummy` level must be an Int value or string, got " *
               "$(repr(k))")
     return RanefMargin(target, Symbol(string(c) * "_dummy_" * string(k)),
         RanefZRecipe(:dummy, c, k))
+end
+
+# Post-lowering margin proof: the partition-time gate admits data-or-defined
+# names (shapes don't exist yet), so every `:column` margin proves here
+# that it is bound data or an EMITTED vector-shaped derived local. Scalar
+# derived locals stay rejected; so do vector definitions that emit no
+# column (predictor locations inline into the predictor; absorbed
+# definitions reference a coefficient — Z columns must be data-only
+# derivations like `w = x .* z`). Runs before plan construction so the
+# failure is a SurfaceLoweringError naming the margin, not a bind-time
+# "not bound".
+function _validate_bucket_margins(buckets::Vector{RanefBucket},
+        data::Set{Symbol}, derived::Vector{VectorAssignmentSpec},
+        detshape, used_locs::Set{Symbol})
+    emitted = Set{Symbol}(d.name for d in derived)
+    for b in buckets
+        for m in b.margins
+            m.z.kind === :column || continue
+            c = m.z.column
+            c in data && continue
+            c in emitted && continue
+            shape = get(detshape, c, :unknown)
+            if shape === :scalar
+                _sfail("bucket $(b.label) margin `$c` for `$(m.predictor)` " *
+                       "is a scalar model definition — margins need " *
+                       "vector-shaped (n_obs) derived locals (bind " *
+                       "`w = x .* z`, then `$(m.predictor) => [w]`)")
+            elseif shape === :vector && c in used_locs
+                _sfail("bucket $(b.label) margin `$c` for `$(m.predictor)` " *
+                       "is the predictor location `$c`, which inlines into " *
+                       "the predictor and emits no Z column — bind the " *
+                       "interaction as its own derived local (`w = ...`, " *
+                       "then `$(m.predictor) => [w]`)")
+            elseif shape === :vector
+                _sfail("bucket $(b.label) margin `$c` for `$(m.predictor)` " *
+                       "is absorbed into its predictor (predictor " *
+                       "structure, not a standalone column) and emits no " *
+                       "Z column — Z columns must be data-only " *
+                       "derivations (`w = x .* z`)")
+            else
+                _sfail("bucket $(b.label) margin `$c` for `$(m.predictor)` " *
+                       "is neither bound data nor a vector-shaped derived " *
+                       "local")
+            end
+        end
+    end
+    return nothing
 end
 
 _contains_ranef(ex) = ex isa Expr &&
@@ -1338,6 +1399,22 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     seen_doc = false
     line = 0
     args, plate_ctx, plate_params = _expand_plates(ast.args, data)
+    # Defined names for the bucket partition-time gate: buckets lower in
+    # statement order, before shapes exist, so margins admit data-or-defined
+    # names here (forward references work) and prove vector shape after
+    # lowering (`_validate_bucket_margins`). The scan never throws — the
+    # main loop below owns every rejection.
+    detnames = Set{Symbol}()
+    for arg in args
+        arg isa Expr || continue
+        st = try
+            _unwrap_trivia(arg)
+        catch
+            continue
+        end
+        st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol &&
+            push!(detnames, st.args[1])
+    end
     for arg in args
         if arg isa LineNumberNode
             line = arg.line
@@ -1364,7 +1441,8 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             _sfail("nested `begin` blocks do not lower — flatten the block")
         st = _unwrap_trivia(arg)
         if _is_bucket_stmt(st)
-            b = _lower_bucket(st, line, data, seen, seelines, buckets)
+            b = _lower_bucket(st, line, data, detnames, seen, seelines,
+                buckets)
             push!(buckets, b)
             continue
         end
