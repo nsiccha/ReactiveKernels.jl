@@ -112,7 +112,7 @@ end
     nt = constrain(layout, u)
     @test Vector(nt.L_scales) ≈ exp.([0.3, -0.1])
     @test Matrix(nt.L_L_corr) ≈ lkj_chol_constrain([0.7], 2)
-    @test !haskey(nt, :b_corr) # no ranef derived draws leak
+    @test !haskey(nt, :b_corr) # no varying derived draws leak
     @test unconstrain(layout, nt) ≈ u
     @test logjac(layout, u) ≈ (0.3 + -0.1) + lkj_chol_logjac([0.7], 2)
     @test length(coordinate_names(layout)) == 7

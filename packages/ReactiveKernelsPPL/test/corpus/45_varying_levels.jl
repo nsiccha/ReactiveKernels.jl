@@ -1,9 +1,8 @@
-# data: y x z g
+# data: y g
 begin
     a ~ Normal(0, 5)
     sigma ~ Exponential(1)
-    w = x .* z
-    r ~ varying_effect(g, [1, w])
+    r ~ varying_effect(g, [1]; levels=["c", "a", "b", "d"])
     mu = a .+ r
     y .~ Normal.(mu, sigma)
 end

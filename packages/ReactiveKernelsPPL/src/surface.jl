@@ -349,7 +349,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
-    sample, det, plate_ctx, plate_specs, scans, buckets, bases, vectors,
+    sample, det, plate_ctx, plate_specs, scans, bases, vectors,
     hbases, kplates, r2d2decls, joints, varying_draws, varying_pending =
         _partition_statements(ast, data)
     # Varying bindings (draws + contributions): contributions compose
@@ -404,8 +404,6 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         synth = Ref(0), synth_derived = VectorAssignmentSpec[], taken,
         scan_states = Set{Symbol}(s.state for s in scans),
         scan_coefs = Set{Symbol}(),
-        buckets = Dict{Tuple{Union{Nothing,Symbol},Symbol},RanefBucket}(
-            (b.id, b.group) => b for b in buckets),
         varying_draws = Dict{Symbol,VaryingDraws}(
             d.label => d for d in varying_draws),
         varying_pending = varying_pending,
@@ -498,7 +496,6 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
                                         "column (predictor $(d.label))")
         end
     end
-    _validate_bucket_margins(buckets, data, derived, detshape, used_locs)
     _validate_varying_margins(varying_draws, data, derived, detshape,
         used_locs)
     # Varying bindings compose only as direct predictor summands:
@@ -521,7 +518,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
         levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
-        ranef_buckets = buckets, varying_draws = varying_draws,
+        varying_draws = varying_draws,
         varying_slices = varying_slices,
         vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
@@ -793,7 +790,7 @@ function _reject_unknown_calls(where, rhs)
     if rhs.head === :call && !isempty(rhs.args)
         fn = rhs.args[1]
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
-                fn ∉ VECTOR_FNS && fn !== :ranef && fn !== :spline &&
+                fn ∉ VECTOR_FNS && fn !== :spline &&
                 fn !== :hsgp && fn !== :mo && fn !== :mo1
             startswith(string(fn), ".") && _sfail(
                 "$where uses dotted operator `$fn`, which is not in " *
@@ -864,165 +861,14 @@ end
 
 # Top-level statements: skip line numbers and one leading docstring-to-be
 # (ignored in slice 1); everything else must be an Expr.
-# A `ranef_bucket` do-block declares one shared random-effect draws block:
-# `ranef_bucket(:ID, g; eta=1.0) do <target> => [margins...] ... end`
-# (plain: `ranef_bucket(g) do ... end`). Lowers directly to RanefBucket IR.
-# `levels=[...]` declares the grouping's levels in numbering order (SB
-# `CA.levels` for categorical groupings — custom order admitted, extra
-# entries are unobserved prior-only levels); omitted, bind derives
-# sort-ordered observed levels.
-# Continuous margins reference data columns or vector-shaped derived
-# locals (`w = x .* z`, then `mu => [w]`); the partition-time gate admits
-# data-or-defined names (`detnames` pre-scan — buckets lower in statement
-# order, before shapes exist, so forward references work) and
-# `_validate_bucket_margins` proves vector shape after lowering. Claims
-# the bucket + gather labels up front so user definitions can never
-# collide with in-graph names (K=1 scale/xi, correlated L/tau/z).
-_is_bucket_stmt(st) =
-    st isa Expr && st.head === :do && length(st.args) == 2 &&
-    st.args[1] isa Expr && st.args[1].head === :call &&
-    !isempty(st.args[1].args) && st.args[1].args[1] === :ranef_bucket
-
-function _lower_bucket(st::Expr, line::Int, data::Set{Symbol},
-        detnames::Set{Symbol}, seen::Set{Symbol}, seelines::Dict{Symbol,Int},
-        buckets::Vector{RanefBucket})
-    where = line > 0 ? "bucket (line $line)" : "bucket"
-    call = st.args[1]
-    doex = st.args[2]
-    doex isa Expr && doex.head === :(->) && length(doex.args) == 2 ||
-        _sfail("$where takes a `do ... end` block of `target => [...]` lines")
-    doex.args[1] isa Expr && doex.args[1].head === :tuple &&
-        isempty(doex.args[1].args) ||
-        _sfail("$where takes no iteration variables (`do ... end`, not " *
-              "`do x ... end`)")
-    body = doex.args[2]
-    body isa Expr && body.head === :block ||
-        _sfail("$where takes a `do ... end` block of `target => [...]` lines")
-    pos = Any[]
-    eta = 1.0
-    eta_given = false
-    levels = nothing
-    for a in call.args[2:end]
-        if a isa Expr && a.head === :parameters
-            for kw in a.args
-                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where takes keywords `eta`/`levels` only")
-                kw.args[1] === :eta || kw.args[1] === :levels ||
-                    _sfail("$where takes keywords `eta`/`levels` only, got " *
-                          "`$(kw.args[1])`")
-                if kw.args[1] === :eta
-                    v = kw.args[2]
-                    v isa Real && !(v isa Bool) ||
-                        _sfail("$where eta must be a numeric literal, got $(repr(v))")
-                    eta = Float64(v)
-                    eta_given = true
-                else
-                    levels = _lower_bucket_levels(kw.args[2], where)
-                end
-            end
-        else
-            push!(pos, a)
-        end
-    end
-    id = nothing
-    group = nothing
-    if length(pos) == 1
-        group = pos[1]
-    elseif length(pos) == 2
-        id, group = pos
-        id isa QuoteNode && id.value isa Symbol ||
-            _sfail("$where quotes its bucket id: got $(repr(id)) — write " *
-                  "`ranef_bucket(:ID, group)` (bare names are data columns)")
-    else
-        _sfail("$where takes `(group)` or `(:ID, group)` positionally")
-    end
-    group isa Symbol ||
-        _sfail("$where grouping must be a bare data column, got $(repr(group))")
-    group in data ||
-        _sfail("$where grouping `$group` is not data")
-    key = (id === nothing ? nothing : id.value, group)
-    any(b -> (b.id, b.group) == key, buckets) &&
-        _sfail("$where duplicates bucket $key (one block per (id, group))")
-    margins = RanefMargin[]
-    slices = Tuple{Symbol,UnitRange{Int}}[]
-    seen_targets = Set{Symbol}()
-    nlines = 0
-    for ln in body.args
-        ln isa LineNumberNode && continue
-        nlines += 1
-        ln isa Expr && ln.head === :call && length(ln.args) == 3 &&
-            ln.args[1] === :(=>) ||
-            _sfail("$where body lines are `target => [margins...]`, got " *
-                  "$(repr(ln))")
-        target, vec = ln.args[2], ln.args[3]
-        target isa Symbol ||
-            _sfail("$where margin target must be a predictor name, got " *
-                  "$(repr(target))")
-        target in seen_targets &&
-            _sfail("$where lists target `$target` twice (one margin list " *
-                  "per target)")
-        push!(seen_targets, target)
-        vec isa Expr && vec.head === :vect ||
-            _sfail("$where margin list for `$target` must be a vector " *
-                  "(`$target => [1]`), even for one margin")
-        isempty(vec.args) &&
-            _sfail("$where margin list for `$target` is empty")
-        lo = length(margins) + 1
-        for e in vec.args
-            push!(margins, _lower_margin_elem(e, target, data, detnames, where))
-        end
-        push!(slices, (target, lo:length(margins)))
-    end
-    nlines >= 1 || _sfail("$where needs at least one `target => [...]` line")
-    K = length(margins)
-    kind = if key[1] !== nothing
-        :correlated
-    elseif K == 1 && margins[1].z.kind === :ones
-        :intercept1
-    elseif K == 1
-        :slope1
-    else
-        :correlated
-    end
-    if kind !== :correlated
-        eta_given && _sfail("$where is a K=1 plain bucket (kind $kind) and " *
-              "takes no LKJ eta (no correlation to parameterize)")
-        eta = NaN
-    elseif !(eta > 0)
-        _sfail("$where eta must be positive, got $eta")
-    end
-    suffix = key[1] === nothing ? string(group) : string(key[1]) * "_" * string(group)
-    label = Symbol("bucket_" * suffix)
-    _claim!(seen, seelines, label, line)
-    for (t, _) in slices
-        _claim!(seen, seelines, Symbol("r_$(t)_" * suffix), line)
-    end
-    b = RanefBucket(key[1], group, kind, margins, slices, eta, label,
-        levels)
-    if kind === :intercept1 || kind === :slope1
-        for nm in _ranef_k1_names(b)
-            _claim!(seen, seelines, nm, line)
-        end
-    else
-        for nm in _ranef_corr_names(b)
-            _claim!(seen, seelines, nm, line)
-        end
-        # The derived draws `b_<suffix>` live in `constrain` output only
-        # (never sampled, never in-graph) — claimed so a user definition
-        # can never shadow them there.
-        _claim!(seen, seelines, Symbol("b_" * suffix), line)
-    end
-    return b
-end
-
-# A bucket's declared grouping levels (`levels=["c", "a", "b", "d"]`):
-# a literal vector in DECLARED numbering order (SB `CA.levels` for
-# categorical groupings) — extra entries are unobserved prior-only
-# levels. Elements are literal-embeddable scalars: numbers (Bool rides
-# Real), strings, chars, or QUOTED symbols (`:a` — a bare name is not
-# a level value). Shape (non-empty, duplicate-free) is checked here
-# with line context; the contract re-checks for hand-built plans.
-function _lower_bucket_levels(v, where)
+# Declared grouping levels (`levels=["c", "a", "b", "d"]`): a literal
+# vector in DECLARED numbering order (SB `CA.levels` for categorical
+# groupings) — extra entries are unobserved prior-only levels. Elements
+# are literal-embeddable scalars: numbers (Bool rides Real), strings,
+# chars, or QUOTED symbols (`:a` — a bare name is not a level value).
+# Shape (non-empty, duplicate-free) is checked here with line context;
+# the contract re-checks for hand-built plans.
+function _lower_grouping_levels(v, where)
     v isa Expr && v.head === :vect ||
         _sfail("$where levels takes a literal level vector " *
               "(`levels=[\"b\", \"a\"]`), got $(repr(v))")
@@ -1050,113 +896,9 @@ function _lower_bucket_levels(v, where)
     return levels
 end
 
-# One margin element: `1` (intercept), a bare data column or vector-shaped
-# derived local (continuous Z), or an explicit `dummy(c, k)` indicator
-# (level VALUE for Int, exact match for strings). No coding inference —
-# treatment/cell-means arrive expanded. Defined (non-data) names pass here
-# and prove vector shape in `_validate_bucket_margins` (scalar derived
-# locals stay rejected there).
-function _lower_margin_elem(e, target::Symbol, data::Set{Symbol},
-        detnames::Set{Symbol}, where)
-    e isa Integer && !(e isa Bool) ||
-        return _lower_margin_symbol(e, target, data, detnames, where)
-    e == 1 ||
-        _sfail("$where margin integer must be exactly `1` (intercept); " *
-              "for slopes write the bare column or derived local " *
-              "(`$target => [x]`)")
-    return RanefMargin(target, :Intercept, RanefZRecipe(:ones, :none, nothing))
-end
-
-function _lower_margin_symbol(e, target::Symbol, data::Set{Symbol},
-        detnames::Set{Symbol}, where)
-    e isa Symbol || return _lower_margin_dummy(e, target, data, where)
-    e in data || e in detnames ||
-        _sfail("$where margin `$e` for `$target` is neither bound data " *
-              "nor a model definition (margins are `1`, bare data " *
-              "columns, vector-shaped derived locals, or `dummy(c, k)`)")
-    return RanefMargin(target, e, RanefZRecipe(:column, e, nothing))
-end
-
-function _lower_margin_dummy(e, target::Symbol, data::Set{Symbol}, where)
-    e isa Expr && e.head === :call && length(e.args) == 3 &&
-        e.args[1] === :dummy ||
-        _sfail("$where margin $(repr(e)) for `$target` is not admitted " *
-              "(margins are `1`, bare data columns, vector-shaped " *
-              "derived locals, or `dummy(c, k)` — bind an inline " *
-              "expression via an assignment first, e.g. `w = x .* z` " *
-              "then `$target => [w]`)")
-    c, k = e.args[2], e.args[3]
-    c isa Symbol ||
-        _sfail("$where `dummy` column must be a bare data column, got " *
-              "$(repr(c))")
-    c in data ||
-        _sfail("$where `dummy` column `$c` is not data (`dummy` needs a " *
-              "raw column — level membership needs bound values)")
-    (k isa Integer && !(k isa Bool)) || k isa AbstractString ||
-        _sfail("$where `dummy` level must be an Int value or string, got " *
-              "$(repr(k))")
-    return RanefMargin(target, Symbol(string(c) * "_dummy_" * string(k)),
-        RanefZRecipe(:dummy, c, k))
-end
-
-# Post-lowering margin proof: the partition-time gate admits data-or-defined
-# names (shapes don't exist yet), so every `:column` margin proves here
-# that it is bound data or an EMITTED vector-shaped derived local. Scalar
-# derived locals stay rejected; so do vector definitions that emit no
-# column (predictor locations inline into the predictor; absorbed
-# definitions reference a coefficient — Z columns must be data-only
-# derivations like `w = x .* z`). Runs before plan construction so the
-# failure is a SurfaceLoweringError naming the margin, not a bind-time
-# "not bound".
-function _validate_bucket_margins(buckets::Vector{RanefBucket},
-        data::Set{Symbol}, derived::Vector{VectorAssignmentSpec},
-        detshape, used_locs::Set{Symbol})
-    emitted = Set{Symbol}(d.name for d in derived)
-    for b in buckets
-        for m in b.margins
-            m.z.kind === :column || continue
-            c = m.z.column
-            c in data && continue
-            c in emitted && continue
-            shape = get(detshape, c, :unknown)
-            if shape === :scalar
-                _sfail("bucket $(b.label) margin `$c` for `$(m.predictor)` " *
-                       "is a scalar model definition — margins need " *
-                       "vector-shaped (n_obs) derived locals (bind " *
-                       "`w = x .* z`, then `$(m.predictor) => [w]`)")
-            elseif shape === :vector && c in used_locs
-                _sfail("bucket $(b.label) margin `$c` for `$(m.predictor)` " *
-                       "is the predictor location `$c`, which inlines into " *
-                       "the predictor and emits no Z column — bind the " *
-                       "interaction as its own derived local (`w = ...`, " *
-                       "then `$(m.predictor) => [w]`)")
-            elseif shape === :vector
-                _sfail("bucket $(b.label) margin `$c` for `$(m.predictor)` " *
-                       "is absorbed into its predictor (predictor " *
-                       "structure, not a standalone column) and emits no " *
-                       "Z column — Z columns must be data-only " *
-                       "derivations (`w = x .* z`)")
-            else
-                _sfail("bucket $(b.label) margin `$c` for `$(m.predictor)` " *
-                       "is neither bound data nor a vector-shaped derived " *
-                       "local")
-            end
-        end
-    end
-    return nothing
-end
-
-_contains_ranef(ex) = ex isa Expr &&
-    (_is_gather_call(ex) || any(_contains_ranef, ex.args))
-
-_is_gather_call(ex) =
-    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-    ex.args[1] === :ranef
-
 # Varying-effect margin elements: `1` (intercept), a bare data column or
 # vector-shaped derived local (continuous Z), or an explicit `dummy(c, k)`
-# indicator. Same vocabulary as bucket margins, minus the target (margins
-# live on the shared draws; targets live on slices).
+# indicator (margins live on the shared draws; targets live on slices).
 function _lower_varying_margin_elem(e, data::Set{Symbol},
         detnames::Set{Symbol}, where)
     e isa Integer && !(e isa Bool) ||
@@ -1239,7 +981,7 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
                     eta = Float64(v)
                     eta_given = true
                 else
-                    levels = _lower_bucket_levels(kw.args[2], where)
+                    levels = _lower_grouping_levels(kw.args[2], where)
                 end
             end
         else
@@ -1247,8 +989,8 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
         end
     end
     length(pos) == 3 && pos[1] isa QuoteNode && pos[1].value isa Symbol &&
-        _sfail("$where takes `(group, [margins...])` — bucket ids are " *
-              "removed (independent blocks on one grouping disambiguate " *
+        _sfail("$where takes `(group, [margins...])` — no id position " *
+              "(independent blocks on one grouping disambiguate " *
               "by binding name, not labels)")
     length(pos) == 2 ||
         _sfail("$where takes `(group, [margins...])` positionally, got " *
@@ -1407,10 +1149,10 @@ function _finalize_varying_slices(ctx)
     return slices
 end
 
-# Post-lowering margin proof (the bucket-gate mirror): the
-# partition-time gate admits data-or-defined names (shapes don't exist
-# yet), so every `:column` margin proves here that it is bound data or
-# an EMITTED vector-shaped derived local.
+# Post-lowering margin proof: the partition-time gate admits
+# data-or-defined names (shapes don't exist yet), so every `:column`
+# margin proves here that it is bound data or an EMITTED
+# vector-shaped derived local.
 function _validate_varying_margins(draws::Vector{VaryingDraws},
         data::Set{Symbol}, derived::Vector{VectorAssignmentSpec},
         detshape, used_locs::Set{Symbol})
@@ -1941,7 +1683,6 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     sample = SampleStmt[]
     det = Pair{Symbol,Any}[]
     scans = ScanSpec[]
-    buckets = RanefBucket[]
     bases = SplineBasis[]
     vectors = SplineVector[]
     hbases = HSGPBasis[]
@@ -1954,11 +1695,11 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     seen_doc = false
     line = 0
     args, plate_ctx, plate_params = _expand_plates(ast.args, data)
-    # Defined names for the bucket partition-time gate: buckets lower in
-    # statement order, before shapes exist, so margins admit data-or-defined
-    # names here (forward references work) and prove vector shape after
-    # lowering (`_validate_bucket_margins`). The scan never throws — the
-    # main loop below owns every rejection.
+    # Defined names for the varying partition-time gate: draws blocks
+    # lower in statement order, before shapes exist, so margins admit
+    # data-or-defined names here (forward references work) and prove
+    # vector shape after lowering (`_validate_varying_margins`). The
+    # scan never throws — the main loop below owns every rejection.
     detnames = Set{Symbol}()
     for arg in args
         arg isa Expr || continue
@@ -1995,12 +1736,6 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         arg.head === :block &&
             _sfail("nested `begin` blocks do not lower — flatten the block")
         st = _unwrap_trivia(arg)
-        if _is_bucket_stmt(st)
-            b = _lower_bucket(st, line, data, detnames, seen, seelines,
-                buckets)
-            push!(buckets, b)
-            continue
-        end
         if _is_basis_stmt(st)
             b, vs = _lower_basis(st, line, data, seen, seelines, bases)
             push!(bases, b)
@@ -2038,9 +1773,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 continue
             end
             lhs, rng, levs = _sample_lhs(st.args[2], bc, tilde, data)
-            lhs in (:ranef, :ranef_bucket, :dummy) &&
-                _sfail("`$lhs` is reserved (ranef surface) and cannot be " *
-                       "sampled")
+            lhs === :dummy &&
+                _sfail("`dummy` is reserved (margin surface) and cannot " *
+                       "be sampled")
             lhs in (:spline, :spline_basis) &&
                 _sfail("`$lhs` is reserved (spline surface) and cannot be " *
                        "sampled")
@@ -2070,9 +1805,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             lhs = st.args[1]
             lhs === :target && _sfail("no `target` in rkppl models " *
                                       "(density comes only from `~`)")
-            lhs in (:ranef, :ranef_bucket, :dummy) &&
-                _sfail("`$lhs` is reserved (ranef surface) and cannot be " *
-                       "redefined")
+            lhs === :dummy &&
+                _sfail("`dummy` is reserved (margin surface) and cannot " *
+                       "be redefined")
             lhs in (:spline, :spline_basis) &&
                 _sfail("`$lhs` is reserved (spline surface) and cannot be " *
                        "redefined")
@@ -2137,11 +1872,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             levels_by_group[d.group] = (d.levels, draws_lines[d.label])
         end
     end
-    !isempty(buckets) && !isempty(varying_raw) &&
-        _sfail("a model uses either `varying_*` statements or " *
-              "`ranef_bucket`, not both (one hierarchical spelling " *
-              "per model)")
-    return sample, det, plate_ctx, plate_params, scans, buckets, bases,
+    return sample, det, plate_ctx, plate_params, scans, bases,
         vectors, hbases, kplates, r2d2decls, joints, varying_draws,
         varying_pending
 end
@@ -4079,12 +3810,12 @@ end
 
 function _record_coefuses!(coefuse, pname, uses, lhs)
     for (name, addr, sign) in uses
-        bucket = get!(coefuse, name, Tuple{Symbol,Symbol,Int}[])
-        for (p2, _, _) in bucket
+        entries = get!(coefuse, name, Tuple{Symbol,Symbol,Int}[])
+        for (p2, _, _) in entries
             p2 === pname && _sfail("response $lhs: coefficient $name is " *
                                    "used twice in predictor $pname")
         end
-        push!(bucket, (pname, addr, sign))
+        push!(entries, (pname, addr, sign))
     end
     return nothing
 end
@@ -4122,7 +3853,7 @@ function _analyze_predictor(pname, rhs, ctx, lhs)
     # admitted — both evaluate the likelihood over a coefficient-free LP
     # (data for offsets, the increment-simplex contrast for `mo1`) with an
     # empty coefficient layout. Any other coefficient-free shape
-    # (latent/gather/spline/hsgp/scan-only, or an empty summand list)
+    # (latent/effect/spline/hsgp/scan-only, or an empty summand list)
     # stays fail-closed: a scan summand needs a sibling coefficient
     # (SB's `ar` always pairs with an intercept).
     if isempty(uses) && !(!isempty(terms) &&
@@ -4139,13 +3870,9 @@ end
 function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
     ex isa Symbol || return _inline_structure_expr(ex, ctx, visited, where)
     haskey(ctx.detmap, ex) || return ex
-    # Gather-like atoms never hide in definitions: an inlined alias would
+    # Summand atoms never hide in definitions: an inlined alias would
     # silently become a direct summand, bypassing the lowering screens
     # (scalar defs always inline; structural vector defs inline too).
-    _contains_ranef(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
-        "into $where) calls `ranef()`, which lowers only as a direct " *
-        "predictor summand (`mu = a .+ b .* x .+ ranef(:ID, g)`), not " *
-        "inside definitions")
     _uses_varying_contrib(ctx.detmap[ex], ctx.varying_contribs) &&
         _sfail("definition `$ex` (inlined into $where) references a " *
         "varying contribution, which lowers only as a direct predictor " *
@@ -4214,14 +3941,6 @@ function _classify_summand(pname, core, sign::Int, ctx)
                             "in data (terms are bare coefficients, " *
                             "`coefficient .* column`, " *
                             "`coefficients[column]`, and bare columns)")
-    if _contains_ranef(core)
-        _is_gather_call(core) ||
-            _sfail("predictor $pname: `ranef()` gathers lower only as " *
-                  "direct additive summands " *
-                  "(`mu = a .+ b .* x .+ ranef(:ID, g)`), not nested in " *
-                  "$(repr(core))")
-        return _classify_gather(pname, core, sign, ctx)
-    end
     # Bare contributions route via `_classify_symbol` above; any other
     # expression mentioning one fails here (additive-only, never nested).
     if _uses_varying_contrib(core, ctx.varying_contribs)
@@ -4296,47 +4015,6 @@ function _classify_summand(pname, core, sign::Int, ctx)
                   "prior location)")
 end
 
-# A `ranef(:ID, g)` / `ranef(g)` gather: the enclosing predictor's slice of
-# the named bucket (SB's `r_<target>_<suffix>` summand). Additive only;
-# linkage (bucket + slice existence) is verified here so the surface error
-# names the predictor; the contract re-checks for hand-built plans.
-function _classify_gather(pname, core::Expr, sign::Int, ctx)
-    where = "predictor $pname"
-    args = core.args[2:end]
-    id = nothing
-    group = nothing
-    if length(args) == 1
-        group = only(args)
-    elseif length(args) == 2
-        id, group = args
-        id isa QuoteNode && id.value isa Symbol ||
-            _sfail("$where quotes its gather bucket id: got $(repr(id)) " *
-                  "— write `ranef(:ID, $group)` (bare names are data columns)")
-        id = id.value
-    else
-        _sfail("$where gather takes `ranef(group)` or `ranef(:ID, group)`")
-    end
-    group isa Symbol ||
-        _sfail("$where gather group must be a bare data column, got " *
-              "$(repr(group))")
-    sign > 0 ||
-        _sfail("$where negates a `ranef()` gather — gathers are additive " *
-              "only (write `.+ ranef(...)`)")
-    key = (id, group)
-    haskey(ctx.buckets, key) ||
-        _sfail("$where gathers unknown bucket $key — declare it with " *
-              "`ranef_bucket($(id === nothing ? "" : ":$id, ")group) do ... end`")
-    b = ctx.buckets[key]
-    any(s -> s[1] === pname, b.slices) ||
-        _sfail("$where gathers bucket $key, which carries no slice for " *
-              "`$pname` (slices name predictors; an inline location lowers " *
-              "as `<resp>_eta` — bind the location to a named definition " *
-              "to gather there)")
-    suffix = id === nothing ? string(group) : string(id) * "_" * string(group)
-    label = Symbol("r_$(pname)_" * suffix)
-    return TermSpec(RanefGatherTerm, [group],
-        (bucket_id = id, bucket_group = group), label, label), nothing
-end
 
 # A `spline(:id)` summand: the named basis's direct summand in the
 # enclosing predictor (SB's `X*b + Z*(sd*z)` shape). Additive only, one
@@ -4801,13 +4479,13 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
         for t in pred.terms
             # Offsets carry no coefficient; latent terms carry a PlateParameter
             # whose prior lives on the plate parameter, not as a coefficient;
-            # gather terms carry a RanefBucket, effect terms a VaryingDraws,
-            # whose geometries are self-priored; spline summands carry
-            # SplineVectors, self-priored likewise; hsgp summands carry an
-            # HSGPBasis, self-priored likewise; and monotonic summands
-            # (mo1) carry an increment simplex, also self-priored.
+            # effect terms carry a VaryingDraws, whose geometry is
+            # self-priored; spline summands carry SplineVectors,
+            # self-priored likewise; hsgp summands carry an HSGPBasis,
+            # self-priored likewise; and monotonic summands (mo1) carry
+            # an increment simplex, also self-priored.
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
-                t.kind === RanefGatherTerm || t.kind === VaryingEffectTerm ||
+                t.kind === VaryingEffectTerm ||
                 t.kind === SplineSummandTerm ||
                 t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||
@@ -4871,7 +4549,7 @@ function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
         overrides = Dict{Symbol,Tuple{Float64,Float64}}()
         for t in pred.terms
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
-                t.kind === RanefGatherTerm ||
+                t.kind === VaryingEffectTerm ||
                 t.kind === SplineSummandTerm ||
                 t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||
@@ -5275,9 +4953,6 @@ function _lower_truncated_param(lhs, rhs, coefuse)
 end
 
 function _lower_assignment(nm, rhs, coefuse)
-    _contains_ranef(rhs) && _sfail("assignment `$nm` calls `ranef()`, " *
-        "which lowers only as a direct predictor summand " *
-        "(`mu = a .+ b .* x .+ ranef(:ID, g)`), not inside definitions")
     _contains_spline(rhs) && _sfail("assignment `$nm` calls `spline()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ b .* x .+ spline(:s_x)`), not inside definitions")
@@ -5305,9 +4980,6 @@ end
 # coefficient discipline and types the node (vocabulary and Julia-shape
 # screens ran at the definition pre-pass).
 function _lower_vector_assignment(nm, rhs, coefuse)
-    _contains_ranef(rhs) && _sfail("derived column `$nm` calls `ranef()`, " *
-        "which lowers only as a direct predictor summand " *
-        "(`mu = a .+ b .* x .+ ranef(:ID, g)`), not inside definitions")
     _contains_spline(rhs) && _sfail("derived column `$nm` calls `spline()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ b .* x .+ spline(:s_x)`), not inside definitions")

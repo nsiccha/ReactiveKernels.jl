@@ -46,7 +46,6 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     end
     append!(stmts, _assignment_statements(plan))
     append!(stmts, preprocessing_recipes(plan))
-    append!(stmts, _ranef_statements(plan))
     append!(stmts, _varying_statements(plan))
     append!(stmts, _hsgp_basis_statements(plan))
     append!(stmts, _scan_reconstruction_statements(plan, layout))
@@ -161,13 +160,6 @@ function _predictor_statements(plan::StructuralPlan)
             b.kind === HSGPSummandTerm &&
                 push!(terms, _hsgp_summand_expr(plan, b.column))
         end
-        # A gather contributes its bucket's direct `r` expression (SB's
-        # `r_<target>_<suffix>` summand), resolved from the TERMS — the
-        # (bucket_id, bucket_group) key does not fit a design block.
-        for t in pred.terms
-            t.kind === RanefGatherTerm &&
-                push!(terms, _ranef_gather_expr(plan, pred, t))
-        end
         # A varying effect contributes its draws block's direct `r`
         # expression (SB's `r_<target>_<suffix>` summand), resolved from
         # the TERMS — the draws label does not fit a design block.
@@ -177,7 +169,7 @@ function _predictor_statements(plan::StructuralPlan)
         end
         # A scan summand contributes its state's direct scaled expression
         # (`state .* coef`, SB's `ar` latent path with its free beta),
-        # resolved from the TERMS like a gather.
+        # resolved from the TERMS like any summand.
         for t in pred.terms
             t.kind === ScanSummandTerm &&
                 push!(terms, _scan_summand_expr(plan, pred, t))
@@ -390,31 +382,12 @@ function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSp
 end
 
 # Group-index encoder nodes, one per grouped column (`_ppl_gidx_<group>`):
-# an in-model `_declared_codes` call over the bucket's DECLARED levels
+# an in-model `_declared_codes` call over the draws' DECLARED levels
 # (bind-known — filled or emitter-provided — so the order agrees with
 # validation by construction; never sorted). Data-only, hence
 # bound-folded; strings are native-only, exactly like factor contrasts.
-# K=1 and correlated buckets on the same group share one encoder
+# K=1 and correlated draws on the same group share one encoder
 # (per-group dedup; same-group levels agreement is validated).
-function _ranef_statements(plan::StructuralPlan)
-    stmts = Expr[]
-    groups = Symbol[]
-    for b in plan.ranef_buckets
-        b.group in groups && continue
-        push!(groups, b.group)
-        b.levels === nothing && throw(ContractValidationError(
-            "[generator] internal: bucket $(b.label) has no declared " *
-            "levels (validate_plan proves this)"))
-        lvlvec = Expr(:vect,
-            (_level_literal(lv) for lv in b.levels)...)
-        push!(stmts, Expr(:(=), Symbol(:_ppl_gidx_, b.group),
-            Expr(:call, :_declared_codes, b.group, lvlvec)))
-    end
-    return stmts
-end
-
-# One `_ppl_gidx_<group>` encoder per grouping over the draws'
-# DECLARED levels (same dedup and bind-known order as the bucket arm).
 function _varying_statements(plan::StructuralPlan)
     stmts = Expr[]
     groups = Symbol[]
@@ -430,15 +403,6 @@ function _varying_statements(plan::StructuralPlan)
             Expr(:call, :_declared_codes, d.group, lvlvec)))
     end
     return stmts
-end
-
-function _gather_bucket(plan::StructuralPlan, t::TermSpec)
-    i = findfirst(b -> b.id === t.options.bucket_id &&
-        b.group === t.options.bucket_group, plan.ranef_buckets)
-    i === nothing && throw(ContractValidationError(
-        "[generator] gather addresses unknown bucket " *
-        "($(t.options.bucket_id), $(t.options.bucket_group))"))
-    return plan.ranef_buckets[i]
 end
 
 # Term-to-draws join by label, plus the (draws, target) slice (unique
@@ -459,21 +423,11 @@ function _slice_draws(plan::StructuralPlan, pred::PredictorSpec,
     return d, plan.varying_slices[si]
 end
 
-# One margin's Z as an rvalue: bare columns stay bare (raw ports and
-# derived locals alike); dummies compare against the bind-known level
-# value. `:ones` never reaches emission (an intercept needs no Z
-# multiply, and slope1 margins are never `:ones` by kind dispatch).
-function _ranef_z_expr(z::RanefZRecipe)
-    z.kind === :column && return z.column
-    z.kind === :dummy &&
-        return Expr(:call, :.==, z.column, _level_literal(z.level))
-    throw(ContractValidationError(
-        "[generator] internal: ones-Z reached gather emission"))
-end
-
-# One varying margin's Z as an rvalue: identical semantics to the
-# bucket arm (bare columns stay bare; dummies compare against the
-# bind-known level value; `:ones` never reaches emission).
+# One varying margin's Z as an rvalue: bare columns stay bare (raw
+# ports and derived locals alike); dummies compare against the
+# bind-known level value. `:ones` never reaches emission (an intercept
+# needs no Z multiply, and slope1 margins are never `:ones` by kind
+# dispatch).
 function _varying_z_expr(z::VaryingZRecipe)
     z.kind === :column && return z.column
     z.kind === :dummy &&
@@ -482,29 +436,11 @@ function _varying_z_expr(z::VaryingZRecipe)
         "[generator] internal: ones-Z reached effect emission"))
 end
 
-# One bucket's direct `r` summand, SB-literal (`sbimpl.jl`
-# `ranef_intercept`/`ranef_slope`, including association order — no `b`
-# node, the draws stay implicit): intercept
-# `exp(log_scale) * xi[idx]`, slope `tau * (xi[idx] .* Z)`.
-# Correlated buckets take the K² implicit-draws arm below (this
-# predictor's slice only).
-function _ranef_gather_expr(plan::StructuralPlan, pred::PredictorSpec,
-        t::TermSpec)
-    b = _gather_bucket(plan, t)
-    b.kind === :correlated && return _ranef_corr_gather_expr(plan, pred, b)
-    scale, xi = _ranef_k1_names(b)
-    gathered = Expr(:ref, xi, Symbol(:_ppl_gidx_, b.group))
-    if b.kind === :intercept1
-        return Expr(:call, :*, Expr(:call, :exp, scale), gathered)
-    end
-    Z = _ranef_z_expr(only(b.margins).z)
-    return Expr(:call, :*, scale, Expr(:call, :.*, gathered, Z))
-end
-
-# One varying draws block's direct `r` summand, SB-literal (same math
-# and association order as the bucket arm — no `b` node, the draws stay
-# implicit). Correlated draws take the K² implicit-draws arm below
-# (this slice's columns only).
+# One varying draws block's direct `r` summand, SB-literal (SB's K=1
+# intercept/slope math and association order — no `b` node, the draws
+# stay implicit): intercept `exp(log_scale) * xi[idx]`, slope
+# `tau * (xi[idx] .* Z)`. Correlated draws take the K² implicit-draws
+# arm below (this slice's columns only).
 function _varying_effect_expr(plan::StructuralPlan, pred::PredictorSpec,
         t::TermSpec)
     d, s = _slice_draws(plan, pred, t)
@@ -548,44 +484,6 @@ function _varying_corr_effect_expr(plan::StructuralPlan, d::VaryingDraws,
             push!(parts, sj)
         else
             push!(parts, :($(_varying_z_expr(m.z)) .* $sj))
-        end
-    end
-    return foldl((a, c) -> :($a .+ $c), parts)
-end
-
-# One correlated bucket's direct `r` summand for one predictor slice
-# (SB `rows_dot_product(Z, b[idx,cols])` with the draws implicit — the
-# Stage-B no-`b`-node precedent): per slice margin j,
-# `Z_j .* sum_s (tau[j]*L[j,s]) .* z_flat[s + (gidx-1)*K]` over
-# `s in 1:j` (L lower-triangular — the `s > j` terms are structural
-# zeros, never emitted). `:ones` Z drops the factor (multiply by 1).
-# K, the slice range, and the `s` bound are all static; tau reads are
-# scalar refs (the coefficient-block precedent) and L reads the named
-# `_ppl_rl_` scalars from the layout edges.
-function _ranef_corr_gather_expr(plan::StructuralPlan, pred::PredictorSpec,
-        b::RanefBucket)
-    si = findfirst(s -> s[1] === pred.name, b.slices)
-    si === nothing && throw(ContractValidationError(
-        "[generator] internal: gather of bucket $((b.id, b.group)) in " *
-        "predictor $(pred.name) has no slice (validate_plan proves this)"))
-    cols = b.slices[si][2]
-    K = length(b.margins)
-    L, tau, z = _ranef_corr_names(b)
-    gidx = Symbol(:_ppl_gidx_, b.group)
-    parts = Any[]
-    for j in cols
-        m = b.margins[j]
-        inner = Any[]
-        for s in 1:j
-            A = :($(Expr(:ref, tau, j)) * $(_rl_name(L, j, s)))
-            idx = :($s .+ ($gidx .- 1) .* $K)
-            push!(inner, :($A .* $(Expr(:ref, z, idx))))
-        end
-        sj = foldl((a, c) -> :($a .+ $c), inner)
-        if m.z.kind === :ones
-            push!(parts, sj)
-        else
-            push!(parts, :($(_ranef_z_expr(m.z)) .* $sj))
         end
     end
     return foldl((a, c) -> :($a .+ $c), parts)
@@ -1544,36 +1442,14 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         _vector_prior_stmts!(stmts, terms, v.name, v.family, v.args,
             v.support_override)
     end
-    # Ranef buckets. K=1 (Stage B, SB `ranef_intercept`/`ranef_slope`):
-    # the scalar scale prior plus the standardized `xi` plate (shared
-    # vector-prior helper). Correlated (Stage C, SB
-    # `ranef_correlated_draws`): the LKJ node plus the `tau`/`z_flat`
-    # plates (shared vector-prior helper). `tau` emits WITHOUT the thin
-    # layer's `+log(2)` half renormalizer in both: SB's
-    # `std_normal(; lower=0)` is Stan lower-bound kernel semantics (exp
-    # Jacobian only, no truncation normalizer). User-facing `HalfNormal`
-    # priors keep the proper-half convention; bucket-internal `tau`
-    # follows SB.
-    for b in plan.ranef_buckets
-        if b.kind === :correlated
-            L, tau, z = _ranef_corr_names(b)
-            lnode = Symbol(:_ppl_prior_, L)
-            push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(b))))
-            push!(terms, lnode)
-            _vector_prior_stmts!(stmts, terms, tau, :normal,
-                (arg1 = 0, arg2 = 1), nothing)
-            _vector_prior_stmts!(stmts, terms, z, :normal,
-                (arg1 = 0, arg2 = 1), nothing)
-            continue
-        end
-        scale, xi = _ranef_k1_names(b)
-        snode = Symbol(:_ppl_prior_, scale)
-        scell = _family_logpdf_expr(:normal, Any[0, 1], scale)
-        push!(stmts, :($snode::Float64 = $scell))
-        push!(terms, snode)
-        _vector_prior_stmts!(stmts, terms, xi, :normal, (arg1 = 0, arg2 = 1),
-            nothing)
-    end
+    # Varying draws. K=1: the scalar scale prior plus the
+    # standardized `xi` plate (shared vector-prior helper). Correlated:
+    # the LKJ node plus the `tau`/`z_flat` plates (shared vector-prior
+    # helper). `tau` emits WITHOUT the thin layer's `+log(2)` half
+    # renormalizer in both: SB's `std_normal(; lower=0)` is Stan
+    # lower-bound kernel semantics (exp Jacobian only, no truncation
+    # normalizer). User-facing `HalfNormal` priors keep the
+    # proper-half convention; draws-internal `tau` follows SB.
     for d in plan.varying_draws
         if d.kind === :correlated
             L, tau, z = _varying_corr_names(d)
@@ -1599,7 +1475,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     # standardized `beta_raw` plate (shared vector-prior helper). The
     # floored rhos emit WITHOUT a truncation normalizer: SB's
     # `lognormal(0,1; lower=rho_lower)` is Stan lower-bound kernel
-    # semantics (offset-exp Jacobian only — the ranef-`tau` precedent).
+    # semantics (offset-exp Jacobian only — the varying-`tau` precedent).
     for hb in plan.hsgp_bases
         names = _hsgp_names(hb)
         for rho in names.rhos
@@ -1650,12 +1526,6 @@ function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64)
         end
     end
     return foldl((a, c) -> :($a + $c), terms)
-end
-
-# One correlated bucket's LKJ prior node (names/sizes from the bucket).
-function _lkj_prior_expr(b::RanefBucket)
-    return _lkj_prior_terms(_ranef_corr_names(b)[1], length(b.margins),
-        b.lkj_eta)
 end
 
 # One correlated draws block's LKJ prior node (names/sizes from the draws).

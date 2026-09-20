@@ -52,14 +52,14 @@ end
 
 """One packed slice: a coefficient block, a scalar latent, a scan vector
 latent, a per-cell latent block, a leveled vector latent (cutpoints,
-thresholds, simplex), a spline coefficient-vector block, a ranef vector
-block (K=1 `xi`, correlated `tau`/`z_flat`), a correlated-ranef LKJ
+thresholds, simplex), a spline coefficient-vector block, a varying
+vector block (K=1 `xi`, correlated `tau`/`z_flat`), a varying LKJ
 Cholesky factor, a joint-outcomes LKJ Cholesky factor, or an HSGP
 coefficient-vector block (`beta_raw`). `lo` is the constrained lower
 bound of an `:interval`/`:floored` transform (`:interval` also sets
 `hi`; `NaN` otherwise)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :ranef | :ranef_corr | :varying | :varying_corr | :cholesky_corr | :hsgp
+    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :varying | :varying_corr | :cholesky_corr | :hsgp
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
@@ -125,8 +125,8 @@ function assign_layout(plan::StructuralPlan)
             "monotonic term)"))
         # A joint-outcomes LKJ Cholesky factor packs K(K−1)/2 thetas under
         # its own kind (K=1 packs zero, constraining to `[1.0]` — the
-        # ranef `:ranef_corr` shape with no tau/z_flat siblings and no
-        # derived draws, so it needs its own kind, not a shared one).
+        # varying `:varying_corr` shape with no tau/z_flat siblings and
+        # no derived draws, so it needs its own kind, not a shared one).
         if p.family === :cholesky_corr_lkj
             K = p.size
             packed = K * (K - 1) ÷ 2
@@ -161,52 +161,16 @@ function assign_layout(plan::StructuralPlan)
                 transform, lo, hi))
         offset += v.width
     end
-    # Ranef buckets in plan order. K=1 (Stage B): the scalar scale
-    # (`:sampled`, real for `log_scale`, exp for `tau` — the exp
-    # Jacobian is Stan's lower-bound kernel term, no renormalizer)
-    # plus the standardized G-vector `xi` (`:ranef`, plate-shaped
-    # identity block; G from declared levels). Correlated (Stage C, SB
-    # declaration order L/tau/z): the LKJ Cholesky factor (`:ranef_corr`
-    # packing K*(K-1)/2 thetas — K=1 packs zero and constrains to
-    # `[1.0]`), the marginal-scale K-vector `tau` (`:ranef` with `:exp`
-    # — the same Stan kernel semantics as the Stage-B scalar), and the
-    # standardized `z_flat` (`:ranef` identity, K*G column-major).
-    for b in plan.ranef_buckets
-        if b.kind === :correlated
-            K = length(b.margins)
-            L, tau, z = _ranef_corr_names(b)
-            P = K * (K - 1) ÷ 2
-            labels = [Symbol(string(L) * "." * string(i)) for i in 1:P]
-            push!(entries,
-                LayoutEntry(:ranef_corr, nothing, L, labels, offset, P,
-                    :lkj))
-            offset += P
-            push!(entries,
-                LayoutEntry(:ranef, nothing, tau, [tau], offset, K,
-                    :exp))
-            offset += K
-            G = _bucket_nlevels(b)
-            push!(entries,
-                LayoutEntry(:ranef, nothing, z, [z], offset, K * G,
-                    :identity))
-            offset += K * G
-            continue
-        end
-        scale, xi = _ranef_k1_names(b)
-        transform = b.kind === :intercept1 ? :identity : :exp
-        push!(entries,
-            LayoutEntry(:sampled, nothing, scale, [scale], offset, 1,
-                transform))
-        offset += 1
-        G = _bucket_nlevels(b)
-        push!(entries,
-            LayoutEntry(:ranef, nothing, xi, [xi], offset, G, :identity))
-        offset += G
-    end
-    # Varying draws in plan order: identical entry shapes to buckets
-    # (`:sampled` scalar scale plus `:varying` xi vector for K=1;
-    # `:varying_corr` LKJ factor plus `:varying` tau/z vectors for
-    # correlated).
+    # Varying draws in plan order. K=1: the scalar scale (`:sampled`,
+    # real for `log_scale`, exp for `tau` — the exp Jacobian is Stan's
+    # lower-bound kernel term, no renormalizer) plus the standardized
+    # G-vector `xi` (`:varying`, plate-shaped identity block; G from
+    # declared levels). Correlated (SB declaration order L/tau/z): the
+    # LKJ Cholesky factor (`:varying_corr` packing K*(K-1)/2 thetas —
+    # K=1 packs zero and constrains to `[1.0]`), the marginal-scale
+    # K-vector `tau` (`:varying` with `:exp` — the same Stan kernel
+    # semantics as the K=1 scalar), and the standardized `z_flat`
+    # (`:varying` identity, K*G column-major).
     for d in plan.varying_draws
         if d.kind === :correlated
             K = length(d.margins)
@@ -577,15 +541,14 @@ function coordinate_names(layout::LayoutTable)
             for label in e.labels
                 push!(names, Symbol(string(e.predictor) * "." * string(label)))
             end
-        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef ||
+        elseif e.kind === :plate || e.kind === :spline ||
                e.kind === :varying || e.kind === :hsgp
             for i in 1:e.size
                 push!(names, Symbol(string(e.name) * "." * string(i)))
             end
         elseif e.kind === :vector
             append!(names, e.labels)
-        elseif e.kind === :ranef_corr || e.kind === :varying_corr ||
-               e.kind === :cholesky_corr
+        elseif e.kind === :varying_corr || e.kind === :cholesky_corr
             append!(names, e.labels)
         elseif e.kind === :scan
             for label in e.labels
@@ -602,7 +565,7 @@ end
     constrain(layout, unconstrained) -> NamedTuple
 
 Host-side constrain: packed vector → `(predictor => Vector, param => scalar,
-…)`. A correlated-ranef bucket contributes its Cholesky factor `L` (K×K),
+…)`. A correlated varying draw contributes its Cholesky factor `L` (K×K),
 its scale vector `tau`, its standardized draws `z_flat`, plus the DERIVED
 correlated draws `b_<suffix>` (G×K, SB `(diag_pre_multiply(tau,L)*z)'`
 — output mapping, ignored by [`unconstrain`](@ref)). For testing,
@@ -617,7 +580,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :coefficient
             push!(pairs, e.predictor => Vector{Float64}(seg))
-        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef ||
+        elseif e.kind === :plate || e.kind === :spline ||
                e.kind === :varying || e.kind === :hsgp
             v = [_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name => v)
@@ -625,11 +588,10 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, e.name => Vector{Float64}(seg))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
-        elseif e.kind === :ranef_corr || e.kind === :varying_corr ||
-               e.kind === :cholesky_corr
+        elseif e.kind === :varying_corr || e.kind === :cholesky_corr
             # Both LKJ-factor kinds share the host hyperspherical edges
-            # (name/size-keyed — kind-agnostic); only `:ranef_corr` grows
-            # the derived `b_` draws below.
+            # (name/size-keyed — kind-agnostic); only `:varying_corr`
+            # grows the derived `b_` draws below.
             push!(pairs, e.name =>
                 lkj_chol_constrain(Vector{Float64}(seg), _lkj_dim(e.size)))
         else
@@ -637,48 +599,18 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, e.name => v)
         end
     end
-    for (bname, b) in _ranef_corr_draws(layout, u)
-        push!(pairs, bname => b)
-    end
     for (bname, b) in _varying_corr_draws(layout, u)
         push!(pairs, bname => b)
     end
     return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
 end
 
-# Derived correlated draws per `:ranef_corr` entry: `b_<suffix>` (G×K),
-# SB `(diag_pre_multiply(tau,L)*z)'` with `z_flat` in SB column-major
-# order. Sibling entries are found by the canonical `_ranef_corr_names`
-# spelling (`L_<s>` → `tau_<s>` / `z_flat_<s>`), never by adjacency,
-# so entry-order changes cannot miswire it.
-function _ranef_corr_draws(layout::LayoutTable, u::AbstractVector{<:Real})
-    out = Pair{Symbol,Matrix{Float64}}[]
-    byname = Dict{Symbol,LayoutEntry}(e.name => e for e in layout.entries)
-    for e in layout.entries
-        e.kind === :ranef_corr || continue
-        sfx = string(e.name)[3:end]
-        tau_e = get(byname, Symbol("tau_", sfx), nothing)
-        z_e = get(byname, Symbol("z_flat_", sfx), nothing)
-        (tau_e === nothing || z_e === nothing) && throw(ContractValidationError(
-            "[layout] LKJ entry $(e.name) has no tau/z_flat siblings " *
-            "(assign_layout always emits the triple)"))
-        K = _lkj_dim(e.size)
-        tau = [_constrain_elt(tau_e, Float64(x)) for x in
-            u[tau_e.offset:(tau_e.offset + tau_e.size - 1)]]
-        zf = [Float64(x) for x in u[z_e.offset:(z_e.offset + z_e.size - 1)]]
-        length(zf) == K * (length(zf) ÷ K) || throw(ContractValidationError(
-            "[layout] z_flat length $(length(zf)) is not a multiple of K=$K"))
-        G = length(zf) ÷ K
-        L = lkj_chol_constrain(
-            Vector{Float64}(u[e.offset:(e.offset + e.size - 1)]), K)
-        zmat = reshape(zf, K, G)
-        push!(out, Symbol("b_", sfx) => Matrix((Diagonal(tau) * L * zmat)'))
-    end
-    return out
-end
-
-# Derived correlated draws per `:varying_corr` entry: identical
-# construction to the bucket arm (SB `(diag_pre_multiply(tau,L)*z)'`).
+# Derived correlated draws per `:varying_corr` entry: `b_<suffix>`
+# (G×K), SB `(diag_pre_multiply(tau,L)*z)'` with `z_flat` in SB
+# column-major order. Sibling entries are found by the canonical
+# `_varying_corr_names` spelling (`L_<s>` → `tau_<s>` /
+# `z_flat_<s>`), never by adjacency, so entry-order changes cannot
+# miswire it.
 function _varying_corr_draws(layout::LayoutTable, u::AbstractVector{<:Real})
     out = Pair{Symbol,Matrix{Float64}}[]
     byname = Dict{Symbol,LayoutEntry}(e.name => e for e in layout.entries)
@@ -722,11 +654,10 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] predictor $(e.predictor) length mismatch"),
             )
             u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
-        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef ||
+        elseif e.kind === :plate || e.kind === :spline ||
                e.kind === :varying || e.kind === :hsgp
             what = e.kind === :plate ? "plate parameter" :
                 e.kind === :spline ? "spline vector" :
-                e.kind === :ranef ? "ranef vector" :
                 e.kind === :varying ? "varying vector" : "hsgp vector"
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing $what $(e.name)"),
@@ -757,8 +688,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] vector parameter $(e.name) length mismatch"),
             )
             u[e.offset:(e.offset + e.size - 1)] .= _vector_unconstrain(e, v)
-        elseif e.kind === :ranef_corr || e.kind === :varying_corr ||
-               e.kind === :cholesky_corr
+        elseif e.kind === :varying_corr || e.kind === :cholesky_corr
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing LKJ factor $(e.name)"),
             )
@@ -799,8 +729,7 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             total += _vector_logjac(e, seg)
             continue
         end
-        if e.kind === :ranef_corr || e.kind === :varying_corr ||
-                e.kind === :cholesky_corr
+        if e.kind === :varying_corr || e.kind === :cholesky_corr
             # LKJ thetas couple through the hyperspherical rows —
             # entry-level, never per-coordinate.
             total += lkj_chol_logjac(Vector{Float64}(seg), _lkj_dim(e.size))
@@ -904,24 +833,22 @@ function transform_statements(e::LayoutEntry)
         return Expr[:($(e.name)::AbstractVector{Float64} =
             view(unconstrained, $lo:$hi))]
     end
-    if e.kind === :plate || e.kind === :spline || e.kind === :ranef ||
+    if e.kind === :plate || e.kind === :spline ||
        e.kind === :varying || e.kind === :hsgp
         # Spline vectors ride the plate transform path (block + scalar
         # endpoints); the contract pins their supports to real/positive,
-        # so the :interval arm below is unreachable for them. Ranef and
-        # varying vectors ride it too (`xi`/`z_flat` identity, `tau`
-        # exp), as do HSGP coefficient vectors (`beta_raw`, identity
-        # only).
+        # so the :interval arm below is unreachable for them. Varying
+        # vectors ride it too (`xi`/`z_flat` identity, `tau` exp), as
+        # do HSGP coefficient vectors (`beta_raw`, identity only).
         return _plate_transform_statements(e)
     end
     if e.kind === :vector
         return _vector_transform_statements(e)
     end
-    if e.kind === :ranef_corr || e.kind === :varying_corr ||
-            e.kind === :cholesky_corr
+    if e.kind === :varying_corr || e.kind === :cholesky_corr
         # Both LKJ-factor kinds share the scalar-unrolled hyperspherical
         # twin (name/size-keyed `_ppl_rl_` temps — kind-agnostic).
-        return _ranef_corr_transform_statements(e)
+        return _lkj_corr_transform_statements(e)
     end
     o = e.offset
     coord = coordinate_read(o)
@@ -1072,9 +999,9 @@ function _vector_transform_statements(e::LayoutEntry)
     return stmts
 end
 
-# Constrained Cholesky entries / logistic-sigma + theta temps for a
-# `:ranef_corr` entry: `_ppl_rl_<L>_<i>_<j>` (lower triangle incl.
-# diagonal; downstream gather/prior cells read these scalars directly),
+# Constrained Cholesky entries / logistic-sigma + theta temps for an
+# LKJ-factor entry: `_ppl_rl_<L>_<i>_<j>` (lower triangle incl.
+# diagonal; downstream effect/prior cells read these scalars directly),
 # `_ppl_rsg_<L>_<i>_<j>` (sigma(u)), `_ppl_rth_<L>_<i>_<j>` (theta).
 # All `_ppl_`-hygienic.
 _rl_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rl_, L, :_, i, :_, j)
@@ -1085,10 +1012,10 @@ _rth_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rth_, L, :_, i, :_, j)
 # `lkj_chol_constrain` (IDENTICAL scalar ops in the IDENTICAL order —
 # left-assoc products, `pi`/`log(pi)` precomputed host-side literals —
 # so in-graph and host agree bit-for-bit). No matrix ever
-# materializes: the gather reads the `_ppl_rl_` scalars directly
+# materializes: the effect reads the `_ppl_rl_` scalars directly
 # (fully transparent to the planner and the reverse pass — no new
 # Enzyme surface). K=1 emits its constant `[1.0]` edge only.
-function _ranef_corr_transform_statements(e::LayoutEntry)
+function _lkj_corr_transform_statements(e::LayoutEntry)
     K = _lkj_dim(e.size)
     L = e.name
     stmts = Expr[:($(_rl_name(L, 1, 1))::Float64 = 1.0)]
@@ -1138,8 +1065,7 @@ function jacobian_term(e::LayoutEntry)
     if e.kind === :coefficient
         throw(ContractValidationError("[layout] non-identity coefficient block"))
     end
-    if e.kind === :ranef_corr || e.kind === :varying_corr ||
-            e.kind === :cholesky_corr
+    if e.kind === :varying_corr || e.kind === :cholesky_corr
         K = _lkj_dim(e.size)
         K == 1 && return nothing
         L = e.name
@@ -1172,14 +1098,14 @@ function jacobian_term(e::LayoutEntry)
             log1p(-$(_vector_z(e, j)))) for j in 1:e.size]
         return foldl((a, b) -> :($a + $b), terms)
     end
-    if e.kind === :plate || e.kind === :spline || e.kind === :ranef ||
+    if e.kind === :plate || e.kind === :spline ||
        e.kind === :varying || e.kind === :hsgp
         # Interval plates hand-roll the per-cell Jacobian sum (parameterized
         # bounds, no companion `logjac` plate); every registry transform sums
         # its companion `logjac` plate from `_plate_transform_statements`.
         # Spline vectors share the shape (their supports never reach
         # :interval, but the arm stays correct if that ever changes), as do
-        # ranef vectors (`xi`/`z_flat` identity, `tau` exp) and hsgp
+        # varying vectors (`xi`/`z_flat` identity, `tau` exp) and hsgp
         # vectors (`beta_raw` identity). Anything else is loud (a companion
         # plate that was never emitted must never sum silently).
         if e.transform === :interval

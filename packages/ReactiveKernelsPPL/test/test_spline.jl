@@ -33,7 +33,8 @@ function _swith(plan::StructuralPlan; predictors = nothing, bases = nothing,
         plan.assignments, plan.columns, plan.n_obs; roles = plan.roles,
         derived = plan.derived, levelmaps = plan.levelmaps,
         plate_parameters = plan.plate_parameters, scans = plan.scans,
-        ranef_buckets = plan.ranef_buckets,
+        varying_draws = plan.varying_draws,
+        varying_slices = plan.varying_slices,
         spline_bases = bases === nothing ? plan.spline_bases : bases,
         spline_vectors = vectors === nothing ? plan.spline_vectors : vectors)
 end

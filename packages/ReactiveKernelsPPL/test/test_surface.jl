@@ -34,7 +34,8 @@ _plans_equal(a::StructuralPlan, b::StructuralPlan) =
     length(a.plate_parameters) == length(b.plate_parameters) &&
     all(_pparams_equal.(a.plate_parameters, b.plate_parameters)) &&
     a.columns == b.columns && a.n_obs === b.n_obs && a.roles == b.roles &&
-    _buckets_equal(a.ranef_buckets, b.ranef_buckets)
+    _draws_equal(a.varying_draws, b.varying_draws) &&
+    _slices_equal(a.varying_slices, b.varying_slices)
 
 _pparams_equal(a::PlateParameter, b::PlateParameter) =
     a.name === b.name && a.family === b.family &&
@@ -43,23 +44,28 @@ _pparams_equal(a::PlateParameter, b::PlateParameter) =
     a.support_override === b.support_override && a.range == b.range &&
     a.label === b.label
 
-_buckets_equal(a::Vector{RanefBucket}, b::Vector{RanefBucket}) =
-    length(a) == length(b) && all(_bucket_equal.(a, b))
+_draws_equal(a::Vector{VaryingDraws}, b::Vector{VaryingDraws}) =
+    length(a) == length(b) && all(_draw_equal.(a, b))
 
-_bucket_equal(a::RanefBucket, b::RanefBucket) =
-    a.id === b.id && a.group === b.group && a.kind === b.kind &&
-    _margins_equal(a.margins, b.margins) && a.slices == b.slices &&
+_draw_equal(a::VaryingDraws, b::VaryingDraws) =
+    a.group === b.group && a.kind === b.kind &&
+    _vmargins_equal(a.margins, b.margins) &&
     (a.lkj_eta == b.lkj_eta || (isnan(a.lkj_eta) && isnan(b.lkj_eta))) &&
-    a.label === b.label
+    a.label === b.label && a.suffix == b.suffix
 
-_margins_equal(a::Vector{RanefMargin}, b::Vector{RanefMargin}) =
-    length(a) == length(b) && all(_margin_equal.(a, b))
+_slices_equal(a::Vector{VaryingSlice}, b::Vector{VaryingSlice}) =
+    length(a) == length(b) && all(_slice_equal.(a, b))
 
-_margin_equal(a::RanefMargin, b::RanefMargin) =
-    a.predictor === b.predictor && a.coefficient === b.coefficient &&
-    _recipe_equal(a.z, b.z)
+_slice_equal(a::VaryingSlice, b::VaryingSlice) =
+    a.draws === b.draws && a.columns == b.columns && a.target === b.target
 
-_recipe_equal(a::RanefZRecipe, b::RanefZRecipe) =
+_vmargins_equal(a::Vector{VaryingMargin}, b::Vector{VaryingMargin}) =
+    length(a) == length(b) && all(_vmargin_equal.(a, b))
+
+_vmargin_equal(a::VaryingMargin, b::VaryingMargin) =
+    a.coefficient === b.coefficient && _vrecipe_equal(a.z, b.z)
+
+_vrecipe_equal(a::VaryingZRecipe, b::VaryingZRecipe) =
     a.kind === b.kind && a.column === b.column && a.level == b.level
 
 _maps_equal(a::LevelMap, b::LevelMap) =
@@ -1361,11 +1367,9 @@ end
     # Other coefficient-free shapes stay fail-closed (message pinned).
     err = try
         lower_rkppl(quote
-                mu = ranef(g)
+                r ~ varying_effect(g, [1])
+                mu = r
                 y .~ Normal.(mu, 1.0)
-                ranef_bucket(g) do
-                    mu => [1]
-                end
             end, (:y, :g))
         nothing
     catch e

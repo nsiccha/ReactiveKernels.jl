@@ -33,7 +33,8 @@ function _hwith(plan::StructuralPlan; predictors = nothing, bases = nothing)
         plan.columns, plan.n_obs; roles = plan.roles,
         derived = plan.derived, levelmaps = plan.levelmaps,
         plate_parameters = plan.plate_parameters, scans = plan.scans,
-        ranef_buckets = plan.ranef_buckets,
+        varying_draws = plan.varying_draws,
+        varying_slices = plan.varying_slices,
         spline_bases = plan.spline_bases,
         spline_vectors = plan.spline_vectors,
         hsgp_bases = bases === nothing ? plan.hsgp_bases : bases)
