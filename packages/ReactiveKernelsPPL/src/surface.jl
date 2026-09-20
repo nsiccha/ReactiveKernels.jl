@@ -42,11 +42,15 @@ _sfail(msg) = throw(SurfaceLoweringError(msg))
 A captured `@rkppl` block (AST with call-site line numbers), not yet
 lowered. Call it with data keywords to lower and bind:
 `model(; y, x, g)::StructuralPlan` (bound). Mirrors StanBlocks `SlicModel`.
+`fixed` carries `Base.merge` NamedTuple fixes (name => data column); explicit
+call kwargs win over it.
 """
 struct RKPPLModel
     ast::Expr
     mod::Module
+    fixed::Dict{Symbol,AbstractVector}
 end
+RKPPLModel(ast, mod) = RKPPLModel(ast, mod, Dict{Symbol,AbstractVector}())
 
 """
     RKPPLSubmodel(name, argnames, body, mod)
@@ -119,6 +123,9 @@ end
 
 function (m::RKPPLModel)(; kwargs...)
     cols = Dict{Symbol,AbstractVector}()
+    for (k, v) in m.fixed
+        cols[k] = v
+    end
     for (k, v) in kwargs
         cols[k] = _check_col(k, v)
     end
@@ -148,6 +155,166 @@ _check_col(k, v) = v isa AbstractVector ? v :
 function _bind_model(m::RKPPLModel, cols::Dict{Symbol,AbstractVector})
     plan = lower_rkppl(m.ast, keys(cols); mod = m.mod)
     return bind_data(plan, cols)
+end
+
+# ── Model merge (StanBlocks-style program composition) ─────────────────────
+# `Base.merge(m, override)` splices override statements into a copy of the
+# base model's captured block AST, keyed on the bare LHS name — the
+# RK-submodel analogue of StanBlocks `Base.merge` (stanblocks-use §2).
+# Syntactic only: every semantic gate (roles, shapes, vocabulary) stays in
+# `lower_rkppl`, so a merged model lowers through the one pipeline and a
+# spliced statement automatically keeps the base's structural role (the RK
+# analogue of SB declaration inheritance — re-derived, never carried).
+
+"""
+    Base.merge(m::RKPPLModel, override::Expr) -> RKPPLModel
+    Base.merge(m::RKPPLModel, fix::NamedTuple) -> RKPPLModel
+    Base.merge(m::RKPPLModel, parts...) -> RKPPLModel
+
+Compose model programs over shared submodel blocks (StanBlocks `Base.merge`
+analogue). Each form returns a NEW model; the base (AST and fixed dict) is
+unchanged.
+
+Statement splice: `override` is one `~` / `.~` / `name = ...` statement or a
+`quote ... end` block of them. An override whose bare LHS names a base
+top-level statement replaces it in place; a fresh LHS appends (completing an
+incomplete base). A submodel use-site is a statement, so merge rewrites which
+shared block a program calls (`y ~ stream_a(...)` to `y ~ stream_b(...)`)
+without forking the shared def. Multi-part calls fold left, so fix-vs-splice
+conflicts resolve to the LATER part (write the fix last).
+
+NamedTuple fix: each `name = value` removes the matching base statement and
+stores `value` (an `AbstractVector`) as model data, bound at the call —
+explicit call kwargs win over it (SB easily-rebound data).
+
+Fail-closed: non-statement overrides, non-bare LHS, duplicate base LHS,
+fixes naming no statement, and non-vector fix values throw
+`SurfaceLoweringError`. Ranged / levels / joint LHS (`y[R]`,
+`c[levels(g)]`, `[y1, y2]`) are unmatchable (indexed overrides deferred);
+`@plate` / `@scan` cells are invisible to the top-level matcher, so a
+colliding append fails at lowering through the single-assignment gate.
+"""
+function Base.merge(m::RKPPLModel, override::Expr)
+    out = Any[a for a in m.ast.args]
+    idx, dups, blocked = _merge_base_index(out)
+    for raw in _merge_override_stmts(override)
+        st = _merge_unwrap_override(raw)
+        lhs = _merge_override_lhs(st)
+        lhs in dups && _sfail("merge override `$lhs` matches more than " *
+                              "one base-model statement (the base is " *
+                              "broken — lowering would reject it)")
+        lhs in blocked && _sfail("merge override `$lhs` names a ranged, " *
+                                 "levels, or joint LHS (indexed overrides " *
+                                 "are a deferred slice)")
+        if haskey(idx, lhs)
+            out[idx[lhs]] = raw
+        else
+            push!(out, raw)
+        end
+    end
+    return RKPPLModel(Expr(:block, out...), m.mod, copy(m.fixed))
+end
+
+function Base.merge(m::RKPPLModel, fix::NamedTuple)
+    isempty(fix) && _sfail("merge with an empty NamedTuple fixes nothing")
+    out = Any[a for a in m.ast.args]
+    idx, dups, blocked = _merge_base_index(out)
+    new_fixed = copy(m.fixed)
+    drop = Set{Int}()
+    for (nm, val) in pairs(fix)
+        nm in dups && _sfail("merge fix `$nm` matches more than one " *
+                             "base-model statement (the base is broken — " *
+                             "lowering would reject it)")
+        nm in blocked && _sfail("merge fix `$nm` names a ranged, levels, " *
+                                "or joint LHS (indexed overrides are a " *
+                                "deferred slice)")
+        haskey(idx, nm) || _sfail("merge fix `$nm` matches no base-model " *
+                                  "statement (a fixed name must name a " *
+                                  "`~` / `.~` / `=` statement to remove)")
+        val isa AbstractVector || _sfail("merge fix `$nm` must be an " *
+            "AbstractVector (data-backed; got $(typeof(val)))")
+        push!(drop, idx[nm])
+        new_fixed[nm] = val
+    end
+    kept = Any[a for (i, a) in enumerate(out) if i ∉ drop]
+    return RKPPLModel(Expr(:block, kept...), m.mod, new_fixed)
+end
+
+function Base.merge(m::RKPPLModel, first, rest...)
+    if isempty(rest)
+        _sfail("merge takes a quoted statement/block or a NamedTuple of " *
+               "fixed values, got $(repr(first))")
+    end
+    out = Base.merge(m, first)
+    for part in rest
+        out = Base.merge(out, part)
+    end
+    return out
+end
+
+# Index base top-level statements by bare LHS name: `idx` (name => position),
+# `dups` (broken-base duplicates), `blocked` (ref stems / joint outcomes —
+# indexed overrides deferred). Plate/scan blocks and unparseable statements
+# are invisible (lowering owns their gates).
+function _merge_base_index(args)
+    idx = Dict{Symbol,Int}()
+    dups = Set{Symbol}()
+    blocked = Set{Symbol}()
+    for (i, arg) in pairs(args)
+        arg isa Expr || continue
+        st = try
+            _unwrap_trivia(arg)
+        catch
+            continue
+        end
+        if _is_sample(st) || _is_broadcast_sample(st)
+            _merge_index_lhs!(idx, dups, blocked, st.args[2], i)
+        elseif st.head === :(=) && length(st.args) == 2 &&
+                st.args[1] isa Symbol
+            _merge_claim!(idx, dups, st.args[1], i)
+        end
+    end
+    return idx, dups, blocked
+end
+
+_merge_claim!(idx::Dict{Symbol,Int}, dups::Set{Symbol}, nm::Symbol, i::Int) =
+    haskey(idx, nm) ? push!(dups, nm) : (idx[nm] = i)
+
+function _merge_index_lhs!(idx, dups, blocked, lhs, i::Int)
+    lhs isa Symbol && return _merge_claim!(idx, dups, lhs, i)
+    lhs isa Expr || return nothing
+    if lhs.head === :ref && !isempty(lhs.args) && lhs.args[1] isa Symbol
+        push!(blocked, lhs.args[1])
+    elseif lhs.head === :vect
+        for o in lhs.args
+            o isa Symbol && push!(blocked, o)
+        end
+    end
+    return nothing
+end
+
+function _merge_override_stmts(override::Expr)
+    override.head === :block || return Any[override]
+    return Any[a for a in override.args if !(a isa LineNumberNode)]
+end
+
+function _merge_unwrap_override(raw)
+    raw isa Expr || _sfail("merge override must be a `~`, `.~` or " *
+                           "`name = ...` statement, got $(repr(raw))")
+    try
+        return _unwrap_trivia(raw)
+    catch
+        _sfail("merge override $(repr(raw)) is not a splicing statement")
+    end
+end
+
+function _merge_override_lhs(st::Expr)
+    ok = ((_is_sample(st) || _is_broadcast_sample(st)) &&
+        st.args[2] isa Symbol) ||
+        (st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol)
+    ok || _sfail("merge override must be a `~`, `.~` or `name = ...` " *
+                 "statement with a bare Symbol LHS, got $(repr(st))")
+    return _stmt_lhs(st)::Symbol
 end
 
 """
