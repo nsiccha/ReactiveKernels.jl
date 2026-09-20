@@ -40,7 +40,7 @@ Analyze one predictor's terms against raw columns. Factor blocks read
 their levels from `levelmaps` (keyed by predictor name + column);
 columns stay the source for continuous/offset terms.
 """
-function design_shape(pred::PredictorSpec, columns::Dict{Symbol,AbstractVector};
+function design_shape(pred::PredictorSpec, columns::AbstractDict{Symbol};
         levelmaps::Vector{LevelMap} = LevelMap[])
     blocks = DesignBlock[]
     for t in pred.terms
@@ -178,7 +178,7 @@ contrast is parameter-derived, so no data variance exists (no SB
 precedent in the flat mirror).
 """
 function r2d2_column_scales(shape::DesignShape,
-        columns::Dict{Symbol,AbstractVector},
+        columns::AbstractDict{Symbol},
         overrides::Dict{Symbol,Tuple{Float64,Float64}})
     share = Int[]
     fallback = Float64[]
@@ -223,7 +223,7 @@ function r2d2_column_scales(shape::DesignShape,
     return (share, fallback, loc, varx)
 end
 
-function _r2d2_block_variances(b::DesignBlock, columns::Dict{Symbol,AbstractVector})
+function _r2d2_block_variances(b::DesignBlock, columns::AbstractDict{Symbol})
     if b.kind === FactorTerm
         col = columns[b.column]
         n = length(col)

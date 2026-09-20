@@ -48,9 +48,9 @@ call kwargs win over it.
 struct RKPPLModel
     ast::Expr
     mod::Module
-    fixed::Dict{Symbol,AbstractVector}
+    fixed::Dict{Symbol,ColumnData}
 end
-RKPPLModel(ast, mod) = RKPPLModel(ast, mod, Dict{Symbol,AbstractVector}())
+RKPPLModel(ast, mod) = RKPPLModel(ast, mod, Dict{Symbol,ColumnData}())
 
 """
     RKPPLSubmodel(name, argnames, body, mod)
@@ -128,7 +128,7 @@ macro rkppl(data, body)
 end
 
 function (m::RKPPLModel)(; kwargs...)
-    cols = Dict{Symbol,AbstractVector}()
+    cols = Dict{Symbol,ColumnData}()
     for (k, v) in m.fixed
         cols[k] = v
     end
@@ -140,9 +140,9 @@ end
 
 function _bind_immediate(m::RKPPLModel, data)
     cols = if data isa NamedTuple
-        Dict{Symbol,AbstractVector}(k => _check_col(k, v) for (k, v) in pairs(data))
+        Dict{Symbol,ColumnData}(k => _check_col(k, v) for (k, v) in pairs(data))
     elseif data isa AbstractDict
-        Dict{Symbol,AbstractVector}(
+        Dict{Symbol,ColumnData}(
             _dict_key(k) => _check_col(k, v) for (k, v) in data)
     else
         _sfail("@rkppl data must be a NamedTuple or dict of columns, " *
@@ -155,10 +155,10 @@ _dict_key(k::Symbol) = k
 _dict_key(k::AbstractString) = Symbol(k)
 _dict_key(k) = _sfail("data column keys must be Symbols, got $(repr(k))")
 
-_check_col(k, v) = v isa AbstractVector ? v :
-    _sfail("data column $k must be an AbstractVector, got $(typeof(v))")
+_check_col(k, v) = v isa ColumnData ? v :
+    _sfail("data column $k must be a vector or matrix, got $(typeof(v))")
 
-function _bind_model(m::RKPPLModel, cols::Dict{Symbol,AbstractVector})
+function _bind_model(m::RKPPLModel, cols::Dict{Symbol,ColumnData})
     plan = lower_rkppl(m.ast, keys(cols); mod = m.mod)
     return bind_data(plan, cols)
 end
@@ -190,7 +190,7 @@ without forking the shared def. Multi-part calls fold left, so fix-vs-splice
 conflicts resolve to the LATER part (write the fix last).
 
 NamedTuple fix: each `name = value` removes the matching base statement and
-stores `value` (an `AbstractVector`) as model data, bound at the call —
+stores `value` (a vector or matrix) as model data, bound at the call —
 explicit call kwargs win over it (SB easily-rebound data).
 
 Fail-closed: non-statement overrides, non-bare LHS, duplicate base LHS,
@@ -237,8 +237,8 @@ function Base.merge(m::RKPPLModel, fix::NamedTuple)
         haskey(idx, nm) || _sfail("merge fix `$nm` matches no base-model " *
                                   "statement (a fixed name must name a " *
                                   "`~` / `.~` / `=` statement to remove)")
-        val isa AbstractVector || _sfail("merge fix `$nm` must be an " *
-            "AbstractVector (data-backed; got $(typeof(val)))")
+        val isa ColumnData || _sfail("merge fix `$nm` must be a " *
+            "vector or matrix (data-backed; got $(typeof(val)))")
         push!(drop, idx[nm])
         new_fixed[nm] = val
     end

@@ -65,6 +65,8 @@ _ordered_columns(plan::StructuralPlan) =
 
 _data_arg(name::Symbol, col::AbstractVector) =
     Expr(:(::), name, Vector{eltype(col)})
+_data_arg(name::Symbol, col::AbstractMatrix) =
+    Expr(:(::), name, Matrix{eltype(col)})
 
 # Dedicated eval scope for generated models. The `using` lines resolve via
 # this package's own Project (by file location), so generated code loads in
@@ -1354,7 +1356,7 @@ end
 # positive by construction (simplex/logistic/exp transforms +
 # validated varx). The consuming plate-sum shape is unchanged.
 function _r2d2_prior_stmts(rp::R2D2Prior, shape::DesignShape,
-        columns::Dict{Symbol,AbstractVector}, mut::Symbol, sdt::Symbol)
+        columns::AbstractDict{Symbol}, mut::Symbol, sdt::Symbol)
     share, fallback, loc, varx =
         r2d2_column_scales(shape, columns, rp.overrides)
     elts = Any[]

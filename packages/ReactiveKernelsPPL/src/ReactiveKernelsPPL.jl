@@ -17,7 +17,7 @@ using ReactiveKernels
 import SpecialFunctions
 using SpecialFunctions: loggamma
 
-export ColumnRef, ParamName
+export ColumnRef, ParamName, ColumnData
 export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
