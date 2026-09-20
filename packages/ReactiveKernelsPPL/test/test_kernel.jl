@@ -31,7 +31,7 @@ end
 # (observes intermediates the kernel never returns): slice params bind
 # their flat refs, globals bind constrained values, assignments run in
 # order, and the collected name is returned.
-function _eval_kernel_cell(kp::KernelPlate, columns::Dict{Symbol,AbstractVector},
+function _eval_kernel_cell(kp::KernelPlate, columns::AbstractDict{Symbol},
         globals::Dict{Symbol,<:Real})
     binds = Expr(:block)
     for (col, param, kind) in kp.slices

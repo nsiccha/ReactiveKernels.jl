@@ -26,6 +26,42 @@ const ColumnRef = Symbol
 """Reference to a sampled parameter or scalar assignment by name."""
 const ParamName = Symbol
 
+"""Bound column values: length-n vectors or n-row matrices (whole-design
+data, Stan `matrix[N,K]`). Matrices bind and validate beside vectors;
+every per-observation role (response, term, weights, trials, scales,
+bounds, grouping, axes, slices) reads vectors only — those readers fetch
+through [`_vector_column`](@ref) and fail closed on a matrix."""
+const ColumnData = Union{AbstractVector,AbstractMatrix}
+
+# Row count of a bound column: length for vectors, row count for matrices.
+_column_nrows(col::AbstractVector) = length(col)
+_column_nrows(col::AbstractMatrix) = size(col, 1)
+
+"""Normalize caller-supplied columns to the plan's column table (vectors
+and matrices only — anything else fails closed here, not in a converter)."""
+function _checked_columns(columns::AbstractDict{Symbol})
+    out = Dict{Symbol,ColumnData}()
+    for (k, v) in columns
+        v isa ColumnData ||
+            _fail(:plan, "column $k must be a vector or matrix, got $(summary(v))")
+        out[k] = v
+    end
+    return out
+end
+
+"""Fetch a bound column that must be a VECTOR (every per-observation role —
+response, term, weights, trials, scales, bounds, grouping, axes, slices —
+never reads a matrix; those fail closed here)."""
+function _vector_column(columns::AbstractDict{Symbol}, name::Symbol,
+        label::Symbol, what::AbstractString)
+    col = columns[name]
+    col isa AbstractVector ||
+        _fail(label, "$what `$name` must be a vector column, got " *
+              "$(summary(col)) (matrix columns bind whole-design :data — " *
+              "no $what reads one)")
+    return col
+end
+
 """Slice-1 likelihood families (D3 narrow slice), plus the leveled slice-2
 families (categorical / ordinal / multinomial): reference-coded
 multi-logit categorical, cumulative-logit ordinal with ordered cutpoints,
@@ -767,7 +803,7 @@ struct StructuralPlan
     parameters::Vector{SampledParameter}
     assignments::Vector{AssignmentSpec}
     derived::Vector{VectorAssignmentSpec}
-    columns::Dict{Symbol,AbstractVector}
+    columns::Dict{Symbol,ColumnData}
     n_obs::Int
     roles::Dict{Symbol,Symbol}
     levelmaps::Vector{LevelMap}
@@ -793,12 +829,13 @@ StructuralPlan(
     parameters::Vector{SampledParameter},
     assignments::Vector{AssignmentSpec},
     derived::Vector{VectorAssignmentSpec},
-    columns::Dict{Symbol,AbstractVector},
+    columns::AbstractDict{Symbol},
     n_obs::Int,
     roles::Dict{Symbol,Symbol}) =
     StructuralPlan(responses, predictors, population_priors, parameters,
-        assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[],
-        VaryingDraws[], VaryingSlice[], VectorParameter[],
+        assignments, derived, _checked_columns(columns), n_obs, roles,
+        LevelMap[], ScanSpec[], VaryingDraws[], VaryingSlice[],
+        VectorParameter[],
         SplineBasis[], SplineVector[], HSGPBasis[], KernelPlate[],
         R2D2Prior[])
 
@@ -816,7 +853,7 @@ function StructuralPlan(
         population_priors::Vector{PopulationPrior},
         parameters::Vector{SampledParameter},
         assignments::Vector{AssignmentSpec},
-        columns::Dict{Symbol,AbstractVector},
+        columns::AbstractDict{Symbol},
         n_obs::Int;
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         derived::Vector{VectorAssignmentSpec} = VectorAssignmentSpec[],
@@ -832,8 +869,9 @@ function StructuralPlan(
         kernel_plates::Vector{KernelPlate} = KernelPlate[],
         r2d2_priors::Vector{R2D2Prior} = R2D2Prior[])
     return StructuralPlan(responses, predictors, population_priors,
-        parameters, assignments, derived, columns, n_obs, roles, levelmaps,
-        plate_parameters, scans, varying_draws, varying_slices,
+        parameters, assignments, derived, _checked_columns(columns), n_obs,
+        roles, levelmaps, plate_parameters, scans, varying_draws,
+        varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
         kernel_plates, r2d2_priors)
 end
@@ -1394,7 +1432,8 @@ function _validate_margin_data(m::VaryingMargin, label::Symbol,
               "not bound")
     if z.kind === :column
         _is_derived(plan, z.column) && return nothing
-        eltype(plan.columns[z.column]) <: Real ||
+        zcol = _vector_column(plan.columns, z.column, label, "Z column")
+        eltype(zcol) <: Real ||
             _fail(label, "margin $(m.coefficient): Z column $(z.column) " *
                   "must be numeric (a categorical slope needs explicit " *
                   "`dummy($(z.column), k)` recipes)")
@@ -1402,7 +1441,8 @@ function _validate_margin_data(m::VaryingMargin, label::Symbol,
         _is_derived(plan, z.column) &&
             _fail(label, "margin $(m.coefficient): :dummy needs a raw " *
                   "column (level membership needs bound values)")
-        z.level in _grouping_levels(plan.columns[z.column]) ||
+        zcol = _vector_column(plan.columns, z.column, label, "grouping column")
+        z.level in _grouping_levels(zcol) ||
             _fail(label, "margin $(m.coefficient): dummy level " *
                   "$(repr(z.level)) is not a level of $(z.column)")
     end
@@ -1426,7 +1466,9 @@ function _validate_varying_draws_data(plan::StructuralPlan)
         # Coverage: every observed value needs a declared code (an
         # uncovered value would encode 0 and gather out of bounds).
         levels = d.levels::Vector
-        for v in plan.columns[d.group]
+        groupcol =
+            _vector_column(plan.columns, d.group, d.label, "grouping column")
+        for v in groupcol
             v in levels ||
                 _fail(d.label, "grouping value $(repr(v)) of $(d.group) " *
                       "is not a declared level (declared: $(repr(levels)))")
@@ -1466,15 +1508,16 @@ end
 # pass through (validated by `_validate_varying_levels_shape` +
 # `_validate_varying_draws_data`).
 function _eval_draws_levels(draws::Vector{VaryingDraws},
-        columns::Dict{Symbol,AbstractVector})
+        columns::AbstractDict{Symbol})
     out = VaryingDraws[]
     for d in draws
         d.levels !== nothing && (push!(out, d); continue)
         haskey(columns, d.group) ||
             _fail(d.label, "grouping column $(d.group) is not bound")
+        groupcol = _vector_column(columns, d.group, d.label, "grouping column")
         levels =
             try
-                _grouping_levels(columns[d.group])
+                _grouping_levels(groupcol)
             catch err
                 _fail(d.label, "grouping column $(d.group) levels not " *
                              "orderable ($err)")
@@ -1494,8 +1537,20 @@ function _validate_columns(plan::StructuralPlan)
     for (name, col) in plan.columns
         # Kernel-managed columns (slices + scalar expansions) carry two
         # lengths by design — they validate under kernel rules, not here.
-        name in managed || length(col) == plan.n_obs ||
-            _fail(name, "column length $(length(col)) ≠ n_obs $(plan.n_obs)")
+        if col isa AbstractMatrix
+            size(col, 1) == plan.n_obs ||
+                _fail(name, "matrix column has $(size(col, 1)) rows ≠ " *
+                      "n_obs $(plan.n_obs)")
+            size(col, 2) >= 1 ||
+                _fail(name, "design matrix has 0 columns " *
+                      "(bind ≥ 1 predictor column)")
+            eltype(col) <: Real ||
+                _fail(name, "matrix column must be numeric, " *
+                      "got $(eltype(col))")
+        else
+            name in managed || length(col) == plan.n_obs ||
+                _fail(name, "column length $(length(col)) ≠ n_obs $(plan.n_obs)")
+        end
         !any(ismissing, col) ||
             _fail(name, "column contains missing (slice 1 has no missingness machinery)")
     end
@@ -1604,9 +1659,11 @@ function _validate_splines_data(plan::StructuralPlan)
             _is_derived(plan, c) &&
                 _fail(sb.label, "spline :$(sb.id): axis column $c must " *
                       "be raw data (the bind-time fit needs bound values)")
-            eltype(plan.columns[c]) <: Real ||
+            axiscol =
+                _vector_column(plan.columns, c, sb.label, "spline axis column")
+            eltype(axiscol) <: Real ||
                 _fail(sb.label, "spline :$(sb.id): axis column $c must " *
-                      "be numeric, got $(eltype(plan.columns[c]))")
+                      "be numeric, got $(eltype(axiscol))")
         end
         for b in sb.blocks, c in b.columns
             haskey(plan.columns, c) ||
@@ -1687,9 +1744,11 @@ function _validate_hsgp_data(plan::StructuralPlan)
             _is_derived(plan, c) &&
                 _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
                       "be raw data (the bind-time fit needs bound values)")
-            eltype(plan.columns[c]) <: Real ||
+            axiscol =
+                _vector_column(plan.columns, c, hb.label, "hsgp axis column")
+            eltype(axiscol) <: Real ||
                 _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
-                      "be numeric, got $(eltype(plan.columns[c]))")
+                      "be numeric, got $(eltype(axiscol))")
         end
         length(hb.fits) == length(hb.axes) ||
             _fail(hb.label, "hsgp :$(hb.id): fits not filled at bind " *
@@ -2056,7 +2115,7 @@ function _validate_kernels_data(plan::StructuralPlan)
                   "(bind_data resolves :unknown from lengths)")
         haskey(plan.columns, col) ||
             _fail(kp.label, "slice column `$col` is not bound")
-        colv = plan.columns[col]
+        colv = _vector_column(plan.columns, col, kp.label, "slice column")
         eltype(colv) <: Real ||
             _fail(kp.label, "slice column `$col` must be numeric, " *
                   "got $(eltype(colv))")
@@ -2075,7 +2134,8 @@ function _validate_kernels_data(plan::StructuralPlan)
             haskey(plan.columns, exp) ||
                 _fail(kp.label, "scalar slice `$param` expansion `$exp` " *
                       "missing (bind_data materializes flat T-blocks)")
-            expv = plan.columns[exp]
+            expv =
+                _vector_column(plan.columns, exp, kp.label, "slice expansion")
             length(expv) == flat ||
                 _fail(kp.label, "expansion `$exp` has length " *
                       "$(length(expv)), want flat $flat")
@@ -2553,7 +2613,9 @@ function _collect_vector_condition!(refs, ex, plan, label, bound::Bool)
         "knowledge — inline the comparison",
     )
     if bound && haskey(plan.columns, ex)
-        eltype(plan.columns[ex]) === Bool ||
+        condcol =
+            _vector_column(plan.columns, ex, label, "ifelse condition column")
+        eltype(condcol) === Bool ||
             _fail(label, "`ifelse` condition column $ex must be Bool")
         return nothing
     end
@@ -3187,7 +3249,7 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
         # Derived columns are length-n by construction; their eltype is
         # unknown statically (in-graph Julia errors are loud).
         _is_derived(plan, c) && return nothing
-        col = plan.columns[c]
+        col = _vector_column(plan.columns, c, t.label, "term column")
         eltype(col) <: Real ||
             _fail(t.label, "column $c must be numeric")
     end
@@ -3207,7 +3269,7 @@ function _validate_monotonic_columns(t::TermSpec, plan::StructuralPlan)
     _is_derived(plan, c) && _fail(t.label,
         "monotonic index $c must be a bound raw column of level codes " *
         "(the emitter binds integer codes 1..K, SB's `<c>_idx`)")
-    col = plan.columns[c]
+    col = _vector_column(plan.columns, c, t.label, "monotonic index")
     (eltype(col) <: Integer && eltype(col) !== Bool) ||
         _fail(t.label, "monotonic index $c must hold integer level codes " *
               "1..K, got eltype $(eltype(col))")
@@ -3306,14 +3368,16 @@ end
 # Binder evaluation: sort-ordered uniques, then the subset selection
 # (bounds-checked against the observed count).
 function _eval_levelmaps(levelmaps::Vector{LevelMap},
-        columns::Dict{Symbol,AbstractVector})
+        columns::AbstractDict{Symbol})
     out = LevelMap[]
     for m in levelmaps
         haskey(columns, m.column) ||
             _fail(:plan, "LevelMap addresses missing column $(m.column)")
+        groupcol =
+            _vector_column(columns, m.column, :plan, "grouping column")
         levels =
             try
-                _grouping_levels(columns[m.column])
+                _grouping_levels(groupcol)
             catch err
                 _fail(:plan, "grouping column $(m.column) levels not " *
                              "orderable ($err)")
@@ -3968,7 +4032,7 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
             "response range $(r.range) covers $(length(r.range)) cells " *
             "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
     end
-    col = plan.columns[r.response]
+    col = _vector_column(plan.columns, r.response, r.label, "response")
     if _is_bernoulli_family(r.family)
         eltype(col) === Bool && return nothing
         eltype(col) <: Integer && all(x -> x == 0 || x == 1, col) && return nothing
@@ -4030,7 +4094,8 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
                 "raw (derived counts need shape metadata — planned)")
             haskey(plan.columns, c) ||
                 return _fail(r.label, "count column $c missing")
-            _is_count_column(plan.columns[c]) ||
+            countcol = _vector_column(plan.columns, c, r.label, "count column")
+            _is_count_column(countcol) ||
                 return _fail(r.label, "count column $c must hold " *
                     "non-negative integers")
         end
@@ -4045,7 +4110,8 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
                 "(derived outcomes need shape metadata — planned)")
             haskey(plan.columns, c) ||
                 return _fail(r.label, "joint outcome column $c missing")
-            eltype(plan.columns[c]) <: Real ||
+            outcol = _vector_column(plan.columns, c, r.label, "joint outcome")
+            eltype(outcol) <: Real ||
                 return _fail(r.label, "joint outcome $c must be numeric")
         end
         return nothing
@@ -4147,7 +4213,7 @@ function _validate_scale_data(r::LikelihoodSpec, plan::StructuralPlan)
         "raw (derived-column scales need shape metadata — planned)")
     haskey(plan.columns, s) ||
         _fail(r.label, "scale references unknown name $s")
-    col = plan.columns[s]
+    col = _vector_column(plan.columns, s, r.label, "scale column")
     (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
         _fail(r.label, "per-observation scale $s must be finite positive numerics")
     length(col) == plan.n_obs ||
@@ -4166,7 +4232,7 @@ function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
     end
     r.trials === nothing && _fail(r.label,
         "Binomial response requires trials (Int column or literal)")
-    ycol = plan.columns[r.response]
+    ycol = _vector_column(plan.columns, r.response, r.label, "response")
     t = r.trials
     if t isa Int
         t >= 0 || _fail(r.label, "Binomial trials literal must be non-negative")
@@ -4179,7 +4245,7 @@ function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
         "raw (derived trials need shape metadata — planned)")
     haskey(plan.columns, t) ||
         _fail(r.label, "trials column $t missing")
-    col = plan.columns[t]
+    col = _vector_column(plan.columns, t, r.label, "trials column")
     (eltype(col) <: Integer && eltype(col) !== Bool) ||
         _fail(r.label, "trials column must hold integers")
     all(>=(0), col) ||
@@ -4215,7 +4281,7 @@ function _validate_multinomial_trials(r::LikelihoodSpec, plan::StructuralPlan)
         "raw (derived trials need shape metadata — planned)")
     haskey(plan.columns, t) ||
         _fail(r.label, "trials column $t missing")
-    col = plan.columns[t]
+    col = _vector_column(plan.columns, t, r.label, "trials column")
     (eltype(col) <: Integer && eltype(col) !== Bool) ||
         _fail(r.label, "trials column must hold integers")
     all(>=(0), col) ||
@@ -4245,7 +4311,7 @@ function _validate_ordinal_data(r::LikelihoodSpec, plan::StructuralPlan)
         haskey(plan.columns, d) || _fail(r.label,
             "discrimination $d must be a data column or a log-link " *
             "predictor (a modeled scale)")
-        col = plan.columns[d]
+        col = _vector_column(plan.columns, d, r.label, "discrimination column")
         (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
             _fail(r.label, "discrimination column $d must be finite " *
                 "positive numerics")
@@ -4256,7 +4322,7 @@ function _validate_ordinal_data(r::LikelihoodSpec, plan::StructuralPlan)
             "design raw (derived columns need shape metadata — planned)")
         haskey(plan.columns, c) ||
             _fail(r.label, "threshold column $c missing")
-        col = plan.columns[c]
+        col = _vector_column(plan.columns, c, r.label, "threshold column")
         (eltype(col) <: Real && all(isfinite, col)) ||
             _fail(r.label, "threshold column $c must be finite numerics")
     end
@@ -4270,7 +4336,7 @@ function _validate_weights(r::LikelihoodSpec, plan::StructuralPlan)
         "raw (derived weights need shape metadata — planned)")
     haskey(plan.columns, r.weights) ||
         _fail(r.label, "weights column $(r.weights) missing")
-    col = plan.columns[r.weights]
+    col = _vector_column(plan.columns, r.weights, r.label, "weights column")
     eltype(col) <: Real && all(isfinite, col) && all(>=(0), col) ||
         _fail(r.label, "frequency weights must be finite non-negative numerics")
     return nothing
@@ -4298,7 +4364,7 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
     lo = _bound_values(ev.lower, :lower, r, plan)
     hi = _bound_values(ev.upper, :upper, r, plan)
     if ev.kind === :interval_censored
-        resp = plan.columns[r.response]
+        resp = _vector_column(plan.columns, r.response, r.label, "response")
         all(isfinite, resp) ||
             _fail(r.label, "interval evidence requires finite response values")
         all(resp .< hi) ||
@@ -4327,7 +4393,7 @@ function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
         "bounds raw (derived bounds need shape metadata — planned)")
     haskey(plan.columns, bound) ||
         _fail(r.label, "$side bound column $bound missing")
-    col = plan.columns[bound]
+    col = _vector_column(plan.columns, bound, r.label, "$side bound column")
     if r.family === PoissonLogFam
         (eltype(col) <: Integer && eltype(col) !== Bool) || _fail(r.label,
             "$side bound column must hold integers for Poisson evidence")
@@ -4362,7 +4428,7 @@ _upgrade_role!(roles, col, role) =
 # fits (bind-then-build ordering keeps them consistent across
 # rebinds — the SB DATA-vs-literal concern).
 function _fit_hsgp_bases(plan::StructuralPlan,
-        columns::Dict{Symbol,AbstractVector})
+        columns::AbstractDict{Symbol})
     isempty(plan.hsgp_bases) && return HSGPBasis[]
     out = HSGPBasis[]
     for hb in plan.hsgp_bases
@@ -4371,7 +4437,7 @@ function _fit_hsgp_bases(plan::StructuralPlan,
             haskey(columns, c) ||
                 _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
                       "not bound")
-            col = columns[c]
+            col = _vector_column(columns, c, hb.label, "hsgp axis column")
             eltype(col) <: Real ||
                 _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
                       "be numeric, got $(eltype(col))")
@@ -4394,7 +4460,7 @@ function _fit_hsgp_bases(plan::StructuralPlan,
 end
 
 function _materialize_splines!(plan::StructuralPlan,
-        columns::Dict{Symbol,AbstractVector})
+        columns::Dict{Symbol,ColumnData})
     isempty(plan.spline_bases) && return SplineBasis[]
     out = SplineBasis[]
     for sb in plan.spline_bases
@@ -4403,10 +4469,12 @@ function _materialize_splines!(plan::StructuralPlan,
             haskey(columns, c) ||
                 _fail(sb.label, "spline :$(sb.id): axis column $c is " *
                       "not bound")
-            eltype(columns[c]) <: Real ||
+            axiscol =
+                _vector_column(columns, c, sb.label, "spline axis column")
+            eltype(axiscol) <: Real ||
                 _fail(sb.label, "spline :$(sb.id): axis column $c must " *
-                      "be numeric, got $(eltype(columns[c]))")
-            push!(axes, columns[c])
+                      "be numeric, got $(eltype(axiscol))")
+            push!(axes, axiscol)
         end
         wantcols = _spline_basis_columns(sb.id, sb.kind, sb.k)
         for (_, cols) in wantcols, c in cols
@@ -4444,7 +4512,7 @@ end
 # leftovers fail closed (a typo'd key must not silently reshape the
 # plate). Returns resolved nodes; the input plan is untouched.
 function _resolve_kernels!(plan::StructuralPlan,
-        columns::Dict{Symbol,AbstractVector}, dims::AbstractDict{Symbol,<:Integer})
+        columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer})
     isempty(plan.kernel_plates) && return KernelPlate[]
     kp = only(plan.kernel_plates)
     for (k, v) in dims
@@ -4493,7 +4561,8 @@ function _resolve_kernels!(plan::StructuralPlan,
     for (col, param, _) in kp.slices
         haskey(columns, col) ||
             _fail(kp.label, "slice column `$col` is not bound")
-        L = length(columns[col])
+        colv = _vector_column(columns, col, kp.label, "slice column")
+        L = length(colv)
         kind = if T === nothing
             L == n_sub ||
                 _fail(kp.label, "slice `$param` column `$col` has length " *
@@ -4516,7 +4585,7 @@ function _resolve_kernels!(plan::StructuralPlan,
                 _fail(kp.label, "column `$exp` is reserved for kernel " *
                       "plate `$(kp.result)`'s flat expansion of `$col` — " *
                       "rename the caller-supplied column")
-            columns[exp] = repeat(Vector{Float64}(columns[col]); inner = T)
+            columns[exp] = repeat(Vector{Float64}(colv); inner = T)
         end
     end
     resolved0 = KernelPlate(kp.result, n_sub, T, slices2,
@@ -4541,15 +4610,18 @@ facts stay visible in terms + draws). Draws blocks with
 plain vectors — emitter-declared levels pass through). `dims` binds
 kernel-plate dims keys
 (`subject_count`, `timepoint_count`) to positive integers; every key must
-be consumed.
+be consumed. Columns are vectors or matrices (whole-design data, Stan
+`matrix[N,K]`): a matrix binds with `n_obs` rows, ≥ 1 column, and a
+numeric eltype; every per-observation role reads vectors only and fails
+closed on a matrix.
 """
-function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
+function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}())
     validate_structure(plan)
     isempty(columns) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
-    columns = Dict{Symbol,AbstractVector}(columns)
+    columns = _checked_columns(columns)
     bases = _materialize_splines!(plan, columns)
     hbases = _fit_hsgp_bases(plan, columns)
     kbases = _resolve_kernels!(plan, columns, dims)
@@ -4601,7 +4673,8 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     merged = merge(inferred, roles)
     # Kernel plans carry two column lengths by design: n_obs is the flat
     # length (vector models) or n_sub (all-scalar) — never first-column.
-    n = isempty(kbases) ? length(first(values(columns))) :
+    # Otherwise n_obs is the first column's ROW count (length for vectors).
+    n = isempty(kbases) ? _column_nrows(first(values(columns))) :
         _kernel_flat_length(only(kbases).subjects, only(kbases).timepoints)
     maps = _eval_levelmaps(plan.levelmaps, columns)
     draws = _eval_draws_levels(plan.varying_draws, columns)
@@ -4632,7 +4705,7 @@ end
 # inference. Returns new (immutable) vectors; unbound plans keep
 # `nothing`.
 function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
-        vectors::Vector{VectorParameter}, columns::Dict{Symbol,AbstractVector},
+        vectors::Vector{VectorParameter}, columns::AbstractDict{Symbol},
         predictors::Vector{PredictorSpec} = PredictorSpec[],
         r2d2::Vector{R2D2Prior} = R2D2Prior[])
     out_r = LikelihoodSpec[]
@@ -4721,7 +4794,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
     return out_r, out_v
 end
 
-function _infer_response_levels(r::LikelihoodSpec, columns::Dict{Symbol,AbstractVector})
+function _infer_response_levels(r::LikelihoodSpec, columns::AbstractDict{Symbol})
     if r.family === CategoricalLogitFam
         return 2 + length(r.extra_predictors)
     elseif r.family === MultinomialFam
@@ -4730,7 +4803,7 @@ function _infer_response_levels(r::LikelihoodSpec, columns::Dict{Symbol,Abstract
     r.n_levels !== nothing && return r.n_levels
     haskey(columns, r.response) ||
         _fail(r.label, "response column $(r.response) missing")
-    col = columns[r.response]
+    col = _vector_column(columns, r.response, r.label, "response")
     (eltype(col) <: Integer && eltype(col) !== Bool && !isempty(col)) ||
         _fail(r.label, "a leveled response must hold integers 1..K")
     K = maximum(col)
