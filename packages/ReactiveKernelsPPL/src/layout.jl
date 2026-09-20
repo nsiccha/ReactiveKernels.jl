@@ -53,18 +53,19 @@ end
 """One packed slice: a coefficient block, a scalar latent, a scan vector
 latent, a per-cell latent block, a leveled vector latent (cutpoints,
 thresholds, simplex), a spline coefficient-vector block, a ranef vector
-block (K=1 `xi`, correlated `tau`/`z_flat`), or a correlated-ranef LKJ
-Cholesky factor. `lo`/`hi` are the constrained bounds of an `:interval`
-transform (`NaN` otherwise)."""
+block (K=1 `xi`, correlated `tau`/`z_flat`), a correlated-ranef LKJ
+Cholesky factor, or an HSGP coefficient-vector block (`beta_raw`). `lo`
+is the constrained lower bound of an `:interval`/`:floored` transform
+(`:interval` also sets `hi`; `NaN` otherwise)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :ranef | :ranef_corr
+    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :ranef | :ranef_corr | :hsgp
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
     offset::Int # 1-based packed offset
     size::Int
-    transform::Symbol # :identity | :exp | :logistic | :interval | :ordered | :simplex | :lkj
-    lo::Float64 # :interval lower bound (else NaN)
+    transform::Symbol # :identity | :exp | :logistic | :interval | :floored | :ordered | :simplex | :lkj
+    lo::Float64 # :interval/:floored lower bound (else NaN)
     hi::Float64 # :interval upper bound (else NaN)
 end
 # Non-interval entries omit the bounds.
@@ -202,6 +203,37 @@ function assign_layout(plan::StructuralPlan)
         push!(entries,
             LayoutEntry(:scan, nothing, nm, labels, offset, T, :identity))
         offset += T
+    end
+    # HSGP bases in plan order, SB `_sb_hsgp` declaration order per basis
+    # (rho, sigma, beta): length scales as `:sampled` scalars on the
+    # parameterized `:floored` support (`x = lo + exp(u)`, logjac `u` —
+    # Stan lower-bound kernel semantics, no truncation normalizer), the
+    # marginal scale as a plain `:exp` scalar, and the standardized
+    # M-vector `beta_raw` as one `:hsgp` identity block (the
+    # spline-vector shape). A zero floor (K=1, unbounded) routes to
+    # `:exp`, bit-identical to `:floored` at `lo == 0.0`.
+    for hb in plan.hsgp_bases
+        length(hb.fits) == length(hb.axes) || throw(ContractValidationError(
+            "[layout] hsgp :$(hb.id): fits not filled at bind " *
+            "(bind_data fills one (mu, L) per axis)"))
+        names = _hsgp_names(hb)
+        for (rho, fl) in zip(names.rhos, _hsgp_floors(hb.K, hb.fits, hb.iso))
+            if fl == 0.0
+                push!(entries, LayoutEntry(:sampled, nothing, rho, [rho],
+                    offset, 1, :exp))
+            else
+                push!(entries, LayoutEntry(:sampled, nothing, rho, [rho],
+                    offset, 1, :floored, fl, NaN))
+            end
+            offset += 1
+        end
+        push!(entries, LayoutEntry(:sampled, nothing, names.sigma,
+            [names.sigma], offset, 1, :exp))
+        offset += 1
+        M = _hsgp_n_basis(hb)
+        push!(entries, LayoutEntry(:hsgp, nothing, names.beta, [names.beta],
+            offset, M, :identity))
+        offset += M
     end
     return LayoutTable(entries, offset - 1)
 end
@@ -492,7 +524,8 @@ function coordinate_names(layout::LayoutTable)
             for label in e.labels
                 push!(names, Symbol(string(e.predictor) * "." * string(label)))
             end
-        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef
+        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef ||
+               e.kind === :hsgp
             for i in 1:e.size
                 push!(names, Symbol(string(e.name) * "." * string(i)))
             end
@@ -530,7 +563,8 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :coefficient
             push!(pairs, e.predictor => Vector{Float64}(seg))
-        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef
+        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef ||
+               e.kind === :hsgp
             v = [_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name => v)
         elseif e.kind === :scan
@@ -599,9 +633,11 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] predictor $(e.predictor) length mismatch"),
             )
             u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
-        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef
+        elseif e.kind === :plate || e.kind === :spline || e.kind === :ranef ||
+               e.kind === :hsgp
             what = e.kind === :plate ? "plate parameter" :
-                e.kind === :spline ? "spline vector" : "ranef vector"
+                e.kind === :spline ? "spline vector" :
+                e.kind === :ranef ? "ranef vector" : "hsgp vector"
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing $what $(e.name)"),
             )
@@ -715,14 +751,25 @@ _logjac_value(transform::Symbol, u) =
 # Symbol-keyed parameterless bijector registry (like `:identity`, it lives
 # outside it): it maps ℝ → (lo, hi) via an affine-logistic (`lo + (hi-lo)·σ(u)`)
 # with log-Jacobian `log(x-lo) + log(hi-x) - log(hi-lo)` in the CONSTRAINED
-# value. The in-graph interval edges (below) use the IDENTICAL operations, so
-# host and graph agree bit-for-bit.
-_constrain_elt(e::LayoutEntry, u) = e.transform === :interval ?
-    (e.lo + (e.hi - e.lo) / (1 + exp(-u))) : _constrain_value(e.transform, u)
-_unconstrain_elt(e::LayoutEntry, x) = e.transform === :interval ?
-    (log(x - e.lo) - log(e.hi - x)) : _unconstrain_value(e.transform, x)
+# value. `:floored` is likewise parameterized (Stan's lower-bound kernel
+# ℝ → (lo, ∞), `lo + exp(u)`, log-Jacobian the bare `u` — no truncation
+# normalizer). The in-graph interval/floored edges (below) use the IDENTICAL
+# operations, so host and graph agree bit-for-bit.
+function _constrain_elt(e::LayoutEntry, u)
+    e.transform === :interval &&
+        return e.lo + (e.hi - e.lo) / (1 + exp(-u))
+    e.transform === :floored && return e.lo + exp(u)
+    return _constrain_value(e.transform, u)
+end
+function _unconstrain_elt(e::LayoutEntry, x)
+    e.transform === :interval && return log(x - e.lo) - log(e.hi - x)
+    e.transform === :floored && return log(x - e.lo)
+    return _unconstrain_value(e.transform, x)
+end
 function _logjac_elt(e::LayoutEntry, u)
-    e.transform === :interval || return _logjac_value(e.transform, u)
+    e.transform === :interval || e.transform === :floored ||
+        return _logjac_value(e.transform, u)
+    e.transform === :floored && return u
     x = e.lo + (e.hi - e.lo) / (1 + exp(-u))
     return log(x - e.lo) + log(e.hi - x) - log(e.hi - e.lo)
 end
@@ -761,11 +808,13 @@ function transform_statements(e::LayoutEntry)
         return Expr[:($(e.name)::AbstractVector{Float64} =
             view(unconstrained, $lo:$hi))]
     end
-    if e.kind === :plate || e.kind === :spline || e.kind === :ranef
+    if e.kind === :plate || e.kind === :spline || e.kind === :ranef ||
+       e.kind === :hsgp
         # Spline vectors ride the plate transform path (block + scalar
         # endpoints); the contract pins their supports to real/positive,
         # so the :interval arm below is unreachable for them. Ranef
-        # vectors ride it too (`xi`/`z_flat` identity, `tau` exp).
+        # vectors ride it too (`xi`/`z_flat` identity, `tau` exp), as do
+        # HSGP coefficient vectors (`beta_raw`, identity only).
         return _plate_transform_statements(e)
     end
     if e.kind === :vector
@@ -788,6 +837,18 @@ function transform_statements(e::LayoutEntry)
             :($u::Float64 = $coord),
             :($(e.name)::Float64 = $blo + ($bhi - $blo) / (1 + exp(-$u))),
             :($u::Float64 = log($(e.name) - $blo) - log($bhi - $(e.name))),
+        ]
+    end
+    if e.transform === :floored
+        # Parameterized like :interval (the per-entry floor is not in the
+        # registry): forward + inverse edges hand-rolled with the IDENTICAL
+        # math to the host `_*_elt` path (`lo + exp(u)` / `log(x - lo)`).
+        u = Symbol(:_ppl_fl_, e.name)
+        blo = e.lo
+        return Expr[
+            :($u::Float64 = $coord),
+            :($(e.name)::Float64 = $blo + exp($u)),
+            :($u::Float64 = log($(e.name) - $blo)),
         ]
     end
     # Constrained supports splice the bijector's `constrain` endpoint; the
@@ -994,18 +1055,25 @@ function jacobian_term(e::LayoutEntry)
             log1p(-$(_vector_z(e, j)))) for j in 1:e.size]
         return foldl((a, b) -> :($a + $b), terms)
     end
-    if e.kind === :plate || e.kind === :spline || e.kind === :ranef
+    if e.kind === :plate || e.kind === :spline || e.kind === :ranef ||
+       e.kind === :hsgp
         # Interval plates hand-roll the per-cell Jacobian sum (parameterized
         # bounds, no companion `logjac` plate); every registry transform sums
         # its companion `logjac` plate from `_plate_transform_statements`.
         # Spline vectors share the shape (their supports never reach
         # :interval, but the arm stays correct if that ever changes), as do
-        # ranef vectors (`xi`/`z_flat` identity, `tau` exp).
+        # ranef vectors (`xi`/`z_flat` identity, `tau` exp) and hsgp
+        # vectors (`beta_raw` identity). Anything else is loud (a companion
+        # plate that was never emitted must never sum silently).
         if e.transform === :interval
             blo, bhi = e.lo, e.hi
             return :(sum(log.($(e.name) .- $blo) .+ log.($bhi .- $(e.name)) .-
                          log($bhi - $blo)))
         end
+        e.transform === :exp || e.transform === :logistic ||
+            throw(ContractValidationError("[layout] $(e.kind) block " *
+                  "$(e.name) has no Jacobian rule for transform " *
+                  "$(e.transform)"))
         return :(sum($(_plate_logjac_name(e.name))))
     end
     if e.transform === :interval
@@ -1013,6 +1081,12 @@ function jacobian_term(e::LayoutEntry)
         # uses the constrained `e.name` from the interval constrain edge.
         blo, bhi = e.lo, e.hi
         return :(log($(e.name) - $blo) + log($bhi - $(e.name)) - log($bhi - $blo))
+    end
+    if e.transform === :floored
+        # Stan's lower-bound kernel: the bare unconstrained coordinate
+        # (shared with the constrain edge via structural CSE) — no
+        # truncation normalizer.
+        return coordinate_read(e.offset)
     end
     bij = _bijector_name(e.transform)
     return :($(bij)().logjac($(coordinate_read(e.offset))))
