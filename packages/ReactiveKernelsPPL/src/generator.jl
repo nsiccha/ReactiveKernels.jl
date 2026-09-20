@@ -24,10 +24,6 @@ function build_kernel(plan::StructuralPlan)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
-    nhsgp = length(plan.hsgp_bases)
-    nhsgp == 0 || throw(ContractValidationError(
-        "[generator] HSGP codegen is Stage B — refusing to silently drop " *
-        "$nhsgp hsgp basis(es)"))
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
@@ -51,6 +47,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _assignment_statements(plan))
     append!(stmts, preprocessing_recipes(plan))
     append!(stmts, _ranef_statements(plan))
+    append!(stmts, _hsgp_basis_statements(plan))
     append!(stmts, _scan_reconstruction_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _likelihood_statements(plan))
@@ -90,6 +87,9 @@ using LogExpFunctions: log1pexp
 # transforms); imported from the enclosing module so the emitted
 # `positive_bijector()` / `unit_bijector()` calls resolve.
 import ..positive_bijector, ..unit_bijector
+# In-model grouping encoder (`_ppl_gidx_<group>` nodes call it with the
+# raw column + literal declared levels).
+import .._declared_codes
 end
 
 const _MODEL_COUNTER = Ref(0)
@@ -152,6 +152,13 @@ function _predictor_statements(plan::StructuralPlan)
         for b in shape.blocks
             b.kind === SplineSummandTerm &&
                 push!(terms, _spline_summand_expr(plan, b.column))
+        end
+        # An HSGP summand contributes its basis's direct `PHI * w`
+        # expression (SB `_sb_hsgp`'s `PHI * (sqrt_spd .* beta_raw)`,
+        # evaluated in-graph by `_hsgp_basis_statements`).
+        for b in shape.blocks
+            b.kind === HSGPSummandTerm &&
+                push!(terms, _hsgp_summand_expr(plan, b.column))
         end
         # A gather contributes its bucket's direct `r` expression (SB's
         # `r_<target>_<suffix>` summand), resolved from the TERMS — the
@@ -248,6 +255,118 @@ function _spline_summand_expr(plan::StructuralPlan, id::Symbol)
     return foldl((a, b) -> :($a .+ $b), parts)
 end
 
+# `sqrt(2π)` verbatim from SB `brm_hsgp_sqrt_spd` (the spectral scale).
+const _HSGP_SQRT2PI = 2.5066282746310002
+
+# In-graph HSGP node names for one basis (all `_ppl_`-hygienic): per-axis
+# trig columns, tensor-product columns, the `hcat` basis matrix, the
+# spectral scale, per-basis `sqrt_spd` scalars, their `vect`, the
+# spectral weights, and the predictor summand.
+_hsgp_ax_name(id::Symbol, j::Int, k::Int) = Symbol(:_ppl_hsgp_, id, :_ax, j, :_k, k)
+_hsgp_phi_name(id::Symbol, b::Int) = Symbol(:_ppl_hsgp_, id, :_phi_, b)
+_hsgp_PHI_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_PHI)
+_hsgp_sscale_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_sscale)
+_hsgp_s_name(id::Symbol, b::Int) = Symbol(:_ppl_hsgp_, id, :_s_, b)
+_hsgp_S_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_S)
+_hsgp_w_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_w)
+_hsgp_sum_name(id::Symbol) = Symbol(:_ppl_hsgp_, id)
+
+# One basis's in-graph evaluation (SB `_brm_apply_hsgp` /
+# `brm_hsgp_sqrt_spd` / `_sb_hsgp`, SB op order throughout): per-axis 1D
+# trig columns from the frozen bind fits (`(mu, L)` literals), their
+# tensor-product columns in `CartesianIndices(K)` order, the `hcat` basis
+# matrix, unrolled `sqrt_spd` scalars over the sampled `(rho, sigma)`,
+# and the spec-literal matmul summand `PHI * (S .* beta)`. The basis
+# columns are data-only (bound-folded, the `design_recipe` precedent);
+# the spectral weights stay symbolic. Runs before the predictors (the
+# summand node is the LP splice); the priors stay in `_prior_statements`
+# (order-free).
+function _hsgp_basis_statements(plan::StructuralPlan)
+    stmts = Expr[]
+    for hb in plan.hsgp_bases
+        length(hb.fits) == length(hb.axes) || throw(ContractValidationError(
+            "[generator] hsgp :$(hb.id): fits not filled at bind " *
+            "(bind_data fills one (mu, L) per axis)"))
+        append!(stmts, _hsgp_basis_stmts(hb))
+    end
+    return stmts
+end
+
+function _hsgp_basis_stmts(hb::HSGPBasis)
+    id = hb.id
+    d = length(hb.axes)
+    stmts = Expr[]
+    # Per-axis 1D columns: `PHI[i,k] = inv_sqrt_L * sin(lam_sqrt[k] *
+    # (x[i] - mu + L))` (SB `_brm_apply_hsgp`, element order verbatim).
+    # `lam[k]` is SB's `lambda` literal, `lam_sqrt[k]` its `sqrt`.
+    for (j, axis) in enumerate(hb.axes)
+        mu, L = hb.fits[j]
+        mu, L = Float64(mu), Float64(L)
+        inv_sqrt_L = 1.0 / sqrt(L)
+        for k in 1:hb.K[j]
+            lam_sqrt = sqrt((k * pi / (2.0 * L))^2)
+            col = _hsgp_ax_name(id, j, k)
+            push!(stmts, :($col =
+                $inv_sqrt_L .* sin.($lam_sqrt .* ($axis .- $mu .+ $L))))
+        end
+    end
+    # Tensor-product columns in `CartesianIndices(K)` order (SB's
+    # `enumerate(CartesianIndices(K))`): one axis reuses its column.
+    midcs = collect(CartesianIndices(Tuple(hb.K)))
+    phis = Symbol[]
+    for (b, I) in enumerate(midcs)
+        if d == 1
+            push!(phis, _hsgp_ax_name(id, 1, I[1]))
+        else
+            phi = _hsgp_phi_name(id, b)
+            cols = [_hsgp_ax_name(id, j, I[j]) for j in 1:d]
+            push!(stmts, :($phi = $(foldl((a, c) -> :($a .* $c), cols))))
+            push!(phis, phi)
+        end
+    end
+    push!(stmts, :($(_hsgp_PHI_name(id)) = hcat($(phis...))))
+    # Spectral weights (SB `brm_hsgp_sqrt_spd`): `scale = sigma *
+    # prod(sqrt(rho_j * sqrt(2π)))`, `s[b] = scale * exp(-0.25 *
+    # sum(rho_j^2 * omega2[b,j]))` — left-assoc folds, SB order. Iso
+    # shares one rho across axes; `omega2` is the frozen `lambda`
+    # literal above.
+    names = _hsgp_names(hb)
+    rhos = hb.iso ? fill(names.rhos[1], d) : names.rhos
+    factors = Any[names.sigma]
+    for j in 1:d
+        push!(factors, :(sqrt($(rhos[j]) * $_HSGP_SQRT2PI)))
+    end
+    sscale = _hsgp_sscale_name(id)
+    push!(stmts, :($sscale::Float64 = $(foldl((a, c) -> :($a * $c), factors))))
+    snames = Symbol[]
+    for (b, I) in enumerate(midcs)
+        terms = Any[]
+        for j in 1:d
+            lam = (I[j] * pi / (2.0 * hb.fits[j][2]))^2
+            push!(terms, :($(rhos[j]) * $(rhos[j]) * $lam))
+        end
+        expsum = foldl((a, c) -> :($a + $c), terms)
+        s = _hsgp_s_name(id, b)
+        push!(stmts, :($s::Float64 = $sscale * exp(-0.25 * $expsum)))
+        push!(snames, s)
+    end
+    S = _hsgp_S_name(id)
+    push!(stmts, :($S = $(Expr(:vect, snames...))))
+    w = _hsgp_w_name(id)
+    push!(stmts, :($w = $S .* $(names.beta)))
+    push!(stmts, :($(_hsgp_sum_name(id)) = $(_hsgp_PHI_name(id)) * $w))
+    return stmts
+end
+
+# One HSGP summand's direct expression: the basis's precomputed
+# `_hsgp_basis_statements` node (resolved from the design block's basis
+# id; the lookup below is loud defense in depth).
+function _hsgp_summand_expr(plan::StructuralPlan, id::Symbol)
+    any(hb -> hb.id === id, plan.hsgp_bases) || throw(ContractValidationError(
+        "[generator] hsgp summand addresses unknown basis :$id"))
+    return _hsgp_sum_name(id)
+end
+
 # One scan summand's direct expression (`state .* coef`, explicit dotted
 # form): the in-graph recurrence state scaled by its sampled scalar
 # coefficient. Both names resolve from the term's options (validated
@@ -263,22 +382,25 @@ function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSp
 end
 
 # Group-index encoder nodes, one per grouped column (`_ppl_gidx_<group>`):
-# an in-graph indicator sum over the bind-known `_grouping_levels`
-# order (same helper the data validator uses, so the order agrees by
-# construction). Data-only, hence bound-folded; strings are native-only,
-# exactly like factor contrasts. K=1 and correlated buckets on the same
-# group share one encoder (per-group dedup).
+# an in-model `_declared_codes` call over the bucket's DECLARED levels
+# (bind-known — filled or emitter-provided — so the order agrees with
+# validation by construction; never sorted). Data-only, hence
+# bound-folded; strings are native-only, exactly like factor contrasts.
+# K=1 and correlated buckets on the same group share one encoder
+# (per-group dedup; same-group levels agreement is validated).
 function _ranef_statements(plan::StructuralPlan)
     stmts = Expr[]
     groups = Symbol[]
     for b in plan.ranef_buckets
         b.group in groups && continue
         push!(groups, b.group)
-        levels = _grouping_levels(plan.columns[b.group])
-        parts = Any[Expr(:call, :.*, Expr(:call, :.==, b.group,
-            _level_literal(lv)), j) for (j, lv) in enumerate(levels)]
-        idx = foldl((a, c) -> Expr(:call, :.+, a, c), parts)
-        push!(stmts, Expr(:(=), Symbol(:_ppl_gidx_, b.group), idx))
+        b.levels === nothing && throw(ContractValidationError(
+            "[generator] internal: bucket $(b.label) has no declared " *
+            "levels (validate_plan proves this)"))
+        lvlvec = Expr(:vect,
+            (_level_literal(lv) for lv in b.levels)...)
+        push!(stmts, Expr(:(=), Symbol(:_ppl_gidx_, b.group),
+            Expr(:call, :_declared_codes, b.group, lvlvec)))
     end
     return stmts
 end
@@ -499,6 +621,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _multinomial_plate_stmts(r, plan, node, pw)
     elseif r.family === CategoricalFam
         return _categorical_plain_plate_stmts(r, plan, node, pw)
+    elseif r.family === MvNormalCholeskyFam
+        return _mvn_cholesky_plate_stmts(r, plan, node, pw)
     else
         throw(ContractValidationError(
             "[generator] response family $(r.family) has no emitter"))
@@ -509,10 +633,11 @@ _predictor(plan::StructuralPlan, name::Symbol) =
     only(p for p in plan.predictors if p.name === name)
 
 # The per-observation location node feeding a response's likelihood plate: a
-# scan-state latent vector fed directly (its own name — the layout view), or a
-# linear predictor's `_ppl_lp_<name>` node otherwise.
+# scan-state or per-cell (plate) latent vector fed directly (its own name —
+# the layout view), or a linear predictor's `_ppl_lp_<name>` node otherwise.
 function _location_node(r::LikelihoodSpec, plan::StructuralPlan)
     any(s -> s.state === r.predictor, plan.scans) && return r.predictor
+    _is_plate_param(plan, r.predictor) && return r.predictor
     return _lp_name(_predictor(plan, r.predictor))
 end
 
@@ -551,9 +676,11 @@ end
 function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _location_node(r, plan)
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, lp]
     yv, lpv = _dovar(1), _dovar(2)
-    sref = _thread_ref!(inputs, r.scale)
+    sref = _thread_ref!(inputs, sarg)
     lb, ub = _thread_bounds!(inputs, r.evidence, false)
     base = :(normal($lpv, $sref).logpdf($yv))
     cell = _gaussian_cell(r.evidence.kind, base, yv, lb, ub, lpv, sref)
@@ -561,7 +688,7 @@ function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _gaussian_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, lpv::Symbol, sref)
@@ -726,35 +853,78 @@ function _nb2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
     mu = _mu_name(r.label)
-    pre = :($mu = exp.($lp))
+    pre = Expr[:($mu = exp.($lp))]
+    sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, mu]
     yv, muv = _dovar(1), _dovar(2)
-    phiref = _thread_ref!(inputs, r.scale)
+    phiref = _thread_ref!(inputs, sarg)
     cell = :(negative_binomial2($muv, $phiref).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
     # Surface is Distributions-SCALE `Gamma(alpha, mu/alpha)`; the kernel
     # takes rate, so the boundary inverts (same as the sampled-gamma prior).
-    av = r.scale isa Symbol ? r.scale : Float64(r.scale)
+    av = sarg isa Symbol ? sarg : Float64(sarg)
     rate = _rate_name(r.label)
-    pre = :($rate = $av ./ exp.($lp))
+    push!(pre, :($rate = $av ./ exp.($lp)))
     inputs = Any[y, rate]
     yv, ratev = _dovar(1), _dovar(2)
-    aref = _thread_ref!(inputs, r.scale)
+    aref = _thread_ref!(inputs, sarg)
     cell = :(gamma($aref, $ratev).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# The scale argument a likelihood plate threads per cell: scalar scales
+# (parameter, assignment, literal, raw data column) pass through untouched;
+# a predictor-fed scale binds its constrained vector once
+# (`_ppl_sc_<label>`, the `_ppl_mu_`/`_ppl_rate_` precompute precedent —
+# the link inverts here, never inside the cell) and the plate iterates
+# the node. The logit inversion reuses the Beta plate's inlined
+# `1 ./ (1 .+ exp.(-lp))` spelling (no new imports, Enzyme-safe).
+_sc_name(label::Symbol) = Symbol(:_ppl_sc_, label)
+
+function _scale_plate_arg(r::LikelihoodSpec, plan::StructuralPlan, pre::Vector{Expr})
+    s = r.scale
+    s isa ScalePredictorRef || return s
+    pred = _predictor(plan, s.predictor)
+    lp = _lp_name(pred)
+    sc = _sc_name(r.label)
+    rhs = if s.link === IdentityLink
+        lp
+    elseif s.link === LogLink
+        :(exp.($lp))
+    elseif s.link === LogitLink
+        :(1 ./ (1 .+ exp.(-$lp)))
+    else
+        throw(ContractValidationError(
+            "[generator] scale predictor link $(s.link) has no inversion " *
+            "(admitted: identity, log, logit)"))
+    end
+    # The annotation is load-bearing for AD, not decoration: it proves the
+    # plate input `:axis` statically, so `prepare` lowers the straight-line
+    # plate form. Unannotated (metadata-`Any`) vector inputs lower with the
+    # runtime `_authored_plate_is_axis` / `_plate_dependency_changed` guards,
+    # whose form defeats Enzyme's static-activity analysis on some endpoint
+    # bodies (NB2, found by test: silently wrong gradients). `AbstractVector`
+    # is eltype-free so integer offset-only LPs still match. The LP is
+    # always a vector here: codegen entry points validate first (empty
+    # predictors rejected) and gate HSGP (the only termless-at-emission
+    # shape), so every scale predictor contributes a vector summand.
+    push!(pre, :($sc::AbstractVector = $rhs))
+    return sc
 end
 
 _prob_name(label::Symbol) = Symbol(:_ppl_p_, label)
@@ -1099,6 +1269,110 @@ function _categorical_plain_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     return _plate_sum_stmts(pw, node, inputs, cell)
 end
 
+# Joint correlated-outcomes likelihood (SB's per-row
+# `multi_normal_cholesky(mean_row, L)` with
+# `L = diag_pre_multiply(scales, L_corr)`): one plate over the K outcome
+# columns + K mean LPs sums the per-row density. The row cell is scalar
+# forward substitution over threaded do-vars (the multinomial-cell shape —
+# no matrix, no triangular solve in the cell, so the tensorized plate
+# traces; a core-`mvnormal` splice was probed and fails Reactant primal
+# inside the plate — the in-cell `\` hits scalar indexing in Reactant's
+# `generic_trimatdiv!`, a primal gap distinct from the §7f gradient gap).
+# The L entries materialize as `_ppl_mvn_Le_` scalars (row-scaled layout
+# temps) and thread as shared scalar plate inputs.
+function _mvn_cholesky_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        node::Symbol, pw::Symbol)
+    outcomes = [r.response; r.extra_responses...]
+    preds = [r.predictor; r.extra_predictors...]
+    K = length(outcomes)
+    si = findfirst(p -> p.name === r.factor_scales, plan.vector_parameters)
+    ci = findfirst(p -> p.name === r.factor_corr, plan.vector_parameters)
+    (si === nothing || ci === nothing) && throw(ContractValidationError(
+        "[generator] joint response $(r.label) factor pieces unresolved " *
+        "(validate_plan links them)"))
+    sc, cr = plan.vector_parameters[si], plan.vector_parameters[ci]
+    (sc.size == K && cr.size == K) || throw(ContractValidationError(
+        "[generator] joint response $(r.label) factor sizes disagree " *
+        "with the $K outcomes (validate_plan checks this)"))
+    stmts = Expr[]
+    # L[i,j] = scales[i] * L_corr[i,j] (j ≤ i), one scalar per lower entry.
+    for i in 1:K, j in 1:i
+        push!(stmts, :($(_mvn_L_entry(r.label, i, j))::Float64 =
+            $(_vector_elt_name(sc.name, i)) * $(_rl_name(cr.name, i, j))))
+    end
+    lps = [_lp_name(_predictor(plan, q)) for q in preds]
+    inputs = Any[outcomes...; lps...]
+    yvs = [_dovar(i) for i in 1:K]
+    mvs = [_dovar(K + i) for i in 1:K]
+    Ld = Dict{Tuple{Int,Int},Symbol}()
+    for i in 1:K, j in 1:i
+        Ld[(i, j)] = _thread_ref!(inputs, _mvn_L_entry(r.label, i, j))
+    end
+    cell = _mvn_row_cell(K, yvs, mvs, Ld)
+    append!(stmts, _plate_sum_stmts(pw, node, inputs, cell))
+    return stmts
+end
+
+# In-graph L-entry name for a joint response (`_ppl_mvn_Le_<label>_<i>_<j>`,
+# j ≤ i). All `_ppl_`-hygienic.
+_mvn_L_entry(label::Symbol, i::Int, j::Int) =
+    Symbol(:_ppl_mvn_Le_, label, :_, i, :_, j)
+
+# One joint row's log-density as a single scalar expression: residuals,
+# forward substitution (`z[i] = (d[i] − Σ L[i,j]·z[j]) / L[i,i]`, inlined —
+# K is small), quadratic form, and the row constant. Pointwise-pure: each
+# lane evaluates its row's full `multi_normal_cholesky` log-density.
+function _mvn_row_cell(K::Int, yvs::Vector{Symbol}, mvs::Vector{Symbol},
+        Ld::Dict{Tuple{Int,Int},Symbol})
+    ds = [:( $(yvs[i]) - $(mvs[i]) ) for i in 1:K]
+    zs = Any[]
+    for i in 1:K
+        num = ds[i]
+        for j in 1:i-1
+            num = :( $num - $(Ld[(i, j)]) * $(zs[j]) )
+        end
+        push!(zs, :( ($num) / $(Ld[(i, i)]) ))
+    end
+    quad = foldl((a, z) -> :( $a + $z * $z ), zs; init = :(0.0))
+    logdet = foldl((a, i) -> :( $a + log($(Ld[(i, i)])) ), 1:K; init = :(0.0))
+    row_const = -0.5 * K * log(2 * pi)
+    return :( $row_const - $logdet - 0.5 * $quad )
+end
+
+# R2D2 prior bindings: the location vector stays a literal (SB
+# `beta_loc`), while the scale vector unrolls per design column —
+# literal fallbacks at share 0, `sqrt(phi[k]*R2*tau^2/varx[j])`
+# expressions over the in-graph simplex elements + scalars otherwise
+# (SB `brm_r2d2_scale`, unrolled — the share map is static data, so no
+# data-dependent branching enters the graph). All radicands are
+# positive by construction (simplex/logistic/exp transforms +
+# validated varx). The consuming plate-sum shape is unchanged.
+function _r2d2_prior_stmts(rp::R2D2Prior, shape::DesignShape,
+        columns::Dict{Symbol,AbstractVector}, mut::Symbol, sdt::Symbol)
+    share, fallback, loc, varx =
+        r2d2_column_scales(shape, columns, rp.overrides)
+    elts = Any[]
+    for j in eachindex(share)
+        if share[j] == 0
+            push!(elts, fallback[j])
+            continue
+        end
+        ph = _vector_elt_name(rp.phi, share[j])
+        r2 = rp.r2
+        t2 = rp.tau isa Symbol ? :($(rp.tau) * $(rp.tau)) :
+            Float64(rp.tau)^2
+        push!(elts, :(sqrt($ph * $r2 * $t2 / $(varx[j]))))
+    end
+    return Any[:($mut = Float64[$(loc...)]), :($sdt = Float64[$(elts...)])]
+end
+
+_r2d2_for(plan::StructuralPlan, pred::Symbol) = begin
+    for rp in plan.r2d2_priors
+        rp.predictor === pred && return rp
+    end
+    return nothing
+end
+
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     stmts = Expr[]
     terms = Any[]
@@ -1107,11 +1381,16 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         shape.width == 0 && continue
         node = Symbol(:_ppl_prior_, pred.name)
         pw = Symbol(:_ppl_pw_prior_, pred.name)
-        loc, sca = coefficient_priors(shape, plan.population_priors)
         mut = Symbol(:_ppl_prmu_, pred.name)
         sdt = Symbol(:_ppl_prsd_, pred.name)
-        push!(stmts, :($mut = Float64[$(loc...)]))
-        push!(stmts, :($sdt = Float64[$(sca...)]))
+        rp = _r2d2_for(plan, pred.name)
+        if rp === nothing
+            loc, sca = coefficient_priors(shape, plan.population_priors)
+            push!(stmts, :($mut = Float64[$(loc...)]))
+            push!(stmts, :($sdt = Float64[$(sca...)]))
+        else
+            push!(stmts, _r2d2_prior_stmts(rp, shape, plan.columns, mut, sdt)...)
+        end
         coef = block_name(pred.name)
         cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
         cell = :(normal($mv, $sv).logpdf($cv))
@@ -1124,8 +1403,9 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         push!(terms, node)
     end
     # Leveled vector latents (cutpoints/thresholds/simplexes/coefficient
-    # packs): unrolled scalar sums over the `_ppl_v_` layout elements
-    # (bound plans carry concrete sizes). Empty packs contribute 0.0.
+    # packs, joint-factor scales/Cholesky): unrolled scalar sums over the
+    # `_ppl_v_` layout elements (bound plans carry concrete sizes). Empty
+    # packs contribute 0.0.
     for p in plan.vector_parameters
         node = Symbol(:_ppl_prior_, p.name)
         push!(stmts, :($node::Float64 = $(_vector_prior_expr(p))))
@@ -1186,6 +1466,27 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         _vector_prior_stmts!(stmts, terms, xi, :normal, (arg1 = 0, arg2 = 1),
             nothing)
     end
+    # HSGP bases (SB `_sb_hsgp`/`_sb_hsgp_aniso`): the length scales and
+    # marginal scale as scalar `lognormal(0, 1)` nodes plus the
+    # standardized `beta_raw` plate (shared vector-prior helper). The
+    # floored rhos emit WITHOUT a truncation normalizer: SB's
+    # `lognormal(0,1; lower=rho_lower)` is Stan lower-bound kernel
+    # semantics (offset-exp Jacobian only — the ranef-`tau` precedent).
+    for hb in plan.hsgp_bases
+        names = _hsgp_names(hb)
+        for rho in names.rhos
+            node = Symbol(:_ppl_prior_, rho)
+            cell = _family_logpdf_expr(:lognormal, Any[0, 1], rho)
+            push!(stmts, :($node::Float64 = $cell))
+            push!(terms, node)
+        end
+        snode = Symbol(:_ppl_prior_, names.sigma)
+        scell = _family_logpdf_expr(:lognormal, Any[0, 1], names.sigma)
+        push!(stmts, :($snode::Float64 = $scell))
+        push!(terms, snode)
+        _vector_prior_stmts!(stmts, terms, names.beta, :normal,
+            (arg1 = 0, arg2 = 1), nothing)
+    end
     # Sequential-recurrence (scan) latents: setup + recurrence density.
     scanstmts, scannodes = _scan_prior_statements(plan, layout)
     append!(stmts, scanstmts)
@@ -1195,18 +1496,18 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     return stmts
 end
 
-# One correlated bucket's LKJ prior node (Stan `lkj_corr_cholesky_lpdf`
-# op order, preserved verbatim from the host
-# `lkj_corr_cholesky_logpdf`: constant literal first, then per-diagonal
-# terms in row order — `(K-i)*log(L[i,i])` at `eta == 1.0`, else
-# `a*log + b*log` with emission-time coefficients). Reads the named
-# `_ppl_rl_` diagonal scalars. K=1 is the `0.0` literal (Stan's K=1 LKJ
+# Shared LKJ-prior node body (Stan `lkj_corr_cholesky_lpdf` op order,
+# preserved verbatim from the host `lkj_corr_cholesky_logpdf`: constant
+# literal first, then per-diagonal terms in row order — `(K-i)*log(L[i,i])`
+# at `eta == 1.0`, else `a*log + b*log` with emission-time coefficients).
+# Reads the named `_ppl_rl_` diagonal scalars — no matrix materializes, and
+# the scalar-only form keeps the native Enzyme reverse pass on the same
+# straight-line shape as every other prior (the core `lkj_corr_cholesky`
+# object's `(1:K)` range broadcasts fail Enzyme reverse, so the splice
+# stays out of generated code). K=1 is the `0.0` literal (Stan's K=1 LKJ
 # term is ±0.0 — no diagonal, zero constant).
-function _lkj_prior_expr(b::RanefBucket)
-    K = length(b.margins)
-    L = _ranef_corr_names(b)[1]
+function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64)
     K == 1 && return :(0.0)
-    eta = b.lkj_eta
     terms = Any[lkj_logconst(K, eta)]
     if eta == 1.0
         for i in 2:K
@@ -1221,6 +1522,12 @@ function _lkj_prior_expr(b::RanefBucket)
         end
     end
     return foldl((a, c) -> :($a + $c), terms)
+end
+
+# One correlated bucket's LKJ prior node (names/sizes from the bucket).
+function _lkj_prior_expr(b::RanefBucket)
+    return _lkj_prior_terms(_ranef_corr_names(b)[1], length(b.margins),
+        b.lkj_eta)
 end
 
 # One plate over a latent VECTOR (a plate parameter or a spline vector),
@@ -1313,12 +1620,18 @@ end
 # Normal for threshold/coefficient packs (Stan `ordered`/`vector`
 # semantics — no factorial normalizer, matching `_BRMThresholdPrior`),
 # Dirichlet for simplexes (Stan `dirichlet_lpdf`: the log-multivariate-Beta
-# normalizer folds host-side — data-only — plus Σ (α−1)·log(s)).
+# normalizer folds host-side — data-only — plus Σ (α−1)·log(s)),
+# elementwise Exponential for joint-factor scales (a literal scale inlines;
+# a sampled hyperparameter resolves as a body local, the scalar-prior
+# shape), and the shared LKJ node for joint Cholesky factors.
 function _vector_prior_expr(p::VectorParameter)
     m = p.size
     m === nothing && throw(ContractValidationError(
         "[generator] vector parameter $(p.name) has unresolved size " *
         "(bind_data infers it)"))
+    if p.family === :cholesky_corr_lkj
+        return _lkj_prior_terms(p.name, m, Float64(p.args.arg1))
+    end
     elts = [_vector_elt_name(p.name, i) for i in 1:m]
     if p.family === :simplex_dirichlet
         alpha = Vector{Float64}(p.args.arg1)
@@ -1329,9 +1642,20 @@ function _vector_prior_expr(p::VectorParameter)
         end
         return foldl((x, y) -> :($x + $y), terms)
     end
-    mu, s = Float64(p.args.arg1), Float64(p.args.arg2)
-    terms = Any[:(normal($mu, $s).logpdf($t)) for t in elts]
-    return foldl((x, y) -> :($x + $y), terms; init = :(0.0))
+    if p.family === :positive_exponential
+        th = p.args.arg1
+        theta = th isa Symbol ? th : Float64(th)
+        terms = Any[:(exponential($theta).logpdf($t)) for t in elts]
+        return foldl((x, y) -> :($x + $y), terms; init = :(0.0))
+    end
+    if p.family === :ordered_normal || p.family === :vector_normal
+        mu, s = Float64(p.args.arg1), Float64(p.args.arg2)
+        terms = Any[:(normal($mu, $s).logpdf($t)) for t in elts]
+        return foldl((x, y) -> :($x + $y), terms; init = :(0.0))
+    end
+    throw(ContractValidationError(
+        "[generator] vector parameter $(p.name) family $(p.family) " *
+        "has no scalar prior form"))
 end
 
 # --- Sequential-recurrence (scan) density (slice 1: CENTERED) ---

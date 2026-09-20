@@ -30,7 +30,8 @@ const ParamName = Symbol
 families (categorical / ordinal / multinomial): reference-coded
 multi-logit categorical, cumulative-logit ordinal with ordered cutpoints,
 general typed ordinal (2 structures × 3 links), shared-simplex multinomial
-over a count matrix, and plain categorical over simplex probabilities."""
+over a count matrix, plain categorical over simplex probabilities, and the
+joint correlated-outcomes family (per-row MvNormal over a Cholesky factor)."""
 @enum LikelihoodFamily::UInt8 begin
     GaussianFam
     BernoulliLogitFam
@@ -48,6 +49,7 @@ over a count matrix, and plain categorical over simplex probabilities."""
     OrdinalFam
     MultinomialFam
     CategoricalFam
+    MvNormalCholeskyFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -95,13 +97,35 @@ struct ResponseEvidence
 end
 
 """
+    ScalePredictorRef(predictor, link)
+
+A predictor-fed scale/shape use: the response's auxiliary (Gaussian
+sigma, NB2 dispersion phi, Gamma shape alpha) is a whole linear
+predictor, varying per observation. `predictor` names the
+[`PredictorSpec`](@ref) (planned exactly like a location predictor:
+terms, priors, one link); `link` is the scale use-site wrapper —
+[`IdentityLink`](@ref) (bare predictor), [`LogLink`](@ref)
+(`exp.(predictor)`), or [`LogitLink`](@ref) (`logistic.(predictor)`) —
+and must equal the predictor's own link (the one-link-per-predictor
+rule). The generator binds the constrained vector once per response
+(`_ppl_sc_<label>`) and threads it through the likelihood plate per
+cell, so evidence corrections read the per-cell scale.
+"""
+struct ScalePredictorRef
+    predictor::Symbol
+    link::LinkFunction
+end
+
+"""
     LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, trials[, range]])
 
-One independent response. `scale` is the response's scalar auxiliary —
-Gaussian sigma, NB2 dispersion phi, Gamma shape alpha (parameter,
-assignment, or folded literal) — and must be `nothing` otherwise. (One
-slot covers every admitted family; a two-auxiliary family such as Beta
-needs a new field — noted, not built.) `weights` is a
+One independent response. `scale` is the response's auxiliary —
+Gaussian sigma, NB2 dispersion phi, Gamma shape alpha — either scalar
+(parameter, assignment, folded literal, or a raw per-observation data
+column) or, for Gaussian/NB2/Gamma only, a [`ScalePredictorRef`](@ref)
+(predictor-fed per-observation scale); it must be `nothing` otherwise.
+(One slot covers every admitted family; a two-auxiliary family such as
+Beta needs a new field — noted, not built.) `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
 closed emitter-side. `trials` is the Binomial trial count (Int column or
 Int literal), `nothing` otherwise. `range` carries a literal `y[1:N]`
@@ -142,14 +166,37 @@ at their defaults:
 
 Multinomial/Categorical responses name their shared-simplex
 [`VectorParameter`](@ref) in `predictor` (no linear predictor — the
-scan-state precedent).
+scan-state precedent). A Gaussian-identity response may likewise name a
+[`PlateParameter`](@ref) in `predictor`: a latent-mean observation
+(`x_obs ~ Normal(x_true, sd)` with scalar constant `sd` — the SB `me`
+mirror).
+
+
+Joint correlated-outcomes responses (`MvNormalCholeskyFam`, SB
+`[y1..yK] ~ MvNormalCholesky([mu1..muK], L)`) use the trailing joint
+fields, built with keywords (`extra_responses=`, `factor_scales=`,
+`factor_corr=`); every other family leaves them at their defaults:
+
+- `extra_responses`: joint outcome columns after `response`
+  (outcome order 1..K is `[response; extra_responses...]`, K ≥ 1);
+  empty otherwise. Each outcome's mean is an identity-link linear
+  predictor: `predictor` for outcome 1, `extra_predictors` (reused
+  from the CategoricalLogit shape) for outcomes 2..K.
+- `factor_scales`: the joint factor's positive scale vector
+  ([`VectorParameter`](@ref), K scales), `nothing` otherwise.
+- `factor_corr`: the joint factor's LKJ Cholesky factor
+  ([`VectorParameter`](@ref), K×K), `nothing` otherwise.
+
+Joint widths are structural (K = 1 + `length(extra_responses)`):
+no `n_levels`, no bind-time size inference — the factor parameters
+carry concrete sizes validated against K.
 """
 struct LikelihoodSpec
     family::LikelihoodFamily
     link::LinkFunction
     response::ColumnRef
     predictor::Symbol
-    scale::Union{Nothing,ParamName,Real}
+    scale::Union{Nothing,ParamName,Real,ScalePredictorRef}
     weights::Union{Nothing,ColumnRef}
     evidence::ResponseEvidence
     label::Symbol
@@ -163,6 +210,9 @@ struct LikelihoodSpec
     discrimination::Union{Nothing,Real,ColumnRef}
     threshold_columns::Vector{ColumnRef}
     threshold_coefs::Union{Nothing,ParamName}
+    extra_responses::Vector{ColumnRef}
+    factor_scales::Union{Nothing,ParamName}
+    factor_corr::Union{Nothing,ParamName}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
@@ -183,11 +233,15 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         ordinal_structure::Union{Nothing,Symbol} = nothing,
         discrimination::Union{Nothing,Real,ColumnRef} = nothing,
         threshold_columns::Vector{ColumnRef} = Symbol[],
-        threshold_coefs::Union{Nothing,ParamName} = nothing)
+        threshold_coefs::Union{Nothing,ParamName} = nothing,
+        extra_responses::Vector{ColumnRef} = Symbol[],
+        factor_scales::Union{Nothing,ParamName} = nothing,
+        factor_corr::Union{Nothing,ParamName} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
-        threshold_columns, threshold_coefs)
+        threshold_columns, threshold_coefs, extra_responses, factor_scales,
+        factor_corr)
 end
 
 """
@@ -198,7 +252,9 @@ One additive predictor term: structure only, never materialized designs
 never a per-level label. Terms take no options: factor sizing lives in
 the plan's [`LevelMap`](@ref)s (full-rank over exactly the mapped
 levels; no contrasts, no reference dropping — that machinery was
-BRM-specific and is gone).
+BRM-specific and is gone). A `ContinuousTerm` may name a per-cell latent
+([`PlateParameter`](@ref)) instead of a data column: the latent vector
+enters the design with a free coefficient (the SB `me` mirror).
 """
 struct TermSpec
     kind::TermKind
@@ -231,6 +287,38 @@ struct PopulationPrior
     addressee::Symbol
     location::Real
     scale::Real
+end
+
+"""
+    R2D2Prior(predictor, r2, phi, tau, overrides)
+
+Flat whole-predictor R2D2 variance decomposition (SB mirror, the
+`effect(lp,:) ~ r2d2(...)` form — the `sd(...) ~ r2d2(...)` R2D2M2/ICC
+grammar belongs to the hierarchical lane, never here). One per
+predictor at most; a predictor with an `R2D2Prior` carries NO
+[`PopulationPrior`](@ref) rows (coverage moves here).
+
+- `r2` names the scalar `Beta` [`SampledParameter`](@ref).
+- `phi` names the `:simplex_dirichlet` [`VectorParameter`](@ref) whose
+  length is the share count.
+- `tau` is the total scale: a sampled-parameter name (half-Normal) or
+  a positive literal (SB's data `tau_bsv`).
+- `overrides` maps addressees with an explicit Normal prior to their
+  `(location, scale)` — those columns keep their own scale and leave
+  the simplex (the SB share_idx/fallback composition). The intercept
+  is always share 0 (its override, if stated, supplies loc/scale).
+
+Share assignment follows SB exactly: every non-intercept design
+column without an override takes the next share in design-column
+order; the emitter derives
+`scale[j] = sqrt(phi[share] * R2 * tau^2 / varx[j])`.
+"""
+struct R2D2Prior
+    predictor::Symbol
+    r2::Symbol
+    phi::Symbol
+    tau::Union{Symbol,Real}
+    overrides::Dict{Symbol,Tuple{Float64,Float64}}
 end
 
 """
@@ -328,7 +416,7 @@ struct RanefMargin
 end
 
 """
-    RanefBucket(id, group, kind, margins, slices, lkj_eta, label)
+    RanefBucket(id, group, kind, margins, slices, lkj_eta, label[, levels])
 
 One shared random-effect draws block (SB mirror): non-centered geometry
 over `K = length(margins)` margins in `G` groups of raw column `group`.
@@ -339,7 +427,14 @@ tau + z_flat; ALL ID buckets, even K=1 — SB's ID path has no K=1 fast
 path). `slices` maps each target predictor to its static column range;
 the ranges partition `1:K` contiguously in body order. `lkj_eta` is the
 LKJ shape (correlated only; `NaN` otherwise). `label` is `:bucket_<suffix>`
-(`<ID>_<group>` or plain `<group>`).
+(`<ID>_<group>` or plain `<group>`). `levels` is the grouping's DECLARED
+levels in numbering order (SB `CA.levels` for categorical groupings,
+sort order otherwise): the in-model [`_declared_codes`](@ref) encoder
+numbers groups by position in this vector — no sorting — and `G` is its
+length (unobserved declared levels keep prior-only coefficients, exactly
+like SB). `nothing` pre-bind (or when the emitter has no declaration):
+[`bind_data`](@ref) fills sort-ordered observed levels, which equal SB
+numbering for plain vectors; hand-built bound plans must fill it too.
 """
 struct RanefBucket
     id::Union{Nothing,Symbol}
@@ -349,7 +444,16 @@ struct RanefBucket
     slices::Vector{Tuple{Symbol,UnitRange{Int}}}
     lkj_eta::Float64
     label::Symbol
+    levels::Union{Nothing,Vector}
 end
+
+# Pre-declared-levels 7-arg positional construction keeps working with
+# `levels = nothing` (bind_data derives sort-ordered levels); the
+# emitter path passes explicit declared levels.
+RanefBucket(id::Union{Nothing,Symbol}, group::ColumnRef, kind::Symbol,
+    margins::Vector{RanefMargin}, slices::Vector{Tuple{Symbol,UnitRange{Int}}},
+    lkj_eta::Float64, label::Symbol) =
+    RanefBucket(id, group, kind, margins, slices, lkj_eta, label, nothing)
 
 """
     VectorParameter(name, family, args, size[, label])
@@ -366,12 +470,24 @@ thresholds, or a shared simplex), packed as one contiguous block:
 - `:simplex_dirichlet` — a simplex with a `Dirichlet(arg1)` prior
   (`arg1` a literal concentration vector — frozen data, the
   coefficient-prior precedent) + the stick-breaking Jacobian.
+- `:positive_exponential` — a positive K-vector with an elementwise
+  `Exponential(arg1)` prior (the joint factor's scales; `arg1` a
+  finite positive literal or a scalar parameter/assignment name —
+  sampled scale hyperparameters ride the scalar-prior shape).
+- `:cholesky_corr_lkj` — a K×K LKJ Cholesky factor with an
+  `lkj_corr_cholesky(arg1)` prior (`arg1` the shape hyperparameter,
+  a finite positive literal), packing K(K−1)/2 thetas.
 
 `size` is the constrained length (K−1 for thresholds, K for a simplex;
 `nothing` = infer at bind from the linked leveled response). Args are
 LITERALS only (hierarchical threshold/Dirichlet concentrations fail
-closed — planned). K=1 is uniform: zero-length threshold vectors carry
-no statements/prior/Jacobian, and a 1-simplex is the constant `[1.0]`.
+closed — planned), except an exponential scale, which also admits a
+scalar parameter/assignment name. K=1 is uniform: zero-length
+threshold vectors carry no statements/prior/Jacobian, a 1-simplex is
+the constant `[1.0]`, and a 1×1 LKJ factor packs zero thetas
+(constraining to `[1.0]` with a `0.0` prior node — Stan's K=1 LKJ).
+Joint-factor sizes are STRUCTURAL (`size` = the joint width K,
+concrete — never `nothing`).
 """
 struct VectorParameter
     name::ParamName
@@ -654,6 +770,7 @@ struct StructuralPlan
     spline_vectors::Vector{SplineVector}
     hsgp_bases::Vector{HSGPBasis}
     kernel_plates::Vector{KernelPlate}
+    r2d2_priors::Vector{R2D2Prior}
 end
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
@@ -672,7 +789,7 @@ StructuralPlan(
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[],
         RanefBucket[], VectorParameter[], SplineBasis[], SplineVector[],
-        HSGPBasis[], KernelPlate[])
+        HSGPBasis[], KernelPlate[], R2D2Prior[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -700,11 +817,12 @@ function StructuralPlan(
         spline_bases::Vector{SplineBasis} = SplineBasis[],
         spline_vectors::Vector{SplineVector} = SplineVector[],
         hsgp_bases::Vector{HSGPBasis} = HSGPBasis[],
-        kernel_plates::Vector{KernelPlate} = KernelPlate[])
+        kernel_plates::Vector{KernelPlate} = KernelPlate[],
+        r2d2_priors::Vector{R2D2Prior} = R2D2Prior[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, columns, n_obs, roles, levelmaps,
         plate_parameters, scans, ranef_buckets, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, kernel_plates)
+        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -931,7 +1049,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
     BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
-    OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam)
+    OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
+    MvNormalCholeskyFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -988,6 +1107,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_predictors(plan)
     _validate_levelmaps(plan)
     _validate_priors(plan)
+    _validate_r2d2(plan)
     _validate_kernels(plan)
     _validate_responses(plan)
     _validate_ranef_buckets(plan)
@@ -1013,6 +1133,7 @@ function validate_data(plan::StructuralPlan)
     _validate_splines_data(plan)
     _validate_hsgp_data(plan)
     _validate_kernels_data(plan)
+    _validate_r2d2_data(plan)
     return nothing
 end
 
@@ -1160,6 +1281,27 @@ function _validate_bucket_shape(b::RanefBucket, prednames::Set{Symbol})
             _fail(b.label, "K=1 plain bucket takes no LKJ eta (no " *
                   "correlation to parameterize), got $(b.lkj_eta)")
     end
+    _validate_bucket_levels_shape(b)
+    return nothing
+end
+
+# Declared-levels checks provable without data (coverage needs the bound
+# column — `_validate_ranef_buckets_data`). Emitter-provided levels must
+# be non-empty, duplicate-free, and literal-embeddable (the admission
+# mirrors `_level_literal` in preprocessing.jl — the generator embeds
+# these values into the `_declared_codes` call).
+function _validate_bucket_levels_shape(b::RanefBucket)
+    b.levels === nothing && return nothing
+    !isempty(b.levels) ||
+        _fail(b.label, "bucket declares zero grouping levels")
+    length(unique(b.levels)) == length(b.levels) ||
+        _fail(b.label, "bucket declares duplicate grouping levels " *
+              "($(repr(b.levels)))")
+    for lv in b.levels
+        lv isa Union{Number,String,Bool,Char,Symbol} ||
+            _fail(b.label, "declared level $(repr(lv)) is not " *
+                  "literal-embeddable (numeric/string/symbol only)")
+    end
     return nothing
 end
 
@@ -1226,14 +1368,69 @@ function _validate_ranef_buckets_data(plan::StructuralPlan)
         _is_derived(plan, b.group) &&
             _fail(b.label, "grouping column $(b.group) must be raw data " *
                   "(level knowledge needs bound values)")
-        levels = _grouping_levels(plan.columns[b.group])
-        length(levels) >= 1 ||
-            _fail(b.label, "grouping column $(b.group) has no levels")
+        b.levels === nothing &&
+            _fail(b.label, "bucket has no declared grouping levels " *
+                  "(bind_data fills these — hand-built bound plans must too)")
+        # Coverage: every observed value needs a declared code (an
+        # uncovered value would encode 0 and gather out of bounds).
+        levels = b.levels::Vector
+        for v in plan.columns[b.group]
+            v in levels ||
+                _fail(b.label, "grouping value $(repr(v)) of $(b.group) " *
+                      "is not a declared level (declared: $(repr(levels)))")
+        end
         for m in b.margins
             _validate_margin_data(m, b.label, plan)
         end
     end
+    # One grouping, one numbering: same-group buckets share the per-group
+    # `_ppl_gidx_` encoder, so their declared levels must agree exactly
+    # (order included — codes are positions).
+    for i in eachindex(plan.ranef_buckets)
+        for j in (i + 1):length(plan.ranef_buckets)
+            bi, bj = plan.ranef_buckets[i], plan.ranef_buckets[j]
+            bi.group === bj.group || continue
+            bi.levels == bj.levels ||
+                _fail(:plan, "buckets $(bi.label) and $(bj.label) share " *
+                      "grouping $(bi.group) but declare different levels " *
+                      "($(repr(bi.levels)) vs $(repr(bj.levels)))")
+        end
+    end
     return nothing
+end
+
+# Group count for a bucket: the DECLARED level count (unobserved declared
+# levels keep prior-only coefficients, exactly like SB). Loud defense in
+# depth — validate_data proves levels non-nothing on every bound plan.
+function _bucket_nlevels(b::RanefBucket)
+    b.levels === nothing && throw(ContractValidationError(
+        "[layout] bucket $(b.label) has no declared grouping levels " *
+        "(bind_data fills these — hand-built bound plans must too)"))
+    return length(b.levels)
+end
+
+# Binder evaluation for bucket levels (the LevelMap precedent):
+# `nothing` fills sort-ordered observed levels (SB numbering for plain
+# vectors); emitter-provided levels pass through (validated by
+# `_validate_bucket_levels_shape` + `_validate_ranef_buckets_data`).
+function _eval_bucket_levels(buckets::Vector{RanefBucket},
+        columns::Dict{Symbol,AbstractVector})
+    out = RanefBucket[]
+    for b in buckets
+        b.levels !== nothing && (push!(out, b); continue)
+        haskey(columns, b.group) ||
+            _fail(b.label, "grouping column $(b.group) is not bound")
+        levels =
+            try
+                _grouping_levels(columns[b.group])
+            catch err
+                _fail(b.label, "grouping column $(b.group) levels not " *
+                             "orderable ($err)")
+            end
+        push!(out, RanefBucket(b.id, b.group, b.kind, b.margins, b.slices,
+            b.lkj_eta, b.label, collect(levels)))
+    end
+    return out
 end
 
 function _validate_margin_data(m::RanefMargin, label::Symbol, plan::StructuralPlan)
@@ -2490,7 +2687,12 @@ const VECTOR_ARITY = Dict{Symbol,Tuple{Vararg{Symbol}}}(
     :ordered_normal => (:arg1, :arg2),
     :vector_normal => (:arg1, :arg2),
     :simplex_dirichlet => (:arg1,),
+    :positive_exponential => (:arg1,),
+    :cholesky_corr_lkj => (:arg1,),
 )
+
+"""Joint-factor vector families (the correlated-outcomes factor pieces)."""
+const _JOINT_FACTOR_FAMILIES = (:positive_exponential, :cholesky_corr_lkj)
 
 # Constrained vector (cutpoint/threshold/simplex) parameters: family/arity
 # plus literal-only args (a threshold Normal takes literal location/scale; a
@@ -2505,7 +2707,8 @@ function _validate_vector_parameters(plan::StructuralPlan)
     for p in plan.vector_parameters
         haskey(VECTOR_ARITY, p.family) || _fail(p.label,
             "vector family $(p.family) unknown (admitted: ordered_normal, " *
-            "vector_normal, simplex_dirichlet)")
+            "vector_normal, simplex_dirichlet, positive_exponential, " *
+            "cholesky_corr_lkj)")
         expected = VECTOR_ARITY[p.family]
         Tuple(keys(p.args)) == expected || _fail(p.label,
             "family $(p.family) takes positional keys $expected, got " *
@@ -2525,6 +2728,32 @@ function _validate_vector_parameters(plan::StructuralPlan)
                 "length $(length(alpha))")
             p.size === nothing || p.size >= 1 || _fail(p.label,
                 "simplex size must be ≥ 1, got $(p.size)")
+        elseif p.family === :positive_exponential
+            th = p.args.arg1
+            if th isa Symbol
+                th in _union_names(plan) || _fail(p.label,
+                    "exponential scale $th is not a scalar " *
+                    "parameter/assignment name")
+            else
+                (th isa Real && isfinite(th) && th > 0) || _fail(p.label,
+                    "exponential scale must be a finite positive literal " *
+                    "or a scalar parameter/assignment name, got $(repr(th))")
+            end
+            p.size !== nothing || _fail(p.label,
+                "joint-factor scales need a concrete size (the joint width " *
+                "K — sizes are structural, never inferred)")
+            p.size >= 1 || _fail(p.label,
+                "joint-factor scales size must be ≥ 1, got $(p.size)")
+        elseif p.family === :cholesky_corr_lkj
+            eta = p.args.arg1
+            (eta isa Real && isfinite(eta) && eta > 0) || _fail(p.label,
+                "LKJ shape must be a finite positive literal " *
+                "(a hyperparameter), got $(repr(eta))")
+            p.size !== nothing || _fail(p.label,
+                "joint-factor LKJ Cholesky needs a concrete size (the joint " *
+                "width K — sizes are structural, never inferred)")
+            p.size >= 1 || _fail(p.label,
+                "joint-factor LKJ Cholesky size must be ≥ 1, got $(p.size)")
         else
             mu, s = p.args.arg1, p.args.arg2
             (mu isa Real && isfinite(mu)) || _fail(p.label,
@@ -2538,9 +2767,10 @@ function _validate_vector_parameters(plan::StructuralPlan)
     end
     # Linkage: each vector parameter is referenced by exactly one response
     # (as `thresholds` for ordered families, as `threshold_coefs` for
-    # per-threshold Ordinal, or as the simplex `predictor`) or by exactly
-    # one monotonic term (as its `increments` simplex) — never both, never
-    # shared.
+    # per-threshold Ordinal, as the simplex `predictor`, or as a joint
+    # factor piece), by exactly one monotonic term (as its `increments`
+    # simplex), or by exactly one R2D2 prior (as its share `phi`) —
+    # never shared.
     refs = Dict{Symbol,Vector{Symbol}}(
         p.name => Symbol[] for p in plan.vector_parameters)
     for r in plan.responses
@@ -2558,6 +2788,15 @@ function _validate_vector_parameters(plan::StructuralPlan)
         if _is_simplex_family(r.family) && haskey(refs, r.predictor)
             push!(refs[r.predictor], r.label)
         end
+        # A joint response links its factor's two pieces explicitly (existence
+        # + family diagnosis belongs to `_validate_joint_response`, which runs
+        # later with the full response context — here only count the edges).
+        if r.family === MvNormalCholeskyFam
+            for f in (r.factor_scales, r.factor_corr)
+                f === nothing && continue
+                haskey(refs, f) && push!(refs[f], r.label)
+            end
+        end
     end
     for pred in plan.predictors, t in pred.terms
         (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) || continue
@@ -2570,15 +2809,24 @@ function _validate_vector_parameters(plan::StructuralPlan)
             ":simplex_dirichlet vector parameter, got $(p.family)")
         push!(refs[incr], t.label)
     end
+    for rp in plan.r2d2_priors
+        haskey(refs, rp.phi) || _fail(rp.predictor,
+            "R2D2 share parameter $(rp.phi) is not a vector parameter")
+        p = only(q for q in plan.vector_parameters if q.name === rp.phi)
+        p.family === :simplex_dirichlet || _fail(rp.predictor,
+            "R2D2 share parameter $(rp.phi) must be a " *
+            ":simplex_dirichlet vector parameter, got $(p.family)")
+        push!(refs[rp.phi], rp.predictor)
+    end
     for p in plan.vector_parameters
         got = refs[p.name]
         isempty(got) && _fail(p.label,
-            "vector parameter $(p.name) unused by any response or " *
-            "monotonic term")
+            "vector parameter $(p.name) unused by any response, " *
+            "monotonic term, joint-factor link, or R2D2 prior")
         length(got) == 1 || _fail(p.label,
             "vector parameter $(p.name) shared by " *
-            "$(join(got, ", ")) — one vector parameter per response or " *
-            "monotonic term")
+            "$(join(got, ", ")) — one vector parameter per response, " *
+            "monotonic term, joint-factor link, or R2D2 prior")
     end
     return nothing
 end
@@ -2887,6 +3135,15 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
     # columns; structure validation checked both names.
     t.kind === ScanSummandTerm && return nothing
     for c in t.columns
+        # A per-cell latent enters a design only through a ContinuousTerm
+        # (a free coefficient scaling the latent vector — the SB `me`
+        # mirror); every other term kind over a latent fails closed.
+        if _is_plate_param(plan, c) && t.kind !== RanefGatherTerm
+            t.kind === ContinuousTerm || _fail(t.label,
+                "term over the latent vector $c must be a ContinuousTerm " *
+                "(a free coefficient scaling the latent — got $(t.kind))")
+            continue
+        end
         haskey(plan.columns, c) || _is_derived(plan, c) ||
             _fail(t.label, "term references missing column $c")
     end
@@ -2897,6 +3154,9 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
     # coverage is a LevelMap concern (_validate_levelmaps_data).
     if t.kind === ContinuousTerm || t.kind === OffsetTerm
         c = only(t.columns)
+        # A latent vector is length-n by construction (like a derived
+        # column); its values are parameters, never data eltypes.
+        _is_plate_param(plan, c) && return nothing
         # Derived columns are length-n by construction; their eltype is
         # unknown statically (in-graph Julia errors are loud).
         _is_derived(plan, c) && return nothing
@@ -3080,9 +3340,14 @@ end
 
 function _validate_priors(plan::StructuralPlan)
     seen = Set{Tuple{Symbol,Symbol}}()
+    r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
     for pr in plan.population_priors
         any(p -> p.name === pr.predictor, plan.predictors) ||
             _fail(:plan, "prior addresses unknown predictor $(pr.predictor)")
+        pr.predictor in r2d2 && _fail(:plan,
+            "predictor $(pr.predictor) carries an R2D2Prior — its prior " *
+            "mass lives there, not in a PopulationPrior row (explicit " *
+            "Normal columns ride the overrides map)")
         key = (pr.predictor, pr.addressee)
         key in seen &&
             _fail(:plan, "duplicate prior for $key")
@@ -3091,6 +3356,8 @@ function _validate_priors(plan::StructuralPlan)
             _fail(:plan, "prior for $key must be Normal(finite, positive)")
     end
     for pred in plan.predictors
+        # R2D2 predictors are covered by _validate_r2d2, not here.
+        pred.name in r2d2 && continue
         # Offset terms carry no coefficient; latent terms carry the per-cell
         # PlateParameter, whose prior lives on the plate parameter itself;
         # gather terms carry a RanefBucket, spline summands a SplineBasis,
@@ -3107,6 +3374,96 @@ function _validate_priors(plan::StructuralPlan)
         for a in addressees
             (pred.name, a) in seen ||
                 _fail(:plan, "no prior for ($(pred.name), $a)")
+        end
+    end
+    return nothing
+end
+
+# R2D2 structural checks: predictor linkage (one per predictor),
+# parameter families (Beta R2, simplex phi, half-Normal-or-literal tau),
+# and override addressees. Share counts need design widths, so they wait
+# for `_validate_r2d2_data`.
+function _validate_r2d2(plan::StructuralPlan)
+    seen = Set{Symbol}()
+    for rp in plan.r2d2_priors
+        pred = nothing
+        for p in plan.predictors
+            p.name === rp.predictor && (pred = p)
+        end
+        pred === nothing && _fail(:plan,
+            "R2D2 prior addresses unknown predictor $(rp.predictor)")
+        rp.predictor in seen && _fail(:plan,
+            "duplicate R2D2 prior for predictor $(rp.predictor) " *
+            "(one per predictor)")
+        push!(seen, rp.predictor)
+        r2 = nothing
+        for p in plan.parameters
+            p.name === rp.r2 && (r2 = p)
+        end
+        r2 === nothing && _fail(rp.predictor,
+            "R2D2 R2 parameter $(rp.r2) is not a sampled parameter")
+        r2.family === :beta || _fail(rp.predictor,
+            "R2D2 R2 parameter $(rp.r2) must be Beta, got $(r2.family)")
+        # phi linkage + family ride _validate_vector_parameters; tau:
+        if rp.tau isa Symbol
+            tau = nothing
+            for p in plan.parameters
+                p.name === rp.tau && (tau = p)
+            end
+            tau === nothing && _fail(rp.predictor,
+                "R2D2 tau $(rp.tau) names neither a sampled parameter " *
+                "nor a literal (data tau_bsv inlines as a literal)")
+            (tau.family === :normal && tau.support_override === :positive) ||
+                _fail(rp.predictor,
+                    "sampled R2D2 tau $(rp.tau) must be half-Normal " *
+                    "(`HalfNormal(s)`), got $(tau.family) with " *
+                    "override $(repr(tau.support_override))")
+        else
+            isfinite(rp.tau) && rp.tau > 0 || _fail(rp.predictor,
+                "literal R2D2 tau must be finite and strictly positive " *
+                "(SB `_sb_r2d2_positive`), got $(repr(rp.tau))")
+        end
+        allowed = Set{Symbol}(t.addressee for t in pred.terms)
+        any(t -> t.kind === InterceptTerm, pred.terms) &&
+            push!(allowed, :Intercept)
+        for (addr, (loc, sca)) in rp.overrides
+            addr in allowed || _fail(rp.predictor,
+                "R2D2 override addresses $addr, not a column of " *
+                "predictor $(rp.predictor)")
+            isfinite(loc) && isfinite(sca) && sca > 0 || _fail(rp.predictor,
+                "R2D2 override for $addr must be Normal(finite, " *
+                "positive), got ($(repr(loc)), $(repr(sca)))")
+        end
+    end
+    return nothing
+end
+
+# R2D2 data checks: the share composition needs design widths + bound
+# columns. Runs at bind (after levelmaps bind, after phi size inference).
+function _validate_r2d2_data(plan::StructuralPlan)
+    isempty(plan.r2d2_priors) && return nothing
+    for rp in plan.r2d2_priors
+        pred = only(p for p in plan.predictors if p.name === rp.predictor)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
+        share, _, _, varx =
+            r2d2_column_scales(shape, plan.columns, rp.overrides)
+        n_shares = isempty(share) ? 0 : maximum(share)
+        n_shares == 0 && _fail(rp.predictor,
+            "R2D2 over predictor $(rp.predictor) decomposes nothing " *
+            "(intercept-only or every column overridden) — the flat " *
+            "slice has no bucket rule to no-op for (that lives in " *
+            "the hierarchical lane)")
+        phi = only(p for p in plan.vector_parameters if p.name === rp.phi)
+        phi.size == n_shares || _fail(rp.predictor,
+            "R2D2 phi $(rp.phi) has $(phi.size) shares but predictor " *
+            "$(rp.predictor) decomposes $n_shares columns")
+        for j in eachindex(share)
+            share[j] == 0 && continue
+            isfinite(varx[j]) && varx[j] > 0 || _fail(rp.predictor,
+                "R2D2 column $j of predictor $(rp.predictor) has " *
+                "non-positive variance $(repr(varx[j])) — a constant " *
+                "column cannot join the simplex (drop it or give it " *
+                "an explicit Normal prior)")
         end
     end
     return nothing
@@ -3132,6 +3489,12 @@ function _validate_unleveled_fields(r::LikelihoodSpec)
         _fail(r.label, "only Ordinal takes threshold_columns")
     r.threshold_coefs === nothing ||
         _fail(r.label, "only Ordinal takes threshold_coefs")
+    isempty(r.extra_responses) ||
+        _fail(r.label, "only joint MvNormalCholesky takes extra_responses")
+    r.factor_scales === nothing ||
+        _fail(r.label, "only joint MvNormalCholesky takes factor_scales")
+    r.factor_corr === nothing ||
+        _fail(r.label, "only joint MvNormalCholesky takes factor_corr")
     return nothing
 end
 
@@ -3173,6 +3536,12 @@ function _validate_categorical_fields(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "CategoricalLogit takes no threshold_columns")
     r.threshold_coefs === nothing ||
         _fail(r.label, "CategoricalLogit takes no threshold_coefs")
+    isempty(r.extra_responses) ||
+        _fail(r.label, "CategoricalLogit takes no extra_responses")
+    r.factor_scales === nothing ||
+        _fail(r.label, "CategoricalLogit takes no factor_scales")
+    r.factor_corr === nothing ||
+        _fail(r.label, "CategoricalLogit takes no factor_corr")
     return nothing
 end
 
@@ -3212,6 +3581,12 @@ function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "an ordered response takes no extra_predictors")
     isempty(r.count_columns) ||
         _fail(r.label, "an ordered response takes no count_columns")
+    isempty(r.extra_responses) ||
+        _fail(r.label, "an ordered response takes no extra_responses")
+    r.factor_scales === nothing ||
+        _fail(r.label, "an ordered response takes no factor_scales")
+    r.factor_corr === nothing ||
+        _fail(r.label, "an ordered response takes no factor_corr")
     _validate_ordinal_extras(r, plan, used_predictors)
     return nothing
 end
@@ -3308,6 +3683,12 @@ function _validate_simplex_response(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "a simplex response takes no threshold_columns")
     r.threshold_coefs === nothing ||
         _fail(r.label, "a simplex response takes no threshold_coefs")
+    isempty(r.extra_responses) ||
+        _fail(r.label, "a simplex response takes no extra_responses")
+    r.factor_scales === nothing ||
+        _fail(r.label, "a simplex response takes no factor_scales")
+    r.factor_corr === nothing ||
+        _fail(r.label, "a simplex response takes no factor_corr")
     if r.family === MultinomialFam
         all_count = [r.response; r.count_columns...]
         length(unique(all_count)) == length(all_count) ||
@@ -3327,6 +3708,91 @@ function _validate_simplex_response(r::LikelihoodSpec, plan::StructuralPlan)
         r.n_levels === nothing || r.n_levels >= 1 || _fail(r.label,
             "n_levels must be ≥ 1, got $(r.n_levels)")
     end
+    if r.range !== nothing
+        first(r.range) == 1 || _fail(r.label,
+            "response range must start at 1 (got $(r.range)) — " *
+            "ranges cover eachindex exactly, no partial windows")
+        length(r.range) >= 1 || _fail(r.label,
+            "response range $(r.range) is empty")
+    end
+    return nothing
+end
+
+# Joint correlated-outcomes responses (SB
+# `[y1..yK] ~ MvNormalCholesky([mu1..muK], L)`): K outcome columns (lead +
+# tail) with K identity-link mean predictors (lead + `extra_predictors`,
+# reused from the CategoricalLogit shape) and one LKJ factor (scales +
+# Cholesky pieces linked explicitly). Widths are structural (K =
+# 1 + length(extra_responses)) — no `n_levels`, no bind-time inference.
+# Scalar/data-column means route through offset-only predictors
+# emitter-side; row weights stay planned (no SB joint semantics to mirror).
+function _validate_joint_response(r::LikelihoodSpec, plan::StructuralPlan,
+        used_predictors::Set{Symbol})
+    r.link === IdentityLink || _fail(r.label,
+        "a joint response uses IdentityLink (means enter the MvNormal " *
+        "directly — no link applies), got $(r.link)")
+    outcomes = [r.response; r.extra_responses...]
+    length(unique(outcomes)) == length(outcomes) ||
+        _fail(r.label, "joint outcome columns repeat a column " *
+            "($(join(outcomes, ", ")))")
+    K = length(outcomes)
+    preds = [r.predictor; r.extra_predictors...]
+    length(preds) == K || _fail(r.label,
+        "joint response has $K outcomes but $(length(preds)) mean " *
+        "predictors (one identity-link predictor per outcome)")
+    length(unique(preds)) == length(preds) ||
+        _fail(r.label, "joint mean predictors repeat a predictor " *
+            "($(join(preds, ", "))) — one linear predictor per outcome")
+    for q in preds
+        i = findfirst(p -> p.name === q, plan.predictors)
+        i === nothing && _fail(r.label,
+            "joint mean predictor $q is not a plan predictor")
+        plan.predictors[i].link === IdentityLink || _fail(r.label,
+            "joint mean predictor $q must carry IdentityLink (got " *
+            "$(plan.predictors[i].link)) — means enter the MvNormal directly")
+        push!(used_predictors, q)
+    end
+    r.factor_scales === nothing && _fail(r.label,
+        "a joint response requires its factor_scales vector parameter")
+    r.factor_corr === nothing && _fail(r.label,
+        "a joint response requires its factor_corr vector parameter")
+    si = findfirst(p -> p.name === r.factor_scales, plan.vector_parameters)
+    si === nothing && _fail(r.label,
+        "factor_scales $(r.factor_scales) is not a vector parameter")
+    ci = findfirst(p -> p.name === r.factor_corr, plan.vector_parameters)
+    ci === nothing && _fail(r.label,
+        "factor_corr $(r.factor_corr) is not a vector parameter")
+    sp, cp = plan.vector_parameters[si], plan.vector_parameters[ci]
+    sp.family === :positive_exponential || _fail(r.label,
+        "factor_scales $(sp.name) must be :positive_exponential, got " *
+        "$(sp.family)")
+    cp.family === :cholesky_corr_lkj || _fail(r.label,
+        "factor_corr $(cp.name) must be :cholesky_corr_lkj, got " *
+        "$(cp.family)")
+    sp.size == K || _fail(r.label,
+        "factor_scales size $(sp.size) disagrees with the $K joint outcomes")
+    cp.size == K || _fail(r.label,
+        "factor_corr size $(cp.size) disagrees with the $K joint outcomes")
+    r.n_levels === nothing ||
+        _fail(r.label,
+            "a joint response takes no n_levels (widths are structural)")
+    r.thresholds === nothing ||
+        _fail(r.label, "a joint response takes no thresholds")
+    isempty(r.count_columns) ||
+        _fail(r.label, "a joint response takes no count_columns")
+    r.ordinal_structure === nothing ||
+        _fail(r.label, "a joint response takes no ordinal_structure")
+    r.discrimination === nothing ||
+        _fail(r.label, "a joint response takes no discrimination")
+    isempty(r.threshold_columns) ||
+        _fail(r.label, "a joint response takes no threshold_columns")
+    r.threshold_coefs === nothing ||
+        _fail(r.label, "a joint response takes no threshold_coefs")
+    r.trials === nothing ||
+        _fail(r.label, "a joint response takes no trials")
+    r.weights === nothing ||
+        _fail(r.label, "joint responses take no weights " *
+            "(row weights on a joint density are planned)")
     if r.range !== nothing
         first(r.range) == 1 || _fail(r.label,
             "response range must start at 1 (got $(r.range)) — " *
@@ -3359,6 +3825,10 @@ function _validate_responses(plan::StructuralPlan)
     scan_states = Set{Symbol}(s.state for s in plan.scans)
     used_predictors = Set{Symbol}()
     for r in plan.responses
+        # A scale predictor feeds a slot exactly like a location predictor,
+        # so it counts toward the unused-predictor check below.
+        r.scale isa ScalePredictorRef &&
+            push!(used_predictors, r.scale.predictor)
         # A scan-state latent vector location: the mean is the carried state
         # directly (no linear predictor). Slice 1 admits Gaussian-identity only.
         if r.predictor in scan_states
@@ -3372,11 +3842,48 @@ function _validate_responses(plan::StructuralPlan)
             _validate_unleveled_fields(r)
             continue
         end
+        # A per-cell latent location (no linear predictor — the scan-state
+        # precedent): a latent-mean observation `x_obs ~ Normal(x_true, sd)`
+        # with scalar constant `sd` (the SB `me` mirror). Gaussian-identity
+        # only; SB's observation likelihood is never weighted, truncated,
+        # or ranged, so those fields fail closed.
+        if _is_plate_param(plan, r.predictor)
+            (r.family === GaussianFam && r.link === IdentityLink) || _fail(
+                r.label,
+                "a plate-mean response location ($(r.predictor)) is " *
+                "Gaussian-identity only (got $(r.family)/$(r.link))",
+            )
+            r.scale isa Real || _fail(r.label,
+                "a plate-mean observation ($(r.predictor)) takes a scalar " *
+                "constant scale (SB `me` sd — got " *
+                "$(r.scale === nothing ? "nothing" : repr(r.scale)))")
+            r.weights === nothing || _fail(r.label,
+                "a plate-mean observation ($(r.predictor)) takes no weights")
+            r.evidence.kind === :none || _fail(r.label,
+                "a plate-mean observation ($(r.predictor)) takes no " *
+                "censoring/truncation evidence")
+            r.range === nothing || _fail(r.label,
+                "a plate-mean observation ($(r.predictor)) takes no range " *
+                "(the latent covers the whole column)")
+            _validate_scale(r, plan)
+            _validate_evidence_structure(r, plan)
+            _validate_unleveled_fields(r)
+            continue
+        end
         # A simplex-vector location (no linear predictor — the scan-state
         # precedent): Multinomial/Categorical name their shared-simplex
         # vector parameter in `predictor`.
         if _is_simplex_family(r.family)
             _validate_simplex_response(r, plan)
+            _validate_scale(r, plan)
+            _validate_evidence_structure(r, plan)
+            continue
+        end
+        # A joint correlated-outcomes response (K outcomes, K mean
+        # predictors, one LKJ factor): validated whole, skipping the
+        # single-predictor triple.
+        if r.family === MvNormalCholeskyFam
+            _validate_joint_response(r, plan, used_predictors)
             _validate_scale(r, plan)
             _validate_evidence_structure(r, plan)
             continue
@@ -3501,6 +4008,20 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
                     "non-negative integers")
         end
         return nothing
+    elseif r.family === MvNormalCholeskyFam
+        # The joint outcomes cross as K raw numeric columns (lead + tail),
+        # row-aligned by the uniform-`n_obs` rule (SB packs complete aligned
+        # rows emitter-side; missingness fails closed in `_validate_columns`).
+        for c in [r.response; r.extra_responses...]
+            _is_derived(plan, c) && return _fail(r.label,
+                "joint outcome $c is derived — joint outcomes bind raw " *
+                "(derived outcomes need shape metadata — planned)")
+            haskey(plan.columns, c) ||
+                return _fail(r.label, "joint outcome column $c missing")
+            eltype(plan.columns[c]) <: Real ||
+                return _fail(r.label, "joint outcome $c must be numeric")
+        end
+        return nothing
     else
         return _fail(r.label, "response family $(r.family) has no column rule")
     end
@@ -3538,6 +4059,7 @@ function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
             _fail(r.label, "scale literal must be finite positive")
         return nothing
     end
+    s isa ScalePredictorRef && return _validate_scale_predictor(r, plan, s)
     # A scalar parameter/assignment scale resolves now; a per-observation scale
     # is a raw data column resolved at bind (see `_validate_scale_data`), so
     # defer an unknown symbol rather than failing structurally (mirrors how
@@ -3545,6 +4067,39 @@ function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     s isa Symbol && s in _union_names(plan) && return nothing
     s isa Symbol && return nothing
     return _fail(r.label, "scale references unknown name $s")
+end
+
+# A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha):
+# the predictor exists, carries the use-site link (the
+# one-link-per-predictor rule), and is not the response's own location
+# predictor (the two slots take distinct predictors — the BRM-side plan
+# rule, mirrored here as defense in depth). Beta-kappa predictors are
+# deferred; predictor-fed Binomial trials likewise (trials stay
+# column-or-literal by type).
+function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
+        s::ScalePredictorRef)
+    r.family === BetaLogitFam && _fail(r.label,
+        "Beta response with a scale predictor: predictor-fed concentration " *
+        "(kappa) is deferred — use a scalar kappa (parameter or literal)")
+    (r.family === GaussianFam || r.family === NegativeBinomial2Fam ||
+        r.family === GammaLogFam) ||
+        _fail(r.label, "this response family takes no scale predictor")
+    (s.link === IdentityLink || s.link === LogLink ||
+        s.link === LogitLink) ||
+        _fail(r.label, "scale predictor link must be identity, log, or " *
+            "logit (got $(s.link))")
+    idx = findfirst(p -> p.name === s.predictor, plan.predictors)
+    idx === nothing && _fail(r.label,
+        "scale addresses unknown predictor $(s.predictor)")
+    pred = plan.predictors[idx]
+    pred.link === s.link ||
+        _fail(r.label, "scale predictor $(s.predictor) carries link " *
+            "$(pred.link), scale use wraps $(s.link) — one link per predictor")
+    s.predictor === r.predictor &&
+        _fail(r.label, "scale predictor $(s.predictor) is the response's " *
+            "own location predictor — location and scale take distinct " *
+            "predictors")
+    return nothing
 end
 
 # Data-level per-observation scale check: a scalar parameter/assignment name
@@ -3555,6 +4110,9 @@ end
 function _validate_scale_data(r::LikelihoodSpec, plan::StructuralPlan)
     s = r.scale
     (s === nothing || s isa Real) && return nothing
+    # A predictor-fed scale is an n_obs LP by construction (design over the
+    # bound rows); there is no column length to check at bind.
+    s isa ScalePredictorRef && return nothing
     s isa Symbol || return nothing
     s in _union_names(plan) && return nothing
     _is_derived(plan, s) && _fail(r.label,
@@ -3951,7 +4509,9 @@ untouched. Inference precedence: response > trials > evidence > weight >
 group > predictor > data; term columns are the only `:predictor` source, so
 assignment/extra columns stay `:data`. Bucket grouping columns upgrade to
 `:group` (grouping dominates predictor use in the label; both facts stay
-visible in terms + buckets). `dims` binds kernel-plate dims keys
+visible in terms + buckets). Ranef buckets with `levels === nothing`
+gain sort-ordered observed levels (SB numbering for plain vectors —
+emitter-declared levels pass through). `dims` binds kernel-plate dims keys
 (`subject_count`, `timepoint_count`) to positive integers; every key must
 be consumed.
 """
@@ -3999,6 +4559,9 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         for c in r.count_columns
             haskey(inferred, c) && (inferred[c] = :response)
         end
+        for c in r.extra_responses
+            haskey(inferred, c) && (inferred[c] = :response)
+        end
         for c in r.threshold_columns
             haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
         end
@@ -4013,17 +4576,18 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     n = isempty(kbases) ? length(first(values(columns))) :
         _kernel_flat_length(only(kbases).subjects, only(kbases).timepoints)
     maps = _eval_levelmaps(plan.levelmaps, columns)
+    buckets = _eval_bucket_levels(plan.ranef_buckets, columns)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
-            plan.predictors)
+            plan.predictors, plan.r2d2_priors)
     bound = StructuralPlan(responses2, plan.predictors,
         plan.population_priors, plan.parameters, plan.assignments,
         columns, n; roles = merged, derived = plan.derived,
         levelmaps = maps, plate_parameters = plan.plate_parameters,
-        scans = plan.scans, ranef_buckets = plan.ranef_buckets,
+        scans = plan.scans, ranef_buckets = buckets,
         vector_parameters = vectors2, spline_bases = bases,
         spline_vectors = plan.spline_vectors, hsgp_bases = hbases,
-        kernel_plates = kbases)
+        kernel_plates = kbases, r2d2_priors = plan.r2d2_priors)
     validate_data(bound)
     return bound
 end
@@ -4033,13 +4597,15 @@ end
 # predictor count; Multinomial: count-column count) or from the response
 # column (max(y) for OrderedLogistic/Ordinal/Categorical); vector-param
 # `size === nothing` fills from the linked response (K−1 thresholds, K
-# simplex) or, for a monotonic-linked increments simplex, from its frozen
-# concentration length (K−1 increments for K levels). Explicit values
-# assert against the inference. Returns new (immutable) vectors; unbound
-# plans keep `nothing`.
+# simplex), from its frozen concentration length for a monotonic-linked
+# increments simplex (K−1 increments for K levels) or an R2D2-linked
+# share simplex (K shares). Explicit values assert against the
+# inference. Returns new (immutable) vectors; unbound plans keep
+# `nothing`.
 function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         vectors::Vector{VectorParameter}, columns::Dict{Symbol,AbstractVector},
-        predictors::Vector{PredictorSpec} = PredictorSpec[])
+        predictors::Vector{PredictorSpec} = PredictorSpec[],
+        r2d2::Vector{R2D2Prior} = R2D2Prior[])
     out_r = LikelihoodSpec[]
     for r in responses
         _is_leveled_family(r.family) || (push!(out_r, r); continue)
@@ -4062,6 +4628,10 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) ||
             continue
         monotonic_link[t.options.increments] = t.label
+    end
+    r2d2_link = Dict{Symbol,Symbol}()
+    for rp in r2d2
+        r2d2_link[rp.phi] = rp.predictor
     end
     out_v = VectorParameter[]
     for p in vectors
@@ -4098,6 +4668,21 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "(K=1 degenerates emitter-side and never reaches the thin layer)")
             p.size === nothing || p.size == want || _fail(p.label,
                 "monotonic increments size $(p.size) disagrees with its " *
+                "concentration length $want")
+            push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
+        elseif p.family in _JOINT_FACTOR_FAMILIES
+            # Joint-factor sizes are structural (concrete at construction,
+            # validated against the joint width) — bind passes them through.
+            p.size === nothing && _fail(p.label,
+                "internal: joint-factor size unresolved at bind")
+            push!(out_v, p)
+        elseif haskey(r2d2_link, p.name)
+            want = length(p.args.arg1)
+            want >= 1 || _fail(p.label,
+                "R2D2 shares need ≥ 1 share (an empty concentration " *
+                "decomposes nothing)")
+            p.size === nothing || p.size == want || _fail(p.label,
+                "R2D2 phi size $(p.size) disagrees with its " *
                 "concentration length $want")
             push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
         else

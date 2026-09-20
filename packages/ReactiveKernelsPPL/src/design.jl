@@ -159,3 +159,93 @@ function coefficient_priors(shape::DesignShape, priors::Vector{PopulationPrior})
     end
     return (locations, scales)
 end
+
+"""
+    r2d2_column_scales(shape, columns, overrides) -> (share, fallback, loc, varx)
+
+Bound data-only R2D2 share composition (SB `_sb_emit_r2d2_popefs!`
+mirror): per-design-column `share_idx` (0 = fallback), fallback
+scales, locations, and column variances, all in design-column order.
+The intercept is always share 0 (SB default `(loc, fallback) =
+(0.0, 1.0)` unless overridden); every other data column takes the
+next share unless its addressee carries an explicit-Normal override.
+Factor blocks fan out per dummy (variances via the
+`brm_cat_variances` `m*(n-m)/(n*(n-1))` formula in level order);
+continuous columns take the sample variance (N−1, the Stan
+`variance()` normalization). Width-0 blocks (offsets, gathers,
+summands) contribute nothing. Monotonic columns fail closed: their
+contrast is parameter-derived, so no data variance exists (no SB
+precedent in the flat mirror).
+"""
+function r2d2_column_scales(shape::DesignShape,
+        columns::Dict{Symbol,AbstractVector},
+        overrides::Dict{Symbol,Tuple{Float64,Float64}})
+    share = Int[]
+    fallback = Float64[]
+    loc = Float64[]
+    varx = Float64[]
+    next_share = 1
+    for b in shape.blocks
+        b.width == 0 && continue
+        if b.kind === MonotonicTerm
+            throw(ContractValidationError(
+                "[$(shape.predictor)] R2D2 over a monotonic column is " *
+                "not in the flat slice (the mo contrast is " *
+                "parameter-derived, so no data variance exists)"))
+        end
+        if b.kind === InterceptTerm
+            # Always share 0 (SB); the override, if stated, supplies
+            # loc/scale. No data variance exists (column is nothing) —
+            # unused at share 0 either way.
+            oloc, ofb = get(overrides, b.addressee, (0.0, 1.0))
+            push!(share, 0)
+            push!(fallback, ofb)
+            push!(loc, oloc)
+            push!(varx, 0.0)
+            continue
+        end
+        if haskey(overrides, b.addressee)
+            oloc, ofb = overrides[b.addressee]
+            append!(share, fill(0, b.width))
+            append!(fallback, fill(ofb, b.width))
+            append!(loc, fill(oloc, b.width))
+            append!(varx, _r2d2_block_variances(b, columns))
+            continue
+        end
+        for _ in 1:b.width
+            push!(share, next_share)
+            next_share += 1
+        end
+        append!(fallback, fill(1.0, b.width))
+        append!(loc, fill(0.0, b.width))
+        append!(varx, _r2d2_block_variances(b, columns))
+    end
+    return (share, fallback, loc, varx)
+end
+
+function _r2d2_block_variances(b::DesignBlock, columns::Dict{Symbol,AbstractVector})
+    if b.kind === FactorTerm
+        col = columns[b.column]
+        n = length(col)
+        return Float64[
+            _r2d2_dummy_variance(col, lvl, n) for lvl in b.levels]
+    end
+    col = columns[b.column]
+    return Float64[_r2d2_sample_variance(col)]
+end
+
+# Sample variance, N−1 normalization (Stan `variance()`).
+function _r2d2_sample_variance(col::AbstractVector)
+    n = length(col)
+    n < 2 && return NaN
+    m = sum(col) / n
+    return sum((x - m)^2 for x in col) / (n - 1)
+end
+
+# Dummy variance without materializing the dummy (SB
+# `brm_cat_variances`: m*(n-m)/(n*(n-1)) over the level codes).
+function _r2d2_dummy_variance(col::AbstractVector, lvl, n::Int)
+    n < 2 && return NaN
+    m = count(==(lvl), col)
+    return Float64(m * (n - m) / (n * (n - 1)))
+end

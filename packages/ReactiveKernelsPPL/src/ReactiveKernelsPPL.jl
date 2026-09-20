@@ -22,13 +22,15 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
     BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
-    OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam
+    OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
+    MvNormalCholeskyFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
     RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm, ScanSummandTerm,
     MonotonicTerm, MonotonicSummandTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
-export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec
+export ScalePredictorRef
+export PopulationPrior, R2D2Prior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec
 export RanefZRecipe, RanefMargin, RanefBucket
 export SplineBasisBlock, SplineBasis, SplineVector
 export HSGPBasis
@@ -48,7 +50,8 @@ export ordered_constrain, ordered_unconstrain, ordered_logjac
 export simplex_constrain, simplex_unconstrain, simplex_logjac
 export lkj_chol_constrain, lkj_chol_unconstrain, lkj_chol_logjac
 export lkj_logconst, lkj_corr_cholesky_logpdf
-export positive_bijector, unit_bijector, interval_bijector, BIJECTORS
+export positive_bijector, unit_bijector, interval_bijector, floored_bijector,
+    BIJECTORS
 export coordinate_read, block_read, transform_statements, jacobian_term
 export design_name, offset_name, monotonic_name, design_recipe, offset_recipe,
     monotonic_recipe

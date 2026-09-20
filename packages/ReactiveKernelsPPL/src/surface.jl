@@ -177,7 +177,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
     sample, det, plate_ctx, plate_specs, scans, buckets, bases, vectors,
-    hbases, kplates = _partition_statements(ast, data)
+    hbases, kplates, r2d2decls, joints = _partition_statements(ast, data)
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
@@ -188,6 +188,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # lowering, before `_lower_parameters` runs).
     dirichlet_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dirichlet_call(s.rhs))
+    # Covariance-factor declarations (`L ~ LKJCovarianceFactor(...)`): the
+    # only stems a joint response accepts as its factor (checked during
+    # joint lowering, before `_lower_parameters` runs).
+    factor_names = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && _is_lkj_factor_call(s.rhs))
     # Shape every definition (data-free: data ⇒ vector, sampled ⇒ scalar,
     # det-refs recurse with memo; cycles error downstream), then
     # canonicalize each RHS in dependency order (Julia-valid undotted
@@ -206,7 +211,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # referencing a coefficient candidate (Normal-priored or free name).
     # All other vector definitions stay symbolic as named locals.
     structural = _structural_defs(det, data, canonmap, normal_priors,
-        prior_names)
+        prior_names, plate_names)
     vecdefs = Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :vector)
     taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names,
         plate_names)
@@ -244,13 +249,26 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
                    "scalar-only")
         end
     end
+    # Joint correlated-outcomes responses lower after the broadcast
+    # responses (same predictor interning/coefficient recording, before
+    # coefficient priors resolve).
+    for j in joints
+        push!(responses,
+            _lower_joint_response(j, factor_names, ctx, predictors, pred_idx,
+                coefuse))
+    end
     for c in ctx.scan_coefs
         haskey(coefuse, c) && _sfail("$c is both a predictor coefficient " *
             "and a scan coefficient — scan coefficients are sampled " *
             "scalars, not population coefficients (rename one)")
     end
-    priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors)
+    r2d2set = Set{Symbol}(d.predictor for d in r2d2decls)
+    priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
+        r2d2set)
+    r2d2s, taus = _lower_r2d2_priors(r2d2decls, sample, coefuse, predictors,
+        levelmaps, taken)
     params, paramsyms, dirichlets = _lower_parameters(sample, coefuse, ctx)
+    append!(params, taus)
     plate_parameters = PlateParameter[
         _lower_plate_parameter(nm, rhs, rng, coefuse)
         for (nm, rhs, rng, _) in plate_specs]
@@ -258,6 +276,10 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     for r in responses
         push!(used_locs, r.predictor)
         union!(used_locs, r.extra_predictors)
+        # A scale predictor's definition is absorbed like a location's —
+        # never also a derived column.
+        r.scale isa ScalePredictorRef &&
+            push!(used_locs, r.scale.predictor)
     end
     skip = _absorbed_skip(det, canonmap, responses, paramsyms, ctx.absorbed,
         used_locs)
@@ -290,7 +312,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         ranef_buckets = buckets,
         vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
-        kernel_plates = kplates)
+        kernel_plates = kplates, r2d2_priors = r2d2s)
     validate_structure(plan)
     return plan
 end
@@ -499,16 +521,18 @@ const _KNOWN_VALUE_FNS = union(Set{Symbol}(ASSIGNMENT_FNS),
     Set{Symbol}((:ifelse,)))
 
 # Structural definitions: anything transitively referencing a coefficient
-# candidate (a Normal-priored sampled name or a free name — data, det, and
-# other sampled names excluded). Structural definitions inline into
-# predictors; every other definition keeps its binding as a kernel local.
-function _structural_defs(det, data, canonmap, normal_priors, prior_names)
+# candidate (a Normal-priored sampled name or a free name — data, det,
+# per-cell latents, and other sampled names excluded). Structural
+# definitions inline into predictors; every other definition keeps its
+# binding as a kernel local.
+function _structural_defs(det, data, canonmap, normal_priors, prior_names,
+        plate_names)
     detkeys = Set{Symbol}(nm for (nm, _) in det)
     structural = Set{Symbol}()
     for (nm, _) in det
         refs = _value_symbols(canonmap[nm])
         if any(s -> s in normal_priors ||
-                _is_free_name(s, data, detkeys, prior_names), refs)
+                _is_free_name(s, data, detkeys, prior_names, plate_names), refs)
             push!(structural, nm)
         end
     end
@@ -526,10 +550,11 @@ function _structural_defs(det, data, canonmap, normal_priors, prior_names)
     return structural
 end
 
-function _is_free_name(s::Symbol, data, detkeys, prior_names)
+function _is_free_name(s::Symbol, data, detkeys, prior_names, plate_names)
     s in data && return false
     s in detkeys && return false
     s in prior_names && return false
+    s in plate_names && return false
     s in _KNOWN_VALUE_FNS && return false
     return true
 end
@@ -906,6 +931,39 @@ _is_mo1_call(ex) =
 _is_basis_stmt(st) =
     st isa Expr && st.head === :call && !isempty(st.args) &&
     st.args[1] === :spline_basis
+
+# A bare `r2d2(mu, R2, phi[, tau])` call declares a flat R2D2 variance
+# decomposition over one predictor (same bare-call-declaration shape as
+# `spline_basis`): positional predictor + R2/phi parameter names, plus
+# an optional tau (sampled-parameter name or positive literal; omitted
+# synthesizes a half-standard-Normal `r2d2_<pred>_tau_bsv`).
+_is_r2d2_stmt(st) =
+    st isa Expr && st.head === :call && !isempty(st.args) &&
+    st.args[1] === :r2d2
+
+function _lower_r2d2_decl(st::Expr, line::Int)
+    where = line > 0 ? "r2d2 (line $line)" : "r2d2"
+    args = [a for a in st.args[2:end]
+        if !(a isa Expr && a.head === :parameters)]
+    any(a -> a isa Expr && a.head === :parameters, st.args[2:end]) &&
+        _sfail("$where takes positional args only " *
+               "(`r2d2(mu, R2, phi[, tau])`), no keywords")
+    length(args) == 3 || length(args) == 4 ||
+        _sfail("$where takes `(predictor, R2, phi[, tau])` — " *
+               "$(length(args)) positional args, got $(repr(st))")
+    pred, r2, phi = args[1:3]
+    pred isa Symbol || _sfail("$where predictor must be a bare " *
+                              "predictor name, got $(repr(pred))")
+    r2 isa Symbol || _sfail("$where R2 must be a bare scalar-Beta " *
+                            "parameter name, got $(repr(r2))")
+    phi isa Symbol || _sfail("$where phi must be a bare " *
+                             "simplex-parameter name, got $(repr(phi))")
+    tau = length(args) == 4 ? args[4] : nothing
+    tau === nothing || tau isa Symbol || tau isa Real ||
+        _sfail("$where tau must be a sampled-parameter name or a " *
+               "positive literal, got $(repr(tau))")
+    return (predictor = pred, r2 = r2, phi = phi, tau = tau, line = line)
+end
 
 function _lower_basis(st::Expr, line::Int, data::Set{Symbol},
         seen::Set{Symbol}, seelines::Dict{Symbol,Int},
@@ -1334,6 +1392,8 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     vectors = SplineVector[]
     hbases = HSGPBasis[]
     kplates = KernelPlate[]
+    r2d2decls = NamedTuple[]
+    joints = JointSampleStmt[]
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
     seen_doc = false
@@ -1402,9 +1462,26 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             push!(kplates, kp)
             continue
         end
+        if _is_r2d2_stmt(st)
+            push!(r2d2decls, _lower_r2d2_decl(st, line))
+            continue
+        end
         if _is_sample(st) || _is_broadcast_sample(st)
             bc = _is_broadcast_sample(st)
             tilde = bc ? "`.~`" : "`~`"
+            # A vector LHS is the joint correlated-outcomes form (plain `~`
+            # only — row-grouped, never broadcast).
+            if st.args[2] isa Expr && st.args[2].head === :vect
+                bc && _sfail("joint responses use `~`, not `.~` " *
+                             "(`[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)` " *
+                             "— row-grouped, never broadcast)")
+                j = _parse_joint_stmt(st, line, data)
+                for o in j.outcomes
+                    _claim!(seen, seelines, o, line)
+                end
+                push!(joints, j)
+                continue
+            end
             lhs, rng, levs = _sample_lhs(st.args[2], bc, tilde, data)
             lhs in (:ranef, :ranef_bucket, :dummy) &&
                 _sfail("`$lhs` is reserved (ranef surface) and cannot be " *
@@ -1414,6 +1491,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                        "sampled")
             lhs in (:hsgp, :hsgp_basis) &&
                 _sfail("`$lhs` is reserved (hsgp surface) and cannot be " *
+                       "sampled")
+            lhs === :r2d2 &&
+                _sfail("`r2d2` is reserved (r2d2 surface) and cannot be " *
                        "sampled")
             _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[3], lhs)
@@ -1431,6 +1511,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             lhs in (:hsgp, :hsgp_basis) &&
                 _sfail("`$lhs` is reserved (hsgp surface) and cannot be " *
                        "redefined")
+            lhs === :r2d2 &&
+                _sfail("`r2d2` is reserved (r2d2 surface) and cannot be " *
+                       "redefined")
             lhs in data && _sfail("$lhs is bound data and cannot be redefined")
             _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[2], lhs)
@@ -1440,7 +1523,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         end
     end
     return sample, det, plate_ctx, plate_params, scans, buckets, bases,
-        vectors, hbases, kplates
+        vectors, hbases, kplates, r2d2decls, joints
 end
 
 # Pre-pass: expand top-level `@plate for i in R ... end` blocks into
@@ -1809,6 +1892,51 @@ function _sample_lhs(lhs, bc, tilde, data)
     return target, _lower_lhs_range(target, index), nothing
 end
 
+# Joint-response statement: `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`
+# (SB's joint form). Outcomes are bare distinct data symbols; means are
+# one location expression per outcome; the factor names an
+# `LKJCovarianceFactor` declaration. Width/factor linkage checks belong
+# to `_lower_joint_response` + contract validation.
+function _parse_joint_stmt(st::Expr, line::Int, data::Set{Symbol})
+    outs = st.args[2].args
+    isempty(outs) && _sfail("joint response `[]` is empty — name the " *
+                            "outcome data columns " *
+                            "(`[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`)")
+    for o in outs
+        o isa Symbol || _sfail("joint outcomes are bare data columns, " *
+                               "got $(repr(o))")
+        o in data || _sfail("joint outcome $o is not data (joint " *
+                            "responses observe data columns — $o is not " *
+                            "among the bound data names)")
+    end
+    length(unique(outs)) == length(outs) ||
+        _sfail("joint outcomes repeat a column " *
+               "($(join(outs, ", ")))")
+    rhs = st.args[3]
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+        rhs.args[1] === :MvNormalCholesky ||
+        _sfail("a `[y1, y2]` response takes " *
+               "`MvNormalCholesky([mu1, mu2], L)`, got $(repr(rhs))")
+    args = _plain_args(rhs, "`MvNormalCholesky`")
+    length(args) == 2 || _sfail("`MvNormalCholesky` takes ([means], " *
+                                "factor) " *
+                                "(`[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`), " *
+                                "got $(length(args)) arguments")
+    means, factor = args
+    means isa Expr && means.head === :vect &&
+        length(means.args) == length(outs) ||
+        _sfail("joint response [$(join(outs, ", "))] has " *
+               "$(length(outs)) outcomes but $(repr(means)) means " *
+               "(one mean per outcome: `[mu1, mu2]`)")
+    factor isa Symbol || _sfail("joint factor $(repr(factor)) must name " *
+                                "an `LKJCovarianceFactor` declaration " *
+                                "(`L ~ LKJCovarianceFactor(K, Exponential(1.0), eta)` " *
+                                "in the model)")
+    _reject_target(rhs, Symbol(join(outs, "_")))
+    return JointSampleStmt(Vector{Symbol}(outs), Vector{Any}(means.args),
+        factor, line)
+end
+
 # The `levels(g)[S]` index of a subset prior: returns `(g, subset)`.
 function _levels_subset_index(col::Symbol, index::Expr, data::Set{Symbol})
     length(index.args) == 2 && _is_levels_call(index.args[1]) ||
@@ -1926,6 +2054,17 @@ struct SampleStmt
 end
 SampleStmt(lhs::Symbol, rhs, broadcast::Bool) =
     SampleStmt(lhs, rhs, broadcast, nothing, nothing)
+
+"""One joint `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)` statement: K
+outcome columns, K mean expressions, and the factor stem (an
+`LKJCovarianceFactor` declaration elsewhere in the model). Plain `~`
+only — the likelihood groups rows, never broadcasts."""
+struct JointSampleStmt
+    outcomes::Vector{Symbol}
+    means::Vector{Any}
+    factor::Symbol
+    line::Int
+end
 
 _is_doc_macro(m) =
     m === Symbol("@doc") || (m isa GlobalRef && m.name === Symbol("@doc"))
@@ -2395,9 +2534,11 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
         return _lower_leveled_response(lhs, call, range, weights, evidence,
             ctx, predictors, pred_idx, coefuse)
     end
-    family, lik_link, pred_link, loc, scale, trials =
+    family, lik_link, pred_link, loc, scale_raw, trials =
         _lower_response_base(lhs, call, ctx)
     pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
+        coefuse)
+    scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
         evidence, Symbol(lhs, "_resp"), trials, range)
@@ -2553,6 +2694,30 @@ function _lower_categorical_response(lhs, call, range, weights, evidence,
                            "(`s ~ Dirichlet(...)` in the model)")
     return LikelihoodSpec(CategoricalFam, IdentityLink, lhs, s,
         nothing, weights, evidence, label, nothing, range)
+end
+
+# Joint correlated-outcomes response:
+# `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`. Each mean lowers as an
+# ordinary identity-link location (own predictor per outcome, named
+# definitions interned by name, inline means synthesized per outcome);
+# the factor stem resolves to its two `LKJCovarianceFactor` pieces.
+function _lower_joint_response(j::JointSampleStmt, factor_names::Set{Symbol},
+        ctx, predictors, pred_idx, coefuse)
+    tag = "[$(join(j.outcomes, ", "))]"
+    j.factor in factor_names || _sfail(
+        "joint response $tag factor $(j.factor) must name an " *
+        "`LKJCovarianceFactor` declaration " *
+        "(`L ~ LKJCovarianceFactor(K, Exponential(1.0), eta)` in the model)")
+    pnames = Symbol[_lower_location(o, m, IdentityLink, ctx, predictors,
+        pred_idx, coefuse; synth = Symbol(o, "_joint_", k))
+        for (k, (o, m)) in enumerate(zip(j.outcomes, j.means))]
+    scales, corr = _lkj_factor_names(j.factor)
+    label = Symbol(join(j.outcomes, "_") * "_resp")
+    return LikelihoodSpec(MvNormalCholeskyFam, IdentityLink, j.outcomes[1],
+        pnames[1], nothing, nothing, ResponseEvidence(:none, nothing, nothing),
+        label, nothing, nothing; extra_responses = j.outcomes[2:end],
+        extra_predictors = pnames[2:end], factor_scales = scales,
+        factor_corr = corr)
 end
 
 # `.~` takes a dotted distribution object (`Normal.(mu, sigma)`); convert
@@ -2745,8 +2910,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
-        return GaussianFam, IdentityLink, IdentityLink, args[1],
-        _lower_scale(lhs, args[2], ctx), nothing
+        return GaussianFam, IdentityLink, IdentityLink, args[1], args[2],
+        nothing
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link)")
@@ -2762,8 +2927,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial2` takes " *
                                     "`NegativeBinomial2.(exp.(eta), phi)`")
         return NegativeBinomial2Fam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp),
-        _lower_scale(lhs, args[2], ctx), nothing
+        _lower_link_arg(lhs, args[1], :exp), args[2], nothing
     elseif fam === :Gamma
         loc, scale = _lower_gamma_args(lhs, args, ctx)
         return GammaLogFam, LogLink, LogLink, loc, scale, nothing
@@ -2810,12 +2974,30 @@ function _lower_gamma_args(lhs, args, ctx)
     _same_aux(a1, a2) || _sfail(
         "response $lhs: both `Gamma` positions must name the same alpha " *
         "(got $(repr(a1)) and $(repr(a2)))")
-    return loc, _lower_scale(lhs, a1, ctx)
+    return loc, a1
 end
 
-_same_aux(a, b) =
-    a isa Symbol && b isa Symbol ? a === b :
-    a isa Real && b isa Real ? a == b : false
+# Both auxiliary positions name the same use: bare names, equal literals,
+# or structurally equal scale-predictor spellings (bare or one
+# `exp.`/`logistic.` wrapper over the same predictor). Anything else —
+# mixed wrappers, distinct predictors — is a mismatch, never a merge.
+function _same_aux(a, b)
+    ka = _aux_key(a)
+    kb = _aux_key(b)
+    return ka !== nothing && ka == kb
+end
+
+function _aux_key(a)
+    a isa Symbol && return (:bare, a)
+    a isa Real && return (:lit, a)
+    if a isa Expr && a.head === :. && length(a.args) == 2 &&
+            a.args[1] isa Symbol && a.args[1] in (:exp, :logistic) &&
+            a.args[2] isa Expr && a.args[2].head === :tuple &&
+            length(a.args[2].args) == 1 && a.args[2].args[1] isa Symbol
+        return (:wrap, a.args[1], a.args[2].args[1])
+    end
+    return nothing
+end
 
 const _BETA_MSG = "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`"
 
@@ -2850,7 +3032,7 @@ function _lower_beta_args(lhs, args, ctx)
         "response $lhs: both `Beta` positions must name the same kappa " *
         "(got $(repr(k1)) and $(repr(k2)))")
     loc = _lower_link_arg(lhs, _dot2call_nested_link(lhs, m1, :Beta), :logistic)
-    return loc, _lower_scale(lhs, k1, ctx)
+    return loc, k1
 end
 
 function _lower_response_base_error(lhs, rhs, fam)
@@ -2872,6 +3054,10 @@ function _lower_response_base_error(lhs, rhs, fam)
                                 "`Gamma.(alpha, exp.(eta) ./ alpha)`")
     fam === :BetaLogit && _sfail("response $lhs: write " *
                                  _BETA_MSG)
+    fam === :MvNormalCholesky && _sfail(
+        "response $lhs: `MvNormalCholesky` is joint-only " *
+        "(`[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)` with plain `~` — " *
+        "row-grouped, never broadcast)")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, Bernoulli, Poisson, Binomial, " *
                   "NegativeBinomial2, Gamma, Beta, CategoricalLogit, " *
@@ -2949,6 +3135,126 @@ function _lower_scale(lhs, s, ctx)
                   "expressions via an assignment first), got $(repr(s))")
 end
 
+# Scale use-site lowering (Gaussian sigma, NB2 phi, Gamma alpha, Beta
+# kappa): a scalar scale (parameter/assignment name, raw per-observation
+# data column, literal) passes through `_lower_scale` untouched; a
+# predictor definition feeds the scale slot — bare for an identity-link
+# scale (`Normal.(mu, sigma)`), or under one dotted link wrapper
+# (`Normal.(mu, exp.(sigma))` for log, `logistic.(sigma)` for logit).
+# The wrapper arrives unconverted (the scale position passes the spine
+# converter through), so it matches here in dotted `Expr(:., ...)` form.
+# Undotted wrappers fail closed (scalar `exp(log_sigma)` use-site
+# wrappers are deferred — the LP link spells the transform instead), as
+# do wrappers over anything but a predictor definition.
+function _lower_scale_use(lhs, s, ctx, predictors, pred_idx, coefuse)
+    # Scaleless families (Bernoulli/Poisson/Binomial) carry `nothing`
+    # through untouched.
+    s === nothing && return nothing
+    if s isa Expr && s.head === :.
+        return _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+    end
+    if s isa Expr && s.head === :call && !isempty(s.args) &&
+            s.args[1] isa Symbol && s.args[1] in (:exp, :logistic)
+        return _sfail("response $lhs scale wraps `$(s.args[1])` undotted " *
+                      "(`$(repr(s))`) — scale link wrappers broadcast " *
+                      "(`$(s.args[1]).(predictor)` over a predictor " *
+                      "definition); scalar `exp(log_sigma)` use-site " *
+                      "wrappers are deferred (spell the transform as the " *
+                      "predictor's link instead)")
+    end
+    if s isa Symbol && _is_scale_predictor_def(s, ctx)
+        pname = _lower_scale_predictor(lhs, s, IdentityLink, ctx, predictors,
+            pred_idx, coefuse)
+        return ScalePredictorRef(pname, IdentityLink)
+    end
+    return _lower_scale(lhs, s, ctx)
+end
+
+# A bare scale name feeds the predictor slot when it is a per-observation
+# definition that is not latent-backed: vector-shaped definitions plus
+# bare `coefficients[group]` factor-index refs (ref-shaped, hence
+# scalar-shaped in `detshape`, but per-observation at runtime — the
+# factor-term predictor spelling). Per-cell latents (plate names and
+# derived columns reading one) stay on the scalar path — a plate
+# parameter already threads per cell as a name, and a latent transform
+# is not an affine predictor. Scalar assignments, data gathers
+# (`x[g]`), and literal indexing (`v[1]`) likewise stay scalar-path,
+# exactly as before.
+_is_scale_predictor_def(s::Symbol, ctx) =
+    haskey(ctx.detmap, s) && !(s in ctx.plate_names) &&
+    !_derived_reads_latent(s, ctx) &&
+    (get(ctx.detshape, s, :scalar) === :vector ||
+        _is_factor_index_def(ctx.detmap[s], ctx))
+
+function _is_factor_index_def(rhs, ctx)
+    rhs isa Expr || return false
+    rhs.head === :ref || return false
+    length(rhs.args) == 2 || return false
+    base, idx = rhs.args
+    base isa Symbol || return false
+    idx isa Symbol || return false
+    base in ctx.data && return false
+    return idx in ctx.data
+end
+
+function _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+    f = length(s.args) >= 1 ? s.args[1] : nothing
+    targs = length(s.args) == 2 && s.args[2] isa Expr &&
+            s.args[2].head === :tuple ? s.args[2].args : Any[]
+    if !(f isa Symbol && f in (:exp, :logistic)) || length(targs) != 1
+        return _sfail("response $lhs scale $(repr(s)) is not an admitted " *
+                      "scale use — write a bare parameter/assignment name, " *
+                      "a per-observation data column, a literal, a bare " *
+                      "predictor definition, or one `exp.`/`logistic.` " *
+                      "wrapper over a predictor definition")
+    end
+    inner = only(targs)
+    inner isa Symbol && _is_scale_predictor_def(inner, ctx) || return _sfail(
+        "response $lhs scale $(repr(s)): `$f.` wraps a predictor " *
+        "definition (`$f.(predictor)` with `predictor = ...` affine in " *
+        "data) — got $(repr(inner))")
+    link = f === :exp ? LogLink : LogitLink
+    pname = _lower_scale_predictor(lhs, inner, link, ctx, predictors,
+        pred_idx, coefuse)
+    return ScalePredictorRef(pname, link)
+end
+
+# Analyze (or intern) a scale predictor: exactly the location-predictor
+# treatment (`_lower_location`'s named-definition arm) under the use-site
+# link — affine analysis, coefficient-use recording, one link per
+# predictor. Family admission (Gaussian/NB2/Gamma; Beta deferred) is the
+# contract's gate (`_validate_scale_predictor`), so hand-built plans get
+# the same rule.
+function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
+        pred_idx, coefuse)
+    haskey(pred_idx, name) || haskey(ctx.detmap, name) ||
+        return _lower_scale_predictor_error(lhs, name, ctx)
+    if haskey(pred_idx, name)
+        pred = predictors[pred_idx[name]]
+        pred.link === link || _sfail(
+            "predictor $name is shared by slots needing links " *
+            "$(pred.link) and $link — one link per predictor")
+        return name
+    end
+    terms, uses = _analyze_predictor(name, ctx.detmap[name], ctx, lhs)
+    _record_coefuses!(coefuse, name, uses, lhs)
+    push!(predictors, PredictorSpec(name, link, terms, name))
+    pred_idx[name] = length(predictors)
+    return name
+end
+
+function _lower_scale_predictor_error(lhs, name, ctx)
+    name in ctx.data && _sfail("response $lhs scale predictor $name is a " *
+                              "data column, not a predictor definition " *
+                              "(`$name = ...` affine in data)")
+    name in ctx.prior_names && _sfail(
+        "response $lhs scale predictor $name is a scalar parameter — a " *
+        "predictor-fed scale is a per-observation definition " *
+        "(`$name = ...` affine in data)")
+    return _sfail("response $lhs scale predictor $name is not a predictor " *
+                  "definition (`$name = ...` affine in data)")
+end
+
 function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse; synth::Union{Nothing,Symbol} = nothing)
     # A per-cell latent VECTOR is the whole location via a LatentTerm predictor
@@ -2958,11 +3264,15 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
     # (`theta[i] = mu .+ tau .* z[i]` then `y[i] ~ Normal.(theta[i], s)` — the
     # non-centered / latent-transform shape, emitted as a derived column and
     # referenced directly). A derived location with NO latent stays a design
-    # predictor; mixed latent+fixed BARE-expression locations are a later slice.
+    # predictor; a latent-reading definition WITH coefficient structure is a
+    # design predictor too (`b .* theta` classifies as a ContinuousTerm over
+    # the latent — the SB `me` mirror), while a bare latent inside a larger
+    # expression fails in `_classify_symbol`.
     if loc isa Symbol && loc in ctx.plate_names
         return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
     end
-    if loc isa Symbol && haskey(ctx.detmap, loc) && _derived_reads_latent(loc, ctx)
+    if loc isa Symbol && haskey(ctx.detmap, loc) && _derived_reads_latent(loc, ctx) &&
+            !_is_design_shaped(loc, ctx)
         return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
     end
     if loc isa Symbol
@@ -2985,7 +3295,9 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         _sfail("response $lhs location is a literal — use an intercept-only " *
                "predictor (`eta = a`)")
     else
-        _reject_plate_in_predictor(lhs, loc, ctx)
+        # Per-cell latents classify inline like data columns: `b .* x_true`
+        # is a ContinuousTerm over the latent (the SB `me` mirror); a bare
+        # latent fails in `_classify_symbol`, never silently.
         # Multi-eta responses (CategoricalLogit) index their synthetic
         # predictors; the single-eta default keeps its established name.
         pname = synth === nothing ? Symbol(lhs, "_eta") : synth
@@ -3011,6 +3323,78 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
     push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
     pred_idx[pname] = length(predictors)
     return pname
+end
+
+# A latent-reading definition is a DESIGN predictor (not a latent transform)
+# when it has coefficient structure (a Normal-priored or free coefficient
+# candidate), reads no scalar parameter (a non-coefficient sampled name
+# like the non-centered `tau` — any such read marks a latent transform),
+# and scales every latent it mentions by a coefficient (the SB `me`
+# `a .+ b .* x_true` shape). Anything else latent-reading stays a
+# LatentTerm location (the conservative pre-me behavior).
+_is_design_shaped(name::Symbol, ctx) =
+    name in ctx.structural && !_det_reads_param(name, ctx) &&
+    _latent_uses_scaled(name, ctx)
+
+# Every per-cell latent mention in the (inlined) definition is scaled by a
+# coefficient (`b .* theta`): the summand split mirrors `_analyze_predictor`
+# (inlining is idempotent — re-running it there re-absorbs the same names).
+function _latent_uses_scaled(name::Symbol, ctx)
+    rhs = _inline_structure(ctx.detmap[name], ctx, Set{Symbol}([name]),
+        "predictor $name")
+    out = Tuple{Int,Any}[]
+    _collect_signed!(out, rhs, 1, name)
+    for (_, core) in out
+        _summand_latent_scaled(core, ctx) || return false
+    end
+    return true
+end
+
+# A summand is latent-scaled when no per-cell latent appears in it except
+# as a factor of a dotted product with a coefficient (`b .* theta`, with
+# data/local/vector factors alongside at most): bare latents, latents
+# under any other operator, and parameter/computed scalings mark a latent
+# transform instead.
+function _summand_latent_scaled(core, ctx)
+    core isa Symbol && return core ∉ ctx.plate_names
+    core isa Expr || return true
+    if core.head === :call && !isempty(core.args) && core.args[1] === :.*
+        any(f -> f isa Symbol && f in ctx.plate_names,
+            core.args[2:end]) || return true
+        coefs = 0
+        for f in core.args[2:end]
+            if f isa Symbol
+                k = _summand_kind(f, ctx)
+                (k === :coef || k === :latent || k === :data ||
+                    k === :local) || return false
+                k === :coef && (coefs += 1)
+            elseif f isa Number
+                return false
+            else
+                _canon_shape(f, ctx.data, ctx.detshape) === :vector ||
+                    return false
+                any(s -> s in ctx.plate_names, _value_symbols(f)) &&
+                    return false
+            end
+        end
+        return coefs >= 1
+    end
+    return all(s -> s ∉ ctx.plate_names, _value_symbols(core))
+end
+
+# Does a definition transitively read a scalar parameter (a sampled name
+# that is NOT a Normal-priored coefficient candidate)?
+function _det_reads_param(name::Symbol, ctx)
+    seen = Set{Symbol}((name,))
+    stack = collect(_value_symbols(ctx.detmap[name]))
+    while !isempty(stack)
+        s = pop!(stack)
+        s in seen && continue
+        push!(seen, s)
+        s in ctx.prior_names && s ∉ ctx.normal_priors && return true
+        haskey(ctx.detmap, s) && append!(stack, _value_symbols(ctx.detmap[s]))
+    end
+    return false
 end
 
 # Does a derived column transitively read a per-cell latent (plate parameter)?
@@ -3042,19 +3426,6 @@ function _lower_location_symbol_error(lhs, loc, ctx)
         "scalar parameter cannot vary per observation")
     return _sfail("response $lhs location $loc is not a predictor " *
                   "definition (`$loc = ...` affine in data)")
-end
-
-# A per-cell latent is a bare whole location in slice-1; a latent buried in a
-# predictor expression (mixed latent + fixed effects) is a later increment.
-function _reject_plate_in_predictor(lhs, loc, ctx)
-    for s in _value_symbols(loc)
-        s in ctx.plate_names && _sfail(
-            "response $lhs location $(repr(loc)) combines the per-cell latent " *
-            "$s with other predictor structure — a latent is a bare location " *
-            "in slice-1 (`y[i] ~ Normal.($s[i], s)`); mixed latent + " *
-            "fixed-effect predictors are planned")
-    end
-    return nothing
 end
 
 function _record_coefuses!(coefuse, pname, uses, lhs)
@@ -3252,7 +3623,7 @@ function _classify_summand(pname, core, sign::Int, ctx)
     detkeys = Set{Symbol}(keys(ctx.detmap))
     coefrefs = Symbol[s for s in _value_symbols(core)
         if s in ctx.normal_priors ||
-            _is_free_name(s, ctx.data, detkeys, ctx.prior_names)]
+            _is_free_name(s, ctx.data, detkeys, ctx.prior_names, ctx.plate_names)]
     length(coefrefs) > 1 && _sfail("predictor $pname: $(repr(core)) is " *
                                    "nonlinear in coefficients")
     length(coefrefs) == 1 && _sfail(
@@ -3529,6 +3900,9 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     (core in ctx.data || core in ctx.vecdefs) &&
         return TermSpec(OffsetTerm, [core], NamedTuple(),
         core, Symbol(core, "_off")), nothing
+    core in ctx.plate_names && _sfail(
+        "predictor $pname: bare latent $core is not a term — scale it " *
+        "by a coefficient (`b .* $core`, the SB `me` mirror)")
     core in ctx.scan_states && _sfail("predictor $pname: $core is a bare " *
         "scan state — LP use needs a sampled coefficient (`b .* $core` " *
         "in an additive position); a bare scan state is only a direct " *
@@ -3583,7 +3957,10 @@ function _classify_product(pname, core::Expr, sign::Int, ctx)
             k = _summand_kind(g, ctx)
             if k === :coef
                 push!(coefs, g)
-            elseif k === :data || k === :local
+            elseif k === :data || k === :local || k === :latent
+                # A per-cell latent scales like a data column (`b .* x_true`
+                # — the SB `me` mirror): the ContinuousTerm below names the
+                # latent vector and the coefficient stays free.
                 push!(values, g)
             elseif k === :number
                 _sfail("predictor $pname: literal scaling in " *
@@ -3659,6 +4036,7 @@ function _summand_kind(s::Symbol, ctx)
     s in ctx.vecdefs && return :local
     haskey(ctx.detmap, s) && return :det
     s in ctx.prior_names && s ∉ ctx.normal_priors && return :param
+    s in ctx.plate_names && return :latent
     return :coef
 end
 function _summand_kind(n::Number, ctx)
@@ -3718,7 +4096,8 @@ end
 # (`c[levels(g)] .~ Normal.(lit, lit)`), which also size the block —
 # required, never defaulted — and each one emits its LevelMap.
 # Plan order follows predictors, addressees in term order.
-function _lower_coefficient_priors(sample, coefuse, predictors)
+function _lower_coefficient_priors(sample, coefuse, predictors,
+        r2d2::Set{Symbol} = Set{Symbol}())
     stated = Dict{Symbol,Any}()
     for s in sample
         haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
@@ -3737,6 +4116,9 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
     priors = PopulationPrior[]
     levelmaps = LevelMap[]
     for pred in predictors
+        # R2D2 predictors carry their prior mass in the R2D2Prior
+        # (overrides included) — _lower_r2d2_priors, not here.
+        pred.name in r2d2 && continue
         for t in pred.terms
             # Offsets carry no coefficient; latent terms carry a PlateParameter
             # whose prior lives on the plate parameter, not as a coefficient;
@@ -3777,6 +4159,106 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
     end
     _check_identified(predictors, levelmaps)
     return priors, levelmaps
+end
+
+# R2D2 declarations to IR: one R2D2Prior per declared predictor.
+# Stated Normal coefficient priors become share-0 overrides (scalar
+# via _coefficient_normal, factor blocks via the broadcast form);
+# unstated columns join the simplex (factors take a full-cover
+# LevelMap — the identified check fires exactly when that collides
+# with an intercept, same as the PopulationPrior path). Omitted tau
+# synthesizes a half-standard-Normal parameter.
+function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
+        taken)
+    stated = Dict{Symbol,Any}()
+    for s in sample
+        haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
+    end
+    by_pred = Dict{Symbol,PredictorSpec}(p.name => p for p in predictors)
+    seen = Set{Symbol}()
+    out = R2D2Prior[]
+    taus = SampledParameter[]
+    r2d2preds = PredictorSpec[]
+    for d in decls
+        haskey(by_pred, d.predictor) || _sfail(
+            "r2d2 over unknown predictor $(d.predictor) " *
+            "(predictors come from response linear predictors)")
+        d.predictor in seen && _sfail(
+            "duplicate r2d2 declaration for predictor $(d.predictor) " *
+            "(one per predictor)")
+        push!(seen, d.predictor)
+        pred = by_pred[d.predictor]
+        push!(r2d2preds, pred)
+        overrides = Dict{Symbol,Tuple{Float64,Float64}}()
+        for t in pred.terms
+            (t.kind === OffsetTerm || t.kind === LatentTerm ||
+                t.kind === RanefGatherTerm ||
+                t.kind === SplineSummandTerm ||
+                t.kind === HSGPSummandTerm ||
+                t.kind === ScanSummandTerm ||
+                t.kind === MonotonicSummandTerm) && continue
+            addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
+            use = _find_use(coefuse, pred.name, addr)
+            use === nothing && _sfail("internal: no coefficient use for " *
+                                      "($(pred.name), $addr)")
+            t.kind === MonotonicTerm && _sfail(
+                "r2d2 over predictor $(pred.name): monotonic columns " *
+                "are not in the flat slice (the mo contrast is " *
+                "parameter-derived, so no data variance exists)")
+            name = use[1]
+            sign = use[3]
+            if t.kind === FactorTerm
+                ov = _lower_r2d2_factor(pred, t, name, sign, stated,
+                    levelmaps)
+                ov === nothing || (overrides[addr] = ov)
+                continue
+            end
+            haskey(stated, name) || continue
+            s = stated[name]
+            s.levels !== nothing && _sfail("coefficient $name takes a " *
+                                           "scalar prior (`$name ~ Normal`), " *
+                                           "not a levels prior — it is used " *
+                                           "as $(t.kind), not a factor")
+            loc, scale = _coefficient_normal(name, s.rhs, pred.name, addr)
+            overrides[addr] = (sign * loc, scale)
+        end
+        tau = d.tau
+        if tau === nothing
+            tau = Symbol(:r2d2_, d.predictor, :_tau_bsv)
+            tau in taken && _sfail(
+                "r2d2 over $(d.predictor): synthesized tau $tau " *
+                "collides with a model name — pass tau explicitly " *
+                "(`r2d2($(d.predictor), $(d.r2), $(d.phi), mytau)` " *
+                "with `mytau ~ HalfNormal(1)`)")
+            push!(taus, SampledParameter(tau, :normal, (arg1 = 0, arg2 = 1),
+                :positive, tau))
+        end
+        push!(out, R2D2Prior(d.predictor, d.r2, d.phi, tau, overrides))
+    end
+    _check_identified(r2d2preds, levelmaps)
+    return out, taus
+end
+
+# An R2D2 factor: a stated broadcast prior becomes a share-0 override
+# (with its levels subset, as on the PopulationPrior path); an
+# unstated factor joins the simplex under a full-cover LevelMap.
+function _lower_r2d2_factor(pred, t, name, sign, stated, levelmaps)
+    col = only(t.columns)
+    haskey(stated, name) || begin
+        push!(levelmaps, LevelMap(pred.name, col, [], :levels, :))
+        return nothing
+    end
+    s = stated[name]
+    s.levels === nothing && _sfail("coefficient $name is vector-valued " *
+                                   "(factor over $col) — scalar priors " *
+                                   "cannot size it; write " *
+                                   "`$name[levels($col)] .~ Normal.(0, 1)`")
+    gcol, subset = s.levels
+    gcol === col || _sfail("coefficient $name: levels column $gcol " *
+                           "differs from use column $col")
+    loc, scale = _coefficient_broadcast_normal(name, s.rhs, pred.name, col)
+    push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
+    return (sign * loc, scale)
 end
 
 function _lower_factor_prior(pred, t, name, sign, stated, levelmaps)
@@ -3881,6 +4363,16 @@ function _lower_parameters(sample, coefuse, ctx)
             push!(vectors, _lower_dirichlet(s.lhs, s.rhs))
             continue
         end
+        if _is_lkj_factor_call(s.rhs)
+            haskey(coefuse, s.lhs) && _sfail(
+                "$(s.lhs) is a predictor coefficient and cannot also be " *
+                "an LKJCovarianceFactor")
+            sc, cr = _lower_lkj_factor(s.lhs, s.rhs, coefuse, ctx)
+            push!(vectors, sc)
+            push!(vectors, cr)
+            sc.args.arg1 isa Symbol && push!(syms, sc.args.arg1)
+            continue
+        end
         haskey(coefuse, s.lhs) && continue
         s.levels !== nothing && _sfail("levels prior `$(s.lhs)[...]` is " *
                                        "never used in a predictor — size " *
@@ -3929,6 +4421,61 @@ function _lower_dirichlet(lhs, rhs)
         lhs)
 end
 
+_is_lkj_factor_call(rhs) =
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+    rhs.args[1] === :LKJCovarianceFactor
+
+# SB's derived factor-piece names for a stem `L`: `L_scales` (the positive
+# scale vector) and `L_L_corr` (the LKJ Cholesky factor). Single source for
+# the factor allocator and the joint-response linker.
+_lkj_factor_names(stem::Symbol) =
+    (Symbol(stem, :_scales), Symbol(stem, :_L_corr))
+
+# SB's covariance-factor declaration, decomposed:
+# `L ~ LKJCovarianceFactor(K, Exponential(θ), eta)` allocates the factor's
+# two plan nodes — the positive scales vector and the LKJ Cholesky factor
+# (SB's `target_scales` / `target_L_corr`) — which the joint response
+# links explicitly. The `L` factor itself materializes in-graph as
+# `diag_pre_multiply(scales, L_corr)`; the stem binds no plan node.
+# Scale priors are Exponential-only in this slice (SB's default;
+# sampled-θ hyperparameters ride the scalar-prior shape).
+function _lower_lkj_factor(lhs, rhs, coefuse, ctx)
+    args = _plain_args(rhs, "`LKJCovarianceFactor`")
+    length(args) == 3 || _sfail("parameter $lhs: " *
+                                "`LKJCovarianceFactor` takes (K, scale prior, " *
+                                "shape) " *
+                                "(`L ~ LKJCovarianceFactor(2, Exponential(1.0), 2.0)`), " *
+                                "got $(length(args)) arguments")
+    K, prior, shape = args
+    (K isa Integer && !(K isa Bool) && K >= 1) ||
+        _sfail("parameter $lhs: `LKJCovarianceFactor` needs an integer " *
+               "dimension K ≥ 1, got $(repr(K))")
+    prior isa Expr && prior.head === :call && !isempty(prior.args) &&
+        prior.args[1] === :Exponential ||
+        _sfail("parameter $lhs: joint-factor scale prior is " *
+               "`Exponential(θ)` in this slice (SB's default), got " *
+               "$(repr(prior))")
+    pargs = _plain_args(prior, "`Exponential`")
+    length(pargs) == 1 || _sfail("parameter $lhs: `Exponential` takes " *
+                                 "exactly the scale")
+    theta = _lower_param_arg(lhs, only(pargs), coefuse)
+    (shape isa Real && isfinite(shape) && shape > 0) ||
+        _sfail("parameter $lhs: LKJ shape must be a finite positive " *
+               "literal (a hyperparameter), got $(repr(shape))")
+    scales, corr = _lkj_factor_names(lhs)
+    for nm in (scales, corr)
+        nm in ctx.taken && _sfail(
+            "implicit factor piece $nm for $lhs collides " *
+            "with your definition — rename yours")
+        push!(ctx.taken, nm)
+    end
+    Ki = Int(K)
+    return (VectorParameter(scales, :positive_exponential, (arg1 = theta,),
+            Ki, lhs),
+        VectorParameter(corr, :cholesky_corr_lkj, (arg1 = Float64(shape),),
+            Ki, lhs))
+end
+
 function _lower_parameter(lhs, rhs, coefuse)
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || _sfail(
         "parameter $lhs needs a distribution call, got $(repr(rhs))")
@@ -3951,8 +4498,9 @@ function _lower_parameter(lhs, rhs, coefuse)
         _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
                "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
                "Beta, InverseGamma, HalfNormal, HalfCauchy, Flat, " *
-               "Dirichlet, truncated). If `$fam` is meant as a submodel, " *
-               "define it with `@rkppl $fam(args...) = begin ... end` and " *
+               "Dirichlet, LKJCovarianceFactor, truncated). If `$fam` is " *
+               "meant as a submodel, define it with " *
+               "`@rkppl $fam(args...) = begin ... end` and " *
                "make it visible in the lowering module (`mod=`).")
     args = _plain_args(rhs, "`$fam`")
     vals = [_lower_param_arg(lhs, a, coefuse) for a in args]

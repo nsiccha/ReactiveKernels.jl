@@ -807,10 +807,12 @@ end
 # with explicit per-margin/per-group loops (never the fused forms),
 # over the global margin subset `js` with Z columns `Zs` (Zs[j] is the
 # j-th GLOBAL margin's column; `:ones` margins pass `ones(n)`).
-function _ref_corr_r(bound, groupcol, L, tau, zflat, Zs, js)
+# `levels` overrides the numbering order (declared-order tests); default
+# is sort order (the bind fill for plain vectors).
+function _ref_corr_r(bound, groupcol, L, tau, zflat, Zs, js; levels = nothing)
     K = length(Zs)
-    levels = sort!(unique(bound.columns[groupcol]))
-    idx = [findfirst(==(v), levels) for v in bound.columns[groupcol]]
+    lv = levels === nothing ? sort!(unique(bound.columns[groupcol])) : levels
+    idx = [findfirst(==(v), lv) for v in bound.columns[groupcol]]
     r = zeros(Float64, length(idx))
     for m in eachindex(idx)
         g = idx[m]
@@ -1203,4 +1205,184 @@ end
     none = restore_draws(layout, Matrix{Float64}(undef, layout.total, 0))
     @test Tuple(keys(none)) == Tuple(keys(draws))
     @test isempty(none.L_g) && isempty(none.b_g)
+end
+
+# Swap declared levels onto one bucket of a lowered (unbound) plan.
+function _with_levels(plan::StructuralPlan, levels::Vector, which::Int = 1)
+    b = plan.ranef_buckets[which]
+    plan.ranef_buckets[which] = RanefBucket(b.id, b.group, b.kind,
+        b.margins, b.slices, b.lkj_eta, b.label, levels)
+    return plan
+end
+
+@testset "declared codes helper" begin
+    dc = ReactiveKernelsPPL._declared_codes
+    # Declared order, never sorted: levels [3, 1, 2].
+    @test dc([1, 3, 2, 1], [3, 1, 2]) == [2, 1, 3, 2]
+    # Strings in declared order.
+    @test dc(["b", "a", "c", "b"], ["c", "b", "a"]) == [2, 3, 1, 2]
+    # Single level; repeated values.
+    @test dc([7, 7], [7]) == [1, 1]
+    # Unobserved declared levels keep their positions.
+    @test dc(["a", "c"], ["c", "b", "a"]) == [3, 1]
+    # Symbols.
+    @test dc([:x, :y], [:y, :x]) == [2, 1]
+end
+
+@testset "ranef declared levels structure validation" begin
+    b = _rbucket()
+    mklevels(lv) = RanefBucket(b.id, b.group, b.kind, b.margins,
+        b.slices, b.lkj_eta, b.label, lv)
+    # Empty levels fail.
+    bad = _rbase(; with_gather = true)
+    bad.ranef_buckets[1] = mklevels([])
+    @test_throws ContractValidationError validate_structure(bad)
+    # Duplicate levels fail.
+    dup = _rbase(; with_gather = true)
+    dup.ranef_buckets[1] = mklevels([1, 2, 1])
+    @test_throws ContractValidationError validate_structure(dup)
+    # Non-literal-embeddable levels fail.
+    nonemb = _rbase(; with_gather = true)
+    nonemb.ranef_buckets[1] = mklevels([1, missing])
+    @test_throws ContractValidationError validate_structure(nonemb)
+    # Valid declared levels (order ≠ sorted) pass.
+    ok = _rbase(; with_gather = true)
+    ok.ranef_buckets[1] = mklevels(["b", "a"])
+    @test validate_structure(ok) === nothing
+end
+
+@testset "ranef declared levels bind" begin
+    cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5],
+        :g => [2, 1, 3, 1])
+    mkplan() = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1]
+            end
+        end, (:y, :g))
+    # `nothing` fills sort-ordered observed levels (SB numbering for
+    # plain vectors).
+    bound = bind_data(mkplan(), cols)
+    @test only(bound.ranef_buckets).levels == [1, 2, 3]
+    # Provided levels pass through; G counts unobserved declared levels.
+    bound2 = bind_data(_with_levels(mkplan(), [3, 1, 2, 4]), cols)
+    @test only(bound2.ranef_buckets).levels == [3, 1, 2, 4]
+    @test assign_layout(bound2).total == 6 # a + log_scale + 4 xi cells
+    # Observed-but-undeclared values fail closed (they would encode 0).
+    bad = _with_levels(mkplan(), [1, 2])
+    @test_throws ContractValidationError bind_data(bad, cols)
+    # Hand-built bound plans with `levels === nothing` fail loud.
+    hand = bind_data(mkplan(), cols)
+    hb = only(hand.ranef_buckets)
+    hand.ranef_buckets[1] = RanefBucket(hb.id, hb.group, hb.kind,
+        hb.margins, hb.slices, hb.lkj_eta, hb.label, nothing)
+    @test_throws ContractValidationError validate_data(hand)
+    # Same-group buckets must agree on levels (order included).
+    two = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(:A, g) .+ ranef(:B, g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(:A, g) do
+                mu => [1]
+            end
+            ranef_bucket(:B, g) do
+                mu => [1]
+            end
+        end, (:y, :g))
+    agree = bind_data(_with_levels(_with_levels(two, [2, 1, 3], 1),
+        [2, 1, 3], 2), cols)
+    @test agree.ranef_buckets[1].levels == agree.ranef_buckets[2].levels
+    disagree = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ ranef(:A, g) .+ ranef(:B, g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(:A, g) do
+                mu => [1]
+            end
+            ranef_bucket(:B, g) do
+                mu => [1]
+            end
+        end, (:y, :g))
+    _with_levels(_with_levels(disagree, [2, 1, 3], 1), [1, 2, 3], 2)
+    @test_throws ContractValidationError bind_data(disagree, cols)
+end
+
+# Declared-order K=1 intercept reference: SB `exp(log_scale) * xi[idx]`
+# with `idx` in DECLARED position order (never sorted) and `xi` sized
+# by the declared count (unobserved levels are prior-only).
+function _ref_declared_intercept(bound, nt, levels)
+    idx = [findfirst(==(v), levels) for v in bound.columns[:g]]
+    r = exp(nt.log_scale_g) .* nt.xi_g[idx]
+    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), bound.columns[:y]))
+    pr = logpdf(Normal(0, 5), nt.mu[1]) + logpdf(Exponential(1), nt.sigma) +
+        logpdf(Normal(0, 1), nt.log_scale_g) +
+        sum(logpdf.(Normal(0, 1), nt.xi_g))
+    return (; ll, pr)
+end
+
+@testset "ranef declared-order intercept e2e values and gradient" begin
+    _, _, y = _rk1_cols()
+    g = ["a", "c", "b", "a", "c", "b", "a", "c"]
+    levels = ["c", "a", "b", "d"] # declared ≠ sorted; "d" unobserved
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g) do
+                mu => [1]
+            end
+        end, (:y, :g))
+    bound = bind_data(_with_levels(plan, levels),
+        Dict{Symbol,AbstractVector}(:g => g, :y => y))
+    built = build_kernel(bound)
+    # a + sigma + log_scale + 4 xi cells (d is prior-only).
+    @test built.layout.total == 7
+    u = [0.2, 0.1, -0.3, 0.4, 0.0, -0.1, 0.25]
+    nt = constrain(built.layout, u)
+    ref = _ref_declared_intercept(bound, nt, levels)
+    @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
+    @test _query(built.spec, bound, :prior, u) ≈ ref.pr
+    @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + u[2]
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "ranef declared-order correlated e2e values and gradient" begin
+    gv = ["a", "c", "b", "c", "a", "b"]
+    xv = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    yv = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    levels = ["c", "b", "a", "d"] # declared ≠ sorted; "d" unobserved
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(:ID, g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(:ID, g) do
+                mu => [1, x]
+            end
+        end, (:y, :x, :g))
+    bound = bind_data(_with_levels(plan, levels),
+        Dict{Symbol,AbstractVector}(:g => gv, :x => xv, :y => yv))
+    built = build_kernel(bound)
+    # coef + sigma + 1 theta + 2 tau + 2*4 z cells.
+    @test built.layout.total == 13
+    u = collect(range(-0.4, 0.4; length = built.layout.total))
+    nt = constrain(built.layout, u)
+    r = _ref_corr_r(bound, :g, nt.L_ID_g, nt.tau_ID_g, nt.z_flat_ID_g,
+        [ones(6), xv], 1:2; levels)
+    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
+    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+        logpdf(Exponential(1), nt.sigma) +
+        _ref_lkj_k2(nt.L_ID_g, 1.0) +
+        sum(logpdf.(Normal(0, 1), nt.tau_ID_g)) +
+        sum(logpdf.(Normal(0, 1), nt.z_flat_ID_g))
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    @test _query(built.spec, bound, :prior, u) ≈ pr
+    s = 1 / (1 + exp(-u[3]))
+    jac = u[2] + u[4] + u[5] + log(sin(pi * s)) + log(pi) + log(s) +
+        log1p(-s)
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
+    _check_gradient(built.spec, bound, u)
 end

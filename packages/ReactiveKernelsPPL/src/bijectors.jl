@@ -96,3 +96,25 @@ function _prepared_interval_endpoint(lo::Float64, hi::Float64, endpoint::Symbol)
         prepare(getproperty(interval_bijector, endpoint); bound = (; lo = lo, hi = hi))
     end
 end
+
+# Floored positive (lo, ∞): offset-exp ℝ → (lo, ∞) — Stan's lower-bound
+# kernel (`real<lower=lo>`, SB `lognormal(0,1; lower=rho_lower)`): the
+# Jacobian is the bare exp term (`u`), with NO truncation renormalizer
+# (the ranef-`tau` precedent). `logjac` reads the UNCONSTRAINED value.
+@kernel floored_bijector(lo::Float64) = begin
+    constrain(u::Float64)::Float64 = lo + exp(u)
+    inv(constrain, x::Float64)::Float64 = log(x - lo)
+    unconstrain(x::Float64)::Float64 = inv(constrain, x)
+    logjac(u::Float64)::Float64 = u
+end
+
+# Cache of prepared floored endpoints, keyed by (lo, endpoint): the owner
+# bound is `bound=` into the prepared scalar kernel, so the host call is
+# `k(value)`. Lazy, like `_prepared_endpoint`.
+const _PREPARED_FLOORED = Dict{Tuple{Float64,Symbol},Any}()
+
+function _prepared_floored_endpoint(lo::Float64, endpoint::Symbol)
+    get!(_PREPARED_FLOORED, (lo, endpoint)) do
+        prepare(getproperty(floored_bijector, endpoint); bound = (; lo = lo))
+    end
+end
