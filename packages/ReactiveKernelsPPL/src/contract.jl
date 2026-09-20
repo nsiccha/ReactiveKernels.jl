@@ -432,9 +432,11 @@ levels in numbering order (SB `CA.levels` for categorical groupings,
 sort order otherwise): the in-model [`_declared_codes`](@ref) encoder
 numbers groups by position in this vector — no sorting — and `G` is its
 length (unobserved declared levels keep prior-only coefficients, exactly
-like SB). `nothing` pre-bind (or when the emitter has no declaration):
-[`bind_data`](@ref) fills sort-ordered observed levels, which equal SB
-numbering for plain vectors; hand-built bound plans must fill it too.
+like SB). Surface spelling: `ranef_bucket(g; levels=[...])` (order =
+numbering; extra entries are unobserved prior-only levels). `nothing`
+pre-bind (or when the emitter has no declaration): [`bind_data`](@ref)
+fills sort-ordered observed levels, which equal SB numbering for plain
+vectors; hand-built bound plans must fill it too.
 """
 struct RanefBucket
     id::Union{Nothing,Symbol}

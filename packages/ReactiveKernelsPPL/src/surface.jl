@@ -651,6 +651,10 @@ end
 # A `ranef_bucket` do-block declares one shared random-effect draws block:
 # `ranef_bucket(:ID, g; eta=1.0) do <target> => [margins...] ... end`
 # (plain: `ranef_bucket(g) do ... end`). Lowers directly to RanefBucket IR.
+# `levels=[...]` declares the grouping's levels in numbering order (SB
+# `CA.levels` for categorical groupings — custom order admitted, extra
+# entries are unobserved prior-only levels); omitted, bind derives
+# sort-ordered observed levels.
 # Continuous margins reference data columns or vector-shaped derived
 # locals (`w = x .* z`, then `mu => [w]`); the partition-time gate admits
 # data-or-defined names (`detnames` pre-scan — buckets lower in statement
@@ -681,18 +685,24 @@ function _lower_bucket(st::Expr, line::Int, data::Set{Symbol},
     pos = Any[]
     eta = 1.0
     eta_given = false
+    levels = nothing
     for a in call.args[2:end]
         if a isa Expr && a.head === :parameters
             for kw in a.args
                 kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where takes keyword `eta` only")
-                kw.args[1] === :eta ||
-                    _sfail("$where takes keyword `eta` only, got `$(kw.args[1])`")
-                v = kw.args[2]
-                v isa Real && !(v isa Bool) ||
-                    _sfail("$where eta must be a numeric literal, got $(repr(v))")
-                eta = Float64(v)
-                eta_given = true
+                    _sfail("$where takes keywords `eta`/`levels` only")
+                kw.args[1] === :eta || kw.args[1] === :levels ||
+                    _sfail("$where takes keywords `eta`/`levels` only, got " *
+                          "`$(kw.args[1])`")
+                if kw.args[1] === :eta
+                    v = kw.args[2]
+                    v isa Real && !(v isa Bool) ||
+                        _sfail("$where eta must be a numeric literal, got $(repr(v))")
+                    eta = Float64(v)
+                    eta_given = true
+                else
+                    levels = _lower_bucket_levels(kw.args[2], where)
+                end
             end
         else
             push!(pos, a)
@@ -771,7 +781,8 @@ function _lower_bucket(st::Expr, line::Int, data::Set{Symbol},
     for (t, _) in slices
         _claim!(seen, seelines, Symbol("r_$(t)_" * suffix), line)
     end
-    b = RanefBucket(key[1], group, kind, margins, slices, eta, label)
+    b = RanefBucket(key[1], group, kind, margins, slices, eta, label,
+        levels)
     if kind === :intercept1 || kind === :slope1
         for nm in _ranef_k1_names(b)
             _claim!(seen, seelines, nm, line)
@@ -786,6 +797,41 @@ function _lower_bucket(st::Expr, line::Int, data::Set{Symbol},
         _claim!(seen, seelines, Symbol("b_" * suffix), line)
     end
     return b
+end
+
+# A bucket's declared grouping levels (`levels=["c", "a", "b", "d"]`):
+# a literal vector in DECLARED numbering order (SB `CA.levels` for
+# categorical groupings) — extra entries are unobserved prior-only
+# levels. Elements are literal-embeddable scalars: numbers (Bool rides
+# Real), strings, chars, or QUOTED symbols (`:a` — a bare name is not
+# a level value). Shape (non-empty, duplicate-free) is checked here
+# with line context; the contract re-checks for hand-built plans.
+function _lower_bucket_levels(v, where)
+    v isa Expr && v.head === :vect ||
+        _sfail("$where levels takes a literal level vector " *
+              "(`levels=[\"b\", \"a\"]`), got $(repr(v))")
+    levels = Any[]
+    for e in v.args
+        if e isa QuoteNode && e.value isa Symbol
+            push!(levels, e.value)
+        elseif e isa Union{Real,String,Char}
+            push!(levels, e)
+        elseif e isa Symbol
+            _sfail("$where level $(repr(e)) is a bare name — levels are " *
+                  "literal values: quote symbols (`:$e`) or write strings " *
+                  "(`\"$e\"`)")
+        else
+            _sfail("$where level $(repr(e)) is not literal-embeddable " *
+                  "(numbers, strings, chars, or quoted symbols only)")
+        end
+    end
+    isempty(levels) &&
+        _sfail("$where levels declares zero grouping levels " *
+              "(`levels=[]` carries no groups)")
+    length(unique(levels)) == length(levels) ||
+        _sfail("$where levels declares duplicate grouping levels " *
+              "($(repr(levels)))")
+    return levels
 end
 
 # One margin element: `1` (intercept), a bare data column or vector-shaped

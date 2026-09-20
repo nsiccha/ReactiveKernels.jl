@@ -1309,6 +1309,93 @@ end
     @test_throws ContractValidationError bind_data(disagree, cols)
 end
 
+# Surface-level bucket with a spliced `levels` value (`QuoteNode` mirrors
+# how `[:c]` parses; bare Symbols stay bare names).
+_levels_lit(v::Symbol) = QuoteNode(v)
+_levels_lit(v) = v
+function _levels_plan(lv)
+    return lower_rkppl(Expr(:block,
+            :(mu = a .+ ranef(g)), :(y .~ Normal.(mu, 1.5)),
+            Expr(:do,
+                Expr(:call, :ranef_bucket, :g,
+                    Expr(:parameters, Expr(:kw, :levels, lv))),
+                Expr(:(->), Expr(:tuple), Expr(:block, :(mu => [1]))))),
+        (:y, :g))
+end
+_levels_vals(vals::Vector) =
+    _levels_plan(Expr(:vect, (_levels_lit(v) for v in vals)...))
+
+@testset "ranef bucket levels surface spelling" begin
+    # Declared order lands verbatim (never sorted); every
+    # literal-embeddable element shape rides.
+    for vals in (["c", "a", "b", "d"], [3, 1, 2, 4], [:c, :a],
+            ['c', 'a'], [true, false], [1.5, 2.5], Any[1, "a"])
+        @test only(_levels_vals(vals).ranef_buckets).levels == vals
+    end
+    # Quoted ID + eta combo; omitted levels stay `nothing` (bind derives).
+    combo = lower_rkppl(quote
+            mu = a .+ ranef(:ID, g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(:ID, g; eta = 2.0, levels = [:c, :a]) do
+                mu => [1]
+            end
+        end, (:y, :g))
+    b = only(combo.ranef_buckets)
+    @test b.levels == [:c, :a] && b.lkj_eta == 2.0
+    bare = lower_rkppl(quote
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g) do
+                mu => [1]
+            end
+        end, (:y, :g))
+    @test only(bare.ranef_buckets).levels === nothing
+end
+
+@testset "ranef bucket levels surface failures" begin
+    # Not a literal vector: string / bare column / range.
+    for lv in ("ab", :g, Expr(:call, :(:), 1, 3))
+        @test_throws SurfaceLoweringError _levels_plan(lv)
+    end
+    # Empty / duplicates.
+    @test_throws SurfaceLoweringError _levels_plan(Expr(:vect))
+    @test_throws SurfaceLoweringError _levels_plan(Expr(:vect, "a", "a"))
+    # Bare names are not level values (one or all).
+    @test_throws SurfaceLoweringError _levels_plan(Expr(:vect, :a, :b))
+    @test_throws SurfaceLoweringError _levels_plan(Expr(:vect, 1, "a", :b))
+    # Non-literal elements: nested vector / call / non-embeddable value.
+    @test_throws SurfaceLoweringError _levels_plan(Expr(:vect, 1, Expr(:vect, 2)))
+    @test_throws SurfaceLoweringError _levels_plan(Expr(:vect, 1, Expr(:call, :f, 2)))
+    @test_throws SurfaceLoweringError _levels_plan(Expr(:vect, 1, missing))
+    # Unknown keyword (the reworded two-keyword gate).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, 1.5)
+            ranef_bucket(g; foo = 1) do
+                mu => [1]
+            end
+        end, (:y, :g))
+    # The two guidance messages are pinned: literal-vector requirement and
+    # the bare-name quote-it fix.
+    err = try
+        _levels_plan("ab")
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError &&
+        occursin("takes a literal level vector", sprint(showerror, err))
+    err = try
+        _levels_plan(Expr(:vect, :a))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError &&
+        occursin("is a bare name", sprint(showerror, err)) &&
+        occursin("`:a`", sprint(showerror, err))
+end
+
 # Declared-order K=1 intercept reference: SB `exp(log_scale) * xi[idx]`
 # with `idx` in DECLARED position order (never sorted) and `xi` sized
 # by the declared count (unobserved levels are prior-only).
@@ -1385,4 +1472,55 @@ end
         log1p(-s)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
     _check_gradient(built.spec, bound, u)
+end
+
+@testset "ranef surface levels intercept e2e values and gradient" begin
+    _, _, y = _rk1_cols()
+    g = ["a", "c", "b", "a", "c", "b", "a", "c"]
+    levels = ["c", "a", "b", "d"] # declared ≠ sorted; "d" unobserved
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(g; levels = ["c", "a", "b", "d"]) do
+                mu => [1]
+            end
+        end, (:y, :g))
+    # Surface text carries declared levels into the bucket (the P2 channel).
+    @test only(plan.ranef_buckets).levels == levels
+    bound = bind_data(plan, Dict{Symbol,AbstractVector}(:g => g, :y => y))
+    @test only(bound.ranef_buckets).levels == levels
+    built = build_kernel(bound)
+    # a + sigma + log_scale + 4 xi cells (d is prior-only).
+    @test built.layout.total == 7
+    u = [0.2, 0.1, -0.3, 0.4, 0.0, -0.1, 0.25]
+    nt = constrain(built.layout, u)
+    ref = _ref_declared_intercept(bound, nt, levels)
+    @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
+    @test _query(built.spec, bound, :prior, u) ≈ ref.pr
+    @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + u[2]
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "ranef surface levels correlated bind" begin
+    gv = ["a", "c", "b", "c", "a", "b"]
+    xv = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    yv = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    levels = ["c", "b", "a", "d"] # declared ≠ sorted; "d" unobserved
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ ranef(:ID, g)
+            y .~ Normal.(mu, sigma)
+            ranef_bucket(:ID, g; levels = ["c", "b", "a", "d"]) do
+                mu => [1, x]
+            end
+        end, (:y, :x, :g))
+    @test only(plan.ranef_buckets).levels == levels
+    bound = bind_data(plan,
+        Dict{Symbol,AbstractVector}(:g => gv, :x => xv, :y => yv))
+    # Surface levels pass bind through; G counts the unobserved level.
+    @test only(bound.ranef_buckets).levels == levels
+    @test assign_layout(bound).total == 13 # coef + sigma + theta + 2 tau + 2×4 z
 end
