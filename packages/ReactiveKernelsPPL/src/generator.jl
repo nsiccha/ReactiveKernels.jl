@@ -670,9 +670,11 @@ end
 function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _location_node(r, plan)
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, lp]
     yv, lpv = _dovar(1), _dovar(2)
-    sref = _thread_ref!(inputs, r.scale)
+    sref = _thread_ref!(inputs, sarg)
     lb, ub = _thread_bounds!(inputs, r.evidence, false)
     base = :(normal($lpv, $sref).logpdf($yv))
     cell = _gaussian_cell(r.evidence.kind, base, yv, lb, ub, lpv, sref)
@@ -680,7 +682,7 @@ function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _gaussian_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, lpv::Symbol, sref)
@@ -845,35 +847,78 @@ function _nb2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
     mu = _mu_name(r.label)
-    pre = :($mu = exp.($lp))
+    pre = Expr[:($mu = exp.($lp))]
+    sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, mu]
     yv, muv = _dovar(1), _dovar(2)
-    phiref = _thread_ref!(inputs, r.scale)
+    phiref = _thread_ref!(inputs, sarg)
     cell = :(negative_binomial2($muv, $phiref).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
     # Surface is Distributions-SCALE `Gamma(alpha, mu/alpha)`; the kernel
     # takes rate, so the boundary inverts (same as the sampled-gamma prior).
-    av = r.scale isa Symbol ? r.scale : Float64(r.scale)
+    av = sarg isa Symbol ? sarg : Float64(sarg)
     rate = _rate_name(r.label)
-    pre = :($rate = $av ./ exp.($lp))
+    push!(pre, :($rate = $av ./ exp.($lp)))
     inputs = Any[y, rate]
     yv, ratev = _dovar(1), _dovar(2)
-    aref = _thread_ref!(inputs, r.scale)
+    aref = _thread_ref!(inputs, sarg)
     cell = :(gamma($aref, $ratev).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# The scale argument a likelihood plate threads per cell: scalar scales
+# (parameter, assignment, literal, raw data column) pass through untouched;
+# a predictor-fed scale binds its constrained vector once
+# (`_ppl_sc_<label>`, the `_ppl_mu_`/`_ppl_rate_` precompute precedent —
+# the link inverts here, never inside the cell) and the plate iterates
+# the node. The logit inversion reuses the Beta plate's inlined
+# `1 ./ (1 .+ exp.(-lp))` spelling (no new imports, Enzyme-safe).
+_sc_name(label::Symbol) = Symbol(:_ppl_sc_, label)
+
+function _scale_plate_arg(r::LikelihoodSpec, plan::StructuralPlan, pre::Vector{Expr})
+    s = r.scale
+    s isa ScalePredictorRef || return s
+    pred = _predictor(plan, s.predictor)
+    lp = _lp_name(pred)
+    sc = _sc_name(r.label)
+    rhs = if s.link === IdentityLink
+        lp
+    elseif s.link === LogLink
+        :(exp.($lp))
+    elseif s.link === LogitLink
+        :(1 ./ (1 .+ exp.(-$lp)))
+    else
+        throw(ContractValidationError(
+            "[generator] scale predictor link $(s.link) has no inversion " *
+            "(admitted: identity, log, logit)"))
+    end
+    # The annotation is load-bearing for AD, not decoration: it proves the
+    # plate input `:axis` statically, so `prepare` lowers the straight-line
+    # plate form. Unannotated (metadata-`Any`) vector inputs lower with the
+    # runtime `_authored_plate_is_axis` / `_plate_dependency_changed` guards,
+    # whose form defeats Enzyme's static-activity analysis on some endpoint
+    # bodies (NB2, found by test: silently wrong gradients). `AbstractVector`
+    # is eltype-free so integer offset-only LPs still match. The LP is
+    # always a vector here: codegen entry points validate first (empty
+    # predictors rejected) and gate HSGP (the only termless-at-emission
+    # shape), so every scale predictor contributes a vector summand.
+    push!(pre, :($sc::AbstractVector = $rhs))
+    return sc
 end
 
 _prob_name(label::Symbol) = Symbol(:_ppl_p_, label)

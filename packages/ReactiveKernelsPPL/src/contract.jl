@@ -97,13 +97,35 @@ struct ResponseEvidence
 end
 
 """
+    ScalePredictorRef(predictor, link)
+
+A predictor-fed scale/shape use: the response's auxiliary (Gaussian
+sigma, NB2 dispersion phi, Gamma shape alpha) is a whole linear
+predictor, varying per observation. `predictor` names the
+[`PredictorSpec`](@ref) (planned exactly like a location predictor:
+terms, priors, one link); `link` is the scale use-site wrapper —
+[`IdentityLink`](@ref) (bare predictor), [`LogLink`](@ref)
+(`exp.(predictor)`), or [`LogitLink`](@ref) (`logistic.(predictor)`) —
+and must equal the predictor's own link (the one-link-per-predictor
+rule). The generator binds the constrained vector once per response
+(`_ppl_sc_<label>`) and threads it through the likelihood plate per
+cell, so evidence corrections read the per-cell scale.
+"""
+struct ScalePredictorRef
+    predictor::Symbol
+    link::LinkFunction
+end
+
+"""
     LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, trials[, range]])
 
-One independent response. `scale` is the response's scalar auxiliary —
-Gaussian sigma, NB2 dispersion phi, Gamma shape alpha (parameter,
-assignment, or folded literal) — and must be `nothing` otherwise. (One
-slot covers every admitted family; a two-auxiliary family such as Beta
-needs a new field — noted, not built.) `weights` is a
+One independent response. `scale` is the response's auxiliary —
+Gaussian sigma, NB2 dispersion phi, Gamma shape alpha — either scalar
+(parameter, assignment, folded literal, or a raw per-observation data
+column) or, for Gaussian/NB2/Gamma only, a [`ScalePredictorRef`](@ref)
+(predictor-fed per-observation scale); it must be `nothing` otherwise.
+(One slot covers every admitted family; a two-auxiliary family such as
+Beta needs a new field — noted, not built.) `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
 closed emitter-side. `trials` is the Binomial trial count (Int column or
 Int literal), `nothing` otherwise. `range` carries a literal `y[1:N]`
@@ -174,7 +196,7 @@ struct LikelihoodSpec
     link::LinkFunction
     response::ColumnRef
     predictor::Symbol
-    scale::Union{Nothing,ParamName,Real}
+    scale::Union{Nothing,ParamName,Real,ScalePredictorRef}
     weights::Union{Nothing,ColumnRef}
     evidence::ResponseEvidence
     label::Symbol
@@ -3711,6 +3733,10 @@ function _validate_responses(plan::StructuralPlan)
     scan_states = Set{Symbol}(s.state for s in plan.scans)
     used_predictors = Set{Symbol}()
     for r in plan.responses
+        # A scale predictor feeds a slot exactly like a location predictor,
+        # so it counts toward the unused-predictor check below.
+        r.scale isa ScalePredictorRef &&
+            push!(used_predictors, r.scale.predictor)
         # A scan-state latent vector location: the mean is the carried state
         # directly (no linear predictor). Slice 1 admits Gaussian-identity only.
         if r.predictor in scan_states
@@ -3941,6 +3967,7 @@ function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
             _fail(r.label, "scale literal must be finite positive")
         return nothing
     end
+    s isa ScalePredictorRef && return _validate_scale_predictor(r, plan, s)
     # A scalar parameter/assignment scale resolves now; a per-observation scale
     # is a raw data column resolved at bind (see `_validate_scale_data`), so
     # defer an unknown symbol rather than failing structurally (mirrors how
@@ -3948,6 +3975,39 @@ function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     s isa Symbol && s in _union_names(plan) && return nothing
     s isa Symbol && return nothing
     return _fail(r.label, "scale references unknown name $s")
+end
+
+# A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha):
+# the predictor exists, carries the use-site link (the
+# one-link-per-predictor rule), and is not the response's own location
+# predictor (the two slots take distinct predictors — the BRM-side plan
+# rule, mirrored here as defense in depth). Beta-kappa predictors are
+# deferred; predictor-fed Binomial trials likewise (trials stay
+# column-or-literal by type).
+function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
+        s::ScalePredictorRef)
+    r.family === BetaLogitFam && _fail(r.label,
+        "Beta response with a scale predictor: predictor-fed concentration " *
+        "(kappa) is deferred — use a scalar kappa (parameter or literal)")
+    (r.family === GaussianFam || r.family === NegativeBinomial2Fam ||
+        r.family === GammaLogFam) ||
+        _fail(r.label, "this response family takes no scale predictor")
+    (s.link === IdentityLink || s.link === LogLink ||
+        s.link === LogitLink) ||
+        _fail(r.label, "scale predictor link must be identity, log, or " *
+            "logit (got $(s.link))")
+    idx = findfirst(p -> p.name === s.predictor, plan.predictors)
+    idx === nothing && _fail(r.label,
+        "scale addresses unknown predictor $(s.predictor)")
+    pred = plan.predictors[idx]
+    pred.link === s.link ||
+        _fail(r.label, "scale predictor $(s.predictor) carries link " *
+            "$(pred.link), scale use wraps $(s.link) — one link per predictor")
+    s.predictor === r.predictor &&
+        _fail(r.label, "scale predictor $(s.predictor) is the response's " *
+            "own location predictor — location and scale take distinct " *
+            "predictors")
+    return nothing
 end
 
 # Data-level per-observation scale check: a scalar parameter/assignment name
@@ -3958,6 +4018,9 @@ end
 function _validate_scale_data(r::LikelihoodSpec, plan::StructuralPlan)
     s = r.scale
     (s === nothing || s isa Real) && return nothing
+    # A predictor-fed scale is an n_obs LP by construction (design over the
+    # bound rows); there is no column length to check at bind.
+    s isa ScalePredictorRef && return nothing
     s isa Symbol || return nothing
     s in _union_names(plan) && return nothing
     _is_derived(plan, s) && _fail(r.label,
