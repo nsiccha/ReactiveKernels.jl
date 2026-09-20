@@ -71,6 +71,16 @@ bound to a non-data LHS (`latent = <return>`). Invoked as
 the LHS (`latent_…`) and spliced into the parent plan, so a submodel lowers
 exactly like a hand-inlined model — transparent and reusable, never an opaque
 node.
+
+A fused stream def (design + coefficients inside, Stan
+`bernoulli_logit_glm`-style) keeps the response shell but NOT the predictor
+name: its affine local namespaces under the data LHS (`y_mu`), and an inline
+compound location synthesizes (`y_eta`) — both move the lowered predictor and
+its `<predictor>_coef` block. To factor design + coefficients into a def
+WITHOUT moving names, return the affine from a latent def and bind it at a
+named use site (`mu ~ affine_def(X, b)`, then `y .~ family.(...mu...)`): the
+use-site LHS names the predictor, and the plan is identical to the
+hand-written decomposed program.
 """
 struct RKPPLSubmodel
     name::Symbol
