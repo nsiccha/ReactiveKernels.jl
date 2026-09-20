@@ -410,10 +410,8 @@ end
         eta = a .+ b .* x
         y .~ gamma.(alpha, exp.(eta) ./ alpha)
     end, Dn2)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ b .* x
-        y .~ BinomialLogit.(n, mu)
-    end, Dn3)
+    # (The fused `BinomialLogit.(n, mu)` head lowers as the decomposed twin —
+    # pinned in "surface fused response heads", not here.)
 end
 
 @testset "surface plan equality" begin
