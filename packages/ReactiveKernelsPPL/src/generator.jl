@@ -47,6 +47,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _assignment_statements(plan))
     append!(stmts, preprocessing_recipes(plan))
     append!(stmts, _ranef_statements(plan))
+    append!(stmts, _varying_statements(plan))
     append!(stmts, _hsgp_basis_statements(plan))
     append!(stmts, _scan_reconstruction_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
@@ -166,6 +167,13 @@ function _predictor_statements(plan::StructuralPlan)
         for t in pred.terms
             t.kind === RanefGatherTerm &&
                 push!(terms, _ranef_gather_expr(plan, pred, t))
+        end
+        # A varying effect contributes its draws block's direct `r`
+        # expression (SB's `r_<target>_<suffix>` summand), resolved from
+        # the TERMS — the draws label does not fit a design block.
+        for t in pred.terms
+            t.kind === VaryingEffectTerm &&
+                push!(terms, _varying_effect_expr(plan, pred, t))
         end
         # A scan summand contributes its state's direct scaled expression
         # (`state .* coef`, SB's `ar` latent path with its free beta),
@@ -405,6 +413,25 @@ function _ranef_statements(plan::StructuralPlan)
     return stmts
 end
 
+# One `_ppl_gidx_<group>` encoder per grouping over the draws'
+# DECLARED levels (same dedup and bind-known order as the bucket arm).
+function _varying_statements(plan::StructuralPlan)
+    stmts = Expr[]
+    groups = Symbol[]
+    for d in plan.varying_draws
+        d.group in groups && continue
+        push!(groups, d.group)
+        d.levels === nothing && throw(ContractValidationError(
+            "[generator] internal: draws $(d.label) has no declared " *
+            "levels (validate_plan proves this)"))
+        lvlvec = Expr(:vect,
+            (_level_literal(lv) for lv in d.levels)...)
+        push!(stmts, Expr(:(=), Symbol(:_ppl_gidx_, d.group),
+            Expr(:call, :_declared_codes, d.group, lvlvec)))
+    end
+    return stmts
+end
+
 function _gather_bucket(plan::StructuralPlan, t::TermSpec)
     i = findfirst(b -> b.id === t.options.bucket_id &&
         b.group === t.options.bucket_group, plan.ranef_buckets)
@@ -412,6 +439,24 @@ function _gather_bucket(plan::StructuralPlan, t::TermSpec)
         "[generator] gather addresses unknown bucket " *
         "($(t.options.bucket_id), $(t.options.bucket_group))"))
     return plan.ranef_buckets[i]
+end
+
+# Term-to-draws join by label, plus the (draws, target) slice (unique
+# by validation). The term carries the draws label; the slice carries
+# the explicit column range — the generator never re-derives ranges.
+function _slice_draws(plan::StructuralPlan, pred::PredictorSpec,
+        t::TermSpec)
+    i = findfirst(d -> d.label === t.options.draws, plan.varying_draws)
+    i === nothing && throw(ContractValidationError(
+        "[generator] effect term addresses unknown draws " *
+        "($(t.options.draws))"))
+    d = plan.varying_draws[i]
+    si = findfirst(s -> s.draws === d.label && s.target === pred.name,
+        plan.varying_slices)
+    si === nothing && throw(ContractValidationError(
+        "[generator] internal: effect term of draws $(d.label) in " *
+        "predictor $(pred.name) has no slice (validate_plan proves this)"))
+    return d, plan.varying_slices[si]
 end
 
 # One margin's Z as an rvalue: bare columns stay bare (raw ports and
@@ -424,6 +469,17 @@ function _ranef_z_expr(z::RanefZRecipe)
         return Expr(:call, :.==, z.column, _level_literal(z.level))
     throw(ContractValidationError(
         "[generator] internal: ones-Z reached gather emission"))
+end
+
+# One varying margin's Z as an rvalue: identical semantics to the
+# bucket arm (bare columns stay bare; dummies compare against the
+# bind-known level value; `:ones` never reaches emission).
+function _varying_z_expr(z::VaryingZRecipe)
+    z.kind === :column && return z.column
+    z.kind === :dummy &&
+        return Expr(:call, :.==, z.column, _level_literal(z.level))
+    throw(ContractValidationError(
+        "[generator] internal: ones-Z reached effect emission"))
 end
 
 # One bucket's direct `r` summand, SB-literal (`sbimpl.jl`
@@ -443,6 +499,58 @@ function _ranef_gather_expr(plan::StructuralPlan, pred::PredictorSpec,
     end
     Z = _ranef_z_expr(only(b.margins).z)
     return Expr(:call, :*, scale, Expr(:call, :.*, gathered, Z))
+end
+
+# One varying draws block's direct `r` summand, SB-literal (same math
+# and association order as the bucket arm — no `b` node, the draws stay
+# implicit). Correlated draws take the K² implicit-draws arm below
+# (this slice's columns only).
+function _varying_effect_expr(plan::StructuralPlan, pred::PredictorSpec,
+        t::TermSpec)
+    d, s = _slice_draws(plan, pred, t)
+    d.kind === :correlated &&
+        return _varying_corr_effect_expr(plan, d, s)
+    scale, xi = _varying_k1_names(d)
+    gathered = Expr(:ref, xi, Symbol(:_ppl_gidx_, d.group))
+    if d.kind === :intercept1
+        return Expr(:call, :*, Expr(:call, :exp, scale), gathered)
+    end
+    Z = _varying_z_expr(only(d.margins).z)
+    return Expr(:call, :*, scale, Expr(:call, :.*, gathered, Z))
+end
+
+# One correlated draws block's direct `r` summand for one slice
+# (SB `rows_dot_product(Z, b[idx,cols])` with the draws implicit — the
+# no-`b`-node precedent): per slice margin j,
+# `Z_j .* sum_s (tau[j]*L[j,s]) .* z_flat[s + (gidx-1)*K]` over
+# `s in 1:j` (L lower-triangular — the `s > j` terms are structural
+# zeros, never emitted). `:ones` Z drops the factor (multiply by 1).
+# K, the slice range, and the `s` bound are all static; tau reads are
+# scalar refs (the coefficient-block precedent) and L reads the named
+# `_ppl_rl_` scalars from the layout edges.
+function _varying_corr_effect_expr(plan::StructuralPlan, d::VaryingDraws,
+        s::VaryingSlice)
+    cols = s.columns
+    K = length(d.margins)
+    L, tau, z = _varying_corr_names(d)
+    gidx = Symbol(:_ppl_gidx_, d.group)
+    parts = Any[]
+    for j in cols
+        m = d.margins[j]
+        inner = Any[]
+        for q in 1:j
+            A = :($(Expr(:ref, tau, j)) * $(_rl_name(L, j, q)))
+            idx = :($q .+ ($gidx .- 1) .* $K)
+            push!(inner, :($A .* $(Expr(:ref, z, idx))))
+        end
+        sj = foldl((a, c) -> :($a .+ $c), inner)
+        if m.z.kind === :ones
+            push!(parts, sj)
+        else
+            push!(parts, :($(_varying_z_expr(m.z)) .* $sj))
+        end
+    end
+    return foldl((a, c) -> :($a .+ $c), parts)
 end
 
 # One correlated bucket's direct `r` summand for one predictor slice
@@ -1466,6 +1574,26 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         _vector_prior_stmts!(stmts, terms, xi, :normal, (arg1 = 0, arg2 = 1),
             nothing)
     end
+    for d in plan.varying_draws
+        if d.kind === :correlated
+            L, tau, z = _varying_corr_names(d)
+            lnode = Symbol(:_ppl_prior_, L)
+            push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(d))))
+            push!(terms, lnode)
+            _vector_prior_stmts!(stmts, terms, tau, :normal,
+                (arg1 = 0, arg2 = 1), nothing)
+            _vector_prior_stmts!(stmts, terms, z, :normal,
+                (arg1 = 0, arg2 = 1), nothing)
+            continue
+        end
+        scale, xi = _varying_k1_names(d)
+        snode = Symbol(:_ppl_prior_, scale)
+        scell = _family_logpdf_expr(:normal, Any[0, 1], scale)
+        push!(stmts, :($snode::Float64 = $scell))
+        push!(terms, snode)
+        _vector_prior_stmts!(stmts, terms, xi, :normal, (arg1 = 0, arg2 = 1),
+            nothing)
+    end
     # HSGP bases (SB `_sb_hsgp`/`_sb_hsgp_aniso`): the length scales and
     # marginal scale as scalar `lognormal(0, 1)` nodes plus the
     # standardized `beta_raw` plate (shared vector-prior helper). The
@@ -1528,6 +1656,12 @@ end
 function _lkj_prior_expr(b::RanefBucket)
     return _lkj_prior_terms(_ranef_corr_names(b)[1], length(b.margins),
         b.lkj_eta)
+end
+
+# One correlated draws block's LKJ prior node (names/sizes from the draws).
+function _lkj_prior_expr(d::VaryingDraws)
+    return _lkj_prior_terms(_varying_corr_names(d)[1], length(d.margins),
+        d.lkj_eta)
 end
 
 # One plate over a latent VECTOR (a plate parameter or a spline vector),

@@ -127,6 +127,14 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps)
         # (bucket_id, bucket_group) key, which does not fit one Symbol.
         return DesignBlock(RanefGatherTerm, only(t.columns), t.addressee, 0,
             Symbol[], [])
+    elseif t.kind === VaryingEffectTerm
+        # A varying effect is a direct `r` expression over the group
+        # index and the draws block's draws (SB's
+        # `r_<target>_<suffix>` summand) — no design-matrix width.
+        # `column` carries the grouping column (the encoder input); the
+        # generator reads the TERMS for the draws label.
+        return DesignBlock(VaryingEffectTerm, only(t.columns), t.addressee,
+            0, Symbol[], [])
     else
         throw(ContractValidationError("[$label] term kind $(t.kind) has no design rule"))
     end

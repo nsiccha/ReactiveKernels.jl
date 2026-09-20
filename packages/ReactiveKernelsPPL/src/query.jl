@@ -165,7 +165,7 @@ function restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real})
         for e in layout.entries
             if e.kind === :coefficient
                 push!(pairs, e.predictor => Matrix{Float64}(undef, e.size, 0))
-            elseif e.kind === :ranef_corr
+            elseif e.kind === :ranef_corr || e.kind === :varying_corr
                 push!(pairs, e.name => Vector{Matrix{Float64}}(undef, 0))
             else
                 push!(pairs, e.name => Vector{Float64}(undef, 0))
@@ -173,7 +173,7 @@ function restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real})
         end
         # Derived draws ride at the end, exactly as `constrain` orders them.
         for e in layout.entries
-            e.kind === :ranef_corr || continue
+            (e.kind === :ranef_corr || e.kind === :varying_corr) || continue
             sfx = string(e.name)[3:end]
             push!(pairs, Symbol("b_", sfx) =>
                 Vector{Matrix{Float64}}(undef, 0))

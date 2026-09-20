@@ -80,6 +80,7 @@ coefficient (`u .* beta`, SB's `ar` latent path with its free `popefs` beta)."""
     ScanSummandTerm
     MonotonicTerm
     MonotonicSummandTerm
+    VaryingEffectTerm
 end
 
 """
@@ -458,6 +459,84 @@ RanefBucket(id::Union{Nothing,Symbol}, group::ColumnRef, kind::Symbol,
     RanefBucket(id, group, kind, margins, slices, lkj_eta, label, nothing)
 
 """
+    VaryingZRecipe(kind, column, level)
+
+One varying-effect design (Z) column recipe: structure only, never a
+materialized vector pre-codegen. `kind` is `:ones` (intercept — `column`
+is `:none`, `level` is `nothing`), `:column` (continuous raw column),
+or `:dummy` (indicator over `column`: `level` is the level VALUE for
+`Int`, exact match for `AbstractString`). The thin layer performs NO
+coding inference — treatment/cell-means decisions arrive as explicit
+`dummy` recipes from the emitter.
+"""
+struct VaryingZRecipe
+    kind::Symbol
+    column::Symbol
+    level::Union{Nothing,Int,AbstractString}
+end
+
+"""
+    VaryingMargin(coefficient, z)
+
+One varying-effect margin in draws order: `coefficient` is the margin
+address (`:Intercept`, a column, or a dummy label), `z` is the
+[`VaryingZRecipe`](@ref) for its Z column. Margins live on the shared
+draws; per-target column ranges live on [`VaryingSlice`](@ref).
+"""
+struct VaryingMargin
+    coefficient::Symbol
+    z::VaryingZRecipe
+end
+
+"""
+    VaryingDraws(group, kind, margins, lkj_eta, label, suffix[, levels])
+
+One shared varying-effect draws block: non-centered geometry over
+`K = length(margins)` margins in `G` groups of raw column `group`.
+`kind` is `:intercept1` (single-`1` without eta: log-scale/xi
+geometry), `:slope1` (single slope without eta: tau/xi geometry), or
+`:correlated` (LKJ + tau + z_flat; K >= 2, or K = 1 with eta given —
+the vacuous-1x1-LKJ route). `label` is the link identity
+(`:draws_<suffix>`); `suffix` is the in-graph naming stem (the group,
+or `group_binding` when two draws share a grouping). `levels` is the
+grouping's DECLARED levels in numbering order (`nothing` pre-bind, or
+when the emitter has no declaration — [`bind_data`](@ref) fills
+sort-ordered observed levels). Shared draws are consumed by value
+flow: each [`VaryingSlice`](@ref) names this draws' label plus explicit
+columns — never by label matching across statements.
+"""
+struct VaryingDraws
+    group::ColumnRef
+    kind::Symbol
+    margins::Vector{VaryingMargin}
+    lkj_eta::Float64
+    label::Symbol
+    suffix::String
+    levels::Union{Nothing,Vector}
+end
+
+# Pre-declared-levels 6-arg positional construction keeps working with
+# `levels = nothing` (bind_data derives sort-ordered levels).
+VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
+    lkj_eta::Float64, label::Symbol, suffix::String) =
+    VaryingDraws(group, kind, margins, lkj_eta, label, suffix, nothing)
+
+"""
+    VaryingSlice(draws, columns, target)
+
+One target application of a [`VaryingDraws`](@ref) block: `draws` names
+the draws label, `columns` selects its explicit column range, `target`
+is the predictor the contribution feeds. One slice per (draws, target);
+a draws block's slices partition `1:K` exactly once, in any slice
+order (columns are explicit, never positional by body order).
+"""
+struct VaryingSlice
+    draws::Symbol
+    columns::UnitRange{Int}
+    target::Symbol
+end
+
+"""
     VectorParameter(name, family, args, size[, label])
 
 One constrained VECTOR parameter for a leveled response (cutpoints,
@@ -750,8 +829,11 @@ name table (duplicates rejected). N≥1 independent responses; shared
 predictor Symbols allowed. `levelmaps` sizes every factor term
 (binder-evaluated values); `plate_parameters` carries per-cell latents,
 `vector_parameters` leveled-response latents (cutpoints/thresholds/simplexes),
-`scans` sequential-recurrence latents, and `ranef_buckets` random-effect
-draws blocks (empty for a plain population-GLM plan).
+`scans` sequential-recurrence latents, `ranef_buckets` random-effect
+draws blocks (empty for a plain population-GLM plan), and
+`varying_draws`/`varying_slices` the generic varying-effect draws
+blocks plus their per-target applications (the SSA spelling; a model
+uses either spelling, never both).
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -767,6 +849,8 @@ struct StructuralPlan
     plate_parameters::Vector{PlateParameter}
     scans::Vector{ScanSpec}
     ranef_buckets::Vector{RanefBucket}
+    varying_draws::Vector{VaryingDraws}
+    varying_slices::Vector{VaryingSlice}
     vector_parameters::Vector{VectorParameter}
     spline_bases::Vector{SplineBasis}
     spline_vectors::Vector{SplineVector}
@@ -790,8 +874,9 @@ StructuralPlan(
     roles::Dict{Symbol,Symbol}) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[],
-        RanefBucket[], VectorParameter[], SplineBasis[], SplineVector[],
-        HSGPBasis[], KernelPlate[], R2D2Prior[])
+        RanefBucket[], VaryingDraws[], VaryingSlice[], VectorParameter[],
+        SplineBasis[], SplineVector[], HSGPBasis[], KernelPlate[],
+        R2D2Prior[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -815,6 +900,8 @@ function StructuralPlan(
         plate_parameters::Vector{PlateParameter} = PlateParameter[],
         scans::Vector{ScanSpec} = ScanSpec[],
         ranef_buckets::Vector{RanefBucket} = RanefBucket[],
+        varying_draws::Vector{VaryingDraws} = VaryingDraws[],
+        varying_slices::Vector{VaryingSlice} = VaryingSlice[],
         vector_parameters::Vector{VectorParameter} = VectorParameter[],
         spline_bases::Vector{SplineBasis} = SplineBasis[],
         spline_vectors::Vector{SplineVector} = SplineVector[],
@@ -823,8 +910,9 @@ function StructuralPlan(
         r2d2_priors::Vector{R2D2Prior} = R2D2Prior[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, columns, n_obs, roles, levelmaps,
-        plate_parameters, scans, ranef_buckets, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors)
+        plate_parameters, scans, ranef_buckets, varying_draws, varying_slices,
+        vector_parameters, spline_bases, spline_vectors, hsgp_bases,
+        kernel_plates, r2d2_priors)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -1004,14 +1092,15 @@ function _hsgp_floors(K::Vector{Int}, fits::Vector{Tuple{Float64,Float64}},
 end
 
 """Slice-1 term-name vocabulary (emitter-side admission keys; `:ranef_gather`,
-`:spline_summand`, `:monotonic`, and `:monotonic_summand` joined with their
-slices)."""
+`:varying_effect`, `:spline_summand`, `:monotonic`, and
+`:monotonic_summand` joined with their slices)."""
 const TERM_NAMES = Dict{Symbol,TermKind}(
     :intercept => InterceptTerm,
     :continuous => ContinuousTerm,
     :factor => FactorTerm,
     :offset => OffsetTerm,
     :ranef_gather => RanefGatherTerm,
+    :varying_effect => VaryingEffectTerm,
     :spline_summand => SplineSummandTerm,
     :hsgp_summand => HSGPSummandTerm,
     :scan_summand => ScanSummandTerm,
@@ -1056,8 +1145,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
-    RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm, ScanSummandTerm,
-    MonotonicTerm, MonotonicSummandTerm)
+    RanefGatherTerm, VaryingEffectTerm, SplineSummandTerm, HSGPSummandTerm,
+    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate):
 scalar/reduction vocabulary plus vector-returning whole-column functions."""
@@ -1113,6 +1202,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_kernels(plan)
     _validate_responses(plan)
     _validate_ranef_buckets(plan)
+    _validate_varying_draws(plan)
     _validate_splines(plan)
     _validate_hsgp(plan)
     return nothing
@@ -1132,6 +1222,7 @@ function validate_data(plan::StructuralPlan)
     _validate_response_data(plan)
     _validate_plate_parameters_data(plan)
     _validate_ranef_buckets_data(plan)
+    _validate_varying_draws_data(plan)
     _validate_splines_data(plan)
     _validate_hsgp_data(plan)
     _validate_kernels_data(plan)
@@ -1337,6 +1428,219 @@ function _validate_margin(m::RanefMargin, label::Symbol)
     return nothing
 end
 
+_is_ones_margin(m::VaryingMargin) =
+    m.z.kind === :ones && m.coefficient === :Intercept
+
+function _validate_margin(m::VaryingMargin, label::Symbol)
+    z = m.z
+    z.kind in (:ones, :column, :dummy) ||
+        _fail(label, "margin $(m.coefficient): Z recipe kind must be " *
+              ":ones, :column, or :dummy, got $(repr(z.kind))")
+    if z.kind === :ones
+        z.column === :none && z.level === nothing ||
+            _fail(label, "margin $(m.coefficient): :ones recipe carries " *
+                  "no column/level")
+        m.coefficient === :Intercept ||
+            _fail(label, "margin $(m.coefficient): :ones recipe addresses " *
+                  ":Intercept")
+    elseif z.kind === :column
+        z.level === nothing ||
+            _fail(label, "margin $(m.coefficient): :column recipe carries " *
+                  "no level")
+        m.coefficient === z.column ||
+            _fail(label, "margin $(m.coefficient): :column recipe " *
+                  "addresses its column $(z.column)")
+    else
+        z.level !== nothing ||
+            _fail(label, "margin $(m.coefficient): :dummy recipe needs " *
+                  "a level value")
+    end
+    return nothing
+end
+
+# K=1 sampled names, derived purely from the draws suffix + kind: the
+# scalar scale (`log_scale_<s>` / `tau_<s>`) and the G-vector
+# (`xi_<s>`). Single source for surface claims, name tables, layout,
+# and the generator.
+# Correlated sampled names, derived purely from the draws suffix: the
+# LKJ Cholesky factor (`L_<s>`, KxK), the marginal-scale vector
+# (`tau_<s>`, K), and the standardized draws (`z_flat_<s>`, K*G
+# column-major). Single source for surface claims, name tables,
+# layout, and the generator. K=1 correlated draws own the same three
+# names (`L` packs zero coords).
+function _varying_corr_names(d::VaryingDraws)
+    d.kind === :correlated ||
+        _fail(d.label, "draws kind $(d.kind) owns no correlated " *
+              "sampled names (K=1 geometry has its own names)")
+    s = d.suffix
+    return (Symbol("L_", s), Symbol("tau_", s), Symbol("z_flat_", s))
+end
+
+function _varying_k1_names(d::VaryingDraws)
+    (d.kind === :intercept1 || d.kind === :slope1) ||
+        _fail(d.label, "draws kind $(d.kind) owns no K=1 sampled names " *
+              "(correlated draws own L/tau/z names instead)")
+    s = d.suffix
+    scale = d.kind === :intercept1 ? Symbol("log_scale_", s) :
+        Symbol("tau_", s)
+    return (scale, Symbol("xi_", s))
+end
+
+# Draws labels/suffixes, kinds, margins, slices, and effect-term
+# linkage: everything provable without data. A draws block's slice
+# ranges partition 1:K exactly once, in any slice order (columns are
+# explicit); every slice is consumed by exactly one effect term (a
+# dangling slice samples dead parameters).
+function _validate_varying_draws(plan::StructuralPlan)
+    draws = plan.varying_draws
+    slices = plan.varying_slices
+    labels = [d.label for d in draws]
+    length(unique(labels)) == length(labels) ||
+        _fail(:plan, "duplicate varying draws labels (one label per draws block)")
+    suffixes = [d.suffix for d in draws]
+    length(unique(suffixes)) == length(suffixes) ||
+        _fail(:plan, "duplicate varying draws suffixes (in-graph names " *
+              "derive from the suffix)")
+    prednames = Set{Symbol}(p.name for p in plan.predictors)
+    bylabel = Dict{Symbol,VaryingDraws}(d.label => d for d in draws)
+    for d in draws
+        _validate_draws_shape(d, prednames, slices)
+    end
+    for s in slices
+        haskey(bylabel, s.draws) ||
+            _fail(:plan, "varying slice for $(s.target) names unknown " *
+                  "draws $(s.draws)")
+        s.target in prednames ||
+            _fail(bylabel[s.draws].label, "varying slice names unknown " *
+                  "predictor $(s.target)")
+    end
+    # Slice ranges partition 1:K exactly once per draws (sorted: slice
+    # order is free, columns are explicit), one slice per
+    # (draws, target), and no range is empty.
+    for d in draws
+        K = length(d.margins)
+        own = [s for s in slices if s.draws === d.label]
+        targets = [s.target for s in own]
+        length(unique(targets)) == length(targets) ||
+            _fail(d.label, "draws lists a target twice (one slice per " *
+                  "(draws, target))")
+        for s in own
+            r = s.columns
+            first(r) <= last(r) ||
+                _fail(d.label, "slice for $(s.target) is empty (each " *
+                      "slice carries at least one margin)")
+            (first(r) >= 1 && last(r) <= K) ||
+                _fail(d.label, "slice for $(s.target) selects $r outside " *
+                      "1:$K")
+        end
+        lo = 1
+        for s in sort!(own; by = s -> first(s.columns))
+            first(s.columns) == lo ||
+                _fail(d.label, "slice for $(s.target) starts at " *
+                      "$(first(s.columns)), want $lo (slices partition " *
+                      "1:$K exactly once)")
+            lo = last(s.columns) + 1
+        end
+        lo - 1 == K ||
+            _fail(d.label, "slices cover $(lo - 1) margins but the draws " *
+                  "block carries $K")
+    end
+    # Effect-term linkage, jointly over predictors + draws + slices.
+    for pred in plan.predictors
+        for t in pred.terms
+            t.kind === VaryingEffectTerm || continue
+            o = t.options
+            haskey(bylabel, o.draws) ||
+                _fail(t.label, "effect term in predictor $(pred.name) " *
+                      "references unknown draws $(o.draws)")
+            any(s -> s.draws === o.draws && s.target === pred.name,
+                slices) ||
+                _fail(t.label, "draws $(o.draws) carries no slice for " *
+                      "predictor $(pred.name)")
+        end
+    end
+    used = Set{Tuple{Symbol,Symbol}}()
+    for pred in plan.predictors
+        for t in pred.terms
+            t.kind === VaryingEffectTerm || continue
+            key = (t.options.draws, pred.name)
+            key in used &&
+                _fail(t.label, "duplicate effect term for draws " *
+                      "$(key[1]) in predictor $(pred.name) (one term per " *
+                      "draws per predictor)")
+            push!(used, key)
+        end
+    end
+    for s in slices
+        (s.draws, s.target) in used ||
+            _fail(bylabel[s.draws].label, "draws $(s.draws) slice for " *
+                  "predictor $(s.target) is never consumed (dangling " *
+                  "slice samples dead parameters — use it or drop it)")
+    end
+    return nothing
+end
+
+function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
+        slices::Vector{VaryingSlice})
+    d.kind in (:intercept1, :slope1, :correlated) ||
+        _fail(d.label, "draws kind must be :intercept1, :slope1, or " *
+              ":correlated, got $(repr(d.kind))")
+    K = length(d.margins)
+    K >= 1 || _fail(d.label, "draws block has zero margins")
+    for m in d.margins
+        _validate_margin(m, d.label)
+    end
+    for s in slices
+        s.draws === d.label || continue
+        s.target in prednames ||
+            _fail(d.label, "draws slice for unknown predictor $(s.target)")
+    end
+    # Kind dispatch: K=1 without eta is :intercept1 (single-`1`) or
+    # :slope1 (single slope); K=1 with eta takes the vacuous-1x1-LKJ
+    # correlated route; K>=2 is always :correlated.
+    want = if K == 1 && isnan(d.lkj_eta) && _is_ones_margin(first(d.margins))
+        :intercept1
+    elseif K == 1 && isnan(d.lkj_eta)
+        :slope1
+    else
+        :correlated
+    end
+    d.kind === want ||
+        _fail(d.label, "draws kind $(d.kind) mismatches its margins " *
+              "(want $want)")
+    if want === :correlated
+        isfinite(d.lkj_eta) && d.lkj_eta > 0 ||
+            _fail(d.label, "correlated draws need a positive LKJ eta, " *
+                  "got $(d.lkj_eta)")
+    else
+        isnan(d.lkj_eta) ||
+            _fail(d.label, "K=1 draws take no LKJ eta (no correlation " *
+                  "to parameterize), got $(d.lkj_eta)")
+    end
+    _validate_varying_levels_shape(d)
+    return nothing
+end
+
+# Declared-levels checks provable without data (coverage needs the bound
+# column — `_validate_varying_draws_data`). Emitter-provided levels must
+# be non-empty, duplicate-free, and literal-embeddable (the admission
+# mirrors `_level_literal` in preprocessing.jl — the generator embeds
+# these values into the `_declared_codes` call).
+function _validate_varying_levels_shape(d::VaryingDraws)
+    d.levels === nothing && return nothing
+    !isempty(d.levels) ||
+        _fail(d.label, "draws block declares zero grouping levels")
+    length(unique(d.levels)) == length(d.levels) ||
+        _fail(d.label, "draws block declares duplicate grouping levels " *
+              "($(repr(d.levels)))")
+    for lv in d.levels
+        lv isa Union{Number,String,Bool,Char,Symbol} ||
+            _fail(d.label, "declared level $(repr(lv)) is not " *
+                  "literal-embeddable (numeric/string/symbol only)")
+    end
+    return nothing
+end
+
 # A literal plate range covers 1:n_obs exactly (the size the latent vector
 # packs), mirroring the response-range cover check.
 function _validate_plate_parameters_data(plan::StructuralPlan)
@@ -1456,6 +1760,102 @@ function _validate_margin_data(m::RanefMargin, label::Symbol, plan::StructuralPl
                   "level $(repr(z.level)) is not a level of $(z.column)")
     end
     return nothing
+end
+
+function _validate_margin_data(m::VaryingMargin, label::Symbol,
+        plan::StructuralPlan)
+    z = m.z
+    z.kind === :ones && return nothing
+    haskey(plan.columns, z.column) || _is_derived(plan, z.column) ||
+        _fail(label, "margin $(m.coefficient): Z column $(z.column) is " *
+              "not bound")
+    if z.kind === :column
+        _is_derived(plan, z.column) && return nothing
+        eltype(plan.columns[z.column]) <: Real ||
+            _fail(label, "margin $(m.coefficient): Z column $(z.column) " *
+                  "must be numeric (a categorical slope needs explicit " *
+                  "`dummy($(z.column), k)` recipes)")
+    else
+        _is_derived(plan, z.column) &&
+            _fail(label, "margin $(m.coefficient): :dummy needs a raw " *
+                  "column (level membership needs bound values)")
+        z.level in _grouping_levels(plan.columns[z.column]) ||
+            _fail(label, "margin $(m.coefficient): dummy level " *
+                  "$(repr(z.level)) is not a level of $(z.column)")
+    end
+    return nothing
+end
+
+function _validate_varying_draws_data(plan::StructuralPlan)
+    for d in plan.varying_draws
+        haskey(plan.columns, d.group) ||
+            _fail(d.label, "grouping column $(d.group) is not bound")
+        _is_derived(plan, d.group) &&
+            _fail(d.label, "grouping column $(d.group) must be raw data " *
+                  "(level knowledge needs bound values)")
+        d.levels === nothing &&
+            _fail(d.label, "draws block has no declared grouping levels " *
+                  "(bind_data fills these — hand-built bound plans must too)")
+        # Coverage: every observed value needs a declared code (an
+        # uncovered value would encode 0 and gather out of bounds).
+        levels = d.levels::Vector
+        for v in plan.columns[d.group]
+            v in levels ||
+                _fail(d.label, "grouping value $(repr(v)) of $(d.group) " *
+                      "is not a declared level (declared: $(repr(levels)))")
+        end
+        for m in d.margins
+            _validate_margin_data(m, d.label, plan)
+        end
+    end
+    # One grouping, one numbering: same-group draws share the per-group
+    # `_ppl_gidx_` encoder, so their declared levels must agree exactly
+    # (order included — codes are positions).
+    for i in eachindex(plan.varying_draws)
+        for j in (i + 1):length(plan.varying_draws)
+            di, dj = plan.varying_draws[i], plan.varying_draws[j]
+            di.group === dj.group || continue
+            di.levels == dj.levels ||
+                _fail(:plan, "draws $(di.label) and $(dj.label) share " *
+                      "grouping $(di.group) but declare different levels " *
+                      "($(repr(di.levels)) vs $(repr(dj.levels)))")
+        end
+    end
+    return nothing
+end
+
+# Group count for a draws block: the DECLARED level count (unobserved
+# declared levels keep prior-only coefficients). Loud defense in
+# depth — validate_data proves levels non-nothing on every bound plan.
+function _draws_nlevels(d::VaryingDraws)
+    d.levels === nothing && throw(ContractValidationError(
+        "[layout] draws $(d.label) has no declared grouping levels " *
+        "(bind_data fills these — hand-built bound plans must too)"))
+    return length(d.levels)
+end
+
+# Binder evaluation for draws levels (the LevelMap precedent):
+# `nothing` fills sort-ordered observed levels; emitter-provided levels
+# pass through (validated by `_validate_varying_levels_shape` +
+# `_validate_varying_draws_data`).
+function _eval_draws_levels(draws::Vector{VaryingDraws},
+        columns::Dict{Symbol,AbstractVector})
+    out = VaryingDraws[]
+    for d in draws
+        d.levels !== nothing && (push!(out, d); continue)
+        haskey(columns, d.group) ||
+            _fail(d.label, "grouping column $(d.group) is not bound")
+        levels =
+            try
+                _grouping_levels(columns[d.group])
+            catch err
+                _fail(d.label, "grouping column $(d.group) levels not " *
+                             "orderable ($err)")
+            end
+        push!(out, VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
+            d.label, d.suffix, collect(levels)))
+    end
+    return out
 end
 
 function _validate_columns(plan::StructuralPlan)
@@ -2077,6 +2477,12 @@ function _validate_name_tables(plan::StructuralPlan)
     corr = Symbol[nm for b in plan.ranef_buckets
         if b.kind === :correlated
         for nm in _ranef_corr_names(b)]
+    vk1 = Symbol[nm for d in plan.varying_draws
+        if d.kind === :intercept1 || d.kind === :slope1
+        for nm in _varying_k1_names(d)]
+    vcorr = Symbol[nm for d in plan.varying_draws
+        if d.kind === :correlated
+        for nm in _varying_corr_names(d)]
     hsgp = Symbol[nm for hb in plan.hsgp_bases for nm in _hsgp_all_names(hb)]
     kern = Symbol[nm for kp in plan.kernel_plates for nm in _kernel_all_names(kp)]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
@@ -2096,6 +2502,10 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate K=1 ranef names")
     length(unique(corr)) == length(corr) ||
         _fail(:plan, "duplicate correlated ranef names")
+    length(unique(vk1)) == length(vk1) ||
+        _fail(:plan, "duplicate K=1 varying names")
+    length(unique(vcorr)) == length(vcorr) ||
+        _fail(:plan, "duplicate correlated varying names")
     length(unique(hsgp)) == length(hsgp) ||
         _fail(:plan, "duplicate hsgp names")
     length(unique(kern)) == length(kern) ||
@@ -2136,6 +2546,25 @@ function _validate_name_tables(plan::StructuralPlan)
         (corr, vectors, "correlated ranef names and vector parameters"),
         (corr, svec, "correlated ranef names and spline vectors"),
         (corr, k1, "correlated ranef names and K=1 ranef names"),
+        (vk1, params, "K=1 varying names and parameters"),
+        (vk1, assigns, "K=1 varying names and assignments"),
+        (vk1, deriveds, "K=1 varying names and derived columns"),
+        (vk1, plates, "K=1 varying names and plate parameters"),
+        (vk1, scanstates, "K=1 varying names and scan states"),
+        (vk1, vectors, "K=1 varying names and vector parameters"),
+        (vk1, svec, "K=1 varying names and spline vectors"),
+        (vcorr, params, "correlated varying names and parameters"),
+        (vcorr, assigns, "correlated varying names and assignments"),
+        (vcorr, deriveds, "correlated varying names and derived columns"),
+        (vcorr, plates, "correlated varying names and plate parameters"),
+        (vcorr, scanstates, "correlated varying names and scan states"),
+        (vcorr, vectors, "correlated varying names and vector parameters"),
+        (vcorr, svec, "correlated varying names and spline vectors"),
+        (vcorr, vk1, "correlated varying names and K=1 varying names"),
+        (vk1, k1, "K=1 varying names and K=1 ranef names"),
+        (vk1, corr, "K=1 varying names and correlated ranef names"),
+        (vcorr, k1, "correlated varying names and K=1 ranef names"),
+        (vcorr, corr, "correlated varying names and correlated ranef names"),
         (hsgp, params, "hsgp names and parameters"),
         (hsgp, assigns, "hsgp names and assignments"),
         (hsgp, deriveds, "hsgp names and derived columns"),
@@ -2145,6 +2574,8 @@ function _validate_name_tables(plan::StructuralPlan)
         (hsgp, svec, "hsgp names and spline vectors"),
         (hsgp, k1, "hsgp names and K=1 ranef names"),
         (hsgp, corr, "hsgp names and correlated ranef names"),
+        (hsgp, vk1, "hsgp names and K=1 varying names"),
+        (hsgp, vcorr, "hsgp names and correlated varying names"),
         (kern, params, "kernel-plate names and parameters"),
         (kern, assigns, "kernel-plate names and assignments"),
         (kern, deriveds, "kernel-plate names and derived columns"),
@@ -2154,24 +2585,26 @@ function _validate_name_tables(plan::StructuralPlan)
         (kern, svec, "kernel-plate names and spline vectors"),
         (kern, k1, "kernel-plate names and K=1 ranef names"),
         (kern, corr, "kernel-plate names and correlated ranef names"),
+        (kern, vk1, "kernel-plate names and K=1 varying names"),
+        (kern, vcorr, "kernel-plate names and correlated varying names"),
         (kern, hsgp, "kernel-plate names and hsgp names"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
     allnames = union(params, assigns, deriveds, plates, scanstates, vectors,
-        svec, k1, corr, hsgp, kern)
+        svec, k1, corr, vk1, vcorr, hsgp, kern)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/spline/ranef/kernel name",
+            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/spline/ranef/varying/kernel name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived/plate/scan/vector/spline/ranef/kernel $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate/scan/vector/spline/ranef/varying/kernel $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, k1, corr, hsgp, kern))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, k1, corr, vk1, vcorr, hsgp, kern))
         _check_name_hygiene(n)
     end
     return nothing
@@ -2939,6 +3372,10 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
         _validate_gather_term(t, pred)
         return nothing
     end
+    if t.kind === VaryingEffectTerm
+        _validate_effect_term(t, pred)
+        return nothing
+    end
     if t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm
         _validate_monotonic_term(t, pred)
         return nothing
@@ -3006,6 +3443,29 @@ function _validate_gather_term(t::TermSpec, pred::PredictorSpec)
               "column [$(o.bucket_group)], got $(t.columns)")
     t.addressee === t.label ||
         _fail(t.label, "ranef gather addressee must be its own label " *
+              "(self-addressed, no population prior), got $(t.addressee)")
+    return nothing
+end
+
+# An effect term names its draws by label in `options` (never a lossy
+# suffix parse) and carries exactly the grouping column; its addressee
+# is its own label (self-addressed: effect terms take no
+# PopulationPrior). Draws linkage (existence, slices, dangling) is
+# checked jointly in `_validate_varying_draws`, which sees predictors,
+# draws, and slices together.
+function _validate_effect_term(t::TermSpec, pred::PredictorSpec)
+    o = t.options
+    Tuple(keys(o)) == (:draws,) ||
+        _fail(t.label, "varying effect options must be exactly " *
+              "`(draws,)`, got $(Tuple(keys(o)))")
+    o.draws isa Symbol ||
+        _fail(t.label, "effect draws must be a Symbol, " *
+              "got $(repr(o.draws))")
+    length(t.columns) == 1 ||
+        _fail(t.label, "varying effect columns must be exactly the " *
+              "grouping column, got $(t.columns)")
+    t.addressee === t.label ||
+        _fail(t.label, "varying effect addressee must be its own label " *
               "(self-addressed, no population prior), got $(t.addressee)")
     return nothing
 end
@@ -3140,7 +3600,8 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
         # A per-cell latent enters a design only through a ContinuousTerm
         # (a free coefficient scaling the latent vector — the SB `me`
         # mirror); every other term kind over a latent fails closed.
-        if _is_plate_param(plan, c) && t.kind !== RanefGatherTerm
+        if _is_plate_param(plan, c) && t.kind !== RanefGatherTerm &&
+                t.kind !== VaryingEffectTerm
             t.kind === ContinuousTerm || _fail(t.label,
                 "term over the latent vector $c must be a ContinuousTerm " *
                 "(a free coefficient scaling the latent — got $(t.kind))")
@@ -3152,6 +3613,9 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
     # Gather terms name the raw grouping column (strings included — the
     # encoder maps levels to codes); presence above is the whole check.
     t.kind === RanefGatherTerm && return nothing
+    # Effect terms name the raw grouping column (strings included — the
+    # encoder maps levels to codes); presence above is the whole check.
+    t.kind === VaryingEffectTerm && return nothing
     # FactorTerm: column presence is checked by the loop above; level
     # coverage is a LevelMap concern (_validate_levelmaps_data).
     if t.kind === ContinuousTerm || t.kind === OffsetTerm
@@ -3362,15 +3826,17 @@ function _validate_priors(plan::StructuralPlan)
         pred.name in r2d2 && continue
         # Offset terms carry no coefficient; latent terms carry the per-cell
         # PlateParameter, whose prior lives on the plate parameter itself;
-        # gather terms carry a RanefBucket, spline summands a SplineBasis,
-        # hsgp summands an HSGPBasis, and monotonic summands (mo1) an
-        # increment simplex, whose geometries are self-priored — none needs
-        # a coefficient prior. Monotonic (mo) terms DO take a free
-        # coefficient, so they stay in the addressee set.
+        # gather terms carry a RanefBucket, effect terms a VaryingDraws,
+        # spline summands a SplineBasis, hsgp summands an HSGPBasis, and
+        # monotonic summands (mo1) an increment simplex, whose geometries
+        # are self-priored — none needs a coefficient prior. Monotonic
+        # (mo) terms DO take a free coefficient, so they stay in the
+        # addressee set.
         addressees = Set{Symbol}(t.addressee for t in pred.terms
             if t.kind !== OffsetTerm && t.kind !== LatentTerm &&
-               t.kind !== RanefGatherTerm && t.kind !== SplineSummandTerm &&
-               t.kind !== HSGPSummandTerm && t.kind !== ScanSummandTerm &&
+               t.kind !== RanefGatherTerm && t.kind !== VaryingEffectTerm &&
+               t.kind !== SplineSummandTerm && t.kind !== HSGPSummandTerm &&
+               t.kind !== ScanSummandTerm &&
                t.kind !== MonotonicSummandTerm)
         any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
         for a in addressees
@@ -4540,6 +5006,9 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     for b in plan.ranef_buckets
         haskey(inferred, b.group) && _upgrade_role!(inferred, b.group, :group)
     end
+    for d in plan.varying_draws
+        haskey(inferred, d.group) && _upgrade_role!(inferred, d.group, :group)
+    end
     for sb in bases, blk in sb.blocks, c in blk.columns
         haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
     end
@@ -4579,6 +5048,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         _kernel_flat_length(only(kbases).subjects, only(kbases).timepoints)
     maps = _eval_levelmaps(plan.levelmaps, columns)
     buckets = _eval_bucket_levels(plan.ranef_buckets, columns)
+    draws = _eval_draws_levels(plan.varying_draws, columns)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
             plan.predictors, plan.r2d2_priors)
@@ -4587,6 +5057,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         columns, n; roles = merged, derived = plan.derived,
         levelmaps = maps, plate_parameters = plan.plate_parameters,
         scans = plan.scans, ranef_buckets = buckets,
+        varying_draws = draws, varying_slices = plan.varying_slices,
         vector_parameters = vectors2, spline_bases = bases,
         spline_vectors = plan.spline_vectors, hsgp_bases = hbases,
         kernel_plates = kbases, r2d2_priors = plan.r2d2_priors)

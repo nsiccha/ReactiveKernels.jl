@@ -350,7 +350,18 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
     sample, det, plate_ctx, plate_specs, scans, buckets, bases, vectors,
-    hbases, kplates, r2d2decls, joints = _partition_statements(ast, data)
+    hbases, kplates, r2d2decls, joints, varying_draws, varying_pending =
+        _partition_statements(ast, data)
+    # Varying bindings (draws + contributions): contributions compose
+    # only as direct predictor summands, never inside definitions.
+    varying_names = Set{Symbol}()
+    varying_contribs = Set{Symbol}()
+    for p in varying_pending
+        push!(varying_names, p.contrib)
+        push!(varying_names, p.draws_lhs)
+        push!(varying_contribs, p.contrib)
+    end
+    varying_draws_names = Set{Symbol}(p.draws_lhs for p in varying_pending)
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
@@ -395,6 +406,12 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         scan_coefs = Set{Symbol}(),
         buckets = Dict{Tuple{Union{Nothing,Symbol},Symbol},RanefBucket}(
             (b.id, b.group) => b for b in buckets),
+        varying_draws = Dict{Symbol,VaryingDraws}(
+            d.label => d for d in varying_draws),
+        varying_pending = varying_pending,
+        varying_contribs = varying_contribs,
+        varying_draws_names = varying_draws_names,
+        varying_use = Dict{Symbol,Symbol}(),
         implicit_vectors = VectorParameter[],
         splines = Dict{Symbol,SplineBasis}(b.id => b for b in bases),
         spline_uses = Dict{Symbol,Symbol}(),
@@ -435,6 +452,12 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
             "and a scan coefficient — scan coefficients are sampled " *
             "scalars, not population coefficients (rename one)")
     end
+    # Varying slices finalize once every predictor is interned: each
+    # contribution resolves to the single predictor that uses it (target
+    # inferred from the single use — never declared twice), in-graph
+    # `r_<target>_<suffix>` labels claim, and each draws block's slice
+    # ranges prove exact-once partition of 1:K.
+    varying_slices = _finalize_varying_slices(ctx)
     r2d2set = Set{Symbol}(d.predictor for d in r2d2decls)
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
         r2d2set)
@@ -476,13 +499,30 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         end
     end
     _validate_bucket_margins(buckets, data, derived, detshape, used_locs)
+    _validate_varying_margins(varying_draws, data, derived, detshape,
+        used_locs)
+    # Varying bindings compose only as direct predictor summands:
+    # non-predictor definitions referencing one fail here (predictor
+    # definitions are the one admitted position; inlined aliases fail
+    # at `_inline_structure` with the use site).
+    for (nm, rhs) in det
+        nm in used_locs && continue
+        if _uses_varying_contrib(rhs, varying_names)
+            _sfail("definition `$nm = $(repr(rhs))` references a varying " *
+                  "binding, which lowers only as a direct predictor " *
+                  "summand (`mu = a .+ r`), not inside definitions — " *
+                  "slice draws explicitly " *
+                  "(`r ~ varying_slice(d, ...)`) and use the slice")
+        end
+    end
     _check_plate_bares(plate_ctx, data, Set{Symbol}(p.name for p in predictors),
         Set{Symbol}(d.name for d in derived), _factor_coefs(coefuse, predictors),
         plate_names)
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
         levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
-        ranef_buckets = buckets,
+        ranef_buckets = buckets, varying_draws = varying_draws,
+        varying_slices = varying_slices,
         vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates, r2d2_priors = r2d2s)
@@ -770,6 +810,9 @@ function _reject_unknown_calls(where, rhs)
             fn in _DIST_VALUE_FNS && _sfail(
                 "$where calls `$fn`, which lowers only under `~`/`.~`, " *
                 "not as a value")
+            fn in (:varying_effect, :varying_draws, :varying_slice) &&
+                _sfail("$where calls `$fn` as a value — varying " *
+                "statements lower only under `~` (`r ~ $fn(...)`)")
             _sfail("$where calls `$fn`, which is not in the slice-1 " *
                    "value vocabulary — arbitrary Julia functions are " *
                    "planned (no-@deffun-ceremony direction) but need " *
@@ -1109,6 +1152,298 @@ _contains_ranef(ex) = ex isa Expr &&
 _is_gather_call(ex) =
     ex isa Expr && ex.head === :call && !isempty(ex.args) &&
     ex.args[1] === :ranef
+
+# Varying-effect margin elements: `1` (intercept), a bare data column or
+# vector-shaped derived local (continuous Z), or an explicit `dummy(c, k)`
+# indicator. Same vocabulary as bucket margins, minus the target (margins
+# live on the shared draws; targets live on slices).
+function _lower_varying_margin_elem(e, data::Set{Symbol},
+        detnames::Set{Symbol}, where)
+    e isa Integer && !(e isa Bool) ||
+        return _lower_varying_margin_symbol(e, data, detnames, where)
+    e == 1 ||
+        _sfail("$where margin integer must be exactly `1` (intercept); " *
+              "for slopes write the bare column or derived local")
+    return VaryingMargin(:Intercept, VaryingZRecipe(:ones, :none, nothing))
+end
+
+function _lower_varying_margin_symbol(e, data::Set{Symbol},
+        detnames::Set{Symbol}, where)
+    e isa Symbol || return _lower_varying_margin_dummy(e, data, where)
+    e in data || e in detnames ||
+        _sfail("$where margin `$e` is neither bound data nor a model " *
+              "definition (margins are `1`, bare data columns, " *
+              "vector-shaped derived locals, or `dummy(c, k)`)")
+    return VaryingMargin(e, VaryingZRecipe(:column, e, nothing))
+end
+
+function _lower_varying_margin_dummy(e, data::Set{Symbol}, where)
+    e isa Expr && e.head === :call && length(e.args) == 3 &&
+        e.args[1] === :dummy ||
+        _sfail("$where margin $(repr(e)) is not admitted (margins are " *
+              "`1`, bare data columns, vector-shaped derived locals, or " *
+              "`dummy(c, k)` — bind an inline expression via an assignment " *
+              "first, e.g. `w = x .* z` then `[1, w]`)")
+    c, k = e.args[2], e.args[3]
+    c isa Symbol ||
+        _sfail("$where `dummy` column must be a bare data column, got " *
+              "$(repr(c))")
+    c in data ||
+        _sfail("$where `dummy` column `$c` is not data (`dummy` needs a " *
+              "raw column — level membership needs bound values)")
+    (k isa Integer && !(k isa Bool)) || k isa AbstractString ||
+        _sfail("$where `dummy` level must be an Int value or string, got " *
+              "$(repr(k))")
+    return VaryingMargin(Symbol(string(c) * "_dummy_" * string(k)),
+        VaryingZRecipe(:dummy, c, k))
+end
+
+_is_varying_call(rhs) =
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+    rhs.args[1] isa Symbol &&
+    rhs.args[1] in (:varying_effect, :varying_draws, :varying_slice)
+
+_varying_head(rhs::Expr) = rhs.args[1]::Symbol
+
+# A draws block shared by fused and split forms:
+# `r ~ varying_effect(g, [margins...]; eta, levels)` binds a contribution
+# over an anonymous draws block; `d ~ varying_draws(g, [margins...];
+# eta, levels)` binds the draws for explicit `varying_slice` consumers.
+# Lowers directly to VaryingDraws IR. Continuous margins reference data
+# columns or vector-shaped derived locals; the partition-time gate
+# admits data-or-defined names (forward references work) and
+# `_validate_varying_margins` proves vector shape after lowering.
+# Claims the draws label up front so user definitions can never
+# collide with in-graph names (K=1 scale/xi, correlated L/tau/z).
+function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
+        data::Set{Symbol}, detnames::Set{Symbol}, seen::Set{Symbol},
+        seelines::Dict{Symbol,Int}, used_suffixes::Set{String})
+    head = _varying_head(call)
+    where = line > 0 ? "$head `$lhs` (line $line)" : "$head `$lhs`"
+    pos = Any[]
+    eta = 1.0
+    eta_given = false
+    levels = nothing
+    for a in call.args[2:end]
+        if a isa Expr && a.head === :parameters
+            for kw in a.args
+                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
+                    _sfail("$where takes keywords `eta`/`levels` only")
+                kw.args[1] === :eta || kw.args[1] === :levels ||
+                    _sfail("$where takes keywords `eta`/`levels` only, got " *
+                          "`$(kw.args[1])`")
+                if kw.args[1] === :eta
+                    v = kw.args[2]
+                    v isa Real && !(v isa Bool) ||
+                        _sfail("$where eta must be a numeric literal, got $(repr(v))")
+                    eta = Float64(v)
+                    eta_given = true
+                else
+                    levels = _lower_bucket_levels(kw.args[2], where)
+                end
+            end
+        else
+            push!(pos, a)
+        end
+    end
+    length(pos) == 3 && pos[1] isa QuoteNode && pos[1].value isa Symbol &&
+        _sfail("$where takes `(group, [margins...])` — bucket ids are " *
+              "removed (independent blocks on one grouping disambiguate " *
+              "by binding name, not labels)")
+    length(pos) == 2 ||
+        _sfail("$where takes `(group, [margins...])` positionally, got " *
+              "$(length(pos)) positional argument(s)")
+    group, vec = pos
+    group isa Symbol ||
+        _sfail("$where grouping must be a bare data column, got $(repr(group))")
+    group in data ||
+        _sfail("$where grouping `$group` is not data")
+    vec isa Expr && vec.head === :vect ||
+        _sfail("$where margins must be a vector (`[1, x]`), even for one " *
+              "margin")
+    isempty(vec.args) &&
+        _sfail("$where margin list is empty")
+    margins = VaryingMargin[
+        _lower_varying_margin_elem(e, data, detnames, where)
+        for e in vec.args]
+    K = length(margins)
+    kind = if K == 1 && !eta_given && _is_ones_vmargin(first(margins))
+        :intercept1
+    elseif K == 1 && !eta_given
+        :slope1
+    else
+        :correlated
+    end
+    if kind !== :correlated
+        eta = NaN
+    elseif !(eta > 0)
+        _sfail("$where eta must be positive, got $eta")
+    end
+    suffix = string(group)
+    if suffix in used_suffixes
+        suffix = string(group) * "_" * string(lhs)
+        suffix in used_suffixes &&
+            _sfail("$where in-graph suffix `$suffix` collides (two draws " *
+                  "blocks share grouping and binding stem — rename a binding)")
+    end
+    push!(used_suffixes, suffix)
+    label = Symbol("draws_" * suffix)
+    _claim!(seen, seelines, label, line)
+    d = VaryingDraws(group, kind, margins, eta, label, suffix, levels)
+    if kind === :intercept1 || kind === :slope1
+        for nm in _varying_k1_names(d)
+            _claim!(seen, seelines, nm, line)
+        end
+    else
+        for nm in _varying_corr_names(d)
+            _claim!(seen, seelines, nm, line)
+        end
+        # The derived draws `b_<suffix>` live in `constrain` output only
+        # (never sampled, never in-graph) — claimed so a user definition
+        # can never shadow them there.
+        _claim!(seen, seelines, Symbol("b_" * suffix), line)
+    end
+    return d
+end
+
+_is_ones_vmargin(m::VaryingMargin) =
+    m.z.kind === :ones && m.coefficient === :Intercept
+
+# One target application of shared draws:
+# `r ~ varying_slice(d, cols)` with `cols` an Int column or a `lo:hi`
+# UnitRange over the draws block's margins. Columns are explicit and
+# validated against the draws width here; the partition (exact-once
+# coverage of 1:K) is checked once all slices are in.
+function _lower_varying_slice(lhs::Symbol, call::Expr, line::Int,
+        draws_by_lhs::Dict{Symbol,VaryingDraws})
+    where = line > 0 ? "varying_slice `$lhs` (line $line)" :
+        "varying_slice `$lhs`"
+    args = call.args[2:end]
+    (length(args) == 2 && !any(a -> a isa Expr && a.head === :parameters,
+        args)) ||
+        _sfail("$where takes `(draws, cols)` positionally (no keywords)")
+    dref, colsel = args
+    dref isa Symbol ||
+        _sfail("$where names a draws block by its binding, got " *
+              "$(repr(dref))")
+    haskey(draws_by_lhs, dref) ||
+        _sfail("$where names unknown draws `$dref` (bind one first: " *
+              "`$dref ~ varying_draws(group, [margins...])`)")
+    d = draws_by_lhs[dref]
+    K = length(d.margins)
+    cols = _lower_varying_columns(colsel, K, where)
+    return (contrib = lhs, draws = d.label, draws_lhs = dref,
+        columns = cols, line = line)
+end
+
+function _lower_varying_columns(colsel, K::Int, where)
+    if colsel isa Integer && !(colsel isa Bool)
+        c = Int(colsel)
+        (1 <= c <= K) ||
+            _sfail("$where selects column $c outside 1:$K")
+        return c:c
+    end
+    colsel isa Expr && colsel.head === :call && length(colsel.args) == 3 &&
+        colsel.args[1] === :(:) &&
+        colsel.args[2] isa Integer && !(colsel.args[2] isa Bool) &&
+        colsel.args[3] isa Integer && !(colsel.args[3] isa Bool) ||
+        _sfail("$where selects an Int column or a `lo:hi` range, got " *
+              "$(repr(colsel))")
+    lo, hi = Int(colsel.args[2]), Int(colsel.args[3])
+    (1 <= lo <= hi <= K) ||
+        _sfail("$where selects $lo:$hi outside 1:$K")
+    return lo:hi
+end
+
+# A varying contribution referenced by name anywhere in an expression
+# (QuoteNodes are not references — `spline(:s_x)` must not match a
+# contribution named `s_x`). Contribs compose only as direct additive
+# predictor summands; every other position fails closed naming this.
+_uses_varying_contrib(ex::Symbol, names::Set{Symbol}) = ex in names
+_uses_varying_contrib(::QuoteNode, ::Set{Symbol}) = false
+_uses_varying_contrib(ex::Expr, names::Set{Symbol}) =
+    any(a -> _uses_varying_contrib(a, names), ex.args)
+_uses_varying_contrib(::Any, ::Set{Symbol}) = false
+
+function _finalize_varying_slices(ctx)
+    slices = VaryingSlice[]
+    for p in ctx.varying_pending
+        target = get(ctx.varying_use, p.contrib, nothing)
+        target === nothing &&
+            _sfail("varying contribution `$(p.contrib)` (line $(p.line)) " *
+                  "is never used in a predictor — every bound " *
+                  "contribution feeds exactly one predictor " *
+                  "(`mu = a .+ $(p.contrib)`); drop it or use it")
+        d = ctx.varying_draws[p.draws]
+        rlabel = Symbol("r_", target, "_", d.suffix)
+        rlabel in ctx.taken &&
+            _sfail("implicit `$rlabel` collides with your definition — " *
+                  "rename yours")
+        push!(ctx.taken, rlabel)
+        push!(slices, VaryingSlice(p.draws, p.columns, target))
+    end
+    # Exact-once partition of 1:K per draws, in slice order (columns
+    # are explicit, so order is free — sort, then prove contiguity).
+    for (label, d) in ctx.varying_draws
+        K = length(d.margins)
+        own = [s for s in slices if s.draws === label]
+        targets = [s.target for s in own]
+        length(unique(targets)) == length(targets) ||
+            _sfail("draws $label feeds a predictor twice (one slice per " *
+                  "(draws, target) — fuse the column ranges)")
+        lo = 1
+        for s in sort!(own; by = s -> first(s.columns))
+            first(s.columns) == lo ||
+                _sfail("draws $label slice for `$(s.target)` starts at " *
+                      "$(first(s.columns)), want $lo (slices partition " *
+                      "1:$K exactly once — every margin consumed once)")
+            lo = last(s.columns) + 1
+        end
+        lo - 1 == K ||
+            _sfail("draws $label slices cover $(lo - 1) of $K margins " *
+                  "(unconsumed margins sample dead parameters — slice " *
+                  "them or drop them from the draws)")
+    end
+    return slices
+end
+
+# Post-lowering margin proof (the bucket-gate mirror): the
+# partition-time gate admits data-or-defined names (shapes don't exist
+# yet), so every `:column` margin proves here that it is bound data or
+# an EMITTED vector-shaped derived local.
+function _validate_varying_margins(draws::Vector{VaryingDraws},
+        data::Set{Symbol}, derived::Vector{VectorAssignmentSpec},
+        detshape, used_locs::Set{Symbol})
+    emitted = Set{Symbol}(d.name for d in derived)
+    for d in draws
+        for m in d.margins
+            m.z.kind === :column || continue
+            c = m.z.column
+            c in data && continue
+            c in emitted && continue
+            shape = get(detshape, c, :unknown)
+            if shape === :scalar
+                _sfail("draws $(d.label) margin `$c` is a scalar model " *
+                       "definition — margins need vector-shaped (n_obs) " *
+                       "derived locals (bind `w = x .* z`, then list `[w]`)")
+            elseif shape === :vector && c in used_locs
+                _sfail("draws $(d.label) margin `$c` is the predictor " *
+                       "location `$c`, which inlines into the predictor " *
+                       "and emits no Z column — bind the interaction as " *
+                       "its own derived local (`w = ...`, then list `[w]`)")
+            elseif shape === :vector
+                _sfail("draws $(d.label) margin `$c` is absorbed into " *
+                       "its predictor (predictor structure, not a " *
+                       "standalone column) and emits no Z column — Z " *
+                       "columns must be data-only derivations (`w = x .* z`)")
+            else
+                _sfail("draws $(d.label) margin `$c` is neither bound " *
+                       "data nor a vector-shaped derived local")
+            end
+        end
+    end
+    return nothing
+end
 
 _contains_spline(ex) = ex isa Expr &&
     (_is_spline_call(ex) || any(_contains_spline, ex.args))
@@ -1613,6 +1948,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     kplates = KernelPlate[]
     r2d2decls = NamedTuple[]
     joints = JointSampleStmt[]
+    varying_raw = NamedTuple[]
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
     seen_doc = false
@@ -1715,6 +2051,19 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 _sfail("`r2d2` is reserved (r2d2 surface) and cannot be " *
                        "sampled")
             _claim!(seen, seelines, lhs, line)
+            if _is_varying_call(st.args[3])
+                head = _varying_head(st.args[3])
+                bc && _sfail("`$lhs` uses `.~` — `$head` statements bind " *
+                             "with `~` (one binding per statement)")
+                st.args[2] isa Symbol ||
+                    _sfail("`$head` left-hand side must be a bare Symbol " *
+                           "(one binding per statement)")
+                lhs in data &&
+                    _sfail("`$lhs` is bound data and cannot bind a " *
+                           "`$head` statement")
+                push!(varying_raw, (st = st, lhs = lhs, line = line))
+                continue
+            end
             _reject_target(st.args[3], lhs)
             push!(sample, SampleStmt(lhs, st.args[3], bc, rng, levs))
         elseif st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol
@@ -1741,8 +2090,60 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             _reject_statement(st)
         end
     end
+    # Varying statements lower draws blocks first (statement order),
+    # then slices — slices may precede their draws textually (forward
+    # references resolve against lowered draws).
+    varying_draws = VaryingDraws[]
+    draws_by_lhs = Dict{Symbol,VaryingDraws}()
+    draws_lines = Dict{Symbol,Int}()
+    used_suffixes = Set{String}()
+    for v in varying_raw
+        _varying_head(v.st.args[3]) === :varying_slice && continue
+        d = _lower_varying_draws_block(v.lhs, v.st.args[3], v.line, data,
+            detnames, seen, seelines, used_suffixes)
+        push!(varying_draws, d)
+        draws_by_lhs[v.lhs] = d
+        draws_lines[d.label] = v.line
+    end
+    varying_pending = NamedTuple[]
+    for v in varying_raw
+        head = _varying_head(v.st.args[3])
+        if head === :varying_effect
+            d = draws_by_lhs[v.lhs]
+            K = length(d.margins)
+            push!(varying_pending, (contrib = v.lhs, draws = d.label,
+                draws_lhs = v.lhs, columns = 1:K, line = v.line))
+        elseif head === :varying_slice
+            push!(varying_pending,
+                _lower_varying_slice(v.lhs, v.st.args[3], v.line,
+                    draws_by_lhs))
+        end
+    end
+    # Same-group draws share one per-group encoder: both-declared
+    # differing levels fail here with lines (bind-derived levels agree
+    # by construction; mixed declared/derived agreement is a bind-time
+    # check on values).
+    levels_by_group = Dict{Symbol,Tuple{Any,Int}}()
+    for d in varying_draws
+        d.levels === nothing && continue
+        if haskey(levels_by_group, d.group)
+            prev, pline = levels_by_group[d.group]
+            prev == d.levels ||
+                _sfail("draws $(d.label) declares grouping levels " *
+                      "$(repr(d.levels)) but same-group draws already " *
+                      "declared $(repr(prev)) (line $pline) — one " *
+                      "grouping, one numbering")
+        else
+            levels_by_group[d.group] = (d.levels, draws_lines[d.label])
+        end
+    end
+    !isempty(buckets) && !isempty(varying_raw) &&
+        _sfail("a model uses either `varying_*` statements or " *
+              "`ranef_bucket`, not both (one hierarchical spelling " *
+              "per model)")
     return sample, det, plate_ctx, plate_params, scans, buckets, bases,
-        vectors, hbases, kplates, r2d2decls, joints
+        vectors, hbases, kplates, r2d2decls, joints, varying_draws,
+        varying_pending
 end
 
 # Pre-pass: expand top-level `@plate for i in R ... end` blocks into
@@ -2423,6 +2824,10 @@ function _submodel_body_parts(sm::RKPPLSubmodel)
         Meta.isexpr(st, :return) && _sfail(
             "submodel `$(sm.name)`: `return` is only admitted as the " *
             "trailing expression (submodels are straight-line; no early return)")
+        (st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
+            _is_varying_call(st.args[3])) && _sfail(
+            "submodel `$(sm.name)`: varying statements lower only at " *
+            "top level (submodel-body extension is future work)")
         (st isa Expr && (_is_sample(st) || _is_broadcast_sample(st) ||
             (st.head === :(=) && length(st.args) == 2 &&
              st.args[1] isa Symbol))) || _sfail(
@@ -3651,6 +4056,14 @@ function _derived_reads_latent(name::Symbol, ctx)
 end
 
 function _lower_location_symbol_error(lhs, loc, ctx)
+    loc in ctx.varying_contribs && _sfail(
+        "response $lhs location is the varying contribution $loc — " *
+        "locations must be predictors with estimated coefficients " *
+        "(bind: `mu = a .+ $loc`)")
+    loc in ctx.varying_draws_names && loc ∉ ctx.varying_contribs &&
+        _sfail("response $lhs location is the varying draws block $loc " *
+              "— slice it (`r ~ varying_slice($loc, ...)`) and bind the " *
+              "slice in a predictor with estimated coefficients")
     loc in ctx.data && _sfail("response $lhs location is the data column " *
                               "$loc — locations must be predictors with " *
                               "estimated coefficients (wrap: " *
@@ -3733,6 +4146,10 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
         "into $where) calls `ranef()`, which lowers only as a direct " *
         "predictor summand (`mu = a .+ b .* x .+ ranef(:ID, g)`), not " *
         "inside definitions")
+    _uses_varying_contrib(ctx.detmap[ex], ctx.varying_contribs) &&
+        _sfail("definition `$ex` (inlined into $where) references a " *
+        "varying contribution, which lowers only as a direct predictor " *
+        "summand (`mu = a .+ b .* x .+ r`), not inside definitions")
     _contains_spline(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
         "into $where) calls `spline()`, which lowers only as a direct " *
         "predictor summand (`mu = a .+ b .* x .+ spline(:s_x)`), not " *
@@ -3804,6 +4221,13 @@ function _classify_summand(pname, core, sign::Int, ctx)
                   "(`mu = a .+ b .* x .+ ranef(:ID, g)`), not nested in " *
                   "$(repr(core))")
         return _classify_gather(pname, core, sign, ctx)
+    end
+    # Bare contributions route via `_classify_symbol` above; any other
+    # expression mentioning one fails here (additive-only, never nested).
+    if _uses_varying_contrib(core, ctx.varying_contribs)
+        _sfail("predictor $pname: varying contributions lower only as " *
+              "direct additive summands (`mu = a .+ b .* x .+ r`), not " *
+              "nested in $(repr(core))")
     end
     if _contains_spline(core)
         _is_spline_call(core) ||
@@ -4133,6 +4557,25 @@ function _classify_mo1(pname, core::Expr, sign::Int, ctx)
 end
 
 function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
+    if core in ctx.varying_contribs
+        sign < 0 && _sfail("predictor $pname: varying contribution " *
+                           "`$core` is additive-only (write `.+ $core`)")
+        haskey(ctx.varying_use, core) &&
+            _sfail("predictor $pname: varying contribution `$core` is " *
+                  "already used in predictor $(ctx.varying_use[core]) " *
+                  "(one contribution feeds exactly one predictor)")
+        ctx.varying_use[core] = pname
+        plabel = only(p.draws for p in ctx.varying_pending
+            if p.contrib === core)
+        d = ctx.varying_draws[plabel]
+        rlabel = Symbol("r_", pname, "_", d.suffix)
+        return TermSpec(VaryingEffectTerm, ColumnRef[d.group],
+            (draws = plabel,), rlabel, rlabel), nothing
+    end
+    core in ctx.varying_draws_names && core ∉ ctx.varying_contribs &&
+        _sfail("predictor $pname: `$core` is a varying draws block, not " *
+              "a per-observation value — slice it " *
+              "(`r ~ varying_slice($core, ...)`) and use the slice")
     (core in ctx.data || core in ctx.vecdefs) &&
         return TermSpec(OffsetTerm, [core], NamedTuple(),
         core, Symbol(core, "_off")), nothing
@@ -4358,13 +4801,13 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
         for t in pred.terms
             # Offsets carry no coefficient; latent terms carry a PlateParameter
             # whose prior lives on the plate parameter, not as a coefficient;
-            # gather terms carry a RanefBucket, whose geometry is self-priored;
-            # spline summands carry SplineVectors, self-priored likewise;
-            # hsgp summands carry an HSGPBasis, self-priored likewise; and
-            # monotonic summands (mo1) carry an increment simplex, also
-            # self-priored.
+            # gather terms carry a RanefBucket, effect terms a VaryingDraws,
+            # whose geometries are self-priored; spline summands carry
+            # SplineVectors, self-priored likewise; hsgp summands carry an
+            # HSGPBasis, self-priored likewise; and monotonic summands
+            # (mo1) carry an increment simplex, also self-priored.
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
-                t.kind === RanefGatherTerm ||
+                t.kind === RanefGatherTerm || t.kind === VaryingEffectTerm ||
                 t.kind === SplineSummandTerm ||
                 t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||

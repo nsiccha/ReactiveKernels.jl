@@ -214,8 +214,8 @@ end
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
         MvNormalCholeskyFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
-        OffsetTerm, RanefGatherTerm, SplineSummandTerm, HSGPSummandTerm,
-        ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm)
+        OffsetTerm, RanefGatherTerm, VaryingEffectTerm, SplineSummandTerm,
+        HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm)
     @test :log in admitted_functions()
     @test :sum in admitted_functions()
     @test :tanh in admitted_functions()
