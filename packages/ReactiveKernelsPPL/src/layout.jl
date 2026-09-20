@@ -165,7 +165,7 @@ function assign_layout(plan::StructuralPlan)
     # (`:sampled`, real for `log_scale`, exp for `tau` — the exp
     # Jacobian is Stan's lower-bound kernel term, no renormalizer)
     # plus the standardized G-vector `xi` (`:ranef`, plate-shaped
-    # identity block; G from bind levels). Correlated (Stage C, SB
+    # identity block; G from declared levels). Correlated (Stage C, SB
     # declaration order L/tau/z): the LKJ Cholesky factor (`:ranef_corr`
     # packing K*(K-1)/2 thetas — K=1 packs zero and constrains to
     # `[1.0]`), the marginal-scale K-vector `tau` (`:ranef` with `:exp`
@@ -185,7 +185,7 @@ function assign_layout(plan::StructuralPlan)
                 LayoutEntry(:ranef, nothing, tau, [tau], offset, K,
                     :exp))
             offset += K
-            G = length(_grouping_levels(plan.columns[b.group]))
+            G = _bucket_nlevels(b)
             push!(entries,
                 LayoutEntry(:ranef, nothing, z, [z], offset, K * G,
                     :identity))
@@ -198,7 +198,7 @@ function assign_layout(plan::StructuralPlan)
             LayoutEntry(:sampled, nothing, scale, [scale], offset, 1,
                 transform))
         offset += 1
-        G = length(_grouping_levels(plan.columns[b.group]))
+        G = _bucket_nlevels(b)
         push!(entries,
             LayoutEntry(:ranef, nothing, xi, [xi], offset, G, :identity))
         offset += G

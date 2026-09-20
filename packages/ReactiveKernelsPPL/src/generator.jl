@@ -87,6 +87,9 @@ using LogExpFunctions: log1pexp
 # transforms); imported from the enclosing module so the emitted
 # `positive_bijector()` / `unit_bijector()` calls resolve.
 import ..positive_bijector, ..unit_bijector
+# In-model grouping encoder (`_ppl_gidx_<group>` nodes call it with the
+# raw column + literal declared levels).
+import .._declared_codes
 end
 
 const _MODEL_COUNTER = Ref(0)
@@ -379,22 +382,25 @@ function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSp
 end
 
 # Group-index encoder nodes, one per grouped column (`_ppl_gidx_<group>`):
-# an in-graph indicator sum over the bind-known `_grouping_levels`
-# order (same helper the data validator uses, so the order agrees by
-# construction). Data-only, hence bound-folded; strings are native-only,
-# exactly like factor contrasts. K=1 and correlated buckets on the same
-# group share one encoder (per-group dedup).
+# an in-model `_declared_codes` call over the bucket's DECLARED levels
+# (bind-known — filled or emitter-provided — so the order agrees with
+# validation by construction; never sorted). Data-only, hence
+# bound-folded; strings are native-only, exactly like factor contrasts.
+# K=1 and correlated buckets on the same group share one encoder
+# (per-group dedup; same-group levels agreement is validated).
 function _ranef_statements(plan::StructuralPlan)
     stmts = Expr[]
     groups = Symbol[]
     for b in plan.ranef_buckets
         b.group in groups && continue
         push!(groups, b.group)
-        levels = _grouping_levels(plan.columns[b.group])
-        parts = Any[Expr(:call, :.*, Expr(:call, :.==, b.group,
-            _level_literal(lv)), j) for (j, lv) in enumerate(levels)]
-        idx = foldl((a, c) -> Expr(:call, :.+, a, c), parts)
-        push!(stmts, Expr(:(=), Symbol(:_ppl_gidx_, b.group), idx))
+        b.levels === nothing && throw(ContractValidationError(
+            "[generator] internal: bucket $(b.label) has no declared " *
+            "levels (validate_plan proves this)"))
+        lvlvec = Expr(:vect,
+            (_level_literal(lv) for lv in b.levels)...)
+        push!(stmts, Expr(:(=), Symbol(:_ppl_gidx_, b.group),
+            Expr(:call, :_declared_codes, b.group, lvlvec)))
     end
     return stmts
 end

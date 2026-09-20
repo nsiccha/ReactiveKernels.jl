@@ -407,3 +407,32 @@ _level_literal(lvl) = throw(
     ContractValidationError("[preprocessing] grouping level $(repr(lvl)) " *
                             "is not literal-embeddable (numeric/string/symbol only)"),
 )
+
+"""
+    _declared_codes(x, levels) -> Vector{Int}
+
+In-model grouping encoder: the 1-based position of each element of raw
+grouping column `x` in DECLARED `levels` order — no sorting (SB
+numbering parity: SB numbers `CA.levels` order for categorical
+groupings, sort order otherwise). The generator splices one call per
+grouped column (`_ppl_gidx_<group> = _declared_codes(<group>,
+[<levels...>])`); both inputs are bound data, so the call folds under
+`bound=` and the Enzyme reverse pass sees no new surface. Validated
+plans only: bind-time coverage validation proves every value occurs in
+`levels`, so the 0 fallback for uncovered values is unreachable
+in-graph (a loud bind error beats a silent wrong gather).
+"""
+function _declared_codes(x::AbstractVector, levels::AbstractVector)
+    codes = Vector{Int}(undef, length(x))
+    for (i, v) in enumerate(x)
+        c = 0
+        for (j, lv) in enumerate(levels)
+            if v == lv
+                c = j
+                break
+            end
+        end
+        codes[i] = c
+    end
+    return codes
+end

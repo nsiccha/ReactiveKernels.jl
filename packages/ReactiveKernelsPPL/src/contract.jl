@@ -416,7 +416,7 @@ struct RanefMargin
 end
 
 """
-    RanefBucket(id, group, kind, margins, slices, lkj_eta, label)
+    RanefBucket(id, group, kind, margins, slices, lkj_eta, label[, levels])
 
 One shared random-effect draws block (SB mirror): non-centered geometry
 over `K = length(margins)` margins in `G` groups of raw column `group`.
@@ -427,7 +427,14 @@ tau + z_flat; ALL ID buckets, even K=1 — SB's ID path has no K=1 fast
 path). `slices` maps each target predictor to its static column range;
 the ranges partition `1:K` contiguously in body order. `lkj_eta` is the
 LKJ shape (correlated only; `NaN` otherwise). `label` is `:bucket_<suffix>`
-(`<ID>_<group>` or plain `<group>`).
+(`<ID>_<group>` or plain `<group>`). `levels` is the grouping's DECLARED
+levels in numbering order (SB `CA.levels` for categorical groupings,
+sort order otherwise): the in-model [`_declared_codes`](@ref) encoder
+numbers groups by position in this vector — no sorting — and `G` is its
+length (unobserved declared levels keep prior-only coefficients, exactly
+like SB). `nothing` pre-bind (or when the emitter has no declaration):
+[`bind_data`](@ref) fills sort-ordered observed levels, which equal SB
+numbering for plain vectors; hand-built bound plans must fill it too.
 """
 struct RanefBucket
     id::Union{Nothing,Symbol}
@@ -437,7 +444,16 @@ struct RanefBucket
     slices::Vector{Tuple{Symbol,UnitRange{Int}}}
     lkj_eta::Float64
     label::Symbol
+    levels::Union{Nothing,Vector}
 end
+
+# Pre-declared-levels 7-arg positional construction keeps working with
+# `levels = nothing` (bind_data derives sort-ordered levels); the
+# emitter path passes explicit declared levels.
+RanefBucket(id::Union{Nothing,Symbol}, group::ColumnRef, kind::Symbol,
+    margins::Vector{RanefMargin}, slices::Vector{Tuple{Symbol,UnitRange{Int}}},
+    lkj_eta::Float64, label::Symbol) =
+    RanefBucket(id, group, kind, margins, slices, lkj_eta, label, nothing)
 
 """
     VectorParameter(name, family, args, size[, label])
@@ -1265,6 +1281,27 @@ function _validate_bucket_shape(b::RanefBucket, prednames::Set{Symbol})
             _fail(b.label, "K=1 plain bucket takes no LKJ eta (no " *
                   "correlation to parameterize), got $(b.lkj_eta)")
     end
+    _validate_bucket_levels_shape(b)
+    return nothing
+end
+
+# Declared-levels checks provable without data (coverage needs the bound
+# column — `_validate_ranef_buckets_data`). Emitter-provided levels must
+# be non-empty, duplicate-free, and literal-embeddable (the admission
+# mirrors `_level_literal` in preprocessing.jl — the generator embeds
+# these values into the `_declared_codes` call).
+function _validate_bucket_levels_shape(b::RanefBucket)
+    b.levels === nothing && return nothing
+    !isempty(b.levels) ||
+        _fail(b.label, "bucket declares zero grouping levels")
+    length(unique(b.levels)) == length(b.levels) ||
+        _fail(b.label, "bucket declares duplicate grouping levels " *
+              "($(repr(b.levels)))")
+    for lv in b.levels
+        lv isa Union{Number,String,Bool,Char,Symbol} ||
+            _fail(b.label, "declared level $(repr(lv)) is not " *
+                  "literal-embeddable (numeric/string/symbol only)")
+    end
     return nothing
 end
 
@@ -1331,14 +1368,69 @@ function _validate_ranef_buckets_data(plan::StructuralPlan)
         _is_derived(plan, b.group) &&
             _fail(b.label, "grouping column $(b.group) must be raw data " *
                   "(level knowledge needs bound values)")
-        levels = _grouping_levels(plan.columns[b.group])
-        length(levels) >= 1 ||
-            _fail(b.label, "grouping column $(b.group) has no levels")
+        b.levels === nothing &&
+            _fail(b.label, "bucket has no declared grouping levels " *
+                  "(bind_data fills these — hand-built bound plans must too)")
+        # Coverage: every observed value needs a declared code (an
+        # uncovered value would encode 0 and gather out of bounds).
+        levels = b.levels::Vector
+        for v in plan.columns[b.group]
+            v in levels ||
+                _fail(b.label, "grouping value $(repr(v)) of $(b.group) " *
+                      "is not a declared level (declared: $(repr(levels)))")
+        end
         for m in b.margins
             _validate_margin_data(m, b.label, plan)
         end
     end
+    # One grouping, one numbering: same-group buckets share the per-group
+    # `_ppl_gidx_` encoder, so their declared levels must agree exactly
+    # (order included — codes are positions).
+    for i in eachindex(plan.ranef_buckets)
+        for j in (i + 1):length(plan.ranef_buckets)
+            bi, bj = plan.ranef_buckets[i], plan.ranef_buckets[j]
+            bi.group === bj.group || continue
+            bi.levels == bj.levels ||
+                _fail(:plan, "buckets $(bi.label) and $(bj.label) share " *
+                      "grouping $(bi.group) but declare different levels " *
+                      "($(repr(bi.levels)) vs $(repr(bj.levels)))")
+        end
+    end
     return nothing
+end
+
+# Group count for a bucket: the DECLARED level count (unobserved declared
+# levels keep prior-only coefficients, exactly like SB). Loud defense in
+# depth — validate_data proves levels non-nothing on every bound plan.
+function _bucket_nlevels(b::RanefBucket)
+    b.levels === nothing && throw(ContractValidationError(
+        "[layout] bucket $(b.label) has no declared grouping levels " *
+        "(bind_data fills these — hand-built bound plans must too)"))
+    return length(b.levels)
+end
+
+# Binder evaluation for bucket levels (the LevelMap precedent):
+# `nothing` fills sort-ordered observed levels (SB numbering for plain
+# vectors); emitter-provided levels pass through (validated by
+# `_validate_bucket_levels_shape` + `_validate_ranef_buckets_data`).
+function _eval_bucket_levels(buckets::Vector{RanefBucket},
+        columns::Dict{Symbol,AbstractVector})
+    out = RanefBucket[]
+    for b in buckets
+        b.levels !== nothing && (push!(out, b); continue)
+        haskey(columns, b.group) ||
+            _fail(b.label, "grouping column $(b.group) is not bound")
+        levels =
+            try
+                _grouping_levels(columns[b.group])
+            catch err
+                _fail(b.label, "grouping column $(b.group) levels not " *
+                             "orderable ($err)")
+            end
+        push!(out, RanefBucket(b.id, b.group, b.kind, b.margins, b.slices,
+            b.lkj_eta, b.label, collect(levels)))
+    end
+    return out
 end
 
 function _validate_margin_data(m::RanefMargin, label::Symbol, plan::StructuralPlan)
@@ -4417,7 +4509,9 @@ untouched. Inference precedence: response > trials > evidence > weight >
 group > predictor > data; term columns are the only `:predictor` source, so
 assignment/extra columns stay `:data`. Bucket grouping columns upgrade to
 `:group` (grouping dominates predictor use in the label; both facts stay
-visible in terms + buckets). `dims` binds kernel-plate dims keys
+visible in terms + buckets). Ranef buckets with `levels === nothing`
+gain sort-ordered observed levels (SB numbering for plain vectors —
+emitter-declared levels pass through). `dims` binds kernel-plate dims keys
 (`subject_count`, `timepoint_count`) to positive integers; every key must
 be consumed.
 """
@@ -4482,6 +4576,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     n = isempty(kbases) ? length(first(values(columns))) :
         _kernel_flat_length(only(kbases).subjects, only(kbases).timepoints)
     maps = _eval_levelmaps(plan.levelmaps, columns)
+    buckets = _eval_bucket_levels(plan.ranef_buckets, columns)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
             plan.predictors, plan.r2d2_priors)
@@ -4489,7 +4584,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
         plan.population_priors, plan.parameters, plan.assignments,
         columns, n; roles = merged, derived = plan.derived,
         levelmaps = maps, plate_parameters = plan.plate_parameters,
-        scans = plan.scans, ranef_buckets = plan.ranef_buckets,
+        scans = plan.scans, ranef_buckets = buckets,
         vector_parameters = vectors2, spline_bases = bases,
         spline_vectors = plan.spline_vectors, hsgp_bases = hbases,
         kernel_plates = kbases, r2d2_priors = plan.r2d2_priors)
