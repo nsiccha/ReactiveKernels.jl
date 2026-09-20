@@ -58,13 +58,19 @@ RKPPLModel(ast, mod) = RKPPLModel(ast, mod, Dict{Symbol,AbstractVector}())
 A captured reusable submodel definition (`@rkppl sm(a, b) = begin … end`),
 mirroring StanBlocks `@slic f(args…)=body`. `argnames` are the positional
 inputs bound by name at the use site; `body` is the block AST — density /
-deterministic `=` statements followed by a trailing RETURN expression whose
-value binds to the use-site LHS; `mod` is the defining module (for symbol
-resolution). Invoked as `latent ~ sm(a, b)` and expanded inline by
-[`lower_rkppl`](@ref) (see `_expand_submodels`): the submodel's own `~`/`=`
-names are namespaced under the LHS (`latent_…`) and spliced into the parent
-plan, so a submodel lowers exactly like a hand-inlined model — transparent and
-reusable, never an opaque node.
+deterministic `=` statements followed by a trailing RETURN expression; `mod`
+is the defining module (for symbol resolution). A trailing `return x` and a
+bare trailing `x` are equivalent spellings. The RETURN selects the submodel
+kind: a bare trailing Symbol that is the LHS of an internal
+`slot .~ family.(...)` response is a RESPONSE POINTER, not a value — it maps
+to the data column at an observation-stream use site (`y ~ sm(...)`), so a
+stream body carries no trailing binding; any other return is a latent VALUE
+bound to a non-data LHS (`latent = <return>`). Invoked as
+`latent ~ sm(a, b)` and expanded inline by [`lower_rkppl`](@ref) (see
+`_expand_submodels`): the submodel's own `~`/`=` names are namespaced under
+the LHS (`latent_…`) and spliced into the parent plan, so a submodel lowers
+exactly like a hand-inlined model — transparent and reusable, never an opaque
+node.
 """
 struct RKPPLSubmodel
     name::Symbol
@@ -2327,7 +2333,8 @@ end
 # the submodel's positional args bind to the call arguments and its own `~`/`=`
 # names are namespaced under the LHS, so the result lowers exactly like a
 # hand-inlined model (the submodel is transparent). Two kinds, read from the
-# submodel's RETURN:
+# submodel's RETURN (a trailing `return x` unwraps to `x` in
+# `_submodel_body_parts`, so both spellings lower identically):
 #   • latent (`latent ~ sm(a,b)`, `latent` NOT data) — returns a VALUE
 #     expression; every local is namespaced (`latent_…`) and a trailing
 #     `latent = <return>` binds the LHS.
@@ -2393,13 +2400,29 @@ end
 
 _ns(lhs::Symbol, nm::Symbol) = Symbol(lhs, :_, nm)
 
-# Split a submodel body into (statements, return-expression).
+# Split a submodel body into (statements, return-expression). A trailing
+# explicit `return x` unwraps to `x`, so it lowers identically to the implicit
+# trailing-expression form on every path (stream + latent, top-level +
+# per-cell): all of them read `ret` from here.
 function _submodel_body_parts(sm::RKPPLSubmodel)
     items = Any[a for a in sm.body.args if !(a isa LineNumberNode)]
     isempty(items) && _sfail("submodel `$(sm.name)` has an empty body")
     ret = last(items)
+    if Meta.isexpr(ret, :return)
+        # A bare `return` parses as `Expr(:return, nothing)` (length 1, value
+        # `nothing` — indistinguishable from an explicit `return nothing`, and
+        # equally unbindable), so the arity check alone cannot fail it closed.
+        unwrap = length(ret.args) == 1 ? ret.args[1] : nothing
+        unwrap === nothing && _sfail(
+            "submodel `$(sm.name)` must end in a RETURN expression bound to " *
+            "the use-site LHS — a bare `return` returns nothing")
+        ret = unwrap
+    end
     stmts = Any[_unwrap_trivia(st) for st in items[1:end-1]]
     for st in stmts
+        Meta.isexpr(st, :return) && _sfail(
+            "submodel `$(sm.name)`: `return` is only admitted as the " *
+            "trailing expression (submodels are straight-line; no early return)")
         (st isa Expr && (_is_sample(st) || _is_broadcast_sample(st) ||
             (st.head === :(=) && length(st.args) == 2 &&
              st.args[1] isa Symbol))) || _sfail(

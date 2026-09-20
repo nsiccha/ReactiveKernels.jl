@@ -1838,6 +1838,26 @@ end
     r ~ Exponential(rate)
     q ~ Normal(0, 1)
 end
+# Explicit-`return` twins: a trailing `return x` unwraps to `x`, so these lower
+# identically to the implicit trailing-expression form (stream + latent,
+# top-level + per-cell).
+@rkppl sub_scale_ret(rate) = begin
+    r ~ Exponential(rate)
+    return r
+end
+@rkppl sub_shift_ret(loc, sc) = begin
+    z ~ Normal(0, 1)
+    return loc + sc * z
+end
+@rkppl sub_earlyret(rate) = begin
+    r ~ Exponential(rate)
+    return r
+    return r
+end
+@rkppl sub_bare(rate) = begin
+    r ~ Exponential(rate)
+    return
+end
 
 @testset "surface submodels" begin
     # Definition capture.
@@ -1865,6 +1885,37 @@ end
     # Namespacing under the LHS: the submodel local `r` becomes `sig_r`.
     @test any(p -> p.name === :sig_r, got.parameters)
     @test !any(p -> p.name === :r, got.parameters)
+
+    # An explicit trailing `return` lowers identically to the implicit form.
+    got_ret = lower_rkppl(quote
+        a ~ Normal(0, 5)
+        sig ~ sub_scale_ret(1.0)
+        eta = a .+ b .* x
+        y .~ Normal.(eta, sig)
+    end, (:y, :x); mod = @__MODULE__)
+    @test _plans_equal(got_ret, want)
+    @test _plans_equal(got_ret, got)
+
+    # Explicit-`return` compound latent value == the implicit twin and the
+    # hand-inlined transform.
+    gotv = lower_rkppl(quote
+        m ~ sub_shift_ret(0.0, 2.0)
+        eta = a .+ b .* x
+        y .~ Normal.(eta, m)
+    end, (:y, :x); mod = @__MODULE__)
+    gotvi = lower_rkppl(quote
+        m ~ sub_shift(0.0, 2.0)
+        eta = a .+ b .* x
+        y .~ Normal.(eta, m)
+    end, (:y, :x); mod = @__MODULE__)
+    wantv = lower_rkppl(quote
+        m_z ~ Normal(0, 1)
+        m = 0.0 + 2.0 * m_z
+        eta = a .+ b .* x
+        y .~ Normal.(eta, m)
+    end, (:y, :x))
+    @test _plans_equal(gotv, gotvi)
+    @test _plans_equal(gotv, wantv)
 
     # The same submodel used twice → per-use-site namespacing, no collision.
     two = lower_rkppl(quote
@@ -1930,6 +1981,18 @@ end
         y .~ Normal.(eta, sig)
     end, (:y, :x); mod = @__MODULE__)
 
+    # Fail-closed: an early (non-trailing) `return` and a bare `return`.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        sig ~ sub_earlyret(1.0)
+        eta = a .+ b .* x
+        y .~ Normal.(eta, sig)
+    end, (:y, :x); mod = @__MODULE__)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        sig ~ sub_bare(1.0)
+        eta = a .+ b .* x
+        y .~ Normal.(eta, sig)
+    end, (:y, :x); mod = @__MODULE__)
+
     # Without a submodel binding in scope, `latent ~ foo(...)` stays an
     # ordinary (unknown-distribution) parameter error — no submodel capture.
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -1966,6 +2029,13 @@ end
     r ~ Exponential(scale)
     r
 end
+@rkppl obs_gstream_ret(x) = begin
+    a ~ Normal(0, 5)
+    s ~ Exponential(1)
+    eta = a .+ b .* x
+    slot .~ Normal.(eta, s)
+    return slot
+end
 
 @testset "surface observation-stream submodels" begin
     # A stream lowers exactly like the hand-inlined program (transparent).
@@ -1987,6 +2057,16 @@ end
     @test got.responses[1].predictor === :y_eta
     @test got.responses[1].scale === :y_s
     @test any(p -> p.name === :y_s, got.parameters)
+
+    # An explicit `return slot` reads as the stream response pointer, exactly
+    # like the implicit trailing symbol.
+    gotr = lower_rkppl(quote
+        y ~ obs_gstream_ret(x)
+    end, (:y, :x); mod = @__MODULE__)
+    @test _plans_equal(gotr, want)
+    @test _plans_equal(gotr, got)
+    @test length(gotr.responses) == 1
+    @test gotr.responses[1].response === :y
 
     # One removable node per stream: two independent response streams, each
     # fully namespaced (add/drop a whole likelihood + its params in one line).
@@ -2075,6 +2155,16 @@ end
     a ~ Normal(0, r)
     b ~ Normal(0, 1)
 end
+@rkppl pcs_centered_ret(m, t) = begin
+    v ~ Normal(m, t)
+    return v
+end
+@rkppl pcs_obs_ret(m, sc) = begin
+    b ~ Normal(0, 1)
+    q = m .+ b
+    slot ~ Normal.(q, sc)
+    return slot
+end
 
 _pcs(cells...) = Expr(:block,
     :(mu ~ Normal(0, 5)), :(sigma ~ Exponential(1)), :(tau ~ Exponential(1)),
@@ -2096,6 +2186,13 @@ _pcs(cells...) = Expr(:block,
     @test pp.name === :theta && pp.family === :normal &&
         collect(values(pp.args)) == [:mu, :tau]
     @test only(sub.predictors).terms[1].kind === LatentTerm
+
+    # ── Explicit-`return` centered latent == the implicit twin and the
+    # hand-written per-cell parameter.
+    subr = lower_rkppl(_pcs(:(theta[i] ~ pcs_centered_ret(mu, tau)),
+                            :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); mod = M)
+    @test _plans_equal(subr, sub)
+    @test _plans_equal(subr, hand)
 
     # ── Non-centered latent submodel == the hand-inlined `z`-transform.
     subn = lower_rkppl(_pcs(:(theta[i] ~ pcs_ncp(mu, tau)),
@@ -2177,6 +2274,11 @@ _pcs(cells...) = Expr(:block,
     @test _query(builto.spec, bo, :posterior, uo) ≈
         llo + pro + log(nto.sigma) + log(nto.tau)
     _check_gradient(builto.spec, bo, uo)
+
+    # ── Explicit-`return` per-cell observation slot == the implicit twin.
+    subor = lower_rkppl(_pcs(:(y[i] ~ pcs_obs_ret(mu, sigma))), (:y, :x); mod = M)
+    @test _plans_equal(subor, subo)
+    @test only(subor.plate_parameters).name === :y_b
 end
 
 @testset "surface plate per-cell submodels failures" begin
