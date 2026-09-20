@@ -3168,7 +3168,8 @@ function _plain_args(rhs::Expr, what)
 end
 
 function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
-    call = _dot2call_response(lhs, rhs)
+    dotted = _desugar_fused_head(lhs, rhs)
+    call = _dot2call_response(lhs, dotted)
     weights, call = _peel_weighted(lhs, call, ctx)
     evidence, call = _peel_evidence(lhs, call, ctx)
     if call.args[1] in (:CategoricalLogit, :OrderedLogistic, :Ordinal,
@@ -3378,6 +3379,79 @@ end
 # the analysis's business, not the peeler's).
 const _DOT_WRAPPERS = (:weighted, :truncated, :censored, :interval_censored)
 
+_dotted_obj(f::Symbol, args...) = Expr(:., f, Expr(:tuple, args...))
+
+# Fused family-name response heads (`BernoulliLogit.(eta)`,
+# `PoissonLog.(eta)`, `BinomialLogit.(n, mu)`,
+# `NegativeBinomial2Log.(eta, phi)`, `GammaLog.(alpha, eta)`,
+# `BetaLogit.(mu, kappa)`): rewrite to the decomposed spelling BEFORE
+# spine conversion, so HAVE recovery is shared by construction — a fused
+# response lowers to the identical plan as its decomposed twin. Arity is
+# validated with fused-spelled errors first (a wrong-arity fused head
+# never reports a confusing decomposed message); keyword arguments fall
+# through untouched to the canonical positional-only error. Malformed
+# shapes likewise pass through to the canonical shape errors. Recurses
+# into the object position of the `weighted.`/`truncated.`/`censored.`/
+# `interval_censored.` wrappers (the first tuple arg in every wrapper).
+function _desugar_fused_head(lhs, rhs)
+    rhs isa Expr && rhs.head === :. || return rhs
+    length(rhs.args) == 2 && rhs.args[1] isa Symbol &&
+        rhs.args[2] isa Expr && rhs.args[2].head === :tuple || return rhs
+    f = rhs.args[1]
+    targs = rhs.args[2].args
+    if f in _DOT_WRAPPERS
+        isempty(targs) && return rhs
+        newfirst = _desugar_fused_head(lhs, targs[1])
+        newfirst === targs[1] && return rhs
+        return Expr(:., f, Expr(:tuple, newfirst, targs[2:end]...))
+    end
+    newrhs = _desugar_fused_base(lhs, f, targs)
+    newrhs === nothing && return rhs
+    return newrhs
+end
+
+function _desugar_fused_base(lhs, f, targs)
+    f in (:BernoulliLogit, :PoissonLog, :BinomialLogit,
+        :NegativeBinomial2Log, :GammaLog, :BetaLogit) || return nothing
+    any(a -> a isa Expr && a.head === :parameters, targs) && return nothing
+    if f === :BernoulliLogit
+        length(targs) == 1 ||
+            _sfail("response $lhs: `BernoulliLogit` takes " *
+                   "`BernoulliLogit.(eta)`")
+        return _dotted_obj(:Bernoulli, _dotted_obj(:logistic, targs[1]))
+    elseif f === :PoissonLog
+        length(targs) == 1 ||
+            _sfail("response $lhs: `PoissonLog` takes `PoissonLog.(eta)`")
+        return _dotted_obj(:Poisson, _dotted_obj(:exp, targs[1]))
+    elseif f === :BinomialLogit
+        length(targs) == 2 ||
+            _sfail("response $lhs: `BinomialLogit` takes " *
+                   "`BinomialLogit.(n, mu)`")
+        return _dotted_obj(:Binomial, targs[1],
+            _dotted_obj(:logistic, targs[2]))
+    elseif f === :NegativeBinomial2Log
+        length(targs) == 2 ||
+            _sfail("response $lhs: `NegativeBinomial2Log` takes " *
+                   "`NegativeBinomial2Log.(eta, phi)`")
+        return _dotted_obj(:NegativeBinomial2, _dotted_obj(:exp, targs[1]),
+            targs[2])
+    elseif f === :GammaLog
+        length(targs) == 2 ||
+            _sfail("response $lhs: `GammaLog` takes `GammaLog.(alpha, eta)`")
+        return _dotted_obj(:Gamma, targs[1],
+            Expr(:call, Symbol("./"), _dotted_obj(:exp, targs[2]), targs[1]))
+    else
+        length(targs) == 2 ||
+            _sfail("response $lhs: `BetaLogit` takes `BetaLogit.(mu, kappa)`")
+        m1 = _dotted_obj(:logistic, targs[1])
+        m2 = _dotted_obj(:logistic, targs[1])
+        return _dotted_obj(:Beta,
+            Expr(:call, Symbol(".*"), m1, targs[2]),
+            Expr(:call, Symbol(".*"),
+                Expr(:call, Symbol(".-"), 1, m2), targs[2]))
+    end
+end
+
 function _dot2call_response(lhs, rhs)
     rhs isa Expr && rhs.head === :. ||
         return _dot2call_object_error(lhs, rhs)
@@ -3397,7 +3471,9 @@ function _dot2call_object_error(lhs, rhs)
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol && rhs.args[1] in
             (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
-                :Gamma, :Beta, :CategoricalLogit, :OrderedLogistic, :Ordinal,
+                :Gamma, :Beta, :BernoulliLogit, :PoissonLog, :BinomialLogit,
+                :NegativeBinomial2Log, :GammaLog, :BetaLogit,
+                :CategoricalLogit, :OrderedLogistic, :Ordinal,
                 :Multinomial, :Categorical, :weighted, :truncated, :censored,
                 :interval_censored)
         _sfail("response $lhs: broadcast the object " *
@@ -3545,7 +3621,11 @@ const _RESPONSE_BASE_MSG =
     "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`, " *
     "`CategoricalLogit.(eta_2, ..., eta_K)`, `OrderedLogistic.(eta)`, " *
     "`Ordinal.(Cumulative(), LogitLink(), eta)`, " *
-    "`Multinomial.(N, s, c2, ..., cK)`, or `Categorical.(s)`"
+    "`Multinomial.(N, s, c2, ..., cK)`, or `Categorical.(s)` " *
+    "(or the fused heads `BernoulliLogit.(eta)`, `PoissonLog.(eta)`, " *
+    "`BinomialLogit.(n, mu)`, `NegativeBinomial2Log.(eta, phi)`, " *
+    "`GammaLog.(alpha, eta)`, `BetaLogit.(mu, kappa)`, which lower " *
+    "identically to their decomposed spellings)"
 
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
@@ -3692,25 +3772,18 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :negative_binomial2 && _sfail("response $lhs: use " *
                                           "`NegativeBinomial2` (the response " *
                                           "spelling, not the kernel endpoint)")
-    fam === :BernoulliLogit && _sfail("response $lhs: write " *
-                                      "`Bernoulli.(logistic.(eta))`")
-    fam === :PoissonLog && _sfail("response $lhs: write " *
-                                  "`Poisson.(exp.(eta))`")
-    fam === :BinomialLogit && _sfail("response $lhs: write " *
-                                     "`Binomial.(n, logistic.(mu))`")
-    fam === :NegativeBinomial2Log && _sfail("response $lhs: write " *
-        "`NegativeBinomial2.(exp.(eta), phi)`")
-    fam === :GammaLog && _sfail("response $lhs: write " *
-                                "`Gamma.(alpha, exp.(eta) ./ alpha)`")
-    fam === :BetaLogit && _sfail("response $lhs: write " *
-                                 _BETA_MSG)
+    fam === :OrderedLogit && _sfail("response $lhs: unknown distribution " *
+                                    "`:OrderedLogit` (write " *
+                                    "`OrderedLogistic.(eta)`)")
     fam === :MvNormalCholesky && _sfail(
         "response $lhs: `MvNormalCholesky` is joint-only " *
         "(`[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)` with plain `~` — " *
         "row-grouped, never broadcast)")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, Bernoulli, Poisson, Binomial, " *
-                  "NegativeBinomial2, Gamma, Beta, CategoricalLogit, " *
+                  "NegativeBinomial2, Gamma, Beta, BernoulliLogit, " *
+                  "PoissonLog, BinomialLogit, NegativeBinomial2Log, " *
+                  "GammaLog, BetaLogit, CategoricalLogit, " *
                   "OrderedLogistic, Ordinal, Multinomial, Categorical). " *
                   "When `$fam` is a defined RKPPLSubmodel, a latent uses " *
                   "`latent ~ $fam(...)` and an observation stream uses plain " *

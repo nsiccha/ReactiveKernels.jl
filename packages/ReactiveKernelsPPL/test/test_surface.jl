@@ -1054,7 +1054,10 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, Dn)
-    # Distributions must be Distributions.jl (julianic, never Stan).
+    # Distributions must be Distributions.jl (julianic, never Stan):
+    # CamelCase constructors with the link explicit (a link wrapper, or a
+    # fused logit/log head naming the link — the fused heads lower as
+    # decomposed twins, pinned in "surface fused response heads" below).
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ normal.(mu, 1.0)
@@ -1062,10 +1065,6 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Bernoulli.(mu)
-    end, Dn)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ b .* x
-        y .~ BernoulliLogit.(mu)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
@@ -1307,6 +1306,184 @@ end
         end
         @test err isa LoadError && err.error isa SurfaceLoweringError
     end
+end
+
+@testset "surface fused response heads" begin
+    Dn = (:y, :x)
+    _fused_errmsg(f) = try
+        f()
+        ""
+    catch e
+        sprint(showerror, e)
+    end
+    # Each fused family-name head lowers to the identical plan as its
+    # decomposed spelling (HAVE recovery is shared by construction — the
+    # family/link/predictor are pinned twice: by twin equality and directly).
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ BernoulliLogit.(mu)
+    end, Dn)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ Bernoulli.(logistic.(mu))
+    end, Dn)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === BernoulliLogitFam
+    @test only(fused.responses).link === LogitLink
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ PoissonLog.(mu)
+    end, Dn)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ Poisson.(exp.(mu))
+    end, Dn)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === PoissonLogFam
+    @test only(fused.responses).link === LogLink
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ BinomialLogit.(10, mu)
+    end, Dn)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ Binomial.(10, logistic.(mu))
+    end, Dn)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === BinomialLogitFam
+    @test only(fused.responses).link === LogitLink
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        phi ~ Exponential(1.0)
+        mu = a .+ b .* x
+        y .~ NegativeBinomial2Log.(mu, phi)
+    end, Dn)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        phi ~ Exponential(1.0)
+        mu = a .+ b .* x
+        y .~ NegativeBinomial2.(exp.(mu), phi)
+    end, Dn)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === NegativeBinomial2Fam
+    @test only(fused.responses).link === LogLink
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        alpha ~ Exponential(1.0)
+        mu = a .+ b .* x
+        y .~ GammaLog.(alpha, mu)
+    end, Dn)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        alpha ~ Exponential(1.0)
+        mu = a .+ b .* x
+        y .~ Gamma.(alpha, exp.(mu) ./ alpha)
+    end, Dn)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === GammaLogFam
+    @test only(fused.responses).link === LogLink
+    Dp2 = (:p, :x)
+    fused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        kappa ~ Gamma(2.0, 1000.0)
+        mu = a .+ b .* x
+        p .~ BetaLogit.(mu, kappa)
+    end, Dp2)
+    decomposed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        kappa ~ Gamma(2.0, 1000.0)
+        mu = a .+ b .* x
+        p .~ Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)
+    end, Dp2)
+    @test _plans_equal(fused, decomposed)
+    @test only(fused.responses).family === BetaLogitFam
+    @test only(fused.responses).link === LogitLink
+    # A fused head under `weighted.` desugars like the top-level head (the
+    # rewrite recurses into the wrapper's object position).
+    Wd = (:y, :x, :w)
+    wfused = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ weighted.(BernoulliLogit.(mu), w)
+    end, Wd)
+    wdecomp = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        mu = a .+ b .* x
+        y .~ weighted.(Bernoulli.(logistic.(mu)), w)
+    end, Wd)
+    @test _plans_equal(wfused, wdecomp)
+    # Wrong-arity fused heads fail naming the FUSED spelling, never the
+    # decomposed one.
+    @test occursin("`BernoulliLogit` takes `BernoulliLogit.(eta)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ BernoulliLogit.(mu, mu)
+        end, Dn)))
+    @test occursin("`PoissonLog` takes `PoissonLog.(eta)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ PoissonLog.()
+        end, Dn)))
+    @test occursin("`BinomialLogit` takes `BinomialLogit.(n, mu)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ BinomialLogit.(mu)
+        end, Dn)))
+    @test occursin("`NegativeBinomial2Log` takes `NegativeBinomial2Log.(eta, phi)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            phi ~ Exponential(1.0)
+            mu = a .+ b .* x
+            y .~ NegativeBinomial2Log.(mu)
+        end, Dn)))
+    @test occursin("`GammaLog` takes `GammaLog.(alpha, eta)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ GammaLog.(mu)
+        end, Dn)))
+    @test occursin("`BetaLogit` takes `BetaLogit.(mu, kappa)`",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            p .~ BetaLogit.(mu)
+        end, Dp2)))
+    # Fused heads take positional arguments only, like every dotted object.
+    @test occursin("positional arguments only",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ BernoulliLogit.(mu; foo = 1)
+        end, Dn)))
+    # An unbracketed fused head names the broadcast fix.
+    @test occursin("broadcast the object",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ BernoulliLogit(mu)
+        end, Dn)))
+    # `OrderedLogit` is a near-miss name, not a fused head: it guides to the
+    # admitted `OrderedLogistic` spelling instead of failing generically.
+    @test occursin("OrderedLogistic.(eta)",
+        _fused_errmsg(() -> lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ OrderedLogit.(mu)
+        end, Dn)))
 end
 
 @testset "surface offset-only predictors" begin
