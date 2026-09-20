@@ -532,12 +532,47 @@ end
     # A finite interval on a non-Normal family is rejected in slice 1.
     @test_throws SurfaceLoweringError lower_rkppl(
         _plate_z(:(truncated(Cauchy(0.0, 1.0), -1.0, 2.0))), (:y,))
-    # One-sided finite bounds are not yet lowered (planned).
+    # A finite LOWER-only bound is still rejected (upper-only lowers below).
     @test_throws SurfaceLoweringError lower_rkppl(
         _plate_z(:(truncated(Normal(0.0, 1.0), 1.0, Inf))), (:y,))
     # Reversed bounds are rejected.
     @test_throws SurfaceLoweringError lower_rkppl(
         _plate_z(:(truncated(Normal(0.0, 1.0), 3.0, 1.0))), (:y,))
+end
+
+@testset "surface upper-truncated parameters" begin
+    # An upper-only truncation lowers to an `(:upper, hi)` support override at
+    # ANY location (the TGI threshold-prior shape: a negative location under a
+    # negative ceiling). The `-Inf` bound is the signed-`Inf` AST call.
+    hi = log(0.5)
+    _plate_z(rhs) = Expr(:block,
+        :(z ~ $rhs),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ Normal(z, 1.0)),
+                    :(y[i] ~ Normal.(theta[i], 1.0))))))
+    got = lower_rkppl(_plate_z(:(truncated(Normal(-2.3, 1.0), -Inf, $hi))), (:y,))
+    p = only(pp for pp in got.parameters if pp.name === :z)
+    @test p.family === :normal
+    @test p.args == (arg1 = -2.3, arg2 = 1.0)
+    @test p.support_override === (:upper, hi)
+    # A per-cell upper latent rides the plate the same way.
+    plate = lower_rkppl(Expr(:block,
+        :(mu ~ Normal(0, 3)), :(tau ~ HalfNormal(2)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ truncated(Normal(mu, tau), -Inf, 2.0)),
+                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y,))
+    @test only(plate.plate_parameters).support_override === (:upper, 2.0)
+    # An upper-only truncation on a non-Normal family is rejected in slice 1.
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _plate_z(:(truncated(Cauchy(0.0, 1.0), -Inf, 1.0))), (:y,))
+    # Bounds are literals: an expression bound (the emitter folds `log(0.5)`)
+    # is rejected.
+    @test_throws SurfaceLoweringError lower_rkppl(
+        _plate_z(:(truncated(Normal(-2.3, 1.0), -Inf, log(0.5)))), (:y,))
 end
 
 @testset "surface parameters and assignments" begin

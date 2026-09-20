@@ -13,8 +13,9 @@
     support_of(family, override) -> Symbol
 
 Inferred unconstrained support (`:real`/`:positive`/`:unit`) for a sampled
-family plus optional `:positive` override (half-Normal/half-Cauchy style).
-Loud on unknown families and inapplicable overrides.
+family plus an optional support override (`:positive` half-Normal/half-Cauchy
+style, `:interval`, or `:upper`). Loud on unknown families and inapplicable
+overrides.
 """
 function support_of(family::Symbol, override::SupportOverride)
     haskey(SAMPLED_SUPPORT, family) ||
@@ -22,8 +23,17 @@ function support_of(family::Symbol, override::SupportOverride)
     inferred = SAMPLED_SUPPORT[family]
     override === nothing && return inferred
     if override isa Tuple
-        override[1] === :interval || throw(ContractValidationError(
-            "[layout] tuple support override must be (:interval, lo, hi), got $override"))
+        if override[1] === :upper
+            length(override) == 2 || throw(ContractValidationError(
+                "[layout] tuple support override must be (:upper, hi), got $override"))
+            inferred === :real || throw(ContractValidationError(
+                "[layout] :upper override needs a real-support family"))
+            return :upper
+        end
+        (override[1] === :interval && length(override) == 3) ||
+            throw(ContractValidationError(
+                "[layout] tuple support override must be (:interval, lo, hi) " *
+                "or (:upper, hi), got $override"))
         inferred === :real || throw(ContractValidationError(
             "[layout] :interval override needs a real-support family"))
         return :interval
@@ -37,12 +47,15 @@ function support_of(family::Symbol, override::SupportOverride)
     return :positive
 end
 
-# The transform kind and (for :interval) the constrained bounds a layout entry
-# needs, from a parameter's family + support override.
+# The transform kind and (for :interval/:upper) the constrained bounds a
+# layout entry needs, from a parameter's family + support override.
 function _entry_transform(family::Symbol, override::SupportOverride)
     support = support_of(family, override)
     if support === :interval
         return (:interval, Float64(override[2]), Float64(override[3]))
+    end
+    if support === :upper
+        return (:upper, NaN, Float64(override[2]))
     end
     transform =
         support === :real ? :identity :
@@ -57,7 +70,7 @@ vector block (K=1 `xi`, correlated `tau`/`z_flat`), a varying LKJ
 Cholesky factor, a joint-outcomes LKJ Cholesky factor, or an HSGP
 coefficient-vector block (`beta_raw`). `lo` is the constrained lower
 bound of an `:interval`/`:floored` transform (`:interval` also sets
-`hi`; `NaN` otherwise)."""
+`hi`; an `:upper` transform sets `hi` only; `NaN` otherwise)."""
 struct LayoutEntry
     kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :varying | :varying_corr | :cholesky_corr | :hsgp
     predictor::Union{Nothing,Symbol}
@@ -65,9 +78,9 @@ struct LayoutEntry
     labels::Vector{Symbol} # per-coordinate labels (length == size)
     offset::Int # 1-based packed offset
     size::Int
-    transform::Symbol # :identity | :exp | :logistic | :interval | :floored | :ordered | :simplex | :lkj
+    transform::Symbol # :identity | :exp | :logistic | :interval | :floored | :upper | :ordered | :simplex | :lkj
     lo::Float64 # :interval/:floored lower bound (else NaN)
-    hi::Float64 # :interval upper bound (else NaN)
+    hi::Float64 # :interval/:upper upper bound (else NaN)
 end
 # Non-interval entries omit the bounds.
 LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
@@ -779,23 +792,28 @@ _logjac_value(transform::Symbol, u) =
 # with log-Jacobian `log(x-lo) + log(hi-x) - log(hi-lo)` in the CONSTRAINED
 # value. `:floored` is likewise parameterized (Stan's lower-bound kernel
 # ℝ → (lo, ∞), `lo + exp(u)`, log-Jacobian the bare `u` — no truncation
-# normalizer). The in-graph interval/floored edges (below) use the IDENTICAL
+# normalizer), as is `:upper` (Stan's upper-bound kernel ℝ → (-∞, hi),
+# `hi - exp(u)`, log-Jacobian the bare `u` — no truncation normalizer).
+# The in-graph interval/floored/upper edges (below) use the IDENTICAL
 # operations, so host and graph agree bit-for-bit.
 function _constrain_elt(e::LayoutEntry, u)
     e.transform === :interval &&
         return e.lo + (e.hi - e.lo) / (1 + exp(-u))
     e.transform === :floored && return e.lo + exp(u)
+    e.transform === :upper && return e.hi - exp(u)
     return _constrain_value(e.transform, u)
 end
 function _unconstrain_elt(e::LayoutEntry, x)
     e.transform === :interval && return log(x - e.lo) - log(e.hi - x)
     e.transform === :floored && return log(x - e.lo)
+    e.transform === :upper && return log(e.hi - x)
     return _unconstrain_value(e.transform, x)
 end
 function _logjac_elt(e::LayoutEntry, u)
     e.transform === :interval || e.transform === :floored ||
-        return _logjac_value(e.transform, u)
+        e.transform === :upper || return _logjac_value(e.transform, u)
     e.transform === :floored && return u
+    e.transform === :upper && return u
     x = e.lo + (e.hi - e.lo) / (1 + exp(-u))
     return log(x - e.lo) + log(e.hi - x) - log(e.hi - e.lo)
 end
@@ -879,6 +897,18 @@ function transform_statements(e::LayoutEntry)
             :($u::Float64 = log($(e.name) - $blo)),
         ]
     end
+    if e.transform === :upper
+        # Parameterized like :interval (the per-entry ceiling is not in the
+        # registry): forward + inverse edges hand-rolled with the IDENTICAL
+        # math to the host `_*_elt` path (`hi - exp(u)` / `log(hi - x)`).
+        u = Symbol(:_ppl_up_, e.name)
+        bhi = e.hi
+        return Expr[
+            :($u::Float64 = $coord),
+            :($(e.name)::Float64 = $bhi - exp($u)),
+            :($u::Float64 = log($bhi - $(e.name))),
+        ]
+    end
     # Constrained supports splice the bijector's `constrain` endpoint; the
     # planner inlines it (no runtime call survives) and shares `coord` with the
     # Jacobian term via structural CSE.
@@ -923,6 +953,20 @@ function _plate_transform_statements(e::LayoutEntry)
                 $blo .+ ($bhi - $blo) ./ (1 .+ exp.(-$u))),
             :($u::AbstractVector{Float64} =
                 log.($(e.name) .- $blo) .- log.($bhi .- $(e.name))),
+        ]
+    end
+    if e.transform === :upper
+        # Parameterized bound ⇒ not in the (parameterless) bijector registry;
+        # hand-rolled broadcast edges over the block view, identical math to the
+        # host `_*_elt` path so in-graph and host agree bit-for-bit. Its
+        # `jacobian_term` sums the unconstrained view (below), so no companion
+        # `logjac` plate is emitted.
+        u = Symbol(:_ppl_up_, e.name)
+        bhi = e.hi
+        return Expr[
+            :($u::AbstractVector{Float64} = $view_read),
+            :($(e.name)::AbstractVector{Float64} = $bhi .- exp.($u)),
+            :($u::AbstractVector{Float64} = log.($bhi .- $(e.name))),
         ]
     end
     bij = _bijector_name(e.transform)
@@ -1101,18 +1145,25 @@ function jacobian_term(e::LayoutEntry)
     end
     if e.kind === :plate || e.kind === :spline ||
        e.kind === :varying || e.kind === :hsgp
-        # Interval plates hand-roll the per-cell Jacobian sum (parameterized
-        # bounds, no companion `logjac` plate); every registry transform sums
-        # its companion `logjac` plate from `_plate_transform_statements`.
-        # Spline vectors share the shape (their supports never reach
-        # :interval, but the arm stays correct if that ever changes), as do
-        # varying vectors (`xi`/`z_flat` identity, `tau` exp) and hsgp
-        # vectors (`beta_raw` identity). Anything else is loud (a companion
-        # plate that was never emitted must never sum silently).
+        # Interval/upper plates hand-roll the per-cell Jacobian sum
+        # (parameterized bounds, no companion `logjac` plate); every registry
+        # transform sums its companion `logjac` plate from
+        # `_plate_transform_statements`. Spline vectors share the shape (their
+        # supports never reach :interval/:upper, but the arms stay correct if
+        # that ever changes), as do varying vectors (`xi`/`z_flat` identity,
+        # `tau` exp) and hsgp vectors (`beta_raw` identity). Anything else is
+        # loud (a companion plate that was never emitted must never sum
+        # silently).
         if e.transform === :interval
             blo, bhi = e.lo, e.hi
             return :(sum(log.($(e.name) .- $blo) .+ log.($bhi .- $(e.name)) .-
                          log($bhi - $blo)))
+        end
+        if e.transform === :upper
+            # Stan's upper-bound kernel: the bare unconstrained coordinates
+            # (shared with the constrain edge via structural CSE) — no
+            # truncation normalizer.
+            return :(sum($(block_read(e.offset, e.size))))
         end
         e.transform === :exp || e.transform === :logistic ||
             throw(ContractValidationError("[layout] $(e.kind) block " *
@@ -1128,6 +1179,12 @@ function jacobian_term(e::LayoutEntry)
     end
     if e.transform === :floored
         # Stan's lower-bound kernel: the bare unconstrained coordinate
+        # (shared with the constrain edge via structural CSE) — no
+        # truncation normalizer.
+        return coordinate_read(e.offset)
+    end
+    if e.transform === :upper
+        # Stan's upper-bound kernel: the bare unconstrained coordinate
         # (shared with the constrain edge via structural CSE) — no
         # truncation normalizer.
         return coordinate_read(e.offset)

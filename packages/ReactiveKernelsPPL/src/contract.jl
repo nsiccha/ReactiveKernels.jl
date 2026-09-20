@@ -363,13 +363,17 @@ end
 
 A latent's support override: `nothing` (infer from the family), the bare
 `Symbol` `:positive` (half-Normal/half-Cauchy truncation of a real-support
-family, exact +log(2) at a literal-zero location), or the tuple
+family, exact +log(2) at a literal-zero location), the tuple
 `(:interval, lo, hi)` (a two-sided finite truncation `truncated(Normal(mu, s),
 lo, hi)` — an affine-logistic constrained transform onto `(lo, hi)` with the
-renormalized truncated density). Shared by scalar [`SampledParameter`](@ref)s
-and per-cell [`PlateParameter`](@ref)s.
+renormalized truncated density), or the tuple `(:upper, hi)` (an upper-only
+truncation `truncated(Normal(mu, s), -Inf, hi)` — Stan's upper-bound kernel
+`x = hi - exp(u)` with the bare-`u` Jacobian and NO truncation renormalizer).
+Shared by scalar [`SampledParameter`](@ref)s and per-cell
+[`PlateParameter`](@ref)s.
 """
-const SupportOverride = Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64}}
+const SupportOverride =
+    Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64},Tuple{Symbol,Float64}}
 
 """
     SampledParameter(name, family, args, support_override, label)
@@ -379,8 +383,9 @@ One non-coefficient latent (scalar, slice 1). `args` use POSITIONAL keys
 semantics (`Exponential(θ)` = scale θ). Values are literals or
 [`ParamName`](@ref)s (hierarchical OK, cycles rejected). `support_override`
 is a [`SupportOverride`](@ref): `nothing` (infer from family), `:positive`
-(half-Normal/half-Cauchy), or `(:interval, lo, hi)` (a finite truncated
-interval).
+(half-Normal/half-Cauchy), `(:interval, lo, hi)` (a finite truncated
+interval), or `(:upper, hi)` (an upper-only truncation with Stan kernel
+semantics).
 """
 struct SampledParameter
     name::ParamName
@@ -2748,12 +2753,28 @@ end
 # `(:interval, lo, hi)` is a two-sided finite truncation with finite lo < hi;
 # the family must be real-support (a truncated Normal), and the density carries
 # the exact -log(cdf(hi) - cdf(lo)) renormalization at any location.
+# `(:upper, hi)` is an upper-only truncation with a finite hi; the family must
+# be real-support (a truncated Normal), and the density is Stan's upper-bound
+# kernel (plain normal_lpdf plus the bare-`u` Jacobian — NO truncation
+# renormalizer, matching SB which never renormalizes bounds).
 function _validate_support_override(label, family::Symbol,
         ov::SupportOverride, args::NamedTuple)
     ov === nothing && return nothing
     if ov isa Tuple
-        ov[1] === :interval || _fail(label,
-            "tuple support override must be (:interval, lo, hi), got $ov")
+        if ov[1] === :upper
+            length(ov) == 2 || _fail(label,
+                "tuple support override must be (:upper, hi), got $ov")
+            family === :normal || _fail(label,
+                "an :upper override is a truncated Normal in slice 1 " *
+                "(`truncated(Normal(mu, s), -Inf, hi)`); got $family")
+            hi = ov[2]
+            isfinite(hi) || _fail(label,
+                ":upper bound must be finite; got $hi")
+            return nothing
+        end
+        (ov[1] === :interval && length(ov) == 3) || _fail(label,
+            "tuple support override must be (:interval, lo, hi) or " *
+            "(:upper, hi); got $ov")
         family === :normal || _fail(label,
             "an :interval override is a truncated Normal in slice 1 " *
             "(`truncated(Normal(mu, s), lo, hi)`); got $family")

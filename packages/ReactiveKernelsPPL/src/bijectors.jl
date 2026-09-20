@@ -118,3 +118,26 @@ function _prepared_floored_endpoint(lo::Float64, endpoint::Symbol)
         prepare(getproperty(floored_bijector, endpoint); bound = (; lo = lo))
     end
 end
+
+# Ceiled negative (-∞, hi): offset-exp ℝ → (-∞, hi) — Stan's upper-bound
+# kernel (`real<upper=hi>`, SB `normal(mu, s; upper=hi)`): the
+# Jacobian is the bare exp term (`u`), with NO truncation renormalizer
+# (the floored mirror: `x = hi - exp(u)`). `logjac` reads the
+# UNCONSTRAINED value.
+@kernel upper_bijector(hi::Float64) = begin
+    constrain(u::Float64)::Float64 = hi - exp(u)
+    inv(constrain, x::Float64)::Float64 = log(hi - x)
+    unconstrain(x::Float64)::Float64 = inv(constrain, x)
+    logjac(u::Float64)::Float64 = u
+end
+
+# Cache of prepared upper endpoints, keyed by (hi, endpoint): the owner
+# bound is `bound=` into the prepared scalar kernel, so the host call is
+# `k(value)`. Lazy, like `_prepared_endpoint`.
+const _PREPARED_UPPER = Dict{Tuple{Float64,Symbol},Any}()
+
+function _prepared_upper_endpoint(hi::Float64, endpoint::Symbol)
+    get!(_PREPARED_UPPER, (hi, endpoint)) do
+        prepare(getproperty(upper_bijector, endpoint); bound = (; hi = hi))
+    end
+end

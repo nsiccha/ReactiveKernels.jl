@@ -81,9 +81,12 @@ end
     @test support_of(:exponential, nothing) === :positive
     @test support_of(:normal, :positive) === :positive
     @test support_of(:normal, (:interval, -1.0, 2.0)) === :interval
+    @test support_of(:normal, (:upper, 2.0)) === :upper
     @test_throws ContractValidationError support_of(:exponential, :positive)
     # An :interval override needs a real-support family.
     @test_throws ContractValidationError support_of(:exponential, (:interval, 0.0, 1.0))
+    # So does an :upper override.
+    @test_throws ContractValidationError support_of(:exponential, (:upper, 1.0))
     @test_throws ContractValidationError support_of(:nope, nothing)
 end
 
@@ -128,6 +131,17 @@ end
     @test constrain(ilayout, iu).q ≈ xq
     @test unconstrain(ilayout, constrain(ilayout, iu)) ≈ iu
     @test logjac(ilayout, iu) ≈ log(xq - ilo) + log(ihi - xq) - log(ihi - ilo)
+    # Upper support exercises Stan's upper-bound kernel (ceiling on the entry;
+    # the Jacobian is the bare unconstrained value — no renormalizer).
+    uhi = log(0.5)
+    clay = LayoutTable(
+        [LayoutEntry(:sampled, nothing, :c, [:c], 1, 1, :upper, NaN, uhi)], 1)
+    cu = [0.4]
+    xc = uhi - exp(0.4)
+    @test constrain(clay, cu).c ≈ xc
+    @test constrain(clay, cu).c < uhi
+    @test unconstrain(clay, constrain(clay, cu)) ≈ cu
+    @test logjac(clay, cu) ≈ 0.4
     @test_throws ContractValidationError constrain(layout, [1.0])
 end
 
@@ -165,6 +179,15 @@ end
         :(_ppl_int_q::Float64 = log(q - $blo) - log($bhi - q)),
     ]
     @test jacobian_term(ientry) == :(log(q - $blo) + log($bhi - q) - log($bhi - $blo))
+    # Upper transform: parameterized ceiling ⇒ hand-rolled forward/inverse
+    # edges; the Jacobian is the bare unconstrained coordinate (Stan kernel).
+    centry = LayoutEntry(:sampled, nothing, :c, [:c], 4, 1, :upper, NaN, bhi)
+    @test transform_statements(centry) == Expr[
+        :(_ppl_up_c::Float64 = sum(view(unconstrained, 4:4))),
+        :(c::Float64 = $bhi - exp(_ppl_up_c)),
+        :(_ppl_up_c::Float64 = log($bhi - c)),
+    ]
+    @test jacobian_term(centry) == :(sum(view(unconstrained, 4:4)))
     @test coordinate_read(3) == :(sum(view(unconstrained, 3:3)))
     @test block_read(2, 4) == :(view(unconstrained, 2:5))
 end
