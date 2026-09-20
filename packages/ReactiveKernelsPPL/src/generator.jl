@@ -1567,9 +1567,9 @@ end
 # Scalar prior log-density per family via distribution-kernel endpoints
 # (Distributions.jl semantics). Args are literals (inlined) or
 # parameter/assignment refs (body locals, fine in scalar position).
-# Half-Normal/half-Cauchy (the only overrides) renormalize by exactly
-# +log(2) (symmetry at 0). `gamma` takes rate, so the contract's scale
-# inverts.
+# Half-Normal/half-Cauchy renormalize by exactly +log(2) (symmetry at 0);
+# the `:interval`/`:upper` corrections live in `_support_correction`.
+# `gamma` takes rate, so the contract's scale inverts.
 # Shared `<family>(remapped args…).logpdf(x)` for a variate expression `x` (a
 # scalar parameter name, a plate do-var, or a scan setup/recurrence read). Args
 # are literals (inlined) or parameter/assignment/threaded refs. Shared by scalar
@@ -1607,10 +1607,17 @@ end
 # +log(2) (symmetry at literal 0); `(:interval, lo, hi)` (a truncated Normal)
 # renormalizes by -log(cdf(hi) - cdf(lo)) at any location, where `argvals` are the
 # family's (mu, s) argument expressions (literals/refs for a scalar prior, or
-# per-cell do-vars for a plate prior — the CDF endpoints thread identically).
+# per-cell do-vars for a plate prior — the CDF endpoints thread identically);
+# `(:upper, hi)` adds NOTHING — Stan's upper-bound kernel is the plain
+# normal_lpdf plus the bare-`u` Jacobian (the varying-`tau`/`:floored`
+# precedent: SB truncation never renormalizes).
 function _support_correction(ov::SupportOverride, argvals)
     ov === nothing && return nothing
-    if ov isa Tuple  # (:interval, lo, hi) — truncated Normal
+    if ov isa Tuple
+        ov[1] === :upper && return nothing  # Stan kernel semantics
+        ov[1] === :interval || throw(ContractValidationError(
+            "[generator] tuple support override must be (:interval, lo, hi) " *
+            "or (:upper, hi), got $ov"))
         lo, hi = ov[2], ov[3]
         mu, s = argvals[1], argvals[2]
         return :(-log(normal($mu, $s).cdf($hi) - normal($mu, $s).cdf($lo)))
@@ -1620,7 +1627,8 @@ end
 
 # Scalar prior log-density per family via distribution-kernel endpoints
 # (Distributions.jl semantics). The support override adds the +log(2) half or
-# the -log(cdf(hi)-cdf(lo)) truncated-interval renormalization (`_support_correction`).
+# the -log(cdf(hi)-cdf(lo)) truncated-interval renormalization (`_support_correction`;
+# an `:upper` override adds nothing — Stan kernel semantics).
 function _sampled_prior_expr(p::SampledParameter)
     argvals = [v for v in values(p.args)]
     base = _family_logpdf_expr(p.family, argvals, p.name)

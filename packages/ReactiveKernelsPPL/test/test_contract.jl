@@ -773,10 +773,25 @@ end
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :normal,
             (arg1 = :mu, arg2 = :tau), (:interval, 3.0, 1.0))))
-    # A tuple override whose head is not :interval is rejected.
+    # A tuple override whose head is neither :interval nor :upper is rejected.
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :normal,
             (arg1 = :mu, arg2 = :tau), (:bogus, 0.0, 1.0))))
+    # An upper-only (:upper, hi) override on a Normal cell is valid.
+    @test (validate_plan(_re_plan(; plate = PlateParameter(:theta, :normal,
+        (arg1 = :mu, arg2 = :tau), (:upper, 1.0)))); true)
+    # :upper is a truncated Normal — a non-Normal family is rejected.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :cauchy,
+            (arg1 = :mu, arg2 = :tau), (:upper, 1.0))))
+    # :upper bound must be finite.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), (:upper, Inf))))
+    # :upper takes exactly one bound.
+    @test_throws ContractValidationError validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :normal,
+            (arg1 = :mu, arg2 = :tau), (:upper, 0.0, 1.0))))
     # Plate name collides with a scalar parameter.
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:mu, :normal, (arg1 = 0.0, arg2 = 1.0),

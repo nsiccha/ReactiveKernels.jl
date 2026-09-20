@@ -5591,17 +5591,28 @@ function _lower_half_param(lhs, rhs, fam, coefuse, matrices)
         lhs)
 end
 
-# A literal truncation bound: `Inf`/`-Inf` (as the `:Inf` symbol or a Real
-# infinity) or a finite Real; a name/expression is rejected (bounds are constant,
-# independent of the cell position).
-_truncation_bound(lhs, b) = b === :Inf ? Inf :
-    (b isa Real ? Float64(b) : _sfail(
+# A literal truncation bound: `Inf`/`-Inf` (as the `:Inf` symbol, a signed
+# `:Inf` call (`-Inf`/`+Inf` AST), or a Real infinity) or a finite Real; a
+# name/expression is rejected (bounds are constant, independent of the cell
+# position).
+function _truncation_bound(lhs, b)
+    b === :Inf && return Inf
+    b isa Real && return Float64(b)
+    if b isa Expr && b.head === :call && length(b.args) == 2 && b.args[2] === :Inf
+        b.args[1] === :- && return -Inf
+        b.args[1] === :+ && return Inf
+    end
+    return _sfail(
         "parameter $lhs: truncation bounds must be literals " *
-        "(a finite Real or Inf), got $(repr(b))"))
+        "(a finite Real or ±Inf), got $(repr(b))")
+end
 
 # Parameter truncation lowers to a support override: `truncated(Normal(0, s), 0,
-# Inf)` (a half at a literal-zero location) → `:positive` (exact +log(2)), and a
-# two-sided FINITE `truncated(Normal(mu, s), lo, hi)` → `(:interval, lo, hi)` (an
+# Inf)` (a half at a literal-zero location) → `:positive` (exact +log(2)); an
+# upper-only `truncated(Normal(mu, s), -Inf, hi)` → `(:upper, hi)` (Stan's
+# upper-bound kernel `x = hi - exp(u)`, bare-`u` Jacobian, NO truncation
+# renormalizer — Normal-only, any location); and a two-sided FINITE
+# `truncated(Normal(mu, s), lo, hi)` → `(:interval, lo, hi)` (an
 # affine-logistic constrained transform with the exact -log(cdf(hi)-cdf(lo))
 # renormalization; Normal-only, any location). Bounds are literals.
 function _lower_truncated_param(lhs, rhs, coefuse, matrices)
@@ -5633,12 +5644,22 @@ function _lower_truncated_param(lhs, rhs, coefuse, matrices)
         return SampledParameter(lhs, base,
             (arg1 = vals[1], arg2 = vals[2]), :positive, lhs)
     end
+    # Upper-only truncation → Stan's upper-bound kernel (Normal-only in
+    # slice 1). A finite LOWER-only bound stays rejected (no one-sided
+    # lower support exists on the scalar path yet).
+    if isinf(lo) && lo < 0 && isfinite(hi)
+        fam === :Normal || _sfail(
+            "parameter $lhs: an upper-only truncation is Normal-only in slice 1 " *
+            "(`truncated(Normal(mu, s), -Inf, hi)`); got $fam")
+        return SampledParameter(lhs, base,
+            (arg1 = vals[1], arg2 = vals[2]), (:upper, hi), lhs)
+    end
     # Two-sided FINITE interval → affine-logistic transform + truncated-Normal
-    # renormalization (Normal-only in slice 1). One-sided finite bounds are
-    # planned (they need a one-sided cdf renorm on the exp transform).
+    # renormalization (Normal-only in slice 1).
     (isfinite(lo) && isfinite(hi)) || _sfail(
         "parameter $lhs: one-sided truncation is slice-1 only as `[0, Inf)` at a " *
-        "zero location (`HalfNormal(s)`); use finite bounds " *
+        "zero location (`HalfNormal(s)`) or upper-only " *
+        "(`truncated(Normal(mu, s), -Inf, hi)`); use finite bounds " *
         "(`truncated(Normal(mu, s), lo, hi)`) otherwise")
     fam === :Normal || _sfail(
         "parameter $lhs: a finite truncated interval is Normal-only in slice 1 " *

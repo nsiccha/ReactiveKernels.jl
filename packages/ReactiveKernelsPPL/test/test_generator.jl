@@ -859,6 +859,81 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+# An upper-only scalar latent (the TGI threshold-prior shape) carries Stan's
+# upper-bound kernel: plain normal_lpdf (NO -log(cdf) renormalization) plus
+# the bare-`u` Jacobian. Oracle is Distributions.jl plain `Normal`.
+@testset "upper-truncated scalar latent end to end" begin
+    hi = log(0.5)
+    x = [0.5, -1.0, 0.25, 1.5, -0.75, 0.0]
+    y = [0.3, 1.2, -0.5, 2.1, 0.0, 1.7]
+    cols = Dict{Symbol,AbstractVector}(:x => x, :y => y)
+    expr = Expr(:block,
+        :(tgi_c_cr ~ truncated(Normal(-2.3, 1.0), -Inf, $hi)),
+        :(mu = a .+ b .* x),
+        :(y .~ Normal.(mu, s)),
+        :(s ~ Exponential(1)))
+    plan = bind_data(lower_rkppl(expr, (:y, :x)), cols)
+    built = build_kernel(plan)
+    @test built.layout.total == 4 # a, b, tgi_c_cr, s
+    u = [0.3, -0.2, 0.1, 0.25]
+    nt = constrain(built.layout, u)
+    a, b, c, s = nt.mu[1], nt.mu[2], nt.tgi_c_cr, nt.s
+    @test c ≈ hi - exp(u[3])
+    @test c < hi
+    mu = a .+ b .* x
+    ll = sum(logpdf.(Normal.(mu, s), y))
+    pr = logpdf(Normal(0, 1), a) + logpdf(Normal(0, 1), b) +
+        logpdf(Normal(-2.3, 1.0), c) + logpdf(Exponential(1), s)
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3] + u[4]
+    _check_gradient(built.spec, plan, u)
+    # The untruncated interim is density-exact on the support interior: same
+    # constrained value ⇒ same prior; the posterior differs by exactly the
+    # Jacobian `u` (snag thin-layer-upper-c3c06483).
+    interim = bind_data(lower_rkppl(Expr(:block,
+            :(tgi_c_cr ~ Normal(-2.3, 1.0)),
+            :(mu = a .+ b .* x),
+            :(y .~ Normal.(mu, s)),
+            :(s ~ Exponential(1))), (:y, :x)), cols)
+    built_i = build_kernel(interim)
+    u_i = [u[1], u[2], c, u[4]]
+    @test _query(built.spec, plan, :prior, u) ≈
+        _query(built_i.spec, interim, :prior, u_i)
+    @test (_query(built.spec, plan, :posterior, u) -
+           _query(built_i.spec, interim, :posterior, u_i)) ≈ u[3]
+end
+
+@testset "plate parameter upper-truncated latent" begin
+    y = [0.3, 1.2, -0.5, 2.1, 0.0, 1.7]
+    n = length(y)
+    hi = 2.0
+    expr = Expr(:block,
+        :(mu ~ Normal(0, 3)),
+        :(tau ~ HalfNormal(2)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ truncated(Normal(mu, tau), -Inf, $hi)),
+                    :(y[i] ~ Normal.(theta[i], 1.0))))))
+    plan = bind_data(lower_rkppl(expr, (:y,)),
+        Dict{Symbol,AbstractVector}(:y => y))
+    built = build_kernel(plan)
+    @test built.layout.total == 2 + n
+    u = vcat([0.3, 0.2], [0.1, -0.4, 0.7, -0.2, 0.5, 0.0])
+    nt = constrain(built.layout, u)
+    mu, tau, theta = nt.mu, nt.tau, Vector(nt.theta)
+    @test all(t -> t < hi, theta)
+    ll = sum(logpdf.(Normal.(theta, 1.0), y))
+    pr = logpdf(Normal(0, 3), mu) + (logpdf(Normal(0, 2), tau) + log(2)) +
+        sum(logpdf.(Normal.(mu, tau), theta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    # log-jacobian: exp for tau (u[2]) + bare-u per theta cell.
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[2] + sum(u[3:end])
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "scan: centered AR(1) end to end" begin
     m = @rkppl begin
         phi ~ Normal(0, 1)
@@ -1531,4 +1606,28 @@ end
     pl = plan(spec; want = :posterior)
     @test prepare(pl)([u]) ≈ x + lj
     @test !occursin("interval_bijector", sprint(show, code_expr(pl)))
+end
+
+# The parameterized upper_bijector(hi) library entry (the floored mirror).
+# Endpoints are the offset-exp ℝ→(-∞,hi) map (`hi - exp(u)`, Stan's
+# upper-bound kernel); the host prepares them with the bound `bound=` in, the
+# generator splices them with a literal bound. The log-Jacobian is the bare
+# `u` — no truncation renormalizer.
+@testset "upper_bijector library entry" begin
+    hi, u = 2.0, 0.3
+    x = hi - exp(u)
+    # host-prepared endpoints (bound bound in) match the offset-exp math
+    @test ReactiveKernelsPPL._prepared_upper_endpoint(hi, :constrain)(u) ≈ x
+    @test ReactiveKernelsPPL._prepared_upper_endpoint(hi, :logjac)(u) ≈ u
+    @test ReactiveKernelsPPL._prepared_upper_endpoint(hi, :unconstrain)(x) ≈ u
+    @test ReactiveKernelsPPL._prepared_upper_endpoint(hi, :constrain)(u) < hi
+    # graph splice with a literal bound inlines (no runtime call) and evaluates
+    spec = @kernel _utest(unconstrained::Vector{Float64}) = begin
+        q::Float64 = upper_bijector(2.0).constrain(sum(view(unconstrained, 1:1)))
+        qlj::Float64 = upper_bijector(2.0).logjac(sum(view(unconstrained, 1:1)))
+        posterior::Float64 = q + qlj
+    end
+    pl = plan(spec; want = :posterior)
+    @test prepare(pl)([u]) ≈ x + u
+    @test !occursin("upper_bijector", sprint(show, code_expr(pl)))
 end
