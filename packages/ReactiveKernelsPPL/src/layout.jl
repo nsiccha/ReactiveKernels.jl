@@ -72,7 +72,7 @@ coefficient-vector block (`beta_raw`). `lo` is the constrained lower
 bound of an `:interval`/`:floored` transform (`:interval` also sets
 `hi`; an `:upper` transform sets `hi` only; `NaN` otherwise)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :varying | :varying_corr | :cholesky_corr | :hsgp
+    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :varying | :varying_corr | :cholesky_corr | :hsgp | :glm
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
@@ -116,6 +116,27 @@ function assign_layout(plan::StructuralPlan)
             LayoutEntry(:coefficient, pred.name, block_name(pred.name), labels,
                 offset, shape.width, :identity))
         offset += shape.width
+    end
+    # GLM-object coefficient vectors: one contiguous identity block per
+    # response matrix (Normal priors on the real line). Width is static
+    # from the intercept-free matrix; a beta shared across responses must
+    # agree on width.
+    glm_widths = Dict{Symbol,Int}()
+    for r in plan.responses
+        _is_glm_family(r.family) || continue
+        m = _find_matrix(plan, r.predictor)
+        K = count(c -> c !== nothing, m.columns)
+        if haskey(glm_widths, r.glm_beta)
+            glm_widths[r.glm_beta] == K || throw(ContractValidationError(
+                "[layout] GLM coefficient vector $(r.glm_beta) sizes $K " *
+                "under $(r.label) but $(glm_widths[r.glm_beta]) elsewhere"))
+            continue
+        end
+        glm_widths[r.glm_beta] = K
+        push!(entries,
+            LayoutEntry(:glm, nothing, r.glm_beta, [r.glm_beta], offset, K,
+                :identity, NaN, NaN))
+        offset += K
     end
     for p in plan.parameters
         transform, lo, hi = _entry_transform(p.family, p.support_override)
@@ -694,7 +715,7 @@ function coordinate_names(layout::LayoutTable)
                 push!(names, Symbol(string(e.predictor) * "." * string(label)))
             end
         elseif e.kind === :plate || e.kind === :spline ||
-               e.kind === :varying || e.kind === :hsgp
+               e.kind === :varying || e.kind === :hsgp || e.kind === :glm
             for i in 1:e.size
                 push!(names, Symbol(string(e.name) * "." * string(i)))
             end
@@ -733,7 +754,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         if e.kind === :coefficient
             push!(pairs, e.predictor => Vector{Float64}(seg))
         elseif e.kind === :plate || e.kind === :spline ||
-               e.kind === :varying || e.kind === :hsgp
+               e.kind === :varying || e.kind === :hsgp || e.kind === :glm
             v = [_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name => v)
         elseif e.kind === :scan
@@ -807,10 +828,11 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             )
             u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
         elseif e.kind === :plate || e.kind === :spline ||
-               e.kind === :varying || e.kind === :hsgp
+               e.kind === :varying || e.kind === :hsgp || e.kind === :glm
             what = e.kind === :plate ? "plate parameter" :
                 e.kind === :spline ? "spline vector" :
-                e.kind === :varying ? "varying vector" : "hsgp vector"
+                e.kind === :varying ? "varying vector" :
+                e.kind === :glm ? "GLM coefficient vector" : "hsgp vector"
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing $what $(e.name)"),
             )
@@ -993,7 +1015,7 @@ function transform_statements(e::LayoutEntry)
             view(unconstrained, $lo:$hi))]
     end
     if e.kind === :plate || e.kind === :spline ||
-       e.kind === :varying || e.kind === :hsgp
+       e.kind === :varying || e.kind === :hsgp || e.kind === :glm
         # Spline vectors ride the plate transform path (block + scalar
         # endpoints); the contract pins their supports to real/positive,
         # so the :interval arm below is unreachable for them. Varying
@@ -1289,7 +1311,7 @@ function jacobian_term(e::LayoutEntry)
         return foldl((a, b) -> :($a + $b), terms)
     end
     if e.kind === :plate || e.kind === :spline ||
-       e.kind === :varying || e.kind === :hsgp
+       e.kind === :varying || e.kind === :hsgp || e.kind === :glm
         # Interval/upper plates hand-roll the per-cell Jacobian sum
         # (parameterized bounds, no companion `logjac` plate); every registry
         # transform sums its companion `logjac` plate from

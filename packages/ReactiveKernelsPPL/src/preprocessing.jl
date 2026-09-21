@@ -379,6 +379,18 @@ function preprocessing_recipes(plan::StructuralPlan)
         off = offset_recipe(shape)
         off !== nothing && push!(stmts, off)
     end
+    # GLM-object response matrices: one `X = Float64.(hcat(...))` recipe
+    # per matrix (emitted once, shared across responses). Columns are
+    # data-only, so the assembly folds at prepare; the object branch
+    # prepends its own ones column downstream.
+    seen_matrices = Set{Symbol}()
+    for r in plan.responses
+        _is_glm_family(r.family) || continue
+        r.predictor in seen_matrices && continue
+        push!(seen_matrices, r.predictor)
+        m = _find_matrix(plan, r.predictor)
+        push!(stmts, :($(m.name) = Float64.(hcat($(m.columns...)))))
+    end
     return stmts
 end
 

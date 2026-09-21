@@ -190,6 +190,47 @@ end
     @test mixed_destination[2][] ≈ mixed_gradient[2]
 end
 
+isdefined(@__MODULE__, :AuthoredPlateChains) ||
+    include(joinpath(@__DIR__, "fixtures", "authored_plate_chains.jl"))
+
+# Authored plates under NA reverse AD take the AD-only scalar loop with the
+# cell kernel hoisted to a direct literal (`_ad_na_plate_loop!`): calling the
+# closure-held nested kernel trips Enzyme static activity analysis. Single
+# (`flat`) and chained (`chain`) plates agree with dataflow, the analytic
+# gradient, and central differences, with size-invariant allocations.
+@testset "prepare_ad over NonAllocatingKernel with authored plates" begin
+    C = AuthoredPlateChains
+    q = [0.7]
+    for (tag, spec) in (("chain", C.chain), ("flat", C.flat))
+        n = 32
+        x = collect(range(-1.0, 1.0; length = n))
+        y = fill(0.3, n)
+        kb = prepare(spec; bound = (; x, y))
+        kbna = prepare_nonallocating(kb)
+        prep = prepare_ad(kb, NA_AD_BACKEND, q; active = :q)
+        prepna = prepare_ad(kbna, NA_AD_BACKEND, q; active = :q)
+        g, gna = zeros(1), zeros(1)
+        v, _ = ad_value_and_gradient!(prep, g, q)
+        vna, _ = ad_value_and_gradient!(prepna, gna, q)
+        @test vna ≈ v
+        @test kbna(q) ≈ v
+        @test gna ≈ g
+        @test only(gna) ≈ -sum((only(q) .* x .- y) .* x)
+        @test naad_findiff(kb, q) ≈ gna rtol = 1e-4
+    end
+    small, big = 8, 64
+    alloc_bytes = map((small, big)) do n
+        x = collect(range(-1.0, 1.0; length = n))
+        y = fill(0.3, n)
+        kbna = prepare_nonallocating(prepare(C.flat; bound = (; x, y)))
+        prepna = prepare_ad(kbna, NA_AD_BACKEND, q; active = :q)
+        gna = zeros(1)
+        ad_value_and_gradient!(prepna, gna, q)
+        @allocated ad_value_and_gradient!(prepna, gna, q)
+    end
+    @test alloc_bytes[1] == alloc_bytes[2]
+end
+
 fscale_naad(a, b) = a * b
 
 @testset "decomposed non-allocating gradient allocates ~nothing" begin
