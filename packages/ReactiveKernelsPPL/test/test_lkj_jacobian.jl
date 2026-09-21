@@ -43,9 +43,27 @@ end
 end
 
 @testset "lkj jacobian K=2 closed form" begin
-    # theta = pi*sigmoid(t); the (i-j) = 1 exponent keeps one log-sin term.
+    # Vine: log|J| = log(1-tanh(t)^2).
+    t = 0.7
+    @test lkj_chol_logjac([t], 2) ≈ log(1 - tanh(t)^2)
+    @test lkj_chol_constrain([t], 2) ≈ [1.0 0.0; tanh(t) sqrt(1 - tanh(t)^2)]
+    @test lkj_chol_unconstrain(lkj_chol_constrain([t], 2), 2) ≈ [t]
+end
+
+@testset "lkj hyperspherical retention" begin
+    # The retained alternative: roundtrip + its own K=2 closed form
+    # (theta = pi*sigmoid(t); the (i-j) = 1 exponent keeps one log-sin
+    # term). Not wired into any layout.
+    for (K, u) in ((2, [0.3]), (3, [0.3, -0.5, 0.7]))
+        L = lkj_chol_constrain_hyperspherical(u, K)
+        @test size(L) == (K, K)
+        for i in 1:K
+            @test sum(L[i, 1:i] .^ 2) ≈ 1.0
+        end
+        @test lkj_chol_unconstrain_hyperspherical(L, K) ≈ u
+    end
     t = 0.7
     s = 1.0 / (1.0 + exp(-t))
-    @test lkj_chol_logjac([t], 2) ≈
+    @test lkj_chol_logjac_hyperspherical([t], 2) ≈
         log(sin(pi * s)) + log(pi) + log(s) + log1p(-s)
 end

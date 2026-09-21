@@ -434,17 +434,115 @@ end
 """
     lkj_chol_constrain(u, K) -> Matrix{Float64}
 
-Host-side LKJ Cholesky-factor transform (thin-layer-owned
-parameterization — NOT Stan's partial-correlation vine; contract:
-the middle layer owns layout+transforms). Row 1 is `[1, 0, ...]`;
-row `i >= 2` is a unit vector from `i-1` logistic angles
-`theta = pi*sigma(u)` packed row-major:
-`L[i,j] = cos(theta_j) * prod(sin(theta[1:j-1]))`,
-`L[i,i] = prod(sin(theta))`. Above-diagonal stays zero. The in-graph
-twin unrolls the identical scalar chain (left-assoc products), so
-host and graph agree bit-for-bit. K=1 constrains `[]` to `[1.0]`.
+Host-side LKJ Cholesky-factor transform: Stan's partial-correlation
+C-vine VERBATIM (user direction — follow Stan where possible; the
+hyperspherical form survives as `lkj_chol_constrain_hyperspherical`).
+Packed column-block order `for j in 2:K, i in 1:(j-1)` (Stan's
+unconstrained order): `z[i,j] = tanh(u)`, upper factor
+`w[1,j] = z[1,j]`, `w[i,j] = z[i,j]*Π_{ip<i}√(1-z[ip,j]²)`,
+`w[i,i] = Π_{ip<i}√(1-z[ip,i]²)`, `L = w'`. The in-graph twin unrolls
+the identical scalar chain (left-assoc products, explicit loops —
+NOT `prod`, whose association is not left-assoc), so host and graph
+agree bit-for-bit. K=1 constrains `[]` to `[1.0]`.
 """
 function lkj_chol_constrain(u::AbstractVector{<:Real}, K::Int)
+    K >= 1 || throw(ContractValidationError(
+        "[layout] LKJ margin count K=$K < 1"))
+    length(u) == K * (K - 1) ÷ 2 || throw(ContractValidationError(
+        "[layout] LKJ packed length $(length(u)) ≠ $K*$(K-1)/2"))
+    z = zeros(Float64, K, K)
+    p = 0
+    for j in 2:K, i in 1:(j - 1)
+        p += 1
+        z[i, j] = tanh(Float64(u[p]))
+    end
+    w = zeros(Float64, K, K)
+    w[1, 1] = 1.0
+    for j in 2:K
+        w[1, j] = z[1, j]
+    end
+    for i in 2:K
+        for j in (i + 1):K
+            v = z[i, j]
+            for ip in 1:(i - 1)
+                v *= sqrt(1 - z[ip, j]^2)
+            end
+            w[i, j] = v
+        end
+        d = 1.0
+        for ip in 1:(i - 1)
+            d *= sqrt(1 - z[ip, i]^2)
+        end
+        w[i, i] = d
+    end
+    return Matrix(w')
+end
+
+"""Inverse of [`lkj_chol_constrain`](@ref): sequential vine inversion
+(`w = L'`; `z[1,j] = w[1,j]`; `z[i,j] = w[i,j]/Π_{ip<i}√(1-z[ip,j]²)`),
+then `u = atanh(z)`. Loud on non-square input, non-positive
+diagonals, and out-of-`(-1,1)` partials (not a Cholesky factor)."""
+function lkj_chol_unconstrain(L::AbstractMatrix{<:Real}, K::Int)
+    size(L) == (K, K) || throw(ContractValidationError(
+        "[layout] LKJ factor size $(size(L)) ≠ ($K, $K)"))
+    for i in 1:K
+        Float64(L[i, i]) > 0 || throw(ContractValidationError(
+            "[layout] LKJ factor has a non-positive diagonal " *
+            "(not a Cholesky factor)"))
+    end
+    z = zeros(Float64, K, K)
+    for j in 2:K
+        z[1, j] = Float64(L[j, 1])
+    end
+    for i in 2:K, j in (i + 1):K
+        d = 1.0
+        for ip in 1:(i - 1)
+            d *= sqrt(1 - z[ip, j]^2)
+        end
+        z[i, j] = Float64(L[j, i]) / d
+    end
+    u = Vector{Float64}(undef, K * (K - 1) ÷ 2)
+    p = 0
+    for j in 2:K, i in 1:(j - 1)
+        p += 1
+        abs(z[i, j]) < 1 || throw(ContractValidationError(
+            "[layout] LKJ partial z[$i,$j] leaves (-1,1) " *
+            "(not a Cholesky factor)"))
+        u[p] = atanh(z[i, j])
+    end
+    return u
+end
+
+"""Log-Jacobian of [`lkj_chol_constrain`](@ref): Stan's vine
+`Σ_{i<j}((j-i+1)/2)·log(1-z[i,j]²)` with `z = tanh(u)` (the L→L'
+Jacobian plus the tanh terms — NOT the manual's corr_matrix formula,
+which carries the L→LL' step too). FD-verified. The in-graph twin
+unrolls the identical sum over the shared z temps, so host and graph
+agree bit-for-bit. K=2: `log(1-tanh(u)²)`."""
+function lkj_chol_logjac(u::AbstractVector{<:Real}, K::Int)
+    length(u) == K * (K - 1) ÷ 2 || throw(ContractValidationError(
+        "[layout] LKJ packed length $(length(u)) ≠ $K*$(K-1)/2"))
+    total = 0.0
+    p = 0
+    for j in 2:K, i in 1:(j - 1)
+        p += 1
+        z = tanh(Float64(u[p]))
+        total += ((j - i + 1) / 2) * log(1 - z^2)
+    end
+    return total
+end
+
+"""
+    lkj_chol_constrain_hyperspherical(u, K) -> Matrix{Float64}
+
+RETAINED alternative to [`lkj_chol_constrain`](@ref) (the pre-vine
+thin-layer-owned parameterization): row `i >= 2` is a unit vector
+from `i-1` logistic angles `theta = pi*sigma(u)` packed ROW-major:
+`L[i,j] = cos(theta_j) * prod(sin(theta[1:j-1]))`,
+`L[i,i] = prod(sin(theta))`. Valid density, same constrained space —
+kept for comparison, not wired into any layout.
+"""
+function lkj_chol_constrain_hyperspherical(u::AbstractVector{<:Real}, K::Int)
     K >= 1 || throw(ContractValidationError(
         "[layout] LKJ margin count K=$K < 1"))
     length(u) == K * (K - 1) ÷ 2 || throw(ContractValidationError(
@@ -475,11 +573,11 @@ function lkj_chol_constrain(u::AbstractVector{<:Real}, K::Int)
     return L
 end
 
-"""Inverse of [`lkj_chol_constrain`](@ref): hyperspherical inversion
-per row (`theta_j = atan(hypot(row[j+1:i]), row[j])`), then
-`u = log(theta) - log(pi - theta)`. Loud outside the hemisphere
-(non-positive diagonal) and on non-square input."""
-function lkj_chol_unconstrain(L::AbstractMatrix{<:Real}, K::Int)
+"""Inverse of [`lkj_chol_constrain_hyperspherical`](@ref):
+hyperspherical inversion per row
+(`theta_j = atan(hypot(row[j+1:i]), row[j])`), then
+`u = log(theta) - log(pi - theta)`."""
+function lkj_chol_unconstrain_hyperspherical(L::AbstractMatrix{<:Real}, K::Int)
     size(L) == (K, K) || throw(ContractValidationError(
         "[layout] LKJ factor size $(size(L)) ≠ ($K, $K)"))
     u = Vector{Float64}(undef, K * (K - 1) ÷ 2)
@@ -498,14 +596,10 @@ function lkj_chol_unconstrain(L::AbstractMatrix{<:Real}, K::Int)
     return u
 end
 
-"""Log-Jacobian of [`lkj_chol_constrain`](@ref): per-angle Gram factor
-`(i-j)*log(sin theta)` (the correlation-matrix volume element the
-Stan-verbatim `lkj_corr_cholesky_logpdf` is a density against — one
-more log-sin per angle than the hyperspherical sphere-volume
-exponent) + logistic `log(pi) + log(s) + log1p(-s)`, summed
-row-major. The in-graph twin unrolls the identical sum over the
-named theta/sigma temps, so host and graph agree bit-for-bit."""
-function lkj_chol_logjac(u::AbstractVector{<:Real}, K::Int)
+"""Log-Jacobian of [`lkj_chol_constrain_hyperspherical`](@ref):
+per-angle `(i-j)*log(sin theta)` + logistic
+`log(pi) + log(s) + log1p(-s)`, summed row-major."""
+function lkj_chol_logjac_hyperspherical(u::AbstractVector{<:Real}, K::Int)
     length(u) == K * (K - 1) ÷ 2 || throw(ContractValidationError(
         "[layout] LKJ packed length $(length(u)) ≠ $K*$(K-1)/2"))
     total = 0.0
@@ -911,8 +1005,8 @@ function transform_statements(e::LayoutEntry)
         return _vector_transform_statements(e)
     end
     if e.kind === :varying_corr || e.kind === :cholesky_corr
-        # Both LKJ-factor kinds share the scalar-unrolled hyperspherical
-        # twin (name/size-keyed `_ppl_rl_` temps — kind-agnostic).
+        # Both LKJ-factor kinds share the scalar-unrolled vine twin
+        # (name/size-keyed `_ppl_rl_` temps — kind-agnostic).
         return _lkj_corr_transform_statements(e)
     end
     o = e.offset
@@ -1096,42 +1190,49 @@ end
 # `_ppl_rsg_<L>_<i>_<j>` (sigma(u)), `_ppl_rth_<L>_<i>_<j>` (theta).
 # All `_ppl_`-hygienic.
 _rl_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rl_, L, :_, i, :_, j)
-_rsg_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rsg_, L, :_, i, :_, j)
-_rth_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rth_, L, :_, i, :_, j)
+_rzb_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rzb_, L, :_, i, :_, j)
 
-# LKJ Cholesky edges: scalar-unrolled twin of the host
+# LKJ Cholesky edges: scalar-unrolled twin of the host vine
 # `lkj_chol_constrain` (IDENTICAL scalar ops in the IDENTICAL order —
-# left-assoc products, `pi`/`log(pi)` precomputed host-side literals —
-# so in-graph and host agree bit-for-bit). No matrix ever
-# materializes: the effect reads the `_ppl_rl_` scalars directly
-# (fully transparent to the planner and the reverse pass — no new
-# Enzyme surface). K=1 emits its constant `[1.0]` edge only.
+# `tanh`/`sqrt` calls, `^2`, left-assoc products — so in-graph and
+# host agree bit-for-bit). No matrix ever materializes: the effect
+# reads the `_ppl_rl_` scalars directly (fully transparent to the
+# planner and the reverse pass — no new Enzyme surface). The `_ppl_rzb_`
+# partial temps are shared with the log-Jacobian twin. K=1 emits its
+# constant `[1.0]` edge only.
 function _lkj_corr_transform_statements(e::LayoutEntry)
     K = _lkj_dim(e.size)
     L = e.name
     stmts = Expr[:($(_rl_name(L, 1, 1))::Float64 = 1.0)]
-    PI = Float64(pi)
+    K == 1 && return stmts
+    # Partials in column-block packing order (Stan's unconstrained
+    # order — the p-th coordinate is z[i,j] for j in 2:K, i in 1:j-1).
     p = 0
+    for j in 2:K, i in 1:(j - 1)
+        p += 1
+        coord = coordinate_read(e.offset + p - 1)
+        z = _rzb_name(L, i, j)
+        push!(stmts, :($z::Float64 = tanh($coord)))
+    end
+    # L[j,1] = z[1,j]; L[j,i] = z[i,j]*Π√(1-z²); L[i,i] = Π√(1-z²).
+    for j in 2:K
+        push!(stmts, :($(_rl_name(L, j, 1))::Float64 =
+            $(_rzb_name(L, 1, j))))
+    end
     for i in 2:K
-        for j in 1:i-1
-            p += 1
-            coord = coordinate_read(e.offset + p - 1)
-            s = _rsg_name(L, i, j)
-            t = _rth_name(L, i, j)
-            push!(stmts, :($s::Float64 = 1.0 / (1.0 + exp(-$coord))))
-            push!(stmts, :($t::Float64 = $PI * $s))
-        end
-        for j in 1:i-1
-            factors = Any[:(cos($(_rth_name(L, i, j))))]
-            for m in 1:j-1
-                push!(factors, :(sin($(_rth_name(L, i, m)))))
+        for j in (i + 1):K
+            factors = Any[_rzb_name(L, i, j)]
+            for ip in 1:(i - 1)
+                zt = _rzb_name(L, ip, j)
+                push!(factors, :(sqrt(1 - $zt^2)))
             end
             prod = foldl((a, b) -> :($a * $b), factors)
-            push!(stmts, :($(_rl_name(L, i, j))::Float64 = $prod))
+            push!(stmts, :($(_rl_name(L, j, i))::Float64 = $prod))
         end
         dfactors = Any[1.0]
-        for m in 1:i-1
-            push!(dfactors, :(sin($(_rth_name(L, i, m)))))
+        for ip in 1:(i - 1)
+            zt = _rzb_name(L, ip, i)
+            push!(dfactors, :(sqrt(1 - $zt^2)))
         end
         dprod = foldl((a, b) -> :($a * $b), dfactors)
         push!(stmts, :($(_rl_name(L, i, i))::Float64 = $dprod))
@@ -1149,7 +1250,7 @@ latent (plate) block sums its companion `logjac` plate (`_plate_logjac_name`);
 a leveled vector entry sums its unrolled twin of the host
 `ordered_logjac`/`simplex_logjac` (shared coordinates via CSE); an LKJ
 entry sums its unrolled twin of the host `lkj_chol_logjac` (named
-theta/sigma temps, shared with the constrain edges).
+partial temps, shared with the constrain edges).
 """
 function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing
@@ -1160,13 +1261,11 @@ function jacobian_term(e::LayoutEntry)
         K = _lkj_dim(e.size)
         K == 1 && return nothing
         L = e.name
-        LOGPI = log(Float64(pi))
         terms = Any[]
-        for i in 2:K, j in 1:i-1
-            s = _rsg_name(L, i, j)
-            t = _rth_name(L, i, j)
-            push!(terms, :($(i - j) * log(sin($t)) + $LOGPI + log($s) +
-                log1p(-$s)))
+        for j in 2:K, i in 1:(j - 1)
+            z = _rzb_name(L, i, j)
+            w = (j - i + 1) / 2
+            push!(terms, :($w * log(1 - $z^2)))
         end
         return foldl((a, b) -> :($a + $b), terms)
     end

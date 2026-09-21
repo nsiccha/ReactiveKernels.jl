@@ -54,7 +54,9 @@ export LayoutTable, LayoutEntry, assign_layout, coordinate_names
 export constrain, unconstrain, logjac, support_of
 export ordered_constrain, ordered_unconstrain, ordered_logjac
 export simplex_constrain, simplex_unconstrain, simplex_logjac
-export lkj_chol_constrain, lkj_chol_unconstrain, lkj_chol_logjac
+export lkj_chol_constrain, lkj_chol_unconstrain, lkj_chol_logjac,
+    lkj_chol_constrain_hyperspherical, lkj_chol_unconstrain_hyperspherical,
+    lkj_chol_logjac_hyperspherical
 export lkj_logconst, lkj_corr_cholesky_logpdf
 export positive_bijector, unit_bijector, interval_bijector, floored_bijector,
     upper_bijector, BIJECTORS
