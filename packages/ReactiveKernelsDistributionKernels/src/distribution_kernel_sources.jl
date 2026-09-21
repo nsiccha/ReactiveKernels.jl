@@ -1,6 +1,14 @@
 module DistributionKernelSources
 
 using ReactiveKernels
+using EnzymeCore
+using LinearAlgebra
+using LoopVectorization
+import LogExpFunctions
+using SpecialFunctions: digamma, loggamma
+
+include("glm_likelihoods.jl")
+include("glm_rules.jl")
 
 export LOCATION_SCALE_SOURCE
 export standard_normal, standard_cauchy, standard_laplace, standard_student_t
@@ -20,6 +28,12 @@ export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial, negative_binomial2
 export inverse_gamma, dirichlet, lkj_corr_cholesky
+export BERNOULLI_LOGIT_GLM_KERNEL_SOURCE, BERNOULLI_LOGIT_GLM_SOURCE
+export bernoulli_logit_glm
+export POISSON_LOG_GLM_KERNEL_SOURCE, POISSON_LOG_GLM_SOURCE
+export poisson_log_glm
+export NORMAL_ID_GLM_KERNEL_SOURCE, NORMAL_ID_GLM_SOURCE
+export normal_id_glm
 export NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE
 export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 export BERNOULLI_SOURCE, LOGNORMAL_SOURCE
@@ -1167,5 +1181,9 @@ function _gp_potrf!(L::Matrix{Float64})
     end
     return L
 end
+
+# GLM objects last: their sources evaluate through _evaluate_source_bindings
+# (defined above) and call the _glm_* likelihoods (included at the top).
+include("glm_kernel_sources.jl")
 
 end # module DistributionKernelSources

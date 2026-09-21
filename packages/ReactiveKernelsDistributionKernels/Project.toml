@@ -4,20 +4,29 @@ authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
 version = "0.1.0"
 
 [deps]
+EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
+LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
 ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 
 [compat]
+DifferentiationInterface = "0.7"
+Enzyme = "0.13"
+EnzymeCore = "0.8"
 LogExpFunctions = "0.3"
+LoopVectorization = "0.12"
 ReactiveKernels = "0.1"
 SpecialFunctions = "2"
 julia = "1.10"
 
 [extras]
+ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
+DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Distributions", "Test"]
+test = ["ADTypes", "DifferentiationInterface", "Distributions", "Enzyme", "Test"]
