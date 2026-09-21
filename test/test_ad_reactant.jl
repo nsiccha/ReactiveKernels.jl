@@ -221,6 +221,83 @@ include("test_ad_fused_reactant.jl")
         @test Float64(compiled_value) ≈ value
         @test Array(compiled_gradient) ≈ reference
     end
+
+    # reactant-full-pr-f9f453e4: a 2-deep chain over a strided slice
+    # miscompiles under Reactant's default pipeline (`slice_slice` fuses the
+    # nested slices into a shape that breaks `slice_elementwise` with an
+    # invalid slice, or Enzyme's reverse with a mismatched add, SIGABRTing
+    # the compile). The `:no_slice_slice` pipeline compiles it with
+    # native-identical results. (The default-pipeline crash is fatal, so only
+    # the workaround path is asserted here.)
+    @testset "chained strided-slice consumers (:no_slice_slice)" begin
+        @kernel chain_plate(u::Vector{Float64}, tmap, off) = begin
+            s = u[1]
+            reads = exp.(s .+ off)
+            r = reads[tmap]
+            m1 = min(r[1], r[2])
+            m2 = min(m1, r[3])
+            total::Float64 = m1 + m2
+        end
+        u = [2.0]
+        tmap = [2, 4, 6]
+        off = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        kernel = prepare(chain_plate; have = (:u, :tmap, :off),
+                         want = :total, bound = (; tmap, off))
+        prepared = prepare_ad(kernel, AD_REACTANT_BACKEND, u; active = :u)
+
+        reference = similar(u)
+        value, reference = ad_value_and_gradient!(prepared, reference, u)
+
+        traced_u = _trace(u)
+        compiled_value, compiled_gradient = compile_ad_value_and_gradient(
+            prepared, traced_u; optimize = :no_slice_slice)(traced_u)
+        @test Float64(compiled_value) ≈ value
+        @test Array(compiled_gradient) ≈ reference
+
+        gradient_only = Array(compile_ad_gradient(
+            prepared, traced_u; optimize = :no_slice_slice)(traced_u))
+        @test gradient_only ≈ reference
+    end
+
+    # An explicit `:all` pipeline matches the default path exactly; this
+    # guards the `optimize` keyword's verbatim forwarding to Reactant.
+    @testset "explicit :all pipeline matches the default" begin
+        @kernel fill_plate(u::Vector{Float64}, tmap) = begin
+            s = u[1]
+            reads = fill(s, 6)
+            r = reads[tmap]
+            m1 = min(r[1], r[2])
+            m2 = min(m1, r[3])
+            total::Float64 = m1 + m2
+        end
+        u = [2.0]
+        tmap = [2, 4, 6]
+        kernel = prepare(fill_plate; have = (:u, :tmap), want = :total,
+                         bound = (; tmap))
+        prepared = prepare_ad(kernel, AD_REACTANT_BACKEND, u; active = :u)
+
+        reference = similar(u)
+        value, reference = ad_value_and_gradient!(prepared, reference, u)
+
+        traced_u = _trace(u)
+        default_value, default_gradient =
+            compile_ad_value_and_gradient(prepared, traced_u)(traced_u)
+        @test Float64(default_value) ≈ value
+        @test Array(default_gradient) ≈ reference
+        explicit_value, explicit_gradient = compile_ad_value_and_gradient(
+            prepared, traced_u; optimize = :all)(traced_u)
+        @test Float64(explicit_value) ≈ value
+        @test Array(explicit_gradient) ≈ reference
+    end
+
+    @testset "surgical pipeline builder strips only slice_slice" begin
+        ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt)
+        pipe = ext._rk_reactant_pipeline_no_slice_slice()
+        @test pipe isa String
+        @test occursin("enzyme{", pipe)
+        @test !occursin(r"slice_slice<\d+>;", pipe)
+        @test occursin("slice_elementwise", pipe)
+    end
 end
 
 @testset "staged prepared AD over bound views (§7a)" begin
