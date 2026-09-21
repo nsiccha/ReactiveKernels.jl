@@ -1223,14 +1223,22 @@ primal kernel itself compiles through Reactant; where it does not, the underlyin
 
 Requires the Reactant weak dependency to be loaded. The differentiation engine is
 the DifferentiationInterface backend passed to [`prepare_ad`](@ref).
+
+`optimize` selects the Reactant optimization pipeline: `nothing` (default)
+runs Reactant's default pipeline; `:no_slice_slice` runs the default pipeline
+minus the `slice_slice` transform, which miscompiles chained consumers of a
+strided slice on Reactant 0.2.284 (see reactivekernels-use §7j); any other
+value forwards verbatim to `Reactant.compile`'s `optimize` keyword.
 """
-function compile_ad_gradient(prepared::PreparedADKernel, args...; sync::Bool = true)
+function compile_ad_gradient(prepared::PreparedADKernel, args...; sync::Bool = true,
+                             optimize = nothing)
     prepared.kernel isa NonAllocatingKernel && throw(ArgumentError(
         "Reactant-compiled AD is not supported over a NonAllocatingKernel " *
         "(the mutating cache program does not stage); prepare the gradient " *
         "from the dataflow kernel instead"))
     _reactant_compile_ad(Val(:gradient), prepared,
-                         _reactant_ad_marker(prepared, args), args...; sync)
+                         _reactant_ad_marker(prepared, args), args...; sync,
+                         optimize)
 end
 
 """
@@ -1245,13 +1253,18 @@ call yields both the potential and its gradient.
 
 Like [`compile_ad_gradient`](@ref), this requires the Reactant weak dependency,
 reuses the DifferentiationInterface backend from [`prepare_ad`](@ref), and only
-compiles where the primal kernel itself compiles through Reactant.
+compiles where the primal kernel itself compiles through Reactant. The
+`optimize` keyword is identical: `nothing` (default) runs Reactant's default
+pipeline, `:no_slice_slice` removes the miscompiling `slice_slice` transform
+(reactivekernels-use §7j), and any other value forwards to `Reactant.compile`.
 """
-function compile_ad_value_and_gradient(prepared::PreparedADKernel, args...; sync::Bool = true)
+function compile_ad_value_and_gradient(prepared::PreparedADKernel, args...; sync::Bool = true,
+                                        optimize = nothing)
     prepared.kernel isa NonAllocatingKernel && throw(ArgumentError(
         "Reactant-compiled AD is not supported over a NonAllocatingKernel " *
         "(the mutating cache program does not stage); prepare the gradient " *
         "from the dataflow kernel instead"))
     _reactant_compile_ad(Val(:value_and_gradient), prepared,
-                         _reactant_ad_marker(prepared, args), args...; sync)
+                         _reactant_ad_marker(prepared, args), args...; sync,
+                         optimize)
 end

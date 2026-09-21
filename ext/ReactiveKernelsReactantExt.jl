@@ -1522,6 +1522,73 @@ _rk_reactant_ad_op(::Val{:gradient}) = DifferentiationInterface.gradient
 _rk_reactant_ad_op(::Val{:value_and_gradient}) =
     DifferentiationInterface.value_and_gradient
 
+# --- Opt-in Reactant pipeline without fused-slice miscompiles ---------------
+# reactant-full-pr-f9f453e4 (interim; see reactivekernels-use §7j).
+#
+# Reactant 0.2.284's `slice_slice` transform fuses nested strided slices into a
+# shape that miscompiles downstream: `slice_elementwise` then builds an invalid
+# slice (single-use chains, e.g. `stablehlo.slice(tensor<2xf64>) -> ???`), or
+# Enzyme's reverse emits a mismatched `stablehlo.add(N, N-1)` (multi-use
+# chains), SIGABRTing the compile. The raw trace is correct (`optimize =
+# :only_enzyme` compiles with correct values/gradients), so compiling the
+# default `:all` pipeline minus just that one pattern restores correct
+# compiles. This builder replicates Reactant's default `:all` pipeline via
+# Reactant's own builders and strips the pattern, so it adapts to Reactant
+# versions that keep the builder API; it fails loudly (instead of silently
+# running `:all`) when the builders or the pattern are absent.
+const _RK_NO_SLICE_SLICE_PATTERNS = (r"slice_slice<\d+>;",)
+
+function _rk_reactant_default_pipeline(backend::String)
+    C = Reactant.Compiler
+    for name in (:optimization_passes, :enzyme_pass, :OpenMP)
+        isdefined(C, name) || throw(ArgumentError(
+            "optimize = :no_slice_slice needs Reactant.Compiler.$name, which " *
+            "this Reactant version ($(pkgversion(Reactant))) does not provide; " *
+            "the fused-slice workaround cannot be built here"))
+    end
+    opts = Reactant.CompileOptions()
+    op1 = C.optimization_passes(opts; sroa = true, recognize_comms = true,
+        lower_comms = true, backend = backend, is_sharded = false,
+        hlo_opts = true)
+    op2 = C.optimization_passes(opts; sroa = false, recognize_comms = true,
+        lower_comms = true, backend = backend, is_sharded = false)
+    blas_int_width = sizeof(LinearAlgebra.BlasInt) * 8
+    kern = "lower-kernel{backend=$backend},canonicalize"
+    jit = "lower-jit{openmp=$(C.OpenMP[]) backend=$backend},symbol-dce"
+    lower = "lower-enzymexla-linalg{backend=$backend blas_int_width=$blas_int_width}," *
+        "lower-enzymexla-blas{backend=$backend blas_int_width=$blas_int_width}," *
+        "lower-enzymexla-lapack{backend=$backend blas_int_width=$blas_int_width}," *
+        "lower-enzymexla-math,lower-enzymexla-mpi{backend=$backend}"
+    # NOTE: a custom string pipeline skips Reactant's post-`:all`
+    # transpose/reshape-propagate-down fixup (it only runs for the `:all`
+    # Symbol); verified harmless on the shapes this recipe targets.
+    join(["raise-triton-custom-call", "mark-func-memory-effects", op1,
+        "enzyme-batch", op2, C.enzyme_pass, op2, "canonicalize",
+        "remove-unnecessary-enzyme-ops", "enzyme-simplify-math", op2, kern,
+        "canonicalize", lower, jit], ",")
+end
+
+function _rk_reactant_pipeline_no_slice_slice()
+    client = Reactant.XLA.default_backend()
+    platform = Reactant.XLA.platform_name(client)
+    backend = if platform == "CUDA"
+        "GPU"
+    elseif platform == "CPU"
+        "cpu"
+    else
+        platform
+    end
+    pipe = _rk_reactant_default_pipeline(backend)
+    for pat in _RK_NO_SLICE_SLICE_PATTERNS
+        occursin(pat, pipe) || throw(ArgumentError(
+            "optimize = :no_slice_slice: pattern $pat not found in this " *
+            "Reactant version's pipeline ($(pkgversion(Reactant))); the " *
+            "workaround needs review before use here"))
+        pipe = replace(pipe, pat => "")
+    end
+    pipe
+end
+
 # Program metadata and the native-only DI cache are not dynamic inputs or
 # mutated outputs of a trace. The traced call below does not use that cache.
 function Reactant.make_tracer(
@@ -1596,7 +1663,7 @@ end
 
 function _rk_reactant_compile_ad_call(
         mode::Val, prepared::ReactiveKernels.PreparedADKernel{I}, kernel,
-        args::Tuple; sync::Bool) where {I}
+        args::Tuple; sync::Bool, optimize = nothing) where {I}
     op = _rk_reactant_ad_op(mode)
     call = ReactiveKernels._ADKernelCall{I,typeof(kernel)}(kernel)
     backend = prepared.backend
@@ -1606,7 +1673,15 @@ function _rk_reactant_compile_ad_call(
             op(call, backend, point, contexts...)
         end
     end
-    Reactant.compile(fn, args; sync = sync)
+    if optimize === nothing
+        Reactant.compile(fn, args; sync = sync)
+    elseif optimize === :no_slice_slice
+        Reactant.compile(
+            fn, args; sync = sync,
+            optimize = _rk_reactant_pipeline_no_slice_slice())
+    else
+        Reactant.compile(fn, args; sync = sync, optimize = optimize)
+    end
 end
 
 # Bound arrays become hidden device operands so a dataset never turns into a
@@ -1621,15 +1696,15 @@ const _REACTANT_EMBEDDED_BOUND_ARRAY_ELEMENTS = Ref(4096)
 
 function _rk_reactant_compile_ad(
         mode::Val, prepared::ReactiveKernels.PreparedADKernel, args::Tuple;
-        sync::Bool)
+        sync::Bool, optimize = nothing)
     kernel, values = ReactiveKernels._externalize_bound_arrays(
         prepared.kernel;
         min_elements = _REACTANT_EMBEDDED_BOUND_ARRAY_ELEMENTS[] + 1)
     isempty(values) && return _rk_reactant_compile_ad_call(
-        mode, prepared, kernel, args; sync)
+        mode, prepared, kernel, args; sync, optimize)
     external_args = map(Reactant.to_rarray, values)
     compiled = _rk_reactant_compile_ad_call(
-        mode, prepared, kernel, (args..., external_args...); sync)
+        mode, prepared, kernel, (args..., external_args...); sync, optimize)
     _ExternalizedADExecutable(compiled, external_args)
 end
 
@@ -1643,25 +1718,27 @@ end
 
 function ReactiveKernels._reactant_compile_ad_externalized(
         mode::Val, prepared::ReactiveKernels.PreparedADKernel,
-        public_args::Tuple, external_args::Tuple; sync::Bool = true)
+        public_args::Tuple, external_args::Tuple; sync::Bool = true,
+        optimize = nothing)
     kernel, values = ReactiveKernels._externalize_bound_arrays(prepared.kernel)
     length(values) == length(external_args) || throw(ArgumentError(
         "externalized Reactant AD expected $(length(values)) bound array " *
         "operand(s); got $(length(external_args))"))
     _rk_reactant_compile_ad_call(
-        mode, prepared, kernel, (public_args..., external_args...); sync)
+        mode, prepared, kernel, (public_args..., external_args...); sync,
+        optimize)
 end
 
 function ReactiveKernels._reactant_compile_ad(
         mode::Val, prepared::ReactiveKernels.PreparedADKernel,
-        ::Reactant.RArray, args...; sync::Bool = true)
-    _rk_reactant_compile_ad(mode, prepared, args; sync = sync)
+        ::Reactant.RArray, args...; sync::Bool = true, optimize = nothing)
+    _rk_reactant_compile_ad(mode, prepared, args; sync = sync, optimize)
 end
 
 function ReactiveKernels._reactant_compile_ad(
         mode::Val, prepared::ReactiveKernels.PreparedADKernel,
-        ::Reactant.RNumber, args...; sync::Bool = true)
-    _rk_reactant_compile_ad(mode, prepared, args; sync = sync)
+        ::Reactant.RNumber, args...; sync::Bool = true, optimize = nothing)
+    _rk_reactant_compile_ad(mode, prepared, args; sync = sync, optimize)
 end
 
 include("ReactiveKernelsReactantExt/traced_slot_compiler.jl")
