@@ -1451,6 +1451,29 @@ function _replica_ad_static_slice(arg, expected_rank, replica_index)
     sliced
 end
 
+function _replica_ad_stack(values::Tuple, ::Type{T}, replica_count) where {T<:Tuple}
+    ntuple(length(T.parameters)) do component
+        component_values = ntuple(
+            index -> getfield(values[index], component), replica_count)
+        _replica_ad_stack(
+            component_values, T.parameters[component], replica_count)
+    end
+end
+
+function _replica_ad_stack(values::Tuple, ::Type{T}, replica_count) where {T}
+    gradient_rank = ReactiveKernels._replica_rank(T)
+    gradients = if gradient_rank == 0
+        ntuple(index -> Reactant.Ops.broadcast_in_dim(
+            values[index], Int64[], Int64[1]), replica_count)
+    else
+        ntuple(index -> Reactant.Ops.reshape(
+            values[index],
+            vcat(collect(Int64, size(values[index])), Int64[1])),
+            replica_count)
+    end
+    Reactant.Ops.concatenate(collect(gradients), gradient_rank + 1)
+end
+
 function ReactiveKernels._replica_ad_call(
         k::ReactiveKernels._ReplicatedADKernel{B,BT,AT}, args,
         marker::Reactant.RArray) where {B,BT,AT}
@@ -1468,7 +1491,7 @@ function ReactiveKernels._replica_ad_call(
             "$(size(arg, ndims(arg))) replicas; expected $replica_count"))
     end
 
-    active_index = Int(typeof(prepared).parameters[1])
+    active_selector = typeof(prepared).parameters[1]
     results = ntuple(replica_count) do replica_index
         scalar_args = ntuple(length(args)) do argument_index
             arg = getfield(args, argument_index)
@@ -1479,7 +1502,7 @@ function ReactiveKernels._replica_ad_call(
             _replica_ad_static_slice(arg, expected_rank, replica_index)
         end
         point, contexts = ReactiveKernels._ad_arguments(
-            Val(active_index), scalar_args)
+            Val(active_selector), scalar_args)
         ReactiveKernels._ad_prepared_value_and_gradient(
             prepared, point, contexts)
     end
@@ -1487,18 +1510,8 @@ function ReactiveKernels._replica_ad_call(
     values = ntuple(index -> Reactant.Ops.broadcast_in_dim(
         first(results[index]), Int64[], Int64[1]), replica_count)
     value = Reactant.Ops.concatenate(collect(values), 1)
-    gradient_rank = ReactiveKernels._replica_rank(AT)
-    if gradient_rank == 0
-        gradients = ntuple(index -> Reactant.Ops.broadcast_in_dim(
-            last(results[index]), Int64[], Int64[1]), replica_count)
-    else
-        gradients = ntuple(index -> Reactant.Ops.reshape(
-            last(results[index]),
-            vcat(collect(Int64, size(last(results[index]))), Int64[1])),
-            replica_count)
-    end
-    gradient = Reactant.Ops.concatenate(
-        collect(gradients), gradient_rank + 1)
+    gradient_values = ntuple(index -> last(results[index]), replica_count)
+    gradient = _replica_ad_stack(gradient_values, AT, replica_count)
     value, gradient
 end
 
@@ -1603,6 +1616,17 @@ function Reactant.traced_type_inner(
     T
 end
 
+const _RKReactantADLeaf = Union{Reactant.TracedRArray,Reactant.TracedRNumber}
+const _RKReactantADTuple = Tuple{Vararg{_RKReactantADLeaf}}
+const _RKReactantADArgumentLeaf = Union{Reactant.RArray,Reactant.RNumber}
+const _RKReactantADArgumentTuple = Tuple{Vararg{_RKReactantADArgumentLeaf}}
+
+# Native heterogeneous active tuples wrap scalar leaves in `Ref` so Enzyme's
+# DI extension sees one duplicated structure. Traced scalars already carry a
+# differentiable mutable backend representation and must stay in the compiler
+# ABI directly.
+ReactiveKernels._ad_active_point_component(value::Reactant.RNumber) = value
+
 # A native DI preparation is tied to native input types. Inside a larger
 # compiled algorithm, select the same kernel's tensorized body and let DI
 # stage its derivative in that enclosing trace instead of launching a
@@ -1621,12 +1645,31 @@ function ReactiveKernels._ad_prepared_value_and_gradient(
         call, prepared.backend, point, contexts...)
 end
 
+function ReactiveKernels._ad_prepared_value_and_gradient(
+        prepared::ReactiveKernels.PreparedADKernel{I},
+        point::_RKReactantADTuple, contexts) where {I}
+    kernel, _ = ReactiveKernels._externalize_bound_arrays(
+        prepared.kernel; materialize_view_copies = true)
+    call = ReactiveKernels._ADKernelCall{I,typeof(kernel)}(kernel)
+    DifferentiationInterface.value_and_gradient(
+        call, prepared.backend, point, contexts...)
+end
+
 function ReactiveKernels._ad_prepared_value_and_gradient!(
         prepared::ReactiveKernels.PreparedADKernel, gradient,
         point::Union{Reactant.TracedRArray,Reactant.TracedRNumber}, contexts)
     value, derivative = ReactiveKernels._ad_prepared_value_and_gradient(
         prepared, point, contexts)
     copyto!(gradient, derivative)
+    value, gradient
+end
+
+function ReactiveKernels._ad_prepared_value_and_gradient!(
+        prepared::ReactiveKernels.PreparedADKernel, gradient,
+        point::_RKReactantADTuple, contexts)
+    value, derivative = ReactiveKernels._ad_prepared_value_and_gradient(
+        prepared, point, contexts)
+    ReactiveKernels._ad_copy_cotangent!(gradient, derivative)
     value, gradient
 end
 
@@ -1639,8 +1682,10 @@ end
 # Contexts are always a (possibly empty) Tuple at every call site; constraining
 # on that keeps this an overload of the core fallback rather than an overwrite.
 function ReactiveKernels._ad_trace_sanity(point, contexts::Tuple)
-    if Reactant.within_compile() &&
-            !(point isa Union{Reactant.TracedRArray,Reactant.TracedRNumber})
+    traced = point isa _RKReactantADLeaf ||
+        (point isa Tuple && !isempty(point) &&
+         all(value -> value isa _RKReactantADLeaf, point))
+    if Reactant.within_compile() && !traced
         throw(ArgumentError(
             "prepared AD with a native active input of type $(typeof(point)) " *
             "inside a Reactant trace would silently return a zero gradient; " *
@@ -1659,6 +1704,15 @@ function ReactiveKernels._ad_prepared_value_and_gradient!(
     ReactiveKernels._ad_trace_sanity(point, contexts)
     invoke(ReactiveKernels._ad_prepared_value_and_gradient!,
            Tuple{Any,Any,Any,Any}, prepared, gradient, point, contexts)
+end
+
+
+function ReactiveKernels._ad_prepared_value_and_gradient!(
+        prepared::ReactiveKernels.PreparedADKernel, gradient,
+        point::Tuple, contexts)
+    ReactiveKernels._ad_trace_sanity(point, contexts)
+    invoke(ReactiveKernels._ad_prepared_value_and_gradient!,
+           Tuple{Any,Any,Tuple,Any}, prepared, gradient, point, contexts)
 end
 
 function _rk_reactant_compile_ad_call(
@@ -1738,6 +1792,14 @@ end
 function ReactiveKernels._reactant_compile_ad(
         mode::Val, prepared::ReactiveKernels.PreparedADKernel,
         ::Reactant.RNumber, args...; sync::Bool = true, optimize = nothing)
+    _rk_reactant_compile_ad(mode, prepared, args; sync = sync, optimize)
+end
+
+
+function ReactiveKernels._reactant_compile_ad(
+        mode::Val, prepared::ReactiveKernels.PreparedADKernel,
+        ::_RKReactantADArgumentTuple, args...;
+        sync::Bool = true, optimize = nothing)
     _rk_reactant_compile_ad(mode, prepared, args; sync = sync, optimize)
 end
 
