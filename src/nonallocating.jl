@@ -164,7 +164,21 @@ function _decompose(ctx::_FusedDecomposition, node, allow_lazy_broadcast::Bool)
     end
     node.head === :ref && length(node.args) >= 2 &&
         return _decompose_getindex(ctx, node.args[1], node.args[2:end])
+    node.head === :. && length(node.args) == 2 &&
+        return _decompose_dotcall(ctx, node.args[1], node.args[2],
+                                  allow_lazy_broadcast)
     nothing
+end
+
+# `f.(args)` parses as `Expr(:., f, Expr(:tuple, ...))` — unlike operator-dot
+# `a .+ b`, which is a `:call` with a dotted callee. Same broadcast
+# semantics, same treatment; anything else in dot position (field access,
+# qualified names: non-tuple second arg) falls back safely.
+function _decompose_dotcall(ctx::_FusedDecomposition, func, tup,
+                             allow_lazy_broadcast::Bool)
+    func isa Symbol || return nothing
+    tup isa Expr && tup.head === :tuple || return nothing
+    _decompose_broadcast(ctx, func, tup.args, allow_lazy_broadcast)
 end
 
 function _decompose_arguments(ctx::_FusedDecomposition, rawargs,

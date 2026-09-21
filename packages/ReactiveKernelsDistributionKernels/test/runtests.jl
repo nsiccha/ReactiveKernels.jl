@@ -468,3 +468,5 @@ end
         @test !isnan(v)
     end
 end
+
+include("test_glm.jl")

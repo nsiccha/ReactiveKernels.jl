@@ -186,6 +186,37 @@ end
         end
     end
 
+    @testset "dotted-call f.(x) spelling decomposes like operator-dot" begin
+        # `f.(x)` parses as `Expr(:.)`, not a dotted-callee `:call`: without
+        # dotcall coverage it silently kept the whole-recipe fallback and
+        # reallocated every call. Includes nesting in both directions.
+        spec = @kernel dotted_calls(u::Vector{Float64}, X::Matrix{Float64}) = begin
+            b::Vector{Float64} = u[1:3]
+            eta::Vector{Float64} = u[4] .+ X * b
+            mu::Vector{Float64} = exp.(eta)
+            t::Vector{Float64} = log.(mu .+ 1.0)
+            total::Float64 = sum(t) - sum(mu)
+        end
+        steady(k, args...) = (k(args...); k(args...); @allocated k(args...))
+        data(n) = (rand(4), rand(n, 3))
+
+        ordinary = prepare(spec; have = (:u, :X), want = :total)
+        k = prepare_nonallocating(spec; have = (:u, :X), want = :total)
+        u, X = data(8)
+        @test k(u, X) == ordinary(u, X)
+
+        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
+        @test any(op -> op isa ReactiveKernels._MaterializeStep, k.ops)
+        @test any(op -> op isa ReactiveKernels._MatMulStep, k.ops)
+
+        small = steady(k, data(8)...)
+        large = steady(k, data(200)...)
+        println("NONALLOCATING_ALLOC_BYTES\tdotted_calls_small\t", small)
+        println("NONALLOCATING_ALLOC_BYTES\tdotted_calls_large\t", large)
+        @test small == large
+        @test small <= 512
+    end
+
     @testset "authored plates keep exact pointwise semantics" begin
         # An untyped plate body materializes through an eltype-`Any` cache in
         # both execution paths, so only value semantics are pinned here; the
