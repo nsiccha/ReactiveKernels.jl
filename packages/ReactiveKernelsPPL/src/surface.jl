@@ -517,7 +517,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # locations (see `used_locs` below).
     kernel_lp_predictors = Set{Symbol}()
     for ks in kstmts
-        kp = _lower_kernel_stmt(ks.st, ks.line, data, ctx, predictors,
+        kp = _lower_plate_stmt(ks.st, ks.line, data, ctx, predictors,
             pred_idx, coefuse, schedules, event_lps)
         for (p, _) in kp.lp_args
             push!(kernel_lp_predictors, p)
@@ -1842,17 +1842,23 @@ const _KERNEL_OBS_FAMILIES = Dict{Symbol,Tuple{Any,Int}}(
 
 # One in-cell observation: `yy .~ Fam.(args...)` with a slice-param
 # response and name-or-literal args (panel: Gaussian only, exactly one
-# obs; grouped: the joint families too, a list). Inline scale/location
+# obs; grouped: the joint families too, a list; plate: like grouped
+# but the response names its data column directly). Inline scale/location
 # expressions are NOT admitted — complex values spell via a
 # pre-assignment (julianic delta, one line).
 function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
         form::String = "panel v1")
     resp = stmt.args[2]
+    plate = form == "plate v1"
     resp isa Symbol ||
-        _sfail("$where obs response must be a bare slice param, got " *
+        _sfail(plate ? "$where obs response must name a response " *
+               "data column, got $(repr(resp))" :
+               "$where obs response must be a bare slice param, got " *
                "$(repr(resp))")
     resp in params ||
-        _sfail("$where obs response `$resp` is not a slice param " *
+        _sfail(plate ? "$where obs response `$resp` is not an observed " *
+               "response column" :
+               "$where obs response `$resp` is not a slice param " *
                "(responses enter the cell as slices)")
     dist = stmt.args[3]
     (dist isa Expr && dist.head === :.) ||
@@ -1889,17 +1895,36 @@ function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
         scale = dargs[2], params = Tuple(dargs[3:end]))
 end
 
-# Grouped-kernel statement (joint-kernel form):
-#   `result ~ kernel(resp..., lp...; subjects=N) do slices... <cell> end`
-# Responses lead, LP args trail (the V2 kernel convention): leading
-# data names are response slices (one per response axis), trailing
-# names are LP definitions (interned as subject-level predictors at
-# late lowering). The cell is assignments (cell calls + gathers +
-# arithmetic) + ONE OR MORE dotted `.~` observations (one per response
-# axis) + a trailing collected name. Schedules enter via separate
-# `name = linear_pk_schedule(...)` declarations, referenced from the
-# cell.
-function _is_kernel_stmt(st::Expr)
+# Grouped-kernel statement (plate form, SB `@plate for` verbatim modulo
+# two documented deviations):
+#   `@plate <result> for <s> in 1:<N> <cell> end`
+# Everything resolves lexically — no argument lists: `.~` LHSs name
+# response data columns directly, outer LP definitions are referenced
+# by name (interned as subject-level predictors at late lowering),
+# schedules/event-LPs enter by separate declarations as before. The
+# cell is assignments (cell calls + gathers + arithmetic) + ONE OR
+# MORE dotted `.~` observations (one per response axis) + a trailing
+# collected name.
+#
+# Deviations from SB (both forced by the KernelPlate IR): (1) the
+# result name rides the header (`@plate pk_loc for ...`) — the IR
+# needs a label, dims-key root, and collected alias; (2) the loop
+# variable is a declarative axis binder and may go unused — the cell
+# is vectorized over the plate (whole-column gathers + per-subject
+# unrolled cell calls), not scalar-per-cell, so there is no per-cell
+# index to use.
+function _is_plate_stmt(st::Expr)
+    st.head === :macrocall && length(st.args) == 4 || return false
+    st.args[1] === Symbol("@plate") || return false
+    st.args[3] isa Symbol || return false
+    loop = st.args[4]
+    loop isa Expr && loop.head === :for || return false
+    return true
+end
+
+# Removed grouped form (`result ~ kernel(...) do ... end`, decision
+# 0tgodim): matched only to fail with the pointer, never lowered.
+function _is_removed_kernel_stmt(st::Expr)
     (_is_sample(st) || _is_broadcast_sample(st)) || return false
     rhs = st.args[3]
     rhs isa Expr && rhs.head === :do || return false
@@ -1909,26 +1934,20 @@ function _is_kernel_stmt(st::Expr)
         call.args[1] === :kernel
 end
 
-# Defensive pre-claim of a grouped kernel statement's syntactic names
-# (result + do-params + assignment LHSs): late lowering owns every
+# Defensive pre-claim of a plate statement's syntactic names (result +
+# loop variable + assignment LHSs): late lowering owns every
 # rejection, so anything unparseable here is skipped silently and fails
 # there with the precise message.
-function _claim_kernel_stmt_names(st::Expr, line::Int, seen::Set{Symbol},
+function _claim_plate_stmt_names(st::Expr, line::Int, seen::Set{Symbol},
         seelines::Dict{Symbol,Int})
-    st.args[2] isa Symbol && _claim!(seen, seelines, st.args[2], line)
-    doex = st.args[3]
-    doex isa Expr && doex.head === :do && length(doex.args) >= 2 ||
+    _claim!(seen, seelines, st.args[3], line)
+    loop = st.args[4]
+    loop isa Expr && loop.head === :for && length(loop.args) == 2 ||
         return nothing
-    lam = doex.args[2]
-    lam isa Expr && lam.head === :-> && length(lam.args) == 2 ||
-        return nothing
-    ptuple, body = lam.args[1], lam.args[2]
-    if ptuple isa Symbol
-        _claim!(seen, seelines, ptuple, line)
-    elseif ptuple isa Expr && ptuple.head === :tuple
-        for p in ptuple.args
-            p isa Symbol && _claim!(seen, seelines, p, line)
-        end
+    head, body = loop.args[1], loop.args[2]
+    if head isa Expr && head.head === :(=) && length(head.args) == 2 &&
+            head.args[1] isa Symbol
+        _claim!(seen, seelines, head.args[1], line)
     end
     body isa Expr && body.head === :block || return nothing
     for s in body.args
@@ -2079,56 +2098,41 @@ function _schedule_column_tuple(val, where, key::Symbol, want::Int,
     return cols
 end
 
-# Late lowering of a grouped kernel statement (see `_is_kernel_stmt`):
-# parses header/cell like the panel form, interns LP-arg predictors via
-# the response-location path (subject-level by use), resolves schedule
-# references against the declared schedules, and assembles the grouped
-# KernelPlate. Unused schedule declarations fail closed.
-function _lower_kernel_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
+# Late lowering of a plate statement (see `_is_plate_stmt`): parses
+# the header/cell, discovers responses (`.~` LHS data columns) and LP
+# references (outer definitions used in-cell) lexically, interns the LP
+# predictors via the response-location path (subject-level by use),
+# resolves schedule references against the declared schedules, and
+# assembles the grouped KernelPlate. Unused schedule declarations fail
+# closed. Produces IR identical in kind to the removed kernel-do form —
+# slices are `(column, column)` and LP cell params are the outer
+# definition names — so contract and generator are untouched.
+function _lower_plate_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
         predictors, pred_idx, coefuse, schedules::Vector{LinearPKScheduleSpec},
         event_lps::Vector{LinearPKEventLPSpec})
-    where = line > 0 ? "grouped kernel (line $line)" : "grouped kernel"
-    bc = _is_broadcast_sample(st)
-    bc && _sfail("$where carries a scalar `~` (the collected result " *
-                 "name), not `.~`")
-    result = st.args[2]
+    where = line > 0 ? "plate (line $line)" : "plate"
+    result = st.args[3]
     result isa Symbol ||
-        _sfail("$where LHS must be a bare Symbol (the collected " *
+        _sfail("$where result must be a bare Symbol (the collected " *
                "result name), got $(repr(result))")
     result in data &&
         _sfail("$where result `$result` is bound data and cannot " *
-               "collect a kernel")
-    doex = st.args[3]
-    length(doex.args) >= 2 && doex.args[2] isa Expr ||
-        _sfail("$where needs `kernel(resp, lp...; subjects=N) do " *
-               "slices... cell end`")
-    call, lam = doex.args[1], doex.args[2]
-    # `kernel(resp, lp...; subjects=N)`: exactly the subjects kwarg; bare
-    # names positionally (response data column first, LP definitions
-    # after).
-    subj = nothing
-    pos = Symbol[]
-    for arg in call.args[2:end]
-        if arg isa Expr && arg.head === :parameters
-            for kw in arg.args
-                kw isa Expr && kw.head === :kw && length(kw.args) == 2 &&
-                    kw.args[1] === :subjects ||
-                    _sfail("$where takes exactly one keyword " *
-                           "`subjects=N`, got $(repr(kw))")
-                subj !== nothing &&
-                    _sfail("$where repeats `subjects=`")
-                subj = kw.args[2]
-            end
-        elseif arg isa Symbol
-            push!(pos, arg)
-        else
-            _sfail("$where inputs must be bare names (a response data " *
-                   "column, then LP definitions), got $(repr(arg))")
-        end
-    end
-    subj === nothing &&
-        _sfail("$where needs `subjects=N` (an integer literal or a " *
-               "dims-key name bound at bind)")
+               "collect a plate")
+    loop = st.args[4]
+    loop isa Expr && loop.head === :for && length(loop.args) == 2 ||
+        _sfail("$where needs `@plate <result> for <s> in 1:<N> cell end`")
+    head, body = loop.args[1], loop.args[2]
+    head isa Expr && head.head === :(=) && length(head.args) == 2 &&
+        head.args[1] isa Symbol ||
+        _sfail("$where loop binds one axis variable " *
+               "(`for <s> in 1:<N>`), got $(repr(head))")
+    loopvar = head.args[1]
+    rng = head.args[2]
+    rng isa Expr && rng.head === :call && length(rng.args) == 3 &&
+        rng.args[1] === :(:) && rng.args[2] == 1 ||
+        _sfail("$where range is `1:<N>` (an integer literal or a " *
+               "dims-key name bound at bind), got $(repr(rng))")
+    subj = rng.args[3]
     subjects = if subj isa Int
         subj > 0 ||
             _sfail("$where subject count must be positive, got $subj")
@@ -2136,50 +2140,9 @@ function _lower_kernel_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
     elseif subj isa Symbol
         subj
     else
-        _sfail("$where `subjects` must be an integer literal or a " *
-               "dims-key name, got $(repr(subj))")
+        _sfail("$where `1:<N>` takes an integer literal or a dims-key " *
+               "name, got $(repr(subj))")
     end
-    isempty(pos) &&
-        _sfail("$where takes response columns plus LP definitions " *
-               "(`kernel(resp..., lp...; subjects=N)`)")
-    # Responses lead, LP args trail (the V2 kernel convention):
-    # leading data names are response slices, trailing definitions
-    # intern as subject LP predictors.
-    n_resp = 0
-    for nm in pos
-        nm in data || break
-        n_resp += 1
-    end
-    n_resp >= 1 ||
-        _sfail("$where response `$(pos[1])` is not bound data " *
-               "(responses lead — the first input is a response column)")
-    for nm in pos[n_resp+1:end]
-        nm in data &&
-            _sfail("$where response `$nm` trails an LP definition " *
-                   "(responses lead, LP args trail)")
-    end
-    resps = pos[1:n_resp]
-    lpraws = pos[n_resp+1:end]
-    isempty(lpraws) &&
-        _sfail("$where takes at least one LP arg after the responses " *
-               "(LP values gather per subject in-cell)")
-    # `do slices... cell end`: plain-Symbol params, one per kernel input
-    # (response slices, then LP cell params).
-    lam.head === :-> && length(lam.args) == 2 ||
-        _sfail("$where `do` block must be `do slices... cell end`")
-    ptuple, body = lam.args[1], lam.args[2]
-    params = if ptuple isa Symbol
-        Symbol[ptuple]
-    elseif ptuple isa Expr && ptuple.head === :tuple &&
-            all(p -> p isa Symbol, ptuple.args)
-        Symbol[ptuple.args...]
-    else
-        _sfail("$where cell params must be plain names (one per kernel " *
-               "input: response slices, then LP cell params)")
-    end
-    length(params) == length(pos) ||
-        _sfail("$where has $(length(params)) cell params for " *
-               "$(length(pos)) kernel inputs (one param per input)")
     body isa Expr && body.head === :block ||
         _sfail("$where cell must be a `begin ... end`-style block")
     # Cell: assignments + one or more `.~` + trailing collected name.
@@ -2219,29 +2182,81 @@ function _lower_kernel_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
     collected === nothing &&
         _sfail("$where cell must end with a collected result name (a " *
                "bare cell name)")
+    # Lexical discovery: `.~` LHSs are response data columns; free cell
+    # names resolving to outer definitions are LP references (first
+    # appearance order — deterministic). Assignment LHSs must not shadow
+    # outer names (SB: writes to outside-bound names are rejected).
+    cell_locals = Set{Symbol}(nm for (nm, _) in assignments)
+    # Shadowing outer definitions, the result, or the loop variable fails
+    # at claim time ("defined twice"); bound data is unclaimed, so the
+    # data shadow fails here (SB write rule).
+    for nm in cell_locals
+        nm in data &&
+            _sfail("$where cell local `$nm` shadows a bound data column " *
+                   "(rename the local — responses name their columns directly)")
+    end
+    resps = Symbol[]
+    for s in obs_stmts
+        lhs = s.args[2]
+        lhs isa Symbol && lhs in data ||
+            _sfail("$where obs response must name a response data " *
+                   "column, got $(repr(lhs))")
+        lhs in resps &&
+            _sfail("$where response `$lhs` is observed twice (one " *
+                   "`.~` per response axis)")
+        push!(resps, lhs)
+    end
+    sched_decl = Set{Symbol}(s.name for s in schedules)
+    elp_decl = Set{Symbol}(el.name for el in event_lps)
+    lpraws = Symbol[]
+    extras = Symbol[]
+    lpseen = Set{Symbol}()
+    for ex in Iterators.flatten(((rhs for (_, rhs) in assignments),
+            (s.args[3] for s in obs_stmts)))
+        for nm in _plate_value_names(ex)
+            (nm in cell_locals || nm === loopvar ||
+                nm in sched_decl || nm in elp_decl || nm in lpseen) &&
+                continue
+            if nm in data
+                # Value-position data reads ride auto-slices (the old
+                # extra positional inputs); index maps never surface
+                # here (gather indices are not values).
+                nm in resps || push!(extras, nm)
+                push!(lpseen, nm)
+                continue
+            end
+            haskey(ctx.detmap, nm) || continue
+            push!(lpraws, nm)
+            push!(lpseen, nm)
+        end
+    end
+    isempty(lpraws) &&
+        _sfail("$where references no LP definition (LP values gather " *
+               "per subject in-cell — reference an outer LP by name)")
     # LP interning via the response-location path (the late-lowering
-    # reason): each LP arg names a definition, interned as an
+    # reason): each LP reference names a definition, interned as an
     # identity-link predictor whose coefs join `coefuse` like response
-    # locations. Subject level follows from exclusive kernel use.
+    # locations. Subject level follows from exclusive kernel use. The
+    # cell param IS the outer name (lexical, no aliasing).
     lp_args = Tuple{Symbol,Symbol}[]
-    for (raw, cparam) in zip(lpraws, params[n_resp+1:end])
+    for raw in lpraws
         pname = try
             _lower_location(result, raw, IdentityLink, ctx, predictors,
                 pred_idx, coefuse)
         catch err
-            err isa SurfaceLoweringError && _sfail("$where LP arg `$raw`: " *
+            err isa SurfaceLoweringError && _sfail("$where LP `$raw`: " *
                 "$(err.message)")
             rethrow()
         end
-        push!(lp_args, (pname, cparam))
+        push!(lp_args, (pname, raw))
     end
-    obses = KernelObs[_lower_kernel_obs(s, params, where, "grouped v1")
+    obses = KernelObs[_lower_kernel_obs(s, resps, where, "plate v1")
         for s in obs_stmts]
-    local_names = union(Set{Symbol}(params),
+    local_names = union(Set{Symbol}(resps), Set{Symbol}(lpraws),
         Set{Symbol}(nm for (nm, _) in assignments))
     collected in local_names ||
         _sfail("$where collected result `$collected` is not a cell " *
-               "name (slice param or cell-local assignment)")
+               "name (response column, LP reference, or cell-local assignment)")
     # Schedule references: the cell's call-first-args and gather roots
     # must name declared schedules; unused declarations fail closed.
     schednames = _kernel_cell_schedule_refs(assignments)
@@ -2273,10 +2288,54 @@ function _lower_kernel_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
                    "typo'd event-LP name?)")
     end
     used = [s for s in schedules if s.name in schednames]
-    slices = Tuple{Symbol,Symbol,Symbol}[(r, p, :unknown)
-        for (r, p) in zip(resps, params[1:n_resp])]
+    slices = Tuple{Symbol,Symbol,Symbol}[(r, r, :unknown)
+        for r in Iterators.flatten((resps, extras))]
     return KernelPlate(result, subjects, nothing, slices, assignments,
         obses, collected, result, lp_args, used)
+end
+
+# Value-position names of a plate-cell expression in first-appearance
+# order: gather indices (`v[map]`) contribute nothing (maps are
+# positions, never values), as do function heads (`f(...)`, `f.(...)`),
+# property tags (`x.tag`), and literals; everything else reads
+# lexically. Lenient collection — the contract cell walker owns precise
+# shape rejection; unknown names fail there.
+function _plate_value_names(ex)
+    out = Symbol[]
+    _collect_plate_value_names!(out, ex)
+    return out
+end
+
+function _collect_plate_value_names!(out::Vector{Symbol}, ex)
+    ex isa Symbol && (push!(out, ex); return nothing)
+    ex isa Expr || return nothing
+    if ex.head === :ref && length(ex.args) == 2
+        _collect_plate_value_names!(out, ex.args[1])
+        return nothing
+    end
+    if ex.head === :call && !isempty(ex.args)
+        for a in ex.args[2:end]
+            _collect_plate_value_names!(out, a)
+        end
+        return nothing
+    end
+    if ex.head === :.
+        if length(ex.args) >= 2 && ex.args[2] isa QuoteNode
+            # Getproperty `x.tag`: the object reads; the tag is static.
+            _collect_plate_value_names!(out, ex.args[1])
+        else
+            # Broadcast `f.(args...)`: the head is static.
+            for a in ex.args[2:end]
+                _collect_plate_value_names!(out, a)
+            end
+        end
+        return nothing
+    end
+    for a in ex.args
+        a isa QuoteNode && continue
+        _collect_plate_value_names!(out, a)
+    end
+    return nothing
 end
 
 # Schedule handles a grouped cell references (call first-args of CELL_FNS
@@ -2408,14 +2467,19 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             push!(kplates, kp)
             continue
         end
-        if _is_kernel_stmt(st)
-            # Grouped kernels lower LATE (LP-arg interning needs the
-            # response-loop predictor table): claim the syntactic names
-            # now (defensive — late lowering owns every rejection) and
+        if _is_plate_stmt(st)
+            # Plates lower LATE (LP interning needs the response-loop
+            # predictor table): claim the syntactic names now
+            # (defensive — late lowering owns every rejection) and
             # stash the statement.
-            _claim_kernel_stmt_names(st, line, seen, seelines)
+            _claim_plate_stmt_names(st, line, seen, seelines)
             push!(kstmts, (st = st, line = line))
             continue
+        end
+        if _is_removed_kernel_stmt(st)
+            _sfail("grouped `kernel(...) do ... end` was removed " *
+                   "(decision 0tgodim) — spell " *
+                   "`@plate <result> for <s> in 1:<N> ... end`")
         end
         if _is_r2d2_stmt(st)
             push!(r2d2decls, _lower_r2d2_decl(st, line))
@@ -2728,7 +2792,10 @@ function _expand_plates(args, data::Set{Symbol})
             continue
         end
         if arg isa Expr && arg.head === :macrocall && !isempty(arg.args) &&
-                arg.args[1] === Symbol("@plate")
+                arg.args[1] === Symbol("@plate") && length(arg.args) == 3
+            # Bare `@plate for ...` (3-arg macrocall) desugars here; the
+            # 4-arg kernel form (`@plate <result> for ...`) passes
+            # through to `_is_plate_stmt` dispatch below.
             pl = line
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
@@ -3282,6 +3349,13 @@ _is_doc_macro(m) =
 
 function _unwrap_trivia(st::Expr)
     while st.head === :macrocall
+        # The 4-arg kernel form (`@plate <result> for ...`) is a
+        # top-level statement in its own right — pass it through to
+        # `_is_plate_stmt` dispatch (only the bare desugared form nests
+        # illegally below).
+        if st.args[1] === Symbol("@plate") && length(st.args) == 4
+            return st
+        end
         m = st.args[1]
         if _is_doc_macro(m)
             # A leading string before a statement parses as `@doc "str" stmt`;

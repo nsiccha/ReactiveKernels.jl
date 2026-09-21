@@ -171,25 +171,25 @@ const _FN_SCHED = """
     log_F = linear_pk_log_f(pk_sched; k = 5)"""
 
 const _FN_CELL_HEAD = """
-        pk_reads = linear_pk_read_locs_auc(pk_sched, log_F, subject_Vc,
-            subject_k10, subject_k12, subject_k21, subject_ka)
+        pk_reads = linear_pk_read_locs_auc(pk_sched, log_F, log_Vc,
+            log_k10, log_k12, log_k21, log_ka)
         conc = pk_reads[pk_sched.conc_map]
         mu = conc[pk_sched.obs_map]
         conc_ecg = conc[pk_sched.ecg_map]
-        qbase_rows = qbase[esubj]
-        qslope_rows = qslope[esubj]
+        qbase_rows = qt_base[esubj]
+        qslope_rows = qt_slope[esubj]
         qt_loc = qbase_rows .+ qslope_rows .* (conc_ecg ./ 0.8)
-        qt_sd = qt_scale .* qt_weight
+        qt_sd = qt_scale .* qt_w
         tgi_exposure = pk_reads[pk_sched.tgi_auc_map] ./ 140.62960372536338
-        tgi_kg_rows = exp.(tgi_g[tsubj])
-        tgi_kd_rows = exp.(tgi_k[tsubj])
+        tgi_kg_rows = exp.(log_tgi_kg[tsubj])
+        tgi_kd_rows = exp.(log_tgi_kd[tsubj])
         tgi_r = tgi_kg_rows .* tgi_t .- tgi_kd_rows .* tgi_exposure
-        tgi_t0_rows = tgi_t0[tsubj]
+        tgi_t0_rows = tgi_baseline_time[tsubj]
         tgi_change = tgi_r .- tgi_kg_rows .* tgi_t0_rows
         tgi_ref = tgi_segmented_nadir(tgi_change, pk_sched_tgi_seg_ends)"""
 
 const _FN_CELL_MU = """
-        tgi_b0_rows = tgi_b0[tsubj]
+        tgi_b0_rows = tgi_ly0[tsubj]
         tgi_mu = tgi_b0_rows .+ tgi_r"""
 
 function final_ast(config::AbstractString = "continuous")
@@ -199,34 +199,22 @@ function final_ast(config::AbstractString = "continuous")
         "\n" * _FN_CCR
     varying = _FN_VARYING * (cont ? "\n" * _FN_VARYING_TB : "")
     lps = _FN_LPS * (cont ? "\n" * _FN_LPS_TB : "")
-    lplist = "log_Vc, log_k10, log_k12, log_k21, log_ka, qt_base, " *
-        "qt_slope, log_tgi_kg, log_tgi_kd" * (cont ? ", tgi_ly0" : "") *
-        ", tgi_baseline_time"
-    doparams = "subject_Vc, subject_k10, subject_k12, subject_k21, " *
-        "subject_ka, qbase, qslope, tgi_g, tgi_k" *
-        (cont ? ", tgi_b0" : "") * ", tgi_t0"
-    (resp, doparam, sdline, obs) = config == "continuous" ?
-        ("tgi_y", "tt", "",
-            "tt .~ Normal.(tgi_mu, tgi_sigma)") :
+    (sdline, obs) = config == "continuous" ?
+        ("", "tgi_y .~ Normal.(tgi_mu, tgi_sigma)") :
         config == "ordinal" ?
-        ("tgi_cc", "ccv",
-            "tgi_sd = 1.4142135623730951 * tgi_sigma",
-            "ccv .~ TgiCategory.(tgi_change, tgi_ref, tgi_c_cr, " *
+        ("tgi_sd = 1.4142135623730951 * tgi_sigma",
+            "tgi_cc .~ TgiCategory.(tgi_change, tgi_ref, tgi_c_cr, " *
             "-0.6931471805599453, 0.4054651081081644, tgi_sd, 0.01)") :
-        ("tgi_bb", "bbv",
-            "tgi_sd = 1.4142135623730951 * tgi_sigma",
-            "bbv .~ TgiResponse.(tgi_change, tgi_ref, " *
+        ("tgi_sd = 1.4142135623730951 * tgi_sigma",
+            "tgi_bb .~ TgiResponse.(tgi_change, tgi_ref, " *
             "-0.6931471805599453, 0.4054651081081644, tgi_sd, 0.01)")
     cell = _FN_CELL_HEAD * (cont ? "\n" * _FN_CELL_MU : "") *
         (isempty(sdline) ? "" : "\n            $sdline")
     return Meta.parse("begin\n$decl\n$varying\n$lps\n$_FN_SCHED\n" * """
-        pk_loc ~ kernel(pk_conc, ecg_y, $resp, pk_lloq, qt_w, tgi_t,
-                $lplist;
-                subjects = kernel_nsub_pk_loc) do yy, qq, $doparam, pk_lloq,
-                qt_weight, tgi_t, $doparams
+        @plate pk_loc for s in 1:kernel_nsub_pk_loc
 """ * cell * "\n" * """
-            yy .~ CensoredAddpropnormal.(mu, sigma_add, sigma_prop, pk_lloq)
-            qq .~ Normal.(qt_loc, qt_sd)
+            pk_conc .~ CensoredAddpropnormal.(mu, sigma_add, sigma_prop, pk_lloq)
+            ecg_y .~ Normal.(qt_loc, qt_sd)
             $obs
             mu
         end

@@ -14,10 +14,10 @@ begin
     log_k21 = b0_k21
     log_ka = b0_ka
     pk_sched = linear_pk_schedule(obs = (:subj, :time), dose = (:dsubj, :dtime, :damt))
-    conc ~ kernel(dv, log_Vc, log_k10, log_k12, log_k21, log_ka; subjects = kernel_nsub_conc) do yy, s_vc, s_k10, s_k12, s_k21, s_ka
-        read_locs = linear_pk_read_locs(pk_sched, s_vc, s_k10, s_k12, s_k21, s_ka)
+    @plate conc for s in 1:kernel_nsub_conc
+        read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_k10, log_k12, log_k21, log_ka)
         mu = read_locs[pk_sched.obs_map]
-        yy .~ Normal.(mu, sigma)
+        dv .~ Normal.(mu, sigma)
         mu
     end
 end

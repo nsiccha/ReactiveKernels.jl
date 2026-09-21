@@ -291,22 +291,19 @@ _pkc_lp_defs() = quote
 end
 
 _pkc_kernel_cell() = quote
-    read_locs =
-        linear_pk_read_locs(pk_sched, s_vc, s_k10, s_k12, s_k21, s_ka)
+    read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_k10, log_k12,
+        log_k21, log_ka)
     mu = read_locs[pk_sched.obs_map]
-    yy .~ Normal.(mu, sigma)
+    dv .~ Normal.(mu, sigma)
     mu
 end
 
 function _pkc_ast(cell = _pkc_kernel_cell())
     pre = _pkc_lp_defs()
-    ker = quote
-        conc ~ kernel(dv, log_Vc, log_k10, log_k12, log_k21, log_ka;
-            subjects = 2) do yy, s_vc, s_k10, s_k12, s_k21, s_ka
-            $(cell.args...)
-        end
-    end
-    return Expr(:block, pre.args..., ker.args...)
+    foro = Expr(:for, Expr(:(=), :s, Expr(:call, :(:), 1, 2)),
+        Expr(:block, cell.args...))
+    ker = Expr(:macrocall, Symbol("@plate"), LineNumberNode(0), :conc, foro)
+    return Expr(:block, pre.args..., ker)
 end
 
 function _pkc_columns(; n_sub::Int = 2)
@@ -336,83 +333,86 @@ end
     kern = (nucleus) -> Expr(:block, base...,
         Meta.parse("begin\n$nucleus\nend").args...)
     # Header shape.
-    @test_throws "needs `subjects=N`" lower_rkppl(kern(
-        "conc ~ kernel(dv, log_Vc) do yy, s_vc\n" *
+    @test_throws "range is `1:<N>`" lower_rkppl(kern(
+        "@plate conc for s in 2\n" *
+        " dv .~ Normal.(dv, sigma)\n dv\nend"), _PKC_DATA)
+    @test_throws "binds one axis variable" lower_rkppl(kern(
+        "@plate conc for (s, t) in 1:2\n" *
+        " dv .~ Normal.(dv, sigma)\n dv\nend"), _PKC_DATA)
+    # Removed kernel-do spells the plate pointer.
+    @test_throws "was removed" lower_rkppl(kern(
+        "conc ~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc\n" *
         " yy .~ Normal.(yy, sigma)\n yy\nend"), _PKC_DATA)
-    @test_throws "exactly one keyword" lower_rkppl(kern(
-        "conc ~ kernel(dv, log_Vc; subjects = 2, extra = 1) do yy, s_vc\n" *
-        " yy .~ Normal.(yy, sigma)\n yy\nend"), _PKC_DATA)
-    @test_throws "not bound data" lower_rkppl(kern(
-        "conc ~ kernel(nope, log_Vc; subjects = 2) do yy, s_vc\n" *
-        " yy .~ Normal.(yy, sigma)\n yy\nend"), _PKC_DATA)
-    @test_throws "at least one LP arg" lower_rkppl(kern(
-        "conc ~ kernel(dv; subjects = 2) do yy\n" *
-        " yy .~ Normal.(yy, sigma)\n yy\nend"), _PKC_DATA)
-    @test_throws "scalar `~`" lower_rkppl(kern(
-        "conc .~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc\n" *
-        " yy .~ Normal.(yy, sigma)\n yy\nend"), _PKC_DATA)
-    @test_throws "cell params for" lower_rkppl(kern(
-        "conc ~ kernel(dv, log_Vc; subjects = 2) do yy\n" *
-        " yy .~ Normal.(yy, sigma)\n yy\nend"), _PKC_DATA)
+    # Responses name data columns; one `.~` per response axis.
+    @test_throws "must name a response data column" lower_rkppl(kern(
+        "@plate conc for s in 1:2\n" *
+        " mu = dv\n nope .~ Normal.(mu, sigma)\n mu\nend"), _PKC_DATA)
+    @test_throws "observed twice" lower_rkppl(kern(
+        "@plate conc for s in 1:2\n" *
+        " mu = dv\n dv .~ Normal.(mu, sigma)\n" *
+        " dv .~ Normal.(mu, sigma)\n mu\nend"), _PKC_DATA)
+    # At least one LP definition is referenced in-cell.
+    @test_throws "references no LP definition" lower_rkppl(kern(
+        "@plate conc for s in 1:2\n" *
+        " read_locs = linear_pk_read_locs(pk_sched, sigma, sigma, sigma, " *
+        "sigma, sigma)\n" *
+        " mu = read_locs[pk_sched.obs_map]\n" *
+        " dv .~ Normal.(mu, sigma)\n mu\nend"), _PKC_DATA)
+    # Cell locals must not shadow outer names (SB write rule): data
+    # shadows fail in the plate check (data is unclaimed); definition
+    # shadows fail at claim time.
+    @test_throws "shadows a bound data column" lower_rkppl(kern(
+        "@plate conc for s in 1:2\n" *
+        " dv = 1.0\n dv .~ Normal.(dv, sigma)\n dv\nend"), _PKC_DATA)
+    @test_throws "defined twice" lower_rkppl(kern(
+        "@plate conc for s in 1:2\n" *
+        " log_Vc = 1.0\n dv .~ Normal.(dv, sigma)\n dv\nend"), _PKC_DATA)
     # Cell shape.
     @test_throws "no `.~` observation" lower_rkppl(kern(
-        "conc ~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc\n" *
-        " mu = yy\n mu\nend"), _PKC_DATA)
+        "@plate conc for s in 1:2\n" *
+        " mu = dv\n mu\nend"), _PKC_DATA)
     @test_throws "broadcasts" lower_rkppl(kern(
-        "conc ~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc\n" *
-        " yy ~ Normal(mu, sigma)\n mu\nend"), _PKC_DATA)
-    @test_throws "collected result" lower_rkppl(kern(
-        "conc ~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc\n" *
-        " yy .~ Normal.(yy, sigma)\n nope\nend"), _PKC_DATA)
+        "@plate conc for s in 1:2\n" *
+        " mu = dv\n dv ~ Normal(mu, sigma)\n mu\nend"), _PKC_DATA)
+    @test_throws "not a cell" lower_rkppl(kern(
+        "@plate conc for s in 1:2\n" *
+        " mu = log_Vc[subj]\n dv .~ Normal.(mu, sigma)\n nope\nend"),
+        _PKC_DATA)
     # Unknown families name the admitted five (message changed when the
     # joint families joined — the fail-closed behavior is unchanged).
     @test_throws "admits in-cell observations" lower_rkppl(kern(
-        "conc ~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc\n" *
-        " yy .~ StudentT.(3.0, yy, sigma)\n yy\nend"), _PKC_DATA)
+        "@plate conc for s in 1:2\n" *
+        " mu = log_Vc[subj]\n" *
+        " dv .~ StudentT.(3.0, dv, sigma)\n mu\nend"), _PKC_DATA)
     # Joint-family arities are exact (TGI cores take sigma too).
     @test_throws "exactly 7 arguments" lower_rkppl(kern(
-        "conc ~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc\n" *
-        " yy .~ TgiCategory.(yy, yy)\n yy\nend"), _PKC_DATA)
+        "@plate conc for s in 1:2\n" *
+        " mu = log_Vc[subj]\n" *
+        " dv .~ TgiCategory.(dv, dv)\n mu\nend"), _PKC_DATA)
     @test_throws "exactly 4 arguments" lower_rkppl(kern(
-        "conc ~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc\n" *
-        " yy .~ CensoredAddpropnormal.(yy, sigma)\n yy\nend"), _PKC_DATA)
+        "@plate conc for s in 1:2\n" *
+        " mu = log_Vc[subj]\n" *
+        " dv .~ CensoredAddpropnormal.(dv, sigma)\n mu\nend"), _PKC_DATA)
     # No inline scale/location expressions (assignment route only):
     # complex locations spell via a pre-assignment (julianic delta).
     @test_throws "cell/model name or a numeric literal" lower_rkppl(kern(
-        "conc ~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc\n" *
-        " yy .~ Normal.(yy, sigma .* w)\n yy\nend"), _PKC_DATA)
-    # Responses lead, LP args trail (data in an LP slot fails).
-    @test_throws "trails an LP definition" lower_rkppl(kern(
-        "conc ~ kernel(dv, log_Vc, dv; subjects = 2) do yy, s_vc, s2\n" *
-        " yy .~ Normal.(yy, sigma)\n yy\nend"), _PKC_DATA)
-    @test_throws "duplicate slice columns" lower_rkppl(kern(
-        "conc ~ kernel(dv, dv, log_Vc; subjects = 2) do yy, yy2, s_vc\n" *
-        " read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc, " *
-        "s_vc, s_vc)\n" *
-        " mu = read_locs[pk_sched.obs_map]\n" *
-        " yy .~ Normal.(mu, sigma)\n mu\nend"), _PKC_DATA)
-    # LP args resolve to definitions (unknown / params fail).
-    @test_throws "LP arg `nope`" lower_rkppl(kern(
-        "conc ~ kernel(dv, nope; subjects = 2) do yy, s_vc\n" *
-        " yy .~ Normal.(yy, sigma)\n yy\nend"), _PKC_DATA)
-    @test_throws "LP arg `sigma`" lower_rkppl(kern(
-        "conc ~ kernel(dv, sigma; subjects = 2) do yy, s_vc\n" *
-        " yy .~ Normal.(yy, sigma)\n yy\nend"), _PKC_DATA)
+        "@plate conc for s in 1:2\n" *
+        " mu = log_Vc[subj]\n" *
+        " dv .~ Normal.(dv, sigma .* w)\n mu\nend"), _PKC_DATA)
     # Schedules: declared, referenced, used.
     nosched = Expr(:block,
         filter(a -> !(a isa Expr && a.head === :(=) &&
             a.args[1] === :pk_sched), base)...,
-        Meta.parse("begin\nconc ~ kernel(dv, log_Vc; subjects = 2) " *
-            "do yy, s_vc\n" *
-            " read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, " *
-            "s_vc, s_vc, s_vc)\n" *
+        Meta.parse("begin\n@plate conc for s in 1:2\n" *
+            " read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc, " *
+            "log_Vc, log_Vc, log_Vc)\n" *
             " mu = read_locs[pk_sched.obs_map]\n" *
-            " yy .~ Normal.(mu, sigma)\n mu\nend\nend").args...)
+            " dv .~ Normal.(mu, sigma)\n mu\nend\nend").args...)
     @test_throws "not declared" lower_rkppl(nosched, _PKC_DATA)
     unused = Expr(:block, base...,
-        Meta.parse("begin\nconc ~ kernel(dv, log_Vc; subjects = 2) " *
-            "do yy, s_vc\n" *
-            " yy .~ Normal.(yy, sigma)\n yy\nend\nend").args...)
+        Meta.parse("begin\n@plate conc for s in 1:2\n" *
+            " mu = log_Vc[subj]\n" *
+            " dv .~ Normal.(mu, sigma)\n mu\nend\nend").args...)
     @test_throws "leaves schedule" lower_rkppl(unused, _PKC_DATA)
     # Schedule declaration shape.
     schedcase = (decl) -> lower_rkppl(
@@ -468,13 +468,13 @@ end
         Meta.parse("begin\nc_cr ~ Normal(0.0, 1.0)\nc_pr ~ Normal(0.0, 1.0)\n" *
             "c_pd ~ Normal(0.0, 1.0)\ntgi_sg ~ Normal(0.0, 1.0)\n" *
             "eps ~ Normal(0.0, 1.0)\n" *
-            "cc ~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc\n" *
-            " read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc, " *
-            "s_vc, s_vc)\n" *
+            "@plate cc for s in 1:2\n" *
+            " read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc, " *
+            "log_Vc, log_Vc, log_Vc)\n" *
             " r = read_locs[pk_sched.obs_map]\n" *
             " ref = read_locs[pk_sched.obs_map]\n" *
-            " yy .~ TgiCategory.(r, ref, c_cr, c_pr, c_pd, tgi_sg, eps)\n" *
-            " yy\nend\nend").args...)
+            " dv .~ TgiCategory.(r, ref, c_cr, c_pr, c_pd, tgi_sg, eps)\n" *
+            " r\nend\nend").args...)
     plan = lower_rkppl(prog, _PKC_DATA)
     obs = only(only(plan.kernel_plates).obs)
     @test obs.family === TgiCategoryFam
@@ -484,58 +484,57 @@ end
 @testset "grouped cell + structure fail-closed battery" begin
     base = _pkc_lp_defs().args
     cellcase = (cell) -> lower_rkppl(Expr(:block, base...,
-            Meta.parse("begin\nconc ~ kernel(dv, log_Vc, log_k10, log_k12, " *
-                "log_k21, log_ka; subjects = 2) do yy, s_vc, s_k10, s_k12, " *
-                "s_k21, s_ka\n$cell\nend\nend").args...), _PKC_DATA)
-    fullcall =
-        "read_locs = linear_pk_read_locs(pk_sched, s_vc, s_k10, s_k12, s_k21, s_ka)"
+            Meta.parse("begin\n@plate conc for s in 1:2\n$cell\nend\nend").args...),
+        _PKC_DATA)
+    fullcall = "read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_k10, " *
+        "log_k12, log_k21, log_ka)"
     # Cell-call shape (contract walker).
     @test_throws "takes 6 arguments" cellcase(
-        "read_locs = linear_pk_read_locs(pk_sched, s_vc)\n" *
+        "read_locs = linear_pk_read_locs(pk_sched, log_Vc)\n" *
         "mu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "dv .~ Normal.(mu, sigma)\nmu")
     @test_throws "not declared" cellcase(
-        "read_locs = linear_pk_read_locs(s_vc, s_vc, s_vc, s_vc, s_vc, s_vc)\n" *
+        "read_locs = linear_pk_read_locs(log_Vc, log_Vc, log_Vc, log_Vc, log_Vc, log_Vc)\n" *
         "mu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "dv .~ Normal.(mu, sigma)\nmu")
     @test_throws "not in the grouped-v1 cell vocabulary" cellcase(
-        "read_locs = pk_conc(pk_sched, s_vc, s_k10, s_k12, s_k21, s_ka)\n" *
+        "read_locs = pk_conc(pk_sched, log_Vc, log_k10, log_k12, log_k21, log_ka)\n" *
         "mu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "dv .~ Normal.(mu, sigma)\nmu")
     @test_throws "compile-time handle" cellcase(
         "x = pk_sched\n$fullcall\n" *
         "mu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "dv .~ Normal.(mu, sigma)\nmu")
     # Gathers.
     @test_throws "must be a schedule map" cellcase(
         "$fullcall\nmu = read_locs[1]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "dv .~ Normal.(mu, sigma)\nmu")
     @test_throws "not declared" cellcase(
         "$fullcall\nmu = read_locs[other.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "dv .~ Normal.(mu, sigma)\nmu")
     # Names + reductions.
     @test_throws "unknown name" cellcase(
         "$fullcall\nmu = read_locs[pk_sched.obs_map]\n" *
-        "x = nope .+ 1.0\nyy .~ Normal.(mu, sigma)\nmu")
+        "x = nope .+ 1.0\ndv .~ Normal.(mu, sigma)\nmu")
     @test_throws "does not lower in a cell" cellcase(
         "$fullcall\nmu = read_locs[pk_sched.obs_map]\n" *
-        "x = sum(mu)\nyy .~ Normal.(mu, sigma)\nmu")
+        "x = sum(mu)\ndv .~ Normal.(mu, sigma)\nmu")
     # Bind-time shapes (surface + structure pass; bind proves spaces).
     bindshapes = (cell) -> bind_data(cellcase(cell), _pkc_columns())
     @test_throws "is not read-space" bindshapes(
-        "$fullcall\nmu = yy[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "$fullcall\nmu = dv[pk_sched.obs_map]\n" *
+        "dv .~ Normal.(mu, sigma)\nmu")
     @test_throws "gather to the obs axis first" bindshapes(
         "$fullcall\nx = read_locs .+ 1.0\n" *
         "mu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "dv .~ Normal.(mu, sigma)\nmu")
     @test_throws "write the dotted form" bindshapes(
         "$fullcall\nmu = read_locs[pk_sched.obs_map]\n" *
-        "x = mu + 1.0\nyy .~ Normal.(x, sigma)\nx")
+        "x = mu + 1.0\ndv .~ Normal.(x, sigma)\nx")
     @test_throws "per-subject LP cell params or model scalars" bindshapes(
-        "read_locs = linear_pk_read_locs(pk_sched, yy, s_k10, s_k12, s_k21, s_ka)\n" *
+        "read_locs = linear_pk_read_locs(pk_sched, dv, log_k10, log_k12, log_k21, log_ka)\n" *
         "mu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "dv .~ Normal.(mu, sigma)\nmu")
 
     # Hand-mutated IR (panel/grouped form rules).
     panel0 = lower_rkppl(Meta.parse("begin\nsigma ~ Exponential(1.0)\n" *
@@ -594,26 +593,32 @@ end
     # Mixed-level predictor (response + kernel share one definition).
     @test_throws "mixed-level" lower_rkppl(Expr(:block, base...,
             Meta.parse("begin\ny .~ Normal.(log_Vc, sigma)\nend").args...,
-            Meta.parse("begin\nconc ~ kernel(dv, log_Vc; subjects = 2) " *
-                "do yy, s_vc\n" *
-                " read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, " *
-                "s_vc, s_vc, s_vc)\n" *
+            Meta.parse("begin\n@plate conc for s in 1:2\n" *
+                " read_locs = linear_pk_read_locs(pk_sched, log_Vc, " *
+                "log_Vc, log_Vc, log_Vc, log_Vc)\n" *
                 " mu = read_locs[pk_sched.obs_map]\n" *
-                " yy .~ Normal.(mu, sigma)\n mu\nend\nend").args...),
+                " dv .~ Normal.(mu, sigma)\n mu\nend\nend").args...),
         union(_PKC_DATA, Set([:y])))
 
-    # Summand-bearing subject predictor (varying seam) fails closed.
-    @test_throws "carries a" lower_rkppl(Expr(:block, base...,
+    # Varying-backed subject predictor (varying seam): admitted since
+    # VaryingEffectTerm joined the subject-term kinds (the joint model
+    # feeds varying-backed LPs to its kernel). This used to fail closed
+    # ("carries a") before the seam; the stale rejection was already
+    # dead on main (verified: same nucleus lowers on clean 0dcf84d).
+    varyok = lower_rkppl(Expr(:block, base...,
             Meta.parse("begin\nr ~ varying_effect(g, [1])\nend").args...,
             Meta.parse("begin\nb0_v2 ~ Normal(0.0, 1.0)\nend").args...,
             Meta.parse("begin\nlog_Vc2 = b0_v2 .+ r\nend").args...,
-            Meta.parse("begin\nconc ~ kernel(dv, log_Vc2; subjects = 2) " *
-                "do yy, s_vc\n" *
-                " read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, " *
-                "s_vc, s_vc, s_vc)\n" *
+            Meta.parse("begin\n@plate conc for s in 1:2\n" *
+                " read_locs = linear_pk_read_locs(pk_sched, log_Vc2, " *
+                "log_Vc2, log_Vc2, log_Vc2, log_Vc2)\n" *
                 " mu = read_locs[pk_sched.obs_map]\n" *
-                " yy .~ Normal.(mu, sigma)\n mu\nend\nend").args...),
+                " dv .~ Normal.(mu, sigma)\n mu\nend\nend").args...),
         union(_PKC_DATA, Set([:g])))
+    @test any(t -> t.kind === VaryingEffectTerm,
+        only(filter(p -> p.name === :log_Vc2, varyok.predictors)).terms)
+    @test (:log_Vc2, :log_Vc2) in
+        only(varyok.kernel_plates).lp_args
     # Hand-built call with a non-schedule first arg (the contract side of
     # the schedule-first rule — surface catches the undeclared case).
     kp_call = only(grouped0.kernel_plates)
@@ -650,7 +655,7 @@ end
     # (the n_obs gate in bound-plan validation is the backstop).
     bad_resp = _pkc_columns()
     bad_resp[:dv] = [10.0, 8.0, 0.5]
-    @test_throws "≠ response `yy` length 3" bind_data(unbound, bad_resp)
+    @test_throws "≠ response `dv` length 3" bind_data(unbound, bad_resp)
     bad_sub = _pkc_columns()
     bad_sub[:age_s] = [35.0, 52.0, 40.0]
     @test_throws "want n_sub" bind_data(unbound, bad_sub)
@@ -669,12 +674,11 @@ end
             "b0 ~ Normal(0.0, 1.0)\nlog_Vc = b0\n" *
             "pk_sched = linear_pk_schedule(obs = (:subj, :time), " *
             "dose = (:dsubj, :dtime, :damt))\n" *
-            "conc ~ kernel(dv, log_Vc; subjects = kernel_nsub_conc) " *
-            "do yy, s_vc\n" *
-            " read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, " *
-            "s_vc, s_vc, s_vc)\n" *
+            "@plate conc for s in 1:kernel_nsub_conc\n" *
+            " read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc, " *
+            "log_Vc, log_Vc, log_Vc)\n" *
             " mu = read_locs[pk_sched.obs_map]\n" *
-            " yy .~ Normal.(mu, sigma)\n mu\nend\nend"), _PKC_DATA)
+            " dv .~ Normal.(mu, sigma)\n mu\nend\nend"), _PKC_DATA)
     keyed_cols = _pkc_columns()
     delete!(keyed_cols, :age_s)
     keyed_bound = bind_data(keyed, keyed_cols;
@@ -698,12 +702,11 @@ end
     ast = Expr(:block, no_k10...,
         Meta.parse("begin\nc_sex[levels(sex_s)] .~ Normal.(0, 2)\nend").args...,
         Meta.parse("begin\nlog_k10 = c_sex[sex_s]\nend").args...,
-        Meta.parse("begin\nconc ~ kernel(dv, log_Vc, log_k10; " *
-            "subjects = 2) do yy, s_vc, s_k10\n" *
-            " read_locs = linear_pk_read_locs(pk_sched, s_vc, s_k10, " *
-            "s_k10, s_k10, s_k10)\n" *
+        Meta.parse("begin\n@plate conc for s in 1:2\n" *
+            " read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_k10, " *
+            "log_k10, log_k10, log_k10)\n" *
             " mu = read_locs[pk_sched.obs_map]\n" *
-            " yy .~ Normal.(mu, sigma)\n mu\nend\nend").args...)
+            " dv .~ Normal.(mu, sigma)\n mu\nend\nend").args...)
     unbound = lower_rkppl(ast, _PKC_DATA)
     @test any(t -> t.kind === FactorTerm,
         only(filter(p -> p.name === :log_k10, unbound.predictors)).terms)
@@ -800,14 +803,12 @@ end
     # plates, one collected name. The joint is the plate sum.
     ast = Expr(:block, _pkc_lp_defs().args...,
         Meta.parse("begin\nsigma2 ~ Exponential(1.0)\nend").args...,
-        Meta.parse("begin\nconc ~ kernel(dv, dv2, log_Vc, log_k10, " *
-            "log_k12, log_k21, log_ka; subjects = 2) " *
-            "do yy, yy2, s_vc, s_k10, s_k12, s_k21, s_ka\n" *
-            " read_locs = linear_pk_read_locs(pk_sched, s_vc, s_k10, " *
-            "s_k12, s_k21, s_ka)\n" *
+        Meta.parse("begin\n@plate conc for s in 1:2\n" *
+            " read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_k10, " *
+            "log_k12, log_k21, log_ka)\n" *
             " mu = read_locs[pk_sched.obs_map]\n" *
-            " yy .~ Normal.(mu, sigma)\n" *
-            " yy2 .~ Normal.(mu, sigma2)\n mu\nend\nend").args...)
+            " dv .~ Normal.(mu, sigma)\n" *
+            " dv2 .~ Normal.(mu, sigma2)\n mu\nend\nend").args...)
     unbound = lower_rkppl(ast, _PKC_DATA)
     @test length(only(unbound.kernel_plates).obs) == 2
     cols = _pkc_columns()
@@ -915,17 +916,16 @@ _pkl_lp_defs() = Expr(:block, _pkc_lp_defs().args...,
 
 function _pkl_ast1()
     pre = _pkl_lp_defs()
-    ker = quote
-        conc ~ kernel(dv, log_Vc, log_k10, log_k12, log_k21, log_ka;
-            subjects = 1) do yy, s_vc, s_k10, s_k12, s_k21, s_ka
-            read_locs = linear_pk_read_locs(pk_sched, log_F, s_vc, s_k10,
-                s_k12, s_k21, s_ka)
-            mu = read_locs[pk_sched.obs_map]
-            yy .~ Normal.(mu, sigma)
-            mu
-        end
+    inner = quote
+        read_locs = linear_pk_read_locs(pk_sched, log_F, log_Vc, log_k10,
+            log_k12, log_k21, log_ka)
+        mu = read_locs[pk_sched.obs_map]
+        dv .~ Normal.(mu, sigma)
+        mu
     end
-    return Expr(:block, pre.args..., ker.args...)
+    foro = Expr(:for, Expr(:(=), :s, Expr(:call, :(:), 1, 1)), inner)
+    ker = Expr(:macrocall, Symbol("@plate"), LineNumberNode(0), :conc, foro)
+    return Expr(:block, pre.args..., ker)
 end
 
 # Independent event-LP evaluator (hand-rolled from SB
@@ -1152,13 +1152,11 @@ end
     base = _pkc_lp_defs().args
     declcase = (decl) -> lower_rkppl(Expr(:block, base...,
             Meta.parse("begin\n$decl\nend").args...,
-            Meta.parse("begin\nconc ~ kernel(dv, log_Vc, log_k10, log_k12, " *
-                "log_k21, log_ka; subjects = 2) do yy, s_vc, s_k10, s_k12, " *
-                "s_k21, s_ka\n" *
-                "read_locs = linear_pk_read_locs(pk_sched, log_F, s_vc, " *
-                "s_k10, s_k12, s_k21, s_ka)\n" *
+            Meta.parse("begin\n@plate conc for s in 1:2\n" *
+                "read_locs = linear_pk_read_locs(pk_sched, log_F, log_Vc, " *
+                "log_k10, log_k12, log_k21, log_ka)\n" *
                 "mu = read_locs[pk_sched.obs_map]\n" *
-                "yy .~ Normal.(mu, sigma)\nmu\nend\nend").args...), _PKC_DATA)
+                "dv .~ Normal.(mu, sigma)\nmu\nend\nend").args...), _PKC_DATA)
     # Declaration shape.
     @test_throws "fixed to `log_F`" declcase(
         "bioav = linear_pk_log_f(pk_sched; k = 5)")
@@ -1190,32 +1188,28 @@ end
     # Call shape (7-arg form; the 6-arg v1 battery above is untouched).
     fullbase = _pkl_lp_defs().args
     cellcase = (cell) -> lower_rkppl(Expr(:block, fullbase...,
-            Meta.parse("begin\nconc ~ kernel(dv, log_Vc, log_k10, log_k12, " *
-                "log_k21, log_ka; subjects = 2) do yy, s_vc, s_k10, s_k12, " *
-                "s_k21, s_ka\n$cell\nend\nend").args...), _PKC_DATA)
-    full7 = "read_locs = linear_pk_read_locs(pk_sched, log_F, s_vc, s_k10, " *
-        "s_k12, s_k21, s_ka)"
+            Meta.parse("begin\n@plate conc for s in 1:2\n$cell\nend\nend").args...),
+        _PKC_DATA)
+    full7 = "read_locs = linear_pk_read_locs(pk_sched, log_F, log_Vc, log_k10, " *
+        "log_k12, log_k21, log_ka)"
     tail = "\nmu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu"
+        "dv .~ Normal.(mu, sigma)\nmu"
     # A malformed call never counts as a use (surface reports the
     # unused LP; the walker's count pin is proved at contract level).
     @test_throws "leaves event-LP" cellcase(
-        "read_locs = linear_pk_read_locs(pk_sched, log_F, s_vc, s_k10)" *
+        "read_locs = linear_pk_read_locs(pk_sched, log_F, log_Vc, log_k10)" *
         tail)
     @test_throws "not declared" cellcase(
-        "read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_k10, " *
-        "s_k12, s_k21, s_ka)" * tail)
+        "read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc, log_k10, " *
+        "log_k12, log_k21, log_ka)" * tail)
     # Linkage both ways (surface owns declared/used).
     @test_throws "not declared" lower_rkppl(Expr(:block, base...,
-            Meta.parse("begin\nconc ~ kernel(dv, log_Vc, log_k10, log_k12, " *
-                "log_k21, log_ka; subjects = 2) do yy, s_vc, s_k10, s_k12, " *
-                "s_k21, s_ka\n$full7$tail\nend\nend").args...), _PKC_DATA)
+            Meta.parse("begin\n@plate conc for s in 1:2\n$full7$tail\nend\nend").args...),
+        _PKC_DATA)
     @test_throws "leaves event-LP" lower_rkppl(Expr(:block, fullbase...,
-            Meta.parse("begin\nconc ~ kernel(dv, log_Vc, log_k10, log_k12, " *
-                "log_k21, log_ka; subjects = 2) do yy, s_vc, s_k10, s_k12, " *
-                "s_k21, s_ka\n" *
-                "read_locs = linear_pk_read_locs(pk_sched, s_vc, s_k10, " *
-                "s_k12, s_k21, s_ka)$tail\nend\nend").args...), _PKC_DATA)
+            Meta.parse("begin\n@plate conc for s in 1:2\n" *
+                "read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_k10, " *
+                "log_k12, log_k21, log_ka)$tail\nend\nend").args...), _PKC_DATA)
     # The 7-arg valid call lowers (structure proves it below).
     good = cellcase(full7 * tail)
     @test length(good.event_lps) == 1
@@ -1237,12 +1231,10 @@ end
     # codegen.
     @test_throws "not declared" validate_structure(strip(good))
     # Dangling LP (declared, never called) fails closed too.
-    six = Meta.parse("begin\nconc ~ kernel(dv, log_Vc, log_k10, log_k12, " *
-        "log_k21, log_ka; subjects = 1) do yy, s_vc, s_k10, s_k12, s_k21, " *
-        "s_ka\n" *
-        "read_locs = linear_pk_read_locs(pk_sched, s_vc, s_k10, s_k12, " *
-        "s_k21, s_ka)\nmu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu\nend\nend")
+    six = Meta.parse("begin\n@plate conc for s in 1:1\n" *
+        "read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_k10, " *
+        "log_k12, log_k21, log_ka)\nmu = read_locs[pk_sched.obs_map]\n" *
+        "dv .~ Normal.(mu, sigma)\nmu\nend\nend")
     # (surface rejects this first — prove the contract layer directly
     # on a hand-spliced plan instead.)
     kp6 = only(lower_rkppl(Expr(:block, _pkc_lp_defs().args...,
@@ -1395,12 +1387,11 @@ end
         :age_s => [0.1], :subj => [1], :time => [24.0],
         :dsubj => [1], :dtime => [0.0], :damt => [100.0], :dv => [1.0])
     one = Expr(:block, _pkl_lp_defs().args...,
-        Meta.parse("begin\nconc ~ kernel(dv, log_Vc, log_k10, log_k12, " *
-            "log_k21, log_ka; subjects = 1) do yy, s_vc, s_k10, s_k12, " *
-            "s_k21, s_ka\n" *
-            "read_locs = linear_pk_read_locs(pk_sched, log_F, s_vc, s_k10, " *
-            "s_k12, s_k21, s_ka)\nmu = read_locs[pk_sched.obs_map]\n" *
-            "yy .~ Normal.(mu, sigma)\nmu\nend\nend").args...)
+        Meta.parse("begin\n@plate conc for s in 1:1\n" *
+            "read_locs = linear_pk_read_locs(pk_sched, log_F, log_Vc, " *
+            "log_k10, log_k12, log_k21, log_ka)\n" *
+            "mu = read_locs[pk_sched.obs_map]\n" *
+            "dv .~ Normal.(mu, sigma)\nmu\nend\nend").args...)
     @test_throws "degenerate" bind_data(lower_rkppl(one, _PKL_DATA), single)
     # Rebuild gates: tampered products never validate.
     tam = deepcopy(bound.columns)
@@ -1499,17 +1490,16 @@ end
 
 function _pkl_ast2()
     pre = _pkl_lp_defs()
-    ker = quote
-        conc ~ kernel(dv, log_Vc, log_k10, log_k12, log_k21, log_ka;
-            subjects = 2) do yy, s_vc, s_k10, s_k12, s_k21, s_ka
-            read_locs = linear_pk_read_locs(pk_sched, log_F, s_vc, s_k10,
-                s_k12, s_k21, s_ka)
-            mu = read_locs[pk_sched.obs_map]
-            yy .~ Normal.(mu, sigma)
-            mu
-        end
+    inner = quote
+        read_locs = linear_pk_read_locs(pk_sched, log_F, log_Vc, log_k10,
+            log_k12, log_k21, log_ka)
+        mu = read_locs[pk_sched.obs_map]
+        dv .~ Normal.(mu, sigma)
+        mu
     end
-    return Expr(:block, pre.args..., ker.args...)
+    foro = Expr(:for, Expr(:(=), :s, Expr(:call, :(:), 1, 2)), inner)
+    ker = Expr(:macrocall, Symbol("@plate"), LineNumberNode(0), :conc, foro)
+    return Expr(:block, pre.args..., ker)
 end
 
 # Two-subject V2 oracle: per-subject LP scalars, the flat event-axis
