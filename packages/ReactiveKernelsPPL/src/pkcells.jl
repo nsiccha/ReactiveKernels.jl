@@ -47,6 +47,22 @@ const LINEAR_EVENT_READ = 1
 const LINEAR_EVENT_DOSE = 2
 const LINEAR_EVENT_DOSE_SEGMENT = 3
 
+# Per-op reads of the `log_F` slice inside the recurrence loop.  `log_F` is
+# parameter-dependent (`linear_pk_event_log_f`, an HSGP over the event axis),
+# so under Reactant it arrives as a `TracedRArray` — or a `view` of one — and
+# a plain `log_F[j]` is the scalar read the tracer refuses (`Scalar indexing
+# is disallowed`, measured on Reactant 0.2.285 compiling the joint fixture;
+# `test_reactant_joint.jl` pins the fix).  The cell is opaque Julia called
+# from generated code, so RK's `@kernel` tensorized rewrite cannot reach this
+# read and no Reactant-extension method can intercept `getindex` on a Base
+# `SubArray` without piracy; the read itself routes through RK's
+# tensorized-gather hook instead.  Natively that hook IS `Base.getindex`
+# (bit-identical, zero overhead); the RK Reactant extension lowers the
+# concrete-index read on a traced vector/view to a 1-element slice.  The op
+# columns (`op_type`, `op_dt`, `op_amount`, …) are bound data and keep plain
+# `getindex`.
+const _traced_op_read = ReactiveKernels._tensorized_getindex
+
 _pk_sched_fail(msg) = throw(ContractValidationError("[schedule] " * msg))
 
 """
@@ -1044,7 +1060,7 @@ function linear_pk_read_locs(op_type::AbstractVector,
             # Encounter order is read order (see docstring): append.
             push!(read_locs, state[2] / Vc)
         else
-            effective_amount = op_amount[j] * exp(log_F[j])
+            effective_amount = op_amount[j] * exp(_traced_op_read(log_F, j))
             if op_type[j] == LINEAR_EVENT_DOSE
                 state = linear_pk_add_dose_3(state, effective_amount)
             else
@@ -1119,7 +1135,7 @@ function linear_pk_read_locs_auc(op_type::AbstractVector,
             push!(conc, state[2] / Vc)
             push!(auc, (given - (state[1] + state[2] + state[3])) / CL)
         else
-            effective_amount = op_amount[j] * exp(log_F[j])
+            effective_amount = op_amount[j] * exp(_traced_op_read(log_F, j))
             if op_type[j] == LINEAR_EVENT_DOSE
                 state = linear_pk_add_dose_3(state, effective_amount)
                 given += effective_amount

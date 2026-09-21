@@ -20,6 +20,8 @@ using Test
 
 isdefined(@__MODULE__, :_parity_columns) ||
     include(joinpath(@__DIR__, "parity", "joint_parity_fixture.jl"))
+isdefined(@__MODULE__, :tiled_columns) ||
+    include(joinpath(@__DIR__, "parity", "joint_tiling.jl"))
 
 const _RJ_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
@@ -66,4 +68,34 @@ end
     rval, rgrad = cad(Reactant.to_rarray(u))
     @test Float64(rval) ≈ native rtol = 1e-9
     @test Array(rgrad) ≈ g rtol = 1e-9
+end
+
+# Joint fixture at tiling K: bound plan + built program + sampler-cut kernel
+# + a deterministic unconstrained point (the benchmark's point, seed
+# 20260917).  `tiled_columns(1)` is the fixture itself (pinned below).
+function _rj_joint(K)
+    bound = bind_data(final_plan("continuous"), tiled_columns(K);
+        dims = Dict(:kernel_nsub_pk_loc => 3K))
+    built = build_kernel(bound)
+    post_q = prepare_query(built, bound, :sampler)
+    u = Vector{Float64}(0.1 .* randn(Xoshiro(20260917), built.layout.total))
+    return (; bound, built, post_q, u)
+end
+
+@testset "Reactant ladder 2: joint K=1 primal @compile parity" begin
+    fx = _rj_joint(1)
+    @test fx.built.layout.total == 101
+    native = fx.post_q(fx.u)
+    # The tiling helper at K=1 reproduces the parity fixture's columns.
+    bound_f = bind_data(final_plan("continuous"), _parity_columns("continuous");
+        dims = Dict(:kernel_nsub_pk_loc => 3))
+    @test prepare_query(build_kernel(bound_f), bound_f, :sampler)(fx.u) == native
+    # Full-program compile of the sampler-cut kernel.  The only lowering gap
+    # this hit was the PK cell's per-op `log_F[j]` read on the traced
+    # bioavailability slice (now `_traced_op_read`, pkcells.jl); everything
+    # else — packed reads, gathers, the TGI scan, plates — traces as authored.
+    compiled = Reactant.@compile fx.post_q(Reactant.to_rarray(fx.u))
+    @test Float64(compiled(Reactant.to_rarray(fx.u))) ≈ native rtol = 1e-9
+    u2 = Vector{Float64}(0.1 .* randn(Xoshiro(7), length(fx.u)))
+    @test Float64(compiled(Reactant.to_rarray(u2))) ≈ fx.post_q(u2) rtol = 1e-9
 end
