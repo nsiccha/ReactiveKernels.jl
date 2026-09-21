@@ -60,7 +60,9 @@ end
 @testset "grouped emission is O(1) in the subject count" begin
     h1, def1 = _parity_statement_heads(1)
     h3, _ = _parity_statement_heads(3)
+    h10, _ = _parity_statement_heads(10)
     @test h1 == h3
+    @test h1 == h10
     @test h1["=call:linear_pk_read_locs_auc_over_subjects"] == 1
     @test h1["=call:tgi_segmented_nadir"] == 1
     r = repr(def1)
