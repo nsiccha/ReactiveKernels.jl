@@ -723,11 +723,10 @@ end
     @test nt.b_g[1, 1] ≈ nt.tau_g[1] * nt.z_flat_g[1]
     # Roundtrip ignores the derived b (constrain output feeds unconstrain).
     @test unconstrain(layout, nt) ≈ u
-    # Jacobian: sigma + tau exps + the K=2 theta term, hand-summed
-    # (the (i-j) = 1 exponent keeps one log-sin term — F1 fix; the old
-    # pure-logistic pin asserted the sphere-volume bug).
-    s = 1 / (1 + exp(-u[3]))
-    lkj = log(sin(pi * s)) + log(pi) + log(s) + log1p(-s)
+    # Jacobian: sigma + tau exps + the K=2 vine term, hand-summed
+    # (Stan's log(1-tanh²); the hyperspherical pin it replaces is kept
+    # in test_lkj_jacobian's retention set).
+    lkj = log(1 - tanh(u[3])^2)
     @test logjac(layout, u) ≈ u[2] + u[4] + u[5] + lkj
 end
 
@@ -791,9 +790,7 @@ end
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
         # No +log(2): SB Stan-convention tau (see the generator comment).
         @test _query(built.spec, bound, :prior, u) ≈ pr
-        s = 1 / (1 + exp(-u[3]))
-        jac = u[2] + u[4] + u[5] + log(sin(pi * s)) + log(pi) + log(s) +
-            log1p(-s)
+        jac = u[2] + u[4] + u[5] + log(1 - tanh(u[3])^2)
         @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
         _check_gradient(built.spec, bound, u)
     end
@@ -831,14 +828,10 @@ end
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
-    # Jacobian: sigma + tau exps + row-2/row-3 theta terms (the
-    # (i-j) Gram exponents: 1, 2, 1 — F1 fix).
-    s3 = 1 / (1 + exp(-u[3]))
-    s4 = 1 / (1 + exp(-u[4]))
-    s5 = 1 / (1 + exp(-u[5]))
-    lj = log(sin(pi * s3)) + log(pi) + log(s3) + log1p(-s3) +
-        2 * log(sin(pi * s4)) + log(pi) + log(s4) + log1p(-s4) +
-        log(sin(pi * s5)) + log(pi) + log(s5) + log1p(-s5)
+    # Jacobian: sigma + tau exps + K=3 vine terms (Stan weights
+    # (j-i+1)/2 over column-block order: 1, 1.5, 1).
+    lj = log(1 - tanh(u[3])^2) + 1.5 * log(1 - tanh(u[4])^2) +
+        log(1 - tanh(u[5])^2)
     jac = u[2] + u[6] + u[7] + u[8] + lj
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
     _check_gradient(built.spec, bound, u)
@@ -917,9 +910,7 @@ end
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
-    s4 = 1 / (1 + exp(-u[4]))
-    jac = u[3] + u[5] + u[6] + log(sin(pi * s4)) + log(pi) + log(s4) +
-        log1p(-s4)
+    jac = u[3] + u[5] + u[6] + log(1 - tanh(u[4])^2)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
     _check_gradient(built.spec, bound, u)
 end
@@ -1345,9 +1336,7 @@ end
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
-    s = 1 / (1 + exp(-u[3]))
-    jac = u[2] + u[4] + u[5] + log(sin(pi * s)) + log(pi) + log(s) +
-        log1p(-s)
+    jac = u[2] + u[4] + u[5] + log(1 - tanh(u[3])^2)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
     _check_gradient(built.spec, bound, u)
 end
@@ -1558,9 +1547,7 @@ end
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     # No truncation renormalizer: Stan lower-bound kernel semantics.
     @test _query(built.spec, bound, :prior, u) ≈ pr
-    s = 1 / (1 + exp(-u[3]))
-    jac = u[2] + u[4] + u[5] + log(sin(pi * s)) + log(pi) + log(s) +
-        log1p(-s)
+    jac = u[2] + u[4] + u[5] + log(1 - tanh(u[3])^2)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
     _check_gradient(built.spec, bound, u)
 end
@@ -1595,9 +1582,7 @@ end
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
-    s = 1 / (1 + exp(-u[3]))
-    jac = u[2] + u[4] + u[5] + log(sin(pi * s)) + log(pi) + log(s) +
-        log1p(-s)
+    jac = u[2] + u[4] + u[5] + log(1 - tanh(u[3])^2)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
     _check_gradient(built.spec, bound, u)
 end
