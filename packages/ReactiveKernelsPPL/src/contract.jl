@@ -1337,14 +1337,17 @@ end
 # Every model-scope name a kernel plate introduces (cell names become flat
 # model-scope locals at codegen): the result, slice params, and cell-local
 # assignment names. Grouped plates additionally introduce their LP cell
-# params and schedule handles. Single source for the global name-table gate.
+# params and schedule handles — EXCEPT self-aliasing params (`(c, c)`
+# slices, `(pname, pname)` LP refs): those are lexical references to an
+# outer column/definition (the plate spelling), not introductions.
+# Single source for the global name-table gate.
 function _kernel_all_names(kp::KernelPlate)
     names = Symbol[kp.result]
-    for (_, p, _) in kp.slices
-        push!(names, p)
+    for (c, p, _) in kp.slices
+        p == c || push!(names, p)
     end
-    for (_, p) in kp.lp_args
-        push!(names, p)
+    for (pname, c) in kp.lp_args
+        c == pname || push!(names, c)
     end
     for s in kp.schedules
         push!(names, s.name)

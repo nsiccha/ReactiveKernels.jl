@@ -200,22 +200,21 @@ _je_lp_defs(decl = "pk_sched = linear_pk_schedule(obs = (:subj, :time), " *
 end
 
 _je_kernel_cell() = quote
-    read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc, s_vc, s_vc)
+    read_locs =
+        linear_pk_read_locs(pk_sched, log_Vc, log_Vc, log_Vc, log_Vc, log_Vc)
     mu = read_locs[pk_sched.obs_map]
     e = read_locs[pk_sched.ecg_map]
     t = read_locs[pk_sched.tgi_map]
-    yy .~ Normal.(mu, sigma)
+    dv .~ Normal.(mu, sigma)
     mu
 end
 
 function _je_ast(cell = _je_kernel_cell(), decl = nothing)
     pre = decl === nothing ? _je_lp_defs() : _je_lp_defs(decl)
-    ker = quote
-        conc ~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc
-            $(cell.args...)
-        end
-    end
-    return Expr(:block, pre.args..., ker.args...)
+    foro = Expr(:for, Expr(:(=), :s, Expr(:call, :(:), 1, 2)),
+        Expr(:block, cell.args...))
+    ker = Expr(:macrocall, Symbol("@plate"), LineNumberNode(0), :conc, foro)
+    return Expr(:block, pre.args..., ker)
 end
 
 function _je_columns()
@@ -301,11 +300,11 @@ end
     @test_throws "is not available" lower_rkppl(_je_ast(_je_kernel_cell(),
         notgi), _JE_DATA)
     conc_cell = quote
-        read_locs =
-            linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc, s_vc, s_vc)
+        read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc, log_Vc,
+            log_Vc, log_Vc)
         c = read_locs[pk_sched.conc_map]
         mu = read_locs[pk_sched.obs_map]
-        yy .~ Normal.(mu, sigma)
+        dv .~ Normal.(mu, sigma)
         mu
     end
     @test_throws "needs an AUC cell call" lower_rkppl(
@@ -403,11 +402,11 @@ function _je_auc_ast()
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt))
         log_F = linear_pk_log_f(pk_sched; k = 5)
-        conc ~ kernel(dv, log_Vc; subjects = 1) do yy, s_vc
-            pk_reads = linear_pk_read_locs_auc(pk_sched, log_F, s_vc,
-                s_vc, s_vc, s_vc, s_vc)
+        @plate conc for s in 1:1
+            pk_reads = linear_pk_read_locs_auc(pk_sched, log_F, log_Vc,
+                log_Vc, log_Vc, log_Vc, log_Vc)
             mu = pk_reads[pk_sched.obs_map]
-            yy .~ Normal.(mu, sigma)
+            dv .~ Normal.(mu, sigma)
             mu
         end
     end""")
@@ -462,11 +461,11 @@ end
         log_Vc = b0_vc
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt))
-        conc ~ kernel(dv, log_Vc; subjects = 1) do yy, s_vc
-            pk_reads = linear_pk_read_locs_auc(pk_sched, s_vc, s_vc,
-                s_vc, s_vc, s_vc)
+        @plate conc for s in 1:1
+            pk_reads = linear_pk_read_locs_auc(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
             mu = pk_reads[pk_sched.obs_map]
-            yy .~ Normal.(mu, sigma)
+            dv .~ Normal.(mu, sigma)
             mu
         end
     end""")
@@ -478,7 +477,7 @@ end
     badassigns = deepcopy(kp.assignments)
     for (_, ex) in badassigns
         ex isa Expr && ex.head === :call &&
-            ex.args[1] === :linear_pk_read_locs_auc && (ex.args[3] = :s_vc)
+            ex.args[1] === :linear_pk_read_locs_auc && (ex.args[3] = :log_Vc)
     end
     kpbad = KernelPlate(kp.result, kp.subjects, kp.timepoints, kp.slices,
         badassigns, kp.obs, kp.collected, kp.label, kp.lp_args, kp.schedules)
@@ -503,36 +502,36 @@ end
 _je_gather_cellcase(cell) = lower_rkppl(_je_ast(Meta.parse(
     "begin\n$cell\nend")), _JE_DATA)
 
-const _JE_FULLCALL =
-    "read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc, s_vc, s_vc)"
+const _JE_FULLCALL = "read_locs = linear_pk_read_locs(pk_sched, log_Vc, " *
+    "log_Vc, log_Vc, log_Vc, log_Vc)"
 
 @testset "D2 bare LP uses fail closed" begin
     good_tail = "mu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu"
+        "dv .~ Normal.(mu, sigma)\nmu"
     @test_throws "gather explicitly" _je_gather_cellcase(
-        "$_JE_FULLCALL\nx = s_vc + 1.0\n$good_tail")
+        "$_JE_FULLCALL\nx = log_Vc + 1.0\n$good_tail")
     # Dotted + nested verbatim positions fail the same way.
     @test_throws "gather explicitly" _je_gather_cellcase(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
-        "x = s_vc .* mu\nyy .~ Normal.(mu, sigma)\nmu")
+        "x = log_Vc .* mu\ndv .~ Normal.(mu, sigma)\nmu")
     @test_throws "gather explicitly" _je_gather_cellcase(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
-        "x = ifelse.(s_vc .> 0, mu, mu)\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "x = ifelse.(log_Vc .> 0, mu, mu)\n" *
+        "dv .~ Normal.(mu, sigma)\nmu")
     @test_throws "gather explicitly" _je_gather_cellcase(
-        "read_locs = linear_pk_read_locs(pk_sched, s_vc + 1, s_vc, s_vc, " *
-        "s_vc, s_vc)\n$good_tail")
+        "read_locs = linear_pk_read_locs(pk_sched, log_Vc + 1, log_Vc, " *
+        "log_Vc, log_Vc, log_Vc)\n$good_tail")
     # LP cell params as obs args fail (gather to rows first).
     @test_throws "do not lower as obs args" _je_gather_cellcase(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(s_vc, sigma)\nmu")
+        "dv .~ Normal.(log_Vc, sigma)\nmu")
     @test_throws "do not lower as obs args" _je_gather_cellcase(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ CensoredAddpropnormal.(mu, sigma, s_vc, sigma)\nmu")
+        "dv .~ CensoredAddpropnormal.(mu, sigma, log_Vc, sigma)\nmu")
 end
 
 @testset "D2 gather index shapes fail closed" begin
-    good_obs = "yy .~ Normal.(mu, sigma)\nmu"
+    good_obs = "dv .~ Normal.(mu, sigma)\nmu"
     @test_throws "names a cell/model value" _je_gather_cellcase(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
         "x = read_locs[mu]\n$good_obs")
@@ -541,7 +540,7 @@ end
         "x = read_locs[sigma]\n$good_obs")
     @test_throws "names a cell/model value" _je_gather_cellcase(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
-        "x = read_locs[s_vc]\n$good_obs")
+        "x = read_locs[log_Vc]\n$good_obs")
     @test_throws "compile-time handle" _je_gather_cellcase(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
         "x = read_locs[pk_sched]\n$good_obs")
@@ -592,21 +591,21 @@ end
     @test_throws "mixes obs axes of length 2 and 3" bindshapes(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
         "e = read_locs[pk_sched.ecg_map]\n" *
-        "x = mu .+ e\nyy .~ Normal.(mu, sigma)\nmu")
-    @test_throws "has length 2 ≠ response `yy` length 3" bindshapes(
+        "x = mu .+ e\ndv .~ Normal.(mu, sigma)\nmu")
+    @test_throws "has length 2 ≠ response `dv` length 3" bindshapes(
         "$_JE_FULLCALL\ne = read_locs[pk_sched.ecg_map]\n" *
-        "yy .~ Normal.(e, sigma)\ne")
+        "dv .~ Normal.(e, sigma)\ne")
     # Read-space and scalar gather sources fail at shape.
     @test_throws "is read-space" bindshapes(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(read_locs, sigma)\nmu")
+        "dv .~ Normal.(read_locs, sigma)\nmu")
     @test_throws "is scalar" bindshapes(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
-        "x = sigma[pk_sched.obs_map]\nyy .~ Normal.(mu, sigma)\nmu")
+        "x = sigma[pk_sched.obs_map]\ndv .~ Normal.(mu, sigma)\nmu")
     # Same-axis dotted arithmetic + scalar broadcast still bind.
     ok = bindshapes("$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
         "e = read_locs[pk_sched.ecg_map]\n" *
-        "x = e .* 2.0 .+ sigma\nyy .~ Normal.(mu, sigma)\nmu")
+        "x = e .* 2.0 .+ sigma\ndv .~ Normal.(mu, sigma)\nmu")
     @test ok.n_obs == 3
 end
 
@@ -628,15 +627,15 @@ function _je_gather_ast()
         log_Vc = b0_vc .+ b1_vc .* age_s
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt))
-        conc ~ kernel(dv, dv2, log_Vc; subjects = 2) do yy, yy2, s_vc
-            read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc,
-                s_vc, s_vc)
+        @plate conc for s in 1:2
+            read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
             mu = read_locs[pk_sched.obs_map]
-            bump = s_vc[subj]
+            bump = log_Vc[subj]
             mu2 = mu .+ bump
             rev = read_locs[revmap]
-            yy .~ Normal.(mu2, sigma)
-            yy2 .~ Normal.(rev, sigma2)
+            dv .~ Normal.(mu2, sigma)
+            dv2 .~ Normal.(rev, sigma2)
             mu2
         end
     end""")
@@ -708,13 +707,13 @@ function _je_foreign_ast()
         log_Vc = b0_vc .+ b1_vc .* age_s
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt), ecg = (:esubj, :etime))
-        conc ~ kernel(dv, qy, log_Vc; subjects = 2) do yy, qq, s_vc
-            read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc,
-                s_vc, s_vc)
+        @plate conc for s in 1:2
+            read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
             mu = read_locs[pk_sched.obs_map]
             e = read_locs[pk_sched.ecg_map]
-            yy .~ Normal.(mu, sigma)
-            qq .~ Normal.(e, sigma2)
+            dv .~ Normal.(mu, sigma)
+            qy .~ Normal.(e, sigma2)
             mu
         end
     end""")
@@ -760,13 +759,13 @@ _je_foreign_data() = Set([:subj, :time, :dsubj, :dtime, :damt, :dv, :qy,
         log_Vc = b0_vc .+ b1_vc .* age_s
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt), ecg = (:esubj, :etime))
-        conc ~ kernel(qy, dv, log_Vc; subjects = 2) do qq, yy, s_vc
-            read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc,
-                s_vc, s_vc)
+        @plate conc for s in 1:2
+            read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
             mu = read_locs[pk_sched.obs_map]
             e = read_locs[pk_sched.ecg_map]
-            qq .~ Normal.(e, sigma2)
-            yy .~ Normal.(mu, sigma)
+            qy .~ Normal.(e, sigma2)
+            dv .~ Normal.(mu, sigma)
             mu
         end
     end""")
@@ -818,7 +817,7 @@ function _je_nadir_ast(cell)
         log_Vc = b0_vc .+ b1_vc .* age_s
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt))
-        conc ~ kernel(dv, qy, log_Vc; subjects = 2) do yy, qq, s_vc
+        @plate conc for s in 1:2
             $(cell)
         end
     end""")
@@ -831,8 +830,8 @@ const _JE_NADIR_GOOD = "$_JE_FULLCALL\n" *
     "chg = read_locs[pk_sched.obs_map]\n" *
     "ref = tgi_segmented_nadir(chg, my_ends)\n" *
     "mu = read_locs[pk_sched.obs_map]\n" *
-    "yy .~ Normal.(mu, sigma)\n" *
-    "qq .~ Normal.(ref, sigma2)\nmu"
+    "dv .~ Normal.(mu, sigma)\n" *
+    "qy .~ Normal.(ref, sigma2)\nmu"
 
 @testset "D5 nadir cell form fails closed" begin
     cellcase = (cell) -> lower_rkppl(_je_nadir_ast(cell), _je_nadir_data())
@@ -840,39 +839,39 @@ const _JE_NADIR_GOOD = "$_JE_FULLCALL\n" *
     @test_throws "takes 2 arguments" cellcase(
         "$_JE_FULLCALL\nchg = read_locs[pk_sched.obs_map]\n" *
         "ref = tgi_segmented_nadir(chg)\n" *
-        "yy .~ Normal.(chg, sigma)\nchg")
+        "dv .~ Normal.(chg, sigma)\nchg")
     @test_throws "must be a bound integer column name" cellcase(
         "$_JE_FULLCALL\nchg = read_locs[pk_sched.obs_map]\n" *
         "ref = tgi_segmented_nadir(chg, 1)\n" *
-        "yy .~ Normal.(chg, sigma)\nchg")
+        "dv .~ Normal.(chg, sigma)\nchg")
     @test_throws "gather explicitly" cellcase(
         "$_JE_FULLCALL\nchg = read_locs[pk_sched.obs_map]\n" *
-        "ref = tgi_segmented_nadir(s_vc, my_ends)\n" *
-        "yy .~ Normal.(chg, sigma)\nchg")
+        "ref = tgi_segmented_nadir(log_Vc, my_ends)\n" *
+        "dv .~ Normal.(chg, sigma)\nchg")
     @test_throws "unknown name" cellcase(
         "$_JE_FULLCALL\nref = tgi_segmented_nadir(nope, my_ends)\n" *
-        "yy .~ Normal.(ref, sigma)\nref")
+        "dv .~ Normal.(ref, sigma)\nref")
     # Only the nadir wires in: other TGI cell functions stay out.
     @test_throws "not in the grouped-v1 cell vocabulary" cellcase(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
-        "x = tgi_ratio_loglinear(mu, s_vc, s_vc)\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "x = tgi_ratio_loglinear(mu, log_Vc, log_Vc)\n" *
+        "dv .~ Normal.(mu, sigma)\nmu")
     # Shapes: change space + ends bound-ness.
     bindshapes = (cell, cols = _je_nadir_columns()) ->
         bind_data(cellcase(cell), cols)
     @test_throws "is read-space" bindshapes(
         "$_JE_FULLCALL\nref = tgi_segmented_nadir(read_locs, my_ends)\n" *
         "mu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "dv .~ Normal.(mu, sigma)\nmu")
     @test_throws "is scalar" bindshapes(
         "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
         "ref = tgi_segmented_nadir(sigma, my_ends)\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "dv .~ Normal.(mu, sigma)\nmu")
     @test_throws "is not bound" bindshapes(
         "$_JE_FULLCALL\nchg = read_locs[pk_sched.obs_map]\n" *
         "ref = tgi_segmented_nadir(chg, nope_ends)\n" *
         "mu = read_locs[pk_sched.obs_map]\n" *
-        "yy .~ Normal.(mu, sigma)\nmu")
+        "dv .~ Normal.(mu, sigma)\nmu")
     # Ends validator: integer, one per subject, nondecreasing from a
     # non-negative start, last == change length.
     @test_throws "must be an integer column" bindshapes(_JE_NADIR_GOOD,
@@ -909,14 +908,14 @@ function _je_seg_ast()
         log_Vc = b0_vc .+ b1_vc .* age_s
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt), tgi = (:tsubj, :ttime))
-        conc ~ kernel(dv, qy, log_Vc; subjects = 2) do yy, qq, s_vc
-            read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc,
-                s_vc, s_vc)
+        @plate conc for s in 1:2
+            read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
             mu = read_locs[pk_sched.obs_map]
             chg = read_locs[pk_sched.tgi_map]
             ref = tgi_segmented_nadir(chg, pk_sched_tgi_seg_ends)
-            yy .~ Normal.(mu, sigma)
-            qq .~ Normal.(ref, sigma2)
+            dv .~ Normal.(mu, sigma)
+            qy .~ Normal.(ref, sigma2)
             mu
         end
     end""")
@@ -1173,14 +1172,14 @@ end
         log_Vc = b0_vc .+ b1_vc .* age_s
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt), ecg = (:esubj, :etime))
-        conc ~ kernel(dv, qy, qt_w, log_Vc; subjects = 2) do yy, qq, ww, s_vc
-            read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc,
-                s_vc, s_vc)
+        @plate conc for s in 1:2
+            read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
             mu = read_locs[pk_sched.obs_map]
             e = read_locs[pk_sched.ecg_map]
-            qt_sd = qt_scale .* ww
-            yy .~ Normal.(mu, sigma)
-            qq .~ Normal.(e, qt_sd)
+            qt_sd = qt_scale .* qt_w
+            dv .~ Normal.(mu, sigma)
+            qy .~ Normal.(e, qt_sd)
             mu
         end
     end""")
@@ -1228,15 +1227,15 @@ function _je_map_ast()
         log_Vc = b0_vc .+ b1_vc .* age_s
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt))
-        conc ~ kernel(dv, log_Vc; subjects = 2) do yy, s_vc
-            read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc,
-                s_vc, s_vc)
+        @plate conc for s in 1:2
+            read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
             mu = read_locs[pk_sched.obs_map]
-            bump = s_vc[subjmap]
+            bump = log_Vc[subjmap]
             mu2 = mu .+ bump
             rev = read_locs[readmap]
             x = mu[readmap2]
-            yy .~ Normal.(mu2, sigma)
+            dv .~ Normal.(mu2, sigma)
             mu2
         end
     end""")
@@ -1281,12 +1280,12 @@ end
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt))
         log_F = linear_pk_log_f(pk_sched; k = 5)
-        conc ~ kernel(dv, log_Vc; subjects = 1) do yy, s_vc
-            pk_reads = linear_pk_read_locs_auc(pk_sched, log_F, s_vc,
-                s_vc, s_vc, s_vc, s_vc)
+        @plate conc for s in 1:1
+            pk_reads = linear_pk_read_locs_auc(pk_sched, log_F, log_Vc,
+                log_Vc, log_Vc, log_Vc, log_Vc)
             mu = pk_reads[pk_sched.obs_map]
             x = pk_reads[aucmap]
-            yy .~ Normal.(mu, sigma)
+            dv .~ Normal.(mu, sigma)
             mu
         end
     end""")
@@ -1326,16 +1325,15 @@ end
         t0base = t0subj
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt), tgi = (:tsubj, :ttime))
-        conc ~ kernel(dv, qy, log_Vc, t0base; subjects = 2) do yy, qq,
-                s_vc, s_t0
-            read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc,
-                s_vc, s_vc)
+        @plate conc for s in 1:2
+            read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
             mu = read_locs[pk_sched.obs_map]
             chg = read_locs[pk_sched.tgi_map]
-            t0rows = s_t0[tsubj]
+            t0rows = t0base[tsubj]
             adj = chg .+ t0rows
-            yy .~ Normal.(mu, sigma)
-            qq .~ Normal.(adj, sigma2)
+            dv .~ Normal.(mu, sigma)
+            qy .~ Normal.(adj, sigma2)
             mu
         end
     end""")
@@ -1413,20 +1411,19 @@ function _je_joint_ast()
         pk_sched = linear_pk_schedule(obs = (:subj, :time),
             dose = (:dsubj, :dtime, :damt), ecg = (:esubj, :etime),
             tgi = (:tsubj, :ttime))
-        conc ~ kernel(dv, qy, cc, bb, yl, qt_w, llq, log_Vc;
-                subjects = 2) do yy, qq, ccv, bbv, ylv, ww, lo, s_vc
-            read_locs = linear_pk_read_locs(pk_sched, s_vc, s_vc, s_vc,
-                s_vc, s_vc)
+        @plate conc for s in 1:2
+            read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
             mu = read_locs[pk_sched.obs_map]
             e = read_locs[pk_sched.ecg_map]
             r = read_locs[pk_sched.tgi_map]
             ref = tgi_segmented_nadir(r, pk_sched_tgi_seg_ends)
-            qt_sd = qt_scale .* ww
-            yy .~ CensoredAddpropnormal.(mu, s_add, s_prop, lo)
-            qq .~ Normal.(e, qt_sd)
-            ccv .~ TgiCategory.(r, ref, -0.5, -0.3, 0.2, sd, 0.01)
-            bbv .~ TgiResponse.(r, ref, -0.3, 0.2, sd, 0.01)
-            ylv .~ TgiCensored.(r, sd, 0.3)
+            qt_sd = qt_scale .* qt_w
+            dv .~ CensoredAddpropnormal.(mu, s_add, s_prop, llq)
+            qy .~ Normal.(e, qt_sd)
+            cc .~ TgiCategory.(r, ref, -0.5, -0.3, 0.2, sd, 0.01)
+            bb .~ TgiResponse.(r, ref, -0.3, 0.2, sd, 0.01)
+            yl .~ TgiCensored.(r, sd, 0.3)
             mu
         end
     end""")
@@ -1550,12 +1547,12 @@ function _je_findiff(f, u; h = cbrt(eps(Float64)))
 end
 
 @testset "D9 nadir over a bare slice resolves" begin
-    # A bare response slice as nadir change (shapes admit slices —
-    # `(:obs, len)`): generation resolves the do-param to its column
+    # A bare response column as nadir change (shapes admit slices —
+    # `(:obs, len)`): generation resolves the response to its column
     # (the grouped flatmap — no undeclared port).
     cell = "$_JE_FULLCALL\nmu = read_locs[pk_sched.obs_map]\n" *
-        "ref = tgi_segmented_nadir(qq, my_ends)\n" *
-        "yy .~ Normal.(mu, sigma)\nqq .~ Normal.(ref, sigma2)\nmu"
+        "ref = tgi_segmented_nadir(qy, my_ends)\n" *
+        "dv .~ Normal.(mu, sigma)\nqy .~ Normal.(ref, sigma2)\nmu"
     cols = _je_nadir_columns()
     bound = bind_data(
         lower_rkppl(_je_nadir_ast(cell), _je_nadir_data()), cols)
