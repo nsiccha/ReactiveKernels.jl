@@ -34,3 +34,25 @@ tiling replicates each subject's ragged segment with no index remap.
 - Contended box (load 11-14 on 8 CPUs): sub-2x differences are noise.
 - RKPPL K=30 gradient: one-time Enzyme `prepare_ad` did not return in
   15 min (bind/build/eval all complete); Stan K=30 grad ~8 ms.
+
+## Reactant rows (2026-09-22 run, `bench_rkppl_reactant.jl`)
+
+- Program: RKPPL at `467a70a` — grouped cell assignments emit one
+  subject-batched statement each, so `kernel_expr` has 209 statements at
+  every K (was 230/419/839 at K=1/5/10).  Native eval/grad unchanged.
+- K=1 primal `Reactant.@compile` of the sampler-cut posterior: parity
+  1.9e-16 vs native at two points; compile 211–227 s at 3.8 GB peak RSS;
+  eval 0.03–0.17 ms device-resident (noise on a contended box; native
+  0.016–0.018 ms at n_obs=7).
+- K=3 primal: the XLA program still grows with K — Reactant traces the
+  runtime subject loop unrolled (bound `op_ends`, exact values,
+  `reactivekernels-use` §7c) — and the compile was SIGTERMed by
+  kb-earlyoom at 6.8 GB RSS after 4.5 min; K=10 not attempted.  An O(1)
+  XLA program needs the per-subject recurrence as a traced loop over a
+  rectangular op table (root RK feature, not in this run).
+- Gradient (`compile_ad_value_and_gradient`): all five K=1 attempts
+  (unrolled and batched programs, default and `no_slice_slice`
+  pipelines) were SIGTERMed by kb-earlyoom after 9–12 min at >4.2 GB RSS
+  before the compile returned — `/var/log/kb-earlyoom/kills.log`, snag
+  `strato2-earlyoom-cf96ec60`.  The compiled AD path itself is proven on
+  the tiny model in `test_reactant_joint.jl`.
