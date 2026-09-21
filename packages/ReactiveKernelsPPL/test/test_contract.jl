@@ -212,7 +212,8 @@ end
         BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
         BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
-        MvNormalCholeskyFam)
+        MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
+        PoissonLogGLMFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,

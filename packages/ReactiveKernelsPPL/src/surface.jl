@@ -386,7 +386,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     ast, pins = _expand_submodels(ast, data, mod)
     sample, det, plate_ctx, plate_specs, scans, bases, vectors,
     hbases, kplates, kstmts, schedules, event_lps, r2d2decls, joints,
-    varying_draws, varying_pending = _partition_statements(ast, data)
+    varying_draws, varying_pending, glms = _partition_statements(ast, data)
     # Varying bindings (draws + contributions): contributions compose
     # only as direct predictor summands, never inside definitions.
     varying_names = Set{Symbol}()
@@ -485,6 +485,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     predictors = PredictorSpec[]
     pred_idx = Dict{Symbol,Int}()
     coefuse = Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}()
+    glmuse = Dict{Symbol,Tuple{Symbol,Symbol}}()
     for s in sample
         if s.broadcast
             # Broadcast coefficient priors lower with their factor term.
@@ -524,6 +525,13 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         end
         push!(kplates, kp)
     end
+    # GLM-object responses lower after the joints (no predictor
+    # interning — the object owns eta; coefficient recording goes to
+    # the separate GLM-use table, before coefficient priors resolve).
+    for g in glms
+        push!(responses,
+            _lower_glm_response(g, sample, prior_names, ctx, coefuse, glmuse))
+    end
     # Every use-site pin must name a lowered predictor: a pin the response
     # never claimed is a silent no-op, never a skip.
     for (rlhs, pin) in ctx.predictor_pins
@@ -555,9 +563,13 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     end
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
         ctx.matrices, r2d2set)
+    for (beta, (label, X)) in glmuse
+        append!(priors, _lower_glm_beta_priors(label, beta, X, sample,
+            ctx.matrices))
+    end
     r2d2s, taus = _lower_r2d2_priors(r2d2decls, sample, coefuse, predictors,
         levelmaps, taken, ctx.matrices)
-    params, paramsyms, dirichlets = _lower_parameters(sample, coefuse, ctx)
+    params, paramsyms, dirichlets = _lower_parameters(sample, coefuse, ctx, glmuse)
     append!(params, taus)
     plate_parameters = PlateParameter[
         _lower_plate_parameter(nm, rhs, rng, coefuse, ctx.matrices)
@@ -2404,6 +2416,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     event_lps = LinearPKEventLPSpec[]
     r2d2decls = NamedTuple[]
     joints = JointSampleStmt[]
+    glms = GLMSampleStmt[]
     varying_raw = NamedTuple[]
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
@@ -2500,6 +2513,23 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 end
                 push!(joints, j)
                 continue
+            end
+            if !bc && st.args[3] isa Expr && st.args[3].head === :call &&
+                    !isempty(st.args[3].args) &&
+                    st.args[3].args[1] isa Symbol &&
+                    st.args[3].args[1] in _GLM_HEADS
+                g = _parse_glm_stmt(st, line, data)
+                _claim!(seen, seelines, g.response, line)
+                push!(glms, g)
+                continue
+            end
+            if bc && st.args[3] isa Expr && st.args[3].head === :call &&
+                    !isempty(st.args[3].args) &&
+                    st.args[3].args[1] isa Symbol &&
+                    st.args[3].args[1] in _GLM_HEADS
+                _sfail("GLM-object heads use whole-data `~`, not `.~` " *
+                       "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
+                       "object owns eta over the whole column)")
             end
             lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde, data)
             lhs === :dummy &&
@@ -2613,7 +2643,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     end
     return sample, det, plate_ctx, plate_params, scans, bases,
         vectors, hbases, kplates, kstmts, schedules, event_lps, r2d2decls,
-        joints, varying_draws, varying_pending
+        joints, varying_draws, varying_pending, glms
 end
 
 # ── Design-matrix extraction (slice D1) ─────────────────────────────
@@ -3342,6 +3372,54 @@ struct JointSampleStmt
     means::Vector{Any}
     factor::Symbol
     line::Int
+end
+
+"""One whole-data GLM-object statement
+(`y ~ NormalIDGLM(X, alpha, beta, sigma)`): the response column, the
+head family, the intercept-free design-matrix name, the scalar
+intercept and coefficient-vector parameters, and the Normal sigma
+(parameter name or positive literal, `nothing` otherwise). Plain `~`
+only — the object owns eta over the whole column, never broadcasts."""
+struct GLMSampleStmt
+    response::Symbol
+    head::Symbol
+    matrix::Symbol
+    alpha::Symbol
+    beta::Symbol
+    sigma::Any
+    line::Int
+end
+
+const _GLM_HEADS = (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
+
+function _parse_glm_stmt(st::Expr, line::Int, data::Set{Symbol})
+    lhs, rhs = st.args[2], st.args[3]
+    head = rhs.args[1]
+    lhs isa Symbol || _sfail("`$head` left-hand side must be a bare " *
+                             "data column, got $(repr(lhs))")
+    lhs in data || _sfail("`$head` responds over data — $lhs is not " *
+                          "a data column")
+    args = _plain_args(rhs, "`$head`")
+    want = head === :NormalIDGLM ? 4 : 3
+    usage = head === :NormalIDGLM ? "`$head(X, alpha, beta, sigma)`" :
+        "`$head(X, alpha, beta)`"
+    length(args) == want || _sfail("response $lhs: `$head` takes " *
+                                   "$usage, got $(length(args)) arguments")
+    X, alpha, beta = args[1], args[2], args[3]
+    X isa Symbol || _sfail("response $lhs: `$head` design matrix " *
+                           "must be a name (`X = hcat(...)`), got $(repr(X))")
+    alpha isa Symbol || _sfail("response $lhs: `$head` intercept " *
+                               "must be a parameter name, got $(repr(alpha))")
+    beta isa Symbol || _sfail("response $lhs: `$head` coefficients " *
+                              "must be a parameter name, got $(repr(beta))")
+    sigma = nothing
+    if head === :NormalIDGLM
+        sigma = args[4]
+        (sigma isa Symbol || sigma isa Real) || _sfail(
+            "response $lhs: `$head` sigma must be a parameter name or " *
+            "a positive literal, got $(repr(sigma))")
+    end
+    return GLMSampleStmt(lhs, head, X, alpha, beta, sigma, line)
 end
 
 _is_doc_macro(m) =
@@ -4081,6 +4159,80 @@ function _lower_joint_response(j::JointSampleStmt, factor_names::Set{Symbol},
         label, nothing, nothing; extra_responses = j.outcomes[2:end],
         extra_predictors = pnames[2:end], factor_scales = scales,
         factor_corr = corr)
+end
+
+function _lower_glm_response(g::GLMSampleStmt, sample, prior_names::Set{Symbol},
+        ctx, coefuse, glmuse::Dict{Symbol,Tuple{Symbol,Symbol}})
+    fam, link = g.head === :NormalIDGLM ? (NormalIDGLMFam, IdentityLink) :
+        g.head === :BernoulliLogitGLM ? (BernoulliLogitGLMFam, LogitLink) :
+        (PoissonLogGLMFam, LogLink)
+    m = get(ctx.matrices, g.matrix, nothing)
+    m === nothing && _sfail("response $(g.response): `$(g.head)` " *
+                            "design matrix $(g.matrix) is not a bound " *
+                            "design matrix (`$(g.matrix) = hcat(...)`)")
+    any(c -> c === nothing, m.columns) && _sfail(
+        "response $(g.response): `$(g.head)` design matrix $(g.matrix) " *
+        "has an intercept-ones position — pass intercept-free X and a " *
+        "separate alpha")
+    for (nm, role) in ((g.alpha, "intercept"), (g.beta, "coefficients"))
+        haskey(coefuse, nm) && _sfail(
+            "response $(g.response): `$(g.head)` $role $nm is also a " *
+            "predictor coefficient — one use per name")
+    end
+    g.alpha in prior_names || _sfail(
+        "response $(g.response): `$(g.head)` intercept $(g.alpha) " *
+        "needs a prior statement (`$(g.alpha) ~ Normal(0, 10)`)")
+    for s in sample
+        s.lhs === g.beta || continue
+        if s.matrix === nothing
+            _sfail("response $(g.response): `$(g.head)` coefficient " *
+                   "vector $(g.beta) needs a broadcast prior " *
+                   "(`$(g.beta)[axes($(g.matrix), 2)] .~ Normal.(...)`)")
+        end
+        s.matrix === g.matrix || _sfail(
+            "response $(g.response): `$(g.head)` coefficient prior " *
+            "sizes $(s.matrix), not the response matrix $(g.matrix)")
+    end
+    sigma = g.sigma
+    if sigma isa Symbol
+        sigma in prior_names || _sfail(
+            "response $(g.response): `$(g.head)` sigma $sigma needs " *
+            "a prior statement or a positive literal")
+        haskey(coefuse, sigma) && _sfail(
+            "response $(g.response): `$(g.head)` sigma $sigma is also " *
+            "a predictor coefficient — one use per name")
+    end
+    label = Symbol(g.response, "_resp")
+    push!(ctx.matrices_used, g.matrix)
+    glmuse[g.beta] = (label, g.matrix)
+    return LikelihoodSpec(fam, link, g.response, g.matrix, sigma, nothing,
+        ResponseEvidence(:none, nothing, nothing), label, nothing, nothing;
+        glm_alpha = g.alpha, glm_beta = g.beta)
+end
+
+# A GLM coefficient vector: K per-element PopulationPriors over the
+# response matrix columns, addressed by response label. Unstated
+# vectors default to K× Normal(0, 1) (the matrix-prior emitter
+# convention — the width is static, so no declaration is needed to
+# size them). Stated vectors take `b[axes(X, 2)] .~ Normal.(loc,
+# scale)` with scalar (shared) or length-K literal-vector
+# (per-element) args.
+function _lower_glm_beta_priors(label::Symbol, beta::Symbol, X::Symbol,
+        sample, matrices::Dict{Symbol,DesignMatrix})
+    m = get(matrices, X, nothing)
+    m === nothing && _sfail("internal: GLM prior over unknown matrix $X")
+    cols = Symbol[c for c in m.columns if c !== nothing]
+    K = length(cols)
+    stated = nothing
+    for s in sample
+        s.lhs === beta || continue
+        stated = s
+    end
+    stated === nothing && return PopulationPrior[
+        PopulationPrior(label, c, 0.0, 1.0) for c in cols]
+    locs, scales = _coefficient_matrix_normal(beta, stated.rhs, label, K)
+    return PopulationPrior[PopulationPrior(label, c, l, sc)
+        for (c, l, sc) in zip(cols, locs, scales)]
 end
 
 # `.~` takes a dotted distribution object (`Normal.(mu, sigma)`); convert
@@ -6102,7 +6254,7 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :InverseGamma => :inverse_gamma,
 )
 
-function _lower_parameters(sample, coefuse, ctx)
+function _lower_parameters(sample, coefuse, ctx, glmuse)
     params = SampledParameter[]
     syms = Set{Symbol}()
     vectors = VectorParameter[]
@@ -6126,6 +6278,7 @@ function _lower_parameters(sample, coefuse, ctx)
             continue
         end
         haskey(coefuse, s.lhs) && continue
+        haskey(glmuse, s.lhs) && continue
         s.levels !== nothing && _sfail("levels prior `$(s.lhs)[...]` is " *
                                        "never used in a predictor — size " *
                                        "only vectors the model indexes")

@@ -90,6 +90,9 @@ joint correlated-outcomes family (per-row MvNormal over a Cholesky factor)."""
     TgiCategoryFam
     TgiResponseFam
     TgiCensoredFam
+    NormalIDGLMFam
+    BernoulliLogitGLMFam
+    PoissonLogGLMFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -235,6 +238,18 @@ fields, built with keywords (`extra_responses=`, `factor_scales=`,
 Joint widths are structural (K = 1 + `length(extra_responses)`):
 no `n_levels`, no bind-time size inference — the factor parameters
 carry concrete sizes validated against K.
+
+GLM-object responses (`NormalIDGLMFam`, `BernoulliLogitGLMFam`,
+`PoissonLogGLMFam`) name their [`DesignMatrix`](@ref) in `predictor`
+(no linear predictor — the object owns eta, the Multinomial/Categorical
+scan-state precedent) and carry the split coefficients in the trailing
+`glm_alpha`/`glm_beta` fields, built with keywords; every other family
+leaves them at their defaults:
+
+- `glm_alpha`: the scalar intercept parameter, `nothing` otherwise.
+- `glm_beta`: the coefficient-vector parameter (one element per matrix
+  column — the matrix is intercept-free, the generator prepends the
+  ones column and `alpha`), `nothing` otherwise.
 """
 struct LikelihoodSpec
     family::LikelihoodFamily
@@ -258,6 +273,8 @@ struct LikelihoodSpec
     extra_responses::Vector{ColumnRef}
     factor_scales::Union{Nothing,ParamName}
     factor_corr::Union{Nothing,ParamName}
+    glm_alpha::Union{Nothing,ParamName}
+    glm_beta::Union{Nothing,ParamName}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
@@ -281,12 +298,14 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         threshold_coefs::Union{Nothing,ParamName} = nothing,
         extra_responses::Vector{ColumnRef} = Symbol[],
         factor_scales::Union{Nothing,ParamName} = nothing,
-        factor_corr::Union{Nothing,ParamName} = nothing)
+        factor_corr::Union{Nothing,ParamName} = nothing,
+        glm_alpha::Union{Nothing,ParamName} = nothing,
+        glm_beta::Union{Nothing,ParamName} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
         threshold_columns, threshold_coefs, extra_responses, factor_scales,
-        factor_corr)
+        factor_corr, glm_alpha, glm_beta)
 end
 
 """
@@ -1553,7 +1572,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
     BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
-    MvNormalCholeskyFam)
+    MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
+    PoissonLogGLMFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -4218,6 +4238,8 @@ _is_ordered_family(f) = f === OrderedLogisticFam || f === OrdinalFam
 _is_simplex_family(f) = f === MultinomialFam || f === CategoricalFam
 _is_leveled_family(f) = f === CategoricalLogitFam || _is_ordered_family(f) ||
     _is_simplex_family(f)
+_is_glm_family(f) = f === NormalIDGLMFam || f === BernoulliLogitGLMFam ||
+    f === PoissonLogGLMFam
 
 """Vector-parameter families and their positional arg keys."""
 const VECTOR_ARITY = Dict{Symbol,Tuple{Vararg{Symbol}}}(
@@ -5010,8 +5032,10 @@ end
 function _validate_priors(plan::StructuralPlan)
     seen = Set{Tuple{Symbol,Symbol}}()
     r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
+    glm_labels = Set{Symbol}(r.label for r in plan.responses if _is_glm_family(r.family))
     for pr in plan.population_priors
         any(p -> p.name === pr.predictor, plan.predictors) ||
+            pr.predictor in glm_labels ||
             _fail(:plan, "prior addresses unknown predictor $(pr.predictor)")
         pr.predictor in r2d2 && _fail(:plan,
             "predictor $(pr.predictor) carries an R2D2Prior — its prior " *
@@ -5059,6 +5083,16 @@ function _validate_priors(plan::StructuralPlan)
         for a in addressees
             (pred.name, a) in seen ||
                 _fail(:plan, "no prior for ($(pred.name), $a)")
+        end
+    end
+    for r in plan.responses
+        _is_glm_family(r.family) || continue
+        m = _find_matrix(plan, r.predictor)
+        m === nothing && continue
+        for c in m.columns
+            c === nothing && continue
+            (r.label, c) in seen ||
+                _fail(:plan, "no prior for ($(r.label), $c)")
         end
     end
     return nothing
@@ -5499,6 +5533,61 @@ function _validate_joint_response(r::LikelihoodSpec, plan::StructuralPlan,
     return nothing
 end
 
+function _validate_glm_response(r::LikelihoodSpec, plan::StructuralPlan)
+    want_link = r.family === NormalIDGLMFam ? IdentityLink :
+        r.family === BernoulliLogitGLMFam ? LogitLink : LogLink
+    r.link === want_link || _fail(r.label,
+        "a GLM-object response uses its canonical link (got $(r.link))")
+    m = _find_matrix(plan, r.predictor)
+    m === nothing && _fail(r.label,
+        "GLM-object response addresses $(r.predictor), which is not a " *
+        "bound design matrix (`X = hcat(...)`)")
+    any(c -> c === nothing, m.columns) && _fail(r.label,
+        "GLM-object design matrix $(m.name) has an intercept-ones " *
+        "position — pass intercept-free X and a separate alpha")
+    r.glm_alpha === nothing && _fail(r.label,
+        "a GLM-object response requires its scalar intercept parameter")
+    ai = findfirst(p -> p.name === r.glm_alpha, plan.parameters)
+    ai === nothing && _fail(r.label,
+        "GLM intercept :$(r.glm_alpha) must name a scalar sampled " *
+        "parameter (`$(r.glm_alpha) ~ Normal(0, 10)`)")
+    r.glm_beta === nothing && _fail(r.label,
+        "a GLM-object response requires its coefficient-vector parameter")
+    length(m.columns) >= 1 || _fail(r.label,
+        "GLM-object design matrix $(m.name) has no columns")
+    r.n_levels === nothing ||
+        _fail(r.label, "a GLM-object response takes no n_levels")
+    r.thresholds === nothing ||
+        _fail(r.label, "a GLM-object response takes no thresholds")
+    isempty(r.extra_predictors) ||
+        _fail(r.label, "a GLM-object response takes no extra_predictors")
+    isempty(r.count_columns) ||
+        _fail(r.label, "a GLM-object response takes no count_columns")
+    r.ordinal_structure === nothing ||
+        _fail(r.label, "a GLM-object response takes no ordinal_structure")
+    r.discrimination === nothing ||
+        _fail(r.label, "a GLM-object response takes no discrimination")
+    isempty(r.threshold_columns) ||
+        _fail(r.label, "a GLM-object response takes no threshold_columns")
+    r.threshold_coefs === nothing ||
+        _fail(r.label, "a GLM-object response takes no threshold_coefs")
+    isempty(r.extra_responses) ||
+        _fail(r.label, "a GLM-object response takes no extra_responses")
+    r.factor_scales === nothing ||
+        _fail(r.label, "a GLM-object response takes no factor_scales")
+    r.factor_corr === nothing ||
+        _fail(r.label, "a GLM-object response takes no factor_corr")
+    r.trials === nothing ||
+        _fail(r.label, "a GLM-object response takes no trials")
+    r.weights === nothing ||
+        _fail(r.label, "GLM-object responses take no weights " *
+            "(weighted GLMs stay on the predictor path)")
+    r.range === nothing ||
+        _fail(r.label, "a GLM-object response takes no range " *
+            "(ranged responses stay on the predictor path)")
+    return nothing
+end
+
 function _validate_responses(plan::StructuralPlan)
     # A kernel plate carries the only likelihood (panel v1): zero
     # top-level responses are admitted iff exactly one kernel plate is
@@ -5584,6 +5673,15 @@ function _validate_responses(plan::StructuralPlan)
             _validate_evidence_structure(r, plan)
             continue
         end
+        # A GLM-object response (whole-data head over a design matrix —
+        # the object owns eta, so no PredictorSpec): validated whole,
+        # skipping the single-predictor triple.
+        if _is_glm_family(r.family)
+            _validate_glm_response(r, plan)
+            _validate_scale(r, plan)
+            _validate_evidence_structure(r, plan)
+            continue
+        end
         idx = findfirst(p -> p.name === r.predictor, plan.predictors)
         idx === nothing &&
             _fail(r.label, "response addresses unknown predictor $(r.predictor)")
@@ -5661,6 +5759,17 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         eltype(col) <: Real ||
             _fail(r.label, "Gaussian response must be numeric")
         return nothing
+    elseif r.family === NormalIDGLMFam
+        eltype(col) <: Real ||
+            _fail(r.label, "NormalIDGLM response must be numeric")
+        return nothing
+    elseif r.family === BernoulliLogitGLMFam
+        eltype(col) === Bool && return nothing
+        eltype(col) <: Integer && all(x -> x == 0 || x == 1, col) && return nothing
+        return _fail(r.label, "BernoulliLogitGLM response must be Bool or 0/1 integers")
+    elseif r.family === PoissonLogGLMFam
+        eltype(col) <: Integer && all(>=(0), col) && return nothing
+        return _fail(r.label, "PoissonLogGLM response must be non-negative integers")
     elseif r.family === GammaLogFam
         # Strictly positive: the gamma kernel guards x > 0, and at exactly
         # 0 it is wrong for shape ≤ 1 (says -Inf; truth is finite/+Inf) —
@@ -5748,7 +5857,8 @@ function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
         r.family === NegativeBinomial2Fam ?
         "NB2 response requires a dispersion phi" :
         r.family === GammaLogFam ? "Gamma response requires a shape alpha" :
-        r.family === BetaLogitFam ? "Beta response requires a concentration kappa" : nothing
+        r.family === BetaLogitFam ? "Beta response requires a concentration kappa" :
+        r.family === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" : nothing
     if need === nothing
         r.scale === nothing ||
             _fail(r.label, "this response family takes no scale auxiliary")

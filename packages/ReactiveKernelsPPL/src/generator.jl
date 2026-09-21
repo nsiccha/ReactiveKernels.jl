@@ -79,7 +79,8 @@ using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
     beta, inverse_gamma, binomial, negative_binomial2, uniform,
-    gp_exp_quad_cov, gp_chol_latent
+    gp_exp_quad_cov, gp_chol_latent,
+    normal_id_glm, bernoulli_logit_glm, poisson_log_glm
 using SpecialFunctions: erfc, loggamma
 # Selective (explicit imports win over any re-export chain, so no `using`
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
@@ -928,10 +929,40 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _categorical_plain_plate_stmts(r, plan, node, pw)
     elseif r.family === MvNormalCholeskyFam
         return _mvn_cholesky_plate_stmts(r, plan, node, pw)
+    elseif _is_glm_family(r.family)
+        return _glm_object_stmts(r, plan, node, pw)
     else
         throw(ContractValidationError(
             "[generator] response family $(r.family) has no emitter"))
     end
+end
+
+# A GLM-object response: one fused constructed-endpoint application
+# over the whole column (no plate — the object owns eta). The
+# intercept-free design matrix gains its ones column from the bound
+# row count (data-only, folds at prepare) and the split coefficients
+# rejoin as `beta_full = [alpha; beta]` (the validated P2 spelling).
+function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
+        pw::Symbol)
+    obj = r.family === NormalIDGLMFam ? :normal_id_glm :
+        r.family === BernoulliLogitGLMFam ? :bernoulli_logit_glm :
+        :poisson_log_glm
+    y, X = r.response, r.predictor
+    yf = _yfloat_name(r.label)
+    xaug = Symbol(:_ppl_glm_X_, r.label)
+    bfull = Symbol(:_ppl_glm_b_, r.label)
+    yconv = r.family === NormalIDGLMFam ? :Float64 : :Int
+    s = r.scale isa Symbol ? r.scale : :(Float64($(r.scale)))
+    call = r.family === NormalIDGLMFam ?
+        :($obj($xaug, $bfull, $s).pointwise($yf)) :
+        :($obj($xaug, $bfull).pointwise($yf))
+    return Expr[
+        :($yf = $yconv.($y)),
+        :($xaug = hcat(ones($(plan.n_obs)), $X)),
+        :($bfull = [$(r.glm_alpha); $(r.glm_beta)]),
+        :($pw = $call),
+        :($node::Float64 = sum($pw)),
+    ]
 end
 
 _predictor(plan::StructuralPlan, name::Symbol) =
@@ -1706,6 +1737,35 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     for p in plan.parameters
         node = Symbol(:_ppl_prior_, p.name)
         push!(stmts, :($node::Float64 = $(_sampled_prior_expr(p))))
+        push!(terms, node)
+    end
+    # GLM-object coefficient vectors: the same plate-prior shape as a
+    # population-prior coefficient block, driven by the response matrix
+    # columns (priors addressed by response label — validation pins
+    # full coverage).
+    for r in plan.responses
+        _is_glm_family(r.family) || continue
+        m = _find_matrix(plan, r.predictor)
+        cols = Symbol[c for c in m.columns if c !== nothing]
+        loc = Float64[]
+        sca = Float64[]
+        for c in cols
+            i = findfirst(p -> p.predictor === r.label && p.addressee === c,
+                plan.population_priors)
+            pr = plan.population_priors[i]
+            push!(loc, Float64(pr.location))
+            push!(sca, Float64(pr.scale))
+        end
+        node = Symbol(:_ppl_prior_, r.label)
+        pw = Symbol(:_ppl_pw_prior_, r.label)
+        mut = Symbol(:_ppl_prmu_, r.label)
+        sdt = Symbol(:_ppl_prsd_, r.label)
+        push!(stmts, :($mut = Float64[$(loc...)]))
+        push!(stmts, :($sdt = Float64[$(sca...)]))
+        cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
+        cell = :(normal($mv, $sv).logpdf($cv))
+        append!(stmts, _plate_sum_stmts(pw, node,
+            Any[r.glm_beta, mut, sdt], cell))
         push!(terms, node)
     end
     # Leveled vector latents (cutpoints/thresholds/simplexes/coefficient
