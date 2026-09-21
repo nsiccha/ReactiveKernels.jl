@@ -386,6 +386,27 @@ end
         @test length(kernel_graph(nested_cse_model).recipes) == 1
         @test @inferred(prepare(nested_cse_model)(2.0)) == (3.0, 3.0)
 
+        # Plain operations (no explicit cse_key) merge across repeated
+        # splices too (planner-branch-a-380e2405): without this, N repeated
+        # calls manufacture N alternative producers and the exact planner
+        # search goes exponential in N.
+        @kernel nested_plain_piece(x::Float64) = begin
+            y::Float64 = exp(x)
+            return y
+        end
+        @kernel nested_plain_twice(u::Float64) = begin
+            a::Float64 = nested_plain_piece(u)
+            b::Float64 = nested_plain_piece(u)
+            s::Float64 = a + b
+            return s
+        end
+        plain_graph = kernel_graph(nested_plain_twice)
+        @test count(r -> r.op === exp, plain_graph.recipes) == 1
+        @test ReactiveKernels.canon_id(plain_graph, nested_plain_twice[:a].id) ==
+              ReactiveKernels.canon_id(plain_graph, nested_plain_twice[:b].id)
+        @test @inferred(prepare(plan(nested_plain_twice; want = :s))(1.0)) ==
+              2 * exp(1.0)
+
         @kernel nested_identity(x::Int) = begin
             y::Int = x
             return y
@@ -1336,6 +1357,25 @@ end
         @test prepare(cse_combined; want = :a)(3) == 3
         @test prepare(cse_combined; want = :b)(3) == 3
         @test prepare(cse_combined; want = :doubled)(3) == 6
+
+        # Same merge, plain operations without an explicit cse_key
+        # (planner-branch-a-380e2405): the shared `exp` still collapses.
+        plain_merge_base = @kernel begin
+            x::Float64
+            y::Float64 = exp(x)
+            return y
+        end
+        plain_merge_fragment = @kernel begin
+            x::Float64
+            y::Float64 = exp(x)
+            z::Float64 = y + 1
+            return z
+        end
+        plain_merged = merge(plain_merge_base, plain_merge_fragment)
+        @test count(
+            r -> r.op === exp, kernel_graph(plain_merged).recipes,
+        ) == 1
+        @test prepare(plain_merged; want = :z)(1.0) == exp(1.0) + 1
 
         single_alias = @kernel begin
             x::Int

@@ -66,7 +66,52 @@ function _candidate_recipes(g::Graph, have::Set{Int}, want::Vector{Int})
         end
     end
     sort!(cand)
+    _prune_dominated_candidates!(g, have, cand)
     cand
+end
+
+# HAVE-direct dominance pruning. A candidate producer `P` of a value `v`
+# (outside HAVE) that makes nothing but `v` is dominated when another
+# candidate `Q` produces `v` straight from HAVE at a strictly smaller
+# `(cost, id)`: any complete selection using `P` can swap `P` for `Q` (plus
+# dead-recipe pruning) without losing completeness or gaining cost, so `P`
+# appears in no optimal plan. The `(cost, id)` order is strict, hence the
+# minimum always survives and no value loses its last producer. This keeps
+# backward (inverse-route) producers from multiplying the exact search
+# whenever the direct HAVE route exists at no greater cost.
+function _prune_dominated_candidates!(g::Graph, have::Set{Int}, cand::Vector{Int})
+    by_value = Dict{Int,Vector{Int}}()
+    for rid in cand, o in g.recipes[rid].outputs
+        cid = canon_id(g, o.id)
+        cid in have && continue
+        push!(get!(by_value, cid, Int[]), rid)
+    end
+    dominated = Set{Int}()
+    for vid in sort!(collect(keys(by_value)))
+        producers = by_value[vid]
+        length(producers) > 1 || continue
+        best_key = nothing
+        best_rid = 0
+        for rid in producers
+            r = g.recipes[rid]
+            all(inp -> canon_id(g, inp.id) in have, r.inputs) || continue
+            key = (r.cost, rid)
+            if best_key === nothing || key < best_key
+                best_key = key
+                best_rid = rid
+            end
+        end
+        best_key === nothing && continue
+        for rid in producers
+            rid == best_rid && continue
+            r = g.recipes[rid]
+            all(o -> (cid = canon_id(g, o.id); cid == vid || cid in have),
+                r.outputs) || continue
+            (r.cost, rid) > best_key && push!(dominated, rid)
+        end
+    end
+    isempty(dominated) && return cand
+    filter!(rid -> !(rid in dominated), cand)
 end
 
 # --- branch-and-bound selection -------------------------------------------
