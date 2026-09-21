@@ -2,9 +2,12 @@
     PreparedADKernel
 
 A prepared DifferentiationInterface gradient for a ReactiveKernels scalar
-objective. Construct one with [`prepare_ad`](@ref), naming the selected HAVE
-port that remains active; every other selected HAVE port is supplied to
-DifferentiationInterface as a `DifferentiationInterface.Constant` context.
+objective. Construct one with [`prepare_ad`](@ref), naming one selected HAVE
+port or an ordered tuple of ports that remain active; every other selected
+HAVE port is supplied to DifferentiationInterface as a
+`DifferentiationInterface.Constant` context. A tuple selector is differentiated
+as one structured point, so one reverse pass returns a tuple of gradients in
+the selector's order.
 
 The stored differentiation preparation is mutable and not thread-safe. Prepare
 one `PreparedADKernel` per concurrent caller.
@@ -74,15 +77,40 @@ struct _ADNonAllocatingKernelCall{I,F,O,A}
     cache_apply::A
 end
 
+_ad_selector_indices(index::Int) = (index,)
+_ad_selector_indices(indices::Tuple) = indices
+
+# DifferentiationInterface's Enzyme extension cannot annotate a structured
+# point that mixes duplicated storage (arrays) and active scalars. Represent a
+# scalar component as mutable scalar storage so the whole tuple is duplicated,
+# then unwrap it at the RK callable boundary and restore its cotangent before
+# returning to the caller. Optional compiler extensions may keep their traced
+# scalar wrappers unchanged by specializing `_ad_active_point_component`.
+_ad_active_point_component(value::Number) = Ref(value)
+_ad_active_point_component(value) = value
+_ad_active_value(value::Base.RefValue) = value[]
+_ad_active_value(value) = value
+
+_ad_restore_cotangent(::Base.RefValue, cotangent::Base.RefValue) = cotangent[]
+function _ad_restore_cotangent(point::Tuple, cotangent::Tuple)
+    map(_ad_restore_cotangent, point, cotangent)
+end
+_ad_restore_cotangent(point, cotangent) = cotangent
+
 @generated function (call::_ADNativeKernelCall{I})(
         active, contexts::Vararg{Any,N}) where {I,N}
-    1 <= I <= N + 1 || return :(throw(ArgumentError(
-        "invalid active input index $I for an RK AD call with $(N + 1) inputs")))
+    indices = _ad_selector_indices(I)
+    input_count = N + length(indices)
+    all(index -> 1 <= index <= input_count, indices) || return :(throw(
+        ArgumentError("invalid active input selector $I for an RK AD call " *
+                      "with $input_count inputs")))
     positional = Any[]
     context_index = 1
-    for input_index in 1:(N + 1)
-        if input_index == I
-            push!(positional, :active)
+    for input_index in 1:input_count
+        active_position = findfirst(==(input_index), indices)
+        if active_position !== nothing
+            push!(positional, I isa Int ? :active :
+                  :(_ad_active_value(getfield(active, $active_position))))
         else
             push!(positional, :(getfield(contexts, $context_index)))
             context_index += 1
@@ -251,7 +279,7 @@ end
 # backend-shadowed slot would be a static-activity error), and compile the
 # resulting unbound program alongside its owned AD caches and operation
 # table.
-function _ad_na_program(kernel::NonAllocatingKernel, active_index::Int,
+function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
                         exemplars::Tuple)
     ast = kernel.ast
     ast.head === :function && ast.args[1] isa Expr &&
@@ -267,12 +295,14 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_index::Int,
     end
     length(have_syms) == length(inputs(kernel)) &&
         all(sym -> sym isa Symbol, have_syms) &&
-        1 <= active_index <= length(have_syms) || throw(ArgumentError(
+        all(index -> 1 <= index <= length(have_syms),
+            _ad_selector_indices(active_selector)) || throw(ArgumentError(
             "AD preparation over a non-allocating kernel requires the " *
-            "active port to select one of the " *
+            "active selector to name ports among the " *
             "$(length(inputs(kernel))) positional HAVE arguments"))
     kernel(exemplars...)
-    tainted = Set{Symbol}((have_syms[active_index],))
+    tainted = Set{Symbol}(
+        have_syms[index] for index in _ad_selector_indices(active_selector))
     elided = Set{Int}()
     ops, caches = kernel.ops, kernel.caches
     length(ops) == length(caches) || throw(ArgumentError(
@@ -296,21 +326,33 @@ end
 function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,
                          ::Val{I}) where {I}
     f, ad_caches, ad_ops = _ad_na_program(kernel, I, args)
+    # A cacheless step program still carries the positional cache-table ABI,
+    # but asking the backend to shadow `Tuple{Nothing,...}` marks a ghost-only
+    # type differentiable. Keep that inert table Constant; any retained slot
+    # still uses Cache so the backend owns and shadows its mutable storage.
+    cache_context = all(isnothing, ad_caches) ?
+        DifferentiationInterface.Constant(ad_caches) :
+        DifferentiationInterface.Cache(ad_caches)
     _ADNonAllocatingKernelCall{I,typeof(f),typeof(ad_ops),
                                typeof(kernel.cache_apply)}(
         f, ad_ops, kernel.cache_apply),
-    (DifferentiationInterface.Cache(ad_caches),)
+    (cache_context,)
 end
 
 @generated function (call::_ADKernelCall{I})(
         active, contexts::Vararg{Any,N}) where {I,N}
-    1 <= I <= N + 1 || return :(throw(ArgumentError(
-        "invalid active input index $I for an RK AD call with $(N + 1) inputs")))
+    indices = _ad_selector_indices(I)
+    input_count = N + length(indices)
+    all(index -> 1 <= index <= input_count, indices) || return :(throw(
+        ArgumentError("invalid active input selector $I for an RK AD call " *
+                      "with $input_count inputs")))
     arguments = Any[]
     context_index = 1
-    for input_index in 1:(N + 1)
-        if input_index == I
-            push!(arguments, :active)
+    for input_index in 1:input_count
+        active_position = findfirst(==(input_index), indices)
+        if active_position !== nothing
+            push!(arguments, I isa Int ? :active :
+                  :(_ad_active_value(getfield(active, $active_position))))
         else
             push!(arguments, :(getfield(contexts, $context_index)))
             context_index += 1
@@ -323,14 +365,18 @@ end
 # the inactive HAVE arguments around the active one, exactly as above.
 @generated function (call::_ADNonAllocatingKernelCall{I})(
         active, contexts::Vararg{Any,N}) where {I,N}
-    1 <= I <= N || return :(throw(ArgumentError(
-        "invalid active input index $I for an RK non-allocating AD call " *
-        "with $N inputs")))
+    indices = _ad_selector_indices(I)
+    input_count = N + length(indices) - 1
+    all(index -> 1 <= index <= input_count, indices) || return :(throw(
+        ArgumentError("invalid active input selector $I for an RK " *
+                      "non-allocating AD call with $input_count inputs")))
     arguments = Any[]
     context_index = 1
-    for input_index in 1:N
-        if input_index == I
-            push!(arguments, :active)
+    for input_index in 1:input_count
+        active_position = findfirst(==(input_index), indices)
+        if active_position !== nothing
+            push!(arguments, I isa Int ? :active :
+                  :(_ad_active_value(getfield(active, $active_position))))
         else
             push!(arguments, :(getfield(contexts, $context_index)))
             context_index += 1
@@ -374,6 +420,19 @@ function _ad_active_index(::_ADKernel, active)
         string(typeof(active))))
 end
 
+function _ad_active_selector(kernel::_ADKernel, active::Tuple)
+    isempty(active) && throw(ArgumentError(
+        "active tuple must identify at least one selected HAVE port"))
+    indices = map(identifier -> _ad_active_index(kernel, identifier), active)
+    length(unique(indices)) == length(indices) || throw(ArgumentError(
+        "active tuple names the same selected HAVE port more than once: " *
+        string(active)))
+    indices
+end
+
+_ad_active_selector(kernel::_ADKernel, active) =
+    _ad_active_index(kernel, active)
+
 function _ad_validate_unique_haves(spec::KernelSpec)
     graph = spec.graph
     haves = inputs(spec)
@@ -398,10 +457,11 @@ end
 # is an active-derived boundary cut. Marking it Constant would sever a real
 # derivative. The caller must instead derive it inside the selected kernel or
 # use DifferentiationInterface directly with an explicit Cache contract.
-function _ad_validate_constant_boundary(kernel::_ADKernel, active_index::Int)
+function _ad_validate_constant_boundary(kernel::_ADKernel, active_selector)
     graph = kernel.plan.graph
-    active = inputs(kernel)[active_index]
-    downstream = Set((canon_id(graph, active.id),))
+    active_indices = _ad_selector_indices(active_selector)
+    active_inputs = map(index -> inputs(kernel)[index], active_indices)
+    downstream = Set(canon_id(graph, active.id) for active in active_inputs)
     changed = true
     while changed
         changed = false
@@ -420,14 +480,16 @@ function _ad_validate_constant_boundary(kernel::_ADKernel, active_index::Int)
 
     derived = Symbol[]
     for (index, input) in pairs(inputs(kernel))
-        index == active_index && continue
+        index in active_indices && continue
         canon_id(graph, input.id) in downstream && push!(derived, input.name)
     end
+    active_names = join((":" * string(input.name) for input in active_inputs), ", ")
     isempty(derived) || throw(ArgumentError(
         "inactive HAVE port$(length(derived) == 1 ? "" : "s") " *
         join((":" * string(name) for name in derived), ", ") *
         " $(length(derived) == 1 ? "is" : "are") transitively downstream of " *
-        "active port :$(active.name) and cannot be treated as " *
+        "active port$(length(active_indices) == 1 ? "" : "s") $active_names " *
+        "and cannot be treated as " *
         "DifferentiationInterface.Constant; derive active-dependent values " *
         "inside the selected kernel, or use an explicit DI Cache boundary"))
     nothing
@@ -442,7 +504,7 @@ _ad_differentiable_value(value::NamedTuple) =
     !isempty(value) && all(_ad_differentiable_value, values(value))
 _ad_differentiable_value(::Any) = false
 
-function _ad_validate_kernel(kernel::_ADKernel, active_index::Int,
+function _ad_validate_kernel(kernel::_ADKernel, active_selector,
                              args::Tuple; scalar_output::Bool = true)
     length(args) == length(inputs(kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(kernel))) values " *
@@ -467,20 +529,23 @@ function _ad_validate_kernel(kernel::_ADKernel, active_index::Int,
         end
     end
 
-    active = inputs(kernel)[active_index]
-    _ad_differentiable_value(args[active_index]) || throw(ArgumentError(
-        "active HAVE port :$(active.name) received non-differentiable exemplar " *
-        "type $(typeof(args[active_index])); expected floating-point scalar, " *
-        "array, tuple, or NamedTuple storage"))
+    for active_index in _ad_selector_indices(active_selector)
+        active = inputs(kernel)[active_index]
+        _ad_differentiable_value(args[active_index]) || throw(ArgumentError(
+            "active HAVE port :$(active.name) received non-differentiable " *
+            "exemplar type $(typeof(args[active_index])); expected " *
+            "floating-point scalar, array, tuple, or NamedTuple storage"))
+    end
 
-    _ad_validate_constant_boundary(kernel, active_index)
+    _ad_validate_constant_boundary(kernel, active_selector)
     nothing
 end
 
 @generated function _ad_arguments(::Val{I}, args::A) where {I,A<:Tuple}
     N = fieldcount(A)
-    1 <= I <= N || return :(throw(ArgumentError(
-        "invalid active input index $I for $N kernel arguments")))
+    indices = _ad_selector_indices(I)
+    all(index -> 1 <= index <= N, indices) || return :(throw(ArgumentError(
+        "invalid active input selector $I for $N kernel arguments")))
     # Values that already carry a DifferentiationInterface context wrapper
     # (the non-allocating path's owned `Cache`) pass through untouched; only
     # raw boundary values become `Constant` contexts.
@@ -488,9 +553,13 @@ end
         A.parameters[index] <: DifferentiationInterface.Context ?
             :(getfield(args, $index)) :
             :(DifferentiationInterface.Constant(getfield(args, $index)))
-        for index in 1:N if index != I
+        for index in 1:N if !(index in indices)
     ]
-    :(getfield(args, $I), ($(contexts...),))
+    point = I isa Int ? :(getfield(args, $I)) :
+        Expr(:tuple, (:(
+            _ad_active_point_component(getfield(args, $index)))
+            for index in indices)...)
+    :($point, ($(contexts...),))
 end
 
 # A native (non-traced) prepared-AD call inside a Reactant trace never reaches
@@ -507,13 +576,13 @@ end
 
 function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
                   scalar_output::Bool = true)
-    active_index = _ad_active_index(kernel, active)
-    _ad_validate_kernel(kernel, active_index, resolved; scalar_output)
+    active_selector = _ad_active_selector(kernel, active)
+    _ad_validate_kernel(kernel, active_selector, resolved; scalar_output)
     call, external_values =
-        _ad_kernel_call(kernel, resolved, Val(active_index))
+        _ad_kernel_call(kernel, resolved, Val(active_selector))
     point, contexts = _ad_arguments(
-        Val(active_index), (resolved..., external_values...))
-    call, point, contexts, active_index, external_values
+        Val(active_selector), (resolved..., external_values...))
+    call, point, contexts, active_selector, external_values
 end
 
 function _ad_spec_kernel(spec::KernelSpec, want, bound = NamedTuple())
@@ -601,11 +670,11 @@ function _prepare_ad(kernel::_ADKernel, resolver,
                      args::Tuple, kwargs::NamedTuple, active)
     _ad_require_backend_packages(backend)
     resolved = _ad_resolve(resolver, args, kwargs)
-    call, point, contexts, active_index, external_values =
+    call, point, contexts, active_selector, external_values =
         _ad_call(kernel, resolved, active)
     preparation = DifferentiationInterface.prepare_gradient(
         call, backend, point, contexts...)
-    PreparedADKernel{active_index,typeof(kernel),typeof(resolver),typeof(call),
+    PreparedADKernel{active_selector,typeof(kernel),typeof(resolver),typeof(call),
                      typeof(backend),typeof(preparation),
                      typeof(external_values)}(
         kernel, resolver, call, backend, preparation, external_values)
@@ -616,12 +685,12 @@ function _prepare_ad_pullback(kernel::_ADKernel, resolver,
                               seed, args::Tuple, kwargs::NamedTuple, active)
     _ad_require_backend_packages(backend)
     resolved = _ad_resolve(resolver, args, kwargs)
-    call, point, contexts, active_index, external_values =
+    call, point, contexts, active_selector, external_values =
         _ad_call(kernel, resolved, active; scalar_output = false)
     preparation = DifferentiationInterface.prepare_pullback(
         call, backend, point, (seed,), contexts...)
     PreparedADPullback{
-        active_index,typeof(kernel),typeof(resolver),typeof(call),
+        active_selector,typeof(kernel),typeof(resolver),typeof(call),
         typeof(backend),typeof(preparation),typeof(external_values),
     }(kernel, resolver, call, backend, preparation, external_values)
 end
@@ -630,9 +699,11 @@ end
     prepare_ad(spec, backend, args...; active, want, bound=(;), kwargs...) -> PreparedADKernel
 
 Prepare a reusable DifferentiationInterface gradient of the explicit scalar
-`want` port in a [`KernelSpec`](@ref). `active` names the one selected HAVE
-port that remains differentiable; all other selected HAVE values are rebound
-on every call and passed as `Constant` contexts.
+`want` port in a [`KernelSpec`](@ref). `active` names one selected HAVE port or
+an ordered tuple of ports that remain differentiable; all other selected HAVE
+values are rebound on every call and passed as `Constant` contexts. A tuple
+selector is differentiated as one structured point, and gradients are returned
+in the same order.
 
 The ordinary authored call surface is preserved: positional defaults and
 keyword HAVE ports are resolved exactly as they are by `prepare(spec)`. The
@@ -671,7 +742,8 @@ end
 
 Prepare a reusable gradient for a low-level [`PreparedKernel`](@ref) whose
 boundary is already fully selected. Such kernels accept only their positional
-HAVE values and must expose exactly one scalar WANT.
+HAVE values and must expose exactly one scalar WANT. `active` may be one port
+identifier or an ordered tuple of identifiers.
 
 The backend's package must be loaded in the calling session (`using Enzyme`
 for `AutoEnzyme`); the backend value alone does not load
@@ -692,7 +764,8 @@ end
 
 Prepare a reusable gradient for a low-level [`NonAllocatingKernel`](@ref)
 whose boundary is already fully selected. Such kernels accept only their
-positional HAVE values and must expose exactly one scalar WANT.
+positional HAVE values and must expose exactly one scalar WANT. `active` may be
+one port identifier or an ordered tuple of identifiers.
 
 The preparation seeds the kernel's caches once with the exemplar arguments,
 then differentiates the same step program through AD-owned concretely-typed
@@ -759,7 +832,8 @@ function replica(prepared::PreparedADKernel{I}; batched) where {I}
     indices = _replica_batch_indices(boundary, batched)
     input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
     foreach(_replica_rank, input_types.parameters)
-    active_type = valtype(boundary[I])
+    active_type = I isa Int ? valtype(boundary[I]) :
+        Tuple{(valtype(boundary[index]) for index in I)...}
     _ReplicatedADKernel{indices,input_types,active_type,
                         typeof(prepared),typeof(boundary)}(
         prepared, boundary)
@@ -820,6 +894,13 @@ end
 
 _replica_ad_stack(values, ::Type{T}) where {T<:Number} = collect(values)
 _replica_ad_stack(values, ::Type{T}) where {T<:AbstractArray} = stack(values)
+function _replica_ad_stack(values, ::Type{T}) where {T<:Tuple}
+    ntuple(length(T.parameters)) do component
+        _replica_ad_stack(
+            map(value -> getfield(value, component), values),
+            T.parameters[component])
+    end
+end
 _replica_ad_stack(values, ::Type{T}) where {T} = throw(ArgumentError(
     "replica AD active ports must be Numbers or AbstractArrays; got $T"))
 
@@ -831,8 +912,9 @@ _replica_ad_stack(values, ::Type{T}) where {T} = throw(ArgumentError(
 
 Prepare a reusable reverse pullback (vector-Jacobian product) for one explicit
 `want` port. `seed` is an exemplar output cotangent. Unlike [`prepare_ad`](@ref),
-the selected WANT may be non-scalar. Exactly one HAVE port is active and all
-other current HAVE values are rebound as `Constant` contexts on every call.
+the selected WANT may be non-scalar. One HAVE port or an ordered tuple of HAVE
+ports is active, and all other current HAVE values are rebound as `Constant`
+contexts on every call.
 
 The backend's package must be loaded in the calling session (`using Enzyme`
 for `AutoEnzyme`); the backend value alone does not load
@@ -876,11 +958,13 @@ end
     ad_gradient(kernel, backend, args...; active)
     ad_gradient(prepared, args...; kwargs...)
 
-Compute a gradient with respect to one named active HAVE port. The `KernelSpec`
-form selects an explicit scalar `want` and preserves authored defaults and
-keywords. The low-level `PreparedKernel` / `NonAllocatingKernel` forms require
-an already selected, positional, single-scalar boundary. The reusable form
-uses a [`PreparedADKernel`](@ref) returned by [`prepare_ad`](@ref).
+Compute a gradient with respect to one named active HAVE port or an ordered
+tuple of ports. The `KernelSpec` form selects an explicit scalar `want` and
+preserves authored defaults and keywords. The low-level `PreparedKernel` /
+`NonAllocatingKernel` forms require an already selected, positional,
+single-scalar boundary. The reusable form uses a [`PreparedADKernel`](@ref)
+returned by [`prepare_ad`](@ref). Tuple selectors return tuple gradients in the
+same order from one differentiation call.
 
 The one-shot forms require the backend's package to be loaded in the calling
 session (`using Enzyme` for `AutoEnzyme`); the backend value alone does not
@@ -895,13 +979,17 @@ function ad_gradient(spec::KernelSpec,
         _ad_reject_bound_keywords(NamedTuple(kwargs))
         call, point, contexts, _, _ = _ad_call(kernel, args, active)
         _ad_trace_sanity(point, contexts)
-        return DifferentiationInterface.gradient(call, backend, point, contexts...)
+        gradient = DifferentiationInterface.gradient(
+            call, backend, point, contexts...)
+        return _ad_restore_cotangent(point, gradient)
     end
     resolver = _ad_resolver(spec)
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
     call, point, contexts, _, _ = _ad_call(kernel, resolved, active)
     _ad_trace_sanity(point, contexts)
-    DifferentiationInterface.gradient(call, backend, point, contexts...)
+    gradient = DifferentiationInterface.gradient(
+        call, backend, point, contexts...)
+    _ad_restore_cotangent(point, gradient)
 end
 
 function ad_gradient(kernel::PreparedKernel,
@@ -913,7 +1001,9 @@ function ad_gradient(kernel::PreparedKernel,
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
     call, point, contexts, _, _ = _ad_call(kernel, args, active)
     _ad_trace_sanity(point, contexts)
-    DifferentiationInterface.gradient(call, backend, point, contexts...)
+    gradient = DifferentiationInterface.gradient(
+        call, backend, point, contexts...)
+    _ad_restore_cotangent(point, gradient)
 end
 
 function ad_gradient(kernel::NonAllocatingKernel,
@@ -926,7 +1016,9 @@ function ad_gradient(kernel::NonAllocatingKernel,
         "keywords"))
     call, point, contexts, _, _ = _ad_call(kernel, args, active)
     _ad_trace_sanity(point, contexts)
-    DifferentiationInterface.gradient(call, backend, point, contexts...)
+    gradient = DifferentiationInterface.gradient(
+        call, backend, point, contexts...)
+    _ad_restore_cotangent(point, gradient)
 end
 
 function _ad_prepared_arguments(
@@ -944,9 +1036,10 @@ end
 function ad_gradient(prepared::PreparedADKernel, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
-    DifferentiationInterface.gradient(
+    gradient = DifferentiationInterface.gradient(
         prepared.call, prepared.preparation, prepared.backend,
         point, contexts...)
+    _ad_restore_cotangent(point, gradient)
 end
 
 """
@@ -969,9 +1062,10 @@ function ad_value_and_gradient(
 end
 
 function _ad_prepared_value_and_gradient(prepared, point, contexts)
-    DifferentiationInterface.value_and_gradient(
+    value, gradient = DifferentiationInterface.value_and_gradient(
         prepared.call, prepared.preparation, prepared.backend,
         point, contexts...)
+    value, _ad_restore_cotangent(point, gradient)
 end
 
 """
@@ -998,8 +1092,9 @@ function ad_pullback(spec::KernelSpec,
     call, point, contexts, _, _ =
         _ad_call(kernel, resolved, active; scalar_output = false)
     _ad_trace_sanity(point, contexts)
-    only(DifferentiationInterface.pullback(
+    cotangent = only(DifferentiationInterface.pullback(
         call, backend, point, (seed,), contexts...))
+    _ad_restore_cotangent(point, cotangent)
 end
 
 function ad_pullback(kernel::PreparedKernel,
@@ -1012,8 +1107,9 @@ function ad_pullback(kernel::PreparedKernel,
     call, point, contexts, _, _ =
         _ad_call(kernel, args, active; scalar_output = false)
     _ad_trace_sanity(point, contexts)
-    only(DifferentiationInterface.pullback(
+    cotangent = only(DifferentiationInterface.pullback(
         call, backend, point, (seed,), contexts...))
+    _ad_restore_cotangent(point, cotangent)
 end
 
 function ad_pullback(kernel::NonAllocatingKernel,
@@ -1027,8 +1123,9 @@ function ad_pullback(kernel::NonAllocatingKernel,
     call, point, contexts, _, _ =
         _ad_call(kernel, args, active; scalar_output = false)
     _ad_trace_sanity(point, contexts)
-    only(DifferentiationInterface.pullback(
+    cotangent = only(DifferentiationInterface.pullback(
         call, backend, point, (seed,), contexts...))
+    _ad_restore_cotangent(point, cotangent)
 end
 
 function _ad_prepared_arguments(
@@ -1046,18 +1143,20 @@ end
 function ad_pullback(prepared::PreparedADPullback, seed, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
-    only(DifferentiationInterface.pullback(
+    cotangent = only(DifferentiationInterface.pullback(
         prepared.call, prepared.preparation, prepared.backend,
         point, (seed,), contexts...))
+    _ad_restore_cotangent(point, cotangent)
 end
 
 """
     ad_value_and_pullback(prepared, seed, args...; kwargs...)
 
 Evaluate the selected WANT and its reverse pullback together. Returns
-`(value, active_cotangent)`, unwrapping DifferentiationInterface's one-direction
-tuple. The prepared object is reusable with new runtime arguments and seeds
-compatible with its preparation exemplars.
+`(value, active_cotangent)`, unwrapping DifferentiationInterface's
+one-direction tuple. A tuple active selector produces a tuple cotangent in the
+selector's order. The prepared object is reusable with new runtime arguments
+and seeds compatible with its preparation exemplars.
 """
 function ad_value_and_pullback(
         prepared::PreparedADPullback, seed, args...; kwargs...)
@@ -1066,7 +1165,7 @@ function ad_value_and_pullback(
     value, pullbacks = DifferentiationInterface.value_and_pullback(
         prepared.call, prepared.preparation, prepared.backend,
         point, (seed,), contexts...)
-    value, only(pullbacks)
+    value, _ad_restore_cotangent(point, only(pullbacks))
 end
 
 """
@@ -1074,15 +1173,31 @@ end
 
 Evaluate the selected WANT and reverse pullback while writing the active-input
 cotangent into caller-owned `cotangent` storage. Returns `(value, cotangent)`.
-The destination must satisfy the differentiation backend's in-place pullback
-contract. Array destinations are the supported ReactiveKernels surface;
-structured destinations should use [`ad_value_and_pullback`](@ref) unless the
-backend explicitly supports mutating that structure.
+For a scalar active selector, the destination must satisfy the differentiation
+backend's in-place pullback contract. For a tuple selector, supply a matching
+tuple of mutable arrays or `Ref` destinations; the structured cotangent is
+copied into them after the one reverse pass.
 """
 function ad_value_and_pullback!(
         prepared::PreparedADPullback, cotangent, seed, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
+    _ad_prepared_value_and_pullback!(
+        prepared, cotangent, seed, point, contexts)
+end
+
+function _ad_prepared_value_and_pullback!(
+        prepared, cotangent, seed, point::Tuple, contexts)
+    value, pullbacks = DifferentiationInterface.value_and_pullback(
+        prepared.call, prepared.preparation, prepared.backend,
+        point, (seed,), contexts...)
+    restored = _ad_restore_cotangent(point, only(pullbacks))
+    _ad_copy_cotangent!(cotangent, restored)
+    value, cotangent
+end
+
+function _ad_prepared_value_and_pullback!(
+        prepared, cotangent, seed, point, contexts)
     value, pullbacks = DifferentiationInterface.value_and_pullback!(
         prepared.call, (cotangent,), prepared.preparation, prepared.backend,
         point, (seed,), contexts...)
@@ -1094,9 +1209,12 @@ end
 
 Compute the scalar value and gradient for a reusable [`PreparedADKernel`](@ref),
 writing the gradient into `gradient`. Runtime arguments follow the original RK
-HAVE boundary; the prepared active port is reordered to DI position one, and
-every other current argument is rebound as a fresh
-`DifferentiationInterface.Constant` context.
+HAVE boundary; the prepared active port or ordered tuple of ports is reordered
+to DI position one, and every other current argument is rebound as a fresh
+`DifferentiationInterface.Constant` context. For a tuple selector, `gradient`
+is a matching tuple of mutable destinations. The backend's structured
+out-of-place gradient is copied into those destinations after the same single
+reverse pass.
 
 Returns the `(value, gradient)` pair from
 `DifferentiationInterface.value_and_gradient!`. The destination must be valid
@@ -1111,11 +1229,12 @@ preparation there.
 @generated function ad_value_and_gradient!(
         prepared::PreparedADKernel{I,K,typeof(tuple),F,B,P,E}, gradient,
         args::Vararg{Any,N}) where {I,K,F,B,P,E,N}
-    1 <= I <= N || return :(throw(ArgumentError(
-        "prepared active input index $I is invalid for $N arguments")))
+    indices = _ad_selector_indices(I)
+    all(index -> 1 <= index <= N, indices) || return :(throw(ArgumentError(
+        "prepared active input selector $I is invalid for $N arguments")))
     contexts = [
         :(DifferentiationInterface.Constant(getfield(args, $index)))
-        for index in 1:N if index != I
+        for index in 1:N if !(index in indices)
     ]
     append!(contexts, [
         E.parameters[index] <: DifferentiationInterface.Context ?
@@ -1124,13 +1243,17 @@ preparation there.
                 getfield(prepared.external_values, $index)))
         for index in 1:fieldcount(E)
     ])
+    point = I isa Int ? :(getfield(args, $I)) :
+        Expr(:tuple, (:(
+            _ad_active_point_component(getfield(args, $index)))
+            for index in indices)...)
     quote
         length(inputs(prepared.kernel)) == $N || throw(ArgumentError(
             "selected HAVE boundary expects " *
             string(length(inputs(prepared.kernel))) *
             " values; got $N"))
         _ad_prepared_value_and_gradient!(
-            prepared, gradient, getfield(args, $I), ($(contexts...),))
+            prepared, gradient, $point, ($(contexts...),))
     end
 end
 
@@ -1147,6 +1270,50 @@ function _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
         point, contexts...)
 end
 
+function _ad_prepared_value_and_gradient!(
+        prepared, gradient, point::Tuple, contexts)
+    value, derivative = _ad_prepared_value_and_gradient(
+        prepared, point, contexts)
+    _ad_copy_cotangent!(gradient, derivative)
+    value, gradient
+end
+
+function _ad_copy_cotangent!(destination::AbstractArray, source)
+    copyto!(destination, source)
+    destination
+end
+
+
+function _ad_copy_cotangent!(destination::Base.RefValue, source)
+    destination[] = source
+    destination
+end
+
+function _ad_copy_cotangent!(destination::Tuple, source::Tuple)
+    length(destination) == length(source) || throw(DimensionMismatch(
+        "gradient destination has $(length(destination)) components; " *
+        "the active tuple has $(length(source))"))
+    foreach(_ad_copy_cotangent!, destination, source)
+    destination
+end
+
+function _ad_copy_cotangent!(destination::NamedTuple, source::NamedTuple)
+    keys(destination) == keys(source) || throw(ArgumentError(
+        "gradient destination fields $(keys(destination)) do not match " *
+        "cotangent fields $(keys(source))"))
+    foreach(_ad_copy_cotangent!, values(destination), values(source))
+    destination
+end
+
+
+function _ad_copy_cotangent!(destination, source)
+    throw(ArgumentError(
+        "structured active gradients require matching mutable array, Ref, " *
+        "or tuple destinations; got $(typeof(destination)) for a " *
+        "$(typeof(source)) cotangent. Use ad_value_and_gradient for an " *
+        "out-of-place structured gradient."))
+end
+
 inputs(prepared::PreparedADKernel) = inputs(prepared.kernel)
 outputs(prepared::PreparedADKernel) = outputs(prepared.kernel)
 code_expr(prepared::PreparedADKernel) = code_expr(prepared.kernel)
@@ -1154,17 +1321,27 @@ inputs(prepared::PreparedADPullback) = inputs(prepared.kernel)
 outputs(prepared::PreparedADPullback) = outputs(prepared.kernel)
 code_expr(prepared::PreparedADPullback) = code_expr(prepared.kernel)
 
+function _show_ad_active(io::IO, boundary, index::Int)
+    print(io, ":", boundary[index].name)
+end
+
+function _show_ad_active(io::IO, boundary, indices::Tuple)
+    show(io, Tuple(boundary[index].name for index in indices))
+end
+
 function Base.show(io::IO, prepared::PreparedADKernel{I}) where {I}
-    print(io, "PreparedADKernel(active=:", inputs(prepared.kernel)[I].name,
-          ", want=:", only(outputs(prepared.kernel)).name, ", kernel=")
+    print(io, "PreparedADKernel(active=")
+    _show_ad_active(io, inputs(prepared.kernel), I)
+    print(io, ", want=:", only(outputs(prepared.kernel)).name, ", kernel=")
     show(io, prepared.kernel)
     print(io, ")")
 end
 
 
 function Base.show(io::IO, prepared::PreparedADPullback{I}) where {I}
-    print(io, "PreparedADPullback(active=:", inputs(prepared.kernel)[I].name,
-          ", want=:", only(outputs(prepared.kernel)).name, ", kernel=")
+    print(io, "PreparedADPullback(active=")
+    _show_ad_active(io, inputs(prepared.kernel), I)
+    print(io, ", want=:", only(outputs(prepared.kernel)).name, ", kernel=")
     show(io, prepared.kernel)
     print(io, ")")
 end
@@ -1172,8 +1349,8 @@ end
 # --- Reactant-compiled automatic differentiation -----------------------------
 # The AD analog of the primal Reactant path (`@compile sync=true kernel(args...)`).
 # These take a native `PreparedADKernel` — which already owns the scalar-WANT /
-# single-active-port validation and the authored-HAVE-order reorder — and compile
-# a DifferentiationInterface gradient (or value-and-gradient) through Reactant.
+# active-port validation and the authored-HAVE-order reorder — and compile a
+# DifferentiationInterface gradient (or value-and-gradient) through Reactant.
 #
 # The differentiation engine stays the caller's DifferentiationInterface backend
 # (the one passed to `prepare_ad`), so ReactiveKernels imports no concrete AD
@@ -1189,7 +1366,8 @@ function _reactant_ad_marker(prepared::PreparedADKernel{I}, args::Tuple) where {
         "Reactant AD compilation expects the $(length(inputs(prepared.kernel)))-value " *
         "HAVE boundary $(Tuple(input.name for input in inputs(prepared.kernel))); " *
         "got $(length(args)) argument(s)"))
-    getfield(args, I)
+    I isa Int ? getfield(args, I) :
+        ntuple(position -> getfield(args, I[position]), length(I))
 end
 
 # Selected by the Reactant extension on `marker::Reactant.RArray` /
@@ -1210,11 +1388,12 @@ function _reactant_compile_ad_externalized end
     compile_ad_gradient(prepared::PreparedADKernel, traced_args...; sync = true)
 
 Reactant/XLA-compile the gradient of a [`PreparedADKernel`](@ref) with respect to
-its one active HAVE port. `traced_args` are the selected HAVE values in authored
-order, already traced with `Reactant.to_rarray` (matching the primal Reactant
-path). Returns a compiled callable that accepts the same traced boundary and
-returns the gradient with respect to the active port; every inactive HAVE is
-held constant, exactly as on the native [`ad_gradient`](@ref) path.
+its active HAVE port or ordered tuple of active ports. `traced_args` are the
+selected HAVE values in authored order, already traced with
+`Reactant.to_rarray` (matching the primal Reactant path). Returns a compiled
+callable that accepts the same traced boundary and returns the gradient with
+respect to the active point; every inactive HAVE is held constant, exactly as
+on the native [`ad_gradient`](@ref) path.
 
 This is the AD analog of compiling the primal kernel with
 `@compile sync = true kernel(traced_args...)`. It is only possible where the
@@ -1248,8 +1427,8 @@ Reactant/XLA-compile the scalar value and gradient of a [`PreparedADKernel`](@re
 together, mirroring the native [`ad_value_and_gradient!`](@ref) boundary. Returns
 a compiled callable that accepts the traced HAVE boundary in authored order and
 returns the `(value, gradient)` pair (a traced scalar and a traced gradient with
-respect to the active port). This is the sampler-facing surface: one compiled
-call yields both the potential and its gradient.
+respect to the active port or ordered active tuple). This is the sampler-facing
+surface: one compiled call yields both the potential and its gradient.
 
 Like [`compile_ad_gradient`](@ref), this requires the Reactant weak dependency,
 reuses the DifferentiationInterface backend from [`prepare_ad`](@ref), and only
