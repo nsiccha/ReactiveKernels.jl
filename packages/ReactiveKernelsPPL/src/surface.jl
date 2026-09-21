@@ -2418,6 +2418,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     joints = JointSampleStmt[]
     glms = GLMSampleStmt[]
     varying_raw = NamedTuple[]
+    level_bindings = Dict{Symbol,Tuple{Symbol,Any}}()
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
     seen_doc = false
@@ -2531,7 +2532,8 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                        "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
                        "object owns eta over the whole column)")
             end
-            lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde, data)
+            lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde, data,
+                level_bindings)
             lhs === :dummy &&
                 _sfail("`dummy` is reserved (margin surface) and cannot " *
                        "be sampled")
@@ -2586,6 +2588,11 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             if _is_event_lp_decl_rhs(st.args[2])
                 push!(event_lps, _lower_event_lp_decl(lhs, st.args[2], line,
                     data))
+                continue
+            end
+            if _is_levels_binding_rhs(st.args[2])
+                push!(level_bindings,
+                    lhs => _lower_levels_binding(lhs, st.args[2], data))
                 continue
             end
             _reject_target(st.args[2], lhs)
@@ -3133,8 +3140,10 @@ _is_broadcast_sample(st::Expr) =
 # (`.~` only), or a matrix-sized ref `b[axes(X, 2)]` (`.~` only).
 # Returns `(column, range, levels, matrix)` with at most one of `range` /
 # `levels` / `matrix` set (`matrix` is the sizing design matrix).
-_sample_lhs(lhs::Symbol, bc, tilde, data) = (lhs, nothing, nothing, nothing)
-function _sample_lhs(lhs, bc, tilde, data)
+_sample_lhs(lhs::Symbol, bc, tilde, data,
+        level_bindings = Dict{Symbol,Tuple{Symbol,Any}}()) =
+    (lhs, nothing, nothing, nothing)
+function _sample_lhs(lhs, bc, tilde, data, level_bindings)
     lhs isa Expr || _sfail("$tilde left-hand side must be a bare Symbol, " *
                            "a range ref (`y[1:N]`), a levels ref " *
                            "(`c[levels(g)]`), or a matrix-sized ref " *
@@ -3187,6 +3196,19 @@ function _sample_lhs(lhs, bc, tilde, data)
                                  "responses ($target is data)")
         gcol = _levels_column(target, index, data)
         return target, nothing, (gcol, Colon()), nothing
+    end
+    if index isa Symbol
+        # Data targets keep the pre-levels path verbatim (per-cell refs
+        # belong in `@plate`; only coefficient targets see levels logic).
+        target in data &&
+            return target, _lower_lhs_range(target, index), nothing, nothing
+        bc || _sfail("sized prior `$(target)[$(index)]` is a vector — " *
+                     "use `.~`, not `~`")
+        haskey(level_bindings, index) || _sfail(
+            "coefficient $target: index name $index must be a bound " *
+            "levels-subset declared as `$index = levels(group)` or " *
+            "`$index = levels(group)[subset]`, got $(repr(index))")
+        return target, nothing, level_bindings[index], nothing
     end
     bc || _sfail("sliced response `$target[...]` is a vector — " *
                  "use `.~`, not `~`")
@@ -3252,21 +3274,42 @@ function _levels_subset_index(col::Symbol, index::Expr, data::Set{Symbol})
     return gcol, _lower_levels_subset(col, gcol, index.args[2])
 end
 
+# A model-level levels binding: exactly the inline levels grammar under a
+# name (`sel = levels(g)` or `sel = levels(g)[subset]`). The stored value is
+# the same `(grouping, subset)` pair carried by a `SampleStmt`, so reuse in
+# coefficient indices follows the ordinary inline lowering path.
+_is_levels_binding_rhs(rhs) =
+    _is_levels_call(rhs) ||
+    rhs isa Expr && rhs.head === :ref && length(rhs.args) == 2 &&
+        _is_levels_call(rhs.args[1])
+
+function _lower_levels_binding(name::Symbol, rhs, data::Set{Symbol})
+    if rhs isa Expr && rhs.head === :ref && length(rhs.args) == 2
+        call, subset = rhs.args
+    else
+        call, subset = rhs, nothing
+    end
+    gcol = _levels_column(name, call, data, "levels binding $name")
+    subset === nothing && return (gcol, Colon())
+    return gcol, _lower_levels_subset(name, gcol, subset)
+end
+
 _is_levels_call(x) =
     x isa Expr && x.head === :call && !isempty(x.args) &&
     x.args[1] isa Symbol && x.args[1] in (:levels, :unique, :sort)
 
-function _levels_column(col::Symbol, call::Expr, data::Set{Symbol})
+function _levels_column(col::Symbol, call::Expr, data::Set{Symbol},
+        where::AbstractString = "coefficient $col")
     fn = call.args[1]
-    fn === :levels || _sfail("coefficient $col: write `levels(...)`, not " *
+    fn === :levels || _sfail("$where: write `levels(...)`, not " *
                              "`$fn(...)` (the levels function is `levels`)")
     length(call.args) == 2 ||
-        _sfail("coefficient $col: `levels` takes exactly one grouping " *
+        _sfail("$where: `levels` takes exactly one grouping " *
                "column, got $(repr(call))")
     gcol = call.args[2]
-    gcol isa Symbol || _sfail("coefficient $col: `levels` takes a bare " *
+    gcol isa Symbol || _sfail("$where: `levels` takes a bare " *
                               "grouping column, got $(repr(gcol))")
-    gcol in data || _sfail("coefficient $col: `levels($gcol)` needs a " *
+    gcol in data || _sfail("$where: `levels($gcol)` needs a " *
                            "data grouping column — $gcol is not data")
     return gcol
 end
