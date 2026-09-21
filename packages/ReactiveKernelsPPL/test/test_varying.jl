@@ -1398,3 +1398,238 @@ end
     @test only(bound.varying_draws).levels == levels
     @test assign_layout(bound).total == 13 # coef + sigma + theta + 2 tau + 2×4 z
 end
+
+# Swap per-margin sd priors onto one draws block of a lowered (unbound) plan.
+function _tv_with_sd(plan::StructuralPlan, sd::Vector{VaryingSdPrior},
+        which::Int = 1)
+    d = plan.varying_draws[which]
+    plan.varying_draws[which] = VaryingDraws(d.group, d.kind,
+        d.margins, d.lkj_eta, d.label, d.suffix, d.levels, sd)
+    return plan
+end
+
+@testset "varying sd priors structure validation" begin
+    # Default is empty (all-`:std_normal`); pre-sd-prior arities keep it.
+    @test _tv_draws().sd_priors == VaryingSdPrior[]
+    b = _tv_draws()
+    @test VaryingDraws(b.group, b.kind, b.margins, b.lkj_eta, b.label,
+        b.suffix).sd_priors == VaryingSdPrior[]
+    @test VaryingDraws(b.group, b.kind, b.margins, b.lkj_eta, b.label,
+        b.suffix, [1, 2]).sd_priors == VaryingSdPrior[]
+    mksd(sd) = _tv_with_sd(_tv_base(; with_effect = true), sd)
+    # Wrong length fails (K = 2 here).
+    @test_throws ContractValidationError validate_structure(
+        mksd([VaryingSdPrior(:exponential, 1 / 3)]))
+    # Unknown family fails.
+    @test_throws ContractValidationError validate_structure(mksd(
+        [VaryingSdPrior(:gamma, 2.0), VaryingSdPrior(:std_normal, 1.0)]))
+    # Non-finite params fail, even on `:std_normal`.
+    @test_throws ContractValidationError validate_structure(mksd(
+        [VaryingSdPrior(:std_normal, NaN), VaryingSdPrior(:std_normal, 1.0)]))
+    # Non-positive scale/sd fail.
+    @test_throws ContractValidationError validate_structure(mksd(
+        [VaryingSdPrior(:exponential, 0.0), VaryingSdPrior(:std_normal, 1.0)]))
+    @test_throws ContractValidationError validate_structure(mksd(
+        [VaryingSdPrior(:normal, -1.0), VaryingSdPrior(:std_normal, 1.0)]))
+    # A finite `:std_normal` param is ignored, not rejected.
+    @test validate_structure(mksd([VaryingSdPrior(:std_normal, 2.0),
+        VaryingSdPrior(:std_normal, 1.0)])) === nothing
+    # Mixed per-margin priors pass on `:correlated`.
+    @test validate_structure(mksd([VaryingSdPrior(:exponential, 1 / 3),
+        VaryingSdPrior(:normal, 2.0)])) === nothing
+    # K=1 kinds fail closed on explicit sd priors (SB has no K=1
+    # override path — the message names the vacuous-eta route).
+    for (m, want) in ((1, :intercept1), (:x, :slope1))
+        k1 = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                r ~ varying_effect(g, [$m])
+                mu = a .+ r
+                y .~ Normal.(mu, 1.5)
+            end, (:y, :x, :g))
+        d = only(k1.varying_draws)
+        @test d.kind === want
+        k1.varying_draws[1] = VaryingDraws(d.group, d.kind,
+            d.margins, d.lkj_eta, d.label, d.suffix, d.levels,
+            [VaryingSdPrior(:exponential, 1.0)])
+        err = try
+            validate_structure(k1)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ContractValidationError
+        @test occursin("vacuous-1x1-LKJ", sprint(showerror, err))
+    end
+end
+
+@testset "varying sd priors emission shape" begin
+    cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0], :g => [1, 2, 1, 3, 2, 3])
+    # The `tau` PRIOR statements only (the effect summand reads
+    # `tau_g[j]` scalar refs on every path — the LKJ-sandwich shape).
+    function _tv_tau_src(sd)
+        plan = lower_rkppl(quote
+                a ~ Normal(0, 5)
+                sigma ~ Exponential(1)
+                r ~ varying_effect(g, [1, x]; eta = 2.0)
+                mu = a .+ r
+                y .~ Normal.(mu, sigma)
+            end, (:y, :x, :g))
+        bound = bind_data(_tv_with_sd(plan, sd), cols)
+        def = kernel_expr(bound, assign_layout(bound))
+        strs = [repr(st) for st in def.args[2].args]
+        taus = filter(s -> occursin("tau_g", s) && startswith(s, ":(_ppl_p"),
+            strs)
+        return join(taus, "\n")
+    end
+    # Default stays the historical plate (no scalar `tau_g[k]` refs).
+    default_src = _tv_tau_src(VaryingSdPrior[])
+    @test occursin("_ppl_pw_prior_tau_g", default_src)
+    @test occursin("plate(tau_g)", default_src)
+    @test occursin("(normal(0.0, 1.0)).logpdf(_ppl_c1)", default_src)
+    @test !occursin("tau_g[", default_src)
+    # Uniform configured prior stays one plate with the mapped family.
+    uni_src = _tv_tau_src([VaryingSdPrior(:exponential, 1 / 3),
+        VaryingSdPrior(:exponential, 1 / 3)])
+    @test occursin("_ppl_pw_prior_tau_g", uni_src)
+    @test occursin("plate(tau_g)", uni_src)
+    @test occursin("(exponential(0.3333333333333333)).logpdf(_ppl_c1)",
+        uni_src)
+    # Mixed margins unroll to one scalar density per margin.
+    mix_src = _tv_tau_src([VaryingSdPrior(:exponential, 1 / 3),
+        VaryingSdPrior(:normal, 2.0)])
+    @test occursin("(exponential(0.3333333333333333)).logpdf(tau_g[1])",
+        mix_src)
+    @test occursin("(normal(0.0, 2.0)).logpdf(tau_g[2])", mix_src)
+    @test occursin("_ppl_prior_tau_g", mix_src)
+end
+
+@testset "varying sd priors survive bind" begin
+    cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0], :g => [1, 2, 1, 3, 2, 3])
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            r ~ varying_effect(g, [1, x]; eta = 2.0)
+            mu = a .+ r
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x, :g))
+    sd = [VaryingSdPrior(:exponential, 1 / 3),
+        VaryingSdPrior(:normal, 2.0)]
+    bound = bind_data(_tv_with_sd(plan, sd), cols)
+    # The levels-fill rebuild threads the config through.
+    @test only(bound.varying_draws).levels == [1, 2, 3]
+    got = only(bound.varying_draws).sd_priors
+    @test [(p.family, p.param) for p in got] ==
+        [(:exponential, 1 / 3), (:normal, 2.0)]
+end
+
+@testset "varying uniform exponential sd e2e values and gradient" begin
+    gv = [1, 2, 1, 3, 2, 3]
+    xv = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    yv = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    cols = Dict{Symbol,AbstractVector}(:g => gv, :x => xv, :y => yv)
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            r ~ varying_effect(g, [1, x]; eta = 2.0)
+            mu = a .+ r
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x, :g))
+    # SB `sd ~ Exponential(0.3333)`: rate 3.0 inverts to scale θ = 1/3.
+    sd = [VaryingSdPrior(:exponential, 1 / 3),
+        VaryingSdPrior(:exponential, 1 / 3)]
+    bound = bind_data(_tv_with_sd(plan, sd), cols)
+    built = build_kernel(bound)
+    # Layout unchanged by the prior: coef + sigma + theta + 2 tau + 6 z.
+    @test built.layout.total == 11
+    @test [e.transform for e in built.layout.entries] ==
+        [:identity, :exp, :lkj, :exp, :identity]
+    u = collect(range(-0.4, 0.4; length = built.layout.total))
+    nt = constrain(built.layout, u)
+    r = _tv_ref_corr_r(bound, :g, nt.L_g, nt.tau_g, nt.z_flat_g,
+        [ones(6), xv], 1:2)
+    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
+    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+        logpdf(Exponential(1), nt.sigma) +
+        _tv_ref_lkj_k2(nt.L_g, 2.0) +
+        sum(logpdf.(Exponential(1 / 3), nt.tau_g)) +
+        sum(logpdf.(Normal(0, 1), nt.z_flat_g))
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    # No truncation renormalizer: Stan lower-bound kernel semantics.
+    @test _query(built.spec, bound, :prior, u) ≈ pr
+    s = 1 / (1 + exp(-u[3]))
+    jac = u[2] + u[4] + u[5] + log(sin(pi * s)) + log(pi) + log(s) +
+        log1p(-s)
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "varying mixed sd priors e2e values and gradient" begin
+    gv = [1, 2, 1, 3, 2, 3]
+    xv = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    yv = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    cols = Dict{Symbol,AbstractVector}(:g => gv, :x => xv, :y => yv)
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            r ~ varying_effect(g, [1, x]; eta = 2.0)
+            mu = a .+ r
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x, :g))
+    sd = [VaryingSdPrior(:exponential, 0.5),
+        VaryingSdPrior(:normal, 2.0)]
+    bound = bind_data(_tv_with_sd(plan, sd), cols)
+    built = build_kernel(bound)
+    @test built.layout.total == 11
+    u = collect(range(-0.4, 0.4; length = built.layout.total))
+    nt = constrain(built.layout, u)
+    r = _tv_ref_corr_r(bound, :g, nt.L_g, nt.tau_g, nt.z_flat_g,
+        [ones(6), xv], 1:2)
+    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
+    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+        logpdf(Exponential(1), nt.sigma) +
+        _tv_ref_lkj_k2(nt.L_g, 2.0) +
+        logpdf(Exponential(0.5), nt.tau_g[1]) +
+        logpdf(Normal(0, 2.0), nt.tau_g[2]) +
+        sum(logpdf.(Normal(0, 1), nt.z_flat_g))
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    @test _query(built.spec, bound, :prior, u) ≈ pr
+    s = 1 / (1 + exp(-u[3]))
+    jac = u[2] + u[4] + u[5] + log(sin(pi * s)) + log(pi) + log(s) +
+        log1p(-s)
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "varying K=1 correlated sd prior e2e values and gradient" begin
+    gv = [1, 2, 1, 2]
+    xv = [0.5, -1.0, 1.5, 0.0]
+    yv = [1.0, 2.0, 1.5, 2.5]
+    cols = Dict{Symbol,AbstractVector}(:g => gv, :x => xv, :y => yv)
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            r ~ varying_effect(g, [x]; eta = 1.0)
+            mu = a .+ r
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x, :g))
+    # The vacuous-1x1-LKJ route takes sd priors like any `:correlated`.
+    bound = bind_data(
+        _tv_with_sd(plan, [VaryingSdPrior(:exponential, 1.0)]), cols)
+    built = build_kernel(bound)
+    @test built.layout.total == 5
+    u = [0.2, 0.1, -0.3, 0.4, -0.1]
+    nt = constrain(built.layout, u)
+    idx = [findfirst(==(v), [1, 2]) for v in gv]
+    r = nt.tau_g[1] .* (nt.z_flat_g[idx] .* xv)
+    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
+    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+        logpdf(Exponential(1), nt.sigma) +
+        logpdf(Exponential(1.0), nt.tau_g[1]) +
+        sum(logpdf.(Normal(0, 1), nt.z_flat_g))
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    @test _query(built.spec, bound, :prior, u) ≈ pr
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2] + u[3]
+    _check_gradient(built.spec, bound, u)
+end

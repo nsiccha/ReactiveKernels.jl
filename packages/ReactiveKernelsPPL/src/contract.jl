@@ -457,7 +457,35 @@ struct VaryingMargin
 end
 
 """
-    VaryingDraws(group, kind, margins, lkj_eta, label, suffix[, levels])
+    VaryingSdPrior(family, param)
+
+One margin's marginal-scale (`tau`) prior inside a [`VaryingDraws`](@ref)
+block — the SB `brm_ranef_sd` per-margin codes in native form:
+
+- `:std_normal` — SB family 0, the unconfigured default (`tau ~ Normal(0, 1)`
+  on the positive half; `param` ignored, conventionally `1.0`).
+- `:exponential` — SB family 1 (`sd ~ Exponential(scale)` in the caller's
+  spelling): `param` is the SCALE `θ` (the `:exponential` /
+  `:positive_exponential` convention everywhere else in this contract — an
+  SB `rate` inverts once at the boundary, `θ = 1 / rate`).
+- `:normal` — SB family 2 (`sd ~ Normal(0, sd)`): `param` is the standard
+  deviation `σ`.
+
+An empty `sd_priors` vector (the default) is all-`:std_normal`: SB's
+unconfigured prior, emitted exactly as before.
+"""
+struct VaryingSdPrior
+    family::Symbol
+    param::Float64
+end
+
+VaryingSdPrior(family::Symbol, param::Real) =
+    VaryingSdPrior(family, Float64(param))
+
+const _SD_PRIOR_FAMILIES = (:std_normal, :exponential, :normal)
+
+"""
+    VaryingDraws(group, kind, margins, lkj_eta, label, suffix[, levels[, sd_priors]])
 
 One shared varying-effect draws block: non-centered geometry over
 `K = length(margins)` margins in `G` groups of raw column `group`.
@@ -469,9 +497,12 @@ the vacuous-1x1-LKJ route). `label` is the link identity
 or `group_binding` when two draws share a grouping). `levels` is the
 grouping's DECLARED levels in numbering order (`nothing` pre-bind, or
 when the emitter has no declaration — [`bind_data`](@ref) fills
-sort-ordered observed levels). Shared draws are consumed by value
-flow: each [`VaryingSlice`](@ref) names this draws' label plus explicit
-columns — never by label matching across statements.
+sort-ordered observed levels). `sd_priors` is the per-margin `tau`
+prior ([`VaryingSdPrior`](@ref); empty — the default — is all
+`:std_normal`); a non-default entry needs `:correlated` draws (K = 1
+takes the vacuous route by passing `eta`). Shared draws are consumed
+by value flow: each [`VaryingSlice`](@ref) names this draws' label
+plus explicit columns — never by label matching across statements.
 """
 struct VaryingDraws
     group::ColumnRef
@@ -481,13 +512,20 @@ struct VaryingDraws
     label::Symbol
     suffix::String
     levels::Union{Nothing,Vector}
+    sd_priors::Vector{VaryingSdPrior}
 end
 
-# Pre-declared-levels 6-arg positional construction keeps working with
-# `levels = nothing` (bind_data derives sort-ordered levels).
+# Pre-sd-prior 6/7-arg positional construction keeps working with
+# `sd_priors` empty (all-`:std_normal`, the unconfigured default).
 VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
     lkj_eta::Float64, label::Symbol, suffix::String) =
-    VaryingDraws(group, kind, margins, lkj_eta, label, suffix, nothing)
+    VaryingDraws(group, kind, margins, lkj_eta, label, suffix, nothing,
+        VaryingSdPrior[])
+VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
+    lkj_eta::Float64, label::Symbol, suffix::String,
+    levels::Union{Nothing,Vector}) =
+    VaryingDraws(group, kind, margins, lkj_eta, label, suffix, levels,
+        VaryingSdPrior[])
 
 """
     VaryingSlice(draws, columns, target)
@@ -1417,7 +1455,42 @@ function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
             _fail(d.label, "K=1 draws take no LKJ eta (no correlation " *
                   "to parameterize), got $(d.lkj_eta)")
     end
+    _validate_sd_priors(d, K)
     _validate_varying_levels_shape(d)
+    return nothing
+end
+
+# Per-margin `tau` priors: empty (the default) is all-`:std_normal`,
+# otherwise one entry per margin in margin order. `:exponential` takes
+# a finite positive SCALE, `:normal` a finite positive sd;
+# `:std_normal` ignores its param (finite, conventionally 1.0). A
+# non-default entry needs `:correlated` draws — SB's sd overrides are
+# a correlated-draws feature (no K=1 intercept/slope override path
+# exists to mirror), so K = 1 without eta fails closed naming the
+# vacuous route.
+function _validate_sd_priors(d::VaryingDraws, K::Int)
+    sds = d.sd_priors
+    (isempty(sds) || length(sds) == K) ||
+        _fail(d.label, "draws list $(length(sds)) sd priors for $K " *
+              "margins (empty for all-default, else exactly one per margin)")
+    for (j, p) in enumerate(sds)
+        p.family in _SD_PRIOR_FAMILIES ||
+            _fail(d.label, "margin $j sd prior family must be one of " *
+                  "$(_SD_PRIOR_FAMILIES), got $(repr(p.family))")
+        isfinite(p.param) ||
+            _fail(d.label, "margin $j sd prior param is not finite " *
+                  "(got $(p.param))")
+        if p.family !== :std_normal
+            p.param > 0 ||
+                _fail(d.label, "margin $j sd prior needs a positive " *
+                      "param, got $(p.param)")
+            d.kind === :correlated ||
+                _fail(d.label, "margin $j carries an explicit sd prior " *
+                      "but these draws are :$(d.kind) (sd priors are a " *
+                      ":correlated-draws feature — pass `eta` for the " *
+                      "vacuous-1x1-LKJ route)")
+        end
+    end
     return nothing
 end
 
@@ -1563,7 +1636,7 @@ function _eval_draws_levels(draws::Vector{VaryingDraws},
                              "orderable ($err)")
             end
         push!(out, VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
-            d.label, d.suffix, collect(levels)))
+            d.label, d.suffix, collect(levels), d.sd_priors))
     end
     return out
 end

@@ -1453,20 +1453,21 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     end
     # Varying draws. K=1: the scalar scale prior plus the
     # standardized `xi` plate (shared vector-prior helper). Correlated:
-    # the LKJ node plus the `tau`/`z_flat` plates (shared vector-prior
-    # helper). `tau` emits WITHOUT the thin layer's `+log(2)` half
-    # renormalizer in both: SB's `std_normal(; lower=0)` is Stan
-    # lower-bound kernel semantics (exp Jacobian only, no truncation
-    # normalizer). User-facing `HalfNormal` priors keep the
-    # proper-half convention; draws-internal `tau` follows SB.
+    # the LKJ node plus the `tau` prior plus the `z_flat` plate (shared
+    # vector-prior helper). `tau` emits WITHOUT the thin layer's
+    # `+log(2)` half renormalizer in both: SB's `std_normal(; lower=0)`
+    # is Stan lower-bound kernel semantics (exp Jacobian only, no
+    # truncation normalizer). User-facing `HalfNormal` priors keep the
+    # proper-half convention; draws-internal `tau` follows SB — under
+    # every configured sd prior too (SB's generic path keeps the
+    # positive bound with no truncation normalizer).
     for d in plan.varying_draws
         if d.kind === :correlated
             L, tau, z = _varying_corr_names(d)
             lnode = Symbol(:_ppl_prior_, L)
             push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(d))))
             push!(terms, lnode)
-            _vector_prior_stmts!(stmts, terms, tau, :normal,
-                (arg1 = 0, arg2 = 1), nothing)
+            _sd_prior_tau_stmts!(stmts, terms, d, tau)
             _vector_prior_stmts!(stmts, terms, z, :normal,
                 (arg1 = 0, arg2 = 1), nothing)
             continue
@@ -1541,6 +1542,59 @@ end
 function _lkj_prior_expr(d::VaryingDraws)
     return _lkj_prior_terms(_varying_corr_names(d)[1], length(d.margins),
         d.lkj_eta)
+end
+
+# One margin's sd prior in the shared (family, args) prior shape (SB's
+# generic-path mirror: `:std_normal` is Normal(0, 1), `:exponential`
+# carries the contract's SCALE, `:normal` is Normal(0, σ)).
+function _sd_prior_shape(p::VaryingSdPrior)
+    p.family === :std_normal && return (:normal, (arg1 = 0.0, arg2 = 1.0))
+    p.family === :exponential && return (:exponential, (arg1 = p.param,))
+    p.family === :normal && return (:normal, (arg1 = 0.0, arg2 = p.param))
+    throw(ContractValidationError("[generator] sd prior family " *
+        "$(repr(p.family)) is not one of $(_SD_PRIOR_FAMILIES) " *
+        "(validate_plan proves this)"))
+end
+
+# A draws block's per-margin `tau` prior shapes in margin order (empty
+# `sd_priors` is all-`:std_normal`).
+function _sd_prior_shapes(d::VaryingDraws)
+    K = length(d.margins)
+    isempty(d.sd_priors) &&
+        return fill((:normal, (arg1 = 0.0, arg2 = 1.0)), K)
+    return [_sd_prior_shape(p) for p in d.sd_priors]
+end
+
+# One correlated draws block's `tau` prior (SB's homogeneous /
+# heterogeneous split): all-Normal(0, 1) keeps the historical plate
+# emission bit-identical; a uniform configured prior stays one plate
+# with the mapped family; mixed margins unroll to one scalar density
+# per margin over `tau[k]` refs (the LKJ-sandwich precedent). Every
+# path keeps `support = nothing` (Stan lower-bound kernel semantics —
+# the layout's `:exp` Jacobian, no truncation renormalizer).
+function _sd_prior_tau_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
+        d::VaryingDraws, tau::Symbol)
+    shapes = _sd_prior_shapes(d)
+    if all(s -> s == (:normal, (arg1 = 0.0, arg2 = 1.0)), shapes)
+        _vector_prior_stmts!(stmts, terms, tau, :normal,
+            (arg1 = 0, arg2 = 1), nothing)
+        return nothing
+    end
+    if all(s -> s == shapes[1], shapes)
+        fam, args = shapes[1]
+        _vector_prior_stmts!(stmts, terms, tau, fam, args, nothing)
+        return nothing
+    end
+    node = Symbol(:_ppl_prior_, tau)
+    cells = Any[]
+    for k in eachindex(shapes)
+        fam, args = shapes[k]
+        push!(cells, _family_logpdf_expr(fam, Any[values(args)...],
+            Expr(:ref, tau, k)))
+    end
+    push!(stmts, :($node::Float64 = $(foldl((a, c) -> :($a + $c), cells))))
+    push!(terms, node)
+    return nothing
 end
 
 # One plate over a latent VECTOR (a plate parameter or a spline vector),
