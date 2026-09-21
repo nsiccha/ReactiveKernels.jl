@@ -431,11 +431,16 @@ end
     built = build_kernel(bound)
     layout = assign_layout(bound)
     r = repr(kernel_expr(bound, layout))
-    @test occursin("linear_pk_read_locs_auc", r)
-    # Expanded over op-column slices — never verbatim (a verbatim
-    # `pk_sched` schedule handle has no runtime binding).
+    # ONE subject-batched statement over the bound op columns + op_ends
+    # — never verbatim (a verbatim `pk_sched` schedule handle has no
+    # runtime binding), never unrolled per subject (the statement count
+    # is O(1) in the subject count; the runner slices at runtime).
+    @test occursin("linear_pk_read_locs_auc_over_subjects(pk_sched_op_ends", r)
     @test occursin("pk_sched_op_type", r)
-    @test occursin("view", r)
+    @test occursin("SubjectSlice(log_F)", r)
+    @test occursin("SubjectScalar(_ppl_lp_log_Vc)", r)
+    @test !occursin("view(", r)
+    @test count("linear_pk_read_locs_auc", r) == 1
     names = coordinate_names(layout)
     u = zeros(length(names))
     @test isfinite(prepare_query(built, bound, :sampler)(u))
@@ -933,11 +938,13 @@ _je_seg_data() = Set([:subj, :time, :dsubj, :dtime, :damt, :dv, :qy,
     @test bound.columns[:pk_sched_tgi_seg_ends] == [3, 3]
     built = build_kernel(bound)
     r = repr(kernel_expr(bound, assign_layout(bound)))
-    # One scan per non-empty segment; the empty segment emits an
-    # empty range-copy (never a scan over nothing; never a view —
-    # heterogeneous vcats break Enzyme AD).
-    @test occursin("scan", r)
-    @test occursin("1:0", r)
+    # One `tgi_segmented_nadir` call over the bound ends column — the
+    # per-segment loop (empty segment included) runs inside the function
+    # at runtime; nothing unrolls per subject at codegen.
+    @test occursin("tgi_segmented_nadir(tgi_change, pk_sched_tgi_seg_ends)", r) ||
+        occursin("tgi_segmented_nadir(", r)
+    @test !occursin("scan(", r)
+    @test !occursin("1:0", r)
     names = coordinate_names(assign_layout(bound))
     sig, sig2, b0, b1 = 0.5, 0.7, 2.0, 0.01
     u = _je_gather_u(names, sig, sig2, b0, b1)
@@ -960,12 +967,15 @@ _je_seg_data() = Set([:subj, :time, :dsubj, :dtime, :damt, :dv, :qy,
     @test !haskey(bound_r1.columns, :pk_sched_tgi_seg_ends)
 end
 
-@testset "D5 nadir unroll traces under Reactant" begin
-    # The emitted unroll shape (scan-over-range-copy + empty
-    # range-copy + vcat) with static ranges, inside a @kernel body
-    # (`scan` is kernel authoring sugar — a bare Reactant.@compile
-    # wrapper cannot see it): native parity first, then the compiled
-    # AD path at two points (away from the min kinks).
+@testset "D5 nadir scan shape traces under Reactant" begin
+    # The hand-authored `scan` spelling of the nadir (scan-over-range-
+    # copy + empty range-copy + vcat) with static ranges, inside a
+    # @kernel body (`scan` is kernel authoring sugar — a bare
+    # Reactant.@compile wrapper cannot see it): native parity first,
+    # then the compiled AD path at two points (away from the min
+    # kinks).  Generated code no longer emits this shape (it calls
+    # `tgi_segmented_nadir`, a plain loop); this pins the RK primitive
+    # `tgi_nadir_scan_expr` documents for hand-authored kernels.
     @kernel _je_nadir_seg_kernel(change::Vector{Float64}) = begin
         r1 = scan(change[1:3]; init = 0.0) do carry, x
             (min(carry, x), carry)

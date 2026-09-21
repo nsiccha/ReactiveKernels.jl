@@ -132,6 +132,7 @@ include("joint_decl.jl")
 # cells register here, after their file (an `import` of a
 # not-yet-defined name warns and never binds).
 Core.eval(PPLGeneratedModels,
-    :(import ..tgi_category_lpmf, ..tgi_response_lpmf, ..tgi_censored_lpdf))
+    :(import ..tgi_category_lpmf, ..tgi_response_lpmf, ..tgi_censored_lpdf,
+        ..tgi_segmented_nadir))
 
 end # module ReactiveKernelsPPL

@@ -63,6 +63,105 @@ const LINEAR_EVENT_DOSE_SEGMENT = 3
 # `getindex`.
 const _traced_op_read = ReactiveKernels._tensorized_getindex
 
+# --- subject-batched cell runner --------------------------------------------
+#
+# The generator emits ONE statement per grouped cell assignment, whatever
+# the subject count: `<cell>_over_subjects(op_ends, opcols..., args...)`
+# loops over subjects at RUNTIME with `view(col, lo:hi)` slices from the
+# bound `op_ends` (the statement count of the generated program is O(1)
+# in the data; only layout, bound data and loop trip counts scale).  Each
+# extra argument carries its per-subject access mode explicitly:
+#
+#   `SubjectSlice(v)`  — `view(v, lo:hi)` over the subject's op range (the
+#                        flat event-frame vectors such as the W2 `log_F`
+#                        provider output);
+#   `SubjectScalar(v)` — the subject's entry `v[s]` (per-subject LP
+#                        vectors), read through `_traced_op_read` so a
+#                        traced LP vector lowers as a 1-element slice;
+#   anything else      — passed verbatim to every subject (model scalars,
+#                        literals).
+#
+# Natively this is exactly the former per-subject unroll (same slices,
+# same scalars, `reduce(vcat, parts)` == the former `vcat(s1, s2, …)`);
+# under Reactant the loop bounds are bound data, so the tracer unrolls
+# it with exact values (`reactivekernels-use` §7c), and the cell body
+# traces as before.
+"""
+    SubjectSlice(v)
+
+Marks a flat op-ordered vector argument of a subject-batched cell call:
+subject `s` receives `view(v, lo:hi)` over its op range (see
+[`linear_pk_read_locs_auc_over_subjects`](@ref)).
+"""
+struct SubjectSlice{V}
+    v::V
+end
+
+"""
+    SubjectScalar(v)
+
+Marks a per-subject vector argument of a subject-batched cell call:
+subject `s` receives the scalar `v[s]` (see
+[`linear_pk_read_locs_auc_over_subjects`](@ref)).
+"""
+struct SubjectScalar{V}
+    v::V
+end
+
+@inline _subject_arg(a::SubjectSlice, rng, s) = view(a.v, rng)
+@inline _subject_arg(a::SubjectScalar, rng, s) = _traced_op_read(a.v, s)
+@inline _subject_arg(a, rng, s) = a
+@inline _subject_args(args::Tuple, rng, s) =
+    map(a -> _subject_arg(a, rng, s), args)
+@inline _subject_views(cols::Tuple, rng) = map(c -> view(c, rng), cols)
+
+function _cell_over_subjects(cell::F, op_ends::AbstractVector{<:Integer},
+        opcols::Tuple, args::Tuple) where {F}
+    n_sub = length(op_ends)
+    n_sub >= 1 || throw(ArgumentError(
+        "subject-batched cell call needs at least one subject (empty op_ends)"))
+    hi = Int(op_ends[1])
+    rng = 1:hi
+    first = cell(_subject_views(opcols, rng)..., _subject_args(args, rng, 1)...)
+    parts = [first]
+    prev = hi
+    for s in 2:n_sub
+        hi = Int(op_ends[s])
+        rng = (prev + 1):hi
+        push!(parts, cell(_subject_views(opcols, rng)...,
+            _subject_args(args, rng, s)...))
+        prev = hi
+    end
+    return reduce(vcat, parts)
+end
+
+"""
+    linear_pk_read_locs_over_subjects(op_ends, op_type, op_dt, op_amount,
+        op_interval, op_count, op_read_idx, args...)
+    linear_pk_read_locs_auc_over_subjects(op_ends, op_type, op_dt, op_amount,
+        op_interval, op_count, op_read_idx, args...)
+
+Run [`linear_pk_read_locs`](@ref) / [`linear_pk_read_locs_auc`](@ref) once
+per subject over the bound op columns and concatenate the per-subject
+results in subject order: subject `s` sees the op range
+`op_ends[s-1]+1:op_ends[s]` (`view`s of the six op columns), and each
+extra argument by its marker — [`SubjectSlice`](@ref) (a `view` over the
+same range), [`SubjectScalar`](@ref) (entry `s`), or verbatim.  This is
+the generated-code spelling of a grouped cell assignment (one statement
+per assignment, independent of the subject count); the result equals
+`vcat` of the per-subject cell calls.
+"""
+linear_pk_read_locs_over_subjects(op_ends::AbstractVector{<:Integer},
+        op_type, op_dt, op_amount, op_interval, op_count, op_read_idx,
+        args...) =
+    _cell_over_subjects(linear_pk_read_locs, op_ends,
+        (op_type, op_dt, op_amount, op_interval, op_count, op_read_idx), args)
+linear_pk_read_locs_auc_over_subjects(op_ends::AbstractVector{<:Integer},
+        op_type, op_dt, op_amount, op_interval, op_count, op_read_idx,
+        args...) =
+    _cell_over_subjects(linear_pk_read_locs_auc, op_ends,
+        (op_type, op_dt, op_amount, op_interval, op_count, op_read_idx), args)
+
 _pk_sched_fail(msg) = throw(ContractValidationError("[schedule] " * msg))
 
 """

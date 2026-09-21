@@ -14,6 +14,16 @@ tiling replicates each subject's ragged segment with no index remap.
   (BridgeStan compiles it on first construct) and the tiled JSONs.
 - `bench_rkppl_tiled.jl` — `TILE_K=K julia --project=<kb-ppl-test-env>
   bench_rkppl_tiled.jl` from `packages/ReactiveKernelsPPL`.
+- `bench_rkppl_reactant.jl` — `TILE_K=K [RK_GRAD=1] [RK_OPT=default|
+  no_slice_slice] julia --project=<env with Reactant+Enzyme+DI>
+  bench_rkppl_reactant.jl`: full-program `Reactant.@compile` of the same
+  posterior (primal) and `compile_ad_value_and_gradient` (Enzyme-through-
+  Reactant), parity-checked against the native kernels at the same point;
+  prints one `RESULT {…}` line whose `reactant_*` fields merge into a
+  `results.json` cell.
+- The tiling helpers (`tiled_columns(K)`) live in
+  `packages/ReactiveKernelsPPL/test/parity/joint_tiling.jl`, shared with the
+  Reactant ladder tests so tests and benchmark bind identical columns.
 - `results.json` — steady-state per-call means (20 reps) behind the
   KB brief plot, with per-cell repeat runs where taken.
 
