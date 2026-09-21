@@ -17,13 +17,14 @@ let d = _posteriordb_data("GLM_Poisson_Data-GLM_Poisson_model")
 end
 
 const GLM_POISSON_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: poisson
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: poisson_log_glm
 using LogExpFunctions: logistic, log1pexp
 
 @kernel model(unconstrained::Vector{Float64},
-              year::Vector{Float64},
+              X::Matrix{Float64},
               counts::Vector{Int}) = begin
-    # q = (α, β₁, β₂, β₃).
+    # q = (α, β₁, β₂, β₃) rides as ONE unpacked HAVE, so a single reverse
+    # pass differentiates the whole posterior (the NA-gradient story).
     u_alpha::Float64 = unconstrained[1]
     u_beta1::Float64 = unconstrained[2]
     u_beta2::Float64 = unconstrained[3]
@@ -44,28 +45,18 @@ using LogExpFunctions: logistic, log1pexp
     jac_beta2::Float64 = log(20.0) - log1pexp(-u_beta2) - log1pexp(u_beta2)
     jac_beta3::Float64 = log(20.0) - log1pexp(-u_beta3) - log1pexp(u_beta3)
 
-    # Two producers for the same `parameters` port and inverse edges exposing its
-    # components — the same HAVE-authority pattern as the other examples. The
-    # constrain-only producer omits the Jacobian; the joint producer emits it.
+    # Single-output statements throughout: the nonallocating backend rejects
+    # multi-output recipes, so the joint (parameters, log_jacobian) producer
+    # is spelled as two statements. Pruning is unaffected.
     parameters = (; alpha, beta1, beta2, beta3)
-    (parameters, log_jacobian::Float64) =
-        ((; alpha, beta1, beta2, beta3),
-         jac_alpha + jac_beta1 + jac_beta2 + jac_beta3)
+    log_jacobian::Float64 = jac_alpha + jac_beta1 + jac_beta2 + jac_beta3
 
-    # Transformed parameters: the log-rate cubic trend. Captured scalars ride the
-    # plate as explicit shared arguments (a scalar plate argument broadcasts
-    # across cells), which is how RK threads graph values into a plate cell. This
-    # is the named transformed-parameter / generated-quantity node.
-    log_lambda = plate(year, alpha, beta1, beta2, beta3) do y, a, b1, b2, b3
-        a + b1 * y + b2 * (y * y) + b3 * (y * y * y)
-    end
-
-    # Likelihood: countⱼ ~ Poisson_log(log_lambdaⱼ). Consumes the named
-    # `log_lambda` once via the natural log-rate HAVE route (single-consumer
-    # plate-chain, fused); the `log_rate =` keyword takes the named plate port.
-    pointwise = plate(counts, log_lambda) do c, ll
-        poisson(; log_rate = ll).logpdf(c)
-    end
+    # Likelihood: count ~ Poisson_log(X·β). The design matrix X (cubic basis
+    # over year, built in the preamble and bound as data) and the coefficient
+    # vector splice into the explicit-math GLM object through one fused
+    # endpoint application — no predictor or likelihood plates.
+    beta::Vector{Float64} = [alpha, beta1, beta2, beta3]
+    pointwise = poisson_log_glm(X, beta).pointwise(counts)
     likelihood::Float64 = sum(pointwise)
 
     # Implicit uniform priors over the box contribute only a constant, which Stan
@@ -76,11 +67,12 @@ using LogExpFunctions: logistic, log1pexp
     unconstrained_prior::Float64 = log_prior + log_jacobian
     posterior::Float64 = constrained_logdensity + log_jacobian
 
-    # Generated quantity: the Poisson rates λ = exp(log_lambda), read off the
-    # same transformed-parameter node so this query can start from `parameters`.
-    lambda = plate(log_lambda) do ll
-        exp(ll)
-    end
+    # Generated quantity: the Poisson rates λ = exp(X·β), rebuilt from the
+    # constrained parameters plus the bound design matrix so this query can
+    # start from `parameters` and prune the density.
+    beta_c::Vector{Float64} =
+        [parameters.alpha, parameters.beta1, parameters.beta2, parameters.beta3]
+    lambda = exp.(X * beta_c)
 
     return posterior
 end
@@ -88,12 +80,13 @@ end
 q = [0.2, 0.1, -0.05, 0.03]
 year = GLM_POISSON_YEAR
 counts = GLM_POISSON_C
+X = hcat(ones(length(year)), year, year .^ 2, year .^ 3)
 
 requested_nodes = (:parameters, :log_jacobian, :likelihood, :posterior)
 density_kernel = prepare(model;
-    have = (:unconstrained, :year, :counts),
+    have = (:unconstrained, :X, :counts),
     want = requested_nodes,
-    bound = (; year, counts))
+    bound = (; X, counts))
 
 output = density_kernel(q)
 parameters, log_jacobian, likelihood, posterior = output
@@ -107,13 +100,13 @@ docs_example = (;
     kernel = density_kernel,
     output,
     requested_nodes,
-    poisson_object = poisson,
+    glm_object = poisson_log_glm,
 )
 """
 
 function evaluate_glm_poisson_source(; model_only::Bool = false)
-    # Bind only the data. The authored source imports the reusable Poisson
-    # endpoint itself and contains the complete PPL assembly with no helper
+    # Bind only the data. The authored source imports the reusable Poisson-log
+    # GLM object itself and contains the complete PPL assembly with no helper
     # evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(GLM_POISSON_SOURCE, @__MODULE__; bindings = (
         :GLM_POISSON_YEAR, :GLM_POISSON_C,
@@ -133,11 +126,11 @@ end
 Build the posteriordb `GLM_Poisson_model` (a Poisson-log cubic-trend GLM) as a
 declarative `ReactiveKernels.KernelSpec`. The bounded-uniform Stan priors are
 scaled-logit interval transforms with their exact `lub_constrain` Jacobian; the
-Poisson-log likelihood reuses the shared Poisson endpoint. The transform
-Jacobian, transformed-parameter `log_lambda`, pointwise log-likelihood,
-likelihood reduction, constrained and unconstrained densities, unconstrained
-posterior, and the generated-quantity rates `lambda` are separate named nodes,
-and the constrained parameters are a plain NamedTuple.
+Poisson-log likelihood splices the explicit-math `poisson_log_glm` object over
+the bound design matrix (cubic basis over year). The transform Jacobian,
+pointwise log-likelihood, likelihood reduction, constrained and unconstrained
+densities, unconstrained posterior, and the generated-quantity rates `lambda`
+are separate named nodes, and the constrained parameters are a plain NamedTuple.
 """
 function build_glm_poisson_graph()
     compose(_GLM_POISSON_GRAPH_TEMPLATE[])
@@ -146,6 +139,8 @@ end
 function demo()
     model = build_glm_poisson_graph()
     q = [0.2, 0.1, -0.05, 0.03]
+    X = hcat(ones(length(GLM_POISSON_YEAR)), GLM_POISSON_YEAR,
+        GLM_POISSON_YEAR .^ 2, GLM_POISSON_YEAR .^ 3)
 
     println("Constrain only (the Jacobian and posterior branches are pruned):")
     constrained_plan = plan(model; have = :unconstrained, want = :parameters)
@@ -155,19 +150,19 @@ function demo()
 
     println("\nUnconstrained-space posterior and its pieces:")
     posterior_plan = plan(model;
-                          have = (:unconstrained, :year, :counts),
+                          have = (:unconstrained, :X, :counts),
                           want = (:log_jacobian, :likelihood, :posterior))
     println(explain(posterior_plan))
     log_jacobian, likelihood, posterior =
-        prepare(posterior_plan)(q, GLM_POISSON_YEAR, GLM_POISSON_C)
+        prepare(posterior_plan)(q, X, GLM_POISSON_C)
     println("log Jacobian + log likelihood = ", log_jacobian, " + ", likelihood)
     println("= unconstrained log posterior = ", posterior)
 
-    println("\nGenerated quantity λ = exp(log_lambda) from a constrained HAVE:")
+    println("\nGenerated quantity λ = exp(X·β) from a constrained HAVE:")
     lambda_plan = plan(model;
-                       have = (:parameters, :year), want = :lambda)
+                       have = (:parameters, :X), want = :lambda)
     println(explain(lambda_plan))
-    lambda = prepare(lambda_plan)(parameters, GLM_POISSON_YEAR)
+    lambda = prepare(lambda_plan)(parameters, X)
     println("Poisson rates λ = ", lambda)
 
     nothing
