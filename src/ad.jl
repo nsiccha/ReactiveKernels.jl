@@ -38,6 +38,12 @@ struct PreparedADPullback{I,K,R,F,B,P,E}
     external_values::E
 end
 
+# Low-level prepared kernels AD accepts: the allocating dataflow kernel and
+# the non-allocating step-program kernel. Both expose the same positional
+# HAVE boundary, single-WANT outputs, and plan graph; only the differentiated
+# call construction differs (see `_ad_kernel_call`).
+const _ADKernel = Union{PreparedKernel,NonAllocatingKernel}
+
 # DifferentiationInterface differentiates its first argument and requires every
 # later argument to be a Context. RK kernels retain authored HAVE order, so this
 # callable restores that order before entering the generated kernel. The active
@@ -55,6 +61,17 @@ end
 struct _ADNativeKernelCall{I,F,O}
     native::F
     ops::O
+end
+
+# The differentiated call for a `NonAllocatingKernel`: the elided unbound step
+# program (`_ad_na_program`) with the operation table and cache driver held
+# constant. The owned AD caches arrive as the trailing `Cache` context, so
+# the backend shadows them itself; the kernel's borrowed primal caches are
+# never exposed to differentiation.
+struct _ADNonAllocatingKernelCall{I,F,O,A}
+    f::F
+    ops::O
+    cache_apply::A
 end
 
 @generated function (call::_ADNativeKernelCall{I})(
@@ -130,6 +147,161 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
     _ADKernelCall{I,typeof(externalized)}(externalized), values
 end
 
+# Match one non-allocating cache step,
+# `__cache_apply__(__caches__[j], __ops__[j], callargs...)`, returning the
+# slot index and call arguments. Anything else is not a step.
+function _ad_na_step_parts(node, ops_length::Int)
+    node isa Expr && node.head === :call && length(node.args) >= 3 ||
+        return nothing
+    node.args[1] === _CACHE_APPLY_ARG || return nothing
+    caches_ref = node.args[2]
+    ops_ref = node.args[3]
+    caches_ref isa Expr && caches_ref.head === :ref &&
+        length(caches_ref.args) == 2 &&
+        caches_ref.args[1] === _CACHES_ARG &&
+        caches_ref.args[2] isa Int || return nothing
+    ops_ref isa Expr && ops_ref.head === :ref &&
+        length(ops_ref.args) == 2 && ops_ref.args[1] === _OPS_ARG &&
+        ops_ref.args[2] isa Int || return nothing
+    step = caches_ref.args[2]
+    ops_ref.args[2] == step && 1 <= step <= ops_length || return nothing
+    step, node.args[4:end]
+end
+
+# Taint-walk one program node, rewriting cache steps whose arguments are all
+# free of the active input into plain operation calls. Returns the rewritten
+# node and whether the active input reaches it. Unknown shapes stay tainted
+# (kept as cache steps): elision is value-preserving either way, but keeping
+# an active step preserves its buffer reuse while eliding one only costs it.
+function _ad_na_walk(node, tainted::Set{Symbol}, ops::Tuple, caches::Tuple,
+                     elided::Set{Int})
+    parts = _ad_na_step_parts(node, length(ops))
+    if parts !== nothing
+        step, callargs = parts
+        rewritten = Any[]
+        step_tainted = false
+        for arg in callargs
+            new_arg, arg_tainted =
+                _ad_na_walk(arg, tainted, ops, caches, elided)
+            push!(rewritten, new_arg)
+            step_tainted = step_tainted || arg_tainted
+        end
+        if !step_tainted && caches[step] isa Base.RefValue
+            push!(elided, step)
+            return Expr(:call, Expr(:ref, _OPS_ARG, step), rewritten...), false
+        end
+        return Expr(:call, _CACHE_APPLY_ARG, Expr(:ref, _CACHES_ARG, step),
+                    Expr(:ref, _OPS_ARG, step), rewritten...), step_tainted
+    end
+    node isa Symbol && return node, node in tainted
+    node isa GlobalRef && return node, false
+    node isa LineNumberNode && return node, false
+    node isa Expr || return node, false
+    if node.head === :(=) && length(node.args) == 2 &&
+            node.args[1] isa Symbol
+        new_rhs, rhs_tainted =
+            _ad_na_walk(node.args[2], tainted, ops, caches, elided)
+        if rhs_tainted
+            push!(tainted, node.args[1])
+        else
+            delete!(tainted, node.args[1])
+        end
+        return Expr(:(=), node.args[1], new_rhs), false
+    end
+    node_tainted = false
+    new_args = Any[]
+    for arg in node.args
+        new_arg, arg_tainted = _ad_na_walk(arg, tainted, ops, caches, elided)
+        push!(new_args, new_arg)
+        node_tainted = node_tainted || arg_tainted
+    end
+    Expr(node.head, new_args...), node_tainted
+end
+
+# Re-wrap one seeded primal slot as a concretely-typed AD-owned slot, copying
+# array contents so the AD program never mutates (or aliases) the kernel's
+# borrowed primal buffers. Views become owning vectors: the slot only needs a
+# same-shaped reusable buffer, not the caller's memory.
+function _ad_na_concretize_cache(slot::Base.RefValue, step::Int, op)
+    seeded = slot[]
+    seeded === nothing && throw(ArgumentError(
+        "AD preparation over a non-allocating kernel requires every retained " *
+        "cache slot to be seeded by the exemplar primal call, but step " *
+        "$step ($(_opname(op))) still holds `nothing`; every step must " *
+        "execute once during preparation"))
+    value = seeded isa Array ? copy(seeded) :
+        seeded isa AbstractArray ? collect(seeded) : seeded
+    Base.RefValue{typeof(value)}(value)
+end
+
+_ad_na_concretize_cache(::Nothing, step::Int, op) = nothing
+
+# Bound views cross the AD boundary as owning copies with identical contents:
+# a `SubArray`-typed constant operand defeats reverse-mode static activity
+# analysis, while identical owning contents differentiate cleanly (the same
+# freeze `prepare_ad` already applies to externalized dataflow operands).
+_ad_na_ad_ops(ops::Tuple) = map(ops) do op
+    op isa _BoundConstant && op.value isa AbstractArray ?
+        _BoundConstant(_externalize_bound_value(op.value, true)) : op
+end
+
+# Build the differentiated program for a `NonAllocatingKernel`: seed the
+# primal caches with the preparation exemplars, elide the cache steps that
+# cannot see the active input (storing caller-owned constant data into a
+# backend-shadowed slot would be a static-activity error), and compile the
+# resulting unbound program alongside its owned AD caches and operation
+# table.
+function _ad_na_program(kernel::NonAllocatingKernel, active_index::Int,
+                        exemplars::Tuple)
+    ast = kernel.ast
+    ast.head === :function && ast.args[1] isa Expr &&
+        ast.args[1].head === :tuple &&
+        length(ast.args[1].args) >= 3 &&
+        ast.args[1].args[1] === _OPS_ARG &&
+        ast.args[1].args[2] === _CACHES_ARG &&
+        ast.args[1].args[3] === _CACHE_APPLY_ARG || throw(ArgumentError(
+            "AD preparation over a non-allocating kernel requires the " *
+            "unbound step-program form; the kernel AST has an unexpected shape"))
+    have_syms = map(ast.args[1].args[4:end]) do arg
+        arg isa Expr && arg.head === :(::) ? arg.args[1] : arg
+    end
+    length(have_syms) == length(inputs(kernel)) &&
+        all(sym -> sym isa Symbol, have_syms) &&
+        1 <= active_index <= length(have_syms) || throw(ArgumentError(
+            "AD preparation over a non-allocating kernel requires the " *
+            "active port to select one of the " *
+            "$(length(inputs(kernel))) positional HAVE arguments"))
+    kernel(exemplars...)
+    tainted = Set{Symbol}((have_syms[active_index],))
+    elided = Set{Int}()
+    ops, caches = kernel.ops, kernel.caches
+    length(ops) == length(caches) || throw(ArgumentError(
+        "AD preparation over a non-allocating kernel requires aligned " *
+        "operation and cache tables; got $(length(ops)) operations and " *
+        "$(length(caches)) caches"))
+    new_stmts = Any[]
+    for stmt in ast.args[2].args
+        new_stmt, _ = _ad_na_walk(stmt, tainted, ops, caches, elided)
+        push!(new_stmts, new_stmt)
+    end
+    ad_caches = ntuple(length(caches)) do index
+        index in elided ? nothing :
+            _ad_na_concretize_cache(caches[index], index, ops[index])
+    end
+    f = compile(Expr(:function, deepcopy(ast.args[1]),
+                     Expr(:block, new_stmts...)))
+    f, ad_caches, _ad_na_ad_ops(ops)
+end
+
+function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,
+                         ::Val{I}) where {I}
+    f, ad_caches, ad_ops = _ad_na_program(kernel, I, args)
+    _ADNonAllocatingKernelCall{I,typeof(f),typeof(ad_ops),
+                               typeof(kernel.cache_apply)}(
+        f, ad_ops, kernel.cache_apply),
+    (DifferentiationInterface.Cache(ad_caches),)
+end
+
 @generated function (call::_ADKernelCall{I})(
         active, contexts::Vararg{Any,N}) where {I,N}
     1 <= I <= N + 1 || return :(throw(ArgumentError(
@@ -147,7 +319,28 @@ end
     :(call.kernel($(arguments...)))
 end
 
-function _ad_active_index(kernel::PreparedKernel, active::Symbol)
+# The trailing context is the owned AD cache tuple; the leading N - 1 restore
+# the inactive HAVE arguments around the active one, exactly as above.
+@generated function (call::_ADNonAllocatingKernelCall{I})(
+        active, contexts::Vararg{Any,N}) where {I,N}
+    1 <= I <= N || return :(throw(ArgumentError(
+        "invalid active input index $I for an RK non-allocating AD call " *
+        "with $N inputs")))
+    arguments = Any[]
+    context_index = 1
+    for input_index in 1:N
+        if input_index == I
+            push!(arguments, :active)
+        else
+            push!(arguments, :(getfield(contexts, $context_index)))
+            context_index += 1
+        end
+    end
+    :(call.f(call.ops, getfield(contexts, $N), call.cache_apply,
+             $(arguments...)))
+end
+
+function _ad_active_index(kernel::_ADKernel, active::Symbol)
     matches = findall(input -> input.name === active, inputs(kernel))
     isempty(matches) && throw(ArgumentError(
         "active port :$active is not in the selected HAVE boundary " *
@@ -157,7 +350,7 @@ function _ad_active_index(kernel::PreparedKernel, active::Symbol)
     only(matches)
 end
 
-function _ad_active_index(kernel::PreparedKernel, active::Value)
+function _ad_active_index(kernel::_ADKernel, active::Value)
     graph = kernel.plan.graph
     owned = get(graph.values, active.id, nothing)
     if owned === nothing || typeof(owned) !== typeof(active) ||
@@ -175,7 +368,7 @@ function _ad_active_index(kernel::PreparedKernel, active::Value)
     only(matches)
 end
 
-function _ad_active_index(::PreparedKernel, active)
+function _ad_active_index(::_ADKernel, active)
     throw(ArgumentError(
         "active must identify a selected HAVE port by Symbol or Value; got " *
         string(typeof(active))))
@@ -205,7 +398,7 @@ end
 # is an active-derived boundary cut. Marking it Constant would sever a real
 # derivative. The caller must instead derive it inside the selected kernel or
 # use DifferentiationInterface directly with an explicit Cache contract.
-function _ad_validate_constant_boundary(kernel::PreparedKernel, active_index::Int)
+function _ad_validate_constant_boundary(kernel::_ADKernel, active_index::Int)
     graph = kernel.plan.graph
     active = inputs(kernel)[active_index]
     downstream = Set((canon_id(graph, active.id),))
@@ -249,7 +442,7 @@ _ad_differentiable_value(value::NamedTuple) =
     !isempty(value) && all(_ad_differentiable_value, values(value))
 _ad_differentiable_value(::Any) = false
 
-function _ad_validate_kernel(kernel::PreparedKernel, active_index::Int,
+function _ad_validate_kernel(kernel::_ADKernel, active_index::Int,
                              args::Tuple; scalar_output::Bool = true)
     length(args) == length(inputs(kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(kernel))) values " *
@@ -288,8 +481,13 @@ end
     N = fieldcount(A)
     1 <= I <= N || return :(throw(ArgumentError(
         "invalid active input index $I for $N kernel arguments")))
+    # Values that already carry a DifferentiationInterface context wrapper
+    # (the non-allocating path's owned `Cache`) pass through untouched; only
+    # raw boundary values become `Constant` contexts.
     contexts = [
-        :(DifferentiationInterface.Constant(getfield(args, $index)))
+        A.parameters[index] <: DifferentiationInterface.Context ?
+            :(getfield(args, $index)) :
+            :(DifferentiationInterface.Constant(getfield(args, $index)))
         for index in 1:N if index != I
     ]
     :(getfield(args, $I), ($(contexts...),))
@@ -307,7 +505,7 @@ function _ad_resolve(resolver, args::Tuple, kwargs::NamedTuple)
     resolver(args...; kwargs...)
 end
 
-function _ad_call(kernel::PreparedKernel, resolved::Tuple, active;
+function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
                   scalar_output::Bool = true)
     active_index = _ad_active_index(kernel, active)
     _ad_validate_kernel(kernel, active_index, resolved; scalar_output)
@@ -398,7 +596,7 @@ function _ad_require_backend_packages(
         "backend extension, which provides the preparation methods"))
 end
 
-function _prepare_ad(kernel::PreparedKernel, resolver,
+function _prepare_ad(kernel::_ADKernel, resolver,
                      backend::DifferentiationInterface.AbstractADType,
                      args::Tuple, kwargs::NamedTuple, active)
     _ad_require_backend_packages(backend)
@@ -413,7 +611,7 @@ function _prepare_ad(kernel::PreparedKernel, resolver,
         kernel, resolver, call, backend, preparation, external_values)
 end
 
-function _prepare_ad_pullback(kernel::PreparedKernel, resolver,
+function _prepare_ad_pullback(kernel::_ADKernel, resolver,
                               backend::DifferentiationInterface.AbstractADType,
                               seed, args::Tuple, kwargs::NamedTuple, active)
     _ad_require_backend_packages(backend)
@@ -486,6 +684,48 @@ function prepare_ad(kernel::PreparedKernel,
     isempty(kwargs) || throw(ArgumentError(
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
+    _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active)
+end
+
+"""
+    prepare_ad(kernel, backend, args...; active) -> PreparedADKernel
+
+Prepare a reusable gradient for a low-level [`NonAllocatingKernel`](@ref)
+whose boundary is already fully selected. Such kernels accept only their
+positional HAVE values and must expose exactly one scalar WANT.
+
+The preparation seeds the kernel's caches once with the exemplar arguments,
+then differentiates the same step program through AD-owned concretely-typed
+cache copies threaded as a `DifferentiationInterface.Cache` context, so the
+backend shadows them itself. Cache steps that cannot see the active input
+(bound constants in particular) run as plain operation calls inside the
+differentiated program: storing caller-owned constant data into a shadowed
+slot would be a static-activity error. The kernel's borrowed primal caches
+are never exposed to the backend, and primal calls keep using them
+independently of the prepared object.
+
+Result types must be stable across calls: a step whose result type changes
+after preparation fails loudly instead of silently reseeding. Like every
+[`PreparedADKernel`](@ref), the stored preparation is mutable and not
+thread-safe; prepare one object per concurrent caller.
+
+Forward-mode backends that push dual numbers through the differentiated
+arguments (e.g. `AutoForwardDiff`) are not supported: the cache slots cannot
+carry duals, and preparation fails loudly inside the backend. Reverse-mode
+(`AutoEnzyme`) and primal-call-based (finite-difference) backends work.
+
+The backend's package must be loaded in the calling session (`using Enzyme`
+for `AutoEnzyme`); the backend value alone does not load
+DifferentiationInterface's backend extension, and preparation without it
+fails loudly naming the missing `using`.
+"""
+function prepare_ad(kernel::NonAllocatingKernel,
+                    backend::DifferentiationInterface.AbstractADType,
+                    args...; active, kwargs...)
+    isempty(kwargs) || throw(ArgumentError(
+        "a low-level NonAllocatingKernel has a positional HAVE boundary and " *
+        "does not accept keywords; use a KernelSpec to preserve authored " *
+        "keywords"))
     _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active)
 end
 
@@ -619,6 +859,18 @@ function prepare_ad_pullback(
         kernel, tuple, backend, seed, args, NamedTuple(), active)
 end
 
+function prepare_ad_pullback(
+        kernel::NonAllocatingKernel,
+        backend::DifferentiationInterface.AbstractADType,
+        seed, args...; active, kwargs...)
+    isempty(kwargs) || throw(ArgumentError(
+        "a low-level NonAllocatingKernel has a positional HAVE boundary and " *
+        "does not accept keywords; use a KernelSpec to preserve authored " *
+        "keywords"))
+    _prepare_ad_pullback(
+        kernel, tuple, backend, seed, args, NamedTuple(), active)
+end
+
 """
     ad_gradient(spec, backend, args...; active, want, kwargs...)
     ad_gradient(kernel, backend, args...; active)
@@ -626,9 +878,9 @@ end
 
 Compute a gradient with respect to one named active HAVE port. The `KernelSpec`
 form selects an explicit scalar `want` and preserves authored defaults and
-keywords. The low-level `PreparedKernel` form requires an already selected,
-positional, single-scalar boundary. The reusable form uses a
-[`PreparedADKernel`](@ref) returned by [`prepare_ad`](@ref).
+keywords. The low-level `PreparedKernel` / `NonAllocatingKernel` forms require
+an already selected, positional, single-scalar boundary. The reusable form
+uses a [`PreparedADKernel`](@ref) returned by [`prepare_ad`](@ref).
 
 The one-shot forms require the backend's package to be loaded in the calling
 session (`using Enzyme` for `AutoEnzyme`); the backend value alone does not
@@ -659,6 +911,19 @@ function ad_gradient(kernel::PreparedKernel,
     isempty(kwargs) || throw(ArgumentError(
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
+    call, point, contexts, _, _ = _ad_call(kernel, args, active)
+    _ad_trace_sanity(point, contexts)
+    DifferentiationInterface.gradient(call, backend, point, contexts...)
+end
+
+function ad_gradient(kernel::NonAllocatingKernel,
+                     backend::DifferentiationInterface.AbstractADType,
+                     args...; active, kwargs...)
+    _ad_require_backend_packages(backend)
+    isempty(kwargs) || throw(ArgumentError(
+        "a low-level NonAllocatingKernel has a positional HAVE boundary and " *
+        "does not accept keywords; use a KernelSpec to preserve authored " *
+        "keywords"))
     call, point, contexts, _, _ = _ad_call(kernel, args, active)
     _ad_trace_sanity(point, contexts)
     DifferentiationInterface.gradient(call, backend, point, contexts...)
@@ -744,6 +1009,21 @@ function ad_pullback(kernel::PreparedKernel,
     isempty(kwargs) || throw(ArgumentError(
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
+    call, point, contexts, _, _ =
+        _ad_call(kernel, args, active; scalar_output = false)
+    _ad_trace_sanity(point, contexts)
+    only(DifferentiationInterface.pullback(
+        call, backend, point, (seed,), contexts...))
+end
+
+function ad_pullback(kernel::NonAllocatingKernel,
+                     backend::DifferentiationInterface.AbstractADType,
+                     seed, args...; active, kwargs...)
+    _ad_require_backend_packages(backend)
+    isempty(kwargs) || throw(ArgumentError(
+        "a low-level NonAllocatingKernel has a positional HAVE boundary and " *
+        "does not accept keywords; use a KernelSpec to preserve authored " *
+        "keywords"))
     call, point, contexts, _, _ =
         _ad_call(kernel, args, active; scalar_output = false)
     _ad_trace_sanity(point, contexts)
@@ -838,8 +1118,10 @@ preparation there.
         for index in 1:N if index != I
     ]
     append!(contexts, [
-        :(DifferentiationInterface.Constant(
-            getfield(prepared.external_values, $index)))
+        E.parameters[index] <: DifferentiationInterface.Context ?
+            :(getfield(prepared.external_values, $index)) :
+            :(DifferentiationInterface.Constant(
+                getfield(prepared.external_values, $index)))
         for index in 1:fieldcount(E)
     ])
     quote
@@ -943,6 +1225,10 @@ Requires the Reactant weak dependency to be loaded. The differentiation engine i
 the DifferentiationInterface backend passed to [`prepare_ad`](@ref).
 """
 function compile_ad_gradient(prepared::PreparedADKernel, args...; sync::Bool = true)
+    prepared.kernel isa NonAllocatingKernel && throw(ArgumentError(
+        "Reactant-compiled AD is not supported over a NonAllocatingKernel " *
+        "(the mutating cache program does not stage); prepare the gradient " *
+        "from the dataflow kernel instead"))
     _reactant_compile_ad(Val(:gradient), prepared,
                          _reactant_ad_marker(prepared, args), args...; sync)
 end
@@ -962,6 +1248,10 @@ reuses the DifferentiationInterface backend from [`prepare_ad`](@ref), and only
 compiles where the primal kernel itself compiles through Reactant.
 """
 function compile_ad_value_and_gradient(prepared::PreparedADKernel, args...; sync::Bool = true)
+    prepared.kernel isa NonAllocatingKernel && throw(ArgumentError(
+        "Reactant-compiled AD is not supported over a NonAllocatingKernel " *
+        "(the mutating cache program does not stage); prepare the gradient " *
+        "from the dataflow kernel instead"))
     _reactant_compile_ad(Val(:value_and_gradient), prepared,
                          _reactant_ad_marker(prepared, args), args...; sync)
 end

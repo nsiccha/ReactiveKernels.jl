@@ -120,6 +120,12 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
         # (scan_id, coef) key, which does not fit one Symbol.
         return DesignBlock(ScanSummandTerm, t.options.scan_id,
             t.addressee, 0, Symbol[], [])
+    elseif t.kind === DarSummandTerm
+        # A dar summand is a direct bare-state splice of the in-graph
+        # differenced-AR(1) trajectory — beta-free (the `mo1` shape), so
+        # no design-matrix width. The state rides in `column`.
+        return DesignBlock(DarSummandTerm, t.options.dar_id,
+            t.addressee, 0, Symbol[], [])
     elseif t.kind === FactorTerm
         col = only(t.columns)
         m = _find_levelmap(levelmaps, pname, col)

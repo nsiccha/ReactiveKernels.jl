@@ -412,6 +412,15 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # joint lowering, before `_lower_parameters` runs).
     factor_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_lkj_factor_call(s.rhs))
+    # Dar trajectory parameters: persistence (`truncated(Normal(mu, s),
+    # 0, 1)`) and scale (`HalfNormal(s)` / `truncated(Normal(0, s), 0,
+    # Inf)`) — the only names a `dar()` call accepts (checked during
+    # response lowering, before `_lower_parameters` runs; the contract
+    # re-checks for hand-built plans).
+    dar_beta_names = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && _is_dar_beta_rhs(s.rhs))
+    dar_sigma_names = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && _is_dar_sigma_rhs(s.rhs))
     # Shape every definition (data-free: data ⇒ vector, sampled ⇒ scalar,
     # det-refs recurse with memo; cycles error downstream), then
     # canonicalize each RHS in dependency order (Julia-valid undotted
@@ -466,7 +475,12 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         matrices = Dict{Symbol,DesignMatrix}(m.name => m for m in matrices),
         matrices_used = Set{Symbol}(),
         coefvecs = Dict{Symbol,Symbol}(s.lhs => s.matrix for s in sample
-            if s.matrix !== nothing))
+            if s.matrix !== nothing),
+        dar_beta_names = dar_beta_names,
+        dar_sigma_names = dar_sigma_names,
+        dar_states = Set{Symbol}(),
+        dar_coefs = Set{Symbol}(),
+        dar_specs = DarSpec[])
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
     pred_idx = Dict{Symbol,Int}()
@@ -517,6 +531,15 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # ranges prove exact-once partition of 1:K.
     varying_slices = _finalize_varying_slices(ctx)
     r2d2set = Set{Symbol}(d.predictor for d in r2d2decls)
+    for c in ctx.dar_coefs
+        haskey(coefuse, c) && _sfail("$c is both a predictor coefficient " *
+            "and a dar trajectory parameter — dar parameters are sampled " *
+            "scalars, not population coefficients (rename one)")
+    end
+    for c in ctx.dar_states
+        haskey(coefuse, c) && _sfail("$c is a dar trajectory state — it " *
+            "splices via its `dar()` call, not as a coefficient (rename one)")
+    end
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
         ctx.matrices, r2d2set)
     r2d2s, taus = _lower_r2d2_priors(r2d2decls, sample, coefuse, predictors,
@@ -583,6 +606,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
         levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
+        dar_paths = ctx.dar_specs,
         varying_draws = varying_draws,
         varying_slices = varying_slices,
         vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
@@ -906,7 +930,7 @@ function _reject_unknown_calls(where, rhs)
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
                 fn ∉ VECTOR_FNS && fn !== :spline &&
                 fn !== :hsgp && fn !== :mo && fn !== :mo1 &&
-                fn !== :hcat
+                fn !== :hcat && fn !== :dar
             startswith(string(fn), ".") && _sfail(
                 "$where uses dotted operator `$fn`, which is not in " *
                 "the slice-1 elementwise vocabulary")
@@ -1329,6 +1353,36 @@ _contains_mo1(ex) = ex isa Expr &&
 _is_mo1_call(ex) =
     ex isa Expr && ex.head === :call && !isempty(ex.args) &&
     ex.args[1] === :mo1
+
+_contains_dar(ex) = ex isa Expr &&
+    (_is_dar_call(ex) || any(_contains_dar, ex.args))
+
+_is_dar_call(ex) =
+    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+    ex.args[1] === :dar
+
+# A dar-persistence RHS: `truncated(Normal(mu, s), 0, 1)` exactly (SB's
+# `beta ~ normal(0.5, 0.2; lower=0, upper=1)`; location/scale ride free,
+# bounds are literal). Arity/shape details stay with `_lower_parameter`;
+# this is the use-site screen, like `dirichlet_names` for `mo()`.
+_is_dar_beta_rhs(rhs) =
+    rhs isa Expr && rhs.head === :call && length(rhs.args) == 4 &&
+    rhs.args[1] === :truncated && _is_normal_call(rhs.args[2]) &&
+    _dar_bound_eq(rhs.args[3], 0.0) && _dar_bound_eq(rhs.args[4], 1.0)
+
+# A dar-scale RHS: `HalfNormal(s)` or `truncated(Normal(0, s), 0, Inf)`
+# (SB's `sigma ~ normal(0, 0.2; lower=0)`; the zero-location detail
+# stays with `_lower_parameter`).
+_is_dar_sigma_rhs(rhs) =
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+    ((rhs.args[1] === :HalfNormal ||
+      (length(rhs.args) == 4 && rhs.args[1] === :truncated &&
+       _is_normal_call(rhs.args[2]) &&
+       _dar_bound_eq(rhs.args[3], 0.0) && _is_dar_inf(rhs.args[4]))))
+
+_dar_bound_eq(b, v::Float64) = b isa Real && Float64(b) == v
+
+_is_dar_inf(b) = b === :Inf || (b isa Real && isinf(Float64(b)) && Float64(b) > 0)
 
 # A bare `spline_basis(:id, x...; kind=..., k=...)` call declares one
 # spline basis (the first bare-call statement: declarations do work at
@@ -4410,6 +4464,10 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
         "into $where) calls `mo1()`, which lowers only as a direct " *
         "predictor summand (`mu = a .+ mo1(c, s)`), not " *
         "inside definitions")
+    _contains_dar(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
+        "into $where) calls `dar()`, which lowers only as a direct " *
+        "predictor summand (`mu = a .+ dar(beta, sigma)`), not " *
+        "inside definitions")
     if ex in ctx.structural || ctx.detshape[ex] !== :vector
         ex in visited && _sfail("$where: cyclic definition through $ex")
         push!(ctx.absorbed, ex)
@@ -4481,6 +4539,14 @@ function _classify_summand(pname, core, sign::Int, ctx)
                   "(`mu = a .+ b .* x .+ hsgp(:h_x)`), not nested in " *
                   "$(repr(core))")
         return _classify_hsgp(pname, core, sign, ctx)
+    end
+    if _contains_dar(core)
+        _is_dar_call(core) ||
+            _sfail("predictor $pname: `dar()` summands lower only as " *
+                  "direct additive summands " *
+                  "(`mu = a .+ dar(beta, sigma)`), not nested in " *
+                  "$(repr(core))")
+        return _classify_dar(pname, core, sign, ctx)
     end
     if _contains_scan(core, ctx.scan_states)
         _is_scan_product(core) ||
@@ -4811,6 +4877,67 @@ function _classify_mo1(pname, core::Expr, sign::Int, ctx)
         label, label), nothing
 end
 
+# A `dar(beta, sigma)` summand: the zero-started differenced-AR(1)
+# trajectory as a direct beta-free summand (SB's `dar(time)` shape —
+# the formula intercept is the initial level, the `mo1` splice shape).
+# Exactly two bare sampled scalars: a truncated-`[0, 1]`-Normal
+# persistence and a positive-Normal scale. Additive only; one `dar()`
+# call per predictor in v1. The state synthesizes as `dar_<pname>` and
+# claims the name up front (the `_implicit_vector!` precedent). Both
+# parameters record in `dar_coefs` (checked disjoint from predictor
+# coefficients after lowering) and lower to `SampledParameter`s, never
+# population priors.
+function _classify_dar(pname, core::Expr, sign::Int, ctx)
+    where = "predictor $pname"
+    sign > 0 ||
+        _sfail("$where negates a `dar()` summand — summands are " *
+              "additive only (write `.+ dar(beta, sigma)`)")
+    args = core.args[2:end]
+    length(args) == 2 ||
+        _sfail("$where `dar()` takes `(persistence, scale)` exactly " *
+              "(`dar(beta, sigma)`), got $(repr(core))")
+    beta, sigma = args
+    beta isa Symbol ||
+        _sfail("$where `dar()` persistence must be a bare sampled " *
+              "parameter, got $(repr(beta))")
+    sigma isa Symbol ||
+        _sfail("$where `dar()` scale must be a bare sampled parameter, " *
+              "got $(repr(sigma))")
+    beta === sigma &&
+        _sfail("$where `dar()` persistence and scale must be distinct " *
+              "parameters (SB samples `beta` and `sigma` separately), " *
+              "got :$beta twice")
+    beta in ctx.prior_names ||
+        _sfail("$where `dar()` persistence $beta has no `~` statement — " *
+              "dar parameters are sampled scalars " *
+              "(`$beta ~ truncated(Normal(0.5, 0.2), 0, 1)`)")
+    beta in ctx.dar_beta_names ||
+        _sfail("$where `dar()` persistence $beta must be " *
+              "`truncated(Normal(mu, s), 0, 1)` (SB's `beta ~ " *
+              "normal(0.5, 0.2; lower=0, upper=1)`)")
+    sigma in ctx.prior_names ||
+        _sfail("$where `dar()` scale $sigma has no `~` statement — dar " *
+              "parameters are sampled scalars (`$sigma ~ HalfNormal(0.2)`)")
+    sigma in ctx.dar_sigma_names ||
+        _sfail("$where `dar()` scale $sigma must be `HalfNormal(s)` or " *
+              "`truncated(Normal(0, s), 0, Inf)` (SB's `sigma ~ " *
+              "normal(0, 0.2; lower=0)`)")
+    state = Symbol(:dar_, pname)
+    state in ctx.dar_states &&
+        _sfail("$where calls `dar()` twice — one dar summand per " *
+              "predictor in v1")
+    state in ctx.taken &&
+        _sfail("$where dar state $state collides with your definition — " *
+              "rename yours")
+    push!(ctx.taken, state)
+    push!(ctx.dar_states, state)
+    push!(ctx.dar_coefs, beta)
+    push!(ctx.dar_coefs, sigma)
+    push!(ctx.dar_specs, DarSpec(state, beta, sigma, state))
+    return TermSpec(DarSummandTerm, ColumnRef[], (dar_id = state,),
+        state, state), nothing
+end
+
 function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     if core in ctx.varying_contribs
         sign < 0 && _sfail("predictor $pname: varying contribution " *
@@ -5070,7 +5197,8 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                 t.kind === SplineSummandTerm ||
                 t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||
-                t.kind === MonotonicSummandTerm) && continue
+                t.kind === MonotonicSummandTerm ||
+                t.kind === DarSummandTerm) && continue
             if t.kind === MatrixTerm
                 append!(priors, _lower_matrix_priors(pred, t, coefuse,
                     stated, matrices))
@@ -5681,6 +5809,9 @@ function _lower_assignment(nm, rhs, coefuse)
     _contains_mo1(rhs) && _sfail("assignment `$nm` calls `mo1()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ mo1(c, s)`), not inside definitions")
+    _contains_dar(rhs) && _sfail("assignment `$nm` calls `dar()`, " *
+        "which lowers only as a direct predictor summand " *
+        "(`mu = a .+ dar(beta, sigma)`), not inside definitions")
     for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by assignment " *
@@ -5708,6 +5839,9 @@ function _lower_vector_assignment(nm, rhs, coefuse)
     _contains_mo1(rhs) && _sfail("derived column `$nm` calls `mo1()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ mo1(c, s)`), not inside definitions")
+    _contains_dar(rhs) && _sfail("derived column `$nm` calls `dar()`, " *
+        "which lowers only as a direct predictor summand " *
+        "(`mu = a .+ dar(beta, sigma)`), not inside definitions")
     for s in _value_symbols(rhs)
         haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
                                      "cannot also be referenced by derived " *

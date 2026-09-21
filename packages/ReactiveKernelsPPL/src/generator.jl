@@ -49,6 +49,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _varying_statements(plan))
     append!(stmts, _hsgp_basis_statements(plan))
     append!(stmts, _scan_reconstruction_statements(plan, layout))
+    append!(stmts, _dar_reconstruction_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _likelihood_statements(plan))
     append!(stmts, _prior_statements(plan, layout))
@@ -176,6 +177,13 @@ function _predictor_statements(plan::StructuralPlan)
         for t in pred.terms
             t.kind === ScanSummandTerm &&
                 push!(terms, _scan_summand_expr(plan, pred, t))
+        end
+        # A dar summand contributes its trajectory state directly (bare,
+        # beta-free — SB's `dar` zero-started path; the formula intercept
+        # is the initial level), resolved from the TERMS like a scan.
+        for t in pred.terms
+            t.kind === DarSummandTerm &&
+                push!(terms, _dar_summand_expr(plan, pred, t))
         end
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
@@ -387,6 +395,18 @@ function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSp
     any(p -> p.name === o.coef, plan.parameters) || throw(ContractValidationError(
         "[generator] scan summand coef :$(o.coef) is not a sampled parameter"))
     return Expr(:call, :.*, o.scan_id, o.coef)
+end
+
+# One dar summand's direct expression (the bare trajectory state): the
+# in-graph `scan(...)` reconstruction is bound to the state's name by
+# `_dar_reconstruction_statements`, so the LP splices the name itself.
+# Validated up front; the lookup below is loud defense in depth.
+function _dar_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
+    o = t.options
+    any(s -> s.state === o.dar_id, plan.dar_paths) || throw(ContractValidationError(
+        "[generator] dar summand in predictor $(pred.name) addresses " *
+        "unknown dar :$(o.dar_id)"))
+    return o.dar_id
 end
 
 # Group-index encoder nodes, one per grouped column (`_ppl_gidx_<group>`):
@@ -1453,20 +1473,21 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     end
     # Varying draws. K=1: the scalar scale prior plus the
     # standardized `xi` plate (shared vector-prior helper). Correlated:
-    # the LKJ node plus the `tau`/`z_flat` plates (shared vector-prior
-    # helper). `tau` emits WITHOUT the thin layer's `+log(2)` half
-    # renormalizer in both: SB's `std_normal(; lower=0)` is Stan
-    # lower-bound kernel semantics (exp Jacobian only, no truncation
-    # normalizer). User-facing `HalfNormal` priors keep the
-    # proper-half convention; draws-internal `tau` follows SB.
+    # the LKJ node plus the `tau` prior plus the `z_flat` plate (shared
+    # vector-prior helper). `tau` emits WITHOUT the thin layer's
+    # `+log(2)` half renormalizer in both: SB's `std_normal(; lower=0)`
+    # is Stan lower-bound kernel semantics (exp Jacobian only, no
+    # truncation normalizer). User-facing `HalfNormal` priors keep the
+    # proper-half convention; draws-internal `tau` follows SB — under
+    # every configured sd prior too (SB's generic path keeps the
+    # positive bound with no truncation normalizer).
     for d in plan.varying_draws
         if d.kind === :correlated
             L, tau, z = _varying_corr_names(d)
             lnode = Symbol(:_ppl_prior_, L)
             push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(d))))
             push!(terms, lnode)
-            _vector_prior_stmts!(stmts, terms, tau, :normal,
-                (arg1 = 0, arg2 = 1), nothing)
+            _sd_prior_tau_stmts!(stmts, terms, d, tau)
             _vector_prior_stmts!(stmts, terms, z, :normal,
                 (arg1 = 0, arg2 = 1), nothing)
             continue
@@ -1504,6 +1525,10 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     scanstmts, scannodes = _scan_prior_statements(plan, layout)
     append!(stmts, scanstmts)
     append!(terms, scannodes)
+    # Differenced-AR(1) trajectories: the iid-innovation prior.
+    darstmts, darnodes = _dar_prior_statements(plan, layout)
+    append!(stmts, darstmts)
+    append!(terms, darnodes)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
     push!(stmts, :(prior::Float64 = $joint))
     return stmts
@@ -1541,6 +1566,59 @@ end
 function _lkj_prior_expr(d::VaryingDraws)
     return _lkj_prior_terms(_varying_corr_names(d)[1], length(d.margins),
         d.lkj_eta)
+end
+
+# One margin's sd prior in the shared (family, args) prior shape (SB's
+# generic-path mirror: `:std_normal` is Normal(0, 1), `:exponential`
+# carries the contract's SCALE, `:normal` is Normal(0, σ)).
+function _sd_prior_shape(p::VaryingSdPrior)
+    p.family === :std_normal && return (:normal, (arg1 = 0.0, arg2 = 1.0))
+    p.family === :exponential && return (:exponential, (arg1 = p.param,))
+    p.family === :normal && return (:normal, (arg1 = 0.0, arg2 = p.param))
+    throw(ContractValidationError("[generator] sd prior family " *
+        "$(repr(p.family)) is not one of $(_SD_PRIOR_FAMILIES) " *
+        "(validate_plan proves this)"))
+end
+
+# A draws block's per-margin `tau` prior shapes in margin order (empty
+# `sd_priors` is all-`:std_normal`).
+function _sd_prior_shapes(d::VaryingDraws)
+    K = length(d.margins)
+    isempty(d.sd_priors) &&
+        return fill((:normal, (arg1 = 0.0, arg2 = 1.0)), K)
+    return [_sd_prior_shape(p) for p in d.sd_priors]
+end
+
+# One correlated draws block's `tau` prior (SB's homogeneous /
+# heterogeneous split): all-Normal(0, 1) keeps the historical plate
+# emission bit-identical; a uniform configured prior stays one plate
+# with the mapped family; mixed margins unroll to one scalar density
+# per margin over `tau[k]` refs (the LKJ-sandwich precedent). Every
+# path keeps `support = nothing` (Stan lower-bound kernel semantics —
+# the layout's `:exp` Jacobian, no truncation renormalizer).
+function _sd_prior_tau_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
+        d::VaryingDraws, tau::Symbol)
+    shapes = _sd_prior_shapes(d)
+    if all(s -> s == (:normal, (arg1 = 0.0, arg2 = 1.0)), shapes)
+        _vector_prior_stmts!(stmts, terms, tau, :normal,
+            (arg1 = 0, arg2 = 1), nothing)
+        return nothing
+    end
+    if all(s -> s == shapes[1], shapes)
+        fam, args = shapes[1]
+        _vector_prior_stmts!(stmts, terms, tau, fam, args, nothing)
+        return nothing
+    end
+    node = Symbol(:_ppl_prior_, tau)
+    cells = Any[]
+    for k in eachindex(shapes)
+        fam, args = shapes[k]
+        push!(cells, _family_logpdf_expr(fam, Any[values(args)...],
+            Expr(:ref, tau, k)))
+    end
+    push!(stmts, :($node::Float64 = $(foldl((a, c) -> :($a + $c), cells))))
+    push!(terms, node)
+    return nothing
 end
 
 # One plate over a latent VECTOR (a plate parameter or a spline vector),
@@ -1945,6 +2023,69 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         total = Symbol(:_ppl_scan_, s.state)
         push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms))))
         push!(nodes, total)
+    end
+    return stmts, nodes
+end
+
+# --- Differenced-AR(1) trajectory reconstruction (dar slice) ---
+
+# Reconstruction statements for every dar trajectory, in plan order — the
+# shared RK-core `scan(...)` carry-fold with a `(x, d)` NamedTuple carry
+# (level + AR(1) increment), zero-started exactly like SB's
+# `differenced_ar1_path` (`x[1] = 0`, `d[0] = 0`):
+#   `rest = scan(z, Ref(beta), Ref(sigma); init = (x = 0.0, d = 0.0)) do ... end`
+#   `state = vcat(0.0, rest)`
+# The per-step outputs are `x[2..T]`; the `vcat` heads the zero start.
+# Runs before predictors/likelihood (the LP splices the state); the
+# innovation prior stays in `_dar_prior_statements` (order-free).
+function _dar_reconstruction_statements(plan::StructuralPlan,
+        layout::LayoutTable)
+    stmts = Expr[]
+    for s in plan.dar_paths
+        any(p -> p.name === s.beta, plan.parameters) || throw(
+            ContractValidationError(
+                "[generator] dar $(s.state): persistence :$(s.beta) is " *
+                "not a sampled parameter"))
+        any(p -> p.name === s.sigma, plan.parameters) || throw(
+            ContractValidationError(
+                "[generator] dar $(s.state): scale :$(s.sigma) is not a " *
+                "sampled parameter"))
+        zname = _dar_innovation_name(s)
+        any(e -> e.kind === :scan && e.name === zname,
+            layout.entries) || throw(ContractValidationError(
+            "[generator] dar $(s.state): layout has no innovation slice " *
+            ":$zname"))
+        beta, sigma = s.beta, s.sigma
+        lambda = Expr(:->,
+            Expr(:tuple, :_ppl_carry, :_ppl_elem, beta, sigma),
+            Expr(:block,
+                :(_ppl_d = $beta * _ppl_carry.d + $sigma * _ppl_elem),
+                :(_ppl_x = _ppl_carry.x + _ppl_d),
+                :(_ppl_next = (x = _ppl_x, d = _ppl_d)),
+                :((_ppl_next, _ppl_x))))
+        kw = Expr(:parameters, Expr(:kw, :init, :((x = 0.0, d = 0.0))))
+        call = Expr(:call, :scan, kw, zname, :(Ref($beta)), :(Ref($sigma)))
+        rest = Symbol(:_ppl_dar_rest_, s.state)
+        push!(stmts, :($rest = $(Expr(:do, call, lambda))))
+        push!(stmts, :($(s.state) = vcat(0.0, $rest)))
+    end
+    return stmts
+end
+
+# The dar innovation prior: the iid `Normal(0, 1)` plate-vector prior
+# shape over the `_ppl_dar_z_<state>` slice (one cell per innovation,
+# the same `_plate_sum_stmts` reduction the non-centered-scan path
+# uses), totalled under the dar-flavored `_ppl_dar_<state>` node.
+function _dar_prior_statements(plan::StructuralPlan, layout::LayoutTable)
+    stmts = Expr[]
+    nodes = Symbol[]
+    for s in plan.dar_paths
+        zname = _dar_innovation_name(s)
+        cell = _family_logpdf_expr(:normal, Any[0, 1], _dovar(1))
+        node = Symbol(:_ppl_dar_, s.state)
+        pw = Symbol(:_ppl_dar_pw_, s.state)
+        append!(stmts, _plate_sum_stmts(pw, node, Any[zname], cell))
+        push!(nodes, node)
     end
     return stmts, nodes
 end
