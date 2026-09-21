@@ -272,9 +272,13 @@ const _FIXED_MAP = Dict{Symbol,Vector{Tuple{String,Int}}}(
     :tgi_ly0 => [(_pop("tgi_ly0"), 1)],
 )
 
-"""RKPPL constrained-space NamedTuple at SB point1 θ (config)."""
-function final_theta_nt(config::AbstractString)
-    c = _parity_theta(config)
+"""RKPPL constrained-space NamedTuple at SB point θ (config).
+
+`cdict` overrides the vendored point1 pins (multi-point constancy
+probes pass oracle pointN dicts; same `key=value` shape)."""
+function final_theta_nt(config::AbstractString,
+        cdict::Dict{String,Float64} = _parity_theta(config))
+    c = cdict
     L7 = [c["b_p_subject_L.$i.$j"] for i in 1:7, j in 1:7]
     Ltg = [c["b_tg_subject_L.$i.$j"] for i in 1:2, j in 1:2]
     base = Pair{Symbol,Any}[
@@ -309,15 +313,48 @@ function final_theta_nt(config::AbstractString)
     return NamedTuple{Tuple(first.(base))}(Tuple(last.(base)))
 end
 
-"""SB pinned constrained-space densities (lp − jac), point1 per config."""
+"""SB pinned RAW point1 lp per config (unconstrained density — the vine
+transplant deleted the lp−jac constrained-space workaround; both sides
+now share Stan's u-space, so raw lp compares directly)."""
 const _PARITY_SB = Dict{String,Float64}(
-    "continuous" => -349.3879680789393,
-    "ordinal" => -96.44172759999246,
-    "binary" => -92.72352892476464,
+    "continuous" => -350.4154070469088,
+    "ordinal" => -97.15237466096582,
+    "binary" => -93.434175985738,
 )
 
-"""Documented global consts (RKPPL − SB); tighten to absolute 1e-9 once
-the delegated const hunt resolves (user direction 2026-09-21)."""
+"""SB pinned point1 LKJ vine coords (unconstrained, Stan packing order)
+per config: (K=7 block, K=2 block). K=1 blocks carry no coords."""
+const _PARITY_LKJ_Z = Dict{String,Tuple{Vector{Float64},Vector{Float64}}}(
+    "continuous" => ([0.1594852990171186, 0.1225159438702959,
+        -0.05948141422714645, 0.08042418011661799, -0.05792518375855486,
+        0.09760313849458126, -0.04891804895347327, -0.1036074131315678,
+        0.09511000096561201, -0.04379657106150329, -0.09019485639112013,
+        0.07097848571626666, -0.02768431655229392, 0.07340378352014737,
+        -0.003617238241934701, 0.07551852671767359, -0.07774767502700819,
+        0.1414622438087307, 0.04215827152169155, -0.06181982709508568,
+        0.02734001039188645], [0.1635625508103211]),
+    "ordinal" => ([0.1594852990171186, 0.1225159438702959,
+        -0.05948141422714645, 0.08042418011661799, -0.05792518375855486,
+        0.09760313849458126, -0.04891804895347327, -0.1036074131315678,
+        0.09511000096561201, -0.04379657106150329, -0.09019485639112013,
+        0.07097848571626666, -0.02768431655229392, 0.07340378352014737,
+        -0.003617238241934701, 0.07551852671767359, -0.07774767502700819,
+        0.1414622438087307, 0.04215827152169155, -0.06181982709508568,
+        0.02734001039188645], [0.1635625508103211]),
+    "binary" => ([0.1594852990171186, 0.1225159438702959,
+        -0.05948141422714645, 0.08042418011661799, -0.05792518375855486,
+        0.09760313849458126, -0.04891804895347327, -0.1036074131315678,
+        0.09511000096561201, -0.04379657106150329, -0.09019485639112013,
+        0.07097848571626666, -0.02768431655229392, 0.07340378352014737,
+        -0.003617238241934701, 0.07551852671767359, -0.07774767502700819,
+        0.1414622438087307, 0.04215827152169155, -0.06181982709508568,
+        0.02734001039188645], [0.1635625508103211]),
+)
+
+"""Documented global consts (RKPPL full posterior − SB raw lp),
+constancy 1e-13 across 3 θ per config (vine probe 2026-09-21);
+tighten to absolute 1e-9 once the delegated const hunt resolves
+(user direction 2026-09-21)."""
 const _PARITY_GAP = Dict{String,Float64}(
     "continuous" => -44.370536171807,
     "ordinal" => -34.7756857316521,
