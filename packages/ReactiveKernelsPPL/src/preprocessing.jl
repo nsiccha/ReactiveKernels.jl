@@ -288,10 +288,11 @@ function monotonic_recipe(increments::Symbol, idx::Symbol, K::Int)
 end
 
 """
-    design_recipe(shape, n_obs; plates) -> Union{Nothing,Expr}
+    design_recipe(shape, n_rows; plates) -> Union{Nothing,Expr}
 
 `_ppl_design_<pred> = Float64.(hcat(<blocks…>))`, or `nothing` for a
-width-0 (offset-only) predictor or a predictor with no static (data-only) blocks. Blocks: intercept → `ones(n)`, continuous
+width-0 (offset-only) predictor or a predictor with no static (data-only) blocks. `n_rows` is the design row count
+(obs-level: `n_obs`; subject-level: `n_sub`). Blocks: intercept → `ones(n)`, continuous
 → the bare column, factor → full-rank dummies over mapped levels,
 matrix → one part per element (`ones(n)` at intercept positions, the
 bare column otherwise — matrices hold data/derived columns only, so no
@@ -305,7 +306,7 @@ materializes the layout's packed-slice `view` to a dense vector so the
 `hcat` stays homogeneous — a mixed `Vector`/`SubArray` `hcat` lowers
 through a Union-typed path Enzyme cannot differentiate.
 """
-function design_recipe(shape::DesignShape, n_obs::Int;
+function design_recipe(shape::DesignShape, n_rows::Int;
         plates::AbstractSet{Symbol} = Set{Symbol}())
     shape.width == 0 && return nothing
     # Continuous blocks contribute their bare column (a bound port), not a
@@ -313,14 +314,14 @@ function design_recipe(shape::DesignShape, n_obs::Int;
     parts = Any[]
     for b in shape.blocks
         if b.kind === InterceptTerm
-            push!(parts, :(ones($n_obs)))
+            push!(parts, :(ones($n_rows)))
         elseif b.kind === ContinuousTerm
             push!(parts, b.column in plates ? :(Float64.($(b.column))) : b.column)
         elseif b.kind === FactorTerm
             push!(parts, _contrast_expr(b))
         elseif b.kind === MatrixTerm
             for e in b.elements
-                push!(parts, e === nothing ? :(ones($n_obs)) : e)
+                push!(parts, e === nothing ? :(ones($n_rows)) : e)
             end
         end
     end
@@ -371,13 +372,25 @@ function preprocessing_recipes(plan::StructuralPlan)
                 only(t.columns), _monotonic_K(plan, t)))
         end
         if !any(b -> b.kind === MonotonicTerm, shape.blocks)
-            recipe = design_recipe(shape, plan.n_obs; plates)
+            rows = _predictor_rows(plan, pred.name)
+            recipe = design_recipe(shape, rows; plates)
             recipe !== nothing && push!(stmts, recipe)
         end
         off = offset_recipe(shape)
         off !== nothing && push!(stmts, off)
     end
     return stmts
+end
+
+"""Design row count of a predictor (obs-level: `n_obs`; subject-level:
+the kernel's subject count — bound plans only)."""
+function _predictor_rows(plan::StructuralPlan, pname::Symbol)
+    _predictor_level(plan, pname) === :obs && return plan.n_obs
+    kp = only(plan.kernel_plates)
+    kp.subjects isa Int ||
+        throw(ContractValidationError("[preprocessing] subject predictor " *
+              "`$pname` needs resolved kernel subjects (bind_data first)"))
+    return kp.subjects
 end
 
 # Level count K for a monotonic term: one more than its linked increments

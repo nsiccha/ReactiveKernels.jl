@@ -1,0 +1,1 @@
+:(qt_y .~ Normal.(qt_loc, qt_scale .* qt_weight))
