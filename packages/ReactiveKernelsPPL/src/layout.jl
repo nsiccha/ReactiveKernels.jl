@@ -266,6 +266,24 @@ function assign_layout(plan::StructuralPlan)
             offset, M, :identity))
         offset += M
     end
+    # Differenced-AR(1) trajectories: one identity slice per path holding
+    # the internally-owned `T - 1` innovations under `_ppl_dar_z_<state>`
+    # (the non-centered-scan innovation-slice shape, so the `:scan` kind's
+    # constrain/unconstrain/coordinate machinery applies untouched); the
+    # state name binds the emitter's `scan(...)` reconstruction. The path
+    # length is `n_obs` by construction (the LP adds elementwise), so a
+    # single observation leaves no innovation — fail closed.
+    for s in plan.dar_paths
+        T = plan.n_obs
+        T >= 2 || throw(ContractValidationError(
+            "[layout] dar $(s.state) needs n_obs ≥ 2 (the innovations " *
+            "are length `n_obs - 1`), got n_obs = $(T)"))
+        nm = _dar_innovation_name(s)
+        labels = Symbol[Symbol(i) for i in 1:(T - 1)]
+        push!(entries,
+            LayoutEntry(:scan, nothing, nm, labels, offset, T - 1, :identity))
+        offset += T - 1
+    end
     return LayoutTable(entries, offset - 1)
 end
 
@@ -845,8 +863,10 @@ which the planner inlines.
 function transform_statements(e::LayoutEntry)
     if e.kind === :coefficient || e.kind === :scan
         # both are identity array slices read into `e.name` (a coefficient
-        # block name, a scan-state slice, or a non-centered scan's
-        # `_ppl_scan_z_<state>` innovation slice the emitter reconstructs from)
+        # block name, a scan-state slice, a non-centered scan's
+        # `_ppl_scan_z_<state>` innovation slice, or a dar trajectory's
+        # `_ppl_dar_z_<state>` slice — the emitter reconstructs from the
+        # innovation slices)
         lo = e.offset
         hi = e.offset + e.size - 1
         return Expr[:($(e.name)::AbstractVector{Float64} =

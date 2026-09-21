@@ -103,7 +103,10 @@ end
 as the whole linear predictor (`lp = theta`, identity design) — the
 random-effects / per-observation-latent location. `ScanSummandTerm` splices a
 sequential-recurrence state into the predictor scaled by a sampled scalar
-coefficient (`u .* beta`, SB's `ar` latent path with its free `popefs` beta)."""
+coefficient (`u .* beta`, SB's `ar` latent path with its free `popefs` beta).
+`DarSummandTerm` splices a differenced-AR(1) trajectory state into the
+predictor UNSCALED (SB's `dar` zero-started integrated path; the formula
+intercept is the initial level, so no coefficient is identified)."""
 @enum TermKind::UInt8 begin
     InterceptTerm
     ContinuousTerm
@@ -117,6 +120,7 @@ coefficient (`u .* beta`, SB's `ar` latent path with its free `popefs` beta)."""
     MonotonicSummandTerm
     VaryingEffectTerm
     MatrixTerm
+    DarSummandTerm
 end
 
 """
@@ -806,6 +810,34 @@ struct ScanSpec
 end
 
 """
+    DarSpec(state, beta, sigma, label)
+
+One differenced-AR(1) trajectory (SB `_sb_dar1`'s `differenced_ar1_path`):
+the zero-started integrated path `x[t+1] = x[t] + d[t]` over the AR(1)
+increments `d[t] = beta*d[t-1] + sigma*z[t]` (`d[0] = 0`, `x[1] = 0`).
+`beta`/`sigma` name the persistence (`Normal` on `(:interval, 0, 1)`) and
+innovation-scale (`Normal` on `:positive`) [`SampledParameter`](@ref)s;
+the `z` innovations (length `n_obs - 1`) are owned internally under the
+reserved `_ppl_dar_z_<state>` name, like a non-centered scan's
+`_ppl_scan_z_<state>` slice. The path length is `n_obs` by construction
+(the LP direct summand adds elementwise to an `n_obs` predictor), so no
+length probe is carried — a `T ≠ n_obs` time axis needs the future
+gathering extension (the `rw` free rider), not this node.
+
+A dedicated node rather than a `ScanSpec`: the v1 scan grammar threads
+one carried array from SAMPLED seeds with full-length innovations, while
+dar starts both carries at zero deterministically, carries (level,
+increment) jointly, and innovates `T - 1` times. The generator still
+lowers through the shared RK-core `scan(...)` carry-fold tier.
+"""
+struct DarSpec
+    state::Symbol
+    beta::Symbol
+    sigma::Symbol
+    label::Symbol
+end
+
+"""
     LevelMap(predictor, column, values, source, subset)
 
 Ordered level values sizing one full-rank factor term: `values` is the
@@ -853,10 +885,10 @@ name table (duplicates rejected). N≥1 independent responses; shared
 predictor Symbols allowed. `levelmaps` sizes every factor term
 (binder-evaluated values); `plate_parameters` carries per-cell latents,
 `vector_parameters` leveled-response latents (cutpoints/thresholds/simplexes),
-`scans` sequential-recurrence latents,
-`varying_draws`/`varying_slices` the generic varying-effect draws
-blocks plus their per-target applications, and `matrices`
-user-bound design matrices referenced by [`MatrixTerm`](@ref)s
+`scans` sequential-recurrence latents, `dar_paths` differenced-AR(1)
+trajectories, `varying_draws`/`varying_slices` the generic
+varying-effect draws blocks plus their per-target applications, and
+`matrices` user-bound design matrices referenced by [`MatrixTerm`](@ref)s
 (empty for a plain population-GLM plan).
 """
 struct StructuralPlan
@@ -872,6 +904,7 @@ struct StructuralPlan
     levelmaps::Vector{LevelMap}
     plate_parameters::Vector{PlateParameter}
     scans::Vector{ScanSpec}
+    dar_paths::Vector{DarSpec}
     varying_draws::Vector{VaryingDraws}
     varying_slices::Vector{VaryingSlice}
     vector_parameters::Vector{VectorParameter}
@@ -898,7 +931,7 @@ StructuralPlan(
     roles::Dict{Symbol,Symbol}) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, _checked_columns(columns), n_obs, roles,
-        LevelMap[], ScanSpec[], VaryingDraws[], VaryingSlice[],
+        LevelMap[], ScanSpec[], DarSpec[], VaryingDraws[], VaryingSlice[],
         VectorParameter[],
         SplineBasis[], SplineVector[], HSGPBasis[], KernelPlate[],
         R2D2Prior[], DesignMatrix[])
@@ -924,6 +957,7 @@ function StructuralPlan(
         levelmaps::Vector{LevelMap} = LevelMap[],
         plate_parameters::Vector{PlateParameter} = PlateParameter[],
         scans::Vector{ScanSpec} = ScanSpec[],
+        dar_paths::Vector{DarSpec} = DarSpec[],
         varying_draws::Vector{VaryingDraws} = VaryingDraws[],
         varying_slices::Vector{VaryingSlice} = VaryingSlice[],
         vector_parameters::Vector{VectorParameter} = VectorParameter[],
@@ -935,7 +969,7 @@ function StructuralPlan(
         matrices::Vector{DesignMatrix} = DesignMatrix[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
-        roles, levelmaps, plate_parameters, scans, varying_draws,
+        roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
         varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
         kernel_plates, r2d2_priors, matrices)
@@ -1143,6 +1177,7 @@ const TERM_NAMES = Dict{Symbol,TermKind}(
     :monotonic => MonotonicTerm,
     :monotonic_summand => MonotonicSummandTerm,
     :matrix => MatrixTerm,
+    :dar_summand => DarSummandTerm,
 )
 
 """Allowlisted assignment functions (slice 1: scalar ops + whole-column
@@ -1183,7 +1218,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
     VaryingEffectTerm, SplineSummandTerm, HSGPSummandTerm,
-    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm, MatrixTerm)
+    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm, MatrixTerm,
+    DarSummandTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate):
 scalar/reduction vocabulary plus vector-returning whole-column functions."""
@@ -1226,6 +1262,7 @@ unbound plans alike (the macro lowering + emitter-AST path call this)."""
 function validate_structure(plan::StructuralPlan)
     _validate_name_tables(plan)
     _validate_scans(plan)
+    _validate_dar_paths(plan)
     _validate_assignments_structure(plan)
     _validate_vector_structure(plan)
     _validate_parameters(plan)
@@ -2269,6 +2306,7 @@ function _validate_name_tables(plan::StructuralPlan)
     deriveds = [d.name for d in plan.derived]
     plates = [p.name for p in plan.plate_parameters]
     scanstates = [s.state for s in plan.scans]
+    darstates = [s.state for s in plan.dar_paths]
     vectors = [p.name for p in plan.vector_parameters]
     svec = [v.name for v in plan.spline_vectors]
     vk1 = Symbol[nm for d in plan.varying_draws
@@ -2289,6 +2327,8 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate plate-parameter names")
     length(unique(scanstates)) == length(scanstates) ||
         _fail(:plan, "duplicate scan-state names")
+    length(unique(darstates)) == length(darstates) ||
+        _fail(:plan, "duplicate dar-state names")
     length(unique(vectors)) == length(vectors) ||
         _fail(:plan, "duplicate vector-parameter names")
     length(unique(svec)) == length(svec) ||
@@ -2368,24 +2408,36 @@ function _validate_name_tables(plan::StructuralPlan)
         (mats, vk1, "design-matrix names and K=1 varying names"),
         (mats, vcorr, "design-matrix names and correlated varying names"),
         (mats, hsgp, "design-matrix names and hsgp names"),
-        (mats, kern, "design-matrix names and kernel-plate names"))
+        (mats, kern, "design-matrix names and kernel-plate names"),
+        (darstates, params, "dar states and parameters"),
+        (darstates, assigns, "dar states and assignments"),
+        (darstates, deriveds, "dar states and derived columns"),
+        (darstates, plates, "dar states and plate parameters"),
+        (darstates, scanstates, "dar states and scan states"),
+        (darstates, vectors, "dar states and vector parameters"),
+        (darstates, svec, "dar states and spline vectors"),
+        (darstates, vk1, "dar states and K=1 varying names"),
+        (darstates, vcorr, "dar states and correlated varying names"),
+        (darstates, hsgp, "dar states and hsgp names"),
+        (darstates, kern, "dar states and kernel-plate names"),
+        (darstates, mats, "dar states and design-matrix names"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
-    allnames = union(params, assigns, deriveds, plates, scanstates, vectors,
-        svec, vk1, vcorr, hsgp, kern, mats)
+    allnames = union(params, assigns, deriveds, plates, scanstates, darstates,
+        vectors, svec, vk1, vcorr, hsgp, kern, mats)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/spline/varying/kernel/matrix name",
+            "predictor $pn collides with a parameter/assignment/derived/plate/scan/dar/vector/spline/varying/kernel/matrix name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived/plate/scan/vector/spline/varying/kernel/matrix $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate/scan/dar/vector/spline/varying/kernel/matrix $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, svec, vk1, vcorr, hsgp, kern, mats))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, darstates, vectors, svec, vk1, vcorr, hsgp, kern, mats))
         _check_name_hygiene(n)
     end
     return nothing
@@ -2426,6 +2478,50 @@ function _validate_scans(plan::StructuralPlan)
         (s.hi isa Int || s.hi isa Symbol) || _fail(s.label,
             "scan loop bound must be a literal Int or a data length Symbol, " *
             "got $(repr(s.hi))")
+    end
+    return nothing
+end
+
+# In-graph name of a dar trajectory's innovation slice
+# (`_ppl_dar_z_<state>`, length `n_obs - 1`). Reserved-prefix validation
+# guarantees no user name collides with it; the state name itself binds
+# the emitter's `scan(...)` reconstruction.
+_dar_innovation_name(s::DarSpec) = Symbol(:_ppl_dar_z_, s.state)
+
+# Structural invariants of each differenced-AR(1) trajectory: the
+# persistence names a `Normal` sampled parameter on exactly `(:interval,
+# 0, 1)` (SB's `beta ~ normal(0.5, 0.2; lower=0, upper=1)`; overrides
+# ride the same spelling with new location/scale) and the scale names a
+# `Normal` sampled parameter on `:positive` (SB's `sigma ~
+# normal(0, 0.2; lower=0)`). The `n_obs ≥ 2` length gate lives in the
+# layout (unbound surface plans carry `n_obs = 0`, like a scan's
+# symbolic `hi` — lengths resolve at bind).
+function _validate_dar_paths(plan::StructuralPlan)
+    for s in plan.dar_paths
+        s.beta === s.sigma && _fail(s.label,
+            "dar persistence and scale must be distinct sampled parameters " *
+            "(SB samples `beta` and `sigma` separately), got :$(s.beta) twice")
+        i = findfirst(p -> p.name === s.beta, plan.parameters)
+        i === nothing && _fail(s.label,
+            "dar persistence :$(s.beta) must name a scalar sampled " *
+            "parameter (`$(s.beta) ~ truncated(Normal(0.5, 0.2), 0, 1)`)")
+        b = plan.parameters[i]
+        (b.family === :normal && b.support_override == (:interval, 0.0, 1.0)) ||
+            _fail(s.label,
+                "dar persistence :$(s.beta) must be Normal on exactly " *
+                "(:interval, 0, 1) (SB's `beta ~ normal(0.5, 0.2; " *
+                "lower=0, upper=1)`), got :$(b.family) on " *
+                "$(repr(b.support_override))")
+        j = findfirst(p -> p.name === s.sigma, plan.parameters)
+        j === nothing && _fail(s.label,
+            "dar scale :$(s.sigma) must name a scalar sampled parameter " *
+            "(`$(s.sigma) ~ HalfNormal(0.2)`)")
+        sg = plan.parameters[j]
+        (sg.family === :normal && sg.support_override === :positive) ||
+            _fail(s.label,
+                "dar scale :$(s.sigma) must be Normal on :positive (SB's " *
+                "`sigma ~ normal(0, 0.2; lower=0)`), got :$(sg.family) " *
+                "on $(repr(sg.support_override))")
     end
     return nothing
 end
@@ -3234,6 +3330,10 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
         _validate_matrix_term(t, pred, plan)
         return nothing
     end
+    if t.kind === DarSummandTerm
+        _validate_dar_term(t, pred, plan)
+        return nothing
+    end
     t.options == NamedTuple() ||
         _fail(t.label, "terms take no options (slice 1: factor sizing " *
                        "lives in LevelMap)")
@@ -3426,6 +3526,33 @@ function _validate_scan_term(t::TermSpec, pred::PredictorSpec, plan::StructuralP
     return nothing
 end
 
+# A dar summand names its trajectory (`dar_id`) in `options` and carries
+# no columns (the state is sampled, not data) and NO coefficient (the
+# zero-started path is beta-free — the formula intercept is the initial
+# level, the `mo1` splice shape); its addressee is its own label
+# (self-addressed: the persistence/scale priors live on the
+# `SampledParameter`s, not a population prior). Beta/sigma linkage is
+# checked on the `DarSpec` itself (`_validate_dar_paths`).
+function _validate_dar_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    o = t.options
+    Tuple(keys(o)) == (:dar_id,) ||
+        _fail(t.label, "dar summand options must be exactly `(dar_id,)`, " *
+              "got $(Tuple(keys(o)))")
+    o.dar_id isa Symbol ||
+        _fail(t.label, "dar summand dar_id must be a Symbol, " *
+              "got $(repr(o.dar_id))")
+    isempty(t.columns) ||
+        _fail(t.label, "dar summand carries no columns (the state is " *
+              "sampled, not data), got $(t.columns)")
+    t.addressee === t.label ||
+        _fail(t.label, "dar summand addressee must be its own label " *
+              "(self-addressed, no population prior), got $(t.addressee)")
+    any(s -> s.state === o.dar_id, plan.dar_paths) ||
+        _fail(t.label, "dar summand addresses unknown dar state " *
+              ":$(o.dar_id) (no such `dar()` trajectory)")
+    return nothing
+end
+
 function _validate_predictor_columns(plan::StructuralPlan)
     for pred in plan.predictors
         for t in pred.terms
@@ -3442,6 +3569,9 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
     # Scan summands name a recurrence + scalar coefficient in `options`, not
     # columns; structure validation checked both names.
     t.kind === ScanSummandTerm && return nothing
+    # Dar summands name a trajectory in `options`, not columns; structure
+    # validation checked the name.
+    t.kind === DarSummandTerm && return nothing
     for c in t.columns
         # A per-cell latent enters a design only through a ContinuousTerm
         # (a free coefficient scaling the latent vector — the SB `me`
@@ -3706,7 +3836,8 @@ function _validate_priors(plan::StructuralPlan)
                 t.kind === SplineSummandTerm ||
                 t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||
-                t.kind === MonotonicSummandTerm) && continue
+                t.kind === MonotonicSummandTerm ||
+                t.kind === DarSummandTerm) && continue
             if t.kind === MatrixTerm
                 m = _find_matrix(plan, t.options.matrix)
                 m === nothing && _fail(:plan,
@@ -4952,7 +5083,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         plan.population_priors, plan.parameters, plan.assignments,
         columns, n; roles = merged, derived = plan.derived,
         levelmaps = maps, plate_parameters = plan.plate_parameters,
-        scans = plan.scans,
+        scans = plan.scans, dar_paths = plan.dar_paths,
         varying_draws = draws, varying_slices = plan.varying_slices,
         vector_parameters = vectors2, spline_bases = bases,
         spline_vectors = plan.spline_vectors, hsgp_bases = hbases,

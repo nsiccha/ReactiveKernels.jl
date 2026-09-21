@@ -25,6 +25,7 @@ include("test_matrix_ir.jl")
 include("test_report.jl")
 include("test_scan.jl")
 include("test_merge.jl")
+include("test_dar.jl")
 
 @testset "package skeleton" begin
     @test isdefined(ReactiveKernelsPPL, :ReactiveKernels)

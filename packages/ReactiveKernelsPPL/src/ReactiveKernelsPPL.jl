@@ -27,7 +27,8 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
     VaryingEffectTerm, SplineSummandTerm, HSGPSummandTerm,
-    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm, MatrixTerm
+    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm, MatrixTerm,
+    DarSummandTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export ScalePredictorRef
 export PopulationPrior, R2D2Prior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec
@@ -62,6 +63,7 @@ export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
 export RKPPLModel, RKPPLSubmodel, lower_rkppl, @rkppl, SurfaceLoweringError
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
+export DarSpec
 
 include("contract.jl")
 include("design.jl")
