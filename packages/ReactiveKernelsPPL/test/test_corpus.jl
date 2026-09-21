@@ -141,3 +141,39 @@ end
         end
     end
 end
+
+@testset "bound levels spelling canonical parity" begin
+    # Every subset shape admitted inline is admitted through a bound name,
+    # and the unbound plan is byte-identical under the canonical serializer.
+    two_to_end = Expr(:call, :(:), 2, :end)
+    cases = (
+        (:(levels(g)), :(levels(h)), nothing, Colon()),
+        (Expr(:ref, :(levels(g)), two_to_end),
+            Expr(:ref, :(levels(h)), two_to_end), two_to_end, (2, :end)),
+        (:(levels(g)[1:2]), :(levels(h)[1:2]), :(1:2), 1:2),
+        (:(levels(g)[[1, 3]]), :(levels(h)[[1, 3]]), :([1, 3]), [1, 3]),
+    )
+    for (g_rhs, h_rhs, subset_expr, subset) in cases
+        g_index = g_rhs.head === :call && subset_expr !== nothing ?
+            Expr(:ref, g_rhs, subset_expr) : g_rhs
+        h_index = h_rhs.head === :call && subset_expr !== nothing ?
+            Expr(:ref, h_rhs, subset_expr) : h_rhs
+        inline = Expr(:block,
+            Expr(:call, :.~, Expr(:ref, :c, g_index), :(Normal.(0, 2))),
+            Expr(:call, :.~, Expr(:ref, :k, h_index), :(Normal.(0, 3))),
+            :(mu = c[g] .+ k[h]),
+            Expr(:call, :.~, :y, :(Normal.(mu, 1.5))))
+        bound = Expr(:block, Expr(:(=), :sel_g, g_rhs),
+            Expr(:(=), :sel_h, h_rhs),
+            Expr(:call, :.~, Expr(:ref, :c, :sel_g), :(Normal.(0, 2))),
+            Expr(:call, :.~, Expr(:ref, :k, :sel_h), :(Normal.(0, 3))),
+            :(mu = c[g] .+ k[h]),
+            Expr(:call, :.~, :y, :(Normal.(mu, 1.5))))
+        data = (:y, :g, :h)
+        inline_plan = lower_rkppl(inline, data)
+        bound_plan = lower_rkppl(bound, data)
+        @test sprint(_canon, bound_plan) == sprint(_canon, inline_plan)
+        @test length(bound_plan.levelmaps) == 2
+        @test all(m -> m.subset == subset, bound_plan.levelmaps)
+    end
+end
