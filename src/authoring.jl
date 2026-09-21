@@ -199,11 +199,25 @@ end
 # key, while separately authored formulas have different Token parameters.
 struct _KernelProvenanceKey{Token} end
 
-_kernel_provenance_key(recipe::Recipe) =
-    _kernel_provenance_key(recipe.op, recipe.cse_key, recipe.effectful)
-_kernel_provenance_key(op, key, ::Bool) = key
-function _kernel_provenance_key(op::_KernelSourceOp{Token}, key, effectful::Bool) where {Token}
-    key === nothing && !effectful ? _KernelProvenanceKey{Token}() : key
+_kernel_source_token(::_KernelSourceOp{Token}) where {Token} = Token
+
+# Provenance CSE key assigned when a child recipe is cloned into a parent
+# graph (nested-spec splice and merge/compose). An explicit `cse_key` always
+# wins and effectful recipes keep `nothing` (`add!` never CSE-merges those).
+# Otherwise the key names the computation: compiler-owned source operations
+# reuse their definition Token, while every other operation keys on
+# `(op, cost, output types)` so that repeated splices of the same pure call
+# merge instead of manufacturing one alternative producer per call site (the
+# planner's exact search is exponential in the number of such producers).
+# Cost rides along so a cheaper spelling still wins the plan instead of being
+# absorbed by an earlier expensive one; output types ride along so a
+# narrower/wider redeclaration never aliases (which `add!` would reject).
+function _kernel_provenance_key(recipe::Recipe)
+    recipe.cse_key !== nothing && return recipe.cse_key
+    recipe.effectful && return nothing
+    op = recipe.op
+    op isa _KernelSourceOp && return _KernelProvenanceKey{_kernel_source_token(op)}()
+    (:kernel_plain_op, op, recipe.cost, map(valtype, recipe.outputs))
 end
 
 _kernel_inline_signature_supported(::Any) = false

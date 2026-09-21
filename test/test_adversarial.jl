@@ -130,6 +130,58 @@ using Test
         @test inputs(alias_kernel) == (x,)
         @test alias_kernel(3.0) == 6.0
     end
+
+    @testset "HAVE-direct producers dominate indirect alternatives" begin
+        g = Graph()
+        u = value!(g, :u, Float64)
+        x = value!(g, :x, Float64)
+        v = value!(g, :v, Float64)
+        add!(g, (u,) => v, exp)
+        add!(g, (x,) => v, log)
+        add!(g, (u,) => x, exp)
+        p = plan(g; have = (u,), want = (v,))
+        # the indirect route can never beat the direct one: pruned, not searched
+        @test [r.id for r in p.candidates] == [1, 3]
+        @test length(p.recipes) == 1 && p.recipes[1].op === exp
+        @test prepare(p)(1.0) == exp(1.0)
+    end
+
+    @testset "dominance keeps cheaper indirect and multi-output routes" begin
+        g = Graph()
+        u = value!(g, :u, Float64)
+        x = value!(g, :x, Float64)
+        v = value!(g, :v, Float64)
+        add!(g, (u,) => v, exp; cost = 2.0)
+        add!(g, (x,) => v, log; cost = 0.5)
+        add!(g, (u,) => x, exp; cost = 0.5)
+        p = plan(g; have = (u,), want = (v,))
+        @test length(p.candidates) == 3
+        @test p.cost == 1.0
+        @test prepare(p)(2.0) == log(exp(2.0))
+
+        g2 = Graph()
+        u2 = value!(g2, :u, Float64)
+        x2 = value!(g2, :x, Float64)
+        v2 = value!(g2, :v, Float64)
+        w2 = value!(g2, :w, Float64)
+        add!(g2, (u2,) => v2, exp)
+        add!(g2, (x2,) => (v2, w2), t -> (t, t))
+        add!(g2, (u2,) => x2, exp)
+        p2 = plan(g2; have = (u2,), want = (v2, w2))
+        @test length(p2.candidates) == 3
+        @test p2.cost == 2.0
+    end
+
+    @testset "identical HAVE-direct producers collapse to the lowest id" begin
+        g = Graph()
+        u = value!(g, :u, Float64)
+        v = value!(g, :v, Float64)
+        add!(g, (u,) => v, exp)
+        add!(g, (u,) => v, exp)
+        p = plan(g; have = (u,), want = (v,))
+        @test [r.id for r in p.candidates] == [1]
+        @test prepare(p)(1.0) == exp(1.0)
+    end
 end
 
 @testset "adversarial reactive contracts" begin
