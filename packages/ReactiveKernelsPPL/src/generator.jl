@@ -51,6 +51,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _scan_reconstruction_statements(plan, layout))
     append!(stmts, _dar_reconstruction_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
+    append!(stmts, _event_lp_statements(plan))
     append!(stmts, _likelihood_statements(plan))
     append!(stmts, _prior_statements(plan, layout))
     push!(stmts, _log_jacobian_statement(layout))
@@ -77,7 +78,7 @@ module PPLGeneratedModels
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
-    beta, inverse_gamma, binomial, negative_binomial2,
+    beta, inverse_gamma, binomial, negative_binomial2, uniform,
     gp_exp_quad_cov, gp_chol_latent
 using SpecialFunctions: erfc, loggamma
 # Selective (explicit imports win over any re-export chain, so no `using`
@@ -93,6 +94,16 @@ import ..positive_bijector, ..unit_bijector
 # In-model grouping encoder (`_ppl_gidx_<group>` nodes call it with the
 # raw column + literal declared levels).
 import .._declared_codes
+# Grouped-kernel cell vocabulary (one call per subject over bound
+# op-column slices plus traced LP scalars). Every `import` here binds
+# when this file loads — names defined by LATER includes (the
+# per-element TGI likelihood cells the joint plates call) cannot
+# register here; they import after their file loads (see the bottom of
+# `ReactiveKernelsPPL.jl`).
+import ..linear_pk_read_locs, ..linear_pk_read_locs_auc
+# Event-LP provider (one call over the flat event axis — the flat
+# `log_F` local the per-subject expansion slices).
+import ..linear_pk_event_log_f
 end
 
 const _MODEL_COUNTER = Ref(0)
@@ -189,6 +200,29 @@ function _predictor_statements(plan::StructuralPlan)
         # zero LP, which broadcasts everywhere a vector LP would.
         rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
         push!(stmts, :($lp = $rhs))
+    end
+    return stmts
+end
+
+# One event-LP provider call (SB `log_F ~ 0 + op_log_dose +
+# hsgp(op_log_dose; k)`): the flat op-ordered `log_F` local over the
+# bound event-axis column + the frozen bind fit + the traced
+# hyperparameters — the same `linear_pk_event_log_f` the host-side
+# oracle path calls, so spec and graph agree by construction. Runs
+# with the predictors (it IS an LP node); the grouped expansion
+# slices the flat local per subject.
+function _event_lp_statements(plan::StructuralPlan)
+    stmts = Expr[]
+    for el in plan.event_lps
+        el.fit === nothing && throw(ContractValidationError(
+            "[generator] event-LP `$(el.name)`: fit not filled at bind " *
+            "(bind_data fits one (mu, L) over the event axis)"))
+        mu, L = el.fit
+        names = _event_lp_names(el)
+        axis = _sched_col_name(el.schedule, :op_log_dose)
+        push!(stmts, :($(el.name) = linear_pk_event_log_f($axis,
+            $(names.slope), $(names.rho), $(names.sigma), $(names.beta),
+            $(Float64(mu)), $(Float64(L)), $(el.k))))
     end
     return stmts
 end
@@ -544,7 +578,7 @@ end
 # flat statements, and the single Gaussian obs lowers as a flat plate
 # reusing the plate-sum machinery. The collected name aliases its flat
 # value (future generated quantities read it).
-function _kernel_plate_likelihood(kp::KernelPlate, plan::StructuralPlan)
+function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
     isbound(plan) ||
         throw(ContractValidationError("[generator] kernel plates lower " *
               "from a bound plan (bind_data first)"))
@@ -556,7 +590,7 @@ function _kernel_plate_likelihood(kp::KernelPlate, plan::StructuralPlan)
     for (nm, ex) in _canonicalize_kernel_assignments(kp)
         push!(stmts, :($nm = $(_rewrite_kernel_refs(ex, flatmap))))
     end
-    obs = kp.obs
+    obs = only(kp.obs)
     obs.family === GaussianFam ||
         throw(ContractValidationError("[generator] kernel plate " *
               "`$(kp.result)` obs family $(obs.family) has no emitter " *
@@ -575,6 +609,266 @@ function _kernel_plate_likelihood(kp::KernelPlate, plan::StructuralPlan)
     collected === kp.result ||
         push!(stmts, :($(kp.result) = $collected))
     return stmts, _lik_name(klabel)
+end
+
+# One grouped cell assignment: CELL_FN calls expand to per-subject calls
+# over static op slices + LP scalars (then vcat flat under the surface
+# name); segmented-nadir calls unroll one single-scan segment per
+# subject; gathers rewrite `v[sched.map]` to `vflat[mapcol]`; slice
+# do-params rewrite to their bound columns (kernel ports are column
+# names — the panel flatmap precedent); everything else emits verbatim
+# (bind proved shapes).
+function _grouped_cell_assignment(nm::Symbol, ex, kp::KernelPlate,
+        sched::LinearPKScheduleSpec, op_ends::AbstractVector, n_sub::Int,
+        lps::Dict{Symbol,Symbol}, columns::Dict{Symbol,ColumnData},
+        flatmap::Dict{Symbol,Symbol})
+    if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+            ex.args[1] isa Symbol && ex.args[1] in CELL_FNS
+        return _expand_grouped_cell_call(nm, ex, kp, sched, op_ends, n_sub,
+            lps)
+    end
+    if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+            ex.args[1] isa Symbol && ex.args[1] in SEGMENT_CELL_FNS
+        return _expand_segmented_nadir_call(nm, ex, kp, n_sub, columns,
+            flatmap)
+    end
+    return Expr[:($nm = $(_rewrite_grouped_gather(ex, sched, lps, flatmap)))]
+end
+
+# Segmented-nadir unroll: one `tgi_nadir_scan_expr` per subject over a
+# static range-copy of the subject's rows (then vcat flat under the
+# surface name, the cell-call precedent). Copies, not views: `scan`
+# over a view scalar-indexes under Reactant's tensorized scan, and an
+# empty view breaks the vcat's homogeneity under Enzyme AD. Empty
+# segments emit an empty range-copy (`scan` needs a non-empty sequence
+# — the tgi contract). The ends are static bind data (the validator
+# proved the segment contract), so all ranges freeze at codegen.
+function _expand_segmented_nadir_call(nm::Symbol, ex::Expr, kp::KernelPlate,
+        n_sub::Int, columns::Dict{Symbol,ColumnData},
+        flatmap::Dict{Symbol,Symbol})
+    # The change vector may be a bare response slice (shapes admit
+    # slices — `(:obs, len)`); slice do-params ride their columns.
+    change = _kernel_obs_ref(ex.args[2], flatmap)
+    endscol = ex.args[3]
+    ends = columns[endscol]
+    stmts = Expr[]
+    per_sub = Symbol[]
+    prev = 0
+    for s in 1:n_sub
+        hi = Int(ends[s])
+        lo = prev + 1
+        rsym = Symbol(:_ppl_k_, kp.result, :_, nm, :_s, s)
+        if lo > hi
+            push!(stmts, :($rsym = $change[1:0]))
+        else
+            rng = Expr(:call, :(:), lo, hi)
+            seq = Expr(:ref, change, rng)
+            push!(stmts, tgi_nadir_scan_expr(seq, rsym))
+        end
+        push!(per_sub, rsym)
+        prev = hi
+    end
+    flat = length(per_sub) == 1 ? only(per_sub) :
+        Expr(:call, :vcat, per_sub...)
+    push!(stmts, :($nm = $flat))
+    return stmts
+end
+
+function _rewrite_grouped_gather(ex, sched::LinearPKScheduleSpec,
+        lps::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
+        flatmap::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
+    ex isa Symbol && return get(flatmap, ex, ex)
+    ex isa Expr || return ex
+    if ex.head === :ref && length(ex.args) == 2
+        vec, idx = ex.args[1], ex.args[2]
+        # LP cell params in gather-source position rewrite to their LP
+        # vectors (structure proved bare LPs reach generation ONLY as
+        # gather sources — every other bare use fails closed there —
+        # so any surviving bare LP elsewhere passes through to a loud
+        # UndefVar instead of a silent wrong vector). The LP check
+        # leads: LP params and slice do-params are disjoint, so order
+        # never matters, but the LP rule must not depend on it.
+        if vec isa Symbol && haskey(lps, vec)
+            vec = lps[vec]
+        else
+            vec = _rewrite_grouped_gather(vec, sched, lps, flatmap)
+        end
+        if idx isa Expr && idx.head === :.
+            m = idx.args[2].value
+            return Expr(:ref, vec, _sched_col_name(sched.name, m))
+        end
+        # Plain-symbol (or computed) flat indices — TGI/QT prep maps and
+        # other bind-materialized integer columns — pass through untouched.
+        return Expr(:ref, vec,
+            _rewrite_grouped_gather(idx, sched, lps, flatmap))
+    end
+    return Expr(ex.head,
+        (_rewrite_grouped_gather(a, sched, lps, flatmap)
+            for a in ex.args)...)
+end
+
+function _expand_grouped_cell_call(nm::Symbol, ex::Expr, kp::KernelPlate,
+        sched::LinearPKScheduleSpec, op_ends::AbstractVector, n_sub::Int,
+        lps::Dict{Symbol,Symbol})
+    fn = ex.args[1]
+    callargs = ex.args[2:end]
+    opfields = CELL_FN_OP_FIELDS[fn]
+    sliced = get(CELL_FN_SLICED_ARGS, fn, Symbol[])
+    stmts = Expr[]
+    per_sub = Symbol[]
+    for s in 1:n_sub
+        lo = s == 1 ? 1 : Int(op_ends[s-1]) + 1
+        hi = Int(op_ends[s])
+        rng = Expr(:call, :(:), lo, hi)
+        args = Any[]
+        for field in opfields
+            push!(args, Expr(:call, :view,
+                _sched_col_name(sched.name, field), rng))
+        end
+        for a in callargs[2:end]
+            if a isa Symbol && haskey(lps, a)
+                lpsym = Symbol(:_ppl_k_, kp.result, :_, a, :_s, s)
+                srg = Expr(:call, :(:), s, s)
+                push!(stmts, :($lpsym = sum(view($(lps[a]), $srg))))
+                push!(args, lpsym)
+            elseif a isa Symbol && a in sliced
+                push!(args, Expr(:call, :view, a, rng))
+            else
+                push!(args, a)
+            end
+        end
+        rsym = Symbol(:_ppl_k_, kp.result, :_, nm, :_s, s)
+        push!(stmts, :($rsym = $(Expr(:call, fn, args...))))
+        push!(per_sub, rsym)
+    end
+    flat = length(per_sub) == 1 ? only(per_sub) :
+        Expr(:call, :vcat, per_sub...)
+    push!(stmts, :($nm = $flat))
+    return stmts
+end
+
+# Grouped-kernel likelihood (per-subject unrolled codegen): the panel flat
+# map cannot express sequential recurrences, so each subject's event loop
+# runs as one `linear_pk_read_locs` call over bound op-column slices
+# (static `view` ranges from `op_ends`) plus per-subject LP scalars
+# (`sum(view(lp, s:s))` — the parked core `q[i]`-normalization
+# workaround), read vectors vcat flat, schedule-map gathers move reads
+# to obs space, and each in-cell observation lowers as a Gaussian plate
+# reusing the plate-sum machinery. Cell calls expand (never emit
+# verbatim); slice do-params rewrite to their bound columns (kernel
+# ports are column names — the panel flatmap precedent); all other
+# assignments emit verbatim under their surface names. The collected
+# name aliases its flat value (future generated quantities + the
+# sibling likelihood-node slice read it).
+#
+# Slice params to columns (grouped `_kernel_flatmap`: grouped slices
+# are all `:response` kind over whole columns — no T-blocks — so the
+# map is do-param → column).
+_grouped_flatmap(kp::KernelPlate) =
+    Dict{Symbol,Symbol}(p => c for (c, p, _) in kp.slices)
+
+function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
+    isbound(plan) ||
+        throw(ContractValidationError("[generator] kernel plates lower " *
+              "from a bound plan (bind_data first)"))
+    kp.subjects isa Int ||
+        throw(ContractValidationError("[generator] kernel plate " *
+              "`$(kp.result)` subjects unresolved (bind_data with dims first)"))
+    n_sub = kp.subjects
+    sched = only(kp.schedules)
+    op_ends = plan.columns[_sched_col_name(sched.name, :op_ends)]
+    lps = Dict{Symbol,Symbol}(c => _lp_name(_predictor(plan, p))
+        for (p, c) in kp.lp_args)
+    flatmap = _grouped_flatmap(kp)
+    stmts = Expr[]
+    for (nm, ex) in kp.assignments
+        append!(stmts, _grouped_cell_assignment(nm, ex, kp, sched, op_ends,
+            n_sub, lps, plan.columns, flatmap))
+    end
+    klabel = Symbol(:kernel_, kp.result)
+    oterms = Any[]
+    for (oi, obs) in enumerate(kp.obs)
+        rcol = only(c for (c, p, _) in kp.slices if p === obs.response)
+        olabel = Symbol(klabel, :_o, oi)
+        ostmts, oterm =
+            _grouped_obs_likelihood_stmts(kp, obs, rcol, olabel)
+        append!(stmts, ostmts)
+        push!(oterms, oterm)
+    end
+    joint = foldl((a, b) -> :($a + $b), oterms; init = :(0.0))
+    push!(stmts, :($(_lik_name(klabel))::Float64 = $joint))
+    collected = haskey(flatmap, kp.collected) ? flatmap[kp.collected] :
+        kp.collected
+    collected === kp.result ||
+        push!(stmts, :($(kp.result) = $collected))
+    return stmts, _lik_name(klabel)
+end
+
+# One grouped in-cell observation → `(stmts, term)`: Gaussian obs
+# (PK-QT-TGI continuous alike) ride the generic plate; the joint
+# families route to their builders with the obs node's
+# `(response, location, scale, params)` mapped to builder kwargs (the
+# surface arity table + contract family checks proved the shapes, so
+# the positional map below is total). QT Gaussian obs route through
+# the GENERIC path (the KernelObs node cannot carry the QT builder's
+# separate weight — the surface spells `qt_sd = qt_scale .*
+# qt_weight` pre-assignments instead; the QT builder stays the golden
+# shape spec the emitter output is pinned to).
+function _grouped_obs_likelihood_stmts(kp::KernelPlate, obs::KernelObs,
+        rcol::Symbol, olabel::Symbol)
+    # Obs location/scale/params naming slice do-params ride their bound
+    # columns (kernel ports are column names — the panel
+    # `_kernel_obs_ref` precedent); cell locals, model scalars, and
+    # literals pass through.
+    flatmap = _grouped_flatmap(kp)
+    loc = _kernel_obs_ref(obs.location, flatmap)
+    scale = _kernel_obs_ref(obs.scale, flatmap)
+    params = map(p -> _kernel_obs_ref(p, flatmap), obs.params)
+    if obs.family === GaussianFam
+        inputs = Any[rcol]
+        rv = _dovar(1)
+        locv = _thread_ref!(inputs, loc)
+        sref = _thread_ref!(inputs, scale)
+        cell = :(normal($locv, $sref).logpdf($rv))
+        pw, node = _pw_name(olabel), _lik_name(olabel)
+        return Expr[_plate_sum_stmts(pw, node, inputs, cell)...], node
+    elseif obs.family === CensoredAddpropnormalFam
+        # `pk_obs_statement` spelling: `(location, scale = add, prop,
+        # lloq)` — all names (the QT builder threads; literals spell
+        # a pre-assignment).
+        for (nm, ref) in ((:location, loc), (:scale, scale),
+                (:params, params[1]), (:params, params[2]))
+            ref isa Symbol ||
+                throw(ContractValidationError("[generator] kernel plate " *
+                      "`$(kp.result)` censored obs $nm `$ref` must be a " *
+                      "cell/model name (literals do not lower — spell " *
+                      "a pre-assignment)"))
+        end
+        return _qt_joint_pk_likelihood_stmts(; response = rcol,
+            location = loc, add = scale, prop = params[1],
+            lloq = params[2], label = olabel)
+    elseif obs.family === TgiCategoryFam
+        return tgi_category_stmts(; response = rcol, r = loc,
+            ref = scale, c_cr = params[1], c_pr = params[2],
+            c_pd = params[3], sigma = params[4], eps = params[5],
+            label = olabel)
+    elseif obs.family === TgiResponseFam
+        return tgi_response_stmts(; response = rcol, r = loc,
+            ref = scale, c_pr = params[1], c_pd = params[2],
+            sigma = params[3], eps = params[4], label = olabel)
+    elseif obs.family === TgiCensoredFam
+        return tgi_censored_stmts(; response = rcol, mu = loc,
+            sigma = scale, lloq = params[1], label = olabel)
+    end
+    throw(ContractValidationError("[generator] kernel plate " *
+          "`$(kp.result)` obs family $(obs.family) has no in-cell " *
+          "emitter (admitted: Gaussian, CensoredAddpropnormal, " *
+          "TgiCategory, TgiResponse, TgiCensored)"))
+end
+
+function _kernel_plate_likelihood(kp::KernelPlate, plan::StructuralPlan)
+    _is_grouped_kernel(kp) && return _grouped_kernel_likelihood(kp, plan)
+    return _panel_kernel_likelihood(kp, plan)
 end
 
 # Slice params to flat refs: vector slices ride their flat T-blocked
@@ -1516,6 +1810,39 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         end
         snode = Symbol(:_ppl_prior_, names.sigma)
         scell = _family_logpdf_expr(:lognormal, Any[0, 1], names.sigma)
+        push!(stmts, :($snode::Float64 = $scell))
+        push!(terms, snode)
+        _vector_prior_stmts!(stmts, terms, names.beta, :normal,
+            (arg1 = 0, arg2 = 1), nothing)
+    end
+    # Event-LP providers (SB V2 term priors verbatim): the dose slope
+    # `Normal(0, 0.6676)` (the specific `effect(log_F, op_log_dose)`
+    # override — BRM specificity beats the wildcard), the length scale
+    # `Uniform(floor, 2.0)` over the `:interval` support (constant
+    # `-log(hi-lo)` — the support keeps it inside), the marginal scale
+    # `Normal(0, 1)` WITHOUT a half normalizer (Stan lower-bound
+    # kernel semantics — the varying-`tau` precedent), and the
+    # standardized `beta_raw` plate (shared vector-prior helper).
+    for el in plan.event_lps
+        el.fit === nothing && throw(ContractValidationError(
+            "[generator] event-LP `$(el.name)`: fit not filled at bind " *
+            "(bind_data fits one (mu, L) over the event axis)"))
+        names = _event_lp_names(el)
+        floor = only(_hsgp_floors([el.k], [el.fit], true))
+        slopesym = names.slope
+        slnode = Symbol(:_ppl_prior_, slopesym)
+        slcell = _family_logpdf_expr(:normal,
+            Any[0.0, _EVENT_LP_SLOPE_PRIOR_SD], slopesym)
+        push!(stmts, :($slnode::Float64 = $slcell))
+        push!(terms, slnode)
+        rhosym = names.rho
+        rnode = Symbol(:_ppl_prior_, rhosym)
+        rcell = :(uniform($floor, $(_EVENT_LP_RHO_PRIOR_HI)).logpdf($rhosym))
+        push!(stmts, :($rnode::Float64 = $rcell))
+        push!(terms, rnode)
+        sigsym = names.sigma
+        snode = Symbol(:_ppl_prior_, sigsym)
+        scell = _family_logpdf_expr(:normal, Any[0, 1], sigsym)
         push!(stmts, :($snode::Float64 = $scell))
         push!(terms, snode)
         _vector_prior_stmts!(stmts, terms, names.beta, :normal,
