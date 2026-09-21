@@ -87,10 +87,10 @@ end
     @test all(s -> s[3] === :unknown, kp0.slices)
     # The emitter passes scalar-context user code verbatim (undotted).
     @test kp0.assignments[1] == (:ke => :(CLi / Vci))
-    @test kp0.obs.response === :yy
-    @test kp0.obs.family === GaussianFam
-    @test kp0.obs.location === :mu
-    @test kp0.obs.scale === :sigma
+    @test only(kp0.obs).response === :yy
+    @test only(kp0.obs).family === GaussianFam
+    @test only(kp0.obs).location === :mu
+    @test only(kp0.obs).scale === :sigma
     @test kp0.collected === :mu
 
     dims = Dict{Symbol,Int}(:kernel_nsub_pred => 3, :kernel_T_pred => 4)
@@ -285,7 +285,9 @@ end
         plate_ast([good_cell[1], :(yy .~ Poisson.(mu)), :mu], [subj]), data)
     @test_throws "obs broadcasts" lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ Normal(mu, sigma)), :mu], [subj]), data)
-    @test_throws "exactly two arguments" lower_rkppl(
+    # Arity message generalized to digits when the joint families joined
+    # the obs table (same fail-closed behavior).
+    @test_throws "exactly 2 arguments" lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ Normal.(mu)), :mu], [subj]), data)
     @test_throws "name or a numeric literal" lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ Normal.(mu .+ 1.0, sigma)), :mu], [subj]), data)
@@ -316,7 +318,8 @@ end
     sparam = SampledParameter(:s, :exponential, (arg1 = 1.0,), nothing, :s)
     kp_hand = KernelPlate(:pred, 1, nothing, [(:t, :ts, :scalar)],
         Pair{Symbol,Any}[],
-        (response = :ts, family = GaussianFam, location = :ts, scale = :s),
+        (response = :ts, family = GaussianFam, location = :ts, scale = :s,
+            params = ()),
         :ts, :pred)
     both_plan = StructuralPlan([resp], [pred_spec],
         PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0)],

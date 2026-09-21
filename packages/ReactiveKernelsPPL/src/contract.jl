@@ -86,6 +86,10 @@ joint correlated-outcomes family (per-row MvNormal over a Cholesky factor)."""
     MultinomialFam
     CategoricalFam
     MvNormalCholeskyFam
+    CensoredAddpropnormalFam
+    TgiCategoryFam
+    TgiResponseFam
+    TgiCensoredFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -669,9 +673,111 @@ struct HSGPBasis
 end
 
 """
-    KernelPlate(result, subjects, timepoints, slices, assignments, obs, collected, label)
+    LinearPKScheduleSpec(name, obs_subj, obs_time, dose_subj, dose_time, dose_amt,
+                         ecg = nothing, tgi = nothing)
 
-One panel kernel (BRM `_RKKernelPlan`, panel v1): `result` is the collected
+One linear-PK event-schedule declaration (grouped kernels): `name` the
+schedule's model-scope handle; the remaining fields the RAW obs/dose
+data columns the bind-time recipe builds the op stream from (surface:
+`name = linear_pk_schedule(obs = (subj, time), dose = (subj, time,
+amount))`). `ecg`/`tgi` are optional `(subject, time)` column pairs
+naming EXTRA READ AXES (surface: `ecg = (subj, time)`, `tgi = (subj,
+time)` keywords) whose rows join the stream as read-only points (SB's
+joint `vcat(pk, qt, tgi)` union). The schedule materializes op columns
+plus `op_ends`, per-axis `(obs_read, obs_map, ecg_read, ecg_map,
+tgi_read, tgi_map)` row products, and the `[conc; auc]`-space
+`conc_map`/`tgi_auc_map` at bind (see
+[`build_linear_pk_schedule`](@ref)); the names here are declaration
+only. Axis products materialize only for declared axes (and the
+`[conc; auc]`-space maps only with an AUC cell call), so v1 bind
+products stay byte-identical without them.
+"""
+struct LinearPKScheduleSpec
+    name::Symbol
+    obs_subj::Symbol
+    obs_time::Symbol
+    dose_subj::Symbol
+    dose_time::Symbol
+    dose_amt::Symbol
+    ecg::Union{Nothing,Tuple{Symbol,Symbol}}
+    tgi::Union{Nothing,Tuple{Symbol,Symbol}}
+end
+"""v1 positional construction (no extra read axes)."""
+LinearPKScheduleSpec(name::Symbol, obs_subj::Symbol, obs_time::Symbol,
+    dose_subj::Symbol, dose_time::Symbol, dose_amt::Symbol) =
+    LinearPKScheduleSpec(name, obs_subj, obs_time, dose_subj, dose_time,
+        dose_amt, nothing, nothing)
+
+"""V2 event-LP slope prior scale (SB `effect(log_F, op_log_dose) ~
+Normal(0.0, 0.6676)` verbatim — the specific overrides the wildcard
+`effect(log_F, :) ~ Normal(0.0, 0.5)` by BRM specificity)."""
+const _EVENT_LP_SLOPE_PRIOR_SD = 0.6676
+
+"""V2 event-LP length-scale prior upper bound (SB
+`length_scale(:, hsgp(op_log_dose)) ~ Uniform(lower, 2.0)` — the
+varyingsource4 upper bound, verbatim)."""
+const _EVENT_LP_RHO_PRIOR_HI = 2.0
+
+"""The fixed event-LP provider name (the SB seam name — the
+per-subject expansion slices the call arg by this NAME)."""
+const EVENT_LP_NAME = :log_F
+
+"""
+    LinearPKEventLPSpec(name, schedule, k, c, fit, label)
+
+One linear-PK event-axis bioavailability LP (SB `log_F ~ 0 +
+op_log_dose + hsgp(op_log_dose; k = 5)`): `name` the provider's
+model-scope flat vector (`:log_F`, fixed — the per-subject expansion
+slices by name); `schedule` the op stream it rides; `k`/`c` the 1-D
+HSGP modes/boundary factor (V2: 5/1.5); `fit` the bind-time `(mu, L)`
+over the `op_log_dose` column (`nothing` pre-bind); `label` the
+validation label. The provider evaluates in-graph via
+[`linear_pk_event_log_f`](@ref) (data axis + frozen fit, traced
+hyperparameters — the Stage-B split); the layout owns
+`slope`/`rho`/`sigma`/`beta_raw` with the V2 priors.
+"""
+struct LinearPKEventLPSpec
+    name::Symbol
+    schedule::Symbol
+    k::Int
+    c::Float64
+    fit::Union{Nothing,Tuple{Float64,Float64}}
+    label::Symbol
+end
+
+# Event-LP sampled names, derived purely from the provider name (the
+# `_hsgp_names` precedent, SB term-prior vocabulary): the dose slope,
+# the HSGP length scale / marginal scale, and the standardized
+# coefficients. Single source for name tables, layout, and the
+# generator.
+function _event_lp_names(el::LinearPKEventLPSpec)
+    id = el.name
+    return (slope = Symbol("slope_", id), rho = Symbol("rho_", id),
+        sigma = Symbol("sigma_", id), beta = Symbol("beta_raw_", id))
+end
+
+"""Flat sampled-name list for name tables + claims (slope, rho, sigma,
+beta — the `_hsgp_all_names` precedent)."""
+function _event_lp_all_names(el::LinearPKEventLPSpec)
+    n = _event_lp_names(el)
+    return Symbol[n.slope, n.rho, n.sigma, n.beta]
+end
+
+"""In-cell observation node: `(response, family, location, scale, params)`
+with `response` a cell param (panel and grouped share the node; grouped
+carries a LIST). `location`/`scale` are the first/second positional
+family args; `params` the remaining args (`()` for two-arg families).
+Multi-param families (joint PK/QT/TGI) are grouped-only."""
+const KernelObs =
+    NamedTuple{(:response, :family, :location, :scale, :params)}
+
+"""
+    KernelPlate(result, subjects, timepoints, slices, assignments, obs, collected, label;
+                lp_args = [], schedules = [])
+
+One kernel (BRM `_RKKernelPlan`) in one of two forms:
+
+PANEL (panel v1: `lp_args`/`schedules` empty): `result` is the collected
 per-subject name (the plate LHS); `subjects` the subject count (integer
 literal, or a dims-key `Symbol` resolved at bind); `timepoints` the
 per-subject timepoint count (`nothing` for all-scalar models, an integer,
@@ -679,10 +785,19 @@ or a dims-key `Symbol` resolved at bind); `slices` the
 `(data column, cell param, kind)` triples with `kind ∈ (:vector, :scalar,
 :unknown)` (`:unknown` pre-bind — kinds resolve from lengths at bind);
 `assignments` the cell-local `name => expr` pairs in cell order (flat
-elementwise vocabulary); `obs` the single in-cell observation
-`(response, family, location, scale)` with `response` a cell param;
+elementwise vocabulary); `obs` the single in-cell observation;
 `collected` the trailing collected cell name. Grouping is ABSENT for
 panel (implicit 1:n subjects — structural, no sentinel).
+
+GROUPED (joint-kernel form: exactly one schedule in v1): `slices` are
+RESPONSE slices (`kind === :response` once bound) over the schedule's
+obs axis; `lp_args` the `(subject predictor, cell param)` pairs (LP
+values gather per subject in-cell); `schedules` the schedule
+declarations the cell calls address; `obs` the in-cell observation
+LIST (one per response axis); `timepoints` is always `nothing`
+(ragged axes have no rectangular T). The cell vocabulary is calls to
+[`CELL_FNS`](@ref), schedule-map gathers, and arithmetic (no flat
+dotify — the generator unrolls per subject).
 """
 struct KernelPlate
     result::Symbol
@@ -690,10 +805,31 @@ struct KernelPlate
     timepoints::Union{Nothing,Int,Symbol}
     slices::Vector{Tuple{Symbol,Symbol,Symbol}}
     assignments::Vector{Pair{Symbol,Any}}
-    obs::NamedTuple{(:response, :family, :location, :scale)}
+    obs::Vector{KernelObs}
     collected::Symbol
     label::Symbol
+    lp_args::Vector{Tuple{Symbol,Symbol}}
+    schedules::Vector{LinearPKScheduleSpec}
 end
+
+"""Panel-v1 positional construction (grouped fields default empty)."""
+KernelPlate(result::Symbol, subjects::Union{Int,Symbol},
+    timepoints::Union{Nothing,Int,Symbol},
+    slices::Vector{Tuple{Symbol,Symbol,Symbol}},
+    assignments::Vector{Pair{Symbol,Any}}, obs::KernelObs,
+    collected::Symbol, label::Symbol) =
+    KernelPlate(result, subjects, timepoints, slices, assignments, [obs],
+        collected, label, Tuple{Symbol,Symbol}[], LinearPKScheduleSpec[])
+KernelPlate(result::Symbol, subjects::Union{Int,Symbol},
+    timepoints::Union{Nothing,Int,Symbol},
+    slices::Vector{Tuple{Symbol,Symbol,Symbol}},
+    assignments::Vector{Pair{Symbol,Any}}, obs::Vector{<:KernelObs},
+    collected::Symbol, label::Symbol) =
+    KernelPlate(result, subjects, timepoints, slices, assignments, obs,
+        collected, label, Tuple{Symbol,Symbol}[], LinearPKScheduleSpec[])
+
+"""Grouped ⟺ the plate carries schedules (panel plates carry none)."""
+_is_grouped_kernel(kp::KernelPlate) = !isempty(kp.schedules)
 
 """Flat length of a resolved kernel plate: `n_sub * T` (`T = 1` all-scalar)."""
 _kernel_flat_length(n_sub::Int, T::Union{Nothing,Int}) =
@@ -706,7 +842,13 @@ _kexp_name(result::Symbol, col::Symbol) = Symbol("$(result)_kexp_$(col)")
 """Columns a kernel plate manages (slice columns + scalar expansions):
 exempt from the uniform-`n_obs` rule, validated under kernel rules.
 Expansions exist only for resolved vector models (`T isa Int`); gating
-on that keeps a stray caller column from hiding behind the exemption."""
+on that keeps a stray caller column from hiding behind the exemption.
+Grouped plates additionally manage their schedules' raw columns, the
+bind-materialized `<sched>_<field>` op columns, and the plain-Symbol
+bind columns the cell references (gather indices + nadir ends — the
+walker admits unknown Symbols ONLY in those positions, and shapes +
+the prep validators prove each one, so the exemption cannot hide a
+stray column)."""
 function _kernel_managed_columns(kp::KernelPlate)
     out = Set{Symbol}()
     for (col, _, kind) in kp.slices
@@ -714,8 +856,59 @@ function _kernel_managed_columns(kp::KernelPlate)
         kind === :scalar && kp.timepoints isa Int &&
             push!(out, _kexp_name(kp.result, col))
     end
+    for s in kp.schedules
+        push!(out, s.obs_subj)
+        push!(out, s.obs_time)
+        push!(out, s.dose_subj)
+        push!(out, s.dose_time)
+        push!(out, s.dose_amt)
+        s.ecg !== nothing && (push!(out, s.ecg[1]); push!(out, s.ecg[2]))
+        s.tgi !== nothing && (push!(out, s.tgi[1]); push!(out, s.tgi[2]))
+        for f in _SCHED_MATERIALIZED_FIELDS
+            push!(out, _sched_col_name(s.name, f))
+        end
+        for f in _sched_extra_fields(s, kp.assignments)
+            push!(out, _sched_col_name(s.name, f))
+        end
+        # The event-axis product (present only with a declared
+        # event-LP): op-length by design, like the op columns.
+        push!(out, _sched_col_name(s.name, :op_log_dose))
+    end
+    union!(out, _cell_bind_columns(kp))
     return out
 end
+
+"""Plain-Symbol bind columns a grouped cell references: gather indices
+(`v[map]`) + segmented-nadir ends (`nadir(change, ends)`). The walker
+admits unknown Symbols only in these positions; shapes prove
+bound-ness + lengths and the prep validators prove content."""
+function _cell_bind_columns(kp::KernelPlate)
+    out = Set{Symbol}()
+    for (_, ex) in kp.assignments
+        _collect_cell_bind_columns!(out, ex)
+    end
+    return out
+end
+
+function _collect_cell_bind_columns!(out::Set{Symbol}, ex)
+    ex isa Expr || return nothing
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[2] isa Symbol
+        push!(out, ex.args[2])
+    end
+    if ex.head === :call && length(ex.args) == 3 && ex.args[1] isa Symbol &&
+            ex.args[1] in SEGMENT_CELL_FNS && ex.args[3] isa Symbol
+        push!(out, ex.args[3])
+    end
+    for a in ex.args
+        _collect_cell_bind_columns!(out, a)
+    end
+    return nothing
+end
+
+"""Bind-materialized schedule column (`sched` + field → `<sched>_<field>`,
+the `_kexp_name` precedent: deterministic bind product, caller
+collisions fail closed)."""
+_sched_col_name(sched::Symbol, field::Symbol) = Symbol("$(sched)_$(field)")
 
 """
     AssignmentSpec(name, expr)
@@ -914,6 +1107,7 @@ struct StructuralPlan
     kernel_plates::Vector{KernelPlate}
     r2d2_priors::Vector{R2D2Prior}
     matrices::Vector{DesignMatrix}
+    event_lps::Vector{LinearPKEventLPSpec}
 end
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
@@ -934,7 +1128,7 @@ StructuralPlan(
         LevelMap[], ScanSpec[], DarSpec[], VaryingDraws[], VaryingSlice[],
         VectorParameter[],
         SplineBasis[], SplineVector[], HSGPBasis[], KernelPlate[],
-        R2D2Prior[], DesignMatrix[])
+        R2D2Prior[], DesignMatrix[], LinearPKEventLPSpec[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -966,14 +1160,23 @@ function StructuralPlan(
         hsgp_bases::Vector{HSGPBasis} = HSGPBasis[],
         kernel_plates::Vector{KernelPlate} = KernelPlate[],
         r2d2_priors::Vector{R2D2Prior} = R2D2Prior[],
-        matrices::Vector{DesignMatrix} = DesignMatrix[])
+        matrices::Vector{DesignMatrix} = DesignMatrix[],
+        event_lps::Vector{LinearPKEventLPSpec} = LinearPKEventLPSpec[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
         varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        kernel_plates, r2d2_priors, matrices)
+        kernel_plates, r2d2_priors, matrices, event_lps)
 end
+
+"""`combine_simultaneous` for one schedule's build: a declared
+event-LP on the schedule selects the V2 no-pre-sum build (a
+nonlinear dose-only effect makes pre-summing raw amounts invalid —
+SB builds the joint schedule with `combine_simultaneous=false`);
+otherwise the v1 pre-summing build."""
+_schedule_combine_simultaneous(plan::StructuralPlan, sched::Symbol) =
+    !any(el -> el.schedule === sched, plan.event_lps)
 
 """Find a design matrix by name, or `nothing`."""
 function _find_matrix(plan::StructuralPlan, name::Symbol)
@@ -1133,11 +1336,18 @@ end
 
 # Every model-scope name a kernel plate introduces (cell names become flat
 # model-scope locals at codegen): the result, slice params, and cell-local
-# assignment names. Single source for the global name-table gate.
+# assignment names. Grouped plates additionally introduce their LP cell
+# params and schedule handles. Single source for the global name-table gate.
 function _kernel_all_names(kp::KernelPlate)
     names = Symbol[kp.result]
     for (_, p, _) in kp.slices
         push!(names, p)
+    end
+    for (_, p) in kp.lp_args
+        push!(names, p)
+    end
+    for s in kp.schedules
+        push!(names, s.name)
     end
     for (nm, _) in kp.assignments
         push!(names, nm)
@@ -1192,6 +1402,130 @@ const ASSIGNMENT_FNS = (
 """Vector-returning whole-column functions (exact-GP slice): admitted in
 derived columns and predictor locations only; always vector-shaped."""
 const VECTOR_FNS = (:gp_exp_quad_cov, :gp_chol_latent)
+
+"""Cell-callable functions (grouped kernels): admitted in grouped-kernel
+cell assignments ONLY, always with a declared schedule as the first
+argument. The generator macro-expands the call per subject (the
+function itself is the host-side spec + oracle path)."""
+const CELL_FNS = (:linear_pk_read_locs, :linear_pk_read_locs_auc)
+
+"""Arity (argument count) of each [`CELL_FNS`](@ref) entry, schedule first."""
+const CELL_FN_ARITY = Dict{Symbol,Int}(:linear_pk_read_locs => 6,
+    :linear_pk_read_locs_auc => 7)
+
+"""Op-column fields each [`CELL_FNS`](@ref) entry reads per subject
+(positional, after the schedule — the generator slices `<sched>_<field>`
+per subject from `op_ends`)."""
+const CELL_FN_OP_FIELDS = Dict{Symbol,Vector{Symbol}}(
+    :linear_pk_read_locs => [:op_type, :op_dt, :op_amount, :op_interval,
+        :op_count, :op_read_idx],
+    :linear_pk_read_locs_auc => [:op_type, :op_dt, :op_amount, :op_interval,
+        :op_count, :op_read_idx])
+
+"""Call args (by NAME) each [`CELL_FNS`](@ref) entry slices per subject
+from a flat op-ordered vector (`view(name, lo:hi)` over the static op
+range — for computed event-frame vectors like the W2 `log_F` provider
+output, which are generated-code locals, not bind columns)."""
+const CELL_FN_SLICED_ARGS = Dict{Symbol,Vector{Symbol}}(
+    :linear_pk_read_locs => [:log_F],
+    :linear_pk_read_locs_auc => [:log_F])
+
+"""Segmented-scan cell calls: per-subject scans over a row series with
+an explicit cumulative-ends vector (no schedule — the nadir runs over
+an obs-axis series, not the op stream). Only the nadir wires into the
+grouped walker (the rest of `TGI_CELL_FUNCTIONS` stays out — the
+joint cell spells latents as elementwise lines)."""
+const SEGMENT_CELL_FNS = (:tgi_segmented_nadir,)
+"""Arity past the function name: change vector + ends column."""
+const SEGMENT_CELL_FN_ARITY =
+    Dict{Symbol,Int}(:tgi_segmented_nadir => 2)
+
+"""Schedule-map gathers a grouped cell may index (`reads[sched.obs_map]`,
+one static int vector per row — the `reactivekernels-use` §7d
+vectorized-gather shape): the per-axis conc-space maps (`obs_map`,
+`ecg_map`, `tgi_map`) plus the `[conc; auc]`-space `conc_map` and
+`tgi_auc_map` (see [`build_linear_pk_schedule`](@ref)). Each map is
+available only when its axis/cell prerequisite holds (see
+[`_sched_available_maps`](@ref)) — undeclared-axis gathers fail closed
+at structure."""
+const SCHEDULE_MAPS = (:obs_map, :ecg_map, :tgi_map, :conc_map, :tgi_auc_map)
+
+"""Bind-materialized columns per schedule (`<sched>_<field>`): the six
+op columns plus `op_ends`, per-obs-row `obs_read`, and the flat
+`obs_map` gather index (see [`build_linear_pk_schedule`](@ref))."""
+const _SCHED_MATERIALIZED_FIELDS =
+    (:op_type, :op_dt, :op_amount, :op_interval, :op_count, :op_read_idx,
+        :op_ends, :obs_read, :obs_map)
+
+"""Per-axis row products, materialized only for declared extra axes."""
+const _SCHED_ECG_FIELDS = (:ecg_read, :ecg_map)
+const _SCHED_TGI_FIELDS = (:tgi_read, :tgi_map)
+
+"""`[conc; auc]`-space maps, materialized only with an AUC cell call
+(`tgi_auc_map` additionally needs the declared tgi axis)."""
+const _SCHED_CONC_FIELDS = (:conc_map,)
+const _SCHED_TGI_AUC_FIELDS = (:tgi_auc_map,)
+"""Cumulative TGI row ends, materialized only with a nadir cell call
+plus the declared tgi axis."""
+const _SCHED_SEG_ENDS_FIELDS = (:tgi_seg_ends,)
+
+"""Whether any top-level cell assignment calls the AUC recurrence
+(the generator expands top-level calls only, so the scan matches it
+exactly — nested calls mis-generate regardless)."""
+function _cell_has_auc_call(assignments::Vector{Pair{Symbol,Any}})
+    for (_, ex) in assignments
+        ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+            ex.args[1] === :linear_pk_read_locs_auc && return true
+    end
+    return false
+end
+
+"""Whether any top-level cell assignment calls the segmented nadir
+(same top-level-only reading as [`_cell_has_auc_call`](@ref))."""
+function _cell_has_nadir_call(assignments::Vector{Pair{Symbol,Any}})
+    for (_, ex) in assignments
+        ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+            ex.args[1] isa Symbol && ex.args[1] in SEGMENT_CELL_FNS &&
+            return true
+    end
+    return false
+end
+
+"""Bind-materialized schedule products beyond [`_SCHED_MATERIALIZED_FIELDS`](@ref):
+per-axis products for declared extra axes, `conc_map` with an AUC
+cell call, `tgi_auc_map` with an AUC cell call plus the declared tgi
+axis, `tgi_seg_ends` with a nadir cell call plus the declared tgi
+axis. Single source for bind materialization, exact-rebuild
+verification, and managed columns."""
+function _sched_extra_fields(sched::LinearPKScheduleSpec,
+        assignments::Vector{Pair{Symbol,Any}})
+    out = Symbol[]
+    sched.ecg !== nothing && append!(out, _SCHED_ECG_FIELDS)
+    sched.tgi !== nothing && append!(out, _SCHED_TGI_FIELDS)
+    if _cell_has_auc_call(assignments)
+        append!(out, _SCHED_CONC_FIELDS)
+        sched.tgi !== nothing && append!(out, _SCHED_TGI_AUC_FIELDS)
+    end
+    if sched.tgi !== nothing && _cell_has_nadir_call(assignments)
+        append!(out, _SCHED_SEG_ENDS_FIELDS)
+    end
+    return out
+end
+
+"""Schedule maps available to a cell: `obs_map` always, per-axis maps
+for declared extra axes, `conc_map` with an AUC cell call,
+`tgi_auc_map` with an AUC cell call plus the declared tgi axis."""
+function _sched_available_maps(sched::LinearPKScheduleSpec,
+        assignments::Vector{Pair{Symbol,Any}})
+    maps = Set{Symbol}([:obs_map])
+    sched.ecg !== nothing && push!(maps, :ecg_map)
+    sched.tgi !== nothing && push!(maps, :tgi_map)
+    if _cell_has_auc_call(assignments)
+        push!(maps, :conc_map)
+        sched.tgi !== nothing && push!(maps, :tgi_auc_map)
+    end
+    return maps
+end
 
 """Whole-column reductions (their single argument must be a bare column)."""
 const REDUCTION_FNS = (:sum, :mean, :std, :var, :minimum, :maximum, :length)
@@ -1279,6 +1613,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_varying_draws(plan)
     _validate_splines(plan)
     _validate_hsgp(plan)
+    _validate_event_lps(plan)
     return nothing
 end
 
@@ -1300,6 +1635,7 @@ function validate_data(plan::StructuralPlan)
     _validate_hsgp_data(plan)
     _validate_kernels_data(plan)
     _validate_r2d2_data(plan)
+    _validate_event_lp_data(plan)
     return nothing
 end
 
@@ -1678,12 +2014,130 @@ function _eval_draws_levels(draws::Vector{VaryingDraws},
     return out
 end
 
+"""Predictor levels (grouped kernels): a predictor consumed ONLY as a
+kernel LP arg is SUBJECT-level (its design rows are subjects); any
+response use makes it obs-level. Mixed use fails closed — split the
+predictor instead."""
+function _predictor_level(plan::StructuralPlan, pname::Symbol)
+    by_kernel = any(kp -> any(((p, _),) -> p === pname, kp.lp_args),
+        plan.kernel_plates)
+    by_resp = any(r -> _response_uses_predictor(r, pname), plan.responses)
+    by_kernel && by_resp &&
+        _fail(:plan, "predictor `$pname` feeds both a kernel LP arg and " *
+              "a response (mixed-level predictors are not supported — " *
+              "split it into a subject-level and an obs-level predictor)")
+    by_kernel && return :subject
+    return :obs
+end
+
+function _response_uses_predictor(r::LikelihoodSpec, pname::Symbol)
+    r.predictor === pname && return true
+    pname in r.extra_predictors && return true
+    r.scale isa ScalePredictorRef && r.scale.predictor === pname &&
+        return true
+    return false
+end
+
+"""Term columns of subject-level predictors (n_sub rows by design):
+exempt from the uniform-`n_obs` rule like kernel-managed columns (only
+bound columns count — a summand's basis id is not a column and fails
+loudly under kernel rules instead). Transitive through derived
+assignments: a data column feeding ONLY subject-level consumers inherits
+subject level (in-graph `standardize`, etc.). A pulled column that ALSO
+feeds obs-level consumers (responses, slices, obs predictors, weights,
+evidence, trials) fails loudly — mixed-level lengths are genuinely
+ambiguous. (Directly-shared columns across levels predate this rule and
+keep their historical behavior; varying-group sharing across levels is
+out of scope.)"""
+function _subject_predictor_columns(plan::StructuralPlan)
+    out = Set{Symbol}()
+    seed = Set{Symbol}()
+    for pred in plan.predictors
+        _predictor_level(plan, pred.name) === :subject || continue
+        for t in pred.terms, c in t.columns
+            push!(seed, c)
+            haskey(plan.columns, c) && push!(out, c)
+        end
+    end
+    if !isempty(seed)
+        deps = _assignment_name_deps(plan)
+        # Fixpoint: subject names (data or not-yet-materialized deriveds)
+        # pull their assignment sources in; bound data sources join `out`.
+        queue = collect(seed)
+        seen = copy(seed)
+        while !isempty(queue)
+            for src in get(deps, pop!(queue), ())
+                src in seen && continue
+                push!(seen, src)
+                haskey(plan.columns, src) && push!(out, src)
+                push!(queue, src)
+            end
+        end
+        # Mixed-level: pulled data columns feeding obs-level consumers.
+        obs = Set{Symbol}()
+        for r in plan.responses
+            push!(obs, r.response)
+            r.weights isa Symbol && push!(obs, r.weights)
+            r.trials isa Symbol && push!(obs, r.trials)
+            if r.evidence !== nothing && r.evidence.kind !== :none
+                r.evidence.lower isa Symbol && push!(obs, r.evidence.lower)
+                r.evidence.upper isa Symbol && push!(obs, r.evidence.upper)
+            end
+        end
+        for kp in plan.kernel_plates, (c, _, _) in kp.slices
+            push!(obs, c)
+        end
+        for pred in plan.predictors
+            _predictor_level(plan, pred.name) === :obs || continue
+            for t in pred.terms, c in t.columns
+                push!(obs, c)
+            end
+        end
+        for c in out
+            c in obs &&
+                _fail(c, "column feeds both subject-level and obs-level " *
+                      "consumers (mixed-level lengths are ambiguous — " *
+                      "bind explicit per-level copies)")
+        end
+    end
+    return out
+end
+
+"""Assignment name dependencies: derived/assignment name → referenced
+names (function heads included — callers intersect with bound columns)."""
+function _assignment_name_deps(plan::StructuralPlan)
+    deps = Dict{Symbol,Set{Symbol}}()
+    for a in plan.assignments
+        deps[a.name] = _expr_names(a.expr)
+    end
+    for d in plan.derived
+        deps[d.name] = _expr_names(d.expr)
+    end
+    return deps
+end
+
+function _expr_names(ex)::Set{Symbol}
+    out = Set{Symbol}()
+    _expr_names!(out, ex)
+    return out
+end
+
+function _expr_names!(out::Set{Symbol}, ex)
+    ex isa Symbol && (push!(out, ex); return nothing)
+    ex isa Expr || return nothing
+    for a in ex.args
+        _expr_names!(out, a)
+    end
+    return nothing
+end
+
 function _validate_columns(plan::StructuralPlan)
     plan.n_obs > 0 || _fail(:plan, "n_obs must be positive, got $(plan.n_obs)")
     managed = Set{Symbol}()
     for kp in plan.kernel_plates
         union!(managed, _kernel_managed_columns(kp))
     end
+    union!(managed, _subject_predictor_columns(plan))
     for (name, col) in plan.columns
         # Kernel-managed columns (slices + scalar expansions) carry two
         # lengths by design — they validate under kernel rules, not here.
@@ -1907,21 +2361,184 @@ function _validate_hsgp_data(plan::StructuralPlan)
     return nothing
 end
 
-# Panel-kernel (KernelPlate) structure: everything provable without data.
-# Panel v1: at most one plate per model; a plate carries the ONLY
+# Event-LP structure (see `_validate_event_lps`): fixed provider
+# name, declared schedule (at most one LP per schedule), admitted
+# k/c, sane hand-built fits, and call linkage (a declared LP feeds
+# at least one 7-arg cell call on its own schedule; a 7-arg call
+# needs its schedule's LP — an unbound `log_F` local must never
+# reach codegen).
+function _validate_event_lps(plan::StructuralPlan)
+    els = plan.event_lps
+    names = [el.name for el in els]
+    length(unique(names)) == length(names) ||
+        _fail(:plan, "duplicate event-LP names")
+    labels = [el.label for el in els]
+    length(unique(labels)) == length(labels) ||
+        _fail(:plan, "duplicate event-LP labels")
+    scheds = [s.name for kp in plan.kernel_plates for s in kp.schedules]
+    for el in els
+        el.name === EVENT_LP_NAME ||
+            _fail(el.label, "event-LP name must be `$(EVENT_LP_NAME)` " *
+                  "(the per-subject expansion slices the call arg by " *
+                  "name — one seam, got `$(el.name)`)")
+        el.schedule in scheds ||
+            _fail(el.label, "event-LP `$(el.name)` schedule " *
+                  "`$(el.schedule)` is not declared " *
+                  "(`$(el.schedule) = linear_pk_schedule(...)`)")
+        el.k isa Int && el.k >= 2 ||
+            _fail(el.label, "event-LP `$(el.name)` k must be an integer " *
+                  "≥ 2 (the truncation floor needs k²−1 > 0; " *
+                  "V2: k = 5, got $(repr(el.k)))")
+        el.c isa Real && isfinite(Float64(el.c)) && Float64(el.c) > 1 ||
+            _fail(el.label, "event-LP `$(el.name)` c must be finite and " *
+                  "exceed 1 (V2: c = 1.5, got $(repr(el.c)))")
+        if el.fit !== nothing
+            mu, L = el.fit
+            isfinite(mu) && isfinite(L) && L > 0 ||
+                _fail(el.label, "event-LP `$(el.name)` fit (mu, L) must " *
+                      "be finite with L > 0, got ($(mu), $(L))")
+        end
+    end
+    # (At most one LP per schedule needs no separate check: the fixed
+    # provider name makes the name-table duplicate rule subsume it —
+    # W2 admits a single event-LP per model.)
+    # Call linkage over grouped-kernel assignments: the cell walker
+    # owns precise 7-arg shape rejection; here every 7-arg call needs
+    # its schedule's declared LP, and every declared LP needs a call.
+    calls = Tuple{Symbol,Symbol}[]
+    for kp in plan.kernel_plates, (_, ex) in kp.assignments
+        _collect_event_lp_calls!(calls, ex)
+    end
+    for (sched, arg) in calls
+        any(el -> el.name === arg && el.schedule === sched, els) ||
+            _fail(:plan, "cell call threads event-LP `$arg` on " *
+                  "schedule `$sched`, which is not declared " *
+                  "(`$arg = linear_pk_log_f($sched; k = 5)`)")
+    end
+    for el in els
+        any(((s, a),) -> s === el.schedule && a === el.name, calls) ||
+            _fail(el.label, "event-LP `$(el.name)` is never called " *
+                  "(declared LPs must feed a 7-arg cell call — " *
+                  "unfed LPs would sample dead parameters)")
+    end
+    return nothing
+end
+
+# 7-arg event-LP cell calls a grouped cell makes (schedule, arg2):
+# lenient collection — the cell walker owns precise rejection. Eight
+# expr args (fn + schedule + log_F + 5 LPs) is the literal event form
+# (NOT arity-relative: the AUC sibling shares the shape under its own
+# arity, and a relative rule would miss it).
+function _collect_event_lp_calls!(calls::Vector{Tuple{Symbol,Symbol}}, ex)
+    ex isa Expr || return nothing
+    if ex.head === :call && length(ex.args) == 8 &&
+            ex.args[1] isa Symbol && ex.args[1] in CELL_FNS &&
+            ex.args[2] isa Symbol && ex.args[3] isa Symbol
+        push!(calls, (ex.args[2], ex.args[3]))
+    end
+    for a in ex.args
+        _collect_event_lp_calls!(calls, a)
+    end
+    return nothing
+end
+
+# Event-LP data: the op_log_dose bind product verified by exact
+# rebuild (never trusted — the schedule precedent), the fit filled
+# and rebuild-identical, and the truncation floor below the V2
+# prior's upper bound (SB `_linear_pk_hsgp_lower` errors the same
+# way).
+function _validate_event_lp_data(plan::StructuralPlan)
+    for el in plan.event_lps
+        col = _sched_col_name(el.schedule, :op_log_dose)
+        haskey(plan.columns, col) ||
+            _fail(el.label, "event-LP `$(el.name)` product `$col` " *
+                  "missing (bind_data materializes the event axis)")
+        tcol = _sched_col_name(el.schedule, :op_type)
+        acol = _sched_col_name(el.schedule, :op_amount)
+        (haskey(plan.columns, tcol) && haskey(plan.columns, acol)) ||
+            _fail(el.label, "event-LP `$(el.name)` schedule products " *
+                  "missing (bind_data materializes op columns)")
+        want = try
+            linear_pk_op_log_dose(plan.columns[tcol], plan.columns[acol])
+        catch err
+            err isa ContractValidationError &&
+                _fail(el.label, "event-LP `$(el.name)`: $(err.message)")
+            rethrow()
+        end
+        plan.columns[col] == want ||
+            _fail(el.label, "event-LP `$(el.name)` product `$col` is " *
+                  "not the event-axis build (bind_data materializes " *
+                  "it — a hand-bound plan must carry the identical " *
+                  "product)")
+        el.fit === nothing &&
+            _fail(el.label, "event-LP `$(el.name)` fit not filled at " *
+                  "bind (one (mu, L) over `$col`)")
+        mu, L = el.fit
+        rmu, rL = _hsgp_axis_fit(plan.columns[col], el.c, el.label,
+            "event-LP `$(el.name)` fit")
+        (mu, L) == (rmu, rL) ||
+            _fail(el.label, "event-LP `$(el.name)` fit ($mu, $L) is " *
+                  "not the bind fit ($rmu, $rL)")
+        floor = only(_hsgp_floors([el.k], [(mu, L)], true))
+        floor < _EVENT_LP_RHO_PRIOR_HI ||
+            _fail(el.label, "event-LP `$(el.name)` HSGP truncation " *
+                  "lower bound $floor is not below " *
+                  "$(_EVENT_LP_RHO_PRIOR_HI) (SB errors the same way)")
+    end
+    return nothing
+end
+
+# Event-LP binds: fit (mu, L) over the materialized op_log_dose
+# column (the shared `_hsgp_axis_fit` core) + the V2 floor gate.
+# Runs AFTER kernel resolution (the axis column materializes there).
+function _fit_event_lps(plan::StructuralPlan,
+        columns::AbstractDict{Symbol})
+    isempty(plan.event_lps) && return LinearPKEventLPSpec[]
+    out = LinearPKEventLPSpec[]
+    for el in plan.event_lps
+        col = _sched_col_name(el.schedule, :op_log_dose)
+        haskey(columns, col) ||
+            _fail(el.label, "event-LP `$(el.name)`: axis column $col " *
+                  "is not bound (bind_data materializes it from the " *
+                  "schedule — internal ordering)")
+        axiscol = _vector_column(columns, col, el.label,
+            "event-LP axis column")
+        fit = _hsgp_axis_fit(axiscol, el.c, el.label,
+            "event-LP `$(el.name)` axis column $col")
+        floor = only(_hsgp_floors([el.k], [fit], true))
+        floor < _EVENT_LP_RHO_PRIOR_HI ||
+            _fail(el.label, "event-LP `$(el.name)` HSGP truncation " *
+                  "lower bound $floor is not below " *
+                  "$(_EVENT_LP_RHO_PRIOR_HI) (SB errors the same way)")
+        push!(out, LinearPKEventLPSpec(el.name, el.schedule, el.k, el.c,
+            fit, el.label))
+    end
+    return out
+end
+
+# Kernel (KernelPlate) structure: everything provable without data.
+# v1: at most one kernel per model; a kernel carries the ONLY
 # likelihood (no top-level responses alongside — BRM routes kernel models
-# away from the GLM flow); grouping is ABSENT (implicit 1:n subjects —
-# structural, no sentinel, pinned here + tests).
+# away from the GLM flow). Panel plates (no schedules) follow
+# `_validate_panel_kernel` (grouping ABSENT — implicit 1:n subjects,
+# structural, no sentinel, pinned here + tests); grouped plates follow
+# `_validate_grouped_kernel`.
 function _validate_kernels(plan::StructuralPlan)
     plates = plan.kernel_plates
     length(plates) <= 1 ||
-        _fail(:plan, "panel v1 admits at most one kernel plate per model " *
+        _fail(:plan, "v1 admits at most one kernel plate per model " *
               "(got $(length(plates)))")
     isempty(plates) && return nothing
+    # Mixed-level predictors (a response and a kernel LP arg sharing one
+    # definition) fail with the precise message before the only-likelihood
+    # gate below (which would otherwise mask the use-site confusion).
+    for kp in plates, (p, _) in kp.lp_args
+        _predictor_level(plan, p)
+    end
     kp = only(plates)
     isempty(plan.responses) ||
         _fail(kp.label, "a kernel plate carries the only likelihood " *
-              "(panel v1: no top-level responses alongside `$(kp.result)`)")
+              "(v1: no top-level responses alongside `$(kp.result)`)")
     # Name hygiene + collisions (result, slice params, cell locals) live in
     # the global `_validate_name_tables` gate via `_kernel_all_names`.
     _check_name_hygiene(kp.label)
@@ -1930,6 +2547,22 @@ function _validate_kernels(plan::StructuralPlan)
             _fail(kp.label, "subject count must be a positive integer, " *
                   "got $(kp.subjects)")
     end
+    if _is_grouped_kernel(kp)
+        _validate_grouped_kernel(plan, kp)
+    else
+        _validate_panel_kernel(plan, kp)
+    end
+    return nothing
+end
+
+# Panel-kernel structure (see `_validate_kernels`).
+function _validate_panel_kernel(plan::StructuralPlan, kp::KernelPlate)
+    length(kp.obs) == 1 ||
+        _fail(kp.label, "panel v1 admits exactly one in-cell observation " *
+              "(got $(length(kp.obs)))")
+    isempty(kp.lp_args) ||
+        _fail(kp.label, "panel plates take no LP args (LP args are the " *
+              "grouped form — declare a schedule)")
     if kp.timepoints isa Int
         kp.timepoints > 0 ||
             _fail(kp.label, "timepoint count must be a positive integer, " *
@@ -1957,27 +2590,173 @@ function _validate_kernels(plan::StructuralPlan)
         push!(cell_locals, nm)
     end
     # The single in-cell observation (Gaussian-identity v1).
-    obs = kp.obs
+    obs = only(kp.obs)
+    _validate_kernel_obs_ref(kp, obs, params, known, false)
+    kp.collected in union(Set{Symbol}(params), cell_locals) ||
+        _fail(kp.label, "collected result `$(kp.collected)` is not a cell " *
+              "name (slice param or cell-local assignment)")
+    return nothing
+end
+
+# One in-cell observation node (panel and grouped share the shape):
+# response a slice param; panel Gaussian-only, grouped the joint
+# families too; location/scale/params names-or-literals resolving to
+# cell/model names (literals finite; Gaussian scale literals positive —
+# positional-second args of multi-param families take no positivity).
+function _validate_kernel_obs_ref(kp::KernelPlate, obs::KernelObs,
+        params::Vector{Symbol}, known::Set{Symbol}, grouped::Bool)
     obs.response in params ||
         _fail(kp.label, "kernel obs response `$(obs.response)` is not a " *
               "slice param (responses enter the cell as slices)")
-    obs.family === GaussianFam ||
-        _fail(kp.label, "panel v1 admits a Gaussian in-cell observation " *
-              "only, got $(obs.family)")
+    if grouped
+        obs.family in (GaussianFam, CensoredAddpropnormalFam,
+                TgiCategoryFam, TgiResponseFam, TgiCensoredFam) ||
+            _fail(kp.label, "grouped kernels admit in-cell observations " *
+                  "`Normal.(...)`, `CensoredAddpropnormal.(...)`, " *
+                  "`TgiCategory.(...)`, `TgiResponse.(...)`, " *
+                  "`TgiCensored.(...)` only, got $(obs.family)")
+    else
+        obs.family === GaussianFam ||
+            _fail(kp.label, "kernel v1 admits a Gaussian in-cell observation " *
+                  "only, got $(obs.family)")
+    end
+    if obs.family === GaussianFam && !isempty(obs.params)
+        _fail(kp.label, "Gaussian in-cell observations take no `params` " *
+              "(got $(obs.params))")
+    end
     for (nm, ref) in ((:location, obs.location), (:scale, obs.scale))
         if ref isa Number && !(ref isa Bool)
-            (isfinite(ref) && (nm === :location || ref > 0)) ||
+            positive = nm === :scale && obs.family === GaussianFam
+            (isfinite(ref) && (!positive || ref > 0)) ||
                 _fail(kp.label, "kernel obs $nm literal must be finite" *
-                      (nm === :scale ? " positive" : "") * ", got $ref")
+                      (positive ? " positive" : "") * ", got $ref")
         elseif ref isa Symbol
             ref in known ||
                 _fail(kp.label, "kernel obs $nm `$ref` is neither a cell " *
                       "name nor a model-level scalar (cross-cell refs " *
                       "fail closed)")
+            grouped && ref in _lp_cell_params(kp) &&
+                _fail(kp.label, "kernel obs $nm `$ref` is an LP cell " *
+                      "param — gather explicitly (`$ref[subj_map]` " *
+                      "with a bound subject column; bare LP cell " *
+                      "params do not lower as obs args)")
         else
             _fail(kp.label, "kernel obs $nm must be a cell/model name or " *
                   "a numeric literal, got $(repr(ref))")
         end
+    end
+    for ref in obs.params
+        if ref isa Number && !(ref isa Bool)
+            isfinite(ref) ||
+                _fail(kp.label, "kernel obs params literal must be " *
+                      "finite, got $ref")
+        elseif ref isa Symbol
+            ref in known ||
+                _fail(kp.label, "kernel obs params `$ref` is neither a " *
+                      "cell name nor a model-level scalar (cross-cell " *
+                      "refs fail closed)")
+            grouped && ref in _lp_cell_params(kp) &&
+                _fail(kp.label, "kernel obs params `$ref` is an LP cell " *
+                      "param — gather explicitly (`$ref[subj_map]` " *
+                      "with a bound subject column; bare LP cell " *
+                      "params do not lower as obs args)")
+        else
+            _fail(kp.label, "kernel obs params must be a cell/model name " *
+                  "or a numeric literal, got $(repr(ref))")
+        end
+    end
+    return nothing
+end
+
+"""Term kinds a subject-level predictor may carry in grouped kernels
+(design over subject columns; summands and per-cell latents need
+row-alignment work and fail closed). `VaryingEffectTerm` is sound here:
+subject rows ARE subjects, so the draws' per-level `r` needs no gather —
+`_ppl_gidx_<group>` is positional 1:n_sub (level order must match
+subject order; the joint parity harness proves it numerically)."""
+const _SUBJECT_TERM_KINDS =
+    (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, VaryingEffectTerm)
+
+# Grouped-kernel structure (see `_validate_kernels`): schedules resolve,
+# LP args name subject-exclusive identity predictors with admitted terms,
+# the cell follows the grouped vocabulary, obs is a non-empty list.
+function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
+    length(kp.schedules) == 1 ||
+        _fail(kp.label, "grouped v1 takes exactly one schedule " *
+              "(got $(length(kp.schedules)) — multi-schedule kernels " *
+              "are sequenced after the PK slice)")
+    kp.timepoints === nothing ||
+        _fail(kp.label, "grouped kernels take no timepoints (ragged axes " *
+              "have no rectangular T)")
+    sched = only(kp.schedules)
+    raw = [sched.obs_subj, sched.obs_time, sched.dose_subj, sched.dose_time,
+        sched.dose_amt]
+    sched.ecg !== nothing && append!(raw, [sched.ecg[1], sched.ecg[2]])
+    sched.tgi !== nothing && append!(raw, [sched.tgi[1], sched.tgi[2]])
+    length(unique(raw)) == length(raw) ||
+        _fail(kp.label, "schedule `$(sched.name)` reuses a raw column " *
+              "($(raw)) — obs/dose/extra axes need distinct columns)")
+    slices = kp.slices
+    isempty(slices) &&
+        _fail(kp.label, "kernel plate `$(kp.result)` takes at least one slice")
+    cols = [c for (c, _, _) in slices]
+    length(unique(cols)) == length(cols) ||
+        _fail(kp.label, "duplicate slice columns $(cols)")
+    params = [p for (_, p, _) in slices]
+    for (_, _, kind) in slices
+        kind in (:response, :unknown) ||
+            _fail(kp.label, "grouped slice kind must be :response (bound) " *
+                  "or :unknown (pre-bind), got $(repr(kind))")
+    end
+    isempty(kp.lp_args) &&
+        _fail(kp.label, "grouped kernels take at least one LP arg " *
+              "(`kernel(resp, lp...; subjects)` — LP values gather per " *
+              "subject in-cell)")
+    pnames = [p for (p, _) in kp.lp_args]
+    length(unique(pnames)) == length(pnames) ||
+        _fail(kp.label, "duplicate LP-arg predictors $(pnames)")
+    cparams = [c for (_, c) in kp.lp_args]
+    length(unique(cparams)) == length(cparams) ||
+        _fail(kp.label, "duplicate LP-arg cell params $(cparams)")
+    for (p, _) in kp.lp_args
+        i = findfirst(q -> q.name === p, plan.predictors)
+        i === nothing &&
+            _fail(kp.label, "kernel LP arg `$p` is not a predictor (LP " *
+                  "args name subject-level predictors; model scalars " *
+                  "enter the cell as globals)")
+        pred = plan.predictors[i]
+        pred.link === IdentityLink ||
+            _fail(kp.label, "kernel LP arg `$p` needs IdentityLink " *
+                  "(got $(pred.link) — subject LPs feed the cell raw)")
+        _predictor_level(plan, p) === :subject ||
+            _fail(kp.label, "kernel LP arg `$p` is unreachable " *
+                  "(internal: mixed-level predictors fail in " *
+                  "`_predictor_level`)")
+        for t in pred.terms
+            t.kind in _SUBJECT_TERM_KINDS ||
+                _fail(kp.label, "subject predictor `$p` carries a " *
+                      "$(t.kind) term (grouped v1 admits " *
+                      "$(_SUBJECT_TERM_KINDS) — summands and per-cell " *
+                      "latents are sequenced after the PK slice)")
+        end
+    end
+    # Cell assignments in order: slice params + LP cell params + earlier
+    # locals + model-scope scalars (schedule handles are compile-time and
+    # enter only as call first-args / gather roots — never as values).
+    known = union(Set{Symbol}(params),
+        Set{Symbol}(c for (_, c) in kp.lp_args), _union_names(plan))
+    schednames = Set{Symbol}(s.name for s in kp.schedules)
+    cell_locals = Set{Symbol}()
+    for (nm, ex) in kp.assignments
+        _collect_grouped_cell_refs!(Symbol[], ex, kp, known, schednames)
+        push!(known, nm)
+        push!(cell_locals, nm)
+    end
+    isempty(kp.obs) &&
+        _fail(kp.label, "grouped kernels take at least one in-cell " *
+              "observation")
+    for obs in kp.obs
+        _validate_kernel_obs_ref(kp, obs, params, known, true)
     end
     kp.collected in union(Set{Symbol}(params), cell_locals) ||
         _fail(kp.label, "collected result `$(kp.collected)` is not a cell " *
@@ -2230,12 +3009,417 @@ function _collect_kernel_cell_condition!(refs, ex, kp::KernelPlate, known::Set{S
     return nothing
 end
 
+# Grouped-kernel cell vocabulary: calls to CELL_FNS (schedule first),
+# schedule-map gathers (`reads[sched.obs_map]`) and prep-map gathers
+# (`v[map]` with a bound integer column), dotted ops/math, undotted
+# arithmetic over scalars, `ifelse`, bare names and numeric literals.
+# Reductions, whole-column functions, other indexing, loops, branches,
+# nested observations, and unknown names fail closed. Shapes
+# (scalar/obs-axis/read-space) resolve at bind
+# (`_grouped_cell_shapes`); this walker checks names + call/gather
+# structure only.
+#
+# LP cell params are per-subject scalars: bare uses admit ONLY as
+# direct cell-call args (`lp_ok`, threaded below) or gather sources
+# (checked in `_collect_grouped_cell_gather!`) — every other bare use
+# fails closed (flat verbatim emission cannot resolve a per-subject
+# name, so the LP value gathers per row explicitly).
+"""LP cell params of a grouped plate (the per-subject gatherable names)."""
+_lp_cell_params(kp::KernelPlate) = Set{Symbol}(c for (_, c) in kp.lp_args)
+"""Response-slice params of a grouped plate (gather leaves, never sources)."""
+_slice_params(kp::KernelPlate) = Set{Symbol}(p for (_, p, _) in kp.slices)
+function _collect_grouped_cell_refs!(refs, ex, kp::KernelPlate,
+        known::Set{Symbol}, schednames::Set{Symbol}, lp_ok::Bool = false)
+    label = kp.label
+    ex isa Number && return nothing
+    ex isa LineNumberNode && return nothing
+    if ex isa Symbol
+        ex in schednames &&
+            _fail(label, "schedule `$ex` is a compile-time handle, not a " *
+                  "value (pass it as a cell-call first arg or a gather " *
+                  "root: `linear_pk_read_locs($ex, ...)` / " *
+                  "`reads[$ex.obs_map]`)")
+        ex in known ||
+            _fail(label, "cell expression references unknown name `$ex` " *
+                  "(slices + LP cell params + earlier cell locals + " *
+                  "model-level scalars only)")
+        !lp_ok && ex in _lp_cell_params(kp) &&
+            _fail(label, "cell expression uses bare LP cell param `$ex` " *
+                  "— gather explicitly (`$ex[subj_map]` with a bound " *
+                  "subject column) or pass `$ex` to a cell call " *
+                  "(per-subject names do not lower in flat verbatim code)")
+        push!(refs, ex)
+        return nothing
+    end
+    ex isa Expr ||
+        _fail(label, "unsupported literal $(repr(ex)) (numeric literals only)")
+    head = ex.head
+    if head === :call
+        fn = ex.args[1]
+        if fn isa Symbol && fn in ELEMENTWISE_OPS
+            for arg in ex.args[2:end]
+                _collect_grouped_cell_refs!(refs, arg, kp, known, schednames)
+            end
+            return nothing
+        end
+        if fn isa Symbol && fn in REDUCTION_FNS
+            return _fail(label, "reduction `$fn` does not lower in a cell " *
+                                "(aggregate in the obs likelihood, not " *
+                                "the cell)")
+        end
+        if fn isa Symbol && fn in VECTOR_FNS
+            return _fail(label, "whole-column `$fn` does not lower in a " *
+                                "cell (whole-model constructs only)")
+        end
+        if fn isa Symbol && fn in CELL_FNS
+            args = ex.args[2:end]
+            want = CELL_FN_ARITY[fn]
+            # The event-LP form threads the provider's flat vector
+            # second (SB position, after the schedule): v1 takes it
+            # optionally (6 or 7 args), the AUC cell takes it
+            # mandatorily (7 args — the runtime has no LP-less form).
+            seven = length(args) == want + 1
+            admit = fn === :linear_pk_read_locs ?
+                (length(args) == want || seven) : length(args) == want
+            admit ||
+                _fail(label, "cell call `$fn` takes $want arguments " *
+                      "(a schedule plus $(want - 1) cell/model names)" *
+                      (fn === :linear_pk_read_locs ?
+                       " or $(want + 1) with the event-LP " *
+                       "`$(EVENT_LP_NAME)` second" :
+                       " with the event-LP `$(EVENT_LP_NAME)` second") *
+                      ", got $(length(args))")
+            s = args[1]
+            s isa Symbol && s in schednames ||
+                _fail(label, "cell call `$fn` takes a declared schedule " *
+                      "first (got $(repr(s)) — admitted schedules: " *
+                      "$(sort!(collect(schednames))))")
+            rest = args[2:end]
+            if seven || fn === :linear_pk_read_locs_auc
+                # The event-LP second arg is the provider's flat
+                # vector: the fixed seam name only — structure
+                # verifies the NAME and skips collection (the
+                # provider output is a generated local, not a plan
+                # parameter/assignment, so it is not cell-known —
+                # the skip is load-bearing, not cosmetic). The
+                # per-subject expansion slices the call arg by NAME.
+                args[2] === EVENT_LP_NAME ||
+                    _fail(label, "cell call `$fn` second argument must " *
+                          "be the event-LP `$(EVENT_LP_NAME)` (got " *
+                          "$(repr(args[2])) — the 7-arg form is " *
+                          "`$fn(sched, log_F, lp...)`)")
+                rest = args[3:end]
+            end
+            # Direct call args: the one verbatim position (besides
+            # gather sources) where bare LP cell params admit — the
+            # per-subject expansion resolves them. Nested positions
+            # keep the default (fail-early on shapes generation
+            # cannot resolve).
+            for arg in rest
+                _collect_grouped_cell_refs!(refs, arg, kp, known,
+                    schednames, true)
+            end
+            return nothing
+        end
+        if fn isa Symbol && fn in SEGMENT_CELL_FNS
+            args = ex.args[2:end]
+            want = SEGMENT_CELL_FN_ARITY[fn]
+            length(args) == want ||
+                _fail(label, "cell call `$fn` takes $want arguments " *
+                      "(a change vector + a cumulative-ends integer " *
+                      "column: `$fn(change, ends)`), got $(length(args))")
+            # The change series is an ordinary cell ref (bare LPs fail
+            # — a per-subject scalar is not a row series); the ends
+            # are a putative bind column (bind proves bound-ness +
+            # the segment contract).
+            _collect_grouped_cell_refs!(refs, args[1], kp, known,
+                schednames)
+            ends = args[2]
+            ends isa Symbol ||
+                _fail(label, "cell call `$fn` ends argument must be a " *
+                      "bound integer column name, got $(repr(ends))")
+            ends in schednames &&
+                _fail(label, "schedule `$ends` is a compile-time " *
+                      "handle, not a value (ends are a bound integer " *
+                      "column: `$fn(change, ends)`)")
+            ends in known &&
+                _collect_grouped_cell_refs!(refs, ends, kp, known,
+                    schednames)
+            return nothing
+        end
+        if fn isa Symbol && fn in ASSIGNMENT_FNS
+            for arg in ex.args[2:end]
+                _collect_grouped_cell_refs!(refs, arg, kp, known, schednames)
+            end
+            return nothing
+        end
+        fn isa Symbol && startswith(string(fn), ".") &&
+            _fail(label, "dotted operator $fn is not in the grouped-v1 " *
+                         "cell vocabulary")
+        return _fail(label, "call `$fn` is not in the grouped-v1 cell " *
+                            "vocabulary (cell calls: $(CELL_FNS))")
+    end
+    head === :. &&
+        return _collect_grouped_cell_dot!(refs, ex, kp, known, schednames)
+    if head === :ref
+        return _collect_grouped_cell_gather!(refs, ex, kp, known, schednames)
+    end
+    head === :(=) && _fail(label, "nested assignment does not lower in a cell")
+    head === :kw &&
+        _fail(label, "keyword arguments do not lower in a cell")
+    return _fail(label, "unsupported expression head $head in a cell " *
+                        "(calls + gathers + elementwise only)")
+end
+
+function _collect_grouped_cell_dot!(refs, ex, kp::KernelPlate,
+        known::Set{Symbol}, schednames::Set{Symbol})
+    label = kp.label
+    length(ex.args) == 2 && ex.args[1] isa Symbol && ex.args[2] isa Expr &&
+        ex.args[2].head === :tuple ||
+        return _fail(label, "field access does not lower in a cell " *
+                            "(dotted calls take `f.(...)`; schedule maps " *
+                            "gather as `reads[sched.obs_map]`)")
+    f = ex.args[1]
+    args = ex.args[2].args
+    if f === :ifelse
+        length(args) == 3 ||
+            _fail(label, "`ifelse` takes `ifelse.(condition, x, y)`")
+        _collect_grouped_cell_condition!(refs, args[1], kp, known, schednames)
+        for arg in args[2:end]
+            _collect_grouped_cell_refs!(refs, arg, kp, known, schednames)
+        end
+        return nothing
+    end
+    f in ELEMENTWISE_FNS ||
+        _fail(label, "dotted call `$f.(...)` is not in the grouped-v1 cell " *
+                     "vocabulary")
+    for arg in args
+        _collect_grouped_cell_refs!(refs, arg, kp, known, schednames)
+    end
+    return nothing
+end
+
+function _collect_grouped_cell_condition!(refs, ex, kp::KernelPlate,
+        known::Set{Symbol}, schednames::Set{Symbol})
+    label = kp.label
+    if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+            ex.args[1] in ELEMENTWISE_COMPARISONS
+        return _collect_grouped_cell_refs!(refs, ex, kp, known, schednames)
+    end
+    ex isa Symbol || return _fail(label, "`ifelse` condition must be a " *
+                                          "comparison (`x .< y`) or a bare " *
+                                          "cell/model boolean name")
+    ex in known ||
+        _fail(label, "`ifelse` condition `$ex` is not a cell or " *
+                     "model-level name")
+    push!(refs, ex)
+    return nothing
+end
+
+# Admitted indexing shapes: `reads[sched.map]` (a cell vector
+# gathered by a schedule map, a static int vector at codegen) and
+# `v[map]` (gathered by a plain-Symbol bound integer column — prep
+# maps and subject columns). Sources are cell-call results, LP cell
+# params (the generator rewrites them to LP vectors), or cell locals;
+# slices and model scalars fail at shape (bind proves spaces).
+function _collect_grouped_cell_gather!(refs, ex, kp::KernelPlate,
+        known::Set{Symbol}, schednames::Set{Symbol})
+    label = kp.label
+    length(ex.args) == 2 || _fail(label, "indexing in a cell takes one " *
+        "index (`v[sched.map]` or `v[map]`), got $(repr(ex))")
+    vec, idx = ex.args[1], ex.args[2]
+    vec isa Symbol && vec in known ||
+        _fail(label, "gather source must be a cell name, got $(repr(vec))")
+    push!(refs, vec)
+    if idx isa Symbol
+        idx in schednames &&
+            _fail(label, "schedule `$idx` is a compile-time handle, not " *
+                  "a value (gather by one of its maps: " *
+                  "`reads[$idx.obs_map]`)")
+        idx in known &&
+            _fail(label, "gather index `$idx` names a cell/model value " *
+                  "(gather indices are schedule maps like " *
+                  "`reads[sched.obs_map]` or bound integer columns — " *
+                  "typo'd column?)")
+        # A putative bind column: bind proves bound + integer-valued +
+        # range + length (shapes + prep validators).
+        return nothing
+    end
+    idx isa Expr && idx.head === :. && length(idx.args) == 2 &&
+        idx.args[1] isa Symbol && idx.args[2] isa QuoteNode ||
+        _fail(label, "gather index must be a schedule map " *
+              "(`reads[sched.obs_map]`) or a bound integer column, " *
+              "got $(repr(idx))")
+    s, m = idx.args[1], idx.args[2].value
+    s in schednames ||
+        _fail(label, "gather schedule `$s` is not declared (admitted: " *
+              "$(sort!(collect(schednames))))")
+    m in SCHEDULE_MAPS ||
+        _fail(label, "schedule `$s` has no map `$m` (admitted maps: " *
+              "$(SCHEDULE_MAPS))")
+    spec = only(sp for sp in kp.schedules if sp.name === s)
+    m in _sched_available_maps(spec, kp.assignments) ||
+        _fail(label, "schedule `$s` map `$m` is not available " *
+              "($(_sched_map_prereq(spec, m, kp.assignments)))")
+    return nothing
+end
+
+# Prerequisite guidance for an unavailable schedule map (the caller
+# proved `m` is a known map on a declared schedule — exactly one
+# condition below fires).
+function _sched_map_prereq(sched::LinearPKScheduleSpec, m::Symbol,
+        assignments::Vector{Pair{Symbol,Any}})
+    if m === :ecg_map || m === :tgi_map
+        ax = m === :ecg_map ? :ecg : :tgi
+        return "axis `$ax` is not declared (`$(sched.name) = " *
+               "linear_pk_schedule(..., $ax = (subj, time))`)"
+    end
+    if !_cell_has_auc_call(assignments)
+        return "`$m` needs an AUC cell call " *
+               "(`linear_pk_read_locs_auc`) in the cell"
+    end
+    return "`$m` needs the declared tgi axis (`$(sched.name) = " *
+           "linear_pk_schedule(..., tgi = (subj, time))`)"
+end
+
+# One declared extra read axis as builder input (`nothing` when
+# undeclared): both columns must be bound.
+function _grouped_schedule_axis(sched::LinearPKScheduleSpec,
+        columns::Dict{Symbol,ColumnData}, axis::Symbol, kp::KernelPlate)
+    spec = axis === :ecg ? sched.ecg : sched.tgi
+    spec === nothing && return nothing
+    for c in spec
+        haskey(columns, c) ||
+            _fail(kp.label, "schedule `$(sched.name)` $axis column `$c` " *
+                  "is not bound")
+    end
+    return (columns[spec[1]], columns[spec[2]])
+end
+
+# Build a grouped schedule from bound columns (shared by bind
+# resolution + exact-rebuild verification, so the two can never drift):
+# raw columns must be bound, extra axes ride when declared, builder
+# errors relabel to the kernel.
+function _build_grouped_schedule(plan::StructuralPlan, kp::KernelPlate,
+        columns::Dict{Symbol,ColumnData})
+    sched = only(kp.schedules)
+    for c in (sched.obs_subj, sched.obs_time, sched.dose_subj,
+            sched.dose_time, sched.dose_amt)
+        haskey(columns, c) ||
+            _fail(kp.label, "schedule `$(sched.name)` column `$c` is not bound")
+    end
+    combine = _schedule_combine_simultaneous(plan, sched.name)
+    ecg = _grouped_schedule_axis(sched, columns, :ecg, kp)
+    tgi = _grouped_schedule_axis(sched, columns, :tgi, kp)
+    return try
+        build_linear_pk_schedule(columns[sched.obs_subj],
+            columns[sched.obs_time], columns[sched.dose_subj],
+            columns[sched.dose_time], columns[sched.dose_amt];
+            combine_simultaneous = combine, ecg = ecg, tgi = tgi)
+    catch err
+        err isa ContractValidationError &&
+            _fail(kp.label, "schedule `$(sched.name)`: $(err.message)")
+        rethrow()
+    end
+end
+
+# Grouped-kernel bind checks: resolved subjects, schedule columns
+# verified by exact rebuild (hand-bound plans carry verified products,
+# never trusted ones — the scalar-expansion precedent), first-obs
+# response on the primary axis (foreign-axis responses ride later
+# observations), numeric finite slices, subject-predictor columns at
+# n_sub, proved cell shapes + per-obs axis agreement, nadir segment
+# contracts, gather-map prep contracts, TGI axis order.
+function _validate_grouped_kernel_data(plan::StructuralPlan, kp::KernelPlate)
+    kp.subjects isa Int ||
+        _fail(kp.label, "subjects dims key `$(kp.subjects)` unresolved " *
+              "(bind_data with dims first)")
+    n_sub = kp.subjects
+    length(kp.schedules) == 1 ||
+        _fail(kp.label, "grouped v1 takes exactly one schedule " *
+              "(got $(length(kp.schedules)))")
+    sched = only(kp.schedules)
+    built = _build_grouped_schedule(plan, kp, plan.columns)
+    built.n_subjects == n_sub ||
+        _fail(kp.label, "schedule `$(sched.name)` covers " *
+              "$(built.n_subjects) subjects ≠ subjects $n_sub")
+    for f in vcat(collect(_SCHED_MATERIALIZED_FIELDS),
+            _sched_extra_fields(sched, kp.assignments))
+        col = _sched_col_name(sched.name, f)
+        haskey(plan.columns, col) ||
+            _fail(kp.label, "schedule `$(sched.name)` product `$col` " *
+                  "missing (bind_data materializes op columns)")
+        plan.columns[col] == getfield(built, f) ||
+            _fail(kp.label, "schedule `$(sched.name)` product `$col` is " *
+                  "not the schedule build (bind_data materializes it — " *
+                  "a hand-bound plan must carry the identical product)")
+    end
+    n_axis = length(plan.columns[sched.obs_subj])
+    plan.n_obs == n_axis ||
+        _fail(kp.label, "n_obs $(plan.n_obs) ≠ schedule obs axis $n_axis " *
+              "(the first in-cell observation responds on the schedule " *
+              "obs axis; foreign-axis responses ride later observations)")
+    for (col, param, kind) in kp.slices
+        kind === :response ||
+            _fail(kp.label, "slice `$param` kind unresolved " *
+                  "(bind_data resolves :unknown to :response)")
+        haskey(plan.columns, col) ||
+            _fail(kp.label, "slice column `$col` is not bound")
+        colv = plan.columns[col]
+        eltype(colv) <: Real ||
+            _fail(kp.label, "slice column `$col` must be numeric, " *
+                  "got $(eltype(colv))")
+        all(isfinite, colv) ||
+            _fail(kp.label, "slice column `$col` must be finite")
+        # Any length admits (foreign-axis responses ride their own
+        # axis); per-obs axis agreement is proved on shapes below.
+    end
+    for (p, _) in kp.lp_args
+        i = findfirst(q -> q.name === p, plan.predictors)
+        i === nothing &&
+            _fail(kp.label, "kernel LP arg `$p` is not a predictor")
+        for t in plan.predictors[i].terms
+            t.kind in _SUBJECT_TERM_KINDS ||
+                _fail(kp.label, "subject predictor `$p` carries a " *
+                      "$(t.kind) term (grouped v1 admits " *
+                      "$(_SUBJECT_TERM_KINDS))")
+            for c in t.columns
+                # In-graph deriveds compute at eval from bound sources
+                # (length-checked at their own level); no bind values exist.
+                _is_derived(plan, c) && continue
+                haskey(plan.columns, c) ||
+                    _fail(kp.label, "subject predictor `$p` column `$c` " *
+                          "is not bound")
+                colv = plan.columns[c]
+                length(colv) == n_sub ||
+                    _fail(kp.label, "subject predictor `$p` column `$c` " *
+                          "has length $(length(colv)), want n_sub $n_sub")
+                if t.kind in (ContinuousTerm, OffsetTerm)
+                    eltype(colv) <: Real ||
+                        _fail(kp.label, "subject predictor `$p` column " *
+                              "`$c` must be numeric, got $(eltype(colv))")
+                    all(isfinite, colv) ||
+                        _fail(kp.label, "subject predictor `$p` column " *
+                              "`$c` must be finite")
+                end
+            end
+        end
+    end
+    shapes = _prove_grouped_cell_shapes(kp, kp.slices, plan.columns)
+    _validate_nadir_ends(kp, shapes, plan.columns)
+    _validate_grouped_gather_maps(kp, shapes, plan.columns,
+        built.n_reads_total)
+    _validate_tgi_axis_order(kp, sched, plan.columns)
+    return nothing
+end
+
 # Kernel bind checks: resolved dims, total kinds, flat-T-blocked lengths,
 # subjects coverage. Runs on bound plans (bind resolves Symbol dims via
 # the `dims` map first; hand-bound plans carry Ints directly).
 function _validate_kernels_data(plan::StructuralPlan)
     isempty(plan.kernel_plates) && return nothing
     kp = only(plan.kernel_plates)
+    _is_grouped_kernel(kp) && return _validate_grouped_kernel_data(plan, kp)
     kp.subjects isa Int ||
         _fail(kp.label, "subjects dims key `$(kp.subjects)` unresolved " *
               "(bind_data with dims first)")
@@ -2318,6 +3502,8 @@ function _validate_name_tables(plan::StructuralPlan)
     hsgp = Symbol[nm for hb in plan.hsgp_bases for nm in _hsgp_all_names(hb)]
     kern = Symbol[nm for kp in plan.kernel_plates for nm in _kernel_all_names(kp)]
     mats = Symbol[m.name for m in plan.matrices]
+    elps = Symbol[nm for el in plan.event_lps
+        for nm in [_event_lp_all_names(el); el.name]]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
@@ -2343,6 +3529,8 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate kernel-plate names")
     length(unique(mats)) == length(mats) ||
         _fail(:plan, "duplicate design-matrix names")
+    length(unique(elps)) == length(elps) ||
+        _fail(:plan, "duplicate event-LP names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
         (assigns, deriveds, "assignments and derived columns"),
@@ -2420,7 +3608,20 @@ function _validate_name_tables(plan::StructuralPlan)
         (darstates, vcorr, "dar states and correlated varying names"),
         (darstates, hsgp, "dar states and hsgp names"),
         (darstates, kern, "dar states and kernel-plate names"),
-        (darstates, mats, "dar states and design-matrix names"))
+        (darstates, mats, "dar states and design-matrix names"),
+        (elps, params, "event-LP names and parameters"),
+        (elps, assigns, "event-LP names and assignments"),
+        (elps, deriveds, "event-LP names and derived columns"),
+        (elps, plates, "event-LP names and plate parameters"),
+        (elps, scanstates, "event-LP names and scan states"),
+        (elps, vectors, "event-LP names and vector parameters"),
+        (elps, svec, "event-LP names and spline vectors"),
+        (elps, vk1, "event-LP names and K=1 varying names"),
+        (elps, vcorr, "event-LP names and correlated varying names"),
+        (elps, hsgp, "event-LP names and hsgp names"),
+        (elps, kern, "event-LP names and kernel-plate names"),
+        (elps, mats, "event-LP names and design-matrix names"),
+        (elps, darstates, "event-LP names and dar states"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
@@ -4400,9 +5601,15 @@ function _validate_responses(plan::StructuralPlan)
                 "response range $(r.range) is empty")
         end
     end
+    for kp in plan.kernel_plates
+        for (p, _) in kp.lp_args
+            push!(used_predictors, p)
+        end
+    end
     for pred in plan.predictors
         pred.name in used_predictors ||
-            _fail(pred.label, "predictor $(pred.name) unused by any response")
+            _fail(pred.label, "predictor $(pred.name) unused by any " *
+                  "response or kernel LP arg")
     end
     return nothing
 end
@@ -4825,6 +6032,26 @@ _upgrade_role!(roles, col, role) =
 # evaluated in-graph in Stage B from the raw columns + these frozen
 # fits (bind-then-build ordering keeps them consistent across
 # rebinds — the SB DATA-vs-literal concern).
+"""One HSGP axis fit (SB `_brm_fit_hsgp` 1-D verbatim): `mu =
+mean(col)`, `L = c*max|col-mu|`, numeric/nonempty/finite/`L > 0`
+gates. Shared by basis binds and the event-LP bind (dev §4 — one
+fit core, two callers)."""
+function _hsgp_axis_fit(col::AbstractVector, c::Real, label::Symbol,
+        where::String)
+    eltype(col) <: Real ||
+        _fail(label, "$where must be numeric, got $(eltype(col))")
+    isempty(col) &&
+        _fail(label, "$where is empty")
+    mu = sum(col) / length(col)
+    L = Float64(c) * maximum(abs.(col .- mu))
+    isfinite(mu) && isfinite(L) ||
+        _fail(label, "$where is non-finite (mu=$mu, L=$L)")
+    L > 0 ||
+        _fail(label, "$where is degenerate " *
+              "(L == 0 — a constant column has no usable domain)")
+    return (Float64(mu), L)
+end
+
 function _fit_hsgp_bases(plan::StructuralPlan,
         columns::AbstractDict{Symbol})
     isempty(plan.hsgp_bases) && return HSGPBasis[]
@@ -4836,20 +6063,8 @@ function _fit_hsgp_bases(plan::StructuralPlan,
                 _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
                       "not bound")
             col = _vector_column(columns, c, hb.label, "hsgp axis column")
-            eltype(col) <: Real ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
-                      "be numeric, got $(eltype(col))")
-            isempty(col) &&
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c is empty")
-            mu = sum(col) / length(col)
-            L = Float64(cj) * maximum(abs.(col .- mu))
-            isfinite(mu) && isfinite(L) ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
-                      "non-finite (mu=$mu, L=$L)")
-            L > 0 ||
-                _fail(hb.label, "hsgp :$(hb.id): axis $c is degenerate " *
-                      "(L == 0 — a constant column has no usable domain)")
-            push!(fits, (Float64(mu), L))
+            push!(fits, _hsgp_axis_fit(col, cj, hb.label,
+                "hsgp :$(hb.id): axis column $c"))
         end
         push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, fits,
             hb.label))
@@ -4901,6 +6116,426 @@ function _materialize_splines!(plan::StructuralPlan,
     return out
 end
 
+# Result space of each CELL_FNS entry (:reads = flat read-space,
+# :obs = obs-space, :scalar). The generator lowers reads per subject
+# and vcats; gathers move reads to obs. The AUC cell returns the flat
+# per-subject `[conc; auc]` blocks (length 2R) — still read-space
+# (gathers move it to an axis first).
+const CELL_FN_RESULT_SPACE = Dict{Symbol,Symbol}(
+    :linear_pk_read_locs => :reads, :linear_pk_read_locs_auc => :reads)
+
+# Bind-time grouped cell shapes: :scalar (LP cell params, model
+# scalars, literals, scalar arithmetic), (:obs, len) (response slices
+# at column length, gathers at map length, dotted obs arithmetic at
+# the common axis length), :reads (cell-call results). Axis IS length
+# (two foreign axes with equal row counts mix silently — the accepted
+# hole: even Stan would not catch it; the fixed joint program + parity
+# tests guard the deliverable). Read-space arithmetic fails closed
+# (gather to the obs axis first — the SB shape); undotted ops over
+# obs/read operands fail closed (write the dotted form — the panel
+# precedent); dotted ops over mismatched axis lengths fail closed
+# naming the axes. Assignments pass through UNCHANGED (no flat dotify
+# — the generator unrolls per subject); this pass only proves shapes.
+function _grouped_cell_shapes(kp::KernelPlate,
+        slices::Vector{Tuple{Symbol,Symbol,Symbol}},
+        columns::Dict{Symbol,ColumnData})
+    shapes = Dict{Symbol,Any}()
+    for (col, p, _) in slices
+        shapes[p] = (:obs, length(columns[col]))
+    end
+    for (_, c) in kp.lp_args
+        shapes[c] = :scalar
+    end
+    for (nm, ex) in kp.assignments
+        shapes[nm] = _grouped_cell_shape(ex, kp, shapes, columns)
+    end
+    return shapes
+end
+
+"""Whether a grouped shape is an obs-axis shape (vs :scalar/:reads)."""
+_is_obs_shape(s) = s isa Tuple && s[1] === :obs
+
+# One dotted operation's result shape (shared by dotted-operator
+# `:call`s and dotted-math `:.`s): read-space fails closed (gather
+# first); obs operands must share one axis length (mismatch fails
+# closed naming the axes); scalars broadcast.
+function _dotted_obs_shape(label::Symbol, ex::Expr, spaces::Vector)
+    any(==(:reads), spaces) &&
+        _fail(label, "read-space arithmetic does not lower — " *
+              "gather to the obs axis first " *
+              "(`reads[sched.obs_map]`), then compute")
+    lens = sort!(unique!([s[2] for s in spaces if _is_obs_shape(s)]))
+    if length(lens) > 1
+        _fail(label, "dotted operation mixes obs axes of length " *
+              join(lens, " and ") * " (operands must share one " *
+              "axis — gather each series to its axis first; got " *
+              "$(repr(ex)))")
+    end
+    return isempty(lens) ? :scalar : (:obs, only(lens))
+end
+
+function _grouped_cell_shape(ex, kp::KernelPlate, shapes::Dict{Symbol,Any},
+        columns::Dict{Symbol,ColumnData})
+    label = kp.label
+    ex isa Number && return :scalar
+    ex isa LineNumberNode && return :scalar
+    # Model scalars (params/assignments) default scalar — structure
+    # proved every other Symbol is a cell name in `shapes`.
+    ex isa Symbol && return get(shapes, ex, :scalar)
+    head = ex.head
+    if head === :call
+        fn = ex.args[1]
+        if fn isa Symbol && fn in CELL_FNS
+            trailing = ex.args[3:end]
+            if (fn === :linear_pk_read_locs &&
+                    length(ex.args) == CELL_FN_ARITY[fn] + 2) ||
+                    fn === :linear_pk_read_locs_auc
+                # The event-LP second arg is the provider's flat
+                # event-axis vector (structure proved the name), not a
+                # scalar — the LP scalars start one later.
+                trailing = ex.args[4:end]
+            end
+            for arg in trailing
+                aspace = _grouped_cell_shape(arg, kp, shapes, columns)
+                aspace === :scalar ||
+                    _fail(label, "cell call `$fn` argument `$(arg)` is " *
+                          "$aspace-space (call args past the schedule " *
+                          "are per-subject LP cell params or model " *
+                          "scalars)")
+            end
+            return CELL_FN_RESULT_SPACE[fn]
+        end
+        if fn isa Symbol && fn in SEGMENT_CELL_FNS
+            # The nadir runs over one obs-axis row series (one entry
+            # per row out); the ends column's segment contract is
+            # proved by the nadir validator (bound plans).
+            changeshape =
+                _grouped_cell_shape(ex.args[2], kp, shapes, columns)
+            changeshape === :reads &&
+                _fail(label, "cell call `$fn` change argument is " *
+                      "read-space — gather to the obs axis first " *
+                      "(`reads[sched.obs_map]` / `v[map]`)")
+            _is_obs_shape(changeshape) ||
+                _fail(label, "cell call `$fn` change argument is " *
+                      "scalar (the nadir runs over a row series)")
+            endscol = ex.args[3]
+            haskey(columns, endscol) ||
+                _fail(label, "cell call `$fn` ends `$endscol` is not " *
+                      "bound (bind_data columns carry it)")
+            return (:obs, changeshape[2])
+        end
+        # Dotted operators (`mu .+ e`): scalars broadcast; obs
+        # operands must share one axis length (mismatch fails closed
+        # naming the axes); read-space fails closed (gather first).
+        if fn isa Symbol && fn in ELEMENTWISE_OPS
+            spaces = [_grouped_cell_shape(a, kp, shapes, columns)
+                      for a in ex.args[2:end]]
+            return _dotted_obs_shape(label, ex, spaces)
+        end
+        # Undotted arithmetic (operator or math function): scalar-only.
+        # Grouped cells emit verbatim (no flat dotify), so an undotted
+        # obs operand fails closed (write the dotted form) and a
+        # read-space operand fails closed (gather to the obs axis
+        # first).
+        if fn isa Symbol && fn in ASSIGNMENT_FNS
+            spaces = [_grouped_cell_shape(a, kp, shapes, columns)
+                      for a in ex.args[2:end]]
+            any(==(:reads), spaces) &&
+                _fail(label, "read-space arithmetic does not lower — " *
+                      "gather to the obs axis first " *
+                      "(`reads[sched.obs_map]`), then compute")
+            any(_is_obs_shape, spaces) &&
+                _fail(label, "undotted `$fn` over obs-space series does " *
+                      "not lower — write the dotted form")
+            return :scalar
+        end
+        return _fail(label, "call `$fn` has no grouped shape rule " *
+                            "(internal: structure validation admits it " *
+                            "but bind does not)")
+    end
+    if head === :.
+        spaces = [_grouped_cell_shape(a, kp, shapes, columns)
+                  for a in ex.args[2].args]
+        return _dotted_obs_shape(label, ex, spaces)
+    end
+    if head === :ref
+        src, idx = ex.args[1], ex.args[2]
+        srcshape = _grouped_cell_shape(src, kp, shapes, columns)
+        # Response slices are leaves (structure admits the shape;
+        # bind proves the space — the v1 pin).
+        src isa Symbol && src in _slice_params(kp) &&
+            _fail(label, "gather source `$src` is not read-space " *
+                  "(response slices are leaves — gathers read " *
+                  "cell-call results, LP cell params, or cell locals: " *
+                  "`reads[sched.obs_map]` / `v[map]`)")
+        is_lp = src isa Symbol && src in _lp_cell_params(kp)
+        (srcshape === :reads || _is_obs_shape(srcshape) || is_lp) ||
+            _fail(label, "gather source `$src` is scalar (gathers read " *
+                  "cell-call results, LP cell params, or cell locals: " *
+                  "`reads[sched.obs_map]` / `v[map]`)")
+        mapcol = idx isa Symbol ? idx :
+            _sched_col_name(idx.args[1], idx.args[2].value)
+        haskey(columns, mapcol) ||
+            _fail(label, "gather map `$mapcol` is not bound " *
+                  "(bind_data columns carry gather maps)")
+        return (:obs, length(columns[mapcol]))
+    end
+    return _fail(label, "unsupported expression head $head in a grouped " *
+                        "cell (internal)")
+end
+
+# Per-obs axis agreement: each in-cell observation's response sets the
+# axis length; location/scale/params refs that are non-scalar must
+# match it exactly (literals and model scalars broadcast). Structure
+# proved every Symbol is a cell name or a model scalar; LP cell params
+# as obs args already failed there (gather explicitly).
+function _validate_grouped_obs_axes(kp::KernelPlate,
+        shapes::Dict{Symbol,Any}, columns::Dict{Symbol,ColumnData})
+    for obs in kp.obs
+        rcol = only(c for (c, p, _) in kp.slices if p === obs.response)
+        rlen = length(columns[rcol])
+        refs = Any[(:location, obs.location), (:scale, obs.scale)]
+        append!(refs, [(:params, pr) for pr in obs.params])
+        for (nm, ref) in refs
+            ref isa Number && continue
+            s = get(shapes, ref, :scalar)
+            s === :scalar && continue
+            s === :reads &&
+                _fail(kp.label, "kernel obs $nm `$ref` is read-space " *
+                      "(gather to the response axis first: " *
+                      "`reads[sched.obs_map]` / `v[map]`)")
+            s[2] == rlen ||
+                _fail(kp.label, "kernel obs $nm `$ref` has length " *
+                      "$(s[2]) ≠ response `$(obs.response)` length " *
+                      "$rlen (one value per response row — gather " *
+                      "each arg to the response axis)")
+        end
+    end
+    return nothing
+end
+
+# Prove grouped cell shapes + per-obs axis agreement (single site for
+# bind resolution + bound-plan validation, so hand-bound plans carry
+# proved shapes too — never trusted ones). Returns the shapes.
+function _prove_grouped_cell_shapes(kp::KernelPlate,
+        slices::Vector{Tuple{Symbol,Symbol,Symbol}},
+        columns::Dict{Symbol,ColumnData})
+    shapes = _grouped_cell_shapes(kp, slices, columns)
+    _validate_grouped_obs_axes(kp, shapes, columns)
+    return shapes
+end
+
+# Segmented-nadir ends contract (bound plans): each nadir call's ends
+# column is integer-valued with one cumulative end per subject,
+# nondecreasing from a non-negative start, last end == change length
+# (shapes proved the ends bound + the change an obs series, so the
+# lengths below are total).
+function _validate_nadir_ends(kp::KernelPlate, shapes::Dict{Symbol,Any},
+        columns::Dict{Symbol,ColumnData})
+    n_sub = kp.subjects
+    for (nm, ex) in kp.assignments
+        ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+            ex.args[1] isa Symbol && ex.args[1] in SEGMENT_CELL_FNS ||
+            continue
+        fn = ex.args[1]
+        endscol = ex.args[3]
+        ends = columns[endscol]
+        eltype(ends) <: Integer ||
+            _fail(kp.label, "cell call `$fn` ends `$endscol` must be " *
+                  "an integer column, got $(eltype(ends))")
+        length(ends) == n_sub ||
+            _fail(kp.label, "cell call `$fn` ends `$endscol` has length " *
+                  "$(length(ends)) ≠ subjects $n_sub (one cumulative " *
+                  "end per subject)")
+        issorted(ends) ||
+            _fail(kp.label, "cell call `$fn` ends `$endscol` must be " *
+                  "nondecreasing (got $ends)")
+        ends[1] >= 0 ||
+            _fail(kp.label, "cell call `$fn` ends `$endscol` must be " *
+                  "non-negative (got $ends)")
+        n_rows = shapes[nm][2]
+        ends[end] == n_rows ||
+            _fail(kp.label, "cell call `$fn` ends `$endscol` last end " *
+                  "$(ends[end]) ≠ change length $n_rows")
+    end
+    return nothing
+end
+
+# Gather-map prep contract (bound plans): every gather's map column is
+# integer-valued, with values inside the source's index range —
+# subject maps (LP-vector sources) within 1..n_sub, read-space maps
+# within the flat reads (R for v1 cells, 2R for AUC cells, from the
+# built schedule), obs-axis maps within the source axis length. Shapes
+# proved bound-ness + source spaces; this proves content.
+function _validate_grouped_gather_maps(kp::KernelPlate,
+        shapes::Dict{Symbol,Any}, columns::Dict{Symbol,ColumnData},
+        n_reads_total::Int)
+    n_sub = kp.subjects
+    for (_, ex) in kp.assignments
+        for (src, mapcol) in _collect_grouped_gather_uses(ex)
+            mapv = columns[mapcol]
+            eltype(mapv) <: Integer ||
+                _fail(kp.label, "gather map `$mapcol` must be an " *
+                      "integer column, got $(eltype(mapv))")
+            if src in _lp_cell_params(kp)
+                all(1 .<= mapv .<= n_sub) ||
+                    _fail(kp.label, "subject map `$mapcol` has entries " *
+                          "outside 1..$n_sub (gathered `$src` is " *
+                          "per-subject — one subject id per row)")
+            else
+                srcshape = shapes[src]
+                bound = srcshape === :reads ?
+                    _gather_reads_bound(kp, src, n_reads_total) :
+                    srcshape[2]
+                all(1 .<= mapv .<= bound) ||
+                    _fail(kp.label, "gather map `$mapcol` has entries " *
+                          "outside 1..$bound (gathered `$src` has " *
+                          "$bound rows)")
+            end
+        end
+    end
+    return nothing
+end
+
+# Flat reads length behind a read-space gather source: R for v1 cells,
+# 2R for AUC cells (per-subject `[conc; auc]` blocks). Shapes proved
+# the source is a cell-call result, so the producing call exists.
+function _gather_reads_bound(kp::KernelPlate, src::Symbol, n_reads_total::Int)
+    for (nm, ex) in kp.assignments
+        if nm === src && ex isa Expr && ex.head === :call
+            return ex.args[1] === :linear_pk_read_locs_auc ?
+                2 * n_reads_total : n_reads_total
+        end
+    end
+    _fail(kp.label, "gather source `$src` has no producing cell call " *
+          "(internal)")
+end
+
+# Every gather use `(source, map-column)` in a cell RHS (sources are
+# cell names, maps schedule maps or plain bind columns — structure
+# proved the shapes).
+function _collect_grouped_gather_uses(ex)
+    out = Tuple{Symbol,Symbol}[]
+    _collect_grouped_gather_uses!(out, ex)
+    return out
+end
+
+function _collect_grouped_gather_uses!(out::Vector{Tuple{Symbol,Symbol}}, ex)
+    ex isa Expr || return nothing
+    if ex.head === :ref && length(ex.args) == 2
+        src, idx = ex.args[1], ex.args[2]
+        mapcol = idx isa Symbol ? idx :
+            _sched_col_name(idx.args[1], idx.args[2].value)
+        push!(out, (src, mapcol))
+    end
+    for a in ex.args
+        _collect_grouped_gather_uses!(out, a)
+    end
+    return nothing
+end
+
+# TGI axis order (bound plans, tgi declared): rows grouped by subject
+# with nondecreasing times within each subject (SB `_joint_tgi_rows`
+# order — the bind derives cumulative ends from the subject column
+# and cannot reorder caller rows, so unordered frames fail closed).
+function _validate_tgi_axis_order(kp::KernelPlate,
+        sched::LinearPKScheduleSpec, columns::Dict{Symbol,ColumnData})
+    sched.tgi === nothing && return nothing
+    tsubj = columns[sched.tgi[1]]
+    ttime = columns[sched.tgi[2]]
+    issorted(tsubj) ||
+        _fail(kp.label, "tgi subject column `$(sched.tgi[1])` must be " *
+              "grouped by subject (sort rows by (subject, time) — SB " *
+              "`_joint_tgi_rows` order)")
+    for s in 1:kp.subjects
+        ts = [ttime[i] for i in eachindex(tsubj, ttime) if tsubj[i] == s]
+        issorted(ts) ||
+            _fail(kp.label, "tgi time column `$(sched.tgi[2])` must be " *
+                  "nondecreasing within subject $s (the nadir runs " *
+                  "over time-ordered rows)")
+    end
+    return nothing
+end
+
+# Grouped-kernel bind resolution: dims keys resolve `subjects` (no
+# timepoints — leftover keys fail closed); the schedule builds from raw
+# columns and must cover exactly n_sub subjects; op columns + maps
+# materialize (`<sched>_<field>`, caller collisions fail closed);
+# slices resolve to :response against the schedule's obs axis; cell
+# shapes resolve (scalar/obs/reads). Returns the resolved node; the
+# input plan is untouched.
+function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
+        columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer})
+    for (k, v) in dims
+        v > 0 ||
+            _fail(kp.label, "dims key `$k` must bind a positive integer, " *
+                  "got $v")
+    end
+    consumed = Set{Symbol}()
+    n_sub = if kp.subjects isa Int
+        kp.subjects
+    else
+        haskey(dims, kp.subjects) ||
+            _fail(kp.label, "subjects dims key `$(kp.subjects)` is not " *
+                  "bound (bind_data `dims` carries it; admitted: an " *
+                  "integer literal or a dims-key name)")
+        push!(consumed, kp.subjects)
+        Int(dims[kp.subjects])
+    end
+    leftovers = setdiff(Set{Symbol}(keys(dims)), consumed)
+    isempty(leftovers) ||
+        _fail(kp.label, "dims key(s) $(sort!(collect(leftovers))) not " *
+              "consumed by kernel plate `$(kp.result)` (grouped kernels " *
+              "take no timepoints dims key — typo'd key?)")
+    sched = only(kp.schedules)
+    built = _build_grouped_schedule(plan, kp, columns)
+    built.n_subjects == n_sub ||
+        _fail(kp.label, "schedule `$(sched.name)` covers " *
+              "$(built.n_subjects) subjects ≠ subjects $n_sub")
+    for f in vcat(collect(_SCHED_MATERIALIZED_FIELDS),
+            _sched_extra_fields(sched, kp.assignments))
+        col = _sched_col_name(sched.name, f)
+        haskey(columns, col) &&
+            _fail(kp.label, "column `$col` is reserved for schedule " *
+                  "`$(sched.name)`'s bind product — rename the " *
+                  "caller-supplied column")
+        columns[col] = getfield(built, f)
+    end
+    # The event-axis product (SB `_linear_pk_dose_event_axis`): only
+    # with a declared event-LP on this schedule — v1 bind products
+    # stay byte-identical without one.
+    for el in plan.event_lps
+        el.schedule === sched.name || continue
+        ecol = _sched_col_name(sched.name, :op_log_dose)
+        haskey(columns, ecol) &&
+            _fail(kp.label, "column `$ecol` is reserved for schedule " *
+                  "`$(sched.name)`'s event-axis product — rename the " *
+                  "caller-supplied column")
+        et = _sched_col_name(sched.name, :op_type)
+        ea = _sched_col_name(sched.name, :op_amount)
+        columns[ecol] = try
+            linear_pk_op_log_dose(columns[et], columns[ea])
+        catch err
+            err isa ContractValidationError &&
+                _fail(kp.label, "schedule `$(sched.name)`: $(err.message)")
+            rethrow()
+        end
+    end
+    slices2 = Tuple{Symbol,Symbol,Symbol}[]
+    for (col, param, _) in kp.slices
+        haskey(columns, col) ||
+            _fail(kp.label, "slice column `$col` is not bound")
+        # Any length admits (foreign-axis responses ride their own
+        # axis — the first-obs-on-primary rule is the n_obs check in
+        # bound-plan validation); per-obs axis agreement is proved on
+        # shapes below.
+        push!(slices2, (col, param, :response))
+    end
+    _prove_grouped_cell_shapes(kp, slices2, columns)
+    return KernelPlate(kp.result, n_sub, nothing, slices2, kp.assignments,
+        kp.obs, kp.collected, kp.label, kp.lp_args, kp.schedules)
+end
+
 # Kernel-plate bind resolution (the `_RKKernelSpec` layout contract): dims
 # keys resolve `subjects`/`timepoints` to positive ints; slice kinds infer
 # totally from lengths (`n_sub*T` → :vector, `n_sub` → :scalar — at `T ==
@@ -4913,6 +6548,8 @@ function _resolve_kernels!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer})
     isempty(plan.kernel_plates) && return KernelPlate[]
     kp = only(plan.kernel_plates)
+    _is_grouped_kernel(kp) &&
+        return KernelPlate[_resolve_grouped_kernel!(plan, kp, columns, dims)]
     for (k, v) in dims
         v > 0 ||
             _fail(kp.label, "dims key `$k` must bind a positive integer, " *
@@ -5023,6 +6660,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     bases = _materialize_splines!(plan, columns)
     hbases = _fit_hsgp_bases(plan, columns)
     kbases = _resolve_kernels!(plan, columns, dims)
+    elbases = _fit_event_lps(plan, columns)
     for (k, v) in roles
         haskey(columns, k) || throw(ContractValidationError(
             "[bind] role for unknown column $k"))
@@ -5040,6 +6678,10 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
     end
     for hb in hbases, c in hb.axes
+        haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
+    end
+    for el in elbases
+        c = _sched_col_name(el.schedule, :op_log_dose)
         haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
     end
     for r in plan.responses
@@ -5065,15 +6707,28 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         end
     end
     for kp in kbases
-        rcol = only(c for (c, p, _) in kp.slices if p === kp.obs.response)
-        haskey(inferred, rcol) && (inferred[rcol] = :response)
+        for obs in kp.obs
+            rcol = only(c for (c, p, _) in kp.slices if p === obs.response)
+            haskey(inferred, rcol) && (inferred[rcol] = :response)
+        end
     end
     merged = merge(inferred, roles)
     # Kernel plans carry two column lengths by design: n_obs is the flat
     # length (vector models) or n_sub (all-scalar) — never first-column.
     # Otherwise n_obs is the first column's ROW count (length for vectors).
-    n = isempty(kbases) ? _column_nrows(first(values(columns))) :
-        _kernel_flat_length(only(kbases).subjects, only(kbases).timepoints)
+    # Grouped plans set n_obs to the primary (first-obs) response length.
+    n = if isempty(kbases)
+        _column_nrows(first(values(columns)))
+    else
+        gkp = only(kbases)
+        if _is_grouped_kernel(gkp)
+            rcol0 = only(c for (c, p, _) in gkp.slices
+                if p === first(gkp.obs).response)
+            length(columns[rcol0])
+        else
+            _kernel_flat_length(gkp.subjects, gkp.timepoints)
+        end
+    end
     maps = _eval_levelmaps(plan.levelmaps, columns)
     draws = _eval_draws_levels(plan.varying_draws, columns)
     responses2, vectors2 =
@@ -5088,7 +6743,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         vector_parameters = vectors2, spline_bases = bases,
         spline_vectors = plan.spline_vectors, hsgp_bases = hbases,
         kernel_plates = kbases, r2d2_priors = plan.r2d2_priors,
-        matrices = plan.matrices)
+        matrices = plan.matrices, event_lps = elbases)
     validate_data(bound)
     return bound
 end

@@ -628,7 +628,15 @@ function _kernel_endpoint_rename(x, renames::Dict{Symbol,Symbol})
     x isa QuoteNode && return x
     x isa Expr || return x
     if x.head === :(.) && length(x.args) == 2
-        return Expr(:(.), _kernel_endpoint_rename(x.args[1], renames), x.args[2])
+        # Property access stores its field as a QuoteNode and must not rename
+        # it.  Dotted-call syntax (`f.(x)`), however, stores the call arguments
+        # in an Expr(:tuple, ...).  Those arguments may refer to method-local
+        # recipes and therefore need the same hygienic rename as an ordinary
+        # call argument.
+        tail = x.args[2]
+        renamed_tail = tail isa Expr && tail.head === :tuple ?
+                       _kernel_endpoint_rename(tail, renames) : tail
+        return Expr(:(.), _kernel_endpoint_rename(x.args[1], renames), renamed_tail)
     elseif x.head === :(::)
         return Expr(:(::), _kernel_endpoint_rename(x.args[1], renames), x.args[2:end]...)
     end

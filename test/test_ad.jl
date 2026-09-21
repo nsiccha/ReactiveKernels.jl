@@ -105,6 +105,120 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         )
     end
 
+    @testset "multiple active ports share one structured reverse pass" begin
+        @kernel multi_active_objective(
+                alpha::Vector{Float64}, beta::Vector{Float64},
+                data::Vector{Float64}; offset::Float64 = 0.0) = begin
+            objective::Float64 =
+                sum(abs2, alpha) + sum(beta .* data) + offset
+        end
+
+        alpha = [0.3, -0.4, 0.2]
+        beta = [-0.1, 0.7, 0.5]
+        data = [2.0, -1.0, 0.5]
+        expected = (copy(data), 2 .* alpha)
+
+        # The selector order, not authored HAVE order, defines the structured
+        # point and returned cotangent order.
+        one_shot = ad_gradient(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = (:beta, :alpha), want = :objective,
+        )
+        @test one_shot isa Tuple
+        @test one_shot[1] ≈ expected[1]
+        @test one_shot[2] ≈ expected[2]
+
+        prepared = prepare_ad(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = (multi_active_objective.beta,
+                      multi_active_objective.alpha),
+            want = :objective,
+        )
+        @test typeof(prepared).parameters[1] == (2, 1)
+        @test occursin("active=(:beta, :alpha)", sprint(show, prepared))
+
+        changed_alpha = [-0.2, 0.6, 0.4]
+        changed_beta = [0.8, -0.3, 0.1]
+        changed_data = [-0.5, 0.25, 3.0]
+        value, gradient = ad_value_and_gradient(
+            prepared, changed_alpha, changed_beta, changed_data; offset = 1.5)
+        @test value ≈ sum(abs2, changed_alpha) +
+              sum(changed_beta .* changed_data) + 1.5
+        @test gradient[1] ≈ changed_data
+        @test gradient[2] ≈ 2 .* changed_alpha
+
+        destinations = (similar(changed_beta), similar(changed_alpha))
+        inplace_value, returned = ad_value_and_gradient!(
+            prepared, destinations,
+            changed_alpha, changed_beta, changed_data; offset = 1.5)
+        @test inplace_value ≈ value
+        @test returned === destinations
+        @test destinations[1] ≈ gradient[1]
+        @test destinations[2] ≈ gradient[2]
+
+        # An explicit one-element tuple deliberately preserves a one-tuple
+        # result, while the historical scalar selector stays unwrapped.
+        singleton = ad_gradient(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = (:alpha,), want = :objective)
+        @test singleton isa Tuple
+        @test only(singleton) ≈ 2 .* alpha
+        @test ad_gradient(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = :alpha, want = :objective) ≈ 2 .* alpha
+
+        @test_throws ArgumentError prepare_ad(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = (), want = :objective)
+        @test_throws ArgumentError prepare_ad(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = (:alpha, :alpha), want = :objective)
+
+        # Heterogeneous active storage (the GLM beta+dispersion shape) is
+        # normalized internally without changing the public scalar cotangent.
+        @kernel mixed_active_objective(
+                coefficients::Vector{Float64}, dispersion::Float64) = begin
+            objective::Float64 =
+                sum(abs2, coefficients) + dispersion^2
+        end
+        coefficients = [0.2, -0.5]
+        dispersion = 1.7
+        mixed = prepare_ad(
+            mixed_active_objective, TEST_AD_BACKEND,
+            coefficients, dispersion;
+            active = (:coefficients, :dispersion), want = :objective)
+        mixed_value, mixed_gradient = ad_value_and_gradient(
+            mixed, coefficients, dispersion)
+        @test mixed_value ≈ sum(abs2, coefficients) + dispersion^2
+        @test mixed_gradient[1] ≈ 2 .* coefficients
+        @test mixed_gradient[2] ≈ 2dispersion
+        mixed_destination = (similar(coefficients), Ref(NaN))
+        _, mixed_returned = ad_value_and_gradient!(
+            mixed, mixed_destination, coefficients, dispersion)
+        @test mixed_returned === mixed_destination
+        @test mixed_destination[1] ≈ mixed_gradient[1]
+        @test mixed_destination[2][] ≈ mixed_gradient[2]
+
+        # Pullback preparation shares the same ordered multi-active point and
+        # restores scalar cotangents at the public boundary.
+        mixed_pullback = prepare_ad_pullback(
+            mixed_active_objective, TEST_AD_BACKEND, 1.0,
+            coefficients, dispersion;
+            active = (:coefficients, :dispersion), want = :objective)
+        pullback_value, mixed_cotangent = ad_value_and_pullback(
+            mixed_pullback, 1.0, coefficients, dispersion)
+        @test pullback_value ≈ mixed_value
+        @test mixed_cotangent[1] ≈ mixed_gradient[1]
+        @test mixed_cotangent[2] ≈ mixed_gradient[2]
+        cotangent_destination = (similar(coefficients), Ref(NaN))
+        _, returned_cotangent = ad_value_and_pullback!(
+            mixed_pullback, cotangent_destination, 1.0,
+            coefficients, dispersion)
+        @test returned_cotangent === cotangent_destination
+        @test cotangent_destination[1] ≈ mixed_gradient[1]
+        @test cotangent_destination[2][] ≈ mixed_gradient[2]
+    end
+
     @testset "active dependency boundary" begin
         function boundary_kernel(kind)
             graph = Graph()

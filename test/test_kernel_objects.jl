@@ -83,6 +83,24 @@ end
     return logdensity
 end
 
+@kernel same_body_broadcasts(X::Matrix{Float64}, beta::Vector{Float64}) = begin
+    eta::Vector{Float64} = X * beta
+
+    direct(y::Vector{Int})::Float64 = begin
+        t::Vector{Float64} = y .* eta
+        sum(exp.(t))
+    end
+    chained(y::Vector{Int})::Float64 = begin
+        t::Vector{Float64} = y .* eta
+        u::Vector{Float64} = exp.(t)
+        sum(u)
+    end
+    scalar(y::Vector{Int})::Float64 = begin
+        t::Float64 = sum(y .* eta)
+        exp.(t)
+    end
+end
+
 end
 
 module KernelObjectPureCalleeFixture
@@ -132,6 +150,23 @@ end
     @test prepare(P.bare_external.endpoint)(2.0) == 4.25
     @test prepare(P.qualified_external.endpoint)(2.0) == 4.25
     @test isempty(ReactiveKernels.kernel_endpoint_names(P.qualified_effect))
+
+    @testset "dotted calls depend on same-body endpoint temporaries" begin
+        X = [1.0 2.0; 1.0 3.0]
+        beta = [0.5, 0.5]
+        y = [1, 0]
+        expected = sum(exp.(y .* (X * beta)))
+
+        @test prepare(F.same_body_broadcasts.direct)(X, beta, y) ≈ expected
+        @test prepare(F.same_body_broadcasts.chained)(X, beta, y) ≈ expected
+        @test prepare(F.same_body_broadcasts.scalar)(X, beta, y) ≈
+              exp(sum(y .* (X * beta)))
+
+        direct_recipe = only(recipe for recipe in
+            F.same_body_broadcasts.direct.graph.recipes
+            if only(recipe.outputs).name === :direct)
+        @test only(direct_recipe.inputs).name === :direct__t
+    end
 
     @test_throws ArgumentError @macroexpand @kernel duplicate_endpoints() = begin
         endpoint(x::Float64)::Float64 = x

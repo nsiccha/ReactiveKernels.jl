@@ -1,0 +1,4 @@
+Expr[:(_ppl_pk_scale_pk_loc = sqrt.(sigma_add ^ 2 .+ (pk_loc .* sigma_prop) .^ 2)), :(_ppl_pw_qt_joint_pk_pk_loc = plate(pk_y, pk_loc, _ppl_pk_scale_pk_loc, pk_lloq) do _ppl_c1, _ppl_c2, _ppl_c3, _ppl_c4
+          #= generator:0 =#
+          ifelse(_ppl_c1 == _ppl_c4, log((normal(_ppl_c2, _ppl_c3)).cdf(_ppl_c4)), (normal(_ppl_c2, _ppl_c3)).logpdf(_ppl_c1))
+      end), :(_ppl_lik_qt_joint_pk_pk_loc::Float64 = sum(_ppl_pw_qt_joint_pk_pk_loc))]

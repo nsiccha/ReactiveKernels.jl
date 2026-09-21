@@ -1,0 +1,4 @@
+Expr[:(_ppl_qt_scale_pk_loc = qt_scale .* qt_weight), :(_ppl_pw_qt_joint_qt_pk_loc = plate(qt_y, qt_loc, _ppl_qt_scale_pk_loc) do _ppl_c1, _ppl_c2, _ppl_c3
+          #= generator:0 =#
+          (normal(_ppl_c2, _ppl_c3)).logpdf(_ppl_c1)
+      end), :(_ppl_lik_qt_joint_qt_pk_loc::Float64 = sum(_ppl_pw_qt_joint_qt_pk_loc))]

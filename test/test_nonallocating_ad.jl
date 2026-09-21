@@ -127,6 +127,69 @@ end
     end
 end
 
+@testset "multiple active non-allocating ports share one reverse pass" begin
+    spec = @kernel multi_active_naad(
+            alpha::Vector{Float64}, beta::Vector{Float64},
+            data::Vector{Float64}) = begin
+        alpha_term::Float64 = sum(abs2, alpha)
+        beta_term::Float64 = sum(beta .* data)
+        objective::Float64 = alpha_term + beta_term
+    end
+    alpha = [0.3, -0.4, 0.2]
+    beta = [-0.1, 0.7, 0.5]
+    data = [2.0, -1.0, 0.5]
+    kernel = prepare(spec; have = (:alpha, :beta, :data), want = :objective)
+    nonallocating = prepare_nonallocating(kernel)
+
+    prepared = prepare_ad(
+        kernel, NA_AD_BACKEND, alpha, beta, data;
+        active = (:beta, :alpha))
+    prepared_nonallocating = prepare_ad(
+        nonallocating, NA_AD_BACKEND, alpha, beta, data;
+        active = (:beta, :alpha))
+
+    reference_value, reference_gradient =
+        ad_value_and_gradient(prepared, alpha, beta, data)
+    value, gradient = ad_value_and_gradient(
+        prepared_nonallocating, alpha, beta, data)
+    @test value == reference_value
+    @test gradient[1] ≈ data
+    @test gradient[2] ≈ 2 .* alpha
+    @test gradient[1] ≈ reference_gradient[1]
+    @test gradient[2] ≈ reference_gradient[2]
+
+    destination = (similar(beta), similar(alpha))
+    inplace_value, returned = ad_value_and_gradient!(
+        prepared_nonallocating, destination, alpha, beta, data)
+    @test inplace_value == value
+    @test returned === destination
+    @test destination[1] ≈ gradient[1]
+    @test destination[2] ≈ gradient[2]
+
+    mixed_spec = @kernel multi_active_mixed_naad(
+            beta::Vector{Float64}, phi::Float64) = begin
+        beta_term::Float64 = sum(abs2, beta)
+        phi_term::Float64 = phi^2
+        objective::Float64 = beta_term + phi_term
+    end
+    phi = 1.7
+    mixed_nonallocating = prepare_nonallocating(
+        mixed_spec; have = (:beta, :phi), want = :objective)
+    mixed = prepare_ad(
+        mixed_nonallocating, NA_AD_BACKEND, beta, phi;
+        active = (:beta, :phi))
+    mixed_value, mixed_gradient = ad_value_and_gradient(mixed, beta, phi)
+    @test mixed_value ≈ sum(abs2, beta) + phi^2
+    @test mixed_gradient[1] ≈ 2 .* beta
+    @test mixed_gradient[2] ≈ 2phi
+    mixed_destination = (similar(beta), Ref(NaN))
+    _, mixed_returned = ad_value_and_gradient!(
+        mixed, mixed_destination, beta, phi)
+    @test mixed_returned === mixed_destination
+    @test mixed_destination[1] ≈ mixed_gradient[1]
+    @test mixed_destination[2][] ≈ mixed_gradient[2]
+end
+
 fscale_naad(a, b) = a * b
 
 @testset "decomposed non-allocating gradient allocates ~nothing" begin
