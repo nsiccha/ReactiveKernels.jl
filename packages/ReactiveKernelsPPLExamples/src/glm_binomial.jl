@@ -17,15 +17,17 @@ let d = _posteriordb_data("GLM_Binomial_data-GLM_Binomial_model")
 end
 
 const GLM_BINOMIAL_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, binomial
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, binomial_logit_glm
 using LogExpFunctions: logistic
 
 @kernel model(unconstrained::Vector{Float64},
-              year::Vector{Float64},
+              X::Matrix{Float64},
               counts::Vector{Int},
               totals::Vector{Int}) = begin
-    # q = (α, β₁, β₂), all unconstrained (Stan `real`, no bounds), so the
-    # transform is the identity and the log Jacobian is zero.
+    # q = (α, β₁, β₂) rides as ONE unpacked HAVE, so a single reverse pass
+    # differentiates the whole posterior (the NA-gradient story). All
+    # unconstrained (Stan `real`, no bounds), so the transform is the
+    # identity and the log Jacobian is zero.
     alpha::Float64 = unconstrained[1]
     beta1::Float64 = unconstrained[2]
     beta2::Float64 = unconstrained[3]
@@ -39,26 +41,24 @@ using LogExpFunctions: logistic
     beta2_prior::Float64 = normal(0.0, 100.0).logpdf(beta2)
     prior::Float64 = alpha_prior + beta1_prior + beta2_prior
 
-    # Transformed parameter: the logit-scale quadratic trend (named node + GQ).
-    logit_p = plate(year, alpha, beta1, beta2) do y, a, b1, b2
-        a + b1 * y + b2 * (y * y)
-    end
-
-    # Likelihood: Cⱼ ~ Binomial_logit(Nⱼ, logit_pⱼ). Consumes the named `logit_p`
-    # once via the natural logit HAVE route (single-consumer plate-chain, fused).
-    pointwise = plate(counts, totals, logit_p) do c, n, lp
-        binomial(; n = n, logit = lp).logpdf(c)
-    end
+    # Likelihood: C ~ Binomial_logit(N, X·β). The design matrix X (quadratic
+    # basis over year, built in the preamble and bound as data) and the
+    # coefficient vector splice into the explicit-math GLM object through one
+    # fused endpoint application — no predictor or likelihood plates.
+    beta::Vector{Float64} = [alpha, beta1, beta2]
+    pointwise = binomial_logit_glm(X, beta, totals).pointwise(counts)
     likelihood::Float64 = sum(pointwise)
 
     constrained_logdensity::Float64 = prior + likelihood
     unconstrained_prior::Float64 = prior + log_jacobian
     posterior::Float64 = constrained_logdensity + log_jacobian
 
-    # Generated quantity: the success probabilities p = inv_logit(logit_p).
-    p = plate(logit_p) do lp
-        logistic(lp)
-    end
+    # Generated quantity: the success probabilities p = inv_logit(X·β),
+    # rebuilt from the constrained parameters plus the bound design matrix
+    # so this query can start from `parameters` and prune the density.
+    beta_c::Vector{Float64} =
+        [parameters.alpha, parameters.beta1, parameters.beta2]
+    p = logistic.(X * beta_c)
 
     return posterior
 end
@@ -67,12 +67,13 @@ q = [0.1, 0.2, -0.1]
 year = GLM_BINOMIAL_YEAR
 counts = GLM_BINOMIAL_C
 totals = GLM_BINOMIAL_N
+X = hcat(ones(length(year)), year, year .^ 2)
 
 requested_nodes = (:parameters, :prior, :likelihood, :posterior)
 density_kernel = prepare(model;
-    have = (:unconstrained, :year, :counts, :totals),
+    have = (:unconstrained, :X, :counts, :totals),
     want = requested_nodes,
-    bound = (; year, counts, totals))
+    bound = (; X, counts, totals))
 
 output = density_kernel(q)
 parameters, prior, likelihood, posterior = output
@@ -87,7 +88,7 @@ docs_example = (;
     output,
     requested_nodes,
     normal_object = normal,
-    binomial_object = binomial,
+    glm_object = binomial_logit_glm,
 )
 """
 
@@ -110,10 +111,11 @@ end
 Build the posteriordb `GLM_Binomial_model` (a binomial-logit quadratic-trend
 GLM) as a declarative `ReactiveKernels.KernelSpec`. The parameters are
 unconstrained with `Normal(0, 100)` priors reusing the shared Normal endpoint;
-the binomial-logit likelihood reuses the shared Binomial endpoint. The prior,
-transformed-parameter `logit_p`, pointwise log-likelihood, likelihood
-reduction, densities, posterior, and the generated-quantity probabilities `p`
-are separate named nodes, and the constrained parameters are a plain NamedTuple.
+the binomial-logit likelihood splices the explicit-math `binomial_logit_glm`
+object over the bound design matrix (quadratic basis over year). The prior,
+pointwise log-likelihood, likelihood reduction, densities, posterior, and the
+generated-quantity probabilities `p` are separate named nodes, and the
+constrained parameters are a plain NamedTuple.
 """
 function build_glm_binomial_graph()
     compose(_GLM_BINOMIAL_GRAPH_TEMPLATE[])
@@ -122,6 +124,8 @@ end
 function demo()
     model = build_glm_binomial_graph()
     q = [0.1, 0.2, -0.1]
+    X = hcat(ones(length(GLM_BINOMIAL_YEAR)), GLM_BINOMIAL_YEAR,
+        GLM_BINOMIAL_YEAR .^ 2)
 
     println("Constrain only (the density branches are pruned):")
     constrained_plan = plan(model; have = :unconstrained, want = :parameters)
@@ -131,18 +135,18 @@ function demo()
 
     println("\nUnconstrained-space posterior and its pieces:")
     posterior_plan = plan(model;
-                          have = (:unconstrained, :year, :counts, :totals),
+                          have = (:unconstrained, :X, :counts, :totals),
                           want = (:prior, :likelihood, :posterior))
     println(explain(posterior_plan))
     prior, likelihood, posterior =
-        prepare(posterior_plan)(q, GLM_BINOMIAL_YEAR, GLM_BINOMIAL_C, GLM_BINOMIAL_N)
+        prepare(posterior_plan)(q, X, GLM_BINOMIAL_C, GLM_BINOMIAL_N)
     println("log prior + log likelihood = ", prior, " + ", likelihood)
     println("= log posterior = ", posterior)
 
-    println("\nGenerated quantity p = inv_logit(logit_p) from a constrained HAVE:")
-    p_plan = plan(model; have = (:parameters, :year), want = :p)
+    println("\nGenerated quantity p = inv_logit(X·β) from a constrained HAVE:")
+    p_plan = plan(model; have = (:parameters, :X), want = :p)
     println(explain(p_plan))
-    p = prepare(p_plan)(parameters, GLM_BINOMIAL_YEAR)
+    p = prepare(p_plan)(parameters, X)
     println("success probabilities p = ", p)
 
     nothing
