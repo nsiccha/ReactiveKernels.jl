@@ -2,8 +2,11 @@
 # `Reactant.@compile` of the sampler-cut posterior (primal) and
 # `compile_ad_value_and_gradient` (Enzyme-through-Reactant) at tiling K.
 #
-#   TILE_K=K [RK_GRAD=1] [RK_OPT=default|no_slice_slice] [REPS=50] \
-#     julia --project=<env with Reactant+Enzyme+DI> bench_rkppl_reactant.jl
+#   TILE_K=K [RK_PRIMAL=1] [RK_GRAD=1] [RK_OPT=default|no_slice_slice] \
+#     [REPS=50] julia --project=<env with Reactant+Enzyme+DI> bench_rkppl_reactant.jl
+#
+# `RK_PRIMAL=0` skips the primal compile (a gradient-only measurement on a
+# memory-constrained host: the compiled primal stays resident otherwise).
 #
 # Prints parity against the native kernels at the benchmark's random point
 # (seed 20260917) and per-call means, then ONE `RESULT {…}` JSON line whose
@@ -24,6 +27,7 @@ include(joinpath(PPLT, "parity", "joint_parity_fixture.jl"))
 include(joinpath(PPLT, "parity", "joint_tiling.jl"))
 
 K = parse(Int, get(ENV, "TILE_K", "3"))
+DO_PRIMAL = get(ENV, "RK_PRIMAL", "1") == "1"
 DO_GRAD = get(ENV, "RK_GRAD", "1") == "1"
 OPT = get(ENV, "RK_OPT", "default")
 REPS = parse(Int, get(ENV, "REPS", "50"))
@@ -43,6 +47,7 @@ res = Dict{String,Any}("n_obs" => bound.n_obs, "unc_dim" => k.layout.total)
 
 # ---- primal ----------------------------------------------------------------
 ur = Reactant.to_rarray(u)
+if DO_PRIMAL
 t_compile = @elapsed compiled = Reactant.@compile post_q(ur)
 got = Float64(compiled(ur))
 ok1 = isapprox(got, native; rtol = 1e-9)
@@ -59,6 +64,7 @@ res["rkppl_eval_ms"] = round(1e3 * t_n / REPS; digits = 4)
 res["reactant_eval_ms"] = round(1e3 * t_r / REPS; digits = 4)
 res["reactant_compile_s"] = round(t_compile; digits = 1)
 res["reactant_primal_parity"] = ok1 && ok2
+end
 flush(stdout)
 
 # ---- value + gradient ------------------------------------------------------

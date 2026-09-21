@@ -1,8 +1,14 @@
 # Reactant track (brm:tgi:reactant, 2026-09-21): full-program
 # `Reactant.@compile` of built RKPPL programs — primal lp parity and
 # compiled value+gradient (Enzyme-through-Reactant) parity against the
-# native kernels. Ladder: tiny model → joint PK+QT+TGI fixture at
-# tiling K=1 (→ K=3/10 in the tiled testsets below).
+# native kernels. Ladder: tiny model (primal + gradient) → joint
+# PK+QT+TGI fixture at tiling K (primal; K=1 by default, ~4 min of XLA
+# compile at ~3.8 GB peak RSS on strato2 — set `RKPPL_REACTANT_KS=1,3,10`
+# for the full ladder).  The joint gradient compile is NOT in the suite:
+# on strato2 every attempt (five, 2026-09-21) was SIGTERMed by kb-earlyoom
+# at host pressure after 9–12 min and >4.2 GB RSS before the compile
+# returned (snag `strato2-earlyoom-cf96ec60`); the tiny-model testset
+# proves the compiled AD path itself.
 #
 # Call shape (the one thing that decides traceability): compile the RAW
 # prepared kernel / `q.ad` directly (top level, or `invokelatest` AROUND
@@ -82,6 +88,9 @@ function _rj_joint(K)
     return (; bound, built, post_q, u)
 end
 
+const _RJ_KS = [parse(Int, s) for s in
+    split(get(ENV, "RKPPL_REACTANT_KS", "1"), ",")]
+
 @testset "Reactant ladder 2: joint K=1 primal @compile parity" begin
     fx = _rj_joint(1)
     @test fx.built.layout.total == 101
@@ -93,9 +102,26 @@ end
     # Full-program compile of the sampler-cut kernel.  The only lowering gap
     # this hit was the PK cell's per-op `log_F[j]` read on the traced
     # bioavailability slice (now `_traced_op_read`, pkcells.jl); everything
-    # else — packed reads, gathers, the TGI scan, plates — traces as authored.
+    # else — packed reads, the subject-batched cell loop, gathers, the
+    # segmented nadir loop, plates — traces as authored.
     compiled = Reactant.@compile fx.post_q(Reactant.to_rarray(fx.u))
     @test Float64(compiled(Reactant.to_rarray(fx.u))) ≈ native rtol = 1e-9
     u2 = Vector{Float64}(0.1 .* randn(Xoshiro(7), length(fx.u)))
     @test Float64(compiled(Reactant.to_rarray(u2))) ≈ fx.post_q(u2) rtol = 1e-9
+end
+
+# Ladder 3 (opt-in): the same proof at larger tilings — the emitted
+# program is identical (one batched statement per cell assignment), only
+# the bound columns and the layout grow, so this pins that the runtime
+# subject loop traces at every K.
+for K in _RJ_KS
+    K == 1 && continue
+    @testset "Reactant ladder 3: joint K=$K primal @compile parity" begin
+        fx = _rj_joint(K)
+        native = fx.post_q(fx.u)
+        compiled = Reactant.@compile fx.post_q(Reactant.to_rarray(fx.u))
+        @test Float64(compiled(Reactant.to_rarray(fx.u))) ≈ native rtol = 1e-9
+        u2 = Vector{Float64}(0.1 .* randn(Xoshiro(7), length(fx.u)))
+        @test Float64(compiled(Reactant.to_rarray(u2))) ≈ fx.post_q(u2) rtol = 1e-9
+    end
 end

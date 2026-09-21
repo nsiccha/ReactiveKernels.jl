@@ -439,7 +439,10 @@ end
     @test occursin("pk_sched_op_type", r)
     @test occursin("SubjectSlice(log_F)", r)
     @test occursin("SubjectScalar(_ppl_lp_log_Vc)", r)
-    @test !occursin("view(", r)
+    # (`view(unconstrained, …)` packed parameter reads are the layout's;
+    # no op-column or event-frame slice is emitted.)
+    @test !occursin("view(pk_sched_", r)
+    @test !occursin("view(log_F", r)
     @test count("linear_pk_read_locs_auc", r) == 1
     names = coordinate_names(layout)
     u = zeros(length(names))
