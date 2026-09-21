@@ -196,6 +196,47 @@ function _ad_na_step_parts(node, ops_length::Int)
     step, node.args[4:end]
 end
 
+# AD-only plate application into an owned cache slot. The nonallocating cache
+# path executes plates via `broadcast!(op.kernel, result, ...)` where the cell
+# kernel is reached through the constant operation table; calling that
+# closure-held nested RGF under reverse-mode Enzyme trips static activity
+# analysis (`EnzymeRuntimeActivityError`), while the identical kernel passed
+# as a direct constant differentiates cleanly — so tainted plate steps take
+# this explicit scalar loop over the instantiated `Broadcasted` with the
+# kernel hoisted to a direct literal (see `_ad_na_walk`). Buffer selection
+# mirrors `ReactiveKernelsMutatingFunctionsExt._apply_authored_plate!`
+# exactly; the coordinate loop mirrors the allocating fallback call method.
+@inline function _ad_na_plate_array_cache(
+        cache::Array{T}, combined_axes::Tuple{Vararg{Any,N}}) where {T,N}
+    result = cache isa Array{T,N} && Base.axes(cache) == combined_axes ?
+             cache : similar(cache, T, combined_axes)
+    result::Array{T,N}
+end
+
+@inline function _ad_na_plate_loop!(
+        slot::Base.RefValue, kernel, ::Val{A}, args...) where {A}
+    wrapped = _authored_plate_arguments(Val(A), args...)
+    combined_axes = Base.Broadcast.combine_axes(wrapped...)
+    isempty(combined_axes) && throw(ArgumentError(
+        "an authored plate requires at least one non-Ref batched argument"))
+    cache = slot[]
+    output_type = eltype(cache)
+    result = if cache isa Array{output_type}
+        _ad_na_plate_array_cache(cache, combined_axes)
+    elseif Base.axes(cache) == combined_axes && eltype(cache) == output_type
+        cache
+    else
+        similar(cache, output_type, combined_axes)
+    end
+    batch = _authored_plate_broadcast(Val(A), args...)
+    for index in eachindex(batch)
+        scalar_args = batch[index]
+        result[index] = kernel(scalar_args...)
+    end
+    slot[] = result
+    return result
+end
+
 # Taint-walk one program node, rewriting cache steps whose arguments are all
 # free of the active input into plain operation calls. Returns the rewritten
 # node and whether the active input reaches it. Unknown shapes stay tainted
@@ -217,6 +258,20 @@ function _ad_na_walk(node, tainted::Set{Symbol}, ops::Tuple, caches::Tuple,
         if !step_tainted && caches[step] isa Base.RefValue
             push!(elided, step)
             return Expr(:call, Expr(:ref, _OPS_ARG, step), rewritten...), false
+        end
+        if step_tainted && ops[step] isa _AuthoredPlateOp &&
+           caches[step] isa Base.RefValue
+            # Hoist the nested cell kernel out of the constant operation table
+            # into a direct literal: calling a closure-held nested RGF under
+            # reverse-mode Enzyme trips activity analysis, while the identical
+            # kernel passed as a direct constant differentiates cleanly.
+            op = ops[step]
+            aval = Expr(:call, GlobalRef(Base, :Val),
+                        QuoteNode(typeof(op).parameters[2]))
+            return Expr(:call,
+                        GlobalRef(@__MODULE__, :_ad_na_plate_loop!),
+                        Expr(:ref, _CACHES_ARG, step), QuoteNode(op.kernel),
+                        aval, rewritten...), true
         end
         return Expr(:call, _CACHE_APPLY_ARG, Expr(:ref, _CACHES_ARG, step),
                     Expr(:ref, _OPS_ARG, step), rewritten...), step_tainted

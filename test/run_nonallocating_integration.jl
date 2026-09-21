@@ -9,6 +9,7 @@ root = normpath(joinpath(@__DIR__, ".."))
 testfiles = [joinpath(@__DIR__, "test_nonallocating.jl"),
              joinpath(@__DIR__, "test_nonallocating_mnist.jl"),
              joinpath(@__DIR__, "test_nonallocating_ad.jl"),
+             joinpath(@__DIR__, "test_ppl_glm_nonallocating_ad.jl"),
              joinpath(@__DIR__, "test_reactive_nonallocating.jl"),
              joinpath(root, "packages", "ReactiveKernelsBatchingExamples",
                       "test", "test_batched_nonallocating.jl")]
@@ -22,12 +23,16 @@ mktempdir() do env
         "expected MutatingFunctions revision $(MUTATING_FUNCTIONS_REV), got $(dep.git_revision)")
     # test_batched_nonallocating.jl exercises the reverse-mode gradient path, so
     # the integration environment also needs the AD and benchmarking stack.
-    Pkg.add(["DifferentiationInterface", "Enzyme", "BenchmarkTools"])
+    # test_ppl_glm_nonallocating_ad.jl needs the PPL surface plus Distributions
+    # oracles for its independent references.
+    Pkg.add(["DifferentiationInterface", "Enzyme", "BenchmarkTools",
+             "Distributions"])
     Pkg.develop(path = root)
     # test_nonallocating_mnist.jl runs the real MNIST example graph. Julia 1.10
     # ignores [sources], so the nested example packages are developed by path.
     Pkg.develop(path = joinpath(root, "packages",
                                 "ReactiveKernelsDistributionKernels"))
+    Pkg.develop(path = joinpath(root, "packages", "ReactiveKernelsPPL"))
     Pkg.develop(path = joinpath(root, "packages", "ReactiveKernelsPPLExamples"))
     Pkg.instantiate()
 
