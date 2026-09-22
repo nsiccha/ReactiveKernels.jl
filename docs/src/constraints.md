@@ -56,8 +56,9 @@ The experimental rectangular PK path retains its loops and lazy branches but
 still fails reverse compilation. Its eager-branch and data-derived unrolling
 workarounds are not acceptable fixes. See the [scan limitations](scan.md).
 
-Two further backend limitations are isolated with standalone reproducers under
-`benchmark/` (Reactant and its AD engine only, no ReactiveKernels code):
+Three further backend limitations are isolated with standalone reproducers
+under `benchmark/` (the backend and its AD engine only, no ReactiveKernels
+code):
 
 - A lazy branch inside a batched plate cell compiles and evaluates for every
   lane count, but reverse compilation through it fails once the batching pass
@@ -72,3 +73,11 @@ Two further backend limitations are isolated with standalone reproducers under
   `repro_reactant_adaptive_while_reverse.jl`. The solver keeps the retained
   loop; its supported gradient is the backsolve adjoint, which differentiates
   only the loop-free right-hand side.
+- Native Enzyme reverse mode aborts the process (an LLVM assertion in its
+  C-level `lgamma_r` handling) when lazily evaluated branches around
+  `loggamma`/`logbeta` sit in non-inlined functions differentiated together,
+  one inside a loop: `repro_enzyme_lgamma_branch.jl`. That is the shape of a
+  guarded `logpdf` plus an observation plate. The lazy guards stay;
+  `ReactiveKernelsDistributionKernels` registers Julia-level reverse rules for
+  `loggamma` and `logabsgamma` (derivative `digamma`) in its Enzyme extension,
+  so the C handler is never reached.
