@@ -13,6 +13,7 @@ n = BridgeStan.param_unc_num(sm)
 z = Vector{Float64}(0.1 .* randn(Xoshiro(20260917), n))
 PR = get(ENV, "PROPTO", "1") == "1"
 lp, grad = log_density_gradient(sm, z; propto = PR) # warmup
+log_density(sm, z; propto = PR) # warmup eval entry point (first call pays lazy init)
 @printf("lp=%.6f finite=%s grad_norm=%.4f all_finite=%s\n",
     lp, isfinite(lp), sqrt(sum(abs2, grad)), all(isfinite, grad))
 t_eval = @elapsed for _ in 1:20

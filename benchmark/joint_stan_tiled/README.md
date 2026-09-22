@@ -64,3 +64,51 @@ tiling replicates each subject's ragged segment with no index remap.
   the same program), independent of the pipeline — filed as snag
   `reactant-ad-comp-c1319307` on ReactiveKernels.  The compiled AD path
   itself is proven on the tiny model in `test_reactant_joint.jl`.
+
+## Rerun on `9710c51` (2026-09-22, `rerun_20260922_9710c51` in `results.json`)
+
+Fresh native + Stan rows on the constraint-repair base (lazy TGI
+branches, O(1) grouped emission intact, joint PK Reactant path
+explicitly rejected per issue #13).  RKPPL run twice per K (reps
+shown); Stan fresh at every cell (K=3 p0 repeated once).
+
+Per-call steady state, ms (eval / grad; both reps shown where they differ):
+
+| K | obs | Stan p=1 | Stan p=0 | RKPPL native |
+| --- | --- | --- | --- | --- |
+| 1 | 7 | 0.12 / 0.18 | 0.05 / 0.29 | 0.02 / 0.64, 0.30 |
+| 3 | 21 | 0.33 / 0.54 | 0.10 / 0.53 | 0.04 / 0.83, 0.66 |
+| 10 | 70 | 1.08 / 2.02 | 0.24 / 1.80 | 0.11, 0.09 / 1.30, 2.48 |
+| 30 | 210 | 4.04 / 7.70 | 0.69 / 7.78 | 0.28 / 4.50, 3.42 |
+
+One-time costs per session, s (bind / build / grad-prep, rep1):
+
+| K | bind | build | grad-prep |
+| --- | --- | --- | --- |
+| 1 | 7.8 | 22.9 | 20.9 |
+| 3 | 7.4 | 22.5 | 20.8 |
+| 10 | 7.4 | 21.9 | 20.3 |
+| 30 | 7.2 | 21.8 | 20.9 |
+
+Deltas vs the O(1) brief table (base `802f9b6`): RKPPL eval
+identical; build/prep still flat (~22 s / ~20 s); RKPPL grad reps
+bracket the old singletons (0.23/0.67/1.85/3.53) — no detectable
+regression from the lazy TGI branches, ~2x rep spread is box
+contention.  Stan p=1 reproduces (slightly faster, lower load).  Stan
+p=0 eval is new clean steady state (old cells included the unwarmed
+first-call init, ~0.5 ms/rep); fresh p=0 eval < p=1 eval at every K
+with identical grad_norm across propto — Stan codegen quirk, noted
+not investigated.
+
+Correctness: Stan pinned point1 lp exact to 10 digits after the fresh
+69.5 s compile; RKPPL lp bit-identical across repeats at every K
+(recorded per cell); `test_joint_emitter.jl` + `test_joint_parity.jl`
+277/277 on this base.  Reactant: joint PK unavailable (issue #13, see
+`rectangular_lowering.md`); no joint reverse or K=10 Reactant runs
+attempted.  Tiled Stan inputs regenerated and byte-identical to the
+2026-09-21 files (oracle md5 `3bc847e67338a12aa0c3dd45cd99b191`).
+
+Harness fix in this run: `bench_stan.jl` now warms `log_density`
+before the eval loop (first call pays ~10 ms lazy init, which had
+polluted the 20-rep mean by ~0.5 ms/rep: unwarmed K=1 p1 eval read
+0.63–0.71 ms vs 0.12 ms warmed).
