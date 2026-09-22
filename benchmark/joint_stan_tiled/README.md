@@ -53,12 +53,14 @@ tiling replicates each subject's ragged segment with no index remap.
   attempt on 2026-09-21 was SIGTERMed at 6.8 GB).  An O(1) XLA program
   needs the per-subject recurrence as a traced loop over a rectangular
   op table (root RK feature, not in this run).
-- Gradient (`compile_ad_value_and_gradient`): six K=1 attempts, none
+- Gradient (`compile_ad_value_and_gradient`): seven K=1 attempts, none
   returned.  Attempts 1–5 (contended box; unrolled and batched programs,
   default and `no_slice_slice` pipelines) were SIGTERMed by kb-earlyoom
   after 9–12 min at 4.2–5.95 GB RSS (snag `strato2-earlyoom-cf96ec60`).
-  Attempt 6 on an idle host (13 GB available) grew to 13.3 GB RSS in
-  8.3 min before the kill — the reverse compile's own requirement, more
-  than 3.5× the primal compile of the same program — filed as snag
+  Attempts 6 (`default`) and 7 (`no_slice_slice`), each alone on an idle
+  host with 13–14 GB available, stayed under 2 GB for 7 min and then
+  grew to 13.3 GB / 14.2 GB RSS within ~90 s before the kill at ~8 min —
+  the reverse compile's own requirement (> 3.5× the primal compile of
+  the same program), independent of the pipeline — filed as snag
   `reactant-ad-comp-c1319307` on ReactiveKernels.  The compiled AD path
   itself is proven on the tiny model in `test_reactant_joint.jl`.
