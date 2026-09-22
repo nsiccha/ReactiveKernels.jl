@@ -1113,6 +1113,12 @@ _recurrence_trace(x) = x
 _recurrence_trace(x::Tuple) = map(_recurrence_trace, x)
 _recurrence_trace(x::NamedTuple) = map(_recurrence_trace, x)
 _recurrence_trace(x::AbstractArray) = Reactant.promote_to(Reactant.TracedRArray, x)
+# A traced array enters a retained loop as a FRESH tracer object: the loop
+# writes each carry slot's result back into the object it was seeded from,
+# and seeding from a state field's own tracer would silently advance that
+# field even where the caller later selects the pre-loop value (a masked
+# iteration of the predicated machine kept stepping the HMC phase point).
+_recurrence_trace(x::Reactant.TracedRArray) = copy(x)
 # A `Diagonal` rides a retained loop as its backing vector — never as the
 # dense matrix `promote_to` would materialize — and is rebuilt from the
 # pre-loop schema (`_sm_restore_source_logical_wrappers`) before source code
