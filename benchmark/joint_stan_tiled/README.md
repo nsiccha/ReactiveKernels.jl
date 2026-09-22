@@ -44,15 +44,21 @@ tiling replicates each subject's ragged segment with no index remap.
   1.9e-16 vs native at two points; compile 211–227 s at 3.8 GB peak RSS;
   eval 0.03–0.17 ms device-resident (noise on a contended box; native
   0.016–0.018 ms at n_obs=7).
-- K=3 primal: the XLA program still grows with K — Reactant traces the
+- K=3 primal (idle host, 2026-09-22): parity 7.3e-16 vs native at two
+  points; compile 206.6 s at 8.6 GB peak RSS; eval 0.026 ms (native
+  0.033 ms).  The XLA program still grows with K — Reactant traces the
   runtime subject loop unrolled (bound `op_ends`, exact values,
-  `reactivekernels-use` §7c) — and the compile was SIGTERMed by
-  kb-earlyoom at 6.8 GB RSS after 4.5 min; K=10 not attempted.  An O(1)
-  XLA program needs the per-subject recurrence as a traced loop over a
-  rectangular op table (root RK feature, not in this run).
-- Gradient (`compile_ad_value_and_gradient`): all five K=1 attempts
-  (unrolled and batched programs, default and `no_slice_slice`
-  pipelines) were SIGTERMed by kb-earlyoom after 9–12 min at >4.2 GB RSS
-  before the compile returned — `/var/log/kb-earlyoom/kills.log`, snag
-  `strato2-earlyoom-cf96ec60`.  The compiled AD path itself is proven on
-  the tiny model in `test_reactant_joint.jl`.
+  `reactivekernels-use` §7c): 3.8 GB at K=1, 8.6 GB at K=3, so K=10
+  extrapolates to ~25 GB and was not attempted (the contended-box K=3
+  attempt on 2026-09-21 was SIGTERMed at 6.8 GB).  An O(1) XLA program
+  needs the per-subject recurrence as a traced loop over a rectangular
+  op table (root RK feature, not in this run).
+- Gradient (`compile_ad_value_and_gradient`): six K=1 attempts, none
+  returned.  Attempts 1–5 (contended box; unrolled and batched programs,
+  default and `no_slice_slice` pipelines) were SIGTERMed by kb-earlyoom
+  after 9–12 min at 4.2–5.95 GB RSS (snag `strato2-earlyoom-cf96ec60`).
+  Attempt 6 on an idle host (13 GB available) grew to 13.3 GB RSS in
+  8.3 min before the kill — the reverse compile's own requirement, more
+  than 3.5× the primal compile of the same program — filed as snag
+  `reactant-ad-comp-c1319307` on ReactiveKernels.  The compiled AD path
+  itself is proven on the tiny model in `test_reactant_joint.jl`.
