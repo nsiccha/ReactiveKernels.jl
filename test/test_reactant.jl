@@ -871,75 +871,68 @@ end
         @test !occursin("for ", string(both.f.tensorized_ast))
     end
 
-    @testset "small static plates lower as scalar lanes" begin
-        ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt)
-        lane_limit = ext._REACTANT_SMALL_STATIC_PLATE_LANES
-        optimized_hlo(kernel, args...) =
-            repr(Reactant.@code_hlo optimize = true kernel(args...))
-
-        x_host = collect(range(-1.0, 1.0; length = 12))
-        locations_host = collect(range(-0.2, 0.4; length = 12))
-        scales_host = collect(range(0.8, 1.1; length = 12))
-        reference = @. -0.5 * log(2π) - log(scales_host) -
-            0.5 * ((x_host - locations_host) / scales_host)^2
+    @testset "plates never unroll into per-lane scalar programs" begin
+        # A plate's lane count is a data length, so the emitted program must
+        # not replicate the cell body per lane even for a small,
+        # preparation-known count (docs/src/constraints.md).  Compare the
+        # unoptimized HLO across two lane counts: only tensor shapes differ.
+        program_lines(kernel, args...) = count(
+            "\n", repr(Reactant.@code_hlo optimize = false kernel(args...)))
+        function normal_inputs(n)
+            x_host = collect(range(-1.0, 1.0; length = n))
+            locations_host = collect(range(-0.2, 0.4; length = n))
+            scales_host = collect(range(0.8, 1.1; length = n))
+            reference = @. -0.5 * log(2π) - log(scales_host) -
+                0.5 * ((x_host - locations_host) / scales_host)^2
+            (x_host, locations_host, scales_host, reference)
+        end
         total = prepare(reactant_authored_normal_loglik)
         both = prepare(extract(
             reactant_authored_normal_loglik;
             want = (:pointwise, :__return__)))
-        x = Reactant.to_rarray(x_host)
-        locations = Reactant.to_rarray(locations_host)
-        scales = Reactant.to_rarray(scales_host)
-        @test length(x_host) <= lane_limit[]
-
-        # A total-only cut of a small plate is a scalar program: no batched
-        # region, no vector reduction, and no lane vector materialized.
-        lane_hlo = optimized_hlo(total, x, locations, scales)
-        @test !occursin("enzyme.batch", lane_hlo)
-        @test !occursin("stablehlo.reduce", lane_hlo)
-        @test !occursin("stablehlo.concatenate", lane_hlo)
-        lane_total = @compile total(x, locations, scales)
-        @test lane_total(x, locations, scales) ≈ sum(reference)
-        lane_both = @compile both(x, locations, scales)
-        lane_pointwise, lane_sum = lane_both(x, locations, scales)
-        @test Array(lane_pointwise) ≈ reference
-        @test lane_sum ≈ sum(reference)
-
-        # Above the lane limit the same plate keeps the batched lowering.
-        previous_limit = lane_limit[]
-        try
-            lane_limit[] = length(x_host) - 1
-            batched_hlo = optimized_hlo(total, x, locations, scales)
-            @test occursin("stablehlo.reduce", batched_hlo)
-            batched_total = @compile total(x, locations, scales)
-            @test batched_total(x, locations, scales) ≈ sum(reference)
-        finally
-            lane_limit[] = previous_limit
+        sizes = Int[]
+        for n in (6, 12)
+            x_host, locations_host, scales_host, reference = normal_inputs(n)
+            x = Reactant.to_rarray(x_host)
+            locations = Reactant.to_rarray(locations_host)
+            scales = Reactant.to_rarray(scales_host)
+            push!(sizes, program_lines(total, x, locations, scales))
+            compiled_total = @compile total(x, locations, scales)
+            @test compiled_total(x, locations, scales) ≈ sum(reference)
+            compiled_both = @compile both(x, locations, scales)
+            pointwise, plate_sum = compiled_both(x, locations, scales)
+            @test Array(pointwise) ≈ reference
+            @test plate_sum ≈ sum(reference)
         end
+        @test sizes[1] == sizes[2]
 
-        # Column lanes of a small eachcol plate take the same scalar path.
-        scores_host = reshape(collect(1.0:15.0) ./ 7, 3, 5)
-        weights_host = collect(range(0.5, 1.5; length = 5))
+        # Column plates over a small eachcol matrix keep the batched lowering.
         eachcol_kernel = prepare(reactant_small_eachcol_plate)
-        eachcol_reference = sum(
-            weights_host[j] * sum(scores_host[:, j]) for j in 1:5)
-        @test eachcol_kernel(scores_host, weights_host) ≈ eachcol_reference
-        scores = Reactant.to_rarray(scores_host)
-        weights = Reactant.to_rarray(weights_host)
-        @test !occursin("enzyme.batch", optimized_hlo(eachcol_kernel, scores, weights))
-        compiled_eachcol = @compile eachcol_kernel(scores, weights)
-        @test compiled_eachcol(scores, weights) ≈ eachcol_reference
+        column_sizes = Int[]
+        for columns in (5, 10)
+            scores_host = reshape(collect(1.0:(3 * columns)) ./ 7, 3, columns)
+            weights_host = collect(range(0.5, 1.5; length = columns))
+            eachcol_reference = sum(
+                weights_host[j] * sum(scores_host[:, j]) for j in 1:columns)
+            @test eachcol_kernel(scores_host, weights_host) ≈ eachcol_reference
+            scores = Reactant.to_rarray(scores_host)
+            weights = Reactant.to_rarray(weights_host)
+            push!(column_sizes, program_lines(eachcol_kernel, scores, weights))
+            compiled_eachcol = @compile eachcol_kernel(scores, weights)
+            @test compiled_eachcol(scores, weights) ≈ eachcol_reference
+        end
+        @test column_sizes[1] == column_sizes[2]
     end
 
-    @testset "bound host data arrays in plates above the lane limit" begin
-        # `bound=` data stays a host array inside the traced program.  Above
-        # the scalar-lanes limit both large-plate lowerings must promote it:
-        # the broadcast lowering deduces its eltype from the RAW host element
-        # type (a guarded count cell then infers `Number`, which has no traced
-        # `similar`), and the batched lowering only recognizes traced arrays as
-        # explicit batch inputs (a host lane vector was captured as a SHARED
-        # closure value, handing the whole vector to every lane's cell).
-        ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt)
-        n = ext._REACTANT_SMALL_STATIC_PLATE_LANES[] + 4
+    @testset "bound host data arrays in plates" begin
+        # `bound=` data stays a host array inside the traced program.  Both
+        # plate lowerings must promote it: the broadcast lowering deduces its
+        # eltype from the RAW host element type (a guarded count cell then
+        # infers `Number`, which has no traced `similar`), and the batched
+        # lowering only recognizes traced arrays as explicit batch inputs (a
+        # host lane vector was captured as a SHARED closure value, handing the
+        # whole vector to every lane's cell).
+        n = 20
 
         counts_host = collect(0:(n - 1))
         rates_host = collect(range(0.5, 4.0; length = n))

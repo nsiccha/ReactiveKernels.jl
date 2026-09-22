@@ -1124,8 +1124,7 @@ end
 # and both large-plate lowerings below need it promoted before they classify
 # or broadcast operands (see `_reactant_plate_operand` for the two failures).
 # Already-traced operands and `Ref`-wrapped shared scalars pass through
-# untouched, so an all-traced plate lowers exactly as before; the <= 16-lane
-# scalar-lanes path never reaches this promotion.
+# untouched, so an all-traced plate lowers exactly as before.
 @inline _reactant_plate_operand(arg) = arg
 @inline _reactant_plate_operand(arg::Reactant.TracedRArray) = arg
 @inline _reactant_plate_operand(arg::AbstractArray) =
@@ -1143,8 +1142,6 @@ end
 
 function _reactant_authored_plate_call(marker, operation, args::Tuple)
     count = _authored_plate_batch_length(marker)
-    lanes = _reactant_plate_lanes(count, operation, args)
-    lanes === nothing || return lanes
     # Only traced arrays and the structural markers count as explicit batch
     # inputs below, so a host lane vector (a `bound=` data vector beside a
     # traced `eachcol` matrix) would otherwise be captured as a SHARED closure
@@ -1179,35 +1176,12 @@ function ReactiveKernels._tensorized_plate_call(
     _reactant_authored_plate_call(marker, operation, args)
 end
 
-# --- Small static plates lower as scalar lane programs -----------------------
-# A plate over a small, statically sized axis is evaluated once per lane with
-# scalar (or column) operands, the lane results stay scalars, and the authored
-# `sum(pointwise)` reduces them with a scalar add chain.  The vectorized
-# lowering is correct but structurally slower on XLA's CPU backend: computed
-# scalars broadcast across lanes and a lane vector reused by several plates
-# are producers XLA refuses to fuse into their consumers, and each
-# `stablehlo.reduce` is another kernel boundary, so one small posterior
-# becomes several kernel launches where a hand-unrolled loop is one.  Keeping
-# small plates scalar restores that single-kernel shape without any
-# model-specific recognition; larger plates keep the batched/broadcast
-# lowering, so accelerator-scale plates are unchanged.  The lane vector is
-# materialized only when a pointwise result is actually demanded.
-const _REACTANT_SMALL_STATIC_PLATE_LANES = Ref(16)
-
-struct _PlateLanes{L<:Tuple}
-    lanes::L
-end
-
-ReactiveKernels._tensorized_plate_is_marker(::_PlateLanes) = true
-ReactiveKernels._tensorized_plate_materialize(value::_PlateLanes) =
-    vcat(value.lanes...)
-ReactiveKernels._tensorized_plate_sum(value::_PlateLanes) =
-    foldl(+, value.lanes)
-function ReactiveKernels._tensorized_plate_call(
-        marker::_PlateLanes, operation, args::Tuple)
-    _reactant_authored_plate_call(marker, operation, args)
-end
-
+# Plates never lower as per-lane scalar programs.  A plate's lane count is a
+# data length (the observation axis), so replicating the cell body once per
+# lane — even for a small, preparation-known count — is the data-derived
+# unrolling `docs/src/constraints.md` forbids; every traced plate keeps the
+# batched (`Ops.batch`) or broadcast lowering, whose emitted program is
+# independent of the lane count.
 # Plain traced vectors carry no structural marker in the core, so without this
 # claim a vector plate lowers through Reactant's generic broadcast.  Claiming
 # them routes the plate here, where a large plate still takes exactly that
@@ -1240,7 +1214,6 @@ ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
     ::ReactiveKernels._TensorizedEachcol{<:Reactant.TracedRArray}) = true
 @inline _reactant_is_structural_marker(
     ::ReactiveKernels._TensorizedPlateBatch{<:Reactant.TracedRArray}) = true
-@inline _reactant_is_structural_marker(::_PlateLanes) = true
 @inline _reactant_structural_marker(::Tuple{}) = nothing
 @inline function _reactant_structural_marker(args::Tuple)
     arg = first(args)
@@ -1271,10 +1244,6 @@ function _reactant_ref_plate_call(operation, args::Tuple)
     # In particular, the shape of an atomic parameter never becomes a lane axis.
     shape = Int64[length(axis) for axis in Base.Broadcast.combine_axes(args...)]
     isempty(shape) && return operation(map(_reactant_plate_scalar_arg, args)...)
-    if length(shape) == 1
-        lanes = _reactant_plate_lanes(only(shape), operation, args)
-        lanes === nothing || return lanes
-    end
     positions = Tuple(index for index in eachindex(args)
         if getfield(args, index) isa Union{AbstractArray,Tuple})
     inputs = Reactant.TracedRArray[
@@ -1304,55 +1273,7 @@ function ReactiveKernels._tensorized_plate_call(
         return _reactant_authored_plate_call(structural, operation, args)
     any(_reactant_plate_ref_array, args) &&
         return _reactant_ref_plate_call(operation, args)
-    lanes = _reactant_plate_lanes(size(marker, 1), operation, args)
-    lanes === nothing ?
-        Base.broadcast(operation, map(_reactant_plate_operand, args)...) :
-        lanes
-end
-
-@inline _authored_plate_batch_length(arg::_PlateLanes) = length(arg.lanes)
-@inline _authored_plate_batch_input(arg::_PlateLanes) = Reactant.promote_to(
-    Reactant.TracedRArray, ReactiveKernels._tensorized_plate_materialize(arg))
-@inline _authored_plate_is_explicit_batch(arg::_PlateLanes, count) = true
-
-# How one plate operand participates in per-lane evaluation: `:lane` operands
-# contribute one value per lane, `:shared` operands are passed to every lane,
-# and `nothing` means the operand shape is outside this lowering, in which
-# case the whole plate keeps its batched or broadcast lowering.
-@inline _plate_lane_kind(arg::ReactiveKernels._TensorizedEachcol, count) =
-    size(arg.parent, 2) == count ? :lane : nothing
-@inline _plate_lane_kind(arg::ReactiveKernels._TensorizedPlateBatch, count) =
-    _plate_lane_kind(arg.values, count)
-@inline _plate_lane_kind(arg::_PlateLanes, count) =
-    length(arg.lanes) == count ? :lane : nothing
-@inline _plate_lane_kind(arg::AbstractArray, count) =
-    ndims(arg) == 1 && length(arg) == count ? :lane : nothing
-@inline _plate_lane_kind(arg::Base.RefValue, count) = :shared
-@inline _plate_lane_kind(arg::Number, count) = :shared
-@inline _plate_lane_kind(arg, count) = nothing
-
-@inline _plate_lane(arg::ReactiveKernels._TensorizedEachcol, lane) =
-    arg.parent[:, lane]
-@inline _plate_lane(arg::ReactiveKernels._TensorizedPlateBatch, lane) =
-    _plate_lane(arg.values, lane)
-@inline _plate_lane(arg::_PlateLanes, lane) = getfield(arg.lanes, lane)
-@inline _plate_lane(arg::AbstractVector, lane) = Reactant.@allowscalar arg[lane]
-
-function _reactant_plate_lanes(count, operation, args::Tuple)
-    1 <= count <= _REACTANT_SMALL_STATIC_PLATE_LANES[] || return nothing
-    kinds = map(arg -> _plate_lane_kind(arg, count), args)
-    any(kind -> kind === nothing, kinds) && return nothing
-    any(kind -> kind === :lane, kinds) || return nothing
-    shared = map(_authored_plate_shared, args)
-    lanes = ntuple(count) do lane
-        lane_args = ntuple(length(args)) do index
-            getfield(kinds, index) === :lane ?
-                _plate_lane(getfield(args, index), lane) :
-                getfield(shared, index)
-        end
-        operation(lane_args...)
-    end
-    _PlateLanes(lanes)
+    Base.broadcast(operation, map(_reactant_plate_operand, args)...)
 end
 
 @inline function ReactiveKernels._batched_call(
