@@ -5819,6 +5819,40 @@ function _sm_functional_control_loop(step, carry, marker)
     carry
 end
 
+# Retained loop of a functional state transition: `body` is one compiled
+# program `(ensures, controls, carry, index) -> carry` over a tuple carry of
+# canonical field values and lexical locals, run once per iteration of
+# `range`.  A backend extension specializes the backend method on its traced
+# marker to run the same body inside one retained loop region; the native
+# loop below is the default.
+@inline function _sm_transition_loop(body, ensures, controls, range, carry::Tuple)
+    _sm_transition_loop_backend(
+        _dynamic_tensorized_marker(carry), body, ensures, controls, range, carry)
+end
+function _sm_transition_loop_backend(marker, body, ensures, controls, range,
+                                     carry::Tuple)
+    for index in range
+        carry = body(ensures, controls, carry, index)
+    end
+    carry
+end
+
+# Canonical slots a transition loop body reads (its writes' right-hand sides
+# and local definitions, nested loops included).
+function _sm_transition_body_reads!(reads::Set{Int}, body, fields)
+    for statement in body
+        if statement isa _PlaceWrite
+            union!(reads, _exec_reads(statement.rhs, fields))
+        elseif statement isa _LocalAssign
+            union!(reads, _sm_local_reads(statement, fields))
+        elseif statement isa _For
+            union!(reads, _exec_reads(statement.iter, fields))
+            _sm_transition_body_reads!(reads, statement.body, fields)
+        end
+    end
+    reads
+end
+
 @inline _sm_predicated_safe_one(value::Number) = one(value)
 @inline _sm_predicated_safe_one(value::LinearAlgebra.Diagonal) =
     LinearAlgebra.Diagonal(one.(value.diag))
@@ -11288,19 +11322,92 @@ function _compile_state_transition(spec::KernelSpec, pf::_PreparedFactory,
                 delete!(stale, canon)
                 push!(current, canon)
             elseif statement isa _For
+                # A captured `Base.Colon` loop is RETAINED: its body is emitted
+                # once as its own program over a carry of every canonical
+                # field value and lexical local, and `_sm_transition_loop`
+                # iterates it (natively a loop; one retained region on a
+                # tracing backend).  Its bounds may be bound numeric data, so
+                # replicating the body per iteration is the data-derived
+                # unrolling `docs/src/constraints.md` forbids.  Derived-field
+                # currentness is a loop invariant: every slot the body reads
+                # is repaired before the loop and again at the end of each
+                # iteration, so the state of the currentness sets after one
+                # emitted iteration is the state after any number of them.
                 length(statement.var) == 1 || _sm_reject(
                     "static transition loop must bind one local")
                 values = _transition_static_value(statement.iter, static_bound)
                 values isa AbstractUnitRange || _sm_reject(
                     "static transition loop iterator must be an integer unit range")
-                length(values) <= 1024 || _sm_reject(
-                    "static transition loop has $(length(values)) iterations; maximum is 1024")
                 variable = only(statement.var)
-                for value in values
-                    syms[(:local, variable)] = value
-                    locals[variable] = false
-                    ltrees[variable] = _DLit{typeof(value)}
-                    emit_block!(statement.body)
+                haskey(locals, variable) && _sm_reject(
+                    "static transition loop variable `$variable` shadows a local")
+                body_reads = sort!(collect(_sm_transition_body_reads!(
+                    Set{Int}(), statement.body, fields)))
+                for canon in body_reads
+                    ensure!(canon)
+                end
+                carried_canons = sort!(collect(keys(names_by_canon)))
+                carried_locals = sort!(collect(keys(locals)); by = String)
+                carry_values = Any[
+                    (syms[(:field, first(names_by_canon[canon]))] for canon in carried_canons)...,
+                    (syms[(:local, name)] for name in carried_locals)...]
+                outer_statements = statements
+                statements = Any[]
+                carry_arg = fresh(:__ft_loop_carry_)
+                index_arg = fresh(:__ft_loop_index_)
+                position = 0
+                for canon in carried_canons
+                    position += 1
+                    symbol = fresh(:__ft_loop_field_, first(names_by_canon[canon]))
+                    push!(statements, :(local $symbol = getfield($carry_arg, $position)))
+                    for alias in names_by_canon[canon]
+                        syms[(:field, alias)] = symbol
+                    end
+                end
+                for name in carried_locals
+                    position += 1
+                    symbol = fresh(:__ft_loop_local_, name)
+                    push!(statements, :(local $symbol = getfield($carry_arg, $position)))
+                    syms[(:local, name)] = symbol
+                end
+                syms[(:local, variable)] = index_arg
+                locals[variable] = false
+                ltrees[variable] = _DLit{eltype(values)}
+                emit_block!(statement.body)
+                for canon in body_reads
+                    ensure!(canon)
+                end
+                outputs = Any[
+                    (syms[(:field, first(names_by_canon[canon]))] for canon in carried_canons)...,
+                    (syms[(:local, name)] for name in carried_locals)...]
+                push!(statements, :(return ($(outputs...),)))
+                body_program = compile(:((ensures, controls, $carry_arg, $index_arg) ->
+                    $(Expr(:block, statements...))))
+                push!(ensures, body_program)
+                body_index = length(ensures)
+                statements = outer_statements
+                delete!(syms, (:local, variable))
+                delete!(locals, variable)
+                delete!(ltrees, variable)
+                result = fresh(:__ft_loop_result_)
+                controls_value = isempty(runtime_controls) ? :nothing : :controls
+                push!(statements, :(local $result = _sm_transition_loop(
+                    getfield(ensures, $body_index), ensures, $controls_value,
+                    $values, ($(carry_values...),))))
+                position = 0
+                for canon in carried_canons
+                    position += 1
+                    symbol = fresh(:__ft_loop_out_, first(names_by_canon[canon]))
+                    push!(statements, :(local $symbol = getfield($result, $position)))
+                    for alias in names_by_canon[canon]
+                        syms[(:field, alias)] = symbol
+                    end
+                end
+                for name in carried_locals
+                    position += 1
+                    symbol = fresh(:__ft_loop_out_, name)
+                    push!(statements, :(local $symbol = getfield($result, $position)))
+                    syms[(:local, name)] = symbol
                 end
             elseif statement isa _Return
                 statement_index == length(body) || _sm_reject(

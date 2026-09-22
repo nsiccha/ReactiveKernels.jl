@@ -554,12 +554,14 @@ conversion, including Float64 intermediates written into Float32 storage.
 The initial public source subset is intentionally finite. It admits direct
 owned-field writes, exact captured `map(copy, tuple)`, tuple and named
 destructuring, bound non-Boolean numeric controls, and integer `Base.Colon`
-loops whose bounds are entirely static. The current implementation unrolls
-these loops during lowering so validity is propagated through every authored
-iteration. Under the [core constraints](constraints.md), this is permissible
-only for fixed structural bounds: a bound derived from runtime or bound data
-must retain iteration or reject. Compile-time availability alone is insufficient;
-existing data-derived unrolling is a limitation to remove. Indexed destinations,
+loops whose bounds are entirely static. Such a loop is retained: its body is
+compiled once as its own program over a carry of every canonical field value
+and lexical local, and runs natively as an ordinary loop or as one retained
+loop region on a tracing backend, whatever the bound — a bound may be bound
+numeric data, so the body is never replicated per iteration
+([core constraints](constraints.md)). Derived-field currentness is a loop
+invariant: every slot the body reads is repaired before the loop and at the
+end of each iteration. Indexed destinations,
 data-dependent branches/loops, arbitrary higher-order calls, and opaque
 callbacks reject. Callback computations used by endpoint recipes must be
 explicit endpoint ports so their authority is auditable and their identity is

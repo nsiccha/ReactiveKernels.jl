@@ -1071,6 +1071,20 @@ function ReactiveKernels._rectangular_fold_impl(
     carry
 end
 
+# A functional state transition's captured `Base.Colon` loop: the body
+# program runs inside one `stablehlo.while` region whatever the bound (the
+# bound may be bound numeric data).  Host carry leaves are lifted once before
+# the loop and traced scalars copied, so every carry slot has its own
+# identity (`_recurrence_trace`).
+function ReactiveKernels._sm_transition_loop_backend(
+        ::Reactant.TracedType, body, ensures, controls, range, carry::Tuple)
+    carry = _recurrence_trace(carry)
+    Reactant.@trace track_numbers = false for index in range
+        carry = body(ensures, controls, carry, index)
+    end
+    carry
+end
+
 function ReactiveKernels._recurrence_branch(
         pred::Reactant.TracedRNumber{Bool}, yes, no, args)
     Reactant.@trace if pred
