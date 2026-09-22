@@ -155,7 +155,9 @@ end
   sequence beside a host later sequence is rejected, so pass every sequence
   traced via `Reactant.to_rarray(data)` on the 1-D path. Native and Reactant
   results match to floating-point tolerance (see
-  `test/test_ppl_examples_reactant.jl`).
+  `test/test_ppl_examples_reactant.jl`). This host-data unrolling is an existing
+  violation of the [core constraints](constraints.md), not a supported design
+  direction. It requires retained iteration or explicit rejection.
 
 ## Generated grouped recurrences
 

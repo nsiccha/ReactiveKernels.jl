@@ -554,9 +554,12 @@ conversion, including Float64 intermediates written into Float32 storage.
 The initial public source subset is intentionally finite. It admits direct
 owned-field writes, exact captured `map(copy, tuple)`, tuple and named
 destructuring, bound non-Boolean numeric controls, and integer `Base.Colon`
-loops whose bounds are entirely static. Static loops are unrolled during
-lowering so validity is propagated through every authored iteration; this is
-not a host loop around traced execution. Indexed destinations,
+loops whose bounds are entirely static. The current implementation unrolls
+these loops during lowering so validity is propagated through every authored
+iteration. Under the [core constraints](constraints.md), this is permissible
+only for fixed structural bounds: a bound derived from runtime or bound data
+must retain iteration or reject. Compile-time availability alone is insufficient;
+existing data-derived unrolling is a limitation to remove. Indexed destinations,
 data-dependent branches/loops, arbitrary higher-order calls, and opaque
 callbacks reject. Callback computations used by endpoint recipes must be
 explicit endpoint ports so their authority is auditable and their identity is
@@ -687,7 +690,9 @@ returns, structured aliases, and effect state travel through the generated loop
 operands. Validated external callable identities are recovered from compiler
 bindings rather than copied through those operands; numeric and array external
 values remain operands. Methods with value returns or host-drained observational records retain
-the existing bounded unrolling path.
+the existing bounded unrolling path. Where its allowance derives from data,
+that path violates the [core constraints](constraints.md) and requires retained
+control flow or explicit rejection; it is not an exception to the rule.
 
 The retained loop checks its finite allowance with an unsigned distance, which
 represents the mathematical distance even when signed subtraction wraps. Its

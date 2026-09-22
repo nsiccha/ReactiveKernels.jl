@@ -32,6 +32,10 @@ features:
 
 ## Overview
 
+All lowering work follows the [core constraints](constraints.md): retain
+data-dependent iteration and preserve lazy branch semantics, including for
+data bound during preparation.
+
 `ReactiveKernels.jl` is a **have → want** computational-graph kernel layer. You
 describe a computation once as a transparent graph of named values and the
 operations connecting them; you declare what you already **have** and what you

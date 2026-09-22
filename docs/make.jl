@@ -46,6 +46,7 @@ include("gibbs_page.jl")
 
 site_pages = [
     "Home" => "index.md",
+    "Core constraints" => "constraints.md",
     "Compiler capability and limits" => "compiler.md",
     "Position batching (vectorize)" => "position-batching.md",
     "Sequential recurrences (scan)" => "scan.md",
