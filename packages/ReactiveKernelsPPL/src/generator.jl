@@ -95,15 +95,19 @@ import ..positive_bijector, ..unit_bijector
 # In-model grouping encoder (`_ppl_gidx_<group>` nodes call it with the
 # raw column + literal declared levels).
 import .._declared_codes
-# Grouped-kernel cell vocabulary (one call per subject over bound
-# op-column slices plus traced LP scalars). Every `import` here binds
-# when this file loads — names defined by LATER includes (the
-# per-element TGI likelihood cells the joint plates call) cannot
-# register here; they import after their file loads (see the bottom of
+# Grouped-kernel cell vocabulary: the subject-batched runners (one call
+# per cell assignment over the bound op columns + `op_ends`, per-subject
+# args marked `SubjectScalar` / `SubjectSlice`) and the cells they run.
+# Every `import` here binds when this file loads — names defined by
+# LATER includes (`tgi_segmented_nadir` and the per-element TGI
+# likelihood cells the joint plates call) cannot register here; they
+# import after their file loads (see the bottom of
 # `ReactiveKernelsPPL.jl`).
 import ..linear_pk_read_locs, ..linear_pk_read_locs_auc
+import ..linear_pk_read_locs_over_subjects,
+    ..linear_pk_read_locs_auc_over_subjects, ..SubjectScalar, ..SubjectSlice
 # Event-LP provider (one call over the flat event axis — the flat
-# `log_F` local the per-subject expansion slices).
+# `log_F` local the batched cell runner slices per subject).
 import ..linear_pk_event_log_f
 end
 
@@ -612,67 +616,45 @@ function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
     return stmts, _lik_name(klabel)
 end
 
-# One grouped cell assignment: CELL_FN calls expand to per-subject calls
-# over static op slices + LP scalars (then vcat flat under the surface
-# name); segmented-nadir calls unroll one single-scan segment per
-# subject; gathers rewrite `v[sched.map]` to `vflat[mapcol]`; slice
+# One grouped cell assignment — always ONE emitted statement, whatever
+# the subject count (the generated program's statement count is O(1) in
+# the data; only the layout, the bound columns and runtime loop trip
+# counts scale with it): CELL_FN calls emit the subject-batched runner
+# over the bound `op_ends` + op columns with marked per-subject args;
+# segmented-nadir calls emit `tgi_segmented_nadir` over the bound ends
+# column; gathers rewrite `v[sched.map]` to `vflat[mapcol]`; slice
 # do-params rewrite to their bound columns (kernel ports are column
 # names — the panel flatmap precedent); everything else emits verbatim
 # (bind proved shapes).
 function _grouped_cell_assignment(nm::Symbol, ex, kp::KernelPlate,
-        sched::LinearPKScheduleSpec, op_ends::AbstractVector, n_sub::Int,
-        lps::Dict{Symbol,Symbol}, columns::Dict{Symbol,ColumnData},
-        flatmap::Dict{Symbol,Symbol})
+        sched::LinearPKScheduleSpec, lps::Dict{Symbol,Symbol},
+        columns::Dict{Symbol,ColumnData}, flatmap::Dict{Symbol,Symbol})
     if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
             ex.args[1] isa Symbol && ex.args[1] in CELL_FNS
-        return _expand_grouped_cell_call(nm, ex, kp, sched, op_ends, n_sub,
-            lps)
+        return _expand_grouped_cell_call(nm, ex, sched, lps)
     end
     if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
             ex.args[1] isa Symbol && ex.args[1] in SEGMENT_CELL_FNS
-        return _expand_segmented_nadir_call(nm, ex, kp, n_sub, columns,
-            flatmap)
+        return _expand_segmented_nadir_call(nm, ex, columns, flatmap)
     end
     return Expr[:($nm = $(_rewrite_grouped_gather(ex, sched, lps, flatmap)))]
 end
 
-# Segmented-nadir unroll: one `tgi_nadir_scan_expr` per subject over a
-# static range-copy of the subject's rows (then vcat flat under the
-# surface name, the cell-call precedent). Copies, not views: `scan`
-# over a view scalar-indexes under Reactant's tensorized scan, and an
-# empty view breaks the vcat's homogeneity under Enzyme AD. Empty
-# segments emit an empty range-copy (`scan` needs a non-empty sequence
-# — the tgi contract). The ends are static bind data (the validator
-# proved the segment contract), so all ranges freeze at codegen.
-function _expand_segmented_nadir_call(nm::Symbol, ex::Expr, kp::KernelPlate,
-        n_sub::Int, columns::Dict{Symbol,ColumnData},
-        flatmap::Dict{Symbol,Symbol})
+# Segmented nadir: the surface call emits verbatim over the bound ends
+# column — `tgi_segmented_nadir` (tgi.jl) runs the per-segment running
+# minimum as a plain eltype-generic loop (native, Enzyme, and Reactant,
+# where the traced change vector is read through the traced-gather hook
+# and the loop unrolls at trace time).  Empty segments are the
+# function's own concern (it returns an empty block for them).
+function _expand_segmented_nadir_call(nm::Symbol, ex::Expr,
+        columns::Dict{Symbol,ColumnData}, flatmap::Dict{Symbol,Symbol})
     # The change vector may be a bare response slice (shapes admit
     # slices — `(:obs, len)`); slice do-params ride their columns.
     change = _kernel_obs_ref(ex.args[2], flatmap)
     endscol = ex.args[3]
-    ends = columns[endscol]
-    stmts = Expr[]
-    per_sub = Symbol[]
-    prev = 0
-    for s in 1:n_sub
-        hi = Int(ends[s])
-        lo = prev + 1
-        rsym = Symbol(:_ppl_k_, kp.result, :_, nm, :_s, s)
-        if lo > hi
-            push!(stmts, :($rsym = $change[1:0]))
-        else
-            rng = Expr(:call, :(:), lo, hi)
-            seq = Expr(:ref, change, rng)
-            push!(stmts, tgi_nadir_scan_expr(seq, rsym))
-        end
-        push!(per_sub, rsym)
-        prev = hi
-    end
-    flat = length(per_sub) == 1 ? only(per_sub) :
-        Expr(:call, :vcat, per_sub...)
-    push!(stmts, :($nm = $flat))
-    return stmts
+    haskey(columns, endscol) || throw(ContractValidationError(
+        "[generator] segmented nadir ends column `$endscol` is not bound"))
+    return Expr[:($nm = $(ex.args[1])($change, $endscol))]
 end
 
 function _rewrite_grouped_gather(ex, sched::LinearPKScheduleSpec,
@@ -708,59 +690,51 @@ function _rewrite_grouped_gather(ex, sched::LinearPKScheduleSpec,
             for a in ex.args)...)
 end
 
-function _expand_grouped_cell_call(nm::Symbol, ex::Expr, kp::KernelPlate,
-        sched::LinearPKScheduleSpec, op_ends::AbstractVector, n_sub::Int,
-        lps::Dict{Symbol,Symbol})
+# The subject-batched cell statement: `<fn>_over_subjects(<sched>_op_ends,
+# <sched>_<opfield>..., args...)` (pkcells.jl), each extra arg marked by
+# its per-subject access — LP cell params `SubjectScalar(<lp vector>)`
+# (entry `s`), flat event-frame vectors `SubjectSlice(v)` (the subject's
+# op range), everything else verbatim.  The runner slices the op columns
+# at runtime from the bound `op_ends`, so the statement is the same for
+# one subject or ten thousand.
+_over_subjects_name(fn::Symbol) = Symbol(fn, :_over_subjects)
+
+function _expand_grouped_cell_call(nm::Symbol, ex::Expr,
+        sched::LinearPKScheduleSpec, lps::Dict{Symbol,Symbol})
     fn = ex.args[1]
     callargs = ex.args[2:end]
     opfields = CELL_FN_OP_FIELDS[fn]
     sliced = get(CELL_FN_SLICED_ARGS, fn, Symbol[])
-    stmts = Expr[]
-    per_sub = Symbol[]
-    for s in 1:n_sub
-        lo = s == 1 ? 1 : Int(op_ends[s-1]) + 1
-        hi = Int(op_ends[s])
-        rng = Expr(:call, :(:), lo, hi)
-        args = Any[]
-        for field in opfields
-            push!(args, Expr(:call, :view,
-                _sched_col_name(sched.name, field), rng))
-        end
-        for a in callargs[2:end]
-            if a isa Symbol && haskey(lps, a)
-                lpsym = Symbol(:_ppl_k_, kp.result, :_, a, :_s, s)
-                srg = Expr(:call, :(:), s, s)
-                push!(stmts, :($lpsym = sum(view($(lps[a]), $srg))))
-                push!(args, lpsym)
-            elseif a isa Symbol && a in sliced
-                push!(args, Expr(:call, :view, a, rng))
-            else
-                push!(args, a)
-            end
-        end
-        rsym = Symbol(:_ppl_k_, kp.result, :_, nm, :_s, s)
-        push!(stmts, :($rsym = $(Expr(:call, fn, args...))))
-        push!(per_sub, rsym)
+    args = Any[_sched_col_name(sched.name, :op_ends)]
+    for field in opfields
+        push!(args, _sched_col_name(sched.name, field))
     end
-    flat = length(per_sub) == 1 ? only(per_sub) :
-        Expr(:call, :vcat, per_sub...)
-    push!(stmts, :($nm = $flat))
-    return stmts
+    for a in callargs[2:end]
+        if a isa Symbol && haskey(lps, a)
+            push!(args, :(SubjectScalar($(lps[a]))))
+        elseif a isa Symbol && a in sliced
+            push!(args, :(SubjectSlice($a)))
+        else
+            push!(args, a)
+        end
+    end
+    return Expr[:($nm = $(Expr(:call, _over_subjects_name(fn), args...)))]
 end
 
-# Grouped-kernel likelihood (per-subject unrolled codegen): the panel flat
-# map cannot express sequential recurrences, so each subject's event loop
-# runs as one `linear_pk_read_locs` call over bound op-column slices
-# (static `view` ranges from `op_ends`) plus per-subject LP scalars
-# (`sum(view(lp, s:s))` — the parked core `q[i]`-normalization
-# workaround), read vectors vcat flat, schedule-map gathers move reads
-# to obs space, and each in-cell observation lowers as a Gaussian plate
-# reusing the plate-sum machinery. Cell calls expand (never emit
-# verbatim); slice do-params rewrite to their bound columns (kernel
-# ports are column names — the panel flatmap precedent); all other
-# assignments emit verbatim under their surface names. The collected
-# name aliases its flat value (future generated quantities + the
-# sibling likelihood-node slice read it).
+# Grouped-kernel likelihood: the panel flat map cannot express sequential
+# recurrences, so each cell assignment emits ONE subject-batched call —
+# `linear_pk_read_locs*_over_subjects` over the bound op columns +
+# `op_ends` with per-subject LP vectors (`SubjectScalar`) and flat
+# event-frame vectors (`SubjectSlice`) — whose runtime loop runs the
+# per-subject event recurrence and concatenates the reads flat; schedule-
+# map gathers move reads to obs space, and each in-cell observation
+# lowers as a Gaussian plate reusing the plate-sum machinery. Cell calls
+# always rewrite to the batched spelling (never emit verbatim — a
+# verbatim schedule handle has no runtime binding); slice do-params
+# rewrite to their bound columns (kernel ports are column names — the
+# panel flatmap precedent); all other assignments emit verbatim under
+# their surface names. The collected name aliases its flat value (future
+# generated quantities + the sibling likelihood-node slice read it).
 #
 # Slice params to columns (grouped `_kernel_flatmap`: grouped slices
 # are all `:response` kind over whole columns — no T-blocks — so the
@@ -775,16 +749,19 @@ function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
     kp.subjects isa Int ||
         throw(ContractValidationError("[generator] kernel plate " *
               "`$(kp.result)` subjects unresolved (bind_data with dims first)"))
-    n_sub = kp.subjects
     sched = only(kp.schedules)
-    op_ends = plan.columns[_sched_col_name(sched.name, :op_ends)]
+    # The batched cell runner reads the subject ranges from this bound
+    # column at runtime; it must be a kernel port (bind materializes it).
+    haskey(plan.columns, _sched_col_name(sched.name, :op_ends)) ||
+        throw(ContractValidationError("[generator] schedule " *
+              "`$(sched.name)` has no bound op_ends column"))
     lps = Dict{Symbol,Symbol}(c => _lp_name(_predictor(plan, p))
         for (p, c) in kp.lp_args)
     flatmap = _grouped_flatmap(kp)
     stmts = Expr[]
     for (nm, ex) in kp.assignments
-        append!(stmts, _grouped_cell_assignment(nm, ex, kp, sched, op_ends,
-            n_sub, lps, plan.columns, flatmap))
+        append!(stmts, _grouped_cell_assignment(nm, ex, kp, sched, lps,
+            plan.columns, flatmap))
     end
     klabel = Symbol(:kernel_, kp.result)
     oterms = Any[]

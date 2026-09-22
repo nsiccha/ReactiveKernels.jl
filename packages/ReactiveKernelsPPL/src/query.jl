@@ -70,6 +70,15 @@ world-age safe (callable from compiled functions), but the RAW returned
 kernel closes over build-time eval'd code: call it from top level, wrap
 the call in `Base.invokelatest`, or use [`SamplerQuery`](@ref), whose
 call paths carry the barrier.
+
+Under Reactant the barrier goes AROUND the compile, never inside the traced
+call: `Reactant.@compile kernel(Reactant.to_rarray(u))` at top level, or
+`Base.invokelatest(Reactant.compile, kernel, (Reactant.to_rarray(u),))` from
+an older world. A traced wrapper `u -> Base.invokelatest(kernel, u)` is
+opaque to Reactant's tracing overlay, so the packed reads
+`sum(view(unconstrained, i:i))` fall through to Base's scalar `mapreduce`
+and fail with `Scalar indexing is disallowed` (measured on Reactant
+0.2.285; `test_reactant_joint.jl` pins the working shape).
 """
 function prepare_query(built, plan::StructuralPlan, preset::Symbol)
     isbound(plan) || throw(ContractValidationError(
@@ -87,6 +96,11 @@ end
 Reusable sampler-space density + gradient over a built program: the prepared
 `:posterior` value kernel plus its `prepare_ad` gradient preparation.
 Construct with [`prepare_sampler`](@ref); not thread-safe (one per caller).
+The call paths below carry a `Base.invokelatest` barrier, so they are not
+traceable by Reactant; compile the fields directly instead —
+`Reactant.@compile q.kernel(traced_u)` for the value and
+`compile_ad_value_and_gradient(q.ad, traced_u)` for value + gradient (see
+[`prepare_query`](@ref)).
 """
 struct SamplerQuery{K,P,L}
     kernel::K
