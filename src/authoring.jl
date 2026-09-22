@@ -1941,7 +1941,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     order_var = gensym(:kernel_port_order)
     have_var = gensym(:kernel_have)
     want_var = gensym(:kernel_want)
-    port_vars = Dict{Symbol,Symbol}()
+    port_indices = Dict{Symbol,Int}()
+    port_values_var = gensym(:kernel_port_values)
     port_order = Symbol[]
     annotations = Dict{Symbol,Vector{Any}}()
     have_names = Symbol[]
@@ -2104,8 +2105,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     end
     entries = rewritten_entries
 
-    for name in port_order
-        port_vars[name] = gensym(name)
+    for (index, name) in enumerate(port_order)
+        port_indices[name] = index
     end
 
     # Pass 2: declare every port before adding any recipe, then emit recipes in
@@ -2113,11 +2114,10 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     # incompatible declarations fail during construction with their real types.
     prelude = Any[]
     for name in port_order
-        value_var = port_vars[name]
         type_exprs = isempty(annotations[name]) ? Any[GlobalRef(Core, :Any)] :
                      annotations[name]
         for type_expr in type_exprs
-            push!(prelude, :($value_var = $declare_ref(
+            push!(prelude, :($port_values_var[$(port_indices[name])] = $declare_ref(
                 $graph_var, $ports_var, $order_var, $(QuoteNode(name)), $type_expr)))
         end
     end
@@ -2135,7 +2135,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         end
     end
 
-    body = Any[]
+    recipe_statements = Any[]
     consumed_names = Set{Symbol}()
     produced_names = Symbol[]
     for entry in entries
@@ -2151,8 +2151,10 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
            def_count[outputs[1][1]] == 1
             op = _kernel_operation(authored_rhs, Symbol[authored_rhs], known)
             cost = 1.0
-            push!(body, :($alias_ref($graph_var, $(port_vars[outputs[1][1]]),
-                                     $(port_vars[authored_rhs]), $op, $cost,
+            push!(recipe_statements, :($alias_ref($graph_var,
+                                     $port_values_var[$(port_indices[outputs[1][1]])],
+                                     $port_values_var[$(port_indices[authored_rhs])],
+                                     $op, $cost,
                                      $(QuoteNode(authored_rhs)))))
             _kernel_push_unique!(produced_names, outputs[1][1])
             push!(consumed_names, authored_rhs)
@@ -2169,15 +2171,17 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         for (name, _) in outputs
             _kernel_push_unique!(produced_names, name)
         end
-        dep_values = Expr(:tuple, (port_vars[name] for name in deps)...)
-        out_values = Expr(:tuple, (port_vars[name] for (name, _) in outputs)...)
+        dep_values = Expr(:tuple, (:($port_values_var[$(port_indices[name])])
+                                   for name in deps)...)
+        out_values = Expr(:tuple, (:($port_values_var[$(port_indices[name])])
+                                   for (name, _) in outputs)...)
         cost = get(metadata, :cost, 1.0)
         cse_key = get(metadata, :cse_key, nothing)
         effectful = get(metadata, :effectful, false)
         op = plate_expr === nothing ? _kernel_operation(
             rhs, deps, known; tensorize = !effectful, mod = mod,
             nested_specs = nested_specs) : plate_expr.operation
-        push!(body, :($add_ref($graph_var, $dep_values, $out_values,
+        push!(recipe_statements, :($add_ref($graph_var, $dep_values, $out_values,
                                $op, $cost, $cse_key, $effectful,
                                $(QuoteNode(rhs)))))
     end
@@ -2186,12 +2190,35 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
             name in consumed_names || _kernel_push_unique!(want_names, name)
         end
     end
+    postlude = Any[]
     for name in want_names
-        push!(body, :($push_unique_ref($want_var, $(QuoteNode(name)))))
+        push!(postlude, :($push_unique_ref($want_var, $(QuoteNode(name)))))
     end
     # Provision automatic reverse edges (InverseFunctions inverses and tuple
     # unpacks) once every authored recipe is in place; see inverse_edges.jl.
-    push!(body, :($synthesize_ref($graph_var)))
+    push!(postlude, :($synthesize_ref($graph_var)))
+
+    # CHUNK the recipe emission statements. Each recipe's `_KernelSourceOp` /
+    # `_KernelOperation` closure is an inline lambda in the emitted expression;
+    # Julia's lowering cost of N nested lambdas in one scope is O(N²). Wrapping
+    # fixed-size groups in an immediately-invoked zero-argument closure bounds
+    # each enclosing scope, making the total lowering cost O(N·chunk).
+    body = Any[]
+    recipe_count = length(recipe_statements)
+    if recipe_count <= _KERNEL_EXPAND_CHUNK
+        append!(body, recipe_statements)
+    else
+        for lo in 1:_KERNEL_EXPAND_CHUNK:recipe_count
+            hi = min(lo + _KERNEL_EXPAND_CHUNK - 1, recipe_count)
+            chunk_fn = gensym(:kernel_expand_chunk)
+            push!(body,
+                  Expr(:(=), chunk_fn,
+                       Expr(:->, Expr(:tuple,),
+                            Expr(:block, recipe_statements[lo:hi]...))))
+            push!(body, :($chunk_fn()))
+        end
+    end
+    append!(body, postlude)
 
     quote
         let
@@ -2200,6 +2227,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
             $order_var = $symbol_ref[]
             $have_var = $symbol_ref[]
             $want_var = $symbol_ref[]
+            $port_values_var = Vector{Any}(undef, $(length(port_order)))
             $(prelude...)
             $(body...)
             $spec_ref($graph_var, $ports_var, $order_var, $have_var, $want_var,
@@ -2474,6 +2502,12 @@ end
 
 struct _KernelDefaultBoundary end
 const _KERNEL_DEFAULT_BOUNDARY = _KernelDefaultBoundary()
+
+# Emission chunk size for `_kernel_expand`. Recipe statements above this count
+# are grouped into immediately-invoked closures to avoid O(N²) lowering of a
+# single giant scope (each inline lambda contributes a nested function scope
+# whose lowering cost grows with the enclosing scope size).
+const _KERNEL_EXPAND_CHUNK = 50
 
 function _kernel_selection(spec::KernelSpec, selection, defaults::Vector{Symbol},
                            label::Symbol)
