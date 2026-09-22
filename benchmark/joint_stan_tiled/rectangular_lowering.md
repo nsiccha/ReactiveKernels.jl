@@ -11,6 +11,20 @@ Enzyme/MLIR. The PK adapter is disabled by default. Set `RK_RECTANGULAR=1` in
 sampler configuration or a demonstrated runtime improvement. TGI nadir uses the
 new path automatically and passes reverse parity. CPU fusion stays enabled.
 
+## Required semantics
+
+Do not statically or trace-time unroll loops whose trip count comes from data,
+including bound data known during preparation or compilation. This applies to
+subject/operation counts and to the binary-power capacity derived from the
+maximum dose count. Both must remain real loops or equivalent batched-array
+operations. Fixed structural compartment algebra is separate from these counts.
+
+Preserve lazy branch semantics. Replacing branches with eager `ifelse` solely
+to bypass a compiler failure is not an accepted solution. Ordinary elementwise
+selection with safely computed operands remains a valid numerical operation.
+The proposed predicated step with a data-derived unrolled power chain has not
+been adopted.
+
 ## Representation and lowering
 
 `columns` is a tuple of equally sized, typed vectors: a rectangular table
