@@ -1048,6 +1048,39 @@ function ReactiveKernels._tensorized_scan(
     buffer
 end
 
+# Promote rectangular data and fixed carry storage once, before the while. This
+# includes host-bound columns even when only a parameter is traced. Copy scalar
+# wrappers at the boundary so two logical carry fields never alias one wrapper.
+_recurrence_trace(x) = x
+_recurrence_trace(x::Tuple) = map(_recurrence_trace, x)
+_recurrence_trace(x::NamedTuple) = map(_recurrence_trace, x)
+_recurrence_trace(x::AbstractArray) = Reactant.promote_to(Reactant.TracedRArray, x)
+_recurrence_trace(x::T) where {T<:Number} =
+    Reactant.promote_to(Reactant.TracedRNumber{T}, x)
+_recurrence_trace(x::Reactant.TracedRNumber) = copy(x)
+
+function ReactiveKernels._rectangular_fold_impl(
+        marker::Reactant.TracedType, step, init, columns, shared, n)
+    carry = _recurrence_trace(init)
+    data = _recurrence_trace(columns)
+    args = _recurrence_trace(shared)
+    Reactant.@trace for i in 1:n
+        row = Reactant.@allowscalar map(c -> c[i], data)
+        carry = _recurrence_trace(step(carry, row, args...))
+    end
+    carry
+end
+
+function ReactiveKernels._recurrence_branch(
+        pred::Reactant.TracedRNumber{Bool}, yes, no, args)
+    Reactant.@trace if pred
+        result = yes(args...)
+    else
+        result = no(args...)
+    end
+    result
+end
+
 # Batched slice-collection plates preserve eachcol structurally in the core.
 # Move the observation axis to the leading batch dimension and lower the
 # scalar recipe with Reactant's batch primitive; no Base.Slices object or host
