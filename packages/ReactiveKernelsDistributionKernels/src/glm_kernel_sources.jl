@@ -415,31 +415,33 @@ using LogExpFunctions: logistic as _rk_logistic
     m2::Vector{Float64} = 1.0 .+ (((2.0 .* reshape(rK, 1, K) .+ 1.0) .* Sw) * ocw)
     dm::Vector{Float64} = (Sw .* (1.0 .- Sw)) * ocw
     Vw::Vector{Float64} = m2 .- m1 .* m1
-    working_weights::Vector{Float64} = ifelse.(Vw .> 0.0, dm .* dm ./ Vw, 0.0)
+    # The quotient is a lazy per-observation cell: a zero-variance row
+    # (all mass on one class) is weight 0 and never forms 0/0.
+    working_weights::Vector{Float64} = plate(dm, Vw) do d, v
+        weight::Float64 = v > 0.0 ? d * d / v : 0.0
+        weight
+    end
 
     # Cumulative-logit cells log(F(hi-e)-F(lo-e)), `logpdf` sums
-    # `pointwise` (see bernoulli NOTE: everything nests to ports). Edge
-    # classes branch to closed one-sided forms — never logistic(+-Inf):
-    # its reverse is 0*Inf = NaN even at benign points, while the value
-    # is fine. Probability-space throughout (log F / log(1-F), bitwise
-    # the oracle): past saturation the value underflows to -Inf exactly
-    # as specified, and the score stays ideal-exact. All gathers are
-    # vector gathers with arithmetic index clamps (branches evaluate
-    # eagerly, so indices must stay in bounds). The interior log takes
-    # a +1e-300 floor on edge rows only: Enzyme computes every branch
-    # reverse eagerly, and the clamped 0/0 there (0 cotangent over a 0
-    # difference) NaNs through 0*NaN selection — the floor makes it
-    # 0/1e-300 = 0 while taken rows keep bitwise-exact log(diff).
+    # `pointwise`. Each observation is one lazy plate cell: the edge
+    # classes take closed one-sided forms — never logistic(+-Inf), whose
+    # reverse is 0*Inf = NaN even at benign points — and only the taken
+    # arm runs, so the interior gathers `c[observed]`/`c[observed - 1]`
+    # are in bounds by construction (no index clamps, no dummy operands,
+    # no floor: an inactive arm contributes neither values nor derivative
+    # work). Probability-space throughout (log F / log(1-F), bitwise the
+    # oracle): past saturation the value underflows to -Inf exactly as
+    # specified, and the score stays ideal-exact.
     logpdf(y::Vector{Int})::Float64 = sum(pointwise(y))
     pointwise(y::Vector{Int})::Vector{Float64} =
-        ifelse.(y .== 1, log.(_rk_logistic.(cuts[y .^ 0] .- eta)),
-            ifelse.(y .== (length(cuts) + 1),
-                log.(1.0 .-
-                    _rk_logistic.(cuts[(y .^ 0) .* length(cuts)] .- eta)),
-                log.(_rk_logistic.(cuts[y .- (y .== (length(cuts) + 1))] .-
-                    eta) .-
-                    _rk_logistic.(cuts[y .- 1 .+ (y .== 1)] .- eta) .+
-                    (((y .== 1) .| (y .== (length(cuts) + 1))) .* 1e-300))))
+        plate(y, eta, Ref(cuts)) do observed, e, c
+            cell::Float64 = observed == 1 ? log(_rk_logistic(c[1] - e)) :
+                (observed == length(c) + 1 ?
+                    log(1.0 - _rk_logistic(c[length(c)] - e)) :
+                    log(_rk_logistic(c[observed] - e) -
+                        _rk_logistic(c[observed - 1] - e)))
+            cell
+        end
     # The eta adjoint collapses exactly: (a(1-a)-b(1-b))/(b-a) =
     # a + b - 1 (no division, no cutoff, exact at all eta).
     score(y::Vector{Int})::Vector{Float64} =

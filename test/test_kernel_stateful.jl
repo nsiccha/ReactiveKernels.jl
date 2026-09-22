@@ -291,6 +291,32 @@ end
         @test RKS._kernel_stmt_method_form(:((a, b) = f(x))) === nothing
     end
 
+    @testset "pure-endpoint straightness: authored plate cells are RK subgraphs" begin
+        straight = RKS._kernel_endpoint_has_nonstraight
+        # A `plate(...) do` cell is lowered by the recipe pass, not an opaque
+        # closure: it keeps the method a pure endpoint (lazy `?:` inside).
+        @test !straight(:(plate(y, eta, Ref(cuts)) do observed, e, c
+            cell::Float64 = observed == 1 ? log(c[1] - e) : log(c[observed] - e)
+            cell
+        end))
+        @test !straight(:(ReactiveKernels.plate(y, mu) do observed, m
+            observed - m
+        end))
+        # Control flow inside the cell, or in a threaded argument, is still
+        # control flow; an ordinary closure or another do-block stays opaque.
+        @test straight(:(plate(y, eta) do observed, e
+            for i in 1:3; e = e + i; end
+            e
+        end))
+        @test straight(:(plate(map(x -> x + 1, y), eta) do observed, e
+            observed - e
+        end))
+        @test straight(:(mapreduce(y, eta) do observed, e
+            observed - e
+        end))
+        @test straight(:(map(x -> x + 1, y)))
+    end
+
     @testset "(1)+(2) short/long extraction with kwargs/typed/where/return-ann" begin
         ms = RKS.kernel_methods(StatefulSigFixture)
         @test length(ms) == 3

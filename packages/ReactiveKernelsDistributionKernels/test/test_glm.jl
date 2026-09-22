@@ -814,6 +814,53 @@ end
         @test !occursin("Distributions", sk)
     end
 
+    @testset "pointwise cells are lazy: no index clamps, no floor, no 0/0" begin
+        # Each observation is one `plate` cell whose edge/interior arms are
+        # authored branches; the lowered program carries no clamped gather
+        # (`y .^ 0`, `y .- 1 .+ (y .== 1)`), no `1e-300` floor, and the
+        # working-weight quotient never forms 0/0 on a zero-variance row.
+        kp = prepare(ordered_logistic_glm.pointwise;
+            have = (:y, :X, :beta, :cuts), want = :pointwise)
+        sk = string(code_expr(kp))
+        @test !occursin("1e-300", sk)
+        @test !occursin(".^ 0", sk)
+        @test !occursin("ifelse", sk)
+        ww = prepare(extract(ordered_logistic_glm;
+            have = (:X, :beta, :cuts), want = :working_weights))
+        @test ww([1.0 800.0], [0.0, 1.0], c0) == [0.0]
+        @test ww([1.0 -800.0], [0.0, 1.0], c0) == [0.0]
+    end
+
+    @testset "reverse gradient follows the analytic score where FD is noisy" begin
+        # dl/dbeta = X' * score(y). At the tail points the interior
+        # differences F(hi) - F(lo) cancel to ~1e-9, so finite differences
+        # of the primal are unusable, and the reverse of log(F(hi) - F(lo))
+        # itself carries the cancellation's ~1e-6 relative error (the score
+        # endpoint's collapsed a + b - 1 form does not). The lazy cell's
+        # reverse stays finite and within that accuracy: no inactive arm
+        # contributes 0 * Inf partials.
+        @kernel _ord_glm_modelS(
+                beta::Vector{Float64}, X::Matrix{Float64},
+                y::Vector{Int}, cuts::Vector{Float64}) = begin
+            ll::Float64 = ordered_logistic_glm.logpdf(y)
+            return ll
+        end
+        kb = prepare(_ord_glm_modelS;
+            have = (:beta, :X, :y, :cuts), want = :ll,
+            bound = (; X = X, y = y, cuts = c0))
+        ks = prepare(ordered_logistic_glm.score;
+            have = (:y, :X, :beta, :cuts), want = :score)
+        prep = prepare_ad(kb,
+            AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const),
+            beta; active = :beta)
+        for q in ([0.4, -0.2], [3.0, -12.0], [20.0, 5.0])
+            v, g = ad_value_and_gradient!(prep, similar(q), q)
+            @test isfinite(v)
+            @test all(isfinite, g)
+            @test g ≈ X' * ks(y, X, q, c0) rtol = 1e-4
+        end
+    end
+
     @testset "analytic adjoint matches finite differences (beta active)" begin
         @kernel _ord_glm_modelB(
                 beta::Vector{Float64}, X::Matrix{Float64},

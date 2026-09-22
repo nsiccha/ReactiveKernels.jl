@@ -450,9 +450,30 @@ end
 # statement-position branches are control flow.  A branch in VALUE position
 # — a ternary, an `if` expression that is the body's result, `a && b` — is a
 # lazy selection the recipe lowering owns (`_kernel_tensorized_rhs`), so it
-# is straight-line like any other expression.
+# is straight-line like any other expression.  An authored `plate(...) do`
+# cell is likewise an RK subgraph the recipe lowering owns
+# (`_kernel_authored_plate_expr`), not an opaque closure: it is straight-line
+# whenever its threaded arguments and its cell body are.
+_kernel_endpoint_callee_name(callee::Symbol) = callee
+_kernel_endpoint_callee_name(callee::GlobalRef) = callee.name
+function _kernel_endpoint_callee_name(callee)
+    callee isa Expr && callee.head === :(.) && length(callee.args) == 2 || return nothing
+    leaf = callee.args[2]
+    leaf isa QuoteNode ? leaf.value : nothing
+end
+_kernel_endpoint_plate_call(call) =
+    call isa Expr && call.head === :call && !isempty(call.args) &&
+    _kernel_endpoint_callee_name(call.args[1]) === :plate
+
 function _kernel_endpoint_has_nonstraight(x)
     x isa Expr || return false
+    if x.head === :do && length(x.args) == 2 && _kernel_endpoint_plate_call(x.args[1])
+        call, lambda = x.args
+        lambda isa Expr && lambda.head === :(->) && length(lambda.args) == 2 ||
+            return true
+        return any(_kernel_endpoint_has_nonstraight, call.args[2:end]) ||
+               _kernel_endpoint_has_nonstraight(lambda.args[2])
+    end
     x.head in (:for, :while, :try, :let, :function, :->,
                :comprehension, :generator) && return true
     if x.head === :block
