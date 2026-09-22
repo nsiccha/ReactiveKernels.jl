@@ -256,7 +256,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "NUTS, log-density, and\nPPL artifacts are external compilation examples and acceptance evidence",
         "not** a general Julia-recursion compiler proof",
         "`compile_state_transition(spec, transition, endpoint_args;",
-        "Static loops are unrolled during\nlowering",
+        "The current implementation unrolls\nthese loops during lowering",
         "do not add geometry or integrator cases to compiler code",
         "fixed-capacity\nstructural vectors",
         "`Diagonal` and `Cholesky` wrappers",
