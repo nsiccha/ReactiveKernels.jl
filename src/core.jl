@@ -222,6 +222,30 @@ end
 # case is a one-tuple `iterated`, and `eachindex(iterated...)` validates that
 # several sequences share axes (a `DimensionMismatch` otherwise).
 @inline function _tensorized_scan(step, init, iterated::Tuple, shared::Tuple)
+    marker = _scan_backend_marker(init, iterated, shared)
+    _tensorized_scan_lowering(marker, step, init, iterated, shared)
+end
+
+# A scan runs on a backend exactly when ANY of its operands is that backend's
+# traced value — the carry seed, an iterated sequence (looking through an
+# `eachrow`/`eachcol` slices wrapper to its parent), or a shared operand
+# (looking through a `Ref`).  Bound host data beside a traced operand is then
+# a constant of the traced program, never a reason to fall back to the host
+# loop: under the core constraints (`docs/src/constraints.md`) the host loop
+# below is the NATIVE lowering, and tracing it would replicate the step body
+# once per data element.  A scan whose every operand is host data runs the
+# native loop as ordinary host precomputation, emitting no program structure.
+@inline _scan_marker_value(x) = x
+@inline _scan_marker_value(x::Base.RefValue) = x[]
+@inline _scan_marker_value(x::Base.AbstractSlices) = parent(x)
+@inline _scan_backend_marker(init, iterated::Tuple, shared::Tuple) =
+    _dynamic_tensorized_marker((init, map(_scan_marker_value, iterated)...,
+                                map(_scan_marker_value, shared)...))
+
+# The native ordered loop.  `nothing` is the no-backend marker; a backend
+# extension specializes `_tensorized_scan_lowering` on its own marker type.
+function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
+                                   shared::Tuple)
     idx = eachindex(iterated...)
     isempty(idx) && throw(ArgumentError("scan requires a non-empty sequence"))
     i1 = first(idx)
