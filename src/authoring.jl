@@ -1671,8 +1671,74 @@ function _kernel_tensorized_undef_vector(ex)
     callee.args[2], ex.args[3]
 end
 
+# A lazy two-way branch in the tensorized companion: the condition and both
+# sides are tensorized, each side is wrapped as a thunk, and
+# `_recurrence_branch` evaluates exactly one of them.  An `elseif` chain
+# arrives as a nested `:elseif` expression on the else side and lowers
+# recursively; a block-wrapped condition (Julia's `elseif` spelling) is
+# unwrapped.
+# The tensorized companion of an authored `for`/`while`: the loop (iterator,
+# condition and body already tensorized) is expanded with `ReactantCore.@trace`
+# at kernel definition.  That transform turns the locals the body assigns into
+# a loop carry and emits ONE retained loop region under a tracing backend
+# (`stablehlo.while`), whatever the trip count; when nothing in the loop is
+# traced its expansion runs the plain Julia loop, so the companion stays
+# correct on every backend (`docs/src/constraints.md`).  `ReactantCore` is the
+# dependency-light macro package (no compiler runtime); Reactant's tracing
+# interpreter follows the expansion only as ordinary closure code, which is
+# why the transform runs at definition time rather than through a runtime
+# generated program.
+# `@trace for` handles one plain induction variable over a range; that is
+# the shape a data-length loop takes (`1:n`, `eachindex(x)`, `axes(x, 1)`).
+# A typed binding, destructuring, or iteration over a collection keeps the
+# authored loop unchanged (it iterates host structure, not a data length).
+_kernel_range_iterator(iter) =
+    iter isa Expr && iter.head === :call && !isempty(iter.args) && (
+        iter.args[1] === :(:) ||
+        iter.args[1] in (:eachindex, :axes, :range) ||
+        (iter.args[1] isa Expr && iter.args[1].head === :. &&
+         iter.args[1].args[end] isa QuoteNode &&
+         iter.args[1].args[end].value in (:OneTo, :eachindex, :axes, :range)))
+
+function _kernel_tensorized_loop(ex, known, mod, scope)
+    if ex.head === :for
+        binding, body = ex.args
+        binding isa Expr && binding.head === :(=) && length(binding.args) == 2 ||
+            throw(ArgumentError("unsupported authored loop binding `$(binding)` in a kernel recipe"))
+        loop_names = Set{Symbol}()
+        _lhs_symbols!(loop_names, binding.args[1])
+        lowered = Expr(:for,
+             Expr(:(=), binding.args[1],
+                  _kernel_tensorized_rhs(binding.args[2], known, mod, scope)),
+             _kernel_tensorized_rhs(body, known, mod, union(scope, loop_names)))
+        retained = binding.args[1] isa Symbol && _kernel_range_iterator(binding.args[2])
+    else
+        condition, body = ex.args
+        lowered = Expr(:while,
+             _kernel_tensorized_rhs(condition, known, mod, scope),
+             _kernel_tensorized_rhs(body, known, mod, scope))
+        retained = true
+    end
+    retained || return lowered
+    Expr(:macrocall, GlobalRef(ReactantCore, Symbol("@trace")),
+         LineNumberNode(@__LINE__, @__FILE__), lowered)
+end
+
+function _kernel_tensorized_branch(condition, then_side, else_side, known, mod,
+                                   scope=known)
+    unwrap(x) = x isa Expr && x.head === :block ?
+        (filtered = [arg for arg in x.args if !(arg isa LineNumberNode)];
+         length(filtered) == 1 ? unwrap(only(filtered)) : x) : x
+    thunk(side) = Expr(:->, Expr(:tuple),
+                       _kernel_tensorized_rhs(unwrap(side), known, mod, scope))
+    Expr(:call, GlobalRef(@__MODULE__, :_recurrence_branch),
+         _kernel_tensorized_rhs(unwrap(condition), known, mod, scope),
+         thunk(then_side), thunk(else_side), Expr(:tuple))
+end
+
 function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
-                                mod::Union{Module,Nothing} = nothing)
+                                mod::Union{Module,Nothing} = nothing,
+                                scope::Set{Symbol} = known)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
     undef_vector = _kernel_tensorized_undef_vector(ex)
@@ -1684,7 +1750,7 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         # allocation unchanged.
         element_type, length_expr = undef_vector
         return Expr(:call, GlobalRef(Base, :zeros), element_type,
-                    _kernel_tensorized_rhs(length_expr, known, mod))
+                    _kernel_tensorized_rhs(length_expr, known, mod, scope))
     elseif ex.head === :(=) && length(ex.args) == 2 &&
            ex.args[1] isa Expr && ex.args[1].head === :ref &&
            ex.args[1].args[1] isa Symbol
@@ -1696,8 +1762,8 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         indices = target.args[2:end]
         return Expr(:(=), array,
             Expr(:call, GlobalRef(@__MODULE__, :_tensorized_setindex), array,
-                 _kernel_tensorized_rhs(ex.args[2], known, mod),
-                 (_kernel_tensorized_rhs(index, known, mod)
+                 _kernel_tensorized_rhs(ex.args[2], known, mod, scope),
+                 (_kernel_tensorized_rhs(index, known, mod, scope)
                   for index in indices)...))
     elseif _kernel_tensorized_assignment_head(ex.head) && length(ex.args) == 2
         # An indexed/property/destructuring assignment target is syntax, not a
@@ -1706,41 +1772,78 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         # even when this optional tensorized companion is never selected.
         # Preserve the authored target exactly and tensorize only the RHS.
         return Expr(ex.head, ex.args[1],
-                    _kernel_tensorized_rhs(ex.args[2], known, mod))
+                    _kernel_tensorized_rhs(ex.args[2], known, mod, scope))
     elseif ex.head === :ref
         return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_getindex),
-                    (_kernel_tensorized_rhs(arg, known, mod) for arg in ex.args)...)
+                    (_kernel_tensorized_rhs(arg, known, mod, scope) for arg in ex.args)...)
     elseif ex.head === :call && !isempty(ex.args) &&
            ex.args[1] isa Symbol && _is_broadcast_operator(ex.args[1])
         operator = Symbol(String(ex.args[1])[2:end])
         return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
                     GlobalRef(Base, operator),
-                    (_kernel_tensorized_rhs(arg, known, mod)
+                    (_kernel_tensorized_rhs(arg, known, mod, scope)
                      for arg in ex.args[2:end])...)
     elseif ex.head === :. && length(ex.args) == 2 &&
            ex.args[2] isa Expr && ex.args[2].head === :tuple
         return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
                     _kernel_tensorized_callee(ex.args[1], known, mod),
-                    (_kernel_tensorized_rhs(arg, known, mod)
+                    (_kernel_tensorized_rhs(arg, known, mod, scope)
                      for arg in ex.args[2].args)...)
-    elseif ex.head === :if && length(ex.args) == 3
-        # `broadcast(ifelse, ...)` is the common scalar/tensor select.  It is
-        # still scalar for scalar branches, while a traced scalar predicate is
-        # broadcast across array branches (Reactant deliberately has no
-        # `ifelse(::TracedBool, ::TracedArray, ::TracedArray)` method).
-        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
-                    GlobalRef(Base, :ifelse),
-                    (_kernel_tensorized_rhs(arg, known, mod) for arg in ex.args)...)
+    elseif ex.head in (:for, :while)
+        # An authored loop keeps its iteration on every backend: the
+        # tensorized companion expands it with `ReactantCore.@trace`, which
+        # runs it as a plain loop natively and as one retained loop region
+        # under a tracing backend — never once per iteration
+        # (`docs/src/constraints.md`).
+        return _kernel_tensorized_loop(ex, known, mod, scope)
+    elseif ex.head === :let && length(ex.args) == 2
+        # Sequential scope: a binding is in scope for the later bindings and
+        # the body (loops need to know which locals they can carry).
+        bindings = ex.args[1]
+        binding_list = bindings isa Expr && bindings.head === :block ?
+            bindings.args : Any[bindings]
+        inner = copy(scope)
+        lowered_bindings = Any[]
+        for binding in binding_list
+            if binding isa Expr && binding.head === :(=) && length(binding.args) == 2
+                push!(lowered_bindings, Expr(:(=), binding.args[1],
+                    _kernel_tensorized_rhs(binding.args[2], known, mod, inner)))
+                _lhs_symbols!(inner, binding.args[1])
+            else
+                push!(lowered_bindings, binding)
+                binding isa Symbol && push!(inner, binding)
+            end
+        end
+        lowered = length(lowered_bindings) == 1 ? only(lowered_bindings) :
+            Expr(:block, lowered_bindings...)
+        return Expr(:let, lowered, _kernel_tensorized_rhs(ex.args[2], known, mod, inner))
+    elseif ex.head === :block
+        inner = copy(scope)
+        statements = Any[]
+        for statement in ex.args
+            push!(statements, _kernel_tensorized_rhs(statement, known, mod, inner))
+            statement isa Expr && _kernel_tensorized_assignment_head(statement.head) &&
+                length(statement.args) == 2 && _lhs_symbols!(inner, statement.args[1])
+        end
+        return Expr(:block, statements...)
+    elseif ex.head in (:if, :elseif) && 2 <= length(ex.args) <= 3
+        # Authored `if`/`?:` keep their lazy Julia semantics on every backend
+        # (`docs/src/constraints.md`): only the taken side is evaluated, so an
+        # inactive side's indexing, allocation, invalid arithmetic and
+        # derivative work never run.  `_recurrence_branch` is the native
+        # ternary and a backend's lazy conditional region (`stablehlo.if`
+        # under Reactant).  A scalar predicate selecting whole arrays stays a
+        # lazy branch too; elementwise selection is the authored `ifelse.`
+        # broadcast, which is left untouched.
+        return _kernel_tensorized_branch(
+            ex.args[1], ex.args[2],
+            length(ex.args) == 3 ? ex.args[3] : nothing, known, mod, scope)
     elseif ex.head === :&& && length(ex.args) == 2
-        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
-                    GlobalRef(Base, :ifelse),
-                    _kernel_tensorized_rhs(ex.args[1], known, mod),
-                    _kernel_tensorized_rhs(ex.args[2], known, mod), false)
+        return _kernel_tensorized_branch(
+            ex.args[1], ex.args[2], false, known, mod, scope)
     elseif ex.head === :|| && length(ex.args) == 2
-        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
-                    GlobalRef(Base, :ifelse),
-                    _kernel_tensorized_rhs(ex.args[1], known, mod), true,
-                    _kernel_tensorized_rhs(ex.args[2], known, mod))
+        return _kernel_tensorized_branch(
+            ex.args[1], true, ex.args[2], known, mod, scope)
     elseif ex.head === :call && !isempty(ex.args) &&
            (!(ex.args[1] isa Symbol) || !(ex.args[1] in known))
         replacement = _tensorized_callee_replacement(ex.args[1])
@@ -1748,7 +1851,7 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
             _kernel_tensorized_callee(ex.args[1], known, mod) :
             GlobalRef(@__MODULE__, replacement)
         return Expr(:call, callee,
-            (_kernel_tensorized_rhs(arg, known, mod)
+            (_kernel_tensorized_rhs(arg, known, mod, scope)
              for arg in ex.args[2:end])...)
     elseif ex.head in (:vcat, :hcat) &&
            !any(arg -> arg isa Expr && arg.head === :row, ex.args)
@@ -1757,15 +1860,15 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         return Expr(:call,
             GlobalRef(@__MODULE__, ex.head === :vcat ?
                 :_tensorized_vcat : :_tensorized_hcat),
-            (_kernel_tensorized_rhs(arg, known, mod) for arg in ex.args)...)
+            (_kernel_tensorized_rhs(arg, known, mod, scope) for arg in ex.args)...)
     elseif ex.head === :call && !isempty(ex.args)
         return Expr(:call,
             _kernel_tensorized_callee(ex.args[1], known, mod),
-            (_kernel_tensorized_rhs(arg, known, mod)
+            (_kernel_tensorized_rhs(arg, known, mod, scope)
              for arg in ex.args[2:end])...)
     end
     Expr(ex.head,
-         (_kernel_tensorized_rhs(arg, known, mod) for arg in ex.args)...)
+         (_kernel_tensorized_rhs(arg, known, mod, scope) for arg in ex.args)...)
 end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
@@ -1807,7 +1910,7 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
          Expr(:->, Expr(:tuple, deps...), rhs),
          Expr(:->, Expr(:tuple, deps...),
-              tensorize ? _kernel_tensorized_rhs(rhs, known) : rhs))
+              tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs))
 end
 
 function _kernel_nested_endpoint_deps(rhs, deps::Vector{Symbol}, known::Set{Symbol},

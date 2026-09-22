@@ -19,10 +19,13 @@ sum_to_zero_testfile = joinpath(
 ppl_examples_testfile = joinpath(
     @__DIR__, "test_ppl_examples_reactant.jl")
 authored_scan_testfile = joinpath(@__DIR__, "test_authored_scan_reactant.jl")
+lazy_branches_testfile = joinpath(@__DIR__, "test_lazy_branches_reactant.jl")
+authored_loops_testfile = joinpath(@__DIR__, "test_authored_loops_reactant.jl")
 rectangular_fold_testfile = joinpath(@__DIR__, "test_rectangular_fold_reactant.jl")
 inner_partial_evaluation_testfile = joinpath(
     @__DIR__, "test_inner_plate_partial_evaluation_reactant.jl")
 ref_array_plate_testfile = joinpath(@__DIR__, "test_ref_array_plate_reactant.jl")
+glm_testfile = joinpath(@__DIR__, "test_glm_reactant.jl")
 example_packages = (
     joinpath(root, "packages", "ReactiveKernelsCompatibilityExamples"),
     joinpath(root, "packages", "ReactiveKernelsDistributionKernels"),
@@ -60,6 +63,9 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $(joinpath(root, "test", "test_brm_hsgp_reactant.jl"))`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $inner_partial_evaluation_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $lazy_branches_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_loops_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $glm_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $rectangular_fold_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $effect_boundary_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $testfile`)
@@ -75,6 +81,8 @@ mktempdir() do env
     elseif selector == "authored-scan"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $rectangular_fold_testfile`)
+    elseif selector == "glm"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $glm_testfile`)
     elseif selector == "ref-array-plate"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ref_array_plate_testfile`)
     elseif selector == "ppl-examples"

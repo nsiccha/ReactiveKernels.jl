@@ -1,7 +1,7 @@
 # Reactant-compiled adaptive solve: primal parity, IR shape, status flags,
-# and ordinary reverse gradients through the compiled program (plain
-# `Enzyme.autodiff(::Reverse, ...)` inside the traced region, lowered by
-# Reactant's Enzyme overlay — no `runtime_activity`, no priming).
+# and backsolve adjoint gradients (the only `Enzyme.autodiff` differentiates
+# the loop-free RHS inside the step; nothing differentiates through the
+# retained adaptive loop — see the extension header for the limitation).
 include("test_reactant_helpers.jl")
 @testset "reactant extension loads" begin
     @test RExt !== nothing
@@ -88,57 +88,29 @@ end
 end
 
 @testset "compiled program IR shape" begin
-    closure = RKRO.traceable_ode_closure(decay_traceable, DECAY_R_CFG,
-        DECAY_R_U0, DECAY_R_P)
-    tm = Reactant.@code_hlo closure(TR(DECAY_R_U0), TR(DECAY_R_P))
-    ir = String(tm)
-    @test occursin("stablehlo", ir)
-    # The adaptive loop lowers to a data-dependent while, not an unrolled
-    # fixed-step chain.
-    @test occursin("stablehlo.while", ir)
-end
-
-@testset "compiled endpoint gradient" begin
-    # Reverse-through-while requires the freeze shape (single-comparison
-    # cond); the primal early-exit cond fails Binomial analysis.
-    closure = RKRO.traceable_ode_closure(decay_traceable, DECAY_R_CFG,
-        DECAY_R_U0, DECAY_R_P; early_exit=false)
-    grad_compiled = compile_reactant_gradient(closure, DECAY_R_U0, DECAY_R_P,
-        1)
-    dp_ad, du0_ad = grad_compiled(TR(DECAY_R_U0), TR(DECAY_R_P),
-        TR(zero.(DECAY_R_U0)), TR(zero.(DECAY_R_P)))
-    solved = compile_ode_solve(decay_traceable, DECAY_R_U0, DECAY_R_P, Tsit5(),
-        DECAY_R_CFG)
-    # Finite differences of the COMPILED solve: a pure pullback check that
-    # shares the primal exactly (each point is a cheap execution).
-    @test Array(dp_ad) ≈ central_gradient(
-        p -> sum(first(solved(DECAY_R_U0, p))), DECAY_R_P) atol = 1e-6
-    @test Array(du0_ad) ≈ central_gradient(
-        x -> sum(first(solved(x, DECAY_R_P))), DECAY_R_U0) atol = 1e-6
-end
-
-@testset "compiled saveat gradient" begin
-    # Reverse-through-while requires the freeze shape (single-comparison
-    # cond); the primal early-exit cond fails Binomial analysis.
-    closure = RKRO.traceable_ode_closure(decay_traceable, DECAY_R_CFG,
-        DECAY_R_U0, DECAY_R_P; early_exit=false)
-    grad_compiled = compile_reactant_gradient(closure, DECAY_R_U0, DECAY_R_P,
-        2)
-    dp_ad, du0_ad = grad_compiled(TR(DECAY_R_U0), TR(DECAY_R_P),
-        TR(zero.(DECAY_R_U0)), TR(zero.(DECAY_R_P)))
-    solved = compile_ode_solve(decay_traceable, DECAY_R_U0, DECAY_R_P, Tsit5(),
-        DECAY_R_CFG)
-    @test Array(dp_ad) ≈ central_gradient(p -> sum(solved(DECAY_R_U0, p)[2]),
-        DECAY_R_P) atol = 1e-6
-    @test Array(du0_ad) ≈ central_gradient(x -> sum(solved(x, DECAY_R_P)[2]),
-        DECAY_R_U0) atol = 1e-6
+    # One retained data-dependent `while`; the program size is independent
+    # of the iteration bound and of the number of saveat points (the dense
+    # buffer is one masked matrix update, not one column per point).
+    sizes = Int[]
+    for (maxiters, saveat) in ((80, [1.0, 2.0]), (1000, [1.0, 2.0]),
+            (1000, [0.5, 1.0, 1.5, 2.0, 2.5, 2.75]))
+        cfg = ReactantTsit5Config(DECAY_R_TSPAN; abstol=1e-10, reltol=1e-8,
+            dt=0.05, maxiters=maxiters, saveat=saveat)
+        closure = RKRO.traceable_ode_closure(decay_traceable, cfg,
+            DECAY_R_U0, DECAY_R_P)
+        ir = repr(Reactant.@code_hlo optimize = false closure(TR(DECAY_R_U0),
+            TR(DECAY_R_P)))
+        @test occursin("stablehlo", ir)
+        @test count("stablehlo.while", ir) == 1
+        push!(sizes, count("\n", ir))
+    end
+    @test allequal(sizes)
 end
 
 @testset "backsolve endpoint gradient" begin
     # Forward compiled solve records the trajectory; the pullback re-solves
     # the augmented adjoint ODE backward in a second early-exit compiled
-    # program — no differentiation through the adaptive while loop, no freeze
-    # shape anywhere in this path.
+    # program — no differentiation through the adaptive while loop.
     grad = compile_backsolve_gradient(decay_traceable, DECAY_R_U0, DECAY_R_P,
         Tsit5(), DECAY_R_CFG; loss=:endpoint)
     du0_ad, dp_ad = grad(DECAY_R_U0, DECAY_R_P)
@@ -189,25 +161,21 @@ end
 
 @testset "backsolve saveat gradient without parameters" begin
     # Multi-segment saveat journey on a nonlinear non-toy system, no μ block.
-    # Reference: the freeze-shape through-while gradient on the same loss —
-    # an independent AD path over the identical forward program. The bar is
-    # the repo's tolerance-scaled convention: backsolve re-solves rather
-    # than differentiating the trajectory, so optimise-vs-discretise error
-    # at the ~1e-6 level is expected (measured 2.5e-6 here; central
-    # differences agree with the freeze reference to 3e-8, confirming the
-    # backsolve value rather than the test bar).
+    # Reference: central differences of the compiled solve on the same loss.
+    # The bar is the repo's tolerance-scaled convention: backsolve re-solves
+    # rather than differentiating the trajectory, so optimise-vs-discretise
+    # error at the ~1e-6 level is expected (measured 2.5e-6 here).
     cfg = ReactantTsit5Config(LOTKA_TSPAN; abstol=1e-10, reltol=1e-8, dt=0.01,
         maxiters=5000, saveat=[3.0, 6.0])
     grad = compile_backsolve_gradient(lotka_traceable, LOTKA_U0, nothing,
         Tsit5(), cfg; loss=:saveat)
     du0_ad, dp_ad = grad(LOTKA_U0)
     @test dp_ad === nothing
-    closure = RKRO.traceable_ode_closure(lotka_traceable, cfg, LOTKA_U0,
-        nothing; early_exit=false)
-    grad_frozen = compile_reactant_gradient(closure, LOTKA_U0, nothing, 2)
-    du0_fz = Array(grad_frozen(TR(LOTKA_U0), TR(zero.(LOTKA_U0))))
-    bar = agreement_bar(1e-10, 1e-8, maximum(abs, du0_fz))
-    @test max_abs_diff([du0_ad], [du0_fz]) < bar
+    solved = compile_ode_solve(lotka_traceable, LOTKA_U0, nothing, Tsit5(),
+        cfg)
+    du0_fd = central_gradient(x -> sum(solved(x)[2]), LOTKA_U0)
+    bar = agreement_bar(1e-10, 1e-8, maximum(abs, du0_fd))
+    @test max_abs_diff([du0_ad], [du0_fd]) < bar
 end
 
 @testset "backsolve loss validation" begin
@@ -245,25 +213,4 @@ end
     @test max_abs_diff([endpoint], [DECAY_R_U0]) <
           agreement_bar(1e-10, 1e-8, 2.0)
     @test size(smat) == (2, 2)
-end
-
-@testset "early-exit and freeze shapes agree bit-for-bit" begin
-    # The two loop shapes share step semantics by construction (identical
-    # bodies); frozen iterations are exact no-ops, so skipping them must
-    # not change a single bit. Any future divergence fails here loudly.
-    early = Reactant.compile(
-        RKRO.traceable_ode_closure(decay_traceable, DECAY_R_CFG, DECAY_R_U0,
-            DECAY_R_P; early_exit=true),
-        (TR(DECAY_R_U0), TR(DECAY_R_P)))
-    frozen = Reactant.compile(
-        RKRO.traceable_ode_closure(decay_traceable, DECAY_R_CFG, DECAY_R_U0,
-            DECAY_R_P; early_exit=false),
-        (TR(DECAY_R_U0), TR(DECAY_R_P)))
-    for (u0, p) in ((DECAY_R_U0, DECAY_R_P), ([2.5, 0.25], [1.0, 2.0]))
-        e_end, e_cols, e_stat = early(TR(u0), TR(p))
-        f_end, f_cols, f_stat = frozen(TR(u0), TR(p))
-        @test Array(e_end) == Array(f_end)
-        @test Float64(e_stat) == Float64(f_stat)
-        @test all(map((a, b) -> Array(a) == Array(b), e_cols, f_cols))
-    end
 end

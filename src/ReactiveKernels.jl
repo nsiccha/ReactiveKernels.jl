@@ -17,6 +17,7 @@ See the design brief this package implements for the full rationale.
 module ReactiveKernels
 
 using RuntimeGeneratedFunctions
+import ReactantCore
 using InverseFunctions: inverse, NoInverse
 using LinearAlgebra
 using LogExpFunctions

@@ -112,12 +112,10 @@ backward in backward early-exit compiled programs; the only
 evaluation, so nothing differentiates through the adaptive while loop.
 
 Direct differentiation through the solve with
-`Enzyme.autodiff(::Reverse, ...)` is NOT supported. The interim
-`early_exit=false` freeze recipe cannot lower checkpointed reverse
-through the data-dependent early-exit loop at solver scale (see
-[`traceable_ode_closure`](@ref)), and the freeze shape wastes bound
-iterations at runtime. `early_exit=false` survives only as a
-diagnostic/reference path exercised by the test-suite agreement gates.
+`Enzyme.autodiff(::Reverse, ...)` is NOT supported: Reactant's reverse
+mode cannot lower through a `while` loop whose exit is data dependent
+(see [`traceable_ode_closure`](@ref) for the limitation and its
+reproducer).
 """
 function compile_ode_solve end
 
@@ -152,8 +150,8 @@ Both directions run the early-exit primal loop. The only
 `Enzyme.autodiff` in this path differentiates the loop-free RHS `f` once
 per stage evaluation (a vector-Jacobian product lowered to straight-line
 code inside the step); nothing differentiates through the adaptive while
-loop, so the legacy freeze shape is never needed. A non-successful forward or
-backward solve throws an `ErrorException` (there is no trajectory to adjoin).
+loop. A non-successful forward or backward solve throws an `ErrorException`
+(there is no trajectory to adjoin).
 """
 function compile_backsolve_gradient end
 
@@ -168,81 +166,26 @@ end
 
 Build the raw traced closure compiled by [`compile_ode_solve`](@ref)
 (requires Reactant.jl; implemented by the package extension). Takes traced
-`(u0,)` or `(u0, p)` and returns traced `(endpoint, saveat_flat, status)`.
+`(u0,)` or `(u0, p)` and returns traced `(endpoint, saveat_matrix, status)`.
 Exposed for IR inspection (`Reactant.@code_hlo`) and custom compilation.
 
-Keyword `early_exit` (default `true`): the primal loop exits on `(n <
-maxiters) & (t < t1)`. `early_exit=false` selects the legacy freeze
-shape (single-comparison cond, runs out the bound). It is kept as a
-diagnostic/reference path for the test-suite agreement gates only — it
-is NOT a supported gradient recipe. Checkpointed reverse through the
-adaptive loop does not lower at solver scale under any Enzyme scheme,
-so differentiate with [`compile_backsolve_gradient`](@ref). Both
-shapes produce bitwise-identical values.
+The program is one retained `@trace while` loop that exits lazily on
+`(n < maxiters) & (t < t1)`; its body is emitted once, so the program size
+is independent of `maxiters` and of the number of saveat points (dense
+output accumulates into one `n × nsave` buffer through a vectorized window
+mask).
+
+Limitation: Enzyme reverse through this loop does not lower — Reactant's
+reverse-mode `while` handling needs a statically known iteration count,
+which a data-dependent exit cannot provide (Reactant/Enzyme-only
+reproducer: `benchmark/repro_reactant_adaptive_while_reverse.jl` at the
+repository root). Differentiate with
+[`compile_backsolve_gradient`](@ref) instead.
 """
 function traceable_ode_closure end
 
 function traceable_ode_closure(args...; kwargs...)
     throw(ArgumentError(
         "traceable_ode_closure requires Reactant.jl to be loaded " *
-        "(the Reactant extension is inactive)"))
-end
-
-"""
-    traceable_fixedn_closure(f, config::ReactantTsit5Config, u0_example, p_example)
-
-Build the raw traced fixed-N closure compiled by
-[`compile_fixedn_solve`](@ref) (requires Reactant.jl; implemented by the
-package extension). Takes traced `(u0,)` or `(u0, p)` and returns traced
-`(endpoint, saveat_cols, status)`. The step count is `config.maxiters`
-(which must be `>= 1`).
-
-Unlike the adaptive closure, the loop bound is static, so tracing
-unrolls all `N` steps into straight-line solver code (no `while` op):
-every step is accepted, the subdivision trigger and the failure latches
-are branchless `ifelse` selects, and step `N` lands exactly on `t1`.
-There are no emergency retries — a poisoned or guard-exceeding step
-latches the failure status and freezes the rest — so the traced solve
-diverges from [`solve_fixed_n`](@ref) exactly when native would retry
-(spike entries on hard problems); on guard-clean solves the two agree
-to printing precision. The unrolled shape is the through-reverse probe
-vehicle: there is no adaptive loop left to differentiate through.
-"""
-function traceable_fixedn_closure end
-
-function traceable_fixedn_closure(args...; kwargs...)
-    throw(ArgumentError(
-        "traceable_fixedn_closure requires Reactant.jl to be loaded " *
-        "(the Reactant extension is inactive)"))
-end
-
-"""
-    compile_fixedn_solve(f, u0_example, p_example, ::Tsit5, config::ReactantTsit5Config)
-
-Compile a fixed-shape fixed-N Tsit5 solve with Reactant (requires
-Reactant.jl; implemented by the package extension). `u0_example` fixes
-the state dimension and element type; `p_example` is either `nothing`
-(the RHS closes over concrete parameters) or an example parameter
-vector, traced alongside `u0`. The step count is `config.maxiters`.
-
-Returns a callable: `solved(u0)` (or `solved(u0, p)`) returns
-`(endpoint, saveat_matrix, status)` with plain Julia values, where
-`saveat_matrix` has one column per configured saveat point and `status`
-is `0` (reached `t1`), `1` (stuck: no representable progress;
-`dtmin` is fixed at 0 as in the adaptive traced driver), or `2`
-(poisoned error estimate observed).
-
-The RHS contract matches [`compile_ode_solve`](@ref). Hyperparameters
-are compile-time constants; the compiled program is the unrolled
-fixed-N schedule (see [`traceable_fixedn_closure`](@ref)). Gradient
-path: plain `Enzyme.autodiff(::Reverse, ...)` inside a second compiled
-function over this closure (straight-line reverse, no loop); compare
-against finite differences of the compiled solve.
-"""
-function compile_fixedn_solve end
-
-function compile_fixedn_solve(args...; kwargs...)
-    throw(ArgumentError(
-        "compile_fixedn_solve requires Reactant.jl to be loaded " *
         "(the Reactant extension is inactive)"))
 end

@@ -27,10 +27,20 @@ code is not executed by the docs build.
 ## Current boundary
 
 - Prepared scalar kernels and tensorized distribution plates are accepted.
-- A plate with at most 16 static lanes lowers as per-lane scalar recipes with
-  a scalar reduction, so a small posterior fuses into one CPU kernel; larger
-  plates keep the batched lowering. The automatic AD compile keeps bound
-  arrays of at most 4096 elements embedded as compiler literals.
+- Every plate keeps the batched or broadcast lowering whatever its lane
+  count: a lane count is a data length, so no plate is unrolled into per-lane
+  scalar recipes (see [core constraints](constraints.md)). The automatic AD
+  compile keeps bound arrays of at most 4096 elements embedded as compiler
+  literals.
+- Authored `if`, `?:`, `&&` and `||` keep their lazy Julia semantics: the
+  tensorized companion lowers them to `stablehlo.if` regions (also inside a
+  batched plate cell), so an inactive side is never evaluated or
+  differentiated. `Base.ifelse` remains an eager select of two already valid
+  values. See [core constraints](constraints.md).
+- An authored `for`/`while` inside a recipe keeps its iteration: the
+  tensorized companion expands it with `ReactantCore.@trace` at kernel
+  definition, so it becomes one `stablehlo.while` region whatever the trip
+  count; the loop body is never replicated per iteration.
 - Whole-kernel `replica` preserves the scalar kernel as its source authority.
 - Compiled AD reuses the native single-active-port, scalar-WANT validation.
 - Unsupported scalar indexing, unbounded control, or structural state rejects;

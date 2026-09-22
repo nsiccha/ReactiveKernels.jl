@@ -597,28 +597,30 @@ end
         a = evaluate_logistic_regression_rhs_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
-    @testset "glm_poisson with bound host data (>16-lane plate)" begin
+    @testset "glm_poisson with bound host data (40-lane plate)" begin
         # The benchmark shape: every data port BOUND as a host array, only the
         # unconstrained vector traced.  `counts` is then a host `Vector{Int}`
-        # inside the 40-lane likelihood plate (above the 16-lane scalar-lanes
-        # threshold, so it lowers through Reactant's broadcast), and the Poisson
-        # `logpdf` cell guards validity with `ifelse(observed >= 0, …, -Inf)`.
-        # Reactant deduces the broadcast eltype from the RAW host element type
-        # before promoting operands, so that guard on a host `Bool` inferred
-        # `Union{Float64,TracedRNumber{Float64}}` — typejoin `Number`, for which
-        # Reactant has no traced `similar` — and the plate failed to trace.  The
-        # extension now promotes host array operands of a large vector plate
-        # before broadcasting, so the bound graph reproduces native.
+        # inside the 40-lane likelihood plate (every traced plate keeps the
+        # batched/broadcast lowering whatever its lane count), and the Poisson
+        # `logpdf` cell guards validity with an authored branch on `observed`.
+        # Reactant deduces a broadcast eltype from the RAW host element type
+        # before promoting operands, so a guard on a host `Bool` once inferred
+        # `Union{Float64,TracedRNumber{Float64}}` — typejoin `Number`, for
+        # which Reactant has no traced `similar` — and the plate failed to
+        # trace.  The extension promotes host array operands of a vector plate
+        # before broadcasting, so the bound graph reproduces native.  The
+        # example's design matrix is the cubic trend of `year`.
         model = build_glm_poisson_graph()
         q = [0.2, 0.1, -0.05, 0.03]
-        have = (:unconstrained, :year, :counts)
+        year = GLM_POISSON_YEAR
+        X = hcat(ones(length(year)), year, year .^ 2, year .^ 3)
+        have = (:unconstrained, :X, :counts)
         all_bound = prepare(model; have, want = :posterior,
-            bound = (; year = GLM_POISSON_YEAR, counts = GLM_POISSON_C))
+            bound = (; X, counts = GLM_POISSON_C))
         @test _rapprox(_compile_run(all_bound, (q,)), all_bound(q))
         counts_bound = prepare(model; have, want = :posterior,
             bound = (; counts = GLM_POISSON_C))
-        @test _rapprox(_compile_run(counts_bound, (q, GLM_POISSON_YEAR)),
-                       counts_bound(q, GLM_POISSON_YEAR))
+        @test _rapprox(_compile_run(counts_bound, (q, X)), counts_bound(q, X))
     end
     # gp_regr — marginal GP regression with a dense in-graph Cholesky of the
     # exponential-quadratic covariance. The PRIMAL lowers through Reactant with

@@ -399,31 +399,26 @@ end
     :(_sm_functional_index(column, $(indices...), index))
 end
 
-@inline _sm_finite_read_position(
-        column, ::_SMFiniteScalarColumnSpec, ::Val{Position}) where {Position} =
-    maximum(_sm_functional_index(column, Position:Position))
 
-@inline _sm_finite_read_position(
-        column, ::_SMFiniteArrayColumnSpec{A,Shape},
-        ::Val{Position}) where {A,Shape,Position} =
-    _sm_finite_read_array_column(
-        column, Position, Val(length(Shape)))
+# One element of a column at a runtime (possibly traced) slot index: a scalar
+# column is one scalar gather, an array column one slice along its trailing
+# slot axis.  `_sm_functional_index` is the backend-neutral indexed read (the
+# Reactant extension gathers under `@allowscalar`).
+@inline _sm_finite_read_slot(column, ::_SMFiniteScalarColumnSpec, index) =
+    _sm_functional_index(column, index)
+@inline _sm_finite_read_slot(
+        column, ::_SMFiniteArrayColumnSpec{A,Shape}, index) where {A,Shape} =
+    _sm_finite_read_array_column(column, index, Val(length(Shape)))
 
-# The structural capacity is part of the compiled ABI.  Enumerate it at
-# generation time and select complete leaves rather than applying a traced
-# scalar index to a backend column.  This is the same bounded gather contract
-# used by the functional control-frame store.
-@generated function _sm_finite_read_column(
-        column, index, spec::Spec, ::Val{Capacity}) where {Spec,Capacity}
-    selected = :(_sm_finite_read_position(column, spec, Val(1)))
-    for position in 2:Capacity
-        selected = :(_sm_predicated_select(
-            index .== oftype(index, $position),
-            _sm_finite_read_position(column, spec, Val($position)),
-            $selected))
-    end
-    selected
-end
+# The structural capacity is part of the compiled ABI, but it is the length of
+# the bound initial container — a data length — so a read must not enumerate
+# it: one dynamic gather at the (already bounds-clamped) slot index reads the
+# element, and the emitted program is independent of the capacity
+# (`docs/src/constraints.md`).  This is the same gather contract the
+# functional control-frame store uses for its vector columns.
+@inline _sm_finite_read_column(
+        column, index, spec, ::Val{Capacity}) where {Capacity} =
+    _sm_finite_read_slot(column, spec, index)
 
 @inline _sm_finite_reconstruct(
         ::_SMFiniteScalarNode{Index}, leaves, static_values) where {Index} =

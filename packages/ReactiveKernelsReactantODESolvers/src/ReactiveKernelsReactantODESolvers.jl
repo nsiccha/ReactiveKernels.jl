@@ -6,8 +6,8 @@ RK-native, explicitly adaptive ODE solvers that lower through Reactant.
 This is a self-contained example subpackage: it owns an explicit adaptive
 Tsit5 implementation whose adaptive control is written in Reactant-traceable
 form (fixed-shape buffers, traceable control flow, no scalar indexing into
-traced arrays, no host-side branching on tensor values), plus ordinary
-reverse-mode gradients through the solve.
+traced arrays, no host-side branching on tensor values), plus backsolve
+adjoint gradients of the compiled solve.
 
 Nothing here is PosteriorDB support until the solver itself is independently
 proven and separately reviewed. Stiff/BDF solvers, discontinuous
@@ -26,7 +26,6 @@ export Tsit5, Tsit5Solution, solve_ode
 export FixedNSolution, solve_fixed_n
 export initial_dt, ReactantTsit5Config, compile_ode_solve
 export compile_backsolve_gradient
-export compile_fixedn_solve
 
 include("tableau.jl")
 include("controller.jl")

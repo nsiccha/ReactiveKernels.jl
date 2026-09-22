@@ -55,11 +55,11 @@ _sum_to_zero_host(value) = value
 end
 
 # The sampler-facing bound posterior is the matched benchmark cell.  Its
-# K = 8 plates and their reductions must lower as one scalar program (no
-# batched region, no vector reduction), and the automatic AD compile must keep
-# the eight-element observation arrays embedded rather than as hidden runtime
-# operands, so Reactant sees the same program shape as a hand-unrolled loop.
-@testset "bound sum-to-zero posterior lowers to a scalar program" begin
+# K-lane plates keep the batched lowering whatever K is (a lane count is a
+# data length; docs/src/constraints.md), so the emitted program must not grow
+# with the number of schools, and the automatic AD compile must keep the
+# observation arrays embedded rather than as hidden runtime operands.
+@testset "bound sum-to-zero posterior lowers to a lane-count-independent program" begin
     ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt)
     observations = Float64.(EIGHT_SCHOOLS_Y)
     observation_scales = Float64.(EIGHT_SCHOOLS_SIGMA)
@@ -73,11 +73,24 @@ end
     )
     q_traced = Reactant.to_rarray(q)
 
-    hlo = repr(Reactant.@code_hlo optimize = true kernel(q_traced))
-    @test !occursin("enzyme.batch", hlo)
-    @test !occursin("stablehlo.reduce", hlo)
     compiled = @compile sync = true kernel(q_traced)
     @test Float64(compiled(q_traced)) ≈ kernel(q) atol = 1e-10
+
+    # Twice the schools: identical unoptimized program, only tensor shapes
+    # differ.
+    program_lines(K) = begin
+        obs = vcat(observations, observations)[1:K]
+        scales = vcat(observation_scales, observation_scales)[1:K]
+        wide = prepare(
+            build_sum_to_zero_graph();
+            have = (:unconstrained, :observations, :observation_scales, :α_prior_sd),
+            want = :posterior,
+            bound = (; observations = obs, observation_scales = scales, α_prior_sd),
+        )
+        q_wide = Reactant.to_rarray([0.5, log(2.0), (0.25 .* collect(1.0:(K - 1)))...])
+        count("\n", repr(Reactant.@code_hlo optimize = false wide(q_wide)))
+    end
+    @test program_lines(8) == program_lines(16)
 
     backend = AutoEnzyme(
         ; mode = Enzyme.Reverse, function_annotation = Enzyme.Const)

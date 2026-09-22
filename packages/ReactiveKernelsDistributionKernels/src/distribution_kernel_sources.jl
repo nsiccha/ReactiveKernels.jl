@@ -205,11 +205,10 @@ const LAPLACE_LOGDENSITY = extract(laplace;
 #     derivative at `p ∈ {0, 1}`, so routing a p HAVE through it makes the
 #     reverse gradient `0 · ±Inf = NaN` at an exact boundary even though the
 #     primal is finite (e.g. p = 1, observed = true has logpdf log(1) = 0).
-#     The inner `ifelse` guards keep the UNSELECTED complement's log argument
-#     off the singularity (log(1)/log1p(0) = 0, finite derivative, killed by
-#     its 0 cotangent), so only the selected, genuinely-finite branch carries a
-#     gradient. Exact impossible events (p = 1 & observed = false, p = 0 &
-#     observed = true) still return -Inf.
+#     The branch is LAZY (`observed ? log(p) : log1p(-p)`): only the selected
+#     side is evaluated and differentiated, so the complement's singular log
+#     never runs (docs/src/constraints.md). Exact impossible events (p = 1 &
+#     observed = false, p = 0 & observed = true) still return -Inf.
 const BERNOULLI_KERNEL_SOURCE = raw"""
 using LogExpFunctions: log1pexp
 
@@ -221,8 +220,7 @@ using LogExpFunctions: log1pexp
 
     logpdf(observed::Bool)::Float64 = begin
         lp::Float64 = -log1pexp(ifelse(observed, -logit, logit))
-        lp::Float64 = ifelse(observed, log(ifelse(observed, p, 1.0)),
-                                        log1p(-ifelse(observed, 0.0, p)))
+        lp::Float64 = observed ? log(p) : log1p(-p)
         lp
     end
     cdf(observed::Bool)::Float64 = ifelse(observed, 1.0, 1 - p)
@@ -235,23 +233,21 @@ const LOGNORMAL_KERNEL_SOURCE = raw"""
     log_scale::Float64 = log(scale)
 
     standardized_log(x::Float64)::Float64 = begin
-        safe_x::Float64 = ifelse(x > 0, x, 1.0)
-        (log(safe_x) - location) / scale
+        x > 0 ? (log(x) - location) / scale : NaN
     end
     inv(standardized_log, z::Float64)::Float64 = exp(location + scale * z)
 
     logpdf(x::Float64)::Float64 = begin
         valid::Bool = x > 0
-        safe_x::Float64 = ifelse(valid, x, 1.0)
         z::Float64 = standardized_log(x)
         standard_logpdf::Float64 = standard_normal.logpdf(z)
-        ifelse(valid, standard_logpdf - log_scale - log(safe_x), -Inf)
+        valid ? standard_logpdf - log_scale - log(x) : -Inf
     end
     cdf(x::Float64)::Float64 = begin
         valid::Bool = x > 0
         z::Float64 = standardized_log(x)
         standard_cdf::Float64 = standard_normal.cdf(z)
-        ifelse(valid, standard_cdf, 0.0)
+        valid ? standard_cdf : 0.0
     end
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard_normal.quantile(p)
@@ -293,11 +289,10 @@ const UNIFORM_KERNEL_SOURCE = raw"""
 @kernel uniform(lower::Float64, upper::Float64) = begin
     width::Float64 = upper - lower
     valid_bounds::Bool = lower < upper
-    safe_width::Float64 = ifelse(valid_bounds, width, 1.0)
 
     logpdf(x::Float64)::Float64 = begin
         valid::Bool = valid_bounds & (x >= lower) & (x <= upper)
-        ifelse(valid, -log(safe_width), -Inf)
+        valid ? -log(width) : -Inf
     end
     cdf(x::Float64)::Float64 = begin
         within::Float64 = (x - lower) / width
@@ -356,13 +351,12 @@ const AR1_KERNEL_SOURCE = raw"""
         transition_ss::Float64 = sum(abs2, innovations)
         valid::Bool = abs(ϕ) < 1
         one_minus_ϕ2::Float64 = 1 - ϕ^2
-        safe_one_minus_ϕ2::Float64 = ifelse(valid, one_minus_ϕ2, 1.0)
-        initial_ss::Float64 = safe_one_minus_ϕ2 * sum(abs2, centered[1:1])
-        value::Float64 =
-            -0.5 * length(x) * log(2π) - length(x) * log_scale +
-            0.5 * log(safe_one_minus_ϕ2) -
-            0.5 * (initial_ss + transition_ss) / scale^2
-        ifelse(valid, value, -Inf)
+        initial_ss::Float64 = one_minus_ϕ2 * sum(abs2, centered[1:1])
+        valid ?
+            (-0.5 * length(x) * log(2π) - length(x) * log_scale +
+             0.5 * log(one_minus_ϕ2) -
+             0.5 * (initial_ss + transition_ss) / scale^2) :
+            -Inf
     end
 end
 """
@@ -386,8 +380,7 @@ using LogExpFunctions: logaddexp, logsumexp
 
 @kernel categorical_logit_ref(nonreference_logits::AbstractVector{Float64}) = begin
     logpdf(observed::Int)::Float64 =
-        ifelse(observed == 1, 0.0,
-               nonreference_logits[max(observed - 1, 1)]) -
+        (observed == 1 ? 0.0 : nonreference_logits[observed - 1]) -
         logaddexp(0.0, logsumexp(nonreference_logits))
 end
 """
@@ -405,11 +398,10 @@ using SpecialFunctions: loggamma, gamma_inc
     rate::Float64 = exp(log_rate)
 
     logpdf(observed::Int)::Float64 =
-        ifelse(observed >= 0,
-               observed * log_rate - rate - loggamma(observed + 1.0),
-               -Inf)
+        observed >= 0 ?
+            observed * log_rate - rate - loggamma(observed + 1.0) : -Inf
     cdf(observed::Int)::Float64 =
-        ifelse(observed >= 0, last(gamma_inc(observed + 1.0, rate)), 0.0)
+        observed >= 0 ? last(gamma_inc(observed + 1.0, rate)) : 0.0
 end
 """
 
@@ -426,16 +418,13 @@ using SpecialFunctions: loggamma, gamma_inc, gamma_inc_inv
     scale::Float64 = 1 / rate
     rate::Float64 = 1 / scale
 
-    logpdf(x::Float64)::Float64 = begin
-        valid::Bool = x > 0
-        safe_x::Float64 = ifelse(valid, x, 1.0)
-        value::Float64 =
-            shape * log_rate - loggamma(shape) +
-            (shape - 1) * log(safe_x) - rate * safe_x
-        ifelse(valid, value, -Inf)
-    end
+    logpdf(x::Float64)::Float64 =
+        x > 0 ?
+            (shape * log_rate - loggamma(shape) +
+             (shape - 1) * log(x) - rate * x) :
+            -Inf
     cdf(x::Float64)::Float64 =
-        ifelse(x > 0, first(gamma_inc(shape, rate * x)), 0.0)
+        x > 0 ? first(gamma_inc(shape, rate * x)) : 0.0
     quantile(p::Float64)::Float64 = gamma_inc_inv(shape, p, 1 - p) / rate
 end
 """
@@ -446,15 +435,12 @@ const BETA_KERNEL_SOURCE = raw"""
 using SpecialFunctions: logbeta, beta_inc, beta_inc_inv
 
 @kernel beta(a::Float64, b::Float64) = begin
-    logpdf(x::Float64)::Float64 = begin
-        valid::Bool = (x > 0) & (x < 1)
-        safe_x::Float64 = ifelse(valid, x, 0.5)
-        value::Float64 =
-            (a - 1) * log(safe_x) + (b - 1) * log1p(-safe_x) - logbeta(a, b)
-        ifelse(valid, value, -Inf)
-    end
+    logpdf(x::Float64)::Float64 =
+        (x > 0) & (x < 1) ?
+            (a - 1) * log(x) + (b - 1) * log1p(-x) - logbeta(a, b) :
+            -Inf
     cdf(x::Float64)::Float64 =
-        ifelse(x <= 0, 0.0, ifelse(x >= 1, 1.0, first(beta_inc(a, b, x))))
+        x <= 0 ? 0.0 : (x >= 1 ? 1.0 : first(beta_inc(a, b, x)))
     quantile(p::Float64)::Float64 = first(beta_inc_inv(a, b, p, 1 - p))
 end
 """
@@ -473,20 +459,16 @@ using SpecialFunctions: loggamma, beta_inc
     logp::Float64 = -log1pexp(-logit)
     log1mp::Float64 = -log1pexp(logit)
 
-    logpdf(observed::Int)::Float64 = begin
-        valid::Bool = (observed >= 0) & (observed <= n)
-        log_choose::Float64 =
-            loggamma(n + 1.0) - loggamma(observed + 1.0) -
-            loggamma(n - observed + 1.0)
-        value::Float64 =
-            log_choose + observed * logp + (n - observed) * log1mp
-        ifelse(valid, value, -Inf)
-    end
+    logpdf(observed::Int)::Float64 =
+        (observed >= 0) & (observed <= n) ?
+            (loggamma(n + 1.0) - loggamma(observed + 1.0) -
+             loggamma(n - observed + 1.0) +
+             observed * logp + (n - observed) * log1mp) :
+            -Inf
     cdf(observed::Int)::Float64 =
-        ifelse(observed < 0, 0.0,
-               ifelse(observed >= n, 1.0,
-                      first(beta_inc(float(n - observed),
-                                     observed + 1.0, 1 - p))))
+        observed < 0 ? 0.0 :
+            (observed >= n ? 1.0 :
+             first(beta_inc(float(n - observed), observed + 1.0, 1 - p)))
 end
 """
 
@@ -496,9 +478,10 @@ end
 # `logpdf` is the FULL Stan lpmf including all loggamma constants (Stan
 # `propto=false` keeps them; cross-backend absolute-value comparison is
 # load-bearing on this). The log1p form is algebraically identical and
-# NaN-free at the mu = 0 / mu = Inf edges (safe_* inputs keep the
-# branchless `ifelse` off NaN on the invalid side). No cdf/quantile
-# (discrete inversion); only `logpdf` is exposed.
+# NaN-free at the mu = 0 / mu = Inf edges; the support guard and the
+# `observed == 0` tail are LAZY branches, so nothing is evaluated on an
+# invalid side (docs/src/constraints.md). No cdf/quantile (discrete
+# inversion); only `logpdf` is exposed.
 const NEGATIVE_BINOMIAL2_KERNEL_SOURCE = raw"""
 using SpecialFunctions: loggamma
 using LogExpFunctions: log1p
@@ -506,15 +489,12 @@ using LogExpFunctions: log1p
 @kernel negative_binomial2(mu::Float64, phi::Float64) = begin
     logpdf(observed::Int)::Float64 = begin
         valid::Bool = (observed >= 0) & (mu >= 0) & (phi > 0)
-        safe_y::Float64 = ifelse(observed >= 0, Float64(observed), 0.0)
-        safe_mu::Float64 = ifelse(mu >= 0, mu, 0.0)
-        safe_phi::Float64 = ifelse(phi > 0, phi, 1.0)
-        base::Float64 =
-            loggamma(safe_y + safe_phi) - loggamma(safe_phi) -
-            loggamma(safe_y + 1.0) - safe_phi * log1p(safe_mu / safe_phi)
-        tail::Float64 = ifelse(observed == 0, 0.0,
-            -safe_y * log1p(safe_phi / safe_mu))
-        ifelse(valid, base + tail, -Inf)
+        y::Float64 = Float64(observed)
+        valid ?
+            (loggamma(y + phi) - loggamma(phi) - loggamma(y + 1.0) -
+             phi * log1p(mu / phi) +
+             (observed == 0 ? 0.0 : -y * log1p(phi / mu))) :
+            -Inf
     end
 end
 """
@@ -531,16 +511,13 @@ using SpecialFunctions: loggamma, gamma_inc, gamma_inc_inv
 @kernel inverse_gamma(shape::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
 
-    logpdf(x::Float64)::Float64 = begin
-        valid::Bool = x > 0
-        safe_x::Float64 = ifelse(valid, x, 1.0)
-        value::Float64 =
-            shape * log_scale - loggamma(shape) -
-            (shape + 1) * log(safe_x) - scale / safe_x
-        ifelse(valid, value, -Inf)
-    end
+    logpdf(x::Float64)::Float64 =
+        x > 0 ?
+            (shape * log_scale - loggamma(shape) -
+             (shape + 1) * log(x) - scale / x) :
+            -Inf
     cdf(x::Float64)::Float64 =
-        ifelse(x > 0, last(gamma_inc(shape, scale / ifelse(x > 0, x, 1.0))), 0.0)
+        x > 0 ? last(gamma_inc(shape, scale / x)) : 0.0
     quantile(p::Float64)::Float64 = scale / gamma_inc_inv(shape, 1 - p, p)
 end
 """

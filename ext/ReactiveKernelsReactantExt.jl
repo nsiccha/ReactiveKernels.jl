@@ -92,6 +92,24 @@ function Reactant.traced_type_inner(
     T
 end
 
+# A runtime-generated function is static program structure: its `body` is an
+# `Expr` whose `GlobalRef`s carry `Core.Binding` back-references (a cycle the
+# generic tracer does not terminate on), and it never holds a traced operand.
+# A retained loop's body closure captures the compiled step as a value, and
+# `@trace while` hands every captured value to the tracer, so shield it here.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels.RuntimeGeneratedFunctions.RuntimeGeneratedFunction,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels.RuntimeGeneratedFunctions.RuntimeGeneratedFunction}
+    T
+end
+
 # The externalized call owns only generated code, the stripped operation
 # table, and static slot indices. Hidden bound arrays are separate traced
 # operands, so traversing this compiler structure would be both unnecessary
@@ -263,6 +281,13 @@ end
     value::Reactant.TracedRNumber) = copy(value)
 @inline ReactiveKernels._sm_control_carry_isolate(
     value::Reactant.AbstractConcreteNumber) = copy(value)
+# A traced array argument enters the control carry as its own tracer object:
+# the retained loop writes each carry slot's result back into the object it
+# was seeded from, and seeding from the caller's argument tracer would turn
+# that write-back into an in-place update of the caller's buffer (an RNG
+# seed argument advanced on the host after a call that never drew from it).
+@inline ReactiveKernels._sm_control_argument_isolate(
+    value::Reactant.TracedRArray) = copy(value)
 
 # A traced branch can legitimately meet a source literal or compiler-static
 # initial value of the same logical scalar type.  Keep that bridge exact: it
@@ -377,12 +402,21 @@ ReactiveKernels._sm_frame_fill(
         value::Reactant.TracedRNumber, ::Val{Capacity}) where {Capacity} =
     Reactant.Ops.fill(value, (Capacity,))
 
+# Reactant's scalar gather/scatter accept only `Int`-typed traced indices
+# (`Union{Int,TracedRNumber{Int}}`); any other traced integer falls through
+# to the general indexing path and returns a one-element ARRAY. A frame index
+# carries the program's index type (`Int8` for an `Int8`-typed machine), so
+# widen it to `Int` at the slot access.
+_frame_slot(index::Reactant.TracedRNumber{Int}) = index
+_frame_slot(index::Reactant.TracedRNumber{<:Integer}) =
+    convert(Reactant.TracedRNumber{Int}, index)
+
 function ReactiveKernels._sm_frame_read(
         values::Reactant.TracedRArray{T,1}, index::Reactant.TracedRNumber) where {T}
     isempty(values) && throw(ArgumentError(
         "functional control frame store cannot be empty"))
     valid = (index >= one(index)) & (index <= length(values))
-    safe = ifelse(valid, index, one(index))
+    safe = _frame_slot(ifelse(valid, index, one(index)))
     Reactant.@allowscalar values[safe]
 end
 
@@ -390,7 +424,7 @@ function ReactiveKernels._sm_frame_write(
         values::Reactant.TracedRArray{T,1}, index::Reactant.TracedRNumber,
         replacement, active) where {T}
     valid = (index >= one(index)) & (index <= length(values))
-    safe = ifelse(valid, index, one(index))
+    safe = _frame_slot(ifelse(valid, index, one(index)))
     Reactant.@allowscalar begin
         result = copy(values)
         result[safe] = ifelse(active & valid, replacement, values[safe])
@@ -423,6 +457,18 @@ end
 @inline function ReactiveKernels._sm_functional_index(
         array::Reactant.TracedRArray, indices...)
     Reactant.@allowscalar getindex(array, indices...)
+end
+
+# A HOST column read at a traced slot index (a bound structural container or
+# frame column beside a traced program) is a constant table of the traced
+# program: lift it and gather, instead of enumerating its capacity with a
+# select chain.  All-concrete indices keep the ordinary host read.
+@inline function ReactiveKernels._sm_functional_index(
+        array::Array, indices::Vararg{Union{Colon,Reactant.TracedRNumber}})
+    any(index -> index isa Reactant.TracedRNumber, indices) ||
+        return getindex(array, indices...)
+    Reactant.@allowscalar getindex(
+        Reactant.promote_to(Reactant.TracedRArray, array), indices...)
 end
 
 @inline function ReactiveKernels._sm_functional_indexed_copy(
@@ -807,6 +853,22 @@ end
         value.uplo, value.info)
 end
 
+# A traced `Diagonal` that crossed a retained loop or a branch dispatch comes
+# back erased: the backing vector, or the materialized dense matrix.  Restore
+# the source wrapper from its schema (the port's frozen initial value).
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::LinearAlgebra.Diagonal, value::Reactant.TracedRArray{T,1}) where {T} =
+    LinearAlgebra.Diagonal(value)
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::LinearAlgebra.Diagonal, value::Reactant.TracedRArray{T,2}) where {T} =
+    LinearAlgebra.Diagonal(LinearAlgebra.diag(value))
+# A batched Cholesky already IS the traced representation of a source
+# Cholesky; its traced `info` is not host metadata to compare against.
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::LinearAlgebra.Cholesky, value::_RKBatchedCholesky) = value
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::_RKBatchedCholesky, value::_RKBatchedCholesky) = value
+
 # A structured-state port is the same immutable program resource plus its
 # generated repair table.  Standalone generic structured operations may
 # capture the port directly; its endpoint state remains dynamic only when
@@ -875,6 +937,15 @@ end
     Reactant.@allowscalar array[index[]]
 end
 
+# A HOST vector read at a traced index (a bound table kept concrete inside a
+# traced plate cell, such as the cut points of an ordered-logistic cell
+# gathered at the observed class) is a constant table of the traced program:
+# lift it and gather, exactly like the state machine's host-column read.
+@inline function ReactiveKernels._tensorized_getindex(
+        array::Array{T,1}, index::Reactant.TracedRNumber{I}) where {T,I<:Integer}
+    Reactant.@allowscalar Reactant.promote_to(Reactant.TracedRArray{T,1}, array)[index[]]
+end
+
 # A CONCRETE-integer scalar index `q[i]` on a traced vector cannot lower:
 # `getindex(::TracedRArray, ::Int)` hits Reactant's scalar-indexing ban (the
 # unrolled/authored scalar read the arma11 snag documented).  When it feeds
@@ -935,25 +1006,34 @@ end
         a::Reactant.TracedRArray, b::Array) =
     ReactiveKernels._tensorized_normalized_dot(a, b)
 
-# A traced `scan` lowers its sequential recurrence to a `stablehlo.while` carry
-# loop instead of unrolling into per-step scalar indexing.  `step` is the
-# prepared two-`want` step kernel `(carry, x..., shared...) -> (new_carry, output)`.
-# The threaded `carry` is an ordinary loop-carried variable — reassigned each
-# iteration, exactly like the transpiler's `state` (`transpiled_program.jl:17`) —
-# so a compound carry rides through as a loop-carried `NamedTuple`.  The per-step
-# outputs are written into a preallocated traced buffer with an in-place
-# `buffer[i] = …` dynamic-update-slice, the same idiom the range-draw probe uses
-# under `@trace for` (`range_draw_probe.jl:17`).  The first step runs eagerly to
-# seed the carry and fix the output element type; the `@trace for` then runs the
-# remaining steps as one `stablehlo.while`.  RK-macro-only per decision
-# `17bnc6t`; Reactant untouched.  A non-scalar per-step output is a loud,
-# reported limitation, never a silent mis-lowering.
+# A traced `scan` lowers its sequential recurrence to ONE `stablehlo.while`
+# carry loop for every iterated-sequence shape, instead of unrolling into
+# per-step scalar indexing.  `step` is the prepared two-`want` step kernel
+# `(carry, x..., shared...) -> (new_carry, output)`.  The threaded `carry` is an
+# ordinary loop-carried variable — reassigned each iteration, exactly like the
+# transpiler's `state` (`transpiled_program.jl:17`) — so a compound carry rides
+# through as a loop-carried `NamedTuple`.  The per-step outputs are written into
+# a preallocated traced buffer with an in-place `buffer[i] = …`
+# dynamic-update-slice.  The first step runs eagerly to seed the carry and fix
+# the output element type; the `@trace for` then runs the remaining steps as one
+# `stablehlo.while` (`N == 1` runs with an empty loop body).  RK-macro-only per
+# decision `17bnc6t`; Reactant untouched.
 #
-# `iterated` is the tuple of per-step sequences advanced in lockstep — one element
-# of each per step, spliced into the step call `step(carry, x..., shared...)`.
-# Under Reactant every iterated sequence must be a traced 1-D array so it can be
-# gathered inside the `while` by the loop counter; a host array (e.g. bound data)
-# has no exposed counter to index and is rejected with a clear message.
+# Core-constraint conformance (`docs/src/constraints.md`): the lowering is
+# selected by `_scan_backend_marker` whenever ANY scan operand is traced, and
+# every iterated sequence is then carried as a traced array — a host/bound
+# sequence is lifted with `promote_to` as a constant of the traced program
+# (exactly as `_reactant_plate_operand` lifts bound plate data), a 1-D sequence
+# is gathered element by element by the loop counter, and an `eachrow` slices
+# wrapper contributes its (lifted) parent matrix, whose row `i` is one traced
+# dynamic slice.  No shape falls back to the host loop, so the emitted program
+# is independent of the sequence length and of the row width.
+#
+# Only the parent arrays cross the `@trace` boundary: the `RowSlices` wrapper
+# itself is not while-carryable (Reactant cannot trace its `OneTo` axes), so
+# the sequences are normalized to plain traced arrays before the loop.  A
+# non-scalar per-step output and a directly iterated N-D array (whose native
+# semantics are linear indexing) remain loud, reported limitations.
 @inline _scan_output_buffer(::Reactant.TracedRNumber{T}, n::Integer) where {T} =
     Reactant.promote_to(Reactant.TracedRArray, zeros(T, n))
 
@@ -968,81 +1048,59 @@ end
 # beside a `Float64` output).
 @inline _scan_output_buffer(out::Number, n::Integer) =
     Reactant.promote_to(Reactant.TracedRArray, zeros(typeof(out), n))
-
-# Gather one matrix row as a HOST vector of traced scalars. The column count
-# rides as `Val{K}`: the `@trace` body re-traces every captured operand as a
-# tracer, so a value-`K` would turn the `1:K` comprehension range into an
-# uncollectable `TracedUnitRange` — the type-domain `K` stays concrete.
-@inline _scan_gather_row(
-        parent::Reactant.TracedRArray{<:Any,2}, i, ::Val{K}) where {K} =
-    Reactant.@allowscalar [parent[i, k] for k in 1:K]
 _scan_output_buffer(out, ::Integer) = throw(ArgumentError(
     "the Reactant scan lowering supports a scalar per-step output; got a " *
     "$(typeof(out)). Author the per-step output as a scalar, or report this " *
     "shape as an unimplemented scan lowering."))
 
-function ReactiveKernels._tensorized_scan(
-        step, init, iterated::Tuple{Reactant.TracedRArray{<:Any,1},Vararg{Any}},
+# Normalize one iterated sequence to the traced array the loop gathers from.
+@inline _scan_traced_sequence(xs::Reactant.TracedRArray{<:Any,1}) = xs
+@inline _scan_traced_sequence(xs::AbstractVector) =
+    Reactant.promote_to(Reactant.TracedRArray, xs)
+@inline _scan_traced_sequence(xs::Base.RowSlices) =
+    Reactant.promote_to(Reactant.TracedRArray, parent(xs))
+_scan_traced_sequence(xs::AbstractArray) = throw(ArgumentError(
+    "the Reactant scan lowering iterates a 1-D sequence or `eachrow` over a " *
+    "matrix; a directly iterated $(ndims(xs))-D array is not supported (its " *
+    "native semantics are linear element iteration). Pass `eachrow(...)` or " *
+    "`vec(...)` explicitly, or report this shape as an unimplemented scan lowering."))
+_scan_traced_sequence(xs) = throw(ArgumentError(
+    "the Reactant scan lowering cannot iterate a $(typeof(xs)) sequence"))
+
+@inline _scan_sequence_length(xs::Reactant.TracedRArray{<:Any,1}) = length(xs)
+@inline _scan_sequence_length(xs::Reactant.TracedRArray{<:Any,2}) = size(xs, 1)
+# Element `i` of a 1-D sequence is one scalar gather; element `i` of a row-wise
+# matrix is one traced dynamic row slice, so the step's row arithmetic stays
+# vector-valued in the emitted program whatever the row width.
+@inline _scan_element(xs::Reactant.TracedRArray{<:Any,1}, i) =
+    Reactant.@allowscalar xs[i]
+@inline _scan_element(xs::Reactant.TracedRArray{<:Any,2}, i) = xs[i, :]
+
+# A concrete (device-resident, untraced) marker means the kernel is executing
+# eagerly outside a compiled program: there is no traced program to build, so
+# the native ordered loop is the correct execution, not an unrolled trace.
+ReactiveKernels._tensorized_scan_lowering(
+        ::Union{Reactant.AbstractConcreteArray,Reactant.AbstractConcreteNumber},
+        step, init, iterated::Tuple, shared::Tuple) =
+    ReactiveKernels._tensorized_scan_lowering(nothing, step, init, iterated, shared)
+
+function ReactiveKernels._tensorized_scan_lowering(
+        marker::Reactant.TracedType, step, init, iterated::Tuple,
         shared::Tuple)
-    all(x -> x isa Reactant.TracedRArray{<:Any,1}, iterated) || throw(ArgumentError(
-        "the Reactant scan lowering requires every iterated sequence to be a " *
-        "traced 1-D array; pass each sequence traced (e.g. Reactant.to_rarray(data)) " *
-        "rather than as bound host data — a host array cannot be indexed by the " *
-        "stablehlo.while loop counter."))
-    n = length(first(iterated))
+    sequences = map(_scan_traced_sequence, iterated)
+    n = _scan_sequence_length(first(sequences))
     n == 0 && throw(ArgumentError("scan requires a non-empty sequence"))
-    all(x -> length(x) == n, iterated) || throw(DimensionMismatch(
-        "scan's iterated sequences must have equal length; got lengths " *
-        "$(map(length, iterated))."))
-    x1 = Reactant.@allowscalar map(xs -> xs[1], iterated)
+    all(xs -> _scan_sequence_length(xs) == n, sequences) || throw(
+        DimensionMismatch(
+            "scan's iterated sequences must have equal length; got lengths " *
+            "$(map(_scan_sequence_length, sequences))."))
+    x1 = map(xs -> _scan_element(xs, 1), sequences)
     carry, out1 = step(init, x1..., shared...)
     buffer = _scan_output_buffer(out1, n)
     Reactant.@allowscalar buffer[1] = out1
     Reactant.@trace for i in 2:n
-        x = Reactant.@allowscalar map(xs -> xs[i], iterated)
+        x = map(xs -> _scan_element(xs, i), sequences)
         carry, out = step(carry, x..., shared...)
-        Reactant.@allowscalar buffer[i] = out
-    end
-    buffer
-end
-
-# A traced `scan` over matrix ROWS — `scan(eachrow(M); ...)` with `M` traced,
-# the HMM forward-algorithm shape — lowers to the same single `stablehlo.while`
-# carry loop as the 1-D method above. The loop closes over the traced parent
-# alone and gathers row `i` by the counter with the `allowscalar` idiom,
-# threads the carry (scalar, `NamedTuple`, or a vector such as an HMM belief
-# state), and writes scalar per-step outputs into the preallocated traced
-# buffer. The first step runs eagerly to seed the carry and fix the output
-# element type, so `N == 1` runs with an empty loop body. A non-scalar
-# per-step output is the same loud, reported limitation as on the 1-D path.
-# Two representation facts pin this shape: the step indexes its row (`row[1]`)
-# without `allowscalar`, which is legal only for a HOST container, so each
-# gathered row is a host vector of traced scalars; and the `RowSlices` wrapper
-# itself is not while-carryable (Reactant cannot trace its `OneTo` axes), so
-# it never crosses the `@trace` boundary — only the parent does. Shapes this
-# method does NOT claim — a host (untraced) parent, `eachrow` over a
-# non-matrix, or a row-slices sequence beside other iterated sequences — keep
-# falling through to the generic native loop, which traces unrolled with exact
-# values. `RowSlices` is `eachrow`'s return type across the supported Julia
-# line; a rename would fail loudly here at precompile, never silently.
-function ReactiveKernels._tensorized_scan(
-        step, init,
-        iterated::Tuple{<:Base.RowSlices{<:Reactant.TracedRArray{<:Any,2}}},
-        shared::Tuple)
-    parent = only(iterated).parent
-    n = size(parent, 1)
-    K = size(parent, 2)
-    n == 0 && throw(ArgumentError("scan requires a non-empty sequence"))
-    # Built OUTSIDE the `@trace` body: the body re-traces every captured value
-    # operand, so an in-body `Val(K)` would meet a traced `K` and die.
-    Kval = Val(K)
-    x1 = _scan_gather_row(parent, 1, Kval)
-    carry, out1 = step(init, x1, shared...)
-    buffer = _scan_output_buffer(out1, n)
-    Reactant.@allowscalar buffer[1] = out1
-    Reactant.@trace for i in 2:n
-        x = _scan_gather_row(parent, i, Kval)
-        carry, out = step(carry, x, shared...)
         Reactant.@allowscalar buffer[i] = out
     end
     buffer
@@ -1055,6 +1113,32 @@ _recurrence_trace(x) = x
 _recurrence_trace(x::Tuple) = map(_recurrence_trace, x)
 _recurrence_trace(x::NamedTuple) = map(_recurrence_trace, x)
 _recurrence_trace(x::AbstractArray) = Reactant.promote_to(Reactant.TracedRArray, x)
+# A traced array enters a retained loop as a FRESH tracer object: the loop
+# writes each carry slot's result back into the object it was seeded from,
+# and seeding from a state field's own tracer would silently advance that
+# field even where the caller later selects the pre-loop value (a masked
+# iteration of the predicated machine kept stepping the HMC phase point).
+_recurrence_trace(x::Reactant.TracedRArray) = copy(x)
+# A `Diagonal` rides a retained loop as its backing vector — never as the
+# dense matrix `promote_to` would materialize — and is rebuilt from the
+# pre-loop schema (`_sm_restore_source_logical_wrappers`) before source code
+# reads the carry, so the loop's argument and result types agree.
+_recurrence_trace(x::LinearAlgebra.Diagonal) = _recurrence_trace(x.diag)
+
+# The wrapper schema of a carry: its recursive shape with every leaf erased
+# (no traced value is captured by the loop body through it, so nothing
+# aliases the carried tracers) and each source wrapper replaced by a marker
+# that `_sm_restore_source_logical_wrappers` rebuilds from the erased leaf.
+struct _DiagonalSchema end
+_carry_schema(::LinearAlgebra.Diagonal) = _DiagonalSchema()
+_carry_schema(x::Tuple) = map(_carry_schema, x)
+_carry_schema(x::NamedTuple) = map(_carry_schema, x)
+_carry_schema(x) = nothing
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::_DiagonalSchema, value::AbstractVector) = LinearAlgebra.Diagonal(value)
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::_DiagonalSchema, value::AbstractMatrix) =
+    LinearAlgebra.Diagonal(LinearAlgebra.diag(value))
 _recurrence_trace(x::T) where {T<:Number} =
     Reactant.promote_to(Reactant.TracedRNumber{T}, x)
 _recurrence_trace(x::Reactant.TracedRNumber) = copy(x)
@@ -1062,14 +1146,41 @@ _recurrence_trace(x::Reactant.TracedRNumber) = copy(x)
 function ReactiveKernels._rectangular_fold_impl(
         marker::Reactant.TracedType, step, init, columns, shared, n)
     n == 0 && return init
+    # `init` doubles as the wrapper schema of the carry (see
+    # `_sm_transition_loop_backend`): the loop carries backing arrays and the
+    # step sees the source wrappers.
+    schema = _carry_schema(init)
     carry = _recurrence_trace(init)
     data = _recurrence_trace(columns)
     args = _recurrence_trace(shared)
     Reactant.@trace for i in 1:n
         row = Reactant.@allowscalar map(c -> c[i], data)
-        carry = _recurrence_trace(step(carry, row, args...))
+        carry = _recurrence_trace(step(
+            ReactiveKernels._sm_restore_source_logical_wrappers(schema, carry),
+            row, args...))
     end
-    carry
+    ReactiveKernels._sm_restore_source_logical_wrappers(schema, carry)
+end
+
+# A functional state transition's captured `Base.Colon` loop: the body
+# program runs inside one `stablehlo.while` region whatever the bound (the
+# bound may be bound numeric data).  Host carry leaves are lifted once before
+# the loop and traced scalars copied, so every carry slot has its own
+# identity (`_recurrence_trace`).
+function ReactiveKernels._sm_transition_loop_backend(
+        ::Reactant.TracedType, body, ensures, controls, range, carry::Tuple)
+    # The pre-loop carry keeps the source wrappers (a `Diagonal` metric); the
+    # retained loop carries their backing arrays.  Restore the wrappers from
+    # the leaf-free schema before the body — the source program — reads the
+    # carry again, and once more for the final carry.
+    schema = _carry_schema(carry)
+    carry = _recurrence_trace(carry)
+    Reactant.@trace track_numbers = false for index in range
+        carry = _recurrence_trace(body(ensures, controls,
+            ReactiveKernels._sm_restore_source_logical_wrappers(schema, carry),
+            index))
+    end
+    ReactiveKernels._sm_restore_source_logical_wrappers(schema, carry)
 end
 
 function ReactiveKernels._recurrence_branch(
@@ -1137,8 +1248,7 @@ end
 # and both large-plate lowerings below need it promoted before they classify
 # or broadcast operands (see `_reactant_plate_operand` for the two failures).
 # Already-traced operands and `Ref`-wrapped shared scalars pass through
-# untouched, so an all-traced plate lowers exactly as before; the <= 16-lane
-# scalar-lanes path never reaches this promotion.
+# untouched, so an all-traced plate lowers exactly as before.
 @inline _reactant_plate_operand(arg) = arg
 @inline _reactant_plate_operand(arg::Reactant.TracedRArray) = arg
 @inline _reactant_plate_operand(arg::AbstractArray) =
@@ -1156,8 +1266,6 @@ end
 
 function _reactant_authored_plate_call(marker, operation, args::Tuple)
     count = _authored_plate_batch_length(marker)
-    lanes = _reactant_plate_lanes(count, operation, args)
-    lanes === nothing || return lanes
     # Only traced arrays and the structural markers count as explicit batch
     # inputs below, so a host lane vector (a `bound=` data vector beside a
     # traced `eachcol` matrix) would otherwise be captured as a SHARED closure
@@ -1192,35 +1300,12 @@ function ReactiveKernels._tensorized_plate_call(
     _reactant_authored_plate_call(marker, operation, args)
 end
 
-# --- Small static plates lower as scalar lane programs -----------------------
-# A plate over a small, statically sized axis is evaluated once per lane with
-# scalar (or column) operands, the lane results stay scalars, and the authored
-# `sum(pointwise)` reduces them with a scalar add chain.  The vectorized
-# lowering is correct but structurally slower on XLA's CPU backend: computed
-# scalars broadcast across lanes and a lane vector reused by several plates
-# are producers XLA refuses to fuse into their consumers, and each
-# `stablehlo.reduce` is another kernel boundary, so one small posterior
-# becomes several kernel launches where a hand-unrolled loop is one.  Keeping
-# small plates scalar restores that single-kernel shape without any
-# model-specific recognition; larger plates keep the batched/broadcast
-# lowering, so accelerator-scale plates are unchanged.  The lane vector is
-# materialized only when a pointwise result is actually demanded.
-const _REACTANT_SMALL_STATIC_PLATE_LANES = Ref(16)
-
-struct _PlateLanes{L<:Tuple}
-    lanes::L
-end
-
-ReactiveKernels._tensorized_plate_is_marker(::_PlateLanes) = true
-ReactiveKernels._tensorized_plate_materialize(value::_PlateLanes) =
-    vcat(value.lanes...)
-ReactiveKernels._tensorized_plate_sum(value::_PlateLanes) =
-    foldl(+, value.lanes)
-function ReactiveKernels._tensorized_plate_call(
-        marker::_PlateLanes, operation, args::Tuple)
-    _reactant_authored_plate_call(marker, operation, args)
-end
-
+# Plates never lower as per-lane scalar programs.  A plate's lane count is a
+# data length (the observation axis), so replicating the cell body once per
+# lane — even for a small, preparation-known count — is the data-derived
+# unrolling `docs/src/constraints.md` forbids; every traced plate keeps the
+# batched (`Ops.batch`) or broadcast lowering, whose emitted program is
+# independent of the lane count.
 # Plain traced vectors carry no structural marker in the core, so without this
 # claim a vector plate lowers through Reactant's generic broadcast.  Claiming
 # them routes the plate here, where a large plate still takes exactly that
@@ -1253,7 +1338,6 @@ ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
     ::ReactiveKernels._TensorizedEachcol{<:Reactant.TracedRArray}) = true
 @inline _reactant_is_structural_marker(
     ::ReactiveKernels._TensorizedPlateBatch{<:Reactant.TracedRArray}) = true
-@inline _reactant_is_structural_marker(::_PlateLanes) = true
 @inline _reactant_structural_marker(::Tuple{}) = nothing
 @inline function _reactant_structural_marker(args::Tuple)
     arg = first(args)
@@ -1284,10 +1368,6 @@ function _reactant_ref_plate_call(operation, args::Tuple)
     # In particular, the shape of an atomic parameter never becomes a lane axis.
     shape = Int64[length(axis) for axis in Base.Broadcast.combine_axes(args...)]
     isempty(shape) && return operation(map(_reactant_plate_scalar_arg, args)...)
-    if length(shape) == 1
-        lanes = _reactant_plate_lanes(only(shape), operation, args)
-        lanes === nothing || return lanes
-    end
     positions = Tuple(index for index in eachindex(args)
         if getfield(args, index) isa Union{AbstractArray,Tuple})
     inputs = Reactant.TracedRArray[
@@ -1317,55 +1397,7 @@ function ReactiveKernels._tensorized_plate_call(
         return _reactant_authored_plate_call(structural, operation, args)
     any(_reactant_plate_ref_array, args) &&
         return _reactant_ref_plate_call(operation, args)
-    lanes = _reactant_plate_lanes(size(marker, 1), operation, args)
-    lanes === nothing ?
-        Base.broadcast(operation, map(_reactant_plate_operand, args)...) :
-        lanes
-end
-
-@inline _authored_plate_batch_length(arg::_PlateLanes) = length(arg.lanes)
-@inline _authored_plate_batch_input(arg::_PlateLanes) = Reactant.promote_to(
-    Reactant.TracedRArray, ReactiveKernels._tensorized_plate_materialize(arg))
-@inline _authored_plate_is_explicit_batch(arg::_PlateLanes, count) = true
-
-# How one plate operand participates in per-lane evaluation: `:lane` operands
-# contribute one value per lane, `:shared` operands are passed to every lane,
-# and `nothing` means the operand shape is outside this lowering, in which
-# case the whole plate keeps its batched or broadcast lowering.
-@inline _plate_lane_kind(arg::ReactiveKernels._TensorizedEachcol, count) =
-    size(arg.parent, 2) == count ? :lane : nothing
-@inline _plate_lane_kind(arg::ReactiveKernels._TensorizedPlateBatch, count) =
-    _plate_lane_kind(arg.values, count)
-@inline _plate_lane_kind(arg::_PlateLanes, count) =
-    length(arg.lanes) == count ? :lane : nothing
-@inline _plate_lane_kind(arg::AbstractArray, count) =
-    ndims(arg) == 1 && length(arg) == count ? :lane : nothing
-@inline _plate_lane_kind(arg::Base.RefValue, count) = :shared
-@inline _plate_lane_kind(arg::Number, count) = :shared
-@inline _plate_lane_kind(arg, count) = nothing
-
-@inline _plate_lane(arg::ReactiveKernels._TensorizedEachcol, lane) =
-    arg.parent[:, lane]
-@inline _plate_lane(arg::ReactiveKernels._TensorizedPlateBatch, lane) =
-    _plate_lane(arg.values, lane)
-@inline _plate_lane(arg::_PlateLanes, lane) = getfield(arg.lanes, lane)
-@inline _plate_lane(arg::AbstractVector, lane) = Reactant.@allowscalar arg[lane]
-
-function _reactant_plate_lanes(count, operation, args::Tuple)
-    1 <= count <= _REACTANT_SMALL_STATIC_PLATE_LANES[] || return nothing
-    kinds = map(arg -> _plate_lane_kind(arg, count), args)
-    any(kind -> kind === nothing, kinds) && return nothing
-    any(kind -> kind === :lane, kinds) || return nothing
-    shared = map(_authored_plate_shared, args)
-    lanes = ntuple(count) do lane
-        lane_args = ntuple(length(args)) do index
-            getfield(kinds, index) === :lane ?
-                _plate_lane(getfield(args, index), lane) :
-                getfield(shared, index)
-        end
-        operation(lane_args...)
-    end
-    _PlateLanes(lanes)
+    Base.broadcast(operation, map(_reactant_plate_operand, args)...)
 end
 
 @inline function ReactiveKernels._batched_call(

@@ -1,11 +1,13 @@
 # Reactant-traced adaptive Tsit5 driver.
 #
-# The traced program is a single `@trace while` loop over fixed-shape buffers:
-# the adaptive accept/reject logic blends via `ifelse` (no traced branches),
-# each step calls the standard prepared `tsit5_stage` kernel, and saveat
-# emission accumulates into a tuple of per-point columns threaded by
-# structural recursion. Hyperparameters are concrete closure constants; only
-# `u0` and (optionally) `p` are traced.
+# The traced program is a single `@trace while` loop over fixed-shape buffers
+# that exits as soon as the span is covered: the adaptive accept/reject
+# logic blends via `ifelse` (a selection between two valid values), each
+# step calls the standard prepared `tsit5_stage` kernel, and saveat emission
+# updates one `n × nsave` dense buffer with a vectorized window mask.
+# Hyperparameters are concrete closure constants; only `u0` and (optionally)
+# `p` are traced. The program size is independent of `maxiters` and of the
+# number of saveat points (locked by the test suite).
 #
 # Verified Reactant constraints (probed against Reactant 0.2.285, recorded
 # here so the next reader does not re-derive them):
@@ -15,43 +17,29 @@
 #   `ifelse` (scalar and broadcast), which lowers to `select`;
 # - loop-carried scalars must derive from traced inputs (concrete literals
 #   do not carry), hence the `z = sum(u0 .* 0)` traced-zero origin;
-# - integer locals referenced in a `@trace while` body promote to traced
-#   integers, so loop bounds/counts must not appear there at all (not even
-#   via globals) — the emission below threads tuples by structural
-#   recursion instead of indexing a flat buffer;
+# - a shared step closure capturing traced values breaks `@trace while`
+#   operand/block-arg matching, so the step body is spelled inline;
 # - parametric structs captured by the loop need a bound the traced
 #   promotion satisfies (`Number`, not `AbstractFloat`);
 # - `Enzyme.autodiff(::Reverse, ...)` inside traced code is intercepted by
-#   Reactant's overlay and lowers the pullback into the program.
-# - Enzyme reverse through a `@trace while` needs `checkpointing =
-#   Binomial(b)` (revolve over a fixed budget), `track_numbers = false`,
-#   a single-comparison condition over a pure `+1` counter, and a constant
-#   bound. The three rejected shapes fail differently (each probed minimal
-#   on a trivial loop): `Periodic(n)` dies at XLA lowering
-#   (`stablehlo.dynamic_pad` untranslatable); a compound `(a < b) & (c < d)`
-#   cond fails analysis under either scheme ("no known iteration count");
-#   a select-on-IV saturating counter segfaults the Binomial reverse
-#   transform (`reverseBinomial`/`popCache`). Through-solve reverse
-#   therefore required a per-iteration freeze shape, not a second clause
-#   or a saturated counter — and even the freeze never lowered at solver
-#   scale under any scheme (see the test suite; minimal repro filed
-#   upstream). Through-solve reverse is NOT supported: the supported
-#   gradient path is the backsolve adjoint (`compile_backsolve_gradient`),
-#   which differentiates only the loop-free RHS VJP inside the step.
-#   Primal `@trace while` lowers a compound `(n < max) & (t < t1)` cond
-#   and exits early (probed minimal), so `early_exit=true` (the default)
-#   runs no frozen iterations at all. The legacy `early_exit=false`
-#   shape survives only as a diagnostic/reference path for the
-#   agreement gates. Measured freeze cost (strato2, 2026-09-18,
-#   Reactant 0.2.285; 2-state decay converging in ~60 native attempts):
-#   maxiters=80 executes in 0.10 ms, maxiters=1000 in 0.55 ms —
-#   execution wall time of the freeze shape scales with the bound, not
-#   the difficulty. Both shapes produce bitwise-identical values (locked
-#   by the agreement test); status semantics are unchanged (exhaustion
-#   still reports from the unreached `t1`).
+#   Reactant's overlay and lowers the pullback into the program;
 # - never place complementary comparisons (`x <= c` and `x > c`) on one
 #   traced value that can be NaN: the optimizer derives one from the
 #   other, wrong for NaN. Test `isnan` explicitly instead.
+#
+# Known limitation (upstream): Enzyme reverse THROUGH the retained
+# `@trace while` does not lower. The loop's exit condition is data
+# dependent (`(n < maxiters) & (t < t1)`), and Reactant's reverse-mode
+# while handling requires a statically known iteration count (or a
+# single-comparison counter with `Binomial` checkpointing; the compound
+# condition fails with "no known iteration count"). Reactant/Enzyme-only
+# reproducer: `benchmark/repro_reactant_adaptive_while_reverse.jl` at the
+# repository root. The supported gradient path is the backsolve adjoint
+# (`compile_backsolve_gradient`), which differentiates only the loop-free
+# RHS VJP inside the step. The former workarounds — a fixed-N straight-line
+# unroll and post-exit dummy-`dt` masked iterations that kept a
+# single-comparison loop shape alive — were removed: both are the shapes
+# `docs/src/constraints.md` forbids.
 
 module ReactiveKernelsReactantODESolversReactantExt
 
@@ -61,7 +49,7 @@ import Reactant
 const RKRO = ReactiveKernelsReactantODESolvers
 
 function RKRO.traceable_ode_closure(f, cfg::RKRO.ReactantTsit5Config,
-        u0_example::AbstractVector, p_example; early_exit::Bool=true)
+        u0_example::AbstractVector, p_example)
     T = typeof(cfg.t0)
     eltype(u0_example) == T ||
         throw(ArgumentError("u0 element type $(eltype(u0_example)) must match config type $T"))
@@ -83,15 +71,7 @@ function RKRO.traceable_ode_closure(f, cfg::RKRO.ReactantTsit5Config,
     atol, rtol = cfg.abstol, cfg.reltol
     dtmax = cfg.dtmax
     maxiters = T(cfg.maxiters)
-    # Checkpointing for Enzyme reverse through the traced while: it must be
-    # `Binomial` (revolve over a fixed checkpoint budget), not `Periodic` —
-    # probed against Reactant 0.2.285, `Periodic(n)` still fails reverse
-    # with "WhileOp does not have known iteration count for cache removal",
-    # and upstream tests reverse-through-while only with `Binomial`.
-    # Built here — concrete, once — so the `@trace` site below splices a
-    # plain value, not an expression.
-    ckpt = Reactant.Binomial(8)
-    saveat_tup = Tuple(cfg.saveat)
+    saveat_vec = copy(cfg.saveat)
     dt_init_signed = tdir * cfg.dt_init
     one_T, zero_T = one(T), zero(T)
     two_T = one_T + one_T
@@ -99,7 +79,7 @@ function RKRO.traceable_ode_closure(f, cfg::RKRO.ReactantTsit5Config,
     qoldinit_T = T(RKRO.TSIT5_QOLDINIT)
     # The step runs through the standard prepared kernel (concrete, once):
     # prepared calls lower through Reactant via the core traced-slot
-    # machinery, primal and reverse. `inv_n` likewise concrete.
+    # machinery. `inv_n` likewise concrete.
     kstep = RKRO.prepare_tsit5_stage()
     inv_n = T(inv(n))
 
@@ -122,50 +102,31 @@ function RKRO.traceable_ode_closure(f, cfg::RKRO.ReactantTsit5Config,
         bad = z + zero_T
         u = u0
         k1 = f(u0, p, t)
-        out = ntuple(_ -> u0 .* zero_T, nsave)
+        # The saveat times as one traced vector (read-only inside the loop)
+        # and the dense buffer as one `n × nsave` matrix carried through it.
+        saveat_tr = z .+ saveat_vec
+        out = u0 .* reshape(saveat_tr .* zero_T, 1, nsave)
 
-        # Loop shape by consumer; the two bodies below are INTENTIONALLY
-        # identical (a shared step closure capturing traced values breaks
-        # `@trace while` operand/block-arg matching — probed). The only
-        # difference is the condition. The agreement test locks both shapes
-        # to bitwise-identical values, so any future divergence fails loudly.
-        #
-        # The primal exits early on a compound `(n < max) & (t < t1)`
-        # condition (probed: lowers and exits in primal Reactant).
-        # Reverse-through-while cannot use that shape: the only `@trace
-        # while` form whose Binomial-checkpointed reverse Enzyme lowers is
-        # a single comparison over a pure `+1` counter and a constant
-        # bound — a compound cond fails analysis ("no known iteration
-        # count"), and a select-on-IV saturating counter segfaults the
-        # Binomial reverse transform (`reverseBinomial`/`popCache`;
-        # minimal repro filed upstream). The freeze variant therefore keeps
-        # the single-comparison cond and turns arrival at `t1` into a
-        # per-iteration no-op freeze, at up to `maxiters` wasted iterations
-        # per solve. Status semantics are unchanged (exhaustion still
-        # reports from the unreached `t1`).
-        if early_exit
-            Reactant.@trace checkpointing = ckpt track_numbers = false while (n_iter < maxiters_tr) & (tdir * (t1 - t) > zero_T)
-            active = tdir * (t1 - t) > zero_T
+        # One retained loop with lazy early exit: the body runs only while
+        # the span is uncovered, so no iteration is ever a masked no-op.
+        Reactant.@trace track_numbers = false while (n_iter < maxiters_tr) & (tdir * (t1 - t) > zero_T)
             dt_use = ifelse(tdir * (t + dt - t1) > zero_T, t1 - t, dt)
-            # Finite dummy step when frozen: `dt_use` is 0 there, and the
-            # dense fraction `(ts - t) / dt_use` would be Inf/NaN. The
-            # primal discards it via the freeze selects, but reverse-mode
-            # forms 0 * non-finite partials into live shadows (NaN
-            # gradients). Every update from the dummy is discarded below.
-            dt_step = ifelse(active, dt_use, one_tr)
-            taken_u, taken_k, taken_EEst = kstep(f, u, k1, p, t,
-                dt_step, tab, atol, rtol, inv_n)
-            taken = (u=taken_u, k=taken_k, EEst=taken_EEst)
-            EEst = taken.EEst
+            taken_u, taken_k, taken_EEst = kstep(f, u, k1, p, t, dt_use, tab,
+                atol, rtol, inv_n)
+            EEst = taken_EEst
             accept = EEst <= one_tr
             q, q11 = RKRO.pi_factors(EEst, qold)
             dt_next = min(
                 ifelse(accept, RKRO.pi_accept_dt(dt_use, q),
                     RKRO.pi_reject_dt(dt_use, q11)), dtmax)
-            u_next = ifelse.(accept, taken.u, u)
-            k1_next = ifelse.(accept, taken.k[7], k1)
-            t_next = ifelse(accept, t + dt_use, t)
-            qold_next = ifelse(accept, max(EEst, qoldinit_tr), qold)
+            t_new = t + dt_use
+            out = RKRO._emit_saveat(out, saveat_tr, u, taken_k, t, dt_use,
+                min(t, t_new), max(t, t_new), accept, dense)
+            u = ifelse.(accept, taken_u, u)
+            k1 = ifelse.(accept, taken_k[7], k1)
+            t = ifelse(accept, t_new, t)
+            dt = dt_next
+            qold = ifelse(accept, max(EEst, qoldinit_tr), qold)
             # A rejected step with finite EEst > 1 is ordinary; a NaN
             # estimate latches `bad` (every float is <= 1, > 1, or NaN).
             # Spelled `isnan`-first deliberately: placing both `EEst <= 1`
@@ -173,60 +134,8 @@ function RKRO.traceable_ode_closure(f, cfg::RKRO.ReactantTsit5Config,
             # the other, which is wrong for NaN (probed: identical NaN
             # input reads `(<=, >)` as `(false, true)` in one program and
             # `(true, false)` in another).
-            bad_next = ifelse(accept, bad, ifelse(isnan(EEst), one_tr, bad))
-            t_new = t + dt_use
-            out = RKRO._emit_saveat_cols(out, saveat_tup, u, taken.k, t,
-                dt_step, min(t, t_new), max(t, t_new), accept & active, dense)
-            u = ifelse.(active, u_next, u)
-            k1 = ifelse.(active, k1_next, k1)
-            t = ifelse(active, t_next, t)
-            dt = ifelse(active, dt_next, dt)
-            qold = ifelse(active, qold_next, qold)
+            bad = ifelse(accept, bad, ifelse(isnan(EEst), one_tr, bad))
             n_iter = n_iter + one_tr
-            bad = ifelse(active, bad_next, bad)
-            end
-        else
-            Reactant.@trace checkpointing = ckpt track_numbers = false while n_iter < maxiters_tr
-            active = tdir * (t1 - t) > zero_T
-            dt_use = ifelse(tdir * (t + dt - t1) > zero_T, t1 - t, dt)
-            # Finite dummy step when frozen: `dt_use` is 0 there, and the
-            # dense fraction `(ts - t) / dt_use` would be Inf/NaN. The
-            # primal discards it via the freeze selects, but reverse-mode
-            # forms 0 * non-finite partials into live shadows (NaN
-            # gradients). Every update from the dummy is discarded below.
-            dt_step = ifelse(active, dt_use, one_tr)
-            taken_u, taken_k, taken_EEst = kstep(f, u, k1, p, t,
-                dt_step, tab, atol, rtol, inv_n)
-            taken = (u=taken_u, k=taken_k, EEst=taken_EEst)
-            EEst = taken.EEst
-            accept = EEst <= one_tr
-            q, q11 = RKRO.pi_factors(EEst, qold)
-            dt_next = min(
-                ifelse(accept, RKRO.pi_accept_dt(dt_use, q),
-                    RKRO.pi_reject_dt(dt_use, q11)), dtmax)
-            u_next = ifelse.(accept, taken.u, u)
-            k1_next = ifelse.(accept, taken.k[7], k1)
-            t_next = ifelse(accept, t + dt_use, t)
-            qold_next = ifelse(accept, max(EEst, qoldinit_tr), qold)
-            # A rejected step with finite EEst > 1 is ordinary; a NaN
-            # estimate latches `bad` (every float is <= 1, > 1, or NaN).
-            # Spelled `isnan`-first deliberately: placing both `EEst <= 1`
-            # and `EEst > 1` lets the optimizer derive one comparison from
-            # the other, which is wrong for NaN (probed: identical NaN
-            # input reads `(<=, >)` as `(false, true)` in one program and
-            # `(true, false)` in another).
-            bad_next = ifelse(accept, bad, ifelse(isnan(EEst), one_tr, bad))
-            t_new = t + dt_use
-            out = RKRO._emit_saveat_cols(out, saveat_tup, u, taken.k, t,
-                dt_step, min(t, t_new), max(t, t_new), accept & active, dense)
-            u = ifelse.(active, u_next, u)
-            k1 = ifelse.(active, k1_next, k1)
-            t = ifelse(active, t_next, t)
-            dt = ifelse(active, dt_next, dt)
-            qold = ifelse(active, qold_next, qold)
-            n_iter = n_iter + one_tr
-            bad = ifelse(active, bad_next, bad)
-            end
         end
         reached = tdir * (t1 - t) <= zero_T
         status = ifelse(bad > half_tr, two_tr,
@@ -245,158 +154,8 @@ function RKRO.compile_ode_solve(f, u0_example::AbstractVector,
     thunk = Reactant.compile(closure, example_args)
     function solved(args...)
         traced = map(Reactant.to_rarray, args)
-        u_end, cols, status = thunk(traced...)
-        (Array(u_end), hcat(map(Array, cols)...), Int(Float64(status)))
-    end
-    p_example === nothing ? (u0,) -> solved(u0) : (u0, p) -> solved(u0, p)
-end
-
-function RKRO.traceable_fixedn_closure(f, cfg::RKRO.ReactantTsit5Config,
-        u0_example::AbstractVector, p_example)
-    T = typeof(cfg.t0)
-    eltype(u0_example) == T ||
-        throw(ArgumentError("u0 element type $(eltype(u0_example)) must match config type $T"))
-    n = length(u0_example)
-    n >= 1 || throw(ArgumentError("state dimension must be positive"))
-    if p_example !== nothing
-        p_example isa AbstractVector ||
-            throw(ArgumentError("traced parameters must be a vector or nothing"))
-        eltype(p_example) == T || throw(ArgumentError(
-            "parameter element type $(eltype(p_example)) must match config type $T"))
-    end
-    nsave = length(cfg.saveat)
-    nsave >= 1 || throw(ArgumentError(
-        "the compiled solve requires at least one interior saveat point"))
-    N = cfg.maxiters
-    N >= 1 || throw(ArgumentError(
-        "the fixed-N solve needs maxiters >= 1 as its step count, got $N"))
-
-    tab = cfg.tab
-    dense = cfg.dense
-    t0, t1, tdir = cfg.t0, cfg.t1, cfg.tdir
-    atol, rtol = cfg.abstol, cfg.reltol
-    dtmax = cfg.dtmax
-    saveat_tup = Tuple(cfg.saveat)
-    dt_init_signed = tdir * cfg.dt_init
-    one_T, zero_T = one(T), zero(T)
-    two_T = one_T + one_T
-    half_T = one_T / two_T
-    qoldinit_T = T(RKRO.TSIT5_QOLDINIT)
-    guard_T = T(RKRO.TSIT5_FIXEDN_GUARD)
-    kstep = RKRO.prepare_tsit5_stage()
-    inv_n = T(inv(n))
-
-    function body(u0, p)
-        z = sum(u0 .* zero_T)
-        one_tr = z + one_T
-        two_tr = z + two_T
-        half_tr = z + half_T
-        zero_tr = z + zero_T
-        qoldinit_tr = z + qoldinit_T
-        guard_tr = z + guard_T
-        t1_tr = z + t1
-        # No `dtmin`: the traced driver fixes it at 0 (the native
-        # default), like the adaptive traced driver — `stuck` latches
-        # only on genuinely unrepresentable progress.
-        # Constant-foldable traced booleans (the index is concrete, so
-        # plain Julia branches gate whole statements; only value choices
-        # need `ifelse`, and those need traced constants).
-        false_tr = zero_tr > one_tr
-        true_tr = one_tr > zero_tr
-        t = z + t0
-        dt = z + dt_init_signed
-        qold = qoldinit_tr + zero_T
-        u = u0
-        k1 = f(u0, p, t)
-        out = ntuple(_ -> u0 .* zero_T, nsave)
-        subdiv = z + zero_T
-        bad = z + zero_T
-        stuck = z + zero_T
-
-        # Plain `for` over the concrete bound unrolls during tracing: the
-        # program is straight-line solver code with no `while` op, which is
-        # what the through-reverse probe needs. Every step is accepted;
-        # the subdivision trigger and the failure latches are branchless
-        # `ifelse` selects; step `N` lands exactly on `t1`. There are no
-        # emergency retries: a poisoned or guard-exceeding step latches
-        # `bad` and freezes the rest (native would retry — the documented
-        # divergence, confined to solves where native retries).
-        for i in 1:N
-            frozen = (bad > half_tr) | (stuck > half_tr)
-            remaining = t1 - t
-            if i == N
-                dt_use = remaining
-            else
-                steps_left = N - i + 1
-                prop = tdir * min(abs(dt), abs(remaining))
-                trigger = tdir * (t + prop - t1) >= zero_T
-                subdiv = ifelse(trigger, one_tr, subdiv)
-                dt_use = ifelse(subdiv > half_tr, remaining / steps_left,
-                    prop)
-            end
-            no_progress = (t + dt_use) == t
-            if i == N
-                # Landing snap (mirror native): an unrepresentable gap
-                # finishes; the landing never latches `stuck`.
-                snap = no_progress
-            else
-                snap = false_tr
-                stuck = ifelse(no_progress, one_tr, stuck)
-            end
-            # Finite dummy step when frozen or snapped: the dense
-            # fraction `(ts - t) / dt_step` would be Inf/NaN at
-            # `dt_use == 0`, and reverse-mode forms 0 * non-finite
-            # partials into live shadows even for discarded updates.
-            dt_step = ifelse(frozen | no_progress, one_tr, dt_use)
-            taken_u, taken_k, taken_EEst = kstep(f, u, k1, p, t,
-                dt_step, tab, atol, rtol, inv_n)
-            EEst = taken_EEst
-            # isnan-first (complementary comparisons on a possibly-NaN
-            # value miscompile); EEst >= 0 unless NaN.
-            step_bad = ifelse(isnan(EEst), true_tr, EEst > guard_tr)
-            bad = ifelse(frozen, bad, ifelse(step_bad, one_tr, bad))
-            if i == N
-                advance = ifelse(frozen, false_tr,
-                    ifelse(step_bad, false_tr, true_tr))
-            else
-                advance = ifelse(frozen | no_progress,
-                    false_tr, ifelse(step_bad, false_tr, true_tr))
-            end
-            q, _ = RKRO.pi_factors(EEst, qold)
-            dt_next = min(RKRO.pi_accept_dt(dt_use, q), dtmax)
-            t_new = t + dt_use
-            out = RKRO._emit_saveat_cols(out, saveat_tup, u, taken_k, t,
-                dt_step, min(t, t_new), max(t, t_new), advance, dense)
-            u = ifelse.(advance, taken_u, u)
-            k1 = ifelse.(advance, taken_k[7], k1)
-            if i == N
-                t = ifelse(advance, ifelse(snap, t1_tr, t + dt_use), t)
-            else
-                t = ifelse(advance, t + dt_use, t)
-            end
-            dt = ifelse(advance, dt_next, dt)
-            qold = ifelse(advance, max(EEst, qoldinit_tr), qold)
-        end
-        reached = tdir * (t1 - t) <= zero_T
-        status = ifelse(bad > half_tr, two_tr,
-            ifelse(stuck > half_tr, one_tr,
-                ifelse(reached, zero_tr, one_tr)))
-        (u, out, status)
-    end
-
-    p_example === nothing ? (u0,) -> body(u0, nothing) : body
-end
-
-function RKRO.compile_fixedn_solve(f, u0_example::AbstractVector,
-        p_example, ::RKRO.Tsit5, cfg::RKRO.ReactantTsit5Config)
-    closure = RKRO.traceable_fixedn_closure(f, cfg, u0_example, p_example)
-    example_args = p_example === nothing ? (Reactant.to_rarray(u0_example),) :
-        (Reactant.to_rarray(u0_example), Reactant.to_rarray(p_example))
-    thunk = Reactant.compile(closure, example_args)
-    function solved(args...)
-        traced = map(Reactant.to_rarray, args)
-        u_end, cols, status = thunk(traced...)
-        (Array(u_end), hcat(map(Array, cols)...), Int(Float64(status)))
+        u_end, smat, status = thunk(traced...)
+        (Array(u_end), Array(smat), Int(Float64(status)))
     end
     p_example === nothing ? (u0,) -> solved(u0) : (u0, p) -> solved(u0, p)
 end
@@ -405,8 +164,7 @@ end
 # backward in time, the adjoint integrates `dλ/dt = -Jᵀλ`, and the parameter
 # quadrature `dμ/dt = -(λᵀf_p)` so `μ(t0) = dL/dp`. The VJP pair comes from
 # one `Enzyme.autodiff` over the loop-free RHS per stage evaluation (lowered
-# to straight-line code inside the step by Reactant's Enzyme overlay — the
-# same closure-in-autodiff pattern the through-while recipe uses, probed
+# to straight-line code inside the step by Reactant's Enzyme overlay, probed
 # minimal inside a `@trace while` body before building on it). Nothing here
 # differentiates through the adaptive loop. Reached through
 # `Reactant.Enzyme` (identical to the `Enzyme` module object), so the

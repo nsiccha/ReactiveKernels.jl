@@ -97,8 +97,10 @@ rejected.
 This function-shaped form describes a graph, not a new object type. Compiled
 reactive state lets you change inputs in place through `set!`, `mutate!`, and
 `touch!`. A `@kernel` that contains its own inner methods can expose pure,
-straight-line methods as transparent endpoints. Methods with mutation or control
-flow remain on the separate, stricter stateful compiler: it reads their source
+straight-line methods as transparent endpoints; a branch in value position and
+an authored `plate(...) do` cell are straight-line, since the recipe lowering
+owns them. Methods with mutation, loops, or statement-position control flow
+remain on the separate, stricter stateful compiler: it reads their source
 directly and only allows calls whose effects it can account for.
 The [compiler capability and limits](compiler.md) page covers the full planning,
 code-generation, state, control-flow, NUTS, and rejection rules.
