@@ -1427,8 +1427,9 @@ const VECTOR_FNS = (:gp_exp_quad_cov, :gp_chol_latent)
 
 """Cell-callable functions (grouped kernels): admitted in grouped-kernel
 cell assignments ONLY, always with a declared schedule as the first
-argument. The generator macro-expands the call per subject (the
-function itself is the host-side spec + oracle path)."""
+argument. The generator emits ONE subject-batched call per assignment
+(`<fn>_over_subjects` over the bound op columns + `op_ends`, pkcells.jl);
+the function itself is the per-subject cell + host-side oracle path."""
 const CELL_FNS = (:linear_pk_read_locs, :linear_pk_read_locs_auc)
 
 """Arity (argument count) of each [`CELL_FNS`](@ref) entry, schedule first."""
@@ -1436,8 +1437,9 @@ const CELL_FN_ARITY = Dict{Symbol,Int}(:linear_pk_read_locs => 6,
     :linear_pk_read_locs_auc => 7)
 
 """Op-column fields each [`CELL_FNS`](@ref) entry reads per subject
-(positional, after the schedule — the generator slices `<sched>_<field>`
-per subject from `op_ends`)."""
+(positional, after the schedule — the generator passes the bound
+`<sched>_<field>` columns to the batched runner, which slices them per
+subject at runtime from `op_ends`)."""
 const CELL_FN_OP_FIELDS = Dict{Symbol,Vector{Symbol}}(
     :linear_pk_read_locs => [:op_type, :op_dt, :op_amount, :op_interval,
         :op_count, :op_read_idx],
@@ -1445,9 +1447,10 @@ const CELL_FN_OP_FIELDS = Dict{Symbol,Vector{Symbol}}(
         :op_count, :op_read_idx])
 
 """Call args (by NAME) each [`CELL_FNS`](@ref) entry slices per subject
-from a flat op-ordered vector (`view(name, lo:hi)` over the static op
-range — for computed event-frame vectors like the W2 `log_F` provider
-output, which are generated-code locals, not bind columns)."""
+from a flat op-ordered vector (emitted as `SubjectSlice(name)` — the
+batched runner takes `view(name, lo:hi)` over the subject's op range —
+for computed event-frame vectors like the W2 `log_F` provider output,
+which are generated-code locals, not bind columns)."""
 const CELL_FN_SLICED_ARGS = Dict{Symbol,Vector{Symbol}}(
     :linear_pk_read_locs => [:log_F],
     :linear_pk_read_locs_auc => [:log_F])

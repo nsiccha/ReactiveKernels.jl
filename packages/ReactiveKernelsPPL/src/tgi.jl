@@ -274,16 +274,23 @@ tgi_inv_logit(x::Number) = 1 / (1 + exp(-x))
 Reference each assessment's size progression is measured from: the smallest
 model-predicted log size change among the PREVIOUS assessments and the
 baseline scan (change 0). Assessments must be in time order (SB
-`tgi_running_nadir`). Host loop — the kernel-side formulation is
-[`tgi_nadir_scan_expr`](@ref) (a plain loop cannot trace on
-param-dependent inputs). `min` matches Stan `fmin` on finite inputs.
+`tgi_running_nadir`). Plain loop, eltype-generic: it is what generated
+code runs (through [`tgi_segmented_nadir`](@ref)) natively, under Enzyme,
+and under Reactant, where a traced change vector is read element-wise
+through the traced-gather hook and the loop unrolls at trace time.
+[`tgi_nadir_scan_expr`](@ref) is the equivalent `scan` spelling for
+hand-authored kernels. `min` matches Stan `fmin` on finite inputs.
 """
 function tgi_running_nadir(r::AbstractVector)
-    out = Vector{Float64}(undef, length(r))
-    current = 0.0
+    # Eltype-generic: a traced change vector (Reactant) yields traced
+    # scalars — reads go through the traced-gather hook (`_traced_op_read`,
+    # pkcells.jl), the running minimum stays scalar arithmetic.
+    T = promote_type(eltype(r), Float64)
+    out = Vector{T}(undef, length(r))
+    current = zero(T)
     for i in eachindex(r)
         out[i] = current
-        current = min(current, Float64(r[i]))
+        current = min(current, _traced_op_read(r, i))
     end
     return out
 end
@@ -317,12 +324,13 @@ is rows `prev+1:ends[s]`, empty when `ends[s] == prev`). Each segment
 runs [`tgi_running_nadir`](@ref); the result vcats the segments (one
 entry per row, in order).
 
-Host-side oracle path for the grouped cell form `tgi_ref =
-tgi_segmented_nadir(tgi_change, tgi_seg_ends)` — the generator unrolls
-one [`tgi_nadir_scan_expr`](@ref) per subject instead (the change
-series is parameter-dependent, so no host loop traces). Validates the
-segment contract defensively (`ends` nondecreasing from a
-non-negative start, last end == row count).
+The grouped cell form `tgi_ref = tgi_segmented_nadir(tgi_change,
+tgi_seg_ends)` emits as exactly this call (one statement, whatever the
+subject count — the ends are a bound column), so this is both the
+host-side oracle and the generated-code path: native, Enzyme, and
+Reactant (traced `change`, element reads through the traced-gather hook,
+loop unrolled at trace time). Validates the segment contract defensively
+(`ends` nondecreasing from a non-negative start, last end == row count).
 """
 function tgi_segmented_nadir(change::AbstractVector,
         ends::AbstractVector{<:Integer})
@@ -336,14 +344,15 @@ function tgi_segmented_nadir(change::AbstractVector,
         throw(ArgumentError("tgi_segmented_nadir last end " *
                             "$(isempty(ends) ? 0 : ends[end]) ≠ row count " *
                             "$(length(change))"))
-    out = Vector{Float64}[]
+    T = promote_type(eltype(change), Float64)
+    out = Vector{T}[]
     prev = 0
     for hi in ends
         push!(out, tgi_running_nadir(view(change, (prev + 1):hi)))
         prev = hi
     end
-    isempty(out) && return Float64[]
-    return vcat(out...)
+    isempty(out) && return zeros(T, 0)
+    return reduce(vcat, out)
 end
 
 # --- likelihood primitives (SB `@deffun` math) ------------------------------

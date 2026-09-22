@@ -842,6 +842,64 @@ end
         :(mu = c[g]),
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
         :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    # A bound levels-subset is plain metadata: it reuses the inline grammar
+    # and is admitted by `=`, not by `~`.
+    got = lower_rkppl(quote
+        sel = levels(g)[2:end]
+        c[sel] .~ Normal.(0, 2)
+        mu = c[g]
+        y .~ Normal.(mu, 1.5)
+    end, (:y, :g))
+    @test length(got.levelmaps) == 1 &&
+        _maps_equal(got.levelmaps[1],
+            LevelMap(:mu, :g, [], :levels, (2, :end)))
+    for (rhs, subset) in (
+            (:(levels(g)), Colon()),
+            (:(levels(g)[2:end]), (2, :end)),
+            (:(levels(g)[1:2]), 1:2),
+            (:(levels(g)[[1, 3]]), [1, 3]))
+        bound = Expr(:block, Expr(:(=), :sel, rhs),
+            Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
+            :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
+        got = lower_rkppl(bound, (:y, :g))
+        @test got.levelmaps[1].subset == subset
+    end
+    # The bound path rejects exactly the subset spellings the inline path
+    # rejects.
+    for rhs in (:(levels(g)[1:n]), :(levels(g)[0:2]),
+                :(levels(g)[3:2]), :(levels(g)[[]]),
+                :(levels(g)[[1.5]]), :(levels(g)[1:2:4]))
+        bound = Expr(:block, Expr(:(=), :sel, rhs),
+            Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
+            :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
+        @test_throws SurfaceLoweringError lower_rkppl(bound, (:y, :g))
+    end
+    # Unknown and non-levels index names fail closed; so does a binding over
+    # a non-data grouping column.
+    unknown = Expr(:block, Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
+        :(mu = c[g]), Expr(:call, :.~, :y, :(Normal.(mu, 1.5))))
+    @test_throws "index name sel must be a bound levels-subset" lower_rkppl(
+        unknown, (:y, :g))
+    nonlevels = Expr(:block, :(sel = g),
+        Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
+        :(mu = c[g]), Expr(:call, :.~, :y, :(Normal.(mu, 1.5))))
+    @test_throws "index name sel must be a bound levels-subset" lower_rkppl(
+        nonlevels, (:y, :g))
+    for assignment in (nothing, :(x = 1.0), :(sel = g), :(sel = unique(g)))
+        block = Expr(:block)
+        assignment === nothing || push!(block.args, assignment)
+        append!(block.args, (Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
+            :(mu = c[g]), Expr(:call, :.~, :y, :(Normal.(mu, 1.5)))))
+        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g, :x))
+    end
+    nongroup = quote
+        sel = levels(z)
+        c[sel] .~ Normal.(0, 2)
+        mu = c[g]
+        y .~ Normal.(mu, 1.5)
+    end
+    @test_throws "levels binding sel: `levels(z)` needs a data grouping" lower_rkppl(
+        nongroup, (:y, :g))
 end
 
 @testset "surface full-rank factor end to end" begin
