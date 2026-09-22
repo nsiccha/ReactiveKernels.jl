@@ -76,6 +76,9 @@ CPU fusion is the acceptance path. No K=10 measurement precedes stable K=3.
 
 ## Reverse blocker
 
+Tracked in [ReactiveKernels #13](https://github.com/nsiccha/ReactiveKernels.jl/issues/13),
+including the full standalone reproducer and environment setup.
+
 Reactant 0.2.285 reports `had set op which was not a direct descendant` while
 processing an `enzyme.set` in the PK recurrence. The joint K=1 reverse process
 exited 1 at 1.98 GiB peak RSS; it did not exhaust memory. The standalone
