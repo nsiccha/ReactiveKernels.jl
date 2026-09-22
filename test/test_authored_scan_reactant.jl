@@ -115,3 +115,60 @@ end
     @test prepare(tuplescan_out)(x) isa Vector
     @test_throws ArgumentError Reactant.@compile prepare(tuplescan_out)(traced_x)
 end
+
+@testset "bound host sequences retain the while loop with a length-independent program" begin
+    spec = AuthoredScanFixtures.authored_scan_arma
+    q = [0.2, 0.7, -0.3]
+    traced_q = Reactant.to_rarray(q)
+    sizes = Int[]
+    for n in (8, 16)
+        series = sin.(1:n)
+        k = prepare(spec; want = :errors, bound = (; series))
+        compiled = Reactant.@compile k(traced_q)
+        @test Array(compiled(traced_q)) ≈ k(q)
+        hlo = repr(Reactant.@code_hlo optimize = false k(traced_q))
+        @test count("stablehlo.while", hlo) == 1
+        push!(sizes, count("\n", hlo))
+    end
+    # Only tensor shapes differ between the two programs: no per-step copy.
+    @test sizes[1] == sizes[2]
+end
+
+@testset "a traced sequence beside a bound sequence shares one while loop" begin
+    spec = AuthoredScanFixtures.authored_scan_lockstep
+    a, b = [0.9, 0.8, 0.5, -0.2, 0.3, 0.6], [1.0, -0.5, 0.2, 0.7, -0.1, 0.4]
+    k = prepare(spec; want = :seq, bound = (; b))
+    traced_a = Reactant.to_rarray(a)
+    compiled = Reactant.@compile k(traced_a)
+    @test Array(compiled(traced_a)) ≈ k(a)
+    hlo = repr(Reactant.@code_hlo optimize = false k(traced_a))
+    @test count("stablehlo.while", hlo) == 1
+end
+
+@testset "eachrow scans retain one while loop independent of length and width" begin
+    spec = AuthoredScanFixtures.authored_scan_eachrow
+    gain = Reactant.to_rarray(0.5; track_numbers = true)
+    bound_sizes = Int[]
+    traced_sizes = Int[]
+    for K in (3, 6), n in (4, 8)
+        M = hcat(collect(1.0:n), fill(0.5, n), fill(0.25, n), fill(0.1, n, K - 3))
+        # A bound (host) matrix is lifted into the traced program.
+        bound = prepare(spec; want = :total, bound = (; mat = M))
+        compiled_bound = Reactant.@compile bound(gain)
+        @test Reactant.to_number(compiled_bound(gain)) ≈ bound(0.5)
+        bound_hlo = repr(Reactant.@code_hlo optimize = false bound(gain))
+        @test count("stablehlo.while", bound_hlo) == 1
+        push!(bound_sizes, count("\n", bound_hlo))
+        # A traced matrix gathers each row as one dynamic slice, so the row
+        # width never unrolls the step body.
+        traced = prepare(spec; want = :total)
+        traced_M = Reactant.to_rarray(M)
+        compiled_traced = Reactant.@compile traced(traced_M, gain)
+        @test Reactant.to_number(compiled_traced(traced_M, gain)) ≈ traced(M, 0.5)
+        traced_hlo = repr(Reactant.@code_hlo optimize = false traced(traced_M, gain))
+        @test count("stablehlo.while", traced_hlo) == 1
+        push!(traced_sizes, count("\n", traced_hlo))
+    end
+    @test allequal(bound_sizes)
+    @test allequal(traced_sizes)
+end

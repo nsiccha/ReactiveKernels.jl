@@ -140,24 +140,27 @@ end
   still returns its vector; requesting the scan port, adding another consumer,
   supplying another broadcast array, or composing multiple plates preserves
   ordinary scan materialization and broadcast shape checks.
-- **Reactant.** `scan` emits a single `stablehlo.while` carry loop in two
-  shapes: every iterated sequence a traced 1-D array (each gathered inside the
-  loop by the loop counter), or a single `eachrow` over a traced matrix (each
-  row gathered by the counter from the traced parent; from RK `a4eaa27`). The
-  carry — scalar, `NamedTuple`, or vector — is threaded as a loop-carried
-  value, the per-step outputs are written into a preallocated traced buffer
-  with a dynamic-update-slice, and the first step runs eagerly to seed the
-  carry and fix the output element type (`N == 1` runs with an empty loop
-  body). Anything else — a host (`bound=`) iterated sequence, `eachrow` over
-  a host matrix, or a row-slices sequence beside other iterated sequences —
-  takes the generic loop instead, which traces unrolled with exact values: no
-  `while`, but also no error. One sharp edge stays loud: a traced 1-D first
-  sequence beside a host later sequence is rejected, so pass every sequence
-  traced via `Reactant.to_rarray(data)` on the 1-D path. Native and Reactant
-  results match to floating-point tolerance (see
-  `test/test_ppl_examples_reactant.jl`). This host-data unrolling is an existing
-  violation of the [core constraints](constraints.md), not a supported design
-  direction. It requires retained iteration or explicit rejection.
+- **Reactant.** `scan` emits a single `stablehlo.while` carry loop for every
+  iterated-sequence shape. The lowering is selected whenever any scan operand
+  is traced (the carry seed, an iterated sequence looked through its
+  `eachrow` wrapper, or a shared operand looked through its `Ref`), and every
+  iterated sequence is then carried as a traced array: a 1-D sequence is
+  gathered element by element by the loop counter, an `eachrow` matrix
+  contributes its parent and row `i` is one traced dynamic slice (so the
+  step's row arithmetic stays vector-valued whatever the row width), and a
+  host (`bound=`) sequence is lifted into the traced program as a constant
+  exactly as bound plate data is. Sequences of different kinds may be
+  iterated together. The carry — scalar, `NamedTuple`, or vector — is
+  threaded as a loop-carried value, the per-step outputs are written into a
+  preallocated traced buffer with a dynamic-update-slice, and the first step
+  runs eagerly to seed the carry and fix the output element type (`N == 1`
+  runs with an empty loop body). The emitted program is independent of the
+  sequence length and of the row width, as the [core
+  constraints](constraints.md) require; native and Reactant results match to
+  floating-point tolerance (see `test/test_authored_scan_reactant.jl` and
+  `test/test_ppl_examples_reactant.jl`). A scan whose every operand is host
+  data runs the native loop as ordinary host precomputation and emits no
+  program structure.
 
 ## Generated grouped recurrences
 
@@ -174,9 +177,8 @@ compilation currently fails in the Reactant/MLIR backend. It is not a supported 
 The experiment, reproducer, and measurements are documented in
 `benchmark/joint_stan_tiled/rectangular_lowering.md` in the repository.
 
-This runtime path does not change the authored `scan` contract below. In
-particular, a host-bound `scan` sequence still follows the generic path described
-above. The rectangular fold is an internal lowering boundary, not a new public
+This runtime path does not change the authored `scan` contract above. The
+rectangular fold is an internal lowering boundary, not a new public
 authoring function. Bound table shapes still specialize an executable; changing
 the bound schedule requires preparing and compiling again.
 
@@ -188,8 +190,11 @@ the bound schedule requires preparing and compiling again.
 - **Iterated sequences precede shared operands.** All bare (iterated) positionals
   come first; every `Ref(...)` shared operand follows. A non-`Ref` positional
   after a `Ref(...)` is rejected.
-- **Per-step output is a scalar** on either Reactant `while` path. A non-scalar
+- **Per-step output is a scalar** on the Reactant `while` path. A non-scalar
   per-step output there is a loud, reported error, never a silent mis-lowering;
   author the output as a scalar (or open an issue for the shape you need).
+- **A directly iterated N-D array is rejected** on the Reactant path (its
+  native semantics are linear element iteration); iterate `eachrow(M)` or
+  `vec(M)` explicitly.
 - **RK-macro-only.** `scan` is recognised by the `@kernel` macro; it does not
   change Reactant itself.
