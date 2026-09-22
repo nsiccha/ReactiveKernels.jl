@@ -174,5 +174,107 @@
     "note": "Contains its own recurrence helpers and uses only baseline RK/PPL math. Process includes first-use package loading.",
     "status": "superseded by upstream_mwe; historical file removed",
     "source_commit": "3b04585925ff40a126a939a781de92e4388c0578"
+  },
+  "emulated_fix_2026_09_22": {
+    "status": "PRELIMINARY: not a released toolchain",
+    "toolchain": {
+      "julia": "1.10.11",
+      "reactant": "0.2.287 (Reactant.jl main e2ccdb9b)",
+      "enzyme": "0.13.204",
+      "libReactantExtra": "Build Reactant_jll CI run 35741925138 of EnzymeAD/Enzyme-JAX PR #3240 (Enzyme-JAX a4465ce9, fix 1)",
+      "fix_2": "Enzyme-JAX a3c086140c7950a2134d2b3bb5ed8583da917011 applied to the post-AD IR by emulation (each reverse stablehlo.if/case reads and zeroes its result adjoints before branching); rest of the shipped pipeline unchanged",
+      "rk_source": "5bec57c851e6c293b22b3e22a9446f17a827e40b",
+      "host": "strato2",
+      "backend": "cpu",
+      "optimization": "default",
+      "sync": true,
+      "repetitions": 20,
+      "seed": 20260917,
+      "rk_rectangular": true
+    },
+    "joint": [
+      {
+        "K": 1,
+        "hlo_unoptimized": {
+          "whiles": 2,
+          "ifs": 10,
+          "ops": 9463,
+          "bytes": 773832
+        },
+        "primal_compile_s": 13.0,
+        "primal_reldiff": 1.882e-16,
+        "reactant_eval_ms": 0.1931,
+        "native_eval_ms": 0.0145,
+        "grad_compile_s": 118.2,
+        "grad_parity_rtol_1e-9": true,
+        "grad_maxrel": 5.599e-14,
+        "reactant_grad_ms": 7.9818,
+        "native_grad_ms": 0.1974,
+        "peak_rss_gib": 5.36
+      },
+      {
+        "K": 3,
+        "hlo_unoptimized": {
+          "whiles": 2,
+          "ifs": 10,
+          "ops": 9463,
+          "bytes": 785908
+        },
+        "primal_compile_s": 12.4,
+        "primal_reldiff": 1.459e-16,
+        "reactant_eval_ms": 0.4598,
+        "native_eval_ms_note": "1.6314 measured in this run, inconsistent with 0.0364 above; treated as noise",
+        "grad_compile_s": 114.5,
+        "grad_parity_rtol_1e-9": true,
+        "grad_maxrel": 1.313e-14,
+        "reactant_grad_ms": 39.4334,
+        "native_grad_ms": 0.4949,
+        "peak_rss_gib": 5.33
+      }
+    ],
+    "control_fix_1_only": {
+      "K": 1,
+      "grad_compile_s": 159.0,
+      "grad_parity_rtol_1e-9": false,
+      "grad_maxrel": 0.01088
+    },
+    "focused_pk_reverse": {
+      "file": "pk_accept (session scratch), shapes of repro_rectangular_reverse.jl",
+      "schedules": [
+        "reproducer",
+        "dose count 2",
+        "dose count 3",
+        "dose count 5",
+        "dose count 8",
+        "3 ragged subjects with interleaved segments",
+        "subject without doses"
+      ],
+      "grad_maxrel_max": 6.15e-15,
+      "grad_compile_s_range": [
+        58.1,
+        69.1
+      ],
+      "reactant_grad_us_range": [
+        2188,
+        4188
+      ],
+      "native_grad_us_range": [
+        28.8,
+        150.1
+      ],
+      "hlo_primal_unoptimized": {
+        "ops": 5948,
+        "whiles": 2,
+        "ifs": 5,
+        "note": "5947 when no dose segment exists"
+      },
+      "hlo_optimized_note": "identical across subject and operation counts; varies only with the static power-bit capacity (inner loop unrolled by the optimizer)"
+    },
+    "reproducer": {
+      "file": "repro_nested_if_reverse.jl",
+      "exact_gradient": -17.27341715259027,
+      "fix_1_only": -11.20811055546394,
+      "with_fix_2": -17.273417152590273
+    }
   }
 }
