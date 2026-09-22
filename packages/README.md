@@ -49,7 +49,10 @@ julia --startup-file=no --project=docs docs/make.jl
 The checked-in `[sources]` entries become useful automatically on newer Julia
 versions; `setup.jl` remains the Julia-1.10-compatible source of local path
 development. CI runs the same path development explicitly rather than assuming
-that root `Pkg.test()` recurses into nested packages.
+that root `Pkg.test()` recurses into nested packages. `setup.jl` also pins
+unregistered test-only dependencies (MutatingFunctions) by URL and revision:
+`Pkg.test` builds its sandbox from the pruned parent manifest, so a test
+extra that is neither registered nor pinned there fails to resolve.
 
 The NUTS compiler exemplar and online-statistics consumers are separate nested
 packages with an acyclic dependency graph:
