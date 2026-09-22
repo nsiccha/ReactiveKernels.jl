@@ -1,0 +1,105 @@
+{
+  "date": "2026-09-22",
+  "host": "strato2",
+  "base": "021a3a8660936bf9162c95e5e9d91e7022b4536c",
+  "julia": "1.10.11",
+  "versions": {
+    "Reactant": "0.2.285",
+    "Enzyme": "0.13.204",
+    "Reactant_jll": "0.0.407+0"
+  },
+  "backend": "CPU, default fusion",
+  "assertions": 858,
+  "runs": [
+    {
+      "files": [
+        "packages/ReactiveKernelsPPL/test/test_tgi.jl"
+      ],
+      "assertions": 256,
+      "exit": 0,
+      "elapsed_seconds": 86,
+      "peak_rss_kib": 1363340
+    },
+    {
+      "files": [
+        "packages/ReactiveKernelsPPL/test/test_pk_rectangular.jl",
+        "packages/ReactiveKernelsPPL/test/test_pkcells.jl"
+      ],
+      "assertions": 270,
+      "exit": 0,
+      "elapsed_seconds": 242,
+      "peak_rss_kib": 1750756
+    },
+    {
+      "files": [
+        "packages/ReactiveKernelsPPL/test/test_tgi_control_flow.jl",
+        "test/test_rectangular_fold_reactant.jl"
+      ],
+      "assertions": 45,
+      "exit": 0,
+      "elapsed_seconds": 81,
+      "peak_rss_kib": 1362156
+    },
+    {
+      "files": [
+        "packages/ReactiveKernelsPPL/test/test_joint_emitter.jl",
+        "packages/ReactiveKernelsPPL/test/test_joint_parity.jl",
+        "packages/ReactiveKernelsPPL/test/test_reactant_joint.jl"
+      ],
+      "assertions": 287,
+      "exit": 0,
+      "elapsed_seconds": 370,
+      "peak_rss_kib": 2174408
+    }
+  ],
+  "structure": {
+    "ragged_pk": {
+      "subjects": [
+        2,
+        6
+      ],
+      "while": [
+        2,
+        2
+      ],
+      "stablehlo_operations": [
+        5934,
+        5934
+      ]
+    },
+    "affine_power": {
+      "exponents": [
+        3,
+        31
+      ],
+      "while": [
+        1,
+        1
+      ],
+      "stablehlo_operations": [
+        303,
+        303
+      ]
+    },
+    "direct_nadir": {
+      "rows": [
+        3,
+        9
+      ],
+      "while": [
+        1,
+        1
+      ],
+      "stablehlo_operations": [
+        63,
+        63
+      ]
+    }
+  },
+  "limits": [
+    "Joint PK reverse remains blocked by RK issue #13; no K3 reverse or K10 runs.",
+    "Default traced PK rejects the unsupported path; primal adapter remains a private diagnostic opt-in.",
+    "Nadir gradient comparisons avoid nondifferentiable ties.",
+    "These are focused acceptance process costs, not fresh joint-model benchmark measurements."
+  ]
+}

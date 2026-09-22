@@ -31,14 +31,10 @@
 #   * scalar core + broadcast/dispatch instead of vector-only Stan functions
 #     (`tgi_category_lpmf` has scalar and vector-reduced methods;
 #     `tgi_category_lpmfs` is the pointwise SB-mirror);
-#   * branchless `ifelse` instead of Stan `if`/`?:`, so every helper traces
-#     through Reactant. `tgi_interval_logprob` feeds DUMMY distinct inputs
-#     to its inner log-difference when the interval is empty: `ifelse`
-#     evaluates both sides, and an exact-tie `log_diff_exp` has an infinite
-#     pullback that a zero cotangent turns into NaN (0 * Inf). Empty
-#     intervals are REAL inputs here (a deep nadir empties the SD/PR
-#     interval exactly via `min`), and Stan's real branch yields gradient 0
-#     there — the dummy feed reproduces that exactly;
+#   * lazy scalar branches use RK's backend control-flow boundary. Empty
+#     intervals do not evaluate or differentiate `log_diff_exp`, whose
+#     exact-tie pullback is infinite. This preserves Stan's branch semantics
+#     without evaluating dummy operands in the inactive branch;
 #   * `tgi_report_logprob` is one branchless `logaddexp` (`log(eps/k)` +
 #     `log1p(-eps) + lp`): exact on finite and `-Inf` inputs alike, eps = 0
 #     included — no `lp > -inf` branch;
@@ -50,21 +46,20 @@
 #     string inside kernel code.
 #
 # Reactant-traceability contract: every exported math function is pure (no
-# input mutation, no exceptions, no strings/dicts), branchless, annotated
+# input mutation, no exceptions, no strings/dicts), annotated
 # `Number` (Reactant's `TracedRNumber` is a `Number`, not a `Real`), and
 # built from Base + `erfc` + `logaddexp` — the `_ordinal_logF`/`_log_diff_exp`
 # precedent (`generator.jl`), all three traced-ready via Reactant's own
 # `SpecialFunctions`/`LogExpFunctions` extensions (whose `logaddexp`
 # mirrors the host `x == y` guard, so `eps = 0` + empty interval stays
 # `-Inf` under tracing too). Option validation lives OUTSIDE traced code
-# (host-side, at build time). The host nadir loop traces only over
-# host/bound data; param-dependent nadirs use the `scan` formulation.
+# (host-side, at build time). Traced nadirs use a rectangular retained loop;
+# native nadirs use ordinary Julia iteration.
 #
 # Recommended grouped-kernel emission shapes (proved in `test_tgi.jl`):
 # elementwise latent lines as flat recipes; nadir via `tgi_nadir_scan_expr`;
 # each observation likelihood as a whole-vector `tgi_*_lpmf/lpdf` recipe over
-# bound responses + traced latents (the ordinal-plate `ifelse(y == j, …)`
-# precedent for integer responses).
+# bound responses + traced latents, with lazy selection of each likelihood.
 
 # --- options ---------------------------------------------------------------
 
@@ -274,17 +269,15 @@ tgi_inv_logit(x::Number) = 1 / (1 + exp(-x))
 Reference each assessment's size progression is measured from: the smallest
 model-predicted log size change among the PREVIOUS assessments and the
 baseline scan (change 0). Assessments must be in time order (SB
-`tgi_running_nadir`). Plain loop, eltype-generic: it is what generated
-code runs (through [`tgi_segmented_nadir`](@ref)) natively, under Enzyme,
-and under Reactant, where a traced change vector is read element-wise
-through the traced-gather hook and the loop unrolls at trace time.
+`tgi_running_nadir`). Native and Enzyme execution use an ordinary loop.
+Reactant execution retains one loop over a rectangular row table, including
+when this helper is called directly rather than through the segmented form.
 [`tgi_nadir_scan_expr`](@ref) is the equivalent `scan` spelling for
 hand-authored kernels. `min` matches Stan `fmin` on finite inputs.
 """
 function tgi_running_nadir(r::AbstractVector)
-    # Eltype-generic: a traced change vector (Reactant) yields traced
-    # scalars — reads go through the traced-gather hook (`_traced_op_read`,
-    # pkcells.jl), the running minimum stays scalar arithmetic.
+    marker = ReactiveKernels._dynamic_tensorized_marker((r,))
+    marker === nothing || return _tgi_rectangular_nadir(r, [length(r)], marker)
     T = promote_type(eltype(r), Float64)
     out = Vector{T}(undef, length(r))
     current = zero(T)
@@ -303,9 +296,9 @@ Kernel-side nadir formulation as a `scan` statement
 output-before-update reproduces [`tgi_running_nadir`](@ref) exactly. The
 sequence must be non-empty (`scan` contract); subjects without assessments
 need their empty case handled at emission. `change` is the subject's row
-sequence: a plain vector name or a range-copy over the subject's
-segment (the segmented unroll slices one subject's rows; copies, not
-views — `scan` over a view scalar-indexes under Reactant).
+sequence: a plain vector name or a range-copy over one subject's segment.
+Grouped kernels use [`tgi_segmented_nadir`](@ref) to retain a single loop
+over all assessments and their reset flags.
 """
 function tgi_nadir_scan_expr(change::Union{Symbol,Expr}, ref::Symbol)
     ex = :($ref = scan($change; init = 0.0) do carry, x
@@ -358,6 +351,7 @@ function tgi_segmented_nadir(change::AbstractVector,
 end
 
 function _tgi_rectangular_nadir(change, ends, marker)
+    isempty(change) && return copy(change)
     reset = zeros(Bool, length(change))
     prev = 0
     for hi in ends
@@ -400,20 +394,20 @@ tgi_log_diff_exp(a::Number, b::Number) = a + log1p(-exp(b - a))
 
 Log-probability that a standard normal falls in `(lo, hi]`, taken on the
 numerically favourable tail (SB `tgi_interval_logprob`). Arguments clamp
-to ±30; an empty interval is `-Inf`. Branchless (`ifelse`): when the
-interval is empty the inner log-difference runs on DUMMY distinct inputs
-(`sa = -1, sb = 1`) instead of the tied real ones, so no infinite
-pullback meets the zero cotangent (see this file's header).
+to ±30; an empty interval is `-Inf`. Both interval validity and tail
+selection are lazy: an empty interval never evaluates the log-difference.
 """
 function tgi_interval_logprob(lo::Number, hi::Number)
     a = min(max(lo, -30.0), 30.0)
     b = min(max(hi, -30.0), 30.0)
-    nonempty = b > a
-    sa = ifelse(nonempty, a, -1.0)
-    sb = ifelse(nonempty, b, 1.0)
-    upper = tgi_log_diff_exp(tgi_normal_lcdf(-sa), tgi_normal_lcdf(-sb))
-    lower = tgi_log_diff_exp(tgi_normal_lcdf(sb), tgi_normal_lcdf(sa))
-    return ifelse(nonempty, ifelse(sa > 0, upper, lower), -Inf)
+    return ReactiveKernels._recurrence_branch(b > a,
+        _tgi_nonempty_interval_logprob, (a, b) -> -Inf, (a, b))
+end
+
+function _tgi_nonempty_interval_logprob(a, b)
+    ReactiveKernels._recurrence_branch(a > 0,
+        (a, b) -> tgi_log_diff_exp(tgi_normal_lcdf(-a), tgi_normal_lcdf(-b)),
+        (a, b) -> tgi_log_diff_exp(tgi_normal_lcdf(b), tgi_normal_lcdf(a)), (a, b))
 end
 
 """
@@ -446,11 +440,22 @@ function tgi_category_lpmf(y::Number, r::Number, ref::Number, c_cr::Number,
     pd = (c_pd + ref - r) / sigma
     pr = min((c_pr - r) / sigma, pd)
     cr = min((c_cr - r) / sigma, pr)
-    lp = ifelse(y == 1, tgi_interval_logprob(-30.0, cr),
-        ifelse(y == 2, tgi_interval_logprob(cr, pr),
-            ifelse(y == 3, tgi_interval_logprob(pr, pd),
-                tgi_interval_logprob(pd, 30.0))))
+    lp = ReactiveKernels._recurrence_branch(y == 1,
+        (y, cr, pr, pd) -> tgi_interval_logprob(-30.0, cr),
+        _tgi_category_noncr, (y, cr, pr, pd))
     return tgi_report_logprob(lp, eps, 4.0)
+end
+
+function _tgi_category_noncr(y, cr, pr, pd)
+    ReactiveKernels._recurrence_branch(y == 2,
+        (y, cr, pr, pd) -> tgi_interval_logprob(cr, pr),
+        _tgi_category_nonpr, (y, cr, pr, pd))
+end
+
+function _tgi_category_nonpr(y, cr, pr, pd)
+    ReactiveKernels._recurrence_branch(y == 3,
+        (pr, pd) -> tgi_interval_logprob(pr, pd),
+        (pr, pd) -> tgi_interval_logprob(pd, 30.0), (pr, pd))
 end
 
 """Pointwise category log-probabilities (SB `tgi_category_lpmfs`)."""
@@ -477,8 +482,9 @@ is a bind-side contract (SB row validation).
 function tgi_response_lpmf(y::Number, r::Number, ref::Number, c_pr::Number,
         c_pd::Number, sigma::Number, eps::Number)
     pr = min(c_pr - r, c_pd + ref - r) / sigma
-    lp = ifelse(y == 1, tgi_interval_logprob(-30.0, pr),
-        tgi_interval_logprob(pr, 30.0))
+    lp = ReactiveKernels._recurrence_branch(y == 1,
+        pr -> tgi_interval_logprob(-30.0, pr),
+        pr -> tgi_interval_logprob(pr, 30.0), (pr,))
     return tgi_report_logprob(lp, eps, 2.0)
 end
 
@@ -503,9 +509,11 @@ CDF all the same. Scalar method + vector-reduced method (dispatch);
 [`tgi_censored_lpdfs`](@ref) is the pointwise SB-mirror.
 """
 function tgi_censored_lpdf(y::Number, mu::Number, sigma::Number, lloq_log::Number)
-    z = (lloq_log - mu) / sigma
-    lpdf = -0.5 * log(2pi) - log(sigma) - 0.5 * ((y - mu) / sigma)^2
-    return ifelse(y <= lloq_log, tgi_normal_lcdf(z), lpdf)
+    return ReactiveKernels._recurrence_branch(y <= lloq_log,
+        (y, mu, sigma, lloq_log) -> tgi_normal_lcdf((lloq_log - mu) / sigma),
+        (y, mu, sigma, lloq_log) ->
+            -0.5 * log(2pi) - log(sigma) - 0.5 * ((y - mu) / sigma)^2,
+        (y, mu, sigma, lloq_log))
 end
 
 """Pointwise left-censored log-densities (SB `tgi_censored_lpdfs`)."""

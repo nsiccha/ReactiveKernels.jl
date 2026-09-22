@@ -1753,6 +1753,8 @@ end
 # their own transparent runtime carrier.
 @inline _embedded_marker_values(x) = ()
 @inline _embedded_marker_values(x::NamedTuple) = values(x)
+# A view or other array wrapper must not hide its traced storage from dispatch.
+@inline _embedded_marker_values(x::AbstractArray) = parent(x) === x ? () : (parent(x),)
 
 @inline function _embedded_axis_marker(value)
     _authored_plate_is_axis(value) && return value

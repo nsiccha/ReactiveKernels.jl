@@ -8,8 +8,10 @@ boundary, `_rectangular_fold(step, init, columns, shared, marker)`.
 **Status:** joint primal proof only; PK reverse compilation is blocked in
 Enzyme/MLIR. The PK adapter is disabled by default. Set `RK_RECTANGULAR=1` in
 `bench_rkppl_reactant.jl` to opt in for measurements. This is not a supported
-sampler configuration or a demonstrated runtime improvement. TGI nadir uses the
-new path automatically and passes reverse parity. CPU fusion stays enabled.
+sampler configuration or a demonstrated runtime improvement. Ordinary traced PK
+calls now fail explicitly with the issue link; they never fall back to the
+unrolled host recurrence. Native PK execution is unchanged. Both direct and
+segmented TGI nadir calls use the retained path. CPU fusion stays enabled.
 
 ## Required semantics
 
@@ -65,6 +67,11 @@ TGI nadir uses one row per assessment and a reset flag for the first assessment
 of each nonempty subject. Empty segments add no rows. Each step stores the
 previous nadir before incorporating the current assessment.
 
+TGI interval and observation likelihoods use the same lazy scalar branch
+boundary. Empty intervals return `-Inf` without evaluating `log_diff_exp`;
+no dummy operands are substituted. Category and censoring decisions likewise
+evaluate only their selected likelihood.
+
 Bound shapes still determine compilation shapes and tape capacity. Changing a
 bound schedule requires preparing/compiling again. The aim is constant program
 structure, not a shape-polymorphic executable or constant total tape memory.
@@ -76,6 +83,32 @@ native/traced reverse parity, lazy branches, and input preservation.
 `packages/ReactiveKernelsPPL/test/test_pk_rectangular.jl` checks unequal subject
 ranges and repeated-dose segments. `test_nadir_rectangular.jl` checks empty
 segments, output-before-update semantics, and reverse parity.
+
+The follow-up constraint tests also cover direct helper calls. Traced array
+wrappers expose their parent storage to RK's general backend-marker discovery,
+so views cannot silently choose the native host loop. Direct PK cells use the
+same experimental adapter as grouped calls; without the diagnostic opt-in,
+both reject compilation with issue #13 instead of tracing an unrolled fallback.
+Standalone affine powers retain their binary-power loop as well.
+
+| Focused unoptimized StableHLO check | Data sizes | Loops | Operation occurrences |
+| --- | --- | ---: | ---: |
+| Ragged PK recurrence | 2 / 6 subjects, repeated operation schedule | 2 / 2 | 5,934 / 5,934 |
+| Standalone affine power | exponents 3 / 31 | 1 / 1 | 303 / 303 |
+| Direct TGI nadir | 3 / 9 assessments | 1 / 1 | 63 / 63 |
+
+`test_tgi_control_flow.jl` checks lazy interval branches and their reverse at
+ordinary, empty, reversed and clamped intervals, plus direct nadir and traced
+views. Nadir gradient comparisons avoid ties at the running minimum, where the
+derivative is undefined. The ordinary TGI fixture retains its native/reference
+and compiled-gradient checks for all observation families.
+
+The constraint-repair acceptance passes 858 assertions in four ordered batches:
+TGI (256), PK cells and retained powers (270), focused control-flow plus core
+fold tests (45), and joint emission/parity/default compilation checks (287).
+Both Reactant and MutatingFunctions extensions were loaded. Process receipts
+and package versions are recorded in `constraint_results.json`; these are
+acceptance costs, not new joint-model performance measurements.
 
 Joint K=1 then K=3 measurements must report unoptimized StableHLO loop/operation
 counts, compile wall time and peak process RSS, synchronized resident-input

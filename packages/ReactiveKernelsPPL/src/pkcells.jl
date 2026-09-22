@@ -116,15 +116,24 @@ end
 @inline _subject_views(cols::Tuple, rng) = map(c -> view(c, rng), cols)
 
 # Experimental until Enzyme/MLIR can reverse the PK recurrence. The benchmark
-# opts in explicitly; normal callers retain the established grouped path.
+# opts in explicitly; compiled callers fail explicitly while it is disabled.
+# Native callers retain ordinary subject and operation iteration.
 const _rectangular_pk_enabled = Ref(false)
+
+function _pk_compiled_cell(cell, ends, opcols, args, marker)
+    _rectangular_pk_enabled[] || throw(ArgumentError(
+        "compiled PK recurrences are disabled pending Reactant reverse control-flow " *
+        "support (https://github.com/nsiccha/ReactiveKernels.jl/issues/13); " *
+        "data-derived loop unrolling is not a supported fallback"))
+    ReactiveKernels._dynamic_tensorized_marker(opcols) === nothing ||
+        throw(ArgumentError("rectangular PK requires bound operation columns"))
+    _pk_rectangular(cell, ends, opcols, args, marker)
+end
 
 function _cell_over_subjects(cell::F, op_ends::AbstractVector{<:Integer},
         opcols::Tuple, args::Tuple) where {F}
-    if _rectangular_pk_enabled[]
-        marker = ReactiveKernels._dynamic_tensorized_marker(map(_subject_value, args))
-        marker === nothing || return _pk_rectangular(cell, op_ends, opcols, args, marker)
-    end
+    marker = ReactiveKernels._dynamic_tensorized_marker((opcols..., map(_subject_value, args)...))
+    marker === nothing || return _pk_compiled_cell(cell, op_ends, opcols, args, marker)
     n_sub = length(op_ends)
     n_sub >= 1 || throw(ArgumentError(
         "subject-batched cell call needs at least one subject (empty op_ends)"))
@@ -936,10 +945,13 @@ _pk_tmul4(a::NTuple{16,Any}, b::NTuple{16,Any}) = (
     a[3] * b[13] + a[7] * b[14] + a[11] * b[15] + a[15] * b[16],
     a[4] * b[13] + a[8] * b[14] + a[12] * b[15] + a[16] * b[16])
 
-# Static binary exponentiation for the 4x4 augmented dose-transition
-# (`count` is host data at every use site, so the loop trip count is
-# static under tracing).
+# Binary exponentiation for the 4x4 augmented dose transition.
+# Native execution uses ordinary binary-power iteration. Tracing retains the
+# recurrence even when the exponent is bound data known during preparation.
 function _pk_matpow4(A::NTuple{16,Any}, n::Integer)
+    marker = ReactiveKernels._dynamic_tensorized_marker(A)
+    marker === nothing || return _pk_retained_power(A, n,
+        zeros(Int, ndigits(max(n, 0); base=2)), marker)
     R = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
     B = A
@@ -1142,22 +1154,23 @@ native+Enzyme precedent) and from the host-side oracle path; the
 same function on both paths keeps spec and graph bit-identical by
 construction.
 
-The reads buffer is eltype-generic (`zeros(typeof(Vc / Vc), 0)`):
-`Vector{Float64}` natively, a `TracedRArray` under Reactant. A
-concrete `zeros(Float64, …)` rejects traced stores (`convert(Float64,
-::TracedRNumber)` has no method — the pkcell slice's first measured
-Reactant failure), and scalar `setindex!` into a `TracedRArray`
-trips the scalar-indexing guard (the slice's second measured
-failure) — so reads accumulate with `push!` (concatenate-lowering,
-no scalar indexing). Encounter order is read order (`op_read_idx`
-is the per-op cumsum of READs), so appending is SB's
-counter-write verbatim.
+Native reads accumulate with `push!` in encounter order (`op_read_idx` is
+the per-op cumsum of READs), matching SB's counter-write. Traced calls never
+execute this host loop: compiled PK recurrences are explicitly unsupported
+pending [Reactant reverse control-flow support](https://github.com/nsiccha/ReactiveKernels.jl/issues/13).
+The experimental rectangular adapter uses a retained loop and a fixed output
+buffer; its private diagnostic opt-in does not enable a supported sampler path.
 """
 function linear_pk_read_locs(op_type::AbstractVector,
         op_dt::AbstractVector, op_amount::AbstractVector,
         op_interval::AbstractVector, op_count::AbstractVector,
         op_read_idx::AbstractVector, log_F::AbstractVector, log_Vc, log_k10,
         log_k12, log_k21, log_ka)
+    cols = (op_type, op_dt, op_amount, op_interval, op_count, op_read_idx)
+    args = (SubjectSlice(log_F), log_Vc, log_k10, log_k12, log_k21, log_ka)
+    marker = ReactiveKernels._dynamic_tensorized_marker((cols..., map(_subject_value, args)...))
+    marker === nothing || return _pk_compiled_cell(linear_pk_read_locs,
+        [length(op_type)], cols, args, marker)
     n_ops = length(op_type)
     (length(op_dt) == n_ops && length(op_amount) == n_ops &&
      length(op_interval) == n_ops && length(op_count) == n_ops &&
@@ -1230,6 +1243,11 @@ function linear_pk_read_locs_auc(op_type::AbstractVector,
         op_interval::AbstractVector, op_count::AbstractVector,
         op_read_idx::AbstractVector, log_F::AbstractVector,
         log_Vc, log_k10, log_k12, log_k21, log_ka)
+    cols = (op_type, op_dt, op_amount, op_interval, op_count, op_read_idx)
+    args = (SubjectSlice(log_F), log_Vc, log_k10, log_k12, log_k21, log_ka)
+    marker = ReactiveKernels._dynamic_tensorized_marker((cols..., map(_subject_value, args)...))
+    marker === nothing || return _pk_compiled_cell(linear_pk_read_locs_auc,
+        [length(op_type)], cols, args, marker)
     n_ops = length(op_type)
     (length(op_dt) == n_ops && length(op_amount) == n_ops &&
      length(op_interval) == n_ops && length(op_count) == n_ops &&
