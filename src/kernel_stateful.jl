@@ -446,10 +446,24 @@ function _kernel_endpoint_is_bang(name)
     leaf isa Symbol && _kernel_endpoint_is_bang(leaf)
 end
 
+# A pure endpoint body is straight-line: loops, closures, comprehensions and
+# statement-position branches are control flow.  A branch in VALUE position
+# — a ternary, an `if` expression that is the body's result, `a && b` — is a
+# lazy selection the recipe lowering owns (`_kernel_tensorized_rhs`), so it
+# is straight-line like any other expression.
 function _kernel_endpoint_has_nonstraight(x)
     x isa Expr || return false
-    x.head in (:if, :for, :while, :try, :&&, :||, :let, :function, :->,
+    x.head in (:for, :while, :try, :let, :function, :->,
                :comprehension, :generator) && return true
+    if x.head === :block
+        statements = Any[arg for arg in x.args if !(arg isa LineNumberNode)]
+        for (index, statement) in enumerate(statements)
+            statement isa Expr && statement.head === :if &&
+                index != length(statements) && return true
+            _kernel_endpoint_has_nonstraight(statement) && return true
+        end
+        return false
+    end
     any(_kernel_endpoint_has_nonstraight, x.args)
 end
 
