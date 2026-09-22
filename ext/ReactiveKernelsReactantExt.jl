@@ -263,6 +263,13 @@ end
     value::Reactant.TracedRNumber) = copy(value)
 @inline ReactiveKernels._sm_control_carry_isolate(
     value::Reactant.AbstractConcreteNumber) = copy(value)
+# A traced array argument enters the control carry as its own tracer object:
+# the retained loop writes each carry slot's result back into the object it
+# was seeded from, and seeding from the caller's argument tracer would turn
+# that write-back into an in-place update of the caller's buffer (an RNG
+# seed argument advanced on the host after a call that never drew from it).
+@inline ReactiveKernels._sm_control_argument_isolate(
+    value::Reactant.TracedRArray) = copy(value)
 
 # A traced branch can legitimately meet a source literal or compiler-static
 # initial value of the same logical scalar type.  Keep that bridge exact: it
@@ -377,12 +384,21 @@ ReactiveKernels._sm_frame_fill(
         value::Reactant.TracedRNumber, ::Val{Capacity}) where {Capacity} =
     Reactant.Ops.fill(value, (Capacity,))
 
+# Reactant's scalar gather/scatter accept only `Int`-typed traced indices
+# (`Union{Int,TracedRNumber{Int}}`); any other traced integer falls through
+# to the general indexing path and returns a one-element ARRAY. A frame index
+# carries the program's index type (`Int8` for an `Int8`-typed machine), so
+# widen it to `Int` at the slot access.
+_frame_slot(index::Reactant.TracedRNumber{Int}) = index
+_frame_slot(index::Reactant.TracedRNumber{<:Integer}) =
+    convert(Reactant.TracedRNumber{Int}, index)
+
 function ReactiveKernels._sm_frame_read(
         values::Reactant.TracedRArray{T,1}, index::Reactant.TracedRNumber) where {T}
     isempty(values) && throw(ArgumentError(
         "functional control frame store cannot be empty"))
     valid = (index >= one(index)) & (index <= length(values))
-    safe = ifelse(valid, index, one(index))
+    safe = _frame_slot(ifelse(valid, index, one(index)))
     Reactant.@allowscalar values[safe]
 end
 
@@ -390,7 +406,7 @@ function ReactiveKernels._sm_frame_write(
         values::Reactant.TracedRArray{T,1}, index::Reactant.TracedRNumber,
         replacement, active) where {T}
     valid = (index >= one(index)) & (index <= length(values))
-    safe = ifelse(valid, index, one(index))
+    safe = _frame_slot(ifelse(valid, index, one(index)))
     Reactant.@allowscalar begin
         result = copy(values)
         result[safe] = ifelse(active & valid, replacement, values[safe])
