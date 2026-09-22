@@ -22,7 +22,7 @@ slot_lmul!(factor,destination)=lmul!(factor,destination)
 @inline slot_scalar_getindex(array,indices...) =
     Reactant.@allowscalar @inbounds getindex(array,indices...)
 
-function compile_traced_slots(program; static_currentness=true, unroll_limit=0,
+function compile_traced_slots(program; static_currentness=true,
         reuse_code=true, projection=nothing)
     contextmap = Dict(Symbol(c.prefix, :_owned)=>c for c in program.contexts)
     sharedmap = Dict(Symbol(c.prefix, :_shared)=>c.shared for c in program.contexts)
@@ -232,15 +232,6 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0,
                 statics[iterator.args[3]] : nothing
             static_range isa AbstractRange{<:Integer} ||
                 error("traced slots: expected a preparation-fixed integer range")
-            if length(static_range)<=unroll_limit
-                returns=false
-                for item in static_range
-                    unrolled=Any[:($(binding.args[1])=$item)]
-                    returns |= blockstatements(x.args[2],unrolled,live)
-                    push!(out,Expr(:if,live,Expr(:block,unrolled...)))
-                end
-                return returns
-            end
             nested=Any[]
             returns=blockstatements(x.args[2],nested,live)
             push!(out,Expr(:for,Expr(:(=),binding.args[1],QuoteNode(static_range)),
