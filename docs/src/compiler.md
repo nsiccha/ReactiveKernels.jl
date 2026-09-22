@@ -717,11 +717,10 @@ next slot lazily inside its block, and the fill count and overflow flag are
 scalar carry slots. Slots fill sequentially, so the drain replays `1:count` in
 emission order without an activity mask.
 
-The residual bounded path checks its finite allowance with an unsigned
-distance, which represents the mathematical distance even when signed
-subtraction wraps, and uses guarded successor probes; the control program's
-loop counters and the residual path both preserve the explicit
-overflow/rollback result at extreme bounds and with small integers.
+The control program's loop counters preserve the explicit overflow/rollback
+result at extreme bounds and with small integers; the earlier bounded
+predicated path (per-iteration replication with an unsigned finite allowance)
+is gone.
 
 Ordered RNG is one typed internal effect authority. Authored kernels keep the
 ordinary Julia expressions `Random.randn!(rng, destination)`,
