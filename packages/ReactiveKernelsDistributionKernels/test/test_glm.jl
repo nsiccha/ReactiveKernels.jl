@@ -1,15 +1,14 @@
 # Fused GLM objects: values vs independent oracles, endpoint consistency,
-# analytic-adjoint correctness vs finite differences, and the rule-firing
-# guard (the ruled call must survive lowering as an opaque call).
+# and analytic-adjoint correctness vs finite differences (generic Enzyme
+# through the object kernels — no hand-written rules, 2026-09-21 policy).
 using ADTypes
 using DifferentiationInterface
 using Distributions: Bernoulli, Binomial, Categorical, NegativeBinomial, Normal, Poisson, logpdf
-using EnzymeCore
 using Enzyme
 using LinearAlgebra: dot
 using LogExpFunctions: log1pexp, softmax
 import LogExpFunctions
-using SpecialFunctions: digamma, loggamma
+using SpecialFunctions: loggamma
 using ReactiveKernels: @kernel, code_expr, extract, prepare,
     prepare_ad, ad_value_and_gradient!
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
@@ -90,11 +89,10 @@ end
         end
     end
 
-    @testset "score tails match Stan's cutoff theta (rule shares this formula)" begin
-        # The rule's reverse calls _glm_bernoulli_theta per cell — the same
-        # function the score endpoint funnels through — so this is the
-        # branches' exact-form proof (the FD check below cannot resolve
-        # 1e-9-scale tail contributions).
+    @testset "score tails match Stan's cutoff theta" begin
+        # The score endpoint implements the cutoff branches directly, so
+        # this is the branches' exact-form proof (the FD check below cannot
+        # resolve 1e-9-scale tail contributions).
         stan_theta(s, yθ) = (em = exp(-yθ);
             s * (yθ > 20 ? em : yθ < -20 ? 1.0 : em / (em + 1.0)))
         ks = prepare(bernoulli_logit_glm.score;
@@ -116,8 +114,8 @@ end
 
     @testset "analytic adjoint matches finite differences" begin
         # The object splices with X/beta as implicit named dependencies; the
-        # ruled H call is the only likelihood node (see the ops test above),
-        # so this FD check validates the analytic adjoint end to end.
+        # whole logpdf is one fused kernel node (see the ops test above), so
+        # this FD check validates the generic-Enzyme adjoint end to end.
         @kernel _bern_glm_model(
                 beta::Vector{Float64}, X::Matrix{Float64},
                 y::Vector{Int}) = begin
@@ -140,10 +138,9 @@ end
         v, g = ad_value_and_gradient!(prep, similar(q), q)
         gref = _glm_fd_grad(oracle, q)
         @test g ≈ gref rtol = 1e-6
-        # Rule-forward (@turbo) value agrees with the scalar H primal.
         @test v ≈ kb(q) rtol = 1e-12
-        # Saturating tails exercise the rule's cutoff branches too. FD runs
-        # against the ruled primal itself here, NOT the Distributions oracle:
+        # Saturating tails exercise the kernel's cutoff branches too. FD runs
+        # against the kernel primal itself here, NOT the Distributions oracle:
         # the oracle's probability form (`Bernoulli(LogExpFunctions.logistic(e))`) suffers
         # 1-p cancellation at saturating eta, and FD amplifies that ~1e-7
         # noise to O(1) — the cutoff form under test has no such noise.
@@ -329,156 +326,6 @@ end
         @test v ≈ kb(q) rtol = 1e-12
     end
 
-    @testset "eta-entry bound-sigma rule method matches FD" begin
-        # White-box: the eta-entry Const-sigma reverse, driven directly.
-        H = DistributionKernelSources._glm_normal_id
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false, false),false,false}()
-        yv = [0.7, -0.2, 1.1, 0.0, -0.9]
-        etav = [0.5, 0.1, 0.8, -0.3, -0.5]
-        s0 = 1.5
-        ed = zeros(5)
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed), EnzymeCore.Const(s0))
-        @test aug.primal ≈ H(yv, etav, s0)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed), EnzymeCore.Const(s0))
-        @test ed ≈ 2.0 .* (yv .- etav) ./ s0^2
-        @test out == (nothing, nothing, nothing)
-    end
-
-    @testset "fused-entry sampled-sigma rule method matches FD" begin
-        # White-box: the fused-entry Duplicated-sigma reverse, driven
-        # directly (the kernel FD test below covers Const-sigma end to end).
-        H = DistributionKernelSources._glm_normal_id_fused
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false, false, false),false,false}()
-        Xw = [1.0 -1.0; 1.0 -0.5; 1.0 0.5; 1.0 1.0; 1.0 0.0]
-        yv = [0.7, -0.2, 1.1, 0.4, -0.9]
-        bv = [0.5, -0.3]
-        s0 = 1.5
-        bd = zeros(2)
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(Xw), EnzymeCore.Duplicated(bv, bd),
-            EnzymeCore.Duplicated(s0, 0.0))
-        @test aug.primal ≈ H(yv, Xw, bv, s0)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv), EnzymeCore.Const(Xw),
-            EnzymeCore.Duplicated(bv, bd), EnzymeCore.Duplicated(s0, 0.0))
-        @test bd ≈ Xw' * (2.0 .* (yv .- Xw * bv) ./ s0^2)
-        h = 1e-7
-        fds = (H(yv, Xw, bv, s0 + h) - H(yv, Xw, bv, s0 - h)) / (2h)
-        @test out[4] ≈ 2.0 * fds rtol = 1e-6
-        @test out[1:3] == (nothing, nothing, nothing)
-        bd2 = zeros(2)
-        aug2 = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(Xw), EnzymeCore.Duplicated(bv, bd2),
-            EnzymeCore.Active(s0))
-        @test aug2.primal ≈ H(yv, Xw, bv, s0)
-        out2 = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug2.tape, EnzymeCore.Const(yv), EnzymeCore.Const(Xw),
-            EnzymeCore.Duplicated(bv, bd2), EnzymeCore.Active(s0))
-        @test bd2 ≈ Xw' * (2.0 .* (yv .- Xw * bv) ./ s0^2)
-        @test out2[4] ≈ 2.0 * fds rtol = 1e-6
-    end
-
-    @testset "fused-entry bound-beta sampled-sigma rule method matches FD" begin
-        # White-box: the Const-beta reverse (beta bound, sigma sampled).
-        H = DistributionKernelSources._glm_normal_id_fused
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false, false, false),false,false}()
-        Xw = [1.0 -1.0; 1.0 -0.5; 1.0 0.5; 1.0 1.0; 1.0 0.0]
-        yv = [0.7, -0.2, 1.1, 0.4, -0.9]
-        bv = [0.5, -0.3]
-        s0 = 1.5
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(Xw), EnzymeCore.Const(bv),
-            EnzymeCore.Duplicated(s0, 0.0))
-        @test aug.primal ≈ H(yv, Xw, bv, s0)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv), EnzymeCore.Const(Xw),
-            EnzymeCore.Const(bv), EnzymeCore.Duplicated(s0, 0.0))
-        h = 1e-7
-        fds = (H(yv, Xw, bv, s0 + h) - H(yv, Xw, bv, s0 - h)) / (2h)
-        @test out[4] ≈ 2.0 * fds rtol = 1e-6
-        @test out[1:3] == (nothing, nothing, nothing)
-        aug2 = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(Xw), EnzymeCore.Const(bv),
-            EnzymeCore.Active(s0))
-        @test aug2.primal ≈ H(yv, Xw, bv, s0)
-        out2 = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug2.tape, EnzymeCore.Const(yv), EnzymeCore.Const(Xw),
-            EnzymeCore.Const(bv), EnzymeCore.Active(s0))
-        @test out2[4] ≈ 2.0 * fds rtol = 1e-6
-    end
-
-    @testset "eta-entry sampled-sigma rule method matches FD" begin
-        # White-box: the Duplicated-sigma reverse method, driven directly.
-        H = DistributionKernelSources._glm_normal_id
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false, false),false,false}()
-        yv = [0.7, -0.2, 1.1, 0.0, -0.9]
-        etav = [0.5, 0.1, 0.8, -0.3, -0.5]
-        s0 = 1.5
-        ed = zeros(5)
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed), EnzymeCore.Duplicated(s0, 0.0))
-        @test aug.primal ≈ H(yv, etav, s0)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed), EnzymeCore.Duplicated(s0, 0.0))
-        @test ed ≈ 2.0 .* (yv .- etav) ./ s0^2
-        h = 1e-7
-        fds = (H(yv, etav, s0 + h) - H(yv, etav, s0 - h)) / (2h)
-        @test out[3] ≈ 2.0 * fds rtol = 1e-6
-        @test out[1] === nothing && out[2] === nothing
-        ed2 = zeros(5)
-        aug2 = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed2), EnzymeCore.Active(s0))
-        @test aug2.primal ≈ H(yv, etav, s0)
-        out2 = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug2.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed2), EnzymeCore.Active(s0))
-        @test ed2 ≈ 2.0 .* (yv .- etav) ./ s0^2
-        @test out2[3] ≈ 2.0 * fds rtol = 1e-6
-    end
-
-    @testset "eta-entry bound-eta sampled-sigma rule method matches FD" begin
-        # White-box: the Const-eta reverse (beta bound, sigma sampled).
-        H = DistributionKernelSources._glm_normal_id
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false, false),false,false}()
-        yv = [0.7, -0.2, 1.1, 0.0, -0.9]
-        etav = [0.5, 0.1, 0.8, -0.3, -0.5]
-        s0 = 1.5
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(etav), EnzymeCore.Duplicated(s0, 0.0))
-        @test aug.primal ≈ H(yv, etav, s0)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Const(etav), EnzymeCore.Duplicated(s0, 0.0))
-        h = 1e-7
-        fds = (H(yv, etav, s0 + h) - H(yv, etav, s0 - h)) / (2h)
-        @test out[3] ≈ 2.0 * fds rtol = 1e-6
-        @test out[1] === nothing && out[2] === nothing
-        aug2 = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(etav), EnzymeCore.Active(s0))
-        @test aug2.primal ≈ H(yv, etav, s0)
-        out2 = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug2.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Const(etav), EnzymeCore.Active(s0))
-        @test out2[3] ≈ 2.0 * fds rtol = 1e-6
-    end
 end
 
 @testset "binomial_logit_glm fused object" begin
@@ -596,7 +443,7 @@ end
         for (m, yi) in zip(mu, y)]
     ref_total = sum(ref_cells)
     # Direct (non-reciprocal) theta spelling: independently validates the
-    # reciprocal twin the rule actually runs.
+    # reciprocal spelling the score endpoint runs.
     ref_score = [yi - (yi + phi0) * m / (m + phi0) for (m, yi) in zip(mu, y)]
 
     @testset "endpoints match the independent oracle" begin
@@ -701,235 +548,9 @@ end
         @test gt ≈ _glm_fd_grad(kb, qtail) rtol = 1e-5
     end
 
-    @testset "bound-phi rule method matches FD" begin
-        # White-box: the Const-phi reverse, driven directly.
-        H = DistributionKernelSources._glm_negbin2_log
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false, false, false, false),false,false}()
-        yv = [1.0, 0.0, 3.0, 2.0, 5.0]
-        etav = [0.5, 0.1, 0.8, -0.3, -0.5]
-        p0 = 2.0
-        lg1 = loggamma.(yv .+ 1.0)
-        lgp = loggamma.(yv .+ p0)
-        ed = zeros(5)
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed), EnzymeCore.Const(p0),
-            EnzymeCore.Const(lg1), EnzymeCore.Const(lgp))
-        @test aug.primal ≈ H(yv, etav, p0, lg1, lgp)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed), EnzymeCore.Const(p0),
-            EnzymeCore.Const(lg1), EnzymeCore.Const(lgp))
-        @test ed ≈ [2.0 * (yi - (yi + p0) * exp(e) / (exp(e) + p0))
-            for (yi, e) in zip(yv, etav)]
-        @test out == (nothing, nothing, nothing, nothing, nothing)
-    end
-
-    @testset "sampled-phi rule method matches FD" begin
-        # White-box: the Duplicated-phi reverse, driven directly. Split
-        # check: the rule returns the DIRECT partial (lgp frozen) and
-        # propagates into lgp's shadow; the graph adds the temp path.
-        H = DistributionKernelSources._glm_negbin2_log
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false, false, false, false),false,false}()
-        yv = [1.0, 0.0, 3.0, 2.0, 5.0]
-        etav = [0.5, 0.1, 0.8, -0.3, -0.5]
-        p0 = 2.0
-        lg1 = loggamma.(yv .+ 1.0)
-        lgp = loggamma.(yv .+ p0)
-        ed = zeros(5)
-        lgpd = zeros(5)
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed), EnzymeCore.Duplicated(p0, 0.0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd))
-        @test aug.primal ≈ H(yv, etav, p0, lg1, lgp)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed), EnzymeCore.Duplicated(p0, 0.0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd))
-        @test ed ≈ [2.0 * (yi - (yi + p0) * exp(e) / (exp(e) + p0))
-            for (yi, e) in zip(yv, etav)]
-        h = 1e-7
-        fdp_frozen = (H(yv, etav, p0 + h, lg1, lgp) - H(yv, etav, p0 - h, lg1, lgp)) / (2h)
-        @test out[3] ≈ 2.0 * fdp_frozen rtol = 1e-6
-        @test lgpd ≈ fill(2.0, 5)
-        fdp_true = (H(yv, etav, p0 + h, lg1, loggamma.(yv .+ p0 .+ h)) -
-            H(yv, etav, p0 - h, lg1, loggamma.(yv .+ p0 .- h))) / (2h)
-        @test out[3] + 2.0 * sum(digamma.(yv .+ p0)) ≈ 2.0 * fdp_true rtol = 1e-6
-        @test out[1:2] == (nothing, nothing) && out[4] === nothing && out[5] === nothing
-        # Same drive with Active-phi (the annotation the real kernel path
-        # produces for scalar actives).
-        ed2 = zeros(5)
-        lgpd2 = zeros(5)
-        aug2 = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed2), EnzymeCore.Active(p0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd2))
-        @test aug2.primal ≈ H(yv, etav, p0, lg1, lgp)
-        out2 = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug2.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed2), EnzymeCore.Active(p0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd2))
-        @test ed2 ≈ [2.0 * (yi - (yi + p0) * exp(e) / (exp(e) + p0))
-            for (yi, e) in zip(yv, etav)]
-        @test out2[3] ≈ 2.0 * fdp_frozen rtol = 1e-6
-        @test lgpd2 ≈ fill(2.0, 5)
-        @test out2[3] + 2.0 * sum(digamma.(yv .+ p0)) ≈ 2.0 * fdp_true rtol = 1e-6
-    end
-
-    @testset "bound-eta sampled-phi rule method matches FD" begin
-        # White-box: the Const-eta reverse (beta bound, phi sampled).
-        # Same split check as the sampled-phi method: direct + propagation.
-        H = DistributionKernelSources._glm_negbin2_log
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false, false, false, false),false,false}()
-        yv = [1.0, 0.0, 3.0, 2.0, 5.0]
-        etav = [0.5, 0.1, 0.8, -0.3, -0.5]
-        p0 = 2.0
-        lg1 = loggamma.(yv .+ 1.0)
-        lgp = loggamma.(yv .+ p0)
-        lgpd = zeros(5)
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(etav), EnzymeCore.Duplicated(p0, 0.0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd))
-        @test aug.primal ≈ H(yv, etav, p0, lg1, lgp)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Const(etav), EnzymeCore.Duplicated(p0, 0.0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd))
-        h = 1e-7
-        fdp_frozen = (H(yv, etav, p0 + h, lg1, lgp) - H(yv, etav, p0 - h, lg1, lgp)) / (2h)
-        @test out[3] ≈ 2.0 * fdp_frozen rtol = 1e-6
-        @test lgpd ≈ fill(2.0, 5)
-        fdp_true = (H(yv, etav, p0 + h, lg1, loggamma.(yv .+ p0 .+ h)) -
-            H(yv, etav, p0 - h, lg1, loggamma.(yv .+ p0 .- h))) / (2h)
-        @test out[3] + 2.0 * sum(digamma.(yv .+ p0)) ≈ 2.0 * fdp_true rtol = 1e-6
-        @test out[1:2] == (nothing, nothing) && out[4] === nothing && out[5] === nothing
-        lgpd2 = zeros(5)
-        aug2 = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(etav), EnzymeCore.Active(p0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd2))
-        @test aug2.primal ≈ H(yv, etav, p0, lg1, lgp)
-        out2 = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug2.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Const(etav), EnzymeCore.Active(p0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd2))
-        @test out2[3] ≈ 2.0 * fdp_frozen rtol = 1e-6
-        @test lgpd2 ≈ fill(2.0, 5)
-        @test out2[3] + 2.0 * sum(digamma.(yv .+ p0)) ≈ 2.0 * fdp_true rtol = 1e-6
-    end
-
-    @testset "fused-entry sampled-phi rule method matches FD" begin
-        # White-box: the fused Duplicated-phi reverse, driven directly.
-        H = DistributionKernelSources._glm_negbin2_log_fused
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false, false, false, false, false),false,false}()
-        Xw = [1.0 -1.0; 1.0 -0.5; 1.0 0.5; 1.0 1.0; 1.0 0.0]
-        yv = [1.0, 0.0, 3.0, 2.0, 5.0]
-        bv = [0.5, -0.3]
-        p0 = 2.0
-        lg1 = loggamma.(yv .+ 1.0)
-        lgp = loggamma.(yv .+ p0)
-        bd = zeros(2)
-        lgpd = zeros(5)
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(Xw), EnzymeCore.Duplicated(bv, bd),
-            EnzymeCore.Duplicated(p0, 0.0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd))
-        @test aug.primal ≈ H(yv, Xw, bv, p0, lg1, lgp)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv), EnzymeCore.Const(Xw),
-            EnzymeCore.Duplicated(bv, bd), EnzymeCore.Duplicated(p0, 0.0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd))
-        etw = Xw * bv
-        erw = exp.(etw)
-        @test bd ≈ Xw' * [2.0 * (yi - (yi + p0) * m / (m + p0))
-            for (yi, m) in zip(yv, erw)]
-        h = 1e-7
-        fdp_frozen = (H(yv, Xw, bv, p0 + h, lg1, lgp) -
-            H(yv, Xw, bv, p0 - h, lg1, lgp)) / (2h)
-        @test out[4] ≈ 2.0 * fdp_frozen rtol = 1e-6
-        @test lgpd ≈ fill(2.0, 5)
-        fdp_true = (H(yv, Xw, bv, p0 + h, lg1, loggamma.(yv .+ p0 .+ h)) -
-            H(yv, Xw, bv, p0 - h, lg1, loggamma.(yv .+ p0 .- h))) / (2h)
-        @test out[4] + 2.0 * sum(digamma.(yv .+ p0)) ≈ 2.0 * fdp_true rtol = 1e-6
-        @test out[1:3] == (nothing, nothing, nothing) &&
-            out[5] === nothing && out[6] === nothing
-        bd2 = zeros(2)
-        lgpd2 = zeros(5)
-        aug2 = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(Xw), EnzymeCore.Duplicated(bv, bd2),
-            EnzymeCore.Active(p0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd2))
-        @test aug2.primal ≈ H(yv, Xw, bv, p0, lg1, lgp)
-        out2 = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug2.tape, EnzymeCore.Const(yv), EnzymeCore.Const(Xw),
-            EnzymeCore.Duplicated(bv, bd2), EnzymeCore.Active(p0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd2))
-        @test bd2 ≈ Xw' * [2.0 * (yi - (yi + p0) * m / (m + p0))
-            for (yi, m) in zip(yv, erw)]
-        @test out2[4] ≈ 2.0 * fdp_frozen rtol = 1e-6
-        @test lgpd2 ≈ fill(2.0, 5)
-        @test out2[4] + 2.0 * sum(digamma.(yv .+ p0)) ≈ 2.0 * fdp_true rtol = 1e-6
-    end
-
-    @testset "fused-entry bound-beta sampled-phi rule method matches FD" begin
-        # White-box: the fused Const-beta reverse (beta bound, phi sampled).
-        H = DistributionKernelSources._glm_negbin2_log_fused
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false, false, false, false, false),false,false}()
-        Xw = [1.0 -1.0; 1.0 -0.5; 1.0 0.5; 1.0 1.0; 1.0 0.0]
-        yv = [1.0, 0.0, 3.0, 2.0, 5.0]
-        bv = [0.5, -0.3]
-        p0 = 2.0
-        lg1 = loggamma.(yv .+ 1.0)
-        lgp = loggamma.(yv .+ p0)
-        lgpd = zeros(5)
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(Xw), EnzymeCore.Const(bv),
-            EnzymeCore.Duplicated(p0, 0.0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd))
-        @test aug.primal ≈ H(yv, Xw, bv, p0, lg1, lgp)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv), EnzymeCore.Const(Xw),
-            EnzymeCore.Const(bv), EnzymeCore.Duplicated(p0, 0.0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd))
-        h = 1e-7
-        fdp_frozen = (H(yv, Xw, bv, p0 + h, lg1, lgp) -
-            H(yv, Xw, bv, p0 - h, lg1, lgp)) / (2h)
-        @test out[4] ≈ 2.0 * fdp_frozen rtol = 1e-6
-        @test lgpd ≈ fill(2.0, 5)
-        fdp_true = (H(yv, Xw, bv, p0 + h, lg1, loggamma.(yv .+ p0 .+ h)) -
-            H(yv, Xw, bv, p0 - h, lg1, loggamma.(yv .+ p0 .- h))) / (2h)
-        @test out[4] + 2.0 * sum(digamma.(yv .+ p0)) ≈ 2.0 * fdp_true rtol = 1e-6
-        @test out[1:3] == (nothing, nothing, nothing) &&
-            out[5] === nothing && out[6] === nothing
-        lgpd2 = zeros(5)
-        aug2 = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Const(Xw), EnzymeCore.Const(bv),
-            EnzymeCore.Active(p0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd2))
-        @test aug2.primal ≈ H(yv, Xw, bv, p0, lg1, lgp)
-        out2 = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug2.tape, EnzymeCore.Const(yv), EnzymeCore.Const(Xw),
-            EnzymeCore.Const(bv), EnzymeCore.Active(p0),
-            EnzymeCore.Const(lg1), EnzymeCore.Duplicated(lgp, lgpd2))
-        @test out2[4] ≈ 2.0 * fdp_frozen rtol = 1e-6
-        @test lgpd2 ≈ fill(2.0, 5)
-        @test out2[4] + 2.0 * sum(digamma.(yv .+ p0)) ≈ 2.0 * fdp_true rtol = 1e-6
-    end
-
     @testset "sampled phi end to end (unpacked beta+phi active)" begin
-        # The risky path pinned whole: rule-direct plus graph-temp halves
-        # must sum to the true sampled-phi gradient.
+        # The whole model pinned end to end: one generic-Enzyme reverse over
+        # the unpacked beta+phi graph must match the true gradient.
         @kernel _nb2_glm_modelQ(
                 q::Vector{Float64}, X::Matrix{Float64}, y::Vector{Int}) = begin
             beta::Vector{Float64} = q[1:2]
@@ -1097,26 +718,6 @@ end
         @test v ≈ kb(q0) rtol = 1e-12
     end
 
-    @testset "eta-entry rule method matches FD" begin
-        # White-box: the object now routes through the fused entry, so the
-        # eta entry (kept for external-eta consumers) is covered directly.
-        H = DistributionKernelSources._glm_categorical_logit
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false),false,false}()
-        yv = [1, 3, 2, 1, 2]
-        etav = [0.5 0.0 -0.4; 0.3 -0.2 0.1; -0.1 0.4 0.2; 0.0 0.1 -0.3; 0.2 -0.1 0.0]
-        ed = zeros(5, 3)
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed))
-        @test aug.primal ≈ H(yv, etav)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed))
-        sms = [softmax(etav[i, :]) for i in 1:5]
-        @test ed ≈ [2.0 * (Float64(c == yv[i]) - sms[i][c]) for i in 1:5, c in 1:3]
-        @test out == (nothing, nothing)
-    end
 end
 
 @testset "ordered_logistic_glm fused object" begin
@@ -1135,7 +736,7 @@ end
         (LogExpFunctions.logistic(cp[yi] - e), LogExpFunctions.logistic(cp[yi + 1] - e)))
     ordcell(e, yi, cuts) = (ab = ordab(e, yi, cuts); log(ab[2] - ab[1]))
     # Direct (non-collapsed) theta spelling: independently validates the
-    # a + b - 1 collapse the rule actually runs.
+    # a + b - 1 collapse the score endpoint runs.
     orddirect(e, yi, cuts) = (ab = ordab(e, yi, cuts);
         (ab[1] * (1 - ab[1]) - ab[2] * (1 - ab[2])) / (ab[2] - ab[1]))
     ref_cells = [ordcell(e, yi, c0) for (e, yi) in zip(eta, y)]
@@ -1266,41 +867,4 @@ end
         @test gt ≈ _glm_fd_grad(kb, ctail) rtol = 1e-5
     end
 
-    @testset "sampled-cuts rule method matches FD, stays finite at saturation" begin
-        # White-box: the Duplicated-cuts reverse, driven directly. Codes
-        # index, so y stays Vector{Int} here (unlike the Float oracles).
-        H = DistributionKernelSources._glm_ordered_logistic
-        ER = EnzymeCore.EnzymeRules
-        cfg = ER.RevConfig{true,false,1,(false, false, false, false),false,false}()
-        yv = [1, 2, 4, 3, 1]
-        etav = [0.5, 0.1, 0.8, -0.3, -0.5]
-        cc0 = [-0.5, 0.5, 1.5]
-        ed = zeros(5)
-        cd = zeros(3)
-        aug = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed), EnzymeCore.Duplicated(cc0, cd))
-        @test aug.primal ≈ H(yv, etav, cc0)
-        out = ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            aug.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etav, ed), EnzymeCore.Duplicated(cc0, cd))
-        @test ed ≈ [2.0 * orddirect(e, yi, cc0) for (e, yi) in zip(etav, yv)]
-        h = 1e-7
-        fdc = [(H(yv, etav, cc0 .+ h .* (1:3 .== k)) -
-                H(yv, etav, cc0 .- h .* (1:3 .== k))) / (2h) for k in 1:3]
-        @test cd ≈ 2.0 .* fdc rtol = 1e-6
-        @test out == (nothing, nothing, nothing)
-        # Saturation: values -Inf, but no NaN may escape the adjoint.
-        etas = fill(800.0, 5)
-        eds = zeros(5)
-        cds = zeros(3)
-        augs = ER.augmented_primal(cfg, EnzymeCore.Const(H),
-            EnzymeCore.Active{Float64}, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etas, eds), EnzymeCore.Duplicated(cc0, cds))
-        @test augs.primal == -Inf
-        ER.reverse(cfg, EnzymeCore.Const(H), EnzymeCore.Active(2.0),
-            augs.tape, EnzymeCore.Const(yv),
-            EnzymeCore.Duplicated(etas, eds), EnzymeCore.Duplicated(cc0, cds))
-        @test all(isfinite, eds) && all(isfinite, cds)
-    end
 end

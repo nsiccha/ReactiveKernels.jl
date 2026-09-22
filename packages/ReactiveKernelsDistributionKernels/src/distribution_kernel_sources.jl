@@ -1,14 +1,9 @@
 module DistributionKernelSources
 
 using ReactiveKernels
-using EnzymeCore
 using LinearAlgebra
-using LoopVectorization
 import LogExpFunctions
 using SpecialFunctions: digamma, loggamma
-
-include("glm_likelihoods.jl")
-include("glm_rules.jl")
 
 export LOCATION_SCALE_SOURCE
 export standard_normal, standard_cauchy, standard_laplace, standard_student_t
