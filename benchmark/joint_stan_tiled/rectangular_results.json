@@ -25,7 +25,7 @@
       "hlo_bytes": 803439,
       "hlo_trace_s": 105.28,
       "compile_after_hlo_s": 12.8,
-      "process_wall_s": 196.70,
+      "process_wall_s": 196.7,
       "peak_rss_kib": 1902096,
       "reactant_eval_ms": 0.1994,
       "native_eval_ms": 0.0204,
@@ -46,7 +46,7 @@
       "compile_after_hlo_s": 14.0,
       "process_wall_s": 224.26,
       "peak_rss_kib": 1850236,
-      "reactant_eval_ms": 0.5230,
+      "reactant_eval_ms": 0.523,
       "native_eval_ms": 0.0364,
       "seeded_point_relative_error": 8.755e-16,
       "parity_two_points": true
@@ -75,8 +75,35 @@
     "subjects": 2,
     "operations": 6,
     "exit_code": 1,
-    "log": "kb-run-compact.2TLXWw",
-    "error": "had set op which was not a direct descendant"
+    "log": "kb-run-compact.TN4m3R",
+    "error": "had set op which was not a direct descendant",
+    "process_wall_s": 52.79,
+    "peak_rss_kib": 1306236,
+    "source_commit": "7fdbf6b7c4f8fe970752cbf8c9229c1b526591c7"
   },
-  "K10": "not attempted"
+  "K10": "not attempted",
+  "standalone_reverse_reproducer": {
+    "file": "repro_rectangular_reverse_standalone.jl",
+    "baseline_commit": "9b129af9fd63106a34a43e35deae4d91a17a9181",
+    "exit_code": 1,
+    "log": "kb-run-compact.hdreP1",
+    "process_wall_s": 81.71,
+    "peak_rss_kib": 1342016,
+    "error": "had set op which was not a direct descendant",
+    "note": "Contains its own recurrence helpers and uses only baseline RK/PPL math. Process includes first-use package loading."
+  },
+  "acceptance_batches": [
+    {
+      "log": "kb-run-compact.AFtZ0Y",
+      "assertions": 70,
+      "exit_code": 0,
+      "coverage": "rectangular fold and branches, nadir reverse, authored scan, native joint parity/emission, MutatingFunctions extension load"
+    },
+    {
+      "log": "kb-run-compact.v0pSaK",
+      "assertions": 512,
+      "exit_code": 0,
+      "coverage": "opt-in PK/default restoration, existing PK cells, joint emitter including native/compiled AD"
+    }
+  ]
 }

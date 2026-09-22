@@ -135,3 +135,15 @@ TILE_K=1 RK_RECTANGULAR=1 RK_HLO=1 RK_PRIMAL=1 RK_GRAD=0 REPS=50 \
 Run `repro_rectangular_reverse.jl` directly in the same environment for the
 focused expected failure. Do not launch the full joint reverse or K=3 reverse
 again until that reproducer compiles and its gradient matches a native oracle.
+
+`repro_rectangular_reverse_standalone.jl` contains the recurrence helpers inline
+and needs only the public PK math. It was also verified against the original RK
+baseline `9b129af9fd63106a34a43e35deae4d91a17a9181`: same diagnostic, exit 1,
+81.71 s whole-process wall, 1,342,016 KiB peak RSS, including first-use loading.
+This version can be shared upstream without publishing the experimental branch.
+
+The final branch acceptance batches pass 582 assertions covering the generic
+fold, lazy branches, nadir reverse, existing authored scan, native joint parity,
+PK cells, and joint emitter native/compiled AD. The MutatingFunctions extension
+also loads successfully. These checks validate the supported paths; the PK
+reverse reproducer remains an expected failure, outside the test suite.
