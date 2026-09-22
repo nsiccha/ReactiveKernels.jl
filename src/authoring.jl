@@ -1688,23 +1688,38 @@ end
 # interpreter follows the expansion only as ordinary closure code, which is
 # why the transform runs at definition time rather than through a runtime
 # generated program.
+# `@trace for` handles one plain induction variable over a range; that is
+# the shape a data-length loop takes (`1:n`, `eachindex(x)`, `axes(x, 1)`).
+# A typed binding, destructuring, or iteration over a collection keeps the
+# authored loop unchanged (it iterates host structure, not a data length).
+_kernel_range_iterator(iter) =
+    iter isa Expr && iter.head === :call && !isempty(iter.args) && (
+        iter.args[1] === :(:) ||
+        iter.args[1] in (:eachindex, :axes, :range) ||
+        (iter.args[1] isa Expr && iter.args[1].head === :. &&
+         iter.args[1].args[end] isa QuoteNode &&
+         iter.args[1].args[end].value in (:OneTo, :eachindex, :axes, :range)))
+
 function _kernel_tensorized_loop(ex, known, mod, scope)
-    lowered = if ex.head === :for
+    if ex.head === :for
         binding, body = ex.args
         binding isa Expr && binding.head === :(=) && length(binding.args) == 2 ||
             throw(ArgumentError("unsupported authored loop binding `$(binding)` in a kernel recipe"))
         loop_names = Set{Symbol}()
         _lhs_symbols!(loop_names, binding.args[1])
-        Expr(:for,
+        lowered = Expr(:for,
              Expr(:(=), binding.args[1],
                   _kernel_tensorized_rhs(binding.args[2], known, mod, scope)),
              _kernel_tensorized_rhs(body, known, mod, union(scope, loop_names)))
+        retained = binding.args[1] isa Symbol && _kernel_range_iterator(binding.args[2])
     else
         condition, body = ex.args
-        Expr(:while,
+        lowered = Expr(:while,
              _kernel_tensorized_rhs(condition, known, mod, scope),
              _kernel_tensorized_rhs(body, known, mod, scope))
+        retained = true
     end
+    retained || return lowered
     Expr(:macrocall, GlobalRef(ReactantCore, Symbol("@trace")),
          LineNumberNode(@__LINE__, @__FILE__), lowered)
 end
