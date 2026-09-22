@@ -1,4 +1,5 @@
 using ReactiveKernels
+using LinearAlgebra
 using Test
 
 include(joinpath(@__DIR__, "fixtures", "stateful_functional_contracts.jl"))
@@ -41,7 +42,13 @@ end
         :control_overflow, :effects, :outbox)
     @test isempty(propertynames(result.effects))
     @test result.outbox.callback.count == 2
-    @test length(result.outbox.callback.records) == 2
+    # Structure-of-arrays storage: one column per numeric state leaf with a
+    # trailing slot axis of the port's capacity (two call sites), the static
+    # callable field carried by reference.
+    storage = result.outbox.callback.storage
+    @test propertynames(storage) == (:arguments,)
+    @test storage.arguments[1].count == [0, 0]
+    @test storage.arguments[1].callback === collector
     @test result.outbox.callback.overflow === false
     @test isempty(collector.counts)
 
@@ -71,7 +78,8 @@ end
     @test collector.counts == [0, 0]
 
     malformed_item = merge(
-        result.outbox.callback, (active=(true,),))
+        result.outbox.callback,
+        (storage=(arguments=((callback=collector, count=[0]),),),))
     malformed_result = merge(
         result, (outbox=(callback=malformed_item,),))
     malformed_error = try
@@ -85,18 +93,35 @@ end
                    sprint(showerror, malformed_error))
     @test collector.counts == [0, 0]
 
-    initial_box = ReactiveKernels._sm_observation_outbox(
-        (arguments=(1,),), Val(1), 0, false)
-    full_box = ReactiveKernels._sm_observation_outbox_push(
-        initial_box, (arguments=(2,),), true)
-    overflow_box = ReactiveKernels._sm_observation_outbox_push(
-        full_box, (arguments=(3,),), true)
-    @test overflow_box.count == 1
+    record_type = NamedTuple{(:arguments,),Tuple{Tuple{Int,Vector{Float64}}}}
+    initial_box = ReactiveKernels._sm_observation_outbox_init(
+        (arguments=(1, [0.0, 0.0]),), record_type, Val(2), 0, false)
+    @test initial_box.storage.arguments[1] == [0, 0]
+    @test initial_box.storage.arguments[2] == zeros(2, 2)
+    @test initial_box.count == 0
+    skipped_box = ReactiveKernels._sm_observation_outbox_write(
+        initial_box, (arguments=(2, [2.0, 3.0]),), record_type, Val(2), false)
+    @test skipped_box.count == 0
+    @test skipped_box.storage.arguments[2] == zeros(2, 2)
+    one_box = ReactiveKernels._sm_observation_outbox_write(
+        initial_box, (arguments=(2, [2.0, 3.0]),), record_type, Val(2), true)
+    full_box = ReactiveKernels._sm_observation_outbox_write(
+        one_box, (arguments=(3, [4.0, 5.0]),), record_type, Val(2), true)
+    @test full_box.count == 2
+    @test full_box.overflow === false
+    @test full_box.storage.arguments[1] == [2, 3]
+    @test full_box.storage.arguments[2] == [2.0 4.0; 3.0 5.0]
+    overflow_box = ReactiveKernels._sm_observation_outbox_write(
+        full_box, (arguments=(4, [6.0, 7.0]),), record_type, Val(2), true)
+    @test overflow_box.count == 2
     @test overflow_box.overflow === true
-    @test only(overflow_box.records).arguments == (2,)
+    @test overflow_box.storage == full_box.storage
+    @test ReactiveKernels._sm_observation_slot_value(
+        full_box.storage, record_type, 2) == (arguments=(3, [4.0, 5.0]),)
     growth_error = try
-        ReactiveKernels._sm_observation_outbox_push(
-            full_box, (arguments=([3],),), true)
+        ReactiveKernels._sm_observation_outbox_write(
+            one_box, (arguments=(3, [4.0, 5.0, 6.0]),), record_type, Val(2),
+            true)
         nothing
     catch error
         error
@@ -104,6 +129,41 @@ end
     @test growth_error isa ArgumentError
     @test occursin("forbidden observational outbox growth",
                    sprint(showerror, growth_error))
+    type_error = try
+        ReactiveKernels._sm_observation_outbox_write(
+            one_box, (arguments=(3.0, [4.0, 5.0]),), record_type, Val(2), true)
+        nothing
+    catch error
+        error
+    end
+    @test type_error isa ArgumentError
+    @test occursin("forbidden observational outbox growth",
+                   sprint(showerror, type_error))
+    # A Cholesky leaf travels as its parts: factors recurse, `uplo` stays a
+    # static identity, `info` is one numeric column.
+    chol = LinearAlgebra.cholesky([4.0 0.0; 0.0 9.0])
+    chol_type = NamedTuple{(:arguments,),Tuple{Tuple{typeof(chol)}}}
+    chol_box = ReactiveKernels._sm_observation_outbox_init(
+        (arguments=(chol,),), chol_type, Val(2), 0, false)
+    @test propertynames(chol_box.storage.arguments[1]) == (:factors, :uplo, :info)
+    @test chol_box.storage.arguments[1].uplo == 'U'
+    @test chol_box.storage.arguments[1].info == [0, 0]
+    other = LinearAlgebra.cholesky([16.0 0.0; 0.0 25.0])
+    chol_box = ReactiveKernels._sm_observation_outbox_write(
+        chol_box, (arguments=(other,),), chol_type, Val(2), true)
+    stored = ReactiveKernels._sm_observation_slot_value(
+        chol_box.storage, chol_type, 1).arguments[1]
+    @test stored isa LinearAlgebra.Cholesky
+    @test stored.factors == other.factors && stored.uplo == 'U' && stored.info == 0
+    wrapper_error = try
+        ReactiveKernels._sm_observation_outbox_write(
+            chol_box, (arguments=(other.factors,),), chol_type, Val(2), true)
+        nothing
+    catch error
+        error
+    end
+    @test wrapper_error isa ArgumentError
+    @test occursin("lost its Cholesky wrapper", sprint(showerror, wrapper_error))
 
     authority = _ObservationAuthority()
     authority_port = effect_lowering_port(

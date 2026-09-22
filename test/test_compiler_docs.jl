@@ -236,7 +236,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "`transition_with_effects(transition)`",
         "`drain_observations!(transition, result)`",
         "internal conservative compiler rule",
-        "logical activity mask and count plus sticky\noverflow",
+        "a fill count, and\na sticky overflow flag",
         "explicitly recompile",
         "no Reactant implementation",
         "one global\nordered event tape/cursor",

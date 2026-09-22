@@ -88,6 +88,28 @@ end
 # method return = pop); an inlined acyclic callee is built with ret_pc == its call-site continuation, so its
 # returns (incl. branch-local early returns) rejoin the caller. `ret_val` (a Symbol or nothing) binds a
 # value-position callee's returned value. `by_mid`/`rec` drive acyclic inlining vs SCC frame suspension.
+# The value of an inlined value-position callee is its trailing expression,
+# and a trailing `if` yields the value of the taken arm.  MethodIR marks only a
+# method's own trailing expression as a `_Return`; mark the arms of a trailing
+# `if` the same way (recursively) so every path through the inlined body binds
+# `ret_val` exactly once instead of discarding the arm's value.
+function _control_value_body(body)
+    isempty(body) && return Any[body...]
+    stmts = Any[body...]
+    last = stmts[end]
+    if last isa _ExprStmt
+        stmts[end] = _Return(last.expr)
+    elseif last isa _Call
+        stmts[end] = _Return(_CallExpr(last.name, last.candidates, last.target,
+                                       last.pos, last.kw))
+    elseif last isa _If
+        stmts[end] = _If(last.cond,
+                         Tuple(_control_value_body(collect(Any, last.thenb))),
+                         Tuple(_control_value_body(collect(Any, last.elseb))))
+    end
+    stmts
+end
+
 function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid, rec, brk::Int=-1, lcont::Int=-1)
     isempty(stmts) && return cont_pc
     st = stmts[1]; rest = stmts[2:end]
@@ -100,7 +122,8 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
         # private spelling here leaves cross-block liveness/type analysis with
         # an unassigned authored local.
         vloc = _lasym(st.lhs)
-        return build_region!(bb, [_subst(x, fmap) for x in callee.body], resume, resume, vloc, by_mid, rec, brk, lcont)
+        return build_region!(bb, [_subst(x, fmap) for x in _control_value_body(callee.body)],
+                             resume, resume, vloc, by_mid, rec, brk, lcont)
     elseif st isa _ExprStmt && st.expr isa _IfExpr
         # A discarded ternary may still contain sibling calls. Make the source
         # branch
@@ -161,7 +184,8 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
                 pc = _newpc!(bb); push!(bb.blks, Blk(pc, Any[], TCall(m, _call_args(v), retb))); return pc
             else                                             # return acyclic-call: inline, its returns = OUR return
                 callee = by_mid[m]; fmap = _argmap(callee, v)
-                return build_region!(bb, [_subst(x, fmap) for x in callee.body], ret_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
+                body = ret_val === nothing ? callee.body : _control_value_body(callee.body)
+                return build_region!(bb, [_subst(x, fmap) for x in body], ret_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
             end
         else                                                 # plain return: evaluate the value, then goto ret_pc
             # Preserve a discarded non-call return expression's evaluation: a
@@ -200,7 +224,7 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
             callee = by_mid[m]
             fmap = _argmap(callee, condition)
             return build_region!(
-                bb, [_subst(x, fmap) for x in callee.body],
+                bb, [_subst(x, fmap) for x in _control_value_body(callee.body)],
                 pc, pc, value, by_mid, rec, brk, lcont)
         end
         push!(bb.blks, Blk(pc, Any[], st.op == :&& ?

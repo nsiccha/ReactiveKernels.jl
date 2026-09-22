@@ -345,6 +345,45 @@ function sum_to_zero_model_source_preserves_published_authority(current, publish
             "\n" *
             "    K::Int = length(effects_s2z)\n",
         ),
+        # The pivot-coordinate transform is vectorized (`w`, suffix sum via
+        # `cumsum`, tail rule) so that no loop over the data-derived number
+        # of free coordinates reaches a tensorizing backend
+        # (`docs/src/constraints.md`); the values are identical.  The prepared
+        # graph differs from the one the published v1 measurements ran, so
+        # those measurements stay attributed to the pinned blob and this
+        # delta stays explicit here.
+        (
+            "    # Vectorized: `w[i] = y[i] / sqrt(i (i + 1))`, the running sum from the\n" *
+            "    # top is the suffix sum `sum(w) - cumsum(w) + w` (spelled without\n" *
+            "    # `reverse`, whose traced lowering reverses its input buffer in place),\n" *
+            "    # and each `constrained[i + 1]` is the running sum at `i` minus\n" *
+            "    # `(i + 1) w[i]`; the last entry is the tail of that rule and the first\n" *
+            "    # is the full sum.  No loop over the (data-derived) number of free\n" *
+            "    # coordinates reaches a tensorizing backend.\n" *
+            "    effects_s2z::AbstractVector{Float64} = let\n" *
+            "        nfree = length(effects_free)\n" *
+            "        index = 1:nfree\n" *
+            "        w = effects_free ./ sqrt.(index .* (index .+ 1))\n" *
+            "        running = sum(w) .- cumsum(w) .+ w\n" *
+            "        tail = running .- (index .+ 1) .* w\n" *
+            "        vcat(running[1], tail)\n" *
+            "    end\n" *
+            "\n",
+            "    effects_s2z::AbstractVector{Float64} = let\n" *
+            "        nfree = length(effects_free)\n" *
+            "        constrained = Vector{Float64}(undef, nfree + 1)\n" *
+            "        running_sum = 0.0\n" *
+            "        for offset in 1:nfree\n" *
+            "            i = nfree - offset + 1\n" *
+            "            w = effects_free[i] / sqrt(i * (i + 1))\n" *
+            "            running_sum += w\n" *
+            "            constrained[i] = running_sum\n" *
+            "            constrained[i + 1] = running_sum - (i + 1) * w\n" *
+            "        end\n" *
+            "        constrained\n" *
+            "    end\n" *
+            "\n",
+        ),
     )
     transformed = current
     for (replacement, original) in replacements
