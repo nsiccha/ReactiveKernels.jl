@@ -207,8 +207,9 @@ julia --startup-file=no --project=mwe-env -e 'using Pkg; Pkg.add([
 julia --startup-file=no --project=mwe-env repro_reactant_while_reverse.jl
 ```
 
-The final branch acceptance batches pass 582 assertions covering the generic
+The initial fold/nadir slice passed 582 assertions covering the generic
 fold, lazy branches, nadir reverse, existing authored scan, native joint parity,
 PK cells, and joint emitter native/compiled AD. The MutatingFunctions extension
-also loads successfully. These checks validate the supported paths; the PK
+also loaded successfully. The later constraint-repair acceptance is the
+858-assertion result above. These checks validate the supported paths; the PK
 reverse reproducer remains an expected failure, outside the test suite.
