@@ -1,14 +1,11 @@
 # Reactant track (brm:tgi:reactant, 2026-09-21): full-program
 # `Reactant.@compile` of built RKPPL programs — primal lp parity and
 # compiled value+gradient (Enzyme-through-Reactant) parity against the
-# native kernels. Ladder: tiny model (primal + gradient) → joint
-# PK+QT+TGI fixture at tiling K (primal; K=1 by default, ~4 min of XLA
-# compile at ~3.8 GB peak RSS on strato2 — set `RKPPL_REACTANT_KS=1,3,10`
-# for the full ladder).  The joint gradient compile is NOT in the suite:
-# on strato2 every attempt (five, 2026-09-21) was SIGTERMed by kb-earlyoom
-# at host pressure after 9–12 min and >4.2 GB RSS before the compile
-# returned (snag `strato2-earlyoom-cf96ec60`); the tiny-model testset
-# proves the compiled AD path itself.
+# native kernels. The default joint PK path now rejects compilation explicitly:
+# unrolling its bound schedule violates the core constraints, and reverse of
+# the retained recurrence is blocked by RK issue #13. Set
+# `RKPPL_REACTANT_RECTANGULAR=1 RKPPL_REACTANT_KS=1,3` to exercise the experimental
+# retained primal ladder. The tiny model still proves the compiled AD path.
 #
 # Call shape (the one thing that decides traceability): compile the RAW
 # prepared kernel / `q.ad` directly (top level, or `invokelatest` AROUND
@@ -91,7 +88,7 @@ end
 const _RJ_KS = [parse(Int, s) for s in
     split(get(ENV, "RKPPL_REACTANT_KS", "1"), ",")]
 
-@testset "Reactant ladder 2: joint K=1 primal @compile parity" begin
+@testset "Reactant ladder 2: joint PK rejects the unrolled fallback" begin
     fx = _rj_joint(1)
     @test fx.built.layout.total == 101
     native = fx.post_q(fx.u)
@@ -99,23 +96,16 @@ const _RJ_KS = [parse(Int, s) for s in
     bound_f = bind_data(final_plan("continuous"), _parity_columns("continuous");
         dims = Dict(:kernel_nsub_pk_loc => 3))
     @test prepare_query(build_kernel(bound_f), bound_f, :sampler)(fx.u) == native
-    # Full-program compile of the sampler-cut kernel.  The only lowering gap
-    # this hit was the PK cell's per-op `log_F[j]` read on the traced
-    # bioavailability slice (now `_traced_op_read`, pkcells.jl); everything
-    # else — packed reads, the subject-batched cell loop, gathers, the
-    # segmented nadir loop, plates — traces as authored.
-    compiled = Reactant.@compile fx.post_q(Reactant.to_rarray(fx.u))
-    @test Float64(compiled(Reactant.to_rarray(fx.u))) ≈ native rtol = 1e-9
-    u2 = Vector{Float64}(0.1 .* randn(Xoshiro(7), length(fx.u)))
-    @test Float64(compiled(Reactant.to_rarray(u2))) ≈ fx.post_q(u2) rtol = 1e-9
+    @test_throws "compiled PK recurrences are disabled" Reactant.@code_hlo fx.post_q(
+        Reactant.to_rarray(fx.u))
 end
 
-# Ladder 3 (opt-in): the same proof at larger tilings — the emitted
-# program is identical (one batched statement per cell assignment), only
-# the bound columns and the layout grow, so this pins that the runtime
-# subject loop traces at every K.
+# Ladder 3 (opt-in diagnostic): retained recurrence primal parity.
+if get(ENV, "RKPPL_REACTANT_RECTANGULAR", "0") == "1"
+previous_mode = ReactiveKernelsPPL._rectangular_pk_enabled[]
+try
+ReactiveKernelsPPL._rectangular_pk_enabled[] = true
 for K in _RJ_KS
-    K == 1 && continue
     @testset "Reactant ladder 3: joint K=$K primal @compile parity" begin
         fx = _rj_joint(K)
         native = fx.post_q(fx.u)
@@ -124,4 +114,8 @@ for K in _RJ_KS
         u2 = Vector{Float64}(0.1 .* randn(Xoshiro(7), length(fx.u)))
         @test Float64(compiled(Reactant.to_rarray(u2))) ≈ fx.post_q(u2) rtol = 1e-9
     end
+end
+finally
+    ReactiveKernelsPPL._rectangular_pk_enabled[] = previous_mode
+end
 end

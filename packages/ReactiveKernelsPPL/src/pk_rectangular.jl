@@ -104,13 +104,19 @@ end
 
 function _pk_rectangular_regular(A, first, amount, interval, count, cols)
     B = _pk_dose_affine(A, amount, interval)
+    Q = _pk_retained_power(B, count - 1, cols, amount)
+    _pk_apply_affine(Q, first)
+end
+
+# Shared by standalone matrix powers and the grouped recurrence. The exponent
+# and matrix are loop-carried data; the bit capacity only sizes the row table.
+function _pk_retained_power(B, exponent, cols, marker)
     R = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
-    init = (; R, B, e=count - 1)
+    init = (; R, B, e=exponent)
     step = (c, row) -> ReactiveKernels._recurrence_branch(c.e > 0,
         _pk_power_step, identity, (c,))
-    power = ReactiveKernels._rectangular_fold(step, init, (cols,), (), amount)
-    _pk_apply_affine(power.R, first)
+    ReactiveKernels._rectangular_fold(step, init, (cols,), (), marker).R
 end
 
 function _pk_power_step(c)

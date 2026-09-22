@@ -869,7 +869,14 @@ end
         sched.op_interval[1:3], sched.op_count[1:3], sched.op_read_idx[1:3])
     cell = _pkc_read_wrap_factory(opcols)
     lp0 = [2.3, -1.4, -0.35, -2.65, -2.08]
-    cc = Reactant.@compile cell(Reactant.to_rarray(lp0))
+    @test_throws "compiled PK recurrences are disabled" Reactant.@code_hlo cell(Reactant.to_rarray(lp0))
+    previous_mode = ReactiveKernelsPPL._rectangular_pk_enabled[]
+    cc = try
+        ReactiveKernelsPPL._rectangular_pk_enabled[] = true
+        Reactant.@compile cell(Reactant.to_rarray(lp0))
+    finally
+        ReactiveKernelsPPL._rectangular_pk_enabled[] = previous_mode
+    end
     for lp in (lp0, [2.0, -1.0, -0.5, -2.0, -1.5])
         @test Array(cc(Reactant.to_rarray(lp))) ≈ Vector{Float64}(cell(lp)) atol = 1e-12
     end
@@ -1767,8 +1774,15 @@ end
     cell = _pkl_read7_wrap_factory(opcols)
     lp0 = [2.3, -1.4, -0.35, -2.65, -2.08]
     lf0 = Vector{Float64}(pv(s0, beta0))
-    cc = Reactant.@compile cell(Reactant.to_rarray(lp0),
-        Reactant.to_rarray(lf0))
+    @test_throws "compiled PK recurrences are disabled" Reactant.@code_hlo cell(
+        Reactant.to_rarray(lp0), Reactant.to_rarray(lf0))
+    previous_mode = ReactiveKernelsPPL._rectangular_pk_enabled[]
+    cc = try
+        ReactiveKernelsPPL._rectangular_pk_enabled[] = true
+        Reactant.@compile cell(Reactant.to_rarray(lp0), Reactant.to_rarray(lf0))
+    finally
+        ReactiveKernelsPPL._rectangular_pk_enabled[] = previous_mode
+    end
     for (lp, lf) in ((lp0, lf0),
             ([2.0, -1.0, -0.5, -2.0, -1.5],
                 Vector{Float64}(pv([-0.35, 1.7, 0.9],
