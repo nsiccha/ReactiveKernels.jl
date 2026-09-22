@@ -155,7 +155,30 @@ end
   sequence beside a host later sequence is rejected, so pass every sequence
   traced via `Reactant.to_rarray(data)` on the 1-D path. Native and Reactant
   results match to floating-point tolerance (see
-  `test/test_ppl_examples_reactant.jl`).
+  `test/test_ppl_examples_reactant.jl`). This host-data unrolling is an existing
+  violation of the [core constraints](constraints.md), not a supported design
+  direction. It requires retained iteration or explicit rejection.
+
+## Generated grouped recurrences
+
+The `ReactiveKernelsPPL` example package uses a separate internal rectangular
+fold for traced TGI nadir assessments. Reset flags represent unequal subject
+lengths, including subjects without assessments. Its primal and reverse paths
+preserve the existing output-before-update semantics.
+
+A PK adapter is experimental and disabled for ordinary callers. It carries
+compartment amounts and a concentration/AUC buffer over a flat operation table;
+repeated-dose segments use a bounded binary-power loop. Joint K=1/K=3 primal
+parity and bounded loop structure pass with CPU fusion enabled, but PK reverse
+compilation currently fails in Enzyme/MLIR. It is not a supported sampler path.
+The experiment, reproducer, and measurements are documented in
+`benchmark/joint_stan_tiled/rectangular_lowering.md` in the repository.
+
+This runtime path does not change the authored `scan` contract below. In
+particular, a host-bound `scan` sequence still follows the generic path described
+above. The rectangular fold is an internal lowering boundary, not a new public
+authoring function. Bound table shapes still specialize an executable; changing
+the bound schedule requires preparing and compiling again.
 
 ## Limitations
 

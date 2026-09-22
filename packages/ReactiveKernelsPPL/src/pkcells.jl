@@ -83,9 +83,9 @@ const _traced_op_read = ReactiveKernels._tensorized_getindex
 #
 # Natively this is exactly the former per-subject unroll (same slices,
 # same scalars, `reduce(vcat, parts)` == the former `vcat(s1, s2, …)`);
-# under Reactant the loop bounds are bound data, so the tracer unrolls
-# it with exact values (`reactivekernels-use` §7c), and the cell body
-# traces as before.
+# the experimental Reactant path in pk_rectangular.jl promotes bound columns
+# to traced constants and combines subject and operation traversal in one
+# fixed-trip loop. It requires an explicit benchmark opt-in below.
 """
     SubjectSlice(v)
 
@@ -115,8 +115,16 @@ end
     map(a -> _subject_arg(a, rng, s), args)
 @inline _subject_views(cols::Tuple, rng) = map(c -> view(c, rng), cols)
 
+# Experimental until Enzyme/MLIR can reverse the PK recurrence. The benchmark
+# opts in explicitly; normal callers retain the established grouped path.
+const _rectangular_pk_enabled = Ref(false)
+
 function _cell_over_subjects(cell::F, op_ends::AbstractVector{<:Integer},
         opcols::Tuple, args::Tuple) where {F}
+    if _rectangular_pk_enabled[]
+        marker = ReactiveKernels._dynamic_tensorized_marker(map(_subject_value, args))
+        marker === nothing || return _pk_rectangular(cell, op_ends, opcols, args, marker)
+    end
     n_sub = length(op_ends)
     n_sub >= 1 || throw(ArgumentError(
         "subject-batched cell call needs at least one subject (empty op_ends)"))
@@ -988,11 +996,15 @@ Propagate a three-state linear PK system across one interval (SB
 """
 function linear_pk_propagate_3(A::NTuple{9,Any}, state::NTuple{3,Any}, dt)
     if dt > 0
-        M = (A[1] * dt, A[2] * dt, A[3] * dt, A[4] * dt, A[5] * dt,
-            A[6] * dt, A[7] * dt, A[8] * dt, A[9] * dt)
-        return _pk_tmatvec3(_pk_expm3(M), state)
+        return _pk_propagate_positive(A, state, dt)
     end
     return state
+end
+
+@inline function _pk_propagate_positive(A, state, dt)
+    M = (A[1] * dt, A[2] * dt, A[3] * dt, A[4] * dt, A[5] * dt,
+        A[6] * dt, A[7] * dt, A[8] * dt, A[9] * dt)
+    _pk_tmatvec3(_pk_expm3(M), state)
 end
 
 """
@@ -1016,13 +1028,21 @@ function linear_pk_add_regular_doses_3(A::NTuple{9,Any}, state::NTuple{3,Any},
         amount, interval, count::Integer)
     after_first = linear_pk_add_dose_3(state, amount)
     count > 1 || return after_first
+    affine = _pk_dose_affine(A, amount, interval)
+    Q = _pk_matpow4(affine, count - 1)
+    _pk_apply_affine(Q, after_first)
+end
+
+@inline function _pk_dose_affine(A, amount, interval)
     M = (A[1] * interval, A[2] * interval, A[3] * interval,
         A[4] * interval, A[5] * interval, A[6] * interval,
         A[7] * interval, A[8] * interval, A[9] * interval)
     P = _pk_expm3(M)
-    affine = (P[1], P[2], P[3], 0.0, P[4], P[5], P[6], 0.0,
+    (P[1], P[2], P[3], 0.0, P[4], P[5], P[6], 0.0,
         P[7], P[8], P[9], 0.0, amount, 0.0, 0.0, 1.0)
-    Q = _pk_matpow4(affine, count - 1)
+end
+
+@inline function _pk_apply_affine(Q, after_first)
     return (Q[1] * after_first[1] + Q[5] * after_first[2] +
             Q[9] * after_first[3] + Q[13],
         Q[2] * after_first[1] + Q[6] * after_first[2] +

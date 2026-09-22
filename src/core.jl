@@ -235,6 +235,29 @@ end
     result
 end
 
+# Internal rectangular recurrence boundary. Unlike scan, this returns the final
+# carry, which may include fixed-size output buffers. Ragged segments use
+# reset/mask/index columns, never dynamic slices or growing containers.
+@inline function _rectangular_fold(step, init, columns::Tuple, shared::Tuple, marker)
+    isempty(columns) && throw(ArgumentError("a rectangular fold needs columns"))
+    n = length(first(columns))
+    all(c -> c isa AbstractVector && length(c) == n, columns) ||
+        throw(DimensionMismatch("rectangular fold columns must be equal-length vectors"))
+    Base.require_one_based_indexing(columns...)
+    _rectangular_fold_impl(marker, step, init, columns, shared, n)
+end
+
+@inline function _rectangular_fold_impl(marker, step, init, columns, shared, n)
+    carry = init
+    for i in 1:n
+        carry = step(carry, map(c -> c[i], columns), shared...)
+    end
+    carry
+end
+
+# Lazy scalar control: inactive singular/overflowing transitions must not run.
+@inline _recurrence_branch(pred, yes, no, args) = pred ? yes(args...) : no(args...)
+
 # Tensorized authored plates keep slice collections structural instead of
 # materializing Base.Slices.  A backend can consume the parent array as one
 # batched value, while the generic fallback preserves ordinary eachcol

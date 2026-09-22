@@ -1,0 +1,178 @@
+{
+  "date_utc": "2026-09-22",
+  "host": "strato2",
+  "julia": "1.10.11",
+  "reactant": "0.2.285",
+  "enzyme": "0.13.204",
+  "reactant_jll": "0.0.407+0",
+  "backend": "cpu",
+  "optimization": "default",
+  "sync": true,
+  "repetitions": 50,
+  "seed": 20260917,
+  "source_note": "Measured the opt-in PK body in this change before the default-off guard and parity-failure assertions were added. Those additions do not change the opted-in numerical body. Raw log basenames are on strato2 in the assigned agent TMPDIR.",
+  "timing_note": "The primal HLO trace was cold and preceded compilation. compile_after_hlo_s is therefore warmed; process_wall_s and peak_rss_kib include setup, native execution, tracing, compilation, and evaluation. HLO counts are textual stablehlo operation occurrences, before optimization.",
+  "primal": [
+    {
+      "K": 1,
+      "n_obs": 7,
+      "unc_dim": 101,
+      "exit_code": 0,
+      "log": "kb-run-compact.QUGBpK",
+      "hlo_whiles": 2,
+      "hlo_ifs": 5,
+      "hlo_ops": 10476,
+      "hlo_bytes": 803439,
+      "hlo_trace_s": 105.28,
+      "compile_after_hlo_s": 12.8,
+      "process_wall_s": 196.7,
+      "peak_rss_kib": 1902096,
+      "reactant_eval_ms": 0.1994,
+      "native_eval_ms": 0.0204,
+      "seeded_point_relative_error": 1.882e-16,
+      "parity_two_points": true
+    },
+    {
+      "K": 3,
+      "n_obs": 21,
+      "unc_dim": 161,
+      "exit_code": 0,
+      "log": "kb-run-compact.BExNZc",
+      "hlo_whiles": 2,
+      "hlo_ifs": 5,
+      "hlo_ops": 9911,
+      "hlo_bytes": 791773,
+      "hlo_trace_s": 118.53,
+      "compile_after_hlo_s": 14.0,
+      "process_wall_s": 224.26,
+      "peak_rss_kib": 1850236,
+      "reactant_eval_ms": 0.523,
+      "native_eval_ms": 0.0364,
+      "seeded_point_relative_error": 8.755e-16,
+      "parity_two_points": true
+    }
+  ],
+  "reverse": [
+    {
+      "K": 1,
+      "exit_code": 1,
+      "log": "kb-run-compact.TrhQwA",
+      "process_wall_s": 389.94,
+      "peak_rss_kib": 2071772,
+      "native_enzyme_eval_ms": 0.1739,
+      "status": "Enzyme/MLIR compilation failure",
+      "error": "had set op which was not a direct descendant",
+      "compiled_eval_ms": null,
+      "parity": null
+    },
+    {
+      "K": 3,
+      "status": "not attempted after reproducible K=1 failure"
+    }
+  ],
+  "focused_reverse_reproducer": {
+    "file": "repro_rectangular_reverse.jl",
+    "subjects": 2,
+    "operations": 6,
+    "exit_code": 1,
+    "log": "kb-run-compact.TN4m3R",
+    "error": "had set op which was not a direct descendant",
+    "process_wall_s": 52.79,
+    "peak_rss_kib": 1306236,
+    "source_commit": "7fdbf6b7c4f8fe970752cbf8c9229c1b526591c7"
+  },
+  "K10": "not attempted",
+  "acceptance_batches": [
+    {
+      "log": "kb-run-compact.AFtZ0Y",
+      "assertions": 70,
+      "exit_code": 0,
+      "coverage": "rectangular fold and branches, nadir reverse, authored scan, native joint parity/emission, MutatingFunctions extension load"
+    },
+    {
+      "log": "kb-run-compact.v0pSaK",
+      "assertions": 512,
+      "exit_code": 0,
+      "coverage": "opt-in PK/default restoration, existing PK cells, joint emitter including native/compiled AD"
+    }
+  ],
+  "upstream_mwe": {
+    "file": "repro_reactant_while_reverse.jl",
+    "imports": [
+      "Reactant",
+      "Enzyme"
+    ],
+    "environment": "fresh public-only environment; no RK packages or developed paths",
+    "shape": 6,
+    "primal": 20.0,
+    "expected_gradient": [
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "exit_code": 1,
+    "error": "had set op which was not a direct descendant",
+    "process_wall_s": 24.9,
+    "peak_rss_kib": 1123152,
+    "log": "kb-run-compact.6p4LeU",
+    "control_log": "kb-run-compact.pr6zoI",
+    "latest_repeat": {
+      "reactant": "0.2.286",
+      "enzyme": "0.13.204",
+      "reactant_jll": "0.0.408+0",
+      "exit_code": 1,
+      "same_error": true,
+      "process_wall_s": 22.39,
+      "peak_rss_kib": 1123292,
+      "log": "kb-run-compact.y7Pvdr",
+      "control_log": "kb-run-compact.6BnJH8",
+      "controls": {
+        "native_enzyme_gradient": [
+          0.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "n3_primal": 5.0,
+        "n3_gradient": [
+          0.0,
+          1.0,
+          1.0
+        ],
+        "n3_unoptimized_while_if": [
+          1,
+          1
+        ],
+        "n6_unoptimized_while_if": [
+          1,
+          1
+        ],
+        "branch_free_n6_gradient": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    }
+  },
+  "historical_rk_dependent_reproducer": {
+    "file": "repro_rectangular_reverse_standalone.jl",
+    "baseline_commit": "9b129af9fd63106a34a43e35deae4d91a17a9181",
+    "exit_code": 1,
+    "log": "kb-run-compact.hdreP1",
+    "process_wall_s": 81.71,
+    "peak_rss_kib": 1342016,
+    "error": "had set op which was not a direct descendant",
+    "note": "Contains its own recurrence helpers and uses only baseline RK/PPL math. Process includes first-use package loading.",
+    "status": "superseded by upstream_mwe; historical file removed",
+    "source_commit": "3b04585925ff40a126a939a781de92e4388c0578"
+  }
+}

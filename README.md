@@ -37,6 +37,9 @@ likelihood terms, pointwise log likelihoods, total log density, and new-group
 prediction. Different `want` sets prune density or generated-quantity work from
 the same graph.
 
+The repository-wide [core constraints](docs/src/constraints.md) require retained
+data-dependent iteration and lazy branch semantics in every lowering.
+
 ## Pipeline
 
 ```
