@@ -432,6 +432,51 @@ function ReactiveKernels._sm_frame_write(
     end
 end
 
+# One slot of a traced column whose trailing axis is the slot axis: a scalar
+# column gathers one element, an array column one slice, at a traced index.
+function _rk_reactant_slot_read(column::Reactant.TracedRArray, index)
+    ndims(column) == 1 && return Reactant.@allowscalar column[index]
+    slice = ntuple(dimension -> dimension == ndims(column) ? index : Colon(),
+                   ndims(column))
+    Reactant.@allowscalar getindex(column, slice...)
+end
+_rk_reactant_slot_index(index) =
+    Reactant.promote_to(Reactant.TracedRNumber{Int64}, index)
+_rk_reactant_slot_one() = Reactant.Ops.constant(Int64(1))
+# Write one slot by a dynamic update slice at the traced index: one op whose
+# operands are the column and the slot value, independent of the capacity.
+function _rk_reactant_slot_write(column, value::Reactant.TracedRNumber, index)
+    Reactant.Ops.dynamic_update_slice(
+        column, Reactant.Ops.broadcast_in_dim(value, Int64[], Int64[1]),
+        [_rk_reactant_slot_index(index)])
+end
+function _rk_reactant_slot_write(column, value::Reactant.TracedRArray, index)
+    Reactant.Ops.dynamic_update_slice(
+        column,
+        Reactant.Ops.reshape(value, vcat(collect(Int64, size(value)), Int64[1])),
+        vcat([_rk_reactant_slot_one() for _ in 1:ndims(value)],
+             [_rk_reactant_slot_index(index)]))
+end
+
+# ---- Structured observational outbox: traced columns -----------------------
+# A slot index at a column access takes Reactant's `Int` gather/scatter type.
+ReactiveKernels._sm_observation_slot(index::Reactant.TracedRNumber{<:Integer}) =
+    _frame_slot(index)
+# One zero-filled traced column with a trailing slot axis: a single `fill`,
+# so no capacity-sized constant is embedded in the program.
+function ReactiveKernels._sm_observation_array_column(
+        value::Reactant.TracedRArray{T,N}, ::Val{Capacity}) where {T,N,Capacity}
+    Reactant.Ops.fill(
+        Reactant.promote_to(Reactant.TracedRNumber{T}, zero(T)),
+        (size(value)..., Capacity))
+end
+ReactiveKernels._sm_observation_column_read(
+        column::Reactant.TracedRArray, index::Reactant.TracedRNumber) =
+    _rk_reactant_slot_read(column, index)
+ReactiveKernels._sm_observation_column_write(
+        column::Reactant.TracedRArray, value, index::Reactant.TracedRNumber) =
+    _rk_reactant_slot_write(column, value, index)
+
 function ReactiveKernels._sm_functional_control_loop(
         step, carry, marker::Reactant.AbstractConcreteNumber)
     Reactant.@trace track_numbers = false while ReactiveKernels._sm_functional_control_continue(carry)
@@ -773,6 +818,11 @@ end
     ReactiveKernels._sm_cholesky_reconstruct(
         ReactiveKernels._sm_backend_storage_value(value.factors),
         value.uplo, value.info)
+
+# The observational outbox stores a Cholesky as its parts; Reactant's traced
+# wrapper exposes the same three.
+ReactiveKernels._sm_observation_cholesky_parts(value::_RKBatchedCholesky) =
+    (factors=value.factors, uplo=value.uplo, info=value.info)
 
 function ReactiveKernels._sm_materialize_observation(
         value::_RKBatchedCholesky,
@@ -1544,26 +1594,17 @@ function ReactiveKernels._replica_ad_call(
             arg = getfield(args, argument_index)
             position = findfirst(==(argument_index), B)
             position === nothing ? arg :
-                _replica_ad_dynamic_slice(arg, ReactiveKernels._replica_rank(
-                    ReactiveKernels.valtype(k.inputs[argument_index])), replica_index)
+                _rk_reactant_slot_read(arg, replica_index)
         end
         replica_point, replica_contexts = ReactiveKernels._ad_arguments(
             Val(active_selector), replica_args)
         replica_value, replica_gradient = ReactiveKernels._ad_prepared_value_and_gradient(
             prepared, replica_point, replica_contexts)
-        value_buffer = _replica_ad_write(value_buffer, replica_value, replica_index)
+        value_buffer = _rk_reactant_slot_write(value_buffer, replica_value, replica_index)
         gradient_buffers = _replica_ad_write_gradient(
             gradient_buffers, replica_gradient, replica_index)
     end
     value_buffer, gradient_buffers
-end
-
-# A single replica's slice of a batched argument, gathered at a traced index.
-function _replica_ad_dynamic_slice(arg, expected_rank, replica_index)
-    expected_rank == 0 && return Reactant.@allowscalar arg[replica_index]
-    slice_indices = ntuple(dimension -> dimension == ndims(arg) ?
-        replica_index : Colon(), ndims(arg))
-    Reactant.@allowscalar getindex(arg, slice_indices...)
 end
 
 _replica_ad_buffers(::Type{T}, shapes, element_type, replica_count) where {T<:Tuple} =
@@ -1575,26 +1616,12 @@ _replica_ad_buffers(::Type{T}, shapes, element_type, replica_count) where {T<:Nu
 _replica_ad_buffers(::Type{T}, shapes, element_type, replica_count) where {T<:AbstractArray} =
     copy(Reactant.Ops.constant(zeros(element_type, only(shapes)..., replica_count)))
 
-_replica_ad_index(replica_index) =
-    Reactant.promote_to(Reactant.TracedRNumber{Int64}, replica_index)
-_replica_ad_one() = Reactant.Ops.constant(Int64(1))
-
-function _replica_ad_write(buffer, value::Reactant.TracedRNumber, replica_index)
-    Reactant.Ops.dynamic_update_slice(
-        buffer, Reactant.Ops.broadcast_in_dim(value, Int64[], Int64[1]),
-        [_replica_ad_index(replica_index)])
-end
-function _replica_ad_write(buffer, value::Reactant.TracedRArray, replica_index)
-    Reactant.Ops.dynamic_update_slice(
-        buffer, Reactant.Ops.reshape(value, vcat(collect(Int64, size(value)), Int64[1])),
-        vcat([_replica_ad_one() for _ in 1:ndims(value)], [_replica_ad_index(replica_index)]))
-end
 _replica_ad_write_gradient(buffers::Tuple, gradient::Tuple, replica_index) =
     ntuple(component -> _replica_ad_write_gradient(
             buffers[component], gradient[component], replica_index),
         length(buffers))
 _replica_ad_write_gradient(buffer, gradient, replica_index) =
-    _replica_ad_write(buffer, gradient, replica_index)
+    _rk_reactant_slot_write(buffer, gradient, replica_index)
 
 # --- Reactant-compiled automatic differentiation -----------------------------
 # Selected by core's `compile_ad_gradient` / `compile_ad_value_and_gradient` when

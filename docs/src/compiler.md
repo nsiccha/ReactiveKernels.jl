@@ -602,9 +602,11 @@ a meaningful value is causal: its state stays in the fixed compiled ABI, and
 host feedback can affect a later transition only after an explicit barrier and
 re-entry as a separately typed input. A source-backed port with no written
 arguments and `Nothing` result has no causal channel, so the compiler generates
-a split kernel automatically. The Reactant region emits source-order records
-into fixed-capacity slots with a logical activity mask and count plus sticky
-overflow; ordinary Julia then calls
+a split kernel automatically. The compiled region writes source-order records
+into structure-of-arrays storage of fixed capacity: one column per numeric
+leaf of the declared record type with a trailing slot axis, a fill count, and
+a sticky overflow flag, written by one dynamic slot write per call site (the
+program never enumerates the capacity); ordinary Julia then calls
 `drain_observations!(transition, result)` after the compiled call returns. No
 `push!`, callback invocation, allocation-driven shape growth, or implicit host
 round trip occurs inside the compiled invocation, and callers may schedule the
@@ -706,12 +708,14 @@ array external values remain operands. This is the lowering the
 replication and predicated both-branch emission are no longer used for these
 methods.
 
-One residual remains on the bounded predicated path: a method whose control
-flow surrounds a host-drained observational callable (`drain_observations!`
-records). Its records are assembled per static call site on the host and the
-retained loop cannot yet carry them; a structured outbox lowering is tracked.
-Under the core constraints this residual is a limitation to remove, not an
-exception.
+Host-drained observational records (`drain_observations!`) travel in that
+loop carry as the structured outbox described above: the storage is seeded
+once before the loop from the record's declared type (a `__self__` argument
+records the whole state; static callable fields are carried by reference and
+restored from the compiler bindings at the drain), each call site writes the
+next slot lazily inside its block, and the fill count and overflow flag are
+scalar carry slots. Slots fill sequentially, so the drain replays `1:count` in
+emission order without an activity mask.
 
 The residual bounded path checks its finite allowance with an unsigned
 distance, which represents the mathematical distance even when signed

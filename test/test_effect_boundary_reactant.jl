@@ -73,7 +73,12 @@ _effects_trace(value) = value
 
     @test isempty(collector.counts)
     @test Int(result.outbox.callback.count) == 2
-    @test map(Bool, result.outbox.callback.active) == (true, true)
+    @test Array(result.outbox.callback.storage.arguments[1].count) == [0, 0]
+    # A static leaf crosses the compiled boundary as Reactant's copy of the
+    # object (its array field is traced); the drain restores callable
+    # identities from the compiler bindings, never from the record.
+    @test result.outbox.callback.storage.arguments[1].callback isa
+          _ReactantObservationCollector
     @test result.state.callback === collector
 
     receipt = fetch(@async drain_observations!(guarded, result))
