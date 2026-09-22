@@ -75,3 +75,19 @@ end
     @test count("stablehlo.if", hlo) >= 2
     @test !occursin("stablehlo.select", hlo)
 end
+
+@testset "reverse through a batched lazy branch: the upstream lane boundary" begin
+    # Reactant's batching pass unrolls a small plate per lane and realizes a
+    # larger one as a loop; Enzyme reverse through a lazy `if` inside that loop
+    # does not lower yet (`benchmark/repro_reactant_batch_if_reverse.jl`).
+    # The primal is lane-count independent either way. This locks the boundary
+    # so an upstream fix (or a shift of the threshold) is noticed here.
+    k = prepare(lazy_plate_guard; want = :total)
+    gradient(v) = Enzyme.gradient(Enzyme.Reverse, k, v)
+    small = [2.0, -1.0, 0.5, -3.0]
+    large = [2.0, -1.0, 0.5, -3.0, 1.5, -0.5]
+    compiled_small = Reactant.@compile gradient(_traced(small))
+    @test _host(only(compiled_small(_traced(small)))) ≈ [0.5, 0.0, 2.0, 0.0]
+    @test _host((Reactant.@compile k(_traced(large)))(_traced(large))) ≈ k(large)
+    @test_throws Reactant.CompilationError Reactant.@compile gradient(_traced(large))
+end

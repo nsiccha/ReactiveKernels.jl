@@ -55,3 +55,20 @@ iterated-sequence shape, including bound host sequences.
 The experimental rectangular PK path retains its loops and lazy branches but
 still fails reverse compilation. Its eager-branch and data-derived unrolling
 workarounds are not acceptable fixes. See the [scan limitations](scan.md).
+
+Two further backend limitations are isolated with standalone reproducers under
+`benchmark/` (Reactant and its AD engine only, no ReactiveKernels code):
+
+- A lazy branch inside a batched plate cell compiles and evaluates for every
+  lane count, but reverse compilation through it fails once the batching pass
+  realizes the plate as a loop (six lanes fail where four lanes, unrolled per
+  lane, succeed): `repro_reactant_batch_if_reverse.jl`. Plated support guards
+  therefore keep their authored branch and lose Reactant reverse gradients
+  above that size until the batched-loop branch lowers upstream; native
+  execution and native reverse are unaffected.
+- Reverse compilation through a retained `while` loop whose exit is data
+  dependent (the adaptive ODE solver's `(n < maxiters) & (t < t1)`) fails
+  because the loop has no statically known iteration count:
+  `repro_reactant_adaptive_while_reverse.jl`. The solver keeps the retained
+  loop; its supported gradient is the backsolve adjoint, which differentiates
+  only the loop-free right-hand side.

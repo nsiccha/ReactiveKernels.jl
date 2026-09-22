@@ -31,15 +31,17 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # Stan's O(K) pivot-coordinate transform, inlined because it is new to this
     # example. It maps K - 1 free coordinates to K effects with zero sum.
     # Vectorized: `w[i] = y[i] / sqrt(i (i + 1))`, the running sum from the
-    # top is a reverse cumulative sum, and each `constrained[i + 1]` is the
-    # running sum at `i` minus `(i + 1) w[i]`; the last entry is the tail of
-    # that rule and the first is the full sum.  No loop over the (data-derived)
-    # number of free coordinates reaches a tensorizing backend.
+    # top is the suffix sum `sum(w) - cumsum(w) + w` (spelled without
+    # `reverse`, whose traced lowering reverses its input buffer in place),
+    # and each `constrained[i + 1]` is the running sum at `i` minus
+    # `(i + 1) w[i]`; the last entry is the tail of that rule and the first
+    # is the full sum.  No loop over the (data-derived) number of free
+    # coordinates reaches a tensorizing backend.
     effects_s2z::AbstractVector{Float64} = let
         nfree = length(effects_free)
         index = 1:nfree
         w = effects_free ./ sqrt.(index .* (index .+ 1))
-        running = reverse(cumsum(reverse(w)))
+        running = sum(w) .- cumsum(w) .+ w
         tail = running .- (index .+ 1) .* w
         vcat(running[1], tail)
     end

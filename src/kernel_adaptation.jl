@@ -9004,8 +9004,10 @@ function _functional_state_machine_method(
                 getfield($carry_arg, :state), $(QuoteNode(name))))
             logical = if haskey(field_regs, name) &&
                     field_regs[name] isa _StructuredStatePort
-                :(_sm_structured_carry_load(
-                    getfield(ports, $(QuoteNode(name))), $carried))
+                :(_sm_structured_carry_restore(
+                    getfield(ports, $(QuoteNode(name))),
+                    _sm_structured_carry_load(
+                        getfield(ports, $(QuoteNode(name))), $carried)))
             else
                 carried
             end
@@ -9551,8 +9553,10 @@ function _functional_state_machine_method(
                 getfield($finished, :state), $(QuoteNode(name)))))
             output = if haskey(field_regs, name) &&
                     field_regs[name] isa _StructuredStatePort
-                :(_sm_structured_carry_load(
-                    getfield(ports, $(QuoteNode(name))), $carried))
+                :(_sm_structured_carry_restore(
+                    getfield(ports, $(QuoteNode(name))),
+                    _sm_structured_carry_load(
+                        getfield(ports, $(QuoteNode(name))), $carried)))
             else
                 carried
             end
@@ -10846,6 +10850,16 @@ end
 
 _sm_structured_carry_load(port::_StructuredStatePort, value) =
     _sm_structured_carry_load(port, value, Val(false))
+
+# A backend's retained loop or branch dispatch may hand a structured carry
+# back with a logical wrapper erased (a traced `Diagonal` metric returns as
+# its backing array).  Before a loaded state reaches source code again,
+# restore the source wrappers from the port's frozen initial value — the same
+# wrapper schema the reusable-port boundary applies — without re-validating
+# the topology the carry store already isolated.
+@inline _sm_structured_carry_restore(port::_StructuredStatePort, value) =
+    _sm_restore_source_logical_wrappers(
+        getfield(getfield(port, :transition), :initial), value)
 
 @generated function _sm_structured_carry_load(
         port::_StructuredStatePort{T}, value, ::Val{OmitStatic}) where {T,OmitStatic}

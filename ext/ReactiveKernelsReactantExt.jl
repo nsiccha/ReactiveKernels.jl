@@ -92,6 +92,24 @@ function Reactant.traced_type_inner(
     T
 end
 
+# A runtime-generated function is static program structure: its `body` is an
+# `Expr` whose `GlobalRef`s carry `Core.Binding` back-references (a cycle the
+# generic tracer does not terminate on), and it never holds a traced operand.
+# A retained loop's body closure captures the compiled step as a value, and
+# `@trace while` hands every captured value to the tracer, so shield it here.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels.RuntimeGeneratedFunctions.RuntimeGeneratedFunction,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels.RuntimeGeneratedFunctions.RuntimeGeneratedFunction}
+    T
+end
+
 # The externalized call owns only generated code, the stripped operation
 # table, and static slot indices. Hidden bound arrays are separate traced
 # operands, so traversing this compiler structure would be both unnecessary
@@ -835,6 +853,22 @@ end
         value.uplo, value.info)
 end
 
+# A traced `Diagonal` that crossed a retained loop or a branch dispatch comes
+# back erased: the backing vector, or the materialized dense matrix.  Restore
+# the source wrapper from its schema (the port's frozen initial value).
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::LinearAlgebra.Diagonal, value::Reactant.TracedRArray{T,1}) where {T} =
+    LinearAlgebra.Diagonal(value)
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::LinearAlgebra.Diagonal, value::Reactant.TracedRArray{T,2}) where {T} =
+    LinearAlgebra.Diagonal(LinearAlgebra.diag(value))
+# A batched Cholesky already IS the traced representation of a source
+# Cholesky; its traced `info` is not host metadata to compare against.
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::LinearAlgebra.Cholesky, value::_RKBatchedCholesky) = value
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::_RKBatchedCholesky, value::_RKBatchedCholesky) = value
+
 # A structured-state port is the same immutable program resource plus its
 # generated repair table.  Standalone generic structured operations may
 # capture the port directly; its endpoint state remains dynamic only when
@@ -901,6 +935,15 @@ end
         array::Reactant.TracedRArray{T,1},
         index::Reactant.TracedRNumber{I}) where {T,I<:Integer}
     Reactant.@allowscalar array[index[]]
+end
+
+# A HOST vector read at a traced index (a bound table kept concrete inside a
+# traced plate cell, such as the cut points of an ordered-logistic cell
+# gathered at the observed class) is a constant table of the traced program:
+# lift it and gather, exactly like the state machine's host-column read.
+@inline function ReactiveKernels._tensorized_getindex(
+        array::Array{T,1}, index::Reactant.TracedRNumber{I}) where {T,I<:Integer}
+    Reactant.@allowscalar Reactant.promote_to(Reactant.TracedRArray{T,1}, array)[index[]]
 end
 
 # A CONCRETE-integer scalar index `q[i]` on a traced vector cannot lower:
@@ -1070,6 +1113,26 @@ _recurrence_trace(x) = x
 _recurrence_trace(x::Tuple) = map(_recurrence_trace, x)
 _recurrence_trace(x::NamedTuple) = map(_recurrence_trace, x)
 _recurrence_trace(x::AbstractArray) = Reactant.promote_to(Reactant.TracedRArray, x)
+# A `Diagonal` rides a retained loop as its backing vector — never as the
+# dense matrix `promote_to` would materialize — and is rebuilt from the
+# pre-loop schema (`_sm_restore_source_logical_wrappers`) before source code
+# reads the carry, so the loop's argument and result types agree.
+_recurrence_trace(x::LinearAlgebra.Diagonal) = _recurrence_trace(x.diag)
+
+# The wrapper schema of a carry: its recursive shape with every leaf erased
+# (no traced value is captured by the loop body through it, so nothing
+# aliases the carried tracers) and each source wrapper replaced by a marker
+# that `_sm_restore_source_logical_wrappers` rebuilds from the erased leaf.
+struct _DiagonalSchema end
+_carry_schema(::LinearAlgebra.Diagonal) = _DiagonalSchema()
+_carry_schema(x::Tuple) = map(_carry_schema, x)
+_carry_schema(x::NamedTuple) = map(_carry_schema, x)
+_carry_schema(x) = nothing
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::_DiagonalSchema, value::AbstractVector) = LinearAlgebra.Diagonal(value)
+ReactiveKernels._sm_restore_source_logical_wrappers(
+        ::_DiagonalSchema, value::AbstractMatrix) =
+    LinearAlgebra.Diagonal(LinearAlgebra.diag(value))
 _recurrence_trace(x::T) where {T<:Number} =
     Reactant.promote_to(Reactant.TracedRNumber{T}, x)
 _recurrence_trace(x::Reactant.TracedRNumber) = copy(x)
@@ -1077,14 +1140,20 @@ _recurrence_trace(x::Reactant.TracedRNumber) = copy(x)
 function ReactiveKernels._rectangular_fold_impl(
         marker::Reactant.TracedType, step, init, columns, shared, n)
     n == 0 && return init
+    # `init` doubles as the wrapper schema of the carry (see
+    # `_sm_transition_loop_backend`): the loop carries backing arrays and the
+    # step sees the source wrappers.
+    schema = _carry_schema(init)
     carry = _recurrence_trace(init)
     data = _recurrence_trace(columns)
     args = _recurrence_trace(shared)
     Reactant.@trace for i in 1:n
         row = Reactant.@allowscalar map(c -> c[i], data)
-        carry = _recurrence_trace(step(carry, row, args...))
+        carry = _recurrence_trace(step(
+            ReactiveKernels._sm_restore_source_logical_wrappers(schema, carry),
+            row, args...))
     end
-    carry
+    ReactiveKernels._sm_restore_source_logical_wrappers(schema, carry)
 end
 
 # A functional state transition's captured `Base.Colon` loop: the body
@@ -1094,11 +1163,18 @@ end
 # identity (`_recurrence_trace`).
 function ReactiveKernels._sm_transition_loop_backend(
         ::Reactant.TracedType, body, ensures, controls, range, carry::Tuple)
+    # The pre-loop carry keeps the source wrappers (a `Diagonal` metric); the
+    # retained loop carries their backing arrays.  Restore the wrappers from
+    # the leaf-free schema before the body — the source program — reads the
+    # carry again, and once more for the final carry.
+    schema = _carry_schema(carry)
     carry = _recurrence_trace(carry)
     Reactant.@trace track_numbers = false for index in range
-        carry = body(ensures, controls, carry, index)
+        carry = _recurrence_trace(body(ensures, controls,
+            ReactiveKernels._sm_restore_source_logical_wrappers(schema, carry),
+            index))
     end
-    carry
+    ReactiveKernels._sm_restore_source_logical_wrappers(schema, carry)
 end
 
 function ReactiveKernels._recurrence_branch(
