@@ -79,8 +79,11 @@ end
         values = (_LWO_F, [1.0, 2.0], [-0.5, -1.0], nothing, 0.0, 0.1, _LWO_C)
         reference = prepared(values...)
         @test _bitwise_equal(compile(ast)(ops, values...), reference)
+        # Julia 1.12+ enforces the world age of bindings created by `Core.eval`;
+        # call the freshly eval'd function in the latest world.
         @test _bitwise_equal(
-            Core.eval(@__MODULE__, ast)(ops, values...), reference)
+            Base.invokelatest(Core.eval(@__MODULE__, ast), ops, values...),
+            reference)
     end
 
     @testset "keyword forms on an authored plate" begin
