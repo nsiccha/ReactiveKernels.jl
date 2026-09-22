@@ -82,16 +82,6 @@
     "source_commit": "7fdbf6b7c4f8fe970752cbf8c9229c1b526591c7"
   },
   "K10": "not attempted",
-  "standalone_reverse_reproducer": {
-    "file": "repro_rectangular_reverse_standalone.jl",
-    "baseline_commit": "9b129af9fd63106a34a43e35deae4d91a17a9181",
-    "exit_code": 1,
-    "log": "kb-run-compact.hdreP1",
-    "process_wall_s": 81.71,
-    "peak_rss_kib": 1342016,
-    "error": "had set op which was not a direct descendant",
-    "note": "Contains its own recurrence helpers and uses only baseline RK/PPL math. Process includes first-use package loading."
-  },
   "acceptance_batches": [
     {
       "log": "kb-run-compact.AFtZ0Y",
@@ -105,5 +95,84 @@
       "exit_code": 0,
       "coverage": "opt-in PK/default restoration, existing PK cells, joint emitter including native/compiled AD"
     }
-  ]
+  ],
+  "upstream_mwe": {
+    "file": "repro_reactant_while_reverse.jl",
+    "imports": [
+      "Reactant",
+      "Enzyme"
+    ],
+    "environment": "fresh public-only environment; no RK packages or developed paths",
+    "shape": 6,
+    "primal": 20.0,
+    "expected_gradient": [
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "exit_code": 1,
+    "error": "had set op which was not a direct descendant",
+    "process_wall_s": 24.9,
+    "peak_rss_kib": 1123152,
+    "log": "kb-run-compact.6p4LeU",
+    "control_log": "kb-run-compact.pr6zoI",
+    "latest_repeat": {
+      "reactant": "0.2.286",
+      "enzyme": "0.13.204",
+      "reactant_jll": "0.0.408+0",
+      "exit_code": 1,
+      "same_error": true,
+      "process_wall_s": 22.39,
+      "peak_rss_kib": 1123292,
+      "log": "kb-run-compact.y7Pvdr",
+      "control_log": "kb-run-compact.6BnJH8",
+      "controls": {
+        "native_enzyme_gradient": [
+          0.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "n3_primal": 5.0,
+        "n3_gradient": [
+          0.0,
+          1.0,
+          1.0
+        ],
+        "n3_unoptimized_while_if": [
+          1,
+          1
+        ],
+        "n6_unoptimized_while_if": [
+          1,
+          1
+        ],
+        "branch_free_n6_gradient": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    }
+  },
+  "historical_rk_dependent_reproducer": {
+    "file": "repro_rectangular_reverse_standalone.jl",
+    "baseline_commit": "9b129af9fd63106a34a43e35deae4d91a17a9181",
+    "exit_code": 1,
+    "log": "kb-run-compact.hdreP1",
+    "process_wall_s": 81.71,
+    "peak_rss_kib": 1342016,
+    "error": "had set op which was not a direct descendant",
+    "note": "Contains its own recurrence helpers and uses only baseline RK/PPL math. Process includes first-use package loading.",
+    "status": "superseded by upstream_mwe; historical file removed",
+    "source_commit": "3b04585925ff40a126a939a781de92e4388c0578"
+  }
 }

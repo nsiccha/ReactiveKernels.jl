@@ -13,17 +13,11 @@ new path automatically and passes reverse parity. CPU fusion stays enabled.
 
 ## Required semantics
 
-Do not statically or trace-time unroll loops whose trip count comes from data,
-including bound data known during preparation or compilation. This applies to
-subject/operation counts and to the binary-power capacity derived from the
-maximum dose count. Both must remain real loops or equivalent batched-array
-operations. Fixed structural compartment algebra is separate from these counts.
-
-Preserve lazy branch semantics. Replacing branches with eager `ifelse` solely
-to bypass a compiler failure is not an accepted solution. Ordinary elementwise
-selection with safely computed operands remains a valid numerical operation.
-The proposed predicated step with a data-derived unrolled power chain has not
-been adopted.
+The repository-wide [core constraints](../../docs/src/constraints.md) apply:
+retain data-derived iteration and required lazy control flow. Here this includes
+subject/operation counts and the binary-power capacity computed from maximum
+dose count. The proposed predicated step with a data-derived unrolled power
+chain was withdrawn and has not been adopted.
 
 ## Representation and lowering
 
@@ -91,7 +85,7 @@ CPU fusion is the acceptance path. No K=10 measurement precedes stable K=3.
 ## Reverse blocker
 
 Tracked in [ReactiveKernels #13](https://github.com/nsiccha/ReactiveKernels.jl/issues/13),
-including the full standalone reproducer and environment setup.
+with an RK-free upstream reproducer in `repro_reactant_while_reverse.jl`.
 
 Reactant 0.2.285 reports `had set op which was not a direct descendant` while
 processing an `enzyme.set` in the PK recurrence. The joint K=1 reverse process
@@ -153,11 +147,32 @@ Run `repro_rectangular_reverse.jl` directly in the same environment for the
 focused expected failure. Do not launch the full joint reverse or K=3 reverse
 again until that reproducer compiles and its gradient matches a native oracle.
 
-`repro_rectangular_reverse_standalone.jl` contains the recurrence helpers inline
-and needs only the public PK math. It was also verified against the original RK
-baseline `9b129af9fd63106a34a43e35deae4d91a17a9181`: same diagnostic, exit 1,
-81.71 s whole-process wall, 1,342,016 KiB peak RSS, including first-use loading.
-This version can be shared upstream without publishing the experimental branch.
+`repro_reactant_while_reverse.jl` reduces the same diagnostic to one scalar
+conditional sum: a traced loop over six values, with a lazy branch that skips
+the first. It imports only Reactant and Enzyme. There are no RK helpers, PK
+equations, operation tables, nested loops, or output buffers. Primal compilation
+returns the correct sum; reverse compilation fails before producing a gradient.
+This replaces the larger RK-dependent example, which was not a minimal upstream
+reproducer.
+
+The exact file was verified in fresh public-only environments containing no RK
+package or developed path. Reactant 0.2.285 / Reactant_jll 0.0.407+0 exits 1 after
+24.90 s at 1,123,152 KiB peak RSS. Reactant 0.2.286 / Reactant_jll 0.0.408+0 also
+fails with the same diagnostic (22.39 s; 1,123,292 KiB). Both use Enzyme 0.13.204
+and Julia 1.10.11. Related three-element conditional and six-element branch-free
+controls compile with correct gradients. These controls narrow the observed
+failure; they do not establish that every loop containing a branch fails.
+
+To share the reproducer, copy that single Julia file and create a public-only
+environment; no RK checkout or experimental branch is required:
+
+```sh
+julia --startup-file=no --project=mwe-env -e 'using Pkg; Pkg.add([
+    PackageSpec(name="Reactant", version="0.2.286"),
+    PackageSpec(name="Enzyme", version="0.13.204"),
+    PackageSpec(name="Reactant_jll", version="0.0.408")])'
+julia --startup-file=no --project=mwe-env repro_reactant_while_reverse.jl
+```
 
 The final branch acceptance batches pass 582 assertions covering the generic
 fold, lazy branches, nadir reverse, existing authored scan, native joint parity,
