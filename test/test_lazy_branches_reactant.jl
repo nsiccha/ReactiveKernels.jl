@@ -89,5 +89,5 @@ end
     compiled_small = Reactant.@compile gradient(_traced(small))
     @test _host(only(compiled_small(_traced(small)))) ≈ [0.5, 0.0, 2.0, 0.0]
     @test _host((Reactant.@compile k(_traced(large)))(_traced(large))) ≈ k(large)
-    @test_throws Reactant.CompilationError Reactant.@compile gradient(_traced(large))
+    @test_throws Reactant.Compiler.CompilationError Reactant.@compile gradient(_traced(large))
 end

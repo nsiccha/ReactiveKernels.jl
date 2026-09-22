@@ -51,7 +51,7 @@ _ord_prepared(X, y) = prepare(_ord_glm_reactant;
         @test all(isfinite, g_native)
     end
     gradient(b) = Enzyme.gradient(Enzyme.Reverse, k, b)
-    @test_throws Reactant.CompilationError Reactant.@compile gradient(_traced(_GLM_R_BETA))
+    @test_throws Reactant.Compiler.CompilationError Reactant.@compile gradient(_traced(_GLM_R_BETA))
 end
 
 @testset "the GLM program does not grow with the observation count" begin
@@ -71,16 +71,14 @@ end
         bound = (; X = _GLM_R_X, y = _GLM_R_Y, cuts = _GLM_R_CUTS))
     compiled_p = Reactant.@compile kp(_traced(_GLM_R_BETA))
     @test _host(compiled_p(_traced(_GLM_R_BETA))) ≈ kp(_GLM_R_BETA)
+    # The weight cell with every operand traced (data included).
     kw = prepare(extract(ordered_logistic_glm;
-        have = (:X, :beta, :cuts), want = :working_weights,
-        bound = (; X = _GLM_R_X, cuts = _GLM_R_CUTS)))
-    compiled_w = Reactant.@compile kw(_traced(_GLM_R_BETA))
-    @test _host(compiled_w(_traced(_GLM_R_BETA))) ≈ kw(_GLM_R_BETA)
+        have = (:X, :beta, :cuts), want = :working_weights))
+    args = (_traced(_GLM_R_X), _traced(_GLM_R_BETA), _traced(_GLM_R_CUTS))
+    compiled_w = Reactant.@compile kw(args...)
+    @test _host(compiled_w(args...)) ≈ kw(_GLM_R_X, _GLM_R_BETA, _GLM_R_CUTS)
     # A saturated row has zero variance: weight exactly 0, no 0/0.
-    saturated = [1.0 800.0]
-    ks = prepare(extract(ordered_logistic_glm;
-        have = (:X, :beta, :cuts), want = :working_weights,
-        bound = (; X = saturated, cuts = _GLM_R_CUTS)))
-    compiled_s = Reactant.@compile ks(_traced([0.0, 1.0]))
-    @test _host(compiled_s(_traced([0.0, 1.0]))) == [0.0]
+    saturated = (_traced([1.0 800.0]), _traced([0.0, 1.0]), _traced(_GLM_R_CUTS))
+    compiled_s = Reactant.@compile kw(saturated...)
+    @test _host(compiled_s(saturated...)) == [0.0]
 end
