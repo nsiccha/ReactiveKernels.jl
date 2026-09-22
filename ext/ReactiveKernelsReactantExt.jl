@@ -425,6 +425,18 @@ end
     Reactant.@allowscalar getindex(array, indices...)
 end
 
+# A HOST column read at a traced slot index (a bound structural container or
+# frame column beside a traced program) is a constant table of the traced
+# program: lift it and gather, instead of enumerating its capacity with a
+# select chain.  All-concrete indices keep the ordinary host read.
+@inline function ReactiveKernels._sm_functional_index(
+        array::Array, indices::Vararg{Union{Colon,Reactant.TracedRNumber}})
+    any(index -> index isa Reactant.TracedRNumber, indices) ||
+        return getindex(array, indices...)
+    Reactant.@allowscalar getindex(
+        Reactant.promote_to(Reactant.TracedRArray, array), indices...)
+end
+
 @inline function ReactiveKernels._sm_functional_indexed_copy(
         array::Reactant.TracedRArray, value, indices...)
     Reactant.@allowscalar begin
