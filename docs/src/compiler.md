@@ -682,23 +682,36 @@ flattened buffer ABI cannot represent Julia object identity. Straight-line and
 state-machine gates both prove valid repeated execution, identity-preserving
 outputs, and rejection of an independently converted counterfeit alias.
 
-Nonrecursive unit-range loops in methods with void returns retain one generated
-body when their observational effects have functional lowerings. Native execution
-uses an ordinary loop; Reactant receives a traced while-region. Compilation does
-not duplicate that body for each permitted iteration. Lexical locals, early
-returns, structured aliases, and effect state travel through the generated loop
-operands. Validated external callable identities are recovered from compiler
-bindings rather than copied through those operands; numeric and array external
-values remain operands. Methods with value returns or host-drained observational records retain
-the existing bounded unrolling path. Where its allowance derives from data,
-that path violates the [core constraints](constraints.md) and requires retained
-control flow or explicit rejection; it is not an exception to the rule.
+Every structured state-machine method with authored control flow — branches,
+guards, short circuits, `for` and `while` loops — lowers through the control
+program: the method's CFG becomes a set of blocks, and one retained loop
+(native `while`; a `stablehlo.while` region under Reactant) dispatches exactly
+one block per step by its (method, pc) address (`stablehlo.case` under
+Reactant). A branch therefore evaluates only its taken side and a loop body is
+emitted once, whatever the admitted iteration count; each loop carries a
+counter checked against `max_iterations`, and exceeding it sets control
+overflow and rolls the transition back, exactly as before. Returned values
+travel in the root frame, so value-returning methods take the same path.
+Lexical locals, early returns, structured aliases, and effect state travel
+through the loop carry. Validated external callable identities are recovered
+from compiler bindings rather than copied through those operands; numeric and
+array external values remain operands. This is the lowering the
+[core constraints](constraints.md) require; the earlier per-iteration
+replication and predicated both-branch emission are no longer used for these
+methods.
 
-The retained loop checks its finite allowance with an unsigned distance, which
-represents the mathematical distance even when signed subtraction wraps. Its
-successor step stays in the authored integer type and runs only below the upper
-bound. The unrolled path uses guarded successor probes. Both preserve the
-explicit overflow/rollback result at extreme bounds and with small integers.
+One residual remains on the bounded predicated path: a method whose control
+flow surrounds a host-drained observational callable (`drain_observations!`
+records). Its records are assembled per static call site on the host and the
+retained loop cannot yet carry them; a structured outbox lowering is tracked.
+Under the core constraints this residual is a limitation to remove, not an
+exception.
+
+The residual bounded path checks its finite allowance with an unsigned
+distance, which represents the mathematical distance even when signed
+subtraction wraps, and uses guarded successor probes; the control program's
+loop counters and the residual path both preserve the explicit
+overflow/rollback result at extreme bounds and with small integers.
 
 Ordered RNG is one typed internal effect authority. Authored kernels keep the
 ordinary Julia expressions `Random.randn!(rng, destination)`,

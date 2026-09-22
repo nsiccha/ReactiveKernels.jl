@@ -44,10 +44,11 @@ Julia statement count alone does not establish this: tracing can still expand
 a host loop.
 
 These are required constraints, not a claim that every existing path already
-conforms. Known gaps include legacy bounded stateful unrolling when its bounds
-derive from data; the [compiler](compiler.md) page describes its present
-behavior. Such paths require retained control flow or explicit rejection; their
-current behavior is not an exception or a template for new implementations. The
+conforms. The known residual gap is the bounded stateful path kept for a
+method whose control flow surrounds a host-drained observational callable; the
+[compiler](compiler.md) page describes it. Such paths require retained control
+flow or explicit rejection; their current behavior is not an exception or a
+template for new implementations. The
 Reactant [scan](scan.md) lowering retains one `while` loop for every
 iterated-sequence shape, including bound host sequences.
 

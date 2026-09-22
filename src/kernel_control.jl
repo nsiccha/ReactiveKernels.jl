@@ -38,8 +38,11 @@ mutable struct BB
     blks::Vector{Blk}
     next::Int
     lower_all_loops::Bool
+    mark_returns::Bool
 end
-BB(blks::Vector{Blk}, next::Int) = BB(blks, next, false)
+BB(blks::Vector{Blk}, next::Int) = BB(blks, next, false, false)
+BB(blks::Vector{Blk}, next::Int, lower_all_loops::Bool) =
+    BB(blks, next, lower_all_loops, false)
 _newpc!(bb) = (p = bb.next; bb.next += 1; p)
 
 # A lowered loop needs its own induction binding. Acyclic callees are inlined
@@ -168,6 +171,11 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
             if v !== nothing
                 push!(eff, ret_val !== nothing ? _LocalAssign((_retvalsym(ret_val),), v) : _ExprStmt(v))
             end
+            # A method-level `return` (ret_pc == 0) is an EXPLICIT return; a
+            # builder that asks for it (`mark_returns`) records it so
+            # `returned` distinguishes it from falling off the end of the
+            # body, which also continues at pc 0.
+            bb.mark_returns && ret_pc == 0 && push!(eff, _RawStmt((:explicit_return,)))
             pc = _newpc!(bb); push!(bb.blks, Blk(pc, eff, TGoto(ret_pc))); return pc
         end
     elseif st isa _SetReturn
@@ -225,10 +233,18 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
         condition = bb.lower_all_loops ?
             _RawCond((:bounded_for, var, hi, counter)) : _RawCond((var, hi))
         push!(bb.blks, Blk(header, Any[], TBranch(condition, body, after)))                           # if var <= hi
-        increments = bb.lower_all_loops ?
-            Any[_RawStmt((:incr, var)), _RawStmt((:incr, counter))] :
-            Any[_RawStmt((:incr, var))]
-        push!(bb.blks, Blk(incr, increments, TGoto(header)))                                         # var += 1
+        if bb.lower_all_loops
+            # The induction variable advances only while it is strictly below
+            # the authored upper bound: a range ending at `typemax` must exit
+            # after its last iteration instead of wrapping and re-entering.
+            step = _newpc!(bb)
+            push!(bb.blks, Blk(incr, Any[],
+                TBranch(_RawCond((:for_successor, var, hi)), step, after)))                       # if var < hi
+            push!(bb.blks, Blk(step,
+                Any[_RawStmt((:incr, var)), _RawStmt((:incr, counter))], TGoto(header)))          # var += 1
+        else
+            push!(bb.blks, Blk(incr, Any[_RawStmt((:incr, var))], TGoto(header)))                    # var += 1
+        end
         init_effects = bb.lower_all_loops ?
             Any[_RawStmt((:init, var, lo)),
                 _RawStmt((:init, counter, _Lit(0)))] :
@@ -273,9 +289,13 @@ end
 _retvalsym(v) = v  # ret_val is already the native local Symbol
 _lasym(lhs) = lhs isa Tuple ? Symbol(lhs[end]) : Symbol(lhs)   # _LocalAssign.lhs path -> local Symbol
 
-function build_method(ir, by_mid, rec; lower_all_loops::Bool=false)
-    bb = BB(Blk[], 1, lower_all_loops)
-    entry = build_region!(bb, collect(Any, ir.body), 0, 0, nothing, by_mid, rec)
+# `ret_val` names the local that receives the method's returned value: a
+# root whose authored `return v` must survive the control loop binds `v` to
+# that local (a spilled frame column) instead of discarding it.
+function build_method(ir, by_mid, rec; lower_all_loops::Bool=false,
+                      ret_val=nothing, mark_returns::Bool=false)
+    bb = BB(Blk[], 1, lower_all_loops, mark_returns)
+    entry = build_region!(bb, collect(Any, ir.body), 0, 0, ret_val, by_mid, rec)
     sort!(bb.blks, by = b -> b.pc)
     (entry = entry, blks = bb.blks)
 end
@@ -375,6 +395,7 @@ function emit_effect(st, locals, S)
             Expr(:while, emit_val(wr.cond, locals, S), Expr(:block, bodyx...))
         elseif e isa Tuple && e[1] === :init;  Expr(:(=), lv(e[2]), emit_val(e[3], locals, S))    # var = lo
         elseif e isa Tuple && e[1] === :incr; Expr(:(=), lv(e[2]), Expr(:call, +, lv(e[2]), 1))   # var += 1
+        elseif e isa Tuple && e[1] === :explicit_return; :(nothing)   # bookkeeping marker for the functional emitter only
         else error("emit_effect: unsupported _RawStmt $(e)") end
     else
         error("emit_effect: unsupported $(typeof(st))")
@@ -740,8 +761,14 @@ end
 # The root is framed even when it is acyclic.  That gives a backend one uniform
 # entry/return protocol for a plain data-dependent loop as well as recursive
 # control.  Truly acyclic sibling callees remain inlined by `build_method`.
+# Only framed methods the root can reach through call edges become program
+# methods: an unrelated recursive SCC elsewhere in the skeleton has no call
+# site that could type its frame, and no block of it can ever be dispatched.
+# `root_return` names the root's returned-value local (see `build_method`).
 function _control_program_from_irs(irs0; root_mid::Int,
-                                   lower_all_loops::Bool=false)
+                                   lower_all_loops::Bool=false,
+                                   root_return=nothing,
+                                   mark_returns::Bool=false)
     irs = Tuple(irs0)
     by_mid = Dict{Int,Any}(ir.id.decl => ir for ir in irs)
     haskey(by_mid, root_mid) || throw(ArgumentError(
@@ -749,7 +776,18 @@ function _control_program_from_irs(irs0; root_mid::Int,
 
     framed = defunctionalized_mids(irs)
     push!(framed, root_mid)
-    methods = sort!(collect(framed))
+    adjacency = Dict{Int,Vector{Int}}(ir.id.decl => _call_edges(ir) for ir in irs)
+    reachable = Set{Int}([root_mid])
+    pending = Int[root_mid]
+    while !isempty(pending)
+        mid = pop!(pending)
+        for callee in get(adjacency, mid, Int[])
+            callee in reachable && continue
+            push!(reachable, callee)
+            push!(pending, callee)
+        end
+    end
+    methods = sort!(collect(mid for mid in framed if mid in reachable))
     midpos = Dict(m => i for (i, m) in enumerate(methods))
     names = Dict(m => by_mid[m].id.name for m in methods)
     entries = Dict{Int,Int}()
@@ -758,7 +796,9 @@ function _control_program_from_irs(irs0; root_mid::Int,
     stored = Dict{Int,Tuple{Vararg{Symbol}}}()
     formal_positions = Dict{Int,Dict{Symbol,Int}}()
     for mid in methods
-        cfg = build_method(by_mid[mid], by_mid, framed; lower_all_loops)
+        cfg = build_method(by_mid[mid], by_mid, framed; lower_all_loops,
+                           ret_val=mid == root_mid ? root_return : nothing,
+                           mark_returns)
         built[mid] = cfg
         entries[mid] = cfg.entry
         cfg_locals = Symbol[]
@@ -791,8 +831,12 @@ function _control_program_from_irs(irs0; root_mid::Int,
     for mid in methods
         for block in sort(built[mid].blks; by = x -> x.pc)
             term = block.term
+            effects = mid == root_mid ? block.effects : Any[
+                effect for effect in block.effects
+                if !(effect isa _RawStmt && effect.expr isa Tuple &&
+                     first(effect.expr) === :explicit_return)]
             common = (; mid, name=names[mid], pc=block.pc,
-                effects=Tuple(block.effects),
+                effects=Tuple(effects),
                 writes=Tuple(_block_writes(block.effects, Set(spilled[mid]))),
                 midpos=midpos[mid])
             if term isa TRet
@@ -831,14 +875,15 @@ function _control_program_from_irs(irs0; root_mid::Int,
 end
 
 function _control_program(skel; root_name::Symbol,
-                          lower_all_loops::Bool=false)
+                          lower_all_loops::Bool=false, root_return=nothing,
+                          mark_returns::Bool=false)
     irs = method_irs(skel)
     roots = [ir.id.decl for ir in irs if ir.id.name === root_name]
     length(roots) == 1 || throw(ArgumentError(
         "control-program root `$root_name` must resolve to exactly one captured method; " *
         "found $(length(roots))"))
     _control_program_from_irs(
-        irs; root_mid=only(roots), lower_all_loops)
+        irs; root_mid=only(roots), lower_all_loops, root_return, mark_returns)
 end
 
 # substitute positional formals with the call's actual arg expressions throughout a node tree.
