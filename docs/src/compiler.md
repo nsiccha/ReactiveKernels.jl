@@ -311,6 +311,10 @@ The same transform accepts a scalar `PreparedADKernel`. `replica(ad; batched =
 :position)` slices each selected HAVE, runs the scalar reverse pass, and stacks
 the objective and active-port gradient along the replica axis. The scalar AD
 preparation remains the derivative authority; it is not re-prepared per replica.
+Under Reactant the replica axis is one retained loop: each iteration gathers
+its replica's slices dynamically, differentiates once, and writes the value and
+gradient into preallocated buffers, so the emitted program is independent of
+the replica count (the batching primitive cannot yet carry a reverse pass).
 See [Position batching](position-batching.md) for the full public contract.
 
 ## Incremental and compiled reactive execution
