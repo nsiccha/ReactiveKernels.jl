@@ -5,8 +5,11 @@
 # (`packages/ReactiveKernelsReactantODESolvers`): integrate until the span
 # is covered, bounded by an iteration cap. The primal compiles and runs; the
 # reverse pass fails inside Reactant's Enzyme lowering because the `while`
-# op has no statically known iteration count. The recorded failure text is
-# at the bottom of this file.
+# op has no statically known iteration count. Recorded failure (strato2,
+# Reactant 0.2.284 / Enzyme 0.13, 2026-09-22):
+#   CompilationError: MLIR pass pipeline "all" failed
+#   error: WhileOp does not have known iteration count for cache removal
+#   (raised from Reactant/src/ControlFlow.jl while_loop)
 using Reactant, Enzyme
 
 function integrate(p)
