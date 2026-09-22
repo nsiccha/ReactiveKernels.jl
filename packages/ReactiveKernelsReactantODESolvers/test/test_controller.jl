@@ -81,25 +81,25 @@ end
     @test all(iszero, weights)
 end
 
-@testset "saveat column emission" begin
+@testset "saveat buffer emission" begin
     tab = RKRO.Tsit5Tableau{Float64}()
     dense = RKRO.Tsit5DenseCoefficients{Float64}()
     uprev = [1.0, 3.0]
     k1 = lotka_volterra(uprev, LOTKA_PARAMS, 0.0)
     step = RKRO.tsit5_step(lotka_volterra, uprev, k1, LOTKA_PARAMS, 0.0, 0.1,
         tab, 1e-6, 1e-3)
-    blank = (zeros(2), zeros(2), zeros(2))
-    saveat = (0.03, 0.07, 0.5)
+    blank = zeros(2, 3)
+    saveat = [0.03, 0.07, 0.5]
 
-    cols = RKRO._emit_saveat_cols(blank, saveat, uprev, step.k, 0.0, 0.1,
+    out = RKRO._emit_saveat(blank, saveat, uprev, step.k, 0.0, 0.1,
         0.0, 0.1, true, dense)
-    @test cols[1] ≈ RKRO.tsit5_dense_eval(uprev, step.k, 0.1, 0.3, dense)
-    @test cols[2] ≈ RKRO.tsit5_dense_eval(uprev, step.k, 0.1, 0.7, dense)
+    @test out[:, 1] ≈ RKRO.tsit5_dense_eval(uprev, step.k, 0.1, 0.3, dense)
+    @test out[:, 2] ≈ RKRO.tsit5_dense_eval(uprev, step.k, 0.1, 0.7, dense)
     # Out-of-window points keep their column.
-    @test cols[3] == zeros(2)
+    @test out[:, 3] == zeros(2)
 
     # Rejected steps emit nothing.
-    cols_rej = RKRO._emit_saveat_cols(blank, saveat, uprev, step.k, 0.0, 0.1,
+    out_rej = RKRO._emit_saveat(blank, saveat, uprev, step.k, 0.0, 0.1,
         0.0, 0.1, false, dense)
-    @test all(==(zeros(2)), cols_rej)
+    @test out_rej == zeros(2, 3)
 end

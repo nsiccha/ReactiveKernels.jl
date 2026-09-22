@@ -8,6 +8,7 @@
     tsit5_dense_weights(θ, dense) -> NTuple{7}
 
 Dense-output weights `(b1(θ), …, b7(θ))` for a fraction `θ` across the step.
+A vector `θ` returns seven vectors, one weight per fraction.
 """
 function tsit5_dense_weights(θ::Number,
         dense::Tsit5DenseCoefficients{<:Number})
@@ -22,12 +23,28 @@ function tsit5_dense_weights(θ::Number,
     (b1, b2, b3, b4, b5, b6, b7)
 end
 
+function tsit5_dense_weights(θ::AbstractVector,
+        dense::Tsit5DenseCoefficients{<:Number})
+    θ2 = θ .* θ
+    b1 = θ .* (dense.r11 .+ θ .* (dense.r12 .+ θ .* (dense.r13 .+ θ .* dense.r14)))
+    b2 = θ2 .* (dense.r22 .+ θ .* (dense.r23 .+ θ .* dense.r24))
+    b3 = θ2 .* (dense.r32 .+ θ .* (dense.r33 .+ θ .* dense.r34))
+    b4 = θ2 .* (dense.r42 .+ θ .* (dense.r43 .+ θ .* dense.r44))
+    b5 = θ2 .* (dense.r52 .+ θ .* (dense.r53 .+ θ .* dense.r54))
+    b6 = θ2 .* (dense.r62 .+ θ .* (dense.r63 .+ θ .* dense.r64))
+    b7 = θ2 .* (dense.r72 .+ θ .* (dense.r73 .+ θ .* dense.r74))
+    (b1, b2, b3, b4, b5, b6, b7)
+end
+
 """
     tsit5_dense_eval(uprev, stages, dt, θ, dense)
 
 Evaluate the dense output at fraction `θ` of the accepted step:
 `uprev + dt*Σbᵢ(θ)kᵢ`. `stages` is the 7-tuple of stage-derivative vectors
 `(k1, …, k7)` of that step. Returns a fresh vector; nothing is mutated.
+
+A vector `θ` of `m` fractions returns the `length(uprev) × m` matrix whose
+column `j` is the dense output at `θ[j]`.
 """
 function tsit5_dense_eval(uprev::AbstractVector,
         stages::NTuple{7,AbstractVector}, dt::Number, θ::Number,
@@ -38,27 +55,32 @@ function tsit5_dense_eval(uprev::AbstractVector,
                     k5 .* b5 .+ k6 .* b6 .+ k7 .* b7)
 end
 
-"""
-    _emit_saveat_cols(cols, saveat, uprev, stages, t, dt, lo, hi, accept, dense)
+function tsit5_dense_eval(uprev::AbstractVector,
+        stages::NTuple{7,AbstractVector}, dt::Number, θ::AbstractVector,
+        dense::Tsit5DenseCoefficients{<:Number})
+    b1, b2, b3, b4, b5, b6, b7 = map(_row, tsit5_dense_weights(θ, dense))
+    k1, k2, k3, k4, k5, k6, k7 = stages
+    uprev .+ dt .* (k1 .* b1 .+ k2 .* b2 .+ k3 .* b3 .+ k4 .* b4 .+
+                    k5 .* b5 .+ k6 .* b6 .+ k7 .* b7)
+end
 
-Emit one accepted step's saveat coverage into per-point columns: for each
-`(column, time)` pair, `column` takes the dense evaluation when the step was
-accepted and the time falls in `(lo, hi]`, else keeps its value. Columns and
-times are tuples threaded by structural recursion (no integer bounds), so
-the same code runs natively and inside a Reactant-traced loop. Returns the
-updated column tuple.
-"""
-_emit_saveat_cols(::Tuple{}, ::Tuple{}, uprev, stages, t, dt, lo, hi, accept,
-    dense) = ()
+_row(v::AbstractVector) = reshape(v, 1, length(v))
 
-function _emit_saveat_cols(cols::Tuple, saveat::Tuple, uprev, stages, t, dt,
-        lo, hi, accept, dense)
-    col = first(cols)
-    ts = first(saveat)
-    win = accept & (lo < ts) & (ts <= hi)
-    θ = (ts - t) / dt
-    dj = tsit5_dense_eval(uprev, stages, dt, θ, dense)
-    (ifelse.(win, dj, col),
-        _emit_saveat_cols(Base.tail(cols), Base.tail(saveat), uprev, stages, t,
-            dt, lo, hi, accept, dense)...)
+"""
+    _emit_saveat(out, saveat, uprev, stages, t, dt, lo, hi, accept, dense)
+
+Emit one step's saveat coverage into the dense buffer `out`
+(`length(uprev) × length(saveat)`): column `j` takes the dense evaluation
+at `saveat[j]` when the step was accepted and the time falls in `(lo, hi]`,
+else keeps its value. One vectorized evaluation over all saveat points and
+one masked selection between two valid values, so the same code runs
+natively and inside a Reactant-traced loop with a program size independent
+of the number of saveat points. Returns the updated buffer; nothing is
+mutated.
+"""
+function _emit_saveat(out::AbstractMatrix, saveat::AbstractVector, uprev,
+        stages, t, dt, lo, hi, accept, dense)
+    win = accept .& (lo .< saveat) .& (saveat .<= hi)
+    θ = (saveat .- t) ./ dt
+    ifelse.(_row(win), tsit5_dense_eval(uprev, stages, dt, θ, dense), out)
 end

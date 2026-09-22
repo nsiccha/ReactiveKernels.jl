@@ -64,12 +64,16 @@ straight-line code). Supported losses are `:endpoint` (one backward
 segment `t1 → t0`) and `:saveat` (one segment per saveat interval, the
 adjoint jumping by `1` at each saveat point). Because continuous
 backsolve is not discretisation differentiation, saveat gradients agree
-with references up to a tolerance-scaled bar, not bit-for-bit. The
-legacy `early_exit=false` freeze shape survives only as a
-diagnostic/reference path for the agreement gates — it is not a
-supported gradient recipe (primal values are bitwise-identical, but
-execution wall time scales with the bound: ~0.28 µs per frozen iteration
-on a 2-state problem, strato2 2026-09-18).
+with references up to a tolerance-scaled bar, not bit-for-bit.
+
+Known limitation: Enzyme reverse *through* the retained adaptive `while`
+loop does not lower (Reactant's reverse-mode `while` handling needs a
+statically known iteration count, which a data-dependent exit cannot
+provide). Reactant/Enzyme-only reproducer:
+`benchmark/repro_reactant_adaptive_while_reverse.jl` at the repository
+root. The former workarounds — a fixed-N straight-line unroll of the
+solver and post-exit dummy-`dt` masked iterations — were removed, since
+both are shapes `docs/src/constraints.md` forbids.
 
 ## Out of scope until separately authorized
 
@@ -89,14 +93,14 @@ ReactiveKernelsReactantODESolvers
 │   ├── controller.jl  # error norm/estimate, PI factors, initial step
 │   ├── step.jl        # validated native entry to the functional step
 │   ├── kernels.jl     # tsit5_stage graph + functional/prepared executors
-│   ├── dense.jl       # dense output + saveat emission
+│   ├── dense.jl       # dense output + vectorized saveat emission
 │   ├── solve.jl       # native adaptive driver
 │   └── reactant.jl    # traced config (driver lives in ext/)
 ├── ext/
 │   └── ReactiveKernelsReactantODESolversReactantExt.jl  # traced driver
 └── test/
-    ├── runtests.jl  # problems, reference, controller, kernels, agreement,
-    │                # guards, enzyme, reactant
+    ├── runtests.jl  # problems, reference, controller, kernels, dense,
+    │                # agreement, guards, fixedn, enzyme, reactant
     └── test_*.jl
 ```
 
