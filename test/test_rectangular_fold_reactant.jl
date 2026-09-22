@@ -35,6 +35,11 @@ end
     end
     @test isempty(segmented_sum(q, Bool[], Float64[]))
     @test_throws DimensionMismatch segmented_sum(q, [true], [1.0, 2.0])
+    empty_fold(q) = RK._rectangular_fold((c, row) -> c + row[1],
+        sum(q), (Float64[],), (), q)
+    rq = Reactant.to_rarray(q)
+    compiled_empty = Reactant.@compile empty_fold(rq)
+    @test Float64(compiled_empty(rq)) == sum(q)
 end
 
 @testset "recurrence branches are lazy" begin

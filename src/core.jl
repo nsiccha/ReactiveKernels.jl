@@ -243,6 +243,7 @@ end
     n = length(first(columns))
     all(c -> c isa AbstractVector && length(c) == n, columns) ||
         throw(DimensionMismatch("rectangular fold columns must be equal-length vectors"))
+    Base.require_one_based_indexing(columns...)
     _rectangular_fold_impl(marker, step, init, columns, shared, n)
 end
 

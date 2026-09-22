@@ -4,6 +4,8 @@
 #
 #   TILE_K=K [RK_PRIMAL=1] [RK_GRAD=1] [RK_OPT=default|no_slice_slice] \
 #     [REPS=50] julia --project=<env with Reactant+Enzyme+DI> bench_rkppl_reactant.jl
+# Set RK_HLO=1 to report unoptimized StableHLO structure before compilation.
+# RK_RECTANGULAR=1 opts into the experimental PK loop (reverse currently fails).
 #
 # `RK_PRIMAL=0` skips the primal compile (a gradient-only measurement on a
 # memory-constrained host: the compiled primal stays resident otherwise).
@@ -31,6 +33,7 @@ DO_PRIMAL = get(ENV, "RK_PRIMAL", "1") == "1"
 DO_GRAD = get(ENV, "RK_GRAD", "1") == "1"
 OPT = get(ENV, "RK_OPT", "default")
 REPS = parse(Int, get(ENV, "REPS", "50"))
+ReactiveKernelsPPL._rectangular_pk_enabled[] = get(ENV, "RK_RECTANGULAR", "0") == "1"
 
 cols = tiled_columns(K)
 plan = final_plan("continuous")
@@ -44,17 +47,31 @@ native = Base.invokelatest(post_q, u)
 flush(stdout)
 
 res = Dict{String,Any}("n_obs" => bound.n_obs, "unc_dim" => k.layout.total)
+res["reactant_rectangular_pk"] = ReactiveKernelsPPL._rectangular_pk_enabled[]
 
 # ---- primal ----------------------------------------------------------------
 ur = Reactant.to_rarray(u)
+if get(ENV, "RK_HLO", "0") == "1"
+    t_hlo = @elapsed hlo = repr(Reactant.@code_hlo optimize=false post_q(ur))
+    res["reactant_hlo_s"] = round(t_hlo; digits=2)
+    res["reactant_hlo_bytes"] = sizeof(hlo)
+    res["reactant_hlo_whiles"] = count("stablehlo.while", hlo)
+    res["reactant_hlo_ifs"] = count("stablehlo.if", hlo)
+    res["reactant_hlo_ops"] = length(collect(eachmatch(r"stablehlo\.[a-z_]+", hlo)))
+    @printf("HLO K=%d bytes=%d whiles=%d ifs=%d ops=%d trace=%.2fs\n",
+        K, res["reactant_hlo_bytes"], res["reactant_hlo_whiles"],
+        res["reactant_hlo_ifs"], res["reactant_hlo_ops"], t_hlo)
+    flush(stdout)
+end
 if DO_PRIMAL
-t_compile = @elapsed compiled = Reactant.@compile post_q(ur)
+t_compile = @elapsed compiled = Reactant.@compile sync=true post_q(ur)
 got = Float64(compiled(ur))
 ok1 = isapprox(got, native; rtol = 1e-9)
 u2 = Vector{Float64}(0.1 .* randn(Xoshiro(7), k.layout.total))
 ok2 = isapprox(Float64(compiled(Reactant.to_rarray(u2))), Base.invokelatest(post_q, u2); rtol = 1e-9)
 @printf("REACTANT K=%d primal compile=%.1fs lp=%.9f match=%s/%s reldiff=%.3e\n",
     K, t_compile, got, ok1, ok2, abs(got - native) / abs(native))
+ok1 && ok2 || error("Reactant primal parity failed at K=$K")
 compiled(ur)
 t_r = @elapsed for _ in 1:REPS; compiled(ur); end
 Base.invokelatest(post_q, u)
@@ -77,13 +94,14 @@ if DO_GRAD
     @printf("K=%d native grad: prep=%.1fs val=%.9f gnorm=%.6f mean=%.4fms\n",
         K, t_prep, val, sqrt(sum(abs2, g)), 1e3 * t_ng / REPS)
     flush(stdout)
-    t_c = @elapsed cad = OPT == "default" ? compile_ad_value_and_gradient(q.ad, ur) :
-        compile_ad_value_and_gradient(q.ad, ur; optimize = Symbol(OPT))
+    t_c = @elapsed cad = OPT == "default" ? compile_ad_value_and_gradient(q.ad, ur; sync=true) :
+        compile_ad_value_and_gradient(q.ad, ur; optimize = Symbol(OPT), sync=true)
     rval, rgrad = cad(ur)
     rg = Array(rgrad)
     gok = isapprox(rg, g; rtol = 1e-9) && isapprox(Float64(rval), val; rtol = 1e-9)
     @printf("REACTANT AD K=%d opt=%s compile=%.1fs val=%.9f parity(rtol1e-9)=%s maxrel=%.3e\n",
         K, OPT, t_c, Float64(rval), gok, maximum(abs.(rg .- g) ./ max.(abs.(g), 1e-8)))
+    gok || error("Reactant reverse parity failed at K=$K")
     t_rg = @elapsed for _ in 1:REPS; cad(ur); end
     @printf("K=%d grad: reactant=%.4fms native=%.4fms\n", K, 1e3 * t_rg / REPS, 1e3 * t_ng / REPS)
     res["rkppl_grad_ms"] = round(1e3 * t_ng / REPS; digits = 4)

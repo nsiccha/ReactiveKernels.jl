@@ -328,8 +328,8 @@ The grouped cell form `tgi_ref = tgi_segmented_nadir(tgi_change,
 tgi_seg_ends)` emits as exactly this call (one statement, whatever the
 subject count — the ends are a bound column), so this is both the
 host-side oracle and the generated-code path: native, Enzyme, and
-Reactant (traced `change`, element reads through the traced-gather hook,
-loop unrolled at trace time). Validates the segment contract defensively
+Reactant (traced `change`, one fixed-trip loop with reset flags and a
+fixed output buffer). Validates the segment contract defensively
 (`ends` nondecreasing from a non-negative start, last end == row count).
 """
 function tgi_segmented_nadir(change::AbstractVector,
@@ -344,6 +344,8 @@ function tgi_segmented_nadir(change::AbstractVector,
         throw(ArgumentError("tgi_segmented_nadir last end " *
                             "$(isempty(ends) ? 0 : ends[end]) ≠ row count " *
                             "$(length(change))"))
+    marker = ReactiveKernels._dynamic_tensorized_marker((change,))
+    marker === nothing || return _tgi_rectangular_nadir(change, ends, marker)
     T = promote_type(eltype(change), Float64)
     out = Vector{T}[]
     prev = 0
@@ -353,6 +355,25 @@ function tgi_segmented_nadir(change::AbstractVector,
     end
     isempty(out) && return zeros(T, 0)
     return reduce(vcat, out)
+end
+
+function _tgi_rectangular_nadir(change, ends, marker)
+    reset = zeros(Bool, length(change))
+    prev = 0
+    for hi in ends
+        hi > prev && (reset[prev+1] = true)
+        prev = hi
+    end
+    init = (current=0.0, out=zeros(length(change)))
+    columns = (collect(eachindex(change)), reset, change)
+    ReactiveKernels._rectangular_fold(_tgi_nadir_step, init, columns, (), marker).out
+end
+
+function _tgi_nadir_step(carry, row)
+    i, reset, value = row
+    current = ifelse(reset, zero(carry.current), carry.current)
+    out = ReactiveKernels._tensorized_setindex(carry.out, current, i)
+    (current=min(current, value), out=out)
 end
 
 # --- likelihood primitives (SB `@deffun` math) ------------------------------

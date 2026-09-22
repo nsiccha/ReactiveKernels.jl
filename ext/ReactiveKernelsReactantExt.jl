@@ -1061,6 +1061,7 @@ _recurrence_trace(x::Reactant.TracedRNumber) = copy(x)
 
 function ReactiveKernels._rectangular_fold_impl(
         marker::Reactant.TracedType, step, init, columns, shared, n)
+    n == 0 && return init
     carry = _recurrence_trace(init)
     data = _recurrence_trace(columns)
     args = _recurrence_trace(shared)

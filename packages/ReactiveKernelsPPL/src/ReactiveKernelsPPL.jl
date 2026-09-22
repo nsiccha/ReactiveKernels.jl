@@ -115,6 +115,7 @@ export TGI_CELL_FUNCTIONS
 
 include("contract.jl")
 include("pkcells.jl")
+include("pk_rectangular.jl")
 include("design.jl")
 include("bijectors.jl")
 include("layout.jl")
