@@ -1497,49 +1497,6 @@ function ReactiveKernels._replica_call(
     length(results) == 1 ? only(results) : results
 end
 
-function _replica_ad_static_slice(arg, expected_rank, replica_index)
-    if expected_rank == 0
-        row = Reactant.Ops.reshape(
-            arg, Int64[1, length(arg)])
-        scalar = Base.getindex(row, 1:1, replica_index)
-        zero_cotangent = Reactant.promote_to(
-            Reactant.TracedRNumber{Reactant.unwrapped_eltype(arg)},
-            Base.zero(Reactant.unwrapped_eltype(arg)))
-        reduced = Reactant.Ops.reduce(
-            scalar, zero_cotangent, Int64[1],
-            ((left, right) -> left + right))
-        return Reactant.TracedRNumber{
-            Reactant.unwrapped_eltype(arg)}((), reduced.mlir_data)
-    end
-    indices = ntuple(dimension -> dimension == ndims(arg) ?
-        replica_index : Colon(), ndims(arg))
-    sliced = getindex(arg, indices...)
-    sliced
-end
-
-function _replica_ad_stack(values::Tuple, ::Type{T}, replica_count) where {T<:Tuple}
-    ntuple(length(T.parameters)) do component
-        component_values = ntuple(
-            index -> getfield(values[index], component), replica_count)
-        _replica_ad_stack(
-            component_values, T.parameters[component], replica_count)
-    end
-end
-
-function _replica_ad_stack(values::Tuple, ::Type{T}, replica_count) where {T}
-    gradient_rank = ReactiveKernels._replica_rank(T)
-    gradients = if gradient_rank == 0
-        ntuple(index -> Reactant.Ops.broadcast_in_dim(
-            values[index], Int64[], Int64[1]), replica_count)
-    else
-        ntuple(index -> Reactant.Ops.reshape(
-            values[index],
-            vcat(collect(Int64, size(values[index])), Int64[1])),
-            replica_count)
-    end
-    Reactant.Ops.concatenate(collect(gradients), gradient_rank + 1)
-end
-
 function ReactiveKernels._replica_ad_call(
         k::ReactiveKernels._ReplicatedADKernel{B,BT,AT}, args,
         marker::Reactant.RArray) where {B,BT,AT}
@@ -1558,28 +1515,86 @@ function ReactiveKernels._replica_ad_call(
     end
 
     active_selector = typeof(prepared).parameters[1]
-    results = ntuple(replica_count) do replica_index
-        scalar_args = ntuple(length(args)) do argument_index
+    # One retained loop over the replica axis (docs/src/constraints.md: a
+    # replica count is a data length, so the autodiff is traced ONCE, not once
+    # per replica).  Each iteration gathers its replica's slice of every
+    # batched argument with a dynamic slice, differentiates with the point and
+    # contexts as explicit arguments, and writes the value and the gradient
+    # into preallocated buffers at the replica index.  Buffers carry the
+    # shapes the per-replica stack used to produce: values `(R,)`, a scalar
+    # gradient `(R,)`, an array gradient `(size..., R)`, a tuple per component.
+    indices = ReactiveKernels._ad_selector_indices(active_selector)
+    gradient_shapes = ntuple(length(indices)) do position
+        index = indices[position]
+        arg = getfield(args, index)
+        index in B ? size(arg)[1:(end - 1)] : size(arg)
+    end
+    element_type = Reactant.unwrapped_eltype(marker)
+    # Each buffer is its own tracer object (`copy`): identical zero constants
+    # can come back as one shared object, which `@trace` reads as aliased
+    # loop-carried variables.
+    value_buffer = copy(Reactant.Ops.constant(zeros(element_type, replica_count)))
+    gradient_buffers = _replica_ad_buffers(AT, gradient_shapes, element_type, replica_count)
+    # Body locals carry a `replica_` prefix: `@trace` seeds a loop-carried
+    # variable from any same-named binding in scope, and `value`/`gradient`
+    # would resolve to functions.  (No `return` inside the block either:
+    # ReactantCore rejects it syntactically.)
+    Reactant.@trace track_numbers = false for replica_index in 1:replica_count
+        replica_args = ntuple(length(args)) do argument_index
             arg = getfield(args, argument_index)
             position = findfirst(==(argument_index), B)
-            position === nothing && return arg
-            expected_rank = ReactiveKernels._replica_rank(
-                ReactiveKernels.valtype(k.inputs[argument_index]))
-            _replica_ad_static_slice(arg, expected_rank, replica_index)
+            position === nothing ? arg :
+                _replica_ad_dynamic_slice(arg, ReactiveKernels._replica_rank(
+                    ReactiveKernels.valtype(k.inputs[argument_index])), replica_index)
         end
-        point, contexts = ReactiveKernels._ad_arguments(
-            Val(active_selector), scalar_args)
-        ReactiveKernels._ad_prepared_value_and_gradient(
-            prepared, point, contexts)
+        replica_point, replica_contexts = ReactiveKernels._ad_arguments(
+            Val(active_selector), replica_args)
+        replica_value, replica_gradient = ReactiveKernels._ad_prepared_value_and_gradient(
+            prepared, replica_point, replica_contexts)
+        value_buffer = _replica_ad_write(value_buffer, replica_value, replica_index)
+        gradient_buffers = _replica_ad_write_gradient(
+            gradient_buffers, replica_gradient, replica_index)
     end
-
-    values = ntuple(index -> Reactant.Ops.broadcast_in_dim(
-        first(results[index]), Int64[], Int64[1]), replica_count)
-    value = Reactant.Ops.concatenate(collect(values), 1)
-    gradient_values = ntuple(index -> last(results[index]), replica_count)
-    gradient = _replica_ad_stack(gradient_values, AT, replica_count)
-    value, gradient
+    value_buffer, gradient_buffers
 end
+
+# A single replica's slice of a batched argument, gathered at a traced index.
+function _replica_ad_dynamic_slice(arg, expected_rank, replica_index)
+    expected_rank == 0 && return Reactant.@allowscalar arg[replica_index]
+    slice_indices = ntuple(dimension -> dimension == ndims(arg) ?
+        replica_index : Colon(), ndims(arg))
+    Reactant.@allowscalar getindex(arg, slice_indices...)
+end
+
+_replica_ad_buffers(::Type{T}, shapes, element_type, replica_count) where {T<:Tuple} =
+    ntuple(component -> _replica_ad_buffers(
+            T.parameters[component], (shapes[component],), element_type, replica_count),
+        length(T.parameters))
+_replica_ad_buffers(::Type{T}, shapes, element_type, replica_count) where {T<:Number} =
+    copy(Reactant.Ops.constant(zeros(element_type, replica_count)))
+_replica_ad_buffers(::Type{T}, shapes, element_type, replica_count) where {T<:AbstractArray} =
+    copy(Reactant.Ops.constant(zeros(element_type, only(shapes)..., replica_count)))
+
+_replica_ad_index(replica_index) =
+    Reactant.promote_to(Reactant.TracedRNumber{Int64}, replica_index)
+_replica_ad_one() = Reactant.Ops.constant(Int64(1))
+
+function _replica_ad_write(buffer, value::Reactant.TracedRNumber, replica_index)
+    Reactant.Ops.dynamic_update_slice(
+        buffer, Reactant.Ops.broadcast_in_dim(value, Int64[], Int64[1]),
+        [_replica_ad_index(replica_index)])
+end
+function _replica_ad_write(buffer, value::Reactant.TracedRArray, replica_index)
+    Reactant.Ops.dynamic_update_slice(
+        buffer, Reactant.Ops.reshape(value, vcat(collect(Int64, size(value)), Int64[1])),
+        vcat([_replica_ad_one() for _ in 1:ndims(value)], [_replica_ad_index(replica_index)]))
+end
+_replica_ad_write_gradient(buffers::Tuple, gradient::Tuple, replica_index) =
+    ntuple(component -> _replica_ad_write_gradient(
+            buffers[component], gradient[component], replica_index),
+        length(buffers))
+_replica_ad_write_gradient(buffer, gradient, replica_index) =
+    _replica_ad_write(buffer, gradient, replica_index)
 
 # --- Reactant-compiled automatic differentiation -----------------------------
 # Selected by core's `compile_ad_gradient` / `compile_ad_value_and_gradient` when

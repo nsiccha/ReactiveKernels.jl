@@ -603,6 +603,23 @@ end
             Reactant.to_rarray(log(1.2); track_numbers = true))
         @test Array(values) ≈ vector_reference[1]
         @test Array(gradients) ≈ vector_reference[2]
+
+        # The replica axis is a data length: one retained loop carries the
+        # autodiff, so the emitted program does not grow with the replica
+        # count (docs/src/constraints.md).
+        program_lines(replicated, positions) = begin
+            hlo = repr(Reactant.@code_hlo optimize = false replicated(
+                Reactant.to_rarray(positions),
+                Reactant.to_rarray(0.1; track_numbers = true),
+                Reactant.to_rarray(log(1.2); track_numbers = true)))
+            @test count("stablehlo.while", hlo) == 1
+            @test count("enzyme.autodiff", hlo) == 1
+            count("\n", hlo)
+        end
+        @test program_lines(scalar_replicated, [0.0, 0.4, 0.9]) ==
+              program_lines(scalar_replicated, [0.0, 0.4, 0.9, 1.3, -0.2, 0.7])
+        @test program_lines(vector_replicated, reshape(collect(0.0:0.05:1.15), 6, 4)) ==
+              program_lines(vector_replicated, reshape(collect(0.0:0.05:2.35), 6, 8))
     end
 
     @testset "graph-native position batching compiles under Reactant" begin
