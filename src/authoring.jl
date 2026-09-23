@@ -1775,7 +1775,8 @@ end
 
 function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
                                 mod::Union{Module,Nothing} = nothing,
-                                scope::Set{Symbol} = known)
+                                scope::Set{Symbol} = known;
+                                in_dotted::Bool = false)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
     undef_vector = _kernel_tensorized_undef_vector(ex)
@@ -1824,15 +1825,22 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
     elseif ex.head === :call && !isempty(ex.args) &&
            ex.args[1] isa Symbol && _is_broadcast_operator(ex.args[1])
         operator = Symbol(String(ex.args[1])[2:end])
-        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
+        # Only the outermost dotted call of a nest materializes; nested ones
+        # stay lazy so Julia's broadcast fusion survives the lowering (snag
+        # `reactant-traced-ff8ff365`).  Every other descent keeps the default
+        # `in_dotted = false`, so a dotted call under any non-dotted parent
+        # still materializes exactly as before.
+        broadcast = in_dotted ? :_tensorized_lazy_broadcast : :_tensorized_broadcast
+        return Expr(:call, GlobalRef(@__MODULE__, broadcast),
                     GlobalRef(Base, operator),
-                    (_kernel_tensorized_rhs(arg, known, mod, scope)
+                    (_kernel_tensorized_rhs(arg, known, mod, scope; in_dotted = true)
                      for arg in ex.args[2:end])...)
     elseif ex.head === :. && length(ex.args) == 2 &&
            ex.args[2] isa Expr && ex.args[2].head === :tuple
-        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
+        broadcast = in_dotted ? :_tensorized_lazy_broadcast : :_tensorized_broadcast
+        return Expr(:call, GlobalRef(@__MODULE__, broadcast),
                     _kernel_tensorized_callee(ex.args[1], known, mod),
-                    (_kernel_tensorized_rhs(arg, known, mod, scope)
+                    (_kernel_tensorized_rhs(arg, known, mod, scope; in_dotted = true)
                      for arg in ex.args[2].args)...)
     elseif ex.head in (:for, :while)
         # An authored loop keeps its iteration on every backend: the
