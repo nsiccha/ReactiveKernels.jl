@@ -76,17 +76,18 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test occursin("Main.BatchedExamples.BATCHED_AD_SOURCE", distributions_ad_docs)
     @test occursin("test_batched_nonallocating.jl", distributions_ad_docs)
     for marker in (
-            "# Manual derivative rule graphs (design example)",
-            "Executable design example; the scalar slice of the generator is shipped",
-            "## Current capability and required RK features",
-            "Everything that turns\nthat graph into a registered custom AD rule is new work",
-            "RK has neither feature",
+            "# Derivative rules from one pure-math graph",
+            "## Generated scalar rules",
+            "## Generated vector rules",
+            "## Two-stage reverse staging",
+            "## Generated adapters",
+            "RK has neither reverse-mode AD nor program transposition",
             "prepare_ad_pullback",
-            "does not consume this manual rule\ngraph",
+            "does not consume a rule graph",
             "render_manual_derivative_rule_cuts()",
-            "render_manual_derivative_pullback_source()",
-            "result.captured_fields",
-            "ChainRules, Mooncake and Reactant adapters — that RK does not generate yet",
+            "render_manual_derivative_rule_source()",
+            "result.residuals",
+            "Not generated yet: a Mooncake adapter",
         )
         @test occursin(marker, manual_rules_docs)
     end
@@ -175,7 +176,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test occursin("\"Automatic differentiation\" => [", make)
     @test occursin("\"Prepared gradients\" => \"automatic-differentiation.md\"", make)
     @test occursin(
-        "\"Manual derivative rules (design)\" => \"manual-derivative-rules.md\"",
+        "\"Derivative rules\" => \"manual-derivative-rules.md\"",
         make,
     )
     @test occursin("compiler.md", index)

@@ -14,9 +14,9 @@ using ReactiveKernelsReactantODESolvers
 include(joinpath(@__DIR__, "..", "examples", "nutpie_diagonal_adaptation.jl"))
 import .NutpieDiagonalAdaptationExample
 
-# Load the executable manual-rule design example. It uses only today's public
-# HAVE→WANT preparation surface; the page labels backend adapter generation as
-# the proposed layer rather than presenting it as an existing package API.
+# Load the executable derivative-rule example: one pure-math graph, the
+# `derivative_rule` it generates, and the same cuts prepared explicitly so the
+# page can render each one.
 include(joinpath(@__DIR__, "..", "examples", "manual_derivative_rule.jl"))
 import .ManualDerivativeRuleExample
 
@@ -108,7 +108,7 @@ site_pages = [
     ],
     "Automatic differentiation" => [
         "Prepared gradients" => "automatic-differentiation.md",
-        "Manual derivative rules (design)" => "manual-derivative-rules.md",
+        "Derivative rules" => "manual-derivative-rules.md",
         "Distributions: scalar and batched" => "distributions-ad.md",
         "PPL: Eight Schools and MNIST" => "ppl-ad.md",
     ],

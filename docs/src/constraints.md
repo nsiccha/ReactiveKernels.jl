@@ -39,7 +39,7 @@ isolate the backend failure instead of adopting an eager workaround.
 **Do not write backend-specific derivative rules as durable code, and never
 attach a rule to a function this repository does not own.** The user-ratified
 policy (ReactiveKernels:reactant decision `2026-09-14T13-13-44-484-15lmrss`,
-design page [manual derivative rules](manual-derivative-rules.md) with
+page [derivative rules](manual-derivative-rules.md) with
 `examples/manual_derivative_rule.jl`) is that a numerical primitive's
 derivatives are authored once as an ordinary pure-math `@kernel` graph — the
 stable primal plus named partials, or forward and reverse branches as outputs
@@ -54,16 +54,21 @@ ordinary reverse mode and nothing else. A rule on a foreign function such as
 `SpecialFunctions.loggamma` is type piracy on top of that: it silently changes
 every Enzyme user in the session.
 
-The generator's first slice is shipped: `scalar_derivative_rule`
-(`src/derivative_rules.jl`) turns a scalar graph that authors the primal plus
-one named partial per input into an RK-owned callable, and the Enzyme adapter
-(`ext/ReactiveKernelsEnzymeExt.jl`) derives both directions from the
-activity-selected cuts of that graph; DistributionKernels' `loggamma` and
-`logbeta` are such rules, and they are the only derivative rules in this
-repository. Vector ports, authored reverse branches, and the ChainRules,
-Mooncake and Reactant adapters remain ReactiveKernels:reactant todo
-`2026-09-14T17-10-05-750-0dsqq02`. A new backend failure of the ordinary path
-remains a backend limitation: isolate it with a backend-only reproducer under
+The generator is shipped (`src/derivative_rules.jl`): `scalar_derivative_rule`
+turns a scalar graph that authors the primal plus one named partial per input,
+and `derivative_rule` a graph that authors a forward branch, a reverse branch,
+or both over array or scalar ports, into an RK-owned callable. The Enzyme and
+ChainRules adapters (`ext/ReactiveKernelsEnzymeExt.jl`,
+`ext/ReactiveKernelsChainRulesCoreExt.jl`) derive every direction from the
+activity-selected cuts of that graph. DistributionKernels' `loggamma` and
+`logbeta` are the only rules in package source; the ODE backsolve adjoint
+consumes a caller's `DerivativeRule` right-hand side. The Mooncake adapter,
+residual compaction, and Reactant rule emission (gated on the upstream
+EnzymeMLIR custom-rule bridge; rule cuts already trace as plain mathematics)
+remain ReactiveKernels:review todo `2026-09-14T17-10-05-750-0dsqq02`.
+
+A new backend failure of the ordinary path remains a backend limitation:
+isolate it with a backend-only reproducer under
 `benchmark/`, record it on this page, and, if it aborts the process, skip the
 affected acceptance cases by name until either the backend lowers the shape or
 a generated rule on an owned callable covers it.
