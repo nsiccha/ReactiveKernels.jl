@@ -42,13 +42,9 @@ for every such callable: the activity pattern of a call selects the cut
 with Enzyme's covector (reverse) or directions (forward, including batch
 width). Nothing backend-specific is authored, and no rule attaches to a
 function outside this repository. `ReactiveKernelsDistributionKernels` uses
-exactly this for `loggamma` and `logbeta`.
-
-```@docs
-scalar_derivative_rule
-ScalarDerivativeRule
-derivative_cut
-```
+exactly this for `loggamma` and `logbeta`. The docstrings of
+[`scalar_derivative_rule`](@ref), [`ScalarDerivativeRule`](@ref) and
+[`derivative_cut`](@ref) are on the [API reference](api.md) page.
 
 ## Current capability and required RK features
 
