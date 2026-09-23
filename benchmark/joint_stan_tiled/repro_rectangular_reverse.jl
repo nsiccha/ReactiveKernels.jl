@@ -1,6 +1,9 @@
 # Focused reproducer for the Reactant 0.2.285 / EnzymeMLIR reverse failure:
 # "had set op which was not a direct descendant". Two subjects, six operations,
 # one repeated-dose segment; no PPL generator, likelihood, or joint model.
+# With that fixed (EnzymeAD/Enzyme-JAX#3240) it compiles, but the gradient is
+# wrong on subject 1's rate parameters until the nested-if adjoint fix
+# (repro_nested_if_reverse.jl) is in as well.
 # Run in an environment with this checkout, ReactiveKernelsPPL, Reactant, Enzyme.
 using ReactiveKernels, ReactiveKernelsPPL, Reactant, Enzyme
 const PPL = ReactiveKernelsPPL
@@ -26,5 +29,5 @@ println("native gradient: ", expected_gradient)
 flush(stdout)
 compiled = Reactant.@compile sync=true gradient(Reactant.to_rarray(q))
 got = Array(compiled(Reactant.to_rarray(q)))
-@assert got ≈ expected_gradient rtol=1e-8
+@assert isapprox(got, expected_gradient; rtol=1e-8) "compiled gradient $got, native $expected_gradient"
 println("compiled gradient matches native: ", got)

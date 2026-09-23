@@ -5,8 +5,10 @@ but its host loops expand once per subject and operation during tracing. The
 first implementation moves those recurrences behind a general RK runtime
 boundary, `_rectangular_fold(step, init, columns, shared, marker)`.
 
-**Status:** joint primal proof only; PK reverse compilation is blocked in
-Enzyme/MLIR. The PK adapter is disabled by default. Set `RK_RECTANGULAR=1` in
+**Status:** joint primal proof on released toolchains. The PK reverse needs two
+Enzyme-JAX fixes that are not released yet (see "Reverse status"). With them,
+one of them emulated, the joint K=1 and K=3 gradients match native. The PK
+adapter is disabled by default. Set `RK_RECTANGULAR=1` in
 `bench_rkppl_reactant.jl` to opt in for measurements. This is not a supported
 sampler configuration or a demonstrated runtime improvement. Ordinary traced PK
 calls now fail explicitly with the issue link; they never fall back to the
@@ -115,7 +117,33 @@ counts, compile wall time and peak process RSS, synchronized resident-input
 evaluation time, and primal/reverse parity against native execution. Default
 CPU fusion is the acceptance path. No K=10 measurement precedes stable K=3.
 
-## Reverse blocker
+## Reverse status
+
+Two Enzyme-JAX defects stood between the retained PK recurrence and a correct
+compiled gradient. Both are backend fixes; neither is in a Reactant_jll release
+yet, so the PK adapter stays opt-in (`_rectangular_pk_enabled`).
+
+1. **Reverse fails to compile** (`had set op which was not a direct
+   descendant`): [ReactiveKernels #13](https://github.com/nsiccha/ReactiveKernels.jl/issues/13),
+   reproducer `repro_reactant_while_reverse.jl`. Fixed by EnzymeAD/Enzyme-JAX
+   #3240 (the if/case removers erase the branch ops they hoisted). The PR's
+   CI-built Reactant_jll passes that reproducer.
+2. **Reverse compiles but is silently wrong** once (1) is fixed: the reverse of
+   a `stablehlo.if`/`stablehlo.case` read its result adjoint in the branches
+   without zeroing it. An if nested in a branch of another if inside a loop —
+   the PK `count > 1` branch inside the read/dose branch — then reuses an
+   earlier iteration's adjoint. The primal is exact; subject 1's
+   rate-parameter derivatives were 6–59% off in `repro_rectangular_reverse.jl`.
+   Reproducer `repro_nested_if_reverse.jl` (Reactant and Enzyme only:
+   -11.208 instead of -17.273). Fixed by zeroing the adjoints in front of the
+   reverse op, as the `scf.if` reverse already does (Enzyme-JAX commit
+   `a3c08614`, stacked on #3240, not yet published).
+
+The measurements under "Preliminary reverse measurements" below were taken
+with fix (1) compiled and fix (2) applied to the post-AD IR by emulation; they
+are not a released toolchain.
+
+### History: the original blocker
 
 Tracked in [ReactiveKernels #13](https://github.com/nsiccha/ReactiveKernels.jl/issues/13),
 with an RK-free upstream reproducer in `repro_reactant_while_reverse.jl`.
@@ -177,8 +205,8 @@ TILE_K=1 RK_RECTANGULAR=1 RK_HLO=1 RK_PRIMAL=1 RK_GRAD=0 REPS=50 \
 ```
 
 Run `repro_rectangular_reverse.jl` directly in the same environment for the
-focused expected failure. Do not launch the full joint reverse or K=3 reverse
-again until that reproducer compiles and its gradient matches a native oracle.
+focused check. On a released toolchain it still fails as described above; with
+both fixes its gradient matches native (see "Reverse status").
 
 `repro_reactant_while_reverse.jl` reduces the same diagnostic to one scalar
 conditional sum: a traced loop over six values, with a lazy branch that skips
@@ -213,3 +241,36 @@ PK cells, and joint emitter native/compiled AD. The MutatingFunctions extension
 also loaded successfully. The later constraint-repair acceptance is the
 858-assertion result above. These checks validate the supported paths; the PK
 reverse reproducer remains an expected failure, outside the test suite.
+
+## Preliminary reverse measurements (emulated fix), 2026-09-22
+
+Not a released toolchain. Setup:
+- Reactant.jl `main` (0.2.287) with Enzyme 0.13.204, Julia 1.10.11.
+- `libReactantExtra` from the `Build Reactant_jll` CI run of Enzyme-JAX PR #3240 (fix 1, compiled).
+- Fix 2 applied by rewriting the post-AD IR exactly as the patched reverse emits it. Each reverse `stablehlo.if`/`case` reads and zeroes its result adjoints before branching; the rest of the shipped pipeline then runs.
+- CPU backend, default fusion, synchronized, resident inputs, `RK_RECTANGULAR=1`, the same seeded point as above.
+
+| Metric | K=1 | K=3 |
+| --- | ---: | ---: |
+| Unoptimized HLO while / if count | 2 / 10 | 2 / 10 |
+| Unoptimized HLO operation occurrences | 9,463 | 9,463 |
+| Primal compile (s, after HLO trace) | 13.0 | 12.4 |
+| Relative primal error | 1.9e-16 | 1.5e-16 |
+| Value+gradient compile (s) | 118.2 | 114.5 |
+| Gradient parity vs native Enzyme (max rel) | 5.6e-14 | 1.3e-14 |
+| Peak process RSS (GiB) | 5.4 | 5.3 |
+| Reactant / native primal evaluation (ms) | 0.193 / 0.0145 | 0.460 / (noisy) |
+| Reactant / native gradient evaluation (ms) | 7.98 / 0.197 | 39.4 / 0.495 |
+
+Findings:
+- **Control:** with fix 1 only (the shipped CI library, no IR rewrite), the K=1 gradient compiles (159 s) but fails parity at max rel 1.1e-2. Fix 2 is required for the joint model, not only for the PK reproducer.
+- **Invariance:** the unoptimized HLO is the same size at K=1 and K=3, and compile time and memory do not grow with K. The unrolled program's gradient compile was killed at 13.3–14.2 GB.
+- **Runtime:** the compiled gradient is 40–80× slower than native Enzyme on CPU, so fused runtime is still not established.
+
+The focused PK reverse over seven schedules also matches native to ≤ 6.2e-15:
+- the reproducer;
+- dose counts 2/3/5/8;
+- three ragged subjects with interleaved dose segments;
+- a subject without doses.
+
+Its compiled gradient takes 2.2–4.2 ms against 29–150 µs native. Across those schedules the unoptimized primal HLO is the same (5,948 ops, 2 while, 5 if; one op fewer when no dose segment exists). The optimized primal and gradient are identical across subject and operation counts. They change only with the static power-bit capacity, because the optimizer unrolls that small constant-trip loop.
