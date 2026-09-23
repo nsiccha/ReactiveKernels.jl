@@ -8,7 +8,24 @@ using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
 
-_kinv_levels(K, n) = [mod1(i, K) for i in 1:n]
+# Every level present, in a deterministic irregular order. Reactant lowers a
+# gather by constant host indices that form an arithmetic progression as one
+# strided `slice` and any other index set as a `gather`: both are constant in
+# size, but a comparison of traced-program sizes across K must not mix them.
+# So no ordinal lane class (first / last / interior level rows) may be an
+# arithmetic progression; the first permutation seed with that property is
+# used, and the property is asserted.
+_kinv_arithmetic(v) = length(v) < 3 || allequal(diff(v))
+function _kinv_levels(K, n)
+    base = [mod1(i, K) for i in 1:n]
+    for seed in 1:1000
+        levels = base[sortperm([sin(seed * 2.3i) for i in 1:n])]
+        classes = (findall(==(1), levels), findall(==(K), levels),
+                   findall(l -> 1 < l < K, levels))
+        any(c -> !isempty(c) && _kinv_arithmetic(c), classes) || return levels
+    end
+    error("no irregular level order found for K = $K, n = $n")
+end
 
 function _kinv_plans(K::Int)
     n = 3K

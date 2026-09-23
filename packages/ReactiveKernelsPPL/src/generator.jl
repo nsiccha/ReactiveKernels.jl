@@ -987,9 +987,11 @@ _pw_name(label::Symbol) = Symbol(:_ppl_pw_, label)
 # A plate must be a whole recipe RHS (never nested under `sum`), and the
 # do-block body carries a LineNumberNode or the cell types as Any. Response
 # `y` and predictor `lp` are always inputs 1-2 (`_ppl_c1/_ppl_c2`).
-function _plate_sum_stmts(pointwise::Symbol, node::Symbol, inputs::Vector{Any}, cell::Expr)
+function _plate_sum_stmts(pointwise::Symbol, node::Symbol, inputs::Vector{Any},
+        cell::Union{Expr,Vector{Expr}})
     dovars = [_dovar(i) for i in eachindex(inputs)]
-    body = Expr(:block, LineNumberNode(0, :generator), cell)
+    body = Expr(:block, LineNumberNode(0, :generator),
+        (cell isa Expr ? (cell,) : cell)...)
     lambda = Expr(:(->), Expr(:tuple, dovars...), body)
     doex = Expr(:do, Expr(:call, :plate, inputs...), lambda)
     return Expr[:($pointwise = $doex), :($node::Float64 = sum($pointwise))]
@@ -1003,6 +1005,15 @@ function _thread_ref!(inputs::Vector{Any}, ref, as_int::Bool = false)
         return _dovar(length(inputs))
     end
     return as_int ? Int(ref) : Float64(ref)
+end
+
+# A weighted cell. A cell that is a lazy branch keeps the branch as its own
+# cell statement (`_ppl_arm = c ? a : b`) with the weight applied after it:
+# only a top-level branch is visible to plate lowering, which splits the
+# lanes when the condition reads bound data only.
+function _weighted_cell(wv, cell::Expr)
+    cell.head === :if || return :($wv * $cell)
+    return Expr[:(_ppl_arm::Float64 = $cell), :($wv * _ppl_arm)]
 end
 
 # Thread Symbol bounds (do-vars), inline Real bounds; nothing stays nothing.
@@ -1502,8 +1513,7 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
         _ordinal_cumulative_cell(r.link, K, yv, etav, dref, _dovar(length(inputs)))
     end
     if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = :($wv * $cell)
+        cell = _weighted_cell(_thread_ref!(inputs, r.weights), cell)
     end
     return Expr[prests..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
@@ -1529,11 +1539,11 @@ end
 # Stage-lane names for response `label`.
 _stage_lane(label::Symbol, what::Symbol) = Symbol(:_ppl_srl_, what, :_, label)
 
-# Stopping-ratio plate over the stage lanes: each lane reads its
-# observation's predictor/scale/weight (gathered by lane), its stage's
-# threshold from the shared vector `Ref(t)`, and — with per_threshold
-# effects — its stage's coefficient pack entries (stage-major:
-# stage j occupies `(j-1)*p+1 .. j*p`). The cell survives (logCC) or stops
+# Stopping-ratio plate over the stage lanes: every lane column is gathered
+# once by the (bound) lane tables — the observation's predictor/scale/weight,
+# the stage's threshold `t[stage]`, and with per_threshold effects the
+# stage's coefficient pack entries (stage-major: stage j occupies
+# `(j-1)*p+1 .. j*p`) — so the cell itself reads only scalars. The cell survives (logCC) or stops
 # (logF) by a lazy branch on the bound stage/level pair, which plate
 # lowering splits by arm. K=1 runs zero stages (SB's zero-information
 # likelihood) and lowers to a zero cell over the observations.
@@ -1549,15 +1559,15 @@ function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         :($stage = _ordinal_stage_idx($y, $K))]
     level = _stage_lane(r.label, :y)
     eta = _stage_lane(r.label, :eta)
-    push!(prests, :($level = $y[$obs]), :($eta = $lp[$obs]))
-    inputs = Any[stage, level, eta]
-    sv, yv, etav = _dovar(1), _dovar(2), _dovar(3)
+    thr = _stage_lane(r.label, :t)
+    push!(prests, :($level = $y[$obs]), :($eta = $lp[$obs]),
+        :($thr = $(r.thresholds)[$stage]))
+    inputs = Any[stage, level, eta, thr]
+    sv, yv, etav, tv = _dovar(1), _dovar(2), _dovar(3), _dovar(4)
     dref = _ordinal_lane_ref!(inputs, prests,
         _ordinal_scale_source!(prests, r, plan), obs, _stage_lane(r.label, :d))
-    push!(inputs, :(Ref($(r.thresholds))))
-    c = _dovar(length(inputs))
     z = if isempty(r.threshold_columns)
-        :($dref * ($c[$sv] - $etav))
+        :($dref * ($tv - $etav))
     else
         eff = _stage_lane(r.label, :eff)
         p = length(r.threshold_columns)
@@ -1565,13 +1575,12 @@ function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
             for (ci, col) in enumerate(r.threshold_columns)]
         push!(prests, :($eff = $(foldl((a, b) -> :($a .+ $b), terms))))
         push!(inputs, eff)
-        :($dref * ($c[$sv] - $etav - $(_dovar(length(inputs)))))
+        :($dref * ($tv - $etav - $(_dovar(length(inputs)))))
     end
     cell = :($sv < $yv ? $(_ordinal_logCC(r.link, z)) : $(_ordinal_logF(r.link, z)))
     if r.weights !== nothing
-        wv = _ordinal_lane_ref!(inputs, prests, r.weights, obs,
-            _stage_lane(r.label, :w))
-        cell = :($wv * $cell)
+        cell = _weighted_cell(_ordinal_lane_ref!(inputs, prests, r.weights,
+            obs, _stage_lane(r.label, :w)), cell)
     end
     return Expr[prests..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end

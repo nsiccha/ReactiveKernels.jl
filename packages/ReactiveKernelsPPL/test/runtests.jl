@@ -37,6 +37,7 @@ include("test_joint_emitter.jl")
 include("test_joint_decl.jl")
 include("test_joint_parity.jl")
 include("test_reactant_joint.jl")
+include("test_leveled_reactant.jl")
 
 @testset "package skeleton" begin
     @test isdefined(ReactiveKernelsPPL, :ReactiveKernels)
