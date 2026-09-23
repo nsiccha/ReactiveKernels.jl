@@ -1648,6 +1648,18 @@ _tensorized_callee_replacement(callee::GlobalRef) =
     nothing
 _tensorized_callee_replacement(callee) = nothing
 
+# Factorization callees whose tensorized result passes through
+# `_tensorized_factorization` (core.jl).  The call itself is kept, so this
+# never changes which method runs; a bare `F = cholesky(A)` recipe keeps its
+# raw identity and is not rewritten.
+_tensorized_factorization_callee(callee::Symbol) = callee === :cholesky
+_tensorized_factorization_callee(callee::GlobalRef) =
+    callee.name === :cholesky && nameof(callee.mod) === :LinearAlgebra
+_tensorized_factorization_callee(callee::Expr) =
+    callee.head === :. && length(callee.args) == 2 &&
+    callee.args[2] == QuoteNode(:cholesky)
+_tensorized_factorization_callee(callee) = false
+
 function _kernel_tensorized_callee(callee, known::Set{Symbol}, mod)
     callee isa Symbol && !(callee in known) && mod isa Module &&
         isdefined(mod, callee) && return GlobalRef(mod, callee)
@@ -1883,9 +1895,11 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         callee = replacement === nothing ?
             _kernel_tensorized_callee(ex.args[1], known, mod) :
             GlobalRef(@__MODULE__, replacement)
-        return Expr(:call, callee,
+        call = Expr(:call, callee,
             (_kernel_tensorized_rhs(arg, known, mod, scope)
              for arg in ex.args[2:end])...)
+        _tensorized_factorization_callee(ex.args[1]) || return call
+        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_factorization), call)
     elseif ex.head in (:vcat, :hcat) &&
            !any(arg -> arg isa Expr && arg.head === :row, ex.args)
         # `[a; b]` / `[a b]` concatenation syntax; `:row`-bearing forms are

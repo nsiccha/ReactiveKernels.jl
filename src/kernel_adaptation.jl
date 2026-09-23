@@ -5036,9 +5036,9 @@ _sm_machine_state_type(
 # A Cholesky wrapper travels as its `(factors, uplo, info)` parts: the factors
 # recurse structurally, `uplo` is a static identity, and `info` is one numeric
 # column (a factorization computed inside a compiled call may carry a traced
-# success flag).  A backend's representation-only wrapper (Reactant's
-# `BatchedCholesky`) registers its own accessor; anything else is not a
-# Cholesky.
+# success flag).  A backend's representation-only wrapper (the Reactant
+# extension's traced Cholesky) registers its own accessor; anything else is
+# not a Cholesky.
 _sm_observation_cholesky_parts(value::LinearAlgebra.Cholesky) =
     (factors=value.factors, uplo=value.uplo, info=value.info)
 _sm_observation_cholesky_parts(value) = nothing
@@ -5547,6 +5547,18 @@ function _sm_validate_observation_result(
     end
     result
 end
+
+# A recipe whose operation is a bare factorization identity (`F = cholesky(A)`)
+# keeps that identity in the graph, so under a tracing backend it returns the
+# backend's own factorization type.  Before such a value is stored as state it
+# passes through `_tensorized_factorization` (core.jl), which the backend
+# extension specializes to its wrapper; container structure is walked and
+# every other leaf is returned unchanged.
+@inline _sm_backend_logical_value(value) = _tensorized_factorization(value)
+@inline _sm_backend_logical_value(value::NamedTuple) =
+    map(_sm_backend_logical_value, value)
+@inline _sm_backend_logical_value(value::Tuple) =
+    map(_sm_backend_logical_value, value)
 
 @inline _sm_backend_storage_value(value) = value
 @inline _sm_backend_storage_value(value::NamedTuple) =
@@ -10567,7 +10579,7 @@ end
 function _sm_normalize_compiled_state(
         transition::CompiledStateTransition, value)
     canonical = _sm_canonicalize_topology(
-        value, _sm_compiled_topology(transition))
+        _sm_backend_logical_value(value), _sm_compiled_topology(transition))
     _sm_restore_compiled_external_groups(transition, canonical)
 end
 

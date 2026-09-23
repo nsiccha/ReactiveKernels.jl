@@ -109,21 +109,29 @@ function Reactant.traced_type_inner(
     T
 end
 
-# A runtime-generated function is static program structure: its `body` is an
-# `Expr` whose `GlobalRef`s carry `Core.Binding` back-references (a cycle the
-# generic tracer does not terminate on), and it never holds a traced operand.
-# A retained loop's body closure captures the compiled step as a value, and
-# `@trace while` hands every captured value to the tracer, so shield it here.
+# The step of a retained transition loop: its compiled body program and the
+# ensure tuple the body receives (which also holds that program).  Both are
+# static program structure — a runtime-generated function's `body` is an
+# `Expr` whose `GlobalRef`s carry `Core.Binding` back-references, a cycle the
+# generic tracer does not terminate on — and neither holds a traced operand.
+# `@trace` hands every value the loop body captures to the tracer, so the loop
+# captures this wrapper instead of the bare programs.
+struct _TransitionLoopStep{B,E}
+    body::B
+    ensures::E
+end
+
+@inline (step::_TransitionLoopStep)(controls, carry, index) =
+    step.body(step.ensures, controls, carry, index)
+
 function Reactant.make_tracer(
-        seen, previous::ReactiveKernels.RuntimeGeneratedFunctions.RuntimeGeneratedFunction,
-        path, mode; kwargs...)
+        seen, previous::_TransitionLoopStep, path, mode; kwargs...)
     previous
 end
 
 function Reactant.traced_type_inner(
         ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
-        ndevices, runtime) where
-        {T<:ReactiveKernels.RuntimeGeneratedFunctions.RuntimeGeneratedFunction}
+        ndevices, runtime) where {T<:_TransitionLoopStep}
     T
 end
 
@@ -694,43 +702,56 @@ function Reactant.traced_type_inner(
     T
 end
 
-# Reactant represents a traced Cholesky factorization as BatchedCholesky.  A
-# Julia Cholesky cannot carry traced `factors` and `info` consistently because
-# its scalar and metadata field types are not both reflected in type
-# parameters.  Normalize the wrapper at the backend boundary while retaining
-# the source-logical factors/uplo/info contract.
-const _RKBatchedCholesky = Reactant.TracedLinearAlgebra.BatchedCholesky
+# Reactant returns a traced Cholesky factorization as its own
+# `BatchedCholesky`, and a Julia `Cholesky` cannot carry traced `factors` and
+# `info` consistently because its scalar and metadata field types are not both
+# reflected in type parameters.  Every traced Cholesky that enters this
+# package's view is therefore normalized, once, into `_TracedCholesky` below:
+# a Cholesky rebuilt from traced parts (`_sm_cholesky_reconstruct`) and the
+# result of an authored `cholesky(...)` in a tensorized kernel body
+# (`_tensorized_factorization`).  The source-logical factors/uplo/info
+# contract is retained, and every method this package needs (factor access,
+# solves, tracing, state transport) is defined on the wrapper; Reactant's own
+# type is only constructed transiently to call Reactant's solve.
+struct _TracedCholesky{T,S<:AbstractArray,I} <: LinearAlgebra.Factorization{T}
+    factors::S
+    uplo::Char
+    info::I
+end
+
+_TracedCholesky(factors::S, uplo::Char, info::I) where {S<:AbstractArray,I} =
+    _TracedCholesky{eltype(factors),S,I}(factors, uplo, info)
+
 const _RKReactantArray = Union{
     Reactant.TracedRArray,Reactant.AbstractConcreteArray}
 
-# Preserve the diagonal structure of a prepared factorization. Reactant's
-# generic BatchedCholesky solve wraps its factors in triangular matrices,
-# which turns this elementwise operation into two dense triangular solves.
-for RHS in (AbstractVector, AbstractMatrix)
-    @eval function LinearAlgebra.ldiv!(
-            factor::_RKBatchedCholesky{T,<:LinearAlgebra.Diagonal{T}},
-            rhs::$RHS{T}) where {T}
-        rhs .= rhs ./ abs2.(factor.factors.diag)
-        rhs
-    end
-end
+@inline ReactiveKernels._tensorized_factorization(
+        factorization::Reactant.TracedLinearAlgebra.BatchedCholesky) =
+    _TracedCholesky(getfield(factorization, :factors),
+                    getfield(factorization, :uplo),
+                    getfield(factorization, :info))
 
-# Reactant's BatchedCholesky (unlike its BatchedSVD) defines no `getproperty`, so a
-# naturally authored `C.L` / `C.U` throws `type BatchedCholesky has no field L`
-# under `@compile`.  Fill that gap in RK's ext (RK-macro-only per decision
-# `17bnc6t` — normalize the factor accessor here, Reactant untouched), mirroring
-# Julia's `LinearAlgebra.Cholesky` `getproperty` semantics and respecting `uplo`.
-# The real fields (`:factors`/`:uplo`/`:info`) fall through to `getfield`, so RK's
-# own accesses and Reactant's internal use are unchanged.  A batched (ndims>2)
-# factor or an unexpected `uplo` is a LOUD error, never a silent mis-lower.
-function Base.getproperty(F::_RKBatchedCholesky, name::Symbol)
+_reactant_cholesky(F::_TracedCholesky) =
+    Reactant.TracedLinearAlgebra.BatchedCholesky(
+        getfield(F, :factors), getfield(F, :uplo), getfield(F, :info))
+
+Base.size(F::_TracedCholesky) = size(getfield(F, :factors))
+Base.size(F::_TracedCholesky, dimension::Integer) =
+    size(getfield(F, :factors), dimension)
+Base.ndims(F::_TracedCholesky) = ndims(getfield(F, :factors))
+
+# `C.L` / `C.U` / `C.UL` follow `LinearAlgebra.Cholesky`'s `getproperty`
+# semantics and respect `uplo`; the real fields (`:factors`/`:uplo`/`:info`)
+# fall through to `getfield`.  A batched (ndims>2) factor or an unexpected
+# `uplo` is a LOUD error, never a silent mis-lower.
+function Base.getproperty(F::_TracedCholesky, name::Symbol)
     if name === :U || name === :L || name === :UL
         factors = getfield(F, :factors)
         uplo = getfield(F, :uplo)
         (uplo === 'U' || uplo === 'L') || throw(ArgumentError(
-            "BatchedCholesky.$name: unexpected uplo=$(repr(uplo)); expected 'U' or 'L'."))
+            "traced Cholesky .$name: unexpected uplo=$(repr(uplo)); expected 'U' or 'L'."))
         ndims(factors) == 2 || throw(ArgumentError(
-            "BatchedCholesky.$name: factor access is not lowerable for a batched " *
+            "traced Cholesky .$name: factor access is not lowerable for a batched " *
             "factor (ndims(factors)=$(ndims(factors))); only a single 2-D " *
             "factorization is supported — index a single batch element first."))
         if name === :U
@@ -745,13 +766,48 @@ function Base.getproperty(F::_RKBatchedCholesky, name::Symbol)
     return getfield(F, name)
 end
 
+Base.propertynames(F::_TracedCholesky, private::Bool = false) =
+    (:U, :L, :UL, (private ? fieldnames(typeof(F)) : ())...)
+
+# Solves go through Reactant's `BatchedCholesky` solve, except that a
+# diagonal factor stays elementwise: Reactant's generic solve wraps the
+# factors in triangular matrices, which turns this elementwise operation into
+# two dense triangular solves.
+for RHS in (AbstractVector, AbstractMatrix)
+    @eval function LinearAlgebra.ldiv!(
+            factor::_TracedCholesky{T,<:LinearAlgebra.Diagonal{T}},
+            rhs::$RHS{T}) where {T}
+        rhs .= rhs ./ abs2.(getfield(factor, :factors).diag)
+        rhs
+    end
+end
+
+function LinearAlgebra.ldiv!(factor::_TracedCholesky, rhs::AbstractArray)
+    LinearAlgebra.ldiv!(_reactant_cholesky(factor), rhs)
+    rhs
+end
+
+Base.:\(factor::_TracedCholesky, rhs::AbstractVecOrMat) =
+    _traced_cholesky_solve(getfield(factor, :factors), factor, rhs)
+Base.:\(factor::_TracedCholesky{T}, rhs::VecOrMat{Complex{T}}) where
+        {T<:LinearAlgebra.BlasReal} =
+    _traced_cholesky_solve(getfield(factor, :factors), factor, rhs)
+
+_traced_cholesky_solve(factors, factor, rhs) = _reactant_cholesky(factor) \ rhs
+function _traced_cholesky_solve(
+        factors::LinearAlgebra.Diagonal, factor, rhs)
+    size(rhs, 1) == size(factors, 1) || throw(DimensionMismatch(
+        "arguments must have the same number of rows"))
+    rhs ./ abs2.(factors.diag)
+end
+
 # A Cholesky supplied as compiled state carries source-static `info` metadata,
 # while a Cholesky computed inside a compiled call carries Reactant's traced
 # success flag.  Preserve the former, but let Reactant concretize the latter
 # when it crosses the compiled result boundary.
 function Reactant.traced_type_inner(
         ::Type{C}, seen, mode::Reactant.TraceMode, track_numbers::Type,
-        ndevices, runtime) where {C<:_RKBatchedCholesky}
+        ndevices, runtime) where {C<:_TracedCholesky}
     Factors = Reactant.traced_type_inner(
         fieldtype(C, :factors), seen, mode, track_numbers,
         ndevices, runtime)
@@ -761,12 +817,11 @@ function Reactant.traced_type_inner(
         Info = Reactant.traced_type_inner(
             Info, seen, mode, track_numbers, ndevices, runtime)
     end
-    _RKBatchedCholesky{
-        eltype(Factors),Factors,Info}
+    _TracedCholesky{eltype(Factors),Factors,Info}
 end
 
 function Reactant.make_tracer(
-        seen, previous::_RKBatchedCholesky, path, mode; kwargs...)
+        seen, previous::_TracedCholesky, path, mode; kwargs...)
     if mode == Reactant.TracedToTypes
         Reactant.make_tracer(
             seen, previous.factors, Reactant.append_path(path, 1), mode;
@@ -790,32 +845,32 @@ function Reactant.make_tracer(
     else
         previous.info
     end
-    _RKBatchedCholesky(factors, previous.uplo, info)
+    _TracedCholesky(factors, previous.uplo, info)
 end
 
 @inline function ReactiveKernels._sm_cholesky_reconstruct(
         factors::A, uplo, info) where {A<:_RKReactantArray}
-    _RKBatchedCholesky(factors, uplo, info)
+    _TracedCholesky(factors, uplo, info)
 end
 @inline function ReactiveKernels._sm_cholesky_reconstruct(
         factors::LinearAlgebra.Diagonal{T,V}, uplo, info) where
         {T,V<:_RKReactantArray}
-    _RKBatchedCholesky(factors, uplo, info)
+    _TracedCholesky(factors, uplo, info)
 end
 
 @inline ReactiveKernels._sm_backend_storage_value(
-        value::_RKBatchedCholesky) =
+        value::_TracedCholesky) =
     ReactiveKernels._sm_cholesky_reconstruct(
         ReactiveKernels._sm_backend_storage_value(value.factors),
         value.uplo, value.info)
 
-# The observational outbox stores a Cholesky as its parts; Reactant's traced
+# The observational outbox stores a Cholesky as its parts; the traced
 # wrapper exposes the same three.
-ReactiveKernels._sm_observation_cholesky_parts(value::_RKBatchedCholesky) =
+ReactiveKernels._sm_observation_cholesky_parts(value::_TracedCholesky) =
     (factors=value.factors, uplo=value.uplo, info=value.info)
 
 function ReactiveKernels._sm_materialize_observation(
-        value::_RKBatchedCholesky,
+        value::_TracedCholesky,
         ::Type{T}) where {T<:LinearAlgebra.Cholesky}
     LinearAlgebra.Cholesky(
         ReactiveKernels._sm_materialize_observation(
@@ -825,7 +880,7 @@ end
 
 function ReactiveKernels._sm_functional_argument_type_ok(
         ::Type{Actual}, ::Type{Expected}) where
-        {Actual<:_RKBatchedCholesky,
+        {Actual<:_TracedCholesky,
          Expected<:LinearAlgebra.Cholesky}
     ReactiveKernels._sm_functional_argument_type_ok(
         fieldtype(Actual, :factors), fieldtype(Expected, :factors)) &&
@@ -835,29 +890,29 @@ function ReactiveKernels._sm_functional_argument_type_ok(
 end
 
 ReactiveKernels._sm_functional_shape_ok(
-        actual::_RKBatchedCholesky,
+        actual::_TracedCholesky,
         expected::LinearAlgebra.Cholesky) =
     ReactiveKernels._sm_functional_shape_ok(
         actual.factors, expected.factors)
 
 ReactiveKernels._sm_shape_contract_ok(
-        value::_RKBatchedCholesky, expected::Tuple) =
+        value::_TracedCholesky, expected::Tuple) =
     ReactiveKernels._sm_shape_contract_ok(value.factors, expected)
 
 function ReactiveKernels._sm_topology_leaves!(
-        leaves, value::_RKBatchedCholesky, path::Tuple)
+        leaves, value::_TracedCholesky, path::Tuple)
     ReactiveKernels._sm_topology_leaves!(
         leaves, value.factors, (path..., :factors))
 end
 
 @inline ReactiveKernels._sm_structural_copy(
-        value::_RKBatchedCholesky) =
+        value::_TracedCholesky) =
     ReactiveKernels._sm_cholesky_reconstruct(
         ReactiveKernels._sm_structural_copy(value.factors),
         value.uplo, value.info)
 
 @inline function ReactiveKernels._sm_predicated_select(
-        active, new::_RKBatchedCholesky, old::_RKBatchedCholesky)
+        active, new::_TracedCholesky, old::_TracedCholesky)
     new.uplo == old.uplo && new.info === old.info || throw(ArgumentError(
         "predicated functional state cannot change Cholesky metadata"))
     ReactiveKernels._sm_cholesky_reconstruct(
@@ -868,7 +923,7 @@ end
 
 function ReactiveKernels._sm_finite_validate_node(
         node::ReactiveKernels._SMFiniteCholeskyNode{Uplo,Info},
-        value::_RKBatchedCholesky, static_values, path::Tuple,
+        value::_TracedCholesky, static_values, path::Tuple,
         strict::Val) where {Uplo,Info}
     value.uplo === Uplo && value.info === Info || throw(ArgumentError(
         "finite structural Cholesky metadata at $path was replaced"))
@@ -883,7 +938,7 @@ end
 # step as representation-only.  Core still rejects every other array
 # structural path.
 @inline function ReactiveKernels._sm_structural_set(
-        value::_RKBatchedCholesky,
+        value::_TracedCholesky,
         ::Val{Path}, replacement) where {Path}
     first(Path) === :factors || throw(ArgumentError(
         "traced Cholesky structural path must name `factors`"))
@@ -902,12 +957,12 @@ ReactiveKernels._sm_restore_source_logical_wrappers(
 ReactiveKernels._sm_restore_source_logical_wrappers(
         ::LinearAlgebra.Diagonal, value::Reactant.TracedRArray{T,2}) where {T} =
     LinearAlgebra.Diagonal(LinearAlgebra.diag(value))
-# A batched Cholesky already IS the traced representation of a source
+# A traced Cholesky already IS the traced representation of a source
 # Cholesky; its traced `info` is not host metadata to compare against.
 ReactiveKernels._sm_restore_source_logical_wrappers(
-        ::LinearAlgebra.Cholesky, value::_RKBatchedCholesky) = value
+        ::LinearAlgebra.Cholesky, value::_TracedCholesky) = value
 ReactiveKernels._sm_restore_source_logical_wrappers(
-        ::_RKBatchedCholesky, value::_RKBatchedCholesky) = value
+        ::_TracedCholesky, value::_TracedCholesky) = value
 
 # A structured-state port is the same immutable program resource plus its
 # generated repair table.  Standalone generic structured operations may
@@ -1215,8 +1270,11 @@ function ReactiveKernels._sm_transition_loop_backend(
     # carry again, and once more for the final carry.
     schema = _carry_schema(carry)
     carry = _recurrence_trace(carry)
+    # Not named `step`: `@trace for` over a non-literal range calls an
+    # unqualified `step(range)` in this scope.
+    loop_step = _TransitionLoopStep(body, ensures)
     Reactant.@trace track_numbers = false for index in range
-        carry = _recurrence_trace(body(ensures, controls,
+        carry = _recurrence_trace(loop_step(controls,
             ReactiveKernels._sm_restore_source_logical_wrappers(schema, carry),
             index))
     end

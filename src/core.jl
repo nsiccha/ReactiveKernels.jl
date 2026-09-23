@@ -217,6 +217,16 @@ end
     sum(_tensorized_broadcast(*, a, b))
 end
 
+# A factorization call (`cholesky(A)`) in a tensorized body.  A tracing
+# backend returns its own factorization type, whose surface can differ from
+# `LinearAlgebra.Cholesky` (Reactant's has no `.L`/`.U`).  The tensorized
+# companion keeps the authored call unchanged and passes its result through
+# this hook; a tracing extension specializes it to wrap its backend type in a
+# type the extension owns, so authored code downstream (`C.L`, `C \ b`) never
+# needs methods on a foreign type.  Per user decision `17bnc6t` this
+# normalizes in the `@kernel` lowering, not in the backend.
+@inline _tensorized_factorization(factorization) = factorization
+
 # The sequential-scan primitive `scan(xs..., Ref(shared)...; init) do carry, x…, s… end`
 # lowers to this.  `step` is the prepared 2-`want` step kernel
 # `(carry, x..., shared...) -> (new_carry, output)`; the scan threads `carry`
