@@ -10,6 +10,7 @@ testfiles = [joinpath(@__DIR__, "test_nonallocating.jl"),
              joinpath(@__DIR__, "test_nonallocating_mnist.jl"),
              joinpath(@__DIR__, "test_nonallocating_ad.jl"),
              joinpath(@__DIR__, "test_ppl_glm_nonallocating_ad.jl"),
+             joinpath(@__DIR__, "test_ppl_joint_nonallocating.jl"),
              joinpath(@__DIR__, "test_reactive_nonallocating.jl"),
              joinpath(root, "packages", "ReactiveKernelsBatchingExamples",
                       "test", "test_batched_nonallocating.jl")]
