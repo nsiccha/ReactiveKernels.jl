@@ -6,10 +6,10 @@ first implementation moves those recurrences behind a general RK runtime
 boundary, `_rectangular_fold(step, init, columns, shared, marker)`.
 
 **Status:** joint primal proof on released toolchains. The PK reverse needs two
-Enzyme-JAX fixes that are not released yet (see "Reverse status"). With them,
-one of them emulated, the joint K=1 and K=3 gradients match native. The PK
-adapter is disabled by default. Set `RK_RECTANGULAR=1` in
-`bench_rkppl_reactant.jl` to opt in for measurements. This is not a supported
+Enzyme-JAX fixes that are not released yet (see "Reverse status"). With both,
+on the CI-built Reactant_jll of Enzyme-JAX PR #3241, the joint K=1 and K=3
+gradients match native. The PK adapter is disabled by default. Set
+`RK_RECTANGULAR=1` in `bench_rkppl_reactant.jl` to opt in for measurements. This is not a supported
 sampler configuration or a demonstrated runtime improvement. Ordinary traced PK
 calls now fail explicitly with the issue link; they never fall back to the
 unrolled host recurrence. Native PK execution is unchanged. Both direct and
@@ -121,7 +121,9 @@ CPU fusion is the acceptance path. No K=10 measurement precedes stable K=3.
 
 Two Enzyme-JAX defects stood between the retained PK recurrence and a correct
 compiled gradient. Both are backend fixes; neither is in a Reactant_jll release
-yet, so the PK adapter stays opt-in (`_rectangular_pk_enabled`).
+yet, so the PK adapter stays opt-in (`_rectangular_pk_enabled`). Both fixes
+together pass on a real CI-built binary (see "Reverse acceptance on the #3241
+CI build").
 
 1. **Reverse fails to compile** (`had set op which was not a direct
    descendant`): [ReactiveKernels #13](https://github.com/nsiccha/ReactiveKernels.jl/issues/13),
@@ -136,12 +138,14 @@ yet, so the PK adapter stays opt-in (`_rectangular_pk_enabled`).
    rate-parameter derivatives were 6–59% off in `repro_rectangular_reverse.jl`.
    Reproducer `repro_nested_if_reverse.jl` (Reactant and Enzyme only:
    -11.208 instead of -17.273). Fixed by zeroing the adjoints in front of the
-   reverse op, as the `scf.if` reverse already does (Enzyme-JAX commit
-   `a3c08614`, stacked on #3240, not yet published).
+   reverse op, as the `scf.if` reverse already does: EnzymeAD/Enzyme-JAX
+   #3241 (stacked on #3240; commit `85c34a10`, the same change as the earlier
+   local `a3c08614` with a project-neutral test).
 
 The measurements under "Preliminary reverse measurements" below were taken
-with fix (1) compiled and fix (2) applied to the post-AD IR by emulation; they
-are not a released toolchain.
+with fix (1) compiled and fix (2) applied to the post-AD IR by emulation. The
+section "Reverse acceptance on the #3241 CI build" repeats the parity checks
+with both fixes compiled. Neither is a released toolchain.
 
 ### History: the original blocker
 
@@ -241,6 +245,23 @@ PK cells, and joint emitter native/compiled AD. The MutatingFunctions extension
 also loaded successfully. The later constraint-repair acceptance is the
 858-assertion result above. These checks validate the supported paths; the PK
 reverse reproducer remains an expected failure, outside the test suite.
+
+## Reverse acceptance on the #3241 CI build, 2026-09-23
+
+Not a released toolchain. Setup:
+- Reactant.jl `main` (0.2.287) with Enzyme 0.13.204, Julia 1.10.11.
+- `libReactantExtra` from the `Build Reactant_jll` CI run of Enzyme-JAX PR #3241 (run `35803008630`, head `85c34a10` = #3240 + fix 2, both compiled).
+- CPU backend, default fusion, synchronized, `RK_RECTANGULAR=1`. Record: `rectangular_results.json` key `ci_binary_3241_2026_09_23`.
+
+| Check | Result |
+| --- | --- |
+| `repro_nested_if_reverse.jl` | -17.273417152590273 (exact -17.27341715259027) |
+| `repro_rectangular_reverse.jl` | all 10 gradient entries match native |
+| Joint K=1 gradient parity vs native (max rel) | 5.6e-14 |
+| Joint K=3 gradient parity vs native (max rel) | 1.3e-14 |
+| Joint K=1 / K=3 primal relative error | 1.9e-16 / 1.5e-16 |
+
+strato2 was heavily shared during these runs (native gradient 0.78–0.82 ms instead of 0.20/0.49 ms), so this section records correctness only. The runtime numbers remain those below.
 
 ## Preliminary reverse measurements (emulated fix), 2026-09-22
 
