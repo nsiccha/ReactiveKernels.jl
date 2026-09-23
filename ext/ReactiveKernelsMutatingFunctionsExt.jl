@@ -17,13 +17,6 @@ end
 # An authored plate's pointwise result is one ordinary single-output recipe.
 # Reuse that recipe's borrowed cache after the first call while preserving the
 # exact broadcast/Ref argument semantics used by allocating execution.
-@inline function _authored_plate_array_cache(
-        cache::Array{T}, combined_axes::Tuple{Vararg{Any,N}}) where {T,N}
-    result = cache isa Array{T,N} && Base.axes(cache) == combined_axes ?
-             cache : similar(cache, T, combined_axes)
-    result::Array{T,N}
-end
-
 @inline function _apply_authored_plate!(
         cache, op::ReactiveKernels._AuthoredPlateOp{K,A}, args...) where {K,A}
     wrapped = ReactiveKernels._authored_plate_arguments(Val(A), args...)
@@ -48,6 +41,13 @@ end
     result
 end
 
+@inline function _authored_plate_array_cache(
+        cache::Array{T}, combined_axes::Tuple{Vararg{Any,N}}) where {T,N}
+    result = cache isa Array{T,N} && Base.axes(cache) == combined_axes ?
+             cache : similar(cache, T, combined_axes)
+    result::Array{T,N}
+end
+
 
 @inline MutatingFunctions.apply!!(
     cache::AbstractArray, op::ReactiveKernels._AuthoredPlateOp, args...) =
@@ -65,6 +65,48 @@ end
     result = _apply_authored_plate!(slot[], op, args...)
     slot[] = result
     result
+end
+
+# Fixed-arity plate steps: the slurped `args...` tuple above round-trips
+# through `ntuple` construction and two splats, which boxes one tuple per call
+# on Julia 1.10 even though every element is stack-allocatable. Bind every
+# argument explicitly for the arities programs actually emit, with the
+# cache-selection logic fully inline (the axes tuple must not cross a helper
+# boundary either); the varargs methods stay as the fallback for degenerate
+# (0-argument, which throws) and very wide plates.
+for _PLATE_N in 1:8
+    _a = [Symbol(:_plate_a_, i) for i in 1:_PLATE_N]
+    _w = [Symbol(:_plate_w_, i) for i in 1:_PLATE_N]
+    _binds = [quote
+        $(_w[i]) = ReactiveKernels._authored_plate_argument(Val(A), $i,
+            $(_a[i]))
+    end for i in 1:_PLATE_N]
+    @eval @inline function cache_apply!(slot::Base.RefValue{SA},
+            op::ReactiveKernels._AuthoredPlateOp{K,A},
+            $(_a...)) where {K,A,SA<:Array}
+        $(_binds...)
+        combined_axes = Base.Broadcast.combine_axes($(_w...))
+        isempty(combined_axes) && throw(ArgumentError(
+            "an authored plate requires at least one non-Ref batched argument"))
+        cache = slot[]
+        output_type = eltype(cache)
+        result = if cache isa Array{output_type}
+            if ndims(cache) == length(combined_axes) &&
+               Base.axes(cache) == combined_axes
+                cache
+            else
+                similar(cache, output_type, combined_axes)
+            end
+        elseif Base.axes(cache) == combined_axes &&
+               eltype(cache) == output_type
+            cache
+        else
+            similar(cache, output_type, combined_axes)
+        end
+        Base.Broadcast.broadcast!(op.kernel, result, $(_w...))
+        slot[] = result
+        result
+    end
 end
 
 # --- destination-passing step coverage --------------------------------------
@@ -118,6 +160,55 @@ end
     size(cache, 1) == rows
 end
 
+# Elementwise `+`/`-` over dense arrays. `Base.+`/`Base.-` on arrays check
+# exact shape agreement and then broadcast (`arraymath.jl`), so on matching
+# shapes `broadcast!` into the cache computes bit-identical values with no
+# temporary; anything else (shape mismatch, mixed eltypes, exotic operands)
+# falls back to the twin call, preserving its exact result and errors. Only
+# `+` has an N-ary method (`-(a, b, c)` is a `MethodError`), so only `+` gets
+# the 3-argument and slurped forms. Restricted to exact `Array` operands: a
+# structured array could shadow the generic method with non-elementwise
+# semantics, and those stay on the allocating fallback.
+@inline function _add_destination_matches(cache::Array{T,N}, args) where {T,N}
+    length(args) >= 2 || return false
+    all(a -> a isa Array{T,N}, args) || return false
+    ax = axes(args[1])
+    all(a -> axes(a) == ax, args) || return false
+    axes(cache) == ax
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T,N}, ::typeof(+), a::Array{T,N}, b::Array{T,N}) where {T,N}
+    _add_destination_matches(cache, (a, b)) || return a + b
+    Base.Broadcast.broadcast!(+, cache, a, b)
+    cache
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T,N}, ::typeof(+),
+        a::Array{T,N}, b::Array{T,N}, c::Array{T,N}) where {T,N}
+    _add_destination_matches(cache, (a, b, c)) || return a + b + c
+    Base.Broadcast.broadcast!(+, cache, a, b, c)
+    cache
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T,N}, ::typeof(+),
+        a::Array{T,N}, b::Array{T,N}, c::Array{T,N}, d::Array{T,N},
+        rest::Array{T,N}...) where {T,N}
+    args = (a, b, c, d, rest...)
+    _add_destination_matches(cache, args) || return +(args...)
+    Base.Broadcast.broadcast!(+, cache, args...)
+    cache
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T,N}, ::typeof(-), a::Array{T,N}, b::Array{T,N}) where {T,N}
+    _add_destination_matches(cache, (a, b)) || return a - b
+    Base.Broadcast.broadcast!(-, cache, a, b)
+    cache
+end
+
 @inline function MutatingFunctions.apply!!(
         cache::Array{T,N}, op::ReactiveKernels._ConcatenateStep{typeof(vcat)},
         args...) where {T,N}
@@ -130,6 +221,54 @@ end
         offset += rows
     end
     cache
+end
+
+# One-dimensional gather without constructing the view object: contiguous
+# ranges copy with offsets, anything else 1-D copies elementwise in index
+# order — both bit-identical to `x[idx]`, whose bounds behavior they preserve
+# (`copyto!`/scalar indexing throw the same `BoundsError`). Any shape the loop
+# does not cover (non-vectors, empty-vs-nonempty mismatches, exotic indices)
+# falls back to the twin call, which reseeds the cache.
+@inline function MutatingFunctions.apply!!(
+        cache::Vector{T}, ::ReactiveKernels._GatherStep,
+        x::AbstractVector{T}, idx::AbstractRange) where {T}
+    n = length(idx)
+    n == 0 && return length(cache) == 0 ? cache : x[idx]
+    length(cache) == n || return x[idx]
+    if idx isa Union{UnitRange,Base.OneTo}
+        return copyto!(cache, 1, x, first(idx), n)
+    end
+    for (i, j) in enumerate(idx)
+        cache[i] = x[j]
+    end
+    cache
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Vector{T}, ::ReactiveKernels._GatherStep,
+        x::AbstractVector{T}, idx::AbstractVector{<:Integer}) where {T}
+    eltype(idx) === Bool && return _gather_slow!(cache, x, idx)
+    n = length(idx)
+    n == 0 && return length(cache) == 0 ? cache : x[idx]
+    length(cache) == n || return x[idx]
+    for i in 1:n
+        cache[i] = x[idx[i]]
+    end
+    cache
+end
+
+# Shapes the fast loops do not cover (non-vectors, multiple indices, logical
+# masks, exotic ranges): the previous view-plus-materialize computation,
+# reusing the tested `_MaterializeStep` method, so behavior never regresses
+# from before `_GatherStep` existed.
+@inline function _gather_slow!(cache, x, idx...)
+    MutatingFunctions.apply!!(cache, ReactiveKernels._MaterializeStep(),
+        Base.Broadcast.broadcasted(Base.identity, view(x, idx...)))
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::AbstractArray, ::ReactiveKernels._GatherStep, x, idx...)
+    _gather_slow!(cache, x, idx...)
 end
 
 @inline function MutatingFunctions.apply!!(
