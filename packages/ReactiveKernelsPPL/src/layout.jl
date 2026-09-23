@@ -339,17 +339,15 @@ for K probabilities; threshold vectors pack their size."""
 _vector_constrained_size(e::LayoutEntry) =
     e.transform === :simplex ? e.size + 1 : e.size
 
-# Scalar logistic (Stan `inv_logit`) and logit, shared by the host
-# simplex edges and their in-graph twins below.
-_ordered_sigma(x::Float64) = 1.0 / (1.0 + exp(-x))
+# Scalar logit, the host simplex inverse's break-fraction map.
 _simplex_logit(z::Float64) = log(z) - log1p(-z)
 
 """
     ordered_constrain(u) -> Vector{Float64}
 
 Host-side ordered transform (Stan `ordered`): `y[1] = u[1]`,
-`y[i] = y[i-1] + exp(u[i])`. The in-graph twin unrolls the identical
-scalar chain.
+`y[i] = y[i-1] + exp(u[i])` — the running sum `cumsum` computes in the
+same order, which is what the in-graph twin emits (bit-identical).
 """
 function ordered_constrain(u::AbstractVector{<:Real})
     y = Vector{Float64}(undef, length(u))
@@ -385,23 +383,28 @@ end
 Host-side stick-breaking simplex transform (thin-layer-owned
 parameterization — NOT Stan's isometric-log-ratio `simplex_constrain`;
 the middle layer owns layout+transforms, the LKJ-factor precedent):
-`z[j] = σ(u[j] + log(K-j))`, `s[j] = remaining[j]*z[j]`,
-`s[K] = remaining[K]`. Empty input constrains to `[1.0]` (the
-deterministic 1-simplex, as in Stan). The in-graph twin unrolls the
-identical scalar chain.
+break fractions `z[j] = σ(u[j] + log(K-j))`, stick remainders
+`r[j] = Π_{i<j} (1 - z[i])` (in closed form, `exp` of the running sum of
+`log1p(-z)`), `s[j] = r[j]*z[j]`, `s[K] = r[K]`. Empty input constrains
+to `[1.0]` (the deterministic 1-simplex, as in Stan). The in-graph twin
+(`_vector_transform_statements`) emits these identical vector operations,
+so host and graph agree bit-for-bit.
 """
 function simplex_constrain(u::AbstractVector{<:Real})
+    length(u) == 0 && return [1.0]
+    z, _, lr = _simplex_breaks(u)
+    return exp.(lr) .* vcat(z, ones(1))
+end
+
+# Break fractions `z` (K−1), `l = log1p(-z)` (K−1), and log stick remainders
+# `lr` (K, `lr[1] = 0`) of the stick-breaking simplex — the vector operations
+# the in-graph twin emits statement by statement.
+function _simplex_breaks(u::AbstractVector{<:Real})
     K = length(u) + 1
-    s = Vector{Float64}(undef, K)
-    K == 1 && (s[1] = 1.0; return s)
-    remaining = 1.0
-    for (j, x) in enumerate(u)
-        z = _ordered_sigma(Float64(x) + log(K - j))
-        s[j] = remaining * z
-        remaining -= s[j]
-    end
-    s[K] = remaining
-    return s
+    z = 1.0 ./ (1.0 .+ exp.(-(Float64.(u) .+ log.(K .- (1:(K - 1))))))
+    l = log1p.(-z)
+    lr = cumsum(vcat(0.0, l))
+    return z, l, lr
 end
 
 """Inverse of [`simplex_constrain`](@ref) (stick-breaking, not Stan's ILR
@@ -421,18 +424,11 @@ function simplex_unconstrain(s::AbstractVector{<:Real})
 end
 
 """Log-Jacobian of [`simplex_constrain`](@ref):
-`Σ [log(remaining) + log(z) + log1p(-z)]` over the K−1 breaks."""
+`Σ [log(r) + log(z) + log1p(-z)]` over the K−1 breaks."""
 function simplex_logjac(u::AbstractVector{<:Real})
-    K = length(u) + 1
-    K == 1 && return 0.0
-    total = 0.0
-    remaining = 1.0
-    for (j, x) in enumerate(u)
-        z = _ordered_sigma(Float64(x) + log(K - j))
-        total += log(remaining) + log(z) + log1p(-z)
-        remaining -= remaining * z
-    end
-    return total
+    length(u) == 0 && return 0.0
+    z, l, lr = _simplex_breaks(u)
+    return sum(view(lr, 1:length(u)) .+ log.(z) .+ l)
 end
 
 """
@@ -917,8 +913,9 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
 end
 
 # Entry-level vector edges (host side). The in-graph twins in
-# `_vector_transform_statements`/`jacobian_term` unroll the IDENTICAL
-# scalar chains, so host and graph agree bit-for-bit.
+# `_vector_transform_statements`/`jacobian_term` emit the IDENTICAL
+# operations (vector statements for thresholds/simplexes, per-element
+# edges for `:exp`), so host and graph agree bit-for-bit.
 _vector_constrain(e::LayoutEntry, seg) =
     e.transform === :identity ? Vector{Float64}(seg) :
     e.transform === :ordered ? ordered_constrain(seg) :
@@ -1142,68 +1139,67 @@ function _plate_transform_statements(e::LayoutEntry)
     ]
 end
 
-# Constrained-element / stick-breaking-temporary names for a `:vector`
-# entry: `_ppl_v_<name>_<i>` (elements, shared with the generator's prior
-# and likelihood cells), `_ppl_vz_<name>_<j>` (break fractions),
-# `_ppl_vr_<name>_<j>` (remainders). All `_ppl_`-hygienic.
+# Per-element scalar names of a positive (`:exp`) `:vector` entry
+# (`_ppl_v_<name>_<i>`, read by the joint-factor prior and the structural
+# L-entry algebra), and the stick-breaking temporaries of a `:simplex`
+# entry: break fractions `_ppl_vz_<name>`, `log1p(-z)` `_ppl_vl_<name>`,
+# log stick remainders `_ppl_vlr_<name>`. All `_ppl_`-hygienic.
 _vector_elt_name(name::Symbol, i::Int) = Symbol(:_ppl_v_, name, :_, i)
 _vector_elt(e::LayoutEntry, i::Int) = _vector_elt_name(e.name, i)
-_vector_z(e::LayoutEntry, j::Int) = Symbol(:_ppl_vz_, e.name, :_, j)
-_vector_r(e::LayoutEntry, j::Int) = Symbol(:_ppl_vr_, e.name, :_, j)
+_vector_z(e::LayoutEntry) = Symbol(:_ppl_vz_, e.name)
+_vector_l(e::LayoutEntry) = Symbol(:_ppl_vl_, e.name)
+_vector_lr(e::LayoutEntry) = Symbol(:_ppl_vlr_, e.name)
 
-# Leveled vector edges: scalar-unrolled twins of the host
-# `ordered_constrain`/`simplex_constrain` (IDENTICAL scalar ops in the
-# IDENTICAL order, so in-graph and host agree bit-for-bit). No vector
-# ever materializes in-graph: downstream prior/likelihood cells read the
-# `_ppl_v_` scalars directly (fully transparent to the planner and the
-# reverse pass — no new Enzyme surface). Empty threshold vectors emit no
-# statements; a 1-simplex emits its constant `[1.0]`.
+# Leveled vector edges (thresholds, threshold-coefficient packs,
+# simplexes): ONE vector-valued statement chain per entry, bound to the
+# entry's own name, whatever its (data-inferred) level count — the
+# statement count and the traced program do not grow with K (core
+# constraint 1). They emit the host `ordered_constrain`/`simplex_constrain`
+# vector operations verbatim, so in-graph and host agree bit-for-bit.
+# Consumers gather from the vector (`Ref(v)` plate inputs, `v[idx]`).
+# Every leading/pivot slice is materialized with `Float64.(…)`: a
+# `vcat` mixing a `SubArray` and a `Vector` lowers through a Union-typed
+# path the native Enzyme reverse pass rejects. Size specializations
+# (empty packs emit nothing — their consumers never read them; a one-element
+# ordered vector is its coordinate; a 1-simplex is the constant `[1.0]`)
+# are finite shape cases, never per-level expansion.
+#
+# `:exp` entries are the joint-factor scales, whose size is the joint
+# outcome count — program structure, not data — and whose readers are the
+# structural per-entry L algebra; they keep per-element scalar edges (the
+# plate `:exp` bijector shape).
 function _vector_transform_statements(e::LayoutEntry)
-    if e.transform === :identity
-        return Expr[:($(_vector_elt(e, i))::Float64 =
-            $(coordinate_read(e.offset + i - 1))) for i in 1:e.size]
-    end
+    lo, hi = e.offset, e.offset + e.size - 1
     if e.transform === :exp
-        # Positive small vectors (joint-factor scales): per-element
-        # bijector edges over packed coordinates (the plate `:exp`
-        # shape, unrolled to `_ppl_v_` scalars for the prior and
-        # L-materialization readers).
         bij = _bijector_name(:exp)
         return Expr[:($(_vector_elt(e, i))::Float64 =
             $(bij)().constrain($(coordinate_read(e.offset + i - 1))))
             for i in 1:e.size]
     end
+    if e.transform === :identity
+        e.size == 0 && return Expr[]
+        return Expr[:($(e.name)::AbstractVector{Float64} =
+            view(unconstrained, $lo:$hi))]
+    end
     if e.transform === :ordered
-        stmts = Expr[]
-        for i in 1:e.size
-            t = _vector_elt(e, i)
-            if i == 1
-                push!(stmts, :($t::Float64 = $(coordinate_read(e.offset))))
-            else
-                prev = _vector_elt(e, i - 1)
-                push!(stmts, :($t::Float64 =
-                    $prev + exp($(coordinate_read(e.offset + i - 1)))))
-            end
-        end
-        return stmts
+        e.size == 0 && return Expr[]
+        e.size == 1 && return Expr[:($(e.name)::AbstractVector{Float64} =
+            view(unconstrained, $lo:$lo))]
+        return Expr[:($(e.name)::AbstractVector{Float64} =
+            cumsum(vcat(Float64.(view(unconstrained, $lo:$lo)),
+                exp.(view(unconstrained, $(lo + 1):$hi)))))]
     end
-    # :simplex — stick-breaking, unrolled (thin-layer-owned, not Stan's ILR).
+    # :simplex — stick-breaking (thin-layer-owned, not Stan's ILR).
     K = e.size + 1
-    stmts = Expr[]
-    K == 1 && return Expr[:($(_vector_elt(e, 1))::Float64 = 1.0)]
-    push!(stmts, :($(_vector_r(e, 1))::Float64 = 1.0))
-    for j in 1:K-1
-        z = _vector_z(e, j)
-        s = _vector_elt(e, j)
-        r = _vector_r(e, j)
-        logK = log(K - j)
-        push!(stmts, :($z::Float64 =
-            1.0 / (1.0 + exp(-($(coordinate_read(e.offset + j - 1)) + $logK)))))
-        push!(stmts, :($s::Float64 = $r * $z))
-        push!(stmts, :($(_vector_r(e, j + 1))::Float64 = $r - $s))
-    end
-    push!(stmts, :($(_vector_elt(e, K))::Float64 = $(_vector_r(e, K))))
-    return stmts
+    K == 1 && return Expr[:($(e.name)::AbstractVector{Float64} = ones(1))]
+    z, l, lr = _vector_z(e), _vector_l(e), _vector_lr(e)
+    return Expr[
+        :($z::AbstractVector{Float64} = 1.0 ./ (1.0 .+ exp.(-(Float64.(
+            view(unconstrained, $lo:$hi)) .+ log.($K .- (1:$(K - 1))))))),
+        :($l::AbstractVector{Float64} = log1p.(-$z)),
+        :($lr::AbstractVector{Float64} = cumsum(vcat(0.0, $l))),
+        :($(e.name)::AbstractVector{Float64} = exp.($lr) .* vcat($z, ones(1))),
+    ]
 end
 
 # Constrained Cholesky entries / logistic-sigma + theta temps for an
@@ -1293,9 +1289,9 @@ function jacobian_term(e::LayoutEntry)
     end
     if e.kind === :vector
         if e.transform === :ordered
+            # Σ u[2:end] over one packed slice (the host `ordered_logjac`).
             e.size < 2 && return nothing
-            terms = Any[coordinate_read(e.offset + i - 1) for i in 2:e.size]
-            return foldl((a, b) -> :($a + $b), terms)
+            return :(sum(view(unconstrained, $(e.offset + 1):$(e.offset + e.size - 1))))
         end
         if e.transform === :exp
             # :exp — Σ u (the exp log-Jacobian is the unconstrained value).
@@ -1303,12 +1299,12 @@ function jacobian_term(e::LayoutEntry)
             terms = Any[coordinate_read(e.offset + i - 1) for i in 1:e.size]
             return foldl((a, b) -> :($a + $b), terms)
         end
-        # :simplex — Σ [log(r) + log(z) + log1p(-z)] over the
-        # breaks, reading the `_vector_transform_statements` temps.
+        # :simplex — Σ [log(r) + log(z) + log1p(-z)] over the K−1 breaks,
+        # reading the `_vector_transform_statements` temps (the host
+        # `simplex_logjac`).
         e.size < 1 && return nothing
-        terms = Any[:(log($(_vector_r(e, j))) + log($(_vector_z(e, j))) +
-            log1p(-$(_vector_z(e, j)))) for j in 1:e.size]
-        return foldl((a, b) -> :($a + $b), terms)
+        return :(sum(view($(_vector_lr(e)), 1:$(e.size)) .+
+            log.($(_vector_z(e))) .+ $(_vector_l(e))))
     end
     if e.kind === :plate || e.kind === :spline ||
        e.kind === :varying || e.kind === :hsgp || e.kind === :glm

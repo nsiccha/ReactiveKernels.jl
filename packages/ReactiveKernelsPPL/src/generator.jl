@@ -95,6 +95,9 @@ import ..positive_bijector, ..unit_bijector
 # In-model grouping encoder (`_ppl_gidx_<group>` nodes call it with the
 # raw column + literal declared levels).
 import .._declared_codes
+# Stopping-ratio stage-lane tables (data-only recipes over the bound
+# response; `preprocessing.jl`).
+import .._ordinal_stage_obs, .._ordinal_stage_idx
 # Grouped-kernel cell vocabulary: the subject-batched runners (one call
 # per cell assignment over the bound op columns + `op_ends`, per-subject
 # args marked `SubjectScalar` / `SubjectSlice`) and the cells they run.
@@ -1428,25 +1431,33 @@ end
 # Stable log-difference of log-probs (a ≥ b): `a + log1p(-exp(b - a))`.
 _log_diff_exp(a, b) = :($a + log1p(-exp($b - $a)))
 
-# Per-threshold effect column name (stage j of response `label`).
-_eff_name(label::Symbol, j::Int) = Symbol(:_ppl_eff_, label, :_, j)
-
 # Modeled-scale precompute name (response `label`).
 _disc_name(label::Symbol) = Symbol(:_ppl_disc_, label)
 
-# Ordinal latent scale as a plate do-var: absent inlines 1.0 (the
-# 3-positional form — byte-identical emission), a literal inlines, a data
-# column threads raw, and a log-link predictor threads its `exp`
-# precompute (structural positivity — the Poisson `exp.(lp)` precedent).
-function _ordinal_scale_ref!(inputs::Vector{Any}, prests::Vector{Expr},
-        r::LikelihoodSpec, plan::StructuralPlan)
+# Ordinal per-observation reference as a plate do-var: `nothing` inlines
+# `absent`, a literal inlines, and a Symbol (data column / precompute)
+# threads — directly for the per-observation cumulative plate
+# (`rows === nothing`), or gathered onto the stopping-ratio stage lanes
+# (`<lane> = ref[rows]`, emitted into `prests`).
+function _ordinal_lane_ref!(inputs::Vector{Any}, prests::Vector{Expr}, ref,
+        rows, lane::Symbol; absent = 1.0)
+    ref === nothing && return absent
+    ref isa Symbol || return Float64(ref)
+    rows === nothing && return _thread_ref!(inputs, ref)
+    push!(prests, :($lane = $ref[$rows]))
+    return _thread_ref!(inputs, lane)
+end
+
+# Ordinal latent scale source: absent (`nothing` — the 3-positional form),
+# a literal, a data column, or a log-link predictor's `exp` precompute
+# (structural positivity — the Poisson `exp.(lp)` precedent).
+function _ordinal_scale_source!(prests::Vector{Expr}, r::LikelihoodSpec,
+        plan::StructuralPlan)
     d = r.discrimination
-    d === nothing && return 1.0
     if d isa Symbol && any(p -> p.name === d, plan.predictors)
-        push!(inputs, _disc_pre!(prests, r, plan, d))
-        return _dovar(length(inputs))
+        return _disc_pre!(prests, r, plan, d)
     end
-    return _thread_ref!(inputs, d)
+    return d
 end
 
 # Modeled-scale column: `exp` over the scale predictor's lp node (the
@@ -1461,35 +1472,35 @@ function _disc_pre!(prests::Vector{Expr}, r::LikelihoodSpec,
     return name
 end
 
-# Ordered response plate (OrderedLogistic + Ordinal, one uniform path:
-# OrderedLogistic is cumulative-logit with d = 1 and no threshold
-# effects). Threshold scalars thread as broadcast plate inputs; the cell
-# is fully static in structure/link/K. K=1 lowers to a zero cell (SB's
+# Ordered response plate (OrderedLogistic + Ordinal; OrderedLogistic is
+# cumulative-logit with d = 1 and no threshold effects). The thresholds
+# thread as ONE shared vector (`Ref(t)`) that each cell gathers by its own
+# level, so nothing in the emitted program — statements or cell — grows
+# with the level count K. K=1 lowers to a zero cell (SB's
 # zero-information likelihood).
 function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
-    y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
     K = r.n_levels
     K === nothing && throw(ContractValidationError(
         "[generator] ordered response $(r.label) has unresolved n_levels " *
         "(bind_data infers it)"))
-    inputs = Any[y, lp]
+    structure = r.family === OrderedLogisticFam ? :cumulative : r.ordinal_structure
+    structure === :cumulative ||
+        return _ordinal_stopping_stmts(r, plan, node, pw, K)
+    lp = _lp_name(_predictor(plan, r.predictor))
+    inputs = Any[r.response, lp]
     yv, etav = _dovar(1), _dovar(2)
     prests = Expr[]
-    dref = _ordinal_scale_ref!(inputs, prests, r, plan)
-    tnames = [_vector_elt_name(r.thresholds, i) for i in 1:K-1]
-    trefs = [_thread_ref!(inputs, t) for t in tnames]
-    erefs = Any[]
-    if !isempty(r.threshold_columns)
-        for j in 1:K-1
-            push!(inputs, _eff_pre!(prests, r, plan, j))
-            push!(erefs, _dovar(length(inputs)))
-        end
+    dref = _ordinal_lane_ref!(inputs, prests,
+        _ordinal_scale_source!(prests, r, plan), nothing, :_)
+    cell = if K == 1
+        # SB's zero-information likelihood; the cell stays a real Expr
+        # over the (integer) response do-var (`:(0.0)` would quote to a
+        # bare Float64, which the plate builder does not take).
+        :(0.0 * $yv)
+    else
+        push!(inputs, :(Ref($(r.thresholds))))
+        _ordinal_cumulative_cell(r.link, K, yv, etav, dref, _dovar(length(inputs)))
     end
-    structure = r.family === OrderedLogisticFam ? :cumulative : r.ordinal_structure
-    cell = structure === :cumulative ?
-        _ordinal_cumulative_cell(r.link, K, yv, etav, dref, trefs) :
-        _ordinal_stopping_cell(r.link, K, yv, etav, dref, trefs, erefs)
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
@@ -1497,112 +1508,127 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     return Expr[prests..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
-# Stage-j threshold-effect column (StoppingRatio per_threshold): the
-# broadcast sum `Σ_c col_c .* β[j,c]` over the raw design columns and
-# the packed coefficient scalars (stage-major: stage j occupies
-# `(j-1)*p+1 .. j*p`). Emits the precompute statement and returns its
-# name for threading. Data-only columns fold under `bound=`; the
-# broadcast itself is the Gamma-pre pattern.
-function _eff_pre!(prests::Vector{Expr}, r::LikelihoodSpec, plan::StructuralPlan, j::Int)
-    p = length(r.threshold_columns)
-    coefs = r.threshold_coefs
-    terms = Any[]
-    for (c, col) in enumerate(r.threshold_columns)
-        b = _vector_elt_name(coefs, (j - 1) * p + c)
-        push!(terms, :($col .* $b))
-    end
-    rhs = foldl((a, b) -> :($a .+ $b), terms)
-    name = _eff_name(r.label, j)
-    push!(prests, :($name = $rhs))
-    return name
-end
-
-# Cumulative cell: `y == 1` takes logF, `y == K` takes logCC, interior
-# levels take the stable log-difference. Thresholds are ordered
-# (constrained), so hi ≥ lo and the difference is well-defined.
+# Cumulative cell over the shared threshold vector `c`: the first level
+# takes logF at `c[1]`, the last logCC at `c[K-1]`, an interior level `y`
+# the stable log-difference of logF at `c[y]` and `c[y-1]` (thresholds
+# are ordered, so hi ≥ lo). Authored as lazy branches on the observed
+# level: only the observation's own arm runs, so every gather is in bounds
+# by construction; the branch condition reads bound data only, so plate
+# lowering splits the lanes by arm before any backend sees a branch.
 function _ordinal_cumulative_cell(link::LinkFunction, K::Int, yv::Symbol,
-        etav::Symbol, dref, trefs::Vector)
-    # K=1 is SB's zero-information likelihood; the cell stays a real
-    # Expr over the (integer) response do-var (`:(0.0)` would quote to
-    # a bare Float64, which the plate builder does not take).
-    K == 1 && return :(0.0 * $yv)
-    first = _ordinal_logF(link, :($dref * ($(trefs[1]) - $etav)))
-    last = _ordinal_logCC(link, :($dref * ($(trefs[K-1]) - $etav)))
-    K == 2 && return :(ifelse($yv == 1, $first, $last))
-    mid = :(0.0)
-    for y in K-1:-1:2
-        hi = _ordinal_logF(link, :($dref * ($(trefs[y]) - $etav)))
-        lo = _ordinal_logF(link, :($dref * ($(trefs[y-1]) - $etav)))
-        mid = :(ifelse($yv == $y, $(_log_diff_exp(hi, lo)), $mid))
-    end
-    return :(ifelse($yv == 1, $first, ifelse($yv == $K, $last, $mid)))
+        etav::Symbol, dref, c::Symbol)
+    first = _ordinal_logF(link, :($dref * ($c[1] - $etav)))
+    last = _ordinal_logCC(link, :($dref * ($c[$(K - 1)] - $etav)))
+    K == 2 && return :($yv == 1 ? $first : $last)
+    hi = _ordinal_logF(link, :($dref * ($c[$yv] - $etav)))
+    lo = _ordinal_logF(link, :($dref * ($c[$yv - 1] - $etav)))
+    return :($yv == 1 ? $first :
+        ($yv == $K ? $last : $(_log_diff_exp(hi, lo))))
 end
 
-# Stopping-ratio cell (SB `brm_ordinal` structure 2): stage j contributes
-# logCC below `y`, logF at `y`, nothing above. `erefs` holds the
-# per-row effect do-vars (empty without per_threshold — effects are 0).
-function _ordinal_stopping_cell(link::LinkFunction, K::Int, yv::Symbol,
-        etav::Symbol, dref, trefs::Vector, erefs::Vector)
-    # K=1 runs zero stages (SB's zero-information likelihood); see the
-    # cumulative K=1 note on quoting a real Expr.
-    K == 1 && return :(0.0 * $yv)
-    terms = Any[]
-    for j in 1:K-1
-        eff = isempty(erefs) ? 0.0 : erefs[j]
-        z = :($dref * ($(trefs[j]) - $etav - $eff))
-        push!(terms, :(ifelse($yv > $j, $(_ordinal_logCC(link, z)),
-            ifelse($yv == $j, $(_ordinal_logF(link, z)), 0.0))))
+# Stage-lane names for response `label`.
+_stage_lane(label::Symbol, what::Symbol) = Symbol(:_ppl_srl_, what, :_, label)
+
+# Stopping-ratio plate over the stage lanes: each lane reads its
+# observation's predictor/scale/weight (gathered by lane), its stage's
+# threshold from the shared vector `Ref(t)`, and — with per_threshold
+# effects — its stage's coefficient pack entries (stage-major:
+# stage j occupies `(j-1)*p+1 .. j*p`). The cell survives (logCC) or stops
+# (logF) by a lazy branch on the bound stage/level pair, which plate
+# lowering splits by arm. K=1 runs zero stages (SB's zero-information
+# likelihood) and lowers to a zero cell over the observations.
+function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        node::Symbol, pw::Symbol, K::Int)
+    y = r.response
+    if K == 1
+        return _plate_sum_stmts(pw, node, Any[y], :(0.0 * $(_dovar(1))))
     end
-    return foldl((a, b) -> :($a + $b), terms)
+    lp = _lp_name(_predictor(plan, r.predictor))
+    obs, stage = _stage_lane(r.label, :obs), _stage_lane(r.label, :stage)
+    prests = Expr[:($obs = _ordinal_stage_obs($y, $K)),
+        :($stage = _ordinal_stage_idx($y, $K))]
+    level = _stage_lane(r.label, :y)
+    eta = _stage_lane(r.label, :eta)
+    push!(prests, :($level = $y[$obs]), :($eta = $lp[$obs]))
+    inputs = Any[stage, level, eta]
+    sv, yv, etav = _dovar(1), _dovar(2), _dovar(3)
+    dref = _ordinal_lane_ref!(inputs, prests,
+        _ordinal_scale_source!(prests, r, plan), obs, _stage_lane(r.label, :d))
+    push!(inputs, :(Ref($(r.thresholds))))
+    c = _dovar(length(inputs))
+    z = if isempty(r.threshold_columns)
+        :($dref * ($c[$sv] - $etav))
+    else
+        eff = _stage_lane(r.label, :eff)
+        p = length(r.threshold_columns)
+        terms = Any[:($col[$obs] .* $(r.threshold_coefs)[($stage .- 1) .* $p .+ $ci])
+            for (ci, col) in enumerate(r.threshold_columns)]
+        push!(prests, :($eff = $(foldl((a, b) -> :($a .+ $b), terms))))
+        push!(inputs, eff)
+        :($dref * ($c[$sv] - $etav - $(_dovar(length(inputs)))))
+    end
+    cell = :($sv < $yv ? $(_ordinal_logCC(r.link, z)) : $(_ordinal_logF(r.link, z)))
+    if r.weights !== nothing
+        wv = _ordinal_lane_ref!(inputs, prests, r.weights, obs,
+            _stage_lane(r.label, :w))
+        cell = :($wv * $cell)
+    end
+    return Expr[prests..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Shared-simplex multinomial (SB `brm_multinomial` vector[K] method): the
-# count matrix crosses as K raw columns; the simplex parameter threads
-# as K broadcast scalars. The cell is Stan's `multinomial_lpmf` in
-# scalar form — `lgamma(N+1) − Σ lgamma(c+1) + Σ c*log(p)` — with the
-# `0*log(0) = 0` convention guarded per term (Stan treats a zero count
-# at a zero probability as 0, not NaN). A literal N folds its
-# `lgamma(N+1)` host-side (exact same value, computed once).
+# count matrix crosses as K raw columns — program structure (the count
+# columns the model names), not a data-inferred size — and the level
+# log-probabilities `log.(p)` thread as one shared vector the cell reads
+# per column. The cell is Stan's `multinomial_lpmf` in scalar form —
+# `lgamma(N+1) − Σ lgamma(c+1) + Σ c*log(p)` — with the `0*log(0) = 0`
+# convention guarded per term (Stan treats a zero count at a zero
+# probability as 0, not NaN). A literal N folds its `lgamma(N+1)`
+# host-side (exact same value, computed once).
 function _multinomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     counts = [r.response; r.count_columns...]
     K = length(counts)
     inputs = Any[counts...]
     cvs = [_dovar(i) for i in 1:K]
     nref = _thread_ref!(inputs, r.trials, true)
-    prefs = [_thread_ref!(inputs, _vector_elt_name(r.predictor, i)) for i in 1:K]
+    logp = _logp_name(r.label)
+    push!(inputs, :(Ref($logp)))
+    lv = _dovar(length(inputs))
     lfact = r.trials isa Int ? loggamma(r.trials + 1.0) : :(loggamma($nref + 1.0))
     cell = :($lfact)
-    for (cv, pv) in zip(cvs, prefs)
+    for (i, cv) in enumerate(cvs)
         cell = :($cell - loggamma($cv + 1.0) +
-            ifelse($cv == 0, 0.0, $cv * log($pv)))
+            ifelse($cv == 0, 0.0, $cv * $lv[$i]))
     end
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[:($logp::AbstractVector{Float64} = log.($(r.predictor))),
+        _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Plain categorical over shared-simplex probabilities (Stan
-# `categorical_lpmf`): the cell selects `log(p[y])` by the observed
-# level (ifelse chain). K=1 lowers to `log(1.0) = 0` uniformly.
+# `categorical_lpmf`): the level log-probabilities `log.(p)` are one
+# vector statement, and each cell gathers its observed level's entry
+# (`logp[y]`) — no per-level work in the cell. K=1 lowers to
+# `log(1.0) = 0` uniformly.
+_logp_name(label::Symbol) = Symbol(:_ppl_logp_, label)
+
 function _categorical_plain_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
-    K = r.n_levels
-    K === nothing && throw(ContractValidationError(
+    r.n_levels === nothing && throw(ContractValidationError(
         "[generator] categorical response $(r.label) has unresolved n_levels " *
         "(bind_data infers it)"))
-    inputs = Any[r.response]
-    yv = _dovar(1)
-    prefs = [_thread_ref!(inputs, _vector_elt_name(r.predictor, i)) for i in 1:K]
-    cell = :(log($(prefs[1])))
-    for j in 2:K
-        cell = :(ifelse($yv == $j, log($(prefs[j])), $cell))
-    end
+    logp = _logp_name(r.label)
+    inputs = Any[r.response, :(Ref($logp))]
+    yv, lv = _dovar(1), _dovar(2)
+    cell = :($lv[$yv])
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[:($logp::AbstractVector{Float64} = log.($(r.predictor))),
+        _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Joint correlated-outcomes likelihood (SB's per-row
@@ -1676,30 +1702,39 @@ function _mvn_row_cell(K::Int, yvs::Vector{Symbol}, mvs::Vector{Symbol},
 end
 
 # R2D2 prior bindings: the location vector stays a literal (SB
-# `beta_loc`), while the scale vector unrolls per design column —
-# literal fallbacks at share 0, `sqrt(phi[k]*R2*tau^2/varx[j])`
-# expressions over the in-graph simplex elements + scalars otherwise
-# (SB `brm_r2d2_scale`, unrolled — the share map is static data, so no
-# data-dependent branching enters the graph). All radicands are
-# positive by construction (simplex/logistic/exp transforms +
-# validated varx). The consuming plate-sum shape is unchanged.
+# `beta_loc`); the scale vector is ONE broadcast over the share simplex,
+# `sqrt.(phi .* R2 .* tau^2 ./ varx)` (SB `brm_r2d2_scale`), whatever the
+# number of design columns (factor levels included). `r2d2_column_scales`
+# numbers the shares 1..S in design-column order, so the shared columns
+# read `phi` in order; share-0 columns (intercept, explicit-Normal
+# overrides) take literal fallbacks, placed by one constant-index gather
+# over `[shared; fallbacks]` (the share map is static data — no
+# data-dependent branching enters the graph). All radicands are positive
+# by construction (simplex/logistic/exp transforms + validated varx). The
+# consuming plate-sum shape is unchanged.
 function _r2d2_prior_stmts(rp::R2D2Prior, shape::DesignShape,
         columns::AbstractDict{Symbol}, mut::Symbol, sdt::Symbol)
     share, fallback, loc, varx =
         r2d2_column_scales(shape, columns, rp.overrides)
-    elts = Any[]
-    for j in eachindex(share)
-        if share[j] == 0
-            push!(elts, fallback[j])
-            continue
-        end
-        ph = _vector_elt_name(rp.phi, share[j])
-        r2 = rp.r2
-        t2 = rp.tau isa Symbol ? :($(rp.tau) * $(rp.tau)) :
-            Float64(rp.tau)^2
-        push!(elts, :(sqrt($ph * $r2 * $t2 / $(varx[j]))))
+    shared = findall(>(0), share)
+    share[shared] == 1:length(shared) || throw(ContractValidationError(
+        "[generator] R2D2 shares of $(rp.predictor) are not numbered in " *
+        "design-column order (r2d2_column_scales assigns them so)"))
+    t2 = rp.tau isa Symbol ? :($(rp.tau) * $(rp.tau)) : Float64(rp.tau)^2
+    scales = :(sqrt.($(rp.phi) .* $(rp.r2) .* $t2 ./
+        Float64[$(varx[shared]...)]))
+    rhs = if length(shared) == length(share)
+        scales
+    else
+        # Shared scales first, fallbacks after (`vcat(traced, host)` —
+        # the order Reactant concatenates), gathered into column order.
+        fb = findall(==(0), share)
+        perm = zeros(Int, length(share))
+        perm[shared] .= 1:length(shared)
+        perm[fb] .= length(shared) .+ (1:length(fb))
+        :(vcat($scales, Float64[$(fallback[fb]...)])[$(Expr(:vect, perm...))])
     end
-    return Any[:($mut = Float64[$(loc...)]), :($sdt = Float64[$(elts...)])]
+    return Any[:($mut = Float64[$(loc...)]), :($sdt = $rhs)]
 end
 
 _r2d2_for(plan::StructuralPlan, pred::Symbol) = begin
@@ -1768,14 +1803,11 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
             Any[r.glm_beta, mut, sdt], cell))
         push!(terms, node)
     end
-    # Leveled vector latents (cutpoints/thresholds/simplexes/coefficient
-    # packs, joint-factor scales/Cholesky): unrolled scalar sums over the
-    # `_ppl_v_` layout elements (bound plans carry concrete sizes). Empty
-    # packs contribute 0.0.
+    # Vector latents (cutpoints/thresholds/simplexes/coefficient packs,
+    # joint-factor scales/Cholesky): one plate-sum or broadcast per vector
+    # (bound plans carry concrete sizes). Empty packs contribute 0.0.
     for p in plan.vector_parameters
-        node = Symbol(:_ppl_prior_, p.name)
-        push!(stmts, :($node::Float64 = $(_vector_prior_expr(p))))
-        push!(terms, node)
+        _vector_parameter_prior_stmts!(stmts, terms, p)
     end
     # Per-cell latent (plate) parameters: one plate over the block, summing the
     # shared-prior log-density across cells (the same plate-sum shape as a
@@ -2079,46 +2111,57 @@ function _sampled_prior_expr(p::SampledParameter)
     return :($base + $corr)
 end
 
-# Vector-latent prior over the `_ppl_v_` layout elements: elementwise
-# Normal for threshold/coefficient packs (Stan `ordered`/`vector`
-# semantics — no factorial normalizer, matching `_BRMThresholdPrior`),
-# Dirichlet for simplexes (Stan `dirichlet_lpdf`: the log-multivariate-Beta
-# normalizer folds host-side — data-only — plus Σ (α−1)·log(s)),
-# elementwise Exponential for joint-factor scales (a literal scale inlines;
-# a sampled hyperparameter resolves as a body local, the scalar-prior
-# shape), and the shared LKJ node for joint Cholesky factors.
-function _vector_prior_expr(p::VectorParameter)
+# Vector-latent prior node `_ppl_prior_<name>`: elementwise Normal for
+# threshold/coefficient packs as one plate-sum over the vector (Stan
+# `ordered`/`vector` semantics — no factorial normalizer, matching
+# `_BRMThresholdPrior`), Dirichlet for simplexes as one broadcast (Stan
+# `dirichlet_lpdf`: the log-multivariate-Beta normalizer folds host-side —
+# data-only — plus Σ (α−1)·log(s); a symmetric concentration inlines one
+# scalar, an asymmetric one its literal α−1 vector), and — for the
+# structural joint factor, whose size is the joint outcome count —
+# elementwise Exponential over the scale scalars (a literal scale inlines;
+# a sampled hyperparameter resolves as a body local) and the shared LKJ
+# node over the Cholesky scalars. None of the leveled (data-sized) forms
+# grows with the vector length.
+function _vector_parameter_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
+        p::VectorParameter)
     m = p.size
     m === nothing && throw(ContractValidationError(
         "[generator] vector parameter $(p.name) has unresolved size " *
         "(bind_data infers it)"))
-    if p.family === :cholesky_corr_lkj
-        return _lkj_prior_terms(p.name, m, Float64(p.args.arg1))
+    node = Symbol(:_ppl_prior_, p.name)
+    if p.family === :ordered_normal || p.family === :vector_normal
+        if m == 0
+            push!(stmts, :($node::Float64 = 0.0))
+            push!(terms, node)
+            return nothing
+        end
+        _vector_prior_stmts!(stmts, terms, p.name, :normal,
+            (arg1 = Float64(p.args.arg1), arg2 = Float64(p.args.arg2)), nothing)
+        return nothing
     end
-    elts = [_vector_elt_name(p.name, i) for i in 1:m]
-    if p.family === :simplex_dirichlet
+    rhs = if p.family === :simplex_dirichlet
         alpha = Vector{Float64}(p.args.arg1)
         normalizer = loggamma(sum(alpha)) - sum(loggamma, alpha)
-        terms = Any[normalizer]
-        for (a, s) in zip(alpha, elts)
-            push!(terms, :($(a - 1.0) * log($s)))
-        end
-        return foldl((x, y) -> :($x + $y), terms)
-    end
-    if p.family === :positive_exponential
+        am1 = alpha .- 1.0
+        weights = all(==(am1[1]), am1) ? am1[1] : :(Float64[$(am1...)])
+        :($normalizer + sum($weights .* log.($(p.name))))
+    elseif p.family === :cholesky_corr_lkj
+        _lkj_prior_terms(p.name, m, Float64(p.args.arg1))
+    elseif p.family === :positive_exponential
         th = p.args.arg1
         theta = th isa Symbol ? th : Float64(th)
-        terms = Any[:(exponential($theta).logpdf($t)) for t in elts]
-        return foldl((x, y) -> :($x + $y), terms; init = :(0.0))
+        foldl((x, y) -> :($x + $y),
+            Any[:(exponential($theta).logpdf($(_vector_elt_name(p.name, i))))
+                for i in 1:m]; init = :(0.0))
+    else
+        throw(ContractValidationError(
+            "[generator] vector parameter $(p.name) family $(p.family) " *
+            "has no prior form"))
     end
-    if p.family === :ordered_normal || p.family === :vector_normal
-        mu, s = Float64(p.args.arg1), Float64(p.args.arg2)
-        terms = Any[:(normal($mu, $s).logpdf($t)) for t in elts]
-        return foldl((x, y) -> :($x + $y), terms; init = :(0.0))
-    end
-    throw(ContractValidationError(
-        "[generator] vector parameter $(p.name) family $(p.family) " *
-        "has no scalar prior form"))
+    push!(stmts, :($node::Float64 = $rhs))
+    push!(terms, node)
+    return nothing
 end
 
 # --- Sequential-recurrence (scan) density (slice 1: CENTERED) ---
