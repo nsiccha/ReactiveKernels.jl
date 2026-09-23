@@ -1905,12 +1905,74 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
     # with a definition-unique gensym token (RK 07:21) + its Form, so a prepared handle distinguishes it
     # from a manually-inserted raw (opaque) closure without IR inspection. Call forwards inline.
     deftoken = gensym(:rk_srcop)
+    if _kernel_branch_parts(rhs) !== nothing
+        # A top-level lazy branch keeps its parts as `_KernelBranch` metadata
+        # (same lazy call semantics) so plate partial evaluation can split
+        # lanes on a data-bound condition.
+        native, _ = _kernel_branch_callable(rhs, deps, known, mod, false)
+        tensor, _ = _kernel_branch_callable(rhs, deps, known, mod, tensorize)
+        return Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
+             Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
+             Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), native, tensor)
+    end
     Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
          Expr(:->, Expr(:tuple, deps...), rhs),
          Expr(:->, Expr(:tuple, deps...),
               tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs))
+end
+
+# `(condition, then, else)` of a value-producing top-level lazy branch —
+# `c ? a : b` / `if … elseif … else … end` (an `elseif` tail is the nested
+# else arm), `a && b` (else `false`), `a || b` (then `true`) — or `nothing`.
+# An `if` without `else` produces `nothing` on its inactive side and is not a
+# value branch.
+function _kernel_branch_parts(ex)
+    ex = _kernel_branch_unwrap(ex)
+    ex isa Expr || return nothing
+    if ex.head in (:if, :elseif) && length(ex.args) == 3
+        return (_kernel_branch_unwrap(ex.args[1]), ex.args[2], ex.args[3])
+    elseif ex.head === :&& && length(ex.args) == 2
+        return (_kernel_branch_unwrap(ex.args[1]), ex.args[2], false)
+    elseif ex.head === :|| && length(ex.args) == 2
+        return (_kernel_branch_unwrap(ex.args[1]), true, ex.args[2])
+    end
+    nothing
+end
+
+function _kernel_branch_unwrap(ex)
+    ex isa Expr && ex.head === :block || return ex
+    statements = [arg for arg in ex.args if !(arg isa LineNumberNode)]
+    length(statements) == 1 ? _kernel_branch_unwrap(only(statements)) : ex
+end
+
+# One part of a branch recipe as a construction expression, plus the recipe
+# arguments it consumes: a leaf is a closure over its own free ports (in
+# recipe-argument order); a nested branch is a `_KernelBranch` consuming every
+# argument. The condition is always a leaf (any branch inside it stays an
+# inline lazy branch of that closure).
+function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
+                                 mod, tensorize::Bool; leaf::Bool = false)
+    parts = leaf ? nothing : _kernel_branch_parts(part)
+    if parts === nothing
+        read = Set(_kernel_free_ports(part, Set{Symbol}(deps)))
+        ports = Symbol[d for d in deps if d in read]
+        body = tensorize ?
+            _kernel_tensorized_rhs(part, known, mod, Set{Symbol}(ports)) : part
+        return Expr(:->, Expr(:tuple, ports...), body), ports
+    end
+    condition, then_side, else_side = parts
+    positions(ports) = Tuple(findfirst(==(p), deps) for p in ports)
+    call = Expr(:->, Expr(:tuple, deps...), tensorize ?
+        _kernel_tensorized_rhs(part, known, mod, Set{Symbol}(deps)) : part)
+    cex, cports = _kernel_branch_callable(condition, deps, known, mod, tensorize;
+                                          leaf = true)
+    tex, tports = _kernel_branch_callable(then_side, deps, known, mod, tensorize)
+    eex, eports = _kernel_branch_callable(else_side, deps, known, mod, tensorize)
+    val(ports) = Expr(:call, GlobalRef(Base, :Val), positions(ports))
+    Expr(:call, GlobalRef(@__MODULE__, :_KernelBranch),
+         val(cports), val(tports), val(eports), call, cex, tex, eex), deps
 end
 
 function _kernel_nested_endpoint_deps(rhs, deps::Vector{Symbol}, known::Set{Symbol},
