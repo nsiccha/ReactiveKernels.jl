@@ -6,14 +6,16 @@
 # function ReactiveKernels does not own.
 module ReactiveKernelsEnzymeExt
 
-using ReactiveKernels: ScalarDerivativeRule, derivative_cut
+using ReactiveKernels: ScalarDerivativeRule, derivative_cut, DerivativeRule, forward_cut,
+    has_forward_branch, has_reverse_branch, stage_primal, stage_reverse
+using ReactiveKernels: _activity_mask, _stage_residual_sources
 import Enzyme
 using Enzyme: Const, Active, Duplicated, DuplicatedNoNeed, BatchDuplicated,
     BatchDuplicatedNoNeed
 using Enzyme.EnzymeCore: Annotation
 import Enzyme.EnzymeRules
 using Enzyme.EnzymeRules: FwdConfig, RevConfig, AugmentedReturn, needs_primal,
-    needs_shadow, width
+    needs_shadow, width, overwritten
 
 @inline _values(args::Tuple) = map(arg -> arg.val, args)
 
@@ -114,5 +116,146 @@ end
     acc + partial * direction
 @inline _forward_add(acc::Tuple, partial, directions::Tuple) =
     map((lane, direction) -> lane + partial * direction, acc, directions)
+
+# ================================================================ vector ====
+# Rules with authored forward/reverse branches (`DerivativeRule`). Reverse
+# mode stages the graph: the augmented primal runs the primal stage of the
+# selected activity pattern (`stage_primal`: the primal plus the reverse
+# cut's covector-independent residuals, computed once), hands Enzyme a zero
+# shadow for an array result (Enzyme accumulates the covector into it), and
+# retains those residuals; the reverse pass runs `stage_reverse` with the
+# covector and accumulates the cotangents into the argument shadows. Forward mode runs the forward cut with
+# Enzyme's directions (zero for inactive inputs), once per batch lane.
+
+const _ReverseActive = Union{Active,Duplicated,BatchDuplicated}
+@generated _reverse_active_vector(args::Tuple) =
+    Tuple(T <: _ReverseActive for T in args.parameters)
+
+@inline _zero_shadow(::Val{1}, primal) = _zero_like(primal)
+@inline _zero_shadow(::Val{W}, primal) where {W} = ntuple(_ -> _zero_like(primal), Val(W))
+@inline _zero_like(x::AbstractArray) = zero(x)
+@inline _zero_like(x::Number) = zero(x)
+
+# Retain the staged residuals across the reverse pass. An input array Enzyme
+# says may be overwritten before then is copied, and so is a residual that IS
+# the returned primal array (the caller owns it and may overwrite it); fresh
+# intermediates of the primal stage are owned here and kept as they are.
+@inline function _retain_residuals(sources::NTuple{R,Int}, residuals::NTuple{R,Any},
+        primal, overwritten_flags) where {R}
+    ntuple(Val(R)) do k
+        value = residuals[k]
+        value isa AbstractArray || return value
+        source = sources[k]
+        # `overwritten` includes the function object at position 1.
+        source > 0 ? (overwritten_flags[source + 1] ? copy(value) : value) :
+            value === primal ? copy(value) : value
+    end
+end
+
+function EnzymeRules.augmented_primal(
+        config::RevConfig, rule::Const{<:DerivativeRule}, ::Type{RT},
+        args::Vararg{Annotation,N}) where {RT,N}
+    active = _reverse_active_vector(args)
+    values = _values(args)
+    if !any(active) || RT <: Const
+        primal = rule.val(values...)
+        shadow = needs_shadow(config) ? _zero_shadow(Val(width(config)), primal) : nothing
+        return AugmentedReturn(needs_primal(config) ? primal : nothing, shadow, nothing)
+    end
+    has_reverse_branch(rule.val) || throw(ArgumentError(
+        "reverse-mode Enzyme through $(rule.val): the rule has no reverse branch " *
+        "(author a covector + cotangents branch in its graph)"))
+    mask = Val(_activity_mask(active, 1))
+    primal, staged = stage_primal(rule.val, mask, values...)
+    shadow = needs_shadow(config) ? _zero_shadow(Val(width(config)), primal) : nothing
+    residuals = _retain_residuals(_stage_residual_sources(rule.val, mask), staged, primal,
+                                  overwritten(config))
+    AugmentedReturn(needs_primal(config) ? primal : nothing, shadow, (shadow, residuals))
+end
+
+function EnzymeRules.reverse(
+        config::RevConfig, rule::Const{<:DerivativeRule}, dret, tape,
+        args::Vararg{Annotation,N}) where {N}
+    tape === nothing && return ntuple(_ -> nothing, Val(N))
+    shadow, residuals = tape
+    active = _reverse_active_vector(args)
+    mask = _activity_mask(active, 1)
+    _reverse_lanes(Val(width(config)), rule.val, Val(mask), dret, shadow, residuals, args)
+end
+
+# Width 1: one covector, one cotangent per active input.
+@inline function _reverse_lanes(::Val{1}, rule, ::Val{M}, dret, shadow, residuals, args::Tuple) where {M}
+    ȳ = dret isa Active ? dret.val : shadow
+    cotangents = stage_reverse(rule, Val(M), residuals, ȳ)
+    _apply_cotangents(args, cotangents)
+end
+# Width W: one covector per lane; Active arguments return a tuple of lanes,
+# batched arguments accumulate lane by lane.
+@inline function _reverse_lanes(::Val{W}, rule, ::Val{M}, dret, shadow, residuals, args::Tuple) where {W,M}
+    lanes = ntuple(Val(W)) do w
+        ȳ = dret isa Active ? dret.val[w] : shadow[w]
+        stage_reverse(rule, Val(M), residuals, ȳ)
+    end
+    _apply_cotangent_lanes(args, lanes, Val(W))
+end
+
+@inline _apply_cotangents(::Tuple{}, ::Tuple) = ()
+@inline function _apply_cotangents(args::Tuple, cotangents::Tuple)
+    arg = first(args)
+    if arg isa Active
+        (first(cotangents), _apply_cotangents(Base.tail(args), Base.tail(cotangents))...)
+    elseif arg isa Duplicated
+        _accumulate!(arg.dval, first(cotangents))
+        (nothing, _apply_cotangents(Base.tail(args), Base.tail(cotangents))...)
+    else
+        (nothing, _apply_cotangents(Base.tail(args), cotangents)...)
+    end
+end
+@inline _apply_cotangent_lanes(::Tuple{}, lanes, ::Val) = ()
+@inline function _apply_cotangent_lanes(args::Tuple, lanes::Tuple, ::Val{W}) where {W}
+    arg = first(args)
+    if arg isa Active
+        value = ntuple(w -> first(lanes[w]), Val(W))
+        (value, _apply_cotangent_lanes(Base.tail(args), map(Base.tail, lanes), Val(W))...)
+    elseif arg isa BatchDuplicated
+        for w in 1:W
+            _accumulate!(arg.dval[w], first(lanes[w]))
+        end
+        (nothing, _apply_cotangent_lanes(Base.tail(args), map(Base.tail, lanes), Val(W))...)
+    else
+        (nothing, _apply_cotangent_lanes(Base.tail(args), lanes, Val(W))...)
+    end
+end
+@inline function _accumulate!(shadow::AbstractArray, cotangent)
+    shadow .+= cotangent
+    nothing
+end
+
+@inline _direction(arg::Union{Duplicated,DuplicatedNoNeed}) = arg.dval
+@inline _direction(arg::Annotation) = _zero_like(arg.val)
+@inline _direction(arg::Union{BatchDuplicated,BatchDuplicatedNoNeed}, w::Int) = arg.dval[w]
+@inline _direction(arg::Annotation, w::Int) = _zero_like(arg.val)
+
+function EnzymeRules.forward(
+        config::FwdConfig, rule::Const{<:DerivativeRule}, ::Type{RT},
+        args::Vararg{Annotation,N}) where {RT,N}
+    values = _values(args)
+    if RT <: Const || !needs_shadow(config)
+        primal = rule.val(values...)
+        return needs_primal(config) ? primal : nothing
+    end
+    has_forward_branch(rule.val) || throw(ArgumentError(
+        "forward-mode Enzyme through $(rule.val): the rule has no forward branch " *
+        "(author a directions + tangent branch in its graph)"))
+    if width(config) == 1
+        primal, tangent = forward_cut(rule.val, values..., map(_direction, args)...)
+        return needs_primal(config) ? Duplicated(primal, tangent) : tangent
+    end
+    lanes = ntuple(Val(width(config))) do w
+        forward_cut(rule.val, values..., map(arg -> _direction(arg, w), args)...)
+    end
+    tangents = map(last, lanes)
+    needs_primal(config) ? BatchDuplicated(first(lanes)[1], tangents) : tangents
+end
 
 end # module

@@ -945,12 +945,12 @@ function _manual_derivative_rule_sources()
         "@kernel matvec_rule(",
         "# -- END DOCS: pure mathematical derivative rule --",
     )
-    pullback = _source_between(
+    rule = _source_between(
         source,
-        "struct MatvecPullback",
-        "# -- END DOCS: generated-style pullback staging --",
+        "const matvec = derivative_rule(",
+        "# -- END DOCS: generated rule --",
     )
-    (; path, graph, pullback)
+    (; path, graph, rule)
 end
 
 """
@@ -1009,10 +1009,11 @@ function render_manual_derivative_rule_cuts()
     render_examples(artifacts)
 end
 
-"""Render the exact example-owned value-plus-pullback staging source."""
-function render_manual_derivative_pullback_source()
+"""Render the example's exact rule graph and its `derivative_rule` declaration."""
+function render_manual_derivative_rule_source()
+    sources = _manual_derivative_rule_sources()
     Markdown.MD(Any[Markdown.Code(
-        "julia", _manual_derivative_rule_sources().pullback,
+        "julia", string(sources.graph, "\n\n", sources.rule),
     )])
 end
 
