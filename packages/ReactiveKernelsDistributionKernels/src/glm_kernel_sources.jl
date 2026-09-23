@@ -111,7 +111,6 @@ docs_example = (;
 """
 
 const POISSON_LOG_GLM_KERNEL_SOURCE = raw"""
-using SpecialFunctions: loggamma
 
 @kernel poisson_log_glm(
         X::Matrix{Float64}, beta::Vector{Float64}) = begin
@@ -210,7 +209,6 @@ docs_example = (;
 
 const BINOMIAL_LOGIT_GLM_KERNEL_SOURCE = raw"""
 using LogExpFunctions: logistic as _rk_logistic
-using SpecialFunctions: loggamma
 
 @kernel binomial_logit_glm(
         X::Matrix{Float64}, beta::Vector{Float64},
@@ -268,7 +266,6 @@ docs_example = (;
 """
 
 const NEG_BINOMIAL_2_LOG_GLM_KERNEL_SOURCE = raw"""
-using SpecialFunctions: loggamma
 
 @kernel neg_binomial_2_log_glm(
         X::Matrix{Float64}, beta::Vector{Float64},

@@ -1,25 +1,40 @@
-# The Enzyme extension gives `loggamma` / `logabsgamma` Julia-level reverse
-# rules.  Without them, Enzyme's C-level `lgamma_r` handling aborts the
-# process (an LLVM assertion, not a Julia error) on the shape every guarded
-# `logpdf` plus an observation plate produces: two lazy branches around gamma
-# calls in non-inlined functions differentiated together
-# (`benchmark/repro_enzyme_lgamma_branch.jl`).
+# INTERIM rules (see ../ext/ReactiveKernelsDistributionKernelsEnzymeExt.jl): the
+# package's own `loggamma`/`logbeta` entry points carry reverse rules, so the
+# shape that aborts Enzyme on SpecialFunctions' bodies
+# (benchmark/repro_enzyme_lgamma_branch.jl) differentiates. They are replaced
+# by generated adapters once the derivative-rule generator lands.
 using DifferentiationInterface: AutoEnzyme, gradient
 import Enzyme
-using ReactiveKernels: extract, prepare, prepare_ad, ad_gradient
+using ReactiveKernels: prepare, prepare_ad, ad_gradient
+using ReactiveKernelsDistributionKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: beta, binomial
-using SpecialFunctions: digamma, loggamma, logbeta
+using SpecialFunctions: digamma
+import SpecialFunctions
 using Test
 
-@testset "Enzyme reverse rules for loggamma / logabsgamma" begin
+# Qualified on purpose: the surrounding runner already binds SpecialFunctions'
+# `loggamma` in `Main`, and the point of this file is the package's own one.
+const _DKS = ReactiveKernelsDistributionKernels.DistributionKernelSources
+
+@testset "interim Enzyme reverse rules on the owned loggamma / logbeta" begin
     @test Base.get_extension(
         ReactiveKernelsDistributionKernels,
         :ReactiveKernelsDistributionKernelsEnzymeExt) !== nothing
+    # The rules attach to this package's entry points, never to SpecialFunctions'.
+    @test _DKS.loggamma !== SpecialFunctions.loggamma
+    @test _DKS.logbeta !== SpecialFunctions.logbeta
+    @test parentmodule(_DKS.loggamma) === _DKS
+    @test _DKS.loggamma(2.5) == SpecialFunctions.loggamma(2.5)
+    @test _DKS.logbeta(1.5, 3.0) == SpecialFunctions.logbeta(1.5, 3.0)
+
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
-    @test gradient(loggamma, backend, 2.5) ≈ digamma(2.5)
-    @test gradient(x -> logbeta(x, 3.0), backend, 1.5) ≈ digamma(1.5) - digamma(4.5)
-    @test gradient(x -> x > 0 ? loggamma(x) : -Inf, backend, 2.5) ≈ digamma(2.5)
-    @test gradient(x -> loggamma(3.0) + x, backend, 2.5) ≈ 1.0   # inactive argument
+    @test gradient(_DKS.loggamma, backend, 2.5) ≈ digamma(2.5)
+    @test gradient(x -> _DKS.logbeta(x, 3.0), backend, 1.5) ≈ digamma(1.5) - digamma(4.5)
+    @test gradient(x -> _DKS.logbeta(3.0, x), backend, 1.5) ≈ digamma(1.5) - digamma(4.5)
+    @test gradient(x -> _DKS.logbeta(x, 2x), backend, 1.5) ≈
+        (digamma(1.5) - digamma(4.5)) + 2 * (digamma(3.0) - digamma(4.5))
+    @test gradient(x -> x > 0 ? _DKS.loggamma(x) : -Inf, backend, 2.5) ≈ digamma(2.5)
+    @test gradient(x -> _DKS.loggamma(3.0) + x, backend, 2.5) ≈ 1.0   # inactive argument
 
     # The reproducer's shape: a guarded beta prior plus a plate of guarded
     # binomial cells, differentiated together through the prepared kernels.

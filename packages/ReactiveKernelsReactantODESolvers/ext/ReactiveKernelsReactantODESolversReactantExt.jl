@@ -169,6 +169,14 @@ end
 # differentiates through the adaptive loop. Reached through
 # `Reactant.Enzyme` (identical to the `Enzyme` module object), so the
 # extension needs no new dependency.
+#
+# INTERIM (user decision 2026-09-23T02-22-38-939-1gh4snu): this explicit
+# backend `autodiff` call is the one hand-placed AD-specific construct in the
+# repository and is kept, documented, until the derivative-rule generator can
+# express the right-hand-side VJP as generator-consumed graph mathematics with
+# loop-carried reverse staging (ReactiveKernels:review todo
+# 2026-09-23T03-04-45-362-1w4062g, depending on the generator slice
+# 2026-09-23T03-00-11-762-1q9sudt; policy: docs/src/constraints.md).
 function _backsolve_rhs(f, n::Int, m::Int, ::Type{T}) where {T<:AbstractFloat}
     zT = zero(T)
     sdot = (uu, pp, ll, tt) -> sum(f(uu, pp, tt) .* ll)
