@@ -187,6 +187,24 @@ end
     end : -Inf
 end
 
+# Host RHS against a traced Cholesky factor (snag `reactant-cholesk-407afd9e`):
+# a bound host right-hand side must promote to a traced constant before
+# Reactant's triangular solve sees it — upstream promotes elementwise to
+# `Matrix{TracedRNumber}` and dies in scalar indexing.
+@kernel reactant_cholesky_bound_rhs(
+        Sigma::Matrix{Float64}, E::Matrix{Float64}) = begin
+    F = cholesky(Symmetric(Sigma))
+    S::Matrix{Float64} = F \ E
+    return S
+end
+
+@kernel reactant_cholesky_bound_rhs_vec(
+        Sigma::Matrix{Float64}, b::Vector{Float64}) = begin
+    F = cholesky(Symmetric(Sigma))
+    x::Vector{Float64} = F \ b
+    return x
+end
+
 _rk_call(k, x, μ, scale) = k(x, μ, scale)
 _rk_allocated(k, x, μ, scale) = @allocated k(x, μ, scale)
 _rk_output_allocated(x) = @allocated similar(x, Float64)
@@ -317,6 +335,34 @@ end
         splat_padded, splat_total = compiled_splat(scores_traced)
         @test Array(splat_padded) ≈ native_splat_padded
         @test_broken splat_total ≈ native_splat_total
+    end
+
+    @testset "bound host RHS of a traced Cholesky solve promotes" begin
+        K_host = [4.0 1.0 0.5; 1.0 3.0 0.2; 0.5 0.2 2.0]
+        I3 = Matrix{Float64}(I, 3, 3)
+        b_host = [1.0, 2.0, 3.0]
+        K_traced = Reactant.to_rarray(K_host)
+
+        bound_matrix = prepare(reactant_cholesky_bound_rhs;
+            have = (:Sigma, :E), want = :S, bound = (; E = I3))
+        native_matrix = bound_matrix(K_host)
+        @test native_matrix ≈ inv(K_host)
+        compiled_matrix = @compile bound_matrix(K_traced)
+        @test Array(compiled_matrix(K_traced)) ≈ native_matrix
+
+        bound_vector = prepare(reactant_cholesky_bound_rhs_vec;
+            have = (:Sigma, :b), want = :x, bound = (; b = b_host))
+        native_vector = bound_vector(K_host)
+        compiled_vector = @compile bound_vector(K_traced)
+        @test Array(compiled_vector(K_traced)) ≈ native_vector
+
+        # A traced RHS lowers identically (promotion is an identity there).
+        traced = prepare(reactant_cholesky_bound_rhs;
+            have = (:Sigma, :E), want = :S)
+        native_traced = traced(K_host, I3)
+        E_traced = Reactant.to_rarray(I3)
+        compiled_traced = @compile traced(K_traced, E_traced)
+        @test Array(compiled_traced(K_traced, E_traced)) ≈ native_traced
     end
 
     @testset "source-derived functional state transition" begin

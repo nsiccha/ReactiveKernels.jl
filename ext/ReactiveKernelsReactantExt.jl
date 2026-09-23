@@ -793,7 +793,19 @@ Base.:\(factor::_TracedCholesky{T}, rhs::VecOrMat{Complex{T}}) where
         {T<:LinearAlgebra.BlasReal} =
     _traced_cholesky_solve(getfield(factor, :factors), factor, rhs)
 
-_traced_cholesky_solve(factors, factor, rhs) = _reactant_cholesky(factor) \ rhs
+function _traced_cholesky_solve(factors, factor, rhs)
+    _reactant_cholesky(factor) \ _promote_cholesky_rhs(factors, rhs)
+end
+
+# A host RHS against traced factors must become a traced array BEFORE
+# Reactant's solve sees it: its triangular path promotes the RHS elementwise
+# to `Matrix{TracedRNumber}` and dies in scalar indexing (snag
+# `reactant-cholesk-407afd9e`). `promote_to` is an identity on already-traced
+# operands, so this only rewrites host arrays.
+_promote_cholesky_rhs(factors, rhs) = rhs
+_promote_cholesky_rhs(factors::Reactant.TracedRArray, rhs::AbstractArray) =
+    Reactant.promote_to(Reactant.TracedRArray, rhs)
+
 function _traced_cholesky_solve(
         factors::LinearAlgebra.Diagonal, factor, rhs)
     size(rhs, 1) == size(factors, 1) || throw(DimensionMismatch(
