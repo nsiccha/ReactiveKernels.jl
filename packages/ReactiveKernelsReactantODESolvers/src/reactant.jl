@@ -107,9 +107,9 @@ step-size sequence itself is computed inside the program.
 
 Gradient path: [`compile_backsolve_gradient`](@ref) is the supported
 way to differentiate this solve. It re-solves the augmented adjoint ODE
-backward in backward early-exit compiled programs; the only
-`Enzyme.autodiff` differentiates the loop-free RHS once per stage
-evaluation, so nothing differentiates through the adaptive while loop.
+backward in early-exit compiled programs whose right-hand side is the
+authored reverse cut of a `ReactiveKernels.DerivativeRule`, so nothing
+differentiates anything, neither the adaptive while loop nor the RHS.
 
 Direct differentiation through the solve with
 `Enzyme.autodiff(::Reverse, ...)` is NOT supported: Reactant's reverse
@@ -126,14 +126,18 @@ function compile_ode_solve(args...; kwargs...)
 end
 
 """
-    compile_backsolve_gradient(f, u0_example, p_example, ::Tsit5,
+    compile_backsolve_gradient(rule, u0_example, p_example, ::Tsit5,
                                config::ReactantTsit5Config; loss=:endpoint)
 
 Compile a backsolve-style adjoint gradient for the fixed-shape solve
 described by `config` (requires Reactant.jl; implemented by the package
-extension). `u0_example` fixes the state dimension and element type;
-`p_example` is either `nothing` or an example parameter vector, as in
-[`compile_ode_solve`](@ref).
+extension). `rule` is a `ReactiveKernels.DerivativeRule` whose graph authors
+the right-hand side `du` and the cotangents of `λᵀ du` with respect to the
+state and the parameters: inputs `(u, p, t)` with a parameter vector, `(u, t)`
+without (`p_example === nothing`); `t` is never active. A plain function is
+refused, because the adjoint needs the rule's reverse cut. `u0_example` fixes
+the state dimension and element type; `p_example` is either `nothing` or an
+example parameter vector, as in [`compile_ode_solve`](@ref).
 
 `loss` selects the scalar loss over the compiled forward solve:
 
@@ -146,17 +150,12 @@ solve, then re-solves the augmented `[u; λ; μ]` adjoint system backward in
 compiled reverse-time programs, and returns `(grad_u0, grad_p)` with plain
 Julia values (`grad_p === nothing` when `p_example === nothing`).
 
-Both directions run the early-exit primal loop. The only
-`Enzyme.autodiff` in this path differentiates the loop-free RHS `f` once
-per stage evaluation (a vector-Jacobian product lowered to straight-line
-code inside the step); nothing differentiates through the adaptive while
-loop. A non-successful forward or backward solve throws an `ErrorException`
-(there is no trajectory to adjoin).
-
-That explicit backend call is an interim (decision
-`2026-09-23T02-22-38-939-1gh4snu`): the right-hand-side VJP is to come from
-the derivative-rule generator as graph mathematics once its slice covers
-vector right-hand sides (todo `2026-09-23T03-04-45-362-1w4062g`).
+Both directions run the early-exit primal loop. The augmented right-hand
+side evaluates the rule's reverse cut once per stage evaluation (the
+vector-Jacobian products `Jᵀλ` and `f_pᵀλ` as authored graph mathematics,
+traced into the step); nothing differentiates anything, neither the adaptive
+while loop nor the right-hand side. A non-successful forward or backward
+solve throws an `ErrorException` (there is no trajectory to adjoin).
 """
 function compile_backsolve_gradient end
 

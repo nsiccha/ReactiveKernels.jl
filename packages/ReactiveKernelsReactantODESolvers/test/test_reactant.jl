@@ -111,7 +111,7 @@ end
     # Forward compiled solve records the trajectory; the pullback re-solves
     # the augmented adjoint ODE backward in a second early-exit compiled
     # program — no differentiation through the adaptive while loop.
-    grad = compile_backsolve_gradient(decay_traceable, DECAY_R_U0, DECAY_R_P,
+    grad = compile_backsolve_gradient(decay_rule, DECAY_R_U0, DECAY_R_P,
         Tsit5(), DECAY_R_CFG; loss=:endpoint)
     du0_ad, dp_ad = grad(DECAY_R_U0, DECAY_R_P)
     solved = compile_ode_solve(decay_traceable, DECAY_R_U0, DECAY_R_P, Tsit5(),
@@ -129,7 +129,7 @@ end
 @testset "backsolve saveat gradient" begin
     # Multi-segment backward journey with an adjoint jump at each saveat
     # point (sum loss).
-    grad = compile_backsolve_gradient(decay_traceable, DECAY_R_U0, DECAY_R_P,
+    grad = compile_backsolve_gradient(decay_rule, DECAY_R_U0, DECAY_R_P,
         Tsit5(), DECAY_R_CFG; loss=:saveat)
     du0_ad, dp_ad = grad(DECAY_R_U0, DECAY_R_P)
     solved = compile_ode_solve(decay_traceable, DECAY_R_U0, DECAY_R_P, Tsit5(),
@@ -150,7 +150,7 @@ end
     # Nonlinear RHS, parameters closed over: no μ block, `grad_p === nothing`.
     cfg = ReactantTsit5Config(LOTKA_TSPAN; abstol=1e-10, reltol=1e-8, dt=0.01,
         maxiters=5000, saveat=[5.0])
-    grad = compile_backsolve_gradient(lotka_traceable, LOTKA_U0, nothing,
+    grad = compile_backsolve_gradient(lotka_rule, LOTKA_U0, nothing,
         Tsit5(), cfg; loss=:endpoint)
     du0_ad, dp_ad = grad(LOTKA_U0)
     @test dp_ad === nothing
@@ -167,7 +167,7 @@ end
     # error at the ~1e-6 level is expected (measured 2.5e-6 here).
     cfg = ReactantTsit5Config(LOTKA_TSPAN; abstol=1e-10, reltol=1e-8, dt=0.01,
         maxiters=5000, saveat=[3.0, 6.0])
-    grad = compile_backsolve_gradient(lotka_traceable, LOTKA_U0, nothing,
+    grad = compile_backsolve_gradient(lotka_rule, LOTKA_U0, nothing,
         Tsit5(), cfg; loss=:saveat)
     du0_ad, dp_ad = grad(LOTKA_U0)
     @test dp_ad === nothing
@@ -179,8 +179,17 @@ end
 end
 
 @testset "backsolve loss validation" begin
-    @test_throws ArgumentError compile_backsolve_gradient(decay_traceable,
+    @test_throws ArgumentError compile_backsolve_gradient(decay_rule,
         DECAY_R_U0, DECAY_R_P, Tsit5(), DECAY_R_CFG; loss=:bogus)
+    # A plain function has no reverse mathematics to hand the adjoint.
+    @test_throws ArgumentError compile_backsolve_gradient(decay_traceable,
+        DECAY_R_U0, DECAY_R_P, Tsit5(), DECAY_R_CFG)
+    # The rule's inputs must match the driver's shape.
+    @test_throws ArgumentError compile_backsolve_gradient(lotka_rule,
+        DECAY_R_U0, DECAY_R_P, Tsit5(), DECAY_R_CFG)
+    # The authored rules agree with the traceable functions they replace.
+    @test decay_rule(DECAY_R_U0, DECAY_R_P, 0.3) == decay_traceable(DECAY_R_U0, DECAY_R_P, 0.3)
+    @test lotka_rule(LOTKA_U0, 0.7) == lotka_traceable(LOTKA_U0, nothing, 0.7)
 end
 
 @testset "compiled status flags" begin
