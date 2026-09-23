@@ -169,9 +169,18 @@ Each adapter is generic over the rule and is loaded with its AD package:
 
 Not generated: rule emission into EnzymeMLIR. Under Reactant a rule's callable
 and cuts trace into the compiled program as plain graph mathematics, but no
-custom rule is emitted — that waits on the upstream custom-rule bridge (see
-[Automatic differentiation through Reactant](reactant-ad.md)) — so Enzyme
-under Reactant differentiates the traced primal cut.
+custom rule is emitted, so Enzyme under Reactant differentiates the traced
+primal cut (see [Automatic differentiation through Reactant](reactant-ad.md)).
+The upstream mechanism is
+[EnzymeAD/Enzyme#2516](https://github.com/EnzymeAD/Enzyme/pull/2516)
+(`[mlir] Split mode & custom rules`). It is open, and no Reactant release
+carries it. Its `enzyme.custom_reverse_rule` augmented-primal and reverse
+regions correspond to `stage_primal` and `stage_reverse`, attached through
+`enzyme.custom_rule` on a callee that is not inlined. As proposed, it has no
+rule sets, so only the all-active activity pattern can be attached. It is
+reverse-only at batch width 1, and Reactant's pipeline does not yet run its
+lowering. ReactiveKernels generates this adapter once a Reactant release
+carries the mechanism.
 
 The first vector consumer is the backsolve adjoint of
 `ReactiveKernelsReactantODESolvers`: its right-hand side is a
