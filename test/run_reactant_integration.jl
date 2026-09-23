@@ -7,6 +7,7 @@ const REACTANT_UUID = UUID("3c362404-f566-11ee-1572-e11a4b42c853")
 root = normpath(joinpath(@__DIR__, ".."))
 testfile = joinpath(@__DIR__, "test_reactant.jl")
 ad_testfile = joinpath(@__DIR__, "test_ad_reactant.jl")
+derivative_rules_testfile = joinpath(@__DIR__, "test_derivative_rules_reactant.jl")
 phasepoint_testfile = joinpath(@__DIR__, "test_reactivehmc_phasepoint_reactant.jl")
 effect_boundary_testfile = joinpath(
     @__DIR__, "test_effect_boundary_reactant.jl")
@@ -70,6 +71,7 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $effect_boundary_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ad_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $derivative_rules_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $phasepoint_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mutation_profile_b_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $sum_to_zero_testfile`)
@@ -89,6 +91,7 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ppl_examples_testfile`)
     elseif selector == "ad"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ad_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $derivative_rules_testfile`)
     elseif selector == "mutation-profile-b"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mutation_profile_b_testfile`)
     elseif selector == "mnist-full-joint"
