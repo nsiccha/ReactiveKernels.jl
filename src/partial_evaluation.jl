@@ -316,6 +316,10 @@ end
     "a partitioned plate argument of size $(size(x)) does not match its $n lanes"))
 (::_LaneGather)(x, lanes) = throw(ArgumentError("a partitioned plate " *
     "argument must be a number or a lane vector, got $(typeof(x))"))
+# Callable structs have no `nameof`, so without these the readable
+# Generated-kernel pane would render the partition's sourceless lane recipes
+# as an opaque `operation(...)` (refused by docs/kernel_examples.jl).
+_readable_callee(::_LaneGather) = :lane_gather
 _opname(::_LaneGather) = "lane_gather"
 
 """
@@ -328,6 +332,7 @@ struct _LaneAssemble
     order::Vector{Int}
 end
 (assemble::_LaneAssemble)(parts...) = vcat(parts...)[assemble.order]
+_readable_callee(::_LaneAssemble) = :lane_assemble
 _opname(::_LaneAssemble) = "lane_assemble"
 
 """

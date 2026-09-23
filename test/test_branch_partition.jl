@@ -122,4 +122,21 @@ isdefined(@__MODULE__, :BranchPartition) ||
         @test has_branch(plate_body(only(plates(bound.plan))))
         @test bound(x) ≈ sum(abs(xi - 1.0) for xi in x)
     end
+
+    @testset "partitioned recipes keep the readable view named" begin
+        # The docs Generated-kernel pane refuses an `operation(` callee
+        # (docs/kernel_examples.jl): the partition's synthesized lane ops must
+        # render under their own names, not as an opaque operation slot.
+        for want in (:total, :pointwise)
+            bound = prepare(C.guarded; have = (:x, :y), want, bound = (; y))
+            readable = string(RK._readable_expr(RK.code_expr(bound), bound))
+            @test !occursin(r"__ops__\[\d+\]", readable)
+            @test !occursin(r"\boperation\(", readable)
+        end
+        pointwise = prepare(C.guarded; have = (:x, :y), want = :pointwise,
+                            bound = (; y))
+        readable = string(RK._readable_expr(RK.code_expr(pointwise), pointwise))
+        @test occursin("lane_gather", readable)
+        @test occursin("lane_assemble", readable)
+    end
 end
