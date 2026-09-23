@@ -13,16 +13,19 @@ ReactantCore = "a3311ec8-5e00-46d5-b541-4f83e724a433"
 RuntimeGeneratedFunctions = "7e49a35a-f44a-4d26-94aa-eba1b4ca6b47"
 
 [weakdeps]
+ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 MutatingFunctions = "8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 
 [extensions]
+ReactiveKernelsChainRulesCoreExt = "ChainRulesCore"
 ReactiveKernelsEnzymeExt = "Enzyme"
 ReactiveKernelsMutatingFunctionsExt = "MutatingFunctions"
 ReactiveKernelsReactantExt = "Reactant"
 
 [compat]
+ChainRulesCore = "1"
 DifferentiationInterface = "0.7"
 Distributions = "0.25"
 Enzyme = "0.13"
@@ -38,6 +41,7 @@ julia = "1.10"
 
 [extras]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 InteractiveUtils = "b77e0a4c-d291-57a0-90e8-8db25a27a240"
@@ -51,4 +55,4 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["BenchmarkTools", "Distributions", "Enzyme", "InteractiveUtils", "LambertW", "LinearAlgebra", "Pkg", "SHA", "StableRNGs", "Statistics", "TOML", "Test"]
+test = ["BenchmarkTools", "ChainRulesCore", "Distributions", "Enzyme", "InteractiveUtils", "LambertW", "LinearAlgebra", "Pkg", "SHA", "StableRNGs", "Statistics", "TOML", "Test"]
