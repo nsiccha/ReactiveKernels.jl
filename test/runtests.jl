@@ -34,6 +34,7 @@ const _MATRIX_CORE_TESTS = (
     "test_ad.jl",
     "test_manual_derivative_rule_example.jl",
     "test_derivative_rules.jl",
+    "test_derivative_rules_mooncake.jl",
     "test_authoring.jl",
     "test_docs_navigation.jl",
     "test_kernel_objects.jl",

@@ -87,7 +87,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
             "render_manual_derivative_rule_cuts()",
             "render_manual_derivative_rule_source()",
             "result.residuals",
-            "Not generated yet: a Mooncake adapter",
+            "Not generated: rule emission into EnzymeMLIR",
         )
         @test occursin(marker, manual_rules_docs)
     end

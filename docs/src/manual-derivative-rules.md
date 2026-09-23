@@ -146,12 +146,17 @@ Each adapter is generic over the rule and is loaded with its AD package:
   `ChainRulesCore`). `rrule` returns the primal and a concretely typed
   pullback that holds the all-active cut's residuals; `frule` runs the
   forward cut, with a zero direction for a `ZeroTangent`.
+- **Mooncake** (`ext/ReactiveKernelsMooncakeExt.jl`, loaded with
+  `Mooncake`). Every rule is a primitive (`@is_primitive`) with no tangent of
+  its own. `rrule!!` returns the primal and a pullback that holds the
+  all-active cut's residuals; array cotangents accumulate into the arguments'
+  forward data and real scalars return theirs. `frule!!` runs the forward cut.
 
-Not generated yet: a Mooncake adapter. Under Reactant a rule's callable and
-cuts trace into the compiled program as plain graph mathematics, but no custom
-rule is emitted into EnzymeMLIR — that waits on the upstream custom-rule
-bridge (see [Automatic differentiation through Reactant](reactant-ad.md)) —
-so Enzyme under Reactant differentiates the traced primal cut.
+Not generated: rule emission into EnzymeMLIR. Under Reactant a rule's callable
+and cuts trace into the compiled program as plain graph mathematics, but no
+custom rule is emitted — that waits on the upstream custom-rule bridge (see
+[Automatic differentiation through Reactant](reactant-ad.md)) — so Enzyme
+under Reactant differentiates the traced primal cut.
 
 The first vector consumer is the backsolve adjoint of
 `ReactiveKernelsReactantODESolvers`: its right-hand side is a
