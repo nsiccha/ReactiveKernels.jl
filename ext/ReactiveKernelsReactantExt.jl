@@ -96,14 +96,16 @@ end
 # fields are runtime-generated cuts of one graph and their operation tables.
 # Its call traces through those cuts' source ops like any other kernel call.
 function Reactant.make_tracer(
-        seen, previous::ReactiveKernels.ScalarDerivativeRule, path, mode;
+        seen, previous::Union{ReactiveKernels.ScalarDerivativeRule,
+                              ReactiveKernels.DerivativeRule}, path, mode;
         kwargs...)
     previous
 end
 
 function Reactant.traced_type_inner(
         ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
-        ndevices, runtime) where {T<:ReactiveKernels.ScalarDerivativeRule}
+        ndevices, runtime) where
+        {T<:Union{ReactiveKernels.ScalarDerivativeRule,ReactiveKernels.DerivativeRule}}
     T
 end
 

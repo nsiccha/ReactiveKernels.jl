@@ -278,6 +278,272 @@ function _partial_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A}) wher
     (; recipe = updated, cache_values, cache_data)
 end
 
+# ---------------------------------------------------------------------------
+# Data-bound branch partitioning of authored plates.
+#
+# A plate cell recipe whose right-hand side is a top-level lazy branch keeps
+# its parts (`_KernelBranch`). When every port of the condition is bound data
+# (a bound plate argument, or a bound-only cell value the cache pass above
+# turned into one), the condition is evaluated per lane here, the lanes are
+# split by outcome, and the plate becomes one plate per taken arm over its own
+# lanes — so no backend ever receives that branch, no lane evaluates an arm it
+# does not take, and every gather inside an arm is in bounds by construction
+# (docs/src/constraints.md). The number of arm plates is bounded by the cell's
+# branch structure, never by the data; lane-subset sizes only change shapes.
+
+"""
+    _LaneGather(n)
+
+Gathers a live plate argument onto one arm's lanes: a lane-length vector is
+indexed by the arm's (bound) lane indices, a singleton array is repeated over
+them, and a scalar broadcasts unchanged. An array result is always a fresh
+gather, never the argument itself, and the call inlines with its shape
+check thrown out of line: native Enzyme reverse cannot statically resolve the
+activity of a result that is sometimes an alias of its input, nor of an array
+returned across a non-inlined call. Any other shape cannot belong to the
+partitioned one-dimensional domain and is rejected.
+"""
+struct _LaneGather
+    n::Int
+end
+@inline (::_LaneGather)(x::Number, lanes) = x
+@inline function (gather::_LaneGather)(x::AbstractArray, lanes)
+    length(x) == 1 && return x[ones(Int, length(lanes))]
+    ndims(x) == 1 && length(x) == gather.n || _lane_gather_mismatch(x, gather.n)
+    x[lanes]
+end
+@noinline _lane_gather_mismatch(x, n) = throw(DimensionMismatch(
+    "a partitioned plate argument of size $(size(x)) does not match its $n lanes"))
+(::_LaneGather)(x, lanes) = throw(ArgumentError("a partitioned plate " *
+    "argument must be a number or a lane vector, got $(typeof(x))"))
+_opname(::_LaneGather) = "lane_gather"
+
+"""
+    _LaneAssemble(order)
+
+Reassembles arm pointwise vectors into lane order: `vcat(parts...)[order]`
+(one gather, `order = invperm(vcat(arm_lanes...))`).
+"""
+struct _LaneAssemble
+    order::Vector{Int}
+end
+(assemble::_LaneAssemble)(parts...) = vcat(parts...)[assemble.order]
+_opname(::_LaneAssemble) = "lane_assemble"
+
+"""
+    _LaneAnchored(f)
+
+An arm body that reads no lane argument, given one it ignores so that plate
+lowering evaluates it once per lane.
+"""
+struct _LaneAnchored{F}
+    f::F
+end
+@inline (arm::_LaneAnchored)(anchor, args...) = arm.f(args...)
+
+_partition_plate_recipe(g, recipe, known, op, pending, want, fresh) = nothing
+function _partition_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A},
+                                 pending::Vector{Recipe}, want, fresh) where {K,A}
+    inner = op.kernel.plan
+    length(inner.have) == length(recipe.inputs) || return nothing
+    length(inner.want) == 1 || return nothing
+    length(op.kernel.ops) == length(inner.recipes) || return nothing
+    length(recipe.outputs) == 1 || return nothing
+    for r in inner.recipes
+        r.effectful && return nothing
+        length(r.outputs) == 1 || return nothing
+        r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} && return nothing
+        _embedded_kernel(r.op) === nothing || return nothing
+    end
+
+    # Bound plate arguments by inner port, and the one-dimensional lane count
+    # they fix. Live arguments are gathered at run time (`_LaneGather`).
+    bound = Dict{Int,Any}()
+    n = nothing
+    for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
+        cid = canon_id(g, outer.id)
+        haskey(known, cid) || continue
+        data = known[cid]
+        if !(index in A) && data isa AbstractArray
+            ndims(data) == 1 || return nothing
+            if length(data) != 1
+                n === nothing && (n = length(data))
+                length(data) == n || return nothing
+            end
+        elseif !(index in A) && !(data isa Number)
+            return nothing
+        end
+        bound[canon_id(inner.graph, input.id)] = index in A ? Ref(data) : data
+    end
+    (n === nothing || n == 0) && return nothing
+
+    # The first branch recipe whose condition reads bound data only.
+    target = nothing
+    for r in inner.recipes
+        r.op isa _KernelSourceOp && r.op.f isa _KernelBranch &&
+            r.op.tensor_f isa _KernelBranch || continue
+        CI = typeof(r.op.f).parameters[1]
+        ports = [canon_id(inner.graph, r.inputs[i].id) for i in CI]
+        all(cid -> haskey(bound, cid), ports) || continue
+        target = (r, ports)
+        break
+    end
+    target === nothing && return nothing
+    branch_recipe, cond_ports = target
+    native, tensor = branch_recipe.op.f, branch_recipe.op.tensor_f
+    pred = broadcast(native.condition, (bound[cid] for cid in cond_ports)...)
+    arms = if pred isa Bool
+        # A lane-invariant condition selects its arm statically.
+        pred ? [(:then, collect(1:n))] : [(:else, collect(1:n))]
+    else
+        pred isa AbstractVector{Bool} && length(pred) == n || return nothing
+        filter(arm -> !isempty(last(arm)),
+            [(:then, findall(pred)), (:else, findall(!, pred))])
+    end
+
+    # An arm computed only from shared values (a constant fallback such as
+    # `-Inf`) does not vary per lane; as its own plate its cell would be one
+    # scalar rather than one value per lane. Such an arm is anchored to a
+    # bound lane argument (`_LaneAnchored`, which ignores it) so both the
+    # native loop and the tensorized batch evaluate it per lane. Known lane
+    # values: bound lane-length vectors and live arguments declared as arrays,
+    # plus every cell value computed from one.
+    lane_values = Set{Int}()
+    anchor = nothing
+    for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
+        index in A && continue
+        cid = canon_id(inner.graph, input.id)
+        if haskey(bound, cid)
+            bound[cid] isa AbstractArray && length(bound[cid]) == n || continue
+            anchor === nothing && (anchor = input)
+        else
+            valtype(outer) <: AbstractArray || continue
+        end
+        push!(lane_values, cid)
+    end
+    for r in inner.recipes
+        any(v -> canon_id(inner.graph, v.id) in lane_values, r.inputs) &&
+            push!(lane_values, canon_id(inner.graph, only(r.outputs).id))
+    end
+
+    token = kernel_sourceop_token(branch_recipe.op)
+    form = kernel_sourceop_form(branch_recipe.op)
+    pointwise = only(recipe.outputs)
+    single = length(arms) == 1
+    lanes_value = Dict{Symbol,Value}()
+    expansion = Recipe[]
+    arm_outputs = Value[]
+    for (side, lanes) in arms
+        # The arm's scalar body: the branch recipe runs only this arm (a
+        # nested branch arm stays a `_KernelBranch` and partitions again).
+        positions = typeof(native).parameters[side === :then ? 2 : 3]
+        arm_f = getfield(native, side === :then ? :then_arm : :else_arm)
+        arm_tf = getfield(tensor, side === :then ? :then_arm : :else_arm)
+        arm_inputs = Value[branch_recipe.inputs[i] for i in positions]
+        if !any(v -> canon_id(inner.graph, v.id) in lane_values, arm_inputs)
+            arm_f, arm_tf = _LaneAnchored(arm_f), _LaneAnchored(arm_tf)
+            pushfirst!(arm_inputs, anchor)
+        end
+        arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
+                                 arm_f, arm_tf)
+        replaced = Recipe(branch_recipe.id, Tuple(arm_inputs),
+            branch_recipe.outputs, arm_op, branch_recipe.cost, nothing,
+            branch_recipe.effectful, branch_recipe.source)
+        arm_recipes = Recipe[r === branch_recipe ? replaced : r
+                             for r in inner.recipes]
+        arm_plan = _partial_subplan(inner, inner.have, inner.want, arm_recipes)
+        kernel = _prepare(arm_plan,
+            _lower_with_ops(arm_plan; inline_embedded = false)...)
+        readable = Dict(r.id => source for (r, source) in
+                        zip(inner.recipes, op.kernel.lowered_recipes))
+        kernel = PreparedKernel(kernel.f, kernel.ops, kernel.inputs,
+            kernel.outputs, kernel.plan, kernel.ast,
+            Tuple(readable[r.id] for r in arm_recipes))
+        arm_plate = _AuthoredPlateOp{typeof(kernel),A}(kernel, op.axis_checks)
+
+        # The arm's plate arguments: shared/scalar arguments pass unchanged,
+        # bound lane vectors are gathered now, live ones at run time.
+        arguments = Value[]
+        for (index, outer) in enumerate(recipe.inputs)
+            cid = canon_id(g, outer.id)
+            if single || index in A
+                push!(arguments, outer)
+            elseif haskey(known, cid)
+                data = known[cid]
+                if data isa AbstractArray && length(data) == n
+                    gathered = data[lanes]
+                    v = value!(g, Symbol(:lane_, side, :_, outer.name),
+                               typeof(gathered))
+                    push!(expansion, Recipe(fresh(), (), (v,),
+                        _BoundConstant(gathered), 0.0, nothing, false))
+                    known[canon_id(g, v.id)] = gathered
+                    push!(arguments, v)
+                else
+                    push!(arguments, outer)
+                end
+            else
+                idx = get!(lanes_value, side) do
+                    v = value!(g, Symbol(:plate_lanes_, side), Vector{Int})
+                    push!(expansion, Recipe(fresh(), (), (v,),
+                        _BoundConstant(lanes), 0.0, nothing, false))
+                    known[canon_id(g, v.id)] = lanes
+                    v
+                end
+                v = value!(g, Symbol(:lane_, side, :_, outer.name), valtype(outer))
+                push!(expansion, Recipe(fresh(), (outer, idx), (v,),
+                    _LaneGather(n), 0.0, nothing, false))
+                push!(arguments, v)
+            end
+        end
+        output = single ? pointwise :
+            value!(g, Symbol(pointwise.name, :_, side), valtype(pointwise))
+        push!(expansion, Recipe(fresh(), Tuple(arguments), (output,), arm_plate,
+            recipe.cost, nothing, false, recipe.source))
+        push!(arm_outputs, output)
+    end
+    single && return (; expansion, rewrite = nothing)
+
+    # Combine the arms. A sole `sum(pointwise)` consumer becomes a sum of
+    # per-arm sums (each fuses into its arm's loop); otherwise the pointwise
+    # vector is reassembled in lane order.
+    pid = canon_id(g, pointwise.id)
+    consumers = [r for r in pending
+                 if any(inp -> canon_id(g, inp.id) == pid, r.inputs)]
+    total = _partition_sum_consumer(consumers, pointwise)
+    wanted = any(w -> canon_id(g, w.id) == pid, want)
+    if total !== nothing && length(consumers) == 1 && !wanted
+        totals = Value[]
+        for output in arm_outputs
+            t = value!(g, Symbol(output.name, :_total), valtype(only(total.outputs)))
+            push!(expansion, Recipe(fresh(), (output,), (t,), sum, 0.0, nothing,
+                false, Expr(:call, :sum, output.name)))
+            push!(totals, t)
+        end
+        combined = Recipe(total.id, Tuple(totals), total.outputs, +, 0.0,
+            nothing, false, Expr(:call, :+, (t.name for t in totals)...))
+        return (; expansion, rewrite = total.id => combined)
+    end
+    order = invperm(reduce(vcat, (last(arm) for arm in arms)))
+    push!(expansion, Recipe(fresh(), Tuple(arm_outputs), (pointwise,),
+        _LaneAssemble(order), 0.0, nothing, false))
+    (; expansion, rewrite = nothing)
+end
+
+function _partition_sum_consumer(consumers, pointwise)
+    length(consumers) == 1 || return nothing
+    r = only(consumers)
+    r.effectful && return nothing
+    length(r.inputs) == 1 && length(r.outputs) == 1 || return nothing
+    source = r.source
+    source isa Expr && source.head === :call && length(source.args) == 2 ||
+        return nothing
+    (source.args[1] === :sum || source.args[1] === GlobalRef(Base, :sum)) ||
+        return nothing
+    source.args[2] === pointwise.name || return nothing
+    (r.op === sum || r.op isa _KernelSourceOp) || return nothing
+    r
+end
+
 function _partial_inner_plates(p::Plan, known)
     any(r -> r.op isa _AuthoredPlateOp, p.recipes) || return p
     # A shallow structural copy preserves public Value identities and recipe
@@ -285,22 +551,39 @@ function _partial_inner_plates(p::Plan, known)
     g = p.graph
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers),
                    copy(g.aliases), g.version)
+    known = Dict{Int,Any}(known)
     recipes = Recipe[]
-    next_id = minimum((r.id for r in p.recipes); init = 0) - 1
+    next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
+    fresh() = (id = next_id[]; next_id[] -= 1; id)
     changed = false
-    for r in p.recipes
+    # A worklist: an arm plate emitted by the branch partition is examined
+    # again (a nested arm or a further branch in its cell), and a rewritten
+    # `sum` consumer replaces the original later in the queue.
+    pending = copy(p.recipes)
+    while !isempty(pending)
+        r = popfirst!(pending)
         specialized = _partial_plate_recipe(copied, r, known, r.op)
-        if specialized === nothing
+        if specialized !== nothing
+            changed = true
+            for (value, data) in zip(specialized.cache_values, specialized.cache_data)
+                push!(recipes, Recipe(fresh(), (), (value,), _BoundConstant(data),
+                                      0.0, nothing, false))
+                known[canon_id(copied, value.id)] = data
+            end
+            r = specialized.recipe
+        end
+        partitioned = _partition_plate_recipe(copied, r, known, r.op, pending,
+                                              p.want, fresh)
+        if partitioned === nothing
             push!(recipes, r)
             continue
         end
         changed = true
-        for (value, data) in zip(specialized.cache_values, specialized.cache_data)
-            push!(recipes, Recipe(next_id, (), (value,), _BoundConstant(data),
-                                  0.0, nothing, false))
-            next_id -= 1
+        if partitioned.rewrite !== nothing
+            id, combined = partitioned.rewrite
+            pending[findfirst(q -> q.id == id, pending)] = combined
         end
-        push!(recipes, specialized.recipe)
+        prepend!(pending, partitioned.expansion)
     end
     changed || return p
     template = Plan(copied, p.have, p.want, p.recipes, p.producer,

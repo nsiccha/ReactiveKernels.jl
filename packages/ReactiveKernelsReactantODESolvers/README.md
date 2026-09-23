@@ -58,9 +58,10 @@ Reverse behavior: gradients come from the backsolve adjoint
 adaptive loop. Both directions run the early-exit primal: the forward
 solve exits on `(n < maxiters) & (t < t1)`, and each backward segment
 re-solves the augmented `[u; λ; μ]` system in reverse time with the same
-early-exit shape. The only `Enzyme.autodiff` differentiates the loop-free
-RHS once per stage evaluation (a vector-Jacobian product lowered to
-straight-line code). Supported losses are `:endpoint` (one backward
+early-exit shape. The right-hand side is a `ReactiveKernels.DerivativeRule`
+whose graph authors `du` and the cotangents of `λᵀ du`; the augmented system
+evaluates that authored reverse cut once per stage evaluation, so nothing
+differentiates the adaptive loop or the right-hand side. Supported losses are `:endpoint` (one backward
 segment `t1 → t0`) and `:saveat` (one segment per saveat interval, the
 adjoint jumping by `1` at each saveat point). Because continuous
 backsolve is not discretisation differentiation, saveat gradients agree

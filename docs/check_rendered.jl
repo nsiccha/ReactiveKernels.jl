@@ -427,16 +427,14 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     )
     structural_markers = Dict(
         "manual-derivative-rules.md" => (
-            "Manual derivative rule graphs (design example)",
-            "Executable design example; the scalar slice of the generator is shipped",
-            "Current capability and required RK features",
-            "Everything that turns",
-            "registered custom AD rule is new work",
+            "Derivative rules from one pure-math graph",
+            "Generated scalar rules",
+            "Generated vector rules",
             "prepare_ad_pullback",
             "examples/manual_derivative_rule.jl",
-            "One graph, three selected cuts",
-            "Value plus a generated-style pullback",
-            "Backend boundary",
+            "One graph, selected cuts",
+            "Two-stage reverse staging",
+            "Generated adapters",
         ),
         "probprog-mcmc.md" => (
             "NUTS sampling performance and diagnostics",

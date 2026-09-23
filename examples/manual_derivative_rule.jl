@@ -6,9 +6,8 @@ using ReactiveKernels
 export EXAMPLE_INPUTS
 export PRIMAL_HAVE, PRIMAL_WANT, FORWARD_HAVE, FORWARD_WANT
 export REVERSE_HAVE, REVERSE_WANT, X_REVERSE_HAVE, X_REVERSE_WANT
-export matvec_rule, matvec_primal, matvec_forward, matvec_reverse
-export matvec_reverse_x, MatvecPullback, MatvecXPullback
-export value_and_pullback, value_and_x_pullback, run
+export matvec_rule, matvec
+export matvec_primal, matvec_forward, matvec_reverse, matvec_reverse_x, run
 
 # One graph owns the primal, JVP, and VJP mathematics. Numerical directions and
 # covectors are ordinary graph values; no AD package's protocol types appear.
@@ -30,6 +29,17 @@ export value_and_pullback, value_and_x_pullback, run
 end
 # -- END DOCS: pure mathematical derivative rule --
 
+# The graph's ports are named into roles once; the generator returns an
+# RK-owned callable whose cuts and AD adapters all come from this one graph.
+# -- BEGIN DOCS: generated rule --
+const matvec = derivative_rule(matvec_rule; primal = :y,
+    directions = (A = :A_dot, x = :x_dot), tangent = :y_dot,
+    covector = :y_bar, cotangents = (A = :A_bar, x = :x_bar),
+    name = :matvec)
+# -- END DOCS: generated rule --
+
+# The same HAVE→WANT boundaries, prepared explicitly so the documentation can
+# render each cut's generated kernel and compute DAG.
 const PRIMAL_HAVE = (:A, :x)
 const PRIMAL_WANT = :y
 const FORWARD_HAVE = (:A, :x, :A_dot, :x_dot)
@@ -48,39 +58,6 @@ const matvec_reverse = prepare(
 const matvec_reverse_x = prepare(
     matvec_rule; have = X_REVERSE_HAVE, want = X_REVERSE_WANT)
 
-# These backend-neutral structs show the staging shape that generated rule
-# adapters would own. They are deliberately example code, not a package API.
-# -- BEGIN DOCS: generated-style pullback staging --
-struct MatvecPullback{K,TA,TX}
-    vjp::K
-    A::TA
-    x::TX
-end
-
-function (pullback::MatvecPullback)(y_bar)
-    pullback.vjp(pullback.A, pullback.x, y_bar)
-end
-
-struct MatvecXPullback{K,TA}
-    vjp::K
-    A::TA
-end
-
-function (pullback::MatvecXPullback)(y_bar)
-    pullback.vjp(pullback.A, y_bar)
-end
-
-function value_and_pullback(A, x)
-    y = matvec_primal(A, x)
-    y, MatvecPullback(matvec_reverse, A, x)
-end
-
-function value_and_x_pullback(A, x)
-    y = matvec_primal(A, x)
-    y, MatvecXPullback(matvec_reverse_x, A)
-end
-# -- END DOCS: generated-style pullback staging --
-
 const EXAMPLE_INPUTS = (
     A = [1.0 2.0; 3.0 4.0],
     x = [0.5, -1.0],
@@ -89,34 +66,46 @@ const EXAMPLE_INPUTS = (
     y_bar = [1.2, -0.4],
 )
 
-"""Execute every documented cut and return its inspectable acceptance evidence."""
+"""Execute the generated rule's cuts and return inspectable acceptance evidence."""
 function run(; inputs = EXAMPLE_INPUTS)
     (; A, x, A_dot, x_dot, y_bar) = inputs
 
-    y = matvec_primal(A, x)
-    y_forward, y_dot = matvec_forward(A, x, A_dot, x_dot)
-    A_bar, x_bar = matvec_reverse(A, x, y_bar)
+    y = matvec(A, x)
+    y_forward, y_dot = forward_cut(matvec, A, x, A_dot, x_dot)
+    # Activity mask: bit `i` set when input `i` (here `A`, `x`) is active.
+    A_bar, x_bar = reverse_cut(matvec, Val(3), A, x, y_bar)
+    (x_only_bar,) = reverse_cut(matvec, Val(2), A, nothing, y_bar)
+    # The two-stage form every generated reverse adapter uses.
+    y_staged, residuals = stage_primal(matvec, Val(3), A, x)
+    _, staged_x_bar = stage_reverse(matvec, Val(3), residuals, y_bar)
 
-    y_reverse, pullback = value_and_pullback(A, x)
-    pullback_A_bar, pullback_x_bar = pullback(y_bar)
-    y_x_only, x_pullback = value_and_x_pullback(A, x)
-    x_only_bar = x_pullback(y_bar)
-
-    (; y, y_forward, y_reverse, y_x_only, y_dot, A_bar, x_bar,
-       pullback_A_bar, pullback_x_bar, x_only_bar,
+    (; y, y_forward, y_dot, A_bar, x_bar, x_only_bar,
+       prepared = (
+           y = matvec_primal(A, x),
+           forward = matvec_forward(A, x, A_dot, x_dot),
+           reverse = matvec_reverse(A, x, y_bar),
+           x_reverse = matvec_reverse_x(A, y_bar),
+       ),
        adjoint_pair = (
            dot(y_bar, y_dot),
            dot(A_bar, A_dot) + dot(x_bar, x_dot),
        ),
+       residuals = (
+           A_only = reverse_residuals(matvec, Val(1)),
+           x_only = reverse_residuals(matvec, Val(2)),
+           both = reverse_residuals(matvec, Val(3)),
+       ),
+       staged_residuals = (
+           A_only = stage_residuals(matvec, Val(1)),
+           x_only = stage_residuals(matvec, Val(2)),
+           both = stage_residuals(matvec, Val(3)),
+       ),
+       staged_y = y_staged, staged_x_bar,
        recipe_ids = (
            primal = Tuple(recipe.id for recipe in matvec_primal.plan.recipes),
            forward = Tuple(recipe.id for recipe in matvec_forward.plan.recipes),
            reverse = Tuple(recipe.id for recipe in matvec_reverse.plan.recipes),
            x_reverse = Tuple(recipe.id for recipe in matvec_reverse_x.plan.recipes),
-       ),
-       captured_fields = (
-           both = fieldnames(typeof(pullback)),
-           x_only = fieldnames(typeof(x_pullback)),
        ))
 end
 

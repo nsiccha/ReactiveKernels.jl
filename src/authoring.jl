@@ -1748,6 +1748,31 @@ function _kernel_tensorized_branch(condition, then_side, else_side, known, mod,
          thunk(then_side), thunk(else_side), Expr(:tuple))
 end
 
+# `begin`/`end` inside an index denote the indexed array's first/last index;
+# Julia resolves them while lowering `a[...]`. Once the tensorized body turns
+# the indexing into a call they would be free variables, so resolve them
+# against the array first, as Julia does: in position `k` of `n` indices,
+# `end` becomes `lastindex(a, k)` (`lastindex(a)` for a single index) and
+# `begin` `firstindex`. A nested `b[...]` resolves its own endpoints.
+function _kernel_ref_endpoints(ex, array, k::Int, n::Int)
+    if ex === :end || ex === :begin
+        f = GlobalRef(Base, ex === :end ? :lastindex : :firstindex)
+        return n == 1 ? Expr(:call, f, array) : Expr(:call, f, array, k)
+    end
+    ex isa Expr || return ex
+    ex.head in (:ref, :quote, :inert) && return ex
+    Expr(ex.head, (_kernel_ref_endpoints(arg, array, k, n) for arg in ex.args)...)
+end
+
+_kernel_ref_has_endpoint(ex) = ex === :end || ex === :begin ||
+    (ex isa Expr && !(ex.head in (:ref, :quote, :inert)) &&
+     any(_kernel_ref_has_endpoint, ex.args))
+
+function _kernel_ref_indices(array, indices)
+    n = length(indices)
+    Any[_kernel_ref_endpoints(index, array, k, n) for (k, index) in enumerate(indices)]
+end
+
 function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
                                 mod::Union{Module,Nothing} = nothing,
                                 scope::Set{Symbol} = known)
@@ -1771,7 +1796,7 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         # while native execution retains the authored in-place loop.
         target = ex.args[1]
         array = target.args[1]
-        indices = target.args[2:end]
+        indices = _kernel_ref_indices(array, target.args[2:end])
         return Expr(:(=), array,
             Expr(:call, GlobalRef(@__MODULE__, :_tensorized_setindex), array,
                  _kernel_tensorized_rhs(ex.args[2], known, mod, scope),
@@ -1786,8 +1811,16 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         return Expr(ex.head, ex.args[1],
                     _kernel_tensorized_rhs(ex.args[2], known, mod, scope))
     elseif ex.head === :ref
-        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_getindex),
-                    (_kernel_tensorized_rhs(arg, known, mod, scope) for arg in ex.args)...)
+        array = _kernel_tensorized_rhs(ex.args[1], known, mod, scope)
+        indices = ex.args[2:end]
+        getindex_call = a -> Expr(:call, GlobalRef(@__MODULE__, :_tensorized_getindex), a,
+            (_kernel_tensorized_rhs(index, known, mod, scope)
+             for index in _kernel_ref_indices(a, indices))...)
+        (array isa Symbol || !any(_kernel_ref_has_endpoint, indices)) &&
+            return getindex_call(array)
+        # A computed array is evaluated once and its endpoints read from it.
+        indexed = gensym(:indexed)
+        return Expr(:let, Expr(:(=), indexed, array), getindex_call(indexed))
     elseif ex.head === :call && !isempty(ex.args) &&
            ex.args[1] isa Symbol && _is_broadcast_operator(ex.args[1])
         operator = Symbol(String(ex.args[1])[2:end])
@@ -1919,12 +1952,74 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
     # with a definition-unique gensym token (RK 07:21) + its Form, so a prepared handle distinguishes it
     # from a manually-inserted raw (opaque) closure without IR inspection. Call forwards inline.
     deftoken = gensym(:rk_srcop)
+    if _kernel_branch_parts(rhs) !== nothing
+        # A top-level lazy branch keeps its parts as `_KernelBranch` metadata
+        # (same lazy call semantics) so plate partial evaluation can split
+        # lanes on a data-bound condition.
+        native, _ = _kernel_branch_callable(rhs, deps, known, mod, false)
+        tensor, _ = _kernel_branch_callable(rhs, deps, known, mod, tensorize)
+        return Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
+             Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
+             Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), native, tensor)
+    end
     Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
          Expr(:->, Expr(:tuple, deps...), rhs),
          Expr(:->, Expr(:tuple, deps...),
               tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs))
+end
+
+# `(condition, then, else)` of a value-producing top-level lazy branch —
+# `c ? a : b` / `if … elseif … else … end` (an `elseif` tail is the nested
+# else arm), `a && b` (else `false`), `a || b` (then `true`) — or `nothing`.
+# An `if` without `else` produces `nothing` on its inactive side and is not a
+# value branch.
+function _kernel_branch_parts(ex)
+    ex = _kernel_branch_unwrap(ex)
+    ex isa Expr || return nothing
+    if ex.head in (:if, :elseif) && length(ex.args) == 3
+        return (_kernel_branch_unwrap(ex.args[1]), ex.args[2], ex.args[3])
+    elseif ex.head === :&& && length(ex.args) == 2
+        return (_kernel_branch_unwrap(ex.args[1]), ex.args[2], false)
+    elseif ex.head === :|| && length(ex.args) == 2
+        return (_kernel_branch_unwrap(ex.args[1]), true, ex.args[2])
+    end
+    nothing
+end
+
+function _kernel_branch_unwrap(ex)
+    ex isa Expr && ex.head === :block || return ex
+    statements = [arg for arg in ex.args if !(arg isa LineNumberNode)]
+    length(statements) == 1 ? _kernel_branch_unwrap(only(statements)) : ex
+end
+
+# One part of a branch recipe as a construction expression, plus the recipe
+# arguments it consumes: a leaf is a closure over its own free ports (in
+# recipe-argument order); a nested branch is a `_KernelBranch` consuming every
+# argument. The condition is always a leaf (any branch inside it stays an
+# inline lazy branch of that closure).
+function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
+                                 mod, tensorize::Bool; leaf::Bool = false)
+    parts = leaf ? nothing : _kernel_branch_parts(part)
+    if parts === nothing
+        read = Set(_kernel_free_ports(part, Set{Symbol}(deps)))
+        ports = Symbol[d for d in deps if d in read]
+        body = tensorize ?
+            _kernel_tensorized_rhs(part, known, mod, Set{Symbol}(ports)) : part
+        return Expr(:->, Expr(:tuple, ports...), body), ports
+    end
+    condition, then_side, else_side = parts
+    positions(ports) = Tuple(findfirst(==(p), deps) for p in ports)
+    call = Expr(:->, Expr(:tuple, deps...), tensorize ?
+        _kernel_tensorized_rhs(part, known, mod, Set{Symbol}(deps)) : part)
+    cex, cports = _kernel_branch_callable(condition, deps, known, mod, tensorize;
+                                          leaf = true)
+    tex, tports = _kernel_branch_callable(then_side, deps, known, mod, tensorize)
+    eex, eports = _kernel_branch_callable(else_side, deps, known, mod, tensorize)
+    val(ports) = Expr(:call, GlobalRef(Base, :Val), positions(ports))
+    Expr(:call, GlobalRef(@__MODULE__, :_KernelBranch),
+         val(cports), val(tports), val(eports), call, cex, tex, eex), deps
 end
 
 function _kernel_nested_endpoint_deps(rhs, deps::Vector{Symbol}, known::Set{Symbol},
