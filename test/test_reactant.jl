@@ -205,6 +205,23 @@ end
     return x
 end
 
+# Nested dotted calls stay fused in the tensorized lowering (snag
+# `reactant-traced-ff8ff365`): the Φ-style blend `tril(X,-1) .+ 0.5 .*
+# Diagonal(diag(X))` must compile as one dense broadcast, not split into an
+# isolated structured `0.5 .* Diagonal(...)`.
+@kernel reactant_fused_diagonal_blend(X::Matrix{Float64}) = begin
+    Phi::Matrix{Float64} = tril(X, -1) .+ 0.5 .* Diagonal(diag(X))
+    return Phi
+end
+
+# A nested dotted broadcast over dense operands (no structured wrapper):
+# compiled before the fusion fix and must stay exact after it.
+@kernel reactant_nested_dense_blend(
+        A::Matrix{Float64}, B::Matrix{Float64}) = begin
+    C::Matrix{Float64} = A .+ B .* 2.0 .- 1.0
+    return C
+end
+
 _rk_call(k, x, μ, scale) = k(x, μ, scale)
 _rk_allocated(k, x, μ, scale) = @allocated k(x, μ, scale)
 _rk_output_allocated(x) = @allocated similar(x, Float64)
@@ -363,6 +380,27 @@ end
         E_traced = Reactant.to_rarray(I3)
         compiled_traced = @compile traced(K_traced, E_traced)
         @test Array(compiled_traced(K_traced, E_traced)) ≈ native_traced
+    end
+
+    @testset "nested dotted calls stay fused in tensorized bodies" begin
+        X_host = [1.0 2.0 3.0; 4.0 5.0 6.0; 7.0 8.0 9.0]
+        A_host = [1.0 2.0; 3.0 4.0]
+        B_host = [5.0 6.0; 7.0 8.0]
+
+        fused = prepare(reactant_fused_diagonal_blend; have = (:X,), want = :Phi)
+        native_fused = fused(X_host)
+        @test native_fused ≈ tril(X_host, -1) + Diagonal(diag(X_host)) / 2
+        rX = Reactant.to_rarray(X_host)
+        compiled_fused = @compile fused(rX)
+        @test Array(compiled_fused(rX)) ≈ native_fused
+
+        nested = prepare(reactant_nested_dense_blend; have = (:A, :B), want = :C)
+        native_nested = nested(A_host, B_host)
+        @test native_nested ≈ A_host .+ B_host .* 2.0 .- 1.0
+        rA = Reactant.to_rarray(A_host)
+        rB = Reactant.to_rarray(B_host)
+        compiled_nested = @compile nested(rA, rB)
+        @test Array(compiled_nested(rA, rB)) ≈ native_nested
     end
 
     @testset "source-derived functional state transition" begin

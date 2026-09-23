@@ -106,6 +106,10 @@ _KernelSourceOp(token::Val, form::Val, f) = _KernelSourceOp(token, form, f, f)
 # so it is resolved while tracing rather than becoming data-dependent control
 # flow in the compiled program.
 @inline _kernel_source_arg_style(arg) = Val(:native)
+# A lazy nested broadcast carries its leaves' style, so marker discovery sees
+# through fusion to the traced operands inside.
+@inline _kernel_source_arg_style(bc::Base.Broadcast.Broadcasted) =
+    _kernel_source_style(bc.args)
 @inline _kernel_source_merge(::Val{:tensorized}, style) = Val(:tensorized)
 @inline _kernel_source_merge(::Val{:native}, style) = style
 @inline _kernel_source_style(::Tuple{}) = Val(:native)
@@ -139,6 +143,12 @@ kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = F
 # promote untraced array operands against the discovered traced marker; without
 # a traced operand the wrappers reduce to the plain Base operations.
 @inline _tensorized_cat_operand(marker, arg) = arg
+# A lazy nested broadcast promotes leaf-wise: rebuild it with each leaf routed
+# through the operand hook, so host leaves lift against the traced marker
+# exactly as if each nest level had materialized on its own.
+@inline _tensorized_cat_operand(marker, bc::Base.Broadcast.Broadcasted) =
+    Base.Broadcast.broadcasted(bc.f,
+        map(arg -> _tensorized_cat_operand(marker, arg), bc.args)...)
 @inline _tensorized_getindex(array, indices...) = getindex(array, indices...)
 @inline function _tensorized_setindex(array, value, indices...)
     setindex!(array, value, indices...)
@@ -162,6 +172,20 @@ end
 @inline _tensorized_broadcast(f, args...) =
     _tensorized_materialize(
         Base.broadcasted(f, _tensorized_cat_operands(args)...))
+
+# Nested dotted calls stay lazy so Julia's broadcast fusion survives the
+# tensorized lowering: only the OUTERMOST dotted call of a nest materializes
+# (via `_tensorized_broadcast` above).  Materializing every nest level
+# separately changes WHICH broadcast style each level compiles under — a fused
+# dense expression such as `tril(X, -1) .+ 0.5 .* Diagonal(diag(X))` splits
+# into an isolated `0.5 .* Diagonal(...)` whose structured style trips the
+# `fzeropreserving` check on traced numbers (snag
+# `reactant-traced-ff8ff365`) — and allocates one temporary per level.  The
+# lazy form promotes exactly like the materializing one (same
+# `_tensorized_cat_operands`), so host/traced mixes lower identically; the
+# enclosing `broadcasted` nests it exactly as Julia's own lowering does.
+@inline _tensorized_lazy_broadcast(f, args...) =
+    Base.broadcasted(f, _tensorized_cat_operands(args)...)
 
 # `broadcast(f, ...)` materializes a `Bool`-eltype result into a `BitArray`, and
 # a tracing backend's `call_with_reactant` recurses without termination on
