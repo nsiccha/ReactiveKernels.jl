@@ -46,6 +46,7 @@ module ReactiveKernelsReactantODESolversReactantExt
 
 using ReactiveKernelsReactantODESolvers
 import Reactant
+import ReactiveKernels
 
 const RKRO = ReactiveKernelsReactantODESolvers
 

@@ -195,6 +195,22 @@ end
         @test indexed_counter_kernel(2.0) == 3.0
         @test calls[:out][] == 1
 
+        # The tensorized companion turns indexing into calls, so `begin`/`end`
+        # inside an index must already be resolved against the indexed array
+        # (a traced body otherwise fails with `UndefVarError: end`). Natively
+        # its wrappers reduce to Base, so evaluating the rewrite checks it.
+        tensorized(body) = eval(Expr(:->, :(u, M, v),
+            ReactiveKernels._kernel_tensorized_rhs(body)))
+        u = [1.0, 2.0, 3.0]; M = [1.0 2.0; 3.0 4.0; 5.0 6.0]; v = [2, 3]
+        for body in (:(u[end:-1:1]), :(u[end]), :(u[begin]), :(u[begin+1:end]),
+                     :(M[end, 1]), :(M[1, end]), :(M[end, :]), :(u[v[end]]),
+                     :(u[end - v[begin]]), :((2 .* u)[end]),
+                     :(let w = copy(u); w[end] = 0.0; w end))
+            @test Base.invokelatest(tensorized(body), u, M, v) ==
+                Base.invokelatest(eval(Expr(:->, :(u, M, v), body)), u, M, v)
+        end
+        @test u == [1.0, 2.0, 3.0]
+
         @test_throws ArgumentError macroexpand(@__MODULE__, quote
             @kernel same_name(same_name) = same_name
         end)

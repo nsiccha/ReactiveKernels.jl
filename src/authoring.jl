@@ -1736,6 +1736,31 @@ function _kernel_tensorized_branch(condition, then_side, else_side, known, mod,
          thunk(then_side), thunk(else_side), Expr(:tuple))
 end
 
+# `begin`/`end` inside an index denote the indexed array's first/last index;
+# Julia resolves them while lowering `a[...]`. Once the tensorized body turns
+# the indexing into a call they would be free variables, so resolve them
+# against the array first, as Julia does: in position `k` of `n` indices,
+# `end` becomes `lastindex(a, k)` (`lastindex(a)` for a single index) and
+# `begin` `firstindex`. A nested `b[...]` resolves its own endpoints.
+function _kernel_ref_endpoints(ex, array, k::Int, n::Int)
+    if ex === :end || ex === :begin
+        f = GlobalRef(Base, ex === :end ? :lastindex : :firstindex)
+        return n == 1 ? Expr(:call, f, array) : Expr(:call, f, array, k)
+    end
+    ex isa Expr || return ex
+    ex.head in (:ref, :quote, :inert) && return ex
+    Expr(ex.head, (_kernel_ref_endpoints(arg, array, k, n) for arg in ex.args)...)
+end
+
+_kernel_ref_has_endpoint(ex) = ex === :end || ex === :begin ||
+    (ex isa Expr && !(ex.head in (:ref, :quote, :inert)) &&
+     any(_kernel_ref_has_endpoint, ex.args))
+
+function _kernel_ref_indices(array, indices)
+    n = length(indices)
+    Any[_kernel_ref_endpoints(index, array, k, n) for (k, index) in enumerate(indices)]
+end
+
 function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
                                 mod::Union{Module,Nothing} = nothing,
                                 scope::Set{Symbol} = known)
@@ -1759,7 +1784,7 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         # while native execution retains the authored in-place loop.
         target = ex.args[1]
         array = target.args[1]
-        indices = target.args[2:end]
+        indices = _kernel_ref_indices(array, target.args[2:end])
         return Expr(:(=), array,
             Expr(:call, GlobalRef(@__MODULE__, :_tensorized_setindex), array,
                  _kernel_tensorized_rhs(ex.args[2], known, mod, scope),
@@ -1774,8 +1799,16 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         return Expr(ex.head, ex.args[1],
                     _kernel_tensorized_rhs(ex.args[2], known, mod, scope))
     elseif ex.head === :ref
-        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_getindex),
-                    (_kernel_tensorized_rhs(arg, known, mod, scope) for arg in ex.args)...)
+        array = _kernel_tensorized_rhs(ex.args[1], known, mod, scope)
+        indices = ex.args[2:end]
+        getindex_call = a -> Expr(:call, GlobalRef(@__MODULE__, :_tensorized_getindex), a,
+            (_kernel_tensorized_rhs(index, known, mod, scope)
+             for index in _kernel_ref_indices(a, indices))...)
+        (array isa Symbol || !any(_kernel_ref_has_endpoint, indices)) &&
+            return getindex_call(array)
+        # A computed array is evaluated once and its endpoints read from it.
+        indexed = gensym(:indexed)
+        return Expr(:let, Expr(:(=), indexed, array), getindex_call(indexed))
     elseif ex.head === :call && !isempty(ex.args) &&
            ex.args[1] isa Symbol && _is_broadcast_operator(ex.args[1])
         operator = Symbol(String(ex.args[1])[2:end])
