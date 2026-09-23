@@ -223,7 +223,8 @@ _mpbr_materialize(value::LinearAlgebra.Cholesky,
         _mpbr_materialize(value.factors, prototype.factors),
         value.uplo, Int(value.info))
 _mpbr_materialize(
-        value::Reactant.TracedLinearAlgebra.BatchedCholesky,
+        value::Base.get_extension(
+            ReactiveKernels, :ReactiveKernelsReactantExt)._TracedCholesky,
         prototype::LinearAlgebra.Cholesky) =
     LinearAlgebra.Cholesky(
         _mpbr_materialize(value.factors, prototype.factors),

@@ -453,7 +453,7 @@ end
 end
 
 # Optional backends may need representation-only wrappers while tracing (for
-# example Reactant's BatchedCholesky).  Reusable results cross back to the
+# example the Reactant extension's traced Cholesky).  Reusable results cross back to the
 # source-logical ABI before their next invocation: retain the backend arrays,
 # but rebuild every structural wrapper from the frozen source schema.  This is
 # intentionally separate from `_sm_finite_reconstruct`, whose backend-aware

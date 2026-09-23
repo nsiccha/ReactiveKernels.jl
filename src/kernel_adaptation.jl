@@ -5036,9 +5036,9 @@ _sm_machine_state_type(
 # A Cholesky wrapper travels as its `(factors, uplo, info)` parts: the factors
 # recurse structurally, `uplo` is a static identity, and `info` is one numeric
 # column (a factorization computed inside a compiled call may carry a traced
-# success flag).  A backend's representation-only wrapper (Reactant's
-# `BatchedCholesky`) registers its own accessor; anything else is not a
-# Cholesky.
+# success flag).  A backend's representation-only wrapper (the Reactant
+# extension's traced Cholesky) registers its own accessor; anything else is
+# not a Cholesky.
 _sm_observation_cholesky_parts(value::LinearAlgebra.Cholesky) =
     (factors=value.factors, uplo=value.uplo, info=value.info)
 _sm_observation_cholesky_parts(value) = nothing

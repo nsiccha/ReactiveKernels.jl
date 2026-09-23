@@ -41,6 +41,15 @@ code is not executed by the docs build.
   tensorized companion expands it with `ReactantCore.@trace` at kernel
   definition, so it becomes one `stablehlo.while` region whatever the trip
   count; the loop body is never replicated per iteration.
+- A traced Cholesky factorization is a wrapper type owned by the Reactant
+  extension, with `LinearAlgebra.Cholesky`'s accessors (`.L`, `.U`, `.UL`,
+  `.factors`) and solves (`\`, `ldiv!`; a diagonal factor divides
+  elementwise). A Cholesky passed as state and a `cholesky(...)` call inside
+  a larger `@kernel` expression (`cholesky(Symmetric(K)).L`) produce it; the
+  extension defines no methods on Reactant's own factorization type, which has
+  no `.L`/`.U`. A `cholesky` call outside that lowering — in a helper function
+  the kernel calls, or a statement that is exactly `F = cholesky(A)` — returns
+  Reactant's type, whose packed factor is `F.factors`.
 - Whole-kernel `replica` preserves the scalar kernel as its source authority.
 - Compiled AD reuses the native single-active-port, scalar-WANT validation.
 - Unsupported scalar indexing, unbounded control, or structural state rejects;
