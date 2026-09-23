@@ -34,6 +34,27 @@ the authored Julia branch and loop semantics in both primal and derivative
 execution. If a backend cannot express them, report the unsupported case and
 isolate the backend failure instead of adopting an eager workaround.
 
+## Derivative rules come from one mathematical graph, never by hand
+
+**Do not write backend-specific derivative rules.** The user-ratified policy
+(ReactiveKernels:reactant decision `2026-09-14T13-13-44-484-15lmrss`, design
+page [manual derivative rules](manual-derivative-rules.md) with
+`examples/manual_derivative_rule.jl`) is that a numerical primitive's
+derivatives are authored once as an ordinary pure-math `@kernel` graph — the
+stable primal plus named partials, or forward and reverse branches as outputs
+of one multi-output graph — and that every AD-protocol adapter (ChainRules,
+Mooncake, Enzyme, Reactant once its upstream bridge exists) is *generated*
+from activity-selected cuts of that graph. Separately authored JVP/VJP
+declarations, hand-written `EnzymeRules`/ChainRules methods, function or
+runtime-activity annotations, and finite-difference substitutions are all
+rejected; the acceptance corpus differentiates the authored primal with the
+backend's ordinary reverse mode and nothing else. The generator is not built
+yet (ReactiveKernels:reactant todo `2026-09-14T17-10-05-750-0dsqq02`), so
+today RK registers no derivative rule at all, and a failure of the ordinary
+path is a backend limitation: isolate it with a backend-only reproducer under
+`benchmark/`, record it on this page, and, if it aborts the process, skip the
+affected acceptance cases by name until the backend lowers the shape.
+
 ## Acceptance and existing limitations
 
 A lowering change must demonstrate that increasing relevant data lengths or
@@ -74,10 +95,11 @@ code):
   loop; its supported gradient is the backsolve adjoint, which differentiates
   only the loop-free right-hand side.
 - Native Enzyme reverse mode aborts the process (an LLVM assertion in its
-  C-level `lgamma_r` handling) when lazily evaluated branches around
+  shadow-allocation caching, reached while it differentiates SpecialFunctions'
+  `logabsgamma` port) when lazily evaluated branches around
   `loggamma`/`logbeta` sit in non-inlined functions differentiated together,
   one inside a loop: `repro_enzyme_lgamma_branch.jl`. That is the shape of a
-  guarded `logpdf` plus an observation plate. The lazy guards stay;
-  `ReactiveKernelsDistributionKernels` registers Julia-level reverse rules for
-  `loggamma` and `logabsgamma` (derivative `digamma`) in its Enzyme extension,
-  so the C handler is never reached.
+  guarded `logpdf` plus an observation plate. The lazy guards stay, and RK
+  registers no custom derivative rule (its acceptance contract is ordinary
+  reverse-mode AD only); the plain-Enzyme acceptance cases that hit the abort
+  are skipped by name until Enzyme lowers this shape.

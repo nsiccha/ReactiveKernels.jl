@@ -470,4 +470,3 @@ end
 end
 
 include("test_glm.jl")
-include("test_enzyme_rules.jl")
