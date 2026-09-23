@@ -13,10 +13,12 @@ ReactantCore = "a3311ec8-5e00-46d5-b541-4f83e724a433"
 RuntimeGeneratedFunctions = "7e49a35a-f44a-4d26-94aa-eba1b4ca6b47"
 
 [weakdeps]
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 MutatingFunctions = "8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 
 [extensions]
+ReactiveKernelsEnzymeExt = "Enzyme"
 ReactiveKernelsMutatingFunctionsExt = "MutatingFunctions"
 ReactiveKernelsReactantExt = "Reactant"
 

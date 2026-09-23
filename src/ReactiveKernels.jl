@@ -34,6 +34,7 @@ include("nonallocating.jl")
 include("graphops.jl")
 include("authoring.jl")
 include("ad.jl")
+include("derivative_rules.jl")
 include("kernel_stateful.jl")
 include("kernel_methodir.jl")
 include("kernel_factory.jl")
@@ -55,6 +56,7 @@ export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan
 export partial_evaluation
 export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
 export prepare_ad_pullback, ad_pullback
+export ScalarDerivativeRule, scalar_derivative_rule, derivative_cut
 export ad_value_and_pullback, ad_value_and_pullback!
 export compile_ad_gradient, compile_ad_value_and_gradient
 export lower, lower_with_ops, lower_batched, replica, plate_body, scan_body, transform, compile

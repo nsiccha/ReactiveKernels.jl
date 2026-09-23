@@ -5,19 +5,34 @@ using LinearAlgebra
 import LogExpFunctions
 import SpecialFunctions
 
-# RK-owned entry points for the two special functions whose derivatives this
-# repository owns. Every distribution source calls THESE names (never
-# SpecialFunctions' directly), so a derivative rule attaches to a function this
-# package owns: a rule on `SpecialFunctions.loggamma` would be type piracy and
-# would change every Enzyme user in the session.
-#
-# INTERIM: the Enzyme extension attaches hand-written reverse rules to these two
-# functions until the derivative-rule generator replaces them with adapters
-# generated from one pure-math graph (ReactiveKernels:review todo
-# 2026-09-23T03-00-11-762-1q9sudt; policy: docs/src/constraints.md). The entry
-# points themselves stay; only their rule bodies flip.
-loggamma(x) = SpecialFunctions.loggamma(x)
-logbeta(a, b) = SpecialFunctions.logbeta(a, b)
+# The two special functions whose derivatives this repository owns, each
+# authored ONCE as a pure-math graph: the stable primal plus its named
+# partials. `scalar_derivative_rule` turns a graph into an RK-owned callable
+# whose value is the graph's primal cut and whose AD adapters (Enzyme today,
+# through ReactiveKernels' own extension) are generated from the
+# activity-selected cuts of the same graph — no backend-specific derivative
+# code anywhere, and no rule on a function this package does not own
+# (docs/src/constraints.md, "Derivative rules come from one mathematical
+# graph, never by hand"). Every distribution and GLM source calls THESE names,
+# never SpecialFunctions' directly.
+@kernel loggamma_graph(x::Float64) = begin
+    y::Float64 = SpecialFunctions.loggamma(x)
+    dy_dx::Float64 = SpecialFunctions.digamma(x)
+    return y, dy_dx
+end
+const loggamma = scalar_derivative_rule(
+    loggamma_graph; primal = :y, partials = (x = :dy_dx,), name = :loggamma)
+
+@kernel logbeta_graph(a::Float64, b::Float64) = begin
+    y::Float64 = SpecialFunctions.logbeta(a, b)
+    dsum::Float64 = SpecialFunctions.digamma(a + b)
+    dy_da::Float64 = SpecialFunctions.digamma(a) - dsum
+    dy_db::Float64 = SpecialFunctions.digamma(b) - dsum
+    return y, dy_da, dy_db
+end
+const logbeta = scalar_derivative_rule(
+    logbeta_graph; primal = :y, partials = (a = :dy_da, b = :dy_db),
+    name = :logbeta)
 
 export LOCATION_SCALE_SOURCE
 export standard_normal, standard_cauchy, standard_laplace, standard_student_t
@@ -53,6 +68,7 @@ export NEGATIVE_BINOMIAL2_SOURCE
 export INVERSE_GAMMA_SOURCE, DIRICHLET_SOURCE, LKJ_CORR_CHOLESKY_SOURCE
 
 const LOCATION_SCALE_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using SpecialFunctions: erfc, erfcinv, beta_inc, beta_inc_inv
 using LogExpFunctions: log1pexp
 
@@ -405,6 +421,7 @@ end
 # straight-line endpoint), so only `logpdf` and `cdf` are exposed. `cdf` is the
 # regularized upper incomplete gamma Q(k+1, λ).
 const POISSON_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using SpecialFunctions: gamma_inc
 
 @kernel poisson(rate::Float64) = begin
@@ -424,6 +441,7 @@ end
 # route while the others become derived views. `logpdf` uses `log_rate` directly
 # for the normalization so no `log(exp(log_rate))` round trip enters the plan.
 const GAMMA_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using SpecialFunctions: gamma_inc, gamma_inc_inv
 
 @kernel gamma(shape::Float64, rate::Float64) = begin
@@ -446,6 +464,7 @@ end
 # Continuous unit-interval family with two positive shapes. `cdf` is the
 # regularized incomplete beta I_x(a, b); `quantile` its inverse.
 const BETA_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: logbeta
 using SpecialFunctions: beta_inc, beta_inc_inv
 
 @kernel beta(a::Float64, b::Float64) = begin
@@ -464,6 +483,7 @@ end
 # closed-form quantile (discrete inversion), so only `logpdf` and `cdf` are
 # exposed. `cdf` is the regularized incomplete beta I_{1-p}(n-k, k+1).
 const BINOMIAL_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using LogExpFunctions: log1pexp
 using SpecialFunctions: beta_inc
 
@@ -497,6 +517,7 @@ end
 # invalid side (docs/src/constraints.md). No cdf/quantile (discrete
 # inversion); only `logpdf` is exposed.
 const NEGATIVE_BINOMIAL2_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using LogExpFunctions: log1p
 
 @kernel negative_binomial2(mu::Float64, phi::Float64) = begin
@@ -519,6 +540,7 @@ end
 # regularized incomplete gamma Q(α, θ/x) — since 1/X ~ Gamma(α, rate = θ) — and
 # `quantile` inverts it through `gamma_inc_inv`.
 const INVERSE_GAMMA_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using SpecialFunctions: gamma_inc, gamma_inc_inv
 
 @kernel inverse_gamma(shape::Float64, scale::Float64) = begin
@@ -543,7 +565,7 @@ end
 # vector-valued family has no scalar cdf/quantile). The `max` keeps `log`
 # straight-line; the domain guard returns -Inf without control flow.
 const DIRICHLET_KERNEL_SOURCE = raw"""
-
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 @kernel dirichlet(alpha::Vector{Float64}) = begin
     log_normalizer::Float64 = loggamma(sum(alpha)) - sum(loggamma, alpha)
 
@@ -571,6 +593,7 @@ end
 # and inline `size(L,1)` inside the ranges — a single reused integer node across
 # the many normalizer terms does not route through the planner.
 const LKJ_CORR_CHOLESKY_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta
 using LinearAlgebra: diag
 
 @kernel lkj_corr_cholesky(eta::Float64) = begin

@@ -92,6 +92,21 @@ function Reactant.traced_type_inner(
     T
 end
 
+# A generated derivative rule is the same kind of static program structure: its
+# fields are runtime-generated cuts of one graph and their operation tables.
+# Its call traces through those cuts' source ops like any other kernel call.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels.ScalarDerivativeRule, path, mode;
+        kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels.ScalarDerivativeRule}
+    T
+end
+
 # A runtime-generated function is static program structure: its `body` is an
 # `Expr` whose `GlobalRef`s carry `Core.Binding` back-references (a cycle the
 # generic tracer does not terminate on), and it never holds a traced operand.
