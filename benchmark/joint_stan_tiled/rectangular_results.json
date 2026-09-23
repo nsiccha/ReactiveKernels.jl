@@ -276,5 +276,67 @@
       "fix_1_only": -11.20811055546394,
       "with_fix_2": -17.273417152590273
     }
+  },
+  "ci_binary_3241_2026_09_23": {
+    "status": "CI-built Reactant_jll of an unmerged Enzyme-JAX PR; not a released toolchain",
+    "toolchain": {
+      "julia": "1.10.11",
+      "reactant": "0.2.287 (Reactant.jl main e2ccdb9b)",
+      "enzyme": "0.13.204",
+      "reactant_jll": "0.0.410",
+      "libReactantExtra": "Build Reactant_jll CI run 35803008630 of EnzymeAD/Enzyme-JAX PR #3241 (head 85c34a10 = #3240 + the if/case result-adjoint zeroing fix), artifact products-x86_64-linux-gnu-cxx11-gpu_version+12.9-gpu+cuda-mode+opt, zip sha256 3e782d64206d456c4fa72f3210dfba3b6eb474f69d15744545e582901e4f8493",
+      "rk_source": "2880da1651f92a20ef124e420e91e4350ee61ba1",
+      "host": "strato2",
+      "backend": "cpu",
+      "optimization": "default",
+      "sync": true,
+      "repetitions": 50,
+      "rk_rectangular": true
+    },
+    "timing_note": "strato2 was heavily shared during these runs (native gradient 0.78-0.82 ms against 0.197/0.495 ms on 2026-09-22), and each compile time is the first compile in a fresh process, so neither evaluation nor compile times are comparable to the other entries; the parity results are the point of this entry",
+    "reproducers": {
+      "repro_nested_if_reverse.jl": {
+        "compiled_gradient": -17.273417152590273,
+        "exact": -17.27341715259027,
+        "pass": true
+      },
+      "repro_rectangular_reverse.jl": {
+        "grad_parity_rtol_1e-8": true,
+        "note": "all 10 entries match native to ~1e-15, including subject 1's log_k10/log_k12/log_k21/log_ka that were 6e-2 to 5.9e-1 off with #3240 alone"
+      },
+      "enzyme_jax_3241_mwe": {
+        "compiled_gradient": 7.0,
+        "exact": 7.0,
+        "pass": true
+      }
+    },
+    "joint": [
+      {
+        "K": 1,
+        "primal_parity": true,
+        "grad_parity_rtol_1e-9": true,
+        "grad_maxrel": 5.599e-14,
+        "primal_reldiff": 1.882e-16,
+        "primal_compile_s": 116.1,
+        "grad_compile_s": 183.7,
+        "reactant_eval_ms": 0.5089,
+        "native_eval_ms": 0.0173,
+        "reactant_grad_ms": 13.3969,
+        "native_grad_ms": 0.8195
+      },
+      {
+        "K": 3,
+        "primal_parity": true,
+        "grad_parity_rtol_1e-9": true,
+        "grad_maxrel": 1.313e-14,
+        "primal_reldiff": 1.459e-16,
+        "primal_compile_s": 87.6,
+        "grad_compile_s": 157.9,
+        "reactant_eval_ms": 0.9355,
+        "native_eval_ms": 0.0336,
+        "reactant_grad_ms": 84.9758,
+        "native_grad_ms": 0.7834
+      }
+    ]
   }
 }
