@@ -1219,7 +1219,10 @@ end
 _recurrence_trace(x) = x
 _recurrence_trace(x::Tuple) = map(_recurrence_trace, x)
 _recurrence_trace(x::NamedTuple) = map(_recurrence_trace, x)
-_recurrence_trace(x::AbstractArray) = Reactant.promote_to(Reactant.TracedRArray, x)
+# Promotion may hand two equal host constants the same tracer (two all-zero
+# columns of one length), so copy: each slot needs its own tracer object.
+_recurrence_trace(x::AbstractArray) =
+    copy(Reactant.promote_to(Reactant.TracedRArray, x))
 # A traced array enters a retained loop as a FRESH tracer object: the loop
 # writes each carry slot's result back into the object it was seeded from,
 # and seeding from a state field's own tracer would silently advance that
@@ -1247,7 +1250,7 @@ ReactiveKernels._sm_restore_source_logical_wrappers(
         ::_DiagonalSchema, value::AbstractMatrix) =
     LinearAlgebra.Diagonal(LinearAlgebra.diag(value))
 _recurrence_trace(x::T) where {T<:Number} =
-    Reactant.promote_to(Reactant.TracedRNumber{T}, x)
+    copy(Reactant.promote_to(Reactant.TracedRNumber{T}, x))
 _recurrence_trace(x::Reactant.TracedRNumber) = copy(x)
 
 function ReactiveKernels._rectangular_fold_impl(

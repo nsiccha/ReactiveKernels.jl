@@ -50,6 +50,31 @@ const RKP = ReactiveKernelsPPL
     end
 end
 
+@testset "equal host columns keep separate loop slots" begin
+    # Single doses only: the all-zero interval column and the default
+    # bioavailability slice are equal host arrays of one length, and the
+    # output buffer has that length too. Each must enter the retained loop as
+    # its own tracer, or the primal-only compile fails to trace.
+    previous_mode = RKP._rectangular_pk_enabled[]
+    try
+    RKP._rectangular_pk_enabled[] = true
+    sched = build_linear_pk_schedule([1, 1], [5.0, 29.0], [1, 1], [0.0, 24.0],
+        [100.0, 100.0])
+    @test all(iszero, sched.op_interval)
+    cols = (sched.op_type, sched.op_dt, sched.op_amount,
+        sched.op_interval, sched.op_count, sched.op_read_idx)
+    lp = log.([10.0, 0.1, 0.2, 0.3, 0.5])
+    f(lp) = RKP.linear_pk_read_locs_auc_over_subjects(sched.op_ends, cols...,
+        RKP.SubjectSlice(zeros(length(sched.op_type))),
+        ntuple(i -> ReactiveKernels._tensorized_getindex(lp, i), 5)...)
+    rlp = Reactant.to_rarray(lp)
+    compiled = Reactant.@compile f(rlp)
+    @test Array(compiled(rlp)) ≈ f(lp) rtol=1e-12
+    finally
+        RKP._rectangular_pk_enabled[] = previous_mode
+    end
+end
+
 @testset "standalone dose power retains its bit loop" begin
     counts = Int[]
     for n in (3, 31)
