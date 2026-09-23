@@ -54,17 +54,19 @@ ordinary reverse mode and nothing else. A rule on a foreign function such as
 `SpecialFunctions.loggamma` is type piracy on top of that: it silently changes
 every Enzyme user in the session.
 
-The generator's first slice is under construction (ReactiveKernels:review todo
-`2026-09-23T03-00-11-762-1q9sudt`, taking over ReactiveKernels:reactant todo
-`2026-09-14T17-10-05-750-0dsqq02`). Until it lands, the only derivative rules
-in this repository are two interim reverse rules attached to
-DistributionKernels' own `loggamma`/`logbeta` entry points (its Enzyme
-extension), marked `INTERIM` in source with that todo; the flip replaces their
-bodies with generator output and deletes the extension. A new backend failure
-of the ordinary path remains a backend limitation: isolate it with a
-backend-only reproducer under `benchmark/`, record it on this page, and, if it
-aborts the process, skip the affected acceptance cases by name until either
-the backend lowers the shape or the generator provides the owned rule.
+The generator's first slice is shipped: `scalar_derivative_rule`
+(`src/derivative_rules.jl`) turns a scalar graph that authors the primal plus
+one named partial per input into an RK-owned callable, and the Enzyme adapter
+(`ext/ReactiveKernelsEnzymeExt.jl`) derives both directions from the
+activity-selected cuts of that graph; DistributionKernels' `loggamma` and
+`logbeta` are such rules, and they are the only derivative rules in this
+repository. Vector ports, authored reverse branches, and the ChainRules,
+Mooncake and Reactant adapters remain ReactiveKernels:reactant todo
+`2026-09-14T17-10-05-750-0dsqq02`. A new backend failure of the ordinary path
+remains a backend limitation: isolate it with a backend-only reproducer under
+`benchmark/`, record it on this page, and, if it aborts the process, skip the
+affected acceptance cases by name until either the backend lowers the shape or
+a generated rule on an owned callable covers it.
 
 ## Acceptance and existing limitations
 
@@ -115,7 +117,7 @@ code):
   `loggamma`/`logbeta` sit in non-inlined functions differentiated together,
   one inside a loop: `repro_enzyme_lgamma_branch.jl`. That is the shape of a
   guarded `logpdf` plus an observation plate. The lazy guards stay; the
-  distribution sources call DistributionKernels' own `loggamma`/`logbeta`
-  entry points, whose reverse rules (interim by hand, generated after the
-  flip; see the rule constraint above) make them primitives for Enzyme, so
-  the failing body is never differentiated.
+  distribution sources call DistributionKernels' own `loggamma`/`logbeta`,
+  rules generated from their pure-math graphs (the rule constraint above),
+  which makes them primitives for Enzyme, so the failing body is never
+  differentiated.

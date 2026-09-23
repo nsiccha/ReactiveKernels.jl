@@ -57,7 +57,7 @@ import .ManualDerivativeRuleExample
     docs_make = read(joinpath(@__DIR__, "..", "docs", "make.jl"), String)
     docs_helpers = read(joinpath(@__DIR__, "..", "docs",
                                  "kernel_examples.jl"), String)
-    @test occursin("Executable design example, not a shipped adapter generator",
+    @test occursin("Executable design example; the scalar slice of the generator is shipped",
                    docs_page)
     @test occursin("examples/manual_derivative_rule.jl", docs_page)
     @test occursin("render_manual_derivative_rule_cuts()", docs_page)

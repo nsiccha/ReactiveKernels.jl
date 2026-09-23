@@ -77,7 +77,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test occursin("test_batched_nonallocating.jl", distributions_ad_docs)
     for marker in (
             "# Manual derivative rule graphs (design example)",
-            "Executable design example, not a shipped adapter generator",
+            "Executable design example; the scalar slice of the generator is shipped",
             "## Current capability and required RK features",
             "Everything that turns\nthat graph into a registered custom AD rule is new work",
             "RK has neither feature",
@@ -86,7 +86,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
             "render_manual_derivative_rule_cuts()",
             "render_manual_derivative_pullback_source()",
             "result.captured_fields",
-            "not yet generate ChainRules, Mooncake, Enzyme, or Reactant",
+            "ChainRules, Mooncake and Reactant adapters — that RK does not generate yet",
         )
         @test occursin(marker, manual_rules_docs)
     end

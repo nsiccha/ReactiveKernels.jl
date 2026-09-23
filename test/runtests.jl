@@ -33,6 +33,7 @@ const _MATRIX_CORE_TESTS = (
     "test_inner_plate_partial_evaluation.jl",
     "test_ad.jl",
     "test_manual_derivative_rule_example.jl",
+    "test_derivative_rules.jl",
     "test_authoring.jl",
     "test_docs_navigation.jl",
     "test_kernel_objects.jl",

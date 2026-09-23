@@ -115,12 +115,20 @@ _KernelSourceOp(token::Val, form::Val, f) = _KernelSourceOp(token, form, f, f)
         _kernel_source_style(Base.tail(args)),
     )
 end
-@inline _kernel_source_call(::Val{:native}, op::_KernelSourceOp, args) =
+# `Vararg{Any,N}` forces specialization on the argument count: Julia's
+# default heuristic leaves a Vararg that is merely forwarded unspecialized,
+# which materializes the arguments as one boxed tuple. Enzyme then meets that
+# tuple as a dynamic `jl_f_tuple` and its runtime tuple rule refuses mixed
+# activity (a constant array next to active ones) unless runtime activity is
+# switched on. Specialized, the arguments stay individual values.
+@inline _kernel_source_call(::Val{:native}, op::_KernelSourceOp,
+                            args::Vararg{Any,N}) where {N} =
     op.f(args...)
-@inline _kernel_source_call(::Val{:tensorized}, op::_KernelSourceOp, args) =
+@inline _kernel_source_call(::Val{:tensorized}, op::_KernelSourceOp,
+                            args::Vararg{Any,N}) where {N} =
     op.tensor_f(args...)
-@inline (op::_KernelSourceOp)(args...) =
-    _kernel_source_call(_kernel_source_style(args), op, args)
+@inline (op::_KernelSourceOp)(args::Vararg{Any,N}) where {N} =
+    _kernel_source_call(_kernel_source_style(args), op, args...)
 kernel_sourceop_token(::_KernelSourceOp{DefToken}) where {DefToken} = DefToken
 kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = Form
 # Tensorized fused bodies may mix untraced constant arrays with traced operands.

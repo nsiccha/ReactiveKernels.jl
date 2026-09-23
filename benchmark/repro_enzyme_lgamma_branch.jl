@@ -10,9 +10,9 @@
 # Each piece alone, the fully inlined shape, and a branchless `ifelse` select
 # all differentiate fine.  This is the shape every guarded `logpdf` plus an
 # observation plate produces in ReactiveKernelsDistributionKernels, whose
-# sources therefore call its own `loggamma`/`logbeta` entry points carrying
-# reverse rules (interim by hand, generated from one pure-math graph once the
-# rule generator lands); with those rules the gradient below matches central
+# sources therefore call its own `loggamma`/`logbeta`: derivative rules
+# generated from one pure-math graph each (`scalar_derivative_rule`), which
+# makes them Enzyme primitives; with them the gradient below matches central
 # differences.  Recorded on strato2, Enzyme 0.13.204 /
 # SpecialFunctions 2, Julia 1.10.11, 2026-09-23.
 using Enzyme, SpecialFunctions

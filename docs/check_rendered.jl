@@ -428,7 +428,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     structural_markers = Dict(
         "manual-derivative-rules.md" => (
             "Manual derivative rule graphs (design example)",
-            "Executable design example, not a shipped adapter generator",
+            "Executable design example; the scalar slice of the generator is shipped",
             "Current capability and required RK features",
             "Everything that turns",
             "registered custom AD rule is new work",

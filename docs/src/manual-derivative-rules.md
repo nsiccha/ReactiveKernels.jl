@@ -5,14 +5,50 @@ reverse-direction mathematics of a small numerical function. Different
 HAVE→WANT cuts then remove every branch that a particular rule invocation does
 not need.
 
-!!! note "Executable design example, not a shipped adapter generator"
-    This page executes current public `@kernel` and `prepare` behavior. The
-    backend adapters discussed below are the approved design target; RK does
-    not yet generate ChainRules, Mooncake, Enzyme, or Reactant rule methods.
+!!! note "Executable design example; the scalar slice of the generator is shipped"
+    This page executes current public `@kernel` and `prepare` behavior. For a
+    scalar graph that authors the primal plus one named partial per input,
+    [`scalar_derivative_rule`](@ref) generates the callable and its Enzyme
+    reverse and forward adapters from activity-selected cuts (the section
+    [Generated scalar rules](@ref) below). The matrix–vector example on this
+    page shows the wider target — authored JVP/VJP branches, residual staging,
+    ChainRules, Mooncake and Reactant adapters — that RK does not generate yet.
 
 The authoring boundary contains ordinary arrays and formulas. It does not
 contain backend tangent types, activity annotations, thunks, accumulation
 conventions, or registration declarations.
+
+## Generated scalar rules
+
+A scalar numerical primitive is authored once as a graph whose WANT ports are
+its value and one partial derivative per input:
+
+```julia
+@kernel loggamma_graph(x::Float64) = begin
+    y::Float64 = SpecialFunctions.loggamma(x)
+    dy_dx::Float64 = SpecialFunctions.digamma(x)
+    return y, dy_dx
+end
+const loggamma = scalar_derivative_rule(
+    loggamma_graph; primal = :y, partials = (x = :dy_dx,), name = :loggamma)
+```
+
+`loggamma(x)` runs the primal cut (`want = :y`; the partial is pruned), and
+its signature is generic, so the same cut traces under Reactant. With
+`Enzyme` loaded, ReactiveKernels' extension registers one generic rule set
+for every such callable: the activity pattern of a call selects the cut
+`want = (:y, partials of the active inputs...)` through
+[`derivative_cut`](@ref), and the scalar chain rule combines those partials
+with Enzyme's covector (reverse) or directions (forward, including batch
+width). Nothing backend-specific is authored, and no rule attaches to a
+function outside this repository. `ReactiveKernelsDistributionKernels` uses
+exactly this for `loggamma` and `logbeta`.
+
+```@docs
+scalar_derivative_rule
+ScalarDerivativeRule
+derivative_cut
+```
 
 ## Current capability and required RK features
 
@@ -21,8 +57,8 @@ authored primal/JVP/VJP formulas, and `prepare` can prune it when the caller
 manually supplies the corresponding HAVE and WANT ports. Everything that turns
 that graph into a registered custom AD rule is new work.
 
-Even when the VJP formula is already present, an RK rule generator still needs
-to add:
+For the vector-valued, authored-branch form on this page, an RK rule
+generator still needs to add:
 
 - backend-neutral roles that map graph ports to primal arguments, directions,
   output covectors, input covectors, and retainable residuals;
@@ -112,10 +148,12 @@ provides one.
 
 ## Backend boundary
 
-Generated ChainRules, Mooncake, and Enzyme adapters would translate the selected
-numeric inputs and outputs into their respective rule protocols. Reactant rule
-emission additionally depends on the upstream EnzymeMLIR custom-rule bridge;
-see [Automatic differentiation through Reactant](reactant-ad.md). Until those
-generators exist, this page is executable evidence for graph pruning plus a
-manually authored staging oracle—not a claim that registering `matvec_rule`
-changes any AD backend or that RK can currently synthesize the pullback.
+Generated ChainRules and Mooncake adapters would translate the selected
+numeric inputs and outputs into their respective rule protocols, as the
+shipped Enzyme adapter does for scalar rules. Reactant rule emission
+additionally depends on the upstream EnzymeMLIR custom-rule bridge; see
+[Automatic differentiation through Reactant](reactant-ad.md). Until those
+generators exist for this vector-valued form, this page's matrix–vector
+example is executable evidence for graph pruning plus a manually authored
+staging oracle—not a claim that registering `matvec_rule` changes any AD
+backend or that RK can currently synthesize its pullback.
