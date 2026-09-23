@@ -19,6 +19,17 @@ end
     return total
 end
 
+# A branch whose condition reads bound data only (`y`) is split during
+# preparation; the constant arm reads no lane argument.
+@kernel data_bound_plate_guard(x::Vector{Float64}, y::Vector{Float64}) = begin
+    pointwise = plate(x, y) do xi, yi
+        cell::Float64 = yi > 0 ? log(xi * yi) : 1.0
+        cell
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+
 @kernel lazy_short_circuit(x::Float64, flag::Bool) = begin
     both::Bool = flag && x > 0
     either::Bool = flag || x > 0
@@ -90,4 +101,25 @@ end
     @test _host(only(compiled_small(_traced(small)))) ≈ [0.5, 0.0, 2.0, 0.0]
     @test _host((Reactant.@compile k(_traced(large)))(_traced(large))) ≈ k(large)
     @test_throws Reactant.Compiler.CompilationError Reactant.@compile gradient(_traced(large))
+end
+
+@testset "a data-bound plate branch is split: reverse at every lane count" begin
+    # The condition reads bound data, so preparation splits the lanes by arm
+    # and no conditional region reaches the traced program; the batched
+    # lazy-branch reverse boundary above does not apply.
+    for n in (8, 32)
+        x = collect(range(0.5, 3.0; length = n))
+        y = [isodd(i) ? 0.5i : -1.0 for i in 1:n]
+        k = prepare(data_bound_plate_guard; have = (:x, :y), want = :total,
+                    bound = (; y))
+        hlo = repr(Reactant.@code_hlo optimize = false k(_traced(x)))
+        @test !occursin("stablehlo.if", hlo)
+        compiled = Reactant.@compile k(_traced(x))
+        @test _host(compiled(_traced(x))) ≈ k(x)
+        @test k(x) ≈ sum(yi > 0 ? log(xi * yi) : 1.0 for (xi, yi) in zip(x, y))
+        gradient(v) = Enzyme.gradient(Enzyme.Reverse, k, v)
+        compiled_gradient = Reactant.@compile gradient(_traced(x))
+        @test _host(only(compiled_gradient(_traced(x)))) ≈
+              [yi > 0 ? 1 / xi : 0.0 for (xi, yi) in zip(x, y)]
+    end
 end
