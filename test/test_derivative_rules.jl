@@ -205,6 +205,33 @@ end
     v_bar::Vector{Float64} = s .* y_bar
     return y, s_bar, v_bar
 end
+# The VJP reads the primal output: the staged residual is y, not x.
+@kernel softmax_rule(x::Vector{Float64}, y_bar::Vector{Float64}) = begin
+    e::Vector{Float64} = exp.(x .- maximum(x))
+    y::Vector{Float64} = e ./ sum(e)
+    x_bar::Vector{Float64} = y .* (y_bar .- sum(y_bar .* y))
+    return y, x_bar
+end
+# A shared exp/log residual: both cotangents read the weights w.
+@kernel logsumexp_rule(a::Vector{Float64}, x::Vector{Float64}, y_bar::Float64) = begin
+    e::Vector{Float64} = exp.(a .* x)
+    s::Float64 = sum(e)
+    y::Float64 = log(s)
+    w::Vector{Float64} = e ./ s
+    a_bar::Vector{Float64} = y_bar .* w .* x
+    x_bar::Vector{Float64} = y_bar .* w .* a
+    return y, a_bar, x_bar
+end
+# An ODE right-hand side: `t` is a port the mathematics does not use, so its
+# authored cotangent is a covector-independent constant.
+@kernel decay_rhs(u::Vector{Float64}, p::Vector{Float64}, t::Float64,
+        du_bar::Vector{Float64}) = begin
+    du::Vector{Float64} = -p .* u
+    u_bar::Vector{Float64} = -p .* du_bar
+    p_bar::Vector{Float64} = -u .* du_bar
+    t_bar::Float64 = 0.0
+    return du, u_bar, p_bar, t_bar
+end
 end # module
 
 const _DRV = DerivativeRuleVectorGraphs
@@ -315,6 +342,76 @@ end
     @test gradient(xx -> sum(matvec(A, xx) .* w), backend, x) ≈ transpose(A) * w
 end
 
+@testset "vector derivative rule: residual compaction (cross-stage liveness)" begin
+    sm = derivative_rule(_DRV.softmax_rule; primal = :y, covector = :y_bar,
+        cotangents = (x = :x_bar,), name = :softmax)
+    x = [0.3, -1.2, 2.0]; ȳ = [0.5, -0.25, 1.0]
+    softmax(v) = exp.(v) ./ sum(exp.(v))
+    # The recompute form reads x; the staged form retains the primal output.
+    @test reverse_residuals(sm, Val(1)) == (true,)
+    @test stage_residuals(sm, Val(1)) == (:y,)
+    y, residuals = stage_primal(sm, Val(1), x)
+    @test y ≈ softmax(x) && residuals[1] === y
+    @test stage_reverse(sm, Val(1), residuals, ȳ) == reverse_cut(sm, Val(1), x, ȳ)
+    # Cut sizes, read off the encoded bodies: the recompute form rebuilds e and y
+    # from x (3 statements), the staged reverse stage is the VJP statement only.
+    reverse_specs, staged_specs = typeof(sm).parameters[6], typeof(sm).parameters[7]
+    @test length(reverse_specs[1][2]) == 3 && length(staged_specs[1][2][2]) == 1
+
+    lse = derivative_rule(_DRV.logsumexp_rule; primal = :y, covector = :y_bar,
+        cotangents = (a = :a_bar, x = :x_bar), name = :logsumexp)
+    a = [0.4, -0.7, 1.1]; z = [1.0, 0.5, -2.0]
+    # Inputs first in signature order, then the shared intermediate.
+    @test stage_residuals(lse, Val(3)) == (:a, :x, :w)
+    @test stage_residuals(lse, Val(1)) == (:x, :w)
+    @test stage_residuals(lse, Val(2)) == (:a, :w)
+    for mask in 1:3
+        y, residuals = stage_primal(lse, Val(mask), a, z)
+        @test y ≈ log(sum(exp.(a .* z)))
+        @test all(stage_reverse(lse, Val(mask), residuals, 0.7) .≈
+                  reverse_cut(lse, Val(mask), a, z, 0.7))
+    end
+    staged3(r, a, z) = stage_primal(r, Val(3), a, z)
+    @test @inferred(staged3(lse, a, z))[1] isa Float64
+    @test_throws ArgumentError stage_primal(lse, Val(4), a, z)
+    @test_throws ArgumentError stage_primal(lse, Val(3), a)
+    @test_throws ArgumentError stage_reverse(lse, Val(3), (a,), 0.7)
+    @test_throws ArgumentError stage_residuals(lse, Val(0))
+    # A rule without a reverse branch has no staged cuts.
+    @kernel double_graph(v::Vector{Float64}, v_dot::Vector{Float64}) = begin
+        y::Vector{Float64} = 2 .* v
+        y_dot::Vector{Float64} = 2 .* v_dot
+        return y, y_dot
+    end
+    double = derivative_rule(double_graph; primal = :y,
+        directions = (v = :v_dot,), tangent = :y_dot, name = :double)
+    @test_throws ArgumentError stage_primal(double, Val(1), x)
+    @test_throws ArgumentError stage_residuals(double, Val(1))
+
+    # Enzyme stages through the compacted cuts.
+    w = [1.2, -0.4, 0.3]
+    ysm = softmax(x)
+    @test only(Enzyme.gradient(Reverse, Const(v -> sum(sm(v) .* w)), x)) ≈
+        ysm .* (w .- sum(w .* ysm))
+    weights = exp.(a .* z) ./ sum(exp.(a .* z))
+    ga, gz = Enzyme.gradient(Reverse, Const((aa, zz) -> lse(aa, zz)), a, z)
+    @test ga ≈ weights .* z && gz ≈ weights .* a
+    @test only(Enzyme.gradient(Reverse, Const(zz -> lse(a, zz)), z)) ≈ weights .* a
+
+    # A covector-independent cotangent (the authored zero for `t`) is retained
+    # from the primal stage and returned by the reverse stage as it is.
+    decay = derivative_rule(_DRV.decay_rhs; primal = :du, covector = :du_bar,
+        cotangents = (u = :u_bar, p = :p_bar, t = :t_bar), name = :decay)
+    u = [1.0, 2.0]; pp = [0.5, 1.5]; λ = [0.3, -0.8]
+    @test :t_bar in stage_residuals(decay, Val(7))
+    @test stage_residuals(decay, Val(3)) == (:u, :p)
+    for mask in 1:7
+        _, residuals = stage_primal(decay, Val(mask), u, pp, 0.4)
+        @test stage_reverse(decay, Val(mask), residuals, λ) ==
+            reverse_cut(decay, Val(mask), u, pp, 0.4, λ)
+    end
+end
+
 @testset "generated ChainRules adapter: scalar and vector rules" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsChainRulesCoreExt) !== nothing
     a, b = 0.3, 0.7
@@ -346,4 +443,11 @@ end
     sy, spullback = ChainRulesCore.rrule(scale, 2.0, x)
     @test sy == 2.0 .* x
     @test spullback(y_bar)[2] ≈ sum(y_bar .* x) && spullback(y_bar)[3] == 2.0 .* y_bar
+    # Staged residuals: the softmax pullback holds the primal output, not x.
+    sm = derivative_rule(_DRV.softmax_rule; primal = :y, covector = :y_bar,
+        cotangents = (x = :x_bar,), name = :softmax)
+    v = [0.3, -1.2, 2.0]; v̄ = [0.5, -0.25, 1.0]
+    my, mpullback = ChainRulesCore.rrule(sm, v)
+    @test mpullback.residuals == (my,)
+    @test mpullback(v̄)[2] == only(reverse_cut(sm, Val(1), v, v̄))
 end

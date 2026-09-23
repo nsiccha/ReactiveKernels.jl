@@ -243,6 +243,16 @@ end
 # its lowered body (the inputs it actually references), so an adapter retains
 # exactly those values across the primal/cotangent staging boundary. Nothing
 # derives one direction from the other: both are authored mathematics.
+#
+# Cross-stage liveness. That recompute form rebuilds every covector-independent
+# intermediate from the inputs. For reverse mode the generator also plans a
+# two-stage split per activity pattern: the covector-independent frontier of
+# the reverse cut (the values its covector-dependent statements read — inputs,
+# the primal output, or graph intermediates such as a shared `exp`) is computed
+# once by a primal-stage cut and retained, and the reverse stage is planned from
+# that frontier plus the covector. Backend adapters stage through
+# `stage_primal`/`stage_reverse`; `reverse_cut` stays for callers that hold the
+# inputs and want the self-contained VJP (the ODE backsolve adjoint).
 
 """
     DerivativeRule{Name,N,Inputs}
@@ -255,10 +265,11 @@ the primal cut. [`forward_cut`](@ref) runs the JVP branch over every direction,
 extensions stage those cuts into their rule protocols; the callable's only
 fields are the cuts' operation tables.
 """
-struct DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,PO,FO,RO} <: Function
+struct DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO} <: Function
     primal_ops::PO
     forward_ops::FO
     reverse_ops::RO
+    staged_ops::SO
 end
 
 function Base.show(io::IO,
@@ -346,6 +357,86 @@ returns a tuple. Requires the rule to have a reverse branch.
         "reverse_cut: activity mask " * $(string(M)) * " is out of range")))
     _rule_body_expr(Reverse[M], :(getfield(getfield(rule, :reverse_ops), $M));
                     tuple_return = true)
+end
+
+"""
+    stage_residuals(rule::DerivativeRule, ::Val{mask}) -> Tuple{Vararg{Symbol}}
+
+The residual environment of the reverse branch for activity `mask`: the
+covector-independent values its VJP reads, found by cross-stage liveness on the
+lowered reverse cut — inputs (in signature order), the primal output, or graph
+intermediates (a stable residual such as a shared `exp`). [`stage_primal`](@ref)
+computes them once; [`stage_reverse`](@ref) reads them instead of recomputing
+the intermediates from the inputs.
+"""
+function stage_residuals(
+        ::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged},
+        ::Val{M}) where {Name,N,Inputs,Primal,Forward,Reverse,Staged,M}
+    Staged === nothing && throw(ArgumentError(
+        "stage_residuals: rule " * string(Name) * " has no reverse branch"))
+    (1 <= M <= length(Staged)) || throw(ArgumentError(
+        "stage_residuals: activity mask " * string(M) * " is out of range"))
+    Staged[M][3]
+end
+
+# Where each staged residual comes from: an input index, `0` for the primal
+# output, `-1` for another graph intermediate (adapters decide what to copy).
+function _stage_residual_sources(rule::DerivativeRule{Name,N,Inputs,Primal},
+        mask::Val) where {Name,N,Inputs,Primal}
+    map(stage_residuals(rule, mask)) do name
+        index = findfirst(==(name), Inputs)
+        index !== nothing ? index : name === Primal[3] ? 0 : -1
+    end
+end
+
+"""
+    stage_primal(rule::DerivativeRule, ::Val{mask}, inputs...) -> (y, residuals)
+
+First stage of reverse mode for activity `mask`: the primal output together
+with the residual tuple named by [`stage_residuals`](@ref), computed by one cut
+of the graph (shared intermediates are computed once).
+"""
+@generated function stage_primal(
+        rule::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged}, ::Val{M},
+        args::Vararg{Any,K}) where {Name,N,Inputs,Primal,Forward,Reverse,Staged,M,K}
+    Staged === nothing && return :(throw(ArgumentError(
+        "stage_primal: rule " * $(string(Name)) * " has no reverse branch")))
+    K == N || return :(throw(ArgumentError(
+        "stage_primal: expected " * $(string(N)) * " inputs, got " * $(string(K)))))
+    (1 <= M <= length(Staged)) || return :(throw(ArgumentError(
+        "stage_primal: activity mask " * $(string(M)) * " is out of range")))
+    stage_spec, _, frontier = Staged[M]
+    block = _rule_body_expr(stage_spec,
+        :(getfield(getfield(getfield(rule, :staged_ops), $M), 1)))
+    block.args[end] = Expr(:return, Expr(:tuple, Primal[3], Expr(:tuple, frontier...)))
+    block
+end
+
+"""
+    stage_reverse(rule::DerivativeRule, ::Val{mask}, residuals::Tuple, covector)
+        -> (cotangents of the active inputs, in input order)
+
+Second stage of reverse mode: the VJP branch for activity `mask`, planned from
+the residuals returned by [`stage_primal`](@ref) and the output covector.
+Equal to [`reverse_cut`](@ref) on the same inputs, without recomputing the
+retained intermediates.
+"""
+stage_reverse(rule::DerivativeRule, mask::Val, residuals::Tuple, covector) =
+    _stage_reverse_call(rule, mask, residuals..., covector)
+
+@generated function _stage_reverse_call(
+        rule::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged}, ::Val{M},
+        args::Vararg{Any,K}) where {Name,N,Inputs,Primal,Forward,Reverse,Staged,M,K}
+    Staged === nothing && return :(throw(ArgumentError(
+        "stage_reverse: rule " * $(string(Name)) * " has no reverse branch")))
+    (1 <= M <= length(Staged)) || return :(throw(ArgumentError(
+        "stage_reverse: activity mask " * $(string(M)) * " is out of range")))
+    _, back_spec, frontier = Staged[M]
+    K == length(frontier) + 1 || return :(throw(ArgumentError(
+        "stage_reverse: expected " * $(string(length(frontier))) *
+        " residuals followed by the covector, got " * $(string(K)) * " arguments")))
+    _rule_body_expr(back_spec,
+        :(getfield(getfield(getfield(rule, :staged_ops), $M), 2)); tuple_return = true)
 end
 
 """
@@ -443,9 +534,47 @@ function derivative_rule(spec::KernelSpec; primal::Symbol,
     end
     reverse_specs = reverse === nothing ? nothing : map(first, reverse)
     reverse_ops = reverse === nothing ? nothing : map(last, reverse)
-    DerivativeRule{name,N,inputs,primal_spec,forward_spec,reverse_specs,
-                   typeof(primal_ops),typeof(forward_ops),typeof(reverse_ops)}(
-        primal_ops, forward_ops, reverse_ops)
+    staged = if has_reverse
+        ntuple(2^N - 1) do mask
+            frontier = _reverse_frontier(reverse_specs[mask], covector, inputs)
+            extra = Tuple(n for n in frontier if !(n in inputs) && n !== primal)
+            stage_want = isempty(extra) ? primal : (primal, extra...)
+            stage_spec, stage_ops = _derivative_cut_lowering(spec, name, inputs, stage_want)
+            active = Tuple(cotangents[i] for i in 1:N if (mask >> (i - 1)) & 1 == 1)
+            want = length(active) == 1 ? active[1] : active
+            back_spec, back_ops = _derivative_cut_lowering(
+                spec, name, (frontier..., covector), want)
+            ((stage_spec, back_spec, frontier), (stage_ops, back_ops))
+        end
+    else
+        nothing
+    end
+    staged_specs = staged === nothing ? nothing : map(first, staged)
+    staged_ops = staged === nothing ? nothing : map(last, staged)
+    DerivativeRule{name,N,inputs,primal_spec,forward_spec,reverse_specs,staged_specs,
+                   typeof(primal_ops),typeof(forward_ops),typeof(reverse_ops),
+                   typeof(staged_ops)}(
+        primal_ops, forward_ops, reverse_ops, staged_ops)
+end
+
+# The covector-independent frontier of a lowered reverse cut: every value its
+# covector-dependent statements read (and any cotangent that does not depend on
+# the covector at all, e.g. an authored zero), inputs first in signature order,
+# then other graph values in order of first use.
+function _reverse_frontier(cut_spec, covector::Symbol, inputs)
+    _, body, ret = cut_spec[1], cut_spec[2], cut_spec[3]
+    dependent = Set{Symbol}((covector,))
+    read = Symbol[]
+    note!(name) = name isa Symbol && !(name in dependent) && !(name in read) &&
+        push!(read, name)
+    for (output, _, arguments) in body
+        any(a -> a isa Symbol && a in dependent, arguments) || continue
+        push!(dependent, output)
+        foreach(note!, arguments)
+    end
+    foreach(note!, ret isa Symbol ? (ret,) : ret)
+    (Tuple(n for n in inputs if n in read)...,
+     Tuple(n for n in read if !(n in inputs))...)
 end
 
 # Every name a lowered cut reads: call arguments and returned values.

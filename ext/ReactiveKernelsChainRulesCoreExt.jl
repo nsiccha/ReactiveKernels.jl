@@ -2,14 +2,14 @@
 # (`src/derivative_rules.jl`). Every `frule`/`rrule` here is generic over the
 # rule: the scalar chain rule combines a scalar rule's partials with the
 # tangents or the covector; a vector rule's authored branches run through its
-# forward and reverse cuts, with the pullback holding exactly the residuals
-# the reverse cut reads. No derivative mathematics is authored here, and
+# forward cut and staged reverse cuts, with the pullback holding exactly the
+# residuals the reverse stage reads. No derivative mathematics is authored here, and
 # nothing attaches to a function ReactiveKernels does not own.
 module ReactiveKernelsChainRulesCoreExt
 
 using ReactiveKernels: ScalarDerivativeRule, derivative_cut, DerivativeRule,
-    forward_cut, reverse_cut, reverse_residuals, has_forward_branch,
-    has_reverse_branch
+    forward_cut, has_forward_branch, has_reverse_branch, stage_primal,
+    stage_reverse
 import ChainRulesCore
 using ChainRulesCore: AbstractZero, NoTangent, unthunk
 
@@ -51,22 +51,21 @@ function ChainRulesCore.frule((_, ẋs...), rule::DerivativeRule{Name,N},
 end
 
 # ChainRules carries no activity information, so the pullback is the
-# all-active cut; it retains only the inputs that cut reads.
+# all-active staged reverse cut; it holds that cut's residuals only.
 struct RulePullback{R,M,T}
     rule::R
     residuals::T
 end
 function (pullback::RulePullback{R,M})(ȳ) where {R,M}
-    (NoTangent(), reverse_cut(pullback.rule, Val(M), pullback.residuals..., unthunk(ȳ))...)
+    (NoTangent(), stage_reverse(pullback.rule, Val(M), pullback.residuals, unthunk(ȳ))...)
 end
 
 function ChainRulesCore.rrule(rule::DerivativeRule{Name,N}, xs::Vararg{Any,N}) where {Name,N}
     has_reverse_branch(rule) || throw(ArgumentError(
         "rrule through $(rule): the rule has no reverse branch"))
     mask = 2^N - 1
-    kept = reverse_residuals(rule, Val(mask))
-    residuals = ntuple(i -> kept[i] ? xs[i] : nothing, Val(N))
-    rule(xs...), RulePullback{typeof(rule),mask,typeof(residuals)}(rule, residuals)
+    y, residuals = stage_primal(rule, Val(mask), xs...)
+    y, RulePullback{typeof(rule),mask,typeof(residuals)}(rule, residuals)
 end
 
 end # module

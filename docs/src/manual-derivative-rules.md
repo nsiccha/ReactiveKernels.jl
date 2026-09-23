@@ -90,12 +90,27 @@ check keeps the two authored branches consistent instead.
 ## Two-stage reverse staging
 
 A reverse protocol receives the output covector only after the primal has
-returned, so every generated reverse adapter stages the one graph: it runs
-the primal cut, retains exactly the inputs that the selected reverse cut
-reads — [`reverse_residuals`](@ref)`(matvec, Val(mask))` — and runs
-`reverse_cut` when the covector arrives. For `matvec`, `A_bar` reads only
-`x` and `x_bar` only `A`, so an `x`-only pullback retains `A` alone and an
-input the cut does not read may be passed as `nothing`.
+returned, so every generated reverse adapter stages the one graph in two cuts
+per activity pattern:
+
+- [`stage_primal`](@ref)`(matvec, Val(mask), A, x)` returns the primal together
+  with the residuals the reverse stage needs;
+- [`stage_reverse`](@ref)`(matvec, Val(mask), residuals, y_bar)` returns the
+  cotangents of the active inputs once the covector arrives.
+
+The residuals, named by [`stage_residuals`](@ref), come from cross-stage
+liveness on the lowered reverse cut: they are the covector-independent values
+its covector-dependent statements read. That can be an input, the primal output,
+or a graph intermediate, which is then computed once in the primal stage instead
+of being recomputed from the inputs. For `matvec`, `A_bar` reads only `x` and
+`x_bar` only `A`, so an `x`-only pullback retains `A` alone. For a softmax graph
+the VJP reads the primal output, so the pullback retains `y`, not `x`, and the
+reverse stage does not rebuild the exponentials.
+
+The self-contained [`reverse_cut`](@ref) remains for callers that hold the
+inputs anyway: it recomputes from the inputs, and
+[`reverse_residuals`](@ref) names the inputs it reads (an input it does not
+read may be passed as `nothing`).
 
 This build-executed receipt checks the cuts, the residual sets and the
 adjoint pairing:
@@ -111,6 +126,8 @@ result = Main.ManualDerivativeRuleExample.run()
     x_only = (true, false),
     both = (true, true),
 )
+@assert result.staged_residuals == (A_only = (:x,), x_only = (:A,), both = (:A, :x))
+@assert result.staged_x_bar == result.x_bar
 @assert result.recipe_ids == (
     primal = (1,),
     forward = (1, 2, 3, 4),
@@ -120,36 +137,34 @@ result = Main.ManualDerivativeRuleExample.run()
 
 (;
     result.residuals,
+    result.staged_residuals,
     result.recipe_ids,
     result.adjoint_pair,
 )
 ```
-
-Retaining a compact stable intermediate of the primal stage instead of an
-original input (cross-stage liveness) is not generated yet: every residual is
-an input of the rule.
 
 ## Generated adapters
 
 Each adapter is generic over the rule and is loaded with its AD package:
 
 - **Enzyme** (`ext/ReactiveKernelsEnzymeExt.jl`). Reverse mode runs the
-  primal cut in the augmented primal, hands Enzyme a zero shadow for an
-  array result, retains the residual inputs (copied when Enzyme reports the
-  argument may be overwritten before the reverse pass), then runs the cut of
-  the call's activity pattern and accumulates the cotangents into the
+  primal stage of the call's activity pattern in the augmented primal, hands
+  Enzyme a zero shadow for an array result, and retains the staged residuals.
+  An input is copied when Enzyme reports it may be overwritten before the
+  reverse pass, and so is a residual that is the returned array itself. The
+  reverse pass runs the reverse stage and accumulates the cotangents into the
   argument shadows; `Active`, `Duplicated` and batched arguments are
   supported. Forward mode runs the forward cut with Enzyme's directions,
   once per batch lane. `DifferentiationInterface` with `AutoEnzyme` reaches
   the same rules.
 - **ChainRules** (`ext/ReactiveKernelsChainRulesCoreExt.jl`, loaded with
   `ChainRulesCore`). `rrule` returns the primal and a concretely typed
-  pullback that holds the all-active cut's residuals; `frule` runs the
+  pullback that holds the all-active pattern's staged residuals; `frule` runs the
   forward cut, with a zero direction for a `ZeroTangent`.
 - **Mooncake** (`ext/ReactiveKernelsMooncakeExt.jl`, loaded with
   `Mooncake`). Every rule is a primitive (`@is_primitive`) with no tangent of
   its own. `rrule!!` returns the primal and a pullback that holds the
-  all-active cut's residuals; array cotangents accumulate into the arguments'
+  all-active pattern's staged residuals; array cotangents accumulate into the arguments'
   forward data and real scalars return theirs. `frule!!` runs the forward cut.
 
 Not generated: rule emission into EnzymeMLIR. Under Reactant a rule's callable

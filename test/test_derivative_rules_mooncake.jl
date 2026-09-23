@@ -47,6 +47,24 @@ end
     return y, y_dot, w_bar, x_bar
 end
 
+# Staged residuals: the primal output (softmax) and a shared intermediate
+# (logsumexp weights) are retained instead of recomputed.
+@kernel softmax_graph(x::Vector{Float64}, y_bar::Vector{Float64}) = begin
+    e::Vector{Float64} = exp.(x .- maximum(x))
+    y::Vector{Float64} = e ./ sum(e)
+    x_bar::Vector{Float64} = y .* (y_bar .- sum(y_bar .* y))
+    return y, x_bar
+end
+@kernel logsumexp_graph(a::Vector{Float64}, x::Vector{Float64}, y_bar::Float64) = begin
+    e::Vector{Float64} = exp.(a .* x)
+    s::Float64 = sum(e)
+    y::Float64 = log(s)
+    w::Vector{Float64} = e ./ s
+    a_bar::Vector{Float64} = y_bar .* w .* x
+    x_bar::Vector{Float64} = y_bar .* w .* a
+    return y, a_bar, x_bar
+end
+
 const two_input = scalar_derivative_rule(
     two_input_graph; primal = :y, partials = (a = :dy_da, b = :dy_db),
     name = :two_input)
@@ -58,6 +76,10 @@ const scale = derivative_rule(scale_graph; primal = :y,
 const wdot = derivative_rule(wdot_graph; primal = :y,
     directions = (w = :w_dot, x = :x_dot), tangent = :y_dot,
     covector = :y_bar, cotangents = (w = :w_bar, x = :x_bar), name = :wdot)
+const softmax = derivative_rule(softmax_graph; primal = :y,
+    covector = :y_bar, cotangents = (x = :x_bar,), name = :softmax)
+const logsumexp = derivative_rule(logsumexp_graph; primal = :y,
+    covector = :y_bar, cotangents = (a = :a_bar, x = :x_bar), name = :logsumexp)
 end # module
 
 const _DRM = DerivativeRuleMooncakeGraphs
@@ -85,6 +107,11 @@ end
     # Reverse-only rule: mixed scalar/array inputs.
     test_rule(rng, _DRM.scale, 2.0, x; is_primitive = true,
         mode = Mooncake.ReverseMode)
+    # Staged residuals (reverse branch only).
+    test_rule(rng, _DRM.softmax, [0.3, -1.2, 2.0]; is_primitive = true,
+        mode = Mooncake.ReverseMode)
+    test_rule(rng, _DRM.logsumexp, [0.4, -0.7, 1.1], [1.0, 0.5, -2.0];
+        is_primitive = true, mode = Mooncake.ReverseMode)
 end
 
 @testset "generated Mooncake adapter: gradients through a loss" begin
@@ -100,6 +127,20 @@ end
     @test gA ≈ 2 .* y * transpose(x)
     @test gx ≈ transpose(A) * (2 .* y) .+ [dy_db * 2 * x[1], 0.0] .+ 0.3
     @test ga ≈ dy_da + sum(x)
+    # The softmax pullback retains the returned array itself; an in-place write
+    # to it by the caller after the call is undone by Mooncake before the
+    # pullback runs, so the gradient is unaffected.
+    v = [0.3, -1.2, 2.0]; w = [1.2, -0.4, 0.3]
+    function overwrite_result(v)
+        y = _DRM.softmax(v)
+        total = sum(y .* w)
+        y .*= 2.0
+        total
+    end
+    c2 = Mooncake.prepare_gradient_cache(overwrite_result, v)
+    _, (_, gv) = Mooncake.value_and_gradient!!(c2, overwrite_result, v)
+    ys = exp.(v) ./ sum(exp.(v))
+    @test gv ≈ ys .* (w .- sum(w .* ys))
     # A missing branch is explicit in the mode that needs it.
     @test_throws ArgumentError Mooncake.frule!!(
         Mooncake.zero_dual(_DRM.scale), Mooncake.zero_dual(2.0), Mooncake.zero_dual(x))

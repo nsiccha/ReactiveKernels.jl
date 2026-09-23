@@ -7,8 +7,8 @@
 module ReactiveKernelsEnzymeExt
 
 using ReactiveKernels: ScalarDerivativeRule, derivative_cut, DerivativeRule, forward_cut,
-    reverse_cut, reverse_residuals, has_forward_branch, has_reverse_branch
-using ReactiveKernels: _activity_mask
+    has_forward_branch, has_reverse_branch, stage_primal, stage_reverse
+using ReactiveKernels: _activity_mask, _stage_residual_sources
 import Enzyme
 using Enzyme: Const, Active, Duplicated, DuplicatedNoNeed, BatchDuplicated,
     BatchDuplicatedNoNeed
@@ -119,12 +119,12 @@ end
 
 # ================================================================ vector ====
 # Rules with authored forward/reverse branches (`DerivativeRule`). Reverse
-# mode stages the graph: the augmented primal runs the primal cut, hands
-# Enzyme a zero shadow for an array result (Enzyme accumulates the covector
-# into it), and retains exactly the inputs the selected reverse cut reads
-# (copied when Enzyme says the argument may be overwritten before the reverse
-# pass); the reverse pass runs that cut with the covector and accumulates the
-# cotangents into the argument shadows. Forward mode runs the forward cut with
+# mode stages the graph: the augmented primal runs the primal stage of the
+# selected activity pattern (`stage_primal`: the primal plus the reverse
+# cut's covector-independent residuals, computed once), hands Enzyme a zero
+# shadow for an array result (Enzyme accumulates the covector into it), and
+# retains those residuals; the reverse pass runs `stage_reverse` with the
+# covector and accumulates the cotangents into the argument shadows. Forward mode runs the forward cut with
 # Enzyme's directions (zero for inactive inputs), once per batch lane.
 
 const _ReverseActive = Union{Active,Duplicated,BatchDuplicated}
@@ -136,14 +136,19 @@ const _ReverseActive = Union{Active,Duplicated,BatchDuplicated}
 @inline _zero_like(x::AbstractArray) = zero(x)
 @inline _zero_like(x::Number) = zero(x)
 
-# Retain the residual inputs for the reverse cut: `nothing` for inputs the cut
-# never reads, a copy for an array Enzyme may overwrite before the reverse pass.
-@inline function _retain_residuals(mask::NTuple{N,Bool}, values::Tuple, overwritten_flags) where {N}
-    ntuple(Val(N)) do i
-        mask[i] || return nothing
-        value = values[i]
+# Retain the staged residuals across the reverse pass. An input array Enzyme
+# says may be overwritten before then is copied, and so is a residual that IS
+# the returned primal array (the caller owns it and may overwrite it); fresh
+# intermediates of the primal stage are owned here and kept as they are.
+@inline function _retain_residuals(sources::NTuple{R,Int}, residuals::NTuple{R,Any},
+        primal, overwritten_flags) where {R}
+    ntuple(Val(R)) do k
+        value = residuals[k]
+        value isa AbstractArray || return value
+        source = sources[k]
         # `overwritten` includes the function object at position 1.
-        (value isa AbstractArray && overwritten_flags[i + 1]) ? copy(value) : value
+        source > 0 ? (overwritten_flags[source + 1] ? copy(value) : value) :
+            value === primal ? copy(value) : value
     end
 end
 
@@ -152,16 +157,18 @@ function EnzymeRules.augmented_primal(
         args::Vararg{Annotation,N}) where {RT,N}
     active = _reverse_active_vector(args)
     values = _values(args)
-    primal = rule.val(values...)
-    shadow = needs_shadow(config) ? _zero_shadow(Val(width(config)), primal) : nothing
     if !any(active) || RT <: Const
+        primal = rule.val(values...)
+        shadow = needs_shadow(config) ? _zero_shadow(Val(width(config)), primal) : nothing
         return AugmentedReturn(needs_primal(config) ? primal : nothing, shadow, nothing)
     end
     has_reverse_branch(rule.val) || throw(ArgumentError(
         "reverse-mode Enzyme through $(rule.val): the rule has no reverse branch " *
         "(author a covector + cotangents branch in its graph)"))
-    mask = _activity_mask(active, 1)
-    residuals = _retain_residuals(reverse_residuals(rule.val, Val(mask)), values,
+    mask = Val(_activity_mask(active, 1))
+    primal, staged = stage_primal(rule.val, mask, values...)
+    shadow = needs_shadow(config) ? _zero_shadow(Val(width(config)), primal) : nothing
+    residuals = _retain_residuals(_stage_residual_sources(rule.val, mask), staged, primal,
                                   overwritten(config))
     AugmentedReturn(needs_primal(config) ? primal : nothing, shadow, (shadow, residuals))
 end
@@ -179,7 +186,7 @@ end
 # Width 1: one covector, one cotangent per active input.
 @inline function _reverse_lanes(::Val{1}, rule, ::Val{M}, dret, shadow, residuals, args::Tuple) where {M}
     ȳ = dret isa Active ? dret.val : shadow
-    cotangents = reverse_cut(rule, Val(M), residuals..., ȳ)
+    cotangents = stage_reverse(rule, Val(M), residuals, ȳ)
     _apply_cotangents(args, cotangents)
 end
 # Width W: one covector per lane; Active arguments return a tuple of lanes,
@@ -187,7 +194,7 @@ end
 @inline function _reverse_lanes(::Val{W}, rule, ::Val{M}, dret, shadow, residuals, args::Tuple) where {W,M}
     lanes = ntuple(Val(W)) do w
         ȳ = dret isa Active ? dret.val[w] : shadow[w]
-        reverse_cut(rule, Val(M), residuals..., ȳ)
+        stage_reverse(rule, Val(M), residuals, ȳ)
     end
     _apply_cotangent_lanes(args, lanes, Val(W))
 end

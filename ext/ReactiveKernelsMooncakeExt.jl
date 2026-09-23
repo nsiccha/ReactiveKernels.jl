@@ -2,14 +2,14 @@
 # (`src/derivative_rules.jl`). Every `rrule!!`/`frule!!` here is generic over
 # the rule: a scalar rule's partials are combined with the covector or the
 # directions by the scalar chain rule; a vector rule's authored branches run
-# through its forward and reverse cuts, with the pullback holding exactly the
-# residuals the reverse cut reads. No derivative mathematics is authored here,
-# and nothing attaches to a function ReactiveKernels does not own.
+# through its forward cut and staged reverse cuts, with the pullback holding
+# exactly the residuals the reverse stage reads. No derivative mathematics is
+# authored here, and nothing attaches to a function ReactiveKernels does not own.
 module ReactiveKernelsMooncakeExt
 
 using ReactiveKernels: ScalarDerivativeRule, derivative_cut, DerivativeRule,
-    forward_cut, reverse_cut, reverse_residuals, has_forward_branch,
-    has_reverse_branch
+    forward_cut, has_forward_branch, has_reverse_branch, stage_primal,
+    stage_reverse
 import Mooncake
 using Mooncake: CoDual, Dual, MinimalCtx, NoRData, NoTangent, @is_primitive,
     primal, tangent, zero_fcodual
@@ -79,7 +79,8 @@ end
 @inline _covector(::NoRData, dy) = dy
 
 # Mooncake carries no activity information, so the pullback runs the
-# all-active cut; it retains only the inputs that cut reads.
+# all-active staged reverse cut; it holds that cut's residuals only (Mooncake
+# restores any later mutation of them before the pullback runs).
 function Mooncake.rrule!!(f::CoDual{<:DerivativeRule{Name,N}},
         xs::Vararg{CoDual,N}) where {Name,N}
     rule = primal(f)
@@ -87,12 +88,10 @@ function Mooncake.rrule!!(f::CoDual{<:DerivativeRule{Name,N}},
         "reverse-mode Mooncake through $(rule): the rule has no reverse branch " *
         "(author a covector + cotangents branch in its graph)"))
     mask = Val(2^N - 1)
-    values = map(primal, xs)
-    kept = reverse_residuals(rule, mask)
-    residuals = ntuple(i -> kept[i] ? values[i] : nothing, Val(N))
-    y, dy = _output(rule(values...))
+    value, residuals = stage_primal(rule, mask, map(primal, xs)...)
+    y, dy = _output(value)
     function vector_rule_pullback(ȳ)
-        cotangents = reverse_cut(rule, mask, residuals..., _covector(ȳ, dy))
+        cotangents = stage_reverse(rule, mask, residuals, _covector(ȳ, dy))
         (NoRData(), map(_rdata, xs, cotangents)...)
     end
     y, vector_rule_pullback

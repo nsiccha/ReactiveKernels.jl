@@ -29,6 +29,9 @@ import .ManualDerivativeRuleExample
         x_only = (true, false),
         both = (true, true),
     )
+    # The staged residual sets and the two-stage reverse result.
+    @test result.staged_residuals == (A_only = (:x,), x_only = (:A,), both = (:A, :x))
+    @test result.staged_y == result.y && result.staged_x_bar == result.x_bar
     @test result.recipe_ids == (
         primal = (1,),
         forward = (1, 2, 3, 4),

@@ -75,6 +75,9 @@ function run(; inputs = EXAMPLE_INPUTS)
     # Activity mask: bit `i` set when input `i` (here `A`, `x`) is active.
     A_bar, x_bar = reverse_cut(matvec, Val(3), A, x, y_bar)
     (x_only_bar,) = reverse_cut(matvec, Val(2), A, nothing, y_bar)
+    # The two-stage form every generated reverse adapter uses.
+    y_staged, residuals = stage_primal(matvec, Val(3), A, x)
+    _, staged_x_bar = stage_reverse(matvec, Val(3), residuals, y_bar)
 
     (; y, y_forward, y_dot, A_bar, x_bar, x_only_bar,
        prepared = (
@@ -92,6 +95,12 @@ function run(; inputs = EXAMPLE_INPUTS)
            x_only = reverse_residuals(matvec, Val(2)),
            both = reverse_residuals(matvec, Val(3)),
        ),
+       staged_residuals = (
+           A_only = stage_residuals(matvec, Val(1)),
+           x_only = stage_residuals(matvec, Val(2)),
+           both = stage_residuals(matvec, Val(3)),
+       ),
+       staged_y = y_staged, staged_x_bar,
        recipe_ids = (
            primal = Tuple(recipe.id for recipe in matvec_primal.plan.recipes),
            forward = Tuple(recipe.id for recipe in matvec_forward.plan.recipes),

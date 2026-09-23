@@ -62,10 +62,12 @@ ChainRules and Mooncake adapters (`ext/ReactiveKernelsEnzymeExt.jl`,
 `ext/ReactiveKernelsChainRulesCoreExt.jl`, `ext/ReactiveKernelsMooncakeExt.jl`)
 derive every direction from the activity-selected cuts of that graph. DistributionKernels' `loggamma` and
 `logbeta` are the only rules in package source; the ODE backsolve adjoint
-consumes a caller's `DerivativeRule` right-hand side. Residual compaction and
-Reactant rule emission (gated on the upstream EnzymeMLIR custom-rule bridge;
-rule cuts already trace as plain mathematics) remain ReactiveKernels:review
-todo `2026-09-14T17-10-05-750-0dsqq02`.
+consumes a caller's `DerivativeRule` right-hand side. Reverse-mode adapters
+stage each rule in two cuts whose residuals come from cross-stage liveness, so
+a shared intermediate is retained rather than recomputed. Reactant rule
+emission (gated on the upstream EnzymeMLIR custom-rule bridge; rule cuts
+already trace as plain mathematics) remains ReactiveKernels:review todo
+`2026-09-14T17-10-05-750-0dsqq02`.
 
 A new backend failure of the ordinary path remains a backend limitation:
 isolate it with a backend-only reproducer under
