@@ -32,13 +32,15 @@
 # intermediate 3- and 4-dimensional storage is FUNCTIONAL (length-typed
 # tuples, never mutated): a concrete `Matrix{Float64}`/`Vector{Float64}`
 # rejects traced stores (`convert(Float64, ::TracedRNumber)` has no
-# method — the pkcell slice's measured Reactant failure), and Enzyme
-# cannot reverse through `*(::Matrix, ::Matrix)` (measured `MethodError`
-# in the slice probe), so the 3x3/4x4 kernels and the matrix
-# exponential (a faithful port of Stan's `matrix_exp_pade` — Pade
+# method — the pkcell slice's measured Reactant failure). The matrix
+# exponential is a faithful port of Stan's `matrix_exp_pade` (Pade
 # fraction + scaling-and-squaring, predicated selection, fixed trip
-# counts) are pure scalar tuple code. Only the returned reads vector
-# is an array, allocated eltype-generic (see `linear_pk_read_locs`).
+# counts) because Enzyme cannot reverse `LinearAlgebra.exp`
+# (`EnzymeNoDerivativeError` in its internals, measured 2026-09-20;
+# plain `Matrix * Matrix` reverses fine — an earlier note here claimed
+# otherwise). The 3x3/4x4 kernels are scalar tuple code, which stays in
+# registers natively. Only the returned reads vector is an array,
+# allocated eltype-generic (see `linear_pk_read_locs`).
 # The accuracy envelope (`l1norm < 5499`, exact-Stan inside) is
 # documented on `_pk_expm3`.
 
