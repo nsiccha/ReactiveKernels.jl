@@ -49,20 +49,42 @@ end
 # return_spec)`; every element is a Symbol, an Int, or a numeric literal, so
 # the whole body is a valid type parameter.
 function _rule_body_expr(spec, ops_expr; tuple_return::Bool = false)
+    _rule_body_expr_mapped(spec, ops_expr; tuple_return)[1]
+end
+
+# The emitted body with the graph-name → local map beside it. Graph ports and
+# intermediates are user-chosen identifiers, so they bind to gensym'd locals:
+# a plain local named `K`, `M`, `N` (or any other static parameter of the
+# calling generated function) refuses to compile, and one named `rule`,
+# `args`, or `__ops__` would shadow the call's own bindings. `stage_primal`
+# needs the map to address the primal output and residuals in its own return.
+function _rule_body_expr_mapped(spec, ops_expr; tuple_return::Bool = false)
     signature, body, ret = spec[1], spec[2], spec[3]
-    statements = Any[:(__ops__ = $ops_expr)]
+    localof = Dict{Symbol,Symbol}()
+    localname(name::Symbol) = get!(localof, name) do
+        gensym(name)
+    end
+    ops_local = gensym(:__ops__)
+    statements = Any[Expr(:(=), ops_local, ops_expr)]
     for (index, name) in enumerate(signature)
-        push!(statements, :($name = getfield(args, $index)))
+        push!(statements,
+            Expr(:(=), localname(name), Expr(:call, :getfield, :args, index)))
     end
     for (output, op, arguments) in body
-        push!(statements, :($output = __ops__[$op]($(arguments...))))
+        call_arguments = map(arguments) do argument
+            argument isa Symbol ? localname(argument) : argument
+        end
+        push!(statements, Expr(:(=), localname(output),
+            Expr(:call, Expr(:ref, ops_local, op), call_arguments...)))
     end
     if ret isa Symbol
-        push!(statements, tuple_return ? :(return ($ret,)) : :(return $ret))
+        returned = localname(ret)
+        push!(statements, tuple_return ? Expr(:return, Expr(:tuple, returned)) :
+            Expr(:return, returned))
     else
-        push!(statements, :(return ($(ret...),)))
+        push!(statements, Expr(:return, Expr(:tuple, map(localname, ret)...)))
     end
-    Expr(:block, statements...)
+    Expr(:block, statements...), localof
 end
 
 @generated function (rule::ScalarDerivativeRule{Name,N,Inputs,Primal})(
@@ -406,9 +428,10 @@ of the graph (shared intermediates are computed once).
     (1 <= M <= length(Staged)) || return :(throw(ArgumentError(
         "stage_primal: activity mask " * $(string(M)) * " is out of range")))
     stage_spec, _, frontier = Staged[M]
-    block = _rule_body_expr(stage_spec,
+    block, localof = _rule_body_expr_mapped(stage_spec,
         :(getfield(getfield(getfield(rule, :staged_ops), $M), 1)))
-    block.args[end] = Expr(:return, Expr(:tuple, Primal[3], Expr(:tuple, frontier...)))
+    block.args[end] = Expr(:return, Expr(:tuple, localof[Primal[3]],
+        Expr(:tuple, map(name -> localof[name], frontier)...)))
     block
 end
 

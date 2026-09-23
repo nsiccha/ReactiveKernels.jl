@@ -40,6 +40,13 @@ end
     return y, dy_dx
 end
 
+# An input named after one of the generated call's own static parameters.
+@kernel name_graph(Name::Float64) = begin
+    y::Float64 = Name^2
+    dy::Float64 = 2 * Name
+    return y, dy
+end
+
 # A rule bound as a global constant, the way a package publishes one.
 const two_input = scalar_derivative_rule(
     two_input_graph; primal = :y, partials = (a = :dy_da, b = :dy_db),
@@ -231,6 +238,19 @@ end
     p_bar::Vector{Float64} = -u .* du_bar
     t_bar::Float64 = 0.0
     return du, u_bar, p_bar, t_bar
+end
+# Ports named after the generated cuts' own static parameters (K, M, N) and
+# arguments (rule), plus a colliding intermediate (args).
+@kernel colliding_graph(K::Float64, M::Float64, N::Float64,
+        K_dot::Float64, M_dot::Float64, N_dot::Float64,
+        rule::Float64) = begin
+    args::Float64 = K * M
+    y::Float64 = args + N
+    y_dot::Float64 = K_dot * M + K * M_dot + N_dot
+    K_bar::Float64 = rule * M
+    M_bar::Float64 = rule * K
+    N_bar::Float64 = rule
+    return y, y_dot, K_bar, M_bar, N_bar
 end
 end # module
 
@@ -450,4 +470,32 @@ end
     my, mpullback = ChainRulesCore.rrule(sm, v)
     @test mpullback.residuals == (my,)
     @test mpullback(v̄)[2] == only(reverse_cut(sm, Val(1), v, v̄))
+end
+
+@testset "derivative rule: colliding port names stay hygienic" begin
+    collide = derivative_rule(_DRV.colliding_graph; primal = :y,
+        directions = (K = :K_dot, M = :M_dot, N = :N_dot), tangent = :y_dot,
+        covector = :rule, cotangents = (K = :K_bar, M = :M_bar, N = :N_bar),
+        name = :collide)
+    K, M, N = 2.0, 3.0, 5.0
+    Kd, Md, Nd = 0.5, -0.25, 1.5
+    yb = 1.2
+    @test collide(K, M, N) == K * M + N
+    y, y_dot = forward_cut(collide, K, M, N, Kd, Md, Nd)
+    @test y == K * M + N && y_dot == Kd * M + K * Md + Nd
+    expected = (yb * M, yb * K, yb)
+    for mask in 1:7
+        want = Tuple(x for (i, x) in enumerate(expected) if (mask >> (i - 1)) & 1 == 1)
+        @test reverse_cut(collide, Val(mask), K, M, N, yb) == want
+        _, residuals = stage_primal(collide, Val(mask), K, M, N)
+        @test stage_reverse(collide, Val(mask), residuals, yb) == want
+    end
+    gK, gM, gN = Enzyme.gradient(Reverse, Const((k, m, n) -> collide(k, m, n)), K, M, N)
+    @test gK ≈ M && gM ≈ K && gN ≈ 1.0
+
+    named = scalar_derivative_rule(_DRG.name_graph; primal = :y,
+        partials = (Name = :dy,), name = :named)
+    @test named(3.0) == 9.0
+    @test derivative_cut(named, (true,), 3.0) == (9.0, 6.0)
+    @test only(Enzyme.gradient(Reverse, Const(t -> named(t)), 3.0)) ≈ 6.0
 end
