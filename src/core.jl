@@ -290,6 +290,32 @@ end
 # Lazy scalar control: inactive singular/overflowing transitions must not run.
 @inline _recurrence_branch(pred, yes, no, args) = pred ? yes(args...) : no(args...)
 
+"""
+    _KernelBranch{CI,TI,EI}(call, condition, then_arm, else_arm)
+
+A recipe whose authored right-hand side is a top-level lazy branch
+(`c ? a : b`, `if`/`elseif`/`else`, `&&`, `||`) keeps that structure as
+metadata beside its ordinary body. Calling it runs `call`, the authored
+branch over every recipe argument — exactly the closure an unstructured
+recipe would carry — so every lowering that treats the enclosing
+`_KernelSourceOp` as opaque is unchanged. The parts are closures over their
+OWN free ports, selected from the recipe's ordered arguments by the position
+tuples `CI`/`TI`/`EI`; a nested branch arm is itself a `_KernelBranch` over
+every argument. Plate partial evaluation reads them: a condition whose ports
+are all bound data is evaluated per lane at preparation, and the plate splits
+into one plate per taken arm (`_partition_plate_recipe`).
+"""
+struct _KernelBranch{CI,TI,EI,F,C,T,E}
+    call::F
+    condition::C
+    then_arm::T
+    else_arm::E
+end
+_KernelBranch(::Val{CI}, ::Val{TI}, ::Val{EI}, call::F, condition::C,
+              then_arm::T, else_arm::E) where {CI,TI,EI,F,C,T,E} =
+    _KernelBranch{CI,TI,EI,F,C,T,E}(call, condition, then_arm, else_arm)
+@inline (branch::_KernelBranch)(args...) = branch.call(args...)
+
 # Tensorized authored plates keep slice collections structural instead of
 # materializing Base.Slices.  A backend can consume the parent array as one
 # batched value, while the generic fallback preserves ordinary eachcol

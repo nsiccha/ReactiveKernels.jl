@@ -248,43 +248,32 @@ offset_name(predictor::Symbol) = Symbol(:_ppl_offset_, predictor)
 """Monotonic-contrast recipe name for an increments simplex (`s` → `_ppl_mo_s`)."""
 monotonic_name(increments::Symbol) = Symbol(:_ppl_mo_, increments)
 
-# Cumulative-contrast temporary for level j (`_ppl_mo_cum_s_1 == 0.0`,
-# `_ppl_mo_cum_s_j = cum_(j-1) + s_(j-1)`): the in-graph `cumsum([0; incr])`.
-_monotonic_cum_name(increments::Symbol, j::Int) =
-    Symbol(:_ppl_mo_cum_, increments, :_, j)
+# Cumulative-contrast vector of an increments simplex (`[0; cumsum(s)]`,
+# K entries, level 1 at 0).
+_monotonic_cum_name(increments::Symbol) = Symbol(:_ppl_mo_cum_, increments)
 
 """
     monotonic_recipe(increments, idx, K) -> Vector{Expr}
 
 The SB `_sb_mo` level-gather recipe for one increments simplex:
 `cumsum([0; incr])[idx]` from the bound index column `idx` (integer codes
-1..K), where the K−1 increments are the `_ppl_v_` layout elements of the
-`increments` simplex. Cumulative level temps mirror the `cumsum`
-(`_ppl_mo_cum_s_1 = 0.0`, each later level adds one increment); the gather
-is an indicator sum over levels 2..K (level 1 contributes 0 by
-construction), the vectorized group-encoder shape — dotted ops only, so
-the Enzyme reverse pass sees no new surface. Emitted before the
-predictor's design recipe; the LP splice (per-block `mo` term or direct
-`mo1` summand) reads the `_ppl_mo_<s>` contrast.
+1..K), where `increments` is the (K−1)-element simplex vector. Two vector
+statements whatever K: the cumulative level contrasts
+`_ppl_mo_cum_<s> = cumsum(vcat(0.0, s))` (running sum in level order) and
+the per-row gather `_ppl_mo_<s> = _ppl_mo_cum_<s>[idx]` — each row reads
+only its own level. Emitted before the predictor's design recipe; the LP
+splice (per-block `mo` term or direct `mo1` summand) reads the
+`_ppl_mo_<s>` contrast.
 """
 function monotonic_recipe(increments::Symbol, idx::Symbol, K::Int)
     K >= 2 || throw(ContractValidationError(
         "[preprocessing] monotonic levels K=$K < 2 " *
         "(K=1 degenerates emitter-side)"))
-    stmts = Expr[]
-    push!(stmts, :($(_monotonic_cum_name(increments, 1))::Float64 = 0.0))
-    for j in 2:K
-        cum = _monotonic_cum_name(increments, j)
-        prev = _monotonic_cum_name(increments, j - 1)
-        push!(stmts, :($cum::Float64 =
-            $prev + $(_vector_elt_name(increments, j - 1))))
-    end
-    parts = Any[Expr(:call, :.*,
-        Expr(:call, :.==, idx, j), _monotonic_cum_name(increments, j))
-        for j in 2:K]
-    gather = foldl((a, c) -> Expr(:call, :.+, a, c), parts)
-    push!(stmts, Expr(:(=), monotonic_name(increments), gather))
-    return stmts
+    cum = _monotonic_cum_name(increments)
+    return Expr[
+        :($cum::AbstractVector{Float64} = cumsum(vcat(0.0, $increments))),
+        Expr(:(=), monotonic_name(increments), :($cum[$idx])),
+    ]
 end
 
 """
@@ -479,4 +468,25 @@ function _declared_codes(x::AbstractVector, levels::AbstractVector)
         codes[i] = c
     end
     return codes
+end
+
+# Stage lanes of a stopping-ratio response (SB `brm_ordinal` structure 2):
+# observation `i` with level `y[i]` passes stages `1..min(y[i], K-1)` —
+# survives (logCC) below its level, stops (logF) at it. The per-observation
+# stage count is data, so the stages flatten into one lane per
+# (observation, stage) pair, built from the bound response: the lane's
+# observation index and stage index. Data-only (folded under `bound=`).
+function _ordinal_stage_obs(y::AbstractVector{<:Integer}, K::Integer)
+    out = Int[]
+    for (i, v) in enumerate(y), _ in 1:min(v, K - 1)
+        push!(out, i)
+    end
+    return out
+end
+function _ordinal_stage_idx(y::AbstractVector{<:Integer}, K::Integer)
+    out = Int[]
+    for v in y, j in 1:min(v, K - 1)
+        push!(out, j)
+    end
+    return out
 end

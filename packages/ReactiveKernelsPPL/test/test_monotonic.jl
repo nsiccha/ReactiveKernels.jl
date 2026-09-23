@@ -340,21 +340,15 @@ end
 
 @testset "monotonic recipe shape" begin
     @test monotonic_name(:s) === :_ppl_mo_s
-    stmts = monotonic_recipe(:s, :c, 3)
-    # K cumulative temps plus the gather; the gather reads levels 2..K
-    # (level 1 contributes 0 by construction).
-    @test length(stmts) == 4
-    @test stmts[1].args[1].args[1] === :_ppl_mo_cum_s_1
-    @test stmts[4].args[1] === :_ppl_mo_s
-    gath = sprint(show, stmts[4])
-    @test occursin("(c .== 2)", gath) && occursin("(c .== 3)", gath)
-    @test !occursin(".== 1", gath)
-    # K=2 is a single gather term over the deterministic 1-simplex edge.
-    two = monotonic_recipe(:s, :c, 2)
-    @test length(two) == 3
-    @test two[3].args[1] === :_ppl_mo_s
-    @test two[3].args[2].args[1] === :.*
-    @test two[3].args[2].args[2] == Expr(:call, :.==, :c, 2)
+    # Two vector statements whatever K: the cumulative level contrasts and
+    # the per-row gather of each row's own level.
+    for K in (2, 3, 7)
+        stmts = monotonic_recipe(:s, :c, K)
+        @test stmts == Expr[
+            :(_ppl_mo_cum_s::AbstractVector{Float64} = cumsum(vcat(0.0, s))),
+            :(_ppl_mo_s = _ppl_mo_cum_s[c]),
+        ]
+    end
     @test_throws ContractValidationError monotonic_recipe(:s, :c, 1)
 end
 

@@ -5,9 +5,11 @@ using LinearAlgebra: dot
 import Enzyme
 
 # The ordered-logistic GLM object's per-observation cells are lazy plate
-# branches (docs/src/constraints.md): under Reactant the edge/interior arms
-# are conditional regions inside the batched cell, nothing is clamped or
-# floored, and the emitted program does not grow with the observation count.
+# branches on the observed level (docs/src/constraints.md). With the levels
+# bound, preparation splits the lanes by arm, so no conditional region reaches
+# Reactant and reverse compiles; with live levels the arms stay conditional
+# regions inside the batched cell. Nothing is clamped or floored either way,
+# and the emitted program does not grow with the observation count.
 
 @kernel _ord_glm_reactant(
         beta::Vector{Float64}, X::Matrix{Float64}, y::Vector{Int},
@@ -31,32 +33,50 @@ _ord_prepared(X, y) = prepare(_ord_glm_reactant;
     have = (:beta, :X, :y, :cuts), want = :posterior,
     bound = (; X, y, cuts = _GLM_R_CUTS))
 
-@testset "ordered-logistic cells stay lazy under Reactant" begin
+@testset "bound levels: ordered-logistic cells are split, reverse compiles" begin
     k = _ord_prepared(_GLM_R_X, _GLM_R_Y)
     hlo = repr(Reactant.@code_hlo optimize = false k(_traced(_GLM_R_BETA)))
-    @test occursin("stablehlo.if", hlo)
+    @test !occursin("stablehlo.if", hlo)
     compiled = Reactant.@compile k(_traced(_GLM_R_BETA))
     for beta in (_GLM_R_BETA, [3.0, -12.0], [20.0, 5.0])
         @test _host(compiled(_traced(beta))) ≈ k(beta)
     end
-    # Reverse through the compiled program: the native reverse is exact and
-    # finite (no inactive arm contributes partials), while Reactant cannot yet
-    # lower reverse through a lazy branch inside a batched cell once the
-    # batching pass realizes the plate as a loop — six observations here
-    # (`benchmark/repro_reactant_batch_if_reverse.jl`, docs/src/constraints.md).
-    # Locked as a loud compile failure so an upstream fix is noticed.
     native = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), _GLM_R_BETA; active = :beta)
+    gradient(b) = Enzyme.gradient(Enzyme.Reverse, k, b)
+    compiled_gradient = Reactant.@compile gradient(_traced(_GLM_R_BETA))
     for beta in (_GLM_R_BETA, [3.0, -12.0], [20.0, 5.0])
         _, g_native = ad_value_and_gradient!(native, similar(beta), beta)
         @test all(isfinite, g_native)
+        @test _host(only(compiled_gradient(_traced(beta)))) ≈ g_native rtol = 1e-6
     end
-    gradient(b) = Enzyme.gradient(Enzyme.Reverse, k, b)
-    @test_throws Reactant.Compiler.CompilationError Reactant.@compile gradient(_traced(_GLM_R_BETA))
+end
+
+@testset "live levels: cells stay lazy regions (upstream reverse boundary)" begin
+    # Reverse through a lazy branch inside a batched cell does not lower yet
+    # once the batching pass realizes the plate as a loop — six observations
+    # here (`benchmark/repro_reactant_batch_if_reverse.jl`,
+    # docs/src/constraints.md). Locked as a loud compile failure so an
+    # upstream fix is noticed.
+    k = prepare(_ord_glm_reactant; have = (:beta, :X, :y, :cuts),
+        want = :posterior, bound = (; X = _GLM_R_X, cuts = _GLM_R_CUTS))
+    y = _traced(_GLM_R_Y)
+    hlo = repr(Reactant.@code_hlo optimize = false k(_traced(_GLM_R_BETA), y))
+    @test occursin("stablehlo.if", hlo)
+    compiled = Reactant.@compile k(_traced(_GLM_R_BETA), y)
+    @test _host(compiled(_traced(_GLM_R_BETA), y)) ≈ k(_GLM_R_BETA, _GLM_R_Y)
+    gradient(b, levels) = Enzyme.gradient(Enzyme.Reverse, k, b, Enzyme.Const(levels))
+    @test_throws Reactant.Compiler.CompilationError Reactant.@compile gradient(
+        _traced(_GLM_R_BETA), y)
 end
 
 @testset "the GLM program does not grow with the observation count" begin
+    # With the levels bound, each level class is gathered by constant lane
+    # indices; Reactant lowers an arithmetic-progression index set as one
+    # strided `slice` and any other set as a `gather` (both constant in
+    # size). Two and three repeats keep every class's lowering kind, so the
+    # comparison isolates growth with the observation count.
     sizes = Int[]
-    for reps in (1, 2)
+    for reps in (2, 3)
         X = repeat(_GLM_R_X, reps, 1)
         y = repeat(_GLM_R_Y, reps)
         k = _ord_prepared(X, y)

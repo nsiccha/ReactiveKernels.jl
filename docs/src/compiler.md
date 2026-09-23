@@ -205,6 +205,45 @@ lowering rewrites only the residual work. Optional downstream preparation
 surfaces consume that same residual plan rather than implementing another
 partial evaluator.
 
+#### Data-bound branches in plate cells
+
+A plate cell statement whose right-hand side is a lazy branch (`c ? a : b`,
+`if`/`elseif`/`else`, `a && b`, `a || b`) is split during preparation when its
+condition reads only bound data. The condition may read a bound plate argument,
+or a bound-only cell value that the pass has already evaluated per lane.
+
+1. The condition is evaluated once per lane, and the lanes are grouped by
+   outcome.
+2. The plate becomes one plate per taken arm, each over that arm's lanes.
+3. The plate's arguments follow the arm's lanes:
+   - bound arguments are gathered during preparation;
+   - live arguments are gathered at run time by constant lane indices;
+   - a singleton or scalar argument broadcasts over the lanes.
+4. A nested arm is split again over its own lanes only, so an inner condition
+   is never evaluated for a lane that does not reach it.
+5. The results are combined:
+   - a sole `sum(pointwise)` consumer becomes a sum of the arm sums;
+   - any other use of the pointwise vector reassembles it in lane order with
+     one gather.
+
+A lane-invariant condition selects its arm without splitting.
+
+The prepared program contains no branch for that condition, so no backend
+receives one:
+
+- every lane evaluates exactly the arm it takes;
+- gathers inside an arm are in bounds by construction;
+- Reactant reverse mode compiles at every lane count, so the batched
+  lazy-branch limitation in the [core constraints](constraints.md) does not
+  arise.
+
+The number of arm plates is bounded by the cell's branch structure, never by
+the data. A condition that reads a live value stays an ordinary lazy branch.
+This includes the shape of a live array, such as `length(c)` of a runtime
+input. Only one-dimensional plate domains are split.
+
+Without a binding, the cell runs its authored lazy branch unchanged.
+
 ### 5. Composition
 
 Low-level `compose` preserves globally stable `Value` identities when graph

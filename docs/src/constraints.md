@@ -34,6 +34,12 @@ the authored Julia branch and loop semantics in both primal and derivative
 execution. If a backend cannot express them, report the unsupported case and
 isolate the backend failure instead of adopting an eager workaround.
 
+When a plate cell's branch condition reads bound data only, preparation
+evaluates it per lane and splits the plate into one plate per taken arm (see
+the [compiler](compiler.md), "Data-bound branches in plate cells"). This is
+the lazy semantics made structural: each lane still evaluates only its own
+arm, and no backend receives the branch.
+
 ## Derivative rules come from one mathematical graph, never by hand
 
 **Do not write backend-specific derivative rules as durable code, and never
@@ -104,10 +110,13 @@ code):
 - A lazy branch inside a batched plate cell compiles and evaluates for every
   lane count, but reverse compilation through it fails once the batching pass
   realizes the plate as a loop (six lanes fail where four lanes, unrolled per
-  lane, succeed): `repro_reactant_batch_if_reverse.jl`. Plated support guards
-  therefore keep their authored branch and lose Reactant reverse gradients
-  above that size until the batched-loop branch lowers upstream; native
-  execution and native reverse are unaffected.
+  lane, succeed): `repro_reactant_batch_if_reverse.jl`, still failing on
+  Reactant 0.2.287. It concerns only branches whose condition reads a live
+  value: a condition on bound data is split away during preparation and never
+  reaches the backend. Plated support guards on live values therefore keep
+  their authored branch and lose Reactant reverse gradients above that size
+  until the batched-loop branch lowers upstream; native execution and native
+  reverse are unaffected.
 - Reverse compilation through a retained `while` loop whose exit is data
   dependent (the adaptive ODE solver's `(n < maxiters) & (t < t1)`) fails
   because the loop has no statically known iteration count:

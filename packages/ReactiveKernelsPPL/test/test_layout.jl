@@ -313,36 +313,42 @@ end
     plan = _vector_layout_plan()
     layout = assign_layout(plan)
     entry = layout.entries[2]
+    # Ordered: one running-sum statement over the packed slice.
     @test transform_statements(entry) == Expr[
-        :(_ppl_v_y_cutpoints_1::Float64 = sum(view(unconstrained, 2:2))),
-        :(_ppl_v_y_cutpoints_2::Float64 = _ppl_v_y_cutpoints_1 +
-            exp(sum(view(unconstrained, 3:3)))),
+        :(y_cutpoints::AbstractVector{Float64} =
+            cumsum(vcat(Float64.(view(unconstrained, 2:2)),
+                exp.(view(unconstrained, 3:3))))),
     ]
     @test jacobian_term(entry) == :(sum(view(unconstrained, 3:3)))
-    # Identity vector: direct coordinate reads, no Jacobian.
+    one_ord = LayoutEntry(:vector, nothing, :o, [:o_1], 7, 1, :ordered)
+    @test transform_statements(one_ord) == Expr[
+        :(o::AbstractVector{Float64} = view(unconstrained, 7:7))]
+    @test jacobian_term(one_ord) === nothing
+    # Identity vector: one packed-slice view, no Jacobian.
     ientry = LayoutEntry(:vector, nothing, :t, [:t_1, :t_2], 4, 2, :identity)
     @test transform_statements(ientry) == Expr[
-        :(_ppl_v_t_1::Float64 = sum(view(unconstrained, 4:4))),
-        :(_ppl_v_t_2::Float64 = sum(view(unconstrained, 5:5))),
-    ]
+        :(t::AbstractVector{Float64} = view(unconstrained, 4:5))]
     @test jacobian_term(ientry) === nothing
-    # Simplex: stick-breaking chain + break Jacobian (K=2 here).
-    sentry = LayoutEntry(:vector, nothing, :s, [:s_1], 6, 1, :simplex)
-    stmts = transform_statements(sentry)
-    @test length(stmts) == 5
-    @test stmts[1] == :(_ppl_vr_s_1::Float64 = 1.0)
-    @test stmts[2] == :(_ppl_vz_s_1::Float64 =
-        1.0 / (1.0 + exp(-(sum(view(unconstrained, 6:6)) + $(log(1))))))
-    @test stmts[3] == :(_ppl_v_s_1::Float64 = _ppl_vr_s_1 * _ppl_vz_s_1)
-    @test stmts[4] == :(_ppl_vr_s_2::Float64 = _ppl_vr_s_1 - _ppl_v_s_1)
-    @test stmts[5] == :(_ppl_v_s_2::Float64 = _ppl_vr_s_2)
-    @test jacobian_term(sentry) ==
-        :(log(_ppl_vr_s_1) + log(_ppl_vz_s_1) + log1p(-_ppl_vz_s_1))
-    # A 1-simplex emits its constant; an empty ordered pack emits nothing.
+    # Simplex: closed-form stick-breaking in four vector statements + the
+    # break Jacobian (K=3 here).
+    sentry = LayoutEntry(:vector, nothing, :s, [:s_1, :s_2], 6, 2, :simplex)
+    @test transform_statements(sentry) == Expr[
+        :(_ppl_vz_s::AbstractVector{Float64} = 1.0 ./ (1.0 .+ exp.(-(Float64.(
+            view(unconstrained, 6:7)) .+ log.(3 .- (1:2)))))),
+        :(_ppl_vl_s::AbstractVector{Float64} = log1p.(-_ppl_vz_s)),
+        :(_ppl_vlr_s::AbstractVector{Float64} = cumsum(vcat(0.0, _ppl_vl_s))),
+        :(s::AbstractVector{Float64} = exp.(_ppl_vlr_s) .* vcat(_ppl_vz_s, ones(1))),
+    ]
+    @test jacobian_term(sentry) == :(sum(view(_ppl_vlr_s, 1:2) .+
+        log.(_ppl_vz_s) .+ _ppl_vl_s))
+    # A 1-simplex emits its constant; an empty ordered/identity pack emits
+    # nothing.
     one = LayoutEntry(:vector, nothing, :s1, Symbol[], 9, 0, :simplex)
-    @test transform_statements(one) == Expr[:(_ppl_v_s1_1::Float64 = 1.0)]
+    @test transform_statements(one) == Expr[:(s1::AbstractVector{Float64} = ones(1))]
     @test jacobian_term(one) === nothing
     mt = LayoutEntry(:vector, nothing, :e, Symbol[], 9, 0, :ordered)
     @test transform_statements(mt) == Expr[]
     @test jacobian_term(mt) === nothing
+    mi = LayoutEntry(:vector, nothing, :e, Symbol[], 9, 0, :identity)
+    @test transform_statements(mi) == Expr[]
 end
