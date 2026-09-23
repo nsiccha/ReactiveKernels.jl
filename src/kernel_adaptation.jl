@@ -5548,6 +5548,18 @@ function _sm_validate_observation_result(
     result
 end
 
+# A recipe whose operation is a bare factorization identity (`F = cholesky(A)`)
+# keeps that identity in the graph, so under a tracing backend it returns the
+# backend's own factorization type.  Before such a value is stored as state it
+# passes through `_tensorized_factorization` (core.jl), which the backend
+# extension specializes to its wrapper; container structure is walked and
+# every other leaf is returned unchanged.
+@inline _sm_backend_logical_value(value) = _tensorized_factorization(value)
+@inline _sm_backend_logical_value(value::NamedTuple) =
+    map(_sm_backend_logical_value, value)
+@inline _sm_backend_logical_value(value::Tuple) =
+    map(_sm_backend_logical_value, value)
+
 @inline _sm_backend_storage_value(value) = value
 @inline _sm_backend_storage_value(value::NamedTuple) =
     map(_sm_backend_storage_value, value)
@@ -10567,7 +10579,7 @@ end
 function _sm_normalize_compiled_state(
         transition::CompiledStateTransition, value)
     canonical = _sm_canonicalize_topology(
-        value, _sm_compiled_topology(transition))
+        _sm_backend_logical_value(value), _sm_compiled_topology(transition))
     _sm_restore_compiled_external_groups(transition, canonical)
 end
 

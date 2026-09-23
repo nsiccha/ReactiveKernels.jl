@@ -44,12 +44,14 @@ code is not executed by the docs build.
 - A traced Cholesky factorization is a wrapper type owned by the Reactant
   extension, with `LinearAlgebra.Cholesky`'s accessors (`.L`, `.U`, `.UL`,
   `.factors`) and solves (`\`, `ldiv!`; a diagonal factor divides
-  elementwise). A Cholesky passed as state and a `cholesky(...)` call inside
-  a larger `@kernel` expression (`cholesky(Symmetric(K)).L`) produce it; the
-  extension defines no methods on Reactant's own factorization type, which has
-  no `.L`/`.U`. A `cholesky` call outside that lowering — in a helper function
-  the kernel calls, or a statement that is exactly `F = cholesky(A)` — returns
-  Reactant's type, whose packed factor is `F.factors`.
+  elementwise). A Cholesky passed as state, a factorization stored into
+  compiled reactive state, and a `cholesky(...)` call inside a larger
+  `@kernel` expression (`cholesky(Symmetric(K)).L`) produce it; the extension
+  defines no methods on Reactant's own factorization type, which has no
+  `.L`/`.U`. Within one kernel call, a `cholesky` call outside that lowering —
+  in a helper function the kernel calls, or a statement that is exactly
+  `F = cholesky(A)` — yields Reactant's type, whose packed factor is
+  `F.factors`.
 - Whole-kernel `replica` preserves the scalar kernel as its source authority.
 - Compiled AD reuses the native single-active-port, scalar-WANT validation.
 - Unsupported scalar indexing, unbounded control, or structural state rejects;
