@@ -175,8 +175,9 @@ end
 _gradient_vector(x::Number) = [x]
 _gradient_vector(x) = collect(x)
 
-function _plain_case_values(artifact)
-    if artifact.name === :eight_schools_extraction
+function check_plain_enzyme_gradient(
+        artifact, have, reference_density, reference_gradient)
+    values = if artifact.name === :eight_schools_extraction
         inputs = artifact.inputs
         ([inputs.μ, inputs.log_τ, inputs.θ...],
          inputs.observations, inputs.observation_scales)
@@ -186,17 +187,6 @@ function _plain_case_values(artifact)
     else
         Tuple(artifact.inputs)
     end
-end
-
-function check_plain_primal(artifact, have, reference_density)
-    values = _plain_case_values(artifact)
-    kernel = prepare(artifact.model; have)
-    @test kernel(values...) ≈ reference_density(first(values))
-end
-
-function check_plain_enzyme_gradient(
-        artifact, have, reference_density, reference_gradient)
-    values = _plain_case_values(artifact)
     active = first(values)
     # Use the authored return: migrated models call it `posterior`, while other
     # examples retain `density`. The reference below checks the same full target.
@@ -219,15 +209,6 @@ function check_plain_enzyme_gradient(
     @test all(isfinite, observed)
     @test all(isapprox.(observed, expected))
 end
-
-# Known Enzyme limitation (benchmark/repro_enzyme_lgamma_branch.jl, Enzyme
-# 0.13.204): reverse mode aborts the Julia process — an LLVM assertion, not a
-# catchable error — on a density whose guarded gamma-family `logpdf`s are
-# differentiated together with an observation plate (two lazy branches around
-# `loggamma`/`logbeta` in non-inlined recipe ops, one inside a loop). RK
-# registers no derivative rule (docs/src/constraints.md), so these cases are
-# skipped BY NAME until Enzyme lowers that shape; their primals are checked.
-const ENZYME_ABORTING_CASES = (:beta_binomial_density,)
 
 @testset "PPL densities support plain DI + Enzyme reverse mode" begin
     cases = (
@@ -258,13 +239,8 @@ const ENZYME_ABORTING_CASES = (:beta_binomial_density,)
     )
     for (artifact, have, reference_density, reference_gradient) in cases
         @testset "$(artifact.name)" begin
-            if artifact.name in ENZYME_ABORTING_CASES
-                @info "skipping plain-Enzyme gradient (known Enzyme abort, see benchmark/repro_enzyme_lgamma_branch.jl)" artifact.name
-                check_plain_primal(artifact, have, reference_density)
-            else
-                check_plain_enzyme_gradient(
-                    artifact, have, reference_density, reference_gradient)
-            end
+            check_plain_enzyme_gradient(
+                artifact, have, reference_density, reference_gradient)
         end
     end
 end

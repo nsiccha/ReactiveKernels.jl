@@ -152,6 +152,11 @@ per stage evaluation (a vector-Jacobian product lowered to straight-line
 code inside the step); nothing differentiates through the adaptive while
 loop. A non-successful forward or backward solve throws an `ErrorException`
 (there is no trajectory to adjoin).
+
+That explicit backend call is an interim (decision
+`2026-09-23T02-22-38-939-1gh4snu`): the right-hand-side VJP is to come from
+the derivative-rule generator as graph mathematics once its slice covers
+vector right-hand sides (todo `2026-09-23T03-04-45-362-1w4062g`).
 """
 function compile_backsolve_gradient end
 

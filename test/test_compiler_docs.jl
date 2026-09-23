@@ -127,6 +127,10 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         # exact AD terminology/support boundaries.
         "brm-hsgp.md",
         "manual-derivative-rules.md",
+        # The core-constraints page owns the derivative-rule policy (one
+        # pure-math graph, generated adapters, no hand-written backend rules)
+        # and names the backends that policy governs.
+        "constraints.md",
         "hmm-drive-1.md",
         # The Kronecker GP page owns its exact native-Enzyme/Reactant boundary
         # disclosure (dense eigendecomposition gradient axes) the same way.

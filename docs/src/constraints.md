@@ -36,24 +36,35 @@ isolate the backend failure instead of adopting an eager workaround.
 
 ## Derivative rules come from one mathematical graph, never by hand
 
-**Do not write backend-specific derivative rules.** The user-ratified policy
-(ReactiveKernels:reactant decision `2026-09-14T13-13-44-484-15lmrss`, design
-page [manual derivative rules](manual-derivative-rules.md) with
+**Do not write backend-specific derivative rules as durable code, and never
+attach a rule to a function this repository does not own.** The user-ratified
+policy (ReactiveKernels:reactant decision `2026-09-14T13-13-44-484-15lmrss`,
+design page [manual derivative rules](manual-derivative-rules.md) with
 `examples/manual_derivative_rule.jl`) is that a numerical primitive's
 derivatives are authored once as an ordinary pure-math `@kernel` graph — the
 stable primal plus named partials, or forward and reverse branches as outputs
 of one multi-output graph — and that every AD-protocol adapter (ChainRules,
 Mooncake, Enzyme, Reactant once its upstream bridge exists) is *generated*
-from activity-selected cuts of that graph. Separately authored JVP/VJP
-declarations, hand-written `EnzymeRules`/ChainRules methods, function or
-runtime-activity annotations, and finite-difference substitutions are all
-rejected; the acceptance corpus differentiates the authored primal with the
-backend's ordinary reverse mode and nothing else. The generator is not built
-yet (ReactiveKernels:reactant todo `2026-09-14T17-10-05-750-0dsqq02`), so
-today RK registers no derivative rule at all, and a failure of the ordinary
-path is a backend limitation: isolate it with a backend-only reproducer under
-`benchmark/`, record it on this page, and, if it aborts the process, skip the
-affected acceptance cases by name until the backend lowers the shape.
+from activity-selected cuts of that graph and attached to a callable this
+repository owns. Separately authored JVP/VJP declarations, hand-written
+`EnzymeRules`/ChainRules methods, function or runtime-activity annotations,
+and finite-difference substitutions are rejected as durable code; the
+acceptance corpus differentiates the authored primal with the backend's
+ordinary reverse mode and nothing else. A rule on a foreign function such as
+`SpecialFunctions.loggamma` is type piracy on top of that: it silently changes
+every Enzyme user in the session.
+
+The generator's first slice is under construction (ReactiveKernels:review todo
+`2026-09-23T03-00-11-762-1q9sudt`, taking over ReactiveKernels:reactant todo
+`2026-09-14T17-10-05-750-0dsqq02`). Until it lands, the only derivative rules
+in this repository are two interim reverse rules attached to
+DistributionKernels' own `loggamma`/`logbeta` entry points (its Enzyme
+extension), marked `INTERIM` in source with that todo; the flip replaces their
+bodies with generator output and deletes the extension. A new backend failure
+of the ordinary path remains a backend limitation: isolate it with a
+backend-only reproducer under `benchmark/`, record it on this page, and, if it
+aborts the process, skip the affected acceptance cases by name until either
+the backend lowers the shape or the generator provides the owned rule.
 
 ## Acceptance and existing limitations
 
@@ -93,13 +104,18 @@ code):
   because the loop has no statically known iteration count:
   `repro_reactant_adaptive_while_reverse.jl`. The solver keeps the retained
   loop; its supported gradient is the backsolve adjoint, which differentiates
-  only the loop-free right-hand side.
+  only the loop-free right-hand side. That right-hand-side VJP is today an
+  explicit backend `autodiff` call inside the solver extension — an interim
+  under decision `2026-09-23T02-22-38-939-1gh4snu`, to be reformulated as
+  generator-consumed graph mathematics (loop-carried reverse staging with
+  right-hand-side-graph VJPs) once the generator slice above exists.
 - Native Enzyme reverse mode aborts the process (an LLVM assertion in its
   shadow-allocation caching, reached while it differentiates SpecialFunctions'
   `logabsgamma` port) when lazily evaluated branches around
   `loggamma`/`logbeta` sit in non-inlined functions differentiated together,
   one inside a loop: `repro_enzyme_lgamma_branch.jl`. That is the shape of a
-  guarded `logpdf` plus an observation plate. The lazy guards stay, and RK
-  registers no custom derivative rule (its acceptance contract is ordinary
-  reverse-mode AD only); the plain-Enzyme acceptance cases that hit the abort
-  are skipped by name until Enzyme lowers this shape.
+  guarded `logpdf` plus an observation plate. The lazy guards stay; the
+  distribution sources call DistributionKernels' own `loggamma`/`logbeta`
+  entry points, whose reverse rules (interim by hand, generated after the
+  flip; see the rule constraint above) make them primitives for Enzyme, so
+  the failing body is never differentiated.
