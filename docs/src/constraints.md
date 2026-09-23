@@ -105,12 +105,10 @@ code):
   dependent (the adaptive ODE solver's `(n < maxiters) & (t < t1)`) fails
   because the loop has no statically known iteration count:
   `repro_reactant_adaptive_while_reverse.jl`. The solver keeps the retained
-  loop; its supported gradient is the backsolve adjoint, which differentiates
-  only the loop-free right-hand side. That right-hand-side VJP is today an
-  explicit backend `autodiff` call inside the solver extension — an interim
-  under decision `2026-09-23T02-22-38-939-1gh4snu`, to be reformulated as
-  generator-consumed graph mathematics (loop-carried reverse staging with
-  right-hand-side-graph VJPs) once the generator slice above exists.
+  loop; its supported gradient is the backsolve adjoint, whose right-hand
+  side is a `DerivativeRule` (the rule constraint above): the augmented
+  system's vector-Jacobian products are the rule's authored reverse cut,
+  evaluated inside the retained loop, so nothing differentiates anything.
 - Native Enzyme reverse mode aborts the process (an LLVM assertion in its
   shadow-allocation caching, reached while it differentiates SpecialFunctions'
   `logabsgamma` port) when lazily evaluated branches around

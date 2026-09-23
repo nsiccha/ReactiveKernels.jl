@@ -21,8 +21,8 @@
 #   operand/block-arg matching, so the step body is spelled inline;
 # - parametric structs captured by the loop need a bound the traced
 #   promotion satisfies (`Number`, not `AbstractFloat`);
-# - `Enzyme.autodiff(::Reverse, ...)` inside traced code is intercepted by
-#   Reactant's overlay and lowers the pullback into the program;
+# - a `DerivativeRule` reverse cut is plain graph mathematics, so it traces
+#   inside the step like any other array expression;
 # - never place complementary comparisons (`x <= c` and `x > c`) on one
 #   traced value that can be NaN: the optimizer derives one from the
 #   other, wrong for NaN. Test `isnan` explicitly instead.
@@ -35,8 +35,9 @@
 # condition fails with "no known iteration count"). Reactant/Enzyme-only
 # reproducer: `benchmark/repro_reactant_adaptive_while_reverse.jl` at the
 # repository root. The supported gradient path is the backsolve adjoint
-# (`compile_backsolve_gradient`), which differentiates only the loop-free
-# RHS VJP inside the step. The former workarounds — a fixed-N straight-line
+# (`compile_backsolve_gradient`), whose right-hand-side VJP is the authored
+# reverse cut of a `DerivativeRule`, evaluated inside the step: nothing
+# differentiates anything. The former workarounds — a fixed-N straight-line
 # unroll and post-exit dummy-`dt` masked iterations that kept a
 # single-comparison loop shape alive — were removed: both are the shapes
 # `docs/src/constraints.md` forbids.
@@ -160,49 +161,57 @@ function RKRO.compile_ode_solve(f, u0_example::AbstractVector,
     p_example === nothing ? (u0,) -> solved(u0) : (u0, p) -> solved(u0, p)
 end
 
-# Augmented backsolve RHS over `w = [u; λ; μ]`: the state re-solves `f`
-# backward in time, the adjoint integrates `dλ/dt = -Jᵀλ`, and the parameter
-# quadrature `dμ/dt = -(λᵀf_p)` so `μ(t0) = dL/dp`. The VJP pair comes from
-# one `Enzyme.autodiff` over the loop-free RHS per stage evaluation (lowered
-# to straight-line code inside the step by Reactant's Enzyme overlay, probed
-# minimal inside a `@trace while` body before building on it). Nothing here
-# differentiates through the adaptive loop. Reached through
-# `Reactant.Enzyme` (identical to the `Enzyme` module object), so the
-# extension needs no new dependency.
-#
-# INTERIM (user decision 2026-09-23T02-22-38-939-1gh4snu): this explicit
-# backend `autodiff` call is the one hand-placed AD-specific construct in the
-# repository and is kept, documented, until the derivative-rule generator can
-# express the right-hand-side VJP as generator-consumed graph mathematics with
-# loop-carried reverse staging (ReactiveKernels:review todo
-# 2026-09-23T03-04-45-362-1w4062g, depending on the generator slice
-# 2026-09-23T03-00-11-762-1q9sudt; policy: docs/src/constraints.md).
-function _backsolve_rhs(f, n::Int, m::Int, ::Type{T}) where {T<:AbstractFloat}
-    zT = zero(T)
-    sdot = (uu, pp, ll, tt) -> sum(f(uu, pp, tt) .* ll)
-    sdot_nop = (uu, ll, tt) -> sum(f(uu, nothing, tt) .* ll)
+# Augmented backsolve RHS over `w = [u; λ; μ]`: the state re-solves the
+# right-hand side backward in time, the adjoint integrates `dλ/dt = -Jᵀλ`,
+# and the parameter quadrature `dμ/dt = -(λᵀf_p)` so `μ(t0) = dL/dp`. The VJP
+# pair `(Jᵀλ, f_pᵀλ)` is the right-hand side's authored reverse cut — the
+# rule's graph owns that mathematics (ReactiveKernels `derivative_rule`) — so
+# the augmented system is ordinary graph arithmetic inside the step and
+# nothing differentiates anything, neither the adaptive loop nor the RHS.
+# With no parameter block the rule takes `(u, t)`; with one it takes
+# `(u, p, t)`; `t` is never active, so only the `u` (and `p`) cotangents are
+# selected.
+function _backsolve_rhs(rule::ReactiveKernels.DerivativeRule, n::Int, m::Int,
+        ::Type{T}) where {T<:AbstractFloat}
     r1 = 1:n
     r2 = (n + 1):(2n)
-    EA = Reactant.Enzyme
+    if m == 0
+        function aug_nop(w, p, t)
+            u = w[r1]
+            lam = w[r2]
+            fwd = rule(u, t)
+            (u_bar,) = ReactiveKernels.reverse_cut(rule, Val(1), u, t, lam)
+            vcat(fwd, .-u_bar)
+        end
+        return aug_nop
+    end
     function aug(w, p, t)
         u = w[r1]
         lam = w[r2]
-        fwd = f(u, p, t)
-        jtu = u .* zT
-        if m == 0
-            # Concrete branch: `m` is a closure constant, never traced.
-            EA.autodiff(EA.Reverse, EA.Const(sdot_nop), EA.Active,
-                EA.Duplicated(u, jtu), EA.Const(lam), EA.Const(t))
-            vcat(fwd, .-jtu)
-        else
-            jtp = p .* zT
-            EA.autodiff(EA.Reverse, EA.Const(sdot), EA.Active,
-                EA.Duplicated(u, jtu), EA.Duplicated(p, jtp),
-                EA.Const(lam), EA.Const(t))
-            vcat(fwd, .-jtu, .-jtp)
-        end
+        fwd = rule(u, p, t)
+        u_bar, p_bar = ReactiveKernels.reverse_cut(rule, Val(3), u, p, t, lam)
+        vcat(fwd, .-u_bar, .-p_bar)
     end
     aug
+end
+
+# The right-hand side of a backsolve gradient must own its reverse
+# mathematics: a plain function has nothing to hand the adjoint.
+function _backsolve_rule(f, m::Int)
+    f isa ReactiveKernels.DerivativeRule || throw(ArgumentError(
+        "compile_backsolve_gradient needs a ReactiveKernels.DerivativeRule " *
+        "right-hand side (one graph authoring du and the u/p cotangents of " *
+        "λᵀ du; see `derivative_rule`), got $(typeof(f)); a plain function " *
+        "cannot supply the adjoint's vector-Jacobian products"))
+    ReactiveKernels.has_reverse_branch(f) || throw(ArgumentError(
+        "compile_backsolve_gradient: $(f) has no reverse branch (covector + " *
+        "cotangents) to supply the adjoint's vector-Jacobian products"))
+    expected = m == 0 ? 2 : 3
+    inputs = ReactiveKernels.rule_inputs(f)
+    length(inputs) == expected || throw(ArgumentError(
+        "compile_backsolve_gradient: the right-hand-side rule must take " *
+        (m == 0 ? "(u, t)" : "(u, p, t)") * " but $(f) takes $(inputs)"))
+    f
 end
 
 function RKRO.compile_backsolve_gradient(f, u0_example::AbstractVector,
@@ -213,9 +222,13 @@ function RKRO.compile_backsolve_gradient(f, u0_example::AbstractVector,
     T = typeof(cfg.t0)
     n = length(u0_example)
     m = p_example === nothing ? 0 : length(p_example)
-    forward = RKRO.compile_ode_solve(f, u0_example, p_example, RKRO.Tsit5(),
-        cfg)
-    aug = _backsolve_rhs(f, n, m, T)
+    rule = _backsolve_rule(f, m)
+    # The forward solve takes the driver's `(u, p, t)` shape; a parameter-free
+    # rule takes `(u, t)`.
+    forward_rhs = m == 0 ? (u, p, t) -> rule(u, t) : rule
+    forward = RKRO.compile_ode_solve(forward_rhs, u0_example, p_example,
+        RKRO.Tsit5(), cfg)
+    aug = _backsolve_rhs(rule, n, m, T)
     w_example = zeros(T, 2n + m)
     # Backward journey, latest first: `:endpoint` re-solves `t1 → t0` in one
     # segment with `λ(t1) = 1`; `:saveat` walks `t1 → … → t0` segment by

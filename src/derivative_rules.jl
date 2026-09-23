@@ -277,6 +277,14 @@ end
 end
 
 """
+    rule_inputs(rule) -> Tuple{Vararg{Symbol}}
+
+The input port names of a generated rule, in signature order.
+"""
+rule_inputs(::ScalarDerivativeRule{Name,N,Inputs}) where {Name,N,Inputs} = Inputs
+rule_inputs(::DerivativeRule{Name,N,Inputs}) where {Name,N,Inputs} = Inputs
+
+"""
     has_forward_branch(rule::DerivativeRule) -> Bool
     has_reverse_branch(rule::DerivativeRule) -> Bool
 """

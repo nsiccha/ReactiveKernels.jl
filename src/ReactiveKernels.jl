@@ -58,7 +58,7 @@ export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
 export prepare_ad_pullback, ad_pullback
 export ScalarDerivativeRule, scalar_derivative_rule, derivative_cut
 export DerivativeRule, derivative_rule, forward_cut, reverse_cut, reverse_residuals
-export has_forward_branch, has_reverse_branch
+export has_forward_branch, has_reverse_branch, rule_inputs
 export ad_value_and_pullback, ad_value_and_pullback!
 export compile_ad_gradient, compile_ad_value_and_gradient
 export lower, lower_with_ops, lower_batched, replica, plate_body, scan_body, transform, compile
