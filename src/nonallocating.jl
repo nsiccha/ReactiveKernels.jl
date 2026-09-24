@@ -63,6 +63,10 @@ struct _MatMulStep end
 struct _FillConstructorStep{F}
     f::F
 end
+
+"One-dimensional gather (`x[idx]`); in-place layers may copy into a destination."
+struct _GatherStep end
+@inline (::_GatherStep)(x, idx...) = x[idx...]
 @inline (op::_FillConstructorStep)(dims::Integer...) = op.f(dims...)
 _fill_constructor_value(::_FillConstructorStep{typeof(zeros)}) = 0.0
 _fill_constructor_value(::_FillConstructorStep{typeof(ones)}) = 1.0
@@ -199,12 +203,25 @@ function _decompose_call(ctx::_FusedDecomposition, callee::Symbol, rawargs)
     resolved = _nonalloc_resolve_const(ctx.mod, callee)
     resolved === nothing && return nothing
     f = something(resolved)
+    if (f === Base.sum || f === Base.prod ||
+        f === Base.minimum || f === Base.maximum) && length(rawargs) == 1
+        reduced = _decompose_singleton_reduction(ctx, rawargs[1])
+        reduced !== nothing && return reduced
+    end
     decomposed = _decompose_arguments(ctx, rawargs, false)
     decomposed === nothing && return nothing
     args, types = decomposed
     T = _static_type(f, types...)
     fref = GlobalRef(ctx.mod, callee)
     if (isconcretetype(T) && isbitstype(T)) || _nonalloc_is_lazy(f)
+        return (Expr(:call, fref, args...), T)
+    end
+    if T isa DataType && isconcretetype(T) && !ismutabletype(T)
+        # An immutable value owns no reusable buffer: a cache step would only
+        # store it back through the passthrough fallback, so emit the
+        # construction inline exactly as the fused closure would run it. This
+        # covers wrapper structs, tuples, and other immutable constructors;
+        # mutable results (arrays, refs, dicts) keep their cache steps below.
         return (Expr(:call, fref, args...), T)
     end
     T isa Type || return nothing
@@ -226,6 +243,65 @@ function _decompose_call(ctx::_FusedDecomposition, callee::Symbol, rawargs)
     # fallback rather than risking a stale destination on a shape change.
     (f === Base.:\ || f === Base.:/) && return nothing
     (_emit_step!(ctx, f, T, args...), T)
+end
+
+# A scalar reduction (`sum`/`prod`/`minimum`/`maximum`) over a provably
+# single-element view is exactly that element — no summation algorithm runs, so
+# there is no rounding to preserve. Match `view(x, a:a, ...)` with every index
+# a syntactic `lo:lo` range over side-effect-free bounds (a Symbol or Number
+# used twice evaluates identically, and evaluates once in the rewritten form),
+# and only when the view call itself statically resolves to an array (so the
+# fused closure's `view` would have succeeded, with identical bounds behavior:
+# `a:a` in-bounds ⟺ `a` in-bounds). Anything else returns `nothing` and the
+# reduction decomposes normally. This is the packed-read spelling
+# `sum(view(unconstrained, i:i))` the query layer generates per scalar layout
+# entry, which otherwise boxes one view object per entry per call.
+function _decompose_singleton_reduction(ctx::_FusedDecomposition, raw)
+    raw isa Expr && raw.head === :call && length(raw.args) >= 3 || return nothing
+    vcallee = raw.args[1]
+    vcallee isa Symbol || return nothing
+    haskey(ctx.argmap, vcallee) && return nothing
+    vresolved = _nonalloc_resolve_const(ctx.mod, vcallee)
+    vresolved === nothing || something(vresolved) !== Base.view && return nothing
+    xraw = raw.args[2]
+    vidx = raw.args[3:end]
+    # Every index is a syntactic `lo:lo` range over provably idempotent bounds
+    # (a name or literal evaluates identically every time, and is evaluated
+    # once in the rewritten form).
+    for idx in vidx
+        idx isa Expr && idx.head === :call && length(idx.args) == 3 &&
+            idx.args[1] === Symbol(":") || return nothing
+        lo, hi = idx.args[2], idx.args[3]
+        lo == hi && lo isa Union{Symbol,Number} || return nothing
+    end
+    colonresolved = _nonalloc_resolve_const(ctx.mod, Symbol(":"))
+    colonresolved === nothing && return nothing
+    colonfn = something(colonresolved)
+    dx = _decompose(ctx, xraw, false)
+    dx === nothing && return nothing
+    dx[2] isa Type || return nothing
+    # The twin's range construction and `view` call must statically resolve to
+    # concrete range and array types: then the twin's `view` provably succeeds
+    # (with identical bounds behavior: `a:a` in-bounds ⟺ `a` in-bounds), the
+    # view holds exactly one element, and scalar `getindex` is that element.
+    trngs = Any[]
+    loexprs = Any[]
+    lotypes = Any[]
+    for idx in vidx
+        lo = idx.args[2]
+        dlo = _decompose(ctx, lo, false)
+        dlo === nothing && return nothing
+        push!(loexprs, dlo[1])
+        push!(lotypes, dlo[2])
+        trng = _static_type(colonfn, dlo[2], dlo[2])
+        trng isa DataType && trng <: AbstractRange || return nothing
+        push!(trngs, trng)
+    end
+    tview = _static_type(Base.view, dx[2], trngs...)
+    tview isa DataType && tview <: AbstractArray || return nothing
+    getexpr = Expr(:call, GlobalRef(Base, :getindex), dx[1], loexprs...)
+    T = _static_type(Base.getindex, dx[2], lotypes...)
+    (getexpr, T)
 end
 
 function _decompose_broadcast(ctx::_FusedDecomposition, base::Symbol, rawargs,
@@ -261,14 +337,14 @@ function _decompose_getindex(ctx::_FusedDecomposition, xraw, idxraws)
     all(t -> t isa Type &&
              (t <: AbstractRange || t <: AbstractVector{<:Integer} ||
               t <: Colon), itypes) || return nothing
-    view_expr = Expr(:call, GlobalRef(Base, :view), dx[1], idxs...)
-    VT = _static_type(Base.view, dx[2], itypes...)
-    bc = Expr(:call, GlobalRef(Base.Broadcast, :broadcasted),
-              GlobalRef(Base, :identity), view_expr)
-    BT = _static_type(Base.Broadcast.broadcasted, typeof(identity), VT)
-    MT = _static_type(Base.Broadcast.materialize, BT)
-    MT isa Type || return nothing
-    (_emit_step!(ctx, _MaterializeStep(), MT, bc), MT)
+    # A dedicated gather step whose arguments are the array and the index
+    # values: one-dimensional vector gathers copy without constructing the
+    # intermediate view object (which otherwise escapes once per call), while
+    # every other shape takes the same view-plus-materialize computation the
+    # in-place layer applies below, so behavior never regresses.
+    GT = _static_type(Base.getindex, dx[2], itypes...)
+    GT isa Type || return nothing
+    (_emit_step!(ctx, _GatherStep(), GT, dx[1], idxs...), GT)
 end
 
 # Try to decompose one fused-source recipe statement. Returns
@@ -357,6 +433,16 @@ function _nonalloc_rewrite_recipe!(newbody, prog::_StepProgram, r::Recipe,
                     record!(dec[2])
                     return
                 end
+            end
+            # A fused source outside the decomposition grammar (control flow,
+            # a branch closure) with an isbits result needs no cache either:
+            # call it directly, exactly as the bare-operation path does below.
+            T = _static_type(op, argtypes...)
+            if isconcretetype(T) && isbitstype(T)
+                j = _step!(prog, op, nothing)
+                push!(newbody.args, Expr(:(=), lhs, _plain_call(j, callargs...)))
+                record!(T)
+                return
             end
         else
             # A bare identity operation: isbits results and identity-preserving

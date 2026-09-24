@@ -61,16 +61,31 @@ end
     compiled_wa = Base.invokelatest(Reactant.compile, post_q,
         (Reactant.to_rarray(u),))
     @test Float64(compiled_wa(Reactant.to_rarray(u))) ≈ native rtol = 1e-9
-    # (c) compiled value + gradient over the sampler's prepared AD
+    # (c) compiled value + gradient over the sampler's prepared AD.
+    # reactant-tiny-mo-88cd8d95: Reactant's DEFAULT pipeline silently
+    # miscompiles this program's reverse — each lane's `-1` adjoint from
+    # the per-lane `-log(σ)` is counted ONCE instead of n times (+(n-1)
+    # on the log-σ coordinate; primal exact). The trace and Enzyme's
+    # reverse are correct (`optimize = :only_enzyme` matches native to
+    # 1e-15), so the correctness assertion pins that pipeline until
+    # upstream fixes the pass (reactivekernels-use §7n; tracking issue
+    # on nsiccha/ReactiveKernels.jl; `:no_slice_slice` does NOT help —
+    # different pass than §7j). The default-pipeline `@test_broken`
+    # below turns suite-red the day upstream fixes it — then drop the
+    # pin and the marker together.
     q = prepare_sampler(built, bound, u; backend = _RJ_BACKEND)
     g = similar(u)
     val, _ = sampler_value_and_gradient!(q, g, u)
     @test val ≈ native rtol = 1e-12
     @test g ≈ _rj_findiff(q, u) rtol = 1e-6
-    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
+    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u);
+        optimize = :only_enzyme)
     rval, rgrad = cad(Reactant.to_rarray(u))
     @test Float64(rval) ≈ native rtol = 1e-9
     @test Array(rgrad) ≈ g rtol = 1e-9
+    cad_default = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
+    _, rgrad_default = cad_default(Reactant.to_rarray(u))
+    @test_broken Array(rgrad_default) ≈ g rtol = 1e-9
 end
 
 # Joint fixture at tiling K: bound plan + built program + sampler-cut kernel

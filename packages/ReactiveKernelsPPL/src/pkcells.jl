@@ -1291,3 +1291,244 @@ function linear_pk_read_locs_auc(op_type::AbstractVector,
     end
     return vcat(conc, auc)
 end
+
+# --- destination-passing cell variants (non-allocating execution) -----------
+#
+# `linear_pk_read_locs!`, `linear_pk_read_locs_auc!` and `linear_pk_event_log_f!`
+# run the same recurrences as their allocating twins, writing into a caller-owned
+# `out` vector instead of `push!`ing into fresh vectors. The MutatingFunctions
+# extension calls them from its `apply!!` methods, so a warmed non-allocating
+# kernel reuses one result buffer per grouped assignment instead of reallocating
+# it on every call.
+#
+# Native-only: unlike the twins, these skip the tensorized-marker check — the
+# extension's `apply!!` performs it once per call and falls back to the allocating
+# twin (which routes to the compiled path or throws the documented error) when
+# traced values are present. Do not call these with traced operands directly.
+#
+# Bit-exactness: the recurrence bodies mirror the allocating twins
+# statement-for-statement (same op order, same encounter order, same expressions);
+# only the sink changes (`out[off + k]` for the k-th READ op instead of `push!`).
+# The v1 `linear_pk_read_locs!` spelling (no `log_F`) uses `op_amount[j]` directly:
+# the twin computes `op_amount[j] * exp(0)`, and `x * 1.0 === x` in IEEE, so the
+# two agree bit-for-bit. `linear_pk_event_log_f!` fuses the PHI/S/w temporaries
+# into one accumulation with the same per-read summation order as the allocating
+# form's `PHI * w` plus `slope .* d .+ smooth` association, so the two agree to
+# floating-point summation association (a few ulp; the joint parity test holds the
+# non-allocating path to ≤ 1e-14 relative against the allocating path).
+
+# Native-execution gate for the MutatingFunctions extension: true when no
+# argument carries a traced (tensorized) marker, i.e. the destination-passing
+# `!` variants below may run. Traced calls fall back to the allocating twin
+# (which routes to the compiled path or throws the documented error).
+function _pk_no_traced_marker(fixed::Tuple, extra::Tuple)
+    ReactiveKernels._dynamic_tensorized_marker((fixed..., extra...)) === nothing
+end
+
+function _pk_count_reads(op_type::AbstractVector, lo::Integer, hi::Integer)
+    n = 0
+    for j in lo:hi
+        op_type[j] == LINEAR_EVENT_READ && (n += 1)
+    end
+    n
+end
+
+"""
+    linear_pk_read_locs!(out, off, op_type, op_dt, op_amount, op_interval,
+                         op_count, op_read_idx, log_F, log_Vc, log_k10, log_k12,
+                         log_k21, log_ka)
+    linear_pk_read_locs!(out, off, op_type, op_dt, op_amount, op_interval,
+                         op_count, op_read_idx, log_Vc, log_k10, log_k12, log_k21,
+                         log_ka)
+
+Destination-passing [`linear_pk_read_locs`](@ref): write the subject's READ
+locations into `out` at `off + 1:off + R` (`R` = number of READ ops) and return
+`out`. The second method is the v1 spelling (bioavailability identically 1).
+Validations mirror the allocating twin; `out` must have room for the `R` reads.
+"""
+function linear_pk_read_locs!(out::AbstractVector, off::Integer,
+        op_type::AbstractVector,
+        op_dt::AbstractVector, op_amount::AbstractVector,
+        op_interval::AbstractVector, op_count::AbstractVector,
+        op_read_idx::AbstractVector, log_F::AbstractVector, log_Vc, log_k10,
+        log_k12, log_k21, log_ka)
+    n_ops = length(op_type)
+    (length(op_dt) == n_ops && length(op_amount) == n_ops &&
+     length(op_interval) == n_ops && length(op_count) == n_ops &&
+     length(op_read_idx) == n_ops && length(log_F) == n_ops) ||
+        throw(ArgumentError("linear_pk_read_locs op columns disagree " *
+                            "in length (all seven must match)"))
+    n_ops >= 1 ||
+        throw(ArgumentError("linear_pk_read_locs needs at least one op"))
+    log_CL = log_Vc + log_k10
+    log_Q = log_Vc + log_k12
+    log_Vp = log_Vc + log_k12 - log_k21
+    A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
+    Vc = exp(log_Vc)
+    state = (0.0, 0.0, 0.0)
+    k = 0
+    for j in 1:n_ops
+        state = linear_pk_propagate_3(A, state, op_dt[j])
+        if op_type[j] == LINEAR_EVENT_READ
+            k += 1
+            out[off + k] = state[2] / Vc
+        else
+            effective_amount = op_amount[j] * exp(_traced_op_read(log_F, j))
+            if op_type[j] == LINEAR_EVENT_DOSE
+                state = linear_pk_add_dose_3(state, effective_amount)
+            else
+                op_type[j] == LINEAR_EVENT_DOSE_SEGMENT ||
+                    throw(ArgumentError("linear PK kernel event stream " *
+                                        "has an unknown operation type " *
+                                        "$(op_type[j]) (SB @stan_assert mirror)"))
+                state = linear_pk_add_regular_doses_3(A, state,
+                    effective_amount, op_interval[j], op_count[j])
+            end
+        end
+    end
+    return out
+end
+
+function linear_pk_read_locs!(out::AbstractVector, off::Integer,
+        op_type::AbstractVector,
+        op_dt::AbstractVector, op_amount::AbstractVector,
+        op_interval::AbstractVector, op_count::AbstractVector,
+        op_read_idx::AbstractVector, log_Vc, log_k10, log_k12, log_k21,
+        log_ka)
+    n_ops = length(op_type)
+    (length(op_dt) == n_ops && length(op_amount) == n_ops &&
+     length(op_interval) == n_ops && length(op_count) == n_ops &&
+     length(op_read_idx) == n_ops) ||
+        throw(ArgumentError("linear_pk_read_locs op columns disagree " *
+                            "in length (all six must match)"))
+    n_ops >= 1 ||
+        throw(ArgumentError("linear_pk_read_locs needs at least one op"))
+    log_CL = log_Vc + log_k10
+    log_Q = log_Vc + log_k12
+    log_Vp = log_Vc + log_k12 - log_k21
+    A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
+    Vc = exp(log_Vc)
+    state = (0.0, 0.0, 0.0)
+    k = 0
+    for j in 1:n_ops
+        state = linear_pk_propagate_3(A, state, op_dt[j])
+        if op_type[j] == LINEAR_EVENT_READ
+            k += 1
+            out[off + k] = state[2] / Vc
+        else
+            effective_amount = op_amount[j]
+            if op_type[j] == LINEAR_EVENT_DOSE
+                state = linear_pk_add_dose_3(state, effective_amount)
+            else
+                op_type[j] == LINEAR_EVENT_DOSE_SEGMENT ||
+                    throw(ArgumentError("linear PK kernel event stream " *
+                                        "has an unknown operation type " *
+                                        "$(op_type[j]) (SB @stan_assert mirror)"))
+                state = linear_pk_add_regular_doses_3(A, state,
+                    effective_amount, op_interval[j], op_count[j])
+            end
+        end
+    end
+    return out
+end
+
+"""
+    linear_pk_read_locs_auc!(out, off, op_type, op_dt, op_amount, op_interval,
+                             op_count, op_read_idx, log_F, log_Vc, log_k10,
+                             log_k12, log_k21, log_ka)
+
+Destination-passing [`linear_pk_read_locs_auc`](@ref): write the subject's
+`[conc; auc]` reads vector into `out` at `off + 1:off + 2R` (`R` = number of
+READ ops) and return `out`. Validations mirror the allocating twin; `out` must
+have room for the `2R` reads.
+"""
+function linear_pk_read_locs_auc!(out::AbstractVector, off::Integer,
+        op_type::AbstractVector,
+        op_dt::AbstractVector, op_amount::AbstractVector,
+        op_interval::AbstractVector, op_count::AbstractVector,
+        op_read_idx::AbstractVector, log_F::AbstractVector,
+        log_Vc, log_k10, log_k12, log_k21, log_ka)
+    n_ops = length(op_type)
+    (length(op_dt) == n_ops && length(op_amount) == n_ops &&
+     length(op_interval) == n_ops && length(op_count) == n_ops &&
+     length(op_read_idx) == n_ops && length(log_F) == n_ops) ||
+        throw(ArgumentError("linear_pk_read_locs_auc op columns disagree " *
+                            "in length (all seven must match)"))
+    n_ops >= 1 ||
+        throw(ArgumentError("linear_pk_read_locs_auc needs at least one op"))
+    log_CL = log_Vc + log_k10
+    log_Q = log_Vc + log_k12
+    log_Vp = log_Vc + log_k12 - log_k21
+    A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
+    Vc = exp(log_Vc)
+    CL = exp(log_CL)
+    state = (0.0, 0.0, 0.0)
+    given = 0.0
+    n_reads = _pk_count_reads(op_type, 1, n_ops)
+    k = 0
+    for j in 1:n_ops
+        state = linear_pk_propagate_3(A, state, op_dt[j])
+        if op_type[j] == LINEAR_EVENT_READ
+            k += 1
+            out[off + k] = state[2] / Vc
+            out[off + n_reads + k] = (given - (state[1] + state[2] + state[3])) / CL
+        else
+            effective_amount = op_amount[j] * exp(_traced_op_read(log_F, j))
+            if op_type[j] == LINEAR_EVENT_DOSE
+                state = linear_pk_add_dose_3(state, effective_amount)
+                given += effective_amount
+            else
+                op_type[j] == LINEAR_EVENT_DOSE_SEGMENT ||
+                    throw(ArgumentError("linear PK kernel event stream " *
+                                        "has an unknown operation type " *
+                                        "$(op_type[j]) (SB @stan_assert mirror)"))
+                state = linear_pk_add_regular_doses_3(A, state,
+                    effective_amount, op_interval[j], op_count[j])
+                given += op_count[j] * effective_amount
+            end
+        end
+    end
+    return out
+end
+
+"""
+    linear_pk_event_log_f!(out, op_log_dose, slope, rho, sigma, beta_raw, mu, L, k)
+
+Destination-passing [`linear_pk_event_log_f`](@ref): write the event-axis
+bioavailability LP into `out` (which must have `length(op_log_dose)` entries)
+and return `out`. Validations mirror the allocating twin. The PHI/S/w
+temporaries are fused into one accumulation with the same per-read summation
+order, so values agree with the allocating form to floating-point summation
+association.
+"""
+function linear_pk_event_log_f!(out::AbstractVector,
+        op_log_dose::AbstractVector, slope, rho,
+        sigma, beta_raw::AbstractVector, mu, L, k::Integer)
+    length(beta_raw) == k ||
+        throw(ArgumentError("linear_pk_event_log_f needs $k hsgp " *
+                            "coefficients (got $(length(beta_raw)))"))
+    L > 0 ||
+        throw(ArgumentError("linear_pk_event_log_f needs a positive " *
+                            "domain half-width L (got $L)"))
+    n = length(op_log_dose)
+    length(out) == n || throw(DimensionMismatch(
+        "linear_pk_event_log_f! destination has length $(length(out)), " *
+        "needs $n"))
+    inv_sqrt_L = 1.0 / sqrt(L)
+    sscale = sigma * sqrt(rho * _PK_EVENT_SQRT2PI)
+    for i in 1:n
+        out[i] = 0.0
+    end
+    for b in 1:k
+        lam_sq = (b * pi / (2.0 * L))^2
+        lam_sqrt = sqrt(lam_sq)
+        wb = sscale * exp(-0.25 * rho * rho * lam_sq) * beta_raw[b]
+        for i in 1:n
+            out[i] += inv_sqrt_L * sin(lam_sqrt * (op_log_dose[i] - mu + L)) * wb
+        end
+    end
+    for i in 1:n
+        out[i] = slope * op_log_dose[i] + out[i]
+    end
+    return out
+end
