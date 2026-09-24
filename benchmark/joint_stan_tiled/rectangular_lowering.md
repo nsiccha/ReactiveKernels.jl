@@ -298,6 +298,14 @@ doses over two subjects. Compiled gradients matched native Enzyme to
 including a same-time dose/read schedule where both exponential tables are
 absent.
 
+The full joint K=1 posterior (7 observations, 101 unconstrained parameters)
+also passed. On the same #3241 binary, its compiled primal improved from the
+earlier 0.509 ms to 0.090 ms and its compiled gradient from 13.397 ms to
+0.529 ms. The current native references were 0.014 ms and 0.182 ms,
+respectively. Primal relative error was `1.9e-16`; the compiled gradient matched
+native Enzyme to `3.3e-14`. The gradient is therefore about 25× faster than
+the prior retained layout, but still 2.9× slower than native at K=1.
+
 The optional `xla_cpu_use_multi_output_fusion` flag improved the hoisted primal
 to 0.73 µs/row, but its gradient aborted inside XLA symbolic-map composition
 on this old CI binary (`GetNumDims() == other.GetNumResults()`, 2 vs 1). Default
