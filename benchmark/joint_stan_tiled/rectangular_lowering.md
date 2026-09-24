@@ -263,6 +263,46 @@ Not a released toolchain. Setup:
 
 strato2 was heavily shared during these runs (native gradient 0.78–0.82 ms instead of 0.20/0.49 ms), so this section records correctness only. The runtime numbers remain those below.
 
+## Same-arithmetic exponential hoisting, 2026-09-24
+
+The rectangular path now computes `exp(A * dt)` for every row that needs it
+before entering the retained recurrence. The rows are array lanes through the
+existing `_pk_expm3`, so Padé selection, LU pivoting, squaring, and per-entry
+operation order are unchanged. The sequential loop only selects the row's nine
+matrix entries and applies the resulting 3×3 matrix to the carried state.
+Repeated-dose segments use the same table for `exp(A * interval)`.
+
+The row sets come from the bound schedule and preserve the existing lazy
+branches: rows whose propagation or repeated-dose branch is not taken are not
+evaluated. This is a layout change, not data-derived unrolling or a replacement
+of the recurrence by superposition.
+
+The focused two-subject, 48-operation benchmark on the #3241 CI binary above
+measured:
+
+| Default CPU fusion | Before hoisting | Hoisted | Native |
+| --- | ---: | ---: | ---: |
+| primal per row | 2.57 µs | 0.95–1.07 µs | 0.34–0.36 µs |
+| gradient per row | 241.4 µs | 4.73–5.23 µs | 2.33–2.35 µs |
+
+Thus hoisting improves the compiled primal by about 2.5–2.7× and the compiled
+gradient by about 46–51×. At this short schedule the compiled path remains
+about 2–3× slower than native; it is not evidence that native execution should
+be removed. The retained HLO stayed structurally invariant when the test
+schedule grew from two to six subjects (28,531 unoptimized StableHLO operation
+occurrences in both cases).
+
+Correctness checks covered the original reproducer, single doses, and repeated
+doses over two subjects. Compiled gradients matched native Enzyme to
+`9.1e-15` or better with no NaNs. The targeted rectangular suite passed 17/17,
+including a same-time dose/read schedule where both exponential tables are
+absent.
+
+The optional `xla_cpu_use_multi_output_fusion` flag improved the hoisted primal
+to 0.73 µs/row, but its gradient aborted inside XLA symbolic-map composition
+on this old CI binary (`GetNumDims() == other.GetNumResults()`, 2 vs 1). Default
+fusion is the validated path; MOF is neither required nor enabled.
+
 ## Preliminary reverse measurements (emulated fix), 2026-09-22
 
 Not a released toolchain. Setup:
