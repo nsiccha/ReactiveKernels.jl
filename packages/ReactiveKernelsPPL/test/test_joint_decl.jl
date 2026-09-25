@@ -827,3 +827,209 @@ end
         tgi_thresholds = :recist, qt_prior_scale = _jd_qt_scale(),
         tgi_baseline_log_size = _jd_tgi_baseline())
 end
+
+# --- memo e2e twin (same 4-subject frame, memo fragments) ---
+
+const _JD_MEMO_DUMMY = (
+    (lp = :log_Vc, resp = :ydVc, scale = 1.5),
+    (lp = :log_k10, resp = :ydK10, scale = 1.6),
+    (lp = :log_k12, resp = :ydK12, scale = 1.7),
+    (lp = :log_k21, resp = :ydK21, scale = 1.8),
+    (lp = :log_ka, resp = :ydKa, scale = 1.9),
+    (lp = :qt_base, resp = :ydQb, scale = 2.0),
+    (lp = :qt_slope, resp = :ydQs, scale = 2.1),
+    (lp = :tgi_net, resp = :ydTg, scale = 2.2),
+    (lp = :log_tgi_kd, resp = :ydKd, scale = 2.3),
+    (lp = :tgi_ly0, resp = :ydLy0, scale = 2.4),
+)
+
+const _JD_MEMO_LPS = [d.lp for d in _JD_MEMO_DUMMY]
+
+function _jd_memo_responses()
+    return LikelihoodSpec[
+        LikelihoodSpec(GaussianFam, IdentityLink, d.resp, d.lp, d.scale,
+            nothing, ResponseEvidence(:none, nothing, nothing),
+            Symbol(d.resp, :_resp))
+        for d in _JD_MEMO_DUMMY
+    ]
+end
+
+function _jd_memo_plan()
+    f = joint_decl_fragments(; tgi_formulas = JOINT_DECL_TGI_FORMULAS_MEMO,
+        tgi_parametrization = :net_kill, tgi_thresholds = :recist,
+        tgi_measure = :sld, qt_prior_scale = _jd_qt_scale(),
+        tgi_baseline_log_size = _jd_tgi_baseline())
+    return StructuralPlan(_jd_memo_responses(), f.predictors,
+        f.population_priors, f.parameters, AssignmentSpec[],
+        Dict{Symbol,AbstractVector}(), 4; derived = f.derived,
+        levelmaps = f.levelmaps, varying_draws = f.varying_draws,
+        varying_slices = f.varying_slices)
+end
+
+function _jd_memo_oracle_lps(nt, cols)
+    male = cols[:male]
+    sage = (cols[:age_yr] .- sum(cols[:age_yr]) / 4) ./
+        sqrt(sum((x - sum(cols[:age_yr]) / 4)^2 for x in cols[:age_yr]) / 3)
+    swt = (cols[:weight_kg] .- sum(cols[:weight_kg]) / 4) ./
+        sqrt(sum((x - sum(cols[:weight_kg]) / 4)^2
+            for x in cols[:weight_kg]) / 3)
+    blcl = Float64.(cols[:indication] .== "BLCL")
+    one = ones(4)
+    idx = [findfirst(==(v), ["S01", "S02", "S03", "S04"])
+        for v in cols[:subject]]
+    Lp = Matrix(nt.L_p_subject)
+    Ltb = Matrix(nt.L_tb_subject)
+    @assert Ltb == [1.0;;] # vacuous 1x1
+    coef = Dict(
+        :log_Vc => Vector(nt.log_Vc), :log_k10 => Vector(nt.log_k10),
+        :log_k12 => Vector(nt.log_k12), :log_k21 => Vector(nt.log_k21),
+        :log_ka => Vector(nt.log_ka), :qt_base => Vector(nt.qt_base),
+        :qt_slope => Vector(nt.qt_slope),
+        :tgi_net => Vector(nt.tgi_net),
+        :log_tgi_kd => Vector(nt.log_tgi_kd),
+        :tgi_ly0 => Vector(nt.tgi_ly0),
+    )
+    pop = Dict{Symbol,Vector{Float64}}(
+        :log_Vc => coef[:log_Vc][1] .* one .+ coef[:log_Vc][2] .* male .+
+            coef[:log_Vc][3] .* sage .+ coef[:log_Vc][4] .* swt .+
+            coef[:log_Vc][5] .* blcl,
+        :log_k10 => coef[:log_k10][1] .* one .+ coef[:log_k10][2] .* male .+
+            coef[:log_k10][3] .* sage .+ coef[:log_k10][4] .* swt .+
+            coef[:log_k10][5] .* blcl,
+        :log_k12 => coef[:log_k12][1] .* one .+ coef[:log_k12][2] .* blcl,
+        :log_k21 => coef[:log_k21][1] .* one .+ coef[:log_k21][2] .* blcl,
+        :log_ka => coef[:log_ka][1] .* one .+ coef[:log_ka][2] .* blcl,
+        :qt_base => coef[:qt_base][1] .* one .+ coef[:qt_base][2] .* male .+
+            coef[:qt_base][3] .* sage .+
+            coef[:qt_base][4] .* cols[:qt_prolonging_drug_ongoing] .+
+            coef[:qt_base][5] .* blcl,
+        :qt_slope => coef[:qt_slope][1] .* one .+
+            coef[:qt_slope][2] .* blcl,
+        :tgi_net => coef[:tgi_net][1] .* one .+
+            coef[:tgi_net][2] .* blcl,
+        :log_tgi_kd => coef[:log_tgi_kd][1] .* one .+
+            coef[:log_tgi_kd][2] .* blcl,
+        :tgi_ly0 => coef[:tgi_ly0][1] .* one .+
+            coef[:tgi_ly0][2] .* male .+ coef[:tgi_ly0][3] .* sage .+
+            coef[:tgi_ly0][4] .* swt .+ coef[:tgi_ly0][5] .* blcl,
+    )
+    r = Dict{Symbol,Vector{Float64}}()
+    for (j, lp) in enumerate(
+            (:log_Vc, :log_k10, :log_k12, :log_k21, :log_ka, :qt_base,
+                :qt_slope, :tgi_net, :log_tgi_kd))
+        r[lp] = _jd_ref_r(idx, Lp, Vector(nt.tau_p_subject),
+            Vector(nt.z_flat_p_subject), j:j)
+    end
+    tau_tb = only(Vector(nt.tau_tb_subject))
+    z_tb = Vector(nt.z_flat_tb_subject)
+    r[:tgi_ly0] = [tau_tb * z_tb[g] for g in idx]
+    return Dict(lp => pop[lp] + r[lp] for lp in _JD_MEMO_LPS)
+end
+
+function _jd_memo_coef_priors()
+    qs = _jd_qt_scale()
+    tb = _jd_tgi_baseline()
+    return Dict{Symbol,Tuple{Vector{Float64},Vector{Float64}}}(
+        :log_Vc => ([2.302585092994046, 0.0, 0.0, 0.0, 0.0],
+            [0.8, 0.1, 0.1, 0.1, 1.0]),
+        :log_k10 => ([-1.405170185988091, 0.0, 0.0, 0.0, 0.0],
+            [0.8, 0.1, 0.1, 0.1, 1.0]),
+        :log_k12 => ([-0.34657359027997265, 0.0], [2.0, 1.0]),
+        :log_k21 => ([-2.649158683274018, 0.0], [2.0, 1.0]),
+        :log_ka => ([-2.0794415416798357, 0.0], [0.8, 1.0]),
+        :qt_base => ([0.0, 0.0, 0.0, 0.0, 0.0], fill(qs, 5)),
+        :qt_slope => ([0.0, 0.0], [qs, qs]),
+        :tgi_net => ([0.0, 0.0], [1.5, 1.0]),
+        :log_tgi_kd => ([0.0, 0.0], [1.5, 1.0]),
+        :tgi_ly0 => ([tb, 0.0, 0.0, 0.0, 0.0], [1.5, 0.1, 0.1, 0.1, 1.0]),
+    )
+end
+
+function _jd_memo_oracle_prior(nt)
+    pr = 0.0
+    cp = _jd_memo_coef_priors()
+    for lp in _JD_MEMO_LPS
+        loc, sc = cp[lp]
+        c = Vector(getproperty(nt, lp))
+        for k in eachindex(c)
+            pr += logpdf(Normal(loc[k], sc[k]), c[k])
+        end
+    end
+    pr += _jd_stan_lkj(Matrix(nt.L_p_subject), 1.0)
+    # |tb| K=1 LKJ term is exactly 0.0 (both sides — asserted in the e2e).
+    tau_p = Vector(nt.tau_p_subject)
+    pr += sum(logpdf(Exponential(JOINT_DECL_SD_SCALES.p), t)
+        for t in tau_p[1:7])
+    pr += sum(logpdf(Exponential(JOINT_DECL_SD_SCALES.tg), t)
+        for t in tau_p[8:9])
+    pr += sum(logpdf(Exponential(JOINT_DECL_SD_SCALES.tb), t)
+        for t in Vector(nt.tau_tb_subject))
+    for v in (Vector(nt.z_flat_p_subject), Vector(nt.z_flat_tb_subject))
+        pr += sum(logpdf(Normal(0, 1), x) for x in v)
+    end
+    pr += logpdf(Exponential(0.25), nt.sigma_add)
+    pr += logpdf(Exponential(0.25), nt.sigma_prop)
+    pr += logpdf(LogNormal(0.0, 1.0), nt.qt_scale)
+    pr += logpdf(LogNormal(-2.0402208285265546, 0.5), nt.tgi_sigma)
+    # Stan upper-bound kernel: plain normal_lpdf, NO renormalizer.
+    pr += logpdf(Normal(-2.3, 1.0), nt.tgi_c_cr)
+    return pr
+end
+
+@testset "joint decl memo bind+layout" begin
+    bound = bind_data(_jd_memo_plan(), _jd_columns())
+    @test isbound(bound)
+    for m in bound.levelmaps
+        @test m.values == ["BLCL"]
+    end
+    for d in bound.varying_draws
+        @test d.levels == ["S01", "S02", "S03", "S04"]
+    end
+    # Mixed sd() carrier: 9 margins in |p| (7x p-scale + 2x tg-scale).
+    @test [length(d.sd_priors) for d in bound.varying_draws] == [9, 1]
+    @test [p.param for p in bound.varying_draws[1].sd_priors] ==
+        vcat(fill(0.3333333333333333, 7), fill(0.5, 2))
+    layout = assign_layout(bound)
+    # 32 coefs + 5 scalars + |p| (36+9+36) + |tb| (0+1+4).
+    @test layout.total == 123
+    @test length(coordinate_names(layout)) == 123
+    byname = Dict(e.name => e for e in layout.entries)
+    @test (byname[:L_p_subject].size, byname[:L_p_subject].transform) ==
+        (36, :lkj)
+    @test (byname[:tau_p_subject].size, byname[:tau_p_subject].transform) ==
+        (9, :exp)
+    @test byname[:z_flat_p_subject].size == 36
+    @test !haskey(byname, :L_tg_subject)
+    # recist+sld upper truncation: hi = log(0.7).
+    @test byname[:tgi_c_cr].transform === :upper
+    @test byname[:tgi_c_cr].hi == -0.3566749439387324
+    u = collect(range(-0.4, 0.4; length = layout.total))
+    nt = constrain(layout, u)
+    @test size(nt.L_p_subject) == (9, 9)
+    @test size(nt.b_p_subject) == (4, 9)
+    @test nt.tgi_c_cr < -0.3566749439387324
+    @test unconstrain(layout, nt) ≈ u
+end
+
+@testset "joint decl memo e2e values and gradient" begin
+    cols = _jd_columns()
+    bound = bind_data(_jd_memo_plan(), cols)
+    built = build_kernel(bound)
+    u = collect(range(-0.4, 0.4; length = built.layout.total))
+    nt = constrain(built.layout, u)
+    lps = _jd_memo_oracle_lps(nt, cols)
+    ll = sum(
+        sum(logpdf(Normal(lps[d.lp][i], d.scale), cols[d.resp][i])
+            for i in 1:4)
+        for d in _JD_MEMO_DUMMY)
+    pr = _jd_memo_oracle_prior(nt)
+    jac = logjac(built.layout, u)
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    @test _query(built.spec, bound, :prior, u) ≈ pr
+    ks = sort!(collect(keys(bound.columns)))
+    bnt = NamedTuple{Tuple(ks)}(Tuple(bound.columns[k] for k in ks))
+    kern = prepare(built.spec; have = (:unconstrained, ks...),
+        want = :posterior, bound = bnt)
+    @test kern(u) ≈ ll + pr + jac
+    _jd_check_gradient(kern, u)
+end
