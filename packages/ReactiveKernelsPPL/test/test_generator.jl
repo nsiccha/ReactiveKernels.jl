@@ -371,6 +371,81 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+function _gen_student_plan(; nu = :nu)
+    cols, n = _gen_columns()
+    params = SampledParameter[
+        SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma)]
+    nu isa Symbol && push!(params,
+        SampledParameter(:nu, :gamma, (arg1 = 2.0, arg2 = 0.1), nothing, :nu))
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu,
+            :sigma, nothing, _none_evidence(), :y_resp, nothing, nothing; nu = nu)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_student(cols, coef, sigma, nu)
+    mu = coef[1] .+ coef[2] .* cols[:x]
+    ll = sum(logpdf(LocationScale(m, sigma, TDist(nu)), y)
+        for (m, y) in zip(mu, cols[:y]))
+    pr = logpdf(Normal(0, 1), coef[1]) + logpdf(Normal(0, 2), coef[2]) +
+        logpdf(Exponential(1), sigma) + logpdf(Gamma(2.0, 0.1), nu)
+    return (; ll, pr)
+end
+
+@testset "student values and gradient" begin
+    plan = _gen_student_plan()
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3, 0.5]
+    nt = constrain(built.layout, u)
+    ref = _ref_student(plan.columns, Vector(nt.mu), nt.sigma, nt.nu)
+    @test _query(built.spec, plan, :posterior, u) ≈ ref.ll + ref.pr + u[3] + u[4]
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "student literal-nu values" begin
+    plan = _gen_student_plan(; nu = 4.0)
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    mu = Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* plan.columns[:x]
+    ll = sum(logpdf(LocationScale(m, nt.sigma, TDist(4.0)), y)
+        for (m, y) in zip(mu, plan.columns[:y]))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Exponential(1), nt.sigma)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3]
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted student values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma,
+            :w, _none_evidence(), :y_resp, nothing, nothing; nu = :nu)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[SampledParameter(:sigma, :exponential, (arg1 = 1.0,),
+                nothing, :sigma),
+            SampledParameter(:nu, :gamma, (arg1 = 2.0, arg2 = 0.1), nothing, :nu)],
+        AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3, 0.5]
+    nt = constrain(built.layout, u)
+    mu = Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* cols[:x]
+    ll = sum(cols[:w] .*
+        [logpdf(LocationScale(m, nt.sigma, TDist(nt.nu)), y)
+            for (m, y) in zip(mu, cols[:y])])
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Exponential(1), nt.sigma) + logpdf(Gamma(2.0, 0.1), nt.nu)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3] + u[4]
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "factor values (int and string groupings)" begin
     for g in ([1, 2, 1, 3, 2, 3], ["a", "b", "a", "c", "b", "c"])
         cols, n = _gen_columns()
