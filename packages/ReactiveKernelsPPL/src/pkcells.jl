@@ -1051,10 +1051,13 @@ end
     M = (A[1] * interval, A[2] * interval, A[3] * interval,
         A[4] * interval, A[5] * interval, A[6] * interval,
         A[7] * interval, A[8] * interval, A[9] * interval)
-    P = _pk_expm3(M)
+    _pk_affine_from_exp(_pk_expm3(M), amount)
+end
+
+# The dose-interval affine map from exp(A*interval): propagate, then add a dose.
+@inline _pk_affine_from_exp(P, amount) =
     (P[1], P[2], P[3], 0.0, P[4], P[5], P[6], 0.0,
         P[7], P[8], P[9], 0.0, amount, 0.0, 0.0, 1.0)
-end
 
 @inline function _pk_apply_affine(Q, after_first)
     return (Q[1] * after_first[1] + Q[5] * after_first[2] +

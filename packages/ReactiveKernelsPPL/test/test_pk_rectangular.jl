@@ -70,6 +70,20 @@ end
     rlp = Reactant.to_rarray(lp)
     compiled = Reactant.@compile f(rlp)
     @test Array(compiled(rlp)) ≈ f(lp) rtol=1e-12
+
+    # A same-time read and dose need neither propagation nor a repeated-dose
+    # affine map. Both hoisted tables are therefore `nothing`; their lazy
+    # branches must still trace and execute without indexing a missing table.
+    zero_sched = build_linear_pk_schedule([1], [0.0], [1], [0.0], [100.0])
+    @test all(iszero, zero_sched.op_dt)
+    zero_cols = (zero_sched.op_type, zero_sched.op_dt, zero_sched.op_amount,
+        zero_sched.op_interval, zero_sched.op_count, zero_sched.op_read_idx)
+    zero_dt(lp) = RKP.linear_pk_read_locs_auc_over_subjects(
+        zero_sched.op_ends, zero_cols...,
+        RKP.SubjectSlice(zeros(length(zero_sched.op_type))),
+        ntuple(i -> ReactiveKernels._tensorized_getindex(lp, i), 5)...)
+    zero_compiled = Reactant.@compile zero_dt(rlp)
+    @test Array(zero_compiled(rlp)) ≈ zero_dt(lp) rtol=1e-12
     finally
         RKP._rectangular_pk_enabled[] = previous_mode
     end
