@@ -222,6 +222,18 @@ end
     return C
 end
 
+# A host-only `Bool` nest fused inside a traced broadcast whose outermost
+# call has NO direct traced operand (snag `dummy-varying-xl-3b05117e`): the
+# promotion marker is then the host `Broadcasted` wrapper itself, so the
+# mask keeps its host style and must dense-materialize (`Array{Bool}`) at
+# the lazy level instead of reaching the backend as a `BitArray` (whose
+# `copyto!` overlay recurses without termination).
+@kernel reactant_fused_host_bool_nest(
+        u::Vector{Float64}, c::Vector{Int64}) = begin
+    z::Vector{Float64} = (c .== 2) .* (u .+ 1.0)
+    return sum(z)
+end
+
 _rk_call(k, x, μ, scale) = k(x, μ, scale)
 _rk_allocated(k, x, μ, scale) = @allocated k(x, μ, scale)
 _rk_output_allocated(x) = @allocated similar(x, Float64)
@@ -401,6 +413,18 @@ end
         rB = Reactant.to_rarray(B_host)
         compiled_nested = @compile nested(rA, rB)
         @test Array(compiled_nested(rA, rB)) ≈ native_nested
+    end
+
+    @testset "nested host Bool mask without a direct traced operand" begin
+        u_host = [0.5, -1.0, 1.5, 2.0]
+        c_host = [1, 2, 2, 1]
+        kernel = prepare(reactant_fused_host_bool_nest; have = (:u, :c),
+            want = :__return__, bound = (; c = c_host))
+        native = kernel(u_host)
+        @test native ≈ sum((c_host .== 2) .* (u_host .+ 1.0))
+        ru = Reactant.to_rarray(u_host)
+        compiled = @compile kernel(ru)
+        @test Float64(compiled(ru)) ≈ native
     end
 
     @testset "source-derived functional state transition" begin
