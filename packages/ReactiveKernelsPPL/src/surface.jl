@@ -582,6 +582,16 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         # never also a derived column.
         r.scale isa ScalePredictorRef &&
             push!(used_locs, r.scale.predictor)
+        # Mixture component predictors absorb like locations (non-predictor
+        # slot names are not definitions — `_absorbed_skip` ignores them).
+        if r.family === MixtureFam
+            for l in r.mixture_locs
+                l isa Symbol && push!(used_locs, l)
+            end
+            for s in r.mixture_scales
+                s isa ScalePredictorRef && push!(used_locs, s.predictor)
+            end
+        end
     end
     # Kernel LP definitions absorb exactly like response locations.
     union!(used_locs, kernel_lp_predictors)
@@ -1014,6 +1024,9 @@ function _absorbed_skip(det, canonmap, responses, paramsyms, absorbed,
         refs = Set{Symbol}(paramsyms)
         for r in responses
             r.scale isa Symbol && push!(refs, r.scale)
+            for s in r.mixture_scales
+                s isa Symbol && push!(refs, s)
+            end
         end
         for (nm, _) in det
             nm in skip && continue
@@ -4005,6 +4018,8 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     call = _dot2call_response(lhs, dotted)
     weights, call = _peel_weighted(lhs, call, ctx)
     evidence, call = _peel_evidence(lhs, call, ctx)
+    call.args[1] === :MixtureModel && return _lower_mixture_response(lhs,
+        call, range, weights, evidence, ctx, predictors, pred_idx, coefuse)
     if call.args[1] in (:CategoricalLogit, :OrderedLogistic, :Ordinal,
             :Multinomial, :Categorical)
         return _lower_leveled_response(lhs, call, range, weights, evidence,
@@ -4018,6 +4033,339 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
         coefuse)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
         evidence, Symbol(lhs, "_resp"), trials, range)
+end
+
+# Run `thunk()`; on a surface failure, attribute it to mixture component
+# `k` (base messages already quote the response + repr — this adds the
+# index without doubling the response prefix).
+function _mixture_component_context(thunk, lhs, k::Int)
+    try
+        return thunk()
+    catch e
+        e isa SurfaceLoweringError || rethrow()
+        detail = e.message
+        prefix = "response $lhs: "
+        startswith(detail, prefix) &&
+            (detail = detail[length(prefix)+1:end])
+        _sfail("response $lhs: mixture component $k: $detail")
+    end
+end
+
+# `y .~ MixtureModel.([C1, ..., CK], w)` — K same-family univariate
+# components + mixing weights (SB `MixtureModel` mirror). Each component
+# lowers through the single-family base spelling (decomposed twin:
+# predictors wrapped, params/literals bare); locations route to predictors
+# (link-space) or scalar slots (sampled params / literals,
+# constrained-scale); weights are a literal vector or a simplex name.
+function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
+        predictors, pred_idx, coefuse)
+    label = Symbol(lhs, "_resp")
+    weights === nothing || _sfail("response $lhs: mixture responses take " *
+        "no frequency weights (v1 — `weighted.(...)` over a mixture is a " *
+        "follow-up)")
+    evidence.kind === :none || _sfail("response $lhs: mixture responses " *
+        "take no censoring/truncation evidence (v1)")
+    range === nothing || _sfail("response $lhs: mixture responses take no " *
+        "range (v1 — mixtures cover the whole column)")
+    args = _plain_args(call, "`MixtureModel`")
+    length(args) == 2 || _sfail("response $lhs: `MixtureModel` takes " *
+        "`MixtureModel.([C1, ..., CK], w)` (a component vector + weights)")
+    comps, wraw = args
+    comps isa Expr && comps.head === :vect || _sfail("response $lhs: " *
+        "`MixtureModel` components ride a vector literal " *
+        "(`[Normal.(mu1, s1), Normal.(mu2, s2)]`), got $(repr(comps))")
+    K = length(comps.args)
+    K >= 1 || _sfail("response $lhs: `MixtureModel` needs ≥ 1 component")
+    fams = LikelihoodFamily[]
+    llinks = LinkFunction[]
+    plinks = LinkFunction[]
+    locs_raw = Any[]
+    scales_raw = Any[]
+    trials_raw = Any[]
+    wrappeds = Bool[]
+    for (k, c) in enumerate(comps.args)
+        c isa Expr && c.head === :. && length(c.args) == 2 &&
+            c.args[1] isa Symbol || _sfail("response $lhs: mixture " *
+            "component $k is not a distribution call " *
+            "(`Normal.(mu, sigma)`), got $(repr(c))")
+        lowered = _mixture_component_context(lhs, k) do
+            compcall = _mixture_dot2call(lhs, _desugar_fused_head(lhs, c))
+            _lower_mixture_component(lhs, compcall, ctx)
+        end
+        fam, ll, pl, loc, sc, tr, wrapped = lowered
+        push!(fams, fam)
+        push!(llinks, ll)
+        push!(plinks, pl)
+        push!(locs_raw, loc)
+        push!(scales_raw, sc)
+        push!(trials_raw, tr)
+        push!(wrappeds, wrapped)
+    end
+    f = fams[1]
+    all(==(f), fams) || _sfail("response $lhs: mixture components must " *
+        "share one family (found $(join(unique!(string.(fams)), ", "))); " *
+        "heterogeneous mixtures are not supported)")
+    f in _MIXTURE_V1_FAMILIES || _sfail("response $lhs: mixture " *
+        "components over $f are not admitted in v1 (admitted: Normal, " *
+        "Bernoulli-logit, Poisson-log, Binomial-logit, " *
+        "NegativeBinomial2-log, Gamma-log, Beta-logit)")
+    ll, pl = llinks[1], plinks[1]
+    trials = nothing
+    if f === BinomialLogitFam
+        t1 = trials_raw[1]
+        all(t -> isequal(t, t1), trials_raw) || _sfail("response $lhs: " *
+            "mixture Binomial components must share one identical " *
+            "trial-count expression (SB rule — share one column)")
+        trials = t1
+    end
+    loc_uses = Union{Symbol,Real}[
+        _lower_mixture_loc(lhs, k, loc, pl, wrappeds[k], ctx, predictors,
+            pred_idx, coefuse) for (k, loc) in enumerate(locs_raw)]
+    scale_uses = Union{Nothing,Symbol,Real,ScalePredictorRef}[]
+    for (k, sc) in enumerate(scales_raw)
+        lowered_sc = _mixture_component_context(lhs, k) do
+            _lower_scale_use(lhs, sc, ctx, predictors, pred_idx, coefuse)
+        end
+        push!(scale_uses, lowered_sc)
+    end
+    w = _lower_mixture_weights(lhs, wraw)
+    prednames = Set{Symbol}(p.name for p in predictors)
+    anchor = _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
+    return LikelihoodSpec(MixtureFam, ll, lhs, anchor, nothing, weights,
+        evidence, label, trials, range; mixture_family = f,
+        mixture_locs = loc_uses, mixture_scales = scale_uses,
+        mixture_weights = w)
+end
+
+# Dotted→call conversion for one mixture component: like
+# `_dot2call_response`, but nested link positions tolerate bare means (a
+# bare Symbol/Real passes through; dotted links convert exactly as in
+# single-family). Bare detection happens downstream in
+# `_lower_mixture_component`.
+function _mixture_dot2call(lhs, rhs::Expr)
+    rhs isa Expr && rhs.head === :. ||
+        return _dot2call_object_error(lhs, rhs)
+    length(rhs.args) == 2 && rhs.args[1] isa Symbol &&
+        rhs.args[2] isa Expr && rhs.args[2].head === :tuple ||
+        _sfail("response $lhs: malformed dotted object $(repr(rhs)) " *
+               "(`Normal.(mu, sigma)` — no field access, no keywords)")
+    targs = rhs.args[2].args
+    any(a -> a isa Expr && a.head === :parameters, targs) && _sfail(
+        "response $lhs: dotted objects take positional arguments " *
+        "only (no keywords)")
+    f = rhs.args[1]
+    return Expr(:call, f,
+        (_mixture_spine_arg(lhs, f, i, a) for (i, a) in enumerate(targs))...)
+end
+
+function _mixture_spine_arg(lhs, f, i, a)
+    link_pos = ((f === :Bernoulli || f === :Poisson) && i == 1) ||
+        (f === :Binomial && i == 2) ||
+        (f === :NegativeBinomial2 && i == 1)
+    link_pos || return a
+    a isa Expr && a.head === :. || return a # A bare mean passes through.
+    return _dot2call_nested_link(lhs, a, f)
+end
+
+# One mixture component: the single-family base spelling, plus bare
+# params/literals (constrained-scale, no link inversion). Wrapped
+# positions route through `_lower_response_base` (identical behavior +
+# messages); bare positions construct directly. Normal (identity link)
+# always routes through base with `wrapped` marking the predictor-bound
+# shape instead. Returns the base 6-tuple plus `wrapped`.
+function _lower_mixture_component(lhs, compcall::Expr, ctx)
+    head = compcall.args[1]
+    head isa Symbol || _sfail("response $lhs: malformed mixture " *
+        "component $(repr(compcall))")
+    if head === :Normal
+        # Identity link: link-space is constrained-space, so predictors,
+        # params, and literals share the position — `wrapped` marks the
+        # predictor-bound shape (definition or inline expression), which
+        # is what the location strictness actually gates on.
+        fam, ll, pl, loc, sc, tr = _lower_response_base(lhs, compcall, ctx)
+        w = !(loc isa Real || (loc isa Symbol && loc in ctx.prior_names))
+        return fam, ll, pl, loc, sc, tr, w
+    elseif head === :Bernoulli
+        args = _plain_args(compcall, "`Bernoulli`")
+        if length(args) == 1 && (args[1] isa Symbol || args[1] isa Real)
+            return BernoulliLogitFam, LogitLink, IdentityLink, args[1],
+            nothing, nothing, false
+        end
+    elseif head === :Poisson
+        args = _plain_args(compcall, "`Poisson`")
+        if length(args) == 1 && (args[1] isa Symbol || args[1] isa Real)
+            return PoissonLogFam, LogLink, LogLink, args[1], nothing,
+            nothing, false
+        end
+    elseif head === :Binomial
+        args = _plain_args(compcall, "`Binomial`")
+        if length(args) == 2 && (args[2] isa Symbol || args[2] isa Real)
+            return BinomialLogitFam, LogitLink, IdentityLink, args[2],
+            nothing, _lower_trials(lhs, args[1], ctx), false
+        end
+    elseif head === :NegativeBinomial2
+        args = _plain_args(compcall, "`NegativeBinomial2`")
+        if length(args) == 2 && (args[1] isa Symbol || args[1] isa Real)
+            return NegativeBinomial2Fam, LogLink, LogLink, args[1], args[2],
+            nothing, false
+        end
+    elseif head === :Gamma
+        bare = _match_bare_gamma(lhs, compcall)
+        bare !== nothing &&
+            return GammaLogFam, LogLink, LogLink, bare[1], bare[2],
+            nothing, false
+    elseif head === :Beta
+        bare = _match_bare_beta(lhs, compcall)
+        bare !== nothing &&
+            return BetaLogitFam, LogitLink, IdentityLink, bare[1], bare[2],
+            nothing, false
+    end
+    fam, ll, pl, loc, sc, tr = _lower_response_base(lhs, compcall, ctx)
+    return fam, ll, pl, loc, sc, tr, true
+end
+
+# A bare-mean Gamma shape (`Gamma.(alpha, mean ./ alpha)` with a bare
+# `mean`): `(mean, alpha)` or `nothing` (wrapped means and malformed
+# shapes fall through to the strict base path).
+function _match_bare_gamma(lhs, compcall::Expr)
+    args = _plain_args(compcall, "`Gamma`")
+    length(args) == 2 || return nothing
+    a1, div = args
+    div isa Expr && div.head === :call && length(div.args) == 3 &&
+        div.args[1] === Symbol("./") || return nothing
+    X, a = div.args[2], div.args[3]
+    (X isa Symbol || X isa Real) || return nothing
+    _same_aux(a1, a) || return nothing
+    return X, a1
+end
+
+# A bare-mean Beta shape (`Beta.(mu .* k, (1 .- mu) .* k)` with a bare
+# `mu`): `(mu, kappa)` or `nothing` (wrapped means and malformed shapes
+# fall through to the strict base path).
+function _match_bare_beta(lhs, compcall::Expr)
+    args = _plain_args(compcall, "`Beta`")
+    length(args) == 2 || return nothing
+    a1, a2 = args
+    a1 isa Expr && a1.head === :call && length(a1.args) == 3 &&
+        a1.args[1] === Symbol(".*") || return nothing
+    a2 isa Expr && a2.head === :call && length(a2.args) == 3 &&
+        a2.args[1] === Symbol(".*") || return nothing
+    c = a2.args[2]
+    c isa Expr && c.head === :call && length(c.args) == 3 &&
+        c.args[1] === Symbol(".-") && c.args[2] == 1 || return nothing
+    m1, k1 = a1.args[2], a1.args[3]
+    m2, k2 = c.args[3], a2.args[3]
+    m1 == m2 || return nothing
+    (m1 isa Symbol || m1 isa Real) || return nothing
+    _same_aux(k1, k2) || return nothing
+    return m1, k1
+end
+
+# One mixture location: a vector predictor definition (or inline affine)
+# lowers to a predictor (link-space; shared definitions intern by name
+# like CategoricalLogit etas); a sampled scalar parameter or numeric
+# literal rides scalar (constrained-scale). Link wrappers apply to
+# predictors only (a wrapped param/literal fails); bare predictors fail
+# (link-space predictors wrap). Scan/latent/matrix/data columns fail
+# closed (data wraps in an offset-only predictor first).
+function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
+        predictors, pred_idx, coefuse)
+    if loc isa Bool
+        _sfail("response $lhs: mixture component $k location is Boolean " *
+               "— locations are numeric")
+    elseif loc isa Real
+        wrapped && _sfail("response $lhs: mixture component $k wraps a " *
+            "literal in a link function — link wrappers apply to " *
+            "predictors (spell literals constrained-scale)")
+        return loc
+    elseif loc isa Symbol
+        loc in ctx.scan_states && _sfail("response $lhs: mixture " *
+            "component $k location is a scan state — scan-state mixture " *
+            "locations are a follow-up")
+        loc in ctx.plate_names && _sfail("response $lhs: mixture " *
+            "component $k location is a per-cell latent — latent mixture " *
+            "locations are a follow-up")
+        haskey(ctx.matrices, loc) && _sfail("response $lhs: mixture " *
+            "component $k location $loc is a design matrix — locations " *
+            "are predictors, sampled parameters, or literals")
+        if loc in ctx.vecdefs && haskey(ctx.detmap, loc)
+            wrapped || _sfail("response $lhs: mixture component $k " *
+                "location $loc is a predictor — link-space predictors " *
+                "wrap (`Poisson.(exp.(eta))`); bare slots are sampled " *
+                "parameters or literals")
+            _derived_reads_latent(loc, ctx) &&
+                !_is_design_shaped(loc, ctx) && _sfail("response $lhs: " *
+                "mixture component $k location reads a latent — latent " *
+                "mixture locations are a follow-up")
+            return _lower_location(lhs, loc, pred_link, ctx, predictors,
+                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"))
+        end
+        haskey(ctx.detmap, loc) && _sfail("response $lhs: mixture " *
+            "component $k location $loc is a scalar definition — v1 " *
+            "locations are predictors, sampled parameters, or literals")
+        if loc in ctx.prior_names
+            wrapped && _sfail("response $lhs: mixture component $k " *
+                "wraps the sampled parameter $loc in a link function — " *
+                "link wrappers apply to predictors (spell sampled " *
+                "parameters bare, constrained-scale)")
+            return loc
+        end
+        loc in ctx.data && _sfail("response $lhs: mixture component $k " *
+            "location is the data column $loc — wrap it in a predictor " *
+            "(`eta = a .+ b .* $loc`, or offset-only `mu = $loc`)")
+        _sfail("response $lhs: mixture component $k location $loc is not " *
+               "a predictor definition, sampled parameter, or literal")
+    else
+        wrapped || _sfail("response $lhs: mixture component $k location " *
+            "is an inline expression — inline locations lower as " *
+            "predictors, so link-space expressions wrap " *
+            "(`Poisson.(exp.(eta))`); bare slots are sampled parameters " *
+            "or literals")
+        # An inline link-space expression: a synthetic predictor, the
+        # CategoricalLogit-eta precedent.
+        return _lower_location(lhs, loc, pred_link, ctx, predictors,
+            pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"))
+    end
+end
+
+# Mixture weights: a literal numeric vector or a simplex parameter name
+# (length/sum/concentration checked at contract — structural, normative).
+function _lower_mixture_weights(lhs, wraw)
+    wraw isa Symbol && return wraw
+    wraw isa Expr && wraw.head === :vect || _sfail("response $lhs: " *
+        "mixture weights are a literal vector (`[0.4, 0.6]`) or a " *
+        "simplex parameter name, got $(repr(wraw))")
+    for (j, e) in enumerate(wraw.args)
+        e isa Real && !(e isa Bool) || _sfail("response $lhs: mixture " *
+            "weight $j is not a numeric literal (got $(repr(e)))")
+    end
+    return Float64.(wraw.args)
+end
+
+# The mixture anchor (the non-nullable `predictor` slot): first location
+# predictor, else first scale predictor, else the weights simplex name,
+# else the first location/scale parameter name — the BRM struct order,
+# verbatim. Fully-fixed mixtures fail closed before anchoring.
+function _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
+    for loc in loc_uses
+        loc isa Symbol && loc in prednames && return loc
+    end
+    for s in scale_uses
+        s isa ScalePredictorRef && return s.predictor
+    end
+    w isa Symbol && return w
+    for loc in loc_uses
+        loc isa Symbol && loc in ctx.prior_names && return loc
+    end
+    for s in scale_uses
+        s isa Symbol && s in ctx.prior_names && return s
+    end
+    for s in scale_uses
+        s isa Symbol && return s # A data-column scale: opaque anchor, never resolved.
+    end
+    _sfail("response $lhs: fully-fixed mixture (all literals) is a " *
+        "constant density with no plan — leave at least one slot free " *
+        "or drop the response")
 end
 
 const _LEVELED_FAMS =
@@ -4691,7 +5039,8 @@ function _lower_response_base_error(lhs, rhs, fam)
                   "NegativeBinomial2, Gamma, Beta, BernoulliLogit, " *
                   "PoissonLog, BinomialLogit, NegativeBinomial2Log, " *
                   "GammaLog, BetaLogit, CategoricalLogit, " *
-                  "OrderedLogistic, Ordinal, Multinomial, Categorical). " *
+                  "OrderedLogistic, Ordinal, Multinomial, Categorical, " *
+                  "MixtureModel). " *
                   "When `$fam` is a defined RKPPLSubmodel, a latent uses " *
                   "`latent ~ $fam(...)` and an observation stream uses plain " *
                   "`$lhs ~ $fam(...)` (the whole-column vectorized callee); " *

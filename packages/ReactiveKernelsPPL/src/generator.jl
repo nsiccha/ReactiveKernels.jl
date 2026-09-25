@@ -932,12 +932,167 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _categorical_plain_plate_stmts(r, plan, node, pw)
     elseif r.family === MvNormalCholeskyFam
         return _mvn_cholesky_plate_stmts(r, plan, node, pw)
+    elseif r.family === MixtureFam
+        return _mixture_plate_stmts(r, plan, node, pw)
     elseif _is_glm_family(r.family)
         return _glm_object_stmts(r, plan, node, pw)
     else
         throw(ContractValidationError(
             "[generator] response family $(r.family) has no emitter"))
     end
+end
+
+# Finite-mixture likelihood (SB `MixtureModel` mirror): K same-family
+# components over dedicated slots lower to ONE plate; each row contributes
+# the max-shifted log-sum-exp over `logw_k + lpdf_k` (categorical-plate
+# precedent: linear in K). Predictor locations ride their LP nodes
+# (link-space, inverted per the component link like the single-family
+# builders); sampled params thread scalar (broadcast) and literals inline
+# (both constrained-scale, no inversion). K=1 uses the general form
+# (exact: m=t1, log(exp(0))=0).
+function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        node::Symbol, pw::Symbol)
+    f = r.mixture_family
+    K = length(r.mixture_locs)
+    y = r.response
+    inputs = Any[y]
+    yv = _dovar(1)
+    pre = Expr[]
+    # Bernoulli widths: validated Bool-or-0/1-Int; the endpoint takes Bool.
+    yref = yv
+    if f === BernoulliLogitFam
+        col = plan.columns[y]
+        yref = eltype(col) === Bool ? yv : :($yv != 0)
+    end
+    # Binomial trials are shared across components: one threaded use.
+    nref = nothing
+    if f === BinomialLogitFam
+        nref = _thread_ref!(inputs, r.trials, true)
+    end
+    # Weights: literals fold at codegen; a simplex parameter binds one
+    # log-vector hoisted out of the plate, threaded by `Ref` (the
+    # multinomial-plate precedent — plate cells cannot capture body
+   # locals) — K logs, not n×K.
+    w = r.mixture_weights
+    logw_lit = w isa Vector ? log.(w) : nothing
+    lwv = nothing
+    if w isa Symbol
+        logp = _logp_name(r.label)
+        push!(pre, :($logp::AbstractVector{Float64} = log.($w)))
+        push!(inputs, :(Ref($logp)))
+        lwv = _dovar(length(inputs))
+    end
+    terms = Expr[]
+    for k in 1:K
+        klab = Symbol(r.label, :_mix, k)
+        locref, is_lp = _mixture_loc_ref(r, plan, k)
+        lpdf = _mixture_component_lpdf(f, r, plan, pre, inputs, k, klab,
+            locref, is_lp, yv, yref, nref)
+        logw_k = logw_lit === nothing ? :($lwv[$k]) : logw_lit[k]
+        push!(terms, :($logw_k + $lpdf))
+    end
+    m = terms[1]
+    for t in terms[2:end]
+        m = :(max($m, $t))
+    end
+    sumexp = :(exp($(terms[1]) - $m))
+    for t in terms[2:end]
+        sumexp = :($sumexp + exp($t - $m))
+    end
+    cell = :($m + log($sumexp))
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# One mixture location slot → `(ref, is_lp)`: a predictor yields its LP
+# node (link-space); a sampled parameter yields its name (threaded scalar
+# at the use site); a literal yields its Float64 (inlined). Threading
+# happens at the use site via `_thread_ref!`, never here: pre-statements
+# need layout-legal refs (nodes, params, literals), not plate do-vars.
+function _mixture_loc_ref(r::LikelihoodSpec, plan::StructuralPlan, k::Int)
+    loc = r.mixture_locs[k]
+    loc isa Real && return Float64(loc), false
+    if any(p -> p.name === loc, plan.predictors)
+        return _lp_name(_predictor(plan, loc)), true
+    end
+    return loc, false
+end
+
+# One mixture component's scalar log-density: the single-family endpoint
+# spelling over that component's slots (per-component precompute labels).
+function _mixture_component_lpdf(f::LikelihoodFamily, r::LikelihoodSpec,
+        plan::StructuralPlan, pre::Vector{Expr}, inputs::Vector{Any}, k::Int,
+        klab::Symbol, locref, is_lp::Bool, yv::Symbol, yref, nref)
+    if f === GaussianFam
+        sarg = _scale_use_plate_arg(r, plan, pre, r.mixture_scales[k], klab)
+        locv = _thread_ref!(inputs, locref)
+        sref = _thread_ref!(inputs, sarg)
+        return :(normal($locv, $sref).logpdf($yv))
+    elseif f === BernoulliLogitFam
+        if is_lp
+            etav = _thread_ref!(inputs, locref)
+            return :(bernoulli(; logit = $etav).logpdf($yref))
+        end
+        p = _thread_ref!(inputs, locref)
+        return :(bernoulli($p).logpdf($yref))
+    elseif f === PoissonLogFam
+        if is_lp
+            etav = _thread_ref!(inputs, locref)
+            return :(poisson(; log_rate = $etav).logpdf($yv))
+        end
+        rate = _thread_ref!(inputs, locref)
+        return :(poisson($rate).logpdf($yv))
+    elseif f === BinomialLogitFam
+        if is_lp
+            etav = _thread_ref!(inputs, locref)
+            return :(binomial(; n = $nref, logit = $etav).logpdf($yv))
+        end
+        p = _thread_ref!(inputs, locref)
+        return :(binomial($nref, $p).logpdf($yv))
+    elseif f === NegativeBinomial2Fam
+        sarg = _scale_use_plate_arg(r, plan, pre, r.mixture_scales[k], klab)
+        muv = if is_lp
+            mu = _mu_name(klab)
+            push!(pre, :($mu = exp.($locref)))
+            _thread_ref!(inputs, mu)
+        else
+            _thread_ref!(inputs, locref)
+        end
+        phiref = _thread_ref!(inputs, sarg)
+        return :(negative_binomial2($muv, $phiref).logpdf($yv))
+    elseif f === GammaLogFam
+        sarg = _scale_use_plate_arg(r, plan, pre, r.mixture_scales[k], klab)
+        # Surface is Distributions-SCALE `Gamma(alpha, mu/alpha)`; the
+        # kernel takes rate, so the boundary inverts (the Gamma-plate
+        # precedent).
+        av = sarg isa Symbol ? sarg : Float64(sarg)
+        rate = _rate_name(klab)
+        if is_lp
+            push!(pre, :($rate = $av ./ exp.($locref)))
+        else
+            push!(pre, :($rate = $av ./ $locref))
+        end
+        ratev = _thread_ref!(inputs, rate)
+        aref = _thread_ref!(inputs, sarg)
+        return :(gamma($aref, $ratev).logpdf($yv))
+    elseif f === BetaLogitFam
+        sarg = _scale_use_plate_arg(r, plan, pre, r.mixture_scales[k], klab)
+        kap = sarg isa Symbol ? sarg : Float64(sarg)
+        mu = _mu_name(klab)
+        muhandle = locref
+        if is_lp
+            push!(pre, :($mu = 1 ./ (1 .+ exp.(-$locref))))
+            muhandle = mu
+        end
+        a = _shape_a_name(klab)
+        b = _shape_b_name(klab)
+        push!(pre, :($a = $muhandle .* $kap))
+        push!(pre, :($b = (1 .- $muhandle) .* $kap))
+        avv = _thread_ref!(inputs, a)
+        bvv = _thread_ref!(inputs, b)
+        return :(beta($avv, $bvv).logpdf($yv))
+    end
+    throw(ContractValidationError(
+        "[generator] mixture over $f has no cell emitter"))
 end
 
 # A GLM-object response: one fused constructed-endpoint application
@@ -1247,11 +1402,19 @@ end
 _sc_name(label::Symbol) = Symbol(:_ppl_sc_, label)
 
 function _scale_plate_arg(r::LikelihoodSpec, plan::StructuralPlan, pre::Vector{Expr})
-    s = r.scale
+    return _scale_use_plate_arg(r, plan, pre, r.scale, r.label)
+end
+
+# One scale-slot use over a likelihood plate: scalar scales pass through
+# untouched; a predictor-fed scale binds its constrained vector once
+# (`_ppl_sc_<label>`) and the plate iterates the node. Mixture
+# components pass their own use + per-component label.
+function _scale_use_plate_arg(r::LikelihoodSpec, plan::StructuralPlan,
+        pre::Vector{Expr}, s, label::Symbol)
     s isa ScalePredictorRef || return s
     pred = _predictor(plan, s.predictor)
     lp = _lp_name(pred)
-    sc = _sc_name(r.label)
+    sc = _sc_name(label)
     rhs = if s.link === IdentityLink
         lp
     elseif s.link === LogLink
