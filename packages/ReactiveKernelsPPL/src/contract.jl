@@ -66,8 +66,10 @@ end
 families (categorical / ordinal / multinomial): reference-coded
 multi-logit categorical, cumulative-logit ordinal with ordered cutpoints,
 general typed ordinal (2 structures × 3 links), shared-simplex multinomial
-over a count matrix, plain categorical over simplex probabilities, and the
-joint correlated-outcomes family (per-row MvNormal over a Cholesky factor)."""
+over a count matrix, plain categorical over simplex probabilities, the
+joint correlated-outcomes family (per-row MvNormal over a Cholesky factor),
+and the finite-mixture family (per-row log-sum-exp over K same-family
+univariate components, SB `MixtureModel` mirror)."""
 @enum LikelihoodFamily::UInt8 begin
     GaussianFam
     BernoulliLogitFam
@@ -93,6 +95,7 @@ joint correlated-outcomes family (per-row MvNormal over a Cholesky factor)."""
     NormalIDGLMFam
     BernoulliLogitGLMFam
     PoissonLogGLMFam
+    MixtureFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -250,6 +253,35 @@ leaves them at their defaults:
 - `glm_beta`: the coefficient-vector parameter (one element per matrix
   column — the matrix is intercept-free, the generator prepends the
   ones column and `alpha`), `nothing` otherwise.
+
+Finite-mixture responses (`MixtureFam`, SB `y ~ MixtureModel(comps, w)`
+mirror) carry K same-family univariate components in the trailing
+mixture fields, built with keywords; every other family leaves them at
+their defaults:
+
+- `mixture_family`: the shared component family (v1: Gaussian/identity,
+  Bernoulli-logit, Poisson-log, Binomial-logit, NB2-log, Gamma-log,
+  Beta-logit), `nothing` otherwise.
+- `mixture_locs`: per-component location uses, length K (K ≥ 1): each a
+  predictor name (link-space, inverted per the component link), a sampled
+  scalar parameter name, or a numeric literal (both constrained-scale, no
+  inversion). Empty otherwise.
+- `mixture_scales`: per-component scale uses, length K: each the
+  component's `scale`-slot use (`nothing`, parameter/assignment name,
+  literal, per-observation column, or [`ScalePredictorRef`](@ref)) —
+  required exactly when the component family takes a scale auxiliary.
+  Empty otherwise.
+- `mixture_weights`: the length-K mixing weights: a literal
+  `Vector{Float64}` (finite, nonnegative, sums to 1) or a
+  `:simplex_dirichlet` [`VectorParameter`](@ref) name, `nothing`
+  otherwise.
+
+`predictor` is an anchor only (first location predictor, else first
+scale predictor, else the weights simplex name, else the first
+location/scale parameter name — fully-fixed mixtures fail closed before
+anchoring); `scale` is `nothing`. Mixture widths are structural
+(K = `length(mixture_locs)`): no `n_levels`, no bind-time size
+inference. Binomial components share one `trials`.
 """
 struct LikelihoodSpec
     family::LikelihoodFamily
@@ -275,6 +307,10 @@ struct LikelihoodSpec
     factor_corr::Union{Nothing,ParamName}
     glm_alpha::Union{Nothing,ParamName}
     glm_beta::Union{Nothing,ParamName}
+    mixture_family::Union{Nothing,LikelihoodFamily}
+    mixture_locs::Vector{Union{Symbol,Real}}
+    mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
+    mixture_weights::Union{Nothing,Symbol,Vector{Float64}}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
@@ -300,12 +336,18 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         factor_scales::Union{Nothing,ParamName} = nothing,
         factor_corr::Union{Nothing,ParamName} = nothing,
         glm_alpha::Union{Nothing,ParamName} = nothing,
-        glm_beta::Union{Nothing,ParamName} = nothing)
+        glm_beta::Union{Nothing,ParamName} = nothing,
+        mixture_family::Union{Nothing,LikelihoodFamily} = nothing,
+        mixture_locs::Vector{Union{Symbol,Real}} = Union{Symbol,Real}[],
+        mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}} =
+            Union{Nothing,Symbol,Real,ScalePredictorRef}[],
+        mixture_weights::Union{Nothing,Symbol,Vector{Float64}} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
         threshold_columns, threshold_coefs, extra_responses, factor_scales,
-        factor_corr, glm_alpha, glm_beta)
+        factor_corr, glm_alpha, glm_beta, mixture_family, mixture_locs,
+        mixture_scales, mixture_weights)
 end
 
 """
@@ -1573,7 +1615,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
-    PoissonLogGLMFam)
+    PoissonLogGLMFam, MixtureFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -2061,6 +2103,12 @@ function _response_uses_predictor(r::LikelihoodSpec, pname::Symbol)
     pname in r.extra_predictors && return true
     r.scale isa ScalePredictorRef && r.scale.predictor === pname &&
         return true
+    # Mixture slots ride dedicated fields (the anchor may name a
+    # parameter, and non-anchor component predictors live in the slots).
+    pname in r.mixture_locs && return true
+    for s in r.mixture_scales
+        s isa ScalePredictorRef && s.predictor === pname && return true
+    end
     return false
 end
 
@@ -4356,6 +4404,12 @@ function _validate_vector_parameters(plan::StructuralPlan)
                 haskey(refs, f) && push!(refs[f], r.label)
             end
         end
+        # A mixture response links its weights simplex the same way (a
+        # literal-weights mixture links nothing).
+        if r.family === MixtureFam && r.mixture_weights isa Symbol
+            haskey(refs, r.mixture_weights) &&
+                push!(refs[r.mixture_weights], r.label)
+        end
     end
     for pred in plan.predictors, t in pred.terms
         (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) || continue
@@ -5225,6 +5279,14 @@ function _validate_unleveled_fields(r::LikelihoodSpec)
         _fail(r.label, "only joint MvNormalCholesky takes factor_scales")
     r.factor_corr === nothing ||
         _fail(r.label, "only joint MvNormalCholesky takes factor_corr")
+    r.mixture_family === nothing ||
+        _fail(r.label, "only Mixture takes mixture_family")
+    isempty(r.mixture_locs) ||
+        _fail(r.label, "only Mixture takes mixture_locs")
+    isempty(r.mixture_scales) ||
+        _fail(r.label, "only Mixture takes mixture_scales")
+    r.mixture_weights === nothing ||
+        _fail(r.label, "only Mixture takes mixture_weights")
     return nothing
 end
 
@@ -5272,6 +5334,14 @@ function _validate_categorical_fields(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "CategoricalLogit takes no factor_scales")
     r.factor_corr === nothing ||
         _fail(r.label, "CategoricalLogit takes no factor_corr")
+    r.mixture_family === nothing ||
+        _fail(r.label, "CategoricalLogit takes no mixture_family")
+    isempty(r.mixture_locs) ||
+        _fail(r.label, "CategoricalLogit takes no mixture_locs")
+    isempty(r.mixture_scales) ||
+        _fail(r.label, "CategoricalLogit takes no mixture_scales")
+    r.mixture_weights === nothing ||
+        _fail(r.label, "CategoricalLogit takes no mixture_weights")
     return nothing
 end
 
@@ -5317,6 +5387,14 @@ function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "an ordered response takes no factor_scales")
     r.factor_corr === nothing ||
         _fail(r.label, "an ordered response takes no factor_corr")
+    r.mixture_family === nothing ||
+        _fail(r.label, "an ordered response takes no mixture_family")
+    isempty(r.mixture_locs) ||
+        _fail(r.label, "an ordered response takes no mixture_locs")
+    isempty(r.mixture_scales) ||
+        _fail(r.label, "an ordered response takes no mixture_scales")
+    r.mixture_weights === nothing ||
+        _fail(r.label, "an ordered response takes no mixture_weights")
     _validate_ordinal_extras(r, plan, used_predictors)
     return nothing
 end
@@ -5419,6 +5497,14 @@ function _validate_simplex_response(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "a simplex response takes no factor_scales")
     r.factor_corr === nothing ||
         _fail(r.label, "a simplex response takes no factor_corr")
+    r.mixture_family === nothing ||
+        _fail(r.label, "a simplex response takes no mixture_family")
+    isempty(r.mixture_locs) ||
+        _fail(r.label, "a simplex response takes no mixture_locs")
+    isempty(r.mixture_scales) ||
+        _fail(r.label, "a simplex response takes no mixture_scales")
+    r.mixture_weights === nothing ||
+        _fail(r.label, "a simplex response takes no mixture_weights")
     if r.family === MultinomialFam
         all_count = [r.response; r.count_columns...]
         length(unique(all_count)) == length(all_count) ||
@@ -5518,6 +5604,14 @@ function _validate_joint_response(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "a joint response takes no threshold_columns")
     r.threshold_coefs === nothing ||
         _fail(r.label, "a joint response takes no threshold_coefs")
+    r.mixture_family === nothing ||
+        _fail(r.label, "a joint response takes no mixture_family")
+    isempty(r.mixture_locs) ||
+        _fail(r.label, "a joint response takes no mixture_locs")
+    isempty(r.mixture_scales) ||
+        _fail(r.label, "a joint response takes no mixture_scales")
+    r.mixture_weights === nothing ||
+        _fail(r.label, "a joint response takes no mixture_weights")
     r.trials === nothing ||
         _fail(r.label, "a joint response takes no trials")
     r.weights === nothing ||
@@ -5577,6 +5671,14 @@ function _validate_glm_response(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "a GLM-object response takes no factor_scales")
     r.factor_corr === nothing ||
         _fail(r.label, "a GLM-object response takes no factor_corr")
+    r.mixture_family === nothing ||
+        _fail(r.label, "a GLM-object response takes no mixture_family")
+    isempty(r.mixture_locs) ||
+        _fail(r.label, "a GLM-object response takes no mixture_locs")
+    isempty(r.mixture_scales) ||
+        _fail(r.label, "a GLM-object response takes no mixture_scales")
+    r.mixture_weights === nothing ||
+        _fail(r.label, "a GLM-object response takes no mixture_weights")
     r.trials === nothing ||
         _fail(r.label, "a GLM-object response takes no trials")
     r.weights === nothing ||
@@ -5585,6 +5687,199 @@ function _validate_glm_response(r::LikelihoodSpec, plan::StructuralPlan)
     r.range === nothing ||
         _fail(r.label, "a GLM-object response takes no range " *
             "(ranged responses stay on the predictor path)")
+    return nothing
+end
+
+# Finite-mixture component families admitted in v1 (the D3/slice-2 scalar
+# families under their primary link; probit/cloglog are follow-ups).
+const _MIXTURE_V1_FAMILIES = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
+    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam, BetaLogitFam)
+
+_mixture_canon_link(f::LikelihoodFamily) =
+    f === GaussianFam ? IdentityLink :
+    f === BernoulliLogitFam ? LogitLink :
+    f === PoissonLogFam ? LogLink :
+    f === BinomialLogitFam ? LogitLink :
+    f === NegativeBinomial2Fam ? LogLink :
+    f === GammaLogFam ? LogLink :
+    f === BetaLogitFam ? LogitLink :
+    throw(ContractValidationError("internal: mixture link for $f unresolved"))
+
+# A literal component location: finite, and inside the family's
+# constrained domain (bare params/literals skip link inversion, so the
+# value itself must be valid — the SB runtime-domain mirror).
+function _validate_mixture_literal_loc(r::LikelihoodSpec, f::LikelihoodFamily,
+        k::Int, v::Real)
+    v isa Bool && _fail(r.label,
+        "mixture component $k location is Boolean — locations are numeric")
+    isfinite(v) || _fail(r.label,
+        "mixture component $k location must be finite")
+    if f === BernoulliLogitFam || f === BinomialLogitFam
+        (0 <= v <= 1) || _fail(r.label,
+            "mixture component $k location $v is not a probability " *
+            "(bare Bernoulli/Binomial locations are constrained-scale)")
+    elseif f === PoissonLogFam || f === NegativeBinomial2Fam
+        v >= 0 || _fail(r.label,
+            "mixture component $k location $v is negative " *
+            "(bare Poisson/NB2 locations are constrained-scale means)")
+    elseif f === GammaLogFam
+        v > 0 || _fail(r.label,
+            "mixture component $k location $v is not positive " *
+            "(bare Gamma locations are constrained-scale means)")
+    elseif f === BetaLogitFam
+        (0 < v < 1) || _fail(r.label,
+            "mixture component $k location $v is not inside (0, 1) " *
+            "(bare Beta locations are constrained-scale means)")
+    end
+    return nothing
+end
+
+# A finite-mixture response (SB `y ~ MixtureModel(comps, w)` mirror):
+# K same-family components over dedicated slots, validated whole. The
+# anchor in `predictor` is never resolved here (it may name a
+# parameter); component predictors join `used_predictors` like any
+# location/scale predictor. Sharing one predictor across components is
+# unambiguous and admitted; fully-fixed mixtures fail closed (a
+# constant density has no plan).
+function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
+        used_predictors::Set{Symbol})
+    f = r.mixture_family
+    f === nothing && _fail(r.label,
+        "a mixture response requires its mixture_family")
+    f in _MIXTURE_V1_FAMILIES || _fail(r.label,
+        "mixture components over $f are not admitted in v1 (admitted: " *
+        "Gaussian/identity, Bernoulli-logit, Poisson-log, Binomial-logit, " *
+        "NB2-log, Gamma-log, Beta-logit)")
+    r.link === _mixture_canon_link(f) || _fail(r.label,
+        "a mixture response carries its components' canonical link " *
+        "(got $(r.link) for $f)")
+    K = length(r.mixture_locs)
+    K >= 1 || _fail(r.label, "a mixture response needs ≥ 1 component")
+    length(r.mixture_scales) == K || _fail(r.label,
+        "mixture has $K locations but $(length(r.mixture_scales)) scales " *
+        "(one scale slot per component)")
+    loc_preds = Symbol[]
+    for (k, loc) in enumerate(r.mixture_locs)
+        if loc isa Real
+            _validate_mixture_literal_loc(r, f, k, loc)
+        elseif loc isa Symbol
+            i = findfirst(p -> p.name === loc, plan.predictors)
+            if i !== nothing
+                pred = plan.predictors[i]
+                (f, r.link, pred.link) in ADMITTED_TRIPLES || _fail(r.label,
+                    "mixture component $k link triple ($f, $(r.link), " *
+                    "$(pred.link)) not admitted")
+                push!(used_predictors, loc)
+                push!(loc_preds, loc)
+            elseif any(p -> p.name === loc, plan.parameters)
+                nothing # A sampled scalar parameter: constrained-scale, prior-owned.
+            elseif any(a -> a.name === loc, plan.assignments)
+                _fail(r.label, "mixture component $k location $loc is a " *
+                    "scalar assignment — v1 locations are predictors, " *
+                    "sampled parameters, or literals")
+            else
+                _fail(r.label, "mixture component $k location $loc is not " *
+                    "a predictor, sampled parameter, or literal")
+            end
+        else
+            _fail(r.label, "mixture component $k location has no lowering " *
+                "(predictor, sampled parameter, or literal)")
+        end
+    end
+    need = _scale_need(f)
+    for (k, s) in enumerate(r.mixture_scales)
+        if need === nothing
+            s === nothing || _fail(r.label,
+                "mixture component $k takes no scale auxiliary ($f " *
+                "components carry location only)")
+        else
+            s === nothing &&
+                _fail(r.label, "$need (mixture component $k)")
+        end
+        s isa Bool && _fail(r.label,
+            "mixture component $k scale is Boolean — scales are numeric")
+        _validate_scale_use(r, plan, s, "mixture component $k scale", f,
+            loc_preds)
+        s isa ScalePredictorRef && push!(used_predictors, s.predictor)
+    end
+    w = r.mixture_weights
+    w === nothing && _fail(r.label,
+        "a mixture response requires its mixture_weights (a literal " *
+        "length-K vector or a simplex parameter)")
+    if w isa Symbol
+        vi = findfirst(p -> p.name === w, plan.vector_parameters)
+        vi === nothing && _fail(r.label,
+            "mixture weights $w is not a vector parameter")
+        vp = plan.vector_parameters[vi]
+        vp.family === :simplex_dirichlet || _fail(r.label,
+            "mixture weights $w must be :simplex_dirichlet, got " *
+            "$(vp.family)")
+        length(vp.args.arg1) == K || _fail(r.label,
+            "mixture weights concentration length " *
+            "$(length(vp.args.arg1)) disagrees with the $K components")
+    else
+        length(w) == K || _fail(r.label,
+            "mixture has $K components but $(length(w)) weights")
+        all(isfinite, w) || _fail(r.label,
+            "mixture weights must be finite")
+        all(>=(0), w) || _fail(r.label,
+            "mixture weights must be nonnegative")
+        total = sum(w)
+        isapprox(total, 1.0; atol = 1e-8) || _fail(r.label,
+            "mixture weights must sum to 1 (got $total)")
+    end
+    r.scale === nothing ||
+        _fail(r.label, "a mixture response carries no top-level scale " *
+            "(scales ride the per-component mixture_scales)")
+    r.weights === nothing ||
+        _fail(r.label, "mixture responses take no frequency weights (v1)")
+    r.evidence.kind === :none ||
+        _fail(r.label, "mixture responses take no censoring/truncation " *
+            "evidence (v1)")
+    r.range === nothing ||
+        _fail(r.label, "mixture responses take no range (v1)")
+    r.n_levels === nothing ||
+        _fail(r.label,
+            "a mixture response takes no n_levels (widths are structural)")
+    r.thresholds === nothing ||
+        _fail(r.label, "a mixture response takes no thresholds")
+    isempty(r.extra_predictors) ||
+        _fail(r.label, "a mixture response takes no extra_predictors " *
+            "(locations ride mixture_locs)")
+    isempty(r.count_columns) ||
+        _fail(r.label, "a mixture response takes no count_columns")
+    r.ordinal_structure === nothing ||
+        _fail(r.label, "a mixture response takes no ordinal_structure")
+    r.discrimination === nothing ||
+        _fail(r.label, "a mixture response takes no discrimination")
+    isempty(r.threshold_columns) ||
+        _fail(r.label, "a mixture response takes no threshold_columns")
+    r.threshold_coefs === nothing ||
+        _fail(r.label, "a mixture response takes no threshold_coefs")
+    isempty(r.extra_responses) ||
+        _fail(r.label, "a mixture response takes no extra_responses")
+    r.factor_scales === nothing ||
+        _fail(r.label, "a mixture response takes no factor_scales")
+    r.factor_corr === nothing ||
+        _fail(r.label, "a mixture response takes no factor_corr")
+    r.glm_alpha === nothing ||
+        _fail(r.label, "a mixture response takes no glm_alpha")
+    r.glm_beta === nothing ||
+        _fail(r.label, "a mixture response takes no glm_beta")
+    if f === BinomialLogitFam
+        r.trials === nothing && _fail(r.label,
+            "mixture over Binomial requires trials (one shared Int column " *
+            "or literal — SB's identical-expression rule, structurally)")
+    else
+        r.trials === nothing ||
+            _fail(r.label, "only Binomial mixtures take trials")
+    end
+    named = any(l -> l isa Symbol, r.mixture_locs) ||
+        any(s -> s isa Symbol || s isa ScalePredictorRef, r.mixture_scales) ||
+        r.mixture_weights isa Symbol
+    named || _fail(r.label,
+        "fully-fixed mixture (all literals) is a constant density with no " *
+        "plan — leave at least one slot free or drop the response")
     return nothing
 end
 
@@ -5610,6 +5905,13 @@ function _validate_responses(plan::StructuralPlan)
     scan_states = Set{Symbol}(s.state for s in plan.scans)
     used_predictors = Set{Symbol}()
     for r in plan.responses
+        # A mixture response validates whole (dedicated component slots;
+        # the anchor is polymorphic, so this branch leads the scan-state
+        # and plate-param checks below).
+        if r.family === MixtureFam
+            _validate_mixture_response(r, plan, used_predictors)
+            continue
+        end
         # A scale predictor feeds a slot exactly like a location predictor,
         # so it counts toward the unused-predictor check below.
         r.scale isa ScalePredictorRef &&
@@ -5820,6 +6122,8 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
                     "non-negative integers")
         end
         return nothing
+    elseif r.family === MixtureFam
+        return _validate_mixture_response_column(r, plan, col)
     elseif r.family === MvNormalCholeskyFam
         # The joint outcomes cross as K raw numeric columns (lead + tail),
         # row-aligned by the uniform-`n_obs` rule (SB packs complete aligned
@@ -5840,6 +6144,47 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     end
 end
 
+# Mixture response column: the single-family column rule of the shared
+# component family (same-family mixtures share one support — SB's rule).
+function _validate_mixture_response_column(r::LikelihoodSpec,
+        plan::StructuralPlan, col::AbstractVector)
+    f = r.mixture_family
+    if f === BernoulliLogitFam
+        eltype(col) === Bool && return nothing
+        eltype(col) <: Integer && all(x -> x == 0 || x == 1, col) && return nothing
+        return _fail(r.label,
+            "mixture response must be Bool or 0/1 integers (Bernoulli components)")
+    elseif f === PoissonLogFam
+        eltype(col) <: Integer && all(>=(0), col) && return nothing
+        return _fail(r.label,
+            "mixture response must be non-negative integers (Poisson components)")
+    elseif f === BinomialLogitFam
+        _is_count_column(col) && return nothing
+        return _fail(r.label,
+            "mixture response must be non-negative integers (Binomial components)")
+    elseif f === NegativeBinomial2Fam
+        _is_count_column(col) && return nothing
+        return _fail(r.label,
+            "mixture response must be non-negative integers (NB2 components)")
+    elseif f === GaussianFam
+        eltype(col) <: Real ||
+            _fail(r.label,
+                "mixture response must be numeric (Gaussian components)")
+        return nothing
+    elseif f === GammaLogFam
+        (eltype(col) <: Real && all(>(0), col)) ||
+            _fail(r.label,
+                "mixture response must be strictly positive numerics (Gamma components)")
+        return nothing
+    elseif f === BetaLogitFam
+        (eltype(col) <: Real && all(x -> 0 < x < 1, col)) ||
+            _fail(r.label,
+                "mixture response must be numerics strictly inside (0, 1) (Beta components)")
+        return nothing
+    end
+    return _fail(r.label, "mixture over $f has no column rule")
+end
+
 # Non-Bool integer column, all non-negative (Binomial/NB2 responses;
 # Bool would pass `<: Integer` and die downstream — exclude it here).
 _is_count_column(col) =
@@ -5852,13 +6197,18 @@ _is_bernoulli_family(f) =
 _is_binomial_family(f) =
     f === BinomialLogitFam || f === BinomialProbitFam || f === BinomialCloglogFam
 
+# Scale-auxiliary requirement per family: the need string, or `nothing`
+# when the family takes no scale (`_validate_scale` for single responses,
+# `_validate_mixture_response` per component).
+_scale_need(fam::LikelihoodFamily) =
+    fam === GaussianFam ? "Gaussian response requires a scale" :
+    fam === NegativeBinomial2Fam ? "NB2 response requires a dispersion phi" :
+    fam === GammaLogFam ? "Gamma response requires a shape alpha" :
+    fam === BetaLogitFam ? "Beta response requires a concentration kappa" :
+    fam === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" : nothing
+
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
-    need = r.family === GaussianFam ? "Gaussian response requires a scale" :
-        r.family === NegativeBinomial2Fam ?
-        "NB2 response requires a dispersion phi" :
-        r.family === GammaLogFam ? "Gamma response requires a shape alpha" :
-        r.family === BetaLogitFam ? "Beta response requires a concentration kappa" :
-        r.family === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" : nothing
+    need = _scale_need(r.family)
     if need === nothing
         r.scale === nothing ||
             _fail(r.label, "this response family takes no scale auxiliary")
@@ -5866,21 +6216,32 @@ function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
         r.scale === nothing &&
             _fail(r.label, "$need (parameter or literal)")
     end
-    s = r.scale
+    return _validate_scale_use(r, plan, r.scale, "scale")
+end
+
+# One scale-slot use (a single response's `scale` or one mixture
+# component's scale): literals are finite-positive, predictor refs route
+# to the predictor rules (against `fam`, forbidding `forbidden`), and
+# symbols defer to bind (parameter/assignment now, raw per-observation
+# column at `_validate_scale_data`).
+function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
+        what::AbstractString, fam::LikelihoodFamily = r.family,
+        forbidden::Vector{Symbol} = [r.predictor])
     s === nothing && return nothing
     if s isa Real
         (isfinite(s) && s > 0) ||
-            _fail(r.label, "scale literal must be finite positive")
+            _fail(r.label, "$what literal must be finite positive")
         return nothing
     end
-    s isa ScalePredictorRef && return _validate_scale_predictor(r, plan, s)
+    s isa ScalePredictorRef &&
+        return _validate_scale_predictor_use(r, plan, s, fam, forbidden)
     # A scalar parameter/assignment scale resolves now; a per-observation scale
     # is a raw data column resolved at bind (see `_validate_scale_data`), so
     # defer an unknown symbol rather than failing structurally (mirrors how
     # per-obs weight/trials columns validate only once data is attached).
     s isa Symbol && s in _union_names(plan) && return nothing
     s isa Symbol && return nothing
-    return _fail(r.label, "scale references unknown name $s")
+    return _fail(r.label, "$what references unknown name $s")
 end
 
 # A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha):
@@ -5892,11 +6253,17 @@ end
 # column-or-literal by type).
 function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
         s::ScalePredictorRef)
-    r.family === BetaLogitFam && _fail(r.label,
+    return _validate_scale_predictor_use(r, plan, s, r.family, [r.predictor])
+end
+
+function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
+        s::ScalePredictorRef, fam::LikelihoodFamily,
+        forbidden::Vector{Symbol})
+    fam === BetaLogitFam && _fail(r.label,
         "Beta response with a scale predictor: predictor-fed concentration " *
         "(kappa) is deferred — use a scalar kappa (parameter or literal)")
-    (r.family === GaussianFam || r.family === NegativeBinomial2Fam ||
-        r.family === GammaLogFam) ||
+    (fam === GaussianFam || fam === NegativeBinomial2Fam ||
+        fam === GammaLogFam) ||
         _fail(r.label, "this response family takes no scale predictor")
     (s.link === IdentityLink || s.link === LogLink ||
         s.link === LogitLink) ||
@@ -5909,7 +6276,7 @@ function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
     pred.link === s.link ||
         _fail(r.label, "scale predictor $(s.predictor) carries link " *
             "$(pred.link), scale use wraps $(s.link) — one link per predictor")
-    s.predictor === r.predictor &&
+    s.predictor in forbidden &&
         _fail(r.label, "scale predictor $(s.predictor) is the response's " *
             "own location predictor — location and scale take distinct " *
             "predictors")
@@ -5922,7 +6289,16 @@ end
 # is strictly positive). A derived column scale is rejected — per-obs scales
 # bind raw (mirrors the weights/trials raw-only rule).
 function _validate_scale_data(r::LikelihoodSpec, plan::StructuralPlan)
-    s = r.scale
+    if r.family === MixtureFam
+        for s in r.mixture_scales
+            _validate_scale_data_use(r, plan, s)
+        end
+        return nothing
+    end
+    return _validate_scale_data_use(r, plan, r.scale)
+end
+
+function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
     (s === nothing || s isa Real) && return nothing
     # A predictor-fed scale is an n_obs LP by construction (design over the
     # bound rows); there is no column length to check at bind.
@@ -5946,6 +6322,9 @@ function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family === MultinomialFam
         return _validate_multinomial_trials(r, plan)
     end
+    if r.family === MixtureFam
+        return _validate_mixture_trials(r, plan)
+    end
     if !_is_binomial_family(r.family)
         r.trials === nothing ||
             _fail(r.label, "only Binomial/Multinomial responses take trials")
@@ -5953,12 +6332,32 @@ function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
     end
     r.trials === nothing && _fail(r.label,
         "Binomial response requires trials (Int column or literal)")
+    return _validate_trials_values(r, plan, "Binomial response")
+end
+
+# Binomial-component mixtures share one trials use (SB's
+# identical-expression rule holds structurally — one field); every
+# other component family takes none.
+function _validate_mixture_trials(r::LikelihoodSpec, plan::StructuralPlan)
+    if r.mixture_family === BinomialLogitFam
+        r.trials === nothing && _fail(r.label,
+            "mixture over Binomial requires trials (one shared Int column " *
+            "or literal)")
+        return _validate_trials_values(r, plan, "mixture response")
+    end
+    r.trials === nothing ||
+        _fail(r.label, "only Binomial mixtures take trials")
+    return nothing
+end
+
+function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
+        what::AbstractString)
     ycol = _vector_column(plan.columns, r.response, r.label, "response")
     t = r.trials
     if t isa Int
         t >= 0 || _fail(r.label, "Binomial trials literal must be non-negative")
         all(ycol .<= t) ||
-            _fail(r.label, "Binomial response exceeds trials $t")
+            _fail(r.label, "$what exceeds trials $t")
         return nothing
     end
     _is_derived(plan, t) && _fail(r.label,
@@ -5974,7 +6373,7 @@ function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
     length(col) == plan.n_obs ||
         _fail(r.label, "trials column length $(length(col)) ≠ n_obs $(plan.n_obs)")
     all(ycol .<= col) ||
-        _fail(r.label, "Binomial response exceeds trials in some row")
+        _fail(r.label, "$what exceeds trials in some row")
     return nothing
 end
 
@@ -6888,11 +7287,15 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
     thresh_link = Dict{Symbol,Symbol}()
     simplex_link = Dict{Symbol,Symbol}()
     coefs_link = Dict{Symbol,Symbol}()
+    mixture_link = Dict{Symbol,Symbol}()
     for r in out_r
         r.thresholds !== nothing && (thresh_link[r.thresholds] = r.label)
         r.threshold_coefs !== nothing && (coefs_link[r.threshold_coefs] = r.label)
         if _is_simplex_family(r.family)
             simplex_link[r.predictor] = r.label
+        end
+        if r.family === MixtureFam && r.mixture_weights isa Symbol
+            mixture_link[r.mixture_weights] = r.label
         end
     end
     monotonic_link = Dict{Symbol,Symbol}()
@@ -6932,6 +7335,16 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             length(p.args.arg1) == K || _fail(p.label,
                 "Dirichlet concentration length $(length(p.args.arg1)) " *
                 "disagrees with n_levels $K")
+            push!(out_v, VectorParameter(p.name, p.family, p.args, K, p.label))
+        elseif haskey(mixture_link, p.name)
+            K = length(by_label[mixture_link[p.name]].mixture_locs)
+            K >= 1 || _fail(p.label, "internal: linked mixture unresolved")
+            p.size === nothing || p.size == K || _fail(p.label,
+                "mixture weights size $(p.size) disagrees with the " *
+                "$K components")
+            length(p.args.arg1) == K || _fail(p.label,
+                "Dirichlet concentration length $(length(p.args.arg1)) " *
+                "disagrees with the $K mixture components")
             push!(out_v, VectorParameter(p.name, p.family, p.args, K, p.label))
         elseif haskey(monotonic_link, p.name)
             want = length(p.args.arg1)
