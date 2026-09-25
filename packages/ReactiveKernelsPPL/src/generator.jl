@@ -889,6 +889,12 @@ end
 function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     node = _lik_name(r.label)
     pw = _pw_name(r.label)
+    if r.mi_jobs !== nothing && !(r.family === GaussianFam ||
+            r.family === GammaLogFam || r.family === BetaLogitFam)
+        throw(ContractValidationError(
+            "[generator] mi() response $(r.label) family $(r.family) " *
+            "has no mi emitter (v1: Gaussian/Gamma/Beta)"))
+    end
     if r.family === GaussianFam
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === StudentTFam
@@ -1160,6 +1166,54 @@ function _plate_sum_stmts(pointwise::Symbol, node::Symbol, inputs::Vector{Any},
     return Expr[:($pointwise = $doex), :($node::Float64 = sum($pointwise))]
 end
 
+# Case-A `mi()` gather naming, per response (`_ppl_mi_<label>_<ref>`):
+# twin responses sharing one predictor gather through distinct nodes.
+_mi_gather_name(label::Symbol, ref::Symbol) = Symbol(:_ppl_mi_, label, :_, ref)
+
+# Gather a computed full-length node by `Jobs` (an lp/rate/shape/scale
+# node the emitter created — always a vector), returning the short node.
+# The gather is its own short plate over `Jobs` with the source `Ref`'d
+# (the ordinal `c[yv]` per-lane-gather precedent): a caller-level fancy
+# `node[Jobs]` does not trace under Reactant (`TracedRArray[Vector{Int}]`
+# shape-inference failure), while per-lane scalar gathers do.
+function _mi_gather_node!(pre::Vector{Expr}, jobs::Symbol, node::Symbol,
+        label::Symbol)
+    g = _mi_gather_name(label, node)
+    jv, rf = _dovar(1), _dovar(2)
+    body = Expr(:block, LineNumberNode(0, :generator), :($rf[$jv]))
+    lambda = Expr(:(->), Expr(:tuple, jv, rf), body)
+    doex = Expr(:do, Expr(:call, :plate, jobs, :(Ref($node))), lambda)
+    push!(pre, :($g = $doex))
+    return g
+end
+
+# Gather a scale-like ref under `mi()`: scalar parameter/assignment names
+# broadcast untouched, columns gather through a short plate, Real
+# literals pass through for `_thread_ref!` to inline; anything else fails
+# closed (gathering a scalar would index nonsense, an unknown name would
+# thread garbage).
+function _mi_gather_ref!(pre::Vector{Expr}, jobs::Symbol, ref,
+        plan::StructuralPlan, label::Symbol)
+    ref isa Real && return ref
+    ref isa Symbol || throw(ContractValidationError(
+        "[generator] mi() response $label gathers Symbol/Real refs only " *
+        "(got $(repr(ref)))"))
+    ref in _union_names(plan) && return ref
+    haskey(plan.columns, ref) || throw(ContractValidationError(
+        "[generator] mi() response $label cannot gather unknown name $ref"))
+    return _mi_gather_node!(pre, jobs, ref, label)
+end
+
+# Gather a resolved scale arg under `mi()`: a predictor-fed scale already
+# resolved to its `_ppl_sc_` node (always a full-length vector — gather
+# it as a node); every other scale shape routes through `_mi_gather_ref!`.
+function _mi_gather_scale!(pre::Vector{Expr}, jobs::Symbol, sarg, r::LikelihoodSpec,
+        plan::StructuralPlan)
+    r.scale isa ScalePredictorRef &&
+        return _mi_gather_node!(pre, jobs, sarg, r.label)
+    return _mi_gather_ref!(pre, jobs, sarg, plan, r.label)
+end
+
 # Thread a Symbol ref as a plate input (returning its do-var); Real
 # literals inline (`as_int` for Poisson bounds — validated integer-valued).
 function _thread_ref!(inputs::Vector{Any}, ref, as_int::Bool = false)
@@ -1191,6 +1245,12 @@ function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
     lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
+    if r.mi_jobs !== nothing
+        # Packed y_obs threads directly (it IS the short plate axis);
+        # every other vector input gathers by Jobs.
+        lp = _mi_gather_node!(pre, r.mi_jobs, lp, r.label)
+        sarg = _mi_gather_scale!(pre, r.mi_jobs, sarg, r, plan)
+    end
     inputs = Any[y, lp]
     yv, lpv = _dovar(1), _dovar(2)
     sref = _thread_ref!(inputs, sarg)
@@ -1466,6 +1526,10 @@ function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbo
     av = sarg isa Symbol ? sarg : Float64(sarg)
     rate = _rate_name(r.label)
     push!(pre, :($rate = $av ./ exp.($lp)))
+    if r.mi_jobs !== nothing
+        rate = _mi_gather_node!(pre, r.mi_jobs, rate, r.label)
+        sarg = _mi_gather_scale!(pre, r.mi_jobs, sarg, r, plan)
+    end
     inputs = Any[y, rate]
     yv, ratev = _dovar(1), _dovar(2)
     aref = _thread_ref!(inputs, sarg)
@@ -1619,6 +1683,15 @@ function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     mu = _mu_name(r.label)
     a = _shape_a_name(r.label)
     b = _shape_b_name(r.label)
+    pre = Expr[:($mu = 1 ./ (1 .+ exp.(-$lp))),
+        :($a = $mu .* $k),
+        :($b = (1 .- $mu) .* $k)]
+    if r.mi_jobs !== nothing
+        # kappa never threads (it folds into the a/b precomputes), so
+        # only the shape nodes gather.
+        a = _mi_gather_node!(pre, r.mi_jobs, a, r.label)
+        b = _mi_gather_node!(pre, r.mi_jobs, b, r.label)
+    end
     inputs = Any[y, a, b]
     yv, avv, bvv = _dovar(1), _dovar(2), _dovar(3)
     cell = :(beta($avv, $bvv).logpdf($yv))
@@ -1626,10 +1699,7 @@ function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[:($mu = 1 ./ (1 .+ exp.(-$lp))),
-        :($a = $mu .* $k),
-        :($b = (1 .- $mu) .* $k),
-        _plate_sum_stmts(pw, node, inputs, cell)...]
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Reference-coded multi-logit categorical (SB `CategoricalLogit`): K−1
