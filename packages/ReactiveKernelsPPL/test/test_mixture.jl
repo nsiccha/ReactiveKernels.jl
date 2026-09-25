@@ -98,6 +98,37 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
         @test r.predictor === :ls # Anchor: first scale predictor.
         @test r.mixture_scales[1] isa ScalePredictorRef
     end
+    @testset "intercept-only scale predictor (SB log(sigma) ~ 1)" begin
+        plan = lower_rkppl(quote
+                mu1 ~ Normal(-2.0, 0.1)
+                mu2 ~ Normal(2.0, 0.1)
+                sigma = c
+                y .~ MixtureModel.([Normal.(mu1, exp.(sigma)),
+                    Normal.(mu2, exp.(sigma))], [0.4, 0.6])
+            end, (:y,))
+        r = only(plan.responses)
+        @test r.mixture_scales == [ScalePredictorRef(:sigma, LogLink),
+            ScalePredictorRef(:sigma, LogLink)]
+        @test r.predictor === :sigma # Anchor: first scale predictor.
+        pred = only(p for p in plan.predictors if p.name === :sigma)
+        @test [t.kind for t in pred.terms] == [InterceptTerm]
+        @test isempty(plan.derived)
+    end
+    @testset "intercept-only location predictor (SB mu ~ 1)" begin
+        plan = lower_rkppl(quote
+                mu1 = c
+                mu2 ~ Normal(0.0, 5.0)
+                sigma ~ Exponential(1.0)
+                y .~ MixtureModel.([Normal.(mu1, sigma),
+                    Normal.(mu2, sigma)], [0.3, 0.7])
+            end, (:y,))
+        r = only(plan.responses)
+        @test r.mixture_locs == [:mu1, :mu2]
+        @test r.predictor === :mu1 # Anchor: first location predictor.
+        pred = only(p for p in plan.predictors if p.name === :mu1)
+        @test [t.kind for t in pred.terms] == [InterceptTerm]
+        @test isempty(plan.derived)
+    end
     @testset "alternate heads desugar per component" begin
         plan = lower_rkppl(quote
                 mu = a .+ b .* x
@@ -763,5 +794,70 @@ end
         large = _mix_reactant(prog, Dict{Symbol,AbstractVector}(
             :y => [-2.0, -1.8, 1.9, 2.2, -2.1, -1.9, 2.0, 2.1]))
         @test small.lines == large.lines
+    end
+end
+
+# SB parity vs the peer lane's BridgeStan numbers (brief
+# 2026-09-25T23-22-01-158-qtfwg1 on
+# BayesianRegressionModels:rk:parity-fam-mixture, BRM 20f532c, StanBlocks
+# 24578c3, BridgeStan 2.9.0): full posterior at u_unc, propto=false,
+# Jacobian included, BridgeStan AD grads. RK layout order differs from SB
+# declaration order, so pins compare by coordinate name (SB pins below are
+# in SB declaration order).
+_mix_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
+
+@testset "mixture SB parity" begin
+    @testset "canonical 2-gaussian" begin
+        # SB: mu1 ~ Normal(-2, 0.1); mu2 ~ Normal(2, 0.1);
+        # log(sigma) ~ 1;
+        # y ~ MixtureModel([Normal(mu1, sigma), Normal(mu2, sigma)],
+        #     [0.4, 0.6]); y = [-2.0, -1.8, 1.9, 2.2];
+        # u (SB order [mu1, mu2, sigma]) = [-2.0, 2.0, log(0.3)].
+        prog = quote
+            mu1 ~ Normal(-2.0, 0.1)
+            mu2 ~ Normal(2.0, 0.1)
+            sigma = c
+            y .~ MixtureModel.([Normal.(mu1, exp.(sigma)),
+                Normal.(mu2, exp.(sigma))], [0.4, 0.6])
+        end
+        bound, built, kern, lay = _mix_query(prog,
+            Dict{Symbol,AbstractVector}(:y => [-2.0, -1.8, 1.9, 2.2]))
+        names = coordinate_names(lay)
+        u = _mix_sb_vec(names, [:mu1 => -2.0, :mu2 => 2.0,
+            Symbol("sigma.Intercept") => log(0.3)])
+        @test abs(Base.invokelatest(kern, u) - (-1.0905162971993954)) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        want = _mix_sb_vec(names, [:mu1 => 2.222222222222222,
+            :mu2 => 1.1111111111111123,
+            Symbol("sigma.Intercept") => -1.796027195674063])
+        @test maximum(abs.(g .- want)) < 1e-10
+    end
+    @testset "poisson count leg" begin
+        # SB: lambda1 ~ Exponential(1); lambda2 ~ Exponential(1);
+        # y ~ MixtureModel([Poisson(lambda1), Poisson(lambda2)],
+        #     [0.3, 0.7]); y = [0, 1, 3, 5, 2];
+        # u = log.([1.5, 4.0]).
+        prog = quote
+            lambda1 ~ Exponential(1.0)
+            lambda2 ~ Exponential(1.0)
+            y .~ MixtureModel.([Poisson.(lambda1), Poisson.(lambda2)],
+                [0.3, 0.7])
+        end
+        bound, built, kern, lay = _mix_query(prog,
+            Dict{Symbol,AbstractVector}(:y => [0, 1, 3, 5, 2]))
+        names = coordinate_names(lay)
+        u = _mix_sb_vec(names, [:lambda1 => log(1.5),
+            :lambda2 => log(4.0)])
+        @test abs(Base.invokelatest(kern, u) - (-13.770608192734482)) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        want = _mix_sb_vec(names, [:lambda1 => -1.4238640775837066,
+            :lambda2 => -5.631856052803615])
+        @test maximum(abs.(g .- want)) < 1e-10
     end
 end

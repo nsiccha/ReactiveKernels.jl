@@ -4288,7 +4288,8 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
         haskey(ctx.matrices, loc) && _sfail("response $lhs: mixture " *
             "component $k location $loc is a design matrix — locations " *
             "are predictors, sampled parameters, or literals")
-        if loc in ctx.vecdefs && haskey(ctx.detmap, loc)
+        if loc in ctx.vecdefs && haskey(ctx.detmap, loc) ||
+                _is_scalar_coef_def(loc, ctx)
             wrapped || _sfail("response $lhs: mixture component $k " *
                 "location $loc is a predictor — link-space predictors " *
                 "wrap (`Poisson.(exp.(eta))`); bare slots are sampled " *
@@ -5157,17 +5158,48 @@ end
 # definition that is not latent-backed: vector-shaped definitions plus
 # bare `coefficients[group]` factor-index refs (ref-shaped, hence
 # scalar-shaped in `detshape`, but per-observation at runtime — the
-# factor-term predictor spelling). Per-cell latents (plate names and
-# derived columns reading one) stay on the scalar path — a plate
-# parameter already threads per cell as a name, and a latent transform
-# is not an affine predictor. Scalar assignments, data gathers
-# (`x[g]`), and literal indexing (`v[1]`) likewise stay scalar-path,
-# exactly as before.
+# factor-term predictor spelling) plus scalar `name = coef` intercept-
+# only definitions (the SB `log(sigma) ~ 1` mirror — the design carries
+# the `ones(n)` intercept block, so the LP still evaluates per cell).
+# Per-cell latents (plate names and derived columns reading one) stay
+# on the scalar path — a plate parameter already threads per cell as
+# a name, and a latent transform is not an affine predictor. Other
+# scalar assignments, data gathers (`x[g]`), and literal indexing
+# (`v[1]`) likewise stay scalar-path, exactly as before.
 _is_scale_predictor_def(s::Symbol, ctx) =
     haskey(ctx.detmap, s) && !(s in ctx.plate_names) &&
     !_derived_reads_latent(s, ctx) &&
     (get(ctx.detshape, s, :scalar) === :vector ||
-        _is_factor_index_def(ctx.detmap[s], ctx))
+        _is_factor_index_def(ctx.detmap[s], ctx) ||
+        _is_scalar_coef_def(s, ctx))
+
+# A scalar definition spelling an intercept-only predictor (`name =
+# coef` over a bare coefficient): admitted to the scale-predictor slot
+# exactly when `_classify_symbol` would take the RHS as an
+# InterceptTerm — anything it rejects or routes elsewhere (parameters,
+# computed scalars, data, latents, varying draws, matrices) stays on
+# the scalar path, so alias chains (`s2 = s`), literal scales, and
+# data-column scales keep today's behavior bit-for-bit. Normal-priored
+# names route to analysis like the location path's stated intercept
+# priors (`a ~ Normal(0, 5)` over `eta = a .+ b .* x`).
+function _is_scalar_coef_def(s::Symbol, ctx)
+    haskey(ctx.detmap, s) || return false
+    s in ctx.plate_names && return false
+    _derived_reads_latent(s, ctx) && return false
+    get(ctx.detshape, s, :scalar) === :scalar || return false
+    rhs = ctx.detmap[s]
+    rhs isa Symbol || return false
+    rhs in ctx.data && return false
+    rhs in ctx.vecdefs && return false
+    haskey(ctx.detmap, rhs) && return false
+    rhs in ctx.prior_names && rhs ∉ ctx.normal_priors && return false
+    rhs in ctx.plate_names && return false
+    rhs in ctx.scan_states && return false
+    rhs in ctx.varying_contribs && return false
+    rhs in ctx.varying_draws_names && return false
+    haskey(ctx.matrices, rhs) && return false
+    return true
+end
 
 function _is_factor_index_def(rhs, ctx)
     rhs isa Expr || return false

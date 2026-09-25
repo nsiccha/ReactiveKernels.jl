@@ -145,6 +145,48 @@ end
     end, (:y1, :y2, :x, :z))
 end
 
+@testset "surface: intercept-only scale predictor" begin
+    # SB `log(sigma) ~ 1` mirror: a scalar `name = coef` definition feeds
+    # the scale-predictor slot; the design carries the `ones(n)` intercept
+    # block, so the LP still evaluates per cell.
+    plan0 = lower_rkppl(quote
+        mu = a .+ b .* x
+        sigma = c
+        y .~ Normal.(mu, exp.(sigma))
+    end, (:y, :x, :z))
+    r = only(plan0.responses)
+    @test r.scale == ScalePredictorRef(:sigma, LogLink)
+    pred = only(p for p in plan0.predictors if p.name === :sigma)
+    @test pred.link === LogLink
+    @test [t.kind for t in pred.terms] == [InterceptTerm]
+    @test (only(p for p in plan0.population_priors if p.predictor === :sigma).addressee) == :Intercept
+    @test isempty(plan0.derived)
+    # A stated Normal prior rides the intercept (the location precedent).
+    stated = lower_rkppl(quote
+        c ~ Normal(0.0, 5.0)
+        mu = a .+ b .* x
+        sigma = c
+        y .~ Normal.(mu, exp.(sigma))
+    end, (:y, :x, :z))
+    pr = only(p for p in stated.population_priors if p.predictor === :sigma)
+    @test (pr.addressee, pr.location, pr.scale) == (:Intercept, 0.0, 5.0)
+    # Bare intercept-only scale is identity link, like the vector shape.
+    bare = lower_rkppl(quote
+        mu = a .+ b .* x
+        sg = c
+        y .~ Normal.(mu, sg)
+    end, (:y, :x, :z))
+    @test only(bare.responses).scale == ScalePredictorRef(:sg, IdentityLink)
+    # Non-Normal parameter aliases stay scalar-path (no reroute).
+    aliased = lower_rkppl(quote
+        mu = a .+ b .* x
+        s ~ Exponential(1.0)
+        s2 = s
+        y .~ Normal.(mu, s2)
+    end, (:y, :x, :z))
+    @test only(aliased.responses).scale === :s2
+end
+
 @testset "surface: scale fail-closed battery" begin
     # Undotted wrappers are never silently reinterpreted (scalar
     # `exp(log_sigma)` use-site wrappers are deferred).
@@ -293,6 +335,29 @@ end
     cols = _vs_cols()
     muv = _vs_lp(nt.mu, cols[:x])
     sgv = exp.(_vs_lp(nt.sigma, cols[:z]))
+    ll = _vs_oracle_gaussian(cols[:y], muv, sgv)
+    pr = _vs_stdnormal_prior(nt.mu, nt.sigma)
+    @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
+        rtol = 1e-12, atol = 1e-12)
+    @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
+        rtol = 1e-12, atol = 1e-12)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "vscale: intercept-only scale values + gradient" begin
+    plan = bind_data(lower_rkppl(quote
+            mu = a .+ b .* x
+            sigma = c
+            y .~ Normal.(mu, exp.(sigma))
+        end, (:y, :x, :z)), _vs_cols())
+    built = build_kernel(plan)
+    @test coordinate_names(built.layout) ==
+        [Symbol("mu.Intercept"), Symbol("mu.x"), Symbol("sigma.Intercept")]
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    cols = _vs_cols()
+    muv = _vs_lp(nt.mu, cols[:x])
+    sgv = fill(exp(only(nt.sigma)), length(cols[:y]))
     ll = _vs_oracle_gaussian(cols[:y], muv, sgv)
     pr = _vs_stdnormal_prior(nt.mu, nt.sigma)
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
