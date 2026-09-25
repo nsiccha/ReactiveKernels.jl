@@ -230,6 +230,15 @@ constructed, and the endpoint is still transparently spliced with no runtime
 hygienic internal recipes, so natural calls such as
 `normal(0.0, 5.0).logpdf(x)` remain transparent too.
 
+A constructed endpoint may also appear under a lazy branch arm, such as
+`mp == 0 ? normal(lpi, 1.5).logpdf(yf) : 0.0` in a plate cell. No recipe
+position exists inside the arm, so the endpoint's planned recipes are rendered
+as source in the arm itself: each arm evaluates its own endpoint copy exactly
+when taken, and a data-bound branch still splits per arm at preparation. An
+endpoint whose lowered form binds locals, runs a plate or scan, or reads a
+non-`Base` global is rejected at authoring time with an action to hoist the
+call above the branch, where it splices as usual.
+
 Named relations stay available as alternate cuts. Authoring one direction is
 enough: a unary call such as `log_scale = log(scale)` gains the reverse edge
 (`scale = exp(log_scale)`, via InverseFunctions.jl) automatically, so the

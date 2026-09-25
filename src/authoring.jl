@@ -1141,12 +1141,237 @@ function _kernel_implicit_plate_result_body(body)
     Expr(:block, statements...)
 end
 
+# Whether the `i`-th child of `ex` is a strict position for constructed-endpoint
+# lowering. A splice (`nested_specs` key) only lowers when the endpoint call is
+# the whole recipe right-hand side (or a `:call` sub-expression lifted into its
+# own recipe); under a lazy branch arm the call would be swept into the fused
+# arm closure as a bare gensym with no method definition. Such positions inline
+# the endpoint's planned recipes as source instead (see below), which keeps the
+# arm lazy and evaluates the endpoint only when the arm is taken. Conditions
+# and first `&&`/`||` operands always evaluate, so they stay strict.
+function _kernel_straight_child(ex, i)
+    ex.head in (:if, :elseif) && return i == 1
+    ex.head in (:(&&), :(||)) && return i == 1
+    return true
+end
+
+function _kernel_note_endpoint_port_type!(local_types, actual::Symbol, formal)
+    T = valtype(formal)
+    if haskey(local_types, actual) && local_types[actual] != T
+        throw(ArgumentError(
+            "plate do-block argument :$actual is used with incompatible " *
+            "endpoint types $(local_types[actual]) and $T"))
+    end
+    local_types[actual] = T
+end
+
+# Expression heads that bind names or otherwise cannot be relocated into a
+# branch arm by substitution. A recipe source containing any of these (at any
+# depth) is rejected loudly rather than inlined with changed meaning.
+const _KERNEL_INLINE_REJECT_HEADS = Set{Symbol}([
+    :(=), :for, :while, :let, :try, :(->), :function, :do, :macrocall,
+    :generator, :comprehension, :typed_comprehension, :filter, :return,
+    :break, :continue, :($), :where, :local, :global, :foreigncall,
+    :cfunction, :new, :splatnew, :the_exception, :enter, :leave,
+    :pop_exception, :meta, :module, :using, :import, :export, :toplevel,
+    :struct, :abstract, :primitive, :goto, :label, :code_coverage_effect,
+    :thunk, :isdefined,
+])
+
+_kernel_inline_reject(endpoint_name, context, why) = throw(ArgumentError(
+    "endpoint :$endpoint_name $context cannot be evaluated under a branch " *
+    "arm ($why); hoist the endpoint call above the branch into its own " *
+    "recipe, where it splices transparently"))
+
+# Substitute endpoint recipe inputs with caller expressions. Only pure value
+# positions are rewritten: quoted content is inert data, keyword/named-field
+# names are field labels rather than references, and any binding or
+# control-flow form is rejected above instead of relocated.
+function _kernel_substitute_endpoint_source(ex, subst::Dict{Symbol,Any},
+                                            endpoint_name, context,
+                                            field_parent::Bool = false)
+    ex isa Symbol && return get(subst, ex, ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    if ex.head === :(=) && field_parent
+        length(ex.args) == 2 ||
+            _kernel_inline_reject(endpoint_name, context,
+                                  "a named-field label is malformed")
+        _kernel_inline_reject_unless_symbol(ex.args[1], endpoint_name, context)
+        return Expr(:(=), ex.args[1],
+                    _kernel_substitute_endpoint_source(
+                        ex.args[2], subst, endpoint_name, context))
+    end
+    ex.head in _KERNEL_INLINE_REJECT_HEADS &&
+        _kernel_inline_reject(endpoint_name, context,
+                              "its lowered form contains `$(ex.head)`")
+    if ex.head === :kw
+        length(ex.args) == 2 ||
+            _kernel_inline_reject(endpoint_name, context,
+                                  "a keyword label is malformed")
+        _kernel_inline_reject_unless_symbol(ex.args[1], endpoint_name, context)
+        return Expr(:kw, ex.args[1],
+                    _kernel_substitute_endpoint_source(
+                        ex.args[2], subst, endpoint_name, context))
+    end
+    if ex.head === :(.)
+        first = _kernel_substitute_endpoint_source(
+            ex.args[1], subst, endpoint_name, context)
+        rest = ex.args[2] isa QuoteNode || ex.args[2] isa Symbol ? ex.args[2] :
+            _kernel_substitute_endpoint_source(
+                ex.args[2], subst, endpoint_name, context)
+        return Expr(:., first, rest)
+    end
+    under_field = ex.head in (:tuple, :parameters)
+    Expr(ex.head,
+         (_kernel_substitute_endpoint_source(
+              arg, subst, endpoint_name, context, under_field)
+          for arg in ex.args)...)
+end
+
+function _kernel_inline_reject_unless_symbol(name, endpoint_name, context)
+    name isa Symbol && return name
+    _kernel_inline_reject(endpoint_name, context,
+                           "a keyword or named-field label is not a name")
+end
+
+# Render a constructed-endpoint call as source for a branch-arm position.
+# `actuals` are the call-site binding sources in the endpoint HAVE order
+# (owner actuals, then explicit arguments). Each planned recipe becomes one
+# hygienic assignment in a nested-`let` block over the used HAVE sources, so
+# the arm evaluates the endpoint exactly when taken. Recipe inputs map to
+# their sources positionally — the same order `_kernel_expand` used when the
+# endpoint was built — matched here by recomputing each recipe's free ports
+# and checking the count (see below).
+function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
+                                      actuals::Vector, context)
+    p = plan(endpoint)
+    g = endpoint.graph
+    have_names = Tuple(endpoint.have_names)
+    have_source = Dict{Int,Any}()
+    for v in p.have
+        position = findfirst(==(v.name), have_names)
+        position === nothing && _kernel_inline_reject(
+            endpoint_name, context,
+            "plan input :$(v.name) is not a caller boundary port")
+        # Each HAVE port maps to its call-site source once; `actuals` runs in
+        # HAVE order (owner actuals, then explicit arguments).
+        cid = canon_id(g, v.id)
+        haskey(have_source, cid) && _kernel_inline_reject(
+            endpoint_name, context, "two boundary ports share one value")
+        have_source[cid] = actuals[position]
+    end
+    length(p.want) == 1 || _kernel_inline_reject(
+        endpoint_name, context, "it has $(length(p.want)) outputs")
+    known = Set{Symbol}(endpoint.port_order)
+    used = Set{Int}(canon_id(g, v.id) for v in p.want)
+    for r in p.recipes, v in r.inputs
+        push!(used, canon_id(g, v.id))
+    end
+    bindings = Any[]
+    expr_of = Dict{Int,Any}()
+    for v in p.have
+        cid = canon_id(g, v.id)
+        cid in used || continue
+        temp = gensym(:endpoint_have)
+        expr_of[cid] = temp
+        push!(bindings, Expr(:(=), temp, have_source[cid]))
+    end
+    statements = Any[]
+    for r in p.recipes
+        r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} &&
+            _kernel_inline_reject(endpoint_name, context,
+                                  "it contains a plate or scan")
+        r.source === _NO_KERNEL_SOURCE && _kernel_inline_reject(
+            endpoint_name, context, "one recipe has no source")
+        # A spliced child recipe's source keeps its original bare names while
+        # the namespace holds the scoped ones, so the port namespace alone
+        # would miss them. Collect every bare name as known, then classify:
+        # an endpoint port is an input (ports shadow globals, exactly as
+        # `_kernel_free_ports` resolves them), a `Base`/`Core` global stays a
+        # global, and anything else is an input candidate. The count check
+        # below proves the candidates are exactly the inputs: every true
+        # input is reported, so a match leaves no room for a non-`Base`
+        # global, which would otherwise rebind into the caller's module.
+        leaves = Set{Symbol}()
+        _kernel_symbol_leaves!(leaves, r.source)
+        reported = try
+            _kernel_free_ports(r.source, union(known, leaves))
+        catch e
+            e isa ArgumentError || rethrow()
+            _kernel_inline_reject(endpoint_name, context,
+                                  "one recipe is not a pure value expression")
+        end
+        params = Symbol[name for name in reported
+                        if name in known ||
+                           !(isdefined(Base, name) || isdefined(Core, name))]
+        if length(params) != length(r.inputs)
+            suspicious = [":$name" for name in params
+                          if !(name in known) &&
+                             !(isdefined(Base, name) || isdefined(Core, name))]
+            hint = if isempty(suspicious)
+                ""
+            else
+                verb = length(suspicious) == 1 ? "is" : "are"
+                " (note: $(join(suspicious, ", ")) $verb neither an " *
+                "endpoint port nor a `Base`/`Core` global)"
+            end
+            _kernel_inline_reject(endpoint_name, context,
+                                  "one recipe mentions $(length(params)) " *
+                                  "ports for $(length(r.inputs)) inputs$hint")
+        end
+        subst = Dict{Symbol,Any}()
+        for (name, v) in zip(params, r.inputs)
+            cid = canon_id(g, v.id)
+            haskey(expr_of, cid) || _kernel_inline_reject(
+                endpoint_name, context,
+                "one recipe reads a value that is not available")
+            subst[name] = expr_of[cid]
+        end
+        inlined = _kernel_substitute_endpoint_source(
+            r.source, subst, endpoint_name, context)
+        outs = Symbol[gensym(:endpoint_value) for _ in r.outputs]
+        for (v, temp) in zip(r.outputs, outs)
+            cid = canon_id(g, v.id)
+            haskey(expr_of, cid) && _kernel_inline_reject(
+                endpoint_name, context,
+                "one recipe produces an already-bound value")
+            expr_of[cid] = temp
+        end
+        push!(statements,
+              length(outs) == 1 ? Expr(:(=), outs[1], inlined) :
+              Expr(:(=), Expr(:tuple, outs...), inlined))
+    end
+    want_cid = canon_id(g, only(p.want).id)
+    haskey(expr_of, want_cid) || _kernel_inline_reject(
+        endpoint_name, context, "its output is not available")
+    body = isempty(statements) ? expr_of[want_cid] :
+        Expr(:block, statements..., expr_of[want_cid])
+    for binding in reverse(bindings)
+        body = Expr(:let, binding, body)
+    end
+    body
+end
+
+# Every bare name in a recipe source, including quoted and label positions.
+# `_kernel_free_ports` filters those positionally; this only widens the known
+# set so spliced child recipes report their original bare names.
+function _kernel_symbol_leaves!(out::Set{Symbol}, ex)
+    ex isa Symbol && (push!(out, ex); return out)
+    ex isa Expr || return out
+    for arg in ex.args
+        _kernel_symbol_leaves!(out, arg)
+    end
+    out
+end
+
 function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       nested_specs::Dict{Symbol,Any},
                                       local_types::Dict{Symbol,Any};
                                       context = "inside @kernel",
                                       materialized = Tuple{Symbol,Any,Any}[],
-                                      cell_locals::Set{Symbol} = Set{Symbol}())
+                                      cell_locals::Set{Symbol} = Set{Symbol}(),
+                                      straight::Bool = true)
     ex isa Expr || return ex, nothing
     ex.head in (:quote, :inert) && return ex, nothing
 
@@ -1233,7 +1458,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 # This preserves ordinary Julia-like construction such as
                 # `normal(0.0, 5.0).logpdf(x)` without hiding runtime object calls.
                 endpoint_inputs = inputs(endpoint)
-                owner_ports = Symbol[]
+                owner_ports = Any[]
                 for (index, (formal, actual)) in
                         enumerate(zip(owner_formals, owner_actuals))
                     if actual isa Symbol && actual in locals
@@ -1250,16 +1475,23 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     # directly) lets an untyped local still bind a typed owner port
                     # with no boundary type mismatch, matching how a top-level
                     # @kernel body already exposes its assigned names as ports.
+                    # Under a branch arm the binding stays inline instead: hoisting
+                    # it would evaluate the arm's endpoint inputs on lanes that do
+                    # not take the arm.
                     rewritten_actual, _ = _kernel_constructed_endpoint(
                         actual, mod, locals, nested_specs, local_types;
                         context = context, materialized = materialized,
-                        cell_locals = cell_locals)
-                    generated_port = gensym(Symbol(formal, :_binding))
-                    generated_type = valtype(endpoint_inputs[index])
-                    push!(materialized,
-                          (generated_port, generated_type, rewritten_actual))
-                    push!(locals, generated_port)
-                    push!(owner_ports, generated_port)
+                        cell_locals = cell_locals, straight = straight)
+                    if straight
+                        generated_port = gensym(Symbol(formal, :_binding))
+                        generated_type = valtype(endpoint_inputs[index])
+                        push!(materialized,
+                              (generated_port, generated_type, rewritten_actual))
+                        push!(locals, generated_port)
+                        push!(owner_ports, generated_port)
+                    else
+                        push!(owner_ports, rewritten_actual)
+                    end
                 end
 
                 # Endpoint method arguments (the observed value in `.logpdf(x)`) are
@@ -1270,7 +1502,9 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 # recipe, typed by the endpoint's explicit boundary, so it lowers
                 # identically to the constructor-argument case rather than being
                 # rejected. A bare name still must resolve to a declared caller port.
-                endpoint_ports = Symbol[]
+                # Under a branch arm the argument stays inline, exactly like an
+                # owner binding above.
+                endpoint_ports = Any[]
                 for (index, actual) in enumerate(endpoint_actuals)
                     if actual isa Symbol && actual in locals
                         push!(endpoint_ports, actual)
@@ -1282,46 +1516,66 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     end
                     rewritten_actual, _ = _kernel_constructed_endpoint(
                         actual, mod, locals, nested_specs, local_types;
-                        context = context, materialized = materialized)
-                    generated_port = gensym(Symbol(explicit[index], :_argument))
-                    generated_type = valtype(
-                        endpoint_inputs[length(owner_formals) + index])
-                    push!(materialized,
-                          (generated_port, generated_type, rewritten_actual))
-                    push!(locals, generated_port)
-                    push!(endpoint_ports, generated_port)
-                end
-
-                actuals = Symbol[owner_ports...; endpoint_ports...]
-                for (actual, formal) in zip(actuals, inputs(endpoint))
-                    T = valtype(formal)
-                    if haskey(local_types, actual) && local_types[actual] != T
-                        throw(ArgumentError(
-                            "plate do-block argument :$actual is used with incompatible " *
-                            "endpoint types $(local_types[actual]) and $T"))
+                        context = context, materialized = materialized,
+                        straight = straight)
+                    if straight
+                        generated_port = gensym(Symbol(explicit[index], :_argument))
+                        generated_type = valtype(
+                            endpoint_inputs[length(owner_formals) + index])
+                        push!(materialized,
+                              (generated_port, generated_type, rewritten_actual))
+                        push!(locals, generated_port)
+                        push!(endpoint_ports, generated_port)
+                    else
+                        push!(endpoint_ports, rewritten_actual)
                     end
-                    local_types[actual] = T
                 end
 
-                generated = gensym(Symbol(endpoint_name, :_endpoint))
-                retargeted = _kernel_endpoint_call_signature(
-                    Val(Tuple(owner_ports)), Val(explicit))
-                nested_specs[generated] = KernelSpec(
-                    endpoint.graph, endpoint.ports, endpoint.port_order,
-                    endpoint.have_names, endpoint.want_names, retargeted)
-                return Expr(:call, generated, endpoint_ports...),
-                       valtype(only(outputs(endpoint)))
+                actuals = Any[owner_ports...; endpoint_ports...]
+                if straight
+                    for (actual, formal) in zip(actuals, inputs(endpoint))
+                        _kernel_note_endpoint_port_type!(
+                            local_types, actual, formal)
+                    end
+                    generated = gensym(Symbol(endpoint_name, :_endpoint))
+                    retargeted = _kernel_endpoint_call_signature(
+                        Val(Tuple(owner_ports)), Val(explicit))
+                    nested_specs[generated] = KernelSpec(
+                        endpoint.graph, endpoint.ports, endpoint.port_order,
+                        endpoint.have_names, endpoint.want_names, retargeted)
+                    return Expr(:call, generated, endpoint_ports...),
+                           valtype(only(outputs(endpoint)))
+                end
+                # Under a branch arm the endpoint graph cannot be spliced: no
+                # recipe position inside the arm exists, and hoisting the call
+                # above the branch would evaluate it on lanes that do not take
+                # the arm. Inline the endpoint's planned recipes as source
+                # instead, so each arm carries its own endpoint evaluation
+                # with the authored lazy semantics — ordinary transparent
+                # math, differentiable by the backend's usual reverse mode.
+                # Only named caller ports take endpoint boundary types; inline
+                # binding sources are not ports.
+                for (actual, formal) in zip(actuals, inputs(endpoint))
+                    actual isa Symbol ||
+                        continue
+                    _kernel_note_endpoint_port_type!(
+                        local_types, actual, formal)
+                end
+                inlined = _kernel_inline_endpoint_call(
+                    endpoint, endpoint_name, actuals, context)
+                return inlined, valtype(only(outputs(endpoint)))
             end
         end
     end
 
     rewritten = Any[]
     child_types = Any[]
-    for arg in ex.args
+    for (i, arg) in enumerate(ex.args)
         child, child_type = _kernel_constructed_endpoint(
             arg, mod, locals, nested_specs, local_types;
             context = context, materialized = materialized,
-            cell_locals = cell_locals)
+            cell_locals = cell_locals,
+            straight = straight && _kernel_straight_child(ex, i))
         # A constructed object endpoint lowers to a call whose head is a generated
         # `nested_specs` key. `_kernel_operation` splices such a call ONLY when it is
         # the WHOLE recipe RHS. A splice used as a SUB-EXPRESSION of a value-combining
@@ -1331,6 +1585,9 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         # with `UndefVarError: ##…_endpoint#N`. Lift each such sub-expression splice into
         # its own hygienic caller recipe, typed by the endpoint output, so the same
         # whole-RHS splice path lowers it, and reference the generated port here.
+        # Under a branch arm no lift happens: the endpoint node already emitted a
+        # prepared call there (a non-`Symbol` callee, so this splice-key test fails),
+        # which stays lazy inside the arm.
         if ex.head === :call && child isa Expr && child.head === :call &&
            !isempty(child.args) && child.args[1] isa Symbol &&
            haskey(nested_specs, child.args[1])

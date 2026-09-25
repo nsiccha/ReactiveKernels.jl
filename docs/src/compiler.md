@@ -242,6 +242,11 @@ the data. A condition that reads a live value stays an ordinary lazy branch.
 This includes the shape of a live array, such as `length(c)` of a runtime
 input. Only one-dimensional plate domains are split.
 
+An arm may contain a constructed object endpoint, such as
+`normal(lpi, 1.5).logpdf(yf)` under a missingness guard. The endpoint's
+recipes are rendered as source inside the arm, so each arm plate evaluates its
+own endpoint copy and no backend receives the branch.
+
 Without a binding, the cell runs its authored lazy branch unchanged.
 
 ### 5. Composition
