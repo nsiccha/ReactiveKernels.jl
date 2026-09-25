@@ -112,8 +112,10 @@ export tgi_category_lpmf, tgi_category_lpmfs,
     tgi_censored_lpdf, tgi_censored_lpdfs
 export tgi_category_stmts, tgi_response_stmts, tgi_censored_stmts
 export TGI_CELL_FUNCTIONS
+export rk_expm
 
 include("contract.jl")
+include("expm_rule.jl")
 include("pkcells.jl")
 include("pk_rectangular.jl")
 include("design.jl")

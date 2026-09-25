@@ -66,9 +66,9 @@ and `derivative_rule` a graph that authors a forward branch, a reverse branch,
 or both over array or scalar ports, into an RK-owned callable. The Enzyme,
 ChainRules and Mooncake adapters (`ext/ReactiveKernelsEnzymeExt.jl`,
 `ext/ReactiveKernelsChainRulesCoreExt.jl`, `ext/ReactiveKernelsMooncakeExt.jl`)
-derive every direction from the activity-selected cuts of that graph. DistributionKernels' `loggamma` and
-`logbeta` are the only rules in package source; the ODE backsolve adjoint
-consumes a caller's `DerivativeRule` right-hand side. Reverse-mode adapters
+derive every direction from the activity-selected cuts of that graph. The rules in package source are
+DistributionKernels' `loggamma` and `logbeta` plus ReactiveKernelsPPL's `rk_expm`; the ODE backsolve
+adjoint consumes a caller's `DerivativeRule` right-hand side. Reverse-mode adapters
 stage each rule in two cuts whose residuals come from cross-stage liveness, so
 a shared intermediate is retained rather than recomputed. Rule cuts already
 trace under Reactant as plain mathematics. Emitting them as EnzymeMLIR custom
