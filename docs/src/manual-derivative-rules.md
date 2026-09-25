@@ -188,6 +188,14 @@ The first vector consumer is the backsolve adjoint of
 reverse cut once per stage, so nothing differentiates the adaptive loop or
 the right-hand side.
 
+The linear-algebra consumer is `ReactiveKernelsPPL.rk_expm`: ordinary reverse
+Enzyme through `LinearAlgebra.exp` fails on its LAPACK `ccall`, so the owned
+callable authors the primal plus JVP/VJP branches — each an augmented-matrix
+exponential with top-right-block extraction — in one graph, and both Enzyme
+directions verify against finite differences. Cholesky needs no rule:
+ordinary Enzyme differentiates the built-in correctly, so the GP latent path
+swaps to it directly.
+
 ## A different boundary: `prepare_ad_pullback`
 
 The existing `prepare_ad_pullback` API asks a `DifferentiationInterface`
