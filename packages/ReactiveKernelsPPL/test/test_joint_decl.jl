@@ -568,9 +568,12 @@ end
 
 # Gradient check on an ALREADY-PREPARED :posterior kernel — the exact
 # `_check_gradient` body (same backend, findiff, tolerances) minus its
-# internal `prepare`, so the e2e pays the 9-minute joint-scale prepare once
-# per want instead of twice for `:posterior` (snag
-# `prepare-9min-on-034fa1d6`; delete this helper when prepare is fast).
+# internal `prepare`, so the e2e pays one joint-scale prepare per want
+# instead of twice for `:posterior`. On canonical `05116b82` that prepare is
+# no longer the historical 9-minute outlier: a fresh-process repro measured
+# plan 0.52 s and cold prepare 26.3 s, with warm follow-up preparations in
+# the 5–15 s range. Keep this helper as the cheaper gradient-proof path and
+# cite a fresh measurement before changing the verification strategy again.
 function _jd_check_gradient(kern, u)
     prep = prepare_ad(kern, _GEN_BACKEND, u; active = :unconstrained)
     g = ReactiveKernels.ad_value_and_gradient!(prep, similar(u), u)[2]
@@ -593,7 +596,7 @@ end
     pr = _jd_oracle_prior(nt)
     jac = logjac(built.layout, u)
     # Three prepares, one per want (ll/pr/posterior) — the `:log_jacobian`
-    # query path is covered in `test_query.jl` and adds a fourth 9-minute
+    # query path is covered in `test_query.jl` and adds another joint-scale
     # prepare here for no new proof (snag `prepare-9min-on-034fa1d6`).
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -719,12 +722,14 @@ end
                 b.evidence)
     end
     # Bind-level agreement (levelmaps evaluate identically on both sides).
-    # There is deliberately NO posterior-numbers comparison here: it costs
-    # four 9-minute joint-scale prepares (snag `prepare-9min-on-034fa1d6`)
-    # to re-prove what the structural comparison above (same plan modulo
-    # the naming stem) plus deterministic lowering plus the e2e already
-    # imply. (Proven once at 9320e1a — twin 150/150 with delta accounting —
-    # then cut as pure waste.)
+    # There is deliberately NO posterior-numbers comparison here: additional
+    # joint-scale preparations remain materially expensive (snag
+    # `prepare-9min-on-034fa1d6`; no longer 9 minutes, but cold preparations
+    # still cost tens of seconds on the 2026-09-25 canonical measurement).
+    # They would re-prove what the structural comparison above (same plan
+    # modulo the naming stem) plus deterministic lowering plus the e2e
+    # already imply. (Proven once at 9320e1a — twin 150/150 with delta
+    # accounting — then cut as pure waste.)
     cols = _jd_columns()
     bsu, bir = bind_data(su, cols), bind_data(ir, cols)
     @test [m.values for m in bsu.levelmaps] ==
