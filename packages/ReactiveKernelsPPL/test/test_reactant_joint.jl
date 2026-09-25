@@ -88,6 +88,41 @@ end
     @test_broken Array(rgrad_default) ≈ g rtol = 1e-9
 end
 
+# Corpus 17 (varying dummy): the `(c .== level)` mask nests inside the LP's
+# traced `.+`/`.*` fusion with no direct traced operand at the outermost
+# call, so the lazy nest kept its host style and Reactant's per-argument
+# standalone materialize produced the overlay-hostile `BitArray`
+# (`StackOverflowError`; snag `dummy-varying-xl-3b05117e`). The lowering now
+# dense-materializes host-only `Bool` nests (`Array{Bool}`), so the program
+# compiles with primal + gradient parity like its ranef siblings.
+@testset "Reactant ladder 1b: varying dummy (corpus 17) primal + gradient" begin
+    plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            r ~ varying_effect(g, [1, dummy(c, 2)])
+            mu = a .+ r
+            y .~ Normal.(mu, 1.5)
+        end, (:y, :c, :g))
+    bound = bind_data(plan, Dict{Symbol,AbstractVector}(
+        :y => [0.5, -1.2, 0.8, 1.5, -0.3, 0.9, -0.7, 1.1],
+        :c => [1, 2, 2, 1, 2, 1, 2, 1],
+        :g => [2, 1, 3, 1, 2, 3, 1, 2]))
+    built = build_kernel(bound)
+    post_q = prepare_query(built, bound, :sampler)
+    u = fill(0.1, built.layout.total)
+    native = post_q(u)
+    @test native ≈ -22.189852822758517 rtol = 1e-12
+    compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
+    @test Float64(compiled(Reactant.to_rarray(u))) ≈ native rtol = 1e-9
+    q = prepare_sampler(built, bound, u; backend = _RJ_BACKEND)
+    g = similar(u)
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    @test val ≈ native rtol = 1e-12
+    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
+    rval, rgrad = cad(Reactant.to_rarray(u))
+    @test Float64(rval) ≈ native rtol = 1e-9
+    @test Array(rgrad) ≈ g rtol = 1e-9
+end
+
 # Joint fixture at tiling K: bound plan + built program + sampler-cut kernel
 # + a deterministic unconstrained point (the benchmark's point, seed
 # 20260917).  `tiled_columns(1)` is the fixture itself (pinned below).

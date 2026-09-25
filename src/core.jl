@@ -175,17 +175,20 @@ end
 
 # Nested dotted calls stay lazy so Julia's broadcast fusion survives the
 # tensorized lowering: only the OUTERMOST dotted call of a nest materializes
-# (via `_tensorized_broadcast` above).  Materializing every nest level
-# separately changes WHICH broadcast style each level compiles under — a fused
-# dense expression such as `tril(X, -1) .+ 0.5 .* Diagonal(diag(X))` splits
-# into an isolated `0.5 .* Diagonal(...)` whose structured style trips the
-# `fzeropreserving` check on traced numbers (snag
-# `reactant-traced-ff8ff365`) — and allocates one temporary per level.  The
-# lazy form promotes exactly like the materializing one (same
-# `_tensorized_cat_operands`), so host/traced mixes lower identically; the
-# enclosing `broadcasted` nests it exactly as Julia's own lowering does.
+# (via `_tensorized_broadcast` above) — with one exception
+# (`_tensorized_lazy_materialize` below): a host-only `Bool` nest.
+# Materializing every nest level separately changes WHICH broadcast style
+# each level compiles under — a fused dense expression such as
+# `tril(X, -1) .+ 0.5 .* Diagonal(diag(X))` splits into an isolated
+# `0.5 .* Diagonal(...)` whose structured style trips the `fzeropreserving`
+# check on traced numbers (snag `reactant-traced-ff8ff365`) — and allocates
+# one temporary per level.  The lazy form promotes exactly like the
+# materializing one (same `_tensorized_cat_operands`), so host/traced mixes
+# lower identically; the enclosing `broadcasted` nests it exactly as Julia's
+# own lowering does.
 @inline _tensorized_lazy_broadcast(f, args...) =
-    Base.broadcasted(f, _tensorized_cat_operands(args)...)
+    _tensorized_lazy_materialize(
+        Base.broadcasted(f, _tensorized_cat_operands(args)...))
 
 # `broadcast(f, ...)` materializes a `Bool`-eltype result into a `BitArray`, and
 # a tracing backend's `call_with_reactant` recurses without termination on
@@ -205,6 +208,40 @@ end
     ) where {N}
     (N >= 1 && Base.Broadcast.combine_eltypes(bc.f, bc.args) === Bool) ?
         collect(bc) : Base.materialize(bc)
+end
+
+# A NESTED host-only `Bool` broadcast (a comparison mask fused inside a
+# traced expression, e.g. the PPL varying-dummy `(c .== 2)` inside the LP's
+# `.+`/`.*` nest) needs the same `BitArray` normalization as the outermost
+# level: a tracing backend standalone-materializes each nested argument of a
+# traced broadcast (Reactant's `_copyto!` maps `Base.materialize` over
+# `bc.args`), and its `copyto!(::BitArray, ::Broadcasted)` overlay re-enters
+# itself without termination (Reactant 0.2.284, the same upstream recursion
+# the outermost normalization guards — a bare `StackOverflowError` that
+# bisects to the wrong op).  The leaf-wise host promotion does NOT save this
+# shape: the promotion marker is the outermost call's first tensorized
+# argument, and when every traced operand hides inside a lazy nest the marker
+# is the host `Broadcasted` wrapper itself — the backend's promotion hook
+# (keyed on a genuine traced marker) never fires, so the mask keeps its host
+# `DefaultArrayStyle` and materializes to a `BitArray` (snag
+# `dummy-varying-xl-3b05117e`: an outermost `.+` over two lazy nests crashes,
+# while the same mask beside a DIRECT traced operand promotes and lowers).
+# Dense-materialize the nest HERE (`collect` gives `Array{Bool}`): the
+# enclosing levels see an ordinary dense host vector — exactly what the
+# outermost normalization already feeds them — so values, shapes, and the
+# promotion behavior above are unchanged.  Same predicate as
+# `_tensorized_materialize` (`DefaultArrayStyle`, `N >= 1`,
+# `combine_eltypes === Bool`); scalar (`N == 0`) nests stay lazy (they
+# materialize to a `Bool`, never a `BitArray`), and anything a backend
+# already promoted to a traced style keeps its lazy form and fusion.  Per
+# user decision `17bnc6t` this normalizes in the `@kernel` lowering, not in
+# Reactant.
+@inline _tensorized_lazy_materialize(bc) = bc
+@inline function _tensorized_lazy_materialize(
+        bc::Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle{N}}
+    ) where {N}
+    (N >= 1 && Base.Broadcast.combine_eltypes(bc.f, bc.args) === Bool) ?
+        collect(bc) : bc
 end
 
 # `LinearAlgebra.dot(a, b)` with a MIXED host-array × traced operand does not lower
