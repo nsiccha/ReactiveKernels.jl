@@ -50,6 +50,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _hsgp_basis_statements(plan))
     append!(stmts, _scan_reconstruction_statements(plan, layout))
     append!(stmts, _dar_reconstruction_statements(plan, layout))
+    append!(stmts, _horseshoe_coef_statements(plan))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _event_lp_statements(plan))
     append!(stmts, _likelihood_statements(plan))
@@ -1940,6 +1941,49 @@ _r2d2_for(plan::StructuralPlan, pred::Symbol) = begin
     return nothing
 end
 
+# Horseshoe derived coefficient blocks: a predictor with any HorseshoePrior
+# lays out no `:coefficient` block (layout skips it), so the block name
+# binds here as a design-ordered vector — triple products on horseshoe
+# addressees, Normal scalars elsewhere. Bound before the linear predictors,
+# which read the name unchanged. Scalar-only by validation (width-1
+# intercept/continuous blocks), so the literal has one entry per term —
+# no data-derived unrolling.
+function _horseshoe_coef_statements(plan::StructuralPlan)
+    stmts = Expr[]
+    for pred in plan.predictors
+        hs = _horseshoe_for(plan, pred.name)
+        isempty(hs) && continue
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
+        by_addr = Dict{Symbol,HorseshoePrior}(h.addressee => h for h in hs)
+        coords = Any[]
+        for b in shape.blocks
+            b.width == 0 && continue
+            (b.kind === InterceptTerm || b.kind === ContinuousTerm) ||
+                throw(ContractValidationError(
+                    "[generator] horseshoe over $(pred.name) meets a " *
+                    "$(b.kind) block (validate_horseshoe restricts terms)"))
+            b.width == 1 || throw(ContractValidationError(
+                "[generator] horseshoe over $(pred.name) meets width " *
+                "$(b.width) (scalar blocks only)"))
+            addr = only(b.labels)
+            h = get(by_addr, addr, nothing)
+            if h === nothing
+                push!(coords, horseshoe_normal_name(pred.name, addr))
+            else
+                raw = horseshoe_raw_name(pred.name, addr)
+                lam = horseshoe_lambda_name(pred.name, addr)
+                tau = horseshoe_tau_name(pred.name, addr)
+                prod = :($raw * $lam * $tau)
+                push!(coords, h.sign == 1 ? prod : :(-$prod))
+            end
+        end
+        coef = block_name(pred.name)
+        push!(stmts, :($coef = [$(coords...)]))
+    end
+    return stmts
+end
+
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     stmts = Expr[]
     terms = Any[]
@@ -1947,6 +1991,10 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         shape.width == 0 && continue
+        # A horseshoe predictor carries no Normal plate prior: its
+        # coordinates derive from triples/Normal scalars whose priors ride
+        # the sampled-parameter loop below.
+        isempty(_horseshoe_for(plan, pred.name)) || continue
         node = Symbol(:_ppl_prior_, pred.name)
         pw = Symbol(:_ppl_pw_prior_, pred.name)
         mut = Symbol(:_ppl_prmu_, pred.name)

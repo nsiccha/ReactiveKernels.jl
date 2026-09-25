@@ -106,6 +106,10 @@ function assign_layout(plan::StructuralPlan)
     entries = LayoutEntry[]
     offset = 1
     for pred in plan.predictors
+        # A horseshoe predictor lays out no coefficient block: every
+        # coordinate derives in-graph from its triple/Normal scalar (the
+        # generator binds the same block name as a local).
+        isempty(_horseshoe_for(plan, pred.name)) || continue
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         labels = Symbol[]

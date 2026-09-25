@@ -431,6 +431,45 @@ struct R2D2Prior
 end
 
 """
+    HorseshoePrior(predictor, addressee, local_scale, global_scale, sign)
+
+One per-coefficient horseshoe shrinkage prior (SB mirror: `coef ~
+Horseshoe(...)` lowers per call site to `raw ~ std_normal()`, `lambda ~
+cauchy(0, local_scale; lower=0)`, `tau ~ cauchy(0, global_scale;
+lower=0)`, `beta = raw * lambda * tau` — each scalar call owns its own
+tau). `addressee` is `:Intercept` or a continuous column of `predictor`
+(factor/matrix/monotonic addressees are out of the flat slice). `sign`
+is the use polarity (`+1` for `.+`, `-1` for `.-`): the derived coordinate
+holds `sign * raw * lambda * tau`.
+
+A predictor with any `HorseshoePrior` carries NO
+[`PopulationPrior`](@ref) rows and NO `:coefficient` layout block:
+every design coordinate is derived in-graph — horseshoe addressees
+from their `(raw, lambda, tau)` triple, every other addressee from a
+Normal scalar — and the triple/scalar priors ride the ordinary
+[`SampledParameter`](@ref) path. Scales are finite strictly-positive
+literals (SB's formula constants); a sampled scale is a follow-up.
+"""
+struct HorseshoePrior
+    predictor::Symbol
+    addressee::Symbol
+    local_scale::Float64
+    global_scale::Float64
+    sign::Int
+end
+
+"""Synthesized triple/scalar names for one horseshoe addressee (surface,
+validator, and generator share these — the names are the contract)."""
+horseshoe_raw_name(pred::Symbol, addr::Symbol) =
+    Symbol(:horseshoe_, pred, :_, addr, :_raw)
+horseshoe_lambda_name(pred::Symbol, addr::Symbol) =
+    Symbol(:horseshoe_, pred, :_, addr, :_lambda)
+horseshoe_tau_name(pred::Symbol, addr::Symbol) =
+    Symbol(:horseshoe_, pred, :_, addr, :_tau)
+horseshoe_normal_name(pred::Symbol, addr::Symbol) =
+    Symbol(:horseshoe_, pred, :_, addr, :_normal)
+
+"""
     SupportOverride
 
 A latent's support override: `nothing` (infer from the family), the bare
@@ -1170,6 +1209,7 @@ struct StructuralPlan
     hsgp_bases::Vector{HSGPBasis}
     kernel_plates::Vector{KernelPlate}
     r2d2_priors::Vector{R2D2Prior}
+    horseshoe_priors::Vector{HorseshoePrior}
     matrices::Vector{DesignMatrix}
     event_lps::Vector{LinearPKEventLPSpec}
 end
@@ -1192,7 +1232,8 @@ StructuralPlan(
         LevelMap[], ScanSpec[], DarSpec[], VaryingDraws[], VaryingSlice[],
         VectorParameter[],
         SplineBasis[], SplineVector[], HSGPBasis[], KernelPlate[],
-        R2D2Prior[], DesignMatrix[], LinearPKEventLPSpec[])
+        R2D2Prior[], HorseshoePrior[], DesignMatrix[],
+        LinearPKEventLPSpec[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -1224,6 +1265,7 @@ function StructuralPlan(
         hsgp_bases::Vector{HSGPBasis} = HSGPBasis[],
         kernel_plates::Vector{KernelPlate} = KernelPlate[],
         r2d2_priors::Vector{R2D2Prior} = R2D2Prior[],
+        horseshoe_priors::Vector{HorseshoePrior} = HorseshoePrior[],
         matrices::Vector{DesignMatrix} = DesignMatrix[],
         event_lps::Vector{LinearPKEventLPSpec} = LinearPKEventLPSpec[])
     return StructuralPlan(responses, predictors, population_priors,
@@ -1231,8 +1273,13 @@ function StructuralPlan(
         roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
         varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        kernel_plates, r2d2_priors, matrices, event_lps)
+        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps)
 end
+
+"""The horseshoe entries covering `pred` (empty when the predictor keeps
+its sampled coefficient block)."""
+_horseshoe_for(plan::StructuralPlan, pred::Symbol) =
+    [h for h in plan.horseshoe_priors if h.predictor === pred]
 
 """`combine_simultaneous` for one schedule's build: a declared
 event-LP on the schedule selects the V2 no-pre-sum build (a
@@ -1680,6 +1727,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_levelmaps(plan)
     _validate_priors(plan)
     _validate_r2d2(plan)
+    _validate_horseshoe(plan)
     _validate_kernels(plan)
     _validate_responses(plan)
     _validate_varying_draws(plan)
@@ -5090,6 +5138,10 @@ end
 function _validate_priors(plan::StructuralPlan)
     seen = Set{Tuple{Symbol,Symbol}}()
     r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
+    hs = Set{Tuple{Symbol,Symbol}}(
+        (h.predictor, h.addressee) for h in plan.horseshoe_priors)
+    hs_preds = Set{Symbol}(h.predictor for h in plan.horseshoe_priors)
+    param_names = Set{Symbol}(p.name for p in plan.parameters)
     glm_labels = Set{Symbol}(r.label for r in plan.responses if _is_glm_family(r.family))
     for pr in plan.population_priors
         any(p -> p.name === pr.predictor, plan.predictors) ||
@@ -5100,6 +5152,9 @@ function _validate_priors(plan::StructuralPlan)
             "mass lives there, not in a PopulationPrior row (explicit " *
             "Normal columns ride the overrides map)")
         key = (pr.predictor, pr.addressee)
+        key in hs && _fail(:plan,
+            "prior for $key duplicates a HorseshoePrior — a horseshoe " *
+            "addressee carries its triple, not a PopulationPrior row")
         key in seen &&
             _fail(:plan, "duplicate prior for $key")
         push!(seen, key)
@@ -5139,7 +5194,13 @@ function _validate_priors(plan::StructuralPlan)
         end
         any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
         for a in addressees
-            (pred.name, a) in seen ||
+            # A horseshoe predictor covers an addressee by its entry or by
+            # a synthesized Normal scalar (family checked in
+            # _validate_horseshoe); every other predictor by a
+            # PopulationPrior row.
+            (pred.name, a) in seen || (pred.name, a) in hs ||
+                (pred.name in hs_preds &&
+                    horseshoe_normal_name(pred.name, a) in param_names) ||
                 _fail(:plan, "no prior for ($(pred.name), $a)")
         end
     end
@@ -5252,6 +5313,107 @@ function _validate_r2d2_data(plan::StructuralPlan)
                 "non-positive variance $(repr(varx[j])) — a constant " *
                 "column cannot join the simplex (drop it or give it " *
                 "an explicit Normal prior)")
+        end
+    end
+    return nothing
+end
+
+# Horseshoe structural checks: predictor linkage, one structured prior
+# per predictor, scalar-only addressees on scalar-only predictors, use
+# polarity, finite positive scales, and triple linkage (each entry's
+# (raw, lambda, tau) sampled parameters exist with the SB geometry:
+# standard-Normal raw, half-Cauchy scales agreeing with the entry).
+function _validate_horseshoe(plan::StructuralPlan)
+    r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
+    seen = Set{Tuple{Symbol,Symbol}}()
+    by_name = Dict{Symbol,SampledParameter}(
+        p.name => p for p in plan.parameters)
+    for h in plan.horseshoe_priors
+        pred = nothing
+        for p in plan.predictors
+            p.name === h.predictor && (pred = p)
+        end
+        pred === nothing && _fail(:plan,
+            "horseshoe prior addresses unknown predictor $(h.predictor)")
+        h.predictor in r2d2 && _fail(:plan,
+            "predictor $(h.predictor) carries both an R2D2Prior and a " *
+            "HorseshoePrior — one structured prior per predictor")
+        key = (h.predictor, h.addressee)
+        key in seen && _fail(:plan, "duplicate horseshoe prior for $key")
+        push!(seen, key)
+        for t in pred.terms
+            (t.kind === InterceptTerm || t.kind === ContinuousTerm ||
+                t.kind === OffsetTerm) || _fail(h.predictor,
+                "horseshoe over predictor $(h.predictor) meets a " *
+                "$(t.kind) term — the flat slice covers " *
+                "intercept/continuous coefficients only")
+        end
+        addrs = Set{Symbol}()
+        for t in pred.terms
+            t.kind === InterceptTerm && push!(addrs, :Intercept)
+            t.kind === ContinuousTerm && push!(addrs, only(t.columns))
+        end
+        h.addressee in addrs || _fail(h.predictor,
+            "horseshoe prior addresses $(h.addressee), not an " *
+            "intercept/continuous column of predictor $(h.predictor)")
+        (h.sign == 1 || h.sign == -1) || _fail(h.predictor,
+            "horseshoe prior for $key has sign $(h.sign) (use polarity " *
+            "is +1/-1)")
+        isfinite(h.local_scale) && h.local_scale > 0 || _fail(h.predictor,
+            "horseshoe prior for $key has local_scale " *
+            "$(repr(h.local_scale)) (finite strictly positive)")
+        isfinite(h.global_scale) && h.global_scale > 0 || _fail(h.predictor,
+            "horseshoe prior for $key has global_scale " *
+            "$(repr(h.global_scale)) (finite strictly positive)")
+        raw = get(by_name, horseshoe_raw_name(h.predictor, h.addressee),
+            nothing)
+        raw === nothing && _fail(h.predictor,
+            "horseshoe prior for $key names no raw parameter " *
+            "($(horseshoe_raw_name(h.predictor, h.addressee)))")
+        (raw.family === :normal && raw.args == (arg1 = 0, arg2 = 1) &&
+            raw.support_override === nothing) || _fail(h.predictor,
+            "horseshoe raw $(raw.name) must be standard-Normal " *
+            "(identity support), got $(raw.family)$(raw.args) with " *
+            "override $(repr(raw.support_override))")
+        for (nm, sc, role) in (
+                (horseshoe_lambda_name(h.predictor, h.addressee),
+                    h.local_scale, "lambda"),
+                (horseshoe_tau_name(h.predictor, h.addressee),
+                    h.global_scale, "tau"))
+            q = get(by_name, nm, nothing)
+            q === nothing && _fail(h.predictor,
+                "horseshoe prior for $key names no $role parameter ($nm)")
+            (q.family === :cauchy && q.support_override === :positive &&
+                length(q.args) == 2 && q.args[1] == 0 &&
+                q.args[2] == sc) || _fail(h.predictor,
+                "horseshoe $role $nm must be half-Cauchy(0, $sc) " *
+                "(`HalfCauchy($sc)`), got $(q.family)$(q.args) with " *
+                "override $(repr(q.support_override))")
+        end
+    end
+    # Non-horseshoe addressees of a horseshoe predictor ride Normal
+    # scalars (the mixed-predictor coordinate).
+    for pname in Set{Symbol}(h.predictor for h in plan.horseshoe_priors)
+        pred = only(p for p in plan.predictors if p.name === pname)
+        hs_addrs = Set{Symbol}(h.addressee
+            for h in plan.horseshoe_priors if h.predictor === pname)
+        for t in pred.terms
+            addr = t.kind === InterceptTerm ? :Intercept :
+                t.kind === ContinuousTerm ? only(t.columns) : nothing
+            addr === nothing && continue
+            addr in hs_addrs && continue
+            nm = horseshoe_normal_name(pname, addr)
+            q = get(by_name, nm, nothing)
+            q === nothing && _fail(pname,
+                "horseshoe predictor $pname addressee $addr carries " *
+                "neither an entry nor its Normal scalar ($nm)")
+            (q.family === :normal && q.support_override === nothing &&
+                length(q.args) == 2 && isfinite(q.args[1]) &&
+                isfinite(q.args[2]) && q.args[2] > 0) || _fail(pname,
+                "horseshoe Normal scalar $nm must be " *
+                "Normal(finite, positive) (identity support), got " *
+                "$(q.family)$(q.args) with override " *
+                "$(repr(q.support_override))")
         end
     end
     return nothing
@@ -7297,6 +7459,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         vector_parameters = vectors2, spline_bases = bases,
         spline_vectors = plan.spline_vectors, hsgp_bases = hbases,
         kernel_plates = kbases, r2d2_priors = plan.r2d2_priors,
+        horseshoe_priors = plan.horseshoe_priors,
         matrices = plan.matrices, event_lps = elbases)
     validate_data(bound)
     return bound
