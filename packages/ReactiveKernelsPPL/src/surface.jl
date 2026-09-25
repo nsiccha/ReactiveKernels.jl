@@ -4025,14 +4025,15 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
         return _lower_leveled_response(lhs, call, range, weights, evidence,
             ctx, predictors, pred_idx, coefuse)
     end
-    family, lik_link, pred_link, loc, scale_raw, trials =
+    family, lik_link, pred_link, loc, scale_raw, trials, nu_raw =
         _lower_response_base(lhs, call, ctx)
     pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
+    nu = _lower_nu_use(lhs, nu_raw, ctx)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
-        evidence, Symbol(lhs, "_resp"), trials, range)
+        evidence, Symbol(lhs, "_resp"), trials, range; nu = nu)
 end
 
 # Run `thunk()`; on a surface failure, attribute it to mixture component
@@ -4869,6 +4870,7 @@ end
 
 const _RESPONSE_BASE_MSG =
     "response distribution must be `Normal.(mu, sigma)`, " *
+    "`StudentT.(nu, mu, sigma)`, " *
     "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link), " *
     "`Poisson.(exp.(eta))`, `Binomial.(n, logistic.(mu))` (or " *
     "`probit`/`cloglog` for the link), " *
@@ -4890,41 +4892,48 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     fam === :weighted &&
         _sfail("`weighted.(...)` goes outermost: " *
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
-    fam in (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
-        :Gamma, :Beta) || return _lower_response_base_error(lhs, rhs, fam)
+    fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
+        :NegativeBinomial2, :Gamma, :Beta) ||
+        return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
         return GaussianFam, IdentityLink, IdentityLink, args[1], args[2],
-        nothing
+        nothing, nothing
+    elseif fam === :StudentT
+        length(args) == 3 || _sfail("response $lhs: `StudentT` takes " *
+                                    "`StudentT.(nu, mu, sigma)`")
+        return StudentTFam, IdentityLink, IdentityLink, args[2], args[3],
+        nothing, args[1]
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link)")
         f, l, loc = _lower_bernoulli_link(lhs, args[1])
-        return f, l, IdentityLink, loc, nothing, nothing
+        return f, l, IdentityLink, loc, nothing, nothing, nothing
     elseif fam === :Binomial
         length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
                                     "`Binomial.(n, logistic.(mu))` (or `probit`/`cloglog` for the link)")
         f, l, loc = _lower_binomial_link(lhs, args[2])
         return f, l, IdentityLink, loc, nothing,
-        _lower_trials(lhs, args[1], ctx)
+        _lower_trials(lhs, args[1], ctx), nothing
     elseif fam === :NegativeBinomial2
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial2` takes " *
                                     "`NegativeBinomial2.(exp.(eta), phi)`")
         return NegativeBinomial2Fam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), args[2], nothing
+        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing
     elseif fam === :Gamma
         loc, scale = _lower_gamma_args(lhs, args, ctx)
-        return GammaLogFam, LogLink, LogLink, loc, scale, nothing
+        return GammaLogFam, LogLink, LogLink, loc, scale, nothing, nothing
     elseif fam === :Beta
         loc, scale = _lower_beta_args(lhs, args, ctx)
-        return BetaLogitFam, LogitLink, IdentityLink, loc, scale, nothing
+        return BetaLogitFam, LogitLink, IdentityLink, loc, scale, nothing,
+        nothing
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
         return PoissonLogFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), nothing, nothing
+        _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing
     end
 end
 
@@ -5028,6 +5037,9 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :negative_binomial2 && _sfail("response $lhs: use " *
                                           "`NegativeBinomial2` (the response " *
                                           "spelling, not the kernel endpoint)")
+    fam === :student_t && _sfail("response $lhs: use " *
+                                 "`StudentT` (the response " *
+                                 "spelling, not the kernel endpoint)")
     fam === :OrderedLogit && _sfail("response $lhs: unknown distribution " *
                                     "`:OrderedLogit` (write " *
                                     "`OrderedLogistic.(eta)`)")
@@ -5036,7 +5048,7 @@ function _lower_response_base_error(lhs, rhs, fam)
         "(`[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)` with plain `~` — " *
         "row-grouped, never broadcast)")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
-                  "(admitted: Normal, Bernoulli, Poisson, Binomial, " *
+                  "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
                   "NegativeBinomial2, Gamma, Beta, BernoulliLogit, " *
                   "PoissonLog, BinomialLogit, NegativeBinomial2Log, " *
                   "GammaLog, BetaLogit, CategoricalLogit, " *
@@ -5119,9 +5131,29 @@ function _lower_scale(lhs, s, ctx)
                   "expressions via an assignment first), got $(repr(s))")
 end
 
+# Student nu use-site lowering: a bare parameter/assignment name or a
+# literal, scalar only — no per-observation columns (a column name fails
+# at the contract's unknown-name gate), no predictor-fed nu (a modeled
+# nu is deferred), no expressions (bind via an assignment first).
+function _lower_nu_use(lhs, s, ctx)
+    s === nothing && return nothing
+    s isa Real && return s
+    if s isa Symbol
+        _is_scale_predictor_def(s, ctx) && _sfail(
+            "response $lhs nu $s is a predictor definition — " *
+            "predictor-fed nu (a modeled df) is deferred: use a scalar " *
+            "nu (parameter or literal)")
+        return s
+    end
+    return _sfail("response $lhs nu must be a bare parameter/assignment " *
+                  "name or a literal (bind expressions via an assignment " *
+                  "first), got $(repr(s))")
+end
+
 # Scale use-site lowering (Gaussian sigma, NB2 phi, Gamma alpha, Beta
-# kappa): a scalar scale (parameter/assignment name, raw per-observation
-# data column, literal) passes through `_lower_scale` untouched; a
+# kappa, Student sigma): a scalar scale (parameter/assignment name, raw
+# per-observation data column, literal) passes through `_lower_scale`
+# untouched; a
 # predictor definition feeds the scale slot — bare for an identity-link
 # scale (`Normal.(mu, sigma)`), or under one dotted link wrapper
 # (`Normal.(mu, exp.(sigma))` for log, `logistic.(sigma)` for logit).
@@ -5237,9 +5269,9 @@ end
 # Analyze (or intern) a scale predictor: exactly the location-predictor
 # treatment (`_lower_location`'s named-definition arm) under the use-site
 # link — affine analysis, coefficient-use recording, one link per
-# predictor. Family admission (Gaussian/NB2/Gamma; Beta deferred) is the
-# contract's gate (`_validate_scale_predictor`), so hand-built plans get
-# the same rule.
+# predictor. Family admission (Gaussian/NB2/Gamma/Student; Beta deferred)
+# is the contract's gate (`_validate_scale_predictor`), so hand-built
+# plans get the same rule.
 function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
         pred_idx, coefuse)
     haskey(pred_idx, name) || haskey(ctx.detmap, name) ||

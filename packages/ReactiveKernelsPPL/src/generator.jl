@@ -79,6 +79,7 @@ using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
     beta, inverse_gamma, binomial, negative_binomial2, uniform,
+    student_t,
     gp_exp_quad_cov, gp_chol_latent,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
 using SpecialFunctions: erfc, loggamma
@@ -889,6 +890,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     pw = _pw_name(r.label)
     if r.family === GaussianFam
         return _gaussian_plate_stmts(r, plan, node, pw)
+    elseif r.family === StudentTFam
+        return _student_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliLogitFam
         # Base GLM case (no evidence, no weights, no literal range): fused
         # whole-vector reduction. Ranged responses stay on the plate path
@@ -1224,6 +1227,27 @@ function _gaussian_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, lpv::Symbo
     else # :interval_censored
         return :(log($(nccdf(ub)) - $(nccdf(yv))))
     end
+end
+
+# Student-t plate: the Gaussian shape with a df argument — validation
+# guarantees `nu` (a sampled name or literal) and sigma, and fails
+# evidence closed (the Gaussian/Poisson-only gate), so the cell is the
+# plain `student_t` endpoint plus optional weights.
+function _student_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, lp]
+    yv, lpv = _dovar(1), _dovar(2)
+    sref = _thread_ref!(inputs, sarg)
+    nuv = _thread_ref!(inputs, r.nu)
+    cell = :(student_t($nuv, $lpv, $sref).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _bernoulli_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)

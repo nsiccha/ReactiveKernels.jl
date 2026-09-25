@@ -96,6 +96,7 @@ univariate components, SB `MixtureModel` mirror)."""
     BernoulliLogitGLMFam
     PoissonLogGLMFam
     MixtureFam
+    StudentTFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -311,6 +312,7 @@ struct LikelihoodSpec
     mixture_locs::Vector{Union{Symbol,Real}}
     mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
     mixture_weights::Union{Nothing,Symbol,Vector{Float64}}
+    nu::Union{Nothing,ParamName,Real}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
@@ -341,13 +343,14 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         mixture_locs::Vector{Union{Symbol,Real}} = Union{Symbol,Real}[],
         mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}} =
             Union{Nothing,Symbol,Real,ScalePredictorRef}[],
-        mixture_weights::Union{Nothing,Symbol,Vector{Float64}} = nothing)
+        mixture_weights::Union{Nothing,Symbol,Vector{Float64}} = nothing,
+        nu::Union{Nothing,ParamName,Real} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
         threshold_columns, threshold_coefs, extra_responses, factor_scales,
         factor_corr, glm_alpha, glm_beta, mixture_family, mixture_locs,
-        mixture_scales, mixture_weights)
+        mixture_scales, mixture_weights, nu)
 end
 
 """
@@ -1277,6 +1280,7 @@ const ADMITTED_TRIPLES = (
     (OrdinalFam, LogitLink, IdentityLink),
     (OrdinalFam, ProbitLink, IdentityLink),
     (OrdinalFam, CloglogLink, IdentityLink),
+    (StudentTFam, IdentityLink, IdentityLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order)."""
@@ -1615,7 +1619,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
-    PoissonLogGLMFam, MixtureFam)
+    PoissonLogGLMFam, MixtureFam, StudentTFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -5910,6 +5914,7 @@ function _validate_responses(plan::StructuralPlan)
         # and plate-param checks below).
         if r.family === MixtureFam
             _validate_mixture_response(r, plan, used_predictors)
+            _validate_nu(r, plan)
             continue
         end
         # A scale predictor feeds a slot exactly like a location predictor,
@@ -5925,6 +5930,7 @@ function _validate_responses(plan::StructuralPlan)
                 "Gaussian-identity only in slice 1 (got $(r.family)/$(r.link))",
             )
             _validate_scale(r, plan)
+            _validate_nu(r, plan)
             _validate_evidence_structure(r, plan)
             _validate_unleveled_fields(r)
             continue
@@ -5953,6 +5959,7 @@ function _validate_responses(plan::StructuralPlan)
                 "a plate-mean observation ($(r.predictor)) takes no range " *
                 "(the latent covers the whole column)")
             _validate_scale(r, plan)
+            _validate_nu(r, plan)
             _validate_evidence_structure(r, plan)
             _validate_unleveled_fields(r)
             continue
@@ -5963,6 +5970,7 @@ function _validate_responses(plan::StructuralPlan)
         if _is_simplex_family(r.family)
             _validate_simplex_response(r, plan)
             _validate_scale(r, plan)
+            _validate_nu(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -5972,6 +5980,7 @@ function _validate_responses(plan::StructuralPlan)
         if r.family === MvNormalCholeskyFam
             _validate_joint_response(r, plan, used_predictors)
             _validate_scale(r, plan)
+            _validate_nu(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -5981,6 +5990,7 @@ function _validate_responses(plan::StructuralPlan)
         if _is_glm_family(r.family)
             _validate_glm_response(r, plan)
             _validate_scale(r, plan)
+            _validate_nu(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -5994,9 +6004,11 @@ function _validate_responses(plan::StructuralPlan)
             "link triple ($(r.family), $(r.link), $(pred.link)) not admitted " *
             "(admitted: Gaussian/identity, Bernoulli-logit/probit/cloglog, " *
             "Poisson-log, Binomial-logit/probit/cloglog, NB2-log, Gamma-log, " *
-            "Beta-logit, Categorical-logit, Ordered-logit, Ordinal spellings)",
+            "Beta-logit, Categorical-logit, Ordered-logit, Ordinal spellings, " *
+            "Student-identity)",
         )
         _validate_scale(r, plan)
+        _validate_nu(r, plan)
         _validate_evidence_structure(r, plan)
         _validate_leveled_fields(r, plan, pred, used_predictors)
         if r.range !== nothing
@@ -6060,6 +6072,10 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     elseif r.family === GaussianFam
         eltype(col) <: Real ||
             _fail(r.label, "Gaussian response must be numeric")
+        return nothing
+    elseif r.family === StudentTFam
+        eltype(col) <: Real ||
+            _fail(r.label, "Student response must be numeric")
         return nothing
     elseif r.family === NormalIDGLMFam
         eltype(col) <: Real ||
@@ -6205,7 +6221,8 @@ _scale_need(fam::LikelihoodFamily) =
     fam === NegativeBinomial2Fam ? "NB2 response requires a dispersion phi" :
     fam === GammaLogFam ? "Gamma response requires a shape alpha" :
     fam === BetaLogitFam ? "Beta response requires a concentration kappa" :
-    fam === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" : nothing
+    fam === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" :
+    fam === StudentTFam ? "Student response requires a scale sigma" : nothing
 
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     need = _scale_need(r.family)
@@ -6244,7 +6261,8 @@ function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
     return _fail(r.label, "$what references unknown name $s")
 end
 
-# A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha):
+# A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha,
+# Student sigma):
 # the predictor exists, carries the use-site link (the
 # one-link-per-predictor rule), and is not the response's own location
 # predictor (the two slots take distinct predictors — the BRM-side plan
@@ -6263,7 +6281,7 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
         "Beta response with a scale predictor: predictor-fed concentration " *
         "(kappa) is deferred — use a scalar kappa (parameter or literal)")
     (fam === GaussianFam || fam === NegativeBinomial2Fam ||
-        fam === GammaLogFam) ||
+        fam === GammaLogFam || fam === StudentTFam) ||
         _fail(r.label, "this response family takes no scale predictor")
     (s.link === IdentityLink || s.link === LogLink ||
         s.link === LogitLink) ||
@@ -6285,9 +6303,9 @@ end
 
 # Data-level per-observation scale check: a scalar parameter/assignment name
 # resolves structurally; a raw data-column scale (the eight-schools known SE)
-# must be finite-positive numerics of length n_obs (a Gaussian/NB2/Gamma scale
-# is strictly positive). A derived column scale is rejected — per-obs scales
-# bind raw (mirrors the weights/trials raw-only rule).
+# must be finite-positive numerics of length n_obs (a Gaussian/NB2/Gamma/
+# Student scale is strictly positive). A derived column scale is rejected —
+# per-obs scales bind raw (mirrors the weights/trials raw-only rule).
 function _validate_scale_data(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family === MixtureFam
         for s in r.mixture_scales
@@ -6315,6 +6333,27 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
         _fail(r.label, "per-observation scale $s must be finite positive numerics")
     length(col) == plan.n_obs ||
         _fail(r.label, "scale column $s length $(length(col)) ≠ n_obs $(plan.n_obs)")
+    return nothing
+end
+
+# Student degrees of freedom: required (a sampled parameter/assignment name
+# or a finite-positive literal), scalar only — no per-observation columns,
+# no predictor-fed nu (a modeled nu is deferred). Unknown names fail
+# structurally: unlike scale there is no bind-time column form to defer to.
+function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
+    if r.family !== StudentTFam
+        r.nu === nothing ||
+            _fail(r.label, "only Student responses take nu (degrees of freedom)")
+        return nothing
+    end
+    n = r.nu
+    n === nothing &&
+        _fail(r.label, "Student response requires nu (degrees of freedom, " *
+            "parameter or literal)")
+    n isa Real && ((isfinite(n) && n > 0) ||
+        _fail(r.label, "nu literal must be finite positive"))
+    n isa Symbol && (n in _union_names(plan) ||
+        _fail(r.label, "nu references unknown name $n"))
     return nothing
 end
 

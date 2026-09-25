@@ -317,6 +317,87 @@ end
     _check_gradient(built.spec, bound, u3)
 end
 
+@testset "surface roundtrip student end to end" begin
+    cols, _ = _gen_columns()
+    # Sampled nu.
+    m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        sigma ~ Exponential(1.0)
+        nu ~ Gamma(2.0, 0.1)
+        mu = a .+ b .* x
+        y .~ StudentT.(nu, mu, sigma)
+    end
+    @test m isa RKPPLModel
+    r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        sigma ~ Exponential(1.0)
+        nu ~ Gamma(2.0, 0.1)
+        mu = a .+ b .* x
+        y .~ StudentT.(nu, mu, sigma)
+    end, (:y, :x)).responses)
+    @test (r.family, r.link, r.scale, r.nu) ===
+        (StudentTFam, IdentityLink, :sigma, :nu)
+    bound = m(; y = cols[:y], x = cols[:x])
+    @test isbound(bound)
+    built = build_kernel(bound)
+    u4 = [0.1, -0.2, 0.3, 0.5]
+    nt = constrain(built.layout, u4)
+    ref = _ref_student(bound.columns, Vector(nt.mu), nt.sigma, nt.nu)
+    @test _query(built.spec, bound, :posterior, u4) ≈ ref.ll + ref.pr + u4[3] + u4[4]
+    _check_gradient(built.spec, bound, u4)
+    # Literal nu and sigma.
+    m = @rkppl begin
+        mu = a .+ b .* x
+        y .~ StudentT.(4.0, mu, 2.0)
+    end
+    r = only(lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ StudentT.(4.0, mu, 2.0)
+    end, (:y, :x)).responses)
+    @test (r.family, r.scale, r.nu) === (StudentTFam, 2.0, 4.0)
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    u = [0.1, -0.2]
+    nt = constrain(built.layout, u)
+    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    ll = sum(logpdf(LocationScale(mm, 2.0, TDist(4.0)), yy)
+        for (mm, yy) in zip(mu, cols[:y]))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "student response failures" begin
+    Dn2 = (:y, :x)
+    # Arity: exactly (nu, mu, sigma).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ StudentT.(mu, 2.0)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ StudentT.(4.0, mu, 2.0, 1.0)
+    end, Dn2)
+    # The kernel-endpoint spelling redirects to the response head.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ student_t.(4.0, mu, 2.0)
+    end, Dn2)
+    # nu takes no expressions (bind via an assignment first).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ StudentT.(2.0 + 2.0, mu, 2.0)
+    end, Dn2)
+    # Predictor-fed nu is deferred.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        nupred = c .+ d .* x
+        y .~ StudentT.(nupred, mu, 2.0)
+    end, Dn2)
+end
+
 @testset "slice-2 response failures" begin
     Dn2 = (:y, :x)
     Dp2 = (:p, :x)
