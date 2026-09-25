@@ -2314,9 +2314,20 @@ struct NonAllocatingKernel{F,O,C,A,IN,OUT}
     ast::Expr
 end
 
-@inline function (k::NonAllocatingKernel)(args...)
-    length(args) == length(k.inputs) || throw(MethodError(k, args))
-    k.f(args...)
+# Emit positional arguments explicitly: splatting the captured `args` tuple
+# into the RGF call allocates (one tuple box per call) even though the emitted
+# program itself is allocation-free. Keep the public call nongenerated so
+# reflection over it continues to accept abstract argument types.
+@generated function _nonallocating_call(
+        k::NonAllocatingKernel, args::A, ::Val{N}) where {A<:Tuple,N}
+    positional = [:(getfield(args, $index)) for index in 1:N]
+    :(k.f($(positional...)))
+end
+
+@inline function (k::NonAllocatingKernel{F,O,C,A,IN,OUT})(
+        args::Vararg{Any,N}) where {F,O,C,A,IN,OUT,N}
+    N == fieldcount(IN) || throw(MethodError(k, args))
+    _nonallocating_call(k, args, Val(N))
 end
 
 function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply)
