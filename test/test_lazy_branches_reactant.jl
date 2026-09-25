@@ -37,6 +37,35 @@ end
     return picked
 end
 
+# A constructed endpoint under a branch arm (a missingness guard): the arm
+# carries its own endpoint evaluation, and a data-bound split removes the
+# branch before any backend sees it.
+@kernel arm_standard_normal() = begin
+    logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5z^2
+end
+
+@kernel arm_location_scale(standard, location::Float64, scale::Float64) = begin
+    log_scale::Float64 = log(scale)
+    scale::Float64 = exp(log_scale)
+    standardized(x::Float64)::Float64 = (x - location) / scale
+    logpdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard.logpdf(z) - log_scale
+    end
+end
+
+@kernel arm_normal = arm_location_scale(arm_standard_normal)
+
+@kernel reactant_endpoint_arm(y_full::Vector{Float64}, lp::Vector{Float64},
+                              mis_pos::Vector{Int}) = begin
+    pointwise = plate(y_full, lp, mis_pos) do yf, lpi, mp
+        cell::Float64 = mp == 0 ? arm_normal(lpi, 1.5).logpdf(yf) : 0.0 * yf
+        cell
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+
 _traced(v) = v isa AbstractArray ? Reactant.to_rarray(v) :
              Reactant.to_rarray(v; track_numbers = true)
 _host(v) = v isa Reactant.AbstractConcreteArray ? Array(v) : Reactant.to_number(v)
@@ -122,4 +151,25 @@ end
         @test _host(only(compiled_gradient(_traced(x)))) ≈
               [yi > 0 ? 1 / xi : 0.0 for (xi, yi) in zip(x, y)]
     end
+end
+
+@testset "a split arm endpoint compiles with no backend branch" begin
+    y_full = [0.5, -1.0, 2.0, 0.25]
+    lp = [0.0, 1.0, -0.5, 0.75]
+    mis_pos = [0, 1, 0, 1]
+    nlogpdf(x, m, s) = -0.5 * log(2π) - log(s) - 0.5 * ((x - m) / s)^2
+    ref = sum(mp == 0 ? nlogpdf(yf, lpi, 1.5) : 0.0 * yf
+              for (yf, lpi, mp) in zip(y_full, lp, mis_pos))
+    gref = [(mp == 0 ? (yf - lpi) / 1.5^2 : 0.0)
+            for (yf, lpi, mp) in zip(y_full, lp, mis_pos)]
+    k = prepare(reactant_endpoint_arm; have = (:y_full, :lp, :mis_pos),
+                want = :total, bound = (; y_full, mis_pos))
+    hlo = repr(Reactant.@code_hlo optimize = false k(_traced(lp)))
+    @test !occursin("stablehlo.if", hlo)
+    @test !occursin("stablehlo.select", hlo)
+    compiled = Reactant.@compile k(_traced(lp))
+    @test _host(compiled(_traced(lp))) ≈ ref
+    gradient(v) = Enzyme.gradient(Enzyme.Reverse, k, v)
+    compiled_gradient = Reactant.@compile gradient(_traced(lp))
+    @test _host(only(compiled_gradient(_traced(lp)))) ≈ gref
 end
