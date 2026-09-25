@@ -298,6 +298,17 @@ doses over two subjects. Compiled gradients matched native Enzyme to
 including a same-time dose/read schedule where both exponential tables are
 absent.
 
+## Addendum: StaticArrays-`exp` swap, 2026-09-25
+
+The hand-ported `_pk_expm3` Padé lanes above were replaced by the
+StaticArrays built-in `exp` on `SMatrix{3,3}` (user direction: use
+built-ins, no Stan-exactness). The hoisted-table structure is unchanged
+(exponentials still build outside the retained recurrence, one row at a
+time); only the kernel changed. Reactant compiles of the new kernel need
+Reactant-side control-flow support (deferred), so the compiled assertions
+were removed until that lands — the native fold still proves the
+restructure.
+
 The full joint K=1 posterior (7 observations, 101 unconstrained parameters)
 also passed. On the same #3241 binary, its compiled primal improved from the
 earlier 0.509 ms to 0.090 ms and its compiled gradient from 13.397 ms to

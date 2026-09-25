@@ -17,6 +17,7 @@ using ReactiveKernels
 import SpecialFunctions
 using SpecialFunctions: erfc, loggamma
 using LogExpFunctions: logaddexp
+using StaticArrays: SMatrix, SVector
 using Statistics: mean, std, var
 
 export ColumnRef, ParamName, ColumnData
