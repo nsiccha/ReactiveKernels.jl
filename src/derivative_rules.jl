@@ -190,6 +190,18 @@ function scalar_derivative_rule(spec::KernelSpec; primal::Symbol,
         primal_ops, cut_ops)
 end
 
+# A bare type in callee position (`UnitRange(a, b)`, `LowerTriangular(M)`)
+# lowers to the type object itself in the operation table. Its tuple field
+# type is then the abstract `UnionAll`/`DataType`, so a generated cut body
+# calling it infers `Any` — which Enzyme's shadow-only forward check refuses.
+# Routing the call through this singleton keeps the type a parameter and the
+# call inferable, with no captured state.
+struct _RuleTypeCall{T} end
+@inline (::_RuleTypeCall{T})(args...) where {T} = T(args...)
+_rule_callable_ops(ops::Tuple) = map(_rule_callable_op, ops)
+_rule_callable_op(op::Type) = _RuleTypeCall{op}()
+_rule_callable_op(op) = op
+
 function _derivative_cut_lowering(spec::KernelSpec, name::Symbol, have, want)
     p = plan(spec; have = have, want = want)
     Tuple(v.name for v in p.have) == have || throw(ArgumentError(
@@ -199,7 +211,7 @@ function _derivative_cut_lowering(spec::KernelSpec, name::Symbol, have, want)
     _needs_embedded_tensorization(p) && throw(ArgumentError(
         "scalar_derivative_rule($(name)): a scalar derivative rule cannot embed a plate"))
     ast, ops, _ = _lower_with_ops(_fuse_authored_plate_chains(p))
-    (_encode_cut_body(ast, name), ops)
+    (_encode_cut_body(ast, name), _rule_callable_ops(ops))
 end
 
 # Encode a lowered `function (__ops__, x::T...) name = __ops__[i](names...);

@@ -362,6 +362,38 @@ end
     @test gradient(xx -> sum(matvec(A, xx) .* w), backend, x) ≈ transpose(A) * w
 end
 
+@testset "vector derivative rule: bare-type callees stay inferable" begin
+    # `UnitRange(h1, n)` has two bare-port arguments, so it lowers to the
+    # `UnionAll` itself in the operation table. A generated cut body calling
+    # that abstract-typed table entry infers `Any`, which Enzyme's
+    # shadow-only forward check refuses; the generator routes such calls
+    # through an inferable singleton instead.
+    @kernel typecall_graph(E::Matrix{Float64}, E_dot::Matrix{Float64}) = begin
+        n::Int = size(E, 1)
+        h::Int = div(n, 2)
+        h1::Int = h + 1
+        r1::UnitRange{Int} = UnitRange(1, h)
+        r2::UnitRange{Int} = UnitRange(h1, n)
+        y::Matrix{Float64} = E[r1, r2]
+        y_dot::Matrix{Float64} = E_dot[r1, r2]
+        return y, y_dot
+    end
+    rule = derivative_rule(typecall_graph; primal = :y,
+        directions = (E = :E_dot,), tangent = :y_dot, name = :typecall)
+    @test has_forward_branch(rule) && !has_reverse_branch(rule)
+    E = [i + 0.1 * j for i in 1:4, j in 1:4]
+    Ed = [0.01 * (i - j) for i in 1:4, j in 1:4]
+    @test rule(E) == E[1:2, 3:4]
+    @test !any(op -> op isa Type, rule.forward_ops)
+    @test @inferred(forward_cut(rule, E, Ed)) == (E[1:2, 3:4], Ed[1:2, 3:4])
+    fwd = Enzyme.autodiff(Forward, Const(rule), Duplicated, Duplicated(E, Ed))
+    @test only(fwd) ≈ Ed[1:2, 3:4]
+    with_primal = Enzyme.autodiff(ForwardWithPrimal, Const(rule), Duplicated,
+        Duplicated(E, Ed))
+    @test with_primal[1] ≈ Ed[1:2, 3:4] && with_primal[2] ≈ E[1:2, 3:4]
+    @test_throws ArgumentError reverse_cut(rule, Val(1), E, Ed)
+end
+
 @testset "vector derivative rule: residual compaction (cross-stage liveness)" begin
     sm = derivative_rule(_DRV.softmax_rule; primal = :y, covector = :y_bar,
         cotangents = (x = :x_bar,), name = :softmax)
