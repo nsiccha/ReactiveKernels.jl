@@ -6114,6 +6114,11 @@ function _validate_mi_structure(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "mi() response $(r.response) takes a linear " *
               "predictor (scan/plate/simplex/joint/GLM locations compose " *
               "in a later increment)")
+    pred = plan.predictors[findfirst(p -> p.name === r.predictor, plan.predictors)]
+    any(!isempty(t.columns) for t in pred.terms) ||
+        _fail(r.label, "mi() response $(r.response) takes a location " *
+              "predictor with a data column (intercept-only crosses no " *
+              "length-n anchor, so n_obs is underivable — deferred)")
     r.weights === nothing ||
         _fail(r.label, "mi() response $(r.response) takes no weights " *
               "(SB's tested mi surface is uncomposed)")
@@ -7541,6 +7546,23 @@ be consumed. Columns are vectors or matrices (whole-design data, Stan
 numeric eltype; every per-observation role reads vectors only and fails
 closed on a matrix.
 """
+# n_obs derivation skips mi-managed columns (packed y_obs/Jobs): every
+# other column crosses at length n, so the first non-managed column
+# pins n_obs order-independently. All-managed (an mi response whose
+# location crosses no full-length column) fails closed — n is
+# underivable, and the structure gate already rejects that shape, so
+# this is unreachable past validation (defense in depth for direct
+# bind_data callers).
+function _bind_nrows(columns::AbstractDict{Symbol}, managed::Set{Symbol})
+    for (k, v) in columns
+        k in managed && continue
+        return _column_nrows(v)
+    end
+    throw(ContractValidationError(
+        "[bind] cannot derive n_obs: every crossed column is mi-managed " *
+        "(an mi-only column set carries no length-n anchor)"))
+end
+
 function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}())
@@ -7606,10 +7628,13 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     merged = merge(inferred, roles)
     # Kernel plans carry two column lengths by design: n_obs is the flat
     # length (vector models) or n_sub (all-scalar) — never first-column.
-    # Otherwise n_obs is the first column's ROW count (length for vectors).
+    # Otherwise n_obs is the first NON-managed column's ROW count (length
+    # for vectors): mi packs y_obs/Jobs short by design, and Dict order
+    # is not a crossing contract (deriving from a packed column fails
+    # every full-length column by order luck).
     # Grouped plans set n_obs to the primary (first-obs) response length.
     n = if isempty(kbases)
-        _column_nrows(first(values(columns)))
+        _bind_nrows(columns, _mi_managed_columns(plan))
     else
         gkp = only(kbases)
         if _is_grouped_kernel(gkp)

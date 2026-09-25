@@ -46,6 +46,10 @@ function _mi_response(family, link, scale; label = :y_resp, kwargs...)
         kwargs...)
 end
 
+_mi_unbind(p::StructuralPlan) = StructuralPlan(p.responses, p.predictors,
+    p.population_priors, p.parameters, p.assignments,
+    Dict{Symbol,AbstractVector}(), 0; matrices = p.matrices)
+
 function _mi_gaussian_plan(; scale = :sigma, cols = _mi_columns()[1], n = 4,
         response_kwargs...)
     params = scale isa Symbol && scale !== nothing ?
@@ -165,6 +169,20 @@ end
             AssignmentSpec[], cols, n)
         @test_throws ContractValidationError validate_plan(plan)
     end
+    # mi + intercept-only location: nothing full-length would cross,
+    # so n is underivable (deferred, fails closed with attribution).
+    let pred = PredictorSpec(:mu, IdentityLink,
+            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+                :Intercept, :intercept)], :mu),
+            r = LikelihoodSpec(struct_args..., nothing, _mi_none_evidence(),
+                :y_resp, nothing, nothing; mi_jobs = :Jobs_y)
+        plan = StructuralPlan([r], PredictorSpec[pred],
+            PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0)],
+            SampledParameter[SampledParameter(:sigma, :exponential,
+                (arg1 = 1.0,), nothing, :sigma)],
+            AssignmentSpec[], cols, n)
+        @test_throws ContractValidationError validate_plan(plan)
+    end
     # mi_jobs naming its own response is not an index column.
     let r = LikelihoodSpec(struct_args..., nothing, _mi_none_evidence(),
             :y_resp, nothing, nothing; mi_jobs = :y)
@@ -221,6 +239,35 @@ end
     mcols = copy(cols)
     mcols[:y] = Union{Missing,Float64}[0.2, missing]
     @test_throws ContractValidationError validate_plan(_mi_data_plan(mcols))
+end
+
+@testset "mi bind_data derives n_obs past packed columns" begin
+    # The BRM emitter binds (derivation runs); hand-built bound plans
+    # pass n explicitly. Repro precondition: a packed mi column iterates
+    # first — asserted, so a future rehash fails loudly, not silently.
+    cols, _ = _mi_columns()
+    @test first(keys(cols)) in (:y, :Jobs_y)
+    b = bind_data(_mi_unbind(_mi_gaussian_plan()), cols)
+    @test isbound(b)
+    @test b.n_obs == 4
+    @test validate_plan(b) === nothing
+    @test b.roles[:Jobs_y] === :data
+    built = build_kernel(b)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ref = _mi_ref_gaussian(b.columns, b.columns[:Jobs_y], Vector(nt.mu),
+        nt.sigma)
+    @test _mi_query(built.spec, b, :posterior, u) ≈ ref.ll + ref.pr + u[3]
+    # All-managed column set (nothing length-n crosses): loud, attributed.
+    u2 = _mi_unbind(_mi_gaussian_plan())
+    err = try
+        bind_data(u2, Dict{Symbol,AbstractVector}(:y => [0.2, -0.4],
+            :Jobs_y => [1, 3]))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ContractValidationError && occursin("mi-managed", err.message)
 end
 
 @testset "mi gaussian values and gradient" begin
