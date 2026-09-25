@@ -2322,15 +2322,18 @@ end
 
 # The additive support-override correction for a prior log-density (or `nothing`
 # for no override): `:positive` (half-Normal/half-Cauchy) renormalizes by exactly
-# +log(2) (symmetry at literal 0); `(:interval, lo, hi)` (a truncated Normal)
-# renormalizes by -log(cdf(hi) - cdf(lo)) at any location, where `argvals` are the
-# family's (mu, s) argument expressions (literals/refs for a scalar prior, or
-# per-cell do-vars for a plate prior — the CDF endpoints thread identically);
+# +log(2) (symmetry at literal 0); `:positive_stan` (the Stan-kernel half)
+# adds NOTHING — plain `_lpdf` plus the bare-`u` Jacobian;
+# `(:interval, lo, hi)` (a truncated Normal) renormalizes by
+# -log(cdf(hi) - cdf(lo)) at any location, where `argvals` are the family's
+# (mu, s) argument expressions (literals/refs for a scalar prior, or per-cell
+# do-vars for a plate prior — the CDF endpoints thread identically);
 # `(:upper, hi)` adds NOTHING — Stan's upper-bound kernel is the plain
 # normal_lpdf plus the bare-`u` Jacobian (the varying-`tau`/`:floored`
 # precedent: SB truncation never renormalizes).
 function _support_correction(ov::SupportOverride, argvals)
     ov === nothing && return nothing
+    ov === :positive_stan && return nothing  # Stan kernel semantics
     if ov isa Tuple
         ov[1] === :upper && return nothing  # Stan kernel semantics
         ov[1] === :interval || throw(ContractValidationError(
@@ -2340,13 +2343,16 @@ function _support_correction(ov::SupportOverride, argvals)
         mu, s = argvals[1], argvals[2]
         return :(-log(normal($mu, $s).cdf($hi) - normal($mu, $s).cdf($lo)))
     end
+    ov === :positive || throw(ContractValidationError(
+        "[generator] support override must be :positive or " *
+        ":positive_stan, got $ov"))
     return :(log(2))  # :positive half
 end
 
 # Scalar prior log-density per family via distribution-kernel endpoints
 # (Distributions.jl semantics). The support override adds the +log(2) half or
 # the -log(cdf(hi)-cdf(lo)) truncated-interval renormalization (`_support_correction`;
-# an `:upper` override adds nothing — Stan kernel semantics).
+# `:positive_stan`/`(:upper, hi)` overrides add nothing — Stan kernel semantics).
 function _sampled_prior_expr(p::SampledParameter)
     argvals = [v for v in values(p.args)]
     base = _family_logpdf_expr(p.family, argvals, p.name)

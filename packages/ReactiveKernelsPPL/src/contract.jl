@@ -437,7 +437,9 @@ One per-coefficient horseshoe shrinkage prior (SB mirror: `coef ~
 Horseshoe(...)` lowers per call site to `raw ~ std_normal()`, `lambda ~
 cauchy(0, local_scale; lower=0)`, `tau ~ cauchy(0, global_scale;
 lower=0)`, `beta = raw * lambda * tau` — each scalar call owns its own
-tau). `addressee` is `:Intercept` or a continuous column of `predictor`
+tau; the halves ride `:positive_stan`, Stan lower-bound kernel
+semantics with NO truncation renormalizer, matching SB which never
+renormalizes bounds). `addressee` is `:Intercept` or a continuous column of `predictor`
 (factor/matrix/monotonic addressees are out of the flat slice). `sign`
 is the use polarity (`+1` for `.+`, `-1` for `.-`): the derived coordinate
 holds `sign * raw * lambda * tau`.
@@ -474,7 +476,11 @@ horseshoe_normal_name(pred::Symbol, addr::Symbol) =
 
 A latent's support override: `nothing` (infer from the family), the bare
 `Symbol` `:positive` (half-Normal/half-Cauchy truncation of a real-support
-family, exact +log(2) at a literal-zero location), the tuple
+family, exact +log(2) at a literal-zero location), the bare `Symbol`
+`:positive_stan` (the same exp-constrained half shape under Stan
+lower-bound kernel semantics — plain `_lpdf` plus the bare-`u` Jacobian,
+NO truncation renormalizer, matching SB which never renormalizes
+bounds), the tuple
 `(:interval, lo, hi)` (a two-sided finite truncation `truncated(Normal(mu, s),
 lo, hi)` — an affine-logistic constrained transform onto `(lo, hi)` with the
 renormalized truncated density), or the tuple `(:upper, hi)` (an upper-only
@@ -494,7 +500,8 @@ One non-coefficient latent (scalar, slice 1). `args` use POSITIONAL keys
 semantics (`Exponential(θ)` = scale θ). Values are literals or
 [`ParamName`](@ref)s (hierarchical OK, cycles rejected). `support_override`
 is a [`SupportOverride`](@ref): `nothing` (infer from family), `:positive`
-(half-Normal/half-Cauchy), `(:interval, lo, hi)` (a finite truncated
+(half-Normal/half-Cauchy), `:positive_stan` (the Stan-kernel half,
+unnormalized), `(:interval, lo, hi)` (a finite truncated
 interval), or `(:upper, hi)` (an upper-only truncation with Stan kernel
 semantics).
 """
@@ -4282,14 +4289,16 @@ function _validate_support_override(label, family::Symbol,
             ":interval lower bound must be < upper bound; got ($lo, $hi)")
         return nothing
     end
-    ov === :positive || _fail(label, "support override must be :positive, got $ov")
+    (ov === :positive || ov === :positive_stan) ||
+        _fail(label, "support override must be :positive or " *
+              ":positive_stan, got $ov")
     (family === :normal || family === :cauchy) || _fail(label,
-        ":positive override only applies to normal/cauchy " *
+        "$ov override only applies to normal/cauchy " *
         "(half-Normal/half-Cauchy); got $family")
     loc = first(values(args))
     loc isa Real && loc == 0 || _fail(label,
-        ":positive override requires literal zero location " *
-        "(+log(2) is exact only by symmetry at 0); got $(repr(loc))")
+        "$ov override requires literal zero location " *
+        "(the half shape truncates at 0); got $(repr(loc))")
     return nothing
 end
 
@@ -5322,7 +5331,8 @@ end
 # per predictor, scalar-only addressees on scalar-only predictors, use
 # polarity, finite positive scales, and triple linkage (each entry's
 # (raw, lambda, tau) sampled parameters exist with the SB geometry:
-# standard-Normal raw, half-Cauchy scales agreeing with the entry).
+# standard-Normal raw, Stan-kernel half-Cauchy scales agreeing with the
+# entry — no truncation renormalizer, SB never renormalizes bounds).
 function _validate_horseshoe(plan::StructuralPlan)
     r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
     seen = Set{Tuple{Symbol,Symbol}}()
@@ -5383,12 +5393,13 @@ function _validate_horseshoe(plan::StructuralPlan)
             q = get(by_name, nm, nothing)
             q === nothing && _fail(h.predictor,
                 "horseshoe prior for $key names no $role parameter ($nm)")
-            (q.family === :cauchy && q.support_override === :positive &&
+            (q.family === :cauchy && q.support_override === :positive_stan &&
                 length(q.args) == 2 && q.args[1] == 0 &&
                 q.args[2] == sc) || _fail(h.predictor,
-                "horseshoe $role $nm must be half-Cauchy(0, $sc) " *
-                "(`HalfCauchy($sc)`), got $(q.family)$(q.args) with " *
-                "override $(repr(q.support_override))")
+                "horseshoe $role $nm must be Stan-kernel half-Cauchy " *
+                "(0, $sc) (`:positive_stan`, no renormalizer — SB " *
+                "never renormalizes bounds), got $(q.family)$(q.args) " *
+                "with override $(repr(q.support_override))")
         end
     end
     # Non-horseshoe addressees of a horseshoe predictor ride Normal

@@ -1,6 +1,7 @@
 # Per-coefficient horseshoe shrinkage prior (SB `_sb_horseshoe[_scaled]`
-# mirror): beta = raw * lambda * tau with raw ~ N(0,1) and half-Cauchy
-# local/global scales, one triple per coefficient.
+# mirror): beta = raw * lambda * tau with raw ~ N(0,1) and Stan-kernel
+# half-Cauchy local/global scales (no truncation renormalizer — SB never
+# renormalizes bounds), one triple per coefficient.
 using Distributions: Normal, Cauchy, Exponential, logpdf
 using Test
 
@@ -43,10 +44,10 @@ end
         @test raw.support_override === nothing
         lam = got[Symbol(:horseshoe_mu_, addr, :_lambda)]
         @test lam.family === :cauchy && lam.args == (arg1 = 0, arg2 = ls)
-        @test lam.support_override === :positive
+        @test lam.support_override === :positive_stan
         tau = got[Symbol(:horseshoe_mu_, addr, :_tau)]
         @test tau.family === :cauchy && tau.args == (arg1 = 0, arg2 = gs)
-        @test tau.support_override === :positive
+        @test tau.support_override === :positive_stan
     end
     # A stated Normal beside a horseshoe stays Normal (mixed predictor).
     mixed = lower_rkppl(quote
@@ -90,11 +91,11 @@ end
     ll = sum(logpdf.(Normal.(mu, sig), cols[:y]))
     pr = logpdf(Normal(0, 1), icpt) +
         logpdf(Normal(0, 1), raw1) +
-        logpdf(Cauchy(0, 1), lam1) + log(2) +
-        logpdf(Cauchy(0, 1), tau1) + log(2) +
+        logpdf(Cauchy(0, 1), lam1) +
+        logpdf(Cauchy(0, 1), tau1) +
         logpdf(Normal(0, 1), raw2) +
-        logpdf(Cauchy(0, 0.5), lam2) + log(2) +
-        logpdf(Cauchy(0, 0.25), tau2) + log(2) +
+        logpdf(Cauchy(0, 0.5), lam2) +
+        logpdf(Cauchy(0, 0.25), tau2) +
         logpdf(Exponential(1), sig)
     jac = u[1] + u[4] + u[5] + u[7] + u[8]
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
@@ -124,8 +125,8 @@ end
     mu = u[2] .+ b1 .* cols[:x1]
     ll = sum(logpdf.(Normal.(mu, sig), cols[:y]))
     pr = logpdf(Normal(0, 1), u[2]) + logpdf(Normal(0, 1), u[3]) +
-        logpdf(Cauchy(0, 1), exp(u[4])) + log(2) +
-        logpdf(Cauchy(0, 1), exp(u[5])) + log(2) +
+        logpdf(Cauchy(0, 1), exp(u[4])) +
+        logpdf(Cauchy(0, 1), exp(u[5])) +
         logpdf(Exponential(1), sig)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[1] + u[4] + u[5]
     _check_gradient(built.spec, bound, u)

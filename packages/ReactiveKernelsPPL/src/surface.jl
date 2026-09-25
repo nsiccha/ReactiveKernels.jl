@@ -6632,9 +6632,9 @@ function _lower_horseshoe_priors(sample, coefuse, predictors,
                         (horseshoe_raw_name(pred.name, addr), :normal,
                             (arg1 = 0, arg2 = 1), nothing),
                         (horseshoe_lambda_name(pred.name, addr), :cauchy,
-                            (arg1 = 0, arg2 = ls), :positive),
+                            (arg1 = 0, arg2 = ls), :positive_stan),
                         (horseshoe_tau_name(pred.name, addr), :cauchy,
-                            (arg1 = 0, arg2 = gs), :positive))
+                            (arg1 = 0, arg2 = gs), :positive_stan))
                     nm in taken && _sfail(
                         "horseshoe over $(pred.name): synthesized $nm " *
                         "collides with a model name — rename yours")
