@@ -2,23 +2,28 @@
 # `joint_pk_qt_tgi_brm1` subject-frame declarations through EXISTING thin-layer
 # varying/preprocessing machinery (no new IR).
 #
-# SB source of truth (bruno `kb-impl/Bruno-arv393-tgi` @ `3af22846`):
+# SB source of truth (bruno `kb-impl/Bruno-arv393-tgi-brm-cv-consume` @
+# `193a2a43`, on `kb-approved`):
 # - PK/QT declarations: `web-pkpd/src/brm_integration.jl` joint body
-#   (~lines 4149-4175) + `JOINT_PK_QT_FORMULAS_V2` (:207-229), audited end to
-#   end by triple `web-pkpd/test/stan_audit_triples/joint_brm2_default.md`
+#   + `JOINT_PK_QT_FORMULAS_V2`, audited end to end by triple
+#   `web-pkpd/test/stan_audit_triples/joint_brm2_default.md`
 #   (§1 BRM text, §2 SLIC, §3 Stan).
 # - TGI declarations: `web-pkpd/src/brm_joint_tgi.jl` `_joint_tgi_body`
-#   (:374-388, aggregate branch; no audit triple covers the tumor block, so
-#   TGI terms cite SB source lines + the brm2-triple lowering pattern).
+#   (aggregate branch; no audit triple covers the tumor block, so TGI
+#   terms cite SB source lines + the brm2-triple lowering pattern).
+# Since the W3a pin (`3af22846`): `f201d6bd` moved the TGI growth/kill
+# margins into the shared `|p|` block (9-dim `LKJCholesky(9, 1.0)`);
+# `733f6920` added the `net_kill` parametrization. Both are covered below.
 #
-# COVERED (default config only — aggregate, direct_linear, gaussian QT obs,
-# log_linear, lugano_ct, spd; everything else fails closed, sequenced
-# separately): the 7 subject-frame LPs (`log_Vc log_k10 log_k12 log_k21
-# log_ka qt_base qt_slope`) with fixed-effect covariates per
-# `JOINT_PK_QT_FORMULAS_V2`, the shared 7-dim `|p|` block (`LKJCholesky(7,
-# 2.0)`), the TGI `|tg|` 2-dim block (`LKJCholesky(2, 2.0)`), the continuous
-# `|tb|` block (`tgi_ly0`), every `effect()` prior, and the scalar params
+# COVERED (two configs — everything else fails closed, sequenced
+# separately): the 7 subject-frame PK/QT LPs with fixed-effect covariates
+# per `JOINT_PK_QT_FORMULAS_V2`, the shared 9-dim `|p|` block
+# (`LKJCholesky(9, 1.0)`: 7 PK/QT + 2 TGI margins), the continuous `|tb|`
+# block (`tgi_ly0`), every `effect()` prior, and the scalar params
 # (`sigma_add sigma_prop qt_scale tgi_sigma tgi_c_cr`).
+# - default: `growth_kill`, intercept-only TGI formulas, lugano_ct + spd.
+# - memo (`arv393_pk_qt_tgi_memo`): `net_kill`, indication on the net/kill
+#   margins + full covariates on `tgi_ly0`, recist + sld.
 #
 # TGI observation is admitted as `:continuous` ONLY: the fixed HAVE seam
 # carries `tgi_ly0`, which SB emits only under `observation == "continuous"`
@@ -85,15 +90,41 @@ const JOINT_DECL_PK_FORMULAS_V2 = (
 )
 
 """Default-config TGI LP formula spellings (SB `JOINT_TGI_FORMULAS_V1`,
-`brm_joint_tgi.jl:68` — all intercept-only)."""
+`brm_joint_tgi.jl` — all intercept-only)."""
 const JOINT_DECL_TGI_FORMULAS_V1 = (tgi_kg = "1", tgi_kd = "1", tgi_ly0 = "1")
 
-"""Joint declaration LP symbols in SB bucket order (`|p|` 1..7, then `|tg|`,
-then `|tb|`). TGI log-LPs are named by SB LP (`log_tgi_kg`), not by SB
-constrained (`tgi_kg`) — the constrained map is `exp` for the 7 log-LPs,
-identity for `qt_base qt_slope tgi_ly0`."""
-const JOINT_DECL_LPS = (:log_Vc, :log_k10, :log_k12, :log_k21, :log_ka,
-    :qt_base, :qt_slope, :log_tgi_kg, :log_tgi_kd, :tgi_ly0)
+"""Memo-config TGI LP formula spellings (memo `arv393_pk_qt_tgi_memo`
+`metadata.yml`: indication on the growth-direction/kill margins, full
+covariates on the baseline). Keys keep SB's `joint_tgi_kg_formula` naming
+even under `net_kill` (SB's kwarg carries the growth-DIRECTION margin's
+formula in both parametrizations)."""
+const JOINT_DECL_TGI_FORMULAS_MEMO = (tgi_kg = "1 + indication",
+    tgi_kd = "1 + indication", tgi_ly0 = "1 + male + standardize(age_yr) + " *
+        "standardize(weight_kg) + indication")
+
+"""TGI growth-direction parametrizations (SB `JOINT_TGI_PARAMETRIZATIONS`,
+`brm_joint_tgi.jl`, user decision `2026-09-22T10-15-09-564-1186i36`):
+`growth_kill` samples the log-linked `log_tgi_kg` LP (constrained `exp`);
+`net_kill` samples the identity-linked `tgi_net` LP (constrained identity,
+may be negative)."""
+const JOINT_DECL_TGI_PARAMETRIZATIONS = (:growth_kill, :net_kill)
+
+"""Growth-direction LP symbol for a parametrization (`:log_tgi_kg` under
+`growth_kill`, `:tgi_net` under `net_kill`)."""
+_joint_decl_growth_lp(par::Symbol) =
+    par === :net_kill ? :tgi_net : :log_tgi_kg
+
+"""Joint declaration LP symbols in SB bucket order (`|p|` 1..9, then `|tb|`;
+`parametrization` selects the growth-direction margin). Log-LPs are named
+by SB LP (`log_tgi_kg`), not by SB constrained (`tgi_kg`) — the
+constrained map is `exp` for the 7 log-LPs, identity for `qt_base
+qt_slope tgi_net tgi_ly0`."""
+joint_decl_lps(par::Symbol = :growth_kill) = (:log_Vc, :log_k10, :log_k12,
+    :log_k21, :log_ka, :qt_base, :qt_slope, _joint_decl_growth_lp(par),
+    :log_tgi_kd, :tgi_ly0)
+
+"""Default-config LP roster (`joint_decl_lps(:growth_kill)`)."""
+const JOINT_DECL_LPS = joint_decl_lps()
 
 # SB population-intercept priors (loc, scale) per LP — baked literals from the
 # joint body (`brm_integration.jl:4157-4161`: `log(vc_prior_median=10.0)`,
@@ -110,6 +141,7 @@ const JOINT_DECL_PK_INTERCEPT_PRIORS = Dict{Symbol,Tuple{Float64,Float64}}(
 )
 const JOINT_DECL_TGI_INTERCEPT_SCALES = Dict{Symbol,Tuple{Float64,Float64}}(
     :log_tgi_kg => (0.0, 1.0),
+    :tgi_net => (0.0, 1.5),
     :log_tgi_kd => (0.0, 1.5),
 )
 
@@ -118,29 +150,44 @@ age+weight 0.1 (`brm_integration.jl:3883-3892`), indication 1.0 (:3904-3908)."""
 const JOINT_DECL_PK_COV_SCALES = (male = 0.1, standardize_age_yr = 0.1,
     standardize_weight_kg = 0.1, indication = 1.0)
 
-"""SB `sd()` marginal-scale priors per bucket, Distributions.jl SCALE
-(`sd(:, p) ~ Exponential(0.3333)` constant, `brm_integration.jl:3693`;
-`sd(:, tg) ~ Exponential(0.5)` + `sd(:, tb) ~ Exponential(1.0)`,
-`brm_joint_tgi.jl:384,377`). SB emits Stan rates 1/scale (3.0/2.0/1.0,
-triple §2-§3). Carried as `VaryingSdPrior(:exponential, θ)` (fix
-`6228160` — the IR takes the scale directly, no inversion)."""
-const JOINT_DECL_SD_SCALES = (p = 0.3333333333333333, tg = 0.5, tb = 1.0)
+"""SB TGI-margin population-covariate prior scales (memo config): male /
+standardized age+weight 0.1 via the wildcard `effect(:, ·)` lines (shared
+with PK/QT — `model_body.brm`); indication 1.0 via BRM's default
+`std_normal()` (no explicit `effect()` line covers TGI indication —
+emitted Stan `cat_tgi_*_indication_beta ~ std_normal()`)."""
+const JOINT_DECL_TGI_COV_SCALES = (male = 0.1, standardize_age_yr = 0.1,
+    standardize_weight_kg = 0.1, indication = 1.0)
 
-"""SB `cor()` LKJ shapes per bucket (`cor(:, p) ~ LKJCholesky(7, 2.0)`,
-triple §1; `cor(:, tg) ~ LKJCholesky(2, 2.0)`, `brm_joint_tgi.jl:385`;
-`|tb|` K=1 takes SB's default eta 1.0 — vacuous, term exactly 0.0)."""
-const JOINT_DECL_LKJ = (p = (7, 2.0), tg = (2, 2.0), tb = (1, 1.0))
+"""SB `sd()` marginal-scale priors per bucket, Distributions.jl SCALE: the
+shared 9-block carries `sd(:, p) ~ Exponential(0.3333)` for the 7 PK/QT
+margins plus per-margin `sd(tgi_·, p) ~ Exponential(0.5)` overrides
+(`_re_r2d2_sd_block` historical path, `brm_integration.jl`; `f201d6bd`);
+`sd(:, tb) ~ Exponential(1.0)` (`brm_joint_tgi.jl`). SB emits Stan rates
+1/scale (3.0/2.0/1.0, triple §2-§3). Carried as
+`VaryingSdPrior(:exponential, θ)` (fix `6228160` — the IR takes the scale
+directly, no inversion)."""
+const JOINT_DECL_SD_SCALES = (p = 0.3333333333333333, tgi = 0.5, tb = 1.0)
+
+"""SB `cor()` LKJ shapes per bucket (`cor(:, p) ~ LKJCholesky(9, 1.0)` —
+eta 1.0 keeps the 7-dim PK/QT principal submatrix at LKJ(7,2),
+`f201d6bd`; `|tb|` K=1 takes SB's default eta 1.0 — vacuous, term exactly
+0.0). The old `|tg|` bucket is gone from SB's emission."""
+const JOINT_DECL_LKJ = (p = (9, 1.0), tb = (1, 1.0))
 
 """SB residual-scale prior scale, V2 `raw_axes` (`pk_residual_scale = 0.25`,
 `brm_integration.jl:3977`; `sigma_add/sigma_prop ~ Exponential(0.25)`)."""
 const JOINT_DECL_PK_RESIDUAL_SCALE = 0.25
 
 """SB TGI scalar priors: `tgi_sigma ~ LogNormal(log(0.13), 0.5)`
-(`brm_joint_tgi.jl:386`); `tgi_c_cr ~ Normal(-2.3, 1.0; upper=log(0.5))`
-under default lugano_ct+spd (:363-369 — carried as `(:upper, hi)`, fix
-`5c38658`)."""
+(`brm_joint_tgi.jl`); `tgi_c_cr ~ Normal(-2.3, 1.0; upper=log_pr)` with the
+PR-boundary upper by thresholds+measure pair (lugano_ct+spd → `log(0.5)`;
+recist+sld → `log(0.7)` — `measure_scale=1.0` in both admitted pairs, so
+the location stays `-2.3`; carried as `(:upper, hi)`, fix `5c38658`)."""
 const JOINT_DECL_TGI_SIGMA = (log(0.13), 0.5)
 const JOINT_DECL_TGI_C_CR = (loc = -2.3, scale = 1.0, upper = log(0.5))
+const JOINT_DECL_TGI_C_CR_UPPER =
+    Dict{Tuple{Symbol,Symbol},Float64}((:lugano_ct, :spd) => log(0.5),
+        (:recist, :sld) => log(0.7))
 
 """SB-declared indication levels (`_ARV393_INDICATION_LEVELS`,
 `brm_integration.jl:2835`): CA.levels order = sort order — the (2,:end)
@@ -156,12 +203,15 @@ const JOINT_DECL_TGI_OBSERVATIONS = (:continuous,)
 """TGI structures the declarations lower (`resistant_fraction` owns
 `tgi_logit_phi`, sequenced separately)."""
 const JOINT_DECL_TGI_STRUCTURES = (:log_linear,)
-"""TGI thresholds the declarations lower (`recist` rescales, `estimated` owns
-`tgi_d_pr`/`tgi_d_pd` — both sequenced separately)."""
-const JOINT_DECL_TGI_THRESHOLDS = (:lugano_ct,)
-"""TGI measures the declarations lower (`sld` halves log thresholds and
-reinterprets rates — sequenced separately)."""
-const JOINT_DECL_TGI_MEASURES = (:spd,)
+"""TGI thresholds the declarations lower (`estimated` owns `tgi_d_pr` /
+`tgi_d_pd` — sequenced separately). Only the (thresholds, measure) pairs
+in `JOINT_DECL_TGI_C_CR_UPPER` lower; SB's other two combos (lugano+sld,
+recist+spd) fail closed as untested."""
+const JOINT_DECL_TGI_THRESHOLDS = (:lugano_ct, :recist)
+"""TGI measures the declarations lower (`sld` carries the memo recist+sld
+pair; the other (thresholds, measure) combos fail closed — see
+`JOINT_DECL_TGI_THRESHOLDS`)."""
+const JOINT_DECL_TGI_MEASURES = (:spd, :sld)
 
 """Admit one joint-declaration option, fail-closed naming the admitted
 spellings (the `admit_qt_spine` precedent)."""
@@ -184,6 +234,21 @@ admit_joint_decl_tgi_thresholds(v::Symbol) =
     _admit_joint_decl("TGI thresholds", v, JOINT_DECL_TGI_THRESHOLDS)
 admit_joint_decl_tgi_measure(v::Symbol) =
     _admit_joint_decl("TGI measure", v, JOINT_DECL_TGI_MEASURES)
+admit_joint_decl_tgi_parametrization(v::Symbol) =
+    _admit_joint_decl("TGI parametrization", v,
+        JOINT_DECL_TGI_PARAMETRIZATIONS)
+
+"""Admit the (thresholds, measure) pair: only the two SB combos with a
+pinned `tgi_c_cr` upper lower (the other two fail closed as untested)."""
+function admit_joint_decl_tgi_thresholds_measure(thresholds::Symbol,
+        measure::Symbol)
+    haskey(JOINT_DECL_TGI_C_CR_UPPER, (thresholds, measure)) ||
+        throw(ContractValidationError("[joint_decl] TGI thresholds+measure " *
+              "pair `($thresholds, $measure)` is not admitted (admitted: " *
+              "(lugano_ct, spd), (recist, sld); the other SB combos are " *
+              "sequenced separately)"))
+    return (thresholds, measure)
+end
 
 """Admit the PK/QT subject-frame formula spellings: byte-equal to
 `JOINT_DECL_PK_FORMULAS_V2` (SB `JOINT_PK_QT_FORMULAS_V2`) or fail closed
@@ -205,20 +270,34 @@ function admit_joint_decl_pk_formulas(formulas::NamedTuple)
 end
 
 """Admit the TGI LP formula spellings: byte-equal to
-`JOINT_DECL_TGI_FORMULAS_V1` (all `"1"`) or fail closed."""
+`JOINT_DECL_TGI_FORMULAS_V1` (all `"1"`, default config) or
+`JOINT_DECL_TGI_FORMULAS_MEMO` (memo config) — the whole set selects at
+once, no mixing — or fail closed."""
 function admit_joint_decl_tgi_formulas(formulas::NamedTuple)
-    want = JOINT_DECL_TGI_FORMULAS_V1
-    keys(formulas) == keys(want) ||
-        throw(ContractValidationError("[joint_decl] TGI formulas carry " *
-              "margins $(keys(formulas)), want $(keys(want)) (default " *
-              "config only)"))
-    for k in keys(want)
-        string(formulas[k]) == string(want[k]) ||
-            throw(ContractValidationError("[joint_decl] TGI formula `$k` " *
-                  "is $(repr(string(formulas[k]))), want \"1\" (covariate " *
-                  "TGI margins are sequenced separately)"))
+    for (tag, want) in
+        (("default", JOINT_DECL_TGI_FORMULAS_V1),
+            ("memo", JOINT_DECL_TGI_FORMULAS_MEMO))
+        keys(formulas) == keys(want) || continue
+        all(string(formulas[k]) == string(want[k]) for k in keys(want)) ||
+            continue
+        return formulas
     end
-    return formulas
+    throw(ContractValidationError("[joint_decl] TGI formulas match " *
+          "neither the default (all \"1\") nor the memo set " *
+          "($(JOINT_DECL_TGI_FORMULAS_MEMO.tgi_kg), " *
+          "$(JOINT_DECL_TGI_FORMULAS_MEMO.tgi_kd), " *
+          "$(JOINT_DECL_TGI_FORMULAS_MEMO.tgi_ly0)) (other TGI formulas " *
+          "are sequenced separately)"))
+end
+
+"""Which admitted TGI formula set `formulas` is (`:v1` or `:memo`).
+Call only with admitted formulas (internal; the admitter ran first)."""
+function _joint_decl_tgi_formula_set(formulas::NamedTuple)
+    want = JOINT_DECL_TGI_FORMULAS_V1
+    keys(formulas) == keys(want) &&
+        all(string(formulas[k]) == string(want[k]) for k in keys(want)) &&
+        return :v1
+    return :memo
 end
 
 """
@@ -339,8 +418,14 @@ _joint_decl_varying(target::Symbol, draws::Symbol, suffix::String) =
 
 """The 10 subject-frame LPs in SB order (design order = SB X order: triple
 §2 `hcat` sequence, indication factor last among fixed effects; the varying
-term rides last — design-neutral)."""
-function joint_decl_predictors()
+term rides last — design-neutral). `tgi_formulas` selects the V1 or memo
+TGI term structures; `tgi_parametrization` selects the growth-direction LP
+(`:log_tgi_kg` vs `:tgi_net`)."""
+function joint_decl_predictors(; tgi_formulas::NamedTuple =
+        JOINT_DECL_TGI_FORMULAS_V1,
+        tgi_parametrization::Symbol = :growth_kill)
+    admit_joint_decl_tgi_formulas(tgi_formulas)
+    admit_joint_decl_tgi_parametrization(tgi_parametrization)
     I = _joint_decl_intercept
     C = _joint_decl_continuous
     F = _joint_decl_factor
@@ -348,6 +433,12 @@ function joint_decl_predictors()
         I(), C(:male), C(:standardize_age_yr), C(:standardize_weight_kg),
         F(:indication),
     ]
+    growth = _joint_decl_growth_lp(tgi_parametrization)
+    memo = _joint_decl_tgi_formula_set(tgi_formulas) === :memo
+    tgi_short = memo ? [I(), F(:indication)] : [I()]
+    tgi_ly0_fixed = memo ?
+        [I(), C(:male), C(:standardize_age_yr),
+            C(:standardize_weight_kg), F(:indication)] : [I()]
     preds = PredictorSpec[
         PredictorSpec(:log_Vc, IdentityLink,
             [pk_full..., _joint_decl_varying(:log_Vc, :draws_p_subject,
@@ -376,28 +467,40 @@ function joint_decl_predictors()
             [I(), F(:indication),
                 _joint_decl_varying(:qt_slope, :draws_p_subject,
                     "p_subject")], :qt_slope),
-        PredictorSpec(:log_tgi_kg, IdentityLink,
-            [I(), _joint_decl_varying(:log_tgi_kg, :draws_tg_subject,
-                "tg_subject")], :log_tgi_kg),
+        PredictorSpec(growth, IdentityLink,
+            [tgi_short...,
+                _joint_decl_varying(growth, :draws_p_subject,
+                    "p_subject")], growth),
         PredictorSpec(:log_tgi_kd, IdentityLink,
-            [I(), _joint_decl_varying(:log_tgi_kd, :draws_tg_subject,
-                "tg_subject")], :log_tgi_kd),
+            [tgi_short...,
+                _joint_decl_varying(:log_tgi_kd, :draws_p_subject,
+                    "p_subject")], :log_tgi_kd),
         PredictorSpec(:tgi_ly0, IdentityLink,
-            [I(), _joint_decl_varying(:tgi_ly0, :draws_tb_subject,
-                "tb_subject")], :tgi_ly0),
+            [tgi_ly0_fixed...,
+                _joint_decl_varying(:tgi_ly0, :draws_tb_subject,
+                    "tb_subject")], :tgi_ly0),
     ]
     return preds
 end
 
-"""Every `effect()` prior (triple §1 + `brm_joint_tgi.jl:382-383,376`).
-`qt_prior_scale` / `tgi_baseline_log_size` are the data-derived prep inputs;
-everything else is an SB-constant baked literal (cited in
-`JOINT_DECL_PK_INTERCEPT_PRIORS` / `JOINT_DECL_PK_COV_SCALES` /
-`JOINT_DECL_TGI_INTERCEPT_SCALES`)."""
-function joint_decl_population_priors(;
-        qt_prior_scale::Real, tgi_baseline_log_size::Real)
+"""Every `effect()` prior (triple §1 + `brm_joint_tgi.jl` fixed lines +
+wildcard `effect(:, ·)` / default `std_normal()` for memo TGI covariates,
+pinned by the emitted memo Stan). `qt_prior_scale` /
+`tgi_baseline_log_size` are the data-derived prep inputs; everything else
+is an SB-constant baked literal (cited in `JOINT_DECL_PK_INTERCEPT_PRIORS`
+/ `JOINT_DECL_PK_COV_SCALES` / `JOINT_DECL_TGI_INTERCEPT_SCALES` /
+`JOINT_DECL_TGI_COV_SCALES`)."""
+function joint_decl_population_priors(; qt_prior_scale::Real,
+        tgi_baseline_log_size::Real,
+        tgi_formulas::NamedTuple = JOINT_DECL_TGI_FORMULAS_V1,
+        tgi_parametrization::Symbol = :growth_kill)
+    admit_joint_decl_tgi_formulas(tgi_formulas)
+    admit_joint_decl_tgi_parametrization(tgi_parametrization)
     qs = Float64(qt_prior_scale)
     tb = Float64(tgi_baseline_log_size)
+    growth = _joint_decl_growth_lp(tgi_parametrization)
+    memo = _joint_decl_tgi_formula_set(tgi_formulas) === :memo
+    tgi_cov = JOINT_DECL_TGI_COV_SCALES
     priors = PopulationPrior[]
     for lp in (:log_Vc, :log_k10)
         loc, sc = JOINT_DECL_PK_INTERCEPT_PRIORS[lp]
@@ -425,46 +528,67 @@ function joint_decl_population_priors(;
     push!(priors, PopulationPrior(:qt_base, :indication, 0.0, qs))
     push!(priors, PopulationPrior(:qt_slope, :Intercept, 0.0, qs))
     push!(priors, PopulationPrior(:qt_slope, :indication, 0.0, qs))
-    for lp in (:log_tgi_kg, :log_tgi_kd)
+    for lp in (growth, :log_tgi_kd)
         loc, sc = JOINT_DECL_TGI_INTERCEPT_SCALES[lp]
         push!(priors, PopulationPrior(lp, :Intercept, loc, sc))
+        memo && push!(priors, PopulationPrior(lp, :indication, 0.0,
+            tgi_cov.indication))
     end
     push!(priors, PopulationPrior(:tgi_ly0, :Intercept, tb, 1.5))
+    if memo
+        push!(priors, PopulationPrior(:tgi_ly0, :male, 0.0, tgi_cov.male))
+        push!(priors, PopulationPrior(:tgi_ly0, :standardize_age_yr, 0.0,
+            tgi_cov.standardize_age_yr))
+        push!(priors, PopulationPrior(:tgi_ly0, :standardize_weight_kg, 0.0,
+            tgi_cov.standardize_weight_kg))
+        push!(priors, PopulationPrior(:tgi_ly0, :indication, 0.0,
+            tgi_cov.indication))
+    end
     return priors
 end
 
 """Indication `LevelMap`s: `(2, :end)` subset per PK/QT LP — the exact SB
 reference-coding mirror (`append_row(0, β)[idx]`, triple §3) given the
-prep-pinned level order. TGI LPs are intercept-only (no factor)."""
-function joint_decl_levelmaps()
+prep-pinned level order — plus the three TGI LPs under the memo formulas
+(same `(2, :end)` convention; default TGI LPs are intercept-only)."""
+function joint_decl_levelmaps(; tgi_formulas::NamedTuple =
+        JOINT_DECL_TGI_FORMULAS_V1,
+        tgi_parametrization::Symbol = :growth_kill)
+    admit_joint_decl_tgi_formulas(tgi_formulas)
+    admit_joint_decl_tgi_parametrization(tgi_parametrization)
+    lps = [:log_Vc, :log_k10, :log_k12, :log_k21, :log_ka, :qt_base,
+        :qt_slope]
+    if _joint_decl_tgi_formula_set(tgi_formulas) === :memo
+        append!(lps, [_joint_decl_growth_lp(tgi_parametrization),
+            :log_tgi_kd, :tgi_ly0])
+    end
     return LevelMap[
-        LevelMap(lp, :indication, [], :levels, (2, :end))
-        for lp in (:log_Vc, :log_k10, :log_k12, :log_k21, :log_ka,
-            :qt_base, :qt_slope)
+        LevelMap(lp, :indication, [], :levels, (2, :end)) for lp in lps
     ]
 end
 
-"""The three shared draws blocks + their per-LP single-column slices (SB
+"""The two shared draws blocks + their per-LP single-column slices (SB
 bucket order; all group on the subject frame). Suffixes mirror SB bucket
 names (`b_p_subject` → `p_subject`: `L_p_subject` / `tau_p_subject` /
-`z_flat_p_subject`). `|tb|` takes the vacuous-1x1-LKJ `:correlated` route
-with SB's default eta 1.0 (term exactly 0.0 — the `:intercept1`
+`z_flat_p_subject`). The 9-dim `|p|` block holds the 7 PK/QT margins
+(`sd ~ Exponential(1/3)`) plus the 2 TGI margins (`sd ~ Exponential(0.5)`
+per-margin overrides) — mixed scales, which the generator unrolls to one
+scalar density per margin. `|tb|` takes the vacuous-1x1-LKJ `:correlated`
+route with SB's default eta 1.0 (term exactly 0.0 — the `:intercept1`
 log-scale/xi geometry would NOT mirror SB's tau-sampled K=1 bucket).
-Each block carries its explicit `sd()` marginal-scale priors
-(`VaryingSdPrior(:exponential, θ)` with SB's scales — fix `6228160`,
-snag `thin-layer-varyi-c90f059f`); each block is uniform, so the generator
-emits one tau plate per block."""
-function joint_decl_varying()
+`sd()` marginal-scale priors ride as `VaryingSdPrior(:exponential, θ)`
+(fix `6228160`, snag `thin-layer-varyi-c90f059f`)."""
+function joint_decl_varying(; tgi_parametrization::Symbol = :growth_kill)
+    admit_joint_decl_tgi_parametrization(tgi_parametrization)
     ones_margin() =
         VaryingMargin(:Intercept, VaryingZRecipe(:ones, :none, nothing))
     exp_prior(s) = VaryingSdPrior(:exponential, s)
+    growth = _joint_decl_growth_lp(tgi_parametrization)
     draws = VaryingDraws[
-        VaryingDraws(:subject, :correlated, [ones_margin() for _ in 1:7],
+        VaryingDraws(:subject, :correlated, [ones_margin() for _ in 1:9],
             JOINT_DECL_LKJ.p[2], :draws_p_subject, "p_subject", nothing,
-            [exp_prior(JOINT_DECL_SD_SCALES.p) for _ in 1:7]),
-        VaryingDraws(:subject, :correlated, [ones_margin() for _ in 1:2],
-            JOINT_DECL_LKJ.tg[2], :draws_tg_subject, "tg_subject", nothing,
-            [exp_prior(JOINT_DECL_SD_SCALES.tg) for _ in 1:2]),
+            vcat([exp_prior(JOINT_DECL_SD_SCALES.p) for _ in 1:7],
+                [exp_prior(JOINT_DECL_SD_SCALES.tgi) for _ in 1:2])),
         VaryingDraws(:subject, :correlated, [ones_margin()],
             JOINT_DECL_LKJ.tb[2], :draws_tb_subject, "tb_subject", nothing,
             [exp_prior(JOINT_DECL_SD_SCALES.tb)]),
@@ -474,17 +598,23 @@ function joint_decl_varying()
         for (j, lp) in enumerate((:log_Vc, :log_k10, :log_k12, :log_k21,
             :log_ka, :qt_base, :qt_slope))
     ]
-    push!(slices, VaryingSlice(:draws_tg_subject, 1:1, :log_tgi_kg))
-    push!(slices, VaryingSlice(:draws_tg_subject, 2:2, :log_tgi_kd))
+    push!(slices, VaryingSlice(:draws_p_subject, 8:8, growth))
+    push!(slices, VaryingSlice(:draws_p_subject, 9:9, :log_tgi_kd))
     push!(slices, VaryingSlice(:draws_tb_subject, 1:1, :tgi_ly0))
     return (draws = draws, slices = slices)
 end
 
-"""The scalar params (triple §1 + `brm_joint_tgi.jl:386,368`). `tgi_c_cr`
-carries SB's `upper=log(0.5)` as `(:upper, hi)` (Stan kernel semantics —
-fix `5c38658`, snag `thin-layer-upper-c3c06483`); the bound is folded to
-the literal (PPL bounds are literal-only)."""
-function joint_decl_scalars()
+"""The scalar params (triple §1 + `brm_joint_tgi.jl`). `tgi_c_cr` carries
+SB's PR-boundary `upper` as `(:upper, hi)` (Stan kernel semantics — fix
+`5c38658`, snag `thin-layer-upper-c3c06483`); the bound is folded to the
+literal (PPL bounds are literal-only) per the admitted
+(thresholds, measure) pair."""
+function joint_decl_scalars(; tgi_thresholds::Symbol = :lugano_ct,
+        tgi_measure::Symbol = :spd)
+    admit_joint_decl_tgi_thresholds(tgi_thresholds)
+    admit_joint_decl_tgi_measure(tgi_measure)
+    admit_joint_decl_tgi_thresholds_measure(tgi_thresholds, tgi_measure)
+    hi = JOINT_DECL_TGI_C_CR_UPPER[(tgi_thresholds, tgi_measure)]
     return SampledParameter[
         SampledParameter(:sigma_add, :exponential,
             (arg1 = JOINT_DECL_PK_RESIDUAL_SCALE,), nothing, :sigma_add),
@@ -498,7 +628,7 @@ function joint_decl_scalars()
         SampledParameter(:tgi_c_cr, :normal,
             (arg1 = JOINT_DECL_TGI_C_CR.loc,
                 arg2 = JOINT_DECL_TGI_C_CR.scale),
-            (:upper, -0.6931471805599453), # = log(0.5), folded literal
+            (:upper, hi),
             :tgi_c_cr),
     ]
 end
