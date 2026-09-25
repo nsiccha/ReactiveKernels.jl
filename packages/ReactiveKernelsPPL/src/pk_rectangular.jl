@@ -9,54 +9,33 @@
 @inline _pk_row_arg(::Val{:slice}, a, s, j) = _traced_op_read(a, j)
 @inline _pk_row_arg(::Val{:subject}, a, s, j) = _traced_op_read(a, s)
 
-# Rows as lanes: one value per row, elementwise arithmetic. The matrix
-# exponential of every row that needs one then runs as array operations over
-# all those rows, outside the sequential recurrence (it does not depend on the
-# state), with the per-row arithmetic of `_pk_expm3` unchanged.
-struct _PKLanes{V<:AbstractVector}
-    v::V
-end
-struct _PKLaneMask{V<:AbstractVector}
-    v::V
-end
-@inline _pk_lane_value(x::Union{_PKLanes,_PKLaneMask}) = x.v
-@inline _pk_lane_value(x) = x
-for op in (:+, :-, :*, :/)
-    @eval Base.$op(a::_PKLanes, b::_PKLanes) = _PKLanes(broadcast($op, a.v, b.v))
-    @eval Base.$op(a::_PKLanes, b::Number) = _PKLanes(broadcast($op, a.v, b))
-    @eval Base.$op(a::Number, b::_PKLanes) = _PKLanes(broadcast($op, a, b.v))
-end
-Base.:-(a::_PKLanes) = _PKLanes(broadcast(-, a.v))
-Base.abs(a::_PKLanes) = _PKLanes(broadcast(abs, a.v))
-Base.exp(a::_PKLanes) = _PKLanes(broadcast(exp, a.v))
-for op in (:<, :>, :>=)
-    @eval Base.$op(a::_PKLanes, b::_PKLanes) = _PKLaneMask(broadcast($op, a.v, b.v))
-    @eval Base.$op(a::_PKLanes, b::Number) = _PKLaneMask(broadcast($op, a.v, b))
-    @eval Base.$op(a::Number, b::_PKLanes) = _PKLaneMask(broadcast($op, a, b.v))
-end
-Base.ifelse(c::_PKLaneMask, a, b) =
-    _PKLanes(broadcast(ifelse, c.v, _pk_lane_value(a), _pk_lane_value(b)))
-
-@inline _pk_rows_arg(::Val{:shared}, a, subject, rows) = a
-@inline _pk_rows_arg(::Val{:slice}, a, subject, rows) = _PKLanes(_traced_op_read(a, rows))
-@inline _pk_rows_arg(::Val{:subject}, a, subject, rows) =
-    _PKLanes(_traced_op_read(a, subject[rows]))
-
 # exp(A*t) for the given rows, as nine column vectors (entry k of every row's
 # column-major 3x3 result); `nothing` when no row needs one. Rows come from
 # bound schedule data, so only rows whose lazy branch is taken are evaluated.
+# The table builds outside the sequential recurrence (the exponential does not
+# depend on the state) with the StaticArrays built-in, one row at a time.
 function _pk_expm_table(modes, values, subject, rows, t)
     isempty(rows) && return nothing
-    _, log_Vc, log_k10, log_k12, log_k21, log_ka =
-        map((mode, a) -> _pk_rows_arg(mode, a, subject, rows), modes, values)
-    log_CL = log_Vc + log_k10
-    A = linear_pk_system_3(log_CL, log_Vc, log_Vc + log_k12,
-        log_Vc + log_k12 - log_k21, log_ka)
-    scale = _PKLanes(t[rows])
-    P = _pk_expm3(map(x -> x * scale, A))
-    map(x -> (x::_PKLanes).v, P)
+    outs = [Any[] for _ in 1:9]
+    for j in rows
+        _, log_Vc, log_k10, log_k12, log_k21, log_ka =
+            map((mode, a) -> _pk_row_arg(mode, a, subject[j], j), modes,
+                values)
+        A = linear_pk_system_3(log_Vc + log_k10, log_Vc, log_Vc + log_k12,
+            log_Vc + log_k12 - log_k21, log_ka)
+        P = exp(A * t[j])
+        for e in 1:9
+            push!(outs[e], P[e])
+        end
+    end
+    return outs
 end
-@inline _pk_table_row(P, i) = map(column -> _traced_op_read(column, i), P)
+@inline _pk_table_smat(P, i) = SMatrix{3,3}(
+    _traced_op_read(P[1], i), _traced_op_read(P[2], i),
+    _traced_op_read(P[3], i), _traced_op_read(P[4], i),
+    _traced_op_read(P[5], i), _traced_op_read(P[6], i),
+    _traced_op_read(P[7], i), _traced_op_read(P[8], i),
+    _traced_op_read(P[9], i))
 _pk_has_auc(::typeof(linear_pk_read_locs)) = false
 _pk_has_auc(::typeof(linear_pk_read_locs_auc)) = true
 
@@ -114,7 +93,7 @@ function _pk_rectangular(cell, ends, opcols, args, marker)
     segment = _pk_expm_table(modes, values, subject, segment_rows, intervals)
     columns = (collect(1:n), subject, reset, conc_index, auc_index, opcols[1:5]...,
         prop_index, segment_index)
-    init = (state=(0.0, 0.0, 0.0), given=0.0, out=zeros(offset))
+    init = (state=SVector(0.0, 0.0, 0.0), given=0.0, out=zeros(offset))
     shared = (values, zeros(Int, bits), prop, segment)
     ReactiveKernels._rectangular_fold(step, init, columns, shared, marker).out
 end
@@ -141,7 +120,7 @@ end
 
 # The hoisted exp(A*dt) of this row applied to the state. Without a table no
 # row has dt > 0, so the branch calling this is never taken.
-_pk_propagate_row(P, i, state) = _pk_tmatvec3(_pk_table_row(P, i), state)
+_pk_propagate_row(P, i, state) = _pk_table_smat(P, i) * state
 _pk_propagate_row(::Nothing, i, state) = state
 
 struct _PKRectangularRead{AUC} end
@@ -169,16 +148,19 @@ end
 # `count` doses at a fixed interval from the hoisted exp(A*interval) of this
 # segment row. Without a table no segment repeats, so this is never taken.
 function _pk_rectangular_regular(P, i, first, amount, count, cols)
-    B = _pk_affine_from_exp(_pk_table_row(P, i), amount)
+    S = _pk_table_smat(P, i)
+    B = SMatrix{4,4}(S[1], S[2], S[3], 0.0, S[4], S[5], S[6], 0.0,
+        S[7], S[8], S[9], 0.0, amount, 0.0, 0.0, 1.0)
     Q = _pk_retained_power(B, count - 1, cols, amount)
-    _pk_apply_affine(Q, first)
+    q = Q * SVector(first[1], first[2], first[3], 1.0)
+    return SVector(q[1], q[2], q[3])
 end
 _pk_rectangular_regular(::Nothing, i, first, amount, count, cols) = first
 
 # Shared by standalone matrix powers and the grouped recurrence. The exponent
 # and matrix are loop-carried data; the bit capacity only sizes the row table.
 function _pk_retained_power(B, exponent, cols, marker)
-    R = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+    R = SMatrix{4,4}(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
     init = (; R, B, e=exponent)
     step = (c, row) -> ReactiveKernels._recurrence_branch(c.e > 0,
@@ -188,6 +170,6 @@ end
 
 function _pk_power_step(c)
     R = ReactiveKernels._recurrence_branch((c.e & 1) == 1,
-        _pk_tmul4, (R, B) -> R, (c.R, c.B))
-    (; R, B=_pk_tmul4(c.B, c.B), e=div(c.e, 2))
+        (R, B) -> R * B, (R, B) -> R, (c.R, c.B))
+    (; R, B=c.B * c.B, e=div(c.e, 2))
 end

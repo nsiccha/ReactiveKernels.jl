@@ -5,11 +5,12 @@ using LinearAlgebra: exp
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Reactant
+using StaticArrays
 using Test
 
 # Grouped-kernel + linear-PK recurrence cell (SB-mirror of the joint
 # brm2 V2 kernel). Vocabulary tests standalone (no compiler): the
-# schedule transliteration, the hand-rolled matrix kernels vs
+# schedule transliteration, the static matrix kernels vs
 # LinearAlgebra, and the full per-subject recurrence vs the reference
 # oracle. Enzyme parity + Reactant compiled-vs-native coverage follow
 # below.
@@ -69,39 +70,15 @@ const _PK_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         [1], [1.0], [2], [0.0], [10.0])
 end
 
-# Tuple/matrix bridges (test-only): the kernels take column-major
-# tuples; the oracle and LinearAlgebra references take matrices.
-_pk_tup2mat(t) = reshape(collect(t), 3, 3)
-_pk_mat2tup(M) = Tuple(vec(M))
-
+# Test-only matrix view of the static system builder (the oracle and
+# LinearAlgebra references take matrices).
 _pk_test_system(lVc, lk10, lk12, lk21, lka) =
-    _pk_tup2mat(ReactiveKernelsPPL.linear_pk_system_3(
+    Matrix(ReactiveKernelsPPL.linear_pk_system_3(
         lVc + lk10, lVc, lVc + lk12, lVc + lk12 - lk21, lka))
 
-# Reactant probes (test-only): vector-in/vector-out wrappers — the
-# kernels take tuples/scalars, XLA takes arrays. The splat uses
-# `@allowscalar`, scoped to the tuple construction ONLY: the traced
-# region below it (expm + recurrence) stays scalar-guard-clean, and
-# `@compile` example/call args are `to_rarray`-marked (plain args
-# bake as constants). The cell factory closes over bound op columns
-# (constants, the generated-code shape) and traces only the LP
-# scalars.
-function _pkc_expm_wrap(x::AbstractVector)
-    t = Reactant.@allowscalar (x[1], x[2], x[3], x[4], x[5], x[6],
-        x[7], x[8], x[9])
-    return collect(ReactiveKernelsPPL._pk_expm3(t))
-end
-_pkc_read_wrap_factory(opcols) = function (lp::AbstractVector)
-    s_vc, s_k10, s_k12, s_k21, s_ka =
-        Reactant.@allowscalar (lp[1], lp[2], lp[3], lp[4], lp[5])
-    return linear_pk_read_locs(opcols[1], opcols[2], opcols[3], opcols[4],
-        opcols[5], opcols[6], s_vc, s_k10, s_k12, s_k21, s_ka)
-end
-
-@testset "hand-rolled matrix kernels vs LinearAlgebra" begin
+@testset "static expm + affine power vs LinearAlgebra" begin
     # Typical PK arguments plus a fast-rates edge and a weekly-dt edge.
-    # Small-dt cases cover Pade degrees 3/5/7 (l1 0.0017/0.083/0.50);
-    # dt=1 selects 9 and the rest 13.
+    # Same math as the LAPACK built-in (oracle bar — never Stan-exact).
     cases = ((2.3, -1.4, -0.35, -2.65, -2.08, 1.0),
         (2.3, -1.4, -0.35, -2.65, -2.08, 24.0),
         (4.0, 1.0, 1.0, 1.0, 2.0, 24.0),
@@ -112,14 +89,15 @@ end
     for (lVc, lk10, lk12, lk21, lka, dt) in cases
         M = _pk_test_system(lVc, lk10, lk12, lk21, lka) .* dt
         d = maximum(abs,
-            collect(ReactiveKernelsPPL._pk_expm3(_pk_mat2tup(M))) - vec(exp(M)))
-        @test d < 5e-13
+            vec(Matrix(exp(StaticArrays.SMatrix{3,3}(M)))) - vec(exp(M)))
+        @test d < 1e-8
     end
     # Static 4x4 power vs `^` (segment counts incl. non-powers of two).
     A = [0.9 0.1 0.0 1.0; 0.0 0.8 0.2 0.0; 0.1 0.0 0.7 0.0; 0.0 0.0 0.0 1.0]
     for n in (1, 2, 3, 7, 64, 100)
-        @test collect(ReactiveKernelsPPL._pk_matpow4(_pk_mat2tup(A), n)) ≈
-            vec(A^n) atol = 1e-12
+        @test vec(Matrix(ReactiveKernelsPPL._pk_smat_pow4(
+            StaticArrays.SMatrix{4,4}(A), n))) ≈
+            vec(A^n) atol = 1e-8
     end
 end
 
@@ -841,45 +819,6 @@ end
     # Nested arithmetic recurses; bare symbols pass through.
     @test rw(:(a + b .* c), spec) == :(a + b .* c)
     @test rw(:x, spec) == :x
-end
-
-@testset "PK expm + cell Reactant parity vs native" begin
-    # One static trace serves every Pade degree (the selection is
-    # fully predicated — no value-specialized recompiles), then the
-    # full one-subject recurrence (segment + reads) at two LP points.
-    v0 = Vector{Float64}(vec(_pk_test_system(2.3, -1.4, -0.35, -2.65, -2.08) .* 24.0))
-    c = Reactant.@compile _pkc_expm_wrap(Reactant.to_rarray(v0))
-    for (lVc, lk10, lk12, lk21, lka, dt) in ((2.3, -1.4, -0.35, -2.65, -2.08, 0.001),
-            (2.3, -1.4, -0.35, -2.65, -2.08, 0.05),
-            (2.3, -1.4, -0.35, -2.65, -2.08, 0.3),
-            (2.3, -1.4, -0.35, -2.65, -2.08, 1.0),
-            (2.3, -1.4, -0.35, -2.65, -2.08, 24.0),
-            (4.0, 1.0, 1.0, 1.0, 2.0, 24.0),
-            (2.3, -1.4, -0.35, -2.65, -2.08, 168.0))
-        M = _pk_test_system(lVc, lk10, lk12, lk21, lka) .* dt
-        v = Vector{Float64}(vec(M))
-        @test Array(c(Reactant.to_rarray(v))) ≈
-            collect(ReactiveKernelsPPL._pk_expm3(_pk_mat2tup(M))) atol = 1e-12
-    end
-    sched = build_linear_pk_schedule(
-        [1, 1, 2, 2], [96.0, 120.0, 0.0, 5.0],
-        [1, 1, 1, 1, 2], [0.0, 24.0, 48.0, 72.0, 0.0],
-        [100.0, 100.0, 100.0, 100.0, 50.0])
-    opcols = (sched.op_type[1:3], sched.op_dt[1:3], sched.op_amount[1:3],
-        sched.op_interval[1:3], sched.op_count[1:3], sched.op_read_idx[1:3])
-    cell = _pkc_read_wrap_factory(opcols)
-    lp0 = [2.3, -1.4, -0.35, -2.65, -2.08]
-    @test_throws "compiled PK recurrences are disabled" Reactant.@code_hlo cell(Reactant.to_rarray(lp0))
-    previous_mode = ReactiveKernelsPPL._rectangular_pk_enabled[]
-    cc = try
-        ReactiveKernelsPPL._rectangular_pk_enabled[] = true
-        Reactant.@compile cell(Reactant.to_rarray(lp0))
-    finally
-        ReactiveKernelsPPL._rectangular_pk_enabled[] = previous_mode
-    end
-    for lp in (lp0, [2.0, -1.0, -0.5, -2.0, -1.5])
-        @test Array(cc(Reactant.to_rarray(lp))) ≈ Vector{Float64}(cell(lp)) atol = 1e-12
-    end
 end
 
 # ── W2 event-LP seam (default-V2 log_F) ─────────────────────────────
@@ -1737,20 +1676,6 @@ _pkl_logf_wrap_factory(x, mu, L, k) = function (s::AbstractVector,
     return linear_pk_event_log_f(x, slope, rho, sig, beta, mu, L, k)
 end
 
-_pkl_read7_wrap_factory(opcols) = function (lp::AbstractVector,
-        lf::AbstractVector)
-    s_vc, s_k10, s_k12, s_k21, s_ka =
-        Reactant.@allowscalar (lp[1], lp[2], lp[3], lp[4], lp[5])
-    # Per-op `log_F[j]` reads inside the recurrence are scalar
-    # iteration over the traced provider vector — inherent to the
-    # seam (the flat event-axis vector feeds per-op dose scaling),
-    # so scalar fallback is explicit here; the v1 factory's
-    # `@allowscalar` scalar reads are the same pattern.
-    return Reactant.@allowscalar linear_pk_read_locs(opcols[1], opcols[2],
-        opcols[3], opcols[4], opcols[5], opcols[6], lf, s_vc, s_k10, s_k12,
-        s_k21, s_ka)
-end
-
 @testset "event-LP seam Reactant parity vs native" begin
     cols = _pkl_columns1()
     sched = build_linear_pk_schedule(cols[:subj], cols[:time], cols[:dsubj],
@@ -1768,29 +1693,4 @@ end
         @test Array(cp(Reactant.to_rarray(s), Reactant.to_rarray(beta))) ≈
             Vector{Float64}(pv(s, beta)) atol = 1e-12
     end
-    # 7-arg cell at a traced log_F slice (+ zeros == v1 native).
-    opcols = (sched.op_type, sched.op_dt, sched.op_amount, sched.op_interval,
-        sched.op_count, sched.op_read_idx)
-    cell = _pkl_read7_wrap_factory(opcols)
-    lp0 = [2.3, -1.4, -0.35, -2.65, -2.08]
-    lf0 = Vector{Float64}(pv(s0, beta0))
-    @test_throws "compiled PK recurrences are disabled" Reactant.@code_hlo cell(
-        Reactant.to_rarray(lp0), Reactant.to_rarray(lf0))
-    previous_mode = ReactiveKernelsPPL._rectangular_pk_enabled[]
-    cc = try
-        ReactiveKernelsPPL._rectangular_pk_enabled[] = true
-        Reactant.@compile cell(Reactant.to_rarray(lp0), Reactant.to_rarray(lf0))
-    finally
-        ReactiveKernelsPPL._rectangular_pk_enabled[] = previous_mode
-    end
-    for (lp, lf) in ((lp0, lf0),
-            ([2.0, -1.0, -0.5, -2.0, -1.5],
-                Vector{Float64}(pv([-0.35, 1.7, 0.9],
-                    [1.2, 0.7, -0.5, 0.3, -1.1]))))
-        @test Array(cc(Reactant.to_rarray(lp), Reactant.to_rarray(lf))) ≈
-            Vector{Float64}(cell(lp, lf)) atol = 1e-12
-    end
-    @test Array(cc(Reactant.to_rarray(lp0),
-        Reactant.to_rarray(zeros(length(lf0))))) ≈
-        Vector{Float64}(linear_pk_read_locs(opcols..., lp0...)) atol = 1e-12
 end

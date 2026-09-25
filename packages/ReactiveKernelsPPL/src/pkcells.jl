@@ -29,20 +29,18 @@
 # `linear_pk_read_locs` call per subject over bound op-column slices plus
 # traced LP scalars, then a vectorized `flat[obs_map]` gather
 # (`reactivekernels-use` §7d shape) and the Gaussian plate. All
-# intermediate 3- and 4-dimensional storage is FUNCTIONAL (length-typed
-# tuples, never mutated): a concrete `Matrix{Float64}`/`Vector{Float64}`
-# rejects traced stores (`convert(Float64, ::TracedRNumber)` has no
-# method — the pkcell slice's measured Reactant failure). The matrix
-# exponential is a faithful port of Stan's `matrix_exp_pade` (Pade
-# fraction + scaling-and-squaring, predicated selection, fixed trip
-# counts) because Enzyme cannot reverse `LinearAlgebra.exp`
-# (`EnzymeNoDerivativeError` in its internals, measured 2026-09-20;
-# plain `Matrix * Matrix` reverses fine — an earlier note here claimed
-# otherwise). The 3x3/4x4 kernels are scalar tuple code, which stays in
-# registers natively. Only the returned reads vector is an array,
-# allocated eltype-generic (see `linear_pk_read_locs`).
-# The accuracy envelope (`l1norm < 5499`, exact-Stan inside) is
-# documented on `_pk_expm3`.
+# intermediate 3- and 4-dimensional storage is static
+# (`SMatrix`/`SVector`: stack-allocated, immutable): a concrete
+# `Matrix{Float64}`/`Vector{Float64}` rejects traced stores
+# (`convert(Float64, ::TracedRNumber)` has no method — the pkcell
+# slice's measured Reactant failure). The matrix exponential is the
+# StaticArrays built-in `exp` on `SMatrix{3,3}` (Higham-2008 Padé,
+# no LAPACK balancing — faster and at least as accurate as Stan's
+# `matrix_exp_pade` on the PK range, measured 2026-09-25; the former
+# hand port was deleted with the user's no-Stan-exactness direction).
+# Native Enzyme reverses through it (pure Julia, no ccalls). Only the
+# returned reads vector is an array, allocated eltype-generic (see
+# `linear_pk_read_locs`).
 
 """Operation codes of the linear-PK event stream (SB `dosing_schedule.jl`)."""
 const LINEAR_EVENT_READ = 1
@@ -558,425 +556,14 @@ function linear_pk_op_log_dose(op_type::AbstractVector,
     return op_log_dose
 end
 
-# --- Hand-rolled matrix kernels (no BLAS/LAPACK — see file header) ---
-#
-# Matrices and states are column-major tuples, updated FUNCTIONALLY
-# (never mutated, never heap-allocated): a concretely-typed
-# `Matrix{Float64}`/`Vector{Float64}` rejects traced stores
-# (`setindex!` hits `convert(Float64, ::TracedRNumber)` — measured),
-# while tuples promote elementwise and trace cleanly. Signatures use
-# `NTuple{N,Any}` (length-checked, eltype-open: traced mixes with
-# constant zeros). Natively the tuples live in registers (LLVM SROA);
-# under Enzyme they are plain SSA values; under Reactant the static
-# loops unroll. The one heap array (`read_locs`, in
-# `linear_pk_read_locs`) is allocated eltype-generic.
-
-"""Stan `matrix_exp_pade` degree-selection thresholds (Higham thetas, verbatim)."""
-const _PK_PADE_THETA3 = 1.495585217958292e-002
-const _PK_PADE_THETA5 = 2.539398330063230e-001
-const _PK_PADE_THETA7 = 9.504178996162932e-001
-const _PK_PADE_THETA9 = 2.097847961257068e+000
-"""Stan `matrix_exp_pade` scaling target norm (theta-13, verbatim)."""
-const _PK_PADE_MAXNORM = 5.371920351148152
-"""Column-major 3x3 identity tuple (Stan's `MatrixType::Identity`)."""
-const _PK_I3 = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-
-# C = A*B for column-major 3x3 tuples (C[i,j] = Σ_k A[i,k]*B[k,j],
-# linear index (k-1)*3+i).
-_pk_tmul3(a::NTuple{9,Any}, b::NTuple{9,Any}) = (
-    a[1] * b[1] + a[4] * b[2] + a[7] * b[3],
-    a[2] * b[1] + a[5] * b[2] + a[8] * b[3],
-    a[3] * b[1] + a[6] * b[2] + a[9] * b[3],
-    a[1] * b[4] + a[4] * b[5] + a[7] * b[6],
-    a[2] * b[4] + a[5] * b[5] + a[8] * b[6],
-    a[3] * b[4] + a[6] * b[5] + a[9] * b[6],
-    a[1] * b[7] + a[4] * b[8] + a[7] * b[9],
-    a[2] * b[7] + a[5] * b[8] + a[8] * b[9],
-    a[3] * b[7] + a[6] * b[8] + a[9] * b[9])
-
-# Elementwise tuple arithmetic. Stan's `s*A + t*B` chains evaluate
-# left-associatively per entry; these helpers compose in that order so
-# the port matches Eigen's rounding term for term.
-_pk_tadd3(a::NTuple{9,Any}, b::NTuple{9,Any}) = (
-    a[1] + b[1], a[2] + b[2], a[3] + b[3], a[4] + b[4], a[5] + b[5],
-    a[6] + b[6], a[7] + b[7], a[8] + b[8], a[9] + b[9])
-_pk_tsub3(a::NTuple{9,Any}, b::NTuple{9,Any}) = (
-    a[1] - b[1], a[2] - b[2], a[3] - b[3], a[4] - b[4], a[5] - b[5],
-    a[6] - b[6], a[7] - b[7], a[8] - b[8], a[9] - b[9])
-_pk_tscale3(s, a::NTuple{9,Any}) = (
-    s * a[1], s * a[2], s * a[3], s * a[4], s * a[5], s * a[6],
-    s * a[7], s * a[8], s * a[9])
-
-# 1-norm (max column absolute sum), Eigen's maxCoeff scan: strict `>`,
-# first maximum wins.
-function _pk_l1norm3(M::NTuple{9,Any})
-    c1 = abs(M[1]) + abs(M[2]) + abs(M[3])
-    c2 = abs(M[4]) + abs(M[5]) + abs(M[6])
-    c3 = abs(M[7]) + abs(M[8]) + abs(M[9])
-    m12 = ifelse(c2 > c1, c2, c1)
-    return ifelse(c3 > m12, c3, m12)
-end
-
-# (3,3)-Pade pair (Stan `matrix_exp_pade3`, same op order):
-# U = A*(b3*A2 + b1*I), V = b2*A2 + b0*I.
-function _pk_pade3(A::NTuple{9,Any})
-    A2 = _pk_tmul3(A, A)
-    tmp = _pk_tadd3(_pk_tscale3(1.0, A2), _pk_tscale3(60.0, _PK_I3))
-    U = _pk_tmul3(A, tmp)
-    V = _pk_tadd3(_pk_tscale3(12.0, A2), _pk_tscale3(120.0, _PK_I3))
-    return U, V
-end
-
-# (5,5)-Pade pair (Stan `matrix_exp_pade5`, same op order).
-function _pk_pade5(A::NTuple{9,Any})
-    A2 = _pk_tmul3(A, A)
-    A4 = _pk_tmul3(A2, A2)
-    tmp = _pk_tadd3(_pk_tadd3(_pk_tscale3(1.0, A4),
-            _pk_tscale3(420.0, A2)), _pk_tscale3(15120.0, _PK_I3))
-    U = _pk_tmul3(A, tmp)
-    V = _pk_tadd3(_pk_tadd3(_pk_tscale3(30.0, A4),
-            _pk_tscale3(3360.0, A2)), _pk_tscale3(30240.0, _PK_I3))
-    return U, V
-end
-
-# (7,7)-Pade pair (Stan `matrix_exp_pade7`, same op order).
-function _pk_pade7(A::NTuple{9,Any})
-    A2 = _pk_tmul3(A, A)
-    A4 = _pk_tmul3(A2, A2)
-    A6 = _pk_tmul3(A4, A2)
-    tmp = _pk_tadd3(_pk_tadd3(_pk_tadd3(_pk_tscale3(1.0, A6),
-                    _pk_tscale3(1512.0, A4)), _pk_tscale3(277200.0, A2)),
-        _pk_tscale3(8648640.0, _PK_I3))
-    U = _pk_tmul3(A, tmp)
-    V = _pk_tadd3(_pk_tadd3(_pk_tadd3(_pk_tscale3(56.0, A6),
-                    _pk_tscale3(25200.0, A4)), _pk_tscale3(1995840.0, A2)),
-        _pk_tscale3(17297280.0, _PK_I3))
-    return U, V
-end
-
-# (9,9)-Pade pair (Stan `matrix_exp_pade9`, same op order).
-function _pk_pade9(A::NTuple{9,Any})
-    A2 = _pk_tmul3(A, A)
-    A4 = _pk_tmul3(A2, A2)
-    A6 = _pk_tmul3(A4, A2)
-    A8 = _pk_tmul3(A6, A2)
-    tmp = _pk_tadd3(_pk_tadd3(_pk_tadd3(_pk_tadd3(
-                        _pk_tscale3(1.0, A8), _pk_tscale3(3960.0, A6)),
-                    _pk_tscale3(2162160.0, A4)),
-                _pk_tscale3(302702400.0, A2)),
-        _pk_tscale3(8821612800.0, _PK_I3))
-    U = _pk_tmul3(A, tmp)
-    V = _pk_tadd3(_pk_tadd3(_pk_tadd3(_pk_tadd3(
-                        _pk_tscale3(90.0, A8), _pk_tscale3(110880.0, A6)),
-                    _pk_tscale3(30270240.0, A4)),
-                _pk_tscale3(2075673600.0, A2)),
-        _pk_tscale3(17643225600.0, _PK_I3))
-    return U, V
-end
-
-# (13,13)-Pade pair (Stan `matrix_exp_pade13`, same op order — the C++
-# reuses `V` for scratch storage; the functional port names each
-# intermediate instead, identical arithmetic).
-function _pk_pade13(A::NTuple{9,Any})
-    A2 = _pk_tmul3(A, A)
-    A4 = _pk_tmul3(A2, A2)
-    A6 = _pk_tmul3(A4, A2)
-    V6 = _pk_tadd3(_pk_tadd3(_pk_tscale3(1.0, A6),
-            _pk_tscale3(16380.0, A4)), _pk_tscale3(40840800.0, A2))
-    tmp = _pk_tadd3(_pk_tmul3(A6, V6), _pk_tadd3(_pk_tadd3(
-                _pk_tadd3(_pk_tscale3(33522128640.0, A6),
-                    _pk_tscale3(10559470521600.0, A4)),
-                _pk_tscale3(1187353796428800.0, A2)),
-            _pk_tscale3(32382376266240000.0, _PK_I3)))
-    U = _pk_tmul3(A, tmp)
-    tmp2 = _pk_tadd3(_pk_tadd3(_pk_tscale3(182.0, A6),
-            _pk_tscale3(960960.0, A4)), _pk_tscale3(1323241920.0, A2))
-    V = _pk_tadd3(_pk_tmul3(A6, tmp2), _pk_tadd3(_pk_tadd3(
-                _pk_tadd3(_pk_tscale3(670442572800.0, A6),
-                    _pk_tscale3(129060195264000.0, A4)),
-                _pk_tscale3(7771770303897600.0, A2)),
-            _pk_tscale3(64764752532480000.0, _PK_I3)))
-    return U, V
-end
-
-# Predicated row-entry swap (branchless pivot): the pair with entries
-# exchanged iff `c`.
-_pk_pivot_swap(c, x, y) = (ifelse(c, y, x), ifelse(c, x, y))
-
-# Predicated 3x3 pick (branchless stage select): `A` iff `c`, else `B`.
-_pk_tpick3(c, A::NTuple{9,Any}, B::NTuple{9,Any}) = (
-    ifelse(c, A[1], B[1]), ifelse(c, A[2], B[2]), ifelse(c, A[3], B[3]),
-    ifelse(c, A[4], B[4]), ifelse(c, A[5], B[5]), ifelse(c, A[6], B[6]),
-    ifelse(c, A[7], B[7]), ifelse(c, A[8], B[8]), ifelse(c, A[9], B[9]))
-
-# Unit-lower forward + upper back substitution for one RHS column
-# (Eigen's small-matrix triangular solves, same per-entry order).
-function _pk_tri_solve3(l10, l20, l21, d11, d12, d13, d22, d23, d33,
-        n0, n1, n2)
-    y0 = n0
-    y1 = n1 - l10 * y0
-    y2 = (n2 - l20 * y0) - l21 * y1
-    x2 = y2 / d33
-    x1 = (y1 - d23 * x2) / d22
-    x0 = ((y0 - d12 * x1) - d13 * x2) / d11
-    return (x0, x1, x2)
-end
-
-"""
-    _pk_lu_solve3(D, N) -> 9-tuple
-
-Solve `D*X = N` for column-major 3x3 tuples via partial-pivot LU
-(Stan's `denom.partialPivLu().solve(number)`): the row swaps are
-predicated on the same strict-magnitude comparisons (Eigen's
-first-maximum-wins pivot rule — a two-swap sorting network
-reproduces it exactly, ties included), then straight-line
-elimination and triangular solves. No guards: a singular `D`
-propagates Inf/NaN exactly as Eigen's unguarded factorization does.
-"""
-function _pk_lu_solve3(D::NTuple{9,Any}, N::NTuple{9,Any})
-    d11, d21, d31 = D[1], D[2], D[3]
-    d12, d22, d32 = D[4], D[5], D[6]
-    d13, d23, d33 = D[7], D[8], D[9]
-    n11, n21, n31 = N[1], N[2], N[3]
-    n12, n22, n32 = N[4], N[5], N[6]
-    n13, n23, n33 = N[7], N[8], N[9]
-    # Pivot step 0: the first-maximum-magnitude row leads.
-    s01 = abs(d11) < abs(d21)
-    (d11, d21) = _pk_pivot_swap(s01, d11, d21)
-    (d12, d22) = _pk_pivot_swap(s01, d12, d22)
-    (d13, d23) = _pk_pivot_swap(s01, d13, d23)
-    (n11, n21) = _pk_pivot_swap(s01, n11, n21)
-    (n12, n22) = _pk_pivot_swap(s01, n12, n22)
-    (n13, n23) = _pk_pivot_swap(s01, n13, n23)
-    s02 = abs(d11) < abs(d31)
-    (d11, d31) = _pk_pivot_swap(s02, d11, d31)
-    (d12, d32) = _pk_pivot_swap(s02, d12, d32)
-    (d13, d33) = _pk_pivot_swap(s02, d13, d33)
-    (n11, n31) = _pk_pivot_swap(s02, n11, n31)
-    (n12, n32) = _pk_pivot_swap(s02, n12, n32)
-    (n13, n33) = _pk_pivot_swap(s02, n13, n33)
-    # Eliminate column 0.
-    l10 = d21 / d11
-    d22 = d22 - l10 * d12
-    d23 = d23 - l10 * d13
-    l20 = d31 / d11
-    d32 = d32 - l20 * d12
-    d33 = d33 - l20 * d13
-    # Pivot step 1 (the computed multipliers travel with their rows)
-    # + eliminate column 1.
-    s12 = abs(d22) < abs(d32)
-    (d22, d32) = _pk_pivot_swap(s12, d22, d32)
-    (d23, d33) = _pk_pivot_swap(s12, d23, d33)
-    (l10, l20) = _pk_pivot_swap(s12, l10, l20)
-    (n21, n31) = _pk_pivot_swap(s12, n21, n31)
-    (n22, n32) = _pk_pivot_swap(s12, n22, n32)
-    (n23, n33) = _pk_pivot_swap(s12, n23, n33)
-    l21 = d32 / d22
-    d33 = d33 - l21 * d23
-    X0 = _pk_tri_solve3(l10, l20, l21, d11, d12, d13, d22, d23, d33,
-        n11, n21, n31)
-    X1 = _pk_tri_solve3(l10, l20, l21, d11, d12, d13, d22, d23, d33,
-        n12, n22, n32)
-    X2 = _pk_tri_solve3(l10, l20, l21, d11, d12, d13, d22, d23, d33,
-        n13, n23, n33)
-    return (X0[1], X0[2], X0[3], X1[1], X1[2], X1[3], X2[1], X2[2], X2[3])
-end
-
-# One predicated degree select (Stan's theta cascade, branchless).
-_pk_pick1(c3, a3, c5, a5, c7, a7, c9, a9, a13) =
-    ifelse(c3, a3, ifelse(c5, a5, ifelse(c7, a7, ifelse(c9, a9, a13))))
-
-# Degree selection over (U, V) pairs: the same strict-`<` comparisons
-# Stan makes choose the same pair, entry by entry.
-function _pk_pick_uv(c3, T3::NTuple{9,Any}, c5, T5::NTuple{9,Any},
-        c7, T7::NTuple{9,Any}, c9, T9::NTuple{9,Any}, T13::NTuple{9,Any})
-    return (_pk_pick1(c3, T3[1], c5, T5[1], c7, T7[1], c9, T9[1], T13[1]),
-        _pk_pick1(c3, T3[2], c5, T5[2], c7, T7[2], c9, T9[2], T13[2]),
-        _pk_pick1(c3, T3[3], c5, T5[3], c7, T7[3], c9, T9[3], T13[3]),
-        _pk_pick1(c3, T3[4], c5, T5[4], c7, T7[4], c9, T9[4], T13[4]),
-        _pk_pick1(c3, T3[5], c5, T5[5], c7, T7[5], c9, T9[5], T13[5]),
-        _pk_pick1(c3, T3[6], c5, T5[6], c7, T7[6], c9, T9[6], T13[6]),
-        _pk_pick1(c3, T3[7], c5, T5[7], c7, T7[7], c9, T9[7], T13[7]),
-        _pk_pick1(c3, T3[8], c5, T5[8], c7, T7[8], c9, T9[8], T13[8]),
-        _pk_pick1(c3, T3[9], c5, T5[9], c7, T7[9], c9, T9[9], T13[9]))
-end
-
-"""
-    _pk_expm3(M) -> 9-tuple
-
-`exp(M)` for column-major 3x3 `M`: faithful julianic port of Stan's
-`matrix_exp_pade` (Eigen `matrix_exp_computeUV` + the `(U+V)/(-U+V)`
-Pade fraction solved by partial-pivot LU + repeated squaring) — same
-approximants, same theta selection, same squaring schedule;
-traceable expression only, no re-mathematizing.
-
-The norm-based selection is predicated, not branched: all five
-`(U, V)` pairs evaluate and the theta cascade selects via `ifelse`
-(the same strict-`<` comparisons Stan makes); squaring step `i`
-applies iff `l1norm >= maxnorm * 2^(i-1)`, which is exactly Stan's
-`frexp(l1norm/maxnorm)` schedule (`s >= i` iff `x >= 2^(i-1)`,
-including the `s < 0 → 0` clamp and exact-power-of-two
-boundaries — the clamped case is `l1norm < maxnorm/2`, where every
-predicate is false). Scaling and squaring run as ten straight-line
-predicated stages (candidate chains + prefix picks — no
-loop-carried predicated values), and the LU pivot is predicated row
-swaps (Eigen's first-maximum-wins rule, ties included). Scaling is
-exact powers of two (`*0.5` halving, Stan's `ldexp` bit-identically).
-
-Accuracy envelope: exact-Stan while `l1norm(M) < maxnorm * 2^10 ≈
-5499` (the ten predicated stages saturate the schedule beyond that —
-typical PK arguments are `||A*dt|| < 50`, the committed edges reach
-`l1 ≈ 355`). Beyond the envelope the scaling saturates and accuracy
-degrades gradually (no guard: a norm check cannot fail loudly
-in-graph under Reactant). Validated against `LinearAlgebra.exp` in
-`test_pkcells.jl`.
-"""
-function _pk_expm3(M::NTuple{9,Any})
-    l1 = _pk_l1norm3(M)
-    # Squaring predicates (see docstring): the bound doubles exactly.
-    bound = _PK_PADE_MAXNORM
-    ap1 = l1 >= bound
-    bound = bound * 2.0
-    ap2 = l1 >= bound
-    bound = bound * 2.0
-    ap3 = l1 >= bound
-    bound = bound * 2.0
-    ap4 = l1 >= bound
-    bound = bound * 2.0
-    ap5 = l1 >= bound
-    bound = bound * 2.0
-    ap6 = l1 >= bound
-    bound = bound * 2.0
-    ap7 = l1 >= bound
-    bound = bound * 2.0
-    ap8 = l1 >= bound
-    bound = bound * 2.0
-    ap9 = l1 >= bound
-    bound = bound * 2.0
-    ap10 = l1 >= bound
-    # Scale candidates 2^-k (exact halving) + prefix picks: the bounds
-    # grow monotonically, so the predicates are a prefix pattern
-    # (ap_i ⟹ ap_j for j < i) and stage i keeps candidate i iff
-    # s >= i. Straight-line — no loop-carried predicated values
-    # (Enzyme's reverse zeroes those; forward + values agree).
-    sc0 = 1.0
-    sc1 = sc0 * 0.5
-    sc2 = sc1 * 0.5
-    sc3 = sc2 * 0.5
-    sc4 = sc3 * 0.5
-    sc5 = sc4 * 0.5
-    sc6 = sc5 * 0.5
-    sc7 = sc6 * 0.5
-    sc8 = sc7 * 0.5
-    sc9 = sc8 * 0.5
-    sc10 = sc9 * 0.5
-    sc = sc0
-    sc = ifelse(ap1, sc1, sc)
-    sc = ifelse(ap2, sc2, sc)
-    sc = ifelse(ap3, sc3, sc)
-    sc = ifelse(ap4, sc4, sc)
-    sc = ifelse(ap5, sc5, sc)
-    sc = ifelse(ap6, sc6, sc)
-    sc = ifelse(ap7, sc7, sc)
-    sc = ifelse(ap8, sc8, sc)
-    sc = ifelse(ap9, sc9, sc)
-    sc = ifelse(ap10, sc10, sc)
-    As = (M[1] * sc, M[2] * sc, M[3] * sc, M[4] * sc, M[5] * sc,
-        M[6] * sc, M[7] * sc, M[8] * sc, M[9] * sc)
-    # All five pairs; the cascade selects Stan's degree (degrees
-    # 3-9 see the unscaled arg, 13 the scaled one, exactly as Stan).
-    U3, V3 = _pk_pade3(M)
-    U5, V5 = _pk_pade5(M)
-    U7, V7 = _pk_pade7(M)
-    U9, V9 = _pk_pade9(M)
-    U13, V13 = _pk_pade13(As)
-    c3 = l1 < _PK_PADE_THETA3
-    c5 = l1 < _PK_PADE_THETA5
-    c7 = l1 < _PK_PADE_THETA7
-    c9 = l1 < _PK_PADE_THETA9
-    U = _pk_pick_uv(c3, U3, c5, U5, c7, U7, c9, U9, U13)
-    V = _pk_pick_uv(c3, V3, c5, V5, c7, V7, c9, V9, V13)
-    number = _pk_tadd3(U, V)
-    denom = _pk_tsub3(V, U)
-    X = _pk_lu_solve3(denom, number)
-    # Square back up: the ten repeated squares as candidates + prefix
-    # picks (same prefix argument as the scale above). The kept value
-    # is exactly the loop form's (X_s); the discarded higher powers
-    # are picked away, never observed.
-    X0 = X
-    X1 = _pk_tmul3(X0, X0)
-    X2 = _pk_tmul3(X1, X1)
-    X3 = _pk_tmul3(X2, X2)
-    X4 = _pk_tmul3(X3, X3)
-    X5 = _pk_tmul3(X4, X4)
-    X6 = _pk_tmul3(X5, X5)
-    X7 = _pk_tmul3(X6, X6)
-    X8 = _pk_tmul3(X7, X7)
-    X9 = _pk_tmul3(X8, X8)
-    X10 = _pk_tmul3(X9, X9)
-    Xf = X0
-    Xf = _pk_tpick3(ap1, X1, Xf)
-    Xf = _pk_tpick3(ap2, X2, Xf)
-    Xf = _pk_tpick3(ap3, X3, Xf)
-    Xf = _pk_tpick3(ap4, X4, Xf)
-    Xf = _pk_tpick3(ap5, X5, Xf)
-    Xf = _pk_tpick3(ap6, X6, Xf)
-    Xf = _pk_tpick3(ap7, X7, Xf)
-    Xf = _pk_tpick3(ap8, X8, Xf)
-    Xf = _pk_tpick3(ap9, X9, Xf)
-    Xf = _pk_tpick3(ap10, X10, Xf)
-    return Xf
-end
-
-# C = A*B for column-major 4x4 tuples (linear index (k-1)*4+i).
-_pk_tmul4(a::NTuple{16,Any}, b::NTuple{16,Any}) = (
-    a[1] * b[1] + a[5] * b[2] + a[9] * b[3] + a[13] * b[4],
-    a[2] * b[1] + a[6] * b[2] + a[10] * b[3] + a[14] * b[4],
-    a[3] * b[1] + a[7] * b[2] + a[11] * b[3] + a[15] * b[4],
-    a[4] * b[1] + a[8] * b[2] + a[12] * b[3] + a[16] * b[4],
-    a[1] * b[5] + a[5] * b[6] + a[9] * b[7] + a[13] * b[8],
-    a[2] * b[5] + a[6] * b[6] + a[10] * b[7] + a[14] * b[8],
-    a[3] * b[5] + a[7] * b[6] + a[11] * b[7] + a[15] * b[8],
-    a[4] * b[5] + a[8] * b[6] + a[12] * b[7] + a[16] * b[8],
-    a[1] * b[9] + a[5] * b[10] + a[9] * b[11] + a[13] * b[12],
-    a[2] * b[9] + a[6] * b[10] + a[10] * b[11] + a[14] * b[12],
-    a[3] * b[9] + a[7] * b[10] + a[11] * b[11] + a[15] * b[12],
-    a[4] * b[9] + a[8] * b[10] + a[12] * b[11] + a[16] * b[12],
-    a[1] * b[13] + a[5] * b[14] + a[9] * b[15] + a[13] * b[16],
-    a[2] * b[13] + a[6] * b[14] + a[10] * b[15] + a[14] * b[16],
-    a[3] * b[13] + a[7] * b[14] + a[11] * b[15] + a[15] * b[16],
-    a[4] * b[13] + a[8] * b[14] + a[12] * b[15] + a[16] * b[16])
-
-# Binary exponentiation for the 4x4 augmented dose transition.
-# Native execution uses ordinary binary-power iteration. Tracing retains the
-# recurrence even when the exponent is bound data known during preparation.
-function _pk_matpow4(A::NTuple{16,Any}, n::Integer)
-    marker = ReactiveKernels._dynamic_tensorized_marker(A)
-    marker === nothing || return _pk_retained_power(A, n,
-        zeros(Int, ndigits(max(n, 0); base=2)), marker)
-    R = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
-    B = A
-    e = Int(n)
-    while e > 0
-        if e & 1 == 1
-            R = _pk_tmul4(R, B)
-        end
-        B = _pk_tmul4(B, B)
-        e >>= 1
-    end
-    return R
-end
-
 # --- SB primitive mirrors (`src/pkpd_models.jl`, same op order) ---
 
 """
-    linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka) -> 9-tuple
+    linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka) -> SMatrix{3,3}
 
 Three-state first-order-absorption/two-compartment amount-system matrix
 (SB `linear_pk_system`, same op order: `exp` the logs, derive the
-micro-constants, column-stack) as a column-major tuple (see the
-functional-tuple note above).
+micro-constants, column-stack) as a static matrix.
 """
 # Scalar arguments are deliberately untyped: Reactant's traced scalars
 # are not `Real`, so an annotation would reject the traced call (the
@@ -990,25 +577,18 @@ function linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
     k10 = CL / Vc
     k12 = Q / Vc
     k21 = Q / Vp
-    return (-ka, ka, 0.0, 0.0, -(k10 + k12), k12, 0.0, k21, -k21)
+    return SMatrix{3,3}(-ka, ka, 0.0, 0.0, -(k10 + k12), k12, 0.0, k21,
+        -k21)
 end
 
-# y = E*x for a column-major 3x3 tuple and a 3-tuple.
-_pk_tmatvec3(E::NTuple{9,Any}, x::NTuple{3,Any}) = (
-    E[1] * x[1] + E[4] * x[2] + E[7] * x[3],
-    E[2] * x[1] + E[5] * x[2] + E[8] * x[3],
-    E[3] * x[1] + E[6] * x[2] + E[9] * x[3])
-
 """
-    linear_pk_propagate_3(A, state, dt) -> 3-tuple
+    linear_pk_propagate_3(A, state, dt) -> SVector{3}
 
 Propagate a three-state linear PK system across one interval (SB
 `linear_pk_propagate`: identity at `dt <= 0`, else `exp(A*dt)*state`
-— the exponential is [`_pk_expm3`](@ref), a faithful port of Stan's
-`matrix_exp_pade`, so there is no approximant delta from SB's
-`matrix_exp`).
+— the exponential is the StaticArrays built-in).
 """
-function linear_pk_propagate_3(A::NTuple{9,Any}, state::NTuple{3,Any}, dt)
+function linear_pk_propagate_3(A::SMatrix{3,3}, state::SVector{3}, dt)
     if dt > 0
         return _pk_propagate_positive(A, state, dt)
     end
@@ -1016,56 +596,56 @@ function linear_pk_propagate_3(A::NTuple{9,Any}, state::NTuple{3,Any}, dt)
 end
 
 @inline function _pk_propagate_positive(A, state, dt)
-    M = (A[1] * dt, A[2] * dt, A[3] * dt, A[4] * dt, A[5] * dt,
-        A[6] * dt, A[7] * dt, A[8] * dt, A[9] * dt)
-    _pk_tmatvec3(_pk_expm3(M), state)
+    exp(A * dt) * state
 end
 
 """
-    linear_pk_add_dose_3(state, amount) -> 3-tuple
+    linear_pk_add_dose_3(state, amount) -> SVector{3}
 
 One oral dose jump to the gut amount state (SB `linear_pk_add_dose`).
 """
-function linear_pk_add_dose_3(state::NTuple{3,Any}, amount)
-    return (state[1] + amount, state[2], state[3])
+function linear_pk_add_dose_3(state::SVector{3}, amount)
+    return SVector(state[1] + amount, state[2], state[3])
 end
 
 """
-    linear_pk_add_regular_doses_3(A, state, amount, interval, count) -> 3-tuple
+    linear_pk_add_regular_doses_3(A, state, amount, interval, count) -> SVector{3}
 
 `count` equal oral doses at a fixed interval, beginning now (SB
 `linear_pk_add_regular_doses`: immediate first jump, then the augmented
 affine transition `[P b; 0 1]^(count-1)` with `P = exp(A*interval)`
-and `b = [amount, 0, 0]` — the power is [`_pk_matpow4`](@ref)).
+and `b = [amount, 0, 0]`).
 """
-function linear_pk_add_regular_doses_3(A::NTuple{9,Any}, state::NTuple{3,Any},
+function linear_pk_add_regular_doses_3(A::SMatrix{3,3}, state::SVector{3},
         amount, interval, count::Integer)
     after_first = linear_pk_add_dose_3(state, amount)
     count > 1 || return after_first
-    affine = _pk_dose_affine(A, amount, interval)
-    Q = _pk_matpow4(affine, count - 1)
-    _pk_apply_affine(Q, after_first)
-end
-
-@inline function _pk_dose_affine(A, amount, interval)
-    M = (A[1] * interval, A[2] * interval, A[3] * interval,
-        A[4] * interval, A[5] * interval, A[6] * interval,
-        A[7] * interval, A[8] * interval, A[9] * interval)
-    _pk_affine_from_exp(_pk_expm3(M), amount)
+    Q = _pk_smat_pow4(_pk_dose_affine(A, amount, interval), count - 1)
+    q = Q * SVector(after_first[1], after_first[2], after_first[3], 1.0)
+    return SVector(q[1], q[2], q[3])
 end
 
 # The dose-interval affine map from exp(A*interval): propagate, then add a dose.
-@inline _pk_affine_from_exp(P, amount) =
-    (P[1], P[2], P[3], 0.0, P[4], P[5], P[6], 0.0,
+@inline function _pk_dose_affine(A, amount, interval)
+    P = exp(A * interval)
+    return SMatrix{4,4}(P[1], P[2], P[3], 0.0, P[4], P[5], P[6], 0.0,
         P[7], P[8], P[9], 0.0, amount, 0.0, 0.0, 1.0)
+end
 
-@inline function _pk_apply_affine(Q, after_first)
-    return (Q[1] * after_first[1] + Q[5] * after_first[2] +
-            Q[9] * after_first[3] + Q[13],
-        Q[2] * after_first[1] + Q[6] * after_first[2] +
-            Q[10] * after_first[3] + Q[14],
-        Q[3] * after_first[1] + Q[7] * after_first[2] +
-            Q[11] * after_first[3] + Q[15])
+# Binary exponentiation for the 4x4 augmented dose transition (Stan's
+# `matrix_power` with a data-only integer exponent — same math).
+function _pk_smat_pow4(B::SMatrix{4,4}, n::Integer)
+    R = SMatrix{4,4}(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    e = Int(n)
+    while e > 0
+        if e & 1 == 1
+            R = R * B
+        end
+        B = B * B
+        e >>= 1
+    end
+    return R
 end
 
 """`sqrt(2π)` verbatim from SB `brm_hsgp_sqrt_spd` (the event-LP
@@ -1189,7 +769,7 @@ function linear_pk_read_locs(op_type::AbstractVector,
     log_Vp = log_Vc + log_k12 - log_k21
     A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
     Vc = exp(log_Vc)
-    state = (0.0, 0.0, 0.0)
+    state = SVector(0.0, 0.0, 0.0)
     read_locs = zeros(typeof(Vc / Vc), 0)
     for j in 1:n_ops
         state = linear_pk_propagate_3(A, state, op_dt[j])
@@ -1267,7 +847,7 @@ function linear_pk_read_locs_auc(op_type::AbstractVector,
     A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
     Vc = exp(log_Vc)
     CL = exp(log_CL)
-    state = (0.0, 0.0, 0.0)
+    state = SVector(0.0, 0.0, 0.0)
     given = 0.0
     conc = zeros(typeof(Vc / Vc), 0)
     auc = zeros(typeof(Vc / Vc), 0)
@@ -1368,7 +948,7 @@ function linear_pk_read_locs!(out::AbstractVector, off::Integer,
     log_Vp = log_Vc + log_k12 - log_k21
     A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
     Vc = exp(log_Vc)
-    state = (0.0, 0.0, 0.0)
+    state = SVector(0.0, 0.0, 0.0)
     k = 0
     for j in 1:n_ops
         state = linear_pk_propagate_3(A, state, op_dt[j])
@@ -1411,7 +991,7 @@ function linear_pk_read_locs!(out::AbstractVector, off::Integer,
     log_Vp = log_Vc + log_k12 - log_k21
     A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
     Vc = exp(log_Vc)
-    state = (0.0, 0.0, 0.0)
+    state = SVector(0.0, 0.0, 0.0)
     k = 0
     for j in 1:n_ops
         state = linear_pk_propagate_3(A, state, op_dt[j])
@@ -1465,7 +1045,7 @@ function linear_pk_read_locs_auc!(out::AbstractVector, off::Integer,
     A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
     Vc = exp(log_Vc)
     CL = exp(log_CL)
-    state = (0.0, 0.0, 0.0)
+    state = SVector(0.0, 0.0, 0.0)
     given = 0.0
     n_reads = _pk_count_reads(op_type, 1, n_ops)
     k = 0
