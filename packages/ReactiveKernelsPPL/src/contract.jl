@@ -439,8 +439,9 @@ cauchy(0, local_scale; lower=0)`, `tau ~ cauchy(0, global_scale;
 lower=0)`, `beta = raw * lambda * tau` — each scalar call owns its own
 tau; the halves ride `:positive_stan`, Stan lower-bound kernel
 semantics with NO truncation renormalizer, matching SB which never
-renormalizes bounds). `addressee` is `:Intercept` or a continuous column of `predictor`
-(factor/matrix/monotonic addressees are out of the flat slice). `sign`
+renormalizes bounds). `addressee` is `:Intercept` or a continuous
+column of `predictor` (factor/matrix/monotonic addressees are out of
+the flat slice). `sign`
 is the use polarity (`+1` for `.+`, `-1` for `.-`): the derived coordinate
 holds `sign * raw * lambda * tau`.
 

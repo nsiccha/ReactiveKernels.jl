@@ -448,7 +448,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         delete!(canonmap, m.name)
     end
     # Structural definitions inline into predictors: anything transitively
-    # referencing a coefficient candidate (Normal-priored or free name).
+    # referencing a coefficient candidate (coef-priored or free name).
     # All other vector definitions stay symbolic as named locals.
     structural = _structural_defs(det, data, canonmap, coef_priors,
         prior_names, plate_names)
@@ -915,7 +915,7 @@ const _KNOWN_VALUE_FNS = union(Set{Symbol}(ASSIGNMENT_FNS),
     Set{Symbol}((:ifelse,)))
 
 # Structural definitions: anything transitively referencing a coefficient
-# candidate (a Normal-priored sampled name or a free name — data, det,
+# candidate (a coef-priored sampled name or a free name — data, det,
 # per-cell latents, and other sampled names excluded). Structural
 # definitions inline into predictors; every other definition keeps its
 # binding as a kernel local.
@@ -5239,7 +5239,7 @@ _is_scale_predictor_def(s::Symbol, ctx, allow_stated::Bool) =
 # on a bare use (`allow_stated == false`): a direct stated name is a
 # parameter (`_lower_scale`), so its alias must be one too — routing
 # the alias to analysis would re-bucket the same prior by spelling.
-# Under a link wrapper (`allow_stated == true`) stated-Normal names
+# Under a link wrapper (`allow_stated == true`) stated coef-prior names
 # route to analysis like the location path's stated intercept priors
 # (`a ~ Normal(0, 5)` over `eta = a .+ b .* x`): the wrapper has no
 # scalar meaning, so the predictor path is the only spelling.
@@ -5479,7 +5479,7 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
 end
 
 # A latent-reading definition is a DESIGN predictor (not a latent transform)
-# when it has coefficient structure (a Normal-priored or free coefficient
+# when it has coefficient structure (a coef-priored or free coefficient
 # candidate), reads no scalar parameter (a non-coefficient sampled name
 # like the non-centered `tau` — any such read marks a latent transform),
 # and scales every latent it mentions by a coefficient (the SB `me`
