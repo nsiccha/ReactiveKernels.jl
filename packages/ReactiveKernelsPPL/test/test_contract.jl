@@ -206,6 +206,22 @@ function _beta_plan(n = 9)
     )
 end
 
+function _student_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([-1.5, 0.5, 2.5], outer = cld(n, 3))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; nu = :nu)],
+        [PredictorSpec(:mu, IdentityLink, _terms(), :mu)],
+        _priors(:mu),
+        [SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma),
+            SampledParameter(:nu, :gamma, (arg1 = 2.0, arg2 = 0.1), nothing, :nu)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
 @testset "contract admission predicates" begin
     @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
         BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
@@ -213,7 +229,7 @@ end
         BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
         MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
-        PoissonLogGLMFam, MixtureFam)
+        PoissonLogGLMFam, MixtureFam, StudentTFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
@@ -244,6 +260,7 @@ end
     @test validate_plan(_binomial_probit_plan()) === nothing
     @test validate_plan(_binomial_cloglog_plan()) === nothing
     @test validate_plan(_beta_plan()) === nothing
+    @test validate_plan(_student_plan()) === nothing
 end
 
 @testset "link triples" begin
@@ -277,6 +294,10 @@ end
     # slice-1 Binomial; the AST path is the real path).
     bad = _bernoulli_probit_plan()
     bad.predictors[1] = PredictorSpec(:eta, ProbitLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Student admits the identity predictor link only.
+    bad = _student_plan()
+    bad.predictors[1] = PredictorSpec(:mu, LogLink, _terms(), :mu)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -324,6 +345,77 @@ end
     bad.responses[1] =
         LikelihoodSpec(BernoulliProbitFam, ProbitLink, :y, :eta, nothing, nothing,
             ResponseEvidence(:censored, 0, 1), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "student response validation" begin
+    # Student requires its scale sigma.
+    bad = _student_plan()
+    bad.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, nothing, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; nu = :nu)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Student requires its degrees of freedom nu.
+    bad = _student_plan()
+    bad.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Only Student responses take nu.
+    bad = _gaussian_plan()
+    bad.responses[1] =
+        LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; nu = 4.0)
+    @test_throws ContractValidationError validate_plan(bad)
+    # nu literals must be finite positive.
+    for lit in (0.0, -2.0, Inf, NaN)
+        bad = _student_plan()
+        bad.responses[1] =
+            LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
+                _none_evidence(), :y_resp, nothing, nothing; nu = lit)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    good = _student_plan()
+    good.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; nu = 4.0)
+    @test validate_plan(good) === nothing
+    # nu names resolve structurally (no bind-time column form).
+    bad = _student_plan()
+    bad.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; nu = :nosuch)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _student_plan()
+    bad.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; nu = :x)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Student response must be numeric.
+    bad = _student_plan()
+    bad.columns[:y] = fill("a", 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _student_plan()
+    bad.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
+            ResponseEvidence(:truncated, -1.0, 1.0), :y_resp, nothing, nothing; nu = :nu)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A predictor-fed sigma is admitted (the Gaussian vscale shape).
+    good = _student_plan()
+    push!(good.predictors, PredictorSpec(:sc, LogLink, _terms(), :sc))
+    append!(good.population_priors, _priors(:sc))
+    good.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu,
+            ScalePredictorRef(:sc, LogLink), nothing,
+            _none_evidence(), :y_resp, nothing, nothing; nu = :nu)
+    @test validate_plan(good) === nothing
+    # But not the response's own location predictor.
+    bad = _student_plan()
+    bad.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu,
+            ScalePredictorRef(:mu, IdentityLink), nothing,
+            _none_evidence(), :y_resp, nothing, nothing; nu = :nu)
     @test_throws ContractValidationError validate_plan(bad)
 end
 

@@ -1,5 +1,5 @@
 # Vector-scale contract tests: predictor-fed scale/shape (Gaussian sigma,
-# NB2 phi, Gamma alpha) via `ScalePredictorRef`.
+# NB2 phi, Gamma alpha, Student sigma) via `ScalePredictorRef`.
 #
 # A scale predictor plans exactly like a location predictor (terms, priors,
 # one link); the surface spells the use-site link bare (identity),
@@ -46,6 +46,14 @@ function _vs_oracle_gamma(y, muv, av)
     for i in eachindex(y)
         # Surface is Distributions-SCALE Gamma(alpha, mu/alpha).
         ll += logpdf(Gamma(av[i], muv[i] / av[i]), y[i])
+    end
+    return ll
+end
+
+function _vs_oracle_student(y, muv, sgv, nu)
+    ll = 0.0
+    for i in eachindex(y)
+        ll += logpdf(LocationScale(muv[i], sgv[i], TDist(nu)), y[i])
     end
     return ll
 end
@@ -450,6 +458,30 @@ end
     av = exp.(_vs_lp(nt.s, z))
     ll = _vs_oracle_gamma(yg, muv, av)
     pr = _vs_stdnormal_prior(nt.eta, nt.s)
+    @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
+        rtol = 1e-12, atol = 1e-12)
+    @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
+        rtol = 1e-12, atol = 1e-12)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "vscale: student log-link sigma values + gradient" begin
+    cols = _vs_cols()
+    plan = bind_data(lower_rkppl(quote
+            mu = a .+ b .* x
+            sigma = c .+ d .* z
+            y .~ StudentT.(4.0, mu, exp.(sigma))
+        end, (:y, :x, :z)), cols)
+    r = only(plan.responses)
+    @test r.scale == ScalePredictorRef(:sigma, LogLink)
+    @test r.nu == 4.0
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1, 0.2]
+    nt = constrain(built.layout, u)
+    muv = _vs_lp(nt.mu, cols[:x])
+    sgv = exp.(_vs_lp(nt.sigma, cols[:z]))
+    ll = _vs_oracle_student(cols[:y], muv, sgv, 4.0)
+    pr = _vs_stdnormal_prior(nt.mu, nt.sigma)
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
