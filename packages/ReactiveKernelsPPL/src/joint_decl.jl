@@ -158,21 +158,27 @@ emitted Stan `cat_tgi_*_indication_beta ~ std_normal()`)."""
 const JOINT_DECL_TGI_COV_SCALES = (male = 0.1, standardize_age_yr = 0.1,
     standardize_weight_kg = 0.1, indication = 1.0)
 
-"""SB `sd()` marginal-scale priors per bucket, Distributions.jl SCALE: the
-shared 9-block carries `sd(:, p) ~ Exponential(0.3333)` for the 7 PK/QT
-margins plus per-margin `sd(tgi_·, p) ~ Exponential(0.5)` overrides
-(`_re_r2d2_sd_block` historical path, `brm_integration.jl`; `f201d6bd`);
-`sd(:, tb) ~ Exponential(1.0)` (`brm_joint_tgi.jl`). SB emits Stan rates
-1/scale (3.0/2.0/1.0, triple §2-§3). Carried as
+"""SB `sd()` marginal-scale priors per bucket, Distributions.jl SCALE
+(`brm_integration.jl`; `f201d6bd`): `sd(:, p) ~ Exponential(0.3333)`,
+`sd(:, tg) ~ Exponential(0.5)`, `sd(:, tb) ~ Exponential(1.0)`
+(`brm_joint_tgi.jl`). SB emits Stan rates 1/scale (3.0/2.0/1.0, triple
+§2-§3). The memo shared 9-block reuses the `p` scale for its 7 PK/QT
+margins plus per-margin `tg`-scale overrides for the 2 TGI margins
+(`_re_r2d2_sd_block` historical path). Carried as
 `VaryingSdPrior(:exponential, θ)` (fix `6228160` — the IR takes the scale
 directly, no inversion)."""
-const JOINT_DECL_SD_SCALES = (p = 0.3333333333333333, tgi = 0.5, tb = 1.0)
+const JOINT_DECL_SD_SCALES = (p = 0.3333333333333333, tg = 0.5, tb = 1.0)
 
-"""SB `cor()` LKJ shapes per bucket (`cor(:, p) ~ LKJCholesky(9, 1.0)` —
-eta 1.0 keeps the 7-dim PK/QT principal submatrix at LKJ(7,2),
-`f201d6bd`; `|tb|` K=1 takes SB's default eta 1.0 — vacuous, term exactly
-0.0). The old `|tg|` bucket is gone from SB's emission."""
-const JOINT_DECL_LKJ = (p = (9, 1.0), tb = (1, 1.0))
+"""SB `cor()` LKJ shapes per bucket, default config (`cor(:, p) ~
+LKJCholesky(7, 2.0)`, `cor(:, tg) ~ LKJCholesky(2, 2.0)`; `|tb|` K=1 takes
+SB's default eta 1.0 — vacuous, term exactly 0.0)."""
+const JOINT_DECL_LKJ = (p = (7, 2.0), tg = (2, 2.0), tb = (1, 1.0))
+
+"""SB `cor()` LKJ shape of the memo shared 9-block (`cor(:, p) ~
+LKJCholesky(9, 1.0)` — eta 1.0 keeps the 7-dim PK/QT principal submatrix
+at LKJ(7,2), `f201d6bd`; the `|tg|` bucket is gone from SB's memo
+emission). Pinned by the memo parity oracle."""
+const JOINT_DECL_LKJ_MEMO_P = (9, 1.0)
 
 """SB residual-scale prior scale, V2 `raw_axes` (`pk_residual_scale = 0.25`,
 `brm_integration.jl:3977`; `sigma_add/sigma_prop ~ Exponential(0.25)`)."""
@@ -435,6 +441,9 @@ function joint_decl_predictors(; tgi_formulas::NamedTuple =
     ]
     growth = _joint_decl_growth_lp(tgi_parametrization)
     memo = _joint_decl_tgi_formula_set(tgi_formulas) === :memo
+    tgi_draws, tgi_suffix =
+        memo ? (:draws_p_subject, "p_subject") :
+        (:draws_tg_subject, "tg_subject")
     tgi_short = memo ? [I(), F(:indication)] : [I()]
     tgi_ly0_fixed = memo ?
         [I(), C(:male), C(:standardize_age_yr),
@@ -469,12 +478,12 @@ function joint_decl_predictors(; tgi_formulas::NamedTuple =
                     "p_subject")], :qt_slope),
         PredictorSpec(growth, IdentityLink,
             [tgi_short...,
-                _joint_decl_varying(growth, :draws_p_subject,
-                    "p_subject")], growth),
+                _joint_decl_varying(growth, tgi_draws,
+                    tgi_suffix)], growth),
         PredictorSpec(:log_tgi_kd, IdentityLink,
             [tgi_short...,
-                _joint_decl_varying(:log_tgi_kd, :draws_p_subject,
-                    "p_subject")], :log_tgi_kd),
+                _joint_decl_varying(:log_tgi_kd, tgi_draws,
+                    tgi_suffix)], :log_tgi_kd),
         PredictorSpec(:tgi_ly0, IdentityLink,
             [tgi_ly0_fixed...,
                 _joint_decl_varying(:tgi_ly0, :draws_tb_subject,
@@ -567,40 +576,66 @@ function joint_decl_levelmaps(; tgi_formulas::NamedTuple =
     ]
 end
 
-"""The two shared draws blocks + their per-LP single-column slices (SB
-bucket order; all group on the subject frame). Suffixes mirror SB bucket
-names (`b_p_subject` → `p_subject`: `L_p_subject` / `tau_p_subject` /
-`z_flat_p_subject`). The 9-dim `|p|` block holds the 7 PK/QT margins
-(`sd ~ Exponential(1/3)`) plus the 2 TGI margins (`sd ~ Exponential(0.5)`
-per-margin overrides) — mixed scales, which the generator unrolls to one
-scalar density per margin. `|tb|` takes the vacuous-1x1-LKJ `:correlated`
-route with SB's default eta 1.0 (term exactly 0.0 — the `:intercept1`
-log-scale/xi geometry would NOT mirror SB's tau-sampled K=1 bucket).
-`sd()` marginal-scale priors ride as `VaryingSdPrior(:exponential, θ)`
-(fix `6228160`, snag `thin-layer-varyi-c90f059f`)."""
-function joint_decl_varying(; tgi_parametrization::Symbol = :growth_kill)
+"""The draws blocks + their per-LP single-column slices (SB bucket
+order; all group on the subject frame). Suffixes mirror SB bucket names
+(`b_p_subject` → `p_subject`: `L_p_subject` / `tau_p_subject` /
+`z_flat_p_subject`). Default config: three blocks — 7-dim `|p|`,
+2-dim `|tg|`, 1-dim `|tb|`. Memo config: two blocks — the shared 9-dim
+`|p|` holds the 7 PK/QT margins (`sd ~ Exponential(1/3)`) plus the 2
+TGI margins (`sd ~ Exponential(0.5)` per-margin overrides) — mixed
+scales, which the generator unrolls to one scalar density per margin.
+`|tb|` takes the vacuous-1x1-LKJ `:correlated` route with SB's default
+eta 1.0 (term exactly 0.0 — the `:intercept1` log-scale/xi geometry
+would NOT mirror SB's tau-sampled K=1 bucket). `sd()` marginal-scale
+priors ride as `VaryingSdPrior(:exponential, θ)` (fix `6228160`, snag
+`thin-layer-varyi-c90f059f`)."""
+function joint_decl_varying(; tgi_formulas::NamedTuple =
+        JOINT_DECL_TGI_FORMULAS_V1,
+        tgi_parametrization::Symbol = :growth_kill)
+    admit_joint_decl_tgi_formulas(tgi_formulas)
     admit_joint_decl_tgi_parametrization(tgi_parametrization)
     ones_margin() =
         VaryingMargin(:Intercept, VaryingZRecipe(:ones, :none, nothing))
     exp_prior(s) = VaryingSdPrior(:exponential, s)
     growth = _joint_decl_growth_lp(tgi_parametrization)
+    memo = _joint_decl_tgi_formula_set(tgi_formulas) === :memo
+    p_margins =
+        [VaryingSlice(:draws_p_subject, j:j, lp)
+            for (j, lp) in enumerate((:log_Vc, :log_k10, :log_k12,
+                :log_k21, :log_ka, :qt_base, :qt_slope))]
+    if memo
+        draws = VaryingDraws[
+            VaryingDraws(:subject, :correlated,
+                [ones_margin() for _ in 1:JOINT_DECL_LKJ_MEMO_P[1]],
+                JOINT_DECL_LKJ_MEMO_P[2], :draws_p_subject, "p_subject",
+                nothing,
+                vcat([exp_prior(JOINT_DECL_SD_SCALES.p) for _ in 1:7],
+                    [exp_prior(JOINT_DECL_SD_SCALES.tg) for _ in 1:2])),
+            VaryingDraws(:subject, :correlated, [ones_margin()],
+                JOINT_DECL_LKJ.tb[2], :draws_tb_subject, "tb_subject",
+                nothing, [exp_prior(JOINT_DECL_SD_SCALES.tb)]),
+        ]
+        slices = vcat(p_margins,
+            [VaryingSlice(:draws_p_subject, 8:8, growth),
+                VaryingSlice(:draws_p_subject, 9:9, :log_tgi_kd),
+                VaryingSlice(:draws_tb_subject, 1:1, :tgi_ly0)])
+        return (draws = draws, slices = slices)
+    end
     draws = VaryingDraws[
-        VaryingDraws(:subject, :correlated, [ones_margin() for _ in 1:9],
+        VaryingDraws(:subject, :correlated, [ones_margin() for _ in 1:7],
             JOINT_DECL_LKJ.p[2], :draws_p_subject, "p_subject", nothing,
-            vcat([exp_prior(JOINT_DECL_SD_SCALES.p) for _ in 1:7],
-                [exp_prior(JOINT_DECL_SD_SCALES.tgi) for _ in 1:2])),
+            [exp_prior(JOINT_DECL_SD_SCALES.p) for _ in 1:7]),
+        VaryingDraws(:subject, :correlated, [ones_margin() for _ in 1:2],
+            JOINT_DECL_LKJ.tg[2], :draws_tg_subject, "tg_subject", nothing,
+            [exp_prior(JOINT_DECL_SD_SCALES.tg) for _ in 1:2]),
         VaryingDraws(:subject, :correlated, [ones_margin()],
             JOINT_DECL_LKJ.tb[2], :draws_tb_subject, "tb_subject", nothing,
             [exp_prior(JOINT_DECL_SD_SCALES.tb)]),
     ]
-    slices = VaryingSlice[
-        VaryingSlice(:draws_p_subject, j:j, lp)
-        for (j, lp) in enumerate((:log_Vc, :log_k10, :log_k12, :log_k21,
-            :log_ka, :qt_base, :qt_slope))
-    ]
-    push!(slices, VaryingSlice(:draws_p_subject, 8:8, growth))
-    push!(slices, VaryingSlice(:draws_p_subject, 9:9, :log_tgi_kd))
-    push!(slices, VaryingSlice(:draws_tb_subject, 1:1, :tgi_ly0))
+    slices = vcat(p_margins,
+        [VaryingSlice(:draws_tg_subject, 1:1, growth),
+            VaryingSlice(:draws_tg_subject, 2:2, :log_tgi_kd),
+            VaryingSlice(:draws_tb_subject, 1:1, :tgi_ly0)])
     return (draws = draws, slices = slices)
 end
 
@@ -665,6 +700,7 @@ function joint_decl_fragments(;
         tgi_structure::Symbol = :log_linear,
         tgi_thresholds::Symbol = :lugano_ct,
         tgi_measure::Symbol = :spd,
+        tgi_parametrization::Symbol = :growth_kill,
         qt_prior_scale::Real,
         tgi_baseline_log_size::Real,
         misclassification::Real = 0.01,
@@ -680,6 +716,8 @@ function joint_decl_fragments(;
     admit_joint_decl_tgi_structure(tgi_structure)
     admit_joint_decl_tgi_thresholds(tgi_thresholds)
     admit_joint_decl_tgi_measure(tgi_measure)
+    admit_joint_decl_tgi_thresholds_measure(tgi_thresholds, tgi_measure)
+    admit_joint_decl_tgi_parametrization(tgi_parametrization)
     vc_prior_median == 10.0 ||
         throw(ContractValidationError("[joint_decl] `vc_prior_median` " *
               "admitted only at the SB default 10.0 (the baked log_Vc " *
@@ -709,16 +747,22 @@ function joint_decl_fragments(;
         throw(ContractValidationError("[joint_decl] `misclassification` " *
               "must lie in [0, 0.5) (SB's own validation; default 0.01), " *
               "got $(repr(misclassification))"))
-    varying = joint_decl_varying()
+    varying = joint_decl_varying(; tgi_formulas = tgi_formulas,
+        tgi_parametrization = tgi_parametrization)
     return (;
-        predictors = joint_decl_predictors(),
+        predictors = joint_decl_predictors(; tgi_formulas = tgi_formulas,
+            tgi_parametrization = tgi_parametrization),
         population_priors = joint_decl_population_priors(;
-            qt_prior_scale = qs, tgi_baseline_log_size = tb),
+            qt_prior_scale = qs, tgi_baseline_log_size = tb,
+            tgi_formulas = tgi_formulas,
+            tgi_parametrization = tgi_parametrization),
         derived = joint_decl_derived(),
-        levelmaps = joint_decl_levelmaps(),
+        levelmaps = joint_decl_levelmaps(; tgi_formulas = tgi_formulas,
+            tgi_parametrization = tgi_parametrization),
         varying_draws = varying.draws,
         varying_slices = varying.slices,
-        parameters = joint_decl_scalars(),
+        parameters = joint_decl_scalars(; tgi_thresholds = tgi_thresholds,
+            tgi_measure = tgi_measure),
         prep = (; qt_prior_scale = qs, tgi_baseline_log_size = tb,
             misclassification = m),
     )

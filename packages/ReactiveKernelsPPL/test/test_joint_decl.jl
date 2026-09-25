@@ -1,5 +1,6 @@
 # Joint PK+QT+TGI declarations (W3a): SB-mirror term-for-term proofs for the
-# default-config `joint_pk_qt_tgi_brm1` subject-frame declaration block.
+# default-config `joint_pk_qt_tgi_brm1` subject-frame declaration block,
+# plus the memo-config (`net_kill` + recist/sld) shape proofs.
 #
 # SB truth: bruno `kb-impl/Bruno-arv393-tgi` @ `3af22846` — PK/QT terms cite
 # the audit triple `web-pkpd/test/stan_audit_triples/joint_brm2_default.md`
@@ -751,4 +752,78 @@ end
     @test occursin("_ppl_prior_L_p_subject", src)
     @test occursin("_ppl_prior_L_tg_subject", src)
     @test occursin("_ppl_gidx_subject", src)
+end
+
+@testset "joint decl memo config" begin
+    # Full memo spelling admits through fragments (SB memo joint:
+    # memo TGI formulas + net_kill + recist/sld pair).
+    f = joint_decl_fragments(; tgi_formulas = JOINT_DECL_TGI_FORMULAS_MEMO,
+        tgi_parametrization = :net_kill, tgi_thresholds = :recist,
+        tgi_measure = :sld, qt_prior_scale = _jd_qt_scale(),
+        tgi_baseline_log_size = _jd_tgi_baseline())
+    # Roster swaps the growth LP to :tgi_net (SB memo bucket order).
+    @test [p.name for p in f.predictors] ==
+        [:log_Vc, :log_k10, :log_k12, :log_k21, :log_ka, :qt_base,
+            :qt_slope, :tgi_net, :log_tgi_kd, :tgi_ly0]
+    byname = Dict(p.name => p for p in f.predictors)
+    # Memo TGI fixed effects: Intercept + indication on growth/kd.
+    @test [(t.kind, t.columns) for t in byname[:tgi_net].terms] ==
+        [(InterceptTerm, Symbol[]), (FactorTerm, [:indication]),
+            (VaryingEffectTerm, [:subject])]
+    @test [(t.kind, t.columns) for t in byname[:log_tgi_kd].terms] ==
+        [(InterceptTerm, Symbol[]), (FactorTerm, [:indication]),
+            (VaryingEffectTerm, [:subject])]
+    # Memo ly0: full margins + covariates (memo formulas).
+    @test [(t.kind, t.columns) for t in byname[:tgi_ly0].terms] ==
+        [(InterceptTerm, Symbol[]), (ContinuousTerm, [:male]),
+            (ContinuousTerm, [:standardize_age_yr]),
+            (ContinuousTerm, [:standardize_weight_kg]),
+            (FactorTerm, [:indication]),
+            (VaryingEffectTerm, [:subject])]
+    # Shared 9-block: growth/kd varying terms ride draws_p_subject.
+    @test byname[:tgi_net].terms[end].options.draws === :draws_p_subject
+    @test byname[:log_tgi_kd].terms[end].options.draws === :draws_p_subject
+    # Draws: |p| K=9 eta 1.0, |tb| K=1 eta 1.0 vacuous; no |tg|.
+    @test [(d.label, d.kind, d.lkj_eta, length(d.margins))
+        for d in f.varying_draws] ==
+        [(:draws_p_subject, :correlated, 1.0, 9),
+            (:draws_tb_subject, :correlated, 1.0, 1)]
+    # Mixed sd() scales: 7x p-scale + 2x tg-scale in the shared block.
+    @test [(p.family, p.param) for p in f.varying_draws[1].sd_priors] ==
+        vcat(fill((:exponential, 0.3333333333333333), 7),
+            fill((:exponential, 0.5), 2))
+    @test [(p.family, p.param) for p in f.varying_draws[2].sd_priors] ==
+        [(:exponential, 1.0)]
+    # Slices: TGI margins at columns 8/9 of the shared block.
+    @test [(s.draws, s.columns, s.target) for s in f.varying_slices] ==
+        vcat(
+            [(:draws_p_subject, j:j, lp)
+                for (j, lp) in enumerate((:log_Vc, :log_k10, :log_k12,
+                    :log_k21, :log_ka, :qt_base, :qt_slope))],
+            [(:draws_p_subject, 8:8, :tgi_net),
+                (:draws_p_subject, 9:9, :log_tgi_kd),
+                (:draws_tb_subject, 1:1, :tgi_ly0)],
+        )
+    # Levelmaps gain the memo TGI LPs (growth + kd + ly0).
+    @test [(m.predictor, m.column, m.subset) for m in f.levelmaps] ==
+        vcat([(lp, :indication, (2, :end))
+                for lp in (:log_Vc, :log_k10, :log_k12, :log_k21, :log_ka,
+                    :qt_base, :qt_slope)],
+            [(:tgi_net, :indication, (2, :end)),
+                (:log_tgi_kd, :indication, (2, :end)),
+                (:tgi_ly0, :indication, (2, :end))])
+    # effect() inventory: 26 + 2 growth/kd indication + 4 ly0 covariates.
+    pr = Dict((p.predictor, p.addressee) => (p.location, p.scale)
+        for p in f.population_priors)
+    @test length(f.population_priors) == 32
+    @test pr[(:tgi_net, :Intercept)] == (0.0, 1.5)
+    @test pr[(:tgi_net, :indication)] == (0.0, 1.0)
+    @test pr[(:tgi_ly0, :male)] == (0.0, 0.1)
+    # recist+sld folds the PR-boundary upper to log(0.7).
+    byparam = Dict(p.name => p for p in f.parameters)
+    @test byparam[:tgi_c_cr].support_override == (:upper, log(0.7))
+    # Pair gate: recist+spd fails closed (lugano_ct+sld covered above).
+    @test_throws ContractValidationError joint_decl_fragments(;
+        tgi_thresholds = :recist, qt_prior_scale = _jd_qt_scale(),
+        tgi_baseline_log_size = _jd_tgi_baseline())
 end
