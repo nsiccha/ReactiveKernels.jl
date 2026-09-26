@@ -61,6 +61,16 @@ end
     @test isempty(mixed.population_priors)
     mgot = Dict(p.name => p for p in mixed.parameters)
     @test mgot[:horseshoe_mu_Intercept_normal].args == (arg1 = 0.0, arg2 = 5.0)
+    # Both keyword spellings land on the entry (bare `:kw` and
+    # `:parameters`-wrapped — neither may silently default).
+    wrapped = lower_rkppl(quote
+            b1 ~ Horseshoe(; global_scale = 0.25)
+            mu = a .+ b1 .* x1
+            sigma ~ Exponential(1.0)
+            y .~ Normal.(mu, sigma)
+        end, Set([:x1, :y]))
+    wentry = only(wrapped.horseshoe_priors)
+    @test (wentry.local_scale, wentry.global_scale) == (1.0, 0.25)
     # Layout: the coefficient block is derived (no :coefficient entry);
     # triples + scalars lay out as sampled parameters.
     bound = bind_data(plan, _horseshoe_cols())
