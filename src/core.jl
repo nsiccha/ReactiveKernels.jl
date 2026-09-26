@@ -125,12 +125,25 @@ end
 # tuple as a dynamic `jl_f_tuple` and its runtime tuple rule refuses mixed
 # activity (a constant array next to active ones) unless runtime activity is
 # switched on. Specialized, the arguments stay individual values.
-@inline _kernel_source_call(::Val{:native}, op::_KernelSourceOp,
-                            args::Vararg{Any,N}) where {N} =
-    op.f(args...)
-@inline _kernel_source_call(::Val{:tensorized}, op::_KernelSourceOp,
-                            args::Vararg{Any,N}) where {N} =
-    op.tensor_f(args...)
+#
+# The forwarding itself is spelled out positionally (no `args...` splat):
+# Julia 1.12 inference refuses to unsplat a forwarded tuple of more than 32
+# elements into a fixed-arity callee, so a fused closure with 33+ inputs
+# (the memo joint's 43-argument log-Jacobian) devolves to dynamic
+# `jl_apply_generic` dispatch. The primal still runs, but Enzyme cannot
+# differentiate through the dynamic call (snag `joint-decl-memo-9642bb45`).
+# A direct N-argument call infers on every version — the same remedy as
+# `_prepared_call` (codegen.jl) for the 1.12 RGF splat-allocation cliff.
+@inline @generated function _kernel_source_call(::Val{:native},
+        op::_KernelSourceOp, args::Vararg{Any,N}) where {N}
+    forwarded = [:(getfield(args, $index)) for index in 1:N]
+    :(op.f($(forwarded...)))
+end
+@inline @generated function _kernel_source_call(::Val{:tensorized},
+        op::_KernelSourceOp, args::Vararg{Any,N}) where {N}
+    forwarded = [:(getfield(args, $index)) for index in 1:N]
+    :(op.tensor_f($(forwarded...)))
+end
 @inline (op::_KernelSourceOp)(args::Vararg{Any,N}) where {N} =
     _kernel_source_call(_kernel_source_style(args), op, args...)
 kernel_sourceop_token(::_KernelSourceOp{DefToken}) where {DefToken} = DefToken
