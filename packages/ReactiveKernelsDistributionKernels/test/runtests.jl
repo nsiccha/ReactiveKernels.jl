@@ -1,6 +1,6 @@
-using Distributions: Bernoulli, Cauchy, Dirichlet, Exponential, Geometric,
-    InverseGamma, Laplace, LKJCholesky, Logistic, LogNormal, MvNormal,
-    NegativeBinomial, Normal, Poisson,
+using Distributions: Bernoulli, BetaBinomial, Cauchy, Dirichlet, Exponential,
+    Geometric, InverseGamma, Laplace, LKJCholesky, Logistic, LogNormal,
+    MvNormal, NegativeBinomial, Normal, Poisson,
     TDist, Uniform, cdf, logpdf, quantile
 using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky, diag
 using LogExpFunctions: log1pexp
@@ -16,12 +16,13 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE,
     MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE,
     CATEGORICAL_LOGIT_KERNEL_SOURCE, CATEGORICAL_LOGIT_REF_KERNEL_SOURCE,
+    BETA_BINOMIAL_KERNEL_SOURCE,
     INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE,
     LKJ_CORR_CHOLESKY_KERNEL_SOURCE,
     normal, cauchy, laplace, logistic, bernoulli, lognormal,
     exponential, geometric, uniform, mvnormal, ar1,
     categorical_logit, categorical_logit_ref,
-    negative_binomial2,
+    negative_binomial2, beta_binomial,
     inverse_gamma, dirichlet, lkj_corr_cholesky, zero_inflated_poisson,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 using Test
@@ -505,6 +506,31 @@ end
     @test zip_rate(2, NaN, 0.2) == -Inf
     @test !isnan(zip_rate(2, NaN, 0.2))
     @test_throws DomainError zip_rate(2, -1.0, 0.2)
+end
+
+@testset "beta_binomial Stan lpmf parity" begin
+    # beta_binomial(n, alpha, beta) is Stan's beta_binomial: the FULL
+    # lpmf (binomial coefficient + lbeta terms), checked against
+    # Distributions.BetaBinomial — the independent oracle.
+    bb = prepare(beta_binomial.logpdf;
+        have = (:observed, :n, :alpha, :beta), want = :logpdf)
+    for (y, n, a, b) in ((3, 10, 2.0, 5.0), (0, 10, 2.0, 5.0),
+            (10, 10, 2.0, 5.0), (7, 12, 0.5, 0.5), (1, 4, 8.0, 3.0))
+        @test bb(y, n, a, b) ≈ logpdf(BetaBinomial(n, a, b), y)
+    end
+    # Out-of-support observations are -Inf, never NaN.
+    @test bb(-1, 10, 2.0, 5.0) == -Inf
+    @test bb(11, 10, 2.0, 5.0) == -Inf
+    # Lifts through the generic plate path; the compiled kernel is
+    # Distributions.jl-free.
+    plated = plate(beta_binomial.logpdf;
+        have = (:observed, :n, :alpha, :beta), want = :logpdf,
+        batched = (:observed,))
+    observations = [0, 3, 7, 10]
+    @test plated(observations, 10, 2.0, 5.0) ≈
+        sum(logpdf(BetaBinomial(10, 2.0, 5.0), y) for y in observations)
+    @test !occursin("Distributions", string(code_expr(plated)))
+    @test occursin("@kernel beta_binomial", BETA_BINOMIAL_KERNEL_SOURCE)
 end
 
 include("test_glm.jl")

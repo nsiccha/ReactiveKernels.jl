@@ -635,6 +635,24 @@ function _gen_ig_plan(; lam = :lam)
     return plan
 end
 
+function _gen_betabinomial2_plan(; phi = :phi, trials = :n)
+    cols, n = _gen_columns()
+    cols[:y] = [6, 8, 5, 9, 4, 7]
+    cols[:n] = [10, 12, 8, 15, 9, 11]
+    params = phi isa Symbol ? SampledParameter[
+        SampledParameter(:phi, :gamma, (arg1 = 2.0, arg2 = 0.1), nothing, :phi)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu,
+            phi, nothing, _none_evidence(), :y_resp, trials, nothing)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
 function _ref_ig(cols, coef, lam)
     mu = exp.(coef[1] .+ coef[2] .* cols[:x])
     return sum(logpdf(InverseGaussian(m, lam), y) for (y, m) in zip(cols[:y], mu))
@@ -652,6 +670,25 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+function _ref_betabinomial2(cols, coef, phi; trials = cols[:n])
+    mu = 1 ./ (1 .+ exp.(.-(coef[1] .+ coef[2] .* cols[:x])))
+    return sum(zip(cols[:y], trials, mu)) do (y, t, m)
+        logpdf(BetaBinomial(t, m * phi, (1 - m) * phi), y)
+    end
+end
+
+@testset "betabinomial2 values and gradient" begin
+    plan = _gen_betabinomial2_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 1.0]
+    nt = constrain(built.layout, u)
+    ll = _ref_betabinomial2(plan.columns, Vector(nt.mu), nt.phi)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Gamma(2.0, 0.1), nt.phi)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "ig literal-lambda values" begin
     plan = _gen_ig_plan(; lam = 1.5)
     built = build_kernel(plan)
@@ -659,6 +696,17 @@ end
     nt = constrain(built.layout, u)
     ll = _ref_ig(plan.columns, Vector(nt.eta), 1.5)
     pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "betabinomial2 literal-phi values" begin
+    plan = _gen_betabinomial2_plan(; phi = 4.0)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_betabinomial2(plan.columns, Vector(nt.mu), 4.0)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, plan, u)
 end
@@ -679,6 +727,29 @@ end
     ll = sum(cols[:w] .*
         [logpdf(InverseGaussian(m, 1.5), y) for (y, m) in zip(cols[:y], mu)])
     pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted betabinomial2 values" begin
+    cols, n = _gen_columns()
+    cols[:y] = [6, 8, 5, 9, 4, 7]
+    cols[:n] = [10, 12, 8, 15, 9, 11]
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu,
+            4.0, :w, _none_evidence(), :y_resp, :n, nothing)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = 1 ./ (1 .+ exp.(.-(Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* cols[:x])))
+    ll = sum(cols[:w] .*
+        [logpdf(BetaBinomial(t, m * 4.0, (1 - m) * 4.0), y)
+            for (y, t, m) in zip(cols[:y], cols[:n], mu)])
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, plan, u)
 end
