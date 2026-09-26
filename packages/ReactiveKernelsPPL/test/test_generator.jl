@@ -658,6 +658,45 @@ function _ref_ig(cols, coef, lam)
     return sum(logpdf(InverseGaussian(m, lam), y) for (y, m) in zip(cols[:y], mu))
 end
 
+function _gen_vm_plan(; kappa = :kappa, interval = nothing)
+    cols, n = _gen_columns()
+    cols[:y] = [0.3, -1.1, 2.0, -2.0, 0.5, 1.1]
+    params = kappa isa Symbol ? SampledParameter[
+        SampledParameter(:kappa, :gamma, (arg1 = 2.0, arg2 = 0.1), nothing, :kappa)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu,
+            kappa, nothing, _none_evidence(), :y_resp, nothing, nothing;
+            interval = interval)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_vm(cols, coef, kap)
+    mu = coef[1] .+ coef[2] .* cols[:x]
+    kvals = kap isa Real ? fill(Float64(kap), length(mu)) : kap
+    return sum(logpdf(VonMises(m, k), y)
+        for (y, m, k) in zip(cols[:y], mu, kvals))
+end
+
+# Circular oracle on the BRM `CircularVonMises` path (wrap mu into the
+# interval, wrap y into the moving support, Distributions base) —
+# independent of the kernel's rem-based spelling.
+function _ref_vm_circ(cols, coef, kap, lo, hi)
+    mu = coef[1] .+ coef[2] .* cols[:x]
+    kvals = kap isa Real ? fill(Float64(kap), length(mu)) : kap
+    w = hi - lo
+    return sum(zip(cols[:y], mu, kvals)) do (y, m, k)
+        wm = lo + mod(m - lo, w)
+        r = (wm - pi) + mod(y - (wm - pi), 2pi)
+        logpdf(VonMises(wm, k), r)
+    end
+end
+
 @testset "ig values and gradient" begin
     plan = _gen_ig_plan()
     built = build_kernel(plan)
@@ -749,6 +788,84 @@ end
     ll = sum(cols[:w] .*
         [logpdf(BetaBinomial(t, m * 4.0, (1 - m) * 4.0), y)
             for (y, t, m) in zip(cols[:y], cols[:n], mu)])
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "vm values and gradient" begin
+    plan = _gen_vm_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 1.0]
+    nt = constrain(built.layout, u)
+    ll = _ref_vm(plan.columns, Vector(nt.mu), nt.kappa)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Gamma(2.0, 0.1), nt.kappa)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "vm circular values and gradient" begin
+    plan = _gen_vm_plan(; interval = (-Float64(pi), Float64(pi)))
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 1.0]
+    nt = constrain(built.layout, u)
+    ll = _ref_vm_circ(plan.columns, Vector(nt.mu), nt.kappa, -Float64(pi),
+        Float64(pi))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Gamma(2.0, 0.1), nt.kappa)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "vm literal-kappa values" begin
+    plan = _gen_vm_plan(; kappa = 1.7)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_vm(plan.columns, Vector(nt.mu), 1.7)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "vm predictor-kappa values" begin
+    cols, n = _gen_columns()
+    cols[:y] = [0.3, -1.1, 2.0, -2.0, 0.5, 1.1]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu,
+            ScalePredictorRef(:lk, LogLink), nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu),
+            PredictorSpec(:lk, LogLink, _gen_terms(), :lk)],
+        [_gen_priors(:mu); _gen_priors(:lk)],
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.3, -0.1]
+    nt = constrain(built.layout, u)
+    kap = exp.(Vector(nt.lk)[1] .+ Vector(nt.lk)[2] .* cols[:x])
+    ll = _ref_vm(plan.columns, Vector(nt.mu), kap)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Normal(0, 1), nt.lk[1]) + logpdf(Normal(0, 2), nt.lk[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted vm values" begin
+    cols, n = _gen_columns()
+    cols[:y] = [0.3, -1.1, 2.0, -2.0, 0.5, 1.1]
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu,
+            1.7, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* cols[:x]
+    ll = sum(cols[:w] .*
+        [logpdf(VonMises(m, 1.7), y) for (y, m) in zip(cols[:y], mu)])
     pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, plan, u)

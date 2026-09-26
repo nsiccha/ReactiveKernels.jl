@@ -101,6 +101,7 @@ univariate components, SB `MixtureModel` mirror)."""
     ZeroInflatedPoissonFam
     InverseGaussianFam
     BetaBinomial2Fam
+    VonMisesFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -157,7 +158,8 @@ end
 
 A predictor-fed scale/shape use: the response's auxiliary (Gaussian
 sigma, NB2 dispersion phi, Gamma shape alpha, Student sigma, hurdle
-p_zero; InverseGaussian lambda and Beta kappa stay scalar-only) is a
+p_zero, VonMises concentration kappa; InverseGaussian lambda, Beta
+kappa, and BetaBinomial2 phi stay scalar-only) is a
 whole linear predictor, varying per observation.
 `predictor` names the
 [`PredictorSpec`](@ref) (planned exactly like a location predictor:
@@ -179,12 +181,14 @@ end
 
 One independent response. `scale` is the response's auxiliary —
 Gaussian sigma, NB2 dispersion phi, Gamma shape alpha, hurdle p_zero,
-InverseGaussian shape lambda, BetaBinomial2 precision phi — either
+InverseGaussian shape lambda, BetaBinomial2 precision phi, VonMises
+concentration kappa — either
 scalar (parameter, assignment, folded literal, or a raw per-observation
-data column) or, for Gaussian/NB2/Gamma/Student/hurdle only, a
+data column) or, for Gaussian/NB2/Gamma/Student/hurdle/VonMises only, a
 [`ScalePredictorRef`](@ref) (predictor-fed per-observation auxiliary);
 it must be `nothing` otherwise. A hurdle p_zero is a probability
-(scalar in [0, 1], predictor-fed logit-only). An InverseGaussian
+(scalar in [0, 1], predictor-fed logit-only). A VonMises kappa is
+predictor-fed log-only (a concentration). An InverseGaussian
 lambda is scalar-only (predictor-fed lambda deferred, the Beta-kappa
 precedent); a BetaBinomial2 phi is scalar-only (predictor-fed phi
 deferred, the same precedent).
@@ -307,6 +311,17 @@ every other response leaves it at `nothing`:
   latent (SB keeps `y_mis` in generated quantities here). v1 admits
   Gaussian/Gamma/Beta, uncomposed (no weights/evidence/range/trials);
   Case-B downstream merged-response uses fail closed emitter-side.
+
+VonMises responses (`VonMisesFam`, SB `brm_von_mises` mirror) carry the
+principal-interval endpoints in the trailing `interval` field, built
+with keywords (`interval=`); every other family leaves it at `nothing`:
+
+- `interval`: `nothing` for exact `VonMises` (moving inclusive support
+  `[mu - pi, mu + pi]`), or the `(lo, hi)` literal pair for
+  `CircularVonMises` (fixed half-open support `[lo, hi)`, finite with
+  `lo < hi` and width exactly `2pi` — the BRM `_brm_circular_interval`
+  rule). The generator wraps mu into `[lo, hi)` per cell and guards
+  `y` to the support, exactly the SB branch structure.
 """
 struct LikelihoodSpec
     family::LikelihoodFamily
@@ -339,6 +354,7 @@ struct LikelihoodSpec
     nu::Union{Nothing,ParamName,Real}
     zi::Union{Nothing,ParamName,Real}
     mi_jobs::Union{Nothing,ColumnRef}
+    interval::Union{Nothing,Tuple{Float64,Float64}}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
@@ -372,13 +388,14 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         mixture_weights::Union{Nothing,Symbol,Vector{Float64}} = nothing,
         nu::Union{Nothing,ParamName,Real} = nothing,
         zi::Union{Nothing,ParamName,Real} = nothing,
-        mi_jobs::Union{Nothing,ColumnRef} = nothing)
+        mi_jobs::Union{Nothing,ColumnRef} = nothing,
+        interval::Union{Nothing,Tuple{Float64,Float64}} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
         threshold_columns, threshold_coefs, extra_responses, factor_scales,
         factor_corr, glm_alpha, glm_beta, mixture_family, mixture_locs,
-        mixture_scales, mixture_weights, nu, zi, mi_jobs)
+        mixture_scales, mixture_weights, nu, zi, mi_jobs, interval)
 end
 
 """
@@ -1368,6 +1385,7 @@ const ADMITTED_TRIPLES = (
     (ZeroInflatedPoissonFam, LogLink, LogLink),
     (InverseGaussianFam, LogLink, LogLink),
     (BetaBinomial2Fam, LogitLink, IdentityLink),
+    (VonMisesFam, IdentityLink, IdentityLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order)."""
@@ -1707,7 +1725,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
-    ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam)
+    ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -6210,6 +6228,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_mixture_response(r, plan, used_predictors)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
+            _validate_interval(r, plan)
             continue
         end
         # A scale predictor feeds a slot exactly like a location predictor,
@@ -6227,6 +6246,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
+            _validate_interval(r, plan)
             _validate_evidence_structure(r, plan)
             _validate_unleveled_fields(r)
             continue
@@ -6257,6 +6277,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
+            _validate_interval(r, plan)
             _validate_evidence_structure(r, plan)
             _validate_unleveled_fields(r)
             continue
@@ -6269,6 +6290,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
+            _validate_interval(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -6280,6 +6302,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
+            _validate_interval(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -6291,6 +6314,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
+            _validate_interval(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -6306,11 +6330,12 @@ function _validate_responses(plan::StructuralPlan)
             "Poisson-log, Binomial-logit/probit/cloglog, NB2-log, Gamma-log, " *
             "Beta-logit, Categorical-logit, Ordered-logit, Ordinal spellings, " *
             "Student-identity, Hurdle-Poisson-log, ZIP-log, " *
-            "InverseGaussian-log, BetaBinomial2-logit)",
+            "InverseGaussian-log, BetaBinomial2-logit, VonMises-identity)",
         )
         _validate_scale(r, plan)
         _validate_nu(r, plan)
         _validate_zi(r, plan)
+        _validate_interval(r, plan)
         _validate_evidence_structure(r, plan)
         _validate_leveled_fields(r, plan, pred, used_predictors)
         if r.range !== nothing
@@ -6385,6 +6410,23 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         # instead of flowing a wrong value.
         (eltype(col) <: Real && all(>(0), col)) ||
             _fail(r.label, "InverseGaussian response must be strictly positive numerics")
+        return nothing
+    elseif r.family === VonMisesFam
+        # Finite angles (Bool is not an angle support); a circular
+        # response additionally honors the half-open principal interval
+        # (SB `brm_von_mises_lpdf` returns -inf at y < lo / y >= hi) —
+        # fail closed instead of flowing a wrong value. The exact
+        # moving support [mu - pi, mu + pi] reads live mu, so only the
+        # kernel guards it.
+        (eltype(col) <: Real && !(eltype(col) <: Bool) &&
+            all(isfinite, col)) ||
+            _fail(r.label, "VonMises response must be finite numerics")
+        if r.interval !== nothing
+            lo, hi = r.interval
+            all(y -> lo <= y < hi, col) ||
+                _fail(r.label, "CircularVonMises response must lie in " *
+                    "[$(lo), $(hi))")
+        end
         return nothing
     elseif r.family === GaussianFam
         eltype(col) <: Real ||
@@ -6544,7 +6586,8 @@ _scale_need(fam::LikelihoodFamily) =
     fam === StudentTFam ? "Student response requires a scale sigma" :
     fam === HurdlePoissonFam ? "Hurdle response requires a hurdle probability p_zero" :
     fam === InverseGaussianFam ? "InverseGaussian response requires a shape lambda" :
-    fam === BetaBinomial2Fam ? "BetaBinomial2 response requires a precision phi" : nothing
+    fam === BetaBinomial2Fam ? "BetaBinomial2 response requires a precision phi" :
+    fam === VonMisesFam ? "VonMises response requires a concentration kappa" : nothing
 
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     need = _scale_need(r.family)
@@ -6589,15 +6632,16 @@ function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
 end
 
 # A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha,
-# Student sigma, hurdle p_zero; Beta kappa and InverseGaussian lambda are
-# deferred above):
+# Student sigma, hurdle p_zero, VonMises kappa; Beta kappa,
+# InverseGaussian lambda, and BetaBinomial2 phi are deferred above):
 # the predictor exists, carries the use-site link (the
 # one-link-per-predictor rule), and is not the response's own location
 # predictor (the two slots take distinct predictors — the BRM-side plan
 # rule, mirrored here as defense in depth). Beta-kappa predictors are
 # deferred; predictor-fed Binomial trials likewise (trials stay
 # column-or-literal by type). A hurdle p_zero predictor is logit-only (a
-# probability); the admitted scale families take identity/log/logit.
+# probability); a VonMises kappa predictor is log-only (a concentration);
+# the remaining admitted scale families take identity/log/logit.
 function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
         s::ScalePredictorRef)
     return _validate_scale_predictor_use(r, plan, s, r.family, [r.predictor])
@@ -6617,12 +6661,16 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
         "precision (phi) is deferred — use a scalar phi (parameter or literal)")
     (fam === GaussianFam || fam === NegativeBinomial2Fam ||
         fam === GammaLogFam || fam === StudentTFam ||
-        fam === HurdlePoissonFam) ||
+        fam === HurdlePoissonFam || fam === VonMisesFam) ||
         _fail(r.label, "this response family takes no scale predictor")
     if fam === HurdlePoissonFam
         s.link === LogitLink ||
             _fail(r.label, "hurdle p_zero predictor link must be logit " *
                 "(a probability — got $(s.link))")
+    elseif fam === VonMisesFam
+        s.link === LogLink ||
+            _fail(r.label, "VonMises kappa predictor link must be log " *
+                "(a concentration — got $(s.link))")
     else
         (s.link === IdentityLink || s.link === LogLink ||
             s.link === LogitLink) ||
@@ -6725,6 +6773,30 @@ function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "zi literal must lie in [0, 1]"))
     z isa Symbol && (z in _union_names(plan) ||
         _fail(r.label, "zi references unknown name $z"))
+    return nothing
+end
+
+# VonMises principal interval: `nothing` for exact `VonMises` (moving
+# support), or the `(lo, hi)` literal pair for `CircularVonMises`
+# (fixed half-open support) — the BRM `_brm_circular_interval` rule:
+# finite endpoints, `lo < hi`, width exactly `2pi` (within `8eps`,
+# the shared tolerance). Only VonMises responses take it.
+function _validate_interval(r::LikelihoodSpec, plan::StructuralPlan)
+    if r.family !== VonMisesFam
+        r.interval === nothing ||
+            _fail(r.label, "only VonMises responses take interval " *
+                "(principal-interval endpoints)")
+        return nothing
+    end
+    r.interval === nothing && return nothing
+    lo, hi = r.interval
+    (isfinite(lo) && isfinite(hi) && lo < hi) ||
+        _fail(r.label, "VonMises interval must be finite with lo < hi " *
+            "(got ($(lo), $(hi)))")
+    isapprox(hi - lo, 2 * Float64(pi); rtol = 8eps(Float64),
+        atol = 8eps(Float64)) ||
+        _fail(r.label, "VonMises interval must have length 2pi " *
+            "(got $(hi - lo))")
     return nothing
 end
 

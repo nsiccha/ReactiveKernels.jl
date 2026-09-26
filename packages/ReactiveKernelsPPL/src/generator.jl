@@ -84,7 +84,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     student_t, zero_inflated_poisson,
     gp_exp_quad_cov, gp_chol_latent,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
-using SpecialFunctions: erfc, loggamma
+using SpecialFunctions: besseli, erfc, loggamma
 # Selective (explicit imports win over any re-export chain, so no `using`
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
 # names in the assignment allowlist.
@@ -923,6 +923,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _zip_plate_stmts(r, plan, node, pw)
     elseif r.family === InverseGaussianFam
         return _ig_plate_stmts(r, plan, node, pw)
+    elseif r.family === VonMisesFam
+        return _vonmises_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
         return _binomial_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomial2Fam
@@ -1511,6 +1513,54 @@ function _ig_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, 
     base = :((log($lamv) - (1.8378770664093456 + 3.0 * log($yv)) -
         $lamv * ($yv - $muv) * ($yv - $muv) / ($muv * $muv * $yv)) / 2.0)
     cell = :($yv > 0 ? $base : -Inf)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Von-Mises likelihood (SB `brm_von_mises_lpdf` mirror): the branch
+# structure spelled exactly — `kappa <= 0 → -Inf` outermost, then the
+# support guard (exact: `y` outside inclusive `[mu - pi, mu + pi]`;
+# circular: `y` outside half-open `[lo, hi)`), then the Stan-native
+# in-support value `-log2π - log(I0(κ)) + κ*cos(y - mu)` with the SB
+# `log2π` literal `1.8378770664093456` and the SB pi literal
+# `3.141592653589793`. The circular mu wrap is the SB fmod spelling
+# `lo + rem(rem(mu - lo, w) + w, w)`. The identity link needs no mu
+# precompute (the lp node IS mu); kappa threads via `_scale_plate_arg`
+# (scalar sampled/literal/assignment/column, or a log-link predictor —
+# the hurdle precedent, log-only at the contract gate). All guards are
+# lazy `?:` (never eager `ifelse`); bound-data conditions (circular
+# support, literal/column kappa) split the plate per taken arm at
+# prepare, while live conditions (sampled/predictor kappa, exact
+# moving support) keep their authored branch to the backend. Weights
+# multiply the cell (the NB2 precedent). Evidence fails closed at the
+# contract gate (Gaussian/Poisson only). No whole-vector fusion yet —
+# a perf-lane follow-up, not this slice.
+function _vonmises_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, lp]
+    yv, muv = _dovar(1), _dovar(2)
+    kapv = _thread_ref!(inputs, sarg)
+    if r.interval === nothing
+        base = :(-1.8378770664093456 - log(besseli(0, $kapv)) +
+            $kapv * cos($yv - $muv))
+        inner = :($yv > $muv + 3.141592653589793 ? -Inf : $base)
+        sup = :($yv < $muv - 3.141592653589793 ? -Inf : $inner)
+    else
+        lo, hi = r.interval
+        w = hi - lo
+        wmu = :($lo + rem(rem($muv - $lo, $w) + $w, $w))
+        base = :(-1.8378770664093456 - log(besseli(0, $kapv)) +
+            $kapv * cos($yv - $wmu))
+        inner = :($yv >= $hi ? -Inf : $base)
+        sup = :($yv < $lo ? -Inf : $inner)
+    end
+    cell = :($kapv <= 0 ? -Inf : $sup)
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)

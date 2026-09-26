@@ -4037,16 +4037,18 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
         return _lower_leveled_response(lhs, call, range, weights, evidence,
             ctx, predictors, pred_idx, coefuse)
     end
-    family, lik_link, pred_link, loc, scale_raw, trials, nu_raw, zi_raw =
-        _lower_response_base(lhs, call, ctx)
+    family, lik_link, pred_link, loc, scale_raw, trials, nu_raw, zi_raw,
+    interval_raw = _lower_response_base(lhs, call, ctx)
     pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
     nu = _lower_nu_use(lhs, nu_raw, ctx)
     zi = _lower_zi_use(lhs, zi_raw, ctx)
+    interval = _lower_interval_use(lhs, interval_raw, ctx)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
-        evidence, Symbol(lhs, "_resp"), trials, range; nu = nu, zi = zi)
+        evidence, Symbol(lhs, "_resp"), trials, range; nu = nu, zi = zi,
+        interval = interval)
 end
 
 # Run `thunk()`; on a surface failure, attribute it to mixture component
@@ -4909,6 +4911,7 @@ const _RESPONSE_BASE_MSG =
     "`Gamma.(alpha, exp.(eta) ./ alpha)`, " *
     "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`, " *
     "`BetaBinomial2.(n, logistic.(mu), phi)`, " *
+    "`VonMises.(mu, kappa)`, `CircularVonMises.(mu, kappa, lo, hi)`, " *
     "`CategoricalLogit.(eta_2, ..., eta_K)`, `OrderedLogistic.(eta)`, " *
     "`Ordinal.(Cumulative(), LogitLink(), eta)`, " *
     "`Multinomial.(N, s, c2, ..., cK)`, or `Categorical.(s)` " *
@@ -4926,74 +4929,86 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
     fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
         :NegativeBinomial2, :Gamma, :Beta, :HurdlePoisson,
-        :ZeroInflatedPoisson, :InverseGaussian, :BetaBinomial2) ||
+        :ZeroInflatedPoisson, :InverseGaussian, :BetaBinomial2,
+        :VonMises, :CircularVonMises) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
         return GaussianFam, IdentityLink, IdentityLink, args[1], args[2],
-        nothing, nothing, nothing
+        nothing, nothing, nothing, nothing
     elseif fam === :StudentT
         length(args) == 3 || _sfail("response $lhs: `StudentT` takes " *
                                     "`StudentT.(nu, mu, sigma)`")
         return StudentTFam, IdentityLink, IdentityLink, args[2], args[3],
-        nothing, args[1], nothing
+        nothing, args[1], nothing, nothing
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link)")
         f, l, loc = _lower_bernoulli_link(lhs, args[1])
-        return f, l, IdentityLink, loc, nothing, nothing, nothing, nothing
+        return f, l, IdentityLink, loc, nothing, nothing, nothing, nothing,
+        nothing
     elseif fam === :Binomial
         length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
                                     "`Binomial.(n, logistic.(mu))` (or `probit`/`cloglog` for the link)")
         f, l, loc = _lower_binomial_link(lhs, args[2])
         return f, l, IdentityLink, loc, nothing,
-        _lower_trials(lhs, args[1], ctx), nothing, nothing
+        _lower_trials(lhs, args[1], ctx), nothing, nothing, nothing
     elseif fam === :NegativeBinomial2
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial2` takes " *
                                     "`NegativeBinomial2.(exp.(eta), phi)`")
         return NegativeBinomial2Fam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
-        nothing
+        nothing, nothing
     elseif fam === :Gamma
         loc, scale = _lower_gamma_args(lhs, args, ctx)
         return GammaLogFam, LogLink, LogLink, loc, scale, nothing, nothing,
-        nothing
+        nothing, nothing
     elseif fam === :Beta
         loc, scale = _lower_beta_args(lhs, args, ctx)
         return BetaLogitFam, LogitLink, IdentityLink, loc, scale, nothing,
-        nothing, nothing
+        nothing, nothing, nothing
     elseif fam === :BetaBinomial2
         length(args) == 3 || _sfail("response $lhs: `BetaBinomial2` takes " *
                                     "`BetaBinomial2.(n, logistic.(mu), phi)`")
         return BetaBinomial2Fam, LogitLink, IdentityLink,
         _lower_link_arg(lhs, args[2], :logistic), args[3],
-        _lower_trials(lhs, args[1], ctx), nothing, nothing
+        _lower_trials(lhs, args[1], ctx), nothing, nothing, nothing
     elseif fam === :HurdlePoisson
         length(args) == 2 || _sfail("response $lhs: `HurdlePoisson` takes " *
                                     "`HurdlePoisson.(exp.(eta), p_zero)`")
         return HurdlePoissonFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
-        nothing
+        nothing, nothing
     elseif fam === :ZeroInflatedPoisson
         length(args) == 2 || _sfail("response $lhs: `ZeroInflatedPoisson` takes " *
                                     "`ZeroInflatedPoisson.(exp.(eta), zi)`")
         return ZeroInflatedPoissonFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
-        args[2]
+        args[2], nothing
     elseif fam === :InverseGaussian
         length(args) == 2 || _sfail("response $lhs: `InverseGaussian` takes " *
                                     "`InverseGaussian.(exp.(eta), lambda)`")
         return InverseGaussianFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
-        nothing
+        nothing, nothing
+    elseif fam === :VonMises
+        length(args) == 2 || _sfail("response $lhs: `VonMises` takes " *
+                                    "`VonMises.(mu, kappa)`")
+        return VonMisesFam, IdentityLink, IdentityLink, args[1], args[2],
+        nothing, nothing, nothing, nothing
+    elseif fam === :CircularVonMises
+        length(args) == 4 || _sfail("response $lhs: `CircularVonMises` takes " *
+                                    "`CircularVonMises.(mu, kappa, lo, hi)`")
+        return VonMisesFam, IdentityLink, IdentityLink, args[1], args[2],
+        nothing, nothing, nothing, (args[3], args[4])
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
         return PoissonLogFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
-        nothing
+        nothing, nothing
     end
 end
 
@@ -5112,6 +5127,12 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :beta_binomial2 && _sfail("response $lhs: use " *
                                       "`BetaBinomial2` (the response " *
                                       "spelling, not the kernel endpoint)")
+    fam === :von_mises && _sfail("response $lhs: use " *
+                                 "`VonMises` (the response " *
+                                 "spelling, not the kernel endpoint)")
+    fam === :circular_von_mises && _sfail("response $lhs: use " *
+                                          "`CircularVonMises` (the response " *
+                                          "spelling, not the kernel endpoint)")
     fam === :OrderedLogit && _sfail("response $lhs: unknown distribution " *
                                     "`:OrderedLogit` (write " *
                                     "`OrderedLogistic.(eta)`)")
@@ -5122,7 +5143,8 @@ function _lower_response_base_error(lhs, rhs, fam)
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
                   "NegativeBinomial2, HurdlePoisson, ZeroInflatedPoisson, " *
-                  "InverseGaussian, BetaBinomial2, Gamma, Beta, " *
+                  "InverseGaussian, BetaBinomial2, VonMises, " *
+                  "CircularVonMises, Gamma, Beta, " *
                   "BernoulliLogit, " *
                   "PoissonLog, BinomialLogit, NegativeBinomial2Log, " *
                   "GammaLog, BetaLogit, CategoricalLogit, " *
@@ -5250,8 +5272,37 @@ function _lower_zi_use(lhs, s, ctx)
                   "first), got $(repr(s))")
 end
 
+# VonMises interval use-site lowering: `nothing` for exact `VonMises`
+# (moving support), or the `(lo, hi)` endpoint pair for
+# `CircularVonMises` (fixed principal interval). Endpoints are
+# compile-time numeric literals — a Real, `:pi`, or unary minus over
+# those (the BRM `interval=` rule); anything else fails closed here,
+# and the contract re-checks finiteness, order, and the `2pi` width.
+function _lower_interval_use(lhs, raw, ctx)
+    raw === nothing && return nothing
+    raw isa Tuple && length(raw) == 2 ||
+        _sfail("response $lhs: `CircularVonMises` takes literal endpoints " *
+               "`CircularVonMises.(mu, kappa, lo, hi)`")
+    return (Float64(_lower_interval_endpoint(lhs, raw[1])),
+        Float64(_lower_interval_endpoint(lhs, raw[2])))
+end
+
+function _lower_interval_endpoint(lhs, a)
+    a isa Real && return a
+    a === :pi && return pi
+    if a isa Expr && a.head === :call && length(a.args) == 2 &&
+            a.args[1] === :(-)
+        inner = a.args[2]
+        inner isa Real && return -inner
+        inner === :pi && return -pi
+    end
+    return _sfail("response $lhs interval endpoints must be numeric " *
+                  "literals (a Real, `pi`, or `-pi`), got $(repr(a))")
+end
+
 # Scale use-site lowering (Gaussian sigma, NB2 phi, Gamma alpha, Beta
-# kappa, Student sigma, hurdle p_zero, BetaBinomial2 phi): a scalar scale
+# kappa, Student sigma, hurdle p_zero, BetaBinomial2 phi, VonMises
+# kappa): a scalar scale
 # (parameter/assignment name, raw per-observation data column, literal)
 # passes through `_lower_scale` untouched; a
 # predictor definition feeds the scale slot — bare for an identity-link
@@ -5381,9 +5432,10 @@ end
 # Analyze (or intern) a scale predictor: exactly the location-predictor
 # treatment (`_lower_location`'s named-definition arm) under the use-site
 # link — affine analysis, coefficient-use recording, one link per
-# predictor. Family admission (Gaussian/NB2/Gamma/Student/hurdle;
-# Beta/IG/BetaBinomial2 deferred) is the contract's gate
-# (`_validate_scale_predictor`), so hand-built plans get the same rule.
+# predictor. Family admission (Gaussian/NB2/Gamma/Student/hurdle/
+# VonMises-log-only; Beta/IG/BetaBinomial2 deferred) is the contract's
+# gate (`_validate_scale_predictor`), so hand-built plans get the same
+# rule.
 function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
         pred_idx, coefuse)
     haskey(pred_idx, name) || haskey(ctx.detmap, name) ||
