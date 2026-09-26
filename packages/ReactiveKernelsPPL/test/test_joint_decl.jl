@@ -1002,12 +1002,12 @@ end
     @test !haskey(byname, :L_tg_subject)
     # recist+sld upper truncation: hi = log(0.7).
     @test byname[:tgi_c_cr].transform === :upper
-    @test byname[:tgi_c_cr].hi == -0.3566749439387324
+    @test byname[:tgi_c_cr].hi == log(0.7)
     u = collect(range(-0.4, 0.4; length = layout.total))
     nt = constrain(layout, u)
     @test size(nt.L_p_subject) == (9, 9)
     @test size(nt.b_p_subject) == (4, 9)
-    @test nt.tgi_c_cr < -0.3566749439387324
+    @test nt.tgi_c_cr < log(0.7)
     @test unconstrain(layout, nt) ≈ u
 end
 
