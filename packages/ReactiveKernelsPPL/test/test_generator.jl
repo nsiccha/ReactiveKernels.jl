@@ -446,6 +446,78 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+function _gen_hurdle_plan(; p_zero = :p_zero)
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    params = p_zero isa Symbol ? SampledParameter[
+        SampledParameter(:p_zero, :beta, (arg1 = 2.0, arg2 = 2.0), nothing, :p_zero)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta,
+            p_zero, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_hurdle(cols, coef, p0)
+    lam = exp.(coef[1] .+ coef[2] .* cols[:x])
+    ll = sum(zip(cols[:y], lam)) do (y, l)
+        y == 0 ? log(p0) :
+            log1p(-p0) + logpdf(Poisson(l), y) - log(-expm1(-l))
+    end
+    return ll
+end
+
+@testset "hurdle values and gradient" begin
+    plan = _gen_hurdle_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_hurdle(plan.columns, Vector(nt.eta), nt.p_zero)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Beta(2.0, 2.0), nt.p_zero)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "hurdle literal-p_zero values" begin
+    plan = _gen_hurdle_plan(; p_zero = 0.35)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_hurdle(plan.columns, Vector(nt.eta), 0.35)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted hurdle values" begin
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta,
+            0.35, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    lam = exp.(Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x])
+    ll = sum(cols[:w] .*
+        [y == 0 ? log(0.35) :
+            log1p(-0.35) + logpdf(Poisson(l), y) - log(-expm1(-l))
+            for (y, l) in zip(cols[:y], lam)])
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "factor values (int and string groupings)" begin
     for g in ([1, 2, 1, 3, 2, 3], ["a", "b", "a", "c", "b", "c"])
         cols, n = _gen_columns()

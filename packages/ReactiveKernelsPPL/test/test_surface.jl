@@ -398,6 +398,97 @@ end
     end, Dn2)
 end
 
+# Hurdle-Poisson scalar log-density (BRM `HurdlePoisson` math, Base-only:
+# `log(-expm1(-λ))` is the `log1mexp(-λ)` truncation correction).
+_hurdle_logpdf(y::Integer, lam::Real, p0::Real) =
+    y == 0 ? log(p0) :
+        log1p(-p0) + logpdf(Poisson(lam), y) - log(-expm1(-lam))
+
+@testset "surface roundtrip hurdle end to end" begin
+    cols, _ = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    # Literal p_zero.
+    m = @rkppl begin
+        eta = a .+ b .* x
+        y .~ HurdlePoisson.(exp.(eta), 0.35)
+    end
+    @test m isa RKPPLModel
+    r = only(lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ HurdlePoisson.(exp.(eta), 0.35)
+    end, (:y, :x)).responses)
+    @test (r.family, r.link, r.predictor, r.scale) ===
+        (HurdlePoissonFam, LogLink, :eta, 0.35)
+    bound = m(; y = cols[:y], x = cols[:x])
+    @test isbound(bound)
+    built = build_kernel(bound)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    lam = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    ll = sum(_hurdle_logpdf(y, l, 0.35) for (y, l) in zip(cols[:y], lam))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    # Predictor-fed p_zero under `logistic.` (the hu submodel).
+    m = @rkppl begin
+        eta = a .+ b .* x
+        hu = c .+ d .* x
+        y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
+    end
+    r = only(lower_rkppl(quote
+        eta = a .+ b .* x
+        hu = c .+ d .* x
+        y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
+    end, (:y, :x)).responses)
+    @test r.family === HurdlePoissonFam
+    @test r.scale == ScalePredictorRef(:hu, LogitLink)
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    u4 = [0.5, -0.25, 0.1, 0.2]
+    nt = constrain(built.layout, u4)
+    lam = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    p0 = 1 ./ (1 .+ exp.(-(nt.hu[1] .+ nt.hu[2] .* cols[:x])))
+    ll = sum(_hurdle_logpdf(y, l, p) for (y, l, p) in zip(cols[:y], lam, p0))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+        logpdf(Normal(0, 1), nt.hu[1]) + logpdf(Normal(0, 1), nt.hu[2])
+    @test _query(built.spec, bound, :posterior, u4) ≈ ll + pr
+    _check_gradient(built.spec, bound, u4)
+end
+
+@testset "hurdle response failures" begin
+    Dn2 = (:y, :x)
+    # Arity: exactly (lambda, p_zero).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ HurdlePoisson.(exp.(eta))
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ HurdlePoisson.(exp.(eta), 0.35, 1.0)
+    end, Dn2)
+    # The kernel-endpoint spelling redirects to the response head.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ hurdle_poisson.(exp.(eta), 0.35)
+    end, Dn2)
+    # The lambda position needs its `exp.` link wrapper (NB2 precedent).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ HurdlePoisson.(eta, 0.35)
+    end, Dn2)
+    # A non-logit p_zero predictor fails at the contract gate.
+    @test_throws ContractValidationError lower_rkppl(quote
+        eta = a .+ b .* x
+        hu = c .+ d .* x
+        y .~ HurdlePoisson.(exp.(eta), exp.(hu))
+    end, Dn2)
+    @test_throws ContractValidationError lower_rkppl(quote
+        eta = a .+ b .* x
+        hu = c .+ d .* x
+        y .~ HurdlePoisson.(exp.(eta), hu)
+    end, Dn2)
+end
+
 @testset "slice-2 response failures" begin
     Dn2 = (:y, :x)
     Dp2 = (:p, :x)
