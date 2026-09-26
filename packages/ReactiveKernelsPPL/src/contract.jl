@@ -100,6 +100,7 @@ univariate components, SB `MixtureModel` mirror)."""
     HurdlePoissonFam
     ZeroInflatedPoissonFam
     InverseGaussianFam
+    BetaBinomial2Fam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -178,18 +179,20 @@ end
 
 One independent response. `scale` is the response's auxiliary —
 Gaussian sigma, NB2 dispersion phi, Gamma shape alpha, hurdle p_zero,
-InverseGaussian shape lambda — either scalar (parameter, assignment,
-folded literal, or a raw per-observation data column) or, for
-Gaussian/NB2/Gamma/Student/hurdle only, a [`ScalePredictorRef`](@ref)
-(predictor-fed per-observation auxiliary); it must be `nothing`
-otherwise. A hurdle p_zero is a probability (scalar in [0, 1],
-predictor-fed logit-only). An InverseGaussian lambda is scalar-only
-(predictor-fed lambda deferred, the Beta-kappa precedent).
+InverseGaussian shape lambda, BetaBinomial2 precision phi — either
+scalar (parameter, assignment, folded literal, or a raw per-observation
+data column) or, for Gaussian/NB2/Gamma/Student/hurdle only, a
+[`ScalePredictorRef`](@ref) (predictor-fed per-observation auxiliary);
+it must be `nothing` otherwise. A hurdle p_zero is a probability
+(scalar in [0, 1], predictor-fed logit-only). An InverseGaussian
+lambda is scalar-only (predictor-fed lambda deferred, the Beta-kappa
+precedent); a BetaBinomial2 phi is scalar-only (predictor-fed phi
+deferred, the same precedent).
 (One slot covers every admitted family; a two-auxiliary family such as
 Beta needs a new field — noted, not built.) `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
-closed emitter-side. `trials` is the Binomial trial count (Int column or
-Int literal), `nothing` otherwise. `range` carries a literal `y[1:N]`
+closed emitter-side. `trials` is the Binomial/BetaBinomial2 trial count
+(Int column or Int literal), `nothing` otherwise. `range` carries a literal `y[1:N]`
 response range (`nothing` = whole column: bare `.~`, `eachindex`,
 `axes`); it must cover `1:n_obs` exactly (checked at bind).
 
@@ -1364,6 +1367,7 @@ const ADMITTED_TRIPLES = (
     (HurdlePoissonFam, LogLink, LogLink),
     (ZeroInflatedPoissonFam, LogLink, LogLink),
     (InverseGaussianFam, LogLink, LogLink),
+    (BetaBinomial2Fam, LogitLink, IdentityLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order)."""
@@ -1703,7 +1707,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
-    ZeroInflatedPoissonFam, InverseGaussianFam)
+    ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -6302,7 +6306,7 @@ function _validate_responses(plan::StructuralPlan)
             "Poisson-log, Binomial-logit/probit/cloglog, NB2-log, Gamma-log, " *
             "Beta-logit, Categorical-logit, Ordered-logit, Ordinal spellings, " *
             "Student-identity, Hurdle-Poisson-log, ZIP-log, " *
-            "InverseGaussian-log)",
+            "InverseGaussian-log, BetaBinomial2-logit)",
         )
         _validate_scale(r, plan)
         _validate_nu(r, plan)
@@ -6364,7 +6368,8 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         return _fail(r.label, "Poisson response must be non-negative integers")
     elseif _is_binomial_family(r.family)
         _is_count_column(col) && return nothing
-        return _fail(r.label, "Binomial response must be non-negative integers")
+        what = r.family === BetaBinomial2Fam ? "BetaBinomial2" : "Binomial"
+        return _fail(r.label, "$what response must be non-negative integers")
     elseif r.family === NegativeBinomial2Fam
         _is_count_column(col) && return nothing
         return _fail(r.label, "NB2 response must be non-negative integers")
@@ -6520,10 +6525,12 @@ _is_count_column(col) =
 
 # Bernoulli/Binomial span three link variants each (logit + slice-2
 # probit/cloglog); response/trials rules are link-independent.
+# BetaBinomial2 shares the Binomial trials rule (trials required, y ≤ n).
 _is_bernoulli_family(f) =
     f === BernoulliLogitFam || f === BernoulliProbitFam || f === BernoulliCloglogFam
 _is_binomial_family(f) =
-    f === BinomialLogitFam || f === BinomialProbitFam || f === BinomialCloglogFam
+    f === BinomialLogitFam || f === BinomialProbitFam || f === BinomialCloglogFam ||
+    f === BetaBinomial2Fam
 
 # Scale-auxiliary requirement per family: the need string, or `nothing`
 # when the family takes no scale (`_validate_scale` for single responses,
@@ -6536,7 +6543,8 @@ _scale_need(fam::LikelihoodFamily) =
     fam === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" :
     fam === StudentTFam ? "Student response requires a scale sigma" :
     fam === HurdlePoissonFam ? "Hurdle response requires a hurdle probability p_zero" :
-    fam === InverseGaussianFam ? "InverseGaussian response requires a shape lambda" : nothing
+    fam === InverseGaussianFam ? "InverseGaussian response requires a shape lambda" :
+    fam === BetaBinomial2Fam ? "BetaBinomial2 response requires a precision phi" : nothing
 
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     need = _scale_need(r.family)
@@ -6604,6 +6612,9 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
     fam === InverseGaussianFam && _fail(r.label,
         "InverseGaussian response with a scale predictor: predictor-fed " *
         "shape (lambda) is deferred — use a scalar lambda (parameter or literal)")
+    fam === BetaBinomial2Fam && _fail(r.label,
+        "BetaBinomial2 response with a scale predictor: predictor-fed " *
+        "precision (phi) is deferred — use a scalar phi (parameter or literal)")
     (fam === GaussianFam || fam === NegativeBinomial2Fam ||
         fam === GammaLogFam || fam === StudentTFam ||
         fam === HurdlePoissonFam) ||
@@ -6726,12 +6737,14 @@ function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
     end
     if !_is_binomial_family(r.family)
         r.trials === nothing ||
-            _fail(r.label, "only Binomial/Multinomial responses take trials")
+            _fail(r.label, "only Binomial/BetaBinomial2/Multinomial responses take trials")
         return nothing
     end
+    what = r.family === BetaBinomial2Fam ? "BetaBinomial2 response" :
+        "Binomial response"
     r.trials === nothing && _fail(r.label,
-        "Binomial response requires trials (Int column or literal)")
-    return _validate_trials_values(r, plan, "Binomial response")
+        "$what requires trials (Int column or literal)")
+    return _validate_trials_values(r, plan, what)
 end
 
 # Binomial-component mixtures share one trials use (SB's
@@ -6754,7 +6767,7 @@ function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
     ycol = _vector_column(plan.columns, r.response, r.label, "response")
     t = r.trials
     if t isa Int
-        t >= 0 || _fail(r.label, "Binomial trials literal must be non-negative")
+        t >= 0 || _fail(r.label, "trials literal must be non-negative")
         all(ycol .<= t) ||
             _fail(r.label, "$what exceeds trials $t")
         return nothing

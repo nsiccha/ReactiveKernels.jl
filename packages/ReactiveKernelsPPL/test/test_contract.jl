@@ -267,6 +267,22 @@ function _ig_plan(n = 9)
     )
 end
 
+function _betabinomial2_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([1, 0, 2], outer = cld(n, 3))[1:n]
+    cols[:n] = fill(4, n)
+    StructuralPlan(
+        [LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phi, nothing,
+            _none_evidence(), :y_resp, :n, nothing)],
+        [PredictorSpec(:mu, IdentityLink, _terms(), :mu)],
+        _priors(:mu),
+        [SampledParameter(:phi, :gamma, (arg1 = 2.0, arg2 = 0.1), nothing, :phi)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
 @testset "contract admission predicates" begin
     @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
         BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
@@ -275,7 +291,7 @@ end
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
         MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
         PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
-        ZeroInflatedPoissonFam, InverseGaussianFam)
+        ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
@@ -310,6 +326,7 @@ end
     @test validate_plan(_hurdle_plan()) === nothing
     @test validate_plan(_zip_plan()) === nothing
     @test validate_plan(_ig_plan()) === nothing
+    @test validate_plan(_betabinomial2_plan()) === nothing
 end
 
 @testset "link triples" begin
@@ -359,6 +376,10 @@ end
     # InverseGaussian admits the log predictor link only.
     bad = _ig_plan()
     bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # BetaBinomial2 admits the identity predictor link only (Beta precedent).
+    bad = _betabinomial2_plan()
+    bad.predictors[1] = PredictorSpec(:mu, LogLink, _terms(), :mu)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -684,6 +705,106 @@ end
     bad.responses[1] =
         LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, :lamc, nothing,
             _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "betabinomial2 response validation" begin
+    # BetaBinomial2 requires its precision phi.
+    bad = _betabinomial2_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, nothing, nothing,
+            _none_evidence(), :y_resp, :n, nothing)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A phi literal must be finite positive.
+    for lit in (0.5, 4.0)
+        good = _betabinomial2_plan()
+        good.responses[1] =
+            LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, lit, nothing,
+                _none_evidence(), :y_resp, :n, nothing)
+        @test validate_plan(good) === nothing
+    end
+    for lit in (0.0, -1.0, NaN, Inf)
+        bad = _betabinomial2_plan()
+        bad.responses[1] =
+            LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, lit, nothing,
+                _none_evidence(), :y_resp, :n, nothing)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # Predictor-fed precision is deferred (Beta-kappa precedent).
+    bad = _betabinomial2_plan()
+    push!(bad.predictors, PredictorSpec(:hup, LogLink, _terms(), :hup))
+    append!(bad.population_priors, _priors(:hup))
+    bad.responses[1] =
+        LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu,
+            ScalePredictorRef(:hup, LogLink), nothing,
+            _none_evidence(), :y_resp, :n, nothing)
+    @test_throws ContractValidationError validate_plan(bad)
+    # BetaBinomial2 requires trials (Binomial rule).
+    bad = _betabinomial2_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phi, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A trials literal binds (non-negative, y ≤ n).
+    good = _betabinomial2_plan()
+    good.responses[1] =
+        LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phi, nothing,
+            _none_evidence(), :y_resp, 4, nothing)
+    @test validate_plan(good) === nothing
+    bad = _betabinomial2_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phi, nothing,
+            _none_evidence(), :y_resp, -1, nothing)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _betabinomial2_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phi, nothing,
+            _none_evidence(), :y_resp, 1, nothing)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Trials columns: Int, non-negative, n_obs-long, y ≤ n row-wise.
+    bad = _betabinomial2_plan()
+    bad.columns[:n] = fill(4.0, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _betabinomial2_plan()
+    bad.columns[:n] = fill(-2, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _betabinomial2_plan()
+    bad.columns[:n] = fill(1, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # BetaBinomial2 response must be non-negative integers (Bool excluded).
+    bad = _betabinomial2_plan()
+    bad.columns[:y] = [0, 1, -1, 2, 0, 1, 3, 0, 2]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _betabinomial2_plan()
+    bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _betabinomial2_plan()
+    bad.columns[:y] = collect(1.0:9.0)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _betabinomial2_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phi, nothing,
+            ResponseEvidence(:truncated, 0, 4), :y_resp, :n, nothing)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A per-observation phi column binds finite-positive.
+    good = _betabinomial2_plan()
+    good.columns[:phic] = repeat([1.0, 2.0, 4.0], 3)
+    good.responses[1] =
+        LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phic, nothing,
+            _none_evidence(), :y_resp, :n, nothing)
+    @test validate_plan(good) === nothing
+    bad = _betabinomial2_plan()
+    bad.columns[:phic] = fill(0.0, 9)
+    bad.responses[1] =
+        LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phic, nothing,
+            _none_evidence(), :y_resp, :n, nothing)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Only Binomial/BetaBinomial2/Multinomial responses take trials.
+    bad = _gaussian_plan()
+    bad.responses[1] =
+        LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp, 4, nothing)
     @test_throws ContractValidationError validate_plan(bad)
 end
 

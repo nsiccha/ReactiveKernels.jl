@@ -641,6 +641,63 @@ _ig_logpdf(y::Real, mu::Real, lam::Real) = logpdf(InverseGaussian(mu, lam), y)
     _check_gradient(built.spec, bound, u3)
 end
 
+# BetaBinomial2 scalar log-density (BRM `BetaBinomial2` math).
+_betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
+    logpdf(BetaBinomial(n, mu * phi, (1 - mu) * phi), y)
+
+@testset "surface roundtrip betabinomial2 end to end" begin
+    cols, _ = _gen_columns()
+    cols[:c] = [6, 8, 5, 9, 4, 7]
+    cols[:n] = [10, 12, 8, 15, 9, 11]
+    # Literal phi.
+    m = @rkppl begin
+        mu = a .+ b .* x
+        c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
+    end
+    @test m isa RKPPLModel
+    r = only(lower_rkppl(quote
+        mu = a .+ b .* x
+        c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
+    end, (:c, :x, :n)).responses)
+    @test (r.family, r.link, r.predictor, r.scale, r.trials) ===
+        (BetaBinomial2Fam, LogitLink, :mu, 4.0, :n)
+    bound = m(; c = cols[:c], x = cols[:x], n = cols[:n])
+    @test isbound(bound)
+    built = build_kernel(bound)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = 1 ./ (1 .+ exp.(.-(nt.mu[1] .+ nt.mu[2] .* cols[:x])))
+    ll = sum(_betabinomial2_logpdf(y, t, mm, 4.0)
+        for (y, t, mm) in zip(cols[:c], cols[:n], mu))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    # Gamma-sampled phi.
+    m = @rkppl begin
+        phi ~ Gamma(2.0, 0.1)
+        mu = a .+ b .* x
+        c .~ BetaBinomial2.(n, logistic.(mu), phi)
+    end
+    r = only(lower_rkppl(quote
+        phi ~ Gamma(2.0, 0.1)
+        mu = a .+ b .* x
+        c .~ BetaBinomial2.(n, logistic.(mu), phi)
+    end, (:c, :x, :n)).responses)
+    @test (r.family, r.scale, r.trials) === (BetaBinomial2Fam, :phi, :n)
+    bound = m(; c = cols[:c], x = cols[:x], n = cols[:n])
+    built = build_kernel(bound)
+    u3 = [0.5, -0.25, 1.0]
+    nt = constrain(built.layout, u3)
+    mu = 1 ./ (1 .+ exp.(.-(nt.mu[1] .+ nt.mu[2] .* cols[:x])))
+    ll = sum(_betabinomial2_logpdf(y, t, mm, nt.phi)
+        for (y, t, mm) in zip(cols[:c], cols[:n], mu))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
+        logpdf(Gamma(2.0, 0.1), nt.phi)
+    @test _query(built.spec, bound, :posterior, u3) ≈
+        ll + pr + logjac(built.layout, u3)
+    _check_gradient(built.spec, bound, u3)
+end
+
 @testset "ig response failures" begin
     Dn2 = (:y, :x)
     # Arity: exactly (mu, lambda).
@@ -673,6 +730,48 @@ end
         ls = c .+ d .* x
         y .~ InverseGaussian.(exp.(eta), ls)
     end, Dn2)
+end
+
+@testset "betabinomial2 response failures" begin
+    Dn3 = (:c, :x, :n)
+    # Arity: exactly (trials, mean, precision).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        c .~ BetaBinomial2.(logistic.(mu), 4.0)
+    end, Dn3)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        c .~ BetaBinomial2.(n, logistic.(mu), 4.0, 1.0)
+    end, Dn3)
+    # The kernel-endpoint spelling redirects to the response head.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        c .~ beta_binomial2.(n, logistic.(mu), 4.0)
+    end, Dn3)
+    # The mean position needs its `logistic.` link wrapper (Beta precedent).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        c .~ BetaBinomial2.(n, mu, 4.0)
+    end, Dn3)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        c .~ BetaBinomial2.(n, exp.(mu), 4.0)
+    end, Dn3)
+    # Trials are an Int column or Int literal (Binomial rule).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        c .~ BetaBinomial2.(2.5, logistic.(mu), 4.0)
+    end, Dn3)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        c .~ BetaBinomial2.(zzz, logistic.(mu), 4.0)
+    end, Dn3)
+    # A predictor-fed phi fails at the contract gate (Beta-kappa deferral).
+    @test_throws ContractValidationError lower_rkppl(quote
+        mu = a .+ b .* x
+        hup = e .+ f .* x
+        c .~ BetaBinomial2.(n, logistic.(mu), logistic.(hup))
+    end, Dn3)
 end
 
 @testset "slice-2 response failures" begin
