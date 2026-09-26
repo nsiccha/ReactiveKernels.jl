@@ -1187,11 +1187,21 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
     length(pos) == 2 ||
         _sfail("$where takes `(group, [margins...])` positionally, got " *
               "$(length(pos)) positional argument(s)")
-    group, vec = pos
-    group isa Symbol ||
-        _sfail("$where grouping must be a bare data column, got $(repr(group))")
-    group in data ||
-        _sfail("$where grouping `$group` is not data")
+    group_raw, vec = pos
+    mm = nothing
+    strata = nothing
+    if group_raw isa Symbol
+        group = group_raw
+        group in data ||
+            _sfail("$where grouping `$group` is not data")
+    elseif _is_grouping_call(group_raw, :mm)
+        mm, group = _lower_mm_grouping(group_raw, data, where)
+    elseif _is_grouping_call(group_raw, :gr)
+        strata, group = _lower_gr_grouping(group_raw, data, where)
+    else
+        _sfail("$where grouping must be a bare data column, `mm(...)`, " *
+              "or `gr(...)`, got $(repr(group_raw))")
+    end
     vec isa Expr && vec.head === :vect ||
         _sfail("$where margins must be a vector (`[1, x]`), even for one " *
               "margin")
@@ -1201,7 +1211,32 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
         _lower_varying_margin_elem(e, data, detnames, where)
         for e in vec.args]
     K = length(margins)
-    kind = if K == 1 && !eta_given && _is_ones_vmargin(first(margins))
+    kind = if strata !== nothing
+        # SB `ranef_correlated_by` has no K=1 special-case: stratified
+        # draws are always correlated, eta exactly 1.0.
+        eta_given && eta != 1.0 &&
+            _sfail("$where stratified draws need eta 1.0 (SB hardcodes " *
+                  "`lkj_corr_cholesky(1.)`), got $eta")
+        eta = 1.0
+        :correlated
+    elseif mm !== nothing && K == 1 && _is_ones_vmargin(first(margins))
+        # SB uses `ranef_intercept_draws` unconditionally for
+        # intercept-only mm blocks — no eta exists on that path.
+        eta_given &&
+            _sfail("$where multi-membership intercept-only draws take " *
+                  "no eta (SB uses the `:intercept1` geometry " *
+                  "unconditionally — pass no eta)")
+        eta = NaN
+        :intercept1
+    elseif mm !== nothing
+        # SB uses `ranef_correlated_draws` (eta hardcoded 1.0) for
+        # every non-intercept mm block, K=1 slopes included.
+        eta_given && eta != 1.0 &&
+            _sfail("$where multi-membership correlated draws need eta " *
+                  "1.0 (SB hardcodes `lkj_corr_cholesky(1.)`), got $eta")
+        eta = 1.0
+        :correlated
+    elseif K == 1 && !eta_given && _is_ones_vmargin(first(margins))
         :intercept1
     elseif K == 1 && !eta_given
         :slope1
@@ -1223,11 +1258,19 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
     push!(used_suffixes, suffix)
     label = Symbol("draws_" * suffix)
     _claim!(seen, seelines, label, line)
-    d = VaryingDraws(group, kind, margins, eta, label, suffix, levels)
+    d = VaryingDraws(group, kind, margins, eta, label, suffix, levels,
+        VaryingSdPrior[], mm, strata)
     if kind === :intercept1 || kind === :slope1
         for nm in _varying_k1_names(d)
             _claim!(seen, seelines, nm, line)
         end
+    elseif strata !== nothing
+        # Stratified per-stratum L/tau names are bind-time (S unknown
+        # here), so only the shared `z_flat` is claimed; the generator
+        # owns the per-stratum names and the bound name tables prove
+        # them unique. No `b_<suffix>`: derived stratified draws are
+        # fail-closed (log-density-only slice).
+        _claim!(seen, seelines, _varying_corr_names(d)[3], line)
     else
         for nm in _varying_corr_names(d)
             _claim!(seen, seelines, nm, line)
@@ -1238,6 +1281,141 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
         _claim!(seen, seelines, Symbol("b_" * suffix), line)
     end
     return d
+end
+
+_is_grouping_call(e, head::Symbol) =
+    e isa Expr && e.head === :call && !isempty(e.args) && e.args[1] === head
+
+# `mm(g1, g2, ...; weights=(w1, w2, ...), normalize)` in group
+# position (SB `mm(...)` mirror): two or more bare membership data
+# columns; `weights` absent (equal `1/M`) or a TUPLE of one bare data
+# column per group; `normalize` a Bool literal (default true).
+# Returns the metadata plus the mm naming symbol (SB `_brm_mm_suffix`
+# spelling — a naming stem, not a data column).
+function _lower_mm_grouping(call::Expr, data::Set{Symbol}, where::AbstractString)
+    groups = Symbol[]
+    weights = nothing
+    weights_given = false
+    normalize = true
+    for a in call.args[2:end]
+        if a isa Expr && a.head === :parameters
+            for kw in a.args
+                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
+                    _sfail("$where `mm(...)` takes keywords " *
+                          "`weights`/`normalize` only")
+                kw.args[1] === :weights || kw.args[1] === :normalize ||
+                    _sfail("$where `mm(...)` takes keywords " *
+                          "`weights`/`normalize` only, got `$(kw.args[1])`")
+                if kw.args[1] === :weights
+                    weights_given = true
+                    wv = kw.args[2]
+                    wv === nothing && continue
+                    wv isa Expr && wv.head === :tuple ||
+                        _sfail("$where `mm(...)` weights takes a tuple " *
+                              "of one bare data column per group " *
+                              "(`weights=(w1, w2)`), got $(repr(wv))")
+                    weights = Symbol[]
+                    for w in wv.args
+                        w isa Symbol ||
+                            _sfail("$where `mm(...)` weight $(repr(w)) " *
+                                  "is not a bare data column")
+                        w in data ||
+                            _sfail("$where `mm(...)` weight `$w` is not data")
+                        push!(weights, w)
+                    end
+                else
+                    nv = kw.args[2]
+                    nv isa Bool ||
+                        _sfail("$where `mm(...)` normalize must be a " *
+                              "Bool literal, got $(repr(nv))")
+                    normalize = nv
+                end
+            end
+        else
+            a isa Expr && a.head === :kw &&
+                _sfail("$where `mm(...)` keywords need a semicolon " *
+                      "(`mm(g1, g2; weights=..., normalize=...)`), got " *
+                      "$(repr(a))")
+            a isa Symbol ||
+                _sfail("$where `mm(...)` groups must be bare data " *
+                      "columns, got $(repr(a))")
+            a in data ||
+                _sfail("$where `mm(...)` group `$a` is not data")
+            push!(groups, a)
+        end
+    end
+    M = length(groups)
+    M >= 2 ||
+        _sfail("$where `mm(...)` takes two or more grouping columns " *
+              "(`mm(g1, g2)`), got $M")
+    if weights_given && weights !== nothing
+        length(weights) == M ||
+            _sfail("$where `mm(...)` lists $(length(weights)) weight " *
+                  "columns for $M groups (one per group, or omit all)")
+    end
+    stem = _mm_suffix(groups, weights, normalize)
+    return VaryingMultiMembership(groups, weights, normalize), Symbol(stem)
+end
+
+# SB `_brm_mm_suffix` spelling: `mm__g1__g2[__w__w1__w2][__raw]`.
+function _mm_suffix(groups::Vector{Symbol},
+        weights::Union{Nothing,Vector{Symbol}}, normalize::Bool)
+    stem = "mm__" * join(string.(groups), "__")
+    weights !== nothing && (stem *= "__w__" * join(string.(weights), "__"))
+    normalize || (stem *= "__raw")
+    return stem
+end
+
+# `gr(g; by=b)` in group position (SB `gr(g, by=b)` mirror): exactly
+# one bare group data column plus the required `by` bare data column.
+# Bare `gr(g)` spells a plain grouping (write the column); `id` is
+# BRM-side bucket spelling (independent blocks disambiguate by
+# binding name instead). Returns the metadata plus the group column.
+function _lower_gr_grouping(call::Expr, data::Set{Symbol}, where::AbstractString)
+    pos = Any[]
+    by = nothing
+    by_given = false
+    for a in call.args[2:end]
+        if a isa Expr && a.head === :parameters
+            for kw in a.args
+                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
+                    _sfail("$where `gr(...)` takes keyword `by` only")
+                kw.args[1] === :by ||
+                    _sfail("$where `gr(...)` takes keyword `by` only, " *
+                          "got `$(kw.args[1])`")
+                bv = kw.args[2]
+                bv isa Symbol ||
+                    _sfail("$where `gr(...)` by must be a bare data " *
+                          "column, got $(repr(bv))")
+                bv in data ||
+                    _sfail("$where `gr(...)` by `$bv` is not data")
+                by = bv
+                by_given = true
+            end
+        else
+            a isa Expr && a.head === :kw &&
+                _sfail("$where `gr(...)` keywords need a semicolon " *
+                      "(`gr(g; by=b)`), got $(repr(a))")
+            push!(pos, a)
+        end
+    end
+    length(pos) == 1 ||
+        _sfail("$where `gr(...)` takes exactly one grouping column " *
+              "(`gr(g; by=b)`), got $(length(pos))")
+    g = only(pos)
+    g isa Symbol ||
+        _sfail("$where `gr(...)` group must be a bare data column, " *
+              "got $(repr(g))")
+    g in data ||
+        _sfail("$where `gr(...)` group `$g` is not data")
+    by_given ||
+        _sfail("$where bare `gr($g)` spells a plain grouping — write " *
+              "the column `$g` directly (stratified grouping needs " *
+              "`gr($g; by=b)`)")
+    by === g &&
+        _sfail("$where stratified draws need distinct group and " *
+              "stratum columns, got `gr($g, by=$g)`")
+    return VaryingStrata(by, nothing), g
 end
 
 _is_ones_vmargin(m::VaryingMargin) =
@@ -2593,6 +2771,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                                       "(density comes only from `~`)")
             lhs === :dummy &&
                 _sfail("`dummy` is reserved (margin surface) and cannot " *
+                       "be redefined")
+            lhs in (:mm, :gr) &&
+                _sfail("`$lhs` is reserved (grouping surface) and cannot " *
                        "be redefined")
             lhs in (:spline, :spline_basis) &&
                 _sfail("`$lhs` is reserved (spline surface) and cannot be " *

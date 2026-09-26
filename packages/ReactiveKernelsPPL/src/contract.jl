@@ -650,7 +650,38 @@ VaryingSdPrior(family::Symbol, param::Real) =
 const _SD_PRIOR_FAMILIES = (:std_normal, :exponential, :normal)
 
 """
-    VaryingDraws(group, kind, margins, lkj_eta, label, suffix[, levels[, sd_priors]])
+    VaryingMultiMembership(groups, weights, normalize)
+
+Multi-membership grouping metadata for a [`VaryingDraws`](@ref) block
+(SB `mm(...)` mirror): `groups` is the ≥2 membership columns (raw
+data — one shared draws block over their UNION levels), `weights` is
+`nothing` (equal `1/M` weights) or one raw numeric column per group,
+`normalize` row-normalizes supplied weights to sum to one (SB
+`_brm_prepare_mm`). `nothing` on the draws = plain single-column
+grouping.
+"""
+struct VaryingMultiMembership
+    groups::Vector{Symbol}
+    weights::Union{Nothing,Vector{Symbol}}
+    normalize::Bool
+end
+
+"""
+    VaryingStrata(by, levels)
+
+Stratified-grouping metadata for a [`VaryingDraws`](@ref) block (SB
+`gr(g, by=b)` mirror): `by` is the raw stratum column, `levels` the
+strata levels in numbering order (`nothing` pre-bind —
+[`bind_data`](@ref) fills sort-ordered observed levels). `nothing` on
+the draws = unstratified.
+"""
+struct VaryingStrata
+    by::Symbol
+    levels::Union{Nothing,Vector}
+end
+
+"""
+    VaryingDraws(group, kind, margins, lkj_eta, label, suffix[, levels[, sd_priors[, mm[, strata]]]])
 
 One shared varying-effect draws block: non-centered geometry over
 `K = length(margins)` margins in `G` groups of raw column `group`.
@@ -665,9 +696,13 @@ when the emitter has no declaration — [`bind_data`](@ref) fills
 sort-ordered observed levels). `sd_priors` is the per-margin `tau`
 prior ([`VaryingSdPrior`](@ref); empty — the default — is all
 `:std_normal`); a non-default entry needs `:correlated` draws (K = 1
-takes the vacuous route by passing `eta`). Shared draws are consumed
-by value flow: each [`VaryingSlice`](@ref) names this draws' label
-plus explicit columns — never by label matching across statements.
+takes the vacuous route by passing `eta`). `mm` is
+[`VaryingMultiMembership`](@ref) metadata (`nothing` = plain
+grouping; `group` is then the mm naming symbol, not a data column).
+`strata` is [`VaryingStrata`](@ref) metadata (`nothing` =
+unstratified). Shared draws are consumed by value flow: each
+[`VaryingSlice`](@ref) names this draws' label plus explicit columns
+— never by label matching across statements.
 """
 struct VaryingDraws
     group::ColumnRef
@@ -678,19 +713,26 @@ struct VaryingDraws
     suffix::String
     levels::Union{Nothing,Vector}
     sd_priors::Vector{VaryingSdPrior}
+    mm::Union{Nothing,VaryingMultiMembership}
+    strata::Union{Nothing,VaryingStrata}
 end
 
-# Pre-sd-prior 6/7-arg positional construction keeps working with
-# `sd_priors` empty (all-`:std_normal`, the unconfigured default).
+# Pre-mm/strata 6/7/8-arg positional construction keeps working with
+# `mm`/`strata` unset (plain single-column grouping).
 VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
     lkj_eta::Float64, label::Symbol, suffix::String) =
     VaryingDraws(group, kind, margins, lkj_eta, label, suffix, nothing,
-        VaryingSdPrior[])
+        VaryingSdPrior[], nothing, nothing)
 VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
     lkj_eta::Float64, label::Symbol, suffix::String,
     levels::Union{Nothing,Vector}) =
     VaryingDraws(group, kind, margins, lkj_eta, label, suffix, levels,
-        VaryingSdPrior[])
+        VaryingSdPrior[], nothing, nothing)
+VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
+    lkj_eta::Float64, label::Symbol, suffix::String,
+    levels::Union{Nothing,Vector}, sd_priors::Vector{VaryingSdPrior}) =
+    VaryingDraws(group, kind, margins, lkj_eta, label, suffix, levels,
+        sd_priors, nothing, nothing)
 
 """
     VaryingSlice(draws, columns, target)
@@ -1877,6 +1919,39 @@ function _varying_k1_names(d::VaryingDraws)
     return (scale, Symbol("xi_", s))
 end
 
+# Stratified sampled names, derived from the draws suffix + stratum
+# position: per-stratum LKJ factor (`L_<s>_s<k>`, KxK) and
+# marginal-scale vector (`tau_<s>_s<k>`, K). The standardized draws
+# (`z_flat_<s>`, K*G column-major) are shared — the third of
+# `_varying_corr_names(d)`. Single source for name tables, layout,
+# and the generator.
+function _varying_strata_names(d::VaryingDraws, k::Int)
+    d.strata !== nothing ||
+        _fail(d.label, "draws block is not stratified (per-stratum " *
+              "names need a `gr(g, by=b)` grouping)")
+    s = d.suffix
+    return (Symbol("L_", s, "_s", k), Symbol("tau_", s, "_s", k))
+end
+
+# Sampled names one `:correlated` draws block contributes to the name
+# tables: the shared triple, or — stratified with known strata levels
+# (bound plans) — the per-stratum frames plus the shared `z_flat`.
+# Unbound stratified draws contribute the base triple as placeholders
+# (suffix-unique, so they can never falsely collide; the bound pass
+# checks the real per-stratum names).
+function _varying_corr_table_names(d::VaryingDraws)
+    st = d.strata
+    if st === nothing || st.levels === nothing
+        return collect(_varying_corr_names(d))
+    end
+    z = _varying_corr_names(d)[3]
+    out = Symbol[z]
+    for k in 1:length(st.levels)
+        append!(out, _varying_strata_names(d, k))
+    end
+    return out
+end
+
 # Draws labels/suffixes, kinds, margins, slices, and effect-term
 # linkage: everything provable without data. A draws block's slice
 # ranges partition 1:K exactly once, in any slice order (columns are
@@ -2009,7 +2084,80 @@ function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
                   "to parameterize), got $(d.lkj_eta)")
     end
     _validate_sd_priors(d, K)
+    _validate_draws_grouping(d, K)
     _validate_varying_levels_shape(d)
+    return nothing
+end
+
+# Multi-membership / stratified grouping shape (SB-mirror geometry
+# selection, provable without data). mm: intercept-only draws are
+# `:intercept1` (SB uses `ranef_intercept_draws` unconditionally —
+# no eta); every other shape is `:correlated` with eta exactly 1.0
+# (SB hardcodes `lkj_corr_cholesky(1.)` on the mm path, the K=1 slope
+# included — there is no mm `:slope1`). Stratified draws are always
+# `:correlated` (SB `ranef_correlated_by` has no K=1 special-case),
+# eta exactly 1.0. Neither path has an SB generic-prior sibling, so
+# both reject non-empty `sd_priors`; SB has no mm × stratified shape.
+function _validate_draws_grouping(d::VaryingDraws, K::Int)
+    mm = d.mm
+    st = d.strata
+    mm === nothing && st === nothing && return nothing
+    mm !== nothing && st !== nothing &&
+        _fail(d.label, "draws block is both multi-membership and " *
+              "stratified (SB has no `mm(...)` × `gr(g, by=b)` shape — " *
+              "pick one)")
+    if mm !== nothing
+        M = length(mm.groups)
+        M >= 2 ||
+            _fail(d.label, "multi-membership draws need at least two " *
+                  "grouping columns, got $M")
+        length(unique(mm.groups)) == M ||
+            _fail(d.label, "multi-membership grouping columns repeat " *
+                  "($(repr(mm.groups)))")
+        if mm.weights !== nothing
+            W = length(mm.weights)
+            W == M ||
+                _fail(d.label, "multi-membership draws list $W weight " *
+                      "columns for $M groups (one per group, or omit all)")
+            length(unique(mm.weights)) == M ||
+                _fail(d.label, "multi-membership weight columns repeat " *
+                      "($(repr(mm.weights)))")
+        end
+        if K == 1 && _is_ones_margin(first(d.margins))
+            d.kind === :intercept1 ||
+                _fail(d.label, "multi-membership intercept-only draws " *
+                      "take no eta (SB uses the `:intercept1` geometry " *
+                      "unconditionally — pass no eta)")
+        elseif d.kind === :correlated
+            d.lkj_eta == 1.0 ||
+                _fail(d.label, "multi-membership correlated draws need " *
+                      "eta 1.0 (SB hardcodes `lkj_corr_cholesky(1.)`), " *
+                      "got $(d.lkj_eta)")
+        else
+            _fail(d.label, "multi-membership draws over non-intercept " *
+                  "margins take the correlated route (SB uses " *
+                  "`ranef_correlated_draws` for every non-intercept mm " *
+                  "block, K=1 included) — got kind :$(d.kind)")
+        end
+        isempty(d.sd_priors) ||
+            _fail(d.label, "multi-membership draws take no sd priors " *
+                  "(SB has no generic-prior mm sibling)")
+    end
+    if st !== nothing
+        d.kind === :correlated ||
+            _fail(d.label, "stratified draws are always :correlated (SB " *
+                  "`ranef_correlated_by` has no K=1 special-case), got " *
+                  ":$(d.kind)")
+        d.lkj_eta == 1.0 ||
+            _fail(d.label, "stratified draws need eta 1.0 (SB hardcodes " *
+                  "`lkj_corr_cholesky(1.)`), got $(d.lkj_eta)")
+        isempty(d.sd_priors) ||
+            _fail(d.label, "stratified draws take no sd priors (SB " *
+                  "supports no configured priors on `gr(g, by=b)` blocks)")
+        st.by !== d.group ||
+            _fail(d.label, "stratified draws need distinct group and " *
+                  "stratum columns, got `gr($(d.group), by=$(d.group))`")
+    end
     return nothing
 end
 
@@ -2121,23 +2269,30 @@ end
 # grouping levels (Int value / string exact match).
 function _validate_varying_draws_data(plan::StructuralPlan)
     for d in plan.varying_draws
-        haskey(plan.columns, d.group) ||
-            _fail(d.label, "grouping column $(d.group) is not bound")
-        _is_derived(plan, d.group) &&
-            _fail(d.label, "grouping column $(d.group) must be raw data " *
-                  "(level knowledge needs bound values)")
-        d.levels === nothing &&
-            _fail(d.label, "draws block has no declared grouping levels " *
-                  "(bind_data fills these — hand-built bound plans must too)")
-        # Coverage: every observed value needs a declared code (an
-        # uncovered value would encode 0 and gather out of bounds).
-        levels = d.levels::Vector
-        groupcol =
-            _vector_column(plan.columns, d.group, d.label, "grouping column")
-        for v in groupcol
-            v in levels ||
-                _fail(d.label, "grouping value $(repr(v)) of $(d.group) " *
-                      "is not a declared level (declared: $(repr(levels)))")
+        if d.mm !== nothing
+            _validate_mm_draws_data(d, plan)
+        else
+            haskey(plan.columns, d.group) ||
+                _fail(d.label, "grouping column $(d.group) is not bound")
+            _is_derived(plan, d.group) &&
+                _fail(d.label, "grouping column $(d.group) must be raw data " *
+                      "(level knowledge needs bound values)")
+            d.levels === nothing &&
+                _fail(d.label, "draws block has no declared grouping levels " *
+                      "(bind_data fills these — hand-built bound plans must too)")
+            # Coverage: every observed value needs a declared code (an
+            # uncovered value would encode 0 and gather out of bounds).
+            levels = d.levels::Vector
+            groupcol = _vector_column(plan.columns, d.group, d.label,
+                "grouping column")
+            for v in groupcol
+                v in levels ||
+                    _fail(d.label, "grouping value $(repr(v)) of $(d.group) " *
+                          "is not a declared level (declared: $(repr(levels)))")
+            end
+        end
+        if d.strata !== nothing
+            _validate_strata_draws_data(d, plan)
         end
         for m in d.margins
             _validate_margin_data(m, d.label, plan)
@@ -2145,15 +2300,118 @@ function _validate_varying_draws_data(plan::StructuralPlan)
     end
     # One grouping, one numbering: same-group draws share the per-group
     # `_ppl_gidx_` encoder, so their declared levels must agree exactly
-    # (order included — codes are positions).
+    # (order included — codes are positions). mm draws carry per-suffix
+    # encoders (never shared), so they sit out the agreement.
     for i in eachindex(plan.varying_draws)
         for j in (i + 1):length(plan.varying_draws)
             di, dj = plan.varying_draws[i], plan.varying_draws[j]
             di.group === dj.group || continue
+            di.mm === nothing && dj.mm === nothing || continue
             di.levels == dj.levels ||
                 _fail(:plan, "draws $(di.label) and $(dj.label) share " *
                       "grouping $(di.group) but declare different levels " *
                       "($(repr(di.levels)) vs $(repr(dj.levels)))")
+        end
+    end
+    return nothing
+end
+
+# Multi-membership data checks (SB `_brm_prepare_mm` mirror): every
+# membership column bound, raw, n_obs-long, and covered by the UNION
+# levels; every weight column bound, vector, real non-Bool, finite,
+# nonnegative, n_obs-long, with a positive finite row total (SB
+# validates totals whenever weights are supplied, normalized or not).
+function _validate_mm_draws_data(d::VaryingDraws, plan::StructuralPlan)
+    mm = d.mm::VaryingMultiMembership
+    M = length(mm.groups)
+    d.levels === nothing &&
+        _fail(d.label, "draws block has no declared grouping levels " *
+              "(bind_data fills the union — hand-built bound plans must too)")
+    levels = d.levels::Vector
+    n_obs = plan.n_obs
+    for (mi, gcol) in enumerate(mm.groups)
+        haskey(plan.columns, gcol) ||
+            _fail(d.label, "membership column $gcol (slot $mi of $M) " *
+                  "is not bound")
+        _is_derived(plan, gcol) &&
+            _fail(d.label, "membership column $gcol must be raw data " *
+                  "(level knowledge needs bound values)")
+        col = _vector_column(plan.columns, gcol, d.label, "membership column")
+        length(col) == n_obs ||
+            _fail(d.label, "membership column $gcol has $(length(col)) " *
+                  "rows; expected $n_obs")
+        for v in col
+            v in levels ||
+                _fail(d.label, "grouping value $(repr(v)) of $gcol " *
+                      "is not a declared union level (declared: " *
+                      "$(repr(levels)))")
+        end
+    end
+    mm.weights === nothing && return nothing
+    for (mi, wcol) in enumerate(mm.weights)
+        haskey(plan.columns, wcol) ||
+            _fail(d.label, "weight column $wcol (slot $mi of $M) " *
+                  "is not bound")
+        w = _vector_column(plan.columns, wcol, d.label, "weight column")
+        eltype(w) <: Real && !(eltype(w) <: Bool) ||
+            _fail(d.label, "weight column $wcol must be real-valued, got " *
+                  "eltype $(eltype(w))")
+        length(w) == n_obs ||
+            _fail(d.label, "weight column $wcol has $(length(w)) rows; " *
+                  "expected $n_obs")
+        for (i, v) in enumerate(w)
+            isfinite(v) ||
+                _fail(d.label, "weight column $wcol at row $i must be " *
+                      "finite, got $(repr(v))")
+            v >= 0 ||
+                _fail(d.label, "weight column $wcol at row $i must be " *
+                      "nonnegative, got $(repr(v))")
+        end
+    end
+    wcols = [plan.columns[w] for w in mm.weights]
+    for i in 1:n_obs
+        total = sum(Float64(w[i]) for w in wcols)
+        isfinite(total) ||
+            _fail(d.label, "weights have a non-finite total at row $i")
+        total > 0 ||
+            _fail(d.label, "weights must have a positive total at row $i")
+    end
+    return nothing
+end
+
+# Stratified data checks: the `by` column bound, raw, n_obs-long, and
+# covered by the strata levels; every group level sits in exactly one
+# stratum (SB `_brm_group_strata` — a straddling group is loud).
+function _validate_strata_draws_data(d::VaryingDraws, plan::StructuralPlan)
+    st = d.strata::VaryingStrata
+    haskey(plan.columns, st.by) ||
+        _fail(d.label, "stratum column $(st.by) is not bound")
+    _is_derived(plan, st.by) &&
+        _fail(d.label, "stratum column $(st.by) must be raw data " *
+              "(level knowledge needs bound values)")
+    st.levels === nothing &&
+        _fail(d.label, "draws block has no declared strata levels " *
+              "(bind_data fills these — hand-built bound plans must too)")
+    slevels = st.levels::Vector
+    bycol = _vector_column(plan.columns, st.by, d.label, "stratum column")
+    length(bycol) == plan.n_obs ||
+        _fail(d.label, "stratum column $(st.by) has $(length(bycol)) " *
+              "rows; expected $(plan.n_obs)")
+    for v in bycol
+        v in slevels ||
+            _fail(d.label, "stratum value $(repr(v)) of $(st.by) " *
+                  "is not a declared stratum (declared: $(repr(slevels)))")
+    end
+    gcol = _vector_column(plan.columns, d.group, d.label, "grouping column")
+    smap = Dict{Any,Any}()
+    for (g, b) in zip(gcol, bycol)
+        if haskey(smap, g)
+            smap[g] == b ||
+                _fail(d.label, "gr($(d.group), by=$(st.by)): group level " *
+                      "$(repr(g)) straddles multiple strata " *
+                      "($(repr(smap[g])) vs $(repr(b)))")
+        else
+            smap[g] = b
         end
     end
     return nothing
@@ -2169,15 +2427,38 @@ function _draws_nlevels(d::VaryingDraws)
     return length(d.levels)
 end
 
+# Stratum count for a stratified draws block: the DECLARED strata
+# level count. Loud defense in depth — validate_data proves strata
+# levels non-nothing on every bound stratified plan.
+function _strata_nlevels(d::VaryingDraws)
+    st = d.strata
+    st === nothing && throw(ContractValidationError(
+        "[layout] draws $(d.label) is not stratified (stratum count " *
+        "needs a `gr(g, by=b)` grouping)"))
+    st.levels === nothing && throw(ContractValidationError(
+        "[layout] draws $(d.label) has no declared strata levels " *
+        "(bind_data fills these — hand-built bound plans must too)"))
+    return length(st.levels)
+end
+
 # Binder evaluation for draws levels (the LevelMap precedent):
 # `nothing` fills sort-ordered observed levels; emitter-provided levels
 # pass through (validated by `_validate_varying_levels_shape` +
-# `_validate_varying_draws_data`).
+# `_validate_varying_draws_data`). mm draws fit the UNION across
+# membership columns (SB `_brm_mm_fit_levels`); stratified draws also
+# fill strata levels from the `by` column.
 function _eval_draws_levels(draws::Vector{VaryingDraws},
         columns::AbstractDict{Symbol})
     out = VaryingDraws[]
     for d in draws
-        d.levels !== nothing && (push!(out, d); continue)
+        if d.mm !== nothing
+            push!(out, _bind_mm_draws(d, columns))
+            continue
+        end
+        if d.levels !== nothing
+            push!(out, _maybe_fill_strata(d, columns))
+            continue
+        end
         haskey(columns, d.group) ||
             _fail(d.label, "grouping column $(d.group) is not bound")
         groupcol = _vector_column(columns, d.group, d.label, "grouping column")
@@ -2188,10 +2469,60 @@ function _eval_draws_levels(draws::Vector{VaryingDraws},
                 _fail(d.label, "grouping column $(d.group) levels not " *
                              "orderable ($err)")
             end
-        push!(out, VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
-            d.label, d.suffix, collect(levels), d.sd_priors))
+        d2 = VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
+            d.label, d.suffix, collect(levels), d.sd_priors, d.mm, d.strata)
+        push!(out, _maybe_fill_strata(d2, columns))
     end
     return out
+end
+
+# Union-level fit for one mm draws block (SB `_brm_mm_fit_levels`:
+# pool per-column levels, dedup, sort). Emitter-provided union levels
+# (the categorical escape hatch — same policy as plain groupings)
+# pass through untouched.
+function _bind_mm_draws(d::VaryingDraws, columns::AbstractDict{Symbol})
+    mm = d.mm::VaryingMultiMembership
+    d.levels !== nothing && return _maybe_fill_strata(d, columns)
+    pooled = Any[]
+    for g in mm.groups
+        haskey(columns, g) ||
+            _fail(d.label, "membership column $g is not bound")
+        col = _vector_column(columns, g, d.label, "membership column")
+        append!(pooled, _grouping_levels(col))
+    end
+    unique!(pooled)
+    levels =
+        try
+            sort!(pooled)
+        catch err
+            _fail(d.label, "membership columns have levels that are not " *
+                         "mutually orderable ($err)")
+        end
+    d2 = VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
+        d.label, d.suffix, collect(levels), d.sd_priors, d.mm, d.strata)
+    return _maybe_fill_strata(d2, columns)
+end
+
+# Strata-level fill for one stratified draws block (sort-ordered
+# observed levels of the `by` column — the group-level precedent).
+# Anything unstratified (or already-filled) passes through untouched.
+function _maybe_fill_strata(d::VaryingDraws, columns::AbstractDict{Symbol})
+    st = d.strata
+    st === nothing && return d
+    st.levels !== nothing && return d
+    haskey(columns, st.by) ||
+        _fail(d.label, "stratum column $(st.by) is not bound")
+    bycol = _vector_column(columns, st.by, d.label, "stratum column")
+    slevels =
+        try
+            _grouping_levels(bycol)
+        catch err
+            _fail(d.label, "stratum column $(st.by) levels not " *
+                         "orderable ($err)")
+        end
+    return VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
+        d.label, d.suffix, d.levels, d.sd_priors, d.mm,
+        VaryingStrata(st.by, collect(slevels)))
 end
 
 """Predictor levels (grouped kernels): a predictor consumed ONLY as a
@@ -3685,7 +4016,7 @@ function _validate_name_tables(plan::StructuralPlan)
         for nm in _varying_k1_names(d)]
     vcorr = Symbol[nm for d in plan.varying_draws
         if d.kind === :correlated
-        for nm in _varying_corr_names(d)]
+        for nm in _varying_corr_table_names(d)]
     hsgp = Symbol[nm for hb in plan.hsgp_bases for nm in _hsgp_all_names(hb)]
     kern = Symbol[nm for kp in plan.kernel_plates for nm in _kernel_all_names(kp)]
     mats = Symbol[m.name for m in plan.matrices]
@@ -4970,6 +5301,12 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
     # Dar summands name a trajectory in `options`, not columns; structure
     # validation checked the name.
     t.kind === DarSummandTerm && return nothing
+    # mm effect terms name the mm naming symbol (not a data column);
+    # membership binding is proven by `_validate_mm_draws_data`.
+    if t.kind === VaryingEffectTerm
+        i = findfirst(d -> d.label === t.options.draws, plan.varying_draws)
+        i !== nothing && plan.varying_draws[i].mm !== nothing && return nothing
+    end
     for c in t.columns
         # A per-cell latent enters a design only through a ContinuousTerm
         # (a free coefficient scaling the latent vector — the SB `me`
@@ -7690,6 +8027,15 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     end
     for d in plan.varying_draws
         haskey(inferred, d.group) && _upgrade_role!(inferred, d.group, :group)
+        if d.mm !== nothing
+            for g in d.mm.groups
+                haskey(inferred, g) && _upgrade_role!(inferred, g, :group)
+            end
+        end
+        if d.strata !== nothing
+            by = d.strata.by
+            haskey(inferred, by) && _upgrade_role!(inferred, by, :group)
+        end
     end
     for sb in bases, blk in sb.blocks, c in blk.columns
         haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
