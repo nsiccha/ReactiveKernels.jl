@@ -209,10 +209,43 @@ function assign_layout(plan::StructuralPlan)
     # K=1 packs zero and constrains to `[1.0]`), the marginal-scale
     # K-vector `tau` (`:varying` with `:exp` — the same Stan kernel
     # semantics as the K=1 scalar), and the standardized `z_flat`
-    # (`:varying` identity, K*G column-major).
+    # (`:varying` identity, K*G column-major). Stratified draws pack
+    # one L/tau pair per stratum (SB `ranef_correlated_by` order —
+    # all L, all tau) plus the one shared `z_flat` block.
     for d in plan.varying_draws
         if d.kind === :correlated
             K = length(d.margins)
+            if d.strata !== nothing
+                # Stratified (SB `ranef_correlated_by` declaration
+                # order — all L, all tau, then the shared z): one LKJ
+                # entry plus one tau entry per stratum, one shared
+                # `z_flat` block (K*G column-major, as unstratified).
+                S = _strata_nlevels(d)
+                P = K * (K - 1) ÷ 2
+                for k in 1:S
+                    Lk, _ = _varying_strata_names(d, k)
+                    labels = [Symbol(string(Lk) * "." * string(i))
+                        for i in 1:P]
+                    push!(entries,
+                        LayoutEntry(:varying_corr, nothing, Lk, labels,
+                            offset, P, :lkj))
+                    offset += P
+                end
+                for k in 1:S
+                    _, tauk = _varying_strata_names(d, k)
+                    push!(entries,
+                        LayoutEntry(:varying, nothing, tauk, [tauk], offset,
+                            K, :exp))
+                    offset += K
+                end
+                z = _varying_corr_names(d)[3]
+                G = _draws_nlevels(d)
+                push!(entries,
+                    LayoutEntry(:varying, nothing, z, [z], offset, K * G,
+                        :identity))
+                offset += K * G
+                continue
+            end
             L, tau, z = _varying_corr_names(d)
             P = K * (K - 1) ÷ 2
             labels = [Symbol(string(L) * "." * string(i)) for i in 1:P]
@@ -783,7 +816,25 @@ end
 # column-major order. Sibling entries are found by the canonical
 # `_varying_corr_names` spelling (`L_<s>` → `tau_<s>` /
 # `z_flat_<s>`), never by adjacency, so entry-order changes cannot
-# miswire it.
+# miswire it. Per-stratum LKJ entries (stratified draws) fail closed:
+# derived stratified draws are query scope, not built in this
+# log-density slice.
+# Specific refusal when an LKJ entry without canonical siblings is a
+# per-stratum frame (`L_<suffix>_s<k>` with the shared
+# `z_flat_<suffix>` present): derived stratified draws are query
+# scope. Anything else falls through to the generic triple error.
+function _stratified_draws_refusal(name::Symbol, sfx::String,
+        byname::Dict{Symbol,LayoutEntry})
+    m = match(r"^(.*)_s(\d+)$", sfx)
+    m === nothing && return nothing
+    haskey(byname, Symbol("z_flat_", m.captures[1])) ||
+        return nothing
+    throw(ContractValidationError(
+        "[layout] derived draws for stratified LKJ entry $name are not " *
+        "built (`constrain`/`restore_draws` do not cover `gr(g, by=b)` " *
+        "blocks — log-density-only slice)"))
+end
+
 function _varying_corr_draws(layout::LayoutTable, u::AbstractVector{<:Real})
     out = Pair{Symbol,Matrix{Float64}}[]
     byname = Dict{Symbol,LayoutEntry}(e.name => e for e in layout.entries)
@@ -792,9 +843,12 @@ function _varying_corr_draws(layout::LayoutTable, u::AbstractVector{<:Real})
         sfx = string(e.name)[3:end]
         tau_e = get(byname, Symbol("tau_", sfx), nothing)
         z_e = get(byname, Symbol("z_flat_", sfx), nothing)
-        (tau_e === nothing || z_e === nothing) && throw(ContractValidationError(
-            "[layout] LKJ entry $(e.name) has no tau/z_flat siblings " *
-            "(assign_layout always emits the triple)"))
+        if tau_e === nothing || z_e === nothing
+            _stratified_draws_refusal(e.name, sfx, byname)
+            throw(ContractValidationError(
+                "[layout] LKJ entry $(e.name) has no tau/z_flat siblings " *
+                "(assign_layout always emits the triple)"))
+        end
         K = _lkj_dim(e.size)
         tau = [_constrain_elt(tau_e, Float64(x)) for x in
             u[tau_e.offset:(tau_e.offset + tau_e.size - 1)]]
