@@ -98,6 +98,7 @@ univariate components, SB `MixtureModel` mirror)."""
     MixtureFam
     StudentTFam
     HurdlePoissonFam
+    ZeroInflatedPoissonFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -317,6 +318,7 @@ struct LikelihoodSpec
     mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
     mixture_weights::Union{Nothing,Symbol,Vector{Float64}}
     nu::Union{Nothing,ParamName,Real}
+    zi::Union{Nothing,ParamName,Real}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
@@ -348,13 +350,14 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}} =
             Union{Nothing,Symbol,Real,ScalePredictorRef}[],
         mixture_weights::Union{Nothing,Symbol,Vector{Float64}} = nothing,
-        nu::Union{Nothing,ParamName,Real} = nothing)
+        nu::Union{Nothing,ParamName,Real} = nothing,
+        zi::Union{Nothing,ParamName,Real} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
         threshold_columns, threshold_coefs, extra_responses, factor_scales,
         factor_corr, glm_alpha, glm_beta, mixture_family, mixture_locs,
-        mixture_scales, mixture_weights, nu)
+        mixture_scales, mixture_weights, nu, zi)
 end
 
 """
@@ -1341,6 +1344,7 @@ const ADMITTED_TRIPLES = (
     (OrdinalFam, CloglogLink, IdentityLink),
     (StudentTFam, IdentityLink, IdentityLink),
     (HurdlePoissonFam, LogLink, LogLink),
+    (ZeroInflatedPoissonFam, LogLink, LogLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order)."""
@@ -1679,7 +1683,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
-    PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam)
+    PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
+    ZeroInflatedPoissonFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -6094,6 +6099,7 @@ function _validate_responses(plan::StructuralPlan)
         if r.family === MixtureFam
             _validate_mixture_response(r, plan, used_predictors)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             continue
         end
         # A scale predictor feeds a slot exactly like a location predictor,
@@ -6110,6 +6116,7 @@ function _validate_responses(plan::StructuralPlan)
             )
             _validate_scale(r, plan)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             _validate_evidence_structure(r, plan)
             _validate_unleveled_fields(r)
             continue
@@ -6139,6 +6146,7 @@ function _validate_responses(plan::StructuralPlan)
                 "(the latent covers the whole column)")
             _validate_scale(r, plan)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             _validate_evidence_structure(r, plan)
             _validate_unleveled_fields(r)
             continue
@@ -6150,6 +6158,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_simplex_response(r, plan)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -6160,6 +6169,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_joint_response(r, plan, used_predictors)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -6170,6 +6180,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_glm_response(r, plan)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -6184,10 +6195,11 @@ function _validate_responses(plan::StructuralPlan)
             "(admitted: Gaussian/identity, Bernoulli-logit/probit/cloglog, " *
             "Poisson-log, Binomial-logit/probit/cloglog, NB2-log, Gamma-log, " *
             "Beta-logit, Categorical-logit, Ordered-logit, Ordinal spellings, " *
-            "Student-identity, Hurdle-Poisson-log)",
+            "Student-identity, Hurdle-Poisson-log, ZIP-log)",
         )
         _validate_scale(r, plan)
         _validate_nu(r, plan)
+        _validate_zi(r, plan)
         _validate_evidence_structure(r, plan)
         _validate_leveled_fields(r, plan, pred, used_predictors)
         if r.range !== nothing
@@ -6251,6 +6263,9 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     elseif r.family === HurdlePoissonFam
         _is_count_column(col) && return nothing
         return _fail(r.label, "Hurdle response must be non-negative integers")
+    elseif r.family === ZeroInflatedPoissonFam
+        _is_count_column(col) && return nothing
+        return _fail(r.label, "ZIP response must be non-negative integers")
     elseif r.family === GaussianFam
         eltype(col) <: Real ||
             _fail(r.label, "Gaussian response must be numeric")
@@ -6557,6 +6572,28 @@ function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "nu literal must be finite positive"))
     n isa Symbol && (n in _union_names(plan) ||
         _fail(r.label, "nu references unknown name $n"))
+    return nothing
+end
+
+# Zero-inflation probability: required (a sampled parameter/assignment
+# name or a literal in [0, 1]), scalar only — no per-observation
+# columns, no predictor-fed zi (a modeled zi submodel is deferred).
+# Unknown names fail structurally: unlike scale there is no bind-time
+# column form to defer to.
+function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
+    if r.family !== ZeroInflatedPoissonFam
+        r.zi === nothing ||
+            _fail(r.label, "only ZIP responses take zi (zero-inflation probability)")
+        return nothing
+    end
+    z = r.zi
+    z === nothing &&
+        _fail(r.label, "ZIP response requires zi (zero-inflation " *
+            "probability, parameter or literal)")
+    z isa Real && ((isfinite(z) && 0 <= z <= 1) ||
+        _fail(r.label, "zi literal must lie in [0, 1]"))
+    z isa Symbol && (z in _union_names(plan) ||
+        _fail(r.label, "zi references unknown name $z"))
     return nothing
 end
 

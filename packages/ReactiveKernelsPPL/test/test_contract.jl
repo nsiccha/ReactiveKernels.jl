@@ -237,6 +237,21 @@ function _hurdle_plan(n = 9)
     )
 end
 
+function _zip_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([0, 1, 2], outer = cld(n, 3))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; zi = :zi)],
+        [PredictorSpec(:eta, LogLink, _terms(), :eta)],
+        _priors(:eta),
+        [SampledParameter(:zi, :beta, (arg1 = 2.0, arg2 = 2.0), nothing, :zi)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
 @testset "contract admission predicates" begin
     @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
         BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
@@ -244,7 +259,8 @@ end
         BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
         MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
-        PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam)
+        PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
+        ZeroInflatedPoissonFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
@@ -277,6 +293,7 @@ end
     @test validate_plan(_beta_plan()) === nothing
     @test validate_plan(_student_plan()) === nothing
     @test validate_plan(_hurdle_plan()) === nothing
+    @test validate_plan(_zip_plan()) === nothing
 end
 
 @testset "link triples" begin
@@ -317,6 +334,10 @@ end
     @test_throws ContractValidationError validate_plan(bad)
     # Hurdle admits the log predictor link only.
     bad = _hurdle_plan()
+    bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # ZIP admits the log predictor link only.
+    bad = _zip_plan()
     bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
     @test_throws ContractValidationError validate_plan(bad)
 end
@@ -517,6 +538,66 @@ end
     bad.responses[1] =
         LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, :p0c, nothing,
             _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "zip response validation" begin
+    # ZIP requires its zero-inflation probability zi.
+    bad = _zip_plan()
+    bad.responses[1] =
+        LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Only ZIP responses take zi.
+    bad = _poisson_plan()
+    bad.responses[1] =
+        LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; zi = 0.2)
+    @test_throws ContractValidationError validate_plan(bad)
+    # zi literals must lie in [0, 1].
+    for lit in (-0.1, 1.5, Inf, NaN)
+        bad = _zip_plan()
+        bad.responses[1] =
+            LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+                _none_evidence(), :y_resp, nothing, nothing; zi = lit)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    for lit in (0.0, 0.2, 1.0)
+        good = _zip_plan()
+        good.responses[1] =
+            LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+                _none_evidence(), :y_resp, nothing, nothing; zi = lit)
+        @test validate_plan(good) === nothing
+    end
+    # zi names resolve structurally (no bind-time column form).
+    bad = _zip_plan()
+    bad.responses[1] =
+        LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; zi = :nosuch)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _zip_plan()
+    bad.responses[1] =
+        LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; zi = :x)
+    @test_throws ContractValidationError validate_plan(bad)
+    # ZIP takes no scale auxiliary.
+    bad = _zip_plan()
+    bad.responses[1] =
+        LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, 1.0, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; zi = :zi)
+    @test_throws ContractValidationError validate_plan(bad)
+    # ZIP response must be non-negative integers.
+    bad = _zip_plan()
+    bad.columns[:y] = fill(1.5, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _zip_plan()
+    bad.columns[:y] = fill(-1, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _zip_plan()
+    bad.responses[1] =
+        LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+            ResponseEvidence(:truncated, 0, 5), :y_resp, nothing, nothing; zi = :zi)
     @test_throws ContractValidationError validate_plan(bad)
 end
 

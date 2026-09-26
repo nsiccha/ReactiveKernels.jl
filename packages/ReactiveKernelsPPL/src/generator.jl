@@ -80,7 +80,7 @@ using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
     beta, inverse_gamma, binomial, negative_binomial2, uniform,
-    student_t,
+    student_t, zero_inflated_poisson,
     gp_exp_quad_cov, gp_chol_latent,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
 using SpecialFunctions: erfc, loggamma
@@ -912,6 +912,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _poisson_plate_stmts(r, plan, node, pw)
     elseif r.family === HurdlePoissonFam
         return _hurdle_plate_stmts(r, plan, node, pw)
+    elseif r.family === ZeroInflatedPoissonFam
+        return _zip_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
         return _binomial_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomial2Fam
@@ -1314,6 +1316,26 @@ function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     lb, ub = _thread_bounds!(inputs, r.evidence, true)
     base = :(poisson(; log_rate = $etav).logpdf($yv))
     cell = _poisson_cell(r.evidence.kind, base, yv, lb, ub, etav)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
+end
+
+# ZIP plate: the Poisson-plate shape with a zero-inflation argument —
+# validation guarantees `zi` (a sampled name or literal) and fails
+# evidence closed (the Gaussian/Poisson-only gate), so the cell is the
+# plain `zero_inflated_poisson` endpoint plus optional weights.
+function _zip_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    inputs = Any[y, lp]
+    yv, etav = _dovar(1), _dovar(2)
+    ziref = _thread_ref!(inputs, r.zi)
+    # All-keyword: the object constructor cannot mix positional and named
+    # owner bindings (matches the `:observed/:log_rate/:zi` HAVE ports).
+    cell = :(zero_inflated_poisson(; log_rate = $etav, zi = $ziref).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
