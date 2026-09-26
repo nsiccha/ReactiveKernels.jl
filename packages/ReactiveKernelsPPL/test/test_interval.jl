@@ -6,8 +6,8 @@
 # Poisson-XLA gap (`poisson.cdf` needs `SpecialFunctions.gamma_inc`,
 # which has no Reactant tracing rule), and the I1/I2 SB-parity probes
 # (N=80, Xoshiro recipes, vectors inlined so the test is immune to
-# RNG/Distributions drift; SB literals filled from the peer lane's
-# BridgeStan brief before landing). (`_findiff_grad` / `_GEN_BACKEND`
+# RNG/Distributions drift; SB literals from the peer lane's BridgeStan
+# brief 2026-09-26T17-04-55-572-1ei4syk). (`_findiff_grad` / `_GEN_BACKEND`
 # come from test_generator.jl, included first.)
 using DifferentiationInterface
 using Distributions: Poisson, Normal, Exponential, logpdf, cdf
@@ -32,14 +32,13 @@ end
 _int_posterior(kern, lay, q::NamedTuple) =
     Base.invokelatest(kern, unconstrain(lay, q))
 
-# Scalar interval log-densities (the response is the lower endpoint:
-# Gaussian `log(F(hi) - F(y))`, Poisson `log(F(ub) - F(y-1))` with
-# F(-1) = 0 definitionally — the inclusive-cdf shift).
+# Scalar interval log-densities (the response is the OPEN lower endpoint
+# per the brm-use contract: `log(CDF(upper) - CDF(response))` for
+# `(response, upper]` — no inclusive-cdf shift on either family).
 _int_gref(y::Real, mu::Real, s::Real, hi::Real) =
     log(cdf(Normal(mu, s), hi) - cdf(Normal(mu, s), y))
-_int_pF(lam::Real, k::Integer) = k < 0 ? 0.0 : cdf(Poisson(lam), k)
 _int_pref(y::Integer, lam::Real, ub::Integer) =
-    log(_int_pF(lam, ub) - _int_pF(lam, y - 1))
+    log(cdf(Poisson(lam), ub) - cdf(Poisson(lam), y))
 
 const _INT_X = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
 const _INT_YG = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
@@ -458,16 +457,18 @@ _int_i2_cols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_I2_Y),
         "fcafb293baa16dc421cbe5b2da42a4a6bd1006c0e7840495495bb3cb419b8c11"
 end
 
-# I1/I2 RK-side pins at the SB-parity u probes (RK value vs the hand
-# oracle; the SB-literal assertions join this testset when the peer
-# brief lands).
+# I1/I2 SB parity at the u probes: RK value vs the hand oracle plus the
+# peer lane's BridgeStan literals (brief 2026-09-26T17-04-55-572-1ei4syk
+# on BayesianRegressionModels:rk:parity-fam-interval, BRM b4d5142,
+# StanBlocks 24578c3, BridgeStan 2.9.0, Julia 1.10.11): full posterior
+# at u_unc, propto=false, BridgeStan AD grads in u-order.
 @testset "interval I1/I2 probe pins" begin
     @testset "I1 interval_gauss" begin
         # SB: mu ~ 1 + x1; effect(mu, Intercept) ~ Normal(0, 1);
         # effect(mu, x1) ~ Normal(0, 1); s ~ Exponential(1);
         # y1 ~ interval_censored(Normal(mu, s); upper=hi1);
         # u = [0.6, -0.2, 0.1].
-        _, _, kern, lay = _int_query(quote
+        bound, built, kern, lay = _int_query(quote
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), hi)
                 s ~ Exponential(1)
@@ -478,13 +479,20 @@ end
         want = _int_gauss_oracle(_INT_I1_Y, _INT_I1_X, _INT_I1_HI, u[1],
             u[2], exp(u[3]))
         @test Base.invokelatest(kern, u) ≈ want rtol = 1e-12
+        @test abs(Base.invokelatest(kern, u) - (-125.2324516926005)) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        sb = [29.63302029600971, -8.742224107020567, 7.502662991196471]
+        @test maximum(abs.(g .- sb)) < 1e-10
     end
     @testset "I2 interval_poisson" begin
         # SB: eta ~ 1 + x2; effect(eta, Intercept) ~ Normal(0, 1);
         # effect(eta, x2) ~ Normal(0, 1);
         # y2 ~ interval_censored(Poisson(exp(eta)); upper=ub2);
         # u = [0.35, 0.45].
-        _, _, kern, lay = _int_query(quote
+        bound, built, kern, lay = _int_query(quote
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), ub)
             end, _int_i2_cols())
@@ -494,5 +502,12 @@ end
         want = _int_pois_oracle(_INT_I2_Y, _INT_I2_X, _INT_I2_UB, u[1],
             u[2])
         @test Base.invokelatest(kern, u) ≈ want rtol = 1e-12
+        @test abs(Base.invokelatest(kern, u) - (-133.16930277473355)) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        sb = [97.63731140634404, -9.621206661764973]
+        @test maximum(abs.(g .- sb)) < 1e-10
     end
 end
