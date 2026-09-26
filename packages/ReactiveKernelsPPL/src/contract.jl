@@ -288,6 +288,18 @@ location/scale parameter name — fully-fixed mixtures fail closed before
 anchoring); `scale` is `nothing`. Mixture widths are structural
 (K = `length(mixture_locs)`): no `n_levels`, no bind-time size
 inference. Binomial components share one `trials`.
+Case-A `mi()` missingness (SB parity, log density only) names its observed-row
+index column in the trailing `mi_jobs` field, built with keywords (`mi_jobs=`);
+every other response leaves it at `nothing`:
+
+- `mi_jobs`: the `Jobs` column (sorted-ascending unique `Int` row indices,
+  a strict nonempty subset of `1:n_obs`). The response column itself crosses
+  PACKED (`y_obs`, aligned with `Jobs`); both ride the managed-columns
+  exemption. The generator gathers every vector likelihood input by `Jobs`
+  and runs the existing cell over the short plate — obs rows only, no
+  latent (SB keeps `y_mis` in generated quantities here). v1 admits
+  Gaussian/Gamma/Beta, uncomposed (no weights/evidence/range/trials);
+  Case-B downstream merged-response uses fail closed emitter-side.
 """
 struct LikelihoodSpec
     family::LikelihoodFamily
@@ -319,6 +331,7 @@ struct LikelihoodSpec
     mixture_weights::Union{Nothing,Symbol,Vector{Float64}}
     nu::Union{Nothing,ParamName,Real}
     zi::Union{Nothing,ParamName,Real}
+    mi_jobs::Union{Nothing,ColumnRef}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
@@ -351,13 +364,14 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
             Union{Nothing,Symbol,Real,ScalePredictorRef}[],
         mixture_weights::Union{Nothing,Symbol,Vector{Float64}} = nothing,
         nu::Union{Nothing,ParamName,Real} = nothing,
-        zi::Union{Nothing,ParamName,Real} = nothing)
+        zi::Union{Nothing,ParamName,Real} = nothing,
+        mi_jobs::Union{Nothing,ColumnRef} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
         threshold_columns, threshold_coefs, extra_responses, factor_scales,
         factor_corr, glm_alpha, glm_beta, mixture_family, mixture_locs,
-        mixture_scales, mixture_weights, nu, zi)
+        mixture_scales, mixture_weights, nu, zi, mi_jobs)
 end
 
 """
@@ -2282,6 +2296,7 @@ function _validate_columns(plan::StructuralPlan)
         union!(managed, _kernel_managed_columns(kp))
     end
     union!(managed, _subject_predictor_columns(plan))
+    union!(managed, _mi_managed_columns(plan))
     for (name, col) in plan.columns
         # Kernel-managed columns (slices + scalar expansions) carry two
         # lengths by design — they validate under kernel rules, not here.
@@ -6071,6 +6086,91 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
     return nothing
 end
 
+# Case-A `mi()` responses a linear predictor observes through packed obs
+# slices: these columns ride the managed exemption (the kernel-managed
+# precedent), validated under mi rules instead of the uniform-`n_obs`
+# rule. The exemption names exactly the columns the `mi_jobs` field
+# points at, so a stray caller column cannot hide behind it.
+function _mi_managed_columns(plan::StructuralPlan)
+    out = Set{Symbol}()
+    for r in plan.responses
+        r.mi_jobs === nothing && continue
+        push!(out, r.response, r.mi_jobs)
+    end
+    return out
+end
+
+# v1 admits Gaussian/Gamma/Beta over a linear predictor, uncomposed.
+# Runs first in the per-response loop: every special predictor shape
+# (scan/plate/simplex/joint/GLM) `continue`s past the standard checks,
+# so the mi gate must precede them all.
+function _validate_mi_structure(r::LikelihoodSpec, plan::StructuralPlan)
+    r.mi_jobs === nothing && return nothing
+    (r.family === GaussianFam || r.family === GammaLogFam ||
+     r.family === BetaLogitFam) ||
+        _fail(r.label, "mi() missingness is Gaussian/Gamma/Beta only in " *
+              "v1 (got $(r.family) — SB's Univariate Continuous mirror)")
+    any(p -> p.name === r.predictor, plan.predictors) ||
+        _fail(r.label, "mi() response $(r.response) takes a linear " *
+              "predictor (scan/plate/simplex/joint/GLM locations compose " *
+              "in a later increment)")
+    pred = plan.predictors[findfirst(p -> p.name === r.predictor, plan.predictors)]
+    any(!isempty(t.columns) for t in pred.terms) ||
+        _fail(r.label, "mi() response $(r.response) takes a location " *
+              "predictor with a data column (intercept-only crosses no " *
+              "length-n anchor, so n_obs is underivable — deferred)")
+    r.weights === nothing ||
+        _fail(r.label, "mi() response $(r.response) takes no weights " *
+              "(SB's tested mi surface is uncomposed)")
+    r.evidence.kind === :none ||
+        _fail(r.label, "mi() response $(r.response) takes no " *
+              "censoring/truncation evidence (SB's tested mi surface is " *
+              "uncomposed)")
+    r.range === nothing ||
+        _fail(r.label, "mi() response $(r.response) takes no range " *
+              "(Jobs already selects the observed rows)")
+    r.trials === nothing ||
+        _fail(r.label, "mi() response $(r.response) takes no trials")
+    r.mi_jobs !== r.response ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must differ from " *
+              "the response column")
+    return nothing
+end
+
+function _validate_mi_data(r::LikelihoodSpec, plan::StructuralPlan)
+    r.mi_jobs === nothing && return nothing
+    haskey(plan.columns, r.mi_jobs) ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) missing")
+    jobs = plan.columns[r.mi_jobs]
+    jobs isa AbstractVector ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must be a vector, " *
+              "got $(summary(jobs))")
+    eltype(jobs) <: Integer && eltype(jobs) !== Bool ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must hold integers, " *
+              "got $(eltype(jobs))")
+    o = length(jobs)
+    o >= 1 || _fail(r.label,
+        "mi() Jobs column $(r.mi_jobs) is empty (at least one observed " *
+        "row is required)")
+    o < plan.n_obs || _fail(r.label,
+        "mi() Jobs column $(r.mi_jobs) covers every row (no missing " *
+        "values — drop the mi() wrapper)")
+    all(j -> 1 <= j <= plan.n_obs, jobs) ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must index " *
+              "1:n_obs ($(plan.n_obs))")
+    length(unique(jobs)) == o ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must not repeat " *
+              "rows (a repeated row would double-count its likelihood)")
+    issorted(jobs) ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must ascend " *
+              "(the emitter crosses findall order)")
+    yobs = _vector_column(plan.columns, r.response, r.label, "mi() response")
+    length(yobs) == o ||
+        _fail(r.label, "mi() response $(r.response) has $(length(yobs)) " *
+              "rows but Jobs selects $o (y_obs must align with Jobs exactly)")
+    return nothing
+end
+
 function _validate_responses(plan::StructuralPlan)
     # A kernel plate carries the only likelihood (panel v1): zero
     # top-level responses are admitted iff exactly one kernel plate is
@@ -6093,6 +6193,7 @@ function _validate_responses(plan::StructuralPlan)
     scan_states = Set{Symbol}(s.state for s in plan.scans)
     used_predictors = Set{Symbol}()
     for r in plan.responses
+        _validate_mi_structure(r, plan)
         # A mixture response validates whole (dedicated component slots;
         # the anchor is polymorphic, so this branch leads the scan-state
         # and plate-param checks below).
@@ -6225,6 +6326,7 @@ end
 
 function _validate_response_data(plan::StructuralPlan)
     for r in plan.responses
+        _validate_mi_data(r, plan)
         _validate_response_column(r, plan)
         _validate_scale_data(r, plan)
         _validate_weights(r, plan)
@@ -7444,6 +7546,23 @@ be consumed. Columns are vectors or matrices (whole-design data, Stan
 numeric eltype; every per-observation role reads vectors only and fails
 closed on a matrix.
 """
+# n_obs derivation skips mi-managed columns (packed y_obs/Jobs): every
+# other column crosses at length n, so the first non-managed column
+# pins n_obs order-independently. All-managed (an mi response whose
+# location crosses no full-length column) fails closed — n is
+# underivable, and the structure gate already rejects that shape, so
+# this is unreachable past validation (defense in depth for direct
+# bind_data callers).
+function _bind_nrows(columns::AbstractDict{Symbol}, managed::Set{Symbol})
+    for (k, v) in columns
+        k in managed && continue
+        return _column_nrows(v)
+    end
+    throw(ContractValidationError(
+        "[bind] cannot derive n_obs: every crossed column is mi-managed " *
+        "(an mi-only column set carries no length-n anchor)"))
+end
+
 function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}())
@@ -7509,10 +7628,13 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     merged = merge(inferred, roles)
     # Kernel plans carry two column lengths by design: n_obs is the flat
     # length (vector models) or n_sub (all-scalar) — never first-column.
-    # Otherwise n_obs is the first column's ROW count (length for vectors).
+    # Otherwise n_obs is the first NON-managed column's ROW count (length
+    # for vectors): mi packs y_obs/Jobs short by design, and Dict order
+    # is not a crossing contract (deriving from a packed column fails
+    # every full-length column by order luck).
     # Grouped plans set n_obs to the primary (first-obs) response length.
     n = if isempty(kbases)
-        _column_nrows(first(values(columns)))
+        _bind_nrows(columns, _mi_managed_columns(plan))
     else
         gkp = only(kbases)
         if _is_grouped_kernel(gkp)
