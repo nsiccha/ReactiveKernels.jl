@@ -1818,9 +1818,12 @@ end
         y1 .~ Normal.(mu, 1.0)
         y2 .~ Poisson.(exp.(mu))
     end, (:y1, :y2, :x))
-    # Coefficient prior discipline.
+    # Coefficient prior discipline (`Cauchy` coefficients were rejected
+    # under Normal-only admission; the prior-vocab slice admits
+    # per-addressee Cauchy — see test_prior_vocab.jl — so the rejection
+    # case moves to `Gamma`, which is not a coefficient family).
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        b ~ Cauchy(0, 1)
+        b ~ Gamma(1, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, Dn)
