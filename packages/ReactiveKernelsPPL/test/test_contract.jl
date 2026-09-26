@@ -237,6 +237,21 @@ function _hurdle_plan(n = 9)
     )
 end
 
+function _nb1_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([0, 1, 2], outer = cld(n, 3))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta, :p, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, LogLink, _terms(), :eta)],
+        _priors(:eta),
+        [SampledParameter(:p, :beta, (arg1 = 2.0, arg2 = 2.0), nothing, :p)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
 function _zip_plan(n = 9)
     cols = _columns(n)
     cols[:y] = repeat([0, 1, 2], outer = cld(n, 3))[1:n]
@@ -306,7 +321,8 @@ end
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
         MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
         PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
-        ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam)
+        ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
+        NegativeBinomialFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
@@ -600,6 +616,72 @@ end
     bad.columns[:p0c] = fill(1.5, 9)
     bad.responses[1] =
         LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, :p0c, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "nb1 response validation" begin
+    # NB1 requires its success probability p.
+    bad = _nb1_plan()
+    bad.responses[1] =
+        LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A p literal must lie in [0, 1] (the hurdle precedent; the kernel
+    # guards the open interval and returns -Inf at the endpoints).
+    for lit in (0.0, 0.4, 1.0)
+        good = _nb1_plan()
+        good.responses[1] =
+            LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta, lit, nothing,
+                _none_evidence(), :y_resp)
+        @test validate_plan(good) === nothing
+    end
+    for lit in (-0.1, 1.5, NaN, Inf)
+        bad = _nb1_plan()
+        bad.responses[1] =
+            LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta, lit, nothing,
+                _none_evidence(), :y_resp)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # Predictor-fed p is deferred (the BetaBinomial2 precedent), on
+    # every link.
+    for link in (IdentityLink, LogLink, LogitLink)
+        bad = _nb1_plan()
+        push!(bad.predictors, PredictorSpec(:ls, link, _terms(), :ls))
+        append!(bad.population_priors, _priors(:ls))
+        bad.responses[1] =
+            LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta,
+                ScalePredictorRef(:ls, link), nothing,
+                _none_evidence(), :y_resp)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # NB1 response must be non-negative integers (Bool excluded).
+    bad = _nb1_plan()
+    bad.columns[:y] = [0, 1, -1, 2, 0, 1, 3, 0, 2]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _nb1_plan()
+    bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _nb1_plan()
+    bad.columns[:y] = collect(1.0:9.0)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _nb1_plan()
+    bad.responses[1] =
+        LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta, :p, nothing,
+            ResponseEvidence(:truncated, 0, 4), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A per-observation p column binds in [0, 1].
+    good = _nb1_plan()
+    good.columns[:pc] = repeat([0.0, 0.5, 1.0], 3)
+    good.responses[1] =
+        LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta, :pc, nothing,
+            _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    bad = _nb1_plan()
+    bad.columns[:pc] = fill(1.5, 9)
+    bad.responses[1] =
+        LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta, :pc, nothing,
             _none_evidence(), :y_resp)
     @test_throws ContractValidationError validate_plan(bad)
 end

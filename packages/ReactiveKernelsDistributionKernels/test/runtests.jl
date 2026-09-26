@@ -19,10 +19,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     BETA_BINOMIAL_KERNEL_SOURCE,
     INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE,
     LKJ_CORR_CHOLESKY_KERNEL_SOURCE,
+    NEGATIVE_BINOMIAL_KERNEL_SOURCE,
     normal, cauchy, laplace, logistic, bernoulli, lognormal,
     exponential, geometric, uniform, mvnormal, ar1,
     categorical_logit, categorical_logit_ref,
-    negative_binomial2, beta_binomial,
+    negative_binomial2, beta_binomial, negative_binomial,
     inverse_gamma, dirichlet, lkj_corr_cholesky, zero_inflated_poisson,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 using Test
@@ -468,6 +469,31 @@ end
             nb2(2, -1.0, 1.5), nb2(2, 2.5, 0.0))
         @test !isnan(v)
     end
+end
+
+@testset "negative_binomial Stan lpmf parity" begin
+    # NB1(r, p) is Stan's neg_binomial(alpha = r, beta = p/(1-p)):
+    # failures before r successes — Distributions.NegativeBinomial is
+    # the direct independent oracle.
+    nb1 = prepare(negative_binomial.logpdf;
+        have = (:observed, :r, :p), want = :logpdf)
+    for (y, r, p) in ((0, 2.5, 0.4), (3, 2.5, 0.4), (7, 0.4, 0.9),
+            (1, 10.0, 0.05), (5, 3.0, 0.7))
+        @test nb1(y, r, p) ≈ logpdf(NegativeBinomial(r, p), y)
+    end
+    # Impossible events are -Inf, never NaN (lazy support guard).
+    @test nb1(-1, 2.5, 0.4) == -Inf
+    @test nb1(2, 0.0, 0.4) == -Inf
+    @test nb1(2, -1.0, 0.4) == -Inf
+    @test nb1(2, 2.5, 0.0) == -Inf
+    @test nb1(2, 2.5, 1.0) == -Inf
+    @test nb1(0, 2.5, 1.0) == -Inf
+    @test nb1(2, 2.5, 1.5) == -Inf
+    for v in (nb1(-1, 2.5, 0.4), nb1(2, 0.0, 0.4), nb1(2, -1.0, 0.4),
+            nb1(2, 2.5, 0.0), nb1(2, 2.5, 1.0), nb1(2, 2.5, 1.5))
+        @test !isnan(v)
+    end
+    @test occursin("@kernel negative_binomial", NEGATIVE_BINOMIAL_KERNEL_SOURCE)
 end
 
 @testset "zero_inflated_poisson Stan lpmf parity" begin
