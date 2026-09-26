@@ -4037,15 +4037,16 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
         return _lower_leveled_response(lhs, call, range, weights, evidence,
             ctx, predictors, pred_idx, coefuse)
     end
-    family, lik_link, pred_link, loc, scale_raw, trials, nu_raw =
+    family, lik_link, pred_link, loc, scale_raw, trials, nu_raw, zi_raw =
         _lower_response_base(lhs, call, ctx)
     pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
     nu = _lower_nu_use(lhs, nu_raw, ctx)
+    zi = _lower_zi_use(lhs, zi_raw, ctx)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
-        evidence, Symbol(lhs, "_resp"), trials, range; nu = nu)
+        evidence, Symbol(lhs, "_resp"), trials, range; nu = nu, zi = zi)
 end
 
 # Run `thunk()`; on a surface failure, attribute it to mixture component
@@ -4174,7 +4175,8 @@ end
 function _mixture_spine_arg(lhs, f, i, a)
     link_pos = ((f === :Bernoulli || f === :Poisson) && i == 1) ||
         (f === :Binomial && i == 2) ||
-        (f === :NegativeBinomial2 && i == 1)
+        (f === :NegativeBinomial2 && i == 1) ||
+        (f === :ZeroInflatedPoisson && i == 1)
     link_pos || return a
     a isa Expr && a.head === :. || return a # A bare mean passes through.
     return _dot2call_nested_link(lhs, a, f)
@@ -4185,7 +4187,9 @@ end
 # positions route through `_lower_response_base` (identical behavior +
 # messages); bare positions construct directly. Normal (identity link)
 # always routes through base with `wrapped` marking the predictor-bound
-# shape instead. Returns the base 6-tuple plus `wrapped`.
+# shape instead. Returns the base leading tuple plus `wrapped`
+# (trailing auxiliary slots are dropped — mixture components carry
+# their own).
 function _lower_mixture_component(lhs, compcall::Expr, ctx)
     head = compcall.args[1]
     head isa Symbol || _sfail("response $lhs: malformed mixture " *
@@ -4743,7 +4747,8 @@ function _dot2call_object_error(lhs, rhs)
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol && rhs.args[1] in
             (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
-                :Gamma, :Beta, :BernoulliLogit, :PoissonLog, :BinomialLogit,
+                :Gamma, :Beta, :ZeroInflatedPoisson, :BernoulliLogit,
+                :PoissonLog, :BinomialLogit,
                 :NegativeBinomial2Log, :GammaLog, :BetaLogit,
                 :CategoricalLogit, :OrderedLogistic, :Ordinal,
                 :Multinomial, :Categorical, :weighted, :truncated, :censored,
@@ -4770,6 +4775,8 @@ function _dot2call_spine_arg(lhs, f, i, a)
     elseif f === :NegativeBinomial2 && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :HurdlePoisson && i == 1
+        return _dot2call_nested_link(lhs, a, f)
+    elseif f === :ZeroInflatedPoisson && i == 1
         return _dot2call_nested_link(lhs, a, f)
     end
     # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
@@ -4893,6 +4900,7 @@ const _RESPONSE_BASE_MSG =
     "`probit`/`cloglog` for the link), " *
     "`NegativeBinomial2.(exp.(eta), phi)`, " *
     "`HurdlePoisson.(exp.(eta), p_zero)`, " *
+    "`ZeroInflatedPoisson.(exp.(eta), zi)`, " *
     "`Gamma.(alpha, exp.(eta) ./ alpha)`, " *
     "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`, " *
     "`CategoricalLogit.(eta_2, ..., eta_K)`, `OrderedLogistic.(eta)`, " *
@@ -4911,52 +4919,63 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         _sfail("`weighted.(...)` goes outermost: " *
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
     fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
-        :NegativeBinomial2, :Gamma, :Beta, :HurdlePoisson) ||
+        :NegativeBinomial2, :Gamma, :Beta, :HurdlePoisson,
+        :ZeroInflatedPoisson) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
         return GaussianFam, IdentityLink, IdentityLink, args[1], args[2],
-        nothing, nothing
+        nothing, nothing, nothing
     elseif fam === :StudentT
         length(args) == 3 || _sfail("response $lhs: `StudentT` takes " *
                                     "`StudentT.(nu, mu, sigma)`")
         return StudentTFam, IdentityLink, IdentityLink, args[2], args[3],
-        nothing, args[1]
+        nothing, args[1], nothing
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link)")
         f, l, loc = _lower_bernoulli_link(lhs, args[1])
-        return f, l, IdentityLink, loc, nothing, nothing, nothing
+        return f, l, IdentityLink, loc, nothing, nothing, nothing, nothing
     elseif fam === :Binomial
         length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
                                     "`Binomial.(n, logistic.(mu))` (or `probit`/`cloglog` for the link)")
         f, l, loc = _lower_binomial_link(lhs, args[2])
         return f, l, IdentityLink, loc, nothing,
-        _lower_trials(lhs, args[1], ctx), nothing
+        _lower_trials(lhs, args[1], ctx), nothing, nothing
     elseif fam === :NegativeBinomial2
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial2` takes " *
                                     "`NegativeBinomial2.(exp.(eta), phi)`")
         return NegativeBinomial2Fam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing
+        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        nothing
     elseif fam === :Gamma
         loc, scale = _lower_gamma_args(lhs, args, ctx)
-        return GammaLogFam, LogLink, LogLink, loc, scale, nothing, nothing
+        return GammaLogFam, LogLink, LogLink, loc, scale, nothing, nothing,
+        nothing
     elseif fam === :Beta
         loc, scale = _lower_beta_args(lhs, args, ctx)
         return BetaLogitFam, LogitLink, IdentityLink, loc, scale, nothing,
-        nothing
+        nothing, nothing
     elseif fam === :HurdlePoisson
         length(args) == 2 || _sfail("response $lhs: `HurdlePoisson` takes " *
                                     "`HurdlePoisson.(exp.(eta), p_zero)`")
         return HurdlePoissonFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing
+        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        nothing
+    elseif fam === :ZeroInflatedPoisson
+        length(args) == 2 || _sfail("response $lhs: `ZeroInflatedPoisson` takes " *
+                                    "`ZeroInflatedPoisson.(exp.(eta), zi)`")
+        return ZeroInflatedPoissonFam, LogLink, LogLink,
+        _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
+        args[2]
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
         return PoissonLogFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing
+        _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
+        nothing
     end
 end
 
@@ -5066,6 +5085,9 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :hurdle_poisson && _sfail("response $lhs: use " *
                                       "`HurdlePoisson` (the response " *
                                       "spelling, not the kernel endpoint)")
+    fam === :zero_inflated_poisson && _sfail("response $lhs: use " *
+                                 "`ZeroInflatedPoisson` (the response " *
+                                 "spelling, not the kernel endpoint)")
     fam === :OrderedLogit && _sfail("response $lhs: unknown distribution " *
                                     "`:OrderedLogit` (write " *
                                     "`OrderedLogistic.(eta)`)")
@@ -5075,7 +5097,8 @@ function _lower_response_base_error(lhs, rhs, fam)
         "row-grouped, never broadcast)")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
-                  "NegativeBinomial2, HurdlePoisson, Gamma, Beta, BernoulliLogit, " *
+                  "NegativeBinomial2, HurdlePoisson, Gamma, Beta, " *
+                  "ZeroInflatedPoisson, BernoulliLogit, " *
                   "PoissonLog, BinomialLogit, NegativeBinomial2Log, " *
                   "GammaLog, BetaLogit, CategoricalLogit, " *
                   "OrderedLogistic, Ordinal, Multinomial, Categorical, " *
@@ -5175,6 +5198,29 @@ function _lower_nu_use(lhs, s, ctx)
         return s
     end
     return _sfail("response $lhs nu must be a bare parameter/assignment " *
+                  "name or a literal (bind expressions via an assignment " *
+                  "first), got $(repr(s))")
+end
+
+# ZIP zi use-site lowering: a bare parameter/assignment name or a
+# literal, scalar only — no per-observation columns (a column name fails
+# at the contract's unknown-name gate), no predictor-fed zi (a modeled
+# zi submodel is deferred), no expressions (bind via an assignment
+# first).
+function _lower_zi_use(lhs, s, ctx)
+    s === nothing && return nothing
+    s isa Real && return s
+    if s isa Symbol
+        # Bare use: stated-prior aliases are scalar zi, like a bare
+        # scale — only undeclared/vector/factor defs count as
+        # predictor-fed here.
+        _is_scale_predictor_def(s, ctx, false) && _sfail(
+            "response $lhs zi $s is a predictor definition — " *
+            "predictor-fed zi (a modeled zi submodel) is deferred: use " *
+            "a scalar zi (parameter or literal)")
+        return s
+    end
+    return _sfail("response $lhs zi must be a bare parameter/assignment " *
                   "name or a literal (bind expressions via an assignment " *
                   "first), got $(repr(s))")
 end
