@@ -522,6 +522,52 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+function _gen_nb1_plan(; p = :p)
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    params = p isa Symbol ? SampledParameter[
+        SampledParameter(:p, :beta, (arg1 = 2.0, arg2 = 2.0), nothing, :p)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta,
+            p, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_nb1(cols, coef, p)
+    rr = exp.(coef[1] .+ coef[2] .* cols[:x])
+    return sum(logpdf(NegativeBinomial(v, p), y)
+        for (y, v) in zip(cols[:y], rr))
+end
+
+@testset "nb1 values and gradient" begin
+    plan = _gen_nb1_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_nb1(plan.columns, Vector(nt.eta), nt.p)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Beta(2.0, 2.0), nt.p)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "nb1 literal-p values" begin
+    plan = _gen_nb1_plan(; p = 0.4)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_nb1(plan.columns, Vector(nt.eta), 0.4)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
 # Two-term log-sum-exp for the zero-arm oracle (stable; no new test dep).
 _zi_logaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
 

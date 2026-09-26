@@ -489,6 +489,89 @@ end
     end, Dn2)
 end
 
+@testset "surface roundtrip nb1 end to end" begin
+    cols, _ = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    # Literal p.
+    m = @rkppl begin
+        eta = a .+ b .* x
+        y .~ NegativeBinomial.(exp.(eta), 0.4)
+    end
+    @test m isa RKPPLModel
+    r = only(lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ NegativeBinomial.(exp.(eta), 0.4)
+    end, (:y, :x)).responses)
+    @test (r.family, r.link, r.predictor, r.scale) ===
+        (NegativeBinomialFam, LogLink, :eta, 0.4)
+    bound = m(; y = cols[:y], x = cols[:x])
+    @test isbound(bound)
+    built = build_kernel(bound)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    rr = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    ll = sum(logpdf(NegativeBinomial(v, 0.4), y)
+        for (y, v) in zip(cols[:y], rr))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    # Beta-sampled p.
+    m = @rkppl begin
+        p ~ Beta(2.0, 2.0)
+        eta = a .+ b .* x
+        y .~ NegativeBinomial.(exp.(eta), p)
+    end
+    r = only(lower_rkppl(quote
+        p ~ Beta(2.0, 2.0)
+        eta = a .+ b .* x
+        y .~ NegativeBinomial.(exp.(eta), p)
+    end, (:y, :x)).responses)
+    @test (r.family, r.scale) === (NegativeBinomialFam, :p)
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    u3 = [0.5, -0.25, 0.3]
+    nt = constrain(built.layout, u3)
+    rr = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    ll = sum(logpdf(NegativeBinomial(v, nt.p), y)
+        for (y, v) in zip(cols[:y], rr))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+        logpdf(Beta(2.0, 2.0), nt.p)
+    # Unit-transform Jacobian, explicit (the zip `_zi_unit_jac` precedent).
+    lj = log(nt.p) + log1p(-nt.p)
+    @test _query(built.spec, bound, :posterior, u3) ≈ ll + pr + lj
+    _check_gradient(built.spec, bound, u3)
+end
+
+@testset "nb1 response failures" begin
+    Dn2 = (:y, :x)
+    # Arity: exactly (r, p).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ NegativeBinomial.(exp.(eta))
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ NegativeBinomial.(exp.(eta), 0.4, 1.0)
+    end, Dn2)
+    # The kernel-endpoint spelling redirects to the response head.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ negative_binomial.(exp.(eta), 0.4)
+    end, Dn2)
+    # The r position needs its `exp.` link wrapper (NB2 precedent).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ NegativeBinomial.(eta, 0.4)
+    end, Dn2)
+    # A predictor-fed p fails at the contract gate (deferred, the
+    # BetaBinomial2 precedent — scalar p only in v1).
+    @test_throws ContractValidationError lower_rkppl(quote
+        eta = a .+ b .* x
+        hu = c .+ d .* x
+        y .~ NegativeBinomial.(exp.(eta), logistic.(hu))
+    end, Dn2)
+end
+
 @testset "surface roundtrip zip end to end" begin
     cols, _ = _gen_columns()
     cols[:y] = [0, 1, 2, 0, 3, 1]

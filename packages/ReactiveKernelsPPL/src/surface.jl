@@ -4967,6 +4967,8 @@ function _dot2call_spine_arg(lhs, f, i, a)
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :NegativeBinomial2 && i == 1
         return _dot2call_nested_link(lhs, a, f)
+    elseif f === :NegativeBinomial && i == 1
+        return _dot2call_nested_link(lhs, a, f)
     elseif f === :HurdlePoisson && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :ZeroInflatedPoisson && i == 1
@@ -5096,6 +5098,7 @@ const _RESPONSE_BASE_MSG =
     "`Poisson.(exp.(eta))`, `Binomial.(n, logistic.(mu))` (or " *
     "`probit`/`cloglog` for the link), " *
     "`NegativeBinomial2.(exp.(eta), phi)`, " *
+    "`NegativeBinomial.(exp.(eta), p)`, " *
     "`HurdlePoisson.(exp.(eta), p_zero)`, " *
     "`ZeroInflatedPoisson.(exp.(eta), zi)`, " *
     "`InverseGaussian.(exp.(eta), lambda)`, " *
@@ -5119,7 +5122,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         _sfail("`weighted.(...)` goes outermost: " *
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
     fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
-        :NegativeBinomial2, :Gamma, :Beta, :HurdlePoisson,
+        :NegativeBinomial2, :NegativeBinomial, :Gamma, :Beta, :HurdlePoisson,
         :ZeroInflatedPoisson, :InverseGaussian, :BetaBinomial2,
         :VonMises, :CircularVonMises) ||
         return _lower_response_base_error(lhs, rhs, fam)
@@ -5150,6 +5153,12 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial2` takes " *
                                     "`NegativeBinomial2.(exp.(eta), phi)`")
         return NegativeBinomial2Fam, LogLink, LogLink,
+        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        nothing, nothing
+    elseif fam === :NegativeBinomial
+        length(args) == 2 || _sfail("response $lhs: `NegativeBinomial` takes " *
+                                    "`NegativeBinomial.(exp.(eta), p)`")
+        return NegativeBinomialFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
         nothing, nothing
     elseif fam === :Gamma
@@ -5303,6 +5312,9 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :negative_binomial2 && _sfail("response $lhs: use " *
                                           "`NegativeBinomial2` (the response " *
                                           "spelling, not the kernel endpoint)")
+    fam === :negative_binomial && _sfail("response $lhs: use " *
+                                        "`NegativeBinomial` (the response " *
+                                        "spelling, not the kernel endpoint)")
     fam === :student_t && _sfail("response $lhs: use " *
                                  "`StudentT` (the response " *
                                  "spelling, not the kernel endpoint)")
@@ -5333,7 +5345,8 @@ function _lower_response_base_error(lhs, rhs, fam)
         "row-grouped, never broadcast)")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
-                  "NegativeBinomial2, HurdlePoisson, ZeroInflatedPoisson, " *
+                  "NegativeBinomial2, NegativeBinomial, " *
+                  "HurdlePoisson, ZeroInflatedPoisson, " *
                   "InverseGaussian, BetaBinomial2, VonMises, " *
                   "CircularVonMises, Gamma, Beta, " *
                   "BernoulliLogit, " *

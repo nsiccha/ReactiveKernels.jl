@@ -50,11 +50,13 @@ export BETA_BINOMIAL_KERNEL_SOURCE
 export INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE
 export LKJ_CORR_CHOLESKY_KERNEL_SOURCE
 export ZERO_INFLATED_POISSON_KERNEL_SOURCE
+export NEGATIVE_BINOMIAL_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial, negative_binomial2
 export beta_binomial
 export inverse_gamma, dirichlet, lkj_corr_cholesky, zero_inflated_poisson
+export negative_binomial
 export BERNOULLI_LOGIT_GLM_KERNEL_SOURCE, BERNOULLI_LOGIT_GLM_SOURCE
 export bernoulli_logit_glm
 export POISSON_LOG_GLM_KERNEL_SOURCE, POISSON_LOG_GLM_SOURCE
@@ -71,6 +73,7 @@ export NEGATIVE_BINOMIAL2_SOURCE
 export BETA_BINOMIAL_SOURCE
 export INVERSE_GAMMA_SOURCE, DIRICHLET_SOURCE, LKJ_CORR_CHOLESKY_SOURCE
 export ZERO_INFLATED_POISSON_SOURCE
+export NEGATIVE_BINOMIAL_SOURCE
 
 const LOCATION_SCALE_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
@@ -538,6 +541,33 @@ using LogExpFunctions: log1p
 end
 """
 
+# Failures-before-successes count family: Stan's `neg_binomial(alpha,
+# beta)` over Distributions.jl's `NegativeBinomial(r, p)` (r
+# successes-shape, p success probability; alpha = r, beta = p/(1-p)).
+# BRM's NB1 response role (`y ~ NegativeBinomial(r, p)` with a `log(r)`
+# predictor and a data success probability). `logpdf` is the FULL Stan
+# lpmf including all loggamma constants (Stan `propto=false` keeps them;
+# cross-backend absolute-value comparison is load-bearing on this),
+# spelled directly in the (r, p) HAVE — no (alpha, beta) round trip. The
+# support guard is a LAZY branch, so nothing is evaluated on an invalid
+# side (docs/src/constraints.md). No cdf/quantile (discrete inversion);
+# only `logpdf` is exposed (the NB2 precedent).
+const NEGATIVE_BINOMIAL_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
+using LogExpFunctions: log1p
+
+@kernel negative_binomial(r::Float64, p::Float64) = begin
+    logpdf(observed::Int)::Float64 = begin
+        valid::Bool = (observed >= 0) & (r > 0) & (p > 0) & (p < 1)
+        y::Float64 = Float64(observed)
+        valid ?
+            (loggamma(y + r) - loggamma(r) - loggamma(y + 1.0) +
+             r * log(p) + y * log1p(-p)) :
+            -Inf
+    end
+end
+"""
+
 # Overdispersed count family over 0..n trials: Stan's
 # `beta_binomial(n, alpha, beta)` with the FULL lpmf including the binomial
 # coefficient and both lbeta terms (Stan `propto=false` keeps them;
@@ -682,12 +712,14 @@ const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
           BETA_BINOMIAL_KERNEL_SOURCE,
           INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE,
           LKJ_CORR_CHOLESKY_KERNEL_SOURCE,
-          ZERO_INFLATED_POISSON_KERNEL_SOURCE), "\n"),
+          ZERO_INFLATED_POISSON_KERNEL_SOURCE,
+          NEGATIVE_BINOMIAL_KERNEL_SOURCE), "\n"),
     (:bernoulli, :lognormal, :exponential, :geometric, :uniform, :mvnormal, :ar1,
      :categorical_logit, :categorical_logit_ref,
      :poisson, :gamma, :beta, :binomial, :negative_binomial2,
      :beta_binomial,
-     :inverse_gamma, :dirichlet, :lkj_corr_cholesky, :zero_inflated_poisson),
+     :inverse_gamma, :dirichlet, :lkj_corr_cholesky, :zero_inflated_poisson,
+     :negative_binomial),
 )
 const bernoulli = _OTHER_DISTRIBUTION_BINDINGS[1]
 const lognormal = _OTHER_DISTRIBUTION_BINDINGS[2]
@@ -708,6 +740,7 @@ const inverse_gamma = _OTHER_DISTRIBUTION_BINDINGS[16]
 const dirichlet = _OTHER_DISTRIBUTION_BINDINGS[17]
 const lkj_corr_cholesky = _OTHER_DISTRIBUTION_BINDINGS[18]
 const zero_inflated_poisson = _OTHER_DISTRIBUTION_BINDINGS[19]
+const negative_binomial = _OTHER_DISTRIBUTION_BINDINGS[20]
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""
 
@@ -1211,6 +1244,36 @@ docs_example = (;
     kernel = zero_inflated_poisson_kernel,
     output,
     plated = zero_inflated_poisson_plated,
+    plate_inputs,
+    plate_output,
+)
+"""
+
+const NEGATIVE_BINOMIAL_SOURCE = NEGATIVE_BINOMIAL_KERNEL_SOURCE * raw"""
+
+negative_binomial_kernel = prepare(negative_binomial.logpdf;
+    have = (:observed, :r, :p), want = :logpdf)
+negative_binomial_plated = plate(negative_binomial.logpdf;
+    have = (:observed, :r, :p), want = :logpdf, batched = (:observed,))
+
+observed = 3
+r = 2.5
+p = 0.4
+inputs = (; observed, r, p)
+output = negative_binomial_kernel(Tuple(inputs)...)
+
+plate_observed = [0, 1, 3, 7]
+plate_inputs = (; observed = plate_observed, r, p)
+plate_output = negative_binomial_plated(Tuple(plate_inputs)...)
+
+docs_example = (;
+    name = :negative_binomial_stan,
+    origin = "NB1 count object with Stan neg_binomial(alpha, beta) semantics (build executed)",
+    inputs,
+    spec = negative_binomial.logpdf,
+    kernel = negative_binomial_kernel,
+    output,
+    plated = negative_binomial_plated,
     plate_inputs,
     plate_output,
 )

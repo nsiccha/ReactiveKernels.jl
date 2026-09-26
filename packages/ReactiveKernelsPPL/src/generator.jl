@@ -80,6 +80,7 @@ using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
     beta, inverse_gamma, binomial, negative_binomial2, beta_binomial,
+    negative_binomial,
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson,
     gp_exp_quad_cov, gp_chol_latent,
@@ -1060,6 +1061,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _binomial_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomial2Fam
         return _nb2_plate_stmts(r, plan, node, pw)
+    elseif r.family === NegativeBinomialFam
+        return _nb1_plate_stmts(r, plan, node, pw)
     elseif r.family === GammaLogFam
         return _gamma_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliProbitFam
@@ -1736,6 +1739,33 @@ function _nb2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     yv, muv = _dovar(1), _dovar(2)
     phiref = _thread_ref!(inputs, sarg)
     cell = :(negative_binomial2($muv, $phiref).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# NB1 likelihood (SB `neg_binomial` mirror): the successes-shape r
+# precomputes outside the cell (`_ppl_r_`, the NB2 `_ppl_mu_`
+# precedent — a computed `exp` constructor arg miscompiles the Enzyme
+# pullback); the success probability p threads scalar or per-obs via
+# `_scale_plate_arg` (predictor-fed p is deferred at the contract
+# gate, the BetaBinomial2 precedent). Weights multiply the cell (the
+# NB2 precedent). No whole-vector fusion yet — a perf-lane follow-up,
+# not this slice.
+_nb1_r_name(label::Symbol) = Symbol(:_ppl_r_, label)
+
+function _nb1_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    rr = _nb1_r_name(r.label)
+    pre = Expr[:($rr = exp.($lp))]
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, rr]
+    yv, rv = _dovar(1), _dovar(2)
+    pref = _thread_ref!(inputs, sarg)
+    cell = :(negative_binomial($rv, $pref).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
