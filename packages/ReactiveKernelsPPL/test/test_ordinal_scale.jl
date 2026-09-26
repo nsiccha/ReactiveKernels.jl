@@ -79,12 +79,15 @@ function _os_plan(; link = LogitLink, structure = :cumulative,
 end
 
 # Enzyme posterior gradient (the `_check_gradient` kernel without the FD
-# comparison — for equivalence checks between spellings).
+# comparison — for equivalence checks between spellings). World-age barrier
+# per the note on `_query` in test_generator.jl.
 function _os_gradient(spec, plan, u)
-    kern = prepare(spec; have = _have(plan), want = :posterior,
-        bound = _bound_nt(plan))
-    prep = prepare_ad(kern, _GEN_BACKEND, u; active = :unconstrained)
-    return ReactiveKernels.ad_value_and_gradient!(prep, similar(u), u)[2]
+    kern = Base.invokelatest(prepare, spec; have = _have(plan),
+        want = :posterior, bound = _bound_nt(plan))
+    prep = Base.invokelatest(prepare_ad, kern, _GEN_BACKEND, u;
+        active = :unconstrained)
+    return Base.invokelatest(ReactiveKernels.ad_value_and_gradient!, prep,
+        similar(u), u)[2]
 end
 
 @testset "ordinal modeled-scale admission" begin
