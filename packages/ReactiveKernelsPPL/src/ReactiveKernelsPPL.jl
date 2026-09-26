@@ -29,7 +29,8 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     MvNormalCholeskyFam, CensoredAddpropnormalFam, TgiCategoryFam,
     TgiResponseFam, TgiCensoredFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
-    ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam
+    ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
+    NegativeBinomialFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
     VaryingEffectTerm, SplineSummandTerm, HSGPSummandTerm,

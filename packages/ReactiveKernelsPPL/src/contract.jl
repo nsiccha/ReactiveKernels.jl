@@ -102,6 +102,7 @@ univariate components, SB `MixtureModel` mirror)."""
     InverseGaussianFam
     BetaBinomial2Fam
     VonMisesFam
+    NegativeBinomialFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -160,7 +161,7 @@ end
 A predictor-fed scale/shape use: the response's auxiliary (Gaussian
 sigma, NB2 dispersion phi, Gamma shape alpha, Student sigma, hurdle
 p_zero, VonMises concentration kappa; InverseGaussian lambda, Beta
-kappa, and BetaBinomial2 phi stay scalar-only) is a
+kappa, BetaBinomial2 phi, and NB1 p stay scalar-only) is a
 whole linear predictor, varying per observation.
 `predictor` names the
 [`PredictorSpec`](@ref) (planned exactly like a location predictor:
@@ -183,12 +184,14 @@ end
 One independent response. `scale` is the response's auxiliary —
 Gaussian sigma, NB2 dispersion phi, Gamma shape alpha, hurdle p_zero,
 InverseGaussian shape lambda, BetaBinomial2 precision phi, VonMises
-concentration kappa — either
+concentration kappa, NB1 success probability p — either
 scalar (parameter, assignment, folded literal, or a raw per-observation
 data column) or, for Gaussian/NB2/Gamma/Student/hurdle/VonMises only, a
 [`ScalePredictorRef`](@ref) (predictor-fed per-observation auxiliary);
 it must be `nothing` otherwise. A hurdle p_zero is a probability
-(scalar in [0, 1], predictor-fed logit-only). A VonMises kappa is
+(scalar in [0, 1], predictor-fed logit-only). An NB1 p is a probability
+too (scalar in [0, 1], or a raw per-observation data column;
+predictor-fed p deferred, the BetaBinomial2 precedent). A VonMises kappa is
 predictor-fed log-only (a concentration). An InverseGaussian
 lambda is scalar-only (predictor-fed lambda deferred, the Beta-kappa
 precedent); a BetaBinomial2 phi is scalar-only (predictor-fed phi
@@ -1443,6 +1446,7 @@ const ADMITTED_TRIPLES = (
     (InverseGaussianFam, LogLink, LogLink),
     (BetaBinomial2Fam, LogitLink, IdentityLink),
     (VonMisesFam, IdentityLink, IdentityLink),
+    (NegativeBinomialFam, LogLink, LogLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order; `:student_t`
@@ -1801,7 +1805,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
-    ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam)
+    ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
+    NegativeBinomialFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -6825,6 +6830,9 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     elseif r.family === NegativeBinomial2Fam
         _is_count_column(col) && return nothing
         return _fail(r.label, "NB2 response must be non-negative integers")
+    elseif r.family === NegativeBinomialFam
+        _is_count_column(col) && return nothing
+        return _fail(r.label, "NB1 response must be non-negative integers")
     elseif r.family === HurdlePoissonFam
         _is_count_column(col) && return nothing
         return _fail(r.label, "Hurdle response must be non-negative integers")
@@ -7014,7 +7022,8 @@ _scale_need(fam::LikelihoodFamily) =
     fam === HurdlePoissonFam ? "Hurdle response requires a hurdle probability p_zero" :
     fam === InverseGaussianFam ? "InverseGaussian response requires a shape lambda" :
     fam === BetaBinomial2Fam ? "BetaBinomial2 response requires a precision phi" :
-    fam === VonMisesFam ? "VonMises response requires a concentration kappa" : nothing
+    fam === VonMisesFam ? "VonMises response requires a concentration kappa" :
+    fam === NegativeBinomialFam ? "NB1 response requires a success probability p" : nothing
 
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     need = _scale_need(r.family)
@@ -7041,6 +7050,10 @@ function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
         if fam === HurdlePoissonFam
             (isfinite(s) && 0 <= s <= 1) ||
                 _fail(r.label, "$what literal must lie in [0, 1] (a hurdle probability)")
+            return nothing
+        elseif fam === NegativeBinomialFam
+            (isfinite(s) && 0 <= s <= 1) ||
+                _fail(r.label, "$what literal must lie in [0, 1] (an NB1 success probability)")
             return nothing
         end
         (isfinite(s) && s > 0) ||
@@ -7086,6 +7099,10 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
     fam === BetaBinomial2Fam && _fail(r.label,
         "BetaBinomial2 response with a scale predictor: predictor-fed " *
         "precision (phi) is deferred — use a scalar phi (parameter or literal)")
+    fam === NegativeBinomialFam && _fail(r.label,
+        "NB1 response with a scale predictor: predictor-fed " *
+        "success probability (p) is deferred — use a scalar p (parameter, " *
+        "literal, or data column)")
     (fam === GaussianFam || fam === NegativeBinomial2Fam ||
         fam === GammaLogFam || fam === StudentTFam ||
         fam === HurdlePoissonFam || fam === VonMisesFam) ||
@@ -7150,6 +7167,11 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
         (eltype(col) <: Real && all(isfinite, col) &&
             all(x -> 0 <= x <= 1, col)) ||
             _fail(r.label, "per-observation p_zero $s must be finite " *
+                "numerics in [0, 1]")
+    elseif r.family === NegativeBinomialFam
+        (eltype(col) <: Real && all(isfinite, col) &&
+            all(x -> 0 <= x <= 1, col)) ||
+            _fail(r.label, "per-observation NB1 p $s must be finite " *
                 "numerics in [0, 1]")
     else
         (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
