@@ -416,6 +416,84 @@ end
     _pv_enzyme_check(_PV_M4, _pv_gcols(), (mu = [0.3, -0.4, 0.1, 0.75],))
 end
 
+@testset "prior vocab SB parity" begin
+    # Peer literals: `BayesianRegressionModels:rk:parity-prior-vocab`
+    # brief `2026-09-26T22-18-21-872-8yw5i7` (BRM `ff5e589`, SB `24578c3`,
+    # BridgeStan 2.9.0; `propto=false`, `jacobian=true`; SB-vs-oracle
+    # ~1e-15, central-diff ≤7e-10). RK lane `fade3b9`. Conventions:
+    # full posterior with constants, log-Jacobian included.
+    _pv_sb_check(prog, cols, q, sbv, sbg) = begin
+        _, _, kern, lay = _pv_query(prog, cols)
+        @test _pv_posterior(kern, lay, q) ≈ sbv rtol = 1e-12
+        g = _pv_enzyme_check(prog, cols, q)
+        @test g ≈ sbg rtol = 1e-9
+    end
+    # P1: StudentT intercept + Laplace slope.
+    _pv_sb_check(_PV_M1, _pv_cols(), (mu = [0.5, -0.25], s = 1.3),
+        -15.676861749966013,
+        [5.393491124260353, 1.998520710059171, 3.491050295857985])
+    # P2: Cauchy intercept + Flat slope (Flat is exactly 0.0 both sides).
+    _pv_sb_check(quote
+            mu = a .+ b .* x
+            y .~ Normal.(mu, s)
+            a ~ Cauchy(0, 1)
+            b ~ Flat()
+            s ~ Exponential(1)
+        end, _pv_cols(), (mu = [0.5, -0.25], s = 1.3),
+        -14.388851106658095,
+        [4.7473372781065075, 0.9985207100591711, 3.491050295857985])
+    # P3: factor StudentT broadcast + Cauchy slope, fixed s = 1.5 (SB
+    # native order is [slope, cats]; the literal below is already in RK
+    # [c1, c2, c3, b] order).
+    _pv_sb_check(_PV_M4, _pv_gcols(), (mu = [0.3, -0.4, 0.1, 0.75],),
+        -21.633064049357102,
+        [0.07852219465122685, 3.2093567251461983, 1.5444721990933479,
+            -2.565555555555555])
+    # P4: Uniform(0.5, 1.5) response scale, default Normal population
+    # priors (SB `real<0.5,1.5>` is the same affine-logit leg).
+    _pv_sb_check(quote
+            mu = a .+ b .* x
+            y .~ Normal.(mu, s)
+            s ~ Uniform(0.5, 1.5)
+        end, _pv_cols(), (mu = [0.5, -0.25], s = 1.3),
+        -15.810050464119632,
+        [5.047337278106507, 1.248520710059171, -0.1334091943559405])
+    # P5: half-StudentT(4, 0, 1) scale — SB's `truncated(...; lower=0)`
+    # is the renormalized truncated distribution, matching RK
+    # `:positive` (exact +log(2)).
+    _pv_sb_check(quote
+            mu = a .+ b .* x
+            y .~ Normal.(mu, s)
+            s ~ truncated(StudentT(4, 0, 1), 0, Inf)
+        end, _pv_cols(), (mu = [0.5, -0.25], s = 1.3),
+        -14.883826525901483,
+        [5.047337278106507, 1.248520710059171, 3.305988784434435])
+    # P5 Stan-kernel twin: `:positive_stan` (emitter/hand path) is the
+    # unrenormalized declaration kernel — exactly SB minus log(2), same
+    # grads.
+    plan = lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ Normal.(mu, s)
+            s ~ truncated(StudentT(4, 0, 1), 0, Inf)
+        end, (:y, :x))
+    i = findfirst(p -> p.name === :s, plan.parameters)
+    p = plan.parameters[i]
+    plan.parameters[i] =
+        SampledParameter(p.name, p.family, p.args, :positive_stan, p.label)
+    validate_structure(plan)
+    bound = bind_data(plan, _pv_cols())
+    built = build_kernel(bound)
+    kern = prepare_query(built, bound, :sampler)
+    q = (mu = [0.5, -0.25], s = 1.3)
+    @test _pv_posterior(kern, built.layout, q) ≈
+        -14.883826525901483 - log(2) rtol = 1e-12
+    u = unconstrain(built.layout, q)
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    sampler_value_and_gradient!(prep, g, u)
+    @test g ≈ [5.047337278106507, 1.248520710059171, 3.305988784434435] rtol = 1e-9
+end
+
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _pv_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
