@@ -1936,13 +1936,14 @@ end
 # Sampled names one `:correlated` draws block contributes to the name
 # tables: the shared triple, or — stratified with known strata levels
 # (bound plans) — the per-stratum frames plus the shared `z_flat`.
-# Unbound stratified draws contribute the base triple as placeholders
-# (suffix-unique, so they can never falsely collide; the bound pass
-# checks the real per-stratum names).
+# Unbound stratified draws contribute only the shared `z_flat` (the
+# per-stratum names need S, unknown pre-bind — the bound pass checks
+# the real names, so no placeholder can falsely collide).
 function _varying_corr_table_names(d::VaryingDraws)
     st = d.strata
-    if st === nothing || st.levels === nothing
-        return collect(_varying_corr_names(d))
+    st === nothing && return collect(_varying_corr_names(d))
+    if st.levels === nothing
+        return [_varying_corr_names(d)[3]]
     end
     z = _varying_corr_names(d)[3]
     out = Symbol[z]
@@ -1982,10 +1983,19 @@ function _validate_varying_draws(plan::StructuralPlan)
     end
     # Slice ranges partition 1:K exactly once per draws (sorted: slice
     # order is free, columns are explicit), one slice per
-    # (draws, target), and no range is empty.
+    # (draws, target), and no range is empty. mm draws feed exactly
+    # one target (SB rejects `mm(...)` with a shared `|ID|` — defense
+    # in depth against emitter bugs; stratified multi-slice stays
+    # legal for `|ID|+gr`, which SB supports).
     for d in draws
         K = length(d.margins)
         own = [s for s in slices if s.draws === d.label]
+        if d.mm !== nothing
+            length(own) <= 1 ||
+                _fail(d.label, "multi-membership draws feed " *
+                      "$(length(own)) targets (SB rejects `mm(...)` with " *
+                      "a shared `|ID|` — one slice per mm draws block)")
+        end
         targets = [s.target for s in own]
         length(unique(targets)) == length(targets) ||
             _fail(d.label, "draws lists a target twice (one slice per " *
@@ -2111,17 +2121,13 @@ function _validate_draws_grouping(d::VaryingDraws, K::Int)
         M >= 2 ||
             _fail(d.label, "multi-membership draws need at least two " *
                   "grouping columns, got $M")
-        length(unique(mm.groups)) == M ||
-            _fail(d.label, "multi-membership grouping columns repeat " *
-                  "($(repr(mm.groups)))")
+        # Repeated groups/weights are degenerate but well-defined
+        # (slots are positional) and SB accepts them — no check.
         if mm.weights !== nothing
             W = length(mm.weights)
             W == M ||
                 _fail(d.label, "multi-membership draws list $W weight " *
                       "columns for $M groups (one per group, or omit all)")
-            length(unique(mm.weights)) == M ||
-                _fail(d.label, "multi-membership weight columns repeat " *
-                      "($(repr(mm.weights)))")
         end
         if K == 1 && _is_ones_margin(first(d.margins))
             d.kind === :intercept1 ||
