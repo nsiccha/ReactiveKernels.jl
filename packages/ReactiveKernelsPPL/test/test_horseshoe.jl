@@ -185,6 +185,16 @@ end
         end
         @test_throws SurfaceLoweringError lower_rkppl(bad, Set([:x1, :y]))
     end
+    # A horseshoe coefficient aliased as a scale stays loud (the
+    # single-assignment gate, ahead of scale admission).
+    aliased = quote
+        b1 ~ Horseshoe()
+        s = b1
+        mu = a .+ b1 .* x1
+        sigma ~ Exponential(1.0)
+        y .~ Normal.(mu, s)
+    end
+    @test_throws SurfaceLoweringError lower_rkppl(aliased, Set([:x1, :y]))
     # Structural coverage (hand-built plans): exactly one prior per key,
     # triples present with half-Cauchy geometry.
     good = lower_rkppl(_horseshoe_demo(), Set([:x1, :x2, :y]))
