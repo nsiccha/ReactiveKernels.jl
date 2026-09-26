@@ -400,8 +400,12 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
-    normal_priors = Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data && _is_normal_call(s.rhs))
+    # Sampled names usable as predictor coefficients: Normal-priored
+    # scalars plus per-coefficient `~ Horseshoe()` scalars (the
+    # horseshoe triple synthesis in `_lower_horseshoe_priors`).
+    coef_priors = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data &&
+            (_is_normal_call(s.rhs) || _is_horseshoe_call(s.rhs)))
     # Simplex parameters (`s ~ Dirichlet(...)`): the only names a
     # monotonic term accepts as its increments (checked during response
     # lowering, before `_lower_parameters` runs).
@@ -444,14 +448,14 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         delete!(canonmap, m.name)
     end
     # Structural definitions inline into predictors: anything transitively
-    # referencing a coefficient candidate (Normal-priored or free name).
+    # referencing a coefficient candidate (coef-priored or free name).
     # All other vector definitions stay symbolic as named locals.
-    structural = _structural_defs(det, data, canonmap, normal_priors,
+    structural = _structural_defs(det, data, canonmap, coef_priors,
         prior_names, plate_names)
     vecdefs = Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :vector)
     taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names,
         plate_names)
-    ctx = (; data, detmap = canonmap, prior_names, normal_priors, detshape,
+    ctx = (; data, detmap = canonmap, prior_names, coef_priors, detshape,
         vecdefs, structural, plate_names, absorbed = Set{Symbol}(),
         predictor_pins = pins, pins_used = Set{Symbol}(),
         pin_owner = Dict{Symbol,Symbol}(),
@@ -552,6 +556,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # ranges prove exact-once partition of 1:K.
     varying_slices = _finalize_varying_slices(ctx)
     r2d2set = Set{Symbol}(d.predictor for d in r2d2decls)
+    hsset = _horseshoe_predictors(sample, coefuse, predictors, r2d2set)
     for c in ctx.dar_coefs
         haskey(coefuse, c) && _sfail("$c is both a predictor coefficient " *
             "and a dar trajectory parameter — dar parameters are sampled " *
@@ -562,15 +567,18 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
             "splices via its `dar()` call, not as a coefficient (rename one)")
     end
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
-        ctx.matrices, r2d2set)
+        ctx.matrices, r2d2set, hsset)
     for (beta, (label, X)) in glmuse
         append!(priors, _lower_glm_beta_priors(label, beta, X, sample,
             ctx.matrices))
     end
     r2d2s, taus = _lower_r2d2_priors(r2d2decls, sample, coefuse, predictors,
         levelmaps, taken, ctx.matrices)
+    hses, hsparams = _lower_horseshoe_priors(sample, coefuse, predictors,
+        hsset, taken)
     params, paramsyms, dirichlets = _lower_parameters(sample, coefuse, ctx, glmuse)
     append!(params, taus)
+    append!(params, hsparams)
     plate_parameters = PlateParameter[
         _lower_plate_parameter(nm, rhs, rng, coefuse, ctx.matrices)
         for (nm, rhs, rng, _) in plate_specs]
@@ -648,8 +656,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         varying_slices = varying_slices,
         vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
-        kernel_plates = kplates, r2d2_priors = r2d2s, matrices = matrices,
-        event_lps = event_lps)
+        kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
+        matrices = matrices, event_lps = event_lps)
     validate_structure(plan)
     return plan
 end
@@ -871,6 +879,10 @@ _is_normal_call(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
     rhs.args[1] === :Normal
 
+_is_horseshoe_call(rhs) =
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+    rhs.args[1] === :Horseshoe
+
 # Dependency order over deterministic definitions (callee before caller;
 # cycles and unknown refs keep source order — cycles error downstream).
 function _det_topo_order(det, detmap)
@@ -903,17 +915,17 @@ const _KNOWN_VALUE_FNS = union(Set{Symbol}(ASSIGNMENT_FNS),
     Set{Symbol}((:ifelse,)))
 
 # Structural definitions: anything transitively referencing a coefficient
-# candidate (a Normal-priored sampled name or a free name — data, det,
+# candidate (a coef-priored sampled name or a free name — data, det,
 # per-cell latents, and other sampled names excluded). Structural
 # definitions inline into predictors; every other definition keeps its
 # binding as a kernel local.
-function _structural_defs(det, data, canonmap, normal_priors, prior_names,
+function _structural_defs(det, data, canonmap, coef_priors, prior_names,
         plate_names)
     detkeys = Set{Symbol}(nm for (nm, _) in det)
     structural = Set{Symbol}()
     for (nm, _) in det
         refs = _value_symbols(canonmap[nm])
-        if any(s -> s in normal_priors ||
+        if any(s -> s in coef_priors ||
                 _is_free_name(s, data, detkeys, prior_names, plate_names), refs)
             push!(structural, nm)
         end
@@ -5227,7 +5239,7 @@ _is_scale_predictor_def(s::Symbol, ctx, allow_stated::Bool) =
 # on a bare use (`allow_stated == false`): a direct stated name is a
 # parameter (`_lower_scale`), so its alias must be one too — routing
 # the alias to analysis would re-bucket the same prior by spelling.
-# Under a link wrapper (`allow_stated == true`) stated-Normal names
+# Under a link wrapper (`allow_stated == true`) stated coef-prior names
 # route to analysis like the location path's stated intercept priors
 # (`a ~ Normal(0, 5)` over `eta = a .+ b .* x`): the wrapper has no
 # scalar meaning, so the predictor path is the only spelling.
@@ -5241,7 +5253,7 @@ function _is_scalar_coef_def(s::Symbol, ctx, allow_stated::Bool)
     rhs in ctx.data && return false
     rhs in ctx.vecdefs && return false
     haskey(ctx.detmap, rhs) && return false
-    rhs in ctx.prior_names && (rhs ∉ ctx.normal_priors || !allow_stated) &&
+    rhs in ctx.prior_names && (rhs ∉ ctx.coef_priors || !allow_stated) &&
         return false
     rhs in ctx.plate_names && return false
     rhs in ctx.scan_states && return false
@@ -5467,7 +5479,7 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
 end
 
 # A latent-reading definition is a DESIGN predictor (not a latent transform)
-# when it has coefficient structure (a Normal-priored or free coefficient
+# when it has coefficient structure (a coef-priored or free coefficient
 # candidate), reads no scalar parameter (a non-coefficient sampled name
 # like the non-centered `tau` — any such read marks a latent transform),
 # and scales every latent it mentions by a coefficient (the SB `me`
@@ -5524,7 +5536,7 @@ function _summand_latent_scaled(core, ctx)
 end
 
 # Does a definition transitively read a scalar parameter (a sampled name
-# that is NOT a Normal-priored coefficient candidate)?
+# that is NOT a coefficient-prior candidate)?
 function _det_reads_param(name::Symbol, ctx)
     seen = Set{Symbol}((name,))
     stack = collect(_value_symbols(ctx.detmap[name]))
@@ -5532,7 +5544,7 @@ function _det_reads_param(name::Symbol, ctx)
         s = pop!(stack)
         s in seen && continue
         push!(seen, s)
-        s in ctx.prior_names && s ∉ ctx.normal_priors && return true
+        s in ctx.prior_names && s ∉ ctx.coef_priors && return true
         haskey(ctx.detmap, s) && append!(stack, _value_symbols(ctx.detmap[s]))
     end
     return false
@@ -5811,7 +5823,7 @@ function _classify_summand(pname, core, sign::Int, ctx)
     end
     detkeys = Set{Symbol}(keys(ctx.detmap))
     coefrefs = Symbol[s for s in _value_symbols(core)
-        if s in ctx.normal_priors ||
+        if s in ctx.coef_priors ||
             _is_free_name(s, ctx.data, detkeys, ctx.prior_names, ctx.plate_names)]
     length(coefrefs) > 1 && _sfail("predictor $pname: $(repr(core)) is " *
                                    "nonlinear in coefficients")
@@ -6181,7 +6193,7 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
                                        "computed scalar, not a sampled " *
                                        "coefficient (computed coefficients " *
                                        "are not in slice 1)")
-    core in ctx.prior_names && core ∉ ctx.normal_priors &&
+    core in ctx.prior_names && core ∉ ctx.coef_priors &&
         _sfail("predictor $pname: $core is a scalar parameter, not a " *
                "term — scalar parameters are not identified separately " *
                "from the intercept (bind the value to a column, " *
@@ -6305,7 +6317,7 @@ function _summand_kind(s::Symbol, ctx)
     s in ctx.data && return :data
     s in ctx.vecdefs && return :local
     haskey(ctx.detmap, s) && return :det
-    s in ctx.prior_names && s ∉ ctx.normal_priors && return :param
+    s in ctx.prior_names && s ∉ ctx.coef_priors && return :param
     s in ctx.plate_names && return :latent
     return :coef
 end
@@ -6368,7 +6380,8 @@ end
 # Plan order follows predictors, addressees in term order.
 function _lower_coefficient_priors(sample, coefuse, predictors,
         matrices::Dict{Symbol,DesignMatrix},
-        r2d2::Set{Symbol} = Set{Symbol}())
+        r2d2::Set{Symbol} = Set{Symbol}(),
+        hs::Set{Symbol} = Set{Symbol}())
     stated = Dict{Symbol,Any}()
     for s in sample
         haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
@@ -6388,8 +6401,10 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
     levelmaps = LevelMap[]
     for pred in predictors
         # R2D2 predictors carry their prior mass in the R2D2Prior
-        # (overrides included) — _lower_r2d2_priors, not here.
+        # (overrides included) — _lower_r2d2_priors, not here. Horseshoe
+        # predictors likewise — _lower_horseshoe_priors, not here.
         pred.name in r2d2 && continue
+        pred.name in hs && continue
         for t in pred.terms
             # Offsets carry no coefficient; latent terms carry a PlateParameter
             # whose prior lives on the plate parameter, not as a coefficient;
@@ -6499,6 +6514,158 @@ function _matrix_prior_arg(name, a, pname, K, role)
     _sfail("coefficient $name prior $role must be a literal or a " *
            "literal $K-vector (hierarchical coefficient priors are not " *
            "in slice 1), got $(repr(a))")
+end
+
+# Horseshoe predictors: any predictor with a stated scalar `~ Horseshoe()`
+# coefficient prior. Stated beside an `r2d2(...)` declaration, or outside
+# an intercept/continuous term, it fails here (one structured prior per
+# predictor; the flat slice covers scalar coefficients only).
+function _horseshoe_predictors(sample, coefuse, predictors,
+        r2d2::Set{Symbol})
+    by_pred = Dict{Symbol,PredictorSpec}(p.name => p for p in predictors)
+    out = Set{Symbol}()
+    for s in sample
+        haskey(coefuse, s.lhs) || continue
+        _is_horseshoe_call(s.rhs) || continue
+        s.levels === nothing && s.matrix === nothing || _sfail(
+            "coefficient $(s.lhs) takes a scalar `Horseshoe(...)` prior " *
+            "— sized (levels/matrix) horseshoe priors are not in slice 1")
+        for (pname, addr, _) in coefuse[s.lhs]
+            pred = get(by_pred, pname, nothing)
+            pred === nothing && continue
+            pname in r2d2 && _sfail(
+                "predictor $pname carries both `r2d2(...)` and a " *
+                "`~ Horseshoe()` coefficient prior — one structured " *
+                "prior per predictor")
+            scalar = any(pred.terms) do t
+                a = t.kind === InterceptTerm ? :Intercept :
+                    t.kind === ContinuousTerm ? only(t.columns) : nothing
+                a === addr
+            end
+            scalar || _sfail(
+                "coefficient $(s.lhs) of predictor $pname takes " *
+                "`Horseshoe(...)` outside an intercept/continuous term " *
+                "— the flat slice covers scalar coefficients only")
+            push!(out, pname)
+        end
+    end
+    return out
+end
+
+# SB `Horseshoe(...)` keyword contract: keywords `local_scale` /
+# `global_scale` only (no positionals), positive finite literal scales
+# defaulting to 1.0 (Bools rejected — SB's numeric-constant rule).
+function _coefficient_horseshoe(name, rhs, pname, addr)
+    where = "coefficient $name of predictor $pname"
+    kws = Any[]
+    for a in rhs.args[2:end]
+        if a isa Expr && a.head === :parameters
+            append!(kws, a.args)
+        elseif a isa Expr && a.head === :kw
+            push!(kws, a)
+        else
+            _sfail("$where `Horseshoe(...)` takes no positional " *
+                   "arguments — use `local_scale=` and/or `global_scale=`")
+        end
+    end
+    ls, gs = 1.0, 1.0
+    for kw in kws
+        kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
+            _sfail("$where `Horseshoe(...)` takes keywords " *
+                   "`local_scale`/`global_scale` only")
+        key, v = kw.args
+        key === :local_scale || key === :global_scale || _sfail(
+            "$where `Horseshoe(...)` takes keywords " *
+            "`local_scale`/`global_scale` only, got `$key`")
+        v isa Bool && _sfail("$where `Horseshoe($key=...)` needs a " *
+                             "numeric literal scale, got `$v`")
+        v isa Real && isfinite(v) && v > 0 || _sfail(
+            "$where `Horseshoe($key=...)` must be finite and " *
+            "strictly positive, got $(repr(v))")
+        if key === :local_scale
+            ls = Float64(v)
+        else
+            gs = Float64(v)
+        end
+    end
+    return ls, gs
+end
+
+# Horseshoe predictors to IR: one HorseshoePrior per stated `~ Horseshoe()`
+# addressee plus its synthesized triple; stated-Normal (or unstated)
+# scalar addressees ride Normal scalars (the mixed-predictor
+# coordinate). Anything but intercept/continuous/offset terms fails
+# closed (the flat slice).
+function _lower_horseshoe_priors(sample, coefuse, predictors,
+        hs::Set{Symbol}, taken::Set{Symbol})
+    stated = Dict{Symbol,Any}()
+    for s in sample
+        haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
+    end
+    out = HorseshoePrior[]
+    params = SampledParameter[]
+    for pred in predictors
+        pred.name in hs || continue
+        for t in pred.terms
+            (t.kind === InterceptTerm || t.kind === ContinuousTerm ||
+                t.kind === OffsetTerm) || _sfail(
+                "horseshoe over predictor $(pred.name) meets a " *
+                "$(t.kind) term — the flat slice covers " *
+                "intercept/continuous coefficients only")
+            t.kind === OffsetTerm && continue
+            addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
+            use = _find_use(coefuse, pred.name, addr)
+            use === nothing && _sfail("internal: no coefficient use for " *
+                                      "($(pred.name), $addr)")
+            name, _, sign = use
+            if !haskey(stated, name)
+                push!(params, _horseshoe_normal_param(pred.name, addr,
+                    0.0, 1.0, taken))
+                continue
+            end
+            s = stated[name]
+            if _is_horseshoe_call(s.rhs)
+                ls, gs = _coefficient_horseshoe(name, s.rhs, pred.name,
+                    addr)
+                push!(out, HorseshoePrior(pred.name, addr, ls, gs, sign))
+                for (nm, fam, args, ov) in (
+                        (horseshoe_raw_name(pred.name, addr), :normal,
+                            (arg1 = 0, arg2 = 1), nothing),
+                        (horseshoe_lambda_name(pred.name, addr), :cauchy,
+                            (arg1 = 0, arg2 = ls), :positive_stan),
+                        (horseshoe_tau_name(pred.name, addr), :cauchy,
+                            (arg1 = 0, arg2 = gs), :positive_stan))
+                    nm in taken && _sfail(
+                        "horseshoe over $(pred.name): synthesized $nm " *
+                        "collides with a model name — rename yours")
+                    push!(taken, nm)
+                    push!(params, SampledParameter(nm, fam, args, ov, nm))
+                end
+                continue
+            end
+            s.levels !== nothing && _sfail("coefficient $name takes a " *
+                                           "scalar prior (`$name ~ Normal`), " *
+                                           "not a levels prior — it is used " *
+                                           "as $(t.kind), not a factor")
+            loc, scale = _coefficient_normal(name, s.rhs, pred.name, addr)
+            push!(params, _horseshoe_normal_param(pred.name, addr,
+                sign * loc, scale, taken))
+        end
+    end
+    return out, params
+end
+
+# One mixed-predictor Normal coordinate (the PopulationPrior convention:
+# the sign rides the location, the scalar IS the signed coordinate).
+function _horseshoe_normal_param(pname, addr, loc, scale,
+        taken::Set{Symbol})
+    nm = horseshoe_normal_name(pname, addr)
+    nm in taken && _sfail(
+        "horseshoe over $pname: synthesized $nm collides with a " *
+        "model name — rename yours")
+    push!(taken, nm)
+    return SampledParameter(nm, :normal, (arg1 = loc, arg2 = scale),
+        nothing, nm)
 end
 
 # R2D2 declarations to IR: one R2D2Prior per declared predictor.

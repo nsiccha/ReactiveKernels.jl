@@ -14,8 +14,8 @@
 
 Inferred unconstrained support (`:real`/`:positive`/`:unit`) for a sampled
 family plus an optional support override (`:positive` half-Normal/half-Cauchy
-style, `:interval`, or `:upper`). Loud on unknown families and inapplicable
-overrides.
+style, `:positive_stan` Stan-kernel half style, `:interval`, or `:upper`).
+Loud on unknown families and inapplicable overrides.
 """
 function support_of(family::Symbol, override::SupportOverride)
     haskey(SAMPLED_SUPPORT, family) ||
@@ -38,11 +38,11 @@ function support_of(family::Symbol, override::SupportOverride)
             "[layout] :interval override needs a real-support family"))
         return :interval
     end
-    override === :positive || throw(
-        ContractValidationError("[layout] support override must be :positive, got $override"),
+    (override === :positive || override === :positive_stan) || throw(
+        ContractValidationError("[layout] support override must be :positive or :positive_stan, got $override"),
     )
     inferred === :real || throw(
-        ContractValidationError("[layout] :positive override needs a real-support family"),
+        ContractValidationError("[layout] $override override needs a real-support family"),
     )
     return :positive
 end
@@ -106,6 +106,10 @@ function assign_layout(plan::StructuralPlan)
     entries = LayoutEntry[]
     offset = 1
     for pred in plan.predictors
+        # A horseshoe predictor lays out no coefficient block: every
+        # coordinate derives in-graph from its triple/Normal scalar (the
+        # generator binds the same block name as a local).
+        isempty(_horseshoe_for(plan, pred.name)) || continue
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         labels = Symbol[]
