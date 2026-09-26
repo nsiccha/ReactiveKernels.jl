@@ -473,6 +473,23 @@ function _gen_hurdle_plan(; p_zero = :p_zero)
     return plan
 end
 
+function _gen_zip_plan(; zi = :zi)
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    params = SampledParameter[]
+    zi isa Symbol && push!(params,
+        SampledParameter(:zi, :beta, (arg1 = 2.0, arg2 = 2.0), nothing, :zi))
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp, nothing, nothing; zi = zi)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
 function _ref_hurdle(cols, coef, p0)
     lam = exp.(coef[1] .+ coef[2] .* cols[:x])
     ll = sum(zip(cols[:y], lam)) do (y, l)
@@ -505,6 +522,52 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+# Two-term log-sum-exp for the zero-arm oracle (stable; no new test dep).
+_zi_logaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
+
+function _ref_zip(cols, coef, zi)
+    eta = coef[1] .+ coef[2] .* cols[:x]
+    ll = sum(zip(eta, cols[:y])) do (e, y)
+        pp = logpdf(Poisson(exp(e)), y)
+        y == 0 ? _zi_logaddexp(log(zi), log1p(-zi) + pp) : log1p(-zi) + pp
+    end
+    pr = logpdf(Normal(0, 1), coef[1]) + logpdf(Normal(0, 2), coef[2]) +
+        logpdf(Beta(2.0, 2.0), zi)
+    return (; ll, pr)
+end
+
+# Unit-support (logistic) log-Jacobian from the constrained value.
+_zi_unit_jac(zi) = log(zi) + log1p(-zi)
+
+@testset "zip values and gradient" begin
+    plan = _gen_zip_plan()
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    ref = _ref_zip(plan.columns, Vector(nt.eta), nt.zi)
+    @test _query(built.spec, plan, :likelihood, u) ≈ ref.ll
+    @test _query(built.spec, plan, :prior, u) ≈ ref.pr
+    @test _query(built.spec, plan, :posterior, u) ≈
+        ref.ll + ref.pr + _zi_unit_jac(nt.zi)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "zip literal-zi values" begin
+    plan = _gen_zip_plan(; zi = 0.25)
+    built = build_kernel(plan)
+    u = [0.1, -0.2]
+    nt = constrain(built.layout, u)
+    eta = Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* plan.columns[:x]
+    ll = sum(zip(eta, plan.columns[:y])) do (e, y)
+        pp = logpdf(Poisson(exp(e)), y)
+        y == 0 ? _zi_logaddexp(log(0.25), log1p(-0.25) + pp) :
+            log1p(-0.25) + pp
+    end
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "weighted hurdle values" begin
     cols, n = _gen_columns()
     cols[:y] = [0, 1, 2, 0, 3, 1]
@@ -523,6 +586,98 @@ end
         [y == 0 ? log(0.35) :
             log1p(-0.35) + logpdf(Poisson(l), y) - log(-expm1(-l))
             for (y, l) in zip(cols[:y], lam)])
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted zip values" begin
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta,
+            nothing, :w, _none_evidence(), :y_resp, nothing, nothing; zi = :zi)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[SampledParameter(:zi, :beta, (arg1 = 2.0, arg2 = 2.0),
+                nothing, :zi)],
+        AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    eta = Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x]
+    ll = sum(cols[:w] .*
+        [let pp = logpdf(Poisson(exp(e)), y)
+             y == 0 ? _zi_logaddexp(log(nt.zi), log1p(-nt.zi) + pp) :
+                 log1p(-nt.zi) + pp
+         end for (e, y) in zip(eta, cols[:y])])
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Beta(2.0, 2.0), nt.zi)
+    @test _query(built.spec, plan, :posterior, u) ≈
+        ll + pr + _zi_unit_jac(nt.zi)
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_ig_plan(; lam = :lam)
+    cols, n = _gen_columns()
+    params = lam isa Symbol ? SampledParameter[
+        SampledParameter(:lam, :lognormal, (arg1 = -0.3, arg2 = 1.0), nothing, :lam)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
+            lam, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_ig(cols, coef, lam)
+    mu = exp.(coef[1] .+ coef[2] .* cols[:x])
+    return sum(logpdf(InverseGaussian(m, lam), y) for (y, m) in zip(cols[:y], mu))
+end
+
+@testset "ig values and gradient" begin
+    plan = _gen_ig_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_ig(plan.columns, Vector(nt.eta), nt.lam)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(LogNormal(-0.3, 1.0), nt.lam)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "ig literal-lambda values" begin
+    plan = _gen_ig_plan(; lam = 1.5)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_ig(plan.columns, Vector(nt.eta), 1.5)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted ig values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
+            1.5, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = exp.(Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x])
+    ll = sum(cols[:w] .*
+        [logpdf(InverseGaussian(m, 1.5), y) for (y, m) in zip(cols[:y], mu)])
     pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, plan, u)

@@ -80,7 +80,7 @@ using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
     beta, inverse_gamma, binomial, negative_binomial2, uniform,
-    student_t,
+    student_t, zero_inflated_poisson,
     gp_exp_quad_cov, gp_chol_latent,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
 using SpecialFunctions: erfc, loggamma
@@ -889,6 +889,12 @@ end
 function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     node = _lik_name(r.label)
     pw = _pw_name(r.label)
+    if r.mi_jobs !== nothing && !(r.family === GaussianFam ||
+            r.family === GammaLogFam || r.family === BetaLogitFam)
+        throw(ContractValidationError(
+            "[generator] mi() response $(r.label) family $(r.family) " *
+            "has no mi emitter (v1: Gaussian/Gamma/Beta)"))
+    end
     if r.family === GaussianFam
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === StudentTFam
@@ -912,6 +918,10 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _poisson_plate_stmts(r, plan, node, pw)
     elseif r.family === HurdlePoissonFam
         return _hurdle_plate_stmts(r, plan, node, pw)
+    elseif r.family === ZeroInflatedPoissonFam
+        return _zip_plate_stmts(r, plan, node, pw)
+    elseif r.family === InverseGaussianFam
+        return _ig_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
         return _binomial_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomial2Fam
@@ -1158,6 +1168,54 @@ function _plate_sum_stmts(pointwise::Symbol, node::Symbol, inputs::Vector{Any},
     return Expr[:($pointwise = $doex), :($node::Float64 = sum($pointwise))]
 end
 
+# Case-A `mi()` gather naming, per response (`_ppl_mi_<label>_<ref>`):
+# twin responses sharing one predictor gather through distinct nodes.
+_mi_gather_name(label::Symbol, ref::Symbol) = Symbol(:_ppl_mi_, label, :_, ref)
+
+# Gather a computed full-length node by `Jobs` (an lp/rate/shape/scale
+# node the emitter created — always a vector), returning the short node.
+# The gather is its own short plate over `Jobs` with the source `Ref`'d
+# (the ordinal `c[yv]` per-lane-gather precedent): a caller-level fancy
+# `node[Jobs]` does not trace under Reactant (`TracedRArray[Vector{Int}]`
+# shape-inference failure), while per-lane scalar gathers do.
+function _mi_gather_node!(pre::Vector{Expr}, jobs::Symbol, node::Symbol,
+        label::Symbol)
+    g = _mi_gather_name(label, node)
+    jv, rf = _dovar(1), _dovar(2)
+    body = Expr(:block, LineNumberNode(0, :generator), :($rf[$jv]))
+    lambda = Expr(:(->), Expr(:tuple, jv, rf), body)
+    doex = Expr(:do, Expr(:call, :plate, jobs, :(Ref($node))), lambda)
+    push!(pre, :($g = $doex))
+    return g
+end
+
+# Gather a scale-like ref under `mi()`: scalar parameter/assignment names
+# broadcast untouched, columns gather through a short plate, Real
+# literals pass through for `_thread_ref!` to inline; anything else fails
+# closed (gathering a scalar would index nonsense, an unknown name would
+# thread garbage).
+function _mi_gather_ref!(pre::Vector{Expr}, jobs::Symbol, ref,
+        plan::StructuralPlan, label::Symbol)
+    ref isa Real && return ref
+    ref isa Symbol || throw(ContractValidationError(
+        "[generator] mi() response $label gathers Symbol/Real refs only " *
+        "(got $(repr(ref)))"))
+    ref in _union_names(plan) && return ref
+    haskey(plan.columns, ref) || throw(ContractValidationError(
+        "[generator] mi() response $label cannot gather unknown name $ref"))
+    return _mi_gather_node!(pre, jobs, ref, label)
+end
+
+# Gather a resolved scale arg under `mi()`: a predictor-fed scale already
+# resolved to its `_ppl_sc_` node (always a full-length vector — gather
+# it as a node); every other scale shape routes through `_mi_gather_ref!`.
+function _mi_gather_scale!(pre::Vector{Expr}, jobs::Symbol, sarg, r::LikelihoodSpec,
+        plan::StructuralPlan)
+    r.scale isa ScalePredictorRef &&
+        return _mi_gather_node!(pre, jobs, sarg, r.label)
+    return _mi_gather_ref!(pre, jobs, sarg, plan, r.label)
+end
+
 # Thread a Symbol ref as a plate input (returning its do-var); Real
 # literals inline (`as_int` for Poisson bounds — validated integer-valued).
 function _thread_ref!(inputs::Vector{Any}, ref, as_int::Bool = false)
@@ -1189,6 +1247,12 @@ function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
     lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
+    if r.mi_jobs !== nothing
+        # Packed y_obs threads directly (it IS the short plate axis);
+        # every other vector input gathers by Jobs.
+        lp = _mi_gather_node!(pre, r.mi_jobs, lp, r.label)
+        sarg = _mi_gather_scale!(pre, r.mi_jobs, sarg, r, plan)
+    end
     inputs = Any[y, lp]
     yv, lpv = _dovar(1), _dovar(2)
     sref = _thread_ref!(inputs, sarg)
@@ -1321,6 +1385,26 @@ function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     return _plate_sum_stmts(pw, node, inputs, cell)
 end
 
+# ZIP plate: the Poisson-plate shape with a zero-inflation argument —
+# validation guarantees `zi` (a sampled name or literal) and fails
+# evidence closed (the Gaussian/Poisson-only gate), so the cell is the
+# plain `zero_inflated_poisson` endpoint plus optional weights.
+function _zip_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    inputs = Any[y, lp]
+    yv, etav = _dovar(1), _dovar(2)
+    ziref = _thread_ref!(inputs, r.zi)
+    # All-keyword: the object constructor cannot mix positional and named
+    # owner bindings (matches the `:observed/:log_rate/:zi` HAVE ports).
+    cell = :(zero_inflated_poisson(; log_rate = $etav, zi = $ziref).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
+end
+
 # Lower-side cdf argument for the inclusive discrete cdf: the mass below
 # lb is F(lb - 1), so truncated/censored low arms and interval cells shift
 # their lower argument by one. Int literals fold; do-vars convert via Int
@@ -1395,6 +1479,42 @@ function _hurdle_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symb
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
+# Inverse-Gaussian / Wald likelihood (SB `brm_inverse_gaussian_lpdf`
+# mirror): the closed form spelled operation-for-operation —
+# `(log(λ) - (log2π + 3*log(y)) - λ*(y-μ)²/(μ²*y))/2` — with the SB
+# `log2π` literal `1.8378770664093456` (`Float64(Distributions.log2π)`
+# exactly). The mean precomputes outside the cell (`_ppl_mu_`, the NB2
+# precedent — a computed `exp` constructor arg miscompiles the Enzyme
+# pullback); lambda threads scalar via `_scale_plate_arg` (predictor-fed
+# lambda is deferred at the contract gate, the Beta-kappa precedent).
+# The `y > 0` guard is lazy `?:` (the DK gamma precedent, not eager
+# `ifelse`); `y` is bound data so preparation splits the plate per
+# taken arm and no backend receives the branch. μ/λ positivity is
+# by-construction (`exp`, positive-constrained layout, contract-validated
+# literals/columns), so no live-value guard enters the cell. Evidence
+# fails closed at the contract gate (Gaussian/Poisson only); weights
+# multiply the cell (the NB2 precedent). No whole-vector fusion yet
+# (the `3*log(y)` normalizer is data-only and would hoist) — a
+# perf-lane follow-up, not this slice.
+function _ig_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    mu = _mu_name(r.label)
+    pre = Expr[:($mu = exp.($lp))]
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, mu]
+    yv, muv = _dovar(1), _dovar(2)
+    lamv = _thread_ref!(inputs, sarg)
+    base = :((log($lamv) - (1.8378770664093456 + 3.0 * log($yv)) -
+        $lamv * ($yv - $muv) * ($yv - $muv) / ($muv * $muv * $yv)) / 2.0)
+    cell = :($yv > 0 ? $base : -Inf)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
 function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
@@ -1444,6 +1564,10 @@ function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbo
     av = sarg isa Symbol ? sarg : Float64(sarg)
     rate = _rate_name(r.label)
     push!(pre, :($rate = $av ./ exp.($lp)))
+    if r.mi_jobs !== nothing
+        rate = _mi_gather_node!(pre, r.mi_jobs, rate, r.label)
+        sarg = _mi_gather_scale!(pre, r.mi_jobs, sarg, r, plan)
+    end
     inputs = Any[y, rate]
     yv, ratev = _dovar(1), _dovar(2)
     aref = _thread_ref!(inputs, sarg)
@@ -1597,6 +1721,15 @@ function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     mu = _mu_name(r.label)
     a = _shape_a_name(r.label)
     b = _shape_b_name(r.label)
+    pre = Expr[:($mu = 1 ./ (1 .+ exp.(-$lp))),
+        :($a = $mu .* $k),
+        :($b = (1 .- $mu) .* $k)]
+    if r.mi_jobs !== nothing
+        # kappa never threads (it folds into the a/b precomputes), so
+        # only the shape nodes gather.
+        a = _mi_gather_node!(pre, r.mi_jobs, a, r.label)
+        b = _mi_gather_node!(pre, r.mi_jobs, b, r.label)
+    end
     inputs = Any[y, a, b]
     yv, avv, bvv = _dovar(1), _dovar(2), _dovar(3)
     cell = :(beta($avv, $bvv).logpdf($yv))
@@ -1604,10 +1737,7 @@ function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[:($mu = 1 ./ (1 .+ exp.(-$lp))),
-        :($a = $mu .* $k),
-        :($b = (1 .- $mu) .* $k),
-        _plate_sum_stmts(pw, node, inputs, cell)...]
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Reference-coded multi-logit categorical (SB `CategoricalLogit`): K−1

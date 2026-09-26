@@ -1,6 +1,6 @@
 using Distributions: Bernoulli, Cauchy, Dirichlet, Exponential, Geometric,
     InverseGamma, Laplace, LKJCholesky, Logistic, LogNormal, MvNormal,
-    NegativeBinomial, Normal,
+    NegativeBinomial, Normal, Poisson,
     TDist, Uniform, cdf, logpdf, quantile
 using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky, diag
 using LogExpFunctions: log1pexp
@@ -22,7 +22,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     exponential, geometric, uniform, mvnormal, ar1,
     categorical_logit, categorical_logit_ref,
     negative_binomial2,
-    inverse_gamma, dirichlet, lkj_corr_cholesky,
+    inverse_gamma, dirichlet, lkj_corr_cholesky, zero_inflated_poisson,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 using Test
 
@@ -467,6 +467,44 @@ end
             nb2(2, -1.0, 1.5), nb2(2, 2.5, 0.0))
         @test !isnan(v)
     end
+end
+
+@testset "zero_inflated_poisson Stan lpmf parity" begin
+    # ZIP(rate, zi) is Stan's zero_inflated_poisson: a structural-zero
+    # mass zi mixed with Poisson(rate) counts — the independent oracle
+    # is the stable two-arm form over Distributions' Poisson.
+    zip = prepare(zero_inflated_poisson.logpdf;
+        have = (:observed, :log_rate, :zi), want = :logpdf)
+    _zip_logaddexp(a, b) = max(a, b) + log1p(exp(-abs(a - b)))
+    for (y, lam, zi) in ((0, 2.5, 0.2), (3, 2.5, 0.2), (0, 0.0, 0.2),
+            (1, 10.0, 0.0), (0, 1.0, 0.0), (2, 0.4, 0.9), (0, 3.0, 1.0))
+        pp = logpdf(Poisson(lam), y)
+        ref = y == 0 ? _zip_logaddexp(log(zi), log1p(-zi) + pp) :
+            log1p(-zi) + pp
+        @test zip(y, log(lam), zi) ≈ ref
+    end
+    # A certain structural zero forbids positive counts.
+    @test zip(3, log(3.0), 1.0) == -Inf
+    # Impossible events are -Inf, never NaN (lazy support guard).
+    @test zip(-1, log(2.5), 0.2) == -Inf
+    @test zip(2, log(2.5), -0.1) == -Inf
+    @test zip(2, log(2.5), 1.5) == -Inf
+    @test zip(0, log(2.5), NaN) == -Inf
+    for v in (zip(-1, log(2.5), 0.2),
+            zip(2, log(2.5), -0.1), zip(2, log(2.5), 1.5),
+            zip(0, log(2.5), NaN))
+        @test !isnan(v)
+    end
+    # A NaN rate reaches the guard through the linear `rate` port
+    # (`log(NaN)` is NaN, not a throw). A negative rate instead throws
+    # DomainError at the eager `log(rate)` route node — invalid HAVE,
+    # not an event (the `poisson` kernel's identical structure throws
+    # the same way).
+    zip_rate = prepare(zero_inflated_poisson.logpdf;
+        have = (:observed, :rate, :zi), want = :logpdf)
+    @test zip_rate(2, NaN, 0.2) == -Inf
+    @test !isnan(zip_rate(2, NaN, 0.2))
+    @test_throws DomainError zip_rate(2, -1.0, 0.2)
 end
 
 include("test_glm.jl")

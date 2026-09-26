@@ -98,6 +98,8 @@ univariate components, SB `MixtureModel` mirror)."""
     MixtureFam
     StudentTFam
     HurdlePoissonFam
+    ZeroInflatedPoissonFam
+    InverseGaussianFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -154,7 +156,8 @@ end
 
 A predictor-fed scale/shape use: the response's auxiliary (Gaussian
 sigma, NB2 dispersion phi, Gamma shape alpha, Student sigma, hurdle
-p_zero) is a whole linear predictor, varying per observation.
+p_zero; InverseGaussian lambda and Beta kappa stay scalar-only) is a
+whole linear predictor, varying per observation.
 `predictor` names the
 [`PredictorSpec`](@ref) (planned exactly like a location predictor:
 terms, priors, one link); `link` is the scale use-site wrapper —
@@ -174,12 +177,14 @@ end
     LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, trials[, range]])
 
 One independent response. `scale` is the response's auxiliary —
-Gaussian sigma, NB2 dispersion phi, Gamma shape alpha, hurdle p_zero —
-either scalar (parameter, assignment, folded literal, or a raw
-per-observation data column) or, for Gaussian/NB2/Gamma/Student/hurdle
-only, a [`ScalePredictorRef`](@ref) (predictor-fed per-observation
-auxiliary); it must be `nothing` otherwise. A hurdle p_zero is a
-probability (scalar in [0, 1], predictor-fed logit-only).
+Gaussian sigma, NB2 dispersion phi, Gamma shape alpha, hurdle p_zero,
+InverseGaussian shape lambda — either scalar (parameter, assignment,
+folded literal, or a raw per-observation data column) or, for
+Gaussian/NB2/Gamma/Student/hurdle only, a [`ScalePredictorRef`](@ref)
+(predictor-fed per-observation auxiliary); it must be `nothing`
+otherwise. A hurdle p_zero is a probability (scalar in [0, 1],
+predictor-fed logit-only). An InverseGaussian lambda is scalar-only
+(predictor-fed lambda deferred, the Beta-kappa precedent).
 (One slot covers every admitted family; a two-auxiliary family such as
 Beta needs a new field — noted, not built.) `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
@@ -287,6 +292,18 @@ location/scale parameter name — fully-fixed mixtures fail closed before
 anchoring); `scale` is `nothing`. Mixture widths are structural
 (K = `length(mixture_locs)`): no `n_levels`, no bind-time size
 inference. Binomial components share one `trials`.
+Case-A `mi()` missingness (SB parity, log density only) names its observed-row
+index column in the trailing `mi_jobs` field, built with keywords (`mi_jobs=`);
+every other response leaves it at `nothing`:
+
+- `mi_jobs`: the `Jobs` column (sorted-ascending unique `Int` row indices,
+  a strict nonempty subset of `1:n_obs`). The response column itself crosses
+  PACKED (`y_obs`, aligned with `Jobs`); both ride the managed-columns
+  exemption. The generator gathers every vector likelihood input by `Jobs`
+  and runs the existing cell over the short plate — obs rows only, no
+  latent (SB keeps `y_mis` in generated quantities here). v1 admits
+  Gaussian/Gamma/Beta, uncomposed (no weights/evidence/range/trials);
+  Case-B downstream merged-response uses fail closed emitter-side.
 """
 struct LikelihoodSpec
     family::LikelihoodFamily
@@ -317,6 +334,8 @@ struct LikelihoodSpec
     mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
     mixture_weights::Union{Nothing,Symbol,Vector{Float64}}
     nu::Union{Nothing,ParamName,Real}
+    zi::Union{Nothing,ParamName,Real}
+    mi_jobs::Union{Nothing,ColumnRef}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
@@ -348,13 +367,15 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}} =
             Union{Nothing,Symbol,Real,ScalePredictorRef}[],
         mixture_weights::Union{Nothing,Symbol,Vector{Float64}} = nothing,
-        nu::Union{Nothing,ParamName,Real} = nothing)
+        nu::Union{Nothing,ParamName,Real} = nothing,
+        zi::Union{Nothing,ParamName,Real} = nothing,
+        mi_jobs::Union{Nothing,ColumnRef} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
         threshold_columns, threshold_coefs, extra_responses, factor_scales,
         factor_corr, glm_alpha, glm_beta, mixture_family, mixture_locs,
-        mixture_scales, mixture_weights, nu)
+        mixture_scales, mixture_weights, nu, zi, mi_jobs)
 end
 
 """
@@ -1341,6 +1362,8 @@ const ADMITTED_TRIPLES = (
     (OrdinalFam, CloglogLink, IdentityLink),
     (StudentTFam, IdentityLink, IdentityLink),
     (HurdlePoissonFam, LogLink, LogLink),
+    (ZeroInflatedPoissonFam, LogLink, LogLink),
+    (InverseGaussianFam, LogLink, LogLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order)."""
@@ -1679,7 +1702,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
-    PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam)
+    PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
+    ZeroInflatedPoissonFam, InverseGaussianFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -2277,6 +2301,7 @@ function _validate_columns(plan::StructuralPlan)
         union!(managed, _kernel_managed_columns(kp))
     end
     union!(managed, _subject_predictor_columns(plan))
+    union!(managed, _mi_managed_columns(plan))
     for (name, col) in plan.columns
         # Kernel-managed columns (slices + scalar expansions) carry two
         # lengths by design — they validate under kernel rules, not here.
@@ -6066,6 +6091,91 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
     return nothing
 end
 
+# Case-A `mi()` responses a linear predictor observes through packed obs
+# slices: these columns ride the managed exemption (the kernel-managed
+# precedent), validated under mi rules instead of the uniform-`n_obs`
+# rule. The exemption names exactly the columns the `mi_jobs` field
+# points at, so a stray caller column cannot hide behind it.
+function _mi_managed_columns(plan::StructuralPlan)
+    out = Set{Symbol}()
+    for r in plan.responses
+        r.mi_jobs === nothing && continue
+        push!(out, r.response, r.mi_jobs)
+    end
+    return out
+end
+
+# v1 admits Gaussian/Gamma/Beta over a linear predictor, uncomposed.
+# Runs first in the per-response loop: every special predictor shape
+# (scan/plate/simplex/joint/GLM) `continue`s past the standard checks,
+# so the mi gate must precede them all.
+function _validate_mi_structure(r::LikelihoodSpec, plan::StructuralPlan)
+    r.mi_jobs === nothing && return nothing
+    (r.family === GaussianFam || r.family === GammaLogFam ||
+     r.family === BetaLogitFam) ||
+        _fail(r.label, "mi() missingness is Gaussian/Gamma/Beta only in " *
+              "v1 (got $(r.family) — SB's Univariate Continuous mirror)")
+    any(p -> p.name === r.predictor, plan.predictors) ||
+        _fail(r.label, "mi() response $(r.response) takes a linear " *
+              "predictor (scan/plate/simplex/joint/GLM locations compose " *
+              "in a later increment)")
+    pred = plan.predictors[findfirst(p -> p.name === r.predictor, plan.predictors)]
+    any(!isempty(t.columns) for t in pred.terms) ||
+        _fail(r.label, "mi() response $(r.response) takes a location " *
+              "predictor with a data column (intercept-only crosses no " *
+              "length-n anchor, so n_obs is underivable — deferred)")
+    r.weights === nothing ||
+        _fail(r.label, "mi() response $(r.response) takes no weights " *
+              "(SB's tested mi surface is uncomposed)")
+    r.evidence.kind === :none ||
+        _fail(r.label, "mi() response $(r.response) takes no " *
+              "censoring/truncation evidence (SB's tested mi surface is " *
+              "uncomposed)")
+    r.range === nothing ||
+        _fail(r.label, "mi() response $(r.response) takes no range " *
+              "(Jobs already selects the observed rows)")
+    r.trials === nothing ||
+        _fail(r.label, "mi() response $(r.response) takes no trials")
+    r.mi_jobs !== r.response ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must differ from " *
+              "the response column")
+    return nothing
+end
+
+function _validate_mi_data(r::LikelihoodSpec, plan::StructuralPlan)
+    r.mi_jobs === nothing && return nothing
+    haskey(plan.columns, r.mi_jobs) ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) missing")
+    jobs = plan.columns[r.mi_jobs]
+    jobs isa AbstractVector ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must be a vector, " *
+              "got $(summary(jobs))")
+    eltype(jobs) <: Integer && eltype(jobs) !== Bool ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must hold integers, " *
+              "got $(eltype(jobs))")
+    o = length(jobs)
+    o >= 1 || _fail(r.label,
+        "mi() Jobs column $(r.mi_jobs) is empty (at least one observed " *
+        "row is required)")
+    o < plan.n_obs || _fail(r.label,
+        "mi() Jobs column $(r.mi_jobs) covers every row (no missing " *
+        "values — drop the mi() wrapper)")
+    all(j -> 1 <= j <= plan.n_obs, jobs) ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must index " *
+              "1:n_obs ($(plan.n_obs))")
+    length(unique(jobs)) == o ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must not repeat " *
+              "rows (a repeated row would double-count its likelihood)")
+    issorted(jobs) ||
+        _fail(r.label, "mi() Jobs column $(r.mi_jobs) must ascend " *
+              "(the emitter crosses findall order)")
+    yobs = _vector_column(plan.columns, r.response, r.label, "mi() response")
+    length(yobs) == o ||
+        _fail(r.label, "mi() response $(r.response) has $(length(yobs)) " *
+              "rows but Jobs selects $o (y_obs must align with Jobs exactly)")
+    return nothing
+end
+
 function _validate_responses(plan::StructuralPlan)
     # A kernel plate carries the only likelihood (panel v1): zero
     # top-level responses are admitted iff exactly one kernel plate is
@@ -6088,12 +6198,14 @@ function _validate_responses(plan::StructuralPlan)
     scan_states = Set{Symbol}(s.state for s in plan.scans)
     used_predictors = Set{Symbol}()
     for r in plan.responses
+        _validate_mi_structure(r, plan)
         # A mixture response validates whole (dedicated component slots;
         # the anchor is polymorphic, so this branch leads the scan-state
         # and plate-param checks below).
         if r.family === MixtureFam
             _validate_mixture_response(r, plan, used_predictors)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             continue
         end
         # A scale predictor feeds a slot exactly like a location predictor,
@@ -6110,6 +6222,7 @@ function _validate_responses(plan::StructuralPlan)
             )
             _validate_scale(r, plan)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             _validate_evidence_structure(r, plan)
             _validate_unleveled_fields(r)
             continue
@@ -6139,6 +6252,7 @@ function _validate_responses(plan::StructuralPlan)
                 "(the latent covers the whole column)")
             _validate_scale(r, plan)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             _validate_evidence_structure(r, plan)
             _validate_unleveled_fields(r)
             continue
@@ -6150,6 +6264,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_simplex_response(r, plan)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -6160,6 +6275,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_joint_response(r, plan, used_predictors)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -6170,6 +6286,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_glm_response(r, plan)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
+            _validate_zi(r, plan)
             _validate_evidence_structure(r, plan)
             continue
         end
@@ -6184,10 +6301,12 @@ function _validate_responses(plan::StructuralPlan)
             "(admitted: Gaussian/identity, Bernoulli-logit/probit/cloglog, " *
             "Poisson-log, Binomial-logit/probit/cloglog, NB2-log, Gamma-log, " *
             "Beta-logit, Categorical-logit, Ordered-logit, Ordinal spellings, " *
-            "Student-identity, Hurdle-Poisson-log)",
+            "Student-identity, Hurdle-Poisson-log, ZIP-log, " *
+            "InverseGaussian-log)",
         )
         _validate_scale(r, plan)
         _validate_nu(r, plan)
+        _validate_zi(r, plan)
         _validate_evidence_structure(r, plan)
         _validate_leveled_fields(r, plan, pred, used_predictors)
         if r.range !== nothing
@@ -6213,6 +6332,7 @@ end
 
 function _validate_response_data(plan::StructuralPlan)
     for r in plan.responses
+        _validate_mi_data(r, plan)
         _validate_response_column(r, plan)
         _validate_scale_data(r, plan)
         _validate_weights(r, plan)
@@ -6251,6 +6371,16 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     elseif r.family === HurdlePoissonFam
         _is_count_column(col) && return nothing
         return _fail(r.label, "Hurdle response must be non-negative integers")
+    elseif r.family === ZeroInflatedPoissonFam
+        _is_count_column(col) && return nothing
+        return _fail(r.label, "ZIP response must be non-negative integers")
+    elseif r.family === InverseGaussianFam
+        # Strictly positive: the Wald kernel guards y > 0 (SB
+        # `brm_inverse_gaussian_lpdf` returns -inf at y ≤ 0) — fail closed
+        # instead of flowing a wrong value.
+        (eltype(col) <: Real && all(>(0), col)) ||
+            _fail(r.label, "InverseGaussian response must be strictly positive numerics")
+        return nothing
     elseif r.family === GaussianFam
         eltype(col) <: Real ||
             _fail(r.label, "Gaussian response must be numeric")
@@ -6405,7 +6535,8 @@ _scale_need(fam::LikelihoodFamily) =
     fam === BetaLogitFam ? "Beta response requires a concentration kappa" :
     fam === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" :
     fam === StudentTFam ? "Student response requires a scale sigma" :
-    fam === HurdlePoissonFam ? "Hurdle response requires a hurdle probability p_zero" : nothing
+    fam === HurdlePoissonFam ? "Hurdle response requires a hurdle probability p_zero" :
+    fam === InverseGaussianFam ? "InverseGaussian response requires a shape lambda" : nothing
 
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     need = _scale_need(r.family)
@@ -6450,14 +6581,15 @@ function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
 end
 
 # A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha,
-# Student sigma, hurdle p_zero):
+# Student sigma, hurdle p_zero; Beta kappa and InverseGaussian lambda are
+# deferred above):
 # the predictor exists, carries the use-site link (the
 # one-link-per-predictor rule), and is not the response's own location
 # predictor (the two slots take distinct predictors — the BRM-side plan
 # rule, mirrored here as defense in depth). Beta-kappa predictors are
 # deferred; predictor-fed Binomial trials likewise (trials stay
 # column-or-literal by type). A hurdle p_zero predictor is logit-only (a
-# probability); the scale families admit identity/log/logit.
+# probability); the admitted scale families take identity/log/logit.
 function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
         s::ScalePredictorRef)
     return _validate_scale_predictor_use(r, plan, s, r.family, [r.predictor])
@@ -6469,6 +6601,9 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
     fam === BetaLogitFam && _fail(r.label,
         "Beta response with a scale predictor: predictor-fed concentration " *
         "(kappa) is deferred — use a scalar kappa (parameter or literal)")
+    fam === InverseGaussianFam && _fail(r.label,
+        "InverseGaussian response with a scale predictor: predictor-fed " *
+        "shape (lambda) is deferred — use a scalar lambda (parameter or literal)")
     (fam === GaussianFam || fam === NegativeBinomial2Fam ||
         fam === GammaLogFam || fam === StudentTFam ||
         fam === HurdlePoissonFam) ||
@@ -6557,6 +6692,28 @@ function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "nu literal must be finite positive"))
     n isa Symbol && (n in _union_names(plan) ||
         _fail(r.label, "nu references unknown name $n"))
+    return nothing
+end
+
+# Zero-inflation probability: required (a sampled parameter/assignment
+# name or a literal in [0, 1]), scalar only — no per-observation
+# columns, no predictor-fed zi (a modeled zi submodel is deferred).
+# Unknown names fail structurally: unlike scale there is no bind-time
+# column form to defer to.
+function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
+    if r.family !== ZeroInflatedPoissonFam
+        r.zi === nothing ||
+            _fail(r.label, "only ZIP responses take zi (zero-inflation probability)")
+        return nothing
+    end
+    z = r.zi
+    z === nothing &&
+        _fail(r.label, "ZIP response requires zi (zero-inflation " *
+            "probability, parameter or literal)")
+    z isa Real && ((isfinite(z) && 0 <= z <= 1) ||
+        _fail(r.label, "zi literal must lie in [0, 1]"))
+    z isa Symbol && (z in _union_names(plan) ||
+        _fail(r.label, "zi references unknown name $z"))
     return nothing
 end
 
@@ -7407,6 +7564,23 @@ be consumed. Columns are vectors or matrices (whole-design data, Stan
 numeric eltype; every per-observation role reads vectors only and fails
 closed on a matrix.
 """
+# n_obs derivation skips mi-managed columns (packed y_obs/Jobs): every
+# other column crosses at length n, so the first non-managed column
+# pins n_obs order-independently. All-managed (an mi response whose
+# location crosses no full-length column) fails closed — n is
+# underivable, and the structure gate already rejects that shape, so
+# this is unreachable past validation (defense in depth for direct
+# bind_data callers).
+function _bind_nrows(columns::AbstractDict{Symbol}, managed::Set{Symbol})
+    for (k, v) in columns
+        k in managed && continue
+        return _column_nrows(v)
+    end
+    throw(ContractValidationError(
+        "[bind] cannot derive n_obs: every crossed column is mi-managed " *
+        "(an mi-only column set carries no length-n anchor)"))
+end
+
 function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}())
@@ -7472,10 +7646,13 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     merged = merge(inferred, roles)
     # Kernel plans carry two column lengths by design: n_obs is the flat
     # length (vector models) or n_sub (all-scalar) — never first-column.
-    # Otherwise n_obs is the first column's ROW count (length for vectors).
+    # Otherwise n_obs is the first NON-managed column's ROW count (length
+    # for vectors): mi packs y_obs/Jobs short by design, and Dict order
+    # is not a crossing contract (deriving from a packed column fails
+    # every full-length column by order luck).
     # Grouped plans set n_obs to the primary (first-obs) response length.
     n = if isempty(kbases)
-        _column_nrows(first(values(columns)))
+        _bind_nrows(columns, _mi_managed_columns(plan))
     else
         gkp = only(kbases)
         if _is_grouped_kernel(gkp)
