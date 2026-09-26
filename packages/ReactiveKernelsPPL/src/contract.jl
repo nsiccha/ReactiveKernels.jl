@@ -429,20 +429,34 @@ end
 
 """
     PopulationPrior(predictor, addressee, location, scale)
+    PopulationPrior(predictor, addressee, family, location, scale[, nu])
 
-Normal-only population prior (slice 1) addressed by
-`(predictor, column|:Intercept)`. A factor source column address applies one
-shared Normal across its full-rank level block (one coefficient per mapped
-level). The emitter fills `Normal(0,1)` defaults so coverage is complete by
-construction — except factor coefficients, whose broadcast prior also sizes
-the block and is therefore required, never defaulted.
+Per-addressee population prior addressed by `(predictor,
+column|:Intercept)`. `family` is one of [`POPULATION_FAMILIES`](@ref)
+(`:flat` contributes 0.0 — StanBlocks flat-token parity — and ignores
+location/scale/nu); `nu` is the StudentT degrees of freedom (`NaN`
+otherwise). A factor source column address applies one shared prior
+across its full-rank level block (one coefficient per mapped level); a
+matrix broadcast applies one shared family with per-element
+locations/scales. The 4-arg form is Normal. The emitter fills
+`Normal(0,1)` defaults so coverage is complete by construction —
+except factor coefficients, whose broadcast prior also sizes the block
+and is therefore required, never defaulted.
 """
 struct PopulationPrior
     predictor::Symbol
     addressee::Symbol
+    family::Symbol
     location::Real
     scale::Real
+    nu::Real
 end
+PopulationPrior(predictor::Symbol, addressee::Symbol, location::Real,
+    scale::Real) = PopulationPrior(predictor, addressee, :normal,
+    location, scale, NaN)
+PopulationPrior(predictor::Symbol, addressee::Symbol, family::Symbol,
+    location::Real, scale::Real) =
+    PopulationPrior(predictor, addressee, family, location, scale, NaN)
 
 """
     R2D2Prior(predictor, r2, phi, tau, overrides)
@@ -1431,7 +1445,8 @@ const ADMITTED_TRIPLES = (
     (VonMisesFam, IdentityLink, IdentityLink),
 )
 
-"""Positional arity per sampled family (Distributions.jl order)."""
+"""Positional arity per sampled family (Distributions.jl order; `:student_t`
+is `(nu, mu, sigma)` in Stan order, matching the response spelling)."""
 const SAMPLED_ARITY = Dict{Symbol,Int}(
     :normal => 2,
     :cauchy => 2,
@@ -1440,20 +1455,38 @@ const SAMPLED_ARITY = Dict{Symbol,Int}(
     :lognormal => 2,
     :beta => 2,
     :inverse_gamma => 2,
+    :student_t => 3,
+    :laplace => 2,
+    :logistic => 2,
+    :uniform => 2,
     :flat => 0,
 )
 
-"""Inferred unconstrained support per sampled family (`:flat` = real)."""
+"""Inferred unconstrained support per sampled family (`:flat` = real;
+`:uniform` bounds come from its literal args)."""
 const SAMPLED_SUPPORT = Dict{Symbol,Symbol}(
     :normal => :real,
     :cauchy => :real,
     :flat => :real,
+    :student_t => :real,
+    :laplace => :real,
+    :logistic => :real,
     :exponential => :positive,
     :gamma => :positive,
     :lognormal => :positive,
     :inverse_gamma => :positive,
     :beta => :unit,
+    :uniform => :interval,
 )
+
+"""Admitted per-addressee population-prior families (prior-vocab slice)."""
+const POPULATION_FAMILIES =
+    (:normal, :student_t, :cauchy, :laplace, :logistic, :flat)
+
+"""Real-support families symmetric about their location: a `:positive`
+half at a literal-zero location renormalizes by exactly `+log(2)`."""
+const SYMMETRIC_SAMPLED_FAMILIES =
+    (:normal, :cauchy, :student_t, :laplace, :logistic)
 
 # Spline block/width/vector/name rules, derived purely from (kind, k):
 # the single source of truth shared by surface lowering (which builds the
@@ -4636,13 +4669,29 @@ function _validate_parameters(plan::StructuralPlan)
             v in names ||
                 _fail(p.label, "arg $k references unknown name $v")
         end
+        _validate_uniform_args(p.label, p.family, p.args)
         _validate_support_override(p.label, p.family, p.support_override, p.args)
     end
     return nothing
 end
 
+# Uniform priors carry their own interval support: bounds are finite
+# literals in order. Sampled or per-cell bounds are rejected — static
+# layout cannot transform parameter-dependent support (SB allows sampled
+# Uniform endpoints; the thin layer fails closed on them).
+function _validate_uniform_args(label, family::Symbol, args::NamedTuple)
+    family === :uniform || return nothing
+    lo, hi = args.arg1, args.arg2
+    lo isa Real && hi isa Real && isfinite(lo) && isfinite(hi) || _fail(label,
+        "uniform bounds must be finite literals, got " *
+        "($(repr(lo)), $(repr(hi)))")
+    lo < hi || _fail(label,
+        "uniform needs lower < upper, got ($lo, $hi)")
+    return nothing
+end
+
 # Shared support-override rule for scalar and per-cell latent parameters:
-# `:positive` half-truncates a real-support (normal/cauchy) family, and the
+# `:positive` half-truncates a symmetric real-support family, and the
 # +log(2) renormalization is exact only for a literal zero location.
 # `(:interval, lo, hi)` is a two-sided finite truncation with finite lo < hi;
 # the family must be real-support (a truncated Normal), and the density carries
@@ -4654,6 +4703,9 @@ end
 function _validate_support_override(label, family::Symbol,
         ov::SupportOverride, args::NamedTuple)
     ov === nothing && return nothing
+    family === :uniform && _fail(label,
+        "a uniform prior carries its own interval support — no support " *
+        "override applies, got $ov")
     if ov isa Tuple
         if ov[1] === :upper
             length(ov) == 2 || _fail(label,
@@ -4683,10 +4735,10 @@ function _validate_support_override(label, family::Symbol,
     (ov === :positive || ov === :positive_stan) ||
         _fail(label, "support override must be :positive or " *
               ":positive_stan, got $ov")
-    (family === :normal || family === :cauchy) || _fail(label,
-        "$ov override only applies to normal/cauchy " *
-        "(half-Normal/half-Cauchy); got $family")
-    loc = first(values(args))
+    family in SYMMETRIC_SAMPLED_FAMILIES || _fail(label,
+        "$ov override only applies to symmetric real-support families " *
+        "($(join(SYMMETRIC_SAMPLED_FAMILIES, ", "))); got $family")
+    loc = family === :student_t ? values(args)[2] : first(values(args))
     loc isa Real && loc == 0 || _fail(label,
         "$ov override requires literal zero location " *
         "(the half shape truncates at 0); got $(repr(loc))")
@@ -4723,6 +4775,7 @@ function _validate_plate_parameters(plan::StructuralPlan)
             # scalar (shared) and derived (per-cell) resolve structurally; a raw
             # data-column arg (per-cell) resolves at bind, like any data ref.
         end
+        _validate_uniform_args(p.label, p.family, p.args)
         _validate_support_override(p.label, p.family, p.support_override, p.args)
         if p.range !== nothing
             r = p.range
@@ -5543,6 +5596,7 @@ end
 
 function _validate_priors(plan::StructuralPlan)
     seen = Set{Tuple{Symbol,Symbol}}()
+    rows = Dict{Tuple{Symbol,Symbol},PopulationPrior}()
     r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
     hs = Set{Tuple{Symbol,Symbol}}(
         (h.predictor, h.addressee) for h in plan.horseshoe_priors)
@@ -5564,8 +5618,19 @@ function _validate_priors(plan::StructuralPlan)
         key in seen &&
             _fail(:plan, "duplicate prior for $key")
         push!(seen, key)
+        rows[key] = pr
+        pr.family in POPULATION_FAMILIES || _fail(:plan,
+            "prior for $key has family $(pr.family) (admitted: " *
+            "$(join(POPULATION_FAMILIES, ", ")))")
+        # `:flat` contributes 0.0 and ignores location/scale/nu.
+        pr.family === :flat && continue
         isfinite(pr.location) && isfinite(pr.scale) && pr.scale > 0 ||
-            _fail(:plan, "prior for $key must be Normal(finite, positive)")
+            _fail(:plan, "prior for $key must be $(pr.family) with " *
+                  "finite location and positive scale")
+        pr.family === :student_t &&
+            (!(pr.nu isa Real) || !isfinite(pr.nu) || !(pr.nu > 0)) &&
+            _fail(:plan, "prior for $key must be student_t with " *
+                  "finite positive nu, got $(repr(pr.nu))")
     end
     for pred in plan.predictors
         # R2D2 predictors are covered by _validate_r2d2, not here.
@@ -5593,7 +5658,19 @@ function _validate_priors(plan::StructuralPlan)
                 m === nothing && _fail(:plan,
                     "internal: matrix term $(t.label) addresses unknown " *
                     "matrix (validate_predictors should have caught this)")
-                union!(addressees, _matrix_element_addressees(m))
+                elems = _matrix_element_addressees(m)
+                union!(addressees, elems)
+                # One family per matrix block (data-derived widths stay in
+                # one plate; only present rows are compared — missing rows
+                # fail coverage below).
+                present = [rows[(pred.name, e)] for e in elems
+                    if haskey(rows, (pred.name, e))]
+                isempty(present) || all(p -> p.family === present[1].family,
+                    present) || _fail(:plan,
+                    "matrix block $(t.options.matrix) of predictor " *
+                    "$(pred.name) mixes prior families " *
+                    "($(join(unique!(map(p -> p.family, copy(present))), ", "))) — " *
+                    "one family per matrix block")
                 continue
             end
             push!(addressees, t.addressee)
@@ -5618,6 +5695,12 @@ function _validate_priors(plan::StructuralPlan)
             c === nothing && continue
             (r.label, c) in seen ||
                 _fail(:plan, "no prior for ($(r.label), $c)")
+            # GLM-object beta vectors are Normal-only; non-Normal
+            # betas use the decomposed predictor form.
+            rows[(r.label, c)].family === :normal || _fail(:plan,
+                "GLM-object beta prior for ($(r.label), $c) is " *
+                "Normal-only (got $(rows[(r.label, c)].family)) — write " *
+                "the decomposed predictor form for other families")
         end
     end
     return nothing

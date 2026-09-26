@@ -426,9 +426,13 @@ end
 
 @testset "matrix surface prior errors" begin
     D = (:y, :x1, :x2)
+    # `Cauchy.(0, 1)` broadcast was rejected under Normal-only admission;
+    # the prior-vocab slice admits per-addressee Cauchy (see
+    # test_prior_vocab.jl), so the rejection case moves to Gamma (not a
+    # coefficient family).
     cases = [
         ("is a vector — use `.~`", quote b[axes(X, 2)] ~ Normal(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("needs a broadcast `Normal.(location, scale)` prior", quote b[axes(X, 2)] .~ Cauchy.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("needs a broadcast prior", quote b[axes(X, 2)] .~ Gamma.(1, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         ("must be a literal or a literal 2-vector", quote s ~ Exponential(1); b[axes(X, 2)] .~ Normal.(0, s); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, s) end),
         ("has 2 elements for 3 columns", quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
     ]

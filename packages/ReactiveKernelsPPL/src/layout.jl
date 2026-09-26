@@ -12,16 +12,21 @@
 """
     support_of(family, override) -> Symbol
 
-Inferred unconstrained support (`:real`/`:positive`/`:unit`) for a sampled
-family plus an optional support override (`:positive` half-Normal/half-Cauchy
-style, `:positive_stan` Stan-kernel half style, `:interval`, or `:upper`).
-Loud on unknown families and inapplicable overrides.
+Inferred unconstrained support (`:real`/`:positive`/`:unit`/`:interval`)
+for a sampled family plus an optional support override (`:positive`
+half-Normal/half-Cauchy style, `:positive_stan` Stan-kernel half style,
+`:interval`, or `:upper`). `:uniform` infers `:interval` from its own
+literal args and takes no override. Loud on unknown families and
+inapplicable overrides.
 """
 function support_of(family::Symbol, override::SupportOverride)
     haskey(SAMPLED_SUPPORT, family) ||
         throw(ContractValidationError("[layout] sampled family $family unknown"))
     inferred = SAMPLED_SUPPORT[family]
     override === nothing && return inferred
+    family === :uniform && throw(ContractValidationError(
+        "[layout] a uniform prior carries its own interval support — no " *
+        "support override applies, got $override"))
     if override isa Tuple
         if override[1] === :upper
             length(override) == 2 || throw(ContractValidationError(
@@ -48,10 +53,14 @@ function support_of(family::Symbol, override::SupportOverride)
 end
 
 # The transform kind and (for :interval/:upper) the constrained bounds a
-# layout entry needs, from a parameter's family + support override.
-function _entry_transform(family::Symbol, override::SupportOverride)
+# layout entry needs, from a parameter's family + support override (+ args:
+# a uniform's bounds come from its literal args, not an override).
+function _entry_transform(family::Symbol, override::SupportOverride,
+        args::NamedTuple)
     support = support_of(family, override)
     if support === :interval
+        family === :uniform &&
+            return (:interval, Float64(args.arg1), Float64(args.arg2))
         return (:interval, Float64(override[2]), Float64(override[3]))
     end
     if support === :upper
@@ -143,14 +152,16 @@ function assign_layout(plan::StructuralPlan)
         offset += K
     end
     for p in plan.parameters
-        transform, lo, hi = _entry_transform(p.family, p.support_override)
+        transform, lo, hi =
+            _entry_transform(p.family, p.support_override, p.args)
         push!(entries,
             LayoutEntry(:sampled, nothing, p.name, [p.name], offset, 1, transform,
                 lo, hi))
         offset += 1
     end
     for p in plan.plate_parameters
-        transform, lo, hi = _entry_transform(p.family, p.support_override)
+        transform, lo, hi =
+            _entry_transform(p.family, p.support_override, p.args)
         size = p.range === nothing ? plan.n_obs : length(p.range)
         push!(entries,
             LayoutEntry(:plate, nothing, p.name, [p.name], offset, size, transform,
@@ -194,7 +205,8 @@ function assign_layout(plan::StructuralPlan)
     # Spline coefficient vectors: one contiguous block per SplineVector
     # (plate-shaped; priors broadcast over cells). Width is static from k.
     for v in plan.spline_vectors
-        transform, lo, hi = _entry_transform(v.family, v.support_override)
+        transform, lo, hi =
+            _entry_transform(v.family, v.support_override, v.args)
         push!(entries,
             LayoutEntry(:spline, nothing, v.name, [v.name], offset, v.width,
                 transform, lo, hi))

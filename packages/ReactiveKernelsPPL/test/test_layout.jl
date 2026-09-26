@@ -79,10 +79,15 @@ end
     @test support_of(:normal, nothing) === :real
     @test support_of(:beta, nothing) === :unit
     @test support_of(:exponential, nothing) === :positive
+    @test support_of(:student_t, nothing) === :real
+    @test support_of(:laplace, nothing) === :real
+    @test support_of(:logistic, nothing) === :real
+    @test support_of(:uniform, nothing) === :interval
     @test support_of(:normal, :positive) === :positive
     @test support_of(:normal, (:interval, -1.0, 2.0)) === :interval
     @test support_of(:normal, (:upper, 2.0)) === :upper
     @test_throws ContractValidationError support_of(:exponential, :positive)
+    @test_throws ContractValidationError support_of(:uniform, :positive)
     # An :interval override needs a real-support family.
     @test_throws ContractValidationError support_of(:exponential, (:interval, 0.0, 1.0))
     # So does an :upper override.
