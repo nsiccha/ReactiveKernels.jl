@@ -4630,7 +4630,8 @@ end
 # convention — the width is static, so no declaration is needed to
 # size them). Stated vectors take `b[axes(X, 2)] .~ Normal.(loc,
 # scale)` with scalar (shared) or length-K literal-vector
-# (per-element) args.
+# (per-element) args — Normal-only (non-Normal betas use the
+# decomposed predictor form).
 function _lower_glm_beta_priors(label::Symbol, beta::Symbol, X::Symbol,
         sample, matrices::Dict{Symbol,DesignMatrix})
     m = get(matrices, X, nothing)
@@ -4644,7 +4645,11 @@ function _lower_glm_beta_priors(label::Symbol, beta::Symbol, X::Symbol,
     end
     stated === nothing && return PopulationPrior[
         PopulationPrior(label, c, 0.0, 1.0) for c in cols]
-    locs, scales = _coefficient_matrix_normal(beta, stated.rhs, label, K)
+    fam, locs, scales, _ =
+        _coefficient_matrix_prior(beta, stated.rhs, label, K)
+    fam === :normal || _sfail("response $label: GLM-object beta vectors " *
+                              "are Normal-only (got `$fam`) — write the " *
+                              "decomposed predictor form for other families")
     return PopulationPrior[PopulationPrior(label, c, l, sc)
         for (c, l, sc) in zip(cols, locs, scales)]
 end
@@ -6506,11 +6511,11 @@ function _treatment_removed(idx)
     return "got $(repr(idx))"
 end
 
-# Coefficient priors: recovered by name from `coef ~ Normal(lit, lit)`
-# statements; missing scalar priors default to Normal(0, 1) (emitter
-# convention). Factor coefficients instead take broadcast priors
-# (`c[levels(g)] .~ Normal.(lit, lit)`), which also size the block —
-# required, never defaulted — and each one emits its LevelMap.
+# Coefficient priors: recovered by name from `coef ~ Fam(...)` statements
+# (one family per addressee — see `_COEF_FAMILIES`); missing scalar priors
+# default to Normal(0, 1) (emitter convention). Factor coefficients instead
+# take broadcast priors (`c[levels(g)] .~ Fam.(...)`), which also size the
+# block — required, never defaulted — and each one emits its LevelMap.
 # Plan order follows predictors, addressees in term order.
 function _lower_coefficient_priors(sample, coefuse, predictors,
         matrices::Dict{Symbol,DesignMatrix},
@@ -6576,11 +6581,12 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
             end
             s = stated[name]
             s.levels !== nothing && _sfail("coefficient $name takes a " *
-                                           "scalar prior (`$name ~ Normal`), " *
-                                           "not a levels prior — it is used " *
+                                           "scalar prior, not a levels prior — it is used " *
                                            "as $(t.kind), not a factor")
-            loc, scale = _coefficient_normal(name, s.rhs, pred.name, addr)
-            push!(priors, PopulationPrior(pred.name, addr, sign * loc, scale))
+            fam, loc, scale, nu =
+                _coefficient_prior(name, s.rhs, pred.name, addr)
+            push!(priors, PopulationPrior(pred.name, addr, fam, sign * loc,
+                scale, nu))
         end
     end
     _check_identified(predictors, levelmaps, matrices)
@@ -6591,8 +6597,9 @@ end
 # use-matrix columns (`:Intercept` at intercept positions). Unstated
 # vectors default to K× Normal(0, 1) (emitter convention — the width is
 # static, so no declaration is needed to size them). Stated vectors take
-# `b[axes(S, 2)] .~ Normal.(loc, scale)` with scalar (shared) or
-# length-K literal-vector (per-element) args — real broadcast semantics.
+# `b[axes(S, 2)] .~ Fam.(args...)` — one shared family with scalar
+# (shared) or length-K literal-vector (per-element) args — real
+# broadcast semantics.
 function _lower_matrix_priors(pred, t, coefuse, stated, matrices)
     X = t.options.matrix
     m = get(matrices, X, nothing)
@@ -6612,25 +6619,37 @@ function _lower_matrix_priors(pred, t, coefuse, stated, matrices)
     # defaulted above).
     s.matrix === nothing && _sfail("internal: matrix prior for $name " *
                                    "lost its sizing matrix")
-    locs, scales = _coefficient_matrix_normal(name, s.rhs, pred.name, K)
-    return PopulationPrior[PopulationPrior(pred.name, e, sign * l, sc)
-        for (e, l, sc) in zip(elems, locs, scales)]
+    fam, locs, scales, nus =
+        _coefficient_matrix_prior(name, s.rhs, pred.name, K)
+    return PopulationPrior[PopulationPrior(pred.name, e, fam, sign * l, sc, n)
+        for (e, l, sc, n) in zip(elems, locs, scales, nus)]
 end
 
-# Dotted matrix priors peel to K (location, scale) pairs: each arg is a
-# Real (shared over elements) or a literal K-vector (per-element) —
-# Julia broadcast semantics over `Normal.(loc, scale)`.
-function _coefficient_matrix_normal(name, rhs, pname, K)
+# Dotted matrix priors peel to one shared family plus K (location,
+# scale, nu) triples: each arg is a Real (shared over elements) or a
+# literal K-vector (per-element) — Julia broadcast semantics over
+# `Fam.(args...)`, arg positions from `_COEF_SHAPES`.
+function _coefficient_matrix_prior(name, rhs, pname, K)
     rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
-        rhs.args[1] === :Normal && rhs.args[2] isa Expr &&
-        rhs.args[2].head === :tuple || _sfail(
+        rhs.args[1] isa Symbol && haskey(_COEF_FAMILIES, rhs.args[1]) &&
+        rhs.args[2] isa Expr && rhs.args[2].head === :tuple || _sfail(
             "coefficient $name of predictor $pname needs a broadcast " *
-            "`Normal.(location, scale)` prior, got $(repr(rhs))")
+            "prior (one of $_COEF_FAMILY_MSG, dotted), got $(repr(rhs))")
+    head = rhs.args[1]
+    fam = _COEF_FAMILIES[head]
     args = rhs.args[2].args
-    length(args) == 2 || _sfail("coefficient $name of predictor $pname " *
-                                "needs `Normal.(location, scale)`")
-    return _matrix_prior_arg(name, args[1], pname, K, "location"),
-        _matrix_prior_arg(name, args[2], pname, K, "scale")
+    if fam === :flat
+        isempty(args) || _sfail("coefficient $name of predictor $pname: " *
+                                "`Flat.()` takes no arguments")
+        return :flat, fill(0.0, K), fill(1.0, K), fill(NaN, K)
+    end
+    want, lipos, spos, npos = _COEF_SHAPES[fam]
+    length(args) == want || _sfail("coefficient $name of predictor $pname " *
+                                   "needs `$head` with $want arguments")
+    vecs = [_matrix_prior_arg(name, a, pname, K, "arg$i")
+        for (i, a) in enumerate(args)]
+    nus = npos == 0 ? fill(NaN, K) : vecs[npos]
+    return fam, vecs[lipos], vecs[spos], nus
 end
 
 function _matrix_prior_arg(name, a, pname, K, role)
@@ -6781,7 +6800,11 @@ function _lower_horseshoe_priors(sample, coefuse, predictors,
                                            "scalar prior (`$name ~ Normal`), " *
                                            "not a levels prior — it is used " *
                                            "as $(t.kind), not a factor")
-            loc, scale = _coefficient_normal(name, s.rhs, pred.name, addr)
+            fam, loc, scale, _ =
+                _coefficient_prior(name, s.rhs, pred.name, addr)
+            fam === :normal || _sfail("coefficient $name of predictor " *
+                                      "$(pred.name) sits beside a horseshoe prior — " *
+                                      "its scalar prior must be `Normal(...)`")
             push!(params, _horseshoe_normal_param(pred.name, addr,
                 sign * loc, scale, taken))
         end
@@ -6804,7 +6827,7 @@ end
 
 # R2D2 declarations to IR: one R2D2Prior per declared predictor.
 # Stated Normal coefficient priors become share-0 overrides (scalar
-# via _coefficient_normal, factor blocks via the broadcast form);
+# via _coefficient_prior, factor blocks via the broadcast form);
 # unstated columns join the simplex (factors take a full-cover
 # LevelMap — the identified check fires exactly when that collides
 # with an intercept, same as the PopulationPrior path). Omitted tau
@@ -6867,7 +6890,12 @@ function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
                                            "scalar prior (`$name ~ Normal`), " *
                                            "not a levels prior — it is used " *
                                            "as $(t.kind), not a factor")
-            loc, scale = _coefficient_normal(name, s.rhs, pred.name, addr)
+            fam, loc, scale, _ =
+                _coefficient_prior(name, s.rhs, pred.name, addr)
+            fam === :normal || _sfail("coefficient $name of predictor " *
+                                      "$(pred.name) carries an r2d2 prior — stated " *
+                                      "scalar priors must be `Normal(...)` " *
+                                      "(r2d2 overrides are Normal-only)")
             overrides[addr] = (sign * loc, scale)
         end
         tau = d.tau
@@ -6904,7 +6932,12 @@ function _lower_r2d2_matrix(pred, t, coefuse, stated, matrices)
     s = stated[name]
     s.matrix === nothing && _sfail("internal: matrix prior for $name " *
                                    "lost its sizing matrix")
-    locs, scales = _coefficient_matrix_normal(name, s.rhs, pred.name, K)
+    fam, locs, scales, _ =
+        _coefficient_matrix_prior(name, s.rhs, pred.name, K)
+    fam === :normal || _sfail("coefficient $name of predictor " *
+                              "$(pred.name) carries an r2d2 prior — stated " *
+                              "matrix priors must be `Normal.(...)` " *
+                              "(r2d2 overrides are Normal-only)")
     return [(e, (sign * l, sc)) for (e, l, sc) in zip(elems, locs, scales)]
 end
 
@@ -6925,7 +6958,12 @@ function _lower_r2d2_factor(pred, t, name, sign, stated, levelmaps)
     gcol, subset = s.levels
     gcol === col || _sfail("coefficient $name: levels column $gcol " *
                            "differs from use column $col")
-    loc, scale = _coefficient_broadcast_normal(name, s.rhs, pred.name, col)
+    fam, loc, scale, _ =
+        _coefficient_broadcast_prior(name, s.rhs, pred.name, col)
+    fam === :normal || _sfail("coefficient $name of predictor " *
+                              "$(pred.name) carries an r2d2 prior — stated " *
+                              "broadcast priors must be `Normal.(...)` " *
+                              "(r2d2 overrides are Normal-only)")
     push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
     return (sign * loc, scale)
 end
@@ -6944,28 +6982,39 @@ function _lower_factor_prior(pred, t, name, sign, stated, levelmaps)
     gcol, subset = s.levels
     gcol === col || _sfail("coefficient $name: levels column $gcol " *
                            "differs from use column $col")
-    loc, scale = _coefficient_broadcast_normal(name, s.rhs, pred.name, col)
+    fam, loc, scale, nu =
+        _coefficient_broadcast_prior(name, s.rhs, pred.name, col)
     push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
-    return PopulationPrior(pred.name, col, sign * loc, scale)
+    return PopulationPrior(pred.name, col, fam, sign * loc, scale, nu)
 end
 
-# Dotted coefficient priors peel to one shared (location, scale): broadcast
-# args must be literals (per-level priors are not in slice 1).
-function _coefficient_broadcast_normal(name, rhs, pname, col)
+# Dotted coefficient priors peel to one shared (family, location, scale,
+# nu): broadcast args must be literals (per-level priors are not in
+# slice 1), positions from `_COEF_SHAPES`.
+function _coefficient_broadcast_prior(name, rhs, pname, col)
     rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
-        rhs.args[1] === :Normal && rhs.args[2] isa Expr &&
-        rhs.args[2].head === :tuple || _sfail(
+        rhs.args[1] isa Symbol && haskey(_COEF_FAMILIES, rhs.args[1]) &&
+        rhs.args[2] isa Expr && rhs.args[2].head === :tuple || _sfail(
             "coefficient $name of predictor $pname needs a broadcast " *
-            "`Normal.(literal, literal)` prior, got $(repr(rhs))")
+            "prior (one of $_COEF_FAMILY_MSG, dotted), got $(repr(rhs))")
+    head = rhs.args[1]
+    fam = _COEF_FAMILIES[head]
     args = rhs.args[2].args
-    length(args) == 2 || _sfail("coefficient $name of predictor $pname " *
-                                "needs `Normal.(location, scale)`")
-    loc, scale = args
-    loc isa Real || _sfail("coefficient $name prior location must be a " *
-                           "literal (per-level priors are not in slice 1)")
-    scale isa Real || _sfail("coefficient $name prior scale must be a " *
-                             "literal (per-level priors are not in slice 1)")
-    return Float64(loc), Float64(scale)
+    if fam === :flat
+        isempty(args) || _sfail("coefficient $name of predictor $pname: " *
+                                "`Flat.()` takes no arguments")
+        return :flat, 0.0, 1.0, NaN
+    end
+    want, lipos, spos, npos = _COEF_SHAPES[fam]
+    length(args) == want || _sfail("coefficient $name of predictor $pname " *
+                                   "needs `$head` with $want arguments")
+    for a in args
+        a isa Real || _sfail("coefficient $name prior parameter must be a " *
+                             "literal (per-level priors are not in slice 1), got " *
+                             "$(repr(a))")
+    end
+    vals = Float64.(args)
+    return fam, vals[lipos], vals[spos], npos == 0 ? NaN : vals[npos]
 end
 
 # Surface-side identifiability gate (the contract validator repeats it for
@@ -7004,29 +7053,61 @@ function _find_use(coefuse, pname, addr)
     return nothing
 end
 
-function _coefficient_normal(name, rhs, pname, addr)
-    rhs isa Expr && rhs.head === :call && rhs.args[1] === :Normal ||
+# Coefficient-prior surface heads → IR families (per-addressee,
+# prior-vocab slice). `StudentT` is `(nu, location, scale)` in Stan
+# order; `Flat()` takes no arguments.
+const _COEF_FAMILIES = Dict{Symbol,Symbol}(
+    :Normal => :normal, :StudentT => :student_t, :Cauchy => :cauchy,
+    :Laplace => :laplace, :Logistic => :logistic, :Flat => :flat,
+)
+const _COEF_FAMILY_MSG = "Normal, StudentT, Cauchy, Laplace, Logistic, Flat"
+
+# Coefficient-prior arg shapes → (arity, location index, scale index, nu
+# index or 0). One row per family, shared by the scalar, broadcast, and
+# matrix peelers — a future family adds a row, never a branch.
+const _COEF_SHAPES = Dict{Symbol,NTuple{4,Int}}(
+    :normal => (2, 1, 2, 0), :cauchy => (2, 1, 2, 0),
+    :laplace => (2, 1, 2, 0), :logistic => (2, 1, 2, 0),
+    :student_t => (3, 2, 3, 1),
+)
+
+# Scalar coefficient prior → (family, location, scale, nu): params are
+# literals (`nu` is `NaN` unless StudentT; `:flat` carries conventional
+# `(0.0, 1.0, NaN)`, ignored downstream).
+function _coefficient_prior(name, rhs, pname, addr)
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+        rhs.args[1] isa Symbol && haskey(_COEF_FAMILIES, rhs.args[1]) ||
         _sfail("coefficient $name of predictor $pname needs a " *
-               "`Normal(literal, literal)` prior, got $(repr(rhs))")
+               "scalar prior (one of $_COEF_FAMILY_MSG), got $(repr(rhs))")
+    head = rhs.args[1]
+    fam = _COEF_FAMILIES[head]
     args = _plain_args(rhs, "coefficient prior")
-    length(args) == 2 || _sfail("coefficient $name of predictor $pname " *
-                                "needs `Normal(location, scale)`")
-    loc, scale = args
-    (loc isa Real || loc === :Inf) ||
-        _sfail("coefficient $name prior location must be a literal " *
-               "(hierarchical coefficient priors are not in slice 1)")
-    (scale isa Real || scale === :Inf) ||
-        _sfail("coefficient $name prior scale must be a literal")
-    locv = loc === :Inf ? Inf : Float64(loc)
-    scalev = scale === :Inf ? Inf : Float64(scale)
-    return locv, scalev
+    if fam === :flat
+        isempty(args) || _sfail("coefficient $name of predictor $pname: " *
+                                "`Flat()` takes no arguments")
+        return :flat, 0.0, 1.0, NaN
+    end
+    want, lipos, spos, npos = _COEF_SHAPES[fam]
+    length(args) == want || _sfail("coefficient $name of predictor $pname " *
+                                   "needs `$head` with $want arguments")
+    vals = [_coefficient_literal(name, a, pname) for a in args]
+    return fam, vals[lipos], vals[spos], npos == 0 ? NaN : vals[npos]
+end
+
+function _coefficient_literal(name, a, pname)
+    (a isa Real || a === :Inf) ||
+        _sfail("coefficient $name prior parameter must be a literal " *
+               "(hierarchical coefficient priors are not in slice 1), got " *
+               "$(repr(a))")
+    return a === :Inf ? Inf : Float64(a)
 end
 
 const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :Normal => :normal, :Cauchy => :cauchy,
     :Exponential => :exponential, :Gamma => :gamma,
     :LogNormal => :lognormal, :Beta => :beta,
-    :InverseGamma => :inverse_gamma,
+    :InverseGamma => :inverse_gamma, :StudentT => :student_t,
+    :Laplace => :laplace, :Logistic => :logistic, :Uniform => :uniform,
 )
 
 function _lower_parameters(sample, coefuse, ctx, glmuse)
@@ -7176,13 +7257,15 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
     fam in (:weighted, :censored, :interval_censored) &&
         _sfail("`$fam` applies to responses only (parameter $lhs)")
     fam in (:normal, :cauchy, :exponential, :gamma, :lognormal, :beta,
-        :inverse_gamma, :halfnormal, :halfcauchy) &&
+        :inverse_gamma, :student_t, :laplace, :logistic, :uniform,
+        :halfnormal, :halfcauchy) &&
         _sfail("parameter $lhs: use Distributions.jl constructors " *
                "(`Normal`, not `normal`)")
     haskey(_PARAM_FAMILIES, fam) ||
         _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
                "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
-               "Beta, InverseGamma, HalfNormal, HalfCauchy, Flat, " *
+               "Beta, InverseGamma, StudentT, Laplace, Logistic, Uniform, " *
+               "HalfNormal, HalfCauchy, Flat, " *
                "Dirichlet, LKJCovarianceFactor, truncated). If `$fam` is " *
                "meant as a submodel, define it with " *
                "`@rkppl $fam(args...) = begin ... end` and " *
@@ -7243,14 +7326,23 @@ function _truncation_bound(lhs, b)
         "(a finite Real or ±Inf), got $(repr(b))")
 end
 
-# Parameter truncation lowers to a support override: `truncated(Normal(0, s), 0,
-# Inf)` (a half at a literal-zero location) → `:positive` (exact +log(2)); an
-# upper-only `truncated(Normal(mu, s), -Inf, hi)` → `(:upper, hi)` (Stan's
-# upper-bound kernel `x = hi - exp(u)`, bare-`u` Jacobian, NO truncation
-# renormalizer — Normal-only, any location); and a two-sided FINITE
-# `truncated(Normal(mu, s), lo, hi)` → `(:interval, lo, hi)` (an
-# affine-logistic constrained transform with the exact -log(cdf(hi)-cdf(lo))
-# renormalization; Normal-only, any location). Bounds are literals.
+# Truncated base heads → (arity, location position). Halves generalize to
+# every symmetric family; upper-only and finite intervals stay Normal-only
+# (the gates below).
+const _TRUNCATED_BASES = Dict{Symbol,Tuple{Int,Int}}(
+    :Normal => (2, 1), :Cauchy => (2, 1), :StudentT => (3, 2),
+    :Laplace => (2, 1), :Logistic => (2, 1),
+)
+
+# Parameter truncation lowers to a support override: `truncated(Base(0, s),
+# 0, Inf)` (a half at a literal-zero location, any symmetric base) →
+# `:positive` (exact +log(2)); an upper-only `truncated(Normal(mu, s),
+# -Inf, hi)` → `(:upper, hi)` (Stan's upper-bound kernel `x = hi - exp(u)`,
+# bare-`u` Jacobian, NO truncation renormalizer — Normal-only, any
+# location); and a two-sided FINITE `truncated(Normal(mu, s), lo, hi)` →
+# `(:interval, lo, hi)` (an affine-logistic constrained transform with the
+# exact -log(cdf(hi)-cdf(lo)) renormalization; Normal-only, any location).
+# Bounds are literals.
 function _lower_truncated_param(lhs, rhs, coefuse, matrices)
     args = _plain_args(rhs, "`truncated`")
     length(args) == 3 || _sfail("parameter $lhs: use the Distributions.jl " *
@@ -7260,25 +7352,29 @@ function _lower_truncated_param(lhs, rhs, coefuse, matrices)
         "parameter $lhs: `truncated` wraps a distribution object, got " *
         "$(repr(obj))")
     fam = obj.args[1]
-    fam in (:Normal, :Cauchy) || _sfail(
-        "parameter $lhs: slice-1 truncation wraps Normal/Cauchy " *
-        "(`truncated(Normal(mu, s), lo, hi)`); got $fam")
+    haskey(_TRUNCATED_BASES, fam) || _sfail(
+        "parameter $lhs: `truncated` wraps a symmetric base " *
+        "(`truncated(Normal(mu, s), lo, hi)`; admitted: Normal, Cauchy, " *
+        "StudentT, Laplace, Logistic); got $fam")
+    want, locpos = _TRUNCATED_BASES[fam]
     oargs = _plain_args(obj, "`$fam`")
-    length(oargs) == 2 || _sfail("parameter $lhs: `$fam` takes two arguments")
+    length(oargs) == want ||
+        _sfail("parameter $lhs: `$fam` takes $want arguments")
     vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in oargs]
     base = _PARAM_FAMILIES[fam]
+    tkeys = ntuple(i -> Symbol(:arg, i), length(vals))
+    targs = NamedTuple{tkeys}(Tuple(vals))
     lo = _truncation_bound(lhs, lo_a)
     hi = _truncation_bound(lhs, hi_a)
     lo < hi || _sfail("parameter $lhs: truncation needs lower < upper, " *
                       "got ($lo, $hi)")
     # Half-truncation [0, Inf) at a literal-zero location → the exact +log(2) case.
     if lo == 0 && isinf(hi) && hi > 0
-        (oargs[1] isa Real && oargs[1] == 0) || _sfail(
+        (oargs[locpos] isa Real && oargs[locpos] == 0) || _sfail(
             "parameter $lhs: a `truncated(_, 0, Inf)` half needs a literal zero " *
-            "location (use `HalfNormal(s)`); a non-zero location needs finite " *
-            "bounds (`truncated(Normal(mu, s), lo, hi)`)")
-        return SampledParameter(lhs, base,
-            (arg1 = vals[1], arg2 = vals[2]), :positive, lhs)
+            "location (a Normal half spells `HalfNormal(s)`); a non-zero " *
+            "location needs finite bounds (`truncated(Normal(mu, s), lo, hi)`)")
+        return SampledParameter(lhs, base, targs, :positive, lhs)
     end
     # Upper-only truncation → Stan's upper-bound kernel (Normal-only in
     # slice 1). A finite LOWER-only bound stays rejected (no one-sided
