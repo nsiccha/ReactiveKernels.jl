@@ -400,12 +400,13 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
-    # Sampled names usable as predictor coefficients: Normal-priored
-    # scalars plus per-coefficient `~ Horseshoe()` scalars (the
-    # horseshoe triple synthesis in `_lower_horseshoe_priors`).
+    # Sampled names usable as predictor coefficients: coefficient-priored
+    # scalars (see `_COEF_FAMILIES`) plus per-coefficient `~ Horseshoe()`
+    # scalars (the horseshoe triple synthesis in
+    # `_lower_horseshoe_priors`).
     coef_priors = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data &&
-            (_is_normal_call(s.rhs) || _is_horseshoe_call(s.rhs)))
+            (_is_coef_prior_call(s.rhs) || _is_horseshoe_call(s.rhs)))
     # Simplex parameters (`s ~ Dirichlet(...)`): the only names a
     # monotonic term accepts as its increments (checked during response
     # lowering, before `_lower_parameters` runs).
@@ -878,6 +879,10 @@ end
 _is_normal_call(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
     rhs.args[1] === :Normal
+
+_is_coef_prior_call(rhs) =
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+    rhs.args[1] isa Symbol && haskey(_COEF_FAMILIES, rhs.args[1])
 
 _is_horseshoe_call(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&

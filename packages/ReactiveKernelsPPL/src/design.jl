@@ -168,21 +168,22 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
 end
 
 """
-    coefficient_priors(shape, priors) -> (locations, scales)
+    coefficient_prior_specs(shape, priors) -> Vector{PopulationPrior}
 
-Expand per-addressee [`PopulationPrior`](@ref)s to per-coefficient location
-and scale vectors in design-column order. A factor addressee fans out to its
-whole contrast block (one shared Normal); a matrix block looks up each
-element addressee in turn (per-column Normals).
+Per-coefficient [`PopulationPrior`](@ref) rows in design-column order (the
+shared expansion core: a factor addressee fans out to its whole block, a
+matrix block looks up each element addressee in turn).
+[`coefficient_priors`](@ref) projects locations/scales; the generator
+reads families from the same walk.
 """
-function coefficient_priors(shape::DesignShape, priors::Vector{PopulationPrior})
+function coefficient_prior_specs(shape::DesignShape,
+        priors::Vector{PopulationPrior})
     by_addressee = Dict{Symbol,PopulationPrior}()
     for pr in priors
         pr.predictor === shape.predictor || continue
         by_addressee[pr.addressee] = pr
     end
-    locations = Float64[]
-    scales = Float64[]
+    out = PopulationPrior[]
     for b in shape.blocks
         b.width == 0 && continue
         if b.kind === MatrixTerm
@@ -193,9 +194,7 @@ function coefficient_priors(shape::DesignShape, priors::Vector{PopulationPrior})
                         "[$(shape.predictor)] no prior for addressee " *
                         "$addr (matrix $(b.addressee) element $lab)"),
                 )
-                pr = by_addressee[addr]
-                push!(locations, Float64(pr.location))
-                push!(scales, Float64(pr.scale))
+                push!(out, by_addressee[addr])
             end
             continue
         end
@@ -203,11 +202,24 @@ function coefficient_priors(shape::DesignShape, priors::Vector{PopulationPrior})
             ContractValidationError("[$(shape.predictor)] no prior for addressee " *
                                     "$(b.addressee)"),
         )
-        pr = by_addressee[b.addressee]
-        append!(locations, fill(Float64(pr.location), b.width))
-        append!(scales, fill(Float64(pr.scale), b.width))
+        append!(out, fill(by_addressee[b.addressee], b.width))
     end
-    return (locations, scales)
+    return out
+end
+
+"""
+    coefficient_priors(shape, priors) -> (locations, scales)
+
+Expand per-addressee [`PopulationPrior`](@ref)s to per-coefficient location
+and scale vectors in design-column order (via
+[`coefficient_prior_specs`](@ref)). A factor addressee fans out to its
+whole contrast block (one shared prior); a matrix block looks up each
+element addressee in turn (per-column priors).
+"""
+function coefficient_priors(shape::DesignShape, priors::Vector{PopulationPrior})
+    specs = coefficient_prior_specs(shape, priors)
+    return ([Float64(s.location) for s in specs],
+        [Float64(s.scale) for s in specs])
 end
 
 """

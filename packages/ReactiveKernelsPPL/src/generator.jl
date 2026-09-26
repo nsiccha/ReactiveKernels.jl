@@ -80,7 +80,7 @@ using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
     beta, inverse_gamma, binomial, negative_binomial2, beta_binomial,
-    uniform,
+    uniform, laplace, logistic,
     student_t, zero_inflated_poisson,
     gp_exp_quad_cov, gp_chol_latent,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
@@ -2238,6 +2238,104 @@ function _horseshoe_coef_statements(plan::StructuralPlan)
     return stmts
 end
 
+# One homogeneous coefficient plate over `coefaccess` (the block symbol or
+# a static-range slice) with per-lane (location, scale[, nu]) vectors.
+# The cell is the table-driven endpoint splice; only the 2-vs-3 arg
+# plate shape differs (StudentT threads a nu vector).
+function _append_coef_plate!(stmts::Vector{Expr}, coefaccess::Any,
+        node::Symbol, pw::Symbol, mut::Symbol, sdt::Symbol, nut::Symbol,
+        loc::Vector{Float64}, sca::Vector{Float64}, nus::Vector{Float64},
+        fam::Symbol)
+    fam === :flat && throw(ContractValidationError(
+        "[generator] internal: flat coefficients contribute no plate"))
+    push!(stmts, :($mut = Float64[$(loc...)]))
+    push!(stmts, :($sdt = Float64[$(sca...)]))
+    if fam === :student_t
+        push!(stmts, :($nut = Float64[$(nus...)]))
+        cv, nuv, mv, sv = _dovar(1), _dovar(2), _dovar(3), _dovar(4)
+        cell = _family_logpdf_expr(fam, Any[nuv, mv, sv], cv)
+        append!(stmts, _plate_sum_stmts(pw, node,
+            Any[coefaccess, nut, mut, sdt], cell))
+    else
+        cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
+        cell = _family_logpdf_expr(fam, Any[mv, sv], cv)
+        append!(stmts, _plate_sum_stmts(pw, node,
+            Any[coefaccess, mut, sdt], cell))
+    end
+    return nothing
+end
+
+# Endpoint args for one population row (literals): StudentT carries nu.
+_population_endpoint_args(pr::PopulationPrior) = pr.family === :student_t ?
+    Any[Float64(pr.nu), Float64(pr.location), Float64(pr.scale)] :
+    Any[Float64(pr.location), Float64(pr.scale)]
+
+# Per-addressee emission for a MIXED predictor (the homogeneous fast path
+# in `_prior_statements` keeps today's exact plate): width-1 blocks become
+# scalar density nodes over literal coefficient reads (the heterogeneous
+# sd-prior margins precedent); wide Factor/MatrixTerm blocks — one family
+# per block, validated — become one plate each over a static-range slice
+# (data-derived widths stay in loops); flat addressees contribute nothing.
+function _mixed_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
+        pred::PredictorSpec, shape::DesignShape,
+        priors::Vector{PopulationPrior})
+    by_addressee = Dict{Symbol,PopulationPrior}()
+    for pr in priors
+        pr.predictor === pred.name || continue
+        by_addressee[pr.addressee] = pr
+    end
+    coef = block_name(pred.name)
+    offset = 0
+    for b in shape.blocks
+        b.width == 0 && continue
+        if b.kind === FactorTerm || b.kind === MatrixTerm
+            elrows = b.kind === FactorTerm ?
+                fill(by_addressee[b.addressee], b.width) :
+                [by_addressee[e === nothing ? :Intercept : e]
+                    for e in b.elements]
+            fam = elrows[1].family
+            fam === :flat || _mixed_wide_block_stmts!(stmts, terms,
+                pred.name, b, coef, offset, elrows, fam)
+        else
+            b.width == 1 || throw(ContractValidationError(
+                "[generator] internal: mixed-prior scalar block " *
+                "$(b.addressee) of $(pred.name) has width $(b.width)"))
+            pr = by_addressee[b.addressee]
+            pr.family === :flat && continue
+            node = Symbol(:_ppl_prior_, pred.name, :_, b.addressee)
+            expr = _family_logpdf_expr(pr.family,
+                _population_endpoint_args(pr),
+                Expr(:ref, coef, offset + 1))
+            push!(stmts, :($node::Float64 = $expr))
+            push!(terms, node)
+        end
+        offset += b.width
+    end
+    return nothing
+end
+
+# One wide homogeneous block of a mixed predictor: a plate over the
+# block's static-range slice with the block family's cell.
+function _mixed_wide_block_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
+        pname::Symbol, b::DesignBlock, coef::Symbol, offset::Int,
+        elrows::Vector{PopulationPrior}, fam::Symbol)
+    tag = b.kind === FactorTerm ? b.addressee : b.column
+    node = Symbol(:_ppl_prior_, pname, :_, tag)
+    pw = Symbol(:_ppl_pw_prior_, pname, :_, tag)
+    mut = Symbol(:_ppl_prmu_, pname, :_, tag)
+    sdt = Symbol(:_ppl_prsd_, pname, :_, tag)
+    nut = Symbol(:_ppl_prnu_, pname, :_, tag)
+    slice = Expr(:ref, coef,
+        Expr(:call, :(:), offset + 1, offset + b.width))
+    loc = [Float64(r.location) for r in elrows]
+    sca = [Float64(r.scale) for r in elrows]
+    nus = [Float64(r.nu) for r in elrows]
+    _append_coef_plate!(stmts, slice, node, pw, mut, sdt, nut, loc, sca,
+        nus, fam)
+    push!(terms, node)
+    return nothing
+end
+
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     stmts = Expr[]
     terms = Any[]
@@ -2255,12 +2353,27 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         sdt = Symbol(:_ppl_prsd_, pred.name)
         rp = _r2d2_for(plan, pred.name)
         if rp === nothing
-            loc, sca = coefficient_priors(shape, plan.population_priors)
-            push!(stmts, :($mut = Float64[$(loc...)]))
-            push!(stmts, :($sdt = Float64[$(sca...)]))
-        else
-            push!(stmts, _r2d2_prior_stmts(rp, shape, plan.columns, mut, sdt)...)
+            specs = coefficient_prior_specs(shape, plan.population_priors)
+            fams = map(s -> s.family, specs)
+            if all(==(fams[1]), fams) && fams[1] !== :flat
+                # Homogeneous fast path: today's exact plate, family cell.
+                nut = Symbol(:_ppl_prnu_, pred.name)
+                loc = [Float64(s.location) for s in specs]
+                sca = [Float64(s.scale) for s in specs]
+                nus = [Float64(s.nu) for s in specs]
+                _append_coef_plate!(stmts, block_name(pred.name), node, pw,
+                    mut, sdt, nut, loc, sca, nus, fams[1])
+                push!(terms, node)
+            elseif all(==(:flat), fams)
+                push!(stmts, :($node::Float64 = 0.0))
+                push!(terms, node)
+            else
+                _mixed_prior_stmts!(stmts, terms, pred, shape,
+                    plan.population_priors)
+            end
+            continue
         end
+        push!(stmts, _r2d2_prior_stmts(rp, shape, plan.columns, mut, sdt)...)
         coef = block_name(pred.name)
         cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
         cell = :(normal($mv, $sv).logpdf($cv))
@@ -2536,42 +2649,32 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     return nothing
 end
 
-# Scalar prior log-density per family via distribution-kernel endpoints
-# (Distributions.jl semantics). Args are literals (inlined) or
-# parameter/assignment refs (body locals, fine in scalar position).
-# Half-Normal/half-Cauchy renormalize by exactly +log(2) (symmetry at 0);
-# the `:interval`/`:upper` corrections live in `_support_correction`.
-# `gamma` takes rate, so the contract's scale inverts.
-# Shared `<family>(remapped args…).logpdf(x)` for a variate expression `x` (a
-# scalar parameter name, a plate do-var, or a scan setup/recurrence read). Args
-# are literals (inlined) or parameter/assignment/threaded refs. Shared by scalar
-# priors, per-cell plate priors, and the scan density. `gamma` takes rate, so
-# the contract's scale inverts.
+# Sampled/prior family → distribution-kernel endpoint object. One row per
+# family — a future family adds a row, never a branch.
+const _PRIOR_ENDPOINTS = Dict{Symbol,Symbol}(
+    :normal => :normal, :cauchy => :cauchy,
+    :exponential => :exponential, :gamma => :gamma,
+    :lognormal => :lognormal, :beta => :beta,
+    :inverse_gamma => :inverse_gamma, :student_t => :student_t,
+    :laplace => :laplace, :logistic => :logistic, :uniform => :uniform,
+)
+
+# Shared `<endpoint>(remapped args…).logpdf(x)` splice for a variate
+# expression `x` (a scalar parameter name, a plate do-var, a scan
+# setup/recurrence read, or a coefficient element read). Args are literals
+# (inlined) or parameter/assignment/threaded refs (Distributions.jl
+# semantics). Shared by scalar priors, per-cell plate priors, population
+# priors, and the scan density. `gamma` takes rate, so the contract's
+# scale inverts; `:flat` is the vacuous 0.0. Symmetric `:positive`
+# halves (`+log(2)`) and the `:interval`/`:upper` corrections live in
+# `_support_correction`.
 function _family_logpdf_expr(family::Symbol, a, x)
-    if family === :normal
-        mu, s = a
-        :(normal($mu, $s).logpdf($x))
-    elseif family === :cauchy
-        mu, s = a
-        :(cauchy($mu, $s).logpdf($x))
-    elseif family === :exponential
-        (th,) = a
-        :(exponential($th).logpdf($x))
-    elseif family === :gamma
-        al, th = a
-        :(gamma($al, 1 / $th).logpdf($x))
-    elseif family === :lognormal
-        mu, s = a
-        :(lognormal($mu, $s).logpdf($x))
-    elseif family === :beta
-        al, be = a
-        :(beta($al, $be).logpdf($x))
-    elseif family === :inverse_gamma
-        al, th = a
-        :(inverse_gamma($al, $th).logpdf($x))
-    else # :flat
-        :(0.0)
-    end
+    family === :flat && return :(0.0)
+    ep = get(_PRIOR_ENDPOINTS, family, nothing)
+    ep === nothing && throw(ContractValidationError(
+        "[generator] prior family $family has no endpoint object"))
+    args = family === :gamma ? (a[1], :(1 / $(a[2]))) : Tuple(a)
+    return :($ep($(args...)).logpdf($x))
 end
 
 # The additive support-override correction for a prior log-density (or `nothing`
