@@ -70,10 +70,13 @@ end
 # Fixed-arity plate steps: the slurped `args...` tuple above round-trips
 # through `ntuple` construction and two splats, which boxes one tuple per call
 # on Julia 1.10 even though every element is stack-allocatable. Bind every
-# argument explicitly for the arities programs actually emit, with the
-# cache-selection logic fully inline (the axes tuple must not cross a helper
-# boundary either); the varargs methods stay as the fallback for degenerate
-# (0-argument, which throws) and very wide plates.
+# argument explicitly for the arities programs actually emit; the varargs
+# methods stay as the fallback for degenerate (0-argument, which throws) and
+# very wide plates. The Array branch still refines through
+# `_authored_plate_array_cache`, which recovers the rank from the inferred
+# axes-tuple type: an untyped batched port seeds the unranked `Ref{Array{T}}`
+# slot, and `ndims` on that rank-unknown cache dynamically dispatches (and
+# leaves `broadcast!` rank-unknown), allocating hundreds of bytes per call.
 for _PLATE_N in 1:8
     _a = [Symbol(:_plate_a_, i) for i in 1:_PLATE_N]
     _w = [Symbol(:_plate_w_, i) for i in 1:_PLATE_N]
@@ -91,12 +94,7 @@ for _PLATE_N in 1:8
         cache = slot[]
         output_type = eltype(cache)
         result = if cache isa Array{output_type}
-            if ndims(cache) == length(combined_axes) &&
-               Base.axes(cache) == combined_axes
-                cache
-            else
-                similar(cache, output_type, combined_axes)
-            end
+            _authored_plate_array_cache(cache, combined_axes)
         elseif Base.axes(cache) == combined_axes &&
                eltype(cache) == output_type
             cache
