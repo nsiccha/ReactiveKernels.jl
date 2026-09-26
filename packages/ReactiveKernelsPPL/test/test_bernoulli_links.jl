@@ -158,6 +158,113 @@ function _links_parity_progs()
     ]
 end
 
+# Binomial-twin stretch dataset (same Xoshiro(2609) stream as the
+# Bernoulli data — identical x, then per-link Binomial draws in cl/cp/cc
+# stream order), with checksums gated before any pin.
+function _bernoulli_links_binom_data()
+    rng = Xoshiro(2609)
+    x = randn(rng, 100)
+    eta = 0.5 .- 0.25 .* x
+    n = fill(5, 100)
+    pl = 1 ./ (1 .+ exp.(-eta))
+    pp = cdf.(Ref(Normal()), eta)
+    pc = 1 .- exp.(-exp.(eta))
+    cl = [rand(rng, Binomial(nn, p)) for (nn, p) in zip(n, pl)]
+    cp = [rand(rng, Binomial(nn, p)) for (nn, p) in zip(n, pp)]
+    cc = [rand(rng, Binomial(nn, p)) for (nn, p) in zip(n, pc)]
+    return x, n, cl, cp, cc
+end
+
+_links_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
+
+# SB parity vs the peer lane's BridgeStan numbers (brief
+# 2026-09-26T14-21-56-212-19fcsp1 on
+# BayesianRegressionModels:rk:parity-fam-bernoulli-links, BRM 61f2a22,
+# StanBlocks 24578c3, BridgeStan 2.9.0): full posterior at u_unc,
+# propto=false, no Jacobian (unconstrained-reals-only models), BridgeStan
+# AD grads. Pins compare by coordinate name (SB pins below are in SB
+# declaration order [b0, b1]).
+@testset "bernoulli links SB parity" begin
+    x, y = _bernoulli_links_data()
+    @test length(y) == 100 && sum(y) == 56
+    cols = Dict{Symbol,AbstractVector}(:y => y, :x => x)
+    sb = Dict(
+        "logit" => (-71.1083613684301,
+            [-6.731688596946846, 2.056004273514957]),
+        "probit" => (-74.70474010682705,
+            [-22.163518695057945, 9.180926009900183]),
+        "cloglog" => (-87.74575244667403,
+            [-52.8528057278787, 17.566693811623846]),
+    )
+    for (name, prog, _) in _links_parity_progs()
+        @testset "$name" begin
+            # SB: a, b ~ std_normal; eta ~ 1 + x; y ~ Bernoulli(link).
+            # u (SB order [b0, b1]) = [0.5, -0.25].
+            bound, built, kern = _links_query(prog, cols)
+            names = coordinate_names(built.layout)
+            u = _links_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
+                Symbol("eta.x") => -0.25])
+            want, wantg = sb[name]
+            @test abs(Base.invokelatest(kern, u) - want) < 1e-12
+            prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+            g = similar(u)
+            sampler_value_and_gradient!(prep, g, u)
+            @test all(isfinite, g)
+            @test maximum(abs.(g .- _links_sb_vec(names,
+                [names[1] => wantg[1], names[2] => wantg[2]]))) < 1e-10
+        end
+    end
+    @testset "binomial twins" begin
+        xb, n, cl, cp, cc = _bernoulli_links_binom_data()
+        @test xb == x
+        @test sum(cl) == 298 && sum(cp) == 352 && sum(cc) == 393
+        @test cl[1:3] == [3, 3, 3] && cp[1:3] == [2, 1, 3] &&
+            cc[1:3] == [3, 4, 5]
+        twins = [
+            ("logit", cl, quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                mu = a .+ b .* x
+                y .~ Binomial.(n, logistic.(mu))
+            end, -150.21083717068223,
+            [-13.658442984734227, 0.6277072431875812]),
+            ("probit", cp, quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                mu = a .+ b .* x
+                y .~ Binomial.(n, probit.(mu))
+            end, -141.05985441626325,
+            [12.6379028940814, -9.979531779005764]),
+            ("cloglog", cc, quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                mu = a .+ b .* x
+                y .~ Binomial.(n, cloglog.(mu))
+            end, -115.99032528998896,
+            [-15.62227803566569, -17.65335024052007]),
+        ]
+        for (name, yy, prog, want, wantg) in twins
+            @testset "$name" begin
+                # SB: a, b ~ std_normal; mu ~ 1 + x; c ~ Binomial(n, link).
+                # u (SB order [b0, b1]) = [0.5, -0.25].
+                tcols = Dict{Symbol,AbstractVector}(:y => yy, :x => xb,
+                    :n => n)
+                bound, built, kern = _links_query(prog, tcols)
+                names = coordinate_names(built.layout)
+                u = _links_sb_vec(names, [Symbol("mu.Intercept") => 0.5,
+                    Symbol("mu.x") => -0.25])
+                @test abs(Base.invokelatest(kern, u) - want) < 1e-12
+                prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+                g = similar(u)
+                sampler_value_and_gradient!(prep, g, u)
+                @test all(isfinite, g)
+                @test maximum(abs.(g .- _links_sb_vec(names,
+                    [names[1] => wantg[1], names[2] => wantg[2]]))) < 1e-10
+            end
+        end
+    end
+end
+
 @testset "bernoulli links n=100 values + Enzyme + XLA" begin
     x, y = _bernoulli_links_data()
     @test length(y) == 100 && sum(y) == 56
