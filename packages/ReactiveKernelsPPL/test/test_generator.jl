@@ -1021,6 +1021,28 @@ end
     prc = logpdf(Normal(0, 1), ntc.mu[1]) + logpdf(Normal(0, 2), ntc.mu[2]) +
         logpdf(Exponential(1), sc)
     @test _query(builtc.spec, planc, :posterior, u) ≈ ll + prc + u[3]
+    # Censored [0, 5] with rows AT the bounds (SB-parity pair mod-weights
+    # twin C1b): at-bound rows are censored observations (clamp law —
+    # CDF mass, not density).
+    ycb = [0.0, 2.0, 1.5, 5.0, 3.0, 2.0]
+    plancb = _gen_evidence_plan(:censored, 0.0, 5.0, ycb)
+    builtcb = build_kernel(plancb)
+    ntcb = constrain(builtcb.layout, u)
+    mucb = ntcb.mu[1] .+ ntcb.mu[2] .* plancb.columns[:x]
+    scb = ntcb.sigma
+    llb = 0.0
+    for i in eachindex(ycb)
+        d = Normal(mucb[i], scb)
+        llb += ycb[i] <= 0.0 ? logcdf(d, 0.0) :
+            ycb[i] >= 5.0 ? logccdf(d, 5.0) : logpdf(d, ycb[i])
+    end
+    prcb = logpdf(Normal(0, 1), ntcb.mu[1]) + logpdf(Normal(0, 2), ntcb.mu[2]) +
+        logpdf(Exponential(1), scb)
+    valcb = _query(builtcb.spec, plancb, :posterior, u)
+    @test valcb ≈ llb + prcb + u[3]
+    # SB pin (BridgeStan, BRM a3865fa, StanBlocks 24578c3, propto=false).
+    @test isapprox(valcb, -24.388817517971585; atol = 1e-12, rtol = 1e-12)
+    _check_gradient(builtcb.spec, plancb, u)
     # Interval (response is lower, upper 5).
     plani = _gen_evidence_plan(:interval_censored, nothing, 5.0, y)
     builti = build_kernel(plani)
@@ -1056,10 +1078,13 @@ end
 end
 
 @testset "poisson evidence lower bounds shift by one (inclusive cdf)" begin
-    # poisson.cdf(k) = P(Y ≤ k): lower-side masses cover Y < lb, i.e. F(lb-1),
-    # while interval cells are open below ((yv, ub], i.e. F(ub) - F(yv) —
-    # the brm-use contract). Oracles are Distributions.jl cdf/logpdf
-    # arithmetic (F(-1) = 0 definitionally), never the emitted forms.
+    # poisson.cdf(k) = P(Y ≤ k): TRUNCATED lower-side masses cover Y < lb,
+    # i.e. F(lb-1), while CENSORED arms follow the clamp law (Y = clamp(X)):
+    # yv ≤ lb takes F(lb) and yv ≥ ub takes 1 - F(ub-1) — at-bound rows are
+    # the censored observations (SB parity pair mod-weights). Interval cells
+    # stay open below ((yv, ub], i.e. F(ub) - F(yv) — the brm-use contract).
+    # Oracles are Distributions.jl cdf/logpdf arithmetic (F(-1) = 0
+    # definitionally), never the emitted forms.
     _F(lam, k) = k < 0 ? 0.0 : cdf(Poisson(lam), k)
     cols, n = _gen_columns()
     cols[:y] = [0, 1, 2, 1, 3, 2]
@@ -1096,17 +1121,39 @@ end
     corr = sum(log.(_F.(lam, 4) .- _F.(lam, cols[:lo] .- 1)))
     @test _query(built.spec, plan, :posterior, u) ≈ base - corr + pr
     _check_gradient(built.spec, plan, u)
-    # Censored lower-only at 2: yv < 2 contributes log(F(1)).
+    # Censored lower-only at 2: yv ≤ 2 contributes log(F(2)) (clamp law).
     built, plan, lam, pr = _run(ResponseEvidence(:censored, 2, nothing))
-    cell = ifelse.(y .< 2, log.(_F.(lam, 1)), logpdf.(Poisson.(lam), y))
+    cell = ifelse.(y .<= 2, log.(_F.(lam, 2)), logpdf.(Poisson.(lam), y))
     @test _query(built.spec, plan, :posterior, u) ≈ sum(cell) + pr
     _check_gradient(built.spec, plan, u)
-    # Censored two-sided [1,2].
+    # Censored two-sided [1,2]: yv ≤ 1 takes F(1), yv ≥ 2 takes 1 - F(1).
     built, plan, lam, pr = _run(ResponseEvidence(:censored, 1, 2))
-    cell = ifelse.(y .< 1, log.(_F.(lam, 0)),
-        ifelse.(y .> 2, log.(1 .- _F.(lam, 2)), logpdf.(Poisson.(lam), y)))
+    cell = ifelse.(y .<= 1, log.(_F.(lam, 1)),
+        ifelse.(y .>= 2, log.(1 .- _F.(lam, 1)), logpdf.(Poisson.(lam), y)))
     @test _query(built.spec, plan, :posterior, u) ≈ sum(cell) + pr
     _check_gradient(built.spec, plan, u)
+    # Censored at-bounds twin C2b (SB-parity pair mod-weights): every row is
+    # a censored observation (y == bound takes the CDF mass, not density).
+    cols2 = _gen_columns()[1]
+    cols2[:y] = [1, 1, 2, 1, 2, 2]
+    plan2 = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta,
+            nothing, nothing, ResponseEvidence(:censored, 1, 2), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols2, n)
+    built2 = build_kernel(plan2)
+    nt2 = constrain(built2.layout, u)
+    lam2 = exp.(nt2.eta[1] .+ nt2.eta[2] .* cols2[:x])
+    pr2 = logpdf(Normal(0, 1), nt2.eta[1]) + logpdf(Normal(0, 2), nt2.eta[2])
+    y2 = cols2[:y]
+    cell2 = ifelse.(y2 .<= 1, log.(_F.(lam2, 1)),
+        ifelse.(y2 .>= 2, log.(1 .- _F.(lam2, 1)), logpdf.(Poisson.(lam2), y2)))
+    val2 = _query(built2.spec, plan2, :posterior, u)
+    @test val2 ≈ sum(cell2) + pr2
+    # SB pin (BridgeStan, BRM a3865fa, StanBlocks 24578c3, propto=false).
+    @test isapprox(val2, -7.8605785148131275; atol = 1e-12, rtol = 1e-12)
+    _check_gradient(built2.spec, plan2, u)
     # Interval (yv,4]: log(F(4) - F(yv)) — open below per the brm-use
     # contract (the response is the exclusive lower endpoint).
     built, plan, lam, pr =
