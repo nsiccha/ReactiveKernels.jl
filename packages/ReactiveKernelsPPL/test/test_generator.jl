@@ -23,9 +23,16 @@ function _have(plan::StructuralPlan)
     return (:unconstrained, _sorted_cols(plan)...)
 end
 
+# World-age barrier (Julia 1.12+): `build_kernel` eval's a fresh
+# `PPLGeneratedModels` binding per build, and 1.12 Test pins the testset
+# body's world, so raw `prepare` / kernel calls from these helpers throw
+# "method too new" (1.10 runs them at latest world and stays green).
+# Same remedy as `prepare_query`/`prepare_sampler` (src/query.jl) and the
+# per-family `Base.invokelatest(kern, ...)` probes.
 function _query(spec, plan, want::Symbol, u)
-    kern = prepare(spec; have = _have(plan), want = want, bound = _bound_nt(plan))
-    return kern(u)
+    kern = Base.invokelatest(prepare, spec; have = _have(plan), want = want,
+        bound = _bound_nt(plan))
+    return Base.invokelatest(kern, u)
 end
 
 function _findiff_grad(f, u; h = cbrt(eps(Float64)))
@@ -41,12 +48,15 @@ function _findiff_grad(f, u; h = cbrt(eps(Float64)))
 end
 
 function _check_gradient(spec, plan, u)
-    kern = prepare(spec; have = _have(plan), want = :posterior,
-        bound = _bound_nt(plan))
-    prep = prepare_ad(kern, _GEN_BACKEND, u; active = :unconstrained)
-    g = ReactiveKernels.ad_value_and_gradient!(prep, similar(u), u)[2]
+    kern = Base.invokelatest(prepare, spec; have = _have(plan),
+        want = :posterior, bound = _bound_nt(plan))
+    prep = Base.invokelatest(prepare_ad, kern, _GEN_BACKEND, u;
+        active = :unconstrained)
+    g = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!, prep,
+        similar(u), u)[2]
     @test all(isfinite, g)
-    @test isapprox(g, _findiff_grad(kern, u); rtol = 1e-5, atol = 1e-7)
+    @test isapprox(g, _findiff_grad(w -> Base.invokelatest(kern, w), u);
+        rtol = 1e-5, atol = 1e-7)
     return g
 end
 

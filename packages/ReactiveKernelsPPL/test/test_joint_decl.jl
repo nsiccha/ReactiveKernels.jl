@@ -575,11 +575,17 @@ end
 # plan 0.52 s and cold prepare 26.3 s, with warm follow-up preparations in
 # the 5–15 s range. Keep this helper as the cheaper gradient-proof path and
 # cite a fresh measurement before changing the verification strategy again.
+# World-age barrier per the note on `_query` in test_generator.jl: 1.12 Test
+# pins testset worlds, so raw calls on `build_kernel` specs throw "method too
+# new" (or miscompile downstream AD through dynamic dispatch).
 function _jd_check_gradient(kern, u)
-    prep = prepare_ad(kern, _GEN_BACKEND, u; active = :unconstrained)
-    g = ReactiveKernels.ad_value_and_gradient!(prep, similar(u), u)[2]
+    prep = Base.invokelatest(prepare_ad, kern, _GEN_BACKEND, u;
+        active = :unconstrained)
+    g = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!, prep,
+        similar(u), u)[2]
     @test all(isfinite, g)
-    @test isapprox(g, _findiff_grad(kern, u); rtol = 1e-5, atol = 1e-7)
+    @test isapprox(g, _findiff_grad(w -> Base.invokelatest(kern, w), u);
+        rtol = 1e-5, atol = 1e-7)
     return g
 end
 
@@ -603,9 +609,9 @@ end
     @test _query(built.spec, bound, :prior, u) ≈ pr
     ks = sort!(collect(keys(bound.columns)))
     bnt = NamedTuple{Tuple(ks)}(Tuple(bound.columns[k] for k in ks))
-    kern = prepare(built.spec; have = (:unconstrained, ks...),
-        want = :posterior, bound = bnt)
-    @test kern(u) ≈ ll + pr + jac
+    kern = Base.invokelatest(prepare, built.spec;
+        have = (:unconstrained, ks...), want = :posterior, bound = bnt)
+    @test Base.invokelatest(kern, u) ≈ ll + pr + jac
     _jd_check_gradient(kern, u)
 end
 
@@ -1028,8 +1034,8 @@ end
     @test _query(built.spec, bound, :prior, u) ≈ pr
     ks = sort!(collect(keys(bound.columns)))
     bnt = NamedTuple{Tuple(ks)}(Tuple(bound.columns[k] for k in ks))
-    kern = prepare(built.spec; have = (:unconstrained, ks...),
-        want = :posterior, bound = bnt)
-    @test kern(u) ≈ ll + pr + jac
+    kern = Base.invokelatest(prepare, built.spec;
+        have = (:unconstrained, ks...), want = :posterior, bound = bnt)
+    @test Base.invokelatest(kern, u) ≈ ll + pr + jac
     _jd_check_gradient(kern, u)
 end
