@@ -530,12 +530,13 @@ end
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
         rtol = 1e-12, atol = 1e-12)
     _check_gradient(built.spec, plan, u)
-    # Censored (upper-only literal bound; hi=2.0 exercises both arms).
+    # Censored (upper-only literal bound; hi=2.0 exercises both arms; the
+    # y == 2.0 rows are censored observations per the clamp law).
     plan = mk(:(censored.(Normal.(mu, exp.(sigma)), -Inf, 2.0)))
     built = build_kernel(plan)
     muv, sgv, pr = _lps(built)
     ll = sum(
-        cols[:y][i] > 2.0 ?
+        cols[:y][i] >= 2.0 ?
             log1p(-cdf(Normal(muv[i], sgv[i]), 2.0)) :
             logpdf(Normal(muv[i], sgv[i]), cols[:y][i])
         for i in eachindex(cols[:y]))
