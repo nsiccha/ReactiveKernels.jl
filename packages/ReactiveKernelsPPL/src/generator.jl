@@ -79,7 +79,8 @@ module PPLGeneratedModels
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
-    beta, inverse_gamma, binomial, negative_binomial2, uniform,
+    beta, inverse_gamma, binomial, negative_binomial2, beta_binomial,
+    uniform,
     student_t, zero_inflated_poisson,
     gp_exp_quad_cov, gp_chol_latent,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
@@ -938,6 +939,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _binomial_cloglog_plate_stmts(r, plan, node, pw)
     elseif r.family === BetaLogitFam
         return _beta_plate_stmts(r, plan, node, pw)
+    elseif r.family === BetaBinomial2Fam
+        return _betabinomial2_plate_stmts(r, plan, node, pw)
     elseif r.family === CategoricalLogitFam
         return _categorical_plate_stmts(r, plan, node, pw)
     elseif r.family === OrderedLogisticFam || r.family === OrdinalFam
@@ -1738,6 +1741,34 @@ function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
         cell = :($wv * $cell)
     end
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# BetaBinomial2 mean-precision: mu/a/b precomputes (the Beta-plate
+# pattern) plus trials threading (the Binomial-plate pattern); the cell
+# is the Stan-native `beta_binomial(n, alpha, beta)` endpoint. phi is
+# never a plate input: a Symbol threads through the precomputes (scalar
+# parameter or per-observation column, both broadcast), a literal
+# inlines (a predictor-fed phi is rejected at the contract gate, the
+# Beta-kappa deferral).
+function _betabinomial2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    k = r.scale isa Symbol ? r.scale : Float64(r.scale)
+    mu = _mu_name(r.label)
+    a = _shape_a_name(r.label)
+    b = _shape_b_name(r.label)
+    inputs = Any[y, a, b]
+    yv, avv, bvv = _dovar(1), _dovar(2), _dovar(3)
+    nref = _thread_ref!(inputs, r.trials, true)
+    cell = :(beta_binomial($nref, $avv, $bvv).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[:($mu = 1 ./ (1 .+ exp.(-$lp))),
+        :($a = $mu .* $k),
+        :($b = (1 .- $mu) .* $k),
+        _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Reference-coded multi-logit categorical (SB `CategoricalLogit`): K−1
