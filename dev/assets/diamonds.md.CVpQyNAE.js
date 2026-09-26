@@ -40,8 +40,8 @@ b_j &amp;\\sim \\operatorname{Normal}(0, 1), \\quad j = 1..24, \\\\
 <span class="line"><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF;">    var&quot;##nu_binding#8314&quot;</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583;"> =</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF;"> 3.0</span></span>
 <span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8;">    log_scale_116431 </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583;">=</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF;"> 2.302585092994046</span></span>
 <span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D;"># … display bounded for docs build memory …</span></span>
-<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D;"># 99 lines total; about 2.272 MiB total,</span></span>
-<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D;"># about 2.271 MiB omitted here.</span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D;"># 99 lines total; about 2.300 MiB total,</span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D;"># about 2.300 MiB omitted here.</span></span>
 <span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583;">            end</span></span>
 <span class="line"><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF;">        var&quot;##plate_total#8369&quot;</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583;"> +=</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF;"> var&quot;##plate_logpdf#8368&quot;</span></span>
 <span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583;">    end</span></span>
