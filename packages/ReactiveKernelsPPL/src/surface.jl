@@ -4289,8 +4289,11 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
         haskey(ctx.matrices, loc) && _sfail("response $lhs: mixture " *
             "component $k location $loc is a design matrix — locations " *
             "are predictors, sampled parameters, or literals")
+        # A stated-prior alias reads like the name itself (a sampled
+        # parameter), so it never routes here — only undeclared
+        # intercept-only defs (the SB `mu ~ 1` mirror) qualify.
         if loc in ctx.vecdefs && haskey(ctx.detmap, loc) ||
-                _is_scalar_coef_def(loc, ctx)
+                _is_scalar_coef_def(loc, ctx, false)
             wrapped || _sfail("response $lhs: mixture component $k " *
                 "location $loc is a predictor — link-space predictors " *
                 "wrap (`Poisson.(exp.(eta))`); bare slots are sampled " *
@@ -5139,7 +5142,10 @@ function _lower_nu_use(lhs, s, ctx)
     s === nothing && return nothing
     s isa Real && return s
     if s isa Symbol
-        _is_scale_predictor_def(s, ctx) && _sfail(
+        # Bare use: stated-prior aliases are scalar nu, like a bare
+        # scale — only undeclared/vector/factor defs count as
+        # predictor-fed here.
+        _is_scale_predictor_def(s, ctx, false) && _sfail(
             "response $lhs nu $s is a predictor definition — " *
             "predictor-fed nu (a modeled df) is deferred: use a scalar " *
             "nu (parameter or literal)")
@@ -5178,7 +5184,9 @@ function _lower_scale_use(lhs, s, ctx, predictors, pred_idx, coefuse)
                       "wrappers are deferred (spell the transform as the " *
                       "predictor's link instead)")
     end
-    if s isa Symbol && _is_scale_predictor_def(s, ctx)
+    # A bare scale keeps the scalar meaning: an alias over a stated prior
+    # lowers like the name itself (a parameter), never as a predictor.
+    if s isa Symbol && _is_scale_predictor_def(s, ctx, false)
         pname = _lower_scale_predictor(lhs, s, IdentityLink, ctx, predictors,
             pred_idx, coefuse)
         return ScalePredictorRef(pname, IdentityLink)
@@ -5198,23 +5206,32 @@ end
 # a name, and a latent transform is not an affine predictor. Other
 # scalar assignments, data gathers (`x[g]`), and literal indexing
 # (`v[1]`) likewise stay scalar-path, exactly as before.
-_is_scale_predictor_def(s::Symbol, ctx) =
+# `allow_stated` gates aliases over stated priors: a link-wrapped use
+# admits stated-Normal coefficients (links exist only over predictors,
+# so the scalar path cannot spell the use at all), while a bare use
+# keeps them scalar — naming a stated name must not re-bucket it.
+_is_scale_predictor_def(s::Symbol, ctx, allow_stated::Bool) =
     haskey(ctx.detmap, s) && !(s in ctx.plate_names) &&
     !_derived_reads_latent(s, ctx) &&
     (get(ctx.detshape, s, :scalar) === :vector ||
         _is_factor_index_def(ctx.detmap[s], ctx) ||
-        _is_scalar_coef_def(s, ctx))
+        _is_scalar_coef_def(s, ctx, allow_stated))
 
 # A scalar definition spelling an intercept-only predictor (`name =
 # coef` over a bare coefficient): admitted to the scale-predictor slot
 # exactly when `_classify_symbol` would take the RHS as an
-# InterceptTerm — anything it rejects or routes elsewhere (parameters,
-# computed scalars, data, latents, varying draws, matrices) stays on
-# the scalar path, so alias chains (`s2 = s`), literal scales, and
-# data-column scales keep today's behavior bit-for-bit. Normal-priored
-# names route to analysis like the location path's stated intercept
-# priors (`a ~ Normal(0, 5)` over `eta = a .+ b .* x`).
-function _is_scalar_coef_def(s::Symbol, ctx)
+# InterceptTerm — anything it rejects or routes elsewhere (computed
+# scalars, data, latents, varying draws, matrices) stays on the scalar
+# path, so alias chains (`s2 = s`), literal scales, and data-column
+# scales keep today's behavior bit-for-bit. Stated priors stay scalar
+# on a bare use (`allow_stated == false`): a direct stated name is a
+# parameter (`_lower_scale`), so its alias must be one too — routing
+# the alias to analysis would re-bucket the same prior by spelling.
+# Under a link wrapper (`allow_stated == true`) stated-Normal names
+# route to analysis like the location path's stated intercept priors
+# (`a ~ Normal(0, 5)` over `eta = a .+ b .* x`): the wrapper has no
+# scalar meaning, so the predictor path is the only spelling.
+function _is_scalar_coef_def(s::Symbol, ctx, allow_stated::Bool)
     haskey(ctx.detmap, s) || return false
     s in ctx.plate_names && return false
     _derived_reads_latent(s, ctx) && return false
@@ -5224,7 +5241,8 @@ function _is_scalar_coef_def(s::Symbol, ctx)
     rhs in ctx.data && return false
     rhs in ctx.vecdefs && return false
     haskey(ctx.detmap, rhs) && return false
-    rhs in ctx.prior_names && rhs ∉ ctx.normal_priors && return false
+    rhs in ctx.prior_names && (rhs ∉ ctx.normal_priors || !allow_stated) &&
+        return false
     rhs in ctx.plate_names && return false
     rhs in ctx.scan_states && return false
     rhs in ctx.varying_contribs && return false
@@ -5256,7 +5274,7 @@ function _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
                       "wrapper over a predictor definition")
     end
     inner = only(targs)
-    inner isa Symbol && _is_scale_predictor_def(inner, ctx) || return _sfail(
+    inner isa Symbol && _is_scale_predictor_def(inner, ctx, true) || return _sfail(
         "response $lhs scale $(repr(s)): `$f.` wraps a predictor " *
         "definition (`$f.(predictor)` with `predictor = ...` affine in " *
         "data) — got $(repr(inner))")

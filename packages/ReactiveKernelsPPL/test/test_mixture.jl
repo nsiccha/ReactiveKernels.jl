@@ -338,6 +338,17 @@ end
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(mu1, s)], Float64[])
             end), SurfaceLoweringError),
+        # A scalar alias over a stated prior reads like the name itself
+        # (a sampled parameter — spell it bare), so it never routes to
+        # the intercept-only location slot (undeclared `mu ~ 1` only).
+        ("stated scalar loc alias",
+            :(begin
+                c ~ Normal(0.0, 5.0)
+                mu1 = c
+                s ~ Exponential(1.0)
+                y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
+                    [0.5, 0.5])
+            end), SurfaceLoweringError),
     ]
     for (label, prog, E) in cases
         @testset "$label" begin
