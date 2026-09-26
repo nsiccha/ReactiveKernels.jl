@@ -920,6 +920,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _hurdle_plate_stmts(r, plan, node, pw)
     elseif r.family === ZeroInflatedPoissonFam
         return _zip_plate_stmts(r, plan, node, pw)
+    elseif r.family === InverseGaussianFam
+        return _ig_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
         return _binomial_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomial2Fam
@@ -1470,6 +1472,42 @@ function _hurdle_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symb
     base = :(poisson(; log_rate = $etav).logpdf($yv))
     trunc = :(log(-expm1(-exp($etav))))
     cell = :(ifelse($yv == 0, log($p0v), log1p(-$p0v) + $base - $trunc))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Inverse-Gaussian / Wald likelihood (SB `brm_inverse_gaussian_lpdf`
+# mirror): the closed form spelled operation-for-operation —
+# `(log(λ) - (log2π + 3*log(y)) - λ*(y-μ)²/(μ²*y))/2` — with the SB
+# `log2π` literal `1.8378770664093456` (`Float64(Distributions.log2π)`
+# exactly). The mean precomputes outside the cell (`_ppl_mu_`, the NB2
+# precedent — a computed `exp` constructor arg miscompiles the Enzyme
+# pullback); lambda threads scalar via `_scale_plate_arg` (predictor-fed
+# lambda is deferred at the contract gate, the Beta-kappa precedent).
+# The `y > 0` guard is lazy `?:` (the DK gamma precedent, not eager
+# `ifelse`); `y` is bound data so preparation splits the plate per
+# taken arm and no backend receives the branch. μ/λ positivity is
+# by-construction (`exp`, positive-constrained layout, contract-validated
+# literals/columns), so no live-value guard enters the cell. Evidence
+# fails closed at the contract gate (Gaussian/Poisson only); weights
+# multiply the cell (the NB2 precedent). No whole-vector fusion yet
+# (the `3*log(y)` normalizer is data-only and would hoist) — a
+# perf-lane follow-up, not this slice.
+function _ig_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    mu = _mu_name(r.label)
+    pre = Expr[:($mu = exp.($lp))]
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, mu]
+    yv, muv = _dovar(1), _dovar(2)
+    lamv = _thread_ref!(inputs, sarg)
+    base = :((log($lamv) - (1.8378770664093456 + 3.0 * log($yv)) -
+        $lamv * ($yv - $muv) * ($yv - $muv) / ($muv * $muv * $yv)) / 2.0)
+    cell = :($yv > 0 ? $base : -Inf)
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)

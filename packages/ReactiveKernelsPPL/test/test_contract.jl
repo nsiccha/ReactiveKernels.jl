@@ -252,6 +252,21 @@ function _zip_plan(n = 9)
     )
 end
 
+function _ig_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = [0.7, 1.4, 2.6, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1][1:n]
+    StructuralPlan(
+        [LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, :lam, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, LogLink, _terms(), :eta)],
+        _priors(:eta),
+        [SampledParameter(:lam, :lognormal, (arg1 = -0.3, arg2 = 1.0), nothing, :lam)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
 @testset "contract admission predicates" begin
     @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
         BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
@@ -260,7 +275,7 @@ end
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
         MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
         PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
-        ZeroInflatedPoissonFam)
+        ZeroInflatedPoissonFam, InverseGaussianFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
@@ -294,6 +309,7 @@ end
     @test validate_plan(_student_plan()) === nothing
     @test validate_plan(_hurdle_plan()) === nothing
     @test validate_plan(_zip_plan()) === nothing
+    @test validate_plan(_ig_plan()) === nothing
 end
 
 @testset "link triples" begin
@@ -338,6 +354,10 @@ end
     @test_throws ContractValidationError validate_plan(bad)
     # ZIP admits the log predictor link only.
     bad = _zip_plan()
+    bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # InverseGaussian admits the log predictor link only.
+    bad = _ig_plan()
     bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
     @test_throws ContractValidationError validate_plan(bad)
 end
@@ -598,6 +618,72 @@ end
     bad.responses[1] =
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
             ResponseEvidence(:truncated, 0, 5), :y_resp, nothing, nothing; zi = :zi)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "ig response validation" begin
+    # InverseGaussian requires its shape lambda.
+    bad = _ig_plan()
+    bad.responses[1] =
+        LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A lambda literal must be finite positive (unlike hurdle p_zero,
+    # the 0 endpoint is not a degenerate-but-valid shape).
+    for lit in (0.5, 2.0)
+        good = _ig_plan()
+        good.responses[1] =
+            LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, lit, nothing,
+                _none_evidence(), :y_resp)
+        @test validate_plan(good) === nothing
+    end
+    for lit in (0.0, -0.1, NaN, Inf)
+        bad = _ig_plan()
+        bad.responses[1] =
+            LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, lit, nothing,
+                _none_evidence(), :y_resp)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # Predictor-fed lambda is deferred (the Beta-kappa precedent), on
+    # every link.
+    for link in (IdentityLink, LogLink, LogitLink)
+        bad = _ig_plan()
+        push!(bad.predictors, PredictorSpec(:ls, link, _terms(), :ls))
+        append!(bad.population_priors, _priors(:ls))
+        bad.responses[1] =
+            LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
+                ScalePredictorRef(:ls, link), nothing,
+                _none_evidence(), :y_resp)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # InverseGaussian response must be strictly positive (Bool excluded).
+    bad = _ig_plan()
+    bad.columns[:y] = [0.7, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _ig_plan()
+    bad.columns[:y] = [0.7, 1.4, -2.6, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _ig_plan()
+    bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _ig_plan()
+    bad.responses[1] =
+        LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, :lam, nothing,
+            ResponseEvidence(:truncated, 0, 4), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A per-observation lambda column binds finite positive.
+    good = _ig_plan()
+    good.columns[:lamc] = repeat([0.5, 1.5, 2.5], 3)
+    good.responses[1] =
+        LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, :lamc, nothing,
+            _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    bad = _ig_plan()
+    bad.columns[:lamc] = fill(-1.0, 9)
+    bad.responses[1] =
+        LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, :lamc, nothing,
+            _none_evidence(), :y_resp)
     @test_throws ContractValidationError validate_plan(bad)
 end
 

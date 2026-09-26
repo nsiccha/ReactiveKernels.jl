@@ -609,6 +609,70 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+function _gen_ig_plan(; lam = :lam)
+    cols, n = _gen_columns()
+    params = lam isa Symbol ? SampledParameter[
+        SampledParameter(:lam, :lognormal, (arg1 = -0.3, arg2 = 1.0), nothing, :lam)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
+            lam, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_ig(cols, coef, lam)
+    mu = exp.(coef[1] .+ coef[2] .* cols[:x])
+    return sum(logpdf(InverseGaussian(m, lam), y) for (y, m) in zip(cols[:y], mu))
+end
+
+@testset "ig values and gradient" begin
+    plan = _gen_ig_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_ig(plan.columns, Vector(nt.eta), nt.lam)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(LogNormal(-0.3, 1.0), nt.lam)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "ig literal-lambda values" begin
+    plan = _gen_ig_plan(; lam = 1.5)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_ig(plan.columns, Vector(nt.eta), 1.5)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted ig values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
+            1.5, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = exp.(Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x])
+    ll = sum(cols[:w] .*
+        [logpdf(InverseGaussian(m, 1.5), y) for (y, m) in zip(cols[:y], mu)])
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "factor values (int and string groupings)" begin
     for g in ([1, 2, 1, 3, 2, 3], ["a", "b", "a", "c", "b", "c"])
         cols, n = _gen_columns()

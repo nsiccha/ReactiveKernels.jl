@@ -99,6 +99,7 @@ univariate components, SB `MixtureModel` mirror)."""
     StudentTFam
     HurdlePoissonFam
     ZeroInflatedPoissonFam
+    InverseGaussianFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -155,7 +156,8 @@ end
 
 A predictor-fed scale/shape use: the response's auxiliary (Gaussian
 sigma, NB2 dispersion phi, Gamma shape alpha, Student sigma, hurdle
-p_zero) is a whole linear predictor, varying per observation.
+p_zero; InverseGaussian lambda and Beta kappa stay scalar-only) is a
+whole linear predictor, varying per observation.
 `predictor` names the
 [`PredictorSpec`](@ref) (planned exactly like a location predictor:
 terms, priors, one link); `link` is the scale use-site wrapper —
@@ -175,12 +177,14 @@ end
     LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, trials[, range]])
 
 One independent response. `scale` is the response's auxiliary —
-Gaussian sigma, NB2 dispersion phi, Gamma shape alpha, hurdle p_zero —
-either scalar (parameter, assignment, folded literal, or a raw
-per-observation data column) or, for Gaussian/NB2/Gamma/Student/hurdle
-only, a [`ScalePredictorRef`](@ref) (predictor-fed per-observation
-auxiliary); it must be `nothing` otherwise. A hurdle p_zero is a
-probability (scalar in [0, 1], predictor-fed logit-only).
+Gaussian sigma, NB2 dispersion phi, Gamma shape alpha, hurdle p_zero,
+InverseGaussian shape lambda — either scalar (parameter, assignment,
+folded literal, or a raw per-observation data column) or, for
+Gaussian/NB2/Gamma/Student/hurdle only, a [`ScalePredictorRef`](@ref)
+(predictor-fed per-observation auxiliary); it must be `nothing`
+otherwise. A hurdle p_zero is a probability (scalar in [0, 1],
+predictor-fed logit-only). An InverseGaussian lambda is scalar-only
+(predictor-fed lambda deferred, the Beta-kappa precedent).
 (One slot covers every admitted family; a two-auxiliary family such as
 Beta needs a new field — noted, not built.) `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
@@ -1359,6 +1363,7 @@ const ADMITTED_TRIPLES = (
     (StudentTFam, IdentityLink, IdentityLink),
     (HurdlePoissonFam, LogLink, LogLink),
     (ZeroInflatedPoissonFam, LogLink, LogLink),
+    (InverseGaussianFam, LogLink, LogLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order)."""
@@ -1698,7 +1703,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
-    ZeroInflatedPoissonFam)
+    ZeroInflatedPoissonFam, InverseGaussianFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -6296,7 +6301,8 @@ function _validate_responses(plan::StructuralPlan)
             "(admitted: Gaussian/identity, Bernoulli-logit/probit/cloglog, " *
             "Poisson-log, Binomial-logit/probit/cloglog, NB2-log, Gamma-log, " *
             "Beta-logit, Categorical-logit, Ordered-logit, Ordinal spellings, " *
-            "Student-identity, Hurdle-Poisson-log, ZIP-log)",
+            "Student-identity, Hurdle-Poisson-log, ZIP-log, " *
+            "InverseGaussian-log)",
         )
         _validate_scale(r, plan)
         _validate_nu(r, plan)
@@ -6368,6 +6374,13 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     elseif r.family === ZeroInflatedPoissonFam
         _is_count_column(col) && return nothing
         return _fail(r.label, "ZIP response must be non-negative integers")
+    elseif r.family === InverseGaussianFam
+        # Strictly positive: the Wald kernel guards y > 0 (SB
+        # `brm_inverse_gaussian_lpdf` returns -inf at y ≤ 0) — fail closed
+        # instead of flowing a wrong value.
+        (eltype(col) <: Real && all(>(0), col)) ||
+            _fail(r.label, "InverseGaussian response must be strictly positive numerics")
+        return nothing
     elseif r.family === GaussianFam
         eltype(col) <: Real ||
             _fail(r.label, "Gaussian response must be numeric")
@@ -6522,7 +6535,8 @@ _scale_need(fam::LikelihoodFamily) =
     fam === BetaLogitFam ? "Beta response requires a concentration kappa" :
     fam === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" :
     fam === StudentTFam ? "Student response requires a scale sigma" :
-    fam === HurdlePoissonFam ? "Hurdle response requires a hurdle probability p_zero" : nothing
+    fam === HurdlePoissonFam ? "Hurdle response requires a hurdle probability p_zero" :
+    fam === InverseGaussianFam ? "InverseGaussian response requires a shape lambda" : nothing
 
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     need = _scale_need(r.family)
@@ -6567,14 +6581,15 @@ function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
 end
 
 # A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha,
-# Student sigma, hurdle p_zero):
+# Student sigma, hurdle p_zero; Beta kappa and InverseGaussian lambda are
+# deferred above):
 # the predictor exists, carries the use-site link (the
 # one-link-per-predictor rule), and is not the response's own location
 # predictor (the two slots take distinct predictors — the BRM-side plan
 # rule, mirrored here as defense in depth). Beta-kappa predictors are
 # deferred; predictor-fed Binomial trials likewise (trials stay
 # column-or-literal by type). A hurdle p_zero predictor is logit-only (a
-# probability); the scale families admit identity/log/logit.
+# probability); the admitted scale families take identity/log/logit.
 function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
         s::ScalePredictorRef)
     return _validate_scale_predictor_use(r, plan, s, r.family, [r.predictor])
@@ -6586,6 +6601,9 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
     fam === BetaLogitFam && _fail(r.label,
         "Beta response with a scale predictor: predictor-fed concentration " *
         "(kappa) is deferred — use a scalar kappa (parameter or literal)")
+    fam === InverseGaussianFam && _fail(r.label,
+        "InverseGaussian response with a scale predictor: predictor-fed " *
+        "shape (lambda) is deferred — use a scalar lambda (parameter or literal)")
     (fam === GaussianFam || fam === NegativeBinomial2Fam ||
         fam === GammaLogFam || fam === StudentTFam ||
         fam === HurdlePoissonFam) ||
