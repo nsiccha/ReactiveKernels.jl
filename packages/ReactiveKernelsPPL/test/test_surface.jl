@@ -583,6 +583,98 @@ end
     end, Dn2)
 end
 
+# Inverse-Gaussian scalar log-density (Distributions.jl oracle; SB
+# `brm_inverse_gaussian_lpdf` matches it operation-for-operation).
+_ig_logpdf(y::Real, mu::Real, lam::Real) = logpdf(InverseGaussian(mu, lam), y)
+
+@testset "surface roundtrip ig end to end" begin
+    cols, _ = _gen_columns()
+    # Literal lambda.
+    m = @rkppl begin
+        eta = a .+ b .* x
+        y .~ InverseGaussian.(exp.(eta), 1.5)
+    end
+    @test m isa RKPPLModel
+    r = only(lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ InverseGaussian.(exp.(eta), 1.5)
+    end, (:y, :x)).responses)
+    @test (r.family, r.link, r.predictor, r.scale) ===
+        (InverseGaussianFam, LogLink, :eta, 1.5)
+    bound = m(; y = cols[:y], x = cols[:x])
+    @test isbound(bound)
+    built = build_kernel(bound)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    ll = sum(_ig_logpdf(y, m, 1.5) for (y, m) in zip(cols[:y], mu))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    # LogNormal-sampled lambda.
+    m = @rkppl begin
+        lam ~ LogNormal(-0.3, 1.0)
+        eta = a .+ b .* x
+        y .~ InverseGaussian.(exp.(eta), lam)
+    end
+    r = only(lower_rkppl(quote
+        lam ~ LogNormal(-0.3, 1.0)
+        eta = a .+ b .* x
+        y .~ InverseGaussian.(exp.(eta), lam)
+    end, (:y, :x)).responses)
+    @test (r.family, r.scale) === (InverseGaussianFam, :lam)
+    @test only(lower_rkppl(quote
+        lam ~ LogNormal(-0.3, 1.0)
+        eta = a .+ b .* x
+        y .~ InverseGaussian.(exp.(eta), lam)
+    end, (:y, :x)).parameters).family === :lognormal
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    u3 = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u3)
+    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    ll = sum(_ig_logpdf(y, m, nt.lam) for (y, m) in zip(cols[:y], mu))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+        logpdf(LogNormal(-0.3, 1.0), nt.lam)
+    @test _query(built.spec, bound, :posterior, u3) ≈
+        ll + pr + logjac(built.layout, u3)
+    _check_gradient(built.spec, bound, u3)
+end
+
+@testset "ig response failures" begin
+    Dn2 = (:y, :x)
+    # Arity: exactly (mu, lambda).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ InverseGaussian.(exp.(eta))
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ InverseGaussian.(exp.(eta), 1.5, 1.0)
+    end, Dn2)
+    # The kernel-endpoint spelling redirects to the response head.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ inverse_gaussian.(exp.(eta), 1.5)
+    end, Dn2)
+    # The mu position needs its `exp.` link wrapper (NB2 precedent).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ InverseGaussian.(eta, 1.5)
+    end, Dn2)
+    # A modeled-lambda predictor fails at the contract gate (deferred).
+    @test_throws ContractValidationError lower_rkppl(quote
+        eta = a .+ b .* x
+        ls = c .+ d .* x
+        y .~ InverseGaussian.(exp.(eta), exp.(ls))
+    end, Dn2)
+    @test_throws ContractValidationError lower_rkppl(quote
+        eta = a .+ b .* x
+        ls = c .+ d .* x
+        y .~ InverseGaussian.(exp.(eta), ls)
+    end, Dn2)
+end
+
 @testset "slice-2 response failures" begin
     Dn2 = (:y, :x)
     Dp2 = (:p, :x)

@@ -4778,6 +4778,8 @@ function _dot2call_spine_arg(lhs, f, i, a)
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :ZeroInflatedPoisson && i == 1
         return _dot2call_nested_link(lhs, a, f)
+    elseif f === :InverseGaussian && i == 1
+        return _dot2call_nested_link(lhs, a, f)
     end
     # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
     # response branch matches the `./` structure (link + alpha identity).
@@ -4901,6 +4903,7 @@ const _RESPONSE_BASE_MSG =
     "`NegativeBinomial2.(exp.(eta), phi)`, " *
     "`HurdlePoisson.(exp.(eta), p_zero)`, " *
     "`ZeroInflatedPoisson.(exp.(eta), zi)`, " *
+    "`InverseGaussian.(exp.(eta), lambda)`, " *
     "`Gamma.(alpha, exp.(eta) ./ alpha)`, " *
     "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`, " *
     "`CategoricalLogit.(eta_2, ..., eta_K)`, `OrderedLogistic.(eta)`, " *
@@ -4920,7 +4923,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
     fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
         :NegativeBinomial2, :Gamma, :Beta, :HurdlePoisson,
-        :ZeroInflatedPoisson) ||
+        :ZeroInflatedPoisson, :InverseGaussian) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
@@ -4970,6 +4973,12 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         return ZeroInflatedPoissonFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
         args[2]
+    elseif fam === :InverseGaussian
+        length(args) == 2 || _sfail("response $lhs: `InverseGaussian` takes " *
+                                    "`InverseGaussian.(exp.(eta), lambda)`")
+        return InverseGaussianFam, LogLink, LogLink,
+        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        nothing
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
@@ -5088,6 +5097,9 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :zero_inflated_poisson && _sfail("response $lhs: use " *
                                  "`ZeroInflatedPoisson` (the response " *
                                  "spelling, not the kernel endpoint)")
+    fam === :inverse_gaussian && _sfail("response $lhs: use " *
+                                        "`InverseGaussian` (the response " *
+                                        "spelling, not the kernel endpoint)")
     fam === :OrderedLogit && _sfail("response $lhs: unknown distribution " *
                                     "`:OrderedLogit` (write " *
                                     "`OrderedLogistic.(eta)`)")
@@ -5097,8 +5109,8 @@ function _lower_response_base_error(lhs, rhs, fam)
         "row-grouped, never broadcast)")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
-                  "NegativeBinomial2, HurdlePoisson, Gamma, Beta, " *
-                  "ZeroInflatedPoisson, BernoulliLogit, " *
+                  "NegativeBinomial2, HurdlePoisson, ZeroInflatedPoisson, " *
+                  "InverseGaussian, Gamma, Beta, BernoulliLogit, " *
                   "PoissonLog, BinomialLogit, NegativeBinomial2Log, " *
                   "GammaLog, BetaLogit, CategoricalLogit, " *
                   "OrderedLogistic, Ordinal, Multinomial, Categorical, " *
@@ -5356,7 +5368,7 @@ end
 # Analyze (or intern) a scale predictor: exactly the location-predictor
 # treatment (`_lower_location`'s named-definition arm) under the use-site
 # link — affine analysis, coefficient-use recording, one link per
-# predictor. Family admission (Gaussian/NB2/Gamma/Student/hurdle; Beta
+# predictor. Family admission (Gaussian/NB2/Gamma/Student/hurdle; Beta/IG
 # deferred) is the contract's gate (`_validate_scale_predictor`), so
 # hand-built plans get the same rule.
 function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
