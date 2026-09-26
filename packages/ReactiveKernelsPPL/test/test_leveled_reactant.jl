@@ -41,22 +41,49 @@ function _lr_measure(built, bound, post_q, u)
         native, primal, val, g, rval = Float64(rval), rgrad = Array(rgrad))
 end
 
+# Upstream Reactant gaps (reactivekernels-use §7r): Cartesian `getindex` of a
+# 1-D traced view reaches `Base.reindex` with a bare (non-tuple) index (gap
+# 1), and behind it Reactant's broadcast eltype probe scalar-evaluates the
+# nested `Float64.(view)` cast, whose scalar conversion does not exist (gap
+# 2). Either signature below is exactly one of those gaps; anything else
+# rethrows loudly.
+_lr_is_upstream_gap(e) =
+    e isa MethodError && (
+        (e.f === Base.reindex && length(e.args) == 2 && !(e.args[2] isa Tuple)) ||
+        (e.f === Float64 && length(e.args) == 1 && e.args[1] isa Reactant.TracedRNumber))
+
+# Families currently blocked by the gaps above. The `@test_broken true` at
+# the end of a pinned family's body FIRES (Unexpected Pass) once upstream
+# fixes both gaps — then drop the name here and the try/catch below.
+const _LR_UPSTREAM_PINNED = ("categorical_simplex", "monotonic", "r2d2_factor")
+
 @testset "leveled families under Reactant" begin
     for (name, _) in _kinv_plans(3)
         @testset "$name" begin
-            small = _lr_reactant(Dict(_kinv_plans(3))[name])
-            large = _lr_reactant(Dict(_kinv_plans(6))[name])
-            # The traced program does not grow with K.
-            @test small.lines == large.lines
-            if startswith(name, "ordinal") || startswith(name, "ordered")
-                @test !small.has_if && !large.has_if
-            end
-            tiny = _lr_reactant(Dict(_kinv_plans(2))[name])
-            for fx in (tiny, small, large)
-                @test fx.primal ≈ fx.native rtol = 1e-9
-                @test fx.val ≈ fx.native rtol = 1e-12
-                @test fx.rval ≈ fx.native rtol = 1e-9
-                @test fx.rgrad ≈ fx.g rtol = 1e-8
+            try
+                small = _lr_reactant(Dict(_kinv_plans(3))[name])
+                large = _lr_reactant(Dict(_kinv_plans(6))[name])
+                # The traced program does not grow with K.
+                @test small.lines == large.lines
+                if startswith(name, "ordinal") || startswith(name, "ordered")
+                    @test !small.has_if && !large.has_if
+                end
+                tiny = _lr_reactant(Dict(_kinv_plans(2))[name])
+                for fx in (tiny, small, large)
+                    @test fx.primal ≈ fx.native rtol = 1e-9
+                    @test fx.val ≈ fx.native rtol = 1e-12
+                    @test fx.rval ≈ fx.native rtol = 1e-9
+                    @test fx.rgrad ≈ fx.g rtol = 1e-8
+                end
+                if name in _LR_UPSTREAM_PINNED
+                    # Self-firing pin: errors (Unexpected Pass) once upstream
+                    # fixes both gaps, forcing removal of the try/catch.
+                    @test_broken true
+                end
+            catch e
+                _lr_is_upstream_gap(e) || rethrow()
+                # Known upstream Reactant gap (§7r): pinned, not passing.
+                @test_broken false
             end
         end
     end
