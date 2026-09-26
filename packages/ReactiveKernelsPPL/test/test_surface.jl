@@ -698,6 +698,79 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
     _check_gradient(built.spec, bound, u3)
 end
 
+# Von-Mises scalar log-densities (Distributions.jl oracles; SB
+# `brm_von_mises_lpdf` matches the native value operation-for-operation).
+_vm_logpdf(y::Real, mu::Real, kap::Real) = logpdf(VonMises(mu, kap), y)
+function _vm_circ_logpdf(y::Real, mu::Real, kap::Real, lo::Real, hi::Real)
+    wm = lo + mod(mu - lo, hi - lo)
+    r = (wm - pi) + mod(y - (wm - pi), 2pi)
+    return logpdf(VonMises(wm, kap), r)
+end
+
+@testset "surface roundtrip vm end to end" begin
+    cols, _ = _gen_columns()
+    cols[:y] = [0.3, -1.1, 2.0, -2.0, 0.5, 1.1]
+    # Literal kappa, exact head.
+    m = @rkppl begin
+        mu = a .+ b .* x
+        y .~ VonMises.(mu, 1.7)
+    end
+    @test m isa RKPPLModel
+    r = only(lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ VonMises.(mu, 1.7)
+    end, (:y, :x)).responses)
+    @test (r.family, r.link, r.predictor, r.scale, r.interval) ===
+        (VonMisesFam, IdentityLink, :mu, 1.7, nothing)
+    bound = m(; y = cols[:y], x = cols[:x])
+    @test isbound(bound)
+    built = build_kernel(bound)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    ll = sum(_vm_logpdf(y, mm, 1.7) for (y, mm) in zip(cols[:y], mu))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    # Gamma-sampled kappa, circular head.
+    m = @rkppl begin
+        kappa ~ Gamma(2.0, 0.1)
+        mu = a .+ b .* x
+        y .~ CircularVonMises.(mu, kappa, -pi, pi)
+    end
+    r = only(lower_rkppl(quote
+        kappa ~ Gamma(2.0, 0.1)
+        mu = a .+ b .* x
+        y .~ CircularVonMises.(mu, kappa, -pi, pi)
+    end, (:y, :x)).responses)
+    @test (r.family, r.scale, r.interval) ===
+        (VonMisesFam, :kappa, (-Float64(pi), Float64(pi)))
+    @test only(lower_rkppl(quote
+        kappa ~ Gamma(2.0, 0.1)
+        mu = a .+ b .* x
+        y .~ CircularVonMises.(mu, kappa, -pi, pi)
+    end, (:y, :x)).parameters).family === :gamma
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    u3 = [0.5, -0.25, 1.0]
+    nt = constrain(built.layout, u3)
+    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    ll = sum(_vm_circ_logpdf(y, mm, nt.kappa, -Float64(pi), Float64(pi))
+        for (y, mm) in zip(cols[:y], mu))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
+        logpdf(Gamma(2.0, 0.1), nt.kappa)
+    @test _query(built.spec, bound, :posterior, u3) ≈
+        ll + pr + logjac(built.layout, u3)
+    _check_gradient(built.spec, bound, u3)
+    # Log-link predictor kappa (the `log(kappa) ~ 1` demand shape).
+    r = only(lower_rkppl(quote
+        mu = a .+ b .* x
+        lk = c .+ d .* x
+        y .~ VonMises.(mu, exp.(lk))
+    end, (:y, :x)).responses)
+    @test r.scale == ScalePredictorRef(:lk, LogLink)
+end
+
 @testset "ig response failures" begin
     Dn2 = (:y, :x)
     # Arity: exactly (mu, lambda).
@@ -772,6 +845,55 @@ end
         hup = e .+ f .* x
         c .~ BetaBinomial2.(n, logistic.(mu), logistic.(hup))
     end, Dn3)
+end
+
+@testset "vm response failures" begin
+    Dn2 = (:y, :x)
+    # Arity: exactly (mu, kappa) / (mu, kappa, lo, hi).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ VonMises.(mu)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ VonMises.(mu, 1.7, 0.0)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ CircularVonMises.(mu, 1.7, -pi)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ CircularVonMises.(mu, 1.7, -pi, pi, 0.0)
+    end, Dn2)
+    # The kernel-endpoint spellings redirect to the response heads.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ von_mises.(mu, 1.7)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ circular_von_mises.(mu, 1.7, -pi, pi)
+    end, Dn2)
+    # Endpoints are compile-time literals, never names.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ CircularVonMises.(mu, 1.7, lo, hi)
+    end, Dn2)
+    # The mu position takes the bare identity predictor — a `log(mu)`
+    # spelling fails closed at bind (the Normal precedent: the synth
+    # offset references the unknown coefficient name).
+    @test_throws ContractValidationError bind_data(lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ VonMises.(exp.(mu), 1.7)
+        end, Dn2),
+        Dict{Symbol,AbstractVector}(:y => [0.3], :x => [0.5]))
+    # A non-log kappa predictor fails at the contract gate (log-only).
+    @test_throws ContractValidationError lower_rkppl(quote
+        mu = a .+ b .* x
+        lk = c .+ d .* x
+        y .~ VonMises.(mu, lk)
+    end, Dn2)
 end
 
 @testset "slice-2 response failures" begin

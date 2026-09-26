@@ -283,6 +283,21 @@ function _betabinomial2_plan(n = 9)
     )
 end
 
+function _vm_plan(n = 9; interval = nothing)
+    cols = _columns(n)
+    cols[:y] = [0.3, -1.1, 2.0, -2.8, 0.5, 1.1, -0.4, 2.9, -1.7][1:n]
+    StructuralPlan(
+        [LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu, :kappa, nothing,
+            _none_evidence(), :y_resp, nothing, nothing; interval = interval)],
+        [PredictorSpec(:mu, IdentityLink, _terms(), :mu)],
+        _priors(:mu),
+        [SampledParameter(:kappa, :gamma, (arg1 = 2.0, arg2 = 0.1), nothing, :kappa)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
 @testset "contract admission predicates" begin
     @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
         BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
@@ -291,7 +306,7 @@ end
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
         MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
         PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
-        ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam)
+        ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
@@ -327,6 +342,9 @@ end
     @test validate_plan(_zip_plan()) === nothing
     @test validate_plan(_ig_plan()) === nothing
     @test validate_plan(_betabinomial2_plan()) === nothing
+    @test validate_plan(_vm_plan()) === nothing
+    @test validate_plan(_vm_plan(; interval = (-Float64(pi), Float64(pi)))) ===
+        nothing
 end
 
 @testset "link triples" begin
@@ -379,6 +397,10 @@ end
     @test_throws ContractValidationError validate_plan(bad)
     # BetaBinomial2 admits the identity predictor link only (Beta precedent).
     bad = _betabinomial2_plan()
+    bad.predictors[1] = PredictorSpec(:mu, LogLink, _terms(), :mu)
+    @test_throws ContractValidationError validate_plan(bad)
+    # VonMises admits the identity predictor link only.
+    bad = _vm_plan()
     bad.predictors[1] = PredictorSpec(:mu, LogLink, _terms(), :mu)
     @test_throws ContractValidationError validate_plan(bad)
 end
@@ -805,6 +827,112 @@ end
     bad.responses[1] =
         LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp, 4, nothing)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "vm response validation" begin
+    # VonMises requires its concentration kappa.
+    bad = _vm_plan()
+    bad.responses[1] =
+        LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A kappa literal must be finite positive.
+    for lit in (0.5, 2.0)
+        good = _vm_plan()
+        good.responses[1] =
+            LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu, lit, nothing,
+                _none_evidence(), :y_resp)
+        @test validate_plan(good) === nothing
+    end
+    for lit in (0.0, -1.0, NaN, Inf)
+        bad = _vm_plan()
+        bad.responses[1] =
+            LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu, lit, nothing,
+                _none_evidence(), :y_resp)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # A log-link kappa predictor is admitted (the `log(kappa) ~ 1` demand).
+    good = _vm_plan()
+    push!(good.predictors, PredictorSpec(:lk, LogLink, _terms(), :lk))
+    append!(good.population_priors, _priors(:lk))
+    good.responses[1] =
+        LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu,
+            ScalePredictorRef(:lk, LogLink), nothing,
+            _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    # Identity/logit kappa predictor links fail closed (a concentration).
+    for link in (IdentityLink, LogitLink)
+        bad = _vm_plan()
+        push!(bad.predictors, PredictorSpec(:lk, link, _terms(), :lk))
+        append!(bad.population_priors, _priors(:lk))
+        bad.responses[1] =
+            LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu,
+                ScalePredictorRef(:lk, link), nothing,
+                _none_evidence(), :y_resp)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # But not the response's own location predictor.
+    bad = _vm_plan()
+    bad.responses[1] =
+        LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu,
+            ScalePredictorRef(:mu, LogLink), nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Interval: finite, lo < hi, width 2pi (the BRM rule).
+    good = _vm_plan(; interval = (-Float64(pi), Float64(pi)))
+    @test validate_plan(good) === nothing
+    good = _vm_plan(; interval = (0.0, 2 * Float64(pi)))
+    good.columns[:y] = mod.(good.columns[:y], 2 * Float64(pi))
+    @test validate_plan(good) === nothing
+    for iv in ((0.0, 1.0), (Float64(pi), -Float64(pi)), (0.0, Inf),
+            (NaN, Float64(pi)))
+        bad = _vm_plan(; interval = iv)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # Only VonMises responses take interval.
+    bad = _gaussian_plan()
+    bad.responses[1] =
+        LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp, nothing, nothing;
+            interval = (-Float64(pi), Float64(pi)))
+    @test_throws ContractValidationError validate_plan(bad)
+    # Exact response must be finite numerics (Bool excluded).
+    bad = _vm_plan()
+    bad.columns[:y] = [0.3, -1.1, 2.0, -2.8, 0.5, 1.1, -0.4, 2.9, Inf]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _vm_plan()
+    bad.columns[:y] = [0.3, -1.1, 2.0, -2.8, 0.5, 1.1, -0.4, 2.9, NaN]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _vm_plan()
+    bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
+    @test_throws ContractValidationError validate_plan(bad)
+    # Circular response honors the half-open [lo, hi).
+    bad = _vm_plan(; interval = (-Float64(pi), Float64(pi)))
+    bad.columns[:y] = [0.3, -1.1, 2.0, -2.8, 0.5, 1.1, -0.4, 2.9, Float64(pi)]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _vm_plan(; interval = (-Float64(pi), Float64(pi)))
+    bad.columns[:y] =
+        [0.3, -1.1, 2.0, -2.8, 0.5, 1.1, -0.4, 2.9, -Float64(pi) - 0.1]
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _vm_plan()
+    bad.responses[1] =
+        LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu, :kappa, nothing,
+            ResponseEvidence(:truncated, -1.0, 1.0), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A per-observation kappa column binds finite positive.
+    good = _vm_plan()
+    good.columns[:kappac] = repeat([0.5, 1.5, 2.5], 3)
+    good.responses[1] =
+        LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu, :kappac, nothing,
+            _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    bad = _vm_plan()
+    bad.columns[:kappac] = fill(-1.0, 9)
+    bad.responses[1] =
+        LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu, :kappac, nothing,
+            _none_evidence(), :y_resp)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
