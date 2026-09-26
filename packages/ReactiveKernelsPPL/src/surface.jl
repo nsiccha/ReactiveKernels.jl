@@ -4769,6 +4769,8 @@ function _dot2call_spine_arg(lhs, f, i, a)
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :NegativeBinomial2 && i == 1
         return _dot2call_nested_link(lhs, a, f)
+    elseif f === :HurdlePoisson && i == 1
+        return _dot2call_nested_link(lhs, a, f)
     end
     # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
     # response branch matches the `./` structure (link + alpha identity).
@@ -4890,6 +4892,7 @@ const _RESPONSE_BASE_MSG =
     "`Poisson.(exp.(eta))`, `Binomial.(n, logistic.(mu))` (or " *
     "`probit`/`cloglog` for the link), " *
     "`NegativeBinomial2.(exp.(eta), phi)`, " *
+    "`HurdlePoisson.(exp.(eta), p_zero)`, " *
     "`Gamma.(alpha, exp.(eta) ./ alpha)`, " *
     "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`, " *
     "`CategoricalLogit.(eta_2, ..., eta_K)`, `OrderedLogistic.(eta)`, " *
@@ -4908,7 +4911,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         _sfail("`weighted.(...)` goes outermost: " *
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
     fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
-        :NegativeBinomial2, :Gamma, :Beta) ||
+        :NegativeBinomial2, :Gamma, :Beta, :HurdlePoisson) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
@@ -4944,6 +4947,11 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         loc, scale = _lower_beta_args(lhs, args, ctx)
         return BetaLogitFam, LogitLink, IdentityLink, loc, scale, nothing,
         nothing
+    elseif fam === :HurdlePoisson
+        length(args) == 2 || _sfail("response $lhs: `HurdlePoisson` takes " *
+                                    "`HurdlePoisson.(exp.(eta), p_zero)`")
+        return HurdlePoissonFam, LogLink, LogLink,
+        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
@@ -5055,6 +5063,9 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :student_t && _sfail("response $lhs: use " *
                                  "`StudentT` (the response " *
                                  "spelling, not the kernel endpoint)")
+    fam === :hurdle_poisson && _sfail("response $lhs: use " *
+                                      "`HurdlePoisson` (the response " *
+                                      "spelling, not the kernel endpoint)")
     fam === :OrderedLogit && _sfail("response $lhs: unknown distribution " *
                                     "`:OrderedLogit` (write " *
                                     "`OrderedLogistic.(eta)`)")
@@ -5064,7 +5075,7 @@ function _lower_response_base_error(lhs, rhs, fam)
         "row-grouped, never broadcast)")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
-                  "NegativeBinomial2, Gamma, Beta, BernoulliLogit, " *
+                  "NegativeBinomial2, HurdlePoisson, Gamma, Beta, BernoulliLogit, " *
                   "PoissonLog, BinomialLogit, NegativeBinomial2Log, " *
                   "GammaLog, BetaLogit, CategoricalLogit, " *
                   "OrderedLogistic, Ordinal, Multinomial, Categorical, " *
@@ -5169,9 +5180,9 @@ function _lower_nu_use(lhs, s, ctx)
 end
 
 # Scale use-site lowering (Gaussian sigma, NB2 phi, Gamma alpha, Beta
-# kappa, Student sigma): a scalar scale (parameter/assignment name, raw
-# per-observation data column, literal) passes through `_lower_scale`
-# untouched; a
+# kappa, Student sigma, hurdle p_zero): a scalar scale
+# (parameter/assignment name, raw per-observation data column, literal)
+# passes through `_lower_scale` untouched; a
 # predictor definition feeds the scale slot — bare for an identity-link
 # scale (`Normal.(mu, sigma)`), or under one dotted link wrapper
 # (`Normal.(mu, exp.(sigma))` for log, `logistic.(sigma)` for logit).
@@ -5299,9 +5310,9 @@ end
 # Analyze (or intern) a scale predictor: exactly the location-predictor
 # treatment (`_lower_location`'s named-definition arm) under the use-site
 # link — affine analysis, coefficient-use recording, one link per
-# predictor. Family admission (Gaussian/NB2/Gamma/Student; Beta deferred)
-# is the contract's gate (`_validate_scale_predictor`), so hand-built
-# plans get the same rule.
+# predictor. Family admission (Gaussian/NB2/Gamma/Student/hurdle; Beta
+# deferred) is the contract's gate (`_validate_scale_predictor`), so
+# hand-built plans get the same rule.
 function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
         pred_idx, coefuse)
     haskey(pred_idx, name) || haskey(ctx.detmap, name) ||

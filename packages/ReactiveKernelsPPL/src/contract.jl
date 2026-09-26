@@ -97,6 +97,7 @@ univariate components, SB `MixtureModel` mirror)."""
     PoissonLogGLMFam
     MixtureFam
     StudentTFam
+    HurdlePoissonFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -152,8 +153,9 @@ end
     ScalePredictorRef(predictor, link)
 
 A predictor-fed scale/shape use: the response's auxiliary (Gaussian
-sigma, NB2 dispersion phi, Gamma shape alpha) is a whole linear
-predictor, varying per observation. `predictor` names the
+sigma, NB2 dispersion phi, Gamma shape alpha, Student sigma, hurdle
+p_zero) is a whole linear predictor, varying per observation.
+`predictor` names the
 [`PredictorSpec`](@ref) (planned exactly like a location predictor:
 terms, priors, one link); `link` is the scale use-site wrapper —
 [`IdentityLink`](@ref) (bare predictor), [`LogLink`](@ref)
@@ -172,10 +174,12 @@ end
     LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, trials[, range]])
 
 One independent response. `scale` is the response's auxiliary —
-Gaussian sigma, NB2 dispersion phi, Gamma shape alpha — either scalar
-(parameter, assignment, folded literal, or a raw per-observation data
-column) or, for Gaussian/NB2/Gamma only, a [`ScalePredictorRef`](@ref)
-(predictor-fed per-observation scale); it must be `nothing` otherwise.
+Gaussian sigma, NB2 dispersion phi, Gamma shape alpha, hurdle p_zero —
+either scalar (parameter, assignment, folded literal, or a raw
+per-observation data column) or, for Gaussian/NB2/Gamma/Student/hurdle
+only, a [`ScalePredictorRef`](@ref) (predictor-fed per-observation
+auxiliary); it must be `nothing` otherwise. A hurdle p_zero is a
+probability (scalar in [0, 1], predictor-fed logit-only).
 (One slot covers every admitted family; a two-auxiliary family such as
 Beta needs a new field — noted, not built.) `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
@@ -1336,6 +1340,7 @@ const ADMITTED_TRIPLES = (
     (OrdinalFam, ProbitLink, IdentityLink),
     (OrdinalFam, CloglogLink, IdentityLink),
     (StudentTFam, IdentityLink, IdentityLink),
+    (HurdlePoissonFam, LogLink, LogLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order)."""
@@ -1674,7 +1679,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
-    PoissonLogGLMFam, MixtureFam, StudentTFam)
+    PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -6179,7 +6184,7 @@ function _validate_responses(plan::StructuralPlan)
             "(admitted: Gaussian/identity, Bernoulli-logit/probit/cloglog, " *
             "Poisson-log, Binomial-logit/probit/cloglog, NB2-log, Gamma-log, " *
             "Beta-logit, Categorical-logit, Ordered-logit, Ordinal spellings, " *
-            "Student-identity)",
+            "Student-identity, Hurdle-Poisson-log)",
         )
         _validate_scale(r, plan)
         _validate_nu(r, plan)
@@ -6243,6 +6248,9 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     elseif r.family === NegativeBinomial2Fam
         _is_count_column(col) && return nothing
         return _fail(r.label, "NB2 response must be non-negative integers")
+    elseif r.family === HurdlePoissonFam
+        _is_count_column(col) && return nothing
+        return _fail(r.label, "Hurdle response must be non-negative integers")
     elseif r.family === GaussianFam
         eltype(col) <: Real ||
             _fail(r.label, "Gaussian response must be numeric")
@@ -6396,7 +6404,8 @@ _scale_need(fam::LikelihoodFamily) =
     fam === GammaLogFam ? "Gamma response requires a shape alpha" :
     fam === BetaLogitFam ? "Beta response requires a concentration kappa" :
     fam === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" :
-    fam === StudentTFam ? "Student response requires a scale sigma" : nothing
+    fam === StudentTFam ? "Student response requires a scale sigma" :
+    fam === HurdlePoissonFam ? "Hurdle response requires a hurdle probability p_zero" : nothing
 
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     need = _scale_need(r.family)
@@ -6420,6 +6429,11 @@ function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
         forbidden::Vector{Symbol} = [r.predictor])
     s === nothing && return nothing
     if s isa Real
+        if fam === HurdlePoissonFam
+            (isfinite(s) && 0 <= s <= 1) ||
+                _fail(r.label, "$what literal must lie in [0, 1] (a hurdle probability)")
+            return nothing
+        end
         (isfinite(s) && s > 0) ||
             _fail(r.label, "$what literal must be finite positive")
         return nothing
@@ -6436,13 +6450,14 @@ function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
 end
 
 # A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha,
-# Student sigma):
+# Student sigma, hurdle p_zero):
 # the predictor exists, carries the use-site link (the
 # one-link-per-predictor rule), and is not the response's own location
 # predictor (the two slots take distinct predictors — the BRM-side plan
 # rule, mirrored here as defense in depth). Beta-kappa predictors are
 # deferred; predictor-fed Binomial trials likewise (trials stay
-# column-or-literal by type).
+# column-or-literal by type). A hurdle p_zero predictor is logit-only (a
+# probability); the scale families admit identity/log/logit.
 function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
         s::ScalePredictorRef)
     return _validate_scale_predictor_use(r, plan, s, r.family, [r.predictor])
@@ -6455,12 +6470,19 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
         "Beta response with a scale predictor: predictor-fed concentration " *
         "(kappa) is deferred — use a scalar kappa (parameter or literal)")
     (fam === GaussianFam || fam === NegativeBinomial2Fam ||
-        fam === GammaLogFam || fam === StudentTFam) ||
+        fam === GammaLogFam || fam === StudentTFam ||
+        fam === HurdlePoissonFam) ||
         _fail(r.label, "this response family takes no scale predictor")
-    (s.link === IdentityLink || s.link === LogLink ||
-        s.link === LogitLink) ||
-        _fail(r.label, "scale predictor link must be identity, log, or " *
-            "logit (got $(s.link))")
+    if fam === HurdlePoissonFam
+        s.link === LogitLink ||
+            _fail(r.label, "hurdle p_zero predictor link must be logit " *
+                "(a probability — got $(s.link))")
+    else
+        (s.link === IdentityLink || s.link === LogLink ||
+            s.link === LogitLink) ||
+            _fail(r.label, "scale predictor link must be identity, log, or " *
+                "logit (got $(s.link))")
+    end
     idx = findfirst(p -> p.name === s.predictor, plan.predictors)
     idx === nothing && _fail(r.label,
         "scale addresses unknown predictor $(s.predictor)")
@@ -6503,8 +6525,15 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
     haskey(plan.columns, s) ||
         _fail(r.label, "scale references unknown name $s")
     col = _vector_column(plan.columns, s, r.label, "scale column")
-    (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
-        _fail(r.label, "per-observation scale $s must be finite positive numerics")
+    if r.family === HurdlePoissonFam
+        (eltype(col) <: Real && all(isfinite, col) &&
+            all(x -> 0 <= x <= 1, col)) ||
+            _fail(r.label, "per-observation p_zero $s must be finite " *
+                "numerics in [0, 1]")
+    else
+        (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
+            _fail(r.label, "per-observation scale $s must be finite positive numerics")
+    end
     length(col) == plan.n_obs ||
         _fail(r.label, "scale column $s length $(length(col)) ≠ n_obs $(plan.n_obs)")
     return nothing

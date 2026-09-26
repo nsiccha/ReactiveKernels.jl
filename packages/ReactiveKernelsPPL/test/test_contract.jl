@@ -222,6 +222,21 @@ function _student_plan(n = 9)
     )
 end
 
+function _hurdle_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([0, 1, 2], outer = cld(n, 3))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, :p_zero, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, LogLink, _terms(), :eta)],
+        _priors(:eta),
+        [SampledParameter(:p_zero, :beta, (arg1 = 2.0, arg2 = 2.0), nothing, :p_zero)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
 @testset "contract admission predicates" begin
     @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
         BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
@@ -229,7 +244,7 @@ end
         BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
         MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
-        PoissonLogGLMFam, MixtureFam, StudentTFam)
+        PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
@@ -261,6 +276,7 @@ end
     @test validate_plan(_binomial_cloglog_plan()) === nothing
     @test validate_plan(_beta_plan()) === nothing
     @test validate_plan(_student_plan()) === nothing
+    @test validate_plan(_hurdle_plan()) === nothing
 end
 
 @testset "link triples" begin
@@ -298,6 +314,10 @@ end
     # Student admits the identity predictor link only.
     bad = _student_plan()
     bad.predictors[1] = PredictorSpec(:mu, LogLink, _terms(), :mu)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Hurdle admits the log predictor link only.
+    bad = _hurdle_plan()
+    bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -416,6 +436,87 @@ end
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu,
             ScalePredictorRef(:mu, IdentityLink), nothing,
             _none_evidence(), :y_resp, nothing, nothing; nu = :nu)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "hurdle response validation" begin
+    # Hurdle requires its hurdle probability p_zero.
+    bad = _hurdle_plan()
+    bad.responses[1] =
+        LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A p_zero literal must lie in [0, 1] — but both endpoints are valid
+    # (degenerate all-positive / all-zero hurdle).
+    for lit in (0.0, 0.35, 1.0)
+        good = _hurdle_plan()
+        good.responses[1] =
+            LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, lit, nothing,
+                _none_evidence(), :y_resp)
+        @test validate_plan(good) === nothing
+    end
+    for lit in (-0.1, 1.5, NaN, Inf)
+        bad = _hurdle_plan()
+        bad.responses[1] =
+            LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, lit, nothing,
+                _none_evidence(), :y_resp)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # A logit-link p_zero predictor is admitted (the hu submodel).
+    good = _hurdle_plan()
+    push!(good.predictors, PredictorSpec(:hu, LogitLink, _terms(), :hu))
+    append!(good.population_priors, _priors(:hu))
+    good.responses[1] =
+        LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta,
+            ScalePredictorRef(:hu, LogitLink), nothing,
+            _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    # Log/identity p_zero predictor links fail closed (a probability).
+    for link in (LogLink, IdentityLink)
+        bad = _hurdle_plan()
+        push!(bad.predictors, PredictorSpec(:hu, link, _terms(), :hu))
+        append!(bad.population_priors, _priors(:hu))
+        bad.responses[1] =
+            LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta,
+                ScalePredictorRef(:hu, link), nothing,
+                _none_evidence(), :y_resp)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # But not the response's own location predictor.
+    bad = _hurdle_plan()
+    bad.responses[1] =
+        LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta,
+            ScalePredictorRef(:eta, LogLink), nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Hurdle response must be non-negative integers (Bool excluded).
+    bad = _hurdle_plan()
+    bad.columns[:y] = [0, 1, -1, 2, 0, 1, 3, 0, 2]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _hurdle_plan()
+    bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _hurdle_plan()
+    bad.columns[:y] = collect(1.0:9.0)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _hurdle_plan()
+    bad.responses[1] =
+        LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, :p_zero, nothing,
+            ResponseEvidence(:truncated, 0, 4), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A per-observation p_zero column binds in [0, 1].
+    good = _hurdle_plan()
+    good.columns[:p0c] = repeat([0.0, 0.5, 1.0], 3)
+    good.responses[1] =
+        LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, :p0c, nothing,
+            _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    bad = _hurdle_plan()
+    bad.columns[:p0c] = fill(1.5, 9)
+    bad.responses[1] =
+        LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, :p0c, nothing,
+            _none_evidence(), :y_resp)
     @test_throws ContractValidationError validate_plan(bad)
 end
 

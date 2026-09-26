@@ -910,6 +910,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
             r.range === nothing &&
             return _poisson_wholevec_stmts(r, plan, node)
         return _poisson_plate_stmts(r, plan, node, pw)
+    elseif r.family === HurdlePoissonFam
+        return _hurdle_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
         return _binomial_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomial2Fam
@@ -1355,6 +1357,42 @@ function _poisson_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, etav::Symbo
     else # :interval_censored
         return :(log($(pcdf(ub)) - $(pcdf(_poisson_below(yv)))))
     end
+end
+
+# Hurdle-Poisson likelihood (SB `hurdle_poisson` mirror): a zero part
+# plus a zero-truncated Poisson positive part. Per cell:
+# `y == 0 ? log(p0) : log1p(-p0) + poisson_logpdf - log(1 - e^-λ)`.
+# The Poisson factor reuses the `poisson(; log_rate)` endpoint HAVE
+# (the Poisson-plate precedent). The truncation correction is the
+# closed form `log(-expm1(-λ))` (Poisson cdf(0) is exactly e^-λ; SB
+# subtracts `poisson_lccdf(0 | λ)` — the same quantity) — NOT the
+# `.cdf(0)` endpoint, whose `gamma_inc` has no Reactant tracing rule
+# (`MethodError` on compile; the truncated/censored Poisson cells
+# carry the same gap). The `y == 0` select is the mixture-Bernoulli
+# `!=` precedent; p_zero threads scalar or via the `_ppl_sc_` node
+# (the scale-predictor precedent — a hurdle p_zero predictor is
+# logit-only at the contract gate). Evidence fails closed at the
+# contract gate (Gaussian/Poisson only); weights multiply the cell
+# (the NB2 precedent). No whole-vector fusion yet: both parts carry
+# per-cell parameter-dependent work (the truncation correction varies
+# with λ even for scalar p_zero) — a perf-lane follow-up, not this
+# slice.
+function _hurdle_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, lp]
+    yv, etav = _dovar(1), _dovar(2)
+    p0v = _thread_ref!(inputs, sarg)
+    base = :(poisson(; log_rate = $etav).logpdf($yv))
+    trunc = :(log(-expm1(-exp($etav))))
+    cell = :(ifelse($yv == 0, log($p0v), log1p(-$p0v) + $base - $trunc))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
