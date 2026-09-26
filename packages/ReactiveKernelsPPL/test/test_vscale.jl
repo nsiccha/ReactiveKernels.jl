@@ -193,6 +193,19 @@ end
         y .~ Normal.(mu, s2)
     end, (:y, :x, :z))
     @test only(aliased.responses).scale === :s2
+    # Normal-priored aliases stay scalar-path on a bare use too: naming a
+    # stated name must not re-bucket it (a latent-submodel `s = s_r`
+    # expansion keeps `s_r` a parameter — the merge joint-session
+    # contract). Only link-wrapped uses admit stated coefficients.
+    naliased = lower_rkppl(quote
+        mu = a .+ b .* x
+        s_r ~ Normal(0.0, 1.0)
+        s = s_r
+        y .~ Normal.(mu, s)
+    end, (:y, :x, :z))
+    @test only(naliased.responses).scale === :s
+    @test any(p -> p.name === :s_r, naliased.parameters)
+    @test !any(p -> p.predictor === :s, naliased.population_priors)
 end
 
 @testset "surface: scale fail-closed battery" begin
