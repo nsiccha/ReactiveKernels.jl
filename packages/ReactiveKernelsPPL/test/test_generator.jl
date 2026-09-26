@@ -1011,9 +1011,9 @@ end
 
 @testset "poisson evidence lower bounds shift by one (inclusive cdf)" begin
     # poisson.cdf(k) = P(Y ≤ k): lower-side masses cover Y < lb, i.e. F(lb-1),
-    # and interval cells cover [yv, ub], i.e. F(ub) - F(yv-1). Oracles are
-    # Distributions.jl cdf/logpdf arithmetic (F(-1) = 0 definitionally),
-    # never the emitted forms.
+    # while interval cells are open below ((yv, ub], i.e. F(ub) - F(yv) —
+    # the brm-use contract). Oracles are Distributions.jl cdf/logpdf
+    # arithmetic (F(-1) = 0 definitionally), never the emitted forms.
     _F(lam, k) = k < 0 ? 0.0 : cdf(Poisson(lam), k)
     cols, n = _gen_columns()
     cols[:y] = [0, 1, 2, 1, 3, 2]
@@ -1061,10 +1061,11 @@ end
         ifelse.(y .> 2, log.(1 .- _F.(lam, 2)), logpdf.(Poisson.(lam), y)))
     @test _query(built.spec, plan, :posterior, u) ≈ sum(cell) + pr
     _check_gradient(built.spec, plan, u)
-    # Interval [yv,4]: log(F(4) - F(yv-1)); the y = 0 row pins F(-1) = 0.
+    # Interval (yv,4]: log(F(4) - F(yv)) — open below per the brm-use
+    # contract (the response is the exclusive lower endpoint).
     built, plan, lam, pr =
         _run(ResponseEvidence(:interval_censored, nothing, 4))
-    ival = sum(log.(_F.(lam, 4) .- _F.(lam, y .- 1)))
+    ival = sum(log.(_F.(lam, 4) .- _F.(lam, y)))
     @test _query(built.spec, plan, :posterior, u) ≈ ival + pr
     _check_gradient(built.spec, plan, u)
 end

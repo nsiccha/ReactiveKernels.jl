@@ -145,7 +145,8 @@ end
 Censoring/truncation evidence wrapper on an admitted family (D3 response
 evidence). Bounds are literals or [`ColumnRef`](@ref)s. For
 `:interval_censored` the response itself is the lower endpoint, so `lower`
-must be `nothing` and `upper` is required.
+must be `nothing` and `upper` is required. The interval is open below:
+the cell is `log(CDF(upper) - CDF(response))` for `(response, upper]`.
 """
 struct ResponseEvidence
     kind::Symbol # :none | :truncated | :censored | :interval_censored

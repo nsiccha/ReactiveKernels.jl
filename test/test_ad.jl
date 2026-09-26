@@ -1,10 +1,23 @@
 using DifferentiationInterface
 import Enzyme
+using InteractiveUtils: code_llvm
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
 
 include("test_authored_plate_chains_ad.jl")
 
 const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
+
+# Wide-splat regression closures, evaluated once at file scope (world-safe:
+# no eval happens inside the testset body). Forty distinct one-input lanes
+# plus one 40-input fused sum, mirroring the memo joint's 43-argument
+# log-Jacobian (snag `joint-decl-memo-9642bb45`).
+const _WIDE_SPLAT_LANES = [
+    Core.eval(@__MODULE__, :(v -> sum(v) + $(Float64(i)))) for i in 1:40
+]
+const _WIDE_SPLAT_SUM = let names = [Symbol(:w_, i) for i in 1:40]
+    Core.eval(@__MODULE__, Expr(:->, Expr(:tuple, names...),
+        Expr(:call, :+, names...)))
+end
 
 _test_ad_value_gradient_allocated(prepared, gradient, q, data) =
     @allocated ad_value_and_gradient!(prepared, gradient, q, data)
@@ -103,6 +116,41 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
             kernel, TEST_AD_BACKEND, true, 0.4;
             active = :logit, unsupported = 1,
         )
+    end
+
+    @testset "wide fused closure differentiates past the 1.12 splat cliff" begin
+        # Julia 1.12 inference refuses to unsplat a forwarded tuple of more
+        # than 32 elements into a fixed-arity callee (snag
+        # `joint-decl-memo-9642bb45`): the memo joint's 43-argument
+        # log-Jacobian devolved to dynamic `jl_apply_generic` dispatch and
+        # Enzyme aborted the gradient. `_kernel_source_call` forwards
+        # positionally, so a 40-input fused closure differentiates on every
+        # version. One vector HAVE keeps the top-level boundary narrow (the
+        # memo shape); the width lives only in the fused op's inputs.
+        graph = Graph()
+        q = value!(graph, :q, Vector{Float64})
+        lanes = [value!(graph, Symbol(:w_, i), Float64) for i in 1:40]
+        for (lane, shift) in zip(lanes, _WIDE_SPLAT_LANES)
+            add!(graph, (q,) => lane, shift)
+        end
+        total = value!(graph, :total, Float64)
+        add!(graph, Tuple(lanes) => total,
+            ReactiveKernels._KernelSourceOp(
+                Val(:wide_splat_regression), Val(:fused), _WIDE_SPLAT_SUM))
+        kernel = prepare(graph; have = (q,), want = total)
+        # 40 lanes plus the wide op, all surviving preparation: a future
+        # pass must not silently shrink the fused call below the cliff.
+        @test length(kernel.ops) == 41
+        point = fill(0.25, 40)
+        @test kernel(point) ≈ 0.25 * 40^2 + 40 * 41 / 2
+        # Static-dispatch pin (fast; the memo e2e covers Enzyme end to
+        # end): pre-fix, 1.12 emitted `jl_apply_generic` for this call and
+        # Enzyme aborted the gradient.
+        op = only(
+            o for o in kernel.ops if o isa ReactiveKernels._KernelSourceOp)
+        llvm = sprint(code_llvm, ReactiveKernels._kernel_source_call,
+            Tuple{Val{:native},typeof(op),ntuple(_ -> Float64, 40)...})
+        @test !occursin("jl_apply_generic", llvm)
     end
 
     @testset "multiple active ports share one structured reverse pass" begin

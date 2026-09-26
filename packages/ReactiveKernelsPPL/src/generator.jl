@@ -1411,8 +1411,9 @@ function _zip_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
 end
 
 # Lower-side cdf argument for the inclusive discrete cdf: the mass below
-# lb is F(lb - 1), so truncated/censored low arms and interval cells shift
-# their lower argument by one. Int literals fold; do-vars convert via Int
+# lb is F(lb - 1), so truncated/censored low arms shift their lower
+# argument by one (interval cells stay unshifted — the response is the
+# open lower endpoint). Int literals fold; do-vars convert via Int
 # (cdf takes Int, which also hardens non-Int Integer columns). The kernel's
 # `observed >= 0` guard maps -1 to 0.0, so no clamp is needed.
 _poisson_below(b::Int) = b - 1
@@ -1444,7 +1445,11 @@ function _poisson_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, etav::Symbo
                 ifelse($yv > $ub, log1p(-$(pcdf(ub))), $base)))
         end
     else # :interval_censored
-        return :(log($(pcdf(ub)) - $(pcdf(_poisson_below(yv)))))
+        # Open below per the brm-use contract (`log(CDF(upper) -
+        # CDF(response))` for `(response, upper]`): the response is the
+        # EXCLUSIVE lower endpoint, so no `_poisson_below` shift (that
+        # shift is for inclusive truncated bounds / clamp arms only).
+        return :(log($(pcdf(ub)) - $(pcdf(yv))))
     end
 end
 
