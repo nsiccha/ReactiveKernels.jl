@@ -64,7 +64,7 @@ end
         for v in plan.spline_vectors]
     @test got == [(:b_s_x_fixed, :flat, NamedTuple(), nothing, 2, :s_x),
         (:b_s_x_raw, :normal, (arg1 = 0, arg2 = 1), nothing, 2, :s_x),
-        (:sd_s_x, :normal, (arg1 = 0, arg2 = 1), :positive, 1, :s_x)]
+        (:sd_s_x, :normal, (arg1 = 0, arg2 = 1), :positive_stan, 1, :s_x)]
     terms = only(plan.predictors).terms
     @test length(terms) == 2
     t = terms[2]
@@ -91,7 +91,7 @@ end
         :b_t2_xz_nr_raw, :sd_t2_xz]
     sd = only(v for v in plan.spline_vectors if v.name === :sd_t2_xz)
     @test (sd.family, sd.support_override, sd.width) ===
-        (:normal, :positive, 3)
+        (:normal, :positive_stan, 3)
     # Explicit kind + default k on `s`.
     plain = lower_rkppl(quote
             spline_basis(:s_x, x; kind = :tps)
@@ -443,7 +443,7 @@ function _ref_spline_tps(bound, nt)
     ll = sum(logpdf.(Normal.(eta, nt.sigma), bound.columns[:y]))
     pr = logpdf(Normal(0, 5), nt.mu[1]) + logpdf(Exponential(1), nt.sigma) +
         sum(logpdf.(Normal(0, 1), nt.b_s_x_raw)) +
-        logpdf(Normal(0, 1), nt.sd_s_x[1]) + log(2)
+        logpdf(Normal(0, 1), nt.sd_s_x[1])  # `:positive_stan`: no +log(2)
     return (; ll, pr)
 end
 
@@ -476,7 +476,7 @@ function _ref_spline_t2(bound, nt)
         sum(logpdf.(Normal(0, 1), nt.b_t2_xz_rr_raw)) +
         sum(logpdf.(Normal(0, 1), nt.b_t2_xz_rn_raw)) +
         sum(logpdf.(Normal(0, 1), nt.b_t2_xz_nr_raw)) +
-        sum(logpdf.(Normal(0, 1), sd)) + 3 * log(2)
+        sum(logpdf.(Normal(0, 1), sd))  # `:positive_stan`: no +3log(2)
     return (; ll, pr)
 end
 
