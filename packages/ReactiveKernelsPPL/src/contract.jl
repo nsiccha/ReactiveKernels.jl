@@ -187,6 +187,20 @@ struct ScalePredictorRef
 end
 
 """
+    MixtureComplementWeights(param, param_first)
+
+2-component mixture weights from one `:unit`-support sampled parameter
+(`[s, 1-s]` when `param_first`, `[1-s, s]` otherwise): the collapsed
+Beta-weight shape. The complement sums to 1 by construction, so no
+simplex validation applies; the generator threads the constrained
+scalar and logs each arm directly.
+"""
+struct MixtureComplementWeights
+    param::Symbol
+    param_first::Bool
+end
+
+"""
     LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, trials[, range]])
 
 One independent response. `scale` is the response's auxiliary —
@@ -311,8 +325,9 @@ their defaults:
   required exactly when the component family takes a scale auxiliary.
   Empty otherwise.
 - `mixture_weights`: the length-K mixing weights: a literal
-  `Vector{Float64}` (finite, nonnegative, sums to 1) or a
-  `:simplex_dirichlet` [`VectorParameter`](@ref) name, `nothing`
+  `Vector{Float64}` (finite, nonnegative, sums to 1), a
+  `:simplex_dirichlet` [`VectorParameter`](@ref) name, or a
+  [`MixtureComplementWeights`](@ref) pair (K == 2), `nothing`
   otherwise.
 
 `predictor` is an anchor only (first location predictor, else first
@@ -372,7 +387,7 @@ struct LikelihoodSpec
     mixture_family::Union{Nothing,LikelihoodFamily}
     mixture_locs::Vector{Union{Symbol,Real}}
     mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
-    mixture_weights::Union{Nothing,Symbol,Vector{Float64}}
+    mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights}
     nu::Union{Nothing,ParamName,Real,ScalePredictorRef}
     zi::Union{Nothing,ParamName,Real,ScalePredictorRef}
     mi_jobs::Union{Nothing,ColumnRef}
@@ -407,7 +422,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         mixture_locs::Vector{Union{Symbol,Real}} = Union{Symbol,Real}[],
         mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}} =
             Union{Nothing,Symbol,Real,ScalePredictorRef}[],
-        mixture_weights::Union{Nothing,Symbol,Vector{Float64}} = nothing,
+        mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights} = nothing,
         nu::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         zi::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         mi_jobs::Union{Nothing,ColumnRef} = nothing,
@@ -1733,7 +1748,7 @@ reductions; elementwise math over columns deferred with vector assignments;
 the AR(1) slice adds `tanh` for the `phi = tanh(phi_raw)` stationarity map)."""
 const ASSIGNMENT_FNS = (
     :+, :-, :*, :/, :^,
-    :log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :tanh,
+    :log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :tanh, :logaddexp,
     :sum, :mean, :std, :var, :minimum, :maximum, :length,
 )
 
@@ -1879,8 +1894,10 @@ const ELEMENTWISE_OPS =
 const ELEMENTWISE_COMPARISONS = (:.==, :.!=, :.<, :.>, :.<=, :.>=)
 
 """Dotted math functions admitted in derived columns (`f.(x)` parses to
-`Expr(:., f, ...)`; single-argument, mirroring the scalar math subset)."""
-const ELEMENTWISE_FNS = (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs)
+`Expr(:., f, ...)`; single-argument, mirroring the scalar math subset —
+plus two-argument `logaddexp` for occupancy marginalization)."""
+const ELEMENTWISE_FNS =
+    (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :logaddexp)
 
 """Families the thin layer can lower (ext handshake predicate)."""
 admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
@@ -4703,8 +4720,13 @@ function _collect_vector_dot!(refs, ex, plan, label, bound::Bool)
         "Julia functions are planned (no-@deffun-ceremony direction) but " *
         "need IR/contract growth",
     )
-    length(args) == 1 ||
-        _fail(label, "`$f.` takes exactly one argument")
+    if f === :logaddexp
+        length(args) == 2 ||
+            _fail(label, "`logaddexp.` takes exactly two arguments")
+    else
+        length(args) == 1 ||
+            _fail(label, "`$f.` takes exactly one argument")
+    end
     _check_numeric_position!(args, plan, label, bound)
     for arg in args
         _collect_vector_refs!(refs, arg, plan, label, bound)
@@ -6594,7 +6616,7 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
     w = r.mixture_weights
     w === nothing && _fail(r.label,
         "a mixture response requires its mixture_weights (a literal " *
-        "length-K vector or a simplex parameter)")
+        "length-K vector, a simplex parameter, or a complement pair)")
     if w isa Symbol
         vi = findfirst(p -> p.name === w, plan.vector_parameters)
         vi === nothing && _fail(r.label,
@@ -6606,6 +6628,19 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
         length(vp.args.arg1) == K || _fail(r.label,
             "mixture weights concentration length " *
             "$(length(vp.args.arg1)) disagrees with the $K components")
+    elseif w isa MixtureComplementWeights
+        K == 2 || _fail(r.label,
+            "complement-pair mixture weights take exactly 2 components " *
+            "(got $K)")
+        pi = findfirst(p -> p.name === w.param, plan.parameters)
+        pi === nothing && _fail(r.label,
+            "complement-pair mixture weight $(w.param) is not a sampled " *
+            "parameter")
+        get(SAMPLED_SUPPORT, plan.parameters[pi].family, :unknown) === :unit ||
+            _fail(r.label,
+            "complement-pair mixture weight $(w.param) must be " *
+            ":unit-support (a Beta/uniform/interval parameter), got " *
+            "$(plan.parameters[pi].family)")
     else
         length(w) == K || _fail(r.label,
             "mixture has $K components but $(length(w)) weights")
@@ -6838,6 +6873,32 @@ function _validate_responses(plan::StructuralPlan)
             r.range === nothing || _fail(r.label,
                 "a plate-mean observation ($(r.predictor)) takes no range " *
                 "(the latent covers the whole column)")
+            _validate_scale(r, plan)
+            _validate_nu(r, plan)
+            _validate_zi(r, plan)
+            _validate_interval(r, plan)
+            _validate_evidence_structure(r, plan)
+            _validate_unleveled_fields(r)
+            continue
+        end
+        # A bare sampled-parameter location (constrained-scale, no link
+        # inversion — the mixture bare-mean slots, single-family form):
+        # Bernoulli/Binomial-logit and Poisson-log over a scalar
+        # parameter. Evidence stays fail-closed (the cdf arms are
+        # link-space); weights/range ride the generic machinery.
+        if any(p -> p.name === r.predictor, plan.parameters)
+            ((r.family === BernoulliLogitFam ||
+                r.family === BinomialLogitFam) &&
+                r.link === LogitLink) ||
+                (r.family === PoissonLogFam && r.link === LogLink) ||
+                _fail(r.label,
+                "a sampled-parameter response location ($(r.predictor)) is " *
+                "Bernoulli/Binomial-logit or Poisson-log only in v1 " *
+                "(got $(r.family)/$(r.link))")
+            r.evidence.kind === :none || _fail(r.label,
+                "a sampled-parameter location ($(r.predictor)) takes no " *
+                "censoring/truncation evidence in v1 (the cdf arms are " *
+                "link-space)")
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
@@ -7608,8 +7669,9 @@ function _validate_evidence_structure(r::LikelihoodSpec, plan::StructuralPlan)
     ev.kind in (:none, :truncated, :censored, :interval_censored) ||
         _fail(r.label, "evidence kind $(ev.kind) unknown")
     ev.kind === :none && return nothing
-    (r.family === GaussianFam || r.family === PoissonLogFam) ||
-        _fail(r.label, "evidence wrappers apply to Gaussian/Poisson only (slice 1)")
+    (r.family === GaussianFam || r.family === PoissonLogFam ||
+        r.family === StudentTFam) ||
+        _fail(r.label, "evidence wrappers apply to Gaussian/Poisson/StudentT only (slice 1)")
     if ev.kind === :interval_censored
         ev.lower === nothing ||
             _fail(r.label, "interval evidence takes no lower (the response is the lower endpoint)")
