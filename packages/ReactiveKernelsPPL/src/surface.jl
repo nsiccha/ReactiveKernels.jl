@@ -588,9 +588,12 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         push!(used_locs, r.predictor)
         union!(used_locs, r.extra_predictors)
         # A scale predictor's definition is absorbed like a location's —
-        # never also a derived column.
+        # never also a derived column. A predictor-fed nu absorbs the
+        # same way.
         r.scale isa ScalePredictorRef &&
             push!(used_locs, r.scale.predictor)
+        r.nu isa ScalePredictorRef &&
+            push!(used_locs, r.nu.predictor)
         # Mixture component predictors absorb like locations (non-predictor
         # slot names are not definitions — `_absorbed_skip` ignores them).
         if r.family === MixtureFam
@@ -1031,7 +1034,7 @@ function _reject_unknown_calls(where, rhs)
 end
 
 # Emission skip set: locations never emit; absorbed definitions emit only
-# while a non-skipped definition (or a response scale / parameter
+# while a non-skipped definition (or a response scale/nu / parameter
 # argument) still names them. Fixpoint: skipping cascades through
 # absorbed-only reference chains (chained intermediates vanish entirely).
 function _absorbed_skip(det, canonmap, responses, paramsyms, absorbed,
@@ -1041,6 +1044,7 @@ function _absorbed_skip(det, canonmap, responses, paramsyms, absorbed,
         refs = Set{Symbol}(paramsyms)
         for r in responses
             r.scale isa Symbol && push!(refs, r.scale)
+            r.nu isa Symbol && push!(refs, r.nu)
             for s in r.mixture_scales
                 s isa Symbol && push!(refs, s)
             end
@@ -4274,7 +4278,7 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
         coefuse)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
-    nu = _lower_nu_use(lhs, nu_raw, ctx)
+    nu = _lower_nu_use(lhs, nu_raw, ctx, predictors, pred_idx, coefuse)
     zi = _lower_zi_use(lhs, zi_raw, ctx)
     interval = _lower_interval_use(lhs, interval_raw, ctx)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
@@ -5510,25 +5514,67 @@ function _lower_scale(lhs, s, ctx)
 end
 
 # Student nu use-site lowering: a bare parameter/assignment name or a
-# literal, scalar only — no per-observation columns (a column name fails
-# at the contract's unknown-name gate), no predictor-fed nu (a modeled
-# nu is deferred), no expressions (bind via an assignment first).
-function _lower_nu_use(lhs, s, ctx)
+# literal stays scalar; a predictor definition feeds the nu slot — bare
+# for an identity-link nu (`StudentT.(lognu, mu, sigma)`), or under one
+# dotted link wrapper (`StudentT.(exp.(lognu), mu, sigma)` for log,
+# `logistic.(lognu)` for logit). The wrapper arrives unconverted (the nu
+# position passes the spine converter through, like scale), so it matches
+# here in dotted `Expr(:., ...)` form. Undotted wrappers fail closed
+# (scalar `exp(log_nu)` use-site wrappers are deferred — the LP link
+# spells the transform instead), as do wrappers over anything but a
+# predictor definition. No per-observation columns (a column name fails at
+# the contract's unknown-name gate), no expressions (bind via an
+# assignment first).
+function _lower_nu_use(lhs, s, ctx, predictors, pred_idx, coefuse)
     s === nothing && return nothing
     s isa Real && return s
+    if s isa Expr && s.head === :.
+        return _lower_nu_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+    end
+    if s isa Expr && s.head === :call && !isempty(s.args) &&
+            s.args[1] isa Symbol && s.args[1] in (:exp, :logistic)
+        return _sfail("response $lhs nu wraps `$(s.args[1])` undotted " *
+                      "(`$(repr(s))`) — nu link wrappers broadcast " *
+                      "(`$(s.args[1]).(predictor)` over a predictor " *
+                      "definition); scalar `exp(log_nu)` use-site " *
+                      "wrappers are deferred (spell the transform as the " *
+                      "predictor's link instead)")
+    end
+    # A bare nu keeps the scalar meaning: an alias over a stated prior
+    # lowers like the name itself (a parameter), never as a predictor.
+    if s isa Symbol && _is_scale_predictor_def(s, ctx, false)
+        pname = _lower_scale_predictor(lhs, s, IdentityLink, ctx, predictors,
+            pred_idx, coefuse)
+        return ScalePredictorRef(pname, IdentityLink)
+    end
     if s isa Symbol
-        # Bare use: stated-prior aliases are scalar nu, like a bare
-        # scale — only undeclared/vector/factor defs count as
-        # predictor-fed here.
-        _is_scale_predictor_def(s, ctx, false) && _sfail(
-            "response $lhs nu $s is a predictor definition — " *
-            "predictor-fed nu (a modeled df) is deferred: use a scalar " *
-            "nu (parameter or literal)")
         return s
     end
     return _sfail("response $lhs nu must be a bare parameter/assignment " *
-                  "name or a literal (bind expressions via an assignment " *
-                  "first), got $(repr(s))")
+                  "name, a literal, a bare predictor definition, or one " *
+                  "`exp.`/`logistic.` wrapper over a predictor definition " *
+                  "(bind expressions via an assignment first), got $(repr(s))")
+end
+
+function _lower_nu_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+    f = length(s.args) >= 1 ? s.args[1] : nothing
+    targs = length(s.args) == 2 && s.args[2] isa Expr &&
+            s.args[2].head === :tuple ? s.args[2].args : Any[]
+    if !(f isa Symbol && f in (:exp, :logistic)) || length(targs) != 1
+        return _sfail("response $lhs nu $(repr(s)) is not an admitted " *
+                      "nu use — write a bare parameter/assignment name, " *
+                      "a literal, a bare predictor definition, or one " *
+                      "`exp.`/`logistic.` wrapper over a predictor definition")
+    end
+    inner = only(targs)
+    inner isa Symbol && _is_scale_predictor_def(inner, ctx, true) || return _sfail(
+        "response $lhs nu $(repr(s)): `$f.` wraps a predictor " *
+        "definition (`$f.(predictor)` with `predictor = ...` affine in " *
+        "data) — got $(repr(inner))")
+    link = f === :exp ? LogLink : LogitLink
+    pname = _lower_scale_predictor(lhs, inner, link, ctx, predictors,
+        pred_idx, coefuse)
+    return ScalePredictorRef(pname, link)
 end
 
 # ZIP zi use-site lowering: a bare parameter/assignment name or a
@@ -5714,10 +5760,10 @@ end
 # Analyze (or intern) a scale predictor: exactly the location-predictor
 # treatment (`_lower_location`'s named-definition arm) under the use-site
 # link — affine analysis, coefficient-use recording, one link per
-# predictor. Family admission (Gaussian/NB2/Gamma/Student/hurdle/
-# VonMises-log-only; Beta/IG/BetaBinomial2 deferred) is the contract's
-# gate (`_validate_scale_predictor`), so hand-built plans get the same
-# rule.
+# predictor. Family admission (Gaussian/NB2/Gamma/Student sigma/Student
+# nu/hurdle/VonMises-log-only; Beta/IG/BetaBinomial2 deferred) is the
+# contract's gate (`_validate_scale_predictor` / `_validate_nu`), so
+# hand-built plans get the same rule.
 function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
         pred_idx, coefuse)
     haskey(pred_idx, name) || haskey(ctx.detmap, name) ||

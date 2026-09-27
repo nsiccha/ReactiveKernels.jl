@@ -1,5 +1,6 @@
 # Vector-scale contract tests: predictor-fed scale/shape (Gaussian sigma,
-# NB2 phi, Gamma alpha, Beta kappa, Student sigma) via `ScalePredictorRef`.
+# NB2 phi, Gamma alpha, Beta kappa, Student sigma, Student nu) via
+# `ScalePredictorRef`.
 #
 # A scale predictor plans exactly like a location predictor (terms, priors,
 # one link); the surface spells the use-site link bare (identity),
@@ -745,4 +746,173 @@ end
     @test annot === :AbstractVector
     @test rhs isa Expr && rhs.head === :. && rhs.args[1] === :exp
     @test rhs.args[2] == Expr(:tuple, :_ppl_lp_sigma)
+end
+
+# Predictor-fed StudentT degrees of freedom (modeled nu): the vscale
+# mechanism reused for the `nu` slot — `StudentT.(exp.(lognu), mu, sigma)`
+# with `lognu` an affine predictor definition. `N1`/`N1b` below are the
+# SB-parity probes (term-nuisance peer brief 1mcop44); the `_vs_cols`
+# fixtures match those probes column-for-column (no RNG).
+function _vs_oracle_student_nu(y, muv, sgv, nuv)
+    ll = 0.0
+    for i in eachindex(y)
+        ll += logpdf(LocationScale(muv[i], sgv[i], TDist(nuv[i])), y[i])
+    end
+    return ll
+end
+
+_vs_u_by_name(names, pairs) = [Dict(pairs)[n] for n in names]
+
+@testset "surface: student log-link nu" begin
+    plan0 = lower_rkppl(quote
+        mu = a .+ b .* x
+        lognu = c .+ d .* z
+        y .~ StudentT.(exp.(lognu), mu, 2.0)
+    end, (:y, :x, :z))
+    r = only(plan0.responses)
+    @test r.nu == ScalePredictorRef(:lognu, LogLink)
+    @test r.scale == 2.0
+    @test [(p.name, p.link) for p in plan0.predictors] ==
+        [(:mu, IdentityLink), (:lognu, LogLink)]
+    # Nu coefficients take population priors exactly like location ones.
+    @test [(p.predictor, p.addressee) for p in plan0.population_priors] ==
+        [(:mu, :Intercept), (:mu, :x), (:lognu, :Intercept), (:lognu, :z)]
+    # Absorbed definitions never also emit as derived columns.
+    @test isempty(plan0.derived)
+    plan = bind_data(plan0, _vs_cols())
+    built = build_kernel(plan)
+    @test built.layout.total == 4
+end
+
+@testset "vscale: student log-link nu values + gradient" begin
+    cols = _vs_cols()
+    plan = bind_data(lower_rkppl(quote
+            mu = a .+ b .* x
+            lognu = c .+ d .* z
+            y .~ StudentT.(exp.(lognu), mu, 2.0)
+        end, (:y, :x, :z)), cols)
+    r = only(plan.responses)
+    @test r.nu == ScalePredictorRef(:lognu, LogLink)
+    @test r.scale == 2.0
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 1.2, 0.2]
+    nt = constrain(built.layout, u)
+    muv = _vs_lp(nt.mu, cols[:x])
+    nuv = exp.(_vs_lp(nt.lognu, cols[:z]))
+    ll = _vs_oracle_student_nu(cols[:y], muv, fill(2.0, length(muv)), nuv)
+    pr = _vs_stdnormal_prior(nt.mu, nt.lognu)
+    @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
+        rtol = 1e-12, atol = 1e-12)
+    @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
+        rtol = 1e-12, atol = 1e-12)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "vscale: student sampled-scale + predictor nu values + gradient" begin
+    cols = _vs_cols()
+    plan = bind_data(lower_rkppl(quote
+            s ~ Exponential(1)
+            mu = a .+ b .* x
+            lognu = c .+ d .* z
+            y .~ StudentT.(exp.(lognu), mu, s)
+        end, (:y, :x, :z)), cols)
+    r = only(plan.responses)
+    @test r.nu == ScalePredictorRef(:lognu, LogLink)
+    @test r.scale == :s
+    built = build_kernel(plan)
+    names = coordinate_names(built.layout)
+    u = _vs_u_by_name(names, [Symbol("mu.Intercept") => 0.5,
+        Symbol("mu.x") => -0.25, Symbol("lognu.Intercept") => 1.2,
+        Symbol("lognu.z") => 0.2, :s => 0.7])
+    nt = constrain(built.layout, u)
+    muv = _vs_lp(nt.mu, cols[:x])
+    nuv = exp.(_vs_lp(nt.lognu, cols[:z]))
+    ll = _vs_oracle_student_nu(cols[:y], muv, fill(nt.s, length(muv)), nuv)
+    pr = _vs_stdnormal_prior(nt.mu, nt.lognu) +
+        logpdf(Exponential(1), nt.s)
+    @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
+        rtol = 1e-12, atol = 1e-12)
+    # The posterior carries the positive-scale log-Jacobian (`log(s)`).
+    @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr + log(nt.s);
+        rtol = 1e-12, atol = 1e-12)
+    _check_gradient(built.spec, plan, u)
+end
+
+# SB parity vs the peer lane's BridgeStan numbers (term-nuisance brief
+# 2026-09-27T14-14-33-651-1mcop44 on
+# BayesianRegressionModels:rk:parity-term-nuisance, BRM 97bb538, StanBlocks
+# 24578c3, BridgeStan 2.9.0, Julia 1.10.11): full posterior at u,
+# propto=false, jacobian=true, BridgeStan AD grads. Pins compare by
+# coordinate name (SB packs [mu_b0, mu_b1, (log(s),) lognu_b0, lognu_b1]).
+@testset "student-nuisance SB parity" begin
+    cols = Dict{Symbol,AbstractVector}(
+        :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+        :z => [1.0, 0.5, -0.5, 1.5, 0.0, -1.0],
+    )
+    @testset "N1 literal sigma" begin
+        # SB: mu ~ 1+x, log(nu) ~ 1+z (std_normal betas);
+        # y ~ LocationScale(mu, 2.0, TDist(nu)).
+        # u (SB order [mu_b0, mu_b1, lognu_b0, lognu_b1]) =
+        # [0.5, -0.25, 1.2, 0.2].
+        prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
+            mu = a .+ b .* x
+            lognu = c .+ d .* z
+            y .~ StudentT.(exp.(lognu), mu, 2.0)
+        end
+        bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+        built = build_kernel(bound)
+        kern = prepare_query(built, bound, :sampler)
+        names = coordinate_names(built.layout)
+        u = _vs_u_by_name(names, [Symbol("mu.Intercept") => 0.5,
+            Symbol("mu.x") => -0.25, Symbol("lognu.Intercept") => 1.2,
+            Symbol("lognu.z") => 0.2])
+        @test abs(Base.invokelatest(kern, u) - (-17.041416962231473)) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        want = _vs_u_by_name(names, [Symbol("mu.Intercept") => 1.9546920098655232,
+            Symbol("mu.x") => 0.7753262549863786,
+            Symbol("lognu.Intercept") => -0.501880184299718,
+            Symbol("lognu.z") => -0.14582439639267716])
+        @test maximum(abs.(g .- want)) < 1e-10
+    end
+    @testset "N1b sampled scale" begin
+        # SB: mu ~ 1+x, s ~ Exponential(1), log(nu) ~ 1+z (std_normal
+        # betas); y ~ LocationScale(mu, s, TDist(nu)).
+        # u (SB order [mu_b0, mu_b1, log(s), lognu_b0, lognu_b1]) =
+        # [0.5, -0.25, 0.7, 1.2, 0.2] (constrained s = exp(0.7)).
+        prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            s ~ Exponential(1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
+            mu = a .+ b .* x
+            lognu = c .+ d .* z
+            y .~ StudentT.(exp.(lognu), mu, s)
+        end
+        bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+        built = build_kernel(bound)
+        kern = prepare_query(built, bound, :sampler)
+        names = coordinate_names(built.layout)
+        u = _vs_u_by_name(names, [Symbol("mu.Intercept") => 0.5,
+            Symbol("mu.x") => -0.25, :s => 0.7,
+            Symbol("lognu.Intercept") => 1.2, Symbol("lognu.z") => 0.2])
+        @test abs(Base.invokelatest(kern, u) - (-18.367541834521536)) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        want = _vs_u_by_name(names, [Symbol("mu.Intercept") => 1.9273163723789564,
+            Symbol("mu.x") => 0.769118716029698, :s => -2.8420059732707563,
+            Symbol("lognu.Intercept") => -0.5025236398819597,
+            Symbol("lognu.z") => -0.1456643951395858])
+        @test maximum(abs.(g .- want)) < 1e-10
+    end
 end
