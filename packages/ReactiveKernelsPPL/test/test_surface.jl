@@ -1097,16 +1097,16 @@ end
         eta = a .+ b .* x
         y .~ InverseGaussian.(eta, 1.5)
     end, Dn2)
-    # A modeled-lambda predictor fails at the contract gate (deferred).
-    @test_throws ContractValidationError lower_rkppl(quote
-        eta = a .+ b .* x
-        ls = c .+ d .* x
-        y .~ InverseGaussian.(exp.(eta), exp.(ls))
-    end, Dn2)
+    # A non-log lambda predictor fails at the contract gate (log-only).
     @test_throws ContractValidationError lower_rkppl(quote
         eta = a .+ b .* x
         ls = c .+ d .* x
         y .~ InverseGaussian.(exp.(eta), ls)
+    end, Dn2)
+    @test_throws ContractValidationError lower_rkppl(quote
+        eta = a .+ b .* x
+        ls = c .+ d .* x
+        y .~ InverseGaussian.(exp.(eta), logistic.(ls))
     end, Dn2)
 end
 
