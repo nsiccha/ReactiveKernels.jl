@@ -1107,6 +1107,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === StudentTFam
         return _student_plate_stmts(r, plan, node, pw)
+    elseif r.family === LogNormalFam
+        return _lognormal_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliLogitFam
         # Base GLM case (no evidence, no weights, no literal range): fused
         # whole-vector reduction. Ranged responses stay on the plate path
@@ -1528,6 +1530,34 @@ function _student_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     sref = _thread_ref!(inputs, sarg)
     nuv = _thread_ref!(inputs, r.nu)
     cell = :(student_t($nuv, $lpv, $sref).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# LogNormal likelihood (Stan `lognormal_lpdf` mirror): the cell calls
+# the prior-proven `lognormal` distribution endpoint
+# (`LOGNORMAL_KERNEL_SOURCE`, Distributions.jl `LogNormal(mu, sigma)`
+# order) — no closed-form respelling, so SB parity is by shared
+# operation order. Mu is the raw location node (identity link, the
+# Student precedent); sigma threads scalar via `_scale_plate_arg`
+# (predictor-fed sigma is deferred at the contract gate, the
+# Beta-kappa precedent). The endpoint's lazy `y > 0` guard returns
+# -Inf off support; `y` is bound data so preparation splits the plate
+# per taken arm and no backend receives the branch. Evidence fails
+# closed at the contract gate (Gaussian/Poisson only); weights
+# multiply the cell (the NB2 precedent).
+function _lognormal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, lp]
+    yv, lpv = _dovar(1), _dovar(2)
+    sref = _thread_ref!(inputs, sarg)
+    cell = :(lognormal($lpv, $sref).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)

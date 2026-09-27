@@ -5154,6 +5154,7 @@ const _RESPONSE_BASE_MSG =
     "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`, " *
     "`BetaBinomial2.(n, logistic.(mu), phi)`, " *
     "`VonMises.(mu, kappa)`, `CircularVonMises.(mu, kappa, lo, hi)`, " *
+    "`LogNormal.(mu, sigma)`, " *
     "`CategoricalLogit.(eta_2, ..., eta_K)`, `OrderedLogistic.(eta)`, " *
     "`Ordinal.(Cumulative(), LogitLink(), eta)`, " *
     "`Multinomial.(N, s, c2, ..., cK)`, or `Categorical.(s)` " *
@@ -5172,7 +5173,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
         :NegativeBinomial2, :NegativeBinomial, :Gamma, :Beta, :HurdlePoisson,
         :ZeroInflatedPoisson, :InverseGaussian, :Exponential, :BetaBinomial2,
-        :VonMises, :CircularVonMises) ||
+        :VonMises, :CircularVonMises, :LogNormal) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
@@ -5257,6 +5258,11 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
                                     "`CircularVonMises.(mu, kappa, lo, hi)`")
         return VonMisesFam, IdentityLink, IdentityLink, args[1], args[2],
         nothing, nothing, nothing, (args[3], args[4])
+    elseif fam === :LogNormal
+        length(args) == 2 || _sfail("response $lhs: `LogNormal` takes " *
+                                    "`LogNormal.(mu, sigma)`")
+        return LogNormalFam, IdentityLink, IdentityLink, args[1], args[2],
+        nothing, nothing, nothing, nothing
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
@@ -5393,6 +5399,9 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :circular_von_mises && _sfail("response $lhs: use " *
                                           "`CircularVonMises` (the response " *
                                           "spelling, not the kernel endpoint)")
+    fam === :lognormal && _sfail("response $lhs: use " *
+                                 "`LogNormal` (the response " *
+                                 "spelling, not the kernel endpoint)")
     fam === :OrderedLogit && _sfail("response $lhs: unknown distribution " *
                                     "`:OrderedLogit` (write " *
                                     "`OrderedLogistic.(eta)`)")
@@ -5405,7 +5414,7 @@ function _lower_response_base_error(lhs, rhs, fam)
                   "NegativeBinomial2, NegativeBinomial, " *
                   "HurdlePoisson, ZeroInflatedPoisson, " *
                   "InverseGaussian, Exponential, BetaBinomial2, VonMises, " *
-                  "CircularVonMises, Gamma, Beta, " *
+                  "CircularVonMises, LogNormal, Gamma, Beta, " *
                   "BernoulliLogit, " *
                   "PoissonLog, BinomialLogit, NegativeBinomial2Log, " *
                   "GammaLog, BetaLogit, CategoricalLogit, " *
