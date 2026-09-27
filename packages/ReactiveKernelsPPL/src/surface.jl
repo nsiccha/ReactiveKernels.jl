@@ -421,7 +421,9 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # 0, 1)`) and scale (`HalfNormal(s)` / `truncated(Normal(0, s), 0,
     # Inf)`) — the only names a `dar()` call accepts (checked during
     # response lowering, before `_lower_parameters` runs; the contract
-    # re-checks for hand-built plans).
+    # re-checks for hand-built plans). `_lower_parameters` re-keys both to
+    # Stan-kernel overrides (`_dar_stan_override`); the spellings stay
+    # Distributions-shaped.
     dar_beta_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dar_beta_rhs(s.rhs))
     dar_sigma_names = Set{Symbol}(s.lhs for s in sample
@@ -6658,12 +6660,14 @@ end
 # trajectory as a direct beta-free summand (SB's `dar(time)` shape —
 # the formula intercept is the initial level, the `mo1` splice shape).
 # Exactly two bare sampled scalars: a truncated-`[0, 1]`-Normal
-# persistence and a positive-Normal scale. Additive only; one `dar()`
-# call per predictor in v1. The state synthesizes as `dar_<pname>` and
-# claims the name up front (the `_implicit_vector!` precedent). Both
-# parameters record in `dar_coefs` (checked disjoint from predictor
-# coefficients after lowering) and lower to `SampledParameter`s, never
-# population priors.
+# persistence and a positive-Normal scale, both under Stan-kernel
+# semantics once lowered (`(:interval_stan, 0, 1)` / `:positive_stan`
+# via `_dar_stan_override` — SB never renormalizes bounds). Additive
+# only; one `dar()` call per predictor in v1. The state synthesizes as
+# `dar_<pname>` and claims the name up front (the
+# `_implicit_vector!` precedent). Both parameters record in `dar_coefs`
+# (checked disjoint from predictor coefficients after lowering) and
+# lower to `SampledParameter`s, never population priors.
 function _classify_dar(pname, core::Expr, sign::Int, ctx)
     where = "predictor $pname"
     sign > 0 ||
@@ -7530,6 +7534,25 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :Laplace => :laplace, :Logistic => :logistic, :Uniform => :uniform,
 )
 
+# A `dar()` trajectory parameter rides Stan-kernel semantics: the
+# persistence's `(:interval, 0, 1)` becomes `(:interval_stan, 0, 1)`
+# and the scale's `:positive` becomes `:positive_stan` — same
+# constrained transforms, NO truncation renormalizers (SB never
+# renormalizes bounds). Keyed on actual `dar()` USE (`dar_specs`), not
+# on RHS shape: a dar-shaped `~` never consumed by `dar()` keeps
+# Distributions semantics. `_classify_dar` already gated both shapes,
+# so a mismatch here is an internal inconsistency the contract
+# rejects downstream.
+function _dar_stan_override(p::SampledParameter, specs::Vector{DarSpec})
+    for s in specs
+        p.name === s.beta && return SampledParameter(p.name, p.family,
+            p.args, (:interval_stan, 0.0, 1.0), p.label)
+        p.name === s.sigma && return SampledParameter(p.name, p.family,
+            p.args, :positive_stan, p.label)
+    end
+    return p
+end
+
 function _lower_parameters(sample, coefuse, ctx, glmuse)
     params = SampledParameter[]
     syms = Set{Symbol}()
@@ -7563,6 +7586,7 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
                                        "it in a matmul (`mu = X * " *
                                        "$(s.lhs)`) or drop it")
         p = _lower_parameter(s.lhs, s.rhs, coefuse, ctx.matrices)
+        p = _dar_stan_override(p, ctx.dar_specs)
         push!(params, p)
         for v in values(p.args)
             v isa Symbol && push!(syms, v)
