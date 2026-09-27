@@ -565,11 +565,14 @@ NO truncation renormalizer, matching SB which never renormalizes
 bounds), the tuple
 `(:interval, lo, hi)` (a two-sided finite truncation `truncated(Normal(mu, s),
 lo, hi)` — an affine-logistic constrained transform onto `(lo, hi)` with the
-renormalized truncated density), or the tuple `(:upper, hi)` (an upper-only
-truncation `truncated(Normal(mu, s), -Inf, hi)` — Stan's upper-bound kernel
-`x = hi - exp(u)` with the bare-`u` Jacobian and NO truncation renormalizer).
-Shared by scalar [`SampledParameter`](@ref)s and per-cell
-[`PlateParameter`](@ref)s.
+renormalized truncated density), the tuple `(:interval_stan, lo, hi)`
+(the same affine-logistic constrained transform onto `(lo, hi)` under
+Stan two-sided-bound kernel semantics — plain `_lpdf` plus the bare-`u`
+Jacobian, NO truncation renormalizer), or the tuple `(:upper, hi)` (an
+upper-only truncation `truncated(Normal(mu, s), -Inf, hi)` — Stan's
+upper-bound kernel `x = hi - exp(u)` with the bare-`u` Jacobian and NO
+truncation renormalizer). Shared by scalar [`SampledParameter`](@ref)s
+and per-cell [`PlateParameter`](@ref)s.
 """
 const SupportOverride =
     Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64},Tuple{Symbol,Float64}}
@@ -584,8 +587,9 @@ semantics (`Exponential(θ)` = scale θ). Values are literals or
 is a [`SupportOverride`](@ref): `nothing` (infer from family), `:positive`
 (half-Normal/half-Cauchy), `:positive_stan` (the Stan-kernel half,
 unnormalized), `(:interval, lo, hi)` (a finite truncated
-interval), or `(:upper, hi)` (an upper-only truncation with Stan kernel
-semantics).
+interval), `(:interval_stan, lo, hi)` (a finite interval with Stan
+kernel semantics, unnormalized), or `(:upper, hi)` (an upper-only
+truncation with Stan kernel semantics).
 """
 struct SampledParameter
     name::ParamName
@@ -1275,8 +1279,10 @@ end
 One differenced-AR(1) trajectory (SB `_sb_dar1`'s `differenced_ar1_path`):
 the zero-started integrated path `x[t+1] = x[t] + d[t]` over the AR(1)
 increments `d[t] = beta*d[t-1] + sigma*z[t]` (`d[0] = 0`, `x[1] = 0`).
-`beta`/`sigma` name the persistence (`Normal` on `(:interval, 0, 1)`) and
-innovation-scale (`Normal` on `:positive`) [`SampledParameter`](@ref)s;
+`beta`/`sigma` name the persistence (`Normal` on `(:interval_stan, 0, 1)`,
+Stan two-sided-bound kernel semantics, unnormalized) and
+innovation-scale (`Normal` on `:positive_stan`, Stan lower-bound kernel
+semantics, unnormalized) [`SampledParameter`](@ref)s;
 the `z` innovations (length `n_obs - 1`) are owned internally under the
 reserved `_ppl_dar_z_<state>` name, like a non-centered scan's
 `_ppl_scan_z_<state>` slice. The path length is `n_obs` by construction
@@ -4379,13 +4385,14 @@ end
 _dar_innovation_name(s::DarSpec) = Symbol(:_ppl_dar_z_, s.state)
 
 # Structural invariants of each differenced-AR(1) trajectory: the
-# persistence names a `Normal` sampled parameter on exactly `(:interval,
-# 0, 1)` (SB's `beta ~ normal(0.5, 0.2; lower=0, upper=1)`; overrides
+# persistence names a `Normal` sampled parameter on exactly
+# `(:interval_stan, 0, 1)` (SB's `beta ~ normal(0.5, 0.2; lower=0,
+# upper=1)`, unnormalized — Stan never renormalizes bounds; overrides
 # ride the same spelling with new location/scale) and the scale names a
-# `Normal` sampled parameter on `:positive` (SB's `sigma ~
-# normal(0, 0.2; lower=0)`). The `n_obs ≥ 2` length gate lives in the
-# layout (unbound surface plans carry `n_obs = 0`, like a scan's
-# symbolic `hi` — lengths resolve at bind).
+# `Normal` sampled parameter on `:positive_stan` (SB's `sigma ~
+# normal(0, 0.2; lower=0)`, unnormalized). The `n_obs ≥ 2` length gate
+# lives in the layout (unbound surface plans carry `n_obs = 0`, like a
+# scan's symbolic `hi` — lengths resolve at bind).
 function _validate_dar_paths(plan::StructuralPlan)
     for s in plan.dar_paths
         s.beta === s.sigma && _fail(s.label,
@@ -4396,22 +4403,22 @@ function _validate_dar_paths(plan::StructuralPlan)
             "dar persistence :$(s.beta) must name a scalar sampled " *
             "parameter (`$(s.beta) ~ truncated(Normal(0.5, 0.2), 0, 1)`)")
         b = plan.parameters[i]
-        (b.family === :normal && b.support_override == (:interval, 0.0, 1.0)) ||
+        (b.family === :normal && b.support_override == (:interval_stan, 0.0, 1.0)) ||
             _fail(s.label,
                 "dar persistence :$(s.beta) must be Normal on exactly " *
-                "(:interval, 0, 1) (SB's `beta ~ normal(0.5, 0.2; " *
-                "lower=0, upper=1)`), got :$(b.family) on " *
+                "(:interval_stan, 0, 1) (SB's `beta ~ normal(0.5, 0.2; " *
+                "lower=0, upper=1)`, unnormalized), got :$(b.family) on " *
                 "$(repr(b.support_override))")
         j = findfirst(p -> p.name === s.sigma, plan.parameters)
         j === nothing && _fail(s.label,
             "dar scale :$(s.sigma) must name a scalar sampled parameter " *
             "(`$(s.sigma) ~ HalfNormal(0.2)`)")
         sg = plan.parameters[j]
-        (sg.family === :normal && sg.support_override === :positive) ||
+        (sg.family === :normal && sg.support_override === :positive_stan) ||
             _fail(s.label,
-                "dar scale :$(s.sigma) must be Normal on :positive (SB's " *
-                "`sigma ~ normal(0, 0.2; lower=0)`), got :$(sg.family) " *
-                "on $(repr(sg.support_override))")
+                "dar scale :$(s.sigma) must be Normal on :positive_stan " *
+                "(SB's `sigma ~ normal(0, 0.2; lower=0)`, unnormalized), " *
+                "got :$(sg.family) on $(repr(sg.support_override))")
     end
     return nothing
 end
@@ -4850,18 +4857,20 @@ function _validate_support_override(label, family::Symbol,
                 ":upper bound must be finite; got $hi")
             return nothing
         end
-        (ov[1] === :interval && length(ov) == 3) || _fail(label,
-            "tuple support override must be (:interval, lo, hi) or " *
-            "(:upper, hi); got $ov")
+        head = ov[1]
+        ((head === :interval || head === :interval_stan) &&
+            length(ov) == 3) || _fail(label,
+            "tuple support override must be (:interval, lo, hi), " *
+            "(:interval_stan, lo, hi), or (:upper, hi); got $ov")
         family === :normal || _fail(label,
-            "an :interval override is a truncated Normal in slice 1 " *
+            "an $head override is a truncated Normal in slice 1 " *
             "(`truncated(Normal(mu, s), lo, hi)`); got $family")
         lo, hi = ov[2], ov[3]
         (isfinite(lo) && isfinite(hi)) || _fail(label,
-            ":interval bounds must be finite (a one-sided or half truncation " *
+            "$head bounds must be finite (a one-sided or half truncation " *
             "uses :positive); got ($lo, $hi)")
         lo < hi || _fail(label,
-            ":interval lower bound must be < upper bound; got ($lo, $hi)")
+            "$head lower bound must be < upper bound; got ($lo, $hi)")
         return nothing
     end
     (ov === :positive || ov === :positive_stan) ||

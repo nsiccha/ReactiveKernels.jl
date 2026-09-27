@@ -3,7 +3,9 @@ using ReactiveKernelsPPL
 using Test
 
 # Differenced-AR(1) trajectory (dar) contract tests: SB `_sb_dar1` mirror —
-# `beta ~ Normal(0.5, 0.2)` on `[0, 1]`, positive `sigma ~ Normal(0, 0.2)`,
+# `beta ~ Normal(0.5, 0.2)` on `[0, 1]` under Stan-kernel semantics
+# (`(:interval_stan, 0, 1)`, unnormalized), positive `sigma ~ Normal(0, 0.2)`
+# under Stan-kernel semantics (`:positive_stan`, unnormalized),
 # `z[T-1] ~ std_normal`, and the zero-started integrated path
 # `x[t+1] = x[t] + d[t]` spliced beta-free into the linear predictor (the
 # formula intercept is the initial level). Corpus drift coverage lives in
@@ -15,9 +17,9 @@ using Test
 # the emitted forms.
 
 _dar_beta() = SampledParameter(:beta, :normal, (arg1 = 0.5, arg2 = 0.2),
-    (:interval, 0.0, 1.0), :beta)
+    (:interval_stan, 0.0, 1.0), :beta)
 _dar_sigma() = SampledParameter(:sigmad, :normal, (arg1 = 0.0, arg2 = 0.2),
-    :positive, :sigmad)
+    :positive_stan, :sigmad)
 
 function _dar_spec(; state = :dar_mu, beta = :beta, sigma = :sigmad)
     return DarSpec(state, beta, sigma, state)
@@ -102,9 +104,12 @@ end
     @test_throws ContractValidationError validate_structure(
         _dar_min_plan([DarSpec(:dar_mu, :beta, :beta, :dar_mu)]))
 
-    # persistence geometry: Normal on exactly (:interval, 0, 1)
+    # persistence geometry: Normal on exactly (:interval_stan, 0, 1) —
+    # including the pre-migration normalized (:interval, 0, 1), which no
+    # longer validates as a dar persistence
     for (fam, sup) in ((:normal, nothing), (:normal, :positive),
-            (:normal, (:interval, 0.0, 2.0)), (:exponential, nothing))
+            (:normal, (:interval, 0.0, 1.0)),
+            (:normal, (:interval_stan, 0.0, 2.0)), (:exponential, nothing))
         p = _dar_min_plan([spec])
         i = findfirst(q -> q.name === :beta, p.parameters)
         p.parameters[i] = SampledParameter(:beta, fam,
@@ -112,8 +117,10 @@ end
         @test_throws ContractValidationError validate_structure(p)
     end
 
-    # scale geometry: Normal on :positive
-    for (fam, sup) in ((:normal, nothing), (:exponential, nothing),
+    # scale geometry: Normal on :positive_stan — including the
+    # pre-migration normalized :positive, which no longer validates
+    for (fam, sup) in ((:normal, nothing), (:normal, :positive),
+            (:exponential, nothing),
             (:normal, (:interval, 0.0, 1.0)), (:cauchy, :positive))
         p = _dar_min_plan([spec])
         i = findfirst(q -> q.name === :sigmad, p.parameters)
@@ -126,7 +133,7 @@ end
     p = _dar_min_plan([spec])
     i = findfirst(q -> q.name === :beta, p.parameters)
     p.parameters[i] = SampledParameter(:beta, :normal,
-        (arg1 = 0.7, arg2 = 0.1), (:interval, 0.0, 1.0), :beta)
+        (arg1 = 0.7, arg2 = 0.1), (:interval_stan, 0.0, 1.0), :beta)
     @test (validate_structure(p); true)
 end
 
@@ -228,12 +235,13 @@ end
     @test st.options == (dar_id = :dar_mu,)
     @test st.addressee === st.label === :dar_mu
     @test isempty(st.columns)
-    # both parameters are sampled scalars, never population priors
+    # both parameters are sampled scalars, never population priors,
+    # re-keyed to Stan-kernel overrides (same spellings, SB semantics)
     byname = Dict(p.name => p for p in plan.parameters)
     @test byname[:beta].family === :normal
-    @test byname[:beta].support_override == (:interval, 0.0, 1.0)
+    @test byname[:beta].support_override == (:interval_stan, 0.0, 1.0)
     @test byname[:sigmad].family === :normal
-    @test byname[:sigmad].support_override === :positive
+    @test byname[:sigmad].support_override === :positive_stan
     @test all(pr -> pr.addressee !== :beta && pr.addressee !== :sigmad,
         plan.population_priors)
 
@@ -247,6 +255,24 @@ end
         y .~ Normal.(mu, sigma)
     end, (:y,))
     @test only(plan2.dar_paths).sigma === :sigmad
+    byname2 = Dict(p.name => p for p in plan2.parameters)
+    @test byname2[:sigmad].support_override === :positive_stan
+
+    # use-keying: a dar-shaped `~` never consumed by `dar()` keeps
+    # Distributions semantics (no Stan re-key)
+    plan3 = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        beta ~ truncated(Normal(0.5, 0.2), 0, 1)
+        sigmad ~ HalfNormal(0.2)
+        sigma ~ Exponential(1)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, sigma)
+    end, (:y, :x))
+    @test isempty(plan3.dar_paths)
+    byname3 = Dict(p.name => p for p in plan3.parameters)
+    @test byname3[:beta].support_override == (:interval, 0.0, 1.0)
+    @test byname3[:sigmad].support_override === :positive
 
     reject(loc) = @test_throws SurfaceLoweringError lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -347,8 +373,9 @@ end
 
 @testset "dar: SB trajectory end to end (oracle + gradient)" begin
     # SB `_sb_dar1` mirror: `beta ~ normal(0.5, 0.2; lower=0, upper=1)`,
-    # `sigma ~ normal(0, 0.2; lower=0)`, `z ~ std_normal(; n=T-1)`, and
-    # the zero-started `differenced_ar1_path` spliced beta-free.
+    # `sigma ~ normal(0, 0.2; lower=0)` — both UNNORMALIZED (Stan never
+    # renormalizes bounds) — `z ~ std_normal(; n=T-1)`, and the
+    # zero-started `differenced_ar1_path` spliced beta-free.
     m = @rkppl begin
         a ~ Normal(0, 1)
         beta ~ truncated(Normal(0.5, 0.2), 0, 1)
@@ -386,8 +413,8 @@ end
         ll = sum(logpdf(Normal(mu[t], sigma), y[t]) for t in 1:T)
         zn = Normal(0.5, 0.2)
         pr = logpdf(Normal(0, 1), aa) +
-             logpdf(zn, beta) - log(cdf(zn, 1) - cdf(zn, 0)) +
-             logpdf(Normal(0, 0.2), sigmad) + log(2) +
+             logpdf(zn, beta) +
+             logpdf(Normal(0, 0.2), sigmad) +
              logpdf(Exponential(1), sigma) +
              sum(logpdf(Normal(0, 1), zt) for zt in z)
         jac = log(beta) + log(1 - beta) + u[3] + u[4]
@@ -397,6 +424,105 @@ end
     for u in ([0.1, 0.3, -0.5, -0.4, 0.2, -0.1, 0.4, 0.0],
               [-0.2, 0.6, 0.1, 0.3, -0.4, 0.2, -0.3, 0.1])
         @test _query(built.spec, plan, :posterior, u) ≈ dar_oracle(u, ydata)
+        _check_gradient(built.spec, plan, u)
+    end
+end
+
+# D1/D2 SB-parity pins (the `test/rk_parity.jl` dar corpus cases, mirrored
+# RK-natively): RK posterior vs the hand oracle (unnormalized priors),
+# vs the peer lane's BridgeStan full-posterior literal (propto=false,
+# jacobian=true), and RK Enzyme grads vs the SB grads in RK u-order
+# (brief 2026-09-27T12-50-22-591-v7kukl on
+# BayesianRegressionModels:rk:parity-term-ar-dar, BRM 97bb538,
+# StanBlocks 24578c3, BridgeStan 2.9.0, Julia 1.10.11). Shared columns
+# `y = [0.5, -0.2, 0.1, 0.9, 1.4, 1.1]` (the `t` axis is length-only on
+# the RK side); `u = range(-0.4, 0.4; length = 9)` matches the BRM
+# layout order (mu_coef, beta, sigmad, s, z.1..5), so the SAME `u`
+# compares directly against the SB literal (SB unpacks a permutation
+# of it peer-side). SB grad order
+# [pop_mu_beta_pop.1, dar_mu_t_beta, dar_mu_t_sigma, dar_mu_t_z.1..5, s]
+# permutes to RK u-order as [1, 2, 3, 9, 4, 5, 6, 7, 8].
+function _dar_sb_pins(u, y, bloc, bsca, sloc, ssca)
+    T = length(y)
+    aa = u[1]
+    beta = 1 / (1 + exp(-u[2]))
+    sigmad = exp(u[3])
+    s = exp(u[4])
+    z = u[5:(5 + T - 2)]
+    x = zeros(T)
+    d = 0.0
+    for t in 1:(T - 1)
+        d = beta * d + sigmad * z[t]
+        x[t + 1] = x[t] + d
+    end
+    mu = aa .+ x
+    ll = sum(logpdf(Normal(mu[t], s), y[t]) for t in 1:T)
+    pr = logpdf(Normal(0, 1), aa) +
+         logpdf(Normal(bloc, bsca), beta) +
+         logpdf(Normal(sloc, ssca), sigmad) +
+         logpdf(Exponential(1), s) +
+         sum(logpdf(Normal(0, 1), zt) for zt in z)
+    jac = log(beta) + log(1 - beta) + u[3] + u[4]
+    return ll + pr + jac
+end
+
+@testset "dar D1/D2 SB-parity pins" begin
+    ydata = [0.5, -0.2, 0.1, 0.9, 1.4, 1.1]
+    u = collect(range(-0.4, 0.4; length = 9))
+    @testset "D1 dar default" begin
+        # SB: mu ~ 1 + dar(t); beta ~ Normal(0.5, 0.2); sigma ~
+        # Normal(0, 0.2); s ~ Exponential(1). SB full -22.57116529873909.
+        m = @rkppl begin
+            a ~ Normal(0, 1)
+            beta ~ truncated(Normal(0.5, 0.2), 0, 1)
+            sigmad ~ HalfNormal(0.2)
+            s ~ Exponential(1)
+            mu = a .+ dar(beta, sigmad)
+            y .~ Normal.(mu, s)
+        end
+        plan = m(; y = ydata)
+        built = build_kernel(plan)
+        @test built.layout.total == 9
+        @test coordinate_names(built.layout)[1:4] ==
+            [Symbol("mu.Intercept"), :beta, :sigmad, :s]
+        post = _query(built.spec, plan, :posterior, u)
+        @test post ≈ _dar_sb_pins(u, ydata, 0.5, 0.2, 0.0, 0.2)
+        @test abs(post - (-22.57116529873909)) < 1e-12
+        sb = [5.466993138042674, 0.8344512151440091, -13.924728401033837,
+            -1.4386732731205805, 5.160141062738464, 4.392079285424707,
+            3.192200195514296, 1.4901788654922776, 0.021427806410332872]
+        prep = prepare_sampler(built, plan, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test maximum(abs.(g .- sb)) < 1e-10
+        _check_gradient(built.spec, plan, u)
+    end
+    @testset "D2 dar prior overrides" begin
+        # SB: D1 + ar(mu, dar(t)) ~ Normal(0.6, 0.1) + sd(mu, dar(t)) ~
+        # Normal(0, 0.3). SB full -19.08072138630899.
+        m = @rkppl begin
+            a ~ Normal(0, 1)
+            beta ~ truncated(Normal(0.6, 0.1), 0, 1)
+            sigmad ~ HalfNormal(0.3)
+            s ~ Exponential(1)
+            mu = a .+ dar(beta, sigmad)
+            y .~ Normal.(mu, s)
+        end
+        plan = m(; y = ydata)
+        built = build_kernel(plan)
+        @test built.layout.total == 9
+        @test coordinate_names(built.layout)[1:4] ==
+            [Symbol("mu.Intercept"), :beta, :sigmad, :s]
+        post = _query(built.spec, plan, :posterior, u)
+        @test post ≈ _dar_sb_pins(u, ydata, 0.6, 0.1, 0.0, 0.3)
+        @test abs(post - (-19.08072138630899)) < 1e-12
+        sb = [5.466993138042674, 4.643891230385576, -4.614727761649957,
+            -1.4386732731205805, 5.160141062738464, 4.392079285424707,
+            3.192200195514296, 1.4901788654922776, 0.021427806410332872]
+        prep = prepare_sampler(built, plan, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test maximum(abs.(g .- sb)) < 1e-10
         _check_gradient(built.spec, plan, u)
     end
 end

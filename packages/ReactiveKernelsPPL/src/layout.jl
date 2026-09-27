@@ -15,7 +15,8 @@
 Inferred unconstrained support (`:real`/`:positive`/`:unit`/`:interval`)
 for a sampled family plus an optional support override (`:positive`
 half-Normal/half-Cauchy style, `:positive_stan` Stan-kernel half style,
-`:interval`, or `:upper`). `:uniform` infers `:interval` from its own
+`:interval`, `:interval_stan` Stan-kernel interval style, or `:upper`).
+`:uniform` infers `:interval` from its own
 literal args and takes no override. Loud on unknown families and
 inapplicable overrides.
 """
@@ -35,12 +36,14 @@ function support_of(family::Symbol, override::SupportOverride)
                 "[layout] :upper override needs a real-support family"))
             return :upper
         end
-        (override[1] === :interval && length(override) == 3) ||
+        head = override[1]
+        ((head === :interval || head === :interval_stan) &&
+            length(override) == 3) ||
             throw(ContractValidationError(
-                "[layout] tuple support override must be (:interval, lo, hi) " *
-                "or (:upper, hi), got $override"))
+                "[layout] tuple support override must be (:interval, lo, hi), " *
+                "(:interval_stan, lo, hi), or (:upper, hi), got $override"))
         inferred === :real || throw(ContractValidationError(
-            "[layout] :interval override needs a real-support family"))
+            "[layout] $head override needs a real-support family"))
         return :interval
     end
     (override === :positive || override === :positive_stan) || throw(
