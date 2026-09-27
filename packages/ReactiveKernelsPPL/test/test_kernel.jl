@@ -412,6 +412,12 @@ end
         :t => [0.0, 1.0, 2.0, 0.0], :dose => [10.0, 20.0],
         :obs => [0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
     @test_throws "neither n_sub" bind_data(unbound, bad_cols; dims)
+    # Non-numeric scalar slice with T bound: the numeric gate fires ahead
+    # of the T-block Float64 conversion (not a raw MethodError).
+    bad_str = merge(cols6, Dict{Symbol,AbstractVector}(:dose => ["a", "b"]))
+    @test_throws "must be numeric" bind_data(unbound, bad_str; dims)
+    bad_sym = merge(cols6, Dict{Symbol,AbstractVector}(:dose => [:a, :b]))
+    @test_throws "must be numeric" bind_data(unbound, bad_sym; dims)
     # Nonpositive dims values.
     @test_throws "positive integer" bind_data(unbound, cols6;
         dims = Dict{Symbol,Int}(:kernel_nsub_pred => 0, :kernel_T_pred => 3))

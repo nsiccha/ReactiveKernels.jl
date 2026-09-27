@@ -1031,7 +1031,8 @@ declarations the cell calls address; `obs` the in-cell observation
 LIST (one per response axis); `timepoints` is always `nothing`
 (ragged axes have no rectangular T). The cell vocabulary is calls to
 [`CELL_FNS`](@ref), schedule-map gathers, and arithmetic (no flat
-dotify — the generator unrolls per subject).
+dotify — the generator emits one subject-batched `_over_subjects`
+statement per assignment).
 """
 struct KernelPlate
     result::Symbol
@@ -7690,7 +7691,8 @@ const CELL_FN_RESULT_SPACE = Dict{Symbol,Symbol}(
 # obs/read operands fail closed (write the dotted form — the panel
 # precedent); dotted ops over mismatched axis lengths fail closed
 # naming the axes. Assignments pass through UNCHANGED (no flat dotify
-# — the generator unrolls per subject); this pass only proves shapes.
+# — the generator emits one subject-batched `_over_subjects` statement
+# per assignment); this pass only proves shapes.
 function _grouped_cell_shapes(kp::KernelPlate,
         slices::Vector{Tuple{Symbol,Symbol,Symbol}},
         columns::Dict{Symbol,ColumnData})
@@ -8175,6 +8177,12 @@ function _resolve_kernels!(plan::StructuralPlan,
                 _fail(kp.label, "column `$exp` is reserved for kernel " *
                       "plate `$(kp.result)`'s flat expansion of `$col` — " *
                       "rename the caller-supplied column")
+            # Numeric gate ahead of the T-block conversion (data
+            # validation's twin check runs after this resolve — without
+            # this, a String/Symbol column dies as a raw MethodError).
+            eltype(colv) <: Real ||
+                _fail(kp.label, "slice column `$col` must be numeric, " *
+                      "got $(eltype(colv))")
             columns[exp] = repeat(Vector{Float64}(colv); inner = T)
         end
     end
