@@ -1287,7 +1287,7 @@ docs_example = (;
 # that gap closes. Written traceably (broadcasts/loops, no LAPACK) for that
 # day — the potrf below is pure Julia precisely because Enzyme cannot
 # differentiate LAPACK.
-export gp_exp_quad_cov, gp_chol_latent
+export gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent
 
 """
     gp_exp_quad_cov(x, sigma, rho, jitter) -> Matrix{Float64}
@@ -1295,8 +1295,9 @@ export gp_exp_quad_cov, gp_chol_latent
 Isotropic squared-exponential covariance (Stan `gp_exp_quad_cov` math):
 `K[i,j] = σ² exp(−(xᵢ−xⱼ)² / 2ρ²)`, plus `jitter` on the diagonal.
 `x` is one axis (iso first); `sigma`/`rho` are positive scalars.
-Matrix locations (aniso) and periodic kernels are sequenced and fail
-closed. Validates args (`ArgumentError`, never silent `NaN`s).
+Matrix locations (aniso) are sequenced and fail closed; the periodic
+sibling is `gp_periodic_cov`. Validates args (`ArgumentError`, never
+silent `NaN`s).
 """
 function gp_exp_quad_cov(x::AbstractVector, sigma::Real, rho::Real,
         jitter::Real)
@@ -1325,6 +1326,49 @@ function gp_exp_quad_cov(x::AbstractMatrix, sigma::Real, rho,
     throw(ArgumentError(
         "gp_exp_quad_cov with matrix locations (aniso, one rho per axis) " *
         "is sequenced after the isotropic slice — pass one axis vector"))
+end
+
+"""
+    gp_periodic_cov(x, sigma, rho, period, jitter) -> Matrix{Float64}
+
+Isotropic periodic covariance (Stan `gp_periodic_cov` math):
+`K[i,j] = σ² exp(−2 sin²(π|xᵢ−xⱼ|/period) / ρ²)`, plus `jitter` on the
+diagonal. `x` is one axis (SB admits one isotropic axis only);
+`sigma`/`rho`/`period` are positive scalars. Matrix locations fail
+closed, as does a non-positive period. Validates args (`ArgumentError`,
+never silent `NaN`s).
+"""
+function gp_periodic_cov(x::AbstractVector, sigma::Real, rho::Real,
+        period::Real, jitter::Real)
+    n = length(x)
+    n >= 1 || throw(ArgumentError(
+        "gp_periodic_cov needs at least one location, got n = $n"))
+    sigma > 0 || throw(ArgumentError(
+        "gp_periodic_cov sigma must be positive, got $sigma"))
+    rho > 0 || throw(ArgumentError(
+        "gp_periodic_cov rho must be positive, got $rho"))
+    isfinite(period) && period > 0 || throw(ArgumentError(
+        "gp_periodic_cov period must be finite and positive, got $period"))
+    isfinite(jitter) && jitter >= 0 || throw(ArgumentError(
+        "gp_periodic_cov jitter must be finite and nonnegative, got $jitter"))
+    s2 = Float64(sigma)^2
+    r2 = Float64(rho)^2
+    per = Float64(period)
+    jit = Float64(jitter)
+    K = Matrix{Float64}(undef, n, n)
+    @inbounds for j_ in 1:n, i in 1:n
+        d = abs(Float64(x[i]) - Float64(x[j_]))
+        s = sin(pi * d / per)
+        K[i, j_] = s2 * exp(-2 * s * s / r2) + (i == j_ ? jit : 0.0)
+    end
+    return K
+end
+
+function gp_periodic_cov(x::AbstractMatrix, sigma::Real, rho::Real,
+        period::Real, jitter::Real)
+    throw(ArgumentError(
+        "gp_periodic_cov with matrix locations is out of slice " *
+        "(SB admits one isotropic axis only) — pass one axis vector"))
 end
 
 """

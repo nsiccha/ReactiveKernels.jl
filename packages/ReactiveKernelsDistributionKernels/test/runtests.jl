@@ -11,7 +11,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     LOCATION_SCALE_SOURCE,
     standard_normal, standard_cauchy, standard_laplace, standard_student_t,
     standard_logistic, location_scale, student_t, gp_exp_quad_cov,
-    gp_chol_latent,
+    gp_periodic_cov, gp_chol_latent,
     BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE,
     EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE,
     MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE,
@@ -428,6 +428,31 @@ end
     # Aniso (matrix locations) is sequenced, fails closed.
     @test_throws ArgumentError gp_exp_quad_cov([0.0 0.0; 1.0 1.0], 1.0, 1.0,
         1e-9)
+end
+
+@testset "gp periodic covariance" begin
+    # Stan gp_periodic_cov math: σ²exp(−2sin²(π|xᵢ−xⱼ|/p)/ρ²), jitter
+    # on the diagonal. One isotropic axis only.
+    x = [0.0, 0.5, 1.5]
+    K = gp_periodic_cov(x, 2.0, 1.5, 1.0, 1e-9)
+    ref = [4 * exp(-2 * sin(pi * abs(a - b) / 1.0)^2 / 1.5^2) +
+           (a == b ? 1e-9 : 0.0) for a in x, b in x]
+    @test K ≈ ref
+    @test K == K' # symmetric
+    @test all(diag(K) .> 4.0) # jitter lifts the unit diagonal (σ²=4)
+    # Periodicity: a full period apart recovers the diagonal value.
+    Kp = gp_periodic_cov([0.0, 1.0], 2.0, 1.5, 1.0, 0.0)
+    @test Kp[1, 2] ≈ Kp[1, 1]
+    @test_throws ArgumentError gp_periodic_cov(Float64[], 1.0, 1.0, 1.0, 1e-9)
+    @test_throws ArgumentError gp_periodic_cov(x, 0.0, 1.0, 1.0, 1e-9)
+    @test_throws ArgumentError gp_periodic_cov(x, 1.0, -2.0, 1.0, 1e-9)
+    @test_throws ArgumentError gp_periodic_cov(x, 1.0, 1.0, 0.0, 1e-9)
+    @test_throws ArgumentError gp_periodic_cov(x, 1.0, 1.0, Inf, 1e-9)
+    @test_throws ArgumentError gp_periodic_cov(x, 1.0, 1.0, 1.0, -1e-9)
+    @test_throws ArgumentError gp_periodic_cov(x, 1.0, 1.0, 1.0, Inf)
+    # Matrix locations are out of slice (SB: one isotropic axis).
+    @test_throws ArgumentError gp_periodic_cov([0.0 0.0; 1.0 1.0], 1.0, 1.0,
+        1.0, 1e-9)
 end
 
 @testset "gp chol latent (pure-Julia potrf)" begin
