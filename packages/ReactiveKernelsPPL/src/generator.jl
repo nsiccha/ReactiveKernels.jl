@@ -1768,7 +1768,7 @@ end
 # exactly). The mean precomputes outside the cell (`_ppl_mu_`, the NB2
 # precedent — a computed `exp` constructor arg miscompiles the Enzyme
 # pullback); lambda threads scalar via `_scale_plate_arg` (predictor-fed
-# lambda is deferred at the contract gate, the Beta-kappa precedent).
+# lambda is deferred at the contract gate).
 # The `y > 0` guard is lazy `?:` (the DK gamma precedent, not eager
 # `ifelse`); `y` is bound data so preparation splits the plate per
 # taken arm and no backend receives the branch. μ/λ positivity is
@@ -2095,18 +2095,21 @@ function _binomial_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, 
 end
 
 # Beta mean-concentration: mu/a/b precomputes (Gamma-pre pattern), kappa
-# by name (Symbol) or inlined (literal); cell needs only (y, a, b), so
-# kappa is never a plate input. Positional beta cell (primary form).
+# by name (Symbol), inlined (literal), or bound once (`_ppl_sc_<label>`
+# via `_scale_plate_arg` for a log-link predictor — the vector folds
+# into the a/b precomputes through broadcast); cell needs only (y, a,
+# b), so kappa is never a plate input. Positional beta cell (primary
+# form).
 function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
-    k = r.scale isa Symbol ? r.scale : Float64(r.scale)
     mu = _mu_name(r.label)
     a = _shape_a_name(r.label)
     b = _shape_b_name(r.label)
-    pre = Expr[:($mu = 1 ./ (1 .+ exp.(-$lp))),
-        :($a = $mu .* $k),
-        :($b = (1 .- $mu) .* $k)]
+    pre = Expr[:($mu = 1 ./ (1 .+ exp.(-$lp)))]
+    sarg = _scale_plate_arg(r, plan, pre)
+    k = sarg isa Symbol ? sarg : Float64(sarg)
+    push!(pre, :($a = $mu .* $k), :($b = (1 .- $mu) .* $k))
     if r.mi_jobs !== nothing
         # kappa never threads (it folds into the a/b precomputes), so
         # only the shape nodes gather.
@@ -2128,8 +2131,7 @@ end
 # is the Stan-native `beta_binomial(n, alpha, beta)` endpoint. phi is
 # never a plate input: a Symbol threads through the precomputes (scalar
 # parameter or per-observation column, both broadcast), a literal
-# inlines (a predictor-fed phi is rejected at the contract gate, the
-# Beta-kappa deferral).
+# inlines (a predictor-fed phi is rejected at the contract gate).
 function _betabinomial2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
