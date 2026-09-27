@@ -1133,6 +1133,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _vonmises_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
         return _binomial_plate_stmts(r, plan, node, pw)
+    elseif r.family === BinomialProbFam
+        return _binomial_prob_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomial2Fam
         return _nb2_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomialFam
@@ -1795,6 +1797,24 @@ function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
     # All-keyword: the object constructor cannot mix positional and named
     # owner bindings (matches the `:observed/:n/:logit` HAVE ports).
     cell = :(binomial(; n = $nref, logit = $etav).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
+end
+
+# Prob-space Binomial (SB `binomial(n, theta)` with a Beta prior — the Rate
+# family): the location is the Beta parameter name itself (no LP node —
+# the Categorical `r.predictor`-as-symbol precedent), threaded scalar
+# through the plate against the positional prob-space kernel.
+function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    inputs = Any[y]
+    yv = _dovar(1)
+    nref = _thread_ref!(inputs, r.trials, true)
+    pref = _thread_ref!(inputs, r.predictor)
+    cell = :(binomial($nref, $pref).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)

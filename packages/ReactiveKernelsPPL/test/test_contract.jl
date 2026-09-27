@@ -317,7 +317,7 @@ end
     @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
         BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
         BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
-        BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
+        BinomialCloglogFam, BinomialProbFam, BetaLogitFam, CategoricalLogitFam,
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
         MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
         PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,

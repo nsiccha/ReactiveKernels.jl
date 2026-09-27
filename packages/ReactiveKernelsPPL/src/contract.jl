@@ -81,6 +81,7 @@ univariate components, SB `MixtureModel` mirror)."""
     BernoulliCloglogFam
     BinomialProbitFam
     BinomialCloglogFam
+    BinomialProbFam
     BetaLogitFam
     CategoricalLogitFam
     OrderedLogisticFam
@@ -1850,7 +1851,7 @@ const ELEMENTWISE_FNS = (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs)
 admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
-    BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
+    BinomialCloglogFam, BinomialProbFam, BetaLogitFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
@@ -6283,6 +6284,26 @@ function _validate_simplex_response(r::LikelihoodSpec, plan::StructuralPlan)
     return nothing
 end
 
+# Prob-space Binomial responses (SB `binomial(n, theta)` with a Beta prior,
+# the Rate family): no linear predictor — the location names the
+# Beta-sampled scalar probability in `predictor`, used as-is under
+# IdentityLink (the simplex precedent). Literals stay rejected: a fully
+# fixed Binomial contributes a constant, never a coordinate.
+function _validate_binomial_prob_response(r::LikelihoodSpec, plan::StructuralPlan)
+    r.link === IdentityLink || _fail(r.label,
+        "a prob-space Binomial response uses IdentityLink (probs are used " *
+        "as-is), got $(r.link)")
+    i = findfirst(p -> p.name === r.predictor, plan.parameters)
+    i === nothing && _fail(r.label,
+        "a prob-space Binomial response names its Beta-sampled probability " *
+        "in `predictor` (`theta ~ Beta(...)` in the model), got " *
+        "$(r.predictor)")
+    plan.parameters[i].family === :beta || _fail(r.label,
+        "a prob-space Binomial probability is Beta-sampled, got " *
+        "$(r.predictor) ~ $(plan.parameters[i].family)")
+    return nothing
+end
+
 # Joint correlated-outcomes responses (SB
 # `[y1..yK] ~ MvNormalCholesky([mu1..muK], L)`): K outcome columns (lead +
 # tail) with K identity-link mean predictors (lead + `extra_predictors`,
@@ -6813,6 +6834,19 @@ function _validate_responses(plan::StructuralPlan)
             _validate_evidence_structure(r, plan)
             continue
         end
+        # A prob-space Binomial location (no linear predictor — the
+        # simplex precedent): the location names a Beta-sampled scalar
+        # parameter in `predictor`.
+        if r.family === BinomialProbFam
+            _validate_binomial_prob_response(r, plan)
+            _validate_scale(r, plan)
+            _validate_nu(r, plan)
+            _validate_zi(r, plan)
+            _validate_interval(r, plan)
+            _validate_evidence_structure(r, plan)
+            _validate_unleveled_fields(r)
+            continue
+        end
         # A joint correlated-outcomes response (K outcomes, K mean
         # predictors, one LKJ factor): validated whole, skipping the
         # single-predictor triple.
@@ -7087,14 +7121,16 @@ end
 _is_count_column(col) =
     eltype(col) <: Integer && eltype(col) !== Bool && all(>=(0), col)
 
-# Bernoulli/Binomial span three link variants each (logit + slice-2
-# probit/cloglog); response/trials rules are link-independent.
-# BetaBinomial2 shares the Binomial trials rule (trials required, y ≤ n).
+# Bernoulli spans three link variants (logit + slice-2 probit/cloglog);
+# Binomial spans those three plus prob-space (BinomialProbFam, a
+# Beta-sampled probability, no link); response/trials rules are
+# link-independent. BetaBinomial2 shares the Binomial trials rule
+# (trials required, y ≤ n).
 _is_bernoulli_family(f) =
     f === BernoulliLogitFam || f === BernoulliProbitFam || f === BernoulliCloglogFam
 _is_binomial_family(f) =
     f === BinomialLogitFam || f === BinomialProbitFam || f === BinomialCloglogFam ||
-    f === BetaBinomial2Fam
+    f === BinomialProbFam || f === BetaBinomial2Fam
 
 # Scale-auxiliary requirement per family: the need string, or `nothing`
 # when the family takes no scale (`_validate_scale` for single responses,

@@ -4270,7 +4270,9 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     end
     family, lik_link, pred_link, loc, scale_raw, trials, nu_raw, zi_raw,
     interval_raw = _lower_response_base(lhs, call, ctx)
-    pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
+    pname = family === BinomialProbFam ?
+        _lower_prob_location(lhs, loc, ctx) :
+        _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
@@ -5009,7 +5011,11 @@ function _dot2call_spine_arg(lhs, f, i, a)
     elseif (f === :Bernoulli || f === :Poisson) && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :Binomial && i == 2
-        return _dot2call_nested_link(lhs, a, f)
+        # A bare prob passes through (prob-space Binomial over a Beta
+        # parameter — the mixture `_mixture_spine_arg` precedent); dotted
+        # links convert exactly as in single-family.
+        a isa Symbol || a isa Real || return _dot2call_nested_link(lhs, a, f)
+        return a
     elseif f === :NegativeBinomial2 && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :NegativeBinomial && i == 1
@@ -5442,13 +5448,32 @@ function _lower_bernoulli_link(lhs, arg)
 end
 
 function _lower_binomial_link(lhs, arg)
+    # Bare prob (a Beta-sampled parameter, constrained-scale — the
+    # mixture bare-mean precedent): prob-space Binomial, no link.
+    if arg isa Symbol || arg isa Real
+        return BinomialProbFam, IdentityLink, arg
+    end
     arg isa Expr && arg.head === :call && !isempty(arg.args) &&
         haskey(_BINOMIAL_LINKS, arg.args[1]) ||
         _sfail("response $lhs: `Binomial` probability takes a link wrapper " *
-               "(`logistic.(mu)`, `probit.(mu)`, or `cloglog.(mu)`), " *
+               "(`logistic.(mu)`, `probit.(mu)`, or `cloglog.(mu)`) or a " *
+               "bare Beta parameter (`theta ~ Beta(...)`), " *
                "got $(repr(arg))")
     fam, link = _BINOMIAL_LINKS[arg.args[1]]
     return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
+end
+
+# Prob-space Binomial location: a sampled parameter name (the Beta family
+# is checked at contract, the Categorical deferral precedent). Literals
+# stay rejected — a fully fixed Binomial contributes a constant.
+function _lower_prob_location(lhs, loc, ctx)
+    loc isa Symbol && loc in ctx.prior_names && return loc
+    loc isa Real && _sfail("response $lhs: prob-space Binomial " *
+                           "probability $loc is a literal — v1 probabilities " *
+                           "are Beta-sampled (`theta ~ Beta(...)` in the model)")
+    return _sfail("response $lhs: prob-space Binomial probability takes a " *
+                  "Beta parameter name (`theta ~ Beta(...)` in the model), " *
+                  "got $(repr(loc))")
 end
 
 function _lower_scale(lhs, s, ctx)
