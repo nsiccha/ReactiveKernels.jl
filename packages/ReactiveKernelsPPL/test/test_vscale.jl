@@ -1,5 +1,5 @@
 # Vector-scale contract tests: predictor-fed scale/shape (Gaussian sigma,
-# NB2 phi, Gamma alpha, Student sigma) via `ScalePredictorRef`.
+# NB2 phi, Gamma alpha, Beta kappa, Student sigma) via `ScalePredictorRef`.
 #
 # A scale predictor plans exactly like a location predictor (terms, priors,
 # one link); the surface spells the use-site link bare (identity),
@@ -255,7 +255,8 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, mu)
     end, (:y, :x))
-    # Beta-kappa predictors are deferred (contract gate).
+    # Beta-kappa predictors are log-only (a concentration — contract
+    # gate): a bare predictor use fails closed.
     @test_throws ContractValidationError lower_rkppl(quote
         mu = a .+ b .* x
         k = c .+ d .* z
@@ -326,9 +327,15 @@ end
     # Scale is the response's own location predictor.
     @test_throws ContractValidationError validate_structure(
         _mk(ScalePredictorRef(:mu, IdentityLink)))
-    # Beta-kappa predictors deferred; scaleless families take no ref.
+    # Beta-kappa predictors admitted log-only (a concentration);
+    # scaleless families take no ref.
+    validate_structure(_mk(ScalePredictorRef(:sigma, LogLink);
+        family = BetaLogitFam, link = LogitLink))
     @test_throws ContractValidationError validate_structure(
-        _mk(ScalePredictorRef(:sigma, LogLink); family = BetaLogitFam,
+        _mk(ScalePredictorRef(:sigma, IdentityLink); family = BetaLogitFam,
+            link = LogitLink))
+    @test_throws ContractValidationError validate_structure(
+        _mk(ScalePredictorRef(:sigma, LogitLink); family = BetaLogitFam,
             link = LogitLink))
     @test_throws ContractValidationError validate_structure(
         _mk(ScalePredictorRef(:sigma, LogLink); family = PoissonLogFam,
