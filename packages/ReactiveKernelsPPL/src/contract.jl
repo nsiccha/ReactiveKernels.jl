@@ -852,8 +852,10 @@ end
     SplineVector(name, family, args, support_override, width, basis, label)
 
 One free spline coefficient block (SB `_sb_s_generic`/`_sb_t2_generic`):
-flat `b_fixed`, standard-normal `b_*_raw`, half-normal `sd` (`:normal`
-+ `:positive`). `width` is static from `k`; `basis` is the owning
+flat `b_fixed`, standard-normal `b_*_raw`, Stan-kernel half-normal `sd`
+(`:normal` + `:positive_stan` — plain `_lpdf` plus the bare-`u` Jacobian,
+NO truncation renormalizer, matching SB which never renormalizes
+bounds). `width` is static from `k`; `basis` is the owning
 [`SplineBasis`](@ref) id. Layout packs each as one contiguous block
 (plate-shaped); priors broadcast over cells.
 """
@@ -1574,7 +1576,7 @@ function _spline_vector_specs(id::Symbol, kind::Symbol, k)
         end
     end
     nsd = kind === :tps ? 1 : 3
-    push!(specs, (sd, :normal, (arg1=0, arg2=1), :positive, nsd))
+    push!(specs, (sd, :normal, (arg1=0, arg2=1), :positive_stan, nsd))
     return specs
 end
 
