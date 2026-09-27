@@ -80,7 +80,7 @@ using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
     beta, inverse_gamma, binomial, negative_binomial2, beta_binomial,
-    negative_binomial,
+    negative_binomial, weibull,
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson,
     gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent,
@@ -1137,6 +1137,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _nb2_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomialFam
         return _nb1_plate_stmts(r, plan, node, pw)
+    elseif r.family === WeibullFam
+        return _weibull_plate_stmts(r, plan, node, pw)
     elseif r.family === GammaLogFam
         return _gamma_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliProbitFam
@@ -1845,6 +1847,31 @@ function _nb1_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     yv, rv = _dovar(1), _dovar(2)
     pref = _thread_ref!(inputs, sarg)
     cell = :(negative_binomial($rv, $pref).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Weibull likelihood (SB `weibull` mirror): the scale's `log_theta` HAVE
+# route takes the link predictor directly (the Poisson/ZIP precedent —
+# no `exp` precompute, no `log(exp())` round trip); the shape k threads
+# scalar or per-obs via `_scale_plate_arg` (predictor-fed k is deferred
+# at the contract gate, the Beta-kappa precedent). Weights multiply the
+# cell (the NB2 precedent). No whole-vector fusion yet — a perf-lane
+# follow-up, not this slice.
+function _weibull_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, lp]
+    yv, etav = _dovar(1), _dovar(2)
+    kref = _thread_ref!(inputs, sarg)
+    # All-keyword: the object constructor cannot mix positional and named
+    # owner bindings (the ZIP precedent).
+    cell = :(weibull(; k = $kref, log_theta = $etav).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)

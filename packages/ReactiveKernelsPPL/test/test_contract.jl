@@ -282,6 +282,21 @@ function _ig_plan(n = 9)
     )
 end
 
+function _weibull_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = [0.7, 1.4, 2.6, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1][1:n]
+    StructuralPlan(
+        [LikelihoodSpec(WeibullFam, LogLink, :y, :eta, :k, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, LogLink, _terms(), :eta)],
+        _priors(:eta),
+        [SampledParameter(:k, :lognormal, (arg1 = 0.0, arg2 = 0.3), nothing, :k)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
 function _betabinomial2_plan(n = 9)
     cols = _columns(n)
     cols[:y] = repeat([1, 0, 2], outer = cld(n, 3))[1:n]
@@ -322,7 +337,7 @@ end
         MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
         PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
         ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
-        NegativeBinomialFam)
+        NegativeBinomialFam, WeibullFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
@@ -808,6 +823,72 @@ end
     bad.columns[:lamc] = fill(-1.0, 9)
     bad.responses[1] =
         LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, :lamc, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "weibull response validation" begin
+    # Weibull requires its shape k.
+    bad = _weibull_plan()
+    bad.responses[1] =
+        LikelihoodSpec(WeibullFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A k literal must be finite positive (the IG precedent: the 0
+    # endpoint is not a degenerate-but-valid shape).
+    for lit in (0.5, 2.0)
+        good = _weibull_plan()
+        good.responses[1] =
+            LikelihoodSpec(WeibullFam, LogLink, :y, :eta, lit, nothing,
+                _none_evidence(), :y_resp)
+        @test validate_plan(good) === nothing
+    end
+    for lit in (0.0, -0.1, NaN, Inf)
+        bad = _weibull_plan()
+        bad.responses[1] =
+            LikelihoodSpec(WeibullFam, LogLink, :y, :eta, lit, nothing,
+                _none_evidence(), :y_resp)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # Predictor-fed k is deferred (the Beta-kappa precedent), on every
+    # link.
+    for link in (IdentityLink, LogLink, LogitLink)
+        bad = _weibull_plan()
+        push!(bad.predictors, PredictorSpec(:ls, link, _terms(), :ls))
+        append!(bad.population_priors, _priors(:ls))
+        bad.responses[1] =
+            LikelihoodSpec(WeibullFam, LogLink, :y, :eta,
+                ScalePredictorRef(:ls, link), nothing,
+                _none_evidence(), :y_resp)
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # Weibull response must be strictly positive (Bool excluded).
+    bad = _weibull_plan()
+    bad.columns[:y] = [0.7, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _weibull_plan()
+    bad.columns[:y] = [0.7, 1.4, -2.6, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _weibull_plan()
+    bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _weibull_plan()
+    bad.responses[1] =
+        LikelihoodSpec(WeibullFam, LogLink, :y, :eta, :k, nothing,
+            ResponseEvidence(:truncated, 0, 4), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # A per-observation k column binds finite positive.
+    good = _weibull_plan()
+    good.columns[:kc] = repeat([0.5, 1.5, 2.5], 3)
+    good.responses[1] =
+        LikelihoodSpec(WeibullFam, LogLink, :y, :eta, :kc, nothing,
+            _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    bad = _weibull_plan()
+    bad.columns[:kc] = fill(-1.0, 9)
+    bad.responses[1] =
+        LikelihoodSpec(WeibullFam, LogLink, :y, :eta, :kc, nothing,
             _none_evidence(), :y_resp)
     @test_throws ContractValidationError validate_plan(bad)
 end

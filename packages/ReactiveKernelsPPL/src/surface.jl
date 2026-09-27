@@ -5022,6 +5022,8 @@ function _dot2call_spine_arg(lhs, f, i, a)
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :BetaBinomial2 && i == 2
         return _dot2call_nested_link(lhs, a, f)
+    elseif f === :Weibull && i == 2
+        return _dot2call_nested_link(lhs, a, f)
     end
     # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
     # response branch matches the `./` structure (link + alpha identity).
@@ -5144,6 +5146,7 @@ const _RESPONSE_BASE_MSG =
     "`probit`/`cloglog` for the link), " *
     "`NegativeBinomial2.(exp.(eta), phi)`, " *
     "`NegativeBinomial.(exp.(eta), p)`, " *
+    "`Weibull.(k, exp.(eta))`, " *
     "`HurdlePoisson.(exp.(eta), p_zero)`, " *
     "`ZeroInflatedPoisson.(exp.(eta), zi)`, " *
     "`InverseGaussian.(exp.(eta), lambda)`, " *
@@ -5167,7 +5170,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         _sfail("`weighted.(...)` goes outermost: " *
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
     fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
-        :NegativeBinomial2, :NegativeBinomial, :Gamma, :Beta, :HurdlePoisson,
+        :NegativeBinomial2, :NegativeBinomial, :Weibull, :Gamma, :Beta,
+        :HurdlePoisson,
         :ZeroInflatedPoisson, :InverseGaussian, :BetaBinomial2,
         :VonMises, :CircularVonMises) ||
         return _lower_response_base_error(lhs, rhs, fam)
@@ -5205,6 +5209,12 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
                                     "`NegativeBinomial.(exp.(eta), p)`")
         return NegativeBinomialFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        nothing, nothing
+    elseif fam === :Weibull
+        length(args) == 2 || _sfail("response $lhs: `Weibull` takes " *
+                                    "`Weibull.(k, exp.(eta))`")
+        return WeibullFam, LogLink, LogLink,
+        _lower_link_arg(lhs, args[2], :exp), args[1], nothing, nothing,
         nothing, nothing
     elseif fam === :Gamma
         loc, scale = _lower_gamma_args(lhs, args, ctx)
@@ -5360,6 +5370,9 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :negative_binomial && _sfail("response $lhs: use " *
                                         "`NegativeBinomial` (the response " *
                                         "spelling, not the kernel endpoint)")
+    fam === :weibull && _sfail("response $lhs: use " *
+                               "`Weibull` (the response " *
+                               "spelling, not the kernel endpoint)")
     fam === :student_t && _sfail("response $lhs: use " *
                                  "`StudentT` (the response " *
                                  "spelling, not the kernel endpoint)")
@@ -5390,7 +5403,7 @@ function _lower_response_base_error(lhs, rhs, fam)
         "row-grouped, never broadcast)")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
-                  "NegativeBinomial2, NegativeBinomial, " *
+                  "NegativeBinomial2, NegativeBinomial, Weibull, " *
                   "HurdlePoisson, ZeroInflatedPoisson, " *
                   "InverseGaussian, BetaBinomial2, VonMises, " *
                   "CircularVonMises, Gamma, Beta, " *
