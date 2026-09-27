@@ -273,6 +273,67 @@ end
     _check_gradient(wbuilt.spec, wplan, u)
 end
 
+function _gen_weighted_bernoulli_plan(y, fam = BernoulliLogitFam,
+        link = LogitLink)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    cols[:w] = [1.0, 2.0, 1.0, 1.0, 2.0, 1.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(fam, link, :y, :eta, nothing, :w,
+            _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+# Bernoulli plate Bool normalization (snag `bernoulli-int-la-78487520`):
+# Int 0/1 responses read Bool lanes through a bind-folded `_ppl_yb_`
+# recipe — never an in-cell `yv != 0` comparison, which
+# misdifferentiates under native Enzyme in some plate shapes (-10.10 vs
+# true -4.97, NaN on perturbation). Bool columns skip the recipe.
+@testset "bernoulli plate Int-y Bool normalization" begin
+    u = [0.25, 0.5]
+    # Weighted logit Int: recipe present, no scalar comparison in the
+    # program, values match the Bool twin, gradient matches findiff.
+    iplan = _gen_weighted_bernoulli_plan(repeat([0, 1], 3))
+    ibuilt = build_kernel(iplan)
+    iex = kernel_expr(iplan, ibuilt.layout)
+    @test _has_sym(iex, :_ppl_yb_y_resp)
+    @test !_has_call(iex, :!=)
+    bplan = _gen_weighted_bernoulli_plan(repeat([false, true], 3))
+    bbuilt = build_kernel(bplan)
+    bex = kernel_expr(bplan, bbuilt.layout)
+    @test !_has_sym(bex, :_ppl_yb_y_resp)
+    @test _query(ibuilt.spec, iplan, :posterior, u) ≈
+        _query(bbuilt.spec, bplan, :posterior, u)
+    _check_gradient(ibuilt.spec, iplan, u)
+    # Ranged logit Int: plate route matches the fused density, gradient
+    # matches findiff.
+    fplan = _gen_bernoulli_plan(repeat([0, 1], 3))
+    fbuilt = build_kernel(fplan)
+    rplan = _gen_ranged_plan(fplan, 1:6)
+    rbuilt = build_kernel(rplan)
+    rex = kernel_expr(rplan, rbuilt.layout)
+    @test _has_sym(rex, :_ppl_yb_y_resp)
+    @test !_has_call(rex, :!=)
+    @test _query(rbuilt.spec, rplan, :posterior, u) ≈
+        _query(fbuilt.spec, fplan, :posterior, u)
+    _check_gradient(rbuilt.spec, rplan, u)
+    # Weighted probit/cloglog Int: recipe present, no scalar
+    # comparison, gradient matches findiff.
+    for (fam, link) in
+            ((BernoulliProbitFam, ProbitLink), (BernoulliCloglogFam, CloglogLink))
+        lplan = _gen_weighted_bernoulli_plan(repeat([0, 1], 3), fam, link)
+        lbuilt = build_kernel(lplan)
+        lex = kernel_expr(lplan, lbuilt.layout)
+        @test _has_sym(lex, :_ppl_yb_y_resp)
+        @test !_has_call(lex, :!=)
+        _check_gradient(lbuilt.spec, lplan, u)
+    end
+end
+
 function _gen_binomial_plan(y, trials)
     cols, n = _gen_columns()
     cols[:y] = y
