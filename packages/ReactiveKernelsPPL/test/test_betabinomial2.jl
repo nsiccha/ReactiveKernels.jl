@@ -1,9 +1,12 @@
 # BetaBinomial2 response (SB `beta_binomial` mirror): surface admission,
 # value parity vs a Distributions.jl hand oracle (literal / Gamma-sampled /
-# per-observation phi, column / literal trials), Enzyme-vs-findiff gradients,
-# Reactant/XLA value+grad, and SB-parity probes (B1/B2 N=80, peer BridgeStan
-# pins from brief 2026-09-26T11-18-32-809-1kc4kdo). (`_findiff_grad` /
-# `_GEN_BACKEND` come from test_generator.jl, included first.)
+# per-observation / modeled phi, column / literal trials),
+# Enzyme-vs-findiff gradients, Reactant/XLA value+grad, and SB-parity
+# probes (B1/B2 N=80, peer BridgeStan pins from brief
+# 2026-09-26T11-18-32-809-1kc4kdo; P3 modeled-precision N=6, pins from
+# term-nuisance spec brief 2026-09-27T14-14-33-651-1mcop44).
+# (`_findiff_grad` / `_GEN_BACKEND` come from test_generator.jl,
+# included first.)
 using DifferentiationInterface
 using Distributions: BetaBinomial, Normal, Gamma, logpdf
 using Enzyme
@@ -36,6 +39,28 @@ const _BB_N = [10, 12, 8, 15, 9, 11]
 const _BB_C = [6, 8, 5, 9, 4, 7]
 _bb_cols() = Dict{Symbol,AbstractVector}(:c => copy(_BB_C), :x => copy(_BB_X),
     :n => copy(_BB_N))
+
+# P3 modeled-precision probe (term-nuisance spec brief
+# 2026-09-27T14-14-33-651-1mcop44 on
+# BayesianRegressionModels:rk:parity-term-nuisance, BRM 97bb538, StanBlocks
+# 24578c3, BridgeStan 2.9.0, Julia 1.10.11): logit(mean) ~ 1 + x,
+# log(precision) ~ 1 + z, Normal(0,1) popefs throughout; full posterior
+# at u, propto=false, Jacobian in.
+const _BB_P3_X = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+const _BB_P3_Z = [1.0, 0.5, -0.5, 1.5, 0.0, -1.0]
+const _BB_P3_N = [8, 6, 10, 5, 4, 9]
+const _BB_P3_Y = [3, 1, 6, 2, 1, 4]
+const _BB_P3_U = [0.2, -0.1, 1.0, 0.15]
+const _BB_P3_VAL = -16.32864549199993
+const _BB_P3_GRAD =
+    [-2.6564341346233356, 1.2760941575308387, 0.5334316828699692, -0.15235617603106094]
+_bb_p3_cols() = Dict{Symbol,AbstractVector}(:y => copy(_BB_P3_Y),
+    :x => copy(_BB_P3_X), :z => copy(_BB_P3_Z), :n => copy(_BB_P3_N))
+_bb_p3_prog() = quote
+    mu = a .+ b .* x
+    hup = c .+ d .* z
+    y .~ BetaBinomial2.(n, logistic.(mu), exp.(hup))
+end
 
 @testset "betabinomial surface admission" begin
     @testset "literal phi, column trials" begin
@@ -77,6 +102,17 @@ _bb_cols() = Dict{Symbol,AbstractVector}(:c => copy(_BB_C), :x => copy(_BB_X),
                 c .~ BetaBinomial2.(n, logistic.(mu), phic)
             end, (:c, :x, :n, :phic))
         @test only(plan.responses).scale === :phic
+    end
+    @testset "predictor-fed precision" begin
+        plan = lower_rkppl(quote
+                mu = a .+ b .* x
+                hup = c .+ d .* z
+                y .~ BetaBinomial2.(n, logistic.(mu), exp.(hup))
+            end, (:y, :x, :z, :n))
+        r = only(plan.responses)
+        @test r.family === BetaBinomial2Fam
+        @test r.scale == ScalePredictorRef(:hup, LogLink)
+        @test r.trials === :n
     end
     @testset "error spellings" begin
         # Wrong arity.
@@ -161,6 +197,20 @@ end
             logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2])
         @test got ≈ want rtol = 1e-12
     end
+    @testset "modeled precision" begin
+        _, _, kern, lay = _bb_query(_bb_p3_prog(), _bb_p3_cols())
+        q = (mu = [_BB_P3_U[1], _BB_P3_U[2]],
+            hup = [_BB_P3_U[3], _BB_P3_U[4]])
+        got = _bb_posterior(kern, lay, q)
+        eta = q.mu[1] .+ q.mu[2] .* _BB_P3_X
+        mu = 1 ./ (1 .+ exp.(-eta))
+        phi = exp.(q.hup[1] .+ q.hup[2] .* _BB_P3_Z)
+        want = sum(_bb_ref(y, n, m, p)
+            for (y, n, m, p) in zip(_BB_P3_Y, _BB_P3_N, mu, phi)) +
+            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2]) +
+            logpdf(Normal(0, 1), q.hup[1]) + logpdf(Normal(0, 1), q.hup[2])
+        @test got ≈ want rtol = 1e-12
+    end
 end
 
 # One Enzyme-vs-findiff gradient check at a constrained probe (no oracle
@@ -191,6 +241,11 @@ end
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), phi)
             end, _bb_cols(), (mu = [0.5, -0.25], phi = 4.0))
+    end
+    @testset "modeled precision" begin
+        _bb_enzyme_check(_bb_p3_prog(), _bb_p3_cols(),
+            (mu = [_BB_P3_U[1], _BB_P3_U[2]],
+                hup = [_BB_P3_U[3], _BB_P3_U[4]]))
     end
 end
 
@@ -257,6 +312,7 @@ end
             mu = a .+ b .* x
             c .~ BetaBinomial2.(n, logistic.(mu), phi)
         end, _bb_cols()),
+        ("modeled precision", _bb_p3_prog(), _bb_p3_cols()),
     ]
     for (name, prog, cols) in progs
         @testset "$name" begin
@@ -365,6 +421,42 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         sb = _bb_sb_vec(names, [Symbol("mu.Intercept") => -3.6814620132469567,
             Symbol("mu.x") => -46.90221092744033,
             :phi => -61.221213644655926])
+        @test maximum(abs.(g .- sb)) < 1e-11
+    end
+    @testset "P3 betabinom_precision" begin
+        # SB: logit(mean) ~ 1 + x; log(precision) ~ 1 + z;
+        # Normal(0,1) popefs throughout;
+        # y ~ BetaBinomial2(trials, mean, precision);
+        # u = [0.2, -0.1, 1.0, 0.15]
+        # (mean.Intercept, mean.x, precision.Intercept, precision.z).
+        bound, built, kern, lay = _bb_query(_bb_p3_prog(), _bb_p3_cols())
+        names = coordinate_names(lay)
+        u = _bb_sb_vec(names, [Symbol("mu.Intercept") => _BB_P3_U[1],
+            Symbol("mu.x") => _BB_P3_U[2],
+            Symbol("hup.Intercept") => _BB_P3_U[3],
+            Symbol("hup.z") => _BB_P3_U[4]])
+        got = Base.invokelatest(kern, u)
+        # Measured 2-ulp (7.1e-15) off the SB pin: the shared
+        # `beta_binomial` endpoint's lgamma/lbeta association differs
+        # from Distributions/Stan order (same class as B1/B2's
+        # accepted 1e-13..1e-14 at N=80) — not summation noise (0.0)
+        # and not the modeled-phi path (scalar inputs are bit-identical).
+        @test abs(got - _BB_P3_VAL) < 1e-12
+        eta = _BB_P3_U[1] .+ _BB_P3_U[2] .* _BB_P3_X
+        mu = 1 ./ (1 .+ exp.(-eta))
+        phi = exp.(_BB_P3_U[3] .+ _BB_P3_U[4] .* _BB_P3_Z)
+        want = sum(_bb_ref(y, n, m, p)
+            for (y, n, m, p) in zip(_BB_P3_Y, _BB_P3_N, mu, phi)) +
+            sum(logpdf(Normal(0, 1), v) for v in _BB_P3_U)
+        @test got ≈ want rtol = 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        sb = _bb_sb_vec(names, [Symbol("mu.Intercept") => _BB_P3_GRAD[1],
+            Symbol("mu.x") => _BB_P3_GRAD[2],
+            Symbol("hup.Intercept") => _BB_P3_GRAD[3],
+            Symbol("hup.z") => _BB_P3_GRAD[4]])
         @test maximum(abs.(g .- sb)) < 1e-11
     end
     @testset "B2 betabinomial_mu1" begin

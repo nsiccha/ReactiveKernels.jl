@@ -1929,7 +1929,7 @@ end
 # precedent — a computed `exp` constructor arg miscompiles the Enzyme
 # pullback); the success probability p threads scalar or per-obs via
 # `_scale_plate_arg` (predictor-fed p is deferred at the contract
-# gate, the BetaBinomial2 precedent). Weights multiply the cell (the
+# gate, the Beta-kappa precedent). Weights multiply the cell (the
 # NB2 precedent). No whole-vector fusion yet — a perf-lane follow-up,
 # not this slice.
 _nb1_r_name(label::Symbol) = Symbol(:_ppl_r_, label)
@@ -2168,11 +2168,14 @@ end
 # is the Stan-native `beta_binomial(n, alpha, beta)` endpoint. phi is
 # never a plate input: a Symbol threads through the precomputes (scalar
 # parameter or per-observation column, both broadcast), a literal
-# inlines (a predictor-fed phi is rejected at the contract gate).
+# inlines, and a predictor-fed phi binds its constrained vector once
+# (`_ppl_sc_`, the NB2 precedent) and broadcasts through `a`/`b`.
 function _betabinomial2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
-    k = r.scale isa Symbol ? r.scale : Float64(r.scale)
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
+    k = sarg isa Symbol ? sarg : Float64(sarg)
     mu = _mu_name(r.label)
     a = _shape_a_name(r.label)
     b = _shape_b_name(r.label)
@@ -2184,7 +2187,8 @@ function _betabinomial2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, nod
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[:($mu = 1 ./ (1 .+ exp.(-$lp))),
+    return Expr[pre...,
+        :($mu = 1 ./ (1 .+ exp.(-$lp))),
         :($a = $mu .* $k),
         :($b = (1 .- $mu) .* $k),
         _plate_sum_stmts(pw, node, inputs, cell)...]
