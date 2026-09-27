@@ -1192,11 +1192,13 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     inputs = Any[y]
     yv = _dovar(1)
     pre = Expr[]
-    # Bernoulli widths: validated Bool-or-0/1-Int; the endpoint takes Bool.
+    # Bernoulli widths: validated Bool-or-0/1-Int; the endpoint takes
+    # Bool lanes (bind-folded `_ppl_yb_` recipe, never an in-cell
+    # comparison — `_bernoulli_yplate!`).
     yref = yv
     if f === BernoulliLogitFam
-        col = plan.columns[y]
-        yref = eltype(col) === Bool ? yv : :($yv != 0)
+        yin, yref = _bernoulli_yplate!(pre, plan, y, r.label, yv)
+        inputs[1] = yin
     end
     # Binomial trials are shared across components: one threaded use.
     nref = nothing
@@ -1565,20 +1567,42 @@ function _lognormal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::S
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
+# Bernoulli Bool normalization (snag `bernoulli-int-la-78487520`): a
+# non-Bool validated 0/1 response column reads through a NAMED
+# `_ppl_yb_<label>` recipe instead of an in-cell `yv != 0` comparison.
+# The recipe is data-only so `bound=` folds it exactly once (the
+# `_ppl_yf_` precedent — zero per-eval alloc, verified); the plate then
+# reads Bool lanes and the endpoint's lazy branch never sees a computed
+# comparison, which misdifferentiates under native Enzyme in some plate
+# shapes (observed: -10.10 vs true -4.97, NaN on perturbation; the same
+# math inline or over Bool lanes is exact). Dense `Vector{Bool}`:
+# broadcast comparison yields a BitVector and BitArrays are
+# overlay-hostile (the kernel-plate twin precedent). Bool columns skip
+# the recipe. Returns the plate input symbol and the cell lane ref.
+_ybool_name(label::Symbol) = Symbol(:_ppl_yb_, label)
+
+function _bernoulli_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
+        y::Symbol, label::Symbol, yv::Symbol)
+    col = plan.columns[y]
+    eltype(col) === Bool && return y, yv
+    yb = _ybool_name(label)
+    push!(pre, :($yb = Vector{Bool}($y .!= 0)))
+    return yb, yv
+end
+
 function _bernoulli_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
-    inputs = Any[y, lp]
     yv, etav = _dovar(1), _dovar(2)
-    col = plan.columns[y]
-    # Validated Bool-or-0/1-Int; the endpoint takes Bool.
-    yref = eltype(col) === Bool ? yv : :($yv != 0)
+    pre = Expr[]
+    yin, yref = _bernoulli_yplate!(pre, plan, y, r.label, yv)
+    inputs = Any[yin, lp]
     cell = :(bernoulli(; logit = $etav).logpdf($yref))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Fused whole-vector Poisson-log likelihood (base case: no evidence, no
@@ -1708,8 +1732,10 @@ end
 # subtracts `poisson_lccdf(0 | λ)` — the same quantity) — NOT the
 # `.cdf(0)` endpoint, whose `gamma_inc` has no Reactant tracing rule
 # (`MethodError` on compile; the truncated/censored Poisson cells
-# carry the same gap). The `y == 0` select is the mixture-Bernoulli
-# `!=` precedent; p_zero threads scalar or via the `_ppl_sc_` node
+# carry the same gap). The `y == 0` select is an eager `ifelse` over
+# count lanes (both sides already valid values — not the Bernoulli
+# lazy-branch shape, whose in-cell comparison `_bernoulli_yplate!`
+# now hoists); p_zero threads scalar or via the `_ppl_sc_` node
 # (the scale-predictor precedent — a hurdle p_zero predictor is
 # logit-only at the contract gate). Evidence fails closed at the
 # contract gate (Gaussian/Poisson only); weights multiply the cell
@@ -2000,17 +2026,16 @@ function _bernoulli_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, 
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
     p = _prob_name(r.label)
-    pre = :($p = 0.5 .* erfc.(-$lp ./ sqrt(2)))
-    inputs = Any[y, p]
+    pre = Expr[:($p = 0.5 .* erfc.(-$lp ./ sqrt(2)))]
     yv, pv = _dovar(1), _dovar(2)
-    col = plan.columns[y]
-    yref = eltype(col) === Bool ? yv : :($yv != 0)
+    yin, yref = _bernoulli_yplate!(pre, plan, y, r.label, yv)
+    inputs = Any[yin, p]
     cell = :(bernoulli($pv).logpdf($yref))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Bernoulli cloglog: pure-arithmetic p precompute, positional-p cell.
@@ -2018,17 +2043,16 @@ function _bernoulli_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
     p = _prob_name(r.label)
-    pre = :($p = 1 .- exp.(-exp.($lp)))
-    inputs = Any[y, p]
+    pre = Expr[:($p = 1 .- exp.(-exp.($lp)))]
     yv, pv = _dovar(1), _dovar(2)
-    col = plan.columns[y]
-    yref = eltype(col) === Bool ? yv : :($yv != 0)
+    yin, yref = _bernoulli_yplate!(pre, plan, y, r.label, yv)
+    inputs = Any[yin, p]
     cell = :(bernoulli($pv).logpdf($yref))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Binomial probit/cloglog: precompute p, then logit(p), and reuse the
