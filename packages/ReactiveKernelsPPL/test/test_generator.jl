@@ -755,9 +755,30 @@ function _gen_exp_plan()
     return plan
 end
 
+function _gen_ln_plan(; sigma = :sigma)
+    cols, n = _gen_columns()
+    params = sigma isa Symbol ? SampledParameter[
+        SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(LogNormalFam, IdentityLink, :y, :mu,
+            sigma, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
 function _ref_exp(cols, coef)
     mu = exp.(coef[1] .+ coef[2] .* cols[:x])
     return sum(logpdf(Exponential(m), y) for (y, m) in zip(cols[:y], mu))
+end
+
+function _ref_ln(cols, coef, sig)
+    mu = coef[1] .+ coef[2] .* cols[:x]
+    return sum(logpdf(LogNormal(m, sig), y) for (y, m) in zip(cols[:y], mu))
 end
 
 @testset "ig values and gradient" begin
@@ -945,6 +966,29 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+@testset "lognormal values and gradient" begin
+    plan = _gen_ln_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_ln(plan.columns, Vector(nt.mu), nt.sigma)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Exponential(1), nt.sigma)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "lognormal literal-sigma values" begin
+    plan = _gen_ln_plan(; sigma = 0.5)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_ln(plan.columns, Vector(nt.mu), 0.5)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "weighted exponential values" begin
     cols, n = _gen_columns()
     cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
@@ -961,6 +1005,26 @@ end
     ll = sum(cols[:w] .*
         [logpdf(Exponential(m), y) for (y, m) in zip(cols[:y], mu)])
     pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted lognormal values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(LogNormalFam, IdentityLink, :y, :mu,
+            0.5, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* cols[:x]
+    ll = sum(cols[:w] .*
+        [logpdf(LogNormal(m, 0.5), y) for (y, m) in zip(cols[:y], mu)])
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, plan, u)
 end
