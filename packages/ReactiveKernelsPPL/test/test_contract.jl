@@ -843,6 +843,52 @@ end
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
             ResponseEvidence(:truncated, 0, 5), :y_resp, nothing, nothing; zi = :zi)
     @test_throws ContractValidationError validate_plan(bad)
+    # A logit-link zi predictor is admitted (the zi submodel, the
+    # hurdle p_zero precedent).
+    good = _zip_plan()
+    push!(good.predictors, PredictorSpec(:zeta, LogitLink, _terms(), :zeta))
+    append!(good.population_priors, _priors(:zeta))
+    good.responses[1] =
+        LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, nothing, nothing;
+            zi = ScalePredictorRef(:zeta, LogitLink))
+    @test validate_plan(good) === nothing
+    # Log/identity zi predictor links fail closed (a probability).
+    for link in (LogLink, IdentityLink)
+        bad = _zip_plan()
+        push!(bad.predictors, PredictorSpec(:zeta, link, _terms(), :zeta))
+        append!(bad.population_priors, _priors(:zeta))
+        bad.responses[1] =
+            LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+                _none_evidence(), :y_resp, nothing, nothing;
+                zi = ScalePredictorRef(:zeta, link))
+        @test_throws ContractValidationError validate_plan(bad)
+    end
+    # Unknown zi predictor.
+    bad = _zip_plan()
+    bad.responses[1] =
+        LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, nothing, nothing;
+            zi = ScalePredictorRef(:nosuch, LogitLink))
+    @test_throws ContractValidationError validate_plan(bad)
+    # The use-site link must match the predictor's own link.
+    bad = _zip_plan()
+    push!(bad.predictors, PredictorSpec(:zeta, IdentityLink, _terms(), :zeta))
+    append!(bad.population_priors, _priors(:zeta))
+    bad.responses[1] =
+        LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, nothing, nothing;
+            zi = ScalePredictorRef(:zeta, LogitLink))
+    @test_throws ContractValidationError validate_plan(bad)
+    # But not the response's own location predictor (fails at the
+    # logit-only gate here — the shared-predictor shape never carries
+    # a logit link from the surface either).
+    bad = _zip_plan()
+    bad.responses[1] =
+        LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, nothing, nothing;
+            zi = ScalePredictorRef(:eta, LogLink))
+    @test_throws ContractValidationError validate_plan(bad)
 end
 
 @testset "ig response validation" begin
