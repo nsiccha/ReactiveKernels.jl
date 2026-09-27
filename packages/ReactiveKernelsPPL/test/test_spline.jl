@@ -1,9 +1,12 @@
 # Spline contract: in-graph s/t2 bases + vector priors + smoothing (SB
 # `_sb_s_generic`/`_sb_t2_generic` mirror). Surface declarations, IR
-# validation, bind-time materialization, layout, and end-to-end
-# values/gradients vs independent Distributions.jl references. The port
-# itself is verified against BRM by a /tmp differential (BRM is not a test
-# dep); committed here are structural properties + hand references.
+# validation, bind-time materialization, layout, end-to-end
+# values/gradients vs independent Distributions.jl references, and a
+# Reactant/XLA native-vs-compiled leg. The port itself is verified
+# against BRM by a /tmp differential (BRM is not a test dep); committed
+# here are structural properties + hand references (+ SB-parity pins once
+# the BRM peer publishes its BridgeStan literals).
+using Reactant
 
 function _svalid_plan(; t2::Bool = false)
     if t2
@@ -499,4 +502,134 @@ end
     jac = u[2] + u[end-2] + u[end-1] + u[end]
     @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + jac
     _check_gradient(built.spec, bound, u)
+end
+
+# Build (evaluates a new generated model), then trace/compile in a call
+# made through `Base.invokelatest`: the generated recipe closures are
+# newer than the world of the enclosing top-level expression (the
+# leveled-Reactant call-shape precedent).
+function _spline_reactant(bound)
+    built = build_kernel(bound)
+    post_q = prepare_query(built, bound, :sampler)
+    u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
+    return Base.invokelatest(_spline_reactant_measure, built, bound, post_q,
+        u)
+end
+
+function _spline_reactant_measure(built, bound, post_q, u)
+    native = post_q(u)
+    compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
+    primal = Float64(compiled(Reactant.to_rarray(u)))
+    q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
+    rval, rgrad = cad(Reactant.to_rarray(u))
+    return (; native, primal, val, g, rval = Float64(rval),
+        rgrad = Array(rgrad))
+end
+
+@testset "spline under Reactant" begin
+    progs = [
+        ("tps", () -> _svalid_plan(), () -> _spline_cols()),
+        ("t2", () -> _svalid_plan(; t2 = true),
+            () -> _spline_cols(; t2 = true)),
+    ]
+    for (name, plan_fn, cols_fn) in progs
+        @testset "$name" begin
+            bound = bind_data(plan_fn(), cols_fn())
+            fx = _spline_reactant(bound)
+            @test fx.primal ≈ fx.native rtol = 1e-9
+            @test fx.val ≈ fx.native rtol = 1e-12
+            @test fx.rval ≈ fx.native rtol = 1e-9
+            @test fx.rgrad ≈ fx.g rtol = 1e-8
+        end
+    end
+end
+
+# M1/M2 SB parity at the u probes: RK value vs the independent oracle,
+# the RK value pin, the peer lane's BridgeStan full-posterior literal
+# (propto=false, jacobian=true), and the SB grads in RK u-order (brief
+# 2026-09-27T13-01-42-742-16egzpo on
+# BayesianRegressionModels:rk:parity-term-splines-stan, BRM 97bb5388,
+# StanBlocks 24578c3, BridgeStan 2.9.0, Julia 1.10.11). The layout is all
+# identity/exp, matching Stan's lower-bound kernels — no map gap, so the
+# full posterior compares bit-exact (M1, d=0.0) / 1 ulp (M2, d=-7.11e-15).
+# The peer verified its SB basis bit-exact vs the RK materialized columns
+# (M1 4/4, M2 8/8) before comparing values.
+@testset "spline M1/M2 SB-parity pins" begin
+    @testset "M1 s k=4" begin
+        # u = [0.3, 0.2, 0.1, -0.1, 0.4, 0.0, -0.2].
+        # RK order [mu.Intercept, sigma, b_s_x_fixed.1, b_s_x_fixed.2,
+        # b_s_x_raw.1, b_s_x_raw.2, sd_s_x.1]; SB order
+        # [pop_mu_beta_pop.1, s_x_b_fixed.1, s_x_b_fixed.2, s_x_sd_pen.1,
+        # s_x_b_pen_raw.1, s_x_b_pen_raw.2, sigma].
+        bound = bind_data(_svalid_plan(), _spline_cols())
+        built = build_kernel(bound)
+        lay = built.layout
+        @test coordinate_names(lay) == [Symbol("mu.Intercept"), :sigma,
+            Symbol("b_s_x_fixed.1"), Symbol("b_s_x_fixed.2"),
+            Symbol("b_s_x_raw.1"), Symbol("b_s_x_raw.2"),
+            Symbol("sd_s_x.1")]
+        u = [0.3, 0.2, 0.1, -0.1, 0.4, 0.0, -0.2]
+        nt = constrain(lay, u)
+        ref = _ref_spline_tps(bound, nt)
+        post = _query(built.spec, bound, :posterior, u)
+        @test post ≈ ref.ll + ref.pr + u[2] + u[7]
+        @test abs(post - (-22.244895346304787)) < 1e-12
+        # SB full posterior -22.244895346304787, bit-exact vs RK.
+        @test abs(post - (-22.244895346304787)) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        sb = [-2.7161630767907803, -8.4332465153243046, -2.7041630767907803,
+            5.9857744480450616, 2.7109163710758355, 4.5566881239299892,
+            1.574046502394695]
+        @test maximum(abs.(g .- sb)) < 1e-10
+        _check_gradient(built.spec, bound, u)
+    end
+    @testset "M2 t2 k=(3,3)" begin
+        # u = -0.3:0.05:0.3 (13). RK order [mu.Intercept, sigma,
+        # b_t2_xz_fixed.1..3, b_t2_xz_rr_raw.1, b_t2_xz_rn_raw.1..2,
+        # b_t2_xz_nr_raw.1..2, sd_t2_xz.1..3]; SB order
+        # [pop_mu_beta_pop.1, t2_mu_x_z_b_fixed.1..3,
+        # t2_mu_x_z_sd_pen.1..3, t2_mu_x_z_b_rr_raw.1,
+        # t2_mu_x_z_b_rn_raw.1..2, t2_mu_x_z_b_nr_raw.1..2, sigma].
+        plan = lower_rkppl(quote
+                spline_basis(:t2_xz, x, z; k = (3, 3))
+                a ~ Normal(0, 5)
+                sigma ~ Exponential(1)
+                mu = a .+ spline(:t2_xz)
+                y .~ Normal.(mu, sigma)
+            end, (:y, :x, :z))
+        bound = bind_data(plan, _spline_cols(; t2 = true))
+        built = build_kernel(bound)
+        lay = built.layout
+        @test coordinate_names(lay) ==
+            [Symbol("mu.Intercept"), :sigma, Symbol("b_t2_xz_fixed.1"),
+                Symbol("b_t2_xz_fixed.2"), Symbol("b_t2_xz_fixed.3"),
+                Symbol("b_t2_xz_rr_raw.1"), Symbol("b_t2_xz_rn_raw.1"),
+                Symbol("b_t2_xz_rn_raw.2"), Symbol("b_t2_xz_nr_raw.1"),
+                Symbol("b_t2_xz_nr_raw.2"), Symbol("sd_t2_xz.1"),
+                Symbol("sd_t2_xz.2"), Symbol("sd_t2_xz.3")]
+        u = collect(range(-0.3, 0.3; length = 13))
+        nt = constrain(lay, u)
+        ref = _ref_spline_t2(bound, nt)
+        post = _query(built.spec, bound, :posterior, u)
+        jac = u[2] + u[end-2] + u[end-1] + u[end]
+        @test post ≈ ref.ll + ref.pr + jac
+        @test abs(post - (-27.739270897924577)) < 1e-12
+        # SB full posterior -27.739270897924584, 1 ulp from RK.
+        @test abs(post - (-27.739270897924584)) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        sb = [7.2585406630028375, 2.3240804584385835, 0.98991856030834768,
+            1.0727353584400312, -0.33308773248555568, 0.1091189056022403,
+            -0.204465212786443, -0.045932924265366423, -0.42583579743795452,
+            -0.19444326886339713, -0.49478064292138235, -0.64851791691339633,
+            -0.86136887046381405]
+        @test maximum(abs.(g .- sb)) < 1e-10
+        _check_gradient(built.spec, bound, u)
+    end
 end
