@@ -698,6 +698,8 @@ end
 end
 
 @testset "mm intercept e2e values and gradient" begin
+    # Lognormal sd here is the intended SB `ranef_intercept_draws`
+    # mirror (see the `VaryingDraws` docstring), not a divergence.
     @testset "default weights" begin
         bound, built, _, lay = _mm_query(quote
                 a ~ Normal(0, 5)

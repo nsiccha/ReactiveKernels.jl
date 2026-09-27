@@ -453,8 +453,12 @@ end
     @test logjac(slayout, us) ≈ us[2]
 end
 
-# Independent intercept reference: SB `exp(log_scale) * xi[idx]` shape
-# with explicit names/order (no contract helpers — this pins them).
+# Independent intercept reference: SB `ranef_intercept` equations
+# (`log_scale ~ std_normal()`, effect `exp(log_scale) * xi[idx]` — a
+# LogNormal(0, 1) sd) with explicit names/order (no contract helpers —
+# this pins them). The lognormal sd is the intended SB mirror (SB
+# mirrors VBRMI's `chol` 1x1 collapse; see the `VaryingDraws`
+# docstring), NOT a half-normal waiting to happen.
 function _tv_ref_intercept(bound, nt)
     idx = [findfirst(==(v), ["a", "b", "c"]) for v in bound.columns[:g]]
     r = exp(nt.log_scale_g) .* nt.xi_g[idx]
@@ -485,7 +489,9 @@ end
     _check_gradient(built.spec, bound, u)
 end
 
-# Independent slope reference: SB `tau * (xi[idx] .* Z)` association.
+# Independent slope reference: SB `ranef_slope` equations
+# (`tau ~ std_normal(; lower=0)`, effect `tau * (xi[idx] .* Z)` — a
+# half-normal sd plus the Stan `exp`-layout Jacobian).
 function _tv_ref_slope(bound, nt, Z)
     idx = [findfirst(==(v), [1, 2, 3]) for v in bound.columns[:g]]
     r = nt.tau_g .* (nt.xi_g[idx] .* Z)
@@ -537,6 +543,86 @@ end
     @test _query(dbuilt.spec, dbound, :prior, u) ≈ dref.pr
     @test _query(dbuilt.spec, dbound, :posterior, u) ≈
         dref.ll + dref.pr + u[2] + u[3]
+end
+
+@testset "varying K=1 sd-geometry SB parity" begin
+    # Snag intercept1-logno-f87f4be4: the K=1 sd asymmetry (lognormal
+    # intercept sd, half-normal slope sd) is an intended equation-level
+    # SB mirror, not a divergence — SB's own `(1 | g)` path is
+    # log-scale (`ranef_intercept`), its slope path half-normal
+    # (`ranef_slope`). These pins fail loudly if either geometry is
+    # "unified" to the other. Probe sd = 1.2 with literal sigma so the
+    # slope's `exp`-layout Jacobian is the only one in play.
+    y = [0.5, -0.3, 1.1, 0.2]
+    g = [1, 2, 1, 2]
+    x = [0.5, -1.0, 1.5, 0.0]
+    iplan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            r ~ varying_effect(g, [1])
+            mu = a .+ r
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :g))
+    @test only(iplan.varying_draws).kind === :intercept1
+    ibound = bind_data(iplan,
+        Dict{Symbol,AbstractVector}(:y => y, :g => g))
+    ibuilt = build_kernel(ibound)
+    ilay = ibuilt.layout
+    @test only(e.transform for e in ilay.entries
+        if e.name === :log_scale_g) === :identity
+    iq = (mu = [0.0], log_scale_g = log(1.2), xi_g = [0.0, 0.0])
+    iu = unconstrain(ilay, iq)
+    rest = logpdf(Normal(0, 5), 0.0) + 2 * logpdf(Normal(), 0.0)
+    isd = _query(ibuilt.spec, ibound, :prior, iu) - rest
+    @test isd ≈ logpdf(Normal(), log(1.2))
+    ill = _query(ibuilt.spec, ibound, :likelihood, iu)
+    ipr = _query(ibuilt.spec, ibound, :prior, iu)
+    @test _query(ibuilt.spec, ibound, :posterior, iu) ≈ ill + ipr
+    splan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            r ~ varying_effect(g, [x])
+            mu = a .+ r
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x, :g))
+    @test only(splan.varying_draws).kind === :slope1
+    sbound = bind_data(splan,
+        Dict{Symbol,AbstractVector}(:y => y, :g => g, :x => x))
+    sbuilt = build_kernel(sbound)
+    slay = sbuilt.layout
+    @test only(e.transform for e in slay.entries
+        if e.name === :tau_g) === :exp
+    sq = (mu = [0.0], tau_g = 1.2, xi_g = [0.0, 0.0])
+    su = unconstrain(slay, sq)
+    ssd = _query(sbuilt.spec, sbound, :prior, su) - rest
+    @test ssd ≈ logpdf(Normal(), 1.2)
+    sll = _query(sbuilt.spec, sbound, :likelihood, su)
+    spr = _query(sbuilt.spec, sbound, :prior, su)
+    @test _query(sbuilt.spec, sbound, :posterior, su) ≈ sll + spr + log(1.2)
+    # The asymmetry is a shape difference, not a constant: unifying
+    # either geometry to the other moves both assertions above.
+    @test !(isd ≈ ssd)
+    # Escape hatch: K=1 with eta takes the vacuous-1x1-LKJ correlated
+    # route and recovers the half-normal sd (the LKJ contributes
+    # nothing at 1x1) — the spelling for a half-normal K=1.
+    cplan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            r ~ varying_effect(g, [1]; eta = 1.0)
+            mu = a .+ r
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :g))
+    cb = only(cplan.varying_draws)
+    @test cb.kind === :correlated && cb.lkj_eta == 1.0
+    cbound = bind_data(cplan,
+        Dict{Symbol,AbstractVector}(:y => y, :g => g))
+    cbuilt = build_kernel(cbound)
+    clay = cbuilt.layout
+    cq = (mu = [0.0], L_g = [1.0;;], tau_g = [1.2],
+        z_flat_g = [0.0, 0.0])
+    cu = unconstrain(clay, cq)
+    csd = _query(cbuilt.spec, cbound, :prior, cu) - rest
+    @test csd ≈ logpdf(Normal(), 1.2)
+    cll = _query(cbuilt.spec, cbound, :likelihood, cu)
+    cpr = _query(cbuilt.spec, cbound, :prior, cu)
+    @test _query(cbuilt.spec, cbound, :posterior, cu) ≈ cll + cpr + log(1.2)
 end
 
 @testset "varying correlated names" begin

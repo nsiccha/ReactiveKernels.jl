@@ -722,7 +722,21 @@ One shared varying-effect draws block: non-centered geometry over
 `kind` is `:intercept1` (single-`1` without eta: log-scale/xi
 geometry), `:slope1` (single slope without eta: tau/xi geometry), or
 `:correlated` (LKJ + tau + z_flat; K >= 2, or K = 1 with eta given —
-the vacuous-1x1-LKJ route). `label` is the link identity
+the vacuous-1x1-LKJ route). The K=1 sd geometries are deliberately
+asymmetric, mirroring StanBlocks-BRMI (SB) equation-for-equation: an
+intercept margin samples its sd in log space (`log_scale ~ Normal(0,
+1)`, effect `exp(log_scale) * xi` — a LogNormal(0, 1) sd), while a
+slope margin samples a half-normal sd (`tau ~ Normal(0, 1)` on
+`tau > 0` plus the `exp`-layout Jacobian). SB itself is asymmetric
+the same way (`ranef_intercept` / `ranef_intercept_draws` are
+log-scale, `ranef_slope` / `ranef_correlated_draws` are half-normal
+Stan lower-bound kernels): the intercept side mirrors VBRMI's
+`chol` 1x1 collapse (`log_scale ~ N(0,1)`, `L[1,1] =
+exp(log_scale)`), pinned by SB's `sb.3` smoke tests — there is no
+half-normal plain-`(1 | g)` spelling in SB. So a K=1 intercept
+without eta is lognormal here too; passing `eta` routes through
+vacuous-`:correlated` and recovers the half-normal sd (LKJ
+contributes nothing at 1x1). `label` is the link identity
 (`:draws_<suffix>`); `suffix` is the in-graph naming stem (the group,
 or `group_binding` when two draws share a grouping). `levels` is the
 grouping's DECLARED levels in numbering order (`nothing` pre-bind, or
