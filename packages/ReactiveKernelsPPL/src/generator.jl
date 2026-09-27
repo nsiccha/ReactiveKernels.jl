@@ -1494,15 +1494,17 @@ function _gaussian_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, lpv::Symbo
         end
         return :($base - $corr)
     elseif kind === :censored
+        # Clamp law (Y = clamp(X)): at-bound rows are censored observations,
+        # so the arms are non-strict (SB parity pair mod-weights).
         if lb === nothing && ub === nothing
             return base
         elseif lb === nothing
-            return :(ifelse($yv > $ub, log1p(-$(nccdf(ub))), $base))
+            return :(ifelse($yv >= $ub, log1p(-$(nccdf(ub))), $base))
         elseif ub === nothing
-            return :(ifelse($yv < $lb, log($(nccdf(lb))), $base))
+            return :(ifelse($yv <= $lb, log($(nccdf(lb))), $base))
         else
-            return :(ifelse($yv < $lb, log($(nccdf(lb))),
-                ifelse($yv > $ub, log1p(-$(nccdf(ub))), $base)))
+            return :(ifelse($yv <= $lb, log($(nccdf(lb))),
+                ifelse($yv >= $ub, log1p(-$(nccdf(ub))), $base)))
         end
     else # :interval_censored
         return :(log($(nccdf(ub)) - $(nccdf(yv))))
@@ -1619,10 +1621,13 @@ function _zip_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
 end
 
 # Lower-side cdf argument for the inclusive discrete cdf: the mass below
-# lb is F(lb - 1), so truncated/censored low arms shift their lower
-# argument by one (interval cells stay unshifted — the response is the
-# open lower endpoint). Int literals fold; do-vars convert via Int
-# (cdf takes Int, which also hardens non-Int Integer columns). The kernel's
+# lb is F(lb - 1), so TRUNCATED low arms shift their lower argument by one
+# (interval cells stay unshifted — the response is the open lower
+# endpoint). CENSORED arms instead follow the clamp law (Y = clamp(X)):
+# yv ≤ lb takes F(lb) unshifted (the at-bound mass includes F(lb)), while
+# yv ≥ ub takes 1 - F(ub-1) (the shift moves to the upper arm — Y = ub
+# means X ≥ ub). Int literals fold; do-vars convert via Int (cdf takes
+# Int, which also hardens non-Int Integer columns). The kernel's
 # `observed >= 0` guard maps -1 to 0.0, so no clamp is needed.
 _poisson_below(b::Int) = b - 1
 _poisson_below(b::Symbol) = :(Int($b) - 1)
@@ -1645,12 +1650,12 @@ function _poisson_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, etav::Symbo
         if lb === nothing && ub === nothing
             return base
         elseif lb === nothing
-            return :(ifelse($yv > $ub, log1p(-$(pcdf(ub))), $base))
+            return :(ifelse($yv >= $ub, log1p(-$(pcdf(_poisson_below(ub)))), $base))
         elseif ub === nothing
-            return :(ifelse($yv < $lb, log($(pcdf(_poisson_below(lb)))), $base))
+            return :(ifelse($yv <= $lb, log($(pcdf(lb))), $base))
         else
-            return :(ifelse($yv < $lb, log($(pcdf(_poisson_below(lb)))),
-                ifelse($yv > $ub, log1p(-$(pcdf(ub))), $base)))
+            return :(ifelse($yv <= $lb, log($(pcdf(lb))),
+                ifelse($yv >= $ub, log1p(-$(pcdf(_poisson_below(ub)))), $base)))
         end
     else # :interval_censored
         # Open below per the brm-use contract (`log(CDF(upper) -

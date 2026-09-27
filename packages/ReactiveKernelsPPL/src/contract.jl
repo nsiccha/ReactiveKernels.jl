@@ -148,6 +148,8 @@ evidence). Bounds are literals or [`ColumnRef`](@ref)s. For
 `:interval_censored` the response itself is the lower endpoint, so `lower`
 must be `nothing` and `upper` is required. The interval is open below:
 the cell is `log(CDF(upper) - CDF(response))` for `(response, upper]`.
+`:censored` is the clamp law (`Y = clamp(X)`): rows at a bound take the
+CDF mass (`yv ≤ lower` / `yv ≥ upper`), never the density.
 """
 struct ResponseEvidence
     kind::Symbol # :none | :truncated | :censored | :interval_censored
