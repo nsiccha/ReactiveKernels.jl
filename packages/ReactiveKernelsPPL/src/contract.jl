@@ -164,10 +164,11 @@ end
     ScalePredictorRef(predictor, link)
 
 A predictor-fed scale/shape use: the response's auxiliary (Gaussian
-sigma, NB2 dispersion phi, Gamma shape alpha, Student sigma, hurdle
-p_zero, VonMises concentration kappa; InverseGaussian lambda, Beta
-kappa, BetaBinomial2 phi, NB1 p, LogNormal sigma, and Weibull k stay
-scalar-only) is a whole linear predictor, varying per observation.
+sigma, NB2 dispersion phi, Gamma shape alpha, Beta concentration
+kappa, Student sigma, hurdle p_zero, VonMises concentration kappa;
+InverseGaussian lambda, BetaBinomial2 phi, NB1 p, LogNormal sigma,
+and Weibull k stay scalar-only) is a whole linear predictor, varying
+per observation.
 `predictor` names the
 [`PredictorSpec`](@ref) (planned exactly like a location predictor:
 terms, priors, one link); `link` is the scale use-site wrapper —
@@ -192,18 +193,19 @@ InverseGaussian shape lambda, BetaBinomial2 precision phi, VonMises
 concentration kappa, NB1 success probability p, LogNormal scale sigma,
 Weibull shape k — either scalar (parameter, assignment, folded
 literal, or a raw per-observation data column) or, for
-Gaussian/NB2/Gamma/Student/hurdle/VonMises only, a
+Gaussian/NB2/Gamma/Beta/Student/hurdle/VonMises only, a
 [`ScalePredictorRef`](@ref) (predictor-fed per-observation auxiliary);
 it must be `nothing` otherwise. A hurdle p_zero is a probability
 (scalar in [0, 1], predictor-fed logit-only). An NB1 p is a probability
 too (scalar in [0, 1], or a raw per-observation data column;
-predictor-fed p deferred, the BetaBinomial2 precedent). A VonMises kappa is
+predictor-fed p deferred, the BetaBinomial2 precedent). A Beta or
+VonMises kappa is
 predictor-fed log-only (a concentration). An InverseGaussian
-lambda is scalar-only (predictor-fed lambda deferred, the Beta-kappa
-precedent); a BetaBinomial2 phi is scalar-only (predictor-fed phi
-deferred, the same precedent); a LogNormal sigma is scalar-only
-(predictor-fed sigma deferred, the same precedent); a Weibull k is
-scalar-only (predictor-fed k deferred, the same precedent).
+lambda is scalar-only (predictor-fed lambda deferred);
+a BetaBinomial2 phi is scalar-only (predictor-fed phi
+deferred); a LogNormal sigma is scalar-only
+(predictor-fed sigma deferred); a Weibull k is scalar-only
+(predictor-fed k deferred).
 (One slot covers every admitted family; a two-auxiliary family such as
 Beta needs a new field — noted, not built.) `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
@@ -7200,17 +7202,17 @@ function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
 end
 
 # A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha,
-# Student sigma, hurdle p_zero, VonMises kappa; Beta kappa,
+# Beta kappa, Student sigma, hurdle p_zero, VonMises kappa;
 # InverseGaussian lambda, BetaBinomial2 phi, NB1 p, LogNormal sigma,
 # and Weibull k are deferred above):
 # the predictor exists, carries the use-site link (the
 # one-link-per-predictor rule), and is not the response's own location
 # predictor (the two slots take distinct predictors — the BRM-side plan
-# rule, mirrored here as defense in depth). Beta-kappa predictors are
-# deferred; predictor-fed Binomial trials likewise (trials stay
-# column-or-literal by type). A hurdle p_zero predictor is logit-only (a
-# probability); a VonMises kappa predictor is log-only (a concentration);
-# the remaining admitted scale families take identity/log/logit.
+# rule, mirrored here as defense in depth). Predictor-fed Binomial
+# trials are deferred (trials stay column-or-literal by type). A hurdle
+# p_zero predictor is logit-only (a probability); a Beta or VonMises
+# kappa predictor is log-only (a concentration); the remaining admitted
+# scale families take identity/log/logit.
 function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
         s::ScalePredictorRef)
     return _validate_scale_predictor_use(r, plan, s, r.family, [r.predictor])
@@ -7219,9 +7221,6 @@ end
 function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
         s::ScalePredictorRef, fam::LikelihoodFamily,
         forbidden::Vector{Symbol})
-    fam === BetaLogitFam && _fail(r.label,
-        "Beta response with a scale predictor: predictor-fed concentration " *
-        "(kappa) is deferred — use a scalar kappa (parameter or literal)")
     fam === InverseGaussianFam && _fail(r.label,
         "InverseGaussian response with a scale predictor: predictor-fed " *
         "shape (lambda) is deferred — use a scalar lambda (parameter or literal)")
@@ -7241,7 +7240,8 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
         "shape (k) is deferred — use a scalar k (parameter, literal, " *
         "or data column)")
     (fam === GaussianFam || fam === NegativeBinomial2Fam ||
-        fam === GammaLogFam || fam === StudentTFam ||
+        fam === GammaLogFam || fam === BetaLogitFam ||
+        fam === StudentTFam ||
         fam === HurdlePoissonFam || fam === VonMisesFam) ||
         _fail(r.label, "this response family takes no scale predictor")
     if fam === HurdlePoissonFam
@@ -7251,6 +7251,10 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
     elseif fam === VonMisesFam
         s.link === LogLink ||
             _fail(r.label, "VonMises kappa predictor link must be log " *
+                "(a concentration — got $(s.link))")
+    elseif fam === BetaLogitFam
+        s.link === LogLink ||
+            _fail(r.label, "Beta kappa predictor link must be log " *
                 "(a concentration — got $(s.link))")
     else
         (s.link === IdentityLink || s.link === LogLink ||

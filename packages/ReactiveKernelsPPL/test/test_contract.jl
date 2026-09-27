@@ -890,8 +890,7 @@ end
                 _none_evidence(), :y_resp)
         @test_throws ContractValidationError validate_plan(bad)
     end
-    # Predictor-fed k is deferred (the Beta-kappa precedent), on every
-    # link.
+    # Predictor-fed k is deferred, on every link.
     for link in (IdentityLink, LogLink, LogitLink)
         bad = _weibull_plan()
         push!(bad.predictors, PredictorSpec(:ls, link, _terms(), :ls))
