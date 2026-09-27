@@ -273,6 +273,67 @@ end
     _check_gradient(wbuilt.spec, wplan, u)
 end
 
+function _gen_weighted_bernoulli_plan(y, fam = BernoulliLogitFam,
+        link = LogitLink)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    cols[:w] = [1.0, 2.0, 1.0, 1.0, 2.0, 1.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(fam, link, :y, :eta, nothing, :w,
+            _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+# Bernoulli plate Bool normalization (snag `bernoulli-int-la-78487520`):
+# Int 0/1 responses read Bool lanes through a bind-folded `_ppl_yb_`
+# recipe — never an in-cell `yv != 0` comparison, which
+# misdifferentiates under native Enzyme in some plate shapes (-10.10 vs
+# true -4.97, NaN on perturbation). Bool columns skip the recipe.
+@testset "bernoulli plate Int-y Bool normalization" begin
+    u = [0.25, 0.5]
+    # Weighted logit Int: recipe present, no scalar comparison in the
+    # program, values match the Bool twin, gradient matches findiff.
+    iplan = _gen_weighted_bernoulli_plan(repeat([0, 1], 3))
+    ibuilt = build_kernel(iplan)
+    iex = kernel_expr(iplan, ibuilt.layout)
+    @test _has_sym(iex, :_ppl_yb_y_resp)
+    @test !_has_call(iex, :!=)
+    bplan = _gen_weighted_bernoulli_plan(repeat([false, true], 3))
+    bbuilt = build_kernel(bplan)
+    bex = kernel_expr(bplan, bbuilt.layout)
+    @test !_has_sym(bex, :_ppl_yb_y_resp)
+    @test _query(ibuilt.spec, iplan, :posterior, u) ≈
+        _query(bbuilt.spec, bplan, :posterior, u)
+    _check_gradient(ibuilt.spec, iplan, u)
+    # Ranged logit Int: plate route matches the fused density, gradient
+    # matches findiff.
+    fplan = _gen_bernoulli_plan(repeat([0, 1], 3))
+    fbuilt = build_kernel(fplan)
+    rplan = _gen_ranged_plan(fplan, 1:6)
+    rbuilt = build_kernel(rplan)
+    rex = kernel_expr(rplan, rbuilt.layout)
+    @test _has_sym(rex, :_ppl_yb_y_resp)
+    @test !_has_call(rex, :!=)
+    @test _query(rbuilt.spec, rplan, :posterior, u) ≈
+        _query(fbuilt.spec, fplan, :posterior, u)
+    _check_gradient(rbuilt.spec, rplan, u)
+    # Weighted probit/cloglog Int: recipe present, no scalar
+    # comparison, gradient matches findiff.
+    for (fam, link) in
+            ((BernoulliProbitFam, ProbitLink), (BernoulliCloglogFam, CloglogLink))
+        lplan = _gen_weighted_bernoulli_plan(repeat([0, 1], 3), fam, link)
+        lbuilt = build_kernel(lplan)
+        lex = kernel_expr(lplan, lbuilt.layout)
+        @test _has_sym(lex, :_ppl_yb_y_resp)
+        @test !_has_call(lex, :!=)
+        _check_gradient(lbuilt.spec, lplan, u)
+    end
+end
+
 function _gen_binomial_plan(y, trials)
     cols, n = _gen_columns()
     cols[:y] = y
@@ -764,6 +825,44 @@ function _ref_vm_circ(cols, coef, kap, lo, hi)
     end
 end
 
+function _gen_exp_plan()
+    cols, n = _gen_columns()
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(ExponentialLogFam, LogLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _gen_ln_plan(; sigma = :sigma)
+    cols, n = _gen_columns()
+    params = sigma isa Symbol ? SampledParameter[
+        SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(LogNormalFam, IdentityLink, :y, :mu,
+            sigma, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_exp(cols, coef)
+    mu = exp.(coef[1] .+ coef[2] .* cols[:x])
+    return sum(logpdf(Exponential(m), y) for (y, m) in zip(cols[:y], mu))
+end
+
+function _ref_ln(cols, coef, sig)
+    mu = coef[1] .+ coef[2] .* cols[:x]
+    return sum(logpdf(LogNormal(m, sig), y) for (y, m) in zip(cols[:y], mu))
+end
+
 @testset "ig values and gradient" begin
     plan = _gen_ig_plan()
     built = build_kernel(plan)
@@ -976,6 +1075,80 @@ end
     mu = Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* cols[:x]
     ll = sum(cols[:w] .*
         [logpdf(VonMises(m, 1.7), y) for (y, m) in zip(cols[:y], mu)])
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "exponential values and gradient" begin
+    plan = _gen_exp_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_exp(plan.columns, Vector(nt.eta))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "lognormal values and gradient" begin
+    plan = _gen_ln_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_ln(plan.columns, Vector(nt.mu), nt.sigma)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Exponential(1), nt.sigma)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "lognormal literal-sigma values" begin
+    plan = _gen_ln_plan(; sigma = 0.5)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_ln(plan.columns, Vector(nt.mu), 0.5)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted exponential values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(ExponentialLogFam, LogLink, :y, :eta,
+            nothing, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = exp.(Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x])
+    ll = sum(cols[:w] .*
+        [logpdf(Exponential(m), y) for (y, m) in zip(cols[:y], mu)])
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted lognormal values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(LogNormalFam, IdentityLink, :y, :mu,
+            0.5, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* cols[:x]
+    ll = sum(cols[:w] .*
+        [logpdf(LogNormal(m, 0.5), y) for (y, m) in zip(cols[:y], mu)])
     pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, plan, u)

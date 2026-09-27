@@ -911,6 +911,91 @@ end
     @test r.scale == ScalePredictorRef(:lk, LogLink)
 end
 
+@testset "surface roundtrip exponential end to end" begin
+    cols, _ = _gen_columns()
+    m = @rkppl begin
+        eta = a .+ b .* x
+        y .~ Exponential.(exp.(eta))
+    end
+    @test m isa RKPPLModel
+    r = only(lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ Exponential.(exp.(eta))
+    end, (:y, :x)).responses)
+    @test (r.family, r.link, r.predictor, r.scale) ===
+        (ExponentialLogFam, LogLink, :eta, nothing)
+    @test r.weights === nothing
+    @test r.evidence.kind === :none
+    bound = m(; y = cols[:y], x = cols[:x])
+    @test isbound(bound)
+    built = build_kernel(bound)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    ll = sum(logpdf(Exponential(m), y) for (y, m) in zip(cols[:y], mu))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+end
+
+# LogNormal scalar log-density (Distributions.jl oracle; Stan
+# `lognormal_lpdf` matches it operation-for-operation).
+_ln_logpdf(y::Real, mu::Real, sig::Real) = logpdf(LogNormal(mu, sig), y)
+
+@testset "surface roundtrip lognormal end to end" begin
+    cols, _ = _gen_columns()
+    # Literal sigma.
+    m = @rkppl begin
+        mu = a .+ b .* x
+        y .~ LogNormal.(mu, 0.5)
+    end
+    @test m isa RKPPLModel
+    r = only(lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ LogNormal.(mu, 0.5)
+    end, (:y, :x)).responses)
+    @test (r.family, r.link, r.predictor, r.scale) ===
+        (LogNormalFam, IdentityLink, :mu, 0.5)
+    bound = m(; y = cols[:y], x = cols[:x])
+    @test isbound(bound)
+    built = build_kernel(bound)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    ll = sum(_ln_logpdf(y, mm, 0.5) for (y, mm) in zip(cols[:y], mu))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    # Exponential-sampled sigma.
+    m = @rkppl begin
+        sigma ~ Exponential(1)
+        mu = a .+ b .* x
+        y .~ LogNormal.(mu, sigma)
+    end
+    r = only(lower_rkppl(quote
+        sigma ~ Exponential(1)
+        mu = a .+ b .* x
+        y .~ LogNormal.(mu, sigma)
+    end, (:y, :x)).responses)
+    @test (r.family, r.scale) === (LogNormalFam, :sigma)
+    @test only(lower_rkppl(quote
+        sigma ~ Exponential(1)
+        mu = a .+ b .* x
+        y .~ LogNormal.(mu, sigma)
+    end, (:y, :x)).parameters).family === :exponential
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    u3 = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u3)
+    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    ll = sum(_ln_logpdf(y, mm, nt.sigma) for (y, mm) in zip(cols[:y], mu))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
+        logpdf(Exponential(1), nt.sigma)
+    @test _query(built.spec, bound, :posterior, u3) ≈
+        ll + pr + logjac(built.layout, u3)
+    _check_gradient(built.spec, bound, u3)
+end
+
 @testset "ig response failures" begin
     Dn2 = (:y, :x)
     # Arity: exactly (mu, lambda).
@@ -1068,6 +1153,67 @@ end
         mu = a .+ b .* x
         lk = c .+ d .* x
         y .~ VonMises.(mu, lk)
+    end, Dn2)
+end
+
+@testset "exponential response failures" begin
+    Dn2 = (:y, :x)
+    # Arity: exactly (mu,).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ Exponential.(exp.(eta), 1.5)
+    end, Dn2)
+    # The kernel-endpoint spelling redirects to the response head.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ exponential.(exp.(eta))
+    end, Dn2)
+    # The mu position needs its `exp.` link wrapper (Poisson precedent).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ Exponential.(eta)
+    end, Dn2)
+    # No fused `ExponentialLog` head (recent slices stay decomposed-only).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ ExponentialLog.(eta)
+    end, Dn2)
+end
+
+@testset "lognormal response failures" begin
+    Dn2 = (:y, :x)
+    # Arity: exactly (mu, sigma).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ LogNormal.(mu)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ LogNormal.(mu, 0.5, 1.0)
+    end, Dn2)
+    # The kernel-endpoint spelling redirects to the response head.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ lognormal.(mu, 0.5)
+    end, Dn2)
+    # The mu position takes the bare identity predictor — an `exp(mu)`
+    # spelling fails closed at bind (the Normal precedent: the synth
+    # offset references the unknown coefficient name).
+    @test_throws ContractValidationError bind_data(lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ LogNormal.(exp.(mu), 0.5)
+        end, Dn2),
+        Dict{Symbol,AbstractVector}(:y => [0.7], :x => [0.5]))
+    # A modeled-sigma predictor fails at the contract gate (deferred).
+    @test_throws ContractValidationError lower_rkppl(quote
+        mu = a .+ b .* x
+        ls = c .+ d .* x
+        y .~ LogNormal.(mu, exp.(ls))
+    end, Dn2)
+    @test_throws ContractValidationError lower_rkppl(quote
+        mu = a .+ b .* x
+        ls = c .+ d .* x
+        y .~ LogNormal.(mu, ls)
     end, Dn2)
 end
 

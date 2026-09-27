@@ -103,6 +103,8 @@ univariate components, SB `MixtureModel` mirror)."""
     BetaBinomial2Fam
     VonMisesFam
     NegativeBinomialFam
+    ExponentialLogFam
+    LogNormalFam
     WeibullFam
 end
 
@@ -164,8 +166,8 @@ end
 A predictor-fed scale/shape use: the response's auxiliary (Gaussian
 sigma, NB2 dispersion phi, Gamma shape alpha, Student sigma, hurdle
 p_zero, VonMises concentration kappa; InverseGaussian lambda, Beta
-kappa, BetaBinomial2 phi, NB1 p, and Weibull k stay scalar-only) is a
-whole linear predictor, varying per observation.
+kappa, BetaBinomial2 phi, NB1 p, LogNormal sigma, and Weibull k stay
+scalar-only) is a whole linear predictor, varying per observation.
 `predictor` names the
 [`PredictorSpec`](@ref) (planned exactly like a location predictor:
 terms, priors, one link); `link` is the scale use-site wrapper —
@@ -187,9 +189,10 @@ end
 One independent response. `scale` is the response's auxiliary —
 Gaussian sigma, NB2 dispersion phi, Gamma shape alpha, hurdle p_zero,
 InverseGaussian shape lambda, BetaBinomial2 precision phi, VonMises
-concentration kappa, NB1 success probability p, Weibull shape k — either
-scalar (parameter, assignment, folded literal, or a raw per-observation
-data column) or, for Gaussian/NB2/Gamma/Student/hurdle/VonMises only, a
+concentration kappa, NB1 success probability p, LogNormal scale sigma,
+Weibull shape k — either scalar (parameter, assignment, folded
+literal, or a raw per-observation data column) or, for
+Gaussian/NB2/Gamma/Student/hurdle/VonMises only, a
 [`ScalePredictorRef`](@ref) (predictor-fed per-observation auxiliary);
 it must be `nothing` otherwise. A hurdle p_zero is a probability
 (scalar in [0, 1], predictor-fed logit-only). An NB1 p is a probability
@@ -198,8 +201,9 @@ predictor-fed p deferred, the BetaBinomial2 precedent). A VonMises kappa is
 predictor-fed log-only (a concentration). An InverseGaussian
 lambda is scalar-only (predictor-fed lambda deferred, the Beta-kappa
 precedent); a BetaBinomial2 phi is scalar-only (predictor-fed phi
-deferred, the same precedent); a Weibull k is scalar-only
-(predictor-fed k deferred, the same precedent).
+deferred, the same precedent); a LogNormal sigma is scalar-only
+(predictor-fed sigma deferred, the same precedent); a Weibull k is
+scalar-only (predictor-fed k deferred, the same precedent).
 (One slot covers every admitted family; a two-auxiliary family such as
 Beta needs a new field — noted, not built.) `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
@@ -854,8 +858,10 @@ end
     SplineVector(name, family, args, support_override, width, basis, label)
 
 One free spline coefficient block (SB `_sb_s_generic`/`_sb_t2_generic`):
-flat `b_fixed`, standard-normal `b_*_raw`, half-normal `sd` (`:normal`
-+ `:positive`). `width` is static from `k`; `basis` is the owning
+flat `b_fixed`, standard-normal `b_*_raw`, Stan-kernel half-normal `sd`
+(`:normal` + `:positive_stan` — plain `_lpdf` plus the bare-`u` Jacobian,
+NO truncation renormalizer, matching SB which never renormalizes
+bounds). `width` is static from `k`; `basis` is the owning
 [`SplineBasis`](@ref) id. Layout packs each as one contiguous block
 (plate-shaped); priors broadcast over cells.
 """
@@ -1033,7 +1039,8 @@ declarations the cell calls address; `obs` the in-cell observation
 LIST (one per response axis); `timepoints` is always `nothing`
 (ragged axes have no rectangular T). The cell vocabulary is calls to
 [`CELL_FNS`](@ref), schedule-map gathers, and arithmetic (no flat
-dotify — the generator unrolls per subject).
+dotify — the generator emits one subject-batched `_over_subjects`
+statement per assignment).
 """
 struct KernelPlate
     result::Symbol
@@ -1467,6 +1474,8 @@ const ADMITTED_TRIPLES = (
     (BetaBinomial2Fam, LogitLink, IdentityLink),
     (VonMisesFam, IdentityLink, IdentityLink),
     (NegativeBinomialFam, LogLink, LogLink),
+    (ExponentialLogFam, LogLink, LogLink),
+    (LogNormalFam, IdentityLink, IdentityLink),
     (WeibullFam, LogLink, LogLink),
 )
 
@@ -1576,7 +1585,7 @@ function _spline_vector_specs(id::Symbol, kind::Symbol, k)
         end
     end
     nsd = kind === :tps ? 1 : 3
-    push!(specs, (sd, :normal, (arg1=0, arg2=1), :positive, nsd))
+    push!(specs, (sd, :normal, (arg1=0, arg2=1), :positive_stan, nsd))
     return specs
 end
 
@@ -1858,7 +1867,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
     ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
-    NegativeBinomialFam, WeibullFam)
+    NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -6852,7 +6861,8 @@ function _validate_responses(plan::StructuralPlan)
             "Poisson-log, Binomial-logit/probit/cloglog, NB2-log, Gamma-log, " *
             "Beta-logit, Categorical-logit, Ordered-logit, Ordinal spellings, " *
             "Student-identity, Hurdle-Poisson-log, ZIP-log, " *
-            "InverseGaussian-log, BetaBinomial2-logit, VonMises-identity)",
+            "InverseGaussian-log, BetaBinomial2-logit, VonMises-identity, " *
+            "Exponential-log, LogNormal-identity)",
         )
         _validate_scale(r, plan)
         _validate_nu(r, plan)
@@ -6936,6 +6946,16 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         (eltype(col) <: Real && all(>(0), col)) ||
             _fail(r.label, "InverseGaussian response must be strictly positive numerics")
         return nothing
+    elseif r.family === ExponentialLogFam
+        # Non-negative (0 is valid: Exponential(μ) logpdf at 0 is finite):
+        # the exponential kernel guards y >= 0 (SB `exponential_lpdf`
+        # returns -inf at y < 0) — fail closed instead of flowing a
+        # wrong value. Bool is not a continuous support (the VonMises
+        # precedent).
+        (eltype(col) <: Real && !(eltype(col) <: Bool) &&
+            all(>=(0), col)) ||
+            _fail(r.label, "Exponential response must be non-negative numerics")
+        return nothing
     elseif r.family === WeibullFam
         # Strictly positive: the Weibull kernel guards y > 0 (Stan
         # `weibull_lpdf` rejects y < 0 and returns -inf at y = 0 for
@@ -6959,6 +6979,15 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
                 _fail(r.label, "CircularVonMises response must lie in " *
                     "[$(lo), $(hi))")
         end
+        return nothing
+    elseif r.family === LogNormalFam
+        # Strictly positive (Bool is not a positive-continuous support):
+        # the lognormal kernel guards y > 0 (Stan `lognormal_lpdf`
+        # returns -inf at y ≤ 0) — fail closed instead of flowing a
+        # wrong value.
+        (eltype(col) <: Real && !(eltype(col) <: Bool) &&
+            all(>(0), col)) ||
+            _fail(r.label, "LogNormal response must be strictly positive numerics")
         return nothing
     elseif r.family === GaussianFam
         eltype(col) <: Real ||
@@ -7121,6 +7150,7 @@ _scale_need(fam::LikelihoodFamily) =
     fam === BetaBinomial2Fam ? "BetaBinomial2 response requires a precision phi" :
     fam === VonMisesFam ? "VonMises response requires a concentration kappa" :
     fam === NegativeBinomialFam ? "NB1 response requires a success probability p" :
+    fam === LogNormalFam ? "LogNormal response requires a scale sigma" :
     fam === WeibullFam ? "Weibull response requires a shape k" : nothing
 
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
@@ -7171,8 +7201,8 @@ end
 
 # A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha,
 # Student sigma, hurdle p_zero, VonMises kappa; Beta kappa,
-# InverseGaussian lambda, BetaBinomial2 phi, NB1 p, and Weibull k are
-# deferred above):
+# InverseGaussian lambda, BetaBinomial2 phi, NB1 p, LogNormal sigma,
+# and Weibull k are deferred above):
 # the predictor exists, carries the use-site link (the
 # one-link-per-predictor rule), and is not the response's own location
 # predictor (the two slots take distinct predictors — the BRM-side plan
@@ -7201,6 +7231,10 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
     fam === NegativeBinomialFam && _fail(r.label,
         "NB1 response with a scale predictor: predictor-fed " *
         "success probability (p) is deferred — use a scalar p (parameter, " *
+        "literal, or data column)")
+    fam === LogNormalFam && _fail(r.label,
+        "LogNormal response with a scale predictor: predictor-fed " *
+        "scale (sigma) is deferred — use a scalar sigma (parameter, " *
         "literal, or data column)")
     fam === WeibullFam && _fail(r.label,
         "Weibull response with a scale predictor: predictor-fed " *
@@ -7706,7 +7740,8 @@ const CELL_FN_RESULT_SPACE = Dict{Symbol,Symbol}(
 # obs/read operands fail closed (write the dotted form — the panel
 # precedent); dotted ops over mismatched axis lengths fail closed
 # naming the axes. Assignments pass through UNCHANGED (no flat dotify
-# — the generator unrolls per subject); this pass only proves shapes.
+# — the generator emits one subject-batched `_over_subjects` statement
+# per assignment); this pass only proves shapes.
 function _grouped_cell_shapes(kp::KernelPlate,
         slices::Vector{Tuple{Symbol,Symbol,Symbol}},
         columns::Dict{Symbol,ColumnData})
@@ -8191,6 +8226,12 @@ function _resolve_kernels!(plan::StructuralPlan,
                 _fail(kp.label, "column `$exp` is reserved for kernel " *
                       "plate `$(kp.result)`'s flat expansion of `$col` — " *
                       "rename the caller-supplied column")
+            # Numeric gate ahead of the T-block conversion (data
+            # validation's twin check runs after this resolve — without
+            # this, a String/Symbol column dies as a raw MethodError).
+            eltype(colv) <: Real ||
+                _fail(kp.label, "slice column `$col` must be numeric, " *
+                      "got $(eltype(colv))")
             columns[exp] = repeat(Vector{Float64}(colv); inner = T)
         end
     end

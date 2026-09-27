@@ -5020,6 +5020,8 @@ function _dot2call_spine_arg(lhs, f, i, a)
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :InverseGaussian && i == 1
         return _dot2call_nested_link(lhs, a, f)
+    elseif f === :Exponential && i == 1
+        return _dot2call_nested_link(lhs, a, f)
     elseif f === :BetaBinomial2 && i == 2
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :Weibull && i == 2
@@ -5150,10 +5152,12 @@ const _RESPONSE_BASE_MSG =
     "`HurdlePoisson.(exp.(eta), p_zero)`, " *
     "`ZeroInflatedPoisson.(exp.(eta), zi)`, " *
     "`InverseGaussian.(exp.(eta), lambda)`, " *
+    "`Exponential.(exp.(eta))`, " *
     "`Gamma.(alpha, exp.(eta) ./ alpha)`, " *
     "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`, " *
     "`BetaBinomial2.(n, logistic.(mu), phi)`, " *
     "`VonMises.(mu, kappa)`, `CircularVonMises.(mu, kappa, lo, hi)`, " *
+    "`LogNormal.(mu, sigma)`, " *
     "`CategoricalLogit.(eta_2, ..., eta_K)`, `OrderedLogistic.(eta)`, " *
     "`Ordinal.(Cumulative(), LogitLink(), eta)`, " *
     "`Multinomial.(N, s, c2, ..., cK)`, or `Categorical.(s)` " *
@@ -5170,10 +5174,9 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         _sfail("`weighted.(...)` goes outermost: " *
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
     fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
-        :NegativeBinomial2, :NegativeBinomial, :Weibull, :Gamma, :Beta,
-        :HurdlePoisson,
-        :ZeroInflatedPoisson, :InverseGaussian, :BetaBinomial2,
-        :VonMises, :CircularVonMises) ||
+        :NegativeBinomial2, :NegativeBinomial, :Gamma, :Beta, :HurdlePoisson,
+        :ZeroInflatedPoisson, :InverseGaussian, :Exponential, :BetaBinomial2,
+        :VonMises, :CircularVonMises, :LogNormal, :Weibull) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
@@ -5248,6 +5251,12 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         return InverseGaussianFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
         nothing, nothing
+    elseif fam === :Exponential
+        length(args) == 1 || _sfail("response $lhs: `Exponential` takes " *
+                                    "`Exponential.(exp.(eta))`")
+        return ExponentialLogFam, LogLink, LogLink,
+        _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
+        nothing, nothing
     elseif fam === :VonMises
         length(args) == 2 || _sfail("response $lhs: `VonMises` takes " *
                                     "`VonMises.(mu, kappa)`")
@@ -5258,6 +5267,11 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
                                     "`CircularVonMises.(mu, kappa, lo, hi)`")
         return VonMisesFam, IdentityLink, IdentityLink, args[1], args[2],
         nothing, nothing, nothing, (args[3], args[4])
+    elseif fam === :LogNormal
+        length(args) == 2 || _sfail("response $lhs: `LogNormal` takes " *
+                                    "`LogNormal.(mu, sigma)`")
+        return LogNormalFam, IdentityLink, IdentityLink, args[1], args[2],
+        nothing, nothing, nothing, nothing
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
@@ -5385,6 +5399,9 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :inverse_gaussian && _sfail("response $lhs: use " *
                                         "`InverseGaussian` (the response " *
                                         "spelling, not the kernel endpoint)")
+    fam === :exponential && _sfail("response $lhs: use " *
+                                   "`Exponential` (the response " *
+                                   "spelling, not the kernel endpoint)")
     fam === :beta_binomial2 && _sfail("response $lhs: use " *
                                       "`BetaBinomial2` (the response " *
                                       "spelling, not the kernel endpoint)")
@@ -5394,6 +5411,9 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :circular_von_mises && _sfail("response $lhs: use " *
                                           "`CircularVonMises` (the response " *
                                           "spelling, not the kernel endpoint)")
+    fam === :lognormal && _sfail("response $lhs: use " *
+                                 "`LogNormal` (the response " *
+                                 "spelling, not the kernel endpoint)")
     fam === :OrderedLogit && _sfail("response $lhs: unknown distribution " *
                                     "`:OrderedLogit` (write " *
                                     "`OrderedLogistic.(eta)`)")
@@ -5405,8 +5425,8 @@ function _lower_response_base_error(lhs, rhs, fam)
                   "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
                   "NegativeBinomial2, NegativeBinomial, Weibull, " *
                   "HurdlePoisson, ZeroInflatedPoisson, " *
-                  "InverseGaussian, BetaBinomial2, VonMises, " *
-                  "CircularVonMises, Gamma, Beta, " *
+                  "InverseGaussian, Exponential, BetaBinomial2, VonMises, " *
+                  "CircularVonMises, LogNormal, Gamma, Beta, " *
                   "BernoulliLogit, " *
                   "PoissonLog, BinomialLogit, NegativeBinomial2Log, " *
                   "GammaLog, BetaLogit, CategoricalLogit, " *

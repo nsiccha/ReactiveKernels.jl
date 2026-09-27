@@ -149,30 +149,45 @@ function _report_findiff(f, u)
     return g
 end
 
+# Bound-prepare split for multi-probe drivers: lowering/binding/building
+# happen once, then each probe runs value + gradient through the same query.
+# `_run_pipeline` below keeps its exact behavior on top of these two.
+function _prepare_bound_report(bound)
+    built = build_kernel(bound)
+    kern = prepare_query(built, bound, :sampler)
+    return (; bound, built, kern, n = built.layout.total)
+end
+
+function _run_report_probe(prep, u_probe; backend = nothing)
+    u = u_probe === nothing ? zeros(Float64, prep.n) : Vector{Float64}(u_probe)
+    length(u) == prep.n || throw(ArgumentError(
+        "probe point has length $(length(u)), layout needs $(prep.n)"))
+    val = Base.invokelatest(prep.kern, u)
+    grad_line, grad_ok, grad_maxdiff = if backend === nothing
+        "gradient cross-check: not run (no AD backend in this environment)",
+        nothing, nothing
+    else
+        q = prepare_sampler(prep.built, prep.bound, u; backend = backend)
+        v2, g = sampler_value_and_gradient!(q, similar(u), u)
+        ref = _report_findiff(w -> Base.invokelatest(prep.kern, w), u)
+        ok = all(isfinite, g) && isapprox(g, ref; rtol = 1e-5, atol = 1e-7)
+        err = maximum(abs.(g .- ref))
+        "gradient cross-check: AD vs central differences, max|Δ| = $err " *
+            (ok ? "PASS" : "FAIL"), ok, err
+    end
+    return (; u, val, grad_line, grad_ok, grad_maxdiff)
+end
+
 function _run_pipeline(ast::Expr, cols::Dict{Symbol,AbstractVector}, u_probe;
         backend = nothing)
     plan = lower_rkppl(ast, keys(cols))
     bound = bind_data(plan, cols)
-    built = build_kernel(bound)
-    n = built.layout.total
-    u = u_probe === nothing ? zeros(Float64, n) : Vector{Float64}(u_probe)
-    length(u) == n || throw(ArgumentError(
-        "probe point has length $(length(u)), layout needs $n"))
-    kern = prepare_query(built, bound, :sampler)
-    val = Base.invokelatest(kern, u)
-    grad_line = if backend === nothing
-        "gradient cross-check: not run (no AD backend in this environment)"
-    else
-        q = prepare_sampler(built, bound, u; backend = backend)
-        v2, g = sampler_value_and_gradient!(q, similar(u), u)
-        ref = _report_findiff(w -> Base.invokelatest(kern, w), u)
-        ok = all(isfinite, g) && isapprox(g, ref; rtol = 1e-5, atol = 1e-7)
-        err = maximum(abs.(g .- ref))
-        "gradient cross-check: AD vs central differences, max|Δ| = $err " *
-            (ok ? "PASS" : "FAIL")
-    end
-    kex = kernel_expr(bound, built.layout)
-    return (; plan = bound, kernel = kex, u, val, grad_line)
+    prep = _prepare_bound_report(bound)
+    pr = _run_report_probe(prep, u_probe; backend = backend)
+    kex = kernel_expr(bound, prep.built.layout)
+    return (; plan = bound, kernel = kex, u = pr.u, val = pr.val,
+        grad_line = pr.grad_line, grad_ok = pr.grad_ok,
+        grad_maxdiff = pr.grad_maxdiff)
 end
 
 # ----------------------------------------------------------------- report
@@ -211,9 +226,15 @@ function transpile_report(ast::Expr, data;
 end
 
 function _report(ast, cols, layer3, meta, u, backend, fidelity)
+    return _report_and_out(ast, cols, layer3, meta, u, backend, fidelity).md
+end
+
+# Same render, plus the pipeline outputs for batch drivers (`sweep_appends`)
+# that need the posterior value and gradient verdict without a second run.
+function _report_and_out(ast, cols, layer3, meta, u, backend, fidelity)
     out = _run_pipeline(ast, cols, u; backend = backend)
     val_note = isfinite(out.val) ? "finite" : "NON-FINITE"
-    return join([
+    md = join([
         "# Transpile report",
         "",
         _show_meta(meta),
@@ -246,19 +267,198 @@ function _report(ast, cols, layer3, meta, u, backend, fidelity)
         "- $(out.grad_line)",
         "",
     ], "\n")
+    return (; md, out)
+end
+
+# ------------------------------------------------------- v2 artifacts
+#
+# v2 shape (BRM-emitted, closeout pair): `(; case_id, ast, defs, plan, meta)`
+# where `ast`/`defs` are the `_RKEmittedProgram` main block + submodel defs,
+# `plan` is the BRM structural/kernel plan (data == `plan.columns`), and
+# `meta` is a NamedTuple `(; case_id, provenance, brm_pin, ...)`.
+# Binding a v2 plan MUST go through the BRM translate entry point below:
+# production applies BRM-side patches between lowering and binding, so the
+# bare `lower_rkppl` → `bind_data` route diverges on mi / ordinal-extras /
+# kernel-dims models. The translate seam resolves the BRM function from the
+# loaded modules (fusion worker env) and fails closed without it.
+
+const _BRM_UUID = Base.UUID("cdd3e328-398d-47a6-a87b-6047aaf4b4bc")
+const _REPORT_ARTIFACT_VERSION = 2
+
+function _is_v2_artifact(x)
+    x isa NamedTuple || return false
+    ks = keys(x)
+    return :case_id in ks && :defs in ks && :plan in ks && :ast in ks
+end
+
+function _validate_v2(artifact, what::String)
+    artifact isa NamedTuple ||
+        throw(ArgumentError("$what must be a NamedTuple `(; case_id, ast, " *
+                            "defs, plan, meta)`, got $(typeof(artifact))"))
+    for k in (:case_id, :ast, :defs, :plan, :meta)
+        k in keys(artifact) || throw(ArgumentError(
+            "$what is missing `$k` (v2 shape `(; case_id, ast, defs, plan, meta)`"))
+    end
+    artifact.case_id isa AbstractString ||
+        throw(ArgumentError("$what field `case_id` must be a String, " *
+                            "got $(typeof(artifact.case_id))"))
+    artifact.ast isa Expr ||
+        throw(ArgumentError("$what field `ast` must be an Expr, " *
+                            "got $(typeof(artifact.ast))"))
+    artifact.defs isa AbstractVector &&
+        all(x -> x isa Expr, artifact.defs) ||
+        throw(ArgumentError("$what field `defs` must be a Vector{Expr}, " *
+                            "got $(typeof(artifact.defs))"))
+    return artifact
+end
+
+function _v2_brm_translate()
+    mod = get(Base.loaded_modules,
+        Base.PkgId(_BRM_UUID, "BayesianRegressionModels"), nothing)
+    mod === nothing && throw(ArgumentError(
+        "v2 artifact needs BayesianRegressionModels loaded (run in the BRM " *
+        "test env or the fusion worker env with BRM + ReactiveKernelsPPL dev'd)"))
+    hasproperty(mod, :rk_translate_artifact) || throw(ArgumentError(
+        "loaded BayesianRegressionModels has no rk_translate_artifact " *
+        "(BRM pin predates the fusion worker API)"))
+    return getproperty(mod, :rk_translate_artifact)
+end
+
+function _validate_report_probes(u_probes, what::String)
+    u_probes === nothing && return [nothing]
+    u_probes isa AbstractVector && !isempty(u_probes) ||
+        throw(ArgumentError("$what u_probes must be a non-empty vector " *
+                            "(or nothing for the origin probe)"))
+    out = Union{Nothing,Vector{Float64}}[]
+    for (i, up) in enumerate(u_probes)
+        if up === nothing
+            push!(out, nothing)
+        elseif up isa AbstractVector && all(x -> x isa Real, up)
+            uf = Float64.(up)
+            all(isfinite, uf) ||
+                throw(ArgumentError("$what probe $i must be finite"))
+            push!(out, uf)
+        else
+            throw(ArgumentError("$what probe $i must be a vector of " *
+                                "numbers (or nothing), got $(repr(up))"))
+        end
+    end
+    return out
+end
+
+# Multi-probe section builders (shared by the v2 entry and multi-probe
+# drivers). `_report_and_out` above keeps its exact single-probe render;
+# these compose the same `_show_plan` / kernel sprint core underneath.
+_layer3_block(layer3, fidelity) = [
+    "## Layer 3 — `@rkppl` surface",
+    "",
+    "```julia",
+    layer3,
+    "```",
+    "",
+    "Fidelity: $fidelity.",
+    "",
+]
+
+function _boundary_block(plan; title = "## Boundary — `lower_rkppl` → `bind_data`")
+    return [
+        title,
+        "",
+        "```",
+        _show_plan(plan),
+        "```",
+        "",
+    ]
+end
+
+_layer4_block(kernel) = [
+    "## Layer 4 — emitted RK kernel (verbatim)",
+    "",
+    "```julia",
+    sprint(Base.show_unquoted, kernel),
+    "```",
+    "",
+]
+
+function _verification_multi_block(probes)
+    lines = ["## Verification", "", "- probes: $(length(probes))"]
+    for (i, pr) in enumerate(probes)
+        val_note = isfinite(pr.val) ? "finite" : "NON-FINITE"
+        push!(lines, "- probe $i: `u = $(repr(pr.u))`")
+        push!(lines, "- probe $i: `posterior(u) = $(repr(pr.val))` ($val_note)")
+        push!(lines, "- probe $i: $(pr.grad_line)")
+    end
+    push!(lines, "")
+    return lines
+end
+
+function _render_v2_layer3(defs, ast)
+    main3 = _render_ast(ast)
+    _assert_same_shape(_surface_block(main3), ast,
+        "rendered v2 Layer 3 main")
+    isempty(defs) && return main3, "rendered Layer 3 main re-parses to " *
+        "the v2 input AST (modulo line numbers); no submodel defs"
+    rendered = ["# submodel defs (v2, $(length(defs)) defs, shown verbatim)";
+        [sprint(Base.show_unquoted, d) for d in defs]; ""; main3]
+    return join(rendered, "\n"), "rendered Layer 3 main re-parses to the " *
+        "v2 input AST (modulo line numbers); defs shown verbatim as emitted"
+end
+
+"""
+    transpile_report_v2(artifact; u_probes=nothing, backend=nothing, meta_extra=nothing)
+
+Render the machine Layer-3/Boundary/Layer-4/Verification sections for a v2
+(BRM-emitted) artifact `(; case_id, ast, defs, plan, meta)`. Binding goes
+through `BayesianRegressionModels.rk_translate_artifact` (resolved from the
+loaded modules — fails closed without BRM), never the bare lower→bind route.
+`u_probes` is a vector of probe points (`nothing` entries mean the origin);
+`nothing` means a single origin probe. Returns
+`(; md, probes, case_id)` where `probes` carries `(; u, val, grad_ok,
+grad_maxdiff)` per probe for numbers files.
+"""
+function transpile_report_v2(artifact; u_probes = nothing, backend = nothing,
+        meta_extra = nothing)
+    _validate_v2(artifact, "v2 artifact")
+    translate = _v2_brm_translate()
+    bound = Base.invokelatest(translate, artifact)
+    probes_in = _validate_report_probes(u_probes, "v2 artifact")
+    prep = _prepare_bound_report(bound)
+    prs = [_run_report_probe(prep, up; backend = backend) for up in probes_in]
+    layer3, fidelity = _render_v2_layer3(artifact.defs, artifact.ast)
+    meta = meta_extra === nothing ? artifact.meta :
+        merge(_meta_nt(artifact.meta), meta_extra)
+    md = join([
+        "# Transpile report (v2 artifact)",
+        "",
+        _show_meta(meta),
+        "report_version = $(_REPORT_VERSION)",
+        "artifact_version = $(_REPORT_ARTIFACT_VERSION)",
+        "",
+        _layer3_block(layer3, fidelity)...,
+        _boundary_block(bound;
+            title = "## Boundary — `rk_translate_artifact` " *
+                "(lower + BRM patches + bind)")...,
+        _layer4_block(kernel_expr(bound, prep.built.layout))...,
+        _verification_multi_block(prs)...,
+    ], "\n")
+    probes = [(; u = pr.u, val = pr.val, grad_ok = pr.grad_ok,
+        grad_maxdiff = pr.grad_maxdiff) for pr in prs]
+    return (; md, probes, case_id = String(artifact.case_id))
 end
 
 # ------------------------------------------------------------------- CLI
 
 function load_artifact(path::AbstractString)
     payload = Serialization.deserialize(path)
+    _is_v2_artifact(payload) &&
+        return _validate_v2(payload, "artifact $path")
     keys_of(p) = p isa NamedTuple ? keys(p) : p isa AbstractDict ? keys(p) : ()
     get_of(p, k, d) = p isa NamedTuple ? get(p, k, d) :
         p isa AbstractDict ? get(p, k, d) : d
     ks = keys_of(payload)
     if !(:ast in ks && :data in ks)
-        throw(ArgumentError("artifact $path must serialize `(; ast::Expr, data, meta)`, " *
-                            "got keys $ks"))
+        throw(ArgumentError("artifact $path must serialize `(; ast::Expr, data, meta)` " *
+                            "or the v2 `(; case_id, ast, defs, plan, meta)`, got keys $ks"))
     end
     ast = get_of(payload, :ast, nothing)
     ast isa Expr || throw(ArgumentError(
@@ -314,8 +514,14 @@ function main(argv::Vector{String} = ARGS)
         (surface_path === nothing && data_path === nothing) ||
             throw(ArgumentError("pass either --artifact or --surface/--data, not both"))
         art = load_artifact(artifact)
-        meta = model === nothing ? art.meta : merge((; model), _meta_nt(art.meta))
-        md = transpile_report(art.ast, art.data; meta = meta, u = u)
+        if _is_v2_artifact(art)
+            extra = model === nothing ? nothing : (; model)
+            uprobes = u === nothing ? nothing : [u]
+            md = transpile_report_v2(art; u_probes = uprobes, meta_extra = extra).md
+        else
+            meta = model === nothing ? art.meta : merge((; model), _meta_nt(art.meta))
+            md = transpile_report(art.ast, art.data; meta = meta, u = u)
+        end
     else
         (surface_path !== nothing && data_path !== nothing) ||
             throw(ArgumentError("surface mode needs --surface MODEL.jl --data DATA.jl"))
