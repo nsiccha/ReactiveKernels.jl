@@ -742,9 +742,17 @@ end
                 _none_evidence(), :y_resp)
         @test_throws ContractValidationError validate_plan(bad)
     end
-    # Predictor-fed p is deferred (the Beta-kappa precedent), on
-    # every link.
-    for link in (IdentityLink, LogLink, LogitLink)
+    # Predictor-fed p is logit-only (a success probability, the hurdle
+    # precedent).
+    good = _nb1_plan()
+    push!(good.predictors, PredictorSpec(:ls, LogitLink, _terms(), :ls))
+    append!(good.population_priors, _priors(:ls))
+    good.responses[1] =
+        LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta,
+            ScalePredictorRef(:ls, LogitLink), nothing,
+            _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    for link in (IdentityLink, LogLink)
         bad = _nb1_plan()
         push!(bad.predictors, PredictorSpec(:ls, link, _terms(), :ls))
         append!(bad.population_priors, _priors(:ls))

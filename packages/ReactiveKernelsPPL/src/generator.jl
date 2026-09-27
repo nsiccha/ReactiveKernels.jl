@@ -1927,9 +1927,9 @@ end
 # NB1 likelihood (SB `neg_binomial` mirror): the successes-shape r
 # precomputes outside the cell (`_ppl_r_`, the NB2 `_ppl_mu_`
 # precedent — a computed `exp` constructor arg miscompiles the Enzyme
-# pullback); the success probability p threads scalar or per-obs via
-# `_scale_plate_arg` (predictor-fed p is deferred at the contract
-# gate, the Beta-kappa precedent). Weights multiply the cell (the
+# pullback); the success probability p threads scalar, per-obs, or
+# predictor-fed (logit-only, the hurdle precedent) via
+# `_scale_plate_arg`. Weights multiply the cell (the
 # NB2 precedent). No whole-vector fusion yet — a perf-lane follow-up,
 # not this slice.
 _nb1_r_name(label::Symbol) = Symbol(:_ppl_r_, label)

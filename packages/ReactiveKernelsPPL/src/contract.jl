@@ -166,10 +166,10 @@ end
 A predictor-fed scale/shape use: the response's auxiliary (Gaussian
 sigma, NB2 dispersion phi, Gamma shape alpha, Beta concentration
 kappa, Student sigma, Student nu, hurdle p_zero, VonMises
-concentration kappa, BetaBinomial2 precision phi, and — on the
-dedicated `zi` slot — ZIP zero-inflation zi; InverseGaussian lambda,
-NB1 p, LogNormal sigma, and Weibull k stay scalar-only) is a whole
-linear predictor, varying per observation.
+concentration kappa, BetaBinomial2 precision phi, NB1 success
+probability p, and — on the dedicated `zi` slot — ZIP zero-inflation
+zi; InverseGaussian lambda, LogNormal sigma, and Weibull k stay
+scalar-only) is a whole linear predictor, varying per observation.
 `predictor` names the
 [`PredictorSpec`](@ref) (planned exactly like a location predictor:
 terms, priors, one link); `link` is the scale use-site wrapper —
@@ -195,12 +195,12 @@ InverseGaussian shape lambda, BetaBinomial2 precision phi, VonMises
 concentration kappa, NB1 success probability p, LogNormal scale sigma,
 Weibull shape k — either scalar (parameter, assignment, folded
 literal, or a raw per-observation data column) or, for
-Gaussian/NB2/Gamma/Beta/Student/hurdle/VonMises/BB2 only, a
+Gaussian/NB2/Gamma/Beta/Student/hurdle/VonMises/BB2/NB1 only, a
 [`ScalePredictorRef`](@ref) (predictor-fed per-observation auxiliary);
 it must be `nothing` otherwise. A hurdle p_zero is a probability
 (scalar in [0, 1], predictor-fed logit-only). An NB1 p is a probability
-too (scalar in [0, 1], or a raw per-observation data column;
-predictor-fed p deferred, the Beta-kappa precedent). A Beta or
+too (scalar in [0, 1], a raw per-observation data column, or
+predictor-fed logit-only). A Beta or
 VonMises kappa is
 predictor-fed log-only (a concentration). A BetaBinomial2 phi takes
 identity/log/logit (the NB2-phi precedent — the SB spelling is log
@@ -7234,7 +7234,7 @@ end
 
 # A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha,
 # Beta kappa, Student sigma, Student nu, hurdle p_zero, VonMises
-# kappa, BetaBinomial2 phi; InverseGaussian lambda, NB1 p, LogNormal
+# kappa, BetaBinomial2 phi, NB1 p; InverseGaussian lambda, LogNormal
 # sigma, and Weibull k are deferred above):
 # the predictor exists, carries the use-site link (the
 # one-link-per-predictor rule), and is not the response's own location
@@ -7243,7 +7243,8 @@ end
 # enforced at the nu gate, where both slots are visible).
 # Predictor-fed Binomial trials are deferred (trials stay
 # column-or-literal by type). A hurdle p_zero predictor is logit-only
-# (a probability); a Beta or VonMises kappa predictor is log-only (a
+# (a probability), as is an NB1 p predictor (a success probability);
+# a Beta or VonMises kappa predictor is log-only (a
 # concentration); the remaining admitted families take identity/log/logit
 # on either slot.
 function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
@@ -7257,10 +7258,6 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
     fam === InverseGaussianFam && _fail(r.label,
         "InverseGaussian response with a $slot predictor: predictor-fed " *
         "shape (lambda) is deferred — use a scalar lambda (parameter or literal)")
-    fam === NegativeBinomialFam && _fail(r.label,
-        "NB1 response with a $slot predictor: predictor-fed " *
-        "success probability (p) is deferred — use a scalar p (parameter, " *
-        "literal, or data column)")
     fam === LogNormalFam && _fail(r.label,
         "LogNormal response with a $slot predictor: predictor-fed " *
         "scale (sigma) is deferred — use a scalar sigma (parameter, " *
@@ -7273,12 +7270,16 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
         fam === GammaLogFam || fam === BetaLogitFam ||
         fam === StudentTFam ||
         fam === HurdlePoissonFam || fam === VonMisesFam ||
-        fam === BetaBinomial2Fam) ||
+        fam === BetaBinomial2Fam || fam === NegativeBinomialFam) ||
         _fail(r.label, "this response family takes no $slot predictor")
     if fam === HurdlePoissonFam
         s.link === LogitLink ||
             _fail(r.label, "hurdle p_zero predictor link must be logit " *
                 "(a probability — got $(s.link))")
+    elseif fam === NegativeBinomialFam
+        s.link === LogitLink ||
+            _fail(r.label, "NB1 p predictor link must be logit " *
+                "(a success probability — got $(s.link))")
     elseif fam === VonMisesFam
         s.link === LogLink ||
             _fail(r.label, "VonMises kappa predictor link must be log " *
