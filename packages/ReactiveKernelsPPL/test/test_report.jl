@@ -96,6 +96,72 @@ end
     end
 end
 
+@testset "report bound-prepare split: behavior preserved" begin
+    # The multi-probe internals reproduce the single-probe numbers exactly.
+    cols = _norm_cols(_report_demo_data())
+    ast = _surface_block(_REPORT_SURFACE)
+    bound = bind_data(lower_rkppl(ast, keys(cols)), cols)
+    prep = _prepare_bound_report(bound)
+    @test prep.n == 3
+    pr = _run_report_probe(prep, _REPORT_U; backend = _GEN_BACKEND)
+    @test repr(pr.val) == "-15.886646898631646"
+    @test pr.grad_ok === true
+    @test pr.grad_maxdiff isa Float64 && isfinite(pr.grad_maxdiff)
+    pr0 = _run_report_probe(prep, nothing)
+    @test isfinite(pr0.val)
+    @test pr0.grad_ok === nothing
+    @test pr0.grad_maxdiff === nothing
+    md = join([
+        _layer3_block("X", "f")...,
+        _boundary_block(bound)...,
+        _layer4_block(kernel_expr(bound, prep.built.layout))...,
+        _verification_multi_block([pr])...,
+    ], "\n")
+    @test occursin("n_obs = 6", md)
+    @test occursin("ppl_model(unconstrained::Vector{Float64}", md)
+    @test occursin("- probes: 1", md)
+    @test occursin("- probe 1: `posterior(u) = -15.886646898631646`", md)
+end
+
+@testset "report v2 shape: load + fail-closed without BRM" begin
+    mktempdir() do dir
+        ast = _surface_block(_REPORT_SURFACE)
+        good = (; case_id = "demo", ast, defs = Expr[],
+            plan = nothing, meta = (; case_id = "demo", provenance = "test"))
+        v2 = joinpath(dir, "v2.jls")
+        Serialization.serialize(v2, good)
+        loaded = load_artifact(v2)
+        @test _is_v2_artifact(loaded)
+        @test loaded.case_id == "demo"
+        @test !_is_v2_artifact((; ast, data = _report_demo_data()))
+        # This env has no BRM: the translate seam fails closed with guidance.
+        err = try
+            transpile_report_v2(loaded)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("BayesianRegressionModels", sprint(showerror, err))
+        # Malformed v2 fails closed at load.
+        bad = joinpath(dir, "bad.jls")
+        Serialization.serialize(bad,
+            (; case_id = "x", ast, defs = Expr[], plan = nothing))
+        @test_throws ArgumentError load_artifact(bad)
+        Serialization.serialize(bad, (; case_id = "x", ast = "not-expr",
+            defs = Expr[], plan = nothing, meta = (;)))
+        @test_throws ArgumentError load_artifact(bad)
+        # CLI --artifact dispatches v2 (and fails closed without BRM here).
+        @test_throws ArgumentError main(["--artifact", v2])
+        try
+            main(["--artifact", v2])
+            @test false
+        catch e
+            @test occursin("BayesianRegressionModels", sprint(showerror, e))
+        end
+    end
+end
+
 @testset "report CLI main + input errors" begin
     mktempdir() do dir
         model = joinpath(dir, "model.jl")
