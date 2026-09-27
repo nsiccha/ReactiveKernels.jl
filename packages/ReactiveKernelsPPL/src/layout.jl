@@ -312,13 +312,24 @@ function assign_layout(plan::StructuralPlan)
     # marginal scale as a plain `:exp` scalar, and the standardized
     # M-vector `beta_raw` as one `:hsgp` identity block (the
     # spline-vector shape). A zero floor (K=1, unbounded) routes to
-    # `:exp`, bit-identical to `:floored` at `lo == 0.0`.
+    # `:exp`, bit-identical to `:floored` at `lo == 0.0`. Periodic
+    # bases (one isotropic axis, no fits) floor the single rho at the
+    # K-only `_hsgp_periodic_rho_lower` (SB `_sb_hsgp_periodic`).
     for hb in plan.hsgp_bases
-        length(hb.fits) == length(hb.axes) || throw(ContractValidationError(
-            "[layout] hsgp :$(hb.id): fits not filled at bind " *
-            "(bind_data fills one (mu, L) per axis)"))
+        if hb.cov === :periodic
+            isempty(hb.fits) || throw(ContractValidationError(
+                "[layout] hsgp :$(hb.id): periodic carries no fits " *
+                "(no domain to fit)"))
+        else
+            length(hb.fits) == length(hb.axes) || throw(ContractValidationError(
+                "[layout] hsgp :$(hb.id): fits not filled at bind " *
+                "(bind_data fills one (mu, L) per axis)"))
+        end
         names = _hsgp_names(hb)
-        for (rho, fl) in zip(names.rhos, _hsgp_floors(hb.K, hb.fits, hb.iso))
+        floors = hb.cov === :periodic ?
+            [_hsgp_periodic_rho_lower(only(hb.K))] :
+            _hsgp_floors(hb.K, hb.fits, hb.iso)
+        for (rho, fl) in zip(names.rhos, floors)
             if fl == 0.0
                 push!(entries, LayoutEntry(:sampled, nothing, rho, [rho],
                     offset, 1, :exp))
