@@ -5,6 +5,7 @@
 # the emitted expressions) plus Enzyme-vs-findiff gradients. (`_query` /
 # `_check_gradient` come from test_generator.jl, included first.)
 using Distributions: LogNormal, Normal, Exponential, logpdf
+using SpecialFunctions: besseli, besselix
 
 function _hvalid_plan(; aniso::Bool = false)
     if aniso
@@ -504,6 +505,298 @@ end
     built = build_kernel(bound)
     u = [0.2, -0.1, 0.15, 0.05, 0.3]
     ref = _hsgp_ref_posterior(bound, built.layout, u)
+    @test isapprox(_query(built.spec, bound, :posterior, u), ref; rtol = 1e-12)
+    _check_gradient(built.spec, bound, u)
+end
+
+function _hperiodic_plan(; k::Int = 4, period::Float64 = 2.0)
+    return lower_rkppl(quote
+            hsgp_basis(:h_p, x; k = $k, cov = :periodic, period = $period)
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ hsgp(:h_p)
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x))
+end
+
+@testset "hsgp periodic lowering" begin
+    plan = _hperiodic_plan()
+    @test length(plan.hsgp_bases) == 1
+    hb = only(plan.hsgp_bases)
+    @test hb.id === :h_p
+    @test hb.axes == [:x] && hb.K == [4] && hb.c == [1.5] && hb.iso
+    @test hb.cov === :periodic && hb.period == 2.0
+    @test isempty(hb.fits)
+    @test hb.label === :hsgp_h_p
+    @test ReactiveKernelsPPL._hsgp_n_basis(hb) == 8
+    @test ReactiveKernelsPPL._hsgp_all_names(hb) ==
+        [:beta_raw_h_p, :sigma_h_p, :rho_h_p]
+    t = only(plan.predictors).terms[2]
+    @test t.kind === HSGPSummandTerm && isempty(t.columns)
+    @test t.options.hsgp_id === :h_p
+    # Defaults: k=20 like exp-quad; explicit cov=:exp_quad keeps NaN period.
+    dflt = lower_rkppl(quote
+            hsgp_basis(:h_d, x; cov = :periodic, period = 1.0)
+            mu = a .+ hsgp(:h_d)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x))
+    dhb = only(dflt.hsgp_bases)
+    @test dhb.K == [20] && dhb.cov === :periodic && dhb.period == 1.0
+    @test ReactiveKernelsPPL._hsgp_n_basis(dhb) == 40
+    eq = lower_rkppl(quote
+            hsgp_basis(:h_e, x; k = 3, cov = :exp_quad)
+            mu = a .+ hsgp(:h_e)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x))
+    ehb = only(eq.hsgp_bases)
+    @test ehb.cov === :exp_quad && isnan(ehb.period)
+    # `c` is accepted with periodic (SB validates its form, ignores its
+    # value — no domain).
+    cacc = lower_rkppl(quote
+            hsgp_basis(:h_c, x; k = 3, c = 2.5, cov = :periodic, period = 1.0)
+            mu = a .+ hsgp(:h_c)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x))
+    @test only(cacc.hsgp_bases).c == [2.5]
+end
+
+@testset "hsgp periodic surface fail-closed" begin
+    # cov spelling.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            hsgp_basis(:h_p, x; k = 4, cov = :matern, period = 2.0)
+            mu = a .+ hsgp(:h_p)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            hsgp_basis(:h_p, x; k = 4, cov = periodic, period = 2.0)
+            mu = a .+ hsgp(:h_p)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x))
+    # period required iff periodic (SB `_brm_gp_period`).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            hsgp_basis(:h_p, x; k = 4, cov = :periodic)
+            mu = a .+ hsgp(:h_p)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            hsgp_basis(:h_x, x; k = 4, period = 2.0)
+            mu = a .+ hsgp(:h_x)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            hsgp_basis(:h_x, x; k = 4, cov = :exp_quad, period = 2.0)
+            mu = a .+ hsgp(:h_x)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x))
+    for bad in (0.0, -1.0, Inf, NaN, "2.0")
+        @test_throws SurfaceLoweringError lower_rkppl(quote
+                hsgp_basis(:h_p, x; k = 4, cov = :periodic, period = $bad)
+                mu = a .+ hsgp(:h_p)
+                y .~ Normal.(mu, 1.0)
+            end, (:y, :x))
+    end
+    # One isotropic axis (SB "periodic hsgp requires one isotropic axis").
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            hsgp_basis(:h_p, x, z; k = (4, 3), cov = :periodic, period = 2.0)
+            mu = a .+ hsgp(:h_p)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x, :z))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            hsgp_basis(:h_p, x; k = 4, cov = :periodic, period = 2.0,
+                iso = false)
+            mu = a .+ hsgp(:h_p)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x))
+    # Periodic claims the same names (collision still loud).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            rho_h_p = 1.0
+            mu = a .+ hsgp(:h_p)
+            y .~ Normal.(mu, 1.0)
+            hsgp_basis(:h_p, x; k = 4, cov = :periodic, period = 2.0)
+        end, (:y, :x))
+end
+
+@testset "hsgp periodic contract validation" begin
+    good = _hperiodic_plan()
+    hb = only(good.hsgp_bases)
+    per(args...) = HSGPBasis(args..., :periodic, 2.0)
+    # cov membership / periodic shape / period / fits.
+    @test_throws ContractValidationError validate_structure(_hwith(good;
+        bases = [HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits,
+            hb.label, :matern, 2.0)]))
+    @test_throws ContractValidationError validate_structure(_hwith(good;
+        bases = [per(hb.id, [:x, :z], [4, 3], [1.5, 2.0], true,
+            Tuple{Float64,Float64}[], hb.label)]))
+    @test_throws ContractValidationError validate_structure(_hwith(good;
+        bases = [per(hb.id, [:x], [4], [1.5], false,
+            Tuple{Float64,Float64}[], hb.label)]))
+    for badperiod in (NaN, 0.0, -2.0, Inf)
+        @test_throws ContractValidationError validate_structure(_hwith(good;
+            bases = [HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits,
+                hb.label, :periodic, badperiod)]))
+    end
+    @test_throws ContractValidationError validate_structure(_hwith(good;
+        bases = [per(hb.id, hb.axes, hb.K, hb.c, hb.iso, [(0.0, 1.0)],
+            hb.label)]))
+    # exp_quad with a period set is inconsistent (period iff periodic).
+    @test_throws ContractValidationError validate_structure(_hwith(good;
+        bases = [HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits,
+            hb.label, :exp_quad, 2.0)]))
+end
+
+@testset "hsgp periodic bind" begin
+    cols = _hsgp_cols()
+    bound = bind_data(_hperiodic_plan(), cols)
+    hb = only(bound.hsgp_bases)
+    @test isempty(hb.fits)
+    @test hb.period == 2.0 && hb.cov === :periodic
+    @test bound.roles[:x] === :predictor
+    # A constant axis is a usable periodic domain (no degeneracy gate —
+    # the exp-quad L == 0 rejection does not apply).
+    constcols = Dict{Symbol,AbstractVector}(:y => cols[:y],
+        :x => fill(2.0, 4))
+    cbound = bind_data(_hperiodic_plan(), constcols)
+    @test isempty(only(cbound.hsgp_bases).fits)
+    # Bind fail-closed: non-numeric / non-finite axes.
+    strcols = Dict{Symbol,AbstractVector}(:y => cols[:y],
+        :x => ["a", "b", "c", "d"])
+    @test_throws ContractValidationError bind_data(_hperiodic_plan(), strcols)
+    nancols = Dict{Symbol,AbstractVector}(:y => cols[:y],
+        :x => [0.5, NaN, 1.5, 0.0])
+    @test_throws ContractValidationError bind_data(_hperiodic_plan(), nancols)
+    # Codegen/layout guards behind validation: fits on a periodic basis.
+    withfits = HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, [(0.0, 1.0)],
+        hb.label, :periodic, 2.0)
+    bad = _hwith(bound; bases = [withfits])
+    @test_throws ContractValidationError build_kernel(bad)
+    @test_throws ContractValidationError assign_layout(bad)
+end
+
+@testset "hsgp periodic floor" begin
+    fl = ReactiveKernelsPPL._hsgp_periodic_rho_lower
+    # K=1 stays unbounded (the exp-quad degenerate-basis rule).
+    @test fl(1) == 0.0
+    # Defining property: at a = 1/floor^2 the K-th harmonic's spectral
+    # amplitude ratio is 1e-4 (SB `_brm_hsgp_periodic_rho_lower`
+    # rule — checked through the scaled Bessel ratio, the bisection's
+    # own residual).
+    for K in (2, 3, 4, 8, 20)
+        a = 1 / fl(K)^2
+        @test besselix(K, a) / besselix(1, a) ≈ 1e-4
+    end
+    # Floors tighten with K (more harmonics resolve shorter scales).
+    fs = [fl(K) for K in 2:8]
+    @test all(>(0), fs) && issorted(fs; rev = true)
+end
+
+@testset "hsgp periodic layout" begin
+    bound = bind_data(_hperiodic_plan(), _hsgp_cols())
+    layout = assign_layout(bound)
+    # SB `_sb_hsgp_periodic` declaration order (rho, sigma, beta),
+    # appended after the slice-1 entries like the exp-quad triple.
+    kinds = [(e.kind, e.name, e.size, e.transform) for e in layout.entries]
+    @test kinds == [(:coefficient, :mu_coef, 1, :identity),
+        (:sampled, :sigma, 1, :exp),
+        (:sampled, :rho_h_p, 1, :floored),
+        (:sampled, :sigma_h_p, 1, :exp),
+        (:hsgp, :beta_raw_h_p, 8, :identity)]
+    rho_e = layout.entries[3]
+    @test rho_e.lo ≈ ReactiveKernelsPPL._hsgp_periodic_rho_lower(4)
+    @test isnan(rho_e.hi)
+    @test layout.total == 12
+    names = coordinate_names(layout)
+    @test names[3:5] == [:rho_h_p, :sigma_h_p, Symbol("beta_raw_h_p.1")]
+    @test names[end] == Symbol("beta_raw_h_p.8")
+    # Jacobian: the exp/floored coords only (beta is identity).
+    u = collect(0.1:0.1:1.2)
+    @test logjac(layout, u) ≈ u[2] + u[3] + u[4]
+    nt = constrain(layout, u)
+    @test nt.rho_h_p ≈ rho_e.lo + exp(u[3])
+    @test nt.sigma_h_p ≈ exp(u[4])
+    @test Vector(nt.beta_raw_h_p) ≈ u[5:12]
+    @test unconstrain(layout, nt) ≈ u
+    # K=1: the zero floor routes rho to plain :exp.
+    k1 = lower_rkppl(quote
+            hsgp_basis(:h_1p, x; k = 1, cov = :periodic, period = 2.0)
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ hsgp(:h_1p)
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x))
+    k1layout = assign_layout(bind_data(k1, _hsgp_cols()))
+    k1rho = only(e for e in k1layout.entries if e.name === :rho_h_1p)
+    @test (k1rho.kind, k1rho.transform) === (:sampled, :exp)
+    k1beta = only(e for e in k1layout.entries if e.name === :beta_raw_h_1p)
+    @test k1beta.size == 2
+end
+
+# Independent posterior reference for the `_hperiodic_plan` shape (one
+# periodic basis, intercept-only `mu`, `sigma ~ Exponential(1)`
+# likelihood scale): SB `_brm_apply_hsgp_periodic` loop nests + the
+# direct-form spectral weights `sigma*sqrt(2*exp(-a)*I_j(a))` (the
+# unscaled-AMOS path — the emission uses scaled-log space, so the two
+# agree only if both Bessels are right) + Distributions oracles.
+# Constrained values come from `constrain` (locked absolutely by
+# "hsgp periodic layout"); the Jacobian is hand-summed from
+# coordinates, never `logjac`.
+function _hsgp_periodic_ref_posterior(bound::StructuralPlan,
+        layout::LayoutTable, u::AbstractVector{<:Real})
+    hb = only(bound.hsgp_bases)
+    n = bound.n_obs
+    y = Vector{Float64}(bound.columns[:y])
+    nt = constrain(layout, u)
+    hsgp = ReactiveKernelsPPL._hsgp_names(hb)
+    a = only(nt.mu)
+    sig = Float64(nt.sigma)
+    rho = Float64(only(getproperty(nt, r) for r in hsgp.rhos))
+    sigh = Float64(getproperty(nt, hsgp.sigma))
+    beta = Vector{Float64}(getproperty(nt, hsgp.beta))
+    x = Vector{Float64}(bound.columns[only(hb.axes)])
+    k = only(hb.K)
+    w0 = 2pi / hb.period
+    PHI = zeros(n, 2k)
+    for j in 1:k, i in 1:n
+        angle = w0 * j * x[i]
+        PHI[i, j] = cos(angle)
+        PHI[i, k + j] = sin(angle)
+    end
+    aa = 1 / (rho * rho)
+    sspd = Vector{Float64}(undef, 2k)
+    for (b, h) in enumerate(vcat(1:k, 1:k))
+        sspd[b] = sigh * sqrt(2 * exp(-aa) * besseli(h, aa))
+    end
+    muv = a .+ PHI * (sspd .* beta)
+    ll = sum(logpdf.(Normal.(muv, sig), y))
+    pr = logpdf(Normal(0, 5), a) + logpdf(Exponential(1), sig) +
+        logpdf(LogNormal(0, 1), rho) +
+        logpdf(LogNormal(0, 1), sigh) + sum(logpdf.(Normal(0, 1), beta))
+    cnames = coordinate_names(layout)
+    jac = sum(u[findfirst(==(s), cnames)]
+        for s in [:sigma, hsgp.rhos..., hsgp.sigma])
+    return ll + pr + jac
+end
+
+@testset "hsgp periodic end to end" begin
+    bound = bind_data(_hperiodic_plan(), _hsgp_cols())
+    built = build_kernel(bound)
+    u = [0.2, -0.1, 0.15, 0.05, 0.3, -0.2, 0.1, 0.0, 0.25, -0.15, 0.05, 0.1]
+    ref = _hsgp_periodic_ref_posterior(bound, built.layout, u)
+    @test isapprox(_query(built.spec, bound, :posterior, u), ref; rtol = 1e-12)
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "hsgp periodic k1 end to end" begin
+    k1 = lower_rkppl(quote
+            hsgp_basis(:h_1p, x; k = 1, cov = :periodic, period = 2.0)
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ hsgp(:h_1p)
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x))
+    bound = bind_data(k1, _hsgp_cols())
+    built = build_kernel(bound)
+    u = [0.2, -0.1, 0.15, 0.05, 0.3, -0.2]
+    ref = _hsgp_periodic_ref_posterior(bound, built.layout, u)
     @test isapprox(_query(built.spec, bound, :posterior, u), ref; rtol = 1e-12)
     _check_gradient(built.spec, bound, u)
 end
