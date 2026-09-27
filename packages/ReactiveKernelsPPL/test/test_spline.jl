@@ -8,6 +8,8 @@
 # the BRM peer publishes its BridgeStan literals).
 using Reactant
 
+using Reactant
+
 function _svalid_plan(; t2::Bool = false)
     if t2
         return lower_rkppl(quote
@@ -462,6 +464,30 @@ end
     _check_gradient(built.spec, bound, u)
 end
 
+# Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
+# native vs compiled), plus the traced program size.
+function _spline_reactant(plan, cols)
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    post_q = prepare_query(built, bound, :sampler)
+    u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
+    return Base.invokelatest(_spline_reactant_measure, built, bound, post_q, u)
+end
+
+function _spline_reactant_measure(built, bound, post_q, u)
+    hlo = repr(Reactant.@code_hlo optimize = false post_q(Reactant.to_rarray(u)))
+    native = post_q(u)
+    compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
+    primal = Float64(compiled(Reactant.to_rarray(u)))
+    q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
+    rval, rgrad = cad(Reactant.to_rarray(u))
+    return (; lines = count(==('\n'), hlo), native, primal, val, g,
+        rval = Float64(rval), rgrad = Array(rgrad))
+end
+
 # Independent t2 reference: SB three-block shape, sd in (rr,rn,nr) order.
 function _ref_spline_t2(bound, nt)
     X = hcat(bound.columns[:t2_xz_Xfixed_1], bound.columns[:t2_xz_Xfixed_2],
@@ -517,6 +543,7 @@ function _spline_reactant(bound)
 end
 
 function _spline_reactant_measure(built, bound, post_q, u)
+    hlo = repr(Reactant.@code_hlo optimize = false post_q(Reactant.to_rarray(u)))
     native = post_q(u)
     compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
     primal = Float64(compiled(Reactant.to_rarray(u)))
@@ -526,7 +553,7 @@ function _spline_reactant_measure(built, bound, post_q, u)
     cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
     rval, rgrad = cad(Reactant.to_rarray(u))
     return (; native, primal, val, g, rval = Float64(rval),
-        rgrad = Array(rgrad))
+        rgrad = Array(rgrad), lines = count(==('\n'), hlo))
 end
 
 @testset "spline under Reactant" begin
@@ -632,4 +659,13 @@ end
         @test maximum(abs.(g .- sb)) < 1e-10
         _check_gradient(built.spec, bound, u)
     end
+@testset "spline tps HLO length invariance" begin
+    # Data-length invariance (constraints.md): more rows must not
+    # replicate the loop body. (Value+grad Reactant parity lives in
+    # "spline under Reactant" above; this leg adds only the HLO check
+    # against the shared `_spline_reactant` helper.)
+    small = _spline_reactant(bind_data(_svalid_plan(), _spline_cols()))
+    large = _spline_reactant(bind_data(_svalid_plan(),
+        _spline_cols(; n = 24)))
+    @test small.lines == large.lines
 end
