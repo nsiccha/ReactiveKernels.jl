@@ -854,6 +854,33 @@ end
     @test r.scale == ScalePredictorRef(:lk, LogLink)
 end
 
+@testset "surface roundtrip exponential end to end" begin
+    cols, _ = _gen_columns()
+    m = @rkppl begin
+        eta = a .+ b .* x
+        y .~ Exponential.(exp.(eta))
+    end
+    @test m isa RKPPLModel
+    r = only(lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ Exponential.(exp.(eta))
+    end, (:y, :x)).responses)
+    @test (r.family, r.link, r.predictor, r.scale) ===
+        (ExponentialLogFam, LogLink, :eta, nothing)
+    @test r.weights === nothing
+    @test r.evidence.kind === :none
+    bound = m(; y = cols[:y], x = cols[:x])
+    @test isbound(bound)
+    built = build_kernel(bound)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    ll = sum(logpdf(Exponential(m), y) for (y, m) in zip(cols[:y], mu))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+end
+
 @testset "ig response failures" begin
     Dn2 = (:y, :x)
     # Arity: exactly (mu, lambda).
@@ -976,6 +1003,30 @@ end
         mu = a .+ b .* x
         lk = c .+ d .* x
         y .~ VonMises.(mu, lk)
+    end, Dn2)
+end
+
+@testset "exponential response failures" begin
+    Dn2 = (:y, :x)
+    # Arity: exactly (mu,).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ Exponential.(exp.(eta), 1.5)
+    end, Dn2)
+    # The kernel-endpoint spelling redirects to the response head.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ exponential.(exp.(eta))
+    end, Dn2)
+    # The mu position needs its `exp.` link wrapper (Poisson precedent).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ Exponential.(eta)
+    end, Dn2)
+    # No fused `ExponentialLog` head (recent slices stay decomposed-only).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ ExponentialLog.(eta)
     end, Dn2)
 end
 

@@ -743,6 +743,23 @@ function _ref_vm_circ(cols, coef, kap, lo, hi)
     end
 end
 
+function _gen_exp_plan()
+    cols, n = _gen_columns()
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(ExponentialLogFam, LogLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_exp(cols, coef)
+    mu = exp.(coef[1] .+ coef[2] .* cols[:x])
+    return sum(logpdf(Exponential(m), y) for (y, m) in zip(cols[:y], mu))
+end
+
 @testset "ig values and gradient" begin
     plan = _gen_ig_plan()
     built = build_kernel(plan)
@@ -913,6 +930,37 @@ end
     ll = sum(cols[:w] .*
         [logpdf(VonMises(m, 1.7), y) for (y, m) in zip(cols[:y], mu)])
     pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "exponential values and gradient" begin
+    plan = _gen_exp_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_exp(plan.columns, Vector(nt.eta))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted exponential values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(ExponentialLogFam, LogLink, :y, :eta,
+            nothing, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = exp.(Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x])
+    ll = sum(cols[:w] .*
+        [logpdf(Exponential(m), y) for (y, m) in zip(cols[:y], mu)])
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, plan, u)
 end

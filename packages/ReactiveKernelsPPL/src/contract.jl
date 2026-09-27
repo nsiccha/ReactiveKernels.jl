@@ -103,6 +103,7 @@ univariate components, SB `MixtureModel` mirror)."""
     BetaBinomial2Fam
     VonMisesFam
     NegativeBinomialFam
+    ExponentialLogFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -1468,6 +1469,7 @@ const ADMITTED_TRIPLES = (
     (BetaBinomial2Fam, LogitLink, IdentityLink),
     (VonMisesFam, IdentityLink, IdentityLink),
     (NegativeBinomialFam, LogLink, LogLink),
+    (ExponentialLogFam, LogLink, LogLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order; `:student_t`
@@ -1858,7 +1860,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
     ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
-    NegativeBinomialFam)
+    NegativeBinomialFam, ExponentialLogFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -6852,7 +6854,8 @@ function _validate_responses(plan::StructuralPlan)
             "Poisson-log, Binomial-logit/probit/cloglog, NB2-log, Gamma-log, " *
             "Beta-logit, Categorical-logit, Ordered-logit, Ordinal spellings, " *
             "Student-identity, Hurdle-Poisson-log, ZIP-log, " *
-            "InverseGaussian-log, BetaBinomial2-logit, VonMises-identity)",
+            "InverseGaussian-log, BetaBinomial2-logit, VonMises-identity, " *
+            "Exponential-log)",
         )
         _validate_scale(r, plan)
         _validate_nu(r, plan)
@@ -6935,6 +6938,16 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         # instead of flowing a wrong value.
         (eltype(col) <: Real && all(>(0), col)) ||
             _fail(r.label, "InverseGaussian response must be strictly positive numerics")
+        return nothing
+    elseif r.family === ExponentialLogFam
+        # Non-negative (0 is valid: Exponential(μ) logpdf at 0 is finite):
+        # the exponential kernel guards y >= 0 (SB `exponential_lpdf`
+        # returns -inf at y < 0) — fail closed instead of flowing a
+        # wrong value. Bool is not a continuous support (the VonMises
+        # precedent).
+        (eltype(col) <: Real && !(eltype(col) <: Bool) &&
+            all(>=(0), col)) ||
+            _fail(r.label, "Exponential response must be non-negative numerics")
         return nothing
     elseif r.family === VonMisesFam
         # Finite angles (Bool is not an angle support); a circular

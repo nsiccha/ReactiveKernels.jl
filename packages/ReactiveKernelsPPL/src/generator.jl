@@ -1130,6 +1130,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _zip_plate_stmts(r, plan, node, pw)
     elseif r.family === InverseGaussianFam
         return _ig_plate_stmts(r, plan, node, pw)
+    elseif r.family === ExponentialLogFam
+        return _exponential_plate_stmts(r, plan, node, pw)
     elseif r.family === VonMisesFam
         return _vonmises_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
@@ -1732,6 +1734,34 @@ function _ig_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, 
     base = :((log($lamv) - (1.8378770664093456 + 3.0 * log($yv)) -
         $lamv * ($yv - $muv) * ($yv - $muv) / ($muv * $muv * $yv)) / 2.0)
     cell = :($yv > 0 ? $base : -Inf)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Exponential likelihood (SB `exponential_lpdf` mirror): the existing
+# `exponential` distribution-kernel endpoint (prior-proven, Enzyme-covered),
+# spliced per cell with the log-link mean (the Gamma-plate precedent).
+# The mean precomputes outside the cell (`_ppl_mu_`, the NB2 precedent —
+# a computed `exp` constructor arg miscompiles the Enzyme pullback).
+# The `y >= 0` guard lives in the endpoint (`ifelse`, DK-owned); `y` is
+# bound data so preparation splits the plate per taken arm and no
+# backend receives the branch. μ positivity is by-construction (`exp`),
+# so no live-value guard enters the cell. The family takes no scale
+# (Poisson-shaped; SB's rate is `1 ./ mu`, carried inside the kernel's
+# `-log(μ) - y/μ` spelling). Evidence fails closed at the contract gate
+# (Gaussian/Poisson only); weights multiply the cell (the NB2 precedent).
+# No whole-vector fusion yet — a perf-lane follow-up, not this slice.
+function _exponential_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    mu = _mu_name(r.label)
+    pre = Expr[:($mu = exp.($lp))]
+    inputs = Any[y, mu]
+    yv, muv = _dovar(1), _dovar(2)
+    cell = :(exponential($muv).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
