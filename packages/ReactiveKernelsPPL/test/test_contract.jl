@@ -742,7 +742,7 @@ end
                 _none_evidence(), :y_resp)
         @test_throws ContractValidationError validate_plan(bad)
     end
-    # Predictor-fed p is deferred (the BetaBinomial2 precedent), on
+    # Predictor-fed p is deferred (the Beta-kappa precedent), on
     # every link.
     for link in (IdentityLink, LogLink, LogitLink)
         bad = _nb1_plan()
@@ -1044,13 +1044,23 @@ end
                 _none_evidence(), :y_resp, :n, nothing)
         @test_throws ContractValidationError validate_plan(bad)
     end
-    # Predictor-fed precision is deferred (Beta-kappa precedent).
+    # A predictor-fed precision is admitted (identity/log/logit — the
+    # NB2-phi precedent; the SB spelling is log precision).
+    for link in (IdentityLink, LogLink, LogitLink)
+        good = _betabinomial2_plan()
+        push!(good.predictors, PredictorSpec(:hup, link, _terms(), :hup))
+        append!(good.population_priors, _priors(:hup))
+        good.responses[1] =
+            LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu,
+                ScalePredictorRef(:hup, link), nothing,
+                _none_evidence(), :y_resp, :n, nothing)
+        @test validate_plan(good) === nothing
+    end
+    # But not the response's own location predictor.
     bad = _betabinomial2_plan()
-    push!(bad.predictors, PredictorSpec(:hup, LogLink, _terms(), :hup))
-    append!(bad.population_priors, _priors(:hup))
     bad.responses[1] =
         LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu,
-            ScalePredictorRef(:hup, LogLink), nothing,
+            ScalePredictorRef(:mu, IdentityLink), nothing,
             _none_evidence(), :y_resp, :n, nothing)
     @test_throws ContractValidationError validate_plan(bad)
     # BetaBinomial2 requires trials (Binomial rule).

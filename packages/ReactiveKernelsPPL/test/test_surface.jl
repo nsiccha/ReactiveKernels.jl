@@ -581,7 +581,7 @@ end
         y .~ NegativeBinomial.(eta, 0.4)
     end, Dn2)
     # A predictor-fed p fails at the contract gate (deferred, the
-    # BetaBinomial2 precedent — scalar p only in v1).
+    # Beta-kappa precedent — scalar p only in v1).
     @test_throws ContractValidationError lower_rkppl(quote
         eta = a .+ b .* x
         hu = c .+ d .* x
@@ -870,6 +870,31 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
     @test _query(built.spec, bound, :posterior, u3) ≈
         ll + pr + logjac(built.layout, u3)
     _check_gradient(built.spec, bound, u3)
+    # Predictor-fed precision under `exp.` (the log-precision submodel).
+    m = @rkppl begin
+        mu = a .+ b .* x
+        hup = e .+ f .* x
+        c .~ BetaBinomial2.(n, logistic.(mu), exp.(hup))
+    end
+    r = only(lower_rkppl(quote
+        mu = a .+ b .* x
+        hup = e .+ f .* x
+        c .~ BetaBinomial2.(n, logistic.(mu), exp.(hup))
+    end, (:c, :x, :n)).responses)
+    @test (r.family, r.trials) === (BetaBinomial2Fam, :n)
+    @test r.scale == ScalePredictorRef(:hup, LogLink)
+    bound = m(; c = cols[:c], x = cols[:x], n = cols[:n])
+    built = build_kernel(bound)
+    u4 = [0.5, -0.25, 0.1, 0.2]
+    nt = constrain(built.layout, u4)
+    mu = 1 ./ (1 .+ exp.(.-(nt.mu[1] .+ nt.mu[2] .* cols[:x])))
+    phi = exp.(nt.hup[1] .+ nt.hup[2] .* cols[:x])
+    ll = sum(_betabinomial2_logpdf(y, t, mm, p)
+        for (y, t, mm, p) in zip(cols[:c], cols[:n], mu, phi))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
+        logpdf(Normal(0, 1), nt.hup[1]) + logpdf(Normal(0, 1), nt.hup[2])
+    @test _query(built.spec, bound, :posterior, u4) ≈ ll + pr
+    _check_gradient(built.spec, bound, u4)
 end
 
 # Von-Mises scalar log-densities (Distributions.jl oracles; SB
@@ -1133,11 +1158,12 @@ end
         mu = a .+ b .* x
         c .~ BetaBinomial2.(zzz, logistic.(mu), 4.0)
     end, Dn3)
-    # A predictor-fed phi fails at the contract gate (Beta-kappa deferral).
+    # A precision predictor is never the response's own location
+    # predictor (distinct slots — the bare self-use reaches the
+    # contract gate).
     @test_throws ContractValidationError lower_rkppl(quote
         mu = a .+ b .* x
-        hup = e .+ f .* x
-        c .~ BetaBinomial2.(n, logistic.(mu), logistic.(hup))
+        c .~ BetaBinomial2.(n, logistic.(mu), mu)
     end, Dn3)
 end
 
