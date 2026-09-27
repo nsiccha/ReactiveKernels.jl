@@ -1703,7 +1703,7 @@ const ASSIGNMENT_FNS = (
 
 """Vector-returning whole-column functions (exact-GP slice): admitted in
 derived columns and predictor locations only; always vector-shaped."""
-const VECTOR_FNS = (:gp_exp_quad_cov, :gp_chol_latent)
+const VECTOR_FNS = (:gp_exp_quad_cov, :gp_periodic_cov, :gp_chol_latent)
 
 """Cell-callable functions (grouped kernels): admitted in grouped-kernel
 cell assignments ONLY, always with a declared schedule as the first

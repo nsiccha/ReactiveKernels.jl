@@ -83,7 +83,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     negative_binomial,
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson,
-    gp_exp_quad_cov, gp_chol_latent,
+    gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
 using SpecialFunctions: besseli, besselix, erfc, loggamma
 # Selective (explicit imports win over any re-export chain, so no `using`
