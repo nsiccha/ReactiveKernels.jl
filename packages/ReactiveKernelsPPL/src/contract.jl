@@ -105,6 +105,7 @@ univariate components, SB `MixtureModel` mirror)."""
     NegativeBinomialFam
     ExponentialLogFam
     LogNormalFam
+    WeibullFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -165,9 +166,9 @@ end
 A predictor-fed scale/shape use: the response's auxiliary (Gaussian
 sigma, NB2 dispersion phi, Gamma shape alpha, Beta concentration
 kappa, Student sigma, hurdle p_zero, VonMises concentration kappa;
-InverseGaussian lambda, BetaBinomial2 phi, NB1 p, and LogNormal sigma
-stay scalar-only) is a
-whole linear predictor, varying per observation.
+InverseGaussian lambda, BetaBinomial2 phi, NB1 p, LogNormal sigma,
+and Weibull k stay scalar-only) is a whole linear predictor, varying
+per observation.
 `predictor` names the
 [`PredictorSpec`](@ref) (planned exactly like a location predictor:
 terms, priors, one link); `link` is the scale use-site wrapper —
@@ -189,10 +190,10 @@ end
 One independent response. `scale` is the response's auxiliary —
 Gaussian sigma, NB2 dispersion phi, Gamma shape alpha, hurdle p_zero,
 InverseGaussian shape lambda, BetaBinomial2 precision phi, VonMises
-concentration kappa, NB1 success probability p, LogNormal scale sigma
-— either scalar (parameter, assignment, folded literal, or a raw
-per-observation data column) or, for Gaussian/NB2/Gamma/Beta/Student/hurdle/VonMises
-only, a
+concentration kappa, NB1 success probability p, LogNormal scale sigma,
+Weibull shape k — either scalar (parameter, assignment, folded
+literal, or a raw per-observation data column) or, for
+Gaussian/NB2/Gamma/Beta/Student/hurdle/VonMises only, a
 [`ScalePredictorRef`](@ref) (predictor-fed per-observation auxiliary);
 it must be `nothing` otherwise. A hurdle p_zero is a probability
 (scalar in [0, 1], predictor-fed logit-only). An NB1 p is a probability
@@ -203,7 +204,8 @@ predictor-fed log-only (a concentration). An InverseGaussian
 lambda is scalar-only (predictor-fed lambda deferred);
 a BetaBinomial2 phi is scalar-only (predictor-fed phi
 deferred); a LogNormal sigma is scalar-only
-(predictor-fed sigma deferred).
+(predictor-fed sigma deferred); a Weibull k is scalar-only
+(predictor-fed k deferred).
 (One slot covers every admitted family; a two-auxiliary family such as
 Beta needs a new field — noted, not built.) `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
@@ -1476,6 +1478,7 @@ const ADMITTED_TRIPLES = (
     (NegativeBinomialFam, LogLink, LogLink),
     (ExponentialLogFam, LogLink, LogLink),
     (LogNormalFam, IdentityLink, IdentityLink),
+    (WeibullFam, LogLink, LogLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order; `:student_t`
@@ -1866,7 +1869,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
     ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
-    NegativeBinomialFam, ExponentialLogFam, LogNormalFam)
+    NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -6955,6 +6958,13 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
             all(>=(0), col)) ||
             _fail(r.label, "Exponential response must be non-negative numerics")
         return nothing
+    elseif r.family === WeibullFam
+        # Strictly positive: the Weibull kernel guards y > 0 (Stan
+        # `weibull_lpdf` rejects y < 0 and returns -inf at y = 0 for
+        # k < 1) — fail closed instead of flowing a wrong value.
+        (eltype(col) <: Real && all(>(0), col)) ||
+            _fail(r.label, "Weibull response must be strictly positive numerics")
+        return nothing
     elseif r.family === VonMisesFam
         # Finite angles (Bool is not an angle support); a circular
         # response additionally honors the half-open principal interval
@@ -7142,7 +7152,8 @@ _scale_need(fam::LikelihoodFamily) =
     fam === BetaBinomial2Fam ? "BetaBinomial2 response requires a precision phi" :
     fam === VonMisesFam ? "VonMises response requires a concentration kappa" :
     fam === NegativeBinomialFam ? "NB1 response requires a success probability p" :
-    fam === LogNormalFam ? "LogNormal response requires a scale sigma" : nothing
+    fam === LogNormalFam ? "LogNormal response requires a scale sigma" :
+    fam === WeibullFam ? "Weibull response requires a shape k" : nothing
 
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     need = _scale_need(r.family)
@@ -7192,8 +7203,8 @@ end
 
 # A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha,
 # Beta kappa, Student sigma, hurdle p_zero, VonMises kappa;
-# InverseGaussian lambda, BetaBinomial2 phi, NB1 p, and LogNormal sigma
-# are deferred above):
+# InverseGaussian lambda, BetaBinomial2 phi, NB1 p, LogNormal sigma,
+# and Weibull k are deferred above):
 # the predictor exists, carries the use-site link (the
 # one-link-per-predictor rule), and is not the response's own location
 # predictor (the two slots take distinct predictors — the BRM-side plan
@@ -7224,6 +7235,10 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
         "LogNormal response with a scale predictor: predictor-fed " *
         "scale (sigma) is deferred — use a scalar sigma (parameter, " *
         "literal, or data column)")
+    fam === WeibullFam && _fail(r.label,
+        "Weibull response with a scale predictor: predictor-fed " *
+        "shape (k) is deferred — use a scalar k (parameter, literal, " *
+        "or data column)")
     (fam === GaussianFam || fam === NegativeBinomial2Fam ||
         fam === GammaLogFam || fam === BetaLogitFam ||
         fam === StudentTFam ||

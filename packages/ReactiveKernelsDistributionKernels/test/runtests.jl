@@ -1,7 +1,9 @@
+using DifferentiationInterface: AutoEnzyme, gradient
 using Distributions: Bernoulli, BetaBinomial, Cauchy, Dirichlet, Exponential,
     Geometric, InverseGamma, Laplace, LKJCholesky, Logistic, LogNormal,
     MvNormal, NegativeBinomial, Normal, Poisson,
-    TDist, Uniform, cdf, logpdf, quantile
+    TDist, Uniform, Weibull, cdf, logpdf, quantile
+import Enzyme
 using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky, diag
 using LogExpFunctions: log1pexp
 using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, code_expr, explain,
@@ -20,10 +22,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE,
     LKJ_CORR_CHOLESKY_KERNEL_SOURCE,
     NEGATIVE_BINOMIAL_KERNEL_SOURCE,
+    WEIBULL_KERNEL_SOURCE,
     normal, cauchy, laplace, logistic, bernoulli, lognormal,
     exponential, geometric, uniform, mvnormal, ar1,
     categorical_logit, categorical_logit_ref,
-    negative_binomial2, beta_binomial, negative_binomial,
+    negative_binomial2, beta_binomial, negative_binomial, weibull,
     inverse_gamma, dirichlet, lkj_corr_cholesky, zero_inflated_poisson,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 using Test
@@ -519,6 +522,71 @@ end
         @test !isnan(v)
     end
     @test occursin("@kernel negative_binomial", NEGATIVE_BINOMIAL_KERNEL_SOURCE)
+end
+
+@testset "weibull Stan lpdf parity" begin
+    # Weibull(k, theta) is Stan's weibull(alpha = k, sigma = theta):
+    # Julia→Stan passthrough — Distributions.Weibull is the direct
+    # independent oracle.
+    wb = prepare(weibull.logpdf;
+        have = (:x, :k, :theta), want = :logpdf)
+    for (x, k, th) in ((1.5, 2.0, 1.2), (0.5, 0.7, 2.0), (3.0, 5.0, 0.5),
+            (0.1, 1.0, 1.0), (2.0, 3.0, 4.0))
+        @test wb(x, k, th) ≈ logpdf(Weibull(k, th), x)
+    end
+    # The log_theta HAVE route agrees (the Poisson log_rate precedent).
+    wbl = prepare(weibull.logpdf;
+        have = (:x, :k, :log_theta), want = :logpdf)
+    for (x, k, th) in ((1.5, 2.0, 1.2), (0.5, 0.7, 2.0), (3.0, 5.0, 0.5))
+        @test wbl(x, k, log(th)) ≈ logpdf(Weibull(k, th), x)
+    end
+    # Closed-form cdf/quantile (the exponential precedent). The
+    # roundtrip points keep cdf strictly inside (0, 1) (at (3.0, 5.0,
+    # 0.5) cdf saturates to exactly 1.0 and quantile rightly returns
+    # Inf, like Distributions').
+    wbc = prepare(weibull.cdf; have = (:x, :k, :theta), want = :cdf)
+    wbq = prepare(weibull.quantile; have = (:p, :k, :theta), want = :quantile)
+    for (x, k, th) in ((1.5, 2.0, 1.2), (0.5, 0.7, 2.0), (3.0, 5.0, 0.5))
+        @test wbc(x, k, th) ≈ cdf(Weibull(k, th), x)
+    end
+    for (x, k, th) in ((1.5, 2.0, 1.2), (0.5, 0.7, 2.0))
+        @test wbq(cdf(Weibull(k, th), x), k, th) ≈ x
+    end
+    for (p, k, th) in ((0.1, 2.0, 1.2), (0.5, 0.7, 2.0), (0.9, 5.0, 0.5))
+        @test wbq(p, k, th) ≈ quantile(Weibull(k, th), p)
+    end
+    @test wbc(0.0, 2.0, 1.2) == 0.0
+    @test wbc(-1.0, 2.0, 1.2) == 0.0
+    # Impossible events are -Inf, never NaN (lazy support guard). A
+    # negative theta throws DomainError from the eager `log_theta`
+    # derivation instead (the Poisson `log_rate` precedent — in-plan
+    # theta = exp(lp) > 0 always).
+    @test wb(0.0, 2.0, 1.2) == -Inf
+    @test wb(-1.0, 2.0, 1.2) == -Inf
+    @test wb(1.5, 0.0, 1.2) == -Inf
+    @test wb(1.5, -1.0, 1.2) == -Inf
+    @test wb(1.5, 2.0, 0.0) == -Inf
+    @test_throws DomainError wb(1.5, 2.0, -1.0)
+    for v in (wb(0.0, 2.0, 1.2), wb(-1.0, 2.0, 1.2), wb(1.5, 0.0, 1.2),
+            wb(1.5, -1.0, 1.2), wb(1.5, 2.0, 0.0))
+        @test !isnan(v)
+    end
+    # Generic-Enzyme reverse through the prepared kernel (no rule: the
+    # body is transparent math) vs the closed-form partials — which are
+    # Stan's published `weibull_lpdf` partials
+    # (`stan/math/prim/prob/weibull_lpdf.hpp`).
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for (x, k, th) in ((1.5, 2.0, 1.2), (0.5, 0.7, 2.0), (3.0, 5.0, 0.5))
+        z = x / th
+        P = z^k
+        lz = log(z)
+        @test gradient(v -> wb(v, k, th), backend, x) ≈ ((k - 1) - k * P) / x
+        @test gradient(v -> wb(x, v, th), backend, k) ≈ 1 / k + (1 - P) * lz
+        @test gradient(v -> wb(x, k, v), backend, th) ≈ k * (P - 1) / th
+        @test gradient(v -> wbl(v, k, log(th)), backend, x) ≈
+            ((k - 1) - k * P) / x
+    end
+    @test occursin("@kernel weibull", WEIBULL_KERNEL_SOURCE)
 end
 
 @testset "zero_inflated_poisson Stan lpmf parity" begin

@@ -742,6 +742,27 @@ function _gen_ig_plan(; lam = :lam)
     return plan
 end
 
+function _gen_weibull_plan(; k = :k)
+    cols, n = _gen_columns()
+    params = k isa Symbol ? SampledParameter[
+        SampledParameter(:k, :lognormal, (arg1 = 0.0, arg2 = 0.3), nothing, :k)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(WeibullFam, LogLink, :y, :eta,
+            k, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_weibull(cols, coef, k)
+    th = exp.(coef[1] .+ coef[2] .* cols[:x])
+    return sum(logpdf(Weibull(k, t), y) for (y, t) in zip(cols[:y], th))
+end
+
 function _gen_betabinomial2_plan(; phi = :phi, trials = :n)
     cols, n = _gen_columns()
     cols[:y] = [6, 8, 5, 9, 4, 7]
@@ -879,6 +900,49 @@ end
     u = [0.5, -0.25]
     nt = constrain(built.layout, u)
     ll = _ref_ig(plan.columns, Vector(nt.eta), 1.5)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weibull values and gradient" begin
+    plan = _gen_weibull_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_weibull(plan.columns, Vector(nt.eta), nt.k)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(LogNormal(0.0, 0.3), nt.k)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weibull literal-k values" begin
+    plan = _gen_weibull_plan(; k = 2.0)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_weibull(plan.columns, Vector(nt.eta), 2.0)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted weibull values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(WeibullFam, LogLink, :y, :eta,
+            2.0, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    th = exp.(Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x])
+    ll = sum(cols[:w] .*
+        [logpdf(Weibull(2.0, t), y) for (y, t) in zip(cols[:y], th)])
     pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, plan, u)
