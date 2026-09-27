@@ -1521,18 +1521,22 @@ function _gaussian_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, lpv::Symbo
 end
 
 # Student-t plate: the Gaussian shape with a df argument — validation
-# guarantees `nu` (a sampled name or literal) and sigma, and fails
-# evidence closed (the Gaussian/Poisson-only gate), so the cell is the
-# plain `student_t` endpoint plus optional weights.
+# guarantees `nu` (a sampled name, a literal, or a predictor-fed
+# per-observation nu) and sigma, and fails evidence closed (the
+# Gaussian/Poisson-only gate), so the cell is the plain `student_t`
+# endpoint plus optional weights. A predictor-fed nu binds its own
+# `_ppl_sc_<label>_nu` node (the `_nu`-suffixed label cannot collide
+# with any `<lhs>_resp` scale node), so scale and nu predictors coexist.
 function _student_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
+    nuarg = _scale_use_plate_arg(r, plan, pre, r.nu, Symbol(r.label, :_nu))
     inputs = Any[y, lp]
     yv, lpv = _dovar(1), _dovar(2)
     sref = _thread_ref!(inputs, sarg)
-    nuv = _thread_ref!(inputs, r.nu)
+    nuv = _thread_ref!(inputs, nuarg)
     cell = :(student_t($nuv, $lpv, $sref).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)

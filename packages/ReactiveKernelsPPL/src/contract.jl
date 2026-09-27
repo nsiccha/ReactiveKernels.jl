@@ -165,10 +165,10 @@ end
 
 A predictor-fed scale/shape use: the response's auxiliary (Gaussian
 sigma, NB2 dispersion phi, Gamma shape alpha, Beta concentration
-kappa, Student sigma, hurdle p_zero, VonMises concentration kappa;
-InverseGaussian lambda, BetaBinomial2 phi, NB1 p, LogNormal sigma,
-and Weibull k stay scalar-only) is a whole linear predictor, varying
-per observation.
+kappa, Student sigma, Student nu, hurdle p_zero, VonMises
+concentration kappa; InverseGaussian lambda, BetaBinomial2 phi,
+NB1 p, LogNormal sigma, and Weibull k stay scalar-only) is a whole
+linear predictor, varying per observation.
 `predictor` names the
 [`PredictorSpec`](@ref) (planned exactly like a location predictor:
 terms, priors, one link); `link` is the scale use-site wrapper —
@@ -176,8 +176,9 @@ terms, priors, one link); `link` is the scale use-site wrapper —
 (`exp.(predictor)`), or [`LogitLink`](@ref) (`logistic.(predictor)`) —
 and must equal the predictor's own link (the one-link-per-predictor
 rule). The generator binds the constrained vector once per response
-(`_ppl_sc_<label>`) and threads it through the likelihood plate per
-cell, so evidence corrections read the per-cell scale.
+(`_ppl_sc_<label>`, `_ppl_sc_<label>_nu` for the Student nu slot) and
+threads it through the likelihood plate per cell, so evidence
+corrections read the per-cell scale.
 """
 struct ScalePredictorRef
     predictor::Symbol
@@ -207,7 +208,12 @@ deferred); a LogNormal sigma is scalar-only
 (predictor-fed sigma deferred); a Weibull k is scalar-only
 (predictor-fed k deferred).
 (One slot covers every admitted family; a two-auxiliary family such as
-Beta needs a new field — noted, not built.) `weights` is a
+Beta needs a new field — noted, not built.) `nu` is the StudentT
+degrees of freedom, `nothing` otherwise: a sampled parameter/assignment
+name, a finite-positive literal, or a [`ScalePredictorRef`](@ref)
+(predictor-fed per-observation nu — the scale-slot mechanism, with its
+own `_ppl_sc_<label>_nu` node so scale and nu predictors coexist).
+`weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
 closed emitter-side. `trials` is the Binomial/BetaBinomial2 trial count
 (Int column or Int literal), `nothing` otherwise. `range` carries a literal `y[1:N]`
@@ -365,7 +371,7 @@ struct LikelihoodSpec
     mixture_locs::Vector{Union{Symbol,Real}}
     mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
     mixture_weights::Union{Nothing,Symbol,Vector{Float64}}
-    nu::Union{Nothing,ParamName,Real}
+    nu::Union{Nothing,ParamName,Real,ScalePredictorRef}
     zi::Union{Nothing,ParamName,Real}
     mi_jobs::Union{Nothing,ColumnRef}
     interval::Union{Nothing,Tuple{Float64,Float64}}
@@ -400,7 +406,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}} =
             Union{Nothing,Symbol,Real,ScalePredictorRef}[],
         mixture_weights::Union{Nothing,Symbol,Vector{Float64}} = nothing,
-        nu::Union{Nothing,ParamName,Real} = nothing,
+        nu::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         zi::Union{Nothing,ParamName,Real} = nothing,
         mi_jobs::Union{Nothing,ColumnRef} = nothing,
         interval::Union{Nothing,Tuple{Float64,Float64}} = nothing)
@@ -2652,6 +2658,8 @@ function _response_uses_predictor(r::LikelihoodSpec, pname::Symbol)
     r.predictor === pname && return true
     pname in r.extra_predictors && return true
     r.scale isa ScalePredictorRef && r.scale.predictor === pname &&
+        return true
+    r.nu isa ScalePredictorRef && r.nu.predictor === pname &&
         return true
     # Mixture slots ride dedicated fields (the anchor may name a
     # parameter, and non-anchor component predictors live in the slots).
@@ -6765,9 +6773,12 @@ function _validate_responses(plan::StructuralPlan)
             continue
         end
         # A scale predictor feeds a slot exactly like a location predictor,
-        # so it counts toward the unused-predictor check below.
+        # so it counts toward the unused-predictor check below. A
+        # predictor-fed nu counts the same way.
         r.scale isa ScalePredictorRef &&
             push!(used_predictors, r.scale.predictor)
+        r.nu isa ScalePredictorRef &&
+            push!(used_predictors, r.nu.predictor)
         # A scan-state latent vector location: the mean is the carried state
         # directly (no linear predictor). Slice 1 admits Gaussian-identity only.
         if r.predictor in scan_states
@@ -7202,17 +7213,19 @@ function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
 end
 
 # A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha,
-# Beta kappa, Student sigma, hurdle p_zero, VonMises kappa;
-# InverseGaussian lambda, BetaBinomial2 phi, NB1 p, LogNormal sigma,
-# and Weibull k are deferred above):
+# Beta kappa, Student sigma, Student nu, hurdle p_zero, VonMises
+# kappa; InverseGaussian lambda, BetaBinomial2 phi, NB1 p, LogNormal
+# sigma, and Weibull k are deferred above):
 # the predictor exists, carries the use-site link (the
 # one-link-per-predictor rule), and is not the response's own location
-# predictor (the two slots take distinct predictors — the BRM-side plan
-# rule, mirrored here as defense in depth). Predictor-fed Binomial
-# trials are deferred (trials stay column-or-literal by type). A hurdle
-# p_zero predictor is logit-only (a probability); a Beta or VonMises
-# kappa predictor is log-only (a concentration); the remaining admitted
-# scale families take identity/log/logit.
+# predictor (slots take distinct predictors — the BRM-side plan rule,
+# mirrored here as defense in depth; the Student nu/scale cross-hit is
+# enforced at the nu gate, where both slots are visible).
+# Predictor-fed Binomial trials are deferred (trials stay
+# column-or-literal by type). A hurdle p_zero predictor is logit-only
+# (a probability); a Beta or VonMises kappa predictor is log-only (a
+# concentration); the remaining admitted families take identity/log/logit
+# on either slot.
 function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
         s::ScalePredictorRef)
     return _validate_scale_predictor_use(r, plan, s, r.family, [r.predictor])
@@ -7220,30 +7233,30 @@ end
 
 function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
         s::ScalePredictorRef, fam::LikelihoodFamily,
-        forbidden::Vector{Symbol})
+        forbidden::Vector{Symbol}, slot::String = "scale")
     fam === InverseGaussianFam && _fail(r.label,
-        "InverseGaussian response with a scale predictor: predictor-fed " *
+        "InverseGaussian response with a $slot predictor: predictor-fed " *
         "shape (lambda) is deferred — use a scalar lambda (parameter or literal)")
     fam === BetaBinomial2Fam && _fail(r.label,
-        "BetaBinomial2 response with a scale predictor: predictor-fed " *
+        "BetaBinomial2 response with a $slot predictor: predictor-fed " *
         "precision (phi) is deferred — use a scalar phi (parameter or literal)")
     fam === NegativeBinomialFam && _fail(r.label,
-        "NB1 response with a scale predictor: predictor-fed " *
+        "NB1 response with a $slot predictor: predictor-fed " *
         "success probability (p) is deferred — use a scalar p (parameter, " *
         "literal, or data column)")
     fam === LogNormalFam && _fail(r.label,
-        "LogNormal response with a scale predictor: predictor-fed " *
+        "LogNormal response with a $slot predictor: predictor-fed " *
         "scale (sigma) is deferred — use a scalar sigma (parameter, " *
         "literal, or data column)")
     fam === WeibullFam && _fail(r.label,
-        "Weibull response with a scale predictor: predictor-fed " *
+        "Weibull response with a $slot predictor: predictor-fed " *
         "shape (k) is deferred — use a scalar k (parameter, literal, " *
         "or data column)")
     (fam === GaussianFam || fam === NegativeBinomial2Fam ||
         fam === GammaLogFam || fam === BetaLogitFam ||
         fam === StudentTFam ||
         fam === HurdlePoissonFam || fam === VonMisesFam) ||
-        _fail(r.label, "this response family takes no scale predictor")
+        _fail(r.label, "this response family takes no $slot predictor")
     if fam === HurdlePoissonFam
         s.link === LogitLink ||
             _fail(r.label, "hurdle p_zero predictor link must be logit " *
@@ -7259,19 +7272,19 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
     else
         (s.link === IdentityLink || s.link === LogLink ||
             s.link === LogitLink) ||
-            _fail(r.label, "scale predictor link must be identity, log, or " *
+            _fail(r.label, "$slot predictor link must be identity, log, or " *
                 "logit (got $(s.link))")
     end
     idx = findfirst(p -> p.name === s.predictor, plan.predictors)
     idx === nothing && _fail(r.label,
-        "scale addresses unknown predictor $(s.predictor)")
+        "$slot addresses unknown predictor $(s.predictor)")
     pred = plan.predictors[idx]
     pred.link === s.link ||
-        _fail(r.label, "scale predictor $(s.predictor) carries link " *
-            "$(pred.link), scale use wraps $(s.link) — one link per predictor")
+        _fail(r.label, "$slot predictor $(s.predictor) carries link " *
+            "$(pred.link), $slot use wraps $(s.link) — one link per predictor")
     s.predictor in forbidden &&
-        _fail(r.label, "scale predictor $(s.predictor) is the response's " *
-            "own location predictor — location and scale take distinct " *
+        _fail(r.label, "$slot predictor $(s.predictor) is the response's " *
+            "own location predictor — location and $slot take distinct " *
             "predictors")
     return nothing
 end
@@ -7323,9 +7336,9 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
     return nothing
 end
 
-# Student degrees of freedom: required (a sampled parameter/assignment name
-# or a finite-positive literal), scalar only — no per-observation columns,
-# no predictor-fed nu (a modeled nu is deferred). Unknown names fail
+# Student degrees of freedom: required (a sampled parameter/assignment
+# name, a finite-positive literal, or a predictor-fed per-observation nu),
+# scalar only — no per-observation columns. Unknown names fail
 # structurally: unlike scale there is no bind-time column form to defer to.
 function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family !== StudentTFam
@@ -7336,7 +7349,18 @@ function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
     n = r.nu
     n === nothing &&
         _fail(r.label, "Student response requires nu (degrees of freedom, " *
-            "parameter or literal)")
+            "parameter, literal, or predictor)")
+    if n isa ScalePredictorRef
+        # All three slots take distinct predictors: the scale slot's
+        # forbidden list covers location only, so the nu/scale cross-hit
+        # is enforced here, where both slots are visible.
+        r.scale isa ScalePredictorRef && n.predictor === r.scale.predictor &&
+            _fail(r.label, "nu predictor $(n.predictor) is the response's " *
+                "own scale predictor — location, scale, and nu take " *
+                "distinct predictors")
+        return _validate_scale_predictor_use(r, plan, n, r.family,
+            [r.predictor], "nu")
+    end
     n isa Real && ((isfinite(n) && n > 0) ||
         _fail(r.label, "nu literal must be finite positive"))
     n isa Symbol && (n in _union_names(plan) ||

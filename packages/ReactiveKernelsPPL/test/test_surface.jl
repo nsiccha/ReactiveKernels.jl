@@ -390,12 +390,29 @@ end
         mu = a .+ b .* x
         y .~ StudentT.(2.0 + 2.0, mu, 2.0)
     end, Dn2)
-    # Predictor-fed nu is deferred.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ b .* x
-        nupred = c .+ d .* x
-        y .~ StudentT.(nupred, mu, 2.0)
-    end, Dn2)
+    # Predictor-fed nu is admitted (the modeled-nu vscale shape): bare
+    # for identity, `exp.`/`logistic.` for log/logit.
+    let r = only(lower_rkppl(quote
+            mu = a .+ b .* x
+            nupred = c .+ d .* x
+            y .~ StudentT.(nupred, mu, 2.0)
+        end, Dn2).responses)
+        @test r.nu == ScalePredictorRef(:nupred, IdentityLink)
+    end
+    let r = only(lower_rkppl(quote
+            mu = a .+ b .* x
+            nupred = c .+ d .* x
+            y .~ StudentT.(exp.(nupred), mu, 2.0)
+        end, Dn2).responses)
+        @test r.nu == ScalePredictorRef(:nupred, LogLink)
+    end
+    let r = only(lower_rkppl(quote
+            mu = a .+ b .* x
+            nupred = c .+ d .* x
+            y .~ StudentT.(logistic.(nupred), mu, 2.0)
+        end, Dn2).responses)
+        @test r.nu == ScalePredictorRef(:nupred, LogitLink)
+    end
 end
 
 # Hurdle-Poisson scalar log-density (BRM `HurdlePoisson` math, Base-only:

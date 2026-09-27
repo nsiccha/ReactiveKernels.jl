@@ -592,6 +592,50 @@ end
             ScalePredictorRef(:mu, IdentityLink), nothing,
             _none_evidence(), :y_resp, nothing, nothing; nu = :nu)
     @test_throws ContractValidationError validate_plan(bad)
+    # A predictor-fed nu is admitted on every link (the modeled-nu
+    # vscale shape — the sigma precedent above).
+    for link in (IdentityLink, LogLink, LogitLink)
+        good = _student_plan()
+        push!(good.predictors, PredictorSpec(:nup, link, _terms(), :nup))
+        append!(good.population_priors, _priors(:nup))
+        good.responses[1] =
+            LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
+                _none_evidence(), :y_resp, nothing, nothing;
+                nu = ScalePredictorRef(:nup, link))
+        @test validate_plan(good) === nothing
+    end
+    # But not the response's own location predictor.
+    bad = _student_plan()
+    bad.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp, nothing, nothing;
+            nu = ScalePredictorRef(:mu, IdentityLink))
+    @test_throws ContractValidationError validate_plan(bad)
+    # Nor the response's own scale predictor (all three slots distinct).
+    bad = _student_plan()
+    push!(bad.predictors, PredictorSpec(:sc, LogLink, _terms(), :sc))
+    append!(bad.population_priors, _priors(:sc))
+    bad.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu,
+            ScalePredictorRef(:sc, LogLink), nothing,
+            _none_evidence(), :y_resp, nothing, nothing;
+            nu = ScalePredictorRef(:sc, LogLink))
+    @test_throws ContractValidationError validate_plan(bad)
+    # The nu predictor must exist and carry the use-site link.
+    bad = _student_plan()
+    bad.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp, nothing, nothing;
+            nu = ScalePredictorRef(:nosuch, LogLink))
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _student_plan()
+    push!(bad.predictors, PredictorSpec(:nup, IdentityLink, _terms(), :nup))
+    append!(bad.population_priors, _priors(:nup))
+    bad.responses[1] =
+        LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp, nothing, nothing;
+            nu = ScalePredictorRef(:nup, LogLink))
+    @test_throws ContractValidationError validate_plan(bad)
 end
 
 @testset "hurdle response validation" begin
