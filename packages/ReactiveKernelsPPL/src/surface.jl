@@ -588,12 +588,14 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         push!(used_locs, r.predictor)
         union!(used_locs, r.extra_predictors)
         # A scale predictor's definition is absorbed like a location's —
-        # never also a derived column. A predictor-fed nu absorbs the
-        # same way.
+        # never also a derived column. A predictor-fed nu or ZIP zi
+        # absorbs the same way.
         r.scale isa ScalePredictorRef &&
             push!(used_locs, r.scale.predictor)
         r.nu isa ScalePredictorRef &&
             push!(used_locs, r.nu.predictor)
+        r.zi isa ScalePredictorRef &&
+            push!(used_locs, r.zi.predictor)
         # Mixture component predictors absorb like locations (non-predictor
         # slot names are not definitions — `_absorbed_skip` ignores them).
         if r.family === MixtureFam
@@ -4279,7 +4281,7 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
     nu = _lower_nu_use(lhs, nu_raw, ctx, predictors, pred_idx, coefuse)
-    zi = _lower_zi_use(lhs, zi_raw, ctx)
+    zi = _lower_zi_use(lhs, zi_raw, ctx, predictors, pred_idx, coefuse)
     interval = _lower_interval_use(lhs, interval_raw, ctx)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
         evidence, Symbol(lhs, "_resp"), trials, range; nu = nu, zi = zi,
@@ -5577,27 +5579,67 @@ function _lower_nu_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
     return ScalePredictorRef(pname, link)
 end
 
-# ZIP zi use-site lowering: a bare parameter/assignment name or a
-# literal, scalar only — no per-observation columns (a column name fails
-# at the contract's unknown-name gate), no predictor-fed zi (a modeled
-# zi submodel is deferred), no expressions (bind via an assignment
-# first).
-function _lower_zi_use(lhs, s, ctx)
+# ZIP zi use-site lowering (the hurdle p_zero precedent): a scalar zi
+# (parameter/assignment name, literal) passes through untouched; a
+# predictor definition feeds the zi slot — bare for an identity-link zi,
+# or under one dotted link wrapper (`logistic.(zeta)` for logit,
+# `exp.(zeta)` for log). The wrapper arrives unconverted (the zi
+# position passes the spine converter through), so it matches here in
+# dotted `Expr(:., ...)` form. Undotted wrappers fail closed (scalar
+# `exp(log_zi)` use-site wrappers are deferred — the LP link spells the
+# transform instead), as do wrappers over anything but a predictor
+# definition. The contract gates the link (logit-only — a probability)
+# and the predictor rules, so hand-built plans get the same rule. No
+# per-observation columns (a column name fails at the contract's
+# unknown-name gate), no expressions (bind via an assignment first).
+function _lower_zi_use(lhs, s, ctx, predictors, pred_idx, coefuse)
     s === nothing && return nothing
     s isa Real && return s
-    if s isa Symbol
-        # Bare use: stated-prior aliases are scalar zi, like a bare
-        # scale — only undeclared/vector/factor defs count as
-        # predictor-fed here.
-        _is_scale_predictor_def(s, ctx, false) && _sfail(
-            "response $lhs zi $s is a predictor definition — " *
-            "predictor-fed zi (a modeled zi submodel) is deferred: use " *
-            "a scalar zi (parameter or literal)")
-        return s
+    if s isa Expr && s.head === :.
+        return _lower_zi_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
     end
+    if s isa Expr && s.head === :call && !isempty(s.args) &&
+            s.args[1] isa Symbol && s.args[1] in (:exp, :logistic)
+        return _sfail("response $lhs zi wraps `$(s.args[1])` undotted " *
+                      "(`$(repr(s))`) — zi link wrappers broadcast " *
+                      "(`$(s.args[1]).(predictor)` over a predictor " *
+                      "definition); scalar `exp(log_zi)` use-site " *
+                      "wrappers are deferred (spell the transform as the " *
+                      "predictor's link instead)")
+    end
+    # A bare zi keeps the scalar meaning: an alias over a stated prior
+    # lowers like the name itself (a parameter), never as a predictor.
+    if s isa Symbol && _is_scale_predictor_def(s, ctx, false)
+        pname = _lower_scale_predictor(lhs, s, IdentityLink, ctx, predictors,
+            pred_idx, coefuse)
+        return ScalePredictorRef(pname, IdentityLink)
+    end
+    s isa Symbol && return s
     return _sfail("response $lhs zi must be a bare parameter/assignment " *
-                  "name or a literal (bind expressions via an assignment " *
-                  "first), got $(repr(s))")
+                  "name, a literal, a bare predictor definition, or one " *
+                  "`exp.`/`logistic.` wrapper over a predictor definition " *
+                  "(bind expressions via an assignment first), got $(repr(s))")
+end
+
+function _lower_zi_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+    f = length(s.args) >= 1 ? s.args[1] : nothing
+    targs = length(s.args) == 2 && s.args[2] isa Expr &&
+            s.args[2].head === :tuple ? s.args[2].args : Any[]
+    if !(f isa Symbol && f in (:exp, :logistic)) || length(targs) != 1
+        return _sfail("response $lhs zi $(repr(s)) is not an admitted " *
+                      "zi use — write a bare parameter/assignment name, " *
+                      "a literal, a bare predictor definition, or one " *
+                      "`exp.`/`logistic.` wrapper over a predictor definition")
+    end
+    inner = only(targs)
+    inner isa Symbol && _is_scale_predictor_def(inner, ctx, true) || return _sfail(
+        "response $lhs zi $(repr(s)): `$f.` wraps a predictor " *
+        "definition (`$f.(predictor)` with `predictor = ...` affine in " *
+        "data) — got $(repr(inner))")
+    link = f === :exp ? LogLink : LogitLink
+    pname = _lower_scale_predictor(lhs, inner, link, ctx, predictors,
+        pred_idx, coefuse)
+    return ScalePredictorRef(pname, link)
 end
 
 # VonMises interval use-site lowering: `nothing` for exact `VonMises`

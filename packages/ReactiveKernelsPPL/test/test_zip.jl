@@ -1,10 +1,13 @@
 # Zero-inflated Poisson response (SB `ZeroInflatedPoisson` mirror):
+# surface admission, value parity vs a BRM-math hand oracle (literal /
+# Beta-sampled / predictor-fed zi), Enzyme-vs-findiff gradients,
 # Reactant/XLA value+grad parity at unconstrained probes (native vs
 # compiled), plus the traced program size. (`_findiff_grad` /
 # `_GEN_BACKEND` come from test_generator.jl, included first.)
 using DifferentiationInterface
 using Distributions: Beta, Normal, Poisson, logpdf
 using Enzyme
+using LogExpFunctions: logaddexp
 using Random: Xoshiro, rand, randn
 using ReactiveKernels
 using ReactiveKernelsPPL
@@ -46,8 +49,99 @@ function _zip_reactant_measure(built, bound, post_q, u)
         rval = Float64(rval), rgrad = Array(rgrad))
 end
 
+# Shared N=6 term-nuisance columns (spec brief
+# 2026-09-27T14-14-33-651-1mcop44 on
+# BayesianRegressionModels:rk:parity-term-nuisance).
+const _ZIP_X = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+const _ZIP_Z = [1.0, 0.5, -0.5, 1.5, 0.0, -1.0]
+const _ZIP_C = [0, 1, 3, 0, 2, 1]
+_zip_cols() = Dict{Symbol,AbstractVector}(:c => copy(_ZIP_C),
+    :x => copy(_ZIP_X), :z => copy(_ZIP_Z))
+
+@testset "zip surface admission" begin
+    @testset "logit-wrapped zi submodel" begin
+        plan = lower_rkppl(quote
+                eta = a .+ b .* x
+                zeta = d .+ e .* z
+                c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
+            end, (:c, :x, :z))
+        r = only(plan.responses)
+        @test r.zi == ScalePredictorRef(:zeta, LogitLink)
+        pred = only(p for p in plan.predictors if p.name === :zeta)
+        @test pred.link === LogitLink
+        @test count(p -> p.name === :zeta, plan.predictors) == 1
+    end
+    @testset "exp-wrapped zi fails the logit-only gate" begin
+        @test_throws ContractValidationError lower_rkppl(quote
+                eta = a .+ b .* x
+                zeta = d .+ e .* z
+                c .~ ZeroInflatedPoisson.(exp.(eta), exp.(zeta))
+            end, (:c, :x, :z))
+    end
+    @testset "bare zi predictor fails the logit-only gate" begin
+        @test_throws ContractValidationError lower_rkppl(quote
+                eta = a .+ b .* x
+                zeta = d .+ e .* z
+                c .~ ZeroInflatedPoisson.(exp.(eta), zeta)
+            end, (:c, :x, :z))
+    end
+end
+
+# Posterior at a constrained probe (world-age-safe call).
+_zip_posterior(kern, lay, q::NamedTuple) =
+    Base.invokelatest(kern, unconstrain(lay, q))
+
+# Scalar ZIP log-density (Stan `zero_inflated_poisson_lpmf` math).
+_zip_ref(y::Integer, lam::Real, zi::Real) =
+    y == 0 ? logaddexp(log(zi), log1p(-zi) - lam) :
+        log1p(-zi) + logpdf(Poisson(lam), y)
+
+@testset "zip value parity" begin
+    @testset "modeled zi" begin
+        _, _, kern, lay = _zip_query(quote
+                eta = a .+ b .* x
+                zeta = d .+ e .* z
+                c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
+            end, _zip_cols())
+        q = (eta = [0.5, -0.25], zeta = [0.1, 0.2])
+        got = _zip_posterior(kern, lay, q)
+        lam = exp.(q.eta[1] .+ q.eta[2] .* _ZIP_X)
+        zi = 1 ./ (1 .+ exp.(-(q.zeta[1] .+ q.zeta[2] .* _ZIP_Z)))
+        want = sum(_zip_ref(y, l, p) for (y, l, p) in zip(_ZIP_C, lam, zi)) +
+            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
+            logpdf(Normal(0, 1), q.zeta[1]) + logpdf(Normal(0, 1), q.zeta[2])
+        @test got ≈ want rtol = 1e-12
+    end
+end
+
+# One Enzyme-vs-findiff gradient check at a constrained probe (no oracle
+# needed).
+function _zip_enzyme_check(prog::Expr, cols::Dict{Symbol,AbstractVector},
+        q::NamedTuple)
+    bound, built, kern, lay = _zip_query(prog, cols)
+    u = unconstrain(lay, q)
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    _, _ = sampler_value_and_gradient!(prep, g, u)
+    @test all(isfinite, g)
+    @test isapprox(g, _findiff_grad(w -> Base.invokelatest(kern, w), u);
+        rtol = 1e-5, atol = 1e-7)
+    return g
+end
+
+@testset "zip Enzyme gradients" begin
+    @testset "modeled zi" begin
+        _zip_enzyme_check(quote
+                eta = a .+ b .* x
+                zeta = d .+ e .* z
+                c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
+            end, _zip_cols(), (eta = [0.5, -0.25], zeta = [0.1, 0.2]))
+    end
+end
+
 @testset "zip under Reactant" begin
     x = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0, 0.2, -0.3]
+    z = [1.0, 0.5, -0.5, 1.5, 0.0, -1.0, 0.7, -0.4]
     progs = [
         ("sampled-zi", quote
             a ~ Normal(0, 1)
@@ -64,6 +158,16 @@ end
             y .~ ZeroInflatedPoisson.(exp.(eta), 0.25)
         end, Dict{Symbol,AbstractVector}(:y => [0, 1, 2, 0, 3, 1, 0, 2],
             :x => x)),
+        ("modeled-zi", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            d ~ Normal(0, 1)
+            e ~ Normal(0, 1)
+            eta = a .+ b .* x
+            zeta = d .+ e .* z
+            y .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
+        end, Dict{Symbol,AbstractVector}(:y => [0, 1, 2, 0, 3, 1, 0, 2],
+            :x => x, :z => z)),
     ]
     for (name, prog, cols) in progs
         @testset "$name" begin
@@ -162,6 +266,42 @@ _zip_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         @test all(isfinite, g)
         want = _zip_sb_vec(names, [Symbol("eta.Intercept") => 19.760035335326634,
             Symbol("eta.x") => 1.5136408591772776])
+        @test maximum(abs.(g .- want)) < 1e-10
+    end
+    @testset "term-nuisance Z1 modeled zi" begin
+        # SB: log(lambda) ~ 1 + x, logit(zi) ~ 1 + z (std_normal betas);
+        # c ~ ZeroInflatedPoisson(lambda, zi). Shared N=6 columns with
+        # the term-nuisance spec (brief 2026-09-27T14-14-33-651-1mcop44
+        # on BayesianRegressionModels:rk:parity-term-nuisance, BRM
+        # 97bb538, StanBlocks 24578c3, BridgeStan 2.9.0, Julia 1.10.11):
+        # full posterior at u_unc, propto=false, Jacobian included,
+        # BridgeStan AD grads.
+        # u (SB order [b0_lam, b1_lam, b0_zi, b1_zi]) =
+        # [0.2, -0.1, -0.5, 0.3].
+        prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            d ~ Normal(0, 1)
+            e ~ Normal(0, 1)
+            eta = a .+ b .* x
+            zeta = d .+ e .* z
+            c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
+        end
+        bound, built, kern, lay = _zip_query(prog, _zip_cols())
+        names = coordinate_names(lay)
+        u = _zip_sb_vec(names, [Symbol("eta.Intercept") => 0.2,
+            Symbol("eta.x") => -0.1, Symbol("zeta.Intercept") => -0.5,
+            Symbol("zeta.z") => 0.3])
+        @test abs(Base.invokelatest(kern, u) - (-12.817555472510582)) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        want = _zip_sb_vec(names,
+            [Symbol("eta.Intercept") => 1.3994279452027645,
+                Symbol("eta.x") => 2.749163921471043,
+                Symbol("zeta.Intercept") => -0.3947193742893724,
+                Symbol("zeta.z") => 0.661995785655106])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end

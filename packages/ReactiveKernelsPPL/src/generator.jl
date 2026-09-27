@@ -1664,15 +1664,21 @@ function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
 end
 
 # ZIP plate: the Poisson-plate shape with a zero-inflation argument —
-# validation guarantees `zi` (a sampled name or literal) and fails
-# evidence closed (the Gaussian/Poisson-only gate), so the cell is the
-# plain `zero_inflated_poisson` endpoint plus optional weights.
+# validation guarantees `zi` (a sampled name, a literal, or a
+# predictor-fed zi submodel) and fails evidence closed (the
+# Gaussian/Poisson-only gate), so the cell is the plain
+# `zero_inflated_poisson` endpoint plus optional weights. A zi
+# predictor binds its constrained vector once (`_ppl_sc_`, the
+# scale-predictor precedent — logit-only at the contract gate) and the
+# plate iterates it per cell.
 function _zip_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _lp_name(_predictor(plan, r.predictor))
+    pre = Expr[]
+    ziarg = _scale_use_plate_arg(r, plan, pre, r.zi, r.label)
     inputs = Any[y, lp]
     yv, etav = _dovar(1), _dovar(2)
-    ziref = _thread_ref!(inputs, r.zi)
+    ziref = _thread_ref!(inputs, ziarg)
     # All-keyword: the object constructor cannot mix positional and named
     # owner bindings (matches the `:observed/:log_rate/:zi` HAVE ports).
     cell = :(zero_inflated_poisson(; log_rate = $etav, zi = $ziref).logpdf($yv))
@@ -1680,7 +1686,7 @@ function _zip_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Lower-side cdf argument for the inclusive discrete cdf: the mass below

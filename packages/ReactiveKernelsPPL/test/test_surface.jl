@@ -670,11 +670,28 @@ end
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), 0.1 + 0.1)
     end, Dn2)
-    # Predictor-fed zi is deferred.
+    # zi link wrappers broadcast over a predictor definition —
+    # undotted wrappers fail closed (admission shapes live in
+    # test_zip.jl).
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         zipred = c .+ d .* x
-        y .~ ZeroInflatedPoisson.(exp.(eta), zipred)
+        y .~ ZeroInflatedPoisson.(exp.(eta), logistic(zipred))
+    end, Dn2)
+    # A zi wrapper over anything but a predictor definition fails
+    # closed, as does a non-link wrapper.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ ZeroInflatedPoisson.(exp.(eta), logistic.(0.25))
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ ZeroInflatedPoisson.(exp.(eta), logistic.(x))
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        zipred = c .+ d .* x
+        y .~ ZeroInflatedPoisson.(exp.(eta), sqrt.(zipred))
     end, Dn2)
     # An unbracketed head names the broadcast fix.
     @test_throws SurfaceLoweringError lower_rkppl(quote

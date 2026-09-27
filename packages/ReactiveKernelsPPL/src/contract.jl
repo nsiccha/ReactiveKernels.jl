@@ -166,7 +166,8 @@ end
 A predictor-fed scale/shape use: the response's auxiliary (Gaussian
 sigma, NB2 dispersion phi, Gamma shape alpha, Beta concentration
 kappa, Student sigma, Student nu, hurdle p_zero, VonMises
-concentration kappa; InverseGaussian lambda, BetaBinomial2 phi,
+concentration kappa, and — on the dedicated `zi` slot — ZIP
+zero-inflation zi; InverseGaussian lambda, BetaBinomial2 phi,
 NB1 p, LogNormal sigma, and Weibull k stay scalar-only) is a whole
 linear predictor, varying per observation.
 `predictor` names the
@@ -372,7 +373,7 @@ struct LikelihoodSpec
     mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
     mixture_weights::Union{Nothing,Symbol,Vector{Float64}}
     nu::Union{Nothing,ParamName,Real,ScalePredictorRef}
-    zi::Union{Nothing,ParamName,Real}
+    zi::Union{Nothing,ParamName,Real,ScalePredictorRef}
     mi_jobs::Union{Nothing,ColumnRef}
     interval::Union{Nothing,Tuple{Float64,Float64}}
 end
@@ -407,7 +408,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
             Union{Nothing,Symbol,Real,ScalePredictorRef}[],
         mixture_weights::Union{Nothing,Symbol,Vector{Float64}} = nothing,
         nu::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
-        zi::Union{Nothing,ParamName,Real} = nothing,
+        zi::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         mi_jobs::Union{Nothing,ColumnRef} = nothing,
         interval::Union{Nothing,Tuple{Float64,Float64}} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
@@ -2660,6 +2661,8 @@ function _response_uses_predictor(r::LikelihoodSpec, pname::Symbol)
     r.scale isa ScalePredictorRef && r.scale.predictor === pname &&
         return true
     r.nu isa ScalePredictorRef && r.nu.predictor === pname &&
+        return true
+    r.zi isa ScalePredictorRef && r.zi.predictor === pname &&
         return true
     # Mixture slots ride dedicated fields (the anchor may name a
     # parameter, and non-anchor component predictors live in the slots).
@@ -6774,11 +6777,13 @@ function _validate_responses(plan::StructuralPlan)
         end
         # A scale predictor feeds a slot exactly like a location predictor,
         # so it counts toward the unused-predictor check below. A
-        # predictor-fed nu counts the same way.
+        # predictor-fed nu or ZIP zi counts the same way.
         r.scale isa ScalePredictorRef &&
             push!(used_predictors, r.scale.predictor)
         r.nu isa ScalePredictorRef &&
             push!(used_predictors, r.nu.predictor)
+        r.zi isa ScalePredictorRef &&
+            push!(used_predictors, r.zi.predictor)
         # A scan-state latent vector location: the mean is the carried state
         # directly (no linear predictor). Slice 1 admits Gaussian-identity only.
         if r.predictor in scan_states
@@ -7369,10 +7374,10 @@ function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
 end
 
 # Zero-inflation probability: required (a sampled parameter/assignment
-# name or a literal in [0, 1]), scalar only — no per-observation
-# columns, no predictor-fed zi (a modeled zi submodel is deferred).
-# Unknown names fail structurally: unlike scale there is no bind-time
-# column form to defer to.
+# name, a literal in [0, 1], or a predictor-fed zi submodel), scalar or
+# predictor only — no per-observation columns. Unknown names fail
+# structurally: unlike scale there is no bind-time column form to defer
+# to.
 function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family !== ZeroInflatedPoissonFam
         r.zi === nothing ||
@@ -7383,10 +7388,35 @@ function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
     z === nothing &&
         _fail(r.label, "ZIP response requires zi (zero-inflation " *
             "probability, parameter or literal)")
+    z isa ScalePredictorRef && return _validate_zi_predictor(r, plan, z)
     z isa Real && ((isfinite(z) && 0 <= z <= 1) ||
         _fail(r.label, "zi literal must lie in [0, 1]"))
     z isa Symbol && (z in _union_names(plan) ||
         _fail(r.label, "zi references unknown name $z"))
+    return nothing
+end
+
+# A predictor-fed zi (ZIP zero-inflation submodel, the hurdle p_zero
+# precedent): logit-only (a probability), over an existing predictor
+# carrying the use-site link (the one-link-per-predictor rule), distinct
+# from the response's own location predictor (the BRM-side plan rule,
+# mirrored here as defense in depth).
+function _validate_zi_predictor(r::LikelihoodSpec, plan::StructuralPlan,
+        z::ScalePredictorRef)
+    z.link === LogitLink ||
+        _fail(r.label, "ZIP zi predictor link must be logit " *
+            "(a probability — got $(z.link))")
+    idx = findfirst(p -> p.name === z.predictor, plan.predictors)
+    idx === nothing && _fail(r.label,
+        "zi addresses unknown predictor $(z.predictor)")
+    pred = plan.predictors[idx]
+    pred.link === z.link ||
+        _fail(r.label, "zi predictor $(z.predictor) carries link " *
+            "$(pred.link), zi use wraps $(z.link) — one link per predictor")
+    z.predictor === r.predictor &&
+        _fail(r.label, "zi predictor $(z.predictor) is the response's " *
+            "own location predictor — location and zi take distinct " *
+            "predictors")
     return nothing
 end
 
