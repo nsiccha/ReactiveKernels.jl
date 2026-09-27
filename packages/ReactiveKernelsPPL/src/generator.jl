@@ -854,10 +854,11 @@ end
 
 # Segmented nadir: the surface call emits verbatim over the bound ends
 # column — `tgi_segmented_nadir` (tgi.jl) runs the per-segment running
-# minimum as a plain eltype-generic loop (native, Enzyme, and Reactant,
-# where the traced change vector is read through the traced-gather hook
-# and the loop unrolls at trace time).  Empty segments are the
-# function's own concern (it returns an empty block for them).
+# minimum as a plain eltype-generic loop (native and Enzyme) or one
+# `_rectangular_fold` over all rows with host-built reset flags
+# (Reactant — a retained traced loop, never a trace-time unroll).
+# Empty segments are the function's own concern (it returns an empty
+# block for them).
 function _expand_segmented_nadir_call(nm::Symbol, ex::Expr,
         columns::Dict{Symbol,ColumnData}, flatmap::Dict{Symbol,Symbol})
     # The change vector may be a bare response slice (shapes admit
