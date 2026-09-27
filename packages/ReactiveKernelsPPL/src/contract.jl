@@ -868,17 +868,24 @@ struct SplineVector
 end
 
 """
-    HSGPBasis(id, axes, K, c, iso, fits, label)
+    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period)
 
-One Hilbert-space GP basis (SB `_sb_hsgp`): `axes` raw data columns,
-`K` modes per axis, `c` boundary factors per axis (`L =
-c*max|x-mu|`, `c > 1`), `iso` length-scale sharing. `fits` holds the
-bind-time `(mu, L)` per axis (empty pre-bind); the basis itself is
-evaluated in-graph from the raw columns + frozen fits (trig is
-elementwise-expressible — unlike spline eigen, no bind-time
+One Hilbert-space GP basis (SB `_sb_hsgp` / `_sb_hsgp_periodic`):
+`axes` raw data columns, `K` modes per axis, `c` boundary factors per
+axis (`L = c*max|x-mu|`, `c > 1`), `iso` length-scale sharing. `fits`
+holds the bind-time `(mu, L)` per axis (empty pre-bind); the basis
+itself is evaluated in-graph from the raw columns + frozen fits (trig
+is elementwise-expressible — unlike spline eigen, no bind-time
 materialization). `M = prod(K)` basis functions; the term owns
 `beta_raw_<id>` (M-vector), `rho_<id>` (iso scalar) or
 `rho_<id>_1..d` (aniso scalars), `sigma_<id>` (scalar).
+
+`cov` selects the kernel (`:exp_quad` or `:periodic`, SB
+``hsgp(...; cov=...)``); `period` is the periodic kernel's formula
+constant (finite and positive iff periodic, `NaN` otherwise). A
+periodic basis takes exactly one isotropic axis, carries no fits and
+no domain (`c` is validated but ignored, the SB mirror), and owns `M
+= 2k` basis functions (cosines then sines over `k` harmonics).
 """
 struct HSGPBasis
     id::Symbol
@@ -888,7 +895,16 @@ struct HSGPBasis
     iso::Bool
     fits::Vector{Tuple{Float64,Float64}}
     label::Symbol
+    cov::Symbol
+    period::Float64
 end
+
+"""Exp-quad v1 positional construction (periodic defaults: `cov =
+:exp_quad`, `period = NaN`)."""
+HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
+    c::Vector{Float64}, iso::Bool,
+    fits::Vector{Tuple{Float64,Float64}}, label::Symbol) =
+    HSGPBasis(id, axes, K, c, iso, fits, label, :exp_quad, NaN)
 
 """
     LinearPKScheduleSpec(name, obs_subj, obs_time, dose_subj, dose_time, dose_amt,
@@ -1577,8 +1593,11 @@ function _hsgp_names(hb::HSGPBasis)
     return (beta = beta, rhos = rhos, sigma = sigma)
 end
 
-"""Basis-function count `M = prod(K)` for an [`HSGPBasis`](@ref)."""
-_hsgp_n_basis(hb::HSGPBasis) = prod(hb.K)
+"""Basis-function count for an [`HSGPBasis`](@ref): `M = prod(K)`
+exp-quad, `M = 2k` periodic (cosines then sines over `k`
+harmonics — SB `2 * only(K)`)."""
+_hsgp_n_basis(hb::HSGPBasis) =
+    hb.cov === :periodic ? 2 * only(hb.K) : prod(hb.K)
 
 # Flat sampled-name list for name tables + claims (beta, rhos, sigma).
 function _hsgp_all_names(hb::HSGPBasis)
@@ -1625,6 +1644,34 @@ function _hsgp_floors(K::Vector{Int}, fits::Vector{Tuple{Float64,Float64}},
             (4 * L / pi) * sqrt(log(100.0) / (k * k - 1))
         for (k, (_, L)) in zip(K, fits)]
     return iso ? [maximum(per)] : per
+end
+
+"""
+    _hsgp_periodic_rho_lower(K) -> Float64
+
+Periodic length-scale validity floor for `K` harmonics (SB
+`_brm_hsgp_periodic_rho_lower` verbatim): the `rho` at which the
+`K`-th harmonic's spectral amplitude has fallen to `1/100` of the
+first's (`I_K(a)/I_1(a) = 100^-2` with `a = 1/rho^2`), solved by
+bisection on the exponentially scaled Bessel functions. Depends on
+`K` alone — no data-derived domain. `K == 1` stays unbounded
+(`0.0`, the exp-quad degenerate-basis rule).
+"""
+function _hsgp_periodic_rho_lower(K::Integer)
+    K > 1 || return 0.0
+    target = 100.0^-2
+    ratio(loga) = let a = exp(loga)
+        SpecialFunctions.besselix(K, a) /
+            SpecialFunctions.besselix(1, a) - target
+    end
+    lo, hi = log(1e-12), log(1e7)
+    ratio(lo) < 0 < ratio(hi) || error(
+        "hsgp: internal periodic validity-floor bracket failed for k=$K")
+    for _ in 1:200
+        mid = (lo + hi) / 2
+        ratio(mid) < 0 ? (lo = mid) : (hi = mid)
+    end
+    return 1 / sqrt(exp((lo + hi) / 2))
 end
 
 """Slice-1 term-name vocabulary (emitter-side admission keys; `:varying_effect`,
@@ -2871,6 +2918,31 @@ function _validate_hsgp(plan::StructuralPlan)
         hb.iso isa Bool ||
             _fail(:plan, "hsgp :$(hb.id): iso must be Bool, " *
                   "got $(repr(hb.iso))")
+        hb.cov in (:exp_quad, :periodic) ||
+            _fail(:plan, "hsgp :$(hb.id): cov must be :exp_quad or " *
+                  ":periodic, got $(repr(hb.cov))")
+        if hb.cov === :periodic
+            # SB "periodic hsgp requires one isotropic axis" + the
+            # `_brm_gp_period` contract (required iff periodic); `c` is
+            # validated above but ignored (the SB mirror — no domain).
+            d == 1 ||
+                _fail(:plan, "hsgp :$(hb.id): periodic takes exactly " *
+                      "one axis column, got $d")
+            hb.iso ||
+                _fail(:plan, "hsgp :$(hb.id): periodic requires " *
+                      "iso=true (one isotropic axis)")
+            hb.period isa Real && isfinite(hb.period) && hb.period > 0 ||
+                _fail(:plan, "hsgp :$(hb.id): periodic requires a " *
+                      "finite positive period, got $(repr(hb.period))")
+            isempty(hb.fits) ||
+                _fail(:plan, "hsgp :$(hb.id): periodic carries no " *
+                      "fits (no domain to fit)")
+        else
+            isnan(hb.period) ||
+                _fail(:plan, "hsgp :$(hb.id): exp_quad carries no " *
+                      "period (got $(repr(hb.period)) — period is " *
+                      "meaningful only with cov=:periodic)")
+        end
         # Fits are bind products (empty pre-bind); a hand-built bound plan
         # carries one finite (mu, L) per axis with L > 0.
         isempty(hb.fits) || length(hb.fits) == d ||
@@ -2917,10 +2989,23 @@ function _validate_hsgp_data(plan::StructuralPlan)
             eltype(axiscol) <: Real ||
                 _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
                       "be numeric, got $(eltype(axiscol))")
+            if hb.cov === :periodic
+                # SB `_brm_gp_axes`: finite values (no degeneracy gate —
+                # a constant axis is a usable periodic domain).
+                all(isfinite, axiscol) ||
+                    _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
+                          "must be finite")
+            end
         end
-        length(hb.fits) == length(hb.axes) ||
-            _fail(hb.label, "hsgp :$(hb.id): fits not filled at bind " *
-                  "(one (mu, L) per axis)")
+        if hb.cov === :periodic
+            isempty(hb.fits) ||
+                _fail(hb.label, "hsgp :$(hb.id): periodic carries no " *
+                      "fits (no domain to fit)")
+        else
+            length(hb.fits) == length(hb.axes) ||
+                _fail(hb.label, "hsgp :$(hb.id): fits not filled at bind " *
+                      "(one (mu, L) per axis)")
+        end
     end
     return nothing
 end
@@ -7507,6 +7592,26 @@ function _fit_hsgp_bases(plan::StructuralPlan,
     isempty(plan.hsgp_bases) && return HSGPBasis[]
     out = HSGPBasis[]
     for hb in plan.hsgp_bases
+        if hb.cov === :periodic
+            # No domain to fit (SB `_brm_hsgp_basis_state` periodic
+            # branch): the axis still binds as a numeric finite vector
+            # (SB `_brm_gp_axes` — no degeneracy gate, a constant axis
+            # is a usable periodic domain).
+            c = only(hb.axes)
+            haskey(columns, c) ||
+                _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
+                      "not bound")
+            col = _vector_column(columns, c, hb.label, "hsgp axis column")
+            eltype(col) <: Real ||
+                _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
+                      "be numeric, got $(eltype(col))")
+            all(isfinite, col) ||
+                _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
+                      "must be finite")
+            push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso,
+                Tuple{Float64,Float64}[], hb.label, hb.cov, hb.period))
+            continue
+        end
         fits = Tuple{Float64,Float64}[]
         for (c, cj) in zip(hb.axes, hb.c)
             haskey(columns, c) ||
@@ -7517,7 +7622,7 @@ function _fit_hsgp_bases(plan::StructuralPlan,
                 "hsgp :$(hb.id): axis column $c"))
         end
         push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, fits,
-            hb.label))
+            hb.label, hb.cov, hb.period))
     end
     return out
 end

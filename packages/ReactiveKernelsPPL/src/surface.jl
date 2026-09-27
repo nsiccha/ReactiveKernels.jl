@@ -1774,11 +1774,15 @@ function _lower_basis_k(v, where)
     return Int(v)
 end
 
-# A bare `hsgp_basis(:id, x...; k=..., c=..., iso=...)` call declares
-# one HSGP basis (same bare-call-declaration shape as `spline_basis`).
-# Quoted id, bare raw axes (any count ≥ 1), literal `k` (positive
-# integer or per-axis tuple, default 20), literal `c` (real > 1 or
-# per-axis tuple, default 1.5), literal `iso` Bool (default true).
+# A bare `hsgp_basis(:id, x...; k=..., c=..., iso=..., cov=...,
+# period=...)` call declares one HSGP basis (same
+# bare-call-declaration shape as `spline_basis`). Quoted id, bare raw
+# axes (any count ≥ 1; exactly one for periodic), literal `k`
+# (positive integer or per-axis tuple, default 20), literal `c` (real
+# > 1 or per-axis tuple, default 1.5), literal `iso` Bool (default
+# true), quoted `cov` (`:exp_quad` or `:periodic`, default
+# `:exp_quad`), literal `period` (finite positive — required iff
+# periodic, refused otherwise, the SB `_brm_gp_period` contract).
 # Lowers directly to HSGPBasis IR (fits fill at bind); claims the
 # basis label and the sampled names up front so user definitions can
 # never collide with Stage-B graph names (summand labels ride the
@@ -1795,19 +1799,39 @@ function _lower_hsgp_basis(st::Expr, line::Int, data::Set{Symbol},
     k = nothing
     c = nothing
     iso = true
+    cov = :exp_quad
+    period = nothing
     for a in st.args[2:end]
         if a isa Expr && a.head === :parameters
             for kw in a.args
                 kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where takes keywords `k`/`c`/`iso` only")
+                    _sfail("$where takes keywords `k`/`c`/`iso`/`cov`/" *
+                          "`period` only")
                 key = kw.args[1]
                 key === :k || key === :c || key === :iso ||
-                    _sfail("$where takes keywords `k`/`c`/`iso` only, got " *
-                          "`$key`")
+                    key === :cov || key === :period ||
+                    _sfail("$where takes keywords `k`/`c`/`iso`/`cov`/" *
+                          "`period` only, got `$key`")
                 if key === :k
                     k = _lower_hsgp_k(kw.args[2], where)
                 elseif key === :c
                     c = _lower_hsgp_c(kw.args[2], where)
+                elseif key === :cov
+                    v = kw.args[2]
+                    v isa QuoteNode && v.value isa Symbol ||
+                        _sfail("$where quotes its cov: got $(repr(v)) — " *
+                              "write `cov=:exp_quad` or `cov=:periodic`")
+                    v.value === :exp_quad || v.value === :periodic ||
+                        _sfail("$where cov must be `:exp_quad` or " *
+                              "`:periodic`, got $(repr(v.value))")
+                    cov = v.value
+                elseif key === :period
+                    v = kw.args[2]
+                    v isa Real && !(v isa Bool) && isfinite(Float64(v)) &&
+                        Float64(v) > 0 ||
+                        _sfail("$where `period` must be a finite " *
+                              "positive numeric literal, got $(repr(v))")
+                    period = Float64(v)
                 else
                     v = kw.args[2]
                     v isa Bool ||
@@ -1837,13 +1861,34 @@ function _lower_hsgp_basis(st::Expr, line::Int, data::Set{Symbol},
     end
     length(axes) == length(unique(axes)) ||
         _sfail("$where axis columns must be distinct, got $axes")
+    # The SB periodic contract: one isotropic axis (BRM term
+    # preparation), `period` required iff periodic (SB
+    # `_brm_gp_period`); `c` stays accepted (SB validates its form
+    # and ignores its value — no domain).
+    if cov === :periodic
+        length(axes) == 1 ||
+            _sfail("$where periodic takes exactly one axis column, " *
+                  "got $axes")
+        iso ||
+            _sfail("$where periodic requires `iso=true` (one " *
+                  "isotropic axis)")
+        period === nothing &&
+            _sfail("$where `cov=:periodic` requires a numeric " *
+                  "`period=` formula constant (the kernel's period on " *
+                  "the axis's own scale)")
+    else
+        period === nothing ||
+            _sfail("$where `period=` is meaningful only with " *
+                  "`cov=:periodic` (got `cov=:exp_quad`)")
+    end
     d = length(axes)
     k = k === nothing ? fill(20, d) : _hsgp_broadcast_opt(k, d, where, :k)
     c = c === nothing ? fill(1.5, d) : _hsgp_broadcast_opt(c, d, where, :c)
     label = Symbol("hsgp_", id)
     _claim!(seen, seelines, label, line)
     hb = HSGPBasis(id, Vector{Symbol}(axes), k, c, iso,
-        Tuple{Float64,Float64}[], label)
+        Tuple{Float64,Float64}[], label, cov,
+        period === nothing ? NaN : period)
     for nm in _hsgp_all_names(hb)
         _claim!(seen, seelines, nm, line)
     end
