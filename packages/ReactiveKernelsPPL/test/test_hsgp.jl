@@ -4,8 +4,14 @@
 # SB-shape hand references (per-row loops + Distributions oracles, never
 # the emitted expressions) plus Enzyme-vs-findiff gradients. (`_query` /
 # `_check_gradient` come from test_generator.jl, included first.)
+using DifferentiationInterface
 using Distributions: LogNormal, Normal, Exponential, logpdf
-using SpecialFunctions: besseli, besselix
+using Enzyme
+using ReactiveKernels
+using ReactiveKernelsPPL
+using Reactant
+using SpecialFunctions
+using Test
 
 function _hvalid_plan(; aniso::Bool = false)
     if aniso
@@ -799,4 +805,101 @@ end
     ref = _hsgp_periodic_ref_posterior(bound, built.layout, u)
     @test isapprox(_query(built.spec, bound, :posterior, u), ref; rtol = 1e-12)
     _check_gradient(built.spec, bound, u)
+end
+
+# Build (evaluates a new generated model), then trace/compile in a call
+# made through `Base.invokelatest`: the generated recipe closures are
+# newer than the world of the enclosing top-level expression (the
+# leveled-Reactant call-shape precedent).
+function _hsgp_reactant(bound)
+    built = build_kernel(bound)
+    post_q = prepare_query(built, bound, :sampler)
+    u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
+    return Base.invokelatest(_hsgp_reactant_measure, built, bound, post_q, u)
+end
+
+function _hsgp_reactant_measure(built, bound, post_q, u)
+    native = post_q(u)
+    compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
+    primal = Float64(compiled(Reactant.to_rarray(u)))
+    q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
+    rval, rgrad = cad(Reactant.to_rarray(u))
+    return (; native, primal, val, g, rval = Float64(rval),
+        rgrad = Array(rgrad))
+end
+
+function _hsgp_xla_cols()
+    return Dict{Symbol,AbstractVector}(
+        :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+        :z => [1.0, 0.5, -0.5, 2.0, 0.0, 1.5])
+end
+
+# Upstream XLA gap (the von-Mises pin precedent): `besselix` has no
+# method for a traced scalar, so every periodic program fails at trace
+# time with `MethodError: no method matching besselix(::Int64,
+# ::TracedRNumber{Float64})` (measured on Reactant 0.2.288: the
+# primal trace throws before any gradient is staged). The signature
+# below is exactly that gap; anything else rethrows loudly.
+_hsgp_is_upstream_gap(e) =
+    e isa MethodError && e.f === SpecialFunctions.besselix &&
+    length(e.args) == 2 && e.args[2] isa Reactant.TracedRNumber
+
+# Programs blocked by the gap above. The `@test_broken true` at the
+# end of a pinned prog's body FIRES (Unexpected Pass) once upstream
+# wires besselix — then drop the name here and the try/catch.
+const _HSGP_UPSTREAM_PINNED = ("periodic",)
+
+@testset "hsgp under Reactant" begin
+    progs = [
+        ("1d", quote
+            hsgp_basis(:h_x, x; k = 4)
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ hsgp(:h_x)
+            y .~ Normal.(mu, sigma)
+        end),
+        ("aniso", quote
+            hsgp_basis(:h_xz, x, z; k = (4, 3), c = (1.5, 2.0), iso = false)
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ hsgp(:h_xz)
+            y .~ Normal.(mu, sigma)
+        end),
+        ("periodic", quote
+            hsgp_basis(:h_p, x; k = 4, cov = :periodic, period = 2.0)
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            mu = a .+ hsgp(:h_p)
+            y .~ Normal.(mu, sigma)
+        end),
+    ]
+    for (name, prog) in progs
+        @testset "$name" begin
+            cols = _hsgp_xla_cols()
+            keep = name == "aniso" ? (:y, :x, :z) : (:y, :x)
+            bound = bind_data(lower_rkppl(prog, keep), cols)
+            try
+                fx = _hsgp_reactant(bound)
+                @test fx.primal ≈ fx.native rtol = 1e-9
+                @test fx.val ≈ fx.native rtol = 1e-12
+                @test fx.rval ≈ fx.native rtol = 1e-9
+                @test fx.rgrad ≈ fx.g rtol = 1e-8
+                if name in _HSGP_UPSTREAM_PINNED
+                    # Self-firing pin: errors (Unexpected Pass) once
+                    # upstream wires besselix, forcing removal of the
+                    # try/catch.
+                    @test_broken true
+                end
+            catch e
+                _hsgp_is_upstream_gap(e) || rethrow()
+                name in _HSGP_UPSTREAM_PINNED || rethrow()
+                # Known upstream besselix gap (above): pinned, not passing.
+                @test_broken false
+            end
+        end
+    end
 end
