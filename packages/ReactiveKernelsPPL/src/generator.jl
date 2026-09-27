@@ -85,7 +85,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     student_t, zero_inflated_poisson,
     gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
-using SpecialFunctions: besseli, erfc, loggamma
+using SpecialFunctions: besseli, besselix, erfc, loggamma
 # Selective (explicit imports win over any re-export chain, so no `using`
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
 # names in the assignment allowlist.
@@ -326,6 +326,9 @@ const _HSGP_SQRT2PI = 2.5066282746310002
 # spectral weights, and the predictor summand.
 _hsgp_ax_name(id::Symbol, j::Int, k::Int) = Symbol(:_ppl_hsgp_, id, :_ax, j, :_k, k)
 _hsgp_phi_name(id::Symbol, b::Int) = Symbol(:_ppl_hsgp_, id, :_phi_, b)
+_hsgp_cos_name(id::Symbol, j::Int) = Symbol(:_ppl_hsgp_, id, :_cos_, j)
+_hsgp_sin_name(id::Symbol, j::Int) = Symbol(:_ppl_hsgp_, id, :_sin_, j)
+_hsgp_a_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_a)
 _hsgp_PHI_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_PHI)
 _hsgp_sscale_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_sscale)
 _hsgp_s_name(id::Symbol, b::Int) = Symbol(:_ppl_hsgp_, id, :_s_, b)
@@ -346,10 +349,17 @@ _hsgp_sum_name(id::Symbol) = Symbol(:_ppl_hsgp_, id)
 function _hsgp_basis_statements(plan::StructuralPlan)
     stmts = Expr[]
     for hb in plan.hsgp_bases
-        length(hb.fits) == length(hb.axes) || throw(ContractValidationError(
-            "[generator] hsgp :$(hb.id): fits not filled at bind " *
-            "(bind_data fills one (mu, L) per axis)"))
-        append!(stmts, _hsgp_basis_stmts(hb))
+        if hb.cov === :periodic
+            isempty(hb.fits) || throw(ContractValidationError(
+                "[generator] hsgp :$(hb.id): periodic carries no fits " *
+                "(no domain to fit)"))
+            append!(stmts, _hsgp_periodic_stmts(hb))
+        else
+            length(hb.fits) == length(hb.axes) || throw(ContractValidationError(
+                "[generator] hsgp :$(hb.id): fits not filled at bind " *
+                "(bind_data fills one (mu, L) per axis)"))
+            append!(stmts, _hsgp_basis_stmts(hb))
+        end
     end
     return stmts
 end
@@ -410,6 +420,70 @@ function _hsgp_basis_stmts(hb::HSGPBasis)
         expsum = foldl((a, c) -> :($a + $c), terms)
         s = _hsgp_s_name(id, b)
         push!(stmts, :($s::Float64 = $sscale * exp(-0.25 * $expsum)))
+        push!(snames, s)
+    end
+    S = _hsgp_S_name(id)
+    push!(stmts, :($S = $(Expr(:vect, snames...))))
+    w = _hsgp_w_name(id)
+    push!(stmts, :($w = $S .* $(names.beta)))
+    push!(stmts, :($(_hsgp_sum_name(id)) = $(_hsgp_PHI_name(id)) * $w))
+    return stmts
+end
+
+# One periodic basis's in-graph evaluation (SB
+# `_brm_apply_hsgp_periodic` / `brm_hsgp_periodic_sqrt_spd` /
+# `_sb_hsgp_periodic`): `k` harmonics of the fundamental angular
+# frequency `w0 = 2π/period` as `2k` cosine/sine columns (cosines
+# first, then sines — SB element order), unrolled `sqrt_spd` scalars
+# over the sampled `(rho, sigma)`, and the spec-literal matmul
+# summand `PHI * (S .* beta)`. The basis columns are data-only
+# (bound-folded); the spectral weights stay symbolic.
+#
+# Spectral weights (SB `brm_hsgp_periodic_sqrt_spd`): with `a =
+# 1/(rho*rho)`, `q_j = sigma*sqrt(2*exp(-a)*I_j(a))`. Stan evaluates
+# this in log space through `log_modified_bessel_first_kind`;
+# SpecialFunctions offers no log-Bessel, so the emission uses the
+# exponentially scaled `besselix` (`I_j(a) = besselix(j,a)*exp(a)`,
+# exact algebra): `q_b = exp(log(sigma) + 0.5*(log(2) +
+# log(besselix(h_b, a))))`. Never overflows (the direct
+# `sqrt(2*exp(-a)*besseli(j,a))` form throws AMOS for large `a`),
+# Enzyme-clean (probed vs findiff). The harmonic index `h_b` is the
+# frozen SB `harmonics` literal (`[1..k, 1..k]`).
+function _hsgp_periodic_stmts(hb::HSGPBasis)
+    id = hb.id
+    x = only(hb.axes)
+    k = only(hb.K)
+    period = Float64(hb.period)
+    stmts = Expr[]
+    # Trig columns: `PHI[i,j] = cos(w0*j*x[i])`,
+    # `PHI[i,k+j] = sin(w0*j*x[i])` (SB
+    # `_brm_apply_hsgp_periodic`, element order verbatim). The
+    # `w0*j` literal folds SB's `(w0*j)*x[i]` left-assoc product.
+    w0 = 2.0 * pi / period
+    coscols = Symbol[]
+    sincols = Symbol[]
+    for j in 1:k
+        wj = w0 * j
+        cc = _hsgp_cos_name(id, j)
+        sc = _hsgp_sin_name(id, j)
+        push!(stmts, :($cc = cos.($wj .* $x)))
+        push!(stmts, :($sc = sin.($wj .* $x)))
+        push!(coscols, cc)
+        push!(sincols, sc)
+    end
+    push!(stmts, :($(_hsgp_PHI_name(id)) = hcat($(coscols...), $(sincols...))))
+    # Spectral weights, one scalar per basis column over the frozen
+    # harmonic index (SB `brm_hsgp_periodic_sqrt_spd` in scaled-log
+    # space — see above).
+    names = _hsgp_names(hb)
+    rho = only(names.rhos)
+    a = _hsgp_a_name(id)
+    push!(stmts, :($a::Float64 = 1.0 / ($rho * $rho)))
+    snames = Symbol[]
+    for (b, h) in enumerate(vcat(1:k, 1:k))
+        s = _hsgp_s_name(id, b)
+        push!(stmts, :($s::Float64 = exp(log($(names.sigma)) +
+            0.5 * (0.6931471805599453 + log(besselix($h, $a))))))
         push!(snames, s)
     end
     S = _hsgp_S_name(id)
@@ -1420,15 +1494,17 @@ function _gaussian_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, lpv::Symbo
         end
         return :($base - $corr)
     elseif kind === :censored
+        # Clamp law (Y = clamp(X)): at-bound rows are censored observations,
+        # so the arms are non-strict (SB parity pair mod-weights).
         if lb === nothing && ub === nothing
             return base
         elseif lb === nothing
-            return :(ifelse($yv > $ub, log1p(-$(nccdf(ub))), $base))
+            return :(ifelse($yv >= $ub, log1p(-$(nccdf(ub))), $base))
         elseif ub === nothing
-            return :(ifelse($yv < $lb, log($(nccdf(lb))), $base))
+            return :(ifelse($yv <= $lb, log($(nccdf(lb))), $base))
         else
-            return :(ifelse($yv < $lb, log($(nccdf(lb))),
-                ifelse($yv > $ub, log1p(-$(nccdf(ub))), $base)))
+            return :(ifelse($yv <= $lb, log($(nccdf(lb))),
+                ifelse($yv >= $ub, log1p(-$(nccdf(ub))), $base)))
         end
     else # :interval_censored
         return :(log($(nccdf(ub)) - $(nccdf(yv))))
@@ -1545,10 +1621,13 @@ function _zip_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
 end
 
 # Lower-side cdf argument for the inclusive discrete cdf: the mass below
-# lb is F(lb - 1), so truncated/censored low arms shift their lower
-# argument by one (interval cells stay unshifted — the response is the
-# open lower endpoint). Int literals fold; do-vars convert via Int
-# (cdf takes Int, which also hardens non-Int Integer columns). The kernel's
+# lb is F(lb - 1), so TRUNCATED low arms shift their lower argument by one
+# (interval cells stay unshifted — the response is the open lower
+# endpoint). CENSORED arms instead follow the clamp law (Y = clamp(X)):
+# yv ≤ lb takes F(lb) unshifted (the at-bound mass includes F(lb)), while
+# yv ≥ ub takes 1 - F(ub-1) (the shift moves to the upper arm — Y = ub
+# means X ≥ ub). Int literals fold; do-vars convert via Int (cdf takes
+# Int, which also hardens non-Int Integer columns). The kernel's
 # `observed >= 0` guard maps -1 to 0.0, so no clamp is needed.
 _poisson_below(b::Int) = b - 1
 _poisson_below(b::Symbol) = :(Int($b) - 1)
@@ -1571,12 +1650,12 @@ function _poisson_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, etav::Symbo
         if lb === nothing && ub === nothing
             return base
         elseif lb === nothing
-            return :(ifelse($yv > $ub, log1p(-$(pcdf(ub))), $base))
+            return :(ifelse($yv >= $ub, log1p(-$(pcdf(_poisson_below(ub)))), $base))
         elseif ub === nothing
-            return :(ifelse($yv < $lb, log($(pcdf(_poisson_below(lb)))), $base))
+            return :(ifelse($yv <= $lb, log($(pcdf(lb))), $base))
         else
-            return :(ifelse($yv < $lb, log($(pcdf(_poisson_below(lb)))),
-                ifelse($yv > $ub, log1p(-$(pcdf(ub))), $base)))
+            return :(ifelse($yv <= $lb, log($(pcdf(lb))),
+                ifelse($yv >= $ub, log1p(-$(pcdf(_poisson_below(ub)))), $base)))
         end
     else # :interval_censored
         # Open below per the brm-use contract (`log(CDF(upper) -
