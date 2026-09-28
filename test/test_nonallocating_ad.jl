@@ -385,3 +385,99 @@ end
     @test gna == ones(n)
     @test vb != va
 end
+
+# Tainted NA steps over in-place broadcast with a `Const` array operand (a
+# bound, folded, or inactive port) take the AD-only scalar loops
+# (`_ad_na_materialize_loop!`, `_ad_na_arith_loop!`): on Julia 1.12 Enzyme's
+# `copyto!` override unaliases the shadowed destination against every source,
+# and the fresh-or-`Const` array phi trips static activity analysis
+# (`EnzymeRuntimeActivityError`), while the identical program differentiates
+# cleanly on Julia 1.10 (snag `na-broadcast-act-38b42481`).
+@testset "tainted NA arithmetic steps with bound arrays" begin
+    spec = @kernel arith_const_naad(a, b) = begin
+        c = a + b
+        d = a - b
+        e = +(a, b, a)
+        s = sum(c) + sum(d) + sum(e)
+        return s
+    end
+    a0 = [0.3, -0.4, 0.2]
+    b0 = [2.0, -1.0, 0.5]
+    kb = prepare(spec; have = (:a, :b), want = :s, bound = (; b = b0))
+    kbna = prepare_nonallocating(spec; have = (:a, :b), want = :s,
+                                 bound = (; b = b0))
+    # Vacuity: the arithmetic must decompose to bare `+`/`-` steps (not the
+    # fused fallback), or this test exercises nothing.
+    @test any(op -> op === +, kbna.ops)
+    @test any(op -> op === -, kbna.ops)
+    prep = prepare_ad(kb, NA_AD_BACKEND, a0; active = :a)
+    prepna = prepare_ad(kbna, NA_AD_BACKEND, a0; active = :a)
+    @test any(op -> op === +, prepna.call.ops)
+    @test any(op -> op === -, prepna.call.ops)
+    g, gna = similar(a0), similar(a0)
+    v, _ = ad_value_and_gradient!(prep, g, a0)
+    vna, _ = ad_value_and_gradient!(prepna, gna, a0)
+    @test vna == v
+    @test gna == g == fill(4.0, length(a0))
+end
+
+@testset "tainted NA dotted steps with bound arrays" begin
+    spec = @kernel dotted_const_naad(a, d) = begin
+        t = d .+ a
+        s = sum(t)
+        return s
+    end
+    a0 = [0.3, -0.4, 0.2]
+    d0 = [2.0, -1.0, 0.5]
+    kb = prepare(spec; have = (:a, :d), want = :s, bound = (; d = d0))
+    kbna = prepare_nonallocating(spec; have = (:a, :d), want = :s,
+                                 bound = (; d = d0))
+    @test any(op -> op isa ReactiveKernels._MaterializeStep, kbna.ops)
+    prep = prepare_ad(kb, NA_AD_BACKEND, a0; active = :a)
+    prepna = prepare_ad(kbna, NA_AD_BACKEND, a0; active = :a)
+    @test any(op -> op isa ReactiveKernels._MaterializeStep, prepna.call.ops)
+    g, gna = similar(a0), similar(a0)
+    v, _ = ad_value_and_gradient!(prep, g, a0)
+    vna, _ = ad_value_and_gradient!(prepna, gna, a0)
+    @test vna == v
+    @test gna == g == ones(length(a0))
+
+    # N-D: the scalar loop indexes every dimension, not just vectors.
+    matspec = @kernel mat_const_naad(A, B) = begin
+        C = A + B
+        S = sum(C)
+        return S
+    end
+    A0 = [0.3 -0.4 0.2; 1.1 0.7 -0.9]
+    B0 = [2.0 -1.0 0.5; 0.25 1.5 -2.25]
+    matkb = prepare(matspec; have = (:A, :B), want = :S, bound = (; B = B0))
+    matkbna = prepare_nonallocating(matspec; have = (:A, :B), want = :S,
+                                    bound = (; B = B0))
+    @test any(op -> op === +, matkbna.ops)
+    matprep = prepare_ad(matkb, NA_AD_BACKEND, A0; active = :A)
+    matprepna = prepare_ad(matkbna, NA_AD_BACKEND, A0; active = :A)
+    gmat, gmatna = similar(A0), similar(A0)
+    vmat, _ = ad_value_and_gradient!(matprep, gmat, A0)
+    vmatna, _ = ad_value_and_gradient!(matprepna, gmatna, A0)
+    @test vmatna == vmat
+    @test gmatna == gmat == ones(size(A0))
+
+    # N-D dotted: the materialize loop indexes every dimension too.
+    dotmatspec = @kernel dotmat_const_naad(A, D) = begin
+        T = D .+ A
+        S = sum(T)
+        return S
+    end
+    dotmatkb = prepare(dotmatspec; have = (:A, :D), want = :S,
+                       bound = (; D = B0))
+    dotmatkbna = prepare_nonallocating(dotmatspec; have = (:A, :D),
+                                       want = :S, bound = (; D = B0))
+    @test any(op -> op isa ReactiveKernels._MaterializeStep, dotmatkbna.ops)
+    dotmatprep = prepare_ad(dotmatkb, NA_AD_BACKEND, A0; active = :A)
+    dotmatprepna = prepare_ad(dotmatkbna, NA_AD_BACKEND, A0; active = :A)
+    gdot, gdotna = similar(A0), similar(A0)
+    vdot, _ = ad_value_and_gradient!(dotmatprep, gdot, A0)
+    vdotna, _ = ad_value_and_gradient!(dotmatprepna, gdotna, A0)
+    @test vdotna == vdot
+    @test gdotna == gdot == ones(size(A0))
+end

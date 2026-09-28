@@ -246,6 +246,86 @@ end
     return result
 end
 
+# AD-only broadcast materialization into an owned cache slot. The
+# nonallocating cache path executes `_MaterializeStep` via
+# `materialize!(cache, instantiate(bc))`, which lands in
+# `Base.Broadcast.copyto!` over an instantiated `Broadcasted` — the one shape
+# reverse-mode Enzyme rewrites to its `override_bc_copyto!` loop. That loop's
+# `preprocess` unaliases the destination against every source
+# (`mightalias ? copy : identity`), and on Julia 1.12 the resulting
+# fresh-or-`Const` array phi trips static activity analysis
+# (`EnzymeRuntimeActivityError: Constant memory is stored to a differentiable
+# variable`) whenever a source array is `Const` — a bound, folded, or
+# inactive port — while the identical code differentiates cleanly on Julia
+# 1.10 (snag `na-broadcast-act-38b42481`; upstream Enzyme behavior, see
+# `reactivekernels-use` §7t). So tainted materialize steps take this explicit
+# scalar loop over the instantiated `Broadcasted` instead (see `_ad_na_walk`).
+# Same-index element reads feed same-index writes, which is alias-safe by
+# construction with no unalias copy; the guard and the allocating fallback
+# mirror the extension's `apply!!` exactly.
+@inline function _ad_na_materialize_loop!(
+        slot::Base.RefValue, bc::Base.Broadcast.Broadcasted)
+    cache = slot[]
+    instantiated = Base.Broadcast.instantiate(bc)
+    if cache isa AbstractArray &&
+       Base.axes(cache) == Base.axes(instantiated) &&
+       Base.Broadcast.combine_eltypes(instantiated.f, instantiated.args) ===
+       eltype(cache)
+        # Index both sides with the `Broadcasted`'s own indices (the plate
+        # loop's shape): a linear `Int` over `eachindex(cache)` is rejected
+        # for N-D `Broadcasted` getindex on Julia 1.10, while the
+        # `Broadcasted` indices subscript both sides on every version.
+        # `axes(cache) == axes(instantiated)` keeps every subscript in
+        # range; elide the checks (the same 1.12
+        # `checkbounds(::Broadcasted, ::Integer)` per-element allocation the
+        # plate loop above avoids).
+        @inbounds for index in eachindex(instantiated)
+            cache[index] = instantiated[index]
+        end
+        slot[] = cache
+        return cache
+    end
+    result = Base.Broadcast.materialize(bc)
+    slot[] = result
+    return result
+end
+
+# AD-only plain-`+`/`-` array application into an owned cache slot. The
+# extension spells these steps `broadcast!` into the cache — the same
+# instantiated-`copyto!` shape as above, failing the same way under
+# reverse-mode Enzyme on Julia 1.12 with a `Const` array operand. Tainted
+# steps whose operands are all exact-shape `Array`s take the scalar loop;
+# anything else (scalars, ranges, structured arrays, shape changes) keeps the
+# twin call `f(args...)`, which allocates through the non-instantiated
+# `materialize` path Enzyme rewrites cleanly. The guard mirrors the
+# extension's `_add_destination_matches` exactly.
+@inline function _ad_na_arith_loop!(
+        slot::Base.RefValue, f::Union{typeof(+),typeof(-)}, args...)
+    cache = slot[]
+    if _ad_na_arith_matches(cache, args)
+        instantiated = Base.Broadcast.instantiate(
+            Base.Broadcast.broadcasted(f, args...))
+        # The `Broadcasted`'s own indices subscript both sides on every
+        # Julia version (a linear `Int` is rejected for N-D `Broadcasted`
+        # getindex on 1.10); the guard's exact-axes match keeps every
+        # subscript in range, so elide the checks.
+        @inbounds for index in eachindex(instantiated)
+            cache[index] = instantiated[index]
+        end
+        slot[] = cache
+        return cache
+    end
+    result = f(args...)
+    slot[] = result
+    return result
+end
+
+@inline _ad_na_arith_matches(cache::Array{T,N}, args) where {T,N} =
+    length(args) >= 2 && all(a -> a isa Array{T,N}, args) &&
+    all(a -> Base.axes(a) == Base.axes(args[1]), args) &&
+    Base.axes(cache) == Base.axes(args[1])
+@inline _ad_na_arith_matches(cache, args) = false
+
 # Taint-walk one program node, rewriting cache steps whose arguments are all
 # free of the active input into plain operation calls. Steps free of every
 # HAVE input (bound-data-only) are folded instead: their seeded value is
@@ -300,6 +380,30 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
                         GlobalRef(@__MODULE__, :_ad_na_plate_loop!),
                         Expr(:ref, _CACHES_ARG, step), QuoteNode(op.kernel),
                         aval, rewritten...), true, false
+        end
+        if step_tainted && caches[step] isa Base.RefValue &&
+           ((ops[step] isa _MaterializeStep && length(callargs) == 1) ||
+            (ops[step] === Base.:+ && length(callargs) >= 2) ||
+            (ops[step] === Base.:- && length(callargs) == 2))
+            # Route the instantiated broadcast through an explicit scalar loop
+            # instead of `materialize!`/`broadcast!`: on Julia 1.12 Enzyme's
+            # `copyto!` override unaliases the shadowed destination against
+            # every source, and the fresh-or-`Const` array phi trips static
+            # activity analysis whenever a source array is `Const` (bound,
+            # folded, or inactive). The loop reads and writes the same index,
+            # so it is alias-safe without the unalias copy.
+            if ops[step] isa _MaterializeStep
+                return Expr(:call,
+                            GlobalRef(@__MODULE__,
+                                      :_ad_na_materialize_loop!),
+                            Expr(:ref, _CACHES_ARG, step), rewritten...),
+                    true, false
+            end
+            return Expr(:call,
+                        GlobalRef(@__MODULE__, :_ad_na_arith_loop!),
+                        Expr(:ref, _CACHES_ARG, step),
+                        Expr(:ref, _OPS_ARG, step), rewritten...),
+                true, false
         end
         return Expr(:call, _CACHE_APPLY_ARG, Expr(:ref, _CACHES_ARG, step),
                     Expr(:ref, _OPS_ARG, step), rewritten...),
