@@ -215,6 +215,39 @@ end
     result::Array{T,N}
 end
 
+# Scalar-likes in an instantiated `Broadcasted` argument tuple are exactly
+# Base's `_broadcast_getindex` scalar-likes: `Ref`s, zero-dimensional arrays,
+# and numbers all ignore the index and deref themselves. Their values are
+# index-invariant, so the AD scalar loops deref each one once per call
+# instead of once per element; everything else (arrays, tuples) is read per
+# element through `_broadcast_getindex`, exactly the per-element read
+# `getindex` performs after its bounds check.
+@inline _ad_na_hoist(x::Union{Ref,AbstractArray{<:Any,0},Number}) = x[]
+@inline _ad_na_hoist(x) = x
+@inline _ad_na_fetch(::Union{Ref,AbstractArray{<:Any,0},Number},
+                     hoisted, index) = hoisted
+@inline _ad_na_fetch(x, hoisted, index) =
+    Base.Broadcast._broadcast_getindex(x, index)
+@inline function _ad_na_scalar_args(args::Tuple, hoisted::Tuple, index)
+    (_ad_na_fetch(args[1], hoisted[1], index),
+     _ad_na_scalar_args(Base.tail(args), Base.tail(hoisted), index)...)
+end
+@inline _ad_na_scalar_args(::Tuple{}, ::Tuple{}, index) = ()
+
+# Hoist the element fetch out of the per-element `Broadcasted` dispatch: the
+# instantiated descriptor re-derefs its `Ref` scalars and re-dispatches
+# through its `f` field on every element, and under reverse-mode Enzyme on
+# Julia 1.12 with `--check-bounds=yes` those per-element reads through the
+# descriptor allocate (the same `Broadcasted` per-element work the plate loop
+# below avoids). Deref each scalar-like once per call and apply the hoisted
+# `f` directly; the per-element values are unchanged.
+@inline function _ad_na_broadcast_hoisted(bc::Base.Broadcast.Broadcasted)
+    hoisted = ntuple(length(bc.args)) do position
+        _ad_na_hoist(bc.args[position])
+    end
+    return bc.f, bc.args, hoisted
+end
+
 @inline function _ad_na_plate_loop!(
         slot::Base.RefValue, kernel, ::Val{A}, args...) where {A}
     wrapped = _authored_plate_arguments(Val(A), args...)
@@ -232,14 +265,28 @@ end
     end
     batch = _authored_plate_broadcast(Val(A), args...)
     # `index` comes from `eachindex(batch)` and `result` carries exactly the
-    # broadcast axes, so both subscripts are provably in range. Elide the
-    # checks: Julia 1.12's `checkbounds(::Broadcasted, ::Integer)` builds
+    # broadcast axes, so both subscripts are provably in range (the
+    # instantiated descriptor's axes are the ordinary broadcast compatibility
+    # check). Fetch the element through `_broadcast_getindex` instead of
+    # `getindex`: Julia 1.12's `checkbounds(::Broadcasted, ::Integer)` builds
     # `eachindex(IndexLinear(), bc)` per call, and under reverse-mode Enzyme
     # that check allocates per gradient call (measured 256B at n=8 growing to
     # 1184B at n=64, where Julia 1.10's pure-arithmetic check stays
-    # size-invariant), defeating this loop's zero-allocation contract.
+    # size-invariant), defeating this loop's zero-allocation contract — and
+    # `@inbounds` does not elide the check when execution runs with
+    # `--check-bounds=yes` (the nonallocating recipe's own flag). The helper
+    # is exactly the per-element read `getindex` performs after its bounds
+    # check, so the values and the differentiated form are unchanged; the only
+    # remaining per-element check is the wrapped argument's own array bounds
+    # check, pure arithmetic on every Julia version. Scalar-like arguments
+    # and the applied kernel are hoisted out of the loop on top of that (see
+    # `_ad_na_broadcast_hoisted`): the descriptor re-derefs its `Ref` scalars
+    # and re-reads its fields per element, and under reverse-mode Enzyme on
+    # Julia 1.12 with `--check-bounds=yes` that per-element work through the
+    # descriptor allocates. The per-element values are unchanged.
+    _, args_tuple, hoisted = _ad_na_broadcast_hoisted(batch)
     @inbounds for index in eachindex(batch)
-        scalar_args = batch[index]
+        scalar_args = _ad_na_scalar_args(args_tuple, hoisted, index)
         result[index] = kernel(scalar_args...)
     end
     slot[] = result
@@ -276,11 +323,17 @@ end
         # for N-D `Broadcasted` getindex on Julia 1.10, while the
         # `Broadcasted` indices subscript both sides on every version.
         # `axes(cache) == axes(instantiated)` keeps every subscript in
-        # range; elide the checks (the same 1.12
-        # `checkbounds(::Broadcasted, ::Integer)` per-element allocation the
-        # plate loop above avoids).
+        # range. Fetch the element through `_broadcast_getindex` rather than
+        # `getindex`, and apply the hoisted function and scalar-likes instead
+        # of dispatching through the descriptor per element (see
+        # `_ad_na_broadcast_hoisted`): the same 1.12 per-element `Broadcasted`
+        # work the plate loop above avoids, which `@inbounds` cannot elide
+        # when execution runs with `--check-bounds=yes`; the fetch helper is
+        # exactly the per-element read `getindex` performs after its bounds
+        # check, so the values and the differentiated form are unchanged.
+        f, args_tuple, hoisted = _ad_na_broadcast_hoisted(instantiated)
         @inbounds for index in eachindex(instantiated)
-            cache[index] = instantiated[index]
+            cache[index] = f(_ad_na_scalar_args(args_tuple, hoisted, index)...)
         end
         slot[] = cache
         return cache
@@ -308,9 +361,14 @@ end
         # The `Broadcasted`'s own indices subscript both sides on every
         # Julia version (a linear `Int` is rejected for N-D `Broadcasted`
         # getindex on 1.10); the guard's exact-axes match keeps every
-        # subscript in range, so elide the checks.
+        # subscript in range. Fetch the element through `_broadcast_getindex`
+        # and apply the hoisted function and scalar-likes instead of
+        # dispatching through the descriptor per element, for the same reason
+        # as the materialize loop above: the 1.12 per-element `Broadcasted`
+        # allocation survives `@inbounds` under `--check-bounds=yes`.
+        f, args_tuple, hoisted = _ad_na_broadcast_hoisted(instantiated)
         @inbounds for index in eachindex(instantiated)
-            cache[index] = instantiated[index]
+            cache[index] = f(_ad_na_scalar_args(args_tuple, hoisted, index)...)
         end
         slot[] = cache
         return cache
