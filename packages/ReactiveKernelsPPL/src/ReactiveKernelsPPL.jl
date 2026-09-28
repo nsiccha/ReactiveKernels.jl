@@ -118,10 +118,12 @@ export tgi_category_lpmf, tgi_category_lpmfs,
 export tgi_category_stmts, tgi_response_stmts, tgi_censored_stmts
 export TGI_CELL_FUNCTIONS
 export rk_expm
+export transit_twocmt_unit, transit_twocmt_unit_response
 
 include("contract.jl")
 include("expm_rule.jl")
 include("pkcells.jl")
+include("transit_twocmt.jl")
 include("pk_rectangular.jl")
 include("design.jl")
 include("bijectors.jl")
