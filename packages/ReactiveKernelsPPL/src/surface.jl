@@ -594,11 +594,12 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
             "splices via its `dar()` call, not as a coefficient (rename one)")
     end
     # Hyperparameter names the broadcast peelers admit at the surface:
-    # sampled names and scalar definitions. Anything else (data,
+    # sampled scalar names (derived responses excluded — they are
+    # vectors) and scalar definitions. Anything else (data,
     # coefficients, vectors, unknown names) fails here with the legacy
     # spelling error — the contract refines roles (location vs scale
     # support) for the admitted names.
-    hyper_names = union(sampled_names,
+    hyper_names = union(prior_names,
         Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :scalar))
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
         ctx.matrices, hyper_names, r2d2set, hsset)
