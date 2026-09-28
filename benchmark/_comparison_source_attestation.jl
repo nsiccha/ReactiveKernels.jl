@@ -16,7 +16,7 @@ export SUM_TO_ZERO_MODEL_SOURCE_CURRENT_DELTA
 const COMPARATOR_SOURCE_CURRENT_DELTA =
     "long-form native/bound/nonallocating matrix around byte-preserved Turing/manual baselines plus terminal definition-only guard"
 const EIGHT_SCHOOLS_MODEL_SOURCE_CURRENT_DELTA =
-    "published centered hierarchy and every public boundary are preserved; additive scalar-index-free packed extraction and a single-output Jacobian recipe enable Reactant and nonallocating configurations; the hand-written parameters unpack is removed in favor of automatic tuple-unpack edges"
+    "published centered hierarchy and every public boundary are preserved; additive scalar-index-free packed extraction and a single-output Jacobian recipe enable Reactant and nonallocating configurations; the hand-written parameters unpack is removed in favor of automatic tuple-unpack edges; the centered half-Cauchy uses Stan's lower-bound kernel (bare Cauchy, no proper-half normalization)"
 const MNIST_COMPARATOR_SOURCE_CURRENT_DELTA =
     "additive two-model native/bound/nonallocating matrix; published Turing/manual AD baselines unchanged; documentation markers plus terminal definition-only include guard"
 const MNIST_MODEL_SOURCE_CURRENT_DELTA =
@@ -24,7 +24,7 @@ const MNIST_MODEL_SOURCE_CURRENT_DELTA =
 const SUM_TO_ZERO_MODEL_SOURCE_CURRENT_DELTA =
     "published model body is preserved; scalar-indexed packed extraction, the model_only evaluator/init path, and automatic tuple-unpack edges (hand-written parameters unpack removed) are the only current-source deltas"
 const EIGHT_SCHOOLS_RECORDED_TO_CURRENT_MODEL_SOURCE_DELTA =
-    "recorded model body is preserved; artifact-backed real data, scalar-indexed packed extraction, the model_only evaluator/init path, and automatic tuple-unpack edges (hand-written parameters unpack removed) are the only recorded-to-current deltas"
+    "recorded model body is preserved; artifact-backed real data, scalar-indexed packed extraction, the model_only evaluator/init path, automatic tuple-unpack edges (hand-written parameters unpack removed), and Stan's lower-bound half-Cauchy kernel (bare Cauchy, no proper-half normalization) are the only recorded-to-current deltas"
 const _DOCS_BASELINE_MARKERS = (
     "# DOCS-BASELINE-BEGIN: turing",
     "# DOCS-BASELINE-END: turing",
@@ -181,6 +181,26 @@ function eight_schools_model_source_preserves_published_authority(current, publi
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source(; model_only = true).model\n",
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source().model\n",
         ),
+        # The centered half-Cauchy spelling follows Stan's lower-bound
+        # kernel (bare Cauchy, no proper-half `+log(2)`); the constraint
+        # and Jacobian are unchanged, so the measured benchmark is the
+        # same program up to an additive constant.
+        (
+            "    # Log prior: μ ~ Normal(0, 5), τ constrained positive with Stan's\n" *
+            "    # lower-bound kernel (bare Cauchy, no proper-half `+log(2)`), and\n" *
+            "    # θⱼ ~ Normal(μ, τ). The scale keeps its fixed 5. Supplying both τ and\n" *
+            "    # log_τ to each effects Normal makes both graph values authoritative HAVE\n" *
+            "    # inputs: neither is recomputed or checked.\n" *
+            "    μ_prior::Float64 = normal(0.0, 5.0).logpdf(μ)\n" *
+            "    τ_prior::Float64 = cauchy(0.0, 5.0).logpdf(τ)\n",
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n" *
+            "    # and θⱼ ~ Normal(μ, τ). The half-Cauchy keeps its fixed scale 5. Supplying\n" *
+            "    # both τ and log_τ to each effects Normal makes both graph values\n" *
+            "    # authoritative HAVE inputs: neither is recomputed or checked.\n" *
+            "    μ_prior::Float64 = normal(0.0, 5.0).logpdf(μ)\n" *
+            "    τ_cauchy::Float64 = cauchy(0.0, 5.0).logpdf(τ)\n" *
+            "    τ_prior::Float64 = log(2.0) + τ_cauchy\n",
+        ),
         # The hand-written `parameters` unpack is gone from the authored
         # source: automatic tuple-unpack edges reproduce it exactly, so the
         # prepared graph — and the measured benchmark — is unchanged.
@@ -231,6 +251,26 @@ function eight_schools_model_source_matches_recorded_current(current, recorded)
         (
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source(; model_only = true).model\n",
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source().model\n",
+        ),
+        # The centered half-Cauchy spelling follows Stan's lower-bound
+        # kernel (bare Cauchy, no proper-half `+log(2)`); the constraint
+        # and Jacobian are unchanged, so the measured benchmark is the
+        # same program up to an additive constant.
+        (
+            "    # Log prior: μ ~ Normal(0, 5), τ constrained positive with Stan's\n" *
+            "    # lower-bound kernel (bare Cauchy, no proper-half `+log(2)`), and\n" *
+            "    # θⱼ ~ Normal(μ, τ). The scale keeps its fixed 5. Supplying both τ and\n" *
+            "    # log_τ to each effects Normal makes both graph values authoritative HAVE\n" *
+            "    # inputs: neither is recomputed or checked.\n" *
+            "    μ_prior::Float64 = normal(0.0, 5.0).logpdf(μ)\n" *
+            "    τ_prior::Float64 = cauchy(0.0, 5.0).logpdf(τ)\n",
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n" *
+            "    # and θⱼ ~ Normal(μ, τ). The half-Cauchy keeps its fixed scale 5. Supplying\n" *
+            "    # both τ and log_τ to each effects Normal makes both graph values\n" *
+            "    # authoritative HAVE inputs: neither is recomputed or checked.\n" *
+            "    μ_prior::Float64 = normal(0.0, 5.0).logpdf(μ)\n" *
+            "    τ_cauchy::Float64 = cauchy(0.0, 5.0).logpdf(τ)\n" *
+            "    τ_prior::Float64 = log(2.0) + τ_cauchy\n",
         ),
         # The hand-written `parameters` unpack is gone from the authored
         # source: automatic tuple-unpack edges reproduce it exactly, so the
