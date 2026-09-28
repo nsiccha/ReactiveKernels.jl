@@ -93,6 +93,7 @@ site_pages = [
             "Lotka–Volterra adaptive ODE" => "lotka-volterra.md",
             "SIR with environmental bacteria" => "sir.md",
             "One-compartment Michaelis–Menten" => "one-comp-mm-elim-abs.md",
+            "Varying-source PK slice" => "varyingsource-pk.md",
             "Soil incubation two-pool carbon" => "soil-incubation.md",
         ],
         "Gaussian processes" => [
