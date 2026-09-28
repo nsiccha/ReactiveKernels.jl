@@ -27,7 +27,7 @@
 # still catch implementation bugs because kern() runs the real maps.
 # (`_check_gradient` / `_GEN_BACKEND` come from test_generator.jl.)
 using Distributions: Normal, Dirichlet, Beta, Gamma, Binomial, Poisson,
-    logpdf
+    Bernoulli, Cauchy, logpdf
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
@@ -264,4 +264,206 @@ end
            log(1.0) # exp Jacobian at u=0 is log(1)=0; kept explicit
     @test abs(Base.invokelatest(kern, u) - want) < 1e-12
     _check_gradient(built.spec, bound, u)
+end
+
+# NOTE (G3/G4): glmm1_model / glmm_poisson have NO RK counterpart — the
+# SB form samples (tau, group-totals) with the fixed effects ANALYTICALLY
+# MARGINALIZED (brm_total: beta = conditional mean, -0.5*logdet(Q)
+# adjustment; 4- and 10-dim probes), while the thin layer's varying
+# effects are explicit non-centered (beta, tau, z). Marginal != joint:
+# no probe translation closes the gap (verified structural wall, same
+# class as the partner's HMM/occupancy walls but on the RK side). The
+# GLM verdict brief records G3/G4 as NO-COUNTERPART.
+
+@testset "G1 glm_binomial SB parity" begin
+    # SB: eta ~ 1+year+year2, Normal(0,100) coefs;
+    # counts ~ BinomialLogit(totals, eta); 6 rows;
+    # u=[0.1,0.2,-0.1] (intercept, year, year2);
+    # value -43.311049476871304. Direct u-parity (identity coefs).
+    prog = Meta.parse("""begin
+        a ~ Normal(0.0, 100.0)
+        b1 ~ Normal(0.0, 100.0)
+        b2 ~ Normal(0.0, 100.0)
+        eta = a .+ b1 .* year .+ b2 .* year2
+        counts .~ Binomial.(totals, logistic.(eta))
+    end""")
+    df = (counts = [14, 9, 11, 6, 4, 7], totals = fill(20, 6),
+        year = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5],
+        year2 = [6.25, 2.25, 0.25, 0.25, 2.25, 6.25])
+    cols = Dict{Symbol,AbstractVector}(:counts => df.counts,
+        :totals => df.totals, :year => df.year, :year2 => df.year2)
+    bound, built, kern, lay = _sb_query(prog, cols)
+    names = coordinate_names(lay)
+    @test Set(names) == Set([Symbol("eta.Intercept"), Symbol("eta.year"),
+        Symbol("eta.year2")])
+    u = _sb_vec(names, [Symbol("eta.Intercept") => 0.1,
+        Symbol("eta.year") => 0.2, Symbol("eta.year2") => -0.1])
+    @test abs(Base.invokelatest(kern, u) - (-43.311049476871304)) < 1e-12
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    sampler_value_and_gradient!(prep, g, u)
+    @test all(isfinite, g)
+    want = _sb_vec(names, [Symbol("eta.Intercept") => -3.683080936679581,
+        Symbol("eta.year") => -43.93322274728044,
+        Symbol("eta.year2") => 22.58426637610638])
+    @test maximum(abs.(g .- want)) < 1e-10
+    # Independent oracle at the probe.
+    eta = 0.1 .+ 0.2 .* df.year .- 0.1 .* df.year2
+    wantv = sum(logpdf(Normal(0, 100), c) for c in (0.1, 0.2, -0.1)) +
+            sum(logpdf(Binomial(20, _sb_logistic(e)), k)
+                for (e, k) in zip(eta, df.counts))
+    @test abs(Base.invokelatest(kern, u) - wantv) < 1e-12
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "G2 glm_poisson SB parity" begin
+    # SB: log(mu) ~ 1+year+year2+year3, Flat coefs (DELTA: slice has
+    # bounded-uniform); counts ~ Poisson(mu); 6 rows;
+    # u=[0.2,0.1,-0.05,0.03]; value -17.788101912439263. Direct u-parity
+    # (identity coefs, no prior terms).
+    prog = Meta.parse("""begin
+        a ~ Flat()
+        b1 ~ Flat()
+        b2 ~ Flat()
+        b3 ~ Flat()
+        mu = a .+ b1 .* year .+ b2 .* year2 .+ b3 .* year3
+        counts .~ Poisson.(exp.(mu))
+    end""")
+    df = (counts = [3, 1, 6, 2, 1, 4],
+        year = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5],
+        year2 = [6.25, 2.25, 0.25, 0.25, 2.25, 6.25],
+        year3 = [-15.625, -3.375, -0.125, 0.125, 3.375, 15.625])
+    cols = Dict{Symbol,AbstractVector}(:counts => df.counts,
+        :year => df.year, :year2 => df.year2, :year3 => df.year3)
+    bound, built, kern, lay = _sb_query(prog, cols)
+    names = coordinate_names(lay)
+    @test Set(names) == Set([Symbol("mu.Intercept"), Symbol("mu.year"),
+        Symbol("mu.year2"), Symbol("mu.year3")])
+    u = _sb_vec(names, [Symbol("mu.Intercept") => 0.2,
+        Symbol("mu.year") => 0.1, Symbol("mu.year2") => -0.05,
+        Symbol("mu.year3") => 0.03])
+    @test abs(Base.invokelatest(kern, u) - (-17.788101912439263)) < 1e-12
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    sampler_value_and_gradient!(prep, g, u)
+    @test all(isfinite, g)
+    want = _sb_vec(names, [Symbol("mu.Intercept") => 10.062859779706784,
+        Symbol("mu.year") => -3.8913188535023844,
+        Symbol("mu.year2") => 30.397137846772317,
+        Symbol("mu.year3") => -8.606116623948758])
+    @test maximum(abs.(g .- want)) < 1e-10
+    eta = 0.2 .+ 0.1 .* df.year .- 0.05 .* df.year2 .+ 0.03 .* df.year3
+    wantv = sum(logpdf(Poisson(exp(e)), k)
+                for (e, k) in zip(eta, df.counts))
+    @test abs(Base.invokelatest(kern, u) - wantv) < 1e-12
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "G5 logistic_regression_rhs SB parity" begin
+    # SB: b0 ~ Normal(0,5); b1,b2 ~ Horseshoe(local=1, global=0.1)
+    # (DELTA: slice has regularized HS + slab); mu = b0+b1*x1+b2*x2;
+    # y ~ BernoulliLogit(mu); 6 rows. Direct u-parity: the thin-layer
+    # horseshoe triples (raw/intercept-Normal, lambda/tau Stan-kernel
+    # half-Cauchy, b = raw*lambda*tau) match Stan's emission exactly.
+    prog = Meta.parse("""begin
+        b0 ~ Normal(0.0, 5.0)
+        b1 ~ Horseshoe(local_scale = 1.0, global_scale = 0.1)
+        b2 ~ Horseshoe(local_scale = 1.0, global_scale = 0.1)
+        mu = b0 .+ b1 .* x1 .+ b2 .* x2
+        y .~ Bernoulli.(logistic.(mu))
+    end""")
+    df = (y = [0, 1, 1, 0, 1, 0],
+        x1 = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+        x2 = [1.0, 0.5, -0.5, 1.5, 0.0, -1.0])
+    cols = Dict{Symbol,AbstractVector}(:y => df.y, :x1 => df.x1,
+        :x2 => df.x2)
+    bound, built, kern, lay = _sb_query(prog, cols)
+    names = coordinate_names(lay)
+    # SB order [b0, b1_raw, b1_lambda, b1_tau, b2_raw, b2_lambda, b2_tau].
+    sb_names = [:b0, :b1_raw, :b1_lambda, :b1_tau,
+        :b2_raw, :b2_lambda, :b2_tau]
+    rk_of = Dict(:b0 => :horseshoe_mu_Intercept_normal,
+        :b1_raw => :horseshoe_mu_x1_raw,
+        :b1_lambda => :horseshoe_mu_x1_lambda,
+        :b1_tau => :horseshoe_mu_x1_tau,
+        :b2_raw => :horseshoe_mu_x2_raw,
+        :b2_lambda => :horseshoe_mu_x2_lambda,
+        :b2_tau => :horseshoe_mu_x2_tau)
+    @test Set(names) == Set(values(rk_of))
+    cases = ((fill(0.0, 7), -19.11542134761971,
+        [0.0, -0.75, 0.0, -0.9801980198019802, -0.75, 0.0,
+            -0.9801980198019802]),
+        ([0.1, 0.5, 0.2, -0.3, 0.4, 0.1, -0.2], -19.632259916162344,
+            [-0.443292992040744, -1.5463985021133373, -0.7205745712815728,
+                -1.4874090156567834, -1.3113983243232483,
+                -0.46422732435425496, -1.3351614013328863]))
+    for (uu, val, grad) in cases
+        u = _sb_vec(names, [rk_of[s] => v for (s, v) in zip(sb_names, uu)])
+        @test abs(Base.invokelatest(kern, u) - val) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        want = _sb_vec(names,
+            [rk_of[s] => v for (s, v) in zip(sb_names, grad)])
+        @test maximum(abs.(g .- want)) < 1e-10
+    end
+    # Independent oracle at the u2 probe.
+    b0v, r1, l1, t1, r2, l2, t2 = 0.1, 0.5, exp(0.2), exp(-0.3), 0.4,
+        exp(0.1), exp(-0.2)
+    bb1, bb2 = r1 * l1 * t1, r2 * l2 * t2
+    mu = b0v .+ bb1 .* df.x1 .+ bb2 .* df.x2
+    wantv = logpdf(Normal(0, 5), b0v) + logpdf(Normal(0, 1), r1) +
+            logpdf(Normal(0, 1), r2) +
+            logpdf(Cauchy(0, 1), l1) + logpdf(Cauchy(0, 0.1), t1) +
+            logpdf(Cauchy(0, 1), l2) + logpdf(Cauchy(0, 0.1), t2) +
+            sum(logpdf(Bernoulli(_sb_logistic(e)), v)
+                for (e, v) in zip(mu, df.y)) +
+            0.2 - 0.3 + 0.1 - 0.2 # exp Jacobians on lambda/tau
+    u2 = _sb_vec(names, [rk_of[s] => v for (s, v) in
+        zip(sb_names, [0.1, 0.5, 0.2, -0.3, 0.4, 0.1, -0.2])])
+    @test abs(Base.invokelatest(kern, u2) - wantv) < 1e-12
+    _check_gradient(built.spec, bound, u2)
+end
+
+@testset "G5m logistic minimal SB parity" begin
+    # SB minimal horseshoe isolation: b0 ~ Normal(0,5),
+    # b1 ~ Horseshoe(1.0, 0.1) over x1 == 0 (N=2, y=[0,1], so b1*x1 = 0
+    # and mu = b0 regardless). zeros(4) -> -10.128751716069296; u2 ->
+    # -10.362079506135036.
+    prog = Meta.parse("""begin
+        b0 ~ Normal(0.0, 5.0)
+        b1 ~ Horseshoe(local_scale = 1.0, global_scale = 0.1)
+        mu = b0 .+ b1 .* x1
+        y .~ Bernoulli.(logistic.(mu))
+    end""")
+    df = (y = [0, 1], x1 = [0.0, 0.0])
+    cols = Dict{Symbol,AbstractVector}(:y => df.y, :x1 => df.x1)
+    bound, built, kern, lay = _sb_query(prog, cols)
+    names = coordinate_names(lay)
+    sb_names = [:b0, :b1_raw, :b1_lambda, :b1_tau]
+    rk_of = Dict(:b0 => :horseshoe_mu_Intercept_normal,
+        :b1_raw => :horseshoe_mu_x1_raw,
+        :b1_lambda => :horseshoe_mu_x1_lambda,
+        :b1_tau => :horseshoe_mu_x1_tau)
+    @test Set(names) == Set(values(rk_of))
+    cases = ((fill(0.0, 4), -10.128751716069296,
+        [0.0, 0.0, 0.0, -0.9801980198019802]),
+        ([0.2, -0.4, 0.3, 0.1], -10.362079506135036,
+            [-0.10766799462495585, 0.4, -0.291312612451591,
+                -0.9837583602379762]))
+    for (uu, val, grad) in cases
+        u = _sb_vec(names, [rk_of[s] => v for (s, v) in zip(sb_names, uu)])
+        @test abs(Base.invokelatest(kern, u) - val) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        want = _sb_vec(names,
+            [rk_of[s] => v for (s, v) in zip(sb_names, grad)])
+        @test maximum(abs.(g .- want)) < 1e-10
+    end
+    _check_gradient(built.spec, bound,
+        _sb_vec(names, [rk_of[s] => v for (s, v) in
+            zip(sb_names, [0.2, -0.4, 0.3, 0.1])]))
 end
