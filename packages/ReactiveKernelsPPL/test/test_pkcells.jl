@@ -356,12 +356,13 @@ end
         "@plate conc for s in 1:2\n" *
         " mu = log_Vc[subj]\n dv .~ Normal.(mu, sigma)\n nope\nend"),
         _PKC_DATA)
-    # Unknown families name the admitted five (message changed when the
-    # joint families joined — the fail-closed behavior is unchanged).
+    # Unknown families name the admitted eleven (7 scalar + 4 joint;
+    # StudentT joined the admitted set in v2 axis 2, so the probe uses
+    # Categorical — the fail-closed behavior is unchanged).
     @test_throws "admits in-cell observations" lower_rkppl(kern(
         "@plate conc for s in 1:2\n" *
         " mu = log_Vc[subj]\n" *
-        " dv .~ StudentT.(3.0, dv, sigma)\n mu\nend"), _PKC_DATA)
+        " dv .~ Categorical.(dv, sg)\n mu\nend"), _PKC_DATA)
     # Joint-family arities are exact (TGI cores take sigma too).
     @test_throws "exactly 7 arguments" lower_rkppl(kern(
         "@plate conc for s in 1:2\n" *
@@ -387,9 +388,25 @@ end
             " mu = read_locs[pk_sched.obs_map]\n" *
             " dv .~ Normal.(mu, sigma)\n mu\nend\nend").args...)
     @test_throws "not declared" lower_rkppl(nosched, _PKC_DATA)
-    unused = Expr(:block, base...,
+    # Structural linkage (v2 axis 1) retired the single-schedule
+    # ref-less probe: one declared schedule + a ref-less cell now
+    # links (the dose-free case — the bind-time dose/PK coherence
+    # gate keeps the missing-call typo loud). Pin the linkage, and
+    # cover the global unused-schedule gate with two schedules where
+    # the cell feeds only one.
+    linked = lower_rkppl(Expr(:block, base...,
         Meta.parse("begin\n@plate conc for s in 1:2\n" *
             " mu = log_Vc[subj]\n" *
+            " dv .~ Normal.(mu, sigma)\n mu\nend\nend").args...),
+        _PKC_DATA)
+    @test only(only(linked.kernel_plates).schedules).name === :pk_sched
+    unused = Expr(:block, base...,
+        Meta.parse("begin\ns2 = linear_pk_schedule(obs = (:subj, :time), " *
+            "dose = (:dsubj, :dtime, :damt))\nend").args...,
+        Meta.parse("begin\n@plate conc for s in 1:2\n" *
+            " read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_k10, " *
+            "log_k12, log_k21, log_ka)\n" *
+            " mu = read_locs[pk_sched.obs_map]\n" *
             " dv .~ Normal.(mu, sigma)\n mu\nend\nend").args...)
     @test_throws "leaves schedule" lower_rkppl(unused, _PKC_DATA)
     # Schedule declaration shape.
@@ -437,10 +454,21 @@ end
         "t", "grouped v1")
     @test n.family === TgiCensoredFam
     @test (n.location, n.scale, n.params) === (:mu, :sg, (:lq,))
-    # Panel form still admits Gaussian only.
-    @test_throws "Gaussian in-cell observation only" low(
+    # Panel form admits the scalar response-space set (v2 — ordered
+    # contract change); joint heads stay grouped-only.
+    @test_throws "grouped-only" low(
         Meta.parse("yy .~ TgiCategory.(r, ref, c1, c2, c3, sg, e)"),
         [:yy], "t")
+    # Scalar unit shapes: 1-arg families leave scale nothing.
+    b = low(Meta.parse("yy .~ Bernoulli.(p)"), [:yy], "t")
+    @test (b.family, b.location, b.scale, b.params) ===
+        (BernoulliLogitFam, :p, nothing, ())
+    s = low(Meta.parse("yy .~ StudentT.(nu, mu, sg)"), [:yy], "t")
+    @test (s.family, s.location, s.scale, s.params) ===
+        (StudentTFam, :nu, :mu, (:sg,))
+    g = low(Meta.parse("yy .~ Poisson.(mu)"), [:yy], "t", "grouped v1")
+    @test (g.family, g.location, g.scale, g.params) ===
+        (PoissonLogFam, :mu, nothing, ())
     # End to end through surface + contract with defined names.
     prog = Expr(:block, _pkc_lp_defs().args...,
         Meta.parse("begin\nc_cr ~ Normal(0.0, 1.0)\nc_pr ~ Normal(0.0, 1.0)\n" *

@@ -313,6 +313,25 @@ end
     cache
 end
 
+# Row/column reduction with a preparation-constant `dims`. Base's
+# `sum!`/`prod!`/`minimum!`/`maximum!` run the same per-lane `mapreducedim`
+# pass the allocating twin (`f(A; dims = ...)` uses, so values are
+# bit-identical; the cache must already have the exact result shape and
+# eltype, and anything else reseeds through the twin call.
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T}, op::ReactiveKernels._RowReduceStep, A::Array) where {T}
+    T === Base.promote_op(getfield(op, :f), eltype(A)) || return op(A)
+    axes(cache) == Base.reduced_indices(axes(A), getfield(op, :dims)) ||
+        return op(A)
+    _rk_rowreduce_inplace!(getfield(op, :f), cache, A)
+    cache
+end
+
+@inline _rk_rowreduce_inplace!(::typeof(sum), r, A) = Base.sum!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(prod), r, A) = Base.prod!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(minimum), r, A) = Base.minimum!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(maximum), r, A) = Base.maximum!(r, A)
+
 # --- public entry points ----------------------------------------------------
 
 function ReactiveKernels.prepare_reactive_nonallocating(graph::ReactiveKernels.Graph;

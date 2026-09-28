@@ -318,7 +318,10 @@ function _v2_brm_translate()
     mod === nothing && throw(ArgumentError(
         "v2 artifact needs BayesianRegressionModels loaded (run in the BRM " *
         "test env or the fusion worker env with BRM + ReactiveKernelsPPL dev'd)"))
-    hasproperty(mod, :rk_translate_artifact) || throw(ArgumentError(
+    # isdefined, not hasproperty: the latter is false for non-exported
+    # names, and the worker entry point must resolve either way (twin
+    # recommendation on SB-numbers brief 66anzj; BRM now exports it too).
+    isdefined(mod, :rk_translate_artifact) || throw(ArgumentError(
         "loaded BayesianRegressionModels has no rk_translate_artifact " *
         "(BRM pin predates the fusion worker API)"))
     return getproperty(mod, :rk_translate_artifact)

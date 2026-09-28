@@ -81,21 +81,29 @@ such a recipe as one opaque operation, the rewrite decomposes its captured
 expression into primitive steps at preparation time:
 
 - identity-preserving wrappers (`view`, `reshape`, `transpose`, `eachcol`,
-  ranges, scalar arithmetic) run inline — they never owned a buffer worth
-  caching;
+  postfix `'`/`.'`, ranges, scalar arithmetic) run inline — they never owned
+  a buffer worth caching;
 - broadcast materializations (dotted calls, and array `getindex` with range
   indices), `vcat`, `zeros`/`ones`, and matrix products each become their own
   destination-passing step with a typed persistent cache, guarded by exact
   shape and eltype checks so a batch-size change reseeds instead of corrupting
   a stale buffer;
+- row/column reductions (`sum`, `prod`, `minimum`, `maximum`) with a
+  *preparation-constant* `dims` keyword become destination-passing reduction
+  steps (`maximum(m; dims = 2)` reuses its result buffer); a `dims` value
+  read from a port or computed at runtime is outside this grammar;
 - every other call becomes its own cache step, so registered `apply!!`
   coverage applies per step.
 
 Free symbols in the captured expression resolve against the authoring module's
 own `const` bindings — the exact functions the fused closure would call, never
-name-based guesses. Any source shape outside this grammar (control flow, a
-non-`const` global, a call through a port) keeps the whole-recipe cache step,
-which preserves the original closure semantics unchanged.
+name-based guesses. Module-qualified callees (`Pkg.f`) resolve through the same
+rule: every path segment must itself be a `const` module binding. Any source
+shape outside this grammar (control flow, a non-`const` global, a call through
+a port, keyword calls other than constant-`dims` reductions) keeps the
+whole-recipe cache step, which preserves the original closure semantics
+unchanged — a `cumsum(m; dims = 2)` recipe therefore still computes correctly
+while re-running its allocating twin.
 
 One observable difference: a plate reduction such as `sum` over an authored
 plate is fused into an accumulator loop by ordinary `prepare`, while the
