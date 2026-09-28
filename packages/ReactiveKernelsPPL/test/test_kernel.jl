@@ -1,4 +1,5 @@
 using DifferentiationInterface
+using Distributions
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
@@ -281,8 +282,32 @@ end
         plate_ast([good_cell[1], good_cell[2]], [subj]), data)
     @test_throws "only the trailing statement" lower_rkppl(
         plate_ast([:mu, good_cell[1], good_cell[2], :mu], [subj]), data)
-    @test_throws "Gaussian in-cell observation only" lower_rkppl(
+    # v2 (ordered contract change): panel admits the scalar
+    # response-space set — Poisson lowers (1-arg, scaleless node).
+    pois = lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ Poisson.(mu)), :mu], [subj]), data)
+    @test only(only(pois.kernel_plates).obs).family === PoissonLogFam
+    @test only(only(pois.kernel_plates).obs).scale === nothing
+    # Grouped-only joint heads fail closed in panel cells.
+    @test_throws "grouped-only" lower_rkppl(
+        plate_ast([good_cell[1],
+            :(yy .~ TgiResponse.(mu, sigma, a, b, c, d)), :mu], [subj]), data)
+    # Fused link-space heads fail closed naming the pre-assignment fix.
+    @test_throws "pre-assignment" lower_rkppl(
+        plate_ast([good_cell[1], :(yy .~ BernoulliLogit.(eta)), :mu],
+            [subj]), data)
+    # Binomial needs trials threading (sequenced follow-up).
+    @test_throws "trials threading" lower_rkppl(
+        plate_ast([good_cell[1], :(yy .~ Binomial.(n, p)), :mu], [subj]), data)
+    # Unknown heads fail with the admitted list.
+    @test_throws "admits in-cell observations" lower_rkppl(
+        plate_ast([good_cell[1], :(yy .~ Cauchy.(mu, sigma)), :mu], [subj]), data)
+    # 1-arg arity pins.
+    @test_throws "exactly 1 arguments" lower_rkppl(
+        plate_ast([good_cell[1], :(yy .~ Poisson.(mu, sigma)), :mu], [subj]), data)
+    # 3-arg StudentT arity pin (nu, mu, sigma — Distributions order).
+    @test_throws "exactly 3 arguments" lower_rkppl(
+        plate_ast([good_cell[1], :(yy .~ StudentT.(mu, sigma)), :mu], [subj]), data)
     @test_throws "obs broadcasts" lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ Normal(mu, sigma)), :mu], [subj]), data)
     # Arity message generalized to digits when the joint families joined
@@ -326,8 +351,9 @@ end
         [sparam], AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
         kernel_plates = [kp_hand])
     @test_throws "only likelihood" validate_structure(both_plan)
-    # Two plates in one model (distinct cell names — shared names would
-    # trip single-assignment first).
+    # Two panel plates in one model (v2: panels compose freely —
+    # distinct cell names; shared names trip single-assignment first).
+    # A shared subjects dims key consumes once.
     cell2 = [
         :(mu2 = (b0 .* d2) .* ts2),
         :(yy2 .~ Normal.(mu2, sigma)),
@@ -337,7 +363,13 @@ end
         plate_ast(good_cell, [subj]).args...,
         plate_ast(cell2, [subj]; lhs = :pred2,
             params = [:ts2, :d2, :yy2]).args[3])
-    @test_throws "at most one kernel plate" lower_rkppl(two, data)
+    two_plan = lower_rkppl(two, data)
+    @test [kp.result for kp in two_plan.kernel_plates] == [:pred, :pred2]
+    # Duplicate plate results trip single-assignment at the surface.
+    dupe = Expr(:block,
+        plate_ast(good_cell, [subj]).args...,
+        plate_ast(cell2, [subj]; params = [:ts2, :d2, :yy2]).args[3])
+    @test_throws "defined twice" lower_rkppl(dupe, data)
     # Responseless GLM plans (no plate) still fail as before.
     nolhs = Expr(:block, Expr(:call, :~, :sigma, Expr(:call, :Exponential, 1.0)))
     @test_throws "plan has no responses" lower_rkppl(nolhs, (:y,))
@@ -371,6 +403,24 @@ end
     # Cross-cell refs fail closed.
     @test_throws "unknown name" lower_rkppl(
         plate_ast([:(mu = (b0 .* d) .* zz), obs_stmt, :mu]), data)
+    # Scalar-obs literal domains (v2 — response-space roles).
+    @test_throws "not a probability" lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ Bernoulli.(2.0)), :mu]), data)
+    @test_throws "not a nonnegative mean" lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ Poisson.(-1.0)), :mu]), data)
+    @test_throws "response-space phi" lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ NegativeBinomial2.(mu, 0.0)), :mu]), data)
+    @test_throws "response-space alpha" lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ Gamma.(0.0, sigma)), :mu]), data)
+    @test_throws "response-space b" lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ Beta.(mu, -1.0)), :mu]), data)
+    @test_throws "positive degrees of freedom" lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ StudentT.(0.0, mu, sigma)), :mu]), data)
+    @test_throws "response-space sigma" lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ StudentT.(4.0, mu, 0.0)), :mu]), data)
+    # v1 Gaussian scale message byte-preserved through the scalar path.
+    @test_throws "must be finite positive" lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ Normal.(mu, 0.0)), :mu]), data)
     # Undotted over 2+ genuinely-vector operands fails at bind (kinds
     # resolve there): ts and yy are both vector slices here.
     two_vec_unbound = lower_rkppl(
@@ -396,8 +446,12 @@ end
     @test_throws "not consumed" bind_data(unbound_exp, cols6;
         dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :kernel_T_pred => 3,
             :kernel_T_preed => 3))
-    # Ambiguous T keys fail closed.
+    # Ambiguous T keys fail closed (v1 inference only).
     @test_throws "ambiguous timepoints" bind_data(unbound, cols6;
+        dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :T1 => 3, :T2 => 3))
+    # The `kernel_T_<result>` convention names the plate's T key; a
+    # second key beside it is a stray, not an ambiguity.
+    @test_throws "not consumed by any kernel plate" bind_data(unbound, cols6;
         dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :kernel_T_pred => 3,
             :kernel_T_pred2 => 3))
     # T bound but unused (T > 1, all scalar).
@@ -418,6 +472,42 @@ end
     @test_throws "must be numeric" bind_data(unbound, bad_str; dims)
     bad_sym = merge(cols6, Dict{Symbol,AbstractVector}(:dose => [:a, :b]))
     @test_throws "must be numeric" bind_data(unbound, bad_sym; dims)
+    # Count responses reject non-count columns at bind.
+    float_cols = Dict{Symbol,AbstractVector}(
+        :t => [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+        :dose => [10.0, 20.0],
+        :obs => [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+    )
+    pois_unbound = lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ Poisson.(mu)), :mu]), data)
+    @test_throws "non-negative integers" bind_data(pois_unbound, float_cols; dims)
+    bern_unbound = lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ Bernoulli.(mu)), :mu]), data)
+    @test_throws "Bool or 0/1" bind_data(bern_unbound, float_cols; dims)
+    # Scalar count slices in T-models fail closed (Float64 expansions).
+    scalar_count_cols = Dict{Symbol,AbstractVector}(
+        :t => [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+        :dose => [10.0, 20.0],
+        :obs => [1, 2],
+    )
+    @test_throws "scalar slice" bind_data(pois_unbound, scalar_count_cols; dims)
+    # Gamma/Beta response domains.
+    gamma_unbound = lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ Gamma.(sigma, mu)), :mu]), data)
+    zero_cols = Dict{Symbol,AbstractVector}(
+        :t => [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+        :dose => [10.0, 20.0],
+        :obs => [0.0, 0.2, 0.3, 0.4, 0.5, 0.6],
+    )
+    @test_throws "strictly positive" bind_data(gamma_unbound, zero_cols; dims)
+    beta_unbound = lower_rkppl(
+        plate_ast([mu_stmt, :(yy .~ Beta.(sigma, mu)), :mu]), data)
+    oob_cols = Dict{Symbol,AbstractVector}(
+        :t => [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+        :dose => [10.0, 20.0],
+        :obs => [0.1, 0.2, 1.5, 0.4, 0.5, 0.6],
+    )
+    @test_throws "strictly inside (0, 1)" bind_data(beta_unbound, oob_cols; dims)
     # Nonpositive dims values.
     @test_throws "positive integer" bind_data(unbound, cols6;
         dims = Dict{Symbol,Int}(:kernel_nsub_pred => 0, :kernel_T_pred => 3))
@@ -439,5 +529,385 @@ end
     kp_lit = only(lit.kernel_plates)
     @test kp_lit.subjects == 2
     @test kp_lit.timepoints == 3
+end
+
+# --- Axis 2: non-gaussian panel obs (values + Enzyme vs findiff) ------------
+
+const _AXIS2_T = [0.5, 1.0, 2.0, 0.5, 1.0, 2.0]
+const _AXIS2_DOSE = [1.0, 2.0]
+const _AXIS2_DEX = [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]
+const _AXIS2_DIMS = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :kernel_T_pred => 3)
+
+function _axis2_build(cell, obsy; params = [:(b0 ~ Normal(0.0, 1.0))])
+    ast = Expr(:block, params...,
+        Expr(:call, :~, :pred, Expr(:do,
+            Expr(:call, :plate,
+                Expr(:parameters, Expr(:kw, :subjects, :kernel_nsub_pred)),
+                :t, :dose, :obs),
+            Expr(:->, Expr(:tuple, :ts, :d, :yy),
+                Expr(:block, cell...)))))
+    columns = Dict{Symbol,AbstractVector}(
+        :t => _AXIS2_T, :dose => _AXIS2_DOSE, :obs => obsy)
+    bound = bind_data(lower_rkppl(ast, (:dose, :obs, :t)), columns;
+        dims = _AXIS2_DIMS)
+    return build_kernel(bound), bound
+end
+
+function _axis2_value_grad(built, bound, u, ll, prior, jac)
+    @test prepare_query(built, bound, :likelihood)(u) ≈ ll atol = 1e-10
+    @test prepare_query(built, bound, :prior)(u) ≈ prior atol = 1e-10
+    @test prepare_query(built, bound, :sampler)(u) ≈ ll + prior + jac atol = 1e-10
+    q = prepare_sampler(built, bound, u; backend = _KERNEL_BACKEND)
+    g = Vector{Float64}(undef, length(u))
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    @test val ≈ ll + prior + jac atol = 1e-10
+    @test g ≈ _kernel_findiff(
+        x -> prepare_query(built, bound, :sampler)(x), u) atol = 1e-6
+end
+
+@testset "axis2 Poisson plate vs Distributions oracle" begin
+    built, bound = _axis2_build(
+        [:(mu = exp.(b0 .* d .* ts)), :(yy .~ Poisson.(mu)), :mu],
+        [1, 0, 2, 3, 1, 0])
+    @test only(only(bound.kernel_plates).obs).family === PoissonLogFam
+    names = coordinate_names(built.layout)
+    @test names == [:b0]
+    u = [0.25]
+    mu = exp.(0.25 .* _AXIS2_DEX .* _AXIS2_T)
+    ll = sum(logpdf.(Poisson.(mu), [1, 0, 2, 3, 1, 0]))
+    _axis2_value_grad(built, bound, u, ll, logpdf(Normal(0.0, 1.0), 0.25), 0.0)
+end
+
+@testset "axis2 Bernoulli plate (Int lanes) vs oracle" begin
+    built, bound = _axis2_build(
+        [:(eta = b0 .* d .* ts), :(p = 1 ./ (1 .+ exp.(-eta))),
+            :(yy .~ Bernoulli.(p)), :p],
+        [1, 0, 1, 1, 0, 0])
+    @test only(only(bound.kernel_plates).obs).family === BernoulliLogitFam
+    # Int lanes read their bind-materialized Bool twin (exact 0/1;
+    # the `!=` comparison misdifferentiates under native Enzyme —
+    # snag `bernoulli-int-la-78487520`). Dense Vector{Bool}: BitArrays
+    # are overlay-hostile (reactant ladder-1b).
+    twin = bound.columns[ReactiveKernelsPPL._kbool_name(:pred, :yy)]
+    @test twin isa Vector{Bool}
+    @test twin == Bool[1, 0, 1, 1, 0, 0]
+    # Hand-bound plans verify the twin (verified, not trusted).
+    notwin = deepcopy(bound)
+    delete!(notwin.columns, ReactiveKernelsPPL._kbool_name(:pred, :yy))
+    @test_throws "Bool twin" ReactiveKernelsPPL._validate_kernels_data(notwin)
+    u = [0.5]
+    eta = 0.5 .* _AXIS2_DEX .* _AXIS2_T
+    p = 1 ./ (1 .+ exp.(-eta))
+    ll = sum(logpdf.(Bernoulli.(p), Bool[1, 0, 1, 1, 0, 0]))
+    _axis2_value_grad(built, bound, u, ll, logpdf(Normal(0.0, 1.0), 0.5), 0.0)
+end
+
+@testset "axis2 Bernoulli scalar response twins its expansion" begin
+    # Mechanical shape (one y per subject over T lanes — the
+    # likelihood counts each 3x): pins expansion→twin→lanes wiring.
+    ast = Expr(:block, :(b0 ~ Normal(0.0, 1.0)),
+        Expr(:call, :~, :pred, Expr(:do,
+            Expr(:call, :plate,
+                Expr(:parameters, Expr(:kw, :subjects, :kernel_nsub_pred)),
+                :t, :dose, :obs),
+            Expr(:->, Expr(:tuple, :ts, :d, :yy), Expr(:block,
+                :(eta = b0 .* d .* ts),
+                :(p = 1 ./ (1 .+ exp.(-eta))),
+                :(yy .~ Bernoulli.(p)), :p)))))
+    columns = Dict{Symbol,AbstractVector}(
+        :t => _AXIS2_T, :dose => _AXIS2_DOSE, :obs => Bool[1, 0])
+    bound = bind_data(lower_rkppl(ast, (:dose, :obs, :t)), columns;
+        dims = _AXIS2_DIMS)
+    # Scalar Bool response → Float64 expansion → Bool twin.
+    @test eltype(bound.columns[:pred_kexp_obs]) === Float64
+    twin = bound.columns[ReactiveKernelsPPL._kbool_name(:pred, :yy)]
+    @test twin isa Vector{Bool}
+    @test twin == Bool[1, 1, 1, 0, 0, 0]
+    built = build_kernel(bound)
+    u = [0.5]
+    eta = 0.5 .* _AXIS2_DEX .* _AXIS2_T
+    p = 1 ./ (1 .+ exp.(-eta))
+    ll = sum(logpdf.(Bernoulli.(p), Bool[1, 1, 1, 0, 0, 0]))
+    _axis2_value_grad(built, bound, u, ll, logpdf(Normal(0.0, 1.0), 0.5), 0.0)
+end
+
+@testset "axis2 Bernoulli plate (Bool lanes) vs oracle" begin
+    built, bound = _axis2_build(
+        [:(eta = b0 .* d .* ts), :(p = 1 ./ (1 .+ exp.(-eta))),
+            :(yy .~ Bernoulli.(p)), :p],
+        Bool[1, 0, 1, 1, 0, 0])
+    u = [0.5]
+    eta = 0.5 .* _AXIS2_DEX .* _AXIS2_T
+    p = 1 ./ (1 .+ exp.(-eta))
+    ll = sum(logpdf.(Bernoulli.(p), Bool[1, 0, 1, 1, 0, 0]))
+    _axis2_value_grad(built, bound, u, ll, logpdf(Normal(0.0, 1.0), 0.5), 0.0)
+end
+
+@testset "axis2 NB2 plate vs Distributions oracle" begin
+    built, bound = _axis2_build(
+        [:(mu = exp.(b0 .* d .* ts)), :(yy .~ NegativeBinomial2.(mu, phi)), :mu],
+        [1, 0, 2, 3, 1, 0];
+        params = [:(b0 ~ Normal(0.0, 1.0)), :(phi ~ Exponential(1.0))])
+    names = coordinate_names(built.layout)
+    fixed = Dict(:b0 => 0.25, :phi => 2.0)
+    u = [n === :phi ? log(fixed[n]) : fixed[n] for n in names]
+    mu = exp.(0.25 .* _AXIS2_DEX .* _AXIS2_T)
+    # Stan NB2(mu, phi) == NegativeBinomial(phi, phi/(mu+phi)).
+    nb = NegativeBinomial.(2, 2.0 ./ (mu .+ 2.0))
+    ll = sum(logpdf.(nb, [1, 0, 2, 3, 1, 0]))
+    prior = logpdf(Normal(0.0, 1.0), 0.25) + logpdf(Exponential(1.0), 2.0)
+    _axis2_value_grad(built, bound, u, ll, prior, log(2.0))
+end
+
+@testset "axis2 Gamma plate (symbolic scale) vs oracle" begin
+    built, bound = _axis2_build(
+        [:(mu = exp.(b0 .* d .* ts)), :(sc = mu ./ alpha),
+            :(yy .~ Gamma.(alpha, sc)), :mu],
+        [0.5, 1.2, 2.1, 0.8, 1.5, 2.5];
+        params = [:(b0 ~ Normal(0.0, 1.0)), :(alpha ~ Exponential(1.0))])
+    names = coordinate_names(built.layout)
+    fixed = Dict(:b0 => 0.25, :alpha => 2.0)
+    u = [n === :alpha ? log(fixed[n]) : fixed[n] for n in names]
+    mu = exp.(0.25 .* _AXIS2_DEX .* _AXIS2_T)
+    sc = mu ./ 2.0
+    ll = sum(logpdf.(Gamma.(2.0, sc), [0.5, 1.2, 2.1, 0.8, 1.5, 2.5]))
+    prior = logpdf(Normal(0.0, 1.0), 0.25) + logpdf(Exponential(1.0), 2.0)
+    _axis2_value_grad(built, bound, u, ll, prior, log(2.0))
+end
+
+@testset "axis2 Beta plate vs Distributions oracle" begin
+    built, bound = _axis2_build(
+        [:(mu = 1 ./ (1 .+ exp.(-b0 .* d .* ts))), :(a = mu .* kappa),
+            :(b = (1 .- mu) .* kappa), :(yy .~ Beta.(a, b)), :mu],
+        [0.2, 0.7, 0.5, 0.3, 0.8, 0.4];
+        params = [:(b0 ~ Normal(0.0, 1.0)), :(kappa ~ Exponential(1.0))])
+    names = coordinate_names(built.layout)
+    fixed = Dict(:b0 => 0.5, :kappa => 3.0)
+    u = [n === :kappa ? log(fixed[n]) : fixed[n] for n in names]
+    mu = 1 ./ (1 .+ exp.(-0.5 .* _AXIS2_DEX .* _AXIS2_T))
+    ll = sum(logpdf.(Beta.(mu .* 3.0, (1 .- mu) .* 3.0),
+        [0.2, 0.7, 0.5, 0.3, 0.8, 0.4]))
+    prior = logpdf(Normal(0.0, 1.0), 0.5) + logpdf(Exponential(1.0), 3.0)
+    _axis2_value_grad(built, bound, u, ll, prior, log(3.0))
+end
+
+@testset "axis2 StudentT plate vs Distributions oracle" begin
+    built, bound = _axis2_build(
+        [:(mu = (b0 .* d) .* ts), :(yy .~ StudentT.(nu, mu, sigma)), :mu],
+        [0.5, 1.2, 2.1, 0.8, 1.5, 2.5];
+        params = [:(b0 ~ Normal(0.0, 1.0)), :(sigma ~ Exponential(1.0)),
+            :(nu ~ Gamma(2.0, 0.1))])
+    names = coordinate_names(built.layout)
+    fixed = Dict(:b0 => 0.5, :sigma => 1.5, :nu => 4.0)
+    u = [n === :b0 ? fixed[n] : log(fixed[n]) for n in names]
+    mu = (0.5 .* _AXIS2_DEX) .* _AXIS2_T
+    td = LocationScale.(mu, 1.5, Ref(TDist(4.0)))
+    ll = sum(logpdf.(td, [0.5, 1.2, 2.1, 0.8, 1.5, 2.5]))
+    prior = logpdf(Normal(0.0, 1.0), 0.5) + logpdf(Exponential(1.0), 1.5) +
+        logpdf(Gamma(2.0, 0.1), 4.0)
+    _axis2_value_grad(built, bound, u, ll, prior, log(1.5) + log(4.0))
+end
+
+@testset "axis2 literal obs args (folded, not threaded)" begin
+    built, bound = _axis2_build(
+        [:(mu = exp.(b0 .* d .* ts)), :(sc = mu ./ 2.0),
+            :(yy .~ Gamma.(2.0, sc)), :mu],
+        [0.5, 1.2, 2.1, 0.8, 1.5, 2.5])
+    names = coordinate_names(built.layout)
+    @test names == [:b0]
+    u = [0.25]
+    mu = exp.(0.25 .* _AXIS2_DEX .* _AXIS2_T)
+    ll = sum(logpdf.(Gamma.(2.0, mu ./ 2.0), [0.5, 1.2, 2.1, 0.8, 1.5, 2.5]))
+    _axis2_value_grad(built, bound, u, ll, logpdf(Normal(0.0, 1.0), 0.25), 0.0)
+    # StudentT with literal nu + sigma (params slot literal).
+    built2, bound2 = _axis2_build(
+        [:(mu = (b0 .* d) .* ts), :(yy .~ StudentT.(4.0, mu, 1.5)), :mu],
+        [0.5, 1.2, 2.1, 0.8, 1.5, 2.5])
+    mu2 = (0.5 .* _AXIS2_DEX) .* _AXIS2_T
+    ll2 = sum(logpdf.(LocationScale.(mu2, 1.5, Ref(TDist(4.0))),
+        [0.5, 1.2, 2.1, 0.8, 1.5, 2.5]))
+    _axis2_value_grad(built2, bound2, [0.5], ll2,
+        logpdf(Normal(0.0, 1.0), 0.5), 0.0)
+end
+
+# The generated program's statement count is O(1) in the data (flat
+# codegen — constraints.md acceptance): tiling subjects must not
+# change the emitted program's shape.
+function _kernel_statement_heads(bound)
+    def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
+    heads = Dict{String,Int}()
+    for st in def.args[2].args
+        st isa Expr || continue
+        h = string(st.head)
+        if h == "=" && st.args[2] isa Expr && st.args[2].head === :call &&
+                st.args[2].args[1] isa Symbol
+            h = "=call:" * string(st.args[2].args[1])
+        end
+        heads[h] = get(heads, h, 0) + 1
+    end
+    return heads
+end
+
+@testset "panel emission is O(1) in the subject count" begin
+    cell = [:(mu = exp.(b0 .* d .* ts)), :(yy .~ Poisson.(mu)), :mu]
+    small = Dict{Symbol,AbstractVector}(
+        :t => _AXIS2_T, :dose => _AXIS2_DOSE, :obs => [1, 0, 2, 3, 1, 0])
+    big = Dict{Symbol,AbstractVector}(
+        :t => vcat(_AXIS2_T, _AXIS2_T), :dose => vcat(_AXIS2_DOSE, _AXIS2_DOSE),
+        :obs => [1, 0, 2, 3, 1, 0, 1, 0, 2, 3, 1, 0])
+    mkast() = Expr(:block, :(b0 ~ Normal(0.0, 1.0)),
+        Expr(:call, :~, :pred, Expr(:do,
+            Expr(:call, :plate,
+                Expr(:parameters, Expr(:kw, :subjects, :kernel_nsub_pred)),
+                :t, :dose, :obs),
+            Expr(:->, Expr(:tuple, :ts, :d, :yy), Expr(:block, cell...)))))
+    b2 = bind_data(lower_rkppl(mkast(), (:dose, :obs, :t)), small;
+        dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :kernel_T_pred => 3))
+    b4 = bind_data(lower_rkppl(mkast(), (:dose, :obs, :t)), big;
+        dims = Dict{Symbol,Int}(:kernel_nsub_pred => 4, :kernel_T_pred => 3))
+    @test _kernel_statement_heads(b2) == _kernel_statement_heads(b4)
+end
+
+# Joint-3 fixture shared by the value test and the battery: two
+# all-scalar panel plates, unequal n=4/n=3, shared b0, sigma on plate 1
+# only. n_obs is the total lanes (4+3).
+function _axis3_joint3()
+    ast = quote
+        b0 ~ Normal(0.0, 1.0)
+        sigma ~ Exponential(1.0)
+        pred1 ~ plate(x1, y1; subjects = kernel_nsub_pred1) do xx1, yy1
+            mu1 = b0 .* xx1
+            yy1 .~ Normal.(mu1, sigma)
+            mu1
+        end
+        pred2 ~ plate(x2, y2; subjects = kernel_nsub_pred2) do xx2, yy2
+            mu2 = exp.(b0 .* xx2)
+            yy2 .~ Poisson.(mu2)
+            mu2
+        end
+    end
+    columns = Dict{Symbol,AbstractVector}(
+        :x1 => [0.5, 1.0, 1.5, 2.0], :y1 => [0.4, 1.1, 1.4, 2.2],
+        :x2 => [0.5, 1.0, 1.5], :y2 => [1, 2, 3])
+    dims = Dict{Symbol,Int}(:kernel_nsub_pred1 => 4, :kernel_nsub_pred2 => 3)
+    return ast, columns, dims
+end
+
+@testset "axis3 joint-3 two-plate gaussian+poisson vs SB" begin
+    # Joint primary (SB mirror: partner brief
+    # `BayesianRegressionModels:rk:kernel:plate/briefs/2026-09-27T17-16-01-132-1u4svoe`).
+    ast, columns, dims = _axis3_joint3()
+    x1, y1 = columns[:x1], columns[:y1]
+    x2, y2 = columns[:x2], columns[:y2]
+    bound =
+        bind_data(lower_rkppl(ast, (:x1, :y1, :x2, :y2)), columns; dims = dims)
+    @test bound.n_obs == 7
+    @test [kp.result for kp in bound.kernel_plates] == [:pred1, :pred2]
+    @test [kp.timepoints for kp in bound.kernel_plates] == [nothing, nothing]
+    built = build_kernel(bound)
+    names = coordinate_names(built.layout)
+    u = [n === :b0 ? 0.5 : log(1.5) for n in names]
+    # SB value (propto=false + Jacobian, u = [b0, sigma-unc]).
+    @test prepare_query(built, bound, :sampler)(u) ≈ -11.969630233025292 atol = 1e-9
+    # Independent Distributions oracle (lane-exact + sigma Jacobian).
+    mu1 = 0.5 .* x1
+    ll1 = sum(logpdf.(Normal.(mu1, 1.5), y1))
+    mu2 = exp.(0.5 .* x2)
+    ll2 = sum(logpdf.(Poisson.(mu2), y2))
+    want = ll1 + ll2 + logpdf(Normal(0.0, 1.0), 0.5) +
+        logpdf(Exponential(1.0), 1.5) + log(1.5)
+    @test prepare_query(built, bound, :sampler)(u) ≈ want atol = 1e-10
+    q = prepare_sampler(built, bound, u; backend = _KERNEL_BACKEND)
+    g = Vector{Float64}(undef, length(u))
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    @test val ≈ want atol = 1e-10
+    # SB grad in SB u-order [b0, sigma-unc]; map by name.
+    sb = Dict(:b0 => 2.833765996036988, :sigma => -3.5022222222222226)
+    for (i, n) in enumerate(names)
+        @test g[i] ≈ sb[n] atol = 1e-8
+    end
+    @test g ≈ _kernel_findiff(
+        x -> prepare_query(built, bound, :sampler)(x), u) atol = 1e-6
+end
+
+@testset "axis3 multi-plate fail-closed battery" begin
+    ast, columns, dims = _axis3_joint3()
+    unbound = lower_rkppl(ast, (:x1, :y1, :x2, :y2))
+    # Stray dims keys fail once, globally (a key for no plate at all).
+    stray = merge(dims, Dict{Symbol,Int}(:kernel_T_preed => 3))
+    @test_throws "not consumed by any kernel plate" bind_data(unbound, columns; dims = stray)
+    # Top-level responses alongside plates name every plate result.
+    resp = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s, nothing,
+        ResponseEvidence(:none, nothing, nothing), :y_resp)
+    pred_spec = PredictorSpec(:mu, IdentityLink,
+        TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+            :Intercept, :intercept)], :mu)
+    sparam = SampledParameter(:s, :exponential, (arg1 = 1.0,), nothing, :s)
+    mkplate(result, col, param) = KernelPlate(result, 1, nothing,
+        [(col, param, :scalar)], Pair{Symbol,Any}[],
+        (response = param, family = GaussianFam, location = param, scale = :s,
+            params = ()),
+        param, result)
+    both2 = StructuralPlan([resp], [pred_spec],
+        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0)],
+        [sparam], AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        kernel_plates = [mkplate(:pred1, :t, :ts),
+            mkplate(:pred2, :t2, :ts2)])
+    @test_throws "no top-level responses alongside `pred1`, `pred2`" validate_structure(both2)
+    # Hand-bound n_obs must be the lanes sum (positive control first).
+    bound = bind_data(unbound, columns; dims = dims)
+    mkhand(n) = StructuralPlan(bound.responses, bound.predictors,
+        bound.population_priors, bound.parameters, bound.assignments,
+        bound.columns, n; kernel_plates = bound.kernel_plates)
+    @test validate_data(mkhand(7)) === nothing
+    @test_throws "total kernel lanes" validate_data(mkhand(6))
+    # A shared subjects key consumes once (all-scalar pair).
+    shr = quote
+        b0 ~ Normal(0.0, 1.0)
+        sigma ~ Exponential(1.0)
+        pa ~ plate(x, y; subjects = kernel_nsub) do xx, yy
+            ma = b0 .* xx
+            yy .~ Normal.(ma, sigma)
+            ma
+        end
+        pb ~ plate(x, y; subjects = kernel_nsub) do xx2, yy2
+            mb = b0 .* xx2
+            yy2 .~ Normal.(mb, sigma)
+            mb
+        end
+    end
+    shr_cols = Dict{Symbol,AbstractVector}(:x => [1.0, 2.0], :y => [0.5, 1.5])
+    shr_bound = bind_data(lower_rkppl(shr, (:x, :y)), shr_cols;
+        dims = Dict{Symbol,Int}(:kernel_nsub => 2))
+    @test shr_bound.n_obs == 4
+    # Per-plate timepoints via the convention (bind-level, no values).
+    t_ast = quote
+        b0 ~ Normal(0.0, 1.0)
+        p1 ~ plate(t, dose, obs; subjects = kernel_nsub_p1) do ts, d, yy
+            m1 = exp.(b0 .* d .* ts)
+            yy .~ Poisson.(m1)
+            m1
+        end
+        p2 ~ plate(t, dose, obs; subjects = kernel_nsub_p2) do ts2, d2, yy2
+            m2 = exp.(b0 .* d2 .* ts2)
+            yy2 .~ Poisson.(m2)
+            m2
+        end
+    end
+    t_cols = Dict{Symbol,AbstractVector}(
+        :t => [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+        :dose => [10.0, 20.0],
+        :obs => [1, 0, 2, 3, 1, 0])
+    t_bound = bind_data(lower_rkppl(t_ast, (:t, :dose, :obs)), t_cols;
+        dims = Dict{Symbol,Int}(:kernel_nsub_p1 => 2, :kernel_T_p1 => 3,
+            :kernel_nsub_p2 => 2, :kernel_T_p2 => 3))
+    @test t_bound.n_obs == 12
+    @test [kp.timepoints for kp in t_bound.kernel_plates] == [3, 3]
+    # A non-conventional T key with N plates: the T-needing plate names
+    # its conventional key.
+    t_unbound = lower_rkppl(t_ast, (:t, :dose, :obs))
+    @test_throws "bind `kernel_T_p1`" bind_data(t_unbound, t_cols;
+        dims = Dict{Symbol,Int}(:kernel_nsub_p1 => 2, :kernel_nsub_p2 => 2,
+            :Tee => 3))
 end
 
