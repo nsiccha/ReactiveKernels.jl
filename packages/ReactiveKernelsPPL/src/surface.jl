@@ -4270,8 +4270,10 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     end
     family, lik_link, pred_link, loc, scale_raw, trials, nu_raw, zi_raw,
     interval_raw = _lower_response_base(lhs, call, ctx)
-    pname = family === BinomialProbFam ?
-        _lower_prob_location(lhs, loc, ctx) :
+    pname = (family === BinomialProbFam ||
+            family === ZeroInflatedBinomialFam) ?
+        _lower_prob_location(lhs, loc, ctx,
+            family === BinomialProbFam ? "Binomial" : "ZeroInflatedBinomial") :
         _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
@@ -4987,7 +4989,8 @@ function _dot2call_object_error(lhs, rhs)
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol && rhs.args[1] in
             (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
-                :Gamma, :Beta, :ZeroInflatedPoisson, :BernoulliLogit,
+                :Gamma, :Beta, :ZeroInflatedPoisson, :ZeroInflatedBinomial,
+                :BernoulliLogit,
                 :PoissonLog, :BinomialLogit,
                 :NegativeBinomial2Log, :GammaLog, :BetaLogit,
                 :CategoricalLogit, :OrderedLogistic, :Ordinal,
@@ -5152,6 +5155,7 @@ const _RESPONSE_BASE_MSG =
     "`NegativeBinomial.(exp.(eta), p)`, " *
     "`HurdlePoisson.(exp.(eta), p_zero)`, " *
     "`ZeroInflatedPoisson.(exp.(eta), zi)`, " *
+    "`ZeroInflatedBinomial.(n, p, zi)`, " *
     "`InverseGaussian.(exp.(eta), lambda)`, " *
     "`Gamma.(alpha, exp.(eta) ./ alpha)`, " *
     "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`, " *
@@ -5174,8 +5178,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
     fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
         :NegativeBinomial2, :NegativeBinomial, :Gamma, :Beta, :HurdlePoisson,
-        :ZeroInflatedPoisson, :InverseGaussian, :BetaBinomial2,
-        :VonMises, :CircularVonMises) ||
+        :ZeroInflatedPoisson, :ZeroInflatedBinomial, :InverseGaussian,
+        :BetaBinomial2, :VonMises, :CircularVonMises) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
@@ -5238,6 +5242,19 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         return ZeroInflatedPoissonFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
         args[2], nothing
+    elseif fam === :ZeroInflatedBinomial
+        length(args) == 3 || _sfail("response $lhs: `ZeroInflatedBinomial` takes " *
+                                    "`ZeroInflatedBinomial.(n, p, zi)`")
+        # v1 is prob-space only (the BinomialProb precedent): a bare
+        # Beta-sampled p. Link-wrapped probabilities (a predictor-fed GLM
+        # shape) are a planned slice, never a silent misroute.
+        pp = args[2]
+        (pp isa Symbol || pp isa Real) ||
+            _sfail("response $lhs: `ZeroInflatedBinomial` probability takes " *
+                "a bare Beta parameter (`p ~ Beta(...)` in the model), " *
+                "got $(repr(pp))")
+        return ZeroInflatedBinomialFam, IdentityLink, IdentityLink, pp,
+        nothing, _lower_trials(lhs, args[1], ctx), nothing, args[3], nothing
     elseif fam === :InverseGaussian
         length(args) == 2 || _sfail("response $lhs: `InverseGaussian` takes " *
                                     "`InverseGaussian.(exp.(eta), lambda)`")
@@ -5375,6 +5392,9 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :zero_inflated_poisson && _sfail("response $lhs: use " *
                                  "`ZeroInflatedPoisson` (the response " *
                                  "spelling, not the kernel endpoint)")
+    fam === :zero_inflated_binomial && _sfail("response $lhs: use " *
+                                 "`ZeroInflatedBinomial` (the response " *
+                                 "spelling, not the kernel endpoint)")
     fam === :inverse_gaussian && _sfail("response $lhs: use " *
                                         "`InverseGaussian` (the response " *
                                         "spelling, not the kernel endpoint)")
@@ -5398,6 +5418,7 @@ function _lower_response_base_error(lhs, rhs, fam)
                   "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
                   "NegativeBinomial2, NegativeBinomial, " *
                   "HurdlePoisson, ZeroInflatedPoisson, " *
+                  "ZeroInflatedBinomial, " *
                   "InverseGaussian, BetaBinomial2, VonMises, " *
                   "CircularVonMises, Gamma, Beta, " *
                   "BernoulliLogit, " *
@@ -5463,15 +5484,15 @@ function _lower_binomial_link(lhs, arg)
     return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
 end
 
-# Prob-space Binomial location: a sampled parameter name (the Beta family
-# is checked at contract, the Categorical deferral precedent). Literals
-# stay rejected — a fully fixed Binomial contributes a constant.
-function _lower_prob_location(lhs, loc, ctx)
+# Prob-space Binomial-family location: a sampled parameter name (the Beta
+# family is checked at contract, the Categorical deferral precedent).
+# Literals stay rejected — a fully fixed Binomial contributes a constant.
+function _lower_prob_location(lhs, loc, ctx, what::String = "Binomial")
     loc isa Symbol && loc in ctx.prior_names && return loc
-    loc isa Real && _sfail("response $lhs: prob-space Binomial " *
+    loc isa Real && _sfail("response $lhs: prob-space $what " *
                            "probability $loc is a literal — v1 probabilities " *
                            "are Beta-sampled (`theta ~ Beta(...)` in the model)")
-    return _sfail("response $lhs: prob-space Binomial probability takes a " *
+    return _sfail("response $lhs: prob-space $what probability takes a " *
                   "Beta parameter name (`theta ~ Beta(...)` in the model), " *
                   "got $(repr(loc))")
 end

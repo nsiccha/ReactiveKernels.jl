@@ -666,6 +666,46 @@ end
     end, Dn2)
 end
 
+@testset "zib response failures" begin
+    Ds = (:s,)
+    # Arity: exactly (n, p, zi).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        p ~ Beta(1.0, 1.0)
+        zi ~ Beta(1.0, 1.0)
+        s .~ ZeroInflatedBinomial.(3, p)
+    end, Ds)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        p ~ Beta(1.0, 1.0)
+        zi ~ Beta(1.0, 1.0)
+        s .~ ZeroInflatedBinomial.(3, p, zi, 0.1)
+    end, Ds)
+    # The kernel-endpoint spelling redirects to the response head.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        p ~ Beta(1.0, 1.0)
+        zi ~ Beta(1.0, 1.0)
+        s .~ zero_inflated_binomial.(3, p, zi)
+    end, Ds)
+    # v1 is prob-space only: link-wrapped probabilities fail closed.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        p ~ Beta(1.0, 1.0)
+        zi ~ Beta(1.0, 1.0)
+        eta = a .+ b .* x
+        s .~ ZeroInflatedBinomial.(3, logistic.(eta), zi)
+    end, (:s, :x))
+    # Literal probabilities stay rejected (a fully fixed ZIB
+    # contributes a constant).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        zi ~ Beta(1.0, 1.0)
+        s .~ ZeroInflatedBinomial.(3, 0.5, zi)
+    end, Ds)
+    # An unbracketed head names the broadcast fix.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        p ~ Beta(1.0, 1.0)
+        zi ~ Beta(1.0, 1.0)
+        s .~ ZeroInflatedBinomial(3, p, zi)
+    end, Ds)
+end
+
 # Inverse-Gaussian scalar log-density (Distributions.jl oracle; SB
 # `brm_inverse_gaussian_lpdf` matches it operation-for-operation).
 _ig_logpdf(y::Real, mu::Real, lam::Real) = logpdf(InverseGaussian(mu, lam), y)
