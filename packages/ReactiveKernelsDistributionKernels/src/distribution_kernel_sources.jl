@@ -1379,6 +1379,10 @@ docs_example = (;
     kernel = weibull_kernel,
     output,
     plated = weibull_plated,
+    plate_inputs,
+    plate_output,
+)
+"""
 const ZERO_INFLATED_BINOMIAL_SOURCE = ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE * raw"""
 
 zero_inflated_binomial_kernel = prepare(zero_inflated_binomial.logpdf;
