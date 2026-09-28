@@ -1,3 +1,4 @@
+using Distributions: Exponential, Normal, logpdf
 using ReactiveKernelsPPL
 using Test
 
@@ -429,16 +430,50 @@ end
     # `Cauchy.(0, 1)` broadcast was rejected under Normal-only admission;
     # the prior-vocab slice admits per-addressee Cauchy (see
     # test_prior_vocab.jl), so the rejection case moves to Gamma (not a
-    # coefficient family).
+    # coefficient family). Likewise `Normal.(0, s)` with sampled `s`
+    # was rejected before the shared-hyperparameter slice; it is now
+    # the admitted hierarchical spelling (see "matrix hierarchical
+    # prior values vs oracle" below), so the arg-gate rejection case
+    # moves to an unknown hyper name.
     cases = [
         ("is a vector — use `.~`", quote b[axes(X, 2)] ~ Normal(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         ("needs a broadcast prior", quote b[axes(X, 2)] .~ Gamma.(1, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("must be a literal or a literal 2-vector", quote s ~ Exponential(1); b[axes(X, 2)] .~ Normal.(0, s); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, s) end),
+        ("must be a literal, a literal 2-vector, or a shared-hyperparameter name", quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         ("has 2 elements for 3 columns", quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
     ]
     for (msg, ast) in cases
         err = _mx_err(ast, D)
         @test err isa SurfaceLoweringError && occursin(msg, err.message)
+    end
+end
+
+@testset "matrix hierarchical prior values vs oracle" begin
+    # The admitted hierarchical spelling: a sampled scale threads into
+    # per-element `PopulationPrior` scales and the emitter reads it
+    # back per evaluation (posterior matches a Distributions.jl oracle
+    # bit-for-bit and moves with the hyper).
+    prog = quote
+        s ~ Exponential(1)
+        b[axes(X, 2)] .~ Normal.(0, s)
+        X = hcat(1, x1)
+        mu = X * b
+        y .~ Normal.(mu, s)
+    end
+    Y = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    X1 = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    cols = Dict{Symbol,AbstractVector}(:y => Y, :x1 => X1)
+    plan = lower_rkppl(prog, (:y, :x1))
+    @test all(p -> p.scale === :s, plan.population_priors)
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    kern = prepare_query(built, bound, :sampler)
+    oracle(b, s) = logpdf(Exponential(1), s) +
+        sum(logpdf(Normal(0, s), bj) for bj in b) +
+        sum(logpdf(Normal(b[1] + b[2] * x, s), y)
+            for (x, y) in zip(X1, Y)) + log(s)
+    for q in ((mu = [0.5, -0.25], s = 1.3), (mu = [0.5, -0.25], s = 0.7))
+        @test Base.invokelatest(kern, unconstrain(built.layout, q)) ≈
+            oracle(q.mu, q.s)
     end
 end
 
