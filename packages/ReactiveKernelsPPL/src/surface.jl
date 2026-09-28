@@ -421,7 +421,9 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # 0, 1)`) and scale (`HalfNormal(s)` / `truncated(Normal(0, s), 0,
     # Inf)`) — the only names a `dar()` call accepts (checked during
     # response lowering, before `_lower_parameters` runs; the contract
-    # re-checks for hand-built plans).
+    # re-checks for hand-built plans). `_lower_parameters` re-keys both to
+    # Stan-kernel overrides (`_dar_stan_override`); the spellings stay
+    # Distributions-shaped.
     dar_beta_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dar_beta_rhs(s.rhs))
     dar_sigma_names = Set{Symbol}(s.lhs for s in sample
@@ -4588,24 +4590,45 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
     end
 end
 
-# Mixture weights: a literal numeric vector or a simplex parameter name
-# (length/sum/concentration checked at contract — structural, normative).
+# Mixture weights: a literal numeric vector, a simplex parameter name,
+# or a complement pair (length/sum/concentration checked at contract —
+# structural, normative).
 function _lower_mixture_weights(lhs, wraw)
     wraw isa Symbol && return wraw
     wraw isa Expr && wraw.head === :vect || _sfail("response $lhs: " *
-        "mixture weights are a literal vector (`[0.4, 0.6]`) or a " *
-        "simplex parameter name, got $(repr(wraw))")
+        "mixture weights are a literal vector (`[0.4, 0.6]`), a " *
+        "simplex parameter name, or a complement pair " *
+        "(`[s, 1.0 - s]`), got $(repr(wraw))")
+    # Complement pair: `[s, 1-s]` / `[1-s, s]` over one sampled
+    # parameter (the collapsed Beta-weight shape).
+    if length(wraw.args) == 2
+        pair = _mixture_complement_pair(wraw.args)
+        pair !== nothing && return pair
+    end
     for (j, e) in enumerate(wraw.args)
         e isa Real && !(e isa Bool) || _sfail("response $lhs: mixture " *
-            "weight $j is not a numeric literal (got $(repr(e)))")
+            "weight $j is not a numeric literal (got $(repr(e))) — " *
+            "sampled weights spell `[s, 1.0 - s]` over one parameter")
     end
     return Float64.(wraw.args)
 end
 
+# `[s, 1-s]` / `[1-s, s]` with `s` a Symbol, else `nothing`.
+function _mixture_complement_pair(args)
+    iscomp(e, s) = e isa Expr && e.head === :call && length(e.args) == 3 &&
+        e.args[1] === :- && e.args[2] isa Real && e.args[2] == 1 &&
+        e.args[3] === s
+    a, b = args[1], args[2]
+    a isa Symbol && iscomp(b, a) && return MixtureComplementWeights(a, true)
+    b isa Symbol && iscomp(a, b) && return MixtureComplementWeights(b, false)
+    return nothing
+end
+
 # The mixture anchor (the non-nullable `predictor` slot): first location
 # predictor, else first scale predictor, else the weights simplex name,
-# else the first location/scale parameter name — the BRM struct order,
-# verbatim. Fully-fixed mixtures fail closed before anchoring.
+# else the complement-pair parameter, else the first location/scale
+# parameter name — the BRM struct order, verbatim. Fully-fixed mixtures
+# fail closed before anchoring.
 function _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
     for loc in loc_uses
         loc isa Symbol && loc in prednames && return loc
@@ -4614,6 +4637,7 @@ function _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
         s isa ScalePredictorRef && return s.predictor
     end
     w isa Symbol && return w
+    w isa MixtureComplementWeights && return w.param
     for loc in loc_uses
         loc isa Symbol && loc in ctx.prior_names && return loc
     end
@@ -5013,8 +5037,13 @@ function _dot2call_spine_arg(lhs, f, i, a)
     if f in _DOT_WRAPPERS && i == 1
         return _dot2call_nested_object(lhs, a)
     elseif (f === :Bernoulli || f === :Poisson) && i == 1
+        # Bare param/literal: the mixture bare-mean slots, single-family
+        # form (sorted downstream in `_lower_location`).
+        (a isa Symbol || a isa Real) && return a
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :Binomial && i == 2
+        # Bare param/literal: see above.
+        (a isa Symbol || a isa Real) && return a
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :NegativeBinomial2 && i == 1
         return _dot2call_nested_link(lhs, a, f)
@@ -5149,9 +5178,12 @@ end
 const _RESPONSE_BASE_MSG =
     "response distribution must be `Normal.(mu, sigma)`, " *
     "`StudentT.(nu, mu, sigma)`, " *
-    "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link), " *
-    "`Poisson.(exp.(eta))`, `Binomial.(n, logistic.(mu))` (or " *
-    "`probit`/`cloglog` for the link), " *
+    "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link, " *
+    "or bare `Bernoulli.(theta)` over a sampled parameter), " *
+    "`Poisson.(exp.(eta))` (or bare `Poisson.(lambda)` over a sampled " *
+    "parameter), `Binomial.(n, logistic.(mu))` (or `probit`/`cloglog` " *
+    "for the link, or bare `Binomial.(n, theta)` over a sampled " *
+    "parameter), " *
     "`NegativeBinomial2.(exp.(eta), phi)`, " *
     "`NegativeBinomial.(exp.(eta), p)`, " *
     "`Weibull.(k, exp.(eta))`, " *
@@ -5198,12 +5230,25 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link)")
+        if args[1] isa Symbol
+            # Bare sampled parameter (constrained-scale, no link
+            # inversion): the mixture bare-mean triple.
+            return BernoulliLogitFam, LogitLink, IdentityLink, args[1],
+            nothing, nothing, nothing, nothing, nothing
+        end
         f, l, loc = _lower_bernoulli_link(lhs, args[1])
         return f, l, IdentityLink, loc, nothing, nothing, nothing, nothing,
         nothing
     elseif fam === :Binomial
         length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
                                     "`Binomial.(n, logistic.(mu))` (or `probit`/`cloglog` for the link)")
+        if args[2] isa Symbol
+            # Bare sampled parameter (constrained-scale): the mixture
+            # bare-mean triple.
+            return BinomialLogitFam, LogitLink, IdentityLink, args[2],
+            nothing, _lower_trials(lhs, args[1], ctx), nothing, nothing,
+            nothing
+        end
         f, l, loc = _lower_binomial_link(lhs, args[2])
         return f, l, IdentityLink, loc, nothing,
         _lower_trials(lhs, args[1], ctx), nothing, nothing, nothing
@@ -5281,6 +5326,12 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
+        if args[1] isa Symbol
+            # Bare sampled parameter (constrained-scale): the mixture
+            # bare-mean triple.
+            return PoissonLogFam, LogLink, LogLink, args[1], nothing,
+            nothing, nothing, nothing, nothing
+        end
         return PoissonLogFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
         nothing, nothing
@@ -5887,8 +5938,13 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         # A pin over a scan state claims nothing (no predictor is built) and
         # falls through to the unconsumed-pin error.
         loc in ctx.scan_states && return loc
-        haskey(ctx.detmap, loc) ||
+        if !haskey(ctx.detmap, loc)
+            # A bare sampled parameter (constrained-scale, no link
+            # inversion): the mixture bare-mean slots, single-family
+            # form. detmap-first preserves stated-prior aliases.
+            loc in ctx.prior_names && return loc
             return _lower_location_symbol_error(lhs, loc, ctx)
+        end
         pin = get(ctx.predictor_pins, lhs, nothing)
         if pin !== nothing && pin !== loc
             # A pin renames one response's predictor — the pinned location
@@ -6604,12 +6660,14 @@ end
 # trajectory as a direct beta-free summand (SB's `dar(time)` shape —
 # the formula intercept is the initial level, the `mo1` splice shape).
 # Exactly two bare sampled scalars: a truncated-`[0, 1]`-Normal
-# persistence and a positive-Normal scale. Additive only; one `dar()`
-# call per predictor in v1. The state synthesizes as `dar_<pname>` and
-# claims the name up front (the `_implicit_vector!` precedent). Both
-# parameters record in `dar_coefs` (checked disjoint from predictor
-# coefficients after lowering) and lower to `SampledParameter`s, never
-# population priors.
+# persistence and a positive-Normal scale, both under Stan-kernel
+# semantics once lowered (`(:interval_stan, 0, 1)` / `:positive_stan`
+# via `_dar_stan_override` — SB never renormalizes bounds). Additive
+# only; one `dar()` call per predictor in v1. The state synthesizes as
+# `dar_<pname>` and claims the name up front (the
+# `_implicit_vector!` precedent). Both parameters record in `dar_coefs`
+# (checked disjoint from predictor coefficients after lowering) and
+# lower to `SampledParameter`s, never population priors.
 function _classify_dar(pname, core::Expr, sign::Int, ctx)
     where = "predictor $pname"
     sign > 0 ||
@@ -7476,6 +7534,25 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :Laplace => :laplace, :Logistic => :logistic, :Uniform => :uniform,
 )
 
+# A `dar()` trajectory parameter rides Stan-kernel semantics: the
+# persistence's `(:interval, 0, 1)` becomes `(:interval_stan, 0, 1)`
+# and the scale's `:positive` becomes `:positive_stan` — same
+# constrained transforms, NO truncation renormalizers (SB never
+# renormalizes bounds). Keyed on actual `dar()` USE (`dar_specs`), not
+# on RHS shape: a dar-shaped `~` never consumed by `dar()` keeps
+# Distributions semantics. `_classify_dar` already gated both shapes,
+# so a mismatch here is an internal inconsistency the contract
+# rejects downstream.
+function _dar_stan_override(p::SampledParameter, specs::Vector{DarSpec})
+    for s in specs
+        p.name === s.beta && return SampledParameter(p.name, p.family,
+            p.args, (:interval_stan, 0.0, 1.0), p.label)
+        p.name === s.sigma && return SampledParameter(p.name, p.family,
+            p.args, :positive_stan, p.label)
+    end
+    return p
+end
+
 function _lower_parameters(sample, coefuse, ctx, glmuse)
     params = SampledParameter[]
     syms = Set{Symbol}()
@@ -7509,6 +7586,7 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
                                        "it in a matmul (`mu = X * " *
                                        "$(s.lhs)`) or drop it")
         p = _lower_parameter(s.lhs, s.rhs, coefuse, ctx.matrices)
+        p = _dar_stan_override(p, ctx.dar_specs)
         push!(params, p)
         for v in values(p.args)
             v isa Symbol && push!(syms, v)

@@ -570,11 +570,19 @@ end
     bad = _student_plan()
     bad.columns[:y] = fill("a", 9)
     @test_throws ContractValidationError validate_plan(bad)
-    # Evidence wrappers stay Gaussian/Poisson-only.
-    bad = _student_plan()
-    bad.responses[1] =
+    # Evidence wrappers admit Gaussian/Poisson/StudentT (slice 1):
+    # StudentT + truncated validates (the Gaussian clamp law over the
+    # `student_t` cdf).
+    good = _student_plan()
+    good.responses[1] =
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
             ResponseEvidence(:truncated, -1.0, 1.0), :y_resp, nothing, nothing; nu = :nu)
+    @test validate_plan(good) === nothing
+    # Other families stay fail-closed at the evidence gate.
+    bad = _hurdle_plan()
+    bad.responses[1] =
+        LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, :p_zero, nothing,
+            ResponseEvidence(:truncated, 0, 5), :y_resp, nothing, nothing)
     @test_throws ContractValidationError validate_plan(bad)
     # A predictor-fed sigma is admitted (the Gaussian vscale shape).
     good = _student_plan()

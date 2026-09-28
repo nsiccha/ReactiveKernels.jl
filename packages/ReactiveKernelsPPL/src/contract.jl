@@ -187,6 +187,20 @@ struct ScalePredictorRef
 end
 
 """
+    MixtureComplementWeights(param, param_first)
+
+2-component mixture weights from one `:unit`-support sampled parameter
+(`[s, 1-s]` when `param_first`, `[1-s, s]` otherwise): the collapsed
+Beta-weight shape. The complement sums to 1 by construction, so no
+simplex validation applies; the generator threads the constrained
+scalar and logs each arm directly.
+"""
+struct MixtureComplementWeights
+    param::Symbol
+    param_first::Bool
+end
+
+"""
     LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, trials[, range]])
 
 One independent response. `scale` is the response's auxiliary —
@@ -311,8 +325,9 @@ their defaults:
   required exactly when the component family takes a scale auxiliary.
   Empty otherwise.
 - `mixture_weights`: the length-K mixing weights: a literal
-  `Vector{Float64}` (finite, nonnegative, sums to 1) or a
-  `:simplex_dirichlet` [`VectorParameter`](@ref) name, `nothing`
+  `Vector{Float64}` (finite, nonnegative, sums to 1), a
+  `:simplex_dirichlet` [`VectorParameter`](@ref) name, or a
+  [`MixtureComplementWeights`](@ref) pair (K == 2), `nothing`
   otherwise.
 
 `predictor` is an anchor only (first location predictor, else first
@@ -372,7 +387,7 @@ struct LikelihoodSpec
     mixture_family::Union{Nothing,LikelihoodFamily}
     mixture_locs::Vector{Union{Symbol,Real}}
     mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
-    mixture_weights::Union{Nothing,Symbol,Vector{Float64}}
+    mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights}
     nu::Union{Nothing,ParamName,Real,ScalePredictorRef}
     zi::Union{Nothing,ParamName,Real,ScalePredictorRef}
     mi_jobs::Union{Nothing,ColumnRef}
@@ -407,7 +422,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         mixture_locs::Vector{Union{Symbol,Real}} = Union{Symbol,Real}[],
         mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}} =
             Union{Nothing,Symbol,Real,ScalePredictorRef}[],
-        mixture_weights::Union{Nothing,Symbol,Vector{Float64}} = nothing,
+        mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights} = nothing,
         nu::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         zi::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         mi_jobs::Union{Nothing,ColumnRef} = nothing,
@@ -565,11 +580,14 @@ NO truncation renormalizer, matching SB which never renormalizes
 bounds), the tuple
 `(:interval, lo, hi)` (a two-sided finite truncation `truncated(Normal(mu, s),
 lo, hi)` — an affine-logistic constrained transform onto `(lo, hi)` with the
-renormalized truncated density), or the tuple `(:upper, hi)` (an upper-only
-truncation `truncated(Normal(mu, s), -Inf, hi)` — Stan's upper-bound kernel
-`x = hi - exp(u)` with the bare-`u` Jacobian and NO truncation renormalizer).
-Shared by scalar [`SampledParameter`](@ref)s and per-cell
-[`PlateParameter`](@ref)s.
+renormalized truncated density), the tuple `(:interval_stan, lo, hi)`
+(the same affine-logistic constrained transform onto `(lo, hi)` under
+Stan two-sided-bound kernel semantics — plain `_lpdf` plus the bare-`u`
+Jacobian, NO truncation renormalizer), or the tuple `(:upper, hi)` (an
+upper-only truncation `truncated(Normal(mu, s), -Inf, hi)` — Stan's
+upper-bound kernel `x = hi - exp(u)` with the bare-`u` Jacobian and NO
+truncation renormalizer). Shared by scalar [`SampledParameter`](@ref)s
+and per-cell [`PlateParameter`](@ref)s.
 """
 const SupportOverride =
     Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64},Tuple{Symbol,Float64}}
@@ -584,8 +602,9 @@ semantics (`Exponential(θ)` = scale θ). Values are literals or
 is a [`SupportOverride`](@ref): `nothing` (infer from family), `:positive`
 (half-Normal/half-Cauchy), `:positive_stan` (the Stan-kernel half,
 unnormalized), `(:interval, lo, hi)` (a finite truncated
-interval), or `(:upper, hi)` (an upper-only truncation with Stan kernel
-semantics).
+interval), `(:interval_stan, lo, hi)` (a finite interval with Stan
+kernel semantics, unnormalized), or `(:upper, hi)` (an upper-only
+truncation with Stan kernel semantics).
 """
 struct SampledParameter
     name::ParamName
@@ -1275,8 +1294,10 @@ end
 One differenced-AR(1) trajectory (SB `_sb_dar1`'s `differenced_ar1_path`):
 the zero-started integrated path `x[t+1] = x[t] + d[t]` over the AR(1)
 increments `d[t] = beta*d[t-1] + sigma*z[t]` (`d[0] = 0`, `x[1] = 0`).
-`beta`/`sigma` name the persistence (`Normal` on `(:interval, 0, 1)`) and
-innovation-scale (`Normal` on `:positive`) [`SampledParameter`](@ref)s;
+`beta`/`sigma` name the persistence (`Normal` on `(:interval_stan, 0, 1)`,
+Stan two-sided-bound kernel semantics, unnormalized) and
+innovation-scale (`Normal` on `:positive_stan`, Stan lower-bound kernel
+semantics, unnormalized) [`SampledParameter`](@ref)s;
 the `z` innovations (length `n_obs - 1`) are owned internally under the
 reserved `_ppl_dar_z_<state>` name, like a non-centered scan's
 `_ppl_scan_z_<state>` slice. The path length is `n_obs` by construction
@@ -1733,7 +1754,7 @@ reductions; elementwise math over columns deferred with vector assignments;
 the AR(1) slice adds `tanh` for the `phi = tanh(phi_raw)` stationarity map)."""
 const ASSIGNMENT_FNS = (
     :+, :-, :*, :/, :^,
-    :log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :tanh,
+    :log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :tanh, :logaddexp,
     :sum, :mean, :std, :var, :minimum, :maximum, :length,
 )
 
@@ -1879,8 +1900,10 @@ const ELEMENTWISE_OPS =
 const ELEMENTWISE_COMPARISONS = (:.==, :.!=, :.<, :.>, :.<=, :.>=)
 
 """Dotted math functions admitted in derived columns (`f.(x)` parses to
-`Expr(:., f, ...)`; single-argument, mirroring the scalar math subset)."""
-const ELEMENTWISE_FNS = (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs)
+`Expr(:., f, ...)`; single-argument, mirroring the scalar math subset —
+plus two-argument `logaddexp` for occupancy marginalization)."""
+const ELEMENTWISE_FNS =
+    (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :logaddexp)
 
 """Families the thin layer can lower (ext handshake predicate)."""
 admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
@@ -4379,13 +4402,14 @@ end
 _dar_innovation_name(s::DarSpec) = Symbol(:_ppl_dar_z_, s.state)
 
 # Structural invariants of each differenced-AR(1) trajectory: the
-# persistence names a `Normal` sampled parameter on exactly `(:interval,
-# 0, 1)` (SB's `beta ~ normal(0.5, 0.2; lower=0, upper=1)`; overrides
+# persistence names a `Normal` sampled parameter on exactly
+# `(:interval_stan, 0, 1)` (SB's `beta ~ normal(0.5, 0.2; lower=0,
+# upper=1)`, unnormalized — Stan never renormalizes bounds; overrides
 # ride the same spelling with new location/scale) and the scale names a
-# `Normal` sampled parameter on `:positive` (SB's `sigma ~
-# normal(0, 0.2; lower=0)`). The `n_obs ≥ 2` length gate lives in the
-# layout (unbound surface plans carry `n_obs = 0`, like a scan's
-# symbolic `hi` — lengths resolve at bind).
+# `Normal` sampled parameter on `:positive_stan` (SB's `sigma ~
+# normal(0, 0.2; lower=0)`, unnormalized). The `n_obs ≥ 2` length gate
+# lives in the layout (unbound surface plans carry `n_obs = 0`, like a
+# scan's symbolic `hi` — lengths resolve at bind).
 function _validate_dar_paths(plan::StructuralPlan)
     for s in plan.dar_paths
         s.beta === s.sigma && _fail(s.label,
@@ -4396,22 +4420,22 @@ function _validate_dar_paths(plan::StructuralPlan)
             "dar persistence :$(s.beta) must name a scalar sampled " *
             "parameter (`$(s.beta) ~ truncated(Normal(0.5, 0.2), 0, 1)`)")
         b = plan.parameters[i]
-        (b.family === :normal && b.support_override == (:interval, 0.0, 1.0)) ||
+        (b.family === :normal && b.support_override == (:interval_stan, 0.0, 1.0)) ||
             _fail(s.label,
                 "dar persistence :$(s.beta) must be Normal on exactly " *
-                "(:interval, 0, 1) (SB's `beta ~ normal(0.5, 0.2; " *
-                "lower=0, upper=1)`), got :$(b.family) on " *
+                "(:interval_stan, 0, 1) (SB's `beta ~ normal(0.5, 0.2; " *
+                "lower=0, upper=1)`, unnormalized), got :$(b.family) on " *
                 "$(repr(b.support_override))")
         j = findfirst(p -> p.name === s.sigma, plan.parameters)
         j === nothing && _fail(s.label,
             "dar scale :$(s.sigma) must name a scalar sampled parameter " *
             "(`$(s.sigma) ~ HalfNormal(0.2)`)")
         sg = plan.parameters[j]
-        (sg.family === :normal && sg.support_override === :positive) ||
+        (sg.family === :normal && sg.support_override === :positive_stan) ||
             _fail(s.label,
-                "dar scale :$(s.sigma) must be Normal on :positive (SB's " *
-                "`sigma ~ normal(0, 0.2; lower=0)`), got :$(sg.family) " *
-                "on $(repr(sg.support_override))")
+                "dar scale :$(s.sigma) must be Normal on :positive_stan " *
+                "(SB's `sigma ~ normal(0, 0.2; lower=0)`, unnormalized), " *
+                "got :$(sg.family) on $(repr(sg.support_override))")
     end
     return nothing
 end
@@ -4703,8 +4727,13 @@ function _collect_vector_dot!(refs, ex, plan, label, bound::Bool)
         "Julia functions are planned (no-@deffun-ceremony direction) but " *
         "need IR/contract growth",
     )
-    length(args) == 1 ||
-        _fail(label, "`$f.` takes exactly one argument")
+    if f === :logaddexp
+        length(args) == 2 ||
+            _fail(label, "`logaddexp.` takes exactly two arguments")
+    else
+        length(args) == 1 ||
+            _fail(label, "`$f.` takes exactly one argument")
+    end
     _check_numeric_position!(args, plan, label, bound)
     for arg in args
         _collect_vector_refs!(refs, arg, plan, label, bound)
@@ -4850,18 +4879,20 @@ function _validate_support_override(label, family::Symbol,
                 ":upper bound must be finite; got $hi")
             return nothing
         end
-        (ov[1] === :interval && length(ov) == 3) || _fail(label,
-            "tuple support override must be (:interval, lo, hi) or " *
-            "(:upper, hi); got $ov")
+        head = ov[1]
+        ((head === :interval || head === :interval_stan) &&
+            length(ov) == 3) || _fail(label,
+            "tuple support override must be (:interval, lo, hi), " *
+            "(:interval_stan, lo, hi), or (:upper, hi); got $ov")
         family === :normal || _fail(label,
-            "an :interval override is a truncated Normal in slice 1 " *
+            "an $head override is a truncated Normal in slice 1 " *
             "(`truncated(Normal(mu, s), lo, hi)`); got $family")
         lo, hi = ov[2], ov[3]
         (isfinite(lo) && isfinite(hi)) || _fail(label,
-            ":interval bounds must be finite (a one-sided or half truncation " *
+            "$head bounds must be finite (a one-sided or half truncation " *
             "uses :positive); got ($lo, $hi)")
         lo < hi || _fail(label,
-            ":interval lower bound must be < upper bound; got ($lo, $hi)")
+            "$head lower bound must be < upper bound; got ($lo, $hi)")
         return nothing
     end
     (ov === :positive || ov === :positive_stan) ||
@@ -6594,7 +6625,7 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
     w = r.mixture_weights
     w === nothing && _fail(r.label,
         "a mixture response requires its mixture_weights (a literal " *
-        "length-K vector or a simplex parameter)")
+        "length-K vector, a simplex parameter, or a complement pair)")
     if w isa Symbol
         vi = findfirst(p -> p.name === w, plan.vector_parameters)
         vi === nothing && _fail(r.label,
@@ -6606,6 +6637,19 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
         length(vp.args.arg1) == K || _fail(r.label,
             "mixture weights concentration length " *
             "$(length(vp.args.arg1)) disagrees with the $K components")
+    elseif w isa MixtureComplementWeights
+        K == 2 || _fail(r.label,
+            "complement-pair mixture weights take exactly 2 components " *
+            "(got $K)")
+        pi = findfirst(p -> p.name === w.param, plan.parameters)
+        pi === nothing && _fail(r.label,
+            "complement-pair mixture weight $(w.param) is not a sampled " *
+            "parameter")
+        get(SAMPLED_SUPPORT, plan.parameters[pi].family, :unknown) === :unit ||
+            _fail(r.label,
+            "complement-pair mixture weight $(w.param) must be " *
+            ":unit-support (a Beta/uniform/interval parameter), got " *
+            "$(plan.parameters[pi].family)")
     else
         length(w) == K || _fail(r.label,
             "mixture has $K components but $(length(w)) weights")
@@ -6838,6 +6882,32 @@ function _validate_responses(plan::StructuralPlan)
             r.range === nothing || _fail(r.label,
                 "a plate-mean observation ($(r.predictor)) takes no range " *
                 "(the latent covers the whole column)")
+            _validate_scale(r, plan)
+            _validate_nu(r, plan)
+            _validate_zi(r, plan)
+            _validate_interval(r, plan)
+            _validate_evidence_structure(r, plan)
+            _validate_unleveled_fields(r)
+            continue
+        end
+        # A bare sampled-parameter location (constrained-scale, no link
+        # inversion — the mixture bare-mean slots, single-family form):
+        # Bernoulli/Binomial-logit and Poisson-log over a scalar
+        # parameter. Evidence stays fail-closed (the cdf arms are
+        # link-space); weights/range ride the generic machinery.
+        if any(p -> p.name === r.predictor, plan.parameters)
+            ((r.family === BernoulliLogitFam ||
+                r.family === BinomialLogitFam) &&
+                r.link === LogitLink) ||
+                (r.family === PoissonLogFam && r.link === LogLink) ||
+                _fail(r.label,
+                "a sampled-parameter response location ($(r.predictor)) is " *
+                "Bernoulli/Binomial-logit or Poisson-log only in v1 " *
+                "(got $(r.family)/$(r.link))")
+            r.evidence.kind === :none || _fail(r.label,
+                "a sampled-parameter location ($(r.predictor)) takes no " *
+                "censoring/truncation evidence in v1 (the cdf arms are " *
+                "link-space)")
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
@@ -7609,8 +7679,9 @@ function _validate_evidence_structure(r::LikelihoodSpec, plan::StructuralPlan)
     ev.kind in (:none, :truncated, :censored, :interval_censored) ||
         _fail(r.label, "evidence kind $(ev.kind) unknown")
     ev.kind === :none && return nothing
-    (r.family === GaussianFam || r.family === PoissonLogFam) ||
-        _fail(r.label, "evidence wrappers apply to Gaussian/Poisson only (slice 1)")
+    (r.family === GaussianFam || r.family === PoissonLogFam ||
+        r.family === StudentTFam) ||
+        _fail(r.label, "evidence wrappers apply to Gaussian/Poisson/StudentT only (slice 1)")
     if ev.kind === :interval_censored
         ev.lower === nothing ||
             _fail(r.label, "interval evidence takes no lower (the response is the lower endpoint)")

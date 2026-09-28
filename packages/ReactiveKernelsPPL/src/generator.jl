@@ -91,7 +91,7 @@ using SpecialFunctions: besseli, besselix, erfc, loggamma
 # names in the assignment allowlist.
 using Statistics: mean, std, var
 using LinearAlgebra: dot
-using LogExpFunctions: log1pexp
+using LogExpFunctions: log1pexp, logaddexp
 # Bijector objects the generated program splices (constrained-parameter
 # transforms); imported from the enclosing module so the emitted
 # `positive_bijector()` / `unit_bijector()` calls resolve.
@@ -1115,7 +1115,7 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         # (the cover rule makes them whole-column today, but the fused sum
         # must never silently outgrow a future partial range).
         r.evidence.kind === :none && r.weights === nothing &&
-            r.range === nothing &&
+            r.range === nothing && !_is_bare_param_location(r, plan) &&
             return _bernoulli_wholevec_stmts(r, plan, node)
         return _bernoulli_plate_stmts(r, plan, node, pw)
     elseif r.family === PoissonLogFam
@@ -1123,7 +1123,7 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         # whole-vector reduction (faster native + Reactant; the per-cell
         # plate handles evidence/weights/ranges).
         r.evidence.kind === :none && r.weights === nothing &&
-            r.range === nothing &&
+            r.range === nothing && !_is_bare_param_location(r, plan) &&
             return _poisson_wholevec_stmts(r, plan, node)
         return _poisson_plate_stmts(r, plan, node, pw)
     elseif r.family === HurdlePoissonFam
@@ -1214,11 +1214,18 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     w = r.mixture_weights
     logw_lit = w isa Vector ? log.(w) : nothing
     lwv = nothing
+    logw_comp = nothing
     if w isa Symbol
         logp = _logp_name(r.label)
         push!(pre, :($logp::AbstractVector{Float64} = log.($w)))
         push!(inputs, :(Ref($logp)))
         lwv = _dovar(length(inputs))
+    elseif w isa MixtureComplementWeights
+        # Complement pair (K == 2 by contract): thread the constrained
+        # scalar once; `log1p(-p)` is the stable `log(1-p)` arm.
+        pv = _thread_ref!(inputs, w.param)
+        first, second = :(log($pv)), :(log1p(-$pv))
+        logw_comp = w.param_first ? (first, second) : (second, first)
     end
     terms = Expr[]
     for k in 1:K
@@ -1226,7 +1233,9 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         locref, is_lp = _mixture_loc_ref(r, plan, k)
         lpdf = _mixture_component_lpdf(f, r, plan, pre, inputs, k, klab,
             locref, is_lp, yv, yref, nref)
-        logw_k = logw_lit === nothing ? :($lwv[$k]) : logw_lit[k]
+        logw_k = logw_lit === nothing ?
+            (logw_comp === nothing ? :($lwv[$k]) : logw_comp[k]) :
+            logw_lit[k]
         push!(terms, :($logw_k + $lpdf))
     end
     m = terms[1]
@@ -1372,6 +1381,11 @@ function _location_node(r::LikelihoodSpec, plan::StructuralPlan)
     _is_plate_param(plan, r.predictor) && return r.predictor
     return _lp_name(_predictor(plan, r.predictor))
 end
+
+# A bare sampled-parameter location (constrained-scale, no link inversion):
+# `r.predictor` names a scalar parameter, not a PredictorSpec.
+_is_bare_param_location(r::LikelihoodSpec, plan::StructuralPlan) =
+    any(p -> p.name === r.predictor, plan.parameters)
 
 _dovar(i::Int) = Symbol(:_ppl_c, i)
 _pw_name(label::Symbol) = Symbol(:_ppl_pw_, label)
@@ -1522,11 +1536,11 @@ end
 
 # Student-t plate: the Gaussian shape with a df argument — validation
 # guarantees `nu` (a sampled name, a literal, or a predictor-fed
-# per-observation nu) and sigma, and fails evidence closed (the
-# Gaussian/Poisson-only gate), so the cell is the plain `student_t`
-# endpoint plus optional weights. A predictor-fed nu binds its own
-# `_ppl_sc_<label>_nu` node (the `_nu`-suffixed label cannot collide
-# with any `<lhs>_resp` scale node), so scale and nu predictors coexist.
+# per-observation nu) and sigma; evidence arms mirror the Gaussian
+# clamp law over the `student_t` cdf (`_student_cell`), plus optional
+# weights. A predictor-fed nu binds its own `_ppl_sc_<label>_nu` node
+# (the `_nu`-suffixed label cannot collide with any `<lhs>_resp` scale
+# node), so scale and nu predictors coexist.
 function _student_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _location_node(r, plan)
@@ -1537,7 +1551,9 @@ function _student_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     yv, lpv = _dovar(1), _dovar(2)
     sref = _thread_ref!(inputs, sarg)
     nuv = _thread_ref!(inputs, nuarg)
-    cell = :(student_t($nuv, $lpv, $sref).logpdf($yv))
+    lb, ub = _thread_bounds!(inputs, r.evidence, false)
+    base = :(student_t($nuv, $lpv, $sref).logpdf($yv))
+    cell = _student_cell(r.evidence.kind, base, yv, lb, ub, nuv, lpv, sref)
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
@@ -1596,14 +1612,54 @@ function _bernoulli_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
     return yb, yv
 end
 
+# Student-t evidence arms: the Gaussian clamp law over the `student_t`
+# cdf (continuous bounds, non-strict censored arms).
+function _student_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub,
+        nuv, lpv::Symbol, sref)
+    kind === :none && return base
+    stcdf(b) = :(student_t($nuv, $lpv, $sref).cdf($b))
+    if kind === :truncated
+        corr = if lb === nothing && ub === nothing
+            return base
+        elseif lb === nothing
+            :(log($(stcdf(ub))))
+        elseif ub === nothing
+            :(log(1.0 - $(stcdf(lb))))
+        else
+            :(log($(stcdf(ub)) - $(stcdf(lb))))
+        end
+        return :($base - $corr)
+    elseif kind === :censored
+        if lb === nothing && ub === nothing
+            return base
+        elseif lb === nothing
+            return :(ifelse($yv >= $ub, log1p(-$(stcdf(ub))), $base))
+        elseif ub === nothing
+            return :(ifelse($yv <= $lb, log($(stcdf(lb))), $base))
+        else
+            return :(ifelse($yv <= $lb, log($(stcdf(lb))),
+                ifelse($yv >= $ub, log1p(-$(stcdf(ub))), $base)))
+        end
+    else # :interval_censored
+        return :(log($(stcdf(ub)) - $(stcdf(yv))))
+    end
+end
+
 function _bernoulli_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
-    yv, etav = _dovar(1), _dovar(2)
+    yv = _dovar(1)
     pre = Expr[]
     yin, yref = _bernoulli_yplate!(pre, plan, y, r.label, yv)
-    inputs = Any[yin, lp]
-    cell = :(bernoulli(; logit = $etav).logpdf($yref))
+    inputs = Any[yin]
+    if _is_bare_param_location(r, plan)
+        pv = _thread_ref!(inputs, r.predictor)
+        cell = :(bernoulli($pv).logpdf($yref))
+    else
+        lp = _lp_name(_predictor(plan, r.predictor))
+        push!(inputs, lp)
+        etav = _dovar(2)
+        cell = :(bernoulli(; logit = $etav).logpdf($yref))
+    end
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
@@ -1650,12 +1706,20 @@ end
 
 function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
-    inputs = Any[y, lp]
-    yv, etav = _dovar(1), _dovar(2)
-    lb, ub = _thread_bounds!(inputs, r.evidence, true)
-    base = :(poisson(; log_rate = $etav).logpdf($yv))
-    cell = _poisson_cell(r.evidence.kind, base, yv, lb, ub, etav)
+    inputs = Any[y]
+    yv = _dovar(1)
+    if _is_bare_param_location(r, plan)
+        # Contract rejects evidence for bare locations, so no bounds thread.
+        ratev = _thread_ref!(inputs, r.predictor)
+        cell = :(poisson($ratev).logpdf($yv))
+    else
+        lp = _lp_name(_predictor(plan, r.predictor))
+        push!(inputs, lp)
+        etav = _dovar(2)
+        lb, ub = _thread_bounds!(inputs, r.evidence, true)
+        base = :(poisson(; log_rate = $etav).logpdf($yv))
+        cell = _poisson_cell(r.evidence.kind, base, yv, lb, ub, etav)
+    end
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
@@ -1666,7 +1730,7 @@ end
 # ZIP plate: the Poisson-plate shape with a zero-inflation argument —
 # validation guarantees `zi` (a sampled name, a literal, or a
 # predictor-fed zi submodel) and fails evidence closed (the
-# Gaussian/Poisson-only gate), so the cell is the plain
+# Gaussian/Poisson/StudentT-only gate), so the cell is the plain
 # `zero_inflated_poisson` endpoint plus optional weights. A zi
 # predictor binds its constrained vector once (`_ppl_sc_`, the
 # scale-predictor precedent — logit-only at the contract gate) and the
@@ -1750,7 +1814,7 @@ end
 # now hoists); p_zero threads scalar or via the `_ppl_sc_` node
 # (the scale-predictor precedent — a hurdle p_zero predictor is
 # logit-only at the contract gate). Evidence fails closed at the
-# contract gate (Gaussian/Poisson only); weights multiply the cell
+# contract gate (Gaussian/Poisson/StudentT only); weights multiply the cell
 # (the NB2 precedent). No whole-vector fusion yet: both parts carry
 # per-cell parameter-dependent work (the truncation correction varies
 # with λ even for scalar p_zero) — a perf-lane follow-up, not this
@@ -1786,7 +1850,7 @@ end
 # taken arm and no backend receives the branch. μ/λ positivity is
 # by-construction (`exp`, positive-constrained layout, contract-validated
 # literals/columns), so no live-value guard enters the cell. Evidence
-# fails closed at the contract gate (Gaussian/Poisson only); weights
+# fails closed at the contract gate (Gaussian/Poisson/StudentT only); weights
 # multiply the cell (the NB2 precedent). No whole-vector fusion yet
 # (the `3*log(y)` normalizer is data-only and would hoist) — a
 # perf-lane follow-up, not this slice.
@@ -1853,7 +1917,7 @@ end
 # prepare, while live conditions (sampled/predictor kappa, exact
 # moving support) keep their authored branch to the backend. Weights
 # multiply the cell (the NB2 precedent). Evidence fails closed at the
-# contract gate (Gaussian/Poisson only). No whole-vector fusion yet —
+# contract gate (Gaussian/Poisson/StudentT only). No whole-vector fusion yet —
 # a perf-lane follow-up, not this slice.
 function _vonmises_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
@@ -1887,13 +1951,21 @@ end
 
 function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
-    inputs = Any[y, lp]
-    yv, etav = _dovar(1), _dovar(2)
-    nref = _thread_ref!(inputs, r.trials, true)
-    # All-keyword: the object constructor cannot mix positional and named
-    # owner bindings (matches the `:observed/:n/:logit` HAVE ports).
-    cell = :(binomial(; n = $nref, logit = $etav).logpdf($yv))
+    inputs = Any[y]
+    yv = _dovar(1)
+    if _is_bare_param_location(r, plan)
+        nref = _thread_ref!(inputs, r.trials, true)
+        pv = _thread_ref!(inputs, r.predictor)
+        cell = :(binomial($nref, $pv).logpdf($yv))
+    else
+        lp = _lp_name(_predictor(plan, r.predictor))
+        push!(inputs, lp)
+        etav = _dovar(2)
+        nref = _thread_ref!(inputs, r.trials, true)
+        # All-keyword: the object constructor cannot mix positional and named
+        # owner bindings (matches the `:observed/:n/:logit` HAVE ports).
+        cell = :(binomial(; n = $nref, logit = $etav).logpdf($yv))
+    end
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
@@ -3068,8 +3140,9 @@ const _PRIOR_ENDPOINTS = Dict{Symbol,Symbol}(
 # semantics). Shared by scalar priors, per-cell plate priors, population
 # priors, and the scan density. `gamma` takes rate, so the contract's
 # scale inverts; `:flat` is the vacuous 0.0. Symmetric `:positive`
-# halves (`+log(2)`) and the `:interval`/`:upper` corrections live in
-# `_support_correction`.
+# halves (`+log(2)`) and the `:interval` correction live in
+# `_support_correction` (the Stan-kernel `:positive_stan` /
+# `:interval_stan` / `:upper` overrides add nothing there).
 function _family_logpdf_expr(family::Symbol, a, x)
     family === :flat && return :(0.0)
     ep = get(_PRIOR_ENDPOINTS, family, nothing)
@@ -3087,6 +3160,9 @@ end
 # -log(cdf(hi) - cdf(lo)) at any location, where `argvals` are the family's
 # (mu, s) argument expressions (literals/refs for a scalar prior, or per-cell
 # do-vars for a plate prior — the CDF endpoints thread identically);
+# `(:interval_stan, lo, hi)` adds NOTHING — Stan's two-sided-bound kernel
+# is the plain normal_lpdf plus the bare-`u` Jacobian (the dar-beta
+# precedent: SB truncation never renormalizes);
 # `(:upper, hi)` adds NOTHING — Stan's upper-bound kernel is the plain
 # normal_lpdf plus the bare-`u` Jacobian (the varying-`tau`/`:floored`
 # precedent: SB truncation never renormalizes).
@@ -3094,10 +3170,10 @@ function _support_correction(ov::SupportOverride, argvals)
     ov === nothing && return nothing
     ov === :positive_stan && return nothing  # Stan kernel semantics
     if ov isa Tuple
-        ov[1] === :upper && return nothing  # Stan kernel semantics
+        (ov[1] === :upper || ov[1] === :interval_stan) && return nothing  # Stan kernel semantics
         ov[1] === :interval || throw(ContractValidationError(
-            "[generator] tuple support override must be (:interval, lo, hi) " *
-            "or (:upper, hi), got $ov"))
+            "[generator] tuple support override must be (:interval, lo, hi), " *
+            "(:interval_stan, lo, hi), or (:upper, hi), got $ov"))
         lo, hi = ov[2], ov[3]
         mu, s = argvals[1], argvals[2]
         return :(-log(normal($mu, $s).cdf($hi) - normal($mu, $s).cdf($lo)))
@@ -3111,7 +3187,8 @@ end
 # Scalar prior log-density per family via distribution-kernel endpoints
 # (Distributions.jl semantics). The support override adds the +log(2) half or
 # the -log(cdf(hi)-cdf(lo)) truncated-interval renormalization (`_support_correction`;
-# `:positive_stan`/`(:upper, hi)` overrides add nothing — Stan kernel semantics).
+# `:positive_stan`/`(:interval_stan, lo, hi)`/`(:upper, hi)` overrides add
+# nothing — Stan kernel semantics).
 function _sampled_prior_expr(p::SampledParameter)
     argvals = [v for v in values(p.args)]
     base = _family_logpdf_expr(p.family, argvals, p.name)
