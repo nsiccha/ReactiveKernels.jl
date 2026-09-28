@@ -5,7 +5,8 @@
 # Reads the spec and writes canned-but-spec-derived sections.md +
 # numbers.toml + artifact.jls. Failure-path fixtures: `--fail` exits 1;
 # `--bad-numbers <kind>` writes a malformed numbers.toml with kind in
-# `missing-key`, `bad-grad`, `count`.
+# `missing-key`, `bad-grad`, `count`. `--no-token` is accepted and ignored
+# (mirrors the real worker flag the driver passes when wrapping).
 
 using TOML
 
@@ -22,6 +23,8 @@ function _stub_args(argv)
             out = argv[i]
         elseif a == "--fail"
             fail = true
+        elseif a == "--no-token"
+            nothing  # driver-wrapped invocation; the stub never gates
         elseif a == "--bad-numbers"
             i += 1; i > length(argv) && error("stub worker: --bad-numbers needs a kind")
             bad = argv[i]
