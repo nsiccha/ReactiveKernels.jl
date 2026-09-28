@@ -44,7 +44,8 @@ export VaryingZRecipe, VaryingMargin, VaryingSdPrior, VaryingDraws, VaryingSlice
 export VaryingMultiMembership, VaryingStrata
 export SplineBasisBlock, SplineBasis, SplineVector
 export HSGPBasis
-export KernelPlate, LinearPKScheduleSpec, LinearPKEventLPSpec
+export KernelPlate, LinearPKScheduleSpec, LinearPKEventLPSpec,
+    VaryingSourcePKScheduleSpec
 export EVENT_LP_NAME
 export LevelMap
 export DesignMatrix
@@ -121,12 +122,17 @@ export TGI_CELL_FUNCTIONS
 export rk_expm
 export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
     prepare_transit_twocmt_rule
+export varyingsource_effectiveness, varyingsource_effective_dose,
+    prepare_varyingsource_pk, varyingsource_pk_concentration, varyingsource_pk_locs
+export build_varyingsource_pk_schedule, varyingsource_pk_read_locs_over_subjects
 
 include("contract.jl")
 include("expm_rule.jl")
 include("pkcells.jl")
 include("transit_twocmt.jl")
 include("transit_twocmt_rule.jl")
+include("varyingsource_pk.jl")
+include("varyingsource_schedule.jl")
 include("pk_rectangular.jl")
 include("design.jl")
 include("bijectors.jl")

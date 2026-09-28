@@ -2377,7 +2377,7 @@ end
 
 _is_schedule_decl_rhs(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
-    rhs.args[1] === :linear_pk_schedule
+    rhs.args[1] in (:linear_pk_schedule, :varyingsource_pk_schedule)
 
 # `name = linear_pk_schedule(obs = (subj, time), dose = (subj, time,
 # amount), ecg = (subj, time), tgi = (subj, time))`: raw obs/dose DATA
@@ -2388,6 +2388,7 @@ _is_schedule_decl_rhs(rhs) =
 function _lower_schedule_decl(lhs::Symbol, rhs::Expr, line::Int,
         data::Set{Symbol})
     where = line > 0 ? "schedule `$lhs` (line $line)" : "schedule `$lhs`"
+    varying = rhs.args[1] === :varyingsource_pk_schedule
     kws = Any[]
     for arg in rhs.args[2:end]
         if arg isa Expr && arg.head === :parameters
@@ -2403,9 +2404,12 @@ function _lower_schedule_decl(lhs::Symbol, rhs::Expr, line::Int,
                    "amount)` keywords only, got $(repr(kw))")
         key, val = kw.args[1], kw.args[2]
         key === :obs || key === :dose || key === :ecg || key === :tgi ||
-            _sfail("$where takes `obs=`/`dose=`/`ecg=`/`tgi=` keywords " *
-                   "only, got `$key=`")
-        want = key === :dose ? 3 : 2
+            _sfail("$where takes " *
+                   (varying ? "`obs=`/`dose=`" : "`obs=`/`dose=`/`ecg=`/`tgi=`") *
+                   " keywords only, got `$key=`")
+        varying && !(key in (:obs, :dose)) &&
+            _sfail("$where varying-source PK slice takes `obs=`/`dose=` only")
+        want = key === :dose ? (varying ? 4 : 3) : 2
         cols = _schedule_column_tuple(val, where, key, want, data)
         if key === :obs
             obs_spec === nothing || _sfail("$where repeats `obs=`")
@@ -2422,7 +2426,10 @@ function _lower_schedule_decl(lhs::Symbol, rhs::Expr, line::Int,
         end
     end
     obs_spec === nothing && _sfail("$where needs `obs=(subj, time)`")
-    dose_spec === nothing && _sfail("$where needs `dose=(subj, time, amount)`")
+    dose_spec === nothing && _sfail("$where needs " *
+        (varying ? "`dose=(subj, time, amount, treatment)`" : "`dose=(subj, time, amount)`"))
+    varying && return VaryingSourcePKScheduleSpec(lhs, obs_spec[1], obs_spec[2],
+        dose_spec[1], dose_spec[2], dose_spec[3], dose_spec[4])
     ecg = ecg_spec === nothing ? nothing : (ecg_spec[1], ecg_spec[2])
     tgi = tgi_spec === nothing ? nothing : (tgi_spec[1], tgi_spec[2])
     return LinearPKScheduleSpec(lhs, obs_spec[1], obs_spec[2], dose_spec[1],
@@ -2525,7 +2532,7 @@ end
 # slices are `(column, column)` and LP cell params are the outer
 # definition names — so contract and generator are untouched.
 function _lower_plate_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
-        predictors, pred_idx, coefuse, schedules::Vector{LinearPKScheduleSpec},
+        predictors, pred_idx, coefuse, schedules::Vector{PKScheduleSpec},
         event_lps::Vector{LinearPKEventLPSpec})
     where = line > 0 ? "plate (line $line)" : "plate"
     result = st.args[3]
@@ -2833,7 +2840,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     hbases = HSGPBasis[]
     kplates = KernelPlate[]
     kstmts = NamedTuple[]
-    schedules = LinearPKScheduleSpec[]
+    schedules = PKScheduleSpec[]
     event_lps = LinearPKEventLPSpec[]
     r2d2decls = NamedTuple[]
     joints = JointSampleStmt[]

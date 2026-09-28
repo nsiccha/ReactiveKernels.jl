@@ -136,6 +136,7 @@ import .._ordinal_stage_obs, .._ordinal_stage_idx
 import ..linear_pk_read_locs, ..linear_pk_read_locs_auc
 import ..linear_pk_read_locs_over_subjects,
     ..linear_pk_read_locs_auc_over_subjects, ..SubjectScalar, ..SubjectSlice
+import ..varyingsource_pk_read_locs_over_subjects
 # Event-LP provider (one call over the flat event axis — the flat
 # `log_F` local the batched cell runner slices per subject).
 import ..linear_pk_event_log_f
@@ -941,11 +942,11 @@ end
 # names — the panel flatmap precedent); everything else emits verbatim
 # (bind proved shapes).
 function _grouped_cell_assignment(nm::Symbol, ex, kp::KernelPlate,
-        sched::LinearPKScheduleSpec, lps::Dict{Symbol,Symbol},
+        sched::PKScheduleSpec, lps::Dict{Symbol,Symbol},
         columns::Dict{Symbol,ColumnData}, flatmap::Dict{Symbol,Symbol})
     if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
             ex.args[1] isa Symbol && ex.args[1] in CELL_FNS
-        return _expand_grouped_cell_call(nm, ex, sched, lps)
+        return _expand_grouped_cell_call(nm, ex, sched, lps, flatmap)
     end
     if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
             ex.args[1] isa Symbol && ex.args[1] in SEGMENT_CELL_FNS
@@ -972,7 +973,7 @@ function _expand_segmented_nadir_call(nm::Symbol, ex::Expr,
     return Expr[:($nm = $(ex.args[1])($change, $endscol))]
 end
 
-function _rewrite_grouped_gather(ex, sched::LinearPKScheduleSpec,
+function _rewrite_grouped_gather(ex, sched::PKScheduleSpec,
         lps::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         flatmap::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
     ex isa Symbol && return get(flatmap, ex, ex)
@@ -1015,7 +1016,7 @@ end
 _over_subjects_name(fn::Symbol) = Symbol(fn, :_over_subjects)
 
 function _expand_grouped_cell_call(nm::Symbol, ex::Expr,
-        sched::LinearPKScheduleSpec, lps::Dict{Symbol,Symbol})
+        sched::LinearPKScheduleSpec, lps::Dict{Symbol,Symbol}, flatmap)
     fn = ex.args[1]
     callargs = ex.args[2:end]
     opfields = CELL_FN_OP_FIELDS[fn]
@@ -1034,6 +1035,25 @@ function _expand_grouped_cell_call(nm::Symbol, ex::Expr,
         end
     end
     return Expr[:($nm = $(Expr(:call, _over_subjects_name(fn), args...)))]
+end
+
+# Independent ragged axes stay bound vectors; the native runner traverses
+# subjects and dose/lag/reference ranges at runtime. Dose modifiers are in
+# caller dose-row order and the schedule's dose_index preserves that order.
+function _expand_grouped_cell_call(nm::Symbol, ex::Expr,
+        sched::VaryingSourcePKScheduleSpec, lps::Dict{Symbol,Symbol}, flatmap)
+    fields = (:reference_ends, :dose_ends, :lag_ends, :concentration_ends,
+        :dose_amount, :dose_index, :treatment_map, :unique_dts,
+        :concentration_idxs, :dosing_time_idxs)
+    args = Any[_sched_col_name(sched.name, f) for f in fields]
+    for a in ex.args[3:end]
+        if a isa Symbol && haskey(lps, a)
+            push!(args, :(SubjectScalar($(lps[a]))))
+        else
+            push!(args, _rewrite_grouped_gather(a, sched, lps, flatmap))
+        end
+    end
+    return Expr[:($nm = varyingsource_pk_read_locs_over_subjects($(args...)))]
 end
 
 # Grouped-kernel likelihood: the panel flat map cannot express sequential
@@ -1067,9 +1087,9 @@ function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
     sched = only(kp.schedules)
     # The batched cell runner reads the subject ranges from this bound
     # column at runtime; it must be a kernel port (bind materializes it).
-    haskey(plan.columns, _sched_col_name(sched.name, :op_ends)) ||
+    haskey(plan.columns, _sched_col_name(sched.name, _sched_ends_field(sched))) ||
         throw(ContractValidationError("[generator] schedule " *
-              "`$(sched.name)` has no bound op_ends column"))
+              "`$(sched.name)` has no bound subject-ends column"))
     lps = Dict{Symbol,Symbol}(c => _lp_name(_predictor(plan, p))
         for (p, c) in kp.lp_args)
     flatmap = _grouped_flatmap(kp)

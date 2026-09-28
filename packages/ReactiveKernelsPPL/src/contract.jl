@@ -964,6 +964,8 @@ HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
     fits::Vector{Tuple{Float64,Float64}}, label::Symbol) =
     HSGPBasis(id, axes, K, c, iso, fits, label, :exp_quad, NaN)
 
+abstract type PKScheduleSpec end
+
 """
     LinearPKScheduleSpec(name, obs_subj, obs_time, dose_subj, dose_time, dose_amt,
                          ecg = nothing, tgi = nothing)
@@ -984,7 +986,7 @@ only. Axis products materialize only for declared axes (and the
 `[conc; auc]`-space maps only with an AUC cell call), so v1 bind
 products stay byte-identical without them.
 """
-struct LinearPKScheduleSpec
+struct LinearPKScheduleSpec <: PKScheduleSpec
     name::Symbol
     obs_subj::Symbol
     obs_time::Symbol
@@ -999,6 +1001,38 @@ LinearPKScheduleSpec(name::Symbol, obs_subj::Symbol, obs_time::Symbol,
     dose_subj::Symbol, dose_time::Symbol, dose_amt::Symbol) =
     LinearPKScheduleSpec(name, obs_subj, obs_time, dose_subj, dose_time,
         dose_amt, nothing, nothing)
+
+"""
+    VaryingSourcePKScheduleSpec(name, obs_subj, obs_time, dose_subj, dose_time,
+                              dose_amt, treatment)
+
+Raw-column declaration for a Gamma-transit/twocmt PK slice. `treatment` is
+the dose-row treatment/diet key; first appearance within each subject assigns
+the unit-response index. Dose rows must already be time ordered per subject.
+Binding builds independent ragged reference, dose, lag, and lag-index ranges.
+The surface spells `varyingsource_pk_schedule(obs=(subject,time),
+dose=(subject,time,amount,treatment))`. PD read grids are outside this slice.
+"""
+struct VaryingSourcePKScheduleSpec <: PKScheduleSpec
+    name::Symbol
+    obs_subj::Symbol
+    obs_time::Symbol
+    dose_subj::Symbol
+    dose_time::Symbol
+    dose_amt::Symbol
+    treatment::Symbol
+end
+
+function _sched_raw_columns(s::LinearPKScheduleSpec)
+    raw = [s.obs_subj, s.obs_time, s.dose_subj, s.dose_time, s.dose_amt]
+    s.ecg !== nothing && append!(raw, s.ecg)
+    s.tgi !== nothing && append!(raw, s.tgi)
+    return raw
+end
+_sched_raw_columns(s::VaryingSourcePKScheduleSpec) =
+    [s.obs_subj, s.obs_time, s.dose_subj, s.dose_time, s.dose_amt, s.treatment]
+_sched_ends_field(::LinearPKScheduleSpec) = :op_ends
+_sched_ends_field(::VaryingSourcePKScheduleSpec) = :reference_ends
 
 """V2 event-LP slope prior scale (SB `effect(log_F, op_log_dose) ~
 Normal(0.0, 0.6676)` verbatim — the specific overrides the wildcard
@@ -1109,7 +1143,7 @@ struct KernelPlate
     collected::Symbol
     label::Symbol
     lp_args::Vector{Tuple{Symbol,Symbol}}
-    schedules::Vector{LinearPKScheduleSpec}
+    schedules::Vector{PKScheduleSpec}
 end
 
 """Panel-v1 positional construction (grouped fields default empty)."""
@@ -1165,14 +1199,8 @@ function _kernel_managed_columns(kp::KernelPlate)
             push!(out, _kexp_name(kp.result, col))
     end
     for s in kp.schedules
-        push!(out, s.obs_subj)
-        push!(out, s.obs_time)
-        push!(out, s.dose_subj)
-        push!(out, s.dose_time)
-        push!(out, s.dose_amt)
-        s.ecg !== nothing && (push!(out, s.ecg[1]); push!(out, s.ecg[2]))
-        s.tgi !== nothing && (push!(out, s.tgi[1]); push!(out, s.tgi[2]))
-        for f in _SCHED_MATERIALIZED_FIELDS
+        union!(out, _sched_raw_columns(s))
+        for f in _sched_materialized_fields(s)
             push!(out, _sched_col_name(s.name, f))
         end
         for f in _sched_extra_fields(s, kp.assignments)
@@ -1180,7 +1208,8 @@ function _kernel_managed_columns(kp::KernelPlate)
         end
         # The event-axis product (present only with a declared
         # event-LP): op-length by design, like the op columns.
-        push!(out, _sched_col_name(s.name, :op_log_dose))
+        s isa LinearPKScheduleSpec &&
+            push!(out, _sched_col_name(s.name, :op_log_dose))
     end
     for obs in kp.obs
         # Bernoulli Bool twins (present only for non-Bool flats —
@@ -1815,11 +1844,12 @@ cell assignments ONLY, always with a declared schedule as the first
 argument. The generator emits ONE subject-batched call per assignment
 (`<fn>_over_subjects` over the bound op columns + `op_ends`, pkcells.jl);
 the function itself is the per-subject cell + host-side oracle path."""
-const CELL_FNS = (:linear_pk_read_locs, :linear_pk_read_locs_auc)
+const CELL_FNS = (:linear_pk_read_locs, :linear_pk_read_locs_auc,
+    :varyingsource_pk_read_locs)
 
 """Arity (argument count) of each [`CELL_FNS`](@ref) entry, schedule first."""
 const CELL_FN_ARITY = Dict{Symbol,Int}(:linear_pk_read_locs => 6,
-    :linear_pk_read_locs_auc => 7)
+    :linear_pk_read_locs_auc => 7, :varyingsource_pk_read_locs => 13)
 
 """Op-column fields each [`CELL_FNS`](@ref) entry reads per subject
 (positional, after the schedule — the generator passes the bound
@@ -1866,6 +1896,17 @@ op columns plus `op_ends`, per-obs-row `obs_read`, and the flat
 const _SCHED_MATERIALIZED_FIELDS =
     (:op_type, :op_dt, :op_amount, :op_interval, :op_count, :op_read_idx,
         :op_ends, :obs_read, :obs_map)
+
+_sched_materialized_fields(::LinearPKScheduleSpec) = _SCHED_MATERIALIZED_FIELDS
+_sched_materialized_fields(::VaryingSourcePKScheduleSpec) =
+    (:reference_ends, :dose_ends, :lag_ends, :concentration_ends,
+        :dose_amount, :dose_index, :treatment_map, :unique_dts,
+        :concentration_idxs, :dosing_time_idxs, :obs_map)
+
+_sched_extra_fields(::VaryingSourcePKScheduleSpec, assignments) = Symbol[]
+_sched_available_maps(::VaryingSourcePKScheduleSpec, assignments) = Set([:obs_map])
+_sched_map_prereq(::VaryingSourcePKScheduleSpec, m, assignments) =
+    "varyingsource PK schedules provide only `obs_map` (PK slice)"
 
 """Per-axis row products, materialized only for declared extra axes."""
 const _SCHED_ECG_FIELDS = (:ecg_read, :ecg_map)
@@ -3158,6 +3199,9 @@ function _validate_event_lps(plan::StructuralPlan)
             _fail(el.label, "event-LP `$(el.name)` schedule " *
                   "`$(el.schedule)` is not declared " *
                   "(`$(el.schedule) = linear_pk_schedule(...)`)")
+        all(s -> s.name !== el.schedule || s isa LinearPKScheduleSpec,
+            (s for kp in plan.kernel_plates for s in kp.schedules)) ||
+            _fail(el.label, "linear_pk_log_f needs a linear-PK schedule")
         el.k isa Int && el.k >= 2 ||
             _fail(el.label, "event-LP `$(el.name)` k must be an integer " *
                   "≥ 2 (the truncation floor needs k²−1 > 0; " *
@@ -3582,10 +3626,7 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
         _fail(kp.label, "grouped kernels take no timepoints (ragged axes " *
               "have no rectangular T)")
     sched = only(kp.schedules)
-    raw = [sched.obs_subj, sched.obs_time, sched.dose_subj, sched.dose_time,
-        sched.dose_amt]
-    sched.ecg !== nothing && append!(raw, [sched.ecg[1], sched.ecg[2]])
-    sched.tgi !== nothing && append!(raw, [sched.tgi[1], sched.tgi[2]])
+    raw = _sched_raw_columns(sched)
     length(unique(raw)) == length(raw) ||
         _fail(kp.label, "schedule `$(sched.name)` reuses a raw column " *
               "($(raw)) — obs/dose/extra axes need distinct columns)")
@@ -3642,6 +3683,25 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
     cell_locals = Set{Symbol}()
     for (nm, ex) in kp.assignments
         _collect_grouped_cell_refs!(Symbol[], ex, kp, known, schednames)
+        if ex isa Expr && ex.head === :call &&
+                ex.args[1] === :varyingsource_pk_read_locs
+            weights = ex.args[6]
+            weights isa Symbol || _fail(kp.label,
+                "varyingsource GP weights need a shared coefficient vector name")
+            wi = findfirst(v -> v.name === weights, plan.vector_parameters)
+            if weights in params
+                # Bind checks the coefficient vector's square dimension.
+            elseif wi !== nothing
+                v = plan.vector_parameters[wi]
+                k = v.size === nothing ? 0 : isqrt(v.size)
+                v.family === :vector_normal && k > 0 && k * k == v.size ||
+                    _fail(kp.label, "varyingsource GP weights need a " *
+                        "concrete square vector_normal parameter")
+            else
+                _fail(kp.label, "varyingsource GP weights must name a " *
+                    "bound coefficient vector or vector_normal parameter")
+            end
+        end
         push!(known, nm)
         push!(cell_locals, nm)
     end
@@ -3980,15 +4040,30 @@ function _collect_grouped_cell_refs!(refs, ex, kp::KernelPlate,
                       (fn === :linear_pk_read_locs ?
                        " or $(want + 1) with the event-LP " *
                        "`$(EVENT_LP_NAME)` second" :
-                       " with the event-LP `$(EVENT_LP_NAME)` second") *
+                       fn === :linear_pk_read_locs_auc ?
+                       " with the event-LP `$(EVENT_LP_NAME)` second" : "") *
                       ", got $(length(args))")
             s = args[1]
             s isa Symbol && s in schednames ||
                 _fail(label, "cell call `$fn` takes a declared schedule " *
                       "first (got $(repr(s)) — admitted schedules: " *
                       "$(sort!(collect(schednames))))")
+            spec = only(q for q in kp.schedules if q.name === s)
+            (fn === :varyingsource_pk_read_locs) ==
+                (spec isa VaryingSourcePKScheduleSpec) ||
+                _fail(label, "cell call `$fn` has an incompatible schedule `$s`")
             rest = args[2:end]
-            if seven || fn === :linear_pk_read_locs_auc
+            if fn === :varyingsource_pk_read_locs
+                # Shared GP vectors have a dedicated port, not the scalar
+                # name environment. The plan-level cell validator proves
+                # the bound-vector / vector_normal declaration and size.
+                weights = args[5]
+                weights isa Symbol || _fail(label,
+                    "varyingsource GP weights need a shared coefficient vector name")
+                push!(refs, weights)
+                rest = vcat(args[2:4], args[6:end])
+            end
+            if (fn === :linear_pk_read_locs && seven) || fn === :linear_pk_read_locs_auc
                 # The event-LP second arg is the provider's flat
                 # vector: the fixed seam name only — structure
                 # verifies the NAME and skips collection (the
@@ -4196,10 +4271,15 @@ end
 function _build_grouped_schedule(plan::StructuralPlan, kp::KernelPlate,
         columns::Dict{Symbol,ColumnData})
     sched = only(kp.schedules)
-    for c in (sched.obs_subj, sched.obs_time, sched.dose_subj,
-            sched.dose_time, sched.dose_amt)
+    for c in _sched_raw_columns(sched)
         haskey(columns, c) ||
             _fail(kp.label, "schedule `$(sched.name)` column `$c` is not bound")
+    end
+    if sched isa VaryingSourcePKScheduleSpec
+        return build_varyingsource_pk_schedule(columns[sched.obs_subj],
+            columns[sched.obs_time], columns[sched.dose_subj],
+            columns[sched.dose_time], columns[sched.dose_amt],
+            columns[sched.treatment])
     end
     combine = _schedule_combine_simultaneous(plan, sched.name)
     ecg = _grouped_schedule_axis(sched, columns, :ecg, kp)
@@ -4236,7 +4316,7 @@ function _validate_grouped_kernel_data(plan::StructuralPlan, kp::KernelPlate)
     built.n_subjects == n_sub ||
         _fail(kp.label, "schedule `$(sched.name)` covers " *
               "$(built.n_subjects) subjects ≠ subjects $n_sub")
-    for f in vcat(collect(_SCHED_MATERIALIZED_FIELDS),
+    for f in vcat(collect(_sched_materialized_fields(sched)),
             _sched_extra_fields(sched, kp.assignments))
         col = _sched_col_name(sched.name, f)
         haskey(plan.columns, col) ||
@@ -5354,8 +5434,8 @@ function _validate_vector_parameters(plan::StructuralPlan)
     # (as `thresholds` for ordered families, as `threshold_coefs` for
     # per-threshold Ordinal, as the simplex `predictor`, or as a joint
     # factor piece), by exactly one monotonic term (as its `increments`
-    # simplex), or by exactly one R2D2 prior (as its share `phi`) —
-    # never shared.
+    # simplex), by exactly one R2D2 prior (as its share `phi`), or by
+    # one grouped varying-source PK plate (its shared GP coefficients).
     refs = Dict{Symbol,Vector{Symbol}}(
         p.name => Symbol[] for p in plan.vector_parameters)
     for r in plan.responses
@@ -5409,15 +5489,27 @@ function _validate_vector_parameters(plan::StructuralPlan)
             ":simplex_dirichlet vector parameter, got $(p.family)")
         push!(refs[rp.phi], rp.predictor)
     end
+    for kp in plan.kernel_plates
+        used = Set{Symbol}()
+        for (_, ex) in kp.assignments
+            ex isa Expr && ex.head === :call && length(ex.args) == 14 &&
+                ex.args[1] === :varyingsource_pk_read_locs || continue
+            weights = ex.args[6]
+            weights isa Symbol && haskey(refs, weights) && push!(used, weights)
+        end
+        for weights in used
+            push!(refs[weights], kp.label)
+        end
+    end
     for p in plan.vector_parameters
         got = refs[p.name]
         isempty(got) && _fail(p.label,
             "vector parameter $(p.name) unused by any response, " *
-            "monotonic term, joint-factor link, or R2D2 prior")
+            "monotonic term, joint-factor link, R2D2 prior, or varying-source PK plate")
         length(got) == 1 || _fail(p.label,
             "vector parameter $(p.name) shared by " *
             "$(join(got, ", ")) — one vector parameter per response, " *
-            "monotonic term, joint-factor link, or R2D2 prior")
+            "monotonic term, joint-factor link, R2D2 prior, or varying-source PK plate")
     end
     return nothing
 end
@@ -8333,7 +8425,8 @@ end
 # per-subject `[conc; auc]` blocks (length 2R) — still read-space
 # (gathers move it to an axis first).
 const CELL_FN_RESULT_SPACE = Dict{Symbol,Symbol}(
-    :linear_pk_read_locs => :reads, :linear_pk_read_locs_auc => :reads)
+    :linear_pk_read_locs => :reads, :linear_pk_read_locs_auc => :reads,
+    :varyingsource_pk_read_locs => :reads)
 
 # Bind-time grouped cell shapes: :scalar (LP cell params, model
 # scalars, literals, scalar arithmetic), (:obs, len) (response slices
@@ -8399,6 +8492,31 @@ function _grouped_cell_shape(ex, kp::KernelPlate, shapes::Dict{Symbol,Any},
         fn = ex.args[1]
         if fn isa Symbol && fn in CELL_FNS
             trailing = ex.args[3:end]
+            if fn === :varyingsource_pk_read_locs
+                sched = only(kp.schedules)
+                ndose = length(columns[sched.dose_subj])
+                # Three dose modifiers may be flat dose-row vectors or
+                # scalars. GP weights are one shared square coefficient
+                # vector; the runner checks its concrete dimension.
+                for arg in trailing[1:3]
+                    space = _grouped_cell_shape(arg, kp, shapes, columns)
+                    (space === :scalar || space == (:obs, ndose)) ||
+                        _fail(label, "varyingsource dose argument `$arg` needs " *
+                            "a scalar or the $ndose-row dose axis, got $space")
+                end
+                weights = trailing[4]
+                weights isa Symbol && !(weights in _lp_cell_params(kp)) ||
+                    _fail(label, "varyingsource GP weights need a shared " *
+                        "coefficient vector name")
+                space = _grouped_cell_shape(weights, kp, shapes, columns)
+                if _is_obs_shape(space)
+                    k = isqrt(space[2])
+                    k > 0 && k * k == space[2] ||
+                        _fail(label, "varyingsource GP weights need a " *
+                            "nonempty square coefficient vector")
+                end
+                trailing = trailing[5:end]
+            end
             if (fn === :linear_pk_read_locs &&
                     length(ex.args) == CELL_FN_ARITY[fn] + 2) ||
                     fn === :linear_pk_read_locs_auc
@@ -8669,6 +8787,9 @@ function _validate_tgi_axis_order(kp::KernelPlate,
     return nothing
 end
 
+_validate_tgi_axis_order(kp::KernelPlate, sched::VaryingSourcePKScheduleSpec,
+    columns::Dict{Symbol,ColumnData}) = nothing
+
 # Grouped-kernel bind resolution: dims keys resolve `subjects` (no
 # timepoints — leftover keys fail closed); the schedule builds from raw
 # columns and must cover exactly n_sub subjects; op columns + maps
@@ -8703,7 +8824,7 @@ function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
     # stay admitted — this gates only the global emptiness.
     ndose = length(columns[sched.dose_subj])
     if _cell_has_pk_call(kp.assignments)
-        ndose > 0 ||
+        (ndose > 0 || sched isa VaryingSourcePKScheduleSpec) ||
             _fail(kp.label, "cell calls a PK recurrence but schedule " *
                   "`$(sched.name)` binds no dose rows (bind dose data " *
                   "or drop the call)")
@@ -8715,7 +8836,7 @@ function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
     built.n_subjects == n_sub ||
         _fail(kp.label, "schedule `$(sched.name)` covers " *
               "$(built.n_subjects) subjects ≠ subjects $n_sub")
-    for f in vcat(collect(_SCHED_MATERIALIZED_FIELDS),
+    for f in vcat(collect(_sched_materialized_fields(sched)),
             _sched_extra_fields(sched, kp.assignments))
         col = _sched_col_name(sched.name, f)
         haskey(columns, col) &&
@@ -9276,6 +9397,11 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "R2D2 phi size $(p.size) disagrees with its " *
                 "concentration length $want")
             push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
+        elseif p.family === :vector_normal && p.size !== nothing
+            # A grouped varying-source GP coefficient vector has a concrete
+            # structural size; its cell linkage and square size were proved
+            # by validate_structure before bind.
+            push!(out_v, p)
         else
             _fail(p.label, "internal: vector parameter unlinked at bind")
         end
@@ -9315,4 +9441,3 @@ function _with_levels(r::LikelihoodSpec, K::Int)
         threshold_columns = r.threshold_columns,
         threshold_coefs = r.threshold_coefs)
 end
-
