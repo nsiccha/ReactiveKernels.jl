@@ -161,11 +161,6 @@ Each adapter is generic over the rule and is loaded with its AD package:
   `ChainRulesCore`). `rrule` returns the primal and a concretely typed
   pullback that holds the all-active pattern's staged residuals; `frule` runs the
   forward cut, with a zero direction for a `ZeroTangent`.
-- **Mooncake** (`ext/ReactiveKernelsMooncakeExt.jl`, loaded with
-  `Mooncake`). Every rule is a primitive (`@is_primitive`) with no tangent of
-  its own. `rrule!!` returns the primal and a pullback that holds the
-  all-active pattern's staged residuals; array cotangents accumulate into the arguments'
-  forward data and real scalars return theirs. `frule!!` runs the forward cut.
 
 Not generated: rule emission into EnzymeMLIR. Under Reactant a rule's callable
 and cuts trace into the compiled program as plain graph mathematics, but no

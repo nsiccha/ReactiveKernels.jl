@@ -1,0 +1,166 @@
+# One mathematical graph for the unit response and its parameter/lag partials.
+# The series accumulate analytic partials alongside their values; reverse mode
+# contracts these retained partials and never differentiates a series loop.
+# The ordinary path uses exactly the same recurrence with partials pruned.
+
+import SpecialFunctions: digamma
+
+_transit_initial(s, ::Val) = (inv(s), -inv(s)^2)
+_transit_initial(s, ::Val{:watson}) = (1.0, 0.0)
+_transit_factor(s, x, n, ::Val{:u}) =
+    (x * (s + n - 1) / (n * (s + n)),
+     x / (n * (s + n)^2), (s + n - 1) / (n * (s + n)))
+_transit_factor(s, x, n, ::Val{:p}) =
+    (x / (s + n), -x / (s + n)^2, inv(s + n))
+_transit_factor(s, x, n, ::Val{:watson}) =
+    ((n - s) / x, -inv(x), -(n - s) / x^2)
+_transit_converged(term, acc, rtol, ::Val) = abs(term) <= rtol * abs(acc)
+_transit_converged(term, acc, rtol, ::Val{:watson}) = false
+
+function _transit_series(s, x, rtol, trips, kind, ::Val{partials}) where {partials}
+    term, term_s = _transit_initial(s, kind)
+    term_x = 0.0
+    acc, acc_s, acc_x = term, term_s, term_x
+    for n in 1:trips
+        factor, factor_s, factor_x = _transit_factor(s, x, n, kind)
+        if partials
+            term_s = term_s * factor + term * factor_s
+            term_x = term_x * factor + term * factor_x
+            acc_s += term_s
+            acc_x += term_x
+        end
+        term *= factor
+        acc += term
+        _transit_converged(term, acc, rtol, kind) && break
+    end
+    return acc, acc_s, acc_x
+end
+
+# Return (I, ∂λ I, ∂rate I, ∂shape I, ∂t I). Each branch differentiates
+# its own numerical expression, including the truncated Watson expansion.
+function _transit_mode_math(λ, t, rate, shape, s_log_r, lgs, ψs,
+        rtol, watson_terms, ::Val{partials}) where {partials}
+    if t == 0.0
+        # The parameter partials of the zero-length integral are exactly zero.
+        dt = shape == 1.0 ? rate : 0.0
+        return 0.0, 0.0, 0.0, 0.0, dt
+    end
+    μ = rate - λ
+    w = -μ * t
+    logt = log(t)
+    if w > _TRANSIT_SERIES_WMAX
+        a, a_s, a_w = _transit_series(shape, w, rtol, watson_terms - 1,
+            Val(:watson), Val(partials))
+        y = exp(s_log_r - lgs - rate * t + (shape - 1) * logt - log(-μ) + log(a))
+        if partials
+            dλ = inv(μ) + t * a_w / a
+            dr = shape / rate - t - dλ
+            ds = log(rate) - ψs + logt + a_s / a
+            dt = -rate + (shape - 1) / t - μ * a_w / a
+            return y, y * dλ, y * dr, y * ds, y * dt
+        end
+    elseif w < -_TRANSIT_P_XMAX
+        y = exp(s_log_r - shape * log(μ) - λ * t)
+        if partials
+            return y, y * (shape / μ - t), y * (shape / rate - shape / μ),
+                y * (log(rate) - log(μ)), -λ * y
+        end
+    elseif w < -1.0
+        a, a_s, a_x = _transit_series(shape, -w, rtol, _TRANSIT_SERIES_TRIPS,
+            Val(:p), Val(partials))
+        y = exp(s_log_r - lgs - rate * t + shape * logt + log(a))
+        if partials
+            dλ = -t * a_x / a
+            dr = shape / rate - t - dλ
+            ds = log(rate) - ψs + logt + a_s / a
+            dt = -rate + shape / t + μ * a_x / a
+            return y, y * dλ, y * dr, y * ds, y * dt
+        end
+    else
+        a, a_s, a_w = _transit_series(shape, w, rtol, _TRANSIT_SERIES_TRIPS,
+            Val(:u), Val(partials))
+        y = exp(s_log_r - lgs - λ * t + shape * logt + log(a))
+        if partials
+            dλ = -t + t * a_w / a
+            dr = shape / rate - t * a_w / a
+            ds = log(rate) - ψs + logt + a_s / a
+            dt = -λ + shape / t - μ * a_w / a
+            return y, y * dλ, y * dr, y * ds, y * dt
+        end
+    end
+    return y, 0.0, 0.0, 0.0, 0.0
+end
+
+function _transit_response_partials(ts, p, rtol, watson_terms)
+    length(p) == 5 || throw(DimensionMismatch("transit parameters need five entries"))
+    _transit_check_accuracy(rtol, watson_terms)
+    k10, k12, k21, rate, shape = p
+    α, β, C1, C2 = _twocmt_disposition(k10, k12, k21)
+    D0 = k10 + k12 - k21
+    disc = sqrt(D0 * D0 + 4k12 * k21)
+    dd = (D0 / disc, (D0 + 2k21) / disc, (-D0 + 2k12) / disc)
+    dβ = (0.5 * (1 + dd[1]), 0.5 * (1 + dd[2]), 0.5 * (1 + dd[3]))
+    dα = (k21 / β - α / β * dβ[1], -α / β * dβ[2],
+        k10 / β - α / β * dβ[3])
+    dC1 = ((-dα[1] - C1 * dd[1]) / disc,
+        (-dα[2] - C1 * dd[2]) / disc,
+        (1 - dα[3] - C1 * dd[3]) / disc)
+    s_log_r = shape * log(rate)
+    lgs = DistributionKernelSources.loggamma(shape)
+    ψs = digamma(shape)
+    n = length(ts)
+    amounts = Vector{Float64}(undef, n)
+    jac = Matrix{Float64}(undef, n, 5)
+    dt = Vector{Float64}(undef, n)
+    for i in eachindex(ts)
+        a = _transit_mode_math(α, ts[i], rate, shape, s_log_r, lgs, ψs,
+            rtol, watson_terms, Val(true))
+        b = _transit_mode_math(β, ts[i], rate, shape, s_log_r, lgs, ψs,
+            rtol, watson_terms, Val(true))
+        amounts[i] = C1 * a[1] + C2 * b[1]
+        for j in 1:3
+            jac[i, j] = dC1[j] * (a[1] - b[1]) +
+                C1 * a[2] * dα[j] + C2 * b[2] * dβ[j]
+        end
+        jac[i, 4] = C1 * a[3] + C2 * b[3]
+        jac[i, 5] = C1 * a[4] + C2 * b[4]
+        dt[i] = C1 * a[5] + C2 * b[5]
+    end
+    return amounts, jac, dt
+end
+
+"""
+    prepare_transit_twocmt_rule(; series_rtol=1e-15, watson_terms=8)
+
+Prepare a generated reverse rule for the unit response. The returned callable
+accepts `(ts, p)`, where `p` is `[k10, k12, k21, rate, shape]`.
+One mathematical graph retains analytic parameter/lag partials; reverse
+execution contracts those residuals. Numerical controls are bound before
+rule generation and carry no derivative. The series retain runtime loops
+and lazy regime selection. Accuracy is validated for `shape ∈ [1, 8]`.
+"""
+function prepare_transit_twocmt_rule(; series_rtol::Float64 = 1e-15,
+        watson_terms::Int = _TRANSIT_WATSON_TERMS)
+    _transit_check_accuracy(series_rtol, watson_terms)
+    @kernel transit_twocmt_graph(ts::Vector{Float64}, p::Vector{Float64},
+            amounts_bar::Vector{Float64}) = begin
+        solution = _transit_response_partials(ts, p, series_rtol, watson_terms)
+        amounts::Vector{Float64} = solution[1]
+        jac::Matrix{Float64} = solution[2]
+        dt::Vector{Float64} = solution[3]
+        ts_bar::Vector{Float64} = dt .* amounts_bar
+        p_bar::Vector{Float64} = transpose(jac) * amounts_bar
+        return amounts, ts_bar, p_bar
+    end
+    return derivative_rule(transit_twocmt_graph; primal = :amounts,
+        covector = :amounts_bar, cotangents = (ts = :ts_bar, p = :p_bar),
+        name = :transit_twocmt_rule)
+end
+
+"""
+    transit_twocmt_rule(ts, p)
+
+Unit response with the generated reverse rule at default numerical controls.
+Use [`prepare_transit_twocmt_rule`](@ref) for a different accuracy setting.
+"""
+const transit_twocmt_rule = prepare_transit_twocmt_rule()

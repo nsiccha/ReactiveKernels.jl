@@ -50,7 +50,7 @@ page [derivative rules](manual-derivative-rules.md) with
 derivatives are authored once as an ordinary pure-math `@kernel` graph — the
 stable primal plus named partials, or forward and reverse branches as outputs
 of one multi-output graph — and that every AD-protocol adapter (ChainRules,
-Mooncake, Enzyme, Reactant once its upstream bridge exists) is *generated*
+Enzyme, Reactant once its upstream bridge exists) is *generated*
 from activity-selected cuts of that graph and attached to a callable this
 repository owns. Separately authored JVP/VJP declarations, hand-written
 `EnzymeRules`/ChainRules methods, function or runtime-activity annotations,
@@ -63,9 +63,9 @@ every Enzyme user in the session.
 The generator is shipped (`src/derivative_rules.jl`): `scalar_derivative_rule`
 turns a scalar graph that authors the primal plus one named partial per input,
 and `derivative_rule` a graph that authors a forward branch, a reverse branch,
-or both over array or scalar ports, into an RK-owned callable. The Enzyme,
-ChainRules and Mooncake adapters (`ext/ReactiveKernelsEnzymeExt.jl`,
-`ext/ReactiveKernelsChainRulesCoreExt.jl`, `ext/ReactiveKernelsMooncakeExt.jl`)
+or both over array or scalar ports, into an RK-owned callable. The Enzyme and
+ChainRules adapters (`ext/ReactiveKernelsEnzymeExt.jl`,
+`ext/ReactiveKernelsChainRulesCoreExt.jl`)
 derive every direction from the activity-selected cuts of that graph. The rules in package source are
 DistributionKernels' `loggamma` and `logbeta` plus ReactiveKernelsPPL's `rk_expm`; the ODE backsolve
 adjoint consumes a caller's `DerivativeRule` right-hand side. Reverse-mode adapters
