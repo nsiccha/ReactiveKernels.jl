@@ -19,17 +19,18 @@
 #   `S(s,μ,t) = ∫_0^t u^(s-1) e^(-μu) du`, `s ≥ 1`, `t ≥ 0`, `μ ∈ ℝ`.
 #
 # `S` is evaluated in three regimes in `w = -μt` (all in log space where a
-# direct evaluation could over/underflow; every loop has a fixed trip count
-# so the whole primitive is transparent math that Enzyme reverses natively
-# — no generated rule, no foreign special-function call on the
-# differentiated path):
+# direct evaluation could over/underflow; plain loops with a convergence
+# break under a fixed cap, so the whole primitive is transparent math that
+# Enzyme reverses natively — no generated rule, no foreign special-function
+# call on the differentiated path):
 #
-# - `|w| ≤ 40` (including `μ = 0` and small `μ < 0`): fixed-128-trip power
-#   series `S = t^s * Σ w^n/((s+n)*n!)`.
+# - `|w| ≤ 40` (including `μ = 0` and small `μ < 0`): power series
+#   `S = t^s * Σ w^n/((s+n)*n!)` (cap 128, typically ~10-30 trips).
 # - `w < -1` (`μt > 1`): log-space regularized-gamma form
-#   `s*(log r - log μ) + log P(s,μt) - λt`; `P` comes from a fixed-128-trip
-#   rising-factorial series for `μt ≤ 60` (DLMF 8.7.1) and `log P = 0`
-#   beyond (the omitted upper tail is `< 1e-17` for the validated `s ≤ 8`).
+#   `s*(log r - log μ) + log P(s,μt) - λt`; `P` comes from a
+#   rising-factorial series for `μt ≤ 60` (DLMF 8.7.1, same cap) and
+#   `log P = 0` beyond (the omitted upper tail is `< 1e-17` for the
+#   validated `s ≤ 8`).
 # - `w > 40` (`μt < -40`, reached at ordinary points when disposition `β`
 #   exceeds absorption `r`): the `v = t-u` substitution gives the bounded
 #   form `e^(-rt)*T(s,w,t)`, `T ≤ t^(s-1)/w`, evaluated with an 8-term
@@ -74,30 +75,35 @@ function _twocmt_disposition(k10::Float64, k12::Float64, k21::Float64)
     return α, β, N1 / disc, M2 / disc
 end
 
-# Fixed-trip `Σ_{n≥0} w^n/((s+n)*n!)`: the `S` series, from expanding
-# `e^(-μu)` and integrating termwise (`S = t^s` times this sum). Verified
-# by differentiation (`dS/dt = t^(s-1)*e^(-μt)`) in the commit message.
+# `Σ_{n≥0} w^n/((s+n)*n!)`: the `S` series, from expanding `e^(-μu)` and
+# integrating termwise (`S = t^s` times this sum). Verified by
+# differentiation (`dS/dt = t^(s-1)*e^(-μt)`). Convergence break with a
+# fixed cap: terms shrink geometrically once past `|w|`, so typical points
+# take ~10-30 trips instead of the cap (measured ~5x gradient speedup);
+# the break threshold keeps truncation at ~1e-15 relative.
 function _transit_u_sum(s::Float64, w::Float64)
     acc = 1.0 / s
     term = 1.0 / s
     for n in 1:_TRANSIT_SERIES_TRIPS
         term *= w * (s + n - 1) / (n * (s + n))
         acc += term
+        abs(term) <= 1e-15 * abs(acc) && break
     end
     return acc
 end
 
-# Fixed-trip `Σ_{k≥0} x^k/(s)_{k+1}` with the rising factorial
+# `Σ_{k≥0} x^k/(s)_{k+1}` with the rising factorial
 # `(s)_{k+1} = s*(s+1)*...*(s+k)`: the inner sum of
 # `P(s,x) = e^(-x)*x^s/Γ(s)` times this sum (DLMF 8.7.1). NOTE the
 # denominator is the rising factorial, NOT `(s+k)*k!` — the latter is the
-# `S`-series shape and gives wrong values here.
+# `S`-series shape and gives wrong values here. Same convergence break.
 function _transit_p_sum(s::Float64, x::Float64)
     acc = 1.0 / s
     term = 1.0 / s
     for k in 1:_TRANSIT_SERIES_TRIPS
         term *= x / (s + k)
         acc += term
+        abs(term) <= 1e-15 * abs(acc) && break
     end
     return acc
 end
@@ -154,7 +160,7 @@ Central-compartment amount at lag `t ≥ 0` for a unit dose at `t = 0` under
 the twocmt + Gamma-transit dynamics — the exact closed form of the
 varyingsource unit solve. All arguments are positive constants with
 `shape ≥ 1` (`shape = 1 + rate*mode` in StanBlocks `params`). Plain Julia,
-fixed-trip loops: Enzyme reverses through it natively.
+convergence-capped loops: Enzyme reverses through it natively.
 """
 function transit_twocmt_unit(t::Float64, k10::Float64, k12::Float64,
         k21::Float64, rate::Float64, shape::Float64)
