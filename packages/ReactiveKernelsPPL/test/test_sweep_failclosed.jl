@@ -152,6 +152,18 @@ using Test
                 y .~ Normal.(mu, sigma_obs)
             end), (:y, :t, :A1, :A2, :C1, :C2, :X1m, :X2m, :X1a, :X2a),
             SurfaceLoweringError),
+        # bordet builder 7 (brm_grouped_hsgp_centeredness @ e800ef8d):
+        # grouped HSGP (`by=`) has no basis spelling — hsgp_basis takes
+        # k/c/iso/cov/period only. (The builder's other pieces —
+        # varying intercepts, intercept-only sigma, censored Gaussian —
+        # are admitted; the grouped smooths gate it F.)
+        ("bordet-builder7", "grouped hsgp by kwarg",
+            :(begin
+                a ~ Normal(0, 1)
+                mu = a .+ hsgp(:h_x)
+                y .~ Normal.(mu, 1.5)
+                hsgp_basis(:h_x, x; k = 5, by = g)
+            end), (:y, :x, :g), SurfaceLoweringError),
         # garch11: GARCH(1,1) variance recursion is deterministic given
         # data+params; same scan-setup gate.
         ("garch11", "deterministic scan setup",
