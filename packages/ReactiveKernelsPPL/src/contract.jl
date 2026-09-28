@@ -81,6 +81,7 @@ univariate components, SB `MixtureModel` mirror)."""
     BernoulliCloglogFam
     BinomialProbitFam
     BinomialCloglogFam
+    BinomialProbFam
     BetaLogitFam
     CategoricalLogitFam
     OrderedLogisticFam
@@ -106,6 +107,7 @@ univariate components, SB `MixtureModel` mirror)."""
     ExponentialLogFam
     LogNormalFam
     WeibullFam
+    ZeroInflatedBinomialFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -1967,12 +1969,13 @@ const ELEMENTWISE_FNS =
 admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
-    BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
+    BinomialCloglogFam, BinomialProbFam, BetaLogitFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
     ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
-    NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam)
+    NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
+    ZeroInflatedBinomialFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -6733,6 +6736,45 @@ function _validate_simplex_response(r::LikelihoodSpec, plan::StructuralPlan)
     return nothing
 end
 
+# Prob-space Binomial responses (SB `binomial(n, theta)` with a Beta prior,
+# the Rate family): no linear predictor — the location names the
+# Beta-sampled scalar probability in `predictor`, used as-is under
+# IdentityLink (the simplex precedent). Literals stay rejected: a fully
+# fixed Binomial contributes a constant, never a coordinate.
+function _validate_binomial_prob_response(r::LikelihoodSpec, plan::StructuralPlan)
+    r.link === IdentityLink || _fail(r.label,
+        "a prob-space Binomial response uses IdentityLink (probs are used " *
+        "as-is), got $(r.link)")
+    i = findfirst(p -> p.name === r.predictor, plan.parameters)
+    i === nothing && _fail(r.label,
+        "a prob-space Binomial response names its Beta-sampled probability " *
+        "in `predictor` (`theta ~ Beta(...)` in the model), got " *
+        "$(r.predictor)")
+    plan.parameters[i].family === :beta || _fail(r.label,
+        "a prob-space Binomial probability is Beta-sampled, got " *
+        "$(r.predictor) ~ $(plan.parameters[i].family)")
+    return nothing
+end
+
+# Zero-inflated prob-space Binomial (the BinomialProb precedent plus the
+# ZIP zi slot): the location names a Beta-sampled scalar probability in
+# `predictor`, trials ride the shared Binomial rule, and zi (structural-zero
+# probability, parameter or literal) is checked by `_validate_zi`.
+function _validate_zib_response(r::LikelihoodSpec, plan::StructuralPlan)
+    r.link === IdentityLink || _fail(r.label,
+        "a zero-inflated prob-space Binomial response uses IdentityLink " *
+        "(probs are used as-is), got $(r.link)")
+    i = findfirst(p -> p.name === r.predictor, plan.parameters)
+    i === nothing && _fail(r.label,
+        "a zero-inflated prob-space Binomial response names its " *
+        "Beta-sampled probability in `predictor` " *
+        "(`p ~ Beta(...)` in the model), got $(r.predictor)")
+    plan.parameters[i].family === :beta || _fail(r.label,
+        "a zero-inflated prob-space Binomial probability is Beta-sampled, " *
+        "got $(r.predictor) ~ $(plan.parameters[i].family)")
+    return nothing
+end
+
 # Joint correlated-outcomes responses (SB
 # `[y1..yK] ~ MvNormalCholesky([mu1..muK], L)`): K outcome columns (lead +
 # tail) with K identity-link mean predictors (lead + `extra_predictors`,
@@ -7307,6 +7349,32 @@ function _validate_responses(plan::StructuralPlan)
             _validate_evidence_structure(r, plan)
             continue
         end
+        # A prob-space Binomial location (no linear predictor — the
+        # simplex precedent): the location names a Beta-sampled scalar
+        # parameter in `predictor`.
+        if r.family === BinomialProbFam
+            _validate_binomial_prob_response(r, plan)
+            _validate_scale(r, plan)
+            _validate_nu(r, plan)
+            _validate_zi(r, plan)
+            _validate_interval(r, plan)
+            _validate_evidence_structure(r, plan)
+            _validate_unleveled_fields(r)
+            continue
+        end
+        # A zero-inflated prob-space Binomial location (the BinomialProb
+        # precedent plus zi): the location names a Beta-sampled scalar
+        # parameter in `predictor`.
+        if r.family === ZeroInflatedBinomialFam
+            _validate_zib_response(r, plan)
+            _validate_scale(r, plan)
+            _validate_nu(r, plan)
+            _validate_zi(r, plan)
+            _validate_interval(r, plan)
+            _validate_evidence_structure(r, plan)
+            _validate_unleveled_fields(r)
+            continue
+        end
         # A joint correlated-outcomes response (K outcomes, K mean
         # predictors, one LKJ factor): validated whole, skipping the
         # single-predictor triple.
@@ -7409,7 +7477,8 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         return _fail(r.label, "Poisson response must be non-negative integers")
     elseif _is_binomial_family(r.family)
         _is_count_column(col) && return nothing
-        what = r.family === BetaBinomial2Fam ? "BetaBinomial2" : "Binomial"
+        what = r.family === BetaBinomial2Fam ? "BetaBinomial2" :
+            r.family === ZeroInflatedBinomialFam ? "ZeroInflatedBinomial" : "Binomial"
         return _fail(r.label, "$what response must be non-negative integers")
     elseif r.family === NegativeBinomial2Fam
         _is_count_column(col) && return nothing
@@ -7610,14 +7679,18 @@ end
 _is_count_column(col) =
     eltype(col) <: Integer && eltype(col) !== Bool && all(>=(0), col)
 
-# Bernoulli/Binomial span three link variants each (logit + slice-2
-# probit/cloglog); response/trials rules are link-independent.
-# BetaBinomial2 shares the Binomial trials rule (trials required, y ≤ n).
+# Bernoulli spans three link variants (logit + slice-2 probit/cloglog);
+# Binomial spans those three plus prob-space (BinomialProbFam, a
+# Beta-sampled probability, no link) plus zero-inflated prob-space
+# (ZeroInflatedBinomialFam, a Beta-sampled probability + zi, no link);
+# response/trials rules are link-independent. BetaBinomial2 shares the
+# Binomial trials rule (trials required, y ≤ n).
 _is_bernoulli_family(f) =
     f === BernoulliLogitFam || f === BernoulliProbitFam || f === BernoulliCloglogFam
 _is_binomial_family(f) =
     f === BinomialLogitFam || f === BinomialProbitFam || f === BinomialCloglogFam ||
-    f === BetaBinomial2Fam
+    f === BinomialProbFam || f === BetaBinomial2Fam ||
+    f === ZeroInflatedBinomialFam
 
 # Scale-auxiliary requirement per family: the need string, or `nothing`
 # when the family takes no scale (`_validate_scale` for single responses,
@@ -7847,14 +7920,15 @@ end
 # structurally: unlike scale there is no bind-time column form to defer
 # to.
 function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
-    if r.family !== ZeroInflatedPoissonFam
+    if r.family !== ZeroInflatedPoissonFam &&
+            r.family !== ZeroInflatedBinomialFam
         r.zi === nothing ||
-            _fail(r.label, "only ZIP responses take zi (zero-inflation probability)")
+            _fail(r.label, "only ZIP/ZIB responses take zi (zero-inflation probability)")
         return nothing
     end
     z = r.zi
     z === nothing &&
-        _fail(r.label, "ZIP response requires zi (zero-inflation " *
+        _fail(r.label, "ZIP/ZIB response requires zi (zero-inflation " *
             "probability, parameter or literal)")
     z isa ScalePredictorRef && return _validate_zi_predictor(r, plan, z)
     z isa Real && ((isfinite(z) && 0 <= z <= 1) ||
@@ -7925,6 +7999,7 @@ function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
         return nothing
     end
     what = r.family === BetaBinomial2Fam ? "BetaBinomial2 response" :
+        r.family === ZeroInflatedBinomialFam ? "ZeroInflatedBinomial response" :
         "Binomial response"
     r.trials === nothing && _fail(r.label,
         "$what requires trials (Int column or literal)")

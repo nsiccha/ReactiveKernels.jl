@@ -1,5 +1,5 @@
 using DifferentiationInterface: AutoEnzyme, gradient
-using Distributions: Bernoulli, BetaBinomial, Cauchy, Dirichlet, Exponential,
+using Distributions: Bernoulli, BetaBinomial, Binomial, Cauchy, Dirichlet, Exponential,
     Geometric, InverseGamma, Laplace, LKJCholesky, Logistic, LogNormal,
     MvNormal, NegativeBinomial, Normal, Poisson,
     TDist, Uniform, Weibull, cdf, logpdf, quantile
@@ -23,11 +23,13 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     LKJ_CORR_CHOLESKY_KERNEL_SOURCE,
     NEGATIVE_BINOMIAL_KERNEL_SOURCE,
     WEIBULL_KERNEL_SOURCE,
+    ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE,
     normal, cauchy, laplace, logistic, bernoulli, lognormal,
     exponential, geometric, uniform, mvnormal, ar1,
     categorical_logit, categorical_logit_ref,
     negative_binomial2, beta_binomial, negative_binomial, weibull,
     inverse_gamma, dirichlet, lkj_corr_cholesky, zero_inflated_poisson,
+    zero_inflated_binomial,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 using Test
 
@@ -625,6 +627,38 @@ end
     @test zip_rate(2, NaN, 0.2) == -Inf
     @test !isnan(zip_rate(2, NaN, 0.2))
     @test_throws DomainError zip_rate(2, -1.0, 0.2)
+end
+
+@testset "zero_inflated_binomial Stan lpmf parity" begin
+    # ZIB(n, p, zi) is a structural-zero mass zi mixed with Binomial(n, p)
+    # counts (the m0 capture-recapture marginal shape) — the independent
+    # oracle is the stable two-arm form over Distributions' Binomial.
+    zib = prepare(zero_inflated_binomial.logpdf;
+        have = (:observed, :n, :p, :zi), want = :logpdf)
+    _zib_logaddexp(a, b) = max(a, b) + log1p(exp(-abs(a - b)))
+    for (y, n, p, zi) in ((0, 3, 0.5, 0.2), (2, 3, 0.5, 0.2),
+            (0, 3, 0.5, 0.0), (1, 10, 0.3, 0.0), (0, 5, 0.9, 0.0),
+            (3, 3, 0.4, 0.9), (0, 3, 0.5, 1.0))
+        bb = logpdf(Binomial(n, p), y)
+        ref = y == 0 ? _zib_logaddexp(log(zi), log1p(-zi) + bb) :
+            log1p(-zi) + bb
+        @test zib(y, n, p, zi) ≈ ref
+    end
+    # A certain structural zero forbids positive counts.
+    @test zib(2, 3, 0.5, 1.0) == -Inf
+    # Impossible events are -Inf, never NaN (lazy support guard).
+    @test zib(-1, 3, 0.5, 0.2) == -Inf
+    @test zib(4, 3, 0.5, 0.2) == -Inf
+    @test zib(2, 3, 0.5, -0.1) == -Inf
+    @test zib(2, 3, 0.5, 1.5) == -Inf
+    @test zib(0, 3, 0.5, NaN) == -Inf
+    for v in (zib(-1, 3, 0.5, 0.2), zib(4, 3, 0.5, 0.2),
+            zib(2, 3, 0.5, -0.1), zib(2, 3, 0.5, 1.5),
+            zib(0, 3, 0.5, NaN))
+        @test !isnan(v)
+    end
+    @test occursin("@kernel zero_inflated_binomial",
+        ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE)
 end
 
 @testset "beta_binomial Stan lpmf parity" begin

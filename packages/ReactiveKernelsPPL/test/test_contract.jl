@@ -362,12 +362,13 @@ end
     @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
         BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
         BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
-        BinomialCloglogFam, BetaLogitFam, CategoricalLogitFam,
+        BinomialCloglogFam, BinomialProbFam, BetaLogitFam, CategoricalLogitFam,
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
         MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
         PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
         ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
-        NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam)
+        NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
+        ZeroInflatedBinomialFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
