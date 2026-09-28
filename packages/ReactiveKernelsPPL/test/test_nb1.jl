@@ -1,10 +1,11 @@
-# NB1 response (SB `neg_binomial` mirror): per-observation-p value
-# parity vs the Distributions.jl oracle, Enzyme-vs-findiff gradients,
-# O(1) emission, Reactant/XLA value+grad parity, and the agreed SB
-# parity dataset (gated regeneration). SB-pin testsets are appended
-# once the peer lane's BridgeStan numbers land (same flow as hurdle:
-# pins filled before landing). (`_findiff_grad` / `_GEN_BACKEND` come
-# from test_generator.jl, included first.)
+# NB1 response (SB `neg_binomial` mirror): per-observation-p and
+# modeled-p value parity vs the Distributions.jl oracle,
+# Enzyme-vs-findiff gradients, O(1) emission, Reactant/XLA value+grad
+# parity, and the agreed SB parity datasets (N1/N2 gated regeneration;
+# B1 pins carried from term-nuisance spec `1mcop44`, confirmed against
+# the peer lane's fresh BridgeStan brief before landing — same flow as
+# hurdle). (`_findiff_grad` / `_GEN_BACKEND` come from test_generator.jl,
+# included first.)
 using DifferentiationInterface
 using Distributions: Beta, NegativeBinomial, Normal, logpdf
 using Enzyme
@@ -32,6 +33,24 @@ const _NB1_X = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
 const _NB1_Y = [0, 1, 2, 0, 3, 1]
 _nb1_cols() = Dict{Symbol,AbstractVector}(:y => copy(_NB1_Y), :x => copy(_NB1_X))
 
+# B1 modeled-p probe (term-nuisance SB spec `1mcop44`): `log(r) ~ 1+x`,
+# `logit(p) ~ 1+z`, `c ~ NegativeBinomial(r, p)`, all effect priors
+# `Normal(0, 1)`.
+const _B1_X = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+const _B1_Z = [1.0, 0.5, -0.5, 1.5, 0.0, -1.0]
+const _B1_C = [3, 1, 6, 2, 1, 4]
+_b1_cols() = Dict{Symbol,AbstractVector}(:c => copy(_B1_C), :x => copy(_B1_X),
+    :z => copy(_B1_Z))
+_b1_prog() = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
+    e ~ Normal(0, 1)
+    f ~ Normal(0, 1)
+    eta = a .+ b .* x
+    hu = e .+ f .* z
+    c .~ NegativeBinomial.(exp.(eta), logistic.(hu))
+end
+
 @testset "nb1 per-observation p values" begin
     # The SB-established spelling (p as a data column): value parity
     # vs the Distributions.jl oracle.
@@ -47,6 +66,20 @@ _nb1_cols() = Dict{Symbol,AbstractVector}(:y => copy(_NB1_Y), :x => copy(_NB1_X)
     want = sum(logpdf(NegativeBinomial(v, p), y)
         for (y, v, p) in zip(_NB1_Y, rr, cols[:pc])) +
         logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+    @test got ≈ want rtol = 1e-12
+end
+
+@testset "nb1 modeled-p values" begin
+    # B1 probe shape: value parity vs the Distributions.jl oracle at a
+    # constrained probe (all-Normal, so constrained == unconstrained).
+    _, _, kern, lay = _nb1_query(_b1_prog(), _b1_cols())
+    q = (eta = [0.2, -0.1], hu = [-0.5, 0.3])
+    got = _nb1_posterior(kern, lay, q)
+    rr = exp.(q.eta[1] .+ q.eta[2] .* _B1_X)
+    pp = 1 ./ (1 .+ exp.(-(q.hu[1] .+ q.hu[2] .* _B1_Z)))
+    want = sum(logpdf(NegativeBinomial(v, p), y)
+        for (y, v, p) in zip(_B1_C, rr, pp)) +
+        sum(logpdf(Normal(0, 1), t) for t in (q.eta..., q.hu...))
     @test got ≈ want rtol = 1e-12
 end
 
@@ -95,6 +128,10 @@ end
                 y .~ NegativeBinomial.(exp.(eta), p)
             end, _nb1_cols(), (eta = [0.5, -0.25], p = 0.4))
     end
+    @testset "modeled p (B1)" begin
+        _nb1_enzyme_check(_b1_prog(), _b1_cols(),
+            (eta = [0.2, -0.1], hu = [-0.5, 0.3]))
+    end
 end
 
 # Statement-head histogram of the generated kernel (the joint-parity
@@ -121,6 +158,13 @@ end
     h12 = _nb1_statement_heads(prog, Dict{Symbol,AbstractVector}(
         :y => vcat(_NB1_Y, _NB1_Y), :x => vcat(_NB1_X, _NB1_X)))
     @test h6 == h12
+    # The modeled-p plate (predictor-fed `_ppl_sc_` precompute) likewise
+    # must not unroll over observations.
+    m6 = _nb1_statement_heads(_b1_prog(), _b1_cols())
+    m12 = _nb1_statement_heads(_b1_prog(), Dict{Symbol,AbstractVector}(
+        :c => vcat(_B1_C, _B1_C), :x => vcat(_B1_X, _B1_X),
+        :z => vcat(_B1_Z, _B1_Z)))
+    @test m6 == m12
 end
 
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
@@ -165,6 +209,7 @@ end
             eta = a .+ b .* x
             y .~ NegativeBinomial.(exp.(eta), 0.4)
         end, Dict{Symbol,AbstractVector}(:y => copy(y), :x => copy(x))),
+        ("modeled-p", _b1_prog(), _b1_cols()),
     ]
     for (name, prog, cols) in progs
         @testset "$name" begin
@@ -265,6 +310,35 @@ _nb1_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         @test all(isfinite, g)
         want = _nb1_sb_vec(names, [Symbol("eta.Intercept") => -24.308315361938934,
             Symbol("eta.x") => 21.08901738421236])
+        @test maximum(abs.(g .- want)) < 1e-10
+    end
+    @testset "B1 modeled p" begin
+        # SB (term-nuisance spec `1mcop44` on
+        # BayesianRegressionModels:rk:parity-term-nuisance, BRM 97bb538
+        # over canonical 3b54939, StanBlocks 24578c3, BridgeStan 2.9.0,
+        # Julia 1.10.11; confirmed against the peer lane's fresh
+        # BridgeStan brief before landing): log(r) ~ 1 + x,
+        # logit(p) ~ 1 + z, all effect priors Normal(0, 1),
+        # c ~ NegativeBinomial(r, p) (emitted
+        # `c ~ neg_binomial(r, p ./ (1.0 - p))`). Full posterior at u,
+        # propto=false, Jacobian included, BridgeStan AD grads. Pins
+        # compare by coordinate name (SB pins below are in SB
+        # declaration order [b0_r, b1_r, b0_p, b1_p]).
+        # u = [0.2, -0.1, -0.5, 0.3].
+        bound, built, kern, lay = _nb1_query(_b1_prog(), _b1_cols())
+        names = coordinate_names(lay)
+        u = _nb1_sb_vec(names, [Symbol("eta.Intercept") => 0.2,
+            Symbol("eta.x") => -0.1, Symbol("hu.Intercept") => -0.5,
+            Symbol("hu.z") => 0.3])
+        @test abs(Base.invokelatest(kern, u) - (-17.21077676236189)) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        want = _nb1_sb_vec(names, [Symbol("eta.Intercept") => 3.2359990802629035,
+            Symbol("eta.x") => 3.8226220328762897,
+            Symbol("hu.Intercept") => -1.6053435570340273,
+            Symbol("hu.z") => -0.18482410804380967])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end

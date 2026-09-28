@@ -580,13 +580,34 @@ end
         eta = a .+ b .* x
         y .~ NegativeBinomial.(eta, 0.4)
     end, Dn2)
-    # A predictor-fed p fails at the contract gate (deferred, the
-    # Beta-kappa precedent — scalar p only in v1).
+    # NB1 p predictors are logit-only (a success probability, the
+    # hurdle precedent): bare and log-link spellings fail closed.
     @test_throws ContractValidationError lower_rkppl(quote
         eta = a .+ b .* x
         hu = c .+ d .* x
-        y .~ NegativeBinomial.(exp.(eta), logistic.(hu))
+        y .~ NegativeBinomial.(exp.(eta), hu)
     end, Dn2)
+    @test_throws ContractValidationError lower_rkppl(quote
+        eta = a .+ b .* x
+        hu = c .+ d .* x
+        y .~ NegativeBinomial.(exp.(eta), exp.(hu))
+    end, Dn2)
+end
+
+@testset "nb1 modeled-p surface admission" begin
+    plan = lower_rkppl(quote
+            eta = a .+ b .* x
+            hu = c .+ d .* z
+            y .~ NegativeBinomial.(exp.(eta), logistic.(hu))
+        end, (:y, :x, :z))
+    r = only(plan.responses)
+    @test r.family === NegativeBinomialFam
+    @test r.link === LogLink
+    @test r.predictor === :eta
+    @test r.scale == ScalePredictorRef(:hu, LogitLink)
+    pred = only(p for p in plan.predictors if p.name === :hu)
+    @test pred.link === LogitLink
+    @test count(p -> p.name === :hu, plan.predictors) == 1
 end
 
 @testset "surface roundtrip zip end to end" begin
