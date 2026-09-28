@@ -269,6 +269,32 @@ end
     _gather_slow!(cache, x, idx...)
 end
 
+# Partitioned-plate lane gathers: `x[lanes]` elementwise into the cache, or a
+# fill when the argument is a singleton (the twin's
+# `x[ones(Int, length(lanes))]` branch). The guards mirror the twin's branch
+# order exactly — the singleton check first, so out-of-range lane indices on
+# a length-1 argument fill rather than throwing — and any mismatch falls back
+# to the twin call, preserving its exact result and errors (`enumerate` keeps
+# the loop correct for any lane-vector axes). Bool lane masks stay on the
+# fallback: positional indexing with a Bool element is an error, not a mask
+# selection.
+@inline function MutatingFunctions.apply!!(
+        cache::Vector{T}, gather::ReactiveKernels._LaneGather,
+        x::AbstractVector{T}, lanes::AbstractVector{<:Integer}) where {T}
+    eltype(lanes) === Bool && return gather(x, lanes)
+    if length(x) == 1
+        length(cache) == length(lanes) || return gather(x, lanes)
+        fill!(cache, x[1])
+        return cache
+    end
+    ndims(x) == 1 && length(x) == gather.n || return gather(x, lanes)
+    length(cache) == length(lanes) || return gather(x, lanes)
+    for (i, lane) in enumerate(lanes)
+        cache[i] = x[lane]
+    end
+    cache
+end
+
 @inline function MutatingFunctions.apply!!(
         cache::Array{Float64,N}, op::ReactiveKernels._FillConstructorStep,
         dims::Vararg{Integer,N}) where {N}
