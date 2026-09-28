@@ -5,6 +5,7 @@
 # varying_draws(g, [margins...])` + `r ~ varying_slice(d, cols)`)
 # spellings.
 
+using Reactant
 using SpecialFunctions: loggamma
 
 function _tv_draws(;
@@ -1703,4 +1704,163 @@ end
     @test _query(built.spec, bound, :prior, u) ≈ pr
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2] + u[3]
     _check_gradient(built.spec, bound, u)
+end
+
+@testset "varying sd= keyword admission" begin
+    k1 = lower_rkppl(quote
+            mu ~ Normal(0, 5)
+            r ~ varying_effect(g, [1]; eta = 1.0, sd = Cauchy(0, 5))
+            eta = mu .+ r
+            y .~ Normal.(eta, sigma)
+        end, (:y, :sigma, :g))
+    d1 = only(k1.varying_draws)
+    @test d1.kind === :correlated
+    @test d1.sd_priors == [VaryingSdPrior(:cauchy, 5.0)]
+    k2 = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            r ~ varying_effect(g, [1, x]; eta = 2.0, sd = Normal(0, 2))
+            mu = a .+ r
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x, :g))
+    d2 = only(k2.varying_draws)
+    @test d2.sd_priors ==
+        [VaryingSdPrior(:normal, 2.0), VaryingSdPrior(:normal, 2.0)]
+    ke = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            r ~ varying_effect(g, [x]; eta = 1.0, sd = Exponential(0.5))
+            mu = a .+ r
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x, :g))
+    de = only(ke.varying_draws)
+    @test de.sd_priors == [VaryingSdPrior(:exponential, 0.5)]
+end
+
+@testset "varying sd= fail-closed battery" begin
+    bad = (
+        # (label, raw, message-fragment)
+        ("half-cauchy implies +log2", :(HalfCauchy(0, 5)), "bare form"),
+        ("half-normal implies +log2", :(HalfNormal(0, 2)), "bare form"),
+        ("nonzero location", :(Normal(1, 2)), "location must be literal 0"),
+        ("non-positive scale", :(Cauchy(0, -1)), "positive literal"),
+        ("exponential arity", :(Exponential()), "one scale argument"),
+        ("bare literal", :(5.0), "takes `Cauchy(0, σ)`"),
+        ("sampled name", :s, "takes `Cauchy(0, σ)`"),
+        ("per-margin tuple", :((Cauchy(0, 5), Normal(0, 2))),
+            "per-margin sd priors are planned"),
+    )
+    for (_, raw, msg) in bad
+        err = try
+            lower_rkppl(Expr(:block,
+                    :(mu ~ Normal(0, 5)),
+                    Expr(:call, :~, :r, Expr(:call, :varying_effect, :g,
+                            Expr(:vect, 1),
+                            Expr(:parameters,
+                                Expr(:kw, :eta, 1.0),
+                                Expr(:kw, :sd, raw)))),
+                    :(eta = mu .+ r),
+                    Expr(:call, :.~, :y,
+                        Expr(:., :Normal, Expr(:tuple, :eta, :sigma)))),
+                (:y, :sigma, :g))
+            nothing
+        catch e
+            e
+        end
+        @test err isa SurfaceLoweringError
+        @test occursin(msg, sprint(showerror, err))
+    end
+    # `sd=` without `eta` on K=1: the draws stay non-correlated, so the
+    # contract names the vacuous-eta route.
+    cerr = try
+        lower_rkppl(quote
+                mu ~ Normal(0, 5)
+                r ~ varying_effect(g, [1]; sd = Cauchy(0, 5))
+                eta = mu .+ r
+                y .~ Normal.(eta, sigma)
+            end, (:y, :sigma, :g))
+        nothing
+    catch e
+        e
+    end
+    @test cerr isa ContractValidationError
+    @test occursin("pass `eta` for the vacuous-1x1-LKJ route",
+        sprint(showerror, cerr))
+end
+
+# Classic eight-schools data (embedded — the posteriordb subset).
+const _TVSD_Y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
+const _TVSD_SG = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
+const _TVSD_NC = quote
+    mu ~ Normal(0, 5)
+    r ~ varying_effect(g, [1]; eta = 1.0, sd = Cauchy(0, 5))
+    eta = mu .+ r
+    y .~ Normal.(eta, sigma)
+end
+
+function _tvsd_nc_cols()
+    return Dict{Symbol,AbstractVector}(:g => collect(1:8),
+        :y => copy(_TVSD_Y), :sigma => copy(_TVSD_SG))
+end
+
+# Build, then trace/compile through `Base.invokelatest` with a
+# `prepare_query` closure (the leveled-Reactant call-shape precedent — a
+# `_query` closure captures `built`/`bound` structs whose `KernelSpec`
+# signature Reactant cannot trace).
+function _tvsd_reactant(bound)
+    built = build_kernel(bound)
+    post_q = prepare_query(built, bound, :sampler)
+    u = [0.2, -0.3, 0.1, -0.1, 0.25, 0.0, -0.2, 0.15, 0.05, -0.05]
+    return Base.invokelatest(_tvsd_reactant_measure, built, bound, post_q, u)
+end
+
+function _tvsd_reactant_measure(built, bound, post_q, u)
+    native = post_q(u)
+    compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
+    primal = Float64(compiled(Reactant.to_rarray(u)))
+    q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
+    rval, rgrad = cad(Reactant.to_rarray(u))
+    return (; native, primal, val, g,
+        rval = Float64(rval), rgrad = Array(rgrad))
+end
+
+@testset "varying cauchy sd e2e values and gradient" begin
+    cols = _tvsd_nc_cols()
+    plan = lower_rkppl(_TVSD_NC, (:y, :sigma, :g))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    # mu + tau + 8 innovations (K=1 LKJ carries no coordinates).
+    @test built.layout.total == 10
+    u = [0.2, -0.3, 0.1, -0.1, 0.25, 0.0, -0.2, 0.15, 0.05, -0.05]
+    nt = constrain(built.layout, u)
+    theta = nt.eta[1] .+ nt.tau_g[1] .* nt.z_flat_g
+    ll = sum(logpdf.(Normal.(theta, cols[:sigma]), cols[:y]))
+    # Stan-kernel Cauchy (NO +log2) and NO LKJ term (K=1 exactly zero).
+    pr = logpdf(Normal(0, 5), nt.eta[1]) +
+        logpdf(Cauchy(0, 5), nt.tau_g[1]) +
+        sum(logpdf.(Normal(0, 1), nt.z_flat_g))
+    @test _query(built.spec, bound, :likelihood, u) ≈ ll
+    @test _query(built.spec, bound, :prior, u) ≈ pr
+    # :exp Jacobian oracle over coordinate offsets (entry position in the
+    # entries list is NOT the coordinate — the L entry packs zero thetas).
+    jac = sum(sum(u[e.offset:(e.offset + e.size - 1)])
+        for e in built.layout.entries if e.transform === :exp)
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "varying cauchy sd under Reactant" begin
+    # Vector-mu Normal-id: default pipeline (narrowed §7n scope —
+    # scalar-mu only).
+    cols = _tvsd_nc_cols()
+    plan = lower_rkppl(_TVSD_NC, (:y, :sigma, :g))
+    bound = bind_data(plan, cols)
+    fx = _tvsd_reactant(bound)
+    @test fx.primal ≈ fx.native rtol = 1e-9
+    @test fx.val ≈ fx.native rtol = 1e-12
+    @test fx.rval ≈ fx.native rtol = 1e-9
+    @test fx.rgrad ≈ fx.g rtol = 1e-8
 end

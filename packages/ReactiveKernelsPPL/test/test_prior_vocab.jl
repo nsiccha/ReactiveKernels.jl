@@ -9,7 +9,7 @@
 # (phase 2 of their todo). (`_findiff_grad` / `_GEN_BACKEND` come from
 # test_generator.jl, included first.)
 using Distributions: Normal, Cauchy, TDist, Laplace, Logistic, Uniform,
-    Exponential, logpdf
+    Exponential, Bernoulli, logpdf
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Reactant
@@ -545,5 +545,658 @@ end
             :g => vcat(_PV_G, _PV_G .+ 3))
         @test _pv_reactant(_PV_M4, morelevels).lines == small.lines
     end
+end
+
+# M5: Stan-kernel halves — `Normal(0, s; lower=0)` is the bare symmetric
+# density on positive support with NO +log(2) renormalizer (Stan
+# `real<lower=0>` + `~ normal()` kernel semantics, matching the
+# posteriordb reference kernels). Complement of the proper halves
+# (`HalfNormal`, `truncated(..., 0, Inf)`).
+const _PV_M5 = quote
+    mu = a .+ b .* x
+    y .~ Normal.(mu, s)
+    s ~ Normal(0, 2; lower=0)
+    t ~ Cauchy(0, 5; lower=0)
+end
+_pv_m5_oracle(a::Real, b::Real, s::Real, t::Real) =
+    logpdf(Normal(0, 1), a) + logpdf(Normal(0, 1), b) +
+    logpdf(Normal(0, 2), s) + logpdf(Cauchy(0, 5), t) +
+    _pv_gauss_ll(a, b, s) + log(s) + log(t)
+
+# M5 twin with proper halves: identical except the +log(2) per half.
+const _PV_M5_PROPER = quote
+    mu = a .+ b .* x
+    y .~ Normal.(mu, s)
+    s ~ HalfNormal(2)
+    t ~ HalfCauchy(5)
+end
+
+@testset "stan-kernel halves admission" begin
+    plan = lower_rkppl(_PV_M5, (:y, :x))
+    s = _pv_param(plan, :s)
+    @test s.family === :normal
+    @test s.args == (arg1 = 0, arg2 = 2)
+    @test s.support_override === :positive_stan
+    t = _pv_param(plan, :t)
+    @test t.family === :cauchy
+    @test t.args == (arg1 = 0, arg2 = 5)
+    @test t.support_override === :positive_stan
+    plan = lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ Normal.(mu, s)
+            v ~ StudentT(4, 0, 1; lower=0)
+            s ~ Exponential(1)
+        end, (:y, :x))
+    v = _pv_param(plan, :v)
+    @test v.family === :student_t
+    @test v.args == (arg1 = 4, arg2 = 0, arg3 = 1)
+    @test v.support_override === :positive_stan
+    @testset "sampled scale" begin
+        plan = lower_rkppl(quote
+                mu = a .+ b .* x
+                y .~ Normal.(mu, s)
+                sc ~ Exponential(1)
+                s ~ Normal(0, sc; lower=0)
+            end, (:y, :x))
+        s = _pv_param(plan, :s)
+        @test s.args == (arg1 = 0, arg2 = :sc)
+        @test s.support_override === :positive_stan
+    end
+    @testset "narrow gate fails closed" begin
+        cases = (
+            ("lower must be literal 0",
+                :(Normal(0, 2; lower = 1)),
+                "Stan-kernel `lower` must be literal 0"),
+            ("non-literal lower",
+                :(Normal(0, 2; lower = lo)),
+                "Stan-kernel `lower` must be literal 0"),
+            ("upper points at truncated",
+                :(Normal(0, 2; upper = 3)),
+                "spelled `truncated(Normal(mu, s), -Inf, hi)`"),
+            ("unknown keyword",
+                :(Normal(0, 2; shape = 1)),
+                "unknown prior keyword"),
+            ("non-symmetric base",
+                :(Exponential(1; lower = 0)),
+                "needs a symmetric base"),
+            ("uniform base",
+                :(Uniform(0, 1; lower = 0)),
+                "needs a symmetric base"),
+            ("non-zero location",
+                :(Normal(1, 2; lower = 0)),
+                "requires literal zero location"),
+            ("wrong arity",
+                :(Normal(0; lower = 0)),
+                "takes 2 positional arguments"),
+        )
+        for (label, rhs, msg) in cases
+            err = try
+                lower_rkppl(quote
+                        mu = a .+ b .* x
+                        y .~ Normal.(mu, s)
+                        p ~ $rhs
+                        s ~ Exponential(1)
+                    end, (:y, :x))
+                nothing
+            catch e
+                e
+            end
+            @test err isa SurfaceLoweringError
+            @test occursin(msg, sprint(showerror, err))
+        end
+    end
+    @testset "kwargs on proper halves stay positional-only" begin
+        for rhs in (:(HalfNormal(2; lower = 0)),
+                :(truncated(Normal(0, 2), 0, Inf; lower = 0)))
+            err = try
+                lower_rkppl(quote
+                        mu = a .+ b .* x
+                        y .~ Normal.(mu, s)
+                        p ~ $rhs
+                        s ~ Exponential(1)
+                    end, (:y, :x))
+                nothing
+            catch e
+                e
+            end
+            @test err isa SurfaceLoweringError
+        end
+    end
+end
+
+@testset "stan-kernel halves values vs Distributions oracles" begin
+    q = (mu = [0.5, -0.25], s = 1.3, t = 2.1)
+    _, _, kern, lay = _pv_query(_PV_M5, _pv_cols())
+    @test _pv_posterior(kern, lay, q) ≈
+        _pv_m5_oracle(0.5, -0.25, 1.3, 2.1) rtol = 1e-12
+    # The proper-half twin differs by exactly +log(2) per half.
+    _, _, kkern, klay = _pv_query(_PV_M5_PROPER, _pv_cols())
+    @test _pv_posterior(kkern, klay, q) - _pv_posterior(kern, lay, q) ≈
+        2 * log(2) rtol = 1e-12
+end
+
+@testset "stan-kernel halves Enzyme gradients" begin
+    _pv_enzyme_check(_PV_M5, _pv_cols(), (mu = [0.5, -0.25], s = 1.3, t = 2.1))
+end
+
+# Ladder-1 Reactant measure for the scalar-mu Stan-half leg: a scalar
+# (intercept-only broadcast) mu + sampled Normal-id scale silently
+# miscompiles its default-pipeline reverse (§7n — each lane's `-1`
+# adjoint from the per-lane `-log(s)` is counted once instead of n
+# times, +(n-1) on the log-scale coordinate), so the correctness
+# assertion pins `optimize = :only_enzyme` and the default pipeline
+# rides `@test_broken` (pattern in `test_reactant_joint.jl`). The marker
+# turns suite-red the day upstream fixes the pass — then drop the pin
+# and marker together. Scope note (matrix-a trigger probes, Reactant
+# 0.2.288): scalar mu miscompiles at any n and any sampled scale prior
+# (Exponential, Stan-half Normal); vector mu is exact on default at any
+# coef count, scale prior, and n — so only scalar-mu legs take this
+# ladder, and the vector-mu M5 leg below asserts default directly.
+function _pv_sh_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
+    plan = lower_rkppl(prog, keys(cols))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    post_q = prepare_query(built, bound, :sampler)
+    u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
+    return Base.invokelatest(_pv_sh_reactant_measure, built, bound, post_q, u)
+end
+function _pv_sh_reactant_measure(built, bound, post_q, u)
+    native = post_q(u)
+    compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
+    primal = Float64(compiled(Reactant.to_rarray(u)))
+    q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u);
+        optimize = :only_enzyme)
+    rval, rgrad = cad(Reactant.to_rarray(u))
+    cad_default = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
+    _, rgrad_default = cad_default(Reactant.to_rarray(u))
+    return (; native, primal, val, g, rval = Float64(rval),
+        rgrad = Array(rgrad), rgrad_default = Array(rgrad_default))
+end
+
+@testset "stan-kernel halves under Reactant" begin
+    # Vector-mu M5: default pipeline verified exact (see scope note
+    # above), so this leg asserts default directly — no ladder pin.
+    fx = _pv_reactant(_PV_M5, _pv_cols())
+    @test fx.primal ≈ fx.native rtol = 1e-9
+    @test fx.val ≈ fx.native rtol = 1e-12
+    @test fx.rval ≈ fx.native rtol = 1e-9
+    @test fx.rgrad ≈ fx.g rtol = 1e-8
+end
+
+# M6: scalar-mu twin of the Stan-half scale — the §7n trigger shape
+# (intercept-only broadcast mu + sampled scale), covered by values,
+# Enzyme, and the ladder-1 Reactant leg.
+const _PV_M6 = quote
+    a ~ Normal(0, 1)
+    s ~ Normal(0, 2; lower=0)
+    mu = a
+    y .~ Normal.(mu, s)
+end
+_pv_m6_oracle(a::Real, s::Real) =
+    logpdf(Normal(0, 1), a) + logpdf(Normal(0, 2), s) +
+    sum(logpdf(Normal(a, s), y) for y in _PV_Y) + log(s)
+_pv_ycols() = Dict{Symbol,AbstractVector}(:y => copy(_PV_Y))
+
+@testset "stan-kernel halves scalar-mu values" begin
+    q = (mu = [0.5], s = 1.3)
+    _, _, kern, lay = _pv_query(_PV_M6, _pv_ycols())
+    @test _pv_posterior(kern, lay, q) ≈ _pv_m6_oracle(0.5, 1.3) rtol = 1e-12
+end
+
+@testset "stan-kernel halves scalar-mu Enzyme gradients" begin
+    _pv_enzyme_check(_PV_M6, _pv_ycols(), (mu = [0.5], s = 1.3))
+end
+
+@testset "stan-kernel halves scalar-mu under Reactant" begin
+    fx = _pv_sh_reactant(_PV_M6, _pv_ycols())
+    @test fx.primal ≈ fx.native rtol = 1e-9
+    @test fx.val ≈ fx.native rtol = 1e-12
+    @test fx.rval ≈ fx.native rtol = 1e-9
+    @test fx.rgrad ≈ fx.g rtol = 1e-8
+    @test_broken fx.rgrad_default ≈ fx.g rtol = 1e-8
+end
+
+# M7: flat with support — `Flat(; lower=0)` (positive, Stan kernel),
+# `Flat(; lower=lo, upper=hi)` (finite interval), `Flat(; upper=hi)`
+# (upper-bounded). Improper throughout: density 0.0, Jacobian only —
+# the posteriordb flat-sigma / flat-interval shape.
+const _PV_M7 = quote
+    mu = a .+ b .* x
+    y .~ Normal.(mu, s)
+    s ~ Flat(; lower=0)
+    u ~ Flat(; lower=0, upper=100)
+    w ~ Flat(; upper=5)
+end
+_pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
+    logpdf(Normal(0, 1), a) + logpdf(Normal(0, 1), b) +
+    _pv_gauss_ll(a, b, s) + log(s) +
+    _pv_interval_logjac(0, 100, u) + log(5 - w)
+
+@testset "flat support admission" begin
+    plan = lower_rkppl(_PV_M7, (:y, :x))
+    s = _pv_param(plan, :s)
+    @test s.family === :flat
+    @test s.support_override === :positive_stan
+    u = _pv_param(plan, :u)
+    @test u.family === :flat
+    @test u.support_override == (:interval, 0.0, 100.0)
+    w = _pv_param(plan, :w)
+    @test w.family === :flat
+    @test w.support_override == (:upper, 5.0)
+    bare = lower_rkppl(quote
+            mu = a .+ b .* x
+            y .~ Normal.(mu, s)
+            p ~ Flat()
+            s ~ Exponential(1)
+        end, (:y, :x))
+    @test _pv_param(bare, :p).support_override === nothing
+    @testset "narrow gate fails closed" begin
+        cases = (
+            ("nonzero one-sided lower",
+                :(Flat(; lower = 3)),
+                "must be literal 0"),
+            ("non-literal lower",
+                :(Flat(; lower = lo)),
+                "must be a finite literal"),
+            ("infinite upper",
+                :(Flat(; upper = Inf)),
+                "must be a finite literal"),
+            ("infinite paired upper",
+                :(Flat(; lower = 0, upper = Inf)),
+                "must be a finite literal"),
+            ("unknown keyword",
+                :(Flat(; shape = 1)),
+                "unknown flat keyword"),
+            ("inverted interval",
+                :(Flat(; lower = 10, upper = 5)),
+                "needs lower < upper"),
+            ("positional arg",
+                :(Flat(5)),
+                "takes no arguments"),
+        )
+        for (label, rhs, msg) in cases
+            err = try
+                lower_rkppl(quote
+                        mu = a .+ b .* x
+                        y .~ Normal.(mu, s)
+                        p ~ $rhs
+                        s ~ Exponential(1)
+                    end, (:y, :x))
+                nothing
+            catch e
+                e
+            end
+            @test err isa SurfaceLoweringError
+            @test occursin(msg, sprint(showerror, err))
+        end
+    end
+end
+
+@testset "flat support values vs oracles" begin
+    q = (mu = [0.5, -0.25], s = 1.3, u = 50.0, w = 2.0)
+    _, _, kern, lay = _pv_query(_PV_M7, _pv_cols())
+    @test _pv_posterior(kern, lay, q) ≈
+        _pv_m7_oracle(0.5, -0.25, 1.3, 50.0, 2.0) rtol = 1e-12
+end
+
+@testset "flat support Enzyme gradients" begin
+    _pv_enzyme_check(_PV_M7, _pv_cols(),
+        (mu = [0.5, -0.25], s = 1.3, u = 50.0, w = 2.0))
+end
+
+@testset "flat support under Reactant" begin
+    # Vector-mu M7: default pipeline (narrowed §7n scope — scalar-mu
+    # only), like the M5 leg above.
+    fx = _pv_reactant(_PV_M7, _pv_cols())
+    @test fx.primal ≈ fx.native rtol = 1e-9
+    @test fx.val ≈ fx.native rtol = 1e-12
+    @test fx.rval ≈ fx.native rtol = 1e-9
+    @test fx.rgrad ≈ fx.g rtol = 1e-8
+end
+
+# M8: centered hierarchical factor prior — `c[levels(g)] .~
+# Normal.(mu_alpha, sigma_alpha)` with sampled hypers, plus a literal
+# continuous term (the mixed-predictor shape: hyper plate over the
+# factor block, scalar node over the slope).
+const _PV_M8 = quote
+    mu_alpha ~ Normal(0, 10)
+    sigma_alpha ~ Exponential(1)
+    s ~ Exponential(1)
+    c[levels(g)] .~ Normal.(mu_alpha, sigma_alpha)
+    b ~ Normal(0, 10)
+    mu = c[g] .+ b .* x
+    y .~ Normal.(mu, s)
+end
+function _pv_m8_oracle(c::AbstractVector, b::Real, mua::Real, saa::Real,
+        s::Real)
+    pr = logpdf(Normal(0, 10), mua) + logpdf(Exponential(1), saa) +
+        logpdf(Exponential(1), s) + logpdf(Normal(0, 10), b) +
+        sum(logpdf(Normal(mua, saa), cj) for cj in c)
+    ll = sum(logpdf(Normal(c[gi] + b * x, s), y)
+        for (gi, x, y) in zip(_PV_G, _PV_X, _PV_Y))
+    return pr + ll + log(saa) + log(s)
+end
+_pv_m8_q() = (mu = [0.3, -0.4, 0.1, 0.75], mu_alpha = 0.5,
+    sigma_alpha = 1.3, s = 1.1)
+
+@testset "centered factor priors admission" begin
+    plan = lower_rkppl(_PV_M8, (:y, :x, :g))
+    row = only(p for p in plan.population_priors if p.addressee === :g)
+    @test row.family === :normal
+    @test row.location === :mu_alpha
+    @test row.scale === :sigma_alpha
+    @testset "surface gate fails closed" begin
+        cases = (
+            ("symbol nu",
+                :(StudentT.(ndf, 0, 2)),
+                "nu hyperparameter must be a literal"),
+            ("per-level vector",
+                :(Normal.([0, 0, 0], 2)),
+                "per-level priors are not in slice 1"),
+            ("computed arg",
+                :(Normal.(mu_alpha + 0, 2)),
+                "per-level priors are not in slice 1"),
+            ("scalar coef hyper",
+                :scalar,
+                "ride factor broadcasts"),
+            ("sign-flipped hyper",
+                :signflip,
+                "sign-flipped hierarchical location"),
+            ("unknown location hyper",
+                :(Normal.(nope, sigma_alpha)),
+                "must be a literal or shared-hyperparameter name"),
+            ("data location hyper",
+                :(Normal.(x, sigma_alpha)),
+                "must be a literal or shared-hyperparameter name"),
+        )
+        for (label, rhs, msg) in cases
+            err = try
+                if rhs === :scalar
+                    lower_rkppl(quote
+                            mu_alpha ~ Normal(0, 10)
+                            s ~ Exponential(1)
+                            mu = a .+ b .* x
+                            b ~ Normal(mu_alpha, 2)
+                            y .~ Normal.(mu, s)
+                        end, (:y, :x))
+                elseif rhs === :signflip
+                    lower_rkppl(quote
+                            mu_alpha ~ Normal(0, 10)
+                            sigma_alpha ~ Exponential(1)
+                            s ~ Exponential(1)
+                            c[levels(g)] .~
+                                Normal.(mu_alpha, sigma_alpha)
+                            mu = -c[g] .+ b .* x
+                            b ~ Normal(0, 10)
+                            y .~ Normal.(mu, s)
+                        end, (:y, :x, :g))
+                else
+                    lower_rkppl(quote
+                            mu_alpha ~ Normal(0, 10)
+                            sigma_alpha ~ Exponential(1)
+                            s ~ Exponential(1)
+                            c[levels(g)] .~ $rhs
+                            mu = c[g] .+ b .* x
+                            b ~ Normal(0, 10)
+                            y .~ Normal.(mu, s)
+                        end, (:y, :x, :g))
+                end
+                nothing
+            catch e
+                e
+            end
+            @test err isa SurfaceLoweringError
+            @test occursin(msg, sprint(showerror, err))
+        end
+    end
+    @testset "contract resolution fails closed" begin
+        cases = (
+            ("coef location hyper",
+                :(Normal.(b, sigma_alpha)),
+                "location hyperparameter"),
+            ("assignment scale hyper",
+                :(Normal.(mu_alpha, sc)),
+                "scale hyperparameter names a positive-support"),
+            ("real-support scale hyper",
+                :(Normal.(mu_alpha, mu_beta)),
+                "positive-support sampled parameter"),
+        )
+        for (label, rhs, msg) in cases
+            err = try
+                lower_rkppl(quote
+                        mu_alpha ~ Normal(0, 10)
+                        mu_beta ~ Normal(0, 10)
+                        sigma_alpha ~ Exponential(1)
+                        s ~ Exponential(1)
+                        sc = 1.0
+                        c[levels(g)] .~ $rhs
+                        mu = c[g] .+ b .* x
+                        b ~ Normal(0, 10)
+                        y .~ Normal.(mu, s)
+                    end, (:y, :x, :g))
+                nothing
+            catch e
+                e
+            end
+            @test err isa ContractValidationError
+            @test occursin(msg, sprint(showerror, err))
+        end
+    end
+end
+
+@testset "centered factor priors interval scale hypers" begin
+    # Non-negative intervals count (radon_county `Flat(; lower=0,
+    # upper=100)`); negative lower bounds stay rejected.
+    for hyper in (:(Flat(; lower = 0, upper = 100)), :(Uniform(0, 100)))
+        plan = lower_rkppl(quote
+                mu_alpha ~ Normal(0, 10)
+                sigma_alpha ~ $hyper
+                s ~ Exponential(1)
+                c[levels(g)] .~ Normal.(mu_alpha, sigma_alpha)
+                mu = c[g] .+ b .* x
+                b ~ Normal(0, 10)
+                y .~ Normal.(mu, s)
+            end, (:y, :x, :g))
+        row = only(p for p in plan.population_priors if p.addressee === :g)
+        @test row.scale === :sigma_alpha
+    end
+    for hyper in (:(Flat(; lower = -1, upper = 100)), :(Uniform(-1, 100)))
+        err = try
+            lower_rkppl(quote
+                    mu_alpha ~ Normal(0, 10)
+                    sigma_alpha ~ $hyper
+                    s ~ Exponential(1)
+                    c[levels(g)] .~ Normal.(mu_alpha, sigma_alpha)
+                    mu = c[g] .+ b .* x
+                    b ~ Normal(0, 10)
+                    y .~ Normal.(mu, s)
+                end, (:y, :x, :g))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ContractValidationError
+        @test occursin("positive-support sampled parameter",
+            sprint(showerror, err))
+    end
+end
+
+@testset "centered factor priors values vs oracles" begin
+    _, _, kern, lay = _pv_query(_PV_M8, _pv_gcols())
+    @test _pv_posterior(kern, lay, _pv_m8_q()) ≈
+        _pv_m8_oracle([0.3, -0.4, 0.1], 0.75, 0.5, 1.3, 1.1) rtol = 1e-12
+end
+
+@testset "centered factor priors Enzyme gradients" begin
+    _pv_enzyme_check(_PV_M8, _pv_gcols(), _pv_m8_q())
+end
+
+@testset "centered factor priors under Reactant" begin
+    # Vector-mu M8: default pipeline (narrowed §7n scope — scalar-mu
+    # only).
+    fx = _pv_reactant(_PV_M8, _pv_gcols())
+    @test fx.primal ≈ fx.native rtol = 1e-9
+    @test fx.val ≈ fx.native rtol = 1e-12
+    @test fx.rval ≈ fx.native rtol = 1e-9
+    @test fx.rgrad ≈ fx.g rtol = 1e-8
+end
+
+# M9: mixed flat intercept + Normal slope — regression for the mixed
+# scalar offset bug (a flat `continue` skipped the design-position
+# accumulation, so every later prior read the wrong coefficient).
+const _PV_M9 = quote
+    a ~ Flat()
+    b ~ Normal(0, 2)
+    s ~ Exponential(1)
+    mu = a .+ b .* x
+    y .~ Normal.(mu, s)
+end
+_pv_m9_oracle(a::Real, b::Real, s::Real) =
+    logpdf(Normal(0, 2), b) + logpdf(Exponential(1), s) +
+    _pv_gauss_ll(a, b, s) + log(s)
+
+@testset "mixed flat scalar offset values vs oracles" begin
+    _, _, kern, lay = _pv_query(_PV_M9, _pv_cols())
+    # a ≠ b, so a misaligned prior read cannot hide.
+    @test _pv_posterior(kern, lay, (mu = [0.5, -0.25], s = 1.3)) ≈
+        _pv_m9_oracle(0.5, -0.25, 1.3) rtol = 1e-12
+end
+
+@testset "mixed flat scalar offset Enzyme gradients" begin
+    _pv_enzyme_check(_PV_M9, _pv_cols(), (mu = [0.5, -0.25], s = 1.3))
+end
+
+@testset "mixed flat scalar offset under Reactant" begin
+    fx = _pv_reactant(_PV_M9, _pv_cols())
+    @test fx.primal ≈ fx.native rtol = 1e-9
+    @test fx.val ≈ fx.native rtol = 1e-12
+    @test fx.rval ≈ fx.native rtol = 1e-9
+    @test fx.rgrad ≈ fx.g rtol = 1e-8
+end
+
+# M10: uniform coefficients (the dogs_log shape) — flat intercept +
+# two interval slopes. The layout splits the block into transform runs
+# and the generator reassembles it; priors are -log(width) per coef.
+const _PV_M10 = quote
+    a ~ Flat()
+    b1 ~ Uniform(-100, 0)
+    b2 ~ Uniform(0, 100)
+    mu = a .+ b1 .* x .+ b2 .* z
+    y .~ BernoulliLogit.(mu)
+end
+const _PV_Z = [3.0, 2.0, 1.0, 0.5, 1.5, 2.5]
+const _PV_YB = [true, false, true, true, false, true]
+_pv_m10_cols() = Dict{Symbol,AbstractVector}(
+    :y => copy(_PV_YB), :x => copy(_PV_X), :z => copy(_PV_Z))
+function _pv_m10_oracle(a::Real, b1::Real, b2::Real)
+    pr = -log(100.0) - log(100.0)
+    eta = a .+ b1 .* _PV_X .+ b2 .* _PV_Z
+    ll = sum(logpdf.(Bernoulli.(1 ./ (1 .+ exp.(-eta))), _PV_YB))
+    jac = _pv_interval_logjac(-100, 0, b1) + _pv_interval_logjac(0, 100, b2)
+    return pr + ll + jac
+end
+_pv_m10_q() = (mu = [0.5, -1.0, 2.0],)
+
+@testset "uniform coefficients admission" begin
+    plan = lower_rkppl(_PV_M10, (:y, :x, :z))
+    rows = Dict(p.addressee => p for p in plan.population_priors)
+    @test rows[:x].family === :uniform
+    @test (rows[:x].location, rows[:x].scale) == (-100.0, 0.0)
+    @test rows[:z].family === :uniform
+    @test (rows[:z].location, rows[:z].scale) == (0.0, 100.0)
+    bound = bind_data(plan, _pv_m10_cols())
+    lay = assign_layout(bound)
+    coefs = [e for e in lay.entries if e.kind === :coefficient]
+    @test length(coefs) == 3
+    @test [e.transform for e in coefs] == [:identity, :interval, :interval]
+    @test [(e.lo, e.hi) for e in coefs[2:3]] ==
+        [(-100.0, 0.0), (0.0, 100.0)]
+    @test coordinate_names(lay) ==
+        [Symbol("mu.Intercept"), Symbol("mu.x"), Symbol("mu.z")]
+    # Uniform factor broadcast lowers with literal bounds.
+    fplan = lower_rkppl(quote
+            c[levels(g)] .~ Uniform.(0, 10)
+            mu = c[g]
+            y .~ Normal.(mu, 1.5)
+        end, (:y, :g))
+    frow = only(p for p in fplan.population_priors if p.addressee === :g)
+    @test frow.family === :uniform
+    @test (frow.location, frow.scale) == (0.0, 10.0)
+    @testset "bounds gate fails closed" begin
+        scalar_cases = (
+            ("scalar hyper bound",
+                :(Uniform(lo, 3)),
+                SurfaceLoweringError,
+                "must be a literal"),
+            ("scalar inverted",
+                :(Uniform(10, 5)),
+                ContractValidationError,
+                "lo < hi"),
+            ("scalar infinite",
+                :(Uniform(0, Inf)),
+                ContractValidationError,
+                "lo < hi"),
+        )
+        for (label, rhs, ex, msg) in scalar_cases
+            err = try
+                lower_rkppl(quote
+                        a ~ Flat()
+                        b ~ $rhs
+                        mu = a .+ b .* x
+                        y .~ Normal.(mu, 1.5)
+                    end, (:y, :x))
+                nothing
+            catch e
+                e
+            end
+            @test err isa ex
+            @test occursin(msg, sprint(showerror, err))
+        end
+        broad_cases = (
+            ("broadcast hyper bound",
+                :(Uniform.(lo, 3)),
+                SurfaceLoweringError,
+                "bounds must be finite literals"),
+            ("broadcast inverted",
+                :(Uniform.(10, 5)),
+                ContractValidationError,
+                "lo < hi"),
+        )
+        for (label, rhs, ex, msg) in broad_cases
+            err = try
+                lower_rkppl(quote
+                        c[levels(g)] .~ $rhs
+                        mu = c[g]
+                        y .~ Normal.(mu, 1.5)
+                    end, (:y, :g))
+                nothing
+            catch e
+                e
+            end
+            @test err isa ex
+            @test occursin(msg, sprint(showerror, err))
+        end
+    end
+end
+
+@testset "uniform coefficients values vs oracles" begin
+    _, _, kern, lay = _pv_query(_PV_M10, _pv_m10_cols())
+    @test _pv_posterior(kern, lay, _pv_m10_q()) ≈
+        _pv_m10_oracle(0.5, -1.0, 2.0) rtol = 1e-12
+end
+
+@testset "uniform coefficients Enzyme gradients" begin
+    _pv_enzyme_check(_PV_M10, _pv_m10_cols(), _pv_m10_q())
+end
+
+@testset "uniform coefficients under Reactant" begin
+    fx = _pv_reactant(_PV_M10, _pv_m10_cols())
+    @test fx.primal ≈ fx.native rtol = 1e-9
+    @test fx.val ≈ fx.native rtol = 1e-12
+    @test fx.rval ≈ fx.native rtol = 1e-9
+    @test fx.rgrad ≈ fx.g rtol = 1e-8
 end
 

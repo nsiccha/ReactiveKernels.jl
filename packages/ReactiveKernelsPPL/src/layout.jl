@@ -106,6 +106,56 @@ struct LayoutTable
 end
 
 """
+    _coefficient_runs(plan, pred, shape) -> Vector{NamedTuple}
+
+Maximal transform runs over a predictor's design positions: uniform
+prior rows mark interval elements (bounds from the row — validated
+finite lo < hi by the time layout runs); everything else, including
+blocks with no prior row, is identity. Each run is `(labels,
+transform, lo, hi)` with per-position labels in design order.
+"""
+function _coefficient_runs(plan::StructuralPlan, pred, shape)
+    rows = Dict{Symbol,PopulationPrior}()
+    for pr in plan.population_priors
+        pr.predictor === pred.name || continue
+        rows[pr.addressee] = pr
+    end
+    runs = NamedTuple{(:labels, :transform, :lo, :hi),
+        Tuple{Vector{Symbol},Symbol,Float64,Float64}}[]
+    pushkey(lab, tr, lo, hi) = begin
+        if !isempty(runs) && runs[end].transform === tr &&
+                (tr === :identity ||
+                    (runs[end].lo == lo && runs[end].hi == hi))
+            push!(runs[end].labels, lab)
+        else
+            push!(runs, (labels = [lab], transform = tr, lo = lo, hi = hi))
+        end
+    end
+    for b in shape.blocks
+        b.width == 0 && continue
+        if b.kind === MatrixTerm
+            for (e, lab) in zip(b.elements, b.labels)
+                addr = e === nothing ? :Intercept : e
+                pushkey(lab, _coef_position_key(rows, addr)...)
+            end
+        else
+            for lab in b.labels
+                pushkey(lab, _coef_position_key(rows, b.addressee)...)
+            end
+        end
+    end
+    return runs
+end
+
+function _coef_position_key(rows::Dict{Symbol,PopulationPrior}, addr::Symbol)
+    pr = get(rows, addr, nothing)
+    pr === nothing && return (:identity, NaN, NaN)
+    pr.family === :uniform &&
+        return (:interval, Float64(pr.location), Float64(pr.scale))
+    return (:identity, NaN, NaN)
+end
+
+"""
     assign_layout(plan) -> LayoutTable
 
 Assign packed coordinates: coefficient blocks in `plan.predictors` order,
@@ -124,14 +174,31 @@ function assign_layout(plan::StructuralPlan)
         isempty(_horseshoe_for(plan, pred.name)) || continue
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
-        labels = Symbol[]
-        for b in shape.blocks
-            append!(labels, b.labels)
+        runs = _coefficient_runs(plan, pred, shape)
+        if isempty(runs) ||
+                (length(runs) == 1 && runs[1].transform === :identity)
+            labels = Symbol[]
+            for b in shape.blocks
+                append!(labels, b.labels)
+            end
+            push!(entries,
+                LayoutEntry(:coefficient, pred.name, block_name(pred.name),
+                    labels, offset, shape.width, :identity))
+            offset += shape.width
+            continue
         end
-        push!(entries,
-            LayoutEntry(:coefficient, pred.name, block_name(pred.name), labels,
-                offset, shape.width, :identity))
-        offset += shape.width
+        # Split block: one entry per maximal transform run (uniform
+        # coefficients carry per-run interval bounds); the generator
+        # reassembles the block name by offset order
+        # (`_coef_reassembly_statements`).
+        for (i, run) in enumerate(runs)
+            seg = Symbol(string(block_name(pred.name)) * "__s" * string(i))
+            push!(entries,
+                LayoutEntry(:coefficient, pred.name, seg, run.labels,
+                    offset, length(run.labels), run.transform, run.lo,
+                    run.hi))
+            offset += length(run.labels)
+        end
     end
     # GLM-object coefficient vectors: one contiguous identity block per
     # response matrix (Normal priors on the real line). Width is static
@@ -804,14 +871,53 @@ correlated draws `b_<suffix>` (G×K, SB `(diag_pre_multiply(tau,L)*z)'`
 output mapping, and future prediction; the generator emits the
 in-graph equivalent.
 """
+# Coefficient entries grouped by predictor in offset order (split
+# blocks reassemble to one predictor vector in design order).
+function _coefficient_groups(layout::LayoutTable)
+    groups = Dict{Symbol,Vector{LayoutEntry}}()
+    for e in layout.entries
+        e.kind === :coefficient || continue
+        p = e.predictor::Symbol
+        push!(get!(groups, p, LayoutEntry[]), e)
+    end
+    for g in values(groups)
+        sort!(g; by = e -> e.offset)
+    end
+    return groups
+end
+
+# One predictor's constrained coefficient vector from its entries:
+# identity runs copy through, interval runs constrain per element.
+function _constrain_coefficient(entries::Vector{LayoutEntry}, u)
+    if length(entries) == 1 && entries[1].transform === :identity
+        e = entries[1]
+        return Vector{Float64}(u[e.offset:(e.offset + e.size - 1)])
+    end
+    out = Float64[]
+    for e in entries
+        seg = u[e.offset:(e.offset + e.size - 1)]
+        if e.transform === :identity
+            append!(out, Float64.(seg))
+        else
+            append!(out, [_constrain_elt(e, Float64(x)) for x in seg])
+        end
+    end
+    return out
+end
+
 function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     length(u) == layout.total ||
         throw(ContractValidationError("[layout] unconstrained length $(length(u)) ≠ $(layout.total)"))
     pairs = Pair{Symbol,Any}[]
+    coef_groups = _coefficient_groups(layout)
+    seen_coef = Set{Symbol}()
     for e in layout.entries
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :coefficient
-            push!(pairs, e.predictor => Vector{Float64}(seg))
+            p = e.predictor::Symbol
+            p in seen_coef && continue
+            push!(seen_coef, p)
+            push!(pairs, p => _constrain_coefficient(coef_groups[p], u))
         elseif e.kind === :plate || e.kind === :spline ||
                e.kind === :varying || e.kind === :hsgp || e.kind === :glm
             v = [_constrain_elt(e, Float64(x)) for x in seg]
@@ -897,16 +1003,35 @@ Inverse of [`constrain`](@ref): named values → packed unconstrained vector.
 """
 function unconstrain(layout::LayoutTable, nt::NamedTuple)
     u = Vector{Float64}(undef, layout.total)
+    coef_groups = _coefficient_groups(layout)
+    seen_coef = Set{Symbol}()
     for e in layout.entries
         if e.kind === :coefficient
-            haskey(nt, e.predictor) || throw(
-                ContractValidationError("[layout] missing predictor $(e.predictor)"),
+            p = e.predictor::Symbol
+            p in seen_coef && continue
+            push!(seen_coef, p)
+            haskey(nt, p) || throw(
+                ContractValidationError("[layout] missing predictor $p"),
             )
-            v = nt[e.predictor]
-            length(v) == e.size || throw(
-                ContractValidationError("[layout] predictor $(e.predictor) length mismatch"),
+            v = nt[p]
+            entries = coef_groups[p]
+            total = sum(e2.size for e2 in entries)
+            length(v) == total || throw(
+                ContractValidationError("[layout] predictor $p length mismatch"),
             )
-            u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
+            pos = 1
+            for e2 in entries
+                seg = v[pos:(pos + e2.size - 1)]
+                if e2.transform === :identity
+                    u[e2.offset:(e2.offset + e2.size - 1)] .= Float64.(seg)
+                else
+                    for (k, x) in enumerate(seg)
+                        u[e2.offset + k - 1] =
+                            _unconstrain_elt(e2, Float64(x))
+                    end
+                end
+                pos += e2.size
+            end
         elseif e.kind === :plate || e.kind === :spline ||
                e.kind === :varying || e.kind === :hsgp || e.kind === :glm
             what = e.kind === :plate ? "plate parameter" :
@@ -1084,16 +1209,38 @@ sampled entry (`:exp`/`:logistic`) splices the bijector's `constrain` endpoint,
 which the planner inlines.
 """
 function transform_statements(e::LayoutEntry)
-    if e.kind === :coefficient || e.kind === :scan
-        # both are identity array slices read into `e.name` (a coefficient
-        # block name, a scan-state slice, a non-centered scan's
-        # `_ppl_scan_z_<state>` innovation slice, or a dar trajectory's
-        # `_ppl_dar_z_<state>` slice — the emitter reconstructs from the
-        # innovation slices)
+    if e.kind === :scan
+        # scan-state slices read a view into `e.name` (a scan-state slice,
+        # a non-centered scan's `_ppl_scan_z_<state>` innovation slice, or
+        # a dar trajectory's `_ppl_dar_z_<state>` slice — the emitter
+        # reconstructs from the innovation slices)
         lo = e.offset
         hi = e.offset + e.size - 1
         return Expr[:($(e.name)::AbstractVector{Float64} =
             view(unconstrained, $lo:$hi))]
+    end
+    if e.kind === :coefficient
+        # Coefficient runs: identity runs read a view; interval runs
+        # (uniform coefficients) hand-roll the broadcast constrain edge
+        # with the IDENTICAL math to the host `_*_elt` path (mirroring
+        # the plate `:interval` arm below).
+        lo = e.offset
+        hi = e.offset + e.size - 1
+        view_read = :(view(unconstrained, $lo:$hi))
+        e.transform === :identity &&
+            return Expr[:($(e.name)::AbstractVector{Float64} = $view_read)]
+        e.transform === :interval || throw(ContractValidationError(
+            "[layout] coefficient block $(e.name) has no transform rule " *
+            "for $(e.transform) (admitted: :identity, :interval)"))
+        u = Symbol(:_ppl_int_, e.name)
+        blo, bhi = e.lo, e.hi
+        return Expr[
+            :($u::AbstractVector{Float64} = $view_read),
+            :($(e.name)::AbstractVector{Float64} =
+                $blo .+ ($bhi - $blo) ./ (1 .+ exp.(-$u))),
+            :($u::AbstractVector{Float64} =
+                log.($(e.name) .- $blo) .- log.($bhi .- $(e.name))),
+        ]
     end
     if e.kind === :plate || e.kind === :spline ||
        e.kind === :varying || e.kind === :hsgp || e.kind === :glm
@@ -1357,7 +1504,15 @@ partial temps, shared with the constrain edges).
 function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing
     if e.kind === :coefficient
-        throw(ContractValidationError("[layout] non-identity coefficient block"))
+        # Interval runs (uniform coefficients) hand-roll the per-cell
+        # Jacobian sum — the same expression as the host `_logjac_elt`
+        # path, so no companion `logjac` plate is emitted.
+        e.transform === :interval || throw(ContractValidationError(
+            "[layout] coefficient block $(e.name) has no Jacobian rule " *
+            "for $(e.transform) (admitted: :identity, :interval)"))
+        blo, bhi = e.lo, e.hi
+        return :(sum(log.($(e.name) .- $blo) .+ log.($bhi .- $(e.name)) .-
+                     log($bhi - $blo)))
     end
     if e.kind === :varying_corr || e.kind === :cholesky_corr
         K = _lkj_dim(e.size)

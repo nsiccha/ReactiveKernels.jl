@@ -63,6 +63,7 @@ include("test_joint_parity.jl")
 include("test_reactant_joint.jl")
 include("test_leveled_reactant.jl")
 include("test_prior_vocab.jl")
+include("test_derived_response.jl")
 
 @testset "package skeleton" begin
     @test isdefined(ReactiveKernelsPPL, :ReactiveKernels)
