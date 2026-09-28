@@ -7316,7 +7316,11 @@ function _validate_responses(plan::StructuralPlan)
         # Bernoulli/Binomial-logit and Poisson-log over a scalar
         # parameter. Evidence stays fail-closed (the cdf arms are
         # link-space); weights/range ride the generic machinery.
-        if any(p -> p.name === r.predictor, plan.parameters)
+        # Prob-space families skip this gate — they carry their own
+        # location validation in the dedicated arms below.
+        if any(p -> p.name === r.predictor, plan.parameters) &&
+                r.family !== BinomialProbFam &&
+                r.family !== ZeroInflatedBinomialFam
             ((r.family === BernoulliLogitFam ||
                 r.family === BinomialLogitFam) &&
                 r.link === LogitLink) ||
