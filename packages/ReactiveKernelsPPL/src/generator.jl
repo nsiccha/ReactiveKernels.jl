@@ -44,6 +44,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     for e in layout.entries
         append!(stmts, transform_statements(e))
     end
+    append!(stmts, _coef_reassembly_statements(plan, layout))
     append!(stmts, _assignment_statements(plan))
     append!(stmts, preprocessing_recipes(plan))
     append!(stmts, _varying_statements(plan))
@@ -61,6 +62,28 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     sig = Expr(:call, name, :(unconstrained::Vector{Float64}),
         (_data_arg(colname, col) for (colname, col) in _ordered_columns(plan))...)
     return Expr(:(=), sig, Expr(:block, stmts...))
+end
+
+# Reassemble split coefficient blocks: predictors whose layout holds
+# several `:coefficient` entries (identity/interval runs from uniform
+# priors) rejoin into the block name by offset order. Single-entry
+# predictors emit nothing (their entry already binds the block name).
+# Every segment is materialized with `Float64.(…)`: a `vcat` mixing a
+# `SubArray` and a `Vector` lowers through a Union-typed path the
+# native Enzyme reverse pass rejects (same rule as the leveled vector
+# edges in `_vector_transform_statements`).
+function _coef_reassembly_statements(plan::StructuralPlan, layout::LayoutTable)
+    stmts = Expr[]
+    for pred in plan.predictors
+        segs = [e for e in layout.entries
+            if e.kind === :coefficient && e.predictor === pred.name]
+        length(segs) <= 1 && continue
+        sort!(segs; by = e -> e.offset)
+        mats = [:(Float64.($(s.name))) for s in segs]
+        push!(stmts, :($(block_name(pred.name))::AbstractVector{Float64} =
+            vcat($(mats...))))
+    end
+    return stmts
 end
 
 _ordered_columns(plan::StructuralPlan) =
@@ -2681,16 +2704,47 @@ end
 
 # One homogeneous coefficient plate over `coefaccess` (the block symbol or
 # a static-range slice) with per-lane (location, scale[, nu]) vectors.
+# A lane is a `Vector{Float64}` (literal lane, bound here) or a `Symbol`
+# (shared hyperparameter, aliased here and threaded as a plate scalar —
+# RK auto-threads an unthreaded signature scalar read by the cell — so
+# the centered shape keeps one plate, O(1) in levels).
 # The cell is the table-driven endpoint splice; only the 2-vs-3 arg
-# plate shape differs (StudentT threads a nu vector).
+# plate shape differs (StudentT threads a nu vector; nu is always a
+# literal — validation pins it).
+# Bind one plate-prior lane: a literal lane vector, or a shared-hyper
+# alias (the hyper name reads its constrained value — transforms and
+# assignments all precede the prior statements in the generated body).
+_bind_plate_prior_arg!(stmts::Vector{Expr}, name::Symbol,
+    v::Vector{Float64}) = push!(stmts, :($name = Float64[$(v...)]))
+_bind_plate_prior_arg!(stmts::Vector{Expr}, name::Symbol, v::Symbol) =
+    push!(stmts, :($name = $v))
+
+# Collapse one prior-arg position across a block's rows to its plate
+# lane: all-literal rows give the literal lane vector; rows sharing one
+# hyper name give the name; anything else (mixed literal/hyper,
+# disagreeing hypers) is a loud internal error — the surface admits
+# shared hypers on factor broadcasts only.
+function _plate_prior_lane(rows::Vector{PopulationPrior}, field::Symbol,
+        what::String)
+    vals = map(r -> getfield(r, field), rows)
+    all(v -> v isa Real, vals) &&
+        return Float64[v for v in vals]
+    all(v -> v isa Symbol, vals) && allequal(vals) &&
+        return vals[1]
+    throw(ContractValidationError(
+        "[generator] internal: $what mixes literal and hyperparameter " *
+        "priors across one coefficient block (shared hypers ride " *
+        "factor broadcasts only)"))
+end
+
 function _append_coef_plate!(stmts::Vector{Expr}, coefaccess::Any,
         node::Symbol, pw::Symbol, mut::Symbol, sdt::Symbol, nut::Symbol,
-        loc::Vector{Float64}, sca::Vector{Float64}, nus::Vector{Float64},
-        fam::Symbol)
+        loc::Union{Vector{Float64},Symbol}, sca::Union{Vector{Float64},Symbol},
+        nus::Vector{Float64}, fam::Symbol)
     fam === :flat && throw(ContractValidationError(
         "[generator] internal: flat coefficients contribute no plate"))
-    push!(stmts, :($mut = Float64[$(loc...)]))
-    push!(stmts, :($sdt = Float64[$(sca...)]))
+    _bind_plate_prior_arg!(stmts, mut, loc)
+    _bind_plate_prior_arg!(stmts, sdt, sca)
     if fam === :student_t
         push!(stmts, :($nut = Float64[$(nus...)]))
         cv, nuv, mv, sv = _dovar(1), _dovar(2), _dovar(3), _dovar(4)
@@ -2742,13 +2796,24 @@ function _mixed_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
                 "[generator] internal: mixed-prior scalar block " *
                 "$(b.addressee) of $(pred.name) has width $(b.width)"))
             pr = by_addressee[b.addressee]
-            pr.family === :flat && continue
-            node = Symbol(:_ppl_prior_, pred.name, :_, b.addressee)
-            expr = _family_logpdf_expr(pr.family,
-                _population_endpoint_args(pr),
-                Expr(:ref, coef, offset + 1))
-            push!(stmts, :($node::Float64 = $expr))
-            push!(terms, node)
+            # Flat scalars contribute no node but still occupy their
+            # design position — the offset accumulates below for every
+            # block (a `continue` here would misalign every later
+            # read).
+            if pr.family !== :flat
+                (pr.location isa Real && pr.scale isa Real) ||
+                    throw(ContractValidationError(
+                        "[generator] internal: scalar coefficient " *
+                        "$(b.addressee) of $(pred.name) carries a " *
+                        "hyperparameter prior (shared hypers ride " *
+                        "factor broadcasts only)"))
+                node = Symbol(:_ppl_prior_, pred.name, :_, b.addressee)
+                expr = _family_logpdf_expr(pr.family,
+                    _population_endpoint_args(pr),
+                    Expr(:ref, coef, offset + 1))
+                push!(stmts, :($node::Float64 = $expr))
+                push!(terms, node)
+            end
         end
         offset += b.width
     end
@@ -2768,8 +2833,9 @@ function _mixed_wide_block_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     nut = Symbol(:_ppl_prnu_, pname, :_, tag)
     slice = Expr(:ref, coef,
         Expr(:call, :(:), offset + 1, offset + b.width))
-    loc = [Float64(r.location) for r in elrows]
-    sca = [Float64(r.scale) for r in elrows]
+    what = "$(b.kind) block $tag of $pname"
+    loc = _plate_prior_lane(elrows, :location, what)
+    sca = _plate_prior_lane(elrows, :scale, what)
     nus = [Float64(r.nu) for r in elrows]
     _append_coef_plate!(stmts, slice, node, pw, mut, sdt, nut, loc, sca,
         nus, fam)
@@ -2796,7 +2862,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
         if rp === nothing
             specs = coefficient_prior_specs(shape, plan.population_priors)
             fams = map(s -> s.family, specs)
-            if all(==(fams[1]), fams) && fams[1] !== :flat
+            alllit = all(s -> s.location isa Real && s.scale isa Real, specs)
+            if all(==(fams[1]), fams) && fams[1] !== :flat && alllit
                 # Homogeneous fast path: today's exact plate, family cell.
                 nut = Symbol(:_ppl_prnu_, pred.name)
                 loc = [Float64(s.location) for s in specs]
@@ -2840,6 +2907,11 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
             i = findfirst(p -> p.predictor === r.label && p.addressee === c,
                 plan.population_priors)
             pr = plan.population_priors[i]
+            (pr.location isa Real && pr.scale isa Real) ||
+                throw(ContractValidationError(
+                    "[generator] internal: GLM beta prior for " *
+                    "$(r.label).$c carries a hyperparameter " *
+                    "(hierarchical GLM priors are not in slice 1)"))
             push!(loc, Float64(pr.location))
             push!(sca, Float64(pr.scale))
         end
@@ -3057,6 +3129,7 @@ function _sd_prior_shape(p::VaryingSdPrior)
     p.family === :std_normal && return (:normal, (arg1 = 0.0, arg2 = 1.0))
     p.family === :exponential && return (:exponential, (arg1 = p.param,))
     p.family === :normal && return (:normal, (arg1 = 0.0, arg2 = p.param))
+    p.family === :cauchy && return (:cauchy, (arg1 = 0.0, arg2 = p.param))
     throw(ContractValidationError("[generator] sd prior family " *
         "$(repr(p.family)) is not one of $(_SD_PRIOR_FAMILIES) " *
         "(validate_plan proves this)"))
@@ -3117,7 +3190,7 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     tv = _dovar(1)
     argvals = Any[_thread_ref!(inputs, v) for v in values(args)]
     cell = _family_logpdf_expr(family, argvals, tv)
-    corr = _support_correction(support, argvals)
+    corr = _support_correction(family, support, argvals)
     corr === nothing || (cell = :($cell + $corr))
     append!(stmts, _plate_sum_stmts(pw, node, inputs, cell))
     push!(terms, node)
@@ -3163,11 +3236,13 @@ end
 # do-vars for a plate prior — the CDF endpoints thread identically);
 # `(:interval_stan, lo, hi)` adds NOTHING — Stan's two-sided-bound kernel
 # is the plain normal_lpdf plus the bare-`u` Jacobian (the dar-beta
-# precedent: SB truncation never renormalizes);
+# precedent: SB truncation never renormalizes) — and neither does
+# `:flat`, which is improper (Jacobian only, no renormalization,
+# matching Stan lower/interval-bound kernel semantics);
 # `(:upper, hi)` adds NOTHING — Stan's upper-bound kernel is the plain
 # normal_lpdf plus the bare-`u` Jacobian (the varying-`tau`/`:floored`
 # precedent: SB truncation never renormalizes).
-function _support_correction(ov::SupportOverride, argvals)
+function _support_correction(family::Symbol, ov::SupportOverride, argvals)
     ov === nothing && return nothing
     ov === :positive_stan && return nothing  # Stan kernel semantics
     if ov isa Tuple
@@ -3175,6 +3250,7 @@ function _support_correction(ov::SupportOverride, argvals)
         ov[1] === :interval || throw(ContractValidationError(
             "[generator] tuple support override must be (:interval, lo, hi), " *
             "(:interval_stan, lo, hi), or (:upper, hi), got $ov"))
+        family === :flat && return nothing  # improper: Jacobian only
         lo, hi = ov[2], ov[3]
         mu, s = argvals[1], argvals[2]
         return :(-log(normal($mu, $s).cdf($hi) - normal($mu, $s).cdf($lo)))
@@ -3193,7 +3269,7 @@ end
 function _sampled_prior_expr(p::SampledParameter)
     argvals = [v for v in values(p.args)]
     base = _family_logpdf_expr(p.family, argvals, p.name)
-    corr = _support_correction(p.support_override, argvals)
+    corr = _support_correction(p.family, p.support_override, argvals)
     corr === nothing && return base
     return :($base + $corr)
 end

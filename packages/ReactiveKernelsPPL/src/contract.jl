@@ -470,27 +470,30 @@ Per-addressee population prior addressed by `(predictor,
 column|:Intercept)`. `family` is one of [`POPULATION_FAMILIES`](@ref)
 (`:flat` contributes 0.0 — StanBlocks flat-token parity — and ignores
 location/scale/nu); `nu` is the StudentT degrees of freedom (`NaN`
-otherwise). A factor source column address applies one shared prior
-across its full-rank level block (one coefficient per mapped level); a
-matrix broadcast applies one shared family with per-element
-locations/scales. The 4-arg form is Normal. The emitter fills
-`Normal(0,1)` defaults so coverage is complete by construction —
-except factor coefficients, whose broadcast prior also sizes the block
-and is therefore required, never defaulted.
+otherwise, always a literal). A factor source column address applies
+one shared prior across its full-rank level block (one coefficient per
+mapped level); a matrix broadcast applies one shared family with
+per-element locations/scales. `location`/`scale` are literals or
+sampled-hyperparameter names (the centered-hierarchical shape:
+validation pins a scalar sampled parameter or scalar assignment for a
+location, a positive-support sampled parameter for a scale). The 4-arg
+form is Normal. The emitter fills `Normal(0,1)` defaults so coverage is
+complete by construction — except factor coefficients, whose broadcast
+prior also sizes the block and is therefore required, never defaulted.
 """
 struct PopulationPrior
     predictor::Symbol
     addressee::Symbol
     family::Symbol
-    location::Real
-    scale::Real
+    location::Union{Real,Symbol}
+    scale::Union{Real,Symbol}
     nu::Real
 end
-PopulationPrior(predictor::Symbol, addressee::Symbol, location::Real,
-    scale::Real) = PopulationPrior(predictor, addressee, :normal,
-    location, scale, NaN)
+PopulationPrior(predictor::Symbol, addressee::Symbol,
+    location::Union{Real,Symbol}, scale::Union{Real,Symbol}) =
+    PopulationPrior(predictor, addressee, :normal, location, scale, NaN)
 PopulationPrior(predictor::Symbol, addressee::Symbol, family::Symbol,
-    location::Real, scale::Real) =
+    location::Union{Real,Symbol}, scale::Union{Real,Symbol}) =
     PopulationPrior(predictor, addressee, family, location, scale, NaN)
 
 """
@@ -688,6 +691,9 @@ block — the SB `brm_ranef_sd` per-margin codes in native form:
   SB `rate` inverts once at the boundary, `θ = 1 / rate`).
 - `:normal` — SB family 2 (`sd ~ Normal(0, sd)`): `param` is the standard
   deviation `σ`.
+- `:cauchy` — RK extension, no SB code (`sd ~ Cauchy(0, σ)`): `param` is
+  the scale `σ` (Stan-kernel, no `+log2` — the posteriordb
+  eight-schools-noncentered `tau ~ Cauchy(0, 5)` shape).
 
 An empty `sd_priors` vector (the default) is all-`:std_normal`: SB's
 unconfigured prior, emitted exactly as before.
@@ -700,7 +706,7 @@ end
 VaryingSdPrior(family::Symbol, param::Real) =
     VaryingSdPrior(family, Float64(param))
 
-const _SD_PRIOR_FAMILIES = (:std_normal, :exponential, :normal)
+const _SD_PRIOR_FAMILIES = (:std_normal, :exponential, :normal, :cauchy)
 
 """
     VaryingMultiMembership(groups, weights, normalize)
@@ -1559,7 +1565,7 @@ const SAMPLED_SUPPORT = Dict{Symbol,Symbol}(
 
 """Admitted per-addressee population-prior families (prior-vocab slice)."""
 const POPULATION_FAMILIES =
-    (:normal, :student_t, :cauchy, :laplace, :logistic, :flat)
+    (:normal, :student_t, :cauchy, :laplace, :logistic, :flat, :uniform)
 
 """Real-support families symmetric about their location: a `:positive`
 half at a literal-zero location renormalizes by exactly `+log(2)`."""
@@ -4452,11 +4458,16 @@ function _check_name_hygiene(n::Symbol)
 end
 
 function _validate_column_names(plan::StructuralPlan)
+    # Derived responses bind-materialize into the columns (their bound
+    # values ARE the response data), so response-named derived columns
+    # are exempt from the overlap rule; every other derived name still
+    # collides (a caller column the model derives is a shadowing bug).
+    resps = Set{Symbol}(r.response for r in plan.responses)
     col_overlap = filter(
         n -> haskey(plan.columns, n),
         union([p.name for p in plan.parameters],
             [a.name for a in plan.assignments],
-            [d.name for d in plan.derived],
+            [d.name for d in plan.derived if d.name ∉ resps],
             [p.name for p in plan.plate_parameters]),
     )
     isempty(col_overlap) || _fail(
@@ -4870,9 +4881,11 @@ function _validate_support_override(label, family::Symbol,
         if ov[1] === :upper
             length(ov) == 2 || _fail(label,
                 "tuple support override must be (:upper, hi), got $ov")
-            family === :normal || _fail(label,
-                "an :upper override is a truncated Normal in slice 1 " *
-                "(`truncated(Normal(mu, s), -Inf, hi)`); got $family")
+            (family === :normal || family === :flat) || _fail(label,
+                "an :upper override is a truncated Normal or an " *
+                "upper-bounded flat in slice 1 " *
+                "(`truncated(Normal(mu, s), -Inf, hi)` / " *
+                "`Flat(; upper=hi)`); got $family")
             hi = ov[2]
             isfinite(hi) || _fail(label,
                 ":upper bound must be finite; got $hi")
@@ -4883,9 +4896,11 @@ function _validate_support_override(label, family::Symbol,
             length(ov) == 3) || _fail(label,
             "tuple support override must be (:interval, lo, hi), " *
             "(:interval_stan, lo, hi), or (:upper, hi); got $ov")
-        family === :normal || _fail(label,
-            "an $head override is a truncated Normal in slice 1 " *
-            "(`truncated(Normal(mu, s), lo, hi)`); got $family")
+        (family === :normal || family === :flat) || _fail(label,
+            "an $head override is a truncated Normal or a " *
+            "flat-on-an-interval in slice 1 " *
+            "(`truncated(Normal(mu, s), lo, hi)` / " *
+            "`Flat(; lower=lo, upper=hi)`); got $family")
         lo, hi = ov[2], ov[3]
         (isfinite(lo) && isfinite(hi)) || _fail(label,
             "$head bounds must be finite (a one-sided or half truncation " *
@@ -4897,6 +4912,16 @@ function _validate_support_override(label, family::Symbol,
     (ov === :positive || ov === :positive_stan) ||
         _fail(label, "support override must be :positive or " *
               ":positive_stan, got $ov")
+    if family === :flat
+        # Flat is improper (density 0.0, Jacobian only): only the
+        # kernel half applies — a proper :positive would renormalize a
+        # density flat does not have.
+        ov === :positive_stan || _fail(label,
+            "a flat takes :positive_stan (`Flat(; lower=0)`), not " *
+            ":positive (proper halves renormalize a density flat " *
+            "does not have)")
+        return nothing
+    end
     family in SYMMETRIC_SAMPLED_FAMILIES || _fail(label,
         "$ov override only applies to symmetric real-support families " *
         "($(join(SYMMETRIC_SAMPLED_FAMILIES, ", "))); got $family")
@@ -5756,6 +5781,24 @@ function _validate_levelmaps_data(plan::StructuralPlan)
     return nothing
 end
 
+# Whether a sampled parameter is provably positive for the scale-hyper
+# role: `:positive` support, or an `:interval` whose lower bound is a
+# non-negative literal (override tuple or the uniform family's own
+# args — non-literal bounds fail closed).
+function _hyper_scale_positive(p::SampledParameter)
+    sup = support_of(p.family, p.support_override)
+    sup === :positive && return true
+    sup === :interval || return false
+    if p.support_override isa Tuple && p.support_override[1] === :interval
+        lo = p.support_override[2]
+        return lo isa Real && !(lo isa Bool) && lo >= 0
+    end
+    p.family === :uniform || return false
+    hasproperty(p.args, :arg1) || return false
+    lo = p.args.arg1
+    return lo isa Real && !(lo isa Bool) && lo >= 0
+end
+
 function _validate_priors(plan::StructuralPlan)
     seen = Set{Tuple{Symbol,Symbol}}()
     rows = Dict{Tuple{Symbol,Symbol},PopulationPrior}()
@@ -5764,6 +5807,8 @@ function _validate_priors(plan::StructuralPlan)
         (h.predictor, h.addressee) for h in plan.horseshoe_priors)
     hs_preds = Set{Symbol}(h.predictor for h in plan.horseshoe_priors)
     param_names = Set{Symbol}(p.name for p in plan.parameters)
+    by_param = Dict{Symbol,SampledParameter}(p.name => p for p in plan.parameters)
+    assign_names = Set{Symbol}(a.name for a in plan.assignments)
     glm_labels = Set{Symbol}(r.label for r in plan.responses if _is_glm_family(r.family))
     for pr in plan.population_priors
         any(p -> p.name === pr.predictor, plan.predictors) ||
@@ -5786,9 +5831,61 @@ function _validate_priors(plan::StructuralPlan)
             "$(join(POPULATION_FAMILIES, ", ")))")
         # `:flat` contributes 0.0 and ignores location/scale/nu.
         pr.family === :flat && continue
-        isfinite(pr.location) && isfinite(pr.scale) && pr.scale > 0 ||
-            _fail(:plan, "prior for $key must be $(pr.family) with " *
-                  "finite location and positive scale")
+        # `:uniform` carries finite literal bounds (location, scale) =
+        # (lo, hi) with lo < hi — no hyperparameter bounds in slice 1.
+        if pr.family === :uniform
+            (pr.location isa Real && pr.scale isa Real &&
+                isfinite(pr.location) && isfinite(pr.scale) &&
+                pr.location < pr.scale) ||
+                _fail(:plan, "prior for $key must be uniform with " *
+                      "finite literal bounds lo < hi, got " *
+                      "($(repr(pr.location)), $(repr(pr.scale)))")
+            continue
+        end
+        # Location/scale are literals or hyperparameter names (the
+        # centered-hierarchical shape). A location hyperparameter names
+        # a scalar sampled parameter or scalar assignment; a scale
+        # hyperparameter names a positive-support sampled parameter
+        # (assignments are not statically positive — sample the scale
+        # instead). Coefficient priors are DAG sinks (nothing references
+        # them, and parameters cannot reference coefficients), so the
+        # new edge cannot cycle — no topological check is owed.
+        _loc = pr.location
+        if _loc isa Symbol
+            _loc in param_names || _loc in assign_names ||
+                _fail(:plan, "prior for $key has location " *
+                      "hyperparameter $_loc — a location hyperparameter " *
+                      "names a scalar sampled parameter or scalar " *
+                      "assignment (not a data column, coefficient, or " *
+                      "vector)")
+        else
+            isfinite(_loc) ||
+                _fail(:plan, "prior for $key must be $(pr.family) " *
+                      "with finite location and positive scale")
+        end
+        _sc = pr.scale
+        if _sc isa Symbol
+            haskey(by_param, _sc) ||
+                _fail(:plan, "prior for $key has scale hyperparameter " *
+                      "$_sc — a scale hyperparameter names a " *
+                      "positive-support sampled parameter (not an " *
+                      "assignment, data column, or coefficient)")
+            # Interval hypers count when the whole interval is
+            # non-negative (the open-interval transform keeps reads
+            # strictly inside, so the scale stays positive) — the
+            # radon_county `Flat(; lower=0, upper=100)` shape.
+            _hyper_scale_positive(by_param[_sc]) ||
+                _fail(:plan, "prior for $key has scale hyperparameter " *
+                      "$_sc — a scale hyperparameter names a " *
+                      "positive-support sampled parameter " *
+                      "(`Exponential`, `Gamma`, `HalfNormal`, " *
+                      "`Normal(0, s; lower=0)`, `Flat(; lower=0, " *
+                      "upper=hi)`, `Uniform(0, hi)`, ...)")
+        else
+            (isfinite(_sc) && _sc > 0) ||
+                _fail(:plan, "prior for $key must be $(pr.family) " *
+                      "with finite location and positive scale")
+        end
         pr.family === :student_t &&
             (!(pr.nu isa Real) || !isfinite(pr.nu) || !(pr.nu > 0)) &&
             _fail(:plan, "prior for $key must be student_t with " *
@@ -7007,9 +7104,11 @@ function _validate_response_data(plan::StructuralPlan)
 end
 
 function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
-    _is_derived(plan, r.response) && _fail(r.label,
-        "response $(r.response) is a derived column — slice-1 binds " *
-        "responses raw (derived responses need shape metadata — planned)")
+    if _is_derived(plan, r.response) && !haskey(plan.columns, r.response)
+        _fail(r.label, "response $(r.response) is a derived column with " *
+            "no bound values — bind_data materializes derived responses, " *
+            "so a hand-built plan must include the column")
+    end
     haskey(plan.columns, r.response) ||
         _fail(r.label, "response column $(r.response) missing")
     if r.range !== nothing
@@ -8424,6 +8523,121 @@ function _bind_nrows(columns::AbstractDict{Symbol}, managed::Set{Symbol})
         "(an mi-only column set carries no length-n anchor)"))
 end
 
+# Bind-time materialization of derived responses: a response over a
+# derived column (`ly = log.(earn)` then `ly .~ ...`) evaluates its
+# (structure-proven) expression over the bound columns and joins them,
+# so every downstream consumer — roles, n_obs, validation, generation —
+# reads it exactly like a raw column. The in-graph local (`ly =
+# log.(earn)` in `_assignment_statements`) recomputes the identical value
+# (same expression, same inputs); `bound=` folds the data-only duplicate
+# on compiled paths.
+function _materialize_derived_responses!(plan::StructuralPlan,
+        columns::Dict{Symbol,ColumnData})
+    derived =
+        [r.response for r in plan.responses if _is_derived(plan, r.response)]
+    isempty(derived) && return columns
+    det_exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
+    for d in plan.derived
+        det_exprs[d.name] = d.expr
+    end
+    for name in derived
+        haskey(columns, name) && throw(ContractValidationError(
+            "[bind] column $name is derived in the model — drop it from " *
+            "bind_data (derived responses materialize from bound data)"))
+        try
+            columns[name] = _eval_derived_name(plan, name, det_exprs, columns,
+                Dict{Symbol,Any}(), name)
+        catch e
+            e isa ContractValidationError && rethrow()
+            throw(ContractValidationError(
+                "[bind] derived response $name failed to evaluate: " *
+                sprint(showerror, e)))
+        end
+    end
+    return columns
+end
+
+# Host evaluator for derived-response expressions: bound columns and
+# (transitive) deterministic definitions resolve; sampled, latent,
+# coefficient, and unknown names fail naming the response. Forms mirror
+# the contract walkers (`_collect_vector_refs!` /
+# `_collect_assignment_refs!`), which prove them before bind — anything
+# else fails closed here too.
+const _DERIVED_DOTTED_OPS = Dict{Symbol,Function}(
+    :.+ => +, :.- => -, :.* => *, :./ => /, :.^ => ^, :.% => %,
+    :.== => ==, :.!= => !=, :.< => <, :.> => >, :.<= => <=, :.>= => >=)
+const _DERIVED_MATH_FNS = Dict{Symbol,Function}(
+    :log => log, :log10 => log10, :log1p => log1p, :exp => exp,
+    :expm1 => expm1, :sqrt => sqrt, :abs => abs)
+const _DERIVED_SCALAR_FNS = Dict{Symbol,Function}(
+    :+ => +, :- => -, :* => *, :/ => /, :^ => ^,
+    :log => log, :log10 => log10, :log1p => log1p, :exp => exp,
+    :expm1 => expm1, :sqrt => sqrt, :abs => abs, :tanh => tanh,
+    :sum => sum, :mean => mean, :std => std, :var => var,
+    :minimum => minimum, :maximum => maximum, :length => length)
+
+function _eval_derived_name(plan::StructuralPlan, name::Symbol, det_exprs,
+        columns, memo::Dict{Symbol,Any}, root::Symbol)
+    haskey(memo, name) && return memo[name]
+    haskey(columns, name) && return columns[name]
+    haskey(det_exprs, name) || throw(ContractValidationError(
+        "[bind] derived response $root reads $name which is not bound " *
+        "data (responses derive from bound columns only)"))
+    memo[name] = _eval_derived_node(
+        det_exprs[name], plan, det_exprs, columns, memo, root)
+    return memo[name]
+end
+
+function _eval_derived_node(ex, plan::StructuralPlan, det_exprs, columns,
+        memo::Dict{Symbol,Any}, root::Symbol)
+    ex isa Number && return ex
+    ex isa Symbol &&
+        return _eval_derived_name(plan, ex, det_exprs, columns, memo, root)
+    ex isa Expr || throw(ContractValidationError(
+        "[bind] derived response $root: unsupported literal $(repr(ex)) " *
+        "(numeric literals only)"))
+    if ex.head === :call
+        fn = ex.args[1]
+        if fn isa Symbol && haskey(_DERIVED_DOTTED_OPS, fn)
+            f = _DERIVED_DOTTED_OPS[fn]
+            vals = [_eval_derived_node(a, plan, det_exprs, columns, memo, root)
+                for a in ex.args[2:end]]
+            return broadcast(f, vals...)
+        end
+        if fn isa Symbol && haskey(_DERIVED_SCALAR_FNS, fn)
+            f = _DERIVED_SCALAR_FNS[fn]
+            vals = [_eval_derived_node(a, plan, det_exprs, columns, memo, root)
+                for a in ex.args[2:end]]
+            return f(vals...)
+        end
+        return throw(ContractValidationError(
+            "[bind] derived response $root: `$fn` is not admitted in a " *
+            "derived response (elementwise operators, elementwise math, " *
+            "`ifelse`, and scalar/reduction calls only)"))
+    end
+    if ex.head === :.
+        # `f.(x)` / `ifelse.(c, x, y)` — the contract walker proves the
+        # `f.(tuple)` shape before bind.
+        f = ex.args[1]
+        args = ex.args[2].args
+        if f === :ifelse
+            vals = [_eval_derived_node(a, plan, det_exprs, columns, memo, root)
+                for a in args]
+            return ifelse.(vals...)
+        end
+        f isa Symbol && haskey(_DERIVED_MATH_FNS, f) && length(args) == 1 ||
+            throw(ContractValidationError(
+                "[bind] derived response $root: `$(repr(ex))` is not " *
+                "admitted in a derived response (single-argument " *
+                "elementwise math only)"))
+        return _DERIVED_MATH_FNS[f].(
+            _eval_derived_node(args[1], plan, det_exprs, columns, memo, root))
+    end
+    return throw(ContractValidationError(
+        "[bind] derived response $root: unsupported expression head " *
+        "$(ex.head) in a derived response"))
+end
+
 function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}())
@@ -8431,6 +8645,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     isempty(columns) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
     columns = _checked_columns(columns)
+    _materialize_derived_responses!(plan, columns)
     bases = _materialize_splines!(plan, columns)
     hbases = _fit_hsgp_bases(plan, columns)
     kbases = _resolve_kernels!(plan, columns, dims)

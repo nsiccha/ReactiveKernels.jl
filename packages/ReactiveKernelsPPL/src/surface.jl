@@ -399,7 +399,16 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     varying_draws_names = Set{Symbol}(p.draws_lhs for p in varying_pending)
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
-    prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
+    detnames_all = Set{Symbol}(nm for (nm, _) in det)
+    # Derived responses (`.~` over a deterministic definition, either
+    # order): data-like everywhere downstream — excluded from the sampled
+    # name table (mixture/coef-prior/param positions keep treating them
+    # as data) and skipped by parameter lowering.
+    derived_response_names = Set{Symbol}(s.lhs for s in sample
+        if s.broadcast && s.levels === nothing && s.matrix === nothing &&
+            s.lhs ∉ data && s.lhs in detnames_all)
+    sampled_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
+    prior_names = setdiff(sampled_names, derived_response_names)
     # Sampled names usable as predictor coefficients: coefficient-priored
     # scalars (see `_COEF_FAMILIES`) plus per-coefficient `~ Horseshoe()`
     # scalars (the horseshoe triple synthesis in
@@ -459,7 +468,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names,
         plate_names)
     ctx = (; data, detmap = canonmap, prior_names, coef_priors, detshape,
-        vecdefs, structural, plate_names, absorbed = Set{Symbol}(),
+        vecdefs, structural, derived_responses = derived_response_names,
+        plate_names, absorbed = Set{Symbol}(),
         predictor_pins = pins, pins_used = Set{Symbol}(),
         pin_owner = Dict{Symbol,Symbol}(),
         pin_source = Dict{Symbol,Tuple{Symbol,Symbol}}(),
@@ -499,12 +509,18 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
             s.levels !== nothing && continue
             # Matrix coefficient priors lower with their matrix term.
             s.matrix !== nothing && continue
-            s.lhs in data || _sfail("`.~` broadcasts over a data column " *
-                                    "— $(s.lhs) is not data (scalar " *
-                                    "parameters use `~`)")
-            push!(responses,
-                _lower_response(s.lhs, s.rhs, s.range, ctx, predictors,
-                    pred_idx, coefuse))
+            if s.lhs in data
+                push!(responses,
+                    _lower_response(s.lhs, s.rhs, s.range, ctx, predictors,
+                        pred_idx, coefuse))
+            elseif s.lhs in ctx.vecdefs
+                _gate_derived_response!(s.lhs, ctx)
+                push!(responses,
+                    _lower_response(s.lhs, s.rhs, s.range, ctx, predictors,
+                        pred_idx, coefuse))
+            else
+                _sfail(_broadcast_lhs_msg(s.lhs, detshape))
+            end
         elseif s.lhs in data
             _sfail("$(s.lhs) is data — vector responses broadcast with " *
                    "`.~` (`$(s.lhs) .~ Normal.(mu, sigma)`); `~` is " *
@@ -569,14 +585,21 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         haskey(coefuse, c) && _sfail("$c is a dar trajectory state — it " *
             "splices via its `dar()` call, not as a coefficient (rename one)")
     end
+    # Hyperparameter names the broadcast peelers admit at the surface:
+    # sampled names and scalar definitions. Anything else (data,
+    # coefficients, vectors, unknown names) fails here with the legacy
+    # spelling error — the contract refines roles (location vs scale
+    # support) for the admitted names.
+    hyper_names = union(sampled_names,
+        Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :scalar))
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
-        ctx.matrices, r2d2set, hsset)
+        ctx.matrices, hyper_names, r2d2set, hsset)
     for (beta, (label, X)) in glmuse
         append!(priors, _lower_glm_beta_priors(label, beta, X, sample,
-            ctx.matrices))
+            ctx.matrices, hyper_names))
     end
     r2d2s, taus = _lower_r2d2_priors(r2d2decls, sample, coefuse, predictors,
-        levelmaps, taken, ctx.matrices)
+        levelmaps, taken, ctx.matrices, hyper_names)
     hses, hsparams = _lower_horseshoe_priors(sample, coefuse, predictors,
         hsset, taken)
     params, paramsyms, dirichlets = _lower_parameters(sample, coefuse, ctx, glmuse)
@@ -1162,6 +1185,58 @@ _varying_head(rhs::Expr) = rhs.args[1]::Symbol
 # `_validate_varying_margins` proves vector shape after lowering.
 # Claims the draws label up front so user definitions can never
 # collide with in-graph names (K=1 scale/xi, correlated L/tau/z).
+# A draws block's `sd=` keyword: one zero-located scale call for every
+# margin (`sd=Cauchy(0, 5)`). sd priors are Stan-kernel by construction
+# (support `nothing` — no `+log2`), so the proper-half spellings are
+# rejected with the bare form (a `HalfCauchy` prior means `+log2`
+# everywhere else; aliasing it here would lie). Per-margin tuples are
+# planned, not admitted.
+function _lower_varying_sd_prior(raw, K::Int, where)
+    raw isa Expr && raw.head === :tuple &&
+        _sfail("$where per-margin sd priors are planned — pass one " *
+              "`sd=` call for all $K margins")
+    raw isa Expr && raw.head === :vect &&
+        _sfail("$where per-margin sd priors are planned — pass one " *
+              "`sd=` call for all $K margins, not a vector")
+    raw isa Expr && raw.head === :call && !isempty(raw.args) &&
+        raw.args[1] isa Symbol || _sfail(
+            "$where `sd=` takes `Cauchy(0, σ)`, `Normal(0, σ)`, or " *
+            "`Exponential(θ)` (literal args), got $(repr(raw))")
+    fam = raw.args[1]
+    args = raw.args[2:end]
+    if fam === :HalfCauchy || fam === :HalfNormal || _sd_is_truncated(raw)
+        _sfail("$where sd priors are Stan-kernel (no `+log2`) — spell " *
+              "the bare form (`sd=Cauchy(0, σ)`), not `$(repr(raw))`")
+    end
+    fam === :Cauchy || fam === :Normal || fam === :Exponential ||
+        _sfail("$where `sd=` takes `Cauchy(0, σ)`, `Normal(0, σ)`, or " *
+              "`Exponential(θ)`, got `$(repr(raw))`")
+    if fam === :Exponential
+        length(args) == 1 || _sfail("$where `sd=Exponential(θ)` takes " *
+            "one scale argument (Distributions scale convention, like " *
+            "sampled `s ~ Exponential(1)`), got $(repr(raw))")
+        th = args[1]
+        th isa Real && !(th isa Bool) && th > 0 ||
+            _sfail("$where sd Exponential scale must be a positive " *
+                  "literal, got $(repr(th))")
+        return fill(VaryingSdPrior(:exponential, Float64(th)), K)
+    end
+    length(args) == 2 || _sfail("$where `sd=$fam(0, σ)` takes a " *
+        "zero location and a scale, got $(repr(raw))")
+    loc, sc = args
+    loc isa Real && !(loc isa Bool) && loc == 0 ||
+        _sfail("$where sd $fam location must be literal 0, got " *
+              "$(repr(loc))")
+    sc isa Real && !(sc isa Bool) && sc > 0 ||
+        _sfail("$where sd $fam scale must be a positive literal, got " *
+              "$(repr(sc))")
+    sym = fam === :Cauchy ? :cauchy : :normal
+    return fill(VaryingSdPrior(sym, Float64(sc)), K)
+end
+
+_sd_is_truncated(raw::Expr) =
+    raw.head === :call && !isempty(raw.args) && raw.args[1] === :truncated
+
 function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
         data::Set{Symbol}, detnames::Set{Symbol}, seen::Set{Symbol},
         seelines::Dict{Symbol,Int}, used_suffixes::Set{String})
@@ -1171,13 +1246,15 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
     eta = 1.0
     eta_given = false
     levels = nothing
+    sd_raw = nothing
     for a in call.args[2:end]
         if a isa Expr && a.head === :parameters
             for kw in a.args
                 kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where takes keywords `eta`/`levels` only")
+                    _sfail("$where takes keywords `eta`/`levels`/`sd` only")
                 kw.args[1] === :eta || kw.args[1] === :levels ||
-                    _sfail("$where takes keywords `eta`/`levels` only, got " *
+                    kw.args[1] === :sd ||
+                    _sfail("$where takes keywords `eta`/`levels`/`sd` only, got " *
                           "`$(kw.args[1])`")
                 if kw.args[1] === :eta
                     v = kw.args[2]
@@ -1185,6 +1262,8 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
                         _sfail("$where eta must be a numeric literal, got $(repr(v))")
                     eta = Float64(v)
                     eta_given = true
+                elseif kw.args[1] === :sd
+                    sd_raw = kw.args[2]
                 else
                     levels = _lower_grouping_levels(kw.args[2], where)
                 end
@@ -1271,8 +1350,10 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
     push!(used_suffixes, suffix)
     label = Symbol("draws_" * suffix)
     _claim!(seen, seelines, label, line)
+    sd_priors = sd_raw === nothing ? VaryingSdPrior[] :
+        _lower_varying_sd_prior(sd_raw, K, where)
     d = VaryingDraws(group, kind, margins, eta, label, suffix, levels,
-        VaryingSdPrior[], mm, strata)
+        sd_priors, mm, strata)
     if kind === :intercept1 || kind === :slope1
         for nm in _varying_k1_names(d)
             _claim!(seen, seelines, nm, line)
@@ -2682,6 +2763,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     level_bindings = Dict{Symbol,Tuple{Symbol,Any}}()
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
+    # Definitions observed by a `.~` response (derived responses —
+    # either statement order; the double-observation guard).
+    derived_observed = Set{Symbol}()
     seen_doc = false
     line = 0
     args, plate_ctx, plate_params = _expand_plates(ast.args, data)
@@ -2793,6 +2877,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                        "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
                        "object owns eta over the whole column)")
             end
+            _reject_derived_ref_lhs(st.args[2], detnames)
             lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde, data,
                 level_bindings)
             lhs === :dummy &&
@@ -2807,7 +2892,28 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             lhs === :r2d2 &&
                 _sfail("`r2d2` is reserved (r2d2 surface) and cannot be " *
                        "sampled")
-            _claim!(seen, seelines, lhs, line)
+            if bc && st.args[2] isa Symbol
+                # A derived response observes an existing deterministic
+                # definition (`ly = log.(earn)` then `ly .~ ...`) instead
+                # of claiming a fresh name; either order lowers (the
+                # varying forward-reference precedent). A second `.~`
+                # over the same name stays a double definition.
+                if lhs in seen
+                    if lhs in detnames && lhs ∉ derived_observed
+                        push!(derived_observed, lhs)
+                    elseif lhs in derived_observed
+                        _sfail("$lhs is already observed by a `.~` " *
+                                "response (one response per column)")
+                    else
+                        _claim!(seen, seelines, lhs, line)
+                    end
+                else
+                    _claim!(seen, seelines, lhs, line)
+                    lhs in detnames && push!(derived_observed, lhs)
+                end
+            else
+                _claim!(seen, seelines, lhs, line)
+            end
             if _is_varying_call(st.args[3])
                 head = _varying_head(st.args[3])
                 bc && _sfail("`$lhs` uses `.~` — `$head` statements bind " *
@@ -2843,7 +2949,11 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 _sfail("`r2d2` is reserved (r2d2 surface) and cannot be " *
                        "redefined")
             lhs in data && _sfail("$lhs is bound data and cannot be redefined")
-            _claim!(seen, seelines, lhs, line)
+            # Forward `.~`: the observation claimed first — this first
+            # definition completes it (a second definition still throws).
+            forward_response = lhs in seen && lhs in derived_observed &&
+                !any(p -> p.first === lhs, det)
+            forward_response || _claim!(seen, seelines, lhs, line)
             if _is_schedule_decl_rhs(st.args[2])
                 push!(schedules, _lower_schedule_decl(lhs, st.args[2], line,
                     data))
@@ -3398,6 +3508,26 @@ _is_sample(st::Expr) =
 
 _is_broadcast_sample(st::Expr) =
     st.head === :call && length(st.args) == 3 && st.args[1] === :.~
+
+# A ref LHS over a deterministic definition: ranges cover raw data
+# columns and levels/matrix sizings size coefficient priors — neither
+# observes a derived column (broadcast bare: `ly .~ ...`). Runs before
+# `_sample_lhs` so the message names the position, not the fallout.
+function _reject_derived_ref_lhs(lhs, detnames::Set{Symbol})
+    lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
+        lhs.args[1] isa Symbol && lhs.args[1] in detnames || return nothing
+    target = lhs.args[1]
+    index = lhs.args[2]
+    if _is_levels_call(index) || _is_axes2_call(index) ||
+            (index isa Expr && index.head === :ref)
+        _sfail("`$(repr(lhs))` sizes a coefficient prior but `$target` " *
+                "is a deterministic definition — rename the definition " *
+                "or the prior")
+    end
+    return _sfail("response range `$(repr(lhs))` covers a raw data " *
+                  "column — `$target` is a derived column, broadcast bare " *
+                  "(`$target .~ ...`)")
+end
 
 # Sampling-statement LHS: a bare Symbol, a one-dimensional range ref
 # `y[R]` (`.~` only), a levels ref `c[levels(g)]` / `c[levels(g)][S]`
@@ -4264,6 +4394,35 @@ function _plain_args(rhs::Expr, what)
     return rhs.args[2:end]
 end
 
+# A derived response observes data-only vector structure: structural
+# (predictor) definitions and direct sampled-name reads fail here (the
+# bind evaluator owns transitive closure — a scalar-definition chain
+# into a parameter fails at bind naming the name).
+function _gate_derived_response!(lhs::Symbol, ctx)
+    lhs in ctx.structural && _sfail("response $lhs is a predictor " *
+        "definition — responses observe data columns or data-derived " *
+        "columns (`ly = log.(earn)`)")
+    for v in _value_symbols(ctx.detmap[lhs])
+        v in ctx.prior_names && _sfail("response $lhs reads the " *
+            "sampled name $v — responses derive from bound data only")
+    end
+    return nothing
+end
+
+# Broadcast-LHS rejection: scalar/matrix definitions name their shape;
+# anything else keeps the legacy not-data message verbatim.
+function _broadcast_lhs_msg(lhs::Symbol, detshape)
+    shape = get(detshape, lhs, nothing)
+    shape === :scalar && return "`.~` broadcasts over a data column " *
+        "or a vector-shaped derived column — $lhs is a scalar " *
+        "definition (scalar parameters use `~`)"
+    shape === :matrix && return "`.~` broadcasts over a data column " *
+        "or a vector-shaped derived column — $lhs is a design matrix " *
+        "(matrices lower only in predictor matmuls)"
+    return "`.~` broadcasts over a data column — $lhs is not data " *
+        "(scalar parameters use `~`)"
+end
+
 function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     dotted = _desugar_fused_head(lhs, rhs)
     call = _dot2call_response(lhs, dotted)
@@ -4894,7 +5053,7 @@ end
 # (per-element) args — Normal-only (non-Normal betas use the
 # decomposed predictor form).
 function _lower_glm_beta_priors(label::Symbol, beta::Symbol, X::Symbol,
-        sample, matrices::Dict{Symbol,DesignMatrix})
+        sample, matrices::Dict{Symbol,DesignMatrix}, hyper_names::Set{Symbol})
     m = get(matrices, X, nothing)
     m === nothing && _sfail("internal: GLM prior over unknown matrix $X")
     cols = Symbol[c for c in m.columns if c !== nothing]
@@ -4907,7 +5066,7 @@ function _lower_glm_beta_priors(label::Symbol, beta::Symbol, X::Symbol,
     stated === nothing && return PopulationPrior[
         PopulationPrior(label, c, 0.0, 1.0) for c in cols]
     fam, locs, scales, _ =
-        _coefficient_matrix_prior(beta, stated.rhs, label, K)
+        _coefficient_matrix_prior(beta, stated.rhs, label, K, hyper_names)
     fam === :normal || _sfail("response $label: GLM-object beta vectors " *
                               "are Normal-only (got `$fam`) — write the " *
                               "decomposed predictor form for other families")
@@ -6951,7 +7110,7 @@ end
 # block — required, never defaulted — and each one emits its LevelMap.
 # Plan order follows predictors, addressees in term order.
 function _lower_coefficient_priors(sample, coefuse, predictors,
-        matrices::Dict{Symbol,DesignMatrix},
+        matrices::Dict{Symbol,DesignMatrix}, hyper_names::Set{Symbol},
         r2d2::Set{Symbol} = Set{Symbol}(),
         hs::Set{Symbol} = Set{Symbol}())
     stated = Dict{Symbol,Any}()
@@ -6994,7 +7153,7 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                 t.kind === DarSummandTerm) && continue
             if t.kind === MatrixTerm
                 append!(priors, _lower_matrix_priors(pred, t, coefuse,
-                    stated, matrices))
+                    stated, matrices, hyper_names))
                 continue
             end
             addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
@@ -7005,7 +7164,7 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
             sign = use[3]
             if t.kind === FactorTerm
                 push!(priors, _lower_factor_prior(pred, t, name, sign,
-                    stated, levelmaps))
+                    stated, levelmaps, hyper_names))
                 continue
             end
             if !haskey(stated, name)
@@ -7033,7 +7192,8 @@ end
 # `b[axes(S, 2)] .~ Fam.(args...)` — one shared family with scalar
 # (shared) or length-K literal-vector (per-element) args — real
 # broadcast semantics.
-function _lower_matrix_priors(pred, t, coefuse, stated, matrices)
+function _lower_matrix_priors(pred, t, coefuse, stated, matrices,
+        hyper_names::Set{Symbol})
     X = t.options.matrix
     m = get(matrices, X, nothing)
     m === nothing && _sfail("internal: matrix term over unknown matrix $X")
@@ -7053,16 +7213,24 @@ function _lower_matrix_priors(pred, t, coefuse, stated, matrices)
     s.matrix === nothing && _sfail("internal: matrix prior for $name " *
                                    "lost its sizing matrix")
     fam, locs, scales, nus =
-        _coefficient_matrix_prior(name, s.rhs, pred.name, K)
-    return PopulationPrior[PopulationPrior(pred.name, e, fam, sign * l, sc, n)
+        _coefficient_matrix_prior(name, s.rhs, pred.name, K, hyper_names)
+    if sign != 1 && any(l -> l isa Symbol, locs)
+        _sfail("coefficient $name: a sign-flipped hierarchical " *
+               "location is not admitted — restate the model with an " *
+               "unflipped `Normal.($(locs[1]), $(scales[1]))` broadcast")
+    end
+    return PopulationPrior[PopulationPrior(pred.name, e, fam,
+            sign == 1 ? l : sign * l, sc, n)
         for (e, l, sc, n) in zip(elems, locs, scales, nus)]
 end
 
 # Dotted matrix priors peel to one shared family plus K (location,
-# scale, nu) triples: each arg is a Real (shared over elements) or a
-# literal K-vector (per-element) — Julia broadcast semantics over
-# `Fam.(args...)`, arg positions from `_COEF_SHAPES`.
-function _coefficient_matrix_prior(name, rhs, pname, K)
+# scale, nu) triples: each arg is a Real (shared over elements), a
+# shared-hyperparameter name, or a literal K-vector (per-element) —
+# Julia broadcast semantics over `Fam.(args...)`, arg positions from
+# `_COEF_SHAPES`.
+function _coefficient_matrix_prior(name, rhs, pname, K,
+        hyper_names::Set{Symbol})
     rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
         rhs.args[1] isa Symbol && haskey(_COEF_FAMILIES, rhs.args[1]) &&
         rhs.args[2] isa Expr && rhs.args[2].head === :tuple || _sfail(
@@ -7079,27 +7247,34 @@ function _coefficient_matrix_prior(name, rhs, pname, K)
     want, lipos, spos, npos = _COEF_SHAPES[fam]
     length(args) == want || _sfail("coefficient $name of predictor $pname " *
                                    "needs `$head` with $want arguments")
-    vecs = [_matrix_prior_arg(name, a, pname, K, "arg$i")
+    vecs = [_matrix_prior_arg(name, a, pname, K, "arg$i", hyper_names)
         for (i, a) in enumerate(args)]
     nus = npos == 0 ? fill(NaN, K) : vecs[npos]
     return fam, vecs[lipos], vecs[spos], nus
 end
 
-function _matrix_prior_arg(name, a, pname, K, role)
+function _matrix_prior_arg(name, a, pname, K, role, hyper_names::Set{Symbol})
     a isa Real && return fill(Float64(a), K)
     a === :Inf && return fill(Inf, K)
+    if a isa Symbol
+        a in hyper_names || _sfail("coefficient $name prior $role " *
+            "must be a literal, a literal $K-vector, or a " *
+            "shared-hyperparameter name (per-level priors are not in " *
+            "slice 1), got $(repr(a))")
+        return fill(a, K)
+    end
     if a isa Expr && a.head === :vect
         length(a.args) == K || _sfail(
             "coefficient $name prior $role has $(length(a.args)) " *
             "elements for $K columns — one per column")
         all(x -> x isa Real || x === :Inf, a.args) || _sfail(
             "coefficient $name prior $role elements must be literals " *
-            "(hierarchical coefficient priors are not in slice 1)")
+            "(per-element hyperparameters are not in slice 1)")
         return Float64[x === :Inf ? Inf : x for x in a.args]
     end
-    _sfail("coefficient $name prior $role must be a literal or a " *
-           "literal $K-vector (hierarchical coefficient priors are not " *
-           "in slice 1), got $(repr(a))")
+    _sfail("coefficient $name prior $role must be a literal, a literal " *
+           "$K-vector, or a shared-hyperparameter name (per-level " *
+           "priors are not in slice 1), got $(repr(a))")
 end
 
 # Horseshoe predictors: any predictor with a stated scalar `~ Horseshoe()`
@@ -7266,7 +7441,7 @@ end
 # with an intercept, same as the PopulationPrior path). Omitted tau
 # synthesizes a half-standard-Normal parameter.
 function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
-        taken, matrices::Dict{Symbol,DesignMatrix})
+        taken, matrices::Dict{Symbol,DesignMatrix}, hyper_names::Set{Symbol})
     stated = Dict{Symbol,Any}()
     for s in sample
         haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
@@ -7296,7 +7471,7 @@ function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
                 t.kind === MonotonicSummandTerm) && continue
             if t.kind === MatrixTerm
                 for (e, ov) in _lower_r2d2_matrix(pred, t, coefuse,
-                        stated, matrices)
+                        stated, matrices, hyper_names)
                     overrides[e] = ov
                 end
                 continue
@@ -7313,7 +7488,7 @@ function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
             sign = use[3]
             if t.kind === FactorTerm
                 ov = _lower_r2d2_factor(pred, t, name, sign, stated,
-                    levelmaps)
+                    levelmaps, hyper_names)
                 ov === nothing || (overrides[addr] = ov)
                 continue
             end
@@ -7351,7 +7526,8 @@ end
 # An R2D2 matrix: a stated broadcast prior becomes per-element share-0
 # overrides; an unstated vector joins the simplex (the intercept
 # element takes share 0 by default, as on the scalar path).
-function _lower_r2d2_matrix(pred, t, coefuse, stated, matrices)
+function _lower_r2d2_matrix(pred, t, coefuse, stated, matrices,
+        hyper_names::Set{Symbol})
     X = t.options.matrix
     m = get(matrices, X, nothing)
     m === nothing && _sfail("internal: matrix term over unknown matrix $X")
@@ -7366,18 +7542,24 @@ function _lower_r2d2_matrix(pred, t, coefuse, stated, matrices)
     s.matrix === nothing && _sfail("internal: matrix prior for $name " *
                                    "lost its sizing matrix")
     fam, locs, scales, _ =
-        _coefficient_matrix_prior(name, s.rhs, pred.name, K)
+        _coefficient_matrix_prior(name, s.rhs, pred.name, K, hyper_names)
     fam === :normal || _sfail("coefficient $name of predictor " *
                               "$(pred.name) carries an r2d2 prior — stated " *
                               "matrix priors must be `Normal.(...)` " *
                               "(r2d2 overrides are Normal-only)")
+    any(v -> v isa Symbol, (locs..., scales...)) &&
+        _sfail("coefficient $name of predictor $(pred.name) carries an " *
+               "r2d2 prior — stated overrides must be literal " *
+               "`Normal.(...)` (hyperparameter overrides are not in " *
+               "slice 1)")
     return [(e, (sign * l, sc)) for (e, l, sc) in zip(elems, locs, scales)]
 end
 
 # An R2D2 factor: a stated broadcast prior becomes a share-0 override
 # (with its levels subset, as on the PopulationPrior path); an
 # unstated factor joins the simplex under a full-cover LevelMap.
-function _lower_r2d2_factor(pred, t, name, sign, stated, levelmaps)
+function _lower_r2d2_factor(pred, t, name, sign, stated, levelmaps,
+        hyper_names::Set{Symbol})
     col = only(t.columns)
     haskey(stated, name) || begin
         push!(levelmaps, LevelMap(pred.name, col, [], :levels, :))
@@ -7392,16 +7574,22 @@ function _lower_r2d2_factor(pred, t, name, sign, stated, levelmaps)
     gcol === col || _sfail("coefficient $name: levels column $gcol " *
                            "differs from use column $col")
     fam, loc, scale, _ =
-        _coefficient_broadcast_prior(name, s.rhs, pred.name, col)
+        _coefficient_broadcast_prior(name, s.rhs, pred.name, col, hyper_names)
     fam === :normal || _sfail("coefficient $name of predictor " *
                               "$(pred.name) carries an r2d2 prior — stated " *
                               "broadcast priors must be `Normal.(...)` " *
                               "(r2d2 overrides are Normal-only)")
+    (loc isa Symbol || scale isa Symbol) &&
+        _sfail("coefficient $name of predictor $(pred.name) carries an " *
+               "r2d2 prior — stated overrides must be literal " *
+               "`Normal.(...)` (hyperparameter overrides are not in " *
+               "slice 1)")
     push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
     return (sign * loc, scale)
 end
 
-function _lower_factor_prior(pred, t, name, sign, stated, levelmaps)
+function _lower_factor_prior(pred, t, name, sign, stated, levelmaps,
+        hyper_names::Set{Symbol})
     col = only(t.columns)
     haskey(stated, name) || _sfail("factor coefficient $name over $col " *
                                    "needs an explicit broadcast prior " *
@@ -7416,15 +7604,22 @@ function _lower_factor_prior(pred, t, name, sign, stated, levelmaps)
     gcol === col || _sfail("coefficient $name: levels column $gcol " *
                            "differs from use column $col")
     fam, loc, scale, nu =
-        _coefficient_broadcast_prior(name, s.rhs, pred.name, col)
+        _coefficient_broadcast_prior(name, s.rhs, pred.name, col, hyper_names)
     push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
-    return PopulationPrior(pred.name, col, fam, sign * loc, scale, nu)
+    if sign != 1 && loc isa Symbol
+        _sfail("coefficient $name: a sign-flipped hierarchical " *
+               "location is not admitted — restate the model with an " *
+               "unflipped `Normal.($loc, $scale)` broadcast")
+    end
+    loc = sign == 1 ? loc : sign * loc
+    return PopulationPrior(pred.name, col, fam, loc, scale, nu)
 end
 
 # Dotted coefficient priors peel to one shared (family, location, scale,
-# nu): broadcast args must be literals (per-level priors are not in
-# slice 1), positions from `_COEF_SHAPES`.
-function _coefficient_broadcast_prior(name, rhs, pname, col)
+# nu): broadcast args are literals or shared-hyperparameter names
+# (per-level priors are not in slice 1), positions from `_COEF_SHAPES`.
+function _coefficient_broadcast_prior(name, rhs, pname, col,
+        hyper_names::Set{Symbol})
     rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
         rhs.args[1] isa Symbol && haskey(_COEF_FAMILIES, rhs.args[1]) &&
         rhs.args[2] isa Expr && rhs.args[2].head === :tuple || _sfail(
@@ -7441,12 +7636,39 @@ function _coefficient_broadcast_prior(name, rhs, pname, col)
     want, lipos, spos, npos = _COEF_SHAPES[fam]
     length(args) == want || _sfail("coefficient $name of predictor $pname " *
                                    "needs `$head` with $want arguments")
-    for a in args
-        a isa Real || _sfail("coefficient $name prior parameter must be a " *
-                             "literal (per-level priors are not in slice 1), got " *
-                             "$(repr(a))")
+    # Location/scale take literals or shared-hyperparameter names (the
+    # centered shape: `c[levels(g)] .~ Normal.(mu_alpha, sigma_alpha)`);
+    # nu stays a literal, and per-level vectors stay out of slice 1.
+    # Uniform bounds stay literals (no hyperparameter bounds in
+    # slice 1). The surface admits known names (sampled + scalar
+    # definitions); role resolution (scalar location, positive-support
+    # scale) is the contract's `_validate_priors`, which sees the
+    # whole plan.
+    if fam === :uniform
+        all(a -> a isa Real, args) ||
+            _sfail("coefficient $name of predictor $pname: `Uniform` " *
+                   "bounds must be finite literals " *
+                   "(`Uniform.(lo, hi)` with lo < hi), got " *
+                   "($(join(map(repr, args), ", ")))")
     end
-    vals = Float64.(args)
+    for (i, a) in enumerate(args)
+        a isa Real && continue
+        if a isa Symbol
+            npos != 0 && i == npos &&
+                _sfail("coefficient $name of predictor $pname: the " *
+                       "`$head` nu hyperparameter must be a literal, " *
+                       "got $(repr(a))")
+            a in hyper_names || _sfail("coefficient $name prior " *
+                "parameter must be a literal or shared-hyperparameter " *
+                "name (per-level priors are not in slice 1), got " *
+                "$(repr(a))")
+            continue
+        end
+        _sfail("coefficient $name prior parameter must be a literal " *
+               "or shared-hyperparameter name (per-level priors are " *
+               "not in slice 1), got $(repr(a))")
+    end
+    vals = Any[a isa Real ? Float64(a) : a for a in args]
     return fam, vals[lipos], vals[spos], npos == 0 ? NaN : vals[npos]
 end
 
@@ -7492,8 +7714,10 @@ end
 const _COEF_FAMILIES = Dict{Symbol,Symbol}(
     :Normal => :normal, :StudentT => :student_t, :Cauchy => :cauchy,
     :Laplace => :laplace, :Logistic => :logistic, :Flat => :flat,
+    :Uniform => :uniform,
 )
-const _COEF_FAMILY_MSG = "Normal, StudentT, Cauchy, Laplace, Logistic, Flat"
+const _COEF_FAMILY_MSG =
+    "Normal, StudentT, Cauchy, Laplace, Logistic, Flat, Uniform"
 
 # Coefficient-prior arg shapes → (arity, location index, scale index, nu
 # index or 0). One row per family, shared by the scalar, broadcast, and
@@ -7501,7 +7725,7 @@ const _COEF_FAMILY_MSG = "Normal, StudentT, Cauchy, Laplace, Logistic, Flat"
 const _COEF_SHAPES = Dict{Symbol,NTuple{4,Int}}(
     :normal => (2, 1, 2, 0), :cauchy => (2, 1, 2, 0),
     :laplace => (2, 1, 2, 0), :logistic => (2, 1, 2, 0),
-    :student_t => (3, 2, 3, 1),
+    :student_t => (3, 2, 3, 1), :uniform => (2, 1, 2, 0),
 )
 
 # Scalar coefficient prior → (family, location, scale, nu): params are
@@ -7530,7 +7754,8 @@ end
 function _coefficient_literal(name, a, pname)
     (a isa Real || a === :Inf) ||
         _sfail("coefficient $name prior parameter must be a literal " *
-               "(hierarchical coefficient priors are not in slice 1), got " *
+               "(shared-hyperparameter priors ride factor broadcasts " *
+               "— `c[levels(g)] .~ Normal.(mu, s)` — only), got " *
                "$(repr(a))")
     return a === :Inf ? Inf : Float64(a)
 end
@@ -7567,7 +7792,7 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
     syms = Set{Symbol}()
     vectors = VectorParameter[]
     for s in sample
-        s.lhs in ctx.data && continue
+        (s.lhs in ctx.data || s.lhs in ctx.derived_responses) && continue
         if _is_dirichlet_call(s.rhs)
             haskey(coefuse, s.lhs) && _sfail(
                 "$(s.lhs) is a predictor coefficient and cannot also be " *
@@ -7723,11 +7948,75 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
                "meant as a submodel, define it with " *
                "`@rkppl $fam(args...) = begin ... end` and " *
                "make it visible in the lowering module (`mod=`).")
+    if any(a -> a isa Expr && a.head === :parameters, rhs.args[2:end])
+        return _lower_stan_half_param(lhs, rhs, fam, coefuse, matrices)
+    end
     args = _plain_args(rhs, "`$fam`")
     vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in args]
     argkeys = ntuple(i -> Symbol(:arg, i), length(vals))
     return SampledParameter(lhs, _PARAM_FAMILIES[fam],
         NamedTuple{argkeys}(Tuple(vals)), nothing, lhs)
+end
+
+# Stan-kernel halves: `s ~ Normal(0, sc; lower=0)` (and the other
+# symmetric bases) lowers to the `:positive_stan` support override — the
+# bare symmetric density on positive support with NO `+log(2)`
+# renormalizer, matching Stan's `real<lower=0>` + `~ normal()` kernel and
+# the posteriordb reference kernels. This is the complement of
+# `HalfNormal(sc)` / `truncated(Normal(0, sc), 0, Inf)`, which are the
+# PROPER (renormalized) halves. IR validation, layout, and generation
+# already cover `:positive_stan`; this is only the surface spelling.
+# Admitted narrowly: exactly `lower=0` (literal zero), symmetric base,
+# literal-zero location. Anything else fails closed naming the form.
+function _lower_stan_half_param(lhs, rhs, fam, coefuse, matrices)
+    kws = Expr[]
+    posargs = Any[]
+    for a in rhs.args[2:end]
+        if a isa Expr && a.head === :parameters
+            append!(kws, a.args)
+        else
+            push!(posargs, a)
+        end
+    end
+    for kw in kws
+        kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
+            _sfail("parameter $lhs: Stan-kernel halves take exactly " *
+                   "`lower=0` (`$fam(0, s; lower=0)`), got $(repr(kw))")
+        k = kw.args[1]
+        k === :lower || _sfail(k === :upper ?
+            "parameter $lhs: `upper=` is spelled `truncated(Normal(mu, s), " *
+            "-Inf, hi)` — `; lower=0` is the only admitted prior keyword" :
+            "parameter $lhs: unknown prior keyword `$k` — the only " *
+            "admitted prior keyword is `lower=0` " *
+            "(`$fam(0, s; lower=0)`)")
+        v = kw.args[2]
+        v isa Real && v == 0 ||
+            _sfail("parameter $lhs: Stan-kernel `lower` must be literal " *
+                   "0, got $(repr(v))")
+    end
+    length(kws) == 1 ||
+        _sfail("parameter $lhs: Stan-kernel halves take exactly one " *
+               "keyword (`$fam(0, s; lower=0)`)")
+    haskey(_TRUNCATED_BASES, fam) ||
+        _sfail("parameter $lhs: `; lower=0` needs a symmetric base " *
+               "(Normal, Cauchy, StudentT, Laplace, Logistic) with " *
+               "zero location — `$fam` carries its own support " *
+               "(`HalfNormal`/`truncated` are already positive; " *
+               "`Uniform` carries its interval)")
+    arity, locpos = _TRUNCATED_BASES[fam]
+    length(posargs) == arity ||
+        _sfail("parameter $lhs: `$fam` takes $arity positional " *
+               "arguments (`$fam(0, s; lower=0)`), got " *
+               "$(length(posargs))")
+    loc = posargs[locpos]
+    loc isa Real && loc == 0 ||
+        _sfail("parameter $lhs: Stan-kernel `; lower=0` requires " *
+               "literal zero location (the half shape truncates at 0), " *
+               "got $(repr(loc))")
+    vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in posargs]
+    argkeys = ntuple(i -> Symbol(:arg, i), length(vals))
+    return SampledParameter(lhs, _PARAM_FAMILIES[fam],
+        NamedTuple{argkeys}(Tuple(vals)), :positive_stan, lhs)
 end
 
 function _lower_param_arg(lhs, a, coefuse, matrices)
@@ -7745,10 +8034,72 @@ function _lower_param_arg(lhs, a, coefuse, matrices)
 end
 
 function _lower_flat(lhs, rhs)
-    args = _plain_args(rhs, "`Flat`")
-    isempty(args) ||
+    posargs = Any[]
+    kws = Expr[]
+    for a in rhs.args[2:end]
+        if a isa Expr && a.head === :parameters
+            append!(kws, a.args)
+        else
+            push!(posargs, a)
+        end
+    end
+    isempty(posargs) ||
         _sfail("parameter $lhs: `Flat()` takes no arguments in slice 1")
-    return SampledParameter(lhs, :flat, NamedTuple(), nothing, lhs)
+    isempty(kws) &&
+        return SampledParameter(lhs, :flat, NamedTuple(), nothing, lhs)
+    return _lower_flat_support(lhs, kws)
+end
+
+# Flat with support: `Flat(; lower=0)` (positive, Stan kernel),
+# `Flat(; upper=hi)` (upper-bounded), `Flat(; lower=lo, upper=hi)`
+# (finite interval). Improper throughout: density 0.0, Jacobian only —
+# the posteriordb flat-sigma / flat-interval shape (e.g. radon_county
+# sigmas, kidscore/wells flat sigmas). Bounds are finite literals;
+# one-sided lower at nonzero has no spelling (no :floored override in
+# slice 1) and fails closed naming the admitted forms.
+function _lower_flat_support(lhs, kws::Vector{Expr})
+    have_lower = false
+    have_upper = false
+    lower = NaN
+    upper = NaN
+    for kw in kws
+        kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
+            _sfail("parameter $lhs: flat support takes `lower=`/`upper=` " *
+                   "(`Flat(; lower=0)`, `Flat(; upper=hi)`, or " *
+                   "`Flat(; lower=lo, upper=hi)`), got $(repr(kw))")
+        k, v = kw.args[1], kw.args[2]
+        k === :lower || k === :upper ||
+            _sfail("parameter $lhs: unknown flat keyword `$k` — " *
+                   "admitted: `Flat(; lower=0)`, `Flat(; upper=hi)`, " *
+                   "`Flat(; lower=lo, upper=hi)`")
+        v isa Real && isfinite(v) ||
+            _sfail("parameter $lhs: flat `$k` must be a finite " *
+                   "literal, got $(repr(v))")
+        if k === :lower
+            lower = Float64(v)
+            have_lower = true
+        else
+            upper = Float64(v)
+            have_upper = true
+        end
+    end
+    if have_lower && !have_upper
+        lower == 0 || _sfail("parameter $lhs: one-sided flat `lower` " *
+                             "must be literal 0 (`Flat(; lower=0)` for " *
+                             "positive support); a lower bound at $lower " *
+                             "needs its pair (`Flat(; lower=$lower, " *
+                             "upper=hi)` with $lower < hi)")
+        return SampledParameter(lhs, :flat, NamedTuple(),
+            :positive_stan, lhs)
+    end
+    if have_upper && !have_lower
+        return SampledParameter(lhs, :flat, NamedTuple(),
+            (:upper, upper), lhs)
+    end
+    lower < upper || _sfail("parameter $lhs: flat interval needs " *
+                            "lower < upper, got ($lower, $upper)")
+    return SampledParameter(lhs, :flat, NamedTuple(),
+        (:interval, lower, upper), lhs)
 end
 
 # `HalfNormal(s)` / `HalfCauchy(s)` lower to the `:positive` support
