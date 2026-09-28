@@ -282,6 +282,59 @@ end
         @test occursin("single-output recipes", sprint(showerror, err))
         @test occursin("recipe 1", sprint(showerror, err))
     end
+
+    @testset "partitioned lane gathers reuse their cache" begin
+        gather = ReactiveKernels._LaneGather(4)
+        x = [10.0, 20.0, 30.0, 40.0]
+        lanes = [3, 1, 4]
+        cache = Vector{Float64}(undef, 3)
+        out = MutatingFunctions.apply!!(cache, gather, x, lanes)
+        @test out === cache
+        @test out == x[lanes]
+        # A singleton argument fills (the twin's `x[ones(...)]` branch),
+        # even for out-of-range lane indices that would throw on a gather.
+        solo = [7.0]
+        fill_cache = Vector{Float64}(undef, 2)
+        filled = MutatingFunctions.apply!!(fill_cache, gather, solo, [9, 9])
+        @test filled === fill_cache
+        @test filled == [7.0, 7.0]
+        # Shape mismatches fall back to the twin call and reseed.
+        wrong = Vector{Float64}(undef, 1)
+        @test MutatingFunctions.apply!!(wrong, gather, x, lanes) == x[lanes]
+        @test MutatingFunctions.apply!!(wrong, gather, solo, [9, 9]) == [7.0, 7.0]
+        # The twin's errors survive the rule unchanged.
+        @test_throws DimensionMismatch MutatingFunctions.apply!!(
+            cache, gather, [1.0, 2.0], lanes)
+        @test_throws DimensionMismatch gather([1.0, 2.0], lanes)
+        oob_cache = Vector{Float64}(undef, 2)
+        @test_throws BoundsError MutatingFunctions.apply!!(
+            oob_cache, gather, x, [1, 99])
+        # Bool lanes take the twin's mask selection, never positional indexing.
+        mask = [true, false, true, false]
+        @test MutatingFunctions.apply!!(cache, gather, x, mask) ==
+            gather(x, mask) == [10.0, 30.0]
+        # Scalar arguments pass through untouched.
+        @test MutatingFunctions.apply!!(cache, gather, 2.0, lanes) == 2.0
+        # Steady-state reuse allocates nothing.
+        @test (@allocated MutatingFunctions.apply!!(cache, gather, x, lanes)) == 0
+    end
+
+    @testset "partitioned plates stay allocation-free end to end" begin
+        isdefined(@__MODULE__, :BranchPartition) ||
+            include("fixtures/branch_partition.jl")
+        C = BranchPartition
+        x = [0.5, 1.5, 2.0, 0.25, 3.0, 1.25, 0.75]
+        y = [1.0, -2.0, 0.5, -1.0, 2.0, -0.5, 1.5]
+        reference = sum(yi > 0 ? log(xi * yi) : xi - 1.0
+                        for (xi, yi) in zip(x, y))
+        k = prepare_nonallocating(C.guarded; have = (:x, :y), want = :total,
+                                  bound = (; y))
+        @test any(op -> op isa ReactiveKernels._LaneGather, k.ops)
+        @test k(x) ≈ reference
+        allocated = kernel_allocations(k, x)
+        println("NONALLOCATING_ALLOC_BYTES\tlane_gather\t", allocated)
+        @test allocated == 0
+    end
 end
 
 @testset "partial evaluation through non-allocating preparation" begin
