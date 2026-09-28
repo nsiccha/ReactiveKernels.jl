@@ -1,0 +1,267 @@
+# SB parity: matrix-b mixture (M1/M2/M3) + rate-GLM (G6/G7) legs vs the
+# pair partner's BridgeStan numbers (briefs 2026-09-27T22-26-41-960-17idfk9
+# (mixtures) and 2026-09-27T22-25-49-345-ia3a6q (glm) on
+# BayesianRegressionModels:rk:kernel:matrix-b, BRM 88c5621, StanBlocks
+# 342436de, BridgeStan 2.9.0). Full posterior at u, propto=false,
+# Jacobian included. Partner formulas + data recovered from their banked
+# run scripts (/tmp/matrix-b-mixtures.jl, /tmp/matrix-b-glm.jl); M2's
+# simplex point machine-read from their compiled model
+# (BridgeStan param_constrain at 0.3^14).
+#
+# Map audit (all verified in-tree): RK `:real`/`:positive`/`:interval`
+# transforms are bit-identical to Stan's (affine-logistic interval,
+# exp positive, identity real) with identical log-Jacobians, and
+# Uniform/Beta/Gamma/Dirichlet prior densities match Stan's
+# propto=false forms — so G6/G7 compare DIRECTLY at the same u, and
+# mixture mus/sigmas ride identical coords. The ONE structural gap: RK
+# simplex is stick-breaking, Stan's is ILR/softmax (Helmert contrasts —
+# confirmed: hand-derived prediction matched machine-read
+# param_constrain to 5 digits). Mixture legs therefore translate the
+# probe (u_RK* = same mus/sigmas, w-block = stick-breaking inverse of
+# w_SB) and assert
+#   RK_value(u_RK*) - SB_banked == RK_stick_jac - SB_ILR_jac
+# with SB_ILR_jac = sum(log, w) + 0.5*log(K) — confirmed empirically
+# against BOTH banked M1 (gap closes exactly) and M2 (matches to ~1e-4
+# by hand). Both directions of the stick map are hand-rolled below
+# (independent of the implementation under test); the value assertions
+# still catch implementation bugs because kern() runs the real maps.
+# (`_check_gradient` / `_GEN_BACKEND` come from test_generator.jl.)
+using Distributions: Normal, Dirichlet, Beta, Gamma, Binomial, Poisson,
+    logpdf
+using ReactiveKernels
+using ReactiveKernelsPPL
+using Test
+
+# ---- Hand-rolled stick-breaking pair (independent of layout.jl) ----
+_sb_logistic(x) = 1.0 / (1.0 + exp(-x))
+
+# Inverse: simplex -> K-1 logits (z_j = w_j / remaining).
+function _sb_unconstrain(w::AbstractVector)
+    K = length(w)
+    u = Vector{Float64}(undef, K - 1)
+    remaining = 1.0
+    for j in 1:(K - 1)
+        z = w[j] / remaining
+        u[j] = log(z) - log1p(-z) - log(K - j)
+        remaining -= w[j]
+    end
+    return u
+end
+
+# Forward log-Jacobian: sum over breaks of log(r) + log(z) + log1p(-z).
+function _sb_logjac(u::AbstractVector)
+    K = length(u) + 1
+    lr, acc = 0.0, 0.0
+    for j in 1:(K - 1)
+        z = _sb_logistic(u[j] + log(K - j))
+        l = log1p(-z)
+        acc += lr + log(z) + l
+        lr += l
+    end
+    return acc
+end
+
+# Stan ILR simplex log-Jacobian (empirically confirmed, see header).
+_stan_simplex_logjac(w::AbstractVector) = sum(log, w) + 0.5 * log(length(w))
+
+# Stable K-term log-sum-exp over a vector of log terms.
+function _sb_logsumexp(ts::AbstractVector)
+    m = maximum(ts)
+    return m + log(sum(exp, ts .- m))
+end
+
+function _sb_query(prog::Expr, cols::Dict{Symbol,<:AbstractVector})
+    plan = lower_rkppl(prog, keys(cols))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    kern = prepare_query(built, bound, :sampler)
+    return bound, built, kern, built.layout
+end
+
+_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
+
+# Posterior at an unconstrained probe (world-age-safe call).
+_sb_posterior(kern, lay, u) = Base.invokelatest(kern, u)
+
+@testset "M1 normal_mixture SB parity" begin
+    # SB: mu1,mu2 ~ Normal(0,10); w ~ Dirichlet(2,1.0);
+    # y ~ Mixture([N(mu1,1), N(mu2,1)], w); y=[-2,-1.8,1.9,2.2];
+    # u=zeros(3), names [mu1,mu2,w.1], value -19.003522156056047.
+    # w_SB at zeros = [0.5, 0.5] (machine-read CONSTRAINED M1).
+    prog = Meta.parse("""begin
+        mu1 ~ Normal(0.0, 10.0)
+        mu2 ~ Normal(0.0, 10.0)
+        w ~ Dirichlet(2, 1.0)
+        y .~ MixtureModel.([Normal.(mu1, 1.0), Normal.(mu2, 1.0)], w)
+    end""")
+    cols = Dict{Symbol,AbstractVector}(:y => [-2.0, -1.8, 1.9, 2.2])
+    bound, built, kern, lay = _sb_query(prog, cols)
+    names = coordinate_names(lay)
+    w_sb = [0.5, 0.5]
+    uw = _sb_unconstrain(w_sb)
+    @test length(uw) == 1 && abs(uw[1]) < 1e-15
+    widx = findall(n -> !(n in (:mu1, :mu2)), names)
+    @test length(widx) == 1
+    u = zeros(length(names))
+    u[widx] .= uw
+    got = _sb_posterior(kern, lay, u)
+    sb_val = -19.003522156056047
+    # Cross-parity: same constrained point, Jacobian difference only.
+    @test abs((got - sb_val) -
+              (_sb_logjac(uw) - _stan_simplex_logjac(w_sb))) < 1e-12
+    # Independent oracle at the RK probe (self-consistency).
+    pr = logpdf(Normal(0, 10), 0.0) + logpdf(Normal(0, 10), 0.0) +
+         logpdf(Dirichlet([1.0, 1.0]), w_sb)
+    lik = sum(cols[:y]) do v
+        _sb_logsumexp([log(w_sb[1]) + logpdf(Normal(0, 1), v),
+            log(w_sb[2]) + logpdf(Normal(0, 1), v)])
+    end
+    @test abs(got - (pr + lik + _sb_logjac(uw))) < 1e-12
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "M2 normal_mixture_k SB parity" begin
+    # SB: mu1..5 ~ Normal(0,10); s1..5 ~ Uniform(0,10); w ~ Dirichlet(5,1.0);
+    # y ~ Mixture(5 x N(mui,si), w); y=[-3,-2.5,0.1,0.5,2.0,2.8];
+    # u=0.3^14, value -43.83833258031802. w_SB machine-read from the
+    # partner's compiled model (param_constrain at 0.3^14); mus/sigmas ride
+    # identical coords (identity + affine-logistic interval, same u).
+    prog = Meta.parse("""begin
+        mu1 ~ Normal(0.0, 10.0)
+        mu2 ~ Normal(0.0, 10.0)
+        mu3 ~ Normal(0.0, 10.0)
+        mu4 ~ Normal(0.0, 10.0)
+        mu5 ~ Normal(0.0, 10.0)
+        s1 ~ Uniform(0.0, 10.0)
+        s2 ~ Uniform(0.0, 10.0)
+        s3 ~ Uniform(0.0, 10.0)
+        s4 ~ Uniform(0.0, 10.0)
+        s5 ~ Uniform(0.0, 10.0)
+        w ~ Dirichlet(5, 1.0)
+        y .~ MixtureModel.([Normal.(mu1, s1), Normal.(mu2, s2),
+            Normal.(mu3, s3), Normal.(mu4, s4), Normal.(mu5, s5)], w)
+    end""")
+    y = [-3.0, -2.5, 0.1, 0.5, 2.0, 2.8]
+    cols = Dict{Symbol,AbstractVector}(:y => y)
+    bound, built, kern, lay = _sb_query(prog, cols)
+    names = coordinate_names(lay)
+    w_sb = [0.31350412057955673, 0.20511041318944392, 0.17560848639229368,
+        0.15866512050066742, 0.14711185933803816]
+    uw = _sb_unconstrain(w_sb)
+    rest = [:mu1, :mu2, :mu3, :mu4, :mu5, :s1, :s2, :s3, :s4, :s5]
+    widx = findall(n -> !(n in rest), names)
+    @test length(widx) == 4
+    u = [n in rest ? 0.3 : 0.0 for n in names]
+    u[widx] .= uw
+    got = _sb_posterior(kern, lay, u)
+    sb_val = -43.83833258031802
+    @test abs((got - sb_val) -
+              (_sb_logjac(uw) - _stan_simplex_logjac(w_sb))) < 1e-12
+    # Independent oracle at the RK probe (self-consistency).
+    s_at = 10.0 * _sb_logistic(0.3)
+    pr = sum(logpdf(Normal(0, 10), 0.3) for _ in 1:5) + 5 * (-log(10.0)) +
+         logpdf(Dirichlet(fill(1.0, 5)), w_sb)
+    lik = sum(y) do v
+        _sb_logsumexp([log(w_sb[k]) + logpdf(Normal(0.3, s_at), v)
+                       for k in 1:5])
+    end
+    ijac = log(s_at) + log(10.0 - s_at) - log(10.0)
+    @test abs(got - (pr + lik + 5 * ijac + _sb_logjac(uw))) < 1e-12
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "M3 low_dim_gauss_mix SB parity" begin
+    # SB: mu1,mu2 ~ Normal(0,2); s1,s2 ~ Normal(0,2) (UNCONSTRAINED reals
+    # threaded raw as sigmas — garbage-in-garbage-out exactly like Stan);
+    # w ~ Dirichlet(2,5.0); y=[-1.5,-1.2,0.9,1.1]; value -41.77127219940857.
+    # PROBE ERRATUM: the partner brief table says u=zeros, but the banked
+    # value is at 0.3^5 (their reruns script; at zeros sigma=0 makes the
+    # density non-finite, while 0.3^5 reconstructs the banked value).
+    # w_SB = Stan K=2 ILR at z=0.3 (partner-validated simplex2).
+    # M4 (low_dim_gauss_mix_collapse) is banked IDENTICAL (m4=m3 in the
+    # partner script, same value) — this leg covers both.
+    prog = Meta.parse("""begin
+        mu1 ~ Normal(0.0, 2.0)
+        mu2 ~ Normal(0.0, 2.0)
+        s1 ~ Normal(0.0, 2.0)
+        s2 ~ Normal(0.0, 2.0)
+        w ~ Dirichlet(2, 5.0)
+        y .~ MixtureModel.([Normal.(mu1, s1), Normal.(mu2, s2)], w)
+    end""")
+    y = [-1.5, -1.2, 0.9, 1.1]
+    cols = Dict{Symbol,AbstractVector}(:y => y)
+    bound, built, kern, lay = _sb_query(prog, cols)
+    names = coordinate_names(lay)
+    w_sb = [0.6045031524689135, 0.3954968475310864]
+    uw = _sb_unconstrain(w_sb)
+    rest = [:mu1, :mu2, :s1, :s2]
+    widx = findall(n -> !(n in rest), names)
+    @test length(widx) == 1
+    u = [n in rest ? 0.3 : 0.0 for n in names]
+    u[widx] .= uw
+    got = _sb_posterior(kern, lay, u)
+    sb_val = -41.77127219940857
+    @test abs((got - sb_val) -
+              (_sb_logjac(uw) - _stan_simplex_logjac(w_sb))) < 1e-12
+    pr = sum(logpdf(Normal(0, 2), 0.3) for _ in 1:4) +
+         logpdf(Dirichlet([5.0, 5.0]), w_sb)
+    lik = sum(y) do v
+        _sb_logsumexp([log(w_sb[1]) + logpdf(Normal(0.3, 0.3), v),
+            log(w_sb[2]) + logpdf(Normal(0.3, 0.3), v)])
+    end
+    @test abs(got - (pr + lik + _sb_logjac(uw))) < 1e-12
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "G6 beta-binomial SB parity" begin
+    # SB: rate ~ Beta(2,2); successes ~ Binomial(trials, rate);
+    # successes=[7,4,9], trials=[10,10,12]; u=zeros(1);
+    # value -7.633312211078095, grad [4.0]. Direct u-parity (same
+    # logistic map + Beta density both sides).
+    prog = Meta.parse("""begin
+        rate ~ Beta(2.0, 2.0)
+        k .~ Binomial.(n, rate)
+    end""")
+    cols = Dict{Symbol,AbstractVector}(:k => [7, 4, 9], :n => [10, 10, 12])
+    bound, built, kern, lay = _sb_query(prog, cols)
+    names = coordinate_names(lay)
+    u = _sb_vec(names, [:rate => 0.0])
+    @test abs(Base.invokelatest(kern, u) - (-7.633312211078095)) < 1e-12
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    sampler_value_and_gradient!(prep, g, u)
+    @test all(isfinite, g)
+    @test maximum(abs.(g .- _sb_vec(names, [:rate => 4.0]))) < 1e-10
+    # Independent oracle at the probe (rate=0.5).
+    want = logpdf(Beta(2.0, 2.0), 0.5) +
+           sum(logpdf(Binomial(n, 0.5), k)
+               for (k, n) in ((7, 10), (4, 10), (9, 12))) +
+           log(0.5) + log(0.5)
+    @test abs(Base.invokelatest(kern, u) - want) < 1e-12
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "G7 poisson-gamma SB parity" begin
+    # SB: rate ~ Gamma(2,1); counts ~ Poisson(rate); counts=[3,1,6,2];
+    # u=zeros(1); value -14.064157861798101, grad [9.0]. Direct u-parity
+    # (same exp map + Gamma density both sides).
+    prog = Meta.parse("""begin
+        rate ~ Gamma(2.0, 1.0)
+        y .~ Poisson.(rate)
+    end""")
+    cols = Dict{Symbol,AbstractVector}(:y => [3, 1, 6, 2])
+    bound, built, kern, lay = _sb_query(prog, cols)
+    names = coordinate_names(lay)
+    u = _sb_vec(names, [:rate => 0.0])
+    @test abs(Base.invokelatest(kern, u) - (-14.064157861798101)) < 1e-12
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    sampler_value_and_gradient!(prep, g, u)
+    @test all(isfinite, g)
+    @test maximum(abs.(g .- _sb_vec(names, [:rate => 9.0]))) < 1e-10
+    want = logpdf(Gamma(2.0, 1.0), 1.0) +
+           sum(logpdf(Poisson(1.0), v) for v in (3, 1, 6, 2)) +
+           log(1.0) # exp Jacobian at u=0 is log(1)=0; kept explicit
+    @test abs(Base.invokelatest(kern, u) - want) < 1e-12
+    _check_gradient(built.spec, bound, u)
+end

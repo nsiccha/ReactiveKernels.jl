@@ -5863,8 +5863,8 @@ end
 # treatment (`_lower_location`'s named-definition arm) under the use-site
 # link — affine analysis, coefficient-use recording, one link per
 # predictor. Family admission (Gaussian/NB2/Gamma/Beta-log-only/Student
-# sigma/Student nu/hurdle/VonMises-log-only/BB2/NB1-logit-only;
-# IG/LogNormal/Weibull deferred) is the
+# sigma/Student nu/hurdle/VonMises-log-only/BB2/NB1-logit-only/
+# IG-log-only; LogNormal/Weibull deferred) is the
 # contract's gate (`_validate_scale_predictor` / `_validate_nu`), so
 # hand-built plans get the same rule.
 function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,

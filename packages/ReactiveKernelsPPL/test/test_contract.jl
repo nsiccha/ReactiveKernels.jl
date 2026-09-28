@@ -930,9 +930,17 @@ end
                 _none_evidence(), :y_resp)
         @test_throws ContractValidationError validate_plan(bad)
     end
-    # Predictor-fed lambda is deferred (the Beta-kappa precedent), on
-    # every link.
-    for link in (IdentityLink, LogLink, LogitLink)
+    # A log-link lambda predictor is admitted (the `log(lam) ~ 1` demand).
+    good = _ig_plan()
+    push!(good.predictors, PredictorSpec(:ls, LogLink, _terms(), :ls))
+    append!(good.population_priors, _priors(:ls))
+    good.responses[1] =
+        LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
+            ScalePredictorRef(:ls, LogLink), nothing,
+            _none_evidence(), :y_resp)
+    @test validate_plan(good) === nothing
+    # Identity/logit lambda predictor links fail closed (a shape).
+    for link in (IdentityLink, LogitLink)
         bad = _ig_plan()
         push!(bad.predictors, PredictorSpec(:ls, link, _terms(), :ls))
         append!(bad.population_priors, _priors(:ls))
@@ -942,6 +950,13 @@ end
                 _none_evidence(), :y_resp)
         @test_throws ContractValidationError validate_plan(bad)
     end
+    # But not the response's own location predictor.
+    bad = _ig_plan()
+    bad.responses[1] =
+        LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
+            ScalePredictorRef(:eta, LogLink), nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
     # InverseGaussian response must be strictly positive (Bool excluded).
     bad = _ig_plan()
     bad.columns[:y] = [0.7, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
