@@ -143,6 +143,7 @@ intercept is the initial level, so no coefficient is identified)."""
     VaryingEffectTerm
     MatrixTerm
     DarSummandTerm
+    ComposedTerm
 end
 
 """
@@ -1846,6 +1847,7 @@ const TERM_NAMES = Dict{Symbol,TermKind}(
     :monotonic_summand => MonotonicSummandTerm,
     :matrix => MatrixTerm,
     :dar_summand => DarSummandTerm,
+    :composed => ComposedTerm,
 )
 
 """Allowlisted assignment functions (slice 1: scalar ops + whole-column
@@ -2071,7 +2073,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
     VaryingEffectTerm, SplineSummandTerm, HSGPSummandTerm,
     ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm, MatrixTerm,
-    DarSummandTerm)
+    DarSummandTerm, ComposedTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate):
 scalar/reduction vocabulary plus vector-returning whole-column functions."""
@@ -5796,6 +5798,10 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
         _validate_dar_term(t, pred, plan)
         return nothing
     end
+    if t.kind === ComposedTerm
+        _validate_composed_term(t, pred, plan)
+        return nothing
+    end
     t.options == NamedTuple() ||
         _fail(t.label, "terms take no options (slice 1: factor sizing " *
                        "lives in LevelMap)")
@@ -6012,6 +6018,92 @@ function _validate_dar_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPl
     any(s -> s.state === o.dar_id, plan.dar_paths) ||
         _fail(t.label, "dar summand addresses unknown dar state " *
               ":$(o.dar_id) (no such `dar()` trajectory)")
+    return nothing
+end
+
+const _COMPOSED_OPS = (:.*, :.+, :.-)
+const _COMPOSED_AFFINE_KINDS =
+    (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
+
+"""Recurse a composed tree: leaves must be declared subs/scalars, nodes
+dotted `.*`/`.+`/`.−` of matching arity. Returns the leaf set."""
+function _validate_composed_tree(tree, subs::Vector{Symbol},
+        scalars::Vector{Symbol}, label::Symbol)
+    allowed = union(subs, scalars)
+    leaves = Symbol[]
+    function walk(node)
+        if node isa Symbol
+            node in allowed || _fail(label,
+                "composed tree leaf $node is neither a declared " *
+                "sub-predictor $subs nor a scalar $scalars")
+            push!(leaves, node)
+            return nothing
+        end
+        node isa Expr && node.head === :call && !isempty(node.args) &&
+            node.args[1] isa Symbol || _fail(label,
+                "composed tree node $(repr(node)) is not a dotted call " *
+                "(v1: `. .*`/`.+`/`.−` over sub-predictors and scalars)")
+        op = node.args[1]
+        op in _COMPOSED_OPS || _fail(label,
+            "composed tree op $op is not admitted (v1: `. .*`, `.+`, `.−`)")
+        args = node.args[2:end]
+        if op === :.-
+            length(args) == 1 || length(args) == 2 ||
+                _fail(label, "composed `.−` takes one or two operands, " *
+                      "got $(length(args))")
+        else
+            length(args) == 2 ||
+                _fail(label, "composed `$op` takes two operands, " *
+                      "got $(length(args))")
+        end
+        for a in args
+            walk(a)
+        end
+        return nothing
+    end
+    walk(tree)
+    return leaves
+end
+
+function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
+        plan::StructuralPlan)
+    o = t.options
+    Tuple(keys(o)) == (:tree, :subs, :scalars) ||
+        _fail(t.label, "composed options must be exactly " *
+              "`(tree, subs, scalars)`, got $(Tuple(keys(o)))")
+    o.subs isa Vector{Symbol} && o.scalars isa Vector{Symbol} ||
+        _fail(t.label, "composed subs/scalars must be `Vector{Symbol}`")
+    isempty(t.columns) ||
+        _fail(t.label, "composed term carries no columns (sub-predictors " *
+              "and scalars resolve in-graph), got $(t.columns)")
+    length(pred.terms) == 1 ||
+        _fail(t.label, "composed term is the whole linear predictor " *
+              "(no sibling design terms in v1)")
+    any(pp -> pp.predictor === pred.name, plan.population_priors) &&
+        _fail(t.label, "composed predictor $(pred.name) takes no " *
+              "population priors (coefficients live in the " *
+              "sub-predictors)")
+    myidx = findfirst(p -> p.name === pred.name, plan.predictors)
+    for s in o.subs
+        sidx = findfirst(p -> p.name === s, plan.predictors)
+        sidx === nothing &&
+            _fail(t.label, "composed sub-predictor $s names no predictor")
+        sidx < myidx ||
+            _fail(t.label, "composed sub-predictor $s must precede " *
+                  "$(pred.name) (LP nodes emit in plan order)")
+        sub = plan.predictors[sidx]
+        all(u -> u.kind in _COMPOSED_AFFINE_KINDS, sub.terms) ||
+            _fail(t.label, "composed sub-predictor $s must be affine " *
+                  "(v1: intercept/continuous/factor/offset terms only — " *
+                  "no nested compositions, latents, or summands)")
+    end
+    known = _union_names(plan)
+    for c in o.scalars
+        c in known ||
+            _fail(t.label, "composed scalar $c is neither a sampled " *
+                  "parameter nor a scalar assignment")
+    end
+    _validate_composed_tree(o.tree, o.subs, o.scalars, t.label)
     return nothing
 end
 
@@ -6387,7 +6479,9 @@ function _validate_priors(plan::StructuralPlan)
         # hsgp summands an HSGPBasis, and monotonic summands (mo1) an
         # increment simplex, whose geometries are self-priored — none needs
         # a coefficient prior. Monotonic (mo) terms DO take a free
-        # coefficient, so they stay in the addressee set. Matrix terms
+        # coefficient, so they stay in the addressee set. Composed terms
+        # carry no coefficient either (theirs live in the sub-predictors).
+        # Matrix terms
         # expand to their per-element addressees (one PopulationPrior row
         # per matrix column).
         addressees = Set{Symbol}()
@@ -6398,7 +6492,8 @@ function _validate_priors(plan::StructuralPlan)
                 t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||
                 t.kind === MonotonicSummandTerm ||
-                t.kind === DarSummandTerm) && continue
+                t.kind === DarSummandTerm ||
+                t.kind === ComposedTerm) && continue
             if t.kind === MatrixTerm
                 m = _find_matrix(plan, t.options.matrix)
                 m === nothing && _fail(:plan,
@@ -7636,6 +7731,14 @@ function _validate_responses(plan::StructuralPlan)
     for kp in plan.kernel_plates
         for (p, _) in kp.lp_args
             push!(used_predictors, p)
+        end
+    end
+    # Composed sub-predictors are used by their composed predictor (the
+    # tree references them, not any response slot).
+    for pred in plan.predictors
+        for t in pred.terms
+            t.kind === ComposedTerm || continue
+            union!(used_predictors, t.options.subs)
         end
     end
     for pred in plan.predictors

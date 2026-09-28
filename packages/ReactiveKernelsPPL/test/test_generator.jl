@@ -2484,3 +2484,47 @@ end
     @test prepare(pl)([u]) ≈ x + u
     @test !occursin("upper_bijector", sprint(show, code_expr(pl)))
 end
+
+# Composed predictors evaluate their combination tree in-graph: sub-LPs
+# resolve to their LP nodes, scalars to constrained locals — plain
+# broadcast math under ordinary reverse mode.
+function _gen_composed_plan()
+    cols, n = _gen_columns()
+    cols[:y] = [false, true, true, false, true, false]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[
+            PredictorSpec(:th, IdentityLink, _gen_terms(), :th),
+            PredictorSpec(:al, IdentityLink, _gen_terms(), :al),
+            PredictorSpec(:eta, IdentityLink,
+                TermSpec[TermSpec(ComposedTerm, ColumnRef[],
+                    (tree = :(be .* (th .- al)), subs = [:th, :al],
+                        scalars = [:be]),
+                    :eta_composed, :eta_composed)], :eta)],
+        PopulationPrior[vcat(_gen_priors(:th), _gen_priors(:al))...],
+        SampledParameter[SampledParameter(:be, :normal,
+            (arg1 = 0.0, arg2 = 5.0), nothing, :be)],
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "composed values and gradient" begin
+    plan = _gen_composed_plan()
+    built = build_kernel(plan)
+    u = [0.25, 0.5, -0.1, 0.3, 0.7]
+    nt = constrain(built.layout, u)
+    cth, cal, be = Vector(nt.th), Vector(nt.al), nt.be
+    th = cth[1] .+ cth[2] .* plan.columns[:x]
+    al = cal[1] .+ cal[2] .* plan.columns[:x]
+    eta = be .* (th .- al)
+    ll = sum(logpdf.(Bernoulli.(1 ./ (1 .+ exp.(-eta))), plan.columns[:y]))
+    pr = sum(logpdf(Normal(0, 1), c) for c in (cth[1], cal[1])) +
+        sum(logpdf(Normal(0, 2), c) for c in (cth[2], cal[2])) +
+        logpdf(Normal(0, 5), be)
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end

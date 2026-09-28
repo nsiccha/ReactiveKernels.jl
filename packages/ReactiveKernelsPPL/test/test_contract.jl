@@ -372,7 +372,7 @@ end
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
-        MatrixTerm, DarSummandTerm)
+        MatrixTerm, DarSummandTerm, ComposedTerm)
     @test :log in admitted_functions()
     @test :sum in admitted_functions()
     @test :tanh in admitted_functions()
