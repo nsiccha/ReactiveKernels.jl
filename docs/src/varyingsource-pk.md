@@ -82,7 +82,13 @@ different controls with `prepare_varyingsource_pk(; series_rtol, watson_terms)`.
 The grouped emitter currently uses the default controls. The
 [unit-response comparison](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/transit_twocmt)
 measures reverse gradients against actual Stan BDF; it does not measure this
-complete PK slice or the full posterior.
+complete PK slice or the full posterior. The separate
+[emitted PK-slice comparison](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/varyingsource_pk)
+measures the full 17-coordinate slice density and reverse gradient on public
+synthetic 3/30-subject workloads, including GP feedback, likelihood, priors,
+and the sigma Jacobian. It records 14.5–50× speedups with gradient differences
+below production Stan's measured differences on those cases. It does not
+establish full-twin or real-fit performance.
 
 Native Enzyme reverse differentiates the ordinary cell and GP arithmetic.
 The transit primitive uses its existing generated mathematical reverse rule.
