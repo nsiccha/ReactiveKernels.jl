@@ -1,6 +1,7 @@
 using ReactiveKernelsPPL
 using Test
 
+include("test_parse_hygiene.jl")
 include("test_contract.jl")
 include("test_layout.jl")
 include("test_preprocessing.jl")

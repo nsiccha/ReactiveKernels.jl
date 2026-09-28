@@ -659,6 +659,7 @@ end
         @test maximum(abs.(g .- sb)) < 1e-10
         _check_gradient(built.spec, bound, u)
     end
+end
 @testset "spline tps HLO length invariance" begin
     # Data-length invariance (constraints.md): more rows must not
     # replicate the loop body. (Value+grad Reactant parity lives in
