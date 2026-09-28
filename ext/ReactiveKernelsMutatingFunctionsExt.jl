@@ -269,6 +269,32 @@ end
     _gather_slow!(cache, x, idx...)
 end
 
+# Partitioned-plate lane gathers: `x[lanes]` elementwise into the cache, or a
+# fill when the argument is a singleton (the twin's
+# `x[ones(Int, length(lanes))]` branch). The guards mirror the twin's branch
+# order exactly — the singleton check first, so out-of-range lane indices on
+# a length-1 argument fill rather than throwing — and any mismatch falls back
+# to the twin call, preserving its exact result and errors (`enumerate` keeps
+# the loop correct for any lane-vector axes). Bool lane masks stay on the
+# fallback: positional indexing with a Bool element is an error, not a mask
+# selection.
+@inline function MutatingFunctions.apply!!(
+        cache::Vector{T}, gather::ReactiveKernels._LaneGather,
+        x::AbstractVector{T}, lanes::AbstractVector{<:Integer}) where {T}
+    eltype(lanes) === Bool && return gather(x, lanes)
+    if length(x) == 1
+        length(cache) == length(lanes) || return gather(x, lanes)
+        fill!(cache, x[1])
+        return cache
+    end
+    ndims(x) == 1 && length(x) == gather.n || return gather(x, lanes)
+    length(cache) == length(lanes) || return gather(x, lanes)
+    for (i, lane) in enumerate(lanes)
+        cache[i] = x[lane]
+    end
+    cache
+end
+
 @inline function MutatingFunctions.apply!!(
         cache::Array{Float64,N}, op::ReactiveKernels._FillConstructorStep,
         dims::Vararg{Integer,N}) where {N}
@@ -276,6 +302,25 @@ end
     fill!(cache, ReactiveKernels._fill_constructor_value(op))
     cache
 end
+
+# Row/column reduction with a preparation-constant `dims`. Base's
+# `sum!`/`prod!`/`minimum!`/`maximum!` run the same per-lane `mapreducedim`
+# pass the allocating twin (`f(A; dims = ...)` uses, so values are
+# bit-identical; the cache must already have the exact result shape and
+# eltype, and anything else reseeds through the twin call.
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T}, op::ReactiveKernels._RowReduceStep, A::Array) where {T}
+    T === Base.promote_op(getfield(op, :f), eltype(A)) || return op(A)
+    axes(cache) == Base.reduced_indices(axes(A), getfield(op, :dims)) ||
+        return op(A)
+    _rk_rowreduce_inplace!(getfield(op, :f), cache, A)
+    cache
+end
+
+@inline _rk_rowreduce_inplace!(::typeof(sum), r, A) = Base.sum!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(prod), r, A) = Base.prod!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(minimum), r, A) = Base.minimum!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(maximum), r, A) = Base.maximum!(r, A)
 
 # --- public entry points ----------------------------------------------------
 

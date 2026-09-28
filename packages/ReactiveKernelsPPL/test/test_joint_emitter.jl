@@ -1166,8 +1166,10 @@ _je_router_kp() =
     badlit = (response = :dv, family = CensoredAddpropnormalFam,
         location = :mu, scale = 0.1, params = (:prop, :llq))
     @test_throws "literals do not lower" route(kp, badlit, :dv, :o1)
-    # Unrouted families fail naming the admitted set.
-    badfam = (response = :yy, family = BernoulliLogitFam,
+    # Unrouted families fail naming the admitted set (v2, ordered
+    # contract change: Bernoulli routes through the shared scalar
+    # emitter now, so the pin uses still-unroutable MixtureFam).
+    badfam = (response = :yy, family = MixtureFam,
         location = :mu, scale = 1.0, params = ())
     @test_throws "has no in-cell emitter" route(kp, badfam, :yy, :o1)
 end
@@ -1739,4 +1741,478 @@ end
     rval, rgrad = compiled(traced)
     @test Float64(rval) ≈ val atol = 1e-9
     @test Array(rgrad) ≈ g atol = 1e-6
+end
+
+# --- Axis 2: grouped scalar obs via the shared emitter ------------------------
+
+@testset "axis2 grouped Poisson obs end to end" begin
+    ast = Meta.parse("""begin
+        b0_vc ~ Normal(0.0, 1.0)
+        b1_vc ~ Normal(0.0, 1.0)
+        log_Vc = b0_vc .+ b1_vc .* age_s
+        pk_sched = linear_pk_schedule(obs = (:subj, :time),
+            dose = (:dsubj, :dtime, :damt))
+        @plate conc for s in 1:2
+            read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
+            mu = read_locs[pk_sched.obs_map]
+            lam = exp.(mu)
+            cc .~ Poisson.(lam)
+            lam
+        end
+    end""")
+    data = Set([:subj, :time, :dsubj, :dtime, :damt, :cc, :age_s])
+    unbound = lower_rkppl(ast, data)
+    @test only(only(unbound.kernel_plates).obs).family === PoissonLogFam
+    cols = Dict{Symbol,AbstractVector}(
+        :subj => [1, 1, 2, 2], :time => [10.0, 20.0, 5.0, 15.0],
+        :dsubj => [1, 2], :dtime => [0.0, 0.0],
+        :damt => [100.0, 50.0], :cc => [1, 0, 2, 1],
+        :age_s => [30.0, 40.0])
+    bound = bind_data(unbound, cols)
+    @test bound.n_obs == 4
+    built = build_kernel(bound)
+    names = coordinate_names(assign_layout(bound))
+    b0, b1 = 2.0, 0.01
+    u = _je_gather_u(names, 0.5, 0.7, b0, b1)
+    lps = b0 .+ b1 .* cols[:age_s]
+    sched = build_linear_pk_schedule(cols[:subj], cols[:time],
+        cols[:dsubj], cols[:dtime], cols[:damt])
+    conc = vcat([_je_oracle_auc_reads(sched, s,
+        zeros(s == 1 ? sched.op_ends[1] :
+            sched.op_ends[s] - sched.op_ends[s-1]),
+        lps[s], lps[s], lps[s], lps[s], lps[s])[1:sched.n_reads[s]]
+        for s in 1:2]...)
+    lam = exp.(conc[sched.obs_map])
+    want_like = sum(logpdf.(Poisson.(lam), cols[:cc]))
+    want = want_like + logpdf(Normal(0.0, 1.0), b0) +
+        logpdf(Normal(0.0, 1.0), b1)
+    @test prepare_query(built, bound, :likelihood)(u) ≈ want_like atol = 1e-9
+    @test prepare_query(built, bound, :sampler)(u) ≈ want atol = 1e-9
+    q = prepare_sampler(built, bound, u; backend = _JE_BACKEND)
+    g = Vector{Float64}(undef, length(u))
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    @test val ≈ want atol = 1e-9
+    fd = similar(u, Float64)
+    h = cbrt(eps(Float64))
+    for i in eachindex(u)
+        up, dn = copy(u), copy(u)
+        up[i] += h
+        dn[i] -= h
+        fd[i] = (prepare_query(built, bound, :sampler)(up) -
+            prepare_query(built, bound, :sampler)(dn)) / (2h)
+    end
+    @test g ≈ fd atol = 1e-6
+end
+
+@testset "axis2 grouped Bernoulli obs twins Int lanes" begin
+    ast = Meta.parse("""begin
+        b0_vc ~ Normal(0.0, 1.0)
+        b1_vc ~ Normal(0.0, 1.0)
+        log_Vc = b0_vc .+ b1_vc .* age_s
+        pk_sched = linear_pk_schedule(obs = (:subj, :time),
+            dose = (:dsubj, :dtime, :damt))
+        @plate conc for s in 1:2
+            read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
+            mu = read_locs[pk_sched.obs_map]
+            p = 1 ./ (1 .+ exp.(.-mu))
+            cc .~ Bernoulli.(p)
+            p
+        end
+    end""")
+    data = Set([:subj, :time, :dsubj, :dtime, :damt, :cc, :age_s])
+    unbound = lower_rkppl(ast, data)
+    @test only(only(unbound.kernel_plates).obs).family === BernoulliLogitFam
+    cols = Dict{Symbol,AbstractVector}(
+        :subj => [1, 1, 2, 2], :time => [10.0, 20.0, 5.0, 15.0],
+        :dsubj => [1, 2], :dtime => [0.0, 0.0],
+        :damt => [100.0, 50.0], :cc => [1, 0, 1, 1],
+        :age_s => [30.0, 40.0])
+    bound = bind_data(unbound, cols)
+    twin = bound.columns[ReactiveKernelsPPL._kbool_name(:conc, :cc)]
+    @test twin isa Vector{Bool}
+    @test twin == Bool[1, 0, 1, 1]
+    notwin = deepcopy(bound)
+    delete!(notwin.columns, ReactiveKernelsPPL._kbool_name(:conc, :cc))
+    kp = only(notwin.kernel_plates)
+    @test_throws "Bool twin" ReactiveKernelsPPL._validate_grouped_kernel_data(
+        notwin, kp)
+    built = build_kernel(bound)
+    names = coordinate_names(assign_layout(bound))
+    b0, b1 = 2.0, 0.01
+    u = _je_gather_u(names, 0.5, 0.7, b0, b1)
+    lps = b0 .+ b1 .* cols[:age_s]
+    sched = build_linear_pk_schedule(cols[:subj], cols[:time],
+        cols[:dsubj], cols[:dtime], cols[:damt])
+    conc = vcat([_je_oracle_auc_reads(sched, s,
+        zeros(s == 1 ? sched.op_ends[1] :
+            sched.op_ends[s] - sched.op_ends[s-1]),
+        lps[s], lps[s], lps[s], lps[s], lps[s])[1:sched.n_reads[s]]
+        for s in 1:2]...)
+    p = 1 ./ (1 .+ exp.(-conc[sched.obs_map]))
+    want_like = sum(logpdf.(Bernoulli.(p), Bool[1, 0, 1, 1]))
+    want = want_like + logpdf(Normal(0.0, 1.0), b0) +
+        logpdf(Normal(0.0, 1.0), b1)
+    @test prepare_query(built, bound, :likelihood)(u) ≈ want_like atol = 1e-9
+    @test prepare_query(built, bound, :sampler)(u) ≈ want atol = 1e-9
+    q = prepare_sampler(built, bound, u; backend = _JE_BACKEND)
+    g = Vector{Float64}(undef, length(u))
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    @test val ≈ want atol = 1e-9
+    fd = similar(u, Float64)
+    h = cbrt(eps(Float64))
+    for i in eachindex(u)
+        up, dn = copy(u), copy(u)
+        up[i] += h
+        dn[i] -= h
+        fd[i] = (prepare_query(built, bound, :sampler)(up) -
+            prepare_query(built, bound, :sampler)(dn)) / (2h)
+    end
+    @test g ≈ fd atol = 1e-6
+end
+
+@testset "axis3 two grouped plates stay fail-closed" begin
+    # v2 scope: panel plates compose freely, but multi-schedule grouped
+    # models are a sequenced follow-up.
+    ast = Meta.parse("""begin
+        b0_vc ~ Normal(0.0, 1.0)
+        b1_vc ~ Normal(0.0, 1.0)
+        log_Vc = b0_vc .+ b1_vc .* age_s
+        pk_sched = linear_pk_schedule(obs = (:subj, :time),
+            dose = (:dsubj, :dtime, :damt))
+        pk_sched2 = linear_pk_schedule(obs = (:subj, :time),
+            dose = (:dsubj, :dtime, :damt))
+        @plate conc for s in 1:2
+            read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
+            mu = read_locs[pk_sched.obs_map]
+            cc .~ Bernoulli.(mu)
+            mu
+        end
+        @plate conc2 for s2 in 1:2
+            read_locs2 = linear_pk_read_locs(pk_sched2, log_Vc, log_Vc,
+                log_Vc, log_Vc, log_Vc)
+            mu2 = read_locs2[pk_sched2.obs_map]
+            cc2 .~ Bernoulli.(mu2)
+            mu2
+        end
+    end""")
+    data = Set([:subj, :time, :dsubj, :dtime, :damt, :cc, :cc2, :age_s])
+    @test_throws "at most one grouped kernel plate" lower_rkppl(ast, data)
+end
+
+# Radon-kernel fixtures (arrays verbatim from
+# `ReactiveKernelsPPLExamples/src/radon_variable_intercept_noncentered.jl`,
+# N=60/J=8 subset with county sizes {4, 16, 7, 14, 10, 6, 2, 1}).
+function _radon_kernel_data()
+    county = vcat(fill(1, 4), fill(2, 16), fill(3, 7), fill(4, 14),
+        fill(5, 10), fill(6, 6), fill(7, 2), fill(8, 1))
+    floor = Float64[
+0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+0.0, 0.0, 1.0, 1.0, 1.0, 0.0,
+0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+1.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+0.0, 0.0, 0.0, 0.0, 1.0, 1.0,
+0.0, 1.0, 0.0, 0.0, 0.0, 0.0
+    ]
+    logradon = Float64[
+0.0953101798043249, 0.832909122935104, 1.09861228866811,
+0.832909122935104, 0.0953101798043249, 1.09861228866811,
+1.22377543162212, 0.182321556793955, 0.955511445027436,
+0.262364264467491, 0.693147180559945, 0.832909122935104,
+0.336472236621213, 0.182321556793955, 0.470003629245736,
+1.52605630349505, 0.641853886172395, 1.16315080980568,
+1.85629799036563, 1.22377543162212, 1.50407739677627,
+1.54756250871601, -0.693147180559945, 1.75785791755237,
+1.54756250871601, 1.85629799036563, 0.832909122935104,
+1.62924053973028, 0.641853886172395, 2.26176309847379,
+1.56861591791385, 1.3609765531356, 2.55722731136763,
+1.98787434815435, 1.94591014905531, 2.57261223020711,
+1.77495235091167, 2.66722820658195, 1.80828877117927,
+2.26176309847379, 1.93152141160321, 1.7404661748405,
+1.48160454092422, 0.336472236621213, 0.641853886172395,
+1.45861502269952, 0.741937344729377, 1.38629436111989,
+-0.105360515657826, 1.25276296849537, 0.832909122935104,
+2.27212588550934, -2.30258509299405, 1.56861591791385,
+0.53062825106217, 2.69462718077007, 2.56494935746154,
+0.405465108108164, 1.02961941718116, 1.38629436111989
+    ]
+    return county, floor, logradon
+end
+
+function _radon_kernel_ast()
+    Meta.parse("""begin
+        r ~ varying_effect(county_id, [1])
+        mu_alpha ~ Normal(0.0, 10.0)
+        beta ~ Normal(0.0, 10.0)
+        sigma_y ~ HalfNormal(1.0)
+        alpha = mu_alpha .+ r
+        cy = linear_pk_schedule(obs = (:county_idx, :time),
+            dose = (:dsubj, :dtime, :damt))
+        @plate radon for s in 1:8
+            aa = alpha[county_idx]
+            mu = aa .+ beta .* ff
+            yy .~ Normal.(mu, sigma_y)
+            mu
+        end
+    end""")
+end
+
+_radon_kernel_dnames() = Set([:county_id, :county_idx, :time,
+    :dsubj, :dtime, :damt, :ff, :yy])
+
+function _radon_kernel_cols()
+    county, floor, logradon = _radon_kernel_data()
+    Dict{Symbol,AbstractVector}(
+        :county_id => collect(1:8),
+        :county_idx => county, :time => Float64.(collect(1:60)),
+        :dsubj => Int[], :dtime => Float64[], :damt => Float64[],
+        :ff => floor, :yy => logradon)
+end
+
+@testset "axis1 radon-kernel grouped-LP, natural [1] spelling" begin
+    # Dose-free grouped plate (empty dose columns, structural schedule
+    # linkage); per-county alpha via a VaryingEffectTerm subject LP;
+    # floor via auto-slice; mu sampled (joint, dim 12).
+    # NOTE (snag intercept1-logno-f87f4be4, triaged + landed option A,
+    # main 34733f8b): SB's own plain-`(1|g)` path is log-scale, so the
+    # natural `[1]` spelling (:intercept1) IS the SB parity target. The
+    # earlier ones-data-column workaround (slope1, half-normal tau)
+    # matched SB's slope path instead and is dropped; the slope1-round
+    # SB pins (partner brief
+    # `BayesianRegressionModels:rk:kernel:plate/briefs/2026-09-27T18-47-51-506-1q1x9fe`,
+    # 13/13) are retired with it. Fresh plain-path SB probe numbers
+    # (partner brief
+    # `BayesianRegressionModels:rk:kernel:plate/briefs/2026-09-28T01-11-55-840-yuxyj5`,
+    # 9/9) pin the value + gradient below; the closed-form oracle
+    # matches the SB value bit-exactly (delta 0.0).
+    bound = bind_data(
+        lower_rkppl(_radon_kernel_ast(), _radon_kernel_dnames()),
+        _radon_kernel_cols())
+    @test bound.n_obs == 60
+    kp = only(bound.kernel_plates)
+    @test kp.subjects == 8
+    @test only(kp.schedules).name === :cy
+    @test only(bound.varying_draws).kind === :intercept1
+    built = build_kernel(bound)
+    names = coordinate_names(built.layout)
+    @test length(names) == 12
+    @test any(n -> startswith(String(n), "log_scale_"), names)
+    @test !any(n -> startswith(String(n), "tau_"), names)
+    # Probe point (shared with the partner's SB plain-path probe);
+    # map by name. NOTE: mu_alpha is consumed as the alpha LP's
+    # intercept coefficient, so its coordinate is `alpha.Intercept`
+    # (the b0_vc precedent), not a bare param.
+    praw = [0.1, -0.2, 0.3, -0.1, 0.2, 0.0, -0.3, 0.15]
+    u = map(names) do n
+        s = String(n)
+        startswith(s, "log_scale_") && return log(1.2)
+        startswith(s, "xi_") && return praw[parse(Int, split(s, ".")[2])]
+        n === Symbol("alpha.Intercept") && return 0.2
+        n === :beta && return 0.4
+        n === :sigma_y && return log(0.9)
+        error("unexpected coordinate $n")
+    end
+    # Closed-form plain-path oracle: example density + std-normal(xi) +
+    # std-normal(log_scale, u-space direct, no Jacobian) + population
+    # priors + half-normal sigma_y (+log2) with its log Jacobian.
+    county, floor, logradon = _radon_kernel_data()
+    sa, sy = 1.2, 0.9
+    alpha = 0.2 .+ sa .* praw
+    mu = alpha[county] .+ 0.4 .* floor
+    want = sum(logpdf.(Normal.(mu, sy), logradon)) +
+        sum(logpdf.(Normal(0.0, 1.0), praw)) +
+        logpdf(Normal(0.0, 1.0), log(sa)) +
+        logpdf(Normal(0.0, 10.0), 0.2) + logpdf(Normal(0.0, 10.0), 0.4) +
+        logpdf(Normal(0.0, 1.0), sy) + log(2) + log(sy)
+    @test prepare_query(built, bound, :sampler)(u) ≈ want rtol = 1e-10
+    q = prepare_sampler(built, bound, u; backend = _JE_BACKEND)
+    g = Vector{Float64}(undef, length(u))
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    @test val ≈ want rtol = 1e-10
+    # SB round-2 pins (plain path; SB u-order
+    # [mu, log_scale, xi×8, beta, sigma_y]); map by name.
+    sbval = -128.48657346033664
+    sbgrad = [67.53363912940304, -5.3910911481335635,
+        1.6477640212483597, 19.435382687407802, 3.8972152066688137,
+        37.210856108089196, 7.159340952414465, 7.301276295885807,
+        2.9001252226508503, 1.3408064609183559, 4.724317611877145,
+        68.29675182589588]
+    @test want ≈ sbval rtol = 1e-12
+    @test prepare_query(built, bound, :sampler)(u) ≈ sbval rtol = 1e-9
+    for (i, n) in enumerate(names)
+        s = String(n)
+        j = n === Symbol("alpha.Intercept") ? 1 :
+            startswith(s, "log_scale_") ? 2 :
+            startswith(s, "xi_") ? 2 + parse(Int, split(s, ".")[2]) :
+            n === :beta ? 11 : 12
+        @test g[i] ≈ sbgrad[j] rtol = 1e-8
+    end
+    fd = similar(u, Float64)
+    h = cbrt(eps(Float64))
+    for i in eachindex(u)
+        up, dn = copy(u), copy(u)
+        up[i] += h
+        dn[i] -= h
+        fd[i] = (prepare_query(built, bound, :sampler)(up) -
+            prepare_query(built, bound, :sampler)(dn)) / (2h)
+    end
+    @test g ≈ fd atol = 1e-6
+end
+
+@testset "axis1 dose/PK coherence + schedule linkage battery" begin
+    # Dose rows with no PK call: missing-call typo (or empty the dose).
+    cols1 = _radon_kernel_cols()
+    cols1[:dsubj] = [1]
+    cols1[:dtime] = [0.0]
+    cols1[:damt] = [100.0]
+    @test_throws "makes no PK call" bind_data(
+        lower_rkppl(_radon_kernel_ast(), _radon_kernel_dnames()), cols1)
+    # PK call with empty dose: the recurrence needs dose rows.
+    gcols = _je_gather_columns()
+    gcols[:dsubj] = Int[]
+    gcols[:dtime] = Float64[]
+    gcols[:damt] = Float64[]
+    @test_throws "binds no dose rows" bind_data(
+        lower_rkppl(_je_gather_ast(), _je_gather_data()), gcols)
+    # Two schedules, no refs: ambiguous linkage.
+    amb = Meta.parse("""begin
+        b ~ Normal(0.0, 1.0)
+        sg ~ Exponential(1.0)
+        lp = b .+ age_s
+        s1 = linear_pk_schedule(obs = (:subj, :time),
+            dose = (:dsubj, :dtime, :damt))
+        s2 = linear_pk_schedule(obs = (:subj, :time),
+            dose = (:dsubj, :dtime, :damt))
+        @plate p for s in 1:2
+            v = lp[subj]
+            yy .~ Normal.(v, sg)
+            v
+        end
+    end""")
+    ambdata =
+        Set([:age_s, :subj, :time, :dsubj, :dtime, :damt, :yy])
+    @test_throws "references no schedule" lower_rkppl(amb, ambdata)
+    # LP without any schedule: need one (empty dose for dose-free).
+    nosched = Meta.parse("""begin
+        b ~ Normal(0.0, 1.0)
+        sg ~ Exponential(1.0)
+        lp = b .+ age_s
+        @plate p for s in 1:2
+            v = lp[subj]
+            yy .~ Normal.(v, sg)
+            v
+        end
+    end""")
+    @test_throws "no schedule is declared" lower_rkppl(nosched, ambdata)
+end
+
+# Eight schools, plate-expressed (Rubin's y/se; one obs per school):
+# the second axis-1 representative model. Known-SE data-column scale
+# threads through the grouped plate like a response column.
+function _es8_kernel_data()
+    y = Float64[28, 8, -3, 7, -1, 1, 18, 12]
+    se = Float64[15, 10, 16, 11, 9, 11, 10, 18]
+    return y, se
+end
+
+function _es8_kernel_ast()
+    Meta.parse("""begin
+        r ~ varying_effect(school_id, [1])
+        mu ~ Normal(0.0, 10.0)
+        theta = mu .+ r
+        es = linear_pk_schedule(obs = (:school_idx, :time),
+            dose = (:dsubj, :dtime, :damt))
+        @plate es8 for s in 1:8
+            m = theta[school_idx]
+            yy .~ Normal.(m, se)
+            m
+        end
+    end""")
+end
+
+_es8_kernel_dnames() = Set([:school_id, :school_idx, :time,
+    :dsubj, :dtime, :damt, :yy, :se])
+
+function _es8_kernel_cols()
+    y, se = _es8_kernel_data()
+    Dict{Symbol,AbstractVector}(
+        :school_id => collect(1:8), :school_idx => collect(1:8),
+        :time => Float64.(collect(1:8)),
+        :dsubj => Int[], :dtime => Float64[], :damt => Float64[],
+        :yy => y, :se => se)
+end
+
+@testset "axis1 eight-schools dose-free grouped plate, natural [1]" begin
+    # Dose-free grouped plate (empty dose columns, structural schedule
+    # linkage); per-school theta via a VaryingEffectTerm subject LP;
+    # known per-school SE as a data-column scale (no sigma param —
+    # dim 10). SB joint-1 numbers (partner brief
+    # `BayesianRegressionModels:rk:kernel:plate/briefs/2026-09-28T02-55-02-354-1qqdmtf`)
+    # pin the value + gradient below (three-way value at 1ulp; SB
+    # grad vs oracle-FD max 6.8e-10).
+    bound = bind_data(
+        lower_rkppl(_es8_kernel_ast(), _es8_kernel_dnames()),
+        _es8_kernel_cols())
+    @test bound.n_obs == 8
+    kp = only(bound.kernel_plates)
+    @test kp.subjects == 8
+    @test only(kp.schedules).name === :es
+    @test only(bound.varying_draws).kind === :intercept1
+    built = build_kernel(bound)
+    names = coordinate_names(built.layout)
+    @test length(names) == 10
+    @test any(n -> startswith(String(n), "log_scale_"), names)
+    @test !any(n -> startswith(String(n), "tau_"), names)
+    # Probe point (shared with the partner's SB probe); map by name.
+    xi = [0.5, -0.5, 0.3, -0.3, 0.1, -0.1, 0.2, -0.2]
+    u = map(names) do n
+        s = String(n)
+        startswith(s, "log_scale_") && return log(5.0)
+        startswith(s, "xi_") && return xi[parse(Int, split(s, ".")[2])]
+        n === Symbol("theta.Intercept") && return 8.0
+        error("unexpected coordinate $n")
+    end
+    y, se = _es8_kernel_data()
+    tau = 5.0
+    th = 8.0 .+ tau .* xi
+    want = sum(logpdf.(Normal.(th, se), y)) +
+        sum(logpdf.(Normal(0.0, 1.0), xi)) +
+        logpdf(Normal(0.0, 1.0), log(tau)) +
+        logpdf(Normal(0.0, 10.0), 8.0)
+    @test prepare_query(built, bound, :sampler)(u) ≈ want rtol = 1e-10
+    q = prepare_sampler(built, bound, u; backend = _JE_BACKEND)
+    g = Vector{Float64}(undef, length(u))
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    @test val ≈ want rtol = 1e-10
+    # SB joint-1 pins (SB u-order [mu, log_scale, xi×8]); map by name.
+    sbval = -43.011100061689454
+    sbgrad = [-0.08748897593357821, -1.5141485725389365,
+        -0.11111111111111116, 0.625, -0.5441406249999999,
+        0.32066115702479336, -0.6864197530864196, -0.16859504132231398,
+        0.24999999999999994, 0.27716049382716046]
+    @test want ≈ sbval rtol = 1e-12
+    @test prepare_query(built, bound, :sampler)(u) ≈ sbval rtol = 1e-9
+    for (i, n) in enumerate(names)
+        s = String(n)
+        j = n === Symbol("theta.Intercept") ? 1 :
+            startswith(s, "log_scale_") ? 2 :
+            2 + parse(Int, split(s, ".")[2])
+        @test g[i] ≈ sbgrad[j] rtol = 1e-8
+    end
+    fd = similar(u, Float64)
+    h = cbrt(eps(Float64))
+    for i in eachindex(u)
+        up, dn = copy(u), copy(u)
+        up[i] += h
+        dn[i] -= h
+        fd[i] = (prepare_query(built, bound, :sampler)(up) -
+            prepare_query(built, bound, :sampler)(dn)) / (2h)
+    end
+    @test g ≈ fd atol = 1e-6
 end

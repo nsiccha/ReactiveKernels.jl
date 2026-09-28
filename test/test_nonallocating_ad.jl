@@ -262,3 +262,71 @@ fscale_naad(a, b) = a * b
     @test na_bytes <= 64
     @test na_bytes < dataflow_bytes
 end
+
+@testset "bound-only steps fold once per preparation" begin
+    spec = @kernel fold_mixed_naad(m, v, a) = begin
+        t = m * v .+ a
+        s = sum(t)
+        return s
+    end
+    n = 2000
+    m = hcat(ones(n), collect(1.0:n))
+    v = [0.5, -0.25]
+    a0 = fill(0.1, n)
+    kb = prepare(spec; have = (:m, :v, :a), want = :s, bound = (; m, v))
+    kbna = prepare_nonallocating(spec; have = (:m, :v, :a), want = :s,
+                                 bound = (; m, v))
+    matmul_step = findfirst(
+        op -> op isa ReactiveKernels._MatMulStep, kbna.ops)
+    @test matmul_step !== nothing
+    prep = prepare_ad(kb, NA_AD_BACKEND, a0; active = :a)
+    prepna = prepare_ad(kbna, NA_AD_BACKEND, a0; active = :a)
+    g, gna = similar(a0), similar(a0)
+    v_, _ = ad_value_and_gradient!(prep, g, a0)
+    vna, _ = ad_value_and_gradient!(prepna, gna, a0)
+    @test vna == v_
+    @test gna == g == ones(n)
+    # The bound-only product folded to exactly one appended constant.
+    primal_bounds = count(
+        op -> op isa ReactiveKernels._BoundConstant, kbna.ops)
+    @test length(prepna.call.ops) == length(kbna.ops) + 1
+    @test count(op -> op isa ReactiveKernels._BoundConstant,
+                prepna.call.ops) == primal_bounds + 1
+    # The folded value is an owned copy, never the primal slot's buffer.
+    folded = last(prepna.call.ops).value
+    @test folded == kbna.caches[matmul_step][] == m * v
+    @test folded !== kbna.caches[matmul_step][]
+    # The gradient never recomputes the bound-only product.
+    dataflow_bytes = @allocated ad_value_and_gradient!(prep, g, a0)
+    na_bytes = @allocated ad_value_and_gradient!(prepna, gna, a0)
+    println("NONALLOCATING_AD_ALLOC\tfold_dataflow\t", dataflow_bytes)
+    println("NONALLOCATING_AD_ALLOC\tfold_nonalloc\t", na_bytes)
+    @test dataflow_bytes > 0
+    @test na_bytes < sizeof(a0)
+    @test na_bytes < dataflow_bytes
+end
+
+@testset "inactive unbound steps still recompute per call" begin
+    spec = @kernel fold_live_naad(m, v, a) = begin
+        t = m * v .+ a
+        s = sum(t)
+        return s
+    end
+    n = 2000
+    m = hcat(ones(n), collect(1.0:n))
+    v = [0.5, -0.25]
+    a0 = fill(0.1, n)
+    kbna = prepare_nonallocating(spec; have = (:m, :v, :a), want = :s,
+                                 bound = (; m))
+    prepna = prepare_ad(kbna, NA_AD_BACKEND, v, a0; active = :a)
+    # The product sees the unbound port, so nothing folds.
+    @test length(prepna.call.ops) == length(kbna.ops)
+    gna = similar(a0)
+    va, _ = ad_value_and_gradient!(prepna, gna, v, a0)
+    @test va ≈ sum(m * v) + sum(a0)
+    @test gna == ones(n)
+    vb, _ = ad_value_and_gradient!(prepna, gna, 2v, a0)
+    @test vb ≈ sum(m * (2v)) + sum(a0)
+    @test gna == ones(n)
+    @test vb != va
+end

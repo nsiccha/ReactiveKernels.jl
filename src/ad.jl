@@ -68,9 +68,11 @@ end
 
 # The differentiated call for a `NonAllocatingKernel`: the elided unbound step
 # program (`_ad_na_program`) with the operation table and cache driver held
-# constant. The owned AD caches arrive as the trailing `Cache` context, so
-# the backend shadows them itself; the kernel's borrowed primal caches are
-# never exposed to differentiation.
+# constant. HAVE-free elided steps are folded to appended `_BoundConstant`
+# loads, so the gradient never recomputes bound-data-only work. The owned AD
+# caches arrive as the trailing `Cache` context, so the backend shadows them
+# itself; the kernel's borrowed primal caches are never exposed to
+# differentiation.
 struct _ADNonAllocatingKernelCall{I,F,O,A}
     f::F
     ops::O
@@ -238,26 +240,45 @@ end
 end
 
 # Taint-walk one program node, rewriting cache steps whose arguments are all
-# free of the active input into plain operation calls. Returns the rewritten
-# node and whether the active input reaches it. Unknown shapes stay tainted
-# (kept as cache steps): elision is value-preserving either way, but keeping
-# an active step preserves its buffer reuse while eliding one only costs it.
-function _ad_na_walk(node, tainted::Set{Symbol}, ops::Tuple, caches::Tuple,
-                     elided::Set{Int})
+# free of the active input into plain operation calls. Steps free of every
+# HAVE input (bound-data-only) are folded instead: their seeded value is
+# call-independent, so it is captured once into `fold_values` (appended to the
+# operation table as `_BoundConstant`s by `_ad_na_program`) and the step
+# becomes a zero-arg constant load. Returns the rewritten node, whether the
+# active input reaches it, and whether it is free of every HAVE input. Unknown
+# shapes stay tainted (kept as cache steps): elision is value-preserving either
+# way, but keeping an active step preserves its buffer reuse while eliding one
+# only costs it. Folding is the dual conservative choice: only positively
+# proven HAVE-free steps fold, and zero-argument steps (already constant loads)
+# keep their plain call.
+function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
+                     ops::Tuple, caches::Tuple, elided::Set{Int},
+                     fold_values::Vector{Any})
     parts = _ad_na_step_parts(node, length(ops))
     if parts !== nothing
         step, callargs = parts
         rewritten = Any[]
         step_tainted = false
+        step_free = true
         for arg in callargs
-            new_arg, arg_tainted =
-                _ad_na_walk(arg, tainted, ops, caches, elided)
+            new_arg, arg_tainted, arg_free =
+                _ad_na_walk(arg, tainted, have_free, ops, caches, elided,
+                            fold_values)
             push!(rewritten, new_arg)
             step_tainted = step_tainted || arg_tainted
+            step_free = step_free && arg_free
         end
         if !step_tainted && caches[step] isa Base.RefValue
+            if step_free && !isempty(callargs)
+                push!(elided, step)
+                push!(fold_values,
+                      _ad_na_seed_value(caches[step], step, ops[step]))
+                slot = length(ops) + length(fold_values)
+                return Expr(:call, Expr(:ref, _OPS_ARG, slot)), false, true
+            end
             push!(elided, step)
-            return Expr(:call, Expr(:ref, _OPS_ARG, step), rewritten...), false
+            return Expr(:call, Expr(:ref, _OPS_ARG, step), rewritten...),
+                false, step_free
         end
         if step_tainted && ops[step] isa _AuthoredPlateOp &&
            caches[step] isa Base.RefValue
@@ -271,49 +292,66 @@ function _ad_na_walk(node, tainted::Set{Symbol}, ops::Tuple, caches::Tuple,
             return Expr(:call,
                         GlobalRef(@__MODULE__, :_ad_na_plate_loop!),
                         Expr(:ref, _CACHES_ARG, step), QuoteNode(op.kernel),
-                        aval, rewritten...), true
+                        aval, rewritten...), true, false
         end
         return Expr(:call, _CACHE_APPLY_ARG, Expr(:ref, _CACHES_ARG, step),
-                    Expr(:ref, _OPS_ARG, step), rewritten...), step_tainted
+                    Expr(:ref, _OPS_ARG, step), rewritten...),
+            step_tainted, !step_tainted && step_free
     end
-    node isa Symbol && return node, node in tainted
-    node isa GlobalRef && return node, false
-    node isa LineNumberNode && return node, false
-    node isa Expr || return node, false
+    node isa Symbol && return node, node in tainted, node in have_free
+    node isa GlobalRef && return node, false, true
+    node isa LineNumberNode && return node, false, true
+    node isa Expr || return node, false, true
     if node.head === :(=) && length(node.args) == 2 &&
             node.args[1] isa Symbol
-        new_rhs, rhs_tainted =
-            _ad_na_walk(node.args[2], tainted, ops, caches, elided)
+        new_rhs, rhs_tainted, rhs_free =
+            _ad_na_walk(node.args[2], tainted, have_free, ops, caches, elided,
+                        fold_values)
         if rhs_tainted
             push!(tainted, node.args[1])
         else
             delete!(tainted, node.args[1])
         end
-        return Expr(:(=), node.args[1], new_rhs), false
+        if rhs_free
+            push!(have_free, node.args[1])
+        else
+            delete!(have_free, node.args[1])
+        end
+        return Expr(:(=), node.args[1], new_rhs), false, rhs_free
     end
     node_tainted = false
+    node_free = true
     new_args = Any[]
     for arg in node.args
-        new_arg, arg_tainted = _ad_na_walk(arg, tainted, ops, caches, elided)
+        new_arg, arg_tainted, arg_free =
+            _ad_na_walk(arg, tainted, have_free, ops, caches, elided,
+                        fold_values)
         push!(new_args, new_arg)
         node_tainted = node_tainted || arg_tainted
+        node_free = node_free && arg_free
     end
-    Expr(node.head, new_args...), node_tainted
+    Expr(node.head, new_args...), node_tainted, node_free
 end
 
-# Re-wrap one seeded primal slot as a concretely-typed AD-owned slot, copying
-# array contents so the AD program never mutates (or aliases) the kernel's
-# borrowed primal buffers. Views become owning vectors: the slot only needs a
-# same-shaped reusable buffer, not the caller's memory.
-function _ad_na_concretize_cache(slot::Base.RefValue, step::Int, op)
+# Owned value for one seeded primal slot: array contents are copied so the AD
+# program never mutates (or aliases) the kernel's borrowed primal buffers.
+# Views become owning vectors: the AD side only needs same-shaped reusable
+# storage, not the caller's memory. Every step must execute once during the
+# preparation seeding call.
+function _ad_na_seed_value(slot::Base.RefValue, step::Int, op)
     seeded = slot[]
     seeded === nothing && throw(ArgumentError(
         "AD preparation over a non-allocating kernel requires every retained " *
         "cache slot to be seeded by the exemplar primal call, but step " *
         "$step ($(_opname(op))) still holds `nothing`; every step must " *
         "execute once during preparation"))
-    value = seeded isa Array ? copy(seeded) :
+    seeded isa Array ? copy(seeded) :
         seeded isa AbstractArray ? collect(seeded) : seeded
+end
+
+# Re-wrap one seeded primal slot as a concretely-typed AD-owned slot.
+function _ad_na_concretize_cache(slot::Base.RefValue, step::Int, op)
+    value = _ad_na_seed_value(slot, step, op)
     Base.RefValue{typeof(value)}(value)
 end
 
@@ -331,9 +369,11 @@ end
 # Build the differentiated program for a `NonAllocatingKernel`: seed the
 # primal caches with the preparation exemplars, elide the cache steps that
 # cannot see the active input (storing caller-owned constant data into a
-# backend-shadowed slot would be a static-activity error), and compile the
-# resulting unbound program alongside its owned AD caches and operation
-# table.
+# backend-shadowed slot would be a static-activity error), fold the elided
+# steps that cannot see any HAVE input (their seeded value is call-
+# independent, so it is captured once as an appended `_BoundConstant`), and
+# compile the resulting unbound program alongside its owned AD caches and
+# operation table.
 function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
                         exemplars::Tuple)
     ast = kernel.ast
@@ -358,7 +398,9 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
     kernel(exemplars...)
     tainted = Set{Symbol}(
         have_syms[index] for index in _ad_selector_indices(active_selector))
+    have_free = Set{Symbol}()
     elided = Set{Int}()
+    fold_values = Any[]
     ops, caches = kernel.ops, kernel.caches
     length(ops) == length(caches) || throw(ArgumentError(
         "AD preparation over a non-allocating kernel requires aligned " *
@@ -366,7 +408,8 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
         "$(length(caches)) caches"))
     new_stmts = Any[]
     for stmt in ast.args[2].args
-        new_stmt, _ = _ad_na_walk(stmt, tainted, ops, caches, elided)
+        new_stmt, _, _ = _ad_na_walk(stmt, tainted, have_free, ops, caches,
+                                     elided, fold_values)
         push!(new_stmts, new_stmt)
     end
     ad_caches = ntuple(length(caches)) do index
@@ -375,7 +418,9 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
     end
     f = compile(Expr(:function, deepcopy(ast.args[1]),
                      Expr(:block, new_stmts...)))
-    f, ad_caches, _ad_na_ad_ops(ops)
+    ad_ops = isempty(fold_values) ? ops :
+        (ops..., map(_BoundConstant, fold_values)...)
+    f, ad_caches, _ad_na_ad_ops(ad_ops)
 end
 
 function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,

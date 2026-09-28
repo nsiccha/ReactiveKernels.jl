@@ -49,6 +49,14 @@ function check_parity()
 end
 end # module NonConstGlobalFixture
 
+# Module-qualified callees resolve through the same const-binding rule as
+# bare names; this fixture gives the tests a foreign module to path through.
+module QualifiedCalleeFixture
+export logistic, double
+logistic(x) = 1 / (1 + exp(-x))
+double(x) = 2 .* x
+end
+
 function nonallocating_op_call_indices(ast)
     indices = Int[]
     function visit(node)
@@ -217,6 +225,115 @@ end
         @test small <= 512
     end
 
+    @testset "qualified callees decompose like bare names" begin
+        spec = @kernel qualified_calls(x::Vector{Float64}) = begin
+            l::Vector{Float64} = QualifiedCalleeFixture.logistic.(x)
+            out::Float64 = sum(l)
+        end
+        ordinary = prepare(spec; have = (:x,), want = :out)
+        k = prepare_nonallocating(spec; have = (:x,), want = :out)
+        x = randn(64)
+        @test k(x) == ordinary(x)
+        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
+        @test any(op -> op isa ReactiveKernels._MaterializeStep, k.ops)
+        steady(k, args...) = (k(args...); @allocated k(args...))
+        small = steady(k, randn(64))
+        large = steady(k, randn(256))
+        println("NONALLOCATING_ALLOC_BYTES\tqualified_calls_small\t", small)
+        println("NONALLOCATING_ALLOC_BYTES\tqualified_calls_large\t", large)
+        @test small == large
+        @test small <= 512
+    end
+
+    @testset "postfix adjoint stays lazy inside broadcasts" begin
+        spec = @kernel adjoint_broadcast(X::Matrix{Float64}, a::Vector{Float64}) = begin
+            eta::Matrix{Float64} = X .+ a'
+            out::Float64 = sum(eta)
+        end
+        reshape_spec = @kernel reshape_broadcast(X::Matrix{Float64}, a::Vector{Float64}) = begin
+            eta::Matrix{Float64} = X .+ reshape(a, 1, length(a))
+            out::Float64 = sum(eta)
+        end
+        ordinary = prepare(spec; have = (:X, :a), want = :out)
+        ordinary_rs = prepare(reshape_spec; have = (:X, :a), want = :out)
+        k = prepare_nonallocating(spec; have = (:X, :a), want = :out)
+        k_rs = prepare_nonallocating(reshape_spec; have = (:X, :a), want = :out)
+        X, a = randn(32, 3), randn(3)
+        @test k(X, a) == ordinary(X, a) == k_rs(X, a) == ordinary_rs(X, a)
+        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
+        @test any(op -> op isa ReactiveKernels._MaterializeStep, k.ops)
+        steady(k, args...) = (k(args...); @allocated k(args...))
+        small = steady(k, randn(32, 3), randn(3))
+        large = steady(k, randn(200, 3), randn(3))
+        println("NONALLOCATING_ALLOC_BYTES\tadjoint_broadcast_small\t", small)
+        println("NONALLOCATING_ALLOC_BYTES\tadjoint_broadcast_large\t", large)
+        @test small == large
+        @test small <= 512
+        # batch-size change reseeds the materialize cache with parity
+        for n in (8, 64, 8, 200)
+            Xn, an = randn(n, 3), randn(3)
+            @test k(Xn, an) == ordinary(Xn, an)
+        end
+    end
+
+    @testset "dims reductions with constant axes become destination steps" begin
+        spec = @kernel rowmax_dims(m::Matrix{Float64}) = begin
+            r::Vector{Float64} = vec(maximum(m; dims = 2))
+            out::Float64 = sum(r)
+        end
+        colsum_spec = @kernel colsum_dims(m::Matrix{Float64}) = begin
+            c::Vector{Float64} = vec(sum(m; dims = 1))
+            out::Float64 = sum(c)
+        end
+        ordinary = prepare(spec; have = (:m,), want = :out)
+        k = prepare_nonallocating(spec; have = (:m,), want = :out)
+        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
+        @test any(op -> op isa ReactiveKernels._RowReduceStep, k.ops)
+        m = randn(64, 3)
+        @test k(m) == ordinary(m)
+        # Bit-identical to the plain reduction across sizes, including the
+        # batch-size changes the guarded cache reseeds on.
+        for n in (1, 5, 64, 257)
+            mn = randn(n, 3)
+            @test k(mn) == sum(vec(maximum(mn; dims = 2)))
+        end
+        steady(k, args...) = (k(args...); @allocated k(args...))
+        small = steady(k, randn(64, 3))
+        large = steady(k, randn(257, 3))
+        println("NONALLOCATING_ALLOC_BYTES\trowmax_dims_small\t", small)
+        println("NONALLOCATING_ALLOC_BYTES\trowmax_dims_large\t", large)
+        @test small == large
+        @test small <= 512
+
+        ordinary_cs = prepare(colsum_spec; have = (:m,), want = :out)
+        k_cs = prepare_nonallocating(colsum_spec; have = (:m,), want = :out)
+        @test k_cs(m) == ordinary_cs(m)
+        @test any(op -> op isa ReactiveKernels._RowReduceStep, k_cs.ops)
+    end
+
+    @testset "non-reduction kwargs and port-valued dims keep the fallback" begin
+        cumsum_spec = @kernel cumsum_dims(m::Matrix{Float64}) = begin
+            c::Matrix{Float64} = cumsum(m; dims = 2)
+            out::Float64 = sum(c)
+        end
+        dyn_spec = @kernel rowmax_dyn(m::Matrix{Float64}, d::Int) = begin
+            r::Vector{Float64} = vec(maximum(m; dims = d))
+            out::Float64 = sum(r)
+        end
+        ordinary = prepare(cumsum_spec; have = (:m,), want = :out)
+        k = prepare_nonallocating(cumsum_spec; have = (:m,), want = :out)
+        m = randn(16, 3)
+        @test k(m) == ordinary(m)
+        @test any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
+        @test !any(op -> op isa ReactiveKernels._RowReduceStep, k.ops)
+
+        ordinary_dyn = prepare(dyn_spec; have = (:m, :d), want = :out)
+        k_dyn = prepare_nonallocating(dyn_spec; have = (:m, :d), want = :out)
+        @test k_dyn(m, 2) == ordinary_dyn(m, 2)
+        @test any(op -> op isa ReactiveKernels._KernelSourceOp, k_dyn.ops)
+        @test !any(op -> op isa ReactiveKernels._RowReduceStep, k_dyn.ops)
+    end
+
     @testset "authored plates keep exact pointwise semantics" begin
         # An untyped plate body materializes through an eltype-`Any` cache in
         # both execution paths, so only value semantics are pinned here; the
@@ -281,6 +398,59 @@ end
         @test err isa ArgumentError
         @test occursin("single-output recipes", sprint(showerror, err))
         @test occursin("recipe 1", sprint(showerror, err))
+    end
+
+    @testset "partitioned lane gathers reuse their cache" begin
+        gather = ReactiveKernels._LaneGather(4)
+        x = [10.0, 20.0, 30.0, 40.0]
+        lanes = [3, 1, 4]
+        cache = Vector{Float64}(undef, 3)
+        out = MutatingFunctions.apply!!(cache, gather, x, lanes)
+        @test out === cache
+        @test out == x[lanes]
+        # A singleton argument fills (the twin's `x[ones(...)]` branch),
+        # even for out-of-range lane indices that would throw on a gather.
+        solo = [7.0]
+        fill_cache = Vector{Float64}(undef, 2)
+        filled = MutatingFunctions.apply!!(fill_cache, gather, solo, [9, 9])
+        @test filled === fill_cache
+        @test filled == [7.0, 7.0]
+        # Shape mismatches fall back to the twin call and reseed.
+        wrong = Vector{Float64}(undef, 1)
+        @test MutatingFunctions.apply!!(wrong, gather, x, lanes) == x[lanes]
+        @test MutatingFunctions.apply!!(wrong, gather, solo, [9, 9]) == [7.0, 7.0]
+        # The twin's errors survive the rule unchanged.
+        @test_throws DimensionMismatch MutatingFunctions.apply!!(
+            cache, gather, [1.0, 2.0], lanes)
+        @test_throws DimensionMismatch gather([1.0, 2.0], lanes)
+        oob_cache = Vector{Float64}(undef, 2)
+        @test_throws BoundsError MutatingFunctions.apply!!(
+            oob_cache, gather, x, [1, 99])
+        # Bool lanes take the twin's mask selection, never positional indexing.
+        mask = [true, false, true, false]
+        @test MutatingFunctions.apply!!(cache, gather, x, mask) ==
+            gather(x, mask) == [10.0, 30.0]
+        # Scalar arguments pass through untouched.
+        @test MutatingFunctions.apply!!(cache, gather, 2.0, lanes) == 2.0
+        # Steady-state reuse allocates nothing.
+        @test (@allocated MutatingFunctions.apply!!(cache, gather, x, lanes)) == 0
+    end
+
+    @testset "partitioned plates stay allocation-free end to end" begin
+        isdefined(@__MODULE__, :BranchPartition) ||
+            include("fixtures/branch_partition.jl")
+        C = BranchPartition
+        x = [0.5, 1.5, 2.0, 0.25, 3.0, 1.25, 0.75]
+        y = [1.0, -2.0, 0.5, -1.0, 2.0, -0.5, 1.5]
+        reference = sum(yi > 0 ? log(xi * yi) : xi - 1.0
+                        for (xi, yi) in zip(x, y))
+        k = prepare_nonallocating(C.guarded; have = (:x, :y), want = :total,
+                                  bound = (; y))
+        @test any(op -> op isa ReactiveKernels._LaneGather, k.ops)
+        @test k(x) ≈ reference
+        allocated = kernel_allocations(k, x)
+        println("NONALLOCATING_ALLOC_BYTES\tlane_gather\t", allocated)
+        @test allocated == 0
     end
 end
 

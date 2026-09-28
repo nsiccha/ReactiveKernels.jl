@@ -475,6 +475,39 @@ end
     end
 end
 
+@testset "sweep token wrap: argv shape (no token acquired)" begin
+    worker = ["julia", "--startup-file=no", "/abs/worker.jl"]
+    # Unwrapped default: exactly the pre-wrap shape (regression pin).
+    @test _worker_cmd(worker, "s.toml", "o").exec ==
+        ["julia", "--startup-file=no", "/abs/worker.jl",
+        "--spec", "s.toml", "--out", "o"]
+    # Wrapped: helper prefix coupled to --no-token (exactly one side gates).
+    @test _worker_cmd(worker, "s.toml", "o"; wrap_token = true).exec ==
+        ["kb-acquire-compute-token", "--",
+        "julia", "--startup-file=no", "/abs/worker.jl",
+        "--spec", "s.toml", "--out", "o", "--no-token"]
+    # No execution happens above: safe in CI without the helper or a token.
+end
+
+@testset "sweep CLI --wrap-token parses (no execution)" begin
+    args = _sweep_cli_args(["--manifest", "m.toml", "--out", "o"])
+    @test args.wrap_token == false
+    args = _sweep_cli_args(["--manifest", "m.toml", "--out", "o", "--wrap-token"])
+    @test args.wrap_token == true
+    @test args.manifest_path == "m.toml"
+    @test args.out_dir == "o"
+    @test_throws ArgumentError _sweep_cli_args(["--manifest", "m.toml"])
+end
+
+@testset "sweep stub worker accepts --no-token" begin
+    mktempdir() do dir
+        mani = _write_brm_manifest(dir; extra_worker_args = ["--no-token"])
+        res = sweep_appends(mani, joinpath(dir, "out"))
+        @test res.ok
+        @test res.results[1].verdict == "VERIFY_OK"
+    end
+end
+
 @testset "sweep brm-probe worker failures" begin
     mktempdir() do dir
         # Nonzero exit.
