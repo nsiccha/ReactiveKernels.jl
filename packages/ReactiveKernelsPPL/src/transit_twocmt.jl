@@ -5,7 +5,7 @@
 # + `transit_source`) with the exact closed form: a two-exponential
 # disposition convolved with the Gamma-PDF input. The Stan program integrates
 # the forced 2-state system numerically (tol 1e-6/1e-6, max 10000 steps) with
-# full forward sensitivities; no canned analytic solver covers the
+# full sensitivities; no canned analytic solver covers the
 # Gamma-transit input, so the closed form is authored here.
 #
 # Math. The twocmt matrix has real, distinct, negative eigenvalues for all
@@ -19,12 +19,11 @@
 #   `S(s,μ,t) = ∫_0^t u^(s-1) e^(-μu) du`, `s ≥ 1`, `t ≥ 0`, `μ ∈ ℝ`.
 #
 # `S` is evaluated in three regimes in `w = -μt` (all in log space where a
-# direct evaluation could over/underflow; plain loops with a convergence
-# break under a fixed cap, so the whole primitive is transparent math that
-# Enzyme reverses natively — no generated rule, no foreign special-function
-# call on the differentiated path):
+# direct evaluation could over/underflow). The shared recurrence in
+# transit_twocmt_rule.jl is transparent math for native Enzyme reversal;
+# the generated rule instead retains analytic partials of that recurrence.
 #
-# - `|w| ≤ 40` (including `μ = 0` and small `μ < 0`): power series
+# - `-1 ≤ w ≤ 40` (including `μ = 0` and small `μ < 0`): power series
 #   `S = t^s * Σ w^n/((s+n)*n!)` (cap 128, typically ~10-30 trips).
 # - `w < -1` (`μt > 1`): log-space regularized-gamma form
 #   `s*(log r - log μ) + log P(s,μt) - λt`; `P` comes from a
@@ -33,16 +32,18 @@
 #   validated `s ≤ 8`).
 # - `w > 40` (`μt < -40`, reached at ordinary points when disposition `β`
 #   exceeds absorption `r`): the `v = t-u` substitution gives the bounded
-#   form `e^(-rt)*T(s,w,t)`, `T ≤ t^(s-1)/w`, evaluated with an 8-term
-#   Watson `1/(μt)` expansion (error `~1e-10` at the handoff, shrinking as
-#   `1/W`).
+#   form `e^(-rt)*T(s,w,t)`, `T ≤ t^s/w`, evaluated with an 8-term
+#   Watson `1/(μt)` expansion. Its truncation error is separate from the
+#   convergence tolerance of the two series; `1e-15` is not a guarantee of
+#   floating-point accuracy for the whole response.
 #
 # The eigen-combination is a convex combination (`C1, C2 ∈ (0,1)`), so it
 # cannot cancel; the numerators are rationalized with a sign branch on
 # `D0 = k10+k12-k21` so neither the `D0 > 0` nor the `D0 < 0` side
-# subtracts nearly-equal numbers. Validated for `s ∈ [1, 8]`, `t ≥ 0`
-# (pinned in `test_transit_twocmt.jl`); the code is total on `s > 0`,
-# `r ≥ 0`, `t ≥ 0` and degrades gracefully outside the validated box.
+# subtracts nearly-equal numbers. The slow eigenrate uses the determinant
+# identity `α = k10*k21/β` to avoid cancellation too. Validated for positive
+# micro-constants and rate, `s ∈ [1, 8]`, `t ≥ 0`; no accuracy claim is made
+# outside this box.
 #
 # `lgamma` on the differentiated path is DistributionKernels' owned
 # `loggamma` (rule-covered, Enzyme-clean), never SpecialFunctions'
@@ -56,6 +57,13 @@ const _TRANSIT_SERIES_WMAX = 40.0
 const _TRANSIT_P_XMAX = 60.0
 const _TRANSIT_WATSON_TERMS = 8
 
+function _transit_check_accuracy(rtol, watson_terms)
+    0.0 < rtol < 1.0 || throw(ArgumentError("series_rtol must lie in (0, 1)"))
+    1 <= watson_terms <= _TRANSIT_SERIES_TRIPS ||
+        throw(ArgumentError("watson_terms must lie in 1:128"))
+    nothing
+end
+
 # Two-exponential disposition of the twocmt matrix: slow/fast rates
 # `(α, β)` plus the convex weights `(C1, C2)`. The numerators are
 # rationalized against the sign of `D0` (see the file header).
@@ -63,8 +71,8 @@ function _twocmt_disposition(k10::Float64, k12::Float64, k21::Float64)
     D0 = k10 + k12 - k21
     disc = sqrt(D0 * D0 + 4.0 * k12 * k21)
     half_trace = 0.5 * (k10 + k12 + k21)
-    α = half_trace - 0.5 * disc
     β = half_trace + 0.5 * disc
+    α = k10 * (k21 / β)
     if D0 <= 0.0
         N1 = 0.5 * (disc - D0)
         M2 = (2.0 * k12 * k21) / (disc - D0)
@@ -81,15 +89,9 @@ end
 # fixed cap: terms shrink geometrically once past `|w|`, so typical points
 # take ~10-30 trips instead of the cap (measured ~5x gradient speedup);
 # the break threshold keeps truncation at ~1e-15 relative.
-function _transit_u_sum(s::Float64, w::Float64)
-    acc = 1.0 / s
-    term = 1.0 / s
-    for n in 1:_TRANSIT_SERIES_TRIPS
-        term *= w * (s + n - 1) / (n * (s + n))
-        acc += term
-        abs(term) <= 1e-15 * abs(acc) && break
-    end
-    return acc
+function _transit_u_sum(s::Float64, w::Float64, rtol::Float64 = 1e-15)
+    return first(_transit_series(s, w, rtol, _TRANSIT_SERIES_TRIPS,
+        Val(:u), Val(false)))
 end
 
 # `Σ_{k≥0} x^k/(s)_{k+1}` with the rising factorial
@@ -97,15 +99,9 @@ end
 # `P(s,x) = e^(-x)*x^s/Γ(s)` times this sum (DLMF 8.7.1). NOTE the
 # denominator is the rising factorial, NOT `(s+k)*k!` — the latter is the
 # `S`-series shape and gives wrong values here. Same convergence break.
-function _transit_p_sum(s::Float64, x::Float64)
-    acc = 1.0 / s
-    term = 1.0 / s
-    for k in 1:_TRANSIT_SERIES_TRIPS
-        term *= x / (s + k)
-        acc += term
-        abs(term) <= 1e-15 * abs(acc) && break
-    end
-    return acc
+function _transit_p_sum(s::Float64, x::Float64, rtol::Float64 = 1e-15)
+    return first(_transit_series(s, x, rtol, _TRANSIT_SERIES_TRIPS,
+        Val(:p), Val(false)))
 end
 
 # `log S(s,μ,t)` for `|w| ≤ 40`, `w = -μt`. At `t = 0` this is `-Inf`
@@ -136,21 +132,10 @@ end
 # One disposition-mode convolution `I(λ,t)` (see the file header).
 # `s_log_r = s*log(r)` and `lgs = lgamma(s)` are hoisted by the caller.
 function _transit_mode_I(λ::Float64, t::Float64, rate::Float64,
-        shape::Float64, s_log_r::Float64, lgs::Float64)
-    μ = rate - λ
-    w = -μ * t
-    if w > _TRANSIT_SERIES_WMAX
-        logT = _transit_log_T_watson(shape, -μ, t)
-        return exp(s_log_r - lgs - rate * t + logT)
-    elseif w < -_TRANSIT_P_XMAX
-        return exp(s_log_r - shape * log(μ) - λ * t)
-    elseif w < -1.0
-        logP = _transit_log_P_series(shape, -w, lgs)
-        return exp(s_log_r - shape * log(μ) + logP - λ * t)
-    else
-        logS = _transit_log_S_series(shape, w, t)
-        return exp(s_log_r - lgs - λ * t + logS)
-    end
+        shape::Float64, s_log_r::Float64, lgs::Float64,
+        rtol::Float64 = 1e-15, watson_terms::Int = _TRANSIT_WATSON_TERMS)
+    return first(_transit_mode_math(λ, t, rate, shape, s_log_r, lgs, 0.0,
+        rtol, watson_terms, Val(false)))
 end
 
 """
@@ -163,12 +148,14 @@ varyingsource unit solve. All arguments are positive constants with
 convergence-capped loops: Enzyme reverses through it natively.
 """
 function transit_twocmt_unit(t::Float64, k10::Float64, k12::Float64,
-        k21::Float64, rate::Float64, shape::Float64)
+        k21::Float64, rate::Float64, shape::Float64;
+        series_rtol::Float64 = 1e-15, watson_terms::Int = _TRANSIT_WATSON_TERMS)
+    _transit_check_accuracy(series_rtol, watson_terms)
     α, β, C1, C2 = _twocmt_disposition(k10, k12, k21)
     s_log_r = shape * log(rate)
     lgs = DistributionKernelSources.loggamma(shape)
-    Iα = _transit_mode_I(α, t, rate, shape, s_log_r, lgs)
-    Iβ = _transit_mode_I(β, t, rate, shape, s_log_r, lgs)
+    Iα = _transit_mode_I(α, t, rate, shape, s_log_r, lgs, series_rtol, watson_terms)
+    Iβ = _transit_mode_I(β, t, rate, shape, s_log_r, lgs, series_rtol, watson_terms)
     return C1 * Iα + C2 * Iβ
 end
 
@@ -179,7 +166,9 @@ end
 one unit solve). Plain loop over the scalar primitive.
 """
 function transit_twocmt_unit_response(ts::AbstractVector, k10::Float64,
-        k12::Float64, k21::Float64, rate::Float64, shape::Float64)
+        k12::Float64, k21::Float64, rate::Float64, shape::Float64;
+        series_rtol::Float64 = 1e-15, watson_terms::Int = _TRANSIT_WATSON_TERMS)
+    _transit_check_accuracy(series_rtol, watson_terms)
     n = length(ts)
     out = Vector{Float64}(undef, n)
     α, β, C1, C2 = _twocmt_disposition(k10, k12, k21)
@@ -187,8 +176,8 @@ function transit_twocmt_unit_response(ts::AbstractVector, k10::Float64,
     lgs = DistributionKernelSources.loggamma(shape)
     for i in eachindex(ts)
         t = Float64(ts[i])
-        Iα = _transit_mode_I(α, t, rate, shape, s_log_r, lgs)
-        Iβ = _transit_mode_I(β, t, rate, shape, s_log_r, lgs)
+        Iα = _transit_mode_I(α, t, rate, shape, s_log_r, lgs, series_rtol, watson_terms)
+        Iβ = _transit_mode_I(β, t, rate, shape, s_log_r, lgs, series_rtol, watson_terms)
         out[i] = C1 * Iα + C2 * Iβ
     end
     return out
