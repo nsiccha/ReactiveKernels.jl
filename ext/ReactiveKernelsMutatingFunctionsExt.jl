@@ -278,6 +278,14 @@ end
 # the loop correct for any lane-vector axes). Bool lane masks stay on the
 # fallback: positional indexing with a Bool element is an error, not a mask
 # selection.
+#
+# The gather loop itself is `@inbounds`, with the twin's `BoundsError` on
+# out-of-range lanes preserved by an explicit integer-range validation (pinned
+# by tests): the guards above establish `length(cache) == length(lanes)`, so
+# only the data-driven `x[lane]` index needs the manual check. Spelled-out
+# integer comparisons stay allocation-free where the per-element `checkbounds`
+# calls do not: under reverse-mode Enzyme on Julia 1.12 those checks allocate
+# (~17.6 bytes/element measured), defeating the non-allocating gradient.
 @inline function MutatingFunctions.apply!!(
         cache::Vector{T}, gather::ReactiveKernels._LaneGather,
         x::AbstractVector{T}, lanes::AbstractVector{<:Integer}) where {T}
@@ -289,7 +297,9 @@ end
     end
     ndims(x) == 1 && length(x) == gather.n || return gather(x, lanes)
     length(cache) == length(lanes) || return gather(x, lanes)
-    for (i, lane) in enumerate(lanes)
+    n = length(x)
+    @inbounds for (i, lane) in enumerate(lanes)
+        (1 <= lane <= n) || throw(BoundsError(x, lane))
         cache[i] = x[lane]
     end
     cache
@@ -302,6 +312,25 @@ end
     fill!(cache, ReactiveKernels._fill_constructor_value(op))
     cache
 end
+
+# Row/column reduction with a preparation-constant `dims`. Base's
+# `sum!`/`prod!`/`minimum!`/`maximum!` run the same per-lane `mapreducedim`
+# pass the allocating twin (`f(A; dims = ...)` uses, so values are
+# bit-identical; the cache must already have the exact result shape and
+# eltype, and anything else reseeds through the twin call.
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T}, op::ReactiveKernels._RowReduceStep, A::Array) where {T}
+    T === Base.promote_op(getfield(op, :f), eltype(A)) || return op(A)
+    axes(cache) == Base.reduced_indices(axes(A), getfield(op, :dims)) ||
+        return op(A)
+    _rk_rowreduce_inplace!(getfield(op, :f), cache, A)
+    cache
+end
+
+@inline _rk_rowreduce_inplace!(::typeof(sum), r, A) = Base.sum!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(prod), r, A) = Base.prod!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(minimum), r, A) = Base.minimum!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(maximum), r, A) = Base.maximum!(r, A)
 
 # --- public entry points ----------------------------------------------------
 

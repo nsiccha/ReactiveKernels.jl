@@ -35,6 +35,8 @@
 #   worker = ["julia", "--startup-file=no", "--project=/abs/env",
 #             "/abs/worker.jl"]       # brm-probe-kind: argv prefix; the driver
 #                                     # appends `--spec <in.toml> --out <dir>`
+#                                     # (plus `--no-token` when wrapping — see
+#                                     # token gating below)
 #   u_probes = [[0.5, -0.25, 0.1]]    # optional (absent = single origin probe;
 #                                     # TOML has no null). brm-probe-kind: the
 #                                     # worker expands the absent case
@@ -65,8 +67,17 @@
 # `sb_grad_maxdiff?`, `oracle?`; optional `[pins]` String table), and
 # `artifact.jls` (v2, opaque). Missing outputs, bad numbers, a probe-count
 # mismatch, or a nonzero exit become an ERROR row (never a silent skip).
-# The worker gates its own heavy Stan legs on a compute token; to bound a
-# hung worker, prefix its argv with `timeout` (the driver's argv is yours).
+#
+# Token gating (coordinator supplemental ruling on 1womb1l): at fusion the
+# DRIVER wraps worker invocations with `kb-acquire-compute-token` and passes
+# `--no-token`, so the worker skips its own gating; worker self-gating stays
+# as fallback for standalone invocation only. Exactly one side gates per
+# invocation — never both, never neither. The wrap is coupled to the flag in
+# `_worker_cmd`: `wrap_token=true` prefixes the helper AND appends
+# `--no-token`; `wrap_token=false` (default — fixtures and CI run token-free
+# per the spec-lock) passes neither, so a real worker still self-gates. To
+# bound a hung worker, prefix its argv with `timeout` (the manifest argv is
+# yours; the helper prefix composes outside it).
 #
 # Exit codes: 0 iff every case reaches VERIFY_OK. A case that throws is
 # caught into an ERROR row; the driver still writes every good case plus
@@ -80,7 +91,7 @@
 #   include("packages/ReactiveKernelsPPL/report/sweep_appends.jl")
 #   using Enzyme, DifferentiationInterface
 #   sweep_appends("fusion_manifest.toml", "fusion_out";
-#       backend = AutoEnzyme(; mode = Enzyme.Reverse))
+#       backend = AutoEnzyme(; mode = Enzyme.Reverse), wrap_token = true)
 
 include(joinpath(@__DIR__, "transpile_report.jl"))
 using TOML
@@ -451,9 +462,20 @@ function _write_worker_spec(c::SweepCase, mani::SweepManifest, out_dir)
     return spec_path
 end
 
-function _run_worker(c::SweepCase, spec_path, case_out)
+const _TOKEN_HELPER = "kb-acquire-compute-token"
+
+# Pure argv builder, factored for token-free tests: wrap and `--no-token`
+# are coupled here so exactly one side gates per invocation (see header).
+function _worker_cmd(worker::Vector{String}, spec_path, case_out;
+        wrap_token::Bool = false)
+    argv = vcat(worker, ["--spec", spec_path, "--out", case_out])
+    wrap_token || return Cmd(argv)
+    return Cmd(vcat([_TOKEN_HELPER, "--"], argv, ["--no-token"]))
+end
+
+function _run_worker(c::SweepCase, spec_path, case_out; wrap_token::Bool = false)
     mkpath(case_out)
-    cmd = Cmd(vcat(c.worker, ["--spec", spec_path, "--out", case_out]))
+    cmd = _worker_cmd(c.worker, spec_path, case_out; wrap_token)
     outbuf, errbuf = IOBuffer(), IOBuffer()
     run_ok = try
         run(pipeline(cmd; stdout = outbuf, stderr = errbuf))
@@ -558,10 +580,11 @@ function _read_worker_numbers(case_out, c::SweepCase)
     return read(sec_path, String), probes, art_path, wpins
 end
 
-function _run_brm_case(c::SweepCase, mani::SweepManifest, out_dir)
+function _run_brm_case(c::SweepCase, mani::SweepManifest, out_dir;
+        wrap_token::Bool = false)
     spec_path = _write_worker_spec(c, mani, out_dir)
     case_out = _case_path(joinpath(out_dir, ".worker"), c.id, ".out")
-    run_ok, log = _run_worker(c, spec_path, case_out)
+    run_ok, log = _run_worker(c, spec_path, case_out; wrap_token)
     log_path = _case_path(out_dir, c.id, ".worker.log")
     mkpath(dirname(log_path))
     write(log_path, log)
@@ -673,7 +696,7 @@ into ERROR rows; `ok` is true iff every case reaches VERIFY_OK.
 Manifest-level problems throw before anything is written.
 """
 function sweep_appends(manifest_path::AbstractString, out_dir::AbstractString;
-        backend = nothing)
+        backend = nothing, wrap_token::Bool = false)
     mani = load_manifest(manifest_path)
     mkpath(out_dir)
     results = SweepResult[]
@@ -681,7 +704,7 @@ function sweep_appends(manifest_path::AbstractString, out_dir::AbstractString;
     for c in mani.cases
         r = try
             if c.kind === :brm
-                rr, wpins = _run_brm_case(c, mani, out_dir)
+                rr, wpins = _run_brm_case(c, mani, out_dir; wrap_token)
                 worker_pins[rr.id] = wpins
                 rr
             else
@@ -705,9 +728,10 @@ end
 
 # ------------------------------------------------------------------- CLI
 
-function sweep_main(argv::Vector{String} = ARGS)
+function _sweep_cli_args(argv::Vector{String})
     manifest_path = nothing
     out_dir = nothing
+    wrap_token = false
     i = 1
     while i <= length(argv)
         flag = argv[i]
@@ -717,8 +741,11 @@ function sweep_main(argv::Vector{String} = ARGS)
             _need(); i += 1; manifest_path = argv[i]
         elseif flag == "--out"
             _need(); i += 1; out_dir = argv[i]
+        elseif flag == "--wrap-token"
+            wrap_token = true
         else
-            throw(ArgumentError("unknown flag $flag (want --manifest PATH --out DIR)"))
+            throw(ArgumentError("unknown flag $flag " *
+                "(want --manifest PATH --out DIR [--wrap-token])"))
         end
         i += 1
     end
@@ -726,7 +753,13 @@ function sweep_main(argv::Vector{String} = ARGS)
         throw(ArgumentError("sweep needs --manifest PATH --out DIR"))
     out_dir === nothing &&
         throw(ArgumentError("sweep needs --manifest PATH --out DIR"))
-    return sweep_appends(manifest_path, out_dir).ok ? 0 : 1
+    return (; manifest_path, out_dir, wrap_token)
+end
+
+function sweep_main(argv::Vector{String} = ARGS)
+    args = _sweep_cli_args(argv)
+    return sweep_appends(args.manifest_path, args.out_dir;
+        wrap_token = args.wrap_token).ok ? 0 : 1
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

@@ -384,14 +384,25 @@ function preprocessing_recipes(plan::StructuralPlan)
 end
 
 """Design row count of a predictor (obs-level: `n_obs`; subject-level:
-the kernel's subject count — bound plans only)."""
+the using kernel plate's subject count — bound plans only)."""
 function _predictor_rows(plan::StructuralPlan, pname::Symbol)
     _predictor_level(plan, pname) === :obs && return plan.n_obs
-    kp = only(plan.kernel_plates)
-    kp.subjects isa Int ||
+    users = KernelPlate[kp for kp in plan.kernel_plates
+        if any(pr -> pr[1] === pname, kp.lp_args)]
+    isempty(users) &&
         throw(ContractValidationError("[preprocessing] subject predictor " *
-              "`$pname` needs resolved kernel subjects (bind_data first)"))
-    return kp.subjects
+              "`$pname` is used by no kernel plate (internal: level " *
+              "says subject)"))
+    for kp in users
+        kp.subjects isa Int ||
+            throw(ContractValidationError("[preprocessing] subject predictor " *
+                  "`$pname` needs resolved kernel subjects (bind_data first)"))
+    end
+    ns = unique!([kp.subjects for kp in users])
+    length(ns) == 1 && return ns[1]
+    throw(ContractValidationError("[preprocessing] subject predictor " *
+          "`$pname` feeds kernel plates with different subject counts " *
+          "$ns (sequenced follow-up — split the predictor per plate)"))
 end
 
 # Level count K for a monotonic term: one more than its linked increments

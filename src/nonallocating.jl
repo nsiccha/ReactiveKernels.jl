@@ -16,13 +16,14 @@
 # reused for:
 #
 # - identity-preserving wrappers (`view`, `reshape`, `transpose`, `eachcol`,
-#   ranges, scalar arithmetic, …) and isbits-valued calls are emitted inline —
-#   they never owned a buffer worth caching;
+#   postfix `'`/`.'`, ranges, scalar arithmetic, …) and isbits-valued calls
+#   are emitted inline — they never owned a buffer worth caching;
 # - broadcast materializations (dotted calls, and array `getindex` with
 #   range/vector indices via `view`) become `_MaterializeStep` destination
 #   steps;
 # - `vcat` becomes `_ConcatenateStep` and `zeros`/`ones` become
-#   `_FillConstructorStep`;
+#   `_FillConstructorStep`; `sum`/`prod`/`minimum`/`maximum` with a
+#   preparation-constant `dims` keyword become `_RowReduceStep`;
 # - every other resolved call stays a generic per-step cache operation, so
 #   registered in-place coverage (e.g. `mul!`-backed `*`) applies per step.
 #
@@ -30,10 +31,14 @@
 # with no captured fields, so its free symbols resolve in
 # `parentmodule(op.f)`. Decomposition resolves every free symbol against that
 # module, requires the binding to be `const`, and emits `GlobalRef`s to those
-# exact bindings — never name-based guesses. Any source shape outside the
-# grammar (or any resolution failure) falls back to the previous whole-recipe
-# cache step, so decomposition never widens behavior; it only exposes the same
-# computation at a granularity the in-place layer can reuse.
+# exact bindings — never name-based guesses. Module-qualified callees
+# (`Pkg.f`) resolve through the same rule, requiring every path segment to be
+# a `const` module binding. Any source shape outside the grammar (keyword
+# calls other than constant-`dims` reductions, a non-`const` global, a call
+# through a port — including `dims` read from a port) falls back to the
+# previous whole-recipe cache step, so decomposition never widens behavior;
+# it only exposes the same computation at a granularity the in-place layer
+# can reuse.
 
 # --- destination step operations -------------------------------------------
 # Core-owned; CALLING one is the exact allocating semantics, so a hand-written
@@ -63,6 +68,19 @@ struct _MatMulStep end
 struct _FillConstructorStep{F}
     f::F
 end
+
+"""
+Row/column reduction with a preparation-constant `dims` keyword
+(`sum`/`prod`/`minimum`/`maximum`). The callable is the exact allocating
+semantics (`f(A; dims = ...)`); the MutatingFunctions extension reuses the
+destination through Base's `reducedim!` family, which runs the same
+per-lane `mapreducedim` pass as the allocating twin.
+"""
+struct _RowReduceStep{F,D}
+    f::F
+    dims::D
+end
+@inline (op::_RowReduceStep)(A) = op.f(A; dims = op.dims)
 
 "One-dimensional gather (`x[idx]`); in-place layers may copy into a destination."
 struct _GatherStep end
@@ -116,6 +134,40 @@ function _nonalloc_resolve_const(mod::Module, s::Symbol)
     Some(getglobal(mod, s))
 end
 
+# Resolve a callee that is either a bare name or a module-qualified path
+# (`LogExpFunctions.logistic`, `A.B.f`). Every step must name a `const`
+# binding — the same rule bare names follow — and the owner of each path
+# segment must itself be a `const` module binding, so the emitted `GlobalRef`
+# always names the exact function the fused closure would call. Returns
+# `(function value, GlobalRef)` or `nothing`.
+function _nonalloc_resolve_function(mod::Module, callee)
+    if callee isa Symbol
+        r = _nonalloc_resolve_const(mod, callee)
+        r === nothing && return nothing
+        return (something(r), GlobalRef(mod, callee))
+    end
+    callee isa Expr && callee.head === :. && length(callee.args) == 2 &&
+        callee.args[2] isa QuoteNode || return nothing
+    owner = if callee.args[1] isa Symbol
+        r = _nonalloc_resolve_const(mod, callee.args[1])
+        if r === nothing
+            return nothing
+        end
+        something(r)
+    else
+        r = _nonalloc_resolve_function(mod, callee.args[1])
+        if r === nothing
+            return nothing
+        end
+        first(r)
+    end
+    owner isa Module || return nothing
+    name = callee.args[2].value
+    name isa Symbol && isdefined(owner, name) && isconst(owner, name) ||
+        return nothing
+    (getglobal(owner, name), GlobalRef(owner, name))
+end
+
 function _nonalloc_undotted(s::Symbol)
     str = String(s)
     length(str) > 1 && startswith(str, '.') || return nothing
@@ -159,13 +211,24 @@ function _decompose(ctx::_FusedDecomposition, node, allow_lazy_broadcast::Bool)
     node isa Expr || return (node, typeof(node))
     if node.head === :call && !isempty(node.args)
         callee = node.args[1]
-        callee isa Symbol || return nothing
-        base = _nonalloc_undotted(callee)
+        callee isa Symbol || callee isa Expr || return nothing
+        callee isa Expr &&
+            _nonalloc_resolve_function(ctx.mod, callee) === nothing &&
+            return nothing
+        base = callee isa Symbol ? _nonalloc_undotted(callee) : nothing
         base === nothing ||
             return _decompose_broadcast(ctx, base, node.args[2:end],
                                         allow_lazy_broadcast)
         return _decompose_call(ctx, callee, node.args[2:end])
     end
+    # Postfix `'` parses as `Expr(:')` and `.'` as `Expr(:.')` — unary
+    # operator-expression heads, not `:call`s with an operator callee. Route
+    # them through the ordinary call path under their exact Base names.
+    (node.head === Symbol("'") || node.head === Symbol(".'")) &&
+        length(node.args) == 1 &&
+        return _decompose_call(ctx,
+            node.head === Symbol("'") ? :adjoint : :transpose,
+            Any[node.args[1]])
     node.head === :ref && length(node.args) >= 2 &&
         return _decompose_getindex(ctx, node.args[1], node.args[2:end])
     node.head === :. && length(node.args) == 2 &&
@@ -176,13 +239,18 @@ end
 
 # `f.(args)` parses as `Expr(:., f, Expr(:tuple, ...))` — unlike operator-dot
 # `a .+ b`, which is a `:call` with a dotted callee. Same broadcast
-# semantics, same treatment; anything else in dot position (field access,
-# qualified names: non-tuple second arg) falls back safely.
+# semantics, same treatment; `f` may be a bare name or a module-qualified
+# path. Anything else in dot position (field access into a non-module value,
+# a non-`const` binding) falls back safely.
 function _decompose_dotcall(ctx::_FusedDecomposition, func, tup,
                              allow_lazy_broadcast::Bool)
-    func isa Symbol || return nothing
     tup isa Expr && tup.head === :tuple || return nothing
-    _decompose_broadcast(ctx, func, tup.args, allow_lazy_broadcast)
+    if func isa Symbol
+        return _decompose_broadcast(ctx, func, tup.args, allow_lazy_broadcast)
+    end
+    rf = _nonalloc_resolve_function(ctx.mod, func)
+    rf === nothing && return nothing
+    _decompose_broadcast(ctx, rf[1], rf[2], tup.args, allow_lazy_broadcast)
 end
 
 function _decompose_arguments(ctx::_FusedDecomposition, rawargs,
@@ -200,9 +268,57 @@ end
 
 function _decompose_call(ctx::_FusedDecomposition, callee::Symbol, rawargs)
     haskey(ctx.argmap, callee) && return nothing        # call through a port
-    resolved = _nonalloc_resolve_const(ctx.mod, callee)
-    resolved === nothing && return nothing
-    f = something(resolved)
+    rf = _nonalloc_resolve_function(ctx.mod, callee)
+    rf === nothing && return nothing
+    _decompose_call_resolved(ctx, callee, rf[1], rf[2], rawargs)
+end
+
+function _decompose_call(ctx::_FusedDecomposition, callee, rawargs)
+    rf = _nonalloc_resolve_function(ctx.mod, callee)
+    rf === nothing && return nothing
+    _decompose_call_resolved(ctx, callee, rf[1], rf[2], rawargs)
+end
+
+function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
+                                  rawargs)
+    if callee isa Symbol
+        haskey(ctx.argmap, callee) && return nothing
+    end
+    # Keyword calls: only the reduction family with a preparation-constant
+    # `dims` keyword leaves the whole-recipe fallback, via `_RowReduceStep`.
+    # Every other keyword shape (including port-valued `dims`) is outside the
+    # step grammar and keeps the fused closure, which applies the keywords
+    # with its original semantics.
+    kwargs = nothing
+    positional = rawargs
+    if !isempty(rawargs) && rawargs[1] isa Expr &&
+       rawargs[1].head === :parameters
+        kwargs = rawargs[1].args
+        positional = rawargs[2:end]
+        for kw in kwargs
+            kw isa Expr && kw.head === :kw && length(kw.args) == 2 &&
+                kw.args[1] === :dims || return nothing
+        end
+    end
+    if kwargs !== nothing
+        (f === Base.sum || f === Base.prod ||
+         f === Base.minimum || f === Base.maximum) &&
+            length(positional) == 1 || return nothing
+        dimsval = _nonalloc_dims_const(only(kwargs))
+        dimsval === nothing && return nothing
+        reduced = _decompose_singleton_reduction(ctx, positional[1])
+        reduced !== nothing && return reduced
+        decomposed = _decompose_arguments(ctx, positional, false)
+        decomposed === nothing && return nothing
+        args, types = decomposed
+        length(types) == 1 && types[1] isa Type || return nothing
+        D = something(dimsval)
+        T = _static_type(A -> f(A; dims = D), only(types))
+        T isa DataType && isconcretetype(T) && T <: AbstractArray ||
+            return nothing
+        return (_emit_step!(ctx, _RowReduceStep(f, D), T, args...), T)
+    end
+    rawargs = positional
     if (f === Base.sum || f === Base.prod ||
         f === Base.minimum || f === Base.maximum) && length(rawargs) == 1
         reduced = _decompose_singleton_reduction(ctx, rawargs[1])
@@ -212,7 +328,6 @@ function _decompose_call(ctx::_FusedDecomposition, callee::Symbol, rawargs)
     decomposed === nothing && return nothing
     args, types = decomposed
     T = _static_type(f, types...)
-    fref = GlobalRef(ctx.mod, callee)
     if (isconcretetype(T) && isbitstype(T)) || _nonalloc_is_lazy(f)
         return (Expr(:call, fref, args...), T)
     end
@@ -243,6 +358,20 @@ function _decompose_call(ctx::_FusedDecomposition, callee::Symbol, rawargs)
     # fallback rather than risking a stale destination on a shape change.
     (f === Base.:\ || f === Base.:/) && return nothing
     (_emit_step!(ctx, f, T, args...), T)
+end
+
+# A preparation-constant reduction axis: an `Int`, `Colon`, or a tuple of
+# `Int`s written as a literal in the source. Anything computed (a port read,
+# a call) would freeze a preparation-time value into the step table and is
+# therefore outside the grammar.
+function _nonalloc_dims_const(kw)
+    kw isa Expr && kw.head === :kw && length(kw.args) == 2 || return nothing
+    v = kw.args[2]
+    v isa Int && return Some(v)
+    v === Colon() && return Some(Colon())
+    v isa Expr && v.head === :tuple && all(a -> a isa Integer, v.args) &&
+        return Some(Tuple(v.args))
+    nothing
 end
 
 # A scalar reduction (`sum`/`prod`/`minimum`/`maximum`) over a provably
@@ -307,14 +436,18 @@ end
 function _decompose_broadcast(ctx::_FusedDecomposition, base::Symbol, rawargs,
                               allow_lazy_broadcast::Bool)
     haskey(ctx.argmap, base) && return nothing
-    resolved = _nonalloc_resolve_const(ctx.mod, base)
-    resolved === nothing && return nothing
-    f = something(resolved)
+    rf = _nonalloc_resolve_function(ctx.mod, base)
+    rf === nothing && return nothing
+    _decompose_broadcast(ctx, rf[1], rf[2], rawargs, allow_lazy_broadcast)
+end
+
+function _decompose_broadcast(ctx::_FusedDecomposition, f, fref::GlobalRef,
+                              rawargs, allow_lazy_broadcast::Bool)
     decomposed = _decompose_arguments(ctx, rawargs, true)
     decomposed === nothing && return nothing
     args, types = decomposed
     bc = Expr(:call, GlobalRef(Base.Broadcast, :broadcasted),
-              GlobalRef(ctx.mod, base), args...)
+              fref, args...)
     BT = _static_type(Base.Broadcast.broadcasted, typeof(f), types...)
     allow_lazy_broadcast && return (bc, BT)
     T = _static_type(Base.Broadcast.materialize, BT)

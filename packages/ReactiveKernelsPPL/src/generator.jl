@@ -831,24 +831,103 @@ function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
         push!(stmts, :($nm = $(_rewrite_kernel_refs(ex, flatmap))))
     end
     obs = only(kp.obs)
-    obs.family === GaussianFam ||
+    obs.family in _KERNEL_SCALAR_FAMS ||
         throw(ContractValidationError("[generator] kernel plate " *
-              "`$(kp.result)` obs family $(obs.family) has no emitter " *
-              "(panel v1: Gaussian only)"))
-    inputs = Any[flatmap[obs.response]]
-    rv = _dovar(1)
-    # Location threads as input 2 when symbolic (the `_ppl_lp_` precedent:
-    # computed flat locals ride as plate inputs); literals inline.
-    locv = _thread_ref!(inputs, _kernel_obs_ref(obs.location, flatmap))
-    sref = _thread_ref!(inputs, _kernel_obs_ref(obs.scale, flatmap))
-    cell = :(normal($locv, $sref).logpdf($rv))
+              "`$(kp.result)` obs family $(obs.family) has no panel " *
+              "emitter (admitted: Normal, Bernoulli, Poisson, " *
+              "NegativeBinomial2, Gamma, Beta, StudentT)"))
     klabel = Symbol(:kernel_, kp.result)
-    append!(stmts, _plate_sum_stmts(_pw_name(klabel), _lik_name(klabel),
-        inputs, cell))
+    rcol = _kernel_obs_rcol(kp, obs, flatmap[obs.response], plan)
+    append!(stmts, _kernel_scalar_obs_stmts(obs, rcol,
+        flatmap, plan, klabel, _pw_name(klabel), _lik_name(klabel)))
     collected = haskey(flatmap, kp.collected) ? flatmap[kp.collected] : kp.collected
     collected === kp.result ||
         push!(stmts, :($(kp.result) = $collected))
     return stmts, _lik_name(klabel)
+end
+
+# One scalar response-space in-cell observation → its plate statements
+# (panel and grouped share the emitter — the grouped Gaussian arm was
+# the panel arm's near-duplicate). Cell spellings are the
+# mixture/plate endpoint precedents over the obs node's response-space
+# (location, scale, params). `rcol` is the response plate input (flat
+# for panel, whole-column for grouped); `label` scopes precomputes
+# (Gamma rate); slice-param args ride `flatmap`; cell locals, model
+# scalars, and literals pass through (`_thread_ref!`: symbols ride as
+# inputs — the `_ppl_lp_` precedent — literals inline).
+function _kernel_scalar_obs_stmts(obs::KernelObs, rcol::Symbol,
+        flatmap::Dict{Symbol,Symbol}, plan::Union{StructuralPlan,Nothing},
+        label::Symbol, pw::Symbol, node::Symbol)
+    fam = obs.family
+    loc = _kernel_obs_ref(obs.location, flatmap)
+    scale = obs.scale === nothing ? nothing :
+        _kernel_obs_ref(obs.scale, flatmap)
+    params = map(p -> _kernel_obs_ref(p, flatmap), obs.params)
+    inputs = Any[rcol]
+    rv = _dovar(1)
+    pre = Expr[]
+    cell = if fam === GaussianFam
+        locv = _thread_ref!(inputs, loc)
+        sref = _thread_ref!(inputs, scale)
+        :(normal($locv, $sref).logpdf($rv))
+    elseif fam === BernoulliLogitFam
+        pv = _thread_ref!(inputs, loc)
+        :(bernoulli($pv).logpdf($rv))
+    elseif fam === PoissonLogFam
+        muv = _thread_ref!(inputs, loc)
+        :(poisson($muv).logpdf($rv))
+    elseif fam === NegativeBinomial2Fam
+        muv = _thread_ref!(inputs, loc)
+        phiref = _thread_ref!(inputs, scale)
+        :(negative_binomial2($muv, $phiref).logpdf($rv))
+    elseif fam === GammaLogFam
+        # Surface is Distributions-SCALE `Gamma(alpha, scale)`; the
+        # kernel takes rate — invert at the boundary (the Gamma-plate
+        # precedent; literals fold, symbols precompute once outside
+        # the plate over layout-legal refs).
+        aref = _thread_ref!(inputs, loc)
+        ratev = if scale isa Symbol
+            rate = _rate_name(label)
+            push!(pre, :($rate = 1 ./ $scale))
+            _thread_ref!(inputs, rate)
+        else
+            1.0 / Float64(scale)
+        end
+        :(gamma($aref, $ratev).logpdf($rv))
+    elseif fam === BetaLogitFam
+        avv = _thread_ref!(inputs, loc)
+        bvv = _thread_ref!(inputs, scale)
+        :(beta($avv, $bvv).logpdf($rv))
+    elseif fam === StudentTFam
+        nuv = _thread_ref!(inputs, loc)
+        muv = _thread_ref!(inputs, scale)
+        sigv = _thread_ref!(inputs, params[1])
+        :(student_t($nuv, $muv, $sigv).logpdf($rv))
+    else
+        throw(ContractValidationError(
+            "[generator] in-cell obs family $fam has no scalar emitter"))
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# In-cell obs response column: Bernoulli plates read Bool lanes — a
+# non-Bool flat redirects to its bind-materialized Bool twin (exact
+# for 0/1; the `!=` comparison misdifferentiates under native Enzyme —
+# snag `bernoulli-int-la-78487520`). All other families read `rcol`.
+function _kernel_obs_rcol(kp::KernelPlate, obs::KernelObs, rcol::Symbol,
+        plan::Union{StructuralPlan,Nothing})
+    obs.family === BernoulliLogitFam || return rcol
+    plan === nothing && throw(ContractValidationError(
+        "[generator] Bernoulli in-cell obs needs the bound plan " *
+        "(response eltype check — internal: pass plan)"))
+    haskey(plan.columns, rcol) || throw(ContractValidationError(
+        "[generator] Bernoulli in-cell response `$rcol` is not bound"))
+    eltype(plan.columns[rcol]) === Bool && return rcol
+    twin = _kbool_name(kp.result, obs.response)
+    haskey(plan.columns, twin) || throw(ContractValidationError(
+        "[generator] Bernoulli in-cell Bool twin `$twin` missing " *
+        "(bind_data materializes it for non-Bool responses)"))
+    return twin
 end
 
 # One grouped cell assignment — always ONE emitted statement, whatever
@@ -1005,7 +1084,7 @@ function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
         rcol = only(c for (c, p, _) in kp.slices if p === obs.response)
         olabel = Symbol(klabel, :_o, oi)
         ostmts, oterm =
-            _grouped_obs_likelihood_stmts(kp, obs, rcol, olabel)
+            _grouped_obs_likelihood_stmts(kp, obs, rcol, olabel, plan)
         append!(stmts, ostmts)
         push!(oterms, oterm)
     end
@@ -1018,35 +1097,35 @@ function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
     return stmts, _lik_name(klabel)
 end
 
-# One grouped in-cell observation → `(stmts, term)`: Gaussian obs
-# (PK-QT-TGI continuous alike) ride the generic plate; the joint
-# families route to their builders with the obs node's
+# One grouped in-cell observation → `(stmts, term)`: scalar obs
+# (PK-QT-TGI continuous alike) ride the shared scalar emitter; the
+# joint families route to their builders with the obs node's
 # `(response, location, scale, params)` mapped to builder kwargs (the
 # surface arity table + contract family checks proved the shapes, so
 # the positional map below is total). QT Gaussian obs route through
-# the GENERIC path (the KernelObs node cannot carry the QT builder's
+# the SHARED path (the KernelObs node cannot carry the QT builder's
 # separate weight — the surface spells `qt_sd = qt_scale .*
 # qt_weight` pre-assignments instead; the QT builder stays the golden
-# shape spec the emitter output is pinned to).
+# shape spec the emitter output is pinned to). `plan` threads the
+# bound columns for the Bernoulli eltype check (direct unit calls
+# over non-Bernoulli obs pass `nothing`).
 function _grouped_obs_likelihood_stmts(kp::KernelPlate, obs::KernelObs,
-        rcol::Symbol, olabel::Symbol)
+        rcol::Symbol, olabel::Symbol, plan::Union{StructuralPlan,Nothing} = nothing)
+    flatmap = _grouped_flatmap(kp)
+    if obs.family in _KERNEL_SCALAR_FAMS
+        pw, node = _pw_name(olabel), _lik_name(olabel)
+        rcol2 = _kernel_obs_rcol(kp, obs, rcol, plan)
+        return _kernel_scalar_obs_stmts(obs, rcol2, flatmap, plan, olabel,
+            pw, node), node
+    end
     # Obs location/scale/params naming slice do-params ride their bound
     # columns (kernel ports are column names — the panel
     # `_kernel_obs_ref` precedent); cell locals, model scalars, and
     # literals pass through.
-    flatmap = _grouped_flatmap(kp)
     loc = _kernel_obs_ref(obs.location, flatmap)
     scale = _kernel_obs_ref(obs.scale, flatmap)
     params = map(p -> _kernel_obs_ref(p, flatmap), obs.params)
-    if obs.family === GaussianFam
-        inputs = Any[rcol]
-        rv = _dovar(1)
-        locv = _thread_ref!(inputs, loc)
-        sref = _thread_ref!(inputs, scale)
-        cell = :(normal($locv, $sref).logpdf($rv))
-        pw, node = _pw_name(olabel), _lik_name(olabel)
-        return Expr[_plate_sum_stmts(pw, node, inputs, cell)...], node
-    elseif obs.family === CensoredAddpropnormalFam
+    if obs.family === CensoredAddpropnormalFam
         # `pk_obs_statement` spelling: `(location, scale = add, prop,
         # lloq)` — all names (the QT builder threads; literals spell
         # a pre-assignment).
@@ -1076,8 +1155,9 @@ function _grouped_obs_likelihood_stmts(kp::KernelPlate, obs::KernelObs,
     end
     throw(ContractValidationError("[generator] kernel plate " *
           "`$(kp.result)` obs family $(obs.family) has no in-cell " *
-          "emitter (admitted: Gaussian, CensoredAddpropnormal, " *
-          "TgiCategory, TgiResponse, TgiCensored)"))
+          "emitter (admitted: Normal, Bernoulli, Poisson, " *
+          "NegativeBinomial2, Gamma, Beta, StudentT, " *
+          "CensoredAddpropnormal, TgiCategory, TgiResponse, TgiCensored)"))
 end
 
 function _kernel_plate_likelihood(kp::KernelPlate, plan::StructuralPlan)
