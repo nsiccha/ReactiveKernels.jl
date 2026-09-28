@@ -80,6 +80,22 @@ _bare_posterior(kern, lay, q::NamedTuple) =
         k .~ Binomial.(n, nosuch)
     end"""), (:k, :n))
 
+    # Bare predictors keep their link: the bare slot admits sampled
+    # parameters only, so a deterministic definition still needs its
+    # link wrapper (mirrors the slice-1 / error-paths pins).
+    @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
+        mu = a .+ b .* x
+        k .~ Binomial.(n, mu)
+    end"""), (:k, :n, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
+        mu = a .+ b .* x
+        y .~ Bernoulli.(mu)
+    end"""), (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
+        mu = a .+ b .* x
+        y .~ Poisson.(mu)
+    end"""), (:y, :x))
+
     # Evidence on a bare location fails closed (cdf arms are link-space).
     @test_throws ContractValidationError bind_data(
         lower_rkppl(Meta.parse("""begin
