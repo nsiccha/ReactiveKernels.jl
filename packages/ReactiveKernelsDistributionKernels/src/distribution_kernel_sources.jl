@@ -50,6 +50,7 @@ export BETA_BINOMIAL_KERNEL_SOURCE
 export INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE
 export LKJ_CORR_CHOLESKY_KERNEL_SOURCE
 export ZERO_INFLATED_POISSON_KERNEL_SOURCE
+export ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE
 export NEGATIVE_BINOMIAL_KERNEL_SOURCE
 export WEIBULL_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
@@ -58,7 +59,7 @@ export poisson, gamma, beta, binomial, negative_binomial2
 export beta_binomial
 export inverse_gamma, dirichlet, lkj_corr_cholesky, zero_inflated_poisson
 export negative_binomial
-export weibull
+export weibull, zero_inflated_binomial
 export BERNOULLI_LOGIT_GLM_KERNEL_SOURCE, BERNOULLI_LOGIT_GLM_SOURCE
 export bernoulli_logit_glm
 export POISSON_LOG_GLM_KERNEL_SOURCE, POISSON_LOG_GLM_SOURCE
@@ -75,6 +76,7 @@ export NEGATIVE_BINOMIAL2_SOURCE
 export BETA_BINOMIAL_SOURCE
 export INVERSE_GAMMA_SOURCE, DIRICHLET_SOURCE, LKJ_CORR_CHOLESKY_SOURCE
 export ZERO_INFLATED_POISSON_SOURCE
+export ZERO_INFLATED_BINOMIAL_SOURCE
 export NEGATIVE_BINOMIAL_SOURCE
 export WEIBULL_SOURCE
 
@@ -736,6 +738,38 @@ using LogExpFunctions: logaddexp, log1p
 end
 """
 
+# Zero-inflated binomial family: a structural-zero mass `zi` mixed with
+# `Binomial(n, p)` counts (the m0 capture-recapture marginal shape:
+# P(s) = zi*δ₀ + (1-zi)*Bin(s|n,p)). `logpdf` is the FULL lpmf including
+# the binomial-coefficient constants (Stan `propto=false` parity;
+# cross-backend absolute-value comparison is load-bearing on this). The
+# `logit`/`p`/`logp`/`log1mp` nodes mirror `binomial` verbatim
+# (including its boundary behavior); the mixture arms mirror
+# `zero_inflated_poisson`. Branches are LAZY ternaries
+# (docs/src/constraints.md): the zero arm never forms `y * logp`, the
+# positive arm never forms the zero mixture. No cdf/quantile (discrete
+# inversion); only `logpdf` is exposed.
+const ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
+using LogExpFunctions: logaddexp, log1pexp
+
+@kernel zero_inflated_binomial(n::Int, p::Float64, zi::Float64) = begin
+    logit::Float64 = log(p) - log1p(-p)
+    p::Float64 = 1 / (1 + exp(-logit))
+    logp::Float64 = -log1pexp(-logit)
+    log1mp::Float64 = -log1pexp(logit)
+
+    logpdf(observed::Int)::Float64 =
+        ((observed >= 0) & (observed <= n) & (zi >= 0) & (zi <= 1)) ?
+            (observed == 0 ?
+                logaddexp(log(zi), log1p(-zi) + n * log1mp) :
+                log1p(-zi) + loggamma(n + 1.0) - loggamma(observed + 1.0) -
+                loggamma(n - observed + 1.0) + observed * logp +
+                (n - observed) * log1mp) :
+            -Inf
+end
+"""
+
 const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
     join((BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE,
           EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE,
@@ -750,14 +784,15 @@ const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
           LKJ_CORR_CHOLESKY_KERNEL_SOURCE,
           ZERO_INFLATED_POISSON_KERNEL_SOURCE,
           NEGATIVE_BINOMIAL_KERNEL_SOURCE,
-          WEIBULL_KERNEL_SOURCE), "\n"),
+          WEIBULL_KERNEL_SOURCE,
+          ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE), "\n"),
     (:bernoulli, :lognormal, :exponential, :geometric, :uniform, :mvnormal, :ar1,
      :categorical_logit, :categorical_logit_ref,
      :poisson, :gamma, :beta, :binomial, :negative_binomial2,
      :beta_binomial,
      :inverse_gamma, :dirichlet, :lkj_corr_cholesky, :zero_inflated_poisson,
      :negative_binomial,
-     :weibull),
+     :weibull, :zero_inflated_binomial),
 )
 const bernoulli = _OTHER_DISTRIBUTION_BINDINGS[1]
 const lognormal = _OTHER_DISTRIBUTION_BINDINGS[2]
@@ -780,6 +815,7 @@ const lkj_corr_cholesky = _OTHER_DISTRIBUTION_BINDINGS[18]
 const zero_inflated_poisson = _OTHER_DISTRIBUTION_BINDINGS[19]
 const negative_binomial = _OTHER_DISTRIBUTION_BINDINGS[20]
 const weibull = _OTHER_DISTRIBUTION_BINDINGS[21]
+const zero_inflated_binomial = _OTHER_DISTRIBUTION_BINDINGS[22]
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""
 
@@ -1343,6 +1379,36 @@ docs_example = (;
     kernel = weibull_kernel,
     output,
     plated = weibull_plated,
+    plate_inputs,
+    plate_output,
+)
+"""
+const ZERO_INFLATED_BINOMIAL_SOURCE = ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE * raw"""
+
+zero_inflated_binomial_kernel = prepare(zero_inflated_binomial.logpdf;
+    have = (:observed, :n, :p, :zi), want = :logpdf)
+zero_inflated_binomial_plated = plate(zero_inflated_binomial.logpdf;
+    have = (:observed, :n, :p, :zi), want = :logpdf, batched = (:observed,))
+
+observed = 0
+n = 3
+p = 0.5
+zi = 0.2
+inputs = (; observed, n, p, zi)
+output = zero_inflated_binomial_kernel(Tuple(inputs)...)
+
+plate_observed = [0, 1, 0, 3]
+plate_inputs = (; observed = plate_observed, n, p, zi)
+plate_output = zero_inflated_binomial_plated(Tuple(plate_inputs)...)
+
+docs_example = (;
+    name = :zero_inflated_binomial_stan,
+    origin = "ZIB count object with zero_inflated_binomial(n, p, zi) semantics (build executed)",
+    inputs,
+    spec = zero_inflated_binomial.logpdf,
+    kernel = zero_inflated_binomial_kernel,
+    output,
+    plated = zero_inflated_binomial_plated,
     plate_inputs,
     plate_output,
 )

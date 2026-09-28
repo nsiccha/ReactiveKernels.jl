@@ -105,7 +105,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     beta, inverse_gamma, binomial, negative_binomial2, beta_binomial,
     negative_binomial, weibull,
     uniform, laplace, logistic,
-    student_t, zero_inflated_poisson,
+    student_t, zero_inflated_poisson, zero_inflated_binomial,
     gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
 using SpecialFunctions: besseli, besselix, erfc, loggamma
@@ -1241,6 +1241,10 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _vonmises_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
         return _binomial_plate_stmts(r, plan, node, pw)
+    elseif r.family === BinomialProbFam
+        return _binomial_prob_plate_stmts(r, plan, node, pw)
+    elseif r.family === ZeroInflatedBinomialFam
+        return _zib_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomial2Fam
         return _nb2_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomialFam
@@ -2070,6 +2074,43 @@ function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
         # owner bindings (matches the `:observed/:n/:logit` HAVE ports).
         cell = :(binomial(; n = $nref, logit = $etav).logpdf($yv))
     end
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
+end
+
+# Prob-space Binomial (SB `binomial(n, theta)` with a Beta prior — the Rate
+# family): the location is the Beta parameter name itself (no LP node —
+# the Categorical `r.predictor`-as-symbol precedent), threaded scalar
+# through the plate against the positional prob-space kernel.
+function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    inputs = Any[y]
+    yv = _dovar(1)
+    nref = _thread_ref!(inputs, r.trials, true)
+    pref = _thread_ref!(inputs, r.predictor)
+    cell = :(binomial($nref, $pref).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
+end
+
+# Zero-inflated-Binomial plate (the ZIB head): prob-space scalar p (the
+# BinomialProb precedent) plus the zi slot (the ZIP precedent). The
+# kernel endpoint takes all three positionally; weights multiply the
+# cell (the NB2 precedent).
+function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    inputs = Any[y]
+    yv = _dovar(1)
+    nref = _thread_ref!(inputs, r.trials, true)
+    pref = _thread_ref!(inputs, r.predictor)
+    ziref = _thread_ref!(inputs, r.zi)
+    cell = :(zero_inflated_binomial($nref, $pref, $ziref).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)

@@ -1,0 +1,243 @@
+# Zero-inflated Binomial response (the m0 capture-recapture marginal
+# shape): `ZeroInflatedBinomial.(n, p, zi)` over a Beta-sampled
+# probability p (the BinomialProb precedent) plus the ZIP-convention zi
+# slot (structural-zero probability, parameter or literal). Surface
+# admission, value parity vs a Distributions.jl hand oracle,
+# Enzyme-vs-findiff gradients, O(1) emission, Reactant/XLA value+grad.
+# (`_findiff_grad` / `_GEN_BACKEND` come from test_generator.jl, included
+# first.)
+#
+# SB parity: partner numbers pending. REQUEST to
+# BayesianRegressionModels:rk:kernel:everything (Stan propto=false with
+# Jacobians, BridgeStan AD grads; Stan has no zero_inflated_binomial
+# builtin — the density is P(s) = zi*δ₀ + (1-zi)*Bin(s|n,p), FULL lpmf
+# with binomial-coefficient constants):
+#   Z1: cols s=[1,0,2,0,3,1,0,2]; probe p=0.6, zi=0.3; model
+#       p ~ Beta(1,1), zi ~ Beta(1,1), s ~ ZeroInflatedBinomial(3,p,zi).
+#   Z2: same cols; probe p=0.6, zi=0.25 literal; model
+#       p ~ Beta(1,1), s ~ ZeroInflatedBinomial(3,p,0.25).
+# Pin under `_ZIB_SB` once the partner's numbers brief lands.
+using DifferentiationInterface
+using Distributions: Beta, Binomial, logpdf
+using Enzyme
+using ReactiveKernels
+using ReactiveKernelsPPL
+using Reactant
+using Test
+
+# Lower + bind + build + query a ZIB program; return
+# `(bound, built, kern, layout)`.
+function _zib_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
+    plan = lower_rkppl(prog, keys(cols))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    kern = prepare_query(built, bound, :sampler)
+    return bound, built, kern, built.layout
+end
+
+# Posterior at a constrained probe (world-age-safe call).
+_zib_posterior(kern, lay, q::NamedTuple) =
+    Base.invokelatest(kern, unconstrain(lay, q))
+
+_zib_logaddexp(a, b) = max(a, b) + log1p(exp(-abs(a - b)))
+
+# Hand oracle for one ZIB cell (independent of the layout): the stable
+# two-arm form over Distributions' Binomial.
+function _zib_oracle_cell(y::Int, n::Int, p::Float64, zi::Float64)
+    bb = logpdf(Binomial(n, p), y)
+    return y == 0 ? _zib_logaddexp(log(zi), log1p(-zi) + bb) :
+        log1p(-zi) + bb
+end
+
+const _ZIB_S = [1, 0, 2, 0, 3, 1, 0, 2]
+const _ZIB_N = 3
+_zib_cols() = Dict{Symbol,AbstractVector}(:s => copy(_ZIB_S))
+const _ZIB_PROG = quote
+    p ~ Beta(1.0, 1.0)
+    zi ~ Beta(1.0, 1.0)
+    s .~ ZeroInflatedBinomial.(3, p, zi)
+end
+const _ZIB_LITERAL_PROG = quote
+    p ~ Beta(1.0, 1.0)
+    s .~ ZeroInflatedBinomial.(3, p, 0.25)
+end
+const _ZIB_TRIALS_COL_PROG = quote
+    p ~ Beta(1.0, 1.0)
+    zi ~ Beta(1.0, 1.0)
+    s .~ ZeroInflatedBinomial.(n, p, zi)
+end
+_zib_trials_cols() = Dict{Symbol,AbstractVector}(:s => copy(_ZIB_S),
+    :n => fill(_ZIB_N, length(_ZIB_S)))
+
+@testset "zib admission" begin
+    @testset "sampled zi" begin
+        plan = lower_rkppl(_ZIB_PROG, (:s,))
+        r = only(plan.responses)
+        @test r.family === ZeroInflatedBinomialFam
+        @test r.link === IdentityLink
+        @test r.predictor === :p
+        @test r.trials === 3
+        @test r.zi === :zi
+        @test Set(p.name for p in plan.parameters) == Set([:p, :zi])
+        @test all(p -> p.family === :beta, plan.parameters)
+    end
+    @testset "literal zi" begin
+        plan = lower_rkppl(_ZIB_LITERAL_PROG, (:s,))
+        r = only(plan.responses)
+        @test r.family === ZeroInflatedBinomialFam
+        @test r.zi === 0.25
+    end
+    @testset "trials column" begin
+        plan = lower_rkppl(_ZIB_TRIALS_COL_PROG, (:s, :n))
+        r = only(plan.responses)
+        @test r.family === ZeroInflatedBinomialFam
+        @test r.trials === :n
+    end
+end
+
+@testset "zib contract failures" begin
+    # Non-Beta p fails at contract (surface admits sampled params).
+    @test_throws ContractValidationError lower_rkppl(quote
+        p ~ Normal(0.0, 1.0)
+        zi ~ Beta(1.0, 1.0)
+        s .~ ZeroInflatedBinomial.(3, p, zi)
+    end, (:s,))
+    # zi literal outside [0, 1].
+    @test_throws ContractValidationError lower_rkppl(quote
+        p ~ Beta(1.0, 1.0)
+        s .~ ZeroInflatedBinomial.(3, p, 1.5)
+    end, (:s,))
+    # zi names nothing in the plan.
+    @test_throws ContractValidationError lower_rkppl(quote
+        p ~ Beta(1.0, 1.0)
+        s .~ ZeroInflatedBinomial.(3, p, nosuch)
+    end, (:s,))
+    # Response exceeding trials fails at bind.
+    plan = lower_rkppl(_ZIB_PROG, (:s,))
+    bad = Dict{Symbol,AbstractVector}(:s => [1, 0, 4, 0])
+    @test_throws ContractValidationError bind_data(plan, bad)
+end
+
+@testset "zib value parity" begin
+    @testset "sampled zi" begin
+        _, _, kern, lay = _zib_query(_ZIB_PROG, _zib_cols())
+        q = (p = 0.6, zi = 0.3)
+        got = _zib_posterior(kern, lay, q)
+        # Hand oracle: Beta priors + ZIB likelihood + logit Jacobians
+        # (log(p*(1-p))), fully independent of the layout.
+        want = logpdf(Beta(1.0, 1.0), 0.6) + logpdf(Beta(1.0, 1.0), 0.3) +
+               sum(_zib_oracle_cell(y, _ZIB_N, 0.6, 0.3) for y in _ZIB_S) +
+               log(0.6 * 0.4) + log(0.3 * 0.7)
+        @test got ≈ want rtol = 1e-12
+    end
+    @testset "literal zi" begin
+        _, _, kern, lay = _zib_query(_ZIB_LITERAL_PROG, _zib_cols())
+        q = (p = 0.6,)
+        got = _zib_posterior(kern, lay, q)
+        want = logpdf(Beta(1.0, 1.0), 0.6) +
+               sum(_zib_oracle_cell(y, _ZIB_N, 0.6, 0.25) for y in _ZIB_S) +
+               log(0.6 * 0.4)
+        @test got ≈ want rtol = 1e-12
+    end
+    @testset "trials column matches literal" begin
+        _, _, kern, lay = _zib_query(_ZIB_TRIALS_COL_PROG, _zib_trials_cols())
+        q = (p = 0.6, zi = 0.3)
+        got = _zib_posterior(kern, lay, q)
+        _, _, kern2, lay2 = _zib_query(_ZIB_PROG, _zib_cols())
+        want = _zib_posterior(kern2, lay2, q)
+        @test got ≈ want rtol = 1e-12
+    end
+end
+
+# One Enzyme-vs-findiff gradient check at a constrained probe (no oracle
+# needed).
+function _zib_enzyme_check(prog::Expr, cols::Dict{Symbol,AbstractVector},
+        q::NamedTuple)
+    bound, built, kern, lay = _zib_query(prog, cols)
+    u = unconstrain(lay, q)
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    _, _ = sampler_value_and_gradient!(prep, g, u)
+    @test all(isfinite, g)
+    @test isapprox(g, _findiff_grad(w -> Base.invokelatest(kern, w), u);
+        rtol = 1e-5, atol = 1e-7)
+    return g
+end
+
+@testset "zib Enzyme gradients" begin
+    @testset "sampled zi" begin
+        _zib_enzyme_check(_ZIB_PROG, _zib_cols(), (p = 0.6, zi = 0.3))
+    end
+    @testset "literal zi" begin
+        _zib_enzyme_check(_ZIB_LITERAL_PROG, _zib_cols(), (p = 0.6,))
+    end
+end
+
+# Statement-head histogram of the generated kernel (the joint-parity
+# O(1) pattern): the ZIB plate must not unroll over observations.
+function _zib_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
+    plan = lower_rkppl(prog, keys(cols))
+    bound = bind_data(plan, cols)
+    def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
+    heads = Dict{String,Int}()
+    for st in def.args[2].args
+        st isa Expr || continue
+        heads[string(st.head)] = get(heads, string(st.head), 0) + 1
+    end
+    return heads
+end
+
+@testset "zib emission is O(1) in n_obs" begin
+    h8 = _zib_statement_heads(_ZIB_PROG, _zib_cols())
+    h16 = _zib_statement_heads(_ZIB_PROG,
+        Dict{Symbol,AbstractVector}(:s => vcat(_ZIB_S, _ZIB_S)))
+    @test h8 == h16
+end
+
+# Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
+# native vs compiled), plus the traced program size.
+function _zib_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
+    plan = lower_rkppl(prog, keys(cols))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    post_q = prepare_query(built, bound, :sampler)
+    u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
+    return Base.invokelatest(_zib_reactant_measure, built, bound, post_q, u)
+end
+
+function _zib_reactant_measure(built, bound, post_q, u)
+    hlo = repr(Reactant.@code_hlo optimize = false post_q(Reactant.to_rarray(u)))
+    native = post_q(u)
+    compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
+    primal = Float64(compiled(Reactant.to_rarray(u)))
+    q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
+    rval, rgrad = cad(Reactant.to_rarray(u))
+    return (; lines = count(==('\n'), hlo), native, primal, val, g,
+        rval = Float64(rval), rgrad = Array(rgrad))
+end
+
+@testset "zib under Reactant" begin
+    progs = [
+        ("sampled-zi", _ZIB_PROG, _zib_cols()),
+        ("literal-zi", _ZIB_LITERAL_PROG, _zib_cols()),
+    ]
+    for (name, prog, cols) in progs
+        @testset "$name" begin
+            fx = _zib_reactant(prog, cols)
+            @test fx.primal ≈ fx.native rtol = 1e-9
+            @test fx.val ≈ fx.native rtol = 1e-12
+            @test fx.rval ≈ fx.native rtol = 1e-9
+            @test fx.rgrad ≈ fx.g rtol = 1e-8
+        end
+    end
+    @testset "traced program is O(1) in n_obs" begin
+        _, prog, _ = progs[1]
+        small = _zib_reactant(prog,
+            Dict{Symbol,AbstractVector}(:s => [1, 0, 2, 0]))
+        large = _zib_reactant(prog, _zib_cols())
+        @test small.lines == large.lines
+    end
+end

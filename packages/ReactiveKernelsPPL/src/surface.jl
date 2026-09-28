@@ -4516,7 +4516,16 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     end
     family, lik_link, pred_link, loc, scale_raw, trials, nu_raw, zi_raw,
     interval_raw = _lower_response_base(lhs, call, ctx)
-    pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
+    # Prob-space families bypass the predictor-building location
+    # lowering (their location names a Beta-sampled scalar parameter;
+    # the Beta family is checked at contract). Every other family
+    # routes through `_lower_location` with its identity for the
+    # bare-location gate.
+    pname = (family === BinomialProbFam ||
+            family === ZeroInflatedBinomialFam) ?
+        _lower_prob_location(lhs, loc, ctx,
+            family === BinomialProbFam ? "Binomial" : "ZeroInflatedBinomial") :
+        _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse; fam = family)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
@@ -5253,7 +5262,8 @@ function _dot2call_object_error(lhs, rhs)
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol && rhs.args[1] in
             (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
-                :Gamma, :Beta, :ZeroInflatedPoisson, :BernoulliLogit,
+                :Gamma, :Beta, :ZeroInflatedPoisson, :ZeroInflatedBinomial,
+                :BernoulliLogit,
                 :PoissonLog, :BinomialLogit,
                 :NegativeBinomial2Log, :GammaLog, :BetaLogit,
                 :CategoricalLogit, :OrderedLogistic, :Ordinal,
@@ -5427,6 +5437,7 @@ const _RESPONSE_BASE_MSG =
     "`Weibull.(k, exp.(eta))`, " *
     "`HurdlePoisson.(exp.(eta), p_zero)`, " *
     "`ZeroInflatedPoisson.(exp.(eta), zi)`, " *
+    "`ZeroInflatedBinomial.(n, p, zi)`, " *
     "`InverseGaussian.(exp.(eta), lambda)`, " *
     "`Exponential.(exp.(eta))`, " *
     "`Gamma.(alpha, exp.(eta) ./ alpha)`, " *
@@ -5451,8 +5462,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
     fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
         :NegativeBinomial2, :NegativeBinomial, :Gamma, :Beta, :HurdlePoisson,
-        :ZeroInflatedPoisson, :InverseGaussian, :Exponential, :BetaBinomial2,
-        :VonMises, :CircularVonMises, :LogNormal, :Weibull) ||
+        :ZeroInflatedPoisson, :ZeroInflatedBinomial, :InverseGaussian, :Exponential,
+        :BetaBinomial2, :VonMises, :CircularVonMises, :LogNormal, :Weibull) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
@@ -5540,6 +5551,19 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         return ZeroInflatedPoissonFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
         args[2], nothing
+    elseif fam === :ZeroInflatedBinomial
+        length(args) == 3 || _sfail("response $lhs: `ZeroInflatedBinomial` takes " *
+                                    "`ZeroInflatedBinomial.(n, p, zi)`")
+        # v1 is prob-space only (the BinomialProb precedent): a bare
+        # Beta-sampled p. Link-wrapped probabilities (a predictor-fed GLM
+        # shape) are a planned slice, never a silent misroute.
+        pp = args[2]
+        (pp isa Symbol || pp isa Real) ||
+            _sfail("response $lhs: `ZeroInflatedBinomial` probability takes " *
+                "a bare Beta parameter (`p ~ Beta(...)` in the model), " *
+                "got $(repr(pp))")
+        return ZeroInflatedBinomialFam, IdentityLink, IdentityLink, pp,
+        nothing, _lower_trials(lhs, args[1], ctx), nothing, args[3], nothing
     elseif fam === :InverseGaussian
         length(args) == 2 || _sfail("response $lhs: `InverseGaussian` takes " *
                                     "`InverseGaussian.(exp.(eta), lambda)`")
@@ -5700,6 +5724,9 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :zero_inflated_poisson && _sfail("response $lhs: use " *
                                  "`ZeroInflatedPoisson` (the response " *
                                  "spelling, not the kernel endpoint)")
+    fam === :zero_inflated_binomial && _sfail("response $lhs: use " *
+                                 "`ZeroInflatedBinomial` (the response " *
+                                 "spelling, not the kernel endpoint)")
     fam === :inverse_gaussian && _sfail("response $lhs: use " *
                                         "`InverseGaussian` (the response " *
                                         "spelling, not the kernel endpoint)")
@@ -5729,6 +5756,7 @@ function _lower_response_base_error(lhs, rhs, fam)
                   "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
                   "NegativeBinomial2, NegativeBinomial, Weibull, " *
                   "HurdlePoisson, ZeroInflatedPoisson, " *
+                  "ZeroInflatedBinomial, " *
                   "InverseGaussian, Exponential, BetaBinomial2, VonMises, " *
                   "CircularVonMises, LogNormal, Gamma, Beta, " *
                   "BernoulliLogit, " *
@@ -5779,13 +5807,32 @@ function _lower_bernoulli_link(lhs, arg)
 end
 
 function _lower_binomial_link(lhs, arg)
+    # Bare prob (a Beta-sampled parameter, constrained-scale — the
+    # mixture bare-mean precedent): prob-space Binomial, no link.
+    if arg isa Symbol || arg isa Real
+        return BinomialProbFam, IdentityLink, arg
+    end
     arg isa Expr && arg.head === :call && !isempty(arg.args) &&
         haskey(_BINOMIAL_LINKS, arg.args[1]) ||
         _sfail("response $lhs: `Binomial` probability takes a link wrapper " *
-               "(`logistic.(mu)`, `probit.(mu)`, or `cloglog.(mu)`), " *
+               "(`logistic.(mu)`, `probit.(mu)`, or `cloglog.(mu)`) or a " *
+               "bare Beta parameter (`theta ~ Beta(...)`), " *
                "got $(repr(arg))")
     fam, link = _BINOMIAL_LINKS[arg.args[1]]
     return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
+end
+
+# Prob-space Binomial-family location: a sampled parameter name (the Beta
+# family is checked at contract, the Categorical deferral precedent).
+# Literals stay rejected — a fully fixed Binomial contributes a constant.
+function _lower_prob_location(lhs, loc, ctx, what::String = "Binomial")
+    loc isa Symbol && loc in ctx.prior_names && return loc
+    loc isa Real && _sfail("response $lhs: prob-space $what " *
+                           "probability $loc is a literal — v1 probabilities " *
+                           "are Beta-sampled (`theta ~ Beta(...)` in the model)")
+    return _sfail("response $lhs: prob-space $what probability takes a " *
+                  "Beta parameter name (`theta ~ Beta(...)` in the model), " *
+                  "got $(repr(loc))")
 end
 
 function _lower_scale(lhs, s, ctx)
