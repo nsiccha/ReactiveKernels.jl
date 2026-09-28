@@ -532,6 +532,14 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         end
         push!(kplates, kp)
     end
+    # Declared schedules feed a cell (any plate's — panel plates carry
+    # no schedules, so single-grouped models behave as before).
+    used_scheds = Set{Symbol}(s.name for kp in kplates for s in kp.schedules)
+    for s in schedules
+        s.name in used_scheds ||
+            _sfail("model leaves schedule `$(s.name)` unused (declared " *
+                   "schedules must feed a cell — typo'd schedule name?)")
+    end
     # GLM-object responses lower after the joints (no predictor
     # interning — the object owns eta; coefficient recording goes to
     # the separate GLM-use table, before coefficient priors resolve).
@@ -2104,21 +2112,65 @@ function _lower_kernel_plate(st::Expr, line::Int, data::Set{Symbol},
 end
 
 # In-cell observation families: surface head => (family enum, total arg
-# count). Location-first, scale second positional, the rest `params`.
-# Panel admits `Normal` only; grouped admits the joint families too.
+# count). Location-first, scale second positional, the rest `params`
+# (1-arg families leave `scale === nothing`). Panel admits the scalar
+# response-space set (v2: the standard response vocabulary — link
+# inversion spells via a pre-assignment, never a fused head); grouped
+# admits the joint families too.
 const _KERNEL_OBS_FAMILIES = Dict{Symbol,Tuple{Any,Int}}(
     :Normal => (GaussianFam, 2),
+    :Bernoulli => (BernoulliLogitFam, 1),
+    :Poisson => (PoissonLogFam, 1),
+    :NegativeBinomial2 => (NegativeBinomial2Fam, 2),
+    :Gamma => (GammaLogFam, 2),
+    :Beta => (BetaLogitFam, 2),
+    :StudentT => (StudentTFam, 3),
     :CensoredAddpropnormal => (CensoredAddpropnormalFam, 4),
     :TgiCategory => (TgiCategoryFam, 7),
     :TgiResponse => (TgiResponseFam, 6),
     :TgiCensored => (TgiCensoredFam, 3))
 
+# Scalar response-space heads a panel cell admits (v2; the grouped
+# joint heads stay grouped-only — they need a schedule).
+const _PANEL_OBS_HEADS = (:Normal, :Bernoulli, :Poisson,
+    :NegativeBinomial2, :Gamma, :Beta, :StudentT)
+
+# Fused link-space heads rejected in cells (response-space node — the
+# link inverts via a pre-assignment, the julianic delta): head => the
+# admitted spelling.
+const _KERNEL_FUSED_HEADS = Dict{Symbol,String}(
+    :BernoulliLogit => "`p = 1 ./ (1 .+ exp.(-eta))` + `Bernoulli.(p)`",
+    :PoissonLog => "`mu = exp.(eta)` + `Poisson.(mu)`",
+    :BernoulliProbit => "probit link (not admitted in cells)",
+    :BernoulliCloglog => "cloglog link (not admitted in cells)")
+
+# Binomial heads (sequenced follow-up — the obs node has no trials
+# slot; the mixture precedent threads trials separately).
+const _KERNEL_BINOMIAL_HEADS = (:Binomial, :BinomialLogit,
+    :BinomialProbit, :BinomialCloglog)
+
+# Admitted-head list for the in-cell obs errors (hardcoded order —
+# Dict iteration is unstable): panel the scalar response-space set,
+# grouped plus the joint four.
+_kernel_admitted_msg(grouped::Bool) =
+    "`Normal.(...)`, `Bernoulli.(...)`, `Poisson.(...)`, " *
+    "`NegativeBinomial2.(...)`, `Gamma.(...)`, `Beta.(...)`, " *
+    "`StudentT.(...)`" *
+    (grouped ? ", `CensoredAddpropnormal.(...)`, `TgiCategory.(...)`, " *
+     "`TgiResponse.(...)`, `TgiCensored.(...)` " : " ")
+
 # One in-cell observation: `yy .~ Fam.(args...)` with a slice-param
-# response and name-or-literal args (panel: Gaussian only, exactly one
-# obs; grouped: the joint families too, a list; plate: like grouped
-# but the response names its data column directly). Inline scale/location
-# expressions are NOT admitted — complex values spell via a
-# pre-assignment (julianic delta, one line).
+# response and name-or-literal args (panel: the scalar response-space
+# set, exactly one obs; grouped: the joint families too, a list;
+# plate: like grouped but the response names its data column
+# directly). Inline scale/location expressions are NOT admitted —
+# complex values spell via a pre-assignment (julianic delta, one
+# line) — and fused link-space heads are rejected for the same reason
+# (the node is response-space-pure). The response surface's
+# link-unwrapping/shape-decomposition does NOT apply in cells (args are
+# opaque names — the julianic delta): the user applies links in
+# pre-assignments, and values agree with the standard spelling whenever
+# the pre-assignment computes the same constrained quantity.
 function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
         form::String = "panel v1")
     resp = stmt.args[2]
@@ -2143,16 +2195,25 @@ function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
                "$(repr(dist))")
     head = dist.args[1]
     grouped = form != "panel v1"
-    if !grouped && head !== :Normal
-        _sfail("$where $form admits a Gaussian in-cell observation " *
-               "only, got `$head.(...)`")
-    end
     spec = get(_KERNEL_OBS_FAMILIES, head, nothing)
-    spec === nothing &&
+    if spec === nothing
+        fused = get(_KERNEL_FUSED_HEADS, head, nothing)
+        fused !== nothing &&
+            _sfail("$where in-cell observations take response-space " *
+                   "heads (the link inverts via a pre-assignment): got " *
+                   "fused `$head.(...)` — spell $fused")
+        head in _KERNEL_BINOMIAL_HEADS &&
+            _sfail("$where `$head.(...)` needs trials threading " *
+                   "(sequenced follow-up — the in-cell obs node has no " *
+                   "trials slot)")
         _sfail("$where $form admits in-cell observations " *
-               "`Normal.(...)`, `CensoredAddpropnormal.(...)`, " *
-               "`TgiCategory.(...)`, `TgiResponse.(...)`, " *
-               "`TgiCensored.(...)` only, got `$head.(...)`")
+               _kernel_admitted_msg(grouped) * "only, got `$head.(...)`")
+    end
+    if !grouped && !(head in _PANEL_OBS_HEADS)
+        _sfail("$where $form admits in-cell observations " *
+               _kernel_admitted_msg(false) *
+               "only — `$head.(...)` is grouped-only (declare a schedule)")
+    end
     fam, arity = spec
     dargs = dist.args[2].args
     length(dargs) == arity ||
@@ -2165,7 +2226,8 @@ function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
                    "numeric literal, got $(repr(ref))")
     end
     return (response = resp, family = fam, location = dargs[1],
-        scale = dargs[2], params = Tuple(dargs[3:end]))
+        scale = arity == 1 ? nothing : dargs[2],
+        params = arity <= 2 ? () : Tuple(dargs[3:end]))
 end
 
 # Grouped-kernel statement (plate form, SB `@plate for` verbatim modulo
@@ -2539,11 +2601,9 @@ function _lower_plate_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
             _sfail("$where references schedule `$s`, which is not " *
                    "declared (`$s = linear_pk_schedule(...)`)")
     end
-    for s in schedules
-        s.name in schednames ||
-            _sfail("$where leaves schedule `$(s.name)` unused (declared " *
-                   "schedules must feed the cell — typo'd schedule name?)")
-    end
+    # Unused schedules fail globally, after all plates lower (v2: a
+    # schedule feeds SOME plate's cell — the per-plate check would
+    # demand every schedule in every plate).
     # Event-LP references: a 7-arg call's second arg must name a
     # declared event-LP; unused declarations fail closed (the
     # schedule precedent — unfed LPs would sample dead parameters).
@@ -2561,6 +2621,24 @@ function _lower_plate_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
                    "typo'd event-LP name?)")
     end
     used = [s for s in schedules if s.name in schednames]
+    if isempty(used) && length(schedules) == 1
+        # Structural linkage (v2 axis 1): a ref-less cell with exactly
+        # one declared schedule attaches it — there is nothing to
+        # confuse (dose-free plates make no PK calls; the bind-time
+        # dose/PK coherence gate keeps the missing-call typo loud).
+        used = [only(schedules)]
+    end
+    if isempty(used) && length(schedules) > 1
+        _sfail("$where references no schedule; with " *
+               "$(length(schedules)) declared, reference one in-cell " *
+               "(a read_locs call or a sched.map gather)")
+    end
+    if isempty(used) && isempty(schedules) && !isempty(lp_args)
+        _sfail("$where takes LP args but no schedule is declared " *
+               "(grouped plates need one — declare `sched = " *
+               "linear_pk_schedule(...)` and bind empty dose columns " *
+               "for a dose-free plate)")
+    end
     slices = Tuple{Symbol,Symbol,Symbol}[(r, r, :unknown)
         for r in Iterators.flatten((resps, extras))]
     return KernelPlate(result, subjects, nothing, slices, assignments,

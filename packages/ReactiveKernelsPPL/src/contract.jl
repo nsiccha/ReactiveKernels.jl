@@ -1055,6 +1055,13 @@ Multi-param families (joint PK/QT/TGI) are grouped-only."""
 const KernelObs =
     NamedTuple{(:response, :family, :location, :scale, :params)}
 
+"""Scalar response-space in-cell obs families (v2 panel set; grouped
+admits these plus the joint families). Cell args are constrained-scale
+values (bare args skip link inversion — literals prove domains)."""
+const _KERNEL_SCALAR_FAMS = (GaussianFam, BernoulliLogitFam,
+    PoissonLogFam, NegativeBinomial2Fam, GammaLogFam, BetaLogitFam,
+    StudentTFam)
+
 """
     KernelPlate(result, subjects, timepoints, slices, assignments, obs, collected, label;
                 lp_args = [], schedules = [])
@@ -1124,6 +1131,14 @@ _kernel_flat_length(n_sub::Int, T::Union{Nothing,Int}) =
 precedent: deterministic bind product, caller collisions fail closed)."""
 _kexp_name(result::Symbol, col::Symbol) = Symbol("$(result)_kexp_$(col)")
 
+"""Bernoulli in-cell Bool twin: `<result>_kbool_<response>` — the exact
+Bool lanes a non-Bool Bernoulli flat reads (the `!=` comparison
+misdifferentiates under native Enzyme — snag
+`bernoulli-int-la-78487520`). Named by response PARAM (one twin per
+obs, stable across raw/expansion flats)."""
+_kbool_name(result::Symbol, response::Symbol) =
+    Symbol("$(result)_kbool_$(response)")
+
 """Columns a kernel plate manages (slice columns + scalar expansions):
 exempt from the uniform-`n_obs` rule, validated under kernel rules.
 Expansions exist only for resolved vector models (`T isa Int`); gating
@@ -1159,8 +1174,34 @@ function _kernel_managed_columns(kp::KernelPlate)
         # event-LP): op-length by design, like the op columns.
         push!(out, _sched_col_name(s.name, :op_log_dose))
     end
+    for obs in kp.obs
+        # Bernoulli Bool twins (present only for non-Bool flats —
+        # the absent twin is an inert managed name).
+        obs.family === BernoulliLogitFam &&
+            push!(out, _kbool_name(kp.result, obs.response))
+    end
     union!(out, _cell_bind_columns(kp))
     return out
+end
+
+# Bool-twin materialization (the kexp precedent: deterministic bind
+# product, caller-supplied collisions reserved-fail): Bernoulli plates
+# read Bool lanes — the `!=` comparison misdifferentiates under native
+# Enzyme (snag `bernoulli-int-la-78487520`), so non-Bool flats (integer
+# columns, Float64 expansions) gain an exact Bool twin. Dense
+# `Vector{Bool}` — broadcast comparison yields a BitVector and
+# BitArrays are overlay-hostile (reactant ladder-1b). Returns the twin
+# name, or `nothing` when the flat is already Bool.
+function _materialize_kernel_bool_twin!(kp::KernelPlate, obs::KernelObs,
+        flatv::AbstractVector, columns::Dict{Symbol,ColumnData})
+    eltype(flatv) === Bool && return nothing
+    twin = _kbool_name(kp.result, obs.response)
+    haskey(columns, twin) &&
+        _fail(kp.label, "column `$twin` is reserved for kernel plate " *
+              "`$(kp.result)`'s Bool twin of `$(obs.response)` — " *
+              "rename the caller-supplied column")
+    columns[twin] = Vector{Bool}(flatv .!= 0)
+    return twin
 end
 
 """Plain-Symbol bind columns a grouped cell references: gather indices
@@ -1837,6 +1878,18 @@ function _cell_has_auc_call(assignments::Vector{Pair{Symbol,Any}})
     for (_, ex) in assignments
         ex isa Expr && ex.head === :call && !isempty(ex.args) &&
             ex.args[1] === :linear_pk_read_locs_auc && return true
+    end
+    return false
+end
+
+"""Whether any top-level cell assignment calls a PK recurrence
+(same top-level-only reading as [`_cell_has_auc_call`](@ref);
+segmented-nadir calls are data-driven and do not count)."""
+function _cell_has_pk_call(assignments::Vector{Pair{Symbol,Any}})
+    for (_, ex) in assignments
+        ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+            ex.args[1] isa Symbol && ex.args[1] in CELL_FNS &&
+            return true
     end
     return false
 end
@@ -3228,17 +3281,16 @@ function _fit_event_lps(plan::StructuralPlan,
 end
 
 # Kernel (KernelPlate) structure: everything provable without data.
-# v1: at most one kernel per model; a kernel carries the ONLY
-# likelihood (no top-level responses alongside — BRM routes kernel models
-# away from the GLM flow). Panel plates (no schedules) follow
+# v2: N kernel plates per model (panel plates compose freely; at most
+# one grouped plate — multi-schedule grouped models are a sequenced
+# follow-up). The plates jointly carry the ONLY likelihood (no
+# top-level responses alongside — BRM routes kernel models away from
+# the GLM flow). Panel plates (no schedules) follow
 # `_validate_panel_kernel` (grouping ABSENT — implicit 1:n subjects,
 # structural, no sentinel, pinned here + tests); grouped plates follow
 # `_validate_grouped_kernel`.
 function _validate_kernels(plan::StructuralPlan)
     plates = plan.kernel_plates
-    length(plates) <= 1 ||
-        _fail(:plan, "v1 admits at most one kernel plate per model " *
-              "(got $(length(plates)))")
     isempty(plates) && return nothing
     # Mixed-level predictors (a response and a kernel LP arg sharing one
     # definition) fail with the precise message before the only-likelihood
@@ -3246,22 +3298,28 @@ function _validate_kernels(plan::StructuralPlan)
     for kp in plates, (p, _) in kp.lp_args
         _predictor_level(plan, p)
     end
-    kp = only(plates)
+    results = join(["`$(kp.result)`" for kp in plates], ", ")
     isempty(plan.responses) ||
-        _fail(kp.label, "a kernel plate carries the only likelihood " *
-              "(v1: no top-level responses alongside `$(kp.result)`)")
+        _fail(:plan, "kernel plates carry the only likelihood " *
+              "(v2: no top-level responses alongside $results)")
+    ngrouped = count(_is_grouped_kernel, plates)
+    ngrouped <= 1 ||
+        _fail(:plan, "v2 admits at most one grouped kernel plate per " *
+              "model (got $ngrouped — sequenced follow-up)")
     # Name hygiene + collisions (result, slice params, cell locals) live in
     # the global `_validate_name_tables` gate via `_kernel_all_names`.
-    _check_name_hygiene(kp.label)
-    if kp.subjects isa Int
-        kp.subjects > 0 ||
-            _fail(kp.label, "subject count must be a positive integer, " *
-                  "got $(kp.subjects)")
-    end
-    if _is_grouped_kernel(kp)
-        _validate_grouped_kernel(plan, kp)
-    else
-        _validate_panel_kernel(plan, kp)
+    for kp in plates
+        _check_name_hygiene(kp.label)
+        if kp.subjects isa Int
+            kp.subjects > 0 ||
+                _fail(kp.label, "subject count must be a positive integer, " *
+                      "got $(kp.subjects)")
+        end
+        if _is_grouped_kernel(kp)
+            _validate_grouped_kernel(plan, kp)
+        else
+            _validate_panel_kernel(plan, kp)
+        end
     end
     return nothing
 end
@@ -3310,37 +3368,43 @@ function _validate_panel_kernel(plan::StructuralPlan, kp::KernelPlate)
 end
 
 # One in-cell observation node (panel and grouped share the shape):
-# response a slice param; panel Gaussian-only, grouped the joint
-# families too; location/scale/params names-or-literals resolving to
-# cell/model names (literals finite; Gaussian scale literals positive —
-# positional-second args of multi-param families take no positivity).
+# response a slice param; panel the scalar response-space set, grouped
+# the joint families too; location/scale/params names-or-literals
+# resolving to cell/model names (literals finite; constrained-scale
+# domains per family below — bare cell args skip link inversion, so
+# the value itself must be valid. Positional-second args of the
+# multi-param JOINT families take no positivity).
 function _validate_kernel_obs_ref(kp::KernelPlate, obs::KernelObs,
         params::Vector{Symbol}, known::Set{Symbol}, grouped::Bool)
     obs.response in params ||
         _fail(kp.label, "kernel obs response `$(obs.response)` is not a " *
               "slice param (responses enter the cell as slices)")
     if grouped
-        obs.family in (GaussianFam, CensoredAddpropnormalFam,
+        obs.family in (_KERNEL_SCALAR_FAMS..., CensoredAddpropnormalFam,
                 TgiCategoryFam, TgiResponseFam, TgiCensoredFam) ||
             _fail(kp.label, "grouped kernels admit in-cell observations " *
-                  "`Normal.(...)`, `CensoredAddpropnormal.(...)`, " *
+                  "`Normal.(...)`, `Bernoulli.(...)`, `Poisson.(...)`, " *
+                  "`NegativeBinomial2.(...)`, `Gamma.(...)`, `Beta.(...)`, " *
+                  "`StudentT.(...)`, `CensoredAddpropnormal.(...)`, " *
                   "`TgiCategory.(...)`, `TgiResponse.(...)`, " *
                   "`TgiCensored.(...)` only, got $(obs.family)")
     else
-        obs.family === GaussianFam ||
-            _fail(kp.label, "kernel v1 admits a Gaussian in-cell observation " *
-                  "only, got $(obs.family)")
+        obs.family in _KERNEL_SCALAR_FAMS ||
+            _fail(kp.label, "panel kernels admit scalar in-cell " *
+                  "observations `Normal.(...)`, `Bernoulli.(...)`, " *
+                  "`Poisson.(...)`, `NegativeBinomial2.(...)`, " *
+                  "`Gamma.(...)`, `Beta.(...)`, `StudentT.(...)` only, " *
+                  "got $(obs.family)")
     end
-    if obs.family === GaussianFam && !isempty(obs.params)
-        _fail(kp.label, "Gaussian in-cell observations take no `params` " *
-              "(got $(obs.params))")
-    end
+    obs.family in _KERNEL_SCALAR_FAMS &&
+        return _validate_kernel_scalar_obs(kp, obs, known, grouped)
+    # Joint families below (Gaussian rides the scalar path above).
     for (nm, ref) in ((:location, obs.location), (:scale, obs.scale))
         if ref isa Number && !(ref isa Bool)
-            positive = nm === :scale && obs.family === GaussianFam
-            (isfinite(ref) && (!positive || ref > 0)) ||
-                _fail(kp.label, "kernel obs $nm literal must be finite" *
-                      (positive ? " positive" : "") * ", got $ref")
+            # Joint families take no positivity (Gaussian rides the
+            # scalar path above).
+            isfinite(ref) ||
+                _fail(kp.label, "kernel obs $nm literal must be finite, got $ref")
         elseif ref isa Symbol
             ref in known ||
                 _fail(kp.label, "kernel obs $nm `$ref` is neither a cell " *
@@ -3377,6 +3441,115 @@ function _validate_kernel_obs_ref(kp::KernelPlate, obs::KernelObs,
         end
     end
     return nothing
+end
+
+# One scalar response-space in-cell observation (v2): shape rules per
+# family (1-arg Bernoulli/Poisson leave `scale === nothing`; StudentT
+# carries sigma in `params`), then per-slot validation. Symbol refs
+# resolve to cell/model names (LP cell params gather explicitly, the
+# grouped precedent); literals prove constrained-scale domains (the
+# mixture-literal precedent — bare cell args skip link inversion, so
+# the value itself must be valid).
+function _validate_kernel_scalar_obs(kp::KernelPlate, obs::KernelObs,
+        known::Set{Symbol}, grouped::Bool)
+    fam = obs.family
+    one_arg = fam === BernoulliLogitFam || fam === PoissonLogFam
+    if one_arg
+        obs.scale === nothing ||
+            _fail(kp.label, "$fam in-cell observations take their " *
+                  "location only (got a scale slot)")
+    else
+        obs.scale === nothing &&
+            _fail(kp.label, "$fam in-cell observations take location + " *
+                  "scale (got location only)")
+    end
+    want_params = fam === StudentTFam ? 1 : 0
+    length(obs.params) == want_params ||
+        _fail(kp.label, "$fam in-cell observations take " *
+              (want_params == 0 ? "no `params`" :
+               "exactly one `params` entry (sigma)") *
+              " (got $(obs.params))")
+    _validate_kernel_obs_arg(kp, obs, :location, obs.location, known, grouped)
+    obs.scale === nothing ||
+        _validate_kernel_obs_arg(kp, obs, :scale, obs.scale, known, grouped)
+    for ref in obs.params
+        _validate_kernel_obs_arg(kp, obs, :params, ref, known, grouped)
+    end
+    return nothing
+end
+
+function _validate_kernel_obs_arg(kp::KernelPlate, obs::KernelObs,
+        slot::Symbol, ref, known::Set{Symbol}, grouped::Bool)
+    if ref isa Number && !(ref isa Bool)
+        _kernel_obs_literal_domain(kp, obs, slot, ref)
+        return nothing
+    elseif ref isa Symbol
+        ref in known ||
+            _fail(kp.label, "kernel obs $slot `$ref` is neither a cell " *
+                  "name nor a model-level scalar (cross-cell refs " *
+                  "fail closed)")
+        grouped && ref in _lp_cell_params(kp) &&
+            _fail(kp.label, "kernel obs $slot `$ref` is an LP cell " *
+                  "param — gather explicitly (`$ref[subj_map]` " *
+                  "with a bound subject column; bare LP cell " *
+                  "params do not lower as obs args)")
+        return nothing
+    else
+        _fail(kp.label, "kernel obs $slot must be a cell/model name or " *
+              "a numeric literal, got $(repr(ref))")
+    end
+end
+
+# Constrained-scale domain of one scalar-obs literal arg, per family
+# (slot roles: Bernoulli location = p; Poisson location = mu; NB2 =
+# (mu, phi); Gamma = Distributions (shape, scale); Beta = (a, b)
+# shapes; StudentT = (nu, mu, sigma) in (location, scale, params)).
+function _kernel_obs_literal_domain(kp::KernelPlate, obs::KernelObs,
+        slot::Symbol, v::Real)
+    fam = obs.family
+    if fam === GaussianFam
+        # v1 message, byte-preserved.
+        positive = slot === :scale
+        (isfinite(v) && (!positive || v > 0)) ||
+            _fail(kp.label, "kernel obs $slot literal must be finite" *
+                  (positive ? " positive" : "") * ", got $v")
+        return nothing
+    end
+    isfinite(v) ||
+        _fail(kp.label, "kernel obs $slot literal must be finite, got $v")
+    ok = if fam === BernoulliLogitFam
+        0 <= v <= 1
+    elseif fam === PoissonLogFam
+        v >= 0
+    elseif fam === NegativeBinomial2Fam
+        slot === :scale ? v > 0 : v >= 0
+    elseif fam === GammaLogFam || fam === BetaLogitFam
+        v > 0
+    elseif fam === StudentTFam
+        slot === :scale ? true : v > 0
+    else
+        true
+    end
+    ok && return nothing
+    domain, role = if fam === BernoulliLogitFam
+        "a probability in [0, 1]", "p"
+    elseif fam === PoissonLogFam
+        "a nonnegative mean", "mu"
+    elseif fam === NegativeBinomial2Fam
+        slot === :location ? ("a nonnegative mean", "mu") :
+            ("positive", "phi")
+    elseif fam === GammaLogFam
+        slot === :location ? ("positive", "alpha") : ("positive", "scale")
+    elseif fam === BetaLogitFam
+        slot === :location ? ("positive", "a") : ("positive", "b")
+    elseif fam === StudentTFam
+        slot === :location ? ("positive degrees of freedom", "nu") :
+            ("positive", "sigma")
+    else
+        "positive", string(slot)
+    end
+    _fail(kp.label, "kernel obs $slot literal $v is not $domain " *
+          "(response-space $role)")
 end
 
 """Term kinds a subject-level predictor may carry in grouped kernels
@@ -4065,11 +4238,6 @@ function _validate_grouped_kernel_data(plan::StructuralPlan, kp::KernelPlate)
                   "not the schedule build (bind_data materializes it — " *
                   "a hand-bound plan must carry the identical product)")
     end
-    n_axis = length(plan.columns[sched.obs_subj])
-    plan.n_obs == n_axis ||
-        _fail(kp.label, "n_obs $(plan.n_obs) ≠ schedule obs axis $n_axis " *
-              "(the first in-cell observation responds on the schedule " *
-              "obs axis; foreign-axis responses ride later observations)")
     for (col, param, kind) in kp.slices
         kind === :response ||
             _fail(kp.label, "slice `$param` kind unresolved " *
@@ -4084,6 +4252,25 @@ function _validate_grouped_kernel_data(plan::StructuralPlan, kp::KernelPlate)
             _fail(kp.label, "slice column `$col` must be finite")
         # Any length admits (foreign-axis responses ride their own
         # axis); per-obs axis agreement is proved on shapes below.
+    end
+    # First-obs-on-primary (per plate): the first in-cell observation
+    # responds on the schedule obs axis; foreign-axis responses ride
+    # later observations.
+    n_axis = length(plan.columns[sched.obs_subj])
+    _kernel_plate_nlanes(kp, plan.columns) == n_axis ||
+        _fail(kp.label, "primary response length " *
+              "$(_kernel_plate_nlanes(kp, plan.columns)) ≠ schedule obs " *
+              "axis $n_axis (the first in-cell observation responds on " *
+              "the schedule obs axis; foreign-axis responses ride later " *
+              "observations)")
+    for obs in kp.obs
+        # Scalar obs validate their response column per family (the
+        # panel mirror); joint responses prove on shapes below.
+        obs.family in _KERNEL_SCALAR_FAMS || continue
+        rcol = only(c for (c, p, _) in kp.slices if p === obs.response)
+        colv = _vector_column(plan.columns, rcol, kp.label, "obs response")
+        _validate_kernel_obs_column(kp, obs, rcol, colv)
+        _validate_kernel_bool_twin(kp, obs, rcol, plan)
     end
     for (p, _) in kp.lp_args
         i = findfirst(q -> q.name === p, plan.predictors)
@@ -4127,10 +4314,38 @@ end
 # Kernel bind checks: resolved dims, total kinds, flat-T-blocked lengths,
 # subjects coverage. Runs on bound plans (bind resolves Symbol dims via
 # the `dims` map first; hand-bound plans carry Ints directly).
+# Likelihood lanes of one resolved plate (panel: flat length; grouped:
+# primary-response length): the bind_data `n` summand and the hand-bound
+# n_obs check share it. Per-plate bodies run first, so subjects are
+# resolved and slice columns bound whenever this is called.
+function _kernel_plate_nlanes(kp::KernelPlate, columns::AbstractDict{Symbol})
+    _is_grouped_kernel(kp) ||
+        return _kernel_flat_length(kp.subjects, kp.timepoints)
+    rcol0 = only(c for (c, p, _) in kp.slices if p === first(kp.obs).response)
+    return length(columns[rcol0])
+end
+
 function _validate_kernels_data(plan::StructuralPlan)
     isempty(plan.kernel_plates) && return nothing
-    kp = only(plan.kernel_plates)
-    _is_grouped_kernel(kp) && return _validate_grouped_kernel_data(plan, kp)
+    for kp in plan.kernel_plates
+        if _is_grouped_kernel(kp)
+            _validate_grouped_kernel_data(plan, kp)
+        else
+            _validate_panel_kernel_data(plan, kp)
+        end
+    end
+    # n_obs is the total likelihood lanes across plates (bind_data sets
+    # the sum; a hand-bound plan must carry it).
+    lanes =
+        [_kernel_plate_nlanes(kp, plan.columns) for kp in plan.kernel_plates]
+    plan.n_obs == sum(lanes) ||
+        _fail(:plan, "n_obs $(plan.n_obs) ≠ total kernel lanes $(sum(lanes)) " *
+              "($(join(["$(kp.result)=$n"
+                           for (kp, n) in zip(plan.kernel_plates, lanes)], ", ")))")
+    return nothing
+end
+
+function _validate_panel_kernel_data(plan::StructuralPlan, kp::KernelPlate)
     kp.subjects isa Int ||
         _fail(kp.label, "subjects dims key `$(kp.subjects)` unresolved " *
               "(bind_data with dims first)")
@@ -4140,13 +4355,10 @@ function _validate_kernels_data(plan::StructuralPlan)
         _fail(kp.label, "timepoints dims key `$T` unresolved " *
               "(bind_data with dims first)")
     flat = _kernel_flat_length(n_sub, T)
-    plan.n_obs == flat ||
-        _fail(kp.label, "n_obs $(plan.n_obs) ≠ kernel flat length $flat " *
-              "(n_sub=$n_sub$((T === nothing ? "" : ", T=$T")))")
     if T === nothing
         all(s -> s[3] === :scalar, kp.slices) ||
             _fail(kp.label, "a vector slice needs T (bind the " *
-                  "`kernel_T_<result>` dims key)")
+                  "`kernel_T_$(kp.result)` dims key)")
     elseif T > 1
         any(s -> s[3] === :vector, kp.slices) ||
             _fail(kp.label, "T=$T bound but no vector slice uses it " *
@@ -4188,6 +4400,77 @@ function _validate_kernels_data(plan::StructuralPlan)
                 _fail(kp.label, "expansion `$exp` is not the flat " *
                       "T-block repeat of `$col`")
         end
+    end
+    for obs in kp.obs
+        obs.family in _KERNEL_SCALAR_FAMS || continue
+        si = findfirst(s -> s[2] === obs.response, kp.slices)
+        kind = kp.slices[si][3]
+        rcol = kp.slices[si][1]
+        if (obs.family === PoissonLogFam ||
+                obs.family === NegativeBinomial2Fam) &&
+                kind === :scalar && T !== nothing
+            _fail(kp.label, (obs.family === PoissonLogFam ? "Poisson" :
+                  "NB2") * " in-cell response `$(obs.response)` rides a " *
+                  "scalar slice (one count per subject over T=$T " *
+                  "timepoints) — the count endpoints take Int lanes, but " *
+                  "scalar expansions are Float64: bind per-timepoint " *
+                  "counts as a vector slice (length n_sub*T), or drop T " *
+                  "for an all-scalar plate")
+        end
+        colv = _vector_column(plan.columns, rcol, kp.label, "obs response")
+        _validate_kernel_obs_column(kp, obs, rcol, colv)
+        flat = (kind === :scalar && T !== nothing) ?
+            _kexp_name(kp.result, rcol) : rcol
+        _validate_kernel_bool_twin(kp, obs, flat, plan)
+    end
+    return nothing
+end
+
+# Bernoulli in-cell Bool twin verification (bind products are verified,
+# not trusted — the kexp precedent): non-Bool flats read their twin.
+function _validate_kernel_bool_twin(kp::KernelPlate, obs::KernelObs,
+        flat::Symbol, plan::StructuralPlan)
+    obs.family === BernoulliLogitFam || return nothing
+    flatv = _vector_column(plan.columns, flat, kp.label, "obs flat")
+    eltype(flatv) === Bool && return nothing
+    twin = _kbool_name(kp.result, obs.response)
+    haskey(plan.columns, twin) ||
+        _fail(kp.label, "Bernoulli in-cell Bool twin `$twin` missing " *
+              "(bind_data materializes it for non-Bool responses)")
+    twinv = _vector_column(plan.columns, twin, kp.label, "Bool twin")
+    eltype(twinv) === Bool ||
+        _fail(kp.label, "Bool twin `$twin` must be Bool, got " *
+              "$(eltype(twinv))")
+    twinv == (flatv .!= 0) ||
+        _fail(kp.label, "Bool twin `$twin` is not `(flat .!= 0)`")
+    return nothing
+end
+
+# One scalar in-cell observation's RESPONSE column, per family (the
+# `_validate_response_column` mirror — same domains, kernel-attributed
+# messages). Validates the RAW slice column: scalar-slice expansions
+# are Float64 by construction (exact for 0/1 + counts); Bernoulli
+# non-Bool flats read their bind-materialized Bool twin.
+function _validate_kernel_obs_column(kp::KernelPlate, obs::KernelObs,
+        col::Symbol, colv::AbstractVector)
+    fam = obs.family
+    if fam === BernoulliLogitFam
+        (eltype(colv) === Bool ||
+            (eltype(colv) <: Integer && all(x -> x == 0 || x == 1, colv))) ||
+            _fail(kp.label, "Bernoulli in-cell response `$col` must be " *
+                  "Bool or 0/1 integers")
+    elseif fam === PoissonLogFam || fam === NegativeBinomial2Fam
+        _is_count_column(colv) ||
+            _fail(kp.label, (fam === PoissonLogFam ? "Poisson" : "NB2") *
+                  " in-cell response `$col` must be non-negative integers")
+    elseif fam === GammaLogFam
+        (eltype(colv) <: Real && all(>(0), colv)) ||
+            _fail(kp.label, "Gamma in-cell response `$col` must be " *
+                  "strictly positive numerics")
+    elseif fam === BetaLogitFam
+        (eltype(colv) <: Real && all(x -> 0 < x < 1, colv)) ||
+            _fail(kp.label, "Beta in-cell response `$col` must be " *
+                  "numerics strictly inside (0, 1)")
     end
     return nothing
 end
@@ -6801,13 +7084,13 @@ function _validate_mi_data(r::LikelihoodSpec, plan::StructuralPlan)
 end
 
 function _validate_responses(plan::StructuralPlan)
-    # A kernel plate carries the only likelihood (panel v1): zero
-    # top-level responses are admitted iff exactly one kernel plate is
-    # present. Responseless GLM plans still fail.
+    # Kernel plates carry the only likelihood (v2): zero top-level
+    # responses are admitted iff at least one kernel plate is present.
+    # Responseless GLM plans still fail.
     if isempty(plan.responses)
         # `_validate_kernels` runs before this gate and owns the plate-count
-        # diagnosis; here exactly one kernel plate excuses zero responses.
-        length(plan.kernel_plates) == 1 ||
+        # diagnosis; here any kernel plates excuse zero responses.
+        !isempty(plan.kernel_plates) ||
             _fail(:plan, "plan has no responses")
     end
     rlabels = [r.label for r in plan.responses]
@@ -8216,13 +8499,13 @@ end
 # shapes resolve (scalar/obs/reads). Returns the resolved node; the
 # input plan is untouched.
 function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
-        columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer})
+        columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer},
+        consumed::Set{Symbol})
     for (k, v) in dims
         v > 0 ||
             _fail(kp.label, "dims key `$k` must bind a positive integer, " *
                   "got $v")
     end
-    consumed = Set{Symbol}()
     n_sub = if kp.subjects isa Int
         kp.subjects
     else
@@ -8233,13 +8516,24 @@ function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
         push!(consumed, kp.subjects)
         Int(dims[kp.subjects])
     end
-    leftovers = setdiff(Set{Symbol}(keys(dims)), consumed)
-    isempty(leftovers) ||
-        _fail(kp.label, "dims key(s) $(sort!(collect(leftovers))) not " *
-              "consumed by kernel plate `$(kp.result)` (grouped kernels " *
-              "take no timepoints dims key — typo'd key?)")
+    # Leftovers fail once, globally, in `_resolve_kernels!` (a key for a
+    # sibling plate is not this plate's typo).
     sched = only(kp.schedules)
     built = _build_grouped_schedule(plan, kp, columns)
+    # Dose/PK coherence (v2 axis 1): dose rows must feed the model and
+    # PK calls need dose rows. Dose-free subjects alongside dosed ones
+    # stay admitted — this gates only the global emptiness.
+    ndose = length(columns[sched.dose_subj])
+    if _cell_has_pk_call(kp.assignments)
+        ndose > 0 ||
+            _fail(kp.label, "cell calls a PK recurrence but schedule " *
+                  "`$(sched.name)` binds no dose rows (bind dose data " *
+                  "or drop the call)")
+    elseif ndose > 0
+        _fail(kp.label, "schedule `$(sched.name)` binds $ndose dose " *
+              "rows but the cell makes no PK call (missing read_locs " *
+              "call? — or bind empty dose columns for a dose-free plate)")
+    end
     built.n_subjects == n_sub ||
         _fail(kp.label, "schedule `$(sched.name)` covers " *
               "$(built.n_subjects) subjects ≠ subjects $n_sub")
@@ -8282,6 +8576,12 @@ function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
         # shapes below.
         push!(slices2, (col, param, :response))
     end
+    for obs in kp.obs
+        obs.family === BernoulliLogitFam || continue
+        rcol = only(c for (c, p, _) in slices2 if p === obs.response)
+        flatv = _vector_column(columns, rcol, kp.label, "slice column")
+        _materialize_kernel_bool_twin!(kp, obs, flatv, columns)
+    end
     _prove_grouped_cell_shapes(kp, slices2, columns)
     return KernelPlate(kp.result, n_sub, nothing, slices2, kp.assignments,
         kp.obs, kp.collected, kp.label, kp.lp_args, kp.schedules)
@@ -8292,21 +8592,47 @@ end
 # totally from lengths (`n_sub*T` → :vector, `n_sub` → :scalar — at `T ==
 # 1` the lengths coincide and kinds are unobservable, so all-scalar
 # stands); scalar slices in vector models materialize flat T-block
-# expansions (spline-blocks precedent). Every dims key must be consumed —
-# leftovers fail closed (a typo'd key must not silently reshape the
-# plate). Returns resolved nodes; the input plan is untouched.
+# expansions (spline-blocks precedent). Each plate consumes its own keys
+# through one shared set (subjects always named per plate; timepoints
+# via the `kernel_T_<result>` convention, v1 any-leftover inference for
+# single-plate models); leftovers fail once, globally (a key for plate
+# B is not plate A's typo). Returns resolved nodes; the input plan is
+# untouched.
 function _resolve_kernels!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer})
     isempty(plan.kernel_plates) && return KernelPlate[]
-    kp = only(plan.kernel_plates)
-    _is_grouped_kernel(kp) &&
-        return KernelPlate[_resolve_grouped_kernel!(plan, kp, columns, dims)]
+    # One shared consumed set: each plate consumes its own dims keys;
+    # leftovers fail once, globally (a key for plate B is not plate
+    # A's typo).
+    consumed = Set{Symbol}()
+    out = KernelPlate[]
+    nplates = length(plan.kernel_plates)
+    for kp in plan.kernel_plates
+        if _is_grouped_kernel(kp)
+            push!(out,
+                _resolve_grouped_kernel!(plan, kp, columns, dims, consumed))
+        else
+            push!(out,
+                _resolve_panel_kernel!(kp, columns, dims, consumed, nplates))
+        end
+    end
+    leftovers = setdiff(Set{Symbol}(keys(dims)), consumed)
+    isempty(leftovers) ||
+        _fail(:plan, "dims key(s) $(sort!(collect(leftovers))) not " *
+              "consumed by any kernel plate (typo'd key? — grouped " *
+              "kernels take no timepoints dims key; multi-plate " *
+              "timepoints keys spell `kernel_T_<result>`)")
+    return out
+end
+
+function _resolve_panel_kernel!(kp::KernelPlate,
+        columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer},
+        consumed::Set{Symbol}, nplates::Int)
     for (k, v) in dims
         v > 0 ||
             _fail(kp.label, "dims key `$k` must bind a positive integer, " *
                   "got $v")
     end
-    consumed = Set{Symbol}()
     n_sub = if kp.subjects isa Int
         kp.subjects
     else
@@ -8326,22 +8652,33 @@ function _resolve_kernels!(plan::StructuralPlan,
         push!(consumed, kp.timepoints)
         Int(dims[kp.timepoints])
     else
+        # Unnamed timepoints (surface always leaves `nothing`): the
+        # `kernel_T_<result>` convention names the plate's T key (the
+        # slice-length errors already prescribe this spelling). The v1
+        # any-single-leftover inference stays for single-plate models;
+        # anything else defers — stray keys fail in the global
+        # leftovers gate, and a T-needing plate fails at its slice
+        # lengths naming the convention.
         rest = setdiff(Set{Symbol}(keys(dims)), consumed)
-        if isempty(rest)
-            nothing
-        elseif length(rest) == 1
-            tk = only(rest)
-            push!(consumed, tk)
-            Int(dims[tk])
+        conv = Symbol("kernel_T_$(kp.result)")
+        if conv in rest
+            push!(consumed, conv)
+            Int(dims[conv])
+        elseif nplates == 1
+            if isempty(rest)
+                nothing
+            elseif length(rest) == 1
+                tk = only(rest)
+                push!(consumed, tk)
+                Int(dims[tk])
+            else
+                _fail(kp.label, "ambiguous timepoints dims keys " *
+                      "$(sort!(collect(rest))) (one T key besides subjects)")
+            end
         else
-            _fail(kp.label, "ambiguous timepoints dims keys " *
-                  "$(sort!(collect(rest))) (one T key besides subjects)")
+            nothing
         end
     end
-    leftovers = setdiff(Set{Symbol}(keys(dims)), consumed)
-    isempty(leftovers) ||
-        _fail(kp.label, "dims key(s) $(sort!(collect(leftovers))) not " *
-              "consumed by kernel plate `$(kp.result)` (typo'd key?)")
     flat = _kernel_flat_length(n_sub, T)
     slices2 = Tuple{Symbol,Symbol,Symbol}[]
     for (col, param, _) in kp.slices
@@ -8353,7 +8690,7 @@ function _resolve_kernels!(plan::StructuralPlan,
             L == n_sub ||
                 _fail(kp.label, "slice `$param` column `$col` has length " *
                       "$L ≠ n_sub $n_sub and no T dims key is bound " *
-                      "(vector slices need T: bind `kernel_T_<result>`)")
+                      "(vector slices need T: bind `kernel_T_$(kp.result)`)")
             :scalar
         else
             # Scalar-first: at T == 1 the lengths coincide and kinds are
@@ -8380,11 +8717,20 @@ function _resolve_kernels!(plan::StructuralPlan,
             columns[exp] = repeat(Vector{Float64}(colv); inner = T)
         end
     end
+    for obs in kp.obs
+        obs.family === BernoulliLogitFam || continue
+        si = findfirst(s -> s[2] === obs.response, slices2)
+        col, kind = slices2[si][1], slices2[si][3]
+        flatv = (kind === :scalar && T !== nothing) ?
+            columns[_kexp_name(kp.result, col)] :
+            _vector_column(columns, col, kp.label, "slice column")
+        _materialize_kernel_bool_twin!(kp, obs, flatv, columns)
+    end
     resolved0 = KernelPlate(kp.result, n_sub, T, slices2,
         kp.assignments, kp.obs, kp.collected, kp.label)
     canon = _canonicalize_kernel_assignments(resolved0)
-    return KernelPlate[KernelPlate(kp.result, n_sub, T, slices2,
-        canon, kp.obs, kp.collected, kp.label)]
+    return KernelPlate(kp.result, n_sub, T, slices2,
+        canon, kp.obs, kp.collected, kp.label)
 end
 
 """
@@ -8496,24 +8842,18 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         end
     end
     merged = merge(inferred, roles)
-    # Kernel plans carry two column lengths by design: n_obs is the flat
-    # length (vector models) or n_sub (all-scalar) — never first-column.
-    # Otherwise n_obs is the first NON-managed column's ROW count (length
-    # for vectors): mi packs y_obs/Jobs short by design, and Dict order
-    # is not a crossing contract (deriving from a packed column fails
-    # every full-length column by order luck).
-    # Grouped plans set n_obs to the primary (first-obs) response length.
+    # Kernel plans carry two column lengths by design: n_obs is the
+    # TOTAL likelihood lanes across plates (panel: flat length — vector
+    # models — or n_sub — all-scalar; grouped: primary-response
+    # length) — never first-column. Otherwise n_obs is the first
+    # NON-managed column's ROW count (length for vectors): mi packs
+    # y_obs/Jobs short by design, and Dict order is not a crossing
+    # contract (deriving from a packed column fails every full-length
+    # column by order luck).
     n = if isempty(kbases)
         _bind_nrows(columns, _mi_managed_columns(plan))
     else
-        gkp = only(kbases)
-        if _is_grouped_kernel(gkp)
-            rcol0 = only(c for (c, p, _) in gkp.slices
-                if p === first(gkp.obs).response)
-            length(columns[rcol0])
-        else
-            _kernel_flat_length(gkp.subjects, gkp.timepoints)
-        end
+        sum(kp -> _kernel_plate_nlanes(kp, columns), kbases)
     end
     maps = _eval_levelmaps(plan.levelmaps, columns)
     draws = _eval_draws_levels(plan.varying_draws, columns)
