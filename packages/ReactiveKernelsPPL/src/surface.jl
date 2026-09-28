@@ -4279,7 +4279,7 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     family, lik_link, pred_link, loc, scale_raw, trials, nu_raw, zi_raw,
     interval_raw = _lower_response_base(lhs, call, ctx)
     pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
-        coefuse)
+        coefuse; fam = family)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
     nu = _lower_nu_use(lhs, nu_raw, ctx, predictors, pred_idx, coefuse)
@@ -5917,7 +5917,8 @@ function _claim_pin!(lhs, pin, ctx, pred_idx)
 end
 
 function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
-        coefuse; synth::Union{Nothing,Symbol} = nothing)
+        coefuse; synth::Union{Nothing,Symbol} = nothing,
+        fam::Union{Nothing,LikelihoodFamily} = nothing)
     # A per-cell latent VECTOR is the whole location via a LatentTerm predictor
     # (`lp = theta`, identity design; the latent's prior lives on its
     # PlateParameter, so no coefficient use is recorded). Two spellings: a bare
@@ -5950,8 +5951,15 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         if !haskey(ctx.detmap, loc)
             # A bare sampled parameter (constrained-scale, no link
             # inversion): the mixture bare-mean slots, single-family
-            # form. detmap-first preserves stated-prior aliases.
-            loc in ctx.prior_names && return loc
+            # form — Bernoulli/Binomial-logit and Poisson-log ONLY
+            # (every other family rejects here with
+            # SurfaceLoweringError, never downstream). detmap-first
+            # preserves stated-prior aliases.
+            if loc in ctx.prior_names
+                (fam === BernoulliLogitFam || fam === BinomialLogitFam ||
+                    fam === PoissonLogFam) && return loc
+                return _lower_location_symbol_error(lhs, loc, ctx)
+            end
             return _lower_location_symbol_error(lhs, loc, ctx)
         end
         pin = get(ctx.predictor_pins, lhs, nothing)
