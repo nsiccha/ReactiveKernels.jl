@@ -5230,9 +5230,12 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link)")
-        if args[1] isa Symbol
+        if args[1] isa Symbol && !haskey(ctx.detmap, args[1])
             # Bare sampled parameter (constrained-scale, no link
-            # inversion): the mixture bare-mean triple.
+            # inversion): the mixture bare-mean triple. A deterministic
+            # definition is a predictor, not a parameter — it falls
+            # through to link lowering, which throws the link-required
+            # error (bare predictors keep their link).
             return BernoulliLogitFam, LogitLink, IdentityLink, args[1],
             nothing, nothing, nothing, nothing, nothing
         end
@@ -5242,9 +5245,12 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :Binomial
         length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
                                     "`Binomial.(n, logistic.(mu))` (or `probit`/`cloglog` for the link)")
-        if args[2] isa Symbol
+        if args[2] isa Symbol && !haskey(ctx.detmap, args[2])
             # Bare sampled parameter (constrained-scale): the mixture
-            # bare-mean triple.
+            # bare-mean triple. A deterministic definition is a
+            # predictor, not a parameter — it falls through to link
+            # lowering, which throws the link-required error (bare
+            # predictors keep their link).
             return BinomialLogitFam, LogitLink, IdentityLink, args[2],
             nothing, _lower_trials(lhs, args[1], ctx), nothing, nothing,
             nothing
@@ -5326,9 +5332,12 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
-        if args[1] isa Symbol
+        if args[1] isa Symbol && !haskey(ctx.detmap, args[1])
             # Bare sampled parameter (constrained-scale): the mixture
-            # bare-mean triple.
+            # bare-mean triple. A deterministic definition is a
+            # predictor, not a parameter — it falls through to link
+            # lowering, which throws the link-required error (bare
+            # predictors keep their link).
             return PoissonLogFam, LogLink, LogLink, args[1], nothing,
             nothing, nothing, nothing, nothing
         end
