@@ -1843,8 +1843,9 @@ end
 # `log2π` literal `1.8378770664093456` (`Float64(Distributions.log2π)`
 # exactly). The mean precomputes outside the cell (`_ppl_mu_`, the NB2
 # precedent — a computed `exp` constructor arg miscompiles the Enzyme
-# pullback); lambda threads scalar via `_scale_plate_arg` (predictor-fed
-# lambda is deferred at the contract gate).
+# pullback); lambda threads via `_scale_plate_arg` (scalar
+# sampled/literal/assignment/column, or a log-link predictor — the
+# VonMises-kappa precedent, log-only at the contract gate).
 # The `y > 0` guard is lazy `?:` (the DK gamma precedent, not eager
 # `ifelse`); `y` is bound data so preparation splits the plate per
 # taken arm and no backend receives the branch. μ/λ positivity is

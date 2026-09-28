@@ -783,7 +783,9 @@ end
 
 function _ref_ig(cols, coef, lam)
     mu = exp.(coef[1] .+ coef[2] .* cols[:x])
-    return sum(logpdf(InverseGaussian(m, lam), y) for (y, m) in zip(cols[:y], mu))
+    lvals = lam isa Real ? fill(Float64(lam), length(mu)) : lam
+    return sum(logpdf(InverseGaussian(m, l), y)
+        for (y, m, l) in zip(cols[:y], mu, lvals))
 end
 
 function _gen_vm_plan(; kappa = :kappa, interval = nothing)
@@ -944,6 +946,26 @@ end
     ll = sum(cols[:w] .*
         [logpdf(Weibull(2.0, t), y) for (y, t) in zip(cols[:y], th)])
     pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "ig predictor-lambda values" begin
+    cols, n = _gen_columns()
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
+            ScalePredictorRef(:ls, LogLink), nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta),
+            PredictorSpec(:ls, LogLink, _gen_terms(), :ls)],
+        [_gen_priors(:eta); _gen_priors(:ls)],
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.3, -0.1]
+    nt = constrain(built.layout, u)
+    lam = exp.(Vector(nt.ls)[1] .+ Vector(nt.ls)[2] .* cols[:x])
+    ll = _ref_ig(plan.columns, Vector(nt.eta), lam)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Normal(0, 1), nt.ls[1]) + logpdf(Normal(0, 2), nt.ls[2])
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, plan, u)
 end
