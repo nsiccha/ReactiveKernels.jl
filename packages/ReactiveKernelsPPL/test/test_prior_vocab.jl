@@ -911,6 +911,9 @@ _pv_m8_q() = (mu = [0.3, -0.4, 0.1, 0.75], mu_alpha = 0.5,
             ("data location hyper",
                 :(Normal.(x, sigma_alpha)),
                 "must be a literal or shared-hyperparameter name"),
+            ("derived-response location hyper",
+                :derivedhyper,
+                "must be a literal or shared-hyperparameter name"),
         )
         for (label, rhs, msg) in cases
             err = try
@@ -933,6 +936,19 @@ _pv_m8_q() = (mu = [0.3, -0.4, 0.1, 0.75], mu_alpha = 0.5,
                             b ~ Normal(0, 10)
                             y .~ Normal.(mu, s)
                         end, (:y, :x, :g))
+                elseif rhs === :derivedhyper
+                    # A derived response is an n-vector, not a scalar
+                    # hyperparameter — rejected at the surface with the
+                    # spelling message (robust G1).
+                    lower_rkppl(quote
+                            sigma_alpha ~ Exponential(1)
+                            s ~ Exponential(1)
+                            b ~ Normal(0, 10)
+                            ly = log.(earn)
+                            c[levels(g)] .~ Normal.(ly, sigma_alpha)
+                            mu = c[g] .+ b .* x
+                            ly .~ Normal.(mu, s)
+                        end, (:earn, :x, :g))
                 else
                     lower_rkppl(quote
                             mu_alpha ~ Normal(0, 10)
@@ -1042,6 +1058,16 @@ end
     @test fx.val ≈ fx.native rtol = 1e-12
     @test fx.rval ≈ fx.native rtol = 1e-9
     @test fx.rgrad ≈ fx.g rtol = 1e-8
+    # The centered hyper plate stays one plate: doubling n_obs /
+    # n_levels adds no HLO lines (core constraint 1 — robust G1).
+    bigcols = Dict{Symbol,AbstractVector}(
+        :y => vcat(_PV_Y, _PV_Y), :x => vcat(_PV_X, _PV_X),
+        :g => vcat(_PV_G, _PV_G))
+    @test _pv_reactant(_PV_M8, bigcols).lines == fx.lines
+    morelevels = Dict{Symbol,AbstractVector}(
+        :y => vcat(_PV_Y, _PV_Y), :x => vcat(_PV_X, _PV_X),
+        :g => vcat(_PV_G, _PV_G .+ 3))
+    @test _pv_reactant(_PV_M8, morelevels).lines == fx.lines
 end
 
 # M9: mixed flat intercept + Normal slope — regression for the mixed
@@ -1198,5 +1224,11 @@ end
     @test fx.val ≈ fx.native rtol = 1e-12
     @test fx.rval ≈ fx.native rtol = 1e-9
     @test fx.rgrad ≈ fx.g rtol = 1e-8
+    # Split-block reassembly is structural (runs, not lanes): doubling
+    # n_obs adds no HLO lines (core constraint 1 — robust G1).
+    bigcols = Dict{Symbol,AbstractVector}(
+        :y => vcat(_PV_YB, _PV_YB), :x => vcat(_PV_X, _PV_X),
+        :z => vcat(_PV_Z, _PV_Z))
+    @test _pv_reactant(_PV_M10, bigcols).lines == fx.lines
 end
 
