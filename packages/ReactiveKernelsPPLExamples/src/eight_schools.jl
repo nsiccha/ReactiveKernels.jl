@@ -56,13 +56,13 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # prior and likelihood graph; when the components are supplied instead,
     # HAVE authority cuts the inverse edges.
 
-    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),
-    # and θⱼ ~ Normal(μ, τ). The half-Cauchy keeps its fixed scale 5. Supplying
-    # both τ and log_τ to each effects Normal makes both graph values
-    # authoritative HAVE inputs: neither is recomputed or checked.
+    # Log prior: μ ~ Normal(0, 5), τ constrained positive with Stan's
+    # lower-bound kernel (bare Cauchy, no proper-half `+log(2)`), and
+    # θⱼ ~ Normal(μ, τ). The scale keeps its fixed 5. Supplying both τ and
+    # log_τ to each effects Normal makes both graph values authoritative HAVE
+    # inputs: neither is recomputed or checked.
     μ_prior::Float64 = normal(0.0, 5.0).logpdf(μ)
-    τ_cauchy::Float64 = cauchy(0.0, 5.0).logpdf(τ)
-    τ_prior::Float64 = log(2.0) + τ_cauchy
+    τ_prior::Float64 = cauchy(0.0, 5.0).logpdf(τ)
     effects_pointwise = plate(θ, μ, τ, log_τ) do θj, μj, τj, log_τj
         normal(;
             location = μj, scale = τj, log_scale = log_τj).logpdf(θj)

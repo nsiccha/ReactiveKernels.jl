@@ -21,15 +21,16 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
 @testset "@ppl posteriordb-model parity (experimental)" begin
     @testset "eight_schools (centered) — parity with the hand-authored kernel" begin
         # The whole model, authored in four `~` statements. The centered
-        # posteriordb parametrization: μ ~ Normal(0,5), τ ~ HalfCauchy(0,5),
-        # θⱼ ~ Normal(μ,τ), yⱼ ~ Normal(θⱼ,σⱼ). `positive(cauchy(…))` supplies the
-        # half-Cauchy (+log 2 normalization and log/exp transform with Jacobian
-        # log_τ), so the unconstrained packing is q = [μ, log_τ, θ…] — identical
-        # to the hand-authored kernel's.
+        # posteriordb parametrization uses Stan's positive-scale convention:
+        # μ ~ Normal(0,5), bare Cauchy(0,5) on τ > 0, θⱼ ~ Normal(μ,τ),
+        # yⱼ ~ Normal(θⱼ,σⱼ). `stan_positive(cauchy(…))` supplies the log/exp
+        # transform and Jacobian log_τ without proper-half `+log 2`, so the
+        # unconstrained packing is q = [μ, log_τ, θ…] — identical to the
+        # hand-authored kernel's.
         @ppl eight_schools(y::Vector{Float64}, sigma::Vector{Float64}, J::Int) =
             begin
                 mu ~ normal(0.0, 5.0)
-                tau ~ positive(cauchy(0.0, 5.0))
+                tau ~ stan_positive(cauchy(0.0, 5.0))
                 theta::vector[J] ~ normal(mu, tau)
                 y ~ normal(theta, sigma)
             end
