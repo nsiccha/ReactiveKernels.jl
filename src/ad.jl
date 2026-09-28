@@ -231,7 +231,14 @@ end
         similar(cache, output_type, combined_axes)
     end
     batch = _authored_plate_broadcast(Val(A), args...)
-    for index in eachindex(batch)
+    # `index` comes from `eachindex(batch)` and `result` carries exactly the
+    # broadcast axes, so both subscripts are provably in range. Elide the
+    # checks: Julia 1.12's `checkbounds(::Broadcasted, ::Integer)` builds
+    # `eachindex(IndexLinear(), bc)` per call, and under reverse-mode Enzyme
+    # that check allocates per gradient call (measured 256B at n=8 growing to
+    # 1184B at n=64, where Julia 1.10's pure-arithmetic check stays
+    # size-invariant), defeating this loop's zero-allocation contract.
+    @inbounds for index in eachindex(batch)
         scalar_args = batch[index]
         result[index] = kernel(scalar_args...)
     end

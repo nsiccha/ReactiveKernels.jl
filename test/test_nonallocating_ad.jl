@@ -231,6 +231,61 @@ isdefined(@__MODULE__, :AuthoredPlateChains) ||
     @test alloc_bytes[1] == alloc_bytes[2]
 end
 
+# Partitioned plates gather live lane arguments at run time (`_LaneGather`).
+# Arithmetic cells keep the plate bodies free of transcendental calls, so the
+#gradient's only per-lane work is gathers plus arithmetic: on Julia 1.12 the
+#gather loop's per-element bounds checks allocated ~17.6 bytes/lane under
+#reverse-mode Enzyme (the same class as the plate-loop `checkbounds`
+#regression above), and the NA gradient must stay size-invariant there too.
+@kernel arith_partition_naad(x::Vector{Float64}, y::Vector{Float64}) = begin
+    pointwise = plate(x, y) do xi, yi
+        cell::Float64 = yi > 0 ? xi * yi : 2.0 * xi + 1.0
+        cell
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+
+@testset "partitioned NA gradients over arithmetic cells stay size-invariant" begin
+    # Warmup prep: the first partitioned-AD preparation in a process carries
+    # a fixed ~600B per-call cost on every Julia version (process-order
+    # effect, unrelated to sizes); measure only after it is settled.
+    let xw = [0.5, -0.5], yw = [1.0, -1.0]
+        kbw = prepare_nonallocating(arith_partition_naad;
+                                    have = (:x, :y), want = :total,
+                                    bound = (; y = yw))
+        prepw = prepare_ad(kbw, NA_AD_BACKEND, xw; active = :x)
+        gw = similar(xw)
+        ad_value_and_gradient!(prepw, gw, xw)
+        @allocated ad_value_and_gradient!(prepw, gw, xw)
+    end
+    alloc_bytes = map((16, 128)) do n
+        x = collect(range(-2.0, 2.0; length = n))
+        y = Float64[isodd(i) ? 1.0 : -1.0 for i in 1:n]
+        kbna = prepare_nonallocating(arith_partition_naad;
+                                     have = (:x, :y), want = :total,
+                                     bound = (; y))
+        # Vacuity guard: without partitioning there are no lane gathers and
+        # this test would pass while exercising nothing.
+        @test any(op -> op isa ReactiveKernels._LaneGather, kbna.ops)
+        kb = prepare(arith_partition_naad; have = (:x, :y), want = :total,
+                     bound = (; y))
+        prepna = prepare_ad(kbna, NA_AD_BACKEND, x; active = :x)
+        prep = prepare_ad(kb, NA_AD_BACKEND, x; active = :x)
+        gna, g = similar(x), similar(x)
+        vna, _ = ad_value_and_gradient!(prepna, gna, x)
+        v, _ = ad_value_and_gradient!(prep, g, x)
+        @test vna ≈ v
+        @test gna ≈ g
+        dataflow_bytes = @allocated ad_value_and_gradient!(prep, g, x)
+        na_bytes = @allocated ad_value_and_gradient!(prepna, gna, x)
+        @test na_bytes < dataflow_bytes
+        na_bytes
+    end
+    println("NONALLOCATING_AD_ALLOC\tpartition_arith\t", alloc_bytes)
+    @test alloc_bytes[1] == alloc_bytes[2]
+end
+
 fscale_naad(a, b) = a * b
 
 @testset "decomposed non-allocating gradient allocates ~nothing" begin
