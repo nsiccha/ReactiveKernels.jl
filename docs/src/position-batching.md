@@ -117,6 +117,25 @@ them to the scalar graph would give that port the wrong layout. Refresh the
 build outputs when their positions or shared inputs change. This uses the
 planner's existing graph cuts and binding, with caller-owned stage values.
 
+Prepare stable cuts once when shared inputs change between requests. Keep those
+inputs as runtime HAVE in both cuts, rather than calling `prepare(...; bound=...)`
+for each new value. Binding can fold data-only work, but repeated preparation
+also pays planning, code generation and compilation costs. For this graph, the
+read cut above is already independent of the schedule; reuse it with a runtime
+build cut:
+
+```julia
+runtime_build = vectorize(prepare(response_graph;
+    have=(:position, :schedule), want=:units); batched=:position)
+runtime_units = runtime_build(positions, schedule)
+@assert read(runtime_units, 0.5) == batch(positions, schedule, 0.5)
+```
+
+Construct these cut objects outside the repeated request or draw loop. Compute
+their units once per request; the units remain caller-owned data. Shared-only
+recipes still execute once per lifted call. This reuses the prepared computation
+without a process-wide cache of request values.
+
 ## Purity, allocation, and compiler parity
 
 The lifted surface reuses the scalar graph as its mathematical authority. The
@@ -146,8 +165,12 @@ second = borrowed(positions, schedule, 3.0)
 ```
 
 These outputs are **borrowed until the next call** to that prepared object,
-including its views and nested leaves. Copy or `deepcopy` before returning them
-from a callback, publishing them, or keeping them in reactive state. Use a
+including its views and nested leaves. An explicitly opted-in internal reducer
+may consume them immediately without copying raw trajectories; finish that
+reduction before calling the same object again, then publish owned compact
+results. Copy or `deepcopy` arrays retained past the next call, published from a
+callback, or kept in reactive state. A function return alone does not require
+copying. Use a
 separate prepared object per concurrent caller; the cache is not reentrant.
 Changing shapes or element types reseeds storage. Feeding a retained output back
 as an input detaches its buffer so the input is not overwritten. Reuse avoids
