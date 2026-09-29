@@ -36,6 +36,13 @@ const WARMED = prepare_batched(trajectory; have = HAVE, batched = :position,
                               want = :conc)
 const WARMUP = WARMED(ones(2, 1), 0.0, [0.5, 1.0], [3.0, 4.0])
 
+@kernel borrowed_curve(position, data; amount=1.0) = begin
+    result = (; curve=position .* data .* amount, total=position * sum(data) * amount)
+end
+const BORROWED = vectorize(borrowed_curve; batched=:position, reuse=true)
+const USED_BORROWED = copy(BORROWED)
+const BORROWED_WARMUP = USED_BORROWED([1.0, 2.0], [3.0, 4.0]; amount=2.0)
+
 module Nested
 using ReactiveKernels
 import ..PrecompiledPreparedConsumer: trajectory, HAVE
