@@ -135,8 +135,10 @@ empty schedule, author the recurrence in its own kernel, prepare it once, and
 call that prepared kernel only in the nonempty arm:
 
 ```julia
-@kernel nonempty_weights(rows::Matrix{Float64}, slots::Vector{Int}) = begin
-    weights = scan(eachrow(rows), Ref(slots);
+import ReactiveKernels
+
+ReactiveKernels.@kernel nonempty_weights(rows::Matrix{Float64}, slots::Vector{Int}) = begin
+    weights = ReactiveKernels.scan(eachrow(rows), Ref(slots);
             init = (; prior = zeros(Float64, length(slots)), index = 1)) do carry, row, positions
         weight = row[1] + sum(carry.prior)
         next = ifelse.(positions .== carry.index, weight, carry.prior)
@@ -144,9 +146,9 @@ call that prepared kernel only in the nonempty arm:
     end
     return weights
 end
-const prepared_weights = prepare(nonempty_weights)
+const prepared_weights = ReactiveKernels.prepare(nonempty_weights)
 
-@kernel maybe_weights(rows::Matrix{Float64}, slots::Vector{Int}, n::Int) = begin
+ReactiveKernels.@kernel maybe_weights(rows::Matrix{Float64}, slots::Vector{Int}, n::Int) = begin
     weights = if n == 0
         Float64[]
     else
@@ -163,7 +165,11 @@ explicitly. This is an ordinary callable boundary, not transparent graph
 splicing across the branch. Writing `scan(...) do … end` directly inside the
 branch arm is unsupported: `scan` sugar is recognized only when it is a
 recipe's top-level right-hand side. The branch-local form reaches the runtime
-placeholder instead.
+placeholder instead. Scan recognition also requires the actual
+`ReactiveKernels.scan` binding. With `import ReactiveKernels` alone, spell the
+callee `ReactiveKernels.scan` as above, or add `using ReactiveKernels: scan`
+before using bare `scan`. A bare, unbound `scan` remains an ordinary call and
+raises `UndefVarError` when executed; a typed assignment does not change this.
 
 ## Lowering and semantics
 

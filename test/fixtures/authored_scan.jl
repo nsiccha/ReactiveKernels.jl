@@ -101,6 +101,23 @@ end
 
 const prepared_authored_scan_nonempty = prepare(authored_scan_nonempty)
 
+# A consumer using only `import ReactiveKernels` can still author a scan by
+# qualifying its callee. The macro resolves that binding before constructing
+# the scan op; a typed left-hand side is supported in either spelling.
+module QualifiedScanBinding
+import ReactiveKernels
+
+const spec = ReactiveKernels.@kernel qualified_scan(xs::Vector{Float64}) = begin
+    values::Vector{Float64} = ReactiveKernels.scan(xs; init = 0.0) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    return values
+end
+const prepared = ReactiveKernels.prepare(spec)
+
+end
+
 @kernel authored_scan_lazy_branch(mat::Matrix{Float64}, positions::Vector{Int}, n::Int) = begin
     weights::Vector{Float64} = if n == 0
         Float64[]

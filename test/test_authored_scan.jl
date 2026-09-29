@@ -25,6 +25,11 @@ _authored_scan_mixed(x) = Base.inferencebarrier(x > 2 ? 1.5 : 1)
     @test weights(empty_mat, empty_positions, 0) == Float64[]
     @test total(empty_mat, empty_positions, 0) == 0.0
     @test_throws ArgumentError weights(empty_mat, empty_positions, 1)
+
+    qualified = AuthoredScanFixtures.QualifiedScanBinding.prepared
+    @test qualified([1.0, 2.0, 3.0]) == [1.0, 3.0, 6.0]
+    @test count(r -> r.op isa ReactiveKernels._AuthoredScanOp,
+                qualified.plan.recipes) == 1
 end
 
 @testset "authored scan native step lowering" begin

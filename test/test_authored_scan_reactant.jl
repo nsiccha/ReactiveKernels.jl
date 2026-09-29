@@ -24,6 +24,13 @@ end
     @test Reactant.to_number(empty_compiled(empty_mat, empty_positions, 0)) == 0.0
     empty_hlo = repr(Reactant.@code_hlo optimize = false total(empty_mat, empty_positions, 0))
     @test count("stablehlo.while", empty_hlo) == 0
+
+    qualified = AuthoredScanFixtures.QualifiedScanBinding.prepared
+    traced_xs = Reactant.to_rarray([1.0, 2.0, 3.0])
+    qualified_compiled = Reactant.@compile qualified(traced_xs)
+    @test Array(qualified_compiled(traced_xs)) == [1.0, 3.0, 6.0]
+    qualified_hlo = repr(Reactant.@code_hlo optimize = false qualified(traced_xs))
+    @test count("stablehlo.while", qualified_hlo) == 1
 end
 
 @testset "authored scan retains its tensorized carry loop" begin
