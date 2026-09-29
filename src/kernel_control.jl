@@ -576,7 +576,7 @@ function compile_dispatcher(irs0; typemap, cap::Int, root_mid::Int)
         end
         $S
     end
-    @RuntimeGeneratedFunction(Expr(:->, Expr(:tuple, S, SC, A0), body))
+    compile(Expr(:->, Expr(:tuple, S, SC, A0), body))
 end
 
 # ======================= SCC-inlining (RK 09:29: inline acyclic, defunctionalize only the recursive SCC) =======================

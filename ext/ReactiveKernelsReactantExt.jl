@@ -80,6 +80,17 @@ end
 # generic struct traversal in charge would recursively trace that metadata (and
 # eventually encounter types such as Tuple{Vararg{Value}}), even though kernel
 # execution only needs the already-compiled callable and operation tuple.
+function Reactant.make_tracer(seen, previous::ReactiveKernels._PrecompileWarmFunction,
+                              path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels._PrecompileWarmFunction}
+    T
+end
+
 function Reactant.make_tracer(seen, previous::ReactiveKernels.PreparedKernel,
                               path, mode; kwargs...)
     previous

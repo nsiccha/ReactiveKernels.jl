@@ -136,7 +136,8 @@ function _ad_native_ops(kernel::PreparedKernel)
     ops = kernel.ops
     any(op -> op isa _AuthoredScanOp, ops) || return ops
     native = kernel.f.native
-    native isa RuntimeGeneratedFunctions.RuntimeGeneratedFunction || return ops
+    _native_generated_function(native) isa
+        RuntimeGeneratedFunctions.RuntimeGeneratedFunction || return ops
     # Inspect the compiled callable's cached source, not the separately mutable
     # display AST exposed by code_expr(kernel).
     ast = RuntimeGeneratedFunctions.get_expression(native)

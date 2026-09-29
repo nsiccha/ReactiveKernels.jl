@@ -1694,8 +1694,102 @@ transform(ast::Expr, passes...) = foldl((a, pass) -> pass(a), passes; init = ast
 
 Compile a lowered `Expr` into a native Julia function via
 `RuntimeGeneratedFunctions`. The returned callable takes `(__ops__, args...)`.
+Prepared callables may be stored as package-level constants: during package
+precompilation, the package being compiled owns the generated expression cache.
+Global names in the lowered body still resolve in `ReactiveKernels`.
 """
-compile(ast::Expr) = @RuntimeGeneratedFunction(ast)
+function compile(ast::Expr)
+    cache_module = _generated_function_cache_module()
+    cache_module === (@__MODULE__) &&
+        return RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, ast)
+    Base.invokelatest(RuntimeGeneratedFunctions.init, cache_module)
+    # The cache and generated method must share an owner on Julia 1.12: a
+    # generator defined in an older dependency cannot read new global bindings.
+    # Julia's macro hygiene resolves globals in RK while preserving lexical
+    # scopes, rather than guessing which symbols in the body are free names.
+    qualified = macroexpand(@__MODULE__, Expr(:macrocall,
+        GlobalRef(@__MODULE__, Symbol("@_native_context")), LineNumberNode(0), ast))
+    qualified = _native_parameter_names(ast, qualified)
+    f = Base.invokelatest(RuntimeGeneratedFunction, cache_module, cache_module, qualified)
+    # Only functions prepared before the new context method becomes visible
+    # need this barrier, e.g. a builder that immediately warms its first kernel.
+    applicable(RuntimeGeneratedFunctions.generated_callfunc, f) ? f :
+        _PrecompileWarmFunction(f)
+end
+
+macro _native_context(ast)
+    ast
+end
+
+# Preserve the lowered argument names used by operation-table inspection.
+# Macro hygiene still owns every local binding and qualifies every global.
+function _native_parameter_names(original, qualified)
+    original.args[1] isa Expr && original.args[1].head === :tuple &&
+        qualified.args[1] isa Expr && qualified.args[1].head === :tuple ||
+        return qualified
+    names = Dict{Symbol,Symbol}()
+    for (old, new) in zip(original.args[1].args, qualified.args[1].args)
+        old = old isa Expr && old.head === :(::) ? old.args[1] : old
+        new = new isa Expr && new.head === :(::) ? new.args[1] : new
+        old isa Symbol && new isa Symbol && (names[new] = old)
+    end
+    function restore(node)
+        node isa Symbol && return get(names, node, node)
+        node isa Expr || return node
+        node.head === :quote && return node
+        Expr(node.head, map(restore, node.args)...)
+    end
+    restore(qualified)
+end
+
+struct _PrecompileWarmFunction{F} <: Function
+    f::F
+end
+
+@inline function (f::_PrecompileWarmFunction)(args...)
+    # During ordinary execution the image's context method is already loaded.
+    # Keep latest-world dispatch confined to execution while building an image.
+    ccall(:jl_generating_output, Cint, ()) == 0 ? f.f(args...) :
+        _precompile_warm_call(f.f, args...)
+end
+
+@inline function _precompile_warm_call(f, args...)
+    result_type = Core.Compiler.return_type(f, typeof(args))
+    # The first call can precede the new method's world. After load, retain
+    # the native return type rather than leaking invokelatest's Any result.
+    Base.invokelatest(f, args...)::(result_type === Union{} ? Any : result_type)
+end
+
+_native_generated_function(f) = f
+_native_generated_function(f::_PrecompileWarmFunction) = f.f
+RuntimeGeneratedFunctions.get_expression(f::_PrecompileWarmFunction) =
+    Base.invokelatest(RuntimeGeneratedFunctions.get_expression, f.f)
+RuntimeGeneratedFunctions.drop_expr(f::_PrecompileWarmFunction) =
+    _PrecompileWarmFunction(Base.invokelatest(RuntimeGeneratedFunctions.drop_expr, f.f))
+@inline RuntimeGeneratedFunctions.generated_callfunc(f::_PrecompileWarmFunction, args...) =
+    f(args...)
+
+# RGF caches created in an already-loaded dependency are not part of a
+# consumer's package image. Use Julia's actual precompilation target rather
+# than the graph's author module: consumers can prepare imported graphs, and
+# preparation can run inside helpers or submodules. This is cold-path loader
+# state only. Ordinary runtime preparation still uses RK's existing context.
+function _generated_function_cache_module()
+    (ccall(:jl_generating_output, Cint, ()) == 0 ||
+     Base.JLOptions().incremental == 0) && return @__MODULE__
+    target = @static if isdefined(Base, :precompilation_target)
+        # Julia 1.10 / 1.11.
+        Base.precompilation_target
+    elseif isdefined(Base, :precompilation_stack)
+        # Julia 1.12+ records nested package precompilation in order.
+        isempty(Base.precompilation_stack) ? nothing : last(Base.precompilation_stack)
+    else
+        error("cannot identify the package owning generated functions during precompilation")
+    end
+    # Non-package output generation has no package-loader target.
+    target === nothing && return @__MODULE__
+    Base.root_module(target)
+end
 
 # A plated kernel owns two compiled bodies but presents exactly the same
 # PreparedKernel API as every scalar kernel.  The batched input position is a
@@ -1919,7 +2013,8 @@ end
 # or dynamically access the table keep the reconstruction path above.
 _externalize_bound_array_body(f, positions) = nothing
 function _externalize_bound_array_body(
-        f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, positions)
+        f::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction,
+                 _PrecompileWarmFunction}, positions)
     ast = deepcopy(RuntimeGeneratedFunctions.get_expression(f))
     ports = Dict(index=>gensym(:_rk_bound_operand) for index in positions)
     valid = true
