@@ -1,0 +1,80 @@
+{
+  "baseline_source": "475afe619dc1ecd7513e1d7cc7cec32a609ea33b",
+  "candidate_source": "eaeef55dd2444c279bce34be2ae0af05a4925d27",
+  "host": "strato2",
+  "julia": "1.10.11",
+  "enzyme_gradient_only": "0.13.205",
+  "original_stan_sha256": "b203d15ecdb2940a3503a162a3ce88415b1fa763d163af2684e14ecefb2d7c2e",
+  "stan_binaries": [
+    {
+      "path": "/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd/pkpd-full-build/varyingsource3_model.so",
+      "bytes": 3500128,
+      "sha256": "3a549561f8b14727a572a1972bbf0ef7d22c57ed60f8a2f6fbc8dc449741beaa"
+    },
+    {
+      "path": "/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd/pkpd-full-build/varyingsource3_tight_model.so",
+      "bytes": 3518600,
+      "sha256": "f2f596e970305387f23b9fc90b05d938dc74cc984e2cf7ba55ffdb2a96ae32da"
+    },
+    {
+      "path": "/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd/pkpd-full-build/varyingsource3_reference_model.so",
+      "bytes": 3519992,
+      "sha256": "b2ace54f0085ef5b5fac4fd376453178d0ce2daedc7fe990bdeeb66666d9803b"
+    }
+  ],
+  "primal": {
+    "exit": 0,
+    "seconds": 246,
+    "ended": "2026-09-29T06:53:31Z",
+    "enzyme_loaded": false,
+    "same_exported_densities_and_coordinates_as_baseline": true
+  },
+  "gradient": {
+    "exit": 0,
+    "seconds": 386,
+    "ended": "2026-09-29T07:02:22Z",
+    "same_exported_densities_coordinates_gradients_as_baseline": true
+  },
+  "files": [
+    {
+      "path": "primal.jl",
+      "bytes": 5714,
+      "sha256": "1314f6e55fcff958f717c2cc751c148594ec3e84629e898a04af93a242f28fb1"
+    },
+    {
+      "path": "primal-baseline-strato2-20260929.tsv",
+      "bytes": 209763,
+      "sha256": "44dcd0f306826158293a7b6f7404ff5dd96a0c2c0fc7a332851402b56961c971"
+    },
+    {
+      "path": "primal-joint-strato2-20260929.tsv",
+      "bytes": 209787,
+      "sha256": "d03a231af3e97e45861deb1eeec3fefa8f62f166a9c7772254efd1caba19d990"
+    },
+    {
+      "path": "receipt-primal-baseline-strato2-20260929.txt",
+      "bytes": 5053,
+      "sha256": "0992c203b5b4f345e53ab9f608c8dac90d649a01aa28a34d5361251f21024c93"
+    },
+    {
+      "path": "receipt-primal-joint-strato2-20260929.txt",
+      "bytes": 5045,
+      "sha256": "37521cf9698e45aff9bc8a87207a93aae8f18b48e7b5db0ab51741a5ee9c9e23"
+    },
+    {
+      "path": "gradients.jl",
+      "bytes": 7593,
+      "sha256": "d16f42b85fe172e729f2d6e29fe0d0900173df77bc05bb28c163663d077b64cd"
+    },
+    {
+      "path": "gradients-joint-strato2-20260929.tsv",
+      "bytes": 297632,
+      "sha256": "094e1a4436c4af1c00afe4b2191f8dab6cb8374016686a4dc476cbc4de968d0f"
+    },
+    {
+      "path": "receipt-gradients-joint-strato2-20260929.txt",
+      "bytes": 4119,
+      "sha256": "72b8db92bb5d3a28c0e6636073ea87090e83af8b4680bc089335e60bf5b76419"
+    }
+  ]
+}
