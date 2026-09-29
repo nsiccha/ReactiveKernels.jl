@@ -88,4 +88,29 @@ end
 end
 
 allocated(kernel::K, args::Vararg{Any,N}) where {K,N} = @allocated kernel(args...)
+
+# Inner plate prepared on its own, then embedded as one recipe op in an outer
+# graph (the SUPERPOSITION_PREPARED shape): the plate axis comes from
+# schedule-derived data bound at outer preparation, while the dose vector stays
+# a live HAVE port of the outer kernel.
+@kernel embedded_dose_inner(x, q) = begin
+    pointwise = plate(x, Ref(q)) do xi, qq
+        2 * xi + qq[1]
+    end
+    return pointwise
+end
+
+function embedded_dose_outer_graph(; dose_type::Type = Any)
+    inner = prepare(embedded_dose_inner)
+    g = Graph()
+    sched = value!(g, :schedule, Any)
+    dose = value!(g, :dose_mgs, dose_type)
+    n = value!(g, :n, Any)
+    add!(g; inputs = (sched,), outputs = (n,), op = length)
+    planv = value!(g, :plan, Any)
+    add!(g; inputs = (n,), outputs = (planv,), op = x -> collect(1.0:x))
+    result = value!(g, :result, Any)
+    add!(g; inputs = (planv, dose), outputs = (result,), op = inner)
+    (; graph = g, schedule = sched, dose = dose, result)
+end
 end
