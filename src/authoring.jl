@@ -55,6 +55,9 @@ struct _KernelSignatureCallable{F,S}
     signature::S
 end
 
+Base.copy(callable::_KernelSignatureCallable{<:BorrowedBatchedKernel}) =
+    _KernelSignatureCallable(copy(callable.target), callable.signature)
+
 @inline function (callable::_KernelSignatureCallable)(args...; kwargs...)
     _kernel_signature_invoke(callable, args, NamedTuple(kwargs))
 end
