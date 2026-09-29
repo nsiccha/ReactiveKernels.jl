@@ -128,6 +128,43 @@ forward = scan(eachrow(scan_rows), Ref(gain); init = seed) do carry, row, g
 end
 ```
 
+### Lazy empty schedules
+
+`scan` requires at least one row. When a surrounding graph also accepts an
+empty schedule, author the recurrence in its own kernel, prepare it once, and
+call that prepared kernel only in the nonempty arm:
+
+```julia
+@kernel nonempty_weights(rows::Matrix{Float64}, slots::Vector{Int}) = begin
+    weights = scan(eachrow(rows), Ref(slots);
+            init = (; prior = zeros(Float64, length(slots)), index = 1)) do carry, row, positions
+        weight = row[1] + sum(carry.prior)
+        next = ifelse.(positions .== carry.index, weight, carry.prior)
+        ((; prior = next, index = carry.index + 1), weight)
+    end
+    return weights
+end
+const prepared_weights = prepare(nonempty_weights)
+
+@kernel maybe_weights(rows::Matrix{Float64}, slots::Vector{Int}, n::Int) = begin
+    weights = if n == 0
+        Float64[]
+    else
+        prepared_weights(rows, slots)
+    end
+    return weights
+end
+```
+
+The empty arm never runs the recurrence. For a traced nonempty row sequence,
+Reactant retains one `stablehlo.while`; the same graph can be prepared and run
+with ordinary Julia values. Pass every per-call input to the prepared kernel
+explicitly. This is an ordinary callable boundary, not transparent graph
+splicing across the branch. Writing `scan(...) do … end` directly inside the
+branch arm is unsupported: `scan` sugar is recognized only when it is a
+recipe's top-level right-hand side. The branch-local form reaches the runtime
+placeholder instead.
+
 ## Lowering and semantics
 
 - **Native.** The generated ordered loop contains the scalar step directly,
