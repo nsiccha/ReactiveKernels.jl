@@ -103,3 +103,6 @@ truncation error is separate from the adaptive-series tolerance. Standalone
 math callers can bind different PK controls with `prepare_varyingsource_pkpd`.
 The existing [17-coordinate PK benchmark](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/varyingsource_pk) is a
 PK slice measurement; it does not measure this full statistical model.
+The [full posterior benchmark](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/varyingsource_pkpd)
+records the complete synthetic model, coordinate map, precision checks and
+timings at 232 and 583 coordinates.
