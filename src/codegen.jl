@@ -1287,14 +1287,7 @@ function _batched_dependency_analysis(p::Plan, batched)
 end
 
 
-function _replicated_graph_plan(p::Plan)
-    for recipe in p.recipes
-        recipe.op isa _AuthoredPlateOp && return false
-        recipe.op isa _AuthoredScanOp && return false
-        _embedded_kernel(recipe.op) === nothing || return false
-    end
-    true
-end
+_replicated_graph_plan(p::Plan) = all(!recipe.effectful for recipe in p.recipes)
 
 function _replicated_dependency_analysis(p::Plan, batched)
     graph = p.graph
@@ -1317,24 +1310,20 @@ function _replicated_dependency_analysis(p::Plan, batched)
     dependencies = _plate_dependencies(p, mapped_ids)
     positions = Tuple(
         findfirst(value -> value.name === name, p.have) for name in names)
-    expected_ranks = Tuple(_replica_rank(valtype(p.have[index])) + 1
-                           for index in positions)
+    input_types = Tuple{(valtype(p.have[index]) for index in positions)...}
+    foreach(_replica_expected_rank, input_types.parameters)
     (; mapped = Tuple(mapped), mapped_ids,
-       recipe_dependencies = dependencies.recipes, positions, expected_ranks)
+       recipe_dependencies = dependencies.recipes, positions, input_types)
 end
 
 @inline function _replicated_validate_axes(
-        args::Tuple, ::Val{B}, ::Val{R}) where {B,R}
-    marker = getfield(args, first(B))
-    replica_count = size(marker, ndims(marker))
-    for (index, expected_rank) in zip(B, R)
-        arg = getfield(args, index)
-        ndims(arg) == expected_rank || throw(DimensionMismatch(
-            "position-batched port at HAVE position $index has rank " *
-            "$(ndims(arg)); expected $expected_rank (scalar rank plus one)"))
-        size(arg, ndims(arg)) == replica_count || throw(DimensionMismatch(
+        args::Tuple, ::Val{B}, ::Type{BT}) where {B,BT}
+    replica_count = _replica_batch_count(getfield(args, first(B)), BT.parameters[1])
+    for (position, index) in enumerate(B)
+        count = _replica_batch_count(getfield(args, index), BT.parameters[position])
+        count == replica_count || throw(DimensionMismatch(
             "position-batched ports disagree on batch length; got " *
-            "$(size(arg, ndims(arg))) and $replica_count"))
+            "$count and $replica_count"))
     end
     replica_count
 end
@@ -1344,6 +1333,10 @@ end
         arg::AbstractArray{T,N}, replica_index) where {T,N}
     copy(selectdim(arg, N, replica_index))
 end
+@inline _replicated_project(arg::NamedTuple, index) =
+    map(value -> _replicated_project(value, index), arg)
+@inline _replicated_project(arg::Tuple, index) =
+    map(value -> _replicated_project(value, index), arg)
 
 @inline function _replicated_output(::Type{T}, replica_count) where {T<:Number}
     Vector{T}(undef, replica_count)
@@ -1359,14 +1352,42 @@ end
 end
 
 @inline function _replicated_store!(destination, replica_index, value)
+    size(selectdim(destination, ndims(destination), replica_index)) == size(value) ||
+        throw(DimensionMismatch("position outputs must have the same shape at every position"))
+    eltype(destination) === eltype(value) || throw(ArgumentError(
+        "position outputs must have the same numeric element type at every position"))
     copyto!(selectdim(destination, ndims(destination), replica_index), value)
     destination
+end
+@inline function _replicated_store!(destination::Tuple, index, value::Tuple)
+    length(destination) == length(value) || throw(ArgumentError(
+        "position outputs must have the same tuple length"))
+    map((out, item) -> _replicated_store!(out, index, item), destination, value)
+end
+@inline function _replicated_store!(destination::NamedTuple{K}, index,
+                                    value::NamedTuple{L}) where {K,L}
+    K == L || throw(ArgumentError("position outputs must have the same record fields"))
+    map((out, item) -> _replicated_store!(out, index, item), destination, value)
 end
 @inline _replicated_output(value::Number, replica_count) =
     Vector{typeof(value)}(undef, replica_count)
 @inline function _replicated_output(value::AbstractArray, replica_count)
+    eltype(value) <: Number || throw(ArgumentError(
+        "position output arrays must have numeric elements; put record fields in a tuple or named tuple"))
     similar(value, (size(value)..., replica_count))
 end
+@inline _replicated_output(value::NamedTuple, count) =
+    map(item -> _replicated_output(item, count), value)
+@inline _replicated_output(value::Tuple, count) =
+    map(item -> _replicated_output(item, count), value)
+_replicated_output(value, count) = throw(ArgumentError(
+    "position outputs must contain numbers, arrays, tuples or named tuples; got $(typeof(value))"))
+_replicated_output(::Type{T}, count) where {T} = throw(ArgumentError(
+    "an empty position batch needs declared output types; cannot infer $T without a position"))
+_replicated_output(::Type{T}, count) where {T<:Tuple} =
+    map(type -> _replicated_output(type, count), fieldtypes(T))
+_replicated_output(::Type{T}, count) where {T<:NamedTuple} =
+    NamedTuple{fieldnames(T)}(map(type -> _replicated_output(type, count), fieldtypes(T)))
 
 """
     lower_replicated(p::Plan; batched) -> Expr
@@ -1377,14 +1398,13 @@ independent of every batched port execute once above the loop. This is position
 batching, not broadcast data batching: each batched array port is projected to
 its scalar-kernel argument at one position.
 
-The restricted graph-native path accepts straight-line operation recipes.
-Authored plates/scans and embedded prepared kernels retain the complete scalar
-callable fallback.
+Every selected recipe is called through its ordinary scalar operation, including
+plates, scans and embedded kernels. Their internal runtime control flow stays
+inside that operation; shared-only composite recipes hoist just like any other.
 """
-function lower_replicated(p::Plan; batched)
+function lower_replicated(p::Plan; batched, reuse = false)
     _replicated_graph_plan(p) || throw(ArgumentError(
-        "position batching graph lowering does not support authored plates, " *
-        "scans, or embedded prepared kernels"))
+        "position batching requires pure recipes"))
     analysis = _replicated_dependency_analysis(p, batched)
     g = p.graph
     names = _varnames(p)
@@ -1414,14 +1434,22 @@ function lower_replicated(p::Plan; batched)
     end
 
     argexprs = Any[_OPS_ARG]
+    reuse && push!(argexprs, :__output_caches__)
     for v in p.have
         push!(argexprs, nm(v))
     end
     body = Expr(:block)
-    runtime_args = Expr(:tuple, argexprs[2:end]...)
+    runtime_args = Expr(:tuple, (nm(v) for v in p.have)...)
     push!(body.args, :(replica_count = _replicated_validate_axes(
         $runtime_args, Val($(analysis.positions)),
-        Val($(analysis.expected_ranks)))))
+        $(analysis.input_types))))
+    empty_outputs = Any[Expr(:call, GlobalRef(@__MODULE__, :_replicated_output),
+                            valtype(v), 0) for v in p.want]
+    empty_result = length(empty_outputs) == 1 ? only(empty_outputs) :
+                   Expr(:tuple, empty_outputs...)
+    push!(body.args, :(if replica_count == 0
+        return $empty_result
+    end))
     for (recipe_index, recipe) in enumerate(p.recipes)
         isempty(analysis.recipe_dependencies[recipe_index]) || continue
         lhsnames = [nm(output) for output in recipe.outputs]
@@ -1437,14 +1465,19 @@ function lower_replicated(p::Plan; batched)
     first_index = gensym(:replica_index)
     push!(body.args, :($first_index = 1))
     recipe_assignments!(body, first_index)
-    for v in p.want
+    for (output_index, v) in enumerate(p.want)
         cid = canon_id(g, v.id)
+        value = haskey(projected, cid) ? projected[cid] : nm(v)
+        allocation = reuse ?
+            Expr(:call, GlobalRef(@__MODULE__, :_replicated_output!),
+                 Expr(:ref, :__output_caches__, output_index), value, :replica_count) :
+            Expr(:call, GlobalRef(@__MODULE__, :_replicated_output), value, :replica_count)
         push!(body.args, Expr(:(=), output_vars[cid],
-            Expr(:call, GlobalRef(@__MODULE__, :_replicated_output),
-                 nm(v), :replica_count)))
+            allocation))
         push!(body.args,
               Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
-                   output_vars[cid], first_index, nm(v)))
+                   output_vars[cid], first_index,
+                   haskey(projected, cid) ? projected[cid] : nm(v)))
     end
 
     rest_body = Expr(:block)
@@ -1453,7 +1486,8 @@ function lower_replicated(p::Plan; batched)
         cid = canon_id(g, v.id)
         push!(rest_body.args,
               Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
-                   output_vars[cid], :replica_index, nm(v)))
+                   output_vars[cid], :replica_index,
+                   haskey(projected, cid) ? projected[cid] : nm(v)))
     end
     push!(body.args, Expr(:for,
         Expr(:(=), :replica_index,
@@ -2179,7 +2213,8 @@ end
 
 @inline function (k::ReplicatedKernel{B})(args...) where {B}
     length(args) == length(k.inputs) || throw(MethodError(k, args))
-    _replica_call(k, args, getfield(args, first(B)))
+    marker = _dynamic_tensorized_marker(args)
+    _replica_call(k, args, marker === nothing ? getfield(args, first(B)) : marker)
 end
 
 inputs(k::ReplicatedKernel) = k.inputs
@@ -2197,6 +2232,54 @@ _replica_rank(::Type{T}) where {T<:Number} = 0
 _replica_rank(::Type{T}) where {T<:AbstractArray} = ndims(T)
 _replica_rank(::Type{T}) where {T} = throw(ArgumentError(
     "replica batched ports must be Numbers or AbstractArrays; got $T"))
+
+# Known numeric ranks retain their validation. Untyped and record boundaries
+# derive their layout from the runtime container, without narrowing the scalar
+# graph's HAVE types or inventing a second mathematical graph.
+_replica_expected_rank(::Type{T}) where {T<:Number} = 1
+_replica_expected_rank(::Type{<:AbstractArray{T,N}}) where {T,N} = N + 1
+_replica_expected_rank(::Type{<:AbstractArray}) = nothing
+_replica_expected_rank(::Type{Any}) = nothing
+_replica_expected_rank(::Type{T}) where {T<:Union{Tuple,NamedTuple}} = nothing
+_replica_expected_rank(::Type{T}) where {T} = throw(ArgumentError(
+    "position-batched ports must be numeric, tuple or named-tuple values; got $T"))
+
+@inline function _replica_batch_count(arg::AbstractArray, ::Type{T}) where {T}
+    expected = _replica_expected_rank(T)
+    ndims(arg) > 0 || throw(DimensionMismatch("a position batch needs a trailing axis"))
+    expected === nothing || ndims(arg) == expected || throw(DimensionMismatch(
+        "position-batched input has rank $(ndims(arg)); expected $expected"))
+    Base.require_one_based_indexing(arg)
+    size(arg, ndims(arg))
+end
+@inline _replica_field_types(::Type{Any}, arg) = map(_ -> Any, arg)
+@inline _replica_field_types(::Type{T}, arg::Tuple) where {T<:Tuple} =
+    isconcretetype(T) ? fieldtypes(T) : map(_ -> Any, arg)
+@inline function _replica_field_types(::Type{T}, arg::NamedTuple{K}) where
+        {K,T<:NamedTuple}
+    isconcretetype(T) || return map(_ -> Any, arg)
+    fieldnames(T) == K || throw(ArgumentError("position record fields differ from the scalar port"))
+    NamedTuple{K}(fieldtypes(T))
+end
+@inline function _replica_batch_count(arg::Union{Tuple,NamedTuple}, ::Type{T}) where {T}
+    isempty(arg) && throw(ArgumentError("a position record needs at least one batched leaf"))
+    types = _replica_field_types(T, arg)
+    length(types) == length(arg) || throw(ArgumentError(
+        "position tuple length differs from the scalar port"))
+    counts = map(_replica_batch_count, arg, types)
+    count = first(counts)
+    all(==(count), counts) || throw(DimensionMismatch(
+        "position record leaves disagree on batch length"))
+    count
+end
+_replica_batch_count(arg, ::Type{T}) where {T} = throw(ArgumentError(
+    "position batches need arrays or tuple/named-tuple trees of arrays; got $(typeof(arg))"))
+
+_replica_output_type(::Type{Any}) = true
+_replica_output_type(::Type{T}) where {T<:Union{Number,AbstractArray}} = true
+_replica_output_type(::Type{T}) where {T<:Union{Tuple,NamedTuple}} =
+    !isconcretetype(T) || all(_replica_output_type, fieldtypes(T))
+_replica_output_type(::Type) = false
 
 function _replica_batch_indices(boundary, batched)
     names = Tuple(batched isa Symbol ? (batched,) : batched)
@@ -2219,11 +2302,11 @@ function _replica(target, batched)
     boundary = inputs(target)
     indices = _replica_batch_indices(boundary, batched)
     input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
-    foreach(_replica_rank, input_types.parameters)
+    foreach(_replica_expected_rank, input_types.parameters)
     output_types = Tuple{(valtype(value) for value in outputs(target))...}
-    all(type -> type <: Union{Number,AbstractArray}, output_types.parameters) ||
+    all(_replica_output_type, output_types.parameters) ||
         throw(ArgumentError(
-            "replica outputs must be Numbers or AbstractArrays; got $(output_types.parameters)"))
+            "replica outputs must be numeric or tuple/named-tuple trees; got $(output_types.parameters)"))
     ReplicatedKernel{indices,input_types,output_types,typeof(target),
                      typeof(boundary),typeof(outputs(target))}(
         target, boundary, outputs(target))
@@ -2297,11 +2380,14 @@ function _replica_graph(target::PreparedKernel, batched)
     boundary = inputs(target)
     input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
     output_types = Tuple{(valtype(value) for value in outputs(target))...}
+    # The position driver calls whole recipe operations. Scalar codegen's op
+    # table can instead flatten embedded programs, so it is not this table.
+    ops = Tuple(recipe.op for recipe in target.plan.recipes)
     GraphReplicatedKernel{indices,input_types,output_types,
-                          typeof(native),typeof(target.ops),typeof(target.plan),
+                          typeof(native),typeof(ops),typeof(target.plan),
                           typeof(target),typeof(boundary),
                           typeof(outputs(target))}(
-        target, native, target.ops, target.plan, ast,
+        target, native, ops, target.plan, ast,
         boundary, outputs(target))
 end
 
@@ -2309,10 +2395,74 @@ function replica_graph(kernel::PreparedKernel; batched)
     _replica_graph(kernel, batched)
 end
 
+# Reuse only the final stacked buffers. Intermediate allocation remains the
+# scalar recipe's responsibility, and the owning surface has no mutable cache.
+_replicated_reuse(cache, value, count) = _replicated_output(value, count)
+@inline function _replicated_reuse(cache::AbstractArray, value::Number, count)
+    cache isa Vector{typeof(value)} && length(cache) == count ?
+        cache : _replicated_output(value, count)
+end
+@inline function _replicated_reuse(cache::AbstractArray, value::Array{T,N}, count) where {T,N}
+    cache isa Array{T,N+1} && size(cache) == (size(value)..., count) ?
+        cache : _replicated_output(value, count)
+end
+@inline function _replicated_reuse(cache::Tuple, value::Tuple, count)
+    length(cache) == length(value) || return _replicated_output(value, count)
+    map((out, item) -> _replicated_reuse(out, item, count), cache, value)
+end
+@inline function _replicated_reuse(cache::NamedTuple{K}, value::NamedTuple{L}, count) where {K,L}
+    K == L || return _replicated_output(value, count)
+    map((out, item) -> _replicated_reuse(out, item, count), cache, value)
+end
+@inline function _replicated_output!(slot, value, count)
+    slot[] = _replicated_reuse(slot[], value, count)
+end
+
+_replicated_alias(cache::AbstractArray, arg::AbstractArray) =
+    Base.mightalias(cache, arg) ||
+    (!(eltype(arg) <: Number) && any(item -> _replicated_alias(cache, item), arg))
+_replicated_alias(cache::AbstractArray, arg::Union{Tuple,NamedTuple}) =
+    any(item -> _replicated_alias(cache, item), arg)
+_replicated_alias(cache, arg) = false
+_replicated_aliases(cache::AbstractArray, args) =
+    any(arg -> _replicated_alias(cache, arg), args)
+_replicated_aliases(cache::Union{Tuple,NamedTuple}, args) =
+    any(item -> _replicated_aliases(item, args), cache)
+_replicated_aliases(cache, args) = false
+
+struct BorrowedBatchedKernel{K,F,C}
+    target::K
+    native::F
+    caches::C
+    ast::Expr
+end
+function _borrowed_batch(target::GraphReplicatedKernel)
+    ast = lower_replicated(target.plan; batched=batched_ports(target), reuse=true)
+    BorrowedBatchedKernel(target, compile(ast),
+                          map(_ -> Ref{Any}(nothing), target.outputs), ast)
+end
+@inline function (kernel::BorrowedBatchedKernel)(args...)
+    length(args) == length(inputs(kernel)) || throw(MethodError(kernel, args))
+    _dynamic_tensorized_marker(args) === nothing || throw(ArgumentError(
+        "reuse=true borrows native output buffers; compile the owning batch instead"))
+    for slot in kernel.caches
+        # A caller may feed an earlier borrowed output into the next call.
+        # Detach in that case so no input is modified through an output alias.
+        _replicated_aliases(slot[], args) && (slot[] = nothing)
+    end
+    kernel.native(kernel.target.ops, kernel.caches, args...)
+end
+inputs(kernel::BorrowedBatchedKernel) = inputs(kernel.target)
+outputs(kernel::BorrowedBatchedKernel) = outputs(kernel.target)
+plan(kernel::BorrowedBatchedKernel) = plan(kernel.target)
+code_expr(kernel::BorrowedBatchedKernel) = kernel.ast
+
 @inline _replica_native_arg(arg, ::Type{T}, replica_index) where {T<:Number} =
     arg[replica_index]
 @inline _replica_native_arg(arg, ::Type{T}, replica_index) where {T<:AbstractArray} =
     copy(selectdim(arg, ndims(arg), replica_index))
+@inline _replica_native_arg(arg, ::Type{T}, index) where {T} =
+    _replicated_project(arg, index)
 
 @generated function _replica_native_inputs(
         ::Val{B}, ::Type{BT}, args::A, replica_index) where {B,BT,A}
@@ -2332,6 +2482,14 @@ end
 
 _replica_stack(values, ::Type{T}) where {T<:Number} = collect(values)
 _replica_stack(values, ::Type{T}) where {T<:AbstractArray} = stack(values)
+function _replica_stack(values, ::Type{T}) where {T}
+    isempty(values) && return _replicated_output(T, 0)
+    result = _replicated_output(first(values), length(values))
+    for (index, value) in enumerate(values)
+        _replicated_store!(result, index, value)
+    end
+    result
+end
 
 function _replica_native_outputs(results, ::Type{OT}) where {OT<:Tuple}
     output_types = OT.parameters
@@ -2345,17 +2503,7 @@ function _replica_native_outputs(results, ::Type{OT}) where {OT<:Tuple}
 end
 
 function _replica_call(k::ReplicatedKernel{B,BT,OT}, args, marker) where {B,BT,OT}
-    replica_count = size(marker, ndims(marker))
-    for index in B
-        arg = getfield(args, index)
-        expected_rank = _replica_rank(valtype(k.inputs[index])) + 1
-        ndims(arg) == expected_rank || throw(DimensionMismatch(
-            "replica port :$(k.inputs[index].name) has rank $(ndims(arg)); " *
-            "expected $expected_rank (scalar rank plus one trailing replica axis)"))
-        size(arg, ndims(arg)) == replica_count || throw(DimensionMismatch(
-            "replica port :$(k.inputs[index].name) has " *
-            "$(size(arg, ndims(arg))) replicas; expected $replica_count"))
-    end
+    replica_count = _replicated_validate_axes(args, Val(B), BT)
     results = map(1:replica_count) do replica_index
         scalar_args = _replica_native_inputs(
             Val(B), BT, args, replica_index)

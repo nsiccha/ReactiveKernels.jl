@@ -26,6 +26,7 @@ rectangular_fold_testfile = joinpath(@__DIR__, "test_rectangular_fold_reactant.j
 inner_partial_evaluation_testfile = joinpath(
     @__DIR__, "test_inner_plate_partial_evaluation_reactant.jl")
 ref_array_plate_testfile = joinpath(@__DIR__, "test_ref_array_plate_reactant.jl")
+position_batching_testfile = joinpath(@__DIR__, "test_position_batching_reactant.jl")
 glm_testfile = joinpath(@__DIR__, "test_glm_reactant.jl")
 example_packages = (
     joinpath(root, "packages", "ReactiveKernelsCompatibilityExamples"),
@@ -61,6 +62,7 @@ mktempdir() do env
     julia = Base.julia_cmd()
     selector = get(ENV, "RK_REACTANT_TESTSET", "all")
     if selector == "all"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $position_batching_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $(joinpath(root, "test", "test_brm_hsgp_reactant.jl"))`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $inner_partial_evaluation_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
@@ -84,6 +86,8 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $testfile $ARGS`)
     elseif selector == "brm-hsgp"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $(joinpath(root, "test", "test_brm_hsgp_reactant.jl"))`)
+    elseif selector == "position-batching"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $position_batching_testfile`)
     elseif selector == "inner-partial-evaluation"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $inner_partial_evaluation_testfile`)
     elseif selector == "authored-scan"

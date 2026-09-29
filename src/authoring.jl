@@ -3129,75 +3129,87 @@ end
 
 """
     prepare_batched(spec::KernelSpec; batched, have=inputs(spec),
-                    want=outputs(spec), passes=()) -> ReplicatedKernel
+                    want=outputs(spec), passes=(), reuse=false) -> callable
 
 First-class position batching for a scalar `@kernel`. The named HAVE ports
 carry one shared trailing batch axis; all other HAVE ports are shared by every
 position. A scalar batched port becomes a vector, a rank-`r` array batched port
 becomes rank-`r + 1`, and every selected output is stacked on the same trailing
-axis. `batched` may be one port name or a tuple of names; those names must be
+axis. Tuple and named-tuple trees preserve their structure and stack each
+numeric leaf. Untyped ports infer their rank from the actual batch container;
+known numeric annotations retain strict rank checks. `batched` may be one port
+name or a tuple of names; those names must be
 unique and agree on the batch length.
 
 This is position batching, not a likelihood `plate`: one scalar parameter
 position is evaluated at each slice while data remains shared. The scalar graph
 stays the mathematical authority, `plan` still owns HAVE/WANT selection and CSE,
 and native execution evaluates independent positions in a generated typed
-driver. Reactant lowers the same map to its backend batch primitive; a
+driver. Reactant lowers the same map to a retained loop with output buffers; a
 `PreparedADKernel` lifted with [`replica`](@ref) produces one gradient per
 position.
 
-The lifted kernel requires the same pure, straight-line semantics as ordinary
-prepared kernels. It allocates the requested output containers and copies
-array-valued slices, so it is not the allocation-free reducing `plate` contract.
+The lifted kernel requires pure recipes and retains their internal loops and
+lazy branches. Native execution hoists shared-only recipes, including plates,
+scans and embedded kernels. The default allocates fresh stacked outputs;
+retaining a result across calls is safe. It is not the allocation-free reducing
+`plate` contract.
+
+`reuse=true` opts into native borrowed stacked-output buffers. A later call may
+overwrite every returned array; consume synchronously or `deepcopy` before
+publishing, retaining or passing it to a callback. Prepare one instance per
+independent caller; the borrowed kernel is not reentrant. Shape/type changes
+reseed buffers, and buffers aliasing this call's inputs detach. This reuses final
+outputs only: scalar recipes may still allocate intermediates. Reactant uses
+the owning surface (`reuse=false`).
+
+To bind shared values, lift `prepare(spec; have, want, bound=(; shared...))` with
+`vectorize`. To retain position-dependent work across calls, build a named
+intermediate with one vectorized WANT cut, then supply that stacked intermediate
+as a batched HAVE in a second cut of the same graph. No second model is needed.
 """
 function prepare_batched(spec::KernelSpec;
                          batched,
                          have = _KERNEL_DEFAULT_BOUNDARY,
                          want = _KERNEL_DEFAULT_BOUNDARY,
-                         passes = ())
+                         passes = (),
+                         reuse = false)
     selected_have = have === _KERNEL_DEFAULT_BOUNDARY ? inputs(spec) : have
     selected_want = want === _KERNEL_DEFAULT_BOUNDARY ? outputs(spec) : want
     prepared = prepare(plan(spec; have = selected_have, want = selected_want);
                        passes = passes)
-    replicated = try
-        replica_graph(prepared; batched)
-    catch err
-        err isa ArgumentError || rethrow()
-        replica(prepared; batched)
-    end
+    replicated = vectorize(prepared; batched, reuse)
     have === _KERNEL_DEFAULT_BOUNDARY || return replicated
     _kernel_signature_callable(replicated, spec.call_signature)
 end
 
 """
-    vectorize(kernel::PreparedKernel; batched) -> ReplicatedKernel
+    vectorize(kernel::PreparedKernel; batched, reuse=false) -> callable
     vectorize(spec::KernelSpec; batched, have=inputs(spec),
-              want=outputs(spec), passes=()) -> ReplicatedKernel
+              want=outputs(spec), passes=(), reuse=false) -> callable
 
 Lift a scalar kernel over position batching. This is the concise public spelling
 for [`prepare_batched`](@ref); `replica` remains the equivalent lower-level
 name. See that docstring for the batch-axis, output-shape, purity, and
 allocation contract.
 """
-function vectorize(kernel::PreparedKernel; batched)
-    try
-        replica_graph(kernel; batched)
-    catch err
-        err isa ArgumentError || rethrow()
-        replica(kernel; batched)
-    end
+function vectorize(kernel::PreparedKernel; batched, reuse = false)
+    replicated = replica_graph(kernel; batched)
+    reuse ? _borrowed_batch(replicated) : replicated
 end
 
 function vectorize(spec::KernelSpec;
                    batched,
                    have = _KERNEL_DEFAULT_BOUNDARY,
                    want = _KERNEL_DEFAULT_BOUNDARY,
-                   passes = ())
-    prepare_batched(spec; batched, have, want, passes)
+                   passes = (),
+                   reuse = false)
+    prepare_batched(spec; batched, have, want, passes, reuse)
 end
 
-function vectorize(callable::_KernelSignatureCallable; batched)
-    replica(callable; batched)
+function vectorize(callable::_KernelSignatureCallable; batched, reuse = false)
+    replicated = vectorize(callable.target; batched, reuse)
+    _kernel_signature_callable(replicated, callable.signature)
 end
 
 "Names of HAVE ports carrying the shared trailing batch axis."
@@ -3205,10 +3217,12 @@ batched_ports(kernel::ReplicatedKernel{B}) where {B} =
     Tuple(kernel.inputs[index].name for index in B)
 batched_ports(kernel::GraphReplicatedKernel{B}) where {B} =
     Tuple(kernel.inputs[index].name for index in B)
+batched_ports(kernel::BorrowedBatchedKernel) = batched_ports(kernel.target)
 
 "The scalar prepared kernel retained as the mathematical authority."
 scalar_kernel(kernel::ReplicatedKernel) = kernel.target
 scalar_kernel(kernel::GraphReplicatedKernel) = kernel.target
+scalar_kernel(kernel::BorrowedBatchedKernel) = scalar_kernel(kernel.target)
 
 """
     plate(spec::KernelSpec; have, want, batched, reduce = :+) -> PreparedKernel
