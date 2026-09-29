@@ -1389,6 +1389,52 @@ _replicated_output(::Type{T}, count) where {T<:Tuple} =
 _replicated_output(::Type{T}, count) where {T<:NamedTuple} =
     NamedTuple{fieldnames(T)}(map(type -> _replicated_output(type, count), fieldtypes(T)))
 
+# A recipe-free batched HAVE already has the desired stacked layout when its
+# leaves are dense numeric arrays. Vectors of scalar records and custom arrays
+# still need ordinary projection and stacking; copying their outer container
+# would change the output layout or scalar representation.
+_replicated_passthrough_compatible(value) = false
+_replicated_passthrough_compatible(::Array{T,N}) where {T,N} =
+    T <: Number && (N > 1 || (N == 1 && isconcretetype(T)))
+_replicated_passthrough_compatible(value::Union{Tuple,NamedTuple}) =
+    all(_replicated_passthrough_compatible, value)
+
+_replicated_passthrough_output(value::Array) = copy(value)
+_replicated_passthrough_output(value::Union{Tuple,NamedTuple}) =
+    map(_replicated_passthrough_output, value)
+_replicated_passthrough_reuse(cache, value) = _replicated_passthrough_output(value)
+@inline function _replicated_passthrough_reuse(cache, value::Array)
+    cache isa typeof(value) && size(cache) == size(value) ?
+        copyto!(cache, value) : _replicated_passthrough_output(value)
+end
+@inline function _replicated_passthrough_reuse(cache::Tuple, value::Tuple)
+    length(cache) == length(value) || return _replicated_passthrough_output(value)
+    map(_replicated_passthrough_reuse, cache, value)
+end
+@inline function _replicated_passthrough_reuse(
+        cache::NamedTuple{K}, value::NamedTuple{L}) where {K,L}
+    K == L || return _replicated_passthrough_output(value)
+    map(_replicated_passthrough_reuse, cache, value)
+end
+@inline function _replicated_passthrough_output!(slot, value)
+    output = _replicated_passthrough_reuse(slot[], value)
+    slot[] = output
+    # Mapping may concretize explicitly abstract NamedTuple fields, just as
+    # ordinary projection/stacking does. Its result need not have input's type.
+    output
+end
+@inline function _replicated_passthrough_output!(slot, value::Array{T,N}) where {T,N}
+    output = _replicated_passthrough_reuse(slot[], value)::Array{T,N}
+    slot[] = output
+    output
+end
+@inline function _replicated_fill!(output, value, count)
+    for index in Base.OneTo(count)
+        _replicated_store!(output, index, value)
+    end
+    output
+end
+
 """
     lower_replicated(p::Plan; batched) -> Expr
 
@@ -1450,6 +1496,29 @@ function lower_replicated(p::Plan; batched, reuse = false)
     push!(body.args, :(if replica_count == 0
         return $empty_result
     end))
+    if isempty(p.recipes)
+        compatible = Expr(:call, GlobalRef(Base, :all),
+            GlobalRef(@__MODULE__, :_replicated_passthrough_compatible),
+            Expr(:tuple, (nm(v) for v in p.want if mapped(canon_id(g, v.id)))...))
+        passthrough_outputs = map(enumerate(p.want)) do (output_index, v)
+            value = nm(v)
+            if mapped(canon_id(g, v.id))
+                reuse ? Expr(:call, GlobalRef(@__MODULE__, :_replicated_passthrough_output!),
+                             Expr(:ref, :__output_caches__, output_index), value) :
+                        Expr(:call, GlobalRef(@__MODULE__, :_replicated_passthrough_output), value)
+            else
+                allocation = reuse ?
+                    Expr(:call, GlobalRef(@__MODULE__, :_replicated_output!),
+                         Expr(:ref, :__output_caches__, output_index), value, :replica_count) :
+                    Expr(:call, GlobalRef(@__MODULE__, :_replicated_output), value, :replica_count)
+                Expr(:call, GlobalRef(@__MODULE__, :_replicated_fill!),
+                     allocation, value, :replica_count)
+            end
+        end
+        passthrough_result = length(p.want) == 1 ? only(passthrough_outputs) :
+                             Expr(:tuple, passthrough_outputs...)
+        push!(body.args, Expr(:if, compatible, Expr(:return, passthrough_result)))
+    end
     for (recipe_index, recipe) in enumerate(p.recipes)
         isempty(analysis.recipe_dependencies[recipe_index]) || continue
         lhsnames = [nm(output) for output in recipe.outputs]
@@ -2414,8 +2483,33 @@ end
     K == L || return _replicated_output(value, count)
     map((out, item) -> _replicated_reuse(out, item, count), cache, value)
 end
-@inline function _replicated_output!(slot, value, count)
-    slot[] = _replicated_reuse(slot[], value, count)
+_replicated_destination_type(::Type) = Any
+_replicated_destination_type(::Type{T}) where {T<:Number} =
+    isconcretetype(T) ? Vector{T} : Any
+_replicated_destination_type(::Type{Array{T,N}}) where {T,N} = Array{T,N+1}
+function _replicated_destination_type(::Type{T}) where {T<:Tuple}
+    isconcretetype(T) || return Any
+    Tuple{map(_replicated_destination_type, fieldtypes(T))...}
+end
+function _replicated_destination_type(::Type{T}) where {T<:NamedTuple}
+    isconcretetype(T) || return Any
+    leaves = Tuple{map(_replicated_destination_type, fieldtypes(T))...}
+    # NamedTuple's tuple parameter is invariant: a predicted Any field would
+    # reject a concrete custom-array destination. Keep such records broad.
+    isconcretetype(leaves) ? NamedTuple{fieldnames(T),leaves} : Any
+end
+
+@inline @generated function _replicated_output!(slot, value::V, count) where {V}
+    # Only the scalar value's structural type determines this assertion, never
+    # a data length or shape. Cache slots still accept later shapes/types, and
+    # custom `similar` results retain the broad fallback. Emit the type itself
+    # so nested native records stay concrete before the retained position loop.
+    destination = _replicated_destination_type(V)
+    quote
+        output = _replicated_reuse(slot[], value, count)
+        slot[] = output
+        output::$destination
+    end
 end
 
 _replicated_alias(cache::AbstractArray, arg::AbstractArray) =

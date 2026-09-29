@@ -137,3 +137,11 @@ code):
   rules generated from their pure-math graphs (the rule constraint above),
   which makes them primitives for Enzyme, so the failing body is never
   differentiated.
+- Reactant 0.2.284 fails to finish MLIR greedy rewriting for a retained
+  pure-copy loop returning structured position leaves and a repeated shared
+  array. The lifted HAVE/WANT passthrough exceeded a 480-second execution
+  budget; its unchanged complete-callable emitter and the Reactant-only
+  `repro_reactant_passthrough_loop.jl` each exceeded a 90-second budget in the
+  same optimizer. The named structured-passthrough compiler acceptance case
+  is skipped on that version. Native passthrough remains supported; the
+  compiler's loop and scalar semantics are retained.

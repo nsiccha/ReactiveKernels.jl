@@ -151,6 +151,14 @@ slices, so it is not the allocation-free reducing contract of a likelihood
 scalar operations, so their shared-only recipes also execute above the position
 loop. Their internal loops and lazy branches retain the scalar semantics.
 
+For compatible native numeric leaves, borrowed lowering recovers concrete final
+destination types before the position loop. A recipe-free HAVE/WANT cut can
+copy compatible dense numeric stacks directly, including tuple and named-tuple
+trees, without creating scalar slices first. Vectors of scalar records and
+custom array layouts retain projection and stacking. These internal reductions
+leave the ownership, empty-batch, validation, and scalar dispatch contracts
+in place; allocating scalar recipes still allocate their intermediate arrays.
+
 By default every call owns fresh stacked output arrays, including record
 leaves. Later calls cannot change retained results. To consume bounded batches
 immediately on the native backend, opt into final output-buffer reuse:
@@ -212,3 +220,10 @@ same requirement as the scalar prepared AD kernel. The position axis remains a
 backend loop rather than one copied body per position. The loop keeps each
 position's lazy branches, including inactive arithmetic. Compile the
 ordinary owning batch; `reuse=true` is a native-only borrowed-buffer surface.
+
+Reactant 0.2.284 has an additional optimizer limitation for a recipe-free cut
+that returns structured position leaves and a repeated shared array. Its
+retained copy loop fails to finish MLIR rewriting within the bounded compile
+budget; see the [constraints](constraints.md) and the backend-only
+`benchmark/repro_reactant_passthrough_loop.jl` reproducer. Native execution
+supports this cut.
