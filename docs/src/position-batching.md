@@ -170,13 +170,40 @@ may consume them immediately without copying raw trajectories; finish that
 reduction before calling the same object again, then publish owned compact
 results. Copy or `deepcopy` arrays retained past the next call, published from a
 callback, or kept in reactive state. A function return alone does not require
-copying. Use a
-separate prepared object per concurrent caller; the cache is not reentrant.
+copying. Use a separate instance per concurrent caller; the cache is not reentrant.
 Changing shapes or element types reseeds storage. Feeding a retained output back
 as an input detaches its buffer so the input is not overwritten. Reuse avoids
 allocation of compatible final stacked buffers; per-position projections and
 scalar intermediate arrays may still allocate. It does not make an allocating
 scalar kernel allocation-free, and it does not cache positions or unit solves.
+
+Prepare one native borrowed template, then use `copy(template)` to create an
+independent reader for each request or concurrent caller:
+
+```julia
+template = vectorize(response_graph; batched=:position, reuse=true)
+reader = copy(template)
+compact_totals = map((0.5, 1.0, 2.0)) do amount
+    result = reader(positions, schedule, amount)
+    sum(result.total) # consume borrowed arrays before the next call
+end
+```
+
+Copy reuses the exact prepared scalar graph and generated callable. It creates
+fresh empty buffer slots without planning, lowering, or code generation. This
+works for pristine templates and objects that were already called: prior output
+buffers are neither shared nor copied. Authored keyword/default signatures are
+preserved. Bound data, pure recipe callables, signatures, and generated-code
+metadata remain shared and read-only. Ordinary Julia specialization on a new
+argument type may still occur at first invocation.
+
+One reader can serve all sequential batches and immediate reductions within a
+request. Keep its construction inside full-operation timing when measuring
+request cost. Each copy follows the same shape/type reseeding and input-alias
+detachment rules. Its outputs remain borrowed until its own next call, so use
+`deepcopy(result)` for an owned nested result. Generic `deepcopy(template)`
+recursively copies graph metadata and populated buffers; it is not the cheap
+empty-instance construction contract.
 
 With Reactant, `@compile batched(positions, shared...)` lowers the same map to a
 retained loop with dynamic slices and output buffers. A scalar kernel that compiles under Reactant therefore

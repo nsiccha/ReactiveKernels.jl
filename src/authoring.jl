@@ -55,6 +55,9 @@ struct _KernelSignatureCallable{F,S}
     signature::S
 end
 
+Base.copy(callable::_KernelSignatureCallable{<:BorrowedBatchedKernel}) =
+    _KernelSignatureCallable(copy(callable.target), callable.signature)
+
 @inline function (callable::_KernelSignatureCallable)(args...; kwargs...)
     _kernel_signature_invoke(callable, args, NamedTuple(kwargs))
 end
@@ -3157,8 +3160,13 @@ retaining a result across calls is safe. It is not the allocation-free reducing
 
 `reuse=true` opts into native borrowed stacked-output buffers. A later call may
 overwrite every returned array; consume synchronously or `deepcopy` before
-publishing, retaining or passing it to a callback. Prepare one instance per
-independent caller; the borrowed kernel is not reentrant. Shape/type changes
+publishing, retaining or passing it to a callback. Prepare a template once,
+then use `copy(template)` for each independent caller. Copy shares the scalar
+graph and compiled callable with fresh empty buffer slots, without planning,
+lowering or code generation, even when the template was already called.
+Keyword/default signatures are preserved. Bound data and computation metadata
+remain shared and read-only; previous outputs are neither shared nor copied.
+One instance can serve sequential batches; it is not reentrant. Shape/type changes
 reseed buffers, and buffers aliasing this call's inputs detach. This reuses final
 outputs only: scalar recipes may still allocate intermediates. Reactant uses
 the owning surface (`reuse=false`).
@@ -3192,6 +3200,10 @@ Lift a scalar kernel over position batching. This is the concise public spelling
 for [`prepare_batched`](@ref); `replica` remains the equivalent lower-level
 name. See that docstring for the batch-axis, output-shape, purity, and
 allocation contract.
+
+For a native `reuse=true` result, `copy(kernel)` creates an independent execution
+instance with empty output buffers and the same prepared computation. See
+[`prepare_batched`](@ref) for its lifetime and concurrency contract.
 """
 function vectorize(kernel::PreparedKernel; batched, reuse = false)
     replicated = replica_graph(kernel; batched)
