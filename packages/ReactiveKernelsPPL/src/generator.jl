@@ -137,6 +137,10 @@ import ..linear_pk_read_locs, ..linear_pk_read_locs_auc
 import ..linear_pk_read_locs_over_subjects,
     ..linear_pk_read_locs_auc_over_subjects, ..SubjectScalar, ..SubjectSlice
 import ..varyingsource_pk_read_locs_over_subjects
+import ..varyingsource_pkpd_read_locs_over_subjects
+import .._varyingsource_pkpd_schedule_columns
+import .._varyingsource_pkpd_subject_columns
+import .._centered_correlated_logpdf
 # Event-LP provider (one call over the flat event axis — the flat
 # `log_F` local the batched cell runner slices per subject).
 import ..linear_pk_event_log_f
@@ -283,7 +287,7 @@ function _mo_block_terms(plan::StructuralPlan, shape::DesignShape)
     k = 1
     for b in shape.blocks
         if b.kind === InterceptTerm
-            push!(terms, Expr(:call, :.*, Expr(:call, :ones, plan.n_obs),
+            push!(terms, Expr(:call, :.*, Expr(:call, :ones, _predictor_rows(plan,shape.predictor)),
                 _coef_coord(coef, k)))
             k += 1
         elseif b.kind === ContinuousTerm
@@ -296,7 +300,7 @@ function _mo_block_terms(plan::StructuralPlan, shape::DesignShape)
             k += w
         elseif b.kind === MatrixTerm
             w = b.width
-            push!(terms, :($(_matrix_block_expr(b, plan.n_obs)) *
+            push!(terms, :($(_matrix_block_expr(b, _predictor_rows(plan,shape.predictor))) *
                 $(:(view($coef, $k:$(k + w - 1))))))
             k += w
         elseif b.kind === MonotonicTerm
@@ -686,6 +690,7 @@ function _varying_effect_expr(plan::StructuralPlan, pred::PredictorSpec,
         t::TermSpec)
     d, s = _slice_draws(plan, pred, t)
     d.mm !== nothing && return _varying_mm_effect_expr(plan, d, s)
+    d.kind === :centered_correlated && return _varying_centered_effect_expr(d,s)
     d.kind === :correlated &&
         return _varying_corr_effect_expr(plan, d, s)
     scale, xi = _varying_k1_names(d)
@@ -695,6 +700,20 @@ function _varying_effect_expr(plan::StructuralPlan, pred::PredictorSpec,
     end
     Z = _varying_z_expr(only(d.margins).z)
     return Expr(:call, :*, scale, Expr(:call, :.*, gathered, Z))
+end
+
+function _varying_centered_effect_expr(d::VaryingDraws,s::VaryingSlice)
+    b = _varying_corr_names(d)[3]
+    K = length(d.margins)
+    gidx = Symbol(:_ppl_gidx_,d.group)
+    parts = Any[]
+    for j in s.columns
+        idx = :($j .+ ($gidx .- 1) .* $K)
+        effect = Expr(:ref,b,idx)
+        z = d.margins[j].z
+        push!(parts,z.kind === :ones ? effect : :($(_varying_z_expr(z)) .* $effect))
+    end
+    return foldl((a,c)->:($a .+ $c),parts)
 end
 
 # One mm draws block's direct `r` summand (SB `multi_membership_*`
@@ -1046,14 +1065,37 @@ function _expand_grouped_cell_call(nm::Symbol, ex::Expr,
         :dose_amount, :dose_index, :treatment_map, :unique_dts,
         :concentration_idxs, :dosing_time_idxs)
     args = Any[_sched_col_name(sched.name, f) for f in fields]
-    for a in ex.args[3:end]
+    for (i,a) in enumerate(ex.args[3:end])
         if a isa Symbol && haskey(lps, a)
-            push!(args, :(SubjectScalar($(lps[a]))))
+            push!(args, i <= 3 ? lps[a] : :(SubjectScalar($(lps[a]))))
         else
             push!(args, _rewrite_grouped_gather(a, sched, lps, flatmap))
         end
     end
     return Expr[:($nm = varyingsource_pk_read_locs_over_subjects($(args...)))]
+end
+
+function _expand_grouped_cell_call(nm::Symbol, ex::Expr,
+        sched::VaryingSourcePKPDScheduleSpec, lps::Dict{Symbol,Symbol}, flatmap)
+    fields = Any[_sched_col_name(sched.name,f) for f in _VS_PKPD_SCHEDULE_FIELDS]
+    bound = Symbol(:_ppl_vs_schedule_,sched.name,:_,nm)
+    args = Any[]
+    for (i,a) in enumerate(ex.args[3:end])
+        push!(args,a isa Symbol && haskey(lps,a) ?
+            (i <= 3 ? lps[a] : :(SubjectScalar($(lps[a])))) :
+            _rewrite_grouped_gather(a,sched,lps,flatmap))
+    end
+    subject = Symbol(:_ppl_vs_subject_,sched.name,:_,nm)
+    hyper = Symbol(:_ppl_vs_hyper_,sched.name,:_,nm)
+    columns = Any[a isa Symbol && haskey(lps,a) ? lps[a] :
+        _rewrite_grouped_gather(a,sched,lps,flatmap) for a in ex.args[20:32]]
+    hypers = Any[args[i] for i in (5,6,7,8,9,11,12,14,15,16,17)]
+    ends = _sched_col_name(sched.name,:obs_ends)
+    return Expr[:($bound = _varyingsource_pkpd_schedule_columns($(fields...))),
+        :($subject = _varyingsource_pkpd_subject_columns(length($ends),$(columns...))),
+        :($hyper = Float64[$(hypers...)]),
+        :($nm = varyingsource_pkpd_read_locs_over_subjects($bound,
+            $(args[1:3]...),$subject,$hyper,$(args[4]),$(args[10]),$(args[13])))]
 end
 
 # Grouped-kernel likelihood: the panel flat map cannot express sequential
@@ -3110,7 +3152,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     # every configured sd prior too (SB's generic path keeps the
     # positive bound with no truncation normalizer).
     for d in plan.varying_draws
-        if d.kind === :correlated
+        if _is_correlated_kind(d.kind)
             if d.strata !== nothing
                 _stratified_prior_stmts!(stmts, terms, d)
                 continue
@@ -3120,8 +3162,18 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
             push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(d))))
             push!(terms, lnode)
             _sd_prior_tau_stmts!(stmts, terms, d, tau)
-            _vector_prior_stmts!(stmts, terms, z, :normal,
-                (arg1 = 0, arg2 = 1), nothing)
+            if d.kind === :centered_correlated
+                K = length(d.margins)
+                lower = Symbol(:_ppl_centered_L_,d.suffix)
+                vals = Any[_rl_name(L,i,j) for i in 1:K for j in 1:i]
+                push!(stmts,:($lower = Float64[$(vals...)]))
+                node = Symbol(:_ppl_prior_,z)
+                push!(stmts,:($node::Float64 = _centered_correlated_logpdf($z,$tau,$lower)))
+                push!(terms,node)
+            else
+                _vector_prior_stmts!(stmts, terms, z, :normal,
+                    (arg1 = 0, arg2 = 1), nothing)
+            end
             continue
         end
         scale, xi = _varying_k1_names(d)
@@ -3810,4 +3862,3 @@ function _log_jacobian_statement(layout::LayoutTable)
     jac = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
     return :(log_jacobian::Float64 = $jac)
 end
-

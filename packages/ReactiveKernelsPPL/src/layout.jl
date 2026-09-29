@@ -295,7 +295,7 @@ function assign_layout(plan::StructuralPlan)
     # one L/tau pair per stratum (SB `ranef_correlated_by` order —
     # all L, all tau) plus the one shared `z_flat` block.
     for d in plan.varying_draws
-        if d.kind === :correlated
+        if _is_correlated_kind(d.kind)
             K = length(d.margins)
             if d.strata !== nothing
                 # Stratified (SB `ranef_correlated_by` declaration
@@ -974,6 +974,17 @@ function _varying_corr_draws(layout::LayoutTable, u::AbstractVector{<:Real})
         e.kind === :varying_corr || continue
         sfx = string(e.name)[3:end]
         tau_e = get(byname, Symbol("tau_", sfx), nothing)
+        b_e = get(byname,Symbol("b_flat_",sfx),nothing)
+        if b_e !== nothing
+            tau_e !== nothing || throw(ContractValidationError(
+                "[layout] centered LKJ entry $(e.name) has no tau sibling"))
+            K = _lkj_dim(e.size)
+            b_e.size % K == 0 || throw(ContractValidationError(
+                "[layout] centered b_flat length is not a multiple of K=$K"))
+            b = Float64.(u[b_e.offset:(b_e.offset+b_e.size-1)])
+            push!(out,Symbol("b_",sfx)=>Matrix(reshape(b,K,b_e.size÷K)'))
+            continue
+        end
         z_e = get(byname, Symbol("z_flat_", sfx), nothing)
         if tau_e === nothing || z_e === nothing
             _stratified_draws_refusal(e.name, sfx, byname)

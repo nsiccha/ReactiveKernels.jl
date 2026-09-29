@@ -744,12 +744,14 @@ end
 """
     VaryingDraws(group, kind, margins, lkj_eta, label, suffix[, levels[, sd_priors[, mm[, strata]]]])
 
-One shared varying-effect draws block: non-centered geometry over
+One shared varying-effect draws block over
 `K = length(margins)` margins in `G` groups of raw column `group`.
 `kind` is `:intercept1` (single-`1` without eta: log-scale/xi
 geometry), `:slope1` (single slope without eta: tau/xi geometry), or
-`:correlated` (LKJ + tau + z_flat; K >= 2, or K = 1 with eta given —
-the vacuous-1x1-LKJ route). The K=1 sd geometries are deliberately
+`:correlated` (non-centered LKJ + tau + z_flat), or
+`:centered_correlated` (LKJ + tau + directly sampled b_flat, native only).
+The correlated kinds admit K >= 2, or K = 1 with eta given
+(the vacuous-1x1-LKJ route). The K=1 sd geometries are deliberately
 asymmetric, mirroring StanBlocks-BRMI (SB) equation-for-equation: an
 intercept margin samples its sd in log space (`log_scale ~ Normal(0,
 1)`, effect `exp(log_scale) * xi` — a LogNormal(0, 1) sd), while a
@@ -1023,6 +1025,22 @@ struct VaryingSourcePKScheduleSpec <: PKScheduleSpec
     treatment::Symbol
 end
 
+"""Raw observation/dose declaration for the full varying-source PK/PD cell.
+`obs_assay` selects PK/PBMC/CSF; `discretization` names cumulative raw
+discretization lags. Binding owns all time grids and ragged index products.
+"""
+struct VaryingSourcePKPDScheduleSpec <: PKScheduleSpec
+    name::Symbol
+    obs_subj::Symbol
+    obs_time::Symbol
+    obs_assay::Symbol
+    dose_subj::Symbol
+    dose_time::Symbol
+    dose_amt::Symbol
+    treatment::Symbol
+    discretization::Symbol
+end
+
 function _sched_raw_columns(s::LinearPKScheduleSpec)
     raw = [s.obs_subj, s.obs_time, s.dose_subj, s.dose_time, s.dose_amt]
     s.ecg !== nothing && append!(raw, s.ecg)
@@ -1031,8 +1049,12 @@ function _sched_raw_columns(s::LinearPKScheduleSpec)
 end
 _sched_raw_columns(s::VaryingSourcePKScheduleSpec) =
     [s.obs_subj, s.obs_time, s.dose_subj, s.dose_time, s.dose_amt, s.treatment]
+_sched_raw_columns(s::VaryingSourcePKPDScheduleSpec) =
+    [s.obs_subj, s.obs_time, s.obs_assay, s.dose_subj, s.dose_time,
+        s.dose_amt, s.treatment, s.discretization]
 _sched_ends_field(::LinearPKScheduleSpec) = :op_ends
 _sched_ends_field(::VaryingSourcePKScheduleSpec) = :reference_ends
+_sched_ends_field(::VaryingSourcePKPDScheduleSpec) = :obs_ends
 
 """V2 event-LP slope prior scale (SB `effect(log_F, op_log_dose) ~
 Normal(0.0, 0.6676)` verbatim — the specific overrides the wildcard
@@ -1845,11 +1867,26 @@ argument. The generator emits ONE subject-batched call per assignment
 (`<fn>_over_subjects` over the bound op columns + `op_ends`, pkcells.jl);
 the function itself is the per-subject cell + host-side oracle path."""
 const CELL_FNS = (:linear_pk_read_locs, :linear_pk_read_locs_auc,
-    :varyingsource_pk_read_locs)
+    :varyingsource_pk_read_locs, :varyingsource_pkpd_read_locs)
 
 """Arity (argument count) of each [`CELL_FNS`](@ref) entry, schedule first."""
 const CELL_FN_ARITY = Dict{Symbol,Int}(:linear_pk_read_locs => 6,
-    :linear_pk_read_locs_auc => 7, :varyingsource_pk_read_locs => 13)
+    :linear_pk_read_locs_auc => 7, :varyingsource_pk_read_locs => 13,
+    :varyingsource_pkpd_read_locs => 31)
+
+# Positions include the function name, as in an Expr(:call,...). These
+# shared vector ports are independent of all subject and observation axes.
+const CELL_FN_VECTOR_PORTS = Dict{Symbol,Tuple}(
+    :varyingsource_pk_read_locs =>
+        ((position=6,shape=:square,minimum=1,label="GP weights"),),
+    :varyingsource_pkpd_read_locs =>
+        ((position=6,shape=:square,minimum=2,label="GP innovations"),
+         (position=12,shape=:basis,minimum=2,label="placebo innovations"),
+         (position=15,shape=:basis,minimum=2,label="CSF placebo innovations")))
+
+_cell_schedule_compatible(fn, s) = fn === :varyingsource_pk_read_locs ?
+    s isa VaryingSourcePKScheduleSpec : fn === :varyingsource_pkpd_read_locs ?
+    s isa VaryingSourcePKPDScheduleSpec : s isa LinearPKScheduleSpec
 
 """Op-column fields each [`CELL_FNS`](@ref) entry reads per subject
 (positional, after the schedule — the generator passes the bound
@@ -1902,6 +1939,18 @@ _sched_materialized_fields(::VaryingSourcePKScheduleSpec) =
     (:reference_ends, :dose_ends, :lag_ends, :concentration_ends,
         :dose_amount, :dose_index, :treatment_map, :unique_dts,
         :concentration_idxs, :dosing_time_idxs, :obs_map)
+
+const _VS_PKPD_SCHEDULE_FIELDS = (:reference_ends, :dose_ends, :lag_ends,
+    :concentration_ends, :dose_amount, :dose_index, :treatment_map, :unique_dts,
+    :concentration_idxs, :dosing_time_idxs, :obs_ends, :assay, :obs_map,
+    :pk_ends, :pk_idxs, :pd2_write_ends, :pd2_step_ends, :pd2_idxs, :pd2_dts,
+    :pd2_center_idxs, :pd3_write_ends, :pd3_step_ends, :pd3_idxs, :pd3_dts,
+    :pd3_center_idxs, :placebo_ends, :placebo_time)
+_sched_materialized_fields(::VaryingSourcePKPDScheduleSpec) = _VS_PKPD_SCHEDULE_FIELDS
+_sched_extra_fields(::VaryingSourcePKPDScheduleSpec, assignments) = Symbol[]
+_sched_available_maps(::VaryingSourcePKPDScheduleSpec, assignments) = Set([:obs_map])
+_sched_map_prereq(::VaryingSourcePKPDScheduleSpec, m, assignments) =
+    "varyingsource PK/PD schedules provide only `obs_map`"
 
 _sched_extra_fields(::VaryingSourcePKScheduleSpec, assignments) = Symbol[]
 _sched_available_maps(::VaryingSourcePKScheduleSpec, assignments) = Set([:obs_map])
@@ -2150,12 +2199,15 @@ end
 # layout, and the generator. K=1 correlated draws own the same three
 # names (`L` packs zero coords).
 function _varying_corr_names(d::VaryingDraws)
-    d.kind === :correlated ||
+    _is_correlated_kind(d.kind) ||
         _fail(d.label, "draws kind $(d.kind) owns no correlated " *
               "sampled names (K=1 geometry has its own names)")
     s = d.suffix
-    return (Symbol("L_", s), Symbol("tau_", s), Symbol("z_flat_", s))
+    return (Symbol("L_", s), Symbol("tau_", s),
+        Symbol(d.kind === :centered_correlated ? "b_flat_" : "z_flat_", s))
 end
+
+_is_correlated_kind(kind) = kind in (:correlated,:centered_correlated)
 
 function _varying_k1_names(d::VaryingDraws)
     (d.kind === :intercept1 || d.kind === :slope1) ||
@@ -2306,9 +2358,9 @@ end
 
 function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
         slices::Vector{VaryingSlice})
-    d.kind in (:intercept1, :slope1, :correlated) ||
+    d.kind in (:intercept1, :slope1, :correlated, :centered_correlated) ||
         _fail(d.label, "draws kind must be :intercept1, :slope1, or " *
-              ":correlated, got $(repr(d.kind))")
+              ":correlated or :centered_correlated, got $(repr(d.kind))")
     K = length(d.margins)
     K >= 1 || _fail(d.label, "draws block has zero margins")
     for m in d.margins
@@ -2322,7 +2374,9 @@ function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
     # Kind dispatch: K=1 without eta is :intercept1 (single-`1`) or
     # :slope1 (single slope); K=1 with eta takes the vacuous-1x1-LKJ
     # correlated route; K>=2 is always :correlated.
-    want = if K == 1 && isnan(d.lkj_eta) && _is_ones_margin(first(d.margins))
+    want = if d.kind === :centered_correlated
+        :centered_correlated
+    elseif K == 1 && isnan(d.lkj_eta) && _is_ones_margin(first(d.margins))
         :intercept1
     elseif K == 1 && isnan(d.lkj_eta)
         :slope1
@@ -2332,7 +2386,7 @@ function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
     d.kind === want ||
         _fail(d.label, "draws kind $(d.kind) mismatches its margins " *
               "(want $want)")
-    if want === :correlated
+    if _is_correlated_kind(want)
         isfinite(d.lkj_eta) && d.lkj_eta > 0 ||
             _fail(d.label, "correlated draws need a positive LKJ eta, " *
                   "got $(d.lkj_eta)")
@@ -2360,6 +2414,8 @@ function _validate_draws_grouping(d::VaryingDraws, K::Int)
     mm = d.mm
     st = d.strata
     mm === nothing && st === nothing && return nothing
+    d.kind === :centered_correlated && _fail(d.label,
+        "centered correlated draws require plain grouping (multi-membership and strata are unsupported)")
     mm !== nothing && st !== nothing &&
         _fail(d.label, "draws block is both multi-membership and " *
               "stratified (SB has no `mm(...)` × `gr(g, by=b)` shape — " *
@@ -2439,7 +2495,7 @@ function _validate_sd_priors(d::VaryingDraws, K::Int)
             p.param > 0 ||
                 _fail(d.label, "margin $j sd prior needs a positive " *
                       "param, got $(p.param)")
-            d.kind === :correlated ||
+            _is_correlated_kind(d.kind) ||
                 _fail(d.label, "margin $j carries an explicit sd prior " *
                       "but these draws are :$(d.kind) (sd priors are a " *
                       ":correlated-draws feature — pass `eta` for the " *
@@ -2779,19 +2835,37 @@ function _maybe_fill_strata(d::VaryingDraws, columns::AbstractDict{Symbol})
         VaryingStrata(st.by, collect(slevels)))
 end
 
-"""Predictor levels (grouped kernels): a predictor consumed ONLY as a
-kernel LP arg is SUBJECT-level (its design rows are subjects); any
-response use makes it obs-level. Mixed use fails closed — split the
-predictor instead."""
+# Varying-source dose modifiers use raw dose rows. Other direct LP ports
+# use subject rows. One predictor cannot serve both axes.
+function _kernel_lp_axis(kp::KernelPlate, cell::Symbol)
+    axes = Set{Symbol}()
+    for (_, ex) in kp.assignments
+        ex isa Expr && ex.head === :call && ex.args[1] in CELL_FNS || continue
+        for (i, arg) in enumerate(ex.args)
+            arg === cell || continue
+            push!(axes, ex.args[1] in (:varyingsource_pk_read_locs,
+                :varyingsource_pkpd_read_locs) && i in 3:5 ? :dose : :subject)
+        end
+    end
+    length(axes) > 1 && _fail(kp.label,
+        "kernel LP `$cell` feeds both dose and subject arguments (split the predictor)")
+    return isempty(axes) ? :subject : only(axes)
+end
+
+"""Predictor axis: grouped kernel LP ports select subject or dose rows;
+response predictors use observation rows. Mixed use fails closed."""
 function _predictor_level(plan::StructuralPlan, pname::Symbol)
-    by_kernel = any(kp -> any(((p, _),) -> p === pname, kp.lp_args),
-        plan.kernel_plates)
+    axes = Set{Symbol}(_kernel_lp_axis(kp,c) for kp in plan.kernel_plates
+        for (p,c) in kp.lp_args if p === pname)
+    by_kernel = !isempty(axes)
     by_resp = any(r -> _response_uses_predictor(r, pname), plan.responses)
     by_kernel && by_resp &&
         _fail(:plan, "predictor `$pname` feeds both a kernel LP arg and " *
               "a response (mixed-level predictors are not supported — " *
               "split it into a subject-level and an obs-level predictor)")
-    by_kernel && return :subject
+    length(axes) > 1 && _fail(:plan,
+        "predictor `$pname` feeds both dose and subject kernel arguments (split the predictor)")
+    by_kernel && return only(axes)
     return :obs
 end
 
@@ -2813,12 +2887,12 @@ function _response_uses_predictor(r::LikelihoodSpec, pname::Symbol)
     return false
 end
 
-"""Term columns of subject-level predictors (n_sub rows by design):
+"""Term columns of subject or dose predictors:
 exempt from the uniform-`n_obs` rule like kernel-managed columns (only
 bound columns count — a summand's basis id is not a column and fails
 loudly under kernel rules instead). Transitive through derived
-assignments: a data column feeding ONLY subject-level consumers inherits
-subject level (in-graph `standardize`, etc.). A pulled column that ALSO
+assignments: a data column feeding ONLY kernel LP consumers inherits
+their axis (in-graph `standardize`, etc.). A pulled column that ALSO
 feeds obs-level consumers (responses, slices, obs predictors, weights,
 evidence, trials) fails loudly — mixed-level lengths are genuinely
 ambiguous. (Directly-shared columns across levels predate this rule and
@@ -2828,7 +2902,7 @@ function _subject_predictor_columns(plan::StructuralPlan)
     out = Set{Symbol}()
     seed = Set{Symbol}()
     for pred in plan.predictors
-        _predictor_level(plan, pred.name) === :subject || continue
+        _predictor_level(plan, pred.name) === :obs && continue
         for t in pred.terms, c in t.columns
             push!(seed, c)
             haskey(plan.columns, c) && push!(out, c)
@@ -3613,6 +3687,11 @@ subject rows ARE subjects, so the draws' per-level `r` needs no gather —
 subject order; the joint parity harness proves it numerically)."""
 const _SUBJECT_TERM_KINDS =
     (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, VaryingEffectTerm)
+const _DOSE_TERM_KINDS =
+    (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, MonotonicTerm,
+        MonotonicSummandTerm)
+_kernel_lp_term_kinds(kp,cell) = _kernel_lp_axis(kp,cell) === :dose ?
+    _DOSE_TERM_KINDS : _SUBJECT_TERM_KINDS
 
 # Grouped-kernel structure (see `_validate_kernels`): schedules resolve,
 # LP args name subject-exclusive identity predictors with admitted terms,
@@ -3652,7 +3731,7 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
     cparams = [c for (_, c) in kp.lp_args]
     length(unique(cparams)) == length(cparams) ||
         _fail(kp.label, "duplicate LP-arg cell params $(cparams)")
-    for (p, _) in kp.lp_args
+    for (p, cell) in kp.lp_args
         i = findfirst(q -> q.name === p, plan.predictors)
         i === nothing &&
             _fail(kp.label, "kernel LP arg `$p` is not a predictor (LP " *
@@ -3662,15 +3741,16 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
         pred.link === IdentityLink ||
             _fail(kp.label, "kernel LP arg `$p` needs IdentityLink " *
                   "(got $(pred.link) — subject LPs feed the cell raw)")
-        _predictor_level(plan, p) === :subject ||
+        _predictor_level(plan, p) in (:subject,:dose) ||
             _fail(kp.label, "kernel LP arg `$p` is unreachable " *
                   "(internal: mixed-level predictors fail in " *
                   "`_predictor_level`)")
+        admitted = _kernel_lp_term_kinds(kp,cell)
         for t in pred.terms
-            t.kind in _SUBJECT_TERM_KINDS ||
+            t.kind in admitted ||
                 _fail(kp.label, "subject predictor `$p` carries a " *
                       "$(t.kind) term (grouped v1 admits " *
-                      "$(_SUBJECT_TERM_KINDS) — summands and per-cell " *
+                      "$admitted — unsupported summands and per-cell " *
                       "latents are sequenced after the PK slice)")
         end
     end
@@ -3681,26 +3761,36 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
         Set{Symbol}(c for (_, c) in kp.lp_args), _union_names(plan))
     schednames = Set{Symbol}(s.name for s in kp.schedules)
     cell_locals = Set{Symbol}()
+    scalar_names = Set{Symbol}(p.name for p in plan.parameters)
+    union!(scalar_names,Set{Symbol}(a.name for a in plan.assignments))
     for (nm, ex) in kp.assignments
         _collect_grouped_cell_refs!(Symbol[], ex, kp, known, schednames)
-        if ex isa Expr && ex.head === :call &&
-                ex.args[1] === :varyingsource_pk_read_locs
-            weights = ex.args[6]
+        for (source,_) in _collect_grouped_gather_uses(ex)
+            source isa Expr || continue
+            all(a -> a isa Number || a isa Symbol && a in scalar_names,source.args) ||
+                _fail(kp.label,"literal gather entries must be numeric literals or model scalar names")
+        end
+        if ex isa Expr && ex.head === :call
+          for port in get(CELL_FN_VECTOR_PORTS, ex.args[1], ())
+            weights = ex.args[port.position]
             weights isa Symbol || _fail(kp.label,
-                "varyingsource GP weights need a shared coefficient vector name")
+                "varyingsource $(port.label) need a shared coefficient vector name")
             wi = findfirst(v -> v.name === weights, plan.vector_parameters)
             if weights in params
                 # Bind checks the coefficient vector's square dimension.
             elseif wi !== nothing
                 v = plan.vector_parameters[wi]
-                k = v.size === nothing ? 0 : isqrt(v.size)
-                v.family === :vector_normal && k > 0 && k * k == v.size ||
-                    _fail(kp.label, "varyingsource GP weights need a " *
-                        "concrete square vector_normal parameter")
+                k = v.size === nothing ? 0 :
+                    port.shape === :square ? isqrt(v.size) : v.size
+                v.family === :vector_normal && k >= port.minimum &&
+                    (port.shape !== :square || k * k == v.size) ||
+                    _fail(kp.label, "varyingsource $(port.label) need a " *
+                        "concrete $(port.shape) vector_normal parameter")
             else
-                _fail(kp.label, "varyingsource GP weights must name a " *
+                _fail(kp.label, "varyingsource $(port.label) must name a " *
                     "bound coefficient vector or vector_normal parameter")
             end
+          end
         end
         push!(known, nm)
         push!(cell_locals, nm)
@@ -4049,19 +4139,22 @@ function _collect_grouped_cell_refs!(refs, ex, kp::KernelPlate,
                       "first (got $(repr(s)) — admitted schedules: " *
                       "$(sort!(collect(schednames))))")
             spec = only(q for q in kp.schedules if q.name === s)
-            (fn === :varyingsource_pk_read_locs) ==
-                (spec isa VaryingSourcePKScheduleSpec) ||
+            _cell_schedule_compatible(fn,spec) ||
                 _fail(label, "cell call `$fn` has an incompatible schedule `$s`")
             rest = args[2:end]
-            if fn === :varyingsource_pk_read_locs
+            if haskey(CELL_FN_VECTOR_PORTS,fn)
                 # Shared GP vectors have a dedicated port, not the scalar
                 # name environment. The plan-level cell validator proves
                 # the bound-vector / vector_normal declaration and size.
-                weights = args[5]
-                weights isa Symbol || _fail(label,
-                    "varyingsource GP weights need a shared coefficient vector name")
-                push!(refs, weights)
-                rest = vcat(args[2:4], args[6:end])
+                ports = CELL_FN_VECTOR_PORTS[fn]
+                for port in ports
+                    weights = ex.args[port.position]
+                    weights isa Symbol || _fail(label,
+                        "varyingsource $(port.label) need a shared coefficient vector name")
+                    push!(refs, weights)
+                end
+                rest = Any[a for (i,a) in enumerate(args[2:end])
+                    if all(p -> p.position != i+2,ports)]
             end
             if (fn === :linear_pk_read_locs && seven) || fn === :linear_pk_read_locs_auc
                 # The event-LP second arg is the provider's flat
@@ -4196,9 +4289,16 @@ function _collect_grouped_cell_gather!(refs, ex, kp::KernelPlate,
     length(ex.args) == 2 || _fail(label, "indexing in a cell takes one " *
         "index (`v[sched.map]` or `v[map]`), got $(repr(ex))")
     vec, idx = ex.args[1], ex.args[2]
-    vec isa Symbol && vec in known ||
-        _fail(label, "gather source must be a cell name, got $(repr(vec))")
-    push!(refs, vec)
+    if vec isa Expr && vec.head === :vect
+        isempty(vec.args) && _fail(label,"literal gather source is empty")
+        for a in vec.args
+            _collect_grouped_cell_refs!(refs,a,kp,known,schednames)
+        end
+    else
+        vec isa Symbol && vec in known ||
+            _fail(label, "gather source must be a cell name or scalar vector literal, got $(repr(vec))")
+        push!(refs, vec)
+    end
     if idx isa Symbol
         idx in schednames &&
             _fail(label, "schedule `$idx` is a compile-time handle, not " *
@@ -4280,6 +4380,11 @@ function _build_grouped_schedule(plan::StructuralPlan, kp::KernelPlate,
             columns[sched.obs_time], columns[sched.dose_subj],
             columns[sched.dose_time], columns[sched.dose_amt],
             columns[sched.treatment])
+    elseif sched isa VaryingSourcePKPDScheduleSpec
+        return build_varyingsource_pkpd_schedule(columns[sched.obs_subj],
+            columns[sched.obs_time],columns[sched.obs_assay],
+            columns[sched.dose_subj],columns[sched.dose_time],
+            columns[sched.dose_amt],columns[sched.treatment],columns[sched.discretization])
     end
     combine = _schedule_combine_simultaneous(plan, sched.name)
     ecg = _grouped_schedule_axis(sched, columns, :ecg, kp)
@@ -4361,15 +4466,18 @@ function _validate_grouped_kernel_data(plan::StructuralPlan, kp::KernelPlate)
         _validate_kernel_obs_column(kp, obs, rcol, colv)
         _validate_kernel_bool_twin(kp, obs, rcol, plan)
     end
-    for (p, _) in kp.lp_args
+    for (p, cell) in kp.lp_args
         i = findfirst(q -> q.name === p, plan.predictors)
         i === nothing &&
             _fail(kp.label, "kernel LP arg `$p` is not a predictor")
+        axis = _kernel_lp_axis(kp,cell)
+        n_rows = axis === :dose ? length(plan.columns[sched.dose_subj]) : n_sub
+        admitted = _kernel_lp_term_kinds(kp,cell)
         for t in plan.predictors[i].terms
-            t.kind in _SUBJECT_TERM_KINDS ||
+            t.kind in admitted ||
                 _fail(kp.label, "subject predictor `$p` carries a " *
                       "$(t.kind) term (grouped v1 admits " *
-                      "$(_SUBJECT_TERM_KINDS))")
+                      "$admitted)")
             for c in t.columns
                 # In-graph deriveds compute at eval from bound sources
                 # (length-checked at their own level); no bind values exist.
@@ -4378,9 +4486,9 @@ function _validate_grouped_kernel_data(plan::StructuralPlan, kp::KernelPlate)
                     _fail(kp.label, "subject predictor `$p` column `$c` " *
                           "is not bound")
                 colv = plan.columns[c]
-                length(colv) == n_sub ||
-                    _fail(kp.label, "subject predictor `$p` column `$c` " *
-                          "has length $(length(colv)), want n_sub $n_sub")
+                length(colv) == n_rows ||
+                    _fail(kp.label, "$axis predictor `$p` column `$c` " *
+                          "has length $(length(colv)), want $axis rows $n_rows")
                 if t.kind in (ContinuousTerm, OffsetTerm)
                     eltype(colv) <: Real ||
                         _fail(kp.label, "subject predictor `$p` column " *
@@ -4580,7 +4688,7 @@ function _validate_name_tables(plan::StructuralPlan)
         if d.kind === :intercept1 || d.kind === :slope1
         for nm in _varying_k1_names(d)]
     vcorr = Symbol[nm for d in plan.varying_draws
-        if d.kind === :correlated
+        if _is_correlated_kind(d.kind)
         for nm in _varying_corr_table_names(d)]
     hsgp = Symbol[nm for hb in plan.hsgp_bases for nm in _hsgp_all_names(hb)]
     kern = Symbol[nm for kp in plan.kernel_plates for nm in _kernel_all_names(kp)]
@@ -5492,10 +5600,11 @@ function _validate_vector_parameters(plan::StructuralPlan)
     for kp in plan.kernel_plates
         used = Set{Symbol}()
         for (_, ex) in kp.assignments
-            ex isa Expr && ex.head === :call && length(ex.args) == 14 &&
-                ex.args[1] === :varyingsource_pk_read_locs || continue
-            weights = ex.args[6]
-            weights isa Symbol && haskey(refs, weights) && push!(used, weights)
+            ex isa Expr && ex.head === :call || continue
+            for port in get(CELL_FN_VECTOR_PORTS,ex.args[1],())
+                weights = ex.args[port.position]
+                weights isa Symbol && haskey(refs, weights) && push!(used, weights)
+            end
         end
         for weights in used
             push!(refs[weights], kp.label)
@@ -8426,7 +8535,7 @@ end
 # (gathers move it to an axis first).
 const CELL_FN_RESULT_SPACE = Dict{Symbol,Symbol}(
     :linear_pk_read_locs => :reads, :linear_pk_read_locs_auc => :reads,
-    :varyingsource_pk_read_locs => :reads)
+    :varyingsource_pk_read_locs => :reads, :varyingsource_pkpd_read_locs => :reads)
 
 # Bind-time grouped cell shapes: :scalar (LP cell params, model
 # scalars, literals, scalar arithmetic), (:obs, len) (response slices
@@ -8492,7 +8601,7 @@ function _grouped_cell_shape(ex, kp::KernelPlate, shapes::Dict{Symbol,Any},
         fn = ex.args[1]
         if fn isa Symbol && fn in CELL_FNS
             trailing = ex.args[3:end]
-            if fn === :varyingsource_pk_read_locs
+            if haskey(CELL_FN_VECTOR_PORTS,fn)
                 sched = only(kp.schedules)
                 ndose = length(columns[sched.dose_subj])
                 # Three dose modifiers may be flat dose-row vectors or
@@ -8504,18 +8613,21 @@ function _grouped_cell_shape(ex, kp::KernelPlate, shapes::Dict{Symbol,Any},
                         _fail(label, "varyingsource dose argument `$arg` needs " *
                             "a scalar or the $ndose-row dose axis, got $space")
                 end
-                weights = trailing[4]
+              for port in CELL_FN_VECTOR_PORTS[fn]
+                weights = ex.args[port.position]
                 weights isa Symbol && !(weights in _lp_cell_params(kp)) ||
-                    _fail(label, "varyingsource GP weights need a shared " *
+                    _fail(label, "varyingsource $(port.label) need a shared " *
                         "coefficient vector name")
                 space = _grouped_cell_shape(weights, kp, shapes, columns)
                 if _is_obs_shape(space)
-                    k = isqrt(space[2])
-                    k > 0 && k * k == space[2] ||
-                        _fail(label, "varyingsource GP weights need a " *
-                            "nonempty square coefficient vector")
+                    k = port.shape === :square ? isqrt(space[2]) : space[2]
+                    k >= port.minimum && (port.shape !== :square || k*k == space[2]) ||
+                        _fail(label, "varyingsource $(port.label) need a " *
+                            "nonempty $(port.shape) coefficient vector")
                 end
-                trailing = trailing[5:end]
+              end
+                trailing = Any[a for (i,a) in enumerate(trailing) if i > 3 &&
+                    all(p -> p.position != i+2,CELL_FN_VECTOR_PORTS[fn])]
             end
             if (fn === :linear_pk_read_locs &&
                     length(ex.args) == CELL_FN_ARITY[fn] + 2) ||
@@ -8590,7 +8702,13 @@ function _grouped_cell_shape(ex, kp::KernelPlate, shapes::Dict{Symbol,Any},
     end
     if head === :ref
         src, idx = ex.args[1], ex.args[2]
-        srcshape = _grouped_cell_shape(src, kp, shapes, columns)
+        srcshape = if src isa Expr && src.head === :vect
+            all(a -> _grouped_cell_shape(a,kp,shapes,columns) === :scalar,src.args) ||
+                _fail(label,"literal gather entries must be scalar")
+            (:obs,length(src.args))
+        else
+            _grouped_cell_shape(src,kp,shapes,columns)
+        end
         # Response slices are leaves (structure admits the shape;
         # bind proves the space — the v1 pin).
         src isa Symbol && src in _slice_params(kp) &&
@@ -8707,11 +8825,16 @@ function _validate_grouped_gather_maps(kp::KernelPlate,
             eltype(mapv) <: Integer ||
                 _fail(kp.label, "gather map `$mapcol` must be an " *
                       "integer column, got $(eltype(mapv))")
-            if src in _lp_cell_params(kp)
-                all(1 .<= mapv .<= n_sub) ||
+            if src isa Expr
+                bound = length(src.args)
+                all(1 .<= mapv .<= bound) ||
+                    _fail(kp.label,"gather map `$mapcol` has entries outside 1..$bound (scalar vector literal)")
+            elseif src in _lp_cell_params(kp)
+                bound = _kernel_lp_axis(kp,src) === :dose ?
+                    length(columns[only(kp.schedules).dose_subj]) : n_sub
+                all(1 .<= mapv .<= bound) ||
                     _fail(kp.label, "subject map `$mapcol` has entries " *
-                          "outside 1..$n_sub (gathered `$src` is " *
-                          "per-subject — one subject id per row)")
+                          "outside 1..$bound (gathered `$src` is a kernel LP)")
             else
                 srcshape = shapes[src]
                 bound = srcshape === :reads ?
@@ -8745,12 +8868,12 @@ end
 # cell names, maps schedule maps or plain bind columns — structure
 # proved the shapes).
 function _collect_grouped_gather_uses(ex)
-    out = Tuple{Symbol,Symbol}[]
+    out = Tuple{Union{Symbol,Expr},Symbol}[]
     _collect_grouped_gather_uses!(out, ex)
     return out
 end
 
-function _collect_grouped_gather_uses!(out::Vector{Tuple{Symbol,Symbol}}, ex)
+function _collect_grouped_gather_uses!(out::Vector{Tuple{Union{Symbol,Expr},Symbol}}, ex)
     ex isa Expr || return nothing
     if ex.head === :ref && length(ex.args) == 2
         src, idx = ex.args[1], ex.args[2]
@@ -8787,7 +8910,8 @@ function _validate_tgi_axis_order(kp::KernelPlate,
     return nothing
 end
 
-_validate_tgi_axis_order(kp::KernelPlate, sched::VaryingSourcePKScheduleSpec,
+_validate_tgi_axis_order(kp::KernelPlate,
+    sched::Union{VaryingSourcePKScheduleSpec,VaryingSourcePKPDScheduleSpec},
     columns::Dict{Symbol,ColumnData}) = nothing
 
 # Grouped-kernel bind resolution: dims keys resolve `subjects` (no
@@ -8824,7 +8948,7 @@ function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
     # stay admitted — this gates only the global emptiness.
     ndose = length(columns[sched.dose_subj])
     if _cell_has_pk_call(kp.assignments)
-        (ndose > 0 || sched isa VaryingSourcePKScheduleSpec) ||
+        (ndose > 0 || sched isa Union{VaryingSourcePKScheduleSpec,VaryingSourcePKPDScheduleSpec}) ||
             _fail(kp.label, "cell calls a PK recurrence but schedule " *
                   "`$(sched.name)` binds no dose rows (bind dose data " *
                   "or drop the call)")

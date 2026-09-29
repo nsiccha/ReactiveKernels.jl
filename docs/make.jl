@@ -94,6 +94,7 @@ site_pages = [
             "SIR with environmental bacteria" => "sir.md",
             "One-compartment Michaelis–Menten" => "one-comp-mm-elim-abs.md",
             "Varying-source PK slice" => "varyingsource-pk.md",
+            "Varying-source PK/PD cell" => "varyingsource-pkpd.md",
             "Soil incubation two-pool carbon" => "soil-incubation.md",
         ],
         "Gaussian processes" => [

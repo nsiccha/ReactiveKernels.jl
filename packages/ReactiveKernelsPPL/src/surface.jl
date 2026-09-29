@@ -1254,16 +1254,17 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
     pos = Any[]
     eta = 1.0
     eta_given = false
+    centered = false
     levels = nothing
     sd_raw = nothing
     for a in call.args[2:end]
         if a isa Expr && a.head === :parameters
             for kw in a.args
                 kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where takes keywords `eta`/`levels`/`sd` only")
+                    _sfail("$where takes keywords `eta`/`levels`/`sd`/`centered` only")
                 kw.args[1] === :eta || kw.args[1] === :levels ||
-                    kw.args[1] === :sd ||
-                    _sfail("$where takes keywords `eta`/`levels`/`sd` only, got " *
+                    kw.args[1] === :sd || kw.args[1] === :centered ||
+                    _sfail("$where takes keywords `eta`/`levels`/`sd`/`centered` only, got " *
                           "`$(kw.args[1])`")
                 if kw.args[1] === :eta
                     v = kw.args[2]
@@ -1273,6 +1274,9 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
                     eta_given = true
                 elseif kw.args[1] === :sd
                     sd_raw = kw.args[2]
+                elseif kw.args[1] === :centered
+                    kw.args[2] isa Bool || _sfail("$where centered must be a Bool literal")
+                    centered = kw.args[2]
                 else
                     levels = _lower_grouping_levels(kw.args[2], where)
                 end
@@ -1344,7 +1348,12 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
     else
         :correlated
     end
-    if kind !== :correlated
+    if centered
+        mm === nothing && strata === nothing ||
+            _sfail("$where centered draws require plain grouping")
+        kind = :centered_correlated
+    end
+    if !_is_correlated_kind(kind)
         eta = NaN
     elseif !(eta > 0)
         _sfail("$where eta must be positive, got $eta")
@@ -2377,7 +2386,34 @@ end
 
 _is_schedule_decl_rhs(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
-    rhs.args[1] in (:linear_pk_schedule, :varyingsource_pk_schedule)
+    rhs.args[1] in (:linear_pk_schedule, :varyingsource_pk_schedule,
+        :varyingsource_pkpd_schedule)
+
+function _lower_varyingsource_pkpd_schedule_decl(lhs,rhs,line,data)
+    where = line > 0 ? "schedule `$lhs` (line $line)" : "schedule `$lhs`"
+    keys = Dict{Symbol,Any}()
+    for item in rhs.args[2:end]
+        kws = item isa Expr && item.head === :parameters ? item.args : [item]
+        for kw in kws
+            kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
+                _sfail("$where takes obs/dose/discretization keywords")
+            key,value = kw.args
+            key in (:obs,:dose,:discretization) ||
+                _sfail("$where unknown keyword `$key`")
+            haskey(keys,key) && _sfail("$where repeats `$key=`")
+            keys[key] = value
+        end
+    end
+    all(k -> haskey(keys,k),(:obs,:dose,:discretization)) ||
+        _sfail("$where needs obs=(subject,time,assay), dose=(subject,time,amount,treatment), and discretization=<raw lag column>")
+    obs = _schedule_column_tuple(keys[:obs],where,:obs,3,data)
+    dose = _schedule_column_tuple(keys[:dose],where,:dose,4,data)
+    disc = keys[:discretization]
+    disc = disc isa QuoteNode ? disc.value : disc
+    disc isa Symbol && disc in data ||
+        _sfail("$where discretization must name a bound raw lag column")
+    return VaryingSourcePKPDScheduleSpec(lhs,obs...,dose...,disc)
+end
 
 # `name = linear_pk_schedule(obs = (subj, time), dose = (subj, time,
 # amount), ecg = (subj, time), tgi = (subj, time))`: raw obs/dose DATA
@@ -2387,6 +2423,8 @@ _is_schedule_decl_rhs(rhs) =
 # form.
 function _lower_schedule_decl(lhs::Symbol, rhs::Expr, line::Int,
         data::Set{Symbol})
+    rhs.args[1] === :varyingsource_pkpd_schedule &&
+        return _lower_varyingsource_pkpd_schedule_decl(lhs,rhs,line,data)
     where = line > 0 ? "schedule `$lhs` (line $line)" : "schedule `$lhs`"
     varying = rhs.args[1] === :varyingsource_pk_schedule
     kws = Any[]
