@@ -182,6 +182,24 @@ end
 @inline _tensorized_hcat(args...) = hcat(_tensorized_cat_operands(args)...)
 @inline _tensorized_cat(args...; dims) =
     cat(_tensorized_cat_operands(args)...; dims = dims)
+# A scalar-vector literal (`[a, b, c]`) in a tensorized body.  The default
+# is the plain `Base.vect` construction; a tracing extension builds a real
+# traced vector when any element is traced (a host container of traced
+# scalars fails downstream — gathering it recurses without termination).
+@inline _tensorized_vect(args...) = Base.vect(args...)
+# The scalar type a literal element contributes to the promoted element
+# type.  The default reads the host type directly; a tracing backend
+# specializes it to see through its traced scalar wrapper — a
+# `TracedRNumber{Float64}`'s `typeof` is the wrapper, not `Float64`, so a
+# bare promotion would abstract the element type.
+@inline _tensorized_vect_eltype(x::Number) = typeof(x)
+# Build the traced vector from its element type: the host `vect` container
+# always builds (wrapper promotion keeps every element assignable), and the
+# broadcast conversion lifts it into the traced program — the same
+# construction a hand-written `Float64.([a, b, c])` performs, generalized
+# over `T`.
+@inline _tensorized_vect_construct(::Type{T}, args::Tuple) where {T} =
+    T.(Base.vect(args...))
 @inline _tensorized_broadcast(f, args...) =
     _tensorized_materialize(
         Base.broadcasted(f, _tensorized_cat_operands(args)...))

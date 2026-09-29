@@ -1889,20 +1889,24 @@ function _is_broadcast_operator(sym::Symbol)
     length(s) >= 2 && s[1] === '.' && Base.isoperator(Symbol(s[2:end]))
 end
 
-# Cat-family callees rewritten in the tensorized body only.  The wrappers
-# (core.jl) let a tracing backend promote untraced constant-array operands to
-# traced constants before concatenating; a callee shadowed by a graph port
+# Cat-family callees plus the scalar-vector literal constructor `vect`,
+# rewritten in the tensorized body only.  The wrappers (core.jl) let a
+# tracing backend promote untraced constant-array operands to traced
+# constants before concatenating, and `_tensorized_vect` builds a real
+# traced vector from traced scalars; a callee shadowed by a graph port
 # keeps its port meaning and is never rewritten.
 _tensorized_callee_replacement(callee::Symbol) =
     callee === :vcat ? :_tensorized_vcat :
     callee === :hcat ? :_tensorized_hcat :
     callee === :cat ? :_tensorized_cat :
+    callee === :vect ? :_tensorized_vect :
     callee === :eachcol ? :_tensorized_eachcol :
     callee === :getindex ? :_tensorized_getindex :
     callee === :dot ? :_tensorized_dot : nothing
 _tensorized_callee_replacement(callee::GlobalRef) =
     callee.mod === Base && callee.name === :eachcol ? :_tensorized_eachcol :
     callee.mod === Base && callee.name === :getindex ? :_tensorized_getindex :
+    callee.mod === Base && callee.name === :vect ? :_tensorized_vect :
     callee.name === :dot && nameof(callee.mod) === :LinearAlgebra ?
         :_tensorized_dot :
     nothing
@@ -2175,6 +2179,12 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         return Expr(:call,
             GlobalRef(@__MODULE__, ex.head === :vcat ?
                 :_tensorized_vcat : :_tensorized_hcat),
+            (_kernel_tensorized_rhs(arg, known, mod, scope) for arg in ex.args)...)
+    elseif ex.head === :vect
+        # A scalar-vector literal (`[a, b, c]`); the companion builds a
+        # real traced vector when any element is traced, and reduces to
+        # `Base.vect` otherwise.
+        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_vect),
             (_kernel_tensorized_rhs(arg, known, mod, scope) for arg in ex.args)...)
     elseif ex.head === :call && !isempty(ex.args)
         return Expr(:call,

@@ -1088,6 +1088,44 @@ end
     Reactant.@allowscalar getindex(array, indices...)
 end
 
+# The scalar type a vector-literal element contributes under tracing: the
+# wrapped type, so promotion abstracts nothing.  `ConcretePJRTNumber` is a
+# closed-over traced constant rather than a `TracedRNumber`, but carries
+# the same wrapped type.
+@inline ReactiveKernels._tensorized_vect_eltype(
+    x::Union{Reactant.TracedRNumber,Reactant.ConcretePJRTNumber}) =
+    Reactant.unwrapped_eltype(typeof(x))
+
+# A scalar-vector literal with a traced element builds a real traced
+# vector.  A host `Vector{TracedRNumber}` container fails downstream in
+# two measured ways: gathering it at a host or traced index recurses
+# without termination (`StackOverflowError`), and a typed `Float64[...]`
+# spelling fails filling a host `Vector{Float64}`
+# (`Float64(::TracedRNumber)` via `__inbounds_setindex!`).  An all-host
+# literal keeps the plain `Base.vect` construction, and an abstract
+# promoted type (unrepresentable in the backend) keeps the host container
+# rather than erroring where the host form succeeds.
+@inline function ReactiveKernels._tensorized_vect(args::Number...)
+    marker = ReactiveKernels._tensorized_cat_marker(args)
+    marker === nothing && return Base.vect(args...)
+    T = promote_type(map(ReactiveKernels._tensorized_vect_eltype, args)...)
+    isconcretetype(T) || return Base.vect(args...)
+    return ReactiveKernels._tensorized_vect_construct(T, args)
+end
+
+# A typed scalar-vector literal (`Float64[a, b, c]`, a `:ref` head with a
+# type in array position) with traced elements: the core fallback routes
+# it to `getindex(::Type{T}, ...)` which fills a host `Vector{T}` and
+# fails converting the traced elements.  Construct the traced vector at
+# the authored type instead; all-host arguments keep the exact `getindex`
+# behavior, and an abstract `T` keeps the host container.
+@inline function ReactiveKernels._tensorized_getindex(
+        ::Type{T}, args::Number...) where {T}
+    marker = ReactiveKernels._tensorized_cat_marker(args)
+    (marker === nothing || !isconcretetype(T)) && return getindex(T, args...)
+    return ReactiveKernels._tensorized_vect_construct(T, args)
+end
+
 @inline function ReactiveKernels._tensorized_setindex(
         array::Reactant.TracedRArray, value, indices...)
     Reactant.@allowscalar begin
