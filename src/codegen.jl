@@ -2530,11 +2530,19 @@ struct BorrowedBatchedKernel{K,F,C}
     caches::C
     ast::Expr
 end
+_borrowed_batch_caches(boundary) = map(_ -> Ref{Any}(nothing), boundary)
 function _borrowed_batch(target::GraphReplicatedKernel)
     ast = lower_replicated(target.plan; batched=batched_ports(target), reuse=true)
     BorrowedBatchedKernel(target, compile(ast),
-                          map(_ -> Ref{Any}(nothing), target.outputs), ast)
+                          _borrowed_batch_caches(target.outputs), ast)
 end
+
+# A new native execution instance shares the read-only computation, not the
+# buffers of an earlier call. No planning, lowering or compilation occurs.
+Base.copy(kernel::BorrowedBatchedKernel) =
+    BorrowedBatchedKernel(kernel.target, kernel.native,
+                         _borrowed_batch_caches(outputs(kernel)), kernel.ast)
+
 @inline function (kernel::BorrowedBatchedKernel)(args...)
     length(args) == length(inputs(kernel)) || throw(MethodError(kernel, args))
     _dynamic_tensorized_marker(args) === nothing || throw(ArgumentError(

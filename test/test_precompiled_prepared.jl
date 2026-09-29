@@ -28,10 +28,12 @@ using ReactiveKernels, Test
         write(joinpath(derived, "src", "ImportedPreparedConsumer.jl"), """
             module ImportedPreparedConsumer
             using ReactiveKernels
-            import PrecompiledPreparedConsumer: trajectory, HAVE
+            import PrecompiledPreparedConsumer: trajectory, HAVE, borrowed_curve
             const WAS_PRECOMPILED = ccall(:jl_generating_output, Cint, ()) != 0
             const BATCH = prepare_batched(trajectory; have = HAVE,
                 batched = :position, want = (:total, :conc))
+            const BORROWED = prepare_batched(borrowed_curve;
+                batched = :position, reuse = true)
             end
             """)
 
@@ -59,6 +61,25 @@ using ReactiveKernels, Test
             doses = [3.0, 4.0]
             args = (positions, 0.0, schedule, doses)
             expected = ([3.5 4.0; 5.0 6.0], [8.5, 10.0])
+
+            # Instantiate saved pristine/used templates BEFORE any post-load
+            # preparation. Copy must reuse the image-owned executable body.
+            for template in (C.BORROWED, C.USED_BORROWED,
+                             ImportedPreparedConsumer.BORROWED)
+                instance = copy(template)
+                @test instance.target.native === template.target.native
+                @test instance.target.target === template.target.target
+                @test code_expr(instance) === code_expr(template)
+                @test all(slot[] === nothing for slot in instance.target.caches)
+                first = instance([2.0, 3.0], [4.0, 5.0])
+                @test first == (curve=[8.0 12.0; 10.0 15.0], total=[18.0, 27.0])
+                published = deepcopy(first)
+                @test copy(instance)([2.0, 3.0], [4.0, 5.0]; amount=2.0) ==
+                    (curve=2 .* published.curve, total=2 .* published.total)
+                @test first == published
+            end
+            @test C.BORROWED_WARMUP ==
+                (curve=[6.0 12.0; 8.0 16.0], total=[14.0, 28.0])
 
             # Call every saved object before constructing anything after load.
             # Re-preparing first would silently repopulate the missing bodies.
