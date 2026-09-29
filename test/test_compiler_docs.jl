@@ -148,6 +148,10 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "lotka-volterra.md",
         "one-comp-mm-elim-abs.md",
         "soil-incubation.md",
+        # These PK model pages likewise own their native gradient support and
+        # explicit rejection of compiled execution.
+        "varyingsource-pk.md",
+        "varyingsource-pkpd.md",
     ))
     forbidden_ad_prose = (
         "DifferentiationInterface",
