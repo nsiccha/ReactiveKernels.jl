@@ -73,6 +73,7 @@ end
         end
         @test first.signature === template.signature
         @test second.signature === template.signature
+        @test_throws ArgumentError first(positions, data; unknown=1.0)
         @test raw(first).caches[1] !== raw(second).caches[1]
         @test raw(first).caches[1] !== raw(template).caches[1]
 
@@ -146,6 +147,17 @@ end
     @test result == original
     @test detached !== result
     @test raw(instance).native === raw(template).native
+
+    # Bound inputs belong to the shared, read-only scalar computation.
+    bound_data = [2.0, 4.0]
+    bound = vectorize(prepare(instance_graph; have=(:position, :data, :amount),
+                             want=:result, bound=(data=bound_data,));
+                      batched=:position, reuse=true)
+    bound_copy = copy(bound)
+    @test bound_copy.target === bound.target
+    @test bound_copy.native === bound.native
+    @test bound_copy([1.0, 2.0], 0.5) == owned([1.0, 2.0], bound_data; amount=0.5)
+    @test bound_data == [2.0, 4.0]
 end
 
 @testset "borrowed records and input aliases" begin
