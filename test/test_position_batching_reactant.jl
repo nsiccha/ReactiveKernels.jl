@@ -153,3 +153,5 @@ end
     # zero-sized outputs remain the upstream tensor.empty export gap (#12).
     @test batch(zeros(2, 0), 0.5) == Float64[]
 end
+
+include("test_position_batching_allocation_slices_reactant.jl")
