@@ -79,7 +79,75 @@ On managed compute hosts, hold one compute token across the build and run.
 The requested full-data Mac benchmark remains separate from this synthetic
 comparison. See [the consumer contract](../../docs/src/varyingsource-pkpd.md).
 
-## Measured results
+## Primal-only output selection, 2026-09-29
+
+`primal.jl` runs the same six posterior points without loading Enzyme. It
+checks the coordinate map, complete density and likelihood against the original
+Stan binaries at all three tolerances. Schedule construction, binding and query
+preparation precede the timed evaluations. Each measured call computes the full
+unconstrained log density, including constants and transform Jacobians.
+
+```sh
+julia --startup-file=no --threads=1 --project=/path/to/consumer-env \
+  benchmark/varyingsource_pkpd/primal.jl /path/to/ReactiveKernels.jl \
+  /path/to/scratch/build /path/to/primal-results.tsv
+```
+
+The baseline is `475afe61`, published in `3cdba95c`; the new source is
+`eaeef55d`. The new mathematical rule offers a value-only recipe and a joint
+value/partials recipe. Generic rule lowering accepts both, allowing the planner
+to select the value-only recipe for ordinary evaluation. No posterior-specific
+optimizer or cache was added. The same-process primitive comparison and
+operation-count regressions are documented in
+[the transit benchmark](../transit_twocmt/README.md).
+
+Full-posterior median microseconds on strato2:
+
+| Subjects | Point | Baseline RK primal | New RK primal | Baseline / new | Production Stan in new run |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 | 1 | 93.059 | 79.095 | 1.18× | 456.293 |
+| 3 | 2 | 70.261 | 52.584 | 1.34× | 408.091 |
+| 3 | 3 | 64.087 | 46.997 | 1.36× | 252.770 |
+| 30 | 1 | 397.857 | 273.266 | 1.46× | 3608.468 |
+| 30 | 2 | 400.797 | 274.752 | 1.46× | 3710.373 |
+| 30 | 3 | 398.910 | 275.001 | 1.45× | 2194.743 |
+
+These before/after full-model timings are separate runs on a shared host;
+the same-process paired primitive benchmark is the stronger attribution check.
+Both full-model runs used ten warmups and sixty shuffled five-call samples,
+one Julia/BLAS thread, Julia 1.10.11 and the same Stan binaries as below. Baseline
+`TFqMQ8` exited 0 in 259 seconds; new run `cj5q9H` exited 0 in 246 seconds.
+No Enzyme module was loaded in either run. All 24 old/new exported density values
+and coordinate vectors are identical. New Julia allocations are 92,384 bytes
+at 3 subjects and 193,296 at 30, down from 99,488 and 264,336. Stan's Julia
+allocation counter excludes its C++ heap.
+
+The [baseline table](primal-baseline-strato2-20260929.tsv) and
+[new table](primal-joint-strato2-20260929.tsv) include medians, IQRs,
+coordinates and density errors. Exact exits are in the
+[baseline receipt](receipt-primal-baseline-strato2-20260929.txt) and
+[new receipt](receipt-primal-joint-strato2-20260929.txt). The new driver differs
+from the executed scratch driver only in its usage-message filename.
+
+This removes derivative-only work from the primitive primal. It does not infer
+the internals of opaque functions or move shared GP preparation out of the
+posterior's subject loop. Those shared-work improvements remain separate from
+this output-selection change. Bruno's app uses its own mathematical graph and
+workload; its preparation-inclusive results are a separate acceptance check.
+
+The unchanged full-gradient driver also passed at `eaeef55d`: run `3Bgath`
+exited 0 in 386 seconds. All twelve exported coordinate vectors, gradients,
+reference gradients and densities are identical to the original gradient run.
+All six RK cases retain the accuracy-matched verdict. Julia allocations remain
+258,128/703,792 bytes at 3/30 subjects. Current RK medians are
+274.84/312.34/256.10 μs at 3 subjects and 1713.78/1667.54/1344.21 μs at 30.
+Stan's timings also changed between runs, so these are regression receipts,
+not evidence for a gradient speedup from this change. See
+[the new gradient table](gradients-joint-strato2-20260929.tsv),
+[exact receipt](receipt-gradients-joint-strato2-20260929.txt), and
+[artifact/source hashes](joint-validation.json).
+
+## Original gradient results
 
 The complete run exited 0 in 402 seconds at 2026-09-29T01:32:50Z on strato2
 (AMD EPYC-Milan / Julia `znver3`). Julia 1.10.11, Enzyme 0.13.205,

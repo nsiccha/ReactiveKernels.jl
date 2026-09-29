@@ -46,8 +46,8 @@ function Base.show(io::IO, ::ScalarDerivativeRule{Name,N,Inputs}) where {Name,N,
 end
 
 # A cut body is `(signature_names, ((output, op_index, (arguments...)), ...),
-# return_spec)`; every element is a Symbol, an Int, or a numeric literal, so
-# the whole body is a valid type parameter.
+# return_spec)`; an output is a Symbol or a tuple of Symbols for a joint
+# recipe. Every element is type-parameter-safe data, including destructuring.
 function _rule_body_expr(spec, ops_expr; tuple_return::Bool = false)
     _rule_body_expr_mapped(spec, ops_expr; tuple_return)[1]
 end
@@ -74,7 +74,9 @@ function _rule_body_expr_mapped(spec, ops_expr; tuple_return::Bool = false)
         call_arguments = map(arguments) do argument
             argument isa Symbol ? localname(argument) : argument
         end
-        push!(statements, Expr(:(=), localname(output),
+        lhs = output isa Symbol ? localname(output) :
+            Expr(:tuple, map(localname, output)...)
+        push!(statements, Expr(:(=), lhs,
             Expr(:call, Expr(:ref, ops_local, op), call_arguments...)))
     end
     if ret isa Symbol
@@ -248,8 +250,17 @@ function _encode_cut_body(ast::Expr, name::Symbol)
             continue
         end
         ret === nothing || unsupported("a statement after the return")
-        (statement isa Expr && statement.head === :(=) && statement.args[1] isa Symbol) ||
+        (statement isa Expr && statement.head === :(=)) ||
             unsupported("the statement $(statement)")
+        lhs = statement.args[1]
+        output = if lhs isa Symbol
+            lhs
+        elseif lhs isa Expr && lhs.head === :tuple &&
+                !isempty(lhs.args) && all(x -> x isa Symbol, lhs.args)
+            Tuple(lhs.args)
+        else
+            unsupported("the assignment target $(lhs)")
+        end
         call = statement.args[2]
         (call isa Expr && call.head === :call && call.args[1] isa Expr &&
          call.args[1].head === :ref && call.args[1].args[1] === _OPS_ARG &&
@@ -258,7 +269,7 @@ function _encode_cut_body(ast::Expr, name::Symbol)
             (arg isa Symbol || arg isa Number) && return arg
             unsupported("the call argument $(arg)")
         end
-        push!(body, (statement.args[1], call.args[1].args[2], Tuple(arguments)))
+        push!(body, (output, call.args[1].args[2], Tuple(arguments)))
     end
     ret === nothing && unsupported("no return statement")
     (Tuple(names), Tuple(body), ret)
@@ -604,7 +615,10 @@ function _reverse_frontier(cut_spec, covector::Symbol, inputs)
         push!(read, name)
     for (output, _, arguments) in body
         any(a -> a isa Symbol && a in dependent, arguments) || continue
-        push!(dependent, output)
+        # Every result of a joint recipe depends on the recipe's arguments.
+        # Record the names separately so none becomes a false residual that
+        # preparation tries to compute before the covector is available.
+        union!(dependent, output isa Symbol ? (output,) : output)
         foreach(note!, arguments)
     end
     foreach(note!, ret isa Symbol ? (ret,) : ret)

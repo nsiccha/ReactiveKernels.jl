@@ -1,7 +1,9 @@
 # One mathematical graph for the unit response and its parameter/lag partials.
 # The series accumulate analytic partials alongside their values; reverse mode
 # contracts these retained partials and never differentiates a series loop.
-# The ordinary path uses exactly the same recurrence with partials pruned.
+# The graph offers a values-only recipe and a joint values/partials recipe.
+# Planning selects the former for ordinary calls and the latter for reverse
+# staging, so values are not recomputed when the partials are needed.
 
 import SpecialFunctions: digamma
 
@@ -129,13 +131,21 @@ function _transit_response_partials(ts, p, rtol, watson_terms)
     return amounts, jac, dt
 end
 
+function _transit_response_values(ts, p, rtol, watson_terms)
+    length(p) == 5 || throw(DimensionMismatch("transit parameters need five entries"))
+    return transit_twocmt_unit_response(ts, p[1], p[2], p[3], p[4], p[5];
+        series_rtol = rtol, watson_terms)
+end
+
 """
     prepare_transit_twocmt_rule(; series_rtol=1e-15, watson_terms=8)
 
 Prepare a generated reverse rule for the unit response. The returned callable
 accepts `(ts, p)`, where `p` is `[k10, k12, k21, rate, shape]`.
-One mathematical graph retains analytic parameter/lag partials; reverse
-execution contracts those residuals. Numerical controls are bound before
+One mathematical graph offers the response alone or jointly with analytic
+parameter/lag partials. Ordinary calls select the values-only recipe; reverse
+staging selects the joint recipe once and contracts its retained residuals.
+Numerical controls are bound before
 rule generation and carry no derivative. The series retain runtime loops
 and lazy regime selection. Accuracy is validated for `shape ∈ [1, 8]`.
 """
@@ -144,10 +154,9 @@ function prepare_transit_twocmt_rule(; series_rtol::Float64 = 1e-15,
     _transit_check_accuracy(series_rtol, watson_terms)
     @kernel transit_twocmt_graph(ts::Vector{Float64}, p::Vector{Float64},
             amounts_bar::Vector{Float64}) = begin
-        solution = _transit_response_partials(ts, p, series_rtol, watson_terms)
-        amounts::Vector{Float64} = solution[1]
-        jac::Matrix{Float64} = solution[2]
-        dt::Vector{Float64} = solution[3]
+        amounts::Vector{Float64} = _transit_response_values(ts, p, series_rtol, watson_terms)
+        (amounts, jac::Matrix{Float64}, dt::Vector{Float64}) =
+            _transit_response_partials(ts, p, series_rtol, watson_terms)
         ts_bar::Vector{Float64} = dt .* amounts_bar
         p_bar::Vector{Float64} = transpose(jac) * amounts_bar
         return amounts, ts_bar, p_bar
