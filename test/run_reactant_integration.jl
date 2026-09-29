@@ -76,6 +76,12 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mutation_profile_b_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $sum_to_zero_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ppl_examples_testfile`)
+    elseif selector == "reactant"
+        # The monolithic `test_reactant.jl` entrypoint selects inner suites
+        # from its own `ARGS`; forward ours so one group runs per process,
+        # e.g. `RK_REACTANT_TESTSET=reactant julia
+        # test/run_reactant_integration.jl core pathfinder`.
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $testfile $ARGS`)
     elseif selector == "brm-hsgp"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $(joinpath(root, "test", "test_brm_hsgp_reactant.jl"))`)
     elseif selector == "inner-partial-evaluation"

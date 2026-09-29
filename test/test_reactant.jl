@@ -10,8 +10,19 @@ import LambertW
 import TOML
 import Reactant: @compile, @jit
 
-include("test_authored_plate_chains_reactant.jl")
-include("test_ref_array_plate_reactant.jl")
+include("reactant_suite_selector.jl")
+
+# Suite gate: with no `ARGS` selector every suite below runs (the historical
+# full behavior); otherwise only the selected suites run, in suite order.
+# Global setup (imports, fixtures, kernels) always runs.
+const _SELECTED_REACTANT_SUITES = _select_reactant_suites(ARGS)
+
+if "plate-chains" in _SELECTED_REACTANT_SUITES
+    include("test_authored_plate_chains_reactant.jl")
+end
+if "ref-array-plate" in _SELECTED_REACTANT_SUITES
+    include("test_ref_array_plate_reactant.jl")
+end
 
 module _ReactantStatefulFix
 include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
@@ -307,6 +318,9 @@ end
     density::Float64 = sum(q .* data)
 end
 
+# Suite gate: the core testset keeps its historical indentation so this gate
+# reads as a two-line diff instead of an 850-line re-indent.
+if "core" in _SELECTED_REACTANT_SUITES
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
 
@@ -1165,10 +1179,23 @@ end
         @test gradient[3] ≈ reference_σ
     end
 end
+end
 
-include("test_nutpie_reactant.jl")
-include("test_reactivehmc_statistics_reactant.jl")
-include("test_reactivehmc_hmc_reactant.jl")
-include("test_finite_structural_container_reactant.jl")
-include("test_kernel_nuts_reactant.jl")
-include("test_pathfinder_reactant.jl")
+if "nutpie" in _SELECTED_REACTANT_SUITES
+    include("test_nutpie_reactant.jl")
+end
+if "reactivehmc-statistics" in _SELECTED_REACTANT_SUITES
+    include("test_reactivehmc_statistics_reactant.jl")
+end
+if "reactivehmc-hmc" in _SELECTED_REACTANT_SUITES
+    include("test_reactivehmc_hmc_reactant.jl")
+end
+if "finite-structural-container" in _SELECTED_REACTANT_SUITES
+    include("test_finite_structural_container_reactant.jl")
+end
+if "kernel-nuts" in _SELECTED_REACTANT_SUITES
+    include("test_kernel_nuts_reactant.jl")
+end
+if "pathfinder" in _SELECTED_REACTANT_SUITES
+    include("test_pathfinder_reactant.jl")
+end
