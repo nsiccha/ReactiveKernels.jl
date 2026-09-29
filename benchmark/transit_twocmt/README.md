@@ -1,5 +1,59 @@
 # Two-compartment transit reverse-gradient comparison
 
+## Reactant primal component, 2026-09-29
+
+`transit_twocmt_rule(ts, p)` now compiles its values-only mathematical cut
+with live lag and parameter arrays on Reactant 0.2.289's CPU backend. The
+native and compiled paths share each recurrence update. The compiled path
+retains the lag loop and capped series loops; after convergence it lazily
+freezes the carry. The zero-lag, rationalized disposition and numerical
+regime branches also remain lazy.
+
+The focused fixture `packages/ReactiveKernelsPPL/test/test_transit_twocmt_reactant.jl`
+passed 32 assertions in a run that exited 0 in 104 seconds. It checks 7/29
+lags, reuse of each executable with changed times and parameters, both
+disposition arms, shape one, empty lags, bound accuracy controls, and input
+immutability. The earlier numerical probe measured a maximum absolute
+native/compiled difference of `4.44e-16`. Both lag sizes retain seven
+`stablehlo.while` and thirteen `stablehlo.if` operations, with HLO sizes
+26,215 and 26,375 bytes. These are structure and parity checks, not timings.
+
+The native regression run exited 0 in 129 seconds: 206 independent
+quadrature assertions, three ordinary Enzyme gradient assertions, two
+vector-response assertions, four values-only allocation assertions, 77
+generated-rule assertions and four accuracy-control assertions. Both
+seeded MutatingFunctions extensions and the RK Reactant extension loaded.
+The run used Julia 1.10.11, Enzyme 0.13.205 and one Julia/BLAS thread.
+Receipts and source hashes are in `receipt-reactant-primal-strato2-20260929.txt`.
+
+Reproduce the compiled fixture in an environment containing this worktree's
+RK and ReactiveKernelsPPL packages and Reactant:
+
+```sh
+julia --startup-file=no --threads=1 --project=/path/to/consumer-env -e \
+  'using Reactant; Reactant.set_default_backend("cpu"); include("packages/ReactiveKernelsPPL/test/test_transit_twocmt_reactant.jl")'
+```
+
+Managed hosts wrap this command in their compute-token and compact-runner
+helpers. This component result does not establish compiled reverse mode or
+acceptance of the complete PKPD log density. The native-only PK/PD reader,
+ordered-dose and centered-prior guards remain in force.
+
+## Application unit-response acceptance, 2026-09-29
+
+The same transit runtime also passes the actual ShinyRK unit-response graph
+cut on ARM64 CPU with Reactant 0.2.289. Lattice and exact schedules use 97 and
+247 lags with three live PK positions. Both native references and each reused
+compiled executable pass first/changed-input parity and ownership checks.
+The full StableHLO operation histogram is unchanged between the two lag sizes
+at each optimization phase, with 15 retained loops in both preoptimization
+and default HLO. The application runner's 139 native checks also pass.
+
+The exact source pins, artifact hashes, tolerances and limits are in
+[the application receipt](receipt-app-unit-primal-mac-20260929.md). This is the
+unit-response cut only: dose superposition, the complete application graph,
+full PKPD density and compiled reverse remain separate acceptance gates.
+
 ## Primal selection and shared reverse work, 2026-09-29
 
 `primal.jl` compares the earlier tuple-projection rule graph with the same

@@ -1,0 +1,71 @@
+Standalone transit primal acceptance, strato2, 2026-09-29
+Base/source integration HEAD: e28c4af914d5d8ac270729f28f40b6ae1df8bca7
+Working delta: generic retained transit recurrence and focused compiled fixture.
+Julia 1.10.11; Reactant 0.2.289; ReactantCore 0.1.23; Reactant_jll 0.0.413+0;
+Enzyme 0.13.205; Enzyme_jll 0.0.294+0; DifferentiationInterface 0.7.21;
+MutatingFunctions 0.1.0 from the seeded kb-extdep mirror; CPU backend;
+one Julia/precompile/BLAS thread; default depot; no flags disabling images.
+Ordinary native reverse only. Whole PKPD log density and compiled reverse unmeasured.
+Numerical probe max absolute delta 4.440892098500626e-16 at 7 and 29 lags.
+Final compiled fixture verifies changed times, changed parameters, empty lags,
+accuracy controls and input immutability (32 assertions).
+Final HLO: 7 while / 13 if regions; 26215 bytes (7), 26375 bytes (29).
+Native regression: 206+3+2+4+77+4 = 296 assertions and actual extension loads.
+Source SHA256:
+9b8f4a78575718ea7b486ef14e8381e22f3c8e21d3b5645d7aba9bb4501d006d  packages/ReactiveKernelsPPL/src/transit_twocmt.jl
+8c8f82a80ef6eb360447cfeb295bda5a2d155e3cbbb285b64de90cb7a8d0150e  packages/ReactiveKernelsPPL/src/transit_twocmt_rule.jl
+63934c53ec84c66aeb1af71fc761033f982f5b84e0e8698e5ad74627701b1385  packages/ReactiveKernelsPPL/test/test_transit_twocmt_reactant.jl
+6f01f1694e7646373bcc69267471bd0fc067247315a41b675fff6c5acaf0f1ee  acceptance-env/Project.toml
+f1bd24633a6a874a8d428707e26412965a5702f8c5ddcdd3c47722c24f80e35a  acceptance-env/Manifest.toml
+
+Native receipt:
+
+[kb-run-compact] pid=20 pgid=20 argv=timeout 2400 kb-acquire-compute-token -- timeout 1200 julia --startup-file=no --project=/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/reactant-audit-env /home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/transit_native_checks.jl /home/n/.local/state/kb-agents-worktrees/ReactiveKernels-brm-pkpd-reactant-audit started=2026-09-29T09:26:12Z log=/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/transit-native-checks.log
+queue position: 0 waiter(s) ahead of you
+TOKEN_ACQUIRED tok3 (queue)
+MEM_OK mem_avail_kb=17843124 floor_kb=10165373 holders=2 reserve_kb=2623322
+   Resolving package versions...
+    Updating `~/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/reactant-audit-env/Project.toml`
+  [8a4c2d94] + MutatingFunctions v0.1.0 `~/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/MutatingFunctions`
+    Updating `~/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/reactant-audit-env/Manifest.toml`
+  [8a4c2d94] + MutatingFunctions v0.1.0 `~/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/MutatingFunctions`
+PHASE_GATE name=extension-load-and-native-transit tok=3
+MEM_OK mem_avail_kb=15594696 floor_kb=10165373 holders=2 reserve_kb=2623322
+PHASE_OK name=extension-load-and-native-transit
+SEEDED_EXTENSIONS_LOADED
+PHASE_GATE name=native-transit-quadrature-and-reverse tok=3
+MEM_OK mem_avail_kb=15297560 floor_kb=10165373 holders=2 reserve_kb=2623322
+PHASE_OK name=native-transit-quadrature-and-reverse
+Test Summary:                                   | Pass  Total  Time
+transit twocmt closed form vs quadrature oracle |  206    206  9.6s
+Test Summary:                                        | Pass  Total     Time
+transit twocmt Enzyme gradient vs finite differences |    3      3  1m04.2s
+Test Summary:                                 | Pass  Total  Time
+transit twocmt vector response matches scalar |    2      2  0.1s
+Test Summary:                                           | Pass  Total  Time
+transit primal selects values without derivative arrays |    4      4  0.0s
+Test Summary:                  | Pass  Total   Time
+transit generated reverse rule |   77     77  10.0s
+Test Summary:                      | Pass  Total  Time
+transit explicit accuracy controls |    4      4  1.0s
+NATIVE_TRANSIT_CHECKS_FINISHED
+[kb-run-compact] exit=0 elapsed=129s ended=2026-09-29T09:28:21Z log=/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/transit-native-checks.log
+
+Compiled receipt:
+
+[kb-run-compact] pid=20 pgid=20 argv=timeout 1800 kb-acquire-compute-token -- timeout 900 julia --startup-file=no --project=/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/reactant-audit-env /home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/transit_reactant_checks.jl /home/n/.local/state/kb-agents-worktrees/ReactiveKernels-brm-pkpd-reactant-audit /home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/transit-reactant-check-results started=2026-09-29T09:34:16Z log=/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/transit-reactant-checks.log
+queue position: 0 waiter(s) ahead of you
+TOKEN_ACQUIRED tok3 (queue)
+MEM_OK mem_avail_kb=17419732 floor_kb=10165373 holders=2 reserve_kb=2623322
+PHASE_GATE name=transit-reactant-regressions tok=3
+MEM_OK mem_avail_kb=16542760 floor_kb=10165373 holders=2 reserve_kb=2623322
+PHASE_OK name=transit-reactant-regressions
+Test Summary:                                          | Pass  Total     Time
+transit Reactant primal retains loops and lazy regimes |   28     28  1m00.8s
+Test Summary:                                              | Pass  Total  Time
+transit Reactant empty lags and explicit accuracy controls |    4      4  6.8s
+PHASE_GATE name=transit-hlo-evidence tok=3
+MEM_OK mem_avail_kb=16516836 floor_kb=10165373 holders=2 reserve_kb=2623322
+PHASE_OK name=transit-hlo-evidence
+TRANSIT_REACTANT_REGRESSIONS_FINISHED Dict{String, Any}("29" => Dict("branches" => 13, "hlo_bytes" => 26375, "whiles" => 7), "7" => Dict("branches" => 13, "hlo_bytes" => 26215, "whiles" => 7))
+[kb-run-compact] exit=0 elapsed=104s ended=2026-09-29T09:36:00Z log=/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-reactant-audit/transit-reactant-checks.log

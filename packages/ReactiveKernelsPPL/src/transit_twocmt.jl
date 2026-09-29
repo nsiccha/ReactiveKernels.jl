@@ -67,21 +67,21 @@ end
 # Two-exponential disposition of the twocmt matrix: slow/fast rates
 # `(α, β)` plus the convex weights `(C1, C2)`. The numerators are
 # rationalized against the sign of `D0` (see the file header).
-function _twocmt_disposition(k10::Float64, k12::Float64, k21::Float64)
+function _twocmt_disposition(k10, k12, k21)
     D0 = k10 + k12 - k21
     disc = sqrt(D0 * D0 + 4.0 * k12 * k21)
     half_trace = 0.5 * (k10 + k12 + k21)
     β = half_trace + 0.5 * disc
     α = k10 * (k21 / β)
-    if D0 <= 0.0
-        N1 = 0.5 * (disc - D0)
-        M2 = (2.0 * k12 * k21) / (disc - D0)
-    else
-        N1 = (2.0 * k12 * k21) / (disc + D0)
-        M2 = 0.5 * (disc + D0)
-    end
+    N1, M2 = ReactiveKernels._recurrence_branch(D0 <= 0.0,
+        _twocmt_weights_low, _twocmt_weights_high, (disc, D0, k12, k21))
     return α, β, N1 / disc, M2 / disc
 end
+
+_twocmt_weights_low(disc, D0, k12, k21) =
+    (0.5 * (disc - D0), (2.0 * k12 * k21) / (disc - D0))
+_twocmt_weights_high(disc, D0, k12, k21) =
+    ((2.0 * k12 * k21) / (disc + D0), 0.5 * (disc + D0))
 
 # `Σ_{n≥0} w^n/((s+n)*n!)`: the `S` series, from expanding `e^(-μu)` and
 # integrating termwise (`S = t^s` times this sum). Verified by
@@ -131,8 +131,8 @@ end
 
 # One disposition-mode convolution `I(λ,t)` (see the file header).
 # `s_log_r = s*log(r)` and `lgs = lgamma(s)` are hoisted by the caller.
-function _transit_mode_I(λ::Float64, t::Float64, rate::Float64,
-        shape::Float64, s_log_r::Float64, lgs::Float64,
+function _transit_mode_I(λ, t, rate,
+        shape, s_log_r, lgs,
         rtol::Float64 = 1e-15, watson_terms::Int = _TRANSIT_WATSON_TERMS)
     return first(_transit_mode_math(λ, t, rate, shape, s_log_r, lgs, 0.0,
         rtol, watson_terms, Val(false)))
@@ -144,11 +144,12 @@ end
 Central-compartment amount at lag `t ≥ 0` for a unit dose at `t = 0` under
 the twocmt + Gamma-transit dynamics — the exact closed form of the
 varyingsource unit solve. All arguments are positive constants with
-`shape ≥ 1` (`shape = 1 + rate*mode` in StanBlocks `params`). Plain Julia,
-convergence-capped loops: Enzyme reverses through it natively.
+`shape ≥ 1` (`shape = 1 + rate*mode` in StanBlocks `params`). Native Enzyme
+reverses through the convergence-capped loops. Reactant primal execution
+retains those loops and the lazy numerical regimes.
 """
-function transit_twocmt_unit(t::Float64, k10::Float64, k12::Float64,
-        k21::Float64, rate::Float64, shape::Float64;
+function transit_twocmt_unit(t, k10, k12,
+        k21, rate, shape;
         series_rtol::Float64 = 1e-15, watson_terms::Int = _TRANSIT_WATSON_TERMS)
     _transit_check_accuracy(series_rtol, watson_terms)
     α, β, C1, C2 = _twocmt_disposition(k10, k12, k21)
@@ -163,17 +164,26 @@ end
     transit_twocmt_unit_response(ts, k10, k12, k21, rate, shape) -> Vector{Float64}
 
 [`transit_twocmt_unit`](@ref) over a lag grid (the `unique_dts` column of
-one unit solve). Plain loop over the scalar primitive.
+one unit solve). Native execution uses an ordinary loop; Reactant primal
+execution retains the lag loop and writes a fresh response buffer.
 """
-function transit_twocmt_unit_response(ts::AbstractVector, k10::Float64,
-        k12::Float64, k21::Float64, rate::Float64, shape::Float64;
+function transit_twocmt_unit_response(ts::AbstractVector, k10,
+        k12, k21, rate, shape;
         series_rtol::Float64 = 1e-15, watson_terms::Int = _TRANSIT_WATSON_TERMS)
     _transit_check_accuracy(series_rtol, watson_terms)
     n = length(ts)
-    out = Vector{Float64}(undef, n)
     α, β, C1, C2 = _twocmt_disposition(k10, k12, k21)
     s_log_r = shape * log(rate)
     lgs = DistributionKernelSources.loggamma(shape)
+    marker = ReactiveKernels._dynamic_tensorized_marker((ts, k10, k12,
+        k21, rate, shape))
+    if marker !== nothing
+        step = _TransitResponseStep(series_rtol, watson_terms)
+        return ReactiveKernels._rectangular_fold(step, zeros(Float64, n),
+            (collect(eachindex(ts)), ts),
+            (α, β, C1, C2, rate, shape, s_log_r, lgs), marker)
+    end
+    out = Vector{Float64}(undef, n)
     for i in eachindex(ts)
         t = Float64(ts[i])
         Iα = _transit_mode_I(α, t, rate, shape, s_log_r, lgs, series_rtol, watson_terms)
@@ -181,4 +191,19 @@ function transit_twocmt_unit_response(ts::AbstractVector, k10::Float64,
         out[i] = C1 * Iα + C2 * Iβ
     end
     return out
+end
+
+struct _TransitResponseStep
+    rtol::Float64
+    watson_terms::Int
+end
+
+function (step::_TransitResponseStep)(out, row, α, β, C1, C2,
+        rate, shape, s_log_r, lgs)
+    i, t = row
+    Iα = _transit_mode_I(α, t, rate, shape, s_log_r, lgs,
+        step.rtol, step.watson_terms)
+    Iβ = _transit_mode_I(β, t, rate, shape, s_log_r, lgs,
+        step.rtol, step.watson_terms)
+    ReactiveKernels._tensorized_setindex(out, C1 * Iα + C2 * Iβ, i)
 end
