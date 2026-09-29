@@ -592,7 +592,7 @@ function ReactiveKernels._replicated_backend_call(
     names = Tuple(k.inputs[index].name for index in B)
     fallback = ReactiveKernels._replica(k.target, names)
     ReactiveKernels._replica_call(
-        fallback, args, getfield(args, first(B)))
+        fallback, args, ReactiveKernels._dynamic_tensorized_marker(args))
 end
 
 # The batched AD wrapper is immutable compiler metadata for the same reason:
@@ -1539,86 +1539,73 @@ end
     f.tensorized(ops, args...)
 end
 
-# Callable passed to Reactant's batch primitive. It captures only shared
-# arguments; replicated tensors arrive as per-replica slices, avoiding both
-# scalar indexing and accidentally broadcasting the full batched operands as
-# closure state.
-struct _ReplicaScalarCall{B,BT,N,K,S}
-    target::K
-    shared::S
-end
+# Position counts are data, including when a shape is known during tracing.
+# Enzyme's batch lowering expands position-dependent branches and hoists their
+# arithmetic out of the branches. Retain a runtime loop instead, with one
+# scalar call per position and explicit stacked output buffers.
+_replica_loop_operand(arg::AbstractArray) = _reactant_plate_operand(arg)
+_replica_loop_operand(arg::Union{Tuple,NamedTuple}) = map(_replica_loop_operand, arg)
+_replica_loop_operand(arg) = arg
+_replica_loop_slice(arg::AbstractArray, index) = _rk_reactant_slot_read(arg, index)
+_replica_loop_slice(arg::Union{Tuple,NamedTuple}, index) =
+    map(value -> _replica_loop_slice(value, index), arg)
 
-@inline _replica_scalar_arg(arg, ::Type{T}) where {T<:Number} = arg[]
-@inline _replica_scalar_arg(arg, ::Type{T}) where {T<:AbstractArray} = arg
+# The backend unrolls small constant while bounds by default. A position count
+# comes from data shape, so keep that bound opaque to constant-loop unrolling.
+_replica_loop_limit(count) = only(Reactant.Ops.optimization_barrier(
+    Reactant.Ops.constant(Int64(count))))
 
-@generated function (call::_ReplicaScalarCall{B,BT,N})(batched_args...) where
-        {B,BT,N}
-    batched_lookup = Dict(index => position for (position, index) in enumerate(B))
-    shared_index = 0
-    values = Any[]
-    for index in 1:N
-        if haskey(batched_lookup, index)
-            position = batched_lookup[index]
-            push!(values, :(_replica_scalar_arg(
-                getfield(batched_args, $position), $(BT.parameters[position]))))
-        else
-            shared_index += 1
-            push!(values, :(getfield(getfield(call, :shared), $shared_index)))
-        end
+function _replica_loop_args(::Val{B}, args, index) where {B}
+    ntuple(length(args)) do position
+        arg = getfield(args, position)
+        position in B ? _replica_loop_slice(arg, index) : arg
     end
-    :(getfield(call, :target)($(values...)))
 end
 
-
-@inline function _replica_to_leading(arg)
-    rank = ndims(arg)
-    rank == 1 && return arg
-    permutation = (rank, ntuple(identity, rank - 1)...)
-    permutedims(arg, permutation)
+_replica_loop_buffers(value::Union{Tuple,NamedTuple}, count) =
+    map(item -> _replica_loop_buffers(item, count), value)
+function _replica_loop_buffers(value::Union{Number,AbstractArray}, count)
+    T = Reactant.unwrapped_eltype(value)
+    zero_value = Reactant.promote_to(Reactant.TracedRNumber{T}, zero(T))
+    # Each buffer is its own tracer object; a shared zero constant must not
+    # become aliased loop carry. Fill emits one operation for every capacity.
+    copy(Reactant.Ops.fill(zero_value, Int64[size(value)..., count]))
 end
-
-@inline function _replica_to_trailing(arg, ::Type{T}) where {T}
-    rank = ReactiveKernels._replica_rank(T)
-    rank == 0 && return arg
-    permutation = (ntuple(index -> index + 1, rank)..., 1)
-    permutedims(arg, permutation)
-end
-
-@generated function _replica_shared(::Val{B}, args::A) where {B,A}
-    values = Any[:(getfield(args, $index)) for index in 1:length(A.parameters)
-                 if !(index in B)]
-    Expr(:tuple, values...)
-end
+_replica_loop_write(buffers::Union{Tuple,NamedTuple}, values, index) =
+    map((buffer, value) -> _replica_loop_write(buffer, value, index), buffers, values)
+_replica_loop_write(buffer, value::Number, index) =
+    _rk_reactant_slot_write(buffer, Reactant.promote_to(Reactant.TracedRNumber, value), index)
+_replica_loop_write(buffer, value::AbstractArray, index) =
+    _rk_reactant_slot_write(buffer, _reactant_plate_operand(value), index)
 
 function ReactiveKernels._replica_call(
         k::ReactiveKernels.ReplicatedKernel{B,BT,OT}, args,
-        marker::Reactant.RArray) where {B,BT,OT}
-    replica_count = size(marker, ndims(marker))
-    batched_inputs = Reactant.TracedRArray[]
-    for index in B
+        marker::Union{Reactant.RArray,Reactant.TracedRNumber}) where {B,BT,OT}
+    replica_count = ReactiveKernels._replicated_validate_axes(args, Val(B), BT)
+    replica_inputs = ntuple(length(args)) do index
         arg = getfield(args, index)
-        expected_rank = ReactiveKernels._replica_rank(
-            ReactiveKernels.valtype(k.inputs[index])) + 1
-        ndims(arg) == expected_rank || throw(DimensionMismatch(
-            "replica port :$(k.inputs[index].name) has rank $(ndims(arg)); " *
-            "expected $expected_rank (scalar rank plus one trailing replica axis)"))
-        size(arg, ndims(arg)) == replica_count || throw(DimensionMismatch(
-            "replica port :$(k.inputs[index].name) has " *
-            "$(size(arg, ndims(arg))) replicas; expected $replica_count"))
-        push!(batched_inputs, _replica_to_leading(arg))
+        index in B ? _replica_loop_operand(arg) : arg
     end
-
-    shared = _replica_shared(Val(B), args)
-    scalar_call = _ReplicaScalarCall{B,BT,length(args),typeof(k.target),
-                                     typeof(shared)}(k.target, shared)
-    batched_outputs = Reactant.Ops.batch(
-        scalar_call, batched_inputs, Int64[replica_count])
-    output_types = OT.parameters
-    results = ntuple(length(output_types)) do output_index
-        _replica_to_trailing(batched_outputs[output_index],
-                             output_types[output_index])
+    if replica_count == 0
+        empty_outputs = ntuple(index -> ReactiveKernels._replicated_output(
+            OT.parameters[index], 0), length(OT.parameters))
+        result = length(empty_outputs) == 1 ? only(empty_outputs) : empty_outputs
+        return _replica_loop_operand(result)
     end
-    length(results) == 1 ? only(results) : results
+    # One fixed prologue position supplies the runtime output layout, including
+    # untyped record leaves. The remaining positions use the same retained body.
+    replica_selector = Val(B)
+    first_args = _replica_loop_args(replica_selector, replica_inputs, 1)
+    first_value = k.target(first_args...)
+    replica_buffers = _replica_loop_buffers(first_value, replica_count)
+    replica_buffers = _replica_loop_write(replica_buffers, first_value, 1)
+    replica_limit = _replica_loop_limit(replica_count)
+    Reactant.@trace track_numbers=false for replica_index in 2:replica_limit
+        replica_args = _replica_loop_args(replica_selector, replica_inputs, replica_index)
+        replica_values = k.target(replica_args...)
+        replica_buffers = _replica_loop_write(replica_buffers, replica_values, replica_index)
+    end
+    replica_buffers
 end
 
 function ReactiveKernels._replica_ad_call(
@@ -1659,11 +1646,12 @@ function ReactiveKernels._replica_ad_call(
     # loop-carried variables.
     value_buffer = copy(Reactant.Ops.constant(zeros(element_type, replica_count)))
     gradient_buffers = _replica_ad_buffers(AT, gradient_shapes, element_type, replica_count)
+    replica_limit = _replica_loop_limit(replica_count)
     # Body locals carry a `replica_` prefix: `@trace` seeds a loop-carried
     # variable from any same-named binding in scope, and `value`/`gradient`
     # would resolve to functions.  (No `return` inside the block either:
     # ReactantCore rejects it syntactically.)
-    Reactant.@trace track_numbers = false for replica_index in 1:replica_count
+    Reactant.@trace track_numbers = false for replica_index in 1:replica_limit
         replica_args = ntuple(length(args)) do argument_index
             arg = getfield(args, argument_index)
             position = findfirst(==(argument_index), B)
