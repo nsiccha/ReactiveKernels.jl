@@ -50,6 +50,68 @@ end
 end
 end
 
+module NestedLanePlateFixtures
+using ReactiveKernels
+
+# A host schedule with a compact per-dose plan, embedded as one prepared plate
+# child in a batched outer graph: the cell's first recipe is all-host data, so
+# the tensorized lowering materializes one row vector per lane before the
+# traced gather recipe runs.
+struct GatherSchedule
+    nobs::Int
+    shifts::Vector{Int}
+end
+
+_superpose_row(row, response, amounts) =
+    sum(response[max.(row, 1)] .* (row .> 0) .* amounts)
+
+@kernel superposition(plan, units, weights) = begin
+    observations = collect(1:plan.nobs)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do observation, schedule_plan, response, amounts
+        row = observation .- schedule_plan.shifts
+        _superpose_row(row, response, amounts)
+    end
+    return concentration
+end
+const SUPERPOSITION_PREPARED = prepare(superposition)
+
+@kernel amount_outer(units, weights, schedule) = begin
+    plan = schedule.plan
+    concentration = SUPERPOSITION_PREPARED(plan, units, weights)
+    return concentration
+end
+
+@kernel traced_superposition(obs, shifts, units, weights) = begin
+    concentration::Vector{Float64} = plate(obs, Ref(shifts), Ref(units), Ref(weights)) do observation, sh, response, amounts
+        row = observation .- sh
+        _superpose_row(row, response, amounts)
+    end
+    return concentration
+end
+const TRACED_SUPERPOSITION_PREPARED = prepare(traced_superposition)
+
+@kernel traced_amount_outer(obs, shifts, units, weights) = begin
+    concentration = TRACED_SUPERPOSITION_PREPARED(obs, shifts, units, weights)
+    return concentration
+end
+
+_ragged_rows(n) = [collect(1:i) for i in 1:n]
+
+@kernel ragged_inner(n, units) = begin
+    rows = _ragged_rows(n)
+    out::Vector{Float64} = plate(rows, Ref(units)) do row, response
+        sum(response[row])
+    end
+    return out
+end
+const RAGGED_PREPARED = prepare(ragged_inner)
+
+@kernel ragged_outer(n, units) = begin
+    out = RAGGED_PREPARED(n, units)
+    return out
+end
+end
+
 @testset "Ref array plates retain atomic parameters in Reactant" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     q = [0.7, -0.3]
@@ -158,5 +220,80 @@ end
             _, gradient = compiled_ad(ad, rq, rx)
             @test Array(gradient) ≈ reference_gradient
         end
+    end
+
+    @testset "host-plan masked gather keeps lane structure under batching" begin
+        # Lane count (6), dose count (2), and subject batch (3) are all
+        # distinct, so any lane/batch confusion changes shapes or values.
+        plan = NestedLanePlateFixtures.GatherSchedule(6, [0, 3])
+        schedule = (; plan)
+        units = reshape(collect(1.0:18.0), 6, 3)
+        weights = [1.0 2.0 3.0; 4.0 5.0 6.0]
+        B = prepare_batched(NestedLanePlateFixtures.amount_outer;
+            have = (:units, :weights, :schedule),
+            batched = (:units, :weights), want = :concentration)
+        reference = B(units, weights, schedule)
+        expected = Matrix{Float64}(undef, 6, 3)
+        for s in 1:3, o in 1:6
+            row = o .- plan.shifts
+            expected[o, s] = sum(units[max.(row, 1), s] .* (row .> 0) .* weights[:, s])
+        end
+        @test reference ≈ expected
+        f = (u, w, s) -> B(u, w, s)
+        runits, rweights = Reactant.to_rarray(units), Reactant.to_rarray(weights)
+        hlo = repr(Reactant.@code_hlo optimize = :none f(runits, rweights, schedule))
+        @test occursin("stablehlo.while", hlo)
+        compiled = Reactant.@compile sync = true f(runits, rweights, schedule)
+        @test Array(compiled(runits, rweights, schedule)) ≈ reference
+        # Changed inputs reuse the same program with fresh values.
+        units2 = units .* 1.5 .+ 1.0
+        weights2 = weights .+ 2.0
+        runits2 = Reactant.to_rarray(units2)
+        rweights2 = Reactant.to_rarray(weights2)
+        reference2 = B(units2, weights2, schedule)
+        @test reference2 != reference
+        @test Array(compiled(runits2, rweights2, schedule)) ≈ reference2
+        # Doubling the lane count must not replicate the program.
+        plan12 = NestedLanePlateFixtures.GatherSchedule(12, [0, 3])
+        schedule12 = (; plan = plan12)
+        units12 = reshape(collect(1.0:36.0), 12, 3)
+        runits12 = Reactant.to_rarray(units12)
+        hlo12 = repr(Reactant.@code_hlo optimize = :none f(runits12, rweights, schedule12))
+        @test count("stablehlo.while", hlo12) == count("stablehlo.while", hlo)
+        @test count("\n", hlo12) == count("\n", hlo)
+        compiled12 = Reactant.@compile sync = true f(runits12, rweights, schedule12)
+        @test Array(compiled12(runits12, rweights, schedule12)) ≈
+            B(units12, weights, schedule12)
+    end
+
+    @testset "traced lane axis keeps vector lanes whole" begin
+        obs = collect(1:6)
+        shifts = [0, 2, 4]
+        units = reshape(collect(1.0:18.0), 6, 3)
+        weights = [5.0, 6.0, 7.0]
+        B = prepare_batched(NestedLanePlateFixtures.traced_amount_outer;
+            have = (:obs, :shifts, :units, :weights),
+            batched = (:units,), want = :concentration)
+        reference = B(obs, shifts, units, weights)
+        @test size(reference) == (6, 3)
+        f = (o, s, u, w) -> B(o, s, u, w)
+        robs = Reactant.to_rarray(obs)
+        runits = Reactant.to_rarray(units)
+        compiled = Reactant.@compile sync = true f(robs, shifts, runits, weights)
+        got = Array(compiled(robs, shifts, runits, weights))
+        @test size(got) == (6, 3)
+        @test got ≈ reference
+    end
+
+    @testset "ragged and empty per-lane values raise loudly" begin
+        units = [10.0 20.0; 30.0 40.0; 50.0 60.0]
+        B = prepare_batched(NestedLanePlateFixtures.ragged_outer;
+            have = (:n, :units), batched = (:units,), want = :out)
+        @test B(3, units) ≈ [10.0 20.0; 40.0 60.0; 90.0 120.0]
+        f = (nn, u) -> B(nn, u)
+        runits = Reactant.to_rarray(units)
+        @test_throws ArgumentError Reactant.@compile sync = true f(3, runits)
+        @test isempty(B(0, units))
+        @test_throws ArgumentError Reactant.@compile sync = true f(0, runits)
     end
 end
