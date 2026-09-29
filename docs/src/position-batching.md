@@ -151,6 +151,14 @@ slices, so it is not the allocation-free reducing contract of a likelihood
 scalar operations, so their shared-only recipes also execute above the position
 loop. Their internal loops and lazy branches retain the scalar semantics.
 
+For compatible native numeric leaves, borrowed lowering recovers concrete final
+destination types before the position loop. A recipe-free HAVE/WANT cut can
+copy compatible dense numeric stacks directly, including tuple and named-tuple
+trees, without creating scalar slices first. Vectors of scalar records and
+custom array layouts retain projection and stacking. These internal reductions
+leave the ownership, empty-batch, validation, and scalar dispatch contracts
+in place; allocating scalar recipes still allocate their intermediate arrays.
+
 By default every call owns fresh stacked output arrays, including record
 leaves. Later calls cannot change retained results. To consume bounded batches
 immediately on the native backend, opt into final output-buffer reuse:
@@ -177,14 +185,6 @@ as an input detaches its buffer so the input is not overwritten. Reuse avoids
 allocation of compatible final stacked buffers; per-position projections and
 scalar intermediate arrays may still allocate. It does not make an allocating
 scalar kernel allocation-free, and it does not cache positions or unit solves.
-
-For compatible native numeric leaves, borrowed lowering recovers concrete final
-destination types before the position loop. A recipe-free HAVE/WANT cut can
-copy compatible dense numeric stacks directly, including tuple and named-tuple
-trees, without creating scalar slices first. Vectors of scalar records and
-custom array layouts retain projection and stacking. These internal reductions
-leave the ownership, empty-batch, validation, and scalar dispatch contracts above
-in place; allocating scalar recipes still allocate their intermediate arrays.
 
 With Reactant, `@compile batched(positions, shared...)` lowers the same map to a
 retained loop with dynamic slices and output buffers. A scalar kernel that compiles under Reactant therefore
