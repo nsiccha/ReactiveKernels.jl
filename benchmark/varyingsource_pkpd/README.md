@@ -129,11 +129,11 @@ coordinates and density errors. Exact exits are in the
 [new receipt](receipt-primal-joint-strato2-20260929.txt). The new driver differs
 from the executed scratch driver only in its usage-message filename.
 
-This removes derivative-only work from the primitive primal. It does not infer
-the internals of opaque functions or move shared GP preparation out of the
-posterior's subject loop. Those shared-work improvements remain separate from
-this output-selection change. Bruno's app uses its own mathematical graph and
-workload; its preparation-inclusive results are a separate acceptance check.
+This removes derivative-only work from the primitive primal. Shared GP work at
+that checkpoint still ran inside the posterior's subject loop; the following
+section records its factoring into shared graph nodes. Bruno's app uses its own
+mathematical graph and workload; its preparation-inclusive results are a
+separate acceptance check.
 
 The unchanged full-gradient driver also passed at `eaeef55d`: run `3Bgath`
 exited 0 in 386 seconds. All twelve exported coordinate vectors, gradients,
@@ -146,6 +146,110 @@ not evidence for a gradient speedup from this change. See
 [the new gradient table](gradients-joint-strato2-20260929.tsv),
 [exact receipt](receipt-gradients-joint-strato2-20260929.txt), and
 [artifact/source hashes](joint-validation.json).
+
+## Shared GP mathematical dependencies
+
+Runtime checkpoint `cd3ed22a` starts from published `ed98d70c`. The emitter
+exposes effectiveness weights, its scalar normalization, the primary placebo
+course and a CSF-only secondary course as ordinary RK graph nodes. The existing
+planner shares live producers once per evaluation and folds fully bound
+producers during preparation. Subject-specific GP predictors retain the general
+reader. The same subject/grid traversal consumes these mathematical results;
+no persistent cache or new AD adapter is introduced.
+
+The full sampler has live GP parameters. Its GP preparation counters are zero;
+the domain-independent fixture in `test/test_shared_preparation.jl` separately
+checks once-per-preparation basis work, fully bound weights/normalization,
+changed live inputs, rebinding and WANT pruning. It passes 33 assertions.
+The shared reader retains no-dose and empty-course guards, and secondary
+preparation visits only CSF times. Both reader forms retain identical LLVM
+across 3/30-subject data, with runtime loop and branch instructions. Rebinding
+also leaves the executable emitted graph size fixed. Opaque helper internals
+remain ordinary Julia: the placebo sine basis still runs over the time grid
+inside each course producer.
+
+Primal-only counters instrument the owned mathematical functions after timing,
+including view-backed innovation vectors. The actual full sampler calls are:
+
+| Subjects | Baseline weights | Shared weights | Baseline normalization | Shared normalization | Baseline placebo courses | Shared placebo courses |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 | 2 | 1 | 2 | 1 | 5 | 2 |
+| 30 | 20 | 1 | 20 | 1 | 50 | 2 |
+
+All three GP preparation counters are zero in both runs because these parameters
+are live. Changing an unconstrained input preserves the evaluation counts.
+See the [baseline counts](counts-shared-gp-baseline-strato2-20260929.tsv)
+and [shared counts](counts-shared-gp-strato2-20260929.tsv).
+
+All six full-posterior densities and coordinate vectors are identical to the
+published joint baseline. The largest old/new gradient difference is
+`1.7053025658242404e-13`; all six RK cases retain the accuracy-matched verdict
+against the original three Stan tolerances. Gradient Julia allocations fall
+from 258,128 to 221,616 bytes at 3 subjects and from 703,792 to 630,608 at 30.
+The unchanged full gradient driver exits 0 in 741 seconds. See
+[raw gradients](gradients-shared-gp-strato2-20260929.tsv) and the
+[exact receipt](receipt-shared-gp-gradients-strato2-20260929.txt).
+
+`shared_gp.jl` measures one initial query preparation plus first evaluation per
+subject size, then the six steady posterior points. Model construction and
+schedule binding are outside the initial measurement; bound producers, lowering,
+native query creation and first-call generated-code compilation are inside.
+Both runs visit 3 subjects before 30, so the second size shares compilation of
+ordinary package methods. These are single initial measurements, not medians:
+
+| Subjects | Baseline initial seconds | Shared initial seconds | Baseline Julia bytes | Shared Julia bytes |
+| ---: | ---: | ---: | ---: | ---: |
+| 3 | 40.1958 | 60.6942 | 1,420,898,680 | 1,439,343,928 |
+| 30 | 29.5208 | 39.3184 | 673,981,832 | 652,510,392 |
+
+The prepared callable is then specialized once and sampled with three warmups
+and 31 samples of five calls per point. No Enzyme module is loaded. This call
+path differs from the older `primal-joint` table's per-call world-age barrier;
+compare the following two same-protocol tables for attribution:
+
+| Subjects | Point | Baseline steady μs | Shared steady μs | Baseline Julia bytes | Shared Julia bytes |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 | 1 | 32.1404 | 46.6942 | 26,592 | 26,192 |
+| 3 | 2 | 32.6490 | 31.7516 | 26,592 | 26,192 |
+| 3 | 3 | 32.5170 | 31.4654 | 26,592 | 26,192 |
+| 30 | 1 | 318.5976 | 296.2990 | 127,504 | 121,136 |
+| 30 | 2 | 281.9350 | 284.5146 | 127,504 | 121,136 |
+| 30 | 3 | 256.8946 | 278.7708 | 127,504 | 121,136 |
+
+These separate runs experienced shared-host contention. Initial time rises and
+steady timings move in both directions; the measurements do not establish a
+wall-time speedup. Actual operation counts and allocation reductions establish
+the removed repeated mathematical work. The raw tables retain IQRs, all
+coordinates and densities. The comparison script checks those identities and
+the complete old/new gradients against the published joint gradient baseline.
+
+The [baseline primal table](primal-shared-gp-baseline-strato2-20260929.tsv)
+and [shared primal table](primal-shared-gp-strato2-20260929.tsv) contain both
+initial and steady measurements. Their exact receipts are
+[baseline](receipt-shared-gp-baseline-primal-strato2-20260929.txt), exit 0/315s,
+and [shared](receipt-shared-gp-primal-strato2-20260929.txt), exit 0/416s.
+The [comparison output](shared-gp-comparison.json) records checked values,
+gradient deltas, counts and before/after costs. Reproduce each primal run with
+its own consumer environment resolved to the indicated repository root, then
+compare the resulting artifacts:
+
+```sh
+julia --startup-file=no --threads=1 --project=/path/to/consumer-env \
+  benchmark/varyingsource_pkpd/shared_gp.jl /path/to/ReactiveKernels.jl \
+  /path/to/primal.tsv /path/to/counts.tsv
+python3 benchmark/varyingsource_pkpd/compare_shared_gp.py \
+  /path/to/primal-before.tsv /path/to/primal-after.tsv \
+  /path/to/gradients-before.tsv /path/to/gradients-after.tsv \
+  /path/to/counts-before.tsv /path/to/counts-after.tsv
+```
+
+Focused successful receipts cover
+[bound/live emitted reverse](receipt-shared-gp-emitter-strato2-20260929.txt),
+[shared values, lazy arms and subject-specific fallback](receipt-shared-gp-shared-tests-strato2-20260929.txt),
+and [generic dependencies, raw/shared LLVM and both actual MutatingFunctions extension loads](receipt-shared-gp-core-loops-extensions-strato2-20260929.txt).
+The [identity record](shared-gp-validation.json) records runtime, source and
+Stan-binary hashes. Reactant acceptance and Bruno's real app workload remain
+separate acceptance lanes.
 
 ## Original gradient results
 

@@ -63,6 +63,23 @@ amplitudes are positive constrained values. `placebo_lo` and `placebo_hi`
 define the raw time domain; the placebo basis clamps to this domain before
 mapping to `[-1,1]` with padding `L=1.5`.
 
+When these GP inputs are shared across subjects, the emitter exposes their
+mathematical dependencies as ordinary graph nodes: transformed effectiveness
+weights, the scalar normalization term, a primary placebo course, and a
+CSF-only secondary course. Each live producer runs once per density evaluation.
+RK's existing `bound=` preparation evaluates any producer whose inputs are all
+bound once, and reuses its result. Changing live innovations, scales or slopes
+recomputes the dependent nodes; rebinding the raw schedule rebuilds the time
+inputs. Subject-specific GP predictors retain the general subject traversal.
+There is no persistent model cache.
+
+The subject and grid loops remain runtime loops. A schedule with no doses skips
+effectiveness preparation, and empty placebo grids skip their GP inputs. The
+secondary course uses only CSF times, so absent CSF data does not evaluate its
+parameters. RK shares explicitly authored nodes; it does not infer or hoist
+mathematics inside opaque helper functions. The remaining sine-basis evaluation
+inside each placebo-course producer still follows its runtime time grid.
+
 These transforms do not add priors. The original model's GP length-scale
 prior has lower bound `(6/pi)*sqrt(log(100)/(k^2-1))` and upper bound `2`, so
 its effectiveness prior requires `k ≥ 4`, although the mathematical transform
