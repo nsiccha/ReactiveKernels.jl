@@ -1932,9 +1932,10 @@ end
 # back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded from the
 # axis candidates, so an array-valued atom cannot be mistaken for the plate
 # axis; but when every axis operand is bound and no axis candidate remains,
-# `_embedded_marker_candidates` admits array-valued HAVE ports (atomic ones
-# included) as backend markers, since only the marker TYPE — never its axis —
-# selects native vs. tensorized execution there.
+# `_embedded_marker_candidates` admits every HAVE port not provably scalar
+# (array-valued and ambiguous/`Any` ones, atomic ones included) as backend
+# markers, since only the marker TYPE — never its axis — selects native vs.
+# tensorized execution there.
 struct _DynamicEmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
     native::N
     tensorized::T
@@ -2254,14 +2255,18 @@ function _embedded_marker_candidates(p::Plan)
         # HAVE port: every axis operand is bound (`bound=`), so the plate axis is
         # a compile-time constant baked into both bodies (the native body derives
         # its own axis; the tensorized body takes the marker-less axis fallback).
-        # Backend selection still needs a runtime marker, so admit any
-        # array-valued active HAVE port as one — including a whole-vector
-        # `Ref`-captured parameter that is atomic for broadcasting yet remains a
-        # live array HAVE. Only the marker TYPE is consulted (`_batched_call`
-        # dispatches native vs. tensorized on it), never its axis, so an atomic
-        # array admitted here cannot be mistaken for the plate axis.
+        # Backend selection still needs a runtime marker, so admit every active
+        # HAVE port the static axis class does not PROVE scalar (`:not_axis`) —
+        # including a whole-vector `Ref`-captured parameter that is atomic for
+        # broadcasting yet remains a live array HAVE, and an untyped (`Any`)
+        # port whose live values are arrays. Only the marker TYPE is consulted
+        # (`_batched_call` dispatches native vs. tensorized on it), never its
+        # axis, so an admitted port can never be mistaken for the plate axis;
+        # the dynamic runtime selection skips scalar values. Only provably
+        # scalar live ports (e.g. `::Float64`) still throw below.
         for (position, input) in enumerate(p.have)
-            valtype(input) <: AbstractArray && push!(candidates, position)
+            _static_plate_axis_class(valtype(input)) === :not_axis ||
+                push!(candidates, position)
         end
     end
     Tuple(candidates)

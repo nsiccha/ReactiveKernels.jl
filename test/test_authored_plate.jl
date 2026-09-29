@@ -93,6 +93,47 @@ end
     @test bound_mid(q) == middle
 end
 
+@testset "embedded prepared plate: bound axis with untyped live array HAVE" begin
+    C = AuthoredPlateChains
+    schedule = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]   # nobs = 6 plate-axis rows
+    dose = [0.5, 1.5, 2.5]                        # ndoses = 3 ≠ nobs
+    plan_axis = collect(1.0:length(schedule))
+    ref = 2 .* plan_axis .+ dose[1]
+
+    # Untyped (`Any`) live dose port with a bound schedule-derived axis. This
+    # used to throw "an embedded plate requires an array-valued HAVE port in
+    # the outer kernel" because the fallback marker search only admitted
+    # array-TYPED ports.
+    outer = C.embedded_dose_outer_graph()
+    unbound = prepare(outer.graph; have = (outer.schedule, outer.dose),
+                      want = outer.result)
+    @test unbound(schedule, dose) ≈ ref
+    bound = prepare(outer.graph; have = (outer.schedule, outer.dose),
+                    want = outer.result, bound = [outer.schedule => schedule])
+    @test bound.f isa ReactiveKernels._DynamicEmbeddedFunctionPair
+    got = bound(dose)
+    @test got ≈ ref
+    # The plate axis is the bound nobs plan, never the ndoses live dose extent.
+    @test length(got) == length(schedule)
+    # The live dose dependence is real: changed doses change the result.
+    @test bound(dose .+ 1.0) ≈ 2 .* plan_axis .+ (dose[1] + 1.0)
+    @test !(bound(dose .+ 1.0) ≈ got)
+
+    # A typed dose port keeps the static backend marker.
+    touter = C.embedded_dose_outer_graph(; dose_type = Vector{Float64})
+    tbound = prepare(touter.graph; have = (touter.schedule, touter.dose),
+                     want = touter.result,
+                     bound = [touter.schedule => schedule])
+    @test tbound.f isa ReactiveKernels._EmbeddedFunctionPair
+    @test tbound(dose) ≈ ref
+
+    # Provably scalar live ports still throw the contract error.
+    souter = C.embedded_dose_outer_graph(; dose_type = Float64)
+    @test_throws ArgumentError prepare(
+        souter.graph; have = (souter.schedule, souter.dose),
+        want = souter.result, bound = [souter.schedule => schedule])
+end
+
 @kernel authored_standard_normal() = begin
     logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
 end
