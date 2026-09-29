@@ -146,7 +146,7 @@ end
     @test pterm === :_ppl_lik_qt_joint_pk_pk_loc
     @test length(pstmts) == 3
     @test pstmts[1] == :(_ppl_pk_scale_pk_loc =
-        sqrt.(sigma_add^2 .+ (pk_loc .* sigma_prop) .^ 2))
+        sqrt.(sigma_add.^2 .+ (pk_loc .* sigma_prop) .^ 2))
     @test pstmts[2].head === :(=) && pstmts[2].args[1] === :_ppl_pw_qt_joint_pk_pk_loc
     @test pstmts[3] == :(_ppl_lik_qt_joint_pk_pk_loc::Float64 =
         sum(_ppl_pw_qt_joint_pk_pk_loc))

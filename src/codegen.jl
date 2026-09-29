@@ -1822,22 +1822,27 @@ end
 # receive array-valued constants as explicit inactive operands: capturing them
 # in the callable can either turn a whole dataset into source-level literals or
 # obscure its read-only activity. This compact call boundary replaces only
-# array-valued `_BoundConstant`s with trailing hidden operands. The public
+# array-containing `_BoundConstant`s with trailing hidden operands. The public
 # PreparedKernel is unchanged; ordinary execution and inspection retain the
 # residual ABI.
 struct _ExternalBoundArraySlot{I} end
 
-struct _ExternalizedBoundArrayCall{F,O,I}
+struct _ExternalizedBoundArrayCall{F,O,I,H}
     f::F
     ops::O
 end
 
-@generated function (call::_ExternalizedBoundArrayCall{F,O,I})(
-        args::Vararg{Any,N}) where {F,O,I,N}
+@generated function (call::_ExternalizedBoundArrayCall{F,O,I,H})(
+        args::Vararg{Any,N}) where {F,O,I,H,N}
     external_count = length(I)
     public_count = N - external_count
     public_count >= 0 || return :(throw(ArgumentError(
         "externalized bound-array call is missing hidden operands")))
+    if H
+        forwarded = Any[:(getfield(args,$index)) for index in 1:N]
+        return :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+            getfield(call,:f),getfield(call,:ops),$(forwarded...)))
+    end
     replacements = Dict(index => slot for (slot, index) in enumerate(I))
     operations = Any[]
     for index in 1:fieldcount(O)
@@ -1858,13 +1863,16 @@ end
 """
     _externalize_bound_arrays(kernel; min_elements = 0) -> (call, values)
 
-Return an internal backend call plus the array-valued partial-evaluation
+Return an internal backend call plus the array-containing partial-evaluation
 constants it expects as trailing hidden operands. If the kernel contains no
 such constants, return the kernel itself and an empty tuple. Scalar and other
 small static constants remain in the operation table; `min_elements` lets a
 backend keep arrays below that element count in the table as well, so a small
 static dataset stays a compiler literal it can fold rather than a runtime
-operand it must read. By default every array is externalized.
+operand it must read. By default every array is externalized. Tuples and named
+tuples containing arrays cross as one structured operand, preserving their
+fields without capturing the arrays in the differentiated callable. A structured
+value crosses when any of its array leaves meets `min_elements`.
 
 This is a backend ABI adapter, not a different model boundary: `kernel` keeps
 its original public inputs, and `call(public_args..., values...)` is exactly
@@ -1882,8 +1890,8 @@ function _externalize_bound_array_call(f, ops;
                                        materialize_view_copies::Bool = false)
     positions = Tuple(
         index for (index, op) in pairs(ops)
-        if op isa _BoundConstant && op.value isa AbstractArray &&
-           length(op.value) >= min_elements)
+        if op isa _BoundConstant &&
+           _has_external_bound_array(op.value, min_elements))
     isempty(positions) && return nothing, ()
     values = Tuple(
         _externalize_bound_value(ops[index].value, materialize_view_copies)
@@ -1893,10 +1901,58 @@ function _externalize_bound_array_call(f, ops;
         slot === nothing ? ops[index] :
             _ExternalBoundArraySlot{slot}()
     end
+    structured = any(index -> ops[index].value isa Union{Tuple,NamedTuple}, positions)
+    external_body = structured ? _externalize_bound_array_body(f,positions) : nothing
+    callable = external_body === nothing ? f :
+        RuntimeGeneratedFunctions.drop_expr(external_body)
     call = _ExternalizedBoundArrayCall{
-        typeof(f),typeof(stripped),positions}(f, stripped)
+        typeof(callable),typeof(stripped),positions,
+        external_body !== nothing}(callable, stripped)
     call, values
 end
+
+# A compiled body whose operation-table accesses are literal can load hidden
+# bound operands directly. This changes only its internal argument boundary;
+# every loop, branch and arithmetic expression stays intact. Rebuilding an
+# array-containing operation tuple beside an active argument can obscure its
+# activity before the tuple is optimized away. Source transforms that inspect
+# or dynamically access the table keep the reconstruction path above.
+_externalize_bound_array_body(f, positions) = nothing
+function _externalize_bound_array_body(
+        f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, positions)
+    ast = deepcopy(RuntimeGeneratedFunctions.get_expression(f))
+    ports = Dict(index=>gensym(:_rk_bound_operand) for index in positions)
+    valid = true
+    function replace_load(node)
+        if node === _OPS_ARG
+            valid = false
+            return node
+        end
+        node isa Expr || return node
+        node.head === :quote && return node
+        if node.head === :call && length(node.args) == 1
+            slot = _operation_slot(node.args[1])
+            haskey(ports,slot) && return ports[slot]
+        end
+        slot = _operation_slot(node)
+        if slot !== nothing
+            haskey(ports,slot) && (valid = false)
+            return node
+        end
+        Expr(node.head,map(replace_load,node.args)...)
+    end
+    body = replace_load(ast.args[2])
+    valid || return nothing
+    append!(ast.args[1].args,[ports[index] for index in positions])
+    ast.args[2] = body
+    compile(ast)
+end
+
+_has_external_bound_array(value, min_elements) = false
+_has_external_bound_array(value::AbstractArray, min_elements) =
+    length(value) >= min_elements
+_has_external_bound_array(value::Union{Tuple,NamedTuple}, min_elements) =
+    any(v -> _has_external_bound_array(v, min_elements), value)
 
 function _externalize_bound_arrays(kernel::PreparedKernel;
                                    min_elements::Integer = 0,
@@ -1920,6 +1976,11 @@ function _externalize_bound_value(value::AbstractArray,
     axes(collected) == axes(value) || return value
     collected
 end
+
+_externalize_bound_value(value, materialize_view_copies::Bool) = value
+_externalize_bound_value(value::Union{Tuple,NamedTuple},
+                         materialize_view_copies::Bool) =
+    map(v -> _externalize_bound_value(v, materialize_view_copies), value)
 
 # Prepared RK kernels are compiler-owned program structure when used as recipe
 # operations. Flatten them automatically so ordinary composition of `plate`

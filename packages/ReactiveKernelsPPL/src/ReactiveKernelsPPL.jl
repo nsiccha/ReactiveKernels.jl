@@ -45,7 +45,7 @@ export VaryingMultiMembership, VaryingStrata
 export SplineBasisBlock, SplineBasis, SplineVector
 export HSGPBasis
 export KernelPlate, LinearPKScheduleSpec, LinearPKEventLPSpec,
-    VaryingSourcePKScheduleSpec
+    VaryingSourcePKScheduleSpec, VaryingSourcePKPDScheduleSpec
 export EVENT_LP_NAME
 export LevelMap
 export DesignMatrix
@@ -125,14 +125,20 @@ export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
 export varyingsource_effectiveness, varyingsource_effective_dose,
     prepare_varyingsource_pk, varyingsource_pk_concentration, varyingsource_pk_locs
 export build_varyingsource_pk_schedule, varyingsource_pk_read_locs_over_subjects
+export varyingsource_gp_weights, varyingsource_log_placebo, varyingsource_pd_locs,
+    prepare_varyingsource_pkpd, varyingsource_pkpd_locs
+export build_varyingsource_pkpd_schedule, varyingsource_pkpd_read_locs_over_subjects
 
 include("contract.jl")
+include("varying_centered.jl")
 include("expm_rule.jl")
 include("pkcells.jl")
 include("transit_twocmt.jl")
 include("transit_twocmt_rule.jl")
 include("varyingsource_pk.jl")
+include("varyingsource_pd.jl")
 include("varyingsource_schedule.jl")
+include("varyingsource_pkpd_schedule.jl")
 include("pk_rectangular.jl")
 include("design.jl")
 include("bijectors.jl")

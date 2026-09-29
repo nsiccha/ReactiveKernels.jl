@@ -189,13 +189,14 @@ function _qt_joint_qt_likelihood_stmts(;
 end
 
 """PK likelihood: `addprop` rides a flat pre-local
-(`sqrt.(add^2 .+ (loc .* prop).^2)`, SB's `addprop`), then a per-element
-`lower_clamping` plate (SB's `lower_clamping_normal_lpdf` branch
-structure: at-bound `==` takes the log-cdf arm, above-bound takes the
-logpdf arm, below-bound is unreachable — prep clamps). The log-cdf arm
+(`sqrt.(add.^2 .+ (loc .* prop).^2)`, SB's `addprop`), then a per-element
+`lower_clamping` plate (at or below the bound takes the log-cdf arm,
+above-bound takes the logpdf arm). Prepared, clamped observations keep
+SB's `lower_clamping_normal_lpdf` behavior; raw below-bound observations
+follow the original varying-source Stan model. The log-cdf arm
 reuses the landed censored-Gaussian `log(normal(...).cdf(...))` form
 (`_gaussian_cell`; ≤2ulp from SB's `log(erfc) - log(2)` spelling, no new
-formula); the `==` boundary differs deliberately from top-level
+formula); the censored boundary differs deliberately from top-level
 `:censored` (`<`), where at-bound rows take the density — here every BLQ
 row sits exactly at LLOQ and SB takes the cdf there."""
 function _qt_joint_pk_likelihood_stmts(;
@@ -203,7 +204,7 @@ function _qt_joint_pk_likelihood_stmts(;
         lloq::Symbol, label::Symbol)
     sc = Symbol(:_ppl_pk_scale_, label)
     pre = Expr(:(=), sc, Expr(:., :sqrt, Expr(:tuple, Expr(:call, :.+,
-        Expr(:call, :^, add, 2),
+        Expr(:call, :.^, add, 2),
         Expr(:call, :.^, Expr(:call, :.*, location, prop), 2)))))
     klabel = Symbol(:qt_joint_pk_, label)
     pw = _pw_name(klabel)
@@ -211,6 +212,6 @@ function _qt_joint_pk_likelihood_stmts(;
     inputs = Any[response, location, sc, lloq]
     yv, lpv, sv, lov = _dovar(1), _dovar(2), _dovar(3), _dovar(4)
     base = :(normal($lpv, $sv).logpdf($yv))
-    cell = :(ifelse($yv == $lov, log(normal($lpv, $sv).cdf($lov)), $base))
+    cell = :(ifelse($yv <= $lov, log(normal($lpv, $sv).cdf($lov)), $base))
     return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...], node
 end

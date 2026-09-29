@@ -583,6 +583,34 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         @test gradient ≈ ref_grad
     end
 
+    @testset "bound structured arrays stay outside the derivative callable" begin
+        structured_objective(q, data) = sum(
+            data.weights[i] * q[data.rows[i]]^2 for i in eachindex(data.rows)) +
+            data.nested[2]
+        @kernel structured_bound_like(q::Vector{Float64}, y::Matrix{Float64}) = begin
+            data = (weights=view(y,:,1),rows=[2,1,2],nested=(view(y,:,2),0.5))
+            objective::Float64 = structured_objective(q,data)
+        end
+        q, y = [0.3,-0.4], [1.0 4.0;2.0 5.0;3.0 6.0]
+        kernel = prepare(structured_bound_like;
+                         have=(:q,:y),want=:objective,bound=(;y))
+        external, values = ReactiveKernels._externalize_bound_arrays(kernel)
+        @test only(values).weights isa SubArray
+        @test external(q,values...) == kernel(q)
+        unchanged, none = ReactiveKernels._externalize_bound_arrays(
+            kernel;min_elements=4)
+        @test unchanged === kernel && isempty(none)
+        prepared = prepare_ad(kernel,TEST_AD_BACKEND,q;active=:q)
+        data = only(prepared.external_values)
+        @test data.weights isa Vector && data.nested[1] isa Vector
+        @test data.rows == [2,1,2] && data.nested[2] == 0.5
+        g = zeros(length(q))
+        value,returned = ad_value_and_gradient!(prepared,g,q)
+        @test value ≈ 2q[1]^2+4q[2]^2+0.5
+        @test returned === g
+        @test g ≈ [4q[1],8q[2]]
+    end
+
     @testset "bound matrix views externalize as owning copies" begin
         # Likelihood plates over bind-time `view(y, :, j)` columns are the
         # posteriordb lotka-volterra shape: observation columns beside an
