@@ -24,9 +24,14 @@ using ReactiveKernels
 import ReactiveKernelsNUTSExamples
 using Test
 
+# The optional Reactant suite's group/file selector is dependency-free, so the
+# core suite loads it here and regression-tests the selection logic itself.
+include("reactant_suite_selector.jl")
+
 const _MATRIX_CORE_TESTS = (
     "test_brm_hsgp.jl",
     "test_runtests_selector.jl",
+    "test_reactant_selector.jl",
     "test_stateless.jl",
     "test_lower_with_ops.jl",
     "test_partial_evaluation.jl",
