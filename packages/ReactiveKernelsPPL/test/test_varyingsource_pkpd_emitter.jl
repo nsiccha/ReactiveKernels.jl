@@ -89,7 +89,7 @@ function _vs_full_emit_point(names)
     return [p[n] for n in names]
 end
 
-function _vs_full_emit_oracle(u,names,cols)
+function _vs_full_emit_oracle(u,names,cols;subject_dose_slopes=nothing)
     p = Dict(zip(names,u))
     vector(n,k) = haskey(p,Symbol(n,".1")) ? [p[Symbol(n,".",i)] for i in 1:k] : cols[n]
     logs = [p[Symbol(n,".Intercept")] for n in _VS_FULL_LOG_NAMES, s in 1:3]
@@ -99,7 +99,7 @@ function _vs_full_emit_oracle(u,names,cols)
         vector(:gp_w,4),[p[:rho_p],p[:sd_p],p[:rho_csf],p[:sd_csf]],vector(:p_w,3),vector(:c_w,3))
     s = build_varyingsource_pkpd_schedule(cols[:subj],cols[:time],cols[:assay],
         cols[:dsubj],cols[:dtime],cols[:damt],cols[:treatment],cols[:disc])
-    mu = _vs_full_batch_oracle(q,s;subject_logs=logs)[s.obs_map]
+    mu = _vs_full_batch_oracle(q,s;subject_logs=logs,subject_dose_slopes)[s.obs_map]
     prior = sum(n in _VS_FULL_POSITIVE ? logpdf(Exponential(1.),exp(v))+v :
         logpdf(Normal(0.,1.),v) for (n,v) in p)
     return prior+sum(logpdf.(Normal.(mu,exp(p[:sigma])),cols[:dv]))
@@ -150,5 +150,37 @@ end
         push!(expressions,kernel_expr(bound,assign_layout(bound)))
     end
     @test all(e -> _vs_ast_calls(e,:varyingsource_pkpd_read_locs_over_subjects)==1,expressions)
+    @test all(e -> _vs_ast_calls(e,:_vs_gp_weights)==1,expressions)
+    @test all(e -> _vs_ast_calls(e,:_vs_gp_normalizer)==1,expressions)
+    @test all(e -> _vs_ast_calls(e,:varyingsource_log_placebo)==2,expressions)
     @test _vs_ast_size(expressions[1]) == _vs_ast_size(expressions[2])
+end
+
+@testset "subject-specific GP predictors retain per-subject mathematics" begin
+    cols = _vs_full_emit_columns()
+    body = _vs_full_emit_ast()
+    index = findfirst(body.args) do ex
+        ex isa Expr && ex.head === :call && ex.args[1] === :(~) &&
+            ex.args[2] === :dose_slope
+    end
+    body.args[index] = :(b_dose_slope ~ Normal(0.,1.))
+    insert!(body.args,index+1,:(dose_slope = b_dose_slope .+ age_s))
+    plan = lower_rkppl(body,Set(keys(cols)))
+    bound = bind_data(plan,cols;dims=Dict(:kernel_nsub_loc=>3))
+    built = build_kernel(bound)
+    expression = kernel_expr(bound,built.layout)
+    @test _vs_ast_calls(expression,:varyingsource_pkpd_read_locs_over_subjects) == 1
+    @test _vs_ast_calls(expression,:_vs_gp_weights) == 0
+    names = coordinate_names(built.layout)
+    oracle_names = [n === Symbol("dose_slope.Intercept") ? :dose_slope : n for n in names]
+    u = _vs_full_emit_point(oracle_names)
+    index = findfirst(==(:dose_slope),oracle_names)
+    query = prepare_query(built,bound,:sampler)
+    for delta in (0.,.1)
+        point = copy(u)
+        point[index] += delta
+        slopes = point[index] .+ cols[:age_s]
+        @test query(point) ≈ _vs_full_emit_oracle(point,oracle_names,cols;
+            subject_dose_slopes=slopes) rtol=2e-9 atol=3e-6
+    end
 end

@@ -30,6 +30,7 @@ const _MATRIX_CORE_TESTS = (
     "test_stateless.jl",
     "test_lower_with_ops.jl",
     "test_partial_evaluation.jl",
+    "test_shared_preparation.jl",
     "test_inner_plate_partial_evaluation.jl",
     "test_branch_partition.jl",
     "test_ad.jl",

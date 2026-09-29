@@ -34,6 +34,64 @@ function _vs_pkpd_times(measurements, doses, discretization)
     return grid
 end
 
+# The traversal consumes either subject-specific mathematical inputs or shared
+# graph results. These local wrappers contain no cache or mutable state.
+struct _VSSubjectEffectiveness{T}
+    args::T
+end
+struct _VSSubjectPlacebo{T}
+    args::T
+end
+struct _VSShared{T}
+    value::T
+end
+struct _VSSharedEffectiveness{W,S}
+    weights::W
+    scalars::S
+end
+@inline function _vs_subject_effectiveness(p::_VSSharedEffectiveness, s)
+    return (; min_dose=10000.0, max_dose=200000.0, max_conc=2000.0,
+        dose_slope=p.scalars[1], conc_slope=p.scalars[2],
+        weights=p.weights, normalizer=p.scalars[3])
+end
+@inline function _vs_subject_effectiveness(p::_VSSubjectEffectiveness, s)
+    w, d, c, r_d, r_c, sd = p.args
+    weights = varyingsource_gp_weights(w, _vs_subject_value(r_d,s),
+        _vs_subject_value(r_c,s), _vs_subject_value(sd,s))
+    return varyingsource_effectiveness(weights, _vs_subject_value(d,s), _vs_subject_value(c,s))
+end
+@inline _vs_subject_placebo(p::_VSShared, s, times, rows) = view(p.value, rows)
+@inline function _vs_subject_placebo(p::_VSSubjectPlacebo, s, times, rows)
+    w, r, sd, lo, hi = p.args
+    return varyingsource_log_placebo(times, w, _vs_subject_value(r,s),
+        _vs_subject_value(sd,s), _vs_subject_value(lo,s), _vs_subject_value(hi,s))
+end
+
+# Bound schedule facts and shared live mathematics are separate dependencies.
+# Empty arms must not touch invalid or absent GP inputs.
+_vs_pkpd_has_doses(schedule) = schedule.dose_ends[end] > 0
+_vs_pkpd_placebo_times(schedule) = schedule.placebo_time
+function _vs_pkpd_csf_times(schedule)
+    times = Vector{Float64}(undef, length(schedule.pd3_dts))
+    for s in eachindex(schedule.obs_ends)
+        p2r = _vs_block(schedule.pd2_step_ends,s)
+        p3r = _vs_block(schedule.pd3_step_ends,s)
+        pr = _vs_block(schedule.placebo_ends,s)
+        for (i,j) in enumerate(p3r)
+            times[j] = schedule.placebo_time[first(pr) + length(p2r) + i - 1]
+        end
+    end
+    return times
+end
+function _vs_gp_weights(has_doses, w, r_d, r_c, sd)
+    has_doses || return nothing
+    return varyingsource_gp_weights(w, r_d, r_c, sd)
+end
+function _vs_gp_normalizer(has_doses, weights, d, c)
+    has_doses || return 0.0
+    return -d - c + _varyingsource_gp(weights, -1.0, -1.0)
+end
+
 """
     varyingsource_pkpd_read_locs_over_subjects(schedule, dose_log_rate,
         dose_log_mode, dose_log_F, gp_unit_weights, dose_slope, conc_slope,
@@ -74,6 +132,21 @@ reads only its baseline. Priors and likelihood belong to the model.
         log_baseline_pbmc,log_kout,log_theta1_pbmc,log_theta2_pbmc,
         log_baseline_csf,log_theta1_csf,log_theta2_csf,
         log_absorption_rate,log_absorption_mode)))
+    return _vs_pkpd_read_math(schedule, dose_log_rate, dose_log_mode, dose_log_F,
+        _VSSubjectEffectiveness((gp_unit_weights,dose_slope,conc_slope,
+            dose_scale,conc_scale,eff_scale)),
+        _VSSubjectPlacebo((placebo_unit_weights,placebo_length_scale,placebo_sd,placebo_lo,placebo_hi)),
+        _VSSubjectPlacebo((csf_unit_weights,csf_length_scale,csf_sd,placebo_lo,placebo_hi)),
+        log_Vc,log_k10,log_k12,log_k21,log_baseline_pbmc,log_kout,
+        log_theta1_pbmc,log_theta2_pbmc,log_baseline_csf,log_theta1_csf,
+        log_theta2_csf,log_absorption_rate,log_absorption_mode)
+end
+
+@inline function _vs_pkpd_read_math(schedule, dose_log_rate, dose_log_mode, dose_log_F,
+        effectiveness, primary_placebo, secondary_placebo,
+        log_Vc,log_k10,log_k12,log_k21,log_baseline_pbmc,log_kout,
+        log_theta1_pbmc,log_theta2_pbmc,log_baseline_csf,log_theta1_csf,
+        log_theta2_csf,log_absorption_rate,log_absorption_mode)
     n = length(schedule.obs_ends)
     n > 0 || throw(ArgumentError("varyingsource PK/PD needs at least one subject"))
     out = zeros(Float64, schedule.obs_ends[end])
@@ -83,11 +156,7 @@ reads only its baseline. Priors and likelihood belong to the model.
         concentration = zeros(Float64,length(rr))
         if !isempty(dr)
             rows = view(schedule.dose_index,dr)
-            weights = varyingsource_gp_weights(gp_unit_weights,
-                _vs_subject_value(dose_scale,s), _vs_subject_value(conc_scale,s),
-                _vs_subject_value(eff_scale,s))
-            effect = varyingsource_effectiveness(weights,
-                _vs_subject_value(dose_slope,s), _vs_subject_value(conc_slope,s))
+            effect = _vs_subject_effectiveness(effectiveness,s)
             pk = _VARYINGSOURCE_PK_CELL(length(rr),view(schedule.dose_amount,dr),
                 view(schedule.treatment_map,dr),view(schedule.unique_dts,_vs_block(schedule.lag_ends,s)),
                 view(schedule.concentration_idxs,_vs_block(schedule.concentration_ends,s)),
@@ -112,10 +181,9 @@ reads only its baseline. Priors and likelihood belong to the model.
         if !isempty(w2r)
             placebo = zeros(Float64,length(p2r))
             if !isempty(p2r)
-                times = view(schedule.placebo_time,first(placebo_range):(first(placebo_range)+length(p2r)-1))
-                course = varyingsource_log_placebo(times,placebo_unit_weights,
-                    _vs_subject_value(placebo_length_scale,s), _vs_subject_value(placebo_sd,s),
-                    _vs_subject_value(placebo_lo,s), _vs_subject_value(placebo_hi,s))
+                rows = first(placebo_range):(first(placebo_range)+length(p2r)-1)
+                times = view(schedule.placebo_time,rows)
+                course = _vs_subject_placebo(primary_placebo,s,times,rows)
                 for i in eachindex(placebo)
                     placebo[i] = course[i]
                 end
@@ -131,13 +199,10 @@ reads only its baseline. Priors and likelihood belong to the model.
         if !isempty(w3r)
             placebo = zeros(Float64,length(p3r))
             if !isempty(p3r)
-                times = view(schedule.placebo_time,(first(placebo_range)+length(p2r)):last(placebo_range))
-                primary = varyingsource_log_placebo(times,placebo_unit_weights,
-                    _vs_subject_value(placebo_length_scale,s), _vs_subject_value(placebo_sd,s),
-                    _vs_subject_value(placebo_lo,s), _vs_subject_value(placebo_hi,s))
-                secondary = varyingsource_log_placebo(times,csf_unit_weights,
-                    _vs_subject_value(csf_length_scale,s), _vs_subject_value(csf_sd,s),
-                    _vs_subject_value(placebo_lo,s), _vs_subject_value(placebo_hi,s))
+                rows = (first(placebo_range)+length(p2r)):last(placebo_range)
+                times = view(schedule.placebo_time,rows)
+                primary = _vs_subject_placebo(primary_placebo,s,times,rows)
+                secondary = _vs_subject_placebo(secondary_placebo,s,times,p3r)
                 for i in eachindex(placebo)
                     placebo[i] = primary[i] + secondary[i]
                 end
@@ -154,9 +219,24 @@ reads only its baseline. Priors and likelihood belong to the model.
     return out
 end
 
-# The emitted call groups the fixed thirteen LP roles into matrix columns and
-# eleven shared scalar roles into a vector. The data-dependent subject axis
-# stays a runtime axis, while the graph operation has a small positional ABI.
+# This emitted boundary receives ordinary mathematical results, so RK can fold
+# bound producers or share live producers without inspecting the traversal.
+@inline function varyingsource_pkpd_read_locs_over_subjects(schedule,
+        dose_log_rate,dose_log_mode,dose_log_F,logs::AbstractMatrix,
+        weights::Union{Nothing,AbstractMatrix},scalars::AbstractVector,
+        primary::AbstractVector,secondary::AbstractVector)
+    size(logs) == (length(schedule.obs_ends),13) && length(scalars) == 3 ||
+        throw(DimensionMismatch("full PK/PD subject parameter dimensions disagree"))
+    _vs_native_math((schedule,logs,weights,scalars,primary,secondary))
+    _vs_native_math(map(_subject_value,(dose_log_rate,dose_log_mode,dose_log_F)))
+    lp(i) = SubjectScalar(view(logs,:,i))
+    return _vs_pkpd_read_math(schedule,dose_log_rate,dose_log_mode,dose_log_F,
+        _VSSharedEffectiveness(weights,scalars),_VSShared(primary),_VSShared(secondary),
+        lp(1),lp(2),lp(3),lp(4),lp(5),lp(6),lp(7),lp(8),lp(9),lp(10),lp(11),lp(12),lp(13))
+end
+
+# Raw compact spelling retained for callers supplying shared hyperparameters.
+# Emission supplies graph-computed mathematics through the overload above.
 @inline function varyingsource_pkpd_read_locs_over_subjects(schedule,
         dose_log_rate,dose_log_mode,dose_log_F,logs::AbstractMatrix,
         hyper::AbstractVector,gp_unit_weights,placebo_unit_weights,csf_unit_weights)
