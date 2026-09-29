@@ -321,6 +321,7 @@ end
 # Suite gate: the core testset keeps its historical indentation so this gate
 # reads as a two-line diff instead of an 850-line re-indent.
 if "core" in _SELECTED_REACTANT_SUITES
+include("test_precompiled_prepared_reactant.jl")
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
 
