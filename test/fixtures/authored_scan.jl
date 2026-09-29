@@ -118,6 +118,20 @@ const prepared = ReactiveKernels.prepare(spec)
 
 end
 
+module BareScanWithoutBinding
+import ReactiveKernels
+
+const spec = ReactiveKernels.@kernel unbound_scan(xs::Vector{Float64}) = begin
+    values::Vector{Float64} = scan(xs; init = 0.0) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    return values
+end
+const prepared = ReactiveKernels.prepare(spec)
+
+end
+
 @kernel authored_scan_lazy_branch(mat::Matrix{Float64}, positions::Vector{Int}, n::Int) = begin
     weights::Vector{Float64} = if n == 0
         Float64[]

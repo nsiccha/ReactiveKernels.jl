@@ -30,6 +30,8 @@ _authored_scan_mixed(x) = Base.inferencebarrier(x > 2 ? 1.5 : 1)
     @test qualified([1.0, 2.0, 3.0]) == [1.0, 3.0, 6.0]
     @test count(r -> r.op isa ReactiveKernels._AuthoredScanOp,
                 qualified.plan.recipes) == 1
+    unbound = AuthoredScanFixtures.BareScanWithoutBinding.prepared
+    @test_throws UndefVarError unbound([1.0, 2.0, 3.0])
 end
 
 @testset "authored scan native step lowering" begin
