@@ -96,3 +96,18 @@ Reactant execution fails explicitly: compiled transit-rule and sequential-dose
 control flow are not established for this cell. The slice does not yet include
 PD/placebo grids, full centered hierarchical subject effects, GP prior
 transforms, or BRM-side grouped extraction. Those remain full-twin work.
+
+## Standalone transit primal execution
+
+The lower-level `transit_twocmt_rule(ts, p)` values-only call supports
+Reactant 0.2.289 CPU execution with live Float64 lag and parameter arrays.
+Its lag and numerical-series loops remain retained, and numerical-regime arms
+remain lazy. The standalone fixture covers changed inputs, empty lag arrays
+and explicitly bound accuracy controls. Native Enzyme reverse continues to
+use the existing generated rule.
+
+The actual application unit-response cut also passes lattice/exact schedules
+with 97/247 lags, changed live PK positions, executable reuse and input/output
+ownership. See the [transit benchmark receipts](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/transit_twocmt)
+for exact environments and checks. This component support does not establish
+compiled reverse, full dose superposition, or the complete PK/PD reader.
