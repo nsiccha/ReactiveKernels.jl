@@ -1413,8 +1413,78 @@ end
 # untouched, so an all-traced plate lowers exactly as before.
 @inline _reactant_plate_operand(arg) = arg
 @inline _reactant_plate_operand(arg::Reactant.TracedRArray) = arg
-@inline _reactant_plate_operand(arg::AbstractArray) =
-    Reactant.promote_to(Reactant.TracedRArray, arg)
+@inline function _reactant_plate_operand(arg::AbstractArray)
+    # Only dense Number arrays lower to MLIR constants: `collect` preserves the
+    # element type, so Reactant's `constant(collect(x))` fallback never makes
+    # progress on anything else and recurses without termination. Refuse loudly
+    # at this boundary instead of reaching that fallback.
+    eltype(arg) <: Number &&
+        return Reactant.promote_to(Reactant.TracedRArray, arg)
+    nested = !isempty(arg) && all(value -> value isa AbstractArray, arg)
+    hint = nested ?
+           "rectangular 1-D per-lane nesting is stacked by the plate lowering, " *
+           "so this value reached promotion unstacked (multi-dimensional, " *
+           "ragged, or empty nesting, or a structural-path lane argument)" :
+           "this value is neither a dense numeric array nor per-lane nested data"
+    throw(ArgumentError(
+        "cannot promote a host $(typeof(arg)) to a traced plate operand: " *
+        "only dense Number arrays lower to MLIR constants; " * hint))
+end
+
+# Per-lane non-scalar intermediates of a multi-recipe tensorized plate cell
+# reach a downstream traced plate call as nested host arrays (one element per
+# lane) when the producing recipe's operands were all host data. MLIR constants
+# are dense and rectilinear, so a rectangular 1-D nesting stacks into a dense
+# lanes-leading array (`stacked[i, ...] == arg[i][...]`), which then batches
+# with one lane slice per lane. Anything else cannot be represented — ragged
+# lanes have no dense form and an empty nesting has unknowable per-lane shape —
+# so it raises loudly here. Operands that are already dense, and nesting this
+# helper does not claim (multi-dimensional outers, non-array elements), keep
+# the existing promotion path untouched.
+@inline _stack_nested_lane_values(arg) = arg
+@inline _stack_nested_lane_values(arg::AbstractArray) =
+    _stack_nested_lane_array(arg, eltype(arg))
+@inline _stack_nested_lane_array(
+    arg::AbstractArray, ::Type{T}) where {T<:Number} = arg
+function _stack_nested_lane_array(arg::AbstractArray, ::Type)
+    ndims(arg) == 1 || return arg
+    all(value -> value isa AbstractArray, arg) || return arg
+    isempty(arg) && throw(ArgumentError(
+        "cannot batch an empty nested lane array under Reactant: with zero " *
+        "lanes its per-lane shape is unknowable, so it cannot lower to a " *
+        "dense lanes-leading constant"))
+    first_size = size(first(arg))
+    for (lane, value) in enumerate(arg)
+        size(value) == first_size || throw(ArgumentError(
+            "cannot batch ragged per-lane values under Reactant: lane $lane " *
+            "has size $(size(value)) but lane 1 has size $first_size; " *
+            "per-lane intermediates of a tensorized plate must be rectangular " *
+            "to lower to a dense lanes-leading constant"))
+    end
+    return _stack_nested_lane_values(stack(arg; dims = 1))
+end
+
+# A batch whose lanes return non-scalar values (a per-lane vector from an
+# earlier plate recipe) keeps its lane structure for downstream recipe calls:
+# wrapping preserves the lanes-leading layout that a bare higher-rank array
+# would lose to lane confusion. Scalar-lane batches keep today's bare
+# representation, and multi-dimensional lane grids are untouched.
+@inline _wrap_vector_lane_batch(result, shape) = result
+@inline function _wrap_vector_lane_batch(result::Reactant.TracedRArray, shape)
+    length(shape) == 1 && ndims(result) > 1 ?
+        ReactiveKernels._TensorizedPlateBatch(result) : result
+end
+
+@inline function _reactant_lane_batch_input(arg, shape)
+    lifted = _stack_nested_lane_values(arg)
+    input = _reactant_plate_broadcast_input(lifted)
+    # A stacked nesting is already a dense lanes-leading array; the batch maps
+    # its leading lanes and slices the trailing per-lane dimensions, so no
+    # broadcast reshaping applies to it.
+    lifted !== arg && return input
+    return Reactant.Ops.broadcast_in_dim(
+        input, collect(Int64, 1:ndims(input)), shape)
+end
 
 function _reactant_plate_batch(operation, args, batch_positions, scalar_positions,
         batch_inputs, batch_shape)
@@ -1533,16 +1603,22 @@ function _reactant_ref_plate_call(operation, args::Tuple)
     positions = Tuple(index for index in eachindex(args)
         if getfield(args, index) isa Union{AbstractArray,Tuple})
     inputs = Reactant.TracedRArray[
-        let input = _reactant_plate_broadcast_input(getfield(args, index))
-            Reactant.Ops.broadcast_in_dim(
-                input, collect(Int64, 1:ndims(input)), shape)
-        end for index in positions
+        _reactant_lane_batch_input(getfield(args, index), shape)
+        for index in positions
     ]
-    result = _reactant_plate_batch(operation, args, positions, positions, inputs, shape)
+    # A broadcast input always has exactly the lane rank, so it contributes one
+    # scalar per lane as before; a stacked nesting keeps trailing per-lane
+    # dimensions above the lane rank, and its lanes arrive as whole slices.
+    scalar_positions = Tuple(positions[k] for k in eachindex(positions)
+        if ndims(inputs[k]) == length(shape))
+    result = _reactant_plate_batch(operation, args, positions, scalar_positions,
+        inputs, shape)
     # An empty batch can leave tensor.empty after Reactant's batch lowering,
     # which XLA cannot export. Its shape and element type are already known,
     # and it contains no parameter-dependent values: return the empty constant.
-    isempty(result) ? zeros(Reactant.unwrapped_eltype(result), size(result)) : result
+    result = isempty(result) ?
+        zeros(Reactant.unwrapped_eltype(result), size(result)) : result
+    return _wrap_vector_lane_batch(result, shape)
 end
 
 function ReactiveKernels._tensorized_plate_call(
