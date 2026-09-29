@@ -86,4 +86,60 @@ function _authored_scan_eachrow_reference(mat, gain)
     seq
 end
 
+# Keep scan at the top level of its own authored recipe, then call the prepared
+# kernel only from the live arm of a separate graph. This preserves a genuine
+# empty schedule without asking scan to infer an output type from zero steps.
+@kernel authored_scan_nonempty(mat::Matrix{Float64}, positions::Vector{Int}) = begin
+    weights::Vector{Float64} = scan(eachrow(mat), Ref(positions);
+            init = (; prior = zeros(Float64, length(positions)), index = 1)) do carry, row, slots
+        weight = row[1] + sum(carry.prior)
+        next = ifelse.(slots .== carry.index, weight, carry.prior)
+        ((; prior = next, index = carry.index + 1), weight)
+    end
+    return weights
+end
+
+const prepared_authored_scan_nonempty = prepare(authored_scan_nonempty)
+
+# A consumer using only `import ReactiveKernels` can still author a scan by
+# qualifying its callee. The macro resolves that binding before constructing
+# the scan op; a typed left-hand side is supported in either spelling.
+module QualifiedScanBinding
+import ReactiveKernels
+
+const spec = ReactiveKernels.@kernel qualified_scan(xs::Vector{Float64}) = begin
+    values::Vector{Float64} = ReactiveKernels.scan(xs; init = 0.0) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    return values
+end
+const prepared = ReactiveKernels.prepare(spec)
+
+end
+
+module BareScanWithoutBinding
+import ReactiveKernels
+
+const spec = ReactiveKernels.@kernel unbound_scan(xs::Vector{Float64}) = begin
+    values::Vector{Float64} = scan(xs; init = 0.0) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    return values
+end
+const prepared = ReactiveKernels.prepare(spec)
+
+end
+
+@kernel authored_scan_lazy_branch(mat::Matrix{Float64}, positions::Vector{Int}, n::Int) = begin
+    weights::Vector{Float64} = if n == 0
+        Float64[]
+    else
+        prepared_authored_scan_nonempty(mat, positions)
+    end
+    total::Float64 = sum(weights)
+    return total
+end
+
 end

@@ -5,10 +5,34 @@ if !isdefined(@__MODULE__, :AuthoredScanFixtures)
     include(joinpath(@__DIR__, "fixtures", "authored_scan.jl"))
 end
 using .AuthoredScanFixtures: authored_scan_arma, _authored_scan_reference,
-    authored_scan_lockstep, _authored_scan_lockstep_reference
+    authored_scan_lockstep, _authored_scan_lockstep_reference,
+    authored_scan_lazy_branch, prepared_authored_scan_nonempty
 
 _authored_scan_allocated(k, args::Vararg{Any,N}) where {N} = @allocated k(args...)
 _authored_scan_mixed(x) = Base.inferencebarrier(x > 2 ? 1.5 : 1)
+
+@testset "authored scan composes with a lazy empty branch" begin
+    mat = [1.0 0.2 0.1; 2.0 0.3 0.4; 3.0 0.5 0.6]
+    positions = collect(1:3)
+    expected = [1.0, 3.0, 7.0]
+    weights = prepare(authored_scan_lazy_branch; want = :weights)
+    total = prepare(authored_scan_lazy_branch; want = :total)
+    @test prepared_authored_scan_nonempty(mat, positions) == expected
+    @test weights(mat, positions, 3) == expected
+    @test total(mat, positions, 3) == sum(expected)
+
+    empty_mat, empty_positions = zeros(Float64, 0, 1), Int[]
+    @test weights(empty_mat, empty_positions, 0) == Float64[]
+    @test total(empty_mat, empty_positions, 0) == 0.0
+    @test_throws ArgumentError weights(empty_mat, empty_positions, 1)
+
+    qualified = AuthoredScanFixtures.QualifiedScanBinding.prepared
+    @test qualified([1.0, 2.0, 3.0]) == [1.0, 3.0, 6.0]
+    @test count(r -> r.op isa ReactiveKernels._AuthoredScanOp,
+                qualified.plan.recipes) == 1
+    unbound = AuthoredScanFixtures.BareScanWithoutBinding.prepared
+    @test_throws UndefVarError unbound([1.0, 2.0, 3.0])
+end
 
 @testset "authored scan native step lowering" begin
     q = [0.2, 0.7, -0.3]

@@ -6,6 +6,33 @@ if !isdefined(@__MODULE__, :AuthoredScanFixtures)
     include(joinpath(@__DIR__, "fixtures", "authored_scan.jl"))
 end
 
+@testset "prepared authored scan runs only in the live lazy arm" begin
+    mat = [1.0 0.2 0.1; 2.0 0.3 0.4; 3.0 0.5 0.6]
+    positions = collect(1:3)
+    traced_mat = Reactant.to_rarray(mat)
+    traced_positions = Reactant.to_rarray(positions)
+    weights = prepare(AuthoredScanFixtures.authored_scan_lazy_branch; want = :weights)
+    compiled = Reactant.@compile weights(traced_mat, traced_positions, 3)
+    @test Array(compiled(traced_mat, traced_positions, 3)) == weights(mat, positions, 3)
+    hlo = repr(Reactant.@code_hlo optimize = false weights(traced_mat, traced_positions, 3))
+    @test count("stablehlo.while", hlo) == 1
+
+    empty_mat = Reactant.to_rarray(zeros(Float64, 0, 1))
+    empty_positions = Reactant.to_rarray(Int[])
+    total = prepare(AuthoredScanFixtures.authored_scan_lazy_branch; want = :total)
+    empty_compiled = Reactant.@compile total(empty_mat, empty_positions, 0)
+    @test Reactant.to_number(empty_compiled(empty_mat, empty_positions, 0)) == 0.0
+    empty_hlo = repr(Reactant.@code_hlo optimize = false total(empty_mat, empty_positions, 0))
+    @test count("stablehlo.while", empty_hlo) == 0
+
+    qualified = AuthoredScanFixtures.QualifiedScanBinding.prepared
+    traced_xs = Reactant.to_rarray([1.0, 2.0, 3.0])
+    qualified_compiled = Reactant.@compile qualified(traced_xs)
+    @test Array(qualified_compiled(traced_xs)) == [1.0, 3.0, 6.0]
+    qualified_hlo = repr(Reactant.@code_hlo optimize = false qualified(traced_xs))
+    @test count("stablehlo.while", qualified_hlo) == 1
+end
+
 @testset "authored scan retains its tensorized carry loop" begin
     spec = AuthoredScanFixtures.authored_scan_arma
     q, series = [0.2, 0.7, -0.3], sin.(1:20)
