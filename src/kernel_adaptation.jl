@@ -1058,6 +1058,7 @@ end
 # allocation gates below prove the distinction.  Do not mislabel the retained library cache root as an
 # Any-free value graph.
 _sm_compiled_call(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction) = f
+_sm_compiled_call(f::_PrecompileWarmFunction) = f
 
 _sm_reject(msg) = throw(_LLowerReject(msg))
 
