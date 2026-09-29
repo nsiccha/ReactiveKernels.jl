@@ -17,6 +17,30 @@ const _TRANSIT_LOOSE_RULE = prepare_transit_twocmt_rule(; series_rtol = 1e-6,
 _transit_loose_weighted(lp, ts, weights) =
     dot(weights, _TRANSIT_LOOSE_RULE(ts, exp.(lp)))
 
+function _transit_rule_primal_bytes(ts, p)
+    transit_twocmt_rule(ts, p)
+    @allocated transit_twocmt_rule(ts, p)
+end
+function _transit_direct_primal_bytes(ts, p)
+    transit_twocmt_unit_response(ts, p[1], p[2], p[3], p[4], p[5])
+    @allocated transit_twocmt_unit_response(ts, p[1], p[2], p[3], p[4], p[5])
+end
+
+@testset "transit primal selects values without derivative arrays" begin
+    p = [0.08, 0.15, 0.05, 0.2, 1.2]
+    for n in (7, 1024)
+        ts = collect(range(0., 168.; length = n))
+        values = transit_twocmt_rule(ts, p)
+        joint, _ = stage_primal(transit_twocmt_rule, Val(2), ts, p)
+        @test values == joint
+        # A primal should allocate only its returned response, not the
+        # n-by-5 parameter Jacobian and n-vector of lag partials.
+        bytes = _transit_rule_primal_bytes(ts, p)
+        direct_bytes = _transit_direct_primal_bytes(ts, p)
+        @test bytes <= direct_bytes + 256
+    end
+end
+
 @testset "transit generated reverse rule" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     for c in _TRANSIT_CASES

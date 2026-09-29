@@ -1,5 +1,48 @@
 # Two-compartment transit reverse-gradient comparison
 
+## Primal selection and shared reverse work, 2026-09-29
+
+`primal.jl` compares the earlier tuple-projection rule graph with the same
+recurrence exposed as value-only and joint value/partials recipes. Both run
+in the same process. The generated-rule compiler now accepts tuple-output
+recipes, so the ordinary planner selects a value-only call for a primal and
+one joint call for reverse staging. No new AD adapter or model-specific cache
+is involved.
+
+```sh
+julia --startup-file=no --threads=1 --project=/path/to/consumer-env \
+  benchmark/transit_twocmt/primal.jl /scratch/primal-results.tsv
+```
+
+Strato2 run `Fdbasf` exited 0 in 47 seconds. It used Julia 1.10.11,
+Enzyme 0.13.205, one Julia/BLAS thread, ten warmups and sixty shuffled
+five-call samples. The lag grids span 0–168 hours; parameters are
+`[0.08, 0.15, 0.05, 0.2, shape]`. The old/new values, parameter gradients,
+and staged pullbacks for all three activity masks were bit-identical.
+
+| Lags | Shape | Previous primal, μs | Current primal, μs | Previous gradient, μs | Current gradient, μs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 11 | 1.2 | 3.835 | 2.002 | 4.232 | 4.240 |
+| 11 | 8.0 | 3.012 | 1.415 | 3.176 | 3.188 |
+| 1401 | 1.2 | 431.120 | 206.340 | 440.430 | 439.892 |
+| 1401 | 8.0 | 397.947 | 197.858 | 409.521 | 412.146 |
+
+Primal speedups are 1.92–2.13× in these unit-response cases. At 1401 lags,
+Julia allocations fall from 79,056 to 11,552 bytes; gradient allocations
+remain 90,656 bytes. The gradient timings differ by less than 0.7% in this
+run. This is a primitive-level comparison, not a claim of the same speedup
+for a full posterior or application.
+
+The domain-independent multi-output regression counts executions: no joint
+derivative recipe in the primal, one joint recipe in reverse staging, and no
+recomputation by the pullback. It also verifies bound preparation and explicit
+rebinding. The transit regression checks response-only allocation growth at
+7/1024 lags, with independent quadrature and ordinary reverse checks retained.
+Raw samples summarized by median/IQR and both focused-suite receipts are in
+`results-primal-strato2-20260929.tsv` and `receipt-primal-strato2-20260929.txt`.
+
+## Original reverse comparison
+
 This benchmark compares three paths for the same scalar: the sum of central
 unit-dose amounts on a deterministic 1401-lag grid. The five differentiated
 linear coordinates are `[k10, k12, k21, rate, shape]`.

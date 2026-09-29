@@ -69,6 +69,34 @@ neither directions nor the covector, in HAVE order (`A`, `x`). The returned
 
 ## One graph, selected cuts
 
+Rule graphs support ordinary multi-output recipes. A mathematical primitive
+can offer a value-only recipe alongside a joint recipe that shares work between
+the value and partials:
+
+```julia
+@kernel sine_graph(x::Float64) = begin
+    y::Float64 = sin(x)
+    (y, dy::Float64) = sincos(x)
+    return y, dy
+end
+const sine = scalar_derivative_rule(sine_graph;
+    primal = :y, partials = (x = :dy,))
+```
+
+The ordinary planner selects `sin` for the primal and one `sincos` call when
+both value and partial are needed. The same tuple-output support applies to
+vector rules and their reverse stages: joint outputs are available together,
+and covector-dependent outputs remain in the reverse stage. Neither the AD
+adapter nor the caller chooses a separate implementation.
+
+This does not inspect the body of an opaque recipe or discover equivalent
+algorithms. The graph must expose the value-only and joint mathematical
+recipes. Returning a tuple from one opaque helper and then indexing its first
+element still executes that helper's complete body. For example, the native
+transit response graph offers its existing value recurrence and the joint
+value/partial recurrence; a plain call omits derivative arrays, while reverse
+staging computes the joint recurrence once and retains the partials.
+
 The panels below prepare the same HAVE→WANT boundaries explicitly, execute
 each cut during the documentation build, and show its generated Julia and
 selected compute DAG.
