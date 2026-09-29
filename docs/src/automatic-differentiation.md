@@ -95,6 +95,10 @@ constants in the residual kernel, and the prepared derivative boundary accepts
 only the remaining HAVE ports. Rebind by preparing again from the original
 kernel specification.
 
+Bound data may also contain tuples or named tuples of arrays. Native AD
+preserves the record shape and copies nested array views into ordinary arrays
+at preparation. Rebinding such records uses the same preparation step.
+
 ```julia
 bound_prepared = prepare_ad(
     objective, backend, parameters, 1.25, 0.0;
