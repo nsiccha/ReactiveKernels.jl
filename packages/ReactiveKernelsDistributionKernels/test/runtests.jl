@@ -6,8 +6,8 @@ using Distributions: Bernoulli, BetaBinomial, Binomial, Cauchy, Dirichlet, Expon
 import Enzyme
 using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky, diag
 using LogExpFunctions: log1pexp
-using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, code_expr, explain,
-    extract, plan, plate, prepare
+using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, ad_gradient, code_expr,
+    explain, extract, plan, plate, prepare, prepare_ad
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     LOCATION_SCALE_SOURCE,
@@ -356,6 +356,23 @@ end
     let L = [1.0 0.0; 0.6 0.8]
         @test kernel(L, 2.0) ≈ logpdf(LKJCholesky(2, 2.0, :L),
                                       Cholesky(LowerTriangular(L)))
+    end
+    # Native reverse Enzyme through the LKJ density (snag lkj-corr-cholesk-44503bef):
+    # the index vectors are materialized before float scaling, so no TwicePrecision
+    # StepRangeLen is built. Oracle: d/dL[i,i] Σⱼ wⱼ log L[j,j] = wᵢ/L[i,i] with
+    # wᵢ = K + 2(eta - 1) - i; off-diagonals are 0. K = 2 covers the empty
+    # normalizer sum; K = 3 the nonempty one.
+    @testset "native Enzyme gradient" begin
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        for (L, eta) in (([1.0 0.0; 0.6 0.8], 2.0),
+                ([1.0 0.0 0.0; 0.6 0.8 0.0; 0.3 0.4 0.8660254037844386], 2.0))
+            K = size(L, 1)
+            w = (K + 2 * (eta - 1)) .- collect(1:K)
+            expected = [i == j ? w[i] / L[i, i] : 0.0 for i in 1:K, j in 1:K]
+            @test gradient(L_ -> kernel(L_, eta), backend, L) ≈ expected
+            prepared = prepare_ad(kernel, backend, L, eta; active = :L)
+            @test ad_gradient(prepared, L, eta) ≈ expected
+        end
     end
     @test occursin("@kernel lkj_corr_cholesky", LKJ_CORR_CHOLESKY_KERNEL_SOURCE)
     @test !occursin("Distributions", string(code_expr(kernel)))
