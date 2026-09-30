@@ -1463,3 +1463,64 @@ end
     @test ReactiveKernels._tensorized_get(u, 2, 0.0) === -2.25
     @test ReactiveKernels._tensorized_get(Dict(:a => 1), :b, 0) === 0
 end
+
+module TraceableHelperFixtures
+using ReactiveKernels
+struct Lattice
+    shifts::Vector{Int}
+end
+struct Exact end
+@traceable row_index(t, p::Lattice, i) = t - p.shifts[i]
+@traceable row_index(row, ::Exact, i) = row[i]
+@traceable function clipped(x, lo = 0.0)::Float64
+    y = x - lo
+    if y > 0
+        return y
+    else
+        return 0.0
+    end
+end
+@traceable scaled(x::T, s) where {T<:Real} = s * x
+end
+
+@testset "@traceable: the method as written, plus the rewritten one for tracing" begin
+    H = TraceableHelperFixtures
+    lattice = H.Lattice([0, 2, 5])
+    # The native method is the authored one.
+    @test H.row_index(7, lattice, 2) == 5
+    @test H.row_index([4, 9, 1], H.Exact(), 2) == 9
+    @test H.clipped(2.5, 1.0) === 1.5 && H.clipped(0.5, 1.0) === 0.0 && H.clipped(2.0) === 2.0
+    @test H.scaled(2, 1.5) == 3.0
+    # The tensorized hook dispatches to the rewritten body by the authored
+    # signature; on host values it computes what the method computes.
+    call = ReactiveKernels._tensorized_call
+    @test call(H.row_index, 7, lattice, 2) == 5
+    @test call(H.row_index, [4, 9, 1], H.Exact(), 2) == 9
+    @test call(H.clipped, 2.5, 1.0) === 1.5 && call(H.clipped, 0.5, 1.0) === 0.0
+    @test call(H.clipped, 2.0) === 2.0
+    @test call(H.scaled, 2, 1.5) == 3.0
+    @test call(+, 1, 2) == 3
+    # The rewritten body carries the recipe rewrites (a traced index reads
+    # through `_tensorized_getindex`; a branch is lazy).
+    rewritten = string(ReactiveKernels._traceable_definition(
+        :(row_index(t, p::Lattice, i) = t - p.shifts[i]), H))
+    @test occursin("_tensorized_getindex", rewritten)
+    @test occursin("_recurrence_branch", string(ReactiveKernels._traceable_definition(
+        :(f(x) = x > 0 ? x : zero(x)), H)))
+    # A recipe routes calls to helpers through the hook; Base and package
+    # calls, and calls with keyword arguments, keep their form.
+    lower(ex) = string(ReactiveKernels._kernel_tensorized_rhs(ex, Set{Symbol}(), H,
+                                                              Set([:t, :p, :i, :x])))
+    @test occursin("_tensorized_call", lower(:(row_index(t, p, i))))
+    @test occursin("_tensorized_call", lower(:(not_yet_defined(t))))
+    @test !occursin("_tensorized_call", lower(:(exp(x) + sum(x))))
+    @test !occursin("_tensorized_call", lower(:(plate(x))))
+    @test !occursin("_tensorized_call", lower(:(row_index(t, p; i = i))))
+    # Loud refusals.
+    define(ex) = ReactiveKernels._traceable_definition(ex, H)
+    @test_throws ArgumentError define(:(sum(x::Lattice) = 0))
+    @test_throws ArgumentError define(:(g(x; k = 1) = x))
+    @test_throws ArgumentError define(:(g(x) = (x > 0 && return 1; 2)))
+    @test_throws ArgumentError define(:(g(x)))
+    @test_throws ArgumentError define(:((x -> x)(y) = y))
+end

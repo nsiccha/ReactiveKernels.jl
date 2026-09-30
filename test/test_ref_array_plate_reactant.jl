@@ -486,6 +486,45 @@ end
     end
     return concentration
 end
+# One graph over both plan types with the per-type rule in a dispatching
+# helper, summed over `eachindex` of the doses (snag
+# `retained-dose-lo-08380b54`). `@traceable` gives the helper the recipe
+# rewrites, so its reads at the traced dose index lower as they do inline and
+# the dose axis stays one retained loop. The inline cells are the references.
+@traceable _row(t, plan::Lattice, j) = t - plan.shifts[j]
+@traceable _row(row, ::Exact, j) = row[j]
+@kernel traceable_cell(plan, units, weights) = begin
+    observations = _domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, _row(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return concentration
+end
+@kernel inline_lattice_cell(plan, units, weights) = begin
+    observations = _domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, t - p.shifts[j], 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return concentration
+end
+@kernel inline_exact_cell(plan, units, weights) = begin
+    observations = _domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, t[j], 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return concentration
+end
+# The same helper without `@traceable`: Reactant refuses its read at the
+# traced index.
+_plain_row(t, plan::Lattice, j) = t - plan.shifts[j]
+_plain_row(row, ::Exact, j) = row[j]
+@kernel plain_helper_cell(plan, units, weights) = begin
+    observations = _domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, _plain_row(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return concentration
+end
 # `get` outside a plate: every recipe op selects its tensorized companion on
 # traced arguments, so a plain kernel reads a traced or host table the same way.
 @kernel table_read(index, table::Vector{Float64}, hosted::Vector{Float64}) = begin
@@ -560,6 +599,37 @@ end
             repr(Reactant.@code_hlo optimize = :none kernel(plan, runits, rw))
         end
         @test count("\n", programs[1]) == count("\n", programs[2])
+    end
+
+    @testset "a @traceable dispatching helper keeps the dose axis one retained loop" begin
+        traceable = prepare(F.traceable_cell)
+        plans(ndoses) = let s = [div((i - 1) * nobs, ndoses) + 1 for i in 1:ndoses]
+            (F.Lattice(s, nobs), F.Exact([max(t - si, 0) for t in 1:nobs, si in s]))
+        end
+        for (index, reference) in ((1, prepare(F.inline_lattice_cell)),
+                                   (2, prepare(F.inline_exact_cell)))
+            programs = map((3, 6)) do ndoses
+                plan = plans(ndoses)[index]
+                w = collect(range(1.0, 2.0; length = ndoses))
+                rw = Reactant.to_rarray(w)
+                expected = reference(plan, units, w)
+                @test traceable(plan, units, w) == expected
+                compiled = Reactant.@compile sync = true traceable(plan, runits, rw)
+                @test Array(compiled(plan, runits, rw)) ≈ expected
+                @test Array(compiled(plan, runits2, rw)) ≈ reference(plan, units2, w)
+                hlo = repr(Reactant.@code_hlo optimize = :none traceable(plan, runits, rw))
+                inline = repr(Reactant.@code_hlo optimize = :none reference(plan, runits, rw))
+                @test count("\n", hlo) == count("\n", inline)
+                @test count("stablehlo.while", hlo) == count("stablehlo.while", inline)
+                hlo
+            end
+            @test occursin("stablehlo.while", programs[1])
+            @test count("\n", programs[1]) == count("\n", programs[2])
+            plain = prepare(F.plain_helper_cell)
+            plan = plans(3)[index]
+            rw = Reactant.to_rarray([1.0, 1.5, 2.0])
+            @test_throws "Scalar indexing is disallowed" Reactant.@compile plain(plan, runits, rw)
+        end
     end
 
     @testset "get in a plain kernel: traced index, host table, concrete index" begin

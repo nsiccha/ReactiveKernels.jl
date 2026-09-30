@@ -57,9 +57,12 @@ code is not executed by the docs build.
   `sum(term for i in eachindex(x) [if cond]; init = x0)`, is the same retained
   loop with an explicit accumulator (the filter stays a lazy branch), so a sum
   over doses does not grow the program with the dose count. The loop index is
-  then traced: indexing written in the term is lowered, host tables included,
-  while a helper function indexing with it has no traced method. A generator
-  over a helper-produced iterator keeps the per-element trace.
+  then traced: indexing written in the term is lowered, host tables included.
+  A helper the term calls with it is lowered the same way when it is defined
+  with `@traceable` (`@traceable lag(t, p::Lattice, j) = t - p.shifts[j]`);
+  an ordinary helper indexing with it fails with `Scalar indexing is
+  disallowed`. A generator over a helper-produced iterator keeps the
+  per-element trace.
 - A traced Cholesky factorization is a wrapper type owned by the Reactant
   extension, with `LinearAlgebra.Cholesky`'s accessors (`.L`, `.U`, `.UL`,
   `.factors`) and solves (`\`, `ldiv!`; a diagonal factor divides

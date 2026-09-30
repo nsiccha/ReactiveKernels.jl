@@ -108,6 +108,21 @@ A domain port needs no declared type. `observations = domain(plan)`, with
 `domain` returning `1:plan.nobs` for one plan type and `eachrow(plan.rows)` for
 another, is one graph for both: the native loop is scheduled from the value
 each call receives, exactly as for a declared `UnitRange` or `Vector` domain.
+The per-type rule belongs in a dispatching helper defined with `@traceable`,
+iterated over `eachindex` of the doses:
+
+```julia
+@traceable lag(t, p::LatticePlan, j) = t - p.shifts[j]
+@traceable lag(row, ::ExactPlan, j) = row[j]
+# in the cell
+sum(w[j] * get(u, lag(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+```
+
+Natively `lag` is the method as written. Under a tracing backend the sum is
+one retained loop whose index is traced, and `@traceable` gives the helper the
+same lowering of `p.shifts[j]` and `row[j]` that the term gets, so the program
+is the one the inline spelling emits for either plan. An ordinary helper
+cannot read at a traced index (`Scalar indexing is disallowed`).
 
 Purity is the plate contract, just as it is for ordinary stateless RK recipes.
 RK does not inspect an opaque Julia callable to prove its implementation pure;

@@ -523,6 +523,14 @@ end
 # authorize their backend's scalar gather lowering.
 @inline _tensorized_getindex(args...) = getindex(args...)
 
+# A call in a tensorized fused body to a function this package and Base do not
+# own routes through this hook (`_kernel_tensorized_rhs`).  Without a
+# `@traceable` method it is exactly the call; `@traceable f(args...) = body`
+# adds a method for `typeof(f)` whose body has the recipe rewrites, so a
+# helper that indexes with a traced loop index lowers like the same indexing
+# written in the recipe.  The native body never routes through it.
+@inline _tensorized_call(f::F, args::Vararg{Any,N}) where {F,N} = f(args...)
+
 # `get(A, i, default)` in a tensorized fused body routes through this hook: the
 # total gather that reads `A[i]` when `i` is a valid index and yields `default`
 # otherwise (a causal response that is zero before its dose, a lookup table
