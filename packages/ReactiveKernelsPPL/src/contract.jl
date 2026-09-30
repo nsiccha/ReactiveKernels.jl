@@ -929,7 +929,61 @@ struct SplineVector
 end
 
 """
-    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period)
+    HyperPrior(family, args)
+
+A literal-argument prior on a positive hyperparameter (HSGP length
+scale / marginal scale, spline smoothing sd): `family` in
+[`_HYPER_PRIOR_FAMILIES`](@ref), `args` its literal arguments as
+`(arg1 = ..., ...)` in Distributions.jl order. Stan-kernel semantics
+on the positive support: the plain `_lpdf` plus the transform
+Jacobian, no truncation normalizer (SB `length_scale(...)`/`sd(...)`
+term priors).
+"""
+struct HyperPrior
+    family::Symbol
+    args::NamedTuple
+end
+
+# Admitted hyperparameter prior families (positive-support or Stan-kernel
+# halves of symmetric families) and their Distributions arities.
+const _HYPER_PRIOR_FAMILIES = Dict{Symbol,Tuple{Vararg{Int}}}(
+    :lognormal => (2,), :inverse_gamma => (2,), :gamma => (2,),
+    :exponential => (1,), :normal => (2,), :cauchy => (2,),
+    :student_t => (3,), :uniform => (2,))
+
+# A `Uniform(lo, hi)` hyper prior BOUNDS its hyperparameter (the SB
+# prior-bound intersection with the positive support): the
+# hyperparameter rides an `(:interval, lo, hi)` transform. `nothing`
+# for every other family (positive `exp` support).
+_hyper_prior_bounds(hp::HyperPrior) = hp.family === :uniform ?
+    (Float64(hp.args.arg1), Float64(hp.args.arg2)) : nothing
+_hyper_prior_bounds(::Nothing) = nothing
+
+function _validate_hyper_prior(hp::HyperPrior, label::Symbol, what)
+    haskey(_HYPER_PRIOR_FAMILIES, hp.family) || _fail(label,
+        "$what prior family $(hp.family) is not admitted (admitted: " *
+        "$(join(sort!(collect(keys(_HYPER_PRIOR_FAMILIES))), ", ")))")
+    length(hp.args) in _HYPER_PRIOR_FAMILIES[hp.family] || _fail(label,
+        "$what prior $(hp.family) takes " *
+        "$(_HYPER_PRIOR_FAMILIES[hp.family]) arguments, got " *
+        "$(length(hp.args))")
+    keys(hp.args) == ntuple(i -> Symbol(:arg, i), length(hp.args)) ||
+        _fail(label, "$what prior args must be `(arg1, ...)`, got " *
+              "$(keys(hp.args))")
+    all(v -> v isa Real && !(v isa Bool) && isfinite(v), values(hp.args)) ||
+        _fail(label, "$what prior args must be finite numeric " *
+              "literals, got $(hp.args)")
+    if hp.family === :uniform
+        lo, hi = hp.args.arg1, hp.args.arg2
+        0 <= lo < hi || _fail(label, "$what prior Uniform($lo, $hi) must " *
+            "satisfy 0 <= lo < hi (it bounds a positive hyperparameter)")
+    end
+    return nothing
+end
+
+"""
+    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period[, rho_prior,
+              sigma_prior])
 
 One Hilbert-space GP basis (SB `_sb_hsgp` / `_sb_hsgp_periodic`):
 `axes` raw data columns, `K` modes per axis, `c` boundary factors per
@@ -947,6 +1001,20 @@ constant (finite and positive iff periodic, `NaN` otherwise). A
 periodic basis takes exactly one isotropic axis, carries no fits and
 no domain (`c` is validated but ignored, the SB mirror), and owns `M
 = 2k` basis functions (cosines then sines over `k` harmonics).
+
+`rho_prior` / `sigma_prior` override the default `lognormal(0, 1)`
+priors ([`HyperPrior`](@ref), SB `length_scale(:, hsgp(x)) ~ ...` /
+`sd(:, hsgp(x)) ~ ...`). An explicit length-scale prior replaces the
+whole default declaration INCLUDING the approximation-validity floor
+(BRM `_brm_hsgp_declared_rho_lower`): the length scales then ride a
+plain `exp` transform; a `Uniform(lo, hi)` prior instead BOUNDS the
+hyperparameter (`(:interval, lo, hi)`, SB prior-bound intersection).
+`nothing` keeps the default.
+
+`domain` (SB `hsgp(...; domain=...)`) fixes the eigenfunction domain
+per axis as `(lower, upper)` pairs: bind uses `(mu, L) = ((lo+hi)/2,
+(hi-lo)/2)` instead of the data-fitted `L = c*max|x-mu|` (so `c` does
+not apply), and every bound axis value must lie inside its pair.
 """
 struct HSGPBasis
     id::Symbol
@@ -958,7 +1026,28 @@ struct HSGPBasis
     label::Symbol
     cov::Symbol
     period::Float64
+    rho_prior::Union{Nothing,HyperPrior}
+    sigma_prior::Union{Nothing,HyperPrior}
+    domain::Union{Nothing,Vector{Tuple{Float64,Float64}}}
 end
+
+"""Default-prior construction (SB `_sb_hsgp`'s `lognormal(0, 1)`
+length scales on the validity floor + `lognormal(0, 1)` marginal
+scale)."""
+HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
+    c::Vector{Float64}, iso::Bool,
+    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
+    period::Float64) =
+    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, nothing,
+        nothing, nothing)
+
+"""Stated-hyper-prior construction without a fixed domain."""
+HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
+    c::Vector{Float64}, iso::Bool,
+    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
+    period::Float64, rho_prior, sigma_prior) =
+    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, rho_prior,
+        sigma_prior, nothing)
 
 """Exp-quad v1 positional construction (periodic defaults: `cov =
 :exp_quad`, `period = NaN`)."""
@@ -3059,8 +3148,17 @@ function _validate_splines(plan::StructuralPlan)
             "$wantnames, got $gotvec")
         byname = Dict{Symbol,SplineVector}(v.name => v
             for v in plan.spline_vectors if v.basis === sb.id)
+        _, sdname = _spline_block_roles(sb.id, sb.kind, sb.k)
         for (vname, vfamily, vargs, vsupport, vwidth) in wantvec
             v = byname[vname]
+            # The smoothing-sd vector may carry a stated hyper prior
+            # (SB `sd(mu, s(x)) ~ ...`) — same Stan-kernel positive
+            # support and width, family/args from the admitted set.
+            if vname === sdname && !(v.family === vfamily && v.args == vargs)
+                _validate_hyper_prior(HyperPrior(v.family, v.args), :plan,
+                    "spline :$(sb.id) sd")
+                vfamily, vargs = v.family, v.args
+            end
             (v.family === vfamily && v.args == vargs &&
              v.support_override === vsupport && v.width == vwidth) ||
                 _fail(:plan, "spline :$(sb.id): vector :$vname must be " *
@@ -3138,6 +3236,20 @@ function _validate_hsgp(plan::StructuralPlan)
     length(unique(labels)) == length(labels) ||
         _fail(:plan, "duplicate hsgp basis labels")
     for hb in plan.hsgp_bases
+        hb.rho_prior === nothing || _validate_hyper_prior(hb.rho_prior,
+            :plan, "hsgp :$(hb.id) length-scale")
+        hb.sigma_prior === nothing || _validate_hyper_prior(hb.sigma_prior,
+            :plan, "hsgp :$(hb.id) sd")
+        if hb.domain !== nothing
+            hb.cov === :periodic && _fail(:plan, "hsgp :$(hb.id): a " *
+                "periodic basis has no domain (drop `domain=`)")
+            length(hb.domain) == length(hb.axes) || _fail(:plan,
+                "hsgp :$(hb.id): domain has $(length(hb.domain)) pairs " *
+                "for $(length(hb.axes)) axes (one `(lower, upper)` per axis)")
+            all(p -> isfinite(p[1]) && isfinite(p[2]) && p[1] < p[2],
+                hb.domain) || _fail(:plan, "hsgp :$(hb.id): domain pairs " *
+                "must be finite with lower < upper, got $(hb.domain)")
+        end
         d = length(hb.axes)
         d >= 1 ||
             _fail(:plan, "hsgp :$(hb.id): takes at least one axis column")
@@ -8587,20 +8699,35 @@ function _fit_hsgp_bases(plan::StructuralPlan,
                 _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
                       "must be finite")
             push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso,
-                Tuple{Float64,Float64}[], hb.label, hb.cov, hb.period))
+                Tuple{Float64,Float64}[], hb.label, hb.cov, hb.period,
+                hb.rho_prior, hb.sigma_prior, hb.domain))
             continue
         end
         fits = Tuple{Float64,Float64}[]
-        for (c, cj) in zip(hb.axes, hb.c)
+        for (j, (c, cj)) in enumerate(zip(hb.axes, hb.c))
             haskey(columns, c) ||
                 _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
                       "not bound")
             col = _vector_column(columns, c, hb.label, "hsgp axis column")
-            push!(fits, _hsgp_axis_fit(col, cj, hb.label,
-                "hsgp :$(hb.id): axis column $c"))
+            if hb.domain === nothing
+                push!(fits, _hsgp_axis_fit(col, cj, hb.label,
+                    "hsgp :$(hb.id): axis column $c"))
+            else
+                # Fixed domain (SB `_brm_hsgp_domain_fits` /
+                # `_brm_check_hsgp_domain`): the data must lie inside.
+                lo, hi = hb.domain[j]
+                eltype(col) <: Real && all(isfinite, col) ||
+                    _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
+                          "must be finite numeric")
+                all(v -> lo <= v <= hi, col) || _fail(hb.label,
+                    "hsgp :$(hb.id): axis column $c has values outside " *
+                    "its fixed domain ($lo, $hi)")
+                push!(fits, ((lo + hi) / 2, (hi - lo) / 2))
+            end
         end
         push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, fits,
-            hb.label, hb.cov, hb.period))
+            hb.label, hb.cov, hb.period, hb.rho_prior, hb.sigma_prior,
+            hb.domain))
     end
     return out
 end

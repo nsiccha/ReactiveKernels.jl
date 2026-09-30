@@ -396,11 +396,19 @@ function assign_layout(plan::StructuralPlan)
                 "(bind_data fills one (mu, L) per axis)"))
         end
         names = _hsgp_names(hb)
-        floors = hb.cov === :periodic ?
+        # A stated length-scale prior replaces the default declaration
+        # including its validity floor (BRM
+        # `_brm_hsgp_declared_rho_lower`): plain `exp` length scales.
+        floors = hb.rho_prior !== nothing ? zeros(length(names.rhos)) :
+            hb.cov === :periodic ?
             [_hsgp_periodic_rho_lower(only(hb.K))] :
             _hsgp_floors(hb.K, hb.fits, hb.iso)
+        rbounds = _hyper_prior_bounds(hb.rho_prior)
         for (rho, fl) in zip(names.rhos, floors)
-            if fl == 0.0
+            if rbounds !== nothing
+                push!(entries, LayoutEntry(:sampled, nothing, rho, [rho],
+                    offset, 1, :interval, rbounds...))
+            elseif fl == 0.0
                 push!(entries, LayoutEntry(:sampled, nothing, rho, [rho],
                     offset, 1, :exp))
             else
@@ -409,8 +417,12 @@ function assign_layout(plan::StructuralPlan)
             end
             offset += 1
         end
-        push!(entries, LayoutEntry(:sampled, nothing, names.sigma,
-            [names.sigma], offset, 1, :exp))
+        sbounds = _hyper_prior_bounds(hb.sigma_prior)
+        push!(entries, sbounds === nothing ?
+            LayoutEntry(:sampled, nothing, names.sigma, [names.sigma],
+                offset, 1, :exp) :
+            LayoutEntry(:sampled, nothing, names.sigma, [names.sigma],
+                offset, 1, :interval, sbounds...))
         offset += 1
         M = _hsgp_n_basis(hb)
         push!(entries, LayoutEntry(:hsgp, nothing, names.beta, [names.beta],

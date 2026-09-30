@@ -3243,16 +3243,23 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     # floored rhos emit WITHOUT a truncation normalizer: SB's
     # `lognormal(0,1; lower=rho_lower)` is Stan lower-bound kernel
     # semantics (offset-exp Jacobian only — the varying-`tau` precedent).
+    # Stated hyper priors (`HyperPrior`) replace the defaults with the
+    # same Stan-kernel semantics (plain `_lpdf`, no normalizer).
     for hb in plan.hsgp_bases
         names = _hsgp_names(hb)
+        rfam, rargs = hb.rho_prior === nothing ? (:lognormal, Any[0, 1]) :
+            (hb.rho_prior.family, collect(Any, values(hb.rho_prior.args)))
+        sfam, sargs = hb.sigma_prior === nothing ?
+            (:lognormal, Any[0, 1]) :
+            (hb.sigma_prior.family, collect(Any, values(hb.sigma_prior.args)))
         for rho in names.rhos
             node = Symbol(:_ppl_prior_, rho)
-            cell = _family_logpdf_expr(:lognormal, Any[0, 1], rho)
+            cell = _family_logpdf_expr(rfam, rargs, rho)
             push!(stmts, :($node::Float64 = $cell))
             push!(terms, node)
         end
         snode = Symbol(:_ppl_prior_, names.sigma)
-        scell = _family_logpdf_expr(:lognormal, Any[0, 1], names.sigma)
+        scell = _family_logpdf_expr(sfam, sargs, names.sigma)
         push!(stmts, :($snode::Float64 = $scell))
         push!(terms, snode)
         _vector_prior_stmts!(stmts, terms, names.beta, :normal,

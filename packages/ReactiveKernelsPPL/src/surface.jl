@@ -1731,11 +1731,13 @@ _dar_bound_eq(b, v::Float64) = b isa Real && Float64(b) == v
 
 _is_dar_inf(b) = b === :Inf || (b isa Real && isinf(Float64(b)) && Float64(b) > 0)
 
-# A bare `spline_basis(:id, x...; kind=..., k=...)` call declares one
-# spline basis (the first bare-call statement: declarations do work at
-# lowering — they build IR + claim the generated names — so the "bare
-# call does nothing" rejection does not apply). Quoted id, bare raw
-# axes (1 → :tps, 2 → :t2 when `kind` is omitted), literal `k`
+# A bare `spline_basis(:id, x...; kind=..., k=..., sd=...)` call
+# declares one spline basis (the first bare-call statement:
+# declarations do work at lowering — they build IR + claim the
+# generated names — so the "bare call does nothing" rejection does not
+# apply). `sd=` states the smoothing-sd prior (SB `sd(mu, s(x)) ~ ...`,
+# `_lower_hyper_prior`; default Stan-kernel `Normal(0, 1)`). Quoted
+# id, bare raw axes (1 → :tps, 2 → :t2 when `kind` is omitted), literal `k`
 # (default 10 / (5, 5)). Lowers directly to SplineBasis IR + the fully
 # determined SplineVector set (contract `_spline_*` rules); claims the
 # basis label, vector names, and materialized basis-column names up
@@ -1777,6 +1779,41 @@ function _lower_r2d2_decl(st::Expr, line::Int)
     return (predictor = pred, r2 = r2, phi = phi, tau = tau, line = line)
 end
 
+# A basis hyper-prior keyword (`hsgp_basis(...; length_scale=...,
+# sd=...)`, `spline_basis(...; sd=...)` — SB `length_scale(:, hsgp(x))
+# ~ ...` / `sd(:, s(x)) ~ ...`): one Distributions.jl call with literal
+# arguments from the admitted positive-hyperparameter families. Stan
+# kernel semantics on the positive support (no `+log2` renormalizer),
+# so the proper-half spellings fail closed toward the bare form.
+function _lower_hyper_prior(raw, where, what::Symbol)
+    admitted = "LogNormal, InverseGamma, Gamma, Exponential, Normal, " *
+        "Cauchy, StudentT, Uniform (literal arguments)"
+    raw isa Expr && raw.head === :call && !isempty(raw.args) &&
+        raw.args[1] isa Symbol || _sfail(
+            "$where `$what=` takes one distribution call ($admitted), " *
+            "got $(repr(raw))")
+    fam = raw.args[1]
+    (fam === :HalfNormal || fam === :HalfCauchy || fam === :truncated) &&
+        _sfail("$where `$what=` priors are Stan-kernel on the positive " *
+              "support (no `+log2`) — spell the bare form " *
+              "(`$what=Normal(0, s)`), not `$(repr(raw))`")
+    sym = get(_PARAM_FAMILIES, fam, nothing)
+    sym !== nothing && haskey(_HYPER_PRIOR_FAMILIES, sym) || _sfail(
+        "$where `$what=` family `$fam` is not admitted ($admitted)")
+    args = _plain_args(raw, "$where `$what=$fam`")
+    length(args) in _HYPER_PRIOR_FAMILIES[sym] || _sfail(
+        "$where `$what=$fam` takes $(only(_HYPER_PRIOR_FAMILIES[sym])) " *
+        "argument(s), got $(length(args))")
+    vals = map(args) do a
+        a isa Real && !(a isa Bool) && isfinite(Float64(a)) || _sfail(
+            "$where `$what=$fam` arguments must be finite numeric " *
+            "literals, got $(repr(a))")
+        Float64(a)
+    end
+    return HyperPrior(sym,
+        NamedTuple{ntuple(i -> Symbol(:arg, i), length(vals))}(Tuple(vals)))
+end
+
 function _lower_basis(st::Expr, line::Int, data::Set{Symbol},
         seen::Set{Symbol}, seelines::Dict{Symbol,Int},
         bases::Vector{SplineBasis})
@@ -1785,16 +1822,19 @@ function _lower_basis(st::Expr, line::Int, data::Set{Symbol},
     kind = nothing
     kind_given = false
     k = nothing
+    sd_prior = nothing
     for a in st.args[2:end]
         if a isa Expr && a.head === :parameters
             for kw in a.args
                 kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where takes keywords `kind`/`k` only")
+                    _sfail("$where takes keywords `kind`/`k`/`sd` only")
                 key = kw.args[1]
-                key === :kind || key === :k ||
-                    _sfail("$where takes keywords `kind`/`k` only, got " *
-                          "`$key`")
-                if key === :kind
+                key === :kind || key === :k || key === :sd ||
+                    _sfail("$where takes keywords `kind`/`k`/`sd` only, " *
+                          "got `$key`")
+                if key === :sd
+                    sd_prior = _lower_hyper_prior(kw.args[2], where, :sd)
+                elseif key === :kind
                     v = kw.args[2]
                     v isa QuoteNode && v.value isa Symbol ||
                         _sfail("$where quotes its kind: got $(repr(v)) — " *
@@ -1852,8 +1892,12 @@ function _lower_basis(st::Expr, line::Int, data::Set{Symbol},
     label = Symbol("spline_", id)
     _claim!(seen, seelines, label, line)
     vectors = SplineVector[]
+    _, sdname = _spline_block_roles(id, kind, k)
     for (vname, vfamily, vargs, vsupport, vwidth) in
             _spline_vector_specs(id, kind, k)
+        if vname === sdname && sd_prior !== nothing
+            vfamily, vargs = sd_prior.family, sd_prior.args
+        end
         _claim!(seen, seelines, vname, line)
         push!(vectors, SplineVector(vname, vfamily, vargs, vsupport,
             vwidth, id, vname))
@@ -1886,14 +1930,17 @@ function _lower_basis_k(v, where)
 end
 
 # A bare `hsgp_basis(:id, x...; k=..., c=..., iso=..., cov=...,
-# period=...)` call declares one HSGP basis (same
-# bare-call-declaration shape as `spline_basis`). Quoted id, bare raw
-# axes (any count ≥ 1; exactly one for periodic), literal `k`
+# period=..., length_scale=..., sd=...)` call declares one HSGP basis
+# (same bare-call-declaration shape as `spline_basis`). Quoted id, bare
+# raw axes (any count ≥ 1; exactly one for periodic), literal `k`
 # (positive integer or per-axis tuple, default 20), literal `c` (real
 # > 1 or per-axis tuple, default 1.5), literal `iso` Bool (default
 # true), quoted `cov` (`:exp_quad` or `:periodic`, default
 # `:exp_quad`), literal `period` (finite positive — required iff
-# periodic, refused otherwise, the SB `_brm_gp_period` contract).
+# periodic, refused otherwise, the SB `_brm_gp_period` contract),
+# and stated hyper priors `length_scale=`/`sd=` (`_lower_hyper_prior`;
+# SB `length_scale(:, hsgp(x)) ~ ...`/`sd(:, hsgp(x)) ~ ...` — a stated
+# length scale drops the validity floor, BRM semantics).
 # Lowers directly to HSGPBasis IR (fits fill at bind); claims the
 # basis label and the sampled names up front so user definitions can
 # never collide with Stage-B graph names (summand labels ride the
@@ -1912,18 +1959,29 @@ function _lower_hsgp_basis(st::Expr, line::Int, data::Set{Symbol},
     iso = true
     cov = :exp_quad
     period = nothing
+    rho_prior = nothing
+    sigma_prior = nothing
+    domain = nothing
+    kwlist = "`k`/`c`/`iso`/`cov`/`period`/`length_scale`/`sd`/`domain`"
     for a in st.args[2:end]
         if a isa Expr && a.head === :parameters
             for kw in a.args
                 kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where takes keywords `k`/`c`/`iso`/`cov`/" *
-                          "`period` only")
+                    _sfail("$where takes keywords $kwlist only")
                 key = kw.args[1]
                 key === :k || key === :c || key === :iso ||
                     key === :cov || key === :period ||
-                    _sfail("$where takes keywords `k`/`c`/`iso`/`cov`/" *
-                          "`period` only, got `$key`")
-                if key === :k
+                    key === :length_scale || key === :sd ||
+                    key === :domain ||
+                    _sfail("$where takes keywords $kwlist only, got `$key`")
+                if key === :domain
+                    domain = kw.args[2]
+                elseif key === :length_scale
+                    rho_prior = _lower_hyper_prior(kw.args[2], where,
+                        :length_scale)
+                elseif key === :sd
+                    sigma_prior = _lower_hyper_prior(kw.args[2], where, :sd)
+                elseif key === :k
                     k = _lower_hsgp_k(kw.args[2], where)
                 elseif key === :c
                     c = _lower_hsgp_c(kw.args[2], where)
@@ -1993,17 +2051,51 @@ function _lower_hsgp_basis(st::Expr, line::Int, data::Set{Symbol},
                   "`cov=:periodic` (got `cov=:exp_quad`)")
     end
     d = length(axes)
+    if domain !== nothing
+        cov === :periodic && _sfail("$where periodic bases have no domain " *
+            "(drop `domain=`)")
+        c === nothing || _sfail("$where `domain=` fixes the approximation " *
+            "boundary directly and cannot also take the data-derived " *
+            "expansion factor `c` (SB `hsgp(...; domain=...)`)")
+        domain = _lower_hsgp_domain(domain, d, where)
+    end
     k = k === nothing ? fill(20, d) : _hsgp_broadcast_opt(k, d, where, :k)
     c = c === nothing ? fill(1.5, d) : _hsgp_broadcast_opt(c, d, where, :c)
     label = Symbol("hsgp_", id)
     _claim!(seen, seelines, label, line)
     hb = HSGPBasis(id, Vector{Symbol}(axes), k, c, iso,
         Tuple{Float64,Float64}[], label, cov,
-        period === nothing ? NaN : period)
+        period === nothing ? NaN : period, rho_prior, sigma_prior, domain)
     for nm in _hsgp_all_names(hb)
         _claim!(seen, seelines, nm, line)
     end
     return hb
+end
+
+# `domain=(lo, hi)` (one axis) or `domain=((lo1, hi1), (lo2, hi2), ...)`
+# (one pair per axis): finite numeric literals with lo < hi (SB
+# `_brm_hsgp_domain_fits`).
+function _lower_hsgp_domain(v, d::Int, where)
+    ispair(x) = x isa Expr && x.head === :tuple && length(x.args) == 2 &&
+        all(a -> a isa Real && !(a isa Bool) && isfinite(Float64(a)), x.args)
+    pairs = if d == 1 && ispair(v)
+        Any[v]
+    elseif v isa Expr && v.head === :tuple && length(v.args) == d &&
+            all(ispair, v.args)
+        v.args
+    else
+        _sfail("$where `domain=` takes " * (d == 1 ? "`(lower, upper)`" :
+            "one `(lower, upper)` pair per axis ($d axes)") *
+            " of numeric literals, got $(repr(v))")
+    end
+    out = Tuple{Float64,Float64}[]
+    for p in pairs
+        lo, hi = Float64(p.args[1]), Float64(p.args[2])
+        lo < hi || _sfail("$where `domain=` needs lower < upper, got " *
+            "($lo, $hi)")
+        push!(out, (lo, hi))
+    end
+    return out
 end
 
 function _lower_hsgp_k(v, where)
@@ -6124,7 +6216,13 @@ _is_scale_predictor_def(s::Symbol, ctx, allow_stated::Bool) =
     !_derived_reads_latent(s, ctx) &&
     (get(ctx.detshape, s, :scalar) === :vector ||
         _is_factor_index_def(ctx.detmap[s], ctx) ||
+        _is_hsgp_only_def(ctx.detmap[s]) ||
         _is_scalar_coef_def(s, ctx, allow_stated))
+
+# A bare HSGP summand definition (`lsig = hsgp(:h)`, SB
+# `log(sigma) ~ 0 + hsgp(x)`): per-observation, a scale predictor.
+_is_hsgp_only_def(rhs) = rhs isa Expr && rhs.head === :call &&
+    !isempty(rhs.args) && rhs.args[1] === :hsgp
 
 # A scalar definition spelling an intercept-only predictor (`name =
 # coef` over a bare coefficient): admitted to the scale-predictor slot
@@ -6843,9 +6941,12 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
     # (SB's `ar` always pairs with an intercept).
     # A composed sub-predictor may be varying-effect-only (brms
     # `theta ~ 0 + (1 | person)`): its coefficients live in the draws.
+    # HSGP-summand-only predictors are admitted too (SB `0 + hsgp(x)`,
+    # brm_hsgp): the basis weights are self-priored.
     if isempty(uses) && !(!isempty(terms) &&
             all(t -> t.kind === OffsetTerm ||
                 t.kind === MonotonicSummandTerm ||
+                t.kind === HSGPSummandTerm ||
                 (composed_sub && t.kind === VaryingEffectTerm), terms))
         _sfail("predictor $pname has no estimated coefficients — add an " *
                "intercept or coefficient (bare-data offset affines and " *
