@@ -1319,10 +1319,24 @@ ReactiveKernels._tensorized_scan_lowering(
         step, init, iterated::Tuple, shared::Tuple) =
     ReactiveKernels._tensorized_scan_lowering(nothing, step, init, iterated, shared)
 
+# `@trace` writes each loop result back into the tracer object it carried
+# (`Reactant.Ops.while_loop`), and it carries every traced value the body
+# captures, including operands the body only reads. A loop that captures the
+# caller's own input tracer therefore rebinds that input to a `while` result:
+# Reactant then counts the input as mutated and returns it as an aliased
+# program output, and the optimizer rewrites a ZERO-SIZED one to
+# `tensor.empty`, which XLA export rejects (§7l). So a retained loop reads its
+# operands through fresh tracer objects; `copy` emits no operation, and a host
+# value stays host. Other wrappers pass through unchanged.
+_loop_capture(x) = x
+_loop_capture(x::Union{Tuple,NamedTuple}) = map(_loop_capture, x)
+_loop_capture(x::Union{Reactant.TracedRArray,Reactant.TracedRNumber}) = copy(x)
+
 function ReactiveKernels._tensorized_scan_lowering(
         marker::Reactant.TracedType, step, init, iterated::Tuple,
         shared::Tuple)
-    sequences = map(_scan_traced_sequence, iterated)
+    sequences = _loop_capture(map(_scan_traced_sequence, iterated))
+    shared = _loop_capture(shared)
     n = _scan_sequence_length(first(sequences))
     all(xs -> _scan_sequence_length(xs) == n, sequences) || throw(
         DimensionMismatch(
@@ -1356,7 +1370,7 @@ _recurrence_trace(x::AbstractArray) =
 # and seeding from a state field's own tracer would silently advance that
 # field even where the caller later selects the pre-loop value (a masked
 # iteration of the predicated machine kept stepping the HMC phase point).
-_recurrence_trace(x::Reactant.TracedRArray) = copy(x)
+_recurrence_trace(x::Reactant.TracedRArray) = _loop_capture(x)
 # A `Diagonal` rides a retained loop as its backing vector — never as the
 # dense matrix `promote_to` would materialize — and is rebuilt from the
 # pre-loop schema (`_sm_restore_source_logical_wrappers`) before source code
@@ -1379,7 +1393,7 @@ ReactiveKernels._sm_restore_source_logical_wrappers(
     LinearAlgebra.Diagonal(LinearAlgebra.diag(value))
 _recurrence_trace(x::T) where {T<:Number} =
     copy(Reactant.promote_to(Reactant.TracedRNumber{T}, x))
-_recurrence_trace(x::Reactant.TracedRNumber) = copy(x)
+_recurrence_trace(x::Reactant.TracedRNumber) = _loop_capture(x)
 
 function ReactiveKernels._rectangular_fold_impl(
         marker::Reactant.TracedType, step, init, columns, shared, n)
@@ -1812,9 +1826,11 @@ function ReactiveKernels._replica_call(
         k::ReactiveKernels.ReplicatedKernel{B,BT,OT}, args,
         marker::Union{Reactant.RArray,Reactant.TracedRNumber}) where {B,BT,OT}
     replica_count = ReactiveKernels._replicated_validate_axes(args, Val(B), BT)
+    # Fresh tracers (`_loop_capture`): the loop must not rebind the caller's
+    # inputs, shared ones included (a zero-dose amount vector).
     replica_inputs = ntuple(length(args)) do index
         arg = getfield(args, index)
-        index in B ? _replica_loop_operand(arg) : arg
+        _loop_capture(index in B ? _replica_loop_operand(arg) : arg)
     end
     if replica_count == 0
         empty_outputs = ntuple(index -> ReactiveKernels._replicated_output(
@@ -1877,13 +1893,16 @@ function ReactiveKernels._replica_ad_call(
     value_buffer = copy(Reactant.Ops.constant(zeros(element_type, replica_count)))
     gradient_buffers = _replica_ad_buffers(AT, gradient_shapes, element_type, replica_count)
     replica_limit = _replica_loop_limit(replica_count)
+    # The loop reads the caller's arguments through fresh tracers
+    # (`_loop_capture`), so it never rebinds them.
+    replica_operands = _loop_capture(args)
     # Body locals carry a `replica_` prefix: `@trace` seeds a loop-carried
     # variable from any same-named binding in scope, and `value`/`gradient`
     # would resolve to functions.  (No `return` inside the block either:
     # ReactantCore rejects it syntactically.)
     Reactant.@trace track_numbers = false for replica_index in 1:replica_limit
-        replica_args = ntuple(length(args)) do argument_index
-            arg = getfield(args, argument_index)
+        replica_args = ntuple(length(replica_operands)) do argument_index
+            arg = getfield(replica_operands, argument_index)
             position = findfirst(==(argument_index), B)
             position === nothing ? arg :
                 _rk_reactant_slot_read(arg, replica_index)
