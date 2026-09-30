@@ -1097,6 +1097,35 @@ end
     Reactant.@allowscalar getindex(array, indices...)
 end
 
+# `get(A, i, default)` at a TRACED index: Base's lazy branch on the bounds test
+# stays a lazy branch (`stablehlo.if`), so the gather runs only in the in-range
+# arm and an out-of-range index is never read.  A host table is a constant of
+# the traced program, lifted exactly like `_tensorized_getindex` lifts it.  The
+# default is converted to the element type so both arms carry one traced type
+# (Base returns `Union{T,typeof(default)}` when they differ; a traced branch
+# needs one type, and the element type is the value the in-range arm yields).
+@inline function _rk_traced_get(array::Reactant.TracedRArray{T,1},
+        index::Reactant.TracedRNumber{I}, default) where {T,I<:Integer}
+    inbounds = (index >= firstindex(array)) & (index <= lastindex(array))
+    ReactiveKernels._recurrence_branch(inbounds,
+        () -> ReactiveKernels._tensorized_getindex(array, index),
+        () -> Reactant.promote_to(Reactant.TracedRNumber{T}, convert(T, default)),
+        ())
+end
+@inline ReactiveKernels._tensorized_get(array::Reactant.TracedRArray{T,1},
+        index::Reactant.TracedRNumber{I}, default) where {T,I<:Integer} =
+    _rk_traced_get(array, index, default)
+@inline ReactiveKernels._tensorized_get(array::Array{T,1},
+        index::Reactant.TracedRNumber{I}, default) where {T,I<:Integer} =
+    _rk_traced_get(Reactant.promote_to(Reactant.TracedRArray{T,1}, array),
+                   index, default)
+# A CONCRETE index is decided on the host, as Base decides it; the in-range
+# read of a traced vector takes the concrete-index `_tensorized_getindex` path.
+@inline ReactiveKernels._tensorized_get(array::Reactant.TracedRArray{T,1},
+        index::Integer, default) where {T} =
+    checkbounds(Bool, array, index) ?
+        ReactiveKernels._tensorized_getindex(array, index) : default
+
 # The scalar type a vector-literal element contributes under tracing: the
 # wrapped type, so promotion abstracts nothing.  `ConcretePJRTNumber` is a
 # closed-over traced constant rather than a `TracedRNumber`, but carries

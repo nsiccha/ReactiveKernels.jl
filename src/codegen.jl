@@ -113,13 +113,21 @@ end
     Base.Broadcast.instantiate(broadcasted)
 end
 
-function _authored_plate_marker(::Val{A}, args...) where {A}
-    index = findfirst(eachindex(args)) do position
-        !(position in A) && _authored_plate_is_axis(getfield(args, position))
+# The first non-atomic argument that is an axis, as an unrolled conditional
+# chain over the argument positions. `_authored_plate_is_axis` is decided by
+# the argument's type for every collection the lowering accepts, so the chain
+# folds to one argument when the generated body is compiled for concrete types;
+# a `findfirst` closure over the argument tuple instead allocated per call
+# (304 bytes for a three-port plate whose domain port carries no declared type).
+@generated function _authored_plate_marker(::Val{A}, args...) where {A}
+    body = :(throw(ArgumentError(
+        "an authored plate requires at least one batched argument")))
+    for position in reverse(eachindex(args))
+        position in A && continue
+        body = :(_authored_plate_is_axis(getfield(args, $position)) ?
+            getfield(args, $position) : $body)
     end
-    index === nothing && throw(ArgumentError(
-        "an authored plate requires at least one batched argument"))
-    getfield(args, index)
+    body
 end
 @inline _authored_plate_zero(::Type{T}, marker) where {T} = zero(T)
 @inline _authored_plate_zero(::Type{Any}, marker) = zero(eltype(marker))
@@ -711,6 +719,25 @@ function _authored_plate_unconditional_group(
     end
 end
 
+# The same decision from the VALUE a call receives. A port without a declared
+# type (`observations = domain(plan)`, one graph serving several plan types)
+# keeps the scheduling guard above at lowering time, but the generated body is
+# compiled for the concrete argument types: this trait is a constant there, so
+# a one-dimensional domain drops the guard and its per-coordinate bookkeeping
+# exactly as a declared `UnitRange`/`Vector` domain does, while a runtime
+# scalar keeps the guard (and its value computed once above the loop).
+@inline _plate_unconditional_root(::AbstractVector) = true
+@inline _plate_unconditional_root(::Tuple) = true
+@inline _plate_unconditional_root(_) = false
+
+function _authored_plate_runtime_unconditional(callargs, roots, positions, atomic)
+    tests = Any[Expr(:call, GlobalRef(@__MODULE__, :_plate_unconditional_root),
+                     callargs[positions[root]]) for root in sort!(collect(roots))
+                if !(positions[root] in atomic)]
+    isempty(tests) && return false
+    foldl((left, right) -> Expr(:||, left, right), tests)
+end
+
 function _authored_plate_scalar_ref(inner::Plan, locals, callargs,
                                     callvalues, prepared_arguments, atomic,
                                     input::Value, index, looped::Bool)
@@ -1004,8 +1031,10 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
                 callargs, roots, root_positions, atomic)
             changed = _authored_plate_changed(
                 callargs, roots, root_positions, atomic, index, previous)
-            condition = Expr(:&&, has_axis,
-                Expr(:||, first_coordinate, changed))
+            condition = Expr(:||,
+                _authored_plate_runtime_unconditional(
+                    callargs, roots, root_positions, atomic),
+                Expr(:&&, has_axis, Expr(:||, first_coordinate, changed)))
             push!(loopbody.args, Expr(:if, condition, assignments))
         end
     end

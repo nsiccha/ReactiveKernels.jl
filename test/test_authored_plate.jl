@@ -1331,3 +1331,125 @@ end
         end
     end)
 end
+
+# --- the natural superposition cell (snag one-natural-supe-39da86a4)
+# The concentration at observation t is the sum, over the doses already given,
+# of the dose weight times the unit response at the lag since that dose. Two
+# natural spellings state exactly that: the unit response extended by zero
+# before its dose (`get(units, lag, 0.0)`, Base's total gather), and the sum
+# over the doses given (a filtered generator). Both are ordinary Julia natively;
+# the tensorized companion keeps each branch lazy (`test_ref_array_plate_reactant.jl`).
+# One graph serves both plan types through dispatching helpers: its domain port
+# carries no declared type, and the native lowering schedules it from the
+# concrete value it receives.
+struct _NaturalSupLattice
+    shifts::Vector{Int}
+    nobs::Int
+end
+struct _NaturalSupExact
+    rows::Matrix{Int}
+end
+_natural_sup_domain(plan::_NaturalSupLattice) = 1:plan.nobs
+_natural_sup_domain(plan::_NaturalSupExact) = eachrow(plan.rows)
+_natural_sup_doses(plan::_NaturalSupLattice) = eachindex(plan.shifts)
+_natural_sup_doses(plan::_NaturalSupExact) = axes(plan.rows, 2)
+_natural_sup_lag(t, plan::_NaturalSupLattice, j) = t - plan.shifts[j]
+_natural_sup_lag(row, ::_NaturalSupExact, j) = row[j]
+
+@kernel natural_sup_get(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, t - p.shifts[j], 0.0) for j in eachindex(p.shifts); init = 0.0)
+    end
+    return concentration
+end
+@kernel natural_sup_filter(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * u[t - p.shifts[j]] for j in eachindex(p.shifts) if t > p.shifts[j]; init = 0.0)
+    end
+    return concentration
+end
+@kernel natural_sup_one_graph(plan, units, weights) = begin
+    observations = _natural_sup_domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, _natural_sup_lag(t, p, j), 0.0) for j in _natural_sup_doses(p); init = 0.0)
+    end
+    return concentration
+end
+# The same one-graph cell with the domain port declared, the per-plan-type
+# split this graph replaces; the allocation control below.
+@kernel natural_sup_lattice_typed(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, _natural_sup_lag(t, p, j), 0.0) for j in _natural_sup_doses(p); init = 0.0)
+    end
+    return concentration
+end
+
+_natural_sup_allocated(k, plan, units, weights) = @allocated k(plan, units, weights)
+
+@testset "authored plate block: natural superposition cell (get, filtered sum, one graph)" begin
+    nobs = 257
+    units = collect(range(0.5, 2.0; length = nobs))
+    kernels = map(prepare, (natural_sup_get, natural_sup_filter, natural_sup_one_graph,
+                            natural_sup_lattice_typed))
+    get_cell, filter_cell, one_graph, typed = kernels
+    for shifts in ([0, 40, 100], [3, 3, 250], Int[])
+        weights = collect(range(0.75, 1.5; length = length(shifts)))
+        expected = [sum((t > s ? w * units[t - s] : 0.0 for (s, w) in zip(shifts, weights));
+                        init = 0.0) for t in 1:nobs]
+        lattice = _NaturalSupLattice(shifts, nobs)
+        exact = _NaturalSupExact([max(t - s, 0) for t in 1:nobs, s in shifts])
+        @test get_cell(lattice, units, weights) == expected
+        @test filter_cell(lattice, units, weights) == expected
+        @test one_graph(lattice, units, weights) == expected
+        @test one_graph(exact, units, weights) == expected
+        @test typed(lattice, units, weights) == expected
+    end
+
+    # The undeclared domain schedules like the declared one: the output is the
+    # only allocation, on both plan types (before, the runtime axis marker
+    # allocated 304 B per call and every cell carried the axis-changed guard).
+    shifts = [0, 40, 100]
+    weights = [3.0, 1.5, 0.25]
+    lattice = _NaturalSupLattice(shifts, nobs)
+    exact = _NaturalSupExact([max(t - s, 0) for t in 1:nobs, s in shifts])
+    for (k, plan) in ((one_graph, lattice), (one_graph, exact), (typed, lattice))
+        _natural_sup_allocated(k, plan, units, weights)
+    end
+    output_bytes = _natural_sup_allocated(typed, lattice, units, weights)
+    # A per-cell allocation would add at least 16 B per observation.
+    @test output_bytes < 2 * sizeof(Float64) * nobs
+    @test _natural_sup_allocated(one_graph, lattice, units, weights) == output_bytes
+    @test _natural_sup_allocated(one_graph, exact, units, weights) == output_bytes
+end
+
+@testset "tensorized companion: filtered sums and get keep their branches lazy" begin
+    # The tensorized rewrite, evaluated on host values, is Base's own fold: the
+    # filter is a branch on the accumulator and `get` stays `Base.get`.
+    lowered = ReactiveKernels._kernel_tensorized_rhs(
+        :(sum(w[j] * u[t - s[j]] for j in eachindex(s) if t > s[j]; init = z)))
+    @test lowered.head === :call && lowered.args[1] == GlobalRef(Base, :foldl)
+    @test occursin("_recurrence_branch", string(lowered))
+    companion = Core.eval(@__MODULE__, :((t, s, u, w, z) -> $lowered))
+    native(t, s, u, w, z) = sum(w[j] * u[t - s[j]] for j in eachindex(s) if t > s[j]; init = z)
+    u = [1.5, -2.25, 0.125, 7.0, 3.5]
+    for (t, s, w, z) in ((5, [0, 2, 4], [1.0, 0.5, 2.0], 0.0),
+                         (1, [0, 2, 4], [1.0, 0.5, 2.0], 0.0),     # one dose given
+                         (1, [1, 2, 4], [1.0, 0.5, 2.0], 0.0),     # none given: init
+                         (3, Int[], Float64[], 0.0),               # no doses
+                         (5, [0, 2, 4], [1.0, 0.5, 2.0], 0),       # Int init, Float64 terms
+                         (5, [0, 2, 4], [1.0, 0.5, 2.0], -0.0))
+        @test companion(t, s, u, w, z) === native(t, s, u, w, z)
+    end
+    # Only the `init` form is rewritten: without it Base seeds the sum with the
+    # first ACCEPTED element, which a traced condition cannot select.
+    plain = ReactiveKernels._kernel_tensorized_rhs(:(sum(u[j] for j in r if c[j])))
+    @test !occursin("foldl", string(plain))
+    # `get` routes through the tensorized hook, whose fallback is `Base.get`.
+    @test occursin("_tensorized_get", string(ReactiveKernels._kernel_tensorized_rhs(:(get(u, i, 0.0)))))
+    @test ReactiveKernels._tensorized_get(u, 9, 0.0) === 0.0
+    @test ReactiveKernels._tensorized_get(u, 2, 0.0) === -2.25
+    @test ReactiveKernels._tensorized_get(Dict(:a => 1), :b, 0) === 0
+end
