@@ -6135,8 +6135,9 @@ end
 
 const _COMPOSED_OPS = (:.*, :.+, :.-)
 # Elementwise unary maps admitted over a composed subtree (`exp.(la)` —
-# the IRT discrimination `a = exp(log_a)`), spelled as Julia dotted calls.
-const _COMPOSED_UNARY = (:exp,)
+# the IRT discrimination `a = exp(log_a)`; `logistic.(xi)` — the Bordet
+# transient/saturating curves), spelled as Julia dotted calls.
+const _COMPOSED_UNARY = (:exp, :logistic)
 const _COMPOSED_AFFINE_KINDS =
     (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
 # Sub-predictors are affine plus varying-effect summands (per-level
@@ -6146,14 +6147,16 @@ const _COMPOSED_SUB_KINDS = (_COMPOSED_AFFINE_KINDS..., VaryingEffectTerm)
 """Recurse a composed tree: leaves must be declared subs/scalars, nodes
 dotted `.*`/`.+`/`.−` of matching arity. Returns the leaf set."""
 function _validate_composed_tree(tree, subs::Vector{Symbol},
-        scalars::Vector{Symbol}, label::Symbol)
-    allowed = union(subs, scalars)
+        scalars::Vector{Symbol}, label::Symbol,
+        datas::Vector{Symbol} = Symbol[])
+    allowed = union(subs, scalars, datas)
     leaves = Symbol[]
     function walk(node)
         if node isa Symbol
             node in allowed || _fail(label,
                 "composed tree leaf $node is neither a declared " *
-                "sub-predictor $subs nor a scalar $scalars")
+                "sub-predictor $subs, a scalar $scalars, nor a data " *
+                "column $datas")
             push!(leaves, node)
             return nothing
         end
@@ -6202,9 +6205,14 @@ function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
               "`(tree, subs, scalars)`, got $(Tuple(keys(o)))")
     o.subs isa Vector{Symbol} && o.scalars isa Vector{Symbol} ||
         _fail(t.label, "composed subs/scalars must be `Vector{Symbol}`")
-    isempty(t.columns) ||
-        _fail(t.label, "composed term carries no columns (sub-predictors " *
-              "and scalars resolve in-graph), got $(t.columns)")
+    # Columns are exactly the tree's data leaves (bound data read
+    # elementwise in-graph, e.g. `(log_time .- loc) .* exp.(ls)`).
+    datas = Symbol[c for c in t.columns]
+    for c in datas
+        c in o.subs || c in o.scalars || continue
+        _fail(t.label, "composed column $c collides with a sub-predictor " *
+              "or scalar name")
+    end
     length(pred.terms) == 1 ||
         _fail(t.label, "composed term is the whole linear predictor " *
               "(no sibling design terms in v1)")
@@ -6233,7 +6241,12 @@ function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
             _fail(t.label, "composed scalar $c is neither a sampled " *
                   "parameter nor a scalar assignment")
     end
-    _validate_composed_tree(o.tree, o.subs, o.scalars, t.label)
+    leaves = _validate_composed_tree(o.tree, o.subs, o.scalars, t.label,
+        datas)
+    for c in datas
+        c in leaves || _fail(t.label, "composed column $c is not a leaf " *
+            "of the tree (columns are exactly the tree's data leaves)")
+    end
     return nothing
 end
 

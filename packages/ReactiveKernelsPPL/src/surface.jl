@@ -447,7 +447,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     canonmap = Dict{Symbol,Any}()
     for nm in _det_topo_order(det, detmap)
         rhs = detmap[nm]
-        _reject_unknown_calls("definition `$nm = $(repr(rhs))`", rhs)
+        _reject_unknown_calls("definition `$nm = $(repr(rhs))`", rhs;
+            composed_maps = true)
         canonmap[nm] = _canonical_expr(rhs, data, detshape,
             "definition `$nm = $(repr(rhs))`")
     end
@@ -1016,7 +1017,12 @@ const _DIST_VALUE_FNS =
         :Dirichlet, :CategoricalLogit, :OrderedLogistic, :Ordinal,
         :Multinomial, :Categorical)
 
-function _reject_unknown_calls(where, rhs)
+# `composed_maps`: the definition-level screen runs before composition
+# analysis, so a definition that will inline into a composed tree
+# (`bump = logistic.(xi) .* tm`) may carry the composed elementwise maps;
+# `logistic.` still fails with the link guidance wherever it reaches the
+# predictor analysis (`_analyze_predictor` re-screens strictly).
+function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
     rhs isa Expr || return nothing
     rhs.head === :ref && return nothing
     if rhs.head === :call && !isempty(rhs.args)
@@ -1059,16 +1065,17 @@ function _reject_unknown_calls(where, rhs)
         f = rhs.args[1]
         # (`exp.` is both the Poisson link and admitted elementwise math,
         # so only `logistic.` guides here.)
-        f === :logistic && _sfail(
+        f === :logistic && !composed_maps && _sfail(
             "$where calls `logistic.`, which only lowers as a `.~` link " *
-            "(`Bernoulli.(logistic.(eta))`)")
-        f === :ifelse || f in ELEMENTWISE_FNS || _sfail(
+            "(`Bernoulli.(logistic.(eta))`) or as a composed-predictor map")
+        f === :ifelse || f in ELEMENTWISE_FNS ||
+            (composed_maps && f in _COMPOSED_UNARY) || _sfail(
             "$where calls `$f.`, which is not in the slice-1 value " *
             "vocabulary — arbitrary Julia functions are planned " *
             "(no-@deffun-ceremony direction) but need IR/contract growth")
     end
     for a in rhs.args
-        _reject_unknown_calls(where, a)
+        _reject_unknown_calls(where, a; composed_maps)
     end
     return nothing
 end
@@ -6736,6 +6743,10 @@ function _composed_trigger(rhs, ctx)
     rhs isa Symbol && return haskey(ctx.detmap, rhs) &&
         ctx.detmap[rhs] !== rhs && _composed_trigger(ctx.detmap[rhs], ctx)
     rhs isa Expr || return false
+    # An admitted elementwise map over a subtree reaching a sub-predictor
+    # (`resp = logistic.((log_dose .- dl) .* exp.(dls))`) is a composition.
+    _is_composed_map(rhs) && rhs.args[1] in _COMPOSED_UNARY &&
+        return _composed_has_sub(rhs, ctx, true)
     rhs.head === :call || return false
     isempty(rhs.args) && return false
     op = rhs.args[1]
@@ -6766,7 +6777,7 @@ end
 Leaves: sub-predictors (vector defs) and scalars (sampled names,
 scalar definitions). Everything else fails closed with guidance."""
 function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
-        scalars::Vector{Symbol})
+        scalars::Vector{Symbol}, datas::Vector{Symbol} = Symbol[])
     where = "predictor $pname"
     if node isa Symbol
         # A name bound to a composition inlines its tree (the definition
@@ -6774,7 +6785,7 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         if haskey(ctx.detmap, node) && _composed_trigger(node, ctx)
             push!(ctx.absorbed, node)
             return _extract_composed_tree(pname, ctx.detmap[node], ctx,
-                subs, scalars)
+                subs, scalars, datas)
         end
         if _is_composed_sub(node, ctx, true)
             node in subs || push!(subs, node)
@@ -6783,8 +6794,10 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             node in scalars || push!(scalars, node)
             return node
         elseif node in ctx.data
-            return _sfail("$where combines data column $node directly — " *
-                "v1 compositions combine sub-predictors and scalars only")
+            # A bound data column read elementwise in-graph (v3:
+            # `(log_time .- loc) .* exp.(ls)`); it becomes a term column.
+            node in datas || push!(datas, node)
+            return node
         elseif haskey(ctx.detmap, node)
             return _sfail("$where combines $node, which is neither an " *
                 "affine sub-predictor nor a scalar (latent/scan/varying " *
@@ -6808,7 +6821,7 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         length(node.args[2].args) == 1 || return _sfail("$where " *
             "$(repr(f)). takes one operand")
         return Expr(:., f, Expr(:tuple, _extract_composed_tree(pname,
-            only(node.args[2].args), ctx, subs, scalars)))
+            only(node.args[2].args), ctx, subs, scalars, datas)))
     end
     node.head === :call || return _sfail("$where composition node " *
         "$(repr(node)) is not admitted (v1: `. .*`/`.+`/`.−` over " *
@@ -6820,18 +6833,18 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
     if op === :.* || op === :.+ || op ===:.-
         if op === :.+ && length(args) == 1
             return _extract_composed_tree(pname, only(args), ctx, subs,
-                scalars)
+                scalars, datas)
         end
         ok = op === :.- ? length(args) in (1, 2) : length(args) == 2
         ok || return _sfail("$where `$op` takes " *
             (op === :.- ? "one or two operands" : "two operands"))
         return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
-            subs, scalars) for a in args)...)
+            subs, scalars, datas) for a in args)...)
     elseif op === :* && length(args) == 2
         # Julia-valid scalar `*` normalizes to dotted (Base broadcasts —
         # behavior-preserving, the canonicalization doctrine).
         return _extract_composed_tree(pname, Expr(:call, :.*, args...),
-            ctx, subs, scalars)
+            ctx, subs, scalars, datas)
     elseif op === :+ || op === :- || op === :/ || op === :^
         return _sfail("$where combines vectors without dots: " *
             "$(repr(node)) — as in Julia, write the dotted form " *
@@ -6850,7 +6863,8 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
         predictors, pred_idx, coefuse)
     subs = Symbol[]
     scalars = Symbol[]
-    tree = _extract_composed_tree(pname, rhs, ctx, subs, scalars)
+    datas = Symbol[]
+    tree = _extract_composed_tree(pname, rhs, ctx, subs, scalars, datas)
     isempty(subs) && _sfail("predictor $pname has no sub-predictor — " *
         "compositions combine at least one sub-predictor LP")
     for s in subs
@@ -6888,7 +6902,7 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
         end
     end
     label = Symbol(pname, "_composed")
-    term = TermSpec(ComposedTerm, ColumnRef[],
+    term = TermSpec(ComposedTerm, ColumnRef[datas...],
         (tree = tree, subs = subs, scalars = scalars), label, label)
     push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
     pred_idx[pname] = length(predictors)

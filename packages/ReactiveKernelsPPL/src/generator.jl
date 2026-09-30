@@ -115,6 +115,9 @@ using SpecialFunctions: besseli, besselix, erfc, loggamma
 using Statistics: mean, std, var
 using LinearAlgebra: dot
 using LogExpFunctions: log1pexp, logaddexp
+# The inverse-logit MATH function under a distinct name: plain `logistic`
+# here is the Logistic distribution kernel object (imported above).
+import LogExpFunctions: logistic as _ppl_logistic
 # Bijector objects the generated program splices (constrained-parameter
 # transforms); imported from the enclosing module so the emitted
 # `positive_bijector()` / `unit_bijector()` calls resolve.
@@ -568,6 +571,11 @@ function _dar_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpe
     return o.dar_id
 end
 
+# Composed elementwise maps → their generated-module bindings (`logistic`
+# is the distribution object there; the math function is `_ppl_logistic`).
+const _COMPOSED_MAP_EMIT = Dict{Symbol,Symbol}(:exp => :exp,
+    :logistic => :_ppl_logistic)
+
 """Rewrite a composed tree to in-graph nodes (contract validated it)."""
 function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
         pred::Symbol)
@@ -579,9 +587,11 @@ function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
             "unknown sub-predictor $node"))
         return _lp_name(plan.predictors[i])
     end
-    # Dotted unary map `f.(x)`: `Expr(:., f, Expr(:tuple, x))`.
-    node.head === :. && return Expr(:., node.args[1], Expr(:tuple,
-        _composed_rewrite(only(node.args[2].args), subs, plan, pred)))
+    # Dotted unary map `f.(x)`: `Expr(:., f, Expr(:tuple, x))`, the map
+    # renamed to its generated-module math binding.
+    node.head === :. && return Expr(:., _COMPOSED_MAP_EMIT[node.args[1]],
+        Expr(:tuple,
+            _composed_rewrite(only(node.args[2].args), subs, plan, pred)))
     return Expr(node.head, node.args[1],
         (_composed_rewrite(a, subs, plan, pred) for a in node.args[2:end])...)
 end

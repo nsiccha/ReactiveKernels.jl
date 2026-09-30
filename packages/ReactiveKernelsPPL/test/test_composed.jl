@@ -133,6 +133,37 @@ end
         :(ga .* (be .* th))
 end
 
+@testset "composed data leaves + logistic maps (v3)" begin
+    # A bound data column reads elementwise in-graph as a tree leaf and
+    # rides the composed term's columns (v1/v2 failed these closed).
+    plan = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        eta = be .* (th .+ xs)
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    t = only(plan.predictors[2].terms)
+    @test t.kind === ComposedTerm
+    @test t.options.tree == :(be .* (th .+ xs))
+    @test t.columns == [:xs]
+    # `logistic.` maps (and a name bound to a map composition) inline.
+    curve = lower_rkppl(quote
+        loc = a_l .+ b_l .* g
+        ls = a_s .+ b_s .* g
+        xi = (xs .- loc) .* exp.(ls)
+        resp = logistic.(xi)
+        m0 ~ Normal(0.0, 1.0)
+        mu = m0 .+ resp
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :xs, :g))
+    mt = only(curve.predictors[end].terms)
+    @test mt.kind === ComposedTerm
+    @test mt.options.tree ==
+        :(m0 .+ logistic.((xs .- loc) .* exp.(ls)))
+    @test mt.options.subs == [:loc, :ls]
+    @test isempty(curve.derived)
+end
+
 @testset "composed fail-closed" begin
     # Undotted vector combination: Julia-truthful, write the dots.
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -148,13 +179,20 @@ end
         eta = 2.0 .* th
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
-    # Data columns never combine directly — only sub-LPs and scalars.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        th = a_th .+ b_th .* xs
-        be ~ Normal(0.0, 100.0)
-        eta = be .* (th .+ xs)
-        y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    # `logistic.` outside a composition keeps the link guidance (the
+    # predictor analysis re-screens strictly).
+    err = try
+        lower_rkppl(quote
+            mu = a .+ b .* xs
+            p = logistic.(mu)
+            y .~ Bernoulli.(p)
+        end, (:y, :xs))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError
+    @test occursin("`.~` link", sprint(showerror, err))
     # A scalar leaf names a sampled name or scalar definition — or fails.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         th = a_th .+ b_th .* xs

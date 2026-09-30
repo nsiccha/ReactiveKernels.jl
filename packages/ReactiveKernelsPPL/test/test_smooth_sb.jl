@@ -29,7 +29,9 @@
 # (zeros and 0.3^n), so the n = coordinate COUNT and the layout-name
 # assertions carry the mapping; the HSGP/spline math itself is pinned
 # against independent oracles in test_hsgp.jl / test_spline.jl.
-# (`_check_gradient` / `_GEN_BACKEND` come from test_generator.jl.)
+# (`_check_gradient` / `_GEN_BACKEND` come from test_generator.jl;
+# `_irt_intercept_integral` — the exact collapsed-totals bridge — from
+# test_irt.jl, both included earlier by runtests.jl.)
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
@@ -228,6 +230,40 @@ _sm_bordet(slope::Bool, lik) = quote
     log_obs .~ $lik
 end
 
+# Bordet `brm_hierarchical_terms` (builder 5): mean = base + bump * resp
+# over per-series correlated parametric curves — `transient` (loc,
+# log-slope, magnitude; `bump_math`) and `saturating` (loc, log-slope;
+# `sigmoid_math`) — as a composed predictor v3 (data-column leaves +
+# `logistic.` maps over varying-slice subs). `series` indexes the 4
+# biomarker x person series (Bordet derives it the same way).
+const _SM_BORDET_D5 = quote
+    sigma ~ Exponential(1)
+    r_base ~ varying_effect(series, [1])
+    base = b0 .+ r_base
+    dt ~ varying_draws(series, [1, 1, 1])
+    t1 ~ varying_slice(dt, 1)
+    t2 ~ varying_slice(dt, 2)
+    t3 ~ varying_slice(dt, 3)
+    ds ~ varying_draws(series, [1, 1])
+    s1 ~ varying_slice(ds, 1)
+    s2 ~ varying_slice(ds, 2)
+    tl = t1
+    tls = t2
+    tm = t3
+    dl = s1
+    dls = s2
+    xi = (log_time .- tl) .* exp.(tls)
+    bump = logistic.(xi) .* logistic.(.-xi) .* tm
+    resp = logistic.((log_dose .- dl) .* exp.(dls))
+    mu = base .+ bump .* resp
+    log_obs .~ censored.(Normal.(mu, sigma), lloq, uloq)
+end
+const _SM_BORDET_D5_DATA = (; log_time = _SM_BORDET.log_time,
+    log_dose = _SM_BORDET.log_dose,
+    series = _SM_BORDET.biomarker .+ (_SM_BORDET.person .- 1) .* 2,
+    lloq = _SM_BORDET.lloq, uloq = _SM_BORDET.uloq,
+    log_obs = _SM_BORDET.log_obs)
+
 const _SM_BRUNO_X = [-1.0, -0.7, -0.4, -0.1, 0.2, 0.5, 0.8, 1.0]
 const _SM_BRUNO_Y = [0.2, -0.3, 0.5, 1.1, 0.7, -0.1, -0.6, 0.3]
 # bruno hsgp: minmax axis, fixed L = 1.5 (`domain=(-1.5, 1.5)`), rho
@@ -338,6 +374,28 @@ end
     end
 end
 
+@testset "bordet builder 5 SB parity (pin 72d4bfc9)" begin
+    # SB (D5, 0.3^35) emits the `base ~ 1 + (1 | series)` block in
+    # collapsed totals (`total_scale_base_tau`, `total_base.1-4`, the
+    # Normal(0, 1) intercept integrated out); every other coordinate —
+    # both correlated curve blocks (L/tau/z_flat), sigma — shares RK's
+    # parameterization. The exact intercept integral bridges the two.
+    _, _, kern, lay = _sm_query(_SM_BORDET_D5, _sm_cols(_SM_BORDET_D5_DATA))
+    @test lay.total == 36
+    base = Dict{Symbol,Float64}(nm => 0.3 for nm in coordinate_names(lay))
+    val, resid = _irt_intercept_integral(kern, lay, base,
+        Symbol("base.Intercept"), [Symbol("xi_series.$j") for j in 1:4],
+        :log_scale_series, fill(0.3, 4), 1.0)
+    @test resid < 1e-10
+    @test val ≈ -55.98105373202722 atol = 1e-10
+    # The composed mean's data leaves ride the term's columns (the
+    # data columns the tree reads elementwise in-graph).
+    plan = lower_rkppl(_SM_BORDET_D5, keys(_SM_BORDET_D5_DATA))
+    t = only(only(p for p in plan.predictors if p.name === :mu).terms)
+    @test t.kind === ComposedTerm
+    @test Set(t.columns) == Set([:log_time, :log_dose])
+end
+
 @testset "bruno HSGP/GP components SB parity (0090db25)" begin
     xc = [2 * (clamp(v, -0.5, 0.5) + 0.5) / 1.0 - 1.0 for v in _SM_BRUNO_X]
     for (label, prog, data, n, banked) in (
@@ -363,6 +421,7 @@ const _SM_ITEMS = (
         lloq, uloq))), _SM_BORDET),
     ("bordet D4", _sm_bordet(false, :(censored.(StudentT.(4.0, log_y,
         exp.(ls)), lloq, uloq))), _SM_BORDET),
+    ("bordet D5", _SM_BORDET_D5, _SM_BORDET_D5_DATA),
     ("bruno hsgp", _sm_bruno1(:x), (; x = _SM_BRUNO_X, y = _SM_BRUNO_Y)),
     ("bruno gp_effectiveness", _SM_BRUNO_EFF, _SM_BRUNO_EFF_DATA),
 )
