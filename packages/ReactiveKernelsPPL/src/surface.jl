@@ -374,6 +374,14 @@ resolved to [`RKPPLSubmodel`](@ref)s; a resolving call is expanded inline
 before partitioning (see `_expand_submodels`). Non-submodel call heads
 (distributions, unknown names) are untouched and screened as before, so the
 default `mod=Main` keeps every non-submodel model unchanged.
+
+Input ownership and concurrency: neither `ast` nor the submodel bodies
+reachable through `mod` is mutated, so one AST may be lowered repeatedly
+and shared across tasks. Submodel resolution only READS `mod` bindings
+(`isdefined` / `getfield` — no eval, no registration), so definitions in
+distinct private modules never collide: one fresh `Module` per lowering,
+each holding its own `@rkppl name(args...) = ...` defs, is sufficient for
+concurrent independent lowerings with no shared lock.
 """
 function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     data = Set{Symbol}()
