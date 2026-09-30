@@ -158,7 +158,13 @@ collateral result to a discard local rather than changing the logical value.
 The generated function closes over no graph object and does not resolve
 operations through module globals.
 
-`RuntimeGeneratedFunctions` compiles the expression. The resulting
+`RuntimeGeneratedFunctions` compiles the expression. Lowering's scratch locals
+(plate axes and indices, scan carries, the renamed locals of a spliced embedded
+kernel) are alpha-renamed to canonical names before the expression reaches its
+content-addressed cache, so an unchanged plan lowers to one callable type:
+preparing the same graph shape again — including a `bound=` rebinding to data
+of the same types — reuses that type and compiles once per process rather than
+once per preparation. The resulting
 `PreparedKernel` stores the compiled callable, its concrete operation tuple,
 and inspection metadata. Calling it performs no graph traversal, producer
 selection, topological sort, cache lookup, or dynamic scheduling. Julia still
