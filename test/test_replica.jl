@@ -99,9 +99,16 @@ end
     transformed = log.(data)
     @test totals ≈ [2sum(transformed), 3sum(transformed)]
     @test pointwise ≈ [2 .* transformed 3 .* transformed]
-    lowered = string(code_expr(kernel))
-    @test occursin("transformed = (__ops__[1])(data)", lowered)
-    @test !occursin("transformed = (__ops__[1])(var\"##theta_position", lowered)
+    # The shared recipe runs once on the shared data above the position loop,
+    # never on a projected position inside it.
+    expression = code_expr(kernel)
+    loop_index = findlast(node -> node isa Expr && node.head === :for,
+                          expression.args[2].args)
+    before_loop = string(Expr(:block, expression.args[2].args[1:loop_index-1]...))
+    loop = string(expression.args[2].args[loop_index])
+    @test occursin("(__ops__[1])(data)", before_loop)
+    @test !occursin("(__ops__[1])", loop)
+    @test !occursin("(__ops__[1])(var\"##theta_position", before_loop)
 end
 
 @kernel replica_defaulted(x::Float64, offset::Float64 = 1.0) = begin

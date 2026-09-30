@@ -101,7 +101,9 @@ end
     @test batch isa ReactiveKernels.GraphReplicatedKernel
     @test batch([2.0, 3.0], [1.0, 2.0, 3.0]) == [28.0, 42.0]
     expression = code_expr(batch)
-    loop_index = findfirst(node -> node isa Expr && node.head === :for,
+    # The position loop is the last top-level loop; a hoisted plate emits its
+    # own fused loop above it.
+    loop_index = findlast(node -> node isa Expr && node.head === :for,
                           expression.args[2].args)
     before_loop = Expr(:block, expression.args[2].args[1:loop_index-1]...)
     loop = expression.args[2].args[loop_index]
@@ -110,6 +112,41 @@ end
     @test batch([2.0], [1.0, 2.0, 3.0]) == [28.0]
     @test batch(fill(2.0, 23), [1.0, 2.0, 3.0]) == fill(28.0, 23)
     @test code_expr(batch) === expression
+end
+
+_position_plate_bytes(kernel, args...) =
+    minimum(@allocated(kernel(args...)) for _ in 1:3)
+
+@testset "per-position plates lower as in prepare" begin
+    # A plate whose operands vary with the position runs once per position. It
+    # emits the scalar kernel's fused native loop, not the plate operation's
+    # per-cell fallback (snag inline-natural-s-126a07a6: 3.0 MB against
+    # 0.33 MB per position and read on the ShinyRK superposition plate).
+    @kernel per_position_plate(position::Vector{Float64}, shifts::Vector{Int},
+                               n::Int) = begin
+        response::Vector{Float64} = exp.(-position[1] .* (0:(n - 1)))
+        weights::Vector{Float64} = position[2] .* (1:length(shifts))
+        observations = 1:n
+        concentration::Vector{Float64} = plate(observations, Ref(shifts),
+                Ref(response), Ref(weights)) do t, s, u, w
+            sum((w[j] * get(u, t - s[j], 0.0) for j in eachindex(s)); init = 0.0)
+        end
+        return concentration
+    end
+    positions = [0.1 0.2 0.3 0.4; 1.0 2.0 3.0 4.0]
+    shifts, n = [0, 5, 9], 2000
+    scalar = prepare(per_position_plate)
+    expected = reduce(hcat, [scalar(positions[:, i], shifts, n)
+                             for i in axes(positions, 2)])
+    scalar_bytes = (scalar(positions[:, 1], shifts, n);
+                    _position_plate_bytes(scalar, positions[:, 1], shifts, n))
+    for reuse in (false, true)
+        batch = vectorize(per_position_plate; batched = :position, reuse)
+        @test batch(positions, shifts, n) == expected
+        bytes = _position_plate_bytes(batch, positions, shifts, n)
+        # Per position: the scalar kernel's own arrays plus the stacked output.
+        @test bytes <= 2 * size(positions, 2) * scalar_bytes
+    end
 end
 
 @testset "rank checks and HAVE passthrough" begin
