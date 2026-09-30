@@ -348,7 +348,8 @@ end
 # form lowers under Reactant without unrolling (RK-macro-only per decision
 # `17bnc6t`; Reactant untouched).  `iterated` and `shared` are tuples; the common
 # case is a one-tuple `iterated`, and `eachindex(iterated...)` validates that
-# several sequences share axes (a `DimensionMismatch` otherwise).
+# several sequences share axes (a `DimensionMismatch` otherwise). Empty
+# sequences run no step and yield an empty result.
 @inline function _tensorized_scan(step, init, iterated::Tuple, shared::Tuple)
     marker = _scan_backend_marker(init, iterated, shared)
     _tensorized_scan_lowering(marker, step, init, iterated, shared)
@@ -370,12 +371,23 @@ end
     _dynamic_tensorized_marker((init, map(_scan_marker_value, iterated)...,
                                 map(_scan_marker_value, shared)...))
 
+# The per-step output type of a scan step applied to these argument types. An
+# empty sequence runs no step, so its (empty) result is typed the way Base's
+# `accumulate` types one: by inference, `Any` when inference cannot tell.
+function _scan_step_output_type(step, argument_types...)
+    R = Base.promote_op(step, argument_types...)
+    R isa DataType && R <: Tuple && length(R.parameters) == 2 ?
+        fieldtype(R, 2) : Any
+end
+
 # The native ordered loop.  `nothing` is the no-backend marker; a backend
 # extension specializes `_tensorized_scan_lowering` on its own marker type.
+# An empty sequence returns an empty result without running the step.
 function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
                                    shared::Tuple)
     idx = eachindex(iterated...)
-    isempty(idx) && throw(ArgumentError("scan requires a non-empty sequence"))
+    isempty(idx) && return similar(first(iterated), _scan_step_output_type(
+        step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...))
     i1 = first(idx)
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared...)
     result = similar(first(iterated), typeof(out1))

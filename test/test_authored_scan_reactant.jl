@@ -62,8 +62,86 @@ end
         @test host ≈ k(a, b)
         # A single carry loop over BOTH sequences — not two loops, not unrolled.
         hlo = repr(Reactant.@code_hlo optimize = false k(traced_a, traced_b))
-        @test occursin("stablehlo.while", hlo)
+        @test count("stablehlo.while", hlo) == 1
     end
+    # The program is independent of the sequence length, traced or bound.
+    traced_sizes, bound_sizes = Int[], Int[]
+    for n in (6, 12)
+        a, b = sin.(1:n), cos.(1:n)
+        k = prepare(spec; want = :seq)
+        traced_hlo = repr(Reactant.@code_hlo optimize = false k(
+            Reactant.to_rarray(a), Reactant.to_rarray(b)))
+        @test count("stablehlo.while", traced_hlo) == 1
+        push!(traced_sizes, count("\n", traced_hlo))
+        kb = prepare(spec; want = :seq, bound = (; b))
+        bound_hlo = repr(Reactant.@code_hlo optimize = false kb(Reactant.to_rarray(a)))
+        @test count("stablehlo.while", bound_hlo) == 1
+        push!(bound_sizes, count("\n", bound_hlo))
+    end
+    @test allequal(traced_sizes)
+    @test allequal(bound_sizes)
+end
+
+@kernel authored_scan_reactant_doses(mgs::Vector{Float64}, units::Matrix{Float64}, n::Int) = begin
+    slots = collect(1:n)
+    weights = scan(mgs, eachrow(units), Ref(slots);
+            init = (; prior = zeros(Float64, n), index = 1)) do carry, mg, u, positions
+        weight = mg / (1 + sum(carry.prior .* u))
+        next = ifelse.(positions .== carry.index, weight, carry.prior)
+        ((; prior = next, index = carry.index + 1), weight)
+    end
+    total::Float64 = 1.0 + sum(weights)
+    return total
+end
+
+@kernel authored_scan_reactant_turnover(pd, conc_mid::Vector{Float64}, dts::Vector{Float64}) = begin
+    kin = pd.baseline * pd.kout
+    updated = scan(conc_mid, dts, Ref(pd), Ref(kin);
+            init = pd.baseline) do previous, concentration, dt, parameters, input_rate
+        c2 = parameters.kout * (1 + concentration /
+            (parameters.theta1 * concentration + parameters.theta2))
+        steady = input_rate / c2
+        next = (previous - steady) * exp(-c2 * dt) + steady
+        (next, next)
+    end
+    trajectory = vcat([pd.baseline], updated)
+    return trajectory
+end
+
+@testset "an empty traced sequence compiles to no loop and an empty result" begin
+    pd = (; baseline = 100.0, kout = 0.3, theta1 = 1.2, theta2 = 40.0)
+    traced_pd = Reactant.to_rarray(pd; track_numbers = true)
+    for n in (0, 4)
+        conc, dts = collect(1.0:n), fill(0.1, n)
+        whiles = n == 0 ? 0 : 1
+        # Every sequence traced, then the whole schedule bound as host data.
+        k = prepare(authored_scan_reactant_turnover)
+        traced = (Reactant.to_rarray(conc), Reactant.to_rarray(dts))
+        compiled = Reactant.@compile k(traced_pd, traced...)
+        @test Array(compiled(traced_pd, traced...)) ≈ k(pd, conc, dts)
+        hlo = repr(Reactant.@code_hlo optimize = false k(traced_pd, traced...))
+        @test count("stablehlo.while", hlo) == whiles
+        kb = prepare(authored_scan_reactant_turnover; bound = (; conc_mid = conc, dts))
+        compiled_bound = Reactant.@compile kb(traced_pd)
+        @test Array(compiled_bound(traced_pd)) ≈ kb(pd)
+        bound_hlo = repr(Reactant.@code_hlo optimize = false kb(traced_pd))
+        @test count("stablehlo.while", bound_hlo) == whiles
+
+        # A vector carry over a 1-D sequence beside matrix rows.
+        mgs, units = collect(1.0:n), [i < j ? 0.5 : 0.0 for j in 1:n, i in 1:n]
+        kd = prepare(authored_scan_reactant_doses)
+        traced_doses = (Reactant.to_rarray(mgs), Reactant.to_rarray(units))
+        compiled_doses = Reactant.@compile kd(traced_doses..., n)
+        @test Reactant.to_number(compiled_doses(traced_doses..., n)) ≈ kd(mgs, units, n)
+        doses_hlo = repr(Reactant.@code_hlo optimize = false kd(traced_doses..., n))
+        @test count("stablehlo.while", doses_hlo) == whiles
+    end
+    # The empty scan port itself as the program output: an empty traced input of
+    # the output type is forwarded, which XLA exports (§7l).
+    k = prepare(authored_scan_reactant_turnover; want = :updated)
+    empty = (Reactant.to_rarray(Float64[]), Reactant.to_rarray(Float64[]))
+    compiled = Reactant.@compile k(traced_pd, empty...)
+    @test Array(compiled(traced_pd, empty...)) == Float64[]
 end
 
 @testset "authored eachrow scan keeps one while loop" begin
