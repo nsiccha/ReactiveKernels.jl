@@ -87,7 +87,11 @@ boundary. For inputs shaped like `x`, `reshape(location, 1, :)`, and
 `reshape(scale, 1, 1, :)`, work depending only on `scale` runs once per scale
 coordinate and its scalar result is reused across the two inner dimensions.
 There is still one Cartesian traversal, and no axis-sized intermediate is
-created for the reused value.
+created for the reused value. Each cell recipe's fused closure is inlined into
+that traversal, including a cell whose body carries its own loop (a reduction
+over a short inner axis such as a few doses per observation); Julia's inlining
+heuristic would otherwise keep such a cell a per-coordinate function call and
+recompute its loop invariants on every observation.
 
 Purity is the plate contract, just as it is for ordinary stateless RK recipes.
 RK does not inspect an opaque Julia callable to prove its implementation pure;

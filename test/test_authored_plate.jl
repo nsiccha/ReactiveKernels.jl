@@ -1146,3 +1146,71 @@ end
     end
     @test prepare(_kw_call_plate; want = :pointwise)(e) ≈ expected
 end
+
+# A plate cell whose fused closure carries a LOOP — a `sum(generator)` over an
+# inner host axis, the dose-superposition shape — was a real function call on
+# every plate coordinate on Julia 1.10: the inlining heuristic refuses a
+# loop-carrying closure, so the cell's loop invariants (`plan.shifts`,
+# `eachindex`) were recomputed per observation, at 2× the time of the same
+# body written inline. `_kernel_source_call` now callsite-inlines the native
+# fused closure (snag `generator-plate-e160f4c2`). Julia 1.12 inlines this
+# closure on its own, so the plain-call control is asserted only where the
+# heuristic refuses it.
+@testset "authored plate cell: a loop-carrying cell closure is inlined into the native loop" begin
+    plan = (; shifts = [0, 4, 9], nobs = 4096)
+    _slots(plan) = eachindex(plan.shifts)
+    _lookup(observation, plan, i) = observation - plan.shifts[i]
+    @kernel _generator_cell(plan, units, weights) = begin
+        observations::UnitRange{Int} = 1:plan.nobs
+        concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units),
+                                               Ref(weights)) do observation, schedule_plan, response, amounts
+            sum((ifelse(_lookup(observation, schedule_plan, i) > 0,
+                        response[max(_lookup(observation, schedule_plan, i), 1)] * amounts[i],
+                        0.0)
+                 for i in _slots(schedule_plan)); init = 0.0)
+        end
+        return concentration
+    end
+    units = [sin(0.01k) + 1.5 for k in 1:plan.nobs]
+    weights = [0.5, 1.25, 0.75]
+    kernel = prepare(_generator_cell)
+    reference = [sum(observation - s > 0 ? units[observation - s] * w : 0.0
+                     for (s, w) in zip(plan.shifts, weights))
+                 for observation in 1:plan.nobs]
+    @test kernel(plan, units, weights) ≈ reference
+    # Output-only allocation: a per-cell allocation would add ≥ 32 B per observation.
+    kernel(plan, units, weights)
+    @test (@allocated kernel(plan, units, weights)) < 3 * sizeof(Float64) * plan.nobs
+
+    # The cell op is the fused closure whose recipe yields the plate value; its
+    # closure arguments are the do-block formals in recipe-input order.
+    cell_index = only(i for (i, recipe) in enumerate(kernel.lowered_recipes)
+                      if [v.name for v in recipe.outputs] == [:__plate_value__])
+    op = kernel.ops[cell_index]
+    @test op isa ReactiveKernels._KernelSourceOp
+    formal_types = Dict(:schedule_plan => typeof(plan), :observation => Int,
+                        :response => typeof(units), :amounts => typeof(weights))
+    argtypes = Tuple(formal_types[v.name] for v in kernel.lowered_recipes[cell_index].inputs)
+    invokes_closure(f, types) = any(only(Base.code_typed(f, types; optimize = true))[1].code) do stmt
+        stmt isa Expr && stmt.head === :invoke || return false
+        callee = stmt.args[1]
+        callee isa Core.CodeInstance && (callee = callee.def)
+        callee isa Core.MethodInstance || return false
+        # The specialized signature names the concrete closure type (a cell
+        # closure over local helpers is parametric; the method's own `sig` is not).
+        callee.specTypes isa DataType && callee.specTypes.parameters[1] === typeof(op.f)
+    end
+    @test !invokes_closure(ReactiveKernels._kernel_source_call,
+                           (Val{:native}, typeof(op), argtypes...))
+    # Negative control: the same call without the annotation keeps the closure
+    # as an `invoke` wherever the heuristic refuses to inline it (Julia 1.10).
+    # Fixed arity on purpose: a forwarded `args...` splat is left unspecialized
+    # and lowers to a dynamic apply, which the `invoke` scan cannot see.
+    plain_call(op, a, b, c, d) = op.f(a, b, c, d)
+    @test length(argtypes) == 4
+    if VERSION < v"1.11"
+        @test invokes_closure(plain_call, (typeof(op), argtypes...))
+    else
+        @info "plain-call control skipped: this Julia inlines the loop-carrying closure itself" VERSION
+    end
+end

@@ -21,6 +21,12 @@ struct PreparedADKernel{I,K,R,F,B,P,E}
     external_values::E
 end
 
+# Same statically-untraced contract as `PreparedKernel` (codegen.jl): this
+# object is captured by the `@trace` loop in `_replica_ad_call`, and its
+# kernel reaches the same `Type`-carrying recipe metadata.
+ReactantCore.is_traced(::PreparedADKernel) = false
+ReactantCore.is_traced(::PreparedADKernel, ::Base.IdSet) = false
+
 """
     PreparedADPullback
 
