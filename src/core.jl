@@ -523,6 +523,38 @@ end
 # authorize their backend's scalar gather lowering.
 @inline _tensorized_getindex(args...) = getindex(args...)
 
+"""
+    ReactiveKernels.traced(f, args...)
+
+The call a kernel makes in place of `f(args...)` when a tracing backend
+(Reactant) compiles it.  The default is `f(args...)`.  Add a method for your
+own function to give it a tracing implementation, while native execution keeps
+calling `f` itself:
+
+```julia
+# native: a hand-written in-place loop, fast but not traceable
+superpose(plan, units, weights) = ...
+# under tracing: any traceable implementation, here a prepared plate kernel
+ReactiveKernels.traced(::typeof(superpose), plan, units, weights) =
+    SUPERPOSE_KERNEL(plan, units, weights)
+```
+
+The method may be any Julia the backend can trace: a prepared kernel, a
+`derivative_rule`, or backend code in the package's own Reactant extension.
+Dispatch selects it by the authored argument types, so annotate the arguments
+that choose the implementation and leave traced arguments untyped.
+[`@traceable`](@ref) defines such a method from a helper's own body.
+
+A kernel routes a positional call through `traced` only in the code a tracing
+backend runs, and only for functions Base, Core and ReactiveKernels do not
+own; a call with keyword arguments is not routed.  Define the method before
+the `@kernel` that calls `f`: a recipe that is exactly `x = f(ports...)` keeps
+`f` itself as its operation unless `f` already has a `traced` method when the
+kernel is defined.  The two implementations are separate code: test the traced
+one against the native one.
+"""
+@inline traced(f::F, args::Vararg{Any,N}) where {F,N} = f(args...)
+
 # `get(A, i, default)` in a tensorized fused body routes through this hook: the
 # total gather that reads `A[i]` when `i` is a valid index and yields `default`
 # otherwise (a causal response that is zero before its dose, a lookup table

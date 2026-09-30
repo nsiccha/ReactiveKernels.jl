@@ -67,7 +67,7 @@ export prepare_batched, vectorize
 export batched_ports, scalar_kernel
 export explain, code_expr, inputs, outputs, valtype
 export compose, extract, PreparationCache, prepare!, canon_id
-export KernelSpec, KernelObjectSpec, @kernel, @node, kernel_graph, port, copy!!
+export KernelSpec, KernelObjectSpec, @kernel, @node, @traceable, kernel_graph, port, copy!!
 export PartialFunction, partial
 # Experimental captured-control consumer interface.
 export prepare_transpiled, initial_transpiled_state, transpiled_endpoint
