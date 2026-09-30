@@ -1,0 +1,171 @@
+# Composed predictors (v1): a response/scale location combining affine
+# sub-predictor LPs with scalars under `. .*`/`.+`/`.−` (IRT 2PL,
+# hierarchical products, additive sub-LP merges). Sub-predictors intern
+# affine under IdentityLink; the combination tree evaluates in-graph.
+@testset "composed product lowers" begin
+    plan = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        al = a_al .+ b_al .* xs
+        be ~ Normal(0.0, 100.0)
+        eta = be .* (th .- al)
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    @test [p.name for p in plan.predictors] == [:th, :al, :eta]
+    @test all(p -> p.link === IdentityLink, plan.predictors)
+    subs = plan.predictors[1:2]
+    @test all(p -> [t.kind for t in p.terms] ==
+        [InterceptTerm, ContinuousTerm], subs)
+    eta = plan.predictors[3]
+    @test length(eta.terms) == 1
+    t = only(eta.terms)
+    @test t.kind === ComposedTerm
+    @test t.options.subs == [:th, :al]
+    @test t.options.scalars == [:be]
+    @test t.options.tree == :(be .* (th .- al))
+    @test Set([(p.predictor, p.addressee)
+        for p in plan.population_priors]) ==
+        Set([(:th, :Intercept), (:th, :xs), (:al, :Intercept), (:al, :xs)])
+    @test [(p.name, p.family) for p in plan.parameters] ==
+        [(:be, :normal)]
+    @test isempty(plan.derived)
+    @test isempty(plan.assignments)
+end
+
+@testset "composed additive and scalar-star" begin
+    add = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        al = a_al .+ b_al .* xs
+        eta = th .+ al
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    t = only(add.predictors[3].terms)
+    @test t.kind === ComposedTerm
+    @test t.options.tree == :(th .+ al)
+    @test isempty(t.options.scalars)
+    # Julia-valid scalar `*` normalizes to dotted (Base broadcasts).
+    star = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        eta = be * th
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    t = only(star.predictors[2].terms)
+    @test t.kind === ComposedTerm
+    @test t.options.tree == :(be .* th)
+end
+
+@testset "composed factor sub" begin
+    # Bare factor indexing (`th = c[g]`) shapes scalar globally but analyzes
+    # to an affine FactorTerm — under `.*` it is a sub-predictor.
+    plan = lower_rkppl(quote
+        c[levels(g)] .~ Normal.(0, 2)
+        th = c[g]
+        be ~ Normal(0.0, 100.0)
+        eta = be .* th
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :g))
+    @test [p.name for p in plan.predictors] == [:th, :eta]
+    @test only(plan.predictors[1].terms).kind === FactorTerm
+    t = only(plan.predictors[2].terms)
+    @test t.kind === ComposedTerm
+    @test t.options.subs == [:th]
+    @test [(p.predictor, p.addressee) for p in plan.population_priors] ==
+        [(:th, :g)]
+    # Under `.+` the same alias keeps the affine merge (with
+    # unstated-coefficient defaults) — never reroutes into a composition.
+    aff = lower_rkppl(quote
+        c[levels(g)] .~ Normal.(0, 2)
+        th = c[g]
+        mu = th .+ b .* x
+        y .~ Normal.(mu, 1.5)
+    end, (:y, :g, :x))
+    @test [p.name for p in aff.predictors] == [:mu]
+    @test [t.kind for t in only(aff.predictors).terms] ==
+        [FactorTerm, ContinuousTerm]
+end
+
+@testset "composed inline and scale locations" begin
+    inl = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        y .~ Bernoulli.(logistic.(be .* th))
+    end, (:y, :xs))
+    @test [p.name for p in inl.predictors] == [:th, :y_eta]
+    @test only(inl.predictors[2].terms).kind === ComposedTerm
+    vscale = lower_rkppl(quote
+        mu = a .+ b .* xs
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        sg = be .* th
+        y .~ Normal.(mu, exp.(sg))
+    end, (:y, :xs))
+    sg = only(p for p in vscale.predictors if p.name === :sg)
+    @test only(sg.terms).kind === ComposedTerm
+end
+
+@testset "composed fail-closed" begin
+    # Undotted vector combination: Julia-truthful, write the dots.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        al = a_al .+ b_al .* xs
+        be ~ Normal(0.0, 100.0)
+        eta = be * th - al
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    # Literal scales fold into a coefficient or prior, not the tree.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        eta = 2.0 .* th
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    # Data columns never combine directly — only sub-LPs and scalars.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        eta = be .* (th .+ xs)
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    # Nested compositions lower only at response/scale locations.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        ga ~ Normal(0.0, 100.0)
+        mid = be .* th
+        eta = ga .* mid
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    # ... including through a shared, already-interned composed root.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        ga ~ Normal(0.0, 100.0)
+        mid = be .* th
+        y1 .~ Bernoulli.(logistic.(mid))
+        eta2 = ga .* mid
+        y2 .~ Bernoulli.(logistic.(eta2))
+    end, (:y1, :y2, :xs))
+    # A scalar leaf names a sampled name or scalar definition — or fails.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        eta = be .* th
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    # A scalar leaf cannot also be a sub-predictor coefficient.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        th = a .+ b .* xs
+        b ~ Normal(0, 1)
+        eta = b .* th
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    # Shrinkage priors go on the coefficient-holding sub-predictors,
+    # never the composed root.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        r2d2(eta, R2, phi)
+        R2 ~ Beta(1, 1)
+        phi ~ Dirichlet(2, 1.0)
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        eta = be .* th
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+end

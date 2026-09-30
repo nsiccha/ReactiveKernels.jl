@@ -19,6 +19,14 @@ Validate, assign layout, emit, and evaluate a self-contained `@kernel`
 program for `plan`. `spec` is the `KernelSpec` (callable after `prepare`
 with `have=(:unconstrained, data…)`); `layout` is its
 [`LayoutTable`](@ref) (R10 read API for the sampler side).
+
+Thread safety: concurrent `build_kernel` calls over independent plans are
+supported — the counter-suffixed `PPLGeneratedModels` binding is assigned
+under a package-owned lock, so every build gets a distinct binding with no
+caller-side synchronization. The returned spec closes over build-time
+eval'd code: `prepare` it and call it through [`prepare_query`](@ref) /
+[`prepare_sampler`](@ref) (which carry the `Base.invokelatest` world-age
+barrier) or wrap those calls in `Base.invokelatest` yourself.
 """
 function build_kernel(plan::StructuralPlan)
     validate_plan(plan)
@@ -150,15 +158,25 @@ end
 
 const _MODEL_COUNTER = Ref(0)
 
+# Package-owned binding lock: the counter increment plus the two
+# `PPLGeneratedModels` evals are one critical section, so concurrent
+# `build_kernel` calls always land on distinct bindings (an unsynchronized
+# `Ref` increment drops updates under contention and two builds would
+# silently share one binding — the second model's def wins and the first
+# task reads back the wrong kernel).
+const _MODEL_EVAL_LOCK = ReentrantLock()
+
 function _eval_kernel_def(def::Expr)
-    _MODEL_COUNTER[] += 1
-    name = Symbol(:ppl_model_, _MODEL_COUNTER[])
-    sig = def.args[1]
-    renamed = Expr(:(=), Expr(:call, name, sig.args[2:end]...), def.args[2])
-    call =
-        Expr(:macrocall, Symbol("@kernel"), LineNumberNode(1, :generator), renamed)
-    Core.eval(PPLGeneratedModels, call)
-    return Core.eval(PPLGeneratedModels, name)
+    lock(_MODEL_EVAL_LOCK) do
+        _MODEL_COUNTER[] += 1
+        name = Symbol(:ppl_model_, _MODEL_COUNTER[])
+        sig = def.args[1]
+        renamed = Expr(:(=), Expr(:call, name, sig.args[2:end]...), def.args[2])
+        call = Expr(:macrocall, Symbol("@kernel"), LineNumberNode(1, :generator),
+            renamed)
+        Core.eval(PPLGeneratedModels, call)
+        return Core.eval(PPLGeneratedModels, name)
+    end
 end
 
 # Scalar + derived assignments in topo order (params already constrained
@@ -237,6 +255,15 @@ function _predictor_statements(plan::StructuralPlan)
         for t in pred.terms
             t.kind === DarSummandTerm &&
                 push!(terms, _dar_summand_expr(plan, pred, t))
+        end
+        # A composed term evaluates its combination tree in-graph:
+        # sub-predictors resolve to their LP nodes (emitted above —
+        # contract orders subs first), scalars to their constrained
+        # locals (params constrained above, assignments emitted above).
+        # Plain broadcast math: ordinary reverse mode on every backend.
+        for t in pred.terms
+            t.kind === ComposedTerm &&
+                push!(terms, _composed_expr(plan, pred, t))
         end
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
@@ -557,6 +584,26 @@ function _dar_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpe
         "[generator] dar summand in predictor $(pred.name) addresses " *
         "unknown dar :$(o.dar_id)"))
     return o.dar_id
+end
+
+"""Rewrite a composed tree to in-graph nodes (contract validated it)."""
+function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
+        pred::Symbol)
+    if node isa Symbol
+        node in subs || return node
+        i = findfirst(p -> p.name === node, plan.predictors)
+        i === nothing && throw(ContractValidationError(
+            "[generator] composed term in predictor $pred addresses " *
+            "unknown sub-predictor $node"))
+        return _lp_name(plan.predictors[i])
+    end
+    return Expr(node.head, node.args[1],
+        (_composed_rewrite(a, subs, plan, pred) for a in node.args[2:end])...)
+end
+
+function _composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
+    o = t.options
+    return _composed_rewrite(o.tree, o.subs, plan, pred.name)
 end
 
 # Group-index encoder nodes, one per grouped column (`_ppl_gidx_<group>`):

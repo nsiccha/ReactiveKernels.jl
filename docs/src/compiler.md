@@ -247,20 +247,32 @@ The residual body is value-independent exactly when the inner-plate pass
 below leaves it alone. A residual whose authored plates specialize on bound
 data — bound-only cell recipes evaluated at preparation, data-bound branch
 partitions — is still specialized and compiled per binding and reuses only
-the plan and prefix; a residual containing authored plates is templated per
-bound-value type and array-shape signature, because those decide whether the
-pass rewrites it. The entries never observe bound values after preparation
+the plan and prefix. For a residual containing authored plates the pass runs
+on every binding (it declines before evaluating anything when a plate has
+nothing bound to specialize), and every binding it leaves alone shares the one
+compiled residual, whatever the bound values' types or array lengths: an
+inline plate over a bound domain rebinds to a new domain length at the cost of
+the prefix, exactly as the same plate in a separately prepared child does.
+(Before, such a residual was templated per bound-value type and array-shape
+signature, so each new bound array length lowered the residual again and kept
+another template: 2.6 ms and 1.16 MB more per new schedule length on the
+ShinyRK simulation graph, and about 43 kB retained per length.) The entries
+never observe bound values after preparation
 and keep none of them: a template holds the compiled callable and the
 value-independent tail of the operation table, not the kernel of the binding it
 was built from. Binding freshness remains the caller's responsibility as for
 `prepare`.
 
 Rebinding itself is not specialized on the graph's kernel types. Its code is
-compiled once per process for every graph, so the first rebinding of a graph
-costs what any later one does. (Before, the first rebinding of each graph in a
-process compiled the rebinding path for that graph's prefix and residual kernel
-types: 290 ms and 40 MB for the ShinyRK simulation graph, whose steady-state
-rebinding costs about 1 ms.)
+compiled once, for every graph, into the ReactiveKernels package image, so the
+first rebinding of a graph in a process compiles nothing and costs what any
+later one does. (Before, the first rebinding of each graph in a process
+compiled the rebinding path for that graph's prefix and residual kernel types:
+290 ms and 40 MB for the ShinyRK simulation graph, whose steady-state
+rebinding costs about 1 ms. Later, while that untyped path was compiled only
+incidentally with the first binding, a change to its arguments moved its
+compilation back to the first rebinding in each process: about 40 ms and
+0.55 MB on the same graph.)
 
 #### Data-bound branches in plate cells
 

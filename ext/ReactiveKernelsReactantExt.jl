@@ -1003,10 +1003,17 @@ ReactiveKernels._sm_restore_source_logical_wrappers(
 ReactiveKernels._sm_restore_source_logical_wrappers(
         ::LinearAlgebra.Diagonal, value::Reactant.TracedRArray{T,2}) where {T} =
     LinearAlgebra.Diagonal(LinearAlgebra.diag(value))
-# A traced Cholesky already IS the traced representation of a source
-# Cholesky; its traced `info` is not host metadata to compare against.
+# While tracing, a traced Cholesky already IS the traced representation of a
+# source Cholesky; its traced `info` is not host metadata to compare against.
+# Once its factors are device arrays — the guarded host bridge, where host
+# canonicalization rebuilt the wrapper through `_sm_cholesky_reconstruct` —
+# the core rebuilds the source `LinearAlgebra.Cholesky`, so the restored state
+# has the type the executable was compiled for.
+const _RKTracedFactors = Union{
+    Reactant.TracedRArray,LinearAlgebra.Diagonal{<:Any,<:Reactant.TracedRArray}}
 ReactiveKernels._sm_restore_source_logical_wrappers(
-        ::LinearAlgebra.Cholesky, value::_TracedCholesky) = value
+        ::LinearAlgebra.Cholesky,
+        value::_TracedCholesky{T,<:_RKTracedFactors}) where {T} = value
 ReactiveKernels._sm_restore_source_logical_wrappers(
         ::_TracedCholesky, value::_TracedCholesky) = value
 

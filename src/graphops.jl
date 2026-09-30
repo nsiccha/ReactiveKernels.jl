@@ -153,14 +153,43 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     end
     # The per-binding mathematics runs outside the lock.
     hoisted = _bound_hoisted(entry, data)
-    shape = _bound_shape_key(entry, data, hoisted)
+    residual, specialized = _bound_residual(entry, hoisted)
+    # A residual the inner-plate pass rewrote bakes this binding's values in.
+    specialized === residual || return prepare(specialized; passes = passes)
     fresh = nothing
     template = lock(cache.lock) do
-        get!(entry.templates, shape) do
-            template, kernel = _bound_build(entry, hoisted, passes)
-            fresh = kernel
-            template
-        end
+        entry.template isa _UnbuiltTemplate || return entry.template
+        template, kernel = _bound_build(entry, residual, hoisted, passes)
+        entry.template = template
+        fresh = kernel
+        template
     end
-    fresh === nothing ? _bound_rebind(entry, template, hoisted, passes) : fresh
+    fresh === nothing ? _bound_rebind(entry, template, residual, hoisted, passes) : fresh
+end
+
+# The bound-preparation path is untyped (partial_evaluation.jl), so one
+# compilation serves every graph and bound type; these directives put it in
+# this package's image. Nothing else guarantees it is compiled before the first
+# rebinding in a process: the first binding compiled `_bound_rebind` only
+# while the inliner split its call above into static calls, and the
+# `Union{Nothing,Plan}` residual argument ended that split (snag
+# first-rebinding-64d82bfc: 41 ms and 0.55 MB at the first rebinding of the
+# ShinyRK simulation graph in every process).
+for graph_key in (Nothing, UInt64)
+    precompile(_prepare_bound!, (PreparationCache, Graph, Any, Any, Any, Any, graph_key)) ||
+        error("no _prepare_bound! method for a $graph_key graph key")
+end
+for template in (_BoundTemplate, PreparedKernel, Nothing)
+    precompile(_bound_rebind, (_BoundEntry, template, Any, Any, Any)) ||
+        error("no _bound_rebind method for a $template template")
+end
+for residual in (Plan, Nothing)
+    precompile(_bound_residual_plan, (_BoundEntry, residual, Any)) ||
+        error("no _bound_residual_plan method for a $residual residual")
+end
+for (f, types) in ((_bound_entry, (Plan, Any)), (_bound_hoisted, (_BoundEntry, Tuple)),
+                   (_bound_residual, (_BoundEntry, Any)),
+                   (_bound_build, (_BoundEntry, Any, Any, Any)),
+                   (_partial_residual, (Plan, _PartialBoundary, Any)))
+    precompile(f, types) || error("no $f method for $types")
 end
