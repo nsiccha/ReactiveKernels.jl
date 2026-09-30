@@ -715,6 +715,19 @@ end
     end
 end
 
+@testset "authored scan reverse AD over an empty sequence" begin
+    # No step runs, so the value is the empty reduction and the gradient is zero.
+    q = [0.2, 0.7, -0.3]
+    k = prepare(AuthoredScanFixtures.authored_scan_arma;
+                bound = (; series = Float64[]), want = :total)
+    prepared = prepare_ad(k, TEST_AD_BACKEND, q; active = :q)
+    gradient = fill(NaN, length(q))
+    value, returned = ad_value_and_gradient!(prepared, gradient, q)
+    @test value === 0.0
+    @test returned === gradient
+    @test gradient == zeros(length(q))
+end
+
 @testset "scan AD preserves operation-table source transforms" begin
     spec = AuthoredScanFixtures.authored_scan_arma
     q, series = [0.2, 0.7, -0.3], [0.5]
