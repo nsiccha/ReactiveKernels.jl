@@ -523,6 +523,15 @@ end
 # authorize their backend's scalar gather lowering.
 @inline _tensorized_getindex(args...) = getindex(args...)
 
+# `get(A, i, default)` in a tensorized fused body routes through this hook: the
+# total gather that reads `A[i]` when `i` is a valid index and yields `default`
+# otherwise (a causal response that is zero before its dose, a lookup table
+# with a fill value).  Native semantics are exactly `Base.get`.  Base decides
+# with a lazy branch on the bounds test, so a tracing extension keeps that
+# branch lazy on a traced index: the read of `A[i]` stays inside the taken arm
+# and an out-of-range index is never read (`docs/src/constraints.md`).
+@inline _tensorized_get(args...) = get(args...)
+
 """
     Graph()
 

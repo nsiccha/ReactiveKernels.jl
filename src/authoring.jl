@@ -1931,10 +1931,12 @@ _tensorized_callee_replacement(callee::Symbol) =
     callee === :vect ? :_tensorized_vect :
     callee === :eachcol ? :_tensorized_eachcol :
     callee === :getindex ? :_tensorized_getindex :
+    callee === :get ? :_tensorized_get :
     callee === :dot ? :_tensorized_dot : nothing
 _tensorized_callee_replacement(callee::GlobalRef) =
     callee.mod === Base && callee.name === :eachcol ? :_tensorized_eachcol :
     callee.mod === Base && callee.name === :getindex ? :_tensorized_getindex :
+    callee.mod === Base && callee.name === :get ? :_tensorized_get :
     callee.mod === Base && callee.name === :vect ? :_tensorized_vect :
     callee.name === :dot && nameof(callee.mod) === :LinearAlgebra ?
         :_tensorized_dot :
@@ -2039,6 +2041,79 @@ function _kernel_tensorized_branch(condition, then_side, else_side, known, mod,
     Expr(:call, GlobalRef(@__MODULE__, :_recurrence_branch),
          _kernel_tensorized_rhs(unwrap(condition), known, mod, scope),
          thunk(then_side), thunk(else_side), Expr(:tuple))
+end
+
+# A filtered generator reduction `sum(term for i in iter if condition; init = x)`
+# states a sum over the elements that satisfy the condition — the sum over the
+# doses already given, over the observations inside a window.  Base evaluates it
+# as a left fold over `Iterators.filter`, whose `if` branches on the condition;
+# under a tracing backend the condition is traced and that host branch fails
+# (`non-boolean (TracedRNumber{Bool}) used in boolean context`).  The
+# tensorized companion spells out the same fold with the filter as a lazy
+# branch on the accumulator: `add_sum(acc, term)` runs only in the taken arm,
+# so the term's indexing and arithmetic stay inactive for a rejected element
+# (`docs/src/constraints.md`), and the accumulation order is Base's own
+# (`sum(itr; init)` is `foldl(add_sum, itr; init)` for a generator), so the
+# result is the same value.  Only the `init` form is rewritten: without it the
+# first ACCEPTED element seeds the sum, which a traced condition cannot select
+# at trace time.  The iteration itself is the ordinary Julia iteration of the
+# host iterator, exactly as the unfiltered generator is traced.
+function _kernel_filtered_sum_parts(ex)
+    ex isa Expr && ex.head === :call && length(ex.args) >= 2 || return nothing
+    callee = ex.args[1]
+    callee === :sum || callee == GlobalRef(Base, :sum) || return nothing
+    generator = nothing
+    init = nothing
+    for arg in ex.args[2:end]
+        if arg isa Expr && arg.head === :parameters
+            for parameter in arg.args
+                if parameter === :init
+                    init === nothing || return nothing
+                    init = :init
+                elseif parameter isa Expr && parameter.head === :kw &&
+                       parameter.args[1] === :init
+                    init === nothing || return nothing
+                    init = parameter.args[2]
+                else
+                    return nothing
+                end
+            end
+        elseif arg isa Expr && arg.head === :kw && arg.args[1] === :init
+            init === nothing || return nothing
+            init = arg.args[2]
+        elseif arg isa Expr && arg.head === :generator && generator === nothing
+            generator = arg
+        else
+            return nothing
+        end
+    end
+    (generator === nothing || init === nothing) && return nothing
+    length(generator.args) == 2 || return nothing
+    term, clause = generator.args
+    clause isa Expr && clause.head === :filter && length(clause.args) == 2 ||
+        return nothing
+    condition, binding = clause.args
+    binding isa Expr && binding.head === :(=) && length(binding.args) == 2 &&
+        binding.args[1] isa Symbol || return nothing
+    (; term, condition, variable = binding.args[1], iterator = binding.args[2], init)
+end
+
+function _kernel_tensorized_filtered_sum(parts, known, mod, scope)
+    variable = parts.variable
+    accumulator = gensym(:filtered_sum)
+    inner = union(scope, Set((variable, accumulator)))
+    formals = Expr(:tuple, accumulator, variable)
+    accept = Expr(:->, formals, Expr(:call, GlobalRef(Base, :add_sum), accumulator,
+        _kernel_tensorized_rhs(parts.term, known, mod, inner)))
+    reject = Expr(:->, formals, accumulator)
+    step = Expr(:->, formals,
+        Expr(:call, GlobalRef(@__MODULE__, :_recurrence_branch),
+             _kernel_tensorized_rhs(parts.condition, known, mod, inner),
+             accept, reject, formals))
+    Expr(:call, GlobalRef(Base, :foldl),
+         Expr(:parameters, Expr(:kw, :init,
+              _kernel_tensorized_rhs(parts.init, known, mod, scope))),
+         step, _kernel_tensorized_rhs(parts.iterator, known, mod, scope))
 end
 
 # `begin`/`end` inside an index denote the indexed array's first/last index;
@@ -2206,6 +2281,9 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
             ex.args[1], true, ex.args[2], known, mod, scope)
     elseif ex.head === :call && !isempty(ex.args) &&
            (!(ex.args[1] isa Symbol) || !(ex.args[1] in known))
+        filtered = _kernel_filtered_sum_parts(ex)
+        filtered === nothing ||
+            return _kernel_tensorized_filtered_sum(filtered, known, mod, scope)
         replacement = _tensorized_callee_replacement(ex.args[1])
         callee = replacement === nothing ?
             _kernel_tensorized_callee(ex.args[1], known, mod) :
