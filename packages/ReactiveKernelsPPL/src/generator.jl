@@ -238,6 +238,15 @@ function _predictor_statements(plan::StructuralPlan)
             t.kind === DarSummandTerm &&
                 push!(terms, _dar_summand_expr(plan, pred, t))
         end
+        # A composed term evaluates its combination tree in-graph:
+        # sub-predictors resolve to their LP nodes (emitted above —
+        # contract orders subs first), scalars to their constrained
+        # locals (params constrained above, assignments emitted above).
+        # Plain broadcast math: ordinary reverse mode on every backend.
+        for t in pred.terms
+            t.kind === ComposedTerm &&
+                push!(terms, _composed_expr(plan, pred, t))
+        end
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
         rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
@@ -557,6 +566,26 @@ function _dar_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpe
         "[generator] dar summand in predictor $(pred.name) addresses " *
         "unknown dar :$(o.dar_id)"))
     return o.dar_id
+end
+
+"""Rewrite a composed tree to in-graph nodes (contract validated it)."""
+function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
+        pred::Symbol)
+    if node isa Symbol
+        node in subs || return node
+        i = findfirst(p -> p.name === node, plan.predictors)
+        i === nothing && throw(ContractValidationError(
+            "[generator] composed term in predictor $pred addresses " *
+            "unknown sub-predictor $node"))
+        return _lp_name(plan.predictors[i])
+    end
+    return Expr(node.head, node.args[1],
+        (_composed_rewrite(a, subs, plan, pred) for a in node.args[2:end])...)
+end
+
+function _composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
+    o = t.options
+    return _composed_rewrite(o.tree, o.subs, plan, pred.name)
 end
 
 # Group-index encoder nodes, one per grouped column (`_ppl_gidx_<group>`):
