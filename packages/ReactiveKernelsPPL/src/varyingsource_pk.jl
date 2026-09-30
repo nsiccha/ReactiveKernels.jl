@@ -148,9 +148,21 @@ function _vs_pk_check_lengths(n_times, dose, treatment_map, concentration_idxs,
     return nothing
 end
 
+# Grid validation stays behind this call boundary on purpose. Inlined lower
+# bounds on `g`/`nt` feed range facts into the loop nest below, whose native
+# Enzyme reverse then reads uninitialized shadows when the GP weights are
+# bound (Constant); an inlineable helper miscompiles identically. The throws,
+# conditions, and messages match the former inline checks exactly.
+@noinline function _vs_pk_check_grids(g, nt, m)
+    g > 0 || throw(ArgumentError("a dosed subject needs a lag grid"))
+    1 <= nt <= m || throw(ArgumentError("treatment map is outside source columns"))
+    return nothing
+end
+
 # Keep GP coefficients and scalar parameters as separate mathematical inputs.
-# A temporary boxed effectiveness tuple with constant coefficients and active
-# slopes obscures field activity across the subject loop in native Enzyme.
+# The tuple is unpacked at the boundary; the native-Enzyme hazard for bound
+# (Constant) weights is inline range validation (see `_vs_pk_check_grids`), not
+# the tuple itself.
 function _varyingsource_pk_concentration(cell::VaryingSourcePKCell, n_times,
         dose, treatment_map, unique_dts, concentration_idxs, dosing_time_idxs,
         dose_log_rate, dose_log_mode, dose_log_F, weights, dose_slope, conc_slope,
@@ -169,9 +181,8 @@ function _varyingsource_pk_concentration(cell::VaryingSourcePKCell, n_times,
         "varyingsource PK cells support native execution only; compiled " *
         "transit-rule and sequential-dose control flow is not established"))
     g = length(unique_dts)
-    g > 0 || throw(ArgumentError("a dosed subject needs a lag grid"))
     nt = maximum(treatment_map)
-    1 <= nt <= m || throw(ArgumentError("treatment map is outside source columns"))
+    _vs_pk_check_grids(g, nt, m)
     for i in eachindex(dose)
         dose[i] > 0 || throw(ArgumentError("varyingsource doses must be positive"))
         1 <= treatment_map[i] <= nt || throw(ArgumentError("invalid treatment index"))
