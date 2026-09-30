@@ -7,16 +7,21 @@
 # (`_findiff_grad` / `_GEN_BACKEND` come from test_generator.jl, included
 # first.)
 #
-# SB parity: partner numbers pending. REQUEST to
-# BayesianRegressionModels:rk:kernel:everything (Stan propto=false with
-# Jacobians, BridgeStan AD grads; Stan has no zero_inflated_binomial
-# builtin — the density is P(s) = zi*δ₀ + (1-zi)*Bin(s|n,p), FULL lpmf
-# with binomial-coefficient constants):
+# SB parity: NO COUNTERPART (documented outcome, not a failure). The
+# partner's probe records (test/sb_sweep_probe_records.jsonl, 8 probes:
+# R1/R3/ARK/R2/R4/DUG0/DUG1/DUGh; briefs 2026-09-28T12-50-19-611-xlkh75
+# and 2026-09-28T15-12-36-933-u490ai on
+# BayesianRegressionModels:rk:kernel:everything) bank no Z probe, and the
+# 115 case records hold no ZeroInflatedBinomial case — the nearest
+# neighbor, `m0`, is an (omega,p) capture-recapture model on different
+# data. Stan has no zero_inflated_binomial builtin, so no hand-built Z
+# probe exists to pin under `_ZIB_SB`. Requested points for the record:
 #   Z1: cols s=[1,0,2,0,3,1,0,2]; probe p=0.6, zi=0.3; model
 #       p ~ Beta(1,1), zi ~ Beta(1,1), s ~ ZeroInflatedBinomial(3,p,zi).
 #   Z2: same cols; probe p=0.6, zi=0.25 literal; model
 #       p ~ Beta(1,1), s ~ ZeroInflatedBinomial(3,p,0.25).
-# Pin under `_ZIB_SB` once the partner's numbers brief lands.
+# The Distributions-oracle value tests below stand in place of SB parity
+# (same shape as the verified-wall notes in test_bare_location.jl).
 using DifferentiationInterface
 using Distributions: Beta, Binomial, logpdf
 using Enzyme

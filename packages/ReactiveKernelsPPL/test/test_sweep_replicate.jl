@@ -9,23 +9,31 @@
 # (`_findiff_grad` / `_GEN_BACKEND` come from test_generator.jl, included
 # first.)
 #
-# SB parity: partner numbers pending. REQUEST to
-# BayesianRegressionModels:rk:kernel:everything (SB parity probes; Stan
-# propto=false with Jacobians, BridgeStan AD grads):
+# SB parity: partner numbers LANDED and pinned under `_SR_SB` (briefs
+# 2026-09-28T12-50-19-611-xlkh75 (R1/R3/ARK) and
+# 2026-09-28T15-12-36-933-u490ai (R2/R4/DUG) on
+# BayesianRegressionModels:rk:kernel:everything; records
+# test/sb_sweep_probe_records.jsonl, promoted 7be1eeb, repromote 58a838df,
+# merge 92cd40cd on ns/devibe; driver ran at brm_tip 77c97a3a).
+# Stan propto=false with Jacobians, BridgeStan AD grads. Pinned probes:
 #   R1: cols k=[6], n=[10]; probe theta=0.6 (u=logit(0.6)); model
 #       theta ~ Beta(1,1), k ~ Binomial(n,theta).
 #   R3: cols k=[6,8], n=[10,12]; probe theta=0.6; same model, two trials.
 #   R2: cols k1=[6], n1=[10], k2=[8], n2=[12]; probe theta1=0.6, theta2=0.7;
 #       two independent Beta-Binomial responses.
 #   R4: cols k=[6], n=[10]; probe theta=0.6, thetaprior=0.4; R1 plus a
-#       prior-only thetaprior ~ Beta(1,1).
+#       prior-only thetaprior ~ Beta(1,1) (SB keeps it sampled via a
+#       density-exact `0 *` link; BRM would otherwise demote it to GQ).
 #   ARK: cols yt=[1.0,2.0,1.5], ylag1=[0.5,1.0,2.0], ylag2=[0.2,0.5,1.0];
 #       probe alpha=1.0, b=[0.5,-0.25], sigma=1.5; model alpha/b ~ Normal(0,10),
-#       sigma ~ HalfCauchy(0,2.5) (truncated-Cauchy spelling), yt ~ Normal.
-#   DUG: cols y=[1.0,2.0,1.5], age=[1.0,5.0,9.0]; probe Linf=1.0, kk=1.0,
-#       t0=1.0, sigma=e; von-Bertalanffy mean, Normal response.
-# Pin under `_SR_SB` once the partner's numbers brief lands (follow-up todo
-# on the sweep queue).
+#       sigma ~ truncated-Cauchy(0,2.5) NORMALIZED (+log 2), yt ~ Normal.
+#       (The inventory `ark` case record is unnormalized decl-bound on a
+#       different dataset — the pin uses the ARK probe, not the case.)
+#   DUG: cols y=[1.0,2.0,1.5], age=[1.0,5.0,9.0]; DUG1 probe Linf=1.0,
+#       kk=1.0, t0=1.0, sigma=e (u=ones(4)) plus the DUG0 zeros probe;
+#       von-Bertalanffy mean, Normal response. DUGh is the same model on
+#       the STALE header dataset (y=[0.8,1.6,2.1], age=[0.5,1.0,2.0]) —
+#       documented here, no RK leg (RK cols follow the code data).
 using DifferentiationInterface
 using Distributions: Beta, Binomial, Cauchy, Exponential, Normal, logpdf
 using Enzyme
@@ -109,6 +117,29 @@ const _SR_ARK_PROG = quote
     mu = alpha .+ b1 .* ylag1 .+ b2 .* ylag2
     yt .~ Normal.(mu, sigma)
 end
+
+# BridgeStan reference pins (lp + AD grad, propto=false, Jacobian
+# included) from the partner briefs cited in the header. `grad` rides the
+# SB declaration order (`stan_names` in the records); legs map it onto RK
+# coordinates by name. Stan shas: R1/R3 92591dcff428ab7f, R2
+# a55e3effae366dca, R4 b37f7c8c3c098b8e, ARK ccd97a8d2768f599, DUG
+# 7f7ebc2298cb633d.
+const _SR_SB = (
+    R1 = (lp = -2.8101254950152406, grad = [-0.19999999999999996]),
+    R3 = (lp = -4.357335650071095, grad = [0.6000000000000006]),
+    R2 = (lp = -5.83550624952482,
+        grad = [-0.19999999999999996, -0.7999999999999996]),
+    R4 = (lp = -4.237241850655386,
+        grad = [-0.19999999999999996, 0.19999999999999996]),
+    ARK = (lp = -15.023820664671407,
+        grad = [-2.3102450980392155, 0.06777777777777777,
+            0.006111111111111098, 0.012499999999999982]),
+    DUG0 = (lp = -12.138631199228037, grad = [2.0, 0.0, 0.0, 4.25]),
+    DUG1 = (lp = -11.88668938104969,
+        grad = [1.202980209660058, -0.9897216700153967,
+            -1.1378821505379024, -4.4087291217338285]),
+)
+_sr_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
 
 @testset "sweep replicate admission" begin
     @testset "rate: Beta-sampled prob into Binomial" begin
@@ -220,6 +251,103 @@ end
             sum(logpdf(Normal(0.0, 10.0), c) for c in q.mu) +
             logpdf(Cauchy(0.0, 2.5), 1.5) + log(2) + log(1.5)
         @test got ≈ want rtol = 1e-12
+    end
+end
+
+# One SB value+grad pin at a constrained probe (the _SR_SB leg pattern):
+# posterior vs the banked lp, Enzyme grad vs the banked BridgeStan grad
+# mapped onto RK coordinates by name.
+function _sr_sb_check(prog::Expr, cols::Dict{Symbol,AbstractVector},
+        q::NamedTuple, pin::NamedTuple, pairs::Vector{<:Pair})
+    bound, built, kern, lay = _sr_query(prog, cols)
+    @test abs(_sr_posterior(kern, lay, q) - pin.lp) < 1e-12
+    names = coordinate_names(lay)
+    @test Set(names) == Set(first.(pairs))
+    u = unconstrain(lay, q)
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    sampler_value_and_gradient!(prep, g, u)
+    @test all(isfinite, g)
+    want = _sr_sb_vec(names, pairs)
+    @test maximum(abs.(g .- want)) < 1e-10
+    return nothing
+end
+
+@testset "sweep replicate SB parity" begin
+    # Direct u-parity throughout: RK interval/exp maps plus the
+    # Beta/Cauchy/Exponential densities match Stan's propto=false forms
+    # (map audit in test_sb_parity.jl), and both sides evaluate the same
+    # model, data, and probe. RK layout order differs from SB declaration
+    # order, so grad pins compare by coordinate name.
+    @testset "rate_1 (R1)" begin
+        # SB: theta ~ Beta(1,1); k ~ Binomial(n,theta); k=[6], n=[10];
+        # probe theta=0.6.
+        _sr_sb_check(_SR_RATE_PROG, _sr_r1_cols(), (theta = 0.6,), _SR_SB.R1,
+            [:theta => only(_SR_SB.R1.grad)])
+    end
+    @testset "rate_3 (R3)" begin
+        # SB: same model; k=[6,8], n=[10,12]; probe theta=0.6.
+        _sr_sb_check(_SR_RATE_PROG, _sr_r3_cols(), (theta = 0.6,), _SR_SB.R3,
+            [:theta => only(_SR_SB.R3.grad)])
+    end
+    @testset "rate_2 (R2)" begin
+        # SB: two independent Beta-Binomials; probe (0.6, 0.7).
+        _sr_sb_check(_SR_R2_PROG, _sr_r2_cols(), (theta1 = 0.6, theta2 = 0.7),
+            _SR_SB.R2, [:theta1 => _SR_SB.R2.grad[1],
+                :theta2 => _SR_SB.R2.grad[2]])
+    end
+    @testset "rate_4 (R4)" begin
+        # SB: R1 plus prior-only thetaprior ~ Beta(1,1), kept sampled via
+        # a density-exact `0 *` link; probe (0.6, 0.4).
+        _sr_sb_check(_SR_R4_PROG, _sr_r1_cols(),
+            (theta = 0.6, thetaprior = 0.4), _SR_SB.R4,
+            [:theta => _SR_SB.R4.grad[1],
+                :thetaprior => _SR_SB.R4.grad[2]])
+    end
+    @testset "ark (ARK)" begin
+        # SB: alpha/b ~ Normal(0,10), sigma ~ normalized
+        # truncated-Cauchy(0,2.5); probe (1.0, 0.5, -0.25, 1.5) in
+        # [pop.1, pop.2, pop.3, sigma] order.
+        _sr_sb_check(_SR_ARK_PROG, _sr_ark_cols(),
+            (mu = [1.0, 0.5, -0.25], sigma = 1.5), _SR_SB.ARK,
+            [Symbol("mu.Intercept") => _SR_SB.ARK.grad[2],
+                Symbol("mu.ylag1") => _SR_SB.ARK.grad[3],
+                Symbol("mu.ylag2") => _SR_SB.ARK.grad[4],
+                :sigma => _SR_SB.ARK.grad[1]])
+    end
+    @testset "dugongs (DUG0 zeros)" begin
+        # SB: Linf ~ Normal(2,1), kk/t0 ~ Normal(0,1), sigma ~
+        # Exponential(1); von-Bertalanffy mean; u=zeros(4). Linf rides
+        # the synth coordinate; order-agnostic u, name-mapped grad.
+        bound, built, kern, lay = _sr_query(_SR_DUG_PROG, _sr_dug_cols())
+        names = coordinate_names(lay)
+        u = zeros(lay.total)
+        @test abs(Base.invokelatest(kern, u) - _SR_SB.DUG0.lp) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        want = _sr_sb_vec(names,
+            [Symbol("mu._rkppl_synth_1") => _SR_SB.DUG0.grad[1],
+                :kk => _SR_SB.DUG0.grad[2], :t0 => _SR_SB.DUG0.grad[3],
+                :sigma => _SR_SB.DUG0.grad[4]])
+        @test maximum(abs.(g .- want)) < 1e-10
+    end
+    @testset "dugongs (DUG1 ones)" begin
+        # SB: same model; u=ones(4) → Linf=kk=t0=1, sigma=e.
+        bound, built, kern, lay = _sr_query(_SR_DUG_PROG, _sr_dug_cols())
+        names = coordinate_names(lay)
+        u = ones(lay.total)
+        @test abs(Base.invokelatest(kern, u) - _SR_SB.DUG1.lp) < 1e-12
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        want = _sr_sb_vec(names,
+            [Symbol("mu._rkppl_synth_1") => _SR_SB.DUG1.grad[1],
+                :kk => _SR_SB.DUG1.grad[2], :t0 => _SR_SB.DUG1.grad[3],
+                :sigma => _SR_SB.DUG1.grad[4]])
+        @test maximum(abs.(g .- want)) < 1e-10
     end
 end
 
