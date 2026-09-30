@@ -67,7 +67,15 @@ The definition uses ordinary function syntax (as in ReactiveObjects.jl), and
 its argument list is the default set of inputs. Functions like `f` and `h` are
 inputs too: they run only when the prepared kernel is called. Type annotations
 are optional; leaving them off does not stop the generated function from
-specializing on the concrete values you pass. Every named value is reachable as
+specializing on the concrete values you pass. A type on an assigned name
+(`weights::Vector{Float64} = …`) is a declared contract: in the native body of a
+kernel that also owns a plate, a scan or an embedded prepared kernel it becomes
+a typed local, so the assigned value is converted to that type (an identity for
+a value already of that type) and stays concretely typed for every consumer —
+in particular across a prepared child called inside a lazy `if` arm, where
+Julia's inference would otherwise widen the nested call and every consumer of
+the result, an embedded plate's per-cell call above all, would dispatch
+dynamically. Every named value is reachable as
 a port (`model.f`, `model.x`, `model.a`, `model.out`). With no explicit
 `return`, the derived values such as `out` are the default outputs; a `return`
 can pick different defaults without hiding any port. You may refer to a value

@@ -11,6 +11,7 @@ using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Reactant
+using SHA
 using Test
 
 # Lower + bind + build + query a Weibull program; return
@@ -292,9 +293,21 @@ _wb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
 
 @testset "weibull SB parity" begin
     @testset "W1 weibull_sampled" begin
-        # Inline-transcription guard: the probe-published checksums.
-        @test sum(_WB_SB_X) == 6.829548057573992
-        @test sum(_WB_SB_Y) == 145.41154229417995
+        # Inline-transcription guard: the probe-published byte hash
+        # (exact — element bytes do not depend on reduction order) plus
+        # tight isapprox checks on the published coordinate sums. The
+        # sums must NOT be `==`: `sum(::Vector{Float64})` reassociates
+        # under SIMD/codegen, so these identical literals sum to
+        # ...995 on AVX2+FMA, ...992 under SSE2-only codegen, and
+        # ...987 on the CI runners (all Julia 1.10) — an exact golden
+        # encodes one CPU, not the data.
+        @test bytes2hex(sha256(vcat(reinterpret(UInt8, _WB_SB_X),
+            reinterpret(UInt8, _WB_SB_Y)))) ==
+            "79edf05a046aad1b5f892e5b6e122925927a067c045244ddf22bb328398318e5"
+        # Observed cross-CPU spread is <=8 ULP (~2e-15 relative);
+        # rtol=1e-12 carries ~500x headroom.
+        @test isapprox(sum(_WB_SB_X), 6.829548057573992; rtol = 1e-12)
+        @test isapprox(sum(_WB_SB_Y), 145.41154229417995; rtol = 1e-12)
         # SB: k ~ LogNormal(0, 0.3); mu ~ 1 + x;
         # effect(mu, Intercept) ~ Normal(0, 1);
         # effect(mu, x) ~ Normal(0, 1);

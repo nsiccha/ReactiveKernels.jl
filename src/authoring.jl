@@ -2043,6 +2043,20 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
                                 in_dotted::Bool = false)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
+    if ex.head === :macrocall && mod isa Module
+        # A macro reads the SYNTAX of its arguments: `@.` dots only the calls
+        # whose callee is a `Symbol`, `@view` accepts only index syntax.  The
+        # rewrites below replace callees and index syntax with compiler-owned
+        # references, so rewriting a macro's arguments before the macro runs
+        # hands it other syntax than the native body gives it.
+        # `@.(100 * (v - v[1]) / v[1])` kept every call undotted — a
+        # `MethodError` under a tracing backend, and silently the matrix
+        # product for `@.(a * b)` — and `@view v[1:2]` failed at kernel
+        # definition (snag `batched-broadcas-9269c801`).  Lower the macro's
+        # expansion instead: that is the code the native body runs.
+        return _kernel_tensorized_rhs(macroexpand(mod, ex), known, mod, scope;
+                                      in_dotted = in_dotted)
+    end
     undef_vector = _kernel_tensorized_undef_vector(ex)
     if undef_vector !== nothing
         # A tracing backend cannot place traced scalars into a host
