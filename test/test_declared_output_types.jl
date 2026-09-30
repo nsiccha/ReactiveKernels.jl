@@ -148,5 +148,10 @@ end
     positions = [0.5, 1.0, 2.0]
     xs = collect(1.0:5.0)
     @test batch(positions, xs, 5) == [sum(_DOT_CHILD(xs, s)) for s in positions]
-    @test _dot_decl(:weights, Vector{Float64}) in _dot_declarations(code_expr(batch))
+    # The per-position body is spliced with renamed locals (`##embedded_weights#N`).
+    @test any(_dot_declarations(code_expr(batch))) do declaration
+        name, T = declaration.args
+        T === Vector{Float64} &&
+            (name === :weights || occursin(r"^##embedded_weights#\d+$", String(name)))
+    end
 end

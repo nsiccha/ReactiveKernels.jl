@@ -1238,7 +1238,8 @@ end
 # product) has its native body traced by Reactant directly, where a host-typed
 # local would `convert` a traced array. So `_lower_with_ops` declares only in
 # the native body of a kernel that `prepare` builds as a native/tensorized pair
-# (`_needs_embedded_tensorization`), and `lower_batched` in its native loop.
+# (`_needs_embedded_tensorization`), `lower_batched` in its native loop, and
+# the position driver (`_lower_replicated_with_ops`) in both of its parts.
 # A bound constant (`_BoundConstant`) is exempt: inference already knows its
 # exact value type, and a declaration would only convert a deliberately bound
 # view or range into an owning copy. `Any` declares nothing.
@@ -1252,7 +1253,9 @@ function _declare_typed_output!(body::Expr, value::Value, name, declared::Set{Sy
 end
 
 function _lower_with_ops(p::Plan; tensorized::Bool = false,
-                         inline_embedded::Bool = true)
+                         inline_embedded::Bool = true,
+                         declare::Bool = !tensorized && inline_embedded &&
+                                         _needs_embedded_tensorization(p))
     g = p.graph
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
@@ -1266,7 +1269,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     skipped_recipes = Set{Int}()
     pending_scans = Dict{Int,Any}()
     declared = Set{Symbol}()
-    declare_types = !tensorized && inline_embedded && _needs_embedded_tensorization(p)
+    declare_types = declare
     # HAVE is authoritative, and the first selected producer of any other
     # logical value owns its binding. Later recipes may emit that value as a
     # collateral multi-output; execute the recipe but discard the duplicate so
@@ -1607,7 +1610,7 @@ end
 end
 
 """
-    lower_replicated(p::Plan; batched) -> Expr
+    lower_replicated(p::Plan; batched, reuse = false) -> Expr
 
 Lower a scalar plan over a shared trailing **position axis**. Recipes that
 transitively depend on a batched HAVE port execute once per position; recipes
@@ -1615,11 +1618,50 @@ independent of every batched port execute once above the loop. This is position
 batching, not broadcast data batching: each batched array port is projected to
 its scalar-kernel argument at one position.
 
-Every selected recipe is called through its ordinary scalar operation, including
-plates, scans and embedded kernels. Their internal runtime control flow stays
-inside that operation; shared-only composite recipes hoist just like any other.
+The plan is split at its batched HAVE ports exactly as `bound=` partial
+evaluation splits it at bound ports (`_replicated_parts`): a shared prefix and
+a per-position residual. Each part is lowered by the ordinary native scalar
+lowering (`_lower_with_ops`) and spliced into the position driver, so authored
+plates emit their fused loops, scans inline their step, and embedded kernels
+splice, exactly as [`prepare`](@ref) lowers the same recipes. Their internal
+runtime control flow stays inside that per-position body. The operation table
+the returned function expects is the second result of
+`_lower_replicated_with_ops`.
 """
-function lower_replicated(p::Plan; batched, reuse = false)
+lower_replicated(p::Plan; batched, reuse = false) =
+    first(_lower_replicated_with_ops(p; batched, reuse))
+
+# The shared prefix is every recipe computable from the non-batched HAVE ports
+# alone (the same first-producer-wins split `bound=` partial evaluation uses,
+# `_partial_split`); the residual is the rest. The residual's HAVE boundary is
+# the batched ports plus every prefix-owned value it or the WANT list reads,
+# so a shared-only WANT passes through the residual unchanged.
+function _replicated_parts(p::Plan, analysis)
+    g = p.graph
+    mapped_have = Value[v for v in p.have if canon_id(g, v.id) in analysis.mapped_ids]
+    shared_have = Value[v for v in p.have if !(canon_id(g, v.id) in analysis.mapped_ids)]
+    prefix, residual, prefix_owned = _partial_split(
+        p, Set(canon_id(g, v.id) for v in shared_have))
+    constants = _partial_constants(p, prefix_owned, residual)
+    have_ids = Set(canon_id(g, v.id) for v in p.have)
+    prefix_want = Value[v for v in constants if !(canon_id(g, v.id) in have_ids)]
+    (; prefix = _partial_subplan(p, shared_have, prefix_want, prefix),
+       residual = _partial_subplan(p, vcat(mapped_have, constants), p.want, residual))
+end
+
+# Lower one part as `prepare` lowers a scalar kernel. Every output is declared,
+# as the position driver always did: its body is host-only by construction
+# (a traced batch calls the scalar target through `_replica`).
+_replicated_part_ast(part::Plan) =
+    _lower_with_ops(_fuse_authored_plate_chains(part); declare = true)
+
+# A bound constant keeps its exact value type (a bound view stays a view).
+function _replicated_declares(p::Plan, value::Value)
+    producer = get(p.producer, canon_id(p.graph, value.id), nothing)
+    !(producer isa Recipe && producer.op isa _BoundConstant)
+end
+
+function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     _replicated_graph_plan(p) || throw(ArgumentError(
         "position batching requires pure recipes"))
     analysis = _replicated_dependency_analysis(p, batched)
@@ -1627,27 +1669,43 @@ function lower_replicated(p::Plan; batched, reuse = false)
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
     mapped(cid) = cid in analysis.mapped_ids
+    parts = _replicated_parts(p, analysis)
+    have_ids = Set(canon_id(g, v.id) for v in p.have)
+    declared = Set{Symbol}()
 
-    projected = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_position))
-                     for v in p.have if canon_id(g, v.id) in analysis.mapped_ids)
+    prefix_ast, prefix_ops = if isempty(parts.prefix.want)
+        nothing, ()
+    else
+        ast, ops, _ = _replicated_part_ast(parts.prefix)
+        ast, ops
+    end
+    residual_ast, residual_ops, _ = _replicated_part_ast(parts.residual)
+    residual_offset = length(prefix_ops)
 
-    function recipe_assignments!(destination, replica_index)
-        for (cid, variable) in projected
-            push!(destination.args,
-                :($variable = _replicated_project(
-                    $(g.values[cid].name), $replica_index)))
+    # One per-position block: project the batched ports, then the spliced
+    # residual body binds one fresh local per WANT. `_embedded_statements`
+    # renames every residual local, so the first-position block and the loop
+    # body are independent copies of the same scalar program.
+    function position_block!(destination, replica_index, want_vars)
+        callargs = Any[]
+        for v in parts.residual.have
+            if mapped(canon_id(g, v.id))
+                projected = gensym(Symbol(v.name, :_position))
+                push!(destination.args,
+                      :($projected = _replicated_project($(nm(v)), $replica_index)))
+                push!(callargs, projected)
+            else
+                push!(callargs, nm(v))
+            end
         end
-        for (recipe_index, recipe) in enumerate(p.recipes)
-            isempty(analysis.recipe_dependencies[recipe_index]) && continue
-            lhsnames = [nm(output) for output in recipe.outputs]
-            lhs = length(lhsnames) == 1 ? only(lhsnames) :
-                  Expr(:tuple, lhsnames...)
-            args = Any[haskey(projected, canon_id(g, input.id)) ?
-                       projected[canon_id(g, input.id)] : nm(input)
-                       for input in recipe.inputs]
-            call = Expr(:call, Expr(:ref, _OPS_ARG, recipe_index), args...)
-            push!(destination.args, Expr(:(=), lhs, call))
+        for (v, variable) in zip(p.want, want_vars)
+            canon_id(g, v.id) in have_ids && continue
+            _replicated_declares(p, v) &&
+                _declare_typed_output!(destination, v, variable, declared)
         end
+        lhs = length(want_vars) == 1 ? only(want_vars) : Expr(:tuple, want_vars...)
+        append!(destination.args,
+                _embedded_statements(residual_ast, callargs, lhs, residual_offset))
     end
 
     argexprs = Any[_OPS_ARG]
@@ -1656,15 +1714,6 @@ function lower_replicated(p::Plan; batched, reuse = false)
         push!(argexprs, nm(v))
     end
     body = Expr(:block)
-    # Declared recipe-output types hold at function scope, so the first-position
-    # block and the position loop both assign the same typed local.
-    let declared = Set{Symbol}(), have_ids = Set(canon_id(g, v.id) for v in p.have)
-        for recipe in p.recipes, output in recipe.outputs
-            canon_id(g, output.id) in have_ids && continue
-            recipe.op isa _BoundConstant && continue
-            _declare_typed_output!(body, output, nm(output), declared)
-        end
-    end
     runtime_args = Expr(:tuple, (nm(v) for v in p.have)...)
     push!(body.args, :(replica_count = _replicated_validate_axes(
         $runtime_args, Val($(analysis.positions)),
@@ -1699,44 +1748,45 @@ function lower_replicated(p::Plan; batched, reuse = false)
                              Expr(:tuple, passthrough_outputs...)
         push!(body.args, Expr(:if, compatible, Expr(:return, passthrough_result)))
     end
-    for (recipe_index, recipe) in enumerate(p.recipes)
-        isempty(analysis.recipe_dependencies[recipe_index]) || continue
-        lhsnames = [nm(output) for output in recipe.outputs]
-        lhs = length(lhsnames) == 1 ? only(lhsnames) :
-              Expr(:tuple, lhsnames...)
-        call = Expr(:call, Expr(:ref, _OPS_ARG, recipe_index),
-                    (nm(input) for input in recipe.inputs)...)
-        push!(body.args, Expr(:(=), lhs, call))
+    if prefix_ast !== nothing
+        prefix_names = Any[nm(v) for v in parts.prefix.want]
+        for v in parts.prefix.want
+            _replicated_declares(p, v) &&
+                _declare_typed_output!(body, v, nm(v), declared)
+        end
+        lhs = length(prefix_names) == 1 ? only(prefix_names) :
+              Expr(:tuple, prefix_names...)
+        append!(body.args, _embedded_statements(
+            prefix_ast, Any[nm(v) for v in parts.prefix.have], lhs, 0))
     end
 
     output_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_batched))
                        for v in p.want)
     first_index = gensym(:replica_index)
+    first_vars = Any[gensym(Symbol(v.name, :_first)) for v in p.want]
     push!(body.args, :($first_index = 1))
-    recipe_assignments!(body, first_index)
+    position_block!(body, first_index, first_vars)
     for (output_index, v) in enumerate(p.want)
         cid = canon_id(g, v.id)
-        value = haskey(projected, cid) ? projected[cid] : nm(v)
+        value = first_vars[output_index]
         allocation = reuse ?
             Expr(:call, GlobalRef(@__MODULE__, :_replicated_output!),
                  Expr(:ref, :__output_caches__, output_index), value, :replica_count) :
             Expr(:call, GlobalRef(@__MODULE__, :_replicated_output), value, :replica_count)
-        push!(body.args, Expr(:(=), output_vars[cid],
-            allocation))
+        push!(body.args, Expr(:(=), output_vars[cid], allocation))
         push!(body.args,
               Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
-                   output_vars[cid], first_index,
-                   haskey(projected, cid) ? projected[cid] : nm(v)))
+                   output_vars[cid], first_index, value))
     end
 
     rest_body = Expr(:block)
-    recipe_assignments!(rest_body, :replica_index)
-    for v in p.want
-        cid = canon_id(g, v.id)
+    rest_vars = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
+    position_block!(rest_body, :replica_index, rest_vars)
+    for (output_index, v) in enumerate(p.want)
         push!(rest_body.args,
               Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
-                   output_vars[cid], :replica_index,
-                   haskey(projected, cid) ? projected[cid] : nm(v)))
+                   output_vars[canon_id(g, v.id)], :replica_index,
+                   rest_vars[output_index]))
     end
     push!(body.args, Expr(:for,
         Expr(:(=), :replica_index,
@@ -1746,7 +1796,8 @@ function lower_replicated(p::Plan; batched, reuse = false)
     retval = length(p.want) == 1 ? only(values(output_vars)) :
              Expr(:tuple, (output_vars[canon_id(g, v.id)] for v in p.want)...)
     push!(body.args, Expr(:return, retval))
-    Expr(:function, Expr(:tuple, argexprs...), body)
+    Expr(:function, Expr(:tuple, argexprs...), body),
+    (prefix_ops..., residual_ops...)
 end
 
 """
@@ -2702,14 +2753,11 @@ function _replica_graph(target::PreparedKernel, batched)
     indices = _replica_batch_indices(inputs(target), batched)
     _replicated_graph_plan(target.plan) || throw(ArgumentError(
         "scalar kernel requires the complete-callable replica fallback"))
-    ast = lower_replicated(target.plan; batched)
+    ast, ops = _lower_replicated_with_ops(target.plan; batched)
     native = compile(ast)
     boundary = inputs(target)
     input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
     output_types = Tuple{(valtype(value) for value in outputs(target))...}
-    # The position driver calls whole recipe operations. Scalar codegen's op
-    # table can instead flatten embedded programs, so it is not this table.
-    ops = Tuple(recipe.op for recipe in target.plan.recipes)
     GraphReplicatedKernel{indices,input_types,output_types,
                           typeof(native),typeof(ops),typeof(target.plan),
                           typeof(target),typeof(boundary),
@@ -2782,23 +2830,25 @@ _replicated_aliases(cache::Union{Tuple,NamedTuple}, args) =
     any(item -> _replicated_aliases(item, args), cache)
 _replicated_aliases(cache, args) = false
 
-struct BorrowedBatchedKernel{K,F,C}
+struct BorrowedBatchedKernel{K,F,O,C}
     target::K
     native::F
+    ops::O
     caches::C
     ast::Expr
 end
 _borrowed_batch_caches(boundary) = map(_ -> Ref{Any}(nothing), boundary)
 function _borrowed_batch(target::GraphReplicatedKernel)
-    ast = lower_replicated(target.plan; batched=batched_ports(target), reuse=true)
-    BorrowedBatchedKernel(target, compile(ast),
+    ast, ops = _lower_replicated_with_ops(
+        target.plan; batched=batched_ports(target), reuse=true)
+    BorrowedBatchedKernel(target, compile(ast), ops,
                           _borrowed_batch_caches(target.outputs), ast)
 end
 
 # A new native execution instance shares the read-only computation, not the
 # buffers of an earlier call. No planning, lowering or compilation occurs.
 Base.copy(kernel::BorrowedBatchedKernel) =
-    BorrowedBatchedKernel(kernel.target, kernel.native,
+    BorrowedBatchedKernel(kernel.target, kernel.native, kernel.ops,
                          _borrowed_batch_caches(outputs(kernel)), kernel.ast)
 
 @inline function (kernel::BorrowedBatchedKernel)(args...)
@@ -2810,7 +2860,7 @@ Base.copy(kernel::BorrowedBatchedKernel) =
         # Detach in that case so no input is modified through an output alias.
         _replicated_aliases(slot[], args) && (slot[] = nothing)
     end
-    kernel.native(kernel.target.ops, kernel.caches, args...)
+    kernel.native(kernel.ops, kernel.caches, args...)
 end
 inputs(kernel::BorrowedBatchedKernel) = inputs(kernel.target)
 outputs(kernel::BorrowedBatchedKernel) = outputs(kernel.target)

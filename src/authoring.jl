@@ -3309,7 +3309,9 @@ position.
 
 The lifted kernel requires pure recipes and retains their internal loops and
 lazy branches. Native execution hoists shared-only recipes, including plates,
-scans and embedded kernels. The default allocates fresh stacked outputs;
+scans and embedded kernels, and lowers both the hoisted prefix and the
+per-position residual as `prepare` lowers a scalar kernel, so an inline plate
+runs as its fused loop at every position. The default allocates fresh stacked outputs;
 retaining a result across calls is safe. It is not the allocation-free reducing
 `plate` contract.
 

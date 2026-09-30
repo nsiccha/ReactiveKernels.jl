@@ -148,9 +148,21 @@ Native graph lowering validates ranks and equal batch lengths, evaluates
 recipes that depend only on shared ports once, then evaluates position-dependent
 recipes once per position. It stacks requested outputs and copies array-valued
 slices, so it is not the allocation-free reducing contract of a likelihood
-`plate`. Pure authored plates, scans and embedded kernels are called as whole
-scalar operations, so their shared-only recipes also execute above the position
-loop. Their internal loops and lazy branches retain the scalar semantics.
+`plate`. The shared prefix and the per-position residual are each lowered as
+`prepare` lowers a scalar kernel: an authored plate emits its fused
+native loop, a scan inlines its step (and streams into a plate that consumes
+it), and an embedded kernel is spliced. A plate authored inline in the batched
+graph therefore costs per position what it costs in the scalar kernel, whether
+it depends on a position or only on shared ports. Internal loops and lazy
+branches retain the scalar semantics.
+
+Up to canonical `d4f65756` the position driver instead called every plate
+through the plate operation's per-cell fallback. On the ShinyRK superposition
+plate (6529 observations, 14 doses, 32 positions per read) that allocated
+3.0 MB per position and read, against 0.33 MB with the same plate in a
+separately prepared child kernel, and took 6 to 9 times as long. On such a
+pin, keep a position-dependent plate in its own prepared child kernel called
+from the batched graph.
 
 For compatible native numeric leaves, borrowed lowering recovers concrete final
 destination types before the position loop. A recipe-free HAVE/WANT cut can
