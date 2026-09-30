@@ -532,6 +532,52 @@ end
 # and an out-of-range index is never read (`docs/src/constraints.md`).
 @inline _tensorized_get(args...) = get(args...)
 
+# A value a retained generator loop reads but never carries.
+# `ReactantCore.@trace for` hands every variable its body references to the
+# tracer as a loop argument, and the tracer rebuilds a struct with traced
+# fields — impossible for a host struct whose fields are concretely typed (a
+# schedule plan holding a `Vector{Int}`), so a loop reading such a value failed
+# with `NoFieldMatchError`.  An untraced capture crosses the loop boundary in
+# this wrapper, which a tracing extension passes through unchanged.  A traced
+# capture stays a loop argument, entered as a fresh tracer object
+# (`_loop_capture_traced`): `@trace` writes each loop result back into every
+# traced object the body reads, so the caller's own tracer would be rebound
+# and returned as an aliased program output, which XLA export rejects for a
+# zero-sized one.  Without a tracing backend the wrapper is opened again at
+# every use and nothing else changes.
+struct _LoopHostValue{T}
+    value::T
+end
+ReactantCore.is_traced(::_LoopHostValue) = false
+ReactantCore.is_traced(::_LoopHostValue, ::Base.IdSet) = false
+@inline _loop_capture(x) =
+    ReactantCore.is_traced(x) ? _loop_capture_traced(x) : _LoopHostValue(x)
+_loop_capture_traced(x) = x
+@inline _loop_open(x) = x
+@inline _loop_open(x::_LoopHostValue) = x.value
+
+# A carried local of a retained loop, re-bound just before the loop.  When
+# anything the loop reads is traced (the `witnesses`: its captures and its
+# carry), a tracing extension replaces the value by a fresh traced copy
+# (`_loop_seed_traced`), because `ReactantCore.@trace` carries a value only by
+# updating a traced object that exists before the loop: a host seed such as
+# `acc = 0.0` has none, and the loop's result was silently dropped (the loop
+# returned `0.0`).  With nothing traced the value is returned unchanged.
+@inline _loop_seed(x, witnesses...) =
+    _loop_any_traced(witnesses) ? _loop_seed_traced(x) : x
+@inline _loop_any_traced(::Tuple{}) = false
+@inline _loop_any_traced(witnesses::Tuple) =
+    ReactantCore.is_traced(first(witnesses)) || _loop_any_traced(Base.tail(witnesses))
+_loop_seed_traced(x) = x
+
+# Whether a retained `for` loop's range is an untraced host range with no
+# elements, so the loop is skipped instead of traced (`_kernel_tensorized_loop`).
+# A range with a traced bound is never skipped.  The colon form takes the
+# bounds `@trace for` reads from `a:b` / `a:s:b` syntax.
+@inline _loop_host_empty(range) = !ReactantCore.is_traced(range) && isempty(range)
+@inline _loop_host_empty_colon(bounds...) =
+    !_loop_any_traced(bounds) && isempty((:)(bounds...))
+
 """
     Graph()
 

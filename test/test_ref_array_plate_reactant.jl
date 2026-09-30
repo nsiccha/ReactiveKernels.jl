@@ -530,6 +530,38 @@ end
         @test count("\n", hlo2) == count("\n", hlo)
     end
 
+    # A sum over `eachindex` of the doses is one retained loop: the program is
+    # the same for three doses and for six (`docs/src/constraints.md`). A sum
+    # over a helper-produced iterator (the one-graph cell's `_doses(p)`) keeps
+    # its per-element trace, so helper indexing stays valid there.
+    @testset "the dose axis is one retained loop" begin
+        for k in (F.get_cell, F.filter_cell)
+            kernel = prepare(k)
+            programs = map((3, 6)) do ndoses
+                s = [div((i - 1) * nobs, ndoses) + 1 for i in 1:ndoses]
+                w = collect(range(1.0, 2.0; length = ndoses))
+                plan = F.Lattice(s, nobs)
+                rw = Reactant.to_rarray(w)
+                compiled = Reactant.@compile sync = true kernel(plan, runits, rw)
+                @test Array(compiled(plan, runits, rw)) ≈ kernel(plan, units, w)
+                repr(Reactant.@code_hlo optimize = :none kernel(plan, runits, rw))
+            end
+            @test occursin("stablehlo.while", programs[1])
+            @test count("\n", programs[1]) == count("\n", programs[2])
+        end
+        kernel = prepare(F.exact_row_cell)
+        programs = map((3, 6)) do ndoses
+            s = [div((i - 1) * nobs, ndoses) + 1 for i in 1:ndoses]
+            w = collect(range(1.0, 2.0; length = ndoses))
+            plan = F.Exact([max(t - si, 0) for t in 1:nobs, si in s])
+            rw = Reactant.to_rarray(w)
+            compiled = Reactant.@compile sync = true kernel(plan, runits, rw)
+            @test Array(compiled(plan, runits, rw)) ≈ kernel(plan, units, w)
+            repr(Reactant.@code_hlo optimize = :none kernel(plan, runits, rw))
+        end
+        @test count("\n", programs[1]) == count("\n", programs[2])
+    end
+
     @testset "get in a plain kernel: traced index, host table, concrete index" begin
         kernel = prepare(F.table_read)
         table = [1.0, 2.0, 4.0]
