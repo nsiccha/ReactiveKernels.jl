@@ -4,6 +4,11 @@
 # With that fixed (EnzymeAD/Enzyme-JAX#3240) it compiles, but the gradient is
 # wrong on subject 1's rate parameters until the nested-if adjoint fix
 # (repro_nested_if_reverse.jl) is in as well.
+# 2026-09-30: both upstream fixes verified in released Reactant 0.2.289+
+# (standalone while/nested-if reproducers pass exactly; RK issue #13 closed),
+# but this PK repro now fails at trace time in StaticArrays._exp via
+# PPL._pk_expm_table (TypeError: non-boolean TracedRNumber{Bool}; since
+# f396c41e) — a separate lane from the upstream defects.
 # Run in an environment with this checkout, ReactiveKernelsPPL, Reactant, Enzyme.
 using ReactiveKernels, ReactiveKernelsPPL, Reactant, Enzyme
 const PPL = ReactiveKernelsPPL

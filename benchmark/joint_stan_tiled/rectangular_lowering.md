@@ -125,6 +125,13 @@ yet, so the PK adapter stays opt-in (`_rectangular_pk_enabled`). Both fixes
 together pass on a real CI-built binary (see "Reverse acceptance on the #3241
 CI build").
 
+**2026-09-30 update:** both defects are fixed in released Reactant 0.2.289+
+(the standalone `repro_reactant_while_reverse.jl` and
+`repro_nested_if_reverse.jl` pass exactly there; RK issue #13 closed). The PK
+adapter stays opt-in regardless: its rectangular reverse now fails earlier, at
+trace time in the StaticArrays matrix exponential (`_pk_expm_table`, since
+`f396c41e`), which is a separate lane from the upstream defects.
+
 1. **Reverse fails to compile** (`had set op which was not a direct
    descendant`): [ReactiveKernels #13](https://github.com/nsiccha/ReactiveKernels.jl/issues/13),
    reproducer `repro_reactant_while_reverse.jl`. Fixed by EnzymeAD/Enzyme-JAX

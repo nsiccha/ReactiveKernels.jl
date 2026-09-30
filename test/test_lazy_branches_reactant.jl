@@ -116,20 +116,26 @@ end
     @test !occursin("stablehlo.select", hlo)
 end
 
-@testset "reverse through a batched lazy branch: the upstream lane boundary" begin
-    # Reactant's batching pass unrolls a small plate per lane and realizes a
-    # larger one as a loop; Enzyme reverse through a lazy `if` inside that loop
-    # does not lower yet (`benchmark/repro_reactant_batch_if_reverse.jl`).
-    # The primal is lane-count independent either way. This locks the boundary
-    # so an upstream fix (or a shift of the threshold) is noticed here.
+@testset "reverse through a batched lazy branch matches at every lane count" begin
+    # Enzyme reverse through a lazy `if` inside a batched plate cell lowers
+    # since Reactant 0.2.289 (the upstream Enzyme-JAX remover gap, RK issue
+    # #13, is fixed there). The primal is lane-count independent either way.
+    # `benchmark/repro_reactant_batch_if_reverse.jl` (Reactant + Enzyme only)
+    # guards the lift as a regression test.
     k = prepare(lazy_plate_guard; want = :total)
     gradient(v) = Enzyme.gradient(Enzyme.Reverse, k, v)
     small = [2.0, -1.0, 0.5, -3.0]
     large = [2.0, -1.0, 0.5, -3.0, 1.5, -0.5]
+    xlarge = [isodd(i) ? 0.5i : -0.25i for i in 1:32]
     compiled_small = Reactant.@compile gradient(_traced(small))
     @test _host(only(compiled_small(_traced(small)))) ≈ [0.5, 0.0, 2.0, 0.0]
     @test _host((Reactant.@compile k(_traced(large)))(_traced(large))) ≈ k(large)
-    @test_throws Reactant.Compiler.CompilationError Reactant.@compile gradient(_traced(large))
+    compiled_large = Reactant.@compile gradient(_traced(large))
+    @test _host(only(compiled_large(_traced(large)))) ≈
+        [0.5, 0.0, 2.0, 0.0, 1 / 1.5, 0.0]
+    compiled_xlarge = Reactant.@compile gradient(_traced(xlarge))
+    @test _host(only(compiled_xlarge(_traced(xlarge)))) ≈
+        [xi > 0 ? 1 / xi : 0.0 for xi in xlarge]
 end
 
 @testset "a data-bound plate branch is split: reverse at every lane count" begin
