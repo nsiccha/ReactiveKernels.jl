@@ -696,25 +696,35 @@ _partial_hoisted(p::Plan, b::_PartialBoundary, values::Tuple) =
 
 # The zero-input constant recipes carrying one binding's hoisted values into
 # the residual plan, under negative ids that cannot collide with graph recipes.
-_partial_constant_recipes(constants::Vector{Value}, hoisted) =
-    [Recipe(-index, (), (value,), _BoundConstant(hoisted[index]), 0.0, nothing, false)
-     for (index, value) in enumerate(constants)]
+function _partial_constant_recipes(constants::Vector{Value}, @nospecialize(hoisted))
+    # A loop, not a comprehension: its closure would be typed by `hoisted` and
+    # compiled again for every binding's value types.
+    recipes = Vector{Recipe}(undef, length(constants))
+    for (index, value) in enumerate(constants)
+        recipes[index] = Recipe(-index, (), (value,), _BoundConstant(hoisted[index]),
+                                0.0, nothing, false)
+    end
+    recipes
+end
 
-# The residual plan for one binding — constant slots first, then the residual
-# recipes — and its inner-plate specialization over the hoisted values. The
+# The residual plan for one binding: constant slots first, then the residual
+# recipes.
+function _partial_residual_plan(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
+    recipes = isempty(b.constants) ? b.residual :
+        vcat(_partial_constant_recipes(b.constants, hoisted), b.residual)
+    _partial_subplan(p, b.remaining, p.want, recipes)
+end
+
+# That plan and its inner-plate specialization over the hoisted values. The
 # second is the plan `prepare` compiles; it is the first object exactly when
 # the inner-plate pass had nothing to do.
 function _partial_residual(p::Plan, b::_PartialBoundary, hoisted)
     g = p.graph
     known = Dict{Int,Any}()
-    recipes = b.residual
-    if !isempty(b.constants)
-        for (value, data) in zip(b.constants, hoisted)
-            known[canon_id(g, value.id)] = data
-        end
-        recipes = vcat(_partial_constant_recipes(b.constants, hoisted), b.residual)
+    for (value, data) in zip(b.constants, hoisted)
+        known[canon_id(g, value.id)] = data
     end
-    residual = _partial_subplan(p, b.remaining, p.want, recipes)
+    residual = _partial_residual_plan(p, b, hoisted)
     residual, _partial_inner_plates(residual, known)
 end
 
@@ -744,21 +754,36 @@ end
 # residual the pass would rewrite keeps the ordinary per-binding
 # specialization on the cached plan and prefix. A residual without authored
 # plates shares one template across every binding.
+#
+# Nothing here is on a kernel's call path, and the kernel types involved are
+# as varied as the graphs prepared, so an entry and a template are untyped
+# containers and every function over them takes its arguments unspecialized:
+# each is compiled once, for every graph and every bound type, instead of once
+# per prefix and residual kernel type at the first rebinding in a process
+# (snag plain-prepare-wi-4cd01ccf: 290 ms for the ShinyRK simulation graph).
+# A template also keeps no binding's values: only the compiled callable and
+# the value-independent tails of the operation table and readable recipes.
 
-struct _BoundTemplate{K}
-    residual::Plan   # recipes 1:n are the constant slots of the binding it came from
-    kernel::K        # the residual `PreparedKernel`; `f`, `ast` and the tail of `ops` are reused
+struct _BoundTemplate
+    f::Any           # the compiled residual callable, shared by every binding
+    ops::Tuple       # the operation table after the constant slots
+    inputs::Tuple
+    outputs::Tuple
+    ast::Expr
+    lowered::Tuple   # the readable recipes after the constant slots
 end
 
-struct _BoundEntry{PK}
+struct _BoundEntry
     plan::Plan
     boundary::_PartialBoundary
-    prefix::PK                 # prepared prefix kernel, or `nothing` without constants
+    prefix::Any                # prepared prefix kernel, or `nothing` without constants
     shaped::Bool               # residual authored plates: templates are per value shape
-    templates::Dict{Any,Any}   # shape key => `_BoundTemplate`, or `nothing` (per-binding path)
+    # shape key => `_BoundTemplate`; the kernel itself when it has no constant
+    # slots; or `nothing` (a value-dependent residual: the per-binding path)
+    templates::Dict{Any,Any}
 end
 
-function _bound_entry(p::Plan, ports)
+function _bound_entry(p::Plan, @nospecialize(ports))
     boundary = _partial_boundary(p, collect(Value, _astuple(ports)))
     prefix = isempty(boundary.constants) ? nothing :
              prepare(_partial_prefix_plan(p, boundary))
@@ -766,7 +791,7 @@ function _bound_entry(p::Plan, ports)
     _BoundEntry(p, boundary, prefix, shaped, Dict{Any,Any}())
 end
 
-_bound_hoisted(entry::_BoundEntry, data::Tuple) =
+_bound_hoisted(entry::_BoundEntry, @nospecialize(data::Tuple)) =
     entry.prefix === nothing ? () :
     _partial_prefix_values(entry.boundary.constants, entry.prefix(data...))
 
@@ -777,13 +802,13 @@ _bound_shape(x::Tuple) = map(_bound_shape, x)
 _bound_shape(x::NamedTuple) = map(_bound_shape, x)
 _bound_shape(x::Ref) = (typeof(x), _bound_shape(x[]))
 
-_bound_shape_key(entry::_BoundEntry, data, hoisted) =
+_bound_shape_key(entry::_BoundEntry, @nospecialize(data), @nospecialize(hoisted)) =
     entry.shaped ? (_bound_shape(data), _bound_shape(hoisted)) : nothing
 
 # The first binding of a shape: the ordinary preparation, capturing the
 # template when the residual proved value-independent. Returns the template
 # (or `nothing`) and this binding's kernel.
-function _bound_build(entry::_BoundEntry, hoisted, passes)
+function _bound_build(entry::_BoundEntry, @nospecialize(hoisted), @nospecialize(passes))
     residual, specialized = _partial_residual(entry.plan, entry.boundary, hoisted)
     kernel = prepare(specialized; passes = passes)
     n = length(entry.boundary.constants)
@@ -791,26 +816,30 @@ function _bound_build(entry::_BoundEntry, hoisted, passes)
     # exactly this binding's constants in slot order.
     templated = specialized === residual &&
         all(i -> kernel.ops[i] isa _BoundConstant && kernel.ops[i].value === hoisted[i], 1:n)
-    (templated ? _BoundTemplate(residual, kernel) : nothing), kernel
+    templated || return nothing, kernel
+    n == 0 && return kernel, kernel
+    _BoundTemplate(kernel.f, kernel.ops[(n + 1):end], kernel.inputs, kernel.outputs,
+                   kernel.ast, kernel.lowered_recipes[(n + 1):end]), kernel
 end
 
-# The per-binding path for a value-dependent residual: inner-plate
-# specialization and compilation on the cached plan and prefix.
-_bound_specialize(entry::_BoundEntry, hoisted, passes) =
+# A later binding of a value-dependent residual: inner-plate specialization
+# and compilation on the cached plan and prefix.
+_bound_rebind(entry::_BoundEntry, ::Nothing, @nospecialize(hoisted), @nospecialize(passes)) =
     prepare(last(_partial_residual(entry.plan, entry.boundary, hoisted)); passes = passes)
 
-# A later binding: the same compiled callable over a fresh constant table.
-function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate, hoisted)
-    k = template.kernel
-    constants = entry.boundary.constants
-    n = length(constants)
-    n == 0 && return k
-    recipes = _partial_constant_recipes(constants, hoisted)
-    ops = (Tuple(r.op for r in recipes)..., k.ops[(n + 1):end]...)
-    lowered = (recipes..., k.lowered_recipes[(n + 1):end]...)
-    residual = _partial_subplan(template.residual, template.residual.have,
-        template.residual.want, vcat(recipes, template.residual.recipes[(n + 1):end]))
-    PreparedKernel(k.f, ops, k.inputs, k.outputs, residual, k.ast, lowered)
+# A residual that reads no hoisted value is one kernel for every binding.
+_bound_rebind(::_BoundEntry, kernel::PreparedKernel, @nospecialize(hoisted),
+              @nospecialize(passes)) = kernel
+
+# A later binding of a value-independent residual: the same compiled callable
+# over a fresh constant table.
+function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
+                       @nospecialize(hoisted), @nospecialize(passes))
+    residual = _partial_residual_plan(entry.plan, entry.boundary, hoisted)
+    recipes = residual.recipes[1:length(entry.boundary.constants)]
+    ops = (Any[recipe.op for recipe in recipes]..., template.ops...)
+    PreparedKernel(template.f, ops, template.inputs, template.outputs, residual,
+                   template.ast, (recipes..., template.lowered...))
 end
 
 # Normalize the public `bound` kwarg — one `Value => data` pair or an

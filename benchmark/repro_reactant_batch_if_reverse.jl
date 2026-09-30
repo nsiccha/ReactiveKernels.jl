@@ -1,15 +1,15 @@
-# Standalone CPU reproducer: only Reactant and Enzyme are required.
+# Standalone CPU regression lock: only Reactant and Enzyme are required.
 #
-# Enzyme reverse through a lazy `@trace if` inside an `Ops.batch` cell works
-# for a small batch (4 lanes, which the batching pass unrolls per lane) and
-# fails for a larger one (6 lanes, which it realizes as a loop) with
-#   error: had set op which was not a direct descendant
-# in the MLIR pass pipeline. The primal compiles at every size. This is the
+# Enzyme reverse through a lazy `@trace if` inside an `Ops.batch` cell failed
+# for a larger batch (6 lanes, which the batching pass realized as a loop)
+# with `error: had set op which was not a direct descendant` in the MLIR pass
+# pipeline (recorded on strato2, Reactant 0.2.284 / Enzyme 0.13, 2026-09-22;
+# RK issue #13). Since Reactant 0.2.289 the upstream defect is fixed and this
+# file passes exactly at every size; it now guards the lift. This is the
 # shape of every per-observation lazy branch of a plated likelihood
 # (`plate(...) do` cells with `?:` guards) under Reactant; RK keeps the
-# authored branch lazy per docs/src/constraints.md, so reverse through such
-# plates is unavailable until this lowers upstream. Recorded on strato2,
-# Reactant 0.2.284 / Enzyme 0.13, 2026-09-22.
+# authored branch lazy per docs/src/constraints.md. Verified on strato2,
+# Reactant 0.2.289 and 0.2.290 / Enzyme 0.13.207, 2026-09-30.
 using Reactant, Enzyme
 
 function cell(x0)
