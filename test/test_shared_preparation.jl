@@ -368,6 +368,66 @@ end
     @test hoisted.value === nothing
 end
 
+# The testset above warms the rebinding path on another graph first. The first
+# rebinding in a FRESH process must compile nothing too: the path is in the
+# package image, not compiled by whichever rebinding comes first (snag
+# first-rebinding-64d82bfc: 41 ms and 0.55 MB once per process on the ShinyRK
+# simulation graph, for a residual with or without an authored plate).
+@testset "the first rebinding in a fresh process compiles nothing" begin
+    fixture = raw"""
+        using ReactiveKernels
+        square(data) = data .^ 2
+        @kernel plain(data, q) = begin
+            b = square(data)
+            total = sum(b .* q)
+            return total
+        end
+        # An inline plate over a bound domain whose cells read a live value:
+        # the inner-plate pass runs on every binding and leaves it alone.
+        @kernel plated(data, q) = begin
+            b = square(data)
+            observations::UnitRange{Int} = 1:length(b)
+            values::Vector{Float64} = plate(observations, Ref(b), Ref(q)) do t, shared, w
+                shared[t] * w[t]
+            end
+            total = sum(values)
+            return total
+        end
+        spec = ARGS[1] == "plated" ? plated : plain
+        function first_rebinding(spec)
+            q = [1.0, 2.0, 3.0]
+            k1 = prepare(spec; bound = (; data = [1.0, 2.0, 3.0]))
+            # Read both counters before any arithmetic on them.
+            Base.cumulative_compile_timing(true)
+            before = Base.cumulative_compile_time_ns()
+            k2 = prepare(spec; bound = (; data = [3.0, 2.0, 1.0]))
+            after = Base.cumulative_compile_time_ns()
+            Base.cumulative_compile_timing(false)
+            (first(after) - first(before), k2.f === k1.f, k1(q), k2(q))
+        end
+        compile_ns, shared, value1, value2 = first_rebinding(spec)
+        entry = only(values(ReactiveKernels._graph_preparations(spec.graph).bound))
+        print(join((compile_ns, shared, value1, value2, entry.plates), ","))
+        """
+    # Package-image native code is not used under coverage or without images.
+    options = Base.JLOptions()
+    if options.code_coverage != 0 || options.use_pkgimages == 0
+        @test_skip "package-image native code is not in use"
+    else
+        project = Base.active_project()
+        for (name, plates) in (("plain", false), ("plated", true))
+            out = read(`$(Base.julia_cmd()) --startup-file=no --project=$project -e $fixture $name`,
+                       String)
+            compile_ns, shared, value1, value2, has_plates = split(out, ",")
+            @test parse(Int, compile_ns) == 0
+            @test shared == "true"
+            @test parse(Float64, value1) == 1.0 + 8.0 + 27.0
+            @test parse(Float64, value2) == 9.0 + 8.0 + 3.0
+            @test has_plates == string(plates)
+        end
+    end
+end
+
 module PlainBoundFixture
 using ReactiveKernels
 const calls = Ref(0)
