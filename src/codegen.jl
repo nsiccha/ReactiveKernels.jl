@@ -1048,7 +1048,7 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
 end
 
 function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
-                                           op::_AuthoredPlateOp, callargs,
+                                           op::_AuthoredPlateOp, callargs, callvalues,
                                            pointwise_lhs, total_lhs)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
@@ -1058,11 +1058,38 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
         "an authored plate body must lower to one operation per transparent scalar recipe"))
 
     atomic = typeof(op).parameters[2]
+    # A cell recipe whose transitive roots are all atomic (`Ref`) arguments or
+    # statically scalar ports is loop-invariant: the native lowering evaluates
+    # it ONCE above the cell loop (an empty-`dynamic` group in
+    # `_lower_authored_plate_native!`). The tensorized body must give its value
+    # the same standing. A cell-local ARRAY built from atomic operands only
+    # (`shifts = schedule_plan.shifts` read from a `Ref`-wrapped host plan) is
+    # one shared value, not a lane axis, so it is evaluated once with the
+    # unwrapped atomic operands and re-enters every downstream tensorized plate
+    # call wrapped in `Ref`, exactly like an atomic argument. Before this, the
+    # bare invariant array met the lane axis in `combine_axes` and the whole
+    # plate failed with `DimensionMismatch` under Reactant while the native
+    # kernel was correct (snag `plate-cell-gathe-94d4a929`). The distinguished
+    # result is never treated as invariant, so a degenerate constant cell keeps
+    # its former lowering.
+    root_positions = Dict(
+        canon_id(inner.graph, input.id) => position
+        for (position, input) in enumerate(inner.have))
+    dependencies = _plate_dependencies(inner, Set(keys(root_positions)))
+    # Statically scalar means the OUTER argument's value type (`callvalues`),
+    # exactly as the native lowering decides — never the cell formal's inferred
+    # element type, which is scalar for the batched axis itself.
+    invariant_root(root) = root_positions[root] in atomic ||
+        valtype(callvalues[root_positions[root]]) <: Number
+    result_cid = canon_id(inner.graph, only(inner.want).id)
     locals = Dict{Int,Any}()
+    shared = Dict{Int,Any}()
     for (index, input) in enumerate(inner.have)
         arg = callargs[index]
-        locals[canon_id(inner.graph, input.id)] = index in atomic ?
+        cid = canon_id(inner.graph, input.id)
+        locals[cid] = index in atomic ?
             Expr(:call, GlobalRef(Base, :Ref), arg) : arg
+        shared[cid] = arg
     end
     op_offset = length(runtime_ops)
     append!(runtime_ops, inner_kernel.ops)
@@ -1071,15 +1098,25 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
         length(recipe.outputs) == 1 || throw(ArgumentError(
             "an authored plate currently requires single-output scalar recipes"))
         output = only(recipe.outputs)
+        output_cid = canon_id(inner.graph, output.id)
         out = gensym(Symbol(:plate_, output.name))
-        args = Any[locals[canon_id(inner.graph, input.id)] for input in recipe.inputs]
         operation = Expr(:ref, _OPS_ARG, op_offset + recipe_index)
+        if output_cid != result_cid &&
+           all(invariant_root, dependencies.recipes[recipe_index])
+            args = Any[shared[canon_id(inner.graph, input.id)]
+                       for input in recipe.inputs]
+            push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
+            locals[output_cid] = Expr(:call, GlobalRef(Base, :Ref), out)
+            shared[output_cid] = out
+            continue
+        end
+        args = Any[locals[canon_id(inner.graph, input.id)] for input in recipe.inputs]
         call = Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_call),
                     operation, args...)
         push!(body.args, Expr(:(=), out, call))
-        locals[canon_id(inner.graph, output.id)] = out
+        locals[output_cid] = out
     end
-    scalar_result = locals[canon_id(inner.graph, only(inner.want).id)]
+    scalar_result = locals[result_cid]
     materialized = Expr(:call,
         GlobalRef(@__MODULE__, :_tensorized_plate_materialize), scalar_result)
     pointwise_lhs === nothing ||
@@ -1186,7 +1223,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                     body, scan_recipe.op, scan_args, nothing, scan_offset; consumer)
             elseif tensorized
                 _lower_authored_plate_tensorized!(
-                    body, runtime_ops, runtime_recipes, r.op, callargs,
+                    body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
                     pointwise_lhs, total_lhs)
             else
                 _lower_authored_plate_native!(
@@ -1821,18 +1858,37 @@ function _lower_batched_tensorized(p::Plan; batched, reduce = :+)
         push!(assigned, cid)
         op = Expr(:ref, _OPS_ARG, k)
         args = Any[nm(inp) for inp in r.inputs]
-        call = recipe_is_batched[k] ?
-               Expr(:call, GlobalRef(Base, :broadcast), op, args...) :
-               Expr(:call, op, args...)
+        if recipe_is_batched[k]
+            # A batched recipe maps over the lane axis; every operand that is
+            # NOT batched — a shared scalar, or a shared ARRAY port such as the
+            # whole unit-response vector a per-dose cell gathers from — is one
+            # atomic value per lane. It enters the call wrapped in `Ref`, and
+            # the call routes through `_tensorized_plate_call`, whose backend
+            # extension batches a shared array payload (`Ops.batch`) instead
+            # of expanding it as a broadcast axis. Before this, a shared array
+            # HAVE was broadcast as an axis (`DimensionMismatch`, snag
+            # `plate-cell-gathe-94d4a929`) while `lower_batched` hoisted it
+            # correctly natively.
+            shared = Any[
+                canon_id(g, inp.id) in batched_vals ? nm(inp) :
+                    Expr(:call, GlobalRef(Base, :Ref), nm(inp))
+                for inp in r.inputs]
+            call = Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_call),
+                        op, shared...)
+        else
+            call = Expr(:call, op, args...)
+        end
         push!(body.args, Expr(:(=), nm(out), call))
     end
 
+    materialized = Expr(:call,
+        GlobalRef(@__MODULE__, :_tensorized_plate_materialize), nm(want))
     retval = if reduce === nothing
-        nm(want)
+        materialized
     elseif reduce === :+
-        Expr(:call, GlobalRef(Base, :sum), nm(want))
+        Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_sum), nm(want))
     else
-        Expr(:call, GlobalRef(Base, :reduce), reduce, nm(want))
+        Expr(:call, GlobalRef(Base, :reduce), reduce, materialized)
     end
     push!(body.args, Expr(:return, retval))
     Expr(:function, Expr(:tuple, argexprs...), body)
