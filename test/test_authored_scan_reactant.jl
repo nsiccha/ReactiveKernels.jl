@@ -144,6 +144,28 @@ end
     @test Array(compiled(traced_pd, empty...)) == Float64[]
 end
 
+@kernel authored_scan_reactant_shared(xs::Vector{Float64}, amounts::Vector{Float64}) = begin
+    path::Vector{Float64} = scan(xs, Ref(amounts); init = 0.0) do carry, x, a
+        next = carry + x + sum(a; init = 0.0)
+        (next, next)
+    end
+    return path
+end
+
+@testset "a zero-sized traced shared operand compiles in the scan loop" begin
+    # The loop reads it through a fresh tracer; rebinding the caller's argument
+    # to a loop result made XLA export fail on `tensor.empty` (§7l).
+    k = prepare(authored_scan_reactant_shared)
+    xs = [1.0, 2.0, 3.0]
+    for amounts in (Float64[], [0.5, 0.25])
+        traced = (Reactant.to_rarray(xs), Reactant.to_rarray(amounts))
+        compiled = Reactant.@compile k(traced...)
+        @test Array(compiled(traced...)) ≈ k(xs, amounts)
+        hlo = repr(Reactant.@code_hlo optimize = false k(traced...))
+        @test count("stablehlo.while", hlo) == 1
+    end
+end
+
 @testset "authored eachrow scan keeps one while loop" begin
     spec = AuthoredScanFixtures.authored_scan_eachrow
     M = hcat(collect(1.0:12.0), fill(0.5, 12), fill(0.25, 12))

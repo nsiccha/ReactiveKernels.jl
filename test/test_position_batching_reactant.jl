@@ -154,4 +154,47 @@ end
     @test batch(zeros(2, 0), 0.5) == Float64[]
 end
 
+_batched_dose_slots(plan) = 1:plan.ndoses
+@kernel batched_dose_schedule(position::Vector{Float64}, plan,
+                              amounts::Vector{Float64}) = begin
+    scale = position[1]
+    weights::Vector{Float64} = scan(amounts, Ref(scale); init = 0.0) do carry, amount, s
+        weight = s * amount
+        (carry + weight, weight)
+    end
+    observations::UnitRange{Int} = 1:plan.nobs
+    trajectory::Vector{Float64} = plate(observations, Ref(plan), Ref(weights), scale) do t, p, w, s
+        s * t + sum(w[j] * (t > p.shifts[j] ? 1.0 : 0.0)
+                    for j in _batched_dose_slots(p); init = 0.0)
+    end
+    total::Float64 = sum(amounts; init = 0.0) + scale
+    return trajectory, total
+end
+
+@testset "a zero-dose shared amount vector compiles in the retained position loop" begin
+    # The loop reads the shared amounts through a fresh tracer. Rebinding the
+    # caller's zero-sized argument to a loop result made it an aliased program
+    # output that the optimizer rewrote to an unexportable `tensor.empty`.
+    for (plan, amounts) in (((; nobs=5, ndoses=0, shifts=Int[]), Float64[]),
+                            ((; nobs=5, ndoses=2, shifts=[0, 2]), [10.0, 20.0]))
+        batch = prepare_batched(batched_dose_schedule;
+            have=(:position, :plan, :amounts), batched=:position,
+            want=(:trajectory, :total))
+        read_batch(position, amount) = batch(position, plan, amount)
+        for npos in (1, 3)
+            positions = reshape(collect(2.0:(npos + 1)), 1, npos)
+            traced = (Reactant.to_rarray(positions), Reactant.to_rarray(amounts))
+            compiled = Reactant.@compile read_batch(traced...)
+            trajectory, total = compiled(traced...)
+            expected = read_batch(positions, amounts)
+            @test Array(trajectory) ≈ expected[1]
+            @test Array(total) ≈ expected[2]
+            changed = positions .+ 1
+            trajectory, total = compiled(Reactant.to_rarray(changed), traced[2])
+            @test Array(trajectory) ≈ read_batch(changed, amounts)[1]
+            @test Array(traced[2]) == amounts
+        end
+    end
+end
+
 include("test_position_batching_allocation_slices_reactant.jl")
