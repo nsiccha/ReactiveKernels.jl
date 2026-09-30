@@ -1969,7 +1969,9 @@ function _lower_hsgp_basis(st::Expr, line::Int, data::Set{Symbol},
     rho_prior = nothing
     sigma_prior = nothing
     domain = nothing
-    kwlist = "`k`/`c`/`iso`/`cov`/`period`/`length_scale`/`sd`/`domain`"
+    by = nothing
+    kwlist = "`k`/`c`/`iso`/`cov`/`period`/`length_scale`/`sd`/" *
+        "`domain`/`by`"
     for a in st.args[2:end]
         if a isa Expr && a.head === :parameters
             for kw in a.args
@@ -1979,15 +1981,21 @@ function _lower_hsgp_basis(st::Expr, line::Int, data::Set{Symbol},
                 key === :k || key === :c || key === :iso ||
                     key === :cov || key === :period ||
                     key === :length_scale || key === :sd ||
-                    key === :domain ||
+                    key === :domain || key === :by ||
                     _sfail("$where takes keywords $kwlist only, got `$key`")
                 if key === :domain
                     domain = kw.args[2]
+                elseif key === :by
+                    v = kw.args[2]
+                    v isa Symbol && v in data || _sfail("$where `by=` takes " *
+                        "a bare grouping data column, got $(repr(v))")
+                    by = v
                 elseif key === :length_scale
-                    rho_prior = _lower_hyper_prior(kw.args[2], where,
+                    rho_prior = _lower_hsgp_hyper_spec(kw.args[2], where,
                         :length_scale)
                 elseif key === :sd
-                    sigma_prior = _lower_hyper_prior(kw.args[2], where, :sd)
+                    sigma_prior = _lower_hsgp_hyper_spec(kw.args[2], where,
+                        :sd)
                 elseif key === :k
                     k = _lower_hsgp_k(kw.args[2], where)
                 elseif key === :c
@@ -2058,6 +2066,20 @@ function _lower_hsgp_basis(st::Expr, line::Int, data::Set{Symbol},
                   "`cov=:periodic` (got `cov=:exp_quad`)")
     end
     d = length(axes)
+    for (spec, what) in ((rho_prior, :length_scale), (sigma_prior, :sd))
+        spec isa HSGPHyperLP || continue
+        by === nothing && _sfail("$where `$what=` hyper-predictor " *
+            "`$(spec.intercept ? "1 + " : "")(1 | $(spec.group))` needs a " *
+            "grouped basis — add `by = $(spec.group)`")
+        spec.group === by || _sfail("$where `$what=` hyper-predictor " *
+            "groups by $(spec.group) but the basis groups by $by — one " *
+            "hyper level per term group")
+    end
+    if by !== nothing
+        (cov === :exp_quad && iso && d == 1) || _sfail("$where `by=` takes " *
+            "one isotropic exp-quad axis in v1 (aniso / periodic grouped " *
+            "bases are planned)")
+    end
     if domain !== nothing
         cov === :periodic && _sfail("$where periodic bases have no domain " *
             "(drop `domain=`)")
@@ -2072,11 +2094,31 @@ function _lower_hsgp_basis(st::Expr, line::Int, data::Set{Symbol},
     _claim!(seen, seelines, label, line)
     hb = HSGPBasis(id, Vector{Symbol}(axes), k, c, iso,
         Tuple{Float64,Float64}[], label, cov,
-        period === nothing ? NaN : period, rho_prior, sigma_prior, domain)
+        period === nothing ? NaN : period, rho_prior, sigma_prior, domain,
+        by === nothing ? nothing : HSGPGrouping(by, nothing))
     for nm in _hsgp_all_names(hb)
         _claim!(seen, seelines, nm, line)
     end
     return hb
+end
+
+# A basis `length_scale=`/`sd=` value: a stated hyper prior
+# (`_lower_hyper_prior`) or a per-group log-linear hyper-predictor (SB
+# `log(length_scale(hsgp(x))) ~ 1 + (1 | g)`): `1 + (1 | g)` or
+# `(1 | g)`, spelled with the grouping column the basis takes as `by`.
+function _lower_hsgp_hyper_spec(raw, where, what::Symbol)
+    isbar(e) = e isa Expr && e.head === :call && length(e.args) == 3 &&
+        e.args[1] === :| && e.args[2] == 1 && e.args[3] isa Symbol
+    isbar(raw) && return HSGPHyperLP(false, raw.args[3])
+    if raw isa Expr && raw.head === :call && length(raw.args) == 3 &&
+            raw.args[1] === :+ && raw.args[2] == 1 && isbar(raw.args[3])
+        return HSGPHyperLP(true, raw.args[3].args[3])
+    end
+    raw isa Expr && raw.head === :call && raw.args[1] in (:+, :|) &&
+        _sfail("$where `$what=` hyper-predictors take `1 + (1 | g)` or " *
+            "`(1 | g)` (per-group log-linear, BRM defaults), got " *
+            "$(repr(raw))")
+    return _lower_hyper_prior(raw, where, what)
 end
 
 # `domain=(lo, hi)` (one axis) or `domain=((lo1, hi1), (lo2, hi2), ...)`
@@ -6317,7 +6359,7 @@ function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
             "$(pred.link) and $link — one link per predictor")
         return name
     end
-    if _composed_trigger(ctx.detmap[name], ctx)
+    if _composed_root(ctx.detmap[name], ctx)
         return _lower_composed_predictor(name, ctx.detmap[name], ctx, lhs,
             link, predictors, pred_idx, coefuse)
     end
@@ -6446,7 +6488,7 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
                 return pname
             end
         end
-        if _composed_trigger(ctx.detmap[loc], ctx)
+        if _composed_root(ctx.detmap[loc], ctx)
             return _lower_composed_predictor(pname, ctx.detmap[loc], ctx,
                 lhs, pred_link, predictors, pred_idx, coefuse)
         end
@@ -6474,7 +6516,7 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
                 "derived predictor name $pname collides with your definition — " *
                 "rename yours")
         end
-        if _composed_trigger(loc, ctx)
+        if _composed_root(loc, ctx)
             return _lower_composed_predictor(pname, loc, ctx, lhs,
                 pred_link, predictors, pred_idx, coefuse)
         end
@@ -6773,6 +6815,27 @@ function _composed_trigger(rhs, ctx)
     end
 end
 
+# A root that is only an admitted map over ONE bare sub-predictor
+# (`exp.(mu)`, `logistic.(mu)`, or a name bound to one) is a link
+# spelling, not a composition: at a response/scale location it keeps the
+# link path (Poisson `exp.`, Bernoulli `logistic.` peel there; any other
+# family fails closed with the link guidance or at bind). Inside a real
+# combination the same map composes (`exp.(la) .* th`).
+function _is_bare_sub_map(rhs, ctx)
+    if rhs isa Symbol
+        haskey(ctx.detmap, rhs) && ctx.detmap[rhs] !== rhs || return false
+        return _is_bare_sub_map(ctx.detmap[rhs], ctx)
+    end
+    _is_composed_map(rhs) && rhs.args[1] in _COMPOSED_UNARY || return false
+    arg = only(rhs.args[2].args)
+    arg isa Symbol || return false
+    _composed_trigger(arg, ctx) && return false
+    return _is_composed_sub(arg, ctx, true)
+end
+
+_composed_root(rhs, ctx) =
+    _composed_trigger(rhs, ctx) && !_is_bare_sub_map(rhs, ctx)
+
 """Extract + validate a combination tree (trigger already fired).
 Leaves: sub-predictors (vector defs) and scalars (sampled names,
 scalar definitions). Everything else fails closed with guidance."""
@@ -6911,7 +6974,7 @@ end
 
 function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
     where = "predictor $pname"
-    _composed_trigger(rhs, ctx) && _sfail(
+    _composed_root(rhs, ctx) && _sfail(
         "predictor $pname combines sub-predictors inside a nested " *
         "definition — compositions lower only at response/scale " *
         "locations (bind the pieces: `th = ...; eta = be .* th`, then " *

@@ -396,6 +396,146 @@ end
     @test Set(t.columns) == Set([:log_time, :log_dose])
 end
 
+_sm_probe(n) = [0.2 * sin(1.3i) + 0.02i for i in 1:n]
+
+# Bordet `brm_group_specific_hsgp_mean` (builder 6): per-biomarker HSGP
+# smooths (`by = biomarker`, SB `_sb_hsgp_by`) whose log length scale and
+# log marginal sd each take the per-biomarker hyper-predictor
+# `1 + (1 | biomarker)` (SB `log(length_scale(hsgp(x))) ~ 1 + (1 | g)`,
+# BRM defaults: Normal(0, 1) intercept, Stan-kernel half-Normal(0, 1)
+# sd, non-centered z; length scales floored per group at the validity
+# floor, SB `fmax`).
+const _SM_BORDET_D6 = quote
+    hsgp_basis(:h_t, log_time; k = 10, by = biomarker,
+        length_scale = 1 + (1 | biomarker), sd = 1 + (1 | biomarker))
+    hsgp_basis(:h_d, log_dose; k = 10, by = biomarker,
+        length_scale = 1 + (1 | biomarker), sd = 1 + (1 | biomarker))
+    r_b ~ varying_effect(biomarker, [1])
+    r_p ~ varying_effect(person, [1])
+    log_y = a .+ b_aff .* affectable .+ hsgp(:h_t) .+ hsgp(:h_d) .+ r_b .+
+        r_p
+    ls = c0
+    log_obs .~ censored.(Normal.(log_y, exp.(ls)), lloq, uloq)
+end
+
+# Independent D6 oracle for the parts the grouped basis touches: the
+# hyper-predictor + weight priors and the censored likelihood (per-row
+# group lookup, per-group length scale / sd / weights). The remaining
+# priors are shared by both probes of a difference and cancel.
+function _sm_d6_oracle(d, data, fits)
+    lp = 0.0
+    n = length(data.log_obs)
+    f = zeros(n)
+    G, K = 2, 10
+    for (id, x) in ((:h_t, data.log_time), (:h_d, data.log_dose))
+        mu, L = fits[id]
+        floor = (4 * L / pi) * sqrt(log(100.0) / (K^2 - 1))
+        hyper(tag) = begin
+            b0 = d[Symbol("beta0_", tag, "_", id)]
+            usd = d[Symbol("sd_", tag, "_", id)]
+            z = [d[Symbol("z_", tag, "_", id, ".", g)] for g in 1:G]
+            lp += logpdf(Normal(), b0) + logpdf(Normal(), exp(usd)) + usd +
+                sum(logpdf.(Normal(), z))
+            exp.(b0 .+ exp(usd) .* z)
+        end
+        rho = max.(hyper(:rho), floor)
+        sig = hyper(:sigma)
+        w = [d[Symbol("beta_raw_", id, ".", j)] for j in 1:(G * K)]
+        lp += sum(logpdf.(Normal(), w))
+        W = reshape(w, G, K)
+        for i in 1:n, k in 1:K
+            g = data.biomarker[i]
+            lam = (k * pi / (2L))^2
+            phi = sin(sqrt(lam) * (x[i] - mu + L)) / sqrt(L)
+            spd = sig[g] * sqrt(sqrt(2pi) * rho[g]) *
+                exp(-0.25 * rho[g]^2 * lam)
+            f[i] += phi * spd * W[g, k]
+        end
+    end
+    rb = exp(d[:log_scale_biomarker]) .*
+        [d[Symbol("xi_biomarker.", g)] for g in 1:2]
+    rp = exp(d[:log_scale_person]) .* [d[Symbol("xi_person.", p)] for p in 1:2]
+    s = exp(d[Symbol("ls.Intercept")])
+    for i in 1:n
+        m = d[Symbol("log_y.Intercept")] +
+            d[Symbol("log_y.affectable")] * data.affectable[i] + f[i] +
+            rb[data.biomarker[i]] + rp[data.person[i]]
+        y, lo, hi = data.log_obs[i], data.lloq[i], data.uloq[i]
+        lp += y <= lo ? logcdf(Normal(m, s), lo) :
+            y >= hi ? logccdf(Normal(m, s), hi) : logpdf(Normal(m, s), y)
+    end
+    return lp
+end
+
+@testset "bordet builder 6 SB parity + grouped oracle (pin 72d4bfc9)" begin
+    bound, _, kern, lay = _sm_query(_SM_BORDET_D6, _sm_cols(_SM_BORDET))
+    @test lay.total == 65
+    @test _sm_val(kern, fill(0.3, 65)) ≈ -93.77705891192933 atol = 1e-10
+    # The uniform SB probe gives both groups identical hypers and
+    # weights, so it cannot see a group mix-up; this non-uniform
+    # difference (grouped-basis coordinates only) can.
+    names = coordinate_names(lay)
+    fits = Dict(hb.id => only(hb.fits) for hb in bound.hsgp_bases)
+    @test all(hb -> hb.by.levels == [1, 2], bound.hsgp_bases)
+    u1 = _sm_probe(65)
+    grouped = [occursin(r"_(h_t|h_d)(\.|$)", String(nm)) for nm in names]
+    @test count(grouped) == 2 * (8 + 20)
+    u2 = copy(u1)
+    u2[grouped] .= [0.4 * cos(0.9i) - 0.03i for i in 1:count(grouped)]
+    d1 = Dict(zip(names, u1))
+    d2 = Dict(zip(names, u2))
+    @test _sm_val(kern, u1) - _sm_val(kern, u2) ≈
+        _sm_d6_oracle(d1, _SM_BORDET, fits) -
+        _sm_d6_oracle(d2, _SM_BORDET, fits) atol = 1e-9
+end
+
+@testset "grouped HSGP surface + contract" begin
+    base(kws...) = quote
+        hsgp_basis(:h, x; k = 6, $(kws...))
+        mu = a .+ hsgp(:h)
+        y .~ Normal.(mu, 1.0)
+    end
+    cols = (:y, :x, :g, :q)
+    kw(k, v) = Expr(:kw, k, v)
+    # `by` alone (shared hypers), `(1 | g)` without an intercept, and a
+    # stated prior on the other hyper all lower.
+    hb = only(lower_rkppl(base(kw(:by, :g)), cols).hsgp_bases)
+    @test hb.by == HSGPGrouping(:g, nothing) && hb.rho_prior === nothing
+    hb = only(lower_rkppl(base(kw(:by, :g),
+        kw(:length_scale, :((1 | g))), kw(:sd, :(Normal(0, 1)))),
+        cols).hsgp_bases)
+    @test hb.rho_prior == HSGPHyperLP(false, :g)
+    @test hb.sigma_prior isa HyperPrior
+    # Fail closed: a hyper-predictor without `by`, grouped by another
+    # column, a non-`1 + (1 | g)` formula, `by` on a 2-D / periodic basis,
+    # and a non-column `by`.
+    for bad in (base(kw(:length_scale, :(1 + (1 | g)))),
+            base(kw(:by, :g), kw(:sd, :(1 + (1 | q)))),
+            base(kw(:by, :g), kw(:sd, :(2 + (1 | g)))),
+            base(kw(:by, :g), kw(:sd, :(1 + (x | g)))),
+            base(kw(:by, :g), kw(:cov, QuoteNode(:periodic)),
+                kw(:period, 1.0)),
+            base(kw(:by, :(g .+ 1))))
+        @test_throws SurfaceLoweringError lower_rkppl(bad, cols)
+    end
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        hsgp_basis(:h, x, q; k = (4, 4), by = g)
+        mu = a .+ hsgp(:h)
+        y .~ Normal.(mu, 1.0)
+    end, cols)
+    # A hand-built hyper-predictor without a grouping is contract-invalid.
+    plan = lower_rkppl(base(kw(:by, :g),
+        kw(:length_scale, :(1 + (1 | g)))), cols)
+    hb = only(plan.hsgp_bases)
+    bad = HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits, hb.label,
+        hb.cov, hb.period, hb.rho_prior, hb.sigma_prior, hb.domain, nothing)
+    @test_throws ContractValidationError validate_structure(
+        StructuralPlan(plan.responses, plan.predictors,
+            plan.population_priors, plan.parameters, plan.assignments,
+            plan.columns, plan.n_obs; derived = plan.derived,
+            hsgp_bases = [bad]))
+end
+
 @testset "bruno HSGP/GP components SB parity (0090db25)" begin
     xc = [2 * (clamp(v, -0.5, 0.5) + 0.5) / 1.0 - 1.0 for v in _SM_BRUNO_X]
     for (label, prog, data, n, banked) in (
@@ -422,11 +562,10 @@ const _SM_ITEMS = (
     ("bordet D4", _sm_bordet(false, :(censored.(StudentT.(4.0, log_y,
         exp.(ls)), lloq, uloq))), _SM_BORDET),
     ("bordet D5", _SM_BORDET_D5, _SM_BORDET_D5_DATA),
+    ("bordet D6", _SM_BORDET_D6, _SM_BORDET),
     ("bruno hsgp", _sm_bruno1(:x), (; x = _SM_BRUNO_X, y = _SM_BRUNO_Y)),
     ("bruno gp_effectiveness", _SM_BRUNO_EFF, _SM_BRUNO_EFF_DATA),
 )
-
-_sm_probe(n) = [0.2 * sin(1.3i) + 0.02i for i in 1:n]
 
 @testset "smooth Enzyme-vs-findiff ($label)" for (label, prog, data) in _SM_ITEMS
     bound, built, _, lay = _sm_query(prog, _sm_cols(data))

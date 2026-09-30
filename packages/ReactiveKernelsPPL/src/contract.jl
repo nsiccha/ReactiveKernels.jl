@@ -982,8 +982,41 @@ function _validate_hyper_prior(hp::HyperPrior, label::Symbol, what)
 end
 
 """
+    HSGPHyperLP(intercept, group)
+
+A grouped HSGP hyperparameter's log-linear hyper-predictor (SB
+`log(length_scale(hsgp(x))) ~ 1 + (1 | g)` / `~ (1 | g)`): per group
+`log h_g = beta0 + sd * z_g` (`intercept` false drops `beta0`), with the
+BRM defaults `beta0 ~ Normal(0, 1)`, `sd ~ Normal(0, 1)` on the positive
+support (Stan kernel), non-centered `z ~ Normal(0, 1)`. `group` must be
+the basis's `by` column (one hyper level per term group). A length scale
+is floored per group at the validity floor (SB `brm_hsgp_by_hyper_S`
+`fmax(rho_g, rho_lower)`).
+"""
+struct HSGPHyperLP
+    intercept::Bool
+    group::Symbol
+end
+
+# A hyper-predictor carries no stated bounds (its floor is applied
+# in-graph per group).
+_hyper_prior_bounds(::HSGPHyperLP) = nothing
+
+"""
+    HSGPGrouping(column, levels)
+
+A per-group HSGP (SB `hsgp(x; by = g)`): the basis weights vary by the
+levels of data column `column` (`levels` sort-ordered observed levels,
+`nothing` pre-bind — [`bind_data`](@ref) fills them).
+"""
+struct HSGPGrouping
+    column::Symbol
+    levels::Union{Nothing,Vector{Any}}
+end
+
+"""
     HSGPBasis(id, axes, K, c, iso, fits, label, cov, period[, rho_prior,
-              sigma_prior])
+              sigma_prior[, domain[, by]]])
 
 One Hilbert-space GP basis (SB `_sb_hsgp` / `_sb_hsgp_periodic`):
 `axes` raw data columns, `K` modes per axis, `c` boundary factors per
@@ -1015,6 +1048,12 @@ hyperparameter (`(:interval, lo, hi)`, SB prior-bound intersection).
 per axis as `(lower, upper)` pairs: bind uses `(mu, L) = ((lo+hi)/2,
 (hi-lo)/2)` instead of the data-fitted `L = c*max|x-mu|` (so `c` does
 not apply), and every bound axis value must lie inside its pair.
+
+`by` ([`HSGPGrouping`](@ref), SB `hsgp(x; by = g)`) makes the basis
+weights per group (`G*M` standardized weights) over one shared basis;
+the hyperparameters stay shared unless `rho_prior` / `sigma_prior` carry
+an [`HSGPHyperLP`](@ref) (per-group log-linear hyper-predictors). v1:
+one isotropic exp-quad axis.
 """
 struct HSGPBasis
     id::Symbol
@@ -1026,9 +1065,10 @@ struct HSGPBasis
     label::Symbol
     cov::Symbol
     period::Float64
-    rho_prior::Union{Nothing,HyperPrior}
-    sigma_prior::Union{Nothing,HyperPrior}
+    rho_prior::Union{Nothing,HyperPrior,HSGPHyperLP}
+    sigma_prior::Union{Nothing,HyperPrior,HSGPHyperLP}
     domain::Union{Nothing,Vector{Tuple{Float64,Float64}}}
+    by::Union{Nothing,HSGPGrouping}
 end
 
 """Default-prior construction (SB `_sb_hsgp`'s `lognormal(0, 1)`
@@ -1039,7 +1079,7 @@ HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
     fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
     period::Float64) =
     HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, nothing,
-        nothing, nothing)
+        nothing, nothing, nothing)
 
 """Stated-hyper-prior construction without a fixed domain."""
 HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
@@ -1047,7 +1087,15 @@ HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
     fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
     period::Float64, rho_prior, sigma_prior) =
     HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, rho_prior,
-        sigma_prior, nothing)
+        sigma_prior, nothing, nothing)
+
+"""Fixed-domain construction without grouping."""
+HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
+    c::Vector{Float64}, iso::Bool,
+    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
+    period::Float64, rho_prior, sigma_prior, domain) =
+    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, rho_prior,
+        sigma_prior, domain, nothing)
 
 """Exp-quad v1 positional construction (periodic defaults: `cov =
 :exp_quad`, `period = NaN`)."""
@@ -1836,8 +1884,19 @@ function _hsgp_names(hb::HSGPBasis)
     sigma = Symbol("sigma_", id)
     rhos = hb.iso ? [Symbol("rho_", id)] :
         [Symbol("rho_", id, :_, j) for j in 1:length(hb.axes)]
-    return (beta = beta, rhos = rhos, sigma = sigma)
+    hyper(tag, spec) = spec isa HSGPHyperLP ?
+        (beta0 = Symbol("beta0_", tag, :_, id), sd = Symbol("sd_", tag, :_,
+            id), z = Symbol("z_", tag, :_, id), intercept = spec.intercept) :
+        nothing
+    return (beta = beta, rhos = rhos, sigma = sigma,
+        rho_hyper = hyper(:rho, hb.rho_prior),
+        sigma_hyper = hyper(:sigma, hb.sigma_prior))
 end
+
+"""Group count of an [`HSGPBasis`](@ref) (1 ungrouped; the bound
+`by` level count grouped — `nothing` levels pre-bind count as 0)."""
+_hsgp_n_groups(hb::HSGPBasis) = hb.by === nothing ? 1 :
+    hb.by.levels === nothing ? 0 : length(hb.by.levels)
 
 """Basis-function count for an [`HSGPBasis`](@ref): `M = prod(K)`
 exp-quad, `M = 2k` periodic (cosines then sines over `k`
@@ -1848,7 +1907,13 @@ _hsgp_n_basis(hb::HSGPBasis) =
 # Flat sampled-name list for name tables + claims (beta, rhos, sigma).
 function _hsgp_all_names(hb::HSGPBasis)
     n = _hsgp_names(hb)
-    return Symbol[n.beta, n.sigma, n.rhos...]
+    out = Symbol[n.beta, n.sigma, n.rhos...]
+    for h in (n.rho_hyper, n.sigma_hyper)
+        h === nothing && continue
+        h.intercept && push!(out, h.beta0)
+        push!(out, h.sd, h.z)
+    end
+    return out
 end
 
 # Every model-scope name a kernel plate introduces (cell names become flat
@@ -3236,10 +3301,30 @@ function _validate_hsgp(plan::StructuralPlan)
     length(unique(labels)) == length(labels) ||
         _fail(:plan, "duplicate hsgp basis labels")
     for hb in plan.hsgp_bases
-        hb.rho_prior === nothing || _validate_hyper_prior(hb.rho_prior,
+        hb.rho_prior isa HyperPrior && _validate_hyper_prior(hb.rho_prior,
             :plan, "hsgp :$(hb.id) length-scale")
-        hb.sigma_prior === nothing || _validate_hyper_prior(hb.sigma_prior,
-            :plan, "hsgp :$(hb.id) sd")
+        hb.sigma_prior isa HyperPrior && _validate_hyper_prior(
+            hb.sigma_prior, :plan, "hsgp :$(hb.id) sd")
+        for (spec, what) in ((hb.rho_prior, "length-scale"),
+                             (hb.sigma_prior, "sd"))
+            spec isa HSGPHyperLP || continue
+            hb.by === nothing && _fail(:plan, "hsgp :$(hb.id): a $what " *
+                "hyper-predictor needs a grouped basis (`by = ...`)")
+            spec.group === hb.by.column || _fail(:plan, "hsgp :$(hb.id): " *
+                "the $what hyper-predictor groups by $(spec.group) but " *
+                "the basis groups by $(hb.by.column) — one hyper level " *
+                "per term group")
+        end
+        if hb.by !== nothing
+            (hb.cov === :exp_quad && hb.iso && length(hb.axes) == 1) ||
+                _fail(:plan, "hsgp :$(hb.id): `by` grouping takes one " *
+                    "isotropic exp-quad axis in v1 (aniso / periodic " *
+                    "grouped bases are planned)")
+            lv = hb.by.levels
+            lv === nothing || (!isempty(lv) && allunique(lv)) ||
+                _fail(:plan, "hsgp :$(hb.id): `by` levels must be " *
+                    "non-empty and distinct, got $(repr(lv))")
+        end
         if hb.domain !== nothing
             hb.cov === :periodic && _fail(:plan, "hsgp :$(hb.id): a " *
                 "periodic basis has no domain (drop `domain=`)")
@@ -8738,9 +8823,23 @@ function _fit_hsgp_bases(plan::StructuralPlan,
                 push!(fits, ((lo + hi) / 2, (hi - lo) / 2))
             end
         end
+        by = hb.by
+        if by !== nothing && by.levels === nothing
+            haskey(columns, by.column) || _fail(hb.label, "hsgp " *
+                ":$(hb.id): grouping column $(by.column) is not bound")
+            gcol = _vector_column(columns, by.column, hb.label,
+                "hsgp grouping column")
+            levels = try
+                _grouping_levels(gcol)
+            catch err
+                _fail(hb.label, "hsgp :$(hb.id): grouping column " *
+                    "$(by.column) levels not orderable ($err)")
+            end
+            by = HSGPGrouping(by.column, collect(Any, levels))
+        end
         push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, fits,
             hb.label, hb.cov, hb.period, hb.rho_prior, hb.sigma_prior,
-            hb.domain))
+            hb.domain, by))
     end
     return out
 end
@@ -9608,6 +9707,11 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     end
     for hb in hbases, c in hb.axes
         haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
+    end
+    for hb in hbases
+        hb.by === nothing && continue
+        haskey(inferred, hb.by.column) &&
+            _upgrade_role!(inferred, hb.by.column, :group)
     end
     for el in elbases
         c = _sched_col_name(el.schedule, :op_log_dose)

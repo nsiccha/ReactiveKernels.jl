@@ -400,9 +400,72 @@ function _hsgp_basis_statements(plan::StructuralPlan)
             length(hb.fits) == length(hb.axes) || throw(ContractValidationError(
                 "[generator] hsgp :$(hb.id): fits not filled at bind " *
                 "(bind_data fills one (mu, L) per axis)"))
-            append!(stmts, _hsgp_basis_stmts(hb))
+            append!(stmts, hb.by === nothing ? _hsgp_basis_stmts(hb) :
+                _hsgp_grouped_stmts(hb))
         end
     end
+    return stmts
+end
+
+# One grouped basis (SB `_sb_hsgp_by` / `brm_hsgp_by_hyper_S`), one
+# isotropic axis: the shared basis matrix `PHI` (n x M, frozen fits), the
+# per-group length scales / marginal scales (a G-vector from the
+# hyper-predictor `exp.(beta0 .+ sd .* z)` — length scales floored per
+# group at the validity floor, SB `fmax(rho_g, rho_lower)` — or the
+# shared scalar), the per-group spectral weights `SPD` (G x M, SB
+# `brm_hsgp_sqrt_spd` per group), the per-group standardized weights
+# `W = reshape(beta_raw, G, M)`, and the row-wise summand
+# `sum(PHI .* (OH * (SPD .* W)); dims = 2)` over the data-only one-hot
+# group matrix `OH` (n x G) — SB `rows_dot_product(S, beta[group_idx, :])`
+# with its row mask, matmul-only so it traces through Reactant.
+function _hsgp_grouped_stmts(hb::HSGPBasis)
+    id = hb.id
+    stmts = Expr[]
+    axis = only(hb.axes)
+    mu, L = Float64.(only(hb.fits))
+    inv_sqrt_L = 1.0 / sqrt(L)
+    K = only(hb.K)
+    cols = Symbol[]
+    for k in 1:K
+        lam_sqrt = sqrt((k * pi / (2.0 * L))^2)
+        col = _hsgp_ax_name(id, 1, k)
+        push!(stmts, :($col =
+            $inv_sqrt_L .* sin.($lam_sqrt .* ($axis .- $mu .+ $L))))
+        push!(cols, col)
+    end
+    PHI = _hsgp_PHI_name(id)
+    push!(stmts, :($PHI = hcat($(cols...))))
+    names = _hsgp_names(hb)
+    levels = hb.by.levels
+    G = length(levels)
+    gidx = Symbol(:_ppl_hsgp_, id, :_gidx)
+    lvlvec = Expr(:vect, (_level_literal(lv) for lv in levels)...)
+    push!(stmts, :($gidx = _declared_codes($(hb.by.column), $lvlvec)))
+    OH = Symbol(:_ppl_hsgp_, id, :_OH)
+    push!(stmts, :($OH = hcat($((:(Float64.($gidx .== $g)) for g in 1:G)...))))
+    floor = only(_hsgp_floors(hb.K, hb.fits, hb.iso))
+    function hyper_vec(h, floor)
+        eta = h.intercept ? :($(h.beta0) .+ $(h.sd) .* $(h.z)) :
+            :($(h.sd) .* $(h.z))
+        v = :(exp.($eta))
+        return floor > 0 ? :(max.($v, $floor)) : v
+    end
+    rho = names.rho_hyper === nothing ? only(names.rhos) :
+        hyper_vec(names.rho_hyper, hb.rho_prior isa HSGPHyperLP ? floor : 0.0)
+    sigma = names.sigma_hyper === nothing ? names.sigma :
+        hyper_vec(names.sigma_hyper, 0.0)
+    rv = Symbol(:_ppl_hsgp_, id, :_rho)
+    sv = Symbol(:_ppl_hsgp_, id, :_sigma)
+    push!(stmts, :($rv = $rho))
+    push!(stmts, :($sv = $sigma))
+    lamrow = Expr(:hcat, ((k * pi / (2.0 * L))^2 for k in 1:K)...)
+    SPD = _hsgp_S_name(id)
+    push!(stmts, :($SPD = ($sv .* sqrt.($rv .* $_HSGP_SQRT2PI)) .*
+        exp.(-0.25 .* ($rv .* $rv) .* $lamrow)))
+    W = _hsgp_w_name(id)
+    push!(stmts, :($W = reshape($(names.beta), $G, $K)))
+    push!(stmts, :($(_hsgp_sum_name(id)) =
+        vec(sum($PHI .* ($OH * ($SPD .* $W)); dims = 2))))
     return stmts
 end
 
@@ -3257,21 +3320,48 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     # same Stan-kernel semantics (plain `_lpdf`, no normalizer).
     for hb in plan.hsgp_bases
         names = _hsgp_names(hb)
-        rfam, rargs = hb.rho_prior === nothing ? (:lognormal, Any[0, 1]) :
-            (hb.rho_prior.family, collect(Any, values(hb.rho_prior.args)))
-        sfam, sargs = hb.sigma_prior === nothing ?
-            (:lognormal, Any[0, 1]) :
-            (hb.sigma_prior.family, collect(Any, values(hb.sigma_prior.args)))
-        for rho in names.rhos
-            node = Symbol(:_ppl_prior_, rho)
-            cell = _family_logpdf_expr(rfam, rargs, rho)
-            push!(stmts, :($node::Float64 = $cell))
-            push!(terms, node)
+        rfam, rargs = hb.rho_prior isa HyperPrior ?
+            (hb.rho_prior.family, collect(Any, values(hb.rho_prior.args))) :
+            (:lognormal, Any[0, 1])
+        sfam, sargs = hb.sigma_prior isa HyperPrior ?
+            (hb.sigma_prior.family,
+                collect(Any, values(hb.sigma_prior.args))) :
+            (:lognormal, Any[0, 1])
+        # Per-group hyper-predictors (BRM defaults): intercept
+        # `Normal(0, 1)`, sd `Normal(0, 1)` on the positive support
+        # (Stan kernel — plain `_lpdf`), non-centered `z` standard normal.
+        function hyper_priors!(h)
+            if h.intercept
+                bnode = Symbol(:_ppl_prior_, h.beta0)
+                push!(stmts, :($bnode::Float64 =
+                    $(_family_logpdf_expr(:normal, Any[0, 1], h.beta0))))
+                push!(terms, bnode)
+            end
+            dnode = Symbol(:_ppl_prior_, h.sd)
+            push!(stmts, :($dnode::Float64 =
+                $(_family_logpdf_expr(:normal, Any[0, 1], h.sd))))
+            push!(terms, dnode)
+            _vector_prior_stmts!(stmts, terms, h.z, :normal,
+                (arg1 = 0, arg2 = 1), nothing)
         end
-        snode = Symbol(:_ppl_prior_, names.sigma)
-        scell = _family_logpdf_expr(sfam, sargs, names.sigma)
-        push!(stmts, :($snode::Float64 = $scell))
-        push!(terms, snode)
+        if names.rho_hyper !== nothing
+            hyper_priors!(names.rho_hyper)
+        else
+            for rho in names.rhos
+                node = Symbol(:_ppl_prior_, rho)
+                cell = _family_logpdf_expr(rfam, rargs, rho)
+                push!(stmts, :($node::Float64 = $cell))
+                push!(terms, node)
+            end
+        end
+        if names.sigma_hyper !== nothing
+            hyper_priors!(names.sigma_hyper)
+        else
+            snode = Symbol(:_ppl_prior_, names.sigma)
+            scell = _family_logpdf_expr(sfam, sargs, names.sigma)
+            push!(stmts, :($snode::Float64 = $scell))
+            push!(terms, snode)
+        end
         _vector_prior_stmts!(stmts, terms, names.beta, :normal,
             (arg1 = 0, arg2 = 1), nothing)
     end

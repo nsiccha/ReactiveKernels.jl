@@ -164,6 +164,40 @@ end
     @test isempty(curve.derived)
 end
 
+@testset "composed bare maps stay link spellings" begin
+    # A map over ONE bare sub-predictor at a location (inline or through
+    # a name) is a link spelling, never a composition: families without
+    # that link fail closed exactly as before compositions existed.
+    D = (:y, :x)
+    Dict1 = Dict{Symbol,AbstractVector}(:y => [0.3], :x => [0.5])
+    @test_throws ContractValidationError bind_data(lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Normal.(exp.(mu), 1.5)
+    end, D), Dict1)
+    @test_throws ContractValidationError bind_data(lower_rkppl(quote
+        mu = a .+ b .* x
+        m = exp.(mu)
+        y .~ Normal.(m, 1.5)
+    end, D), Dict1)
+    # ... while the Poisson log link still peels.
+    pois = lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Poisson.(exp.(mu))
+    end, D)
+    @test only(pois.predictors).link === LogLink
+    # A named map inside a real combination still inlines.
+    plan = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        la = a_la .+ b_la .* xs
+        al = exp.(la)
+        eta = al .* th
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    t = only(plan.predictors[end].terms)
+    @test t.kind === ComposedTerm
+    @test t.options.tree == :(exp.(la) .* th)
+end
+
 @testset "composed fail-closed" begin
     # Undotted vector combination: Julia-truthful, write the dots.
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -185,7 +219,7 @@ end
         lower_rkppl(quote
             mu = a .+ b .* xs
             p = logistic.(mu)
-            y .~ Bernoulli.(p)
+            y .~ Normal.(p, 1.0)
         end, (:y, :xs))
         nothing
     catch e
