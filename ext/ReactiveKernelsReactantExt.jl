@@ -443,13 +443,21 @@ function ReactiveKernels._sm_frame_write(
     end
 end
 
+# Storage layout reverses the axes, so a column's trailing slot axis leads.
+# Slot slices and updates are taken there: with the slot axis trailing, the
+# backend sees `reshape(dynamic_slice)` inserting a unit dimension ahead of the
+# dropped slot dimension, and Enzyme-JAX's `reshape_dynamic_slice`/`reshape_dus`
+# rewrites then never finish (benchmark/repro_reactant_reshape_slice_rewrite.jl).
+_rk_reactant_storage(value::Reactant.TracedRArray) = ndims(value) <= 1 ? value :
+    permutedims(value, ntuple(dimension -> ndims(value) + 1 - dimension, ndims(value)))
+
 # One slot of a traced column whose trailing axis is the slot axis: a scalar
 # column gathers one element, an array column one slice, at a traced index.
 function _rk_reactant_slot_read(column::Reactant.TracedRArray, index)
     ndims(column) == 1 && return Reactant.@allowscalar column[index]
-    slice = ntuple(dimension -> dimension == ndims(column) ? index : Colon(),
-                   ndims(column))
-    Reactant.@allowscalar getindex(column, slice...)
+    slot = Reactant.@allowscalar getindex(_rk_reactant_storage(column), index,
+        ntuple(_ -> Colon(), ndims(column) - 1)...)
+    _rk_reactant_storage(slot)
 end
 _rk_reactant_slot_index(index) =
     Reactant.promote_to(Reactant.TracedRNumber{Int64}, index)
@@ -462,11 +470,12 @@ function _rk_reactant_slot_write(column, value::Reactant.TracedRNumber, index)
         [_rk_reactant_slot_index(index)])
 end
 function _rk_reactant_slot_write(column, value::Reactant.TracedRArray, index)
-    Reactant.Ops.dynamic_update_slice(
-        column,
-        Reactant.Ops.reshape(value, vcat(collect(Int64, size(value)), Int64[1])),
-        vcat([_rk_reactant_slot_one() for _ in 1:ndims(value)],
-             [_rk_reactant_slot_index(index)]))
+    slot = _rk_reactant_storage(value)
+    _rk_reactant_storage(Reactant.Ops.dynamic_update_slice(
+        _rk_reactant_storage(column),
+        Reactant.Ops.reshape(slot, vcat(Int64[1], collect(Int64, size(slot)))),
+        vcat([_rk_reactant_slot_index(index)],
+             [_rk_reactant_slot_one() for _ in 1:ndims(value)])))
 end
 
 # ---- Structured observational outbox: traced columns -----------------------

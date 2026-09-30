@@ -2050,6 +2050,17 @@ struct PreparedKernel{F,O,IN,OUT,RR}
     lowered_recipes::RR
 end
 
+# A prepared kernel is statically untraced. `Recipe.cse_key` provenance tuples
+# carry output `Type`s as data (authoring.jl `_kernel_provenance_key`), and
+# ReactantCore's `::Type` `is_traced` early-out covers only the 1-arg call
+# while the structural recursion is 2-arg, so walking a kernel reaches type
+# internals and throws `type DataType has no field var` (upstream ReactantCore
+# gap). Kernels are immutable compile-time metadata built before tracing and
+# never contain tracers; `@trace` still takes the traced path when a loop's
+# DATA operands are traced.
+ReactantCore.is_traced(::PreparedKernel) = false
+ReactantCore.is_traced(::PreparedKernel, ::Base.IdSet) = false
+
 # Partial evaluation deliberately stores hoisted values in the prepared
 # operation tuple so the public residual kernel has only its unbound HAVE
 # ports. Compiler and differentiation backends must nevertheless be able to
@@ -2330,6 +2341,11 @@ end
 inputs(k::ReplicatedKernel) = k.inputs
 outputs(k::ReplicatedKernel) = k.outputs
 code_expr(k::ReplicatedKernel) = code_expr(k.target)
+
+# Same statically-untraced contract as `PreparedKernel` above: the whole
+# object is captured by the `@trace` loop in `_replica_call`.
+ReactantCore.is_traced(::ReplicatedKernel) = false
+ReactantCore.is_traced(::ReplicatedKernel, ::Base.IdSet) = false
 
 function Base.show(io::IO, k::ReplicatedKernel{B}) where {B}
     names = Tuple(k.inputs[i].name for i in B)

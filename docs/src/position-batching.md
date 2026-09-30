@@ -221,9 +221,9 @@ backend loop rather than one copied body per position. The loop keeps each
 position's lazy branches, including inactive arithmetic. Compile the
 ordinary owning batch; `reuse=true` is a native-only borrowed-buffer surface.
 
-Reactant 0.2.284 has an additional optimizer limitation for a recipe-free cut
-that returns structured position leaves and a repeated shared array. Its
-retained copy loop fails to finish MLIR rewriting within the bounded compile
-budget; see the [constraints](constraints.md) and the backend-only
-`benchmark/repro_reactant_passthrough_loop.jl` reproducer. Native execution
-supports this cut.
+The loop reads and writes each position in storage layout, with the position
+axis leading, so the optimized program slices the compiled arguments directly.
+With the position axis trailing, two backend rewrite patterns never finish;
+see the [constraints](constraints.md) and the backend-only
+`benchmark/repro_reactant_reshape_slice_rewrite.jl` reproducer. The array
+layout at the call boundary is unchanged.
