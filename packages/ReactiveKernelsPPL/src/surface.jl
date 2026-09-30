@@ -6208,6 +6208,10 @@ function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
             "$(pred.link) and $link — one link per predictor")
         return name
     end
+    if _composed_trigger(ctx.detmap[name], ctx)
+        return _lower_composed_predictor(name, ctx.detmap[name], ctx, lhs,
+            link, predictors, pred_idx, coefuse)
+    end
     terms, uses = _analyze_predictor(name, ctx.detmap[name], ctx, lhs)
     _record_coefuses!(coefuse, name, uses, lhs)
     push!(predictors, PredictorSpec(name, link, terms, name))
@@ -6333,6 +6337,10 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
                 return pname
             end
         end
+        if _composed_trigger(ctx.detmap[loc], ctx)
+            return _lower_composed_predictor(pname, ctx.detmap[loc], ctx,
+                lhs, pred_link, predictors, pred_idx, coefuse)
+        end
         terms, uses = _analyze_predictor(pname, ctx.detmap[loc], ctx, lhs)
     elseif loc isa Number
         _sfail("response $lhs location is a literal — use an intercept-only " *
@@ -6356,6 +6364,10 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
                 "derived predictor name $pname collides with your definition — " *
                 "rename yours")
+        end
+        if _composed_trigger(loc, ctx)
+            return _lower_composed_predictor(pname, loc, ctx, lhs,
+                pred_link, predictors, pred_idx, coefuse)
         end
         terms, uses = _analyze_predictor(pname, loc, ctx, lhs)
     end
@@ -6515,8 +6527,243 @@ end
 # (terms, uses) with uses :: Vector{(coef name, addressee, sign)}.
 # Anonymous non-affine vector substructure auto-extracts to synthetic
 # derived locals, so naming a subexpression never changes legality.
+"""Names a definition may not hide behind in a composition (data-only
+leaves keep today's affine/synth paths; anything else routes composed)."""
+function _composed_data_only(s::Symbol, ctx, seen::Set{Symbol})
+    s in seen && return true
+    haskey(ctx.detmap, s) || return s in ctx.data
+    push!(seen, s)
+    for leaf in _value_symbols(ctx.detmap[s])
+        leaf === s && continue
+        if leaf in ctx.data
+            continue
+        elseif haskey(ctx.detmap, leaf) && _composed_data_only(leaf, ctx, seen)
+            continue
+        else
+            return false
+        end
+    end
+    return true
+end
+
+"""A sub-predictor candidate: vector-shaped definition that is not data,
+a latent/scan/varying object, or a pure data combination (those keep
+today's paths — data combos merge affinely, latents keep their arms).
+Under `.*` (`allow_factor`), bare factor indexing (`th = c[g]`) qualifies
+too — scalar-shaped globally (the inlining doctrine) but an affine
+FactorTerm under analysis. Under `.+` it never qualifies, so `mu = a .+ th`
+keeps the affine merge (with unstated-intercept defaults)."""
+function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
+    haskey(ctx.detmap, s) || return false
+    if get(ctx.detshape, s, :scalar) !== :vector
+        allow_factor && _is_factor_index_def(ctx.detmap[s], ctx) ||
+            return false
+    end
+    s in ctx.data && return false
+    s in ctx.plate_names && return false
+    s in ctx.scan_states && return false
+    s in ctx.varying_contribs && return false
+    s in ctx.varying_draws_names && return false
+    _derived_reads_latent(s, ctx) && return false
+    _composed_data_only(s, ctx, Set{Symbol}()) && return false
+    return true
+end
+
+"""A scalar leaf: sampled name (any prior — coefficient collisions fail
+at the surface, where the sub interning is complete) or scalar-shaped
+definition."""
+function _is_composed_scalar(s::Symbol, ctx)
+    s in ctx.prior_names && return true
+    haskey(ctx.detmap, s) || return false
+    return get(ctx.detshape, s, :scalar) === :scalar
+end
+
+function _composed_has_sub(node, ctx, allow_factor::Bool = false)
+    node isa Symbol && return _is_composed_sub(node, ctx, allow_factor)
+    node isa Expr || return false
+    node.head === :call || return any(
+        a -> _composed_has_sub(a, ctx, allow_factor), node.args)
+    isempty(node.args) && return false
+    return any(a -> _composed_has_sub(a, ctx, allow_factor), node.args[2:end])
+end
+
+function _composed_has_scalar_leaf(node, ctx)
+    node isa Symbol && return _is_composed_scalar(node, ctx)
+    node isa Expr || return false
+    node.head === :call || return false
+    isempty(node.args) && return false
+    op = node.args[1]
+    op isa Symbol || return false
+    # Only the additive spine counts (a scalar under `.*` is the
+    # product's own factor, not an additive operand).
+    op !== :.+ && op !== :.- && return false
+    return any(a -> _composed_has_scalar_leaf(a, ctx), node.args[2:end])
+end
+
+function _composed_count_subs(node, ctx)
+    node isa Symbol && return _is_composed_sub(node, ctx) ? 1 : 0
+    node isa Expr || return 0
+    node.head === :call || return 0
+    isempty(node.args) && return 0
+    op = node.args[1]
+    op isa Symbol || return 0
+    # Recurse through the additive spine only — a sub under `.*`
+    # triggers the product rule, not the operand count.
+    op !== :.+ && op !== :.- && return _composed_has_sub(node, ctx) ? 1 : 0
+    return sum(a -> _composed_count_subs(a, ctx), node.args[2:end])
+end
+
+"""Whether a raw predictor body routes to composed analysis: a `.*`
+(or Julia-valid scalar `*`) over a sub-predictor, or a `.+`/`.−`
+combining two sub-predictors (or one plus a scalar). Under `.*` a bare
+factor-index definition (`th = c[g]`) counts as a sub-predictor; under
+`.+` it keeps the affine merge. Affine merges (`th .+ x`), aliases, and
+data-only combinations keep today's paths."""
+function _composed_trigger(rhs, ctx)
+    rhs isa Expr || return false
+    rhs.head === :call || return false
+    isempty(rhs.args) && return false
+    op = rhs.args[1]
+    op isa Symbol || return false
+    if op === :.*
+        return any(a -> _composed_has_sub(a, ctx, true), rhs.args[2:end])
+    elseif op === :* && length(rhs.args) == 3
+        a, b = rhs.args[2], rhs.args[3]
+        sa = _shape_of(a, ctx.data, ctx.detmap, Dict{Symbol,Symbol}(),
+            Set{Symbol}())
+        sb = _shape_of(b, ctx.data, ctx.detmap, Dict{Symbol,Symbol}(),
+            Set{Symbol}())
+        return (sa === :scalar && _composed_has_sub(b, ctx, true)) ||
+               (sb === :scalar && _composed_has_sub(a, ctx, true))
+    elseif op === :.+ || op ===:.-
+        return _composed_count_subs(rhs, ctx) >= 2 ||
+            (_composed_count_subs(rhs, ctx) >= 1 &&
+                _composed_has_scalar_leaf(rhs, ctx))
+    else
+        return any(a -> _composed_trigger(a, ctx), rhs.args[2:end])
+    end
+end
+
+"""Extract + validate a combination tree (trigger already fired).
+Leaves: sub-predictors (vector defs) and scalars (sampled names,
+scalar definitions). Everything else fails closed with guidance."""
+function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
+        scalars::Vector{Symbol})
+    where = "predictor $pname"
+    if node isa Symbol
+        if _is_composed_sub(node, ctx, true)
+            node in subs || push!(subs, node)
+            return node
+        elseif _is_composed_scalar(node, ctx)
+            node in scalars || push!(scalars, node)
+            return node
+        elseif node in ctx.data
+            return _sfail("$where combines data column $node directly — " *
+                "v1 compositions combine sub-predictors and scalars only")
+        elseif haskey(ctx.detmap, node)
+            return _sfail("$where combines $node, which is neither an " *
+                "affine sub-predictor nor a scalar (latent/scan/varying " *
+                "parts stay out of v1 compositions)")
+        else
+            return _sfail("$where combines $node, which names nothing — " *
+                "declare it (`$node ~ Prior` or `$node = ...`)")
+        end
+    end
+    node isa Number && return _sfail(
+        "$where scales by the literal $node — fold literal scales " *
+        "into a coefficient or prior instead")
+    node isa Expr || return _sfail("$where composition node " *
+        "$(repr(node)) is not admitted (v1: `. .*`/`.+`/`.−` over " *
+        "sub-predictors and scalars)")
+    node.head === :call || return _sfail("$where composition node " *
+        "$(repr(node)) is not admitted (v1: `. .*`/`.+`/`.−` over " *
+        "sub-predictors and scalars)")
+    isempty(node.args) && return _sfail("$where has an empty call node")
+    op = node.args[1]
+    op isa Symbol || return _sfail("$where has an anonymous call node")
+    args = [a for a in node.args[2:end] if !(a isa LineNumberNode)]
+    if op === :.* || op === :.+ || op ===:.-
+        if op === :.+ && length(args) == 1
+            return _extract_composed_tree(pname, only(args), ctx, subs,
+                scalars)
+        end
+        ok = op === :.- ? length(args) in (1, 2) : length(args) == 2
+        ok || return _sfail("$where `$op` takes " *
+            (op === :.- ? "one or two operands" : "two operands"))
+        return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
+            subs, scalars) for a in args)...)
+    elseif op === :* && length(args) == 2
+        # Julia-valid scalar `*` normalizes to dotted (Base broadcasts —
+        # behavior-preserving, the canonicalization doctrine).
+        return _extract_composed_tree(pname, Expr(:call, :.*, args...),
+            ctx, subs, scalars)
+    elseif op === :+ || op === :- || op === :/ || op === :^
+        return _sfail("$where combines vectors without dots: " *
+            "$(repr(node)) — as in Julia, write the dotted form " *
+            "(`. .*`/`.+`/`.−`) or bind scalar subexpressions to a name " *
+            "first (`s = be + 1; eta = s .* th`)")
+    else
+        return _sfail("$where applies `$op` inside a composition — v1 " *
+            "admits `. .*`/`.+`/`.−` over sub-predictors and scalars only")
+    end
+end
+
+"""Lower a composed predictor at a response/scale location: intern the
+affine subs (scale-predictor pattern, IdentityLink), then push the
+composed predictor itself. Nested compositions fail in the guard."""
+function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
+        predictors, pred_idx, coefuse)
+    subs = Symbol[]
+    scalars = Symbol[]
+    tree = _extract_composed_tree(pname, rhs, ctx, subs, scalars)
+    isempty(subs) && _sfail("predictor $pname has no sub-predictor — " *
+        "compositions combine at least one sub-predictor LP")
+    for s in subs
+        if haskey(pred_idx, s)
+            pred = predictors[pred_idx[s]]
+            pred.link === IdentityLink || _sfail(
+                "predictor $s is shared by slots needing links " *
+                "$(pred.link) and $IdentityLink — one link per predictor")
+            all(t -> t.kind in _COMPOSED_AFFINE_KINDS, pred.terms) || _sfail(
+                "predictor $pname: sub-predictor $s must be affine " *
+                "(no nested compositions, latents, or summands in v1)")
+            push!(ctx.absorbed, s)
+            continue
+        end
+        terms, uses = _analyze_predictor(s, ctx.detmap[s], ctx, lhs)
+        all(t -> t.kind in _COMPOSED_AFFINE_KINDS, terms) || _sfail(
+            "predictor $pname: sub-predictor $s must be affine " *
+            "(no nested compositions, latents, or summands in v1)")
+        _record_coefuses!(coefuse, s, uses, lhs)
+        push!(predictors, PredictorSpec(s, IdentityLink, terms, s))
+        pred_idx[s] = length(predictors)
+        # An interned sub is absorbed like a response location — its
+        # definition never also emits as a derived column.
+        push!(ctx.absorbed, s)
+    end
+    for c in scalars
+        if haskey(coefuse, c)
+            owners = join(unique!(map(first, copy(coefuse[c]))), ", ")
+            _sfail("predictor $pname: scalar $c is a coefficient of " *
+                "predictor $owners — a scalar leaf cannot also be a " *
+                "coefficient (rename one)")
+        end
+    end
+    label = Symbol(pname, "_composed")
+    term = TermSpec(ComposedTerm, ColumnRef[],
+        (tree = tree, subs = subs, scalars = scalars), label, label)
+    push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
+    pred_idx[pname] = length(predictors)
+    return pname
+end
+
 function _analyze_predictor(pname, rhs, ctx, lhs)
     where = "predictor $pname"
+    _composed_trigger(rhs, ctx) && _sfail(
+        "predictor $pname combines sub-predictors inside a nested " *
+        "definition — compositions lower only at response/scale " *
+        "locations (bind the pieces: `th = ...; eta = be .* th`, then " *
+        "use `eta`)")
     expanded = _inline_structure(rhs, ctx, Set{Symbol}([pname]), where)
     _find_hcat(expanded) && _sfail(
         "predictor $pname calls `hcat` outside a matrix definition — " *
@@ -7322,14 +7569,17 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
             # self-priored; spline summands carry SplineVectors,
             # self-priored likewise; hsgp summands carry an HSGPBasis,
             # self-priored likewise; and monotonic summands (mo1) carry
-            # an increment simplex, also self-priored.
+            # an increment simplex, also self-priored. Composed terms carry
+            # no coefficient at all (their coefficients live in the affine
+            # sub-predictors, priored there).
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
                 t.kind === VaryingEffectTerm ||
                 t.kind === SplineSummandTerm ||
                 t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||
                 t.kind === MonotonicSummandTerm ||
-                t.kind === DarSummandTerm) && continue
+                t.kind === DarSummandTerm ||
+                t.kind === ComposedTerm) && continue
             if t.kind === MatrixTerm
                 append!(priors, _lower_matrix_priors(pred, t, coefuse,
                     stated, matrices, hyper_names))
@@ -7642,6 +7892,10 @@ function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
         push!(r2d2preds, pred)
         overrides = Dict{Symbol,Tuple{Float64,Float64}}()
         for t in pred.terms
+            t.kind === ComposedTerm && _sfail(
+                "r2d2 over predictor $(pred.name): composed predictors take " *
+                "no shrinkage prior (their coefficients live in the " *
+                "sub-predictors — declare r2d2 over a sub-predictor instead)")
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
                 t.kind === VaryingEffectTerm ||
                 t.kind === SplineSummandTerm ||

@@ -162,6 +162,13 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
         labels = Symbol[e === nothing ? :Intercept : e for e in m.columns]
         return DesignBlock(MatrixTerm, m.name, t.addressee, length(m.columns),
             labels, [], copy(m.columns))
+    elseif t.kind === ComposedTerm
+        # A composed term evaluates an elementwise combination tree over
+        # sub-predictor LP nodes and scalar nodes in-graph — no
+        # design-matrix width (coefficients live in the sub-predictors
+        # and scalars). The generator reads the TERMS for the tree.
+        return DesignBlock(ComposedTerm, nothing, t.addressee, 0, Symbol[],
+            [])
     else
         throw(ContractValidationError("[$label] term kind $(t.kind) has no design rule"))
     end
