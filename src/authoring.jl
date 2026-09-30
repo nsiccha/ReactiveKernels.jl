@@ -1961,6 +1961,41 @@ function _kernel_tensorized_callee(callee, known::Set{Symbol}, mod)
     callee
 end
 
+# Whether a tensorized call goes through `traced` (core.jl), where a tracing
+# method of the callee can take it.  Only a positional call to a function
+# neither Base, Core nor this package owns: a tracing method of a function the
+# caller does not own would be piracy, and every other call keeps exactly its
+# emitted form.  A name unbound when the recipe is defined (a helper defined
+# later) routes too; without a tracing method the hook is the plain call.
+function _kernel_tensorized_routed(callee, arguments, mod)
+    any(arg -> arg isa Expr && arg.head in (:parameters, :kw), arguments) &&
+        return false
+    if callee isa GlobalRef
+        isdefined(callee.mod, callee.name) || return true
+        f = getglobal(callee.mod, callee.name)
+        f isa Function && !(f isa Type) || return false
+        return !(Base.moduleroot(parentmodule(f)) in (Base, Core, @__MODULE__))
+    end
+    callee isa Symbol && mod isa Module
+end
+
+# Whether `callee` names a function with its own `traced` method.  A whole
+# recipe `x = f(ports...)` keeps `f` itself as its operation, which a tracing
+# backend would call natively; with a `traced` method the recipe takes the
+# source-op path instead, whose tracing companion routes the call.  Methods
+# defined after the recipe are not seen.
+function _kernel_callee_has_traced_method(callee::Symbol, mod)
+    mod isa Module && isdefined(mod, callee) || return false
+    f = getglobal(mod, callee)
+    f isa Function && !(f isa Type) || return false
+    for m in methods(traced)
+        signature = Base.unwrap_unionall(m.sig)
+        length(signature.parameters) >= 2 && signature.parameters[2] === typeof(f) &&
+            return true
+    end
+    false
+end
+
 function _kernel_tensorized_assignment_head(head)
     head === :(=) && return true
     head isa Symbol || return false
@@ -2514,9 +2549,12 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         callee = replacement === nothing ?
             _kernel_tensorized_callee(ex.args[1], known, mod) :
             GlobalRef(@__MODULE__, replacement)
-        call = Expr(:call, callee,
-            (_kernel_tensorized_rhs(arg, known, mod, scope)
-             for arg in ex.args[2:end])...)
+        arguments = Any[_kernel_tensorized_rhs(arg, known, mod, scope)
+                        for arg in ex.args[2:end]]
+        call = replacement === nothing &&
+               _kernel_tensorized_routed(callee, arguments, mod) ?
+            Expr(:call, GlobalRef(@__MODULE__, :traced), callee, arguments...) :
+            Expr(:call, callee, arguments...)
         _tensorized_factorization_callee(ex.args[1]) || return call
         return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_factorization), call)
     elseif ex.head in (:vcat, :hcat) &&
@@ -2543,6 +2581,132 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
          (_kernel_tensorized_rhs(arg, known, mod, scope) for arg in ex.args)...)
 end
 
+"""
+    @traceable f(args...) = body
+    @traceable function f(args...) ... end
+
+Define an ordinary method of `f`, plus the [`ReactiveKernels.traced`](@ref)
+method with the same signature whose body is this body rewritten as a
+`@kernel` recipe body is.  Native execution calls the method as written.
+Under a tracing backend (Reactant), a recipe calling `f` reaches the rewritten
+body, so indexing, `get`, lazy branches and data-length loops inside the helper
+lower as they do written in the recipe.  One body serves both; write a
+`traced` method by hand instead when the tracing implementation must differ
+(an opaque or foreign component).
+
+The case it exists for is a per-type rule applied at a traced index, such as a
+dose superposition over several schedule-plan types summed as one retained
+loop:
+
+```julia
+@traceable row_index(t, p::LatticePlan, i) = t - p.shifts[i]
+@traceable row_index(row, ::ExactPlan, i) = row[i]
+
+@kernel cell(plan, units, weights) = begin
+    observations = domain(plan)
+    c::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[i] * get(u, row_index(t, p, i), 0.0) for i in eachindex(w); init = 0.0)
+    end
+end
+```
+
+Under the retained loop `i` is a traced value.  Without `@traceable` the
+helper receives it and Reactant refuses the read (`Scalar indexing is
+disallowed`); with it, `p.shifts[i]` and `row[i]` are gathers as in the recipe.
+Dispatch is Julia's: the rewritten method has the authored signature, so each
+plan type selects its own rule.  Annotate the arguments that select the
+method; leave the arguments that carry traced values untyped.
+
+Supported: positional arguments with optional defaults, `where` clauses, and
+a return-type annotation (kept on the native method only).  A `@traceable`
+method of a function from Base, Core or ReactiveKernels is rejected, and so
+are keyword arguments and a `return` before the end of the body (write that
+branch as an expression).  Calls with keyword arguments are not routed to the
+rewritten method.  Calls the body makes to other helpers route through
+`traced` as well.
+"""
+macro traceable(def)
+    _traceable_definition(def, __module__)
+end
+
+function _traceable_definition(def, mod::Module)
+    usage = "`@traceable f(args...) = body` or `@traceable function f(args...) ... end`"
+    def isa Expr && def.head in (:(=), :function) && length(def.args) == 2 ||
+        throw(ArgumentError("@traceable expects a method definition, $usage; got `$(def)`."))
+    signature, body = def.args
+    wheres = Any[]
+    while signature isa Expr && signature.head === :where
+        push!(wheres, signature.args[2:end])
+        signature = signature.args[1]
+    end
+    signature isa Expr && signature.head === :(::) && length(signature.args) == 2 &&
+        (signature = signature.args[1])
+    signature isa Expr && signature.head === :call && !isempty(signature.args) ||
+        throw(ArgumentError("@traceable expects a method definition, $usage; got `$(def)`."))
+    callee = signature.args[1]
+    callee isa Symbol || (callee isa Expr && callee.head === :.) || throw(ArgumentError(
+        "@traceable defines a method of a named function; got the callee `$(callee)`."))
+    if callee isa Symbol && isdefined(mod, callee) && getglobal(mod, callee) isa Function
+        owner = parentmodule(getglobal(mod, callee))
+        Base.moduleroot(owner) in (Base, Core, @__MODULE__) && throw(ArgumentError(
+            "@traceable cannot add a method to `$(callee)`, which $(owner) owns; " *
+            "define a helper function of your own."))
+    end
+    formals = signature.args[2:end]
+    any(arg -> arg isa Expr && arg.head === :parameters, formals) && throw(ArgumentError(
+        "@traceable does not support keyword arguments in `$(signature)`; " *
+        "pass them positionally."))
+    names = Set{Symbol}()
+    for formal in formals
+        formal isa Expr && formal.head === :kw && (formal = formal.args[1])
+        formal isa Expr && formal.head === :... && (formal = formal.args[1])
+        _lhs_symbols!(names, formal)
+    end
+    for layer in wheres, parameter in layer
+        parameter isa Expr && parameter.head in (:<:, :>:) && (parameter = parameter.args[1])
+        parameter isa Symbol && push!(names, parameter)
+    end
+    rewritten = _kernel_tensorized_rhs(_traceable_tail_body(body, signature),
+                                       names, mod, copy(names))
+    companion = Expr(:call, GlobalRef(@__MODULE__, :traced),
+                     Expr(:(::), Expr(:call, GlobalRef(Core, :typeof), callee)),
+                     formals...)
+    for layer in reverse(wheres)
+        companion = Expr(:where, companion, layer...)
+    end
+    esc(Expr(:block, def, Expr(:(=), companion, rewritten), callee))
+end
+
+# The body with its tail-position `return`s replaced by their values: the
+# rewrite turns a branch into thunks, where `return` would leave the thunk
+# rather than the method.  Any other `return` is rejected.
+function _traceable_tail_body(ex, signature)
+    if ex isa Expr && ex.head === :return
+        return _traceable_no_return(isempty(ex.args) ? nothing : only(ex.args), signature)
+    elseif ex isa Expr && ex.head === :block
+        position = findlast(arg -> !(arg isa LineNumberNode), ex.args)
+        position === nothing && return ex
+        args = Any[i == position ? _traceable_tail_body(arg, signature) :
+                   _traceable_no_return(arg, signature)
+                   for (i, arg) in enumerate(ex.args)]
+        return Expr(:block, args...)
+    elseif ex isa Expr && ex.head in (:if, :elseif)
+        return Expr(ex.head, _traceable_no_return(ex.args[1], signature),
+            (_traceable_tail_body(arg, signature) for arg in ex.args[2:end])...)
+    end
+    _traceable_no_return(ex, signature)
+end
+
+function _traceable_no_return(ex, signature)
+    ex isa Expr || return ex
+    ex.head in (:->, :function, :quote, :inert) && return ex
+    ex.head === :return && throw(ArgumentError(
+        "@traceable does not support a `return` before the end of `$(signature)`; " *
+        "write the branch as an expression (`condition ? a : b`)."))
+    foreach(arg -> _traceable_no_return(arg, signature), ex.args)
+    ex
+end
+
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                            tensorize::Bool = true,
                            mod::Union{Module,Nothing} = nothing,
@@ -2563,7 +2727,8 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
             return generated_spec === nothing ? callee : generated_spec
         end
         if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
-           (!tensorize || _tensorized_callee_replacement(callee) === nothing) &&
+           (!tensorize || (_tensorized_callee_replacement(callee) === nothing &&
+                           !_kernel_callee_has_traced_method(callee, mod))) &&
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
             return callee                                   # BARE exact identity — stays raw (validated)
