@@ -523,7 +523,13 @@ mutable struct Graph
     producers::Dict{Int,Vector{Int}} # canonical value id => indices into `recipes`
     aliases::Dict{Int,Int}           # value id => structurally-equal canonical id
     version::Int
+    # The value-independent work of this graph's bound preparations, reused by
+    # `prepare(…; bound)` (`_graph_preparations`, graphops.jl); `nothing` until
+    # the first one. Not part of the graph's meaning.
+    preparations::Any
 end
+Graph(values, recipes, producers, aliases, version) =
+    Graph(values, recipes, producers, aliases, version, nothing)
 Graph() = Graph(Dict{Int,Value}(), Recipe[], Dict{Int,Vector{Int}}(),
                 Dict{Int,Int}(), 0)
 

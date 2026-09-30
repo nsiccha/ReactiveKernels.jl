@@ -104,6 +104,15 @@ using ReactiveKernels, Test
             @test C.Nested.BATCH(args...) == expected[2]
             @test ImportedPreparedConsumer.BATCH(args...) == reverse(expected)
 
+            # The image carries the graph's bound preparation from `BOUND`:
+            # binding new data after load reuses its compiled residual.
+            rebound = prepare(C.trajectory; have = C.HAVE, want = C.WANT,
+                              bound = (dose_mgs = [5.0, 6.0],))
+            @test rebound.f === C.BOUND.f
+            @test rebound(positions[:, 1], 0.0, schedule) == ([5.5, 7.0], 12.5)
+            @test C.BOUND(positions[:, 1], 0.0, schedule) ==
+                (expected[1][:, 1], expected[2][1])
+
             # The cache belongs to the image being produced, even for an
             # imported graph or a preparation performed inside a submodule.
             owner(f) = parentmodule(typeof(

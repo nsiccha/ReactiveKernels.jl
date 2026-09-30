@@ -281,6 +281,118 @@ end
     @test hoisted.value === nothing
 end
 
+module PlainBoundFixture
+using ReactiveKernels
+const calls = Ref(0)
+basis(data) = (calls[] += 1; data .^ 2)
+@kernel spec(samples, data, q) = begin
+    b = basis(data)
+    w = q .* 2
+    values = plate(samples, Ref(b), Ref(w)) do x, shared_b, shared_w
+        x * sum(shared_b) + sum(shared_w)
+    end
+    return values
+end
+end
+
+# Plain `prepare(…; bound)` reuses the value-independent work of earlier
+# bindings through a cache the graph holds; no caller-owned cache is needed
+# (snag plain-prepare-wi-4cd01ccf).
+@testset "plain bound preparation reuses the graph's earlier bindings" begin
+    B = PlainBoundFixture
+    data, q = [2., 3.], [.5, -.2]
+    samples = collect(1.:5)
+    expected(data) = samples .* sum(data .^ 2) .+ sum(q .* 2)
+    fresh(bound) = prepare(plan(B.spec);
+        bound = ReactiveKernels._kernel_bound_pairs(B.spec, bound))
+    B.calls[] = 0
+    k1 = prepare(B.spec; bound = (; data))
+    k2 = prepare(B.spec; bound = (; data = 2data))
+    @test B.calls[] == 2
+    @test k2.f === k1.f
+    @test typeof(k2) === typeof(k1)
+    @test k1(samples, q) == fresh((; data))(samples, q) == expected(data)
+    @test k2(samples, q) == fresh((; data = 2data))(samples, q) == expected(2data)
+    @test k1(samples, q) == expected(data)
+    @test length(B.spec.graph.preparations.cache) == 1
+
+    # Another boundary of the same graph is its own entry; a residual that
+    # reads no bound value is one kernel for every binding.
+    w1 = prepare(B.spec; want = :w, bound = (; data))
+    @test w1 === prepare(B.spec; want = :w, bound = (; data = 2data))
+    @test w1(samples, q) == q .* 2
+    @test length(B.spec.graph.preparations.cache) == 2
+
+    # A spliced prepared child and a lazy arm over differently typed bindings.
+    F = CachedBoundFixture
+    nested = [prepare(F.nested; bound = (; data = d)) for d in ([1.0, 2.0], [3.0, 4.0])]
+    @test nested[2].f === nested[1].f
+    @test nested[2]([2.0, 0.5]) == 9.0 * 2.0 + 16.0 * 0.5
+    P = CachedBoundPlanFixture
+    for plan_data in (P.LatticePlan([1, 3, 4]), P.ExactPlan([1 2; 3 4]), P.LatticePlan(Int[]))
+        amounts = fill(0.5, P.count_of(plan_data))
+        @test prepare(P.dosing; bound = (; plan = plan_data))(amounts) ==
+            sum(P.offsets(plan_data) .* amounts; init = 0.0)
+    end
+
+    # A value-dependent residual still specializes per binding.
+    x = [1.0, 2.0, 3.0, 4.0]
+    for mask in ([1.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0])
+        @test prepare(F.masked; bound = (; mask))(x) ==
+            [m > 0 ? 2xi : -xi for (xi, m) in zip(x, mask)]
+    end
+
+    # The graph form; a mutation of the graph starts afresh.
+    g = Graph()
+    xv = value!(g, :x, Float64)
+    d = value!(g, :d, Vector{Float64})
+    s = value!(g, :s, Float64)
+    r = value!(g, :r, Float64)
+    add!(g; inputs = (d,), outputs = (s,), op = sum)
+    add!(g; inputs = (xv, s), outputs = (r,), op = *)
+    gk1 = prepare(g; have = (xv, d), want = (r,), bound = (d => [1.0, 2.0],))
+    gk2 = prepare(g; have = (xv, d), want = (r,), bound = (d => [5.0, 5.0],))
+    @test gk1(2.0) == 6.0 && gk2(2.0) == 20.0
+    @test gk2.f === gk1.f
+    old = g.preparations
+    r2 = value!(g, :r2, Float64)
+    add!(g; inputs = (r,), outputs = (r2,), op = -)
+    @test prepare(g; have = (xv, d), want = (r2,), bound = (d => [1.0, 1.0],))(3.0) == -6.0
+    @test g.preparations !== old && g.preparations.version == g.version
+    @test length(g.preparations.cache) == 1
+
+    # A pass that is not a singleton (a closure) is not retained.
+    h = Graph()
+    hx = value!(h, :x, Float64)
+    hd = value!(h, :d, Vector{Float64})
+    hs = value!(h, :s, Float64)
+    hr = value!(h, :r, Float64)
+    add!(h; inputs = (hd,), outputs = (hs,), op = sum)
+    add!(h; inputs = (hx, hs), outputs = (hr,), op = *)
+    offset = Ref(0)
+    closure_pass = ast -> (offset[] += 1; ast)
+    @test prepare(h; have = (hx, hd), want = (hr,), passes = (closure_pass,),
+                  bound = (hd => [1.0, 2.0],))(2.0) == 6.0
+    @test offset[] == 1
+    @test h.preparations === nothing
+    # An empty binding is the ordinary unbound preparation.
+    @test prepare(h; have = (hx, hs), want = (hr,), bound = ())(2.0, 3.0) == 6.0
+    @test h.preparations === nothing
+
+    # Rebinding through the graph keeps no binding's data either.
+    function plain_first_binding_hoisted()
+        kernel = prepare(FirstRebindingFixture.fresh; have = (:data, :q),
+                         want = :scaled, bound = (; data = [6.0, 7.0]))
+        constant = only(op for op in kernel.ops if op isa ReactiveKernels._BoundConstant)
+        WeakRef(constant.value)
+    end
+    hoisted = plain_first_binding_hoisted()
+    @test prepare(FirstRebindingFixture.fresh; have = (:data, :q), want = :scaled,
+                  bound = (; data = [1.0, 2.0]))([0.0, 0.0]) == [2.0, 8.0]
+    GC.gc(); GC.gc()
+    @test hoisted.value === nothing
+end
+
 @testset "cached bound preparation specializes a value-dependent residual per binding" begin
     F = CachedBoundFixture
     cache = PreparationCache()

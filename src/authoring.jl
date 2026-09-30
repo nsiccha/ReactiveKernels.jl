@@ -3122,13 +3122,20 @@ reachable from only those ports executes once here, and the returned kernel is
 positional over the remaining HAVE ports in their selected order. The authored
 signature convenience layer (positional defaults and keywords) applies only to
 unbound default-boundary preparations.
+
+A repeated bound preparation of the same kernel, boundary and bound port set
+reuses the plan and compiled code of earlier bindings and runs only the
+data-only subgraph on the new values (see `prepare` on a `Graph`), so binding
+per request needs no caller-held cache; [`prepare!`](@ref) with a
+[`PreparationCache`](@ref) gives that reuse an explicit lifetime.
 """
 function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
                  bound = NamedTuple())
-    isempty(bound) || return prepare(plan(spec; have = have, want = want);
-                                     passes = passes,
-                                     bound = _kernel_bound_pairs(spec, bound))
+    isempty(bound) || return prepare(spec.graph;
+        have = _kernel_selection(spec, have, spec.have_names, :have),
+        want = _kernel_selection(spec, want, spec.want_names, :want),
+        passes = passes, bound = _kernel_bound_pairs(spec, bound))
     prepared = prepare(plan(spec; have = have, want = want); passes = passes)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)

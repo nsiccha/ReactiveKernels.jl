@@ -52,6 +52,11 @@ retains none of them. Rebinding is not specialized on the graph's kernel
 types, so a graph's first rebinding in a process compiles nothing once any
 graph has rebound. Lookups and first-time preparations hold the cache's lock,
 so one cache may serve concurrent tasks.
+
+Plain `prepare(g; …, bound)` and `prepare(spec; …, bound)` reuse the same
+bound entries through a cache the graph itself holds (see
+[`prepare`](@ref)); a caller-owned cache gives those entries an explicit
+lifetime instead, independent of the graph's.
 """
 struct PreparationCache
     kernels::Dict{Any,PreparedKernel}
@@ -64,6 +69,7 @@ PreparationCache() = PreparationCache(Dict{Any,PreparedKernel}(),
 Base.length(c::PreparationCache) = length(c.kernels) + length(c.bound)
 
 _sig(g::Graph, vs) = Tuple(canon_id(g, v.id) for v in _astuple(vs))
+_pass_key(pass) = Base.issingletontype(typeof(pass)) ? typeof(pass) : objectid(pass)
 
 """
     prepare!(cache, g; have, want, passes=(), bound=()) -> PreparedKernel
@@ -83,7 +89,8 @@ it reuses the plan and prefix only.
 """
 function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
                   passes = (), bound = ())
-    bound === () || return _prepare_bound!(cache, g, have, want, passes, bound)
+    bound === () || return _prepare_bound!(cache, g, have, want, passes, bound,
+                                           objectid(g))
     key = (objectid(g), g.version, _sig(g, have), _sig(g, want),
            Tuple(objectid(p) for p in passes))
     lock(cache.lock) do
@@ -93,12 +100,52 @@ function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
     end
 end
 
+# The bound preparations plain `prepare(g; bound)` reuses. The graph holds them,
+# so they live exactly as long as it does, and a mutation (a new version)
+# starts afresh rather than keeping entries no lookup can reach. Their keys
+# leave out the graph's identity, which is implicit, and name each (singleton)
+# pass by its type: neither `objectid` survives serialization, and a graph
+# bound while a package image is produced keeps these entries in the image.
+struct _GraphPreparations
+    version::Int
+    cache::PreparationCache
+end
+
+const _GRAPH_PREPARATIONS_LOCK = ReentrantLock()
+
+function _graph_preparations(g::Graph)
+    lock(_GRAPH_PREPARATIONS_LOCK) do
+        memo = g.preparations
+        memo isa _GraphPreparations && memo.version == g.version && return memo.cache
+        cache = PreparationCache()
+        g.preparations = _GraphPreparations(g.version, cache)
+        cache
+    end
+end
+
+# Whether plain `prepare(g; bound, passes)` goes through the graph's cache: a
+# non-empty binding whose passes keep one identity across calls. A pass built
+# afresh per call (a closure over request data) would key a new entry on every
+# call, so such a preparation is not retained.
+function _reuses_bound_preparation(@nospecialize(bound), @nospecialize(passes))
+    bound === () && return false
+    all(pass -> Base.issingletontype(typeof(pass)), passes) || return false
+    !isempty(first(_partial_bound_pairs(bound)))
+end
+
+_graph_bound_preparation(g::Graph, @nospecialize(have), @nospecialize(want),
+                         @nospecialize(passes), @nospecialize(bound)) =
+    _prepare_bound!(_graph_preparations(g), g, have, want, passes, bound, nothing)
+
+# `graph_key` names the graph in a caller-owned cache (its `objectid`), and is
+# `nothing` in the graph's own cache.
 function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
-                         @nospecialize(want), @nospecialize(passes), @nospecialize(bound))
+                         @nospecialize(want), @nospecialize(passes), @nospecialize(bound),
+                         graph_key)
     ports, data = _partial_bound_pairs(bound)
     isempty(ports) && return prepare!(cache, g; have = have, want = want, passes = passes)
-    key = (:bound, objectid(g), g.version, _sig(g, have), _sig(g, want),
-           _sig(g, ports), Tuple(objectid(p) for p in passes))
+    key = (:bound, graph_key, g.version, _sig(g, have), _sig(g, want),
+           _sig(g, ports), Tuple(_pass_key(p) for p in passes))
     entry = lock(cache.lock) do
         get!(cache.bound, key) do
             _bound_entry(plan(g; have = have, want = want), ports)
