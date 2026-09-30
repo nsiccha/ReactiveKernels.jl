@@ -137,11 +137,16 @@ code):
   rules generated from their pure-math graphs (the rule constraint above),
   which makes them primitives for Enzyme, so the failing body is never
   differentiated.
-- Reactant 0.2.284 fails to finish MLIR greedy rewriting for a retained
-  pure-copy loop returning structured position leaves and a repeated shared
-  array. The lifted HAVE/WANT passthrough exceeded a 480-second execution
-  budget; its unchanged complete-callable emitter and the Reactant-only
-  `repro_reactant_passthrough_loop.jl` each exceeded a 90-second budget in the
-  same optimizer. The named structured-passthrough compiler acceptance case
-  is skipped on that version. Native passthrough remains supported; the
-  compiler's loop and scalar semantics are retained.
+- Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
+  never finish on a reshape that inserts a unit dimension ahead of a dropped
+  one: each creates a constant for the inserted dimension, fails a later
+  check, and leaves MLIR's greedy rewriting without a fixed point.
+  `repro_reactant_reshape_slice_rewrite.jl` runs each pattern alone on at most
+  four operations, and `repro_reactant_passthrough_loop.jl` reaches the first
+  through the default pipeline; both hold on Reactant 0.2.284 and 0.2.289. A
+  slice along a trailing axis at a traced index, copied into an output buffer,
+  produces that reshape. Slot columns therefore slice and update in storage
+  layout, where the slot axis leads and both patterns fail before creating
+  anything: the retained position loop, a recipe-free structured passthrough
+  and an embedded plate under `prepare_batched` compile with the default
+  optimizer. The loop and the scalar semantics are retained.
