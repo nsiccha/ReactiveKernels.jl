@@ -134,10 +134,28 @@ end
 # differentiate through the dynamic call (snag `joint-decl-memo-9642bb45`).
 # A direct N-argument call infers on every version — the same remedy as
 # `_prepared_call` (codegen.jl) for the 1.12 RGF splat-allocation cliff.
+#
+# The native call is CALLSITE-INLINED (`Base.@inline op.f(...)`, spelled out as
+# the expression that macro expands to, so the generated body carries no
+# macrocall). Julia's inlining heuristic refuses a closure whose body carries a
+# loop — a plate cell such as `sum(f(i) for i in slots)` — so without the
+# annotation the cell stayed a real function call on every plate coordinate,
+# and the loop's invariants (`plan.shifts`, `eachindex`) were recomputed per
+# cell. Measured on a 16321-observation, 3-dose superposition plate (Julia
+# 1.10.11, x86-64): 70 µs per read as a plain call, 37 µs inlined — the same
+# time as the cell body written inline in a hand loop — with allocation and
+# values unchanged (snag `generator-plate-e160f4c2`). For a closure the
+# heuristic already inlines the annotation changes nothing; the tensorized
+# twin traces and needs none. Julia 1.12 inlines this closure on its own.
 @inline @generated function _kernel_source_call(::Val{:native},
         op::_KernelSourceOp, args::Vararg{Any,N}) where {N}
     forwarded = [:(getfield(args, $index)) for index in 1:N]
-    :(op.f($(forwarded...)))
+    value = gensym(:value)
+    Expr(:block,
+         Expr(:inline, true),
+         Expr(:local, Expr(:(=), value, :(op.f($(forwarded...))))),
+         Expr(:inline, false),
+         value)
 end
 @inline @generated function _kernel_source_call(::Val{:tensorized},
         op::_KernelSourceOp, args::Vararg{Any,N}) where {N}

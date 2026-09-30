@@ -1857,6 +1857,7 @@ precompilation, the package being compiled owns the generated expression cache.
 Global names in the lowered body still resolve in `ReactiveKernels`.
 """
 function compile(ast::Expr)
+    ast = _canonical_locals(ast)
     cache_module = _generated_function_cache_module()
     cache_module === (@__MODULE__) &&
         return RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, ast)
@@ -1867,7 +1868,8 @@ function compile(ast::Expr)
     # scopes, rather than guessing which symbols in the body are free names.
     qualified = macroexpand(@__MODULE__, Expr(:macrocall,
         GlobalRef(@__MODULE__, Symbol("@_native_context")), LineNumberNode(0), ast))
-    qualified = _native_parameter_names(ast, qualified)
+    # Hygiene renames every local through the global `gensym` counter again.
+    qualified = _canonical_locals(_native_parameter_names(ast, qualified))
     f = Base.invokelatest(RuntimeGeneratedFunction, cache_module, cache_module, qualified)
     # Only functions prepared before the new context method becomes visible
     # need this barrier, e.g. a builder that immediately warms its first kernel.
@@ -1877,6 +1879,40 @@ end
 
 macro _native_context(ast)
     ast
+end
+
+# Lowering mints its scratch locals with `gensym` (plate axes and indices, scan
+# carries, the renamed locals of a spliced embedded kernel), and `gensym` draws
+# on a process-global counter: two lowerings of one unchanged plan differ in
+# exactly those names. `RuntimeGeneratedFunctions` keys its body cache on a
+# content hash of the expression and carries that hash in the callable's TYPE,
+# so every fresh lowering would otherwise mint a new `RuntimeGeneratedFunction`
+# type — and with it a new `PreparedKernel`/`_EmbeddedFunctionPair` constructor
+# specialization at `prepare` time plus a new `generated_callfunc` expansion at
+# the first call — on EVERY `prepare` of an unchanged graph (snag
+# `prepare-with-bou-2b4faf57`: ~15–60 ms of compilation per request-time
+# `prepare(...; bound = ...)` of a graph embedding a prepared plate child).
+# Alpha-rename the gensym'd locals in first-occurrence order before the body
+# reaches the cache: identical lowerings then produce byte-identical bodies,
+# one callable type, and one compilation per graph shape. Distinct originals
+# map to distinct names (the map is a bijection on the symbols it touches), so
+# hygiene is preserved; quoted data and every non-`#` symbol are untouched.
+_lowering_gensym(s::Symbol) = (str = String(s); !isempty(str) && str[1] == '#')
+
+function _canonical_locals(ast::Expr)
+    names = Dict{Symbol,Symbol}()
+    function canonical(s::Symbol)
+        get!(names, s) do
+            Symbol(replace(String(s), r"#\d+" => ""), '#', length(names) + 1)
+        end
+    end
+    function walk(node)
+        node isa Symbol && return _lowering_gensym(node) ? canonical(node) : node
+        node isa Expr || return node
+        node.head === :quote && return node
+        Expr(node.head, map(walk, node.args)...)
+    end
+    walk(ast)
 end
 
 # Preserve the lowered argument names used by operation-table inspection.
@@ -2068,6 +2104,17 @@ struct PreparedKernel{F,O,IN,OUT,RR}
     ast::Expr
     lowered_recipes::RR
 end
+
+# A prepared kernel is statically untraced. `Recipe.cse_key` provenance tuples
+# carry output `Type`s as data (authoring.jl `_kernel_provenance_key`), and
+# ReactantCore's `::Type` `is_traced` early-out covers only the 1-arg call
+# while the structural recursion is 2-arg, so walking a kernel reaches type
+# internals and throws `type DataType has no field var` (upstream ReactantCore
+# gap). Kernels are immutable compile-time metadata built before tracing and
+# never contain tracers; `@trace` still takes the traced path when a loop's
+# DATA operands are traced.
+ReactantCore.is_traced(::PreparedKernel) = false
+ReactantCore.is_traced(::PreparedKernel, ::Base.IdSet) = false
 
 # Partial evaluation deliberately stores hoisted values in the prepared
 # operation tuple so the public residual kernel has only its unbound HAVE
@@ -2349,6 +2396,11 @@ end
 inputs(k::ReplicatedKernel) = k.inputs
 outputs(k::ReplicatedKernel) = k.outputs
 code_expr(k::ReplicatedKernel) = code_expr(k.target)
+
+# Same statically-untraced contract as `PreparedKernel` above: the whole
+# object is captured by the `@trace` loop in `_replica_call`.
+ReactantCore.is_traced(::ReplicatedKernel) = false
+ReactantCore.is_traced(::ReplicatedKernel, ::Base.IdSet) = false
 
 function Base.show(io::IO, k::ReplicatedKernel{B}) where {B}
     names = Tuple(k.inputs[i].name for i in B)
