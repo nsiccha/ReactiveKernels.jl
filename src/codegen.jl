@@ -1090,6 +1090,40 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
     body
 end
 
+# A recipe output authored with a type (`weights::Vector{Float64} = ...`) is
+# emitted as a typed local of the NATIVE product: Julia converts the assigned
+# value to the declared type (an identity for a value already of that type, a
+# loud error for an inconvertible one) and, decisively, keeps the value's type
+# known to inference for every consumer. Without it a nested prepared kernel
+# called from inside a recipe -- a prepared scan child in a lazy arm, a prepared
+# plate child -- re-enters the same generic RK call operators that are already
+# on the inference stack (`_KernelSourceOp`, `_kernel_source_call`,
+# `_prepared_call`, RGF `generated_callfunc`); Julia's recursion heuristic then
+# widens the re-entered signatures and the child's result reaches the parent as
+# an abstract type (`Vector`, `Any`) even though the child alone infers exactly.
+# Every consumer of that value dispatches dynamically -- inside an embedded plate
+# loop once per cell, boxing the coordinate and the result (measured on the
+# ShinyRK simulation graph: 2.4x the read time and 3x the bytes of the children's
+# sum; snag `embedded-prepare-612e5944`). The declaration restores the authored
+# contract at the assignment. Only a product that is host-only by construction
+# may declare: the tensorized product binds traced arrays to the same names, and
+# a PLAIN prepared kernel (no plate, scan or embedded pair, hence no tensorized
+# product) has its native body traced by Reactant directly, where a host-typed
+# local would `convert` a traced array. So `_lower_with_ops` declares only in
+# the native body of a kernel that `prepare` builds as a native/tensorized pair
+# (`_needs_embedded_tensorization`), and `lower_batched` in its native loop.
+# A bound constant (`_BoundConstant`) is exempt: inference already knows its
+# exact value type, and a declaration would only convert a deliberately bound
+# view or range into an owning copy. `Any` declares nothing.
+function _declare_typed_output!(body::Expr, value::Value, name, declared::Set{Symbol})
+    name isa Symbol || return
+    name in declared && return
+    T = valtype(value)
+    T === Any && return
+    push!(declared, name)
+    push!(body.args, Expr(:local, Expr(:(::), name, T)))
+end
+
 function _lower_with_ops(p::Plan; tensorized::Bool = false,
                          inline_embedded::Bool = true)
     g = p.graph
@@ -1104,6 +1138,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     runtime_recipes = Recipe[]
     skipped_recipes = Set{Int}()
     pending_scans = Dict{Int,Any}()
+    declared = Set{Symbol}()
+    declare_types = !tensorized && inline_embedded && _needs_embedded_tensorization(p)
     # HAVE is authoritative, and the first selected producer of any other
     # logical value owns its binding. Later recipes may emit that value as a
     # collateral multi-output; execute the recipe but discard the duplicate so
@@ -1129,6 +1165,12 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             if sum_recipe !== nothing
                 push!(assigned, canon_id(g, only(sum_recipe.outputs).id))
                 push!(skipped_recipes, sum_recipe.id)
+            end
+            if declare_types
+                pointwise_lhs === nothing ||
+                    _declare_typed_output!(body, pointwise, pointwise_lhs, declared)
+                total_lhs === nothing || _declare_typed_output!(
+                    body, only(sum_recipe.outputs), total_lhs, declared)
             end
             if !tensorized && haskey(pending_scans, r.id)
                 scan_recipe, scan_args, scan_offset = pending_scans[r.id]
@@ -1162,6 +1204,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             else
                 push!(assigned, cid)
                 push!(lhsnames, nm(output))
+                declare_types && !(r.op isa _BoundConstant) &&
+                    _declare_typed_output!(body, output, nm(output), declared)
             end
         end
         lhs = length(lhsnames) == 1 ? only(lhsnames) : Expr(:tuple, lhsnames...)
@@ -1485,6 +1529,15 @@ function lower_replicated(p::Plan; batched, reuse = false)
         push!(argexprs, nm(v))
     end
     body = Expr(:block)
+    # Declared recipe-output types hold at function scope, so the first-position
+    # block and the position loop both assign the same typed local.
+    let declared = Set{Symbol}(), have_ids = Set(canon_id(g, v.id) for v in p.have)
+        for recipe in p.recipes, output in recipe.outputs
+            canon_id(g, output.id) in have_ids && continue
+            recipe.op isa _BoundConstant && continue
+            _declare_typed_output!(body, output, nm(output), declared)
+        end
+    end
     runtime_args = Expr(:tuple, (nm(v) for v in p.have)...)
     push!(body.args, :(replica_count = _replicated_validate_axes(
         $runtime_args, Val($(analysis.positions)),
@@ -1656,12 +1709,14 @@ function lower_batched(p::Plan; batched, reduce = :+)
              combined_axes)))
 
     assigned = Set(canon_id(g, v.id) for v in p.have)
+    declared = Set{Symbol}()
     for (k, r) in enumerate(p.recipes)
         isempty(analysis.recipe_dependencies[k]) || continue
         out = only(r.outputs)
         cid = canon_id(g, out.id)
         cid in assigned && continue
         push!(assigned, cid)
+        r.op isa _BoundConstant || _declare_typed_output!(body, out, nm(out), declared)
         push!(body.args, Expr(:(=), nm(out), callexpr(k, r)))
     end
 

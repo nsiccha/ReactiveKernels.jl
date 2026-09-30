@@ -149,7 +149,7 @@ end
 const prepared_weights = ReactiveKernels.prepare(nonempty_weights)
 
 ReactiveKernels.@kernel maybe_weights(rows::Matrix{Float64}, slots::Vector{Int}, n::Int) = begin
-    weights = if n == 0
+    weights::Vector{Float64} = if n == 0
         Float64[]
     else
         prepared_weights(rows, slots)
@@ -162,7 +162,13 @@ The empty arm never runs the recurrence. For a traced nonempty row sequence,
 Reactant retains one `stablehlo.while`; the same graph can be prepared and run
 with ordinary Julia values. Pass every per-call input to the prepared kernel
 explicitly. This is an ordinary callable boundary, not transparent graph
-splicing across the branch. Writing `scan(...) do … end` directly inside the
+splicing across the branch. Declare the arm's result type, as above: a prepared
+child called inside a recipe re-enters the generic call operators the enclosing
+kernel is already being inferred through, so Julia widens the nested call and,
+without the declaration, every consumer of `weights` in a kernel that also owns
+a plate, a scan or an embedded prepared kernel dispatches dynamically — inside
+an embedded plate loop, once per cell. The declaration becomes a typed local of
+that kernel's native body and keeps the value concretely typed. Writing `scan(...) do … end` directly inside the
 branch arm is unsupported: `scan` sugar is recognized only when it is a
 recipe's top-level right-hand side. The branch-local form reaches the runtime
 placeholder instead. Scan recognition also requires the actual
