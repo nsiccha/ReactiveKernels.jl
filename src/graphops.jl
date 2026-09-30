@@ -47,9 +47,11 @@ hoisted constant stays a per-call branch and follows each binding's value.
 Only a residual containing authored plates is templated per bound-value type
 and shape signature, because that decides whether its plates specialize. The
 cache is caller-owned and grows with the distinct boundaries (and those
-shapes) prepared through it; it never observes the bound values afterwards.
-Lookups and first-time preparations hold the cache's lock, so one cache may
-serve concurrent tasks.
+shapes) prepared through it; it never observes the bound values afterwards and
+retains none of them. Rebinding is not specialized on the graph's kernel
+types, so a graph's first rebinding in a process compiles nothing once any
+graph has rebound. Lookups and first-time preparations hold the cache's lock,
+so one cache may serve concurrent tasks.
 """
 struct PreparationCache
     kernels::Dict{Any,PreparedKernel}
@@ -91,7 +93,8 @@ function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
     end
 end
 
-function _prepare_bound!(cache::PreparationCache, g::Graph, have, want, passes, bound)
+function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
+                         @nospecialize(want), @nospecialize(passes), @nospecialize(bound))
     ports, data = _partial_bound_pairs(bound)
     isempty(ports) && return prepare!(cache, g; have = have, want = want, passes = passes)
     key = (:bound, objectid(g), g.version, _sig(g, have), _sig(g, want),
@@ -112,7 +115,5 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, have, want, passes, 
             template
         end
     end
-    fresh === nothing || return fresh
-    template === nothing && return _bound_specialize(entry, hoisted, passes)
-    _bound_rebind(entry, template, hoisted)
+    fresh === nothing ? _bound_rebind(entry, template, hoisted, passes) : fresh
 end

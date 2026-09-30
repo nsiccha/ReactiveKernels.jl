@@ -238,8 +238,18 @@ data — bound-only cell recipes evaluated at preparation, data-bound branch
 partitions — is still specialized and compiled per binding and reuses only
 the plan and prefix; a residual containing authored plates is templated per
 bound-value type and array-shape signature, because those decide whether the
-pass rewrites it. The cache never observes bound values after preparation, so
-binding freshness remains the caller's responsibility as for `prepare`.
+pass rewrites it. The cache never observes bound values after preparation and
+keeps none of them: a template holds the compiled callable and the
+value-independent tail of the operation table, not the kernel of the binding it
+was built from. Binding freshness remains the caller's responsibility as for
+`prepare`.
+
+Rebinding itself is not specialized on the graph's kernel types. Its code is
+compiled once per process for every graph, so the first rebinding of a graph
+costs what any later one does. (Before, the first rebinding of each graph in a
+process compiled the rebinding path for that graph's prefix and residual kernel
+types: 290 ms and 40 MB for the ShinyRK simulation graph, whose steady-state
+rebinding costs about 1 ms.)
 
 #### Data-bound branches in plate cells
 

@@ -225,6 +225,62 @@ end
     @test length(cache) == 1
 end
 
+module FirstRebindingFixture
+using ReactiveKernels
+square(data) = data .^ 2
+@kernel warm(data, q) = begin
+    b = square(data)
+    total = sum(b .* q)
+    return total
+end
+@kernel fresh(data, q) = begin
+    b = square(data)
+    scaled = 2 .* b
+    total = sum(scaled .* q)
+    return total
+end
+end
+
+# Rebinding code is not specialized per kernel type, so once any graph has
+# rebound in a process, the first rebinding of another graph compiles nothing
+# (snag plain-prepare-wi-4cd01ccf: 290 ms and 40 MB once per process for the
+# ShinyRK simulation graph). The cache keeps no binding's data.
+@testset "cached rebinding compiles nothing and retains no bound data" begin
+    F = FirstRebindingFixture
+    cache = PreparationCache()
+    q = [1.0, 2.0, 3.0]
+    for data in ([1.0, 2.0, 3.0], [3.0, 2.0, 1.0])
+        @test prepare!(cache, F.warm; bound = (; data))(q) == sum(data .^ 2 .* q)
+    end
+    k1 = prepare!(cache, F.fresh; bound = (; data = [1.0, 2.0, 3.0]))
+    @test k1(q) == 72.0
+    data2 = [2.0, 0.0, 1.0]
+    Base.cumulative_compile_timing(true)
+    before = first(Base.cumulative_compile_time_ns())
+    k2 = prepare!(cache, F.fresh; bound = (; data = data2))
+    compile_ns = first(Base.cumulative_compile_time_ns()) - before
+    Base.cumulative_compile_timing(false)
+    @test compile_ns == 0
+    @test k2.f === k1.f
+    @test k2(q) == 14.0
+    @test k1(q) == 72.0
+
+    # Neither a template nor an entry keeps the values of the binding it was
+    # built from: a dropped kernel's hoisted data is collectable while the
+    # cache lives on.
+    function first_binding_hoisted(cache)
+        kernel = prepare!(cache, F.fresh; have = (:data, :q), want = :scaled,
+                          bound = (; data = [4.0, 5.0]))
+        constant = only(op for op in kernel.ops if op isa ReactiveKernels._BoundConstant)
+        WeakRef(constant.value)
+    end
+    hoisted = first_binding_hoisted(cache)
+    @test prepare!(cache, F.fresh; have = (:data, :q), want = :scaled,
+                   bound = (; data = [1.0, 1.0]))(q) == [2.0, 2.0]
+    GC.gc(); GC.gc()
+    @test hoisted.value === nothing
+end
+
 @testset "cached bound preparation specializes a value-dependent residual per binding" begin
     F = CachedBoundFixture
     cache = PreparationCache()
