@@ -140,6 +140,20 @@ function Reactant.make_tracer(
     previous
 end
 
+# An untraced value a retained generator loop reads (a host schedule plan): it
+# crosses the loop boundary unchanged, so no struct is rebuilt with traced
+# fields (`ReactiveKernels._loop_capture`).
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._LoopHostValue, path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels._LoopHostValue}
+    T
+end
+
 function Reactant.traced_type_inner(
         ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
         ndevices, runtime) where {T<:_TransitionLoopStep}
@@ -1331,6 +1345,11 @@ ReactiveKernels._tensorized_scan_lowering(
 _fresh_tracers(x) = x
 _fresh_tracers(x::Union{Tuple,NamedTuple}) = map(_fresh_tracers, x)
 _fresh_tracers(x::Union{Reactant.TracedRArray,Reactant.TracedRNumber}) = copy(x)
+# A traced value an authored recipe loop reads (`ReactiveKernels._loop_capture`);
+# any other traced wrapper passes through, as in `_fresh_tracers`.
+ReactiveKernels._loop_capture_traced(
+        x::Union{Tuple,NamedTuple,Reactant.TracedRArray,Reactant.TracedRNumber}) =
+    _fresh_tracers(x)
 
 function ReactiveKernels._tensorized_scan_lowering(
         marker::Reactant.TracedType, step, init, iterated::Tuple,
@@ -1394,6 +1413,28 @@ ReactiveKernels._sm_restore_source_logical_wrappers(
 _recurrence_trace(x::T) where {T<:Number} =
     copy(Reactant.promote_to(Reactant.TracedRNumber{T}, x))
 _recurrence_trace(x::Reactant.TracedRNumber) = _fresh_tracers(x)
+
+# A retained authored loop's carry (`ReactiveKernels._loop_seed`): a host
+# scalar or dense numeric `Array` becomes a traced value of the same element
+# type, a traced value a fresh tracer (`_fresh_tracers`: the loop's in-place
+# carry update never reaches another binding of the same tracer), and tuples
+# recurse.  Every other value — a `Diagonal` metric, a Cholesky or triangular
+# wrapper, a struct — keeps its exact type: the carry's type is part of the
+# compiled contract of the code around the loop, and `_recurrence_trace`'s
+# wrapper-to-backing-array normalization belongs to the ext's own loops, which
+# restore the wrappers.
+const _LoopSeedScalar = Union{Base.IEEEFloat,Integer,
+                              Complex{<:Union{Base.IEEEFloat,Integer}}}
+ReactiveKernels._loop_seed_traced(x::T) where {T<:_LoopSeedScalar} =
+    copy(Reactant.promote_to(Reactant.TracedRNumber{T}, x))
+ReactiveKernels._loop_seed_traced(x::Array{T}) where {T<:_LoopSeedScalar} =
+    copy(Reactant.promote_to(Reactant.TracedRArray, x))
+ReactiveKernels._loop_seed_traced(
+        x::Union{Reactant.TracedRArray,Reactant.TracedRNumber}) = _fresh_tracers(x)
+ReactiveKernels._loop_seed_traced(x::Tuple) =
+    map(ReactiveKernels._loop_seed_traced, x)
+ReactiveKernels._loop_seed_traced(x::NamedTuple) =
+    map(ReactiveKernels._loop_seed_traced, x)
 
 function ReactiveKernels._rectangular_fold_impl(
         marker::Reactant.TracedType, step, init, columns, shared, n)

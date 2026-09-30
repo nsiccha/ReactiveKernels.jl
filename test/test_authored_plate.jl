@@ -1388,6 +1388,7 @@ end
 end
 
 _natural_sup_allocated(k, plan, units, weights) = @allocated k(plan, units, weights)
+_natural_sup_slots(s) = eachindex(s)
 
 @testset "authored plate block: natural superposition cell (get, filtered sum, one graph)" begin
     nobs = 257
@@ -1427,21 +1428,30 @@ end
 
 @testset "tensorized companion: filtered sums and get keep their branches lazy" begin
     # The tensorized rewrite, evaluated on host values, is Base's own fold: the
-    # filter is a branch on the accumulator and `get` stays `Base.get`.
-    lowered = ReactiveKernels._kernel_tensorized_rhs(
-        :(sum(w[j] * u[t - s[j]] for j in eachindex(s) if t > s[j]; init = z)))
-    @test lowered.head === :call && lowered.args[1] == GlobalRef(Base, :foldl)
-    @test occursin("_recurrence_branch", string(lowered))
-    companion = Core.eval(@__MODULE__, :((t, s, u, w, z) -> $lowered))
+    # filter is a branch on the accumulator and `get` stays `Base.get`. Over a
+    # data-length iterator the fold is one authored loop (retained under a
+    # tracing backend); over a helper-produced iterator it is `foldl`.
     native(t, s, u, w, z) = sum(w[j] * u[t - s[j]] for j in eachindex(s) if t > s[j]; init = z)
+    looped = ReactiveKernels._kernel_tensorized_rhs(
+        :(sum(w[j] * u[t - s[j]] for j in eachindex(s) if t > s[j]; init = z)),
+        Set{Symbol}(), nothing, Set([:t, :s, :u, :w, :z]))
+    @test looped.head === :let && occursin("@trace", string(looped))
+    folded = ReactiveKernels._kernel_tensorized_rhs(
+        :(sum(w[j] * u[t - s[j]] for j in _natural_sup_slots(s) if t > s[j]; init = z)))
+    @test folded.head === :call && folded.args[1] == GlobalRef(Base, :foldl)
+    @test occursin("_recurrence_branch", string(folded))
     u = [1.5, -2.25, 0.125, 7.0, 3.5]
-    for (t, s, w, z) in ((5, [0, 2, 4], [1.0, 0.5, 2.0], 0.0),
-                         (1, [0, 2, 4], [1.0, 0.5, 2.0], 0.0),     # one dose given
-                         (1, [1, 2, 4], [1.0, 0.5, 2.0], 0.0),     # none given: init
-                         (3, Int[], Float64[], 0.0),               # no doses
-                         (5, [0, 2, 4], [1.0, 0.5, 2.0], 0),       # Int init, Float64 terms
-                         (5, [0, 2, 4], [1.0, 0.5, 2.0], -0.0))
-        @test companion(t, s, u, w, z) === native(t, s, u, w, z)
+    cases = ((5, [0, 2, 4], [1.0, 0.5, 2.0], 0.0),
+             (1, [0, 2, 4], [1.0, 0.5, 2.0], 0.0),     # one dose given
+             (1, [1, 2, 4], [1.0, 0.5, 2.0], 0.0),     # none given: init
+             (3, Int[], Float64[], 0.0),               # no doses
+             (5, [0, 2, 4], [1.0, 0.5, 2.0], 0),       # Int init, Float64 terms
+             (5, [0, 2, 4], [1.0, 0.5, 2.0], -0.0))
+    for lowered in (looped, folded)
+        companion = Core.eval(@__MODULE__, :((t, s, u, w, z) -> $lowered))
+        for (t, s, w, z) in cases
+            @test companion(t, s, u, w, z) === native(t, s, u, w, z)
+        end
     end
     # Only the `init` form is rewritten: without it Base seeds the sum with the
     # first ACCEPTED element, which a traced condition cannot select.
