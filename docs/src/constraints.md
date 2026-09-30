@@ -105,6 +105,15 @@ The experimental rectangular PK path retains its loops and lazy branches but
 still fails reverse compilation. Its eager-branch and data-derived unrolling
 workarounds are not acceptable fixes. See the [scan limitations](scan.md).
 
+A generator reduction inside a traced plate cell, such as a sum over the doses
+of a schedule, is traced once per element of its host iterator: the emitted
+program grows with the dose count (a three-dose superposition cell emits 139
+lines of StableHLO, a six-dose one 238), while it stays independent of the
+number of plate lanes. This does not conform to the first rule. A retained
+loop or a batched reduction axis would, but it makes the reduction index a
+traced value, and a helper function that indexes host data with that index
+then fails under the backend; inline indexing is lowered by RK.
+
 Three further backend limitations are isolated with standalone reproducers
 under `benchmark/` (the backend and its AD engine only, no ReactiveKernels
 code):

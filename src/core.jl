@@ -348,7 +348,8 @@ end
 # form lowers under Reactant without unrolling (RK-macro-only per decision
 # `17bnc6t`; Reactant untouched).  `iterated` and `shared` are tuples; the common
 # case is a one-tuple `iterated`, and `eachindex(iterated...)` validates that
-# several sequences share axes (a `DimensionMismatch` otherwise).
+# several sequences share axes (a `DimensionMismatch` otherwise). Empty
+# sequences run no step and yield an empty result.
 @inline function _tensorized_scan(step, init, iterated::Tuple, shared::Tuple)
     marker = _scan_backend_marker(init, iterated, shared)
     _tensorized_scan_lowering(marker, step, init, iterated, shared)
@@ -370,12 +371,23 @@ end
     _dynamic_tensorized_marker((init, map(_scan_marker_value, iterated)...,
                                 map(_scan_marker_value, shared)...))
 
+# The per-step output type of a scan step applied to these argument types. An
+# empty sequence runs no step, so its (empty) result is typed the way Base's
+# `accumulate` types one: by inference, `Any` when inference cannot tell.
+function _scan_step_output_type(step, argument_types...)
+    R = Base.promote_op(step, argument_types...)
+    R isa DataType && R <: Tuple && length(R.parameters) == 2 ?
+        fieldtype(R, 2) : Any
+end
+
 # The native ordered loop.  `nothing` is the no-backend marker; a backend
 # extension specializes `_tensorized_scan_lowering` on its own marker type.
+# An empty sequence returns an empty result without running the step.
 function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
                                    shared::Tuple)
     idx = eachindex(iterated...)
-    isempty(idx) && throw(ArgumentError("scan requires a non-empty sequence"))
+    isempty(idx) && return similar(first(iterated), _scan_step_output_type(
+        step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...))
     i1 = first(idx)
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared...)
     result = similar(first(iterated), typeof(out1))
@@ -510,6 +522,15 @@ end
 # semantics are exactly Base.getindex; tracing extensions may explicitly
 # authorize their backend's scalar gather lowering.
 @inline _tensorized_getindex(args...) = getindex(args...)
+
+# `get(A, i, default)` in a tensorized fused body routes through this hook: the
+# total gather that reads `A[i]` when `i` is a valid index and yields `default`
+# otherwise (a causal response that is zero before its dose, a lookup table
+# with a fill value).  Native semantics are exactly `Base.get`.  Base decides
+# with a lazy branch on the bounds test, so a tracing extension keeps that
+# branch lazy on a traced index: the read of `A[i]` stays inside the taken arm
+# and an out-of-range index is never read (`docs/src/constraints.md`).
+@inline _tensorized_get(args...) = get(args...)
 
 """
     Graph()

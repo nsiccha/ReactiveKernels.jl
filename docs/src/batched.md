@@ -93,6 +93,21 @@ over a short inner axis such as a few doses per observation); Julia's inlining
 heuristic would otherwise keep such a cell a per-coordinate function call and
 recompute its loop invariants on every observation.
 
+A reduction over a short inner axis can say what it means. The concentration
+from a few doses is the sum over the doses already given,
+`sum(w[j] * u[t - s[j]] for j in eachindex(s) if t > s[j]; init = 0.0)`, or,
+with the unit response extended by zero before its dose,
+`sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(s); init = 0.0)`. Both run
+as written natively. Under a tracing backend the filter and the in-range test
+of `get` stay lazy branches: an out-of-range lag is never read. A filtered sum
+needs its `init`, because a traced condition cannot choose which element
+starts the sum.
+
+A domain port needs no declared type. `observations = domain(plan)`, with
+`domain` returning `1:plan.nobs` for one plan type and `eachrow(plan.rows)` for
+another, is one graph for both: the native loop is scheduled from the value
+each call receives, exactly as for a declared `UnitRange` or `Vector` domain.
+
 Purity is the plate contract, just as it is for ordinary stateless RK recipes.
 RK does not inspect an opaque Julia callable to prove its implementation pure;
 adding it as an ordinary recipe asserts that contract. A recipe explicitly

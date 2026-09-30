@@ -1097,6 +1097,35 @@ end
     Reactant.@allowscalar getindex(array, indices...)
 end
 
+# `get(A, i, default)` at a TRACED index: Base's lazy branch on the bounds test
+# stays a lazy branch (`stablehlo.if`), so the gather runs only in the in-range
+# arm and an out-of-range index is never read.  A host table is a constant of
+# the traced program, lifted exactly like `_tensorized_getindex` lifts it.  The
+# default is converted to the element type so both arms carry one traced type
+# (Base returns `Union{T,typeof(default)}` when they differ; a traced branch
+# needs one type, and the element type is the value the in-range arm yields).
+@inline function _rk_traced_get(array::Reactant.TracedRArray{T,1},
+        index::Reactant.TracedRNumber{I}, default) where {T,I<:Integer}
+    inbounds = (index >= firstindex(array)) & (index <= lastindex(array))
+    ReactiveKernels._recurrence_branch(inbounds,
+        () -> ReactiveKernels._tensorized_getindex(array, index),
+        () -> Reactant.promote_to(Reactant.TracedRNumber{T}, convert(T, default)),
+        ())
+end
+@inline ReactiveKernels._tensorized_get(array::Reactant.TracedRArray{T,1},
+        index::Reactant.TracedRNumber{I}, default) where {T,I<:Integer} =
+    _rk_traced_get(array, index, default)
+@inline ReactiveKernels._tensorized_get(array::Array{T,1},
+        index::Reactant.TracedRNumber{I}, default) where {T,I<:Integer} =
+    _rk_traced_get(Reactant.promote_to(Reactant.TracedRArray{T,1}, array),
+                   index, default)
+# A CONCRETE index is decided on the host, as Base decides it; the in-range
+# read of a traced vector takes the concrete-index `_tensorized_getindex` path.
+@inline ReactiveKernels._tensorized_get(array::Reactant.TracedRArray{T,1},
+        index::Integer, default) where {T} =
+    checkbounds(Bool, array, index) ?
+        ReactiveKernels._tensorized_getindex(array, index) : default
+
 # The scalar type a vector-literal element contributes under tracing: the
 # wrapped type, so promotion abstracts nothing.  `ConcretePJRTNumber` is a
 # closed-over traced constant rather than a `TracedRNumber`, but carries
@@ -1181,8 +1210,9 @@ end
 # a preallocated traced buffer with an in-place `buffer[i] = …`
 # dynamic-update-slice.  The first step runs eagerly to seed the carry and fix
 # the output element type; the `@trace for` then runs the remaining steps as one
-# `stablehlo.while` (`N == 1` runs with an empty loop body).  RK-macro-only per
-# decision `17bnc6t`; Reactant untouched.
+# `stablehlo.while` (`N == 1` runs with an empty loop body; several lockstep
+# sequences share that one loop; `N == 0` emits no loop, `_scan_empty_output`).
+# RK-macro-only per decision `17bnc6t`; Reactant untouched.
 #
 # Core-constraint conformance (`docs/src/constraints.md`): the lowering is
 # selected by `_scan_backend_marker` whenever ANY scan operand is traced, and
@@ -1240,6 +1270,46 @@ _scan_traced_sequence(xs) = throw(ArgumentError(
 @inline _scan_element(xs::Reactant.TracedRArray{<:Any,1}, i) =
     Reactant.@allowscalar xs[i]
 @inline _scan_element(xs::Reactant.TracedRArray{<:Any,2}, i) = xs[i, :]
+_scan_element_type(::Type{Reactant.TracedRArray{T,1}}) where {T} =
+    Reactant.TracedRNumber{T}
+_scan_element_type(::Type{Reactant.TracedRArray{T,2}}) where {T} =
+    Reactant.TracedRArray{T,1}
+# A stand-in element with the sequence's element type and row width.
+_scan_placeholder(::Reactant.TracedRArray{T,1}) where {T} =
+    Reactant.promote_to(Reactant.TracedRNumber{T}, zero(T))
+_scan_placeholder(xs::Reactant.TracedRArray{T,2}) where {T} =
+    Reactant.promote_to(Reactant.TracedRArray, zeros(T, size(xs, 2)))
+
+_scan_scalar_type(::Type{<:Reactant.TracedRNumber{T}}) where {T} = T
+_scan_scalar_type(::Type{T}) where {T} = T
+
+# A traced sequence's length is static, so an empty one compiles to a program
+# with no loop at all. Its result is empty with the step's scalar output type:
+# inferred, or — when inference cannot see through the traced step — read off
+# one step traced on placeholder elements, exactly as the first step fixes the
+# type of a nonempty result. That step's result is unused, so the optimizer
+# removes it. XLA export rejects a zero-sized result the program allocates
+# (upstream, reactivekernels-use §7l), so an empty traced 1-D sequence of that
+# type is forwarded (a copy of an existing traced empty exports); any other
+# empty result is a zero-sized constant, which works as an intermediate but
+# still meets §7l if it is itself the compiled program's output.
+function _scan_empty_output(step, init, sequences::Tuple, shared::Tuple)
+    output = ReactiveKernels._scan_step_output_type(step, typeof(init),
+        map(xs -> _scan_element_type(typeof(xs)), sequences)...,
+        map(typeof, shared)...)
+    if !(output isa DataType && isconcretetype(output))
+        _, placeholder_output = step(init, map(_scan_placeholder, sequences)..., shared...)
+        output = typeof(placeholder_output)
+    end
+    T = _scan_scalar_type(output)
+    T isa DataType && T <: Number && isconcretetype(T) || throw(ArgumentError(
+        "the Reactant scan lowering supports a scalar per-step output; the step " *
+        "of this empty sequence produces a $(output)"))
+    for xs in sequences
+        xs isa Reactant.TracedRArray{T,1} && return copy(xs)
+    end
+    Reactant.promote_to(Reactant.TracedRArray, zeros(T, 0))
+end
 
 # A concrete (device-resident, untraced) marker means the kernel is executing
 # eagerly outside a compiled program: there is no traced program to build, so
@@ -1254,11 +1324,11 @@ function ReactiveKernels._tensorized_scan_lowering(
         shared::Tuple)
     sequences = map(_scan_traced_sequence, iterated)
     n = _scan_sequence_length(first(sequences))
-    n == 0 && throw(ArgumentError("scan requires a non-empty sequence"))
     all(xs -> _scan_sequence_length(xs) == n, sequences) || throw(
         DimensionMismatch(
             "scan's iterated sequences must have equal length; got lengths " *
             "$(map(_scan_sequence_length, sequences))."))
+    n == 0 && return _scan_empty_output(step, init, sequences, shared)
     x1 = map(xs -> _scan_element(xs, 1), sequences)
     carry, out1 = step(init, x1..., shared...)
     buffer = _scan_output_buffer(out1, n)

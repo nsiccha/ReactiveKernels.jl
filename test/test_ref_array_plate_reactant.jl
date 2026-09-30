@@ -427,3 +427,109 @@ end
         @test Float64(compiled_traced(rshifts, ramounts, obs, rresp)) ≈ native
     end
 end
+
+# --- the natural superposition cell (snag one-natural-supe-39da86a4)
+module NaturalSuperpositionFixtures
+using ReactiveKernels
+
+struct Lattice
+    shifts::Vector{Int}
+    nobs::Int
+end
+struct Exact
+    rows::Matrix{Int}
+end
+_domain(plan::Lattice) = 1:plan.nobs
+_domain(plan::Exact) = eachrow(plan.rows)
+_doses(plan::Lattice) = eachindex(plan.shifts)
+_doses(plan::Exact) = axes(plan.rows, 2)
+_lag(t, plan::Lattice, j) = t - plan.shifts[j]
+# Inside an opaque helper a stored lane row still needs the one-element
+# reduction under Reactant (its scalar-indexing guard); inline `row[j]` in the
+# cell body is lowered by RK.
+_lag(row, ::Exact, j) = sum(view(row, j:j))
+
+@kernel get_cell(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, t - p.shifts[j], 0.0) for j in eachindex(p.shifts); init = 0.0)
+    end
+    return concentration
+end
+@kernel filter_cell(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * u[t - p.shifts[j]] for j in eachindex(p.shifts) if t > p.shifts[j]; init = 0.0)
+    end
+    return concentration
+end
+@kernel exact_row_cell(plan, units, weights) = begin
+    observations = eachrow(plan.rows)
+    concentration::Vector{Float64} = plate(observations, Ref(units), Ref(weights)) do row, u, w
+        sum(w[j] * get(u, row[j], 0.0) for j in eachindex(row); init = 0.0)
+    end
+    return concentration
+end
+@kernel one_graph_cell(plan, units, weights) = begin
+    observations = _domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, _lag(t, p, j), 0.0) for j in _doses(p); init = 0.0)
+    end
+    return concentration
+end
+# `get` outside a plate: every recipe op selects its tensorized companion on
+# traced arguments, so a plain kernel reads a traced or host table the same way.
+@kernel table_read(index, table::Vector{Float64}, hosted::Vector{Float64}) = begin
+    value = get(table, index, -1.0) + get(hosted, index, -1.0) + get(table, 2, -1.0)
+    return value
+end
+end
+
+@testset "natural superposition cell: get and filtered sums lower with lazy branches" begin
+    F = NaturalSuperpositionFixtures
+    nobs = 40
+    shifts = [0, 7, 19]
+    units = collect(range(0.5, 2.0; length = nobs))
+    weights = [3.0, 1.5, 0.25]
+    expected = [sum(t > s ? w * units[t - s] : 0.0 for (s, w) in zip(shifts, weights))
+                for t in 1:nobs]
+    runits, rweights = Reactant.to_rarray(units), Reactant.to_rarray(weights)
+    units2 = units .* 1.5 .+ 1.0
+    runits2 = Reactant.to_rarray(units2)
+    lattice = F.Lattice(shifts, nobs)
+    exact = F.Exact([max(t - s, 0) for t in 1:nobs, s in shifts])
+    cases = ((F.get_cell, lattice), (F.filter_cell, lattice), (F.exact_row_cell, exact),
+             (F.one_graph_cell, lattice), (F.one_graph_cell, exact))
+    @testset "$(nameof(typeof(plan))) $(k)" for (k, plan) in cases
+        kernel = prepare(k)
+        @test kernel(plan, units, weights) ≈ expected
+        compiled = Reactant.@compile sync = true kernel(plan, runits, rweights)
+        @test Array(compiled(plan, runits, rweights)) ≈ expected
+        @test Array(compiled(plan, runits2, rweights)) ≈ kernel(plan, units2, weights)
+        # The in-range test stays a lazy branch: an out-of-range lag (a dose not
+        # yet given) is never read, not clamped and selected away.
+        hlo = repr(Reactant.@code_hlo optimize = :none kernel(plan, runits, rweights))
+        @test occursin("stablehlo.if", hlo)
+    end
+
+    @testset "doubling the lane count does not replicate the program" begin
+        kernel = prepare(F.get_cell)
+        runits_double = Reactant.to_rarray(vcat(units, units))
+        hlo = repr(Reactant.@code_hlo optimize = :none kernel(lattice, runits, rweights))
+        hlo2 = repr(Reactant.@code_hlo optimize = :none kernel(
+            F.Lattice(shifts, 2 * nobs), runits_double, rweights))
+        @test count("\n", hlo2) == count("\n", hlo)
+    end
+
+    @testset "get in a plain kernel: traced index, host table, concrete index" begin
+        kernel = prepare(F.table_read)
+        table = [1.0, 2.0, 4.0]
+        hosted = [10.0, 20.0, 40.0]
+        rtable = Reactant.to_rarray(table)
+        for i in (0, 1, 3, 4)
+            ri = Reactant.to_rarray(i; track_numbers = true)
+            compiled = Reactant.@compile sync = true kernel(ri, rtable, hosted)
+            @test Float64(compiled(ri, rtable, hosted)) == kernel(i, table, hosted)
+        end
+    end
+end

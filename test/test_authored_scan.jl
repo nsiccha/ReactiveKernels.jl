@@ -24,7 +24,8 @@ _authored_scan_mixed(x) = Base.inferencebarrier(x > 2 ? 1.5 : 1)
     empty_mat, empty_positions = zeros(Float64, 0, 1), Int[]
     @test weights(empty_mat, empty_positions, 0) == Float64[]
     @test total(empty_mat, empty_positions, 0) == 0.0
-    @test_throws ArgumentError weights(empty_mat, empty_positions, 1)
+    # The prepared scan itself accepts the empty schedule the live arm passes.
+    @test weights(empty_mat, empty_positions, 1) == Float64[]
 
     qualified = AuthoredScanFixtures.QualifiedScanBinding.prepared
     @test qualified([1.0, 2.0, 3.0]) == [1.0, 3.0, 6.0]
@@ -63,7 +64,8 @@ end
     scalar = prepare(scalar_carry_scan)
     @test scalar([0.5, 1.0, 2.0]) == [0.5, 1.5, 3.5]
     @test scalar([1, 2, 3]) == [1, 3, 6]
-    @test_throws ArgumentError scalar(Float64[])
+    @test scalar(Float64[]) isa Vector{Float64} && isempty(scalar(Float64[]))
+    @test scalar(Int[]) isa Vector{Int} && isempty(scalar(Int[]))
 
     # Only the returned vector should allocate, never per-step boxed carries.
     series = sin.(1:200)
@@ -81,7 +83,7 @@ end
         k(args...)
         _authored_scan_allocated(k, args...)
         @test _authored_scan_allocated(k, args...) == 0
-        @test_throws ArgumentError prepare(authored_scan_arma)(q, Float64[])
+        @test prepare(authored_scan_arma)(q, Float64[]) === 0.0
     end
 
     @kernel scan_broadcast_consumer(xs, weights, offset::Float64) = begin
@@ -268,4 +270,94 @@ end
         end
         return s
     end)
+end
+
+@testset "authored scan over an empty sequence" begin
+    q = [0.2, 0.7, -0.3]
+    # The scan port is an empty vector of the step's output type, a fused plate
+    # consumer sums nothing, and every output stays concretely inferred.
+    for (want, expected) in (
+            (:errors, Float64[]), (:total, 0.0),
+            ((:pointwise, :total), (Float64[], 0.0)),
+            ((:errors, :pointwise, :total), (Float64[], Float64[], 0.0)))
+        k = prepare(authored_scan_arma; want)
+        actual = k(q, Float64[])
+        @test actual == expected
+        @test typeof(actual) == typeof(expected)
+        @test only(Base.return_types(k, Tuple{Vector{Float64},Vector{Float64}})) ==
+            typeof(expected)
+    end
+    @test prepare(authored_scan_arma; bound = (; series = Float64[]))(q) === 0.0
+    @test prepare(authored_scan_lockstep; want = (:seq, :total))(
+        Float64[], Float64[]) == (Float64[], 0.0)
+    @test_throws DimensionMismatch prepare(authored_scan_lockstep)(Float64[], [1.0])
+
+    # A NamedTuple carry holding a vector, iterating matrix rows.
+    empty_weights = prepared_authored_scan_nonempty(zeros(Float64, 0, 1), Int[])
+    @test empty_weights isa Vector{Float64} && isempty(empty_weights)
+    @test only(Base.return_types(prepared_authored_scan_nonempty,
+                                 Tuple{Matrix{Float64},Vector{Int}})) == Vector{Float64}
+
+    # Position batching runs the scan through its operation, not the inlined loop.
+    @kernel positioned_scan(xs::Vector{Float64}, position::Float64) = begin
+        values = scan(xs, Ref(position); init = 0.0) do carry, x, p
+            next = carry + p * x
+            (next, next)
+        end
+        total::Float64 = sum(values)
+        return total
+    end
+    batch = vectorize(positioned_scan; batched = :position, want = :total)
+    @test batch(Float64[], [1.0, 2.0]) == [0.0, 0.0]
+    @test batch([1.0, 2.0], [1.0, 2.0]) == [4.0, 8.0]
+end
+
+# The PD-turnover recurrence written inline in its graph over the two sequences
+# it consumes: an empty schedule yields the init-only trajectory without a lazy
+# arm, and the lockstep form matches the packed `eachrow(hcat(...))` spelling.
+@kernel authored_scan_turnover(pd, conc_mid::Vector{Float64}, dts::Vector{Float64}) = begin
+    kin = pd.baseline * pd.kout
+    updated = scan(conc_mid, dts, Ref(pd), Ref(kin);
+            init = pd.baseline) do previous, concentration, dt, parameters, input_rate
+        c2 = parameters.kout * (1 + concentration /
+            (parameters.theta1 * concentration + parameters.theta2))
+        steady = input_rate / c2
+        next = (previous - steady) * exp(-c2 * dt) + steady
+        (next, next)
+    end
+    trajectory = vcat([pd.baseline], updated)
+    return trajectory
+end
+
+@kernel authored_scan_turnover_packed(pd, conc_mid::Vector{Float64}, dts::Vector{Float64}) = begin
+    kin = pd.baseline * pd.kout
+    steps = hcat(conc_mid, dts)
+    updated = scan(eachrow(steps), Ref(pd), Ref(kin);
+            init = pd.baseline) do previous, row, parameters, input_rate
+        concentration = row[1]
+        dt = row[2]
+        c2 = parameters.kout * (1 + concentration /
+            (parameters.theta1 * concentration + parameters.theta2))
+        steady = input_rate / c2
+        next = (previous - steady) * exp(-c2 * dt) + steady
+        (next, next)
+    end
+    trajectory = vcat([pd.baseline], updated)
+    return trajectory
+end
+
+@testset "a lockstep scan recurrence lives inline in its graph" begin
+    pd = (; baseline = 100.0, kout = 0.3, theta1 = 1.2, theta2 = 40.0)
+    lockstep = prepare(authored_scan_turnover)
+    packed = prepare(authored_scan_turnover_packed)
+    @test lockstep(pd, Float64[], Float64[]) == [pd.baseline]
+    @test packed(pd, Float64[], Float64[]) == [pd.baseline]
+    conc, dts = abs.(sin.(1:40)) .* 50, fill(0.1, 40)
+    @test lockstep(pd, conc, dts) == packed(pd, conc, dts)
+    @test only(Base.return_types(lockstep,
+        Tuple{typeof(pd),Vector{Float64},Vector{Float64}})) == Vector{Float64}
+    # The lockstep form does not build the packed matrix.
+    lockstep(pd, conc, dts); packed(pd, conc, dts)
+    @test _authored_scan_allocated(lockstep, pd, conc, dts) <
+        _authored_scan_allocated(packed, pd, conc, dts)
 end
