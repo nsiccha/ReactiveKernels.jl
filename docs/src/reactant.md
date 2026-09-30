@@ -63,6 +63,16 @@ code is not executed by the docs build.
   an ordinary helper indexing with it fails with `Scalar indexing is
   disallowed`. A generator over a helper-produced iterator keeps the
   per-element trace.
+- A kernel calls `ReactiveKernels.traced(f, args...)` in place of a helper
+  call `f(args...)` when a tracing backend compiles it (only for functions
+  Base, Core and ReactiveKernels do not own, and only positional calls). Its
+  default is `f(args...)`. A method for your own function gives it a tracing
+  implementation while native execution keeps calling `f`: an opaque
+  component, such as a hand-tuned in-place loop, can run under tracing as a
+  prepared kernel or backend code in the package's Reactant extension.
+  `@traceable` defines that method from the helper's own body. The two
+  implementations are separate code, so test the traced one against the
+  native one.
 - A traced Cholesky factorization is a wrapper type owned by the Reactant
   extension, with `LinearAlgebra.Cholesky`'s accessors (`.L`, `.U`, `.UL`,
   `.factors`) and solves (`\`, `ldiv!`; a diagonal factor divides

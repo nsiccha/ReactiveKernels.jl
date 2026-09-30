@@ -1481,6 +1481,19 @@ struct Exact end
     end
 end
 @traceable scaled(x::T, s) where {T<:Real} = s * x
+# A hand-written tracing method: the native method is an opaque in-place loop,
+# the traced one a different implementation of the same mathematics.
+function superpose(plan::Lattice, units, weights, nobs)
+    out = zeros(nobs)
+    for (s, w) in zip(plan.shifts, weights), t in (s + 1):nobs
+        out[t] += w * units[t - s]
+    end
+    out
+end
+plain_helper(plan, units, weights, nobs) = superpose(plan, units, weights, nobs)
+ReactiveKernels.traced(::typeof(superpose), plan::Lattice, units, weights, nobs) =
+    [sum(weights[j] * get(units, t - plan.shifts[j], 0.0) for j in eachindex(weights); init = 0.0)
+     for t in 1:nobs]
 end
 
 @testset "@traceable: the method as written, plus the rewritten one for tracing" begin
@@ -1493,13 +1506,17 @@ end
     @test H.scaled(2, 1.5) == 3.0
     # The tensorized hook dispatches to the rewritten body by the authored
     # signature; on host values it computes what the method computes.
-    call = ReactiveKernels._tensorized_call
+    call = ReactiveKernels.traced
     @test call(H.row_index, 7, lattice, 2) == 5
     @test call(H.row_index, [4, 9, 1], H.Exact(), 2) == 9
     @test call(H.clipped, 2.5, 1.0) === 1.5 && call(H.clipped, 0.5, 1.0) === 0.0
     @test call(H.clipped, 2.0) === 2.0
     @test call(H.scaled, 2, 1.5) == 3.0
     @test call(+, 1, 2) == 3
+    # A hand-written method is reached the same way and agrees with the native one.
+    units = [1.0, 0.5, 0.25, 0.125, 2.0, 4.0]
+    @test call(H.superpose, lattice, units, [1.0, 2.0, 3.0], 6) ==
+          H.superpose(lattice, units, [1.0, 2.0, 3.0], 6)
     # The rewritten body carries the recipe rewrites (a traced index reads
     # through `_tensorized_getindex`; a branch is lazy).
     rewritten = string(ReactiveKernels._traceable_definition(
@@ -1511,11 +1528,18 @@ end
     # calls, and calls with keyword arguments, keep their form.
     lower(ex) = string(ReactiveKernels._kernel_tensorized_rhs(ex, Set{Symbol}(), H,
                                                               Set([:t, :p, :i, :x])))
-    @test occursin("_tensorized_call", lower(:(row_index(t, p, i))))
-    @test occursin("_tensorized_call", lower(:(not_yet_defined(t))))
-    @test !occursin("_tensorized_call", lower(:(exp(x) + sum(x))))
-    @test !occursin("_tensorized_call", lower(:(plate(x))))
-    @test !occursin("_tensorized_call", lower(:(row_index(t, p; i = i))))
+    @test occursin("ReactiveKernels.traced", lower(:(row_index(t, p, i))))
+    @test occursin("ReactiveKernels.traced", lower(:(not_yet_defined(t))))
+    @test !occursin("ReactiveKernels.traced", lower(:(exp(x) + sum(x))))
+    @test !occursin("ReactiveKernels.traced", lower(:(plate(x))))
+    @test !occursin("ReactiveKernels.traced", lower(:(row_index(t, p; i = i))))
+    # A whole recipe `x = f(ports...)` keeps `f` as its raw operation unless
+    # `f` has a `traced` method, which sends it through the tracing companion.
+    operation(ex) = ReactiveKernels._kernel_operation(
+        ex, Symbol[ex.args[2:end]...], Set{Symbol}(ex.args[2:end]); mod = H)
+    @test operation(:(superpose(plan, u, w, n))) isa Expr
+    @test operation(:(row_index(t, p, i))) isa Expr          # @traceable defines one
+    @test operation(:(plain_helper(plan, u, w, n))) === :plain_helper
     # Loud refusals.
     define(ex) = ReactiveKernels._traceable_definition(ex, H)
     @test_throws ArgumentError define(:(sum(x::Lattice) = 0))

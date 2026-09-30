@@ -525,6 +525,26 @@ _plain_row(row, ::Exact, j) = row[j]
     end
     return concentration
 end
+# An opaque component with a hand-written tracing method: natively the
+# dose-outer in-place loop (not traceable), under tracing the natural plate
+# cell. `MIRROR_CALLS` counts entries into the tracing method.
+function _superpose(plan::Lattice, units, weights)
+    out = zeros(eltype(units), plan.nobs)
+    for (s, w) in zip(plan.shifts, weights), t in (s + 1):plan.nobs
+        out[t] += w * units[t - s]
+    end
+    out
+end
+const MIRROR_CALLS = Ref(0)
+const GET_CELL = prepare(get_cell)
+function ReactiveKernels.traced(::typeof(_superpose), plan::Lattice, units, weights)
+    MIRROR_CALLS[] += 1
+    GET_CELL(plan, units, weights)
+end
+@kernel opaque_superposition(plan, units, weights) = begin
+    concentration = _superpose(plan, units, weights)
+    return concentration
+end
 # `get` outside a plate: every recipe op selects its tensorized companion on
 # traced arguments, so a plain kernel reads a traced or host table the same way.
 @kernel table_read(index, table::Vector{Float64}, hosted::Vector{Float64}) = begin
@@ -612,10 +632,10 @@ end
                 plan = plans(ndoses)[index]
                 w = collect(range(1.0, 2.0; length = ndoses))
                 rw = Reactant.to_rarray(w)
-                expected = reference(plan, units, w)
-                @test traceable(plan, units, w) == expected
+                inline_values = reference(plan, units, w)
+                @test traceable(plan, units, w) == inline_values
                 compiled = Reactant.@compile sync = true traceable(plan, runits, rw)
-                @test Array(compiled(plan, runits, rw)) ≈ expected
+                @test Array(compiled(plan, runits, rw)) ≈ inline_values
                 @test Array(compiled(plan, runits2, rw)) ≈ reference(plan, units2, w)
                 hlo = repr(Reactant.@code_hlo optimize = :none traceable(plan, runits, rw))
                 inline = repr(Reactant.@code_hlo optimize = :none reference(plan, runits, rw))
@@ -630,6 +650,26 @@ end
             rw = Reactant.to_rarray([1.0, 1.5, 2.0])
             @test_throws "Scalar indexing is disallowed" Reactant.@compile plain(plan, runits, rw)
         end
+    end
+
+    @testset "a hand-written traced method stands in for an opaque helper" begin
+        kernel = prepare(F.opaque_superposition)
+        F.MIRROR_CALLS[] = 0
+        @test kernel(lattice, units, weights) ≈ expected
+        @test F.MIRROR_CALLS[] == 0              # native runs the method as written
+        programs = map((3, 6)) do ndoses
+            s = [div((i - 1) * nobs, ndoses) + 1 for i in 1:ndoses]
+            w = collect(range(1.0, 2.0; length = ndoses))
+            plan = F.Lattice(s, nobs)
+            rw = Reactant.to_rarray(w)
+            compiled = Reactant.@compile sync = true kernel(plan, runits, rw)
+            @test Array(compiled(plan, runits, rw)) ≈ kernel(plan, units, w)
+            @test Array(compiled(plan, runits2, rw)) ≈ kernel(plan, units2, w)
+            repr(Reactant.@code_hlo optimize = :none kernel(plan, runits, rw))
+        end
+        @test F.MIRROR_CALLS[] > 0
+        @test occursin("stablehlo.while", programs[1])
+        @test count("\n", programs[1]) == count("\n", programs[2])
     end
 
     @testset "get in a plain kernel: traced index, host table, concrete index" begin

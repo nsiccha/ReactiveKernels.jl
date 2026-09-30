@@ -117,7 +117,10 @@ lowered by RK, host tables included. A helper function the term calls with the
 index receives the traced value; its body gets the same lowering when the
 helper is defined with `@traceable`, and an ordinary helper's read fails with
 `Scalar indexing is disallowed`. A per-type rule (one method per schedule-plan
-type) therefore keeps its dispatch and the retained loop.
+type) therefore keeps its dispatch and the retained loop. More generally a
+helper may carry a `ReactiveKernels.traced` method, a separate tracing
+implementation the kernel calls in its place; it must itself satisfy these
+constraints.
 
 Standalone reproducers under `benchmark/` (the backend and its AD engine
 only, no ReactiveKernels code) isolate the remaining backend limitations —

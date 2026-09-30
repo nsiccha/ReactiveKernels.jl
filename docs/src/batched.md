@@ -124,6 +124,18 @@ same lowering of `p.shifts[j]` and `row[j]` that the term gets, so the program
 is the one the inline spelling emits for either plan. An ordinary helper
 cannot read at a traced index (`Scalar indexing is disallowed`).
 
+`@traceable` is shorthand for a `ReactiveKernels.traced` method, the
+implementation a kernel calls in place of the helper when a tracing backend
+compiles it. Write that method by hand when the two should differ: a
+hand-tuned in-place superposition loop stays the native method, and its traced
+method calls a prepared plate kernel with the cell above.
+
+```julia
+superpose(plan, units, weights) = ...        # in-place loop, native only
+ReactiveKernels.traced(::typeof(superpose), plan, units, weights) =
+    SUPERPOSITION_CELL(plan, units, weights) # a prepared kernel
+```
+
 Purity is the plate contract, just as it is for ordinary stateless RK recipes.
 RK does not inspect an opaque Julia callable to prove its implementation pure;
 adding it as an ordinary recipe asserts that contract. A recipe explicitly

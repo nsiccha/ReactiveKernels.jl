@@ -1961,13 +1961,12 @@ function _kernel_tensorized_callee(callee, known::Set{Symbol}, mod)
     callee
 end
 
-# Whether a tensorized call goes through `_tensorized_call`, where a
-# `@traceable` method of the callee can take it.  Only a positional call to a
-# function neither Base, Core nor this package owns: a `@traceable` method of
-# a function the caller does not own would be piracy, and every other call
-# keeps exactly its emitted form.  A name unbound when the recipe is defined
-# (a helper defined later) routes too; without a `@traceable` method the hook
-# is the plain call.
+# Whether a tensorized call goes through `traced` (core.jl), where a tracing
+# method of the callee can take it.  Only a positional call to a function
+# neither Base, Core nor this package owns: a tracing method of a function the
+# caller does not own would be piracy, and every other call keeps exactly its
+# emitted form.  A name unbound when the recipe is defined (a helper defined
+# later) routes too; without a tracing method the hook is the plain call.
 function _kernel_tensorized_routed(callee, arguments, mod)
     any(arg -> arg isa Expr && arg.head in (:parameters, :kw), arguments) &&
         return false
@@ -1978,6 +1977,23 @@ function _kernel_tensorized_routed(callee, arguments, mod)
         return !(Base.moduleroot(parentmodule(f)) in (Base, Core, @__MODULE__))
     end
     callee isa Symbol && mod isa Module
+end
+
+# Whether `callee` names a function with its own `traced` method.  A whole
+# recipe `x = f(ports...)` keeps `f` itself as its operation, which a tracing
+# backend would call natively; with a `traced` method the recipe takes the
+# source-op path instead, whose tracing companion routes the call.  Methods
+# defined after the recipe are not seen.
+function _kernel_callee_has_traced_method(callee::Symbol, mod)
+    mod isa Module && isdefined(mod, callee) || return false
+    f = getglobal(mod, callee)
+    f isa Function && !(f isa Type) || return false
+    for m in methods(traced)
+        signature = Base.unwrap_unionall(m.sig)
+        length(signature.parameters) >= 2 && signature.parameters[2] === typeof(f) &&
+            return true
+    end
+    false
 end
 
 function _kernel_tensorized_assignment_head(head)
@@ -2537,7 +2553,7 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
                         for arg in ex.args[2:end]]
         call = replacement === nothing &&
                _kernel_tensorized_routed(callee, arguments, mod) ?
-            Expr(:call, GlobalRef(@__MODULE__, :_tensorized_call), callee, arguments...) :
+            Expr(:call, GlobalRef(@__MODULE__, :traced), callee, arguments...) :
             Expr(:call, callee, arguments...)
         _tensorized_factorization_callee(ex.args[1]) || return call
         return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_factorization), call)
@@ -2569,11 +2585,14 @@ end
     @traceable f(args...) = body
     @traceable function f(args...) ... end
 
-Define an ordinary method of `f`, and give tracing backends the same method
-with its body rewritten as a `@kernel` recipe body is.  Native execution
-calls the method as written.  Under a tracing backend (Reactant), a recipe
-calling `f` reaches the rewritten body, so indexing, `get`, lazy branches and
-data-length loops inside the helper lower as they do written in the recipe.
+Define an ordinary method of `f`, plus the [`ReactiveKernels.traced`](@ref)
+method with the same signature whose body is this body rewritten as a
+`@kernel` recipe body is.  Native execution calls the method as written.
+Under a tracing backend (Reactant), a recipe calling `f` reaches the rewritten
+body, so indexing, `get`, lazy branches and data-length loops inside the helper
+lower as they do written in the recipe.  One body serves both; write a
+`traced` method by hand instead when the tracing implementation must differ
+(an opaque or foreign component).
 
 The case it exists for is a per-type rule applied at a traced index, such as a
 dose superposition over several schedule-plan types summed as one retained
@@ -2603,7 +2622,8 @@ a return-type annotation (kept on the native method only).  A `@traceable`
 method of a function from Base, Core or ReactiveKernels is rejected, and so
 are keyword arguments and a `return` before the end of the body (write that
 branch as an expression).  Calls with keyword arguments are not routed to the
-rewritten method.
+rewritten method.  Calls the body makes to other helpers route through
+`traced` as well.
 """
 macro traceable(def)
     _traceable_definition(def, __module__)
@@ -2648,7 +2668,7 @@ function _traceable_definition(def, mod::Module)
     end
     rewritten = _kernel_tensorized_rhs(_traceable_tail_body(body, signature),
                                        names, mod, copy(names))
-    companion = Expr(:call, GlobalRef(@__MODULE__, :_tensorized_call),
+    companion = Expr(:call, GlobalRef(@__MODULE__, :traced),
                      Expr(:(::), Expr(:call, GlobalRef(Core, :typeof), callee)),
                      formals...)
     for layer in reverse(wheres)
@@ -2707,7 +2727,8 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
             return generated_spec === nothing ? callee : generated_spec
         end
         if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
-           (!tensorize || _tensorized_callee_replacement(callee) === nothing) &&
+           (!tensorize || (_tensorized_callee_replacement(callee) === nothing &&
+                           !_kernel_callee_has_traced_method(callee, mod))) &&
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
             return callee                                   # BARE exact identity — stays raw (validated)
