@@ -51,12 +51,13 @@ _ord_prepared(X, y) = prepare(_ord_glm_reactant;
     end
 end
 
-@testset "live levels: cells stay lazy regions (upstream reverse boundary)" begin
-    # Reverse through a lazy branch inside a batched cell does not lower yet
-    # once the batching pass realizes the plate as a loop — six observations
-    # here (`benchmark/repro_reactant_batch_if_reverse.jl`,
-    # docs/src/constraints.md). Locked as a loud compile failure so an
-    # upstream fix is noticed.
+@testset "live levels: cells stay lazy regions, reverse matches native" begin
+    # Reverse through a lazy branch inside a batched cell lowers since Reactant
+    # 0.2.289 (the upstream Enzyme-JAX remover gap, RK issue #13, is fixed
+    # there): the cells stay lazy `stablehlo.if` regions and the compiled
+    # reverse gradient matches native Enzyme. Six observations here
+    # (`benchmark/repro_reactant_batch_if_reverse.jl`,
+    # docs/src/constraints.md).
     k = prepare(_ord_glm_reactant; have = (:beta, :X, :y, :cuts),
         want = :posterior, bound = (; X = _GLM_R_X, cuts = _GLM_R_CUTS))
     y = _traced(_GLM_R_Y)
@@ -65,8 +66,15 @@ end
     compiled = Reactant.@compile k(_traced(_GLM_R_BETA), y)
     @test _host(compiled(_traced(_GLM_R_BETA), y)) ≈ k(_GLM_R_BETA, _GLM_R_Y)
     gradient(b, levels) = Enzyme.gradient(Enzyme.Reverse, k, b, Enzyme.Const(levels))
-    @test_throws Reactant.Compiler.CompilationError Reactant.@compile gradient(
-        _traced(_GLM_R_BETA), y)
+    compiled_gradient = Reactant.@compile gradient(_traced(_GLM_R_BETA), y)
+    native = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse),
+        _GLM_R_BETA, _GLM_R_Y; active = :beta)
+    for beta in (_GLM_R_BETA, [3.0, -12.0], [20.0, 5.0])
+        # The compiled side returns (gradient, nothing): the Const levels slot.
+        _, g_native = ad_value_and_gradient!(native, similar(beta), beta, _GLM_R_Y)
+        @test all(isfinite, g_native)
+        @test _host(first(compiled_gradient(_traced(beta), y))) ≈ g_native rtol = 1e-6
+    end
 end
 
 @testset "the GLM program does not grow with the observation count" begin

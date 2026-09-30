@@ -114,20 +114,20 @@ loop or a batched reduction axis would, but it makes the reduction index a
 traced value, and a helper function that indexes host data with that index
 then fails under the backend; inline indexing is lowered by RK.
 
-Three further backend limitations are isolated with standalone reproducers
-under `benchmark/` (the backend and its AD engine only, no ReactiveKernels
-code):
+Standalone reproducers under `benchmark/` (the backend and its AD engine
+only, no ReactiveKernels code) isolate the remaining backend limitations —
+and lock the one Reactant 0.2.289 lifted:
 
 - A lazy branch inside a batched plate cell compiles and evaluates for every
-  lane count, but reverse compilation through it fails once the batching pass
-  realizes the plate as a loop (six lanes fail where four lanes, unrolled per
-  lane, succeed): `repro_reactant_batch_if_reverse.jl`, still failing on
-  Reactant 0.2.287. It concerns only branches whose condition reads a live
-  value: a condition on bound data is split away during preparation and never
-  reaches the backend. Plated support guards on live values therefore keep
-  their authored branch and lose Reactant reverse gradients above that size
-  until the batched-loop branch lowers upstream; native execution and native
-  reverse are unaffected.
+  lane count, and since Reactant 0.2.289 reverse compilation through it
+  lowers too, with compiled gradients matching native Enzyme:
+  `repro_reactant_batch_if_reverse.jl` passes exactly and now guards the lift
+  as a regression test, and RK issue #13 closed with its retained-loop
+  reproducer passing exactly. Before 0.2.289 reverse failed once the batching
+  pass realized the plate as a loop (six lanes failed where four lanes,
+  unrolled per lane, succeeded). The boundary concerned only branches whose
+  condition reads a live value: a condition on bound data is split away
+  during preparation and never reaches the backend.
 - Reverse compilation through a retained `while` loop whose exit is data
   dependent (the adaptive ODE solver's `(n < maxiters) & (t < t1)`) fails
   because the loop has no statically known iteration count:

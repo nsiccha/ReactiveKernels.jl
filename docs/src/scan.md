@@ -252,8 +252,13 @@ A PK adapter is experimental and disabled for ordinary callers. It carries
 compartment amounts and a concentration/AUC buffer over a flat operation table;
 repeated-dose segments use a bounded binary-power loop. Joint K=1/K=3 primal
 parity and bounded loop structure pass with CPU fusion enabled, but PK reverse
-compilation currently fails in the Reactant/MLIR backend (tracking issue #13).
-It is not a supported sampler path.
+compilation currently fails while tracing the rectangular path's StaticArrays
+matrix exponential (`TypeError: non-boolean (TracedRNumber{Bool})` in
+`StaticArrays._exp` via `_pk_expm_table`, since `f396c41e`; seen on Reactant
+0.2.289 with StaticArrays 1.9.22). The upstream Enzyme-JAX defects behind the
+original backend failure are fixed in Reactant 0.2.289+ (RK issue #13 closed,
+both standalone reproducers passing exactly). It is not a supported sampler
+path.
 The experiment, reproducer, and measurements are documented in
 `benchmark/joint_stan_tiled/rectangular_lowering.md` in the repository.
 
