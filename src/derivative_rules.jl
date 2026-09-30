@@ -237,6 +237,11 @@ function _encode_cut_body(ast::Expr, name::Symbol)
     ret = nothing
     for statement in ast.args[2].args
         statement isa LineNumberNode && continue
+        # A declared-type local (`local y::T`, emitted by the native lowering
+        # for an annotated recipe output) carries no computation: the cut is
+        # regenerated from the encoded assignments, whose operations infer
+        # their own result types.
+        statement isa Expr && statement.head === :local && continue
         if statement isa Expr && statement.head === :return
             ret === nothing || unsupported("a second return")
             value = statement.args[1]

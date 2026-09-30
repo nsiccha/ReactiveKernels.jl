@@ -34,6 +34,7 @@ const _MATRIX_CORE_TESTS = (
     "test_reactant_selector.jl",
     "test_stateless.jl",
     "test_lower_with_ops.jl",
+    "test_declared_output_types.jl",
     "test_partial_evaluation.jl",
     "test_shared_preparation.jl",
     "test_inner_plate_partial_evaluation.jl",
