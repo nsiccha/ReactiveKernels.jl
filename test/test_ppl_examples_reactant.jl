@@ -106,7 +106,26 @@ using ReactiveKernelsPPLExamples.GPRegrExample:
     evaluate_gp_regr_source, GP_REGR_X, GP_REGR_Y
 using ReactiveKernelsPPLExamples.AccelGPExample: evaluate_accel_gp_source
 using ReactiveKernelsPPLExamples.GPPoisRegrExample: evaluate_gp_pois_regr_source
-using ReactiveKernelsPPLExamples.HierarchicalGPExample: evaluate_hierarchical_gp_source
+using ReactiveKernelsPPLExamples.HierarchicalGPExample: evaluate_hierarchical_gp_source,
+    HGP_Y, HGP_YEAR_IND, HGP_STATE_IND, HGP_REGION_IND, HGP_STATE_REGION_IND,
+    HGP_N_YEARS, HGP_N_REGIONS, HGP_N_STATES, HGP_N_YEARS_OBS
+using ReactiveKernelsPPLExamples.HmmDrive0Example: evaluate_hmm_drive_0_source,
+    HMM_DRIVE_0_U, HMM_DRIVE_0_V, HMM_DRIVE_0_ALPHA
+using ReactiveKernelsPPLExamples.HmmDrive1Example: evaluate_hmm_drive_1_source,
+    HMM_DRIVE_1_U, HMM_DRIVE_1_V, HMM_DRIVE_1_ALPHA, HMM_DRIVE_1_TAU, HMM_DRIVE_1_RHO
+using ReactiveKernelsPPLExamples.HmmExampleExample: HMM_EXAMPLE_Y, HMM_EXAMPLE_K
+using ReactiveKernelsPPLExamples.HmmGaussianExample: HMM_GAUSSIAN_Y, HMM_GAUSSIAN_K
+using ReactiveKernelsPPLExamples.IohmmRegExample: IOHMM_REG_Y, IOHMM_REG_U, IOHMM_REG_K
+using ReactiveKernelsPPLExamples.MtExample: MT_Y, MT_S, MT_T, MT_M
+using ReactiveKernelsPPLExamples.MthModelExample: MTH_Y, MTH_S, MTH_T, MTH_M
+using ReactiveKernelsPPLExamples.MtbhModelExample: MTBH_Y, MTBH_YPREV, MTBH_S,
+    MTBH_T, MTBH_M
+using ReactiveKernelsPPLExamples.MultiOccupancyExample: evaluate_multi_occupancy_source,
+    MULTI_OCC_X, MULTI_OCC_N, MULTI_OCC_J, MULTI_OCC_K
+using ReactiveKernelsPPLExamples.KroneckerGpExample: evaluate_kronecker_gp_source,
+    KRON_X1, KRON_Y
+import Enzyme
+using DifferentiationInterface: AutoEnzyme
 
 _host(v::Reactant.AbstractConcreteArray) = Array(v)
 _host(v::Reactant.AbstractConcreteNumber) = Reactant.to_number(v)
@@ -130,6 +149,30 @@ function _compile_run(kernel, inputs)
     compiled = @compile sync = true kernel(traced...)
     _host(compiled(traced...))
 end
+
+# Pinned XLA gaps (signature-checked; any other failure rethrows loudly).
+#
+# kronecker_gp: the trace dies in the example's opaque scalar-loop helper
+# `_ccl_constraint_lp` (`z[k]` = `getindex(::TracedRArray, ::Int)`), refused by
+# Reactant's scalar-indexing guard `GPUArraysCore.assertscalar` with
+# "Scalar indexing is disallowed." Stacked directly behind it is an upstream
+# Reactant gap: `eigen(Symmetric(::TracedRArray))` reaches
+# `LinearAlgebra.isdiag(::Symmetric)` → Reactant `isbanded`/`_istril` →
+# `MethodError: no method matching overloaded_triu(::UpperTriangular{
+# TracedRNumber{Float64}, TracedRArray{Float64, 2}}, ::Int64)` (Reactant
+# src/stdlibs/LinearAlgebra.jl:366 defines it for `TracedRArray{T, 2}` only).
+# Measured Reactant 0.2.289, Julia 1.10.11.
+_xla_is_kron_scalar_indexing_gap(e) =
+    e isa ErrorException && startswith(e.msg, "Scalar indexing is disallowed.") &&
+    occursin("Invocation of getindex(::TracedRArray, ::Vararg{Int, N})", e.msg)
+# hierarchical_gp compiled reverse: EnzymeMLIR has no adjoint for
+# `stablehlo.cholesky` (reactivekernels-use §7f; snag reactant-compile-f877fcfd):
+# `Reactant.Compiler.CompilationError: MLIR pass pipeline "all" failed …
+# could not compute the adjoint for this operation … "stablehlo.cholesky"`.
+_xla_is_cholesky_adjoint_gap(e) =
+    e isa Reactant.Compiler.CompilationError && (msg = sprint(showerror, e);
+        occursin("could not compute the adjoint for this operation", msg) &&
+        occursin("stablehlo.cholesky", msg))
 
 # Each migrated / new PPL example compiles and executes through the public
 # Reactant boundary and reproduces its native output. Object-splice densities
@@ -204,6 +247,14 @@ end
         # and iterating a traced matrix directly fails Reactant scalar
         # indexing. The all-bound query stays the natural authoring; parity is
         # asserted above on the unrolled compiled program.
+    end
+    @testset "hmm_drive_0 (posteriordb; exponential-emission HMM, all data bound)" begin
+        a = evaluate_hmm_drive_0_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "hmm_drive_1 (posteriordb; Normal-emission HMM, all data bound)" begin
+        a = evaluate_hmm_drive_1_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "poisson_gamma" begin
         a = evaluate_poisson_gamma_source()
@@ -669,5 +720,116 @@ end
     @testset "hierarchical_gp (posteriordb; hierarchical GP, ILR simplex; primal)" begin
         a = evaluate_hierarchical_gp_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "multi_occupancy (posteriordb; marginalized occupancy, all data bound)" begin
+        a = evaluate_multi_occupancy_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kronecker_gp (posteriordb; Kronecker eigen GP, all data bound)" begin
+        gapped = true
+        try
+            a = evaluate_kronecker_gp_source()
+            # Compile outside `@test` so the gap reaches the signature check.
+            compiled_output = _compile_run(a.kernel, Tuple(a.inputs))
+            @test _rapprox(compiled_output, a.output)
+            # Self-firing pin: errors (Unexpected Pass) once the trace lowers,
+            # forcing removal of the gate.
+            gapped && @test_broken true
+        catch e
+            gapped && _xla_is_kron_scalar_indexing_gap(e) || rethrow()
+        end
+    end
+end
+
+# Compiled reverse gradient (XLA gradient leg) for the hand-written examples
+# with no StanBlocks counterpart. Each item's posterior-only query binds all
+# data, so the unconstrained position is the only traced argument; the gradient
+# is `Reactant.@compile ReactiveKernels.ad_value_and_gradient!` on that traced
+# position (the acceptance_irt_reactant.jl pattern). The reference is the
+# native CPU primal and its central finite-difference gradient.
+const _XLA_AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
+
+function _central_fd_gradient(f, q; h = 1e-6)
+    g = similar(q)
+    for i in eachindex(q)
+        qp = copy(q); qp[i] += h
+        qm = copy(q); qm[i] -= h
+        g[i] = (f(qp) - f(qm)) / (2h)
+    end
+    g
+end
+
+function _xla_value_and_gradient(kernel, q)
+    prepared = prepare_ad(kernel, _XLA_AD_BACKEND, q; active = :unconstrained)
+    traced_q = Reactant.to_rarray(q)
+    traced_gradient = Reactant.to_rarray(similar(q))
+    compiled = @compile sync = true ReactiveKernels.ad_value_and_gradient!(
+        prepared, traced_gradient, traced_q)
+    value, gradient = compiled(prepared, traced_gradient, traced_q)
+    (_host(value), Array{Float64}(gradient))
+end
+
+const _XLA_GRADIENT_ITEMS = (
+    ("hmm_drive_0", evaluate_hmm_drive_0_source, (:unconstrained, :u, :v, :alpha),
+        (; u = HMM_DRIVE_0_U, v = HMM_DRIVE_0_V, alpha = HMM_DRIVE_0_ALPHA), nothing),
+    ("hmm_drive_1", evaluate_hmm_drive_1_source,
+        (:unconstrained, :u, :v, :alpha, :tau, :rho),
+        (; u = HMM_DRIVE_1_U, v = HMM_DRIVE_1_V, alpha = HMM_DRIVE_1_ALPHA,
+           tau = HMM_DRIVE_1_TAU, rho = HMM_DRIVE_1_RHO), nothing),
+    ("hmm_example", evaluate_hmm_example_source, (:unconstrained, :y, :K),
+        (; y = HMM_EXAMPLE_Y, K = HMM_EXAMPLE_K), nothing),
+    ("hmm_gaussian", evaluate_hmm_gaussian_source, (:unconstrained, :y, :K),
+        (; y = HMM_GAUSSIAN_Y, K = HMM_GAUSSIAN_K), nothing),
+    ("iohmm_reg", evaluate_iohmm_reg_source, (:unconstrained, :y, :u, :K),
+        (; y = IOHMM_REG_Y, u = IOHMM_REG_U, K = IOHMM_REG_K), nothing),
+    ("mt", evaluate_mt_source, (:unconstrained, :Y, :s, :T, :M),
+        (; Y = MT_Y, s = MT_S, T = MT_T, M = MT_M), nothing),
+    ("mth_model", evaluate_mth_model_source, (:unconstrained, :Y, :s, :T, :M),
+        (; Y = MTH_Y, s = MTH_S, T = MTH_T, M = MTH_M), nothing),
+    ("mtbh_model", evaluate_mtbh_model_source,
+        (:unconstrained, :Y, :Yprev, :s, :T, :M),
+        (; Y = MTBH_Y, Yprev = MTBH_YPREV, s = MTBH_S, T = MTBH_T, M = MTBH_M),
+        nothing),
+    ("multi_occupancy", evaluate_multi_occupancy_source,
+        (:unconstrained, :X, :n, :J, :K),
+        (; X = MULTI_OCC_X, n = MULTI_OCC_N, J = MULTI_OCC_J, K = MULTI_OCC_K),
+        nothing),
+    ("hierarchical_gp", evaluate_hierarchical_gp_source,
+        (:unconstrained, :y, :year_ind, :state_ind, :region_ind, :state_region_ind,
+         :N_years, :N_regions, :N_states, :N_years_obs),
+        (; y = HGP_Y, year_ind = HGP_YEAR_IND, state_ind = HGP_STATE_IND,
+           region_ind = HGP_REGION_IND, state_region_ind = HGP_STATE_REGION_IND,
+           N_years = HGP_N_YEARS, N_regions = HGP_N_REGIONS, N_states = HGP_N_STATES,
+           N_years_obs = HGP_N_YEARS_OBS),
+        _xla_is_cholesky_adjoint_gap),
+    ("kronecker_gp", evaluate_kronecker_gp_source, (:unconstrained, :x1, :y),
+        (; x1 = KRON_X1, y = KRON_Y), _xla_is_kron_scalar_indexing_gap),
+)
+
+function _xla_gradient_measure(a, have, bound)
+    # A generic (non-symmetric) point near the example's demo position.
+    q = a.inputs.q .+ 0.05 .* sin.(1:length(a.inputs.q))
+    kernel = prepare(a.model; have, want = :posterior, bound)
+    native = kernel(q)
+    fd = _central_fd_gradient(kernel, q)
+    value, gradient = _xla_value_and_gradient(kernel, q)
+    (; native, fd, value, gradient)
+end
+
+# `is_gap` is `nothing`, or the signature of that item's pinned gap (above).
+@testset "PPL examples compiled reverse gradient ($label)" for (label, evaluate, have, bound, is_gap) in _XLA_GRADIENT_ITEMS
+    gapped = is_gap !== nothing
+    try
+        a = evaluate()
+        # The evaluated source defines fresh methods; cross the world-age barrier.
+        r = Base.invokelatest(_xla_gradient_measure, a, have, bound)
+        @test _rapprox(r.value, r.native)
+        @test all(isfinite, r.gradient)
+        @test r.gradient ≈ r.fd rtol = 1e-5
+        # Self-firing pin: errors (Unexpected Pass) once the gap closes,
+        # forcing removal of the gate.
+        gapped && @test_broken true
+    catch e
+        gapped && is_gap(e) || rethrow()
     end
 end
