@@ -3040,6 +3040,17 @@ remaining HAVE ports positionally (in their original relative order); the
 hoisted values are baked in as constants. With `bound = ()` (the default)
 behavior is unchanged. `passes` apply to the residual (per-call) kernel.
 
+Preparing a `Graph` (or an authored `KernelSpec`) with a non-empty `bound`
+reuses everything that does not depend on the bound values — the plan, the
+compiled data-only prefix and the compiled residual — from earlier bindings of
+the same graph version, HAVE/WANT boundary, bound port set and passes, exactly
+as [`prepare!`](@ref) does with a [`PreparationCache`](@ref). A binding of new
+values then costs the prefix's execution, not a fresh planning, lowering and
+compilation. The graph holds these entries, so they live as long as the graph,
+a mutation of the graph starts afresh, and they keep no bound values. Passes
+that are not singletons (closures) are not retained: such a binding is
+prepared afresh. A `Plan` is always prepared afresh.
+
 Selected authored plates with a single plate consumer are composed during
 lowering, eliminating the intermediate array. Named ports remain in `p`: asking
 for an intermediate, supplying it as HAVE, or selecting another consumer keeps
@@ -3084,6 +3095,8 @@ function prepare(p::Plan; passes = (), bound = ())
 end
 
 function prepare(g::Graph; have = (), want = (), passes = (), bound = ())
+    _reuses_bound_preparation(bound, passes) &&
+        return _graph_bound_preparation(g, have, want, passes, bound)
     p = plan(g; have = have, want = want)
     prepare(p; passes = passes, bound = bound)
 end
