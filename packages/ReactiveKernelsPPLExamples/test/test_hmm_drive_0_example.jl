@@ -9,6 +9,21 @@ using SpecialFunctions: loggamma
 
 const _HMM0_AE = AutoEnzyme(mode = Enzyme.Reverse)
 
+# Signature of the pinned upstream Enzyme static-activity gap (see the gradient
+# testset below): `Enzyme.Compiler.EnzymeRuntimeActivityError` "Detected potential
+# need for runtime activity" (measured Enzyme 0.13.208, Julia 1.10.11).
+_hmm0_is_upstream_gap(e) = e isa Enzyme.Compiler.EnzymeRuntimeActivityError
+
+function _hmm0_fd(f, q; h = 1e-6)
+    g = similar(q)
+    for i in eachindex(q)
+        qp = copy(q); qp[i] += h
+        qm = copy(q); qm[i] -= h
+        g[i] = (f(qp) - f(qm)) / (2h)
+    end
+    g
+end
+
 # Graph-independent reference oracle for posteriordb `hmm_drive_0` (posterior
 # `bball_drive_event_0-hmm_drive_0`): the Stan 2.39 inverse-ILR simplex[2] and
 # positive_ordered[2] transforms with their exact Jacobians, the Dirichlet
@@ -150,25 +165,28 @@ end
         end
     end
 
-    @testset "plain-Enzyme reverse gradient — documented static-activity gap" begin
-        # Same documented RK/Enzyme limitation as hmm_drive_1 (snag
-        # scan-prior-enzym-d67d4ac1): the authored scan combined with the
-        # model's six prior endpoint terms trips static activity analysis.
-        # Assert the documented failure so the gap is pinned, not hidden; if
-        # RK fixes the snag, replace this block with full gradient assertions.
-        kb = prepare(model;
-            have = (:unconstrained, :u, :v, :alpha), want = :posterior,
-            bound = (; u = HMM_DRIVE_0_U, v = HMM_DRIVE_0_V, alpha = HMM_DRIVE_0_ALPHA))
-        q = [0.3, -0.2, 0.0, 0.0, 0.0, 0.0]
-        prep = prepare_ad(kb, _HMM0_AE, q; active = :unconstrained)
-        err = try
-            ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)
-            nothing
+    @testset "native primal + plain-Enzyme gradient vs finite differences" begin
+        # Pinned upstream Enzyme gap (snag scan-prior-enzym-d67d4ac1;
+        # reactivekernels-use §7q): the authored scan plus the prior endpoint
+        # terms fail plain static-activity reverse mode with
+        # `Enzyme.Compiler.EnzymeRuntimeActivityError`. Only that signature is
+        # tolerated; anything else rethrows.
+        gapped = true
+        kb = prepare(model; have = _HMM0_HAVE, want = :posterior, bound = _HMM0_BOUND)
+        q = [0.4, 0.25, -0.1, 0.2, 0.05, -0.15]
+        reference(qq) = _hmm_drive_0_reference(qq, HMM_DRIVE_0_U, HMM_DRIVE_0_V,
+            HMM_DRIVE_0_ALPHA).posterior
+        try
+            prep = prepare_ad(kb, _HMM0_AE, q; active = :unconstrained)
+            value, g = ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)
+            @test value ≈ reference(q)
+            @test all(isfinite, g)
+            @test g ≈ _hmm0_fd(reference, q) rtol = 1e-5
+            # Self-firing pin: errors (Unexpected Pass) once upstream Enzyme
+            # differentiates this program, forcing removal of the gate.
+            gapped && @test_broken true
         catch e
-            sprint(showerror, e)
+            gapped && _hmm0_is_upstream_gap(e) || rethrow()
         end
-        @test err !== nothing
-        @test occursin("EnzymeRuntimeActivityError", err)
     end
-
 end

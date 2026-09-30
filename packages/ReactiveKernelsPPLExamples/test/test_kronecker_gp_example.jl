@@ -5,6 +5,29 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     lognormal, lkj_corr_cholesky
 using LinearAlgebra: I, Symmetric, diag, eigen
 using SpecialFunctions: logbeta, loggamma
+using DifferentiationInterface
+import Enzyme
+
+const _KRON_AE = AutoEnzyme(mode = Enzyme.Reverse)
+
+# Pinned upstream Enzyme gap: the margin eigendecompositions
+# `eigen(Symmetric(...))` reach LAPACK `dsyevr_64_` (via
+# `LinearAlgebra.LAPACK.syevr!`), which has no Enzyme derivative rule —
+# `Enzyme.Compiler.EnzymeNoDerivativeError`: "No augmented forward pass found
+# for dsyevr_64_" (measured Enzyme 0.13.208, Julia 1.10.11). Only that
+# signature is tolerated; anything else rethrows.
+_kron_is_upstream_gap(e) = e isa Enzyme.Compiler.EnzymeNoDerivativeError &&
+    occursin("No augmented forward pass found for dsyevr_64_", sprint(showerror, e))
+
+function _kron_fd(f, q; h = 1e-6)
+    g = similar(q)
+    for i in eachindex(q)
+        qp = copy(q); qp[i] += h
+        qm = copy(q); qm[i] -= h
+        g[i] = (f(qp) - f(qm)) / (2h)
+    end
+    g
+end
 
 const _KRON_N = 30
 _kron_dim() = 2 + (_KRON_N * (_KRON_N - 1)) ÷ 2 + 1
@@ -148,6 +171,25 @@ end
             ref = _kron_reference(qp, KRON_X1, KRON_Y)
             @test log_jacobian ≈ ref.log_jacobian
             @test posterior ≈ ref.posterior
+        end
+    end
+
+    @testset "native primal + plain-Enzyme gradient vs finite differences" begin
+        gapped = true
+        pk = prepare(model; have = _KRON_HAVE, want = :posterior, bound = _KRON_BOUND)
+        @test pk(q) ≈ reference.posterior
+        try
+            prep = prepare_ad(pk, _KRON_AE, q; active = :unconstrained)
+            value, g = ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)
+            @test value ≈ reference.posterior
+            @test all(isfinite, g)
+            gfd = _kron_fd(qq -> _kron_reference(qq, KRON_X1, KRON_Y).posterior, q)
+            @test g ≈ gfd rtol = 1e-5
+            # Self-firing pin: errors (Unexpected Pass) once upstream Enzyme
+            # differentiates `dsyevr_64_`, forcing removal of the gate.
+            gapped && @test_broken true
+        catch e
+            gapped && _kron_is_upstream_gap(e) || rethrow()
         end
     end
 end
