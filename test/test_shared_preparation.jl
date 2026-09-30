@@ -129,13 +129,12 @@ end
     @test length(cache) == 2
 
     # A binding of differently TYPED data on the same ports reuses the entry
-    # (no re-planning, same prefix kernel). This residual contains an authored
-    # plate, so its template is per bound type/shape; the port-keyed sharing of
-    # one compiled residual across types is asserted on the plate-free fixture
-    # below.
+    # (no re-planning, same prefix kernel) and, since the inner-plate pass
+    # leaves this plate alone, the same compiled residual.
     fill!(C.calls, 0)
     k5 = prepare!(cache, C.explicit; bound = (; data = [2, 3]))
     @test C.calls == [1, 0, 0]
+    @test k5.f === k1.f
     @test k5(samples, q, scale) == C.opaque(samples, [2, 3], q, scale)
     @test k1(samples, q, scale) == C.opaque(samples, data, q, scale)
     @test length(cache) == 2
@@ -223,6 +222,91 @@ end
     end
     @test all(k -> k.f === first(kernels).f, kernels)
     @test length(cache) == 1
+end
+
+# The ShinyRK simulation graph with its superposition plate authored inline:
+# a bound schedule fixes the plate's domain and unit response, the dose
+# amounts stay live. A plate with a bound-only cell value, which the
+# inner-plate pass specializes only on a domain longer than one lane.
+module InlinePlateFixture
+using ReactiveKernels
+struct LatticePlan
+    nobs::Int
+    shifts::Vector{Int}
+    lags::Vector{Float64}
+end
+row_index(observation, plan::LatticePlan, i) = observation - plan.shifts[i]
+dose_slots(plan::LatticePlan) = eachindex(plan.shifts)
+observation_domain(plan::LatticePlan) = 1:plan.nobs
+@kernel simulation(kernel, plan, amounts::Vector{Float64}) = begin
+    units::Vector{Float64} = exp.(-kernel.k .* plan.lags)
+    weights::Vector{Float64} = amounts .* kernel.F
+    observations = observation_domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do o, p, u, w
+        sum((w[i] * get(u, row_index(o, p, i), 0.0) for i in dose_slots(p)); init = 0.0)
+    end
+    total = sum(concentration)
+    return total
+end
+schedule(n, doses; offset = 0) =
+    LatticePlan(n, collect(offset .+ 3 .* (1:doses)), collect(0.1 .* (0:(n - 1))))
+reference(kernel, plan, amounts) = sum(
+    sum((amounts[i] * kernel.F * get(exp.(-kernel.k .* plan.lags), o - plan.shifts[i], 0.0)
+         for i in eachindex(plan.shifts)); init = 0.0) for o in 1:plan.nobs)
+@kernel scaled(x::Vector{Float64}, data) = begin
+    values = plate(x, data) do xi, d
+        c = exp(d)
+        xi * c
+    end
+    return values
+end
+end
+
+# An inline plate the inner-plate pass leaves alone rebinds to new bound array
+# lengths through the one compiled residual, as the same plate in a prepared
+# child does; the pass still decides every binding, so a binding it rewrites is
+# specialized and the next binding it declines reuses the template (snag
+# inline-plate-reb-7387f072: templates keyed on bound array sizes re-lowered
+# the ShinyRK simulation graph at every new schedule length and kept one
+# template per length).
+@testset "bound preparation shares an inline plate's residual across lengths" begin
+    F = InlinePlateFixture
+    kernel = (; k = 0.3, F = 0.8)
+    fresh(spec, bound) = prepare(plan(spec);
+        bound = ReactiveKernels._kernel_bound_pairs(spec, bound))
+    kernels = map([(40, 3, 0), (42, 3, 0), (40, 3, 1), (57, 5, 0), (8, 1, 2)]) do (n, doses, offset)
+        schedule = F.schedule(n, doses; offset)
+        k = prepare(F.simulation; bound = (; kernel, plan = schedule))
+        amounts = collect(1.0:doses)
+        @test k(amounts) == fresh(F.simulation, (; kernel, plan = schedule))(amounts)
+        @test k(amounts) ≈ F.reference(kernel, schedule, amounts)
+        k
+    end
+    # One compiled residual (the template's lowering) for every length.
+    @test all(k -> k.f === first(kernels).f && k.ast === first(kernels).ast, kernels)
+    entries = collect(values(F.simulation.graph.preparations.cache.bound))
+    @test length(entries) == 1
+    @test only(entries).template isa ReactiveKernels._BoundTemplate
+    # The same through a caller-owned cache, and across a kernel's type.
+    cache = PreparationCache()
+    k1 = prepare!(cache, F.simulation; bound = (; kernel, plan = F.schedule(30, 2)))
+    k2 = prepare!(cache, F.simulation; bound = (; kernel = (; k = 1, F = 2), plan = F.schedule(31, 2)))
+    @test k2.ast === k1.ast
+    @test k2([1.0, 2.0]) ≈ F.reference((; k = 1, F = 2), F.schedule(31, 2), [1.0, 2.0])
+
+    # Specialized (a domain longer than one lane) and unspecialized (one lane)
+    # bindings interleaved: each follows the pass's verdict for its own values.
+    declined = []
+    for (x, data) in (([1.0, 2.0, 3.0], [0.1, 0.2, 0.3]), ([1.0, 2.0, 3.0, 4.0], [0.5]),
+                      ([1.0, 2.0], [0.0, 1.0]), ([2.0, 5.0], [0.25]))
+        k = prepare(F.scaled; bound = (; data))
+        @test k(x) == x .* exp.(data)
+        @test k(x) == fresh(F.scaled, (; data))(x)
+        length(data) == 1 ? push!(declined, k) :
+            @test any(r -> r.op isa ReactiveKernels._AuthoredPlateOp &&
+                           length(r.inputs) > 2, k.plan.recipes)
+    end
+    @test declined[2].ast === declined[1].ast
 end
 
 module FirstRebindingFixture

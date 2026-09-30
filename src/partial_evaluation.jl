@@ -747,13 +747,17 @@ end
 #
 # The residual body is value-independent exactly when the inner-plate pass
 # (`_partial_inner_plates`) leaves the residual plan alone: its plate
-# specializations and data-bound branch partitions bake bound values in.
-# Whether that pass changes a plan is decided by the bound and hoisted values'
-# types and array shapes, never by the numbers themselves, so a residual
-# containing authored plates is templated per shape signature, and a
-# residual the pass would rewrite keeps the ordinary per-binding
-# specialization on the cached plan and prefix. A residual without authored
-# plates shares one template across every binding.
+# specializations and data-bound branch partitions bake bound values in. That
+# pass is the only authority on whether it changes a plan, so a residual
+# containing authored plates runs it on every binding: a binding it rewrites
+# keeps the ordinary per-binding specialization on the cached plan and prefix,
+# and every binding it leaves alone shares the one template, whatever its
+# values' types or array extents. The pass declines cheaply, before any
+# evaluation, when a plate has nothing bound to specialize. A residual without
+# authored plates skips the pass and shares the template outright. Nothing is
+# kept per binding value, type or extent (snag inline-plate-reb-7387f072:
+# keying templates on bound array sizes re-lowered the ShinyRK simulation
+# graph at every new schedule length and kept one template per length).
 #
 # Nothing here is on a kernel's call path, and the kernel types involved are
 # as varied as the graphs prepared, so an entry and a template are untyped
@@ -773,69 +777,78 @@ struct _BoundTemplate
     lowered::Tuple   # the readable recipes after the constant slots
 end
 
-struct _BoundEntry
-    plan::Plan
-    boundary::_PartialBoundary
-    prefix::Any                # prepared prefix kernel, or `nothing` without constants
-    shaped::Bool               # residual authored plates: templates are per value shape
-    # shape key => `_BoundTemplate`; the kernel itself when it has no constant
-    # slots; or `nothing` (a value-dependent residual: the per-binding path)
-    templates::Dict{Any,Any}
+# The template slot before the first binding the inner-plate pass left alone.
+struct _UnbuiltTemplate end
+
+mutable struct _BoundEntry
+    const plan::Plan
+    const boundary::_PartialBoundary
+    const prefix::Any          # prepared prefix kernel, or `nothing` without constants
+    const plates::Bool         # residual authored plates: the inner-plate pass runs per binding
+    # A `_BoundTemplate`; the kernel itself when it has no constant slots;
+    # `nothing` (a residual whose leading slots are not exactly its
+    # constants: the per-binding path); or `_UnbuiltTemplate()`.
+    template::Any
 end
 
 function _bound_entry(p::Plan, @nospecialize(ports))
     boundary = _partial_boundary(p, collect(Value, _astuple(ports)))
     prefix = isempty(boundary.constants) ? nothing :
              prepare(_partial_prefix_plan(p, boundary))
-    shaped = any(r -> r.op isa _AuthoredPlateOp, boundary.residual)
-    _BoundEntry(p, boundary, prefix, shaped, Dict{Any,Any}())
+    plates = any(r -> r.op isa _AuthoredPlateOp, boundary.residual)
+    _BoundEntry(p, boundary, prefix, plates, _UnbuiltTemplate())
 end
 
 _bound_hoisted(entry::_BoundEntry, @nospecialize(data::Tuple)) =
     entry.prefix === nothing ? () :
     _partial_prefix_values(entry.boundary.constants, entry.prefix(data...))
 
-# What the inner-plate pass can see of a value: its type and array extents.
-_bound_shape(x) = typeof(x)
-_bound_shape(x::AbstractArray) = (typeof(x), size(x))
-_bound_shape(x::Tuple) = map(_bound_shape, x)
-_bound_shape(x::NamedTuple) = map(_bound_shape, x)
-_bound_shape(x::Ref) = (typeof(x), _bound_shape(x[]))
+# One binding's residual plan, and the plan the inner-plate pass specialized
+# from it (the same object when the pass left it alone, or did not run).
+function _bound_residual(entry::_BoundEntry, @nospecialize(hoisted))
+    entry.plates || return nothing, nothing
+    _partial_residual(entry.plan, entry.boundary, hoisted)
+end
 
-_bound_shape_key(entry::_BoundEntry, @nospecialize(data), @nospecialize(hoisted)) =
-    entry.shaped ? (_bound_shape(data), _bound_shape(hoisted)) : nothing
-
-# The first binding of a shape: the ordinary preparation, capturing the
-# template when the residual proved value-independent. Returns the template
-# (or `nothing`) and this binding's kernel.
-function _bound_build(entry::_BoundEntry, @nospecialize(hoisted), @nospecialize(passes))
-    residual, specialized = _partial_residual(entry.plan, entry.boundary, hoisted)
-    kernel = prepare(specialized; passes = passes)
+# The first value-independent binding: the ordinary preparation, capturing
+# the template when the leading operation-table slots are exactly the
+# constants. Returns the template (or `nothing`) and this binding's kernel.
+function _bound_build(entry::_BoundEntry, @nospecialize(residual),
+                      @nospecialize(hoisted), @nospecialize(passes))
+    residual === nothing &&
+        (residual = _partial_residual_plan(entry.plan, entry.boundary, hoisted))
+    kernel = prepare(residual; passes = passes)
     n = length(entry.boundary.constants)
     # Rebinding swaps the leading operation-table slots, so they must be
     # exactly this binding's constants in slot order.
-    templated = specialized === residual &&
-        all(i -> kernel.ops[i] isa _BoundConstant && kernel.ops[i].value === hoisted[i], 1:n)
+    templated = all(i -> kernel.ops[i] isa _BoundConstant &&
+                         kernel.ops[i].value === hoisted[i], 1:n)
     templated || return nothing, kernel
     n == 0 && return kernel, kernel
     _BoundTemplate(kernel.f, kernel.ops[(n + 1):end], kernel.inputs, kernel.outputs,
                    kernel.ast, kernel.lowered_recipes[(n + 1):end]), kernel
 end
 
-# A later binding of a value-dependent residual: inner-plate specialization
-# and compilation on the cached plan and prefix.
-_bound_rebind(entry::_BoundEntry, ::Nothing, @nospecialize(hoisted), @nospecialize(passes)) =
-    prepare(last(_partial_residual(entry.plan, entry.boundary, hoisted)); passes = passes)
+# A later binding of a residual whose leading slots are not its constants:
+# compilation on the cached plan and prefix.
+function _bound_rebind(entry::_BoundEntry, ::Nothing, @nospecialize(residual),
+                       @nospecialize(hoisted), @nospecialize(passes))
+    residual === nothing &&
+        (residual = _partial_residual_plan(entry.plan, entry.boundary, hoisted))
+    prepare(residual; passes = passes)
+end
 
 # A residual that reads no hoisted value is one kernel for every binding.
-_bound_rebind(::_BoundEntry, kernel::PreparedKernel, @nospecialize(hoisted),
-              @nospecialize(passes)) = kernel
+_bound_rebind(::_BoundEntry, kernel::PreparedKernel, @nospecialize(residual),
+              @nospecialize(hoisted), @nospecialize(passes)) = kernel
 
-# A later binding of a value-independent residual: the same compiled callable
-# over a fresh constant table.
+# A later value-independent binding: the same compiled callable over a fresh
+# constant table.
 function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
-                       @nospecialize(hoisted), @nospecialize(passes))
-    residual = _partial_residual_plan(entry.plan, entry.boundary, hoisted)
+                       @nospecialize(residual), @nospecialize(hoisted),
+                       @nospecialize(passes))
+    residual === nothing &&
+        (residual = _partial_residual_plan(entry.plan, entry.boundary, hoisted))
     recipes = residual.recipes[1:length(entry.boundary.constants)]
     ops = (Any[recipe.op for recipe in recipes]..., template.ops...)
     PreparedKernel(template.f, ops, template.inputs, template.outputs, residual,
