@@ -211,6 +211,36 @@ lowering rewrites only the residual work. Optional downstream preparation
 surfaces consume that same residual plan rather than implementing another
 partial evaluator.
 
+#### Rebinding through a preparation cache
+
+`prepare(…; bound)` repeats, for every binding, work that does not depend on
+the bound values: planning, the prefix's lowering and compilation, and the
+residual's lowering and compilation. When one graph is bound again and again
+with fresh data — a request-time binding per user interaction — that fixed
+cost can exceed the bound-data mathematics itself. `prepare!(cache, spec;
+have, want, bound)` (and the `Graph` form) keeps that value-independent work
+in a caller-owned `PreparationCache`, per graph version, boundary, bound port
+set and passes: the plan, the prepared prefix kernel, and the compiled
+residual. A later binding of new values to the same ports runs the prefix on
+those values and returns the residual kernel around the same compiled
+callable with a fresh constant table. The returned kernel is the one
+`prepare(…; bound)` returns; only what is recomputed per binding changes. The
+entry is keyed on the bound ports, not on the bound values or their types: a
+later binding of differently typed data on the same ports (a different plan
+struct, an integer vector for a float one) reuses the entry, and its generic
+compiled bodies specialize per concrete type on first use as any Julia call
+does; a lazy branch on a hoisted constant remains a per-call branch and follows
+each binding's value.
+
+The residual body is value-independent exactly when the inner-plate pass
+below leaves it alone. A residual whose authored plates specialize on bound
+data — bound-only cell recipes evaluated at preparation, data-bound branch
+partitions — is still specialized and compiled per binding and reuses only
+the plan and prefix; a residual containing authored plates is templated per
+bound-value type and array-shape signature, because those decide whether the
+pass rewrites it. The cache never observes bound values after preparation, so
+binding freshness remains the caller's responsibility as for `prepare`.
+
 #### Data-bound branches in plate cells
 
 A plate cell statement whose right-hand side is a lazy branch (`c ? a : b`,

@@ -3105,9 +3105,26 @@ function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
     _kernel_signature_callable(prepared, spec.call_signature)
 end
 
+"""
+    prepare!(cache, spec::KernelSpec; have, want, passes=(), bound=(;)) -> callable
+
+Like [`prepare`](@ref) on an authored kernel, reusing `cache`. With a
+non-empty `bound` NamedTuple the [`partial_evaluation`](@ref) pre-pass runs as
+in `prepare`, and the cache keeps its value-independent work — the plan, the
+prepared data-only prefix and the compiled residual — per bound port set, so
+rebinding new data to the same ports costs the prefix's execution and nothing
+else. Use it where one graph is prepared repeatedly with fresh bound data (a
+request-time binding per user interaction); the returned kernel is positional
+over the remaining HAVE ports exactly as `prepare(spec; bound)` returns it.
+"""
 function prepare!(cache::PreparationCache, spec::KernelSpec;
                   have = _KERNEL_DEFAULT_BOUNDARY,
-                  want = _KERNEL_DEFAULT_BOUNDARY, passes = ())
+                  want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
+                  bound = NamedTuple())
+    isempty(bound) || return prepare!(cache, spec.graph;
+        have = _kernel_selection(spec, have, spec.have_names, :have),
+        want = _kernel_selection(spec, want, spec.want_names, :want),
+        passes = passes, bound = _kernel_bound_pairs(spec, bound))
     prepared = prepare!(cache, spec.graph;
                         have = _kernel_selection(spec, have, spec.have_names, :have),
                         want = _kernel_selection(spec, want, spec.want_names, :want),

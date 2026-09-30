@@ -67,7 +67,7 @@ end
 # Two-exponential disposition of the twocmt matrix: slow/fast rates
 # `(α, β)` plus the convex weights `(C1, C2)`. The numerators are
 # rationalized against the sign of `D0` (see the file header).
-function _twocmt_disposition(k10, k12, k21)
+@inline function _twocmt_disposition(k10, k12, k21)
     D0 = k10 + k12 - k21
     disc = sqrt(D0 * D0 + 4.0 * k12 * k21)
     half_trace = 0.5 * (k10 + k12 + k21)
@@ -78,9 +78,9 @@ function _twocmt_disposition(k10, k12, k21)
     return α, β, N1 / disc, M2 / disc
 end
 
-_twocmt_weights_low(disc, D0, k12, k21) =
+@inline _twocmt_weights_low(disc, D0, k12, k21) =
     (0.5 * (disc - D0), (2.0 * k12 * k21) / (disc - D0))
-_twocmt_weights_high(disc, D0, k12, k21) =
+@inline _twocmt_weights_high(disc, D0, k12, k21) =
     ((2.0 * k12 * k21) / (disc + D0), 0.5 * (disc + D0))
 
 # `Σ_{n≥0} w^n/((s+n)*n!)`: the `S` series, from expanding `e^(-μu)` and
@@ -131,7 +131,7 @@ end
 
 # One disposition-mode convolution `I(λ,t)` (see the file header).
 # `s_log_r = s*log(r)` and `lgs = lgamma(s)` are hoisted by the caller.
-function _transit_mode_I(λ, t, rate,
+@inline function _transit_mode_I(λ, t, rate,
         shape, s_log_r, lgs,
         rtol::Float64 = 1e-15, watson_terms::Int = _TRANSIT_WATSON_TERMS)
     return first(_transit_mode_math(λ, t, rate, shape, s_log_r, lgs, 0.0,
@@ -198,7 +198,7 @@ struct _TransitResponseStep
     watson_terms::Int
 end
 
-function (step::_TransitResponseStep)(out, row, α, β, C1, C2,
+@inline function (step::_TransitResponseStep)(out, row, α, β, C1, C2,
         rate, shape, s_log_r, lgs)
     i, t = row
     Iα = _transit_mode_I(α, t, rate, shape, s_log_r, lgs,

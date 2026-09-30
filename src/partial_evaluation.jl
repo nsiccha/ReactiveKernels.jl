@@ -638,12 +638,36 @@ copy. Rebinding new data means running the pass
 again from the same original plan.
 """
 function partial_evaluation(p::Plan, bound, values)
-    g = p.graph
     bound_values = collect(Value, _astuple(bound))
     value_tuple = Tuple(_astuple(values))
     length(bound_values) == length(value_tuple) || throw(ArgumentError(
         "partial evaluation received $(length(bound_values)) bound ports " *
         "but $(length(value_tuple)) bound values"))
+    boundary = _partial_boundary(p, bound_values)
+    hoisted = _partial_hoisted(p, boundary, value_tuple)
+    last(_partial_residual(p, boundary, hoisted))
+end
+
+"""
+    _PartialBoundary
+
+The value-independent half of a partial evaluation: the bound HAVE ports (in
+the caller's order), the remaining HAVE ports (in plan order), the data-only
+`prefix` and the `residual` recipe partition, and the hoisted `constants`
+boundary between them (in constant-slot order). Everything here is a function
+of the plan and the bound PORT set alone, so a cached bound preparation
+(`prepare!(cache, …; bound = …)`) computes it once per boundary.
+"""
+struct _PartialBoundary
+    bound::Vector{Value}
+    remaining::Vector{Value}
+    prefix::Vector{Recipe}
+    residual::Vector{Recipe}
+    constants::Vector{Value}
+end
+
+function _partial_boundary(p::Plan, bound_values::Vector{Value})
+    g = p.graph
     have_ids = Set(canon_id(g, v.id) for v in p.have)
     bound_ids = Set{Int}()
     for v in bound_values
@@ -655,26 +679,138 @@ function partial_evaluation(p::Plan, bound, values)
         push!(bound_ids, cid)
     end
     remaining = Value[v for v in p.have if !(canon_id(g, v.id) in bound_ids)]
-
     prefix, residual, prefix_owned = _partial_split(p, bound_ids)
-    constant_values = _partial_constants(p, prefix_owned, residual)
+    constants = _partial_constants(p, prefix_owned, residual)
+    _PartialBoundary(bound_values, remaining, prefix, residual, constants)
+end
 
-    recipes = residual
+# The prefix plan: bound ports in, hoisted constants out.
+_partial_prefix_plan(p::Plan, b::_PartialBoundary) =
+    _partial_subplan(p, b.bound, b.constants, b.prefix)
+
+# Prepare and run the prefix once for one binding's values; `()` when nothing
+# the residual reads is bind-time.
+_partial_hoisted(p::Plan, b::_PartialBoundary, values::Tuple) =
+    isempty(b.constants) ? () :
+    _partial_prefix_values(b.constants, prepare(_partial_prefix_plan(p, b))(values...))
+
+# The zero-input constant recipes carrying one binding's hoisted values into
+# the residual plan, under negative ids that cannot collide with graph recipes.
+_partial_constant_recipes(constants::Vector{Value}, hoisted) =
+    [Recipe(-index, (), (value,), _BoundConstant(hoisted[index]), 0.0, nothing, false)
+     for (index, value) in enumerate(constants)]
+
+# The residual plan for one binding — constant slots first, then the residual
+# recipes — and its inner-plate specialization over the hoisted values. The
+# second is the plan `prepare` compiles; it is the first object exactly when
+# the inner-plate pass had nothing to do.
+function _partial_residual(p::Plan, b::_PartialBoundary, hoisted)
+    g = p.graph
     known = Dict{Int,Any}()
-    if !isempty(constant_values)
-        prefix_plan = _partial_subplan(p, bound_values, constant_values, prefix)
-        hoisted = _partial_prefix_values(
-            constant_values, prepare(prefix_plan)(value_tuple...))
-        for (value, data) in zip(constant_values, hoisted)
+    recipes = b.residual
+    if !isempty(b.constants)
+        for (value, data) in zip(b.constants, hoisted)
             known[canon_id(g, value.id)] = data
         end
-        recipes = vcat(
-            [Recipe(-index, (), (value,), _BoundConstant(hoisted[index]),
-                    0.0, nothing, false)
-             for (index, value) in enumerate(constant_values)],
-            residual)
+        recipes = vcat(_partial_constant_recipes(b.constants, hoisted), b.residual)
     end
-    _partial_inner_plates(_partial_subplan(p, remaining, p.want, recipes), known)
+    residual = _partial_subplan(p, b.remaining, p.want, recipes)
+    residual, _partial_inner_plates(residual, known)
+end
+
+# ---------------------------------------------------------------------------
+# Cached bound preparation (`prepare!(cache, …; bound = …)`).
+#
+# `prepare(…; bound = …)` repeats, per binding, work that does not depend on
+# the bound VALUES at all: exact planning, the prefix plan's lowering and
+# compilation, the residual plan's lowering(s) and compilation(s), and the
+# embedded-marker analysis. For a graph prepared over and over with fresh data
+# — a request-time `bound=` per user interaction — that fixed cost dominates
+# once the compiled bodies themselves are content-cached (snag
+# prepare-with-bou-c237dc00: ~1.3 ms of the ~2.6 ms `prepare` of the ShinyRK
+# simulation graph on strato2, against ~1.25 ms of genuine bound-data
+# mathematics in its prefix). A `_BoundEntry` keeps the planned boundary and
+# the compiled prefix kernel per (graph, boundary, bound-port set, passes),
+# and a `_BoundTemplate` keeps the compiled residual, so rebinding runs the
+# prefix on the new values and rebuilds the residual `PreparedKernel` around
+# the same compiled callable with a fresh constant table.
+#
+# The residual body is value-independent exactly when the inner-plate pass
+# (`_partial_inner_plates`) leaves the residual plan alone: its plate
+# specializations and data-bound branch partitions bake bound values in.
+# Whether that pass changes a plan is decided by the bound and hoisted values'
+# types and array shapes, never by the numbers themselves, so a residual
+# containing authored plates is templated per shape signature, and a
+# residual the pass would rewrite keeps the ordinary per-binding
+# specialization on the cached plan and prefix. A residual without authored
+# plates shares one template across every binding.
+
+struct _BoundTemplate{K}
+    residual::Plan   # recipes 1:n are the constant slots of the binding it came from
+    kernel::K        # the residual `PreparedKernel`; `f`, `ast` and the tail of `ops` are reused
+end
+
+struct _BoundEntry{PK}
+    plan::Plan
+    boundary::_PartialBoundary
+    prefix::PK                 # prepared prefix kernel, or `nothing` without constants
+    shaped::Bool               # residual authored plates: templates are per value shape
+    templates::Dict{Any,Any}   # shape key => `_BoundTemplate`, or `nothing` (per-binding path)
+end
+
+function _bound_entry(p::Plan, ports)
+    boundary = _partial_boundary(p, collect(Value, _astuple(ports)))
+    prefix = isempty(boundary.constants) ? nothing :
+             prepare(_partial_prefix_plan(p, boundary))
+    shaped = any(r -> r.op isa _AuthoredPlateOp, boundary.residual)
+    _BoundEntry(p, boundary, prefix, shaped, Dict{Any,Any}())
+end
+
+_bound_hoisted(entry::_BoundEntry, data::Tuple) =
+    entry.prefix === nothing ? () :
+    _partial_prefix_values(entry.boundary.constants, entry.prefix(data...))
+
+# What the inner-plate pass can see of a value: its type and array extents.
+_bound_shape(x) = typeof(x)
+_bound_shape(x::AbstractArray) = (typeof(x), size(x))
+_bound_shape(x::Tuple) = map(_bound_shape, x)
+_bound_shape(x::NamedTuple) = map(_bound_shape, x)
+_bound_shape(x::Ref) = (typeof(x), _bound_shape(x[]))
+
+_bound_shape_key(entry::_BoundEntry, data, hoisted) =
+    entry.shaped ? (_bound_shape(data), _bound_shape(hoisted)) : nothing
+
+# The first binding of a shape: the ordinary preparation, capturing the
+# template when the residual proved value-independent. Returns the template
+# (or `nothing`) and this binding's kernel.
+function _bound_build(entry::_BoundEntry, hoisted, passes)
+    residual, specialized = _partial_residual(entry.plan, entry.boundary, hoisted)
+    kernel = prepare(specialized; passes = passes)
+    n = length(entry.boundary.constants)
+    # Rebinding swaps the leading operation-table slots, so they must be
+    # exactly this binding's constants in slot order.
+    templated = specialized === residual &&
+        all(i -> kernel.ops[i] isa _BoundConstant && kernel.ops[i].value === hoisted[i], 1:n)
+    (templated ? _BoundTemplate(residual, kernel) : nothing), kernel
+end
+
+# The per-binding path for a value-dependent residual: inner-plate
+# specialization and compilation on the cached plan and prefix.
+_bound_specialize(entry::_BoundEntry, hoisted, passes) =
+    prepare(last(_partial_residual(entry.plan, entry.boundary, hoisted)); passes = passes)
+
+# A later binding: the same compiled callable over a fresh constant table.
+function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate, hoisted)
+    k = template.kernel
+    constants = entry.boundary.constants
+    n = length(constants)
+    n == 0 && return k
+    recipes = _partial_constant_recipes(constants, hoisted)
+    ops = (Tuple(r.op for r in recipes)..., k.ops[(n + 1):end]...)
+    lowered = (recipes..., k.lowered_recipes[(n + 1):end]...)
+    residual = _partial_subplan(template.residual, template.residual.have,
+        template.residual.want, vcat(recipes, template.residual.recipes[(n + 1):end]))
+    PreparedKernel(k.f, ops, k.inputs, k.outputs, residual, k.ast, lowered)
 end
 
 # Normalize the public `bound` kwarg — one `Value => data` pair or an
