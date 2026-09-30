@@ -103,6 +103,36 @@ end
     @test only(sg.terms).kind === ComposedTerm
 end
 
+@testset "composed named nesting (v2)" begin
+    # A name bound to a composition inlines at its use (naming a
+    # subexpression never changes legality; v1 failed these closed).
+    plan = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        ga ~ Normal(0.0, 100.0)
+        mid = be .* th
+        eta = ga .* mid
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    @test [p.name for p in plan.predictors] == [:th, :eta]
+    @test only(plan.predictors[2].terms).options.tree == :(ga .* (be .* th))
+    @test isempty(plan.derived)
+    # ... including through a shared composed root that is also a
+    # response location (the root interns; the use site inlines it).
+    shared = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        ga ~ Normal(0.0, 100.0)
+        mid = be .* th
+        y1 .~ Bernoulli.(logistic.(mid))
+        eta2 = ga .* mid
+        y2 .~ Bernoulli.(logistic.(eta2))
+    end, (:y1, :y2, :xs))
+    @test [p.name for p in shared.predictors] == [:th, :mid, :eta2]
+    @test only(shared.predictors[3].terms).options.tree ==
+        :(ga .* (be .* th))
+end
+
 @testset "composed fail-closed" begin
     # Undotted vector combination: Julia-truthful, write the dots.
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -125,25 +155,6 @@ end
         eta = be .* (th .+ xs)
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
-    # Nested compositions lower only at response/scale locations.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        th = a_th .+ b_th .* xs
-        be ~ Normal(0.0, 100.0)
-        ga ~ Normal(0.0, 100.0)
-        mid = be .* th
-        eta = ga .* mid
-        y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
-    # ... including through a shared, already-interned composed root.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        th = a_th .+ b_th .* xs
-        be ~ Normal(0.0, 100.0)
-        ga ~ Normal(0.0, 100.0)
-        mid = be .* th
-        y1 .~ Bernoulli.(logistic.(mid))
-        eta2 = ga .* mid
-        y2 .~ Bernoulli.(logistic.(eta2))
-    end, (:y1, :y2, :xs))
     # A scalar leaf names a sampled name or scalar definition — or fails.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         th = a_th .+ b_th .* xs

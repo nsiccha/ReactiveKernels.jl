@@ -579,6 +579,9 @@ function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
             "unknown sub-predictor $node"))
         return _lp_name(plan.predictors[i])
     end
+    # Dotted unary map `f.(x)`: `Expr(:., f, Expr(:tuple, x))`.
+    node.head === :. && return Expr(:., node.args[1], Expr(:tuple,
+        _composed_rewrite(only(node.args[2].args), subs, plan, pred)))
     return Expr(node.head, node.args[1],
         (_composed_rewrite(a, subs, plan, pred) for a in node.args[2:end])...)
 end

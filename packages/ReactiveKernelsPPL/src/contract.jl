@@ -6022,8 +6022,14 @@ function _validate_dar_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPl
 end
 
 const _COMPOSED_OPS = (:.*, :.+, :.-)
+# Elementwise unary maps admitted over a composed subtree (`exp.(la)` —
+# the IRT discrimination `a = exp(log_a)`), spelled as Julia dotted calls.
+const _COMPOSED_UNARY = (:exp,)
 const _COMPOSED_AFFINE_KINDS =
     (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
+# Sub-predictors are affine plus varying-effect summands (per-level
+# random effects: the IRT person ability `theta ~ 0 + (1 | person)`).
+const _COMPOSED_SUB_KINDS = (_COMPOSED_AFFINE_KINDS..., VaryingEffectTerm)
 
 """Recurse a composed tree: leaves must be declared subs/scalars, nodes
 dotted `.*`/`.+`/`.−` of matching arity. Returns the leaf set."""
@@ -6037,6 +6043,17 @@ function _validate_composed_tree(tree, subs::Vector{Symbol},
                 "composed tree leaf $node is neither a declared " *
                 "sub-predictor $subs nor a scalar $scalars")
             push!(leaves, node)
+            return nothing
+        end
+        if node isa Expr && node.head === :. && length(node.args) == 2
+            f, tup = node.args
+            f in _COMPOSED_UNARY || _fail(label,
+                "composed tree map $(repr(f)). is not admitted (v2: " *
+                "$(join(string.(_COMPOSED_UNARY, "."), ", ")))")
+            Meta.isexpr(tup, :tuple, 1) || _fail(label,
+                "composed tree map $f. takes one operand, got " *
+                "$(repr(node))")
+            walk(only(tup.args))
             return nothing
         end
         node isa Expr && node.head === :call && !isempty(node.args) &&
@@ -6092,10 +6109,11 @@ function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
             _fail(t.label, "composed sub-predictor $s must precede " *
                   "$(pred.name) (LP nodes emit in plan order)")
         sub = plan.predictors[sidx]
-        all(u -> u.kind in _COMPOSED_AFFINE_KINDS, sub.terms) ||
+        all(u -> u.kind in _COMPOSED_SUB_KINDS, sub.terms) ||
             _fail(t.label, "composed sub-predictor $s must be affine " *
-                  "(v1: intercept/continuous/factor/offset terms only — " *
-                  "no nested compositions, latents, or summands)")
+                  "plus varying effects (intercept/continuous/factor/" *
+                  "offset/varying-effect terms only — no nested " *
+                  "compositions, latents, or other summands)")
     end
     known = _union_names(plan)
     for c in o.scalars
