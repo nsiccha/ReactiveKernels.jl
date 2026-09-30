@@ -102,6 +102,34 @@ function _kron_reference(q, x1, y)
        posterior = prior + likelihood + log_jacobian)
 end
 
+# K-generic loop transcription of Stan's `cholesky_corr_constrain` (the small-K
+# oracle for the vectorized helpers; the _KRON_N-fixed oracles above are the
+# K=30 authority).
+function _kron_L_from_z_K(z, K)
+    L = zeros(K, K); L[1, 1] = 1.0; k = 1
+    for i in 2:K
+        L[i, 1] = z[k]; sum_sqs = z[k]^2; k += 1
+        for j in 2:(i - 1)
+            L[i, j] = z[k] * sqrt(1.0 - sum_sqs)
+            sum_sqs += L[i, j]^2; k += 1
+        end
+        L[i, i] = sqrt(1.0 - sum_sqs)
+    end
+    L
+end
+function _kron_partial_lp_K(z, K)
+    lp = 0.0; k = 1
+    for i in 2:K
+        sum_sqs = z[k]^2; k += 1
+        for j in 2:(i - 1)
+            lp += 0.5 * log(1.0 - sum_sqs)
+            w = z[k] * sqrt(1.0 - sum_sqs)
+            sum_sqs += w^2; k += 1
+        end
+    end
+    lp
+end
+
 const _KRON_SENTINEL_BEFORE = ReactiveKernelsPPLExamples._DEMO_TAIL_EXECUTIONS[]
 const _KRON_HAVE = (:unconstrained, :x1, :y)
 const _KRON_BOUND = (; x1 = KRON_X1, y = KRON_Y)
@@ -192,4 +220,29 @@ end
             gapped && _kron_is_upstream_gap(e) || rethrow()
         end
     end
+end
+
+@testset "vectorized LKJ helpers match Stan's constrain (snag kronecker-gp-rea-dc8cef6f)" begin
+    sandbox = evaluate_kronecker_gp_source(; model_only = true).sandbox
+    lp_fn = getfield(sandbox, :_ccl_constraint_lp)
+    L_fn = getfield(sandbox, :_cholesky_corr_constrain_L)
+    # The sandbox methods are defined by the evaluation above; cross the
+    # world-age barrier the same way the kernel call does.
+    lp_call(z, K) = Base.invokelatest(lp_fn, z, K)
+    L_call(z, K) = Base.invokelatest(L_fn, z, K)
+    for seed in (5, 17, 101)
+        zp = 0.9 .* sin.((1:(_KRON_N * (_KRON_N - 1) ÷ 2)) .* (0.7 + seed / 50) .+ seed)
+        @test lp_call(zp, _KRON_N) ≈ _kron_partial_lp(zp)
+        @test L_call(zp, _KRON_N) ≈ _kron_L_from_z(zp)
+    end
+    for K in (2, 3, 5, 8)
+        n = (K * (K - 1)) ÷ 2
+        z = 0.9 .* sin.((1:n) .* 0.9 .+ K)
+        @test lp_call(z, K) ≈ _kron_partial_lp_K(z, K)
+        @test L_call(z, K) ≈ _kron_L_from_z_K(z, K)
+    end
+    # The helpers must stay loop-free: K is bound data, and constraints.md
+    # forbids trace-time unrolling a data-derived trip count. (Comment lines
+    # start with `#`, so `^\s*for` only matches code.)
+    @test !occursin(r"(?m)^\s*for\s", KRON_SOURCE)
 end

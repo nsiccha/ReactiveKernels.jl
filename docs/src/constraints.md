@@ -161,3 +161,13 @@ and lock the one Reactant 0.2.289 lifted:
   anything: the retained position loop, a recipe-free structured passthrough
   and an embedded plate under `prepare_batched` compile with the default
   optimizer. The loop and the scalar semantics are retained.
+- Eigendecomposition of a traced matrix does not lower, at several stacked
+  layers: `eigen(Symmetric(A))` dies during tracing in `isdiag` →
+  `overloaded_triu(::UpperTriangular)` (Reactant defines it for
+  `TracedRArray{T, 2}` only; the same missing method is upstream
+  EnzymeAD/Reactant.jl#3369 via symmetric solve), while nonsymmetric
+  `eigen(A)` dies branching on a traced `Bool` and `eigvals(Symmetric(A))`
+  has no traced method at all: `repro_reactant_eigen_symmetric.jl`. That is
+  the shape of the posteriordb `kronecker_gp` example's exact
+  Kronecker-eigenspace marginal likelihood; RK keeps the authored
+  `eigen(Symmetric(·))` calls.
