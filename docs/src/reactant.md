@@ -51,7 +51,10 @@ code is not executed by the docs build.
   `.L`/`.U`. Within one kernel call, a `cholesky` call outside that lowering —
   in a helper function the kernel calls, or a statement that is exactly
   `F = cholesky(A)` — yields Reactant's type, whose packed factor is
-  `F.factors`.
+  `F.factors`. A structured-state Cholesky field leaves a raw compiled
+  transition as that wrapper; `validated_compiled_transition` restores the
+  source `LinearAlgebra.Cholesky` at its host bridge, so the returned state
+  can be passed to the next guarded call.
 - Whole-kernel `replica` preserves the scalar kernel as its source authority.
 - Compiled AD reuses the native single-active-port, scalar-WANT validation.
 - Unsupported scalar indexing, unbounded control, or structural state rejects;

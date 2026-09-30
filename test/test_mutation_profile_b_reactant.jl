@@ -222,9 +222,10 @@ _mpbr_materialize(value::LinearAlgebra.Cholesky,
     LinearAlgebra.Cholesky(
         _mpbr_materialize(value.factors, prototype.factors),
         value.uplo, Int(value.info))
+const _MPBR_TRACED_CHOLESKY = Base.get_extension(
+    ReactiveKernels, :ReactiveKernelsReactantExt)._TracedCholesky
 _mpbr_materialize(
-        value::Base.get_extension(
-            ReactiveKernels, :ReactiveKernelsReactantExt)._TracedCholesky,
+        value::_MPBR_TRACED_CHOLESKY,
         prototype::LinearAlgebra.Cholesky) =
     LinearAlgebra.Cholesky(
         _mpbr_materialize(value.factors, prototype.factors),
@@ -535,6 +536,22 @@ if _mpbr_enabled("logical-wrapper")
     @test ReactiveKernels._sm_finite_validate_elements(port, restored) ===
           restored
 end
+
+# The guarded host bridge canonicalizes a structured state's topology, which
+# rebuilds a device-array Cholesky as the extension's traced wrapper; the
+# final wrapper restore must turn it back into the source Cholesky type the
+# executable was compiled for, or the next guarded call is rejected.
+@testset "structured Cholesky wrappers leave the host bridge source-logical" begin
+    prototype = LinearAlgebra.Cholesky(Diagonal([2.0, 3.0]), 'U', 0)
+    logical = _mpbr_trace(prototype)
+    backend = ReactiveKernels._sm_structural_copy(logical)
+    @test backend isa _MPBR_TRACED_CHOLESKY
+    restored = ReactiveKernels._sm_restore_source_logical_wrappers(
+        prototype, backend)
+    @test typeof(restored) === typeof(logical)
+    @test Array(restored.factors.diag) == [2.0, 3.0]
+    @test (restored.uplo, restored.info) == ('U', 0)
+end
 end
 
 if _mpbr_enabled("scalar-bridge")
@@ -695,12 +712,17 @@ if _mpbr_enabled("generic-nuts")
     @test getfield(guarded, :compiled) === compiled
     raw = compiled(raw_state, raw_replay)
     # Machine entry packs both finite ports, then the raw return restores both
-    # containers and logical Cholesky wrappers. Scalar leaves remain concrete
-    # until the reusable guarded boundary performs its host bridge.
+    # containers and their logical Cholesky wrappers. Scalar leaves remain
+    # concrete, and structured-state Cholesky fields remain the extension's
+    # traced wrapper, until the reusable guarded boundary performs its host
+    # bridge: the raw executable alone is outside the repeated-call contract.
     @test raw.state.trees isa Vector
     @test raw.state.proposals isa Vector
-    @test all(wrapper -> wrapper isa LinearAlgebra.Cholesky,
-        _mpbr_cholesky_wrappers(raw.state))
+    @test all(proposal -> proposal.chol_metric isa LinearAlgebra.Cholesky,
+        raw.state.proposals)
+    @test all(wrapper -> wrapper isa _MPBR_TRACED_CHOLESKY,
+        (raw.state.init.chol_metric, raw.state.fwd.chol_metric,
+         raw.state.bwd.chol_metric))
     @test raw.state.proposals[1].pot isa Reactant.ConcretePJRTNumber
 
     first = guarded(state, replay)
@@ -741,6 +763,10 @@ if _mpbr_enabled("generic-nuts")
     @test typeof(first.state.proposals[1].pot) === Float64
     @test all(wrapper -> wrapper isa LinearAlgebra.Cholesky,
         _mpbr_cholesky_wrappers(first.state))
+    # The host bridge hands back exactly the wrapper types the executable was
+    # compiled for, so the next guarded call reuses it.
+    @test all(typeof.(_mpbr_cholesky_wrappers(first.state)) .===
+              typeof.(_mpbr_cholesky_wrappers(state)))
 
     second = guarded(first.state, first.arguments[1])
     second_state = _mpbr_materialize(second.state, case.snapshot)
