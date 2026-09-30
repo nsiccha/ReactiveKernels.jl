@@ -103,6 +103,101 @@ end
     @test only(sg.terms).kind === ComposedTerm
 end
 
+@testset "composed named nesting (v2)" begin
+    # A name bound to a composition inlines at its use (naming a
+    # subexpression never changes legality; v1 failed these closed).
+    plan = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        ga ~ Normal(0.0, 100.0)
+        mid = be .* th
+        eta = ga .* mid
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    @test [p.name for p in plan.predictors] == [:th, :eta]
+    @test only(plan.predictors[2].terms).options.tree == :(ga .* (be .* th))
+    @test isempty(plan.derived)
+    # ... including through a shared composed root that is also a
+    # response location (the root interns; the use site inlines it).
+    shared = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        ga ~ Normal(0.0, 100.0)
+        mid = be .* th
+        y1 .~ Bernoulli.(logistic.(mid))
+        eta2 = ga .* mid
+        y2 .~ Bernoulli.(logistic.(eta2))
+    end, (:y1, :y2, :xs))
+    @test [p.name for p in shared.predictors] == [:th, :mid, :eta2]
+    @test only(shared.predictors[3].terms).options.tree ==
+        :(ga .* (be .* th))
+end
+
+@testset "composed data leaves + logistic maps (v3)" begin
+    # A bound data column reads elementwise in-graph as a tree leaf and
+    # rides the composed term's columns (v1/v2 failed these closed).
+    plan = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        be ~ Normal(0.0, 100.0)
+        eta = be .* (th .+ xs)
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    t = only(plan.predictors[2].terms)
+    @test t.kind === ComposedTerm
+    @test t.options.tree == :(be .* (th .+ xs))
+    @test t.columns == [:xs]
+    # `logistic.` maps (and a name bound to a map composition) inline.
+    curve = lower_rkppl(quote
+        loc = a_l .+ b_l .* g
+        ls = a_s .+ b_s .* g
+        xi = (xs .- loc) .* exp.(ls)
+        resp = logistic.(xi)
+        m0 ~ Normal(0.0, 1.0)
+        mu = m0 .+ resp
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :xs, :g))
+    mt = only(curve.predictors[end].terms)
+    @test mt.kind === ComposedTerm
+    @test mt.options.tree ==
+        :(m0 .+ logistic.((xs .- loc) .* exp.(ls)))
+    @test mt.options.subs == [:loc, :ls]
+    @test isempty(curve.derived)
+end
+
+@testset "composed bare maps stay link spellings" begin
+    # A map over ONE bare sub-predictor at a location (inline or through
+    # a name) is a link spelling, never a composition: families without
+    # that link fail closed exactly as before compositions existed.
+    D = (:y, :x)
+    Dict1 = Dict{Symbol,AbstractVector}(:y => [0.3], :x => [0.5])
+    @test_throws ContractValidationError bind_data(lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Normal.(exp.(mu), 1.5)
+    end, D), Dict1)
+    @test_throws ContractValidationError bind_data(lower_rkppl(quote
+        mu = a .+ b .* x
+        m = exp.(mu)
+        y .~ Normal.(m, 1.5)
+    end, D), Dict1)
+    # ... while the Poisson log link still peels.
+    pois = lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Poisson.(exp.(mu))
+    end, D)
+    @test only(pois.predictors).link === LogLink
+    # A named map inside a real combination still inlines.
+    plan = lower_rkppl(quote
+        th = a_th .+ b_th .* xs
+        la = a_la .+ b_la .* xs
+        al = exp.(la)
+        eta = al .* th
+        y .~ Bernoulli.(logistic.(eta))
+    end, (:y, :xs))
+    t = only(plan.predictors[end].terms)
+    @test t.kind === ComposedTerm
+    @test t.options.tree == :(exp.(la) .* th)
+end
+
 @testset "composed fail-closed" begin
     # Undotted vector combination: Julia-truthful, write the dots.
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -118,32 +213,20 @@ end
         eta = 2.0 .* th
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
-    # Data columns never combine directly — only sub-LPs and scalars.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        th = a_th .+ b_th .* xs
-        be ~ Normal(0.0, 100.0)
-        eta = be .* (th .+ xs)
-        y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
-    # Nested compositions lower only at response/scale locations.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        th = a_th .+ b_th .* xs
-        be ~ Normal(0.0, 100.0)
-        ga ~ Normal(0.0, 100.0)
-        mid = be .* th
-        eta = ga .* mid
-        y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
-    # ... including through a shared, already-interned composed root.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        th = a_th .+ b_th .* xs
-        be ~ Normal(0.0, 100.0)
-        ga ~ Normal(0.0, 100.0)
-        mid = be .* th
-        y1 .~ Bernoulli.(logistic.(mid))
-        eta2 = ga .* mid
-        y2 .~ Bernoulli.(logistic.(eta2))
-    end, (:y1, :y2, :xs))
+    # `logistic.` outside a composition keeps the link guidance (the
+    # predictor analysis re-screens strictly).
+    err = try
+        lower_rkppl(quote
+            mu = a .+ b .* xs
+            p = logistic.(mu)
+            y .~ Normal.(p, 1.0)
+        end, (:y, :xs))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError
+    @test occursin("`.~` link", sprint(showerror, err))
     # A scalar leaf names a sampled name or scalar definition — or fails.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         th = a_th .+ b_th .* xs

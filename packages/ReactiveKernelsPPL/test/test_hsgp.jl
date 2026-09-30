@@ -149,11 +149,13 @@ end
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # `by=` names a bound grouping column (grouped bases themselves:
+    # test_smooth_sb.jl).
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; by = g)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :g))
+        end, (:y, :x))
     # Use-site discipline.
     @test_throws SurfaceLoweringError lower_rkppl(quote
             mu = a .+ hsgp(:h_nope)

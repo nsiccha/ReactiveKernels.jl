@@ -929,7 +929,94 @@ struct SplineVector
 end
 
 """
-    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period)
+    HyperPrior(family, args)
+
+A literal-argument prior on a positive hyperparameter (HSGP length
+scale / marginal scale, spline smoothing sd): `family` in
+[`_HYPER_PRIOR_FAMILIES`](@ref), `args` its literal arguments as
+`(arg1 = ..., ...)` in Distributions.jl order. Stan-kernel semantics
+on the positive support: the plain `_lpdf` plus the transform
+Jacobian, no truncation normalizer (SB `length_scale(...)`/`sd(...)`
+term priors).
+"""
+struct HyperPrior
+    family::Symbol
+    args::NamedTuple
+end
+
+# Admitted hyperparameter prior families (positive-support or Stan-kernel
+# halves of symmetric families) and their Distributions arities.
+const _HYPER_PRIOR_FAMILIES = Dict{Symbol,Tuple{Vararg{Int}}}(
+    :lognormal => (2,), :inverse_gamma => (2,), :gamma => (2,),
+    :exponential => (1,), :normal => (2,), :cauchy => (2,),
+    :student_t => (3,), :uniform => (2,))
+
+# A `Uniform(lo, hi)` hyper prior BOUNDS its hyperparameter (the SB
+# prior-bound intersection with the positive support): the
+# hyperparameter rides an `(:interval, lo, hi)` transform. `nothing`
+# for every other family (positive `exp` support).
+_hyper_prior_bounds(hp::HyperPrior) = hp.family === :uniform ?
+    (Float64(hp.args.arg1), Float64(hp.args.arg2)) : nothing
+_hyper_prior_bounds(::Nothing) = nothing
+
+function _validate_hyper_prior(hp::HyperPrior, label::Symbol, what)
+    haskey(_HYPER_PRIOR_FAMILIES, hp.family) || _fail(label,
+        "$what prior family $(hp.family) is not admitted (admitted: " *
+        "$(join(sort!(collect(keys(_HYPER_PRIOR_FAMILIES))), ", ")))")
+    length(hp.args) in _HYPER_PRIOR_FAMILIES[hp.family] || _fail(label,
+        "$what prior $(hp.family) takes " *
+        "$(_HYPER_PRIOR_FAMILIES[hp.family]) arguments, got " *
+        "$(length(hp.args))")
+    keys(hp.args) == ntuple(i -> Symbol(:arg, i), length(hp.args)) ||
+        _fail(label, "$what prior args must be `(arg1, ...)`, got " *
+              "$(keys(hp.args))")
+    all(v -> v isa Real && !(v isa Bool) && isfinite(v), values(hp.args)) ||
+        _fail(label, "$what prior args must be finite numeric " *
+              "literals, got $(hp.args)")
+    if hp.family === :uniform
+        lo, hi = hp.args.arg1, hp.args.arg2
+        0 <= lo < hi || _fail(label, "$what prior Uniform($lo, $hi) must " *
+            "satisfy 0 <= lo < hi (it bounds a positive hyperparameter)")
+    end
+    return nothing
+end
+
+"""
+    HSGPHyperLP(intercept, group)
+
+A grouped HSGP hyperparameter's log-linear hyper-predictor (SB
+`log(length_scale(hsgp(x))) ~ 1 + (1 | g)` / `~ (1 | g)`): per group
+`log h_g = beta0 + sd * z_g` (`intercept` false drops `beta0`), with the
+BRM defaults `beta0 ~ Normal(0, 1)`, `sd ~ Normal(0, 1)` on the positive
+support (Stan kernel), non-centered `z ~ Normal(0, 1)`. `group` must be
+the basis's `by` column (one hyper level per term group). A length scale
+is floored per group at the validity floor (SB `brm_hsgp_by_hyper_S`
+`fmax(rho_g, rho_lower)`).
+"""
+struct HSGPHyperLP
+    intercept::Bool
+    group::Symbol
+end
+
+# A hyper-predictor carries no stated bounds (its floor is applied
+# in-graph per group).
+_hyper_prior_bounds(::HSGPHyperLP) = nothing
+
+"""
+    HSGPGrouping(column, levels)
+
+A per-group HSGP (SB `hsgp(x; by = g)`): the basis weights vary by the
+levels of data column `column` (`levels` sort-ordered observed levels,
+`nothing` pre-bind — [`bind_data`](@ref) fills them).
+"""
+struct HSGPGrouping
+    column::Symbol
+    levels::Union{Nothing,Vector{Any}}
+end
+
+"""
+    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period[, rho_prior,
+              sigma_prior[, domain[, by]]])
 
 One Hilbert-space GP basis (SB `_sb_hsgp` / `_sb_hsgp_periodic`):
 `axes` raw data columns, `K` modes per axis, `c` boundary factors per
@@ -947,6 +1034,26 @@ constant (finite and positive iff periodic, `NaN` otherwise). A
 periodic basis takes exactly one isotropic axis, carries no fits and
 no domain (`c` is validated but ignored, the SB mirror), and owns `M
 = 2k` basis functions (cosines then sines over `k` harmonics).
+
+`rho_prior` / `sigma_prior` override the default `lognormal(0, 1)`
+priors ([`HyperPrior`](@ref), SB `length_scale(:, hsgp(x)) ~ ...` /
+`sd(:, hsgp(x)) ~ ...`). An explicit length-scale prior replaces the
+whole default declaration INCLUDING the approximation-validity floor
+(BRM `_brm_hsgp_declared_rho_lower`): the length scales then ride a
+plain `exp` transform; a `Uniform(lo, hi)` prior instead BOUNDS the
+hyperparameter (`(:interval, lo, hi)`, SB prior-bound intersection).
+`nothing` keeps the default.
+
+`domain` (SB `hsgp(...; domain=...)`) fixes the eigenfunction domain
+per axis as `(lower, upper)` pairs: bind uses `(mu, L) = ((lo+hi)/2,
+(hi-lo)/2)` instead of the data-fitted `L = c*max|x-mu|` (so `c` does
+not apply), and every bound axis value must lie inside its pair.
+
+`by` ([`HSGPGrouping`](@ref), SB `hsgp(x; by = g)`) makes the basis
+weights per group (`G*M` standardized weights) over one shared basis;
+the hyperparameters stay shared unless `rho_prior` / `sigma_prior` carry
+an [`HSGPHyperLP`](@ref) (per-group log-linear hyper-predictors). v1:
+one isotropic exp-quad axis.
 """
 struct HSGPBasis
     id::Symbol
@@ -958,7 +1065,37 @@ struct HSGPBasis
     label::Symbol
     cov::Symbol
     period::Float64
+    rho_prior::Union{Nothing,HyperPrior,HSGPHyperLP}
+    sigma_prior::Union{Nothing,HyperPrior,HSGPHyperLP}
+    domain::Union{Nothing,Vector{Tuple{Float64,Float64}}}
+    by::Union{Nothing,HSGPGrouping}
 end
+
+"""Default-prior construction (SB `_sb_hsgp`'s `lognormal(0, 1)`
+length scales on the validity floor + `lognormal(0, 1)` marginal
+scale)."""
+HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
+    c::Vector{Float64}, iso::Bool,
+    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
+    period::Float64) =
+    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, nothing,
+        nothing, nothing, nothing)
+
+"""Stated-hyper-prior construction without a fixed domain."""
+HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
+    c::Vector{Float64}, iso::Bool,
+    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
+    period::Float64, rho_prior, sigma_prior) =
+    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, rho_prior,
+        sigma_prior, nothing, nothing)
+
+"""Fixed-domain construction without grouping."""
+HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
+    c::Vector{Float64}, iso::Bool,
+    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
+    period::Float64, rho_prior, sigma_prior, domain) =
+    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, rho_prior,
+        sigma_prior, domain, nothing)
 
 """Exp-quad v1 positional construction (periodic defaults: `cov =
 :exp_quad`, `period = NaN`)."""
@@ -1747,8 +1884,19 @@ function _hsgp_names(hb::HSGPBasis)
     sigma = Symbol("sigma_", id)
     rhos = hb.iso ? [Symbol("rho_", id)] :
         [Symbol("rho_", id, :_, j) for j in 1:length(hb.axes)]
-    return (beta = beta, rhos = rhos, sigma = sigma)
+    hyper(tag, spec) = spec isa HSGPHyperLP ?
+        (beta0 = Symbol("beta0_", tag, :_, id), sd = Symbol("sd_", tag, :_,
+            id), z = Symbol("z_", tag, :_, id), intercept = spec.intercept) :
+        nothing
+    return (beta = beta, rhos = rhos, sigma = sigma,
+        rho_hyper = hyper(:rho, hb.rho_prior),
+        sigma_hyper = hyper(:sigma, hb.sigma_prior))
 end
+
+"""Group count of an [`HSGPBasis`](@ref) (1 ungrouped; the bound
+`by` level count grouped — `nothing` levels pre-bind count as 0)."""
+_hsgp_n_groups(hb::HSGPBasis) = hb.by === nothing ? 1 :
+    hb.by.levels === nothing ? 0 : length(hb.by.levels)
 
 """Basis-function count for an [`HSGPBasis`](@ref): `M = prod(K)`
 exp-quad, `M = 2k` periodic (cosines then sines over `k`
@@ -1759,7 +1907,13 @@ _hsgp_n_basis(hb::HSGPBasis) =
 # Flat sampled-name list for name tables + claims (beta, rhos, sigma).
 function _hsgp_all_names(hb::HSGPBasis)
     n = _hsgp_names(hb)
-    return Symbol[n.beta, n.sigma, n.rhos...]
+    out = Symbol[n.beta, n.sigma, n.rhos...]
+    for h in (n.rho_hyper, n.sigma_hyper)
+        h === nothing && continue
+        h.intercept && push!(out, h.beta0)
+        push!(out, h.sd, h.z)
+    end
+    return out
 end
 
 # Every model-scope name a kernel plate introduces (cell names become flat
@@ -3059,8 +3213,17 @@ function _validate_splines(plan::StructuralPlan)
             "$wantnames, got $gotvec")
         byname = Dict{Symbol,SplineVector}(v.name => v
             for v in plan.spline_vectors if v.basis === sb.id)
+        _, sdname = _spline_block_roles(sb.id, sb.kind, sb.k)
         for (vname, vfamily, vargs, vsupport, vwidth) in wantvec
             v = byname[vname]
+            # The smoothing-sd vector may carry a stated hyper prior
+            # (SB `sd(mu, s(x)) ~ ...`) — same Stan-kernel positive
+            # support and width, family/args from the admitted set.
+            if vname === sdname && !(v.family === vfamily && v.args == vargs)
+                _validate_hyper_prior(HyperPrior(v.family, v.args), :plan,
+                    "spline :$(sb.id) sd")
+                vfamily, vargs = v.family, v.args
+            end
             (v.family === vfamily && v.args == vargs &&
              v.support_override === vsupport && v.width == vwidth) ||
                 _fail(:plan, "spline :$(sb.id): vector :$vname must be " *
@@ -3138,6 +3301,40 @@ function _validate_hsgp(plan::StructuralPlan)
     length(unique(labels)) == length(labels) ||
         _fail(:plan, "duplicate hsgp basis labels")
     for hb in plan.hsgp_bases
+        hb.rho_prior isa HyperPrior && _validate_hyper_prior(hb.rho_prior,
+            :plan, "hsgp :$(hb.id) length-scale")
+        hb.sigma_prior isa HyperPrior && _validate_hyper_prior(
+            hb.sigma_prior, :plan, "hsgp :$(hb.id) sd")
+        for (spec, what) in ((hb.rho_prior, "length-scale"),
+                             (hb.sigma_prior, "sd"))
+            spec isa HSGPHyperLP || continue
+            hb.by === nothing && _fail(:plan, "hsgp :$(hb.id): a $what " *
+                "hyper-predictor needs a grouped basis (`by = ...`)")
+            spec.group === hb.by.column || _fail(:plan, "hsgp :$(hb.id): " *
+                "the $what hyper-predictor groups by $(spec.group) but " *
+                "the basis groups by $(hb.by.column) — one hyper level " *
+                "per term group")
+        end
+        if hb.by !== nothing
+            (hb.cov === :exp_quad && hb.iso && length(hb.axes) == 1) ||
+                _fail(:plan, "hsgp :$(hb.id): `by` grouping takes one " *
+                    "isotropic exp-quad axis in v1 (aniso / periodic " *
+                    "grouped bases are planned)")
+            lv = hb.by.levels
+            lv === nothing || (!isempty(lv) && allunique(lv)) ||
+                _fail(:plan, "hsgp :$(hb.id): `by` levels must be " *
+                    "non-empty and distinct, got $(repr(lv))")
+        end
+        if hb.domain !== nothing
+            hb.cov === :periodic && _fail(:plan, "hsgp :$(hb.id): a " *
+                "periodic basis has no domain (drop `domain=`)")
+            length(hb.domain) == length(hb.axes) || _fail(:plan,
+                "hsgp :$(hb.id): domain has $(length(hb.domain)) pairs " *
+                "for $(length(hb.axes)) axes (one `(lower, upper)` per axis)")
+            all(p -> isfinite(p[1]) && isfinite(p[2]) && p[1] < p[2],
+                hb.domain) || _fail(:plan, "hsgp :$(hb.id): domain pairs " *
+                "must be finite with lower < upper, got $(hb.domain)")
+        end
         d = length(hb.axes)
         d >= 1 ||
             _fail(:plan, "hsgp :$(hb.id): takes at least one axis column")
@@ -6022,21 +6219,41 @@ function _validate_dar_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPl
 end
 
 const _COMPOSED_OPS = (:.*, :.+, :.-)
+# Elementwise unary maps admitted over a composed subtree (`exp.(la)` —
+# the IRT discrimination `a = exp(log_a)`; `logistic.(xi)` — the Bordet
+# transient/saturating curves), spelled as Julia dotted calls.
+const _COMPOSED_UNARY = (:exp, :logistic)
 const _COMPOSED_AFFINE_KINDS =
     (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
+# Sub-predictors are affine plus varying-effect summands (per-level
+# random effects: the IRT person ability `theta ~ 0 + (1 | person)`).
+const _COMPOSED_SUB_KINDS = (_COMPOSED_AFFINE_KINDS..., VaryingEffectTerm)
 
 """Recurse a composed tree: leaves must be declared subs/scalars, nodes
 dotted `.*`/`.+`/`.−` of matching arity. Returns the leaf set."""
 function _validate_composed_tree(tree, subs::Vector{Symbol},
-        scalars::Vector{Symbol}, label::Symbol)
-    allowed = union(subs, scalars)
+        scalars::Vector{Symbol}, label::Symbol,
+        datas::Vector{Symbol} = Symbol[])
+    allowed = union(subs, scalars, datas)
     leaves = Symbol[]
     function walk(node)
         if node isa Symbol
             node in allowed || _fail(label,
                 "composed tree leaf $node is neither a declared " *
-                "sub-predictor $subs nor a scalar $scalars")
+                "sub-predictor $subs, a scalar $scalars, nor a data " *
+                "column $datas")
             push!(leaves, node)
+            return nothing
+        end
+        if node isa Expr && node.head === :. && length(node.args) == 2
+            f, tup = node.args
+            f in _COMPOSED_UNARY || _fail(label,
+                "composed tree map $(repr(f)). is not admitted (v2: " *
+                "$(join(string.(_COMPOSED_UNARY, "."), ", ")))")
+            Meta.isexpr(tup, :tuple, 1) || _fail(label,
+                "composed tree map $f. takes one operand, got " *
+                "$(repr(node))")
+            walk(only(tup.args))
             return nothing
         end
         node isa Expr && node.head === :call && !isempty(node.args) &&
@@ -6073,9 +6290,14 @@ function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
               "`(tree, subs, scalars)`, got $(Tuple(keys(o)))")
     o.subs isa Vector{Symbol} && o.scalars isa Vector{Symbol} ||
         _fail(t.label, "composed subs/scalars must be `Vector{Symbol}`")
-    isempty(t.columns) ||
-        _fail(t.label, "composed term carries no columns (sub-predictors " *
-              "and scalars resolve in-graph), got $(t.columns)")
+    # Columns are exactly the tree's data leaves (bound data read
+    # elementwise in-graph, e.g. `(log_time .- loc) .* exp.(ls)`).
+    datas = Symbol[c for c in t.columns]
+    for c in datas
+        c in o.subs || c in o.scalars || continue
+        _fail(t.label, "composed column $c collides with a sub-predictor " *
+              "or scalar name")
+    end
     length(pred.terms) == 1 ||
         _fail(t.label, "composed term is the whole linear predictor " *
               "(no sibling design terms in v1)")
@@ -6092,10 +6314,11 @@ function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
             _fail(t.label, "composed sub-predictor $s must precede " *
                   "$(pred.name) (LP nodes emit in plan order)")
         sub = plan.predictors[sidx]
-        all(u -> u.kind in _COMPOSED_AFFINE_KINDS, sub.terms) ||
+        all(u -> u.kind in _COMPOSED_SUB_KINDS, sub.terms) ||
             _fail(t.label, "composed sub-predictor $s must be affine " *
-                  "(v1: intercept/continuous/factor/offset terms only — " *
-                  "no nested compositions, latents, or summands)")
+                  "plus varying effects (intercept/continuous/factor/" *
+                  "offset/varying-effect terms only — no nested " *
+                  "compositions, latents, or other summands)")
     end
     known = _union_names(plan)
     for c in o.scalars
@@ -6103,7 +6326,12 @@ function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
             _fail(t.label, "composed scalar $c is neither a sampled " *
                   "parameter nor a scalar assignment")
     end
-    _validate_composed_tree(o.tree, o.subs, o.scalars, t.label)
+    leaves = _validate_composed_tree(o.tree, o.subs, o.scalars, t.label,
+        datas)
+    for c in datas
+        c in leaves || _fail(t.label, "composed column $c is not a leaf " *
+            "of the tree (columns are exactly the tree's data leaves)")
+    end
     return nothing
 end
 
@@ -8569,20 +8797,49 @@ function _fit_hsgp_bases(plan::StructuralPlan,
                 _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
                       "must be finite")
             push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso,
-                Tuple{Float64,Float64}[], hb.label, hb.cov, hb.period))
+                Tuple{Float64,Float64}[], hb.label, hb.cov, hb.period,
+                hb.rho_prior, hb.sigma_prior, hb.domain))
             continue
         end
         fits = Tuple{Float64,Float64}[]
-        for (c, cj) in zip(hb.axes, hb.c)
+        for (j, (c, cj)) in enumerate(zip(hb.axes, hb.c))
             haskey(columns, c) ||
                 _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
                       "not bound")
             col = _vector_column(columns, c, hb.label, "hsgp axis column")
-            push!(fits, _hsgp_axis_fit(col, cj, hb.label,
-                "hsgp :$(hb.id): axis column $c"))
+            if hb.domain === nothing
+                push!(fits, _hsgp_axis_fit(col, cj, hb.label,
+                    "hsgp :$(hb.id): axis column $c"))
+            else
+                # Fixed domain (SB `_brm_hsgp_domain_fits` /
+                # `_brm_check_hsgp_domain`): the data must lie inside.
+                lo, hi = hb.domain[j]
+                eltype(col) <: Real && all(isfinite, col) ||
+                    _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
+                          "must be finite numeric")
+                all(v -> lo <= v <= hi, col) || _fail(hb.label,
+                    "hsgp :$(hb.id): axis column $c has values outside " *
+                    "its fixed domain ($lo, $hi)")
+                push!(fits, ((lo + hi) / 2, (hi - lo) / 2))
+            end
+        end
+        by = hb.by
+        if by !== nothing && by.levels === nothing
+            haskey(columns, by.column) || _fail(hb.label, "hsgp " *
+                ":$(hb.id): grouping column $(by.column) is not bound")
+            gcol = _vector_column(columns, by.column, hb.label,
+                "hsgp grouping column")
+            levels = try
+                _grouping_levels(gcol)
+            catch err
+                _fail(hb.label, "hsgp :$(hb.id): grouping column " *
+                    "$(by.column) levels not orderable ($err)")
+            end
+            by = HSGPGrouping(by.column, collect(Any, levels))
         end
         push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, fits,
-            hb.label, hb.cov, hb.period))
+            hb.label, hb.cov, hb.period, hb.rho_prior, hb.sigma_prior,
+            hb.domain, by))
     end
     return out
 end
@@ -9450,6 +9707,11 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     end
     for hb in hbases, c in hb.axes
         haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
+    end
+    for hb in hbases
+        hb.by === nothing && continue
+        haskey(inferred, hb.by.column) &&
+            _upgrade_role!(inferred, hb.by.column, :group)
     end
     for el in elbases
         c = _sched_col_name(el.schedule, :op_log_dose)

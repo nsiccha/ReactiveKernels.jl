@@ -219,6 +219,24 @@ directions verify against finite differences. Cholesky needs no rule:
 ordinary Enzyme differentiates the built-in correctly, so the GP latent path
 swaps to it directly.
 
+The second linear-algebra consumer is the symmetric-eigendecomposition pair
+`ReactiveKernelsPPL.rk_symmetric_eigvals` /
+`ReactiveKernelsPPL.rk_symmetric_eigvecs`: ordinary reverse Enzyme through
+`eigen(::Symmetric)` fails on the LAPACK `syevr!` `ccall`
+(`EnzymeNoDerivativeError` for `dsyevr_64_`; Enzyme's derivative table covers
+BLAS plus `potrf` only), so each output is an owned callable whose graph
+authors the symmetric-perturbation JVP and VJP branches
+(`R_dot = diag(Q' * A_dot * Q)` and `A_bar = Q * Diagonal(R_bar) * Q'` for
+values; `Q_dot = Q * (F .* (Q' * A_dot * Q))` and
+`A_bar = Q * Symmetric(F .* (Q' * Q_bar)) * Q'` with
+`F[i, j] = 1 / (R[j] - R[i])` off the diagonal for vectors). Both Enzyme
+directions verify against finite differences, the two branches agree by
+adjoint pairing, and reverse staging retains `Q` (values) and `Q` plus `F`
+(vectors). The rules read only the upper triangle and need distinct
+eigenvalues; eigenvector columns are defined up to sign. A
+symmetric-eigendecomposition-based density calls these names in-graph instead
+of raw `eigen(Symmetric(...))`.
+
 ## A different boundary: `prepare_ad_pullback`
 
 The existing `prepare_ad_pullback` API asks a `DifferentiationInterface`

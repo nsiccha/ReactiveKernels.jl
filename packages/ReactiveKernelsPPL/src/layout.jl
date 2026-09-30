@@ -396,11 +396,39 @@ function assign_layout(plan::StructuralPlan)
                 "(bind_data fills one (mu, L) per axis)"))
         end
         names = _hsgp_names(hb)
-        floors = hb.cov === :periodic ?
+        # A stated length-scale prior replaces the default declaration
+        # including its validity floor (BRM
+        # `_brm_hsgp_declared_rho_lower`): plain `exp` length scales.
+        floors = hb.rho_prior !== nothing ? zeros(length(names.rhos)) :
+            hb.cov === :periodic ?
             [_hsgp_periodic_rho_lower(only(hb.K))] :
             _hsgp_floors(hb.K, hb.fits, hb.iso)
+        G = _hsgp_n_groups(hb)
+        hb.by !== nothing && G == 0 && throw(ContractValidationError(
+            "[layout] hsgp :$(hb.id): by levels not filled at bind"))
+        # Per-group hyper-predictor blocks (SB `_sb_hyper_param_stmts!`
+        # order: intercept, sd, z) replace the shared scalar.
+        function hyper_entries!(h)
+            if h.intercept
+                push!(entries, LayoutEntry(:sampled, nothing, h.beta0,
+                    [h.beta0], offset, 1, :identity))
+                offset += 1
+            end
+            push!(entries, LayoutEntry(:sampled, nothing, h.sd, [h.sd],
+                offset, 1, :exp))
+            offset += 1
+            push!(entries, LayoutEntry(:hsgp, nothing, h.z, [h.z], offset,
+                G, :identity))
+            offset += G
+        end
+        rbounds = _hyper_prior_bounds(hb.rho_prior)
+        names.rho_hyper === nothing || hyper_entries!(names.rho_hyper)
         for (rho, fl) in zip(names.rhos, floors)
-            if fl == 0.0
+            names.rho_hyper === nothing || break
+            if rbounds !== nothing
+                push!(entries, LayoutEntry(:sampled, nothing, rho, [rho],
+                    offset, 1, :interval, rbounds...))
+            elseif fl == 0.0
                 push!(entries, LayoutEntry(:sampled, nothing, rho, [rho],
                     offset, 1, :exp))
             else
@@ -409,10 +437,20 @@ function assign_layout(plan::StructuralPlan)
             end
             offset += 1
         end
-        push!(entries, LayoutEntry(:sampled, nothing, names.sigma,
-            [names.sigma], offset, 1, :exp))
-        offset += 1
-        M = _hsgp_n_basis(hb)
+        sbounds = _hyper_prior_bounds(hb.sigma_prior)
+        if names.sigma_hyper !== nothing
+            hyper_entries!(names.sigma_hyper)
+        else
+            push!(entries, sbounds === nothing ?
+                LayoutEntry(:sampled, nothing, names.sigma, [names.sigma],
+                    offset, 1, :exp) :
+                LayoutEntry(:sampled, nothing, names.sigma, [names.sigma],
+                    offset, 1, :interval, sbounds...))
+            offset += 1
+        end
+        # Grouped bases carry G*M standardized weights (column-major
+        # (G, M): group fastest).
+        M = _hsgp_n_basis(hb) * G
         push!(entries, LayoutEntry(:hsgp, nothing, names.beta, [names.beta],
             offset, M, :identity))
         offset += M
