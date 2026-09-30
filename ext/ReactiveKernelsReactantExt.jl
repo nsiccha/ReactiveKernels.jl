@@ -1328,15 +1328,15 @@ ReactiveKernels._tensorized_scan_lowering(
 # `tensor.empty`, which XLA export rejects (§7l). So a retained loop reads its
 # operands through fresh tracer objects; `copy` emits no operation, and a host
 # value stays host. Other wrappers pass through unchanged.
-_loop_capture(x) = x
-_loop_capture(x::Union{Tuple,NamedTuple}) = map(_loop_capture, x)
-_loop_capture(x::Union{Reactant.TracedRArray,Reactant.TracedRNumber}) = copy(x)
+_fresh_tracers(x) = x
+_fresh_tracers(x::Union{Tuple,NamedTuple}) = map(_fresh_tracers, x)
+_fresh_tracers(x::Union{Reactant.TracedRArray,Reactant.TracedRNumber}) = copy(x)
 
 function ReactiveKernels._tensorized_scan_lowering(
         marker::Reactant.TracedType, step, init, iterated::Tuple,
         shared::Tuple)
-    sequences = _loop_capture(map(_scan_traced_sequence, iterated))
-    shared = _loop_capture(shared)
+    sequences = _fresh_tracers(map(_scan_traced_sequence, iterated))
+    shared = _fresh_tracers(shared)
     n = _scan_sequence_length(first(sequences))
     all(xs -> _scan_sequence_length(xs) == n, sequences) || throw(
         DimensionMismatch(
@@ -1370,7 +1370,7 @@ _recurrence_trace(x::AbstractArray) =
 # and seeding from a state field's own tracer would silently advance that
 # field even where the caller later selects the pre-loop value (a masked
 # iteration of the predicated machine kept stepping the HMC phase point).
-_recurrence_trace(x::Reactant.TracedRArray) = _loop_capture(x)
+_recurrence_trace(x::Reactant.TracedRArray) = _fresh_tracers(x)
 # A `Diagonal` rides a retained loop as its backing vector — never as the
 # dense matrix `promote_to` would materialize — and is rebuilt from the
 # pre-loop schema (`_sm_restore_source_logical_wrappers`) before source code
@@ -1393,7 +1393,7 @@ ReactiveKernels._sm_restore_source_logical_wrappers(
     LinearAlgebra.Diagonal(LinearAlgebra.diag(value))
 _recurrence_trace(x::T) where {T<:Number} =
     copy(Reactant.promote_to(Reactant.TracedRNumber{T}, x))
-_recurrence_trace(x::Reactant.TracedRNumber) = _loop_capture(x)
+_recurrence_trace(x::Reactant.TracedRNumber) = _fresh_tracers(x)
 
 function ReactiveKernels._rectangular_fold_impl(
         marker::Reactant.TracedType, step, init, columns, shared, n)
@@ -1826,11 +1826,11 @@ function ReactiveKernels._replica_call(
         k::ReactiveKernels.ReplicatedKernel{B,BT,OT}, args,
         marker::Union{Reactant.RArray,Reactant.TracedRNumber}) where {B,BT,OT}
     replica_count = ReactiveKernels._replicated_validate_axes(args, Val(B), BT)
-    # Fresh tracers (`_loop_capture`): the loop must not rebind the caller's
-    # inputs, shared ones included (a zero-dose amount vector).
+    # `_fresh_tracers`: the loop must not rebind the caller's inputs, shared
+    # ones included (a zero-dose amount vector).
     replica_inputs = ntuple(length(args)) do index
         arg = getfield(args, index)
-        _loop_capture(index in B ? _replica_loop_operand(arg) : arg)
+        _fresh_tracers(index in B ? _replica_loop_operand(arg) : arg)
     end
     if replica_count == 0
         empty_outputs = ntuple(index -> ReactiveKernels._replicated_output(
@@ -1893,9 +1893,9 @@ function ReactiveKernels._replica_ad_call(
     value_buffer = copy(Reactant.Ops.constant(zeros(element_type, replica_count)))
     gradient_buffers = _replica_ad_buffers(AT, gradient_shapes, element_type, replica_count)
     replica_limit = _replica_loop_limit(replica_count)
-    # The loop reads the caller's arguments through fresh tracers
-    # (`_loop_capture`), so it never rebinds them.
-    replica_operands = _loop_capture(args)
+    # The loop reads the caller's arguments through `_fresh_tracers`, so it
+    # never rebinds them.
+    replica_operands = _fresh_tracers(args)
     # Body locals carry a `replica_` prefix: `@trace` seeds a loop-carried
     # variable from any same-named binding in scope, and `value`/`gradient`
     # would resolve to functions.  (No `return` inside the block either:
