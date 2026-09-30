@@ -40,7 +40,26 @@ code is not executed by the docs build.
 - An authored `for`/`while` inside a recipe keeps its iteration: the
   tensorized companion expands it with `ReactantCore.@trace` at kernel
   definition, so it becomes one `stablehlo.while` region whatever the trip
-  count; the loop body is never replicated per iteration.
+  count; the loop body is never replicated per iteration. A carry may start
+  on the host (`acc = 0.0`, `zeros(n)`): it is re-bound to a fresh traced copy
+  before the loop, because `@trace` carries a value only by updating a traced
+  object that exists before the loop (before, such a loop silently returned
+  its seed). A loop may read a host struct such as a schedule plan; it
+  crosses the loop untraced, and a traced value it reads enters as a fresh
+  tracer, so a zero-sized input is not returned as an aliased output (which
+  XLA export rejects). A loop over an empty host range is skipped, not
+  traced: `@trace` would trace its body once, indexing zero-length arrays.
+  A loop over `eachindex(x)`, `axes(x, d)` or
+  `a:b` whose scope rebinds `first`, `step`, `last`, `one`, `zero`, `div`,
+  `isqrt` or `error` is traced per iteration instead, since `@trace for`
+  resolves those names where it expands.
+- A generator reduction with `init` over a data-length iterator,
+  `sum(term for i in eachindex(x) [if cond]; init = x0)`, is the same retained
+  loop with an explicit accumulator (the filter stays a lazy branch), so a sum
+  over doses does not grow the program with the dose count. The loop index is
+  then traced: indexing written in the term is lowered, host tables included,
+  while a helper function indexing with it has no traced method. A generator
+  over a helper-produced iterator keeps the per-element trace.
 - A traced Cholesky factorization is a wrapper type owned by the Reactant
   extension, with `LinearAlgebra.Cholesky`'s accessors (`.L`, `.U`, `.UL`,
   `.factors`) and solves (`\`, `ldiv!`; a diagonal factor divides
@@ -51,7 +70,10 @@ code is not executed by the docs build.
   `.L`/`.U`. Within one kernel call, a `cholesky` call outside that lowering —
   in a helper function the kernel calls, or a statement that is exactly
   `F = cholesky(A)` — yields Reactant's type, whose packed factor is
-  `F.factors`.
+  `F.factors`. A structured-state Cholesky field leaves a raw compiled
+  transition as that wrapper; `validated_compiled_transition` restores the
+  source `LinearAlgebra.Cholesky` at its host bridge, so the returned state
+  can be passed to the next guarded call.
 - Whole-kernel `replica` preserves the scalar kernel as its source authority.
 - Compiled AD reuses the native single-active-port, scalar-WANT validation.
 - Unsupported scalar indexing, unbounded control, or structural state rejects;

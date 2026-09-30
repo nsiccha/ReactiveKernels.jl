@@ -2007,6 +2007,57 @@ _kernel_range_iterator(iter) =
          iter.args[1].args[end] isa QuoteNode &&
          iter.args[1].args[end].value in (:OneTo, :eachindex, :axes, :range)))
 
+# Locals of `scope` that a loop assigns (its carry): plain, updating and
+# destructuring assignments, and indexed writes (`v[i] = x` rebinds `v` in the
+# tensorized companion).
+function _kernel_loop_assigned!(names::Set{Symbol}, ex, scope)
+    ex isa Expr || return names
+    ex.head in (:quote, :inert, :meta, :line) && return names
+    if _kernel_tensorized_assignment_head(ex.head) && length(ex.args) == 2
+        target = ex.args[1]
+        while target isa Expr && target.head in (:ref, :(::))
+            target = target.args[1]
+        end
+        assigned = _lhs_symbols!(Set{Symbol}(), target)
+        union!(names, intersect(assigned, scope))
+    end
+    for arg in ex.args
+        _kernel_loop_assigned!(names, arg, scope)
+    end
+    names
+end
+
+# The tensorized companion of an authored `for`/`while`.  The loop (iterator,
+# condition and body tensorized) is expanded with `ReactantCore.@trace` at
+# kernel definition, which emits ONE retained loop region under a tracing
+# backend (`stablehlo.while`) whatever the trip count, and runs the plain
+# Julia loop when nothing it reads is traced (`docs/src/constraints.md`).
+# `ReactantCore` is the dependency-light macro package; Reactant's tracing
+# interpreter follows the expansion as ordinary closure code, which is why the
+# transform runs at definition time.
+#
+# `@trace` passes every local the loop reads to the tracer as a loop argument
+# and carries values by updating the traced objects that exist BEFORE the
+# loop; it never assigns results back to the enclosing variables.  Two
+# consequences the companion handles here:
+#
+# - a carry that starts on the host (`acc = 0.0`, a host `Vector`) has no
+#   traced object to update, so the loop's result was silently dropped: the
+#   loop returned its seed.  Each carried local is re-bound before the loop to
+#   a fresh traced copy (`_loop_seed`) whenever anything the loop reads is
+#   traced; with nothing traced the seed is unchanged and the loop is plain;
+# - a read-only local holding a host struct (a schedule plan with a
+#   `Vector{Int}` field) cannot be rebuilt with traced fields
+#   (`NoFieldMatchError`), so read-only locals cross the loop as captures that
+#   an untraced value enters wrapped (`_loop_capture` / `_loop_open`).
+#
+# `@trace for` handles one plain induction variable over a range; that is the
+# shape a data-length loop takes (`1:n`, `eachindex(x)`, `axes(x, 1)`).  A
+# typed binding, destructuring, or iteration over a collection keeps the
+# authored loop unchanged (it iterates host structure, not a data length), and
+# so does a loop in a scope that rebinds a name `@trace for` resolves there
+# (`_kernel_trace_for_hygienic`): per-iteration tracing is exact, a shadowed
+# `step` would not be.
 function _kernel_tensorized_loop(ex, known, mod, scope)
     if ex.head === :for
         binding, body = ex.args
@@ -2014,21 +2065,77 @@ function _kernel_tensorized_loop(ex, known, mod, scope)
             throw(ArgumentError("unsupported authored loop binding `$(binding)` in a kernel recipe"))
         loop_names = Set{Symbol}()
         _lhs_symbols!(loop_names, binding.args[1])
-        lowered = Expr(:for,
-             Expr(:(=), binding.args[1],
-                  _kernel_tensorized_rhs(binding.args[2], known, mod, scope)),
-             _kernel_tensorized_rhs(body, known, mod, union(scope, loop_names)))
-        retained = binding.args[1] isa Symbol && _kernel_range_iterator(binding.args[2])
+        retained = binding.args[1] isa Symbol &&
+            _kernel_range_iterator(binding.args[2]) &&
+            _kernel_trace_for_hygienic(known, scope, mod)
+        parts = (body,)
     else
         condition, body = ex.args
-        lowered = Expr(:while,
-             _kernel_tensorized_rhs(condition, known, mod, scope),
-             _kernel_tensorized_rhs(body, known, mod, scope))
+        loop_names = Set{Symbol}()
         retained = true
+        parts = (condition, body)
     end
-    retained || return lowered
-    Expr(:macrocall, GlobalRef(ReactantCore, Symbol("@trace")),
-         LineNumberNode(@__LINE__, @__FILE__), lowered)
+    if !retained
+        ex.head === :for || error("unreachable")
+        return Expr(:for,
+            Expr(:(=), binding.args[1],
+                 _kernel_tensorized_rhs(binding.args[2], known, mod, scope)),
+            _kernel_tensorized_rhs(body, known, mod, union(scope, loop_names)))
+    end
+    outer = setdiff(scope, loop_names)
+    carried = Set{Symbol}()
+    read = Set{Symbol}()
+    for part in parts
+        _kernel_loop_assigned!(carried, part, outer)
+        _kernel_loop_captures!(read, part, outer)
+    end
+    setdiff!(read, carried)
+    captures = Dict(name => gensym(Symbol(name, :_capture)) for name in read)
+    # `@trace` finds its loop arguments by reading the loop body's syntax, and
+    # a local read only inside a closure — an arm of a lazy branch — is not
+    # found: the loop region then uses a value it was never handed, and the
+    # backend rejects the program ("expect operands to be compatible with body
+    # block arguments").  Every capture is therefore also named once at the top
+    # of the body; the statement computes nothing.
+    capture_reference = Expr(:tuple, (captures[name] for name in sort!(collect(read)))...)
+    substitute(part) = _kernel_loop_substitute(part, captures)
+    body_with_reference(part) = isempty(captures) ? substitute(part) :
+        Expr(:block, capture_reference, substitute(part))
+    inner = union(scope, loop_names, Set(values(captures)))
+    iterator = ex.head === :for ?
+        _kernel_tensorized_rhs(binding.args[2], known, mod, scope) : nothing
+    lowered = if ex.head === :for
+        Expr(:for, Expr(:(=), binding.args[1], iterator),
+             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner))
+    else
+        Expr(:while,
+             _kernel_tensorized_rhs(substitute(condition), known, mod, inner),
+             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner))
+    end
+    traced = Expr(:macrocall, GlobalRef(ReactantCore, Symbol("@trace")),
+                  LineNumberNode(@__LINE__, @__FILE__), lowered)
+    witnesses = Any[captures[name] for name in sort!(collect(read))]
+    append!(witnesses, sort!(collect(carried)))
+    seeds = Any[Expr(:(=), name, Expr(:call, GlobalRef(@__MODULE__, :_loop_seed),
+                                       name, witnesses...))
+                for name in sort!(collect(carried))]
+    bindings = Any[Expr(:(=), captures[name],
+                        Expr(:call, GlobalRef(@__MODULE__, :_loop_capture), name))
+                   for name in sort!(collect(read))]
+    # Captures are bound first: a seed's witnesses name them.
+    loop = isempty(captures) ? Expr(:block, seeds..., traced) :
+        Expr(:let, Expr(:block, bindings...), Expr(:block, seeds..., traced))
+    ex.head === :for || return loop
+    # `@trace for` traces its body once even for zero iterations, so a loop
+    # over an empty host range (the doses of an empty schedule) would still
+    # index its zero-length arrays and emit an invalid slice.  Such a loop runs
+    # zero times, as the plain loop does; the check reads the bounds exactly as
+    # `@trace for` does (`a:b` / `a:s:b` syntax, else the range value).
+    empty = iterator isa Expr && iterator.head === :call &&
+            iterator.args[1] === :(:) ?
+        Expr(:call, GlobalRef(@__MODULE__, :_loop_host_empty_colon), iterator.args[2:end]...) :
+        Expr(:call, GlobalRef(@__MODULE__, :_loop_host_empty), iterator)
+    Expr(:if, empty, nothing, loop)
 end
 
 function _kernel_tensorized_branch(condition, then_side, else_side, known, mod,
@@ -2043,22 +2150,33 @@ function _kernel_tensorized_branch(condition, then_side, else_side, known, mod,
          thunk(then_side), thunk(else_side), Expr(:tuple))
 end
 
-# A filtered generator reduction `sum(term for i in iter if condition; init = x)`
-# states a sum over the elements that satisfy the condition — the sum over the
-# doses already given, over the observations inside a window.  Base evaluates it
-# as a left fold over `Iterators.filter`, whose `if` branches on the condition;
-# under a tracing backend the condition is traced and that host branch fails
-# (`non-boolean (TracedRNumber{Bool}) used in boolean context`).  The
-# tensorized companion spells out the same fold with the filter as a lazy
-# branch on the accumulator: `add_sum(acc, term)` runs only in the taken arm,
-# so the term's indexing and arithmetic stay inactive for a rejected element
-# (`docs/src/constraints.md`), and the accumulation order is Base's own
-# (`sum(itr; init)` is `foldl(add_sum, itr; init)` for a generator), so the
-# result is the same value.  Only the `init` form is rewritten: without it the
-# first ACCEPTED element seeds the sum, which a traced condition cannot select
-# at trace time.  The iteration itself is the ordinary Julia iteration of the
-# host iterator, exactly as the unfiltered generator is traced.
-function _kernel_filtered_sum_parts(ex)
+# A generator reduction `sum(term for i in iter [if condition]; init = x)` in a
+# tensorized companion.  Base evaluates it as a left fold, `foldl(add_sum, …;
+# init)`, over the generator (and `Iterators.filter`).  Under a tracing backend
+# that fold is traced once per element of the host iterator — the emitted
+# program grows with the iterator's length, a dose count for a superposition —
+# and a filter condition on a traced value fails outright (`non-boolean
+# (TracedRNumber{Bool}) used in boolean context`).  The companion spells out
+# the same fold in two ways, both with Base's accumulation order, so the value
+# is Base's:
+#
+# - over a data-length iterator (`eachindex(x)`, `axes(x, d)`, `a:b`, `OneTo`:
+#   the authored-loop rule of `_kernel_range_iterator`) the fold becomes one
+#   authored loop with an explicit accumulator, which `_kernel_tensorized_loop`
+#   retains as one backend loop region whatever the length
+#   (`docs/src/constraints.md`, "Preserve data-dependent iteration").  The
+#   index is then a traced value: indexing written in the term is lowered by
+#   the tensorized rewrites (host tables included), while a helper function
+#   indexing with it has no traced method;
+# - over any other iterator (a helper returning a host collection) the fold is
+#   the ordinary per-element iteration, as before.
+#
+# In both, a filter is a lazy branch on the accumulator: `add_sum(acc, term)`
+# runs only in the taken arm, so a rejected element's indexing and arithmetic
+# stay inactive.  Only the `init` form is rewritten: without it the first
+# ACCEPTED element seeds the sum, which a traced condition cannot select at
+# trace time.
+function _kernel_generator_sum_parts(ex)
     ex isa Expr && ex.head === :call && length(ex.args) >= 2 || return nothing
     callee = ex.args[1]
     callee === :sum || callee == GlobalRef(Base, :sum) || return nothing
@@ -2090,26 +2208,132 @@ function _kernel_filtered_sum_parts(ex)
     (generator === nothing || init === nothing) && return nothing
     length(generator.args) == 2 || return nothing
     term, clause = generator.args
-    clause isa Expr && clause.head === :filter && length(clause.args) == 2 ||
-        return nothing
-    condition, binding = clause.args
-    binding isa Expr && binding.head === :(=) && length(binding.args) == 2 &&
-        binding.args[1] isa Symbol || return nothing
-    (; term, condition, variable = binding.args[1], iterator = binding.args[2], init)
+    condition = nothing
+    if clause isa Expr && clause.head === :filter
+        length(clause.args) == 2 || return nothing
+        condition, clause = clause.args
+    end
+    clause isa Expr && clause.head === :(=) && length(clause.args) == 2 &&
+        clause.args[1] isa Symbol || return nothing
+    (; term, condition, variable = clause.args[1], iterator = clause.args[2], init)
 end
 
-function _kernel_tensorized_filtered_sum(parts, known, mod, scope)
+# `ReactantCore.@trace for` over a non-literal range calls unqualified
+# `first`/`step`/`last` (and `one`/`zero`/`div`/`isqrt`/`error`) in the scope it
+# expands into (reactivekernels-use §7m).  Retain a generator's loop only when
+# none of those names is rebound there — a recipe argument, a port, or a global
+# of the defining module that is not Base's — so a local `step = dt` can never
+# silently change the iteration; otherwise the fold stays per element.
+const _TRACE_FOR_CALLER_NAMES = (:first, :step, :last, :one, :zero, :div, :isqrt, :error)
+function _kernel_trace_for_hygienic(known, scope, mod)
+    for name in _TRACE_FOR_CALLER_NAMES
+        (name in known || name in scope) && return false
+        if mod isa Module && isdefined(mod, name)
+            getglobal(mod, name) === getglobal(Base, name) || return false
+        end
+    end
+    true
+end
+
+# Every symbol of `ex` (a term or condition) that names a local in `scope`.
+function _kernel_loop_captures!(names::Set{Symbol}, ex, scope)
+    if ex isa Symbol
+        ex in scope && push!(names, ex)
+    elseif ex isa Expr && !(ex.head in (:quote, :inert, :meta, :line))
+        for (position, arg) in enumerate(ex.args)
+            # A keyword name is syntax, not a read of the local.
+            ex.head === :kw && position == 1 && continue
+            _kernel_loop_captures!(names, arg, scope)
+        end
+    end
+    names
+end
+
+# Replace each captured local by `_loop_open(<its capture>)`, leaving quoted
+# syntax and keyword names untouched and honoring names an inner lambda,
+# generator, `let` or loop binds (those are not the captured local).
+function _kernel_loop_substitute(ex, captures::Dict{Symbol,Symbol})
+    if ex isa Symbol
+        haskey(captures, ex) || return ex
+        return Expr(:call, GlobalRef(@__MODULE__, :_loop_open), captures[ex])
+    end
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert, :meta, :line) && return ex
+    shadowed(names) = isempty(names) ? captures :
+        Dict(k => v for (k, v) in captures if !(k in names))
+    if ex.head === :-> && length(ex.args) == 2
+        formals = _lhs_symbols!(Set{Symbol}(), ex.args[1])
+        ex.args[1] isa Symbol && push!(formals, ex.args[1])
+        return Expr(:->, ex.args[1], _kernel_loop_substitute(ex.args[2], shadowed(formals)))
+    elseif ex.head === :generator
+        bound = Set{Symbol}()
+        for clause in ex.args[2:end]
+            clause isa Expr && clause.head === :filter && (clause = clause.args[end])
+            clause isa Expr && clause.head === :(=) && _lhs_symbols!(bound, clause.args[1])
+        end
+        inner = shadowed(bound)
+        return Expr(:generator, _kernel_loop_substitute(ex.args[1], inner),
+            (_kernel_loop_substitute_clause(clause, captures, inner)
+             for clause in ex.args[2:end])...)
+    elseif ex.head === :for && length(ex.args) == 2 && ex.args[1] isa Expr &&
+           ex.args[1].head === :(=)
+        bound = _lhs_symbols!(Set{Symbol}(), ex.args[1].args[1])
+        return Expr(:for,
+            Expr(:(=), ex.args[1].args[1], _kernel_loop_substitute(ex.args[1].args[2], captures)),
+            _kernel_loop_substitute(ex.args[2], shadowed(bound)))
+    end
+    args = Any[(ex.head === :kw && position == 1) ? arg :
+               _kernel_loop_substitute(arg, captures)
+               for (position, arg) in enumerate(ex.args)]
+    Expr(ex.head, args...)
+end
+
+# A generator clause: its iterator reads the enclosing captures, its filter
+# condition sees the generator's own bindings.
+function _kernel_loop_substitute_clause(clause, captures, inner)
+    if clause isa Expr && clause.head === :filter
+        return Expr(:filter, _kernel_loop_substitute(clause.args[1], inner),
+            (_kernel_loop_substitute_clause(c, captures, inner) for c in clause.args[2:end])...)
+    elseif clause isa Expr && clause.head === :(=)
+        return Expr(:(=), clause.args[1], _kernel_loop_substitute(clause.args[2], captures))
+    end
+    clause
+end
+
+function _kernel_tensorized_generator_sum(parts, known, mod, scope)
+    accumulator = gensym(:generator_sum)
     variable = parts.variable
-    accumulator = gensym(:filtered_sum)
+    accept = Expr(:call, GlobalRef(Base, :add_sum), accumulator, parts.term)
+    if _kernel_range_iterator(parts.iterator) &&
+       _kernel_trace_for_hygienic(known, scope, mod)
+        # One authored loop with an explicit accumulator; the loop companion
+        # seeds the accumulator and captures the term's locals.  A filter
+        # selects the term or the additive identity `-zero(init)` lazily
+        # (`x + -0.0 === x` for every IEEE `x`, so a rejected element leaves
+        # the sum bitwise unchanged).  The identity is computed once before
+        # the loop: a branch that reads the loop-carried accumulator does not
+        # survive the backend's batching of a loop inside a batched plate cell.
+        identity = gensym(:generator_sum_identity)
+        update = parts.condition === nothing ? accept :
+            Expr(:call, GlobalRef(Base, :add_sum), accumulator,
+                 Expr(:if, parts.condition, parts.term, identity))
+        seed = Expr(:block, Expr(:(=), accumulator, parts.init),
+            Expr(:(=), identity, Expr(:call, GlobalRef(Base, :-),
+                                      Expr(:call, GlobalRef(Base, :zero), accumulator))))
+        loop = Expr(:let, seed, Expr(:block,
+            Expr(:for, Expr(:(=), variable, parts.iterator),
+                 Expr(:block, Expr(:(=), accumulator, update))),
+            accumulator))
+        return _kernel_tensorized_rhs(loop, known, mod, scope)
+    end
+    parts.condition === nothing && return nothing
     inner = union(scope, Set((variable, accumulator)))
     formals = Expr(:tuple, accumulator, variable)
-    accept = Expr(:->, formals, Expr(:call, GlobalRef(Base, :add_sum), accumulator,
-        _kernel_tensorized_rhs(parts.term, known, mod, inner)))
-    reject = Expr(:->, formals, accumulator)
     step = Expr(:->, formals,
         Expr(:call, GlobalRef(@__MODULE__, :_recurrence_branch),
              _kernel_tensorized_rhs(parts.condition, known, mod, inner),
-             accept, reject, formals))
+             Expr(:->, formals, _kernel_tensorized_rhs(accept, known, mod, inner)),
+             Expr(:->, formals, accumulator), formals))
     Expr(:call, GlobalRef(Base, :foldl),
          Expr(:parameters, Expr(:kw, :init,
               _kernel_tensorized_rhs(parts.init, known, mod, scope))),
@@ -2281,9 +2505,11 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
             ex.args[1], true, ex.args[2], known, mod, scope)
     elseif ex.head === :call && !isempty(ex.args) &&
            (!(ex.args[1] isa Symbol) || !(ex.args[1] in known))
-        filtered = _kernel_filtered_sum_parts(ex)
-        filtered === nothing ||
-            return _kernel_tensorized_filtered_sum(filtered, known, mod, scope)
+        reduction = _kernel_generator_sum_parts(ex)
+        if reduction !== nothing
+            lowered = _kernel_tensorized_generator_sum(reduction, known, mod, scope)
+            lowered === nothing || return lowered
+        end
         replacement = _tensorized_callee_replacement(ex.args[1])
         callee = replacement === nothing ?
             _kernel_tensorized_callee(ex.args[1], known, mod) :

@@ -129,13 +129,12 @@ end
     @test length(cache) == 2
 
     # A binding of differently TYPED data on the same ports reuses the entry
-    # (no re-planning, same prefix kernel). This residual contains an authored
-    # plate, so its template is per bound type/shape; the port-keyed sharing of
-    # one compiled residual across types is asserted on the plate-free fixture
-    # below.
+    # (no re-planning, same prefix kernel) and, since the inner-plate pass
+    # leaves this plate alone, the same compiled residual.
     fill!(C.calls, 0)
     k5 = prepare!(cache, C.explicit; bound = (; data = [2, 3]))
     @test C.calls == [1, 0, 0]
+    @test k5.f === k1.f
     @test k5(samples, q, scale) == C.opaque(samples, [2, 3], q, scale)
     @test k1(samples, q, scale) == C.opaque(samples, data, q, scale)
     @test length(cache) == 2
@@ -225,6 +224,91 @@ end
     @test length(cache) == 1
 end
 
+# The ShinyRK simulation graph with its superposition plate authored inline:
+# a bound schedule fixes the plate's domain and unit response, the dose
+# amounts stay live. A plate with a bound-only cell value, which the
+# inner-plate pass specializes only on a domain longer than one lane.
+module InlinePlateFixture
+using ReactiveKernels
+struct LatticePlan
+    nobs::Int
+    shifts::Vector{Int}
+    lags::Vector{Float64}
+end
+row_index(observation, plan::LatticePlan, i) = observation - plan.shifts[i]
+dose_slots(plan::LatticePlan) = eachindex(plan.shifts)
+observation_domain(plan::LatticePlan) = 1:plan.nobs
+@kernel simulation(kernel, plan, amounts::Vector{Float64}) = begin
+    units::Vector{Float64} = exp.(-kernel.k .* plan.lags)
+    weights::Vector{Float64} = amounts .* kernel.F
+    observations = observation_domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do o, p, u, w
+        sum((w[i] * get(u, row_index(o, p, i), 0.0) for i in dose_slots(p)); init = 0.0)
+    end
+    total = sum(concentration)
+    return total
+end
+schedule(n, doses; offset = 0) =
+    LatticePlan(n, collect(offset .+ 3 .* (1:doses)), collect(0.1 .* (0:(n - 1))))
+reference(kernel, plan, amounts) = sum(
+    sum((amounts[i] * kernel.F * get(exp.(-kernel.k .* plan.lags), o - plan.shifts[i], 0.0)
+         for i in eachindex(plan.shifts)); init = 0.0) for o in 1:plan.nobs)
+@kernel scaled(x::Vector{Float64}, data) = begin
+    values = plate(x, data) do xi, d
+        c = exp(d)
+        xi * c
+    end
+    return values
+end
+end
+
+# An inline plate the inner-plate pass leaves alone rebinds to new bound array
+# lengths through the one compiled residual, as the same plate in a prepared
+# child does; the pass still decides every binding, so a binding it rewrites is
+# specialized and the next binding it declines reuses the template (snag
+# inline-plate-reb-7387f072: templates keyed on bound array sizes re-lowered
+# the ShinyRK simulation graph at every new schedule length and kept one
+# template per length).
+@testset "bound preparation shares an inline plate's residual across lengths" begin
+    F = InlinePlateFixture
+    kernel = (; k = 0.3, F = 0.8)
+    fresh(spec, bound) = prepare(plan(spec);
+        bound = ReactiveKernels._kernel_bound_pairs(spec, bound))
+    kernels = map([(40, 3, 0), (42, 3, 0), (40, 3, 1), (57, 5, 0), (8, 1, 2)]) do (n, doses, offset)
+        schedule = F.schedule(n, doses; offset)
+        k = prepare(F.simulation; bound = (; kernel, plan = schedule))
+        amounts = collect(1.0:doses)
+        @test k(amounts) == fresh(F.simulation, (; kernel, plan = schedule))(amounts)
+        @test k(amounts) ≈ F.reference(kernel, schedule, amounts)
+        k
+    end
+    # One compiled residual (the template's lowering) for every length.
+    @test all(k -> k.f === first(kernels).f && k.ast === first(kernels).ast, kernels)
+    entries = collect(values(F.simulation.graph.preparations.cache.bound))
+    @test length(entries) == 1
+    @test only(entries).template isa ReactiveKernels._BoundTemplate
+    # The same through a caller-owned cache, and across a kernel's type.
+    cache = PreparationCache()
+    k1 = prepare!(cache, F.simulation; bound = (; kernel, plan = F.schedule(30, 2)))
+    k2 = prepare!(cache, F.simulation; bound = (; kernel = (; k = 1, F = 2), plan = F.schedule(31, 2)))
+    @test k2.ast === k1.ast
+    @test k2([1.0, 2.0]) ≈ F.reference((; k = 1, F = 2), F.schedule(31, 2), [1.0, 2.0])
+
+    # Specialized (a domain longer than one lane) and unspecialized (one lane)
+    # bindings interleaved: each follows the pass's verdict for its own values.
+    declined = []
+    for (x, data) in (([1.0, 2.0, 3.0], [0.1, 0.2, 0.3]), ([1.0, 2.0, 3.0, 4.0], [0.5]),
+                      ([1.0, 2.0], [0.0, 1.0]), ([2.0, 5.0], [0.25]))
+        k = prepare(F.scaled; bound = (; data))
+        @test k(x) == x .* exp.(data)
+        @test k(x) == fresh(F.scaled, (; data))(x)
+        length(data) == 1 ? push!(declined, k) :
+            @test any(r -> r.op isa ReactiveKernels._AuthoredPlateOp &&
+                           length(r.inputs) > 2, k.plan.recipes)
+    end
+    @test declined[2].ast === declined[1].ast
+end
+
 module FirstRebindingFixture
 using ReactiveKernels
 square(data) = data .^ 2
@@ -282,6 +366,66 @@ end
                    bound = (; data = [1.0, 1.0]))(q) == [2.0, 2.0]
     GC.gc(); GC.gc()
     @test hoisted.value === nothing
+end
+
+# The testset above warms the rebinding path on another graph first. The first
+# rebinding in a FRESH process must compile nothing too: the path is in the
+# package image, not compiled by whichever rebinding comes first (snag
+# first-rebinding-64d82bfc: 41 ms and 0.55 MB once per process on the ShinyRK
+# simulation graph, for a residual with or without an authored plate).
+@testset "the first rebinding in a fresh process compiles nothing" begin
+    fixture = raw"""
+        using ReactiveKernels
+        square(data) = data .^ 2
+        @kernel plain(data, q) = begin
+            b = square(data)
+            total = sum(b .* q)
+            return total
+        end
+        # An inline plate over a bound domain whose cells read a live value:
+        # the inner-plate pass runs on every binding and leaves it alone.
+        @kernel plated(data, q) = begin
+            b = square(data)
+            observations::UnitRange{Int} = 1:length(b)
+            values::Vector{Float64} = plate(observations, Ref(b), Ref(q)) do t, shared, w
+                shared[t] * w[t]
+            end
+            total = sum(values)
+            return total
+        end
+        spec = ARGS[1] == "plated" ? plated : plain
+        function first_rebinding(spec)
+            q = [1.0, 2.0, 3.0]
+            k1 = prepare(spec; bound = (; data = [1.0, 2.0, 3.0]))
+            # Read both counters before any arithmetic on them.
+            Base.cumulative_compile_timing(true)
+            before = Base.cumulative_compile_time_ns()
+            k2 = prepare(spec; bound = (; data = [3.0, 2.0, 1.0]))
+            after = Base.cumulative_compile_time_ns()
+            Base.cumulative_compile_timing(false)
+            (first(after) - first(before), k2.f === k1.f, k1(q), k2(q))
+        end
+        compile_ns, shared, value1, value2 = first_rebinding(spec)
+        entry = only(values(ReactiveKernels._graph_preparations(spec.graph).bound))
+        print(join((compile_ns, shared, value1, value2, entry.plates), ","))
+        """
+    # Package-image native code is not used under coverage or without images.
+    options = Base.JLOptions()
+    if options.code_coverage != 0 || options.use_pkgimages == 0
+        @test_skip "package-image native code is not in use"
+    else
+        project = Base.active_project()
+        for (name, plates) in (("plain", false), ("plated", true))
+            out = read(`$(Base.julia_cmd()) --startup-file=no --project=$project -e $fixture $name`,
+                       String)
+            compile_ns, shared, value1, value2, has_plates = split(out, ",")
+            @test parse(Int, compile_ns) == 0
+            @test shared == "true"
+            @test parse(Float64, value1) == 1.0 + 8.0 + 27.0
+            @test parse(Float64, value2) == 9.0 + 8.0 + 3.0
+            @test has_plates == string(plates)
+        end
+    end
 end
 
 module PlainBoundFixture

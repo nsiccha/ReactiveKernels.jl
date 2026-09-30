@@ -19,6 +19,14 @@ Validate, assign layout, emit, and evaluate a self-contained `@kernel`
 program for `plan`. `spec` is the `KernelSpec` (callable after `prepare`
 with `have=(:unconstrained, data…)`); `layout` is its
 [`LayoutTable`](@ref) (R10 read API for the sampler side).
+
+Thread safety: concurrent `build_kernel` calls over independent plans are
+supported — the counter-suffixed `PPLGeneratedModels` binding is assigned
+under a package-owned lock, so every build gets a distinct binding with no
+caller-side synchronization. The returned spec closes over build-time
+eval'd code: `prepare` it and call it through [`prepare_query`](@ref) /
+[`prepare_sampler`](@ref) (which carry the `Base.invokelatest` world-age
+barrier) or wrap those calls in `Base.invokelatest` yourself.
 """
 function build_kernel(plan::StructuralPlan)
     validate_plan(plan)
@@ -153,15 +161,25 @@ end
 
 const _MODEL_COUNTER = Ref(0)
 
+# Package-owned binding lock: the counter increment plus the two
+# `PPLGeneratedModels` evals are one critical section, so concurrent
+# `build_kernel` calls always land on distinct bindings (an unsynchronized
+# `Ref` increment drops updates under contention and two builds would
+# silently share one binding — the second model's def wins and the first
+# task reads back the wrong kernel).
+const _MODEL_EVAL_LOCK = ReentrantLock()
+
 function _eval_kernel_def(def::Expr)
-    _MODEL_COUNTER[] += 1
-    name = Symbol(:ppl_model_, _MODEL_COUNTER[])
-    sig = def.args[1]
-    renamed = Expr(:(=), Expr(:call, name, sig.args[2:end]...), def.args[2])
-    call =
-        Expr(:macrocall, Symbol("@kernel"), LineNumberNode(1, :generator), renamed)
-    Core.eval(PPLGeneratedModels, call)
-    return Core.eval(PPLGeneratedModels, name)
+    lock(_MODEL_EVAL_LOCK) do
+        _MODEL_COUNTER[] += 1
+        name = Symbol(:ppl_model_, _MODEL_COUNTER[])
+        sig = def.args[1]
+        renamed = Expr(:(=), Expr(:call, name, sig.args[2:end]...), def.args[2])
+        call = Expr(:macrocall, Symbol("@kernel"), LineNumberNode(1, :generator),
+            renamed)
+        Core.eval(PPLGeneratedModels, call)
+        return Core.eval(PPLGeneratedModels, name)
+    end
 end
 
 # Scalar + derived assignments in topo order (params already constrained

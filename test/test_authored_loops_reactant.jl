@@ -54,3 +54,124 @@ end
     compiled = Reactant.@compile k(_traced(x), _traced(0.5))
     @test _host(compiled(_traced(x), _traced(0.5))) ≈ k(x, 0.5)
 end
+
+# `ReactantCore.@trace` carries a loop value by updating the traced object that
+# exists before the loop; it never assigns results back to the enclosing
+# variables. A carry seeded on the host (`acc = 0.0`, `zeros(n)`) therefore had
+# no traced object, and the compiled loop silently returned its seed. The loop
+# companion now re-binds each carried local to a fresh traced copy, and passes
+# read-only host structs through untraced (snag one-natural-supe-39da86a4).
+@kernel host_seed_loop(x::Vector{Float64}) = begin
+    total::Float64 = begin
+        acc = 0.0
+        for i in eachindex(x)
+            acc = acc + x[i] * x[i]
+        end
+        acc
+    end
+    return total
+end
+
+@kernel host_buffer_loop(x::Vector{Float64}) = begin
+    prefix::Vector{Float64} = begin
+        out = zeros(length(x))
+        acc = 0.0
+        for i in eachindex(x)
+            acc = acc + x[i]
+            out[i] = acc
+        end
+        out
+    end
+    return prefix
+end
+
+struct _HostLoopPlan
+    picks::Vector{Int}
+end
+
+@kernel host_struct_loop(plan, x::Vector{Float64}) = begin
+    total::Float64 = begin
+        acc = 0.0
+        for j in eachindex(plan.picks)
+            acc = acc + x[plan.picks[j]]
+        end
+        acc
+    end
+    return total
+end
+
+# `@trace for` resolves `step` in the scope it expands into (reactivekernels-use
+# §7m); with a port named `step` the loop is traced per iteration instead.
+@kernel shadowed_step_loop(x::Vector{Float64}, step::Float64) = begin
+    total::Float64 = begin
+        acc = 0.0
+        for i in eachindex(x)
+            acc = acc + step * x[i]
+        end
+        acc
+    end
+    return total
+end
+
+# `@trace` writes each loop result back into every traced object the body
+# reads; the loop reads the caller's inputs through fresh tracers, so a
+# zero-sized one is not returned as an aliased `tensor.empty` output.
+@kernel loop_reads_empty(x::Vector{Float64}, z::Vector{Float64}) = begin
+    total::Float64 = begin
+        acc = 0.0
+        for i in eachindex(x)
+            acc = acc + x[i] + sum(z)
+        end
+        acc
+    end
+    return total
+end
+
+@testset "a loop carry seeded on the host is carried, not dropped" begin
+    sizes = Int[]
+    for n in (8, 32)
+        x = collect(range(-1.0, 1.0; length = n))
+        k = prepare(host_seed_loop)
+        hlo = repr(Reactant.@code_hlo optimize = false k(_traced(x)))
+        @test count("stablehlo.while", hlo) == 1
+        push!(sizes, count("\n", hlo))
+        compiled = Reactant.@compile k(_traced(x))
+        @test _host(compiled(_traced(x))) ≈ k(x)
+        kb = prepare(host_buffer_loop)
+        compiled_buffer = Reactant.@compile kb(_traced(x))
+        @test _host(compiled_buffer(_traced(x))) ≈ kb(x)
+    end
+    @test sizes[1] == sizes[2]
+
+    x = [0.5, -1.0, 2.0, 0.25, 3.0]
+    plan = _HostLoopPlan([5, 1, 3])
+    ks = prepare(host_struct_loop)
+    compiled_struct = Reactant.@compile ks(plan, _traced(x))
+    @test _host(compiled_struct(plan, _traced(x))) ≈ ks(plan, x)
+
+    # `@trace for` traces its body once even for zero iterations, and indexing
+    # a zero-length array there emits an invalid slice. A loop over an empty
+    # host range is skipped instead, as the plain loop runs zero times (the
+    # doses of an empty schedule).
+    k = prepare(host_seed_loop)
+    empty = Float64[]
+    hlo_empty = repr(Reactant.@code_hlo optimize = false k(_traced(empty)))
+    @test count("stablehlo.while", hlo_empty) == 0
+    compiled_empty = Reactant.@compile k(_traced(empty))
+    @test Float64(compiled_empty(_traced(empty))) === k(empty) === 0.0
+    unplanned = _HostLoopPlan(Int[])
+    compiled_unplanned = Reactant.@compile ks(unplanned, _traced(x))
+    @test Float64(compiled_unplanned(unplanned, _traced(x))) === ks(unplanned, x) === 0.0
+
+    kz = prepare(loop_reads_empty)
+    for z in ([0.5], Float64[])
+        compiled_z = Reactant.@compile sync = true kz(_traced(x), _traced(z))
+        @test Float64(compiled_z(_traced(x), _traced(z))) ≈ kz(x, z)
+    end
+
+    kstep = prepare(shadowed_step_loop)
+    hlo_step = repr(Reactant.@code_hlo optimize = false kstep(_traced(x), _traced(0.5)))
+    @test count("stablehlo.while", hlo_step) == 0
+    compiled_step = Reactant.@compile kstep(_traced(x), _traced(0.5))
+    @test _host(compiled_step(_traced(x), _traced(0.5))) ≈ kstep(x, 0.5)
+end
