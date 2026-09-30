@@ -255,11 +255,14 @@ end
     k1 = prepare!(cache, F.fresh; bound = (; data = [1.0, 2.0, 3.0]))
     @test k1(q) == 72.0
     data2 = [2.0, 0.0, 1.0]
+    # Read both counters before any arithmetic on them: anything compiled
+    # between the reads (even `first` on the counter tuple) is counted.
     Base.cumulative_compile_timing(true)
-    before = first(Base.cumulative_compile_time_ns())
+    before = Base.cumulative_compile_time_ns()
     k2 = prepare!(cache, F.fresh; bound = (; data = data2))
-    compile_ns = first(Base.cumulative_compile_time_ns()) - before
+    after = Base.cumulative_compile_time_ns()
     Base.cumulative_compile_timing(false)
+    compile_ns = first(after) - first(before)
     @test compile_ns == 0
     @test k2.f === k1.f
     @test k2(q) == 14.0
