@@ -153,14 +153,16 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     end
     # The per-binding mathematics runs outside the lock.
     hoisted = _bound_hoisted(entry, data)
-    shape = _bound_shape_key(entry, data, hoisted)
+    residual, specialized = _bound_residual(entry, hoisted)
+    # A residual the inner-plate pass rewrote bakes this binding's values in.
+    specialized === residual || return prepare(specialized; passes = passes)
     fresh = nothing
     template = lock(cache.lock) do
-        get!(entry.templates, shape) do
-            template, kernel = _bound_build(entry, hoisted, passes)
-            fresh = kernel
-            template
-        end
+        entry.template isa _UnbuiltTemplate || return entry.template
+        template, kernel = _bound_build(entry, residual, hoisted, passes)
+        entry.template = template
+        fresh = kernel
+        template
     end
-    fresh === nothing ? _bound_rebind(entry, template, hoisted, passes) : fresh
+    fresh === nothing ? _bound_rebind(entry, template, residual, hoisted, passes) : fresh
 end
