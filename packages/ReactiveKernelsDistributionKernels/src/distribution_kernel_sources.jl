@@ -34,6 +34,12 @@ const logbeta = scalar_derivative_rule(
     logbeta_graph; primal = :y, partials = (a = :dy_da, b = :dy_db),
     name = :logbeta)
 
+# The owned symmetric-eigendecomposition pair (`rk_symmetric_eigvals` /
+# `rk_symmetric_eigvecs`), the same generated-rule shape for a linear-algebra
+# primitive: reached as `DistributionKernelSources.rk_symmetric_*` (and
+# re-exported by ReactiveKernelsPPL).
+include("symmetric_eigen_rules.jl")
+
 export LOCATION_SCALE_SOURCE
 export standard_normal, standard_cauchy, standard_laplace, standard_student_t
 export standard_logistic
