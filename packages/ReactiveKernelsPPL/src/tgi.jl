@@ -293,9 +293,9 @@ end
 
 Kernel-side nadir formulation as a `scan` statement
 (`ref = scan(change; init = 0.0) do carry, x (min(carry, x), carry) end`):
-output-before-update reproduces [`tgi_running_nadir`](@ref) exactly. The
-sequence must be non-empty (`scan` contract); subjects without assessments
-need their empty case handled at emission. `change` is the subject's row
+output-before-update reproduces [`tgi_running_nadir`](@ref) exactly. An empty
+sequence (a subject without assessments) yields an empty result, as
+`tgi_running_nadir` does. `change` is the subject's row
 sequence: a plain vector name or a range-copy over one subject's segment.
 Grouped kernels use [`tgi_segmented_nadir`](@ref) to retain a single loop
 over all assessments and their reset flags.

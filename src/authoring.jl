@@ -3325,22 +3325,25 @@ function plate(spec::KernelSpec; have, want, batched, reduce = :+)
 end
 
 """
-    scan(xs, Ref(shared)...; init) do carry, x, shared...
+    scan(xs, ys..., Ref(shared)...; init) do carry, x, y..., shared...
         …
         (new_carry, output)
     end
 
-Author a bounded SEQUENTIAL recurrence inside a `@kernel` / `@ppl` body. `xs` is
-the sequence to scan over (the sole non-`Ref` positional); `init` seeds the
-threaded `carry`; any `Ref(shared)` operands are broadcast-invariant scalars.
-The do-block receives `(carry, x, shared...)` and must end with the 2-tuple
-`(new_carry, output)`; `scan` returns the vector `[output…]`. A compound carry
-may be carried as a `NamedTuple` (`init = (; a, b)`, read `carry.a`).
+Author a bounded SEQUENTIAL recurrence inside a `@kernel` / `@ppl` body. The
+leading non-`Ref` positionals are the sequences to scan over, advanced in
+lockstep (they must share axes); `init` seeds the threaded `carry`; any trailing
+`Ref(shared)` operands are passed whole to every step. The do-block receives
+`(carry, x, y..., shared...)` and must end with the 2-tuple `(new_carry,
+output)`; `scan` returns the vector `[output…]`. A compound carry may be carried
+as a `NamedTuple` (`init = (; a, b)`, read `carry.a`). Empty sequences run no
+step and return an empty vector of the step's inferred output type.
 
 It lowers to an ordinary ordered loop natively, and to a `stablehlo.while` carry
 loop under Reactant — so a natural sequential recurrence lowers without unrolling
 into forbidden scalar indexing. This is `@kernel` authoring sugar recognized by
-the macro; it is not a callable runtime function outside a kernel body.
+the macro as a recipe's right-hand side, like an authored `plate`; it is not a
+callable runtime function outside a kernel body.
 """
 function scan(args...; kwargs...)
     throw(ArgumentError(

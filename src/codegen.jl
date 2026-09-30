@@ -396,14 +396,48 @@ function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
     isempty(matches) ? nothing : only(matches)
 end
 
+# The static type of an inlined scan step's per-step output, as a chain of
+# `Base.promote_op` over the step's own operations: the type the first step's
+# output would have, without running it. The authored-plate element type uses
+# the same chain; unlike inferring the nested PreparedKernel as a whole, each
+# operation infers exactly inside the enclosing generated body. `nothing` when
+# the step is not one plain operation per recipe (a nested plate, scan or
+# embedded kernel inside the step).
+function _authored_scan_step_output_type(step, input_types, offset)
+    p = step.plan
+    length(step.ops) == length(p.recipes) || return nothing
+    any(op -> op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+        _embedded_kernel(op) !== nothing, step.ops) && return nothing
+    types = Dict{Int,Any}(canon_id(p.graph, v.id) => T
+                          for (v, T) in zip(p.have, input_types))
+    for (i, recipe) in enumerate(p.recipes)
+        all(v -> haskey(types, canon_id(p.graph, v.id)), recipe.inputs) ||
+            return nothing
+        T = Expr(:call, GlobalRef(Base, :promote_op), Expr(:ref, _OPS_ARG, offset + i),
+                 (types[canon_id(p.graph, v.id)] for v in recipe.inputs)...)
+        if length(recipe.outputs) == 1
+            types[canon_id(p.graph, only(recipe.outputs).id)] = T
+        else
+            for (j, output) in enumerate(recipe.outputs)
+                types[canon_id(p.graph, output.id)] =
+                    Expr(:call, GlobalRef(Base, :fieldtype), T, j)
+            end
+        end
+    end
+    length(p.want) == 2 || return nothing
+    get(types, canon_id(p.graph, p.want[2].id), nothing)
+end
+
 # Inline the scalar step into the ordered native loop. Calling the nested
 # PreparedKernel from a loop with a changing carry defeats inference across the
 # RGF boundary; the same step AST and operation table specialize normally here.
+# An empty sequence runs no step: the scan port is an empty vector of the
+# step's output type and a fused plate consumer sums nothing.
 function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
                                       offset; consumer = nothing)
     step = op.kernel
-    indices, index, carry, output = gensym.((:scan_indices, :scan_index,
-                                            :scan_carry, :scan_output))
+    indices, index, carry, output, output_type = gensym.((:scan_indices,
+        :scan_index, :scan_carry, :scan_output, :scan_output_type))
     # `A` marks the atomic operands: index 1 (the carry seed) plus the `Ref`
     # shareds.  The iterated sequences are the remaining operand indices; each is
     # indexed by the loop counter per step, while shared operands pass whole.
@@ -421,57 +455,80 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     end
     step_body = Expr(:block, _embedded_statements(
         step.ast, arguments, Expr(:tuple, carry, output), offset)...)
+    # The step's static output type for an empty sequence: the step's argument
+    # types are the carry seed, one element of each sequence and the shared
+    # operands, exactly as the first step would receive them.
+    typeof_ref, eltype_ref = GlobalRef(Base, :typeof), GlobalRef(Base, :eltype)
+    step_input_types = Any[Expr(:call, typeof_ref, callargs[1])]
+    for i in iterated_positions
+        push!(step_input_types, Expr(:call, eltype_ref, callargs[i]))
+    end
+    for i in shared_positions
+        push!(step_input_types, Expr(:call, typeof_ref, callargs[i]))
+    end
+    empty_output_type = something(
+        _authored_scan_step_output_type(step, step_input_types, offset), Any)
     invariant = Any[]
     initial_output, loop_output, final_output = Expr(:block), Expr(:block), Expr(:block)
+    empty_output = Expr(:block, :($output_type = $empty_output_type))
     if lhs !== nothing
         push!(initial_output.args, :($lhs = $(GlobalRef(Base, :similar))(
-            $xs, $(GlobalRef(Base, :typeof))($output))))
+            $xs, $typeof_ref($output))))
         push!(initial_output.args, :($lhs[$index] = $output))
         push!(loop_output.args, :($lhs[$index] = $output))
+        push!(empty_output.args, :($lhs = $(GlobalRef(Base, :similar))(
+            $xs, $output_type)))
     end
     if consumer !== nothing
         cell, args, positions, cell_offset, pointwise_lhs, total_lhs = consumer
         cell_output = gensym(:scan_cell)
         cell_args = Any[i in positions ? output : arg for (i, arg) in enumerate(args)]
         invariant, dynamic, cell_type = _authored_scan_cell_statements(
-            cell, cell_args, positions, cell_output, cell_offset)
+            cell, cell_args, positions, cell_output, cell_offset; output_type)
         append!(step_body.args, dynamic)
         # Match ordinary plate lowering's inferred result type, including
         # heterogeneous cells; the first value alone cannot type that buffer.
         plate_eltype = gensym(:scan_plate_eltype)
-        push!(initial_output.args, :($plate_eltype = $cell_type))
+        push!(initial_output.args, :($output_type = $typeof_ref($output)))
+        for block in (initial_output, empty_output)
+            push!(block.args, :($plate_eltype = $cell_type))
+        end
         if pointwise_lhs !== nothing
-            push!(initial_output.args, :($pointwise_lhs = $(GlobalRef(Base, :similar))(
-                $xs, $plate_eltype)))
+            for block in (initial_output, empty_output)
+                push!(block.args, :($pointwise_lhs = $(GlobalRef(Base, :similar))(
+                    $xs, $plate_eltype)))
+            end
             push!(initial_output.args, :($pointwise_lhs[$index] = $cell_output))
             push!(loop_output.args, :($pointwise_lhs[$index] = $cell_output))
             push!(final_output.args, :($pointwise_lhs =
                 $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
         end
-        push!(initial_output.args,
-              :($total_lhs = $(GlobalRef(Base, :zero))(
-                  $plate_eltype === Any ? $(GlobalRef(Base, :typeof))($output) :
-                  $plate_eltype) + $cell_output))
+        total_zero = :($(GlobalRef(Base, :zero))(
+            $plate_eltype === Any ? $output_type : $plate_eltype))
+        push!(initial_output.args, :($total_lhs = $total_zero + $cell_output))
+        push!(empty_output.args, :($total_lhs = $total_zero))
         push!(loop_output.args, :($total_lhs = $total_lhs + $cell_output))
     end
     # `eachindex(seqs...)` throws `DimensionMismatch` unless every iterated
     # sequence shares axes, giving the lockstep length check for free.
     push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
-    push!(body.args, :($(GlobalRef(Base, :isempty))($indices) &&
-        throw(ArgumentError("scan requires a non-empty sequence"))))
     append!(body.args, invariant)
-    push!(body.args, :($carry = $(callargs[1])))
-    push!(body.args, :($index = $(GlobalRef(Base, :first))($indices)))
-    append!(body.args, step_body.args)
-    append!(body.args, initial_output.args)
-    push!(body.args, Expr(:for,
+    nonempty = Expr(:block)
+    push!(nonempty.args, :($carry = $(callargs[1])))
+    push!(nonempty.args, :($index = $(GlobalRef(Base, :first))($indices)))
+    append!(nonempty.args, step_body.args)
+    append!(nonempty.args, initial_output.args)
+    push!(nonempty.args, Expr(:for,
         :($index = $(GlobalRef(Base.Iterators, :drop))($indices, 1)),
         Expr(:block, step_body.args..., loop_output.args...)))
+    push!(body.args, Expr(:if, :($(GlobalRef(Base, :isempty))($indices)),
+                          empty_output, nonempty))
     append!(body.args, final_output.args)
     body
 end
 
-function _authored_scan_cell_statements(cell, args, positions, output, offset)
+function _authored_scan_cell_statements(cell, args, positions, output, offset;
+                                        output_type = nothing)
     inner = cell.plan
     length(cell.ops) == length(inner.recipes) || throw(ArgumentError(
         "an authored plate body must lower to one operation per transparent scalar recipe"))
@@ -479,8 +536,12 @@ function _authored_scan_cell_statements(cell, args, positions, output, offset)
     dependencies = _plate_dependencies(inner, roots).recipes
     locals = Dict(canon_id(inner.graph, v.id) => arg
                   for (v, arg) in zip(inner.have, args))
+    # The scan output's type is supplied by the caller when given, so the empty
+    # sequence (which has no output value) types the plate the same way.
     types = Dict{Int,Any}(canon_id(inner.graph, v.id) =>
-        Expr(:call, GlobalRef(Base, :typeof), arg) for (v, arg) in zip(inner.have, args))
+        (output_type !== nothing && i in positions ? output_type :
+         Expr(:call, GlobalRef(Base, :typeof), arg))
+        for (i, (v, arg)) in enumerate(zip(inner.have, args)))
     invariant, dynamic = Any[], Any[]
     for (i, recipe) in enumerate(inner.recipes)
         length(recipe.outputs) == 1 || throw(ArgumentError(
