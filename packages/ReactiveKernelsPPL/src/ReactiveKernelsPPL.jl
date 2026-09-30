@@ -120,6 +120,7 @@ export tgi_category_lpmf, tgi_category_lpmfs,
 export tgi_category_stmts, tgi_response_stmts, tgi_censored_stmts
 export TGI_CELL_FUNCTIONS
 export rk_expm
+export rk_symmetric_eigvals, rk_symmetric_eigvecs
 export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
     prepare_transit_twocmt_rule
 export varyingsource_effectiveness, varyingsource_effective_dose,
@@ -132,6 +133,7 @@ export build_varyingsource_pkpd_schedule, varyingsource_pkpd_read_locs_over_subj
 include("contract.jl")
 include("varying_centered.jl")
 include("expm_rule.jl")
+include("symmetric_eigen_rules.jl")
 include("pkcells.jl")
 include("transit_twocmt.jl")
 include("transit_twocmt_rule.jl")
