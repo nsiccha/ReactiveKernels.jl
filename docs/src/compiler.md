@@ -264,11 +264,15 @@ was built from. Binding freshness remains the caller's responsibility as for
 `prepare`.
 
 Rebinding itself is not specialized on the graph's kernel types. Its code is
-compiled once per process for every graph, so the first rebinding of a graph
-costs what any later one does. (Before, the first rebinding of each graph in a
-process compiled the rebinding path for that graph's prefix and residual kernel
-types: 290 ms and 40 MB for the ShinyRK simulation graph, whose steady-state
-rebinding costs about 1 ms.)
+compiled once, for every graph, into the ReactiveKernels package image, so the
+first rebinding of a graph in a process compiles nothing and costs what any
+later one does. (Before, the first rebinding of each graph in a process
+compiled the rebinding path for that graph's prefix and residual kernel types:
+290 ms and 40 MB for the ShinyRK simulation graph, whose steady-state
+rebinding costs about 1 ms. Later, while that untyped path was compiled only
+incidentally with the first binding, a change to its arguments moved its
+compilation back to the first rebinding in each process: about 40 ms and
+0.55 MB on the same graph.)
 
 #### Data-bound branches in plate cells
 

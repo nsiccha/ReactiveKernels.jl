@@ -718,7 +718,7 @@ end
 # That plan and its inner-plate specialization over the hoisted values. The
 # second is the plan `prepare` compiles; it is the first object exactly when
 # the inner-plate pass had nothing to do.
-function _partial_residual(p::Plan, b::_PartialBoundary, hoisted)
+function _partial_residual(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
     g = p.graph
     known = Dict{Int,Any}()
     for (value, data) in zip(b.constants, hoisted)
@@ -810,14 +810,21 @@ function _bound_residual(entry::_BoundEntry, @nospecialize(hoisted))
     _partial_residual(entry.plan, entry.boundary, hoisted)
 end
 
+# The residual plan `_bound_residual` built, or, where the inner-plate pass did
+# not run, the plain one. Its callers take `residual` unspecialized, and this
+# dispatch keeps the plan a concrete `Plan` after the call: reassigning the
+# `Any` argument instead made every later call in `_bound_rebind` a dynamic
+# dispatch (snag first-rebinding-64d82bfc).
+_bound_residual_plan(::_BoundEntry, residual::Plan, @nospecialize(hoisted)) = residual
+_bound_residual_plan(entry::_BoundEntry, ::Nothing, @nospecialize(hoisted)) =
+    _partial_residual_plan(entry.plan, entry.boundary, hoisted)
+
 # The first value-independent binding: the ordinary preparation, capturing
 # the template when the leading operation-table slots are exactly the
 # constants. Returns the template (or `nothing`) and this binding's kernel.
 function _bound_build(entry::_BoundEntry, @nospecialize(residual),
                       @nospecialize(hoisted), @nospecialize(passes))
-    residual === nothing &&
-        (residual = _partial_residual_plan(entry.plan, entry.boundary, hoisted))
-    kernel = prepare(residual; passes = passes)
+    kernel = prepare(_bound_residual_plan(entry, residual, hoisted); passes = passes)
     n = length(entry.boundary.constants)
     # Rebinding swaps the leading operation-table slots, so they must be
     # exactly this binding's constants in slot order.
@@ -833,13 +840,11 @@ end
 # compilation on the cached plan and prefix.
 function _bound_rebind(entry::_BoundEntry, ::Nothing, @nospecialize(residual),
                        @nospecialize(hoisted), @nospecialize(passes))
-    residual === nothing &&
-        (residual = _partial_residual_plan(entry.plan, entry.boundary, hoisted))
-    prepare(residual; passes = passes)
+    prepare(_bound_residual_plan(entry, residual, hoisted); passes = passes)
 end
 
 # A residual that reads no hoisted value is one kernel for every binding.
-_bound_rebind(::_BoundEntry, kernel::PreparedKernel, @nospecialize(residual),
+_bound_rebind(::_BoundEntry, @nospecialize(kernel::PreparedKernel), @nospecialize(residual),
               @nospecialize(hoisted), @nospecialize(passes)) = kernel
 
 # A later value-independent binding: the same compiled callable over a fresh
@@ -847,11 +852,10 @@ _bound_rebind(::_BoundEntry, kernel::PreparedKernel, @nospecialize(residual),
 function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
                        @nospecialize(residual), @nospecialize(hoisted),
                        @nospecialize(passes))
-    residual === nothing &&
-        (residual = _partial_residual_plan(entry.plan, entry.boundary, hoisted))
-    recipes = residual.recipes[1:length(entry.boundary.constants)]
+    plan = _bound_residual_plan(entry, residual, hoisted)
+    recipes = plan.recipes[1:length(entry.boundary.constants)]
     ops = (Any[recipe.op for recipe in recipes]..., template.ops...)
-    PreparedKernel(template.f, ops, template.inputs, template.outputs, residual,
+    PreparedKernel(template.f, ops, template.inputs, template.outputs, plan,
                    template.ast, (recipes..., template.lowered...))
 end
 
