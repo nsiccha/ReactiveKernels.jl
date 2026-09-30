@@ -19,7 +19,7 @@ _transit_factor(s, x, n, ::Val{:watson}) =
 _transit_converged(term, acc, rtol, ::Val) = abs(term) <= rtol * abs(acc)
 _transit_converged(term, acc, rtol, ::Val{:watson}) = false
 
-function _transit_series(s, x, rtol, trips, kind, ::Val{partials}) where {partials}
+@inline function _transit_series(s, x, rtol, trips, kind, ::Val{partials}) where {partials}
     term, term_s = _transit_initial(s, kind)
     term_x = 0.0
     acc, acc_s, acc_x = term, term_s, term_x
@@ -40,7 +40,14 @@ end
 
 # One numerical update for native early-exit iteration and the retained fold.
 # The fold freezes a converged carry lazily; no inactive factor is evaluated.
-function _transit_series_step(carry, n, s, x, kind, ::Val{partials}) where {partials}
+# The series step, the regime arms below and the rationalized disposition
+# weights are split-out functions so a tracing backend can retain the fold as
+# one loop region and each regime as a lazy conditional region. Natively they
+# are `@inline`: left to the heuristics, the split costs the primal 8-10% over
+# the original single-body `if`/`elseif` chain (16k-lag unit response, snag
+# prepare-with-bou-c237dc00), while inlining the same structure runs ~17%
+# faster than that original. Retained structure and values are unchanged.
+@inline function _transit_series_step(carry, n, s, x, kind, ::Val{partials}) where {partials}
     term, term_s, term_x, acc, acc_s, acc_x = carry
     factor, factor_s, factor_x = _transit_factor(s, x, n, kind)
     if partials
@@ -59,27 +66,27 @@ struct _TransitSeriesStep{K,P,R}
     rtol::R
 end
 
-function (step::_TransitSeriesStep{K,P})(carry, row, s, x) where {K,P}
+@inline function (step::_TransitSeriesStep{K,P})(carry, row, s, x) where {K,P}
     ReactiveKernels._recurrence_branch(carry.active,
         _transit_series_active, (carry, args...) -> carry,
         (carry, only(row), s, x, step.kind, step.rtol, Val(P)))
 end
 
-function _transit_series_active(carry, n, s, x, kind, rtol, partials)
+@inline function _transit_series_active(carry, n, s, x, kind, rtol, partials)
     math = _transit_series_step(carry.math, n, s, x, kind, partials)
     return (math=math, active=!_transit_converged(math.term, math.acc, rtol, kind))
 end
 
 # Return (I, ∂λ I, ∂rate I, ∂shape I, ∂t I). Each branch differentiates
 # its own numerical expression, including the truncated Watson expansion.
-function _transit_mode_math(λ, t, rate, shape, s_log_r, lgs, ψs,
+@inline function _transit_mode_math(λ, t, rate, shape, s_log_r, lgs, ψs,
         rtol, watson_terms, partials::Val)
     ReactiveKernels._recurrence_branch(t == 0.0,
         _transit_mode_zero, _transit_mode_nonzero,
         (λ, t, rate, shape, s_log_r, lgs, ψs, rtol, watson_terms, partials))
 end
 
-function _transit_mode_zero(λ, t, rate, shape, s_log_r, lgs, ψs,
+@inline function _transit_mode_zero(λ, t, rate, shape, s_log_r, lgs, ψs,
         rtol, watson_terms, partials)
     # The parameter partials of the zero-length integral are exactly zero.
     dt = ReactiveKernels._recurrence_branch(shape == 1.0,
@@ -87,7 +94,7 @@ function _transit_mode_zero(λ, t, rate, shape, s_log_r, lgs, ψs,
     return 0.0, 0.0, 0.0, 0.0, dt
 end
 
-function _transit_mode_nonzero(λ, t, rate, shape, s_log_r, lgs, ψs,
+@inline function _transit_mode_nonzero(λ, t, rate, shape, s_log_r, lgs, ψs,
         rtol, watson_terms, partials)
     μ = rate - λ
     w = -μ * t
@@ -98,7 +105,7 @@ function _transit_mode_nonzero(λ, t, rate, shape, s_log_r, lgs, ψs,
             partials, μ, w, logt))
 end
 
-function _transit_mode_watson(λ, t, rate, shape, s_log_r, lgs, ψs,
+@inline function _transit_mode_watson(λ, t, rate, shape, s_log_r, lgs, ψs,
         rtol, watson_terms, ::Val{partials}, μ, w, logt) where {partials}
     a, a_s, a_w = _transit_series(shape, w, rtol, watson_terms - 1,
         Val(:watson), Val(partials))
@@ -113,7 +120,7 @@ function _transit_mode_watson(λ, t, rate, shape, s_log_r, lgs, ψs,
     return y, 0.0, 0.0, 0.0, 0.0
 end
 
-function _transit_mode_not_watson(λ, t, rate, shape, s_log_r, lgs, ψs,
+@inline function _transit_mode_not_watson(λ, t, rate, shape, s_log_r, lgs, ψs,
         rtol, watson_terms, partials, μ, w, logt)
     ReactiveKernels._recurrence_branch(w < -_TRANSIT_P_XMAX,
         _transit_mode_tail, _transit_mode_series,
@@ -121,7 +128,7 @@ function _transit_mode_not_watson(λ, t, rate, shape, s_log_r, lgs, ψs,
             partials, μ, w, logt))
 end
 
-function _transit_mode_tail(λ, t, rate, shape, s_log_r, lgs, ψs,
+@inline function _transit_mode_tail(λ, t, rate, shape, s_log_r, lgs, ψs,
         rtol, watson_terms, ::Val{partials}, μ, w, logt) where {partials}
     y = exp(s_log_r - shape * log(μ) - λ * t)
     if partials
@@ -131,7 +138,7 @@ function _transit_mode_tail(λ, t, rate, shape, s_log_r, lgs, ψs,
     return y, 0.0, 0.0, 0.0, 0.0
 end
 
-function _transit_mode_series(λ, t, rate, shape, s_log_r, lgs, ψs,
+@inline function _transit_mode_series(λ, t, rate, shape, s_log_r, lgs, ψs,
         rtol, watson_terms, partials, μ, w, logt)
     ReactiveKernels._recurrence_branch(w < -1.0,
         _transit_mode_p_series, _transit_mode_u_series,
@@ -139,7 +146,7 @@ function _transit_mode_series(λ, t, rate, shape, s_log_r, lgs, ψs,
             partials, μ, w, logt))
 end
 
-function _transit_mode_p_series(λ, t, rate, shape, s_log_r, lgs, ψs,
+@inline function _transit_mode_p_series(λ, t, rate, shape, s_log_r, lgs, ψs,
         rtol, watson_terms, ::Val{partials}, μ, w, logt) where {partials}
     a, a_s, a_x = _transit_series(shape, -w, rtol, _TRANSIT_SERIES_TRIPS,
         Val(:p), Val(partials))
@@ -154,7 +161,7 @@ function _transit_mode_p_series(λ, t, rate, shape, s_log_r, lgs, ψs,
     return y, 0.0, 0.0, 0.0, 0.0
 end
 
-function _transit_mode_u_series(λ, t, rate, shape, s_log_r, lgs, ψs,
+@inline function _transit_mode_u_series(λ, t, rate, shape, s_log_r, lgs, ψs,
         rtol, watson_terms, ::Val{partials}, μ, w, logt) where {partials}
     a, a_s, a_w = _transit_series(shape, w, rtol, _TRANSIT_SERIES_TRIPS,
         Val(:u), Val(partials))
