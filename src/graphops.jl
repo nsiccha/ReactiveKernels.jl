@@ -38,11 +38,18 @@ deeper: the planned boundary, the compiled data-only prefix and the compiled
 residual body are kept per graph version, have/want/pass signature and bound
 PORT set, so every later binding of new values to the same ports pays only
 the prefix's execution (the bound-data mathematics) and a fresh constant
-table. The cache is caller-owned and grows with the distinct boundaries (and,
-for a residual containing authored plates, the distinct bound-value shapes)
-prepared through it; it never observes the bound values afterwards. Lookups
-and first-time preparations hold the cache's lock, so one cache may serve
-concurrent tasks.
+table. The entry is keyed on the PORTS, not on the bound values or their
+types: a later binding of differently typed data on the same ports (a
+different plan struct, an `Int` vector for a `Float64` one) reuses the entry
+and its compiled bodies, which are generic over those types and specialize
+per concrete type on first use like any other Julia call; a lazy branch on a
+hoisted constant stays a per-call branch and follows each binding's value.
+Only a residual containing authored plates is templated per bound-value type
+and shape signature, because that decides whether its plates specialize. The
+cache is caller-owned and grows with the distinct boundaries (and those
+shapes) prepared through it; it never observes the bound values afterwards.
+Lookups and first-time preparations hold the cache's lock, so one cache may
+serve concurrent tasks.
 """
 struct PreparationCache
     kernels::Dict{Any,PreparedKernel}

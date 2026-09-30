@@ -128,6 +128,18 @@ end
     @test k4(samples) == C.opaque(samples, 2data, 3q, scale)
     @test length(cache) == 2
 
+    # A binding of differently TYPED data on the same ports reuses the entry
+    # (no re-planning, same prefix kernel). This residual contains an authored
+    # plate, so its template is per bound type/shape; the port-keyed sharing of
+    # one compiled residual across types is asserted on the plate-free fixture
+    # below.
+    fill!(C.calls, 0)
+    k5 = prepare!(cache, C.explicit; bound = (; data = [2, 3]))
+    @test C.calls == [1, 0, 0]
+    @test k5(samples, q, scale) == C.opaque(samples, [2, 3], q, scale)
+    @test k1(samples, q, scale) == C.opaque(samples, data, q, scale)
+    @test length(cache) == 2
+
     # A binding that hoists nothing the residual reads returns one kernel.
     w1 = prepare!(cache, C.explicit; want = :w, bound = (; data))
     w2 = prepare!(cache, C.explicit; want = :w, bound = (; data = 2data))
@@ -168,6 +180,49 @@ end
     # The readable residual reports the new binding's constant.
     @test any(recipe -> recipe.op isa ReactiveKernels._BoundConstant &&
                         recipe.op.value == (2data) .^ 2, k2.plan.recipes)
+end
+
+module CachedBoundPlanFixture
+using ReactiveKernels
+struct LatticePlan
+    shifts::Vector{Int}
+end
+struct ExactPlan
+    rows::Matrix{Int}
+end
+count_of(plan::LatticePlan) = length(plan.shifts)
+count_of(plan::ExactPlan) = size(plan.rows, 1)
+offsets(plan::LatticePlan) = plan.shifts
+offsets(plan::ExactPlan) = vec(sum(plan.rows; dims = 2))
+const child = prepare(@kernel weighted_child(o, amounts) = begin
+    r = o .* amounts
+    return r
+end)
+@kernel dosing(plan, amounts) = begin
+    n = count_of(plan)
+    o = offsets(plan)
+    weights = if n == 0
+        Float64[]
+    else
+        child(o, amounts)
+    end
+    total = sum(weights; init = 0.0)
+    return total
+end
+end
+
+@testset "cached bound preparation across bound value types and a lazy arm" begin
+    F = CachedBoundPlanFixture
+    cache = PreparationCache()
+    plans = (F.LatticePlan([1, 3, 4]), F.ExactPlan([1 2; 3 4]), F.LatticePlan(Int[]), F.ExactPlan([0 1; 1 1; 2 2]))
+    amounts = ([1.0, 2.0, 3.0], [0.5, 0.25], Float64[], [1.0, 1.0, 1.0])
+    kernels = [prepare!(cache, F.dosing; bound = (; plan)) for plan in plans]
+    for (plan, a, k) in zip(plans, amounts, kernels)
+        @test k(a) == prepare(F.dosing; bound = (; plan))(a)
+        @test k(a) == sum(F.offsets(plan) .* a; init = 0.0)
+    end
+    @test all(k -> k.f === first(kernels).f, kernels)
+    @test length(cache) == 1
 end
 
 @testset "cached bound preparation specializes a value-dependent residual per binding" begin

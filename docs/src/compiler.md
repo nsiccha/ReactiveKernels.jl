@@ -218,7 +218,13 @@ set and passes: the plan, the prepared prefix kernel, and the compiled
 residual. A later binding of new values to the same ports runs the prefix on
 those values and returns the residual kernel around the same compiled
 callable with a fresh constant table. The returned kernel is the one
-`prepare(…; bound)` returns; only what is recomputed per binding changes.
+`prepare(…; bound)` returns; only what is recomputed per binding changes. The
+entry is keyed on the bound ports, not on the bound values or their types: a
+later binding of differently typed data on the same ports (a different plan
+struct, an integer vector for a float one) reuses the entry, and its generic
+compiled bodies specialize per concrete type on first use as any Julia call
+does; a lazy branch on a hoisted constant remains a per-call branch and follows
+each binding's value.
 
 The residual body is value-independent exactly when the inner-plate pass
 below leaves it alone. A residual whose authored plates specialize on bound
