@@ -1636,6 +1636,7 @@ function _kernel_authored_plate_expr(rhs, mod,
     lambda isa Expr && lambda.head === :(->) && length(lambda.args) == 2 ||
         throw(ArgumentError("plate do-block requires an ordinary argument list and body"))
     formals_expr, scalar_body = lambda.args
+    _kernel_reject_nested_plate(scalar_body, mod)
     formals = formals_expr isa Symbol ? Symbol[formals_expr] :
               formals_expr isa Expr && formals_expr.head === :tuple &&
               all(arg -> arg isa Symbol, formals_expr.args) ?
@@ -1726,6 +1727,34 @@ function _kernel_authored_plate_expr(rhs, mod,
                      Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))))
     (; arguments, operation, inferred, atomic = Tuple(atomic),
        materialized_arguments)
+end
+
+# A `plate(...) do` nested inside another plate's cell is not lowered today:
+# the cell body is prepared as its own scalar kernel and consumed one operation
+# per transparent recipe (`_lower_authored_plate_native!`), and a nested plate
+# recipe's inner operations enter that table at the wrong positions, so the
+# cell called a wrong operation with the wrong arguments at runtime — a
+# `MethodError` for the reporter's shape, silently wrong values elsewhere
+# (snag `plate-cell-gathe-94d4a929`). Reject at authoring time and name the
+# supported spellings of a per-cell reduction over a small shared axis.
+function _kernel_reject_nested_plate(body, mod)
+    body isa Expr || return nothing
+    body.head in (:quote, :inert) && return nothing
+    if body.head === :do && length(body.args) == 2
+        call = body.args[1]
+        if call isa Expr && call.head === :call && !isempty(call.args) &&
+           _kernel_resolve_binding(mod, call.args[1]) === plate
+            throw(ArgumentError(
+                "a `plate(...) do` block nested inside a plate cell is not " *
+                "supported: author the per-cell reduction as a scalar generator " *
+                "(`sum(f(i) for i in eachindex(shared))`, allocation-free natively " *
+                "and lowered per lane under Reactant), or prepare the inner " *
+                "reduction as its own kernel and call that prepared kernel from " *
+                "the cell"))
+        end
+    end
+    foreach(arg -> _kernel_reject_nested_plate(arg, mod), body.args)
+    nothing
 end
 
 function _kernel_authored_plate(spec::KernelSpec, ::Val{A}) where {A}
