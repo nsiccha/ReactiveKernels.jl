@@ -1214,3 +1214,120 @@ end
         @info "plain-call control skipped: this Julia inlines the loop-carrying closure itself" VERSION
     end
 end
+
+# --- per-cell reductions over a few host indices (snag plate-cell-gathe-94d4a929)
+# A plate cell that superposes a few dose responses per observation. The
+# reporter authored it as vector temporaries (`observation .- shifts`,
+# `max.(row, 1)`, a gather, a mask, a fused product, `sum`): every temporary is
+# an ordinary per-cell Julia allocation, so the prepared plate allocated ~336 B
+# per cell and ran ~50× slower than a hand loop. A scalar generator over the
+# per-dose index is allocation-free natively AND lowers per lane under Reactant
+# (`test_ref_array_plate_reactant.jl`), with either plan representation behind a
+# per-dose accessor: index arithmetic on host data for the lattice plan, and the
+# one-element reduction `sum(view(row, i:i))` for a stored row (the same
+# normalization the tensorized `row[i]` lowering uses, so it never trips
+# Reactant's scalar-indexing guard inside an opaque helper).
+struct _PlateGatherLattice
+    shifts::Vector{Int}
+    nobs::Int
+end
+struct _PlateGatherExact
+    rows::Matrix{Int}
+end
+_plate_gather_domain(plan::_PlateGatherLattice) = collect(1:plan.nobs)
+_plate_gather_domain(plan::_PlateGatherExact) = eachrow(plan.rows)
+_plate_gather_slots(plan::_PlateGatherLattice) = eachindex(plan.shifts)
+_plate_gather_slots(plan::_PlateGatherExact) = axes(plan.rows, 2)
+_plate_gather_index(observation, plan::_PlateGatherLattice, i) =
+    observation - plan.shifts[i]
+_plate_gather_index(row, ::_PlateGatherExact, i) = sum(view(row, i:i))
+
+@kernel authored_gather_generator_plate(plan, units, weights) = begin
+    observations = _plate_gather_domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do observation, schedule_plan, response, amounts
+        sum(ifelse(_plate_gather_index(observation, schedule_plan, i) > 0,
+                   response[max(_plate_gather_index(observation, schedule_plan, i), 1)] *
+                       amounts[i], 0.0)
+            for i in _plate_gather_slots(schedule_plan))
+    end
+    return concentration
+end
+
+# The reporter's vector-temporary cell, kept as the value reference and as the
+# allocation control this testset contrasts against.
+_plate_gather_row(row, response, amounts) =
+    sum(response[max.(row, 1)] .* (row .> 0) .* amounts)
+@kernel authored_gather_broadcast_plate(plan, units, weights) = begin
+    observations = collect(1:plan.nobs)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do observation, schedule_plan, response, amounts
+        row = observation .- schedule_plan.shifts
+        _plate_gather_row(row, response, amounts)
+    end
+    return concentration
+end
+
+# Function barrier so `@allocated` measures the kernel, not global-ref boxing.
+_plate_gather_allocated(k, plan, units, weights) = @allocated k(plan, units, weights)
+
+@testset "authored plate block: per-cell generator reduction over host indices" begin
+    shifts = [0, 40, 100]
+    weights = [3.0, 1.5, 0.25]
+    generator = prepare(authored_gather_generator_plate)
+    broadcast_cell = prepare(authored_gather_broadcast_plate)
+    # Bytes per call at two lane counts: the growth between them is the
+    # per-cell cost, independent of the fixed call overhead.
+    bytes = Dict{Tuple{Symbol,Int},Int}()
+    for nobs in (257, 513)
+        lattice = _PlateGatherLattice(shifts, nobs)
+        exact = _PlateGatherExact([o - s for o in 1:nobs, s in shifts])
+        units = collect(range(0.5, 2.0; length = nobs))
+        expected = [sum(o - s > 0 ? units[o - s] * w : 0.0
+                        for (s, w) in zip(shifts, weights)) for o in 1:nobs]
+        @test generator(lattice, units, weights) ≈ expected
+        @test generator(exact, units, weights) ≈ expected
+        @test broadcast_cell(lattice, units, weights) ≈ expected
+        _plate_gather_allocated(generator, lattice, units, weights)
+        _plate_gather_allocated(generator, exact, units, weights)
+        _plate_gather_allocated(broadcast_cell, lattice, units, weights)
+        bytes[(:lattice, nobs)] = _plate_gather_allocated(generator, lattice, units, weights)
+        bytes[(:exact, nobs)] = _plate_gather_allocated(generator, exact, units, weights)
+        bytes[(:broadcast, nobs)] = _plate_gather_allocated(broadcast_cell, lattice, units, weights)
+    end
+    growth(kind) = bytes[(kind, 513)] - bytes[(kind, 257)]
+    per_cell_output = sizeof(Float64) * (513 - 257)
+    # Lattice: the output plus the `collect(1:nobs)` domain recipe grow with
+    # the lane count; exact rows (`eachrow` is lazy): the output only. Nothing
+    # per cell in either case.
+    @test growth(:lattice) <= 2 * per_cell_output + 64
+    @test growth(:exact) <= per_cell_output + 64
+    # The vector-temporary cell allocates several small arrays per cell.
+    @test growth(:broadcast) > 100 * (513 - 257)
+end
+
+@testset "authored plate block: nested plate inside a cell is rejected" begin
+    # Before the authoring check this expanded and prepared, then called the
+    # wrong operation with the wrong arguments at the first invocation
+    # (`MethodError: no method matching -(::Vector{Int64}, ::Vector{Float64}, …)`).
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel nested_plate_in_cell(xs, ys) = begin
+            out = plate(xs, Ref(ys)) do x, shared
+                inner = plate(shared, Ref(x)) do y, xi
+                    xi * y
+                end
+                sum(inner)
+            end
+            return out
+        end
+    end)
+    # A nested plate deeper in an expression is rejected too.
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel nested_plate_in_sum(xs, ys) = begin
+            out = plate(xs, Ref(ys)) do x, shared
+                sum(plate(shared, Ref(x)) do y, xi
+                    xi * y
+                end)
+            end
+            return out
+        end
+    end)
+end
