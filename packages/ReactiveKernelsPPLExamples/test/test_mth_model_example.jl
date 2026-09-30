@@ -1,6 +1,20 @@
 using ReactiveKernelsPPLExamples.MthModelExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 using LogExpFunctions: logistic, log1pexp, logaddexp
+using DifferentiationInterface
+import Enzyme
+
+const _MTH_AE = AutoEnzyme(mode = Enzyme.Reverse)
+
+function _mth_fd(f, q; h = 1e-6)
+    g = similar(q)
+    for i in eachindex(q)
+        qp = copy(q); qp[i] += h
+        qm = copy(q); qm[i] -= h
+        g[i] = (f(qp) - f(qm)) / (2h)
+    end
+    g
+end
 
 # Graph-independent oracle for Mth (capture-recapture, time-varying detection +
 # individual heterogeneity, data-augmentation log_sum_exp marginalization). The
@@ -111,5 +125,17 @@ end
             have = (:unconstrained, :Y, :s, :T, :M), want = :likelihood,
             bound = (; Y = MTH_Y, s = MTH_S, T = MTH_T, M = MTH_M))
         @test occursin("similar", string(code_expr(likelihood_kernel)))
+    end
+
+    @testset "native primal + plain-Enzyme gradient vs finite differences" begin
+        pk = prepare(model;
+            have = (:unconstrained, :Y, :s, :T, :M), want = :posterior,
+            bound = (; Y = MTH_Y, s = MTH_S, T = MTH_T, M = MTH_M))
+        prep = prepare_ad(pk, _MTH_AE, q; active = :unconstrained)
+        value, g = ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)
+        @test value ≈ reference.posterior
+        @test all(isfinite, g)
+        gfd = _mth_fd(qq -> _mth_reference(qq, MTH_Y, MTH_S, MTH_T, MTH_M).posterior, q)
+        @test g ≈ gfd rtol = 1e-5
     end
 end

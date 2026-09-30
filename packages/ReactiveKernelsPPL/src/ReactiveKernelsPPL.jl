@@ -43,7 +43,7 @@ export PopulationPrior, R2D2Prior, HorseshoePrior, SampledParameter, PlateParame
 export VaryingZRecipe, VaryingMargin, VaryingSdPrior, VaryingDraws, VaryingSlice
 export VaryingMultiMembership, VaryingStrata
 export SplineBasisBlock, SplineBasis, SplineVector
-export HSGPBasis
+export HSGPBasis, HyperPrior, HSGPHyperLP, HSGPGrouping
 export KernelPlate, LinearPKScheduleSpec, LinearPKEventLPSpec,
     VaryingSourcePKScheduleSpec, VaryingSourcePKPDScheduleSpec
 export EVENT_LP_NAME

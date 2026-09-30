@@ -1,5 +1,19 @@
 using ReactiveKernelsPPLExamples.MtExample
 using LogExpFunctions: logistic, log1pexp, logaddexp
+using DifferentiationInterface
+import Enzyme
+
+const _MT_AE = AutoEnzyme(mode = Enzyme.Reverse)
+
+function _mt_fd(f, q; h = 1e-6)
+    g = similar(q)
+    for i in eachindex(q)
+        qp = copy(q); qp[i] += h
+        qm = copy(q); qm[i] -= h
+        g[i] = (f(qp) - f(qm)) / (2h)
+    end
+    g
+end
 
 # Graph-independent oracle for Mt (capture-recapture, time-varying detection,
 # data-augmentation log_sum_exp marginalization). The per-individual detection
@@ -91,5 +105,17 @@ end
         pw = pointwise_kernel(q)
         @test likelihood_kernel(q) ≈ sum(pw)
         @test occursin("similar", string(code_expr(pointwise_kernel)))
+    end
+
+    @testset "native primal + plain-Enzyme gradient vs finite differences" begin
+        pk = prepare(model;
+            have = (:unconstrained, :Y, :s, :T, :M), want = :posterior,
+            bound = (; Y = MT_Y, s = MT_S, T = MT_T, M = MT_M))
+        prep = prepare_ad(pk, _MT_AE, q; active = :unconstrained)
+        value, g = ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)
+        @test value ≈ reference.posterior
+        @test all(isfinite, g)
+        gfd = _mt_fd(qq -> _mt_reference(qq, MT_Y, MT_S, MT_T).posterior, q)
+        @test g ≈ gfd rtol = 1e-5
     end
 end
