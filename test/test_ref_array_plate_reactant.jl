@@ -470,6 +470,15 @@ end
     end
     return concentration
 end
+# A nonzero `init` for the empty-domain broadcast below: it distinguishes the
+# probed constant from a zeros fallback.
+@kernel get_cell_offset(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, t - p.shifts[j], 0.0) for j in eachindex(p.shifts); init = 1.5)
+    end
+    return concentration
+end
 @kernel one_graph_cell(plan, units, weights) = begin
     observations = _domain(plan)
     concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
@@ -531,5 +540,43 @@ end
             compiled = Reactant.@compile sync = true kernel(ri, rtable, hosted)
             @test Float64(compiled(ri, rtable, hosted)) == kernel(i, table, hosted)
         end
+    end
+end
+
+# --- an empty dose domain (snag reactant-plate-c-508dc1e3)
+# A plate whose cell is a compile-time constant — the superposition sum over
+# zero doses is `init` for every lane — has no traced output leaf, so
+# `Ops.batch` returns no outputs. The lowering broadcasts the probed constant
+# over the observation domain instead of assuming one traced leaf.
+@testset "empty dose domain: a constant superposition cell broadcasts" begin
+    F = NaturalSuperpositionFixtures
+    nobs = 97
+    plan = F.Lattice(Int[], nobs)
+    units = collect(range(0.5, 2.0; length = nobs))
+    weights = Float64[]
+    runits, rweights = Reactant.to_rarray(units), Reactant.to_rarray(weights)
+    units2 = units .* 1.5 .+ 1.0
+    runits2 = Reactant.to_rarray(units2)
+    for (k, expected) in ((F.get_cell, zeros(nobs)),
+            (F.filter_cell, zeros(nobs)),
+            (F.get_cell_offset, fill(1.5, nobs)))
+        kernel = prepare(k)
+        @test kernel(plan, units, weights) ≈ expected
+        compiled = Reactant.@compile sync = true kernel(plan, runits, rweights)
+        @test Array(compiled(plan, runits, rweights)) ≈ expected
+        # Changed inputs reuse the compiled program; the constant depends on
+        # none of them.
+        @test Array(compiled(plan, runits2, rweights)) ≈
+            kernel(plan, units2, weights)
+    end
+
+    @testset "doubling the lane count does not replicate the program" begin
+        kernel = prepare(F.get_cell)
+        hlo = repr(Reactant.@code_hlo optimize = :none kernel(plan, runits, rweights))
+        plan2 = F.Lattice(Int[], 2 * nobs)
+        runits_double = Reactant.to_rarray(vcat(units, units))
+        hlo2 = repr(Reactant.@code_hlo optimize = :none kernel(
+            plan2, runits_double, rweights))
+        @test count("\n", hlo2) == count("\n", hlo)
     end
 end

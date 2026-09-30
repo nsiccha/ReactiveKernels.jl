@@ -1572,7 +1572,44 @@ function _reactant_plate_batch(operation, args, batch_positions, scalar_position
     call = _AuthoredPlateBatchCall{
         batch_positions,scalar_positions,length(args),
         typeof(operation),typeof(shared)}(operation, shared)
-    only(Reactant.Ops.batch(call, batch_inputs, batch_shape))
+    results = Reactant.Ops.batch(call, batch_inputs, batch_shape)
+    isempty(results) || return only(results)
+    return _reactant_constant_plate_batch(call, batch_inputs, batch_shape)
+end
+
+# `Reactant.Ops.batch` traces the cell once and returns one output per traced
+# result, so a cell that is a compile-time constant — an empty generator sum
+# with `init` over a dose domain with no doses — yields NO outputs, and a bare
+# `only` dies with `ArgumentError: Collection is empty`.  The constant is the
+# same for every lane: lane inputs reach the cell traced, so a host return
+# cannot smuggle lane data out, and the shared operands are lane-independent
+# by construction.  Evaluate the cell once on host samples (the same
+# zero-samples `batch` probes with) and broadcast that value over the batch
+# shape with the backend's own constructors — a host-side fill would run
+# through Reactant's broadcast overdub and fail its shape check.  A traced
+# probe result contradicts the empty batch, and a constant that is neither a
+# scalar nor a dense array cannot broadcast, so both stay loud.
+function _reactant_constant_plate_batch(call, batch_inputs, batch_shape)
+    samples = [fill(Reactant.unwrapped_eltype(input)(0),
+        [size(input, i) for i in (length(batch_shape) + 1):ndims(input)]...)
+        for input in batch_inputs]
+    value = call(samples...)
+    value isa Union{Reactant.TracedRArray,Reactant.TracedRNumber} && throw(ArgumentError(
+        "a Reactant plate cell returned no traced outputs, but re-evaluating " *
+        "it produced a traced value; cannot broadcast an inconsistent cell"))
+    shape = Int64[Int64(dim) for dim in batch_shape]
+    if value isa Number
+        scalar = Reactant.promote_to(Reactant.TracedRNumber, value)
+        return Reactant.Ops.fill(scalar, shape)
+    end
+    value isa AbstractArray || throw(ArgumentError(
+        "a Reactant plate cell returned the host constant $(repr(value)); " *
+        "only scalars and dense arrays broadcast over the batch shape"))
+    input = _reactant_plate_operand(value)
+    lane = ndims(input)
+    return Reactant.Ops.broadcast_in_dim(input,
+        collect(Int64, (length(shape) + 1):(lane + length(shape))),
+        vcat(shape, Int64[size(input, dim) for dim in 1:lane]))
 end
 
 function _reactant_authored_plate_call(marker, operation, args::Tuple)
