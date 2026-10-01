@@ -78,7 +78,7 @@ end
 """One packed slice: a coefficient block, a scalar latent, a scan vector
 latent, a per-cell latent block, a leveled vector latent (cutpoints,
 thresholds, simplex), a spline coefficient-vector block, a varying
-vector block (K=1 `xi`, correlated `tau`/`z_flat`), a varying LKJ
+vector block (`tau`/`z_flat`), a varying LKJ
 Cholesky factor, a joint-outcomes LKJ Cholesky factor, or an HSGP
 coefficient-vector block (`beta_raw`). `lo` is the constrained lower
 bound of an `:interval`/`:floored` transform (`:interval` also sets
@@ -282,63 +282,41 @@ function assign_layout(plan::StructuralPlan)
                 transform, lo, hi))
         offset += v.width
     end
-    # Varying draws in plan order. K=1: the scalar scale (`:sampled`,
-    # real for `log_scale`, exp for `tau` — the exp Jacobian is Stan's
-    # lower-bound kernel term, no renormalizer) plus the standardized
-    # G-vector `xi` (`:varying`, plate-shaped identity block; G from
-    # declared levels). Correlated (SB declaration order L/tau/z): the
-    # LKJ Cholesky factor (`:varying_corr` packing K*(K-1)/2 thetas —
-    # K=1 packs zero and constrains to `[1.0]`), the marginal-scale
-    # K-vector `tau` (`:varying` with `:exp` — the same Stan kernel
-    # semantics as the K=1 scalar), and the standardized `z_flat`
-    # (`:varying` identity, K*G column-major). Stratified draws pack
+    # Varying draws in plan order, at every K (SB declaration order
+    # L/tau/z): the LKJ Cholesky factor (`:varying_corr` packing
+    # K*(K-1)/2 thetas — K=1 packs zero and constrains to `[1.0]`),
+    # the marginal-scale K-vector `tau` (`:varying` with `:exp` — the
+    # exp Jacobian is Stan's lower-bound kernel term, no renormalizer),
+    # and the standardized `z_flat` (`:varying` identity, K*G
+    # column-major; G from declared levels). Stratified draws pack
     # one L/tau pair per stratum (SB `ranef_correlated_by` order —
     # all L, all tau) plus the one shared `z_flat` block.
     for d in plan.varying_draws
-        if _is_correlated_kind(d.kind)
-            K = length(d.margins)
-            if d.strata !== nothing
-                # Stratified (SB `ranef_correlated_by` declaration
-                # order — all L, all tau, then the shared z): one LKJ
-                # entry plus one tau entry per stratum, one shared
-                # `z_flat` block (K*G column-major, as unstratified).
-                S = _strata_nlevels(d)
-                P = K * (K - 1) ÷ 2
-                for k in 1:S
-                    Lk, _ = _varying_strata_names(d, k)
-                    labels = [Symbol(string(Lk) * "." * string(i))
-                        for i in 1:P]
-                    push!(entries,
-                        LayoutEntry(:varying_corr, nothing, Lk, labels,
-                            offset, P, :lkj))
-                    offset += P
-                end
-                for k in 1:S
-                    _, tauk = _varying_strata_names(d, k)
-                    push!(entries,
-                        LayoutEntry(:varying, nothing, tauk, [tauk], offset,
-                            K, :exp))
-                    offset += K
-                end
-                z = _varying_corr_names(d)[3]
-                G = _draws_nlevels(d)
-                push!(entries,
-                    LayoutEntry(:varying, nothing, z, [z], offset, K * G,
-                        :identity))
-                offset += K * G
-                continue
-            end
-            L, tau, z = _varying_corr_names(d)
+        K = length(d.margins)
+        if d.strata !== nothing
+            # Stratified (SB `ranef_correlated_by` declaration
+            # order — all L, all tau, then the shared z): one LKJ
+            # entry plus one tau entry per stratum, one shared
+            # `z_flat` block (K*G column-major, as unstratified).
+            S = _strata_nlevels(d)
             P = K * (K - 1) ÷ 2
-            labels = [Symbol(string(L) * "." * string(i)) for i in 1:P]
-            push!(entries,
-                LayoutEntry(:varying_corr, nothing, L, labels, offset, P,
-                    :lkj))
-            offset += P
-            push!(entries,
-                LayoutEntry(:varying, nothing, tau, [tau], offset, K,
-                    :exp))
-            offset += K
+            for k in 1:S
+                Lk, _ = _varying_strata_names(d, k)
+                labels = [Symbol(string(Lk) * "." * string(i))
+                    for i in 1:P]
+                push!(entries,
+                    LayoutEntry(:varying_corr, nothing, Lk, labels,
+                        offset, P, :lkj))
+                offset += P
+            end
+            for k in 1:S
+                _, tauk = _varying_strata_names(d, k)
+                push!(entries,
+                    LayoutEntry(:varying, nothing, tauk, [tauk], offset,
+                        K, :exp))
+                offset += K
+            end
+            z = _varying_corr_names(d)[3]
             G = _draws_nlevels(d)
             push!(entries,
                 LayoutEntry(:varying, nothing, z, [z], offset, K * G,
@@ -346,16 +324,22 @@ function assign_layout(plan::StructuralPlan)
             offset += K * G
             continue
         end
-        scale, xi = _varying_k1_names(d)
-        transform = d.kind === :intercept1 ? :identity : :exp
+        L, tau, z = _varying_corr_names(d)
+        P = K * (K - 1) ÷ 2
+        labels = [Symbol(string(L) * "." * string(i)) for i in 1:P]
         push!(entries,
-            LayoutEntry(:sampled, nothing, scale, [scale], offset, 1,
-                transform))
-        offset += 1
+            LayoutEntry(:varying_corr, nothing, L, labels, offset, P,
+                :lkj))
+        offset += P
+        push!(entries,
+            LayoutEntry(:varying, nothing, tau, [tau], offset, K,
+                :exp))
+        offset += K
         G = _draws_nlevels(d)
         push!(entries,
-            LayoutEntry(:varying, nothing, xi, [xi], offset, G, :identity))
-        offset += G
+            LayoutEntry(:varying, nothing, z, [z], offset, K * G,
+                :identity))
+        offset += K * G
     end
     # Sequential-recurrence latents: one identity array slice per scan. The
     # length T is the loop bound — a literal Int, or `n_obs` when the bound is a
@@ -1296,7 +1280,7 @@ function transform_statements(e::LayoutEntry)
         # Spline vectors ride the plate transform path (block + scalar
         # endpoints); the contract pins their supports to real/positive,
         # so the :interval arm below is unreachable for them. Varying
-        # vectors ride it too (`xi`/`z_flat` identity, `tau` exp), as
+        # vectors ride it too (`z_flat` identity, `tau` exp), as
         # do HSGP coefficient vectors (`beta_raw`, identity only).
         return _plate_transform_statements(e)
     end
@@ -1613,7 +1597,7 @@ function jacobian_term(e::LayoutEntry)
         # transform sums its companion `logjac` plate from
         # `_plate_transform_statements`. Spline vectors share the shape (their
         # supports never reach :interval/:upper, but the arms stay correct if
-        # that ever changes), as do varying vectors (`xi`/`z_flat` identity,
+        # that ever changes), as do varying vectors (`z_flat` identity,
         # `tau` exp) and hsgp vectors (`beta_raw` identity). Anything else is
         # loud (a companion plate that was never emitted must never sum
         # silently).
