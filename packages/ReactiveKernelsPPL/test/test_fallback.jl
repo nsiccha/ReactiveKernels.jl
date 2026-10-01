@@ -217,6 +217,27 @@ end
         @test [t.kind for t in only(plan.predictors).terms] ==
             [InterceptTerm, FactorTerm]
     end
+    @testset "S6 centered intercept beside a population intercept" begin
+        # The plain spelling (aliased factor index under `.+`) is the
+        # affine Intercept + FactorTerm block; the hierarchical scale
+        # identifies it.
+        _fb_check(quote
+            a ~ Normal(0, 5)
+            r_sg ~ HalfNormal(1)
+            r_c[levels(g)] .~ Normal.(0, r_sg)
+            r = r_c[g]
+            sigma ~ Exponential(1)
+            mu = a .+ r
+            y .~ Normal.(mu, sigma)
+        end, (:y, :g), (mu = [0.2, 0.3, -0.9, 1.4], r_sg = 0.7,
+            sigma = 1.1), q -> begin
+            a, c = q.mu[1], q.mu[2:4]
+            _fb_normal_ll(a .+ c[g], q.sigma) + logpdf(Normal(0, 5), a) +
+                logpdf(_fb_halfnormal(1), q.r_sg) +
+                sum(logpdf.(Normal(0, q.r_sg), c)) +
+                logpdf(Exponential(1), q.sigma)
+        end)
+    end
     @testset "P4 varying slope inline" begin
         _fb_check(_FB_SLOPE_INLINE, (:y, :x, :g), (_rkppl_c_g =
             [0.3, -0.9, 1.4], a = 0.2, b = -0.4, sg = 0.7, sigma = 1.1),
