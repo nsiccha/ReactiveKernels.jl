@@ -11,7 +11,9 @@ permissions:
   contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Branch runs finish; only PR runs give way to a newer push. Cancelling on
+  # main stopped every run before the ~100-minute example-packages job ended.
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
 jobs:
   test:
     name: test (${{ matrix.julia-version }}, ${{ matrix.julia-arch }}, ${{ matrix.os }}, ${{ matrix.test-shard }})
