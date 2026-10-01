@@ -9,7 +9,8 @@
 # scale. Every density is checked against a Distributions.jl oracle.
 # (`_findiff_grad` / `_GEN_BACKEND` come from test_generator.jl, included
 # first.)
-using Distributions: Normal, Exponential, Cauchy, Uniform, truncated, logpdf
+using Distributions: Normal, Exponential, Cauchy, Uniform, Beta, Dirichlet,
+    truncated, logpdf
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
@@ -364,6 +365,60 @@ end
             logpdf(Normal(0, 1), q.m) + logpdf(_fb_halfnormal(1), q.s) +
             sum(logpdf.(Normal(q.m, q.s), .-q.mu)) +
             logpdf(Exponential(1), q.sigma))
+    end
+    # Element reads of a simplex (P6, P6b, Q6): `phi[1]` is a scalar in a
+    # coefficient prior argument (hoisted), in a per-element vector prior
+    # argument and inside a computed coefficient.
+    @testset "simplex element reads" begin
+        x1, x2 = _fb_col(:x1), _fb_col(:x2)
+        v(c) = sum(abs2, c .- sum(c) / length(c)) / (length(c) - 1)
+        r2d2_want(q) = _fb_normal_ll(q.mu[1] .+ q.mu[2] .* x1 .+
+                q.mu[3] .* x2, q.sigma) + logpdf(Normal(0, 5), q.mu[1]) +
+            logpdf(Beta(1, 1), q.R2) + logpdf(Dirichlet([1.0, 1.0]), q.phi) +
+            logpdf(_fb_halfnormal(1), q.tau) +
+            logpdf(Normal(0, sqrt(q.phi[1] * q.R2 * q.tau^2 / v(x1))),
+                q.mu[2]) +
+            logpdf(Normal(0, sqrt(q.phi[2] * q.R2 * q.tau^2 / v(x2))),
+                q.mu[3]) + logpdf(Exponential(1), q.sigma)
+        q = (mu = [0.4, 0.7, -0.5], R2 = 0.3, tau = 0.8, sigma = 1.3,
+            phi = [0.35, 0.65])
+        # P6: the R2D2 prior spelled out per coefficient.
+        _fb_check(quote
+            a ~ Normal(0, 5); R2 ~ Beta(1, 1); phi ~ Dirichlet([1.0, 1.0])
+            tau ~ HalfNormal(1); sigma ~ Exponential(1)
+            b1 ~ Normal(0, sqrt(phi[1] * R2 * tau^2 / var(x1)))
+            b2 ~ Normal(0, sqrt(phi[2] * R2 * tau^2 / var(x2)))
+            mu = a .+ b1 .* x1 .+ b2 .* x2
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x1, :x2), q, r2d2_want)
+        # P6b: the same prior on a design-matrix coefficient vector.
+        _fb_check(quote
+            a ~ Normal(0, 5); R2 ~ Beta(1, 1); phi ~ Dirichlet([1.0, 1.0])
+            tau ~ HalfNormal(1); sigma ~ Exponential(1)
+            X = hcat(x1, x2)
+            b[axes(X, 2)] .~ Normal.(0, [sqrt(phi[1] * R2 * tau^2 / var(x1)),
+                sqrt(phi[2] * R2 * tau^2 / var(x2))])
+            mu = a .+ X * b
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x1, :x2), q, r2d2_want)
+        # Q6: simplex elements as computed coefficients.
+        _fb_check(quote
+            a ~ Normal(0, 5); phi ~ Dirichlet([1.0, 1.0])
+            sigma ~ Exponential(1)
+            mu = a .+ x1 .* phi[1] .+ x2 .* phi[2]
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x1, :x2), (mu = [0.4], sigma = 1.3, phi = [0.35, 0.65]),
+        q -> _fb_normal_ll(q.mu[1] .+ x1 .* q.phi[1] .+ x2 .* q.phi[2],
+                q.sigma) + logpdf(Normal(0, 5), q.mu[1]) +
+            logpdf(Dirichlet([1.0, 1.0]), q.phi) +
+            logpdf(Exponential(1), q.sigma))
+        # The whole simplex read as a scalar stays refused.
+        @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 5); phi ~ Dirichlet([1.0, 1.0])
+            sigma ~ Exponential(1)
+            mu = a .+ phi .* x1
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x1))
     end
 end
 

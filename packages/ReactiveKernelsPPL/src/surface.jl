@@ -9113,12 +9113,44 @@ _reads_column(ex, ctx) = any(s -> s in ctx.data || s in ctx.vecdefs ||
 
 # A derived column reads scalars and columns: a vector-valued parameter
 # (a simplex, a sized coefficient vector) read whole is a shape error.
+# An indexed read (`phi[1]`, `z[g]`) is an element or a gather, not the
+# whole vector; its index is still screened.
 function _check_scalar_reads(pname, core, ctx)
-    for v in _value_symbols(core)
+    for v in _whole_value_symbols(core)
         v in ctx.vector_params && _sfail("predictor $pname: " *
             "$(repr(core)) reads the vector parameter $v as a scalar — " *
             "index it per observation (`$v[g]`) or per element")
     end
+    return nothing
+end
+
+function _whole_value_symbols(ex)
+    out = Set{Symbol}()
+    _whole_value_symbols!(out, ex)
+    return out
+end
+function _whole_value_symbols!(out::Set{Symbol}, ex)
+    if ex isa Expr && ex.head === :ref && !isempty(ex.args)
+        for a in ex.args[2:end]
+            _whole_value_symbols!(out, a)
+        end
+        ex.args[1] isa Symbol || _whole_value_symbols!(out, ex.args[1])
+        return nothing
+    end
+    if ex isa Expr
+        # Recurse through the call/broadcast value positions
+        # `_value_symbols` visits, one argument at a time so nested refs
+        # keep their exemption.
+        if ex.head === :call && !isempty(ex.args)
+            foreach(a -> _whole_value_symbols!(out, a), ex.args[2:end])
+            return nothing
+        elseif ex.head === :. && length(ex.args) == 2 &&
+               ex.args[2] isa Expr && ex.args[2].head === :tuple
+            foreach(a -> _whole_value_symbols!(out, a), ex.args[2].args)
+            return nothing
+        end
+    end
+    union!(out, _value_symbols(ex))
     return nothing
 end
 
