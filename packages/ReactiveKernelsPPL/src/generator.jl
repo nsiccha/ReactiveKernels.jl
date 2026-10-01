@@ -49,12 +49,19 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     isbound(plan) || throw(ContractValidationError(
         "[generator] kernel_expr requires a bound plan (bind_data first)"))
     stmts = Expr[]
+    # Level gathers (`z[g]` over a `levels(h)` axis) read level-code
+    # vectors; collect them from every expression before emitting.
+    gathers = Set{Tuple{Symbol,Symbol}}()
+    assigns = _assignment_statements(plan; gathers)
+    priors = _prior_statements(plan, layout; gathers)
     _each_layout_unit(plan, layout) do unit
         append!(stmts, unit isa LayoutEntry ? transform_statements(unit) :
             _stratified_transform_statements(unit, layout))
     end
     append!(stmts, _coef_reassembly_statements(plan, layout))
-    append!(stmts, _assignment_statements(plan))
+    append!(stmts, _array_value_statements(plan))
+    append!(stmts, _array_level_index_statements(plan, gathers))
+    append!(stmts, assigns)
     append!(stmts, preprocessing_recipes(plan))
     append!(stmts, _varying_statements(plan))
     append!(stmts, _hsgp_basis_statements(plan))
@@ -64,7 +71,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _event_lp_statements(plan))
     append!(stmts, _likelihood_statements(plan))
-    append!(stmts, _prior_statements(plan, layout))
+    append!(stmts, priors)
     push!(stmts, _log_jacobian_statement(plan, layout))
     push!(stmts, :(posterior::Float64 = prior + likelihood + log_jacobian))
     push!(stmts, :(return posterior))
@@ -187,12 +194,14 @@ end
 # above, so every scalar name resolves; derived columns resolve as locals
 # for the recipes below). Unannotated: Int temporaries (e.g. `length`)
 # must not meet a Float64 assertion.
-function _assignment_statements(plan::StructuralPlan)
+function _assignment_statements(plan::StructuralPlan;
+        gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}())
     by_name = Dict{Symbol,Any}(a.name => a for a in plan.assignments)
     for d in plan.derived
         by_name[d.name] = d
     end
-    return Expr[:($(name) = $(by_name[name].expr))
+    return Expr[:($(name) =
+            $(_array_gather_rewrite(by_name[name].expr, plan, gathers)))
         for name in topological_order(plan) if haskey(by_name, name)]
 end
 
@@ -3267,7 +3276,8 @@ function _mixed_wide_block_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     return nothing
 end
 
-function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
+function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
+        gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}())
     stmts = Expr[]
     terms = Any[]
     for pred in plan.predictors
@@ -3521,6 +3531,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     darstmts, darnodes = _dar_prior_statements(plan, layout)
     append!(stmts, darstmts)
     append!(terms, darnodes)
+    # Declared array parameters (`arrays.jl`).
+    _array_prior_stmts!(stmts, terms, plan, gathers)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
     push!(stmts, :(prior::Float64 = $joint))
     return stmts
