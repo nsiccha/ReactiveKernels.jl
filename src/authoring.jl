@@ -2752,6 +2752,17 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
              Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
              Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), native, tensor)
     end
+    reduction = _kernel_reduction_callable(rhs, deps, mod)
+    if reduction !== nothing
+        # A gathered generator sum keeps its parts as `_KernelReduction`
+        # metadata (same call semantics) for the native plate lowering; the
+        # tensorized companion is the ordinary one.
+        return Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
+             Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
+             Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), reduction,
+             Expr(:->, Expr(:tuple, deps...),
+                  tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs))
+    end
     Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
@@ -2810,6 +2821,89 @@ function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
     val(ports) = Expr(:call, GlobalRef(Base, :Val), positions(ports))
     Expr(:call, GlobalRef(@__MODULE__, :_KernelBranch),
          val(cports), val(tports), val(eports), call, cex, tex, eex), deps
+end
+
+# The parts of a gathered generator sum as a `_KernelReduction` construction
+# expression, or `nothing`: a top-level `sum(term for j in iterator; init = x)`
+# without a filter (a filter can skip the term, and with it the gather index,
+# which the dose-outer check evaluates at every cell) whose term evaluates a
+# call `get(A, K, D)` of Base's `get` unconditionally — reached through eager
+# call arguments only — with an `A` that does not read `j`.
+function _kernel_reduction_callable(rhs, deps::Vector{Symbol}, mod)
+    mod isa Module || return nothing
+    parts = _kernel_generator_sum_parts(rhs)
+    parts === nothing && return nothing
+    parts.condition === nothing || return nothing
+    variable = parts.variable
+    gather = _kernel_reduction_gather(parts.term, variable, mod)
+    gather === nothing && return nothing
+    path, source, index, default = gather
+    portset = Set{Symbol}(deps)
+    function own(ex, known)
+        read = Set(_kernel_free_ports(ex, known))
+        Symbol[d for d in deps if d in read]
+    end
+    iterator_ports = own(parts.iterator, portset)
+    init_ports = own(parts.init, portset)
+    source_ports = own(source, portset)
+    index_ports = own(index, setdiff(portset, (variable,)))
+    positions(ports) = Expr(:call, GlobalRef(Base, :Val),
+                            Tuple(findfirst(==(p), deps) for p in ports))
+    accumulator = gensym(:reduction_sum)
+    element = gensym(:reduction_element)
+    gathered = gensym(:reduction_gathered)
+    bind(body) = Expr(:let, Expr(:(=), variable, element), body)
+    add(term) = Expr(:call, GlobalRef(Base, :add_sum), accumulator, term)
+    closure(formals, body) = Expr(:->, Expr(:tuple, formals...), body)
+    Expr(:call, GlobalRef(@__MODULE__, :_KernelReduction),
+         positions(iterator_ports), positions(init_ports),
+         positions(index_ports), positions(source_ports),
+         closure(deps, rhs),
+         closure(iterator_ports, parts.iterator),
+         closure(init_ports, parts.init),
+         closure(Any[accumulator, element, deps...], bind(add(parts.term))),
+         closure(Any[element, index_ports...], bind(index)),
+         closure(source_ports, source),
+         closure(Any[accumulator, element, gathered, deps...],
+                 bind(add(_kernel_replace_at(parts.term, path, gathered)))),
+         closure(Any[accumulator, element, deps...],
+                 bind(add(_kernel_replace_at(parts.term, path, default)))))
+end
+
+# The first `get(A, K, D)` call of Base's `get` in `term` that every evaluation
+# of `term` evaluates (the path from `term` crosses only call arguments) and
+# whose `A` does not mention `variable`, as `(path, A, K, D)`; `nothing` if none.
+function _kernel_reduction_gather(term, variable::Symbol, mod::Module)
+    if term isa Expr && term.head === :call
+        callee = term.args[1]
+        if length(term.args) == 4 && _kernel_is_base_get(callee, mod) &&
+           !any(arg -> arg isa Expr && arg.head in (:parameters, :kw, :...),
+                term.args[2:end]) &&
+           !_kernel_mentions(term.args[2], variable)
+            return ((), term.args[2], term.args[3], term.args[4])
+        end
+        for position in 2:length(term.args)
+            found = _kernel_reduction_gather(term.args[position], variable, mod)
+            found === nothing && continue
+            return ((position, found[1]...), found[2:end]...)
+        end
+    end
+    nothing
+end
+
+_kernel_is_base_get(callee, mod::Module) =
+    (callee === :get && isdefined(mod, :get) && getglobal(mod, :get) === Base.get) ||
+    callee == GlobalRef(Base, :get) || callee == :(Base.get)
+
+_kernel_mentions(ex, name::Symbol) = ex === name ||
+    (ex isa Expr && !(ex.head in (:quote, :inert)) &&
+     any(arg -> _kernel_mentions(arg, name), ex.args))
+
+function _kernel_replace_at(ex, path::Tuple, replacement)
+    isempty(path) && return replacement
+    args = copy(ex.args)
+    args[first(path)] = _kernel_replace_at(args[first(path)], Base.tail(path), replacement)
+    Expr(ex.head, args...)
 end
 
 function _kernel_nested_endpoint_deps(rhs, deps::Vector{Symbol}, known::Set{Symbol},
