@@ -557,6 +557,8 @@ const _SM_ITEMS = (
     ("accel_gp", _SM_ACCELGP, _SM_DATA.accelgp),
     ("brm_hsgp", _SM_BRMHSGP, _sm_mcycle()),
     ("accel_splines", _SM_ACCELSPL, _SM_DATA.accelspl),
+    ("bordet D2", _sm_bordet(false, :(censored.(Normal.(log_y, exp.(ls)),
+        lloq, uloq))), _SM_BORDET),
     ("bordet D3", _sm_bordet(true, :(censored.(Normal.(log_y, exp.(ls)),
         lloq, uloq))), _SM_BORDET),
     ("bordet D4", _sm_bordet(false, :(censored.(StudentT.(4.0, log_y,
