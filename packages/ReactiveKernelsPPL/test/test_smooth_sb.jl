@@ -489,6 +489,103 @@ end
         _sm_d6_oracle(d2, _SM_BORDET, fits) atol = 1e-9
 end
 
+# Bordet `brm_grouped_hsgp_centeredness` (builder 7, Bordet `e800ef8d`,
+# after the sweep pin: implemented on BRM's grouped-HSGP online
+# adaptation): per-biomarker smooths (`by = biomarker`) with SHARED hypers
+# (one rho / sigma per axis, BRM default priors), k = 5 like the pooled
+# builders, crossed ranef baselines, intercept-only log sigma, censored
+# Gaussian. Its "centeredness" is the sampler's online reparametrization of
+# the weights (BRM `adaptive_centering_problem`), not part of the density;
+# RK's non-centered weights are the default compiled frame. No SB numbers
+# exist for this builder yet (the matrix-b SB leg covered builders 2-6), so
+# parity is anchored through the SB-pinned builder 2 below.
+const _SM_BORDET_D7 = quote
+    hsgp_basis(:h_t, log_time; k = 5, by = biomarker)
+    hsgp_basis(:h_d, log_dose; k = 5, by = biomarker)
+    r_b ~ varying_effect(biomarker, [1])
+    r_p ~ varying_effect(person, [1])
+    log_y = a .+ b_aff .* affectable .+ hsgp(:h_t) .+ hsgp(:h_d) .+ r_b .+
+        r_p
+    ls = c0
+    log_obs .~ censored.(Normal.(log_y, exp.(ls)), lloq, uloq)
+end
+
+# Independent D7 oracle for a grouped-weight-only difference: the shared
+# floored length scale (SB `_brm_hsgp_rho_lower`, rho = floor + exp(u)),
+# the shared sd, per-group weights (G x K, column-major), per-row group
+# lookup, and the censored likelihood. Hyper / ranef / intercept priors
+# are equal at both probes and cancel.
+function _sm_d7_oracle(d, data, fits)
+    lp = 0.0
+    n = length(data.log_obs)
+    f = zeros(n)
+    G, K = 2, 5
+    for (id, x) in ((:h_t, data.log_time), (:h_d, data.log_dose))
+        mu, L = fits[id]
+        floor = (4 * L / pi) * sqrt(log(100.0) / (K^2 - 1))
+        rho = floor + exp(d[Symbol("rho_", id)])
+        sig = exp(d[Symbol("sigma_", id)])
+        w = [d[Symbol("beta_raw_", id, ".", j)] for j in 1:(G * K)]
+        lp += sum(logpdf.(Normal(), w))
+        W = reshape(w, G, K)
+        for i in 1:n, k in 1:K
+            lam = (k * pi / (2L))^2
+            phi = sin(sqrt(lam) * (x[i] - mu + L)) / sqrt(L)
+            spd = sig * sqrt(sqrt(2pi) * rho) * exp(-0.25 * rho^2 * lam)
+            f[i] += phi * spd * W[data.biomarker[i], k]
+        end
+    end
+    rb = exp(d[:log_scale_biomarker]) .*
+        [d[Symbol("xi_biomarker.", g)] for g in 1:2]
+    rp = exp(d[:log_scale_person]) .* [d[Symbol("xi_person.", p)] for p in 1:2]
+    s = exp(d[Symbol("ls.Intercept")])
+    for i in 1:n
+        m = d[Symbol("log_y.Intercept")] +
+            d[Symbol("log_y.affectable")] * data.affectable[i] + f[i] +
+            rb[data.biomarker[i]] + rp[data.person[i]]
+        y, lo, hi = data.log_obs[i], data.lloq[i], data.uloq[i]
+        lp += y <= lo ? logcdf(Normal(m, s), lo) :
+            y >= hi ? logccdf(Normal(m, s), hi) : logpdf(Normal(m, s), y)
+    end
+    return lp
+end
+
+@testset "bordet builder 7 grouped shared-hyper HSGP (Bordet e800ef8d)" begin
+    bound, _, kern, lay = _sm_query(_SM_BORDET_D7, _sm_cols(_SM_BORDET))
+    @test lay.total == 33
+    @test all(hb -> hb.by.levels == [1, 2], bound.hsgp_bases)
+    names = coordinate_names(lay)
+    fits = Dict(hb.id => only(hb.fits) for hb in bound.hsgp_bases)
+    # Group-sensitive: a non-uniform difference over the grouped weights.
+    u1 = _sm_probe(33)
+    grouped = [occursin(r"^beta_raw_(h_t|h_d)\.", String(nm)) for nm in names]
+    @test count(grouped) == 2 * 2 * 5
+    u2 = copy(u1)
+    u2[grouped] .= [0.4 * cos(0.9i) - 0.03i for i in 1:count(grouped)]
+    d1 = Dict(zip(names, u1))
+    d2 = Dict(zip(names, u2))
+    @test _sm_val(kern, u1) - _sm_val(kern, u2) ≈
+        _sm_d7_oracle(d1, _SM_BORDET, fits) -
+        _sm_d7_oracle(d2, _SM_BORDET, fits) atol = 1e-9
+    # Pooled equivalence with the SB-pinned builder 2: identical per-group
+    # weights reduce builder 7 to builder 2 plus the (G - 1) = 1 extra copy
+    # of the weight priors. Every other coordinate is shared by name.
+    _, _, kern2, lay2 = _sm_query(_sm_bordet(false,
+        :(censored.(Normal.(log_y, exp.(ls)), lloq, uloq))),
+        _sm_cols(_SM_BORDET))
+    names2 = coordinate_names(lay2)
+    v = _sm_probe(lay2.total)
+    dv = Dict(zip(names2, v))
+    u = map(names) do nm
+        m = match(r"^beta_raw_(h_t|h_d)\.(\d+)$", String(nm))
+        m === nothing ? dv[nm] :
+            dv[Symbol("beta_raw_", m[1], ".", (parse(Int, m[2]) - 1) ÷ 2 + 1)]
+    end
+    w = [dv[nm] for nm in names2 if startswith(String(nm), "beta_raw_")]
+    @test length(w) == 2 * 5
+    @test _sm_val(kern, u) ≈ _sm_val(kern2, v) + sum(logpdf.(Normal(), w)) atol = 1e-10
+end
+
 @testset "grouped HSGP surface + contract" begin
     base(kws...) = quote
         hsgp_basis(:h, x; k = 6, $(kws...))
@@ -557,12 +654,15 @@ const _SM_ITEMS = (
     ("accel_gp", _SM_ACCELGP, _SM_DATA.accelgp),
     ("brm_hsgp", _SM_BRMHSGP, _sm_mcycle()),
     ("accel_splines", _SM_ACCELSPL, _SM_DATA.accelspl),
+    ("bordet D2", _sm_bordet(false, :(censored.(Normal.(log_y, exp.(ls)),
+        lloq, uloq))), _SM_BORDET),
     ("bordet D3", _sm_bordet(true, :(censored.(Normal.(log_y, exp.(ls)),
         lloq, uloq))), _SM_BORDET),
     ("bordet D4", _sm_bordet(false, :(censored.(StudentT.(4.0, log_y,
         exp.(ls)), lloq, uloq))), _SM_BORDET),
     ("bordet D5", _SM_BORDET_D5, _SM_BORDET_D5_DATA),
     ("bordet D6", _SM_BORDET_D6, _SM_BORDET),
+    ("bordet D7", _SM_BORDET_D7, _SM_BORDET),
     ("bruno hsgp", _sm_bruno1(:x), (; x = _SM_BRUNO_X, y = _SM_BRUNO_Y)),
     ("bruno gp_effectiveness", _SM_BRUNO_EFF, _SM_BRUNO_EFF_DATA),
 )
