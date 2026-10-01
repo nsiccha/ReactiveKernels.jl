@@ -1712,31 +1712,32 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
-# An upper-only scalar latent (the TGI threshold-prior shape) carries Stan's
-# upper-bound kernel: plain normal_lpdf (NO -log(cdf) renormalization) plus
-# the bare-`u` Jacobian. Oracle is Distributions.jl plain `Normal`.
+# An upper-only scalar latent (a negative location under a negative ceiling)
+# carries Stan's upper-bound kernel: plain normal_lpdf (NO -log(cdf)
+# renormalization) plus the bare-`u` Jacobian. Oracle is Distributions.jl
+# plain `Normal`.
 @testset "upper-truncated scalar latent end to end" begin
-    hi = log(0.5)
+    hi = -0.5
     x = [0.5, -1.0, 0.25, 1.5, -0.75, 0.0]
     y = [0.3, 1.2, -0.5, 2.1, 0.0, 1.7]
     cols = Dict{Symbol,AbstractVector}(:x => x, :y => y)
     expr = Expr(:block,
-        :(tgi_c_cr ~ truncated(Normal(-2.3, 1.0), -Inf, $hi)),
+        :(w ~ truncated(Normal(-1.0, 1.0), -Inf, $hi)),
         :(mu = a .+ b .* x),
         :(y .~ Normal.(mu, s)),
         :(s ~ Exponential(1)))
     plan = bind_data(lower_rkppl(expr, (:y, :x)), cols)
     built = build_kernel(plan)
-    @test built.layout.total == 4 # a, b, tgi_c_cr, s
+    @test built.layout.total == 4 # a, b, w, s
     u = [0.3, -0.2, 0.1, 0.25]
     nt = constrain(built.layout, u)
-    a, b, c, s = nt.mu[1], nt.mu[2], nt.tgi_c_cr, nt.s
+    a, b, c, s = nt.mu[1], nt.mu[2], nt.w, nt.s
     @test c ≈ hi - exp(u[3])
     @test c < hi
     mu = a .+ b .* x
     ll = sum(logpdf.(Normal.(mu, s), y))
     pr = logpdf(Normal(0, 1), a) + logpdf(Normal(0, 1), b) +
-        logpdf(Normal(-2.3, 1.0), c) + logpdf(Exponential(1), s)
+        logpdf(Normal(-1.0, 1.0), c) + logpdf(Exponential(1), s)
     @test _query(built.spec, plan, :likelihood, u) ≈ ll
     @test _query(built.spec, plan, :prior, u) ≈ pr
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3] + u[4]
@@ -1745,7 +1746,7 @@ end
     # constrained value ⇒ same prior; the posterior differs by exactly the
     # Jacobian `u` (snag thin-layer-upper-c3c06483).
     interim = bind_data(lower_rkppl(Expr(:block,
-            :(tgi_c_cr ~ Normal(-2.3, 1.0)),
+            :(w ~ Normal(-1.0, 1.0)),
             :(mu = a .+ b .* x),
             :(y .~ Normal.(mu, s)),
             :(s ~ Exponential(1))), (:y, :x)), cols)
