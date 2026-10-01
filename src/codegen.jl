@@ -275,10 +275,14 @@ end
 # calls `_tensorized_scan`, specialized by a backend to a `stablehlo.while`.
 # The op's argument order is fixed by authoring: index 1 = carry seed, index 2 =
 # the sequence `xs`, index 3+ = Ref-shared operands; `A` records the atomic
-# (broadcast-invariant) indices {1, 3, 4, …}.
-struct _AuthoredScanOp{K,A}
+# (broadcast-invariant) indices {1, 3, 4, …}. `I` is the authored
+# `include_init` literal: when `true` the result is `[init, output…]`, one
+# element longer than the sequences, written into one buffer.
+struct _AuthoredScanOp{K,A,I}
     kernel::K
 end
+
+_scan_includes_init(::_AuthoredScanOp{K,A,I}) where {K,A,I} = I
 
 "The transparent scalar step plan captured by an authored `scan(...) do` recipe."
 function scan_body(recipe::Recipe)
@@ -292,13 +296,13 @@ end
 # The iterated sequences are the remaining operand indices (>= 2, not in `A`).
 # Split them at compile time so `_tensorized_scan` receives the sequence tuple and
 # the shared tuple explicitly.
-@generated function (op::_AuthoredScanOp{K,A})(args...) where {K,A}
+@generated function (op::_AuthoredScanOp{K,A,I})(args...) where {K,A,I}
     n = length(args)
     n >= 2 || return :(throw(ArgumentError(
         "an authored scan expects (init, sequence, shared...) arguments")))
     iterated = Expr(:tuple, (:(args[$i]) for i in 2:n if !(i in A))...)
     shared = Expr(:tuple, (:(args[$i]) for i in 2:n if i in A)...)
-    :(_tensorized_scan(op.kernel, args[1], $iterated, $shared))
+    :(_tensorized_scan(op.kernel, args[1], $iterated, $shared, Val($I)))
 end
 
 function _lhs_symbols!(symbols::Set{Symbol}, lhs)
@@ -440,12 +444,14 @@ end
 # PreparedKernel from a loop with a changing carry defeats inference across the
 # RGF boundary; the same step AST and operation table specialize normally here.
 # An empty sequence runs no step: the scan port is an empty vector of the
-# step's output type and a fused plate consumer sums nothing.
+# step's output type and a fused plate consumer sums nothing. An
+# `include_init = true` scan writes the carry seed and then each output into
+# one buffer one element longer than the sequences (`[init]` when empty).
 function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
                                       offset; consumer = nothing)
     step = op.kernel
-    indices, index, carry, output, output_type = gensym.((:scan_indices,
-        :scan_index, :scan_carry, :scan_output, :scan_output_type))
+    indices, index, carry, output, output_type, position = gensym.((:scan_indices,
+        :scan_index, :scan_carry, :scan_output, :scan_output_type, :scan_position))
     # `A` marks the atomic operands: index 1 (the carry seed) plus the `Ref`
     # shareds.  The iterated sequences are the remaining operand indices; each is
     # indexed by the loop counter per step, while shared operands pass whole.
@@ -479,7 +485,21 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     invariant = Any[]
     initial_output, loop_output, final_output = Expr(:block), Expr(:block), Expr(:block)
     empty_output = Expr(:block, :($output_type = $empty_output_type))
-    if lhs !== nothing
+    if lhs !== nothing && _scan_includes_init(op)
+        seed, similar_ref = callargs[1], GlobalRef(Base, :similar)
+        promote_ref, length_ref = GlobalRef(Base, :promote_type), GlobalRef(Base, :length)
+        push!(initial_output.args, :($lhs = $similar_ref($xs,
+            $promote_ref($typeof_ref($seed), $typeof_ref($output)),
+            $length_ref($indices) + 1)))
+        push!(initial_output.args, :($lhs[1] = $seed))
+        push!(initial_output.args, :($lhs[2] = $output))
+        push!(initial_output.args, :($position = 2))
+        push!(loop_output.args, :($position += 1))
+        push!(loop_output.args, :($lhs[$position] = $output))
+        push!(empty_output.args, :($lhs = $similar_ref($xs,
+            $promote_ref($typeof_ref($seed), $output_type), 1)))
+        push!(empty_output.args, :($lhs[1] = $seed))
+    elseif lhs !== nothing
         push!(initial_output.args, :($lhs = $(GlobalRef(Base, :similar))(
             $xs, $typeof_ref($output))))
         push!(initial_output.args, :($lhs[$index] = $output))
@@ -572,6 +592,9 @@ end
 # operands need full broadcast-axis validation; other consumers or WANTs need
 # the materialized scan. In either case ordinary native scan lowering applies.
 function _authored_scan_sum_consumer(p::Plan, scan_recipe::Recipe)
+    # The fused loop streams one cell per step; the seed slot of an
+    # init-including scan would need a cell of its own, so it materializes.
+    _scan_includes_init(scan_recipe.op) && return nothing
     output_id = canon_id(p.graph, only(scan_recipe.outputs).id)
     any(w -> canon_id(p.graph, w.id) == output_id, p.want) && return nothing
     consumers = filter(p.recipes) do recipe

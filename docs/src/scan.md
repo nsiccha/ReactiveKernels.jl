@@ -23,6 +23,7 @@ result = scan(xs₁, xs₂, …, Ref(shared₁), Ref(shared₂), …; init = c�
     # … compute with carry, the per-step elements x₁, x₂, …, and the shared operands …
     (new_carry, output)          # the do-block must END with this 2-tuple
 end
+# optional: `include_init = true` returns [c₀, output₁, output₂, …]
 ```
 
 - **`xs₁, xs₂, …`** — one or more **iterated sequences**, the leading non-`Ref`
@@ -39,6 +40,9 @@ end
 - **The do-block** receives `(carry, x₁, x₂, …, shared...)` and must end with the
   2-tuple `(new_carry, output)`. `scan` returns the vector `[output₁, output₂, …]`
   (one entry per step); the final carry is internal.
+- **`include_init = true`** (a literal; default `false`) returns
+  `[init, output₁, output₂, …]` instead: one element longer than the sequences,
+  in one buffer. See [The initial value in the result](#The-initial-value-in-the-result).
 
 The carry may be a scalar, a **`NamedTuple`**, or a vector (an HMM forward
 pass threads its belief-state vector; see the `eachrow` shape below) when
@@ -127,22 +131,59 @@ them into matrix rows. A piecewise-exact turnover recurrence
 step sizes reads both directly:
 
 ```julia
-updated = scan(conc_mid, dts, Ref(pd), Ref(kin);
-               init = pd.baseline) do previous, concentration, dt, parameters, input_rate
+trajectory = scan(conc_mid, dts, Ref(pd), Ref(kin);
+                  init = pd.baseline, include_init = true) do previous, concentration, dt, parameters, input_rate
     c2 = parameters.kout * (1 + concentration /
         (parameters.theta1 * concentration + parameters.theta2))
     steady = input_rate / c2
     next = (previous - steady) * exp(-c2 * dt) + steady
     (next, next)
 end
-trajectory = vcat([pd.baseline], updated)
 ```
 
 This form gives exactly the same result as `scan(eachrow(hcat(conc_mid, dts)), …)`
 reading `row[1]` and `row[2]`, but it does not build the packed matrix. On a
-3264-step schedule it allocated 52,448 B against 104,720 B for the packed form,
-and took 15.8 µs against 20.2 µs. Under Reactant both forms keep one
-`stablehlo.while`.
+3264-step schedule the per-step spelling (`include_init` omitted, then
+`vcat([pd.baseline], updated)`) allocated 52,448 B against 104,720 B for the
+packed form, and took 15.8 µs against 20.2 µs. Under Reactant both forms keep
+one `stablehlo.while`.
+
+## The initial value in the result
+
+A trajectory `[R₀, R₁, …, Rₙ]` of a recurrence whose output is its next carry
+starts with the carry seed. `include_init = true` writes that seed and the `n`
+per-step outputs into one buffer of length `n + 1`, the seed first:
+
+```julia
+trajectory = scan(xs; init = r₀, include_init = true) do previous, x
+    next = update(previous, x)
+    (next, next)
+end
+# == vcat([r₀], scan(xs; init = r₀) do previous, x … end), without the second vector
+```
+
+The value is exactly that of `vcat([init], outputs)`, element type included:
+`promote_type(typeof(init), output type)`, so an `Int` seed beside `Float64`
+outputs gives a `Vector{Float64}`. An empty sequence returns `[init]`. The
+literal is part of the authored graph — the result's length depends on it — so
+`include_init` must be written `true` or `false`, not computed.
+
+On the 3264-step turnover above (strato2, x86-64, Julia 1.10.11, minimum of
+5000 calls), `include_init = true` allocates the 26,224 B trajectory once and
+takes 14.3 µs. The `vcat` form allocates 52,448 B (the per-step vector plus its
+copy) and takes 15.5 µs, and a hand-written loop filling one `n + 1` buffer
+takes 13.7 µs with the same 26,224 B. Values are bitwise identical across all
+three.
+
+Natively, the seed slot keeps the vector materialized: a reducing `plate` over
+an init-including scan reads the stored trajectory rather than streaming each
+cell inside the carry loop (the per-step form's fusion described under
+[Lowering and semantics](#Lowering-and-semantics)). Under Reactant the seed is
+element 1 of the traced output buffer and step `i` writes element `i + 1` from
+the same single `stablehlo.while`; the program contains no concatenation. The
+seed must be a scalar there, like every per-step output; a compound seed is a
+loud `ArgumentError`. An empty traced sequence emits no loop and returns the
+one-element `[init]`, which exports even as the compiled program's own output.
 
 A scan over matrix rows iterates `eachrow` of the matrix — one row per step —
 with whatever carry the recurrence threads (here a 2-vector belief state):
@@ -162,7 +203,8 @@ the step's output type for the carry seed, one element of each sequence and the
 shared operands. It is inferred without running the step, the way Julia's
 `accumulate` types an empty result, and it is `Any` only when inference cannot
 tell. A plate that sums the scan totals zero. In the turnover example above, an
-empty schedule gives `trajectory == [pd.baseline]`. A dose-feedback recurrence
+empty schedule gives `trajectory == [pd.baseline]`: an init-including scan
+returns `[init]`. A dose-feedback recurrence
 over zero doses gives `weights == Float64[]` and `total == 1.0`:
 
 ```julia

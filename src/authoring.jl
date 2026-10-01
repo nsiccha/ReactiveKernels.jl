@@ -1776,7 +1776,8 @@ end
 # per-step element drawn from the single non-`Ref` positional `xs`, and any
 # further formals are `Ref`-wrapped shared/atomic operands (broadcast-invariant,
 # exactly like plate's atomic args).  The do-block returns the 2-tuple
-# `(new_carry, output)`; `scan` returns the vector `[output…]`.  The step is an
+# `(new_carry, output)`; `scan` returns the vector `[output…]`, or, with the
+# literal `include_init = true`, `[init, output…]` in one buffer.  The step is an
 # ordinary TWO-`want` KernelSpec (`want = (:new_carry, :output)`); the native
 # path runs the plain ordered loop (already Reactant-unsafe only via scalar
 # indexing, which the tensorized lowering avoids by emitting a `stablehlo.while`).
@@ -1797,18 +1798,34 @@ function _kernel_authored_scan_expr(rhs, mod)
     length(unique(formals)) == length(formals) || throw(ArgumentError(
         "scan do-block argument names must be unique"))
 
-    # Split the call into positional operands and the required `init =` carry seed.
+    # Split the call into positional operands, the required `init =` carry seed
+    # and the optional `include_init =` literal.
     positional = Any[]
     init_expr = nothing
+    include_init = false
+    function _scan_keyword!(kw)
+        name = kw.args[1]
+        if name === :init
+            init_expr = kw.args[2]
+        elseif name === :include_init
+            kw.args[2] isa Bool || throw(ArgumentError(
+                "scan's `include_init` must be the literal `true` or `false`: it " *
+                "fixes the result's length (n + 1 or n) when the kernel is defined"))
+            include_init = kw.args[2]
+        else
+            throw(ArgumentError(
+                "scan accepts only the `init =` and `include_init =` keywords"))
+        end
+    end
     for arg in call.args[2:end]
         if arg isa Expr && arg.head === :parameters
             for kw in arg.args
-                (kw isa Expr && kw.head === :kw && kw.args[1] === :init) ||
-                    throw(ArgumentError("scan accepts only an `init =` keyword"))
-                init_expr = kw.args[2]
+                kw isa Expr && kw.head === :kw || throw(ArgumentError(
+                    "scan accepts only the `init =` and `include_init =` keywords"))
+                _scan_keyword!(kw)
             end
-        elseif arg isa Expr && arg.head === :kw && arg.args[1] === :init
-            init_expr = arg.args[2]
+        elseif arg isa Expr && arg.head === :kw
+            _scan_keyword!(arg)
         else
             push!(positional, arg)
         end
@@ -1899,14 +1916,16 @@ function _kernel_authored_scan_expr(rhs, mod)
         step_body, signature, nothing, mod; nested_specs = nested_specs)
     operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_scan),
                      step_spec,
-                     Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))))
+                     Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))),
+                     Expr(:call, GlobalRef(Base, :Val), include_init))
     (; arguments, operation, inferred = nothing, atomic = Tuple(atomic),
        materialized_arguments)
 end
 
-function _kernel_authored_scan(spec::KernelSpec, ::Val{A}) where {A}
+function _kernel_authored_scan(spec::KernelSpec, ::Val{A},
+                               ::Val{I} = Val(false)) where {A,I}
     kernel = prepare(spec)
-    _AuthoredScanOp{typeof(kernel),A}(kernel)
+    _AuthoredScanOp{typeof(kernel),A,I}(kernel)
 end
 
 # A dotted operator such as `.*` is broadcast *syntax*, not a bound function:
@@ -3897,7 +3916,7 @@ function plate(spec::KernelSpec; have, want, batched, reduce = :+)
 end
 
 """
-    scan(xs, ys..., Ref(shared)...; init) do carry, x, y..., shared...
+    scan(xs, ys..., Ref(shared)...; init, include_init = false) do carry, x, y..., shared...
         …
         (new_carry, output)
     end
@@ -3910,6 +3929,13 @@ lockstep (they must share axes); `init` seeds the threaded `carry`; any trailing
 output)`; `scan` returns the vector `[output…]`. A compound carry may be carried
 as a `NamedTuple` (`init = (; a, b)`, read `carry.a`). Empty sequences run no
 step and return an empty vector of the step's inferred output type.
+
+With the literal `include_init = true`, `scan` returns `[init, output…]`, one
+element longer than the sequences and written into a single buffer: the
+trajectory `[R₀, R₁, …, Rₙ]` of a recurrence whose output is its next carry.
+Its value and element type (`promote_type(typeof(init), output type)`) are
+those of `vcat([init], scan(…; init))` without the second vector; empty
+sequences return `[init]`.
 
 It lowers to an ordinary ordered loop natively, and to a `stablehlo.while` carry
 loop under Reactant — so a natural sequential recurrence lowers without unrolling
