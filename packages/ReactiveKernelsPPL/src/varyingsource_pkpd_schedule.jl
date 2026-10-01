@@ -1,6 +1,6 @@
 # Bind-time merge of measurements, doses and cumulative discretization lags.
 # Keep equal-time dose boundaries: they produce zero-length PD steps in the
-# deployed varyingsource3 transformed-data recipe.
+# reference transformed-data recipe.
 function _vs_pkpd_times(measurements, doses, discretization)
     grid = Float64[]
     isempty(measurements) && return grid

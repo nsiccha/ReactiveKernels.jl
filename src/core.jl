@@ -349,10 +349,14 @@ end
 # `17bnc6t`; Reactant untouched).  `iterated` and `shared` are tuples; the common
 # case is a one-tuple `iterated`, and `eachindex(iterated...)` validates that
 # several sequences share axes (a `DimensionMismatch` otherwise). Empty
-# sequences run no step and yield an empty result.
-@inline function _tensorized_scan(step, init, iterated::Tuple, shared::Tuple)
+# sequences run no step and yield an empty result. `Val(true)` is the authored
+# `include_init = true`: the result is `[init, output…]` in one buffer of
+# element type `promote_type(typeof(init), output type)`, exactly the value of
+# `vcat([init], outputs)`, and an empty sequence yields `[init]`.
+@inline function _tensorized_scan(step, init, iterated::Tuple, shared::Tuple,
+                                  include_init::Val = Val(false))
     marker = _scan_backend_marker(init, iterated, shared)
-    _tensorized_scan_lowering(marker, step, init, iterated, shared)
+    _tensorized_scan_lowering(marker, step, init, iterated, shared, include_init)
 end
 
 # A scan runs on a backend exactly when ANY of its operands is that backend's
@@ -382,9 +386,10 @@ end
 
 # The native ordered loop.  `nothing` is the no-backend marker; a backend
 # extension specializes `_tensorized_scan_lowering` on its own marker type.
-# An empty sequence returns an empty result without running the step.
+# An empty sequence returns an empty result (or `[init]`) without running the
+# step.
 function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
-                                   shared::Tuple)
+                                   shared::Tuple, ::Val{false} = Val(false))
     idx = eachindex(iterated...)
     isempty(idx) && return similar(first(iterated), _scan_step_output_type(
         step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...))
@@ -394,6 +399,89 @@ function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
     result[i1] = out1
     for i in Iterators.drop(idx, 1)
         carry, out = step(carry, map(xs -> xs[i], iterated)..., shared...)
+        result[i] = out
+    end
+    result
+end
+
+function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
+                                   shared::Tuple, ::Val{true})
+    idx = eachindex(iterated...)
+    if isempty(idx)
+        T = promote_type(typeof(init), _scan_step_output_type(
+            step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...))
+        result = similar(first(iterated), T, 1)
+        result[1] = init
+        return result
+    end
+    i1 = first(idx)
+    carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared...)
+    result = similar(first(iterated), promote_type(typeof(init), typeof(out1)),
+                     length(idx) + 1)
+    result[1] = init
+    result[2] = out1
+    position = 2
+    for i in Iterators.drop(idx, 1)
+        carry, out = step(carry, map(xs -> xs[i], iterated)..., shared...)
+        position += 1
+        result[position] = out
+    end
+    result
+end
+
+# `scan(...; history = h0)`: the step's last argument is a read-only view of
+# the result vector being written, so step `j` reads the outputs of steps
+# `1:j-1` and `h0` at `j` and after. Every backend hands the step that same
+# full-length vector, so a step that reads beyond `j - 1` sees `h0` on each.
+# `h0` is a scalar number and fixes the result's element type; each output is
+# stored converted to it. The view has no `setindex!`, and a carry holding it
+# is refused, because the native view aliases the vector the scan still writes.
+struct _ScanHistory{T,A<:AbstractVector{T}} <: AbstractVector{T}
+    outputs::A
+end
+Base.size(h::_ScanHistory) = size(h.outputs)
+Base.axes(h::_ScanHistory) = axes(h.outputs)
+Base.IndexStyle(::Type{<:_ScanHistory{T,A}}) where {T,A} = IndexStyle(A)
+Base.@propagate_inbounds Base.getindex(h::_ScanHistory, i::Int...) = h.outputs[i...]
+
+function _scan_history_buffer(xs, fill::Number)
+    buffer = similar(xs, typeof(fill))
+    fill!(buffer, fill)
+end
+_scan_history_buffer(xs, fill) = throw(ArgumentError(
+    "a scan's `history =` value must be a number (it fills the outputs not yet " *
+    "written and fixes their element type); got a $(typeof(fill))"))
+
+_scan_holds_history(::Type{<:_ScanHistory}) = true
+_scan_holds_history(T::DataType) = (T <: Tuple || T <: NamedTuple) &&
+    any(_scan_holds_history, fieldtypes(T))
+_scan_holds_history(::Type) = false
+@generated function _scan_history_carry(carry)
+    _scan_holds_history(carry) ? :(throw(ArgumentError(
+        "a `history =` scan step returned its history in the carry; the history " *
+        "is read-only and valid only during its step. Carry the values it needs " *
+        "instead."))) : :carry
+end
+
+@inline function _tensorized_scan_history(step, init, fill, iterated::Tuple,
+                                          shared::Tuple)
+    marker = _scan_backend_marker(init, iterated, (shared..., fill))
+    _tensorized_scan_history_lowering(marker, step, init, fill, iterated, shared)
+end
+
+function _tensorized_scan_history_lowering(::Nothing, step, init, fill,
+                                           iterated::Tuple, shared::Tuple)
+    idx = eachindex(iterated...)
+    result = _scan_history_buffer(first(iterated), fill)
+    earlier = _ScanHistory(result)
+    isempty(idx) && return result
+    i1 = first(idx)
+    carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared..., earlier)
+    carry = _scan_history_carry(carry)
+    result[i1] = out1
+    for i in Iterators.drop(idx, 1)
+        carry, out = step(carry, map(xs -> xs[i], iterated)..., shared..., earlier)
+        carry = _scan_history_carry(carry)
         result[i] = out
     end
     result

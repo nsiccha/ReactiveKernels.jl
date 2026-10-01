@@ -1,7 +1,6 @@
-# Native PK cell of Bruno's varyingsource3/4 twin, source checkpoint 896137dd:
-# src/pkpd_models.jl:690-709, 2199-2204, 2285-2304, 3231-3263.
+# Native PK cell of the varying-source PK/PD model.
 # Treatment j selects source column j, not the first dose carrying label j.
-# Retain that deployed indexing, the normalized 2-D GP, and ordered feedback.
+# Retain that reference indexing, the normalized 2-D GP, and ordered feedback.
 
 function _varyingsource_gp(weights, x, y)
     value = 0.0
@@ -18,7 +17,7 @@ end
 """
     varyingsource_effectiveness(weights, dose_slope, conc_slope)
 
-The varyingsource3 dose/concentration effectiveness surface with its
+The varying-source dose/concentration effectiveness surface with its
 transformed GP weight matrix. The basis has padding 1.5, the dose domain is
 10000–200000, and concentration is clamped to 0–2000 before its log1p map.
 The normalizer makes a dose of 10000 at concentration zero unchanged.
@@ -40,7 +39,7 @@ end
 
 Evaluate the normalized 2-D dose/concentration GP from
 [`varyingsource_effectiveness`](@ref). The dose coordinate is not clamped;
-only the concentration coordinate is clamped, exactly as in the twin.
+only the concentration coordinate is clamped, exactly as in the reference model.
 """
 function varyingsource_effective_dose(dose, concentration, effectiveness)
     e = effectiveness
@@ -97,7 +96,7 @@ doses at `dosing_time_idxs[i]`; its bioavailability is `exp(dose_log_F[i]-log_Vc
 `concentration_idxs` contains `n_times` lag indices per dose, in dose-major
 order. Nonpositive time differences select the zero-lag unit response.
 Treatment-map value `j` selects source column `j`, assembled from
-`dose_log_rate[j]` and `dose_log_mode[j]`. This preserves the deployed twin's
+`dose_log_rate[j]` and `dose_log_mode[j]`. This preserves the reference model's
 first-`maximum(treatment_map)` source-column selection, even when label `j`
 first appears at another dose. The rate is `exp(log_absorption_rate+modifier)`;
 Gamma shape is `1 + rate*exp(log_absorption_mode+modifier)`.

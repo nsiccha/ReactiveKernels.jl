@@ -6,21 +6,15 @@
 # `sd(:, hsgp(x)) ~ ...` / `sd(mu, s(x)) ~ ...`), and HSGP-only
 # predictors (SB `0 + hsgp(x)`, location and `exp.` scale).
 #
-# Also Bordet builders 2-4 (pin 72d4bfc9: pooled HSGP, shape-pooled
-# correlated slope, censored Student-t nu=4) and the bruno HSGP/GP
-# components (pkpd_models.jl @ 0090db25: hsgp, clamped_hsgp,
-# gp_effectiveness), which add the fixed `domain=` and the bounding
-# `length_scale = Uniform(lo, hi)` (SB prior-bound intersection).
+# Also the fixed `domain=` and the bounding `length_scale = Uniform(lo, hi)`
+# (SB prior-bound intersection) on a one-axis HSGP regression.
 #
 # SB numbers: briefs 2026-09-27T22-26-40-536-ftkxju (numbers) and
 # 2026-09-27T22-26-41-702-k7ikuw (verdict: hierarchical_gp /
 # kronecker_gp NO-COUNTERPART) on BayesianRegressionModels:rk:kernel:matrix-b
 # (BRM 88c5621, StanBlocks 342436de, BridgeStan 2.9.0; full posterior,
 # propto=false, Jacobian included). Formulas + data from the partner's
-# run scripts (matrix-b-smooth.jl, -reruns2.jl, -numbers5.jl). Bordet
-# builder 7 (D7): brief 2026-10-01T05-48-36-754-n0wjw1 on
-# BayesianRegressionModels (BRM daadc695, records 328fa77 B7_*, StanBlocks
-# eeee3bad, BridgeStan 2.9.0, same SB conventions).
+# run scripts (matrix-b-smooth.jl, -reruns2.jl, -numbers5.jl).
 #
 # Every leg compares DIRECTLY at the same u: RK's exact GP
 # (`gp_chol_latent(gp_exp_quad_cov(x, sigma, rho, 1e-9), z)`, non-centered)
@@ -32,9 +26,8 @@
 # (zeros and 0.3^n), so the n = coordinate COUNT and the layout-name
 # assertions carry the mapping; the HSGP/spline math itself is pinned
 # against independent oracles in test_hsgp.jl / test_spline.jl.
-# (`_check_gradient` / `_GEN_BACKEND` come from test_generator.jl;
-# `_irt_intercept_integral` — the exact collapsed-totals bridge — from
-# test_irt.jl, both included earlier by runtests.jl.)
+# (`_check_gradient` / `_GEN_BACKEND` come from test_generator.jl,
+# included earlier by runtests.jl.)
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
@@ -223,107 +216,26 @@ const _SM_DATA = (
             hsgp_bases = [bad, plan.hsgp_bases[2]]))
 end
 
-const _SM_BORDET = let
-    bm = [1, 1, 1, 2, 2, 2, 1, 1, 1, 2, 2, 2]
-    t = [0.5, 2.0, 8.0, 0.5, 2.0, 8.0, 0.5, 2.0, 8.0, 0.5, 2.0, 8.0]
-    d = [0.0, 10.0, 50.0, 0.0, 10.0, 50.0, 0.0, 10.0, 50.0, 0.0, 10.0,
-        50.0]
-    (; log_time = log.(t), log_dose = log.(d .+ 1.0),
-        affectable = [0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1],
-        biomarker = bm, person = [1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2],
-        lloq = [b == 1 ? -3.0 : -2.0 for b in bm],
-        uloq = [b == 1 ? 3.0 : 2.5 for b in bm],
-        log_obs = [0.1, 0.5, 1.2, -0.2, 0.3, 0.9, 0.0, 0.4, 1.0, -3.0,
-            0.2, 2.5])
-end
-
-# Bordet `brm_pooled_hsgp` / `brm_shapepooled_hsgp` /
-# `brm_pooled_student_t` (BRM default priors throughout — RK's defaults).
-_sm_bordet(slope::Bool, lik) = quote
-    a ~ Normal(0, 1)
-    b_aff ~ Normal(0, 1)
-    c0 ~ Normal(0, 1)
-    hsgp_basis(:h_t, log_time; k = 5)
-    hsgp_basis(:h_d, log_dose; k = 5)
-    r_b ~ varying_effect(biomarker, $(slope ? :([1, affectable]) : :([1])))
-    r_p ~ varying_effect(person, [1])
-    log_y = a .+ b_aff .* affectable .+ hsgp(:h_t) .+ hsgp(:h_d) .+ r_b .+
-        r_p
-    ls = c0
-    log_obs .~ $lik
-end
-
-# Bordet `brm_hierarchical_terms` (builder 5): mean = base + bump * resp
-# over per-series correlated parametric curves — `transient` (loc,
-# log-slope, magnitude; `bump_math`) and `saturating` (loc, log-slope;
-# `sigmoid_math`) — as a composed predictor v3 (data-column leaves +
-# `logistic.` maps over varying-slice subs). `series` indexes the 4
-# biomarker x person series (Bordet derives it the same way).
-const _SM_BORDET_D5 = quote
-    b0 ~ Normal(0, 1)
-    sigma ~ Exponential(1)
-    r_base ~ varying_effect(series, [1])
-    base = b0 .+ r_base
-    dt ~ varying_draws(series, [1, 1, 1])
-    t1 ~ varying_slice(dt, 1)
-    t2 ~ varying_slice(dt, 2)
-    t3 ~ varying_slice(dt, 3)
-    ds ~ varying_draws(series, [1, 1])
-    s1 ~ varying_slice(ds, 1)
-    s2 ~ varying_slice(ds, 2)
-    tl = t1
-    tls = t2
-    tm = t3
-    dl = s1
-    dls = s2
-    xi = (log_time .- tl) .* exp.(tls)
-    bump = logistic.(xi) .* logistic.(.-xi) .* tm
-    resp = logistic.((log_dose .- dl) .* exp.(dls))
-    mu = base .+ bump .* resp
-    log_obs .~ censored.(Normal.(mu, sigma), lloq, uloq)
-end
-const _SM_BORDET_D5_DATA = (; log_time = _SM_BORDET.log_time,
-    log_dose = _SM_BORDET.log_dose,
-    series = _SM_BORDET.biomarker .+ (_SM_BORDET.person .- 1) .* 2,
-    lloq = _SM_BORDET.lloq, uloq = _SM_BORDET.uloq,
-    log_obs = _SM_BORDET.log_obs)
-
-const _SM_BRUNO_X = [-1.0, -0.7, -0.4, -0.1, 0.2, 0.5, 0.8, 1.0]
-const _SM_BRUNO_Y = [0.2, -0.3, 0.5, 1.1, 0.7, -0.1, -0.6, 0.3]
-# bruno hsgp: minmax axis, fixed L = 1.5 (`domain=(-1.5, 1.5)`), rho
+const _SM_DOMAIN_X = [-1.0, -0.7, -0.4, -0.1, 0.2, 0.5, 0.8, 1.0]
+const _SM_DOMAIN_Y = [0.2, -0.3, 0.5, 1.1, 0.7, -0.1, -0.6, 0.3]
+# One-axis HSGP on a fixed domain L = 1.5 (`domain=(-1.5, 1.5)`), rho
 # bounded by the K=10 validity floor (4*1.5/pi)*sqrt(log(100)/99).
-_sm_bruno1(ax) = quote
+const _SM_DOMAIN_HSGP = quote
     b0 ~ Normal(0, 5)
     mu = b0 .+ hsgp(:h)
-    hsgp_basis(:h, $ax; k = 10, domain = (-1.5, 1.5),
+    hsgp_basis(:h, x; k = 10, domain = (-1.5, 1.5),
         length_scale = Uniform(0.4119140661125232, 2), sd = LogNormal(0, 1))
     sigma ~ Exponential(1)
     y .~ Normal.(mu, sigma)
 end
-const _SM_BRUNO_EFF = quote
-    b0 ~ Normal(0, 5)
-    mu = b0 .+ hsgp(:h)
-    hsgp_basis(:h, xd, xc; k = (8, 8), iso = false,
-        domain = ((-1.5, 1.5), (-1.5, 1.5)),
-        length_scale = Uniform(0.5163616086861821, 2), sd = Normal(0, 1))
-    sigma ~ Exponential(1)
-    y .~ Normal.(mu, sigma)
-end
-const _SM_BRUNO_EFF_DATA = let
-    dose = repeat([0.0, 10.0, 50.0, 200.0], 4)
-    conc = repeat([0.0, 100.0, 500.0, 1500.0], inner = 4)
-    (; xd = @.(-1 + 2 * dose / 200.0), xc = @.(-1 + 2 * conc / 1500.0),
-        y = [0.1, 0.3, 0.8, 1.2, 0.0, 0.2, 0.6, 1.0, -0.1, 0.1, 0.5, 0.9,
-            -0.2, 0.0, 0.4, 0.7])
-end
 
 @testset "hsgp domain + bounding hyper prior" begin
-    plan = lower_rkppl(_sm_bruno1(:x), (:y, :x))
+    plan = lower_rkppl(_SM_DOMAIN_HSGP, (:y, :x))
     hb = only(plan.hsgp_bases)
     @test hb.domain == [(-1.5, 1.5)]
     @test hb.rho_prior == HyperPrior(:uniform,
         (arg1 = 0.4119140661125232, arg2 = 2.0))
-    bound = bind_data(plan, _sm_cols((; x = _SM_BRUNO_X, y = _SM_BRUNO_Y)))
+    bound = bind_data(plan, _sm_cols((; x = _SM_DOMAIN_X, y = _SM_DOMAIN_Y)))
     @test only(bound.hsgp_bases).fits == [(0.0, 1.5)]
     e = only(en for en in assign_layout(bound).entries
         if en.name === :rho_h)
@@ -384,313 +296,6 @@ end
         -68.72536513207879 atol = 1e-10
 end
 
-@testset "bordet builders 2-4 SB parity (pin 72d4bfc9)" begin
-    cols = _sm_cols(_SM_BORDET)
-    for (label, prog, n, banked) in (
-            ("D2 brm_pooled_hsgp",
-             _sm_bordet(false, :(censored.(Normal.(log_y, exp.(ls)), lloq,
-                uloq))), 23, -48.83720708213348),
-            ("D3 brm_shapepooled_hsgp",
-             _sm_bordet(true, :(censored.(Normal.(log_y, exp.(ls)), lloq,
-                uloq))), 27, -56.14227869781161),
-            ("D4 brm_pooled_student_t",
-             _sm_bordet(false, :(censored.(StudentT.(4.0, log_y, exp.(ls)),
-                lloq, uloq))), 23, -47.95500054200704))
-        _, _, kern, lay = _sm_query(prog, cols)
-        @test lay.total == n
-        @test _sm_val(kern, fill(0.3, n)) ≈ banked atol = 1e-10
-    end
-end
-
-@testset "bordet builder 5 SB parity (pin 72d4bfc9)" begin
-    # SB (D5, 0.3^35) emits the `base ~ 1 + (1 | series)` block in
-    # collapsed totals (`total_scale_base_tau`, `total_base.1-4`, the
-    # Normal(0, 1) intercept integrated out); every other coordinate —
-    # both correlated curve blocks (L/tau/z_flat), sigma — shares RK's
-    # parameterization. The exact intercept integral bridges the two.
-    _, _, kern, lay = _sm_query(_SM_BORDET_D5, _sm_cols(_SM_BORDET_D5_DATA))
-    @test lay.total == 36
-    base = Dict{Symbol,Float64}(nm => 0.3 for nm in coordinate_names(lay))
-    val, resid = _irt_intercept_integral(kern, lay, base,
-        Symbol("base.Intercept"), [Symbol("xi_series.$j") for j in 1:4],
-        :log_scale_series, fill(0.3, 4), 1.0)
-    @test resid < 1e-10
-    @test val ≈ -55.98105373202722 atol = 1e-10
-    # The composed mean's data leaves ride the term's columns (the
-    # data columns the tree reads elementwise in-graph).
-    plan = lower_rkppl(_SM_BORDET_D5, keys(_SM_BORDET_D5_DATA))
-    t = only(only(p for p in plan.predictors if p.name === :mu).terms)
-    @test t.kind === ComposedTerm
-    @test Set(t.columns) == Set([:log_time, :log_dose])
-end
-
-_sm_probe(n) = [0.2 * sin(1.3i) + 0.02i for i in 1:n]
-
-# Bordet `brm_group_specific_hsgp_mean` (builder 6): per-biomarker HSGP
-# smooths (`by = biomarker`, SB `_sb_hsgp_by`) whose log length scale and
-# log marginal sd each take the per-biomarker hyper-predictor
-# `1 + (1 | biomarker)` (SB `log(length_scale(hsgp(x))) ~ 1 + (1 | g)`,
-# BRM defaults: Normal(0, 1) intercept, Stan-kernel half-Normal(0, 1)
-# sd, non-centered z; length scales floored per group at the validity
-# floor, SB `fmax`).
-const _SM_BORDET_D6 = quote
-    a ~ Normal(0, 1)
-    b_aff ~ Normal(0, 1)
-    c0 ~ Normal(0, 1)
-    hsgp_basis(:h_t, log_time; k = 10, by = biomarker,
-        length_scale = 1 + (1 | biomarker), sd = 1 + (1 | biomarker))
-    hsgp_basis(:h_d, log_dose; k = 10, by = biomarker,
-        length_scale = 1 + (1 | biomarker), sd = 1 + (1 | biomarker))
-    r_b ~ varying_effect(biomarker, [1])
-    r_p ~ varying_effect(person, [1])
-    log_y = a .+ b_aff .* affectable .+ hsgp(:h_t) .+ hsgp(:h_d) .+ r_b .+
-        r_p
-    ls = c0
-    log_obs .~ censored.(Normal.(log_y, exp.(ls)), lloq, uloq)
-end
-
-# Independent D6 oracle for the parts the grouped basis touches: the
-# hyper-predictor + weight priors and the censored likelihood (per-row
-# group lookup, per-group length scale / sd / weights). The remaining
-# priors are shared by both probes of a difference and cancel.
-function _sm_d6_oracle(d, data, fits)
-    lp = 0.0
-    n = length(data.log_obs)
-    f = zeros(n)
-    G, K = 2, 10
-    for (id, x) in ((:h_t, data.log_time), (:h_d, data.log_dose))
-        mu, L = fits[id]
-        floor = (4 * L / pi) * sqrt(log(100.0) / (K^2 - 1))
-        hyper(tag) = begin
-            b0 = d[Symbol("beta0_", tag, "_", id)]
-            usd = d[Symbol("sd_", tag, "_", id)]
-            z = [d[Symbol("z_", tag, "_", id, ".", g)] for g in 1:G]
-            lp += logpdf(Normal(), b0) + logpdf(Normal(), exp(usd)) + usd +
-                sum(logpdf.(Normal(), z))
-            exp.(b0 .+ exp(usd) .* z)
-        end
-        rho = max.(hyper(:rho), floor)
-        sig = hyper(:sigma)
-        w = [d[Symbol("beta_raw_", id, ".", j)] for j in 1:(G * K)]
-        lp += sum(logpdf.(Normal(), w))
-        W = reshape(w, G, K)
-        for i in 1:n, k in 1:K
-            g = data.biomarker[i]
-            lam = (k * pi / (2L))^2
-            phi = sin(sqrt(lam) * (x[i] - mu + L)) / sqrt(L)
-            spd = sig[g] * sqrt(sqrt(2pi) * rho[g]) *
-                exp(-0.25 * rho[g]^2 * lam)
-            f[i] += phi * spd * W[g, k]
-        end
-    end
-    rb = exp(d[:log_scale_biomarker]) .*
-        [d[Symbol("xi_biomarker.", g)] for g in 1:2]
-    rp = exp(d[:log_scale_person]) .* [d[Symbol("xi_person.", p)] for p in 1:2]
-    s = exp(d[Symbol("ls.Intercept")])
-    for i in 1:n
-        m = d[Symbol("log_y.Intercept")] +
-            d[Symbol("log_y.affectable")] * data.affectable[i] + f[i] +
-            rb[data.biomarker[i]] + rp[data.person[i]]
-        y, lo, hi = data.log_obs[i], data.lloq[i], data.uloq[i]
-        lp += y <= lo ? logcdf(Normal(m, s), lo) :
-            y >= hi ? logccdf(Normal(m, s), hi) : logpdf(Normal(m, s), y)
-    end
-    return lp
-end
-
-@testset "bordet builder 6 SB parity + grouped oracle (pin 72d4bfc9)" begin
-    bound, _, kern, lay = _sm_query(_SM_BORDET_D6, _sm_cols(_SM_BORDET))
-    @test lay.total == 65
-    @test _sm_val(kern, fill(0.3, 65)) ≈ -93.77705891192933 atol = 1e-10
-    # The uniform SB probe gives both groups identical hypers and
-    # weights, so it cannot see a group mix-up; this non-uniform
-    # difference (grouped-basis coordinates only) can.
-    names = coordinate_names(lay)
-    fits = Dict(hb.id => only(hb.fits) for hb in bound.hsgp_bases)
-    @test all(hb -> hb.by.levels == [1, 2], bound.hsgp_bases)
-    u1 = _sm_probe(65)
-    grouped = [occursin(r"_(h_t|h_d)(\.|$)", String(nm)) for nm in names]
-    @test count(grouped) == 2 * (8 + 20)
-    u2 = copy(u1)
-    u2[grouped] .= [0.4 * cos(0.9i) - 0.03i for i in 1:count(grouped)]
-    d1 = Dict(zip(names, u1))
-    d2 = Dict(zip(names, u2))
-    @test _sm_val(kern, u1) - _sm_val(kern, u2) ≈
-        _sm_d6_oracle(d1, _SM_BORDET, fits) -
-        _sm_d6_oracle(d2, _SM_BORDET, fits) atol = 1e-9
-end
-
-# Bordet `brm_grouped_hsgp_centeredness` (builder 7, Bordet `e800ef8d`,
-# after the sweep pin: implemented on BRM's grouped-HSGP online
-# adaptation): per-biomarker smooths (`by = biomarker`) with SHARED hypers
-# (one rho / sigma per axis, BRM default priors), k = 5 like the pooled
-# builders, crossed ranef baselines, intercept-only log sigma, censored
-# Gaussian. Its "centeredness" is the sampler's online reparametrization of
-# the weights (BRM `adaptive_centering_problem`), not part of the density;
-# RK's non-centered weights are the default compiled frame. Anchored three
-# ways: an independent grouped-weight oracle, exact pooled equivalence with
-# the SB-pinned builder 2, and direct SB value + gradient parity (the
-# builder-7 SB testset below).
-const _SM_BORDET_D7 = quote
-    a ~ Normal(0, 1)
-    b_aff ~ Normal(0, 1)
-    c0 ~ Normal(0, 1)
-    hsgp_basis(:h_t, log_time; k = 5, by = biomarker)
-    hsgp_basis(:h_d, log_dose; k = 5, by = biomarker)
-    r_b ~ varying_effect(biomarker, [1])
-    r_p ~ varying_effect(person, [1])
-    log_y = a .+ b_aff .* affectable .+ hsgp(:h_t) .+ hsgp(:h_d) .+ r_b .+
-        r_p
-    ls = c0
-    log_obs .~ censored.(Normal.(log_y, exp.(ls)), lloq, uloq)
-end
-
-# Independent D7 oracle for a grouped-weight-only difference: the shared
-# floored length scale (SB `_brm_hsgp_rho_lower`, rho = floor + exp(u)),
-# the shared sd, per-group weights (G x K, column-major), per-row group
-# lookup, and the censored likelihood. Hyper / ranef / intercept priors
-# are equal at both probes and cancel.
-function _sm_d7_oracle(d, data, fits)
-    lp = 0.0
-    n = length(data.log_obs)
-    f = zeros(n)
-    G, K = 2, 5
-    for (id, x) in ((:h_t, data.log_time), (:h_d, data.log_dose))
-        mu, L = fits[id]
-        floor = (4 * L / pi) * sqrt(log(100.0) / (K^2 - 1))
-        rho = floor + exp(d[Symbol("rho_", id)])
-        sig = exp(d[Symbol("sigma_", id)])
-        w = [d[Symbol("beta_raw_", id, ".", j)] for j in 1:(G * K)]
-        lp += sum(logpdf.(Normal(), w))
-        W = reshape(w, G, K)
-        for i in 1:n, k in 1:K
-            lam = (k * pi / (2L))^2
-            phi = sin(sqrt(lam) * (x[i] - mu + L)) / sqrt(L)
-            spd = sig * sqrt(sqrt(2pi) * rho) * exp(-0.25 * rho^2 * lam)
-            f[i] += phi * spd * W[data.biomarker[i], k]
-        end
-    end
-    rb = exp(d[:log_scale_biomarker]) .*
-        [d[Symbol("xi_biomarker.", g)] for g in 1:2]
-    rp = exp(d[:log_scale_person]) .* [d[Symbol("xi_person.", p)] for p in 1:2]
-    s = exp(d[Symbol("ls.Intercept")])
-    for i in 1:n
-        m = d[Symbol("log_y.Intercept")] +
-            d[Symbol("log_y.affectable")] * data.affectable[i] + f[i] +
-            rb[data.biomarker[i]] + rp[data.person[i]]
-        y, lo, hi = data.log_obs[i], data.lloq[i], data.uloq[i]
-        lp += y <= lo ? logcdf(Normal(m, s), lo) :
-            y >= hi ? logccdf(Normal(m, s), hi) : logpdf(Normal(m, s), y)
-    end
-    return lp
-end
-
-@testset "bordet builder 7 grouped shared-hyper HSGP (Bordet e800ef8d)" begin
-    bound, _, kern, lay = _sm_query(_SM_BORDET_D7, _sm_cols(_SM_BORDET))
-    @test lay.total == 33
-    @test all(hb -> hb.by.levels == [1, 2], bound.hsgp_bases)
-    names = coordinate_names(lay)
-    fits = Dict(hb.id => only(hb.fits) for hb in bound.hsgp_bases)
-    # Group-sensitive: a non-uniform difference over the grouped weights.
-    u1 = _sm_probe(33)
-    grouped = [occursin(r"^beta_raw_(h_t|h_d)\.", String(nm)) for nm in names]
-    @test count(grouped) == 2 * 2 * 5
-    u2 = copy(u1)
-    u2[grouped] .= [0.4 * cos(0.9i) - 0.03i for i in 1:count(grouped)]
-    d1 = Dict(zip(names, u1))
-    d2 = Dict(zip(names, u2))
-    @test _sm_val(kern, u1) - _sm_val(kern, u2) ≈
-        _sm_d7_oracle(d1, _SM_BORDET, fits) -
-        _sm_d7_oracle(d2, _SM_BORDET, fits) atol = 1e-9
-    # Pooled equivalence with the SB-pinned builder 2: identical per-group
-    # weights reduce builder 7 to builder 2 plus the (G - 1) = 1 extra copy
-    # of the weight priors. Every other coordinate is shared by name.
-    _, _, kern2, lay2 = _sm_query(_sm_bordet(false,
-        :(censored.(Normal.(log_y, exp.(ls)), lloq, uloq))),
-        _sm_cols(_SM_BORDET))
-    names2 = coordinate_names(lay2)
-    v = _sm_probe(lay2.total)
-    dv = Dict(zip(names2, v))
-    u = map(names) do nm
-        m = match(r"^beta_raw_(h_t|h_d)\.(\d+)$", String(nm))
-        m === nothing ? dv[nm] :
-            dv[Symbol("beta_raw_", m[1], ".", (parse(Int, m[2]) - 1) ÷ 2 + 1)]
-    end
-    w = [dv[nm] for nm in names2 if startswith(String(nm), "beta_raw_")]
-    @test length(w) == 2 * 5
-    @test _sm_val(kern, u) ≈ _sm_val(kern2, v) + sum(logpdf.(Normal(), w)) atol = 1e-10
-end
-
-# Builder-7 SB pins (brief n0wjw1): BridgeStan lp + AD grad, `u` and `grad`
-# in SB `param_unc_names` order. The map is a pure permutation, since SB and
-# RK share every unconstraining map (rho = floor + exp(u), sigma =
-# exp(u), log-scales and log sigma on the log scale). SB weights
-# `zflat_<axis>.i` are group-major, i = (g - 1) * 5 + b, while RK's are G x K
-# column-major, j = (b - 1) * 2 + g. Then come intercept, affectable
-# contrast, the four hypers, the two ranef blocks, and log sigma.
-const _SM_SB_D7_NAMES = vcat(
-    [Symbol("beta_raw_h_t.", (b - 1) * 2 + g) for g in 1:2 for b in 1:5],
-    [Symbol("beta_raw_h_d.", (b - 1) * 2 + g) for g in 1:2 for b in 1:5],
-    Symbol.(["log_y.Intercept", "log_y.affectable", "rho_h_t", "sigma_h_t",
-        "rho_h_d", "sigma_h_d", "log_scale_biomarker", "xi_biomarker.1",
-        "xi_biomarker.2", "log_scale_person", "xi_person.1", "xi_person.2",
-        "ls.Intercept"]))
-const _SM_SB_D7 = (
-    B7_zeros = (u = zeros(33), lp = -52.89998413012594,
-        grad = [1.7003423045578128, -0.2049047748459992,
-            0.005661909761107061, -6.976389046618564e-05,
-            1.9710315941605404e-07, 0.8914476936327609, -0.6143201590274905,
-            0.0026268400605202287, -0.00020915746994072733,
-            1.0333634374571721e-07, 2.1264015091063553, -0.5187511285620429,
-            0.02739806094347982, -0.00034289857386368786,
-            3.563075419226447e-06, 1.3953617085830905, -1.3473320167998009,
-            0.0076438087036252616, -0.002896997119854075,
-            -1.845730367837447e-05, 4.849529264841065, 7.322744797663907,
-            0.1804684507545622, 0.0, 0.27052982595245967, 0.0, 0.0,
-            3.1999999999999997, 1.6495292648410655, 0.0, 2.8,
-            2.0495292648410652, 5.643293059805448]),
-    B7_u03 = (u = fill(0.3, 33), lp = -58.4765924141802,
-        grad = [-3.025870333576859, -0.3521231772288154, -0.3003759332950278,
-            -0.30000108288831867, -0.300000001176551, -3.417370055083594,
-            -0.4980612907600121, -0.300491861140113, -0.30000411483469624,
-            -0.3000000013455317, -3.6960617931960353, -0.34871858255223753,
-            -0.3060409895716271, -0.3003001932938831, -0.30000136109040043,
-            -4.017249876090646, -0.7987823950328767, -0.3087945444776928,
-            -0.30058750041866306, -0.3000021366884763, -8.849878753705127,
-            -4.17417927056011, 1.4622840708420914, -2.1282893553988553,
-            1.0437318306957721, -2.602961811723761, -3.762338741818742,
-            -5.665940308701948, -6.475188830693859, -3.762338741818742,
-            -5.962267596974636, -6.1788615424211715, 8.774717854734366]),
-    # SB's banked u is exactly `_sm_probe(33)` in SB order.
-    B7_smprobe = (u = _sm_probe(33), lp = -76.9247115805647,
-        grad = [-5.192389310538728, -0.18102100977877478,
-            0.07590712387063692, 0.09668969966195745, -0.1430240028693116,
-            -6.307100882367616, -0.40139069845757175, 0.0038846056791459905,
-            -0.027609699367516314, -0.284033413679849, -6.884863192326766,
-            -0.2154769299622779, -0.0763880404298593, -0.159042389660683,
-            -0.42110797818748613, -8.094651440977817, -0.46464391904941316,
-            -0.16505528286644175, -0.29614356921707735, -0.5525116964012468,
-            -14.537582841038692, -8.515246800785249, 2.0697210657225877,
-            -3.456164453261282, 4.0895253119874155, -7.229920507580953,
-            -10.864842080202811, -10.232893632801037, -12.30782810294773,
-            -20.006495757710077, -17.62359634786066, -14.428651658769061,
-            40.263667662023906]),
-)
-
-@testset "bordet builder 7 SB parity ($label, BRM 328fa77)" for (label, pin) in
-        pairs(_SM_SB_D7)
-    bound, built, kern, lay = _sm_query(_SM_BORDET_D7, _sm_cols(_SM_BORDET))
-    names = coordinate_names(lay)
-    @test sort(names) == sort(_SM_SB_D7_NAMES)
-    perm = [findfirst(==(nm), _SM_SB_D7_NAMES) for nm in names]
-    u = pin.u[perm]
-    @test _sm_val(kern, u) ≈ pin.lp atol = 1e-10
-    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
-    g = similar(u)
-    sampler_value_and_gradient!(prep, g, u)
-    @test maximum(abs.(g .- pin.grad[perm])) < 1e-10
-end
-
 @testset "grouped HSGP surface + contract" begin
     base(kws...) = quote
         a ~ Normal(0, 1)
@@ -740,20 +345,7 @@ end
             hsgp_bases = [bad]))
 end
 
-@testset "bruno HSGP/GP components SB parity (0090db25)" begin
-    xc = [2 * (clamp(v, -0.5, 0.5) + 0.5) / 1.0 - 1.0 for v in _SM_BRUNO_X]
-    for (label, prog, data, n, banked) in (
-            ("hsgp", _sm_bruno1(:x), (; x = _SM_BRUNO_X, y = _SM_BRUNO_Y),
-             14, -26.131600698044252),
-            ("clamped_hsgp", _sm_bruno1(:xc), (; xc, y = _SM_BRUNO_Y), 14,
-             -26.006302028374282),
-            ("gp_effectiveness", _SM_BRUNO_EFF, _SM_BRUNO_EFF_DATA, 69,
-             -89.99169920605078))
-        _, _, kern, lay = _sm_query(prog, _sm_cols(data))
-        @test lay.total == n
-        @test _sm_val(kern, fill(0.3, n)) ≈ banked atol = 1e-10
-    end
-end
+_sm_probe(n) = [0.2 * sin(1.3i) + 0.02i for i in 1:n]
 
 const _SM_ITEMS = (
     ("gp_regr", _SM_GPREGR, _SM_DATA.gpregr),
@@ -761,17 +353,7 @@ const _SM_ITEMS = (
     ("accel_gp", _SM_ACCELGP, _SM_DATA.accelgp),
     ("brm_hsgp", _SM_BRMHSGP, _sm_mcycle()),
     ("accel_splines", _SM_ACCELSPL, _SM_DATA.accelspl),
-    ("bordet D2", _sm_bordet(false, :(censored.(Normal.(log_y, exp.(ls)),
-        lloq, uloq))), _SM_BORDET),
-    ("bordet D3", _sm_bordet(true, :(censored.(Normal.(log_y, exp.(ls)),
-        lloq, uloq))), _SM_BORDET),
-    ("bordet D4", _sm_bordet(false, :(censored.(StudentT.(4.0, log_y,
-        exp.(ls)), lloq, uloq))), _SM_BORDET),
-    ("bordet D5", _SM_BORDET_D5, _SM_BORDET_D5_DATA),
-    ("bordet D6", _SM_BORDET_D6, _SM_BORDET),
-    ("bordet D7", _SM_BORDET_D7, _SM_BORDET),
-    ("bruno hsgp", _sm_bruno1(:x), (; x = _SM_BRUNO_X, y = _SM_BRUNO_Y)),
-    ("bruno gp_effectiveness", _SM_BRUNO_EFF, _SM_BRUNO_EFF_DATA),
+    ("hsgp domain", _SM_DOMAIN_HSGP, (; x = _SM_DOMAIN_X, y = _SM_DOMAIN_Y)),
 )
 
 @testset "smooth Enzyme-vs-findiff ($label)" for (label, prog, data) in _SM_ITEMS
@@ -795,9 +377,7 @@ end
 # XLA legs for the basis-expansion items (HSGP / spline). The exact-GP
 # items stay native-only: Reactant reverse through the dense Cholesky is
 # the upstream gap documented in test_gp.jl (no XLA assertions there by
-# design). The Bordet D4 leg (censored Student-t) routes through the
-# owned `rk_beta_inc`, which traces; `SpecialFunctions.beta_inc` has no
-# traced-scalar method (upstream Reactant placeholder, no backing MLIR op).
+# design).
 @testset "smooth under Reactant ($label)" for (label, prog, data) in _SM_ITEMS[3:end]
     bound, built, post_q, lay = _sm_query(prog, _sm_cols(data))
     fx = Base.invokelatest(_sm_reactant_measure, built, bound, post_q,

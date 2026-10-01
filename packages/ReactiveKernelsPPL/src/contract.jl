@@ -1201,7 +1201,7 @@ const _EVENT_LP_SLOPE_PRIOR_SD = 0.6676
 
 """V2 event-LP length-scale prior upper bound (SB
 `length_scale(:, hsgp(op_log_dose)) ~ Uniform(lower, 2.0)` — the
-varyingsource4 upper bound, verbatim)."""
+reference model's upper bound, verbatim)."""
 const _EVENT_LP_RHO_PRIOR_HI = 2.0
 
 """The fixed event-LP provider name (the SB seam name — the
@@ -6220,7 +6220,7 @@ end
 
 const _COMPOSED_OPS = (:.*, :.+, :.-)
 # Elementwise unary maps admitted over a composed subtree (`exp.(la)` —
-# the IRT discrimination `a = exp(log_a)`; `logistic.(xi)` — the Bordet
+# the IRT discrimination `a = exp(log_a)`; `logistic.(xi)` — sigmoid
 # transient/saturating curves), spelled as Julia dotted calls.
 const _COMPOSED_UNARY = (:exp, :logistic)
 const _COMPOSED_AFFINE_KINDS =

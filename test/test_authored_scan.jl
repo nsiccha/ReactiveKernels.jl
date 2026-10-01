@@ -361,3 +361,223 @@ end
     @test _authored_scan_allocated(lockstep, pd, conc, dts) <
         _authored_scan_allocated(packed, pd, conc, dts)
 end
+
+# The same trajectory with the initial value inside the scan: one n + 1 buffer,
+# `[pd.baseline, R₁, …, Rₙ]`, instead of the per-step vector plus a `vcat` copy.
+@kernel authored_scan_turnover_init(pd, conc_mid::Vector{Float64}, dts::Vector{Float64}) = begin
+    kin = pd.baseline * pd.kout
+    trajectory = scan(conc_mid, dts, Ref(pd), Ref(kin);
+            init = pd.baseline, include_init = true) do previous, concentration, dt, parameters, input_rate
+        c2 = parameters.kout * (1 + concentration /
+            (parameters.theta1 * concentration + parameters.theta2))
+        steady = input_rate / c2
+        next = (previous - steady) * exp(-c2 * dt) + steady
+        (next, next)
+    end
+    return trajectory
+end
+
+@testset "an init-including scan writes [init, outputs...] into one buffer" begin
+    pd = (; baseline = 100.0, kout = 0.3, theta1 = 1.2, theta2 = 40.0)
+    included = prepare(authored_scan_turnover_init)
+    concatenated = prepare(authored_scan_turnover)
+    for n in (0, 1, 2, 40)
+        conc, dts = abs.(sin.(1:n)) .* 50, fill(0.1, n)
+        @test included(pd, conc, dts) == concatenated(pd, conc, dts)
+        @test length(included(pd, conc, dts)) == n + 1
+        bound = prepare(authored_scan_turnover_init; bound = (; conc_mid = conc, dts))
+        @test bound(pd) == concatenated(pd, conc, dts)
+    end
+    @test included(pd, Float64[], Float64[]) == [pd.baseline]
+    @test only(Base.return_types(included,
+        Tuple{typeof(pd),Vector{Float64},Vector{Float64}})) == Vector{Float64}
+    # The trajectory is the only allocation: the per-step form's one buffer plus
+    # its seed slot, with no second vector for the vcat copy.
+    conc, dts = abs.(sin.(1:400)) .* 50, fill(0.1, 400)
+    per_step = prepare(authored_scan_turnover; want = :updated)
+    included(pd, conc, dts); concatenated(pd, conc, dts); per_step(pd, conc, dts)
+    @test _authored_scan_allocated(included, pd, conc, dts) <=
+        _authored_scan_allocated(per_step, pd, conc, dts) + 64
+    @test _authored_scan_allocated(concatenated, pd, conc, dts) >=
+        2 * _authored_scan_allocated(per_step, pd, conc, dts) - 64
+
+    # The element type is the seed's and the outputs' promotion, as the vcat's.
+    @kernel int_seed_scan(xs) = begin
+        cumulative = scan(xs; init = 0, include_init = true) do carry, x
+            next = carry + x
+            (next, next)
+        end
+        return cumulative
+    end
+    seeded = prepare(int_seed_scan)
+    @test seeded([0.5, 1.0]) == [0.0, 0.5, 1.5]
+    @test seeded([0.5, 1.0]) isa Vector{Float64}
+    @test seeded([1, 2]) == [0, 1, 3] && seeded([1, 2]) isa Vector{Int}
+    @test seeded(Float64[]) == [0.0] && seeded(Float64[]) isa Vector{Float64}
+    @test seeded(Int[]) == [0] && seeded(Int[]) isa Vector{Int}
+
+    # `include_init = false` is the default per-step form.
+    @kernel explicit_default_scan(xs) = begin
+        cumulative = scan(xs; init = 0.0, include_init = false) do carry, x
+            next = carry + x
+            (next, next)
+        end
+        return cumulative
+    end
+    @test prepare(explicit_default_scan)([1.0, 2.0]) == [1.0, 3.0]
+
+    # A reducing plate over the trajectory sees the seed too (no streaming fusion).
+    @kernel included_scan_consumer(xs, offset::Float64) = begin
+        cumulative = scan(xs; init = 1.0, include_init = true) do carry, x
+            next = carry + x
+            (next, next)
+        end
+        pointwise = plate(cumulative, offset) do x, o
+            x + o
+        end
+        return sum(pointwise)
+    end
+    @test prepare(included_scan_consumer)([1.0, 2.0], 0.5) == sum([1.0, 2.0, 4.0] .+ 0.5)
+    @test prepare(included_scan_consumer)(Float64[], 0.5) == 1.5
+
+    # Position batching runs the scan operation rather than the inlined loop.
+    @kernel positioned_included_scan(xs::Vector{Float64}, position::Float64) = begin
+        values = scan(xs, Ref(position); init = position, include_init = true) do carry, x, p
+            next = carry + p * x
+            (next, next)
+        end
+        total::Float64 = sum(values)
+        return total
+    end
+    batch = vectorize(positioned_included_scan; batched = :position, want = :total)
+    @test batch(Float64[], [1.0, 2.0]) == [1.0, 2.0]
+    @test batch([1.0, 2.0], [1.0, 2.0]) == [1.0 + 2.0 + 4.0, 2.0 + 4.0 + 8.0]
+
+    @test_throws "must be the literal `true` or `false`" (@eval @kernel nonliteral_scan(
+            xs, flag) = begin
+        s = scan(xs; init = 0.0, include_init = flag) do carry, x
+            (carry + x, carry + x)
+        end
+        return s
+    end)
+    @test_throws "accepts only the `init =`, `include_init =` and `history =` keywords" (
+        @eval @kernel unknown_keyword_scan(xs) = begin
+        s = scan(xs; init = 0.0, reverse = true) do carry, x
+            (carry + x, carry + x)
+        end
+        return s
+    end)
+end
+@testset "a history scan reads its own earlier outputs" begin
+    F = AuthoredScanFixtures
+    amounts = [2.0, 0.0, 1.5, 3.0, 1.0]
+    plan = F.HistoryLattice([0, 2, 3, 7, 12])     # later lags run past `units`
+    units = [exp(-0.3 * (l - 1)) for l in 1:10]
+    expected = F._authored_scan_history_reference(amounts, plan, units)
+    weights = prepare(F.authored_scan_history)
+    # The generator sum folds in the hand loop's order, so the values are bitwise.
+    @test weights(amounts, plan, units) == expected
+    @test prepare(F.authored_scan_history; want = :total)(amounts, plan, units) ==
+        sum(expected)
+    @test only(Base.return_types(weights,
+        Tuple{Vector{Float64},F.HistoryLattice,Vector{Float64}})) == Vector{Float64}
+    # The step reads the result vector itself: nothing is allocated beside it.
+    _authored_scan_allocated(weights, amounts, plan, units)
+    _authored_scan_allocated(similar, amounts)
+    @test _authored_scan_allocated(weights, amounts, plan, units) ==
+        _authored_scan_allocated(similar, amounts)
+    # The op called outside a generated body (the host lowering) agrees.
+    recipe = only(r for r in weights.plan.recipes
+                  if r.op isa ReactiveKernels._AuthoredScanOp)
+    @test recipe.op(0, amounts, eachindex(amounts), plan, units, 0.0) == expected
+
+    # No step runs on an empty sequence: an empty vector of the history's type.
+    empty = weights(Float64[], F.HistoryLattice(Int[]), units)
+    @test empty == Float64[] && empty isa Vector{Float64}
+    @test prepare(F.authored_scan_history; want = :total)(
+        Float64[], F.HistoryLattice(Int[]), units) === 0.0
+
+    # Entries at and after the current step read the history value.
+    xs = [1.0, 2.0, 3.0]
+    buffer = fill(-1.0, 3)
+    for j in eachindex(xs)
+        buffer[j] = xs[j] + sum(buffer)
+    end
+    @test prepare(F.authored_scan_history_ahead)(xs) == buffer
+
+    # A position batch runs the history scan at every position.
+    U = [exp(-0.3 * (l - 1)) * s for l in 1:10, s in (1.0, 0.5, 2.0)]
+    batch = vectorize(F.authored_scan_history; batched = :units, want = :weights)
+    @test batch(amounts, plan, U) == reduce(hcat,
+        [F._authored_scan_history_reference(amounts, plan, U[:, s]) for s in 1:3])
+end
+
+@testset "history scan contract" begin
+    escape = @kernel escape_history(xs::Vector{Float64}) = begin
+        ys = scan(xs; init = 0.0, history = 0.0) do carry, x, earlier
+            (earlier, x)
+        end
+        return ys
+    end
+    # The native history aliases the vector the scan is still writing.
+    @test_throws ArgumentError prepare(escape)([1.0, 2.0])
+    @test_throws CanonicalIndexError (ReactiveKernels._ScanHistory([1.0])[1] = 2.0)
+    nonnumber = @kernel nonnumber_history(xs::Vector{Float64}) = begin
+        ys = scan(xs; init = 0.0, history = [0.0]) do carry, x, earlier
+            (carry, x)
+        end
+        return ys
+    end
+    @test_throws ArgumentError prepare(nonnumber)([1.0])
+    # Outputs are stored as the history value's type.
+    converted = @kernel converted_history(xs::Vector{Float64}) = begin
+        ys = scan(xs; init = 0, history = 0.0) do carry, x, earlier
+            (carry + 1, carry + 1)
+        end
+        return ys
+    end
+    @test prepare(converted)([5.0, 6.0]) == [1.0, 2.0]
+    @test prepare(converted)([5.0, 6.0]) isa Vector{Float64}
+
+    # The history is the do-block's last argument, after the shared operands.
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel missing_history(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, history = 0.0) do carry, x
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel twice_history(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, history = 0.0, history = 1.0) do carry, x, earlier
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel history_with_init(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, include_init = true, history = 0.0) do carry, x, earlier
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel unknown_keyword(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, buffer = 0.0) do carry, x, earlier
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+end
+
+@testset "a scan shares host structs by Ref" begin
+    F = AuthoredScanFixtures
+    xs = [1.0, 2.0, 3.0]
+    plan, cfg = F.HistoryLattice([1, 5, 9]), (; W = [2.0 0.0; 0.0 3.0], m = 2)
+    expected = cumsum([xs[j] * plan.shifts[j] + 5.0 * xs[j] for j in eachindex(xs)])
+    @test prepare(F.authored_scan_host_shared)(xs, plan, cfg) == expected
+end

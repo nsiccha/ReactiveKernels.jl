@@ -1776,10 +1776,14 @@ end
 # per-step element drawn from the single non-`Ref` positional `xs`, and any
 # further formals are `Ref`-wrapped shared/atomic operands (broadcast-invariant,
 # exactly like plate's atomic args).  The do-block returns the 2-tuple
-# `(new_carry, output)`; `scan` returns the vector `[output…]`.  The step is an
+# `(new_carry, output)`; `scan` returns the vector `[output…]`, or, with the
+# literal `include_init = true`, `[init, output…]` in one buffer.  The step is an
 # ordinary TWO-`want` KernelSpec (`want = (:new_carry, :output)`); the native
 # path runs the plain ordered loop (already Reactant-unsafe only via scalar
 # indexing, which the tensorized lowering avoids by emitting a `stablehlo.while`).
+# With `history = h0` the do-block takes one more, LAST formal: the read-only
+# vector of the outputs so far (`h0` at and after the current step); `h0` is
+# the op's last argument, atomic like the carry seed.
 function _kernel_authored_scan_expr(rhs, mod)
     rhs isa Expr && rhs.head === :do && length(rhs.args) == 2 || return nothing
     call, lambda = rhs.args
@@ -1797,26 +1801,48 @@ function _kernel_authored_scan_expr(rhs, mod)
     length(unique(formals)) == length(formals) || throw(ArgumentError(
         "scan do-block argument names must be unique"))
 
-    # Split the call into positional operands and the required `init =` carry seed.
+    # Split the call into positional operands, the required `init =` carry seed
+    # and the optional `include_init =` literal and `history =` fill value.
     positional = Any[]
-    init_expr = nothing
+    keywords = Dict{Symbol,Any}()
+    _scan_keyword!(kw) = begin
+        (kw isa Expr && kw.head === :kw &&
+         kw.args[1] in (:init, :include_init, :history)) || throw(ArgumentError(
+            "scan accepts only the `init =`, `include_init =` and `history =` keywords"))
+        haskey(keywords, kw.args[1]) && throw(ArgumentError(
+            "scan received the `$(kw.args[1]) =` keyword twice"))
+        keywords[kw.args[1]] = kw.args[2]
+    end
     for arg in call.args[2:end]
         if arg isa Expr && arg.head === :parameters
-            for kw in arg.args
-                (kw isa Expr && kw.head === :kw && kw.args[1] === :init) ||
-                    throw(ArgumentError("scan accepts only an `init =` keyword"))
-                init_expr = kw.args[2]
-            end
-        elseif arg isa Expr && arg.head === :kw && arg.args[1] === :init
-            init_expr = arg.args[2]
+            foreach(_scan_keyword!, arg.args)
+        elseif arg isa Expr && arg.head === :kw
+            _scan_keyword!(arg)
         else
             push!(positional, arg)
         end
     end
+    init_expr = get(keywords, :init, nothing)
     init_expr === nothing && throw(ArgumentError("scan requires an `init =` carry seed"))
-    length(positional) == length(formals) - 1 || throw(ArgumentError(
-        "scan received $(length(positional)) positional argument(s), but its do-block has " *
-        "$(length(formals) - 1) non-carry parameter(s) (x, shared...)"))
+    include_init = get(keywords, :include_init, false)
+    include_init isa Bool || throw(ArgumentError(
+        "scan's `include_init` must be the literal `true` or `false`: it " *
+        "fixes the result's length (n + 1 or n) when the kernel is defined"))
+    history_expr = get(keywords, :history, nothing)
+    history = history_expr !== nothing
+    include_init && history && throw(ArgumentError(
+        "scan's `include_init = true` and `history =` cannot be combined: the " *
+        "history is the result vector itself, whose entries are the step outputs"))
+    if history
+        length(positional) == length(formals) - 2 || throw(ArgumentError(
+            "scan with `history =` received $(length(positional)) positional argument(s), " *
+            "but its do-block has $(length(formals) - 2) parameter(s) between the carry " *
+            "and the history (x, shared...); the history is the do-block's last argument"))
+    else
+        length(positional) == length(formals) - 1 || throw(ArgumentError(
+            "scan received $(length(positional)) positional argument(s), but its do-block has " *
+            "$(length(formals) - 1) non-carry parameter(s) (x, shared...)"))
+    end
 
     # The scan op's outer arguments are (carry-seed, xs..., shared...); the carry
     # seed and every `Ref`-wrapped shared operand are atomic (broadcast-invariant),
@@ -1862,6 +1888,7 @@ function _kernel_authored_scan_expr(rhs, mod)
             _push_operand!(operand, false)              # iterated sequence (non-atomic)
         end
     end
+    history && _push_operand!(history_expr, true)       # last: the history fill (atomic)
 
     # Build the step body's 2-want spec. Its HAVE boundary is the do-block formals
     # (carry, x, shared...); an enclosing port used but not passed is out of scope
@@ -1899,14 +1926,18 @@ function _kernel_authored_scan_expr(rhs, mod)
         step_body, signature, nothing, mod; nested_specs = nested_specs)
     operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_scan),
                      step_spec,
-                     Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))))
+                     Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))),
+                     Expr(:call, GlobalRef(Base, :Val), include_init),
+                     Expr(:call, GlobalRef(Base, :Val), history))
     (; arguments, operation, inferred = nothing, atomic = Tuple(atomic),
        materialized_arguments)
 end
 
-function _kernel_authored_scan(spec::KernelSpec, ::Val{A}) where {A}
+function _kernel_authored_scan(spec::KernelSpec, ::Val{A},
+                               ::Val{I} = Val(false),
+                               ::Val{H} = Val(false)) where {A,I,H}
     kernel = prepare(spec)
-    _AuthoredScanOp{typeof(kernel),A}(kernel)
+    _AuthoredScanOp{typeof(kernel),A,I,H}(kernel)
 end
 
 # A dotted operator such as `.*` is broadcast *syntax*, not a bound function:
@@ -3897,7 +3928,11 @@ function plate(spec::KernelSpec; have, want, batched, reduce = :+)
 end
 
 """
-    scan(xs, ys..., Ref(shared)...; init) do carry, x, y..., shared...
+    scan(xs, ys..., Ref(shared)...; init, include_init = false) do carry, x, y..., shared...
+        …
+        (new_carry, output)
+    end
+    scan(xs, ys..., Ref(shared)...; init, history = h0) do carry, x, y..., shared..., earlier
         …
         (new_carry, output)
     end
@@ -3910,6 +3945,21 @@ lockstep (they must share axes); `init` seeds the threaded `carry`; any trailing
 output)`; `scan` returns the vector `[output…]`. A compound carry may be carried
 as a `NamedTuple` (`init = (; a, b)`, read `carry.a`). Empty sequences run no
 step and return an empty vector of the step's inferred output type.
+
+With the literal `include_init = true`, `scan` returns `[init, output…]`, one
+element longer than the sequences and written into a single buffer: the
+trajectory `[R₀, R₁, …, Rₙ]` of a recurrence whose output is its next carry.
+Its value and element type (`promote_type(typeof(init), output type)`) are
+those of `vcat([init], scan(…; init))` without the second vector; empty
+sequences return `[init]`.
+
+With `history = h0` (a number) the do-block takes one more, last argument: the
+result vector being written, read-only. At step `j` its entry `i` is step `i`'s
+output for `i < j` and `h0` from `j` on, on every backend, so a recurrence over
+all earlier outputs (`sum(earlier[i] * u[j - i] for i in 1:j-1; init = 0.0)`,
+with `j` from a lockstep `eachindex(xs)`) needs no carried copy of them. The
+result's element type is `typeof(h0)`. A carry may not hold the history, and
+`history` cannot be combined with `include_init = true`.
 
 It lowers to an ordinary ordered loop natively, and to a `stablehlo.while` carry
 loop under Reactant — so a natural sequential recurrence lowers without unrolling

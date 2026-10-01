@@ -275,10 +275,18 @@ end
 # calls `_tensorized_scan`, specialized by a backend to a `stablehlo.while`.
 # The op's argument order is fixed by authoring: index 1 = carry seed, index 2 =
 # the sequence `xs`, index 3+ = Ref-shared operands; `A` records the atomic
-# (broadcast-invariant) indices {1, 3, 4, …}.
-struct _AuthoredScanOp{K,A}
+# (broadcast-invariant) indices {1, 3, 4, …}. `I` is the authored
+# `include_init` literal: when `true` the result is `[init, output…]`, one
+# element longer than the sequences, written into one buffer. `H` is true for
+# `history = h0`: then `h0` is the LAST argument (atomic) and the step's last
+# formal reads the outputs written so far.
+struct _AuthoredScanOp{K,A,I,H}
     kernel::K
 end
+_AuthoredScanOp{K,A}(kernel::K) where {K,A} = _AuthoredScanOp{K,A,false,false}(kernel)
+_scan_has_history(::_AuthoredScanOp{K,A,I,H}) where {K,A,I,H} = H
+
+_scan_includes_init(::_AuthoredScanOp{K,A,I}) where {K,A,I} = I
 
 "The transparent scalar step plan captured by an authored `scan(...) do` recipe."
 function scan_body(recipe::Recipe)
@@ -292,13 +300,16 @@ end
 # The iterated sequences are the remaining operand indices (>= 2, not in `A`).
 # Split them at compile time so `_tensorized_scan` receives the sequence tuple and
 # the shared tuple explicitly.
-@generated function (op::_AuthoredScanOp{K,A})(args...) where {K,A}
+@generated function (op::_AuthoredScanOp{K,A,I,H})(args...) where {K,A,I,H}
     n = length(args)
-    n >= 2 || return :(throw(ArgumentError(
+    n >= 2 + H || return :(throw(ArgumentError(
         "an authored scan expects (init, sequence, shared...) arguments")))
-    iterated = Expr(:tuple, (:(args[$i]) for i in 2:n if !(i in A))...)
-    shared = Expr(:tuple, (:(args[$i]) for i in 2:n if i in A)...)
-    :(_tensorized_scan(op.kernel, args[1], $iterated, $shared))
+    last_shared = H ? n - 1 : n
+    iterated = Expr(:tuple, (:(args[$i]) for i in 2:last_shared if !(i in A))...)
+    shared = Expr(:tuple, (:(args[$i]) for i in 2:last_shared if i in A)...)
+    H && return :(_tensorized_scan_history(op.kernel, args[1], args[$n],
+                                           $iterated, $shared))
+    :(_tensorized_scan(op.kernel, args[1], $iterated, $shared, Val($I)))
 end
 
 function _lhs_symbols!(symbols::Set{Symbol}, lhs)
@@ -440,12 +451,16 @@ end
 # PreparedKernel from a loop with a changing carry defeats inference across the
 # RGF boundary; the same step AST and operation table specialize normally here.
 # An empty sequence runs no step: the scan port is an empty vector of the
-# step's output type and a fused plate consumer sums nothing.
+# step's output type and a fused plate consumer sums nothing. An
+# `include_init = true` scan writes the carry seed and then each output into
+# one buffer one element longer than the sequences (`[init]` when empty).
 function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
                                       offset; consumer = nothing)
+    _scan_has_history(op) &&
+        return _lower_authored_scan_history_native!(body, op, callargs, lhs, offset)
     step = op.kernel
-    indices, index, carry, output, output_type = gensym.((:scan_indices,
-        :scan_index, :scan_carry, :scan_output, :scan_output_type))
+    indices, index, carry, output, output_type, position = gensym.((:scan_indices,
+        :scan_index, :scan_carry, :scan_output, :scan_output_type, :scan_position))
     # `A` marks the atomic operands: index 1 (the carry seed) plus the `Ref`
     # shareds.  The iterated sequences are the remaining operand indices; each is
     # indexed by the loop counter per step, while shared operands pass whole.
@@ -479,7 +494,21 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     invariant = Any[]
     initial_output, loop_output, final_output = Expr(:block), Expr(:block), Expr(:block)
     empty_output = Expr(:block, :($output_type = $empty_output_type))
-    if lhs !== nothing
+    if lhs !== nothing && _scan_includes_init(op)
+        seed, similar_ref = callargs[1], GlobalRef(Base, :similar)
+        promote_ref, length_ref = GlobalRef(Base, :promote_type), GlobalRef(Base, :length)
+        push!(initial_output.args, :($lhs = $similar_ref($xs,
+            $promote_ref($typeof_ref($seed), $typeof_ref($output)),
+            $length_ref($indices) + 1)))
+        push!(initial_output.args, :($lhs[1] = $seed))
+        push!(initial_output.args, :($lhs[2] = $output))
+        push!(initial_output.args, :($position = 2))
+        push!(loop_output.args, :($position += 1))
+        push!(loop_output.args, :($lhs[$position] = $output))
+        push!(empty_output.args, :($lhs = $similar_ref($xs,
+            $promote_ref($typeof_ref($seed), $output_type), 1)))
+        push!(empty_output.args, :($lhs[1] = $seed))
+    elseif lhs !== nothing
         push!(initial_output.args, :($lhs = $(GlobalRef(Base, :similar))(
             $xs, $typeof_ref($output))))
         push!(initial_output.args, :($lhs[$index] = $output))
@@ -535,6 +564,52 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     body
 end
 
+# A `history = h0` scan: the result vector is filled with `h0` before the first
+# step and each step writes its output into it, so the step's last argument —
+# a read-only view of that vector — holds the outputs of the earlier steps and
+# `h0` at and after the current one: the in-place hand loop. Its element type
+# is `typeof(h0)`; an empty sequence runs no step and yields an empty vector.
+function _lower_authored_scan_history_native!(body, op::_AuthoredScanOp, callargs,
+                                              lhs, offset)
+    lhs === nothing && throw(ArgumentError(
+        "a `history =` scan materializes its output vector"))
+    step = op.kernel
+    indices, index, carry, output, earlier = gensym.((:scan_indices,
+        :scan_index, :scan_carry, :scan_output, :scan_history))
+    atomic = typeof(op).parameters[2]
+    fill_value = callargs[end]
+    iterated_positions = [i for i in 2:(length(callargs) - 1) if !(i in atomic)]
+    shared_positions = [i for i in 2:(length(callargs) - 1) if i in atomic]
+    seqs = Any[callargs[i] for i in iterated_positions]
+    arguments = Any[carry]
+    for i in iterated_positions
+        push!(arguments, Expr(:ref, callargs[i], index))
+    end
+    for i in shared_positions
+        push!(arguments, callargs[i])
+    end
+    push!(arguments, earlier)
+    step_body = _embedded_statements(
+        step.ast, arguments, Expr(:tuple, carry, output), offset)
+    module_ref(name) = GlobalRef(@__MODULE__, name)
+    record = Any[
+        :($carry = $(module_ref(:_scan_history_carry))($carry)),
+        :($lhs[$index] = $output)]
+    push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
+    push!(body.args, :($lhs = $(module_ref(:_scan_history_buffer))(
+        $(first(seqs)), $fill_value)))
+    push!(body.args, :($earlier = $(module_ref(:_ScanHistory))($lhs)))
+    nonempty = Expr(:block,
+        :($carry = $(callargs[1])),
+        :($index = $(GlobalRef(Base, :first))($indices)),
+        step_body..., record...,
+        Expr(:for, :($index = $(GlobalRef(Base.Iterators, :drop))($indices, 1)),
+             Expr(:block, step_body..., record...)))
+    push!(body.args, Expr(:if,
+        :(!$(GlobalRef(Base, :isempty))($indices)), nonempty))
+    body
+end
+
 function _authored_scan_cell_statements(cell, args, positions, output, offset;
                                         output_type = nothing)
     inner = cell.plan
@@ -572,6 +647,11 @@ end
 # operands need full broadcast-axis validation; other consumers or WANTs need
 # the materialized scan. In either case ordinary native scan lowering applies.
 function _authored_scan_sum_consumer(p::Plan, scan_recipe::Recipe)
+    # The fused loop streams one cell per step; the seed slot of an
+    # init-including scan would need a cell of its own, and a history scan
+    # reads its own output vector, so both materialize.
+    (_scan_includes_init(scan_recipe.op) || _scan_has_history(scan_recipe.op)) &&
+        return nothing
     output_id = canon_id(p.graph, only(scan_recipe.outputs).id)
     any(w -> canon_id(p.graph, w.id) == output_id, p.want) && return nothing
     consumers = filter(p.recipes) do recipe
