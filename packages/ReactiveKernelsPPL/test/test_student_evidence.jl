@@ -9,7 +9,6 @@ using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Reactant
-using SpecialFunctions
 using Test
 
 # Lower + bind + build + query an evidence program; return
@@ -193,47 +192,43 @@ function _stev_reactant_measure(built, bound, post_q, u)
     val, _ = sampler_value_and_gradient!(q, g, u)
     cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
     rval, rgrad = cad(Reactant.to_rarray(u))
-    return (; lines = count(==('\n'), hlo), native, primal, val, g,
+    return (; lines = count(==('\n'), hlo),
+        whiles = count("stablehlo.while", hlo),
+        batches = count("enzyme.batch", hlo), native, primal, val, g,
         rval = Float64(rval), rgrad = Array(rgrad))
 end
 
-# Upstream XLA gap (the besselix/gamma_inc pin precedent): `student_t`
-# evidence arms route through `SpecialFunctions.beta_inc`, which has no
-# method for a traced scalar, so every evidence program fails at trace
-# time (measured on Reactant 0.2.288: the primal trace throws before any
-# gradient is staged). The signature below is exactly that gap; anything
-# else rethrows loudly.
-_stev_is_upstream_gap(e) =
-    e isa MethodError && e.f === SpecialFunctions.beta_inc &&
-    length(e.args) == 3 && e.args[3] isa Reactant.TracedRNumber
-
+# The Student-t evidence arms route through the owned `rk_beta_inc`
+# (transparent math over the Student-t slice), which traces under
+# Reactant — `SpecialFunctions.beta_inc` has no traced-scalar method
+# (upstream Reactant placeholder, no backing MLIR op).
 @testset "student evidence under Reactant" begin
     prog = Meta.parse("""begin
         mu = a .+ b .* x
         sigma ~ Exponential(1.0)
         y .~ censored.(StudentT.(3.0, mu, sigma), lo, hi)
     end""")
-    try
-        fx = _stev_reactant(prog, Dict{Symbol,AbstractVector}(
-            :y => [-1.0, 4.0, 12.0], :x => [0.0, 1.0, 2.0],
-            :lo => fill(0.0, 3), :hi => fill(10.0, 3)))
-        @test fx.primal ≈ fx.native rtol = 1e-9
-        @test fx.rval ≈ fx.val rtol = 1e-9
-        @test fx.rgrad ≈ fx.g rtol = 1e-7 atol = 1e-9
-        # Data-length invariance (constraints.md): more rows must not
-        # replicate the loop body.
-        small = _stev_reactant(prog, Dict{Symbol,AbstractVector}(
-            :y => [1.0, 12.0], :x => [0.0, 1.0], :lo => fill(0.0, 2),
-            :hi => fill(10.0, 2)))
-        large = _stev_reactant(prog, Dict{Symbol,AbstractVector}(
-            :y => [-1.0, 1.0, 4.0, 10.0, 12.0, 5.0], :x => collect(0.0:5.0),
-            :lo => fill(0.0, 6), :hi => fill(10.0, 6)))
-        @test small.lines == large.lines
-        # Self-firing pin: errors (Unexpected Pass) once upstream wires
-        # beta_inc, forcing removal of the try/catch.
-        @test_broken true
-    catch e
-        _stev_is_upstream_gap(e) || rethrow()
-        # Known upstream beta_inc gap (above): pinned, not passing.
-    end
+    fx = _stev_reactant(prog, Dict{Symbol,AbstractVector}(
+        :y => [-1.0, 4.0, 12.0], :x => [0.0, 1.0, 2.0],
+        :lo => fill(0.0, 3), :hi => fill(10.0, 3)))
+    @test fx.primal ≈ fx.native rtol = 1e-9
+    @test fx.rval ≈ fx.val rtol = 1e-9
+    @test fx.rgrad ≈ fx.g rtol = 1e-7 atol = 1e-9
+    # Data-length invariance (constraints.md): more rows must not
+    # replicate the loop body. Structural op counts are exactly equal
+    # (retained CF loops, vectorized plate); raw line counts may differ
+    # by constant-dedup noise (measured: one extra deduplicated zero
+    # constant at 6 rows vs 2), so that comparison carries a tight
+    # window that still catches any replication (which would add
+    # hundreds of lines per row — an unrolled CF loop explodes the
+    # reverse past 8 GB on 3 rows).
+    small = _stev_reactant(prog, Dict{Symbol,AbstractVector}(
+        :y => [1.0, 12.0], :x => [0.0, 1.0], :lo => fill(0.0, 2),
+        :hi => fill(10.0, 2)))
+    large = _stev_reactant(prog, Dict{Symbol,AbstractVector}(
+        :y => [-1.0, 1.0, 4.0, 10.0, 12.0, 5.0], :x => collect(0.0:5.0),
+        :lo => fill(0.0, 6), :hi => fill(10.0, 6)))
+    @test small.whiles == large.whiles
+    @test small.batches == large.batches
+    @test abs(small.lines - large.lines) <= 2
 end

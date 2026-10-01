@@ -17,7 +17,10 @@
 # kronecker_gp NO-COUNTERPART) on BayesianRegressionModels:rk:kernel:matrix-b
 # (BRM 88c5621, StanBlocks 342436de, BridgeStan 2.9.0; full posterior,
 # propto=false, Jacobian included). Formulas + data from the partner's
-# run scripts (matrix-b-smooth.jl, -reruns2.jl, -numbers5.jl).
+# run scripts (matrix-b-smooth.jl, -reruns2.jl, -numbers5.jl). Bordet
+# builder 7 (D7): brief 2026-10-01T05-48-36-754-n0wjw1 on
+# BayesianRegressionModels (BRM daadc695, records 328fa77 B7_*, StanBlocks
+# eeee3bad, BridgeStan 2.9.0, same SB conventions).
 #
 # Every leg compares DIRECTLY at the same u: RK's exact GP
 # (`gp_chol_latent(gp_exp_quad_cov(x, sigma, rho, 1e-9), z)`, non-centered)
@@ -36,7 +39,6 @@ using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Reactant
-using SpecialFunctions
 using Statistics: std
 using Test
 
@@ -496,9 +498,10 @@ end
 # builders, crossed ranef baselines, intercept-only log sigma, censored
 # Gaussian. Its "centeredness" is the sampler's online reparametrization of
 # the weights (BRM `adaptive_centering_problem`), not part of the density;
-# RK's non-centered weights are the default compiled frame. No SB numbers
-# exist for this builder yet (the matrix-b SB leg covered builders 2-6), so
-# parity is anchored through the SB-pinned builder 2 below.
+# RK's non-centered weights are the default compiled frame. Anchored three
+# ways: an independent grouped-weight oracle, exact pooled equivalence with
+# the SB-pinned builder 2, and direct SB value + gradient parity (the
+# builder-7 SB testset below).
 const _SM_BORDET_D7 = quote
     hsgp_basis(:h_t, log_time; k = 5, by = biomarker)
     hsgp_basis(:h_d, log_dose; k = 5, by = biomarker)
@@ -584,6 +587,76 @@ end
     w = [dv[nm] for nm in names2 if startswith(String(nm), "beta_raw_")]
     @test length(w) == 2 * 5
     @test _sm_val(kern, u) ≈ _sm_val(kern2, v) + sum(logpdf.(Normal(), w)) atol = 1e-10
+end
+
+# Builder-7 SB pins (brief n0wjw1): BridgeStan lp + AD grad, `u` and `grad`
+# in SB `param_unc_names` order. The map is a pure permutation, since SB and
+# RK share every unconstraining map (rho = floor + exp(u), sigma =
+# exp(u), log-scales and log sigma on the log scale). SB weights
+# `zflat_<axis>.i` are group-major, i = (g - 1) * 5 + b, while RK's are G x K
+# column-major, j = (b - 1) * 2 + g. Then come intercept, affectable
+# contrast, the four hypers, the two ranef blocks, and log sigma.
+const _SM_SB_D7_NAMES = vcat(
+    [Symbol("beta_raw_h_t.", (b - 1) * 2 + g) for g in 1:2 for b in 1:5],
+    [Symbol("beta_raw_h_d.", (b - 1) * 2 + g) for g in 1:2 for b in 1:5],
+    Symbol.(["log_y.Intercept", "log_y.affectable", "rho_h_t", "sigma_h_t",
+        "rho_h_d", "sigma_h_d", "log_scale_biomarker", "xi_biomarker.1",
+        "xi_biomarker.2", "log_scale_person", "xi_person.1", "xi_person.2",
+        "ls.Intercept"]))
+const _SM_SB_D7 = (
+    B7_zeros = (u = zeros(33), lp = -52.89998413012594,
+        grad = [1.7003423045578128, -0.2049047748459992,
+            0.005661909761107061, -6.976389046618564e-05,
+            1.9710315941605404e-07, 0.8914476936327609, -0.6143201590274905,
+            0.0026268400605202287, -0.00020915746994072733,
+            1.0333634374571721e-07, 2.1264015091063553, -0.5187511285620429,
+            0.02739806094347982, -0.00034289857386368786,
+            3.563075419226447e-06, 1.3953617085830905, -1.3473320167998009,
+            0.0076438087036252616, -0.002896997119854075,
+            -1.845730367837447e-05, 4.849529264841065, 7.322744797663907,
+            0.1804684507545622, 0.0, 0.27052982595245967, 0.0, 0.0,
+            3.1999999999999997, 1.6495292648410655, 0.0, 2.8,
+            2.0495292648410652, 5.643293059805448]),
+    B7_u03 = (u = fill(0.3, 33), lp = -58.4765924141802,
+        grad = [-3.025870333576859, -0.3521231772288154, -0.3003759332950278,
+            -0.30000108288831867, -0.300000001176551, -3.417370055083594,
+            -0.4980612907600121, -0.300491861140113, -0.30000411483469624,
+            -0.3000000013455317, -3.6960617931960353, -0.34871858255223753,
+            -0.3060409895716271, -0.3003001932938831, -0.30000136109040043,
+            -4.017249876090646, -0.7987823950328767, -0.3087945444776928,
+            -0.30058750041866306, -0.3000021366884763, -8.849878753705127,
+            -4.17417927056011, 1.4622840708420914, -2.1282893553988553,
+            1.0437318306957721, -2.602961811723761, -3.762338741818742,
+            -5.665940308701948, -6.475188830693859, -3.762338741818742,
+            -5.962267596974636, -6.1788615424211715, 8.774717854734366]),
+    # SB's banked u is exactly `_sm_probe(33)` in SB order.
+    B7_smprobe = (u = _sm_probe(33), lp = -76.9247115805647,
+        grad = [-5.192389310538728, -0.18102100977877478,
+            0.07590712387063692, 0.09668969966195745, -0.1430240028693116,
+            -6.307100882367616, -0.40139069845757175, 0.0038846056791459905,
+            -0.027609699367516314, -0.284033413679849, -6.884863192326766,
+            -0.2154769299622779, -0.0763880404298593, -0.159042389660683,
+            -0.42110797818748613, -8.094651440977817, -0.46464391904941316,
+            -0.16505528286644175, -0.29614356921707735, -0.5525116964012468,
+            -14.537582841038692, -8.515246800785249, 2.0697210657225877,
+            -3.456164453261282, 4.0895253119874155, -7.229920507580953,
+            -10.864842080202811, -10.232893632801037, -12.30782810294773,
+            -20.006495757710077, -17.62359634786066, -14.428651658769061,
+            40.263667662023906]),
+)
+
+@testset "bordet builder 7 SB parity ($label, BRM 328fa77)" for (label, pin) in
+        pairs(_SM_SB_D7)
+    bound, built, kern, lay = _sm_query(_SM_BORDET_D7, _sm_cols(_SM_BORDET))
+    names = coordinate_names(lay)
+    @test sort(names) == sort(_SM_SB_D7_NAMES)
+    perm = [findfirst(==(nm), _SM_SB_D7_NAMES) for nm in names]
+    u = pin.u[perm]
+    @test _sm_val(kern, u) ≈ pin.lp atol = 1e-10
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    sampler_value_and_gradient!(prep, g, u)
+    @test maximum(abs.(g .- pin.grad[perm])) < 1e-10
 end
 
 @testset "grouped HSGP surface + contract" begin
@@ -688,29 +761,14 @@ end
 # XLA legs for the basis-expansion items (HSGP / spline). The exact-GP
 # items stay native-only: Reactant reverse through the dense Cholesky is
 # the upstream gap documented in test_gp.jl (no XLA assertions there by
-# design).
-# Upstream XLA gap (the student-evidence pin precedent): the censored
-# Student-t evidence arms route through `SpecialFunctions.beta_inc`,
-# which has no method for a traced scalar (measured on Reactant
-# 0.2.289/0.2.290). Only the Bordet D4 leg carries it; the signature
-# below is exactly that gap, anything else rethrows loudly.
-_sm_is_upstream_gap(e) =
-    e isa MethodError && e.f === SpecialFunctions.beta_inc &&
-    length(e.args) == 3 && e.args[3] isa Reactant.TracedRNumber
-
+# design). The Bordet D4 leg (censored Student-t) routes through the
+# owned `rk_beta_inc`, which traces; `SpecialFunctions.beta_inc` has no
+# traced-scalar method (upstream Reactant placeholder, no backing MLIR op).
 @testset "smooth under Reactant ($label)" for (label, prog, data) in _SM_ITEMS[3:end]
-    gapped = label == "bordet D4"
-    try
-        bound, built, post_q, lay = _sm_query(prog, _sm_cols(data))
-        fx = Base.invokelatest(_sm_reactant_measure, built, bound, post_q,
-            _sm_probe(lay.total))
-        @test fx.primal ≈ fx.native rtol = 1e-9
-        @test fx.rval ≈ fx.val rtol = 1e-9
-        @test fx.rgrad ≈ fx.g rtol = 1e-7 atol = 1e-9
-        # Self-firing pin: errors (Unexpected Pass) once upstream wires
-        # beta_inc, forcing removal of the gate.
-        gapped && @test_broken true
-    catch e
-        gapped && _sm_is_upstream_gap(e) || rethrow()
-    end
+    bound, built, post_q, lay = _sm_query(prog, _sm_cols(data))
+    fx = Base.invokelatest(_sm_reactant_measure, built, bound, post_q,
+        _sm_probe(lay.total))
+    @test fx.primal ≈ fx.native rtol = 1e-9
+    @test fx.rval ≈ fx.val rtol = 1e-9
+    @test fx.rgrad ≈ fx.g rtol = 1e-7 atol = 1e-9
 end

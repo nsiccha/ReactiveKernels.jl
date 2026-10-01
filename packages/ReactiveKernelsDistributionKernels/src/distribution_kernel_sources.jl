@@ -3,6 +3,7 @@ module DistributionKernelSources
 using ReactiveKernels
 using LinearAlgebra
 import LogExpFunctions
+import ReactantCore
 import SpecialFunctions
 
 # The two special functions whose derivatives this repository owns, each
@@ -39,6 +40,85 @@ const logbeta = scalar_derivative_rule(
 # primitive: reached as `DistributionKernelSources.rk_symmetric_*` (and
 # re-exported by ReactiveKernelsPPL).
 include("symmetric_eigen_rules.jl")
+
+# Owned regularized incomplete beta, I_x(a, b), over the Student-t cdf
+# slice (one shape is 1/2, the other is nu/2 with nu > 0, x in [0, 1]).
+# `SpecialFunctions.beta_inc` has no method for a Reactant-traced scalar
+# (its entry points require `Real`, and Reactant's SpecialFunctions
+# extension leaves `beta...` as an unwired placeholder with no backing
+# MLIR op), so every evidence arm through the Student-t cdf fails at
+# trace time. This spelling is plain transparent math — endpoint guards,
+# reflection to x <= (a+1)/(a+b+2), a logbeta front factor, and Lentz's
+# continued fraction over a FIXED count, kept as one retained
+# `@trace while` (a `for` unrolls into ~300 body copies, whose reverse
+# explodes past 8 GB) — so it traces under Reactant as one small loop
+# and differentiates under Enzyme without any rule (no backend-specific
+# derivative code, no method on a function this repository does not
+# own). Both reflection arms stay finite on the whole slice, so the
+# selection is ordinary `ifelse`.
+#
+# Validated against `SpecialFunctions.beta_inc` on the slice (see
+# `test_rk_beta_inc.jl`); outside it use `SpecialFunctions.beta_inc`
+# (native) — the general-domain port is future work, not a silent
+# extension of this function.
+const RK_BETA_INC_ITERS = 300
+const RK_BETA_INC_FPMIN = 1e-300
+
+function _rk_beta_inc_cf(a, b, x)
+    qab = a + b
+    qap = a + 1
+    qam = a - 1
+    c = one(qab)
+    d = 1 - qab * x / qap
+    d = ifelse(abs(d) < RK_BETA_INC_FPMIN, RK_BETA_INC_FPMIN, d)
+    d = one(d) / d
+    # `* one(d)`, not a bare alias: `@trace` rejects loop-carried
+    # variables whose aliasing pattern changes across the body.
+    h = d * one(d)
+    # Retained `@trace while` (never a `for`): Reactant unrolls a `for`
+    # into ~300 body copies, and reverse through that explodes past 8 GB
+    # on a 3-row program. The retained loop is exactly the
+    # `reactivekernels-use` §7i working shape — `<` (not `<=`) over a
+    # pure +1 counter with a constant bound, `Binomial` checkpointing —
+    # so it reverses exactly at ~1 GB. Natively (nothing traced) `@trace`
+    # runs this as the plain `while` below, so Enzyme still sees
+    # ordinary control flow.
+    i = 0
+    ReactantCore.@trace checkpointing = ReactantCore.Binomial(4) while i < RK_BETA_INC_ITERS
+        m = i + 1
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1 + aa * d
+        d = ifelse(abs(d) < RK_BETA_INC_FPMIN, RK_BETA_INC_FPMIN, d)
+        c = 1 + aa / c
+        c = ifelse(abs(c) < RK_BETA_INC_FPMIN, RK_BETA_INC_FPMIN, c)
+        d = one(d) / d
+        h = h * d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1 + aa * d
+        d = ifelse(abs(d) < RK_BETA_INC_FPMIN, RK_BETA_INC_FPMIN, d)
+        c = 1 + aa / c
+        c = ifelse(abs(c) < RK_BETA_INC_FPMIN, RK_BETA_INC_FPMIN, c)
+        d = one(d) / d
+        h = h * d * c
+        i = i + 1
+    end
+    return h
+end
+
+function _rk_beta_inc_core(a, b, x)
+    front = exp(a * log(x) + b * log1p(-x) - logbeta(a, b))
+    return front * _rk_beta_inc_cf(a, b, x) / a
+end
+
+function rk_beta_inc(a, b, x)
+    direct = _rk_beta_inc_core(a, b, x)
+    y = 1 - x
+    reflected = 1 - _rk_beta_inc_core(b, a, y)
+    thresh = (a + 1) / (a + b + 2)
+    core = ifelse(x < thresh, direct, reflected)
+    return ifelse(x <= 0, zero(core), ifelse(x >= 1, one(core), core))
+end
 
 export LOCATION_SCALE_SOURCE
 export standard_normal, standard_cauchy, standard_laplace, standard_student_t
@@ -87,8 +167,8 @@ export NEGATIVE_BINOMIAL_SOURCE
 export WEIBULL_SOURCE
 
 const LOCATION_SCALE_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
-using SpecialFunctions: erfc, erfcinv, beta_inc, beta_inc_inv
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, rk_beta_inc
+using SpecialFunctions: erfc, erfcinv, beta_inc_inv
 using LogExpFunctions: log1pexp
 
 @kernel standard_normal() = begin
@@ -115,12 +195,14 @@ end
 # `cdf`/`quantile` use the regularized incomplete beta with x = nu/(nu+z^2):
 # for z<=0, F(z) = I_x(nu/2, 1/2)/2; symmetry gives the upper tail and the
 # inverse. Only positive df is a valid parameter, so there is no domain guard.
+# `cdf` calls the owned `rk_beta_inc` (transparent math that traces under
+# Reactant); `SpecialFunctions.beta_inc` has no traced-scalar method.
 @kernel standard_student_t(nu::Float64) = begin
     logpdf(z::Float64)::Float64 =
         loggamma((nu + 1) / 2) - loggamma(nu / 2) - 0.5 * log(nu * π) -
         ((nu + 1) / 2) * log1p(z^2 / nu)
     cdf(z::Float64)::Float64 = begin
-        half_tail::Float64 = 0.5 * first(beta_inc(nu / 2, 0.5, nu / (nu + z^2)))
+        half_tail::Float64 = 0.5 * rk_beta_inc(nu / 2, 0.5, nu / (nu + z^2))
         ifelse(z <= 0, half_tail, 1 - half_tail)
     end
     quantile(p::Float64)::Float64 = begin
@@ -692,7 +774,10 @@ end
 # kernel sums the weighted log-diagonal over all i. Straight-line authoring note:
 # the dimension is taken as `Kf::Float64 = size(L,1)` for the scalar arithmetic
 # and inline `size(L,1)` inside the ranges — a single reused integer node across
-# the many normalizer terms does not route through the planner.
+# the many normalizer terms does not route through the planner. The index
+# vectors are `collect`ed before any float scaling: a float broadcast over a
+# range builds a TwicePrecision StepRangeLen, which native reverse Enzyme
+# cannot differentiate (snag lkj-corr-cholesk-44503bef).
 const LKJ_CORR_CHOLESKY_KERNEL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta
 using LinearAlgebra: diag
@@ -701,14 +786,14 @@ using LinearAlgebra: diag
     logpdf(L::Matrix{Float64})::Float64 = begin
         Kf::Float64 = size(L, 1)
         kernel_term::Float64 =
-            sum(((Kf + 2 * (eta - 1)) .- (1:size(L, 1))) .* log.(diag(L)))
+            sum(((Kf + 2 * (eta - 1)) .- collect(1:size(L, 1))) .* log.(diag(L)))
         alpha::Float64 = eta + 0.5 * Kf - 1
         loginvconst::Float64 =
             (2 * eta + Kf - 3) * log(2.0) +
             (log(π) / 4) * (Kf * (Kf - 1) - 2) +
             logbeta(alpha, alpha) -
             (Kf - 2) * loggamma(eta + 0.5 * (Kf - 1)) +
-            sum(loggamma.(eta .+ 0.5 .* (0:(size(L, 1) - 3))); init = 0.0)
+            sum(loggamma.(eta .+ 0.5 .* collect(0:(size(L, 1) - 3))); init = 0.0)
         kernel_term - loginvconst
     end
 end
