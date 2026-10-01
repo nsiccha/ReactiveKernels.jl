@@ -1,6 +1,7 @@
 using ReactiveKernels
 using LinearAlgebra
 using Random
+import Pkg
 import SHA
 import TOML
 using Test
@@ -136,6 +137,80 @@ end
         path = joinpath(_BENCH_DIR, name)
         @test isfile(path)
         @test _parses(path)
+    end
+end
+
+const _PIN_CONST_PATTERN =
+    r"""^const\s+(\w*REACTANT\w*VERSION\w*)\s*=\s*v"([^"]+)"""
+
+function _reactant_pin_consts(path)
+    pins = Tuple{String,VersionNumber}[]
+    for line in eachline(path)
+        matched = match(_PIN_CONST_PATTERN, strip(line))
+        matched === nothing && continue
+        push!(pins, (String(matched.captures[1]),
+                      VersionNumber(matched.captures[2])))
+    end
+    pins
+end
+
+function _reactant_bound_projects()
+    projects = String[]
+    for name in readdir(_BENCH_DIR)
+        project = joinpath(_BENCH_DIR, name, "Project.toml")
+        isfile(project) && push!(projects, project)
+    end
+    packages = joinpath(_REPOSITORY_ROOT, "packages")
+    for name in readdir(packages)
+        project = joinpath(packages, name, "Project.toml")
+        isfile(project) && push!(projects, project)
+    end
+    projects
+end
+
+function _reactant_compat_bound(project)
+    parsed = TOML.parsefile(project)
+    compat = get(parsed, "compat", Dict{String,Any}())
+    get(compat, "Reactant", nothing)
+end
+
+function _manifest_reactant_version(manifest)
+    parsed = TOML.parsefile(manifest)
+    recorded = get(get(parsed, "deps", Dict{String,Any}()), "Reactant", nothing)
+    recorded === nothing && return nothing
+    VersionNumber(only(recorded)["version"])
+end
+
+@testset "benchmark Reactant pins satisfy root [compat]" begin
+    root_project = TOML.parsefile(joinpath(_REPOSITORY_ROOT, "Project.toml"))
+    root_spec = Pkg.Types.semver_spec(root_project["compat"]["Reactant"])
+    pin_files = vcat(
+        [joinpath(_BENCH_DIR, name)
+         for name in readdir(_BENCH_DIR) if endswith(name, ".jl")],
+        [joinpath(_REPOSITORY_ROOT, "test", "run_reactant_integration.jl")],
+    )
+    found = 0
+    for path in pin_files
+        for (_, version) in _reactant_pin_consts(path)
+            found += 1
+            @test version in root_spec
+        end
+    end
+    # 8 comparison entrypoints + the CI integration runner: a smaller count
+    # means the pin pattern above no longer matches the entrypoint shape.
+    @test found >= 9
+    for project in _reactant_bound_projects()
+        bound = _reactant_compat_bound(project)
+        bound === nothing && continue
+        @test !isempty(intersect(
+            root_spec, Pkg.Types.semver_spec(bound)))
+    end
+    for project in _reactant_bound_projects()
+        manifest = joinpath(dirname(project), "Manifest.toml")
+        isfile(manifest) || continue
+        recorded = _manifest_reactant_version(manifest)
+        recorded === nothing && continue
+        @test recorded in root_spec
     end
 end
 
