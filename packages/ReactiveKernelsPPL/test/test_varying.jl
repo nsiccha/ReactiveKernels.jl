@@ -762,6 +762,48 @@ end
     @test logjac(layout, u) ≈ u[2] + u[4] + u[5] + lkj
 end
 
+@testset "varying derived draws ignore a sibling-spelled parameter" begin
+    # `constrain` used to treat an LKJ block as centered whenever ANY
+    # entry was named `b_flat_<s>`: an author's `b_flat_g` replaced the
+    # derived `b_g` (K = 1) or threw (K = 2). Siblings now come from
+    # varying-draws entries only.
+    cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+        :g => [1, 2, 1, 3, 2, 3])
+    for (margins, K) in ((:([1]), 1), (:([1, x]), 2))
+        plan = lower_rkppl(quote
+                a ~ Normal(0, 5)
+                b_flat_g ~ Exponential(1)
+                r ~ varying_effect(g, $margins; eta = 1.0)
+                mu = a .+ r
+                y .~ Normal.(mu, b_flat_g)
+            end, (:y, :x, :g))
+        layout = assign_layout(bind_data(plan, cols))
+        u = collect(range(-0.5, 0.5; length = layout.total))
+        nt = constrain(layout, u)
+        e = only(e for e in layout.entries if e.name === :b_flat_g)
+        @test e.kind === :sampled
+        @test nt.b_flat_g ≈ exp(u[e.offset])
+        # b[g, j] = sum_s tau[j] L[j, s] z[s, g] (SB `(diag(tau)*L*z)'`).
+        @test size(nt.b_g) == (3, K)
+        for gi in 1:3, j in 1:K
+            @test nt.b_g[gi, j] ≈ sum(nt.tau_g[j] * nt.L_g[j, s] *
+                nt.z_flat_g[s + (gi - 1) * K] for s in 1:j)
+        end
+    end
+    # A centered block owns `b_flat_<s>` (its sampled draws), so the same
+    # spelling there is a duplicate definition at lowering.
+    @test_throws "b_flat_g is defined twice" lower_rkppl(quote
+            a ~ Normal(0, 5)
+            b_flat_g ~ Exponential(1)
+            d ~ varying_draws(g, [1, x]; centered = true, eta = 1.5,
+                sd = Exponential(2.0))
+            r ~ varying_slice(d, 1:2)
+            mu = a .+ r
+            y .~ Normal.(mu, b_flat_g)
+        end, (:y, :x, :g))
+end
+
 # Independent correlated-contribution reference: SB `(diag(tau)*L*z)'`
 # shape with explicit per-margin/per-group loops (never the fused forms),
 # over the global margin subset `js` with Z columns `Zs` (Zs[j] is the

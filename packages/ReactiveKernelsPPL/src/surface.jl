@@ -1818,8 +1818,10 @@ end
 # sd=...)`, `spline_basis(...; sd=...)` — SB `length_scale(:, hsgp(x))
 # ~ ...` / `sd(:, s(x)) ~ ...`): one Distributions.jl call with literal
 # arguments from the admitted positive-hyperparameter families. Stan
-# kernel semantics on the positive support (no `+log2` renormalizer),
-# so the proper-half spellings fail closed toward the bare form.
+# kernel semantics on the positive support (no `+log2` renormalizer) for
+# the real-support families, so the proper-half spellings fail closed
+# toward the bare form; positive-support families and `Uniform` keep
+# their own density (`_hyper_support_override`).
 function _lower_hyper_prior(raw, where, what::Symbol)
     admitted = "LogNormal, InverseGamma, Gamma, Exponential, Normal, " *
         "Cauchy, StudentT, Uniform (literal arguments)"
@@ -1927,12 +1929,8 @@ function _lower_basis(st::Expr, line::Int, data::Set{Symbol},
     label = Symbol("spline_", id)
     _claim!(seen, seelines, label, line)
     vectors = SplineVector[]
-    _, sdname = _spline_block_roles(id, kind, k)
     for (vname, vfamily, vargs, vsupport, vwidth) in
-            _spline_vector_specs(id, kind, k)
-        if vname === sdname && sd_prior !== nothing
-            vfamily, vargs = sd_prior.family, sd_prior.args
-        end
+            _spline_vector_specs(id, kind, k, sd_prior)
         _claim!(seen, seelines, vname, line)
         push!(vectors, SplineVector(vname, vfamily, vargs, vsupport,
             vwidth, id, vname))
