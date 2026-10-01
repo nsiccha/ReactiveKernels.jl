@@ -129,11 +129,41 @@ function _authored_scan_history_reference(amounts, plan, units)
         amounts[j] == 0 && continue
         exposure = 0.0
         for i in 1:j-1
-            exposure += weights[i] * get(units, plan.shifts[j] - plan.shifts[i] + 1, 0.0)
+            exposure += weights[i] * get(units, _history_lag(plan, j, i), 0.0)
         end
         weights[j] = amounts[j] / (1 + exposure)
     end
     weights
+end
+
+# The same lags stored as a 2-D host table (`lags[j, i]`, the stored-row plan
+# of the dose-feedback shape): under a tracing backend the scan's `j` and the
+# sum's `i` are both traced, so the read is a gather at two traced indices.
+struct HistoryTable
+    lags::Matrix{Int}
+end
+HistoryTable(p::HistoryLattice) = HistoryTable(
+    [i < j ? p.shifts[j] - p.shifts[i] + 1 : 0
+     for j in eachindex(p.shifts), i in eachindex(p.shifts)])
+ReactiveKernels.@traceable _history_lag(p::HistoryTable, j, i) = p.lags[j, i]
+
+# A step reading a partly traced named tuple: its scale is traced and its
+# matrix may stay host. A `@traceable` helper sums over both axes of the
+# matrix, each sum a retained loop with a traced index, so `k.W[i, j]` is a
+# gather at two traced indices; the host matrix must cross both loops as a host
+# value, not as a matrix of traced scalars.
+ReactiveKernels.@traceable _scan_surface(k, a, b) =
+    sum((sum((sin(a * i) * k.W[i, j] for i in axes(k.W, 1)); init = 0.0) * sin(b * j)
+         for j in axes(k.W, 2)); init = 0.0)
+
+@kernel authored_scan_surface(W, scale::Float64, xs::Vector{Float64}) = begin
+    model = (; W, scale)
+    ys::Vector{Float64} = scan(xs, Ref(model); init = 0.0) do carry, x, k
+        value = k.scale * _scan_surface(k, x, x + 0.5)
+        (carry + value, value)
+    end
+    total::Float64 = sum(ys)
+    return ys
 end
 
 # A plain scan sharing a host struct and a host named tuple by `Ref`: under a

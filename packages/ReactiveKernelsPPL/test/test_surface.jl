@@ -2054,17 +2054,20 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(m, 2))),
         :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
-    # Levels prior on a non-factor coefficient; unused levels prior.
+    # Levels prior on a non-factor coefficient.
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(a[levels(g)]), :(Normal.(0, 1))),
         :(mu = a .+ c[g]),
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
         :(y .~ Normal.(mu, 1.5))), (:y, :g))
-    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+    # A levels declaration no predictor consumes is a declared array
+    # parameter (test_array_values.jl), not a refused coefficient prior.
+    zplan = lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(z[levels(g)]), :(Normal.(0, 1))),
         :(mu = c[g]),
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
         :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    @test only(zplan.array_parameters).name === :z
     # A bound levels-subset is plain metadata: it reuses the inline grammar
     # and is admitted by `=`, not by `~`.
     got = lower_rkppl(quote
