@@ -8356,11 +8356,14 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             (op === :.- ? "one or two operands" : "two operands"))
         return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
             subs, scalars, datas) for a in args)...)
-    elseif op === :* && length(args) == 2
+    elseif op === :* && length(args) >= 2
         # Julia-valid scalar `*` normalizes to dotted (Base broadcasts —
-        # behavior-preserving, the canonicalization doctrine).
-        return _extract_composed_tree(pname, Expr(:call, :.*, args...),
-            ctx, subs, scalars, datas)
+        # behavior-preserving, the canonicalization doctrine); an n-ary
+        # product `z * lam * tau` folds left like Julia's `*`.
+        lhs = length(args) == 2 ? args[1] :
+            Expr(:call, :*, args[1:end-1]...)
+        return _extract_composed_tree(pname, Expr(:call, :.*, lhs,
+            args[end]), ctx, subs, scalars, datas)
     elseif op === :+ || op === :- || op === :/ || op === :^
         return _sfail("$where combines vectors without dots: " *
             "$(repr(node)) — as in Julia, write the dotted form " *

@@ -420,6 +420,42 @@ end
             y .~ Normal.(mu, sigma)
         end, (:y, :x1))
     end
+    # One predictor mixing an inline factor composition, an n-ary computed
+    # coefficient and a simplex element; the emitted kernel is the same
+    # for every observation count (no data-length unrolling).
+    @testset "computed coefficients beside an inline factor composition" begin
+        x, x1, g = _fb_col(:x), _fb_col(:x1), _FB_COLS[:g]
+        prog = quote
+            a ~ Normal(0, 5); lam ~ HalfCauchy(1); tau ~ HalfCauchy(1)
+            z ~ Normal(0, 1); sg ~ HalfNormal(1)
+            zz[levels(g)] .~ Normal.(0, 1); phi ~ Dirichlet([1.0, 1.0])
+            sigma ~ Exponential(1)
+            mu = a .+ x .* (z * lam * tau) .+ sg .* zz[g] .+ x1 .* phi[1]
+            y .~ Normal.(mu, sigma)
+        end
+        # The inline `zz[g]` keys its levels under the sub-predictor
+        # (`_rkppl_zz_g`), as the alias `zg = zz[g]` keys them under `zg`.
+        q = (a = 0.4, lam = 0.9, tau = 0.3, z = -1.2, sg = 0.7,
+            _rkppl_zz_g = [0.2, -0.5, 0.9], phi = [0.35, 0.65], sigma = 1.3)
+        _fb_check(prog, (:y, :x, :x1, :g), q, q -> _fb_normal_ll(q.a .+
+                x .* (q.z * q.lam * q.tau) .+ q.sg .* q._rkppl_zz_g[g] .+
+                x1 .* q.phi[1], q.sigma) + logpdf(Normal(0, 5), q.a) +
+            logpdf(_fb_halfcauchy(1), q.lam) +
+            logpdf(_fb_halfcauchy(1), q.tau) + logpdf(Normal(0, 1), q.z) +
+            logpdf(_fb_halfnormal(1), q.sg) +
+            sum(logpdf.(Normal(0, 1), q._rkppl_zz_g)) +
+            logpdf(Dirichlet([1.0, 1.0]), q.phi) +
+            logpdf(Exponential(1), q.sigma))
+        nodes(e) = e isa Expr ? 1 + sum(nodes, e.args; init = 0) : 1
+        sizes = map((9, 90)) do n
+            cols = Dict{Symbol,AbstractVector}(:y => randn(n), :x => randn(n),
+                :x1 => randn(n), :g => repeat([1, 2, 3], n ÷ 3))
+            bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+            nodes(ReactiveKernelsPPL.kernel_expr(bound,
+                ReactiveKernelsPPL.assign_layout(bound)))
+        end
+        @test sizes[1] == sizes[2]
+    end
     # A dar parameter scaling a column: the posterior equals the dar-only
     # model on `y - beta .* x` at the same unconstrained point.
     @testset "parameter-scaled column beside a dar summand" begin
