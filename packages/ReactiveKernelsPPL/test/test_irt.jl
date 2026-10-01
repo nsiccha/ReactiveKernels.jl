@@ -86,9 +86,9 @@ const _IRT_LSAT = quote
 end
 
 const _IRT_2PL = quote
-    r_t ~ varying_effect(person, [1]; eta = 1.0, sd = Cauchy(0, 2))
-    r_a ~ varying_effect(item, [1]; eta = 1.0, sd = Cauchy(0, 2))
-    r_b ~ varying_effect(item, [1]; eta = 1.0, sd = Cauchy(0, 2))
+    r_t ~ varying_effect(person, [1]; sd = Cauchy(0, 2))
+    r_a ~ varying_effect(item, [1]; sd = Cauchy(0, 2))
+    r_b ~ varying_effect(item, [1]; sd = Cauchy(0, 2))
     b0 ~ Normal(0, 5)
     th = r_t
     la = r_a
@@ -103,7 +103,7 @@ _irt_latreg(t0prior) = quote
     t0 ~ $t0prior
     bw1 ~ StudentT(3, 0, 1)
     bw2 ~ StudentT(3, 0, 1)
-    r_t ~ varying_effect(person, [1]; eta = 1.0, sd = Exponential(1))
+    r_t ~ varying_effect(person, [1]; sd = Exponential(1))
     c_la[levels(item)] .~ Normal.(1, 1)
     c_b[levels(item)] .~ Normal.(0, 3)
     th = t0 .+ bw1 .* w1 .+ bw2 .* w2 .+ r_t
@@ -117,7 +117,7 @@ _irt_gpcm(t0prior) = quote
     t0 ~ $t0prior
     bw1 ~ StudentT(3, 0, 1)
     bw2 ~ StudentT(3, 0, 1)
-    r_t ~ varying_effect(person, [1]; eta = 1.0, sd = Exponential(1))
+    r_t ~ varying_effect(person, [1]; sd = Exponential(1))
     c_la[levels(item)] .~ Normal.(1, 1)
     c_s1[levels(item)] .~ Normal.(0, 3)
     c_s2[levels(item)] .~ Normal.(0, 3)
@@ -135,7 +135,7 @@ _irt_grsm(t0prior) = quote
     t0 ~ $t0prior
     bw1 ~ StudentT(3, 0, 1)
     bw2 ~ StudentT(3, 0, 1)
-    r_t ~ varying_effect(person, [1]; eta = 1.0, sd = Exponential(1))
+    r_t ~ varying_effect(person, [1]; sd = Exponential(1))
     c_la[levels(item)] .~ Normal.(1, 1)
     c_b[levels(item)] .~ Normal.(0, 3)
     k1 ~ Normal(0, 3)
@@ -196,7 +196,7 @@ end
     @test occursin("exp.", sprint(showerror, err))
     # A bare varying contribution (not a sub alias) stays out of trees.
     bare = quote
-        r ~ varying_effect(g, [1]; eta = 1.0, sd = Cauchy(0, 2))
+        r ~ varying_effect(g, [1]; sd = Cauchy(0, 2))
         be ~ Normal(0, 1)
         eta = be .* r
         y .~ Bernoulli.(logistic.(eta))
