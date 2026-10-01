@@ -153,10 +153,9 @@ using Test
         # bordet-builder7 grouped-hsgp-by probe REMOVED 2026-09-30
         # (R-P1/P2/P3 re-verify): matrix-b landed grouped HSGP
         # (`hsgp_basis(...; by = g)`, commit 6dfdca8d), so the spelling
-        # this case pinned as SurfaceLoweringError now lowers. Grouped-
-        # `by` admission is pinned by the D6 legs in test_smooth_sb.jl;
-        # builder-7 overall still awaits BRM (snag
-        # brm-grouped-hsgp-47a2fcdf), per follow-up 162ibrk.
+        # this case pinned as SurfaceLoweringError now lowers. Builder 7
+        # (Bordet e800ef8d) is admitted and trio-tested as D7 in
+        # test_smooth_sb.jl.
         # garch11: GARCH(1,1) variance recursion is deterministic given
         # data+params; same scan-setup gate.
         ("garch11", "deterministic scan setup",
