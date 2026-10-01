@@ -201,8 +201,8 @@ end
     @test length(names) == 5
     u = map(names) do n
         s = String(n)
-        startswith(s, "log_scale_") && return log(1.2)
-        startswith(s, "xi_") &&
+        startswith(s, "tau_") && return log(1.2)
+        startswith(s, "z_flat_") &&
             return 0.1 * parse(Int, split(s, ".")[2])
         n === Symbol("alpha.Intercept") && return 0.2
         n === :sigma_y && return log(0.9)

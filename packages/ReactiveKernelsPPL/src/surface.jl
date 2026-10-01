@@ -1255,13 +1255,15 @@ _varying_head(rhs::Expr) = rhs.args[1]::Symbol
 # admits data-or-defined names (forward references work) and
 # `_validate_varying_margins` proves vector shape after lowering.
 # Claims the draws label up front so user definitions can never
-# collide with in-graph names (K=1 scale/xi, correlated L/tau/z).
+# collide with in-graph names (L/tau/z).
 # A draws block's `sd=` keyword: one zero-located scale call for every
-# margin (`sd=Cauchy(0, 5)`). sd priors are Stan-kernel by construction
-# (support `nothing` — no `+log2`), so the proper-half spellings are
-# rejected with the bare form (a `HalfCauchy` prior means `+log2`
-# everywhere else; aliasing it here would lie). Per-margin tuples are
-# planned, not admitted.
+# margin (`sd=Cauchy(0, 5)`), at any K. sd priors are Stan-kernel by
+# construction (support `nothing` — no `+log2`), so the proper-half
+# spellings are rejected with the bare form (a `HalfCauchy` prior means
+# `+log2` everywhere else; aliasing it here would lie). Per-margin
+# tuples are planned, not admitted. The default spelled out
+# (`sd=Normal(0, 1)`) lowers to the empty all-default vector, so it
+# gives the plan omitting `sd=` gives.
 function _lower_varying_sd_prior(raw, K::Int, where)
     raw isa Expr && raw.head === :tuple &&
         _sfail("$where per-margin sd priors are planned — pass one " *
@@ -1301,6 +1303,7 @@ function _lower_varying_sd_prior(raw, K::Int, where)
     sc isa Real && !(sc isa Bool) && sc > 0 ||
         _sfail("$where sd $fam scale must be a positive literal, got " *
               "$(repr(sc))")
+    fam === :Normal && sc == 1 && return VaryingSdPrior[]
     sym = fam === :Cauchy ? :cauchy : :normal
     return fill(VaryingSdPrior(sym, Float64(sc)), K)
 end
@@ -1378,47 +1381,28 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
         _lower_varying_margin_elem(e, data, detnames, where)
         for e in vec.args]
     K = length(margins)
-    kind = if strata !== nothing
-        # SB `ranef_correlated_by` has no K=1 special-case: stratified
-        # draws are always correlated, eta exactly 1.0.
-        eta_given && eta != 1.0 &&
-            _sfail("$where stratified draws need eta 1.0 (SB hardcodes " *
-                  "`lkj_corr_cholesky(1.)`), got $eta")
-        eta = 1.0
-        :correlated
-    elseif mm !== nothing && K == 1 && _is_ones_vmargin(first(margins))
-        # SB uses `ranef_intercept_draws` unconditionally for
-        # intercept-only mm blocks — no eta exists on that path.
-        eta_given &&
-            _sfail("$where multi-membership intercept-only draws take " *
-                  "no eta (SB uses the `:intercept1` geometry " *
-                  "unconditionally — pass no eta)")
-        eta = NaN
-        :intercept1
-    elseif mm !== nothing
-        # SB uses `ranef_correlated_draws` (eta hardcoded 1.0) for
-        # every non-intercept mm block, K=1 slopes included.
-        eta_given && eta != 1.0 &&
-            _sfail("$where multi-membership correlated draws need eta " *
-                  "1.0 (SB hardcodes `lkj_corr_cholesky(1.)`), got $eta")
-        eta = 1.0
-        :correlated
-    elseif K == 1 && !eta_given && _is_ones_vmargin(first(margins))
-        :intercept1
-    elseif K == 1 && !eta_given
-        :slope1
-    else
-        :correlated
-    end
+    # One geometry for every K, every grouping and every margin: LKJ +
+    # tau + z draws. The parameterization is a function of what is
+    # written, never of whether a default-valued keyword is present.
+    # At K = 1 the LKJ factor is the fixed 1x1 `[1]` whatever eta is, so
+    # eta parameterizes nothing there: the default spelled out is the
+    # plan omitting it gives, and any other value is refused rather
+    # than silently ignored.
+    K == 1 && eta_given && eta != 1.0 &&
+        _sfail("$where has one margin, so there is no correlation for " *
+              "eta to parameterize — omit eta, got $eta")
+    strata !== nothing && eta != 1.0 &&
+        _sfail("$where stratified draws need eta 1.0 (SB hardcodes " *
+              "`lkj_corr_cholesky(1.)`), got $eta")
+    mm !== nothing && eta != 1.0 &&
+        _sfail("$where multi-membership draws need eta 1.0 (SB " *
+              "hardcodes `lkj_corr_cholesky(1.)`), got $eta")
+    eta > 0 || _sfail("$where eta must be positive, got $eta")
+    kind = :correlated
     if centered
         mm === nothing && strata === nothing ||
             _sfail("$where centered draws require plain grouping")
         kind = :centered_correlated
-    end
-    if !_is_correlated_kind(kind)
-        eta = NaN
-    elseif !(eta > 0)
-        _sfail("$where eta must be positive, got $eta")
     end
     suffix = string(group)
     if suffix in used_suffixes
@@ -1434,11 +1418,7 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
         _lower_varying_sd_prior(sd_raw, K, where)
     d = VaryingDraws(group, kind, margins, eta, label, suffix, levels,
         sd_priors, mm, strata)
-    if kind === :intercept1 || kind === :slope1
-        for nm in _varying_k1_names(d)
-            _claim!(seen, seelines, nm, line)
-        end
-    elseif strata !== nothing
+    if strata !== nothing
         # Stratified per-stratum L/tau names are bind-time (S unknown
         # here), so only the shared `z_flat` is claimed; the generator
         # owns the per-stratum names and the bound name tables prove
@@ -1591,9 +1571,6 @@ function _lower_gr_grouping(call::Expr, data::Set{Symbol}, where::AbstractString
               "stratum columns, got `gr($g, by=$g)`")
     return VaryingStrata(by, nothing), g
 end
-
-_is_ones_vmargin(m::VaryingMargin) =
-    m.z.kind === :ones && m.coefficient === :Intercept
 
 # One target application of shared draws:
 # `r ~ varying_slice(d, cols)` with `cols` an Int column or a `lo:hi`

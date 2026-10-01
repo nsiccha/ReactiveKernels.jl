@@ -4,7 +4,7 @@
 begin
     t0 ~ StudentT(3, 0, 1)
     bw1 ~ Normal(0, 1)
-    r_t ~ varying_effect(person, [1]; eta = 1.0, sd = Exponential(1))
+    r_t ~ varying_effect(person, [1]; sd = Exponential(1))
     c_la[levels(item)] .~ Normal.(1, 1)
     c_s1[levels(item)] .~ Normal.(0, 3)
     c_s2[levels(item)] .~ Normal.(0, 3)
