@@ -122,8 +122,9 @@ const _rectangular_pk_enabled = Ref(false)
 
 function _pk_compiled_cell(cell, ends, opcols, args, marker)
     _rectangular_pk_enabled[] || throw(ArgumentError(
-        "compiled PK recurrences are disabled pending Reactant reverse control-flow " *
-        "support (https://github.com/nsiccha/ReactiveKernels.jl/issues/13); " *
+        "compiled PK recurrences are disabled: PK reverse compilation " *
+        "currently fails tracing the rectangular path's StaticArrays matrix " *
+        "exponential (see docs/src/scan.md, PK adapter note); " *
         "data-derived loop unrolling is not a supported fallback"))
     ReactiveKernels._dynamic_tensorized_marker(opcols) === nothing ||
         throw(ArgumentError("rectangular PK requires bound operation columns"))
@@ -742,7 +743,8 @@ construction.
 Native reads accumulate with `push!` in encounter order (`op_read_idx` is
 the per-op cumsum of READs), matching SB's counter-write. Traced calls never
 execute this host loop: compiled PK recurrences are explicitly unsupported
-pending [Reactant reverse control-flow support](https://github.com/nsiccha/ReactiveKernels.jl/issues/13).
+(PK reverse compilation currently fails tracing the rectangular path's
+StaticArrays matrix exponential — see the [scan](scan.md) PK adapter note).
 The experimental rectangular adapter uses a retained loop and a fixed output
 buffer; its private diagnostic opt-in does not enable a supported sampler path.
 """

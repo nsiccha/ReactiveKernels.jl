@@ -251,4 +251,22 @@ end
         eta = be .* th
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
+    # A dotted unary map over two operands fails closed with guidance,
+    # never a raw `only` ArgumentError (robust G2/G3/G4 re-audit).
+    for bad in (:(exp.(th, al)), :(logistic.(th, al)))
+        err = try
+            lower_rkppl(quote
+                th = a_th .+ b_th .* xs
+                al = a_al .+ b_al .* xs
+                be ~ Normal(0.0, 100.0)
+                eta = $bad
+                y .~ Bernoulli.(logistic.(eta))
+            end, (:y, :xs))
+            nothing
+        catch e
+            e
+        end
+        @test err isa SurfaceLoweringError
+        @test occursin("takes one operand", sprint(showerror, err))
+    end
 end

@@ -148,6 +148,17 @@ const _RJ_KS = [parse(Int, s) for s in
     @test prepare_query(build_kernel(bound_f), bound_f, :sampler)(fx.u) == native
     @test_throws "compiled PK recurrences are disabled" Reactant.@code_hlo fx.post_q(
         Reactant.to_rarray(fx.u))
+    # The refusal names the live blocker (scan.md PK adapter note), not the
+    # closed issue #13 (robust G2/G3/G4 re-audit).
+    err = try
+        Reactant.@code_hlo fx.post_q(Reactant.to_rarray(fx.u))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("scan.md", sprint(showerror, err))
+    @test !occursin("issues/13", sprint(showerror, err))
 end
 
 # Ladder 3 (opt-in diagnostic): retained recurrence primal parity.

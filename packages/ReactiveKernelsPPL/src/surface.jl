@@ -6835,6 +6835,10 @@ function _is_bare_sub_map(rhs, ctx)
         return _is_bare_sub_map(ctx.detmap[rhs], ctx)
     end
     _is_composed_map(rhs) && rhs.args[1] in _COMPOSED_UNARY || return false
+    # Multi-operand maps are not bare-sub link spellings; returning false
+    # routes them to `_extract_composed_tree`, which fails closed with the
+    # one-operand guidance instead of a raw `only` ArgumentError.
+    length(rhs.args[2].args) == 1 || return false
     arg = only(rhs.args[2].args)
     arg isa Symbol || return false
     _composed_trigger(arg, ctx) && return false
