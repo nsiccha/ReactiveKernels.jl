@@ -552,7 +552,7 @@ end
     reject(:(mu = beta_ar .* u))
 end
 
-@testset "tanh assignment: scalar admitted, dotted rejected" begin
+@testset "tanh assignment: scalar and dotted admitted" begin
     plan = lower_rkppl(quote
         phi_raw ~ Normal(0, 1)
         a ~ Normal(0, 1)
@@ -565,14 +565,19 @@ end
     @test only(a for a in plan.assignments if a.name === :phi).expr ==
         :(tanh(phi_raw))
     @test (validate_structure(plan); true)
-    # dotted `tanh.` stays fail-closed (scalar vocabulary only in v1)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # Dotted `tanh.` broadcasts the built-in itself (functions as values):
+    # an elementwise column over `x` (density: test_functions_as_values.jl).
+    dotted = lower_rkppl(quote
         a ~ Normal(0, 1)
         sigma ~ Exponential(1)
         w = tanh.(x)
         mu = a .+ w
         y .~ Normal.(mu, sigma)
     end, (:x, :y))
+    w = only(d for d in dotted.derived if d.name === :w).expr
+    @test w.head === :. && w.args[1] isa GlobalRef &&
+        w.args[1].name === :tanh && w.args[2] == Expr(:tuple, :x)
+    @test (validate_structure(dotted); true)
 end
 
 @testset "non-centered emission: fail-closed shapes" begin
