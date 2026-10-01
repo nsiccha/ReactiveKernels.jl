@@ -555,6 +555,91 @@ end
     @test allequal(sizes)
 end
 
+@testset "a history scan reads a 2-D host lag table at two traced indices" begin
+    F = AuthoredScanFixtures
+    units = [exp(-0.3 * (l - 1)) for l in 1:20]
+    traced_units = Reactant.to_rarray(units)
+    weights = prepare(F.authored_scan_history)
+    sizes = Int[]
+    for (amounts, shifts) in (([2.0, 0.0, 1.5, 3.0], [0, 2, 3, 7]),
+                              ([2.0, 0.0, 1.5, 3.0, 1.0, 0.7, 0.2, 1.1],
+                               [0, 2, 3, 7, 9, 12, 13, 15]))
+        lattice = F.HistoryLattice(shifts)
+        table = F.HistoryTable(lattice)
+        expected = weights(amounts, table, units)
+        @test expected ≈ weights(amounts, lattice, units)
+        traced = Reactant.to_rarray(amounts)
+        compiled = Reactant.@compile weights(traced, table, traced_units)
+        @test Array(compiled(traced, table, traced_units)) ≈ expected
+        changed = Reactant.to_rarray(amounts .+ 0.5)
+        @test Array(compiled(changed, table, traced_units)) ≈
+            weights(amounts .+ 0.5, table, units)
+        hlo = repr(Reactant.@code_hlo optimize = false weights(traced, table, traced_units))
+        @test count("stablehlo.while", hlo) == 3
+        push!(sizes, count("\n", hlo))
+    end
+    # Twice the steps, the same program.
+    @test allequal(sizes)
+
+    table = F.HistoryTable(F.HistoryLattice([0, 2, 3, 7, 12]))
+    amounts = [2.0, 0.0, 1.5, 3.0, 1.0]
+    batch = vectorize(F.authored_scan_history; batched = :units, want = :weights)
+    traced_amounts = Reactant.to_rarray(amounts)
+    lane_sizes = Int[]
+    for lanes in (3, 6)
+        U = [exp(-0.3 * (l - 1)) * s for l in 1:20, s in range(0.5, 2.0; length = lanes)]
+        traced_U = Reactant.to_rarray(U)
+        compiled = Reactant.@compile batch(traced_amounts, table, traced_U)
+        @test Array(compiled(traced_amounts, table, traced_U)) ≈ batch(amounts, table, U)
+        push!(lane_sizes, count("\n", repr(Reactant.@code_hlo optimize = false batch(
+            traced_amounts, table, traced_U))))
+    end
+    @test allequal(lane_sizes)
+end
+
+@testset "a partly traced named tuple keeps its host matrix host in a helper's loops" begin
+    F = AuthoredScanFixtures
+    ys = prepare(F.authored_scan_surface)
+    xs = [0.1, 0.4, 0.9, 1.3]
+    traced_xs = Reactant.to_rarray(xs)
+    scale = Reactant.to_rarray(1.5; track_numbers = true)
+    other_scale = Reactant.to_rarray(-0.5; track_numbers = true)
+    sizes = Int[]
+    for m in (3, 6)
+        W = [sin(a + 2b) / (a + b) for a in 1:m, b in 1:m]
+        for matrix in (W, Reactant.to_rarray(W))    # a host and a traced matrix
+            compiled = Reactant.@compile ys(matrix, scale, traced_xs)
+            @test Array(compiled(matrix, scale, traced_xs)) ≈ ys(W, 1.5, xs)
+            @test Array(compiled(matrix, other_scale, traced_xs)) ≈ ys(W, -0.5, xs)
+        end
+        hlo = repr(Reactant.@code_hlo optimize = false ys(W, scale, traced_xs))
+        # The scan loop, plus the helper's two sums in the step traced before it
+        # and in the loop body; the matrix is never carried element by element.
+        @test count("stablehlo.while", hlo) == 5
+        push!(sizes, count("\n", hlo))
+    end
+    # Twice the matrix side, the same program.
+    @test allequal(sizes)
+
+    # Reverse through the gathers, against central differences of the native kernel.
+    total = prepare(F.authored_scan_surface; want = :total)
+    W = [sin(a + 2b) / (a + b) for a in 1:4, b in 1:4]
+    h = 1e-6
+    fd_W = [(E = zeros(size(W)); E[c] = h;
+             (total(W .+ E, 1.5, xs) - total(W .- E, 1.5, xs)) / 2h)
+            for c in CartesianIndices(W)]
+    gradient_W(w, x) =
+        Enzyme.gradient(Enzyme.Reverse, Enzyme.Const(v -> total(v, 1.5, x)), w)
+    traced_W = Reactant.to_rarray(W)
+    @test isapprox(Array(only((Reactant.@compile gradient_W(traced_W, traced_xs))(
+        traced_W, traced_xs))), fd_W; rtol = 1e-6)
+    fd_scale = (total(W, 1.5 + h, xs) - total(W, 1.5 - h, xs)) / 2h
+    gradient_scale(s, x) =
+        Enzyme.gradient(Enzyme.Reverse, Enzyme.Const(v -> total(W, v, x)), s)
+    @test isapprox(Reactant.to_number(only((Reactant.@compile gradient_scale(
+        scale, traced_xs))(scale, traced_xs))), fd_scale; rtol = 1e-6)
+end
+
 @testset "a scan's host struct and host named tuple stay host in its loop" begin
     F = AuthoredScanFixtures
     xs = [1.0, 2.0, 3.0, 4.0]

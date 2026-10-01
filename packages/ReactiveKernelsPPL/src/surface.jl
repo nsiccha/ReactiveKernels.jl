@@ -506,16 +506,45 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         if s.lhs ∉ data && _is_dar_beta_rhs(s.rhs))
     dar_sigma_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dar_sigma_rhs(s.rhs))
+    # Array-valued declarations shape as `:array` (values, never
+    # per-observation columns, so `B * w` stays a matrix product): declared
+    # arrays (`z[1:K] .~ ...`, two-axis), LKJ Cholesky factors, simplexes,
+    # and vectors sized by a bound data matrix (`w[axes(B, 2)]`, `B` not an
+    # `hcat` definition — never a coefficient vector). A one-axis
+    # `c[levels(g)]` / `b[axes(X, 2)]` declaration over an `hcat` matrix
+    # keeps the slice-1 scalar name shape: it is a coefficient when a
+    # predictor consumes it as one (`c[g]`, `X * b`), and an array (read
+    # by `c[g]`, `c[1]`) otherwise. `value_arrays` are never coefficients:
+    # a bare `z[g]` summand gathers them.
+    hcat_defs = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
+    array_decls = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
+        (s.dims !== nothing ||
+            (s.broadcast && s.matrix !== nothing && s.matrix ∉ hcat_defs) ||
+            (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
+    value_arrays = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
+        (s.dims !== nothing ||
+            (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
+    # Every array-capable declaration (sized `.~`, LKJ, a `Dirichlet`
+    # simplex value): an expression that READS one by index (`L[2, 1] .* x`,
+    # `tau .* z[g]`, `phi[1] .* x`) is a value, never an affine
+    # sub-predictor over coefficients.
+    sized_decls = union(array_decls, dirichlet_names,
+        Set{Symbol}(s.lhs for s in sample
+            if s.lhs ∉ data && s.broadcast &&
+                (s.levels !== nothing || s.matrix !== nothing)))
     # Shape every definition (data-free: data ⇒ vector, sampled ⇒ scalar,
     # det-refs recurse with memo; cycles error downstream), then
     # canonicalize each RHS in dependency order (Julia-valid undotted
     # scalar-array ops take dotted-canonical form; Julia-invalid vector
     # combinations fail here naming the definition). Everything downstream
     # sees canonical RHSs.
+    # Model-level array values: upstream's simplexes plus this lane's
+    # declared array parameters (`z[1:K] .~`, `L ~ LKJCholesky`, ...).
     shape_env = _ShapeEnv(
         union(plate_names, Set{Symbol}(s.state for s in scans), varying_names),
-        dirichlet_names)
-    detshape = _def_shapes(det, data, detmap; env = shape_env)
+        union(dirichlet_names, array_decls))
+    detshape = _def_shapes(det, data, detmap; arrays = array_decls,
+        env = shape_env)
     _check_module_calls(det, detmap, data, shape_env)
     canonmap = Dict{Symbol,Any}()
     for nm in _det_topo_order(det, detmap)
@@ -571,13 +600,18 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         dar_sigma_names = dar_sigma_names,
         dar_states = Set{Symbol}(),
         dar_coefs = Set{Symbol}(),
-        dar_specs = DarSpec[])
+        dar_specs = DarSpec[],
+        array_decls = array_decls,
+        value_arrays = value_arrays,
+        sized_decls = sized_decls)
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
     pred_idx = Dict{Symbol,Int}()
     coefuse = Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}()
     glmuse = Dict{Symbol,Tuple{Symbol,Symbol}}()
     for s in sample
+        # Declared arrays lower with the parameters.
+        s.dims !== nothing && continue
         if s.broadcast
             # Broadcast coefficient priors lower with their factor term.
             s.levels !== nothing && continue
@@ -692,7 +726,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         levelmaps, taken, ctx.matrices, hyper_names)
     hses, hsparams = _lower_horseshoe_priors(sample, coefuse, predictors,
         hsset, taken)
-    params, paramsyms, dirichlets = _lower_parameters(sample, coefuse, ctx, glmuse)
+    params, paramsyms, dirichlets, arrays =
+        _lower_parameters(sample, coefuse, ctx, glmuse)
     append!(params, taus)
     append!(params, hsparams)
     plate_parameters = PlateParameter[
@@ -782,7 +817,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
-        matrices = matrices, event_lps = event_lps)
+        matrices = matrices, event_lps = event_lps,
+        array_parameters = arrays)
     validate_structure(plan)
     return plan
 end
@@ -821,8 +857,8 @@ end
 const _NO_SHAPE_ENV = _ShapeEnv(Set{Symbol}(), Set{Symbol}())
 
 function _def_shapes(det, data::Set{Symbol}, detmap;
-        env::_ShapeEnv = _NO_SHAPE_ENV)
-    memo = Dict{Symbol,Symbol}()
+        arrays::Set{Symbol} = Set{Symbol}(), env::_ShapeEnv = _NO_SHAPE_ENV)
+    memo = Dict{Symbol,Symbol}(a => :array for a in arrays)
     for (nm, _) in det
         memo[nm] = _shape_of(detmap[nm], data, detmap, memo, Set{Symbol}(),
             env)
@@ -835,7 +871,7 @@ function _shape_of(ex, data, detmap, memo, active::Set{Symbol},
     ex isa Symbol ||
         return _shape_of_expr(ex, data, detmap, memo, active, env)
     ex in data && return :vector
-    haskey(detmap, ex) || return :scalar
+    haskey(detmap, ex) || return get(memo, ex, :scalar)
     haskey(memo, ex) && return memo[ex]
     ex in active && return :scalar  # cyclic: errors downstream
     push!(active, ex)
@@ -849,8 +885,16 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         env::_ShapeEnv = _NO_SHAPE_ENV)
     ex isa LineNumberNode && return :scalar
     ex isa Expr || return :scalar
+    shape(a) = _shape_of(a, data, detmap, memo, active, env)
     head = ex.head
     if head === :.
+        # Over a declared array value the elementwise array rules apply
+        # (`sd .* z` stays an array; `z .+ x` is a Julia length mismatch).
+        if _is_dotted_call(ex)
+            argsh = [shape(a) for a in ex.args[2].args]
+            (:array in argsh || :invalid in argsh) &&
+                return _elementwise_shape(argsh)
+        end
         if _is_dotted_call(ex) && ex.args[1] isa GlobalRef
             # A module function broadcast is elementwise over its
             # arguments: observation-aligned exactly when one of them is.
@@ -860,20 +904,57 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         return _broadcast_shape(ex, data, detmap, memo, active, env)
     end
     if head === :ref
+        base = ex.args[1]
+        base isa Symbol && shape(base) === :array &&
+            return _ref_shape(ex, data, shape)
         _is_gather(ex, data, detmap, env) || return :scalar
         return _obs_axis(ex, data, detmap, memo, active, env) ?
             :vector : :scalar
     end
+    head === Symbol("'") && return shape(ex.args[1]) === :array ? :array :
+        :scalar
     head === :call || return :scalar  # exotic heads: downstream rejects
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
     fn isa Symbol || return :scalar  # module/anonymous calls: model-level
     fn in REDUCTION_FNS && return :scalar
-    fn in ELEMENTWISE_OPS &&
+    argshapes = [shape(a) for a in ex.args[2:end]]
+    if fn in ELEMENTWISE_OPS
+        (:array in argshapes || :invalid in argshapes) &&
+            return _elementwise_shape(argshapes)
         return _broadcast_shape(ex, data, detmap, memo, active, env)
-    argshapes = [_shape_of(a, data, detmap, memo, active, env)
-        for a in ex.args[2:end]]
+    end
     return _shape_of_call(fn, argshapes)
+end
+
+# Elementwise (dotted) results: per-observation when any operand is,
+# array-shaped over arrays and scalars, per-observation otherwise (the
+# slice-1 rule: dotted ⇒ vector).
+function _elementwise_shape(argshapes)
+    :invalid in argshapes && return :invalid
+    # An array value never meets a per-observation column elementwise
+    # (lengths differ; index the array per observation: `z[g] .* x`).
+    :array in argshapes && :vector in argshapes && return :invalid
+    :vector in argshapes && return :vector
+    :array in argshapes && return :array
+    return :vector
+end
+
+# Reads of an array (`z[g]` per observation, `phi[1]` scalar, `L[:, 1]`
+# array); every other ref keeps the slice-1 scalar shape (factor
+# coefficients `c[g]` classify by position, not shape).
+function _ref_shape(ex, data, shape)
+    base = ex.args[1]
+    base isa Symbol && shape(base) === :array || return :scalar
+    idx = ex.args[2:end]
+    isempty(idx) && return :scalar
+    if idx[1] isa Symbol && idx[1] in data
+        # Per-observation gather: one value (or row) per observation.
+        length(idx) == 2 && idx[2] === :(:) && return :matrix
+        return :vector
+    end
+    any(i -> i === :(:), idx) && return :array
+    return :scalar
 end
 
 # Built-in broadcasts (dotted operators and math) shape `:vector`, except
@@ -942,6 +1023,7 @@ end
 # Single rule table for undotted `:call` shapes over argument shapes.
 function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
     :invalid in argshapes && return :invalid
+    :array in argshapes && return _array_call_shape(fn, argshapes)
     nvec = count(==(:vector), argshapes)
     nmat = count(==(:matrix), argshapes)
     if fn === :hcat
@@ -995,6 +1077,34 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
     return nvec == 0 ? :scalar : :vector  # unknown heads: follow the args
 end
 
+# Undotted calls over array values follow Julia: `*` is the matrix
+# product (a data matrix times an array is per-observation — `B * w`;
+# arrays and scalars scale), `+`/`-` add equal-shaped arrays, `/`
+# divides by a scalar; elementwise math is dotted. Other heads follow
+# their arguments (per-observation if any is, array otherwise).
+function _array_call_shape(fn::Symbol, argshapes::Vector{Symbol})
+    fn in ELEMENTWISE_OPS && return _elementwise_shape(argshapes)
+    if fn === :*
+        length(argshapes) == 2 || return :invalid
+        a, b = argshapes
+        (a === :matrix || a === :vector) && b === :array && return :vector
+        a in (:scalar, :array) && b in (:scalar, :array) && return :array
+        return :invalid
+    elseif fn === :+ || fn === :-
+        all(==(:array), argshapes) && return :array
+        return :invalid
+    elseif fn === :/
+        length(argshapes) == 2 && argshapes[1] === :array &&
+            argshapes[2] === :scalar && return :array
+        return :invalid
+    elseif fn === :^ || _is_plain_comparison(fn) || fn === :ifelse ||
+            fn in ASSIGNMENT_FNS
+        return :invalid
+    end
+    :vector in argshapes && return :vector
+    return :array
+end
+
 _is_plain_comparison(fn::Symbol) =
     fn === :< || fn === :> || fn === :(==) || fn === :(!=) ||
     fn === :(<=) || fn === :(>=)
@@ -1021,7 +1131,7 @@ function _canonical_expr(ex, data, detshape, where)
         # predictor classification (which checks the coefficient
         # declaration); anything else with a matrix operand already
         # failed above.
-        if fn === :* && :matrix ∉ argshapes &&
+        if fn === :* && :matrix ∉ argshapes && :array ∉ argshapes &&
                 (argshapes[1] === :vector) != (argshapes[2] === :vector)
             return Expr(:call, :.*, args...)
         elseif fn === :/ && argshapes[1] === :vector &&
@@ -1045,30 +1155,52 @@ end
 
 function _canon_shape_expr(ex, data, detshape)
     ex isa Expr || return :scalar
+    shape(a) = _canon_shape(a, data, detshape)
     head = ex.head
     if head === :.
+        if _is_dotted_call(ex)
+            argsh = [shape(a) for a in ex.args[2].args]
+            (:array in argsh || :invalid in argsh) &&
+                return _elementwise_shape(argsh)
+        end
         (_is_dotted_call(ex) && ex.args[1] isa GlobalRef) || return :vector
         return any(a -> _canon_shape(a, data, detshape) in
             (:vector, :matrix), ex.args[2].args) ? :vector : :scalar
     end
     if head === :ref
+        base = ex.args[1]
+        base isa Symbol && shape(base) === :array &&
+            return _ref_shape(ex, data, shape)
         (length(ex.args) == 2 && (ex.args[1] isa Expr ||
             ex.args[1] in data || haskey(detshape, ex.args[1]))) ||
             return :scalar
         return _canon_shape(ex.args[2], data, detshape) === :vector ?
             :vector : :scalar
     end
+    head === Symbol("'") && return shape(ex.args[1]) === :array ? :array :
+        :scalar
     head === :call || return :scalar
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
     fn isa Symbol || return :scalar
     fn in REDUCTION_FNS && return :scalar
-    fn in ELEMENTWISE_OPS && return :vector
-    return _shape_of_call(fn,
-        [_canon_shape(a, data, detshape) for a in ex.args[2:end]])
+    fn in ELEMENTWISE_OPS &&
+        return _elementwise_shape([shape(a) for a in ex.args[2:end]])
+    return _shape_of_call(fn, [shape(a) for a in ex.args[2:end]])
 end
 
 function _julia_mismatch_msg(fn::Symbol, where, ex, argshapes)
+    if :array in argshapes
+        :vector in argshapes && return "$where combines an array value " *
+            "with a per-observation column: `$(repr(ex))` — read the " *
+            "array per observation (`z[g]`, `B * w` with a data matrix " *
+            "`B`) or by position (`z[1]`)"
+        return "$where combines an array value as Julia does not: " *
+            "`$(repr(ex))` — elementwise math over arrays is dotted " *
+            "(`sd .* z`, `exp.(z)`, `a .+ z`), `*` is the matrix product " *
+            "(`B * w` with a data matrix `B`), and `+`/`-` add arrays of " *
+            "one shape"
+    end
     if :matrix in argshapes
         fix = "matrices lower only in predictor matmuls (`mu = X * b`) " *
             "in slice D1"
@@ -1176,6 +1308,8 @@ function _structural_defs(det, data, canonmap, coef_priors, prior_names,
 end
 
 function _is_free_name(s::Symbol, data, detkeys, prior_names, plate_names)
+    # Index syntax (`z[g, :]`, `v[end]`) is not a name.
+    (s === :(:) || s === :end || s === :begin) && return false
     s in data && return false
     s in detkeys && return false
     s in prior_names && return false
@@ -3610,6 +3744,15 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                        "object owns eta over the whole column)")
             end
             _reject_derived_ref_lhs(st.args[2], detnames)
+            arr = _array_sample_lhs(st.args[2], bc, tilde, data)
+            if arr !== nothing
+                alhs, adims = arr
+                _claim!(seen, seelines, alhs, line)
+                _reject_target(st.args[3], alhs)
+                push!(sample, SampleStmt(alhs, st.args[3], bc, nothing,
+                    nothing, nothing, adims))
+                continue
+            end
             lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde, data,
                 level_bindings)
             lhs === :dummy &&
@@ -4451,6 +4594,50 @@ _is_axes2_call(index) =
     index.args[1] === :axes && index.args[2] isa Symbol &&
     index.args[3] == 2
 
+# Declared array parameters ([`ArrayParameter`](@ref)): `z[1:K] .~ ...`
+# (a literal range over a non-data name) and two-axis `z[a, b] .~ ...`
+# (each axis `1:K`, `levels(g)`, or `axes(M, d)`). One-axis
+# `z[levels(g)]` / `z[axes(X, 2)]` keep their coefficient-prior parse:
+# they are arrays exactly when no predictor consumes them as
+# coefficients. Returns `(name, dims)` or `nothing` (not an array).
+function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol})
+    lhs isa Expr && lhs.head === :ref || return nothing
+    target = lhs.args[1]
+    target isa Symbol && target ∉ data || return nothing
+    idx = lhs.args[2:end]
+    if length(idx) == 1
+        _is_literal_range(idx[1]) || return nothing
+    elseif length(idx) != 2
+        _sfail("array $target takes one or two axes, got $(repr(lhs))")
+    end
+    bc || _sfail("array `$(repr(lhs))` is declared elementwise — use " *
+                 "`.~`, not $tilde (`$(repr(lhs)) .~ Normal.(0, 1)`)")
+    return target, Any[_array_axis(target, a, data) for a in idx]
+end
+
+_is_literal_range(r) = r isa Expr && r.head === :call && length(r.args) == 3 &&
+    r.args[1] === :(:)
+
+function _array_axis(target::Symbol, a, data::Set{Symbol})
+    if _is_literal_range(a)
+        lo, hi = a.args[2], a.args[3]
+        lo === 1 && hi isa Integer && !(hi isa Bool) && hi >= 1 || _sfail(
+            "array $target axis $(repr(a)) must be a literal `1:K` with " *
+            "K ≥ 1")
+        return Int(hi)
+    end
+    if _is_levels_call(a)
+        return Expr(:call, :levels,
+            _levels_column(target, a, data, "array $target"))
+    end
+    if a isa Expr && a.head === :call && length(a.args) == 3 &&
+            a.args[1] === :axes && a.args[2] isa Symbol && a.args[3] in (1, 2)
+        return Expr(:call, :axes, a.args[2], a.args[3])
+    end
+    return _sfail("array $target axis $(repr(a)) must be a literal `1:K`, " *
+                  "`levels(g)`, or `axes(M, d)` of a matrix `M`")
+end
+
 # Joint-response statement: `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`
 # (SB's joint form). Outcomes are bare distinct data symbols; means are
 # one location expression per outcome; the factor names an
@@ -4625,7 +4812,10 @@ end
 column: bare LHS, `eachindex`, `axes`). `levels` carries a
 `(grouping column, subset)` pair for `c[levels(g)]` broadcast priors
 (`nothing` otherwise). `matrix` carries the sizing design matrix for
-`b[axes(X, 2)]` coefficient-vector priors (`nothing` otherwise)."""
+`b[axes(X, 2)]` coefficient-vector priors (`nothing` otherwise). `dims`
+carries the axes of a declared array parameter (`z[1:K] .~ ...`,
+`z[levels(g), axes(Z, 2)] .~ ...` — see [`ArrayParameter`](@ref);
+`nothing` otherwise)."""
 struct SampleStmt
     lhs::Symbol
     rhs::Any
@@ -4633,7 +4823,10 @@ struct SampleStmt
     range::Union{Nothing,UnitRange{Int}}
     levels::Any
     matrix::Union{Nothing,Symbol}
+    dims::Union{Nothing,Vector{Any}}
 end
+SampleStmt(lhs::Symbol, rhs, broadcast::Bool, range, levels, matrix) =
+    SampleStmt(lhs, rhs, broadcast, range, levels, matrix, nothing)
 SampleStmt(lhs::Symbol, rhs, broadcast::Bool) =
     SampleStmt(lhs, rhs, broadcast, nothing, nothing, nothing)
 
@@ -7661,7 +7854,32 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     s in ctx.varying_draws_names && return false
     _derived_reads_latent(s, ctx) && return false
     _composed_data_only(s, ctx, Set{Symbol}()) && return false
+    # A definition reading a declared array is a value (an in-graph
+    # column), not an affine sub-predictor — except the bare factor alias
+    # `th = c[g]` over a coefficient-capable `c[levels(g)]`, which keeps
+    # its composed factor-sub meaning.
+    rhs = ctx.detmap[s]
+    _reads_array_value(rhs, ctx) && !(_is_factor_index_def(rhs, ctx) &&
+        rhs.args[1] ∉ ctx.array_decls) && return false
     return true
+end
+
+# Whether `ex` reads a declared array value — a bare array name
+# (`B * w`), or an indexed read of any array-capable declaration
+# (`phi[1]`, `z[g]`, `L[2, 1]`) — directly, or (`follow`) through
+# definitions.
+function _reads_array_value(ex, ctx, seen::Set{Symbol} = Set{Symbol}();
+        follow::Bool = true)
+    if ex isa Symbol
+        ex in ctx.array_decls && return true
+        follow && haskey(ctx.detmap, ex) && ex ∉ seen || return false
+        push!(seen, ex)
+        return _reads_array_value(ctx.detmap[ex], ctx, seen)
+    end
+    ex isa Expr || return false
+    ex.head === :ref && ex.args[1] isa Symbol &&
+        ex.args[1] in ctx.sized_decls && return true
+    return any(a -> _reads_array_value(a, ctx, seen; follow), ex.args)
 end
 
 """A scalar leaf: sampled name (any prior — coefficient collisions fail
@@ -8008,7 +8226,8 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
         "into $where) calls `dar()`, which lowers only as a direct " *
         "predictor summand (`mu = a .+ dar(beta, sigma)`), not " *
         "inside definitions")
-    if ex in ctx.structural || ctx.detshape[ex] !== :vector
+    # Array-valued definitions (`M = (sd .* L)'`) stay named values.
+    if ex in ctx.structural || ctx.detshape[ex] ∉ (:vector, :array)
         ex in visited && _sfail("$where: cyclic definition through $ex")
         push!(ctx.absorbed, ex)
         push!(visited, ex)
@@ -8195,7 +8414,11 @@ function _classify_matmul(pname, core::Expr, sign::Int, ctx)
             "$(length(Smat.columns)) elements (sized by `$S`) but matrix " *
             "`$X` has $K columns")
     else
-        role = r in ctx.data ? "a data column" :
+        role = r in ctx.value_arrays ? "a declared array (an `hcat` " *
+                "design matrix multiplies a coefficient vector " *
+                "`b[axes($X, 2)] .~ ...`; a bound data matrix multiplies " *
+                "arrays, `B * $r`)" :
+            r in ctx.data ? "a data column" :
             haskey(ctx.detmap, r) ? "a computed assignment" :
             r in ctx.prior_names ? "a sampled name" :
             r in ctx.plate_names ? "a latent vector" :
@@ -8561,6 +8784,13 @@ function _classify_product(pname, core::Expr, sign::Int, ctx)
     if any(f -> _contains_mo(f) || _contains_mo1(f), core.args[2:end])
         return _classify_mo_product(pname, core, sign, ctx)
     end
+    # A product whose factors read a declared array directly
+    # (`tau .* z[g]`, `phi[1] .* x`) is a value: extracted whole as an
+    # in-graph column (its scalar factors stay ordinary parameters). A
+    # named column (`b .* w`, `w` a definition) keeps the coefficient
+    # term.
+    _reads_array_value(core, ctx; follow = false) &&
+        return _extract_summand(pname, core, sign, ctx)
     inner = sign
     coefs = Symbol[]
     values = Any[]
@@ -8663,6 +8893,10 @@ function _summand_kind(_, _)
 end
 
 function _classify_ref(pname, core::Expr, sign::Int, ctx)
+    # Reads of a declared array value (`z[g]`, `phi[1]`) are values, not
+    # factor coefficients: extracted as a per-observation column.
+    core.args[1] in ctx.value_arrays &&
+        return _extract_summand(pname, core, sign, ctx)
     length(core.args) == 2 || _sfail("predictor $pname: factor indexing " *
                                      "takes `coefficients[group]` exactly, " *
                                      "got $(repr(core))")
@@ -9401,8 +9635,21 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
     params = SampledParameter[]
     syms = Set{Symbol}()
     vectors = VectorParameter[]
+    arrays = ArrayParameter[]
     for s in sample
         (s.lhs in ctx.data || s.lhs in ctx.derived_responses) && continue
+        if s.dims !== nothing
+            push!(arrays, _lower_array_parameter(s.lhs, s.dims, s.rhs,
+                coefuse, ctx, syms))
+            continue
+        end
+        if !s.broadcast && _is_lkj_cholesky_call(s.rhs)
+            haskey(coefuse, s.lhs) && _sfail(
+                "$(s.lhs) is a predictor coefficient and cannot also be " *
+                "an LKJCholesky factor")
+            push!(arrays, _lower_lkj_cholesky(s.lhs, s.rhs))
+            continue
+        end
         if _is_dirichlet_call(s.rhs)
             haskey(coefuse, s.lhs) && _sfail(
                 "$(s.lhs) is a predictor coefficient and cannot also be " *
@@ -9422,13 +9669,23 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
         end
         haskey(coefuse, s.lhs) && continue
         haskey(glmuse, s.lhs) && continue
-        s.levels !== nothing && _sfail("levels prior `$(s.lhs)[...]` is " *
-                                       "never used in a predictor — size " *
-                                       "only vectors the model indexes")
-        s.matrix !== nothing && _sfail("matrix prior `$(s.lhs)[...]` is " *
-                                       "never used in a predictor — use " *
-                                       "it in a matmul (`mu = X * " *
-                                       "$(s.lhs)`) or drop it")
+        # A sized declaration no predictor consumes as coefficients is a
+        # declared array parameter (a value the model reads by name).
+        if s.levels !== nothing
+            gcol, sub = s.levels
+            sub === Colon() || _sfail("array $(s.lhs) declares a level " *
+                "subset `$(s.lhs)[levels($gcol)[...]]` — subsets size " *
+                "factor coefficients; an array spans all of `levels($gcol)`")
+            push!(arrays, _lower_array_parameter(s.lhs,
+                Any[Expr(:call, :levels, gcol)], s.rhs, coefuse, ctx, syms))
+            continue
+        end
+        if s.matrix !== nothing
+            push!(arrays, _lower_array_parameter(s.lhs,
+                Any[Expr(:call, :axes, s.matrix, 2)], s.rhs, coefuse, ctx,
+                syms))
+            continue
+        end
         p = _lower_parameter(s.lhs, s.rhs, coefuse, ctx.matrices)
         p = _dar_stan_override(p, ctx.dar_specs)
         push!(params, p)
@@ -9436,7 +9693,107 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
             v isa Symbol && push!(syms, v)
         end
     end
-    return params, syms, vectors
+    return params, syms, vectors, arrays
+end
+
+_is_lkj_cholesky_call(rhs) =
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+    rhs.args[1] === :LKJCholesky
+
+# `L ~ LKJCholesky(K, eta)` (Distributions.jl; the optional third argument
+# is `'L'` — `L` is the lower factor). `K` is a literal or `size(M, d)` of
+# a matrix `M`; `eta` a finite positive literal.
+function _lower_lkj_cholesky(lhs, rhs)
+    args = _plain_args(rhs, "`LKJCholesky`")
+    (length(args) == 2 || length(args) == 3) || _sfail("parameter $lhs: " *
+        "`LKJCholesky` takes (K, eta) (`$lhs ~ LKJCholesky(3, 2.0)`), got " *
+        "$(length(args)) arguments")
+    K, eta = args[1], args[2]
+    if length(args) == 3
+        args[3] == 'L' || _sfail("parameter $lhs: `$lhs` is the LOWER " *
+            "Cholesky factor (`LKJCholesky(K, eta)` or `LKJCholesky(K, " *
+            "eta, 'L')`), got uplo $(repr(args[3]))")
+    end
+    dim = if K isa Integer && !(K isa Bool)
+        K >= 1 || _sfail("parameter $lhs: `LKJCholesky` dimension must be " *
+            "≥ 1, got $K")
+        Int(K)
+    elseif K isa Expr && K.head === :call && length(K.args) == 3 &&
+            K.args[1] === :size && K.args[2] isa Symbol && K.args[3] in (1, 2)
+        Expr(:call, :size, K.args[2], K.args[3])
+    else
+        _sfail("parameter $lhs: `LKJCholesky` dimension is a literal or " *
+            "`size(M, d)` of a matrix `M`, got $(repr(K))")
+    end
+    eta isa Real && !(eta isa Bool) && isfinite(eta) && eta > 0 || _sfail(
+        "parameter $lhs: LKJ shape `eta` must be a finite positive literal, " *
+        "got $(repr(eta))")
+    return ArrayParameter(lhs, :lkj_cholesky, (arg1 = Float64(eta),),
+        Any[dim, dim], nothing, lhs)
+end
+
+# `z[axes...] .~ Fam.(args...)`: the elementwise prior is the scalar
+# statement `Fam(args...)` applied per element (Distributions.jl
+# broadcast), so it lowers through the scalar parameter parser (family,
+# half/truncated support) with every non-literal argument passed through
+# as a value (a name or expression read per element; literal vectors per
+# element). Records the names the arguments read in `syms`.
+function _lower_array_parameter(lhs, dims::Vector{Any}, rhs, coefuse, ctx,
+        syms::Set{Symbol})
+    haskey(coefuse, lhs) && _sfail("array $lhs is used as a predictor " *
+        "coefficient — read it as a value (`$lhs[g]` per observation, " *
+        "`B * $lhs` through a data matrix)")
+    call = _undot_distribution(lhs, rhs)
+    held = Dict{Symbol,Any}()
+    call = _hold_array_args(lhs, call, held)
+    p = _lower_parameter(lhs, call, coefuse, ctx.matrices)
+    args = map(v -> v isa Symbol ? get(held, v, v) : v, p.args)
+    for v in values(args)
+        v isa Symbol || v isa Expr || continue
+        for r in _value_symbols(v)
+            haskey(coefuse, r) && _sfail("$r is a predictor coefficient " *
+                "and cannot also be a prior argument (array $lhs)")
+            push!(syms, r)
+        end
+    end
+    return ArrayParameter(lhs, p.family, args, dims, p.support_override, lhs)
+end
+
+# `Fam.(args...)` → `Fam(args...)`, recursively through the distribution
+# arguments of `truncated.(...)` (`truncated.(Normal.(0, s), 0, Inf)`).
+function _undot_distribution(lhs, rhs)
+    rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
+        rhs.args[1] isa Symbol && rhs.args[2] isa Expr &&
+        rhs.args[2].head === :tuple || _sfail("array $lhs takes an " *
+            "elementwise prior `Fam.(args...)` (`$lhs[1:3] .~ " *
+            "Normal.(0, 1)`), got $(repr(rhs))")
+    f = rhs.args[1]
+    args = Any[a isa Expr && a.head === :. && length(a.args) == 2 &&
+            a.args[1] isa Symbol && haskey(_PARAM_FAMILIES, a.args[1]) ?
+            _undot_distribution(lhs, a) : a for a in rhs.args[2].args]
+    return Expr(:call, f, args...)
+end
+
+# Replace each non-literal distribution argument with a placeholder name
+# (the scalar parser admits literals and names only), recorded in `held`
+# so the lowered arguments restore the author's expression.
+function _hold_array_args(lhs, call::Expr, held::Dict{Symbol,Any})
+    out = Any[call.args[1]]
+    for a in call.args[2:end]
+        if a isa Expr && a.head === :call && !isempty(a.args) &&
+                a.args[1] isa Symbol && haskey(_PARAM_FAMILIES, a.args[1])
+            push!(out, _hold_array_args(lhs, a, held))
+        elseif call.args[1] === :truncated
+            push!(out, a)  # truncation bounds keep the scalar grammar
+        elseif a isa Expr && a.head !== :parameters
+            ph = Symbol("#arrayarg#", length(held) + 1)
+            held[ph] = a
+            push!(out, ph)
+        else
+            push!(out, a)
+        end
+    end
+    return Expr(call.head, out...)
 end
 
 _is_dirichlet_call(rhs) =
