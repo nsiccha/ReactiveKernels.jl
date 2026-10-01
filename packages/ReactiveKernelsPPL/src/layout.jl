@@ -1283,8 +1283,8 @@ function transform_statements(e::LayoutEntry)
     if e.kind === :plate || e.kind === :spline ||
        e.kind === :varying || e.kind === :hsgp || e.kind === :glm
         # Spline vectors ride the plate transform path (block + scalar
-        # endpoints); the contract pins their supports to real/positive,
-        # so the :interval arm below is unreachable for them. Varying
+        # endpoints); their supports are real/positive, or :interval
+        # under a bounding `Uniform` sd hyper prior. Varying
         # vectors ride it too (`z_flat` identity, `tau` exp), as
         # do HSGP coefficient vectors (`beta_raw`, identity only).
         return _plate_transform_statements(e)

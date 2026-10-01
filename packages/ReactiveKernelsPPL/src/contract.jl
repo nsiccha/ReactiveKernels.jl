@@ -904,7 +904,9 @@ One free spline coefficient block (SB `_sb_s_generic`/`_sb_t2_generic`):
 flat `b_fixed`, standard-normal `b_*_raw`, Stan-kernel half-normal `sd`
 (`:normal` + `:positive_stan` — plain `_lpdf` plus the bare-`u` Jacobian,
 NO truncation renormalizer, matching SB which never renormalizes
-bounds). `width` is static from `k`; `basis` is the owning
+bounds). A stated `sd` prior from a positive-support family, or a
+bounding `Uniform`, carries no override (`_hyper_support_override`).
+`width` is static from `k`; `basis` is the owning
 [`SplineBasis`](@ref) id. Layout packs each as one contiguous block
 (plate-shaped); priors broadcast over cells.
 """
@@ -940,6 +942,15 @@ const _HYPER_PRIOR_FAMILIES = Dict{Symbol,Tuple{Vararg{Int}}}(
     :lognormal => (2,), :inverse_gamma => (2,), :gamma => (2,),
     :exponential => (1,), :normal => (2,), :cauchy => (2,),
     :student_t => (3,), :uniform => (2,))
+
+# The support override a positive hyperparameter takes under a hyper
+# prior of `family`: a real-support family (Normal, Cauchy, StudentT) rides
+# the Stan-kernel half (`:positive_stan` — plain `_lpdf`, no `+log2`); a
+# positive-support family (LogNormal, InverseGamma, Gamma, Exponential)
+# and the bounding `Uniform` already live on their own support and take
+# none (their own density, Distributions.jl semantics).
+_hyper_support_override(family::Symbol) =
+    SAMPLED_SUPPORT[family] === :real ? :positive_stan : nothing
 
 # A `Uniform(lo, hi)` hyper prior BOUNDS its hyperparameter (the SB
 # prior-bound intersection with the positive support): the
@@ -1846,7 +1857,11 @@ function _spline_block_roles(id::Symbol, kind::Symbol, k)
     return roles, Symbol("sd_$id")
 end
 
-function _spline_vector_specs(id::Symbol, kind::Symbol, k)
+# `sd_prior` is the stated smoothing-sd hyper prior (`spline_basis(...;
+# sd=...)`), `nothing` for the default `Normal(0, 1)`; its family fixes the
+# sd vector's support (`_hyper_support_override`).
+function _spline_vector_specs(id::Symbol, kind::Symbol, k,
+        sd_prior::Union{Nothing,HyperPrior} = nothing)
     specs = Tuple{Symbol,Symbol,NamedTuple,SupportOverride,Int}[]
     widths = Dict(first(b) => last(b) for b in _spline_blocks(kind, k))
     roles, sd = _spline_block_roles(id, kind, k)
@@ -1859,7 +1874,9 @@ function _spline_vector_specs(id::Symbol, kind::Symbol, k)
         end
     end
     nsd = kind === :tps ? 1 : 3
-    push!(specs, (sd, :normal, (arg1=0, arg2=1), :positive_stan, nsd))
+    sdfam, sdargs = sd_prior === nothing ? (:normal, (arg1=0, arg2=1)) :
+        (sd_prior.family, sd_prior.args)
+    push!(specs, (sd, sdfam, sdargs, _hyper_support_override(sdfam), nsd))
     return specs
 end
 
@@ -3141,12 +3158,14 @@ function _validate_splines(plan::StructuralPlan)
         for (vname, vfamily, vargs, vsupport, vwidth) in wantvec
             v = byname[vname]
             # The smoothing-sd vector may carry a stated hyper prior
-            # (SB `sd(mu, s(x)) ~ ...`) — same Stan-kernel positive
-            # support and width, family/args from the admitted set.
+            # (SB `sd(mu, s(x)) ~ ...`) — same width, family/args from
+            # the admitted set, support derived from the family.
             if vname === sdname && !(v.family === vfamily && v.args == vargs)
-                _validate_hyper_prior(HyperPrior(v.family, v.args), :plan,
-                    "spline :$(sb.id) sd")
-                vfamily, vargs = v.family, v.args
+                hp = HyperPrior(v.family, v.args)
+                _validate_hyper_prior(hp, :plan, "spline :$(sb.id) sd")
+                _, vfamily, vargs, vsupport, _ = only(s for s in
+                    _spline_vector_specs(sb.id, sb.kind, sb.k, hp)
+                    if first(s) === sdname)
             end
             (v.family === vfamily && v.args == vargs &&
              v.support_override === vsupport && v.width == vwidth) ||

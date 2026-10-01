@@ -476,6 +476,64 @@ end
     @test sqrt(sum(abs2, ones(n) .- B * (B \ ones(n)))) > 0.1 * sqrt(n)
 end
 
+# A stated smoothing-sd prior's support follows its family: real-support
+# families ride the Stan-kernel half (`:positive_stan`, plain `_lpdf`, no
+# `+log(2)`); positive-support families and the bounding `Uniform` keep
+# their own support and density. Positive families used to pass lowering
+# and then die at `build_kernel` ("positive_stan override needs a
+# real-support family").
+@testset "spline stated sd prior support follows its family" begin
+    u = [0.3, 0.2, -0.1, 0.4, 0.0, -0.2]
+    cases = (
+        (:(Normal(0, 2)), Normal(0, 2), :positive_stan),
+        (:(StudentT(3, 0, 2)), nothing, :positive_stan),
+        (:(LogNormal(0, 1)), LogNormal(0, 1), nothing),
+        (:(Gamma(2, 0.5)), Gamma(2, 0.5), nothing),
+        (:(Exponential(2)), Exponential(2), nothing),
+        (:(InverseGamma(3, 2)), InverseGamma(3, 2), nothing),
+        (:(Uniform(0, 10)), Uniform(0, 10), nothing),
+    )
+    for (spell, dist, support) in cases
+        plan = lower_rkppl(quote
+                spline_basis(:s_x, x; k = 4, sd = $spell)
+                a ~ Normal(0, 5)
+                sigma ~ Exponential(1)
+                mu = a .+ spline(:s_x)
+                y .~ Normal.(mu, sigma)
+            end, (:y, :x))
+        sd = only(v for v in plan.spline_vectors if v.name === :sd_s_x)
+        @test sd.support_override === support
+        @test validate_structure(plan) === nothing
+        bound = bind_data(plan, _spline_cols())
+        built = build_kernel(bound)
+        dist === nothing && continue
+        nt = constrain(built.layout, u)
+        ref = _ref_spline_tps(bound, nt)
+        s = nt.sd_s_x[1]
+        pr = ref.pr - logpdf(Normal(0, 1), s) + logpdf(dist, s)
+        jac = dist isa Uniform ? log(s) + log(10 - s) - log(10) : u[6]
+        @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
+        @test _query(built.spec, bound, :prior, u) ≈ pr
+        @test _query(built.spec, bound, :posterior, u) ≈
+            ref.ll + pr + u[2] + jac
+        _check_gradient(built.spec, bound, u)
+    end
+    # A hand-built plan whose positive-family sd still carries the
+    # Stan-kernel override is refused by the contract.
+    plan = lower_rkppl(quote
+            spline_basis(:s_x, x; k = 4, sd = LogNormal(0, 1))
+            a ~ Normal(0, 5)
+            mu = a .+ spline(:s_x)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x))
+    vs = copy(plan.spline_vectors)
+    i = findfirst(v -> v.name === :sd_s_x, vs)
+    vs[i] = SplineVector(vs[i].name, vs[i].family, vs[i].args,
+        :positive_stan, vs[i].width, vs[i].basis, vs[i].label)
+    @test_throws ContractValidationError validate_structure(
+        _swith(plan; vectors = vs))
+end
+
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _spline_reactant(plan, cols)
