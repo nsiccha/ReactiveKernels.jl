@@ -179,4 +179,37 @@ end
         only(native_gradient(q))
 end
 
+
+# An element read with one integer index per dimension, at least one traced,
+# is one gather whatever the array: a host container of traced scalars is
+# stacked into a traced array first (Reactant's own read of it at a traced
+# index recursed without termination), an index of any integer type reads the
+# element (a traced `Int32` index took Reactant's general path, which returns a
+# 1×1 array), and a read may mix concrete and traced indices.
+@testset "element reads at traced indices: stacked hosts, N-D, Int32" begin
+    W = [0.5 -0.2 0.1; 0.3 0.7 -0.4; -0.1 0.2 0.9]
+    ri, rj = _traced(2), _traced(3)
+    stacked(s, i, j) = ReactiveKernels._tensorized_getindex(
+        [s * W[a, b] for a in 1:3, b in 1:3], i, j)
+    @test _host((Reactant.@compile stacked(_traced(1.5), ri, rj))(
+        _traced(1.5), ri, rj)) ≈ 1.5 * W[2, 3]
+    stacked_vector(s, i) = ReactiveKernels._tensorized_getindex([s, 2s, 3s], i)
+    @test _host((Reactant.@compile stacked_vector(_traced(1.5), rj))(
+        _traced(1.5), rj)) ≈ 4.5
+    read_at(A, i...) = ReactiveKernels._tensorized_getindex(A, i...)
+    for (A, indices, expected) in (
+            (W, (Reactant.to_rarray(Int32(2); track_numbers = true), rj), W[2, 3]),
+            (W[:, 1], (Reactant.to_rarray(Int32(3); track_numbers = true),), W[3, 1]),
+            (W, (ri, 1), W[2, 1]))
+        for array in (A, _traced(A))
+            got = (Reactant.@compile read_at(array, indices...))(array, indices...)
+            @test got isa Reactant.AbstractConcreteNumber
+            @test _host(got) == expected
+        end
+    end
+    A3 = reshape(collect(1.0:24.0), 2, 3, 4)
+    read3(i, k) = ReactiveKernels._tensorized_getindex(A3, i, 3, k)
+    @test _host((Reactant.@compile read3(ri, _traced(4)))(ri, _traced(4))) == A3[2, 3, 4]
+end
+
 end

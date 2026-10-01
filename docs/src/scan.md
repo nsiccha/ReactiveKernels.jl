@@ -327,12 +327,13 @@ using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
   unchanged, field by field for a tuple or named tuple. So a host schedule
   plan (a struct holding a `Vector{Int}`) reaches the step as itself, and a
   host matrix or `Int` in a partly traced model stays host instead of becoming
-  traced scalars. The carry — scalar, `NamedTuple`, or vector — is
-  threaded as a loop-carried value, the per-step outputs are written into a
-  preallocated traced buffer with a dynamic-update-slice, and the first step
-  runs eagerly to seed the carry and fix the output element type (`N == 1`
-  runs with an empty loop body). The emitted program is independent of the
-  sequence length and of the row width, as the [core
+  traced scalars, in the step and in the retained loops of a `@traceable`
+  helper the step passes the model to. The carry — scalar, `NamedTuple`, or
+  vector — is threaded as a loop-carried value, the per-step outputs are
+  written into a preallocated traced buffer with a dynamic-update-slice, and
+  the first step runs eagerly to seed the carry and fix the output element
+  type (`N == 1` runs with an empty loop body). The emitted program is
+  independent of the sequence length and of the row width, as the [core
   constraints](constraints.md) require; native and Reactant results match to
   floating-point tolerance (see `test/test_authored_scan_reactant.jl` and
   `test/test_ppl_examples_reactant.jl`). A scan whose every operand is host
