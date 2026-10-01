@@ -1545,8 +1545,10 @@ end
              (5, [0, 2, 4], [1.0, 0.5, 2.0], -0.0))
     for lowered in (looped, folded)
         companion = Core.eval(@__MODULE__, :((t, s, u, w, z) -> $lowered))
+        # The closure is defined in a newer world than this running testset;
+        # Julia 1.12 and later refuse the direct call (`MethodError`).
         for (t, s, w, z) in cases
-            @test companion(t, s, u, w, z) === native(t, s, u, w, z)
+            @test Base.invokelatest(companion, t, s, u, w, z) === native(t, s, u, w, z)
         end
     end
     # Only the `init` form is rewritten: without it Base seeds the sum with the
