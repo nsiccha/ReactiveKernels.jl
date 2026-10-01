@@ -2975,7 +2975,8 @@ _re_surface(R) = Expr(:block,
     hand = StructuralPlan(hand.responses, hand.predictors, hand.population_priors,
         hand.parameters, hand.assignments, Dict{Symbol,AbstractVector}(), 0;
         plate_parameters = PlateParameter[
-            PlateParameter(:theta, :normal, (arg1 = :mu, arg2 = :tau), :y)])
+            PlateParameter(:theta, :normal, (arg1 = :mu, arg2 = :tau), nothing,
+                :y)])
     @test _plans_equal(plan, hand)
     # eachindex/axes plates are plan-identical.
     @test _plans_equal(lower_rkppl(_re_surface(:(axes(y, 1))), (:y, :x)), plan)

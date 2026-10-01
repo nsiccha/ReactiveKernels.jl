@@ -52,11 +52,12 @@ _pl_plate(R, cells...) = Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
         data)
     @test _pl_canon(wrap) == _pl_canon(wraptop)
     # Operators over scalar-only operands stay scalar (`2 * s` is the same
-    # value in every iteration).
+    # value in every iteration): the cell local is a scalar definition.
     sc = lower_rkppl(Expr(:block, head..., :(mu = a .+ b .* x),
-        _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(mu[i], 2 * s)))), data)
+        _pl_plate(:(eachindex(y)), :(sd = 2 * s), :(y[i] ~ Normal(mu[i], sd)))),
+        data)
     sctop = lower_rkppl(Expr(:block, head..., :(mu = a .+ b .* x),
-        :(y .~ Normal.(mu, 2 * s))), data)
+        :(sd = 2 * s), :(y .~ Normal.(mu, sd))), data)
     @test _pl_canon(sc) == _pl_canon(sctop)
 end
 
@@ -270,7 +271,8 @@ end
         :yy => yy))
     new = _pl_corpus("99_plate_77_radon.jl",
         Dict(:county_idx => cidx, :ff => ff, :yy => yy))
-    _pl_same_density(legacy, new, 0.05 .* (1:12) .- 0.3)
+    n = length(coordinate_names(new[2].layout))
+    _pl_same_density(legacy, new, 0.05 .* (1:n) .- 0.3)
     # Eight schools.
     y8 = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
     se8 = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
@@ -280,7 +282,8 @@ end
         :damt => Float64[], :yy => y8, :se => se8))
     new = _pl_corpus("99_plate_78_eight_schools.jl",
         Dict(:school_idx => collect(1:8), :yy => y8, :se => se8))
-    _pl_same_density(legacy, new, 0.05 .* (1:10) .- 0.2)
+    n = length(coordinate_names(new[2].layout))
+    _pl_same_density(legacy, new, 0.05 .* (1:n) .- 0.2)
 end
 
 @testset "schedule-chain re-spellings match the grouped form" begin
@@ -304,30 +307,34 @@ end
 end
 
 @testset "a latent plate's size is its range" begin
-    # `eachindex(w)` iterates `w`: the latent has one cell per entry of `w`.
-    # Latents over a non-observation axis do not lower yet, so a plate whose
-    # column is not the observation axis is refused instead of being sized
-    # by the response rows.
-    ast = Expr(:block, :(tau ~ Exponential(1)), :(s ~ Exponential(1)),
+    # `eachindex(v)` iterates `v`: the latent has one cell per entry of `v`.
+    # Latents over a non-observation axis do not lower yet, so a plate over
+    # a subject-level column (here `age_s`, 2 subjects beside 4 observation
+    # rows) is refused at bind instead of being sized by the response rows.
+    cols = _pl_pk_cols()
+    ast = _pl_pk_chain(:(dv .~ Normal.(conc, sigma)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
-            Expr(:for, :(j = eachindex(w)), Expr(:block,
-                :(eta[j] ~ Normal(0, tau))))),
-        _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(eta[i], s))))
-    plan = lower_rkppl(ast, (:y, :w))
-    @test only(plan.plate_parameters).range === :w
-    @test_throws "has 3 cells but n_obs is 4" bind_data(plan,
-        Dict{Symbol,AbstractVector}(:y => [0.1, 0.4, -0.2, 0.3],
-            :w => [1.0, 2.0, 3.0]))
-    ok = bind_data(plan, Dict{Symbol,AbstractVector}(
-        :y => [0.1, 0.4, -0.2, 0.3], :w => [1.0, 2.0, 3.0, 4.0]))
-    @test assign_layout(ok).total == 2 + 4
+            Expr(:for, :(s = eachindex(age_s)), Expr(:block,
+                :(eta[s] ~ Normal(0, 1))))))
+    plan = lower_rkppl(ast, _PL_PK_DATA)
+    @test only(plan.plate_parameters).range === :age_s
+    @test_throws "has 2 cells but n_obs is 4" bind_data(plan, cols)
+    # Over the observation axis it binds with one cell per row.
+    ast = Expr(:block, :(tau ~ Exponential(1)), :(s ~ Exponential(1)),
+        _pl_plate(:(eachindex(y)), :(theta[i] ~ Normal(0, tau)),
+            :(y[i] ~ Normal(theta[i], s))))
+    plan = lower_rkppl(ast, (:y,))
+    @test only(plan.plate_parameters).range === :y
+    ok = bind_data(plan, Dict{Symbol,AbstractVector}(:y => [0.1, 0.4, -0.2]))
+    @test assign_layout(ok).total == 2 + 3
 end
 
 @testset "plans without a kernel refuse dims keys" begin
     plan = lower_rkppl(Expr(:block, :(a ~ Normal(0, 1)),
-        :(s ~ Exponential(1)),
-        _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(a, s)))), (:y,))
+        :(b ~ Normal(0, 1)), :(s ~ Exponential(1)),
+        _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(a + b * x[i], s)))),
+        (:y, :x))
     @test_throws "not consumed" bind_data(plan,
-        Dict{Symbol,AbstractVector}(:y => [0.1, 0.2]);
+        Dict{Symbol,AbstractVector}(:y => [0.1, 0.2], :x => [1.0, 2.0]);
         dims = Dict{Symbol,Int}(:nsub => 2, :whatever_typo => 3))
 end
