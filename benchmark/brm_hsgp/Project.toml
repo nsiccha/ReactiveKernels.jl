@@ -15,5 +15,5 @@ Turing = "fce5fe82-541a-59a6-adf8-730c64b5f9a0"
 WarmupHMC = "60658175-6863-4866-a322-ab51a11c0cfe"
 
 [compat]
-Reactant = "=0.2.284"
+Reactant = "=0.2.289"
 julia = "1.10"
