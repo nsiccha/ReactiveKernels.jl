@@ -36,7 +36,6 @@ using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Reactant
-using SpecialFunctions
 using Statistics: std
 using Test
 
@@ -588,29 +587,14 @@ end
 # XLA legs for the basis-expansion items (HSGP / spline). The exact-GP
 # items stay native-only: Reactant reverse through the dense Cholesky is
 # the upstream gap documented in test_gp.jl (no XLA assertions there by
-# design).
-# Upstream XLA gap (the student-evidence pin precedent): the censored
-# Student-t evidence arms route through `SpecialFunctions.beta_inc`,
-# which has no method for a traced scalar (measured on Reactant
-# 0.2.289/0.2.290). Only the Bordet D4 leg carries it; the signature
-# below is exactly that gap, anything else rethrows loudly.
-_sm_is_upstream_gap(e) =
-    e isa MethodError && e.f === SpecialFunctions.beta_inc &&
-    length(e.args) == 3 && e.args[3] isa Reactant.TracedRNumber
-
+# design). The Bordet D4 leg (censored Student-t) routes through the
+# owned `rk_beta_inc`, which traces; `SpecialFunctions.beta_inc` has no
+# traced-scalar method (upstream Reactant placeholder, no backing MLIR op).
 @testset "smooth under Reactant ($label)" for (label, prog, data) in _SM_ITEMS[3:end]
-    gapped = label == "bordet D4"
-    try
-        bound, built, post_q, lay = _sm_query(prog, _sm_cols(data))
-        fx = Base.invokelatest(_sm_reactant_measure, built, bound, post_q,
-            _sm_probe(lay.total))
-        @test fx.primal ≈ fx.native rtol = 1e-9
-        @test fx.rval ≈ fx.val rtol = 1e-9
-        @test fx.rgrad ≈ fx.g rtol = 1e-7 atol = 1e-9
-        # Self-firing pin: errors (Unexpected Pass) once upstream wires
-        # beta_inc, forcing removal of the gate.
-        gapped && @test_broken true
-    catch e
-        gapped && _sm_is_upstream_gap(e) || rethrow()
-    end
+    bound, built, post_q, lay = _sm_query(prog, _sm_cols(data))
+    fx = Base.invokelatest(_sm_reactant_measure, built, bound, post_q,
+        _sm_probe(lay.total))
+    @test fx.primal ≈ fx.native rtol = 1e-9
+    @test fx.rval ≈ fx.val rtol = 1e-9
+    @test fx.rgrad ≈ fx.g rtol = 1e-7 atol = 1e-9
 end
