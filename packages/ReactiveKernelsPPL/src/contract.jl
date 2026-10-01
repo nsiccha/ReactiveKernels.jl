@@ -7392,6 +7392,18 @@ function _validate_joint_response(r::LikelihoodSpec, plan::StructuralPlan,
     return nothing
 end
 
+# GLM-object fields belong to the GLM families only: on any other response
+# a stray glm_alpha/glm_beta means nothing and would silently change nothing
+# (the `_validate_unleveled_fields` rule) — reject it. Runs on every response.
+function _validate_glm_fields(r::LikelihoodSpec)
+    _is_glm_family(r.family) && return nothing
+    r.glm_alpha === nothing ||
+        _fail(r.label, "only GLM-object responses take glm_alpha")
+    r.glm_beta === nothing ||
+        _fail(r.label, "only GLM-object responses take glm_beta")
+    return nothing
+end
+
 function _validate_glm_response(r::LikelihoodSpec, plan::StructuralPlan)
     want_link = r.family === NormalIDGLMFam ? IdentityLink :
         r.family === BernoulliLogitGLMFam ? LogitLink : LogLink
@@ -7769,6 +7781,7 @@ function _validate_responses(plan::StructuralPlan)
     used_predictors = Set{Symbol}()
     for r in plan.responses
         _validate_mi_structure(r, plan)
+        _validate_glm_fields(r)
         # A mixture response validates whole (dedicated component slots;
         # the anchor is polymorphic, so this branch leads the scan-state
         # and plate-param checks below).

@@ -2018,6 +2018,14 @@ _all_fields_spec() = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
     @test p2.n_obs == good.n_obs + 1
     @test all(getfield(p2, f) === getfield(good, f)
         for f in fieldnames(StructuralPlan) if f !== :n_obs)
+    # GLM-object fields fail closed on a non-GLM response (they are never
+    # read there, so carrying them would silently change nothing).
+    for (k, v) in ((:glm_alpha, :ga), (:glm_beta, :gb))
+        rg = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu, nothing,
+            nothing, _none_evidence(), :y_resp, nothing, nothing;
+            thresholds = :y_cutpoints, (k => v,)...)
+        @test_throws ContractValidationError _ordered_plan(; resp = rg)
+    end
 end
 
 function _ordinal_plan(n = 9; link = LogitLink, structure = :cumulative,
