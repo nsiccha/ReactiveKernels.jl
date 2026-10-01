@@ -60,7 +60,8 @@ Coefficient vectors are declared the same way, sized by their design matrix:
   `y ~ Normal(...)` on a data vector is rejected.
 - A `~` whose left-hand side is a bound data column is an observation; every
   other `~` declares a parameter.
-- Single assignment, no control flow, no `target +=`.
+- Single assignment, no `if`, no `target +=`. Loops are written as
+  `@plate` cells or `@scan` recurrences (see [Plates](#Plates)).
 
 ## Factor levels
 
@@ -92,6 +93,22 @@ are shared across elements; literal vectors give one value per element.
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :rkppl_matrix)
 ```
+
+## Plates
+
+`@plate for i in R … end` writes a loop whose cells each mean one iteration
+of that Julia loop, so every value in a cell is a scalar and needs no dots.
+Shapes come from named data (the range, a data index column), never from a
+separate size argument. A cell holds observations, per-cell latents, per-cell
+submodel calls and cell locals. The whole loop lowers at once, exactly like its
+broadcast spelling.
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
+```
+
+`@scan begin … end` writes a sequential recurrence, such as an AR(1) state
+(corpus `38_scan_ar.jl`).
 
 ## Submodels
 
