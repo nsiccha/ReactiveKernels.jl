@@ -120,6 +120,24 @@ const _SM_BRMHSGP = quote
     y .~ Normal.(mu, exp.(lsig))
 end
 
+# accel_splines SB pin vs RK's canonical TPS basis (decision 1vts6mb: each
+# penalized column's first significant entry is positive). The SB numbers
+# below were produced (strato2) on a raw-LAPACK basis whose column 3 has the
+# opposite sign. A column flip is a reparametrization under that column's
+# N(0, 1) raw prior, so the SB pin is reproduced exactly at the point with
+# that column's raw coordinates negated. Drop the mapping once BRM adopts the
+# canonical signs and re-derives the SB number (BRM todo 1wo7z27).
+const _SM_ACCELSPL_SB_FLIPS = (3,)
+function _sm_sb_signed(lay, u)
+    v = copy(u)
+    for (i, n) in enumerate(coordinate_names(lay))
+        m = match(r"^b_s_x2?_raw\.(\d+)$", string(n))
+        m !== nothing && parse(Int, m.captures[1]) in _SM_ACCELSPL_SB_FLIPS &&
+            (v[i] = -v[i])
+    end
+    return v
+end
+
 const _SM_ACCELSPL = quote
     spline_basis(:s_x, x; sd = StudentT(3, 0, 36))
     spline_basis(:s_x2, x2; sd = StudentT(3, 0, 10))
@@ -222,6 +240,9 @@ end
 # Bordet `brm_pooled_hsgp` / `brm_shapepooled_hsgp` /
 # `brm_pooled_student_t` (BRM default priors throughout — RK's defaults).
 _sm_bordet(slope::Bool, lik) = quote
+    a ~ Normal(0, 1)
+    b_aff ~ Normal(0, 1)
+    c0 ~ Normal(0, 1)
     hsgp_basis(:h_t, log_time; k = 5)
     hsgp_basis(:h_d, log_dose; k = 5)
     r_b ~ varying_effect(biomarker, $(slope ? :([1, affectable]) : :([1])))
@@ -239,6 +260,7 @@ end
 # `logistic.` maps over varying-slice subs). `series` indexes the 4
 # biomarker x person series (Bordet derives it the same way).
 const _SM_BORDET_D5 = quote
+    b0 ~ Normal(0, 1)
     sigma ~ Exponential(1)
     r_base ~ varying_effect(series, [1])
     base = b0 .+ r_base
@@ -353,9 +375,13 @@ end
     @test _sm_val(kern, zeros(44)) ≈ -252.782708224855 atol = 1e-10
     @test _sm_val(kern, fill(0.3, 44)) ≈ -272.8662184101349 atol = 1e-10
     # accel_splines: P-accelspl12 (0.3^24; per basis 2 fixed + 8 pen + sd).
+    # Evaluated at the point that maps RK's canonical TPS basis onto the
+    # raw-LAPACK basis SB used (`_sm_sb_signed`). Before canonical signs, a
+    # CI runner's LAPACK flipped column 4 and read -62.92118436085263 here.
     _, _, kern, lay = _sm_query(_SM_ACCELSPL, _sm_cols(_SM_DATA.accelspl))
     @test lay.total == 24
-    @test _sm_val(kern, fill(0.3, 24)) ≈ -68.72536513207879 atol = 1e-10
+    @test _sm_val(kern, _sm_sb_signed(lay, fill(0.3, 24))) ≈
+        -68.72536513207879 atol = 1e-10
 end
 
 @testset "bordet builders 2-4 SB parity (pin 72d4bfc9)" begin
@@ -408,6 +434,9 @@ _sm_probe(n) = [0.2 * sin(1.3i) + 0.02i for i in 1:n]
 # sd, non-centered z; length scales floored per group at the validity
 # floor, SB `fmax`).
 const _SM_BORDET_D6 = quote
+    a ~ Normal(0, 1)
+    b_aff ~ Normal(0, 1)
+    c0 ~ Normal(0, 1)
     hsgp_basis(:h_t, log_time; k = 10, by = biomarker,
         length_scale = 1 + (1 | biomarker), sd = 1 + (1 | biomarker))
     hsgp_basis(:h_d, log_dose; k = 10, by = biomarker,
@@ -503,6 +532,9 @@ end
 # the SB-pinned builder 2, and direct SB value + gradient parity (the
 # builder-7 SB testset below).
 const _SM_BORDET_D7 = quote
+    a ~ Normal(0, 1)
+    b_aff ~ Normal(0, 1)
+    c0 ~ Normal(0, 1)
     hsgp_basis(:h_t, log_time; k = 5, by = biomarker)
     hsgp_basis(:h_d, log_dose; k = 5, by = biomarker)
     r_b ~ varying_effect(biomarker, [1])
@@ -661,6 +693,7 @@ end
 
 @testset "grouped HSGP surface + contract" begin
     base(kws...) = quote
+        a ~ Normal(0, 1)
         hsgp_basis(:h, x; k = 6, $(kws...))
         mu = a .+ hsgp(:h)
         y .~ Normal.(mu, 1.0)
@@ -689,6 +722,7 @@ end
         @test_throws SurfaceLoweringError lower_rkppl(bad, cols)
     end
     @test_throws SurfaceLoweringError lower_rkppl(quote
+        a ~ Normal(0, 1)
         hsgp_basis(:h, x, q; k = (4, 4), by = g)
         mu = a .+ hsgp(:h)
         y .~ Normal.(mu, 1.0)
