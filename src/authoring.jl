@@ -3932,6 +3932,10 @@ end
         …
         (new_carry, output)
     end
+    scan(xs, ys..., Ref(shared)...; init, history = h0) do carry, x, y..., shared..., earlier
+        …
+        (new_carry, output)
+    end
 
 Author a bounded SEQUENTIAL recurrence inside a `@kernel` / `@ppl` body. The
 leading non-`Ref` positionals are the sequences to scan over, advanced in
@@ -3948,6 +3952,14 @@ trajectory `[R₀, R₁, …, Rₙ]` of a recurrence whose output is its next ca
 Its value and element type (`promote_type(typeof(init), output type)`) are
 those of `vcat([init], scan(…; init))` without the second vector; empty
 sequences return `[init]`.
+
+With `history = h0` (a number) the do-block takes one more, last argument: the
+result vector being written, read-only. At step `j` its entry `i` is step `i`'s
+output for `i < j` and `h0` from `j` on, on every backend, so a recurrence over
+all earlier outputs (`sum(earlier[i] * u[j - i] for i in 1:j-1; init = 0.0)`,
+with `j` from a lockstep `eachindex(xs)`) needs no carried copy of them. The
+result's element type is `typeof(h0)`. A carry may not hold the history, and
+`history` cannot be combined with `include_init = true`.
 
 It lowers to an ordinary ordered loop natively, and to a `stablehlo.while` carry
 loop under Reactant — so a natural sequential recurrence lowers without unrolling

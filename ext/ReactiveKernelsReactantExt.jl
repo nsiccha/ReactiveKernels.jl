@@ -1427,10 +1427,13 @@ function ReactiveKernels._tensorized_scan_lowering(
 end
 
 # `scan(...; history = h0)`: the traced result buffer, filled with `h0`, is the
-# while loop's output buffer, and each step reads a fresh tracer of it (`copy`
-# emits no operation), so the step sees the earlier outputs and `h0` from its
-# own index on — the native view's values — and nothing the step does to its
-# argument reaches the buffer. The buffer's element type is `h0`'s.
+# while loop's output buffer, and each step reads it before its own output is
+# written, so the step sees the earlier outputs and `h0` from its own index on
+# — the native view's values. The buffer's element type is `h0`'s. The step
+# reads the buffer itself, not a `copy`: on Reactant 0.2.290 a whole-buffer
+# reduction of a copied tracer inside a short loop (`sum(copy(b))` before
+# `b[i] = …`, 3 iterations) miscompiles under the default optimizer, while the
+# same reduction of `b` is exact (`test_authored_scan_reactant.jl`).
 ReactiveKernels._tensorized_scan_history_lowering(
         ::Union{Reactant.AbstractConcreteArray,Reactant.AbstractConcreteNumber},
         step, init, fill, iterated::Tuple, shared::Tuple) =
@@ -1457,11 +1460,11 @@ function ReactiveKernels._tensorized_scan_history_lowering(
     buffer = _scan_history_traced_buffer(_fresh_tracers(fill), n)
     n == 0 && return _scan_empty_result(_scan_scalar_type(typeof(fill)), sequences)
     x1 = map(xs -> _scan_element(xs, 1), sequences)
-    carry, out1 = step(init, x1..., map(_scan_shared_open, captured)..., copy(buffer))
+    carry, out1 = step(init, x1..., map(_scan_shared_open, captured)..., buffer)
     Reactant.@allowscalar buffer[1] = out1
     Reactant.@trace for i in 2:n
         x = map(xs -> _scan_element(xs, i), sequences)
-        carry, out = step(carry, x..., map(_scan_shared_open, captured)..., copy(buffer))
+        carry, out = step(carry, x..., map(_scan_shared_open, captured)..., buffer)
         Reactant.@allowscalar buffer[i] = out
     end
     buffer

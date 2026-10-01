@@ -460,7 +460,7 @@ end
         end
         return s
     end)
-    @test_throws "accepts only the `init =` and `include_init =` keywords" (
+    @test_throws "accepts only the `init =`, `include_init =` and `history =` keywords" (
         @eval @kernel unknown_keyword_scan(xs) = begin
         s = scan(xs; init = 0.0, reverse = true) do carry, x
             (carry + x, carry + x)
@@ -551,6 +551,14 @@ end
     @test_throws ArgumentError macroexpand(@__MODULE__, quote
         @kernel twice_history(xs::Vector{Float64}) = begin
             ys = scan(xs; init = 0.0, history = 0.0, history = 1.0) do carry, x, earlier
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel history_with_init(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, include_init = true, history = 0.0) do carry, x, earlier
                 (carry, x)
             end
             return ys

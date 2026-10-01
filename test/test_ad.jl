@@ -743,10 +743,15 @@ end
         (f(r) - f(l)) / 2e-5
     end
     k = prepare(F.authored_scan_history; want = :total)
-    for (active, x0, objective) in (
-            (:amounts, amounts0, a -> reference(a, units0)),
-            (:units, units0, u -> reference(amounts0, u)))
-        prepared = prepare_ad(k, TEST_AD_BACKEND, amounts0, plan, units0; active)
+    # With `units` constant, Base's `get(units, lag, 0.0)` times an active value
+    # fails Enzyme's static activity analysis with or without a scan (a plain
+    # recipe `sum(a[i] * get(units, …, 0.0) for i …)` does too), so that case
+    # runs with runtime activity.
+    runtime_activity = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    for (active, x0, objective, backend) in (
+            (:amounts, amounts0, a -> reference(a, units0), runtime_activity),
+            (:units, units0, u -> reference(amounts0, u), TEST_AD_BACKEND))
+        prepared = prepare_ad(k, backend, amounts0, plan, units0; active)
         gradient = zeros(length(x0))
         value, returned = ad_value_and_gradient!(prepared, gradient,
                                                  amounts0, plan, units0)
