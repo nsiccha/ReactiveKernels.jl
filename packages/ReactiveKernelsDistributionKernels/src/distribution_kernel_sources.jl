@@ -35,6 +35,12 @@ const logbeta = scalar_derivative_rule(
     logbeta_graph; primal = :y, partials = (a = :dy_da, b = :dy_db),
     name = :logbeta)
 
+# The owned symmetric-eigendecomposition pair (`rk_symmetric_eigvals` /
+# `rk_symmetric_eigvecs`), the same generated-rule shape for a linear-algebra
+# primitive: reached as `DistributionKernelSources.rk_symmetric_*` (and
+# re-exported by ReactiveKernelsPPL).
+include("symmetric_eigen_rules.jl")
+
 # Owned regularized incomplete beta, I_x(a, b), over the Student-t cdf
 # slice (one shape is 1/2, the other is nu/2 with nu > 0, x in [0, 1]).
 # `SpecialFunctions.beta_inc` has no method for a Reactant-traced scalar
