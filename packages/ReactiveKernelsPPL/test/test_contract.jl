@@ -1553,9 +1553,11 @@ end
     bad = _gaussian_plan()
     push!(bad.assignments, AssignmentSpec(:v, :(lgamma(x))))
     @test_throws ContractValidationError validate_plan(bad)
-    bad = _gaussian_plan()
-    push!(bad.assignments, AssignmentSpec(:v, :(x[1])))
-    @test_throws ContractValidationError validate_plan(bad)
+    # One element of a column is a model-level value (standard Julia
+    # indexing — functions as values); a whole column is not.
+    ok = _gaussian_plan()
+    push!(ok.assignments, AssignmentSpec(:v, :(x[1])))
+    @test validate_plan(ok) === nothing
     bad = _gaussian_plan()
     push!(bad.assignments, AssignmentSpec(:v, :(nope + 1)))
     @test_throws ContractValidationError validate_plan(bad)
