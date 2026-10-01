@@ -3005,8 +3005,8 @@ _has_cell_call(ex) = ex isa Expr && (
         (ex.args[1] in CELL_FNS || ex.args[1] in SEGMENT_CELL_FNS)) ||
     any(_has_cell_call, ex.args))
 
-function _extract_kernel_cells(sample::Vector{SampleStmt},
-        det::Vector{Pair{Symbol,Any}}, data::Set{Symbol})
+function _extract_kernel_cells(sample::Vector, det::Vector{Pair{Symbol,Any}},
+        data::Set{Symbol})
     seeds = Set{Symbol}(nm for (nm, rhs) in det if _has_cell_call(rhs))
     isempty(seeds) && return sample, det, nothing
     detmap = Dict{Symbol,Any}(det)
