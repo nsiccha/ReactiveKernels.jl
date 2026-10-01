@@ -5,9 +5,12 @@
 # statements, deterministic `=`, `model(; data...)` binding) under the
 # standing constraints: Distributions.jl constructors (never Stan lowercase),
 # immutable single-assignment top level, no control flow, no `target`,
-# `@plate` observations + deterministic cells (desugar; sampled cells
-# deferred), `@scan` reserved. Broadcasting is EXPLICIT (no implied
-# vectorization anywhere): vector math is dotted (`mu = a .+ b .* x` —
+# `@plate for i in R` cells that mean one iteration of that Julia loop
+# (observations, per-cell latents, per-cell submodels, cell locals; the
+# desugar evaluates every iteration at once), `@scan` sequential
+# recurrences. Broadcasting is EXPLICIT at top level (no implied
+# vectorization; a plate cell is scalar Julia, so its values need no dots):
+# vector math is dotted (`mu = a .+ b .* x` —
 # undotted scalar/vector `+` is a `MethodError` in Julia too), and vector
 # responses use the Turing dotted tilde (`y .~ Normal.(mu, sigma)`).
 # `=` binds values with Julia semantics; predictor locations inline
@@ -3625,7 +3628,7 @@ end
 function _expand_plates(args, data::Set{Symbol})
     expanded = Any[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
-    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int}},Int}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
     line = 0
     for arg in args
         if arg isa LineNumberNode
@@ -3694,7 +3697,7 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     end
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
-    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int}},Int}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
     # Cell locals bound from a per-index value (they vary with the loop
     # variable, so arithmetic over them vectorizes in the desugar).
     pidx = Set{Symbol}()
@@ -3808,8 +3811,8 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
         bares = _cell_bares(obj, ivar, data)
         setdiff!(bares, plate_defs)
         push!(ctx, (col, line, bares))
-        push!(params, (col, _strip_cell(obj, ivar), _plate_param_range(col, rkind),
-            line))
+        push!(params, (col, _strip_cell(obj, ivar),
+            _plate_param_range(col, rkind, data), line))
         return Expr[]
     end
     bares = _cell_bares(obj, ivar, data)
@@ -3836,9 +3839,13 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
 end
 
 # The per-cell latent's size follows the plate range: a literal `1:N` rides as
-# a UnitRange (validated to cover 1:n_obs at bind), eachindex/axes ⇒ n_obs.
-_plate_param_range(name::Symbol, rkind) =
-    rkind[1] === :coloncall ? _lower_lhs_range(name, rkind[2]) : nothing
+# a UnitRange (validated to cover 1:n_obs at bind); `eachindex(v)` / `axes(v,
+# 1)` over a data column ride as the column `v` (one cell per entry, proved
+# at bind); over a definition (an observation-aligned column) ⇒ n_obs.
+function _plate_param_range(name::Symbol, rkind, data::Set{Symbol})
+    rkind[1] === :coloncall && return _lower_lhs_range(name, rkind[2])
+    return rkind[2] in data ? rkind[2] : nothing
+end
 
 function _cell_lhs_error(lhs, ivar)
     lhs isa Expr && lhs.head === :ref || return _sfail(

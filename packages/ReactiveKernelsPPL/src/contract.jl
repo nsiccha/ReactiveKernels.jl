@@ -628,9 +628,12 @@ plate cell, packed as one contiguous block. `family`/`args`/`support_override`
 follow [`SampledParameter`](@ref) exactly (POSITIONAL `(arg1, …)` keys,
 Distributions.jl semantics), except the args are SHARED across cells — literals
 or scalar parameter/assignment names (per-cell vector args are a later
-increment). `range` is `nothing` (size = `n_obs`, the `eachindex`/`axes` /
-bare-plate case) or a literal `UnitRange{Int}` that must cover `1:n_obs` exactly
-(the `1:N` case), mirroring [`LikelihoodSpec`](@ref)'s response range. A
+increment). `range` is the plate's index set: the `Symbol` of the column `v`
+of an `eachindex(v)` / `axes(v, 1)` plate (one cell per entry of `v`; bind
+proves `length(v) == n_obs` — latents over another axis do not lower yet), a
+literal `UnitRange{Int}` that must cover `1:n_obs` exactly (the `1:N` case),
+mirroring [`LikelihoodSpec`](@ref)'s response range, or `nothing` (size =
+`n_obs`, hand-built plans). A
 real-support prior (`normal`/`cauchy`/half-versions) lays out identity (an
 unconstrained block); positive/unit support constrains per element.
 """
@@ -639,7 +642,7 @@ struct PlateParameter
     family::Symbol
     args::NamedTuple
     support_override::SupportOverride
-    range::Union{Nothing,UnitRange{Int}}
+    range::Union{Nothing,UnitRange{Int},Symbol}
     label::Symbol
 end
 """Provenance/range default to a whole-column (n_obs) plate under the name."""
@@ -647,7 +650,8 @@ PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
     support_override::SupportOverride) =
     PlateParameter(name, family, args, support_override, nothing, name)
 PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
-    support_override::SupportOverride, range::Union{Nothing,UnitRange{Int}}) =
+    support_override::SupportOverride,
+    range::Union{Nothing,UnitRange{Int},Symbol}) =
     PlateParameter(name, family, args, support_override, range, name)
 
 """
@@ -2703,6 +2707,18 @@ function _validate_plate_parameters_data(plan::StructuralPlan)
                 _fail(p.label, "arg $k references unknown name $v")
         end
         p.range === nothing && continue
+        if p.range isa Symbol
+            # One cell per entry of the iterated column (Julia's
+            # `eachindex(v)`), sized at the observation axis.
+            haskey(plan.columns, p.range) || _fail(p.label,
+                "plate over `eachindex($(p.range))`: `$(p.range)` is not bound")
+            n = length(plan.columns[p.range])
+            n == plan.n_obs || _fail(p.label,
+                "plate over `eachindex($(p.range))` has $n cells but n_obs " *
+                "is $(plan.n_obs) — a per-cell latent over another axis " *
+                "does not lower yet (iterate an observation-axis column)")
+            continue
+        end
         last(p.range) == plan.n_obs || _fail(p.label,
             "plate range $(p.range) covers $(length(p.range)) cells " *
             "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
@@ -5648,7 +5664,7 @@ function _validate_plate_parameters(plan::StructuralPlan)
         end
         _validate_uniform_args(p.label, p.family, p.args)
         _validate_support_override(p.label, p.family, p.support_override, p.args)
-        if p.range !== nothing
+        if p.range isa UnitRange
             r = p.range
             (first(r) == 1 && last(r) >= 1) || _fail(p.label,
                 "plate range must start at 1 (`1:N`), got $(first(r)):$(last(r))")
