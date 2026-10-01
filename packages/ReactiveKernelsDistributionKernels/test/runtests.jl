@@ -712,3 +712,4 @@ end
 
 include("test_glm.jl")
 include("test_enzyme_rules.jl")
+include("test_rk_beta_inc.jl")
