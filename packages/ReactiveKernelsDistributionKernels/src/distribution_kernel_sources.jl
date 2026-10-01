@@ -774,7 +774,10 @@ end
 # kernel sums the weighted log-diagonal over all i. Straight-line authoring note:
 # the dimension is taken as `Kf::Float64 = size(L,1)` for the scalar arithmetic
 # and inline `size(L,1)` inside the ranges — a single reused integer node across
-# the many normalizer terms does not route through the planner.
+# the many normalizer terms does not route through the planner. The index
+# vectors are `collect`ed before any float scaling: a float broadcast over a
+# range builds a TwicePrecision StepRangeLen, which native reverse Enzyme
+# cannot differentiate (snag lkj-corr-cholesk-44503bef).
 const LKJ_CORR_CHOLESKY_KERNEL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta
 using LinearAlgebra: diag
@@ -783,14 +786,14 @@ using LinearAlgebra: diag
     logpdf(L::Matrix{Float64})::Float64 = begin
         Kf::Float64 = size(L, 1)
         kernel_term::Float64 =
-            sum(((Kf + 2 * (eta - 1)) .- (1:size(L, 1))) .* log.(diag(L)))
+            sum(((Kf + 2 * (eta - 1)) .- collect(1:size(L, 1))) .* log.(diag(L)))
         alpha::Float64 = eta + 0.5 * Kf - 1
         loginvconst::Float64 =
             (2 * eta + Kf - 3) * log(2.0) +
             (log(π) / 4) * (Kf * (Kf - 1) - 2) +
             logbeta(alpha, alpha) -
             (Kf - 2) * loggamma(eta + 0.5 * (Kf - 1)) +
-            sum(loggamma.(eta .+ 0.5 .* (0:(size(L, 1) - 3))); init = 0.0)
+            sum(loggamma.(eta .+ 0.5 .* collect(0:(size(L, 1) - 3))); init = 0.0)
         kernel_term - loginvconst
     end
 end

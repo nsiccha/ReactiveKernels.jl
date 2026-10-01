@@ -3435,10 +3435,8 @@ end
 # at `eta == 1.0`, else `a*log + b*log` with emission-time coefficients).
 # Reads the named `_ppl_rl_` diagonal scalars — no matrix materializes, and
 # the scalar-only form keeps the native Enzyme reverse pass on the same
-# straight-line shape as every other prior (the core `lkj_corr_cholesky`
-# object's `(1:K)` range broadcasts fail Enzyme reverse, so the splice
-# stays out of generated code). K=1 is the `0.0` literal (Stan's K=1 LKJ
-# term is ±0.0 — no diagonal, zero constant).
+# straight-line shape as every other prior. K=1 is the `0.0` literal
+# (Stan's K=1 LKJ term is ±0.0 — no diagonal, zero constant).
 function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64)
     K == 1 && return :(0.0)
     terms = Any[lkj_logconst(K, eta)]
