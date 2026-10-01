@@ -19,7 +19,8 @@
 # Every leg compares DIRECTLY at the same u: RK's exact GP
 # (`gp_chol_latent(gp_exp_quad_cov(x, sigma, rho, 1e-9), z)`, non-centered)
 # is SB's `gp(x)` emission; the HSGP basis/spectral weights are SB
-# `_sb_hsgp` verbatim; the spline blocks are SB's (term-splines-stan). A
+# `_sb_hsgp` verbatim; the spline blocks are SB's (term-splines-stan)
+# minus the tps constant column (accel_splines bridges it below). A
 # stated length-scale prior drops the validity floor (BRM
 # `_brm_hsgp_declared_rho_lower`), which the brm_hsgp/accel_gp values pin
 # (SB constrains rho = exp(u) there). The banked probes are uniform
@@ -268,10 +269,23 @@ end
     @test lay.total == 44
     @test _sm_val(kern, zeros(44)) ≈ -252.782708224855 atol = 1e-10
     @test _sm_val(kern, fill(0.3, 44)) ≈ -272.8662184101349 atol = 1e-10
-    # accel_splines: P-accelspl12 (0.3^24; per basis 2 fixed + 8 pen + sd).
+    # accel_splines: P-accelspl12 (SB 0.3^24; per basis 2 fixed + 8 pen +
+    # sd). Intended divergence: RK's tps drops SB's constant null column
+    # (decision `1cmodra`, prong `tps-intercept`), so RK packs 1 fixed per
+    # basis (22 coordinates). Folding SB's constant coefficients (0.3
+    # each) into the intercepts b0 and s0 makes the models identical: RK
+    # at 0.3^22 with both intercepts at 0.6 equals the SB literal up to
+    # those two priors, StudentT(3, -13, 36) and StudentT(3, 0, 10).
     _, _, kern, lay = _sm_query(_SM_ACCELSPL, _sm_cols(_SM_DATA.accelspl))
-    @test lay.total == 24
-    @test _sm_val(kern, fill(0.3, 24)) ≈ -68.72536513207879 atol = 1e-10
+    @test lay.total == 22
+    names = coordinate_names(lay)
+    @test names[1:3] ==
+        [Symbol("mu.Intercept"), Symbol("lsig.Intercept"), Symbol("b_s_x_fixed.1")]
+    u = [0.6; 0.6; fill(0.3, 20)]
+    t3(m, s, v) = logpdf(TDist(3), (v - m) / s) - log(s)
+    bridge = t3(-13, 36, 0.6) - t3(-13, 36, 0.3) + t3(0, 10, 0.6) -
+        t3(0, 10, 0.3)
+    @test _sm_val(kern, u) ≈ -68.72536513207879 + bridge atol = 1e-10
 end
 
 @testset "grouped HSGP surface + contract" begin
