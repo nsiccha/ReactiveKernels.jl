@@ -1,4 +1,8 @@
 # Owned symmetric-eigendecomposition primitives with generated AD rules.
+# They live here, beside the owned `loggamma` / `logbeta` rules, so every
+# consumer that already depends on ReactiveKernelsDistributionKernels (the
+# PPL layer and the hand-written PPL examples) reaches them without a new
+# package edge; ReactiveKernelsPPL re-exports the two callables.
 #
 # Ordinary reverse Enzyme through `eigen(::Symmetric)` fails: the call lowers
 # to LAPACK `syevr!` (`dsyevr_64_`), for which Enzyme has no derivative rule

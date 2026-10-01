@@ -220,8 +220,10 @@ ordinary Enzyme differentiates the built-in correctly, so the GP latent path
 swaps to it directly.
 
 The second linear-algebra consumer is the symmetric-eigendecomposition pair
-`ReactiveKernelsPPL.rk_symmetric_eigvals` /
-`ReactiveKernelsPPL.rk_symmetric_eigvecs`: ordinary reverse Enzyme through
+`rk_symmetric_eigvals` / `rk_symmetric_eigvecs`, defined in
+`ReactiveKernelsDistributionKernels.DistributionKernelSources` beside the
+owned `loggamma` / `logbeta` rules and re-exported by `ReactiveKernelsPPL`:
+ordinary reverse Enzyme through
 `eigen(::Symmetric)` fails on the LAPACK `syevr!` `ccall`
 (`EnzymeNoDerivativeError` for `dsyevr_64_`; Enzyme's derivative table covers
 BLAS plus `potrf` only), so each output is an owned callable whose graph

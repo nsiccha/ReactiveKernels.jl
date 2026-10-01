@@ -133,7 +133,12 @@ export build_varyingsource_pkpd_schedule, varyingsource_pkpd_read_locs_over_subj
 include("contract.jl")
 include("varying_centered.jl")
 include("expm_rule.jl")
-include("symmetric_eigen_rules.jl")
+# Owned symmetric-eigendecomposition rules: defined in
+# ReactiveKernelsDistributionKernels (beside `loggamma` / `logbeta`),
+# re-exported here with their rule graphs.
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    rk_symmetric_eigvals, rk_symmetric_eigvecs, rk_symmetric_eigvals_rule,
+    rk_symmetric_eigvecs_rule
 include("pkcells.jl")
 include("transit_twocmt.jl")
 include("transit_twocmt_rule.jl")
