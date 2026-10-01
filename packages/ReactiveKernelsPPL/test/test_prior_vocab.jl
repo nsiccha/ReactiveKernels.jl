@@ -56,6 +56,8 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
 
 @testset "prior vocab sampled admission" begin
     plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             t ~ StudentT(3, 1, 2)
@@ -79,6 +81,8 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
     @test u.args == (arg1 = -1, arg2 = 2)
     @testset "sampled hyperparameters" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 nu ~ Exponential(1)
@@ -94,6 +98,8 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                 (:(TDist(3)), "unknown distribution"))
             err = try
                 lower_rkppl(quote
+                        a ~ Normal(0, 1)
+                        b ~ Normal(0, 1)
                         mu = a .+ b .* x
                         y .~ Normal.(mu, s)
                         t ~ $rhs
@@ -110,6 +116,8 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
     @testset "uniform bounds must be finite literals in order" begin
         # Sampled bound (a known parameter name — the literal-only rule).
         @test_throws ContractValidationError lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 lo ~ Normal(0, 1)
@@ -118,6 +126,8 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
             end, (:y, :x))
         for rhs in (:(Uniform(2, -1)), :(Uniform(0, Inf)))
             @test_throws ContractValidationError lower_rkppl(quote
+                    a ~ Normal(0, 1)
+                    b ~ Normal(0, 1)
                     mu = a .+ b .* x
                     y .~ Normal.(mu, s)
                     u ~ $rhs
@@ -158,6 +168,8 @@ end
 
 @testset "prior vocab truncated halves" begin
     plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             h ~ truncated(StudentT(3, 0, 2), 0, Inf)
@@ -175,6 +187,8 @@ end
     @test _pv_param(plan, :n).support_override === :positive
     @testset "non-zero-location half rejected" begin
         @test_throws SurfaceLoweringError lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 h ~ truncated(StudentT(3, 1, 2), 0, Inf)
@@ -183,12 +197,16 @@ end
     end
     @testset "upper-only and finite intervals stay Normal-only" begin
         @test_throws SurfaceLoweringError lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 h ~ truncated(StudentT(3, 0, 2), -Inf, 1)
                 s ~ Exponential(1)
             end, (:y, :x))
         @test_throws SurfaceLoweringError lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 h ~ truncated(Laplace(0, 1), -1, 1)
@@ -225,6 +243,7 @@ _pv_prior(plan, pred::Symbol, addr::Symbol) =
         @test _pv_prior(plan, :mu, :Intercept).family === :cauchy
         @test _pv_prior(plan, :mu, :x).family === :flat
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 b ~ Logistic(1, 2)
@@ -345,6 +364,8 @@ _pv_m2_oracle(a::Real, b::Real, t::Real, l::Real, g::Real, s::Real) =
 
 # M3: interval-constrained Uniform plus a half-StudentT (exact +log(2)).
 const _PV_M3 = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     u ~ Uniform(-1, 2)
@@ -553,6 +574,8 @@ end
 # posteriordb reference kernels). Complement of the proper halves
 # (`HalfNormal`, `truncated(..., 0, Inf)`).
 const _PV_M5 = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     s ~ Normal(0, 2; lower=0)
@@ -582,6 +605,8 @@ end
     @test t.args == (arg1 = 0, arg2 = 5)
     @test t.support_override === :positive_stan
     plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             v ~ StudentT(4, 0, 1; lower=0)
@@ -593,6 +618,8 @@ end
     @test v.support_override === :positive_stan
     @testset "sampled scale" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 sc ~ Exponential(1)
@@ -632,6 +659,8 @@ end
         for (label, rhs, msg) in cases
             err = try
                 lower_rkppl(quote
+                        a ~ Normal(0, 1)
+                        b ~ Normal(0, 1)
                         mu = a .+ b .* x
                         y .~ Normal.(mu, s)
                         p ~ $rhs
@@ -650,6 +679,8 @@ end
                 :(truncated(Normal(0, 2), 0, Inf; lower = 0)))
             err = try
                 lower_rkppl(quote
+                        a ~ Normal(0, 1)
+                        b ~ Normal(0, 1)
                         mu = a .+ b .* x
                         y .~ Normal.(mu, s)
                         p ~ $rhs
@@ -764,6 +795,8 @@ end
 # (upper-bounded). Improper throughout: density 0.0, Jacobian only —
 # the posteriordb flat-sigma / flat-interval shape.
 const _PV_M7 = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     s ~ Flat(; lower=0)
@@ -787,6 +820,8 @@ _pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
     @test w.family === :flat
     @test w.support_override == (:upper, 5.0)
     bare = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             p ~ Flat()
@@ -820,6 +855,8 @@ _pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
         for (label, rhs, msg) in cases
             err = try
                 lower_rkppl(quote
+                        a ~ Normal(0, 1)
+                        b ~ Normal(0, 1)
                         mu = a .+ b .* x
                         y .~ Normal.(mu, s)
                         p ~ $rhs
@@ -919,6 +956,7 @@ _pv_m8_q() = (mu = [0.3, -0.4, 0.1, 0.75], mu_alpha = 0.5,
             err = try
                 if rhs === :scalar
                     lower_rkppl(quote
+                            a ~ Normal(0, 1)
                             mu_alpha ~ Normal(0, 10)
                             s ~ Exponential(1)
                             mu = a .+ b .* x

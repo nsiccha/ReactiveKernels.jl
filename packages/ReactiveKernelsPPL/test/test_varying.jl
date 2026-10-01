@@ -71,6 +71,8 @@ end
     @test t.addressee === t.label === :r_mu_g
     # Multi-target slices: the split form with explicit column ranges.
     multi = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            c ~ Normal(0, 1)
             d ~ varying_draws(g, [1, x, 1])
             r1 ~ varying_slice(d, 1:2)
             r2 ~ varying_slice(d, 3)
@@ -90,6 +92,7 @@ end
     # One geometry for every K: a single margin, intercept or slope, is
     # the 1x1 correlated case with the canonical eta 1.0.
     one = lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
@@ -100,6 +103,7 @@ end
     @test b.label === :draws_g
     @test b.suffix == "g"
     slope = lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
@@ -111,6 +115,7 @@ end
     # refused rather than silently ignored.
     err = try
         lower_rkppl(quote
+                a ~ Normal(0, 1)
                 r ~ varying_effect(g, [1]; eta = 2.0)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.5)
@@ -125,6 +130,7 @@ end
 
 @testset "varying dummy margins" begin
     got = lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [1, dummy(c, 2), dummy(s, "a")])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
@@ -206,6 +212,8 @@ end
         end, D)
     # Contribution inside a non-predictor definition.
     @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             w = r .+ 1.0
             mu = a .+ b .* x .+ r
@@ -1104,6 +1112,7 @@ end
         end, (:y, :x, :z, :g))
     # A predictor location inlines and emits no Z column.
     @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [mu])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
@@ -1117,6 +1126,7 @@ end
         end, (:y, :x, :g))
     # Predictor structure absorbed into the LP emits no column either.
     @test_throws SurfaceLoweringError lower_rkppl(quote
+            r ~ Prior
             a ~ Normal(0, 5)
             b ~ Normal(0, 2)
             sigma ~ Exponential(1)
@@ -1271,7 +1281,7 @@ function _tv_levels_plan(lv)
     call = Expr(:call, :varying_effect,
         Expr(:parameters, Expr(:kw, :levels, lv)), :g, Expr(:vect, 1))
     return lower_rkppl(Expr(:block,
-            Expr(:call, :~, :r, call),
+            Expr(:call, :~, :r, call), :(a ~ Normal(0, 1)),
             :(mu = a .+ r), :(y .~ Normal.(mu, 1.5))),
         (:y, :g))
 end
@@ -1287,6 +1297,7 @@ _tv_levels_vals(vals::Vector) =
     end
     # Eta combo; omitted levels stay `nothing` (bind derives).
     combo = lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [1, x]; eta = 2.0, levels = [:c, :a])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
@@ -1294,6 +1305,7 @@ _tv_levels_vals(vals::Vector) =
     b = only(combo.varying_draws)
     @test b.levels == [:c, :a] && b.lkj_eta == 2.0
     bare = lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)

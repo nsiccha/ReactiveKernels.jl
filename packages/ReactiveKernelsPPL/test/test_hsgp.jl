@@ -72,6 +72,7 @@ end
     @test t.options.hsgp_id === :h_x
     # Defaults: k=20, c=1.5, iso=true (SB `_brm_axis_option` defaults).
     dflt = lower_rkppl(quote
+            a ~ Normal(0, 1)
             hsgp_basis(:h_d, x)
             mu = a .+ hsgp(:h_d)
             y .~ Normal.(mu, 1.0)
@@ -544,6 +545,7 @@ end
     @test t.options.hsgp_id === :h_p
     # Defaults: k=20 like exp-quad; explicit cov=:exp_quad keeps NaN period.
     dflt = lower_rkppl(quote
+            a ~ Normal(0, 1)
             hsgp_basis(:h_d, x; cov = :periodic, period = 1.0)
             mu = a .+ hsgp(:h_d)
             y .~ Normal.(mu, 1.0)
@@ -552,6 +554,7 @@ end
     @test dhb.K == [20] && dhb.cov === :periodic && dhb.period == 1.0
     @test ReactiveKernelsPPL._hsgp_n_basis(dhb) == 40
     eq = lower_rkppl(quote
+            a ~ Normal(0, 1)
             hsgp_basis(:h_e, x; k = 3, cov = :exp_quad)
             mu = a .+ hsgp(:h_e)
             y .~ Normal.(mu, 1.0)
@@ -561,6 +564,7 @@ end
     # `c` is accepted with periodic (SB validates its form, ignores its
     # value — no domain).
     cacc = lower_rkppl(quote
+            a ~ Normal(0, 1)
             hsgp_basis(:h_c, x; k = 3, c = 2.5, cov = :periodic, period = 1.0)
             mu = a .+ hsgp(:h_c)
             y .~ Normal.(mu, 1.0)

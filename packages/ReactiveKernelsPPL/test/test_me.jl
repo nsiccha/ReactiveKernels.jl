@@ -71,8 +71,29 @@ end
     @test [r.predictor for r in plan.responses] == [:mu, :x_obs_loc]
 end
 
-@testset "surface me lowering: default coefficient prior" begin
+@testset "surface me lowering: coefficient prior is required" begin
+    # Strict declarations (decision 05oe96l): the latent's coefficient `b`
+    # gets no implicit Normal(0, 1) — undeclared, it fails naming the fix;
+    # declared as that prior, it lowers to exactly the old default.
+    undeclared = Expr(:block,
+        :(mu = a .+ b .* x_true),
+        :(a ~ Normal(0, 1)),
+        :(sigma ~ Exponential(1)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(4),
+            Expr(:for, Expr(:(=), :i, :(eachindex(x_obs))),
+                Expr(:block, :(x_true[i] ~ Normal(0, 1))))),
+        :(y .~ Normal.(mu, sigma)),
+        :(x_obs .~ Normal.(x_true, 0.5)))
+    err = try
+        lower_rkppl(undeclared, (:y, :x_obs))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError
+    @test occursin("`b ~ Normal(0, 1)`", sprint(showerror, err))
     ast = Expr(:block,
+        :(b ~ Normal(0, 1)),
         :(mu = a .+ b .* x_true),
         :(a ~ Normal(0, 1)),
         :(sigma ~ Exponential(1)),

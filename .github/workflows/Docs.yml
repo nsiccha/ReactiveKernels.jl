@@ -57,6 +57,7 @@ jobs:
               PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsDistributionKernels")),
               PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsKernelExamples")),
               PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsBatchingExamples")),
+              PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsPPL")),
               PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsPPLExamples")),
               PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsCompatibilityExamples")),
               PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsNUTSExamples")),
