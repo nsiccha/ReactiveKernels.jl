@@ -150,6 +150,23 @@ end
     err = try
         lower_rkppl(quote
                 s ~ Exponential(1.0)
+                m0 ~ Normal(0, 1)
+                t = shifted(x; by = s)
+                mu = m0 .+ x
+                y .~ Normal.(mu, t[1])
+            end, (:y, :x); mod = _FV)
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError
+    @test occursin("shifted", err.message)
+    @test occursin("broadcast", err.message)
+    # Read only inside the call, the column is a whole value and so is the
+    # result: using it as the location says so, with the same spellings.
+    err = try
+        lower_rkppl(quote
+                s ~ Exponential(1.0)
                 t = shifted(x; by = s)
                 y .~ Normal.(t, 1.0)
             end, (:y, :x); mod = _FV)
@@ -158,7 +175,7 @@ end
         e
     end
     @test err isa SurfaceLoweringError
-    @test occursin("shifted", err.message)
+    @test occursin("model-level value", err.message)
     @test occursin("broadcast", err.message)
 
     # Calling a model value is not a function call.
@@ -454,6 +471,29 @@ end
     _, bound, built = _fv_build(ast, cols)
     @test bound.n_obs == 8
     kern = prepare_query(built, bound, :sampler)
+    # The parameter-dependent call takes the columns directly, too: each is
+    # read only as a whole value, so lowering admits the call.
+    _, dbound, dbuilt = _fv_build(quote
+            sigma ~ Exponential(1.0)
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            k ~ Normal(0, 1)
+            scale = a .+ b .* as_vector(gx)
+            reads = decayed_events(g, t, eg, et, ea, w, scale, k)
+            y .~ Normal.(reads[oi], sigma)
+        end, cols)
+    @test dbound.n_obs == 8
+    dkern = prepare_query(dbuilt, dbound, :sampler)
+    # ... unless something else reads one per observation.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            sigma ~ Exponential(1.0)
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            k ~ Normal(0, 1)
+            scale = a .+ b .* as_vector(gx)
+            reads = decayed_events(g, t, eg, et, ea, w, scale, k)
+            y .~ weighted.(Normal.(reads[oi], sigma), t)
+        end, Tuple(keys(cols)); mod = _FV)
     for u in ([0.3, -0.2, 0.5, 0.1], [-1.1, 0.7, -0.3, -0.4])
         th = ReactiveKernelsPPL.constrain(built.layout, u)
         reads = _FV.decayed_events(cols[:g], cols[:t], cols[:eg], cols[:et],
@@ -466,5 +506,10 @@ end
         @test v ≈ Base.invokelatest(kern, u)
         @test isapprox(g, _fv_findiff(w -> Base.invokelatest(kern, w), u);
             rtol = 1e-5, atol = 1e-7)
+        @test Base.invokelatest(dkern, u) ≈ v
+        dq = prepare_sampler(dbuilt, dbound, u; backend = _FV_BACKEND)
+        _, dg = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            dq.ad, similar(u), u)
+        @test dg ≈ g
     end
 end
