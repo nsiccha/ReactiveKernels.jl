@@ -664,7 +664,7 @@ end
     @test_throws "≠ response `dv` length 3" bind_data(unbound, bad_resp)
     bad_sub = _pkc_columns()
     bad_sub[:age_s] = [35.0, 52.0, 40.0]
-    @test_throws "want n_sub" bind_data(unbound, bad_sub)
+    @test_throws "want subject rows" bind_data(unbound, bad_sub)
     missing_col = _pkc_columns()
     delete!(missing_col, :damt)
     @test_throws "is not bound" bind_data(unbound, missing_col)
