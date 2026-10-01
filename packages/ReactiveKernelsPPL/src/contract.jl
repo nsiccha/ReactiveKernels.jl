@@ -3188,9 +3188,14 @@ function _validate_columns(plan::StructuralPlan)
     union!(managed, _subject_predictor_columns(plan))
     union!(managed, _mi_managed_columns(plan))
     # Model-level data values (functions as values: a data-only
-    # assignment bound at bind) carry no observation axis.
-    modelvals = intersect(_bound_module_data_names(plan),
-        Set{Symbol}(a.name for a in plan.assignments))
+    # assignment bound at bind, or a data-only definition only used
+    # whole) and the raw inputs read only whole carry no observation
+    # axis.
+    computed = _bound_module_data_names(plan)
+    inputs, wholedefs = _bound_model_level_inputs(plan)
+    modelvals = union(
+        intersect(computed, Set{Symbol}(a.name for a in plan.assignments)),
+        intersect(computed, wholedefs), inputs)
     for (name, col) in plan.columns
         name in modelvals && continue
         # Kernel-managed columns (slices + scalar expansions) carry two
@@ -9802,11 +9807,16 @@ numeric eltype; every per-observation role reads vectors only and fails
 closed on a matrix. Data-only definitions that call a module function
 (functions as values) are evaluated here, once, and bound under their own
 names — never supplied by the caller; a model-level one may be a number,
-vector or matrix and carries no `n_obs` requirement.
+vector or matrix and carries no `n_obs` requirement. So does a model-level
+data input: a column every definition reads only inside an argument of an
+undotted module call (`gx_m = f(gx)`, or inlined `(b .* f(gx))[g]`) and no
+response, predictor or other slot names — it may have any length or shape
+and never sets `n_obs` (see `_model_level_inputs`).
 """
-# n_obs derivation skips mi-managed columns (packed y_obs/Jobs): every
-# other column crosses at length n, so the first non-managed column
-# pins n_obs order-independently. All-managed (an mi response whose
+# n_obs derivation skips mi-managed columns (packed y_obs/Jobs), bound
+# module data values and model-level data inputs: every other column
+# crosses at length n, so the first non-managed column pins n_obs
+# order-independently. All-managed (an mi response whose
 # location crosses no full-length column) fails closed — n is
 # underivable, and the structure gate already rejects that shape, so
 # this is unreachable past validation (defense in depth for direct
@@ -9901,6 +9911,146 @@ function _bound_module_data_names(plan::StructuralPlan)
     raw = Set{Symbol}(k for k in keys(plan.columns) if k ∉ nodes)
     return Set{Symbol}(n for n in _module_data_names(plan, raw)
         if haskey(plan.columns, n))
+end
+
+"""Model-level data inputs of `plan`: raw columns of `raw` read only as
+whole values. A read is whole inside an argument of an undotted module
+call (`f(gx)`, at any depth), as the gathered value of a gather
+(`gx[g]`, `(b .* gx)[g]`), or anywhere in a definition whose every use is
+whole (`scale = a .+ b .* gx` passed only to calls) — so naming a
+subexpression never changes the verdict. Such a column has no observation
+axis — any length or shape, like the model-level values computed from
+it — and it neither anchors nor crosses `n_obs`. Any other read keeps a
+column observation-aligned: a definition read outside those positions
+(`gx .+ 1` in a predictor, `f.(gx)`, `mean(gx)`, a gather index), or any
+name a response, predictor, plate or other slot holds (a slot added later
+stays fail-closed). Returns `(inputs, defs)`: the columns, and the
+whole-context definitions (whose values may have any length too)."""
+function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
+    defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
+    append!(defs, Pair{Symbol,Any}[d.name => d.expr for d in plan.derived])
+    # Pinning only shrinks the verdict: skip the slot walk when even the
+    # unpinned pass finds nothing.
+    inputs, _ = _whole_value_reads(defs, raw, Set{Symbol}())
+    isempty(inputs) && return inputs, Set{Symbol}()
+    free = union(Set{Symbol}(raw), Set{Symbol}(first(d) for d in defs))
+    named = copy(free)
+    for f in fieldnames(StructuralPlan)
+        f in (:assignments, :derived, :columns, :n_obs, :roles) && continue
+        _drop_held_names!(free, getfield(plan, f))
+    end
+    held = setdiff!(named, free)
+    inputs, ctx = _whole_value_reads(defs, raw, held)
+    return setdiff!(inputs, held), ctx
+end
+
+"""Whole-value reads over `defs` (`name => expr`): the columns of `raw`
+read only as whole values, and the whole-context definitions — every use
+a whole read or inside another whole-context definition (the greatest
+fixpoint), none of them in `pinned`."""
+function _whole_value_reads(defs, raw::AbstractSet{Symbol},
+        pinned::AbstractSet{Symbol})
+    names = Set{Symbol}(first(d) for d in defs)
+    known = union(Set{Symbol}(raw), names)
+    reads = Dict{Symbol,Tuple{Set{Symbol},Set{Symbol}}}()
+    for (nm, ex) in defs
+        w, p = Set{Symbol}(), Set{Symbol}()
+        _classify_reads!(w, p, ex, known, false)
+        reads[nm] = (w, p)
+    end
+    ctx = setdiff(names, pinned)
+    changed = true
+    while changed
+        changed = false
+        for (nm, (_, p)) in reads
+            nm in ctx && continue
+            for d in p
+                d in ctx || continue
+                delete!(ctx, d)
+                changed = true
+            end
+        end
+    end
+    inputs = Set{Symbol}()
+    aligned = Set{Symbol}()
+    for (nm, (w, p)) in reads
+        union!(inputs, intersect(w, raw))
+        union!(nm in ctx ? inputs : aligned, intersect(p, raw))
+    end
+    return setdiff!(inputs, aligned), ctx
+end
+
+"""In a bound plan: `(inputs, defs)` of [`_model_level_inputs`](@ref)."""
+function _bound_model_level_inputs(plan::StructuralPlan)
+    nodes = union(Set{Symbol}(a.name for a in plan.assignments),
+        Set{Symbol}(d.name for d in plan.derived))
+    return _model_level_inputs(plan,
+        Set{Symbol}(k for k in keys(plan.columns) if k ∉ nodes))
+end
+
+# Reads of `raw` names in `ex` (the reads `_expr_value_symbols` sees):
+# inside an argument of an undotted module call into `whole`, anywhere
+# else into `per_obs`.
+function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
+        raw::AbstractSet{Symbol}, inside::Bool)
+    if ex isa Symbol
+        ex in raw && push!(inside ? whole : per_obs, ex)
+    elseif ex isa Expr
+        if ex.head === :kw && length(ex.args) == 2
+            _classify_reads!(whole, per_obs, ex.args[2], raw, inside)
+        elseif ex.head === :call
+            inner = inside || (!isempty(ex.args) && ex.args[1] isa GlobalRef)
+            for a in ex.args[2:end]
+                _classify_reads!(whole, per_obs, a, raw, inner)
+            end
+        elseif _is_dotted_call(ex)
+            for a in ex.args[2].args
+                _classify_reads!(whole, per_obs, a, raw, inside)
+            end
+        elseif ex.head === :ref && length(ex.args) == 2
+            # A gather `v[c]` takes the gathered value whole; its index
+            # keeps the surrounding context.
+            _classify_reads!(whole, per_obs, ex.args[1], raw, true)
+            _classify_reads!(whole, per_obs, ex.args[2], raw, inside)
+        else
+            for a in ex.args
+                _classify_reads!(whole, per_obs, a, raw, inside)
+            end
+        end
+    end
+    return nothing
+end
+
+# Drop from `out` every Symbol `x` holds, at any depth.
+_drop_held_names!(out::Set{Symbol}, x::Symbol) = (delete!(out, x); nothing)
+_drop_held_names!(::Set{Symbol},
+    ::Union{Number,AbstractString,Function,Module,Type,AbstractArray{<:Number}}) =
+    nothing
+function _drop_held_names!(out::Set{Symbol},
+        x::Union{AbstractArray,Tuple,NamedTuple,AbstractSet})
+    for v in x
+        isempty(out) && return nothing
+        _drop_held_names!(out, v)
+    end
+    return nothing
+end
+function _drop_held_names!(out::Set{Symbol}, x::AbstractDict)
+    for (k, v) in x
+        isempty(out) && return nothing
+        _drop_held_names!(out, k)
+        _drop_held_names!(out, v)
+    end
+    return nothing
+end
+_drop_held_names!(out::Set{Symbol}, x::Expr) =
+    _drop_held_names!(out, x.args)
+function _drop_held_names!(out::Set{Symbol}, x::T) where {T}
+    isstructtype(T) || return nothing
+    for f in fieldnames(T)
+        isempty(out) && return nothing
+        isdefined(x, f) && _drop_held_names!(out, getfield(x, f))
+    end
+    return nothing
 end
 
 function _materialize_module_data!(plan::StructuralPlan,
@@ -10143,7 +10293,11 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     isempty(columns) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
     columns = _checked_columns(columns)
+    raw = Set{Symbol}(keys(columns))
     computed = _materialize_module_data!(plan, columns)
+    # Raw inputs read only as whole values (module-call arguments,
+    # gathered values): no n_obs anchor.
+    inputs, _ = _model_level_inputs(plan, raw)
     _materialize_derived_responses!(plan, columns)
     bases = _materialize_splines!(plan, columns)
     hbases = _fit_hsgp_bases(plan, columns)
@@ -10224,7 +10378,8 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # contract (deriving from a packed column fails every full-length
     # column by order luck).
     n = if isempty(kbases)
-        _bind_nrows(columns, union(_mi_managed_columns(plan), computed))
+        _bind_nrows(columns,
+            union(_mi_managed_columns(plan), computed, inputs))
     else
         sum(kp -> _kernel_plate_nlanes(kp, columns), kbases)
     end

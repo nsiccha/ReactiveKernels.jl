@@ -416,7 +416,10 @@ gather. A data-only definition calling such a function is evaluated once by
 kernel under generic AD (an RK-owned derivative rule, when the callee is
 one, is used by Enzyme). A parameter-dependent undotted call over an
 observation column fails closed: its result shape is unknown before
-sampling, so broadcast it or bind its data-only part first.
+sampling, so broadcast it or bind its data-only part first. A data column
+the definitions read only inside undotted module-call arguments, and no
+other statement names, is a whole value instead (a model-level data input
+of any length at bind), so such a call may take it directly.
 
 Input ownership and concurrency: neither `ast` nor the submodel bodies
 reachable through `mod` is mutated, so one AST may be lowered repeatedly
@@ -550,7 +553,12 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         union(dirichlet_names, ordered_names, array_decls))
     detshape = _def_shapes(det, data, detmap; arrays = array_decls,
         env = shape_env)
-    _check_module_calls(det, detmap, data, shape_env)
+    # A data column the definitions read only as whole values (module-call
+    # arguments, gathered values) is a model-level data input at bind, so
+    # a parameter-dependent call may take it; each refusal that waiver
+    # skips is re-checked once the plan shows no other slot reads it.
+    whole = _whole_value_data(det, data, _statement_names(ast))
+    waived = _check_module_calls(det, detmap, data, shape_env; whole)
     canonmap = Dict{Symbol,Any}()
     for nm in _det_topo_order(det, detmap)
         rhs = detmap[nm]
@@ -829,6 +837,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = matrices, event_lps = event_lps,
         array_parameters = arrays)
+    _confirm_whole_value_data(plan, data, waived)
     validate_structure(plan)
     return plan
 end
@@ -886,7 +895,7 @@ function _shape_of(ex, data, detmap, memo, active::Set{Symbol},
     ex in active && return :scalar  # cyclic: errors downstream
     push!(active, ex)
     sh = _shape_of(detmap[ex], data, detmap, memo, active, env)
-    pop!(active)
+    delete!(active, ex)
     memo[ex] = sh
     return sh
 end
@@ -1023,7 +1032,7 @@ function _model_valued(ex, detmap, env, active::Set{Symbol})
         (haskey(detmap, ex) && !(ex in active)) || return false
         push!(active, ex)
         r = _model_valued(detmap[ex], detmap, env, active)
-        pop!(active)
+        delete!(active, ex)
         return r
     end
     ex isa Expr || return false
@@ -1270,7 +1279,7 @@ function _det_topo_order(det, detmap)
         for s in _symbols_in(detmap[nm])
             s in detkeys && s != nm && visit(s)
         end
-        pop!(active)
+        delete!(active, nm)
         push!(done, nm)
         push!(order, nm)
         return nothing
@@ -1559,7 +1568,7 @@ function _data_only(ex, data, detmap, active::Set{Symbol} = Set{Symbol}())
         (haskey(detmap, s) && !(s in active)) || return false
         push!(active, s)
         ok = _data_only(detmap[s], data, detmap, active)
-        pop!(active)
+        delete!(active, s)
         ok || return false
     end
     return true
@@ -1568,32 +1577,97 @@ end
 # An undotted module call takes whole values, so over an observation
 # column its result shape is the function's business: known once its
 # data-only inputs are bound, but never guessed for a parameter-dependent
-# call. Such a call fails here with the honest spellings.
-function _check_module_calls(det, detmap, data, env::_ShapeEnv)
-    memo = Dict{Symbol,Symbol}()
+# call. Such a call fails here with the honest spellings. A data column
+# in `whole` (read only as module-call arguments) has no observation axis;
+# a refusal that only its alignment would raise is returned as waived —
+# (message, the whole columns it rests on) — for
+# `_confirm_whole_value_data`.
+function _check_module_calls(det, detmap, data, env::_ShapeEnv;
+        whole::Set{Symbol} = Set{Symbol}())
+    # Whole columns are model-level values there: still gatherable
+    # (`gx[g]` follows its index), never aligned themselves.
+    aligned = setdiff(data, whole)
+    wenv = _ShapeEnv(env.aligned, union(env.values, whole))
+    memos = (Dict{Symbol,Symbol}(), Dict{Symbol,Symbol}())
+    waived = Tuple{String,Set{Symbol}}[]
     for (nm, rhs) in det
-        _check_module_calls(nm, rhs, detmap, data, env, memo)
+        _check_module_calls(nm, rhs, detmap, data, aligned, whole, env, wenv,
+            memos, waived)
     end
-    return nothing
+    return waived
 end
 
-function _check_module_calls(nm, ex, detmap, data, env, memo)
+function _check_module_calls(nm, ex, detmap, data, aligned, whole, env, wenv,
+        memos, waived)
     ex isa Expr || return nothing
     if ex.head === :call && !isempty(ex.args) && ex.args[1] isa GlobalRef
         for a in ex.args[2:end]
-            _obs_axis(a, data, detmap, memo, Set{Symbol}(), env) || continue
+            _obs_axis(a, data, detmap, memos[1], Set{Symbol}(), env) ||
+                continue
             _data_only(ex, data, detmap) && break
             f = ex.args[1].name
-            _sfail("definition `$nm = $(repr(ex))` calls `$f` on the " *
+            msg = "definition `$nm = $(repr(ex))` calls `$f` on the " *
                 "observation-aligned value `$(repr(a))` together with " *
                 "parameters, so its result shape is unknown until " *
                 "sampling — broadcast it for an elementwise column " *
                 "(`$f.(...)`), or compute the data-only part in its own " *
-                "definition (evaluated once at bind)")
+                "definition (evaluated once at bind)"
+            _obs_axis(a, aligned, detmap, memos[2], Set{Symbol}(), wenv) &&
+                _sfail(msg)
+            push!(waived, (msg, _reached_names(a, detmap, whole)))
         end
     end
     for a in ex.args
-        _check_module_calls(nm, a, detmap, data, env, memo)
+        _check_module_calls(nm, a, detmap, data, aligned, whole, env, wenv,
+            memos, waived)
+    end
+    return nothing
+end
+
+# Data columns the definitions read only as whole values — the bind-time
+# model-level data-input rule (`_model_level_inputs`) over the
+# definitions, with every name another statement mentions (`held`: a
+# response, prior, `@plate`, …) pinned observation-aligned.
+# `_confirm_whole_value_data` re-checks each waiver against the plan.
+function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol})
+    inputs, _ = _whole_value_reads(det, data, held)
+    return setdiff!(inputs, held)
+end
+
+# Every name the non-definition statements of `ast` mention.
+function _statement_names(ast::Expr)
+    out = Set{Symbol}()
+    for st in ast.args
+        st isa LineNumberNode && continue
+        st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
+        _all_symbols!(out, st)
+    end
+    return out
+end
+
+# The names of `among` that `ex` reads, directly or through definitions.
+function _reached_names(ex, detmap, among::Set{Symbol},
+        out::Set{Symbol} = Set{Symbol}(), seen::Set{Symbol} = Set{Symbol}())
+    for s in _value_symbols(ex)
+        s in among && push!(out, s)
+        if haskey(detmap, s) && !(s in seen)
+            push!(seen, s)
+            _reached_names(detmap[s], detmap, among, out, seen)
+        end
+    end
+    return out
+end
+
+# A waived refusal stands unless every whole column it rests on is a
+# model-level data input of the finished plan: any other slot reading one
+# (a response, predictor, plate, …) makes it observation-aligned after
+# all, and the call fails exactly as it would have without the waiver.
+function _confirm_whole_value_data(plan::StructuralPlan, data::Set{Symbol},
+        waived)
+    isempty(waived) && return nothing
+    inputs, _ = _model_level_inputs(plan, data)
+    for (msg, needed) in waived
+        needed ⊆ inputs || _sfail(msg)
     end
     return nothing
 end
@@ -8303,7 +8377,7 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
         push!(ctx.absorbed, ex)
         push!(visited, ex)
         out = _inline_structure(ctx.detmap[ex], ctx, visited, where)
-        pop!(visited)
+        delete!(visited, ex)
         return out
     end
     return ex
@@ -8452,6 +8526,13 @@ function _classify_summand(pname, core, sign::Int, ctx)
     length(coefrefs) == 1 && _sfail(
         "predictor $pname: $(repr(core)) computes over the coefficient " *
         "$(only(coefrefs)) — computed coefficients are not in slice 1")
+    # An undotted module call returns a whole (model-level) value, even
+    # over columns it reads whole.
+    _contains_module_call(core) && _sfail("predictor $pname: " *
+        "$(repr(core)) is a model-level value (an undotted module call " *
+        "takes and returns whole values), not an observation column — " *
+        "gather it with an observation index (`v[c]`), or broadcast the " *
+        "call (`f.(...)`) for an elementwise column")
     return _sfail("predictor $pname: $(repr(core)) is a scalar, not a " *
                   "term — scalar parameters are not identified " *
                   "separately from the intercept (bind the value to a " *
