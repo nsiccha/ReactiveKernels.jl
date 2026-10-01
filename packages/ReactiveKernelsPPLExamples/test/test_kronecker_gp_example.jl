@@ -10,14 +10,18 @@ import Enzyme
 
 const _KRON_AE = AutoEnzyme(mode = Enzyme.Reverse)
 
-# Pinned upstream Enzyme gap: the margin eigendecompositions
-# `eigen(Symmetric(...))` reach LAPACK `dsyevr_64_` (via
-# `LinearAlgebra.LAPACK.syevr!`), which has no Enzyme derivative rule —
-# `Enzyme.Compiler.EnzymeNoDerivativeError`: "No augmented forward pass found
-# for dsyevr_64_" (measured Enzyme 0.13.208, Julia 1.10.11). Only that
-# signature is tolerated; anything else rethrows.
-_kron_is_upstream_gap(e) = e isa Enzyme.Compiler.EnzymeNoDerivativeError &&
-    occursin("No augmented forward pass found for dsyevr_64_", sprint(showerror, e))
+# Pinned Enzyme gap (snag lkj-corr-cholesk-44503bef): with the margins on the
+# owned eigen rules, reverse Enzyme reaches the LKJ(2) density, whose
+# `0.5 .* (0:(K - 3))` builds a float `StepRangeLen` through TwicePrecision
+# (`Base.floatrange` → `steprangelen_hp`); Enzyme cannot differentiate its
+# bit masking — `EnzymeNoDerivativeError` "cannot handle unknown binary
+# operator" in `steprangelen_hp` (measured Enzyme 0.13.208, Julia 1.10.11).
+# Only that signature is tolerated; anything else rethrows.
+_kron_is_lkj_range_gap(e) = e isa Enzyme.Compiler.EnzymeNoDerivativeError &&
+    (msg = sprint(showerror, e);
+     occursin("steprangelen_hp", msg) &&
+     occursin("cannot handle unknown binary operator", msg))
+
 
 function _kron_fd(f, q; h = 1e-6)
     g = similar(q)
@@ -203,6 +207,11 @@ end
     end
 
     @testset "native primal + plain-Enzyme gradient vs finite differences" begin
+        # The margins diagonalize through the owned `rk_symmetric_eigvecs` /
+        # `rk_symmetric_eigvals` rules (raw `eigen(Symmetric(...))` reaches
+        # LAPACK `dsyevr_64_`, which Enzyme cannot differentiate — snag
+        # kronecker-gp-enz-7f7eafb3, resolved). The next gap on this path is
+        # the LKJ float range pinned above.
         gapped = true
         pk = prepare(model; have = _KRON_HAVE, want = :posterior, bound = _KRON_BOUND)
         @test pk(q) ≈ reference.posterior
@@ -213,11 +222,11 @@ end
             @test all(isfinite, g)
             gfd = _kron_fd(qq -> _kron_reference(qq, KRON_X1, KRON_Y).posterior, q)
             @test g ≈ gfd rtol = 1e-5
-            # Self-firing pin: errors (Unexpected Pass) once upstream Enzyme
-            # differentiates `dsyevr_64_`, forcing removal of the gate.
+            # Self-firing pin: errors (Unexpected Pass) once the LKJ source
+            # differentiates, forcing removal of the gate.
             gapped && @test_broken true
         catch e
-            gapped && _kron_is_upstream_gap(e) || rethrow()
+            gapped && _kron_is_lkj_range_gap(e) || rethrow()
         end
     end
 end

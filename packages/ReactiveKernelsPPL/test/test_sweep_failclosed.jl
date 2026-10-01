@@ -150,18 +150,12 @@ using Test
                 y .~ Normal.(mu, sigma_obs)
             end), (:y, :t, :A1, :A2, :C1, :C2, :X1m, :X2m, :X1a, :X2a),
             SurfaceLoweringError),
-        # bordet builder 7 (brm_grouped_hsgp_centeredness @ e800ef8d):
-        # grouped HSGP (`by=`) has no basis spelling — hsgp_basis takes
-        # k/c/iso/cov/period only. (The builder's other pieces —
-        # varying intercepts, intercept-only sigma, censored Gaussian —
-        # are admitted; the grouped smooths gate it F.)
-        ("bordet-builder7", "grouped hsgp by kwarg",
-            :(begin
-                a ~ Normal(0, 1)
-                mu = a .+ hsgp(:h_x)
-                y .~ Normal.(mu, 1.5)
-                hsgp_basis(:h_x, x; k = 5, by = g)
-            end), (:y, :x, :g), SurfaceLoweringError),
+        # bordet-builder7 grouped-hsgp-by probe REMOVED 2026-09-30
+        # (R-P1/P2/P3 re-verify): matrix-b landed grouped HSGP
+        # (`hsgp_basis(...; by = g)`, commit 6dfdca8d), so the spelling
+        # this case pinned as SurfaceLoweringError now lowers. Builder 7
+        # (Bordet e800ef8d) is admitted and trio-tested as D7 in
+        # test_smooth_sb.jl.
         # garch11: GARCH(1,1) variance recursion is deterministic given
         # data+params; same scan-setup gate.
         ("garch11", "deterministic scan setup",

@@ -35,6 +35,11 @@ using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     lognormal, lkj_corr_cholesky
 using LinearAlgebra: I, Symmetric, eigen
+# Owned symmetric-eigendecomposition rules (native Enzyme reverse through the
+# margins; raw `eigen(Symmetric(...))` reaches LAPACK `syevr!`, which Enzyme
+# cannot differentiate).
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    rk_symmetric_eigvals, rk_symmetric_eigvecs
 
 # --- Stan `kron_mvprod`: (A ⊗ B) v without materializing the Kronecker product,
 # where V = reshape(v, n2, n1). ---
@@ -133,13 +138,11 @@ end
     # Transformed parameters: both margin eigendecompositions (exact, dense).
     Sigma1::Matrix{Float64} = var1 .* exp.(xd1 .* bw1)
     Sigma1_reg::Matrix{Float64} = Sigma1 + 0.00001 .* Matrix{Float64}(I, n1, n1)
-    F1 = eigen(Symmetric(Sigma1_reg))
-    Q1::Matrix{Float64} = F1.vectors
-    R1::Vector{Float64} = F1.values
+    Q1::Matrix{Float64} = rk_symmetric_eigvecs(Sigma1_reg)
+    R1::Vector{Float64} = rk_symmetric_eigvals(Sigma1_reg)
     Lambda::Matrix{Float64} = L * transpose(L)
-    F2 = eigen(Symmetric(Lambda))
-    Q2::Matrix{Float64} = F2.vectors
-    R2::Vector{Float64} = F2.values
+    Q2::Matrix{Float64} = rk_symmetric_eigvecs(Lambda)
+    R2::Vector{Float64} = rk_symmetric_eigvals(Lambda)
 
     # eigenvalues[i,j] = R2[i]·R1[j] + sigma1  (Stan `calculate_eigenvalues`).
     eigenvalues::Matrix{Float64} = R2 .* transpose(R1) .+ sigma1
@@ -210,8 +213,10 @@ end
 Build the posteriordb `kronecker_gp` model (a Kronecker-structured GP over a
 2-D grid) as a declarative `ReactiveKernels.KernelSpec`. The RBF margin
 (`var1`, `bw1`) and the correlation margin (`L`, LKJ(2)) are each exactly
-diagonalized in-graph through `eigen(Symmetric(·))`; the marginal likelihood
-is the Stan `kron_mvprod` contraction against the product eigenspectrum. The
+diagonalized in-graph through the owned `rk_symmetric_eigvecs` /
+`rk_symmetric_eigvals` rules (`eigen(Symmetric(·))` with generated AD rules);
+the marginal likelihood is the Stan `kron_mvprod` contraction against the
+product eigenspectrum. The
 LKJ-Cholesky constraining transform (tanh partial-sum form) and its exact
 log-Jacobian are authored in-graph; the squared-distance data matrix `xd` is
 derived in-graph from the bound locations `x1`. Data-generic: dims read from
