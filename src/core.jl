@@ -429,6 +429,64 @@ function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
     result
 end
 
+# `scan(...; history = h0)`: the step's last argument is a read-only view of
+# the result vector being written, so step `j` reads the outputs of steps
+# `1:j-1` and `h0` at `j` and after. Every backend hands the step that same
+# full-length vector, so a step that reads beyond `j - 1` sees `h0` on each.
+# `h0` is a scalar number and fixes the result's element type; each output is
+# stored converted to it. The view has no `setindex!`, and a carry holding it
+# is refused, because the native view aliases the vector the scan still writes.
+struct _ScanHistory{T,A<:AbstractVector{T}} <: AbstractVector{T}
+    outputs::A
+end
+Base.size(h::_ScanHistory) = size(h.outputs)
+Base.axes(h::_ScanHistory) = axes(h.outputs)
+Base.IndexStyle(::Type{<:_ScanHistory{T,A}}) where {T,A} = IndexStyle(A)
+Base.@propagate_inbounds Base.getindex(h::_ScanHistory, i::Int...) = h.outputs[i...]
+
+function _scan_history_buffer(xs, fill::Number)
+    buffer = similar(xs, typeof(fill))
+    fill!(buffer, fill)
+end
+_scan_history_buffer(xs, fill) = throw(ArgumentError(
+    "a scan's `history =` value must be a number (it fills the outputs not yet " *
+    "written and fixes their element type); got a $(typeof(fill))"))
+
+_scan_holds_history(::Type{<:_ScanHistory}) = true
+_scan_holds_history(T::DataType) = (T <: Tuple || T <: NamedTuple) &&
+    any(_scan_holds_history, fieldtypes(T))
+_scan_holds_history(::Type) = false
+@generated function _scan_history_carry(carry)
+    _scan_holds_history(carry) ? :(throw(ArgumentError(
+        "a `history =` scan step returned its history in the carry; the history " *
+        "is read-only and valid only during its step. Carry the values it needs " *
+        "instead."))) : :carry
+end
+
+@inline function _tensorized_scan_history(step, init, fill, iterated::Tuple,
+                                          shared::Tuple)
+    marker = _scan_backend_marker(init, iterated, (shared..., fill))
+    _tensorized_scan_history_lowering(marker, step, init, fill, iterated, shared)
+end
+
+function _tensorized_scan_history_lowering(::Nothing, step, init, fill,
+                                           iterated::Tuple, shared::Tuple)
+    idx = eachindex(iterated...)
+    result = _scan_history_buffer(first(iterated), fill)
+    earlier = _ScanHistory(result)
+    isempty(idx) && return result
+    i1 = first(idx)
+    carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared..., earlier)
+    carry = _scan_history_carry(carry)
+    result[i1] = out1
+    for i in Iterators.drop(idx, 1)
+        carry, out = step(carry, map(xs -> xs[i], iterated)..., shared..., earlier)
+        carry = _scan_history_carry(carry)
+        result[i] = out
+    end
+    result
+end
+
 # Internal rectangular recurrence boundary. Unlike scan, this returns the final
 # carry, which may include fixed-size output buffers. Ragged segments use
 # reset/mask/index columns, never dynamic slices or growing containers.

@@ -1,9 +1,7 @@
 # Tumor-growth-inhibition (TGI) block cell vocabulary + observation likelihoods.
 #
-# SB-mirror of the Bruno `joint_pk_qt_tgi_brm1` tumor block
-# (`web-pkpd/src/brm_joint_tgi.jl` @ bruno mirror ref `kb-impl/Bruno-arv393-tgi`
-# 3af2284686857a37974c83cffa1e555610239dd9; design doc
-# `dev-docs/arv393-tgi-model.md`). Aggregate mode only (no per-lesion
+# Mirrors a StanBlocks (SB) reference joint-model tumor block. Aggregate
+# mode only (no per-lesion
 # `ragged`); logdensity only (no `_rng`, no held_out/GQ, no replay).
 #
 # Ownership split (parent `ReactiveKernels:brm:tgi` wave-1): the PK recurrence
@@ -26,7 +24,7 @@
 #     the host loop cannot trace on param-dependent inputs).
 #
 # Julianic deltas from the SB counterpart (all value-exact on in-contract
-# inputs; each is covered by a dedicated test):
+# inputs):
 #
 #   * scalar core + broadcast/dispatch instead of vector-only Stan functions
 #     (`tgi_category_lpmf` has scalar and vector-reduced methods;
@@ -56,7 +54,7 @@
 # (host-side, at build time). Traced nadirs use a rectangular retained loop;
 # native nadirs use ordinary Julia iteration.
 #
-# Recommended grouped-kernel emission shapes (proved in `test_tgi.jl`):
+# Recommended grouped-kernel emission shapes:
 # elementwise latent lines as flat recipes; nadir via `tgi_nadir_scan_expr`;
 # each observation likelihood as a whole-vector `tgi_*_lpmf/lpdf` recipe over
 # bound responses + traced latents, with lazy selection of each likelihood.

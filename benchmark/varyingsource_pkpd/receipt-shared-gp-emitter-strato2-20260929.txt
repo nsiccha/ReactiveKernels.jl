@@ -1,2 +1,0 @@
-[kb-run-compact] pid=19 pgid=19 argv=julia --startup-file=no --threads=1 --project=/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-shared-gp/env /home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-shared-gp/emitter-only.jl /home/n/.local/state/kb-agents-worktrees/ReactiveKernels-brm-pkpd-shared-gp started=2026-09-29T07:52:28Z log=/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-shared-gp/kb-run-compact.K6U6SK
-[kb-run-compact] exit=0 elapsed=392s ended=2026-09-29T07:59:00Z log=/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-pkpd-shared-gp/kb-run-compact.K6U6SK

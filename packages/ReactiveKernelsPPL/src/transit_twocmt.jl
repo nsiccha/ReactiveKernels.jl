@@ -1,8 +1,8 @@
 # Closed-form two-compartment unit response with Gamma-transit input.
 #
 # This replaces the per-subject-per-treatment `ode_bdf_tol` unit solve of the
-# varyingsource family (Bruno `stan/varyingsource3.stan`, StanBlocks `twocmt`
-# + `transit_source`) with the exact closed form: a two-exponential
+# varyingsource family (a StanBlocks `twocmt` + `transit_source` reference
+# program) with the exact closed form: a two-exponential
 # disposition convolved with the Gamma-PDF input. The Stan program integrates
 # the forced 2-state system numerically (tol 1e-6/1e-6, max 10000 steps) with
 # full sensitivities; no canned analytic solver covers the

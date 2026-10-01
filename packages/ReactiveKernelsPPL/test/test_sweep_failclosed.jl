@@ -87,15 +87,15 @@ using Test
                 Rt = conv(prev, wgt)
                 y .~ Normal.(a, 1.0)
             end), (:y, :prev, :wgt), SurfaceLoweringError),
-        # bruno qt: indexed cumulative-simplex slope; no cumsum admission.
-        ("bruno-qt", "cumsum call",
+        # Indexed cumulative-simplex slope: no cumsum admission.
+        ("cumsum-slope", "cumsum call",
             :(begin
                 w ~ Dirichlet([1.0, 1.0, 1.0])
                 cs = cumsum(w)
                 y .~ Normal.(a, 1.0)
             end), (:y,), SurfaceLoweringError),
-        # bruno qt (second half): data-indexed gather of a slope vector.
-        ("bruno-qt", "index gather",
+        # Data-indexed gather of a slope vector.
+        ("gather-slope", "index gather",
             :(begin
                 a ~ Normal(0, 1)
                 mu = cs[gidx]
@@ -150,12 +150,6 @@ using Test
                 y .~ Normal.(mu, sigma_obs)
             end), (:y, :t, :A1, :A2, :C1, :C2, :X1m, :X2m, :X1a, :X2a),
             SurfaceLoweringError),
-        # bordet-builder7 grouped-hsgp-by probe REMOVED 2026-09-30
-        # (R-P1/P2/P3 re-verify): matrix-b landed grouped HSGP
-        # (`hsgp_basis(...; by = g)`, commit 6dfdca8d), so the spelling
-        # this case pinned as SurfaceLoweringError now lowers. Builder 7
-        # (Bordet e800ef8d) is admitted and trio-tested as D7 in
-        # test_smooth_sb.jl.
         # garch11: GARCH(1,1) variance recursion is deterministic given
         # data+params; same scan-setup gate.
         ("garch11", "deterministic scan setup",
