@@ -524,12 +524,14 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     value_arrays = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
         (s.dims !== nothing ||
             (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
-    # Every array-capable declaration (sized `.~`, LKJ): an
-    # expression that READS one (`L[2, 1] .* x`, `tau .* z[g]`) is a value,
-    # never an affine sub-predictor over coefficients.
-    sized_decls = union(array_decls, Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data && s.broadcast &&
-            (s.levels !== nothing || s.matrix !== nothing)))
+    # Every array-capable declaration (sized `.~`, LKJ, a `Dirichlet`
+    # simplex value): an expression that READS one by index (`L[2, 1] .* x`,
+    # `tau .* z[g]`, `phi[1] .* x`) is a value, never an affine
+    # sub-predictor over coefficients.
+    sized_decls = union(array_decls, dirichlet_names,
+        Set{Symbol}(s.lhs for s in sample
+            if s.lhs ∉ data && s.broadcast &&
+                (s.levels !== nothing || s.matrix !== nothing)))
     # Shape every definition (data-free: data ⇒ vector, sampled ⇒ scalar,
     # det-refs recurse with memo; cycles error downstream), then
     # canonicalize each RHS in dependency order (Julia-valid undotted
