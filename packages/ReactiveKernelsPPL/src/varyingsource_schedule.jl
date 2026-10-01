@@ -6,7 +6,7 @@ Bind-time recipe for the varying-source PK slice. Observation subjects cover
 1:n; doses refer to those subjects and remain in caller order, which must be
 nondecreasing in time within each subject. Equal-time doses remain separate.
 `treatment` supplies the combined treatment/diet key, renumbered in first
-appearance order within each subject, as in Bruno's varyingsource3 twin.
+appearance order within each subject, as in the reference model.
 
 Reference times are the sorted unique union of PK observations and dose times.
 Each subject's lag grid includes zero and every nonnegative dose-to-reference

@@ -1,1 +1,0 @@
-:(pk_y .~ CensoredAddpropnormal.(pk_loc, sigma_add, sigma_prop, pk_lloq))

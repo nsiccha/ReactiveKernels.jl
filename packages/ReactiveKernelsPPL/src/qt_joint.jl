@@ -1,27 +1,24 @@
 # QT coupling + PK/QT in-cell observations for the joint PK+QT(+TGI) thin
-# layer — SB-mirror of the brm2 V2 (`raw_axes`) kernel cell at DEFAULT
+# layer — mirrors a StanBlocks (SB) reference joint kernel cell at DEFAULT
 # config only (direct_linear spine, Gaussian QT obs family, additive QT
 # amplitude, no time effect / comed / R² / regime variants — those are
 # sequenced separately).
 #
-# SB source of truth (bruno `kb-impl/Bruno-arv393-tgi` @ `3af22846`, audit
-# triple `web-pkpd/test/stan_audit_triples/joint_brm2_default.md`):
-# - cell (`brm_integration.jl:4042-4045`, triple §1):
+# SB reference semantics:
+# - cell:
 #     qt_loc = qbase + qslope * (conc[ecg_idx] ./ 0.8)
 #     qt_y ~ normal(qt_loc, qt_scale .* qt_weight)
 #   with the training-derived `reference_exposure` (max observed PK conc)
-#   baked as a literal (`brm_integration.jl:4029-4041`, decision
-#   `2026-08-19T10-50-49-773-0ec3tx1`).
-# - PK likelihood (top-level over the collected `conc[pk_idx]`,
-#   `brm_integration.jl:4064-4066`, triple §1):
+#   baked as a literal.
+# - PK likelihood (top-level over the collected `conc[pk_idx]`):
 #     ragged(pk_conc, obs_subject) ~ censored(Normal(pk_loc,
 #         addprop(pk_loc, sigma_add, sigma_prop)); lower=pk_lloq)
-#   lowering to Stan `lower_clamping_normal` (triple §3): per element,
+#   lowering to Stan `lower_clamping_normal`: per element,
 #   `y == lo` takes `normal_lcdf_stable(lo, loc, scale) =
 #   log(erfc(-(lo-loc)/(scale*√2))) - log(2)`, `y > lo` takes
 #   `normal_lpdf`, else `-inf`; `addprop(loc, add, prop) =
 #   sqrt(add^2 + (loc*prop)^2)` elementwise.
-# - prep (`brm_integration.jl:2404,3363,2975-2976`): BLQ rows are clamped
+# - prep: BLQ rows are clamped
 #   (`pk_conc = max.(pk_conc, pk_lloq)`, so `y >= lo` by construction and
 #   the `-inf` arm is unreachable); `inv_sqrt_k` (the per-ECG-row
 #   `qt_weight` data) must be finite and positive.
@@ -78,8 +75,8 @@ end
     qt_loc_assignment(spine = :direct_linear; base = :qbase, slope = :qslope,
         conc = :conc, ecg_idx = :ecg_idx, reference_exposure) -> Pair{Symbol,Expr}
 
-The `direct_linear` C–QT coupling cell assignment, SB-mirror of
-`brm_integration.jl:4042-4045`: `qt_loc = qbase + qslope *
+The `direct_linear` C–QT coupling cell assignment (SB reference cell):
+`qt_loc = qbase + qslope *
 (conc[ecg_idx] ./ <ref>)` with the prep `reference_exposure` baked as a
 `Float64` literal. Scalar-context `*` (the surface dotifies per
 slice-kind provenance, the Ex1 `ke = CLi / Vci` precedent). `base` /
@@ -100,9 +97,8 @@ end
     qt_obs_statement(family = :gaussian; response = :qt_y, location = :qt_loc,
         scale = :qt_scale, weight = :qt_weight) -> Expr
 
-The default-config in-cell QT observation, SB-mirror of
-`_joint_pk_qt_obs_statement("gaussian", "qt_scale")`
-(`brm_integration.jl:3591-3594`): `qt_y .~ Normal.(qt_loc, qt_scale .*
+The default-config in-cell QT observation (SB reference Gaussian QT
+statement): `qt_y .~ Normal.(qt_loc, qt_scale .*
 qt_weight)`. Dotted per the explicit-dots ruling (scalar `~` over vectors
 is rejected); `weight` is the per-ECG-row `inv_sqrt_k` data HAVE.
 """
@@ -121,9 +117,9 @@ end
 
 The in-cell PK observation, SB-mirror of the V2 top-level
 `censored(Normal(pk_loc, addprop(pk_loc, sigma_add, sigma_prop));
-lower=pk_lloq)` (`brm_integration.jl:4064-4066`) over the collected
+lower=pk_lloq)` over the collected
 `conc[pk_idx]`: `pk_y .~ CensoredAddpropnormal.(pk_loc, sigma_add,
-sigma_prop, pk_lloq)`. The family name mirrors bruno's V1
+sigma_prop, pk_lloq)`. The family name follows the reference
 `censored_addpropnormal` adapter (positional `(location, add, prop,
 lloq)`, julianic CamelCase + dots). Exactly one spelling is admitted.
 """
@@ -139,8 +135,7 @@ end
 """
     validate_qt_joint_prep(; reference_exposure, pk_conc, pk_lloq, inv_sqrt_k)
 
-Bind-time prep contract for the QT slice (SB prep mirror,
-`brm_integration.jl:2404,3363,2975-2976`): positive finite reference
+Bind-time prep contract for the QT slice (SB prep mirror): positive finite reference
 exposure; `pk_conc`/`pk_lloq` pairwise (BLQ rows clamped to LLOQ, so
 `pk_conc .>= pk_lloq` — the SB `-inf` arm is unreachable by
 construction); finite positive per-ECG-row `inv_sqrt_k`. Ragged
