@@ -16,11 +16,13 @@ using LinearAlgebra: Diagonal, Symmetric, eigen, norm, nullspace
 # Spline fits (verbatim port of BRM `src/preparation_basis.jl`, `_brm_` →
 # `_rk_` + `ContractValidationError`): same op order, so bit-identical
 # bases on identical input (verified by a /tmp differential, not committed
-# — BRM is not a test dep). Eigen/nullspace/quantile are inexpressible in
-# the kernel graph, so the fit runs at BIND (host, full LAPACK) — the exact
-# Stan transformed-data mirror — and materializes basis COLUMNS as bound
-# vectors; the graph sees only vector ops. Fit/apply stay split (slice-2
-# replay reuses the fit object); density+gradient-only binds call both.
+# — BRM is not a test dep), except that `s(x)` drops BRM's constant
+# null-space column (`_rk_apply_spline`). Eigen/nullspace/quantile are
+# inexpressible in the kernel graph, so the fit runs at BIND (host, full
+# LAPACK) — the exact Stan transformed-data mirror — and materializes basis
+# COLUMNS as bound vectors; the graph sees only vector ops. Fit/apply stay
+# split (slice-2 replay reuses the fit object); density+gradient-only binds
+# call both.
 _rk_spline_fail(msg) = throw(ContractValidationError("[spline] " * msg))
 
 function _rk_tps_kernel(x::AbstractVector{<:Real}, centers::AbstractVector{<:Real})
@@ -66,11 +68,16 @@ function _rk_fit_spline(x::AbstractVector{<:Real}; k::Int=10)
     (; shift, centers, range_projection, k)
 end
 
+# The unpenalized block is the centered linear column alone. BRM/SB keep
+# a constant column there too; under the flat `b_fixed` prior it duplicates
+# the author's intercept (an exact ridge), so it is dropped, as `t2` drops
+# its constant tensor column (decision `1cmodra`, prong `tps-intercept`).
+# The penalized range space is unchanged (orthogonal to both columns).
 function _rk_apply_spline(fit, x::AbstractVector{<:Real})
     xs = collect(Float64, x)
     all(isfinite, xs) || _rk_spline_fail("`s(x)` requires finite numeric data")
     centered = xs .- fit.shift
-    Xnull = hcat(ones(Float64, length(xs)), centered)
+    Xnull = reshape(centered, :, 1)
     Zpen = _rk_tps_kernel(centered, fit.centers) * fit.range_projection
     Xnull, Zpen
 end

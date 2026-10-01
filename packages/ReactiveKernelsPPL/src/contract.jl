@@ -1799,12 +1799,14 @@ const SYMMETRIC_SAMPLED_FAMILIES =
 # nodes) and contract validation (which re-derives and compares). Widths
 # are static — the fit can only confirm them at bind, never change them.
 # Block order is SB's data order (:fixed first, then pen/rr/rn/nr); the t2
-# sd index follows the pen-block position (rr→1, rn→2, nr→3).
+# sd index follows the pen-block position (rr→1, rn→2, nr→3). Neither
+# kind carries a constant fixed column: the author's intercept owns it
+# (tps is one column narrower than SB's, `_rk_apply_spline`).
 function _spline_blocks(kind::Symbol, k::Union{Int,Tuple{Int,Int}})
     if kind === :tps
         k isa Int ||
             _fail(:plan, "tps spline k must be an Int, got $(repr(k))")
-        return [(:fixed, 2), (:pen, k - 2)]
+        return [(:fixed, 1), (:pen, k - 2)]
     elseif kind === :t2
         k isa Tuple{Int,Int} ||
             _fail(:plan, "t2 spline k must be an (Int, Int) tuple, got " *
