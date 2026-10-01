@@ -1250,8 +1250,19 @@ end
 # the sequences are normalized to plain traced arrays before the loop.  A
 # non-scalar per-step output and a directly iterated N-D array (whose native
 # semantics are linear indexing) remain loud, reported limitations.
+#
+# A scan writes its outputs into its buffer in place, and its loop writes its
+# result back into the buffer's tracer object, so every buffer must be its own
+# tracer object. `promote_to` of a host constant is not: Reactant's
+# `Ops.constant` returns one shared object for equal constants of a program, so
+# two equal-length scans would write into the same buffer and both return the
+# later scan's values (and a later promotion of that constant would read them).
+# `copy` makes a new tracer and emits no operation.
+_scan_owned_buffer(host::Array) =
+    copy(Reactant.promote_to(Reactant.TracedRArray, host))
+
 @inline _scan_output_buffer(::Reactant.TracedRNumber{T}, n::Integer) where {T} =
-    Reactant.promote_to(Reactant.TracedRArray, zeros(T, n))
+    _scan_owned_buffer(zeros(T, n))
 
 # An output-before-update scan body (e.g. `(min(carry, x), carry)`) returns the
 # CONCRETE `init` as its first-step output: the eager first step runs outside
@@ -1263,7 +1274,7 @@ end
 # never the carry's, which may differ (an `Int` counter or `NamedTuple` carry
 # beside a `Float64` output).
 @inline _scan_output_buffer(out::Number, n::Integer) =
-    Reactant.promote_to(Reactant.TracedRArray, zeros(typeof(out), n))
+    _scan_owned_buffer(zeros(typeof(out), n))
 _scan_output_buffer(out, ::Integer) = throw(ArgumentError(
     "the Reactant scan lowering supports a scalar per-step output; got a " *
     "$(typeof(out)). Author the per-step output as a scalar, or report this " *
@@ -1440,8 +1451,7 @@ ReactiveKernels._tensorized_scan_history_lowering(
     ReactiveKernels._tensorized_scan_history_lowering(
         nothing, step, init, fill, iterated, shared)
 
-_scan_history_traced_buffer(fill::Number, n) =
-    Reactant.promote_to(Reactant.TracedRArray, Base.fill(fill, n))
+_scan_history_traced_buffer(fill::Number, n) = _scan_owned_buffer(Base.fill(fill, n))
 _scan_history_traced_buffer(fill::Reactant.TracedRNumber{T}, n) where {T} =
     Reactant.promote_to(Reactant.TracedRArray, zeros(T, n)) .+ fill
 _scan_history_traced_buffer(fill, n) =

@@ -3443,12 +3443,21 @@ end
         y ~ sub_scale(1.0)
     end, (:y, :x); mod = @__MODULE__)
 
-    # Fail-closed: nested submodel call (single-level this slice).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # A nested submodel call expands after the enclosing body: names compose
+    # under each use-site LHS (`sig` → `s` → `r` gives `sig_s_r`).
+    gotn = lower_rkppl(quote
         sig ~ sub_nested(1.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
     end, (:y, :x); mod = @__MODULE__)
+    wantn = lower_rkppl(quote
+        sig_s_r ~ Exponential(1.0)
+        sig_s = sig_s_r
+        sig = sig_s
+        eta = a .+ b .* x
+        y .~ Normal.(eta, sig)
+    end, (:y, :x))
+    @test _plans_equal(gotn, wantn)
 
     # Fail-closed: a submodel body with no trailing return expression.
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -3986,10 +3995,13 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(
         _pcs(:(theta[i] ~ pcs_centered(mu)),
              :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M)
-    # Nested submodel (single-level this slice).
-    @test_throws SurfaceLoweringError lower_rkppl(
+    # A nested per-cell call expands per cell (the direct-bound slot `s` is a
+    # per-cell call in turn): it equals the hand-written per-cell parameter.
+    @test _plans_equal(lower_rkppl(
         _pcs(:(theta[i] ~ pcs_nested(tau)),
-             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M)
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M),
+        lower_rkppl(_pcs(:(theta[i] ~ Normal(0, tau)),
+             :(y[i] ~ Normal.(theta[i], sigma))), D))
     # No trailing return expression.
     @test_throws SurfaceLoweringError lower_rkppl(
         _pcs(:(theta[i] ~ pcs_noret(tau)),
