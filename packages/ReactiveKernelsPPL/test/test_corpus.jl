@@ -27,6 +27,10 @@ function _canon(io::IO, x, depth::Int = 0)
             _canon(io, a, depth + 1)
         end
         print(io, ")")
+    elseif x isa GlobalRef
+        # A resolved module function (functions as values): module + name
+        # only (the runtime binding object is not part of the plan).
+        print(io, "GlobalRef(", nameof(x.mod), ".", x.name, ")")
     elseif x isa QuoteNode
         print(io, "quote(")
         _canon(io, x.value, depth + 1)
