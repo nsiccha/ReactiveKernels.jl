@@ -39,12 +39,18 @@ function _fb_build(prog::Expr, names)
     return plan, bound, built, kern
 end
 
+# The packed vector at a constrained probe; entries the probe leaves out
+# (the empty coefficient block of a coefficient-free composed predictor)
+# come from the layout itself.
+_fb_unconstrain(lay, q::NamedTuple) =
+    unconstrain(lay, merge(constrain(lay, zeros(lay.total)), q))
+
 # Posterior at a constrained probe vs `want(q)` (likelihood + priors at
 # the constrained values) plus the layout's log-Jacobian.
 function _fb_check(prog::Expr, names, q::NamedTuple, want)
     plan, bound, built, kern = _fb_build(prog, names)
     lay = built.layout
-    u = unconstrain(lay, q)
+    u = _fb_unconstrain(lay, q)
     got = Base.invokelatest(kern, u)
     @test got ≈ want(q) + logjac(lay, u) rtol = 1e-12
     return plan
@@ -364,7 +370,7 @@ end
                 z = -1.2, sigma = 1.3)),
             (_FB_EXPR_SCALE, (:y, :x), (mu = [0.4, -0.3], sigma = 1.3)))
         _, bound, built, kern = _fb_build(prog, names)
-        u = unconstrain(built.layout, q)
+        u = _fb_unconstrain(built.layout, q)
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         grad = similar(u)
         sampler_value_and_gradient!(prep, grad, u)

@@ -2043,14 +2043,16 @@ end
         y .~ truncated.(Normal.(mu, 1.0), lo, 5.0)
         lo = x .+ 1
     end, (:y, :x))
-    # Coefficients cannot leak into derived columns.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # A coefficient a derived column also reads is an ordinary parameter
+    # (its summand becomes a derived column too — test_fallback.jl).
+    leak = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         z = x .* b
         y .~ Normal.(mu, 1.0)
     end, (:y, :x))
+    @test any(p -> p.name === :b, leak.parameters)
     # Dotted-unknown calls fail at the surface with vocabulary guidance.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         m = myfun.(x)
@@ -2263,21 +2265,24 @@ end
         y1 .~ Normal.(mu, 1.0)
         y2 .~ Poisson.(exp.(mu))
     end, (:y1, :y2, :x))
-    # Coefficient prior discipline (`Cauchy` coefficients were rejected
-    # under Normal-only admission; the prior-vocab slice admits
-    # per-addressee Cauchy — see test_prior_vocab.jl — so the rejection
-    # case moves to `Gamma`, which is not a coefficient family).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # Coefficient priors take any admitted family and sampled arguments
+    # (coef_grammar A): a non-coefficient family makes `b` an ordinary
+    # parameter whose summand is a derived column; a sampled location
+    # stays in the coefficient block (test_fallback.jl has the oracles).
+    gam = lower_rkppl(quote
         b ~ Gamma(1, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, Dn)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    @test any(p -> p.name === :b && p.family === :gamma, gam.parameters)
+    hyp = lower_rkppl(quote
         m ~ Normal(0, 1)
         b ~ Normal(m, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, Dn)
+    @test any(p -> p.addressee === :x && p.location === :m,
+        hyp.population_priors)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu1 = a .+ b .* x
         mu2 = a .+ c .* x
@@ -2400,12 +2405,15 @@ end
         mu = a .+ b .* x
         y .~ weighted.(truncated(Normal, 0, 10, mu, 1.0), w)
     end, (:y, :x, :w))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # Expression prior arguments bind to a synthetic assignment.
+    expr = lower_rkppl(quote
         s ~ Normal(0, 2 * m)
         m ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, Dn)
+    @test only(p for p in expr.parameters if p.name === :s).args.arg2 ===
+        :_rkppl_s_arg2
     # A response-less block fails structural validation, not lowering.
     @test_throws ContractValidationError lower_rkppl(quote
         a ~ Normal(0, 1)

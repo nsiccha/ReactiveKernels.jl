@@ -382,10 +382,6 @@ end
         err = _mx_err(ast, data)
         @test err isa SurfaceLoweringError && occursin(msg, err.message)
     end
-    # A second coefficient on a matrix column is an ordinary parameter
-    # scaling a derived column (test_fallback.jl).
-    plan = lower_rkppl(quote X = hcat(1, x1); mu = X * b .+ c .* x1; c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end, D)
-    @test any(p -> p.name === :c, plan.parameters)
     # Named-definition RHS violations screen at extraction.
     err = _mx_err(quote X = hcat(1, x1); mu = X * 2; y .~ Normal.(mu, 1.0) end, D)
     @test err isa SurfaceLoweringError &&
@@ -442,7 +438,7 @@ end
     cases = [
         ("is a vector — use `.~`", quote b[axes(X, 2)] ~ Normal(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         ("needs a broadcast prior", quote b[axes(X, 2)] .~ Gamma.(1, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("must be a literal, a literal 2-vector, or a shared-hyperparameter name", quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("must be a literal, a scalar parameter or assignment name, or a 2-vector of those", quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         ("has 2 elements for 3 columns", quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
     ]
     for (msg, ast) in cases

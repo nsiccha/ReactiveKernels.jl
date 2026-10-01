@@ -207,12 +207,15 @@ end
         eta = be * th - al
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
-    # Literal scales fold into a coefficient or prior, not the tree.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # A literal scale is one scalar leaf (a synthetic assignment), like
+    # any sub-free scalar subexpression (test_fallback.jl).
+    lit = lower_rkppl(quote
         th = a_th .+ b_th .* xs
         eta = 2.0 .* th
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
+    @test only(lit.predictors[2].terms).options.tree == :(_rkppl_leaf_1 .* th)
+    @test only(lit.assignments).expr == 2.0
     # `logistic.` outside a composition keeps the link guidance (the
     # predictor analysis re-screens strictly).
     err = try

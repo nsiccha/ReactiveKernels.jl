@@ -673,6 +673,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
             if s.lhs ∉ data && s.dims !== nothing),
         threshold_uses = Dict{Symbol,NamedTuple{(:response, :ordered),
             Tuple{Symbol,Bool}}}(),
+        vector_params = union(dirichlet_names, ordered_names, factor_names,
+            Set{Symbol}(s.lhs for s in sample
+                if s.levels !== nothing || s.matrix !== nothing)),
         mo_uses = Dict{Symbol,Symbol}(),
         matrices = Dict{Symbol,DesignMatrix}(m.name => m for m in matrices),
         matrices_used = Set{Symbol}(),
@@ -8501,10 +8504,14 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
             # per column, across matrix and affine terms alike).
             addrs = addr in keys(ctx.matrices) ?
                 _matrix_element_addressees(ctx.matrices[addr]) : (addr,)
+            # One name reused on another column (`b .* x .+ b .* x1`) is
+            # one ordinary parameter read twice. Two names on one column
+            # (`b .* x .+ c .* x`, a stray second intercept) are an exact
+            # likelihood ridge and stay refused.
+            any(u -> u[1] === name, uses) && _demote_or_fail(name, ctx,
+                "predictor $pname: coefficient $name is used twice")
             for a in addrs
-                # A second coefficient on one column (`b .* x .+ c .* x`)
-                # is an ordinary parameter scaling a derived column.
-                haskey(addr_owner, a) && _demote_or_fail(name, ctx,
+                haskey(addr_owner, a) && _sfail(
                     "predictor $pname: column $a has two coefficients " *
                     "$(addr_owner[a]) and $name — one coefficient per column")
                 addr_owner[a] = name
@@ -9104,6 +9111,17 @@ end
 _reads_column(ex, ctx) = any(s -> s in ctx.data || s in ctx.vecdefs ||
     s in ctx.plate_names, _value_symbols(ex))
 
+# A derived column reads scalars and columns: a vector-valued parameter
+# (a simplex, a sized coefficient vector) read whole is a shape error.
+function _check_scalar_reads(pname, core, ctx)
+    for v in _value_symbols(core)
+        v in ctx.vector_params && _sfail("predictor $pname: " *
+            "$(repr(core)) reads the vector parameter $v as a scalar — " *
+            "index it per observation (`$v[g]`) or per element")
+    end
+    return nothing
+end
+
 # Anonymous non-affine vector substructure becomes a synthetic derived
 # local (offset term over it); the sign folds into the extracted column.
 function _extract_summand(pname, core::Expr, sign::Int, ctx)
@@ -9169,6 +9187,7 @@ function _classify_product(pname, core::Expr, sign::Int, ctx)
     end
     if computed || length(coefs) > 1
         _reads_column(core, ctx) || return _scalar_summand_error(pname, core)
+        _check_scalar_reads(pname, core, ctx)
         return _extract_summand(pname, core, sign, ctx)
     end
     if isempty(coefs)
