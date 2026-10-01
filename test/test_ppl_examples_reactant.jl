@@ -152,19 +152,22 @@ end
 
 # Pinned XLA gaps (signature-checked; any other failure rethrows loudly).
 #
-# kronecker_gp: the trace dies in the example's opaque scalar-loop helper
-# `_ccl_constraint_lp` (`z[k]` = `getindex(::TracedRArray, ::Int)`), refused by
-# Reactant's scalar-indexing guard `GPUArraysCore.assertscalar` with
-# "Scalar indexing is disallowed." Stacked directly behind it is an upstream
-# Reactant gap: `eigen(Symmetric(::TracedRArray))` reaches
+# kronecker_gp: the LKJ-Cholesky helpers carry closed-form
+# `ReactiveKernels.traced` methods (snag kronecker-gp-rea-dc8cef6f), so the
+# trace reaches the stacked upstream Reactant gap: the owned
+# `rk_symmetric_eigvecs`/`rk_symmetric_eigvals` margins' primal
+# `eigen(Symmetric(::TracedRArray))` dies during tracing in
 # `LinearAlgebra.isdiag(::Symmetric)` → Reactant `isbanded`/`_istril` →
 # `MethodError: no method matching overloaded_triu(::UpperTriangular{
 # TracedRNumber{Float64}, TracedRArray{Float64, 2}}, ::Int64)` (Reactant
-# src/stdlibs/LinearAlgebra.jl:366 defines it for `TracedRArray{T, 2}` only).
-# Measured Reactant 0.2.289, Julia 1.10.11.
-_xla_is_kron_scalar_indexing_gap(e) =
-    e isa ErrorException && startswith(e.msg, "Scalar indexing is disallowed.") &&
-    occursin("Invocation of getindex(::TracedRArray, ::Vararg{Int, N})", e.msg)
+# src/stdlibs/LinearAlgebra.jl:366 defines it for `TracedRArray{T, 2}` only;
+# the same missing method is upstream EnzymeAD/Reactant.jl#3369 via symmetric
+# solve, with no traced eigen/eigvals primal behind it — reactivekernels-use
+# §7aa). Measured Reactant 0.2.289, Julia 1.10.11.
+_xla_is_kron_eigen_gap(e) =
+    e isa MethodError && (msg = sprint(showerror, e);
+        occursin("no method matching overloaded_triu", msg) &&
+        occursin("UpperTriangular", msg))
 # hierarchical_gp compiled reverse: EnzymeMLIR has no adjoint for
 # `stablehlo.cholesky` (reactivekernels-use §7f; snag reactant-compile-f877fcfd):
 # `Reactant.Compiler.CompilationError: MLIR pass pipeline "all" failed …
@@ -173,6 +176,20 @@ _xla_is_cholesky_adjoint_gap(e) =
     e isa Reactant.Compiler.CompilationError && (msg = sprint(showerror, e);
         occursin("could not compute the adjoint for this operation", msg) &&
         occursin("stablehlo.cholesky", msg))
+
+# kronecker_gp LKJ-Cholesky helpers (`_ccl_constraint_lp`,
+# `_cholesky_corr_constrain_L`): their closed-form `ReactiveKernels.traced`
+# methods (the code a tracing backend runs in place of the native loops)
+# compiled on a traced position. The sandbox methods are defined by the source
+# evaluation, so callers cross the world-age barrier with `Base.invokelatest`.
+function _kron_lkj_traced_compiled(sandbox, z, K)
+    lp_fn = getfield(sandbox, :_ccl_constraint_lp)
+    L_fn = getfield(sandbox, :_cholesky_corr_constrain_L)
+    rz = Reactant.to_rarray(z)
+    clp = @compile sync = true ReactiveKernels.traced(lp_fn, rz, K)
+    cL = @compile sync = true ReactiveKernels.traced(L_fn, rz, K)
+    (_host(clp(lp_fn, rz, K)), _host(cL(L_fn, rz, K)))
+end
 
 # Each migrated / new PPL example compiles and executes through the public
 # Reactant boundary and reproduces its native output. Object-splice densities
@@ -736,8 +753,26 @@ _xla_is_cholesky_adjoint_gap(e) =
             # forcing removal of the gate.
             gapped && @test_broken true
         catch e
-            gapped && _xla_is_kron_scalar_indexing_gap(e) || rethrow()
+            gapped && _xla_is_kron_eigen_gap(e) || rethrow()
         end
+    end
+    # kronecker_gp — the LKJ-Cholesky helpers' closed-form `traced` methods (no
+    # scalar indexing, no data-derived unroll) compile under Reactant and
+    # reproduce the native loops. The FULL posterior still waits on the
+    # upstream `eigen(::Symmetric)` gap (reactivekernels-use §7aa; snag
+    # kronecker-gp-rea-dc8cef6f), which owns the whole-example legs.
+    @testset "kronecker_gp LKJ tracing implementations compile under Reactant (full posterior waits on upstream eigen §7aa)" begin
+        a = evaluate_kronecker_gp_source(; model_only = true)
+        K = 30
+        z = 0.9 .* sin.((1:((K * (K - 1)) ÷ 2)) .* 0.9 .+ 1.0)
+        compiled_lp, compiled_L =
+            Base.invokelatest(_kron_lkj_traced_compiled, a.sandbox, z, K)
+        native_lp = Base.invokelatest(
+            getfield(a.sandbox, :_ccl_constraint_lp), z, K)
+        native_L = Base.invokelatest(
+            getfield(a.sandbox, :_cholesky_corr_constrain_L), z, K)
+        @test _rapprox(compiled_lp, native_lp)
+        @test _rapprox(compiled_L, native_L)
     end
 end
 
@@ -803,7 +838,7 @@ const _XLA_GRADIENT_ITEMS = (
            N_years_obs = HGP_N_YEARS_OBS),
         _xla_is_cholesky_adjoint_gap),
     ("kronecker_gp", evaluate_kronecker_gp_source, (:unconstrained, :x1, :y),
-        (; x1 = KRON_X1, y = KRON_Y), _xla_is_kron_scalar_indexing_gap),
+        (; x1 = KRON_X1, y = KRON_Y), _xla_is_kron_eigen_gap),
 )
 
 function _xla_gradient_measure(a, have, bound)
