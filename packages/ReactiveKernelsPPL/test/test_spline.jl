@@ -62,12 +62,13 @@ end
     sb = only(plan.spline_bases)
     @test sb.id === :s_x && sb.kind === :tps
     @test sb.axes == [:x] && sb.k == 4
-    @test [(b.name, b.width) for b in sb.blocks] == [(:fixed, 2), (:pen, 2)]
+    # No constant fixed column: the author's intercept `a` owns it.
+    @test [(b.name, b.width) for b in sb.blocks] == [(:fixed, 1), (:pen, 2)]
     @test all(isempty(b.columns) for b in sb.blocks)
     @test sb.label === :spline_s_x
     got = [(v.name, v.family, v.args, v.support_override, v.width, v.basis)
         for v in plan.spline_vectors]
-    @test got == [(:b_s_x_fixed, :flat, NamedTuple(), nothing, 2, :s_x),
+    @test got == [(:b_s_x_fixed, :flat, NamedTuple(), nothing, 1, :s_x),
         (:b_s_x_raw, :normal, (arg1 = 0, arg2 = 1), nothing, 2, :s_x),
         (:sd_s_x, :normal, (arg1 = 0, arg2 = 1), :positive_stan, 1, :s_x)]
     terms = only(plan.predictors).terms
@@ -359,9 +360,9 @@ end
     plan = _svalid_plan()
     bound = bind_data(plan, _spline_cols())
     sb = only(bound.spline_bases)
-    @test sb.blocks[1].columns == [:s_x_Xnull_1, :s_x_Xnull_2]
+    @test sb.blocks[1].columns == [:s_x_Xnull_1]
     @test sb.blocks[2].columns == [:s_x_Zpen_1, :s_x_Zpen_2]
-    for c in [:s_x_Xnull_1, :s_x_Xnull_2, :s_x_Zpen_1, :s_x_Zpen_2]
+    for c in [:s_x_Xnull_1, :s_x_Zpen_1, :s_x_Zpen_2]
         @test haskey(bound.columns, c)
         @test length(bound.columns[c]) == 12
         @test bound.roles[c] === :predictor
@@ -370,8 +371,8 @@ end
     # Materialized columns equal the port's fit/apply on the same axis.
     fit = ReactiveKernelsPPL._rk_fit_spline(_spline_cols()[:x]; k = 4)
     X, Z = ReactiveKernelsPPL._rk_apply_spline(fit, _spline_cols()[:x])
+    @test size(X, 2) == 1
     @test bound.columns[:s_x_Xnull_1] == X[:, 1]
-    @test bound.columns[:s_x_Xnull_2] == X[:, 2]
     @test bound.columns[:s_x_Zpen_1] == Z[:, 1]
     @test bound.columns[:s_x_Zpen_2] == Z[:, 2]
     # Reserved-name exclusivity: caller columns cannot squat basis names.
@@ -401,11 +402,13 @@ end
     rk = ReactiveKernelsPPL
     x = collect(range(-2.0, 3.0; length = 25))
     z = collect(range(0.0, 1.0; length = 25)) .^ 1.5 .* 4 .- 1.0
-    # TPS: constant-first null column, static widths, determinism.
+    # TPS: the unpenalized block is the centered linear column alone (no
+    # constant column), static widths, determinism.
     for k in (3, 6)
         X, Z = rk._rk_spline_basis_tps(x; k = k)
-        @test size(X) == (25, 2) && size(Z) == (25, k - 2)
-        @test X[:, 1] == ones(25)
+        @test size(X) == (25, 1) && size(Z) == (25, k - 2)
+        @test X[:, 1] ≈ x .- sum(x) / length(x)
+        @test abs(sum(X)) < 1e-12
     end
     X1, Z1 = rk._rk_spline_basis_tps(x; k = 5)
     X2, Z2 = rk._rk_spline_basis_tps(x; k = 5)
@@ -424,24 +427,27 @@ end
     layout = assign_layout(bound)
     @test [e.kind for e in layout.entries] ==
         [:coefficient, :sampled, :spline, :spline, :spline]
-    @test [e.size for e in layout.entries] == [1, 1, 2, 2, 1]
+    @test [e.size for e in layout.entries] == [1, 1, 1, 2, 1]
     @test [e.transform for e in layout.entries] ==
         [:identity, :exp, :identity, :identity, :exp]
-    @test layout.total == 7
+    @test layout.total == 6
     names = coordinate_names(layout)
-    @test names[3:4] == [Symbol("b_s_x_fixed.1"), Symbol("b_s_x_fixed.2")]
+    @test names[3] == Symbol("b_s_x_fixed.1")
     @test names[end] === Symbol("sd_s_x.1")
-    u = [0.3, 0.2, 0.1, -0.1, 0.4, 0.0, -0.2]
+    u = [0.3, 0.2, -0.1, 0.4, 0.0, -0.2]
     nt = constrain(layout, u)
     @test nt.sd_s_x == [exp(-0.2)]
     @test unconstrain(layout, nt) ≈ u
-    @test logjac(layout, u) ≈ u[2] + u[7]
+    @test logjac(layout, u) ≈ u[2] + u[6]
 end
 
-# Independent tps reference: SB `a + X*b + Z*(sd*b_raw)` shape with
-# explicit names/indices (no contract helpers — this pins them).
+# Independent tps reference: `a + X*b + Z*(sd*b_raw)` with explicit
+# names/indices (no contract helpers — this pins them). `X` is the
+# centered raw axis, built here from `x` (SB's extra constant column is
+# absent by design).
 function _ref_spline_tps(bound, nt)
-    X = hcat(bound.columns[:s_x_Xnull_1], bound.columns[:s_x_Xnull_2])
+    x = bound.columns[:x]
+    X = reshape(x .- sum(x) / length(x), :, 1)
     Z = hcat(bound.columns[:s_x_Zpen_1], bound.columns[:s_x_Zpen_2])
     eta = nt.mu[1] .+ X * nt.b_s_x_fixed .+
         Z * (nt.sd_s_x[1] .* nt.b_s_x_raw)
@@ -455,13 +461,77 @@ end
 @testset "spline tps e2e values and gradient" begin
     bound = bind_data(_svalid_plan(), _spline_cols())
     built = build_kernel(bound)
-    u = [0.3, 0.2, 0.1, -0.1, 0.4, 0.0, -0.2]
+    u = [0.3, 0.2, -0.1, 0.4, 0.0, -0.2]
     nt = constrain(built.layout, u)
     ref = _ref_spline_tps(bound, nt)
     @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
     @test _query(built.spec, bound, :prior, u) ≈ ref.pr
-    @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + u[2] + u[7]
+    @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + u[2] + u[6]
     _check_gradient(built.spec, bound, u)
+    # No ridge with the intercept: the constant vector is outside the span
+    # of the spline columns (SB's basis contained it exactly).
+    B = hcat(bound.columns[:s_x_Xnull_1], bound.columns[:s_x_Zpen_1],
+        bound.columns[:s_x_Zpen_2])
+    n = size(B, 1)
+    @test sqrt(sum(abs2, ones(n) .- B * (B \ ones(n)))) > 0.1 * sqrt(n)
+end
+
+# A stated smoothing-sd prior's support follows its family: real-support
+# families ride the Stan-kernel half (`:positive_stan`, plain `_lpdf`, no
+# `+log(2)`); positive-support families and the bounding `Uniform` keep
+# their own support and density. Positive families used to pass lowering
+# and then die at `build_kernel` ("positive_stan override needs a
+# real-support family").
+@testset "spline stated sd prior support follows its family" begin
+    u = [0.3, 0.2, -0.1, 0.4, 0.0, -0.2]
+    cases = (
+        (:(Normal(0, 2)), Normal(0, 2), :positive_stan),
+        (:(StudentT(3, 0, 2)), nothing, :positive_stan),
+        (:(LogNormal(0, 1)), LogNormal(0, 1), nothing),
+        (:(Gamma(2, 0.5)), Gamma(2, 0.5), nothing),
+        (:(Exponential(2)), Exponential(2), nothing),
+        (:(InverseGamma(3, 2)), InverseGamma(3, 2), nothing),
+        (:(Uniform(0, 10)), Uniform(0, 10), nothing),
+    )
+    for (spell, dist, support) in cases
+        plan = lower_rkppl(quote
+                spline_basis(:s_x, x; k = 4, sd = $spell)
+                a ~ Normal(0, 5)
+                sigma ~ Exponential(1)
+                mu = a .+ spline(:s_x)
+                y .~ Normal.(mu, sigma)
+            end, (:y, :x))
+        sd = only(v for v in plan.spline_vectors if v.name === :sd_s_x)
+        @test sd.support_override === support
+        @test validate_structure(plan) === nothing
+        bound = bind_data(plan, _spline_cols())
+        built = build_kernel(bound)
+        dist === nothing && continue
+        nt = constrain(built.layout, u)
+        ref = _ref_spline_tps(bound, nt)
+        s = nt.sd_s_x[1]
+        pr = ref.pr - logpdf(Normal(0, 1), s) + logpdf(dist, s)
+        jac = dist isa Uniform ? log(s) + log(10 - s) - log(10) : u[6]
+        @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
+        @test _query(built.spec, bound, :prior, u) ≈ pr
+        @test _query(built.spec, bound, :posterior, u) ≈
+            ref.ll + pr + u[2] + jac
+        _check_gradient(built.spec, bound, u)
+    end
+    # A hand-built plan whose positive-family sd still carries the
+    # Stan-kernel override is refused by the contract.
+    plan = lower_rkppl(quote
+            spline_basis(:s_x, x; k = 4, sd = LogNormal(0, 1))
+            a ~ Normal(0, 5)
+            mu = a .+ spline(:s_x)
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :x))
+    vs = copy(plan.spline_vectors)
+    i = findfirst(v -> v.name === :sd_s_x, vs)
+    vs[i] = SplineVector(vs[i].name, vs[i].family, vs[i].args,
+        :positive_stan, vs[i].width, vs[i].basis, vs[i].label)
+    @test_throws ContractValidationError validate_structure(
+        _swith(plan; vectors = vs))
 end
 
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
@@ -586,33 +656,43 @@ end
 # (M1 4/4, M2 8/8) before comparing values.
 @testset "spline M1/M2 SB-parity pins" begin
     @testset "M1 s k=4" begin
-        # u = [0.3, 0.2, 0.1, -0.1, 0.4, 0.0, -0.2].
-        # RK order [mu.Intercept, sigma, b_s_x_fixed.1, b_s_x_fixed.2,
-        # b_s_x_raw.1, b_s_x_raw.2, sd_s_x.1]; SB order
-        # [pop_mu_beta_pop.1, s_x_b_fixed.1, s_x_b_fixed.2, s_x_sd_pen.1,
-        # s_x_b_pen_raw.1, s_x_b_pen_raw.2, sigma].
+        # Intended divergence: SB's tps keeps a constant null column under
+        # a flat prior, RK drops it (decision `1cmodra`, prong
+        # `tps-intercept`; it duplicated the intercept, an exact ridge).
+        # Folding SB's constant coefficient into the intercept makes the
+        # two models identical, so the SB literals still pin RK exactly:
+        # SB probe u_sb = [0.3, 0.2, 0.1, -0.1, 0.4, 0.0, -0.2] in the
+        # pre-divergence RK order [mu.Intercept, sigma, b_s_x_fixed.1
+        # (constant), b_s_x_fixed.2 (linear), b_s_x_raw.1, b_s_x_raw.2,
+        # sd_s_x.1] (SB order [pop_mu_beta_pop.1, s_x_b_fixed.1,
+        # s_x_b_fixed.2, s_x_sd_pen.1, s_x_b_pen_raw.1, s_x_b_pen_raw.2,
+        # sigma]) is RK's u with intercept 0.3 + 0.1, up to the intercept
+        # prior `Normal(0, 5)` at 0.4 instead of 0.3.
         bound = bind_data(_svalid_plan(), _spline_cols())
         built = build_kernel(bound)
         lay = built.layout
         @test coordinate_names(lay) == [Symbol("mu.Intercept"), :sigma,
-            Symbol("b_s_x_fixed.1"), Symbol("b_s_x_fixed.2"),
-            Symbol("b_s_x_raw.1"), Symbol("b_s_x_raw.2"),
-            Symbol("sd_s_x.1")]
-        u = [0.3, 0.2, 0.1, -0.1, 0.4, 0.0, -0.2]
+            Symbol("b_s_x_fixed.1"), Symbol("b_s_x_raw.1"),
+            Symbol("b_s_x_raw.2"), Symbol("sd_s_x.1")]
+        u = [0.4, 0.2, -0.1, 0.4, 0.0, -0.2]
         nt = constrain(lay, u)
         ref = _ref_spline_tps(bound, nt)
         post = _query(built.spec, bound, :posterior, u)
-        @test post ≈ ref.ll + ref.pr + u[2] + u[7]
-        @test abs(post - (-22.244895346304787)) < 1e-12
-        # SB full posterior -22.244895346304787, bit-exact vs RK.
-        @test abs(post - (-22.244895346304787)) < 1e-12
+        @test post ≈ ref.ll + ref.pr + u[2] + u[6]
+        # SB full posterior -22.244895346304787 at u_sb, bridged.
+        bridged = -22.244895346304787 - logpdf(Normal(0, 5), 0.3) +
+            logpdf(Normal(0, 5), 0.4)
+        @test abs(post - bridged) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         sb = [-2.7161630767907803, -8.4332465153243046, -2.7041630767907803,
             5.9857744480450616, 2.7109163710758355, 4.5566881239299892,
             1.574046502394695]
-        @test maximum(abs.(g .- sb)) < 1e-10
+        # SB's constant-coefficient gradient is the likelihood's slope in
+        # the intercept; add the moved intercept's prior slope -0.4/25.
+        @test maximum(abs.(g .- [sb[3] - 0.4 / 25; sb[[2, 4, 5, 6, 7]]])) <
+            1e-10
         _check_gradient(built.spec, bound, u)
     end
     @testset "M2 t2 k=(3,3)" begin
