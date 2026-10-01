@@ -34,7 +34,9 @@ through [`_vector_column`](@ref) and fail closed on a matrix."""
 const ColumnData = Union{AbstractVector,AbstractMatrix,Number}
 # (`Number`: a model-level data value a data-only definition computes at
 # bind — functions as values. Caller-supplied columns stay vectors and
-# matrices; `_checked_columns` refuses anything else.)
+# matrices, `_SuppliedColumn`: `_checked_columns` and `merge` fixes refuse
+# anything else.)
+const _SuppliedColumn = Union{AbstractVector,AbstractMatrix}
 
 # Row count of a bound column: length for vectors, row count for matrices.
 _column_nrows(col::AbstractVector) = length(col)
@@ -45,7 +47,7 @@ and matrices only — anything else fails closed here, not in a converter)."""
 function _checked_columns(columns::AbstractDict{Symbol})
     out = Dict{Symbol,ColumnData}()
     for (k, v) in columns
-        v isa Union{AbstractVector,AbstractMatrix} ||
+        v isa _SuppliedColumn ||
             _fail(:plan, "column $k must be a vector or matrix, got $(summary(v))")
         out[k] = v
     end
@@ -5358,6 +5360,48 @@ function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
     return nothing
 end
 
+# A gather (`cum[c]`) indexes by row-varying integer DATA. A parameter, a
+# per-cell latent, a vector parameter, or a definition reading one is a
+# value, never an index (`c[x_true]` would index by a real number at run
+# time). Bound, a raw index column must hold integers.
+function _check_gather_index(ex::Expr, plan::StructuralPlan, label,
+        bound::Bool)
+    idx = ex.args[2]
+    names = Set{Symbol}(_all_names(plan))
+    for s in _expr_value_symbols(idx)
+        _reads_data_only(plan, s, names, Set{Symbol}()) || _fail(label,
+            "gather `$(repr(ex))` indexes by $s, which is not data — a " *
+            "gather index is an integer data column (`v[c]`); a " *
+            "parameter or latent is a value, never an index")
+    end
+    if bound && idx isa Symbol && haskey(plan.columns, idx) &&
+            !(idx in names)
+        col = _vector_column(plan.columns, idx, label, "gather index")
+        (eltype(col) <: Integer && eltype(col) !== Bool) || _fail(label,
+            "gather index $idx must hold integer positions, got eltype " *
+            "$(eltype(col))")
+    end
+    return nothing
+end
+
+# `s` names data alone: a raw column (any name the plan does not define),
+# or a definition whose expression reads only such names.
+function _reads_data_only(plan::StructuralPlan, s::Symbol, names,
+        active::Set{Symbol})
+    s in names || return true
+    s in active && return false
+    i = findfirst(d -> d.name === s, plan.derived)
+    j = findfirst(a -> a.name === s, plan.assignments)
+    defn = i !== nothing ? plan.derived[i].expr :
+        j !== nothing ? plan.assignments[j].expr : nothing
+    defn === nothing && return false  # a parameter or latent
+    push!(active, s)
+    ok = all(t -> _reads_data_only(plan, t, names, active),
+        _expr_value_symbols(defn))
+    pop!(active, s)
+    return ok
+end
+
 # Elementwise walker for derived columns (contract v3). Vector mode admits
 # dotted operators, dotted math, `ifelse`, reductions over bare names, and
 # bare names/literals; scalar subterms (undotted allowlist calls) delegate
@@ -5424,6 +5468,7 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     if head === :ref && length(ex.args) == 2
         # Gather (`cum[c]`): a whole model-level value indexed by a
         # row-varying integer column keeps n_obs.
+        _check_gather_index(ex, plan, label, bound)
         _collect_opaque_refs!(refs, ex.args[1], plan, label, bound)
         _collect_vector_refs!(refs, ex.args[2], plan, label, bound)
         return nothing

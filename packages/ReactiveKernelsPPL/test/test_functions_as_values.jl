@@ -175,6 +175,58 @@ end
     end
 end
 
+@testset "functions as values: a gather index is integer data" begin
+    cols = _fv_cols()
+    gathered(idx, extra...) = quote
+        zeta ~ Dirichlet([1.0, 2.0])
+        a ~ Normal(0, 5)
+        b ~ Normal(0, 2)
+        sigma ~ Exponential(1.0)
+        $(extra...)
+        cum = cumsum(vcat(0.0, zeta))
+        m = cum[$idx]
+        mu = a .+ m
+        y .~ Normal.(mu, sigma)
+    end
+    # A per-cell latent is a value, never an index (contract, at lowering).
+    @test_throws ContractValidationError lower_rkppl(gathered(:x_true,
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                Expr(:for, Expr(:(=), :i, :(eachindex(x))), Expr(:block,
+                    :(x_true[i] ~ Normal(0, 1)),
+                    :(x[i] ~ Normal.(x_true[i], 0.5)))))),
+        Tuple(keys(cols)); mod = _FV)
+    # So is a definition reading a parameter, however it is named.
+    @test_throws ContractValidationError lower_rkppl(
+        gathered(:k, :(k = c .* b)), Tuple(keys(cols)); mod = _FV)
+    # A raw index column must hold integers (bind).
+    real_idx = lower_rkppl(gathered(:x), Tuple(keys(cols)); mod = _FV)
+    @test_throws ContractValidationError bind_data(real_idx, cols)
+    # An integer data column gathers (the corpus 97 shape).
+    @test bind_data(lower_rkppl(gathered(:c), Tuple(keys(cols)); mod = _FV),
+        cols) isa StructuralPlan
+end
+
+@testset "functions as values: dotted built-in over an observation column" begin
+    # `tanh` is a scalar built-in outside the dotted elementwise vocabulary;
+    # dotted over a data column it broadcasts the built-in itself.
+    cols = _fv_cols()
+    plan, bound, built = _fv_build(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1.0)
+            w = tanh.(x)
+            mu = a .+ w
+            y .~ Normal.(mu, sigma)
+        end, cols)
+    for u in ([0.3, -0.4], [-1.1, 0.6])
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        a = only(th.mu)
+        @test _fv_value(built, bound, :likelihood, u) ≈
+            sum(logpdf(Normal(a + tanh(cols[:x][i]), th.sigma), cols[:y][i])
+                for i in eachindex(cols[:y]))
+    end
+end
+
+
 @testset "functions as values: naming a subexpression never changes legality" begin
     cols = _fv_cols()
     named = _fv_build(_fv_cum_model(), cols)
