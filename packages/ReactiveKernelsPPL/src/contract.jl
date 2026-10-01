@@ -871,6 +871,51 @@ VectorParameter(name::ParamName, family::Symbol, args::NamedTuple,
     VectorParameter(name, family, args, size, name)
 
 """
+    ArrayParameter(name, family, args, dims, support_override, label)
+
+One declared array-valued parameter: a plain value the model reads by
+name (`z`, `z[g]`, `z[1]`, `B * w`, `L[2, 1]`), never a hidden
+coefficient block. Two kinds of family:
+
+- An elementwise family (any [`SAMPLED_ARITY`](@ref) key): the
+  surface `z[1:K] .~ Normal.(mu, s)` — independent draws per element,
+  with Distributions.jl `Normal.(…)` broadcast semantics. `args` use
+  positional keys `(arg1, …)`; each is a Real literal, a Symbol (a scalar
+  parameter/assignment name, an array parameter, a data column, a
+  derived column, or a vector-valued assignment — read per element), a
+  literal vector (`Expr(:vect, …)`, per element), or a value expression
+  (per element). `support_override` follows [`SampledParameter`](@ref)
+  (`HalfNormal.(s)` is `:normal` + `:positive`).
+- `:lkj_cholesky` — `L ~ LKJCholesky(K, eta)`: the lower-triangular
+  Cholesky factor of a K×K correlation matrix (Distributions.jl
+  `LKJCholesky(K, eta)` density, `uplo = 'L'`). `args = (arg1 = eta,)`, a
+  finite positive literal; `dims` is `[K, K]`.
+
+A `phi ~ Dirichlet(alpha)` simplex is not an array parameter: it stays a
+[`VectorParameter`](@ref), which definitions already read as a model-level
+value (`phi[1]`, `cumsum(phi)`, a gather `cum[c]`).
+
+`dims` holds one entry per array axis, each either a literal `Int` (from
+`1:K`) or the surface sizing expression, resolved against bound data:
+`:(levels(g))` (the sorted distinct values of grouping column `g`; reading
+`z[g]` then looks each observation's value up on that axis),
+`:(axes(M, d))` or `:(size(M, d))` (axis `d` of a bound matrix or a design
+matrix `M`). Arrays have one or two axes.
+"""
+struct ArrayParameter
+    name::ParamName
+    family::Symbol
+    args::NamedTuple
+    dims::Vector{Any}
+    support_override::SupportOverride
+    label::Symbol
+end
+"""Provenance defaults to the parameter's own name."""
+ArrayParameter(name::ParamName, family::Symbol, args::NamedTuple,
+    dims::Vector{Any}, support_override::SupportOverride) =
+    ArrayParameter(name, family, args, dims, support_override, name)
+
+"""
     SplineBasisBlock(name, width, columns)
 
 One fitted basis block (`:fixed`, `:pen`, `:rr`, `:rn`, `:nr`): `width`
@@ -1618,7 +1663,9 @@ predictor Symbols allowed. `levelmaps` sizes every factor term
 trajectories, `varying_draws`/`varying_slices` the generic
 varying-effect draws blocks plus their per-target applications, and
 `matrices` user-bound design matrices referenced by [`MatrixTerm`](@ref)s
-(empty for a plain population-GLM plan).
+(empty for a plain population-GLM plan). `array_parameters` are the
+declared array-valued parameters ([`ArrayParameter`](@ref)) the model reads
+by name.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -1645,7 +1692,22 @@ struct StructuralPlan
     horseshoe_priors::Vector{HorseshoePrior}
     matrices::Vector{DesignMatrix}
     event_lps::Vector{LinearPKEventLPSpec}
+    array_parameters::Vector{ArrayParameter}
 end
+
+# Pre-array full-positional constructor (24-arg): plans built before
+# `array_parameters` existed keep working with none.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
+    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
+    horseshoe_priors, matrices, event_lps) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps,
+        plate_parameters, scans, dar_paths, varying_draws, varying_slices,
+        vector_parameters, spline_bases, spline_vectors, hsgp_bases,
+        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
+        ArrayParameter[])
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
 # before `levelmaps`/`scans`/`varying_draws`/`vector_parameters`/spline/hsgp
@@ -1700,13 +1762,15 @@ function StructuralPlan(
         r2d2_priors::Vector{R2D2Prior} = R2D2Prior[],
         horseshoe_priors::Vector{HorseshoePrior} = HorseshoePrior[],
         matrices::Vector{DesignMatrix} = DesignMatrix[],
-        event_lps::Vector{LinearPKEventLPSpec} = LinearPKEventLPSpec[])
+        event_lps::Vector{LinearPKEventLPSpec} = LinearPKEventLPSpec[],
+        array_parameters::Vector{ArrayParameter} = ArrayParameter[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
         varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps)
+        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
+        array_parameters)
 end
 
 """The horseshoe entries covering `pred` (empty when the predictor keeps
@@ -2296,6 +2360,7 @@ end
 unbound plans alike (the macro lowering + emitter-AST path call this)."""
 function validate_structure(plan::StructuralPlan)
     _validate_name_tables(plan)
+    _validate_array_parameters(plan)
     _validate_scans(plan)
     _validate_dar_paths(plan)
     _validate_assignments_structure(plan)
@@ -2326,6 +2391,7 @@ function validate_data(plan::StructuralPlan)
         "[bind] validate_data requires a bound plan (bind_data first)"))
     _validate_columns(plan)
     _validate_column_names(plan)
+    _validate_array_parameters_data(plan)
     _validate_assignments_data(plan)
     _validate_vector_data(plan)
     _validate_predictor_columns(plan)
@@ -4986,6 +5052,14 @@ function _validate_name_tables(plan::StructuralPlan)
     end
     allnames = union(params, assigns, deriveds, plates, scanstates, darstates,
         vectors, svec, vcorr, hsgp, kern, mats)
+    arrays = _array_names(plan)
+    length(unique(arrays)) == length(arrays) ||
+        _fail(:plan, "duplicate array-parameter names")
+    overlap = intersect(arrays, union(allnames, elps))
+    isempty(overlap) || _fail(:plan, "names in both array parameters and " *
+        "other parameters/assignments/derived/plate/scan/dar/vector/spline/" *
+        "varying/hsgp/kernel/matrix/event-LP names: $(join(overlap, ", "))")
+    allnames = union(allnames, arrays)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
@@ -5111,7 +5185,8 @@ function _validate_column_names(plan::StructuralPlan)
         union([p.name for p in plan.parameters],
             [a.name for a in plan.assignments],
             [d.name for d in plan.derived if d.name ∉ resps],
-            [p.name for p in plan.plate_parameters]),
+            [p.name for p in plan.plate_parameters],
+            _array_names(plan)),
     )
     isempty(col_overlap) || _fail(
         :plan,
@@ -5196,7 +5271,8 @@ admit all; sampled-arg positions stay scalar-only via [`_union_names`](@ref),
 so a scalar arg can never reference a latent vector)."""
 _all_names(plan::StructuralPlan) =
     union(_union_names(plan), [d.name for d in plan.derived],
-        [p.name for p in plan.plate_parameters], _vector_value_names(plan))
+        [p.name for p in plan.plate_parameters], _vector_value_names(plan),
+        _array_names(plan))
 
 """Vector-parameter names (simplexes, cutpoints, …): model-level array values
 that definitions may read whole (`cumsum(vcat(0.0, zeta))`), never scalars."""
@@ -5226,6 +5302,10 @@ _is_plate_param(plan::StructuralPlan, name::Symbol) =
 function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
+    # Expressions over declared array parameters (`phi[1]`, `sd .* z`,
+    # `sum(z)`) follow the array-value vocabulary (`arrays.jl`).
+    _mentions_array(ex, plan) &&
+        return _collect_array_value_refs!(refs, ex, plan, label, bound)
     if ex isa Symbol
         _is_derived(plan, ex) && _fail(
             label,
@@ -5380,6 +5460,10 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
             push!(refs, ex)
             return nothing
         end
+        _is_array_param(plan, ex) && _fail(label, "array $ex is not " *
+            "per-observation — read it per observation by index " *
+            "(`$ex[g]`), by position (`$ex[1]`), through a data matrix " *
+            "(`B * $ex`) or a reduction (`sum($ex)`)")
         bound || return nothing
         haskey(plan.columns, ex) && return nothing
         return _fail(label, "derived column references unknown name $ex")
@@ -5388,6 +5472,8 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     head = ex.head
     if head === :call
         fn = ex.args[1]
+        _is_data_matvec(ex, plan) &&
+            return _collect_data_matvec!(refs, ex, plan, label, bound)
         if fn isa GlobalRef
             # An undotted module call inside a column expression is a
             # model-level subterm over whole values.
@@ -5426,6 +5512,11 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
                             "IR/contract growth")
     end
     head === :. && return _collect_vector_dot!(refs, ex, plan, label, bound)
+    _is_row_gather(plan, ex) && _fail(label, "`$(repr(ex))` is one row " *
+        "per observation (a matrix) — multiply it by a vector " *
+        "(`$(repr(ex)) * v`) or read one column (`$(ex.args[1])[$(ex.args[2]), 1]`)")
+    head === :ref && _collect_array_ref!(refs, ex, plan, label, bound;
+        allow_gather = true) && return nothing
     if head === :ref && length(ex.args) == 2
         # Gather (`cum[c]`): a whole model-level value indexed by a
         # row-varying integer column keeps n_obs.
@@ -5551,7 +5642,10 @@ end
 # (possibly-column) evidence and resolve at bind.
 function _is_vector_valued(ex, plan::StructuralPlan)
     ex isa Symbol && return !(ex in _union_names(plan) ||
-        ex in _vector_value_names(plan))
+        ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
+    ex isa Expr && ex.head === :ref && _is_array_param(plan, ex.args[1]) &&
+        return _array_index_kind(plan, ex) === :gather &&
+            all(i -> i isa Int, ex.args[3:end])
     ex isa Number && return false
     ex isa LineNumberNode && return false
     ex isa Expr || return false
@@ -5962,6 +6056,19 @@ function topological_order(plan::StructuralPlan)
         for v in values(p.args)
             v isa Symbol || continue
             v in allnames && push!(refs, v)
+        end
+        deps[p.name] = refs
+    end
+    # Declared array parameters constrain in the layout transforms; a
+    # name their prior arguments read is a dependency (expressions
+    # included).
+    for p in plan.array_parameters
+        refs = Set{Symbol}()
+        for v in values(p.args)
+            (v isa Symbol || v isa Expr) || continue
+            for r in _symbols_in(v)
+                r in allnames && push!(refs, r)
+            end
         end
         deps[p.name] = refs
     end
