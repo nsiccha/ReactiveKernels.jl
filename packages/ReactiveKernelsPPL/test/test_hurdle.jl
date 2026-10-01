@@ -173,6 +173,8 @@ end
             end, _hur_cols())
         @test _hur_posterior(kern0, lay0, (eta = [0.5, -0.25],)) === -Inf
         _, _, kern1, lay1 = _hur_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 1.0)
             end, _hur_cols())
@@ -180,6 +182,8 @@ end
         allzero = Dict{Symbol,AbstractVector}(:y => zeros(Int, 6),
             :x => copy(_HUR_X))
         _, _, kernz, layz = _hur_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 1.0)
             end, allzero)

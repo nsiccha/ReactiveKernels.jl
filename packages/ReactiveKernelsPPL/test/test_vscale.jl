@@ -479,6 +479,10 @@ end
     _check_gradient(built.spec, plan, u)
     # Logit link: sigma in (0, 1) via the inlined Beta-precedent form.
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             sg = c .+ d .* z
             y .~ Normal.(mu, logistic.(sg))
@@ -530,6 +534,10 @@ end
     # Gamma shape on the log link.
     yg = [1.2, 0.8, 2.1, 1.5, 0.6, 1.9]
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             eta = a .+ b .* x
             s = c .+ d .* z
             y .~ Gamma.(exp.(s), exp.(eta) ./ exp.(s))
@@ -673,6 +681,12 @@ end
     y1 = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
     y2 = [0.5, 1.0, 2.0, 1.5, 2.5, 1.0]
     plan = bind_data(lower_rkppl(quote
+            a1 ~ Normal(0, 1)
+            b1 ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
+            a2 ~ Normal(0, 1)
+            b2 ~ Normal(0, 1)
             mu1 = a1 .+ b1 .* x
             mu2 = a2 .+ b2 .* x
             sigma = c .+ d .* z
@@ -728,6 +742,8 @@ end
     # column, broadcast prior sizing the block — the location rule.
     g = [1, 2, 1, 3, 2, 3]
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             cs[levels(g)] .~ Normal.(0, 2)
             sg = cs[g]

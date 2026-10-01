@@ -349,6 +349,8 @@ _pv_m1_oracle(a::Real, b::Real, s::Real) =
 # M2: new sampled families as pure prior contributors (unstated a/b keep
 # their Normal(0, 1) defaults).
 const _PV_M2 = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     t ~ StudentT(3, 1, 2)
@@ -473,6 +475,8 @@ end
     # P4: Uniform(0.5, 1.5) response scale, default Normal population
     # priors (SB `real<0.5,1.5>` is the same affine-logit leg).
     _pv_sb_check(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             s ~ Uniform(0.5, 1.5)
@@ -483,6 +487,8 @@ end
     # is the renormalized truncated distribution, matching RK
     # `:positive` (exact +log(2)).
     _pv_sb_check(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             s ~ truncated(StudentT(4, 0, 1), 0, Inf)
@@ -493,6 +499,8 @@ end
     # unrenormalized declaration kernel — exactly SB minus log(2), same
     # grads.
     plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             s ~ truncated(StudentT(4, 0, 1), 0, Inf)
@@ -588,6 +596,8 @@ _pv_m5_oracle(a::Real, b::Real, s::Real, t::Real) =
 
 # M5 twin with proper halves: identical except the +log(2) per half.
 const _PV_M5_PROPER = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     s ~ HalfNormal(2)
