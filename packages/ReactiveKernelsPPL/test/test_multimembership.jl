@@ -13,7 +13,8 @@ using ReactiveKernels
 using ReactiveKernelsPPL
 using Reactant
 using Test
-import ReactiveKernelsPPL: lkj_chol_constrain, lkj_logconst
+import ReactiveKernelsPPL: lkj_chol_constrain, lkj_logconst, lkj_chol_logjac,
+    lkj_corr_cholesky_logpdf
 
 # Lower + bind + build + query a program; return
 # `(bound, built, kern, layout)`.
@@ -940,6 +941,42 @@ end
         @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
         _check_gradient(built.spec, bound, u)
     end
+    @testset "K=3" begin
+        # Three margins: the vine's off-diagonal products and two-factor
+        # diagonal run over the stacked per-stratum partials.
+        g = [1, 2, 1, 3, 2, 3]
+        x = [0.5, -1.0, 1.5, 0.0, 0.8, -0.4]
+        x2 = [0.3, -0.7, 1.1, 0.4, -0.2, 0.9]
+        y = [1.0, 2.0, 1.5, 2.5, 0.7, 1.9]
+        cols = Dict{Symbol,AbstractVector}(:y => y, :x => x, :x2 => x2,
+            :g => g, :b => [1, 1, 1, 2, 1, 2])
+        bound, built, _, lay = _mm_query(quote
+                a ~ Normal(0, 5)
+                d ~ varying_draws(gr(g; by = b), [1, x, x2])
+                r ~ varying_slice(d, 1:3)
+                mu = a .+ r
+                y .~ Normal.(mu, 1.0)
+            end, cols)
+        u = [0.4 * sin(1.3i) for i in 1:lay.total]
+        a = only(u[_mm_seg(lay, :mu)])
+        us = [Vector{Float64}(u[_mm_seg(lay, Symbol(:L_g_s, k))]) for k in 1:2]
+        Ls = [lkj_chol_constrain(us[k], 3) for k in 1:2]
+        ts = [exp.(u[_mm_seg(lay, Symbol(:tau_g_s, k))]) for k in 1:2]
+        zmat = reshape(u[_mm_seg(lay, :z_flat_g)], 3, 3)
+        bs = [Matrix((Diagonal(ts[k]) * Ls[k] * zmat)') for k in 1:2]
+        r = _mm_ref_strat_r(g, [1, 1, 2], bs, hcat(ones(6), x, x2))
+        ll = sum(logpdf.(Normal.(a .+ r, 1.0), y))
+        pr = logpdf(Normal(0, 5), a) +
+            sum(lkj_corr_cholesky_logpdf(Ls[k], 1.0) for k in 1:2) +
+            sum(sum(logpdf.(Normal(0, 1), ts[k])) for k in 1:2) +
+            sum(logpdf.(Normal(0, 1), zmat))
+        jac = sum(lkj_chol_logjac(us[k], 3) +
+            sum(u[_mm_seg(lay, Symbol(:tau_g_s, k))]) for k in 1:2)
+        @test _query(built.spec, bound, :likelihood, u) ≈ ll
+        @test _query(built.spec, bound, :prior, u) ≈ pr
+        @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
+        _check_gradient(built.spec, bound, u)
+    end
 end
 
 # Statement-head histogram of the generated kernel (the joint-parity
@@ -981,6 +1018,40 @@ end
     end
     @test _mm_statement_heads(st_prog, st_cols) ==
         _mm_statement_heads(st_prog, _mm_double(st_cols))
+end
+
+# Names the generated kernel body binds. The stratum count S comes from
+# data (`bind_data` fills the levels), so the stacked strata emission
+# must bind the same names whatever S is; per-stratum emission added an
+# `L_<s>_s<k>`/`tau_<s>_s<k>` chain per stratum.
+function _mm_bound_names(prog::Expr, cols::Dict{Symbol,AbstractVector})
+    plan = lower_rkppl(prog, keys(cols))
+    bound = bind_data(plan, cols)
+    def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
+    names = Symbol[]
+    for st in def.args[2].args
+        (st isa Expr && st.head === :(=)) || continue
+        lhs = st.args[1]
+        push!(names, lhs isa Expr && lhs.head === :(::) ? lhs.args[1] : lhs)
+    end
+    return names
+end
+
+@testset "stratified emission is O(1) in the stratum count" begin
+    st_prog = quote
+        a ~ Normal(0, 5)
+        d ~ varying_draws(gr(g; by = b), [1, x])
+        r ~ varying_slice(d, 1:2)
+        mu = a .+ r
+        y .~ Normal.(mu, 1.0)
+    end
+    # Same rows and groups; only the stratum column changes (S = 2 vs 3).
+    cols(bcol) = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
+        :x => copy(_MM_X), :g => [1, 2, 1, 3], :b => bcol)
+    c2, c3 = cols([1, 1, 1, 2]), cols([1, 2, 1, 3])
+    @test _mm_bound_names(st_prog, c2) == _mm_bound_names(st_prog, c3)
+    @test _mm_statement_heads(st_prog, c2) == _mm_statement_heads(st_prog, c3)
+    @test !any(n -> occursin(r"_s\d", string(n)), _mm_bound_names(st_prog, c3))
 end
 
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
@@ -1040,6 +1111,25 @@ end
         small = _mm_reactant(prog, cols)
         large = _mm_reactant(prog, _mm_double(cols))
         @test small.lines == large.lines
+    end
+    @testset "stratified traced program is O(1) in the stratum count" begin
+        # Ten groups over twenty rows; only the stratum count changes
+        # (S = 9 vs 10). Both stacked K×S tau plates sit above the
+        # small-static plate-lane threshold (16), so each lowers to one
+        # broadcast and the program text must not grow with S.
+        _, prog, _ = progs[2]
+        g = repeat(1:10, 2)
+        mk(bcol) = Dict{Symbol,AbstractVector}(
+            :y => [1.0 + 0.1 * sin(i) for i in 1:20],
+            :x => [0.2 * cos(i) for i in 1:20], :g => g, :b => bcol)
+        s9 = _mm_reactant(prog, mk(min.(g, 9)))
+        s10 = _mm_reactant(prog, mk(copy(g)))
+        @test s9.lines == s10.lines
+        for fx in (s9, s10)
+            @test fx.primal ≈ fx.native rtol = 1e-9
+            @test fx.rval ≈ fx.native rtol = 1e-9
+            @test fx.rgrad ≈ fx.g rtol = 1e-8
+        end
     end
 end
 
