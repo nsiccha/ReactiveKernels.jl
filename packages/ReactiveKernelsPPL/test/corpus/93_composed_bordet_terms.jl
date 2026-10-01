@@ -3,6 +3,7 @@
 # curves (transient bump x saturating dose response) composed over data
 # leaves with `logistic.` maps (composed predictors v3).
 begin
+    b0 ~ Normal(0, 1)
     sigma ~ Exponential(1)
     r_base ~ varying_effect(series, [1])
     base = b0 .+ r_base

@@ -226,12 +226,14 @@ end
 
 @testset "merge joint session over shared defs" begin
     m1 = @rkppl begin
+        b ~ Normal(0, 1)
         a ~ Normal(0, 1)
         s ~ merge_latent_normal(1.0)
         mu = a .+ b .* x
         y ~ merge_normal_stream(mu, s)
     end
     m2 = @rkppl begin
+        b ~ Normal(0, 1)
         a ~ Normal(0, 3)
         t ~ merge_latent_normal(2.0)
         nu = a .+ b .* x

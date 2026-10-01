@@ -27,6 +27,8 @@ _mo_cols() = Dict{Symbol,AbstractVector}(
 )
 
 _mo_surface_mo() = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     s ~ Dirichlet([1.0, 2.0])
     mu = a .+ b .* mo(c, s)
     sigma ~ Exponential(1.0)
@@ -34,6 +36,7 @@ _mo_surface_mo() = quote
 end
 
 _mo_surface_mo1() = quote
+    a ~ Normal(0, 1)
     s ~ Dirichlet([1.0, 2.0])
     mu = a .+ mo1(c, s)
     sigma ~ Exponential(1.0)
@@ -206,6 +209,7 @@ end
             y .~ Normal.(mu, 1.0)
         end, (:y, :c))
     @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
             m = sum(mo(c, s))
             mu = a .+ x
@@ -445,6 +449,8 @@ end
         :c => [1, 2, 1, 2],
     )
     bound = bind_data(lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 s ~ Dirichlet(1, 1.0)
                 mu = a .+ b .* mo(c, s)
                 sigma ~ Exponential(1.0)
@@ -471,6 +477,8 @@ end
     # coefficient coordinates including the factor slice.
     cols = _mo_cols()
     bound = bind_data(lower_rkppl(quote
+                b ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 s ~ Dirichlet([1.0, 2.0])
                 cf[levels(g)] .~ Normal.(0.0, 2.0)
                 mu = b .* mo(c, s) .+ d .* x .+ cf[g]
@@ -610,6 +618,8 @@ end
         # u = [0.6, -0.2, 0.1, 0.3, -0.4]. SB full -102.66411213599827.
         cols = _mo_m1_cols()
         bound = bind_data(lower_rkppl(quote
+                    a ~ Normal(0, 1)
+                    b ~ Normal(0, 1)
                     s ~ Dirichlet([1.0, 2.0, 3.0])
                     mu = a .+ b .* mo(c, s)
                     sigma ~ Exponential(1.0)
@@ -651,6 +661,7 @@ end
         # u = [0.5, 0.1, 0.3]. SB full -88.588255516339331.
         cols = _mo_m2_cols()
         bound = bind_data(lower_rkppl(quote
+                    a ~ Normal(0, 1)
                     s ~ Dirichlet([1.0, 2.0])
                     mu = a .+ mo1(c, s)
                     sigma ~ Exponential(1.0)

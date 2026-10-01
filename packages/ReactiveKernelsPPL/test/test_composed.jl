@@ -4,6 +4,10 @@
 # affine under IdentityLink; the combination tree evaluates in-graph.
 @testset "composed product lowers" begin
     plan = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
+        a_al ~ Normal(0, 1)
+        b_al ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         al = a_al .+ b_al .* xs
         be ~ Normal(0.0, 100.0)
@@ -33,6 +37,10 @@ end
 
 @testset "composed additive and scalar-star" begin
     add = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
+        a_al ~ Normal(0, 1)
+        b_al ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         al = a_al .+ b_al .* xs
         eta = th .+ al
@@ -44,6 +52,8 @@ end
     @test isempty(t.options.scalars)
     # Julia-valid scalar `*` normalizes to dotted (Base broadcasts).
     star = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
         eta = be * th
@@ -74,6 +84,7 @@ end
     # Under `.+` the same alias keeps the affine merge (with
     # unstated-coefficient defaults) — never reroutes into a composition.
     aff = lower_rkppl(quote
+        b ~ Normal(0, 1)
         c[levels(g)] .~ Normal.(0, 2)
         th = c[g]
         mu = th .+ b .* x
@@ -86,6 +97,8 @@ end
 
 @testset "composed inline and scale locations" begin
     inl = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
         y .~ Bernoulli.(logistic.(be .* th))
@@ -93,6 +106,10 @@ end
     @test [p.name for p in inl.predictors] == [:th, :y_eta]
     @test only(inl.predictors[2].terms).kind === ComposedTerm
     vscale = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         mu = a .+ b .* xs
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
@@ -107,6 +124,8 @@ end
     # A name bound to a composition inlines at its use (naming a
     # subexpression never changes legality; v1 failed these closed).
     plan = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
         ga ~ Normal(0.0, 100.0)
@@ -120,6 +139,8 @@ end
     # ... including through a shared composed root that is also a
     # response location (the root interns; the use site inlines it).
     shared = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
         ga ~ Normal(0.0, 100.0)
@@ -137,6 +158,8 @@ end
     # A bound data column reads elementwise in-graph as a tree leaf and
     # rides the composed term's columns (v1/v2 failed these closed).
     plan = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
         eta = be .* (th .+ xs)
@@ -148,6 +171,10 @@ end
     @test t.columns == [:xs]
     # `logistic.` maps (and a name bound to a map composition) inline.
     curve = lower_rkppl(quote
+        a_l ~ Normal(0, 1)
+        b_l ~ Normal(0, 1)
+        a_s ~ Normal(0, 1)
+        b_s ~ Normal(0, 1)
         loc = a_l .+ b_l .* g
         ls = a_s .+ b_s .* g
         xi = (xs .- loc) .* exp.(ls)
@@ -181,12 +208,18 @@ end
     end, D), Dict1)
     # ... while the Poisson log link still peels.
     pois = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Poisson.(exp.(mu))
     end, D)
     @test only(pois.predictors).link === LogLink
     # A named map inside a real combination still inlines.
     plan = lower_rkppl(quote
+        a_la ~ Normal(0, 1)
+        b_la ~ Normal(0, 1)
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         la = a_la .+ b_la .* xs
         al = exp.(la)
@@ -229,6 +262,9 @@ end
     @test occursin("`.~` link", sprint(showerror, err))
     # A scalar leaf names a sampled name or scalar definition — or fails.
     @test_throws SurfaceLoweringError lower_rkppl(quote
+        be ~ Prior
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         eta = be .* th
         y .~ Bernoulli.(logistic.(eta))
@@ -243,6 +279,8 @@ end
     # Shrinkage priors go on the coefficient-holding sub-predictors,
     # never the composed root.
     @test_throws SurfaceLoweringError lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         r2d2(eta, R2, phi)
         R2 ~ Beta(1, 1)
         phi ~ Dirichlet(2, 1.0)

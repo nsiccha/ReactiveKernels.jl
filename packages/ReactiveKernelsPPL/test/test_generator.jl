@@ -1661,6 +1661,8 @@ end
     ycount = [3, 1, 6, 2, 1, 4]
     phicol = [2.0, 3.0, 1.5, 2.5, 4.0, 1.0]
     plan0 = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ NegativeBinomial2.(exp.(mu), phi)
     end, (:y, :x, :phi))
@@ -1722,6 +1724,8 @@ end
     cols = Dict{Symbol,AbstractVector}(:x => x, :y => y)
     expr = Expr(:block,
         :(tgi_c_cr ~ truncated(Normal(-2.3, 1.0), -Inf, $hi)),
+        :(a ~ Normal(0, 1)),
+        :(b ~ Normal(0, 1)),
         :(mu = a .+ b .* x),
         :(y .~ Normal.(mu, s)),
         :(s ~ Exponential(1)))

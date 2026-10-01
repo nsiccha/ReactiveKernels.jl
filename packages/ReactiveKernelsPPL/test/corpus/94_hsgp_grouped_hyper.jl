@@ -3,6 +3,9 @@
 # (`by=`) whose log length-scale / log sd each take a per-biomarker
 # hyper-predictor `1 + (1 | biomarker)` (BRM default hyper priors).
 begin
+    a ~ Normal(0, 1)
+    b_aff ~ Normal(0, 1)
+    c0 ~ Normal(0, 1)
     hsgp_basis(:h_t, log_time; k = 10, by = biomarker,
         length_scale = 1 + (1 | biomarker), sd = 1 + (1 | biomarker))
     hsgp_basis(:h_d, log_dose; k = 10, by = biomarker,

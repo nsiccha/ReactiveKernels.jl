@@ -135,10 +135,11 @@ bind the matrix once (`X = hcat(1, x1, x2)` — the intercept `1` plus
 bare data/derived columns), use it only as a predictor matmul
 (`mu = X * b`), and size the coefficient vector with an axes prior
 (`b[axes(X, 2)] .~ Normal.(loc, scale)` — scalar args share over
-elements, literal `[…]` vectors go per element). Unstated vectors
-default to `Normal(0, 1)` per element; under `r2d2(mu, R2, phi)` a
+elements, literal `[…]` vectors go per element). Declarations are
+strict: an undeclared coefficient name or vector fails naming the
+prior to write — nothing is defaulted. Under `r2d2(mu, R2, phi)` a
 stated vector becomes per-element share-0 overrides and an unstated
-one joins the simplex. Every other matrix position (scales, prior
+one joins the simplex (the `r2d2` statement is its prior). Every other matrix position (scales, prior
 arguments, indexing, arithmetic outside a matmul) fails loudly
 naming the spelling. Emitter guidance: matrix and affine spellings
 of one model evaluate bit-identically with identical coefficient
@@ -5331,10 +5332,9 @@ function _lower_glm_response(g::GLMSampleStmt, sample, prior_names::Set{Symbol},
 end
 
 # A GLM coefficient vector: K per-element PopulationPriors over the
-# response matrix columns, addressed by response label. Unstated
-# vectors default to K× Normal(0, 1) (the matrix-prior emitter
-# convention — the width is static, so no declaration is needed to
-# size them). Stated vectors take `b[axes(X, 2)] .~ Normal.(loc,
+# response matrix columns, addressed by response label. An unstated
+# vector fails (`_undeclared_vector` — strict declarations, decision
+# 05oe96l). Stated vectors take `b[axes(X, 2)] .~ Normal.(loc,
 # scale)` with scalar (shared) or length-K literal-vector
 # (per-element) args — Normal-only (non-Normal betas use the
 # decomposed predictor form).
@@ -5349,8 +5349,7 @@ function _lower_glm_beta_priors(label::Symbol, beta::Symbol, X::Symbol,
         s.lhs === beta || continue
         stated = s
     end
-    stated === nothing && return PopulationPrior[
-        PopulationPrior(label, c, 0.0, 1.0) for c in cols]
+    stated === nothing && _undeclared_vector(beta, X, label)
     fam, locs, scales, _ =
         _coefficient_matrix_prior(beta, stated.rhs, label, K, hyper_names)
     fam === :normal || _sfail("response $label: GLM-object beta vectors " *
@@ -6711,7 +6710,8 @@ today's paths — data combos merge affinely, latents keep their arms).
 Under `.*` (`allow_factor`), bare factor indexing (`th = c[g]`) qualifies
 too — scalar-shaped globally (the inlining doctrine) but an affine
 FactorTerm under analysis. Under `.+` it never qualifies, so `mu = a .+ th`
-keeps the affine merge (with unstated-intercept defaults)."""
+keeps the affine merge (its coefficients declared like any other —
+strict declarations)."""
 function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     haskey(ctx.detmap, s) || return false
     if get(ctx.detshape, s, :scalar) !== :vector
@@ -7227,7 +7227,8 @@ end
 
 # An `X * b` matmul: the design matrix's K columns take one coefficient
 # vector — declared (`b[axes(X, 2)] .~ ...`, width-checked against the
-# use matrix) or free (implicit, width follows the use). Coefficient-ness
+# use matrix) or free (classified here, then refused at prior lowering —
+# strict declarations, `_undeclared_vector`). Coefficient-ness
 # is by name role, not shape (the affine free-name precedent): data,
 # computed, sampled, latent, scan, and matrix names all fail naming the
 # spelling. Records `(b, X, sign)`; element priors lower per use-matrix
@@ -7762,9 +7763,26 @@ function _treatment_removed(idx)
     return "got $(repr(idx))"
 end
 
+# Strict declarations (user decision 05oe96l): a name that is not a data
+# column, a definition, or a declared parameter never becomes a parameter
+# with a default prior — on every entry point (`@rkppl` and direct
+# `lower_rkppl` alike). It fails naming the declaration to write.
+function _undeclared_coefficient(name::Symbol, pname::Symbol, alt = nothing)
+    _sfail("predictor $pname: `$name` is not a data column, a definition, " *
+           "or a declared parameter — declare its prior " *
+           "(`$name ~ Normal(0, 1)`" *
+           (alt === nothing ? "" : " or `$alt`") * ") or fix the name")
+end
+
+function _undeclared_vector(name::Symbol, X::Symbol, where::Symbol)
+    _sfail("$where: coefficient vector `$name` of design matrix $X has no " *
+           "prior — declare it (`$name[axes($X, 2)] .~ Normal.(0, 1)`) or " *
+           "fix the name")
+end
+
 # Coefficient priors: recovered by name from `coef ~ Fam(...)` statements
-# (one family per addressee — see `_COEF_FAMILIES`); missing scalar priors
-# default to Normal(0, 1) (emitter convention). Factor coefficients instead
+# (one family per addressee — see `_COEF_FAMILIES`); an undeclared scalar
+# coefficient fails (`_undeclared_coefficient`). Factor coefficients instead
 # take broadcast priors (`c[levels(g)] .~ Fam.(...)`), which also size the
 # block — required, never defaulted — and each one emits its LevelMap.
 # Plan order follows predictors, addressees in term order.
@@ -7829,10 +7847,7 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                     stated, levelmaps, hyper_names))
                 continue
             end
-            if !haskey(stated, name)
-                push!(priors, PopulationPrior(pred.name, addr, 0.0, 1.0))
-                continue
-            end
+            haskey(stated, name) || _undeclared_coefficient(name, pred.name)
             s = stated[name]
             s.levels !== nothing && _sfail("coefficient $name takes a " *
                                            "scalar prior, not a levels prior — it is used " *
@@ -7848,9 +7863,8 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
 end
 
 # A matrix coefficient vector: K per-element PopulationPriors over the
-# use-matrix columns (`:Intercept` at intercept positions). Unstated
-# vectors default to K× Normal(0, 1) (emitter convention — the width is
-# static, so no declaration is needed to size them). Stated vectors take
+# use-matrix columns (`:Intercept` at intercept positions). An unstated
+# vector fails (`_undeclared_vector` — strict declarations). Stated vectors take
 # `b[axes(S, 2)] .~ Fam.(args...)` — one shared family with scalar
 # (shared) or length-K literal-vector (per-element) args — real
 # broadcast semantics.
@@ -7865,13 +7879,12 @@ function _lower_matrix_priors(pred, t, coefuse, stated, matrices,
     name, _, sign = use
     elems = _matrix_element_addressees(m)
     K = length(elems)
-    haskey(stated, name) || return PopulationPrior[
-        PopulationPrior(pred.name, e, 0.0, 1.0) for e in elems]
+    haskey(stated, name) || _undeclared_vector(name, X, pred.name)
     s = stated[name]
     # Reachable only with a matrix marker sized for this use:
     # classification accepts a use only for declared vectors (width
-    # checked against the use matrix) or free names (unstated,
-    # defaulted above).
+    # checked against the use matrix) or free names (unstated, which
+    # fail above).
     s.matrix === nothing && _sfail("internal: matrix prior for $name " *
                                    "lost its sizing matrix")
     fam, locs, scales, nus =
@@ -8015,8 +8028,8 @@ function _coefficient_horseshoe(name, rhs, pname, addr)
 end
 
 # Horseshoe predictors to IR: one HorseshoePrior per stated `~ Horseshoe()`
-# addressee plus its synthesized triple; stated-Normal (or unstated)
-# scalar addressees ride Normal scalars (the mixed-predictor
+# addressee plus its synthesized triple; stated-Normal scalar addressees
+# ride Normal scalars (unstated ones fail — strict declarations) (the mixed-predictor
 # coordinate). Anything but intercept/continuous/offset terms fails
 # closed (the flat slice).
 function _lower_horseshoe_priors(sample, coefuse, predictors,
@@ -8041,11 +8054,8 @@ function _lower_horseshoe_priors(sample, coefuse, predictors,
             use === nothing && _sfail("internal: no coefficient use for " *
                                       "($(pred.name), $addr)")
             name, _, sign = use
-            if !haskey(stated, name)
-                push!(params, _horseshoe_normal_param(pred.name, addr,
-                    0.0, 1.0, taken))
-                continue
-            end
+            haskey(stated, name) || _undeclared_coefficient(name, pred.name,
+                "$name ~ Horseshoe()")
             s = stated[name]
             if _is_horseshoe_call(s.rhs)
                 ls, gs = _coefficient_horseshoe(name, s.rhs, pred.name,
