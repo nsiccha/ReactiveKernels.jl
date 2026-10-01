@@ -1,7 +1,7 @@
 # Varying-source PK slice
 
-`ReactiveKernelsPPL` supplies the PK component of Bruno's `varyingsource3`
-twin at source checkpoint `896137dd`. A Gamma transit input feeds a linear
+`ReactiveKernelsPPL` supplies the PK component of a varying-source PK/PD
+model. A Gamma transit input feeds a linear
 two-compartment system. Each treatment reuses one unit response; doses then
 accumulate in order, with a normalized two-dimensional GP adjusting each dose
 from its amount and the concentration produced by earlier doses.
@@ -30,7 +30,7 @@ vs = varyingsource_pk_schedule(obs = (:subject, :time),
     dose = (:dose_subject, :dose_time, :dose_amount, :treatment_key))
 ```
 
-`treatment_key` is the combined treatment/diet identifier (for the twin,
+`treatment_key` is the combined treatment/diet identifier (for example
 `treatment + 100*diet`). Binding renumbers it by first appearance within each
 subject. Observation subjects must cover `1:n`; dose subjects must refer to
 them. Dose times must be nondecreasing within a subject, and dose amounts must
@@ -58,7 +58,7 @@ extract arbitrary BRM dose-axis predictors. GP slopes are scalars or subject
 predictors. `gp_weights` is a shared square coefficient vector in Julia column
 order: bound data, or a concrete-size `VectorParameter` with family
 `:vector_normal` in the typed plan. The latter prior belongs to that plan; it
-does not reproduce the twin's GP innovation prior automatically.
+does not reproduce the reference model's GP innovation prior automatically.
 
 Binding builds separate cumulative ends for reference times, doses, lags, and
 the dose-major lag-index products. It preserves original dose-row indices and
@@ -69,9 +69,9 @@ reference traversal remain ordinary runtime loops. Dose-free subjects skip
 parameter indexing, GP construction, and unit solves and return zero PK.
 
 Treatment map value `j` selects source column `j`, assembled from dose-column
-modifiers `j`. This preserves the deployed twin's selection of the first
+modifiers `j`. This preserves the reference model's selection of the first
 `maximum(treatment_map)` source columns, even if treatment `j` first appears
-on a later dose. Changing that selection would change the modeled twin.
+on a later dose. Changing that selection would change the modeled system.
 
 ## Numerical and backend limits
 
@@ -86,7 +86,7 @@ The transit primitive uses its existing generated mathematical reverse rule.
 Reactant execution fails explicitly: compiled transit-rule and sequential-dose
 control flow are not established for this cell. The slice does not yet include
 PD/placebo grids, full centered hierarchical subject effects, GP prior
-transforms, or BRM-side grouped extraction. Those remain full-twin work.
+transforms, or BRM-side grouped extraction.
 
 ## Standalone transit primal execution
 

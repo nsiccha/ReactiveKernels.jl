@@ -16,8 +16,8 @@ _vs_build_full(d) = build_varyingsource_pkpd_schedule(d.subject, d.time,
 @testset "varyingsource raw full-grid contract and source boundaries" begin
     d = _vs_pkpd_schedule_fixture()
     s = _vs_build_full(d)
-    # These boundary products were checked against the actual original
-    # _vs_subject_design at Bruno 896137dd, including the equal-time doses.
+    # These boundary products were checked against the reference
+    # subject-design recipe, including the equal-time doses.
     @test s.reference_ends == [18,18,25]
     @test s.obs_ends == [6,7,10]
     @test s.n_reads == [6,1,3]

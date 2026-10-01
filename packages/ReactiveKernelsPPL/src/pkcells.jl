@@ -1,10 +1,9 @@
 # Linear-PK recurrence cell vocabulary (grouped kernels).
 #
-# The SB joint PK/QT/TGI `linear_pk_read_locs_cell` mirror (bruno mirror ref
-# `kb-impl/Bruno-arv393-tgi` @ `3af22846`: `web-pkpd/src/brm_integration.jl`
-# `linear_pk_read_locs_cell`, `src/pkpd_models.jl` `linear_pk_system` /
-# `propagate` / `add_dose` / `add_regular_doses`, `src/dosing_schedule.jl`
-# `build_linear_event_schedule`) plus the event-schedule recipe (D5a).
+# A two-compartment linear-PK event recurrence that mirrors a StanBlocks
+# (SB) reference cell `linear_pk_read_locs_cell` (system build, propagate,
+# single and regular-repeat doses, event-schedule builder) plus the
+# event-schedule recipe (D5a).
 #
 # Two deliberate deltas from SB, both documented at the use site:
 # 1. Read numbering is SUBJECT-LOCAL (1..R_s per subject; SB numbers reads
@@ -42,7 +41,7 @@
 # returned reads vector is an array, allocated eltype-generic (see
 # `linear_pk_read_locs`).
 
-"""Operation codes of the linear-PK event stream (SB `dosing_schedule.jl`)."""
+"""Operation codes of the linear-PK event stream (the SB reference codes)."""
 const LINEAR_EVENT_READ = 1
 const LINEAR_EVENT_DOSE = 2
 const LINEAR_EVENT_DOSE_SEGMENT = 3
@@ -194,11 +193,10 @@ compression are inexpressible in the kernel graph, so the schedule
 builds on the host at bind and materializes op COLUMNS as bound
 vectors).
 
-Verbatim transliteration of Bruno `build_linear_event_schedule`
-(`src/dosing_schedule.jl`), minus the dose-pattern axis (every dose is
-pattern 1 — the V2 joint has no formulation/meal fields, and SB rejects
-them in the log-F formula) and with SUBJECT-LOCAL read numbering (see
-the file header). Same validations, same token order (read-before-dose
+Mirrors the SB reference event-schedule builder, minus the dose-pattern
+axis (every dose is pattern 1 — the V2 joint has no formulation/meal
+fields, and SB rejects them in the log-F formula) and with SUBJECT-LOCAL
+read numbering (see the file header). Same validations, same token order (read-before-dose
 at equal time), same exact-match segment compression. SB's
 `combine_simultaneous` flag is honored verbatim: `true` (default)
 pre-sums same-time doses (exact only at state-independent F ≡ 1 — the
@@ -211,9 +209,8 @@ automatically; the flag is explicit here for direct builder users.
 READ AXES (the joint model's ECG + tumor assessment rows): their times
 join the stream as read-only points, so the recurrence evaluates
 concentration/AUC at every endpoint's times (SB's joint prep
-`vcat(pk, qt, tgi)` subject/time concatenation,
-`brm_integration.jl`, sliced back per axis below — the same
-concatenation order: obs, ecg, tgi). A subject with no PK or dose rows
+`vcat(pk, qt, tgi)` subject/time concatenation, sliced back per axis
+below — the same concatenation order: obs, ecg, tgi). A subject with no PK or dose rows
 still gets its read-only stream (SB's dose-free subject precedent);
 subject coverage and the 1:n contiguity rule apply to the UNION axis.
 Reads stay subject-local; `obs_read`/`obs_map` keep their v1 meaning
@@ -557,7 +554,7 @@ function linear_pk_op_log_dose(op_type::AbstractVector,
     return op_log_dose
 end
 
-# --- SB primitive mirrors (`src/pkpd_models.jl`, same op order) ---
+# --- SB reference primitive mirrors (same op order) ---
 
 """
     linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka) -> SMatrix{3,3}
@@ -722,8 +719,8 @@ end
         -> AbstractVector
 
 One subject's linear-PK read locations (SB `linear_pk_read_locs_cell`,
-same op order): derive `log_CL`/`log_Q`/`log_Vp` from the varyingsource4
-prior coordinates, build the system, walk the event stream threading
+same op order): derive `log_CL`/`log_Q`/`log_Vp` from the
+microconstant prior coordinates, build the system, walk the event stream threading
 the 3-state, record `state[2]/Vc` at READ ops, return every READ
 location.
 
@@ -814,9 +811,7 @@ function linear_pk_read_locs(op_type::AbstractVector,
         log_k12, log_k21, log_ka)
 end
 
-# SB `linear_pk_read_locs_auc_cell` mirror (bruno mirror ref
-# `kb-impl/Bruno-arv393-tgi` @ `3af22846`:
-# `web-pkpd/src/brm_joint_tgi.jl`): the base recurrence plus the exact
+# SB `linear_pk_read_locs_auc_cell` mirror: the base recurrence plus the exact
 # mass-balance identity `AUC(0, t) = (given - sum(state(t))) / CL` — no
 # quadrature, no extra state. At each read op the running bioavailable
 # dose `given` (prior doses only) minus the current body burden, over
