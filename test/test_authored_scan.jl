@@ -468,3 +468,108 @@ end
         return s
     end)
 end
+@testset "a history scan reads its own earlier outputs" begin
+    F = AuthoredScanFixtures
+    amounts = [2.0, 0.0, 1.5, 3.0, 1.0]
+    plan = F.HistoryLattice([0, 2, 3, 7, 12])     # later lags run past `units`
+    units = [exp(-0.3 * (l - 1)) for l in 1:10]
+    expected = F._authored_scan_history_reference(amounts, plan, units)
+    weights = prepare(F.authored_scan_history)
+    # The generator sum folds in the hand loop's order, so the values are bitwise.
+    @test weights(amounts, plan, units) == expected
+    @test prepare(F.authored_scan_history; want = :total)(amounts, plan, units) ==
+        sum(expected)
+    @test only(Base.return_types(weights,
+        Tuple{Vector{Float64},F.HistoryLattice,Vector{Float64}})) == Vector{Float64}
+    # The step reads the result vector itself: nothing is allocated beside it.
+    _authored_scan_allocated(weights, amounts, plan, units)
+    _authored_scan_allocated(similar, amounts)
+    @test _authored_scan_allocated(weights, amounts, plan, units) ==
+        _authored_scan_allocated(similar, amounts)
+    # The op called outside a generated body (the host lowering) agrees.
+    recipe = only(r for r in weights.plan.recipes
+                  if r.op isa ReactiveKernels._AuthoredScanOp)
+    @test recipe.op(0, amounts, eachindex(amounts), plan, units, 0.0) == expected
+
+    # No step runs on an empty sequence: an empty vector of the history's type.
+    empty = weights(Float64[], F.HistoryLattice(Int[]), units)
+    @test empty == Float64[] && empty isa Vector{Float64}
+    @test prepare(F.authored_scan_history; want = :total)(
+        Float64[], F.HistoryLattice(Int[]), units) === 0.0
+
+    # Entries at and after the current step read the history value.
+    xs = [1.0, 2.0, 3.0]
+    buffer = fill(-1.0, 3)
+    for j in eachindex(xs)
+        buffer[j] = xs[j] + sum(buffer)
+    end
+    @test prepare(F.authored_scan_history_ahead)(xs) == buffer
+
+    # A position batch runs the history scan at every position.
+    U = [exp(-0.3 * (l - 1)) * s for l in 1:10, s in (1.0, 0.5, 2.0)]
+    batch = vectorize(F.authored_scan_history; batched = :units, want = :weights)
+    @test batch(amounts, plan, U) == reduce(hcat,
+        [F._authored_scan_history_reference(amounts, plan, U[:, s]) for s in 1:3])
+end
+
+@testset "history scan contract" begin
+    escape = @kernel escape_history(xs::Vector{Float64}) = begin
+        ys = scan(xs; init = 0.0, history = 0.0) do carry, x, earlier
+            (earlier, x)
+        end
+        return ys
+    end
+    # The native history aliases the vector the scan is still writing.
+    @test_throws ArgumentError prepare(escape)([1.0, 2.0])
+    @test_throws CanonicalIndexError (ReactiveKernels._ScanHistory([1.0])[1] = 2.0)
+    nonnumber = @kernel nonnumber_history(xs::Vector{Float64}) = begin
+        ys = scan(xs; init = 0.0, history = [0.0]) do carry, x, earlier
+            (carry, x)
+        end
+        return ys
+    end
+    @test_throws ArgumentError prepare(nonnumber)([1.0])
+    # Outputs are stored as the history value's type.
+    converted = @kernel converted_history(xs::Vector{Float64}) = begin
+        ys = scan(xs; init = 0, history = 0.0) do carry, x, earlier
+            (carry + 1, carry + 1)
+        end
+        return ys
+    end
+    @test prepare(converted)([5.0, 6.0]) == [1.0, 2.0]
+    @test prepare(converted)([5.0, 6.0]) isa Vector{Float64}
+
+    # The history is the do-block's last argument, after the shared operands.
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel missing_history(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, history = 0.0) do carry, x
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel twice_history(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, history = 0.0, history = 1.0) do carry, x, earlier
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel unknown_keyword(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, buffer = 0.0) do carry, x, earlier
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+end
+
+@testset "a scan shares host structs by Ref" begin
+    F = AuthoredScanFixtures
+    xs = [1.0, 2.0, 3.0]
+    plan, cfg = F.HistoryLattice([1, 5, 9]), (; W = [2.0 0.0; 0.0 3.0], m = 2)
+    expected = cumsum([xs[j] * plan.shifts[j] + 5.0 * xs[j] for j in eachindex(xs)])
+    @test prepare(F.authored_scan_host_shared)(xs, plan, cfg) == expected
+end

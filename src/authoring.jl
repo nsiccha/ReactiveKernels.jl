@@ -1781,6 +1781,9 @@ end
 # ordinary TWO-`want` KernelSpec (`want = (:new_carry, :output)`); the native
 # path runs the plain ordered loop (already Reactant-unsafe only via scalar
 # indexing, which the tensorized lowering avoids by emitting a `stablehlo.while`).
+# With `history = h0` the do-block takes one more, LAST formal: the read-only
+# vector of the outputs so far (`h0` at and after the current step); `h0` is
+# the op's last argument, atomic like the carry seed.
 function _kernel_authored_scan_expr(rhs, mod)
     rhs isa Expr && rhs.head === :do && length(rhs.args) == 2 || return nothing
     call, lambda = rhs.args
@@ -1799,41 +1802,47 @@ function _kernel_authored_scan_expr(rhs, mod)
         "scan do-block argument names must be unique"))
 
     # Split the call into positional operands, the required `init =` carry seed
-    # and the optional `include_init =` literal.
+    # and the optional `include_init =` literal and `history =` fill value.
     positional = Any[]
-    init_expr = nothing
-    include_init = false
-    function _scan_keyword!(kw)
-        name = kw.args[1]
-        if name === :init
-            init_expr = kw.args[2]
-        elseif name === :include_init
-            kw.args[2] isa Bool || throw(ArgumentError(
-                "scan's `include_init` must be the literal `true` or `false`: it " *
-                "fixes the result's length (n + 1 or n) when the kernel is defined"))
-            include_init = kw.args[2]
-        else
-            throw(ArgumentError(
-                "scan accepts only the `init =` and `include_init =` keywords"))
-        end
+    keywords = Dict{Symbol,Any}()
+    _scan_keyword!(kw) = begin
+        (kw isa Expr && kw.head === :kw &&
+         kw.args[1] in (:init, :include_init, :history)) || throw(ArgumentError(
+            "scan accepts only the `init =`, `include_init =` and `history =` keywords"))
+        haskey(keywords, kw.args[1]) && throw(ArgumentError(
+            "scan received the `$(kw.args[1]) =` keyword twice"))
+        keywords[kw.args[1]] = kw.args[2]
     end
     for arg in call.args[2:end]
         if arg isa Expr && arg.head === :parameters
-            for kw in arg.args
-                kw isa Expr && kw.head === :kw || throw(ArgumentError(
-                    "scan accepts only the `init =` and `include_init =` keywords"))
-                _scan_keyword!(kw)
-            end
+            foreach(_scan_keyword!, arg.args)
         elseif arg isa Expr && arg.head === :kw
             _scan_keyword!(arg)
         else
             push!(positional, arg)
         end
     end
+    init_expr = get(keywords, :init, nothing)
     init_expr === nothing && throw(ArgumentError("scan requires an `init =` carry seed"))
-    length(positional) == length(formals) - 1 || throw(ArgumentError(
-        "scan received $(length(positional)) positional argument(s), but its do-block has " *
-        "$(length(formals) - 1) non-carry parameter(s) (x, shared...)"))
+    include_init = get(keywords, :include_init, false)
+    include_init isa Bool || throw(ArgumentError(
+        "scan's `include_init` must be the literal `true` or `false`: it " *
+        "fixes the result's length (n + 1 or n) when the kernel is defined"))
+    history_expr = get(keywords, :history, nothing)
+    history = history_expr !== nothing
+    include_init && history && throw(ArgumentError(
+        "scan's `include_init = true` and `history =` cannot be combined: the " *
+        "history is the result vector itself, whose entries are the step outputs"))
+    if history
+        length(positional) == length(formals) - 2 || throw(ArgumentError(
+            "scan with `history =` received $(length(positional)) positional argument(s), " *
+            "but its do-block has $(length(formals) - 2) parameter(s) between the carry " *
+            "and the history (x, shared...); the history is the do-block's last argument"))
+    else
+        length(positional) == length(formals) - 1 || throw(ArgumentError(
+            "scan received $(length(positional)) positional argument(s), but its do-block has " *
+            "$(length(formals) - 1) non-carry parameter(s) (x, shared...)"))
+    end
 
     # The scan op's outer arguments are (carry-seed, xs..., shared...); the carry
     # seed and every `Ref`-wrapped shared operand are atomic (broadcast-invariant),
@@ -1879,6 +1888,7 @@ function _kernel_authored_scan_expr(rhs, mod)
             _push_operand!(operand, false)              # iterated sequence (non-atomic)
         end
     end
+    history && _push_operand!(history_expr, true)       # last: the history fill (atomic)
 
     # Build the step body's 2-want spec. Its HAVE boundary is the do-block formals
     # (carry, x, shared...); an enclosing port used but not passed is out of scope
@@ -1917,15 +1927,17 @@ function _kernel_authored_scan_expr(rhs, mod)
     operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_scan),
                      step_spec,
                      Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))),
-                     Expr(:call, GlobalRef(Base, :Val), include_init))
+                     Expr(:call, GlobalRef(Base, :Val), include_init),
+                     Expr(:call, GlobalRef(Base, :Val), history))
     (; arguments, operation, inferred = nothing, atomic = Tuple(atomic),
        materialized_arguments)
 end
 
 function _kernel_authored_scan(spec::KernelSpec, ::Val{A},
-                               ::Val{I} = Val(false)) where {A,I}
+                               ::Val{I} = Val(false),
+                               ::Val{H} = Val(false)) where {A,I,H}
     kernel = prepare(spec)
-    _AuthoredScanOp{typeof(kernel),A,I}(kernel)
+    _AuthoredScanOp{typeof(kernel),A,I,H}(kernel)
 end
 
 # A dotted operator such as `.*` is broadcast *syntax*, not a bound function:
