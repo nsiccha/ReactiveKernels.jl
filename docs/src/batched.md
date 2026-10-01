@@ -104,6 +104,34 @@ filter and the in-range test of `get` stay lazy branches: an out-of-range lag
 is never read. A filtered sum needs its `init`, because a traced condition
 cannot choose which element starts the sum.
 
+Natively the `get` spelling runs dose-outer. When the doses and the response
+`u` are plate invariants (`Ref` operands, scalars, or cell values computed from
+them only), the native loop makes one pass over the observations per dose, and
+each observation adds that dose's term to its running sum, so every value is
+the authored fold in the authored dose order, bitwise. Where the lag advances
+by exactly one per observation, as `t - s[j]` does over `1:n`, each pass
+splits at the window where the lag is in range: there `u` is read contiguously
+without the range test, and outside it the term takes the default. That is the
+shape of a hand-written accumulation over shifted slices of the response. The
+step-by-one check runs at call time; for a lattice lag it compiles away, and
+for stored per-observation lags (`row[j]`) it stops at the first irregular
+step and that pass reads through `get`, still dose-outer. The doses and `u`
+are evaluated once per call rather than once per observation, which the plate
+purity contract makes equivalent; an error raised by the term can name a
+different observation than the observation-outer order would reach first.
+
+This lowering applies to an unfiltered `sum(term for j in doses; init = x)`
+whose term calls `get(u, lag, default)` as an ordinary call argument (as in
+`w[j] * get(...)`; not inside `?:`, `&&` or a closure), when that sum is the
+cell's only per-observation value and the plate's pointwise result is
+materialized. It needs a concrete sum type that the seed and every term keep,
+an `Int` lag and a `Vector` response, all decided when the kernel is
+compiled; the window split also needs the lag's per-observation inputs to span
+the plate's axes. Otherwise, and for the filtered spelling (whose filter can
+skip the lag), the observation-outer loop runs as before.
+`prepare_nonallocating` evaluates a plate cell by cell through its broadcast
+step and is unchanged.
+
 A domain port needs no declared type. `observations = domain(plan)`, with
 `domain` returning `1:plan.nobs` for one plan type and `eachrow(plan.rows)` for
 another, is one graph for both: the native loop is scheduled from the value
