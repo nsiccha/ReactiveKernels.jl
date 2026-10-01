@@ -1315,6 +1315,16 @@ _scan_scalar_type(::Type{T}) where {T} = T
 # empty result is a zero-sized constant, which works as an intermediate but
 # still meets §7l if it is itself the compiled program's output.
 function _scan_empty_output(step, init, sequences::Tuple, shared::Tuple)
+    T = _scan_empty_output_type(step, init, sequences, shared)
+    for xs in sequences
+        xs isa Reactant.TracedRArray{T,1} && return copy(xs)
+    end
+    Reactant.promote_to(Reactant.TracedRArray, zeros(T, 0))
+end
+
+# The scalar per-step output type of a scan over these traced sequences,
+# without running a step on data.
+function _scan_empty_output_type(step, init, sequences::Tuple, shared::Tuple)
     output = ReactiveKernels._scan_step_output_type(step, typeof(init),
         map(xs -> _scan_element_type(typeof(xs)), sequences)...,
         map(typeof, shared)...)
@@ -1326,10 +1336,7 @@ function _scan_empty_output(step, init, sequences::Tuple, shared::Tuple)
     T isa DataType && T <: Number && isconcretetype(T) || throw(ArgumentError(
         "the Reactant scan lowering supports a scalar per-step output; the step " *
         "of this empty sequence produces a $(output)"))
-    for xs in sequences
-        xs isa Reactant.TracedRArray{T,1} && return copy(xs)
-    end
-    Reactant.promote_to(Reactant.TracedRArray, zeros(T, 0))
+    T
 end
 
 # A concrete (device-resident, untraced) marker means the kernel is executing
@@ -1337,8 +1344,9 @@ end
 # the native ordered loop is the correct execution, not an unrolled trace.
 ReactiveKernels._tensorized_scan_lowering(
         ::Union{Reactant.AbstractConcreteArray,Reactant.AbstractConcreteNumber},
-        step, init, iterated::Tuple, shared::Tuple) =
-    ReactiveKernels._tensorized_scan_lowering(nothing, step, init, iterated, shared)
+        step, init, iterated::Tuple, shared::Tuple, include_init::Val = Val(false)) =
+    ReactiveKernels._tensorized_scan_lowering(
+        nothing, step, init, iterated, shared, include_init)
 
 # `@trace` writes each loop result back into the tracer object it carried
 # (`Reactant.Ops.while_loop`), and it carries every traced value the body
@@ -1360,7 +1368,7 @@ ReactiveKernels._loop_capture_traced(
 
 function ReactiveKernels._tensorized_scan_lowering(
         marker::Reactant.TracedType, step, init, iterated::Tuple,
-        shared::Tuple)
+        shared::Tuple, include_init::Val = Val(false))
     sequences = _fresh_tracers(map(_scan_traced_sequence, iterated))
     shared = _fresh_tracers(shared)
     n = _scan_sequence_length(first(sequences))
@@ -1368,18 +1376,55 @@ function ReactiveKernels._tensorized_scan_lowering(
         DimensionMismatch(
             "scan's iterated sequences must have equal length; got lengths " *
             "$(map(_scan_sequence_length, sequences))."))
-    n == 0 && return _scan_empty_output(step, init, sequences, shared)
+    # A flag, not a static parameter: the Reactant macros below expand locals
+    # into this scope, and a static parameter named `I` collides with one
+    # ("local variable name "I" conflicts with a static parameter").
+    with_seed = include_init isa Val{true}
+    with_seed && _scan_check_seed(init)
+    if n == 0
+        with_seed || return _scan_empty_output(step, init, sequences, shared)
+        # `[init]` has one element, so it exports even as the compiled
+        # program's own output (an empty result does not, §7l).
+        buffer = _scan_seed_buffer(init,
+            _scan_empty_output_type(step, init, sequences, shared), 1)
+        Reactant.@allowscalar buffer[1] = init
+        return buffer
+    end
     x1 = map(xs -> _scan_element(xs, 1), sequences)
     carry, out1 = step(init, x1..., shared...)
-    buffer = _scan_output_buffer(out1, n)
-    Reactant.@allowscalar buffer[1] = out1
+    # An init-including scan writes the seed into slot 1 of the same buffer and
+    # step `i`'s output into slot `i + 1`.
+    buffer = with_seed ? _scan_seed_buffer(init, typeof(out1), n + 1) :
+        _scan_output_buffer(out1, n)
+    with_seed && (Reactant.@allowscalar buffer[1] = init)
+    Reactant.@allowscalar buffer[_scan_slot(1, include_init)] = out1
     Reactant.@trace for i in 2:n
         x = map(xs -> _scan_element(xs, i), sequences)
         carry, out = step(carry, x..., shared...)
-        Reactant.@allowscalar buffer[i] = out
+        Reactant.@allowscalar buffer[_scan_slot(i, include_init)] = out
     end
     buffer
 end
+
+# The buffer slot of step `i`'s output: `i`, or `i + 1` behind the seed.
+@inline _scan_slot(i, ::Val{false}) = i
+@inline _scan_slot(i, ::Val{true}) = i + 1
+
+# The carry seed of an init-including scan is element 1 of the scalar output
+# buffer, so it must be a scalar (traced or host); a compound carry seed has no
+# slot there.
+_scan_check_seed(::Number) = nothing
+_scan_check_seed(init) = throw(ArgumentError(
+    "the Reactant scan lowering supports `include_init = true` only for a " *
+    "scalar carry seed, which becomes element 1 of the scalar output buffer; " *
+    "got a $(typeof(init)). Keep a compound carry out of the output and " *
+    "concatenate explicitly, or seed a scalar carry."))
+
+# The traced output buffer of an init-including scan: its element type is the
+# seed's and the step output's promotion, as `vcat([init], outputs)` gives.
+_scan_seed_buffer(init, output_type, n::Integer) = _scan_output_buffer(
+    zero(promote_type(_scan_scalar_type(typeof(init)),
+                      _scan_scalar_type(output_type))), n)
 
 # Promote rectangular data and fixed carry storage once, before the while. This
 # includes host-bound columns even when only a parameter is traced. Copy scalar

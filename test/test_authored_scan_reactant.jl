@@ -299,3 +299,95 @@ end
     @test allequal(bound_sizes)
     @test allequal(traced_sizes)
 end
+
+@kernel authored_scan_reactant_turnover_init(pd, conc_mid::Vector{Float64}, dts::Vector{Float64}) = begin
+    kin = pd.baseline * pd.kout
+    trajectory = scan(conc_mid, dts, Ref(pd), Ref(kin);
+            init = pd.baseline, include_init = true) do previous, concentration, dt, parameters, input_rate
+        c2 = parameters.kout * (1 + concentration /
+            (parameters.theta1 * concentration + parameters.theta2))
+        steady = input_rate / c2
+        next = (previous - steady) * exp(-c2 * dt) + steady
+        (next, next)
+    end
+    return trajectory
+end
+
+@testset "an init-including scan keeps one while loop and one n + 1 buffer" begin
+    pd = (; baseline = 100.0, kout = 0.3, theta1 = 1.2, theta2 = 40.0)
+    traced_pd = Reactant.to_rarray(pd; track_numbers = true)
+    included = prepare(authored_scan_reactant_turnover_init)
+    concatenated = prepare(authored_scan_reactant_turnover)
+    traced_sizes, bound_sizes = Int[], Int[]
+    for n in (0, 1, 4, 8)
+        conc, dts = abs.(sin.(1:n)) .* 50, fill(0.1, n)
+        expected = concatenated(pd, conc, dts)
+        @test included(pd, conc, dts) == expected
+        traced = (Reactant.to_rarray(conc), Reactant.to_rarray(dts))
+        compiled = Reactant.@compile included(traced_pd, traced...)
+        result = Array(compiled(traced_pd, traced...))
+        @test length(result) == n + 1
+        @test result ≈ expected
+        # Changed inputs reuse the executable.
+        changed = (Reactant.to_rarray(conc .* 2), Reactant.to_rarray(dts))
+        @test Array(compiled(traced_pd, changed...)) ≈ included(pd, conc .* 2, dts)
+        hlo = repr(Reactant.@code_hlo optimize = false included(traced_pd, traced...))
+        @test count("stablehlo.while", hlo) == (n == 0 ? 0 : 1)
+        # Bound host sequences are lifted into the program as constants.
+        kb = prepare(authored_scan_reactant_turnover_init; bound = (; conc_mid = conc, dts))
+        compiled_bound = Reactant.@compile kb(traced_pd)
+        @test Array(compiled_bound(traced_pd)) ≈ expected
+        bound_hlo = repr(Reactant.@code_hlo optimize = false kb(traced_pd))
+        @test count("stablehlo.while", bound_hlo) == (n == 0 ? 0 : 1)
+        if n >= 4
+            push!(traced_sizes, count("\n", hlo))
+            push!(bound_sizes, count("\n", bound_hlo))
+        end
+    end
+    # The program is independent of the sequence length.
+    @test allequal(traced_sizes)
+    @test allequal(bound_sizes)
+    # The concatenated spelling keeps a second buffer the included one does not.
+    conc, dts = abs.(sin.(1:8)) .* 50, fill(0.1, 8)
+    traced = (Reactant.to_rarray(conc), Reactant.to_rarray(dts))
+    included_hlo = repr(Reactant.@code_hlo optimize = false included(traced_pd, traced...))
+    concatenated_hlo = repr(Reactant.@code_hlo optimize = false concatenated(traced_pd, traced...))
+    @test !occursin("stablehlo.concatenate", included_hlo)
+    @test occursin("stablehlo.concatenate", concatenated_hlo)
+
+    # Reverse gradients through the seed and the steps match native Enzyme.
+    @kernel included_decay(x::Vector{Float64}, seed::Float64) = begin
+        path = scan(x; init = seed, include_init = true) do carry, v
+            next = 0.5 * carry + v
+            (next, next)
+        end
+        total::Float64 = sum(abs2, path)
+        return total
+    end
+    x, seed = [0.5, -1.0, 0.25, 2.0], 1.5
+    for active in (:x, :seed)
+        prepared = prepare_ad(included_decay, AutoEnzyme(; mode = Enzyme.Reverse),
+                              x, seed; active, want = :total)
+        vref, gref = ad_value_and_gradient(prepared, x, seed)
+        traced_args = (Reactant.to_rarray(x), Reactant.to_rarray(seed; track_numbers = true))
+        compiled_both = compile_ad_value_and_gradient(prepared, traced_args...)
+        value, gradient = compiled_both(traced_args...)
+        @test Float64(value) ≈ vref
+        host_gradient = gradient isa Reactant.AbstractConcreteArray ? Array(gradient) :
+            Reactant.to_number(gradient)
+        @test host_gradient ≈ gref
+    end
+
+    # The seed is element 1 of the scalar buffer: a compound seed is refused
+    # loudly under Reactant (natively it is the vcat's element type).
+    @kernel included_named_carry(x) = begin
+        path = scan(x; init = (; total = 0.0), include_init = true) do carry, v
+            next = carry.total + v
+            ((; total = next), next)
+        end
+        return path
+    end
+    @test prepare(included_named_carry)([1.0, 2.0]) == Any[(; total = 0.0), 1.0, 3.0]
+    @test_throws "only for a scalar carry seed" Reactant.@compile prepare(
+        included_named_carry)(Reactant.to_rarray([1.0, 2.0]))
+end

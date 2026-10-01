@@ -349,10 +349,14 @@ end
 # `17bnc6t`; Reactant untouched).  `iterated` and `shared` are tuples; the common
 # case is a one-tuple `iterated`, and `eachindex(iterated...)` validates that
 # several sequences share axes (a `DimensionMismatch` otherwise). Empty
-# sequences run no step and yield an empty result.
-@inline function _tensorized_scan(step, init, iterated::Tuple, shared::Tuple)
+# sequences run no step and yield an empty result. `Val(true)` is the authored
+# `include_init = true`: the result is `[init, output…]` in one buffer of
+# element type `promote_type(typeof(init), output type)`, exactly the value of
+# `vcat([init], outputs)`, and an empty sequence yields `[init]`.
+@inline function _tensorized_scan(step, init, iterated::Tuple, shared::Tuple,
+                                  include_init::Val = Val(false))
     marker = _scan_backend_marker(init, iterated, shared)
-    _tensorized_scan_lowering(marker, step, init, iterated, shared)
+    _tensorized_scan_lowering(marker, step, init, iterated, shared, include_init)
 end
 
 # A scan runs on a backend exactly when ANY of its operands is that backend's
@@ -382,9 +386,10 @@ end
 
 # The native ordered loop.  `nothing` is the no-backend marker; a backend
 # extension specializes `_tensorized_scan_lowering` on its own marker type.
-# An empty sequence returns an empty result without running the step.
+# An empty sequence returns an empty result (or `[init]`) without running the
+# step.
 function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
-                                   shared::Tuple)
+                                   shared::Tuple, ::Val{false} = Val(false))
     idx = eachindex(iterated...)
     isempty(idx) && return similar(first(iterated), _scan_step_output_type(
         step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...))
@@ -395,6 +400,31 @@ function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
     for i in Iterators.drop(idx, 1)
         carry, out = step(carry, map(xs -> xs[i], iterated)..., shared...)
         result[i] = out
+    end
+    result
+end
+
+function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
+                                   shared::Tuple, ::Val{true})
+    idx = eachindex(iterated...)
+    if isempty(idx)
+        T = promote_type(typeof(init), _scan_step_output_type(
+            step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...))
+        result = similar(first(iterated), T, 1)
+        result[1] = init
+        return result
+    end
+    i1 = first(idx)
+    carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared...)
+    result = similar(first(iterated), promote_type(typeof(init), typeof(out1)),
+                     length(idx) + 1)
+    result[1] = init
+    result[2] = out1
+    position = 2
+    for i in Iterators.drop(idx, 1)
+        carry, out = step(carry, map(xs -> xs[i], iterated)..., shared...)
+        position += 1
+        result[position] = out
     end
     result
 end
