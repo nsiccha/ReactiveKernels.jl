@@ -1997,6 +1997,23 @@ end
     @test_throws ContractValidationError _ordered_plan(; resp = r)
 end
 
+# Every field non-default (bypassing validation): a rebuild that drops a
+# field shows up as a mismatch against its input.
+_all_fields_spec() = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
+    :s, :w, _none_evidence(), :y_resp, 7, 1:5, nothing, :cuts, [:p2], [:c2],
+    :cumulative, 2.0, [:tc], :tco, [:y2], :fs, :fc, :ga, :gb, GaussianFam,
+    Union{Symbol,Real}[:l1], Union{Nothing,Symbol,Real,ScalePredictorRef}[:s1],
+    :mw, 4.0, 0.2, :jobs, (0.0, 2pi))
+
+@testset "field-preserving rebuilds" begin
+    r = _all_fields_spec()
+    r2 = ReactiveKernelsPPL._with_levels(r, 3)
+    @test r2.n_levels == 3
+    @test [f for f in fieldnames(LikelihoodSpec)
+        if f !== :n_levels && getfield(r2, f) != getfield(r, f)] == Symbol[]
+    @test_throws ArgumentError ReactiveKernelsPPL._with(r; n_level = 3)
+end
+
 function _ordinal_plan(n = 9; link = LogitLink, structure = :cumulative,
         vecfam = :ordered_normal, discrimination = nothing,
         tcols = Symbol[], coefs = nothing, terms = nothing, resp = nothing,
