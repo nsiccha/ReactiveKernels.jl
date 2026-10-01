@@ -819,6 +819,174 @@ function _authored_plate_scalar_ref(inner::Plan, locals, callargs,
     locals[cid]
 end
 
+# Dose-outer lowering of a gathered generator-sum cell (`_KernelReduction`).
+#
+# A cell `sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(s); init = 0.0)`
+# runs observation-outer as authored: per cell, one pass over the doses, each
+# testing whether its lag is in range. With the doses and `u` shared by every
+# cell, the same sum runs dose-outer — one pass over the cells per dose, each
+# cell accumulating `add_sum(acc, term)` in the authored dose order, so every
+# cell's value is the authored fold, bitwise — and when the gather index moves
+# by exactly one per cell (checked at run time, `_plate_affine_index`), each
+# pass splits at the window where the index is in range: a contiguous read of
+# `u` without the test there, the default outside. That is the shape of a
+# hand-written shifted-slice accumulation loop.
+#
+# The plan is static: the materialized pointwise result is the reduction
+# recipe's output, every other cell recipe is a plate invariant (computed once
+# above the loop), and the iterator and gather source read invariants only.
+# The types are checked when the body is compiled (`_plate_reduction_ready`);
+# otherwise the ordinary cell loop runs.
+function _plate_reduction_plan(inner::Plan, inner_kernel, dependencies,
+                               root_positions, atomic, callvalues, pointwise_lhs)
+    pointwise_lhs === nothing && return nothing
+    graph = inner.graph
+    want = canon_id(graph, only(inner.want).id)
+    dynamic(cid) = Set(root for root in get(dependencies, cid, Set{Int}())
+                       if !(root_positions[root] in atomic) &&
+                          !(valtype(callvalues[root_positions[root]]) <: Number))
+    recipe_index = nothing
+    for (position, recipe) in enumerate(inner.recipes)
+        length(recipe.outputs) == 1 || return nothing
+        output = canon_id(graph, only(recipe.outputs).id)
+        if output == want
+            recipe_index = position
+        elseif !isempty(dynamic(output))
+            return nothing
+        end
+    end
+    recipe_index === nothing && return nothing
+    op = inner_kernel.ops[recipe_index]
+    op isa _KernelSourceOp && op.f isa _KernelReduction || return nothing
+    recipe = inner.recipes[recipe_index]
+    roots = dynamic(want)
+    isempty(roots) && return nothing
+    II, XI, KI, AI = typeof(op.f).parameters
+    for position in (II..., AI...)
+        isempty(dynamic(canon_id(graph, recipe.inputs[position].id))) ||
+            return nothing
+    end
+    (; recipe_index, recipe, roots, iterator = II, init = XI, index = KI,
+       source = AI)
+end
+
+# `@inbounds` for generated code, which carries no macro calls.
+_inbounds_expr(ex) = Expr(:block, Expr(:inbounds, true), ex, Expr(:inbounds, :pop))
+function _inbounds_value(ex)
+    value = gensym(:inbounds_value)
+    Expr(:block, Expr(:inbounds, true), Expr(:local, Expr(:(=), value, ex)),
+         Expr(:inbounds, :pop), value)
+end
+
+function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
+                                       callvalues, raw_arguments, prepared_arguments,
+                                       atomic, root_positions, plate_type_exprs, op_offset,
+                                       plate_eltype, output_axes, pointwise_lhs,
+                                       accumulator, cell_loop)
+    recipe = reduction.recipe
+    graph = inner.graph
+    arguments(cell) = Any[_authored_plate_scalar_ref(
+        inner, locals, callargs, callvalues, prepared_arguments, atomic,
+        input, cell, true) for input in recipe.inputs]
+    select(positions, cell) = arguments(cell)[collect(Int, positions)]
+    # Argument types for the compile-time check: a HAVE port's per-cell
+    # element (or atomic value) type, an invariant local's own type.
+    types = Any[haskey(root_positions, canon_id(graph, input.id)) ?
+                plate_type_exprs[canon_id(graph, input.id)] :
+                Expr(:call, GlobalRef(Base, :typeof), locals[canon_id(graph, input.id)])
+                for input in recipe.inputs]
+    ready = Expr(:call, GlobalRef(@__MODULE__, :_plate_reduction_ready),
+                 :($(Expr(:ref, _OPS_ARG, op_offset + reduction.recipe_index)).f),
+                 plate_eltype, Expr(:curly, GlobalRef(Core, :Tuple), types...))
+    if !_authored_plate_unconditional_group(
+            reduction.roots, root_positions, atomic, callvalues)
+        # The cell must run at every coordinate, as it does for a domain value
+        # that is a vector or tuple when called.
+        ready = Expr(:&&, _authored_plate_runtime_unconditional(
+            callargs, reduction.roots, root_positions, atomic), ready)
+    end
+
+    parts = gensym(:plate_reduction)
+    cells = gensym(:plate_cells)
+    count = gensym(:plate_count)
+    iterator = gensym(:plate_iterator)
+    source = gensym(:plate_source)
+    element = gensym(:plate_element)
+    index_of = gensym(:plate_index_of)
+    affine = gensym(:plate_affine)
+    first_index = gensym(:plate_first_index)
+    lo = gensym(:plate_lo)
+    hi = gensym(:plate_hi)
+    position = gensym(:plate_position)
+    cell = gensym(:plate_cell)
+    entry = :($pointwise_lhs[$cell])
+    step(f, extra...) = _inbounds_expr(:($entry = $parts.$f(
+        $entry, $element, $(extra...), $(arguments(cell)...))))
+    window(range, body) = Expr(:for, Expr(:(=), position, range),
+        Expr(:block, Expr(:(=), cell, _inbounds_value(:($cells[$position]))), body))
+    # The index function passed to the out-of-line check (`_PlateCellIndex`).
+    # Its per-cell arguments are the raw plate arguments, read at the cell:
+    # each must span the plate's axes (no singleton expansion), which also
+    # puts every cell in bounds.
+    index_arguments = Any[]
+    spanning = Any[]
+    for position in reduction.index
+        cid = canon_id(graph, recipe.inputs[position].id)
+        have_index = get(root_positions, cid, nothing)
+        if have_index === nothing
+            push!(index_arguments, Expr(:call,
+                GlobalRef(@__MODULE__, :_PlateSharedArgument), locals[cid]))
+        elseif have_index in atomic || valtype(callvalues[have_index]) <: Number
+            push!(index_arguments, Expr(:call,
+                GlobalRef(@__MODULE__, :_PlateSharedArgument), callargs[have_index]))
+        else
+            push!(index_arguments, Expr(:call,
+                GlobalRef(@__MODULE__, :_PlateCellArgument), raw_arguments[have_index]))
+            push!(spanning, raw_arguments[have_index])
+        end
+    end
+    isempty(spanning) || (ready = Expr(:&&, ready, Expr(:call,
+        GlobalRef(@__MODULE__, :_plate_spans), output_axes, spanning...)))
+    index_function = Expr(:call, GlobalRef(@__MODULE__, :_PlateCellIndex),
+        :($parts.index), element, Expr(:tuple, index_arguments...))
+    gathered = _inbounds_value(:($source[$first_index + ($position - 1)]))
+    passes = quote
+        $iterator = $parts.iterator($(select(reduction.iterator, nothing)...))
+        $source = $parts.array($(select(reduction.source, nothing)...))
+        for $cell in $cells
+            $(_inbounds_expr(:($entry = $parts.init($(select(reduction.init, cell)...)))))
+        end
+        for $element in $iterator
+            $index_of = $index_function
+            ($affine, $first_index) =
+                $(GlobalRef(@__MODULE__, :_plate_affine_index))($index_of, $cells)
+            if $affine
+                ($lo, $hi) = $(GlobalRef(@__MODULE__, :_plate_gather_window))(
+                    $source, $first_index, $count)
+                $(window(:(1:($lo - 1)), step(:step_out)))
+                $(window(:($lo:$hi), step(:step_in, gathered)))
+                $(window(:(($hi + 1):$count), step(:step_out)))
+            else
+                for $cell in $cells
+                    $(step(:step))
+                end
+            end
+        end
+    end
+    interchanged = quote
+        $parts = $(Expr(:ref, _OPS_ARG, op_offset + reduction.recipe_index)).f
+        $cells = $(GlobalRef(Base, :CartesianIndices))($output_axes)
+        $count = length($cells)
+        $count > 0 && $passes
+    end
+    if accumulator !== nothing
+        # The total adds the cells in coordinate order, as the cell loop does.
+        push!(interchanged.args, Expr(:for, Expr(:(=), cell, cells),
+            Expr(:block, :($accumulator += $(_inbounds_value(entry))))))
+    end
+    Expr(:if, ready, interchanged, cell_loop)
+end
+
 function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
                                        op::_AuthoredPlateOp, callargs, callvalues,
                                        pointwise_lhs, total_lhs)
@@ -1120,7 +1288,18 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         push!(body.args, :($previous = nothing))
         push!(body.args, :($first_coordinate = true))
     end
-    push!(body.args, Expr(:for, Expr(:(=), index, iteration), loopbody))
+    cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
+    reduction = _plate_reduction_plan(
+        inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
+        pointwise_lhs)
+    if reduction === nothing
+        push!(body.args, cell_loop)
+    else
+        push!(body.args, _lower_plate_reduction_native(
+            reduction, inner, locals, callargs, callvalues, raw_arguments,
+            prepared_arguments, atomic, root_positions, plate_type_exprs, op_offset, plate_eltype,
+            output_axes, pointwise_lhs, accumulator, cell_loop))
+    end
     # Fallback runtime narrowing of the pointwise container. `plate_eltype`
     # already types the buffer up front, so for an inferable body this is a
     # compile-time no-op (`_narrow_plate_output` dispatches on `eltype`); it only

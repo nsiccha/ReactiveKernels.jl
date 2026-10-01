@@ -448,6 +448,135 @@ _KernelBranch(::Val{CI}, ::Val{TI}, ::Val{EI}, call::F, condition::C,
     _KernelBranch{CI,TI,EI,F,C,T,E}(call, condition, then_arm, else_arm)
 @inline (branch::_KernelBranch)(args...) = branch.call(args...)
 
+"""
+    _KernelReduction{II,XI,KI,AI}(call, iterator, init, step, index, array,
+                                   step_in, step_out)
+
+A recipe whose authored right-hand side is a top-level unfiltered generator
+sum with `init` whose term reads one shared vector through Base's total
+gather, `sum(… get(A, K, D) … for j in iterator; init = x)`, keeps its parts
+as metadata beside its ordinary body. Calling it runs `call`, the authored
+expression over every recipe argument, so every lowering that treats the
+enclosing `_KernelSourceOp` as opaque is unchanged.
+
+The native plate lowering reads the parts (`_lower_authored_plate_native!`):
+when the iterator and `A` are plate invariants it runs the sum dose-outer —
+one pass over the cells per element `j`, each cell accumulating
+`Base.add_sum(acc, term)` in the authored order — and, when the gather index
+advances by exactly one per cell, splits each pass at the window where `K` is
+in range, reading `A` there without the bounds test and using `D` outside it.
+`iterator`/`init`/`array` are closures over their OWN ports, selected from
+the recipe's ordered arguments by the position tuples `II`/`XI`/`AI`;
+`index` takes `j` and the ports `KI`; the steps take the accumulator, `j`
+(and `step_in` the gathered value) followed by every recipe argument.
+"""
+struct _KernelReduction{II,XI,KI,AI,F,IT,IN,ST,IX,AR,SI,SO}
+    call::F
+    iterator::IT
+    init::IN
+    step::ST
+    index::IX
+    array::AR
+    step_in::SI
+    step_out::SO
+end
+_KernelReduction(::Val{II}, ::Val{XI}, ::Val{KI}, ::Val{AI}, call::F,
+                 iterator::IT, init::IN, step::ST, index::IX, array::AR,
+                 step_in::SI, step_out::SO) where
+        {II,XI,KI,AI,F,IT,IN,ST,IX,AR,SI,SO} =
+    _KernelReduction{II,XI,KI,AI,F,IT,IN,ST,IX,AR,SI,SO}(
+        call, iterator, init, step, index, array, step_in, step_out)
+# The authored body carries a loop, which Julia's inlining heuristic refuses;
+# inline it at this call site as `_kernel_source_call` inlines the wrapper.
+@inline (reduction::_KernelReduction)(args::Vararg{Any,N}) where {N} =
+    @inline reduction.call(args...)
+
+# Whether a plate's dose-outer lowering of `reduction` keeps the authored
+# semantics for these types: a concrete accumulator type `T` that the seed and
+# every step return unchanged, an `Int` gather index and a `Vector` gather
+# source. `S` is the tuple of the recipe's per-cell argument types. Everything
+# here is a type computation, folded when the plate body is compiled.
+@generated function _plate_reduction_ready(
+        reduction::_KernelReduction{II,XI,KI,AI}, ::Type{T},
+        ::Type{S}) where {II,XI,KI,AI,T,S<:Tuple}
+    types = Any[fieldtype(S, i) for i in 1:fieldcount(S)]
+    select(positions) = Any[types[i] for i in positions]
+    promote = GlobalRef(Base, :promote_op)
+    quote
+        isconcretetype($T) || return false
+        iterator_type = $promote(reduction.iterator, $(select(II)...))
+        element = eltype(iterator_type)
+        isconcretetype(element) || return false
+        $promote(reduction.init, $(select(XI)...)) === $T || return false
+        $promote(reduction.step, $T, element, $(types...)) === $T || return false
+        $promote(reduction.index, element, $(select(KI)...)) === Int || return false
+        source = $promote(reduction.array, $(select(AI)...))
+        source <: Vector || return false
+        $promote(reduction.step_in, $T, element, eltype(source), $(types...)) === $T ||
+            return false
+        $promote(reduction.step_out, $T, element, $(types...)) === $T
+    end
+end
+
+# The gather index of one dose-outer pass as a function of the cell: the
+# reduction's `index` part at the pass element over the cell's arguments, each
+# either read per cell from a plate argument whose axes are the plate's (so
+# every cell is in bounds, and a caller's `@inbounds` reaches the read, as in
+# Base's broadcast) or shared. A struct, not a closure: a closure in a
+# generated kernel body is an opaque closure over `Any` arguments, which
+# dispatches dynamically on every call.
+struct _PlateCellArgument{A}
+    values::A
+end
+struct _PlateSharedArgument{A}
+    value::A
+end
+Base.@propagate_inbounds _plate_argument(argument::_PlateCellArgument, cell) =
+    Base.Broadcast._broadcast_getindex(argument.values, cell)
+@inline _plate_argument(argument::_PlateSharedArgument, cell) = argument.value
+Base.@propagate_inbounds _plate_arguments(::Tuple{}, cell) = ()
+Base.@propagate_inbounds _plate_arguments(arguments::Tuple, cell) =
+    (_plate_argument(first(arguments), cell),
+     _plate_arguments(Base.tail(arguments), cell)...)
+struct _PlateCellIndex{F,J,A<:Tuple}
+    index::F
+    element::J
+    arguments::A
+end
+Base.@propagate_inbounds (index::_PlateCellIndex)(cell) =
+    index.index(index.element, _plate_arguments(index.arguments, cell)...)
+# Whether every per-cell argument of a gather index spans the plate's axes.
+@inline _plate_spans(output_axes) = true
+@inline _plate_spans(output_axes, values, rest...) =
+    axes(values) == output_axes && _plate_spans(output_axes, rest...)
+
+# The first gather index of a dose-outer pass and whether the index advances
+# by exactly one per cell in `cells` order. A pure index map that passes this
+# check reads one contiguous window of the source. `index` reads only cells of
+# `cells` (`_PlateCellIndex` over arguments spanning them). Kept out of line: compiled
+# alone, a shifted-lattice index (`t - shift`) folds the whole scan away, while
+# inlined into the pass nest it ran as a full extra pass.
+@noinline function _plate_affine_index(index, cells)
+    n = length(cells)
+    n == 0 && return (false, 0)
+    first_index = (@inbounds index(cells[1]))::Int
+    first_index > typemax(Int) - (n - 1) && return (false, first_index)
+    for position in 2:n
+        (@inbounds index(cells[position])) == first_index + (position - 1) ||
+            return (false, first_index)
+    end
+    (true, first_index)
+end
+
+# The cell positions whose gather index `first_index + position - 1` lies in
+# `source`'s range, as `lo:hi` within `1:n` (empty when none do).
+@inline function _plate_gather_window(source::AbstractVector, first_index::Int,
+                                      n::Int)
+    lo = clamp(widen(firstindex(source)) - first_index + 1, 1, n + 1)
+    hi = clamp(widen(lastindex(source)) - first_index + 1, lo - 1, n)
+    (Int(lo), Int(hi))
+end
+
 # Tensorized authored plates keep slice collections structural instead of
 # materializing Base.Slices.  A backend can consume the parent array as one
 # batched value, while the generic fallback preserves ordinary eachcol

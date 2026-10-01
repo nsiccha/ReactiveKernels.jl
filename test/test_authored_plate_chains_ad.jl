@@ -58,3 +58,58 @@ end
         @test ad_gradient(bound_ad, q) ≈ gradient
     end
 end
+
+# A gathered generator sum lowers dose-outer (`_KernelReduction`); plain
+# reverse Enzyme differentiates that loop nest. Its gradients equal those of
+# the same cell read through an alias of `get`, which keeps the cell loop.
+module DoseOuterAD
+using ReactiveKernels
+struct Lattice
+    shifts::Vector{Int}
+    nobs::Int
+end
+domain(plan::Lattice) = 1:plan.nobs
+lag(t, plan::Lattice, j) = t - plan.shifts[j]
+const fetch = Base.get
+@kernel cell(plan, units::Vector{Float64}, weights::Vector{Float64}) = begin
+    observations = domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, lag(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    end
+    objective::Float64 = sum(abs2, concentration)
+    return objective
+end
+@kernel control(plan, units::Vector{Float64}, weights::Vector{Float64}) = begin
+    observations = domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * fetch(u, lag(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    end
+    objective::Float64 = sum(abs2, concentration)
+    return objective
+end
+end
+
+@testset "Dose-outer gathered generator sum under plain reverse Enzyme" begin
+    D = DoseOuterAD
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    plan = D.Lattice([0, 40, 100, 300], 257)
+    units = collect(range(0.5, 2.0; length = 257))
+    weights = [3.0, 1.5, 0.25, 2.0]
+    kernel, control = prepare(D.cell), prepare(D.control)
+    @test count(op -> op isa ReactiveKernels._KernelSourceOp &&
+                      op.f isa ReactiveKernels._KernelReduction, kernel.ops) == 1
+    for active in (:units, :weights, (:units, :weights))
+        v, g = ad_value_and_gradient(prepare_ad(kernel, backend, plan, units, weights; active),
+                                     plan, units, weights)
+        v0, g0 = ad_value_and_gradient(prepare_ad(control, backend, plan, units, weights; active),
+                                       plan, units, weights)
+        @test v === v0
+        @test g == g0
+    end
+    # d/dweights of Σ c² with c = Σ_j w_j u[t - s_j] is 2 Σ_t c_t u[t - s_j].
+    c = [sum((w * get(units, t - s, 0.0) for (s, w) in zip(plan.shifts, weights)); init = 0.0)
+         for t in 1:plan.nobs]
+    _, g = ad_value_and_gradient(prepare_ad(kernel, backend, plan, units, weights;
+                                            active = :weights), plan, units, weights)
+    @test g ≈ [2 * sum(c[t] * get(units, t - s, 0.0) for t in 1:plan.nobs) for s in plan.shifts]
+end

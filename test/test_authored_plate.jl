@@ -1426,6 +1426,102 @@ _natural_sup_slots(s) = eachindex(s)
     @test _natural_sup_allocated(one_graph, exact, units, weights) == output_bytes
 end
 
+# Dose-outer lowering of a gathered generator sum (`_KernelReduction`). The
+# control reads through an alias of `get` that the lowering does not recognize,
+# so it keeps the observation-outer cell loop; every value must match it
+# bitwise, including the NaN an infinite weight makes outside the window.
+const _dose_outer_fetch = Base.get
+@kernel dose_outer_cell(plan, units, weights) = begin
+    observations = _natural_sup_domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, _natural_sup_lag(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    end
+    total = sum(concentration)
+    return concentration, total
+end
+@kernel dose_outer_control(plan, units, weights) = begin
+    observations = _natural_sup_domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * _dose_outer_fetch(u, _natural_sup_lag(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    end
+    total = sum(concentration)
+    return concentration, total
+end
+# An `Int` seed against `Float64` terms changes the accumulator type after the
+# first dose: the lowering keeps the cell loop.
+@kernel dose_outer_int_seed(plan, units, weights) = begin
+    observations = _natural_sup_domain(plan)
+    concentration = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, _natural_sup_lag(t, p, j), 0.0) for j in eachindex(w); init = 0)
+    end
+    return concentration
+end
+# A dose loop whose range reads the cell is not a plate invariant.
+@kernel dose_outer_cell_range(plan, units, weights) = begin
+    observations = _natural_sup_domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, _natural_sup_lag(t, p, j), 0.0) for j in 1:min(t, length(w)); init = 0.0)
+    end
+    return concentration
+end
+_dose_outer_reductions(kernel) = count(op -> op isa ReactiveKernels._KernelSourceOp &&
+                                             op.f isa ReactiveKernels._KernelReduction, kernel.ops)
+_dose_outer_same(a, b) = length(a) == length(b) && all(map(===, a, b))
+
+@testset "authored plate block: a gathered generator sum runs dose-outer, bitwise" begin
+    cell, control = prepare(dose_outer_cell), prepare(dose_outer_control)
+    @test _dose_outer_reductions(cell) == 1
+    @test _dose_outer_reductions(control) == 0
+    # The filtered sum skips the term (and its index): no dose-outer parts.
+    @test _dose_outer_reductions(prepare(natural_sup_filter)) == 0
+    nobs = 257
+    for (shifts, weights, nunits) in (
+            ([0, 40, 100], [3.0, 1.5, 0.25], nobs),
+            ([3, 3, 250], [0.75, -1.0, 2.0], nobs),
+            ([300, 0], [1.0, 2.0], nobs),               # a dose after the horizon
+            ([-5, 10], [1.0, 2.0], nobs),               # lags past the response
+            ([0, 40], [-0.0, Inf], nobs),               # NaN outside the window
+            ([0, 40, 100], [3.0, 1.5, 0.25], 50),       # a shorter response
+            ([0, 40], [1.0, 2.0], 0),                   # an empty response
+            (Int[], Float64[], nobs))
+        units = nunits == 0 ? Float64[] : collect(range(0.5, 2.0; length = nunits))
+        lattice = _NaturalSupLattice(shifts, nobs)
+        exact = _NaturalSupExact([max(t - s, 0) for t in 1:nobs, s in shifts])
+        for plan in (lattice, exact)
+            got, expected = cell(plan, units, weights), control(plan, units, weights)
+            @test _dose_outer_same(got[1], expected[1])
+            @test got[2] === expected[2]
+        end
+    end
+    # The authored values, for the plain cases.
+    units = collect(range(0.5, 2.0; length = nobs))
+    shifts, weights = [3, 3, 250], [0.75, -1.0, 2.0]
+    @test cell(_NaturalSupLattice(shifts, nobs), units, weights)[1] ==
+          [sum((t > s ? w * units[t - s] : 0.0 for (s, w) in zip(shifts, weights)); init = 0.0)
+           for t in 1:nobs]
+    # An empty plate.
+    @test cell(_NaturalSupLattice([0, 4], 0), units, [1.0, 2.0]) == (Float64[], 0.0)
+    # Not split, same values: a non-`Vector` response, an `Int` seed, a dose
+    # range that reads the cell.
+    lattice = _NaturalSupLattice([0, 40, 100], nobs)
+    weights = [3.0, 1.5, 0.25]
+    @test _dose_outer_same(cell(lattice, view(units, :), weights)[1],
+                           control(lattice, view(units, :), weights)[1])
+    int_seed = prepare(dose_outer_int_seed)
+    @test _dose_outer_reductions(int_seed) == 1
+    @test int_seed(lattice, units, weights) == control(lattice, units, weights)[1]
+    @test _dose_outer_reductions(prepare(dose_outer_cell_range)) == 1
+    @test prepare(dose_outer_cell_range)(lattice, units, weights) ==
+          [sum((w * get(units, t - s, 0.0) for (s, w) in
+                Iterators.take(zip(lattice.shifts, weights), min(t, 3))); init = 0.0)
+           for t in 1:nobs]
+    # The output is the only allocation, as for the cell loop.
+    _natural_sup_allocated(cell, lattice, units, weights)
+    _natural_sup_allocated(control, lattice, units, weights)
+    @test _natural_sup_allocated(cell, lattice, units, weights) ==
+          _natural_sup_allocated(control, lattice, units, weights)
+end
+
 @testset "tensorized companion: filtered sums and get keep their branches lazy" begin
     # The tensorized rewrite, evaluated on host values, is Base's own fold: the
     # filter is a branch on the accumulator and `get` stays `Base.get`. Over a
@@ -1449,8 +1545,10 @@ end
              (5, [0, 2, 4], [1.0, 0.5, 2.0], -0.0))
     for lowered in (looped, folded)
         companion = Core.eval(@__MODULE__, :((t, s, u, w, z) -> $lowered))
+        # The closure is defined in a newer world than this running testset;
+        # Julia 1.12 and later refuse the direct call (`MethodError`).
         for (t, s, w, z) in cases
-            @test companion(t, s, u, w, z) === native(t, s, u, w, z)
+            @test Base.invokelatest(companion, t, s, u, w, z) === native(t, s, u, w, z)
         end
     end
     # Only the `init` form is rewritten: without it Base seeds the sum with the
