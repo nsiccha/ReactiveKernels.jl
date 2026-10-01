@@ -2012,6 +2012,12 @@ _all_fields_spec() = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
     @test [f for f in fieldnames(LikelihoodSpec)
         if f !== :n_levels && getfield(r2, f) != getfield(r, f)] == Symbol[]
     @test_throws ArgumentError ReactiveKernelsPPL._with(r; n_level = 3)
+    # Plan-level copies keep every field they do not override.
+    good = _ordered_plan()
+    p2 = ReactiveKernelsPPL._with(good; n_obs = good.n_obs + 1)
+    @test p2.n_obs == good.n_obs + 1
+    @test all(getfield(p2, f) === getfield(good, f)
+        for f in fieldnames(StructuralPlan) if f !== :n_obs)
 end
 
 function _ordinal_plan(n = 9; link = LogitLink, structure = :cumulative,
