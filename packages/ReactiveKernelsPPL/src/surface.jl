@@ -5,9 +5,12 @@
 # statements, deterministic `=`, `model(; data...)` binding) under the
 # standing constraints: Distributions.jl constructors (never Stan lowercase),
 # immutable single-assignment top level, no control flow, no `target`,
-# `@plate` observations + deterministic cells (desugar; sampled cells
-# deferred), `@scan` reserved. Broadcasting is EXPLICIT (no implied
-# vectorization anywhere): vector math is dotted (`mu = a .+ b .* x` —
+# `@plate for i in R` cells that mean one iteration of that Julia loop
+# (observations, per-cell latents, per-cell submodels, cell locals; the
+# desugar evaluates every iteration at once), `@scan` sequential
+# recurrences. Broadcasting is EXPLICIT at top level (no implied
+# vectorization; a plate cell is scalar Julia, so its values need no dots):
+# vector math is dotted (`mu = a .+ b .* x` —
 # undotted scalar/vector `+` is a `MethodError` in Julia too), and vector
 # responses use the Turing dotted tilde (`y .~ Normal.(mu, sigma)`).
 # `=` binds values with Julia semantics; predictor locations inline
@@ -400,14 +403,25 @@ this entry point directly with ASTs.
 `mod` is the module against which `latent ~ sm(args...)` call heads are
 resolved to [`RKPPLSubmodel`](@ref)s; a resolving call is expanded inline
 before partitioning (see `_expand_submodels`), and a call inside a submodel
-body resolves against that submodel's defining module. Non-submodel call heads
-(distributions, unknown names) are untouched and screened as before, so the
-default `mod=Main` keeps every non-submodel model unchanged.
+body resolves against that submodel's defining module.
+
+Functions as values: an `=` definition may call any function visible in
+`mod` (a submodel body: in its own defining module). Call heads outside the
+built-in value vocabulary resolve to `GlobalRef`s at lowering, and an
+undefined one fails here naming it. An undotted call is a model-level value
+(no observation axis); a dotted call `f.(...)` is elementwise, observation
+aligned exactly when an argument is; `v[c]` with an observation index is a
+gather. A data-only definition calling such a function is evaluated once by
+[`bind_data`](@ref) and bound as data; any other runs in the generated
+kernel under generic AD (an RK-owned derivative rule, when the callee is
+one, is used by Enzyme). A parameter-dependent undotted call over an
+observation column fails closed: its result shape is unknown before
+sampling, so broadcast it or bind its data-only part first.
 
 Input ownership and concurrency: neither `ast` nor the submodel bodies
 reachable through `mod` is mutated, so one AST may be lowered repeatedly
-and shared across tasks. Submodel resolution only READS `mod` bindings
-(`isdefined` / `getfield` — no eval, no registration), so definitions in
+and shared across tasks. Submodel and function resolution only READ `mod`
+bindings (`isdefined` / `getfield` — no eval, no registration), so definitions in
 distinct private modules never collide: one fresh `Module` per lowering,
 each holding its own `@rkppl name(args...) = ...` defs, is sufficient for
 concurrent independent lowerings with no shared lock.
@@ -424,6 +438,24 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     sample, det, plate_ctx, plate_specs, scans, bases, vectors,
     hbases, kplates, kstmts, schedules, event_lps, r2d2decls, joints,
     varying_draws, varying_pending, glms = _partition_statements(ast, data)
+    # Functions as values: definition call heads outside the built-in
+    # vocabulary resolve in the model module (submodel bodies resolved in
+    # their own module during expansion). Names are gathered before the
+    # schedule-chain extraction so its cell names still shadow functions.
+    model_names = union(data, Set{Symbol}(nm for (nm, _) in det),
+        Set{Symbol}(s.lhs for s in sample),
+        Set{Symbol}(nm for (nm, _, _, _) in plate_specs),
+        Set{Symbol}(s.state for s in scans),
+        Set{Symbol}(p.contrib for p in varying_pending),
+        Set{Symbol}(p.draws_lhs for p in varying_pending),
+        Set{Symbol}(s.name for s in schedules),
+        Set{Symbol}(el.name for el in event_lps))
+    # A top-level schedule chain leaves `det`/`sample` for its grouped
+    # kernel cell (lowered late with the plate statements below).
+    sample, det, chain = _extract_kernel_cells(sample, det, data)
+    chain === nothing || push!(kstmts, (cell = chain,))
+    det = Pair{Symbol,Any}[nm => _resolve_module_calls(rhs, mod, model_names,
+        "definition `$nm = $(repr(rhs))`") for (nm, rhs) in det]
     # Varying bindings (draws + contributions): contributions compose
     # only as direct predictor summands, never inside definitions.
     varying_names = Set{Symbol}()
@@ -488,12 +520,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     array_decls = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
         (s.dims !== nothing ||
             (s.broadcast && s.matrix !== nothing && s.matrix ∉ hcat_defs) ||
-            (!s.broadcast &&
-                (_is_lkj_cholesky_call(s.rhs) || _is_dirichlet_call(s.rhs)))))
+            (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
     value_arrays = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
         (s.dims !== nothing ||
             (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
-    # Every array-capable declaration (sized `.~`, LKJ, Dirichlet): an
+    # Every array-capable declaration (sized `.~`, LKJ): an
     # expression that READS one (`L[2, 1] .* x`, `tau .* z[g]`) is a value,
     # never an affine sub-predictor over coefficients.
     sized_decls = union(array_decls, Set{Symbol}(s.lhs for s in sample
@@ -505,7 +536,14 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # scalar-array ops take dotted-canonical form; Julia-invalid vector
     # combinations fail here naming the definition). Everything downstream
     # sees canonical RHSs.
-    detshape = _def_shapes(det, data, detmap; arrays = array_decls)
+    # Model-level array values: upstream's simplexes plus this lane's
+    # declared array parameters (`z[1:K] .~`, `L ~ LKJCholesky`, ...).
+    shape_env = _ShapeEnv(
+        union(plate_names, Set{Symbol}(s.state for s in scans), varying_names),
+        union(dirichlet_names, array_decls))
+    detshape = _def_shapes(det, data, detmap; arrays = array_decls,
+        env = shape_env)
+    _check_module_calls(det, detmap, data, shape_env)
     canonmap = Dict{Symbol,Any}()
     for nm in _det_topo_order(det, detmap)
         rhs = detmap[nm]
@@ -609,8 +647,15 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # locations (see `used_locs` below).
     kernel_lp_predictors = Set{Symbol}()
     for ks in kstmts
-        kp = _lower_plate_stmt(ks.st, ks.line, data, ctx, predictors,
-            pred_idx, coefuse, schedules, event_lps)
+        kp = if haskey(ks, :cell)
+            c = ks.cell
+            _lower_grouped_cell(c.where, c.result, nothing, nothing,
+                c.assignments, c.obs_stmts, c.collected, data, ctx,
+                predictors, pred_idx, coefuse, schedules, event_lps)
+        else
+            _lower_plate_stmt(ks.st, ks.line, data, ctx, predictors,
+                pred_idx, coefuse, schedules, event_lps)
+        end
         for (p, _) in kp.lp_args
             push!(kernel_lp_predictors, p)
         end
@@ -681,18 +726,6 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         hsset, taken)
     params, paramsyms, dirichlets, arrays =
         _lower_parameters(sample, coefuse, ctx, glmuse)
-    # A simplex no response, monotonic term, mixture or R2D2 prior links
-    # is a plain value (`phi[1]`): an array parameter.
-    linked = _linked_simplex_names(responses, predictors, r2d2s)
-    free = Set{Symbol}(p.name for p in dirichlets
-        if p.family === :simplex_dirichlet && p.name ∉ linked)
-    for p in dirichlets
-        p.name in free || continue
-        push!(arrays, ArrayParameter(p.name, :dirichlet,
-            (arg1 = p.args.arg1,), Any[length(p.args.arg1)], nothing,
-            p.label))
-    end
-    filter!(p -> p.name ∉ free, dirichlets)
     append!(params, taus)
     append!(params, hsparams)
     plate_parameters = PlateParameter[
@@ -788,26 +821,6 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     return plan
 end
 
-# Simplex names a structural consumer links (a response's simplex
-# predictor or mixture weights, a monotonic term's increments, an R2D2
-# prior's shares) — every other `~ Dirichlet` is a plain value.
-function _linked_simplex_names(responses, predictors, r2d2s)
-    out = Set{Symbol}()
-    for r in responses
-        _is_simplex_family(r.family) && push!(out, r.predictor)
-        r.family === MixtureFam && r.mixture_weights isa Symbol &&
-            push!(out, r.mixture_weights)
-    end
-    for pred in predictors, t in pred.terms
-        (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) &&
-            push!(out, t.options.increments)
-    end
-    for rp in r2d2s
-        push!(out, rp.phi)
-    end
-    return out
-end
-
 # A per-cell latent declaration reuses the scalar-parameter distribution
 # parsing (family, args, HalfNormal/truncated → :positive) and rides the
 # plate's range.
@@ -830,45 +843,85 @@ end
 # Unknown call heads do not shape-route here (the vocabulary screen
 # rejects them first); their shape follows their arguments so the
 # downstream error names the function.
+# Shape context beyond data and definitions (functions as values):
+# `aligned` holds the non-data names that carry the observation axis
+# (per-cell latents, scan states, varying bindings); `values` the
+# model-level array parameters (Dirichlet simplexes) definitions may
+# compute with.
+struct _ShapeEnv
+    aligned::Set{Symbol}
+    values::Set{Symbol}
+end
+const _NO_SHAPE_ENV = _ShapeEnv(Set{Symbol}(), Set{Symbol}())
+
 function _def_shapes(det, data::Set{Symbol}, detmap;
-        arrays::Set{Symbol} = Set{Symbol}())
+        arrays::Set{Symbol} = Set{Symbol}(), env::_ShapeEnv = _NO_SHAPE_ENV)
     memo = Dict{Symbol,Symbol}(a => :array for a in arrays)
     for (nm, _) in det
-        memo[nm] = _shape_of(detmap[nm], data, detmap, memo, Set{Symbol}())
+        memo[nm] = _shape_of(detmap[nm], data, detmap, memo, Set{Symbol}(),
+            env)
     end
     return memo
 end
 
-function _shape_of(ex, data, detmap, memo, active::Set{Symbol})
-    ex isa Symbol || return _shape_of_expr(ex, data, detmap, memo, active)
+function _shape_of(ex, data, detmap, memo, active::Set{Symbol},
+        env::_ShapeEnv = _NO_SHAPE_ENV)
+    ex isa Symbol ||
+        return _shape_of_expr(ex, data, detmap, memo, active, env)
     ex in data && return :vector
     haskey(detmap, ex) || return get(memo, ex, :scalar)
     haskey(memo, ex) && return memo[ex]
     ex in active && return :scalar  # cyclic: errors downstream
     push!(active, ex)
-    sh = _shape_of(detmap[ex], data, detmap, memo, active)
+    sh = _shape_of(detmap[ex], data, detmap, memo, active, env)
     pop!(active)
     memo[ex] = sh
     return sh
 end
 
-function _shape_of_expr(ex, data, detmap, memo, active)
+function _shape_of_expr(ex, data, detmap, memo, active,
+        env::_ShapeEnv = _NO_SHAPE_ENV)
     ex isa LineNumberNode && return :scalar
     ex isa Expr || return :scalar
-    shape(a) = _shape_of(a, data, detmap, memo, active)
+    shape(a) = _shape_of(a, data, detmap, memo, active, env)
     head = ex.head
-    head === :. && return _dotted_shape(ex, shape)
-    head === :ref && return _ref_shape(ex, data, shape)
+    if head === :.
+        # Over a declared array value the elementwise array rules apply
+        # (`sd .* z` stays an array; `z .+ x` is a Julia length mismatch).
+        if _is_dotted_call(ex)
+            argsh = [shape(a) for a in ex.args[2].args]
+            (:array in argsh || :invalid in argsh) &&
+                return _elementwise_shape(argsh)
+        end
+        if _is_dotted_call(ex) && ex.args[1] isa GlobalRef
+            # A module function broadcast is elementwise over its
+            # arguments: observation-aligned exactly when one of them is.
+            return _obs_axis(ex, data, detmap, memo, active, env) ?
+                :vector : :scalar
+        end
+        return _broadcast_shape(ex, data, detmap, memo, active, env)
+    end
+    if head === :ref
+        base = ex.args[1]
+        base isa Symbol && shape(base) === :array &&
+            return _ref_shape(ex, data, shape)
+        _is_gather(ex, data, detmap, env) || return :scalar
+        return _obs_axis(ex, data, detmap, memo, active, env) ?
+            :vector : :scalar
+    end
     head === Symbol("'") && return shape(ex.args[1]) === :array ? :array :
         :scalar
     head === :call || return :scalar  # exotic heads: downstream rejects
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
-    fn isa Symbol || return :scalar  # anonymous calls: downstream rejects
+    fn isa Symbol || return :scalar  # module/anonymous calls: model-level
     fn in REDUCTION_FNS && return :scalar
-    fn in ELEMENTWISE_OPS && return _elementwise_shape(
-        [shape(a) for a in ex.args[2:end]])
     argshapes = [shape(a) for a in ex.args[2:end]]
+    if fn in ELEMENTWISE_OPS
+        (:array in argshapes || :invalid in argshapes) &&
+            return _elementwise_shape(argshapes)
+        return _broadcast_shape(ex, data, detmap, memo, active, env)
+    end
     return _shape_of_call(fn, argshapes)
 end
 
@@ -885,10 +938,6 @@ function _elementwise_shape(argshapes)
     return :vector
 end
 
-_dotted_shape(ex, shape) =
-    length(ex.args) == 2 && ex.args[2] isa Expr && ex.args[2].head === :tuple ?
-    _elementwise_shape([shape(a) for a in ex.args[2].args]) : :vector
-
 # Reads of an array (`z[g]` per observation, `phi[1]` scalar, `L[:, 1]`
 # array); every other ref keeps the slice-1 scalar shape (factor
 # coefficients `c[g]` classify by position, not shape).
@@ -904,6 +953,69 @@ function _ref_shape(ex, data, shape)
     end
     any(i -> i === :(:), idx) && return :array
     return :scalar
+end
+
+# Built-in broadcasts (dotted operators and math) shape `:vector`, except
+# over model-level arrays with no observation-aligned operand
+# (`zeta .* 2.0`, `sqrt.(phi .* s)`): standard Julia broadcasting of a
+# model-level value stays model-level.
+function _broadcast_shape(ex, data, detmap, memo, active, env)
+    _obs_axis(ex, data, detmap, memo, active, env) && return :vector
+    _model_valued(ex, detmap, env, Set{Symbol}()) && return :scalar
+    return :vector
+end
+
+# `A[i]` with one index over a value (data, a definition, a call result,
+# or a model-level array parameter) is a gather: it carries the
+# observation axis exactly when its index does. Indexing a levels
+# coefficient (`z[g]`) stays a factor reference.
+_is_gather(ex::Expr, data, detmap, env::_ShapeEnv) =
+    ex.head === :ref && length(ex.args) == 2 &&
+    (ex.args[1] isa Expr || ex.args[1] in data ||
+        haskey(detmap, ex.args[1]) || ex.args[1] in env.values)
+
+# Does `ex` carry the observation axis? Undotted module calls and
+# reductions take whole values and return model-level ones; a gather
+# follows its index.
+function _obs_axis(ex, data, detmap, memo, active, env)
+    if ex isa Symbol
+        ex in data && return true
+        ex in env.aligned && return true
+        haskey(detmap, ex) || return false
+        return _shape_of(ex, data, detmap, memo, active, env) in
+            (:vector, :matrix)
+    end
+    ex isa Expr || return false
+    if ex.head === :call && !isempty(ex.args)
+        fn = ex.args[1]
+        fn isa Symbol || return false
+        fn in REDUCTION_FNS && return false
+        return any(a -> _obs_axis(a, data, detmap, memo, active, env),
+            ex.args[2:end])
+    elseif _is_dotted_call(ex)
+        return any(a -> _obs_axis(a, data, detmap, memo, active, env),
+            ex.args[2].args)
+    elseif ex.head === :ref
+        _is_gather(ex, data, detmap, env) || return false
+        return _obs_axis(ex.args[2], data, detmap, memo, active, env)
+    end
+    return false
+end
+
+# Does `ex` compute with a model-level value beyond scalars — a module
+# call result or an array parameter, directly or through definitions?
+function _model_valued(ex, detmap, env, active::Set{Symbol})
+    ex isa GlobalRef && return true
+    if ex isa Symbol
+        ex in env.values && return true
+        (haskey(detmap, ex) && !(ex in active)) || return false
+        push!(active, ex)
+        r = _model_valued(detmap[ex], detmap, env, active)
+        pop!(active)
+        return r
+    end
+    ex isa Expr || return false
+    return any(a -> _model_valued(a, detmap, env, active), ex.args)
 end
 
 # Single rule table for undotted `:call` shapes over argument shapes.
@@ -1043,8 +1155,26 @@ function _canon_shape_expr(ex, data, detshape)
     ex isa Expr || return :scalar
     shape(a) = _canon_shape(a, data, detshape)
     head = ex.head
-    head === :. && return _dotted_shape(ex, shape)
-    head === :ref && return _ref_shape(ex, data, shape)
+    if head === :.
+        if _is_dotted_call(ex)
+            argsh = [shape(a) for a in ex.args[2].args]
+            (:array in argsh || :invalid in argsh) &&
+                return _elementwise_shape(argsh)
+        end
+        (_is_dotted_call(ex) && ex.args[1] isa GlobalRef) || return :vector
+        return any(a -> _canon_shape(a, data, detshape) in
+            (:vector, :matrix), ex.args[2].args) ? :vector : :scalar
+    end
+    if head === :ref
+        base = ex.args[1]
+        base isa Symbol && shape(base) === :array &&
+            return _ref_shape(ex, data, shape)
+        (length(ex.args) == 2 && (ex.args[1] isa Expr ||
+            ex.args[1] in data || haskey(detshape, ex.args[1]))) ||
+            return :scalar
+        return _canon_shape(ex.args[2], data, detshape) === :vector ?
+            :vector : :scalar
+    end
     head === Symbol("'") && return shape(ex.args[1]) === :array ? :array :
         :scalar
     head === :call || return :scalar
@@ -1243,6 +1373,13 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
                    "IR/contract growth")
         end
     elseif rhs.head === :.
+        if _is_dotted_call(rhs) && rhs.args[1] isa GlobalRef
+            # A module function broadcast: its arguments still screen.
+            for a in rhs.args[2].args
+                _reject_unknown_calls(where, a; composed_maps)
+            end
+            return nothing
+        end
         length(rhs.args) == 2 && rhs.args[1] isa Symbol &&
             rhs.args[2] isa Expr && rhs.args[2].head === :tuple ||
             return nothing  # malformed dotted: downstream rejects
@@ -1260,6 +1397,191 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
     end
     for a in rhs.args
         _reject_unknown_calls(where, a; composed_maps)
+    end
+    return nothing
+end
+
+# ── Functions as values ───────────────────────────────────────────────
+# An `=` definition may call any function visible in the model's module.
+# Call heads the built-in value vocabulary owns keep their built-in
+# meaning, and names with dedicated guidance keep that guidance (the
+# screen above still explains them). Every other head resolves to a
+# `GlobalRef` in the defining module — the model's, or a submodel's own —
+# checked to exist at lowering, read-only (`isdefined`/`getfield`, no
+# eval). A `GlobalRef` call is plain Julia over whole values: undotted it
+# yields a model-level value (no observation axis), dotted it broadcasts
+# elementwise. Data-only definitions that call one are evaluated once by
+# `bind_data`; the rest run in the generated kernel under generic AD.
+
+const _CONSTRUCT_VALUE_HEADS = (:spline, :hsgp, :mo, :mo1, :hcat, :dar)
+
+_builtin_value_head(fn::Symbol) =
+    fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS || fn in VECTOR_FNS ||
+    fn in REDUCTION_FNS || fn in _CONSTRUCT_VALUE_HEADS ||
+    fn in CELL_FNS || fn in SEGMENT_CELL_FNS ||
+    startswith(string(fn), ".") || fn === :treatment || fn === :ifelse ||
+    fn in _RESPONSE_ONLY_FNS || fn in _DIST_VALUE_FNS ||
+    fn in (:varying_effect, :varying_draws, :varying_slice)
+
+_builtin_dotted_head(f::Symbol) =
+    f === :ifelse || f in ELEMENTWISE_FNS || f in _COMPOSED_UNARY
+
+# A dotted built-in scalar function (`var.(cols)`, `tanh.(v)`) broadcasts
+# the vocabulary's own binding — the one undotted `var(x)` means.
+_vocabulary_ref(f::Symbol) = GlobalRef(PPLGeneratedModels, f)
+
+function _resolve_module_path(ex, mod::Module, where)
+    m = if ex isa Symbol
+        isdefined(mod, ex) ? getfield(mod, ex) : nothing
+    elseif ex isa Expr && ex.head === :. && length(ex.args) == 2 &&
+            ex.args[2] isa QuoteNode && ex.args[2].value isa Symbol
+        parent = _resolve_module_path(ex.args[1], mod, where)
+        s = ex.args[2].value
+        isdefined(parent, s) ? getfield(parent, s) : nothing
+    else
+        nothing
+    end
+    m isa Module || _sfail("$where qualifies a call with `$(repr(ex))`, " *
+                           "which is not a module visible in " *
+                           "`$(nameof(mod))`")
+    return m
+end
+
+function _module_binding(m::Module, s::Symbol, where, shown)
+    isdefined(m, s) || _sfail("$where calls `$shown`, which is not defined " *
+        "in module `$(nameof(m))` — define the function there (or import " *
+        "it) before lowering")
+    v = getfield(m, s)
+    v isa Module && _sfail("$where calls `$shown`, which is a module, not " *
+                           "a function")
+    v isa RKPPLSubmodel && _sfail("$where calls submodel `$shown` with " *
+        "`=` — a submodel binds with `~` (`x ~ $shown(...)`)")
+    return GlobalRef(m, s)
+end
+
+# Resolve a call head; built-in heads come back unchanged.
+function _resolve_call_head(fn, mod::Module, names::Set{Symbol}, where;
+        dotted::Bool = false)
+    fn isa GlobalRef && return fn
+    if fn isa Symbol
+        if dotted
+            _builtin_dotted_head(fn) && return fn
+            (fn in ASSIGNMENT_FNS && !(fn in ELEMENTWISE_OPS)) &&
+                return _vocabulary_ref(fn)
+        else
+            _builtin_value_head(fn) && return fn
+        end
+        fn in names && _sfail("$where calls `$fn`, which is a model value, " *
+                              "not a function")
+        return _module_binding(mod, fn, where, fn)
+    end
+    if fn isa Expr && fn.head === :. && length(fn.args) == 2 &&
+            fn.args[2] isa QuoteNode && fn.args[2].value isa Symbol
+        m = _resolve_module_path(fn.args[1], mod, where)
+        return _module_binding(m, fn.args[2].value, where, repr(fn))
+    end
+    return fn  # anonymous or exotic heads: the screen rejects them
+end
+
+# A bare function name passed to a module function (`map(abs2, v)`) is the
+# function value, as in Julia; model names shadow it.
+function _resolve_function_arg(a, mod::Module, names::Set{Symbol}, where)
+    if a isa Symbol
+        (a in names || !isdefined(mod, a)) && return a
+        getfield(mod, a) isa Function || return a
+        return GlobalRef(mod, a)
+    elseif a isa Expr && a.head === :kw && length(a.args) == 2
+        return Expr(:kw, a.args[1],
+            _resolve_function_arg(a.args[2], mod, names, where))
+    elseif a isa Expr && a.head === :parameters
+        return Expr(:parameters, Any[_resolve_function_arg(p, mod, names,
+            where) for p in a.args]...)
+    elseif a isa Expr && a.head === :. && length(a.args) == 2 &&
+            a.args[2] isa QuoteNode && a.args[2].value isa Symbol
+        m = _resolve_module_path(a.args[1], mod, where)
+        return _module_binding(m, a.args[2].value, where, repr(a))
+    end
+    return a
+end
+
+_is_dotted_call(ex) =
+    ex isa Expr && ex.head === :. && length(ex.args) == 2 &&
+    ex.args[2] isa Expr && ex.args[2].head === :tuple
+
+function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
+    ex isa Expr || return ex
+    ex.head === :quote && return ex
+    if ex.head === :call && !isempty(ex.args)
+        head = _resolve_call_head(ex.args[1], mod, names, where)
+        args = Any[_resolve_module_calls(a, mod, names, where)
+            for a in ex.args[2:end]]
+        if head isa GlobalRef
+            args = Any[_resolve_function_arg(a, mod, names, where)
+                for a in args]
+        end
+        return Expr(:call, head, args...)
+    elseif _is_dotted_call(ex)
+        head = _resolve_call_head(ex.args[1], mod, names, where;
+            dotted = true)
+        args = Any[_resolve_module_calls(a, mod, names, where)
+            for a in ex.args[2].args]
+        if head isa GlobalRef
+            args = Any[_resolve_function_arg(a, mod, names, where)
+                for a in args]
+        end
+        return Expr(:., head, Expr(:tuple, args...))
+    end
+    return Expr(ex.head, Any[_resolve_module_calls(a, mod, names, where)
+        for a in ex.args]...)
+end
+
+_contains_module_call(ex) =
+    ex isa GlobalRef ||
+    (ex isa Expr && any(_contains_module_call, ex.args))
+
+# Data-only: every value the expression reads is data or a data-only
+# definition (literals and function values aside).
+function _data_only(ex, data, detmap, active::Set{Symbol} = Set{Symbol}())
+    for s in _value_symbols(ex)
+        s in data && continue
+        (haskey(detmap, s) && !(s in active)) || return false
+        push!(active, s)
+        ok = _data_only(detmap[s], data, detmap, active)
+        pop!(active)
+        ok || return false
+    end
+    return true
+end
+
+# An undotted module call takes whole values, so over an observation
+# column its result shape is the function's business: known once its
+# data-only inputs are bound, but never guessed for a parameter-dependent
+# call. Such a call fails here with the honest spellings.
+function _check_module_calls(det, detmap, data, env::_ShapeEnv)
+    memo = Dict{Symbol,Symbol}()
+    for (nm, rhs) in det
+        _check_module_calls(nm, rhs, detmap, data, env, memo)
+    end
+    return nothing
+end
+
+function _check_module_calls(nm, ex, detmap, data, env, memo)
+    ex isa Expr || return nothing
+    if ex.head === :call && !isempty(ex.args) && ex.args[1] isa GlobalRef
+        for a in ex.args[2:end]
+            _obs_axis(a, data, detmap, memo, Set{Symbol}(), env) || continue
+            _data_only(ex, data, detmap) && break
+            f = ex.args[1].name
+            _sfail("definition `$nm = $(repr(ex))` calls `$f` on the " *
+                "observation-aligned value `$(repr(a))` together with " *
+                "parameters, so its result shape is unknown until " *
+                "sampling — broadcast it for an elementwise column " *
+                "(`$f.(...)`), or compute the data-only part in its own " *
+                "definition (evaluated once at bind)")
+        end
+    end
+    for a in ex.args
+        _check_module_calls(nm, a, detmap, data, env, memo)
     end
     return nothing
 end
@@ -2948,6 +3270,20 @@ function _lower_plate_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
     collected === nothing &&
         _sfail("$where cell must end with a collected result name (a " *
                "bare cell name)")
+    return _lower_grouped_cell(where, result, subjects, loopvar, assignments,
+        obs_stmts, collected, data, ctx, predictors, pred_idx, coefuse,
+        schedules, event_lps)
+end
+
+# The grouped cell core shared by the `@plate <result> for s in 1:N` form
+# and a top-level schedule chain (`_extract_kernel_cells`, `subjects ===
+# nothing`, no loop variable): assignments + `.~` observations + the
+# collected name → the grouped KernelPlate.
+function _lower_grouped_cell(where, result::Symbol, subjects,
+        loopvar::Union{Nothing,Symbol}, assignments::Vector{Pair{Symbol,Any}},
+        obs_stmts::Vector{Expr}, collected::Symbol, data::Set{Symbol}, ctx,
+        predictors, pred_idx, coefuse, schedules::Vector{PKScheduleSpec},
+        event_lps::Vector{LinearPKEventLPSpec})
     # Lexical discovery: `.~` LHSs are response data columns; free cell
     # names resolving to outer definitions are LP references (first
     # appearance order — deterministic). Assignment LHSs must not shadow
@@ -3074,6 +3410,106 @@ function _lower_plate_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
         for r in Iterators.flatten((resps, extras))]
     return KernelPlate(result, subjects, nothing, slices, assignments,
         obses, collected, result, lp_args, used)
+end
+
+# ── Top-level schedule chains ─────────────────────────────────────────
+# A schedule chain is written as ordinary top-level statements — the
+# per-subject cell call is a whole-column value (`reads =
+# linear_pk_read_locs(sched, log_Vc, ...)`: one read vector per subject,
+# concatenated in subject order), its schedule-map gather moves reads to
+# observation rows (`conc = reads[sched.obs_map]`), and the response
+# observes it like any column (`dv .~ Normal.(conc, sigma)`, or per index
+# in `@plate for i in eachindex(dv)`). The subject count is the
+# schedule's (derived from its subject column at bind): there is no plate
+# header, no loop variable and no dims key. Lowering gathers the chain
+# back into the grouped kernel the `@plate <result> for s in 1:N` form
+# builds (identical IR apart from `subjects === nothing`): definitions
+# that call a cell function, or read one that does, are the cell; outer
+# definitions they reference are the subject-level LPs; observations
+# reading the cell are its in-cell observations, named by the first
+# chain value the first observation reads.
+
+# True when `ex` calls a per-subject cell function anywhere.
+_has_cell_call(ex) = ex isa Expr && (
+    (ex.head === :call && !isempty(ex.args) && ex.args[1] isa Symbol &&
+        (ex.args[1] in CELL_FNS || ex.args[1] in SEGMENT_CELL_FNS)) ||
+    any(_has_cell_call, ex.args))
+
+function _extract_kernel_cells(sample::Vector, det::Vector{Pair{Symbol,Any}},
+        data::Set{Symbol})
+    seeds = Set{Symbol}(nm for (nm, rhs) in det if _has_cell_call(rhs))
+    isempty(seeds) && return sample, det, nothing
+    detmap = Dict{Symbol,Any}(det)
+    chain = copy(seeds)
+    grown = true
+    while grown
+        grown = false
+        for (nm, rhs) in det
+            nm in chain && continue
+            any(in(chain), _plate_value_names(rhs)) || continue
+            push!(chain, nm)
+            grown = true
+        end
+    end
+    where = "schedule chain ($(join(sort!(collect(seeds)), ", ")))"
+    obs = SampleStmt[]
+    rest = SampleStmt[]
+    for s in sample
+        s.lhs in chain && _sfail("$where: `$(s.lhs)` is a schedule-chain " *
+            "value and cannot be observed or sampled (observe the data " *
+            "column it predicts: `y .~ Normal.($(s.lhs), sigma)`)")
+        if !any(in(chain), _plate_value_names(s.rhs))
+            push!(rest, s)
+            continue
+        end
+        s.broadcast && s.lhs in data && s.levels === nothing &&
+            s.matrix === nothing || _sfail("$where: `$(s.lhs)` reads a " *
+            "schedule-chain value; only `.~` observations of data columns " *
+            "read one (`$(s.lhs) .~ Normal.(conc, sigma)`)")
+        s.range === nothing || _sfail("$where: `$(s.lhs)[...]` observes a " *
+            "literal range; a schedule chain observes whole columns " *
+            "(`@plate for i in eachindex($(s.lhs))` or `$(s.lhs) .~ ...`)")
+        push!(obs, s)
+    end
+    isempty(obs) && _sfail("$where feeds no observation (observe a data " *
+        "column with the chain's value: `y .~ Normal.(conc, sigma)`)")
+    taken = union(data, Set{Symbol}(first.(det)),
+        Set{Symbol}(s.lhs for s in sample))
+    assignments = Pair{Symbol,Any}[nm => detmap[nm]
+        for nm in _det_topo_order(det, detmap) if nm in chain]
+    chain_names = copy(chain)
+    obs_stmts = Expr[]
+    for s in obs
+        rhs = s.rhs
+        # In-cell observations take names or literals per family slot; a
+        # compound argument binds to a cell local `<response>_arg<k>`.
+        if rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
+                rhs.args[2] isa Expr && rhs.args[2].head === :tuple
+            args = Any[]
+            for (k, a) in enumerate(rhs.args[2].args)
+                if a isa Symbol || a isa Number && !(a isa Bool)
+                    push!(args, a)
+                    continue
+                end
+                nm = Symbol(s.lhs, :_arg, k)
+                nm in taken && _sfail("$where: `$(s.lhs)` argument $k " *
+                    "binds the cell local `$nm`, which is already a name " *
+                    "in the model (bind the argument to a name of your " *
+                    "own and pass that name)")
+                push!(taken, nm)
+                push!(chain_names, nm)
+                push!(assignments, nm => a)
+                push!(args, nm)
+            end
+            rhs = Expr(:., rhs.args[1], Expr(:tuple, args...))
+        end
+        push!(obs_stmts, Expr(:call, :.~, s.lhs, rhs))
+    end
+    first_reads = _plate_value_names(obs_stmts[1].args[3])
+    hit = findfirst(in(chain_names), first_reads)
+    collected = hit === nothing ? last(assignments).first : first_reads[hit]
+    return rest, Pair{Symbol,Any}[p for p in det if p.first ∉ chain],
+        (; where, result = collected, assignments, obs_stmts, collected)
 end
 
 # Value-position names of a plate-cell expression in first-appearance
@@ -3631,7 +4067,7 @@ end
 function _expand_plates(args, data::Set{Symbol})
     expanded = Any[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
-    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int}},Int}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
     line = 0
     for arg in args
         if arg isa LineNumberNode
@@ -3700,10 +4136,13 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     end
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
-    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int}},Int}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+    # Cell locals bound from a per-index value (they vary with the loop
+    # variable, so arithmetic over them vectorizes in the desugar).
+    pidx = Set{Symbol}()
     for c in cells
         push!(out, _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx,
-            params)...)
+            params, pidx)...)
     end
     return out, ctx, params
 end
@@ -3723,11 +4162,21 @@ function _plate_range_kind(R)
                   "`axes(v, 1)` — got $(repr(R))")
 end
 
-# One cell statement → spliced top-level statement(s). Observations
-# (`y[i] ~ OBJ`) become `y .~ OBJ.` (or `y[a:b] .~ OBJ.` under a literal
-# range); deterministic cells strip to top level (visible model-wide —
-# documented looseness: desugared locals leak like any top-level det).
-function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params)
+# One cell statement → spliced top-level statement(s). A cell means what
+# the same statement means in one iteration of a Julia `for` loop: every
+# value in it is a scalar (`x[i]`, a gather `v[g[i]]`, a model scalar, a
+# literal). The desugar is the lowering that evaluates all iterations at
+# once: per-index refs strip to whole columns and every call or operator
+# over a per-index operand takes its broadcast form (`a + b * x[i]` →
+# `a .+ b .* x`) — Julia's own equivalence between applying a scalar
+# function per element and broadcasting it. Already-dotted spellings are
+# kept as written (broadcasting over scalars returns the scalar). So
+# observations (`y[i] ~ OBJ`) become `y .~ OBJ.` (or `y[a:b] .~ OBJ.`
+# under a literal range), and deterministic cells strip to top level
+# (visible model-wide — documented looseness: desugared locals leak like
+# any top-level det).
+function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params,
+        pidx::Set{Symbol})
     c isa Expr || _sfail("cells hold `~` observations and `=` " *
                          "assignments only")
     if c.head === :macrocall && !isempty(c.args) &&
@@ -3741,7 +4190,7 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params)
     end
     if _is_sample(c)
         return _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs,
-            ctx, params)
+            ctx, params, pidx)
     end
     if c.head === :(=) && length(c.args) == 2
         # A deterministic cell binds a bare local (`t = expr`) or an i-indexed
@@ -3760,10 +4209,12 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params)
         end
         col in data && _sfail("cell assignment `$col = ...` redefines " *
                               "bound data")
-        bares = _cell_bares(c.args[2], ivar)
+        bares = _cell_bares(c.args[2], ivar, data)
         setdiff!(bares, plate_defs)
         push!(ctx, (col, line, bares))
-        return [Expr(:(=), col, _strip_cell(c.args[2], ivar))]
+        rhs, per = _dotify_cell(c.args[2], ivar, pidx, false)
+        per && push!(pidx, col)
+        return [Expr(:(=), col, rhs)]
     end
     return _sfail("cells hold `~` observations and `=` assignments only")
 end
@@ -3771,10 +4222,12 @@ end
 # A cell `~` statement is EITHER a per-cell latent parameter declaration
 # (`theta[i] ~ Normal(mu, tau)` — a non-data indexed LHS, scalar undotted
 # distribution, shared-scalar args) or an observation on a sliced data column
-# (`y[i] ~ Normal.(mu[i], s)` — dotted object). Returns the spliced top-level
-# statement(s); a per-cell parameter records its spec in `params` and emits no
-# top-level statement.
-function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx, params)
+# (`y[i] ~ Normal(mu[i], s)` — one scalar draw per index, as in a Julia loop;
+# the broadcast spelling `Normal.(mu[i], s)` means the same and is kept).
+# Returns the spliced top-level statement(s); a per-cell parameter records its
+# spec in `params` and emits no top-level statement.
+function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
+        params, pidx::Set{Symbol})
     lhs = c.args[2]
     lhs isa Symbol && _sfail("bare per-cell sample `$lhs ~ ...` does not " *
                              "lower — index the latent (`$lhs[$ivar] ~ ...`) " *
@@ -3794,23 +4247,24 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx, param
             "per-cell latent `$col[$ivar] ~ ...` takes a scalar (undotted) " *
             "distribution (`$col[$ivar] ~ Normal(mu, tau)` / " *
             "`$col[$ivar] ~ Normal(eta[$ivar], tau)`), got the dotted $(repr(obj))")
-        bares = _cell_bares(obj, ivar)
+        bares = _cell_bares(obj, ivar, data)
         setdiff!(bares, plate_defs)
         push!(ctx, (col, line, bares))
-        push!(params, (col, _strip_cell(obj, ivar), _plate_param_range(col, rkind),
-            line))
+        push!(params, (col, _strip_cell(obj, ivar),
+            _plate_param_range(col, rkind, data), line))
         return Expr[]
     end
-    bares = _cell_bares(obj, ivar)
+    bares = _cell_bares(obj, ivar, data)
     setdiff!(bares, plate_defs)
     push!(ctx, (col, line, bares))
-    # Observation cells mirror top-level spelling exactly (dots as written —
-    # the desugar strips refs, never invents dots): the object must already
-    # be dotted, pairing scalar `~` (the cell) with a pre-dotted object.
-    obj isa Expr && obj.head === :. || _sfail(
-        "cell objects are dotted distribution calls " *
-        "(`y[$ivar] ~ Normal.(mu[$ivar], s)`), got $(repr(obj))")
-    obj = _strip_cell(obj, ivar)
+    obj isa Expr && (obj.head === :call || obj.head === :.) || _sfail(
+        "cell objects are distribution calls " *
+        "(`y[$ivar] ~ Normal(mu[$ivar], s)`), got $(repr(obj))")
+    # One draw per index: the broadcast form of the object is the
+    # vectorized observation (the distribution call and its wrappers take
+    # their dotted form even over scalar-only arguments — `y[i] ~ Normal(0,
+    # 1)` observes every row).
+    obj, _ = _dotify_cell(obj, ivar, pidx, true)
     if rkind[1] === :coloncall
         # Literal ranges validate through the slice-A `y[a:b]` path
         # (start-1, literal endpoints, bind-time cover check).
@@ -3824,9 +4278,13 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx, param
 end
 
 # The per-cell latent's size follows the plate range: a literal `1:N` rides as
-# a UnitRange (validated to cover 1:n_obs at bind), eachindex/axes ⇒ n_obs.
-_plate_param_range(name::Symbol, rkind) =
-    rkind[1] === :coloncall ? _lower_lhs_range(name, rkind[2]) : nothing
+# a UnitRange (validated to cover 1:n_obs at bind); `eachindex(v)` / `axes(v,
+# 1)` over a data column ride as the column `v` (one cell per entry, proved
+# at bind); over a definition (an observation-aligned column) ⇒ n_obs.
+function _plate_param_range(name::Symbol, rkind, data::Set{Symbol})
+    rkind[1] === :coloncall && return _lower_lhs_range(name, rkind[2])
+    return rkind[2] in data ? rkind[2] : nothing
+end
 
 function _cell_lhs_error(lhs, ivar)
     lhs isa Expr && lhs.head === :ref || return _sfail(
@@ -3835,67 +4293,150 @@ function _cell_lhs_error(lhs, ivar)
         "one-dimensional cell refs only (`v[$ivar]`)")
     lhs.args[1] isa Symbol || return _sfail(
         "cell refs index a bare column (`v[$ivar]`)")
-    idx = lhs.args[2]
-    idx isa Expr && idx.head === :ref && return _sfail(
-        "factor indexing inside plates is not in slice B")
-    return _sfail("cell reads index the loop variable exactly " *
-                  "(`v[$ivar]`) — got $(repr(lhs)) (cross-index reads " *
-                  "need `@scan`, reserved)")
+    return _sfail("cell reads index the loop variable (`v[$ivar]`) or " *
+                  "gather through an index column (`v[g[$ivar]]`) — got " *
+                  "$(repr(lhs)) (cross-index reads need `@scan`)")
+end
+
+# `v[g[i]]`: a gather through the data index column `g` (Julia indexing —
+# row `i` reads entry `g[i]` of `v`). Returns `g`, or `nothing` when `ex`
+# is not that shape.
+function _cell_gather_index(ex::Expr, ivar)
+    length(ex.args) == 2 && ex.args[1] isa Symbol || return nothing
+    idx = ex.args[2]
+    idx isa Expr && idx.head === :ref && length(idx.args) == 2 &&
+        idx.args[1] isa Symbol && idx.args[2] === ivar || return nothing
+    return idx.args[1]
 end
 
 # Value-position symbols of a cell expression, validating the loop-variable
-# discipline on the way: refs are exactly `v[i]`, and `i` appears only as
-# an index. Function heads and kw names are positions, not refs.
-function _cell_bares(ex, ivar)
+# discipline on the way: refs are exactly `v[i]` or a gather `v[g[i]]`
+# through a data index column `g`, and `i` appears only as an index.
+# Function heads and kw names are positions, not refs.
+function _cell_bares(ex, ivar, data::Set{Symbol})
     bares = Set{Symbol}()
-    _cell_bares!(ex, ivar, bares)
+    _cell_bares!(ex, ivar, bares, data)
     return bares
 end
 
-function _cell_bares!(ex::Symbol, ivar, bares)
+function _cell_bares!(ex::Symbol, ivar, bares, data)
     ex === ivar && _sfail("loop variable `$ivar` appears only as an " *
                           "index (`v[$ivar]`)")
     push!(bares, ex)
     return nothing
 end
-_cell_bares!(ex, ivar, bares) = nothing
-function _cell_bares!(ex::Expr, ivar, bares)
+_cell_bares!(ex, ivar, bares, data) = nothing
+function _cell_bares!(ex::Expr, ivar, bares, data)
     if ex.head === :ref
-        (length(ex.args) == 2 && ex.args[1] isa Symbol &&
-            ex.args[2] === ivar) || _cell_lhs_error(ex, ivar)
+        length(ex.args) == 2 && ex.args[1] isa Symbol &&
+            ex.args[2] === ivar && return nothing
+        g = _cell_gather_index(ex, ivar)
+        g === nothing && _cell_lhs_error(ex, ivar)
+        g in data || _sfail("cell gather `$(repr(ex))` indexes through " *
+                            "`$g`, which is not bound data (index columns " *
+                            "are integer data columns)")
         return nothing
     end
     if ex.head === :call
         for a in ex.args[2:end]
-            _cell_bares!(a, ivar, bares)
+            _cell_bares!(a, ivar, bares, data)
         end
         return nothing
     end
     if ex.head === :.
         start = length(ex.args) >= 1 && ex.args[1] isa Symbol ? 2 : 1
         for a in ex.args[start:end]
-            _cell_bares!(a, ivar, bares)
+            _cell_bares!(a, ivar, bares, data)
         end
         return nothing
     end
     if ex.head === :kw
         for a in ex.args[2:end]
-            _cell_bares!(a, ivar, bares)
+            _cell_bares!(a, ivar, bares, data)
         end
         return nothing
     end
     for a in ex.args
-        _cell_bares!(a, ivar, bares)
+        _cell_bares!(a, ivar, bares, data)
     end
     return nothing
 end
 
-# Strip exact `v[i]` refs to whole columns (validation ran first).
+# Strip per-index refs to whole values (validation ran first): `v[i]` →
+# `v`, a gather `v[g[i]]` → `v[g]`.
 _strip_cell(ex, ivar) = ex
 _strip_cell(s::Symbol, ivar) = s
 function _strip_cell(ex::Expr, ivar)
-    ex.head === :ref && return ex.args[1]
+    if ex.head === :ref
+        g = _cell_gather_index(ex, ivar)
+        return g === nothing ? ex.args[1] : Expr(:ref, ex.args[1], g)
+    end
     return Expr(ex.head, (_strip_cell(a, ivar) for a in ex.args)...)
+end
+
+# Wrappers and constructors an observation object broadcasts even over
+# scalar-only arguments (one draw per index): distribution constructors
+# (capitalized) and the response wrappers.
+const _CELL_OBJECT_WRAPPERS = (:truncated, :censored, :interval_censored,
+    :weighted)
+_cell_object_call(f::Symbol) =
+    isuppercase(first(string(f))) || f in _CELL_OBJECT_WRAPPERS
+_cell_object_call(f) = false
+
+# Strip a validated cell expression to whole values and take the broadcast
+# form of every call and operator over a per-index operand (`v[i]`, a
+# gather, or a cell local in `pidx` bound from one). Returns `(expr,
+# per_index)`. Already-dotted calls and operators keep their spelling;
+# operators over scalar-only operands stay undotted (they are scalars in
+# every iteration). `object = true` also dots distribution constructors
+# and response wrappers (`_cell_object_call`) so an observation draws once
+# per index.
+_dotify_cell(ex, ivar, pidx, object::Bool) = (ex, false)
+_dotify_cell(ex::Symbol, ivar, pidx, object::Bool) = (ex, ex in pidx)
+function _dotify_cell(ex::Expr, ivar, pidx, object::Bool)
+    ex.head === :ref && return (_strip_cell(ex, ivar), true)
+    if ex.head === :call && !isempty(ex.args)
+        f = ex.args[1]
+        args = Any[]
+        per = false
+        for a in ex.args[2:end]
+            if a isa Expr && (a.head === :parameters || a.head === :kw)
+                push!(args, _strip_cell(a, ivar))
+                continue
+            end
+            da, pa = _dotify_cell(a, ivar, pidx, object)
+            push!(args, da)
+            per |= pa
+        end
+        f isa Symbol || return (Expr(:call, f, args...), per)
+        dotted = startswith(string(f), ".")
+        (dotted || !(per || object && _cell_object_call(f))) &&
+            return (Expr(:call, f, args...), per)
+        Base.isoperator(f) &&
+            return (Expr(:call, Symbol(".", f), args...), true)
+        kws = filter(a -> a isa Expr && a.head === :parameters, args)
+        pos = filter(a -> !(a isa Expr && a.head === :parameters), args)
+        return (Expr(:., f, Expr(:tuple, kws..., pos...)), true)
+    end
+    if ex.head === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
+            ex.args[2].head === :tuple
+        args = Any[]
+        per = false
+        for a in ex.args[2].args
+            da, pa = _dotify_cell(a, ivar, pidx, object)
+            push!(args, da)
+            per |= pa
+        end
+        return (Expr(:., ex.args[1], Expr(:tuple, args...)), per)
+    end
+    out = Any[]
+    per = false
+    for a in ex.args
+        da, pa = _dotify_cell(a, ivar, pidx, object)
+        push!(out, da)
+        per |= pa
+    end
+    return (Expr(ex.head, out...), per)
 end
 
 # Post-analysis whole-vector check: bare cell symbols denoting vectors
@@ -4949,11 +5490,29 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
         callargs, data, _NsRoot(lhs, nothing), keep)
     _check_submodel_hygiene!(sm, "$lhs ~ $(sm.name)(...)", fresh, callargs,
         freebody, used)
-    out = Any[_hsubst(st, submap, idmap) for st in stmts]
+    # Body definitions call functions visible in the submodel's OWN module
+    # (functions as values); resolution precedes substitution (`GlobalRef`
+    # heads and function values pass `_hsubst` intact).
+    bodynames = Set{Symbol}(k for k in keys(submap) if k isa Symbol)
+    union!(bodynames, sm.argnames)
+    out = Any[_hsubst(_resolve_submodel_stmt(st, sm, bodynames), submap, idmap)
+        for st in stmts]
     # Latent: bind the LHS to the return value. Stream: the response IS the
     # binding (the data LHS is already bound), so no trailing assignment.
-    stream || push!(out, Expr(:(=), lhs, _hsubst(ret, submap, idmap)))
+    stream || push!(out, Expr(:(=), lhs, _hsubst(_resolve_module_calls(ret,
+        sm.mod, bodynames, "submodel `$(sm.name)` return `$(repr(ret))`"),
+        submap, idmap)))
     return sm, out
+end
+
+function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol})
+    (st isa Expr && st.head === :(=) && length(st.args) == 2 &&
+        st.args[1] isa Symbol) || return st
+    rhs = st.args[2]
+    (_is_schedule_decl_rhs(rhs) || _is_event_lp_decl_rhs(rhs) ||
+        _is_levels_binding_rhs(rhs)) && return st
+    return Expr(:(=), st.args[1], _resolve_module_calls(rhs, sm.mod, names,
+        "submodel `$(sm.name)` definition `$(st.args[1]) = $(repr(rhs))`"))
 end
 
 # ── Per-cell submodel promotion inside `@plate` ──────────────────────────
@@ -5143,6 +5702,9 @@ end
 function _value_symbols!(out::Set{Symbol}, ex)
     ex isa Symbol && return push!(out, ex)
     ex isa Expr || return nothing
+    # A keyword argument's name is not a value (`f(x; k = 4)`).
+    ex.head === :kw && length(ex.args) == 2 &&
+        return _value_symbols!(out, ex.args[2])
     if ex.head === :call && !isempty(ex.args)
         for a in ex.args[2:end]
             _value_symbols!(out, a)
@@ -7789,6 +8351,16 @@ function _classify_summand(pname, core, sign::Int, ctx)
         _matmul_composition_error(pname, core, ctx)
     end
     head = core.head
+    if head === :ref && length(core.args) == 2 &&
+            (core.args[1] isa Expr || core.args[1] in ctx.data ||
+                haskey(ctx.detmap, core.args[1]) ||
+                core.args[1] in ctx.dirichlet_names) &&
+            _canon_shape(core.args[2], ctx.data, ctx.detshape) === :vector
+        # A gather of a value (`cum[c]`) is an observation column, exactly
+        # as its named form `m = cum[c]`; a levels coefficient indexed by
+        # its group (`c[g]`) stays a factor below.
+        return _extract_summand(pname, core, sign, ctx)
+    end
     head === :ref && return _classify_ref(pname, core, sign, ctx)
     if head === :call && !isempty(core.args) && core.args[1] === :.*
         return _classify_product(pname, core, sign, ctx)

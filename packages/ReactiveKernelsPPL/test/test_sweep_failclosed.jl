@@ -45,14 +45,9 @@ using Test
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu2, s)], wcol)
             end), (:y, :wcol), ContractValidationError),
-        # kronecker_gp: Kronecker-eigenspace marginal likelihood needs
-        # spectral calls outside the slice-1 value vocabulary.
-        ("kronecker_gp", "eigen call in assignments",
-            :(begin
-                a ~ Normal(0, 1)
-                E = eigen(K)
-                y .~ Normal.(a, 1.0)
-            end), (:y, :K), SurfaceLoweringError),
+        # (The kronecker_gp `E = eigen(K)` case was removed: functions as
+        # values admit any function visible in the model module from `=`,
+        # a data-only call evaluated once at bind — test_functions_as_values.jl.)
         # bym2_offset_only: ICAR pairwise-difference prior needs
         # sampled-vector gathers plus a custom edge reduction.
         ("bym2_offset_only", "sampled-vector gather",
@@ -87,20 +82,10 @@ using Test
                 Rt = conv(prev, wgt)
                 y .~ Normal.(a, 1.0)
             end), (:y, :prev, :wgt), SurfaceLoweringError),
-        # Indexed cumulative-simplex slope: no cumsum admission.
-        ("cumsum-slope", "cumsum call",
-            :(begin
-                w ~ Dirichlet([1.0, 1.0, 1.0])
-                cs = cumsum(w)
-                y .~ Normal.(a, 1.0)
-            end), (:y,), SurfaceLoweringError),
-        # Data-indexed gather of a slope vector.
-        ("gather-slope", "index gather",
-            :(begin
-                a ~ Normal(0, 1)
-                mu = cs[gidx]
-                y .~ Normal.(mu, 1.0)
-            end), (:y, :cs, :gidx), SurfaceLoweringError),
+        # (The cumulative-simplex `cumsum(w)` and data-indexed gather
+        # `cs[gidx]` cases were removed: functions as values admit both —
+        # `cumsum(vcat(0.0, zeta))[c]` is pinned against Distributions in
+        # test_functions_as_values.jl and corpus 97.)
         # state_space_stochastic: latent random-walk prior over a sampled
         # vector (vectorized reductions over free states); ranges cover
         # eachindex exactly, never a 2:T window.

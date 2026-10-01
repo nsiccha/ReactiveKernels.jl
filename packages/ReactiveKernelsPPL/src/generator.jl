@@ -109,6 +109,7 @@ _data_arg(name::Symbol, col::AbstractVector) =
     Expr(:(::), name, Vector{eltype(col)})
 _data_arg(name::Symbol, col::AbstractMatrix) =
     Expr(:(::), name, Matrix{eltype(col)})
+_data_arg(name::Symbol, v::Number) = Expr(:(::), name, typeof(v))
 
 # Dedicated eval scope for generated models. The `using` lines resolve via
 # this package's own Project (by file location), so generated code loads in
@@ -200,9 +201,13 @@ function _assignment_statements(plan::StructuralPlan;
     for d in plan.derived
         by_name[d.name] = d
     end
+    # Data definitions calling module functions were evaluated once at
+    # bind and arrive as data arguments; the kernel never recomputes them.
+    computed = _bound_module_data_names(plan)
     return Expr[:($(name) =
             $(_array_gather_rewrite(by_name[name].expr, plan, gathers)))
-        for name in topological_order(plan) if haskey(by_name, name)]
+        for name in topological_order(plan)
+        if haskey(by_name, name) && name ∉ computed]
 end
 
 _lp_name(pred::PredictorSpec) = Symbol(:_ppl_lp_, pred.name)

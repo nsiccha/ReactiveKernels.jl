@@ -31,7 +31,10 @@ data, Stan `matrix[N,K]`). Matrices bind and validate beside vectors;
 every per-observation role (response, term, weights, trials, scales,
 bounds, grouping, axes, slices) reads vectors only — those readers fetch
 through [`_vector_column`](@ref) and fail closed on a matrix."""
-const ColumnData = Union{AbstractVector,AbstractMatrix}
+const ColumnData = Union{AbstractVector,AbstractMatrix,Number}
+# (`Number`: a model-level data value a data-only definition computes at
+# bind — functions as values. Caller-supplied columns stay vectors and
+# matrices; `_checked_columns` refuses anything else.)
 
 # Row count of a bound column: length for vectors, row count for matrices.
 _column_nrows(col::AbstractVector) = length(col)
@@ -42,7 +45,7 @@ and matrices only — anything else fails closed here, not in a converter)."""
 function _checked_columns(columns::AbstractDict{Symbol})
     out = Dict{Symbol,ColumnData}()
     for (k, v) in columns
-        v isa ColumnData ||
+        v isa Union{AbstractVector,AbstractMatrix} ||
             _fail(:plan, "column $k must be a vector or matrix, got $(summary(v))")
         out[k] = v
     end
@@ -628,9 +631,12 @@ plate cell, packed as one contiguous block. `family`/`args`/`support_override`
 follow [`SampledParameter`](@ref) exactly (POSITIONAL `(arg1, …)` keys,
 Distributions.jl semantics), except the args are SHARED across cells — literals
 or scalar parameter/assignment names (per-cell vector args are a later
-increment). `range` is `nothing` (size = `n_obs`, the `eachindex`/`axes` /
-bare-plate case) or a literal `UnitRange{Int}` that must cover `1:n_obs` exactly
-(the `1:N` case), mirroring [`LikelihoodSpec`](@ref)'s response range. A
+increment). `range` is the plate's index set: the `Symbol` of the column `v`
+of an `eachindex(v)` / `axes(v, 1)` plate (one cell per entry of `v`; bind
+proves `length(v) == n_obs` — latents over another axis do not lower yet), a
+literal `UnitRange{Int}` that must cover `1:n_obs` exactly (the `1:N` case),
+mirroring [`LikelihoodSpec`](@ref)'s response range, or `nothing` (size =
+`n_obs`, hand-built plans). A
 real-support prior (`normal`/`cauchy`/half-versions) lays out identity (an
 unconstrained block); positive/unit support constrains per element.
 """
@@ -639,7 +645,7 @@ struct PlateParameter
     family::Symbol
     args::NamedTuple
     support_override::SupportOverride
-    range::Union{Nothing,UnitRange{Int}}
+    range::Union{Nothing,UnitRange{Int},Symbol}
     label::Symbol
 end
 """Provenance/range default to a whole-column (n_obs) plate under the name."""
@@ -647,7 +653,8 @@ PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
     support_override::SupportOverride) =
     PlateParameter(name, family, args, support_override, nothing, name)
 PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
-    support_override::SupportOverride, range::Union{Nothing,UnitRange{Int}}) =
+    support_override::SupportOverride,
+    range::Union{Nothing,UnitRange{Int},Symbol}) =
     PlateParameter(name, family, args, support_override, range, name)
 
 """
@@ -867,8 +874,8 @@ VectorParameter(name::ParamName, family::Symbol, args::NamedTuple,
     ArrayParameter(name, family, args, dims, support_override, label)
 
 One declared array-valued parameter: a plain value the model reads by
-name (`z`, `z[g]`, `phi[1]`, `B * w`, `L[2, 1]`), never a hidden
-coefficient block. Three kinds of family:
+name (`z`, `z[g]`, `z[1]`, `B * w`, `L[2, 1]`), never a hidden
+coefficient block. Two kinds of family:
 
 - An elementwise family (any [`SAMPLED_ARITY`](@ref) key): the
   surface `z[1:K] .~ Normal.(mu, s)` — independent draws per element,
@@ -883,10 +890,10 @@ coefficient block. Three kinds of family:
   Cholesky factor of a K×K correlation matrix (Distributions.jl
   `LKJCholesky(K, eta)` density, `uplo = 'L'`). `args = (arg1 = eta,)`, a
   finite positive literal; `dims` is `[K, K]`.
-- `:dirichlet` — `phi ~ Dirichlet(alpha)` read as a value: a K-simplex.
-  `args = (arg1 = alpha,)`, a literal concentration vector; `dims` is
-  `[K]`. (A simplex consumed by a response, a monotonic term, a mixture or
-  an R2D2 prior stays a linked [`VectorParameter`](@ref).)
+
+A `phi ~ Dirichlet(alpha)` simplex is not an array parameter: it stays a
+[`VectorParameter`](@ref), which definitions already read as a model-level
+value (`phi[1]`, `cumsum(phi)`, a gather `cum[c]`).
 
 `dims` holds one entry per array axis, each either a literal `Int` (from
 `1:K`) or the surface sizing expression, resolved against bound data:
@@ -1334,14 +1341,17 @@ obs axis; `lp_args` the `(subject predictor, cell param)` pairs (LP
 values gather per subject in-cell); `schedules` the schedule
 declarations the cell calls address; `obs` the in-cell observation
 LIST (one per response axis); `timepoints` is always `nothing`
-(ragged axes have no rectangular T). The cell vocabulary is calls to
+(ragged axes have no rectangular T). `subjects === nothing` (the
+top-level schedule-chain form, see `_extract_kernel_cells`) takes the
+subject count from named data at bind — the schedule's subject column —
+and consumes no dims key. The cell vocabulary is calls to
 [`CELL_FNS`](@ref), schedule-map gathers, and arithmetic (no flat
 dotify — the generator emits one subject-batched `_over_subjects`
 statement per assignment).
 """
 struct KernelPlate
     result::Symbol
-    subjects::Union{Int,Symbol}
+    subjects::Union{Nothing,Int,Symbol}
     timepoints::Union{Nothing,Int,Symbol}
     slices::Vector{Tuple{Symbol,Symbol,Symbol}}
     assignments::Vector{Pair{Symbol,Any}}
@@ -1997,7 +2007,11 @@ end
 # outer column/definition (the plate spelling), not introductions.
 # Single source for the global name-table gate.
 function _kernel_all_names(kp::KernelPlate)
-    names = Symbol[kp.result]
+    # A top-level schedule chain names its kernel by the cell value its
+    # first observation reads (`result === collected`, an assignment —
+    # counted once, below).
+    names = any(p -> p.first === kp.result, kp.assignments) ? Symbol[] :
+        Symbol[kp.result]
     for (c, p, _) in kp.slices
         p == c || push!(names, p)
     end
@@ -2303,7 +2317,11 @@ admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
     DarSummandTerm, ComposedTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate):
-scalar/reduction vocabulary plus vector-returning whole-column functions."""
+scalar/reduction vocabulary plus vector-returning whole-column functions —
+the BUILT-IN vocabulary. Beyond it, an `=` definition may call any function
+visible in the model's module (functions as values): a data-only call is
+evaluated once by [`bind_data`](@ref), any other runs in the generated
+kernel."""
 admitted_functions() = (ASSIGNMENT_FNS..., VECTOR_FNS...)
 
 """Elementwise vocabulary the thin layer can lower in derived columns:
@@ -2703,6 +2721,18 @@ function _validate_plate_parameters_data(plan::StructuralPlan)
                 _fail(p.label, "arg $k references unknown name $v")
         end
         p.range === nothing && continue
+        if p.range isa Symbol
+            # One cell per entry of the iterated column (Julia's
+            # `eachindex(v)`), sized at the observation axis.
+            haskey(plan.columns, p.range) || _fail(p.label,
+                "plate over `eachindex($(p.range))`: `$(p.range)` is not bound")
+            n = length(plan.columns[p.range])
+            n == plan.n_obs || _fail(p.label,
+                "plate over `eachindex($(p.range))` has $n cells but n_obs " *
+                "is $(plan.n_obs) — a per-cell latent over another axis " *
+                "does not lower yet (iterate an observation-axis column)")
+            continue
+        end
         last(p.range) == plan.n_obs || _fail(p.label,
             "plate range $(p.range) covers $(length(p.range)) cells " *
             "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
@@ -3151,7 +3181,12 @@ function _validate_columns(plan::StructuralPlan)
     end
     union!(managed, _subject_predictor_columns(plan))
     union!(managed, _mi_managed_columns(plan))
+    # Model-level data values (functions as values: a data-only
+    # assignment bound at bind) carry no observation axis.
+    modelvals = intersect(_bound_module_data_names(plan),
+        Set{Symbol}(a.name for a in plan.assignments))
     for (name, col) in plan.columns
+        name in modelvals && continue
         # Kernel-managed columns (slices + scalar expansions) carry two
         # lengths by design — they validate under kernel rules, not here.
         if col isa AbstractMatrix
@@ -3661,6 +3696,10 @@ end
 
 # Panel-kernel structure (see `_validate_kernels`).
 function _validate_panel_kernel(plan::StructuralPlan, kp::KernelPlate)
+    kp.subjects === nothing &&
+        _fail(kp.label, "panel plates take a subject count (an integer " *
+              "or a dims-key name); only schedule-fed kernels derive it " *
+              "from data")
     length(kp.obs) == 1 ||
         _fail(kp.label, "panel v1 admits exactly one in-cell observation " *
               "(got $(length(kp.obs)))")
@@ -5134,8 +5173,10 @@ function _validate_column_names(plan::StructuralPlan)
     # are exempt from the overlap rule; every other derived name still
     # collides (a caller column the model derives is a shadowing bug).
     resps = Set{Symbol}(r.response for r in plan.responses)
+    # Module data definitions bind-materialize under their own names too.
+    computed = _bound_module_data_names(plan)
     col_overlap = filter(
-        n -> haskey(plan.columns, n),
+        n -> haskey(plan.columns, n) && n ∉ computed,
         union([p.name for p in plan.parameters],
             [a.name for a in plan.assignments],
             [d.name for d in plan.derived if d.name ∉ resps],
@@ -5225,7 +5266,22 @@ admit all; sampled-arg positions stay scalar-only via [`_union_names`](@ref),
 so a scalar arg can never reference a latent vector)."""
 _all_names(plan::StructuralPlan) =
     union(_union_names(plan), [d.name for d in plan.derived],
-        [p.name for p in plan.plate_parameters], _array_names(plan))
+        [p.name for p in plan.plate_parameters], _vector_value_names(plan),
+        _array_names(plan))
+
+"""Vector-parameter names (simplexes, cutpoints, …): model-level array values
+that definitions may read whole (`cumsum(vcat(0.0, zeta))`), never scalars."""
+_vector_value_names(plan::StructuralPlan) =
+    [v.name for v in plan.vector_parameters]
+
+# Every name the expression reads is a model-level value (parameter,
+# assignment, vector parameter) — no column, derived column or unknown name.
+function _model_level_expr(ex, plan::StructuralPlan)
+    known = union(Set{Symbol}(_union_names(plan)),
+        Set{Symbol}(_vector_value_names(plan)))
+    syms = _expr_value_symbols(ex)
+    return !isempty(syms) && all(s -> s in known, syms)
+end
 
 _is_derived(plan::StructuralPlan, name::Symbol) =
     any(d -> d.name === name, plan.derived)
@@ -5252,7 +5308,10 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
             "(`mean($ex)`) or elementwise in a derived definition " *
             "(`log.($ex)`-style); scalar positions take scalars",
         )
-        bound && haskey(plan.columns, ex) && _fail(
+        # (A bound model-level data value — an assignment evaluated at
+        # bind — is a column entry but no observation column.)
+        bound && haskey(plan.columns, ex) &&
+            !any(a -> a.name === ex, plan.assignments) && _fail(
             label,
             "row-varying column $ex outside a reduction (derive it " *
             "elementwise in a `name = ...` definition, e.g. `log.($ex)`)",
@@ -5264,6 +5323,19 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     head = ex.head
     if head === :call
         fn = ex.args[1]
+        if fn isa GlobalRef
+            # A module function takes whole values (functions as values).
+            _collect_opaque_refs!(refs, ex, plan, label, bound)
+            return nothing
+        end
+        if fn isa Symbol && fn in ELEMENTWISE_OPS
+            # Broadcasting over model-level operands stays model-level; a
+            # bare column operand still fails as row-varying below.
+            for arg in ex.args[2:end]
+                _collect_assignment_refs!(refs, arg, plan, label, bound)
+            end
+            return nothing
+        end
         fn isa Symbol && startswith(string(fn), ".") && _fail(
             label,
             "dotted subexpression `$(repr(ex))` is row-varying — stage it " *
@@ -5277,6 +5349,13 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
                 "reduction $fn takes exactly one bare column or derived name",
             )
             arg = ex.args[2]
+            # A reduction of a model-level value is plain Julia
+            # (`sum(zeta)`, `sum(abs2.(w))`); over a column it stays a bare
+            # name (nested column transforms stage as their own definition).
+            if _model_level_expr(arg, plan)
+                _collect_assignment_refs!(refs, arg, plan, label, bound)
+                return nothing
+            end
             arg isa Symbol || _fail(
                 label,
                 "reduction $fn argument must be a bare column or derived " *
@@ -5296,12 +5375,67 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
         end
         return nothing
     end
+    if head === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
+            ex.args[2].head === :tuple
+        # Model-level broadcast (`tanh.(w)`, `f.(zeta, s)`): operands are
+        # model-level values; a bare column operand fails as row-varying.
+        for arg in ex.args[2].args
+            _collect_assignment_refs!(refs, arg, plan, label, bound)
+        end
+        return nothing
+    end
     head === :. && _fail(
         label,
         "broadcast expressions are row-varying — stage them as their own " *
         "derived `name = ...` first",
     )
+    if head === :ref
+        # Indexing a model-level value, or one element of a column.
+        obj = ex.args[1]
+        if !(bound && obj isa Symbol && haskey(plan.columns, obj))
+            _collect_assignment_refs!(refs, obj, plan, label, bound)
+        end
+        for i in ex.args[2:end]
+            _collect_assignment_refs!(refs, i, plan, label, bound)
+        end
+        return nothing
+    end
+    if head === :vect || head === :tuple
+        for a in ex.args
+            _collect_assignment_refs!(refs, a, plan, label, bound)
+        end
+        return nothing
+    end
     return _fail(label, "unsupported expression head $head (pure calls only)")
+end
+
+# Arguments of a module function call (functions as values) are whole
+# Julia values: columns, derived columns, parameters, assignments and
+# vector parameters alike, in any expression. Collects the plan names read
+# (bound columns are inputs, not nodes); keyword names and function values
+# are not reads.
+function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
+    ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String} &&
+        return nothing
+    if ex isa Symbol
+        bound && haskey(plan.columns, ex) && return nothing
+        push!(refs, ex)
+        return nothing
+    end
+    ex isa Expr || _fail(label, "unsupported literal $(repr(ex)) in a " *
+                                "module function call")
+    if ex.head === :kw && length(ex.args) == 2
+        return _collect_opaque_refs!(refs, ex.args[2], plan, label, bound)
+    end
+    args = ex.head === :call ? ex.args[2:end] : ex.args
+    if ex.head === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
+            ex.args[2].head === :tuple
+        args = ex.args[2].args
+    end
+    for a in args
+        _collect_opaque_refs!(refs, a, plan, label, bound)
+    end
+    return nothing
 end
 
 # Elementwise walker for derived columns (contract v3). Vector mode admits
@@ -5317,7 +5451,7 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
         # Per-cell latent (plate) parameters are vectors, so a derived column
         # may transform one (`theta = mu .+ tau .* z`) — the non-centered shape.
         if _is_derived(plan, ex) || _is_plate_param(plan, ex) ||
-                ex in _union_names(plan)
+                ex in _union_names(plan) || ex in _vector_value_names(plan)
             push!(refs, ex)
             return nothing
         end
@@ -5335,6 +5469,12 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
         fn = ex.args[1]
         _is_data_matvec(ex, plan) &&
             return _collect_data_matvec!(refs, ex, plan, label, bound)
+        if fn isa GlobalRef
+            # An undotted module call inside a column expression is a
+            # model-level subterm over whole values.
+            _collect_opaque_refs!(refs, ex, plan, label, bound)
+            return nothing
+        end
         if fn isa Symbol && fn in ELEMENTWISE_OPS
             _check_numeric_position!(ex.args[2:end], plan, label, bound)
             for arg in ex.args[2:end]
@@ -5372,9 +5512,17 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
         "(`$(repr(ex)) * v`) or read one column (`$(ex.args[1])[$(ex.args[2]), 1]`)")
     head === :ref && _collect_array_ref!(refs, ex, plan, label, bound;
         allow_gather = true) && return nothing
+    if head === :ref && length(ex.args) == 2
+        # Gather (`cum[c]`): a whole model-level value indexed by a
+        # row-varying integer column keeps n_obs.
+        _collect_opaque_refs!(refs, ex.args[1], plan, label, bound)
+        _collect_vector_refs!(refs, ex.args[2], plan, label, bound)
+        return nothing
+    end
     head === :ref && return _fail(label, "indexing changes length — " *
                                           "derived columns keep n_obs " *
-                                          "(no `[...]` in vector expressions)")
+                                          "(gathers take one row-varying " *
+                                          "index: `v[c]`)")
     head === :(=) && return _fail(label, "nested assignment does not lower")
     return _fail(label, "unsupported expression head $head in a vector expression")
 end
@@ -5403,12 +5551,20 @@ function _collect_vector_reduction!(refs, ex, plan, label, bound::Bool)
 end
 
 function _collect_vector_dot!(refs, ex, plan, label, bound::Bool)
-    length(ex.args) == 2 && ex.args[1] isa Symbol && ex.args[2] isa Expr &&
-        ex.args[2].head === :tuple ||
+    length(ex.args) == 2 && ex.args[1] isa Union{Symbol,GlobalRef} &&
+        ex.args[2] isa Expr && ex.args[2].head === :tuple ||
         return _fail(label, "field access does not lower in vector " *
                             "expressions (dotted calls take `f.(...)`)")
     f = ex.args[1]
     args = ex.args[2].args
+    if f isa GlobalRef
+        # Module function broadcast (functions as values): elementwise over
+        # its operands, any arity.
+        for arg in args
+            _collect_vector_refs!(refs, arg, plan, label, bound)
+        end
+        return nothing
+    end
     if f === :ifelse
         length(args) == 3 ||
             _fail(label, "`ifelse` takes `ifelse.(condition, x, y)`")
@@ -5480,8 +5636,8 @@ end
 # reductions and scalar calls collapse; unbound unknown symbols count as
 # (possibly-column) evidence and resolve at bind.
 function _is_vector_valued(ex, plan::StructuralPlan)
-    ex isa Symbol && return !(ex in _union_names(plan)) &&
-        !_is_array_param(plan, ex)
+    ex isa Symbol && return !(ex in _union_names(plan) ||
+        ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
     ex isa Expr && ex.head === :ref && _is_array_param(plan, ex.args[1]) &&
         return _array_index_kind(plan, ex) === :gather &&
             all(i -> i isa Int, ex.args[3:end])
@@ -5489,9 +5645,12 @@ function _is_vector_valued(ex, plan::StructuralPlan)
     ex isa LineNumberNode && return false
     ex isa Expr || return false
     head = ex.head
+    head === :ref && length(ex.args) == 2 &&
+        return _is_vector_valued(ex.args[2], plan)  # a gather follows its index
     if head === :call
         isempty(ex.args) && return false
         fn = ex.args[1]
+        fn isa GlobalRef && return false  # undotted module call: model-level
         fn in REDUCTION_FNS && return false
         fn isa Symbol && fn in VECTOR_FNS && return true
         fn isa Symbol && (fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS) &&
@@ -5655,7 +5814,7 @@ function _validate_plate_parameters(plan::StructuralPlan)
         end
         _validate_uniform_args(p.label, p.family, p.args)
         _validate_support_override(p.label, p.family, p.support_override, p.args)
-        if p.range !== nothing
+        if p.range isa UnitRange
             r = p.range
             (first(r) == 1 && last(r) >= 1) || _fail(p.label,
                 "plate range must start at 1 (`1:N`), got $(first(r)):$(last(r))")
@@ -5827,12 +5986,23 @@ function _validate_vector_parameters(plan::StructuralPlan)
             push!(refs[weights], kp.label)
         end
     end
+    # Definitions read vector parameters as whole values (functions as
+    # values); any number of definitions may read one, beside at most one
+    # construct link.
+    defreads = Set{Symbol}()
+    for a in plan.assignments
+        _expr_value_symbols(a.expr, defreads)
+    end
+    for d in plan.derived
+        _expr_value_symbols(d.expr, defreads)
+    end
     for p in plan.vector_parameters
         got = refs[p.name]
-        isempty(got) && _fail(p.label,
+        isempty(got) && p.name ∉ defreads && _fail(p.label,
             "vector parameter $(p.name) unused by any response, " *
-            "monotonic term, joint-factor link, R2D2 prior, or varying-source PK plate")
-        length(got) == 1 || _fail(p.label,
+            "monotonic term, joint-factor link, R2D2 prior, " *
+            "varying-source PK plate, or definition")
+        length(got) <= 1 || _fail(p.label,
             "vector parameter $(p.name) shared by " *
             "$(join(got, ", ")) — one vector parameter per response, " *
             "monotonic term, joint-factor link, R2D2 prior, or varying-source PK plate")
@@ -5864,6 +6034,11 @@ function topological_order(plan::StructuralPlan)
             push!(refs, v)
         end
         deps[p.name] = refs
+    end
+    # Vector parameters are constrained in the layout transforms, ahead of
+    # every definition that reads them (functions as values).
+    for v in _vector_value_names(plan)
+        haskey(deps, v) || (deps[v] = Set{Symbol}())
     end
     # Per-cell latent (plate) parameters: prior args are shared scalars,
     # per-cell derived columns, or raw data columns (never another latent).
@@ -9333,8 +9508,16 @@ function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
             _fail(kp.label, "dims key `$k` must bind a positive integer, " *
                   "got $v")
     end
+    # Leftovers fail once, globally, in `_resolve_kernels!` (a key for a
+    # sibling plate is not this plate's typo).
+    sched = only(kp.schedules)
+    built = _build_grouped_schedule(plan, kp, columns)
     n_sub = if kp.subjects isa Int
         kp.subjects
+    elseif kp.subjects === nothing
+        # Shape from named data: the schedule's subject column (subjects
+        # are 1:n, proved by the build) — no dims key.
+        built.n_subjects
     else
         haskey(dims, kp.subjects) ||
             _fail(kp.label, "subjects dims key `$(kp.subjects)` is not " *
@@ -9343,10 +9526,6 @@ function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
         push!(consumed, kp.subjects)
         Int(dims[kp.subjects])
     end
-    # Leftovers fail once, globally, in `_resolve_kernels!` (a key for a
-    # sibling plate is not this plate's typo).
-    sched = only(kp.schedules)
-    built = _build_grouped_schedule(plan, kp, columns)
     # Dose/PK coherence (v2 axis 1): dose rows must feed the model and
     # PK calls need dose rows. Dose-free subjects alongside dosed ones
     # stay admitted — this gates only the global emptiness.
@@ -9420,27 +9599,33 @@ end
 # 1` the lengths coincide and kinds are unobservable, so all-scalar
 # stands); scalar slices in vector models materialize flat T-block
 # expansions (spline-blocks precedent). Each plate consumes its own keys
-# through one shared set (subjects always named per plate; timepoints
-# via the `kernel_T_<result>` convention, v1 any-leftover inference for
-# single-plate models); leftovers fail once, globally (a key for plate
-# B is not plate A's typo). Returns resolved nodes; the input plan is
-# untouched.
+# through one shared set (subjects named per plate, or derived from a
+# schedule's subject column; timepoints only via the `kernel_T_<result>`
+# key); leftovers fail once, globally (a key for plate B is not plate
+# A's typo). Returns resolved nodes; the input plan is untouched.
 function _resolve_kernels!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer})
-    isempty(plan.kernel_plates) && return KernelPlate[]
+    if isempty(plan.kernel_plates)
+        # Nothing consumes a dims key: a key here is a typo or a shape
+        # the model never asks for (plates take their shapes from data).
+        isempty(dims) ||
+            _fail(:plan, "dims key(s) $(sort!(collect(keys(dims)))) not " *
+                  "consumed (the model has no kernel plate — `@plate` " *
+                  "ranges and schedules take their shapes from data)")
+        return KernelPlate[]
+    end
     # One shared consumed set: each plate consumes its own dims keys;
     # leftovers fail once, globally (a key for plate B is not plate
     # A's typo).
     consumed = Set{Symbol}()
     out = KernelPlate[]
-    nplates = length(plan.kernel_plates)
     for kp in plan.kernel_plates
         if _is_grouped_kernel(kp)
             push!(out,
                 _resolve_grouped_kernel!(plan, kp, columns, dims, consumed))
         else
             push!(out,
-                _resolve_panel_kernel!(kp, columns, dims, consumed, nplates))
+                _resolve_panel_kernel!(kp, columns, dims, consumed))
         end
     end
     leftovers = setdiff(Set{Symbol}(keys(dims)), consumed)
@@ -9454,7 +9639,7 @@ end
 
 function _resolve_panel_kernel!(kp::KernelPlate,
         columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer},
-        consumed::Set{Symbol}, nplates::Int)
+        consumed::Set{Symbol})
     for (k, v) in dims
         v > 0 ||
             _fail(kp.label, "dims key `$k` must bind a positive integer, " *
@@ -9479,29 +9664,16 @@ function _resolve_panel_kernel!(kp::KernelPlate,
         push!(consumed, kp.timepoints)
         Int(dims[kp.timepoints])
     else
-        # Unnamed timepoints (surface always leaves `nothing`): the
-        # `kernel_T_<result>` convention names the plate's T key (the
-        # slice-length errors already prescribe this spelling). The v1
-        # any-single-leftover inference stays for single-plate models;
-        # anything else defers — stray keys fail in the global
-        # leftovers gate, and a T-needing plate fails at its slice
+        # Unnamed timepoints (surface always leaves `nothing`): only the
+        # `kernel_T_<result>` key names the plate's T (the slice-length
+        # errors prescribe this spelling). No other key is ever taken as
+        # T — a typo'd or stray key stays unconsumed and fails in the
+        # global leftovers gate, and a T-needing plate fails at its slice
         # lengths naming the convention.
-        rest = setdiff(Set{Symbol}(keys(dims)), consumed)
         conv = Symbol("kernel_T_$(kp.result)")
-        if conv in rest
+        if haskey(dims, conv)
             push!(consumed, conv)
             Int(dims[conv])
-        elseif nplates == 1
-            if isempty(rest)
-                nothing
-            elseif length(rest) == 1
-                tk = only(rest)
-                push!(consumed, tk)
-                Int(dims[tk])
-            else
-                _fail(kp.label, "ambiguous timepoints dims keys " *
-                      "$(sort!(collect(rest))) (one T key besides subjects)")
-            end
         else
             nothing
         end
@@ -9578,7 +9750,10 @@ kernel-plate dims keys
 be consumed. Columns are vectors or matrices (whole-design data, Stan
 `matrix[N,K]`): a matrix binds with `n_obs` rows, ≥ 1 column, and a
 numeric eltype; every per-observation role reads vectors only and fails
-closed on a matrix.
+closed on a matrix. Data-only definitions that call a module function
+(functions as values) are evaluated here, once, and bound under their own
+names — never supplied by the caller; a model-level one may be a number,
+vector or matrix and carries no `n_obs` requirement.
 """
 # n_obs derivation skips mi-managed columns (packed y_obs/Jobs): every
 # other column crosses at length n, so the first non-managed column
@@ -9605,6 +9780,200 @@ end
 # log.(earn)` in `_assignment_statements`) recomputes the identical value
 # (same expression, same inputs); `bound=` folds the data-only duplicate
 # on compiled paths.
+# ── Functions as values: bind-time data definitions ───────────────────
+# A definition whose expression calls a module function and reads only
+# data (raw columns or other data-only definitions) is data: `bind_data`
+# evaluates it once, as plain Julia, and binds the value under the
+# definition's name. Every consumer then reads it exactly like a bound
+# column — the generated kernel takes it as a data argument (bound by
+# `prepare_query`), never recomputing it. A derived column (observation
+# aligned) must come out a length-n_obs vector and validates as a column;
+# a model-level assignment may be any number, vector or matrix.
+
+# Plan names an expression reads (call heads, keyword names and function
+# values are not reads).
+function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
+    if ex isa Symbol
+        push!(out, ex)
+    elseif ex isa Expr
+        if ex.head === :kw && length(ex.args) == 2
+            _expr_value_symbols(ex.args[2], out)
+        elseif ex.head === :call
+            for a in ex.args[2:end]
+                _expr_value_symbols(a, out)
+            end
+        elseif ex.head === :. && length(ex.args) == 2 &&
+                ex.args[2] isa Expr && ex.args[2].head === :tuple
+            for a in ex.args[2].args
+                _expr_value_symbols(a, out)
+            end
+        else
+            for a in ex.args
+                _expr_value_symbols(a, out)
+            end
+        end
+    end
+    return out
+end
+
+"""Names of the bind-materialized data definitions of `plan`, given the raw
+(caller-supplied) column names: assignments and derived columns that call a
+module function and read only raw columns or other data-only definitions.
+Derived responses keep their own materialization."""
+function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol})
+    nodes = Dict{Symbol,Any}()
+    for a in plan.assignments
+        a.expr isa Expr && (nodes[a.name] = a.expr)
+    end
+    for d in plan.derived
+        d.expr isa Expr && (nodes[d.name] = d.expr)
+    end
+    resps = Set{Symbol}(r.response for r in plan.responses)
+    memo = Dict{Symbol,Bool}()
+    function dataonly(nm, active)
+        haskey(memo, nm) && return memo[nm]
+        nm in active && return false
+        push!(active, nm)
+        ok = all(s -> s in raw || (haskey(nodes, s) && dataonly(s, active)),
+            _expr_value_symbols(nodes[nm]))
+        delete!(active, nm)
+        memo[nm] = ok
+        return ok
+    end
+    return Set{Symbol}(nm for (nm, ex) in nodes
+        if nm ∉ resps && _contains_module_call(ex) &&
+            dataonly(nm, Set{Symbol}()))
+end
+
+"""In a bound plan: the module data definitions bound as columns."""
+function _bound_module_data_names(plan::StructuralPlan)
+    nodes = union(Set{Symbol}(a.name for a in plan.assignments),
+        Set{Symbol}(d.name for d in plan.derived))
+    raw = Set{Symbol}(k for k in keys(plan.columns) if k ∉ nodes)
+    return Set{Symbol}(n for n in _module_data_names(plan, raw)
+        if haskey(plan.columns, n))
+end
+
+function _materialize_module_data!(plan::StructuralPlan,
+        columns::Dict{Symbol,ColumnData})
+    names = _module_data_names(plan, Set{Symbol}(keys(columns)))
+    isempty(names) && return names
+    for nm in sort!(collect(names))
+        haskey(columns, nm) && throw(ContractValidationError(
+            "[bind] column $nm is computed by the model (`$nm = ...` calls " *
+            "a module function on data) — drop it from bind_data"))
+    end
+    exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
+    for d in plan.derived
+        exprs[d.name] = d.expr
+    end
+    vector_defs = Set{Symbol}(d.name for d in plan.derived)
+    memo = Dict{Symbol,Any}()
+    function lookup(nm::Symbol)
+        haskey(memo, nm) && return memo[nm]
+        haskey(columns, nm) && return columns[nm]
+        haskey(exprs, nm) || throw(ContractValidationError(
+            "[bind] data definition reads $nm, which is not bound data"))
+        memo[nm] = _eval_value_expr(exprs[nm], lookup, nm)
+        return memo[nm]
+    end
+    for nm in sort!(collect(names))
+        v = try
+            lookup(nm)
+        catch e
+            e isa ContractValidationError && rethrow()
+            throw(ContractValidationError(
+                "[bind] data definition $nm failed to evaluate: " *
+                sprint(showerror, e)))
+        end
+        if nm in vector_defs
+            v isa AbstractVector || throw(ContractValidationError(
+                "[bind] data definition $nm is an observation column " *
+                "(elementwise over data) but evaluated to $(summary(v))"))
+        else
+            v isa ColumnData || throw(ContractValidationError(
+                "[bind] data definition $nm evaluated to $(summary(v)); " *
+                "model-level data values are numbers, vectors or matrices"))
+        end
+        # Dense storage: the kernel's data arguments are `Vector`/`Matrix`.
+        columns[nm] = v isa AbstractVector ? collect(v) :
+            v isa AbstractMatrix ? Matrix(v) : v
+    end
+    return names
+end
+
+# Plain-Julia evaluation of a resolved definition expression (functions as
+# values): module calls through their `GlobalRef`s, built-in vocabulary
+# heads through the generated-model scope — the bindings the kernel uses.
+function _eval_value_expr(ex, lookup, label)
+    ex isa Union{Number,String} && return ex
+    ex isa QuoteNode && return ex.value
+    ex isa GlobalRef && return getglobal(ex.mod, ex.name)
+    ex isa Symbol && return lookup(ex)
+    ex isa Expr || throw(ContractValidationError(
+        "[bind] $label: unsupported literal $(repr(ex))"))
+    ev(a) = _eval_value_expr(a, lookup, label)
+    h = ex.head
+    if h === :call
+        f = _eval_callee(ex.args[1], label)
+        pos = Any[]
+        kws = Pair{Symbol,Any}[]
+        for a in ex.args[2:end]
+            if a isa Expr && a.head === :parameters
+                for p in a.args
+                    if p isa Expr && p.head === :kw
+                        push!(kws, p.args[1] => ev(p.args[2]))
+                    elseif p isa Symbol
+                        push!(kws, p => lookup(p))
+                    else
+                        throw(ContractValidationError(
+                            "[bind] $label: unsupported keyword form $(repr(p))"))
+                    end
+                end
+            elseif a isa Expr && a.head === :kw
+                push!(kws, a.args[1] => ev(a.args[2]))
+            else
+                push!(pos, ev(a))
+            end
+        end
+        # `invokelatest`: the model module's functions may postdate the
+        # caller's world (bind_data is callable from any world).
+        return Base.invokelatest(f, pos...; kws...)
+    elseif h === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
+            ex.args[2].head === :tuple
+        f = _eval_callee(ex.args[1], label)
+        return Base.invokelatest(broadcast, f, map(ev, ex.args[2].args)...)
+    elseif h === :ref
+        return getindex(ev(ex.args[1]), map(ev, ex.args[2:end])...)
+    elseif h === :vect
+        return Base.vect(map(ev, ex.args)...)
+    elseif h === :tuple
+        return Tuple(map(ev, ex.args))
+    end
+    throw(ContractValidationError(
+        "[bind] $label: unsupported expression head $h in a data definition"))
+end
+
+function _eval_callee(fn, label)
+    fn isa GlobalRef && return getglobal(fn.mod, fn.name)
+    fn isa Symbol || throw(ContractValidationError(
+        "[bind] $label: unsupported call head $(repr(fn))"))
+    s = string(fn)
+    if startswith(s, ".") && length(s) > 1 && fn !== :.
+        op = Symbol(s[2:end])
+        isdefined(PPLGeneratedModels, op) || throw(ContractValidationError(
+            "[bind] $label: unknown operator $fn"))
+        g = getglobal(PPLGeneratedModels, op)
+        return (args...) -> broadcast(g, args...)
+    end
+    # The generated scope binds `logistic` to the distribution kernel; the
+    # value vocabulary's `logistic` is the inverse-logit math function.
+    fn === :logistic && return PPLGeneratedModels._ppl_logistic
+    isdefined(PPLGeneratedModels, fn) || throw(ContractValidationError(
+        "[bind] $label: unknown function $fn"))
+    return getglobal(PPLGeneratedModels, fn)
+end
+
 function _materialize_derived_responses!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData})
     derived =
@@ -9670,6 +10039,12 @@ function _eval_derived_node(ex, plan::StructuralPlan, det_exprs, columns,
     ex isa Expr || throw(ContractValidationError(
         "[bind] derived response $root: unsupported literal $(repr(ex)) " *
         "(numeric literals only)"))
+    if _contains_module_call(ex)
+        # Functions as values: a module call (anywhere below) evaluates as
+        # plain Julia over the resolved inputs.
+        return _eval_value_expr(ex, nm -> _eval_derived_name(plan, nm,
+            det_exprs, columns, memo, root), root)
+    end
     if ex.head === :call
         fn = ex.args[1]
         if fn isa Symbol && haskey(_DERIVED_DOTTED_OPS, fn)
@@ -9719,6 +10094,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     isempty(columns) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
     columns = _checked_columns(columns)
+    computed = _materialize_module_data!(plan, columns)
     _materialize_derived_responses!(plan, columns)
     bases = _materialize_splines!(plan, columns)
     hbases = _fit_hsgp_bases(plan, columns)
@@ -9799,7 +10175,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # contract (deriving from a packed column fails every full-length
     # column by order luck).
     n = if isempty(kbases)
-        _bind_nrows(columns, _mi_managed_columns(plan))
+        _bind_nrows(columns, union(_mi_managed_columns(plan), computed))
     else
         sum(kp -> _kernel_plate_nlanes(kp, columns), kbases)
     end
@@ -9928,6 +10304,15 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             # structural size; its cell linkage and square size were proved
             # by validate_structure before bind.
             push!(out_v, p)
+        elseif p.family === :simplex_dirichlet
+            # A free-standing simplex (functions as values: definitions
+            # compute with it, `cumsum(vcat(0.0, zeta))`) sizes from its
+            # literal concentration.
+            want = length(p.args.arg1)
+            p.size === nothing || p.size == want || _fail(p.label,
+                "simplex size $(p.size) disagrees with its concentration " *
+                "length $want")
+            push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
         else
             _fail(p.label, "internal: vector parameter unlinked at bind")
         end

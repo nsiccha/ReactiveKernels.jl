@@ -5,8 +5,8 @@
 # An array parameter is a VALUE the model reads by name, with standard
 # Julia semantics: `z` is a `Vector{Float64}` (or a `Matrix{Float64}` for a
 # two-axis declaration), `L` is the lower-triangular `Matrix{Float64}`
-# Cholesky factor, `phi` is a simplex vector. Expressions over them are
-# ordinary Julia (`phi[1]`, `sd .* z`, `B * w` with a bound data matrix
+# Cholesky factor. Expressions over them are ordinary Julia (`z[1]`,
+# `L[2, 1]`, `sd .* z`, `B * w` with a bound data matrix
 # `B`). The one non-positional read is the level lookup: an axis declared
 # as `levels(g)` is indexed by the grouping column's VALUES, so `z[g]`
 # reads, for every observation, the element of `z` on that observation's
@@ -26,8 +26,7 @@ function _array_param(plan::StructuralPlan, name::Symbol)
     return plan.array_parameters[i]
 end
 
-_is_structured_array(p::ArrayParameter) =
-    p.family === :lkj_cholesky || p.family === :dirichlet
+_is_structured_array(p::ArrayParameter) = p.family === :lkj_cholesky
 
 # The flat (column-major) packed vector an elementwise array constrains
 # into: the array's own name for one axis, a hygienic local reshaped into
@@ -131,27 +130,11 @@ function _validate_array_parameters(plan::StructuralPlan)
                 "positive literal, got $(repr(eta))")
             p.support_override === nothing || _fail(p.label,
                 "LKJCholesky factor $(p.name) carries no support override")
-        elseif p.family === :dirichlet
-            nd == 1 && p.dims[1] isa Int || _fail(p.label,
-                "simplex $(p.name) has one literal axis, got $(repr(p.dims))")
-            keys(p.args) == (:arg1,) || _fail(p.label,
-                "simplex $(p.name) takes the concentration `alpha` only")
-            alpha = p.args.arg1
-            alpha isa AbstractVector && !isempty(alpha) &&
-                all(x -> x isa Real && isfinite(x) && x > 0, alpha) ||
-                _fail(p.label, "simplex $(p.name): `Dirichlet` " *
-                    "concentrations are a literal vector of finite " *
-                    "positive numbers, got $(repr(alpha))")
-            length(alpha) == p.dims[1] || _fail(p.label, "simplex " *
-                "$(p.name) has $(p.dims[1]) elements but $(length(alpha)) " *
-                "concentrations")
-            p.support_override === nothing || _fail(p.label,
-                "simplex $(p.name) carries no support override")
         else
             haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
                 "array $(p.name) family $(p.family) unknown (admitted: " *
                 "$(join(sort!(collect(keys(SAMPLED_ARITY))), ", ")), " *
-                "lkj_cholesky, dirichlet)")
+                "lkj_cholesky)")
             want = ntuple(i -> Symbol(:arg, i), SAMPLED_ARITY[p.family])
             Tuple(keys(p.args)) == want || _fail(p.label,
                 "array $(p.name) family $(p.family) takes positional keys " *
@@ -481,12 +464,6 @@ function _array_layout_entries!(entries::Vector{LayoutEntry},
             push!(entries, LayoutEntry(:cholesky_corr, nothing, p.name,
                 labels, offset, packed, :lkj))
             offset += packed
-        elseif p.family === :dirichlet
-            K = dims[1]
-            labels = [Symbol(p.name, ".", i) for i in 1:(K - 1)]
-            push!(entries, LayoutEntry(:vector, nothing, p.name, labels,
-                offset, K - 1, :simplex))
-            offset += K - 1
         else
             transform, lo, hi =
                 _entry_transform(p.family, p.support_override, p.args)
@@ -593,12 +570,6 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             push!(stmts, :($node::Float64 =
                 $(_lkj_prior_terms(p.name, dims[1], Float64(p.args.arg1)))))
             push!(terms, node)
-            continue
-        end
-        if p.family === :dirichlet
-            _vector_parameter_prior_stmts!(stmts, terms, VectorParameter(
-                p.name, :simplex_dirichlet,
-                (arg1 = Vector{Float64}(p.args.arg1),), dims[1], p.label))
             continue
         end
         if p.family === :flat

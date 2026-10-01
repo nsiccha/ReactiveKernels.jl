@@ -8,8 +8,9 @@ using Test
 
 # Declared array parameters (`ArrayParameter`): `L ~ LKJCholesky(K, eta)`,
 # sized `z[1:K] .~ ...` / `z[levels(g)] .~ ...` / two-axis
-# `z[levels(g), 1:K] .~ ...`, free simplexes, and bound data matrices,
-# all read as plain values (`L[2, 1]`, `phi[1]`, `z[g]`, `B * w`).
+# `z[levels(g), 1:K] .~ ...`, and bound data matrices, all read as plain
+# values (`L[2, 1]`, `z[1]`, `z[g]`, `B * w`); a free simplex (a
+# `VectorParameter` read as a model-level value) is read by position too.
 # Densities are checked against Distributions.jl, gradients against
 # central differences. Helpers `_query` / `_check_gradient` come from
 # test_generator.jl (included earlier).
@@ -117,6 +118,8 @@ end
 end
 
 @testset "array values: free simplex read by position" begin
+    # The simplex stays a VectorParameter (a model-level value, as for
+    # `cumsum(phi)`); reading it by position needs no array parameter.
     m = @rkppl begin
         phi ~ Dirichlet([2.0, 1.0, 3.0])
         a ~ Normal(0, 1)
@@ -128,8 +131,8 @@ end
     end
     y, x, x2 = _av_y(), _av_x(), _av_x2()
     bound = m(; y, x, x2)
-    @test only(bound.array_parameters).family === :dirichlet
-    @test isempty(bound.vector_parameters)
+    @test isempty(bound.array_parameters)
+    @test only(bound.vector_parameters).name === :phi
     built = build_kernel(bound)
     u = _av_point(built.layout.total)
     nt = constrain(built.layout, u)

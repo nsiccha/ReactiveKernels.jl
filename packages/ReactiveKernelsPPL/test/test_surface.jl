@@ -2795,14 +2795,15 @@ _plate_gauss(R) = Expr(:block,
         lower_rkppl(_plate_gauss(:(eachindex(y))), (:y, :x)), cols)
     @test _query(build_kernel(pb).spec, pb, :posterior, u) ==
         _query(build_kernel(bb).spec, bb, :posterior, u)
-    # Scalar cell objects are rejected (dots as written, like top level).
-    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+    # A scalar cell object is one draw per index, exactly what the
+    # broadcast spelling means (a cell is one loop iteration).
+    @test _plans_equal(lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
             :(mu = a .+ b .* x),
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
                 Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                     Expr(:block, LineNumberNode(6),
-                        :(y[i] ~ Normal(mu[i], s)))))), (:y, :x))
+                        :(y[i] ~ Normal(mu[i], s)))))), (:y, :x)), bare)
     # Dotted wrappers strip through the desugar.
     wrap = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
@@ -2864,7 +2865,8 @@ end
             Expr(:block, :(mu = a .+ b .* x), bad), Dn)
     end
     # Cell violations: broadcast, cross/lag index, bare loop var,
-    # scalar cells, non-data sampled, bare priors, factor indexing.
+    # scalar cells, non-data sampled, bare priors, gathers through a
+    # non-data index (data-column gathers lower: test_plates.jl).
     badcells = Any[
         :(y[i] .~ Normal.(mu[i], s)),
         :(y[j] ~ Normal.(mu[j], s)),
@@ -2873,7 +2875,7 @@ end
         :(y[3] ~ Normal.(mu[3], s)),
         :(z[i] ~ Normal.(0, 1)),
         :(s ~ Exponential(1)),
-        :(y[i] ~ Normal.(c[g[i]], s)),
+        :(y[i] ~ Normal.(c[mu[i]], s)),
         :(y[i, 1] ~ Normal.(mu[i], s)),
     ]
     for bad in badcells
@@ -2954,7 +2956,7 @@ _re_surface(R) = Expr(:block,
     pp = plan.plate_parameters[1]
     @test pp.name === :theta && pp.family === :normal &&
         Tuple(keys(pp.args)) == (:arg1, :arg2) &&
-        collect(values(pp.args)) == [:mu, :tau] && pp.range === nothing
+        collect(values(pp.args)) == [:mu, :tau] && pp.range === :y
     @test Set(p.name for p in plan.parameters) == Set([:mu, :sigma, :tau])
     loc = only(plan.predictors)
     @test loc.name === :y_loc && length(loc.terms) == 1 &&
@@ -2976,7 +2978,8 @@ _re_surface(R) = Expr(:block,
     hand = StructuralPlan(hand.responses, hand.predictors, hand.population_priors,
         hand.parameters, hand.assignments, Dict{Symbol,AbstractVector}(), 0;
         plate_parameters = PlateParameter[
-            PlateParameter(:theta, :normal, (arg1 = :mu, arg2 = :tau), nothing)])
+            PlateParameter(:theta, :normal, (arg1 = :mu, arg2 = :tau), nothing,
+                :y)])
     @test _plans_equal(plan, hand)
     # eachindex/axes plates are plan-identical.
     @test _plans_equal(lower_rkppl(_re_surface(:(axes(y, 1))), (:y, :x)), plan)
