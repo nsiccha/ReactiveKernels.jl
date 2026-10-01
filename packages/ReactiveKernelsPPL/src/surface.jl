@@ -2880,34 +2880,7 @@ end
 
 _is_schedule_decl_rhs(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
-    rhs.args[1] in (:linear_pk_schedule, :varyingsource_pk_schedule,
-        :varyingsource_pkpd_schedule)
-
-function _lower_varyingsource_pkpd_schedule_decl(lhs,rhs,line,data)
-    where = line > 0 ? "schedule `$lhs` (line $line)" : "schedule `$lhs`"
-    keys = Dict{Symbol,Any}()
-    for item in rhs.args[2:end]
-        kws = item isa Expr && item.head === :parameters ? item.args : [item]
-        for kw in kws
-            kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                _sfail("$where takes obs/dose/discretization keywords")
-            key,value = kw.args
-            key in (:obs,:dose,:discretization) ||
-                _sfail("$where unknown keyword `$key`")
-            haskey(keys,key) && _sfail("$where repeats `$key=`")
-            keys[key] = value
-        end
-    end
-    all(k -> haskey(keys,k),(:obs,:dose,:discretization)) ||
-        _sfail("$where needs obs=(subject,time,assay), dose=(subject,time,amount,treatment), and discretization=<raw lag column>")
-    obs = _schedule_column_tuple(keys[:obs],where,:obs,3,data)
-    dose = _schedule_column_tuple(keys[:dose],where,:dose,4,data)
-    disc = keys[:discretization]
-    disc = disc isa QuoteNode ? disc.value : disc
-    disc isa Symbol && disc in data ||
-        _sfail("$where discretization must name a bound raw lag column")
-    return VaryingSourcePKPDScheduleSpec(lhs,obs...,dose...,disc)
-end
+    rhs.args[1] === :linear_pk_schedule
 
 # `name = linear_pk_schedule(obs = (subj, time), dose = (subj, time,
 # amount), ecg = (subj, time), tgi = (subj, time))`: raw obs/dose DATA
@@ -2917,10 +2890,7 @@ end
 # form.
 function _lower_schedule_decl(lhs::Symbol, rhs::Expr, line::Int,
         data::Set{Symbol})
-    rhs.args[1] === :varyingsource_pkpd_schedule &&
-        return _lower_varyingsource_pkpd_schedule_decl(lhs,rhs,line,data)
     where = line > 0 ? "schedule `$lhs` (line $line)" : "schedule `$lhs`"
-    varying = rhs.args[1] === :varyingsource_pk_schedule
     kws = Any[]
     for arg in rhs.args[2:end]
         if arg isa Expr && arg.head === :parameters
@@ -2936,12 +2906,9 @@ function _lower_schedule_decl(lhs::Symbol, rhs::Expr, line::Int,
                    "amount)` keywords only, got $(repr(kw))")
         key, val = kw.args[1], kw.args[2]
         key === :obs || key === :dose || key === :ecg || key === :tgi ||
-            _sfail("$where takes " *
-                   (varying ? "`obs=`/`dose=`" : "`obs=`/`dose=`/`ecg=`/`tgi=`") *
-                   " keywords only, got `$key=`")
-        varying && !(key in (:obs, :dose)) &&
-            _sfail("$where varying-source PK slice takes `obs=`/`dose=` only")
-        want = key === :dose ? (varying ? 4 : 3) : 2
+            _sfail("$where takes `obs=`/`dose=`/`ecg=`/`tgi=` keywords " *
+                   "only, got `$key=`")
+        want = key === :dose ? 3 : 2
         cols = _schedule_column_tuple(val, where, key, want, data)
         if key === :obs
             obs_spec === nothing || _sfail("$where repeats `obs=`")
@@ -2958,10 +2925,7 @@ function _lower_schedule_decl(lhs::Symbol, rhs::Expr, line::Int,
         end
     end
     obs_spec === nothing && _sfail("$where needs `obs=(subj, time)`")
-    dose_spec === nothing && _sfail("$where needs " *
-        (varying ? "`dose=(subj, time, amount, treatment)`" : "`dose=(subj, time, amount)`"))
-    varying && return VaryingSourcePKScheduleSpec(lhs, obs_spec[1], obs_spec[2],
-        dose_spec[1], dose_spec[2], dose_spec[3], dose_spec[4])
+    dose_spec === nothing && _sfail("$where needs `dose=(subj, time, amount)`")
     ecg = ecg_spec === nothing ? nothing : (ecg_spec[1], ecg_spec[2])
     tgi = tgi_spec === nothing ? nothing : (tgi_spec[1], tgi_spec[2])
     return LinearPKScheduleSpec(lhs, obs_spec[1], obs_spec[2], dose_spec[1],
