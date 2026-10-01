@@ -485,8 +485,8 @@ function assign_layout(plan::StructuralPlan)
     # Event-LP providers in plan order: the dose slope as an identity
     # scalar, then the HSGP triple in SB `_sb_hsgp` declaration order
     # (rho, sigma, beta) — but with the V2 term priors' supports: rho
-    # on the parameterized `:interval` (truncation floor, SB's
-    # varyingsource4 upper bound 2.0), sigma plain `:exp`, beta_raw
+    # on the parameterized `:interval` (truncation floor, the reference
+    # model's upper bound 2.0), sigma plain `:exp`, beta_raw
     # one `:hsgp` identity block (the spline-vector shape).
     for el in plan.event_lps
         el.fit === nothing && throw(ContractValidationError(

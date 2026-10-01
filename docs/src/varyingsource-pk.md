@@ -1,7 +1,7 @@
 # Varying-source PK slice
 
-`ReactiveKernelsPPL` supplies the PK component of Bruno's `varyingsource3`
-twin at source checkpoint `896137dd`. A Gamma transit input feeds a linear
+`ReactiveKernelsPPL` supplies the PK component of a varying-source PK/PD
+model. A Gamma transit input feeds a linear
 two-compartment system. Each treatment reuses one unit response; doses then
 accumulate in order, with a normalized two-dimensional GP adjusting each dose
 from its amount and the concentration produced by earlier doses.
@@ -30,7 +30,7 @@ vs = varyingsource_pk_schedule(obs = (:subject, :time),
     dose = (:dose_subject, :dose_time, :dose_amount, :treatment_key))
 ```
 
-`treatment_key` is the combined treatment/diet identifier (for the twin,
+`treatment_key` is the combined treatment/diet identifier (for example
 `treatment + 100*diet`). Binding renumbers it by first appearance within each
 subject. Observation subjects must cover `1:n`; dose subjects must refer to
 them. Dose times must be nondecreasing within a subject, and dose amounts must
@@ -58,7 +58,7 @@ extract arbitrary BRM dose-axis predictors. GP slopes are scalars or subject
 predictors. `gp_weights` is a shared square coefficient vector in Julia column
 order: bound data, or a concrete-size `VectorParameter` with family
 `:vector_normal` in the typed plan. The latter prior belongs to that plan; it
-does not reproduce the twin's GP innovation prior automatically.
+does not reproduce the reference model's GP innovation prior automatically.
 
 Binding builds separate cumulative ends for reference times, doses, lags, and
 the dose-major lag-index products. It preserves original dose-row indices and
@@ -69,9 +69,9 @@ reference traversal remain ordinary runtime loops. Dose-free subjects skip
 parameter indexing, GP construction, and unit solves and return zero PK.
 
 Treatment map value `j` selects source column `j`, assembled from dose-column
-modifiers `j`. This preserves the deployed twin's selection of the first
+modifiers `j`. This preserves the reference model's selection of the first
 `maximum(treatment_map)` source columns, even if treatment `j` first appears
-on a later dose. Changing that selection would change the modeled twin.
+on a later dose. Changing that selection would change the modeled system.
 
 ## Numerical and backend limits
 
@@ -79,23 +79,14 @@ The default cell binds `series_rtol=1e-15` and `watson_terms=8`. The series
 tolerance and asymptotic Watson truncation error are separate. These controls
 do not establish a production accuracy policy. Direct cell users can bind
 different controls with `prepare_varyingsource_pk(; series_rtol, watson_terms)`.
-The grouped emitter currently uses the default controls. The
-[unit-response comparison](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/transit_twocmt)
-measures reverse gradients against actual Stan BDF; it does not measure this
-complete PK slice or the full posterior. The separate
-[emitted PK-slice comparison](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/varyingsource_pk)
-measures the full 17-coordinate slice density and reverse gradient on public
-synthetic 3/30-subject workloads, including GP feedback, likelihood, priors,
-and the sigma Jacobian. It records 14.5–50× speedups with gradient differences
-below production Stan's measured differences on those cases. It does not
-establish full-twin or real-fit performance.
+The grouped emitter currently uses the default controls.
 
 Native Enzyme reverse differentiates the ordinary cell and GP arithmetic.
 The transit primitive uses its existing generated mathematical reverse rule.
 Reactant execution fails explicitly: compiled transit-rule and sequential-dose
 control flow are not established for this cell. The slice does not yet include
 PD/placebo grids, full centered hierarchical subject effects, GP prior
-transforms, or BRM-side grouped extraction. Those remain full-twin work.
+transforms, or BRM-side grouped extraction.
 
 ## Standalone transit primal execution
 
@@ -105,9 +96,5 @@ Its lag and numerical-series loops remain retained, and numerical-regime arms
 remain lazy. The standalone fixture covers changed inputs, empty lag arrays
 and explicitly bound accuracy controls. Native Enzyme reverse continues to
 use the existing generated rule.
-
-The actual application unit-response cut also passes lattice/exact schedules
-with 97/247 lags, changed live PK positions, executable reuse and input/output
-ownership. See the [transit benchmark receipts](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/transit_twocmt)
-for exact environments and checks. This component support does not establish
-compiled reverse, full dose superposition, or the complete PK/PD reader.
+This component support does not establish compiled reverse, full dose
+superposition, or the complete PK/PD reader.

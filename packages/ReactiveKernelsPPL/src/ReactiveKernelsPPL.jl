@@ -87,23 +87,6 @@ export admit_qt_spine, admit_qt_obs_family
 export qt_loc_assignment, qt_obs_statement, pk_obs_statement
 export validate_qt_joint_prep
 export TGIOptions, tgi_options
-export JOINT_DECL_PK_FORMULAS_V2, JOINT_DECL_TGI_FORMULAS_V1, JOINT_DECL_LPS
-export JOINT_DECL_TGI_FORMULAS_MEMO, JOINT_DECL_LKJ_MEMO_P
-export JOINT_DECL_PK_INTERCEPT_PRIORS, JOINT_DECL_TGI_INTERCEPT_SCALES
-export JOINT_DECL_PK_COV_SCALES, JOINT_DECL_SD_SCALES, JOINT_DECL_LKJ
-export JOINT_DECL_PK_RESIDUAL_SCALE, JOINT_DECL_TGI_SIGMA, JOINT_DECL_TGI_C_CR
-export JOINT_DECL_INDICATION_LEVELS
-export JOINT_DECL_TGI_LAYOUTS, JOINT_DECL_TGI_OBSERVATIONS
-export JOINT_DECL_TGI_STRUCTURES, JOINT_DECL_TGI_THRESHOLDS
-export JOINT_DECL_TGI_MEASURES
-export admit_joint_decl_tgi_layout, admit_joint_decl_tgi_observation
-export admit_joint_decl_tgi_structure, admit_joint_decl_tgi_thresholds
-export admit_joint_decl_tgi_measure
-export admit_joint_decl_pk_formulas, admit_joint_decl_tgi_formulas
-export validate_joint_decl_prep
-export joint_decl_derived, joint_decl_predictors, joint_decl_population_priors
-export joint_decl_levelmaps, joint_decl_varying, joint_decl_scalars
-export joint_decl_fragments
 export TGI_OBSERVATIONS, TGI_STRUCTURES, TGI_THRESHOLDS, TGI_MEASURES
 export TGI_TIME_SCALE_H, TGI_LOG_PR, TGI_LOG_PD, TGI_RECIST_LOG_PR,
     TGI_RECIST_LOG_PD
@@ -158,7 +141,6 @@ include("surface.jl")
 include("scan.jl")
 include("qt_joint.jl")
 include("tgi.jl")
-include("joint_decl.jl")
 
 # Late import into the generated-models scope: `PPLGeneratedModels`
 # binds its `import`s when `generator.jl` loads, before `tgi.jl`

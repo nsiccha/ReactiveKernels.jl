@@ -1997,6 +1997,37 @@ end
     @test_throws ContractValidationError _ordered_plan(; resp = r)
 end
 
+# Every field non-default (bypassing validation): a rebuild that drops a
+# field shows up as a mismatch against its input.
+_all_fields_spec() = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
+    :s, :w, _none_evidence(), :y_resp, 7, 1:5, nothing, :cuts, [:p2], [:c2],
+    :cumulative, 2.0, [:tc], :tco, [:y2], :fs, :fc, :ga, :gb, GaussianFam,
+    Union{Symbol,Real}[:l1], Union{Nothing,Symbol,Real,ScalePredictorRef}[:s1],
+    :mw, 4.0, 0.2, :jobs, (0.0, 2pi))
+
+@testset "field-preserving rebuilds" begin
+    r = _all_fields_spec()
+    r2 = ReactiveKernelsPPL._with_levels(r, 3)
+    @test r2.n_levels == 3
+    @test [f for f in fieldnames(LikelihoodSpec)
+        if f !== :n_levels && getfield(r2, f) != getfield(r, f)] == Symbol[]
+    @test_throws ArgumentError ReactiveKernelsPPL._with(r; n_level = 3)
+    # Plan-level copies keep every field they do not override.
+    good = _ordered_plan()
+    p2 = ReactiveKernelsPPL._with(good; n_obs = good.n_obs + 1)
+    @test p2.n_obs == good.n_obs + 1
+    @test all(getfield(p2, f) === getfield(good, f)
+        for f in fieldnames(StructuralPlan) if f !== :n_obs)
+    # GLM-object fields fail closed on a non-GLM response (they are never
+    # read there, so carrying them would silently change nothing).
+    for (k, v) in ((:glm_alpha, :ga), (:glm_beta, :gb))
+        rg = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu, nothing,
+            nothing, _none_evidence(), :y_resp, nothing, nothing;
+            thresholds = :y_cutpoints, (k => v,)...)
+        @test_throws ContractValidationError _ordered_plan(; resp = rg)
+    end
+end
+
 function _ordinal_plan(n = 9; link = LogitLink, structure = :cumulative,
         vecfam = :ordered_normal, discrimination = nothing,
         tcols = Symbol[], coefs = nothing, terms = nothing, resp = nothing,

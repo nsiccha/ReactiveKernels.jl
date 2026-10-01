@@ -1,5 +1,4 @@
-# Native math for Bruno's varying-source PK/PD twin (896137dd):
-# src/pkpd_models.jl:886-909, 1456-1514, 3231-3263.
+# Native math for the varying-source PK/PD model.
 # Basis, observation, and PD-grid sizes are data: retain ordinary loops.
 
 function _vs_native_math(args)
@@ -11,7 +10,7 @@ end
 """
     varyingsource_gp_weights(unit_weights, dose_scale, conc_scale, eff_scale)
 
-Scale the twin's square, column-major GP innovation vector into the matrix
+Scale the model's square, column-major GP innovation vector into the matrix
 consumed by varyingsource_effectiveness. Length scales and amplitude are
 positive constrained values. This is the GP transform, not its prior density.
 All basis traversal remains runtime iteration.
@@ -40,7 +39,7 @@ end
 """
     varyingsource_log_placebo(times, unit_weights, length_scale, sd, lo, hi)
 
-Evaluate clamped_hsgp from the twin: clamp times to [lo, hi], map to [-1, 1],
+Evaluate the clamped HSGP: clamp times to [lo, hi], map to [-1, 1],
 and apply the padded sine basis (L=1.5) and exp-quad spectral weights. The
 result is the log placebo course. Length scale and sd are constrained values.
 An empty evaluation grid skips the weights, hyperparameters, and domain.
@@ -160,7 +159,7 @@ end
         log_theta1_pbmc, log_theta2_pbmc, log_baseline_csf, log_theta1_csf,
         log_theta2_csf, log_absorption_rate, log_absorption_mode)
 
-Compose the twin's PK and PBMC/CSF PD locations in original assay order.
+Compose the model's PK and PBMC/CSF PD locations in original assay order.
 Placebo arrays contain PBMC centres followed by CSF centres. PBMC uses
 log_placebo; CSF uses log_placebo + log_placebo_csf. A dose-free subject skips
 PK math while retaining its PD/placebo response. Absent assays skip their

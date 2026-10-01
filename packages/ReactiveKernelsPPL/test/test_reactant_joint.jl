@@ -1,11 +1,8 @@
-# Reactant track (brm:tgi:reactant, 2026-09-21): full-program
-# `Reactant.@compile` of built RKPPL programs — primal lp parity and
-# compiled value+gradient (Enzyme-through-Reactant) parity against the
-# native kernels. The default joint PK path now rejects compilation explicitly:
-# unrolling its bound schedule violates the core constraints, and reverse of
-# the retained recurrence is blocked by RK issue #13. Set
-# `RKPPL_REACTANT_RECTANGULAR=1 RKPPL_REACTANT_KS=1,3` to exercise the experimental
-# retained primal ladder. The tiny model still proves the compiled AD path.
+# Reactant track: full-program `Reactant.@compile` of built RKPPL programs —
+# primal lp parity and compiled value+gradient (Enzyme-through-Reactant)
+# parity against the native kernels. The default grouped linear-PK path
+# rejects compilation explicitly: unrolling its bound schedule violates the
+# core constraints. The tiny model still proves the compiled AD path.
 #
 # Call shape (the one thing that decides traceability): compile the RAW
 # prepared kernel / `q.ad` directly (top level, or `invokelatest` AROUND
@@ -20,11 +17,6 @@ using ReactiveKernelsPPL
 using Reactant
 using Random
 using Test
-
-isdefined(@__MODULE__, :_parity_columns) ||
-    include(joinpath(@__DIR__, "parity", "joint_parity_fixture.jl"))
-isdefined(@__MODULE__, :tiled_columns) ||
-    include(joinpath(@__DIR__, "parity", "joint_tiling.jl"))
 
 const _RJ_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
@@ -123,33 +115,38 @@ end
     @test Array(rgrad) ≈ g rtol = 1e-9
 end
 
-# Joint fixture at tiling K: bound plan + built program + sampler-cut kernel
-# + a deterministic unconstrained point (the benchmark's point, seed
-# 20260917).  `tiled_columns(1)` is the fixture itself (pinned below).
-function _rj_joint(K)
-    bound = bind_data(final_plan("continuous"), tiled_columns(K);
-        dims = Dict(:kernel_nsub_pk_loc => 3K))
+# Synthetic grouped linear-PK program (two subjects, a repeated-dose
+# schedule): bound plan, sampler-cut kernel and a deterministic point.
+function _rj_grouped_pk()
+    plan = lower_rkppl(Meta.parse("begin\nsigma ~ Exponential(1.0)\n" *
+            "b0 ~ Normal(0.0, 1.0)\nlog_Vc = b0\n" *
+            "pk_sched = linear_pk_schedule(obs = (:subj, :time), " *
+            "dose = (:dsubj, :dtime, :damt))\n" *
+            "@plate conc for s in 1:kernel_nsub_conc\n" *
+            " read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc, " *
+            "log_Vc, log_Vc, log_Vc)\n" *
+            " mu = read_locs[pk_sched.obs_map]\n" *
+            " dv .~ Normal.(mu, sigma)\n mu\nend\nend"),
+        (:subj, :time, :dsubj, :dtime, :damt, :dv))
+    cols = Dict{Symbol,AbstractVector}(
+        :subj => [1, 1, 2, 2], :time => [96.0, 120.0, 0.0, 5.0],
+        :dsubj => [1, 1, 1, 1, 2], :dtime => [0.0, 24.0, 48.0, 72.0, 0.0],
+        :damt => [100.0, 100.0, 100.0, 100.0, 50.0],
+        :dv => [10.0, 8.0, 0.5, 7.0])
+    bound = bind_data(plan, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
     u = Vector{Float64}(0.1 .* randn(Xoshiro(20260917), built.layout.total))
-    return (; bound, built, post_q, u)
+    return (; post_q, u)
 end
 
-const _RJ_KS = [parse(Int, s) for s in
-    split(get(ENV, "RKPPL_REACTANT_KS", "1"), ",")]
-
-@testset "Reactant ladder 2: joint PK rejects the unrolled fallback" begin
-    fx = _rj_joint(1)
-    @test fx.built.layout.total == 101
-    native = fx.post_q(fx.u)
-    # The tiling helper at K=1 reproduces the parity fixture's columns.
-    bound_f = bind_data(final_plan("continuous"), _parity_columns("continuous");
-        dims = Dict(:kernel_nsub_pk_loc => 3))
-    @test prepare_query(build_kernel(bound_f), bound_f, :sampler)(fx.u) == native
+@testset "Reactant ladder 2: grouped PK rejects the unrolled fallback" begin
+    fx = _rj_grouped_pk()
+    @test isfinite(fx.post_q(fx.u))
     @test_throws "compiled PK recurrences are disabled" Reactant.@code_hlo fx.post_q(
         Reactant.to_rarray(fx.u))
     # The refusal names the live blocker (scan.md PK adapter note), not the
-    # closed issue #13 (robust G2/G3/G4 re-audit).
+    # closed issue #13.
     err = try
         Reactant.@code_hlo fx.post_q(Reactant.to_rarray(fx.u))
         nothing
@@ -159,24 +156,4 @@ const _RJ_KS = [parse(Int, s) for s in
     @test err isa ArgumentError
     @test occursin("scan.md", sprint(showerror, err))
     @test !occursin("issues/13", sprint(showerror, err))
-end
-
-# Ladder 3 (opt-in diagnostic): retained recurrence primal parity.
-if get(ENV, "RKPPL_REACTANT_RECTANGULAR", "0") == "1"
-previous_mode = ReactiveKernelsPPL._rectangular_pk_enabled[]
-try
-ReactiveKernelsPPL._rectangular_pk_enabled[] = true
-for K in _RJ_KS
-    @testset "Reactant ladder 3: joint K=$K primal @compile parity" begin
-        fx = _rj_joint(K)
-        native = fx.post_q(fx.u)
-        compiled = Reactant.@compile fx.post_q(Reactant.to_rarray(fx.u))
-        @test Float64(compiled(Reactant.to_rarray(fx.u))) ≈ native rtol = 1e-9
-        u2 = Vector{Float64}(0.1 .* randn(Xoshiro(7), length(fx.u)))
-        @test Float64(compiled(Reactant.to_rarray(u2))) ≈ fx.post_q(u2) rtol = 1e-9
-    end
-end
-finally
-    ReactiveKernelsPPL._rectangular_pk_enabled[] = previous_mode
-end
 end

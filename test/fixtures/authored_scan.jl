@@ -101,6 +101,70 @@ end
 
 const prepared_authored_scan_nonempty = prepare(authored_scan_nonempty)
 
+# A triangular recurrence through `history = 0.0`: each weight reads every
+# earlier weight through the response at their lag (the ShinyRK dose-feedback
+# shape). The plan is a host struct shared by `Ref`, and the lag helper
+# dispatches on it; lags past the response read zero through `get`.
+struct HistoryLattice
+    shifts::Vector{Int}
+end
+ReactiveKernels.@traceable _history_lag(p::HistoryLattice, j, i) =
+    p.shifts[j] - p.shifts[i] + 1
+
+@kernel authored_scan_history(amounts::Vector{Float64}, plan, units::Vector{Float64}) = begin
+    weights::Vector{Float64} = scan(amounts, eachindex(amounts), Ref(plan), Ref(units);
+            init = 0, history = 0.0) do carry, amount, j, p, u, earlier
+        exposure = sum(earlier[i] * get(u, _history_lag(p, j, i), 0.0)
+                       for i in 1:j-1; init = 0.0)
+        weight = amount == 0 ? 0.0 : amount / (1 + exposure)
+        (carry + 1, weight)
+    end
+    total::Float64 = sum(weights)
+    return weights
+end
+
+function _authored_scan_history_reference(amounts, plan, units)
+    weights = zeros(length(amounts))
+    for j in eachindex(amounts)
+        amounts[j] == 0 && continue
+        exposure = 0.0
+        for i in 1:j-1
+            exposure += weights[i] * get(units, plan.shifts[j] - plan.shifts[i] + 1, 0.0)
+        end
+        weights[j] = amounts[j] / (1 + exposure)
+    end
+    weights
+end
+
+# A plain scan sharing a host struct and a host named tuple by `Ref`: under a
+# tracing backend both stay host values inside the retained loop, so the plan
+# helper indexes the struct and `_history_scale` loops over a host bound.
+ReactiveKernels.@traceable _history_shift(p::HistoryLattice, j) = p.shifts[j]
+function _history_scale(cfg, x)
+    total = zero(x)
+    for i in 1:cfg.m
+        total += cfg.W[i, i] * x
+    end
+    total
+end
+
+@kernel authored_scan_host_shared(xs::Vector{Float64}, plan, cfg) = begin
+    ys::Vector{Float64} = scan(xs, eachindex(xs), Ref(plan), Ref(cfg); init = 0.0) do carry, x, j, p, c
+        next = carry + x * _history_shift(p, j) + _history_scale(c, x)
+        (next, next)
+    end
+    return ys
+end
+
+# The history is the whole result vector: entries at and after the current step
+# read the `history` value.
+@kernel authored_scan_history_ahead(xs::Vector{Float64}) = begin
+    seen::Vector{Float64} = scan(xs; init = 0.0, history = -1.0) do carry, x, earlier
+        (carry, x + sum(earlier))
+    end
+    return seen
+end
+
 # A consumer using only `import ReactiveKernels` can still author a scan by
 # qualifying its callee. The macro resolves that binding before constructing
 # the scan op; a typed left-hand side is supported in either spelling.
