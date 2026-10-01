@@ -233,13 +233,18 @@ end
         eta = be .* th
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
-    # A scalar leaf cannot also be a sub-predictor coefficient.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # A scalar leaf that is also a sub-predictor coefficient is one
+    # ordinary parameter read twice (its sub-predictor summand lowers as a
+    # derived column — test_fallback.jl).
+    twice = lower_rkppl(quote
         th = a .+ b .* xs
         b ~ Normal(0, 1)
         eta = b .* th
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
+    @test any(p -> p.name === :b, twice.parameters)
+    @test [t.kind for t in twice.predictors[1].terms] ==
+        [InterceptTerm, OffsetTerm]
     # Shrinkage priors go on the coefficient-holding sub-predictors,
     # never the composed root.
     @test_throws SurfaceLoweringError lower_rkppl(quote

@@ -382,6 +382,10 @@ end
         err = _mx_err(ast, data)
         @test err isa SurfaceLoweringError && occursin(msg, err.message)
     end
+    # A second coefficient on a matrix column is an ordinary parameter
+    # scaling a derived column (test_fallback.jl).
+    plan = lower_rkppl(quote X = hcat(1, x1); mu = X * b .+ c .* x1; c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end, D)
+    @test any(p -> p.name === :c, plan.parameters)
     # Named-definition RHS violations screen at extraction.
     err = _mx_err(quote X = hcat(1, x1); mu = X * 2; y .~ Normal.(mu, 1.0) end, D)
     @test err isa SurfaceLoweringError &&

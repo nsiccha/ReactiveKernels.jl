@@ -896,15 +896,6 @@ _pv_m8_q() = (mu = [0.3, -0.4, 0.1, 0.75], mu_alpha = 0.5,
             ("per-level vector",
                 :(Normal.([0, 0, 0], 2)),
                 "per-level priors are not in slice 1"),
-            ("computed arg",
-                :(Normal.(mu_alpha + 0, 2)),
-                "per-level priors are not in slice 1"),
-            ("scalar coef hyper",
-                :scalar,
-                "ride factor broadcasts"),
-            ("sign-flipped hyper",
-                :signflip,
-                "sign-flipped hierarchical location"),
             ("unknown location hyper",
                 :(Normal.(nope, sigma_alpha)),
                 "must be a literal or shared-hyperparameter name"),
@@ -917,26 +908,7 @@ _pv_m8_q() = (mu = [0.3, -0.4, 0.1, 0.75], mu_alpha = 0.5,
         )
         for (label, rhs, msg) in cases
             err = try
-                if rhs === :scalar
-                    lower_rkppl(quote
-                            mu_alpha ~ Normal(0, 10)
-                            s ~ Exponential(1)
-                            mu = a .+ b .* x
-                            b ~ Normal(mu_alpha, 2)
-                            y .~ Normal.(mu, s)
-                        end, (:y, :x))
-                elseif rhs === :signflip
-                    lower_rkppl(quote
-                            mu_alpha ~ Normal(0, 10)
-                            sigma_alpha ~ Exponential(1)
-                            s ~ Exponential(1)
-                            c[levels(g)] .~
-                                Normal.(mu_alpha, sigma_alpha)
-                            mu = -c[g] .+ b .* x
-                            b ~ Normal(0, 10)
-                            y .~ Normal.(mu, s)
-                        end, (:y, :x, :g))
-                elseif rhs === :derivedhyper
+                if rhs === :derivedhyper
                     # A derived response is an n-vector, not a scalar
                     # hyperparameter — rejected at the surface with the
                     # spelling message (robust G1).
@@ -968,14 +940,49 @@ _pv_m8_q() = (mu = [0.3, -0.4, 0.1, 0.75], mu_alpha = 0.5,
             @test occursin(msg, sprint(showerror, err))
         end
     end
+    # Expression arguments, scalar-coefficient hyper names, sign-flipped
+    # hierarchical locations, a coefficient another prior reads, and
+    # assignment scales all lower (coef_grammar A; oracles in
+    # test_fallback.jl).
+    @testset "widened coefficient-prior grammar admits" begin
+        mk(rhs, use = :(c[g])) = quote
+            mu_alpha ~ Normal(0, 10)
+            sigma_alpha ~ Exponential(1)
+            s ~ Exponential(1)
+            sc = 1.0
+            c[levels(g)] .~ $rhs
+            mu = $use .+ b .* x
+            b ~ Normal(0, 10)
+            y .~ Normal.(mu, s)
+        end
+        computed = lower_rkppl(mk(:(Normal.(mu_alpha + 0, 2))), (:y, :x, :g))
+        row = only(p for p in computed.population_priors if p.addressee === :g)
+        @test row.location === :_rkppl_c_arg1
+        @test any(a -> a.name === :_rkppl_c_arg1, computed.assignments)
+        flipped = lower_rkppl(mk(:(Normal.(mu_alpha, sigma_alpha)),
+            :(-c[g])), (:y, :x, :g))
+        row = only(p for p in flipped.population_priors if p.addressee === :g)
+        @test row.location === :_rkppl_neg_mu_alpha
+        @test any(a -> a.name === :_rkppl_neg_mu_alpha &&
+            a.expr == :(-mu_alpha), flipped.assignments)
+        assigned = lower_rkppl(mk(:(Normal.(mu_alpha, sc))), (:y, :x, :g))
+        row = only(p for p in assigned.population_priors if p.addressee === :g)
+        @test row.scale === :sc
+        coefread = lower_rkppl(mk(:(Normal.(b, sigma_alpha))), (:y, :x, :g))
+        @test any(p -> p.name === :b, coefread.parameters)
+        scalar = lower_rkppl(quote
+                mu_alpha ~ Normal(0, 10)
+                s ~ Exponential(1)
+                a ~ Normal(0, 1)
+                mu = a .+ b .* x
+                b ~ Normal(mu_alpha, 2)
+                y .~ Normal.(mu, s)
+            end, (:y, :x))
+        row = only(p for p in scalar.population_priors if p.addressee === :x)
+        @test row.location === :mu_alpha
+    end
     @testset "contract resolution fails closed" begin
         cases = (
-            ("coef location hyper",
-                :(Normal.(b, sigma_alpha)),
-                "location hyperparameter"),
-            ("assignment scale hyper",
-                :(Normal.(mu_alpha, sc)),
-                "scale hyperparameter names a positive-support"),
             ("real-support scale hyper",
                 :(Normal.(mu_alpha, mu_beta)),
                 "positive-support sampled parameter"),
