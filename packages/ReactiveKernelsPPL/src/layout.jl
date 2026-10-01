@@ -1498,9 +1498,20 @@ _rzb_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rzb_, L, :_, i, :_, j)
 # planner and the reverse pass — no new Enzyme surface). The `_ppl_rzb_`
 # partial temps are shared with the log-Jacobian twin. K=1 emits its
 # constant `[1.0]` edge only.
-function _lkj_corr_transform_statements(e::LayoutEntry)
-    K = _lkj_dim(e.size)
-    L = e.name
+_lkj_corr_transform_statements(e::LayoutEntry) =
+    _lkj_vine_statements(e.name, _lkj_dim(e.size),
+        p -> coordinate_read(e.offset + p - 1))
+
+# The vine edges for one K×K factor named `L`, reading the p-th packed
+# partial through `coord(p)`. `stacked=true` is the stratified-draws
+# form: `coord(p)` reads that partial for every stratum at once and every
+# edge is the same op broadcast over the S-vector, so S never multiplies
+# statements (core constraint 1). `L[1,1]` stays the scalar `1.0` in both.
+function _lkj_vine_statements(L::Symbol, K::Int, coord; stacked::Bool = false)
+    T = stacked ? :(AbstractVector{Float64}) : :Float64
+    call(f, x) = stacked ? :($f.($x)) : :($f($x))
+    mul(a, b) = stacked ? :($a .* $b) : :($a * $b)
+    comp(zt) = stacked ? :(sqrt.(1 .- $zt .^ 2)) : :(sqrt(1 - $zt^2))
     stmts = Expr[:($(_rl_name(L, 1, 1))::Float64 = 1.0)]
     K == 1 && return stmts
     # Partials in column-block packing order (Stan's unconstrained
@@ -1508,34 +1519,44 @@ function _lkj_corr_transform_statements(e::LayoutEntry)
     p = 0
     for j in 2:K, i in 1:(j - 1)
         p += 1
-        coord = coordinate_read(e.offset + p - 1)
         z = _rzb_name(L, i, j)
-        push!(stmts, :($z::Float64 = tanh($coord)))
+        push!(stmts, :($z::$T = $(call(:tanh, coord(p)))))
     end
     # L[j,1] = z[1,j]; L[j,i] = z[i,j]*Π√(1-z²); L[i,i] = Π√(1-z²).
     for j in 2:K
-        push!(stmts, :($(_rl_name(L, j, 1))::Float64 =
-            $(_rzb_name(L, 1, j))))
+        push!(stmts, :($(_rl_name(L, j, 1))::$T = $(_rzb_name(L, 1, j))))
     end
     for i in 2:K
         for j in (i + 1):K
             factors = Any[_rzb_name(L, i, j)]
             for ip in 1:(i - 1)
-                zt = _rzb_name(L, ip, j)
-                push!(factors, :(sqrt(1 - $zt^2)))
+                push!(factors, comp(_rzb_name(L, ip, j)))
             end
-            prod = foldl((a, b) -> :($a * $b), factors)
-            push!(stmts, :($(_rl_name(L, j, i))::Float64 = $prod))
+            prod = foldl(mul, factors)
+            push!(stmts, :($(_rl_name(L, j, i))::$T = $prod))
         end
         dfactors = Any[1.0]
         for ip in 1:(i - 1)
-            zt = _rzb_name(L, ip, i)
-            push!(dfactors, :(sqrt(1 - $zt^2)))
+            push!(dfactors, comp(_rzb_name(L, ip, i)))
         end
-        dprod = foldl((a, b) -> :($a * $b), dfactors)
-        push!(stmts, :($(_rl_name(L, i, i))::Float64 = $dprod))
+        dprod = foldl(mul, dfactors)
+        push!(stmts, :($(_rl_name(L, i, i))::$T = $dprod))
     end
     return stmts
+end
+
+# The vine's log-Jacobian over the `_ppl_rzb_` partials of factor `L`
+# (`nothing` at K=1); `stacked=true` sums each partial's S-vector.
+function _lkj_vine_logjac(L::Symbol, K::Int; stacked::Bool = false)
+    K == 1 && return nothing
+    terms = Any[]
+    for j in 2:K, i in 1:(j - 1)
+        z = _rzb_name(L, i, j)
+        w = (j - i + 1) / 2
+        push!(terms, stacked ? :($w * sum(log.(1 .- $z .^ 2))) :
+            :($w * log(1 - $z^2)))
+    end
+    return foldl((a, b) -> :($a + $b), terms)
 end
 
 """
@@ -1564,16 +1585,7 @@ function jacobian_term(e::LayoutEntry)
                      log($bhi - $blo)))
     end
     if e.kind === :varying_corr || e.kind === :cholesky_corr
-        K = _lkj_dim(e.size)
-        K == 1 && return nothing
-        L = e.name
-        terms = Any[]
-        for j in 2:K, i in 1:(j - 1)
-            z = _rzb_name(L, i, j)
-            w = (j - i + 1) / 2
-            push!(terms, :($w * log(1 - $z^2)))
-        end
-        return foldl((a, b) -> :($a + $b), terms)
+        return _lkj_vine_logjac(e.name, _lkj_dim(e.size))
     end
     if e.kind === :vector
         if e.transform === :ordered
