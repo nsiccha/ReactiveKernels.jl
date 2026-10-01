@@ -1160,10 +1160,12 @@ _pv_m10_q() = (mu = [0.5, -1.0, 2.0],)
     @test (frow.location, frow.scale) == (0.0, 10.0)
     @testset "bounds gate fails closed" begin
         scalar_cases = (
+            # A non-literal bound makes `b` an ordinary parameter (not a
+            # coefficient), whose Uniform support still needs literals.
             ("scalar hyper bound",
                 :(Uniform(lo, 3)),
-                SurfaceLoweringError,
-                "must be a literal"),
+                ContractValidationError,
+                "bounds must be finite literals"),
             ("scalar inverted",
                 :(Uniform(10, 5)),
                 ContractValidationError,
@@ -1177,6 +1179,7 @@ _pv_m10_q() = (mu = [0.5, -1.0, 2.0],)
             err = try
                 lower_rkppl(quote
                         a ~ Flat()
+                        lo ~ Normal(0, 1)
                         b ~ $rhs
                         mu = a .+ b .* x
                         y .~ Normal.(mu, 1.5)

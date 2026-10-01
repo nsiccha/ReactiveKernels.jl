@@ -9983,6 +9983,7 @@ end
 function _coefficient_arg(name, a, pname)
     a isa Real && return Float64(a)
     a === :Inf && return Inf
+    _is_signed_inf(a) && return a.args[1] === :- ? -Inf : Inf
     a isa Symbol && return a
     _sfail("coefficient $name of predictor $pname: prior argument " *
            "$(repr(a)) must be a literal or a name")
@@ -10025,9 +10026,12 @@ function _coef_prior_expressible(rhs)
     fam === :flat && return true
     want, _, _, npos = _COEF_SHAPES[fam]
     length(args) == want || return true
-    all(a -> a isa Real || a isa Symbol, args) || return false
-    fam === :uniform && return all(a -> a isa Real, args)
-    return npos == 0 || args[npos] isa Real
+    lit(a) = a isa Real || a === :Inf || _is_signed_inf(a)
+    all(a -> lit(a) || a isa Symbol, args) || return false
+    # Uniform bounds stay literal (`Inf` included, so the contract's
+    # finite-bounds check reports it on the coefficient path).
+    fam === :uniform && return all(lit, args)
+    return npos == 0 || lit(args[npos])
 end
 
 _is_signed_inf(a) = a isa Expr && a.head === :call && length(a.args) == 2 &&
