@@ -1075,23 +1075,44 @@ end
         marker::Reactant.TracedType, arg::AbstractArray) =
     Reactant.promote_to(Reactant.TracedRArray, arg)
 
-# A traced scalar index is a deliberate gather at this compiler boundary.
-# Reactant 0.2.284 preserves lane-varying dynamic-slice indices under
-# `Ops.batch`, so lower the authored index directly rather than materializing an
-# O(K) select/reduction workaround.
+# A traced scalar index is a deliberate gather at this compiler boundary: one
+# element read with one integer index per dimension (`x[j]`, `W[i, j]`), at
+# least one of them traced, is one dynamic slice. Reactant 0.2.284 preserves
+# lane-varying dynamic-slice indices under `Ops.batch`, so lower the authored
+# index directly rather than materializing an O(K) select/reduction workaround.
+# Every index is passed to Reactant as an `Int`: a traced `Int32` index
+# otherwise takes Reactant's general indexing path, which returns a 1×1 array
+# instead of the element.
+const _RKScalarIndex = Union{Integer,Reactant.TracedRNumber{<:Integer}}
+@inline _rk_traced_index(::Tuple{}) = false
+@inline _rk_traced_index(indices::Tuple) =
+    first(indices) isa Reactant.TracedRNumber || _rk_traced_index(Base.tail(indices))
+@inline _rk_int_index(index::Integer) = Int(index)
+@inline _rk_int_index(index::Reactant.TracedRNumber{Int}) = index
+@inline _rk_int_index(index::Reactant.TracedRNumber{<:Integer}) =
+    convert(Reactant.TracedRNumber{Int}, index)
+@inline _rk_gather(array::Reactant.TracedRArray, indices) =
+    Reactant.@allowscalar array[map(_rk_int_index, indices)...]
+
 @inline function ReactiveKernels._tensorized_getindex(
-        array::Reactant.TracedRArray{T,1},
-        index::Reactant.TracedRNumber{I}) where {T,I<:Integer}
-    Reactant.@allowscalar array[index[]]
+        array::Reactant.TracedRArray{T,N},
+        indices::Vararg{_RKScalarIndex,N}) where {T,N}
+    _rk_traced_index(indices) || return getindex(array, indices...)
+    _rk_gather(array, indices)
 end
 
-# A HOST vector read at a traced index (a bound table kept concrete inside a
+# A HOST array read at a traced index (a bound table kept concrete inside a
 # traced plate cell, such as the cut points of an ordered-logistic cell
-# gathered at the observed class) is a constant table of the traced program:
-# lift it and gather, exactly like the state machine's host-column read.
+# gathered at the observed class, or a schedule plan's 2-D lag table read at
+# two traced loop indices) is a constant table of the traced program: lift it
+# and gather, exactly like the state machine's host-column read. A host
+# container of traced scalars is stacked into one traced array the same way;
+# Reactant's own read of it at a traced index recursed without termination.
 @inline function ReactiveKernels._tensorized_getindex(
-        array::Array{T,1}, index::Reactant.TracedRNumber{I}) where {T,I<:Integer}
-    Reactant.@allowscalar Reactant.promote_to(Reactant.TracedRArray{T,1}, array)[index[]]
+        array::Array{T,N}, indices::Vararg{_RKScalarIndex,N}) where {T,N}
+    _rk_traced_index(indices) || return getindex(array, indices...)
+    _rk_gather(Reactant.promote_to(
+        Reactant.TracedRArray{Reactant.unwrapped_eltype(T),N}, array), indices)
 end
 
 # A CONCRETE-integer scalar index `q[i]` on a traced vector cannot lower:
@@ -1375,33 +1396,29 @@ ReactiveKernels._tensorized_scan_lowering(
 _fresh_tracers(x) = x
 _fresh_tracers(x::Union{Tuple,NamedTuple}) = map(_fresh_tracers, x)
 _fresh_tracers(x::Union{Reactant.TracedRArray,Reactant.TracedRNumber}) = copy(x)
-# A traced value an authored recipe loop reads (`ReactiveKernels._loop_capture`);
-# any other traced wrapper passes through, as in `_fresh_tracers`.
+# A traced leaf an authored recipe loop reads (`ReactiveKernels._loop_capture`,
+# which opens tuples and named tuples leaf by leaf); any other traced wrapper
+# passes through, as in `_fresh_tracers`.
 ReactiveKernels._loop_capture_traced(
-        x::Union{Tuple,NamedTuple,Reactant.TracedRArray,Reactant.TracedRNumber}) =
-    _fresh_tracers(x)
+        x::Union{Reactant.TracedRArray,Reactant.TracedRNumber}) = _fresh_tracers(x)
 
 # A scan's `Ref(...)` operands are read by its retained loop the way an
-# authored loop reads its captures (`ReactiveKernels._loop_capture`): a traced
-# leaf enters as a fresh tracer, and an untraced leaf crosses the loop
-# unchanged in a `_LoopHostValue`. Captured bare, Reactant would trace every
-# host leaf the step reads: a host struct (a schedule plan holding a
-# `Vector{Int}`) cannot be rebuilt with traced fields (`NoFieldMatchError`), a
-# host `Int` becomes a traced bound that a plain `for` cannot iterate, and a
-# host matrix becomes a matrix of traced scalars. Tuples and named tuples are
-# opened leaf by leaf, so a partly traced model keeps its host fields host.
-_scan_shared_operand(x) = ReactiveKernels._loop_capture(x)
-_scan_shared_operand(x::Union{Tuple,NamedTuple}) = map(_scan_shared_operand, x)
-_scan_shared_open(x) = x
-_scan_shared_open(x::ReactiveKernels._LoopHostValue) = x.value
-_scan_shared_open(x::Union{Tuple,NamedTuple}) = map(_scan_shared_open, x)
+# authored loop reads its captures (`ReactiveKernels._loop_capture` /
+# `_loop_open`): a traced leaf enters as a fresh tracer, and an untraced leaf
+# crosses the loop unchanged in a `_LoopHostValue`. Captured bare, Reactant
+# would trace every host leaf the step reads: a host struct (a schedule plan
+# holding a `Vector{Int}`) cannot be rebuilt with traced fields
+# (`NoFieldMatchError`), a host `Int` becomes a traced bound that a plain `for`
+# cannot iterate, and a host matrix becomes a matrix of traced scalars. Tuples
+# and named tuples are opened leaf by leaf, so a partly traced model keeps its
+# host fields host.
 
 function ReactiveKernels._tensorized_scan_lowering(
         marker::Reactant.TracedType, step, init, iterated::Tuple,
         shared::Tuple, include_init::Val = Val(false))
     sequences = _fresh_tracers(map(_scan_traced_sequence, iterated))
-    captured = map(_scan_shared_operand, shared)
-    shared = map(_scan_shared_open, captured)
+    captured = map(ReactiveKernels._loop_capture, shared)
+    shared = map(ReactiveKernels._loop_open, captured)
     n = _scan_sequence_length(first(sequences))
     all(xs -> _scan_sequence_length(xs) == n, sequences) || throw(
         DimensionMismatch(
@@ -1431,7 +1448,7 @@ function ReactiveKernels._tensorized_scan_lowering(
     Reactant.@allowscalar buffer[_scan_slot(1, include_init)] = out1
     Reactant.@trace for i in 2:n
         x = map(xs -> _scan_element(xs, i), sequences)
-        carry, out = step(carry, x..., map(_scan_shared_open, captured)...)
+        carry, out = step(carry, x..., map(ReactiveKernels._loop_open, captured)...)
         Reactant.@allowscalar buffer[_scan_slot(i, include_init)] = out
     end
     buffer
@@ -1461,7 +1478,7 @@ function ReactiveKernels._tensorized_scan_history_lowering(
         marker::Reactant.TracedType, step, init, fill, iterated::Tuple,
         shared::Tuple)
     sequences = _fresh_tracers(map(_scan_traced_sequence, iterated))
-    captured = map(_scan_shared_operand, shared)
+    captured = map(ReactiveKernels._loop_capture, shared)
     n = _scan_sequence_length(first(sequences))
     all(xs -> _scan_sequence_length(xs) == n, sequences) || throw(
         DimensionMismatch(
@@ -1470,11 +1487,11 @@ function ReactiveKernels._tensorized_scan_history_lowering(
     buffer = _scan_history_traced_buffer(_fresh_tracers(fill), n)
     n == 0 && return _scan_empty_result(_scan_scalar_type(typeof(fill)), sequences)
     x1 = map(xs -> _scan_element(xs, 1), sequences)
-    carry, out1 = step(init, x1..., map(_scan_shared_open, captured)..., buffer)
+    carry, out1 = step(init, x1..., map(ReactiveKernels._loop_open, captured)..., buffer)
     Reactant.@allowscalar buffer[1] = out1
     Reactant.@trace for i in 2:n
         x = map(xs -> _scan_element(xs, i), sequences)
-        carry, out = step(carry, x..., map(_scan_shared_open, captured)..., buffer)
+        carry, out = step(carry, x..., map(ReactiveKernels._loop_open, captured)..., buffer)
         Reactant.@allowscalar buffer[i] = out
     end
     buffer

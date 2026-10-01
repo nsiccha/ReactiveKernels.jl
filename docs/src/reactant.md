@@ -47,8 +47,11 @@ code is not executed by the docs build.
   its seed). A loop may read a host struct such as a schedule plan; it
   crosses the loop untraced, and a traced value it reads enters as a fresh
   tracer, so a zero-sized input is not returned as an aliased output (which
-  XLA export rejects). A loop over an empty host range is skipped, not
-  traced: `@trace` would trace its body once, indexing zero-length arrays.
+  XLA export rejects). A tuple or named tuple it reads is opened leaf by
+  leaf, so a partly traced model keeps a host matrix host instead of handing
+  the loop one traced scalar per element. A loop over an empty host range is
+  skipped, not traced: `@trace` would trace its body once, indexing
+  zero-length arrays.
   A loop over `eachindex(x)`, `axes(x, d)` or
   `a:b` whose scope rebinds `first`, `step`, `last`, `one`, `zero`, `div`,
   `isqrt` or `error` is traced per iteration instead, since `@trace for`
@@ -58,6 +61,9 @@ code is not executed by the docs build.
   loop with an explicit accumulator (the filter stays a lazy branch), so a sum
   over doses does not grow the program with the dose count. The loop index is
   then traced: indexing written in the term is lowered, host tables included.
+  An element read with one integer index per dimension, any of them traced, is
+  one gather, so `p.shifts[j]` and `W[i, j]` lower alike, for a host table, a
+  traced array, or a host container of traced scalars (stacked first).
   A helper the term calls with it is lowered the same way when it is defined
   with `@traceable` (`@traceable lag(t, p::Lattice, j) = t - p.shifts[j]`);
   an ordinary helper indexing with it fails with `Scalar indexing is
