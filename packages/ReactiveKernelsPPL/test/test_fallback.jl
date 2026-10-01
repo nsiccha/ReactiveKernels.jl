@@ -2,8 +2,9 @@
 # hierarchical identifiability (decision `1cmodra` prong `fallback`;
 # hunt-priors `coef_grammar`; hunt-emitter `coef-priors`): a predictor
 # summand that is not an affine term lowers as an in-graph derived column
-# or, when it reads a factor-indexed vector inline, through the composed
-# path exactly like its named alias; coefficient priors take names and
+# (an inline `z[g]` reads the declared array `z` as a value; its named
+# alias `zg = z[g]` is a factor sub-predictor — one density, both legal);
+# coefficient priors take names and
 # expressions; a coefficient another statement reads is an ordinary
 # parameter; intercept + full-cover factor is identified by a hierarchical
 # scale. Every density is checked against a Distributions.jl oracle.
@@ -59,17 +60,11 @@ end
 
 _fb_normal_ll(mu, sigma) = sum(logpdf.(Normal.(mu, sigma), _fb_col(:y)))
 
-# Plan text with synthesized names mapped to the alias's names, for
-# inline/alias plan identity.
-function _fb_plan_text(plan, renames::Pair...)
-    s = join(string.((plan.predictors, plan.population_priors,
-        plan.parameters, plan.assignments, plan.derived, plan.levelmaps)),
-        "\n")
-    for r in renames
-        s = replace(s, r)
-    end
-    return s
-end
+# The intercept and slope a probe reads: a predictor's coefficient block
+# (`mu`, in Intercept/column order) when the affine path owns them, else
+# the ordinary scalars (a composition keeps `a`, `b` as names).
+_fb_a(q) = haskey(q, :a) ? q.a : q.mu[1]
+_fb_b(q) = haskey(q, :b) ? q.b : q.mu[2]
 
 const _FB_NC_ALIAS = quote
     a ~ Normal(0, 5); sg ~ HalfNormal(1)
@@ -111,20 +106,22 @@ const _FB_EXPR_SCALE = quote
     y .~ Normal.(mu, sigma)
 end
 
-@testset "fallback: inline and named spellings give the same plan" begin
-    for (alias, inline, renames) in (
-            (_FB_NC_ALIAS, _FB_NC_INLINE, (:_rkppl_z_g => :zg,)),
-            (_FB_SLOPE_ALIAS, _FB_SLOPE_INLINE, (:_rkppl_c_g => :cg,)))
+@testset "fallback: inline and named spellings both lower" begin
+    # Naming a subexpression never changes legality. The inline gather
+    # keys the declared array under the author's name (a derived column);
+    # the alias is a factor sub-predictor. The oracles below check that
+    # both give one density.
+    for (alias, inline, arr) in ((_FB_NC_ALIAS, _FB_NC_INLINE, :z),
+            (_FB_SLOPE_ALIAS, _FB_SLOPE_INLINE, :c))
         pa = lower_rkppl(alias, (:y, :x, :g))
         pinl = lower_rkppl(inline, (:y, :x, :g))
-        @test _fb_plan_text(pinl, (string(k) => string(v) for (k, v) in renames)...) ==
-            _fb_plan_text(pa)
+        @test arr in Set(p.name for p in pinl.array_parameters)
+        @test any(t -> t.kind === ComposedTerm, last(pa.predictors).terms)
     end
     plan = lower_rkppl(_FB_NC_INLINE, (:y, :g))
-    @test [p.name for p in plan.predictors] == [:_rkppl_z_g, :mu]
-    @test only(plan.predictors[2].terms).kind === ComposedTerm
-    @test only(plan.predictors[2].terms).options.tree ==
-        :(a .+ sg .* _rkppl_z_g)
+    @test [t.kind for t in only(plan.predictors).terms] ==
+        [InterceptTerm, OffsetTerm]
+    @test only(plan.derived).expr == :(sg .* z[g])
 end
 
 @testset "fallback: computed coefficients lower as derived columns" begin
@@ -184,13 +181,14 @@ end
                 logpdf(Exponential(1), q.sigma)
         end)
     end
-    nc_want(q) = _fb_normal_ll(q.a .+ q.sg .* q[:_rkppl_z_g][g], q.sigma) +
-        logpdf(Normal(0, 5), q.a) + logpdf(_fb_halfnormal(1), q.sg) +
-        sum(logpdf.(Normal(0, 1), q[:_rkppl_z_g])) +
-        logpdf(Exponential(1), q.sigma)
-    @testset "P3 / A2 non-centered intercept inline" begin
-        _fb_check(_FB_NC_INLINE, (:y, :g), (_rkppl_z_g = [0.3, -0.9, 1.4],
-            a = 0.2, sg = 0.7, sigma = 1.1), nc_want)
+    nc_want(zv) = q -> _fb_normal_ll(_fb_a(q) .+ q.sg .* q[zv][g], q.sigma) +
+        logpdf(Normal(0, 5), _fb_a(q)) + logpdf(_fb_halfnormal(1), q.sg) +
+        sum(logpdf.(Normal(0, 1), q[zv])) + logpdf(Exponential(1), q.sigma)
+    @testset "P3 / A2 non-centered intercept, inline and alias" begin
+        _fb_check(_FB_NC_INLINE, (:y, :g), (z = [0.3, -0.9, 1.4],
+            mu = [0.2], sg = 0.7, sigma = 1.1), nc_want(:z))
+        _fb_check(_FB_NC_ALIAS, (:y, :g), (zg = [0.3, -0.9, 1.4],
+            a = 0.2, sg = 0.7, sigma = 1.1), nc_want(:zg))
     end
     @testset "Q5 reordered `z[g] .* sg`" begin
         _fb_check(quote
@@ -198,8 +196,8 @@ end
             z[levels(g)] .~ Normal.(0, 1); sigma ~ Exponential(1)
             mu = a .+ z[g] .* sg
             y .~ Normal.(mu, sigma)
-        end, (:y, :g), (_rkppl_z_g = [0.3, -0.9, 1.4], a = 0.2, sg = 0.7,
-            sigma = 1.1), nc_want)
+        end, (:y, :g), (z = [0.3, -0.9, 1.4], mu = [0.2], sg = 0.7,
+            sigma = 1.1), nc_want(:z))
     end
     @testset "P3c intercept + hierarchical full-cover factor" begin
         plan = _fb_check(quote
@@ -239,17 +237,20 @@ end
                 logpdf(Exponential(1), q.sigma)
         end)
     end
-    @testset "P4 varying slope inline" begin
-        _fb_check(_FB_SLOPE_INLINE, (:y, :x, :g), (_rkppl_c_g =
-            [0.3, -0.9, 1.4], a = 0.2, b = -0.4, sg = 0.7, sigma = 1.1),
-        q -> begin
-            c = q[:_rkppl_c_g]
-            _fb_normal_ll(q.a .+ q.b .* x .+ c[g] .* x, q.sigma) +
-                logpdf(Normal(0, 5), q.a) + logpdf(Normal(0, 1), q.b) +
+    @testset "P4 varying slope, inline and alias" begin
+        slope_want(cv) = q -> begin
+            c = q[cv]
+            a, b = _fb_a(q), _fb_b(q)
+            _fb_normal_ll(a .+ b .* x .+ c[g] .* x, q.sigma) +
+                logpdf(Normal(0, 5), a) + logpdf(Normal(0, 1), b) +
                 logpdf(_fb_halfnormal(1), q.sg) +
                 sum(logpdf.(Normal(0, q.sg), c)) +
                 logpdf(Exponential(1), q.sigma)
-        end)
+        end
+        _fb_check(_FB_SLOPE_INLINE, (:y, :x, :g), (c = [0.3, -0.9, 1.4],
+            mu = [0.2, -0.4], sg = 0.7, sigma = 1.1), slope_want(:c))
+        _fb_check(_FB_SLOPE_ALIAS, (:y, :x, :g), (cg = [0.3, -0.9, 1.4],
+            a = 0.2, b = -0.4, sg = 0.7, sigma = 1.1), slope_want(:cg))
     end
     hs_want(q) = _fb_normal_ll(q.mu[1] .+ (q.z * q.lam * q.tau) .* x,
         q.sigma) + logpdf(Normal(0, 5), q.mu[1]) +
@@ -420,10 +421,10 @@ end
             y .~ Normal.(mu, sigma)
         end, (:y, :x1))
     end
-    # One predictor mixing an inline factor composition, an n-ary computed
+    # One predictor mixing an inline array gather, an n-ary computed
     # coefficient and a simplex element; the emitted kernel is the same
     # for every observation count (no data-length unrolling).
-    @testset "computed coefficients beside an inline factor composition" begin
+    @testset "computed coefficients beside an inline array gather" begin
         x, x1, g = _fb_col(:x), _fb_col(:x1), _FB_COLS[:g]
         prog = quote
             a ~ Normal(0, 5); lam ~ HalfCauchy(1); tau ~ HalfCauchy(1)
@@ -433,17 +434,33 @@ end
             mu = a .+ x .* (z * lam * tau) .+ sg .* zz[g] .+ x1 .* phi[1]
             y .~ Normal.(mu, sigma)
         end
-        # The inline `zz[g]` keys its levels under the sub-predictor
-        # (`_rkppl_zz_g`), as the alias `zg = zz[g]` keys them under `zg`.
-        q = (a = 0.4, lam = 0.9, tau = 0.3, z = -1.2, sg = 0.7,
-            _rkppl_zz_g = [0.2, -0.5, 0.9], phi = [0.35, 0.65], sigma = 1.3)
-        _fb_check(prog, (:y, :x, :x1, :g), q, q -> _fb_normal_ll(q.a .+
-                x .* (q.z * q.lam * q.tau) .+ q.sg .* q._rkppl_zz_g[g] .+
+        q = (mu = [0.4], lam = 0.9, tau = 0.3, z = -1.2, sg = 0.7,
+            zz = [0.2, -0.5, 0.9], phi = [0.35, 0.65], sigma = 1.3)
+        _fb_check(prog, (:y, :x, :x1, :g), q, q -> _fb_normal_ll(_fb_a(q) .+
+                x .* (q.z * q.lam * q.tau) .+ q.sg .* q.zz[g] .+
+                x1 .* q.phi[1], q.sigma) + logpdf(Normal(0, 5), _fb_a(q)) +
+            logpdf(_fb_halfcauchy(1), q.lam) +
+            logpdf(_fb_halfcauchy(1), q.tau) + logpdf(Normal(0, 1), q.z) +
+            logpdf(_fb_halfnormal(1), q.sg) +
+            sum(logpdf.(Normal(0, 1), q.zz)) +
+            logpdf(Dirichlet([1.0, 1.0]), q.phi) +
+            logpdf(Exponential(1), q.sigma))
+        # The alias spelling routes the same summands through the
+        # composition path (n-ary `*` folds like Julia's).
+        alias = Expr(:block, filter(a -> !(a isa Expr && a.head === :(=) &&
+            a.args[1] === :mu), prog.args)...)
+        insert!(alias.args, length(alias.args), :(zg = zz[g]))
+        insert!(alias.args, length(alias.args), :(mu = a .+ x .* (z * lam *
+            tau) .+ sg .* zg .+ x1 .* phi[1]))
+        qa = merge(Base.structdiff(q, NamedTuple{(:zz, :mu)}),
+            (zg = q.zz, a = q.mu[1]))
+        _fb_check(alias, (:y, :x, :x1, :g), qa, q -> _fb_normal_ll(q.a .+
+                x .* (q.z * q.lam * q.tau) .+ q.sg .* q.zg[g] .+
                 x1 .* q.phi[1], q.sigma) + logpdf(Normal(0, 5), q.a) +
             logpdf(_fb_halfcauchy(1), q.lam) +
             logpdf(_fb_halfcauchy(1), q.tau) + logpdf(Normal(0, 1), q.z) +
             logpdf(_fb_halfnormal(1), q.sg) +
-            sum(logpdf.(Normal(0, 1), q._rkppl_zz_g)) +
+            sum(logpdf.(Normal(0, 1), q.zg)) +
             logpdf(Dirichlet([1.0, 1.0]), q.phi) +
             logpdf(Exponential(1), q.sigma))
         nodes(e) = e isa Expr ? 1 + sum(nodes, e.args; init = 0) : 1
@@ -506,8 +523,8 @@ end
 
 @testset "fallback: Enzyme gradients" begin
     for (prog, names, q) in (
-            (_FB_NC_INLINE, (:y, :g), (_rkppl_z_g = [0.3, -0.9, 1.4],
-                a = 0.2, sg = 0.7, sigma = 1.1)),
+            (_FB_NC_INLINE, (:y, :g), (z = [0.3, -0.9, 1.4],
+                mu = [0.2], sg = 0.7, sigma = 1.1)),
             (_FB_COMPUTED, (:y, :x), (mu = [0.4], lam = 0.9, tau = 0.3,
                 z = -1.2, sigma = 1.3)),
             (_FB_EXPR_SCALE, (:y, :x), (mu = [0.4, -0.3], sigma = 1.3)))

@@ -652,8 +652,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         # Inline factor references inside compositions (`sg .* z[g]`)
         # intern as synthetic sub-predictors, one per `(base, index)`,
         # exactly like the named alias `zg = z[g]`.
-        inline_subs = Dict{Tuple{Symbol,Symbol},Symbol}(),
-        inline_sub_exprs = Dict{Symbol,Expr}(),
         scan_states = Set{Symbol}(s.state for s in scans),
         scan_coefs = Set{Symbol}(),
         varying_draws = Dict{Symbol,VaryingDraws}(
@@ -8171,10 +8169,6 @@ end
 function _composed_has_sub(node, ctx, allow_factor::Bool = false)
     node isa Symbol && return _is_composed_sub(node, ctx, allow_factor)
     node isa Expr || return false
-    # An inline factor reference (`z[g]`) is a sub-predictor exactly where
-    # its named alias (`zg = z[g]`) is: under `.*` (naming a
-    # subexpression never changes legality).
-    _is_factor_index_def(node, ctx) && return allow_factor
     node.head === :call || return any(
         a -> _composed_has_sub(a, ctx, allow_factor), node.args)
     isempty(node.args) && return false
@@ -8273,8 +8267,6 @@ function _is_bare_sub_map(rhs, ctx)
     # one-operand guidance instead of a raw `only` ArgumentError.
     length(rhs.args[2].args) == 1 || return false
     arg = only(rhs.args[2].args)
-    # An inline factor reference maps like its named alias.
-    arg isa Expr && return _is_factor_index_def(arg, ctx)
     arg isa Symbol || return false
     _composed_trigger(arg, ctx) && return false
     return _is_composed_sub(arg, ctx, true)
@@ -8316,11 +8308,6 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             return _sfail("$where combines $node, which names nothing — " *
                 "declare it (`$node ~ Prior` or `$node = ...`)")
         end
-    end
-    if node isa Expr && _is_factor_index_def(node, ctx)
-        nm = _intern_inline_sub!(node, ctx)
-        nm in subs || push!(subs, nm)
-        return nm
     end
     # A sub-free scalar subexpression (a literal, `s + 1`, `sqrt(v)`) is
     # one scalar leaf, exactly as if bound to a name first.
@@ -8407,24 +8394,6 @@ function _composed_scalar_leaf!(pname, node, ctx, scalars)
     return nm
 end
 
-"""An inline factor reference inside a composition (`sg .* z[g]`) interns
-as one synthetic sub-predictor per `(base, index)` — the plan of the named
-alias `zg = z[g]` under a synthesized name."""
-function _intern_inline_sub!(ref::Expr, ctx)
-    key = (ref.args[1]::Symbol, ref.args[2]::Symbol)
-    return get!(ctx.inline_subs, key) do
-        nm = Symbol(:_rkppl_, key[1], :_, key[2])
-        k = 1
-        while nm in ctx.taken
-            k += 1
-            nm = Symbol(:_rkppl_, key[1], :_, key[2], :_, k)
-        end
-        push!(ctx.taken, nm)
-        ctx.inline_sub_exprs[nm] = ref
-        nm
-    end
-end
-
 """Lower a composed predictor at a response/scale location: intern the
 affine subs (scale-predictor pattern, IdentityLink), then push the
 composed predictor itself. Nested compositions fail in the guard."""
@@ -8449,9 +8418,7 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
             push!(ctx.absorbed, s)
             continue
         end
-        srhs = get(ctx.inline_sub_exprs, s) do
-            ctx.detmap[s]
-        end
+        srhs = ctx.detmap[s]
         terms, uses = _analyze_predictor(s, srhs, ctx, lhs;
             composed_sub = true)
         all(t -> t.kind in _COMPOSED_SUB_KINDS, terms) || _sfail(
