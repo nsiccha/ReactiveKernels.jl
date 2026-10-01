@@ -24,6 +24,7 @@ result = scan(xs₁, xs₂, …, Ref(shared₁), Ref(shared₂), …; init = c�
     (new_carry, output)          # the do-block must END with this 2-tuple
 end
 # optional: `include_init = true` returns [c₀, output₁, output₂, …]
+# optional: `history = h₀` appends one do-block argument, the outputs so far
 ```
 
 - **`xs₁, xs₂, …`** — one or more **iterated sequences**, the leading non-`Ref`
@@ -43,6 +44,9 @@ end
 - **`include_init = true`** (a literal; default `false`) returns
   `[init, output₁, output₂, …]` instead: one element longer than the sequences,
   in one buffer. See [The initial value in the result](#The-initial-value-in-the-result).
+- **`history = h₀`** (a number) gives the do-block one more, last argument: the
+  outputs written so far, `h₀` at and after the current step. See
+  [Reading earlier outputs](#Reading-earlier-outputs).
 
 The carry may be a scalar, a **`NamedTuple`**, or a vector (an HMM forward
 pass threads its belief-state vector; see the `eachrow` shape below) when
@@ -195,6 +199,57 @@ forward = scan(eachrow(scan_rows), Ref(gain); init = seed) do carry, row, g
 end
 ```
 
+## Reading earlier outputs
+
+Some recurrences read every earlier output, not one carried value: each dose
+weight of a dose-feedback model depends on the exposure the earlier weighted
+doses produce, `w[j] = f(mg[j], Σ_{i<j} w[i] · u[lag(j, i)])`. With
+`history = h₀` the do-block receives, as its last argument, the result vector
+the scan is writing:
+
+```julia
+weights = scan(dose_mgs, eachindex(dose_mgs), Ref(plan), Ref(units);
+               init = 0, history = 0.0) do carry, mg, j, p, u, earlier
+    exposure = sum(earlier[i] * get(u, lag(p, j, i), 0.0) for i in 1:j-1; init = 0.0)
+    (carry, mg == 0 ? 0.0 : effective_amount(mg, exposure))
+end
+```
+
+- At step `j`, `earlier[i]` is step `i`'s output for `i < j` and `h₀` for
+  `i ≥ j`, on every backend. The vector has the sequences' full length, so a
+  step that needs its own index takes it from a lockstep sequence
+  (`eachindex(dose_mgs)` above).
+- `h₀` must be a number. It is the element type of the result: each output is
+  stored converted to `typeof(h₀)`. An empty sequence returns an empty vector of
+  that type.
+- The history is read-only and belongs to its step. An indexed write in a
+  step is rejected when the kernel is defined, the native view has no
+  `setindex!`, and a carry that holds it is an `ArgumentError`: natively it is
+  a view of the vector the scan is still writing.
+- `include_init = true` and `history` cannot be combined.
+
+The carry is no longer a copy of the outputs. Before, a graph that needed them
+carried the whole vector plus a step index, rebuilt it every step
+(`ifelse.(positions .== carry.index, w, carry.prior)`), and pre-gathered an
+`n × n` matrix of feedback terms. Natively, the history scan is the in-place
+hand loop: the result vector, filled with `h₀`, is written step by step, and
+the step reads it. On the ShinyRK dose-weight step (14 doses, 4 × 4
+effectiveness surface; strato2, x86-64, Julia 1.10.11, minimum over
+BenchmarkTools samples) the history form takes 1.71 µs and allocates 176 B,
+the result vector only, against 1.65 µs and 176 B for the hand-written loop,
+with bitwise-equal values. The carried-vector form takes 2.42 µs and 5,456 B,
+plus 8,160 B for its gathered matrix. In that step a broadcast
+`sin.(…)`/`W * basis` effectiveness helper costs more than either: 5,376 B and
+about 7 µs over the 14 doses. A scan step runs its statements as written, so a
+per-step broadcast allocates every step.
+
+Under Reactant the result buffer is the `while` loop's output buffer, filled
+with `h₀` before the loop; each step reads it before its own output is written.
+The step's sum over `1:j-1` is one retained loop with a traced bound (a
+`stablehlo.while` per step body), and the program does not grow with the number
+of steps: the dose-weight graph emits the same program for 3 and 6 doses, and a
+position batch the same program for 3 and 6 lanes.
+
 ## Empty sequences
 
 An empty schedule needs no special case. When the iterated sequences are empty,
@@ -266,7 +321,13 @@ using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
   step's row arithmetic stays vector-valued whatever the row width), and a
   host (`bound=`) sequence is lifted into the traced program as a constant
   exactly as bound plate data is. Sequences of different kinds may be
-  iterated together, and several lockstep sequences share the one loop. The carry — scalar, `NamedTuple`, or vector — is
+  iterated together, and several lockstep sequences share the one loop.
+  `Ref(...)` operands are read the way an authored loop reads its captures:
+  traced values enter the loop as fresh tracers and host values cross it
+  unchanged, field by field for a tuple or named tuple. So a host schedule
+  plan (a struct holding a `Vector{Int}`) reaches the step as itself, and a
+  host matrix or `Int` in a partly traced model stays host instead of becoming
+  traced scalars. The carry — scalar, `NamedTuple`, or vector — is
   threaded as a loop-carried value, the per-step outputs are written into a
   preallocated traced buffer with a dynamic-update-slice, and the first step
   runs eagerly to seed the carry and fix the output element type (`N == 1`
@@ -320,6 +381,8 @@ the bound schedule requires preparing and compiling again.
 - **Per-step output is a scalar** on the Reactant `while` path. A non-scalar
   per-step output there is a loud, reported error, never a silent mis-lowering;
   author the output as a scalar (or open an issue for the shape you need).
+- **`history` holds numbers and excludes `include_init`.** Its value must be a
+  number, and it cannot be combined with `include_init = true`.
 - **A directly iterated N-D array is rejected** on the Reactant path (its
   native semantics are linear element iteration); iterate `eachrow(M)` or
   `vec(M)` explicitly.

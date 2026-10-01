@@ -1315,7 +1315,11 @@ _scan_scalar_type(::Type{T}) where {T} = T
 # empty result is a zero-sized constant, which works as an intermediate but
 # still meets §7l if it is itself the compiled program's output.
 function _scan_empty_output(step, init, sequences::Tuple, shared::Tuple)
-    T = _scan_empty_output_type(step, init, sequences, shared)
+    _scan_empty_result(_scan_empty_output_type(step, init, sequences, shared),
+                       sequences)
+end
+
+function _scan_empty_result(::Type{T}, sequences::Tuple) where {T}
     for xs in sequences
         xs isa Reactant.TracedRArray{T,1} && return copy(xs)
     end
@@ -1366,11 +1370,27 @@ ReactiveKernels._loop_capture_traced(
         x::Union{Tuple,NamedTuple,Reactant.TracedRArray,Reactant.TracedRNumber}) =
     _fresh_tracers(x)
 
+# A scan's `Ref(...)` operands are read by its retained loop the way an
+# authored loop reads its captures (`ReactiveKernels._loop_capture`): a traced
+# leaf enters as a fresh tracer, and an untraced leaf crosses the loop
+# unchanged in a `_LoopHostValue`. Captured bare, Reactant would trace every
+# host leaf the step reads: a host struct (a schedule plan holding a
+# `Vector{Int}`) cannot be rebuilt with traced fields (`NoFieldMatchError`), a
+# host `Int` becomes a traced bound that a plain `for` cannot iterate, and a
+# host matrix becomes a matrix of traced scalars. Tuples and named tuples are
+# opened leaf by leaf, so a partly traced model keeps its host fields host.
+_scan_shared_operand(x) = ReactiveKernels._loop_capture(x)
+_scan_shared_operand(x::Union{Tuple,NamedTuple}) = map(_scan_shared_operand, x)
+_scan_shared_open(x) = x
+_scan_shared_open(x::ReactiveKernels._LoopHostValue) = x.value
+_scan_shared_open(x::Union{Tuple,NamedTuple}) = map(_scan_shared_open, x)
+
 function ReactiveKernels._tensorized_scan_lowering(
         marker::Reactant.TracedType, step, init, iterated::Tuple,
         shared::Tuple, include_init::Val = Val(false))
     sequences = _fresh_tracers(map(_scan_traced_sequence, iterated))
-    shared = _fresh_tracers(shared)
+    captured = map(_scan_shared_operand, shared)
+    shared = map(_scan_shared_open, captured)
     n = _scan_sequence_length(first(sequences))
     all(xs -> _scan_sequence_length(xs) == n, sequences) || throw(
         DimensionMismatch(
@@ -1400,8 +1420,52 @@ function ReactiveKernels._tensorized_scan_lowering(
     Reactant.@allowscalar buffer[_scan_slot(1, include_init)] = out1
     Reactant.@trace for i in 2:n
         x = map(xs -> _scan_element(xs, i), sequences)
-        carry, out = step(carry, x..., shared...)
+        carry, out = step(carry, x..., map(_scan_shared_open, captured)...)
         Reactant.@allowscalar buffer[_scan_slot(i, include_init)] = out
+    end
+    buffer
+end
+
+# `scan(...; history = h0)`: the traced result buffer, filled with `h0`, is the
+# while loop's output buffer, and each step reads it before its own output is
+# written, so the step sees the earlier outputs and `h0` from its own index on
+# — the native view's values. The buffer's element type is `h0`'s. The step
+# reads the buffer itself, not a `copy`: on Reactant 0.2.290 a whole-buffer
+# reduction of a copied tracer inside a short loop (`sum(copy(b))` before
+# `b[i] = …`, 3 iterations) miscompiles under the default optimizer, while the
+# same reduction of `b` is exact (`test_authored_scan_reactant.jl`).
+ReactiveKernels._tensorized_scan_history_lowering(
+        ::Union{Reactant.AbstractConcreteArray,Reactant.AbstractConcreteNumber},
+        step, init, fill, iterated::Tuple, shared::Tuple) =
+    ReactiveKernels._tensorized_scan_history_lowering(
+        nothing, step, init, fill, iterated, shared)
+
+_scan_history_traced_buffer(fill::Number, n) =
+    Reactant.promote_to(Reactant.TracedRArray, Base.fill(fill, n))
+_scan_history_traced_buffer(fill::Reactant.TracedRNumber{T}, n) where {T} =
+    Reactant.promote_to(Reactant.TracedRArray, zeros(T, n)) .+ fill
+_scan_history_traced_buffer(fill, n) =
+    ReactiveKernels._scan_history_buffer(nothing, fill)  # throws: not a number
+
+function ReactiveKernels._tensorized_scan_history_lowering(
+        marker::Reactant.TracedType, step, init, fill, iterated::Tuple,
+        shared::Tuple)
+    sequences = _fresh_tracers(map(_scan_traced_sequence, iterated))
+    captured = map(_scan_shared_operand, shared)
+    n = _scan_sequence_length(first(sequences))
+    all(xs -> _scan_sequence_length(xs) == n, sequences) || throw(
+        DimensionMismatch(
+            "scan's iterated sequences must have equal length; got lengths " *
+            "$(map(_scan_sequence_length, sequences))."))
+    buffer = _scan_history_traced_buffer(_fresh_tracers(fill), n)
+    n == 0 && return _scan_empty_result(_scan_scalar_type(typeof(fill)), sequences)
+    x1 = map(xs -> _scan_element(xs, 1), sequences)
+    carry, out1 = step(init, x1..., map(_scan_shared_open, captured)..., buffer)
+    Reactant.@allowscalar buffer[1] = out1
+    Reactant.@trace for i in 2:n
+        x = map(xs -> _scan_element(xs, i), sequences)
+        carry, out = step(carry, x..., map(_scan_shared_open, captured)..., buffer)
+        Reactant.@allowscalar buffer[i] = out
     end
     buffer
 end

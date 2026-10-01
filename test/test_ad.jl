@@ -728,6 +728,39 @@ end
     @test gradient == zeros(length(q))
 end
 
+@testset "history scan reverse AD" begin
+    # The steps read the result vector the scan writes; reverse mode
+    # differentiates through those reads with respect to either input.
+    F = AuthoredScanFixtures
+    plan = F.HistoryLattice([0, 2, 3, 7, 12])
+    amounts0 = [2.0, 0.5, 1.5, 3.0, 1.0]
+    units0 = [exp(-0.3 * (l - 1)) for l in 1:10]
+    reference(a, u) = sum(F._authored_scan_history_reference(a, plan, u))
+    fd(f, x0) = map(eachindex(x0)) do i
+        l, r = copy(x0), copy(x0)
+        l[i] -= 1e-5
+        r[i] += 1e-5
+        (f(r) - f(l)) / 2e-5
+    end
+    k = prepare(F.authored_scan_history; want = :total)
+    # With `units` constant, Base's `get(units, lag, 0.0)` times an active value
+    # fails Enzyme's static activity analysis with or without a scan (a plain
+    # recipe `sum(a[i] * get(units, …, 0.0) for i …)` does too), so that case
+    # runs with runtime activity.
+    runtime_activity = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    for (active, x0, objective, backend) in (
+            (:amounts, amounts0, a -> reference(a, units0), runtime_activity),
+            (:units, units0, u -> reference(amounts0, u), TEST_AD_BACKEND))
+        prepared = prepare_ad(k, backend, amounts0, plan, units0; active)
+        gradient = zeros(length(x0))
+        value, returned = ad_value_and_gradient!(prepared, gradient,
+                                                 amounts0, plan, units0)
+        @test value ≈ reference(amounts0, units0)
+        @test returned === gradient
+        @test gradient ≈ fd(objective, x0) rtol = 1e-6 atol = 1e-8
+    end
+end
+
 @testset "scan AD preserves operation-table source transforms" begin
     spec = AuthoredScanFixtures.authored_scan_arma
     q, series = [0.2, 0.7, -0.3], [0.5]

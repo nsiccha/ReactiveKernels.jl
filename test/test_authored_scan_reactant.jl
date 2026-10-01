@@ -391,3 +391,78 @@ end
     @test_throws "only for a scalar carry seed" Reactant.@compile prepare(
         included_named_carry)(Reactant.to_rarray([1.0, 2.0]))
 end
+
+@testset "a history scan keeps one retained loop and matches native" begin
+    F = AuthoredScanFixtures
+    units = [exp(-0.3 * (l - 1)) for l in 1:10]
+    traced_units = Reactant.to_rarray(units)
+    sizes = Int[]
+    for (amounts, shifts) in (([2.0, 0.0, 1.5], [0, 2, 3]),
+                              ([2.0, 0.0, 1.5, 3.0, 1.0, 0.7], [0, 2, 3, 7, 12, 13]))
+        plan = F.HistoryLattice(shifts)
+        traced = Reactant.to_rarray(amounts)
+        weights = prepare(F.authored_scan_history)
+        compiled = Reactant.@compile weights(traced, plan, traced_units)
+        @test Array(compiled(traced, plan, traced_units)) ≈ weights(amounts, plan, units)
+        changed = Reactant.to_rarray(amounts .+ 0.5)
+        @test Array(compiled(changed, plan, traced_units)) ≈
+            weights(amounts .+ 0.5, plan, units)
+        total = prepare(F.authored_scan_history; want = :total)
+        @test Reactant.to_number((Reactant.@compile total(traced, plan, traced_units))(
+            traced, plan, traced_units)) ≈ total(amounts, plan, units)
+        hlo = repr(Reactant.@code_hlo optimize = false weights(traced, plan, traced_units))
+        # The steps' loop and each step's sum over the earlier outputs are
+        # retained loops; the first step's sum sits before the step loop.
+        @test count("stablehlo.while", hlo) == 3
+        push!(sizes, count("\n", hlo))
+    end
+    # The program does not grow with the number of steps.
+    @test allequal(sizes)
+
+    # Entries at and after the current step read the history value. The short
+    # loops are unrolled by the optimizer, the case where a reduction over a
+    # copied buffer tracer miscompiled (the lowering reads the buffer itself).
+    ahead = prepare(F.authored_scan_history_ahead)
+    for n in (3, 4, 7)
+        xs = collect(1.0:n)
+        traced_xs = Reactant.to_rarray(xs)
+        @test Array((Reactant.@compile ahead(traced_xs))(traced_xs)) ≈ ahead(xs)
+    end
+
+    # An empty traced sequence runs no step and emits no step loop.
+    empty, empty_plan = Reactant.to_rarray(Float64[]), F.HistoryLattice(Int[])
+    total = prepare(F.authored_scan_history; want = :total)
+    @test Reactant.to_number((Reactant.@compile total(empty, empty_plan, traced_units))(
+        empty, empty_plan, traced_units)) == 0.0
+    @test count("stablehlo.while", repr(Reactant.@code_hlo optimize = false total(
+        empty, empty_plan, traced_units))) == 0
+end
+
+@testset "a history scan in a position batch" begin
+    F = AuthoredScanFixtures
+    amounts, plan = [2.0, 0.0, 1.5, 3.0, 1.0], F.HistoryLattice([0, 2, 3, 7, 12])
+    batch = vectorize(F.authored_scan_history; batched = :units, want = :weights)
+    traced_amounts = Reactant.to_rarray(amounts)
+    sizes = Int[]
+    for lanes in (3, 6)
+        U = [exp(-0.3 * (l - 1)) * s for l in 1:10, s in range(0.5, 2.0; length = lanes)]
+        traced_U = Reactant.to_rarray(U)
+        compiled = Reactant.@compile batch(traced_amounts, plan, traced_U)
+        @test Array(compiled(traced_amounts, plan, traced_U)) ≈ batch(amounts, plan, U)
+        push!(sizes, count("\n", repr(Reactant.@code_hlo optimize = false batch(
+            traced_amounts, plan, traced_U))))
+    end
+    @test allequal(sizes)
+end
+
+@testset "a scan's host struct and host named tuple stay host in its loop" begin
+    F = AuthoredScanFixtures
+    xs = [1.0, 2.0, 3.0, 4.0]
+    plan, cfg = F.HistoryLattice([1, 5, 9, 2]), (; W = [2.0 0.0; 0.0 3.0], m = 2)
+    k = prepare(F.authored_scan_host_shared)
+    traced = Reactant.to_rarray(xs)
+    compiled = Reactant.@compile k(traced, plan, cfg)
+    @test Array(compiled(traced, plan, cfg)) ≈ k(xs, plan, cfg)
+    @test count("stablehlo.while", repr(Reactant.@code_hlo optimize = false k(
+        traced, plan, cfg))) == 1
+end
