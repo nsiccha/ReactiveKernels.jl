@@ -80,11 +80,13 @@ latent, a per-cell latent block, a leveled vector latent (cutpoints,
 thresholds, simplex), a spline coefficient-vector block, a varying
 vector block (`tau`/`z_flat`), a varying LKJ
 Cholesky factor, a joint-outcomes LKJ Cholesky factor, or an HSGP
-coefficient-vector block (`beta_raw`). `lo` is the constrained lower
+coefficient-vector block (`beta_raw`), or an elementwise array parameter
+(`:array`, column-major over `dims`). `lo` is the constrained lower
 bound of an `:interval`/`:floored` transform (`:interval` also sets
-`hi`; an `:upper` transform sets `hi` only; `NaN` otherwise)."""
+`hi`; an `:upper` transform sets `hi` only; `NaN` otherwise). `dims` is
+the axis lengths of an `:array` entry (empty for every other kind)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :varying | :varying_corr | :cholesky_corr | :hsgp | :glm
+    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :varying | :varying_corr | :cholesky_corr | :hsgp | :glm | :array
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
@@ -93,7 +95,14 @@ struct LayoutEntry
     transform::Symbol # :identity | :exp | :logistic | :interval | :floored | :upper | :ordered | :simplex | :lkj
     lo::Float64 # :interval/:floored lower bound (else NaN)
     hi::Float64 # :interval/:upper upper bound (else NaN)
+    dims::Vector{Int} # :array axis lengths (else empty)
 end
+# Entries other than arrays carry no axes.
+LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
+    labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol,
+    lo, hi) =
+    LayoutEntry(kind, predictor, name, labels, offset, size, transform, lo,
+        hi, Int[])
 # Non-interval entries omit the bounds.
 LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
     labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol) =
@@ -484,6 +493,10 @@ function assign_layout(plan::StructuralPlan)
             [names.beta], offset, el.k, :identity))
         offset += el.k
     end
+    # Declared array parameters last (`arrays.jl`): LKJ factors and
+    # simplexes reuse the `:cholesky_corr` / `:vector` edges, elementwise
+    # arrays pack one `:array` block each.
+    offset = _array_layout_entries!(entries, plan, offset)
     return LayoutTable(entries, offset - 1)
 end
 
@@ -868,7 +881,7 @@ function coordinate_names(layout::LayoutTable)
             for i in 1:e.size
                 push!(names, Symbol(string(e.name) * "." * string(i)))
             end
-        elseif e.kind === :vector
+        elseif e.kind === :vector || e.kind === :array
             append!(names, e.labels)
         elseif e.kind === :varying_corr || e.kind === :cholesky_corr
             append!(names, e.labels)
@@ -949,6 +962,10 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, e.name => Vector{Float64}(seg))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
+        elseif e.kind === :array
+            v = [_constrain_elt(e, Float64(x)) for x in seg]
+            push!(pairs, e.name =>
+                (length(e.dims) == 1 ? v : reshape(v, e.dims...)))
         elseif e.kind === :varying_corr || e.kind === :cholesky_corr
             # Both LKJ-factor kinds share the host hyperspherical edges
             # (name/size-keyed — kind-agnostic); only `:varying_corr`
@@ -1096,6 +1113,17 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] scan state $(e.name) length mismatch"),
             )
             u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
+        elseif e.kind === :array
+            haskey(nt, e.name) || throw(
+                ContractValidationError("[layout] missing array parameter $(e.name)"),
+            )
+            v = nt[e.name]
+            size(v) == Tuple(e.dims) || throw(ContractValidationError(
+                "[layout] array parameter $(e.name) has size $(size(v)), " *
+                "want $(Tuple(e.dims))"))
+            for (k, x) in enumerate(vec(v))
+                u[e.offset + k - 1] = _unconstrain_elt(e, Float64(x))
+            end
         elseif e.kind === :vector
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing vector parameter $(e.name)"),
@@ -1293,6 +1321,7 @@ function transform_statements(e::LayoutEntry)
     if e.kind === :vector
         return _vector_transform_statements(e)
     end
+    e.kind === :array && return _array_transform_statements(e)
     if e.kind === :varying_corr || e.kind === :cholesky_corr
         # Both LKJ-factor kinds share the scalar-unrolled vine twin
         # (name/size-keyed `_ppl_rl_` temps — kind-agnostic).
@@ -1577,6 +1606,7 @@ function jacobian_term(e::LayoutEntry)
     if e.kind === :varying_corr || e.kind === :cholesky_corr
         return _lkj_vine_logjac(e.name, _lkj_dim(e.size))
     end
+    e.kind === :array && return _array_jacobian_term(e)
     if e.kind === :vector
         if e.transform === :ordered
             # Σ u[2:end] over one packed slice (the host `ordered_logjac`).
