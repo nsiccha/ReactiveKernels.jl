@@ -1389,6 +1389,15 @@ end
 
 _natural_sup_allocated(k, plan, units, weights) = @allocated k(plan, units, weights)
 _natural_sup_slots(s) = eachindex(s)
+# Slack for the cross-kernel allocation comparisons below. Exact byte identity
+# between differently-lowered kernels is not portable: Windows Julia 1.13.1
+# measured +32/+48 B for the undeclared-domain kernel against the declared one
+# (CI run 36811107488; the declared baseline itself reads 2183 B there against
+# 2184 B on Linux), while both execute identical allocation sequences on Linux.
+# The slack absorbs such platform constants while keeping the documented
+# regressions detectable: the 304 B runtime marker and any per-cell allocation
+# (at least 16 B per observation here).
+_natural_sup_parity_margin = 128
 
 @testset "authored plate block: natural superposition cell (get, filtered sum, one graph)" begin
     nobs = 257
@@ -1422,8 +1431,12 @@ _natural_sup_slots(s) = eachindex(s)
     output_bytes = _natural_sup_allocated(typed, lattice, units, weights)
     # A per-cell allocation would add at least 16 B per observation.
     @test output_bytes < 2 * sizeof(Float64) * nobs
-    @test _natural_sup_allocated(one_graph, lattice, units, weights) == output_bytes
-    @test _natural_sup_allocated(one_graph, exact, units, weights) == output_bytes
+    # Bounded parity (slack above): the undeclared domain adds no per-call
+    # scheduling allocation on either plan type.
+    @test _natural_sup_allocated(one_graph, lattice, units, weights) <=
+          output_bytes + _natural_sup_parity_margin
+    @test _natural_sup_allocated(one_graph, exact, units, weights) <=
+          output_bytes + _natural_sup_parity_margin
 end
 
 # Dose-outer lowering of a gathered generator sum (`_KernelReduction`). The
@@ -1515,11 +1528,13 @@ _dose_outer_same(a, b) = length(a) == length(b) && all(map(===, a, b))
           [sum((w * get(units, t - s, 0.0) for (s, w) in
                 Iterators.take(zip(lattice.shifts, weights), min(t, 3))); init = 0.0)
            for t in 1:nobs]
-    # The output is the only allocation, as for the cell loop.
+    # The output is the only allocation, as for the cell loop (bounded parity,
+    # same slack: the two lowerings differ, so exact identity is not portable).
     _natural_sup_allocated(cell, lattice, units, weights)
     _natural_sup_allocated(control, lattice, units, weights)
-    @test _natural_sup_allocated(cell, lattice, units, weights) ==
-          _natural_sup_allocated(control, lattice, units, weights)
+    @test _natural_sup_allocated(cell, lattice, units, weights) <=
+          _natural_sup_allocated(control, lattice, units, weights) +
+          _natural_sup_parity_margin
 end
 
 @testset "tensorized companion: filtered sums and get keep their branches lazy" begin
