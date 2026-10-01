@@ -383,8 +383,7 @@ end
         (D, "column x1 has two coefficients b and c", quote X = hcat(1, x1); mu = X * b .+ c .* x1; c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
         (D, "column Intercept has two coefficients", quote X = hcat(1, 1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (Dz, "shared across predictors", quote X = hcat(1, x1); mu = X * b; nu = X * b; y .~ Normal.(mu, 1.0); z .~ Normal.(nu, 1.0) end),
-        b[axes(X, 2)] .~ Normal.(0, 1)
-        (Dg, "unidentified: intercept + full-cover factor", quote c[levels(g)] .~ Normal.(0, 2); X = hcat(1, x1); mu = X * b .+ c[g]; y .~ Normal.(mu, 1.0) end),
+        (Dg, "unidentified: intercept + full-cover factor", quote b[axes(X, 2)] .~ Normal.(0, 1); c[levels(g)] .~ Normal.(0, 2); X = hcat(1, x1); mu = X * b .+ c[g]; y .~ Normal.(mu, 1.0) end),
         (D, "literal scaling of a matmul", quote X = hcat(1, x1); mu = 2 * (X * b); y .~ Normal.(mu, 1.0) end),
         (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = x2 .* (X * b); y .~ Normal.(mu, 1.0) end),
         (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = exp.(X * b); y .~ Normal.(mu, 1.0) end),
@@ -412,10 +411,8 @@ end
         (D, "outside a predictor matmul", quote X = hcat(1, x1); w = sum(X); mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
         (D, "combines a matrix outside a matmul", quote X = hcat(1, x1); w = X; mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
         (D, "scale X is a design matrix", quote X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, X) end),
-        b[axes(X, 2)] .~ Normal.(0, 1)
-        (D, "argument X is a design matrix", quote X = hcat(1, x1); s ~ Normal(X, 1); mu = X * b; y .~ Normal.(mu, s) end),
-        b[axes(X, 2)] .~ Normal.(0, 1)
-        (D, "argument X is a design matrix", quote X = hcat(1, x1); s ~ HalfNormal(X); mu = X * b; y .~ Normal.(mu, s) end),
+        (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); s ~ Normal(X, 1); mu = X * b; y .~ Normal.(mu, s) end),
+        (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); s ~ HalfNormal(X); mu = X * b; y .~ Normal.(mu, s) end),
         (Dm, "multinomial probs X is a design matrix", quote X = hcat(1, x1); mu = X * b; c1 .~ Multinomial.(10, X, c2) end),
         (D, "categorical probs X is a design matrix", quote X = hcat(1, x1); mu = X * b; y .~ Categorical.(X) end),
     ]
