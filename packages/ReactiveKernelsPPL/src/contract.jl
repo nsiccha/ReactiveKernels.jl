@@ -628,9 +628,12 @@ plate cell, packed as one contiguous block. `family`/`args`/`support_override`
 follow [`SampledParameter`](@ref) exactly (POSITIONAL `(arg1, …)` keys,
 Distributions.jl semantics), except the args are SHARED across cells — literals
 or scalar parameter/assignment names (per-cell vector args are a later
-increment). `range` is `nothing` (size = `n_obs`, the `eachindex`/`axes` /
-bare-plate case) or a literal `UnitRange{Int}` that must cover `1:n_obs` exactly
-(the `1:N` case), mirroring [`LikelihoodSpec`](@ref)'s response range. A
+increment). `range` is the plate's index set: the `Symbol` of the column `v`
+of an `eachindex(v)` / `axes(v, 1)` plate (one cell per entry of `v`; bind
+proves `length(v) == n_obs` — latents over another axis do not lower yet), a
+literal `UnitRange{Int}` that must cover `1:n_obs` exactly (the `1:N` case),
+mirroring [`LikelihoodSpec`](@ref)'s response range, or `nothing` (size =
+`n_obs`, hand-built plans). A
 real-support prior (`normal`/`cauchy`/half-versions) lays out identity (an
 unconstrained block); positive/unit support constrains per element.
 """
@@ -639,7 +642,7 @@ struct PlateParameter
     family::Symbol
     args::NamedTuple
     support_override::SupportOverride
-    range::Union{Nothing,UnitRange{Int}}
+    range::Union{Nothing,UnitRange{Int},Symbol}
     label::Symbol
 end
 """Provenance/range default to a whole-column (n_obs) plate under the name."""
@@ -647,7 +650,8 @@ PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
     support_override::SupportOverride) =
     PlateParameter(name, family, args, support_override, nothing, name)
 PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
-    support_override::SupportOverride, range::Union{Nothing,UnitRange{Int}}) =
+    support_override::SupportOverride,
+    range::Union{Nothing,UnitRange{Int},Symbol}) =
     PlateParameter(name, family, args, support_override, range, name)
 
 """
@@ -1289,14 +1293,17 @@ obs axis; `lp_args` the `(subject predictor, cell param)` pairs (LP
 values gather per subject in-cell); `schedules` the schedule
 declarations the cell calls address; `obs` the in-cell observation
 LIST (one per response axis); `timepoints` is always `nothing`
-(ragged axes have no rectangular T). The cell vocabulary is calls to
+(ragged axes have no rectangular T). `subjects === nothing` (the
+top-level schedule-chain form, see `_extract_kernel_cells`) takes the
+subject count from named data at bind — the schedule's subject column —
+and consumes no dims key. The cell vocabulary is calls to
 [`CELL_FNS`](@ref), schedule-map gathers, and arithmetic (no flat
 dotify — the generator emits one subject-batched `_over_subjects`
 statement per assignment).
 """
 struct KernelPlate
     result::Symbol
-    subjects::Union{Int,Symbol}
+    subjects::Union{Nothing,Int,Symbol}
     timepoints::Union{Nothing,Int,Symbol}
     slices::Vector{Tuple{Symbol,Symbol,Symbol}}
     assignments::Vector{Pair{Symbol,Any}}
@@ -1933,7 +1940,11 @@ end
 # outer column/definition (the plate spelling), not introductions.
 # Single source for the global name-table gate.
 function _kernel_all_names(kp::KernelPlate)
-    names = Symbol[kp.result]
+    # A top-level schedule chain names its kernel by the cell value its
+    # first observation reads (`result === collected`, an assignment —
+    # counted once, below).
+    names = any(p -> p.first === kp.result, kp.assignments) ? Symbol[] :
+        Symbol[kp.result]
     for (c, p, _) in kp.slices
         p == c || push!(names, p)
     end
@@ -2637,6 +2648,18 @@ function _validate_plate_parameters_data(plan::StructuralPlan)
                 _fail(p.label, "arg $k references unknown name $v")
         end
         p.range === nothing && continue
+        if p.range isa Symbol
+            # One cell per entry of the iterated column (Julia's
+            # `eachindex(v)`), sized at the observation axis.
+            haskey(plan.columns, p.range) || _fail(p.label,
+                "plate over `eachindex($(p.range))`: `$(p.range)` is not bound")
+            n = length(plan.columns[p.range])
+            n == plan.n_obs || _fail(p.label,
+                "plate over `eachindex($(p.range))` has $n cells but n_obs " *
+                "is $(plan.n_obs) — a per-cell latent over another axis " *
+                "does not lower yet (iterate an observation-axis column)")
+            continue
+        end
         last(p.range) == plan.n_obs || _fail(p.label,
             "plate range $(p.range) covers $(length(p.range)) cells " *
             "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
@@ -3595,6 +3618,10 @@ end
 
 # Panel-kernel structure (see `_validate_kernels`).
 function _validate_panel_kernel(plan::StructuralPlan, kp::KernelPlate)
+    kp.subjects === nothing &&
+        _fail(kp.label, "panel plates take a subject count (an integer " *
+              "or a dims-key name); only schedule-fed kernels derive it " *
+              "from data")
     length(kp.obs) == 1 ||
         _fail(kp.label, "panel v1 admits exactly one in-cell observation " *
               "(got $(length(kp.obs)))")
@@ -5561,7 +5588,7 @@ function _validate_plate_parameters(plan::StructuralPlan)
         end
         _validate_uniform_args(p.label, p.family, p.args)
         _validate_support_override(p.label, p.family, p.support_override, p.args)
-        if p.range !== nothing
+        if p.range isa UnitRange
             r = p.range
             (first(r) == 1 && last(r) >= 1) || _fail(p.label,
                 "plate range must start at 1 (`1:N`), got $(first(r)):$(last(r))")
@@ -9226,8 +9253,16 @@ function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
             _fail(kp.label, "dims key `$k` must bind a positive integer, " *
                   "got $v")
     end
+    # Leftovers fail once, globally, in `_resolve_kernels!` (a key for a
+    # sibling plate is not this plate's typo).
+    sched = only(kp.schedules)
+    built = _build_grouped_schedule(plan, kp, columns)
     n_sub = if kp.subjects isa Int
         kp.subjects
+    elseif kp.subjects === nothing
+        # Shape from named data: the schedule's subject column (subjects
+        # are 1:n, proved by the build) — no dims key.
+        built.n_subjects
     else
         haskey(dims, kp.subjects) ||
             _fail(kp.label, "subjects dims key `$(kp.subjects)` is not " *
@@ -9236,10 +9271,6 @@ function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
         push!(consumed, kp.subjects)
         Int(dims[kp.subjects])
     end
-    # Leftovers fail once, globally, in `_resolve_kernels!` (a key for a
-    # sibling plate is not this plate's typo).
-    sched = only(kp.schedules)
-    built = _build_grouped_schedule(plan, kp, columns)
     # Dose/PK coherence (v2 axis 1): dose rows must feed the model and
     # PK calls need dose rows. Dose-free subjects alongside dosed ones
     # stay admitted — this gates only the global emptiness.
@@ -9313,27 +9344,33 @@ end
 # 1` the lengths coincide and kinds are unobservable, so all-scalar
 # stands); scalar slices in vector models materialize flat T-block
 # expansions (spline-blocks precedent). Each plate consumes its own keys
-# through one shared set (subjects always named per plate; timepoints
-# via the `kernel_T_<result>` convention, v1 any-leftover inference for
-# single-plate models); leftovers fail once, globally (a key for plate
-# B is not plate A's typo). Returns resolved nodes; the input plan is
-# untouched.
+# through one shared set (subjects named per plate, or derived from a
+# schedule's subject column; timepoints only via the `kernel_T_<result>`
+# key); leftovers fail once, globally (a key for plate B is not plate
+# A's typo). Returns resolved nodes; the input plan is untouched.
 function _resolve_kernels!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer})
-    isempty(plan.kernel_plates) && return KernelPlate[]
+    if isempty(plan.kernel_plates)
+        # Nothing consumes a dims key: a key here is a typo or a shape
+        # the model never asks for (plates take their shapes from data).
+        isempty(dims) ||
+            _fail(:plan, "dims key(s) $(sort!(collect(keys(dims)))) not " *
+                  "consumed (the model has no kernel plate — `@plate` " *
+                  "ranges and schedules take their shapes from data)")
+        return KernelPlate[]
+    end
     # One shared consumed set: each plate consumes its own dims keys;
     # leftovers fail once, globally (a key for plate B is not plate
     # A's typo).
     consumed = Set{Symbol}()
     out = KernelPlate[]
-    nplates = length(plan.kernel_plates)
     for kp in plan.kernel_plates
         if _is_grouped_kernel(kp)
             push!(out,
                 _resolve_grouped_kernel!(plan, kp, columns, dims, consumed))
         else
             push!(out,
-                _resolve_panel_kernel!(kp, columns, dims, consumed, nplates))
+                _resolve_panel_kernel!(kp, columns, dims, consumed))
         end
     end
     leftovers = setdiff(Set{Symbol}(keys(dims)), consumed)
@@ -9347,7 +9384,7 @@ end
 
 function _resolve_panel_kernel!(kp::KernelPlate,
         columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer},
-        consumed::Set{Symbol}, nplates::Int)
+        consumed::Set{Symbol})
     for (k, v) in dims
         v > 0 ||
             _fail(kp.label, "dims key `$k` must bind a positive integer, " *
@@ -9372,29 +9409,16 @@ function _resolve_panel_kernel!(kp::KernelPlate,
         push!(consumed, kp.timepoints)
         Int(dims[kp.timepoints])
     else
-        # Unnamed timepoints (surface always leaves `nothing`): the
-        # `kernel_T_<result>` convention names the plate's T key (the
-        # slice-length errors already prescribe this spelling). The v1
-        # any-single-leftover inference stays for single-plate models;
-        # anything else defers — stray keys fail in the global
-        # leftovers gate, and a T-needing plate fails at its slice
+        # Unnamed timepoints (surface always leaves `nothing`): only the
+        # `kernel_T_<result>` key names the plate's T (the slice-length
+        # errors prescribe this spelling). No other key is ever taken as
+        # T — a typo'd or stray key stays unconsumed and fails in the
+        # global leftovers gate, and a T-needing plate fails at its slice
         # lengths naming the convention.
-        rest = setdiff(Set{Symbol}(keys(dims)), consumed)
         conv = Symbol("kernel_T_$(kp.result)")
-        if conv in rest
+        if haskey(dims, conv)
             push!(consumed, conv)
             Int(dims[conv])
-        elseif nplates == 1
-            if isempty(rest)
-                nothing
-            elseif length(rest) == 1
-                tk = only(rest)
-                push!(consumed, tk)
-                Int(dims[tk])
-            else
-                _fail(kp.label, "ambiguous timepoints dims keys " *
-                      "$(sort!(collect(rest))) (one T key besides subjects)")
-            end
         else
             nothing
         end

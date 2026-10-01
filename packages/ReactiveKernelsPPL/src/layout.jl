@@ -232,7 +232,8 @@ function assign_layout(plan::StructuralPlan)
     for p in plan.plate_parameters
         transform, lo, hi =
             _entry_transform(p.family, p.support_override, p.args)
-        size = p.range === nothing ? plan.n_obs : length(p.range)
+        # An `eachindex(v)` plate is proved at bind to have n_obs cells.
+        size = p.range isa UnitRange ? length(p.range) : plan.n_obs
         push!(entries,
             LayoutEntry(:plate, nothing, p.name, [p.name], offset, size, transform,
                 lo, hi))
