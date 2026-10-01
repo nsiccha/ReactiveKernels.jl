@@ -3116,11 +3116,14 @@ function _validate_columns(plan::StructuralPlan)
     union!(managed, _subject_predictor_columns(plan))
     union!(managed, _mi_managed_columns(plan))
     # Model-level data values (functions as values: a data-only
-    # assignment bound at bind) and the raw inputs only module calls read
-    # carry no observation axis.
-    modelvals = union(intersect(_bound_module_data_names(plan),
-            Set{Symbol}(a.name for a in plan.assignments)),
-        _bound_model_level_inputs(plan))
+    # assignment bound at bind, or a data-only definition only used
+    # whole) and the raw inputs read only whole carry no observation
+    # axis.
+    computed = _bound_module_data_names(plan)
+    inputs, wholedefs = _bound_model_level_inputs(plan)
+    modelvals = union(
+        intersect(computed, Set{Symbol}(a.name for a in plan.assignments)),
+        intersect(computed, wholedefs), inputs)
     for (name, col) in plan.columns
         name in modelvals && continue
         # Kernel-managed columns (slices + scalar expansions) carry two
@@ -9754,35 +9757,74 @@ function _bound_module_data_names(plan::StructuralPlan)
         if haskey(plan.columns, n))
 end
 
-"""Model-level data inputs: raw columns of `raw` that every definition
-reads only inside an argument of an undotted module call (`f(gx)`, also
-inlined: `(b .* f(gx))[g]`) and that no other plan slot names. A module
-call takes whole values, so such a column has no observation axis — any
-length or shape, exactly like the model-level values those calls
-compute — and it neither anchors nor crosses `n_obs`. Any other read
-keeps a column observation-aligned: a definition read outside such an
-argument (`gx .+ 1`, `f.(gx)`, `mean(gx)`), or any name a response,
-predictor, plate or other slot holds, so a slot added later stays
-fail-closed."""
+"""Model-level data inputs of `plan`: raw columns of `raw` read only as
+whole values. A read is whole inside an argument of an undotted module
+call (`f(gx)`, at any depth), as the gathered value of a gather
+(`gx[g]`, `(b .* gx)[g]`), or anywhere in a definition whose every use is
+whole (`scale = a .+ b .* gx` passed only to calls) — so naming a
+subexpression never changes the verdict. Such a column has no observation
+axis — any length or shape, like the model-level values computed from
+it — and it neither anchors nor crosses `n_obs`. Any other read keeps a
+column observation-aligned: a definition read outside those positions
+(`gx .+ 1` in a predictor, `f.(gx)`, `mean(gx)`, a gather index), or any
+name a response, predictor, plate or other slot holds (a slot added later
+stays fail-closed). Returns `(inputs, defs)`: the columns, and the
+whole-context definitions (whose values may have any length too)."""
 function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
-    whole = Set{Symbol}()
-    per_obs = Set{Symbol}()
-    for a in plan.assignments
-        _classify_reads!(whole, per_obs, a.expr, raw, false)
-    end
-    for d in plan.derived
-        _classify_reads!(whole, per_obs, d.expr, raw, false)
-    end
-    out = setdiff!(whole, per_obs)
+    defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
+    append!(defs, Pair{Symbol,Any}[d.name => d.expr for d in plan.derived])
+    # Pinning only shrinks the verdict: skip the slot walk when even the
+    # unpinned pass finds nothing.
+    inputs, _ = _whole_value_reads(defs, raw, Set{Symbol}())
+    isempty(inputs) && return inputs, Set{Symbol}()
+    free = union(Set{Symbol}(raw), Set{Symbol}(first(d) for d in defs))
+    named = copy(free)
     for f in fieldnames(StructuralPlan)
-        isempty(out) && return out
         f in (:assignments, :derived, :columns, :n_obs, :roles) && continue
-        _drop_held_names!(out, getfield(plan, f))
+        _drop_held_names!(free, getfield(plan, f))
     end
-    return out
+    held = setdiff!(named, free)
+    inputs, ctx = _whole_value_reads(defs, raw, held)
+    return setdiff!(inputs, held), ctx
 end
 
-"""In a bound plan: the raw columns bound as model-level data inputs."""
+"""Whole-value reads over `defs` (`name => expr`): the columns of `raw`
+read only as whole values, and the whole-context definitions — every use
+a whole read or inside another whole-context definition (the greatest
+fixpoint), none of them in `pinned`."""
+function _whole_value_reads(defs, raw::AbstractSet{Symbol},
+        pinned::AbstractSet{Symbol})
+    names = Set{Symbol}(first(d) for d in defs)
+    known = union(Set{Symbol}(raw), names)
+    reads = Dict{Symbol,Tuple{Set{Symbol},Set{Symbol}}}()
+    for (nm, ex) in defs
+        w, p = Set{Symbol}(), Set{Symbol}()
+        _classify_reads!(w, p, ex, known, false)
+        reads[nm] = (w, p)
+    end
+    ctx = setdiff(names, pinned)
+    changed = true
+    while changed
+        changed = false
+        for (nm, (_, p)) in reads
+            nm in ctx && continue
+            for d in p
+                d in ctx || continue
+                delete!(ctx, d)
+                changed = true
+            end
+        end
+    end
+    inputs = Set{Symbol}()
+    aligned = Set{Symbol}()
+    for (nm, (w, p)) in reads
+        union!(inputs, intersect(w, raw))
+        union!(nm in ctx ? inputs : aligned, intersect(p, raw))
+    end
+    return setdiff!(inputs, aligned), ctx
+end
+
+"""In a bound plan: `(inputs, defs)` of [`_model_level_inputs`](@ref)."""
 function _bound_model_level_inputs(plan::StructuralPlan)
     nodes = union(Set{Symbol}(a.name for a in plan.assignments),
         Set{Symbol}(d.name for d in plan.derived))
@@ -10097,9 +10139,9 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     columns = _checked_columns(columns)
     raw = Set{Symbol}(keys(columns))
     computed = _materialize_module_data!(plan, columns)
-    # Raw inputs read only as whole values (module-call arguments): no
-    # n_obs anchor.
-    inputs = _model_level_inputs(plan, raw)
+    # Raw inputs read only as whole values (module-call arguments,
+    # gathered values): no n_obs anchor.
+    inputs, _ = _model_level_inputs(plan, raw)
     _materialize_derived_responses!(plan, columns)
     bases = _materialize_splines!(plan, columns)
     hbases = _fit_hsgp_bases(plan, columns)

@@ -437,6 +437,49 @@ end
             cols[:y][i]) for i in 1:6)
         @test _fv_value(gbuilt, gbound, :likelihood, u) ≈ ll
     end
+    # Whole-ness follows the value, not the spelling: a definition used
+    # only whole (gathered, or passed to calls) reads its columns whole,
+    # named or inlined.
+    for body in (quote
+                sigma ~ Exponential(1.0)
+                b ~ Normal(0, 1)
+                v = b .* gx
+                y .~ Normal.(v[g], sigma)
+            end, quote
+                sigma ~ Exponential(1.0)
+                b ~ Normal(0, 1)
+                y .~ Normal.((b .* gx)[g], sigma)
+            end)
+        vbound = bind_data(lower_rkppl(body, (:y, :g, :gx); mod = _FV), cols)
+        vbuilt = build_kernel(vbound)
+        for u in ([0.3, -0.2], [-1.1, 0.7])
+            th = ReactiveKernelsPPL.constrain(vbuilt.layout, u)
+            ll = sum(logpdf(Normal(th.b * cols[:gx][cols[:g][i]], th.sigma),
+                cols[:y][i]) for i in 1:6)
+            @test _fv_value(vbuilt, vbound, :likelihood, u) ≈ ll
+        end
+    end
+    xcols = Dict{Symbol,ColumnData}(:y => cols[:y], :gx => cols[:gx],
+        :x => [0.3, -0.1, 0.2, 0.8, -0.5, 0.1])
+    kept = lower_rkppl(quote
+            b ~ Normal(0, 1)
+            sigma ~ Exponential(1.0)
+            m0 ~ Normal(0, 1)
+            sc = b .* gx
+            s_eff = sigma * exp(first(sc))
+            y .~ Normal.(m0 .+ x, s_eff)
+        end, (:y, :x, :gx); mod = _FV)
+    @test any(d -> d.name === :sc, kept.derived)   # stays a named column
+    kbound = bind_data(kept, xcols)
+    @test kbound.n_obs == 6
+    kbuilt = build_kernel(kbound)
+    for u in ([0.3, -0.2, 0.1], [-1.1, 0.7, 0.4])
+        th = ReactiveKernelsPPL.constrain(kbuilt.layout, u)
+        s_eff = th.sigma * exp(th.b * xcols[:gx][1])
+        ll = sum(logpdf(Normal(only(th.y_eta) + xcols[:x][i], s_eff),
+            xcols[:y][i]) for i in 1:6)
+        @test _fv_value(kbuilt, kbound, :likelihood, u) ≈ ll
+    end
     # Any per-observation read keeps the column observation-aligned, so
     # its length is checked as before.
     mixed = lower_rkppl(quote
@@ -500,6 +543,19 @@ end
         end, cols)
     @test dbound.n_obs == 8
     dkern = prepare_query(dbuilt, dbound, :sampler)
+    # A definition passed to several calls is read whole as well.
+    @test bind_data(lower_rkppl(quote
+            sigma ~ Exponential(1.0)
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            k ~ Normal(0, 1)
+            scale = a .+ b .* gx
+            r1 = decayed_events(g, t, eg, et, ea, w, scale, k)
+            r2 = decayed_events(g, t, eg, et, ea, w, scale, 2 * k)
+            y .~ Normal.(r1[oi], sigma)
+            y2 .~ Normal.(r2[oi], sigma)
+        end, (Tuple(keys(cols))..., :y2); mod = _FV),
+        merge(cols, Dict{Symbol,ColumnData}(:y2 => reverse(cols[:y])))).n_obs == 8
     # ... unless something else reads one per observation.
     @test_throws SurfaceLoweringError lower_rkppl(quote
             sigma ~ Exponential(1.0)

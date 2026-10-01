@@ -523,7 +523,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # arguments is a whole value (a model-level data input at bind), so a
     # parameter-dependent call may take it; each refusal that waiver
     # skips is re-checked once the plan shows no other slot reads it.
-    whole = _whole_value_data(det, data)
+    whole = _whole_value_data(det, data, _statement_names(ast))
     waived = _check_module_calls(det, detmap, data, shape_env; whole)
     canonmap = Dict{Symbol,Any}()
     for nm in _det_topo_order(det, detmap)
@@ -1480,16 +1480,25 @@ function _check_module_calls(nm, ex, detmap, data, aligned, whole, env, wenv,
     return nothing
 end
 
-# Data columns every definition reads only inside an argument of an
-# undotted module call — the bind-time model-level data-input rule
-# (`_model_level_inputs`) applied to the definitions.
-function _whole_value_data(det, data::Set{Symbol})
-    whole = Set{Symbol}()
-    per_obs = Set{Symbol}()
-    for (_, rhs) in det
-        _classify_reads!(whole, per_obs, rhs, data, false)
+# Data columns the definitions read only as whole values — the bind-time
+# model-level data-input rule (`_model_level_inputs`) over the
+# definitions, with every name another statement mentions (`held`: a
+# response, prior, `@plate`, …) pinned observation-aligned.
+# `_confirm_whole_value_data` re-checks each waiver against the plan.
+function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol})
+    inputs, _ = _whole_value_reads(det, data, held)
+    return setdiff!(inputs, held)
+end
+
+# Every name the non-definition statements of `ast` mention.
+function _statement_names(ast::Expr)
+    out = Set{Symbol}()
+    for st in ast.args
+        st isa LineNumberNode && continue
+        st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
+        _all_symbols!(out, st)
     end
-    return setdiff!(whole, per_obs)
+    return out
 end
 
 # The names of `among` that `ex` reads, directly or through definitions.
@@ -1512,7 +1521,7 @@ end
 function _confirm_whole_value_data(plan::StructuralPlan, data::Set{Symbol},
         waived)
     isempty(waived) && return nothing
-    inputs = _model_level_inputs(plan, data)
+    inputs, _ = _model_level_inputs(plan, data)
     for (msg, needed) in waived
         needed ⊆ inputs || _sfail(msg)
     end
