@@ -186,6 +186,123 @@ end
         :(dv .~ Normal.(log_Vc, sigma))), _PL_PK_DATA)
 end
 
+# --- The 99_plate_* corpus re-spellings against the forms they replace ----
+
+# Bind a corpus program (test_corpus.jl's loader) and build it.
+function _pl_corpus(file, cols; dims = Dict{Symbol,Int}())
+    ast, data = _load_corpus_case(joinpath(_CORPUS_DIR, file))
+    return _pl_bind(ast, data, Dict(k => v for (k, v) in cols if k in data);
+        dims)
+end
+
+# Same model, same draws: the coordinates line up position by position
+# (only the names the lowering recovers differ), so every preset agrees
+# at one point.
+function _pl_same_density(legacy, new, u)
+    (lb, lbuilt), (nb, nbuilt) = legacy, new
+    @test length(coordinate_names(nbuilt.layout)) ==
+        length(coordinate_names(lbuilt.layout)) == length(u)
+    for preset in (:likelihood, :prior, :sampler)
+        @test _pl_q(nbuilt, nb, preset, u) ≈ _pl_q(lbuilt, lb, preset, u) rtol = 1e-12
+    end
+end
+
+@testset "panel re-spellings match the panel form" begin
+    # Panel layout: 2 subjects x 3 timepoints, per-subject `dose`; the
+    # per-index form reads the same values per row (`dose[i]`).
+    t = [0.5, 1.0, 2.0, 0.5, 1.0, 2.0]
+    dose = [1.0, 2.0]
+    drow = repeat(dose; inner = 3)
+    dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :kernel_T_pred => 3)
+    cases = (
+        ("32_kernel_plate.jl", "99_plate_32_gaussian.jl",
+            [0.5, 1.2, 2.1, 0.8, 1.5, 2.5]),
+        ("69_kernel_plate_poisson.jl", "99_plate_69_poisson.jl",
+            [1, 0, 2, 3, 1, 0]),
+        ("70_kernel_plate_bernoulli.jl", "99_plate_70_bernoulli.jl",
+            [1, 0, 1, 1, 0, 0]),
+        ("71_kernel_plate_nb2.jl", "99_plate_71_nb2.jl", [1, 0, 2, 3, 1, 0]),
+        ("72_kernel_plate_gamma.jl", "99_plate_72_gamma.jl",
+            [0.5, 1.2, 2.1, 0.8, 1.5, 2.5]),
+        ("73_kernel_plate_beta.jl", "99_plate_73_beta.jl",
+            [0.2, 0.7, 0.5, 0.3, 0.8, 0.4]),
+        ("74_kernel_plate_studentt.jl", "99_plate_74_studentt.jl",
+            [0.5, 1.2, 2.1, 0.8, 1.5, 2.5]))
+    for (lf, nf, obs) in cases
+        @testset "$nf" begin
+            legacy = _pl_corpus(lf, Dict(:t => t, :dose => dose, :obs => obs);
+                dims)
+            new = _pl_corpus(nf, Dict(:t => t, :dose => drow, :obs => obs))
+            n = length(coordinate_names(new[2].layout))
+            _pl_same_density(legacy, new, 0.1 .* (1:n))
+        end
+    end
+    # Distributions.jl oracle for one of them (Poisson log mean b0*dose*t).
+    pb, pbuilt = _pl_corpus("99_plate_69_poisson.jl",
+        Dict(:t => t, :dose => drow, :obs => [1, 0, 2, 3, 1, 0]))
+    @test _pl_q(pbuilt, pb, :likelihood, [0.25]) ≈
+        sum(logpdf.(Poisson.(exp.(0.25 .* drow .* t)), [1, 0, 2, 3, 1, 0])) rtol = 1e-12
+    # All-scalar panel (one row per subject).
+    cols = Dict(:dose => [10.0, 20.0, 5.0, 8.0], :dv => [1.1, 2.2, 0.4, 0.9],
+        :ls => [0.1, -0.2, 0.3, 0.0])
+    legacy = _pl_corpus("33_kernel_scalar.jl", cols;
+        dims = Dict{Symbol,Int}(:kernel_nsub_pred => 4))
+    new = _pl_corpus("99_plate_33_offset.jl", cols)
+    _pl_same_density(legacy, new, [0.3])
+    sigma = exp(0.3)
+    mu = (cols[:dose] ./ 10.0) .* exp.(cols[:ls])
+    @test _pl_q(new[2], new[1], :likelihood, [0.3]) ≈
+        sum(logpdf.(Normal.(mu, sigma), cols[:dv])) rtol = 1e-12
+end
+
+@testset "dose-free grouped re-spellings need no schedule" begin
+    # Radon: 8 counties, 2 rows each. The grouped form binds empty dose
+    # columns and a per-county id; the per-index form observes rows with a
+    # per-row varying intercept over the county index.
+    cidx = repeat(1:8; inner = 2)
+    ff = [0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0,
+        0.0, 1.0, 0.0]
+    yy = [1.2, 0.8, 0.5, 1.6, 1.4, 1.1, 0.3, 0.9, 1.7, 0.6, 0.2, 0.7, 1.3,
+        1.5, 0.4, 1.0]
+    legacy = _pl_corpus("77_kernel_radon_dosefree_grouped.jl", Dict(
+        :county_id => collect(1:8), :county_idx => cidx, :time => zeros(16),
+        :dsubj => Int[], :dtime => Float64[], :damt => Float64[], :ff => ff,
+        :yy => yy))
+    new = _pl_corpus("99_plate_77_radon.jl",
+        Dict(:county_idx => cidx, :ff => ff, :yy => yy))
+    _pl_same_density(legacy, new, 0.05 .* (1:12) .- 0.3)
+    # Eight schools.
+    y8 = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
+    se8 = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
+    legacy = _pl_corpus("78_kernel_eight_schools_dosefree_grouped.jl", Dict(
+        :school_id => collect(1:8), :school_idx => collect(1:8),
+        :time => zeros(8), :dsubj => Int[], :dtime => Float64[],
+        :damt => Float64[], :yy => y8, :se => se8))
+    new = _pl_corpus("99_plate_78_eight_schools.jl",
+        Dict(:school_idx => collect(1:8), :yy => y8, :se => se8))
+    _pl_same_density(legacy, new, 0.05 .* (1:10) .- 0.2)
+end
+
+@testset "schedule-chain re-spellings match the grouped form" begin
+    cols = _pl_pk_cols()
+    for (lf, nf, dims) in (
+            ("49_kernel_grouped_pk.jl", "99_plate_49_grouped_pk.jl",
+                Dict{Symbol,Int}(:kernel_nsub_conc => 2)),
+            ("50_kernel_grouped_pk_logf.jl", "99_plate_50_grouped_pk_logf.jl",
+                Dict{Symbol,Int}()),
+            ("75_kernel_grouped_poisson.jl", "99_plate_75_grouped_poisson.jl",
+                Dict{Symbol,Int}(:kernel_nsub_conc => 2)))
+        @testset "$nf" begin
+            legacy = _pl_corpus(lf, cols; dims)
+            new = _pl_corpus(nf, cols)
+            @test coordinate_names(new[2].layout) ==
+                coordinate_names(legacy[2].layout)
+            n = length(coordinate_names(new[2].layout))
+            _pl_same_density(legacy, new, 0.02 .* (1:n) .- 0.05)
+        end
+    end
+end
+
 @testset "a latent plate's size is its range" begin
     # `eachindex(w)` iterates `w`: the latent has one cell per entry of `w`.
     # Latents over a non-observation axis do not lower yet, so a plate whose
