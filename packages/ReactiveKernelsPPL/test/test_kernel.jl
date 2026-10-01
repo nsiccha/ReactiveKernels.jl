@@ -446,9 +446,18 @@ end
     @test_throws "not consumed" bind_data(unbound_exp, cols6;
         dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :kernel_T_pred => 3,
             :kernel_T_preed => 3))
-    # Ambiguous T keys fail closed (v1 inference only).
-    @test_throws "ambiguous timepoints" bind_data(unbound, cols6;
+    # No key other than `kernel_T_<result>` is taken as T: a typo'd or
+    # stray key is never inferred to be the timepoint count (it used to
+    # bind T = 3 silently when it was the only leftover key).
+    @test_throws "no T dims key is bound" bind_data(unbound, cols6;
+        dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :whatever_typo => 3))
+    @test_throws "no T dims key is bound" bind_data(unbound, cols6;
         dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :T1 => 3, :T2 => 3))
+    # All-scalar slices need no T: a stray key is unconsumed, not T.
+    scalar6 = Dict{Symbol,AbstractVector}(
+        :t => [1.0, 2.0], :dose => [10.0, 20.0], :obs => [0.1, 0.4])
+    @test_throws "not consumed by any kernel plate" bind_data(unbound,
+        scalar6; dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :T => 3))
     # The `kernel_T_<result>` convention names the plate's T key; a
     # second key beside it is a stray, not an ambiguity.
     @test_throws "not consumed by any kernel plate" bind_data(unbound, cols6;
