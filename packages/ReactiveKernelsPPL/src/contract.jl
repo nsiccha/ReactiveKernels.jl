@@ -9921,12 +9921,18 @@ function _with_levels(r::LikelihoodSpec, K::Int)
     r.n_levels === nothing || r.n_levels == K || _fail(r.label,
         "n_levels $(r.n_levels) disagrees with the bound data " *
         "(inferred K = $K)")
-    return LikelihoodSpec(r.family, r.link, r.response, r.predictor,
-        r.scale, r.weights, r.evidence, r.label, r.trials, r.range;
-        n_levels = K, thresholds = r.thresholds,
-        extra_predictors = r.extra_predictors, count_columns = r.count_columns,
-        ordinal_structure = r.ordinal_structure,
-        discrimination = r.discrimination,
-        threshold_columns = r.threshold_columns,
-        threshold_coefs = r.threshold_coefs)
+    return _with(r; n_levels = K)
+end
+
+# Field-preserving copy: rebuild `x` through its all-fields positional
+# constructor, replacing only the named fields. A hand-written field list
+# silently resets every field added after it was written; unknown override
+# names fail loudly.
+function _with(x::T; overrides...) where {T}
+    names = fieldnames(T)
+    for k in keys(overrides)
+        k in names || throw(ArgumentError("$T has no field $k"))
+    end
+    return T((haskey(overrides, f) ? overrides[f] : getfield(x, f)
+        for f in names)...)
 end
