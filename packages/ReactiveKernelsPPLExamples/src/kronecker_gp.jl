@@ -49,18 +49,54 @@ _kron_mvprod(A, B, V) = transpose(A * transpose(B * V))
 # log-Jacobian terms are accumulated by `_ccl_constraint_lp` below so each
 # helper stays single-valued). z holds the row-major lower-triangle of the
 # K×K factor; row i (2..K) consumes z entries (1..i-1). ---
-#
-# Both helpers are spelled WITHOUT scalar indexing so the all-bound posterior
-# query traces under Reactant (`z[k]` on a traced z is refused by the
-# scalar-indexing guard). The spelling is a closed form, not an unrolled
-# loop: with s_j the running within-row sum of squares, each step writes
-# w_j = z_j·√(1−s_{j−1}) and s_j = s_{j−1}+w_j², hence
-# 1−s_j = (1−s_{j−1})·(1−z_j²) and log(1−s_j) is a within-row prefix sum of
-# t = log(1−z²). Row maps come from triangular numbers: position p sits in
-# row i(p) = ⌈(1+√(1+8p))/2⌉ at within-row index m(p) = p−(i−1)(i−2)/2.
-# docs/src/constraints.md forbids trace-time unrolling a data-derived trip
-# count (K is bound data), so no `for i in 2:K` appears here.
 _cholesky_corr_constrain_L(z, K) = begin
+    L = zeros(K, K)
+    L[1, 1] = 1.0
+    k = 1
+    for i in 2:K
+        L[i, 1] = z[k]
+        sum_sqs = z[k] * z[k]
+        k += 1
+        for j in 2:(i - 1)
+            L[i, j] = z[k] * sqrt(1.0 - sum_sqs)
+            sum_sqs += L[i, j] * L[i, j]
+            k += 1
+        end
+        L[i, i] = sqrt(1.0 - sum_sqs)
+    end
+    L
+end
+
+# The `0.5·log(1 − sum_sqs)` partial-sum Jacobian terms of Stan's
+# `cholesky_corr_constrain` (the tanh `corr_constrain` terms are added in-graph).
+_ccl_constraint_lp(z, K) = begin
+    lp = 0.0
+    k = 1
+    for i in 2:K
+        sum_sqs = z[k] * z[k]
+        k += 1
+        for j in 2:(i - 1)
+            lp += 0.5 * log(1.0 - sum_sqs)
+            w = z[k] * sqrt(1.0 - sum_sqs)
+            sum_sqs += w * w
+            k += 1
+        end
+    end
+    lp
+end
+
+# --- Tracing implementations of the two helpers (`ReactiveKernels.traced`):
+# a tracing backend (Reactant) calls these in place of the loops above, which
+# native execution keeps. The loops cannot trace: `z[k]` on a traced z is
+# refused by the scalar-indexing guard, and docs/src/constraints.md forbids
+# trace-time unrolling a data-derived trip count (K is bound data). So these
+# are closed forms, not unrolled loops: with s_j the running within-row sum of
+# squares, each step writes w_j = z_j·√(1−s_{j−1}) and s_j = s_{j−1}+w_j²,
+# hence 1−s_j = (1−s_{j−1})·(1−z_j²) and log(1−s_j) is a within-row prefix sum
+# of t = log(1−z²). Row maps come from triangular numbers: position p sits in
+# row i(p) = ⌈(1+√(1+8p))/2⌉ at within-row index m(p) = p−(i−1)(i−2)/2.
+# They are defined before `model`, so its whole recipes route here. ---
+ReactiveKernels.traced(::typeof(_cholesky_corr_constrain_L), z, K) = begin
     n_free = length(z)
     @assert n_free == (K * (K - 1)) ÷ 2
     t = log.(1 .- z .^ 2)
@@ -82,12 +118,10 @@ _cholesky_corr_constrain_L(z, K) = begin
     strict + Float64.(Irow .== Jcol) .* reshape(d, K, 1)
 end
 
-# The `0.5·log(1 − sum_sqs)` partial-sum Jacobian terms of Stan's
-# `cholesky_corr_constrain` (the tanh `corr_constrain` terms are added in-graph).
-# Closed form of the same recurrence `_cholesky_corr_constrain_L` evaluates:
-# each t_m = log(1−z_m²) is counted (i−1−m) times in its row, so the
-# position weight is max(i−1−m, 0) — broadcast, gather-free, no scalar reads.
-_ccl_constraint_lp(z, K) = begin
+# Closed form of the partial-sum Jacobian: each t_m = log(1−z_m²) is counted
+# (i−1−m) times in its row, so the position weight is max(i−1−m, 0) —
+# broadcast, gather-free, no scalar reads.
+ReactiveKernels.traced(::typeof(_ccl_constraint_lp), z, K) = begin
     n_free = length(z)
     @assert n_free == (K * (K - 1)) ÷ 2
     ps = 1:n_free

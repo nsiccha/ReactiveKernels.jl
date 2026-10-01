@@ -175,5 +175,6 @@ and lock the one Reactant 0.2.289 lifted:
   `eigen(A)` dies branching on a traced `Bool` and `eigvals(Symmetric(A))`
   has no traced method at all: `repro_reactant_eigen_symmetric.jl`. That is
   the shape of the posteriordb `kronecker_gp` example's exact
-  Kronecker-eigenspace marginal likelihood; RK keeps the authored
-  `eigen(Symmetric(·))` calls.
+  Kronecker-eigenspace marginal likelihood: its owned
+  `rk_symmetric_eigvals`/`rk_symmetric_eigvecs` margins call
+  `eigen(Symmetric(·))` as their primal and fail the same way.

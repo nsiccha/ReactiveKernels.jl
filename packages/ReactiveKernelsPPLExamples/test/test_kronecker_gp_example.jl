@@ -231,27 +231,38 @@ end
     end
 end
 
-@testset "vectorized LKJ helpers match Stan's constrain (snag kronecker-gp-rea-dc8cef6f)" begin
+@testset "LKJ helpers: native loops + closed-form tracing implementations (snag kronecker-gp-rea-dc8cef6f)" begin
     sandbox = evaluate_kronecker_gp_source(; model_only = true).sandbox
     lp_fn = getfield(sandbox, :_ccl_constraint_lp)
     L_fn = getfield(sandbox, :_cholesky_corr_constrain_L)
     # The sandbox methods are defined by the evaluation above; cross the
-    # world-age barrier the same way the kernel call does.
-    lp_call(z, K) = Base.invokelatest(lp_fn, z, K)
-    L_call(z, K) = Base.invokelatest(L_fn, z, K)
+    # world-age barrier the same way the kernel call does. `traced` called
+    # natively dispatches to the closed form a tracing backend would run.
+    lp_native(z, K) = Base.invokelatest(lp_fn, z, K)
+    L_native(z, K) = Base.invokelatest(L_fn, z, K)
+    lp_traced(z, K) = Base.invokelatest(ReactiveKernels.traced, lp_fn, z, K)
+    L_traced(z, K) = Base.invokelatest(ReactiveKernels.traced, L_fn, z, K)
     for seed in (5, 17, 101)
         zp = 0.9 .* sin.((1:(_KRON_N * (_KRON_N - 1) ÷ 2)) .* (0.7 + seed / 50) .+ seed)
-        @test lp_call(zp, _KRON_N) ≈ _kron_partial_lp(zp)
-        @test L_call(zp, _KRON_N) ≈ _kron_L_from_z(zp)
+        @test lp_native(zp, _KRON_N) ≈ _kron_partial_lp(zp)
+        @test L_native(zp, _KRON_N) ≈ _kron_L_from_z(zp)
+        @test lp_traced(zp, _KRON_N) ≈ _kron_partial_lp(zp)
+        @test L_traced(zp, _KRON_N) ≈ _kron_L_from_z(zp)
     end
     for K in (2, 3, 5, 8)
         n = (K * (K - 1)) ÷ 2
         z = 0.9 .* sin.((1:n) .* 0.9 .+ K)
-        @test lp_call(z, K) ≈ _kron_partial_lp_K(z, K)
-        @test L_call(z, K) ≈ _kron_L_from_z_K(z, K)
+        @test lp_traced(z, K) ≈ _kron_partial_lp_K(z, K)
+        @test L_traced(z, K) ≈ _kron_L_from_z_K(z, K)
     end
-    # The helpers must stay loop-free: K is bound data, and constraints.md
-    # forbids trace-time unrolling a data-derived trip count. (Comment lines
-    # start with `#`, so `^\s*for` only matches code.)
-    @test !occursin(r"(?m)^\s*for\s", KRON_SOURCE)
+    # The tracing implementations must stay loop-free: K is bound data, and
+    # constraints.md forbids trace-time unrolling a data-derived trip count.
+    # They are the source from the first `ReactiveKernels.traced` method to
+    # `@kernel model` (comment lines start with `#`, so `^\s*for` only matches
+    # code); the native loops before them are the positive control.
+    traced_from = first(findfirst(r"(?m)^ReactiveKernels\.traced\(", KRON_SOURCE))
+    model_from = first(findfirst("@kernel model(", KRON_SOURCE))
+    @test traced_from < model_from
+    @test !occursin(r"(?m)^\s*for\s", KRON_SOURCE[traced_from:model_from])
+    @test occursin(r"(?m)^\s*for\s", KRON_SOURCE[1:traced_from])
 end

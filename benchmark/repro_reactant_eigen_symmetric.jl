@@ -20,8 +20,9 @@
 #     eigvals!(::Symmetric{TracedRNumber{Float64}, TracedRArray{Float64, 2}})
 # This is the shape of the posteriordb `kronecker_gp` example's exact
 # Kronecker-eigenspace marginal likelihood (`packages/
-# ReactiveKernelsPPLExamples/src/kronecker_gp.jl`); RK keeps the authored
-# `eigen(Symmetric(·))` calls per docs/src/constraints.md. Tracked on
+# ReactiveKernelsPPLExamples/src/kronecker_gp.jl`), whose owned
+# `rk_symmetric_eigvals`/`rk_symmetric_eigvecs` margins call
+# `eigen(Symmetric(·))` as their primal and fail identically. Tracked on
 # nsiccha/ReactiveKernels.jl (relay upstream from there).
 using Reactant, LinearAlgebra
 

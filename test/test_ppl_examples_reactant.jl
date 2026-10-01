@@ -152,9 +152,11 @@ end
 
 # Pinned XLA gaps (signature-checked; any other failure rethrows loudly).
 #
-# kronecker_gp: the LKJ-Cholesky helpers are closed-form vectorized (snag
-# kronecker-gp-rea-dc8cef6f), so the trace reaches the stacked upstream
-# Reactant gap: `eigen(Symmetric(::TracedRArray))` dies during tracing in
+# kronecker_gp: the LKJ-Cholesky helpers carry closed-form
+# `ReactiveKernels.traced` methods (snag kronecker-gp-rea-dc8cef6f), so the
+# trace reaches the stacked upstream Reactant gap: the owned
+# `rk_symmetric_eigvecs`/`rk_symmetric_eigvals` margins' primal
+# `eigen(Symmetric(::TracedRArray))` dies during tracing in
 # `LinearAlgebra.isdiag(::Symmetric)` → Reactant `isbanded`/`_istril` →
 # `MethodError: no method matching overloaded_triu(::UpperTriangular{
 # TracedRNumber{Float64}, TracedRArray{Float64, 2}}, ::Int64)` (Reactant
@@ -176,16 +178,17 @@ _xla_is_cholesky_adjoint_gap(e) =
         occursin("stablehlo.cholesky", msg))
 
 # kronecker_gp LKJ-Cholesky helpers (`_ccl_constraint_lp`,
-# `_cholesky_corr_constrain_L`) compiled on a traced position. The sandbox
-# methods are defined by the source evaluation, so callers cross the
-# world-age barrier with `Base.invokelatest`.
-function _kron_lkj_helpers_compiled(sandbox, z, K)
+# `_cholesky_corr_constrain_L`): their closed-form `ReactiveKernels.traced`
+# methods (the code a tracing backend runs in place of the native loops)
+# compiled on a traced position. The sandbox methods are defined by the source
+# evaluation, so callers cross the world-age barrier with `Base.invokelatest`.
+function _kron_lkj_traced_compiled(sandbox, z, K)
     lp_fn = getfield(sandbox, :_ccl_constraint_lp)
     L_fn = getfield(sandbox, :_cholesky_corr_constrain_L)
     rz = Reactant.to_rarray(z)
-    clp = @compile sync = true lp_fn(rz, K)
-    cL = @compile sync = true L_fn(rz, K)
-    (_host(clp(rz, K)), _host(cL(rz, K)))
+    clp = @compile sync = true ReactiveKernels.traced(lp_fn, rz, K)
+    cL = @compile sync = true ReactiveKernels.traced(L_fn, rz, K)
+    (_host(clp(lp_fn, rz, K)), _host(cL(L_fn, rz, K)))
 end
 
 # Each migrated / new PPL example compiles and executes through the public
@@ -753,17 +756,17 @@ end
             gapped && _xla_is_kron_eigen_gap(e) || rethrow()
         end
     end
-    # kronecker_gp — the LKJ-Cholesky helpers are closed-form vectorized (no
-    # scalar indexing, no data-derived unroll), so they trace under Reactant
-    # and reproduce native. The FULL posterior still waits on the upstream
-    # `eigen(::Symmetric)` gap (reactivekernels-use §7aa; snag
+    # kronecker_gp — the LKJ-Cholesky helpers' closed-form `traced` methods (no
+    # scalar indexing, no data-derived unroll) compile under Reactant and
+    # reproduce the native loops. The FULL posterior still waits on the
+    # upstream `eigen(::Symmetric)` gap (reactivekernels-use §7aa; snag
     # kronecker-gp-rea-dc8cef6f), which owns the whole-example legs.
-    @testset "kronecker_gp LKJ helpers trace under Reactant (full posterior waits on upstream eigen §7aa)" begin
+    @testset "kronecker_gp LKJ tracing implementations compile under Reactant (full posterior waits on upstream eigen §7aa)" begin
         a = evaluate_kronecker_gp_source(; model_only = true)
         K = 30
         z = 0.9 .* sin.((1:((K * (K - 1)) ÷ 2)) .* 0.9 .+ 1.0)
         compiled_lp, compiled_L =
-            Base.invokelatest(_kron_lkj_helpers_compiled, a.sandbox, z, K)
+            Base.invokelatest(_kron_lkj_traced_compiled, a.sandbox, z, K)
         native_lp = Base.invokelatest(
             getfield(a.sandbox, :_ccl_constraint_lp), z, K)
         native_L = Base.invokelatest(
