@@ -75,8 +75,9 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g1, :g2))
         d = only(plan.varying_draws)
-        @test d.kind === :intercept1
-        @test isnan(d.lkj_eta)
+        # One geometry for every K: an intercept-only mm block is the
+        # 1x1 correlated case.
+        @test (d.kind, d.lkj_eta) === (:correlated, 1.0)
         @test d.group === :mm__g1__g2
         @test d.suffix == "mm__g1__g2"
         @test d.mm.groups == [:g1, :g2]
@@ -154,7 +155,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g1, :g2))
         d = only(plan.varying_draws)
-        @test d.kind === :intercept1
+        @test d.kind === :correlated
         @test d.mm.groups == [:g1, :g2]
     end
     @testset "error spellings" begin
@@ -222,10 +223,10 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
             end, (:y, :x, :g1, :g2))
-        # eta on intercept-only.
+        # A non-default eta at K=1 (nothing to parameterize).
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 a ~ Normal(0, 5)
-                d ~ varying_draws(mm(g1, g2), [1]; eta = 1.0)
+                d ~ varying_draws(mm(g1, g2), [1]; eta = 2.0)
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
@@ -359,10 +360,10 @@ end
 # Hand-built draws for contract-validation tests (surface-independent).
 # Label stays `:draws_g` so the base plan's slice/term linkage holds
 # and the grouping check under test is what fires.
-function _mm_draws(; group = :mm__g1__g2, kind = :intercept1,
+function _mm_draws(; group = :mm__g1__g2, kind = :correlated,
         margins = VaryingMargin[VaryingMargin(:Intercept,
             VaryingZRecipe(:ones, :none, nothing))],
-        lkj_eta = NaN, label = :draws_g, suffix = "mm__g1__g2",
+        lkj_eta = 1.0, label = :draws_g, suffix = "mm__g1__g2",
         levels = nothing, sd_priors = VaryingSdPrior[],
         mm = VaryingMultiMembership([:g1, :g2], nothing, true),
         strata = nothing)
@@ -398,13 +399,17 @@ end
             mm = VaryingMultiMembership([:g1, :g2], [:w1], true))
         @test_throws ContractValidationError _mm_validate(d)
     end
-    @testset "mm slope1 kind rejected" begin
-        d = _mm_draws(kind = :slope1, margins = slope1())
-        @test_throws ContractValidationError _mm_validate(d)
+    @testset "mm retired K=1 kinds rejected" begin
+        for (kind, margins) in ((:intercept1, ones1()), (:slope1, slope1()))
+            d = _mm_draws(; kind, margins, lkj_eta = NaN)
+            @test_throws ContractValidationError _mm_validate(d)
+        end
     end
-    @testset "mm intercept with eta rejected" begin
-        d = _mm_draws(kind = :correlated, lkj_eta = 1.0)
-        @test_throws ContractValidationError _mm_validate(d)
+    @testset "mm K=1 is the 1x1 correlated case" begin
+        @test _mm_validate(_mm_draws()) === nothing
+        @test _mm_validate(_mm_draws(margins = slope1())) === nothing
+        @test_throws ContractValidationError _mm_validate(
+            _mm_draws(lkj_eta = 2.0))
     end
     @testset "mm eta != 1.0 rejected" begin
         d = _mm_draws(kind = :correlated, lkj_eta = 2.0,
@@ -425,8 +430,8 @@ end
         @test_throws ContractValidationError _mm_validate(d)
     end
     @testset "stratified non-correlated rejected" begin
-        d = _mm_draws(group = :g, kind = :intercept1, mm = nothing,
-            label = :draws_g, suffix = "g",
+        d = _mm_draws(group = :g, kind = :intercept1, lkj_eta = NaN,
+            mm = nothing, label = :draws_g, suffix = "g",
             strata = VaryingStrata(:b, nothing))
         @test_throws ContractValidationError _mm_validate(d)
     end
@@ -607,7 +612,7 @@ end
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
             end, _mm_cols())
-        # a + log_scale + xi(3).
+        # a + 0 thetas + tau(1) + z(3): the 1x1 L packs nothing.
         @test lay.total == 5
         _, _, _, lay2 = _mm_query(quote
                 a ~ Normal(0, 5)
@@ -616,7 +621,7 @@ end
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
             end, _mm_cols())
-        # a + 0 thetas + tau(1) + z(3): the vacuous route packs no L.
+        # The same geometry for a slope margin.
         @test lay2.total == 5
         @test count(e -> e.kind === :varying_corr, lay2.entries) == 1
         @test only(e for e in lay2.entries if e.kind === :varying_corr).size == 0
@@ -698,9 +703,19 @@ end
     end
 end
 
+# K=1 mm draws (the 1x1 correlated case): the G×1 draws `tau * z`
+# plus the half-normal `tau` and standard-normal `z` prior terms (the
+# 1x1 LKJ contributes exactly 0.0).
+function _mm_k1_draws(nt, sfx)
+    tau = only(getfield(nt, Symbol("tau_", sfx)))
+    z = getfield(nt, Symbol("z_flat_", sfx))
+    b = reshape(tau .* z, length(z), 1)
+    return b, logpdf(Normal(0, 1), tau) + sum(logpdf.(Normal(0, 1), z))
+end
+
 @testset "mm intercept e2e values and gradient" begin
-    # Lognormal sd here is the intended SB `ranef_intercept_draws`
-    # mirror (see the `VaryingDraws` docstring), not a divergence.
+    # One sd geometry for every K: the half-normal tau of every other
+    # varying block, plus its `exp`-layout Jacobian (u[2]).
     @testset "default weights" begin
         bound, built, _, lay = _mm_query(quote
                 a ~ Normal(0, 5)
@@ -711,16 +726,14 @@ end
             end, _mm_cols())
         u = [0.2, 0.1, -0.3, 0.4, 0.0]
         nt = constrain(lay, u)
-        b = reshape(exp(nt.log_scale_mm__g1__g2) .* nt.xi_mm__g1__g2, 3, 1)
+        b, bpr = _mm_k1_draws(nt, "mm__g1__g2")
         r = _mm_ref_r([_MM_G1, _MM_G2],
             [fill(0.5, 4), fill(0.5, 4)], b, ones(4, 1))
         ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, 1.0), _MM_Y))
-        pr = logpdf(Normal(0, 5), nt.mu[1]) +
-            logpdf(Normal(0, 1), nt.log_scale_mm__g1__g2) +
-            sum(logpdf.(Normal(0, 1), nt.xi_mm__g1__g2))
+        pr = logpdf(Normal(0, 5), nt.mu[1]) + bpr
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
         @test _query(built.spec, bound, :prior, u) ≈ pr
-        @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+        @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2]
         _check_gradient(built.spec, bound, u)
     end
     @testset "normalized weights" begin
@@ -733,19 +746,15 @@ end
             end, _mm_cols())
         u = [0.2, 0.1, -0.3, 0.4, 0.0]
         nt = constrain(lay, u)
-        sfx = "mm__g1__g2__w__w1__w2"
-        b = reshape(exp(getfield(nt, Symbol("log_scale_", sfx))) .*
-            getfield(nt, Symbol("xi_", sfx)), 3, 1)
+        b, bpr = _mm_k1_draws(nt, "mm__g1__g2__w__w1__w2")
         tot = _MM_W1 .+ _MM_W2
         r = _mm_ref_r([_MM_G1, _MM_G2], [_MM_W1 ./ tot, _MM_W2 ./ tot],
             b, ones(4, 1))
         ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, 1.0), _MM_Y))
-        pr = logpdf(Normal(0, 5), nt.mu[1]) +
-            logpdf(Normal(0, 1), getfield(nt, Symbol("log_scale_", sfx))) +
-            sum(logpdf.(Normal(0, 1), getfield(nt, Symbol("xi_", sfx))))
+        pr = logpdf(Normal(0, 5), nt.mu[1]) + bpr
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
         @test _query(built.spec, bound, :prior, u) ≈ pr
-        @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+        @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2]
         _check_gradient(built.spec, bound, u)
     end
     @testset "raw weights" begin
@@ -759,17 +768,13 @@ end
             end, _mm_cols())
         u = [0.2, 0.1, -0.3, 0.4, 0.0]
         nt = constrain(lay, u)
-        sfx = "mm__g1__g2__w__w1__w2__raw"
-        b = reshape(exp(getfield(nt, Symbol("log_scale_", sfx))) .*
-            getfield(nt, Symbol("xi_", sfx)), 3, 1)
+        b, bpr = _mm_k1_draws(nt, "mm__g1__g2__w__w1__w2__raw")
         r = _mm_ref_r([_MM_G1, _MM_G2], [_MM_W1, _MM_W2], b, ones(4, 1))
         ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, 1.0), _MM_Y))
-        pr = logpdf(Normal(0, 5), nt.mu[1]) +
-            logpdf(Normal(0, 1), getfield(nt, Symbol("log_scale_", sfx))) +
-            sum(logpdf.(Normal(0, 1), getfield(nt, Symbol("xi_", sfx))))
+        pr = logpdf(Normal(0, 5), nt.mu[1]) + bpr
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
         @test _query(built.spec, bound, :prior, u) ≈ pr
-        @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+        @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2]
         _check_gradient(built.spec, bound, u)
     end
 end
@@ -1173,27 +1178,43 @@ function _mm_remap_g(g_rk::AbstractVector, lay, pairs::Vector, n_sb::Int)
     return g_sb
 end
 
+# SB samples a K=1 intercept's sd in log space (`log_scale ~
+# Normal(0, 1)`, identity layout); RK uses one sd geometry for every K
+# (half-normal `tau = exp(u)` plus its `exp` Jacobian `u`). At the
+# shared scale coordinate `u` the posteriors differ by exactly this
+# term, and the gradients by its derivative.
+_k1_sd_delta(u) = logpdf(Normal(), exp(u)) + u - logpdf(Normal(), u)
+_k1_sd_delta_grad(u) = 1 + u - exp(2u)
+
 # One SB probe: RK posterior + Enzyme gradient at the remapped SB u
-# against the brief's jacT value + BridgeStan-AD gradient.
+# against the brief's jacT value + BridgeStan-AD gradient. `k1_scale`
+# names the SB position of a K=1 intercept's log-scale coordinate,
+# whose sd-geometry difference (`_k1_sd_delta`) is added to SB's.
 function _mm_sb_check(prog::Expr, cols::Dict{Symbol,AbstractVector},
-        pairs::Vector, sb_val::Float64, sb_grad::Vector{Float64})
+        pairs::Vector, sb_val::Float64, sb_grad::Vector{Float64};
+        k1_scale::Union{Nothing,Int} = nothing)
     bound, built, _, lay = _mm_query(prog, cols)
     u_sb = collect(range(-0.4, 0.4; length = length(sb_grad)))
     u = _mm_remap_u(lay, u_sb, pairs)
+    want_val, want_grad = sb_val, copy(sb_grad)
+    if k1_scale !== nothing
+        want_val += _k1_sd_delta(u_sb[k1_scale])
+        want_grad[k1_scale] += _k1_sd_delta_grad(u_sb[k1_scale])
+    end
     got = _query(built.spec, bound, :posterior, u)
-    @test got ≈ sb_val rtol = 1e-12
+    @test got ≈ want_val rtol = 1e-12
     q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
     g = similar(u)
     val, _ = sampler_value_and_gradient!(q, g, u)
-    @test val ≈ sb_val rtol = 1e-12
-    @test _mm_remap_g(g, lay, pairs, length(sb_grad)) ≈ sb_grad rtol = 1e-8
+    @test val ≈ want_val rtol = 1e-12
+    @test _mm_remap_g(g, lay, pairs, length(sb_grad)) ≈ want_grad rtol = 1e-8
     return got
 end
 
 @testset "SB parity M1 mm-equal" begin
     sfx = "mm__g1__g2"
-    pairs = [:mu => 1:1, Symbol("log_scale_", sfx) => 2:2,
-        Symbol("xi_", sfx) => 3:5, :sigma => 6:6]
+    pairs = [:mu => 1:1, Symbol("tau_", sfx) => 2:2,
+        Symbol("z_flat_", sfx) => 3:5, :sigma => 6:6]
     _mm_sb_check(quote
             a ~ Normal(0, 5)
             sigma ~ Exponential(1)
@@ -1203,13 +1224,14 @@ end
             y .~ Normal.(mu, sigma)
         end, _sb_mm_cols(), pairs, -15.58948984045714,
         [1.250881394124855, 0.29153139168734266, 0.4642299002163417,
-            0.28655716611840265, -0.01939495660342591, -5.86641796738053])
+            0.28655716611840265, -0.01939495660342591, -5.86641796738053];
+        k1_scale = 2)
 end
 
 @testset "SB parity M5 mm-weighted" begin
     sfx = "mm__g1__g2__w__w1__w2"
-    pairs = [:mu => 1:1, Symbol("log_scale_", sfx) => 2:2,
-        Symbol("xi_", sfx) => 3:5, :sigma => 6:6]
+    pairs = [:mu => 1:1, Symbol("tau_", sfx) => 2:2,
+        Symbol("z_flat_", sfx) => 3:5, :sigma => 6:6]
     _mm_sb_check(quote
             a ~ Normal(0, 5)
             sigma ~ Exponential(1)
@@ -1219,13 +1241,14 @@ end
             y .~ Normal.(mu, sigma)
         end, _sb_mm_cols(), pairs, -15.574382310331188,
         [1.236743206846504, 0.3026598991134787, 0.4652073800224629,
-            0.19836679706561827, 0.05669644062510948, -5.896633027632439])
+            0.19836679706561827, 0.05669644062510948, -5.896633027632439];
+        k1_scale = 2)
 end
 
 @testset "SB parity M3 mm-raw" begin
     sfx = "mm__g1__g2__w__w1__w2__raw"
-    pairs = [:mu => 1:1, Symbol("log_scale_", sfx) => 2:2,
-        Symbol("xi_", sfx) => 3:5, :sigma => 6:6]
+    pairs = [:mu => 1:1, Symbol("tau_", sfx) => 2:2,
+        Symbol("z_flat_", sfx) => 3:5, :sigma => 6:6]
     _mm_sb_check(quote
             a ~ Normal(0, 5)
             sigma ~ Exponential(1)
@@ -1236,7 +1259,8 @@ end
             y .~ Normal.(mu, sigma)
         end, _sb_mm_cols(), pairs, -15.492630101384526,
         [0.9963940231145335, 0.31276498503668976, 1.0513921097313184,
-            0.7277672529115509, 0.11772905659279653, -6.06013744552576])
+            0.7277672529115509, 0.11772905659279653, -6.06013744552576];
+        k1_scale = 2)
 end
 
 @testset "SB parity M2 mm-corr" begin

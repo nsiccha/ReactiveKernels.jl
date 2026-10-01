@@ -1,6 +1,7 @@
 # Varying stages A–C: draws/slice IR + surface lowering + validation
-# (Stage A), K=1 codegen (Stage B), LKJ-correlated codegen (Stage C). All
-# three geometries build end to end (tested below), in both the fused
+# (Stage A), K=1 codegen (Stage B), LKJ-correlated codegen (Stage C).
+# One geometry (LKJ + tau + z) serves every K; a single margin is the
+# 1x1 case. It builds end to end (tested below), in both the fused
 # (`r ~ varying_effect(g, [margins...])`) and split (`d ~
 # varying_draws(g, [margins...])` + `r ~ varying_slice(d, cols)`)
 # spellings.
@@ -85,15 +86,17 @@ end
     @test b.lkj_eta == 1.0
 end
 
-@testset "varying lowering K=1 kinds" begin
+@testset "varying lowering K=1 kind" begin
+    # One geometry for every K: a single margin, intercept or slope, is
+    # the 1x1 correlated case with the canonical eta 1.0.
     one = lower_rkppl(quote
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :g))
     b = only(one.varying_draws)
-    @test b.kind === :intercept1
-    @test isnan(b.lkj_eta)
+    @test b.kind === :correlated
+    @test b.lkj_eta == 1.0
     @test b.label === :draws_g
     @test b.suffix == "g"
     slope = lower_rkppl(quote
@@ -102,17 +105,22 @@ end
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :g))
     bs = only(slope.varying_draws)
-    @test bs.kind === :slope1
-    @test isnan(bs.lkj_eta)
-    # K=1 WITH eta takes the vacuous-1x1-LKJ correlated route.
-    kid = lower_rkppl(quote
-            r ~ varying_effect(g, [1]; eta = 2.0)
-            mu = a .+ r
-            y .~ Normal.(mu, 1.5)
-        end, (:y, :g))
-    bk = only(kid.varying_draws)
-    @test bk.kind === :correlated
-    @test bk.lkj_eta == 2.0
+    @test bs.kind === :correlated
+    @test bs.lkj_eta == 1.0
+    # At K=1 eta parameterizes nothing: any value but the default is
+    # refused rather than silently ignored.
+    err = try
+        lower_rkppl(quote
+                r ~ varying_effect(g, [1]; eta = 2.0)
+                mu = a .+ r
+                y .~ Normal.(mu, 1.5)
+            end, (:y, :g))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError &&
+        occursin("no correlation for eta", sprint(showerror, err))
 end
 
 @testset "varying dummy margins" begin
@@ -233,6 +241,23 @@ end
     badkind.varying_draws[1] = VaryingDraws(:g, :slope1,
         _tv_draws().margins, NaN, :draws_g, "g")
     @test_throws ContractValidationError validate_structure(badkind)
+    # The retired K=1 kinds are refused on hand-built plans too.
+    k1m = [VaryingMargin(:Intercept, VaryingZRecipe(:ones, :none, nothing))]
+    retired = _tv_base(; with_effect = true)
+    retired.varying_draws[1] = VaryingDraws(:g, :intercept1, k1m, NaN,
+        :draws_g, "g")
+    @test_throws ContractValidationError validate_structure(retired)
+    # K=1 draws carry the canonical eta 1.0.
+    k1eta = _tv_base(; with_effect = true)
+    k1eta.varying_draws[1] = VaryingDraws(:g, :correlated, k1m, 2.0,
+        :draws_g, "g")
+    k1eta.varying_slices[1] = VaryingSlice(:draws_g, 1:1, :mu)
+    @test_throws ContractValidationError validate_structure(k1eta)
+    k1ok = _tv_base(; with_effect = true)
+    k1ok.varying_draws[1] = VaryingDraws(:g, :correlated, k1m, 1.0,
+        :draws_g, "g")
+    k1ok.varying_slices[1] = VaryingSlice(:draws_g, 1:1, :mu)
+    @test validate_structure(k1ok) === nothing
     badslice = _tv_base(; with_effect = true)
     badslice.varying_slices[1] = VaryingSlice(:draws_g, 1:1, :mu)
     @test_throws ContractValidationError validate_structure(badslice)
@@ -311,7 +336,7 @@ end
 @testset "varying Stage-C builds" begin
     cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5],
         :x => [0.5, -1.0, 1.5, 0.0], :g => [1, 2, 1, 2])
-    # K=1 draws build (intercept + slope); LKJ-correlated builds too.
+    # K=1 draws build (intercept + slope); K=2 builds too.
     iplan = lower_rkppl(quote
             a ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
@@ -319,7 +344,7 @@ end
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :g))
     ibuilt = build_kernel(bind_data(iplan, cols))
-    # a + log_scale_g + 2 xi cells.
+    # a + 0 thetas + 1 tau + 2 z cells.
     @test ibuilt.layout.total == 4
     splan = lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -338,46 +363,26 @@ end
     cbuilt = build_kernel(bind_data(cplan, cols))
     # a + 1 theta + 2 tau + 2*2 z cells.
     @test cbuilt.layout.total == 8
-    k1cplan = lower_rkppl(quote
-            a ~ Normal(0, 1)
-            r ~ varying_effect(g, [1]; eta = 1.0)
-            mu = a .+ r
-            y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
-    # K=1 with eta is :correlated (L packs zero coords).
-    k1cbuilt = build_kernel(bind_data(k1cplan, cols))
-    # a + 0 thetas + 1 tau + 2 z cells.
-    @test k1cbuilt.layout.total == 4
 end
 
 @testset "varying K=1 names" begin
+    # A single margin owns the same L/tau/z names as a larger block.
     iplan = lower_rkppl(quote
             a ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :g))
-    ib = only(iplan.varying_draws)
-    @test ib.kind === :intercept1
-    @test ReactiveKernelsPPL._varying_k1_names(ib) ===
-        (:log_scale_g, :xi_g)
+    @test ReactiveKernelsPPL._varying_corr_names(only(iplan.varying_draws)) ===
+        (:L_g, :tau_g, :z_flat_g)
     splan = lower_rkppl(quote
             a ~ Normal(0, 1)
             r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :g))
-    sb = only(splan.varying_draws)
-    @test sb.kind === :slope1
-    @test ReactiveKernelsPPL._varying_k1_names(sb) === (:tau_g, :xi_g)
-    cplan = lower_rkppl(quote
-            a ~ Normal(0, 1)
-            r ~ varying_effect(g, [1, x])
-            mu = a .+ r
-            y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
-    @test_throws ContractValidationError ReactiveKernelsPPL._varying_k1_names(
-        only(cplan.varying_draws))
+    @test ReactiveKernelsPPL._varying_corr_names(only(splan.varying_draws)) ===
+        (:L_g, :tau_g, :z_flat_g)
     # Claims: user definitions cannot collide with K=1 names.
     @test_throws SurfaceLoweringError lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -391,7 +396,7 @@ end
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-            xi_g ~ Normal(0, 1)
+            z_flat_g ~ Normal(0, 1)
         end, (:y, :x, :g))
     # Name tables: a hand-built parameter under a K=1 name fails.
     clash = lower_rkppl(quote
@@ -400,8 +405,8 @@ end
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :g))
-    push!(clash.parameters, SampledParameter(:log_scale_g, :normal,
-        (arg1 = 0, arg2 = 1), nothing, :log_scale_g))
+    push!(clash.parameters, SampledParameter(:tau_g, :normal,
+        (arg1 = 0, arg2 = 1), nothing, :tau_g))
     @test_throws ContractValidationError validate_structure(clash)
 end
 
@@ -422,20 +427,21 @@ end
         end, (:y, :g))
     bound = bind_data(plan, cols)
     layout = assign_layout(bound)
+    # The 1x1 LKJ factor packs zero coordinates; tau rides :exp (Stan
+    # lower-bound Jacobian, no renorm) — the intercept and slope alike.
     @test [e.kind for e in layout.entries] ==
-        [:coefficient, :sampled, :sampled, :varying]
-    @test [e.size for e in layout.entries] == [1, 1, 1, 3]
+        [:coefficient, :sampled, :varying_corr, :varying, :varying]
+    @test [e.size for e in layout.entries] == [1, 1, 0, 1, 3]
     @test [e.transform for e in layout.entries] ==
-        [:identity, :exp, :identity, :identity]
+        [:identity, :exp, :lkj, :exp, :identity]
     @test layout.total == 6
-    @test coordinate_names(layout)[2:3] ==
-        [:sigma, :log_scale_g]
+    @test coordinate_names(layout)[2:3] == [:sigma, Symbol("tau_g.1")]
     u = [0.2, 0.1, -0.3, 0.4, 0.0, -0.1]
     nt = constrain(layout, u)
-    @test nt.log_scale_g == -0.3 && nt.xi_g == [0.4, 0.0, -0.1]
+    @test nt.L_g == [1.0;;]
+    @test nt.tau_g ≈ [exp(-0.3)] && nt.z_flat_g == [0.4, 0.0, -0.1]
     @test unconstrain(layout, nt) ≈ u
-    @test logjac(layout, u) ≈ u[2]
-    # Slope draws: tau rides :exp (Stan lower-bound Jacobian, no renorm).
+    @test logjac(layout, u) ≈ u[2] + u[3]
     splan = lower_rkppl(quote
             a ~ Normal(0, 1)
             r ~ varying_effect(g, [x])
@@ -446,27 +452,27 @@ end
         :x => collect(1.0:8.0))
     slayout = assign_layout(bind_data(splan, scols))
     @test [e.kind for e in slayout.entries] ==
-        [:coefficient, :sampled, :varying]
+        [:coefficient, :varying_corr, :varying, :varying]
     @test [e.transform for e in slayout.entries] ==
-        [:identity, :exp, :identity]
-    @test coordinate_names(slayout)[2] === :tau_g
+        [:identity, :lkj, :exp, :identity]
+    @test coordinate_names(slayout)[2] === Symbol("tau_g.1")
     us = [0.5, 0.3, 0.1, 0.2, 0.0]
     @test logjac(slayout, us) ≈ us[2]
 end
 
-# Independent intercept reference: SB `ranef_intercept` equations
-# (`log_scale ~ std_normal()`, effect `exp(log_scale) * xi[idx]` — a
-# LogNormal(0, 1) sd) with explicit names/order (no contract helpers —
-# this pins them). The lognormal sd is the intended SB mirror (SB
-# mirrors VBRMI's `chol` 1x1 collapse; see the `VaryingDraws`
-# docstring), NOT a half-normal waiting to happen.
-function _tv_ref_intercept(bound, nt)
-    idx = [findfirst(==(v), ["a", "b", "c"]) for v in bound.columns[:g]]
-    r = exp(nt.log_scale_g) .* nt.xi_g[idx]
+# Independent K=1 reference with explicit names/order (no contract
+# helpers — this pins them): effect `tau * (z[idx] .* Z)`, a half-normal
+# sd (`tau ~ Normal(0, 1)` on `tau > 0`, Stan lower-bound kernel: no
+# +log(2)) plus the `exp`-layout Jacobian, and no LKJ term (the 1x1
+# factor is the fixed `[1]`). One reference for intercept (`Z = 1`) and
+# slope margins: the geometry does not depend on the margin.
+function _tv_ref_k1(bound, nt, Z, levels)
+    idx = [findfirst(==(v), levels) for v in bound.columns[:g]]
+    r = only(nt.tau_g) .* (nt.z_flat_g[idx] .* Z)
     ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), bound.columns[:y]))
     pr = logpdf(Normal(0, 5), nt.mu[1]) + logpdf(Exponential(1), nt.sigma) +
-        logpdf(Normal(0, 1), nt.log_scale_g) +
-        sum(logpdf.(Normal(0, 1), nt.xi_g))
+        logpdf(Normal(0, 1), only(nt.tau_g)) +
+        sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     return (; ll, pr)
 end
 
@@ -483,24 +489,13 @@ end
     built = build_kernel(bound)
     u = [0.2, 0.1, -0.3, 0.4, 0.0, -0.1]
     nt = constrain(built.layout, u)
-    ref = _tv_ref_intercept(bound, nt)
+    ref = _tv_ref_k1(bound, nt, 1.0, ["a", "b", "c"])
     @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
+    # No +log(2): SB Stan-convention tau (see the generator comment).
     @test _query(built.spec, bound, :prior, u) ≈ ref.pr
-    @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + u[2]
+    @test _query(built.spec, bound, :posterior, u) ≈
+        ref.ll + ref.pr + u[2] + u[3]
     _check_gradient(built.spec, bound, u)
-end
-
-# Independent slope reference: SB `ranef_slope` equations
-# (`tau ~ std_normal(; lower=0)`, effect `tau * (xi[idx] .* Z)` — a
-# half-normal sd plus the Stan `exp`-layout Jacobian).
-function _tv_ref_slope(bound, nt, Z)
-    idx = [findfirst(==(v), [1, 2, 3]) for v in bound.columns[:g]]
-    r = nt.tau_g .* (nt.xi_g[idx] .* Z)
-    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), bound.columns[:y]))
-    pr = logpdf(Normal(0, 5), nt.mu[1]) + logpdf(Exponential(1), nt.sigma) +
-        logpdf(Normal(0, 1), nt.tau_g) +
-        sum(logpdf.(Normal(0, 1), nt.xi_g))
-    return (; ll, pr)
 end
 
 @testset "varying slope e2e values and gradient" begin
@@ -519,7 +514,7 @@ end
     built = build_kernel(bound)
     u = [0.2, 0.1, -0.2, 0.3, 0.0, -0.1]
     nt = constrain(built.layout, u)
-    ref = _tv_ref_slope(bound, nt, x2)
+    ref = _tv_ref_k1(bound, nt, x2, [1, 2, 3])
     @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
     # No +log(2): SB Stan-convention tau (see the generator comment).
     @test _query(built.spec, bound, :prior, u) ≈ ref.pr
@@ -539,91 +534,50 @@ end
         Dict{Symbol,AbstractVector}(:g => g2, :y => y, :c => c3))
     dbuilt = build_kernel(dbound)
     dnt = constrain(dbuilt.layout, u)
-    dref = _tv_ref_slope(dbound, dnt, Float64.([v == 2 for v in c3]))
+    dref = _tv_ref_k1(dbound, dnt, Float64.([v == 2 for v in c3]), [1, 2, 3])
     @test _query(dbuilt.spec, dbound, :likelihood, u) ≈ dref.ll
     @test _query(dbuilt.spec, dbound, :prior, u) ≈ dref.pr
     @test _query(dbuilt.spec, dbound, :posterior, u) ≈
         dref.ll + dref.pr + u[2] + u[3]
 end
 
-@testset "varying K=1 sd-geometry SB parity" begin
-    # Snag intercept1-logno-f87f4be4: the K=1 sd asymmetry (lognormal
-    # intercept sd, half-normal slope sd) is an intended equation-level
-    # SB mirror, not a divergence — SB's own `(1 | g)` path is
-    # log-scale (`ranef_intercept`), its slope path half-normal
-    # (`ranef_slope`). These pins fail loudly if either geometry is
-    # "unified" to the other. Probe sd = 1.2 with literal sigma so the
-    # slope's `exp`-layout Jacobian is the only one in play.
+@testset "varying K=1 one sd geometry" begin
+    # One sd geometry for every K and every margin: a K=1 intercept and a
+    # K=1 slope both carry a half-normal `tau` (plus the `exp`-layout
+    # Jacobian), exactly as each margin of a K=2 block does. Probe
+    # sd = 1.2 with literal sigma so tau's Jacobian is the only one.
     y = [0.5, -0.3, 1.1, 0.2]
     g = [1, 2, 1, 2]
     x = [0.5, -1.0, 1.5, 0.0]
-    iplan = lower_rkppl(quote
-            a ~ Normal(0, 5)
-            r ~ varying_effect(g, [1])
-            mu = a .+ r
-            y .~ Normal.(mu, 1.0)
-        end, (:y, :g))
-    @test only(iplan.varying_draws).kind === :intercept1
-    ibound = bind_data(iplan,
-        Dict{Symbol,AbstractVector}(:y => y, :g => g))
-    ibuilt = build_kernel(ibound)
-    ilay = ibuilt.layout
-    @test only(e.transform for e in ilay.entries
-        if e.name === :log_scale_g) === :identity
-    iq = (mu = [0.0], log_scale_g = log(1.2), xi_g = [0.0, 0.0])
-    iu = unconstrain(ilay, iq)
+    cols = Dict{Symbol,AbstractVector}(:y => y, :g => g, :x => x)
     rest = logpdf(Normal(0, 5), 0.0) + 2 * logpdf(Normal(), 0.0)
-    isd = _query(ibuilt.spec, ibound, :prior, iu) - rest
-    @test isd ≈ logpdf(Normal(), log(1.2))
-    ill = _query(ibuilt.spec, ibound, :likelihood, iu)
-    ipr = _query(ibuilt.spec, ibound, :prior, iu)
-    @test _query(ibuilt.spec, ibound, :posterior, iu) ≈ ill + ipr
-    splan = lower_rkppl(quote
-            a ~ Normal(0, 5)
-            r ~ varying_effect(g, [x])
-            mu = a .+ r
-            y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :g))
-    @test only(splan.varying_draws).kind === :slope1
-    sbound = bind_data(splan,
-        Dict{Symbol,AbstractVector}(:y => y, :g => g, :x => x))
-    sbuilt = build_kernel(sbound)
-    slay = sbuilt.layout
-    @test only(e.transform for e in slay.entries
-        if e.name === :tau_g) === :exp
-    sq = (mu = [0.0], tau_g = 1.2, xi_g = [0.0, 0.0])
-    su = unconstrain(slay, sq)
-    ssd = _query(sbuilt.spec, sbound, :prior, su) - rest
-    @test ssd ≈ logpdf(Normal(), 1.2)
-    sll = _query(sbuilt.spec, sbound, :likelihood, su)
-    spr = _query(sbuilt.spec, sbound, :prior, su)
-    @test _query(sbuilt.spec, sbound, :posterior, su) ≈ sll + spr + log(1.2)
-    # The asymmetry is a shape difference, not a constant: unifying
-    # either geometry to the other moves both assertions above.
-    @test !(isd ≈ ssd)
-    # Escape hatch: K=1 with eta takes the vacuous-1x1-LKJ correlated
-    # route and recovers the half-normal sd (the LKJ contributes
-    # nothing at 1x1) — the spelling for a half-normal K=1.
-    cplan = lower_rkppl(quote
-            a ~ Normal(0, 5)
-            r ~ varying_effect(g, [1]; eta = 1.0)
-            mu = a .+ r
-            y .~ Normal.(mu, 1.0)
-        end, (:y, :g))
-    cb = only(cplan.varying_draws)
-    @test cb.kind === :correlated && cb.lkj_eta == 1.0
-    cbound = bind_data(cplan,
-        Dict{Symbol,AbstractVector}(:y => y, :g => g))
-    cbuilt = build_kernel(cbound)
-    clay = cbuilt.layout
-    cq = (mu = [0.0], L_g = [1.0;;], tau_g = [1.2],
-        z_flat_g = [0.0, 0.0])
-    cu = unconstrain(clay, cq)
-    csd = _query(cbuilt.spec, cbound, :prior, cu) - rest
-    @test csd ≈ logpdf(Normal(), 1.2)
-    cll = _query(cbuilt.spec, cbound, :likelihood, cu)
-    cpr = _query(cbuilt.spec, cbound, :prior, cu)
-    @test _query(cbuilt.spec, cbound, :posterior, cu) ≈ cll + cpr + log(1.2)
+    q = (mu = [0.0], L_g = [1.0;;], tau_g = [1.2], z_flat_g = [0.0, 0.0])
+    function k1_sd(margin, kw...)
+        call = Expr(:call, :varying_effect, :g, Expr(:vect, margin))
+        isempty(kw) || insert!(call.args, 2, Expr(:parameters,
+            (Expr(:kw, k, v) for (k, v) in kw)...))
+        plan = lower_rkppl(quote
+                a ~ Normal(0, 5)
+                r ~ $call
+                mu = a .+ r
+                y .~ Normal.(mu, 1.0)
+            end, (:y, :x, :g))
+        bound = bind_data(plan, cols)
+        built = build_kernel(bound)
+        lay = built.layout
+        @test only(e.transform for e in lay.entries
+            if e.name === :tau_g) === :exp
+        u = unconstrain(lay, q)
+        ll = _query(built.spec, bound, :likelihood, u)
+        pr = _query(built.spec, bound, :prior, u)
+        @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + log(1.2)
+        return pr - rest
+    end
+    @test k1_sd(1) ≈ logpdf(Normal(), 1.2)
+    @test k1_sd(:x) ≈ logpdf(Normal(), 1.2)
+    # `sd=` is admitted at K=1, with no eta needed to unlock it.
+    @test k1_sd(1, :sd => :(Cauchy(0, 5))) ≈ logpdf(Cauchy(0, 5), 1.2)
+    @test k1_sd(:x, :sd => :(Exponential(2))) ≈ logpdf(Exponential(2), 1.2)
 end
 
 @testset "varying correlated names" begin
@@ -645,7 +599,7 @@ end
             d ~ varying_draws(g, [1, x]; eta = 1.0)
             r1 ~ varying_slice(d, 1)
             r2 ~ varying_slice(d, 2)
-            e ~ varying_draws(g, [1]; eta = 1.0)
+            e ~ varying_draws(g, [1])
             r3 ~ varying_slice(e, 1)
             mu1 = a1 .+ r1
             mu2 = a2 .+ r2
@@ -658,15 +612,6 @@ end
     @test second.suffix == "g_e"
     @test ReactiveKernelsPPL._varying_corr_names(second) ===
         (:L_g_e, :tau_g_e, :z_flat_g_e)
-    # K=1 kinds own no correlated names.
-    k1plan = lower_rkppl(quote
-            a ~ Normal(0, 1)
-            r ~ varying_effect(g, [1])
-            mu = a .+ r
-            y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
-    @test_throws ContractValidationError ReactiveKernelsPPL._varying_corr_names(
-        only(k1plan.varying_draws))
     # Claims: user definitions cannot collide with correlated names.
     @test_throws SurfaceLoweringError lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -924,7 +869,7 @@ end
     _check_gradient(built.spec, bound, u)
 end
 
-@testset "varying K=1 correlated e2e values and gradient" begin
+@testset "varying K=1 1x1-LKJ e2e values and gradient" begin
     gv = [1, 2, 1, 2]
     xv = [0.5, -1.0, 1.5, 0.0]
     yv = [1.0, 2.0, 1.5, 2.5]
@@ -932,7 +877,7 @@ end
     plan = lower_rkppl(quote
             a ~ Normal(0, 5)
             sigma ~ Exponential(1)
-            r ~ varying_effect(g, [x]; eta = 1.0)
+            r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
         end, (:y, :x, :g))
@@ -1022,7 +967,7 @@ end
             y .~ Normal.(mu, sigma)
         end, (:y, :x, :z, :g))
     db = only(dplan.varying_draws)
-    @test db.kind === :slope1
+    @test db.kind === :correlated
     @test only(db.margins).z == VaryingZRecipe(:column, :w, nothing)
     @test any(d -> d.name === :w, dplan.derived)
     # Forward reference: draws before the definition lowers identically
@@ -1240,7 +1185,7 @@ end
     # Provided levels pass through; G counts unobserved declared levels.
     bound2 = bind_data(_tv_with_levels(mkplan(), [3, 1, 2, 4]), cols)
     @test only(bound2.varying_draws).levels == [3, 1, 2, 4]
-    @test assign_layout(bound2).total == 6 # a + log_scale + 4 xi cells
+    @test assign_layout(bound2).total == 6 # a + 0 thetas + tau + 4 z cells
     # Observed-but-undeclared values fail closed (they would encode 0).
     bad = _tv_with_levels(mkplan(), [1, 2])
     @test_throws ContractValidationError bind_data(bad, cols)
@@ -1300,10 +1245,10 @@ _tv_levels_vals(vals::Vector) =
     end
     # Eta combo; omitted levels stay `nothing` (bind derives).
     combo = lower_rkppl(quote
-            r ~ varying_effect(g, [1]; eta = 2.0, levels = [:c, :a])
+            r ~ varying_effect(g, [1, x]; eta = 2.0, levels = [:c, :a])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :g))
+        end, (:y, :x, :g))
     b = only(combo.varying_draws)
     @test b.levels == [:c, :a] && b.lkj_eta == 2.0
     bare = lower_rkppl(quote
@@ -1356,19 +1301,6 @@ end
         occursin("`:a`", sprint(showerror, err))
 end
 
-# Declared-order K=1 intercept reference: SB `exp(log_scale) * xi[idx]`
-# with `idx` in DECLARED position order (never sorted) and `xi` sized
-# by the declared count (unobserved levels are prior-only).
-function _tv_ref_declared_intercept(bound, nt, levels)
-    idx = [findfirst(==(v), levels) for v in bound.columns[:g]]
-    r = exp(nt.log_scale_g) .* nt.xi_g[idx]
-    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), bound.columns[:y]))
-    pr = logpdf(Normal(0, 5), nt.mu[1]) + logpdf(Exponential(1), nt.sigma) +
-        logpdf(Normal(0, 1), nt.log_scale_g) +
-        sum(logpdf.(Normal(0, 1), nt.xi_g))
-    return (; ll, pr)
-end
-
 @testset "varying declared-order intercept e2e values and gradient" begin
     _, _, y = _tv_k1_cols()
     g = ["a", "c", "b", "a", "c", "b", "a", "c"]
@@ -1383,14 +1315,17 @@ end
     bound = bind_data(_tv_with_levels(plan, levels),
         Dict{Symbol,AbstractVector}(:g => g, :y => y))
     built = build_kernel(bound)
-    # a + sigma + log_scale + 4 xi cells (d is prior-only).
+    # a + sigma + 0 thetas + tau + 4 z cells (d is prior-only).
     @test built.layout.total == 7
     u = [0.2, 0.1, -0.3, 0.4, 0.0, -0.1, 0.25]
     nt = constrain(built.layout, u)
-    ref = _tv_ref_declared_intercept(bound, nt, levels)
+    # Declared position order (never sorted); `z` sized by the declared
+    # count (unobserved levels are prior-only).
+    ref = _tv_ref_k1(bound, nt, 1.0, levels)
     @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
     @test _query(built.spec, bound, :prior, u) ≈ ref.pr
-    @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + u[2]
+    @test _query(built.spec, bound, :posterior, u) ≈
+        ref.ll + ref.pr + u[2] + u[3]
     _check_gradient(built.spec, bound, u)
 end
 
@@ -1444,14 +1379,17 @@ end
     bound = bind_data(plan, Dict{Symbol,AbstractVector}(:g => g, :y => y))
     @test only(bound.varying_draws).levels == levels
     built = build_kernel(bound)
-    # a + sigma + log_scale + 4 xi cells (d is prior-only).
+    # a + sigma + 0 thetas + tau + 4 z cells (d is prior-only).
     @test built.layout.total == 7
     u = [0.2, 0.1, -0.3, 0.4, 0.0, -0.1, 0.25]
     nt = constrain(built.layout, u)
-    ref = _tv_ref_declared_intercept(bound, nt, levels)
+    # Declared position order (never sorted); `z` sized by the declared
+    # count (unobserved levels are prior-only).
+    ref = _tv_ref_k1(bound, nt, 1.0, levels)
     @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
     @test _query(built.spec, bound, :prior, u) ≈ ref.pr
-    @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + u[2]
+    @test _query(built.spec, bound, :posterior, u) ≈
+        ref.ll + ref.pr + u[2] + u[3]
     _check_gradient(built.spec, bound, u)
 end
 
@@ -1513,9 +1451,8 @@ end
     # Mixed per-margin priors pass on `:correlated`.
     @test validate_structure(mksd([VaryingSdPrior(:exponential, 1 / 3),
         VaryingSdPrior(:normal, 2.0)])) === nothing
-    # K=1 kinds fail closed on explicit sd priors (SB has no K=1
-    # override path — the message names the vacuous-eta route).
-    for (m, want) in ((1, :intercept1), (:x, :slope1))
+    # K=1 draws take explicit sd priors like any other K (one geometry).
+    for m in (1, :x)
         k1 = lower_rkppl(quote
                 a ~ Normal(0, 1)
                 r ~ varying_effect(g, [$m])
@@ -1523,18 +1460,10 @@ end
                 y .~ Normal.(mu, 1.5)
             end, (:y, :x, :g))
         d = only(k1.varying_draws)
-        @test d.kind === want
         k1.varying_draws[1] = VaryingDraws(d.group, d.kind,
             d.margins, d.lkj_eta, d.label, d.suffix, d.levels,
             [VaryingSdPrior(:exponential, 1.0)])
-        err = try
-            validate_structure(k1)
-            nothing
-        catch e
-            e
-        end
-        @test err isa ContractValidationError
-        @test occursin("vacuous-1x1-LKJ", sprint(showerror, err))
+        @test validate_structure(k1) === nothing
     end
 end
 
@@ -1674,7 +1603,7 @@ end
     _check_gradient(built.spec, bound, u)
 end
 
-@testset "varying K=1 correlated sd prior e2e values and gradient" begin
+@testset "varying K=1 sd prior e2e values and gradient" begin
     gv = [1, 2, 1, 2]
     xv = [0.5, -1.0, 1.5, 0.0]
     yv = [1.0, 2.0, 1.5, 2.5]
@@ -1682,11 +1611,11 @@ end
     plan = lower_rkppl(quote
             a ~ Normal(0, 5)
             sigma ~ Exponential(1)
-            r ~ varying_effect(g, [x]; eta = 1.0)
+            r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
         end, (:y, :x, :g))
-    # The vacuous-1x1-LKJ route takes sd priors like any `:correlated`.
+    # K=1 takes sd priors like any other K.
     bound = bind_data(
         _tv_with_sd(plan, [VaryingSdPrior(:exponential, 1.0)]), cols)
     built = build_kernel(bound)
@@ -1709,7 +1638,7 @@ end
 @testset "varying sd= keyword admission" begin
     k1 = lower_rkppl(quote
             mu ~ Normal(0, 5)
-            r ~ varying_effect(g, [1]; eta = 1.0, sd = Cauchy(0, 5))
+            r ~ varying_effect(g, [1]; sd = Cauchy(0, 5))
             eta = mu .+ r
             y .~ Normal.(eta, sigma)
         end, (:y, :sigma, :g))
@@ -1729,12 +1658,21 @@ end
     ke = lower_rkppl(quote
             a ~ Normal(0, 5)
             sigma ~ Exponential(1)
-            r ~ varying_effect(g, [x]; eta = 1.0, sd = Exponential(0.5))
+            r ~ varying_effect(g, [x]; sd = Exponential(0.5))
             mu = a .+ r
             y .~ Normal.(mu, sigma)
         end, (:y, :x, :g))
     de = only(ke.varying_draws)
     @test de.sd_priors == [VaryingSdPrior(:exponential, 0.5)]
+    # The default spelled out is the empty all-default vector.
+    kd = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            r ~ varying_effect(g, [1, x]; sd = Normal(0, 1.0))
+            mu = a .+ r
+            y .~ Normal.(mu, sigma)
+        end, (:y, :x, :g))
+    @test only(kd.varying_draws).sd_priors == VaryingSdPrior[]
 end
 
 @testset "varying sd= fail-closed battery" begin
@@ -1770,22 +1708,6 @@ end
         @test err isa SurfaceLoweringError
         @test occursin(msg, sprint(showerror, err))
     end
-    # `sd=` without `eta` on K=1: the draws stay non-correlated, so the
-    # contract names the vacuous-eta route.
-    cerr = try
-        lower_rkppl(quote
-                mu ~ Normal(0, 5)
-                r ~ varying_effect(g, [1]; sd = Cauchy(0, 5))
-                eta = mu .+ r
-                y .~ Normal.(eta, sigma)
-            end, (:y, :sigma, :g))
-        nothing
-    catch e
-        e
-    end
-    @test cerr isa ContractValidationError
-    @test occursin("pass `eta` for the vacuous-1x1-LKJ route",
-        sprint(showerror, cerr))
 end
 
 # Classic eight-schools data (embedded — the posteriordb subset).
@@ -1793,7 +1715,7 @@ const _TVSD_Y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
 const _TVSD_SG = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
 const _TVSD_NC = quote
     mu ~ Normal(0, 5)
-    r ~ varying_effect(g, [1]; eta = 1.0, sd = Cauchy(0, 5))
+    r ~ varying_effect(g, [1]; sd = Cauchy(0, 5))
     eta = mu .+ r
     y .~ Normal.(eta, sigma)
 end

@@ -896,8 +896,7 @@ end
 # One varying margin's Z as an rvalue: bare columns stay bare (raw
 # ports and derived locals alike); dummies compare against the
 # bind-known level value. `:ones` never reaches emission (an intercept
-# needs no Z multiply, and slope1 margins are never `:ones` by kind
-# dispatch).
+# needs no Z multiply).
 function _varying_z_expr(z::VaryingZRecipe)
     z.kind === :column && return z.column
     z.kind === :dummy &&
@@ -906,26 +905,16 @@ function _varying_z_expr(z::VaryingZRecipe)
         "[generator] internal: ones-Z reached effect emission"))
 end
 
-# One varying draws block's direct `r` summand, SB-literal (SB's K=1
-# intercept/slope math and association order — no `b` node, the draws
-# stay implicit): intercept `exp(log_scale) * xi[idx]`, slope
-# `tau * (xi[idx] .* Z)`. Correlated draws take the K² implicit-draws
-# arm below (this slice's columns only); mm draws take the
-# weighted-gather arm (same geometries, per-slot gathers).
+# One varying draws block's direct `r` summand (no `b` node, the draws
+# stay implicit): the K² implicit-draws arm (this slice's columns
+# only, every K); mm draws take the weighted-gather arm (same geometry,
+# per-slot gathers); centered draws read their sampled `b_flat`.
 function _varying_effect_expr(plan::StructuralPlan, pred::PredictorSpec,
         t::TermSpec)
     d, s = _slice_draws(plan, pred, t)
     d.mm !== nothing && return _varying_mm_effect_expr(plan, d, s)
     d.kind === :centered_correlated && return _varying_centered_effect_expr(d,s)
-    d.kind === :correlated &&
-        return _varying_corr_effect_expr(plan, d, s)
-    scale, xi = _varying_k1_names(d)
-    gathered = Expr(:ref, xi, Symbol(:_ppl_gidx_, d.group))
-    if d.kind === :intercept1
-        return Expr(:call, :*, Expr(:call, :exp, scale), gathered)
-    end
-    Z = _varying_z_expr(only(d.margins).z)
-    return Expr(:call, :*, scale, Expr(:call, :.*, gathered, Z))
+    return _varying_corr_effect_expr(plan, d, s)
 end
 
 function _varying_centered_effect_expr(d::VaryingDraws,s::VaryingSlice)
@@ -945,25 +934,18 @@ end
 # One mm draws block's direct `r` summand (SB `multi_membership_*`
 # math, in-graph): per slot `m`, the plain-geometry margin expr at
 # that slot's encoder, weighted by that slot's factor, summed in slot
-# order (SB's per-observation `rv[i] += w*b` association). K=1
-# intercept slots reuse the intercept association verbatim;
-# correlated slots reuse the margin expr below with the shared
-# tau/L/z (there is no mm `:slope1` — validation proves correlated).
+# order (SB's per-observation `rv[i] += w*b` association). Every slot
+# reuses the margin expr below with the shared tau/L/z.
 function _varying_mm_effect_expr(plan::StructuralPlan, d::VaryingDraws,
         s::VaryingSlice)
     mm = d.mm::VaryingMultiMembership
     M = length(mm.groups)
+    L, tau, _ = _varying_corr_names(d)
     parts = Any[]
     for m in 1:M
         gidx = _mm_gidx_name(d, m)
         w = _mm_weight_expr(d, m)
-        inner = if d.kind === :intercept1
-            scale, xi = _varying_k1_names(d)
-            Expr(:call, :*, Expr(:call, :exp, scale), Expr(:ref, xi, gidx))
-        else
-            L, tau, _ = _varying_corr_names(d)
-            _corr_margin_expr(d, s, tau, L, gidx)
-        end
+        inner = _corr_margin_expr(d, s, tau, L, gidx)
         push!(parts, :($w .* $inner))
     end
     return foldl((a, c) -> :($a .+ $c), parts)
@@ -3392,48 +3374,37 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         _vector_prior_stmts!(stmts, terms, v.name, v.family, v.args,
             v.support_override)
     end
-    # Varying draws. K=1: the scalar scale prior plus the
-    # standardized `xi` plate (shared vector-prior helper). Correlated:
-    # the LKJ node plus the `tau` prior plus the `z_flat` plate (shared
-    # vector-prior helper). `tau` emits WITHOUT the thin layer's
-    # `+log(2)` half renormalizer in both: SB's `std_normal(; lower=0)`
+    # Varying draws: the LKJ node plus the `tau` prior plus the
+    # `z_flat` plate (shared vector-prior helper), at every K (the 1x1
+    # LKJ node is the `0.0` literal). `tau` emits WITHOUT the thin
+    # layer's `+log(2)` half renormalizer: SB's `std_normal(; lower=0)`
     # is Stan lower-bound kernel semantics (exp Jacobian only, no
     # truncation normalizer). User-facing `HalfNormal` priors keep the
     # proper-half convention; draws-internal `tau` follows SB — under
     # every configured sd prior too (SB's generic path keeps the
     # positive bound with no truncation normalizer).
     for d in plan.varying_draws
-        if _is_correlated_kind(d.kind)
-            if d.strata !== nothing
-                _stratified_prior_stmts!(stmts, terms, d, layout)
-                continue
-            end
-            L, tau, z = _varying_corr_names(d)
-            lnode = Symbol(:_ppl_prior_, L)
-            push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(d))))
-            push!(terms, lnode)
-            _sd_prior_tau_stmts!(stmts, terms, d, tau)
-            if d.kind === :centered_correlated
-                K = length(d.margins)
-                lower = Symbol(:_ppl_centered_L_,d.suffix)
-                vals = Any[_rl_name(L,i,j) for i in 1:K for j in 1:i]
-                push!(stmts,:($lower = Float64[$(vals...)]))
-                node = Symbol(:_ppl_prior_,z)
-                push!(stmts,:($node::Float64 = _centered_correlated_logpdf($z,$tau,$lower)))
-                push!(terms,node)
-            else
-                _vector_prior_stmts!(stmts, terms, z, :normal,
-                    (arg1 = 0, arg2 = 1), nothing)
-            end
+        if d.strata !== nothing
+            _stratified_prior_stmts!(stmts, terms, d, layout)
             continue
         end
-        scale, xi = _varying_k1_names(d)
-        snode = Symbol(:_ppl_prior_, scale)
-        scell = _family_logpdf_expr(:normal, Any[0, 1], scale)
-        push!(stmts, :($snode::Float64 = $scell))
-        push!(terms, snode)
-        _vector_prior_stmts!(stmts, terms, xi, :normal, (arg1 = 0, arg2 = 1),
-            nothing)
+        L, tau, z = _varying_corr_names(d)
+        lnode = Symbol(:_ppl_prior_, L)
+        push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(d))))
+        push!(terms, lnode)
+        _sd_prior_tau_stmts!(stmts, terms, d, tau)
+        if d.kind === :centered_correlated
+            K = length(d.margins)
+            lower = Symbol(:_ppl_centered_L_,d.suffix)
+            vals = Any[_rl_name(L,i,j) for i in 1:K for j in 1:i]
+            push!(stmts,:($lower = Float64[$(vals...)]))
+            node = Symbol(:_ppl_prior_,z)
+            push!(stmts,:($node::Float64 = _centered_correlated_logpdf($z,$tau,$lower)))
+            push!(terms,node)
+        else
+            _vector_prior_stmts!(stmts, terms, z, :normal,
+                (arg1 = 0, arg2 = 1), nothing)
+        end
     end
     # HSGP bases (SB `_sb_hsgp`/`_sb_hsgp_aniso`): the length scales and
     # marginal scale as scalar `lognormal(0, 1)` nodes plus the

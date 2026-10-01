@@ -747,34 +747,24 @@ end
 
 One shared varying-effect draws block over
 `K = length(margins)` margins in `G` groups of raw column `group`.
-`kind` is `:intercept1` (single-`1` without eta: log-scale/xi
-geometry), `:slope1` (single slope without eta: tau/xi geometry), or
-`:correlated` (non-centered LKJ + tau + z_flat), or
-`:centered_correlated` (LKJ + tau + directly sampled b_flat, native only).
-The correlated kinds admit K >= 2, or K = 1 with eta given
-(the vacuous-1x1-LKJ route). The K=1 sd geometries are deliberately
-asymmetric, mirroring StanBlocks-BRMI (SB) equation-for-equation: an
-intercept margin samples its sd in log space (`log_scale ~ Normal(0,
-1)`, effect `exp(log_scale) * xi` — a LogNormal(0, 1) sd), while a
-slope margin samples a half-normal sd (`tau ~ Normal(0, 1)` on
-`tau > 0` plus the `exp`-layout Jacobian). SB itself is asymmetric
-the same way (`ranef_intercept` / `ranef_intercept_draws` are
-log-scale, `ranef_slope` / `ranef_correlated_draws` are half-normal
-Stan lower-bound kernels): the intercept side mirrors VBRMI's
-`chol` 1x1 collapse (`log_scale ~ N(0,1)`, `L[1,1] =
-exp(log_scale)`), pinned by SB's `sb.3` smoke tests — there is no
-half-normal plain-`(1 | g)` spelling in SB. So a K=1 intercept
-without eta is lognormal here too; passing `eta` routes through
-vacuous-`:correlated` and recovers the half-normal sd (LKJ
-contributes nothing at 1x1). `label` is the link identity
+`kind` is `:correlated` (non-centered LKJ + tau + z_flat) or
+`:centered_correlated` (LKJ + tau + directly sampled b_flat, native
+only). There is one geometry for every K and every margin: a single
+margin, intercept or slope, is the 1x1 case, whose LKJ factor is the
+fixed `[1]` (zero coordinates, a `0.0` prior node), so its sd is the
+same half-normal `tau` (`tau ~ Normal(0, 1)` on `tau > 0` plus the
+`exp`-layout Jacobian) as every margin of a larger block. K = 1 draws
+carry `lkj_eta == 1.0`: no other eta parameterizes anything there.
+(StanBlocks-BRMI samples a K=1 intercept's sd in log space — a
+LogNormal(0, 1) sd. That asymmetry depended on whether `eta` was
+written, so it is not mirrored.) `label` is the link identity
 (`:draws_<suffix>`); `suffix` is the in-graph naming stem (the group,
 or `group_binding` when two draws share a grouping). `levels` is the
 grouping's DECLARED levels in numbering order (`nothing` pre-bind, or
 when the emitter has no declaration — [`bind_data`](@ref) fills
 sort-ordered observed levels). `sd_priors` is the per-margin `tau`
 prior ([`VaryingSdPrior`](@ref); empty — the default — is all
-`:std_normal`); a non-default entry needs `:correlated` draws (K = 1
-takes the vacuous route by passing `eta`). `mm` is
+`:std_normal`), at any K. `mm` is
 [`VaryingMultiMembership`](@ref) metadata (`nothing` = plain
 grouping; `group` is then the mm naming symbol, not a data column).
 `strata` is [`VaryingStrata`](@ref) metadata (`nothing` =
@@ -2380,9 +2370,6 @@ function validate_data(plan::StructuralPlan)
     return nothing
 end
 
-_is_ones_margin(m::VaryingMargin) =
-    m.z.kind === :ones && m.coefficient === :Intercept
-
 function _validate_margin(m::VaryingMargin, label::Symbol)
     z = m.z
     z.kind in (:ones, :column, :dummy) ||
@@ -2410,36 +2397,19 @@ function _validate_margin(m::VaryingMargin, label::Symbol)
     return nothing
 end
 
-# K=1 sampled names, derived purely from the draws suffix + kind: the
-# scalar scale (`log_scale_<s>` / `tau_<s>`) and the G-vector
-# (`xi_<s>`). Single source for surface claims, name tables, layout,
-# and the generator.
-# Correlated sampled names, derived purely from the draws suffix: the
-# LKJ Cholesky factor (`L_<s>`, KxK), the marginal-scale vector
+# Sampled names, derived purely from the draws suffix: the LKJ
+# Cholesky factor (`L_<s>`, KxK), the marginal-scale vector
 # (`tau_<s>`, K), and the standardized draws (`z_flat_<s>`, K*G
-# column-major). Single source for surface claims, name tables,
-# layout, and the generator. K=1 correlated draws own the same three
-# names (`L` packs zero coords).
+# column-major; `b_flat_<s>` when centered). Single source for surface
+# claims, name tables, layout, and the generator. K=1 draws own the
+# same three names (`L` packs zero coords).
 function _varying_corr_names(d::VaryingDraws)
-    _is_correlated_kind(d.kind) ||
-        _fail(d.label, "draws kind $(d.kind) owns no correlated " *
-              "sampled names (K=1 geometry has its own names)")
     s = d.suffix
     return (Symbol("L_", s), Symbol("tau_", s),
         Symbol(d.kind === :centered_correlated ? "b_flat_" : "z_flat_", s))
 end
 
 _is_correlated_kind(kind) = kind in (:correlated,:centered_correlated)
-
-function _varying_k1_names(d::VaryingDraws)
-    (d.kind === :intercept1 || d.kind === :slope1) ||
-        _fail(d.label, "draws kind $(d.kind) owns no K=1 sampled names " *
-              "(correlated draws own L/tau/z names instead)")
-    s = d.suffix
-    scale = d.kind === :intercept1 ? Symbol("log_scale_", s) :
-        Symbol("tau_", s)
-    return (scale, Symbol("xi_", s))
-end
 
 # Stratified sampled names, derived from the draws suffix + stratum
 # position: per-stratum LKJ factor (`L_<s>_s<k>`, KxK) and
@@ -2580,9 +2550,10 @@ end
 
 function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
         slices::Vector{VaryingSlice})
-    d.kind in (:intercept1, :slope1, :correlated, :centered_correlated) ||
-        _fail(d.label, "draws kind must be :intercept1, :slope1, or " *
-              ":correlated or :centered_correlated, got $(repr(d.kind))")
+    _is_correlated_kind(d.kind) ||
+        _fail(d.label, "draws kind must be :correlated or " *
+              ":centered_correlated (one geometry for every K — a single " *
+              "margin is the 1x1 case), got $(repr(d.kind))")
     K = length(d.margins)
     K >= 1 || _fail(d.label, "draws block has zero margins")
     for m in d.margins
@@ -2593,45 +2564,23 @@ function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
         s.target in prednames ||
             _fail(d.label, "draws slice for unknown predictor $(s.target)")
     end
-    # Kind dispatch: K=1 without eta is :intercept1 (single-`1`) or
-    # :slope1 (single slope); K=1 with eta takes the vacuous-1x1-LKJ
-    # correlated route; K>=2 is always :correlated.
-    want = if d.kind === :centered_correlated
-        :centered_correlated
-    elseif K == 1 && isnan(d.lkj_eta) && _is_ones_margin(first(d.margins))
-        :intercept1
-    elseif K == 1 && isnan(d.lkj_eta)
-        :slope1
-    else
-        :correlated
-    end
-    d.kind === want ||
-        _fail(d.label, "draws kind $(d.kind) mismatches its margins " *
-              "(want $want)")
-    if _is_correlated_kind(want)
-        isfinite(d.lkj_eta) && d.lkj_eta > 0 ||
-            _fail(d.label, "correlated draws need a positive LKJ eta, " *
-                  "got $(d.lkj_eta)")
-    else
-        isnan(d.lkj_eta) ||
-            _fail(d.label, "K=1 draws take no LKJ eta (no correlation " *
-                  "to parameterize), got $(d.lkj_eta)")
-    end
+    isfinite(d.lkj_eta) && d.lkj_eta > 0 ||
+        _fail(d.label, "draws need a positive LKJ eta, got $(d.lkj_eta)")
+    K == 1 && d.lkj_eta != 1.0 &&
+        _fail(d.label, "K=1 draws carry LKJ eta 1.0 (the 1x1 factor is " *
+              "the fixed `[1]`, so no other eta parameterizes anything), " *
+              "got $(d.lkj_eta)")
     _validate_sd_priors(d, K)
     _validate_draws_grouping(d, K)
     _validate_varying_levels_shape(d)
     return nothing
 end
 
-# Multi-membership / stratified grouping shape (SB-mirror geometry
-# selection, provable without data). mm: intercept-only draws are
-# `:intercept1` (SB uses `ranef_intercept_draws` unconditionally —
-# no eta); every other shape is `:correlated` with eta exactly 1.0
-# (SB hardcodes `lkj_corr_cholesky(1.)` on the mm path, the K=1 slope
-# included — there is no mm `:slope1`). Stratified draws are always
-# `:correlated` (SB `ranef_correlated_by` has no K=1 special-case),
-# eta exactly 1.0. Neither path has an SB generic-prior sibling, so
-# both reject non-empty `sd_priors`; SB has no mm × stratified shape.
+# Multi-membership / stratified grouping shape (provable without
+# data). Both are `:correlated` with eta exactly 1.0 (SB hardcodes
+# `lkj_corr_cholesky(1.)` on both paths). Neither path has an SB
+# generic-prior sibling, so both reject non-default `sd_priors`; SB
+# has no mm × stratified shape.
 function _validate_draws_grouping(d::VaryingDraws, K::Int)
     mm = d.mm
     st = d.strata
@@ -2655,31 +2604,14 @@ function _validate_draws_grouping(d::VaryingDraws, K::Int)
                 _fail(d.label, "multi-membership draws list $W weight " *
                       "columns for $M groups (one per group, or omit all)")
         end
-        if K == 1 && _is_ones_margin(first(d.margins))
-            d.kind === :intercept1 ||
-                _fail(d.label, "multi-membership intercept-only draws " *
-                      "take no eta (SB uses the `:intercept1` geometry " *
-                      "unconditionally — pass no eta)")
-        elseif d.kind === :correlated
-            d.lkj_eta == 1.0 ||
-                _fail(d.label, "multi-membership correlated draws need " *
-                      "eta 1.0 (SB hardcodes `lkj_corr_cholesky(1.)`), " *
-                      "got $(d.lkj_eta)")
-        else
-            _fail(d.label, "multi-membership draws over non-intercept " *
-                  "margins take the correlated route (SB uses " *
-                  "`ranef_correlated_draws` for every non-intercept mm " *
-                  "block, K=1 included) — got kind :$(d.kind)")
-        end
+        d.lkj_eta == 1.0 ||
+            _fail(d.label, "multi-membership draws need eta 1.0 (SB " *
+                  "hardcodes `lkj_corr_cholesky(1.)`), got $(d.lkj_eta)")
         isempty(d.sd_priors) ||
             _fail(d.label, "multi-membership draws take no sd priors " *
                   "(SB has no generic-prior mm sibling)")
     end
     if st !== nothing
-        d.kind === :correlated ||
-            _fail(d.label, "stratified draws are always :correlated (SB " *
-                  "`ranef_correlated_by` has no K=1 special-case), got " *
-                  ":$(d.kind)")
         d.lkj_eta == 1.0 ||
             _fail(d.label, "stratified draws need eta 1.0 (SB hardcodes " *
                   "`lkj_corr_cholesky(1.)`), got $(d.lkj_eta)")
@@ -2696,11 +2628,8 @@ end
 # Per-margin `tau` priors: empty (the default) is all-`:std_normal`,
 # otherwise one entry per margin in margin order. `:exponential` takes
 # a finite positive SCALE, `:normal` a finite positive sd;
-# `:std_normal` ignores its param (finite, conventionally 1.0). A
-# non-default entry needs `:correlated` draws — SB's sd overrides are
-# a correlated-draws feature (no K=1 intercept/slope override path
-# exists to mirror), so K = 1 without eta fails closed naming the
-# vacuous route.
+# `:std_normal` ignores its param (finite, conventionally 1.0). Every
+# K takes them (one geometry for every K).
 function _validate_sd_priors(d::VaryingDraws, K::Int)
     sds = d.sd_priors
     (isempty(sds) || length(sds) == K) ||
@@ -2713,16 +2642,9 @@ function _validate_sd_priors(d::VaryingDraws, K::Int)
         isfinite(p.param) ||
             _fail(d.label, "margin $j sd prior param is not finite " *
                   "(got $(p.param))")
-        if p.family !== :std_normal
-            p.param > 0 ||
-                _fail(d.label, "margin $j sd prior needs a positive " *
-                      "param, got $(p.param)")
-            _is_correlated_kind(d.kind) ||
-                _fail(d.label, "margin $j carries an explicit sd prior " *
-                      "but these draws are :$(d.kind) (sd priors are a " *
-                      ":correlated-draws feature — pass `eta` for the " *
-                      "vacuous-1x1-LKJ route)")
-        end
+        p.family === :std_normal || p.param > 0 ||
+            _fail(d.label, "margin $j sd prior needs a positive " *
+                  "param, got $(p.param)")
     end
     return nothing
 end
@@ -4949,11 +4871,7 @@ function _validate_name_tables(plan::StructuralPlan)
     darstates = [s.state for s in plan.dar_paths]
     vectors = [p.name for p in plan.vector_parameters]
     svec = [v.name for v in plan.spline_vectors]
-    vk1 = Symbol[nm for d in plan.varying_draws
-        if d.kind === :intercept1 || d.kind === :slope1
-        for nm in _varying_k1_names(d)]
     vcorr = Symbol[nm for d in plan.varying_draws
-        if _is_correlated_kind(d.kind)
         for nm in _varying_corr_table_names(d)]
     hsgp = Symbol[nm for hb in plan.hsgp_bases for nm in _hsgp_all_names(hb)]
     kern = Symbol[nm for kp in plan.kernel_plates for nm in _kernel_all_names(kp)]
@@ -4975,8 +4893,6 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate vector-parameter names")
     length(unique(svec)) == length(svec) ||
         _fail(:plan, "duplicate spline-vector names")
-    length(unique(vk1)) == length(vk1) ||
-        _fail(:plan, "duplicate K=1 varying names")
     length(unique(vcorr)) == length(vcorr) ||
         _fail(:plan, "duplicate correlated varying names")
     length(unique(hsgp)) == length(hsgp) ||
@@ -5008,13 +4924,6 @@ function _validate_name_tables(plan::StructuralPlan)
         (svec, plates, "spline vectors and plate parameters"),
         (svec, scanstates, "spline vectors and scan states"),
         (vectors, svec, "vector parameters and spline vectors"),
-        (vk1, params, "K=1 varying names and parameters"),
-        (vk1, assigns, "K=1 varying names and assignments"),
-        (vk1, deriveds, "K=1 varying names and derived columns"),
-        (vk1, plates, "K=1 varying names and plate parameters"),
-        (vk1, scanstates, "K=1 varying names and scan states"),
-        (vk1, vectors, "K=1 varying names and vector parameters"),
-        (vk1, svec, "K=1 varying names and spline vectors"),
         (vcorr, params, "correlated varying names and parameters"),
         (vcorr, assigns, "correlated varying names and assignments"),
         (vcorr, deriveds, "correlated varying names and derived columns"),
@@ -5022,7 +4931,6 @@ function _validate_name_tables(plan::StructuralPlan)
         (vcorr, scanstates, "correlated varying names and scan states"),
         (vcorr, vectors, "correlated varying names and vector parameters"),
         (vcorr, svec, "correlated varying names and spline vectors"),
-        (vcorr, vk1, "correlated varying names and K=1 varying names"),
         (hsgp, params, "hsgp names and parameters"),
         (hsgp, assigns, "hsgp names and assignments"),
         (hsgp, deriveds, "hsgp names and derived columns"),
@@ -5030,7 +4938,6 @@ function _validate_name_tables(plan::StructuralPlan)
         (hsgp, scanstates, "hsgp names and scan states"),
         (hsgp, vectors, "hsgp names and vector parameters"),
         (hsgp, svec, "hsgp names and spline vectors"),
-        (hsgp, vk1, "hsgp names and K=1 varying names"),
         (hsgp, vcorr, "hsgp names and correlated varying names"),
         (kern, params, "kernel-plate names and parameters"),
         (kern, assigns, "kernel-plate names and assignments"),
@@ -5039,7 +4946,6 @@ function _validate_name_tables(plan::StructuralPlan)
         (kern, scanstates, "kernel-plate names and scan states"),
         (kern, vectors, "kernel-plate names and vector parameters"),
         (kern, svec, "kernel-plate names and spline vectors"),
-        (kern, vk1, "kernel-plate names and K=1 varying names"),
         (kern, vcorr, "kernel-plate names and correlated varying names"),
         (kern, hsgp, "kernel-plate names and hsgp names"),
         (mats, params, "design-matrix names and parameters"),
@@ -5049,7 +4955,6 @@ function _validate_name_tables(plan::StructuralPlan)
         (mats, scanstates, "design-matrix names and scan states"),
         (mats, vectors, "design-matrix names and vector parameters"),
         (mats, svec, "design-matrix names and spline vectors"),
-        (mats, vk1, "design-matrix names and K=1 varying names"),
         (mats, vcorr, "design-matrix names and correlated varying names"),
         (mats, hsgp, "design-matrix names and hsgp names"),
         (mats, kern, "design-matrix names and kernel-plate names"),
@@ -5060,7 +4965,6 @@ function _validate_name_tables(plan::StructuralPlan)
         (darstates, scanstates, "dar states and scan states"),
         (darstates, vectors, "dar states and vector parameters"),
         (darstates, svec, "dar states and spline vectors"),
-        (darstates, vk1, "dar states and K=1 varying names"),
         (darstates, vcorr, "dar states and correlated varying names"),
         (darstates, hsgp, "dar states and hsgp names"),
         (darstates, kern, "dar states and kernel-plate names"),
@@ -5072,7 +4976,6 @@ function _validate_name_tables(plan::StructuralPlan)
         (elps, scanstates, "event-LP names and scan states"),
         (elps, vectors, "event-LP names and vector parameters"),
         (elps, svec, "event-LP names and spline vectors"),
-        (elps, vk1, "event-LP names and K=1 varying names"),
         (elps, vcorr, "event-LP names and correlated varying names"),
         (elps, hsgp, "event-LP names and hsgp names"),
         (elps, kern, "event-LP names and kernel-plate names"),
@@ -5083,7 +4986,7 @@ function _validate_name_tables(plan::StructuralPlan)
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
     allnames = union(params, assigns, deriveds, plates, scanstates, darstates,
-        vectors, svec, vk1, vcorr, hsgp, kern, mats)
+        vectors, svec, vcorr, hsgp, kern, mats)
     arrays = _array_names(plan)
     length(unique(arrays)) == length(arrays) ||
         _fail(:plan, "duplicate array-parameter names")
@@ -5102,7 +5005,7 @@ function _validate_name_tables(plan::StructuralPlan)
             "parameter/assignment/derived/plate/scan/dar/vector/spline/varying/kernel/matrix $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, darstates, vectors, svec, vk1, vcorr, hsgp, kern, mats))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, darstates, vectors, svec, vcorr, hsgp, kern, mats))
         _check_name_hygiene(n)
     end
     return nothing
