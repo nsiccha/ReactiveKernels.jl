@@ -392,6 +392,106 @@ end
         included_named_carry)(Reactant.to_rarray([1.0, 2.0]))
 end
 
+# Two scans of one length in one program, with the same step argument names and
+# different `Ref` operands and seeds. Reactant returns one tracer object for
+# equal host constants, so buffers promoted from `zeros(n)` were shared: both
+# results read the later scan's values.
+@kernel authored_scan_reactant_two_turnovers(a, b, conc::Vector{Float64},
+        dts::Vector{Float64}) = begin
+    akin = a.baseline * a.kout
+    bkin = b.baseline * b.kout
+    first_path::Vector{Float64} = scan(conc, dts, Ref(a), Ref(akin);
+            init = a.baseline, include_init = true) do previous, concentration, dt, parameters, input_rate
+        c2 = parameters.kout * (1 + concentration /
+            (parameters.theta1 * concentration + parameters.theta2))
+        steady = input_rate / c2
+        next = (previous - steady) * exp(-c2 * dt) + steady
+        (next, next)
+    end
+    second_path::Vector{Float64} = scan(conc, dts, Ref(b), Ref(bkin);
+            init = b.baseline, include_init = true) do previous, concentration, dt, parameters, input_rate
+        c2 = parameters.kout * (1 + concentration /
+            (parameters.theta1 * concentration + parameters.theta2))
+        steady = input_rate / c2
+        next = (previous - steady) * exp(-c2 * dt) + steady
+        (next, next)
+    end
+    result = (; first_path, second_path)
+    return result
+end
+
+@kernel authored_scan_reactant_two_plain(xs::Vector{Float64}, s::Float64, t::Float64) = begin
+    p = scan(xs, Ref(s); init = s) do c, x, k
+        next = k * c + x
+        (next, next)
+    end
+    q = scan(xs, Ref(t); init = t) do c, x, k
+        next = k * c + x
+        (next, next)
+    end
+    result = (; p, q)
+    return result
+end
+
+@kernel authored_scan_reactant_two_history(xs::Vector{Float64}, s::Float64, t::Float64) = begin
+    p = scan(xs, eachindex(xs), Ref(s); init = 0.0, history = 0.0) do c, x, j, k, earlier
+        (c, k * x + (j > 1 ? earlier[j - 1] : 0.0))
+    end
+    q = scan(xs, eachindex(xs), Ref(t); init = 0.0, history = 0.0) do c, x, j, k, earlier
+        (c, k * x + (j > 1 ? earlier[j - 1] : 0.0))
+    end
+    result = (; p, q)
+    return result
+end
+
+_scan_host(x::Reactant.AbstractConcreteArray) = Array(x)
+_scan_host(x::NamedTuple) = map(_scan_host, x)
+
+@testset "two equal-length scans in one program keep separate results" begin
+    a = (; baseline = 1000.0, kout = 0.3, theta1 = 1.2, theta2 = 40.0)
+    b = (; baseline = 500.0, kout = 0.2, theta1 = 0.8, theta2 = 30.0)
+    traced_a = Reactant.to_rarray(a; track_numbers = true)
+    traced_b = Reactant.to_rarray(b; track_numbers = true)
+    k = prepare(authored_scan_reactant_two_turnovers)
+    A = (; baseline = [1000.0, 1100.0, 900.0], kout = [0.3, 0.3, 0.25],
+           theta1 = [1.2, 1.2, 1.1], theta2 = [40.0, 40.0, 35.0])
+    B = (; baseline = [500.0, 425.0, 600.0], kout = [0.2, 0.2, 0.22],
+           theta1 = [0.8, 0.8, 0.9], theta2 = [30.0, 30.0, 28.0])
+    traced_A, traced_B = Reactant.to_rarray(A), Reactant.to_rarray(B)
+    batch = prepare_batched(authored_scan_reactant_two_turnovers;
+                            batched = (:a, :b), want = :result)
+    for n in (0, 3, 8)
+        conc, dts = abs.(sin.(1:n)) .* 50, fill(0.1, n)
+        traced = (Reactant.to_rarray(conc), Reactant.to_rarray(dts))
+        expected = k(a, b, conc, dts)
+        @test expected.first_path[1] != expected.second_path[1]
+        actual = _scan_host((Reactant.@compile k(traced_a, traced_b, traced...))(
+            traced_a, traced_b, traced...))
+        @test actual.first_path ≈ expected.first_path
+        @test actual.second_path ≈ expected.second_path
+        hlo = repr(Reactant.@code_hlo optimize = false k(traced_a, traced_b, traced...))
+        @test count("stablehlo.while", hlo) == (n == 0 ? 0 : 2)
+
+        batch_expected = batch(A, B, conc, dts)
+        batch_actual = _scan_host((Reactant.@compile batch(traced_A, traced_B, traced...))(
+            traced_A, traced_B, traced...))
+        @test batch_actual.first_path ≈ batch_expected.first_path
+        @test batch_actual.second_path ≈ batch_expected.second_path
+    end
+
+    xs, s, t = [0.5, -1.0, 0.25, 2.0], 0.5, 0.9
+    traced = (Reactant.to_rarray(xs), Reactant.to_rarray(s; track_numbers = true),
+              Reactant.to_rarray(t; track_numbers = true))
+    for spec in (authored_scan_reactant_two_plain, authored_scan_reactant_two_history)
+        kernel = prepare(spec)
+        expected = kernel(xs, s, t)
+        @test expected.p != expected.q
+        actual = _scan_host((Reactant.@compile kernel(traced...))(traced...))
+        @test actual.p ≈ expected.p
+        @test actual.q ≈ expected.q
+    end
+end
+
 @testset "a history scan keeps one retained loop and matches native" begin
     F = AuthoredScanFixtures
     units = [exp(-0.3 * (l - 1)) for l in 1:10]

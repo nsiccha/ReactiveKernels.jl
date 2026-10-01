@@ -7392,6 +7392,18 @@ function _validate_joint_response(r::LikelihoodSpec, plan::StructuralPlan,
     return nothing
 end
 
+# GLM-object fields belong to the GLM families only: on any other response
+# a stray glm_alpha/glm_beta means nothing and would silently change nothing
+# (the `_validate_unleveled_fields` rule) — reject it. Runs on every response.
+function _validate_glm_fields(r::LikelihoodSpec)
+    _is_glm_family(r.family) && return nothing
+    r.glm_alpha === nothing ||
+        _fail(r.label, "only GLM-object responses take glm_alpha")
+    r.glm_beta === nothing ||
+        _fail(r.label, "only GLM-object responses take glm_beta")
+    return nothing
+end
+
 function _validate_glm_response(r::LikelihoodSpec, plan::StructuralPlan)
     want_link = r.family === NormalIDGLMFam ? IdentityLink :
         r.family === BernoulliLogitGLMFam ? LogitLink : LogLink
@@ -7769,6 +7781,7 @@ function _validate_responses(plan::StructuralPlan)
     used_predictors = Set{Symbol}()
     for r in plan.responses
         _validate_mi_structure(r, plan)
+        _validate_glm_fields(r)
         # A mixture response validates whole (dedicated component slots;
         # the anchor is polymorphic, so this branch leads the scan-state
         # and plate-param checks below).
@@ -9764,17 +9777,10 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
             plan.predictors, plan.r2d2_priors)
-    bound = StructuralPlan(responses2, plan.predictors,
-        plan.population_priors, plan.parameters, plan.assignments,
-        columns, n; roles = merged, derived = plan.derived,
-        levelmaps = maps, plate_parameters = plan.plate_parameters,
-        scans = plan.scans, dar_paths = plan.dar_paths,
-        varying_draws = draws, varying_slices = plan.varying_slices,
+    bound = _with(plan; responses = responses2, columns = columns,
+        n_obs = n, roles = merged, levelmaps = maps, varying_draws = draws,
         vector_parameters = vectors2, spline_bases = bases,
-        spline_vectors = plan.spline_vectors, hsgp_bases = hbases,
-        kernel_plates = kbases, r2d2_priors = plan.r2d2_priors,
-        horseshoe_priors = plan.horseshoe_priors,
-        matrices = plan.matrices, event_lps = elbases)
+        hsgp_bases = hbases, kernel_plates = kbases, event_lps = elbases)
     validate_data(bound)
     return bound
 end
@@ -9833,7 +9839,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             p.size === nothing || p.size == want || _fail(p.label,
                 "thresholds size $(p.size) disagrees with n_levels $K " *
                 "(thresholds number K−1)")
-            push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
+            push!(out_v, _with(p; size = want))
         elseif haskey(coefs_link, p.name)
             lr = by_label[coefs_link[p.name]]
             K = lr.n_levels
@@ -9842,7 +9848,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             p.size === nothing || p.size == want || _fail(p.label,
                 "threshold_coefs size $(p.size) disagrees with n_levels $K " *
                 "× $(length(lr.threshold_columns)) columns (packs (K−1)×p = $want)")
-            push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
+            push!(out_v, _with(p; size = want))
         elseif haskey(simplex_link, p.name)
             K = by_label[simplex_link[p.name]].n_levels
             K === nothing && _fail(p.label, "internal: linked n_levels unresolved")
@@ -9851,7 +9857,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             length(p.args.arg1) == K || _fail(p.label,
                 "Dirichlet concentration length $(length(p.args.arg1)) " *
                 "disagrees with n_levels $K")
-            push!(out_v, VectorParameter(p.name, p.family, p.args, K, p.label))
+            push!(out_v, _with(p; size = K))
         elseif haskey(mixture_link, p.name)
             K = length(by_label[mixture_link[p.name]].mixture_locs)
             K >= 1 || _fail(p.label, "internal: linked mixture unresolved")
@@ -9861,7 +9867,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             length(p.args.arg1) == K || _fail(p.label,
                 "Dirichlet concentration length $(length(p.args.arg1)) " *
                 "disagrees with the $K mixture components")
-            push!(out_v, VectorParameter(p.name, p.family, p.args, K, p.label))
+            push!(out_v, _with(p; size = K))
         elseif haskey(monotonic_link, p.name)
             want = length(p.args.arg1)
             want >= 1 || _fail(p.label,
@@ -9870,7 +9876,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             p.size === nothing || p.size == want || _fail(p.label,
                 "monotonic increments size $(p.size) disagrees with its " *
                 "concentration length $want")
-            push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
+            push!(out_v, _with(p; size = want))
         elseif p.family in _JOINT_FACTOR_FAMILIES
             # Joint-factor sizes are structural (concrete at construction,
             # validated against the joint width) — bind passes them through.
@@ -9885,7 +9891,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             p.size === nothing || p.size == want || _fail(p.label,
                 "R2D2 phi size $(p.size) disagrees with its " *
                 "concentration length $want")
-            push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
+            push!(out_v, _with(p; size = want))
         elseif p.family === :vector_normal && p.size !== nothing
             # A grouped varying-source GP coefficient vector has a concrete
             # structural size; its cell linkage and square size were proved
@@ -9921,12 +9927,18 @@ function _with_levels(r::LikelihoodSpec, K::Int)
     r.n_levels === nothing || r.n_levels == K || _fail(r.label,
         "n_levels $(r.n_levels) disagrees with the bound data " *
         "(inferred K = $K)")
-    return LikelihoodSpec(r.family, r.link, r.response, r.predictor,
-        r.scale, r.weights, r.evidence, r.label, r.trials, r.range;
-        n_levels = K, thresholds = r.thresholds,
-        extra_predictors = r.extra_predictors, count_columns = r.count_columns,
-        ordinal_structure = r.ordinal_structure,
-        discrimination = r.discrimination,
-        threshold_columns = r.threshold_columns,
-        threshold_coefs = r.threshold_coefs)
+    return _with(r; n_levels = K)
+end
+
+# Field-preserving copy: rebuild `x` through its all-fields positional
+# constructor, replacing only the named fields. A hand-written field list
+# silently resets every field added after it was written; unknown override
+# names fail loudly.
+function _with(x::T; overrides...) where {T}
+    names = fieldnames(T)
+    for k in keys(overrides)
+        k in names || throw(ArgumentError("$T has no field $k"))
+    end
+    return T((haskey(overrides, f) ? overrides[f] : getfield(x, f)
+        for f in names)...)
 end
