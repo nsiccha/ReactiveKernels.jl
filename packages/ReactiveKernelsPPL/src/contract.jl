@@ -9809,6 +9809,11 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
             for a in ex.args[2].args
                 _classify_reads!(whole, per_obs, a, raw, inside)
             end
+        elseif ex.head === :ref && length(ex.args) == 2
+            # A gather `v[c]` takes the gathered value whole; its index
+            # keeps the surrounding context.
+            _classify_reads!(whole, per_obs, ex.args[1], raw, true)
+            _classify_reads!(whole, per_obs, ex.args[2], raw, inside)
         else
             for a in ex.args
                 _classify_reads!(whole, per_obs, a, raw, inside)

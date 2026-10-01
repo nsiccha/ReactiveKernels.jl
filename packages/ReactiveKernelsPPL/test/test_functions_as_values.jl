@@ -420,6 +420,23 @@ end
             cols[:y][i]) for i in 1:6)
         @test _fv_value(built, bound, :likelihood, u) ≈ ll
     end
+    # A gather takes the gathered column whole, too: the per-group
+    # covariate needs no call.
+    gplan = lower_rkppl(quote
+            sigma ~ Exponential(1.0)
+            b ~ Normal(0, 1)
+            y .~ Normal.(b .* gx[g], sigma)
+        end, (:y, :g, :gx); mod = _FV)
+    gbound = bind_data(gplan, cols)
+    @test gbound.n_obs == 6
+    gbuilt = build_kernel(gbound)
+    for u in ([0.3, -0.2], [-1.1, 0.7])
+        th = ReactiveKernelsPPL.constrain(gbuilt.layout, u)
+        b = only(th.y_eta)
+        ll = sum(logpdf(Normal(b * cols[:gx][cols[:g][i]], th.sigma),
+            cols[:y][i]) for i in 1:6)
+        @test _fv_value(gbuilt, gbound, :likelihood, u) ≈ ll
+    end
     # Any per-observation read keeps the column observation-aligned, so
     # its length is checked as before.
     mixed = lower_rkppl(quote
@@ -478,8 +495,7 @@ end
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             k ~ Normal(0, 1)
-            scale = a .+ b .* as_vector(gx)
-            reads = decayed_events(g, t, eg, et, ea, w, scale, k)
+            reads = decayed_events(g, t, eg, et, ea, w, a .+ b .* gx, k)
             y .~ Normal.(reads[oi], sigma)
         end, cols)
     @test dbound.n_obs == 8
@@ -493,6 +509,16 @@ end
             scale = a .+ b .* as_vector(gx)
             reads = decayed_events(g, t, eg, et, ea, w, scale, k)
             y .~ weighted.(Normal.(reads[oi], sigma), t)
+        end, Tuple(keys(cols)); mod = _FV)
+    # A gather by a per-observation index is observation-aligned, even of
+    # a whole column.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            s ~ Exponential(1.0)
+            m0 ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            t2 = shifted(gx[g]; by = s)
+            mu = m0 .+ c .* g .+ t2[oi]
+            y .~ Normal.(mu, 1.0)
         end, Tuple(keys(cols)); mod = _FV)
     for u in ([0.3, -0.2, 0.5, 0.1], [-1.1, 0.7, -0.3, -0.4])
         th = ReactiveKernelsPPL.constrain(built.layout, u)

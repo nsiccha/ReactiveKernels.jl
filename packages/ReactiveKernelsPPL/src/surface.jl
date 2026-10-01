@@ -1440,17 +1440,20 @@ end
 # `_confirm_whole_value_data`.
 function _check_module_calls(det, detmap, data, env::_ShapeEnv;
         whole::Set{Symbol} = Set{Symbol}())
+    # Whole columns are model-level values there: still gatherable
+    # (`gx[g]` follows its index), never aligned themselves.
     aligned = setdiff(data, whole)
+    wenv = _ShapeEnv(env.aligned, union(env.values, whole))
     memos = (Dict{Symbol,Symbol}(), Dict{Symbol,Symbol}())
     waived = Tuple{String,Set{Symbol}}[]
     for (nm, rhs) in det
-        _check_module_calls(nm, rhs, detmap, data, aligned, whole, env,
+        _check_module_calls(nm, rhs, detmap, data, aligned, whole, env, wenv,
             memos, waived)
     end
     return waived
 end
 
-function _check_module_calls(nm, ex, detmap, data, aligned, whole, env,
+function _check_module_calls(nm, ex, detmap, data, aligned, whole, env, wenv,
         memos, waived)
     ex isa Expr || return nothing
     if ex.head === :call && !isempty(ex.args) && ex.args[1] isa GlobalRef
@@ -1465,14 +1468,14 @@ function _check_module_calls(nm, ex, detmap, data, aligned, whole, env,
                 "sampling — broadcast it for an elementwise column " *
                 "(`$f.(...)`), or compute the data-only part in its own " *
                 "definition (evaluated once at bind)"
-            _obs_axis(a, aligned, detmap, memos[2], Set{Symbol}(), env) &&
+            _obs_axis(a, aligned, detmap, memos[2], Set{Symbol}(), wenv) &&
                 _sfail(msg)
             push!(waived, (msg, _reached_names(a, detmap, whole)))
         end
     end
     for a in ex.args
-        _check_module_calls(nm, a, detmap, data, aligned, whole, env, memos,
-            waived)
+        _check_module_calls(nm, a, detmap, data, aligned, whole, env, wenv,
+            memos, waived)
     end
     return nothing
 end
