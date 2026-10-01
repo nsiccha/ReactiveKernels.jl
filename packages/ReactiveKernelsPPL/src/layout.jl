@@ -969,8 +969,12 @@ end
 # (G×K), SB `(diag_pre_multiply(tau,L)*z)'` with `z_flat` in SB
 # column-major order. Sibling entries are found by the canonical
 # `_varying_corr_names` spelling (`L_<s>` → `tau_<s>` /
-# `z_flat_<s>`), never by adjacency, so entry-order changes cannot
-# miswire it. Per-stratum LKJ entries (stratified draws) fail closed:
+# `z_flat_<s>`, or `b_flat_<s>` for the centered kind), never by
+# adjacency, so entry-order changes cannot miswire it — and only among
+# `:varying` entries, the kind that varying-draws blocks alone pack, so
+# an author's parameter spelled like a sibling (`b_flat_g ~ ...` beside
+# a non-centered block) is never read as one. Per-stratum LKJ entries
+# (stratified draws) fail closed:
 # derived stratified draws are query scope, not built in this
 # log-density slice.
 # Specific refusal when an LKJ entry without canonical siblings is a
@@ -991,7 +995,8 @@ end
 
 function _varying_corr_draws(layout::LayoutTable, u::AbstractVector{<:Real})
     out = Pair{Symbol,Matrix{Float64}}[]
-    byname = Dict{Symbol,LayoutEntry}(e.name => e for e in layout.entries)
+    byname = Dict{Symbol,LayoutEntry}(e.name => e for e in layout.entries
+        if e.kind === :varying)
     for e in layout.entries
         e.kind === :varying_corr || continue
         sfx = string(e.name)[3:end]
