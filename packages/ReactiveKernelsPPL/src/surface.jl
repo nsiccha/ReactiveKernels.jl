@@ -885,7 +885,7 @@ function _shape_of(ex, data, detmap, memo, active::Set{Symbol},
     ex in active && return :scalar  # cyclic: errors downstream
     push!(active, ex)
     sh = _shape_of(detmap[ex], data, detmap, memo, active, env)
-    pop!(active)
+    delete!(active, ex)
     memo[ex] = sh
     return sh
 end
@@ -1022,7 +1022,7 @@ function _model_valued(ex, detmap, env, active::Set{Symbol})
         (haskey(detmap, ex) && !(ex in active)) || return false
         push!(active, ex)
         r = _model_valued(detmap[ex], detmap, env, active)
-        pop!(active)
+        delete!(active, ex)
         return r
     end
     ex isa Expr || return false
@@ -1269,7 +1269,7 @@ function _det_topo_order(det, detmap)
         for s in _symbols_in(detmap[nm])
             s in detkeys && s != nm && visit(s)
         end
-        pop!(active)
+        delete!(active, nm)
         push!(done, nm)
         push!(order, nm)
         return nothing
@@ -1558,7 +1558,7 @@ function _data_only(ex, data, detmap, active::Set{Symbol} = Set{Symbol}())
         (haskey(detmap, s) && !(s in active)) || return false
         push!(active, s)
         ok = _data_only(detmap[s], data, detmap, active)
-        pop!(active)
+        delete!(active, s)
         ok || return false
     end
     return true
@@ -8306,7 +8306,7 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
         push!(ctx.absorbed, ex)
         push!(visited, ex)
         out = _inline_structure(ctx.detmap[ex], ctx, visited, where)
-        pop!(visited)
+        delete!(visited, ex)
         return out
     end
     return ex

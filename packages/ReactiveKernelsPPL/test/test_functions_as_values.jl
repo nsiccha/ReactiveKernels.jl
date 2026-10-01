@@ -26,6 +26,9 @@ function column_variances(X)
     return var.(eachcol(X))
 end
 shifted(v; by = 1.0) = v .+ by
+as_vector(x) = collect(x)
+scaled(v, k) = v .* k
+l2norm(v) = sqrt(sum(abs2, v))
 # An RK-owned derivative rule (the optional registered rule): softplus with
 # its authored partial; Enzyme uses the generated rule.
 import ReactiveKernels
@@ -315,6 +318,82 @@ end
         end, cols)
     w = [0.2, -0.1, 0.3]
     @test _fv_value(k1, b1, :sampler, w) ≈ _fv_value(k2, b2, :sampler, w)
+end
+
+@testset "functions as values: a definition reached twice (diamond)" begin
+    # A definition read by two definitions that both inline into one
+    # location is a DAG, not a cycle. The definition walks once unwound
+    # their path with `pop!` on a `Set`, which drops an arbitrary element,
+    # so legality depended on the names' hashes. Each name below failed
+    # under that unwinding in at least one of the two shapes tested here.
+    names = (:scale, :base, :q, :tmp, :core, :mid, :alpha2)
+    y = [0.1, 0.4, -0.2, 0.3, 0.0, 0.5]
+    gx = [0.3, -0.1, 0.2, 0.7, -0.4, 0.05]
+    g = [1, 2, 3, 1, 2, 3]
+    cols = Dict{Symbol,ColumnData}(:y => y, :gx => gx, :g => g)
+    u = [0.2, -0.3, 0.5]
+    for s in names
+        r1, r2 = Symbol(s, :_1), Symbol(s, :_2)
+        _, bound, built = _fv_build(quote
+                sigma ~ Exponential(1.0)
+                a ~ Normal(0, 1)
+                k ~ Normal(0, 1)
+                $s = a .+ as_vector(gx)
+                $r1 = scaled($s, k)
+                $r2 = scaled($s, 2 * k)
+                y .~ Normal.($r1[g] .+ $r2[g], sigma)
+            end, cols)
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        sc = th.a .+ gx
+        ll = sum(logpdf(Normal(3 * th.k * sc[g[i]], th.sigma), y[i])
+            for i in eachindex(y))
+        @test _fv_value(built, bound, :likelihood, u) ≈ ll
+    end
+    # A real cycle through the shared definition still fails as one.
+    err = try
+        lower_rkppl(quote
+                sigma ~ Exponential(1.0)
+                a ~ Normal(0, 1)
+                k ~ Normal(0, 1)
+                scale = a .+ as_vector(gx) .+ sum(r2)
+                r1 = scaled(scale, k)
+                r2 = scaled(scale, 2 * k)
+                y .~ Normal.(r1[g] .+ r2[g], sigma)
+            end, (:y, :gx, :g); mod = _FV)
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError
+    @test occursin("cyclic definition", err.message)
+    # Data-only definitions reached twice stay data-only, so a module call
+    # over their observation-aligned result binds once instead of being
+    # refused as parameter-dependent.
+    x = [0.3, -0.1, 0.2, 0.5, 0.1, 0.0]
+    cols2 = Dict{Symbol,ColumnData}(:y => y, :x => x)
+    nrm = sqrt(sum(abs2, (x .+ 1.0) .* 2.0 .+ (x .+ 1.0 .+ 1.0)))
+    for s in names
+        u1, u2, v = Symbol(s, :_1), Symbol(s, :_2), Symbol(s, :_v)
+        plan = lower_rkppl(quote
+                sigma ~ Exponential(1.0)
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                $s = x .+ 1.0
+                $u1 = $s .* 2.0
+                $u2 = $s .+ 1.0
+                $v = $u1 .+ $u2
+                w = l2norm($v)
+                mu = a .+ b .* (x ./ w)
+                y .~ Normal.(mu, sigma)
+            end, (:y, :x); mod = _FV)
+        bound = bind_data(plan, cols2)
+        built = build_kernel(bound)
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        a, b = th.mu
+        ll = sum(logpdf(Normal(a + b * x[i] / nrm, th.sigma), y[i])
+            for i in eachindex(y))
+        @test _fv_value(built, bound, :likelihood, u) ≈ ll
+    end
 end
 
 @testset "functions as values: parameter-dependent gradient (Enzyme vs FD)" begin
