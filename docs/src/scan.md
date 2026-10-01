@@ -292,8 +292,8 @@ preserve the existing output-before-update semantics.
 
 A PK adapter is experimental and disabled for ordinary callers. It carries
 compartment amounts and a concentration/AUC buffer over a flat operation table;
-repeated-dose segments use a bounded binary-power loop. Joint K=1/K=3 primal
-parity and bounded loop structure pass with CPU fusion enabled, but PK reverse
+repeated-dose segments use a bounded binary-power loop. Primal parity and the
+bounded loop structure pass with CPU fusion enabled, but PK reverse
 compilation currently fails while tracing the rectangular path's StaticArrays
 matrix exponential (`TypeError: non-boolean (TracedRNumber{Bool})` in
 `StaticArrays._exp` via `_pk_expm_table`, since `f396c41e`; seen on Reactant
@@ -301,8 +301,8 @@ matrix exponential (`TypeError: non-boolean (TracedRNumber{Bool})` in
 original backend failure are fixed in Reactant 0.2.289+ (RK issue #13 closed,
 both standalone reproducers passing exactly). It is not a supported sampler
 path.
-The experiment, reproducer, and measurements are documented in
-`benchmark/joint_stan_tiled/rectangular_lowering.md` in the repository.
+The standalone CPU reproducers for the two upstream reverse defects are in
+`benchmark/joint_stan_tiled/` in the repository.
 
 This runtime path does not change the authored `scan` contract above. The
 rectangular fold is an internal lowering boundary, not a new public

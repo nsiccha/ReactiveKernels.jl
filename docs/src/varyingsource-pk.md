@@ -79,16 +79,7 @@ The default cell binds `series_rtol=1e-15` and `watson_terms=8`. The series
 tolerance and asymptotic Watson truncation error are separate. These controls
 do not establish a production accuracy policy. Direct cell users can bind
 different controls with `prepare_varyingsource_pk(; series_rtol, watson_terms)`.
-The grouped emitter currently uses the default controls. The
-[unit-response comparison](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/transit_twocmt)
-measures reverse gradients against actual Stan BDF; it does not measure this
-complete PK slice or the full posterior. The separate
-[emitted PK-slice comparison](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/varyingsource_pk)
-measures the full 17-coordinate slice density and reverse gradient on public
-synthetic 3/30-subject workloads, including GP feedback, likelihood, priors,
-and the sigma Jacobian. It records 14.5–50× speedups with gradient differences
-below production Stan's measured differences on those cases. It does not
-establish full-twin or real-fit performance.
+The grouped emitter currently uses the default controls.
 
 Native Enzyme reverse differentiates the ordinary cell and GP arithmetic.
 The transit primitive uses its existing generated mathematical reverse rule.
@@ -105,9 +96,5 @@ Its lag and numerical-series loops remain retained, and numerical-regime arms
 remain lazy. The standalone fixture covers changed inputs, empty lag arrays
 and explicitly bound accuracy controls. Native Enzyme reverse continues to
 use the existing generated rule.
-
-The actual application unit-response cut also passes lattice/exact schedules
-with 97/247 lags, changed live PK positions, executable reuse and input/output
-ownership. See the [transit benchmark receipts](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/transit_twocmt)
-for exact environments and checks. This component support does not establish
-compiled reverse, full dose superposition, or the complete PK/PD reader.
+This component support does not establish compiled reverse, full dose
+superposition, or the complete PK/PD reader.
