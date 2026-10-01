@@ -490,6 +490,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # lowering, before `_lower_parameters` runs).
     dirichlet_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dirichlet_call(s.rhs))
+    # Ordered vectors (`c ~ Ordered(Normal(0, 1), K)`): the only names a
+    # cumulative ordinal response takes as explicit cutpoints (checked
+    # during response lowering, before `_lower_parameters` runs).
+    ordered_names = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && !s.broadcast && _is_ordered_call(s.rhs))
     # Covariance-factor declarations (`L ~ LKJCovarianceFactor(...)`): the
     # only stems a joint response accepts as its factor (checked during
     # joint lowering, before `_lower_parameters` runs).
@@ -525,10 +530,10 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         (s.dims !== nothing ||
             (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
     # Every array-capable declaration (sized `.~`, LKJ, a `Dirichlet`
-    # simplex value): an expression that READS one by index (`L[2, 1] .* x`,
-    # `tau .* z[g]`, `phi[1] .* x`) is a value, never an affine
-    # sub-predictor over coefficients.
-    sized_decls = union(array_decls, dirichlet_names,
+    # simplex or `Ordered` vector value): an expression that READS one by
+    # index (`L[2, 1] .* x`, `tau .* z[g]`, `phi[1] .* x`) is a value, never
+    # an affine sub-predictor over coefficients.
+    sized_decls = union(array_decls, dirichlet_names, ordered_names,
         Set{Symbol}(s.lhs for s in sample
             if s.lhs ∉ data && s.broadcast &&
                 (s.levels !== nothing || s.matrix !== nothing)))
@@ -538,11 +543,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # scalar-array ops take dotted-canonical form; Julia-invalid vector
     # combinations fail here naming the definition). Everything downstream
     # sees canonical RHSs.
-    # Model-level array values: upstream's simplexes plus this lane's
+    # Model-level array values: upstream's simplexes, ordered vectors, and
     # declared array parameters (`z[1:K] .~`, `L ~ LKJCholesky`, ...).
     shape_env = _ShapeEnv(
         union(plate_names, Set{Symbol}(s.state for s in scans), varying_names),
-        union(dirichlet_names, array_decls))
+        union(dirichlet_names, ordered_names, array_decls))
     detshape = _def_shapes(det, data, detmap; arrays = array_decls,
         env = shape_env)
     _check_module_calls(det, detmap, data, shape_env)
@@ -591,6 +596,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         hsgps = Dict{Symbol,HSGPBasis}(b.id => b for b in hbases),
         hsgp_uses = Dict{Symbol,Symbol}(),
         dirichlet_names = dirichlet_names,
+        ordered_names = ordered_names,
+        array_dims = Dict{Symbol,Vector{Any}}(s.lhs => s.dims for s in sample
+            if s.lhs ∉ data && s.dims !== nothing),
+        threshold_uses = Dict{Symbol,NamedTuple{(:response, :ordered),
+            Tuple{Symbol,Bool}}}(),
         mo_uses = Dict{Symbol,Symbol}(),
         matrices = Dict{Symbol,DesignMatrix}(m.name => m for m in matrices),
         matrices_used = Set{Symbol}(),
@@ -4621,9 +4631,20 @@ _is_literal_range(r) = r isa Expr && r.head === :call && length(r.args) == 3 &&
 function _array_axis(target::Symbol, a, data::Set{Symbol})
     if _is_literal_range(a)
         lo, hi = a.args[2], a.args[3]
+        cnt = lo === 1 ? _levels_count(hi) : nothing
+        if cnt !== nothing
+            # `1:length(levels(g)) - k`: a positional axis whose length is
+            # the number of distinct values of `g`, less k (resolved at
+            # bind).
+            g, k = cnt
+            g in data || _sfail("array $target axis $(repr(a)): " *
+                "`levels($g)` needs a data grouping column — $g is not data")
+            n = Expr(:call, :length, Expr(:call, :levels, g))
+            return k == 0 ? n : Expr(:call, :-, n, k)
+        end
         lo === 1 && hi isa Integer && !(hi isa Bool) && hi >= 1 || _sfail(
             "array $target axis $(repr(a)) must be a literal `1:K` with " *
-            "K ≥ 1")
+            "K ≥ 1, or `1:length(levels(g)) - k`")
         return Int(hi)
     end
     if _is_levels_call(a)
@@ -6281,16 +6302,61 @@ function _implicit_vector!(ctx, name::Symbol, family::Symbol, lhs::Symbol)
     return name
 end
 
-# Cumulative-logit ordinal: `y .~ OrderedLogistic.(eta)` + implicit
-# ordered cutpoints (SB's `y_cutpoints::ordered[K-1] ~ std_normal()`).
+# Explicit cutpoints/thresholds of an ordinal response: the trailing
+# argument `Ref(c)` names one declared vector shared by every observation
+# (Distributions.jl `OrderedLogistic.(eta, Ref(c))` broadcast semantics).
+# Cumulative structures take an `Ordered(...)` vector; stopping-ratio
+# stage thresholds are unconstrained, a one-axis sized
+# `c[1:K] .~ Normal.(m, s)` declaration. Each vector serves exactly one
+# response (recorded for `_lower_parameters`, which sizes it).
+function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
+        shown::String)
+    name = arg isa Expr && arg.head === :call && length(arg.args) == 2 &&
+        arg.args[1] === :Ref && arg.args[2] isa Symbol ? arg.args[2] : nothing
+    if name === nothing
+        arg isa Symbol && _sfail("response $lhs: the cutpoints $arg are " *
+            "one vector shared by every observation — write `Ref($arg)` " *
+            "(standard broadcasting would pair each observation with one " *
+            "element of $arg)")
+        _sfail("response $lhs: $shown takes its cutpoints as `Ref(c)` of " *
+               "a declared vector, got $(repr(arg))")
+    end
+    if ordered
+        name in ctx.ordered_names || _sfail("response $lhs: cutpoints " *
+            "$name must be an ordered vector declared in the model " *
+            "(`$name ~ Ordered(Normal(0, 1), length(levels($lhs)) - 1)`)")
+    else
+        name in ctx.ordered_names && _sfail("response $lhs: stopping-ratio " *
+            "thresholds are unconstrained, not ordered — declare " *
+            "`$name[1:length(levels($lhs)) - 1] .~ Normal.(0, 1)`")
+        dims = get(ctx.array_dims, name, nothing)
+        dims !== nothing && length(dims) == 1 || _sfail("response $lhs: " *
+            "thresholds $name must be a one-axis vector declared in the " *
+            "model (`$name[1:length(levels($lhs)) - 1] .~ Normal.(0, 1)`)")
+    end
+    prev = get(ctx.threshold_uses, name, nothing)
+    prev === nothing || _sfail("response $lhs: cutpoints $name already " *
+        "serve response $(prev.response) — one response per cutpoint vector")
+    ctx.threshold_uses[name] = (response = lhs, ordered = ordered)
+    return name
+end
+
+# Cumulative-logit ordinal: `y .~ OrderedLogistic.(eta, Ref(c))` over
+# declared cutpoints `c ~ Ordered(...)`, or the implicit form
+# `y .~ OrderedLogistic.(eta)` + minted ordered cutpoints (SB's
+# `y_cutpoints::ordered[K-1] ~ std_normal()`; removed once BRM emits the
+# explicit form).
 function _lower_ordered_logistic_response(lhs, call, range, weights,
         evidence, label, ctx, predictors, pred_idx, coefuse)
     args = _plain_args(call, "`OrderedLogistic`")
-    length(args) == 1 || _sfail("response $lhs: `OrderedLogistic` takes " *
-                                "`y .~ OrderedLogistic.(eta)`")
+    1 <= length(args) <= 2 || _sfail("response $lhs: `OrderedLogistic` " *
+        "takes `y .~ OrderedLogistic.(eta, Ref(c))` with " *
+        "`c ~ Ordered(Normal(0, 1), length(levels(y)) - 1)`")
     pname = _lower_location(lhs, args[1], IdentityLink, ctx, predictors,
         pred_idx, coefuse)
-    cut = _implicit_vector!(ctx, Symbol(lhs, :_cutpoints), :ordered_normal, lhs)
+    cut = length(args) == 2 ?
+        _explicit_thresholds!(ctx, lhs, args[2], true, "`OrderedLogistic`") :
+        _implicit_vector!(ctx, Symbol(lhs, :_cutpoints), :ordered_normal, lhs)
     return LikelihoodSpec(OrderedLogisticFam, LogitLink, lhs, pname,
         nothing, weights, evidence, label, nothing, range; thresholds = cut)
 end
@@ -6312,17 +6378,19 @@ const _ORDINAL_LINKS = Dict{Symbol,LinkFunction}(
     :CloglogLink => CloglogLink,
 )
 
-# General typed ordinal: `y .~ Ordinal.(Cumulative(), LogitLink(), eta)`
-# (+ implicit thresholds — ordered iff cumulative). Discrimination and
-# per-threshold design are plan-level only (the BRM emitter's path):
-# the dotted object takes exactly three positionals.
+# General typed ordinal:
+# `y .~ Ordinal.(Cumulative(), LogitLink(), eta, Ref(c))` over declared
+# thresholds (ordered iff cumulative — see `_explicit_thresholds!`), or the
+# implicit three-positional form + minted thresholds (removed once BRM
+# emits the explicit form). Discrimination and per-threshold design are
+# plan-level only (the BRM emitter's path).
 function _lower_ordinal_response(lhs, call, range, weights, evidence,
         label, ctx, predictors, pred_idx, coefuse)
     args = _plain_args(call, "`Ordinal`")
-    length(args) == 3 || _sfail("response $lhs: `Ordinal` takes " *
-                                "`y .~ Ordinal.(Cumulative(), LogitLink(), eta)` " *
-                                "(structure, link, eta — discrimination and " *
-                                "per-threshold design are plan-level only)")
+    3 <= length(args) <= 4 || _sfail("response $lhs: `Ordinal` takes " *
+        "`y .~ Ordinal.(Cumulative(), LogitLink(), eta, Ref(c))` " *
+        "(structure, link, eta, thresholds — discrimination and " *
+        "per-threshold design are plan-level only)")
     structure = _ordinal_tag(lhs, args[1], (:Cumulative, :StoppingRatio),
         "structure")
     linktag = _ordinal_tag(lhs, args[2],
@@ -6330,7 +6398,10 @@ function _lower_ordinal_response(lhs, call, range, weights, evidence,
     pname = _lower_location(lhs, args[3], IdentityLink, ctx, predictors,
         pred_idx, coefuse)
     vfam = structure === :Cumulative ? :ordered_normal : :vector_normal
-    thresh = _implicit_vector!(ctx, Symbol(lhs, :_thresholds), vfam, lhs)
+    thresh = length(args) == 4 ?
+        _explicit_thresholds!(ctx, lhs, args[4], structure === :Cumulative,
+            "`Ordinal`") :
+        _implicit_vector!(ctx, Symbol(lhs, :_thresholds), vfam, lhs)
     structure_sym = structure === :Cumulative ? :cumulative : :stopping
     return LikelihoodSpec(OrdinalFam, _ORDINAL_LINKS[linktag], lhs, pname,
         nothing, weights, evidence, label, nothing, range;
@@ -9639,8 +9710,16 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
     for s in sample
         (s.lhs in ctx.data || s.lhs in ctx.derived_responses) && continue
         if s.dims !== nothing
+            if haskey(ctx.threshold_uses, s.lhs)
+                push!(vectors, _lower_plain_thresholds(s, coefuse, ctx))
+                continue
+            end
             push!(arrays, _lower_array_parameter(s.lhs, s.dims, s.rhs,
                 coefuse, ctx, syms))
+            continue
+        end
+        if !s.broadcast && _is_ordered_call(s.rhs)
+            push!(vectors, _lower_ordered(s.lhs, s.rhs, coefuse, ctx))
             continue
         end
         if !s.broadcast && _is_lkj_cholesky_call(s.rhs)
@@ -9828,6 +9907,109 @@ function _lower_dirichlet(lhs, rhs)
                "$(length(args)) arguments")
     end
     return VectorParameter(lhs, :simplex_dirichlet, (arg1 = alpha,), nothing,
+        lhs)
+end
+
+_is_ordered_call(rhs) =
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+    rhs.args[1] === :Ordered
+
+# `length(levels(g)) - k` (k a literal Int ≥ 0; bare `length(levels(g))`
+# is k = 0) → `(g, k)`, else `nothing`.
+function _levels_count(ex)
+    k = 0
+    if ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
+            ex.args[1] === :- && ex.args[3] isa Integer &&
+            !(ex.args[3] isa Bool) && ex.args[3] >= 0
+        k = Int(ex.args[3])
+        ex = ex.args[2]
+    end
+    ex isa Expr && ex.head === :call && length(ex.args) == 2 &&
+        ex.args[1] === :length && ex.args[2] isa Expr &&
+        ex.args[2].head === :call && length(ex.args[2].args) == 2 &&
+        ex.args[2].args[1] === :levels && ex.args[2].args[2] isa Symbol ||
+        return nothing
+    return (ex.args[2].args[2], k)
+end
+
+# A cutpoint vector's length: a literal `K − 1` (concrete size), or
+# `length(levels(y)) - 1` over the response `y` it serves (`nothing`: bind
+# infers K − 1 from `y`, whose level codes `validate_data` proves are
+# exactly 1..K, so the two counts agree on every bound data set). Any other
+# count fails closed.
+function _threshold_size(lhs::Symbol, n, response::Symbol)
+    n isa Integer && !(n isa Bool) && n >= 0 && return Int(n)
+    _levels_count(n) == (response, 1) && return nothing
+    _sfail("$lhs serves response $response, so its length is a literal or " *
+           "`length(levels($response)) - 1` (one cutpoint between each " *
+           "pair of adjacent levels), got $(repr(n))")
+end
+
+# `Normal(m, s)` with finite literal arguments (`Normal()` and `Normal(m)`
+# take Distributions.jl's defaults) → `(m, s)`: the iid element prior of a
+# cutpoint vector.
+function _threshold_normal_args(lhs::Symbol, d, what::String)
+    d isa Expr && d.head === :call && !isempty(d.args) &&
+        d.args[1] === :Normal && length(d.args) <= 3 &&
+        all(a -> a isa Real && !(a isa Bool) && isfinite(a), d.args[2:end]) ||
+        _sfail("$what $lhs: the element prior is `Normal(m, s)` with " *
+               "finite literal arguments (other families and parameter " *
+               "arguments are not admitted for cutpoints yet), got " *
+               "$(repr(d))")
+    m = length(d.args) >= 2 ? Float64(d.args[2]) : 0.0
+    s = length(d.args) == 3 ? Float64(d.args[3]) : 1.0
+    s > 0 || _sfail("$what $lhs: the element prior scale must be positive, " *
+                    "got $s")
+    return m, s
+end
+
+# `c ~ Ordered(Normal(m, s), n)`: n iid `Normal(m, s)` elements restricted
+# to increasing order — the `ordered_constrain` transform plus its
+# Jacobian, and the elementwise prior with no `log(n!)` normalizer (Stan's
+# `ordered[n] c; c ~ normal(m, s)`, Bijectors.jl's `ordered`). `c` is a
+# plain `Vector{Float64}` value (`c[1]`, `c[2] - c[1]`); a cumulative
+# ordinal response consumes it as its cutpoints
+# (`OrderedLogistic.(eta, Ref(c))`), which also admits the data-sized
+# length `length(levels(y)) - 1`. Unconsumed, the length is a literal.
+function _lower_ordered(lhs, rhs, coefuse, ctx)
+    haskey(coefuse, lhs) && _sfail("$lhs is a predictor coefficient and " *
+        "cannot also be an Ordered vector")
+    args = _plain_args(rhs, "`Ordered`")
+    length(args) == 2 || _sfail("parameter $lhs: `Ordered` takes the " *
+        "element distribution and the length " *
+        "(`$lhs ~ Ordered(Normal(0, 1), length(levels(y)) - 1)`), got " *
+        "$(length(args)) arguments")
+    m, s = _threshold_normal_args(lhs, args[1], "Ordered vector")
+    n = args[2]
+    use = get(ctx.threshold_uses, lhs, nothing)
+    size = if use !== nothing
+        _threshold_size(lhs, n, use.response)
+    elseif n isa Integer && !(n isa Bool) && n >= 1
+        Int(n)
+    else
+        _sfail("Ordered vector $lhs serves no ordinal response, so its " *
+               "length is a literal ≥ 1 (`$lhs ~ Ordered(Normal(0, 1), 3)`) " *
+               "— `length(levels(y)) - 1` sizes the cutpoints of the " *
+               "response `y` they serve (`y .~ OrderedLogistic.(eta, " *
+               "Ref($lhs))`), got $(repr(n))")
+    end
+    return VectorParameter(lhs, :ordered_normal, (arg1 = m, arg2 = s), size,
+        lhs)
+end
+
+# Stopping-ratio stage thresholds `c[1:n] .~ Normal.(m, s)`: one
+# unconstrained vector with an iid `Normal(m, s)` prior (the response
+# consumes it as `Ordinal.(StoppingRatio(), link, eta, Ref(c))`).
+function _lower_plain_thresholds(s, coefuse, ctx)
+    lhs = s.lhs
+    haskey(coefuse, lhs) && _sfail("$lhs is a predictor coefficient and " *
+        "cannot also be thresholds")
+    m, sc = _threshold_normal_args(lhs, _undot_distribution(lhs, s.rhs),
+        "thresholds")
+    n = only(s.dims)
+    size = n isa Int ? n : _threshold_size(lhs, n,
+        ctx.threshold_uses[lhs].response)
+    return VectorParameter(lhs, :vector_normal, (arg1 = m, arg2 = sc), size,
         lhs)
 end
 
