@@ -303,7 +303,7 @@ function Base.merge(m::RKPPLModel, fix::NamedTuple)
         haskey(idx, nm) || _sfail("merge fix `$nm` matches no base-model " *
                                   "statement (a fixed name must name a " *
                                   "`~` / `.~` / `=` statement to remove)")
-        val isa ColumnData || _sfail("merge fix `$nm` must be a " *
+        val isa _SuppliedColumn || _sfail("merge fix `$nm` must be a " *
             "vector or matrix (data-backed; got $(typeof(val)))")
         push!(drop, idx[nm])
         new_fixed[nm] = val
