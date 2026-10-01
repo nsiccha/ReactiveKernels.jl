@@ -268,14 +268,20 @@ end
             sigma = 1.3), hs_want)
     end
     @testset "Q3 computed coefficient in a named column" begin
-        _fb_check(quote
+        # The named column is a coefficient-free predictor over the
+        # in-graph derived column; `mu` composes it with the scalar `a`,
+        # which stays an ordinary parameter (no intercept coefficient).
+        plan = _fb_check(quote
             a ~ Normal(0, 5); lam ~ HalfCauchy(1); tau ~ HalfCauchy(1)
             z ~ Normal(0, 1); sigma ~ Exponential(1)
             eff = (z * lam * tau) .* x
             mu = a .+ eff
             y .~ Normal.(mu, sigma)
-        end, (:y, :x), (mu = [0.4], lam = 0.9, tau = 0.3, z = -1.2,
-            sigma = 1.3), hs_want)
+        end, (:y, :x), (a = 0.4, lam = 0.9, tau = 0.3, z = -1.2,
+            sigma = 1.3), q -> hs_want(merge(q, (mu = [q.a],))))
+        @test only(plan.derived).expr == :((z * lam * tau) .* x)
+        @test only(only(plan.predictors[1].terms).columns) ===
+              only(plan.derived).name
     end
     @testset "Q7 parameter-scaled column beside an affine term" begin
         _fb_check(quote
