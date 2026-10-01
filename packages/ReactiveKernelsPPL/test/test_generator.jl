@@ -1750,6 +1750,7 @@ end
     # Jacobian `u` (snag thin-layer-upper-c3c06483).
     interim = bind_data(lower_rkppl(Expr(:block,
             :(tgi_c_cr ~ Normal(-2.3, 1.0)),
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(mu = a .+ b .* x),
             :(y .~ Normal.(mu, s)),
             :(s ~ Exponential(1))), (:y, :x)), cols)

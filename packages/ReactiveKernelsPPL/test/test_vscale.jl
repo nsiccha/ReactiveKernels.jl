@@ -210,7 +210,10 @@ end
     end, (:y, :x, :z))
     pr = only(p for p in stated.population_priors if p.predictor === :sigma)
     @test (pr.addressee, pr.location, pr.scale) == (:Intercept, 0.0, 5.0)
-    # Bare intercept-only scale is identity link, like the vector shape.
+    # Strict declarations: the intercept-only scale's coefficient is
+    # declared, and a declared Normal name aliased into the scale stays
+    # scalar-path (the alias rule below) — the free-name intercept-only
+    # scale predictor no longer exists.
     bare = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
@@ -219,7 +222,7 @@ end
         sg = c
         y .~ Normal.(mu, sg)
     end, (:y, :x, :z))
-    @test only(bare.responses).scale == ScalePredictorRef(:sg, IdentityLink)
+    @test only(bare.responses).scale === :sg
     # Non-Normal parameter aliases stay scalar-path (no reroute).
     aliased = lower_rkppl(quote
         a ~ Normal(0, 1)
