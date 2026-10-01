@@ -361,7 +361,9 @@ end
     # the index vectors are materialized before float scaling, so no TwicePrecision
     # StepRangeLen is built. Oracle: d/dL[i,i] Σⱼ wⱼ log L[j,j] = wᵢ/L[i,i] with
     # wᵢ = K + 2(eta - 1) - i; off-diagonals are 0. K = 2 covers the empty
-    # normalizer sum; K = 3 the nonempty one.
+    # normalizer sum; K = 3 the nonempty one. With eta active the oracle is a
+    # central difference of Distributions' density in eta (the range spelling
+    # failed this leg too, at every K).
     @testset "native Enzyme gradient" begin
         backend = AutoEnzyme(; mode = Enzyme.Reverse)
         for (L, eta) in (([1.0 0.0; 0.6 0.8], 2.0),
@@ -372,6 +374,11 @@ end
             @test gradient(L_ -> kernel(L_, eta), backend, L) ≈ expected
             prepared = prepare_ad(kernel, backend, L, eta; active = :L)
             @test ad_gradient(prepared, L, eta) ≈ expected
+            density_at(e) = logpdf(LKJCholesky(K, e, :L), Cholesky(LowerTriangular(L)))
+            h = 1e-6
+            prepared_eta = prepare_ad(kernel, backend, L, eta; active = :eta)
+            @test ad_gradient(prepared_eta, L, eta) ≈
+                  (density_at(eta + h) - density_at(eta - h)) / (2h) rtol = 1e-6
         end
     end
     @test occursin("@kernel lkj_corr_cholesky", LKJ_CORR_CHOLESKY_KERNEL_SOURCE)
