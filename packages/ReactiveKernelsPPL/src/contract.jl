@@ -834,7 +834,9 @@ thresholds, or a shared simplex), packed as one contiguous block:
 
 - `:ordered_normal` — an ordered cutpoint/threshold vector with an
   elementwise `Normal(arg1, arg2)` prior (Stan `ordered` semantics: no
-  factorial normalizer) + the ordered-transform Jacobian.
+  factorial normalizer) + the ordered-transform Jacobian. The surface
+  `c ~ Ordered(Normal(m, s), n)`; unlinked (a free-standing ordered value)
+  it carries its concrete literal `size`.
 - `:vector_normal` — a plain (unconstrained, identity-transform) vector
   with an elementwise `Normal(arg1, arg2)` prior (stopping-ratio stage
   thresholds).
@@ -901,8 +903,10 @@ value (`phi[1]`, `cumsum(phi)`, a gather `cum[c]`).
 `1:K`) or the surface sizing expression, resolved against bound data:
 `:(levels(g))` (the sorted distinct values of grouping column `g`; reading
 `z[g]` then looks each observation's value up on that axis),
-`:(axes(M, d))` or `:(size(M, d))` (axis `d` of a bound matrix or a design
-matrix `M`). Arrays have one or two axes.
+`:(length(levels(g)) - k)` (from `1:length(levels(g)) - k`: a positional
+axis of that many elements, `k` a literal ≥ 0, bare `length(levels(g))`
+for 0), `:(axes(M, d))` or `:(size(M, d))` (axis `d` of a bound matrix or a
+design matrix `M`). Arrays have one or two axes.
 """
 struct ArrayParameter
     name::ParamName
@@ -10503,6 +10507,10 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             # A grouped varying-source GP coefficient vector has a concrete
             # structural size; its cell linkage and square size were proved
             # by validate_structure before bind.
+            push!(out_v, p)
+        elseif p.family === :ordered_normal && p.size !== nothing
+            # A free-standing ordered vector (`c ~ Ordered(Normal(0, 1), 3)`
+            # read as a value) has its literal structural size.
             push!(out_v, p)
         elseif p.family === :simplex_dirichlet
             # A free-standing simplex (functions as values: definitions
