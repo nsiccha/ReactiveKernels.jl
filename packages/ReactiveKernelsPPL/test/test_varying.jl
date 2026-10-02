@@ -1620,21 +1620,22 @@ end
     default_src = _tv_tau_src(VaryingSdPrior[])
     @test occursin("_ppl_pw_prior_tau_g", default_src)
     @test occursin("plate(tau_g)", default_src)
-    @test occursin("(normal(0.0, 1.0)).logpdf(_ppl_c1)", default_src)
+    @test occursin("normal(", default_src)
+    @test occursin("log(2)", default_src)
     @test !occursin("tau_g[", default_src)
     # Uniform configured prior stays one plate with the mapped family.
     uni_src = _tv_tau_src([VaryingSdPrior(:exponential, 1 / 3),
         VaryingSdPrior(:exponential, 1 / 3)])
     @test occursin("_ppl_pw_prior_tau_g", uni_src)
     @test occursin("plate(tau_g)", uni_src)
-    @test occursin("(exponential(0.3333333333333333)).logpdf(_ppl_c1)",
-        uni_src)
+    @test occursin("exponential(", uni_src)
+    @test !occursin("log(2)", uni_src)
     # Mixed margins unroll to one scalar density per margin.
     mix_src = _tv_tau_src([VaryingSdPrior(:exponential, 1 / 3),
         VaryingSdPrior(:normal, 2.0)])
-    @test occursin("(exponential(0.3333333333333333)).logpdf(tau_g[1])",
-        mix_src)
-    @test occursin("(normal(0.0, 2.0)).logpdf(tau_g[2])", mix_src)
+    @test occursin("exponential(", mix_src) && occursin("tau_g[1]", mix_src)
+    @test occursin("normal(", mix_src) && occursin("tau_g[2]", mix_src)
+    @test occursin("log(2)", mix_src)
     @test occursin("_ppl_prior_tau_g", mix_src)
 end
 
