@@ -1709,9 +1709,7 @@ end
 end
 
 # An upper-only scalar latent (a negative location under a negative ceiling)
-# carries Stan's upper-bound kernel: plain normal_lpdf (NO -log(cdf)
-# renormalization) plus the bare-`u` Jacobian. Oracle is Distributions.jl
-# plain `Normal`.
+# carries the normalized truncated distribution plus the exp Jacobian.
 @testset "upper-truncated scalar latent end to end" begin
     hi = -0.5
     x = [0.5, -1.0, 0.25, 1.5, -0.75, 0.0]
@@ -1735,14 +1733,13 @@ end
     mu = a .+ b .* x
     ll = sum(logpdf.(Normal.(mu, s), y))
     pr = logpdf(Normal(0, 1), a) + logpdf(Normal(0, 1), b) +
-        logpdf(Normal(-1.0, 1.0), c) + logpdf(Exponential(1), s)
+        logpdf(truncated(Normal(-1.0, 1.0), -Inf, hi), c) + logpdf(Exponential(1), s)
     @test _query(built.spec, plan, :likelihood, u) ≈ ll
     @test _query(built.spec, plan, :prior, u) ≈ pr
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[1] + u[4]
     _check_gradient(built.spec, plan, u)
-    # The untruncated interim is density-exact on the support interior: same
-    # constrained value ⇒ same prior; the posterior differs by exactly the
-    # Jacobian `u` (snag thin-layer-upper-c3c06483).
+    # Compared with the plain Normal, truncation adds its normalization
+    # and the coordinate transform adds its Jacobian.
     interim = bind_data(lower_rkppl(Expr(:block,
             :(w ~ Normal(-1.0, 1.0)),
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
@@ -1752,9 +1749,9 @@ end
     built_i = build_kernel(interim)
     u_i = unconstrain(built_i.layout, (; w = c, a, b, s))
     @test _query(built.spec, plan, :prior, u) ≈
-        _query(built_i.spec, interim, :prior, u_i)
+        _query(built_i.spec, interim, :prior, u_i) - logcdf(Normal(-1, 1), hi)
     @test (_query(built.spec, plan, :posterior, u) -
-           _query(built_i.spec, interim, :posterior, u_i)) ≈ u[1]
+           _query(built_i.spec, interim, :posterior, u_i)) ≈ u[1] - logcdf(Normal(-1, 1), hi)
 end
 
 @testset "plate parameter upper-truncated latent" begin
@@ -1779,7 +1776,7 @@ end
     @test all(t -> t < hi, theta)
     ll = sum(logpdf.(Normal.(theta, 1.0), y))
     pr = logpdf(Normal(0, 3), mu) + (logpdf(Normal(0, 2), tau) + log(2)) +
-        sum(logpdf.(Normal.(mu, tau), theta))
+        sum(logpdf.(truncated(Normal(mu, tau), -Inf, hi), theta))
     @test _query(built.spec, plan, :likelihood, u) ≈ ll
     @test _query(built.spec, plan, :prior, u) ≈ pr
     # log-jacobian: exp for tau (u[2]) + bare-u per theta cell.

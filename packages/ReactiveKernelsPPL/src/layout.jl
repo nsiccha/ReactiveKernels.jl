@@ -25,6 +25,7 @@ function support_of(family::Symbol, override::SupportOverride)
         throw(ContractValidationError("[layout] sampled family $family unknown"))
     inferred = SAMPLED_SUPPORT[family]
     override === nothing && return inferred
+    override isa Tuple && override[1] === :truncated && return :truncated
     family === :uniform && throw(ContractValidationError(
         "[layout] a uniform prior carries its own interval support — no " *
         "support override applies, got $override"))
@@ -60,19 +61,33 @@ function support_of(family::Symbol, override::SupportOverride)
     return :positive
 end
 
-# A `(:lower, name)` bound reads the bound model-level data value `name` (a
-# finite non-negative number); every other override passes through.
+# Fold bound data and data-only definitions, retaining sampled dependencies.
 _bound_override(::StructuralPlan, ov) = ov
-function _bound_override(plan::StructuralPlan, ov::Tuple{Symbol,Symbol})
-    ov[1] === :lower || return ov
-    haskey(plan.columns, ov[2]) || throw(ContractValidationError(
-        "[layout] lower bound $(ov[2]) is not bound data (bind the plan " *
-        "first, or define it from data)"))
-    v = plan.columns[ov[2]]
-    v isa Real && isfinite(v) && v >= 0 || throw(ContractValidationError(
-        "[layout] lower bound $(ov[2]) must be a finite non-negative " *
-        "number, got $(summary(v))"))
-    return (:lower, Float64(v))
+function _bound_override(plan::StructuralPlan, ov::Tuple)
+    return (ov[1], (_layout_bound(plan, x) for x in ov[2:end])...)
+end
+function _layout_bound(plan::StructuralPlan, x)
+    x isa Real && return Float64(x)
+    exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
+    merge!(exprs, Dict(d.name => d.expr for d in plan.derived))
+    function lookup(nm)
+        haskey(plan.columns, nm) && return plan.columns[nm]
+        haskey(exprs, nm) && return _eval_value_expr(exprs[nm], lookup, nm)
+        return nm
+    end
+    # A definition reading sampled values remains a graph expression.
+    refs = _value_symbols(x)
+    function isdata(nm, seen = Set{Symbol}())
+        haskey(plan.columns, nm) && return true
+        nm in seen && return false
+        haskey(exprs, nm) || return false
+        all(r -> isdata(r, union(seen, Set([nm]))), _value_symbols(exprs[nm]))
+    end
+    all(isdata, refs) || return x
+    v = _eval_value_expr(x, lookup, :truncation_bound)
+    v isa Real && !isnan(v) || throw(ContractValidationError(
+        "[layout] truncation bound must be a number, got $(summary(v))"))
+    return Float64(v)
 end
 
 # The transform kind and (for :interval/:upper) the constrained bounds a
@@ -81,9 +96,31 @@ end
 function _entry_transform(family::Symbol, override::SupportOverride,
         args::NamedTuple)
     support = support_of(family, override)
+    if support === :truncated
+        lo, hi = override[2], override[3]
+        natural = SAMPLED_SUPPORT[family]
+        clip(fn, a, b) = a isa Real && b isa Real ? fn(a, b) :
+            Expr(:call, nameof(fn), a, b)
+        if natural === :positive || natural === :unit
+            lo = clip(max, lo, 0.0)
+        end
+        natural === :unit && (hi = clip(min, hi, 1.0))
+        if natural === :interval
+            lo = clip(max, lo, args.arg1)
+            hi = clip(min, hi, args.arg2)
+        end
+        if lo isa Real && hi isa Real
+            lo < hi || throw(ContractValidationError(
+                "[layout] truncation has no mass in the base support: ($lo, $hi)"))
+        end
+        lo == -Inf && hi == Inf && return (:identity, NaN, NaN)
+        hi == Inf && return (:floored, lo, NaN)
+        lo == -Inf && return (:upper, NaN, hi)
+        return (:interval, lo, hi)
+    end
     if support === :interval
         family === :uniform &&
-            return (:interval, Float64(args.arg1), Float64(args.arg2))
+            return (:interval, args.arg1, args.arg2)
         return (:interval, Float64(override[2]), Float64(override[3]))
     end
     if support === :upper
@@ -119,8 +156,8 @@ struct LayoutEntry
     offset::Int # 1-based packed offset
     size::Int
     transform::Symbol # :identity | :exp | :logistic | :interval | :floored | :upper | :ordered | :simplex | :lkj
-    lo::Float64 # :interval/:floored lower bound (else NaN)
-    hi::Float64 # :interval/:upper upper bound (else NaN)
+    lo::Union{Float64,Symbol,Expr} # constrained lower bound (else NaN)
+    hi::Union{Float64,Symbol,Expr} # constrained upper bound (else NaN)
     dims::Vector{Int} # :array axis lengths (else empty)
 end
 # Entries other than arrays carry no axes.
@@ -139,7 +176,11 @@ struct LayoutTable
     entries::Vector{LayoutEntry}
     total::Int
     name_paths::Dict{Symbol,Tuple{Vararg{Symbol}}}
+    bound_values::Dict{Symbol,Any}
+    bound_exprs::Dict{Symbol,Any}
 end
+LayoutTable(entries::Vector{LayoutEntry}, total::Int, paths::Dict{Symbol,Tuple{Vararg{Symbol}}}) =
+    LayoutTable(entries, total, paths, Dict{Symbol,Any}(), Dict{Symbol,Any}())
 LayoutTable(entries::Vector{LayoutEntry}, total::Int) =
     LayoutTable(entries, total, Dict{Symbol,Tuple{Vararg{Symbol}}}())
 
@@ -325,7 +366,8 @@ function assign_layout(plan::StructuralPlan)
     end
     for p in plan.parameters
         transform, lo, hi = _entry_transform(p.family,
-            _bound_override(plan, p.support_override), p.args)
+            _bound_override(plan, p.support_override),
+            p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
         push!(entries,
             LayoutEntry(:sampled, nothing, p.name, [p.name], offset, 1, transform,
                 lo, hi))
@@ -333,7 +375,8 @@ function assign_layout(plan::StructuralPlan)
     end
     for p in plan.plate_parameters
         transform, lo, hi =
-            _entry_transform(p.family, p.support_override, p.args)
+            _entry_transform(p.family, _bound_override(plan, p.support_override),
+                p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
         # An `eachindex(v)` plate is proved at bind to have n_obs cells.
         size = p.range isa UnitRange ? length(p.range) : plan.n_obs
         push!(entries,
@@ -601,8 +644,9 @@ function assign_layout(plan::StructuralPlan)
     # simplexes reuse the `:cholesky_corr` / `:vector` edges, elementwise
     # arrays pack one `:array` block each.
     offset = _array_layout_entries!(entries, plan, offset)
-    return LayoutTable(entries, offset - 1,
-        _scope_layout_paths(plan))
+    return LayoutTable(entries, offset - 1, _scope_layout_paths(plan),
+        Dict{Symbol,Any}(plan.columns),
+        Dict{Symbol,Any}(a.name => a.expr for a in (plan.assignments..., plan.derived...)))
 end
 
 """Constrained length of a `:vector` entry: simplex packs K−1 logits
@@ -1114,6 +1158,72 @@ function _flat_draw_values(layout::LayoutTable, nt::NamedTuple)
     return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
 end
 
+# Bounds read the same constrained values and ordinary definitions as the
+# graph. Packing order stays fixed; evaluation follows bound dependencies.
+_dynamic_bounds(e::LayoutEntry) = !(e.lo isa Real && e.hi isa Real)
+function _layout_lookup(layout::LayoutTable, values)
+    active = Set{Symbol}()
+    function lookup(name)
+        haskey(values, name) && return values[name]
+        haskey(layout.bound_values, name) && return layout.bound_values[name]
+        haskey(layout.bound_exprs, name) || throw(ContractValidationError(
+            "[layout] bound references unavailable value $name"))
+        name in active && throw(ContractValidationError("[layout] cyclic bound at $name"))
+        push!(active, name)
+        result = _eval_value_expr(layout.bound_exprs[name], lookup, name)
+        delete!(active, name)
+        return result
+    end
+    return lookup
+end
+function _resolved_entry(layout::LayoutTable, e::LayoutEntry, values)
+    _dynamic_bounds(e) || return e
+    lookup = _layout_lookup(layout, values)
+    resolve(x) = x isa Real ? Float64(x) :
+        _eval_value_expr(x, lookup, e.name)
+    lo, hi = resolve(e.lo), resolve(e.hi)
+    lo isa Real && hi isa Real ||
+        throw(ContractValidationError("[layout] bounds for $(e.name) must be real scalars"))
+    if e.transform === :interval
+        isfinite(lo) && isfinite(hi) && lo < hi || throw(ContractValidationError(
+            "[layout] bounds for $(e.name) require finite lo < hi, got ($lo, $hi)"))
+    elseif e.transform === :floored
+        isfinite(lo) || throw(ContractValidationError("[layout] lower bound for $(e.name) must be finite"))
+    elseif e.transform === :upper
+        isfinite(hi) || throw(ContractValidationError("[layout] upper bound for $(e.name) must be finite"))
+    end
+    return LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset,
+        e.size, e.transform, Float64(lo), Float64(hi), e.dims)
+end
+function _bound_entry_order(layout::LayoutTable)
+    any(_dynamic_bounds, layout.entries) || return layout.entries
+    byname = Dict(e.name => e for e in layout.entries)
+    done, active = Set{Symbol}(), Set{Symbol}()
+    out = LayoutEntry[]
+    function visit(name)
+        name in done && return
+        name in active && throw(ContractValidationError("[layout] cyclic bound at $name"))
+        push!(active, name)
+        if haskey(byname, name)
+            e = byname[name]
+            for x in (e.lo, e.hi), dep in _value_symbols(x)
+                visit(dep)
+            end
+            push!(out, e)
+        elseif haskey(layout.bound_exprs, name)
+            for dep in _value_symbols(layout.bound_exprs[name])
+                visit(dep)
+            end
+        end
+        delete!(active, name)
+        push!(done, name)
+    end
+    for e in layout.entries
+        visit(e.name)
+    end
+    return out
+end
+
 """
     constrain(layout, unconstrained) -> NamedTuple
 
@@ -1131,7 +1241,9 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     pairs = Pair{Symbol,Any}[]
     coef_groups = _coefficient_groups(layout)
     seen_coef = Set{Symbol}()
-    for e in layout.entries
+    values = Dict{Symbol,Any}()
+    for entry in _bound_entry_order(layout)
+        e = _resolved_entry(layout, entry, values)
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :coefficient
             p = e.predictor::Symbol
@@ -1164,7 +1276,11 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             v = _constrain_elt(e, Float64(only(seg)))
             push!(pairs, e.name => v)
         end
+        lastpair = last(pairs)
+        values[first(lastpair)] = last(lastpair)
     end
+    order = Dict(e.name => i for (i, e) in enumerate(layout.entries))
+    sort!(pairs; by = p -> get(order, first(p), 0))
     for (bname, b) in _varying_corr_draws(layout, u)
         push!(pairs, bname => b)
     end
@@ -1239,7 +1355,8 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
     u = Vector{Float64}(undef, layout.total)
     coef_groups = _coefficient_groups(layout)
     seen_coef = Set{Symbol}()
-    for e in layout.entries
+    for entry in layout.entries
+        e = _resolved_entry(layout, entry, nt)
         if e.kind === :coefficient
             p = e.predictor::Symbol
             p in seen_coef && continue
@@ -1354,7 +1471,10 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
     length(u) == layout.total ||
         throw(ContractValidationError("[layout] unconstrained length $(length(u)) ≠ $(layout.total)"))
     total = 0.0
-    for e in layout.entries
+    values = any(_dynamic_bounds, layout.entries) ?
+        _flat_draw_values(layout, constrain(layout, u)) : NamedTuple()
+    for entry in layout.entries
+        e = _resolved_entry(layout, entry, values)
         e.transform === :identity && continue
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :vector
@@ -1611,6 +1731,13 @@ function _plate_transform_statements(e::LayoutEntry)
                 log.($(e.name) .- $blo) .- log.($bhi .- $(e.name))),
         ]
     end
+    if e.transform === :floored
+        u = Symbol(:_ppl_floor_, e.name)
+        return Expr[
+            :($u::AbstractVector{Float64} = $view_read),
+            :($(e.name)::AbstractVector{Float64} = $(e.lo) .+ exp.($u)),
+        ]
+    end
     if e.transform === :upper
         # Parameterized bound ⇒ not in the (parameterless) bijector registry;
         # hand-rolled broadcast edges over the block view, identical math to the
@@ -1840,10 +1967,8 @@ function jacobian_term(e::LayoutEntry)
             return :(sum(log.($(e.name) .- $blo) .+ log.($bhi .- $(e.name)) .-
                          log($bhi - $blo)))
         end
-        if e.transform === :upper
-            # Stan's upper-bound kernel: the bare unconstrained coordinates
-            # (shared with the constrain edge via structural CSE) — no
-            # truncation normalizer.
+        if e.transform === :upper || e.transform === :floored
+            # Both one-sided exp transforms have the bare-coordinate Jacobian.
             return :(sum($(block_read(e.offset, e.size))))
         end
         e.transform === :exp || e.transform === :logistic ||

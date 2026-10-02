@@ -192,13 +192,12 @@ end
     h = _pv_param(plan, :h)
     @test h.family === :student_t
     @test h.args == (arg1 = 3, arg2 = 0, arg3 = 2)
-    @test h.support_override === :positive
-    @test _pv_param(plan, :l).support_override === :positive
-    @test _pv_param(plan, :g).support_override === :positive
-    @test _pv_param(plan, :n).support_override === :positive
-    @testset "non-zero-location half rejected" begin
-        # capability: truncated(StudentT(nu, mu!=0, s), 0, Inf): general (nonzero-location) truncation (todo `0ze68k8`)
-        @test_broken (lower_rkppl(quote
+    @test h.support_override === (:truncated, 0.0, Inf)
+    @test _pv_param(plan, :l).support_override === (:truncated, 0.0, Inf)
+    @test _pv_param(plan, :g).support_override === (:truncated, 0.0, Inf)
+    @test _pv_param(plan, :n).support_override === (:truncated, 0.0, Inf)
+    @testset "non-zero-location truncation" begin
+        @test (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
@@ -207,9 +206,8 @@ end
                 s ~ Exponential(1)
             end, (:y, :x)); true)
     end
-    @testset "upper-only and finite intervals stay Normal-only" begin
-        # capability: upper-only truncation for non-Normal families (truncated(StudentT, -Inf, 1)) (todo `0ze68k8`)
-        @test_broken (lower_rkppl(quote
+    @testset "upper-only and finite intervals across families" begin
+        @test (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
@@ -217,8 +215,7 @@ end
                 h ~ truncated(StudentT(3, 0, 2), -Inf, 1)
                 s ~ Exponential(1)
             end, (:y, :x)); true)
-        # capability: finite-interval truncation for non-Normal families (truncated(Laplace, -1, 1)) (todo `0ze68k8`)
-        @test_broken (lower_rkppl(quote
+        @test (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x

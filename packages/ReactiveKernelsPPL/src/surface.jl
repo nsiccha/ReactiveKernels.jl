@@ -11711,8 +11711,9 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
             rhs.args[1] isa Symbol || return rhs
         if rhs.args[1] === :truncated && length(rhs.args) == 4
             inner = hoist_call(lhs, rhs.args[2])
-            inner === rhs.args[2] && return rhs
-            return Expr(:call, :truncated, inner, rhs.args[3:end]...)
+            bounds = hoist_args(lhs, rhs.args[3:end])
+            inner === rhs.args[2] && bounds == rhs.args[3:end] && return rhs
+            return Expr(:call, :truncated, inner, bounds...)
         end
         rhs.args[1] in _HOIST_FAMILIES || return rhs
         args = rhs.args[2:end]
@@ -11764,6 +11765,7 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :LogNormal => :lognormal, :Beta => :beta,
     :InverseGamma => :inverse_gamma, :StudentT => :student_t,
     :Laplace => :laplace, :Logistic => :logistic, :Uniform => :uniform,
+    :Weibull => :weibull,
 )
 
 # Families whose positional prior arguments hoist (scalar `~` and per-cell
@@ -11813,7 +11815,9 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
             haskey(coefuse, s.lhs) && _sfail(
                 "$(s.lhs) is a predictor coefficient and cannot also be " *
                 "a Dirichlet parameter")
-            push!(vectors, _lower_dirichlet(s.lhs, s.rhs))
+            p = _lower_dirichlet(s.lhs, s.rhs)
+            push!(vectors, p)
+            union!(syms, _value_symbols(p.args.arg1))
             continue
         end
         if _is_lkj_factor_call(s.rhs)
@@ -11845,8 +11849,8 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
         end
         p = _lower_parameter(s.lhs, s.rhs, coefuse, ctx.matrices)
         push!(params, p)
-        for v in values(p.args)
-            v isa Symbol && push!(syms, v)
+        for v in (values(p.args)..., _support_args(p.support_override)...)
+            union!(syms, _value_symbols(v))
         end
     end
     return params, syms, vectors, arrays
@@ -12148,35 +12152,20 @@ _is_dirichlet_call(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
     rhs.args[1] === :Dirichlet
 
-# Simplex parameter: `s ~ Dirichlet(alpha)` (a literal concentration
-# vector) or symmetric `s ~ Dirichlet(K, a)` — SB's two constructor
-# forms, resolved here to a frozen concentration vector (concentrations
-# are hyperparameters: data columns and sampled/model-dependent args
-# fail closed — planned).
+# Concentrations are ordinary values; the simplex dimension is structural
+# and is inferred at bind from their shape.
 function _lower_dirichlet(lhs, rhs)
     args = _plain_args(rhs, "`Dirichlet`")
-    alpha = if length(args) == 1
-        a = only(args)
-        a isa Expr && a.head === :vect && !isempty(a.args) &&
-            all(x -> x isa Real, a.args) ||
-            _sfail("parameter $lhs: `Dirichlet(alpha)` takes a literal " *
-                   "concentration vector (`Dirichlet([1.0, 2.0])`) or " *
-                   "symmetric `Dirichlet(K, a)`, got $(repr(a))")
-        Vector{Float64}(a.args)
-    elseif length(args) == 2
-        K, a = args
-        (K isa Integer && K >= 1 && a isa Real) ||
-            _sfail("parameter $lhs: symmetric `Dirichlet(K, a)` takes a " *
-                   "positive integer dimension and a real concentration, got " *
-                   "($(repr(K)), $(repr(a)))")
-        fill(Float64(a), Int(K))
+    a = _mv_slice_args(Val(:Dirichlet), "parameter $lhs", args).arg1
+    alpha = if a isa Expr && a.head === :vect && all(x -> x isa Real, a.args)
+        Float64.(a.args)
+    elseif _is_fill_call(a) && a.args[2] isa Real
+        fill(Float64(a.args[2]), a.args[3])
     else
-        _sfail("parameter $lhs: `Dirichlet` takes a concentration vector " *
-               "`Dirichlet(alpha)` or symmetric `Dirichlet(K, a)`, got " *
-               "$(length(args)) arguments")
+        a
     end
-    return VectorParameter(lhs, :simplex_dirichlet, (arg1 = alpha,), nothing,
-        lhs)
+    size = _is_fill_call(alpha) ? alpha.args[3] : nothing
+    return VectorParameter(lhs, :simplex_dirichlet, (arg1 = alpha,), size, lhs)
 end
 
 _is_ordered_call(rhs) =
@@ -12360,7 +12349,7 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
     haskey(_PARAM_FAMILIES, fam) ||
         _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
                "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
-               "Beta, InverseGamma, StudentT, Laplace, Logistic, Uniform, " *
+               "Beta, InverseGamma, StudentT, Laplace, Logistic, Uniform, Weibull, " *
                "HalfNormal, HalfCauchy, Flat, " *
                "Dirichlet, LKJCovarianceFactor, truncated). If `$fam` is " *
                "meant as a submodel, define it with " *
@@ -12554,97 +12543,33 @@ const _TRUNCATED_BASES = Dict{Symbol,Tuple{Int,Int}}(
     :Laplace => (2, 1), :Logistic => (2, 1),
 )
 
-# Parameter truncation lowers to a support override: `truncated(Base(0, s),
-# 0, Inf)` (a half at a literal-zero location, any symmetric base) →
-# `:positive` (exact +log(2)); an upper-only `truncated(Normal(mu, s),
-# -Inf, hi)` → `(:upper, hi)` (Stan's upper-bound kernel `x = hi - exp(u)`,
-# bare-`u` Jacobian, NO truncation renormalizer — Normal-only, any
-# location); and a two-sided FINITE `truncated(Normal(mu, s), lo, hi)` →
-# `(:interval, lo, hi)` (an affine-logistic constrained transform with the
-# exact -log(cdf(hi)-cdf(lo)) renormalization; Normal-only, any location).
-# Bounds are literals.
+# Truncation keeps the base density and its authored bounds together. The
+# layout intersects them with the base support; the prior subtracts the
+# probability of precisely that interval (Distributions semantics).
 function _lower_truncated_param(lhs, rhs, coefuse, matrices)
     args = _plain_args(rhs, "`truncated`")
-    length(args) == 3 || _sfail("parameter $lhs: use the Distributions.jl " *
-                                "object form `truncated(Normal(mu, s), lo, hi)`")
-    obj, lo_a, hi_a = args
-    obj isa Expr && obj.head === :call || _sfail(
-        "parameter $lhs: `truncated` wraps a distribution object, got " *
-        "$(repr(obj))")
-    fam = obj.args[1]
-    fam === :LogNormal && return _lower_truncated_lognormal(lhs, obj, lo_a,
-        hi_a, coefuse, matrices)
-    haskey(_TRUNCATED_BASES, fam) || _sfail(
-        "parameter $lhs: `truncated` wraps a symmetric base " *
-        "(`truncated(Normal(mu, s), lo, hi)`; admitted: Normal, Cauchy, " *
-        "StudentT, Laplace, Logistic); got $fam")
-    want, locpos = _TRUNCATED_BASES[fam]
-    oargs = _plain_args(obj, "`$fam`")
-    length(oargs) == want ||
-        _sfail("parameter $lhs: `$fam` takes $want arguments")
-    vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in oargs]
-    base = _PARAM_FAMILIES[fam]
-    tkeys = ntuple(i -> Symbol(:arg, i), length(vals))
-    targs = NamedTuple{tkeys}(Tuple(vals))
-    lo = _truncation_bound(lhs, lo_a)
-    hi = _truncation_bound(lhs, hi_a)
-    lo < hi || _sfail("parameter $lhs: truncation needs lower < upper, " *
-                      "got ($lo, $hi)")
-    # Half-truncation [0, Inf) at a literal-zero location → the exact +log(2) case.
-    if lo == 0 && isinf(hi) && hi > 0
-        (oargs[locpos] isa Real && oargs[locpos] == 0) || _sfail(
-            "parameter $lhs: a `truncated(_, 0, Inf)` half needs a literal zero " *
-            "location (a Normal half spells `HalfNormal(s)`); a non-zero " *
-            "location needs finite bounds (`truncated(Normal(mu, s), lo, hi)`)")
-        return SampledParameter(lhs, base, targs, :positive, lhs)
+    length(args) == 3 || _sfail("parameter $lhs: use " *
+        "`truncated(D(args...), lo, hi)`")
+    obj, lower, upper = args
+    obj isa Expr && obj.head === :call || _sfail("parameter $lhs: " *
+        "`truncated` wraps a distribution object, got $(repr(obj))")
+    base = _lower_parameter(lhs, obj, coefuse, matrices)
+    base.family === :flat && _sfail("parameter $lhs: `truncated` needs a " *
+        "proper distribution; bound an improper prior with `Flat` instead")
+    base.support_override in (nothing, :positive) || _sfail("parameter " *
+        "$lhs: nested truncations are not yet supported")
+    bound(a) = a isa Symbol && a !== :Inf ?
+        _lower_param_arg(lhs, a, coefuse, matrices) : _truncation_bound(lhs, a)
+    lo, hi = bound(lower), bound(upper)
+    if lo isa Real && hi isa Real
+        lo < hi || _sfail("parameter $lhs: truncation needs lower < upper, " *
+            "got ($lo, $hi)")
     end
-    # Upper-only truncation → Stan's upper-bound kernel (Normal-only in
-    # slice 1). A finite LOWER-only bound stays rejected (no one-sided
-    # lower support exists on the scalar path yet).
-    if isinf(lo) && lo < 0 && isfinite(hi)
-        fam === :Normal || _sfail(
-            "parameter $lhs: an upper-only truncation is Normal-only in slice 1 " *
-            "(`truncated(Normal(mu, s), -Inf, hi)`); got $fam")
-        return SampledParameter(lhs, base,
-            (arg1 = vals[1], arg2 = vals[2]), (:upper, hi), lhs)
-    end
-    # Two-sided FINITE interval → affine-logistic transform + truncated-Normal
-    # renormalization (Normal-only in slice 1).
-    (isfinite(lo) && isfinite(hi)) || _sfail(
-        "parameter $lhs: one-sided truncation is slice-1 only as `[0, Inf)` at a " *
-        "zero location (`HalfNormal(s)`) or upper-only " *
-        "(`truncated(Normal(mu, s), -Inf, hi)`); use finite bounds " *
-        "(`truncated(Normal(mu, s), lo, hi)`) otherwise")
-    fam === :Normal || _sfail(
-        "parameter $lhs: a finite truncated interval is Normal-only in slice 1 " *
-        "(`truncated(Normal(mu, s), lo, hi)`); got $fam")
-    return SampledParameter(lhs, base,
-        (arg1 = vals[1], arg2 = vals[2]), (:interval, lo, hi), lhs)
-end
-
-# A lower-only truncation of a positive-support base,
-# `truncated(LogNormal(m, s), lo, Inf)` (user decision `0z5bsqi`, prong
-# `floor`: the subset the HSGP validity floor needs ahead of the general
-# `truncated` lane): `x = lo + exp(u)`, renormalized as in Distributions
-# (`-log P(X > lo)`). `lo` is a non-negative literal or the name of a
-# model-level data value (`rho_floor = maximum(hsgp_rho_floors(lambda))`),
-# read from the bound data.
-function _lower_truncated_lognormal(lhs, obj::Expr, lo_a, hi_a, coefuse,
-        matrices)
-    oargs = _plain_args(obj, "`LogNormal`")
-    length(oargs) == 2 ||
-        _sfail("parameter $lhs: `LogNormal` takes 2 arguments")
-    vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in oargs]
-    hi = _truncation_bound(lhs, hi_a)
-    isinf(hi) && hi > 0 || _sfail("parameter $lhs: a truncated LogNormal " *
-        "takes `Inf` as its upper bound (`truncated(LogNormal(m, s), lo, " *
-        "Inf)`), got $(repr(hi_a))")
-    lo = lo_a isa Symbol && lo_a !== :Inf ? lo_a : _truncation_bound(lhs, lo_a)
-    lo isa Symbol || (isfinite(lo) && lo >= 0) || _sfail("parameter $lhs: " *
-        "a truncated LogNormal's lower bound is a finite non-negative " *
-        "literal or a data name, got $(repr(lo_a))")
-    return SampledParameter(lhs, :lognormal, (arg1 = vals[1], arg2 = vals[2]),
-        (:lower, lo isa Symbol ? lo : Float64(lo)), lhs)
+    # Truncating a half is the same normalized base on the intersection.
+    base.support_override === :positive &&
+        (lo = lo isa Real ? max(0.0, lo) : Expr(:call, :max, 0.0, lo))
+    return SampledParameter(lhs, base.family, base.args,
+        (:truncated, lo, hi), lhs)
 end
 
 function _lower_assignment(nm, rhs, coefuse)

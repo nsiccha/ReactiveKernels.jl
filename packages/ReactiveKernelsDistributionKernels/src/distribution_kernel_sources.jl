@@ -174,12 +174,14 @@ using LogExpFunctions: log1pexp
 @kernel standard_normal() = begin
     logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
     cdf(z::Float64)::Float64 = 0.5 * erfc(-z / sqrt(2))
+    ccdf(z::Float64)::Float64 = 0.5 * erfc(z / sqrt(2))
     quantile(p::Float64)::Float64 = -sqrt(2) * erfcinv(2p)
 end
 
 @kernel standard_cauchy() = begin
     logpdf(z::Float64)::Float64 = -log(π) - log1p(z^2)
     cdf(z::Float64)::Float64 = 0.5 + atan(z) / π
+    ccdf(z::Float64)::Float64 = 0.5 - atan(z) / π
     quantile(p::Float64)::Float64 = tanpi(p - 0.5)
 end
 
@@ -187,6 +189,8 @@ end
     logpdf(z::Float64)::Float64 = -log(2) - abs(z)
     cdf(z::Float64)::Float64 =
         ifelse(z < 0, 0.5 * exp(z), 1 - 0.5 * exp(-z))
+    ccdf(z::Float64)::Float64 =
+        z >= 0 ? 0.5 * exp(-z) : 1 - 0.5 * exp(z)
     quantile(p::Float64)::Float64 =
         ifelse(p < 0.5, log(2p), -log(2 - 2p))
 end
@@ -205,6 +209,10 @@ end
         half_tail::Float64 = 0.5 * rk_beta_inc(nu / 2, 0.5, nu / (nu + z^2))
         ifelse(z <= 0, half_tail, 1 - half_tail)
     end
+    ccdf(z::Float64)::Float64 = begin
+        half_tail::Float64 = 0.5 * rk_beta_inc(nu / 2, 0.5, nu / (nu + z^2))
+        ifelse(z >= 0, half_tail, 1 - half_tail)
+    end
     quantile(p::Float64)::Float64 = begin
         lower::Bool = p < 0.5
         tail::Float64 = ifelse(lower, p, 1 - p)
@@ -221,6 +229,7 @@ end
 @kernel standard_logistic() = begin
     logpdf(z::Float64)::Float64 = -z - 2 * log1pexp(-z)
     cdf(z::Float64)::Float64 = 1 / (1 + exp(-z))
+    ccdf(z::Float64)::Float64 = 1 / (1 + exp(z))
     quantile(p::Float64)::Float64 = log(p) - log1p(-p)
 end
 
@@ -237,6 +246,10 @@ end
     cdf(x::Float64)::Float64 = begin
         z::Float64 = standardized(x)
         standard.cdf(z)
+    end
+    ccdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard.ccdf(z)
     end
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard.quantile(p)
@@ -267,6 +280,10 @@ end
     cdf(x::Float64)::Float64 = begin
         z::Float64 = standardized(x)
         standard_student_t(nu).cdf(z)
+    end
+    ccdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard_student_t(nu).ccdf(z)
     end
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard_student_t(nu).quantile(p)
@@ -380,6 +397,8 @@ const LOGNORMAL_KERNEL_SOURCE = raw"""
         standard_cdf::Float64 = standard_normal.cdf(z)
         valid ? standard_cdf : 0.0
     end
+    ccdf(x::Float64)::Float64 =
+        x > 0 ? standard_normal.ccdf((log(x) - location) / scale) : 1.0
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard_normal.quantile(p)
         inv(standardized_log, z)
@@ -394,6 +413,7 @@ const EXPONENTIAL_KERNEL_SOURCE = raw"""
     logpdf(x::Float64)::Float64 =
         ifelse(x >= 0, -log_scale - x / scale, -Inf)
     cdf(x::Float64)::Float64 = ifelse(x >= 0, -expm1(-x / scale), 0.0)
+    ccdf(x::Float64)::Float64 = x >= 0 ? exp(-x / scale) : 1.0
     quantile(p::Float64)::Float64 = -scale * log1p(-p)
 end
 """
@@ -429,6 +449,8 @@ const UNIFORM_KERNEL_SOURCE = raw"""
         within::Float64 = (x - lower) / width
         ifelse(x < lower, 0.0, ifelse(x >= upper, 1.0, within))
     end
+    ccdf(x::Float64)::Float64 =
+        x < lower ? 1.0 : (x >= upper ? 0.0 : (upper - x) / width)
     quantile(p::Float64)::Float64 = lower + p * width
 end
 """
@@ -558,6 +580,8 @@ using SpecialFunctions: gamma_inc, gamma_inc_inv
             -Inf
     cdf(x::Float64)::Float64 =
         x > 0 ? first(gamma_inc(shape, rate * x)) : 0.0
+    ccdf(x::Float64)::Float64 =
+        x > 0 ? last(gamma_inc(shape, rate * x)) : 1.0
     quantile(p::Float64)::Float64 = gamma_inc_inv(shape, p, 1 - p) / rate
 end
 """
@@ -575,6 +599,8 @@ using SpecialFunctions: beta_inc, beta_inc_inv
             -Inf
     cdf(x::Float64)::Float64 =
         x <= 0 ? 0.0 : (x >= 1 ? 1.0 : first(beta_inc(a, b, x)))
+    ccdf(x::Float64)::Float64 =
+        x <= 0 ? 1.0 : (x >= 1 ? 0.0 : last(beta_inc(a, b, x)))
     quantile(p::Float64)::Float64 = first(beta_inc_inv(a, b, p, 1 - p))
 end
 """
@@ -690,6 +716,8 @@ const WEIBULL_KERNEL_SOURCE = raw"""
     end
     cdf(x::Float64)::Float64 =
         x > 0 ? -expm1(-((x * inv_theta)^k)) : 0.0
+    ccdf(x::Float64)::Float64 =
+        x > 0 ? exp(-((x * inv_theta)^k)) : 1.0
     quantile(p::Float64)::Float64 = theta * (-log1p(-p))^(1 / k)
 end
 """
@@ -736,6 +764,8 @@ using SpecialFunctions: gamma_inc, gamma_inc_inv
             -Inf
     cdf(x::Float64)::Float64 =
         x > 0 ? last(gamma_inc(shape, scale / x)) : 0.0
+    ccdf(x::Float64)::Float64 =
+        x > 0 ? first(gamma_inc(shape, scale / x)) : 1.0
     quantile(p::Float64)::Float64 = scale / gamma_inc_inv(shape, 1 - p, p)
 end
 """
