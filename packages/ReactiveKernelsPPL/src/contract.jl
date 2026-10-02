@@ -10113,10 +10113,10 @@ whole-context definitions (whose values may have any length too)."""
 function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
     append!(defs, Pair{Symbol,Any}[d.name => d.expr for d in plan.derived])
-    # A scalar prior's arguments and a Dirichlet concentration are whole
-    # model values. Propagate that context through their definitions just
-    # as for a module-call argument; their raw data have no observation axis.
-    for p in plan.parameters
+    # Scalar and declared-array prior arguments are whole model values.
+    # Propagate that context through their definitions just as for a
+    # module-call argument; their raw data have no observation axis.
+    for ps in (plan.parameters, plan.array_parameters), p in ps
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
             Expr(:tuple, values(p.args)..., _support_args(p.support_override)...))
     end
@@ -10143,6 +10143,11 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
             for p in plan.vector_parameters
                 delete!(free, p.name)
                 p.family === :simplex_dirichlet || _drop_held_names!(free, p.args)
+            end
+        elseif f === :array_parameters
+            for p in plan.array_parameters
+                delete!(free, p.name)
+                _drop_held_names!(free, p.dims)
             end
         else
             _drop_held_names!(free, getfield(plan, f))
