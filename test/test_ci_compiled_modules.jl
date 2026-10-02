@@ -36,7 +36,10 @@ end
     @test !occursin("JULIA_PKG_PRECOMPILE_AUTO", package_matrix)
     @test !occursin("JULIA_PKG_PRECOMPILE_AUTO", workflow)
     @test !occursin("JULIA_DEPOT_PATH", workflow)
-    @test occursin("cancel-in-progress: true", workflow)
+    # Branch runs must finish; only superseded pull-request runs are cancelled.
+    @test occursin(
+        r"(?m)^  cancel-in-progress: \$\{\{ startsWith\(github\.ref, 'refs/pull/'\) \}\}$",
+        workflow)
     @test occursin("timeout-minutes: 90", package_matrix)
 
     matrix_rows = Set(
