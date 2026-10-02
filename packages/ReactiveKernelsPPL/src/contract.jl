@@ -2264,6 +2264,13 @@ plus two-argument `logaddexp` for occupancy marginalization)."""
 const ELEMENTWISE_FNS =
     (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :logaddexp)
 
+"""Operand count of a built-in elementwise map (`ifelse.(c, x, y)`,
+`logaddexp.(a, b)`; every other one takes one)."""
+const ELEMENTWISE_FN_ARITY = Dict{Symbol,Int}(:ifelse => 3, :logaddexp => 2)
+_elementwise_arity(f::Symbol) = get(ELEMENTWISE_FN_ARITY, f, 1)
+_operands_phrase(n::Int) = ("one", "two", "three")[n] *
+    (n == 1 ? " operand" : " operands")
+
 """Families the thin layer can lower (ext handshake predicate)."""
 admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
@@ -5694,13 +5701,9 @@ function _collect_vector_dot!(refs, ex, plan, label, bound::Bool)
         "Julia functions are planned (no-@deffun-ceremony direction) but " *
         "need IR/contract growth",
     )
-    if f === :logaddexp
-        length(args) == 2 ||
-            _fail(label, "`logaddexp.` takes exactly two arguments")
-    else
-        length(args) == 1 ||
-            _fail(label, "`$f.` takes exactly one argument")
-    end
+    length(args) == _elementwise_arity(f) || _fail(label, "`$f.` takes " *
+        "exactly $(_elementwise_arity(f) == 2 ? "two arguments" :
+            "one argument")")
     _check_numeric_position!(args, plan, label, bound)
     for arg in args
         _collect_vector_refs!(refs, arg, plan, label, bound)
@@ -6530,16 +6533,29 @@ end
 const _COMPOSED_OPS = (:.*, :.+, :.-)
 # Elementwise unary maps admitted over a composed subtree (`exp.(la)` —
 # the IRT discrimination `a = exp(log_a)`; `logistic.(xi)` — sigmoid
-# transient/saturating curves), spelled as Julia dotted calls.
+# transient/saturating curves), spelled as Julia dotted calls. At a
+# location, one of these over ONE bare sub-predictor is a link spelling.
 const _COMPOSED_UNARY = (:exp, :logistic)
+# The other dotted operators (`mu ./ s`, `mu .^ 2`, comparisons for
+# `ifelse.`): plain broadcast math over the LP nodes.
+const _COMPOSED_MORE_OPS = Tuple(op for op in ELEMENTWISE_OPS
+    if op ∉ _COMPOSED_OPS)
+# Every elementwise map a composed tree admits: the link-shaped unary
+# maps, the dotted built-in math functions, `ifelse.`, and any dotted
+# function visible in the model module (a `GlobalRef` head after
+# resolution — functions as values: `hypot.(s1, mu .* s2)`).
+_composed_map_fn(f) = f isa GlobalRef || f === :ifelse ||
+    f in _COMPOSED_UNARY || f in ELEMENTWISE_FNS
 const _COMPOSED_AFFINE_KINDS =
     (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
 # Sub-predictors are affine plus varying-effect summands (per-level
 # random effects: the IRT person ability `theta ~ 0 + (1 | person)`).
 const _COMPOSED_SUB_KINDS = (_COMPOSED_AFFINE_KINDS..., VaryingEffectTerm)
 
-"""Recurse a composed tree: leaves must be declared subs/scalars, nodes
-dotted `.*`/`.+`/`.−` of matching arity. Returns the leaf set."""
+"""Recurse a composed tree: leaves must be declared subs/scalars/data
+columns (a literal arrives as a named scalar leaf), nodes dotted
+operators of matching arity or admitted elementwise maps
+(`_composed_map_fn`). Returns the leaf set."""
 function _validate_composed_tree(tree, subs::Vector{Symbol},
         scalars::Vector{Symbol}, label::Symbol,
         datas::Vector{Symbol} = Symbol[])
@@ -6556,22 +6572,26 @@ function _validate_composed_tree(tree, subs::Vector{Symbol},
         end
         if node isa Expr && node.head === :. && length(node.args) == 2
             f, tup = node.args
-            f in _COMPOSED_UNARY || _fail(label,
-                "composed tree map $(repr(f)). is not admitted (v2: " *
-                "$(join(string.(_COMPOSED_UNARY, "."), ", ")))")
-            Meta.isexpr(tup, :tuple, 1) || _fail(label,
-                "composed tree map $f. takes one operand, got " *
-                "$(repr(node))")
-            walk(only(tup.args))
+            _composed_map_fn(f) || _fail(label,
+                "composed tree map $(repr(f)). is not admitted (" *
+                "$(join(string.(_COMPOSED_UNARY, "."), ", ")), the dotted " *
+                "built-in math functions, `ifelse.`, or a module function)")
+            Meta.isexpr(tup, :tuple) && !isempty(tup.args) || _fail(label,
+                "composed tree map $f. takes operands, got $(repr(node))")
+            f isa Symbol && length(tup.args) != _elementwise_arity(f) &&
+                _fail(label, "composed tree map $f. takes " *
+                    "$(_operands_phrase(_elementwise_arity(f))), got " *
+                    "$(repr(node))")
+            foreach(walk, tup.args)
             return nothing
         end
         node isa Expr && node.head === :call && !isempty(node.args) &&
             node.args[1] isa Symbol || _fail(label,
                 "composed tree node $(repr(node)) is not a dotted call " *
-                "(v1: `. .*`/`.+`/`.−` over sub-predictors and scalars)")
+                "(dotted operators and maps over sub-predictors and scalars)")
         op = node.args[1]
-        op in _COMPOSED_OPS || _fail(label,
-            "composed tree op $op is not admitted (v1: `. .*`, `.+`, `.−`)")
+        op in _COMPOSED_OPS || op in _COMPOSED_MORE_OPS || _fail(label,
+            "composed tree op $op is not admitted (dotted operators only)")
         args = node.args[2:end]
         if op === :.-
             length(args) == 1 || length(args) == 2 ||
@@ -10074,8 +10094,12 @@ end
 
 # Drop from `out` every Symbol `x` holds, at any depth.
 _drop_held_names!(out::Set{Symbol}, x::Symbol) = (delete!(out, x); nothing)
+# A `GlobalRef` names a module function (a composed tree's dotted map),
+# never a model name; its binding is cyclic, so the struct walk below
+# must not enter it.
 _drop_held_names!(::Set{Symbol},
-    ::Union{Number,AbstractString,Function,Module,Type,AbstractArray{<:Number}}) =
+    ::Union{Number,AbstractString,Function,Module,Type,GlobalRef,
+        AbstractArray{<:Number}}) =
     nothing
 function _drop_held_names!(out::Set{Symbol},
         x::Union{AbstractArray,Tuple,NamedTuple,AbstractSet})
