@@ -1032,7 +1032,7 @@ end
 # (G×K), SB `(diag_pre_multiply(tau,L)*z)'` with `z_flat` in SB
 # column-major order. Sibling entries are found by the canonical
 # `_varying_corr_names` spelling (`L_<s>` → `tau_<s>` /
-# `z_flat_<s>`, or `b_flat_<s>` for the centered kind), never by
+# `z_flat_<s>`), never by
 # adjacency, so entry-order changes cannot miswire it — and only among
 # `:varying` entries, the kind that varying-draws blocks alone pack, so
 # an author's parameter spelled like a sibling (`b_flat_g ~ ...` beside
@@ -1064,17 +1064,6 @@ function _varying_corr_draws(layout::LayoutTable, u::AbstractVector{<:Real})
         e.kind === :varying_corr || continue
         sfx = string(e.name)[3:end]
         tau_e = get(byname, Symbol("tau_", sfx), nothing)
-        b_e = get(byname,Symbol("b_flat_",sfx),nothing)
-        if b_e !== nothing
-            tau_e !== nothing || throw(ContractValidationError(
-                "[layout] centered LKJ entry $(e.name) has no tau sibling"))
-            K = _lkj_dim(e.size)
-            b_e.size % K == 0 || throw(ContractValidationError(
-                "[layout] centered b_flat length is not a multiple of K=$K"))
-            b = Float64.(u[b_e.offset:(b_e.offset+b_e.size-1)])
-            push!(out,Symbol("b_",sfx)=>Matrix(reshape(b,K,b_e.size÷K)'))
-            continue
-        end
         z_e = get(byname, Symbol("z_flat_", sfx), nothing)
         if tau_e === nothing || z_e === nothing
             _stratified_draws_refusal(e.name, sfx, byname)

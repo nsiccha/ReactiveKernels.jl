@@ -2271,17 +2271,16 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
     pos = Any[]
     eta = 1.0
     eta_given = false
-    centered = false
     levels = nothing
     sd_raw = nothing
     for a in call.args[2:end]
         if a isa Expr && a.head === :parameters
             for kw in a.args
                 kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where takes keywords `eta`/`levels`/`sd`/`centered` only")
+                    _sfail("$where takes keywords `eta`/`levels`/`sd` only")
                 kw.args[1] === :eta || kw.args[1] === :levels ||
-                    kw.args[1] === :sd || kw.args[1] === :centered ||
-                    _sfail("$where takes keywords `eta`/`levels`/`sd`/`centered` only, got " *
+                    kw.args[1] === :sd ||
+                    _sfail("$where takes keywords `eta`/`levels`/`sd` only, got " *
                           "`$(kw.args[1])`")
                 if kw.args[1] === :eta
                     v = kw.args[2]
@@ -2291,9 +2290,6 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
                     eta_given = true
                 elseif kw.args[1] === :sd
                     sd_raw = kw.args[2]
-                elseif kw.args[1] === :centered
-                    kw.args[2] isa Bool || _sfail("$where centered must be a Bool literal")
-                    centered = kw.args[2]
                 else
                     levels = _lower_grouping_levels(kw.args[2], where)
                 end
@@ -2351,11 +2347,6 @@ function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
               "hardcodes `lkj_corr_cholesky(1.)`), got $eta")
     eta > 0 || _sfail("$where eta must be positive, got $eta")
     kind = :correlated
-    if centered
-        mm === nothing && strata === nothing ||
-            _sfail("$where centered draws require plain grouping")
-        kind = :centered_correlated
-    end
     suffix = string(group)
     if suffix in used_suffixes
         suffix = string(group) * "_" * string(lhs)

@@ -107,6 +107,13 @@ and, for correlated margins, `b_L`. Centered entries expose `b_c` instead of
 `b_z`; their coordinates are the coefficients themselves, so their densities
 at a packed point differ from the non-centered entries.
 
+Centered correlated coefficients use ordinary row priors:
+`eachrow(B[levels(g), 1:K]) .~ MvNormalCholesky(mu, F)`, with a K-vector
+mean `mu` and lower-triangular covariance factor `F`. Read their effects as
+`B[g, 1] .+ x .* B[g, 2]`. The legacy `varying_draws` / `varying_effect`
+keywords are `eta`, `levels`, and `sd`; centered coefficients are declared
+through array priors or the centered library entries above.
+
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("27_varying_slope_lib.jl", :rkppl_varying_slope)
 ```
