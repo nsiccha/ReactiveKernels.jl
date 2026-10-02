@@ -2747,6 +2747,25 @@ struct _ExternalizedBoundArrayCall{F,O,I,H}
     ops::O
 end
 
+# Build a call to the existing body without the RGF vararg wrapper, which
+# packs all operands into one tuple. Keeping readonly structured operands
+# beside live storage in that temporary obscures their activity. This changes
+# only the call boundary, not the generated model body or its operands.
+function _native_body_call_expr(::Type{F}, f, ops, args) where {F}
+    if F <: RuntimeGeneratedFunctions.RuntimeGeneratedFunction
+        return :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+            $f, $ops, $(args...)))
+    elseif F <: _PrecompileWarmFunction
+        # Preserve latest-world execution while building a consumer image;
+        # after loading it, enter the wrapped generated body directly.
+        direct = :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+            getfield($f, :f), $ops, $(args...)))
+        return :(ccall(:jl_generating_output, Cint, ()) == 0 ?
+                 $direct : $f($ops, $(args...)))
+    end
+    :($f($ops, $(args...)))
+end
+
 @generated function (call::_ExternalizedBoundArrayCall{F,O,I,H})(
         args::Vararg{Any,N}) where {F,O,I,H,N}
     external_count = length(I)
@@ -2755,8 +2774,8 @@ end
         "externalized bound-array call is missing hidden operands")))
     if H
         forwarded = Any[:(getfield(args,$index)) for index in 1:N]
-        return :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
-            getfield(call,:f),getfield(call,:ops),$(forwarded...)))
+        return _native_body_call_expr(
+            F, :(getfield(call,:f)), :(getfield(call,:ops)), forwarded)
     end
     replacements = Dict(index => slot for (slot, index) in enumerate(I))
     operations = Any[]
@@ -2772,7 +2791,8 @@ end
     end
     public_args = Any[
         :(getfield(args, $index)) for index in 1:public_count]
-    :(getfield(call, :f)(($(operations...),), $(public_args...)))
+    _native_body_call_expr(
+        F, :(getfield(call, :f)), Expr(:tuple, operations...), public_args)
 end
 
 """
