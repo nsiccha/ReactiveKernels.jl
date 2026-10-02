@@ -502,30 +502,25 @@ function build_linear_pk_schedule(
         n_grouped_dose_events, n_segments)
 end
 
-"""Zero-effect reference dose for the event-axis log-dose column (SB
-`_LINEAR_PK_V6_LOG_REF_DOSE`, verbatim): 10,000 is the zero-effect
-reference and 200,000 maps to twice the raw slope."""
-const _PK_LOG_REF_DOSE = log(10_000.0)
-
 """
-    linear_pk_op_log_dose(op_type, op_amount) -> Vector{Float64}
+    linear_pk_op_log_dose(op_type, op_amount; reference_dose = 1) -> Vector
 
-The normalized log-dose event-axis column (SB
-`_linear_pk_dose_event_axis`'s `op_log_dose`, same validations, same
-construction): `log(op_amount) - log(10_000)` on dosing ops over the
-flat subject-blocked op stream. READ ops carry no dose, and `log(0)`
-is `-Inf`, so they take the mean over dosing operations — clamped
-into the observed dosing support (SB's one-ulp guard), hence interior
+The log-dose event-axis column: `log(op_amount) - log(reference_dose)`
+on dosing operations over the flat subject-blocked operation stream.
+The reference dose must be positive and finite; the generic default is one
+in the amount column's units. READ operations carry no dose, so they take
+the mean over dosing operations, clamped into the observed support, hence interior
 by construction, so an `hsgp(op_log_dose)` basis built from the
 column's range never widens. The cell never reads `log_F` on the READ
 branch, so the fill value never enters the likelihood.
 
-Fails closed exactly where SB errors: no dosing operation, a
-non-positive dosing amount, a non-finite column, or a READ fill
-outside the dosing support.
+Rejects an invalid reference dose, no dosing operation, a non-positive
+dosing amount, a non-finite column, or a READ fill outside the dosing support.
 """
 function linear_pk_op_log_dose(op_type::AbstractVector,
-        op_amount::AbstractVector)
+        op_amount::AbstractVector; reference_dose = 1)
+    reference_dose isa Real && isfinite(reference_dose) && reference_dose > 0 ||
+        _pk_sched_fail("the log-dose reference must be positive and finite")
     n = length(op_type)
     length(op_amount) == n ||
         _pk_sched_fail("op_log_dose columns disagree in length " *
@@ -536,7 +531,7 @@ function linear_pk_op_log_dose(op_type::AbstractVector,
     all(>(0.0), op_amount[dosing]) ||
         _pk_sched_fail("a dosing operation has a non-positive amount, so " *
                        "log dose is undefined")
-    dose_log_dose = log.(op_amount[dosing]) .- _PK_LOG_REF_DOSE
+    dose_log_dose = log.(op_amount[dosing]) .- log(reference_dose)
     dose_lo, dose_hi = extrema(dose_log_dose)
     # `sum/length` is `Statistics.mean` verbatim for real vectors (the
     # `_fit_hsgp_bases` precedent); the clamp is SB's one-ulp guard for

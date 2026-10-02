@@ -17,7 +17,7 @@ begin
     log_k21 = b0_k21 .+ b1_k21 .* age_s
     log_ka = b0_ka .+ b1_ka .* age_s
     pk_sched = linear_pk_schedule(obs = (:subj, :time), dose = (:dsubj, :dtime, :damt))
-    log_F = linear_pk_log_f(pk_sched; k = 5)
+    log_F ~ linear_pk_log_f(pk_sched; k = 5)
     read_locs = linear_pk_read_locs(pk_sched, log_F, log_Vc, log_k10, log_k12, log_k21, log_ka)
     conc = read_locs[pk_sched.obs_map]
     @plate for i in eachindex(dv)

@@ -141,7 +141,11 @@ struct RKPPLSubmodel
     argnames::Vector{Symbol}
     body::Expr
     mod::Module
+    kwdefaults::Vector{Pair{Symbol,Any}}
 end
+RKPPLSubmodel(name, argnames, body, mod) =
+    RKPPLSubmodel(name, argnames, body, mod, Pair{Symbol,Any}[])
+_submodel_args(sm::RKPPLSubmodel) = [sm.argnames; first.(sm.kwdefaults)]
 
 """True for the submodel-definition head `sm(args...) = begin ... end`."""
 _is_submodel_def(body) =
@@ -160,16 +164,33 @@ function _submodel_def_expr(def::Expr, mod::Module)
     name = call.args[1]
     name isa Symbol || _sfail("submodel name must be a bare Symbol, got " *
                               "$(repr(name))")
-    argnames = call.args[2:end]
+    argnames = Any[]
+    kwdefaults = Pair{Symbol,Any}[]
+    for a in call.args[2:end]
+        if Meta.isexpr(a, :parameters)
+            for kw in a.args
+                Meta.isexpr(kw, :kw, 2) && kw.args[1] isa Symbol ||
+                    _sfail("submodel `$name` keyword arguments need named defaults")
+                push!(kwdefaults, kw.args[1] => kw.args[2])
+            end
+        else
+            push!(argnames, a)
+        end
+    end
     for a in argnames
         a isa Symbol || _sfail("submodel `$name` positional arguments must " *
                                "be bare Symbols, got $(repr(a))")
     end
+    allnames = [argnames; first.(kwdefaults)]
+    length(unique(allnames)) == length(allnames) ||
+        _sfail("submodel `$name` has duplicate argument names")
     body isa Expr && body.head === :block ||
         _sfail("submodel `$name` body must be a `begin ... end` block")
     argvec = Expr(:vect, [QuoteNode(a) for a in argnames]...)
+    kwvec = Expr(:vect, [:( $(QuoteNode(k)) => $(Meta.quot(v)) )
+        for (k, v) in kwdefaults]...)
     return esc(:($name = $(RKPPLSubmodel)($(QuoteNode(name)), $argvec,
-                                          $(Meta.quot(body)), $mod)))
+                                          $(Meta.quot(body)), $mod, $kwvec)))
 end
 
 """Capture a model block, or define a reusable submodel
@@ -302,6 +323,16 @@ function Base.merge(m::RKPPLModel, override::Expr)
         end
     end
     return RKPPLModel(Expr(:block, out...), m.mod, copy(m.fixed))
+end
+
+# A library body's statements use the same matcher as a top-level model.
+# Keep the return expression last even when merge appends a new statement.
+function Base.merge(sm::RKPPLSubmodel, override::Expr)
+    stmts, ret = _submodel_body_parts(sm)
+    m = merge(RKPPLModel(Expr(:block, stmts...), sm.mod), override)
+    return RKPPLSubmodel(sm.name, copy(sm.argnames),
+        Expr(:block, m.ast.args..., Expr(:return, ret)), sm.mod,
+        copy(sm.kwdefaults))
 end
 
 function Base.merge(m::RKPPLModel, fix::NamedTuple)
@@ -641,6 +672,15 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # kernel cell (lowered late with the plate statements below).
     sample, det, chain = _extract_kernel_cells(sample, det, data)
     chain === nothing || push!(kstmts, (cell = chain,))
+    # Schedule properties outside cells read the same bind products.
+    # Resolve after extracting cells so their existing schedule handles stay
+    # intact. Product lengths remain runtime data.
+    products = Set{Symbol}()
+    schedmap = Dict(s.name => s for s in schedules)
+    det = Pair{Symbol,Any}[nm => _schedule_data_fields(rhs, schedmap, products)
+        for (nm, rhs) in det]
+    data = union(data, products)
+    union!(model_names, products)
     det = Pair{Symbol,Any}[nm => _resolve_module_calls(rhs, mod, model_names,
         "definition `$nm = $(repr(rhs))`") for (nm, rhs) in det]
     # Prior expression arguments hoist to synthetic definitions, resolved
@@ -1160,6 +1200,22 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     _confirm_whole_value_data(plan, rawdata, waived; whole)
     validate_structure(plan)
     return plan
+end
+
+function _schedule_data_fields(ex, schedules, products)
+    ex isa Expr || return ex
+    if Meta.isexpr(ex, :., 2) && ex.args[1] isa Symbol &&
+            haskey(schedules, ex.args[1]) && ex.args[2] isa QuoteNode
+        sched = schedules[ex.args[1]]
+        field = ex.args[2].value
+        field in _sched_materialized_fields(sched) || _sfail(
+            "schedule `$(sched.name)` has no data field `$field`")
+        name = _sched_col_name(sched.name, field)
+        push!(products, name)
+        return name
+    end
+    return Expr(ex.head, (_schedule_data_fields(a, schedules, products)
+        for a in ex.args)...)
 end
 
 # ── Destructuring and in-model data values ───────────────────────────
@@ -1963,6 +2019,7 @@ function _resolve_function_arg(a, mod::Module, names::Set{Symbol}, where)
             where) for p in a.args]...)
     elseif a isa Expr && a.head === :. && length(a.args) == 2 &&
             a.args[2] isa QuoteNode && a.args[2].value isa Symbol
+        a.args[1] isa Symbol && a.args[1] in names && return a
         m = _resolve_module_path(a.args[1], mod, where)
         return _module_binding(m, a.args[2].value, where, repr(a))
     end
@@ -3608,68 +3665,6 @@ _is_event_lp_decl_rhs(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
     rhs.args[1] === :linear_pk_log_f
 
-# `log_F = linear_pk_log_f(sched; k = 5, c = 1.5)`: the default-V2
-# event-axis bioavailability LP (SB `log_F ~ 0 + op_log_dose +
-# hsgp(op_log_dose; k = 5)`) over one declared schedule's op stream.
-# The LHS is the fixed seam name (the per-subject expansion slices
-# the cell-call arg by NAME); the schedule resolves late (any
-# statement order — the contract proves declaration); k/c are
-# validated literals with the V2 defaults. Keywords take `;`-style
-# or bare form (the schedule-decl precedent).
-function _lower_event_lp_decl(lhs::Symbol, rhs::Expr, line::Int,
-        data::Set{Symbol})
-    where = line > 0 ? "event-LP `$lhs` (line $line)" : "event-LP `$lhs`"
-    lhs === EVENT_LP_NAME ||
-        _sfail("$where: the event-LP provider name is fixed to " *
-               "`$(EVENT_LP_NAME)` (SB seam name — the cell call and " *
-               "the per-subject expansion address it by name)")
-    pos = Any[]
-    kws = Any[]
-    for arg in rhs.args[2:end]
-        if arg isa Expr && arg.head === :parameters
-            append!(kws, arg.args)
-        elseif arg isa Expr && arg.head === :kw
-            push!(kws, arg)
-        else
-            push!(pos, arg)
-        end
-    end
-    length(pos) == 1 && pos[1] isa Symbol ||
-        _sfail("$where takes one schedule handle plus `k=`/`c=` " *
-               "keywords, got $(repr(rhs))")
-    sched = pos[1]
-    sched in data &&
-        _sfail("$where takes a declared schedule handle (got bound " *
-               "data `$sched` — pass the `linear_pk_schedule` " *
-               "declaration's name)")
-    k, c = 5, 1.5
-    for kw in kws
-        kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-            _sfail("$where takes `k=`/`c=` keywords only, got $(repr(kw))")
-        key, val = kw.args[1], kw.args[2]
-        if key === :k
-            val isa Integer && !(val isa Bool) ||
-                _sfail("$where `k` is a positive-integer literal " *
-                       "(V2: k = 5, got $(repr(val)))")
-            k = Int(val)
-        elseif key === :c
-            val isa Real ||
-                _sfail("$where `c` is a numeric literal exceeding 1 " *
-                       "(V2: c = 1.5, got $(repr(val)))")
-            c = Float64(val)
-        else
-            _sfail("$where takes `k=`/`c=` keywords only, got `$key=`")
-        end
-    end
-    k >= 2 ||
-        _sfail("$where `k` must be at least 2 (V2: k = 5, got $k)")
-    isfinite(c) && c > 1 ||
-        _sfail("$where `c` must be finite and exceed 1 (V2: c = 1.5, " *
-               "got $(repr(c)))")
-    return LinearPKEventLPSpec(lhs, sched, k, c, nothing,
-        Symbol(:event_lp_, lhs))
-end
-
 # A `:sym`-tuple of bound data columns (parsed `:sym` is a QuoteNode —
 # the `hsgp_basis(:id, ...)` precedent unwraps the same way).
 function _schedule_column_tuple(val, where, key::Symbol, want::Int,
@@ -3813,7 +3808,7 @@ function _lower_grouped_cell(where, result::Symbol, subjects,
         push!(resps, lhs)
     end
     sched_decl = Set{Symbol}(s.name for s in schedules)
-    elp_decl = Set{Symbol}(el.name for el in event_lps)
+    elp_decl = _kernel_cell_event_lp_refs(assignments)
     lpraws = Symbol[]
     extras = Symbol[]
     lpseen = Set{Symbol}()
@@ -3875,21 +3870,9 @@ function _lower_grouped_cell(where, result::Symbol, subjects,
     # Unused schedules fail globally, after all plates lower (v2: a
     # schedule feeds SOME plate's cell — the per-plate check would
     # demand every schedule in every plate).
-    # Event-LP references: a 7-arg call's second arg must name a
-    # declared event-LP; unused declarations fail closed (the
-    # schedule precedent — unfed LPs would sample dead parameters).
-    elpnames = _kernel_cell_event_lp_refs(assignments)
-    declared_elp = Set{Symbol}(el.name for el in event_lps)
-    for e in elpnames
-        e in declared_elp ||
-            _sfail("$where references event-LP `$e`, which is not " *
-                   "declared (`$e = linear_pk_log_f(sched; k = 5)`)")
-    end
-    for el in event_lps
-        el.name in elpnames ||
-            _sfail("$where leaves event-LP `$(el.name)` unused " *
-                   "(declared event-LPs must feed a 7-arg cell call — " *
-                   "typo'd event-LP name?)")
+    for e in _kernel_cell_event_lp_refs(assignments)
+        haskey(ctx.detmap, e) || e in data ||
+            _sfail("$where event-LP `$e` needs a definition or library submodel statement")
     end
     used = [s for s in schedules if s.name in schednames]
     if isempty(used) && length(schedules) == 1
@@ -4368,9 +4351,8 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 continue
             end
             if _is_event_lp_decl_rhs(st.args[2])
-                push!(event_lps, _lower_event_lp_decl(lhs, st.args[2], line,
-                    data))
-                continue
+                _sfail("linear_pk_log_f is a library submodel: use " *
+                    "`$lhs ~ linear_pk_log_f(sched; k = 5)` so every prior is stated")
             end
             if _is_levels_binding_rhs(st.args[2])
                 push!(level_bindings,
@@ -6246,7 +6228,10 @@ function _reserve_submodel_names!(used::Set{Symbol}, ex, mod::Module,
         sm = _resolve_submodel(ex.args[3], mod)
         if sm !== nothing && !(sm in seen)
             push!(seen, sm)
-            union!(used, sm.argnames)
+            union!(used, _submodel_args(sm))
+            for (_, default) in sm.kwdefaults
+                _all_symbols!(used, default)
+            end
             _all_symbols!(used, sm.body)
             _reserve_submodel_names!(used, sm.body, sm.mod, seen)
         end
@@ -6638,23 +6623,28 @@ function _stream_response(sm::RKPPLSubmodel, stmts, ret)
     return stmts[first(hits)]
 end
 
-# Peel a `predictor = name` use-site pin from a submodel call: returns
-# (positional-callargs, pin-or-nothing). `predictor` is the only admitted
-# keyword and only as a bare Symbol; anything else fails naming the call.
+# Bind positional arguments and declared keyword defaults, then peel an
+# optional `predictor = name` use-site pin. Returns (callargs, pin-or-nothing)
+# with the declared keywords following the positional arguments.
 function _peel_predictor_pin(callexpr::Expr, sm::RKPPLSubmodel)
     posargs = Any[]
     pin = nothing
+    keywords = Dict{Symbol,Any}()
     for a in callexpr.args[2:end]
         if a isa Expr && a.head === :parameters
             for kw in a.args
                 kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
                     _sfail("submodel `$(sm.name)`: malformed keyword " *
-                           "$(repr(a)) (submodel calls take " *
-                           "`predictor = name` only)")
+                           "$(repr(a)) (expected `name = value`)")
                 k = kw.args[1]
+                if any(p -> first(p) === k, sm.kwdefaults)
+                    haskey(keywords, k) && _sfail("submodel `$(sm.name)`: duplicate keyword `$k`")
+                    keywords[k] = kw.args[2]
+                    continue
+                end
                 k === :predictor ||
-                    _sfail("submodel `$(sm.name)` takes keyword " *
-                           "`predictor` only, got `$k`")
+                    _sfail("submodel `$(sm.name)`: unknown keyword `$k`; " *
+                           "expected a declared keyword or `predictor = name`")
                 pin === nothing ||
                     _sfail("submodel `$(sm.name)`: duplicate `predictor =` " *
                            "(`$pin` and `$(kw.args[2])` — one pin per call)")
@@ -6668,6 +6658,19 @@ function _peel_predictor_pin(callexpr::Expr, sm::RKPPLSubmodel)
             push!(posargs, a)
         end
     end
+    substitutions = Dict{Symbol,Any}(zip(sm.argnames, posargs))
+    length(posargs) == length(sm.argnames) || _sfail(
+        "submodel `$(sm.name)` expects $(length(sm.argnames)) positional arguments")
+    for (k, default) in sm.kwdefaults
+        value = get(keywords, k) do
+            resolved = _resolve_module_calls(default, sm.mod,
+                Set{Symbol}(_submodel_args(sm)),
+                "submodel `$(sm.name)` keyword default `$k`")
+            _hsubst(resolved, substitutions, Dict{Symbol,Symbol}())
+        end
+        push!(posargs, value)
+        substitutions[k] = value
+    end
     return posargs, pin
 end
 
@@ -6678,7 +6681,8 @@ end
 # bound to a data column.
 function _submodel_substitution(sm::RKPPLSubmodel, stmts, ret, callargs,
         data::Set{Symbol}, ns, keep::AbstractDict)
-    argset = Set{Symbol}(sm.argnames)
+    argnames = _submodel_args(sm)
+    argset = Set{Symbol}(argnames)
     binders = Set{Symbol}()
     defined = Set{Symbol}()   # binders outside a `~` / `.~` LHS
     ids = Set{Symbol}()
@@ -6688,7 +6692,7 @@ function _submodel_substitution(sm::RKPPLSubmodel, stmts, ret, callargs,
         st isa Expr && _collect_basis_ids!(ids, st)
     end
     submap = Dict{Symbol,Any}()
-    for (a, v) in zip(sm.argnames, callargs)
+    for (a, v) in zip(argnames, callargs)
         submap[a] = v
     end
     for nm in sort!(collect(binders); by = string)
@@ -6753,7 +6757,7 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
                "`$(chain[end].name)` calls `$(sm.name)` with a pin inside " *
                "its body")
     end
-    length(callargs) == length(sm.argnames) || _sfail(
+    length(callargs) == length(_submodel_args(sm)) || _sfail(
         "submodel `$(sm.name)` expects $(length(sm.argnames)) argument(s) " *
         "$(Tuple(sm.argnames)), got $(length(callargs)) at `$lhs ~ " *
         "$(sm.name)(...)`")
@@ -6776,7 +6780,7 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
             "observation-stream submodel: end its body by returning a `slot` " *
             "that is the LHS of an internal `slot .~ family.(...)` response. " *
             "`$(sm.name)` returns a value (latent) — use a non-data LHS.")
-        ret in sm.argnames && _sfail("stream submodel `$(sm.name)`: the " *
+        ret in _submodel_args(sm) && _sfail("stream submodel `$(sm.name)`: the " *
             "response slot `$ret` is an argument — the slot is a local name " *
             "the use-site data column replaces")
     else
@@ -6799,7 +6803,7 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     # (functions as values); resolution precedes substitution (`GlobalRef`
     # heads and function values pass `_hsubst` intact).
     bodynames = Set{Symbol}(k for k in keys(submap) if k isa Symbol)
-    union!(bodynames, sm.argnames)
+    union!(bodynames, _submodel_args(sm))
     out = Any[_hsubst(_resolve_submodel_stmt(st, sm, bodynames), submap, idmap)
         for st in stmts]
     # Latent: bind the LHS to the return value. Stream: the response IS the
@@ -6814,7 +6818,7 @@ function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol})
     (st isa Expr && st.head === :(=) && length(st.args) == 2 &&
         st.args[1] isa Symbol) || return st
     rhs = st.args[2]
-    (_is_schedule_decl_rhs(rhs) || _is_event_lp_decl_rhs(rhs) ||
+    (_is_schedule_decl_rhs(rhs) ||
         _is_levels_binding_rhs(rhs)) && return st
     return Expr(:(=), st.args[1], _resolve_module_calls(rhs, sm.mod, names,
         "submodel `$(sm.name)` definition `$(st.args[1]) = $(repr(rhs))`"))
@@ -6930,7 +6934,7 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
     pin === nothing || _sfail("`predictor = $pin` is top-level-only " *
         "(`y ~ sm(...; predictor = ...)`); per-cell predictors lower " *
         "through the plate path")
-    length(callargs) == length(sm.argnames) || _sfail(
+    length(callargs) == length(_submodel_args(sm)) || _sfail(
         "submodel `$(sm.name)` expects $(length(sm.argnames)) argument(s) " *
         "$(Tuple(sm.argnames)), got $(length(callargs)) at `$col[$ivar] ~ " *
         "$(sm.name)(...)`")
@@ -6980,7 +6984,7 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
             "DATA column (`<data>[$ivar] ~ $(sm.name)(...)`), not the non-data " *
             "name `$col`.")
     end
-    argset = Set{Symbol}(sm.argnames)
+    argset = Set{Symbol}(_submodel_args(sm))
     for st in stmts
         nm = _stmt_lhs(st)
         nm in argset && _sfail("submodel `$(sm.name)`: `$nm` is both an " *

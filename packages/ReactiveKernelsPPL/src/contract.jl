@@ -1269,16 +1269,6 @@ function _sched_raw_columns(s::LinearPKScheduleSpec)
 end
 _sched_ends_field(::LinearPKScheduleSpec) = :op_ends
 
-"""V2 event-LP slope prior scale (SB `effect(log_F, op_log_dose) ~
-Normal(0.0, 0.6676)` verbatim — the specific overrides the wildcard
-`effect(log_F, :) ~ Normal(0.0, 0.5)` by BRM specificity)."""
-const _EVENT_LP_SLOPE_PRIOR_SD = 0.6676
-
-"""V2 event-LP length-scale prior upper bound (SB
-`length_scale(:, hsgp(op_log_dose)) ~ Uniform(lower, 2.0)` — the
-reference model's upper bound, verbatim)."""
-const _EVENT_LP_RHO_PRIOR_HI = 2.0
-
 """The fixed event-LP provider name (the SB seam name — the
 per-subject expansion slices the call arg by this NAME)."""
 const EVENT_LP_NAME = :log_F
@@ -1286,16 +1276,10 @@ const EVENT_LP_NAME = :log_F
 """
     LinearPKEventLPSpec(name, schedule, k, c, fit, label)
 
-One linear-PK event-axis bioavailability LP (SB `log_F ~ 0 +
-op_log_dose + hsgp(op_log_dose; k = 5)`): `name` the provider's
-model-scope flat vector (`:log_F`, fixed — the per-subject expansion
-slices by name); `schedule` the op stream it rides; `k`/`c` the 1-D
-HSGP modes/boundary factor (V2: 5/1.5); `fit` the bind-time `(mu, L)`
-over the `op_log_dose` column (`nothing` pre-bind); `label` the
-validation label. The provider evaluates in-graph via
-[`linear_pk_event_log_f`](@ref) (data axis + frozen fit, traced
-hyperparameters — the Stage-B split); the layout owns
-`slope`/`rho`/`sigma`/`beta_raw` with the V2 priors.
+Retired implicit-provider representation, retained for compatibility with
+serialized plan structure. A nonempty `StructuralPlan.event_lps` is rejected:
+use the ordinary [`linear_pk_log_f`](@ref) library submodel instead. Its
+parameters are authored statements rather than layout-generated blocks.
 """
 struct LinearPKEventLPSpec
     name::Symbol
@@ -1860,13 +1844,12 @@ its sampled coefficient block)."""
 _horseshoe_for(plan::StructuralPlan, pred::Symbol) =
     [h for h in plan.horseshoe_priors if h.predictor === pred]
 
-"""`combine_simultaneous` for one schedule's build: a declared
-event-LP on the schedule selects the V2 no-pre-sum build (a
-nonlinear dose-only effect makes pre-summing raw amounts invalid —
-SB builds the joint schedule with `combine_simultaneous=false`);
-otherwise the v1 pre-summing build."""
+"""Preserve separate simultaneous doses when a cell consumes an event-axis
+bioavailability vector. Adding amounts before a nonlinear dose effect would
+change the model; schedules without that vector may combine amounts."""
 _schedule_combine_simultaneous(plan::StructuralPlan, sched::Symbol) =
-    !any(el -> el.schedule === sched, plan.event_lps)
+    !any(kp -> any(call -> first(call) === sched,
+        _event_lp_calls(kp)), plan.kernel_plates)
 
 """Find a design matrix by name, or `nothing`."""
 function _find_matrix(plan::StructuralPlan, name::Symbol)
@@ -2483,7 +2466,6 @@ function validate_data(plan::StructuralPlan)
     _validate_hsgp_data(plan)
     _validate_kernels_data(plan)
     _validate_r2d2_data(plan)
-    _validate_event_lp_data(plan)
     return nothing
 end
 
@@ -3703,69 +3685,11 @@ function _validate_hsgp_data(plan::StructuralPlan)
     return nothing
 end
 
-# Event-LP structure (see `_validate_event_lps`): fixed provider
-# name, declared schedule (at most one LP per schedule), admitted
-# k/c, sane hand-built fits, and call linkage (a declared LP feeds
-# at least one 7-arg cell call on its own schedule; a 7-arg call
-# needs its schedule's LP — an unbound `log_F` local must never
-# reach codegen).
+# Compatibility representation only: old hand-built event-LP plans would
+# otherwise mint parameters without authored statements (decision 10ldrvz).
 function _validate_event_lps(plan::StructuralPlan)
-    els = plan.event_lps
-    names = [el.name for el in els]
-    length(unique(names)) == length(names) ||
-        _fail(:plan, "duplicate event-LP names")
-    labels = [el.label for el in els]
-    length(unique(labels)) == length(labels) ||
-        _fail(:plan, "duplicate event-LP labels")
-    scheds = [s.name for kp in plan.kernel_plates for s in kp.schedules]
-    for el in els
-        el.name === EVENT_LP_NAME ||
-            _fail(el.label, "event-LP name must be `$(EVENT_LP_NAME)` " *
-                  "(the per-subject expansion slices the call arg by " *
-                  "name — one seam, got `$(el.name)`)")
-        el.schedule in scheds ||
-            _fail(el.label, "event-LP `$(el.name)` schedule " *
-                  "`$(el.schedule)` is not declared " *
-                  "(`$(el.schedule) = linear_pk_schedule(...)`)")
-        all(s -> s.name !== el.schedule || s isa LinearPKScheduleSpec,
-            (s for kp in plan.kernel_plates for s in kp.schedules)) ||
-            _fail(el.label, "linear_pk_log_f needs a linear-PK schedule")
-        el.k isa Int && el.k >= 2 ||
-            _fail(el.label, "event-LP `$(el.name)` k must be an integer " *
-                  "≥ 2 (the truncation floor needs k²−1 > 0; " *
-                  "V2: k = 5, got $(repr(el.k)))")
-        el.c isa Real && isfinite(Float64(el.c)) && Float64(el.c) > 1 ||
-            _fail(el.label, "event-LP `$(el.name)` c must be finite and " *
-                  "exceed 1 (V2: c = 1.5, got $(repr(el.c)))")
-        if el.fit !== nothing
-            mu, L = el.fit
-            isfinite(mu) && isfinite(L) && L > 0 ||
-                _fail(el.label, "event-LP `$(el.name)` fit (mu, L) must " *
-                      "be finite with L > 0, got ($(mu), $(L))")
-        end
-    end
-    # (At most one LP per schedule needs no separate check: the fixed
-    # provider name makes the name-table duplicate rule subsume it —
-    # W2 admits a single event-LP per model.)
-    # Call linkage over grouped-kernel assignments: the cell walker
-    # owns precise 7-arg shape rejection; here every 7-arg call needs
-    # its schedule's declared LP, and every declared LP needs a call.
-    calls = Tuple{Symbol,Symbol}[]
-    for kp in plan.kernel_plates, (_, ex) in kp.assignments
-        _collect_event_lp_calls!(calls, ex)
-    end
-    for (sched, arg) in calls
-        any(el -> el.name === arg && el.schedule === sched, els) ||
-            _fail(:plan, "cell call threads event-LP `$arg` on " *
-                  "schedule `$sched`, which is not declared " *
-                  "(`$arg = linear_pk_log_f($sched; k = 5)`)")
-    end
-    for el in els
-        any(((s, a),) -> s === el.schedule && a === el.name, calls) ||
-            _fail(el.label, "event-LP `$(el.name)` is never called " *
-                  "(declared LPs must feed a 7-arg cell call — " *
-                  "unfed LPs would sample dead parameters)")
-    end
+    isempty(plan.event_lps) || _fail(:plan,
+        "implicit event-LP parameters are retired; use the linear_pk_log_f library submodel")
     return nothing
 end
 
@@ -3774,6 +3698,14 @@ end
 # expr args (fn + schedule + log_F + 5 LPs) is the literal event form
 # (NOT arity-relative: the AUC sibling shares the shape under its own
 # arity, and a relative rule would miss it).
+function _event_lp_calls(kp::KernelPlate)
+    calls = Tuple{Symbol,Symbol}[]
+    for (_, ex) in kp.assignments
+        _collect_event_lp_calls!(calls, ex)
+    end
+    return calls
+end
+
 function _collect_event_lp_calls!(calls::Vector{Tuple{Symbol,Symbol}}, ex)
     ex isa Expr || return nothing
     if ex.head === :call && length(ex.args) == 8 &&
@@ -3785,80 +3717,6 @@ function _collect_event_lp_calls!(calls::Vector{Tuple{Symbol,Symbol}}, ex)
         _collect_event_lp_calls!(calls, a)
     end
     return nothing
-end
-
-# Event-LP data: the op_log_dose bind product verified by exact
-# rebuild (never trusted — the schedule precedent), the fit filled
-# and rebuild-identical, and the truncation floor below the V2
-# prior's upper bound (SB `_linear_pk_hsgp_lower` errors the same
-# way).
-function _validate_event_lp_data(plan::StructuralPlan)
-    for el in plan.event_lps
-        col = _sched_col_name(el.schedule, :op_log_dose)
-        haskey(plan.columns, col) ||
-            _fail(el.label, "event-LP `$(el.name)` product `$col` " *
-                  "missing (bind_data materializes the event axis)")
-        tcol = _sched_col_name(el.schedule, :op_type)
-        acol = _sched_col_name(el.schedule, :op_amount)
-        (haskey(plan.columns, tcol) && haskey(plan.columns, acol)) ||
-            _fail(el.label, "event-LP `$(el.name)` schedule products " *
-                  "missing (bind_data materializes op columns)")
-        want = try
-            linear_pk_op_log_dose(plan.columns[tcol], plan.columns[acol])
-        catch err
-            err isa ContractValidationError &&
-                _fail(el.label, "event-LP `$(el.name)`: $(err.message)")
-            rethrow()
-        end
-        plan.columns[col] == want ||
-            _fail(el.label, "event-LP `$(el.name)` product `$col` is " *
-                  "not the event-axis build (bind_data materializes " *
-                  "it — a hand-bound plan must carry the identical " *
-                  "product)")
-        el.fit === nothing &&
-            _fail(el.label, "event-LP `$(el.name)` fit not filled at " *
-                  "bind (one (mu, L) over `$col`)")
-        mu, L = el.fit
-        rmu, rL = _hsgp_axis_fit(plan.columns[col], el.c, el.label,
-            "event-LP `$(el.name)` fit")
-        (mu, L) == (rmu, rL) ||
-            _fail(el.label, "event-LP `$(el.name)` fit ($mu, $L) is " *
-                  "not the bind fit ($rmu, $rL)")
-        floor = only(_hsgp_floors([el.k], [(mu, L)], true))
-        floor < _EVENT_LP_RHO_PRIOR_HI ||
-            _fail(el.label, "event-LP `$(el.name)` HSGP truncation " *
-                  "lower bound $floor is not below " *
-                  "$(_EVENT_LP_RHO_PRIOR_HI) (SB errors the same way)")
-    end
-    return nothing
-end
-
-# Event-LP binds: fit (mu, L) over the materialized op_log_dose
-# column (the shared `_hsgp_axis_fit` core) + the V2 floor gate.
-# Runs AFTER kernel resolution (the axis column materializes there).
-function _fit_event_lps(plan::StructuralPlan,
-        columns::AbstractDict{Symbol})
-    isempty(plan.event_lps) && return LinearPKEventLPSpec[]
-    out = LinearPKEventLPSpec[]
-    for el in plan.event_lps
-        col = _sched_col_name(el.schedule, :op_log_dose)
-        haskey(columns, col) ||
-            _fail(el.label, "event-LP `$(el.name)`: axis column $col " *
-                  "is not bound (bind_data materializes it from the " *
-                  "schedule — internal ordering)")
-        axiscol = _vector_column(columns, col, el.label,
-            "event-LP axis column")
-        fit = _hsgp_axis_fit(axiscol, el.c, el.label,
-            "event-LP `$(el.name)` axis column $col")
-        floor = only(_hsgp_floors([el.k], [fit], true))
-        floor < _EVENT_LP_RHO_PRIOR_HI ||
-            _fail(el.label, "event-LP `$(el.name)` HSGP truncation " *
-                  "lower bound $floor is not below " *
-                  "$(_EVENT_LP_RHO_PRIOR_HI) (SB errors the same way)")
-        push!(out, LinearPKEventLPSpec(el.name, el.schedule, el.k, el.c,
-            fit, el.label))
-    end
-    return out
 end
 
 # Kernel (KernelPlate) structure: everything provable without data.
@@ -9394,8 +9252,7 @@ _upgrade_role!(roles, col, role) =
 # rebinds — the SB DATA-vs-literal concern).
 """One HSGP axis fit (SB `_brm_fit_hsgp` 1-D verbatim): `mu =
 mean(col)`, `L = c*max|col-mu|`, numeric/nonempty/finite/`L > 0`
-gates. Shared by basis binds and the event-LP bind (dev §4 — one
-fit core, two callers)."""
+gates. Shared by basis binds."""
 function _hsgp_axis_fit(col::AbstractVector, c::Real, label::Symbol,
         where::String)
     eltype(col) <: Real ||
@@ -9936,26 +9793,6 @@ function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
                   "caller-supplied column")
         columns[col] = getfield(built, f)
     end
-    # The event-axis product (SB `_linear_pk_dose_event_axis`): only
-    # with a declared event-LP on this schedule — v1 bind products
-    # stay byte-identical without one.
-    for el in plan.event_lps
-        el.schedule === sched.name || continue
-        ecol = _sched_col_name(sched.name, :op_log_dose)
-        haskey(columns, ecol) &&
-            _fail(kp.label, "column `$ecol` is reserved for schedule " *
-                  "`$(sched.name)`'s event-axis product — rename the " *
-                  "caller-supplied column")
-        et = _sched_col_name(sched.name, :op_type)
-        ea = _sched_col_name(sched.name, :op_amount)
-        columns[ecol] = try
-            linear_pk_op_log_dose(columns[et], columns[ea])
-        catch err
-            err isa ContractValidationError &&
-                _fail(kp.label, "schedule `$(sched.name)`: $(err.message)")
-            rethrow()
-        end
-    end
     slices2 = Tuple{Symbol,Symbol,Symbol}[]
     for (col, param, _) in kp.slices
         haskey(columns, col) ||
@@ -10215,7 +10052,9 @@ Derived responses keep their own materialization."""
 function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol})
     nodes = Dict{Symbol,Any}()
     for a in plan.assignments
-        a.expr isa Expr && (nodes[a.name] = a.expr)
+        # Literal definitions can be dependencies of a module call, such
+        # as the library's named reference dose. They are data-only too.
+        nodes[a.name] = a.expr
     end
     for d in plan.derived
         d.expr isa Expr && (nodes[d.name] = d.expr)
@@ -10517,8 +10356,8 @@ function _scalar_responses_as_observations!(plan::StructuralPlan,
 end
 
 function _materialize_module_data!(plan::StructuralPlan,
-        columns::Dict{Symbol,ColumnData})
-    names = _module_data_names(plan, Set{Symbol}(keys(columns)))
+        columns::Dict{Symbol,ColumnData}; already = Set{Symbol}())
+    names = setdiff(_module_data_names(plan, Set{Symbol}(keys(columns))), already)
     isempty(names) && return names
     for nm in sort!(collect(names))
         haskey(columns, nm) && throw(ContractValidationError(
@@ -10830,7 +10669,9 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     bases = _materialize_splines!(plan, columns)
     hbases = _fit_hsgp_bases(plan, columns)
     kbases = _resolve_kernels!(plan, columns, dims)
-    elbases = _fit_event_lps(plan, columns)
+    # Schedule products now exist: fold definitions that consume them by
+    # the same data-only evaluator, once, before filling parameter shapes.
+    union!(computed, _materialize_module_data!(plan, columns; already = computed))
     for (k, v) in roles
         haskey(columns, k) || throw(ContractValidationError(
             "[bind] role for unknown column $k"))
@@ -10863,10 +10704,6 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         hb.by === nothing && continue
         haskey(inferred, hb.by.column) &&
             _upgrade_role!(inferred, hb.by.column, :group)
-    end
-    for el in elbases
-        c = _sched_col_name(el.schedule, :op_log_dose)
-        haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
     end
     for r in plan.responses
         r.weights !== nothing && haskey(inferred, r.weights) &&
@@ -10921,7 +10758,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     bound = _with(plan; responses = responses2, columns = columns,
         n_obs = n, roles = merged, levelmaps = maps, varying_draws = draws,
         vector_parameters = vectors2, spline_bases = bases,
-        hsgp_bases = hbases, kernel_plates = kbases, event_lps = elbases)
+        hsgp_bases = hbases, kernel_plates = kbases)
     validate_data(bound)
     return bound
 end

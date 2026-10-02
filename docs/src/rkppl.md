@@ -278,6 +278,9 @@ In an array cell, an observation must read a named per-index output
 it lowers exactly like the hand-inlined program. A submodel whose result is a
 response pointer is used as an observation stream: `y ~ stream(x, g)`.
 `Base.merge(model, override)` replaces or appends statements by name.
+Submodels also accept declared keyword defaults and statement replacements:
+`custom = merge(linear_pk_log_f, :(slope ~ Normal(0, 0.5)))` returns a new
+library body, which a program uses as `log_F ~ custom(sched; k = 5)`.
 
 Each call owns a lexical namespace. For `z ~ sm(x)`, `z.b` reads the
 submodel's local `b`, and bare `z` is the actual returned Julia value in
@@ -295,6 +298,36 @@ to their loop. Per-cell calls support `theta[i].b` and the whole local array
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_submodel_example()
+```
+
+### Event-axis bioavailability
+
+`log_F ~ linear_pk_log_f(sched; k = 5, c = 1.5)` combines a linear log-dose
+effect with an HSGP in schedule operation order. The schedule's operation
+fields and basis are data; the body states every prior, including the named
+length-scale validity floor. The reference dose defaults to one in the
+amount column's units; replace `reference_dose = 1` in the body to change it.
+These are the live library statements:
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_library_definitions((:linear_pk_log_f,))
+```
+
+The synthetic schedule program below shows the call, preparation, and
+evaluation. Its draws are `nt.log_F.slope`, `nt.log_F.rho`,
+`nt.log_F.sigma`, and `nt.log_F.z`. Replace a prior by merging the library
+body, then replace the call statement in the model. The old
+`log_F = linear_pk_log_f(...)` form is retired because assignments do not
+declare parameters. Rebuild old prepared models and coordinate mappings.
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_50_grouped_pk_logf.jl", :rkppl_event_lp; preamble = "using ReactiveKernelsPPL")
+```
+
+This is the generated kernel for that program:
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_kernel_program("99_plate_50_grouped_pk_logf.jl")
 ```
 
 ## Querying and fitting
