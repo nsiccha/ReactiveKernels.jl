@@ -1613,8 +1613,8 @@ end
 One differenced-AR(1) trajectory (SB `_sb_dar1`'s `differenced_ar1_path`):
 the zero-started integrated path `x[t+1] = x[t] + d[t]` over the AR(1)
 increments `d[t] = beta*d[t-1] + sigma*z[t]` (`d[0] = 0`, `x[1] = 0`).
-`beta`/`sigma` name the persistence (`Normal` truncated to `(:interval, 0,
-1)`) and innovation-scale (half-Normal, `Normal` on `:positive`)
+`beta`/`sigma` name the persistence (`Normal` truncated to `[0, 1]`)
+and innovation-scale (half-Normal, including `truncated(Normal(0, s), 0, Inf)`)
 [`SampledParameter`](@ref)s, each with Distributions semantics (the
 truncation normalizers stay);
 the `z` innovations (length `n_obs - 1`) are owned internally under the
@@ -5163,9 +5163,10 @@ _dar_innovation_name(s::DarSpec) = Symbol(:_ppl_dar_z_, s.state)
 
 # Structural invariants of each differenced-AR(1) trajectory: the
 # persistence names a `Normal` sampled parameter truncated to exactly
-# `(:interval, 0, 1)` (`beta ~ truncated(Normal(0.5, 0.2), 0, 1)`; other
-# location/scale ride the same spelling) and the scale names a `Normal`
-# sampled parameter on `:positive` (`sigma ~ HalfNormal(0.2)`). Both keep
+# `[0, 1]` (`beta ~ truncated(Normal(0.5, 0.2), 0, 1)`; other
+# location/scale ride the same spelling) and the scale names a half-Normal
+# (`sigma ~ HalfNormal(0.2)` or `truncated(Normal(0, 0.2), 0, Inf)`).
+# Legacy normalized support overrides and general `:truncated` agree. Both keep
 # Distributions semantics — the truncation normalizers stay (user decision
 # `0m1j3iz`, prong `dar-kernel`). The `n_obs ≥ 2` length gate lives in the
 # layout (unbound surface plans carry `n_obs = 0`, like a scan's symbolic
@@ -5180,20 +5181,24 @@ function _validate_dar_paths(plan::StructuralPlan)
             "dar persistence :$(s.beta) must name a scalar sampled " *
             "parameter (`$(s.beta) ~ truncated(Normal(0.5, 0.2), 0, 1)`)")
         b = plan.parameters[i]
-        (b.family === :normal && b.support_override == (:interval, 0.0, 1.0)) ||
+        (b.family === :normal && b.support_override in
+            ((:interval, 0.0, 1.0), (:truncated, 0.0, 1.0))) ||
             _fail(s.label,
                 "dar persistence :$(s.beta) must be a Normal truncated to " *
-                "exactly (:interval, 0, 1) (`truncated(Normal(0.5, 0.2), 0, " *
+                "exactly [0, 1] (`truncated(Normal(0.5, 0.2), 0, " *
                 "1)`), got :$(b.family) on $(repr(b.support_override))")
         j = findfirst(p -> p.name === s.sigma, plan.parameters)
         j === nothing && _fail(s.label,
             "dar scale :$(s.sigma) must name a scalar sampled parameter " *
             "(`$(s.sigma) ~ HalfNormal(0.2)`)")
         sg = plan.parameters[j]
-        (sg.family === :normal && sg.support_override === :positive) ||
+        (sg.family === :normal && (sg.support_override === :positive ||
+            (sg.support_override == (:truncated, 0.0, Inf) &&
+                get(sg.args, :arg1, nothing) == 0))) ||
             _fail(s.label,
-                "dar scale :$(s.sigma) must be a half-Normal on :positive " *
-                "(`HalfNormal(0.2)`), got :$(sg.family) on " *
+                "dar scale :$(s.sigma) must be a half-Normal " *
+                "(`HalfNormal(0.2)` or `truncated(Normal(0, 0.2), 0, Inf)`), " *
+                "got :$(sg.family) on " *
                 "$(repr(sg.support_override))")
     end
     return nothing

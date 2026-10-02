@@ -3,7 +3,7 @@ using ReactiveKernelsPPL
 using Test
 
 # Differenced-AR(1) trajectory (dar) contract tests: SB `_sb_dar1`'s path —
-# `beta ~ truncated(Normal(0.5, 0.2), 0, 1)` (`(:interval, 0, 1)`) and
+# `beta ~ truncated(Normal(0.5, 0.2), 0, 1)` (`(:truncated, 0, 1)`) and
 # `sigma ~ HalfNormal(0.2)` (`:positive`), each keeping the meaning of its
 # statement as written (Distributions semantics, normalizers included: user
 # decision `0m1j3iz`, prong `dar-kernel`), `z[T-1] ~ std_normal`, and the
@@ -78,6 +78,20 @@ end
     @test (validate_structure(_dar_min_plan([spec])); true)
     @test _dar_min_plan([spec]).dar_paths[1].state === :dar_mu
     @test isempty(_dar_min_plan(DarSpec[]).dar_paths)
+
+    # General truncation and legacy normalized overrides admit the same
+    # authored priors. The surface now emits the general representation.
+    for beta_support in ((:interval, 0.0, 1.0), (:truncated, 0.0, 1.0)),
+            sigma_support in (:positive, (:truncated, 0.0, Inf))
+        p = _dar_min_plan([spec])
+        i = findfirst(q -> q.name === :beta, p.parameters)
+        j = findfirst(q -> q.name === :sigmad, p.parameters)
+        p.parameters[i] = ReactiveKernelsPPL._with(p.parameters[i];
+            support_override = beta_support)
+        p.parameters[j] = ReactiveKernelsPPL._with(p.parameters[j];
+            support_override = sigma_support)
+        @test (validate_structure(p); true)
+    end
 
     # dar-state name colliding with a parameter is rejected by the name table
     bad_state = DarSpec(:sigma, :beta, :sigmad, :sigma)
@@ -252,13 +266,13 @@ end
     # the meaning of their statements as written (no Stan-kernel re-key)
     byname = Dict(p.name => p for p in plan.parameters)
     @test byname[:beta].family === :normal
-    @test byname[:beta].support_override == (:interval, 0.0, 1.0)
+    @test byname[:beta].support_override == (:truncated, 0.0, 1.0)
     @test byname[:sigmad].family === :normal
     @test byname[:sigmad].support_override === :positive
     @test all(pr -> pr.addressee !== :beta && pr.addressee !== :sigmad,
         plan.population_priors)
 
-    # the truncated-half sigma spelling lowers identically
+    # The truncated-half sigma spelling has the same normalized density.
     plan2 = lower_rkppl(quote
         a ~ Normal(0, 1)
         beta ~ truncated(Normal(0.5, 0.2), 0, 1)
@@ -269,7 +283,7 @@ end
     end, (:y,))
     @test only(plan2.dar_paths).sigma === :sigmad
     byname2 = Dict(p.name => p for p in plan2.parameters)
-    @test byname2[:sigmad].support_override === :positive
+    @test byname2[:sigmad].support_override == (:truncated, 0.0, Inf)
 
     # a dar-shaped `~` never consumed by `dar()` lowers identically:
     # `dar()` no longer changes what its parameters' statements mean
@@ -284,7 +298,7 @@ end
     end, (:y, :x))
     @test isempty(plan3.dar_paths)
     byname3 = Dict(p.name => p for p in plan3.parameters)
-    @test byname3[:beta].support_override == (:interval, 0.0, 1.0)
+    @test byname3[:beta].support_override == (:truncated, 0.0, 1.0)
     @test byname3[:sigmad].support_override === :positive
 
     # refused: remaining calls violate arity or strict declarations (P3/P6, 05oe96l).
@@ -591,7 +605,7 @@ end
         t.options.coef === nothing,
         only(pl.predictors).terms)
     byname = Dict(p.name => p for p in pl.parameters)
-    @test byname[:beta].support_override == (:interval, 0.0, 1.0)
+    @test byname[:beta].support_override == (:truncated, 0.0, 1.0)
     @test byname[:sigmad].support_override === :positive
     bl = build_kernel(pl)
     bb = build_kernel(pb)
