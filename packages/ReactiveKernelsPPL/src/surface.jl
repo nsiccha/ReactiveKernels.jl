@@ -9739,7 +9739,7 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
             term, use = _extract_summand(pname, core, sign, ctx)
         end
         if use !== nothing
-            name, addr, _ = use
+            name, addr, use_sign = use
             # Matrix uses claim every element addressee (one coefficient
             # per column, across matrix and affine terms alike).
             addrs = addr in keys(ctx.matrices) ?
@@ -9761,9 +9761,10 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
                     (InterceptTerm, ContinuousTerm, FactorTerm,
                      MatrixTerm, MonotonicTerm)
                 # Record the exact use here: an addressee lookup loses identity
-                # when distinct parameters multiply the same column.
+                # when distinct parameters multiply the same column. The use
+                # sign includes both the summand and its product factors.
                 term = TermSpec(term.kind, term.columns,
-                    merge(term.options, (; parameter = name, sign)),
+                    merge(term.options, (; parameter = name, sign = use_sign)),
                     term.addressee, term.label)
             end
         end
