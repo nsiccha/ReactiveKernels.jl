@@ -119,10 +119,13 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
         @test [t.kind for t in pred.terms] == [InterceptTerm]
         @test isempty(plan.derived)
     end
-    @testset "intercept-only location predictor (SB mu ~ 1)" begin
+    @testset "constant location is a declared parameter (SB mu ~ 1)" begin
+        # Strict declarations: the intercept-only location slot (an
+        # undeclared `mu1 = c`) is gone. A constant location is a declared
+        # scalar spelled bare; an alias of one fails (the battery's
+        # "stated scalar loc alias").
         plan = lower_rkppl(quote
-                c ~ Normal(0, 1)
-                mu1 = c
+                mu1 ~ Normal(0, 1)
                 mu2 ~ Normal(0.0, 5.0)
                 sigma ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(mu1, sigma),
@@ -130,9 +133,9 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
             end, (:y,))
         r = only(plan.responses)
         @test r.mixture_locs == [:mu1, :mu2]
-        @test r.predictor === :mu1 # Anchor: first location predictor.
-        pred = only(p for p in plan.predictors if p.name === :mu1)
-        @test [t.kind for t in pred.terms] == [InterceptTerm]
+        @test r.predictor === :mu1 # Anchor: first location.
+        @test isempty(plan.predictors)
+        @test [q.name for q in plan.parameters] == [:mu1, :mu2, :sigma]
         @test isempty(plan.derived)
     end
     @testset "alternate heads desugar per component" begin
@@ -349,8 +352,9 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s)], Float64[])
             end), SurfaceLoweringError),
         # A scalar alias over a stated prior reads like the name itself
-        # (a sampled parameter — spell it bare), so it never routes to
-        # the intercept-only location slot (undeclared `mu ~ 1` only).
+        # (a sampled parameter — spell it bare). It never routes to the
+        # intercept-only location slot, which only an undeclared name
+        # reached (gone under strict declarations).
         ("stated scalar loc alias",
             :(begin
                 c ~ Normal(0.0, 5.0)

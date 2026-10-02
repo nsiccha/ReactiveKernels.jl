@@ -6120,8 +6120,10 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
             "component $k location $loc is a design matrix — locations " *
             "are predictors, sampled parameters, or literals")
         # A stated-prior alias reads like the name itself (a sampled
-        # parameter), so it never routes here — only undeclared
-        # intercept-only defs (the SB `mu ~ 1` mirror) qualify.
+        # parameter), so it never routes here. Only an undeclared
+        # intercept-only def (the SB `mu ~ 1` mirror) did, and strict
+        # declarations refuse that name at prior lowering: a constant
+        # location is a declared scalar spelled bare.
         if loc in ctx.vecdefs && haskey(ctx.detmap, loc) ||
                 _is_scalar_coef_def(loc, ctx, false)
             wrapped || _sfail("response $lhs: mixture component $k " *
@@ -7861,7 +7863,48 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     rhs = ctx.detmap[s]
     _reads_array_value(rhs, ctx) && !(_is_factor_index_def(rhs, ctx) &&
         rhs.args[1] ∉ ctx.array_decls) && return false
+    # Likewise a definition computed from data and non-coefficient scalar
+    # parameters only (`w = s .+ x`, `s ~ Exponential(1)`): it has no
+    # coefficient to compose, so it stays an offset local. Under strict
+    # declarations the intercept beside it (`mu = a .+ w`) is a declared
+    # scalar, which must not turn the sum into a composition.
+    _composed_param_value(s, ctx) && return false
     return true
+end
+
+# A plain scalar parameter: sampled, not coefficient-priored, and none of
+# the array / varying / latent / scan objects that carry their own arms.
+_composed_scalar_param(leaf::Symbol, ctx) =
+    leaf in ctx.prior_names && leaf ∉ ctx.coef_priors &&
+    leaf ∉ ctx.sized_decls && leaf ∉ ctx.varying_contribs &&
+    leaf ∉ ctx.varying_draws_names && leaf ∉ ctx.plate_names &&
+    leaf ∉ ctx.scan_states
+
+"""Whether a definition transitively reads only data and plain scalar
+parameters (`_composed_scalar_param`), at least one of them a parameter
+(a data-only definition is `_composed_data_only`'s)."""
+function _composed_param_value(s::Symbol, ctx)
+    seen = Set{Symbol}()
+    stack = Symbol[s]
+    reads_param = false
+    while !isempty(stack)
+        nm = pop!(stack)
+        nm in seen && continue
+        push!(seen, nm)
+        for leaf in _value_symbols(ctx.detmap[nm])
+            leaf === nm && continue
+            if leaf in ctx.data
+                continue
+            elseif haskey(ctx.detmap, leaf)
+                push!(stack, leaf)
+            elseif _composed_scalar_param(leaf, ctx)
+                reads_param = true
+            else
+                return false
+            end
+        end
+    end
+    return reads_param
 end
 
 # Whether `ex` reads a declared array value — a bare array name

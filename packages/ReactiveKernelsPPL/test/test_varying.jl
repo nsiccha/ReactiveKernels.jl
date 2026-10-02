@@ -1126,7 +1126,6 @@ end
         end, (:y, :x, :g))
     # Predictor structure absorbed into the LP emits no column either.
     @test_throws SurfaceLoweringError lower_rkppl(quote
-            r ~ Prior
             a ~ Normal(0, 5)
             b ~ Normal(0, 2)
             sigma ~ Exponential(1)

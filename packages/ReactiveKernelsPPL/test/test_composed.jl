@@ -262,7 +262,6 @@ end
     @test occursin("`.~` link", sprint(showerror, err))
     # A scalar leaf names a sampled name or scalar definition — or fails.
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        be ~ Prior
         a_th ~ Normal(0, 1)
         b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
