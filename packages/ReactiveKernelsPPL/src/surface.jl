@@ -428,6 +428,16 @@ bindings (`isdefined` / `getfield` — no eval, no registration), so definitions
 distinct private modules never collide: one fresh `Module` per lowering,
 each holding its own `@rkppl name(args...) = ...` defs, is sufficient for
 concurrent independent lowerings with no shared lock.
+
+Coefficients are ordinary named parameters. A scalar `b ~ Fam(...)` used as
+`b .* x` lowers into its predictor's coefficient block (the fast affine
+path) only when its prior is a coefficient prior (`Normal`, `StudentT`,
+`Cauchy`, `Laplace`, `Logistic`, `Flat`, `Uniform` over literal, name or
+expression arguments) and the predictor is its only reader. Any other
+`b` — a positive-support prior, or a name another prior, assignment,
+column or predictor also reads — is an ordinary sampled parameter, and
+each summand that reads it lowers as an in-graph derived column. The
+density is the same either way.
 """
 function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     data = Set{Symbol}()
@@ -438,6 +448,41 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast, pins = _expand_submodels(ast, data, mod)
+    # Fixed point over demotions: a coefficient candidate the affine path
+    # cannot own (another reader, a second predictor or column) is demoted
+    # to an ordinary sampled parameter and lowering restarts. Each round
+    # removes one name, so this terminates within the candidate count.
+    demoted = Set{Symbol}()
+    while true
+        try
+            return _lower_rkppl_once(ast, data, copy(pins), demoted, mod)
+        catch e
+            e isa _DemoteCoefficient || rethrow()
+            e.name in demoted && _sfail("internal: coefficient $(e.name) " *
+                                        "demoted twice")
+            push!(demoted, e.name)
+        end
+    end
+end
+
+"""Internal control flow of [`lower_rkppl`](@ref): the scalar coefficient
+candidate `name` must lower as an ordinary sampled parameter (it has a
+reader outside its coefficient position). Never escapes `lower_rkppl`."""
+struct _DemoteCoefficient <: Exception
+    name::Symbol
+end
+
+# Demote a scalar coefficient candidate (restart lowering with `name` as an
+# ordinary parameter) — or, for a name the affine path cannot demote
+# (factor/matrix coefficient vectors, construct-owned coefficients), fail
+# with `msg`.
+function _demote_or_fail(name::Symbol, ctx, msg)
+    name in ctx.demotable && throw(_DemoteCoefficient(name))
+    return _sfail(msg)
+end
+
+function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
+        mod::Module)
     sample, det, plate_ctx, plate_specs, scans, bases, vectors,
     hbases, kplates, kstmts, schedules, event_lps, r2d2decls, joints,
     varying_draws, varying_pending, glms = _partition_statements(ast, data)
@@ -459,6 +504,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     chain === nothing || push!(kstmts, (cell = chain,))
     det = Pair{Symbol,Any}[nm => _resolve_module_calls(rhs, mod, model_names,
         "definition `$nm = $(repr(rhs))`") for (nm, rhs) in det]
+    # Prior expression arguments hoist to synthetic definitions, resolved
+    # exactly like a definition holding the same expression.
+    det = _hoist_prior_args!(sample, det, data, plate_specs;
+        resolve = a -> _resolve_module_calls(a, mod, model_names,
+            "prior argument `$(repr(a))`"))
     # Varying bindings (draws + contributions): contributions compose
     # only as direct predictor summands, never inside definitions.
     varying_names = Set{Symbol}()
@@ -482,12 +532,17 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     sampled_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     prior_names = setdiff(sampled_names, derived_response_names)
     # Sampled names usable as predictor coefficients: coefficient-priored
-    # scalars (see `_COEF_FAMILIES`) plus per-coefficient `~ Horseshoe()`
-    # scalars (the horseshoe triple synthesis in
-    # `_lower_horseshoe_priors`).
-    coef_priors = Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data &&
-            (_is_coef_prior_call(s.rhs) || _is_horseshoe_call(s.rhs)))
+    # scalars (see `_COEF_FAMILIES`, arguments a coefficient prior can
+    # carry — `_coef_prior_expressible`) plus per-coefficient
+    # `~ Horseshoe()` scalars (the horseshoe triple synthesis in
+    # `_lower_horseshoe_priors`). Demoted names are ordinary parameters.
+    # Only the plain scalar candidates are demotable (vector coefficients
+    # and horseshoe scalars have no ordinary-parameter spelling).
+    demotable = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && s.lhs ∉ demoted && !s.broadcast &&
+            _is_coef_prior_call(s.rhs) && _coef_prior_expressible(s.rhs))
+    coef_priors = union(demotable, Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && _is_horseshoe_call(s.rhs)))
     # Simplex parameters (`s ~ Dirichlet(...)`): the only names a
     # monotonic term accepts as its increments (checked during response
     # lowering, before `_lower_parameters` runs).
@@ -586,7 +641,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # Interned predictors by name (shared with `ctx`: a composition over a
     # definition already interned as a predictor reads its LP node).
     pred_idx = Dict{Symbol,Int}()
-    ctx = (; data, detmap = canonmap, prior_names, coef_priors, detshape,
+    ctx = (; data, detmap = canonmap, prior_names, coef_priors, demotable,
+        detshape,
         vecdefs, structural, derived_responses = derived_response_names,
         pred_idx,
         plate_names, absorbed = Set{Symbol}(),
@@ -594,6 +650,12 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         pin_owner = Dict{Symbol,Symbol}(),
         pin_source = Dict{Symbol,Tuple{Symbol,Symbol}}(),
         synth = Ref(0), synth_derived = VectorAssignmentSpec[], taken,
+        synth_assigns = AssignmentSpec[],
+        negated = Dict{Symbol,Symbol}(),
+        leaf_exprs = Dict{Any,Symbol}(),
+        # Inline factor references inside compositions (`sg .* z[g]`)
+        # intern as synthetic sub-predictors, one per `(base, index)`,
+        # exactly like the named alias `zg = z[g]`.
         scan_states = Set{Symbol}(s.state for s in scans),
         scan_coefs = Set{Symbol}(),
         varying_draws = Dict{Symbol,VaryingDraws}(
@@ -613,6 +675,9 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
             if s.lhs ∉ data && s.dims !== nothing),
         threshold_uses = Dict{Symbol,NamedTuple{(:response, :ordered),
             Tuple{Symbol,Bool}}}(),
+        vector_params = union(dirichlet_names, ordered_names, factor_names,
+            Set{Symbol}(s.lhs for s in sample
+                if s.levels !== nothing || s.matrix !== nothing)),
         mo_uses = Dict{Symbol,Symbol}(),
         matrices = Dict{Symbol,DesignMatrix}(m.name => m for m in matrices),
         matrices_used = Set{Symbol}(),
@@ -707,10 +772,12 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
             "no predictor (nothing to pin — simplex responses and " *
             "scan-state locations build none)")
     end
+    _check_coefficient_uses(coefuse, ctx)
     for c in ctx.scan_coefs
-        haskey(coefuse, c) && _sfail("$c is both a predictor coefficient " *
-            "and a scan coefficient — scan coefficients are sampled " *
-            "scalars, not population coefficients (rename one)")
+        haskey(coefuse, c) && _demote_or_fail(c, ctx, "$c is both a " *
+            "predictor coefficient and a scan coefficient — scan " *
+            "coefficients are sampled scalars, not population " *
+            "coefficients (rename one)")
     end
     # Varying slices finalize once every predictor is interned: each
     # contribution resolves to the single predictor that uses it (target
@@ -721,9 +788,10 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     r2d2set = Set{Symbol}(d.predictor for d in r2d2decls)
     hsset = _horseshoe_predictors(sample, coefuse, predictors, r2d2set)
     for c in ctx.dar_coefs
-        haskey(coefuse, c) && _sfail("$c is both a predictor coefficient " *
-            "and a dar trajectory parameter — dar parameters are sampled " *
-            "scalars, not population coefficients (rename one)")
+        haskey(coefuse, c) && _demote_or_fail(c, ctx, "$c is both a " *
+            "predictor coefficient and a dar trajectory parameter — dar " *
+            "parameters are sampled scalars, not population coefficients " *
+            "(rename one)")
     end
     for c in ctx.dar_states
         haskey(coefuse, c) && _sfail("$c is a dar trajectory state — it " *
@@ -738,7 +806,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     hyper_names = union(prior_names,
         Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :scalar))
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
-        ctx.matrices, hyper_names, r2d2set, hsset)
+        ctx.matrices, hyper_names, ctx, r2d2set, hsset)
     for (beta, (label, X)) in glmuse
         append!(priors, _lower_glm_beta_priors(label, beta, X, sample,
             ctx.matrices, hyper_names))
@@ -749,6 +817,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         hsset, taken)
     params, paramsyms, dirichlets, arrays =
         _lower_parameters(sample, coefuse, ctx, glmuse)
+    # Coefficient-prior hyperparameters read their names too (an inlined
+    # scalar definition that is also a prior scale must still emit).
+    for pr in priors, v in (pr.location, pr.scale)
+        v isa Symbol && push!(paramsyms, v)
+    end
     append!(params, taus)
     append!(params, hsparams)
     plate_parameters = PlateParameter[
@@ -798,13 +871,9 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         end
     end
     append!(derived, ctx.synth_derived)
-    for d in ctx.synth_derived
-        for s in _value_symbols(d.expr)
-            haskey(coefuse, s) && _sfail("$s is a predictor coefficient " *
-                                        "and cannot appear in an extracted " *
-                                        "column (predictor $(d.label))")
-        end
-    end
+    append!(assigns, ctx.synth_assigns)
+    _check_coefficient_readers(coefuse, ctx, predictors, priors, params,
+        plate_parameters, assigns, derived, responses)
     _validate_varying_margins(varying_draws, data, derived, detshape,
         used_locs)
     # Varying bindings compose only as direct predictor summands:
@@ -7946,11 +8015,72 @@ end
 function _record_coefuses!(coefuse, pname, uses, lhs)
     for (name, addr, sign) in uses
         entries = get!(coefuse, name, Tuple{Symbol,Symbol,Int}[])
-        for (p2, _, _) in entries
-            p2 === pname && _sfail("response $lhs: coefficient $name is " *
-                                   "used twice in predictor $pname")
-        end
         push!(entries, (pname, addr, sign))
+    end
+    return nothing
+end
+
+# One coefficient block owns each coefficient: a name used twice (in one
+# predictor, across predictors, or on two columns) is an ordinary
+# parameter read by several summands — a scalar candidate demotes; a
+# vector coefficient fails naming the uses.
+function _check_coefficient_uses(coefuse, ctx)
+    for (name, uses) in coefuse
+        length(uses) > 1 || continue
+        preds = unique!(map(first, copy(uses)))
+        msg = length(preds) > 1 ?
+            "coefficient $name is shared across predictors " *
+            "$(join(preds, ", ")) — coefficient blocks are per-predictor, " *
+            "rename or duplicate it" :
+            "coefficient $name is used twice in predictor $(only(preds)) " *
+            "($(join(unique!(map(u -> u[2], copy(uses))), ", "))) — one " *
+            "coefficient per column"
+        _demote_or_fail(name, ctx, msg)
+    end
+    return nothing
+end
+
+# Every other reader of a coefficient — a prior or parameter argument, an
+# assignment, a derived column, a response slot — demotes a scalar
+# candidate to an ordinary parameter (its summands then lower as derived
+# columns); a vector coefficient fails naming the reader.
+function _check_coefficient_readers(coefuse, ctx, predictors, priors,
+        params, plate_parameters, assigns, derived, responses)
+    isempty(coefuse) && return nothing
+    function read!(who, s)
+        s isa Symbol && haskey(coefuse, s) || return nothing
+        return _demote_or_fail(s, ctx, "$s is a predictor coefficient and " *
+                               "cannot also be read by $who")
+    end
+    for p in predictors, t in p.terms
+        t.kind === ComposedTerm || continue
+        foreach(v -> read!("composed predictor $(p.name)", v),
+            t.options.scalars)
+    end
+    for pr in priors
+        who = "the prior of ($(pr.predictor), $(pr.addressee))"
+        read!(who, pr.location)
+        read!(who, pr.scale)
+    end
+    for p in params, v in values(p.args)
+        read!("parameter $(p.name)", v)
+    end
+    for p in plate_parameters, v in values(p.args)
+        read!("latent $(p.name)", v)
+    end
+    for a in assigns, s in _value_symbols(a.expr)
+        read!("assignment $(a.name)", s)
+    end
+    for d in derived, s in _value_symbols(d.expr)
+        read!("derived column $(d.label)", s)
+    end
+    for r in responses
+        who = "response $(r.response)"
+        for v in (r.scale, r.nu, r.zi, r.mixture_weights)
+            read!(who, v)
+        end
+        foreach(v -> read!(who, v), r.mixture_locs)
+        foreach(v -> read!(who, v), r.mixture_scales)
     end
     return nothing
 end
@@ -8172,13 +8302,11 @@ _composed_root(rhs, ctx) =
 
 """Extract + validate a combination tree (trigger already fired).
 Leaves: sub-predictors (vector defs) and scalars (sampled names,
-scalar definitions); a numeric literal is a leaf where it is an operand
-of an elementwise map or of a dotted operator other than `.*`/`.+`/`.−`
-(`operand`: `hypot.(1.0, mu)`, `mu .^ 2`). Everything else fails closed
-with guidance."""
+scalar definitions) and sub-free scalar subexpressions, a literal
+included (`hypot.(1.0, mu)`, `mu .^ 2`), each one scalar leaf.
+Everything else fails closed with guidance."""
 function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
-        scalars::Vector{Symbol}, datas::Vector{Symbol} = Symbol[];
-        operand::Bool = false)
+        scalars::Vector{Symbol}, datas::Vector{Symbol} = Symbol[])
     where = "predictor $pname"
     if node isa Symbol
         # A name bound to a composition inlines its tree (the definition
@@ -8208,10 +8336,10 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
                 "declare it (`$node ~ Prior` or `$node = ...`)")
         end
     end
-    node isa Number && operand && return node
-    node isa Number && return _sfail(
-        "$where scales by the literal $node — fold literal scales " *
-        "into a coefficient or prior instead")
+    # A sub-free scalar subexpression (a literal, `s + 1`, `sqrt(v)`) is
+    # one scalar leaf, exactly as if bound to a name first.
+    _is_composed_scalar_expr(node, ctx) &&
+        return _composed_scalar_leaf!(pname, node, ctx, scalars)
     node isa Expr || return _sfail("$where composition node " *
         "$(repr(node)) is not admitted (v1: `. .*`/`.+`/`.−` over " *
         "sub-predictors and scalars)")
@@ -8228,7 +8356,7 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         isempty(fargs) && return _sfail("$where $(repr(f)). takes at " *
             "least one operand")
         return Expr(:., f, Expr(:tuple, (_extract_composed_tree(pname, a,
-            ctx, subs, scalars, datas; operand = true) for a in fargs)...))
+            ctx, subs, scalars, datas) for a in fargs)...))
     end
     node.head === :call || return _sfail("$where composition node " *
         "$(repr(node)) is not admitted (v1: `. .*`/`.+`/`.−` over " *
@@ -8251,12 +8379,15 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         length(args) == 2 || return _sfail("$where `$op` takes two " *
             "operands")
         return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
-            subs, scalars, datas; operand = true) for a in args)...)
-    elseif op === :* && length(args) == 2
+            subs, scalars, datas) for a in args)...)
+    elseif op === :* && length(args) >= 2
         # Julia-valid scalar `*` normalizes to dotted (Base broadcasts —
-        # behavior-preserving, the canonicalization doctrine).
-        return _extract_composed_tree(pname, Expr(:call, :.*, args...),
-            ctx, subs, scalars, datas)
+        # behavior-preserving, the canonicalization doctrine); an n-ary
+        # product `z * lam * tau` folds left like Julia's `*`.
+        lhs = length(args) == 2 ? args[1] :
+            Expr(:call, :*, args[1:end-1]...)
+        return _extract_composed_tree(pname, Expr(:call, :.*, lhs,
+            args[end]), ctx, subs, scalars, datas)
     elseif op === :+ || op === :- || op === :/ || op === :^
         return _sfail("$where combines vectors without dots: " *
             "$(repr(node)) — as in Julia, write the dotted form " *
@@ -8268,6 +8399,38 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             "functions over sub-predictors, scalars and data (write `$op` " *
             "dotted, or bind the value to a name first)")
     end
+end
+
+# A composition operand with no sub-predictor and no column that is not
+# itself a composition operator node (those recurse): a scalar value.
+function _is_composed_scalar_expr(node, ctx)
+    node isa Number && return true
+    node isa Expr || return false
+    _composed_has_sub(node, ctx, true) && return false
+    _reads_column(node, ctx) && return false
+    _is_composed_map(node) && return false
+    node.head === :call && !isempty(node.args) &&
+        node.args[1] in (:.*, :.+, :.-, :*) && return false
+    return true
+end
+
+function _composed_scalar_leaf!(pname, node, ctx, scalars)
+    _reject_unknown_calls("predictor $pname", node)
+    nm = get!(ctx.leaf_exprs, node) do
+        k = length(ctx.leaf_exprs) + 1
+        n = Symbol(:_rkppl_leaf_, k)
+        while n in ctx.taken
+            k += 1
+            n = Symbol(:_rkppl_leaf_, k)
+        end
+        push!(ctx.taken, n)
+        v = _fold_literal(node)
+        push!(ctx.synth_assigns, AssignmentSpec(n,
+            v === nothing ? node : v, n))
+        n
+    end
+    nm in scalars || push!(scalars, nm)
+    return nm
 end
 
 """Lower a composed predictor at a response/scale location: intern the
@@ -8294,7 +8457,8 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
             push!(ctx.absorbed, s)
             continue
         end
-        terms, uses = _analyze_predictor(s, ctx.detmap[s], ctx, lhs;
+        srhs = ctx.detmap[s]
+        terms, uses = _analyze_predictor(s, srhs, ctx, lhs;
             composed_sub = true)
         all(t -> t.kind in _COMPOSED_SUB_KINDS, terms) || _sfail(
             "predictor $pname: sub-predictor $s must be affine plus " *
@@ -8310,9 +8474,9 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
     for c in scalars
         if haskey(coefuse, c)
             owners = join(unique!(map(first, copy(coefuse[c]))), ", ")
-            _sfail("predictor $pname: scalar $c is a coefficient of " *
-                "predictor $owners — a scalar leaf cannot also be a " *
-                "coefficient (rename one)")
+            _demote_or_fail(c, ctx, "predictor $pname: scalar $c is a " *
+                "coefficient of predictor $owners — a scalar leaf cannot " *
+                "also be a coefficient (rename one)")
         end
     end
     label = Symbol(pname, "_composed")
@@ -8349,6 +8513,12 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
             # per column, across matrix and affine terms alike).
             addrs = addr in keys(ctx.matrices) ?
                 _matrix_element_addressees(ctx.matrices[addr]) : (addr,)
+            # One name reused on another column (`b .* x .+ b .* x1`) is
+            # one ordinary parameter read twice. Two names on one column
+            # (`b .* x .+ c .* x`, a stray second intercept) are an exact
+            # likelihood ridge and stay refused.
+            any(u -> u[1] === name, uses) && _demote_or_fail(name, ctx,
+                "predictor $pname: coefficient $name is used twice")
             for a in addrs
                 haskey(addr_owner, a) && _sfail(
                     "predictor $pname: column $a has two coefficients " *
@@ -8556,18 +8726,12 @@ function _classify_summand(pname, core, sign::Int, ctx)
     end
     head === :macrocall && _sfail("predictor $pname: macros do not lower " *
                                   "inside predictor expressions")
+    # Any other per-observation summand (a computed coefficient, a
+    # parameter-scaled column, `exp.(s .* x)`) is an in-graph derived
+    # column: the fallback, never a refusal.
     if _canon_shape(core, ctx.data, ctx.detshape) === :vector
         return _extract_summand(pname, core, sign, ctx)
     end
-    detkeys = Set{Symbol}(keys(ctx.detmap))
-    coefrefs = Symbol[s for s in _value_symbols(core)
-        if s in ctx.coef_priors ||
-            _is_free_name(s, ctx.data, detkeys, ctx.prior_names, ctx.plate_names)]
-    length(coefrefs) > 1 && _sfail("predictor $pname: $(repr(core)) is " *
-                                   "nonlinear in coefficients")
-    length(coefrefs) == 1 && _sfail(
-        "predictor $pname: $(repr(core)) computes over the coefficient " *
-        "$(only(coefrefs)) — computed coefficients are not in slice 1")
     # An undotted module call returns a whole (model-level) value, even
     # over columns it reads whole.
     _contains_module_call(core) && _sfail("predictor $pname: " *
@@ -8575,12 +8739,16 @@ function _classify_summand(pname, core, sign::Int, ctx)
         "takes and returns whole values), not an observation column — " *
         "gather it with an observation index (`v[c]`), or broadcast the " *
         "call (`f.(...)`) for an elementwise column")
-    return _sfail("predictor $pname: $(repr(core)) is a scalar, not a " *
-                  "term — scalar parameters are not identified " *
-                  "separately from the intercept (bind the value to a " *
-                  "column, `w = s .+ x`, or fold it into an intercept " *
-                  "prior location)")
+    return _scalar_summand_error(pname, core)
 end
+
+# A scalar-valued summand (`a .+ s * z`, `a .+ phi[1]`) has no column to
+# scale: predictor terms are per-observation values.
+_scalar_summand_error(pname, core) = _sfail(
+    "predictor $pname: $(repr(core)) is a scalar summand, not a " *
+    "per-observation term — scale a column (`($(repr(core))) .* x`) or " *
+    "give the predictor one intercept (`a ~ Normal(...)`) and fold the " *
+    "scalar into its prior location")
 
 # An `X * b` matmul: the design matrix's K columns take one coefficient
 # vector — declared (`b[axes(X, 2)] .~ ...`, width-checked against the
@@ -8940,18 +9108,59 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
         "scan state — LP use needs a sampled coefficient (`b .* $core` " *
         "in an additive position); a bare scan state is only a direct " *
         "response location (`y .~ Normal.($core, s)`)")
-    haskey(ctx.detmap, core) && _sfail("predictor $pname: $core is a " *
-                                       "computed scalar, not a sampled " *
-                                       "coefficient (computed coefficients " *
-                                       "are not in slice 1)")
+    haskey(ctx.detmap, core) && _scalar_summand_error(pname, core)
     core in ctx.prior_names && core ∉ ctx.coef_priors &&
-        _sfail("predictor $pname: $core is a scalar parameter, not a " *
-               "term — scalar parameters are not identified separately " *
-               "from the intercept (bind the value to a column, " *
-               "`w = $core .+ x`, or fold it into an intercept prior " *
-               "location)")
+        _scalar_summand_error(pname, core)
     return TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
         :intercept), (core, :Intercept, sign)
+end
+
+# Whether a summand reads a per-observation value (a data column, a
+# vector definition, a per-cell latent); otherwise it is a scalar.
+_reads_column(ex, ctx) = any(s -> s in ctx.data || s in ctx.vecdefs ||
+    s in ctx.plate_names, _value_symbols(ex))
+
+# A derived column reads scalars and columns: a vector-valued parameter
+# (a simplex, a sized coefficient vector) read whole is a shape error.
+# An indexed read (`phi[1]`, `z[g]`) is an element or a gather, not the
+# whole vector; its index is still screened.
+function _check_scalar_reads(pname, core, ctx)
+    for v in _whole_value_symbols(core)
+        v in ctx.vector_params && _sfail("predictor $pname: " *
+            "$(repr(core)) reads the vector parameter $v as a scalar — " *
+            "index it per observation (`$v[g]`) or per element")
+    end
+    return nothing
+end
+
+function _whole_value_symbols(ex)
+    out = Set{Symbol}()
+    _whole_value_symbols!(out, ex)
+    return out
+end
+function _whole_value_symbols!(out::Set{Symbol}, ex)
+    if ex isa Expr && ex.head === :ref && !isempty(ex.args)
+        for a in ex.args[2:end]
+            _whole_value_symbols!(out, a)
+        end
+        ex.args[1] isa Symbol || _whole_value_symbols!(out, ex.args[1])
+        return nothing
+    end
+    if ex isa Expr
+        # Recurse through the call/broadcast value positions
+        # `_value_symbols` visits, one argument at a time so nested refs
+        # keep their exemption.
+        if ex.head === :call && !isempty(ex.args)
+            foreach(a -> _whole_value_symbols!(out, a), ex.args[2:end])
+            return nothing
+        elseif ex.head === :. && length(ex.args) == 2 &&
+               ex.args[2] isa Expr && ex.args[2].head === :tuple
+            foreach(a -> _whole_value_symbols!(out, a), ex.args[2].args)
+            return nothing
+        end
+    end
+    union!(out, _value_symbols(ex))
+    return nothing
 end
 
 # Anonymous non-affine vector substructure becomes a synthetic derived
@@ -8989,6 +9198,11 @@ function _classify_product(pname, core::Expr, sign::Int, ctx)
     coefs = Symbol[]
     values = Any[]
     stripped = Any[]
+    # A factor that is neither a free coefficient nor a column — a sampled
+    # parameter, a computed scalar (`s * z`, `phi[1]`), a literal — makes
+    # the product a computed-coefficient summand: the derived-column
+    # fallback below, never a refusal.
+    computed = false
     for f in core.args[2:end]
         s, g = _strip_sign(f)
         inner *= s
@@ -9002,32 +9216,21 @@ function _classify_product(pname, core::Expr, sign::Int, ctx)
                 # — the SB `me` mirror): the ContinuousTerm below names the
                 # latent vector and the coefficient stays free.
                 push!(values, g)
-            elseif k === :number
-                _sfail("predictor $pname: literal scaling in " *
-                       "$(repr(core)) is not a term — scale the column " *
-                       "or the prior instead")
-            elseif k === :param
-                _sfail("predictor $pname: $(repr(core)) scales by the " *
-                       "parameter $g — computed coefficients are not " *
-                       "in slice 1")
             else
-                _sfail("predictor $pname: computed assignments do not " *
-                       "lower as coefficients (computed coefficients " *
-                       "are not in slice 1)")
+                computed = true
             end
-        elseif g isa Number
-            _sfail("predictor $pname: literal scaling in $(repr(core)) " *
-                   "is not a term — scale the column or the prior instead")
-        elseif _canon_shape(g, ctx.data, ctx.detshape) === :vector
+        elseif !(g isa Number) &&
+                _canon_shape(g, ctx.data, ctx.detshape) === :vector
             push!(values, g)
         else
-            _sfail("predictor $pname: $(repr(core)) scales by the " *
-                   "computed scalar $(repr(g)) — computed coefficients " *
-                   "are not in slice 1")
+            computed = true
         end
     end
-    length(coefs) > 1 && _sfail("predictor $pname: $(repr(core)) is " *
-                                "nonlinear in coefficients")
+    if computed || length(coefs) > 1
+        _reads_column(core, ctx) || return _scalar_summand_error(pname, core)
+        _check_scalar_reads(pname, core, ctx)
+        return _extract_summand(pname, core, sign, ctx)
+    end
     if isempty(coefs)
         # Pure value product (interaction): extract whole (signs folded
         # in), offset term over it.
@@ -9095,6 +9298,8 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
                                      "takes `coefficients[group]` exactly, " *
                                      "got $(repr(core))")
     base, idx = core.args
+    # A literal element (`phi[1]`) is one scalar, not a per-level column.
+    idx isa Integer && return _scalar_summand_error(pname, core)
     base isa Symbol || _sfail("predictor $pname: factor base must be a " *
                               "bare coefficient vector, got $(repr(base))")
     base in ctx.data && _sfail("predictor $pname: $base is data — " *
@@ -9141,24 +9346,15 @@ end
 # block — required, never defaulted — and each one emits its LevelMap.
 # Plan order follows predictors, addressees in term order.
 function _lower_coefficient_priors(sample, coefuse, predictors,
-        matrices::Dict{Symbol,DesignMatrix}, hyper_names::Set{Symbol},
+        matrices::Dict{Symbol,DesignMatrix}, hyper_names::Set{Symbol}, ctx,
         r2d2::Set{Symbol} = Set{Symbol}(),
         hs::Set{Symbol} = Set{Symbol}())
     stated = Dict{Symbol,Any}()
     for s in sample
         haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
     end
-    for (name, uses) in coefuse
-        preds = unique!(map(first, copy(uses)))
-        length(preds) > 1 && _sfail("coefficient $name is shared across " *
-                                    "predictors $(join(preds, ", ")) — " *
-                                    "coefficient blocks are per-predictor, " *
-                                    "rename or duplicate it")
-        addrs = unique!(map(u -> u[2], copy(uses)))
-        length(addrs) > 1 && _sfail("coefficient $name is used on two " *
-                                    "columns ($(join(addrs, ", "))) — one " *
-                                    "coefficient per column")
-    end
+    # (Multiple uses of one coefficient were settled by
+    # `_check_coefficient_uses` — demoted or refused.)
     priors = PopulationPrior[]
     levelmaps = LevelMap[]
     for pred in predictors
@@ -9187,7 +9383,7 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                 t.kind === ComposedTerm) && continue
             if t.kind === MatrixTerm
                 append!(priors, _lower_matrix_priors(pred, t, coefuse,
-                    stated, matrices, hyper_names))
+                    stated, matrices, hyper_names, ctx))
                 continue
             end
             addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
@@ -9198,7 +9394,7 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
             sign = use[3]
             if t.kind === FactorTerm
                 push!(priors, _lower_factor_prior(pred, t, name, sign,
-                    stated, levelmaps, hyper_names))
+                    stated, levelmaps, hyper_names, ctx))
                 continue
             end
             if !haskey(stated, name)
@@ -9211,11 +9407,12 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                                            "as $(t.kind), not a factor")
             fam, loc, scale, nu =
                 _coefficient_prior(name, s.rhs, pred.name, addr)
-            push!(priors, PopulationPrior(pred.name, addr, fam, sign * loc,
-                scale, nu))
+            loc, scale = _signed_prior(fam, loc, scale, sign, ctx)
+            push!(priors, PopulationPrior(pred.name, addr, fam, loc, scale,
+                nu))
         end
     end
-    _check_identified(predictors, levelmaps, matrices)
+    _check_identified(predictors, levelmaps, matrices, priors)
     return priors, levelmaps
 end
 
@@ -9227,7 +9424,7 @@ end
 # (shared) or length-K literal-vector (per-element) args — real
 # broadcast semantics.
 function _lower_matrix_priors(pred, t, coefuse, stated, matrices,
-        hyper_names::Set{Symbol})
+        hyper_names::Set{Symbol}, ctx)
     X = t.options.matrix
     m = get(matrices, X, nothing)
     m === nothing && _sfail("internal: matrix term over unknown matrix $X")
@@ -9248,14 +9445,12 @@ function _lower_matrix_priors(pred, t, coefuse, stated, matrices,
                                    "lost its sizing matrix")
     fam, locs, scales, nus =
         _coefficient_matrix_prior(name, s.rhs, pred.name, K, hyper_names)
-    if sign != 1 && any(l -> l isa Symbol, locs)
-        _sfail("coefficient $name: a sign-flipped hierarchical " *
-               "location is not admitted — restate the model with an " *
-               "unflipped `Normal.($(locs[1]), $(scales[1]))` broadcast")
+    out = PopulationPrior[]
+    for (e, l, sc, n) in zip(elems, locs, scales, nus)
+        l, sc = _signed_prior(fam, l, sc, sign, ctx)
+        push!(out, PopulationPrior(pred.name, e, fam, l, sc, n))
     end
-    return PopulationPrior[PopulationPrior(pred.name, e, fam,
-            sign == 1 ? l : sign * l, sc, n)
-        for (e, l, sc, n) in zip(elems, locs, scales, nus)]
+    return out
 end
 
 # Dotted matrix priors peel to one shared family plus K (location,
@@ -9283,32 +9478,34 @@ function _coefficient_matrix_prior(name, rhs, pname, K,
                                    "needs `$head` with $want arguments")
     vecs = [_matrix_prior_arg(name, a, pname, K, "arg$i", hyper_names)
         for (i, a) in enumerate(args)]
-    nus = npos == 0 ? fill(NaN, K) : vecs[npos]
+    npos == 0 || all(v -> v isa Real, vecs[npos]) || _sfail(
+        "coefficient $name of predictor $pname: the `$head` nu " *
+        "hyperparameter must be a literal")
+    nus = npos == 0 ? fill(NaN, K) : Float64.(vecs[npos])
     return fam, vecs[lipos], vecs[spos], nus
 end
 
+# One matrix-prior argument → K per-element values: a literal or a name
+# (a sampled scalar or scalar assignment — hoisted expressions included)
+# shared over the elements, or a K-vector `[...]` of literals and names
+# (per-element). Vector-valued arguments (`lambda .* tau`) need vector
+# parameter values, which this path does not read.
 function _matrix_prior_arg(name, a, pname, K, role, hyper_names::Set{Symbol})
-    a isa Real && return fill(Float64(a), K)
-    a === :Inf && return fill(Inf, K)
-    if a isa Symbol
-        a in hyper_names || _sfail("coefficient $name prior $role " *
-            "must be a literal, a literal $K-vector, or a " *
-            "shared-hyperparameter name (per-level priors are not in " *
-            "slice 1), got $(repr(a))")
-        return fill(a, K)
+    function elt(x)
+        x isa Real && return Float64(x)
+        x === :Inf && return Inf
+        x isa Symbol && x in hyper_names && return x
+        return _sfail("coefficient $name prior $role must be a literal, a " *
+            "scalar parameter or assignment name, or a $K-vector of those, " *
+            "got $(repr(a))")
     end
     if a isa Expr && a.head === :vect
         length(a.args) == K || _sfail(
             "coefficient $name prior $role has $(length(a.args)) " *
             "elements for $K columns — one per column")
-        all(x -> x isa Real || x === :Inf, a.args) || _sfail(
-            "coefficient $name prior $role elements must be literals " *
-            "(per-element hyperparameters are not in slice 1)")
-        return Float64[x === :Inf ? Inf : x for x in a.args]
+        return Any[elt(x) for x in a.args]
     end
-    _sfail("coefficient $name prior $role must be a literal, a literal " *
-           "$K-vector, or a shared-hyperparameter name (per-level " *
-           "priors are not in slice 1), got $(repr(a))")
+    return fill(elt(a), K)
 end
 
 # Horseshoe predictors: any predictor with a stated scalar `~ Horseshoe()`
@@ -9442,8 +9639,8 @@ function _lower_horseshoe_priors(sample, coefuse, predictors,
                                            "scalar prior (`$name ~ Normal`), " *
                                            "not a levels prior — it is used " *
                                            "as $(t.kind), not a factor")
-            fam, loc, scale, _ =
-                _coefficient_prior(name, s.rhs, pred.name, addr)
+            fam, loc, scale, _ = _coefficient_prior(name, s.rhs,
+                pred.name, addr; literal = true)
             fam === :normal || _sfail("coefficient $name of predictor " *
                                       "$(pred.name) sits beside a horseshoe prior — " *
                                       "its scalar prior must be `Normal(...)`")
@@ -9536,8 +9733,8 @@ function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
                                            "scalar prior (`$name ~ Normal`), " *
                                            "not a levels prior — it is used " *
                                            "as $(t.kind), not a factor")
-            fam, loc, scale, _ =
-                _coefficient_prior(name, s.rhs, pred.name, addr)
+            fam, loc, scale, _ = _coefficient_prior(name, s.rhs,
+                pred.name, addr; literal = true)
             fam === :normal || _sfail("coefficient $name of predictor " *
                                       "$(pred.name) carries an r2d2 prior — stated " *
                                       "scalar priors must be `Normal(...)` " *
@@ -9627,7 +9824,7 @@ function _lower_r2d2_factor(pred, t, name, sign, stated, levelmaps,
 end
 
 function _lower_factor_prior(pred, t, name, sign, stated, levelmaps,
-        hyper_names::Set{Symbol})
+        hyper_names::Set{Symbol}, ctx)
     col = only(t.columns)
     haskey(stated, name) || _sfail("factor coefficient $name over $col " *
                                    "needs an explicit broadcast prior " *
@@ -9644,12 +9841,7 @@ function _lower_factor_prior(pred, t, name, sign, stated, levelmaps,
     fam, loc, scale, nu =
         _coefficient_broadcast_prior(name, s.rhs, pred.name, col, hyper_names)
     push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
-    if sign != 1 && loc isa Symbol
-        _sfail("coefficient $name: a sign-flipped hierarchical " *
-               "location is not admitted — restate the model with an " *
-               "unflipped `Normal.($loc, $scale)` broadcast")
-    end
-    loc = sign == 1 ? loc : sign * loc
+    loc, scale = _signed_prior(fam, loc, scale, sign, ctx)
     return PopulationPrior(pred.name, col, fam, loc, scale, nu)
 end
 
@@ -9711,9 +9903,12 @@ function _coefficient_broadcast_prior(name, rhs, pname, col,
 end
 
 # Surface-side identifiability gate (the contract validator repeats it for
-# hand-built plans): intercept + full-cover factor is unidentified.
-# Matrix intercepts count (any intercept position in any matrix term).
-function _check_identified(predictors, levelmaps, matrices)
+# hand-built plans, through the same `_full_cover_unidentified`):
+# intercept + full-cover factor is unidentified unless the factor's prior
+# is hierarchical. Matrix intercepts count (any intercept position in any
+# matrix term).
+function _check_identified(predictors, levelmaps, matrices,
+        priors::Vector{PopulationPrior} = PopulationPrior[])
     for pred in predictors
         has_intercept = any(t -> t.kind === InterceptTerm, pred.terms)
         if !has_intercept
@@ -9727,11 +9922,11 @@ function _check_identified(predictors, levelmaps, matrices)
         has_intercept || continue
         for t in pred.terms
             t.kind === FactorTerm || continue
-            m = _find_levelmap(levelmaps, pred.name, only(t.columns))
-            m !== nothing && m.subset === Colon() && _sfail(
-                "predictor $(pred.name) is unidentified: intercept + " *
-                "full-cover factor over $(only(t.columns)) (drop the " *
-                "intercept or index a strict subset of levels)")
+            col = only(t.columns)
+            m = _find_levelmap(levelmaps, pred.name, col)
+            m === nothing && continue
+            msg = _full_cover_unidentified(pred.name, col, m, priors)
+            msg === nothing || _sfail(msg)
         end
     end
     return nothing
@@ -9766,10 +9961,14 @@ const _COEF_SHAPES = Dict{Symbol,NTuple{4,Int}}(
     :student_t => (3, 2, 3, 1), :uniform => (2, 1, 2, 0),
 )
 
-# Scalar coefficient prior → (family, location, scale, nu): params are
-# literals (`nu` is `NaN` unless StudentT; `:flat` carries conventional
-# `(0.0, 1.0, NaN)`, ignored downstream).
-function _coefficient_prior(name, rhs, pname, addr)
+# Scalar coefficient prior → (family, location, scale, nu): location and
+# scale are literals or names (parameters, assignments, hoisted argument
+# expressions — the contract resolves their roles); `nu` and `Uniform`
+# bounds are literals (`_coef_prior_expressible` routes anything else to
+# an ordinary parameter). `nu` is `NaN` unless StudentT; `:flat` carries
+# conventional `(0.0, 1.0, NaN)`, ignored downstream. `literal = true`
+# keeps the literal-only grammar of the r2d2/horseshoe override slots.
+function _coefficient_prior(name, rhs, pname, addr; literal::Bool = false)
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
         rhs.args[1] isa Symbol && haskey(_COEF_FAMILIES, rhs.args[1]) ||
         _sfail("coefficient $name of predictor $pname needs a " *
@@ -9785,8 +9984,194 @@ function _coefficient_prior(name, rhs, pname, addr)
     want, lipos, spos, npos = _COEF_SHAPES[fam]
     length(args) == want || _sfail("coefficient $name of predictor $pname " *
                                    "needs `$head` with $want arguments")
-    vals = [_coefficient_literal(name, a, pname) for a in args]
+    vals = Any[literal ? _coefficient_literal(name, a, pname) :
+        _coefficient_arg(name, a, pname) for a in args]
     return fam, vals[lipos], vals[spos], npos == 0 ? NaN : vals[npos]
+end
+
+function _coefficient_arg(name, a, pname)
+    a isa Real && return Float64(a)
+    a === :Inf && return Inf
+    _is_signed_inf(a) && return a.args[1] === :- ? -Inf : Inf
+    a isa Symbol && return a
+    _sfail("coefficient $name of predictor $pname: prior argument " *
+           "$(repr(a)) must be a literal or a name")
+end
+
+# The signed coefficient's prior (a use `.- b .* x` stores `-b`):
+# symmetric families negate the location — a literal directly, a name
+# through one synthetic negating assignment — and `Uniform(lo, hi)`
+# becomes `Uniform(-hi, -lo)`.
+function _signed_prior(fam, loc, scale, sign::Int, ctx)
+    sign == 1 && return loc, scale
+    fam === :uniform && return -scale, -loc
+    fam === :flat && return loc, scale
+    loc isa Real && return -loc, scale
+    nm = get!(ctx.negated, loc) do
+        n = Symbol(:_rkppl_neg_, loc)
+        k = 1
+        while n in ctx.taken
+            k += 1
+            n = Symbol(:_rkppl_neg_, loc, :_, k)
+        end
+        push!(ctx.taken, n)
+        push!(ctx.synth_assigns, AssignmentSpec(n, Expr(:call, :-, loc), n))
+        n
+    end
+    return nm, scale
+end
+
+# A scalar coefficient prior the affine block can carry: a coefficient
+# family over positional literal/name arguments (expression arguments are
+# names by now — `_hoist_prior_args!`), literal `Uniform` bounds and
+# literal StudentT `nu`. Anything else (keyword halves such as
+# `Normal(0, s; lower=0)`, parameter bounds) is an ordinary parameter
+# prior. Arity mistakes stay with the coefficient path's message.
+function _coef_prior_expressible(rhs)
+    args = rhs.args[2:end]
+    any(a -> a isa Expr && (a.head === :parameters || a.head === :kw),
+        args) && return false
+    fam = _COEF_FAMILIES[rhs.args[1]]
+    fam === :flat && return true
+    want, _, _, npos = _COEF_SHAPES[fam]
+    length(args) == want || return true
+    lit(a) = a isa Real || a === :Inf || _is_signed_inf(a)
+    all(a -> lit(a) || a isa Symbol, args) || return false
+    # Uniform bounds stay literal (`Inf` included, so the contract's
+    # finite-bounds check reports it on the coefficient path).
+    fam === :uniform && return all(lit, args)
+    return npos == 0 || lit(args[npos])
+end
+
+_is_signed_inf(a) = a isa Expr && a.head === :call && length(a.args) == 2 &&
+    a.args[2] === :Inf && (a.args[1] === :- || a.args[1] === :+)
+
+# Pure-literal scalar arithmetic folds to its value (`1 / 2`, `sqrt(2)`):
+# `nothing` unless every leaf is a number and every call is admitted
+# scalar math, with a finite real result.
+const _FOLD_FNS = (:+, :-, :*, :/, :^, :sqrt, :log, :log10, :log1p, :exp,
+    :expm1, :abs)
+function _fold_literal(a)
+    a isa Real && return Float64(a)
+    a isa Expr && a.head === :call && !isempty(a.args) &&
+        a.args[1] in _FOLD_FNS || return nothing
+    vals = Float64[]
+    for x in a.args[2:end]
+        v = _fold_literal(x)
+        v === nothing && return nothing
+        push!(vals, v)
+    end
+    r = try
+        getfield(Base, a.args[1])(vals...)
+    catch
+        return nothing
+    end
+    return r isa Real && isfinite(r) ? Float64(r) : nothing
+end
+
+"""Prior-argument hoisting: an expression in a prior's argument position
+(`b ~ Normal(0, 2 * s)`, `c[levels(g)] .~ Normal.(0, sqrt(v))`,
+`b[axes(X, 2)] .~ Normal.(0, [s1, 2 * s2])`) binds to a synthetic scalar
+definition named after its statement (`_rkppl_b_arg2`), so every prior
+position downstream sees a literal or a name — naming a subexpression
+never changes legality. Pure-literal arithmetic folds to its value instead
+(`Normal(0, 1 / 2)` keeps a literal scale). Response arguments are
+predictor locations and never hoist; vector-valued arguments stay put (the
+per-position peelers name them). `resolve` maps an argument through the
+model's module-call resolution first, so a hoisted argument calls exactly
+what the same expression bound to a name would. Rewrites `sample` and
+`plate_specs` in place (both fresh from `_partition_statements`) and
+returns the extended definition list."""
+function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
+        plate_specs; resolve = identity)
+    detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
+    detnames = Set{Symbol}(keys(detmap))
+    taken = union(data, detnames, Set{Symbol}(s.lhs for s in sample),
+        Set{Symbol}(p[1] for p in plate_specs))
+    out = Pair{Symbol,Any}[nm => rhs for (nm, rhs) in det]
+    memo = Dict{Symbol,Symbol}()
+    function bind(lhs::Symbol, stem::Symbol, a)
+        a isa Expr && !_is_signed_inf(a) && a.head !== :vect &&
+            a.head !== :parameters && a.head !== :kw || return a
+        f = _fold_literal(a)
+        f === nothing || return f
+        r = resolve(a)
+        _shape_of(r, data, detmap, memo, Set{Symbol}()) === :scalar ||
+            return a
+        _reject_unknown_calls("the prior of $lhs (argument " *
+                              "`$(repr(a))`)", r)
+        a = r
+        nm = Symbol(:_rkppl_, stem)
+        k = 1
+        while nm in taken
+            k += 1
+            nm = Symbol(:_rkppl_, stem, :_, k)
+        end
+        push!(taken, nm)
+        push!(out, nm => a)
+        detmap[nm] = a
+        return nm
+    end
+    # Positional arguments only (a `:parameters` keyword block keeps its
+    # place and is never an argument position); unchanged input returns
+    # itself, so untouched statements keep their exact AST.
+    function hoist_args(lhs, args)
+        local res = Any[]
+        i = 0
+        for a in args
+            if a isa Expr && a.head === :parameters
+                push!(res, a)
+                continue
+            end
+            i += 1
+            push!(res, a isa Expr && a.head === :vect ?
+                Expr(:vect, (bind(lhs, Symbol(lhs, :_arg, i, :_, j), x)
+                    for (j, x) in enumerate(a.args))...) :
+                bind(lhs, Symbol(lhs, :_arg, i), a))
+        end
+        return res == args ? args : res
+    end
+    function hoist_call(lhs, rhs)
+        rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+            rhs.args[1] isa Symbol || return rhs
+        if rhs.args[1] === :truncated && length(rhs.args) == 4
+            inner = hoist_call(lhs, rhs.args[2])
+            inner === rhs.args[2] && return rhs
+            return Expr(:call, :truncated, inner, rhs.args[3:end]...)
+        end
+        rhs.args[1] in _HOIST_FAMILIES || return rhs
+        args = rhs.args[2:end]
+        new = hoist_args(lhs, args)
+        new === args && return rhs
+        return Expr(:call, rhs.args[1], new...)
+    end
+    for (i, s) in enumerate(sample)
+        s.lhs in data && continue
+        rhs = s.rhs
+        if s.broadcast
+            # Only sized coefficient-vector priors; other `.~` are
+            # responses (data or derived) whose arguments are locations.
+            s.levels === nothing && s.matrix === nothing && continue
+            rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
+                rhs.args[2] isa Expr && rhs.args[2].head === :tuple &&
+                rhs.args[1] in _HOIST_FAMILIES || continue
+            args = rhs.args[2].args
+            new = hoist_args(s.lhs, args)
+            new === args && continue
+            rhs = Expr(:., rhs.args[1], Expr(:tuple, new...))
+        else
+            s.lhs in detnames && continue
+            rhs = hoist_call(s.lhs, rhs)
+        end
+        rhs === s.rhs && continue
+        sample[i] = SampleStmt(s.lhs, rhs, s.broadcast, s.range, s.levels,
+            s.matrix)
+    end
+    for (i, (nm, rhs, rng, line)) in enumerate(plate_specs)
+        new = hoist_call(nm, rhs)
+        new === rhs || (plate_specs[i] = (nm, new, rng, line))
+    end
+    return out
 end
 
 function _coefficient_literal(name, a, pname)
@@ -9805,6 +10190,11 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :InverseGamma => :inverse_gamma, :StudentT => :student_t,
     :Laplace => :laplace, :Logistic => :logistic, :Uniform => :uniform,
 )
+
+# Families whose positional prior arguments hoist (scalar `~` and per-cell
+# latent priors); `truncated(D(...), lo, hi)` hoists D's arguments only.
+const _HOIST_FAMILIES = union(Set{Symbol}(keys(_PARAM_FAMILIES)),
+    Set{Symbol}(keys(_COEF_FAMILIES)), Set{Symbol}((:HalfNormal, :HalfCauchy)))
 
 # A `dar()` trajectory parameter rides Stan-kernel semantics: the
 # persistence's `(:interval, 0, 1)` becomes `(:interval_stan, 0, 1)`
@@ -10297,8 +10687,6 @@ function _lower_param_arg(lhs, a, coefuse, matrices)
     a isa Symbol || _sfail("parameter $lhs argument $(repr(a)) must be a " *
                            "literal or a parameter/assignment name (bind " *
                            "expressions via an assignment first)")
-    haskey(coefuse, a) && _sfail("$a is a predictor coefficient and cannot " *
-                                 "also be a parameter argument (parameter $lhs)")
     haskey(matrices, a) && _sfail("parameter $lhs argument $a is a design " *
                                   "matrix — prior arguments are scalar " *
                                   "(a literal or a parameter/assignment name)")
@@ -10492,11 +10880,6 @@ function _lower_assignment(nm, rhs, coefuse)
     _contains_dar(rhs) && _sfail("assignment `$nm` calls `dar()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ dar(beta, sigma)`), not inside definitions")
-    for s in _value_symbols(rhs)
-        haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
-                                     "cannot also be referenced by assignment " *
-                                     "$nm")
-    end
     rhs isa Expr || rhs isa Symbol || rhs isa Real ||
         _sfail("assignment $nm must be an expression, name or literal, " *
                "got $(repr(rhs))")
@@ -10522,11 +10905,6 @@ function _lower_vector_assignment(nm, rhs, coefuse)
     _contains_dar(rhs) && _sfail("derived column `$nm` calls `dar()`, " *
         "which lowers only as a direct predictor summand " *
         "(`mu = a .+ dar(beta, sigma)`), not inside definitions")
-    for s in _value_symbols(rhs)
-        haskey(coefuse, s) && _sfail("$s is a predictor coefficient and " *
-                                     "cannot also be referenced by derived " *
-                                     "column $nm")
-    end
     rhs isa Expr || rhs isa Symbol ||
         _sfail("derived column $nm must be an expression or column alias, " *
                "got $(repr(rhs))")

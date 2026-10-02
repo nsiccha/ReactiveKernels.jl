@@ -171,6 +171,27 @@ selection, topological sort, cache lookup, or dynamic scheduling. Julia still
 specializes and executes the recipe callables normally; their own dispatch,
 allocations, exceptions, and side effects are not erased by the graph compiler.
 
+One rewrite reaches into those callables. Natively, a generator fold over a
+data-length iterator, `sum(term for i in iter [if condition]; init = x)` with
+`iter` an `eachindex`, `axes`, `range` or `a:b` call, runs as its
+explicit-accumulator loop in every recipe, plate cell, scan step and
+`@traceable` method body. Base evaluates `sum` with `init` as the left fold
+`foldl(add_sum, …; init)` on Julia 1.10 through 1.13, so the loop returns
+Base's value bitwise, in Base's order: the iterator, then `init`, then the
+condition and the term for each element. The rewrite exists for Julia 1.10's
+inference. When a Base fold is inferred inside another fold's term (a nested
+sum, or a sum in a helper that the term calls), it re-enters `mapfoldl` with a
+larger signature, inference widens that call to `Any`, and every element then
+dispatches dynamically and boxes. A 4 × 4 nested sum allocates 10 times (about
+300 B) per call, and a 14-step scan whose step evaluates one allocates 4,256 B
+beside its 176 B result vector. Julia 1.12 infers the same nest concretely. Some folds keep the
+authored call: one whose term or condition assigns, declares, returns, jumps,
+loops or holds a macro call, one without `init`, one over another iterator (a
+tuple's fold is Base's unrolled one), and one whose `sum` is not Base's. A
+plain helper's own nested sum also keeps it, because RK never sees that body:
+define the helper with `@traceable`, or write it with loops. The tensorized
+companion keeps its own lowering of the same folds.
+
 `transform` applies user-supplied expression passes between lowering and
 compilation. The compiler preserves pass order but cannot prove that a pass
 preserves semantics. A transformed expression is therefore part of the user's

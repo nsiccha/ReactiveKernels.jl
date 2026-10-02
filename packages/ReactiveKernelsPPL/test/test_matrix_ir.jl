@@ -438,7 +438,7 @@ end
     cases = [
         ("is a vector — use `.~`", quote b[axes(X, 2)] ~ Normal(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         ("needs a broadcast prior", quote b[axes(X, 2)] .~ Gamma.(1, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("must be a literal, a literal 2-vector, or a shared-hyperparameter name", quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("must be a literal, a scalar parameter or assignment name, or a 2-vector of those", quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         ("has 2 elements for 3 columns", quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
     ]
     for (msg, ast) in cases

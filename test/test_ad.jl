@@ -18,6 +18,14 @@ const _WIDE_SPLAT_SUM = let names = [Symbol(:w_, i) for i in 1:40]
     Core.eval(@__MODULE__, Expr(:->, Expr(:tuple, names...),
         Expr(:call, :+, names...)))
 end
+# A 33-input fused op mixing one constant array with 32 active lanes, summed
+# pairwise so the closure body itself never splats (snag
+# `rkppl-module-cal-79cad594`).
+const _WIDE_MIXED_SUM = let names = [Symbol(:m_, i) for i in 1:32]
+    Core.eval(@__MODULE__, Expr(:->, Expr(:tuple, :data, names...),
+        foldl((a, b) -> Expr(:call, :+, a, b), names;
+              init = Expr(:call, :sum, :data))))
+end
 
 _test_ad_value_gradient_allocated(prepared, gradient, q, data) =
     @allocated ad_value_and_gradient!(prepared, gradient, q, data)
@@ -150,6 +158,48 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
             o for o in kernel.ops if o isa ReactiveKernels._KernelSourceOp)
         llvm = sprint(code_llvm, ReactiveKernels._kernel_source_call,
             Tuple{Val{:native},typeof(op),ntuple(_ -> Float64, 40)...})
+        @test !occursin("jl_apply_generic", llvm)
+    end
+
+    @testset "wide fused op mixing a constant array with active lanes" begin
+        # Julia's inliner rewrites an `args...` splat into a direct call only
+        # up to 32 elements; the op's own entry call splatted its arguments,
+        # so a 33-input op stayed a dynamic `Core._apply_iterate` whose
+        # argument tuple held the constant `data` next to active lanes, and
+        # reverse mode failed with `EnzymeRuntimeActivityError` (snag
+        # `rkppl-module-cal-79cad594`; a 32-argument module call over a bound
+        # data vector).
+        graph = Graph()
+        q = value!(graph, :q, Vector{Float64})
+        data = value!(graph, :data, Vector{Float64})
+        lanes = [value!(graph, Symbol(:m_, i), Float64) for i in 1:32]
+        for (lane, shift) in zip(lanes, _WIDE_SPLAT_LANES)
+            add!(graph, (q,) => lane, shift)
+        end
+        total = value!(graph, :total, Float64)
+        add!(graph, (data, lanes...) => total,
+            ReactiveKernels._KernelSourceOp(
+                Val(:wide_mixed_regression), Val(:fused), _WIDE_MIXED_SUM))
+        kernel = prepare(graph; have = (q, data), want = total)
+        point = [0.25, -0.5, 1.0]
+        observed = [1.0, 2.0, 3.0]
+        expected_value = sum(observed) + 32 * sum(point) + 32 * 33 / 2
+        @test kernel(point, observed) ≈ expected_value
+        @test ad_gradient(kernel, TEST_AD_BACKEND, point, observed;
+                          active = :q) ≈ fill(32.0, 3)
+        prepared = prepare_ad(kernel, TEST_AD_BACKEND, point, observed;
+                              active = :q)
+        destination = fill(NaN, 3)
+        value, _ = ad_value_and_gradient!(
+            prepared, destination, point, observed)
+        @test value ≈ expected_value
+        @test destination ≈ fill(32.0, 3)
+        # The op's entry call itself forwards statically.
+        op = only(
+            o for o in kernel.ops if o isa ReactiveKernels._KernelSourceOp)
+        llvm = sprint(code_llvm, op,
+            Tuple{Vector{Float64},ntuple(_ -> Float64, 32)...})
+        @test !occursin("jl_f__apply_iterate", llvm)
         @test !occursin("jl_apply_generic", llvm)
     end
 

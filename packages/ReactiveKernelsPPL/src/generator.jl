@@ -688,8 +688,6 @@ function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
             "unknown sub-predictor $node"))
         return _lp_name(plan.predictors[i])
     end
-    # A numeric literal operand (`mu .^ 2`) stays itself.
-    node isa Expr || return node
     # Dotted map `f.(x, ...)`: `Expr(:., f, Expr(:tuple, x, ...))`, the
     # map renamed to its generated-module math binding.
     node.head === :. && return Expr(:., _composed_map_emit(node.args[1]),
@@ -3145,12 +3143,15 @@ _bind_plate_prior_arg!(stmts::Vector{Expr}, name::Symbol,
     v::Vector{Float64}) = push!(stmts, :($name = Float64[$(v...)]))
 _bind_plate_prior_arg!(stmts::Vector{Expr}, name::Symbol, v::Symbol) =
     push!(stmts, :($name = $v))
+# A per-element lane mixing literals and names (`Normal.(0, [s1, 2.0])`):
+# one in-graph vector over the constrained names.
+_bind_plate_prior_arg!(stmts::Vector{Expr}, name::Symbol, v::Vector{Any}) =
+    push!(stmts, :($name = [$(v...)]))
 
 # Collapse one prior-arg position across a block's rows to its plate
 # lane: all-literal rows give the literal lane vector; rows sharing one
-# hyper name give the name; anything else (mixed literal/hyper,
-# disagreeing hypers) is a loud internal error — the surface admits
-# shared hypers on factor broadcasts only.
+# hyper name give the name; per-element names (or names mixed with
+# literals) give one element per row.
 function _plate_prior_lane(rows::Vector{PopulationPrior}, field::Symbol,
         what::String)
     vals = map(r -> getfield(r, field), rows)
@@ -3158,15 +3159,13 @@ function _plate_prior_lane(rows::Vector{PopulationPrior}, field::Symbol,
         return Float64[v for v in vals]
     all(v -> v isa Symbol, vals) && allequal(vals) &&
         return vals[1]
-    throw(ContractValidationError(
-        "[generator] internal: $what mixes literal and hyperparameter " *
-        "priors across one coefficient block (shared hypers ride " *
-        "factor broadcasts only)"))
+    return Any[v isa Symbol ? v : Float64(v) for v in vals]
 end
 
 function _append_coef_plate!(stmts::Vector{Expr}, coefaccess::Any,
         node::Symbol, pw::Symbol, mut::Symbol, sdt::Symbol, nut::Symbol,
-        loc::Union{Vector{Float64},Symbol}, sca::Union{Vector{Float64},Symbol},
+        loc::Union{Vector{Float64},Symbol,Vector{Any}},
+        sca::Union{Vector{Float64},Symbol,Vector{Any}},
         nus::Vector{Float64}, fam::Symbol)
     fam === :flat && throw(ContractValidationError(
         "[generator] internal: flat coefficients contribute no plate"))
@@ -3187,10 +3186,15 @@ function _append_coef_plate!(stmts::Vector{Expr}, coefaccess::Any,
     return nothing
 end
 
-# Endpoint args for one population row (literals): StudentT carries nu.
+# Endpoint args for one population row: a literal, or a parameter /
+# assignment name read as its constrained local (transforms and
+# assignments precede the prior statements). StudentT carries nu.
+_prior_endpoint(v::Symbol) = v
+_prior_endpoint(v::Real) = Float64(v)
 _population_endpoint_args(pr::PopulationPrior) = pr.family === :student_t ?
-    Any[Float64(pr.nu), Float64(pr.location), Float64(pr.scale)] :
-    Any[Float64(pr.location), Float64(pr.scale)]
+    Any[Float64(pr.nu), _prior_endpoint(pr.location),
+        _prior_endpoint(pr.scale)] :
+    Any[_prior_endpoint(pr.location), _prior_endpoint(pr.scale)]
 
 # Per-addressee emission for a MIXED predictor (the homogeneous fast path
 # in `_prior_statements` keeps today's exact plate): width-1 blocks become
@@ -3228,12 +3232,6 @@ function _mixed_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             # block (a `continue` here would misalign every later
             # read).
             if pr.family !== :flat
-                (pr.location isa Real && pr.scale isa Real) ||
-                    throw(ContractValidationError(
-                        "[generator] internal: scalar coefficient " *
-                        "$(b.addressee) of $(pred.name) carries a " *
-                        "hyperparameter prior (shared hypers ride " *
-                        "factor broadcasts only)"))
                 node = Symbol(:_ppl_prior_, pred.name, :_, b.addressee)
                 expr = _family_logpdf_expr(pr.family,
                     _population_endpoint_args(pr),

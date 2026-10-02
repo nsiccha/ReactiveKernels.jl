@@ -6485,8 +6485,7 @@ const _COMPOSED_OPS = (:.*, :.+, :.-)
 # location, one of these over ONE bare sub-predictor is a link spelling.
 const _COMPOSED_UNARY = (:exp, :logistic)
 # The other dotted operators (`mu ./ s`, `mu .^ 2`, comparisons for
-# `ifelse.`): plain broadcast math over the LP nodes, literal operands
-# admitted.
+# `ifelse.`): plain broadcast math over the LP nodes.
 const _COMPOSED_MORE_OPS = Tuple(op for op in ELEMENTWISE_OPS
     if op ∉ _COMPOSED_OPS)
 # Every elementwise map a composed tree admits: the link-shaped unary
@@ -6502,16 +6501,15 @@ const _COMPOSED_AFFINE_KINDS =
 const _COMPOSED_SUB_KINDS = (_COMPOSED_AFFINE_KINDS..., VaryingEffectTerm)
 
 """Recurse a composed tree: leaves must be declared subs/scalars/data
-columns (or numeric literals), nodes dotted operators of matching arity
-or admitted elementwise maps (`_composed_map_fn`). Returns the leaf
-set."""
+columns (a literal arrives as a named scalar leaf), nodes dotted
+operators of matching arity or admitted elementwise maps
+(`_composed_map_fn`). Returns the leaf set."""
 function _validate_composed_tree(tree, subs::Vector{Symbol},
         scalars::Vector{Symbol}, label::Symbol,
         datas::Vector{Symbol} = Symbol[])
     allowed = union(subs, scalars, datas)
     leaves = Symbol[]
     function walk(node)
-        node isa Number && return nothing
         if node isa Symbol
             node in allowed || _fail(label,
                 "composed tree leaf $node is neither a declared " *
@@ -6756,11 +6754,12 @@ function _validate_levelmaps(plan::StructuralPlan)
         if has_intercept
             for t in pred.terms
                 t.kind === FactorTerm || continue
-                m = _find_levelmap(plan.levelmaps, pred.name, only(t.columns))
-                m !== nothing && m.subset === Colon() && _fail(pred.label,
-                    "predictor $(pred.name) is unidentified: intercept + " *
-                    "full-cover factor over $(only(t.columns)) (drop the " *
-                    "intercept or index a strict subset of levels)")
+                col = only(t.columns)
+                m = _find_levelmap(plan.levelmaps, pred.name, col)
+                m === nothing && continue
+                msg = _full_cover_unidentified(pred.name, col, m,
+                    plan.population_priors)
+                msg === nothing || _fail(pred.label, msg)
             end
         end
     end
@@ -6771,6 +6770,32 @@ function _validate_levelmaps(plan::StructuralPlan)
         _validate_subset_shape(m)
     end
     return nothing
+end
+
+# Intercept + full-cover factor (the surface and contract gates share this
+# rule): a hierarchical prior — a parameter or assignment scale around a
+# literal location (`c[levels(g)] .~ Normal.(0, sg)`) — identifies the
+# level offsets against the intercept, so the pair is admitted. A literal
+# or flat prior leaves an exact likelihood ridge pinned only by fixed
+# priors, and a parameter location trades off with the intercept itself;
+# both stay refused. Returns the refusal message or `nothing`.
+function _full_cover_unidentified(pred::Symbol, col::Symbol, m::LevelMap,
+        priors::Vector{PopulationPrior})
+    m.subset === Colon() || return nothing
+    i = findfirst(p -> p.predictor === pred && p.addressee === col, priors)
+    pr = i === nothing ? nothing : priors[i]
+    if pr !== nothing && pr.family !== :flat && pr.family !== :uniform &&
+            pr.scale isa Symbol
+        pr.location isa Real && return nothing
+        return "predictor $pred is unidentified: intercept + full-cover " *
+            "factor over $col whose prior location $(pr.location) is a " *
+            "parameter — the intercept and $(pr.location) trade off " *
+            "exactly (drop one, or center the factor prior at a literal)"
+    end
+    return "predictor $pred is unidentified: intercept + full-cover " *
+        "factor over $col with a fixed prior (drop the intercept, index a " *
+        "strict subset of levels, or give the factor a hierarchical scale: " *
+        "`c[levels($col)] .~ Normal.(0, s)` with `s` a parameter)"
 end
 
 function _find_levelmap(maps::Vector{LevelMap}, pred::Symbol, col::Symbol)
@@ -6930,9 +6955,10 @@ function _validate_priors(plan::StructuralPlan)
         # Location/scale are literals or hyperparameter names (the
         # centered-hierarchical shape). A location hyperparameter names
         # a scalar sampled parameter or scalar assignment; a scale
-        # hyperparameter names a positive-support sampled parameter
-        # (assignments are not statically positive — sample the scale
-        # instead). Coefficient priors are DAG sinks (nothing references
+        # hyperparameter names a positive-support sampled parameter or a
+        # scalar assignment (`b ~ Normal(0, sqrt(phi1 * R2) * tau)` —
+        # its positivity is the author's, as for `Normal(0, s)` in
+        # Julia). Coefficient priors are DAG sinks (nothing references
         # them, and parameters cannot reference coefficients), so the
         # new edge cannot cycle — no topological check is owed.
         _loc = pr.location
@@ -6949,12 +6975,15 @@ function _validate_priors(plan::StructuralPlan)
                       "with finite location and positive scale")
         end
         _sc = pr.scale
-        if _sc isa Symbol
+        if _sc isa Symbol && _sc in assign_names
+            # A scalar assignment scale (in-graph value).
+        elseif _sc isa Symbol
             haskey(by_param, _sc) ||
                 _fail(:plan, "prior for $key has scale hyperparameter " *
                       "$_sc — a scale hyperparameter names a " *
-                      "positive-support sampled parameter (not an " *
-                      "assignment, data column, or coefficient)")
+                      "positive-support sampled parameter or a scalar " *
+                      "assignment (not a data column, coefficient, or " *
+                      "vector)")
             # Interval hypers count when the whole interval is
             # non-negative (the open-interval transform keeps reads
             # strictly inside, so the scale stays positive) — the
