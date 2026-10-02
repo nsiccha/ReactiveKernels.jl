@@ -57,6 +57,12 @@ function decayed_events(g, t, eg, et, ea, w, scale, k)
     end
     return out
 end
+# A helper with forty positional scalar arguments after one vector, summed
+# pairwise (no splat in its own body): a call to it carries more than the 32
+# arguments Julia's inliner forwards statically.
+const WIDE_NAMES = [Symbol(:b, i) for i in 1:40]
+@eval wide_reads(v, $(WIDE_NAMES...)) =
+    fill(sum(v) + $(foldl((a, b) -> :($a + $b), WIDE_NAMES)), 3)
 end
 const _FV = FunctionsAsValuesModels
 
@@ -724,5 +730,118 @@ end
         _, dg = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
             dq.ad, similar(u), u)
         @test dg ≈ g
+    end
+end
+
+@testset "functions as values: elementwise math over level-sized arrays" begin
+    # A declaration's whole-value shape does not depend on whether it
+    # could instead be used as a predictor coefficient. Both declarations
+    # below have the same values in sorted level order. The helper's
+    # result is an ordinary vector, gathered by integer positions.
+    for (K, n) in ((2, 7), (5, 13))
+        cols = Dict(:y => [0.3 * sin(i) for i in 1:n],
+            :g => [mod1(i, K) for i in 1:n])
+        builds = map((:(levels(g)), :(1:length(levels(g))))) do axis
+            _fv_build(quote
+                s ~ HalfNormal(1)
+                z[$axis] .~ Normal.(0, 1)
+                v = exp.(s .* z)
+                w = scaled(v, 2.0)
+                a ~ Normal(0, 1)
+                mu = a .+ w[g]
+                y .~ Normal.(mu, 1.0)
+            end, cols)
+        end
+        for (_, bound, built) in builds
+            @test only(bound.array_parameters).name === :z
+            @test built.layout.total == K + 2
+            u = [0.2 * cos(i) for i in 1:built.layout.total]
+            th = constrain(built.layout, u)
+            want = sum(logpdf.(Normal.(only(th.mu) .+
+                2 .* exp.(th.s .* th.z)[cols[:g]], 1.0), cols[:y]))
+            @test _fv_value(built, bound, :likelihood, u) ≈ want
+            q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+            kern = prepare_query(built, bound, :sampler)
+            val, grad = sampler_value_and_gradient!(q, similar(u), u)
+            @test val ≈ Base.invokelatest(kern, u)
+            @test isapprox(grad,
+                _fv_findiff(v -> Base.invokelatest(kern, v), u);
+                rtol = 1e-5, atol = 1e-7)
+        end
+        u = [0.2 * cos(i) for i in 1:K + 2]
+        @test _fv_value(builds[1][3], builds[1][2], :sampler, u) ≈
+            _fv_value(builds[2][3], builds[2][2], :sampler, u)
+        # Naming the elementwise intermediate keeps its shape and density.
+        _, ibound, ibuilt = _fv_build(quote
+            s ~ HalfNormal(1)
+            z[levels(g)] .~ Normal.(0, 1)
+            w = scaled(exp.(s .* z), 2.0)
+            a ~ Normal(0, 1)
+            mu = a .+ w[g]
+            y .~ Normal.(mu, 1.0)
+        end, cols)
+        @test _fv_value(ibuilt, ibound, :sampler, u) ≈
+            _fv_value(builds[1][3], builds[1][2], :sampler, u)
+    end
+end
+
+@testset "functions as values: whole design-sized arrays beside coefficients" begin
+    # `axes(B, 2)` over an hcat design has the same coefficient-capable
+    # role as `levels(g)`. Whole z is an array while B * b stays affine.
+    cols = _fv_cols()
+    cols[:x2] = [0.25 * cos(i) for i in eachindex(cols[:y])]
+    cols[:c] = [mod1(i, 2) for i in eachindex(cols[:y])]
+    _, bound, built = _fv_build(quote
+        B = hcat(x, x2)
+        s ~ HalfNormal(1)
+        z[axes(B, 2)] .~ Normal.(0, 1)
+        b[axes(B, 2)] .~ Normal.(0, 1)
+        v = exp.(s .* z)
+        w = scaled(v, 2.0)
+        a ~ Normal(0, 1)
+        mu = a .+ B * b .+ w[c]
+        y .~ Normal.(mu, 1.0)
+    end, cols)
+    @test only(bound.array_parameters).name === :z
+    @test any(t -> t.kind === ReactiveKernelsPPL.MatrixTerm,
+        only(bound.predictors).terms)
+    u = [0.2 * cos(i) for i in 1:built.layout.total]
+    th = constrain(built.layout, u)
+    # The affine layout packs the intercept followed by the two slopes.
+    want = sum(logpdf.(Normal.(th.mu[1] .+
+        hcat(cols[:x], cols[:x2]) * th.mu[2:3] .+
+        2 .* exp.(th.s .* th.z)[cols[:c]], 1.0), cols[:y]))
+    @test _fv_value(built, bound, :likelihood, u) ≈ want
+end
+
+@testset "functions as values: a call wider than 32 arguments (Enzyme vs FD)" begin
+    # A parameter-dependent call with a data vector plus forty scalar
+    # parameters reaches the kernel as one fused op of 41+ inputs. Its
+    # reverse gradient used to fail with `EnzymeRuntimeActivityError` once
+    # the op had 32 inputs or more (snag `rkppl-module-cal-79cad594`): the
+    # op's entry call splatted its arguments, and past 32 that splat stays a
+    # dynamic call holding the constant data next to active parameters.
+    cols = Dict{Symbol,ColumnData}(
+        :age => [0.0, 0.1, 0.2], :oi => [1, 2, 3, 3],
+        :y => [0.1, 0.2, 0.3, 0.4])
+    names = _FV.WIDE_NAMES
+    priors = [:($b ~ Normal(0.0, 1.0)) for b in names]
+    for argument in (:age, :(c .* age), :(a .+ c .* age))
+        ast = Expr(:block,
+            :(sigma ~ Exponential(1.0)), :(a ~ Normal(0.0, 1.0)),
+            :(c ~ Normal(0.0, 1.0)), priors...,
+            :(reads = wide_reads($argument, $(names...))),
+            :(y .~ Normal.(reads[oi], sigma)))
+        _, bound, built = _fv_build(ast, cols)
+        kern = prepare_query(built, bound, :sampler)
+        n = length(coordinate_names(built.layout))
+        @test n == 43
+        u = [0.05 * (-1)^i * i / n for i in 1:n]
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        v, g = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            q.ad, similar(u), u)
+        @test v ≈ Base.invokelatest(kern, u)
+        @test isapprox(g, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
     end
 end

@@ -33,6 +33,8 @@ and surface as [`ContractValidationError`](@ref) from the trailing
 """
 struct SurfaceLoweringError <: Exception
     message::String
+    SurfaceLoweringError(message::AbstractString) =
+        new(_author_names(message))
 end
 Base.showerror(io::IO, e::SurfaceLoweringError) =
     print(io, "SurfaceLoweringError: ", e.message)
@@ -221,11 +223,11 @@ _dict_key(k::Symbol) = k
 _dict_key(k::AbstractString) = Symbol(k)
 _dict_key(k) = _sfail("data column keys must be Symbols, got $(repr(k))")
 
-_check_col(k, v) = v isa ColumnData ? v :
-    _sfail("data column $k must be a vector or matrix, got $(typeof(v))")
+_check_col(k, v) = v isa _SuppliedColumn ? v :
+    _sfail("data value $k must be a number or an array, got $(typeof(v))")
 
 function _bind_model(m::RKPPLModel, cols::Dict{Symbol,ColumnData})
-    plan = lower_rkppl(m.ast, keys(cols); mod = m.mod)
+    plan = lower_rkppl(m.ast, cols; mod = m.mod)
     return bind_data(plan, cols)
 end
 
@@ -255,13 +257,15 @@ shared block a program calls (`y ~ stream_a(...)` to `y ~ stream_b(...)`)
 without forking the shared def. Multi-part calls fold left, so fix-vs-splice
 conflicts resolve to the LATER part (write the fix last).
 
-NamedTuple fix: each `name = value` removes the matching base statement and
-stores `value` (a vector or matrix) as model data, bound at the call —
-explicit call kwargs win over it (SB easily-rebound data).
+NamedTuple fix (a pin): each `name = value` removes the matching base
+statement and stores `value` — a number or an array of any shape — as model
+data, bound at the call; explicit call kwargs win over it (SB
+easily-rebound data). A pinned number reads as a model-level value
+(`merge(m, (; tau = 0.3))` reads `tau` exactly as `tau = 0.3` would).
 
 Fail-closed: non-statement overrides, non-bare LHS, duplicate base LHS,
-fixes naming no statement, and non-vector fix values throw
-`SurfaceLoweringError`. Ranged / levels / joint LHS (`y[R]`,
+fixes naming no statement, and fix values that are neither numbers nor
+arrays throw `SurfaceLoweringError`. Ranged / levels / joint LHS (`y[R]`,
 `c[levels(g)]`, `[y1, y2]`) are unmatchable (indexed overrides deferred);
 `@plate` / `@scan` cells are invisible to the top-level matcher, so a
 colliding append fails at lowering through the single-assignment gate.
@@ -304,7 +308,7 @@ function Base.merge(m::RKPPLModel, fix::NamedTuple)
                                   "statement (a fixed name must name a " *
                                   "`~` / `.~` / `=` statement to remove)")
         val isa _SuppliedColumn || _sfail("merge fix `$nm` must be a " *
-            "vector or matrix (data-backed; got $(typeof(val)))")
+            "number or an array (a data value; got $(typeof(val)))")
         push!(drop, idx[nm])
         new_fixed[nm] = val
     end
@@ -389,11 +393,71 @@ function _merge_override_lhs(st::Expr)
     return _stmt_lhs(st)::Symbol
 end
 
+# A number bound to a data name has no observation axis: it lowers as the
+# model-level definition `s = _bound_value(_rkppl_value_s)`, a data-only
+# call `bind_data` evaluates once (functions as values), so `s` reads
+# exactly as the definition `s = <number>` would while its value binds at
+# the call. A name some statement already binds (a `~`/`.~` left-hand
+# side, a definition, a loop variable) keeps its existing reading: a
+# number bound to a response is one observation, and binding data to a
+# sampled or defined name keeps failing as an overlap.
+function _scalar_value_definitions(ast::Expr, data::Set{Symbol},
+        scalars::Set{Symbol})
+    isempty(scalars) && return ast, data
+    bound = Set{Symbol}()
+    _statement_lhs_names!(bound, ast)
+    defs = Any[]
+    data = copy(data)
+    for s in sort!(collect(scalars))
+        s in bound && continue
+        input = _bound_value_input(s)
+        (input in data || _mentions_symbol(ast, input)) &&
+            _sfail("data value $s: the internal name $input is already " *
+                   "used by the model or its data")
+        delete!(data, s)
+        push!(data, input)
+        push!(defs, Expr(:(=), s,
+            Expr(:call, GlobalRef(@__MODULE__, :_bound_value), input)))
+    end
+    isempty(defs) && return ast, data
+    return Expr(:block, ast.args..., defs...), data
+end
+
+function _statement_lhs_names!(out::Set{Symbol}, ex)
+    ex isa Expr || return out
+    if ex.head === :call && length(ex.args) == 3 &&
+            ex.args[1] in (:~, :.~)
+        _lhs_base_names!(out, ex.args[2])
+    elseif ex.head === :(=) && length(ex.args) == 2
+        _lhs_base_names!(out, ex.args[1])
+    end
+    for a in ex.args
+        _statement_lhs_names!(out, a)
+    end
+    return out
+end
+
+function _lhs_base_names!(out::Set{Symbol}, lhs)
+    if lhs isa Symbol
+        push!(out, lhs)
+    elseif lhs isa Expr && lhs.head === :ref && !isempty(lhs.args)
+        _lhs_base_names!(out, lhs.args[1])
+    elseif lhs isa Expr && lhs.head in (:vect, :tuple)
+        foreach(a -> _lhs_base_names!(out, a), lhs.args)
+    end
+    return out
+end
+
+_mentions_symbol(ex, s::Symbol) = ex === s ||
+    (ex isa Expr && any(a -> _mentions_symbol(a, s), ex.args))
+
 """
     lower_rkppl(ast, data_names; mod=Main) -> StructuralPlan
+    lower_rkppl(ast, data; mod=Main) -> StructuralPlan
 
 Lower a captured `@rkppl` block AST to a data-free (unbound) plan.
-`data_names` classifies every `~` / `.~` LHS: data under `.~` is a
+`data_names` (or the keys of `data`, a dict or `NamedTuple` of values)
+classifies every `~` / `.~` LHS: data under `.~` is a
 response, non-data under `~` is a prior (sampled parameter or, when the
 name sits in a predictor coefficient position, a population prior); the
 crossed spellings fail closed (`~` is scalar-only, `.~` broadcasts over
@@ -438,8 +502,36 @@ expression arguments) and the predictor is its only reader. Any other
 column or predictor also reads — is an ordinary sampled parameter, and
 each summand that reads it lowers as an in-graph derived column. The
 density is the same either way.
+
+Data are values of any shape. Given the values (`data`), lowering reads
+each one's shape: a number has no observation axis, so it lowers as a
+model-level value — exactly as the definition `s = 2.0` would read, except
+that `bind_data` binds the number and the kernel takes it as a typed
+scalar argument (`y .~ Normal.(mu, s)` broadcasts it, as Julia does).
+Every `@rkppl` entry point (the model call, `@rkppl data`, `merge` pins)
+lowers with the values. Given names only, a name the model reads per
+observation lowers as per-observation data, and binding a number to it
+fails naming this method. A number bound to a response is one observation.
 """
-function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
+lower_rkppl(ast, data::NamedTuple; mod::Module = Main) =
+    lower_rkppl(ast, Dict{Symbol,Any}(pairs(data)); mod)
+
+function lower_rkppl(ast, data::AbstractDict; mod::Module = Main)
+    names = Symbol[]
+    scalars = Set{Symbol}()
+    for (k, v) in data
+        k isa Symbol || _sfail("data names must be Symbols, got $(repr(k))")
+        push!(names, k)
+        v isa Number && push!(scalars, k)
+    end
+    return _lower_rkppl(ast, names, scalars, mod)
+end
+
+lower_rkppl(ast, data_names; mod::Module = Main) =
+    _lower_rkppl(ast, data_names, Set{Symbol}(), mod)
+
+function _lower_rkppl(ast, data_names, scalars::Set{Symbol},
+        mod::Module)::StructuralPlan
     data = Set{Symbol}()
     for n in data_names
         n isa Symbol || _sfail("data names must be Symbols, got $(repr(n))")
@@ -447,6 +539,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     end
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
+    ast, data = _scalar_value_definitions(ast, data, scalars)
     ast, pins = _expand_submodels(ast, data, mod)
     # Fixed point over demotions: a coefficient candidate the affine path
     # cannot own (another reader, a second predictor or column) is demoted
@@ -569,16 +662,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         if s.lhs ∉ data && _is_dar_beta_rhs(s.rhs))
     dar_sigma_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dar_sigma_rhs(s.rhs))
-    # Array-valued declarations shape as `:array` (values, never
-    # per-observation columns, so `B * w` stays a matrix product): declared
-    # arrays (`z[1:K] .~ ...`, two-axis), LKJ Cholesky factors, simplexes,
-    # and vectors sized by a bound data matrix (`w[axes(B, 2)]`, `B` not an
-    # `hcat` definition — never a coefficient vector). A one-axis
-    # `c[levels(g)]` / `b[axes(X, 2)]` declaration over an `hcat` matrix
-    # keeps the slice-1 scalar name shape: it is a coefficient when a
-    # predictor consumes it as one (`c[g]`, `X * b`), and an array (read
-    # by `c[g]`, `c[1]`) otherwise. `value_arrays` are never coefficients:
-    # a bare `z[g]` summand gathers them.
+    # Declaration roles for predictor classification: sized positional
+    # and two-axis arrays, LKJ Cholesky factors, and vectors sized by a
+    # bound data matrix (not an `hcat` definition) always take the array
+    # route. One-axis `c[levels(g)]` / `b[axes(X, 2)]` over an `hcat`
+    # matrix stay coefficient-capable (`c[g]`, `X * b`), independently of
+    # their whole-value array shape below. `value_arrays` are never
+    # coefficients: a bare `z[g]` summand gathers them.
     hcat_defs = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
     array_decls = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
         (s.dims !== nothing ||
@@ -601,12 +691,15 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # scalar-array ops take dotted-canonical form; Julia-invalid vector
     # combinations fail here naming the definition). Everything downstream
     # sees canonical RHSs.
-    # Model-level array values: upstream's simplexes, ordered vectors, and
-    # declared array parameters (`z[1:K] .~`, `L ~ LKJCholesky`, ...).
+    # Every sized declaration is an array when read as a whole value,
+    # including coefficient-capable `z[levels(g)]` / `b[axes(X, 2)]`.
+    # Shape is independent of whether predictor lowering later consumes
+    # an indexed/matmul use as a coefficient. Keep `array_decls` and
+    # `value_arrays` separate: they control those coefficient use sites.
     shape_env = _ShapeEnv(
         union(plate_names, Set{Symbol}(s.state for s in scans), varying_names),
-        union(dirichlet_names, ordered_names, array_decls))
-    detshape = _def_shapes(det, data, detmap; arrays = array_decls,
+        sized_decls)
+    detshape = _def_shapes(det, data, detmap; arrays = sized_decls,
         env = shape_env)
     # A data column the definitions read only as whole values (module-call
     # arguments, gathered values) is a model-level data input at bind, so
@@ -1033,8 +1126,8 @@ function _elementwise_shape(argshapes)
 end
 
 # Reads of an array (`z[g]` per observation, `phi[1]` scalar, `L[:, 1]`
-# array); every other ref keeps the slice-1 scalar shape (factor
-# coefficients `c[g]` classify by position, not shape).
+# array); every other ref keeps the slice-1 scalar shape. Predictor
+# coefficient roles classify by use site, independently of this shape.
 function _ref_shape(ex, data, shape)
     base = ex.args[1]
     base isa Symbol && shape(base) === :array || return :scalar
@@ -1061,8 +1154,8 @@ end
 
 # `A[i]` with one index over a value (data, a definition, a call result,
 # or a model-level array parameter) is a gather: it carries the
-# observation axis exactly when its index does. Indexing a levels
-# coefficient (`z[g]`) stays a factor reference.
+# observation axis exactly when its index does. Its predictor role is
+# decided separately (`z[g]` may be a factor coefficient there).
 _is_gather(ex::Expr, data, detmap, env::_ShapeEnv) =
     ex.head === :ref && length(ex.args) == 2 &&
     (ex.args[1] isa Expr || ex.args[1] in data ||
@@ -3171,34 +3264,7 @@ end
 
 _is_schedule_decl_rhs(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
-    rhs.args[1] in (:linear_pk_schedule, :varyingsource_pk_schedule,
-        :varyingsource_pkpd_schedule)
-
-function _lower_varyingsource_pkpd_schedule_decl(lhs,rhs,line,data)
-    where = line > 0 ? "schedule `$lhs` (line $line)" : "schedule `$lhs`"
-    keys = Dict{Symbol,Any}()
-    for item in rhs.args[2:end]
-        kws = item isa Expr && item.head === :parameters ? item.args : [item]
-        for kw in kws
-            kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                _sfail("$where takes obs/dose/discretization keywords")
-            key,value = kw.args
-            key in (:obs,:dose,:discretization) ||
-                _sfail("$where unknown keyword `$key`")
-            haskey(keys,key) && _sfail("$where repeats `$key=`")
-            keys[key] = value
-        end
-    end
-    all(k -> haskey(keys,k),(:obs,:dose,:discretization)) ||
-        _sfail("$where needs obs=(subject,time,assay), dose=(subject,time,amount,treatment), and discretization=<raw lag column>")
-    obs = _schedule_column_tuple(keys[:obs],where,:obs,3,data)
-    dose = _schedule_column_tuple(keys[:dose],where,:dose,4,data)
-    disc = keys[:discretization]
-    disc = disc isa QuoteNode ? disc.value : disc
-    disc isa Symbol && disc in data ||
-        _sfail("$where discretization must name a bound raw lag column")
-    return VaryingSourcePKPDScheduleSpec(lhs,obs...,dose...,disc)
-end
+    rhs.args[1] === :linear_pk_schedule
 
 # `name = linear_pk_schedule(obs = (subj, time), dose = (subj, time,
 # amount), ecg = (subj, time), tgi = (subj, time))`: raw obs/dose DATA
@@ -3208,10 +3274,7 @@ end
 # form.
 function _lower_schedule_decl(lhs::Symbol, rhs::Expr, line::Int,
         data::Set{Symbol})
-    rhs.args[1] === :varyingsource_pkpd_schedule &&
-        return _lower_varyingsource_pkpd_schedule_decl(lhs,rhs,line,data)
     where = line > 0 ? "schedule `$lhs` (line $line)" : "schedule `$lhs`"
-    varying = rhs.args[1] === :varyingsource_pk_schedule
     kws = Any[]
     for arg in rhs.args[2:end]
         if arg isa Expr && arg.head === :parameters
@@ -3227,12 +3290,9 @@ function _lower_schedule_decl(lhs::Symbol, rhs::Expr, line::Int,
                    "amount)` keywords only, got $(repr(kw))")
         key, val = kw.args[1], kw.args[2]
         key === :obs || key === :dose || key === :ecg || key === :tgi ||
-            _sfail("$where takes " *
-                   (varying ? "`obs=`/`dose=`" : "`obs=`/`dose=`/`ecg=`/`tgi=`") *
-                   " keywords only, got `$key=`")
-        varying && !(key in (:obs, :dose)) &&
-            _sfail("$where varying-source PK slice takes `obs=`/`dose=` only")
-        want = key === :dose ? (varying ? 4 : 3) : 2
+            _sfail("$where takes `obs=`/`dose=`/`ecg=`/`tgi=` keywords " *
+                   "only, got `$key=`")
+        want = key === :dose ? 3 : 2
         cols = _schedule_column_tuple(val, where, key, want, data)
         if key === :obs
             obs_spec === nothing || _sfail("$where repeats `obs=`")
@@ -3249,10 +3309,7 @@ function _lower_schedule_decl(lhs::Symbol, rhs::Expr, line::Int,
         end
     end
     obs_spec === nothing && _sfail("$where needs `obs=(subj, time)`")
-    dose_spec === nothing && _sfail("$where needs " *
-        (varying ? "`dose=(subj, time, amount, treatment)`" : "`dose=(subj, time, amount)`"))
-    varying && return VaryingSourcePKScheduleSpec(lhs, obs_spec[1], obs_spec[2],
-        dose_spec[1], dose_spec[2], dose_spec[3], dose_spec[4])
+    dose_spec === nothing && _sfail("$where needs `dose=(subj, time, amount)`")
     ecg = ecg_spec === nothing ? nothing : (ecg_spec[1], ecg_spec[2])
     tgi = tgi_spec === nothing ? nothing : (tgi_spec[1], tgi_spec[2])
     return LinearPKScheduleSpec(lhs, obs_spec[1], obs_spec[2], dose_spec[1],
@@ -8697,6 +8754,12 @@ function _classify_summand(pname, core, sign::Int, ctx)
     if _canon_shape(core, ctx.data, ctx.detshape) === :vector
         return _extract_summand(pname, core, sign, ctx)
     end
+    # A number bound as data is a constant, read as its definition
+    # (`off = 0.25`) is: a constant is not a term, exactly as a literal.
+    _is_bound_value_call(core) && _sfail("predictor $pname: data value " *
+        "$(repr(core)) is a number, and a constant is not a term — fold " *
+        "constants into an intercept coefficient with an offset prior " *
+        "location")
     # An undotted module call returns a whole (model-level) value, even
     # over columns it reads whole.
     _contains_module_call(core) && _sfail("predictor $pname: " *

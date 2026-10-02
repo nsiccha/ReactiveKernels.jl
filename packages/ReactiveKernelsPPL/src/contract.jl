@@ -17,6 +17,8 @@ offending node label for BRM-side attribution.
 """
 struct ContractValidationError <: Exception
     message::String
+    ContractValidationError(message::AbstractString) =
+        new(_author_names(message))
 end
 Base.showerror(io::IO, e::ContractValidationError) =
     print(io, "ContractValidationError: ", e.message)
@@ -26,33 +28,52 @@ const ColumnRef = Symbol
 """Reference to a sampled parameter or scalar assignment by name."""
 const ParamName = Symbol
 
-"""Bound column values: length-n vectors or n-row matrices (whole-design
-data, Stan `matrix[N,K]`). Matrices bind and validate beside vectors;
-every per-observation role (response, term, weights, trials, scales,
-bounds, grouping, axes, slices) reads vectors only — those readers fetch
-through [`_vector_column`](@ref) and fail closed on a matrix."""
-const ColumnData = Union{AbstractVector,AbstractMatrix,Number}
-# (`Number`: a model-level data value a data-only definition computes at
-# bind — functions as values. Caller-supplied columns stay vectors and
-# matrices, `_SuppliedColumn`: `_checked_columns` and `merge` fixes refuse
-# anything else.)
-const _SuppliedColumn = Union{AbstractVector,AbstractMatrix}
+"""Bound data values: numbers and arrays of any shape. A value read per
+observation is a length-n vector or an n-row matrix (whole-design data,
+Stan `matrix[N,K]`); every per-observation role (response, term, weights,
+trials, scales, bounds, grouping, axes, slices) reads vectors only — those
+readers fetch through [`_vector_column`](@ref) and fail closed on a
+matrix. Any other value — a number, or an array read only as a whole
+value — is model-level: it has no observation axis, so its shape is free."""
+const ColumnData = Union{AbstractArray,Number}
+# What a caller may pass at every entry point (the model call, `@rkppl data`,
+# `merge` pins, `bind_data`): anything `ColumnData` holds.
+const _SuppliedColumn = ColumnData
 
-# Row count of a bound column: length for vectors, row count for matrices.
+# Row count of a bound value read per observation: length for vectors, row
+# count for matrices. Numbers and higher-dimensional arrays carry no
+# observation axis.
 _column_nrows(col::AbstractVector) = length(col)
 _column_nrows(col::AbstractMatrix) = size(col, 1)
 
-"""Normalize caller-supplied columns to the plan's column table (vectors
-and matrices only — anything else fails closed here, not in a converter)."""
+"""Normalize caller-supplied data values to the plan's value table (numbers
+and arrays — anything else fails closed here, not in a converter)."""
 function _checked_columns(columns::AbstractDict{Symbol})
     out = Dict{Symbol,ColumnData}()
     for (k, v) in columns
         v isa _SuppliedColumn ||
-            _fail(:plan, "column $k must be a vector or matrix, got $(summary(v))")
+            _fail(:plan, "data value $k must be a number or an array, got " *
+                         "$(summary(v))")
         out[k] = v
     end
     return out
 end
+
+# ── Scalar data values ─────────────────────────────────────────────────
+# A data name whose value is a number has no observation axis: it lowers
+# as the model-level definition `s = _bound_value(_rkppl_value_s)` (see
+# `lower_rkppl`), a data-only call that `bind_data` evaluates once, so the
+# kernel takes the number as a typed scalar argument — exactly as a
+# definition `s = 2.0` would read, except the value binds at the call.
+_bound_value(x) = x
+_bound_value_input(name::Symbol) = Symbol("_rkppl_value_", name)
+# Messages name a data value as its author wrote it, never its internal
+# input (`ReactiveKernelsPPL._bound_value(_rkppl_value_s)` reads `s`).
+_author_names(msg::AbstractString) = replace(String(msg),
+    r"(?:ReactiveKernelsPPL\.)?_bound_value\(_rkppl_value_([\p{L}\p{N}_!]+)\)" => s"\1",
+    r"_rkppl_value_([\p{L}\p{N}_!]+)" => s"\1")
+_is_bound_value_call(ex) = ex isa Expr && ex.head === :call &&
+    length(ex.args) == 2 && ex.args[1] == GlobalRef(@__MODULE__, :_bound_value)
 
 """Fetch a bound column that must be a VECTOR (every per-observation role —
 response, term, weights, trials, scales, bounds, grouping, axes, slices —
@@ -1218,57 +1239,13 @@ LinearPKScheduleSpec(name::Symbol, obs_subj::Symbol, obs_time::Symbol,
     LinearPKScheduleSpec(name, obs_subj, obs_time, dose_subj, dose_time,
         dose_amt, nothing, nothing)
 
-"""
-    VaryingSourcePKScheduleSpec(name, obs_subj, obs_time, dose_subj, dose_time,
-                              dose_amt, treatment)
-
-Raw-column declaration for a Gamma-transit/twocmt PK slice. `treatment` is
-the dose-row treatment/diet key; first appearance within each subject assigns
-the unit-response index. Dose rows must already be time ordered per subject.
-Binding builds independent ragged reference, dose, lag, and lag-index ranges.
-The surface spells `varyingsource_pk_schedule(obs=(subject,time),
-dose=(subject,time,amount,treatment))`. PD read grids are outside this slice.
-"""
-struct VaryingSourcePKScheduleSpec <: PKScheduleSpec
-    name::Symbol
-    obs_subj::Symbol
-    obs_time::Symbol
-    dose_subj::Symbol
-    dose_time::Symbol
-    dose_amt::Symbol
-    treatment::Symbol
-end
-
-"""Raw observation/dose declaration for the full varying-source PK/PD cell.
-`obs_assay` selects PK/PBMC/CSF; `discretization` names cumulative raw
-discretization lags. Binding owns all time grids and ragged index products.
-"""
-struct VaryingSourcePKPDScheduleSpec <: PKScheduleSpec
-    name::Symbol
-    obs_subj::Symbol
-    obs_time::Symbol
-    obs_assay::Symbol
-    dose_subj::Symbol
-    dose_time::Symbol
-    dose_amt::Symbol
-    treatment::Symbol
-    discretization::Symbol
-end
-
 function _sched_raw_columns(s::LinearPKScheduleSpec)
     raw = [s.obs_subj, s.obs_time, s.dose_subj, s.dose_time, s.dose_amt]
     s.ecg !== nothing && append!(raw, s.ecg)
     s.tgi !== nothing && append!(raw, s.tgi)
     return raw
 end
-_sched_raw_columns(s::VaryingSourcePKScheduleSpec) =
-    [s.obs_subj, s.obs_time, s.dose_subj, s.dose_time, s.dose_amt, s.treatment]
-_sched_raw_columns(s::VaryingSourcePKPDScheduleSpec) =
-    [s.obs_subj, s.obs_time, s.obs_assay, s.dose_subj, s.dose_time,
-        s.dose_amt, s.treatment, s.discretization]
 _sched_ends_field(::LinearPKScheduleSpec) = :op_ends
-_sched_ends_field(::VaryingSourcePKScheduleSpec) = :reference_ends
-_sched_ends_field(::VaryingSourcePKPDScheduleSpec) = :obs_ends
 
 """V2 event-LP slope prior scale (SB `effect(log_F, op_log_dose) ~
 Normal(0.0, 0.6676)` verbatim — the specific overrides the wildcard
@@ -2132,27 +2109,11 @@ cell assignments ONLY, always with a declared schedule as the first
 argument. The generator emits ONE subject-batched call per assignment
 (`<fn>_over_subjects` over the bound op columns + `op_ends`, pkcells.jl);
 the function itself is the per-subject cell + host-side oracle path."""
-const CELL_FNS = (:linear_pk_read_locs, :linear_pk_read_locs_auc,
-    :varyingsource_pk_read_locs, :varyingsource_pkpd_read_locs)
+const CELL_FNS = (:linear_pk_read_locs, :linear_pk_read_locs_auc)
 
 """Arity (argument count) of each [`CELL_FNS`](@ref) entry, schedule first."""
 const CELL_FN_ARITY = Dict{Symbol,Int}(:linear_pk_read_locs => 6,
-    :linear_pk_read_locs_auc => 7, :varyingsource_pk_read_locs => 13,
-    :varyingsource_pkpd_read_locs => 31)
-
-# Positions include the function name, as in an Expr(:call,...). These
-# shared vector ports are independent of all subject and observation axes.
-const CELL_FN_VECTOR_PORTS = Dict{Symbol,Tuple}(
-    :varyingsource_pk_read_locs =>
-        ((position=6,shape=:square,minimum=1,label="GP weights"),),
-    :varyingsource_pkpd_read_locs =>
-        ((position=6,shape=:square,minimum=2,label="GP innovations"),
-         (position=12,shape=:basis,minimum=2,label="placebo innovations"),
-         (position=15,shape=:basis,minimum=2,label="CSF placebo innovations")))
-
-_cell_schedule_compatible(fn, s) = fn === :varyingsource_pk_read_locs ?
-    s isa VaryingSourcePKScheduleSpec : fn === :varyingsource_pkpd_read_locs ?
-    s isa VaryingSourcePKPDScheduleSpec : s isa LinearPKScheduleSpec
+    :linear_pk_read_locs_auc => 7)
 
 """Op-column fields each [`CELL_FNS`](@ref) entry reads per subject
 (positional, after the schedule — the generator passes the bound
@@ -2201,28 +2162,6 @@ const _SCHED_MATERIALIZED_FIELDS =
         :op_ends, :obs_read, :obs_map)
 
 _sched_materialized_fields(::LinearPKScheduleSpec) = _SCHED_MATERIALIZED_FIELDS
-_sched_materialized_fields(::VaryingSourcePKScheduleSpec) =
-    (:reference_ends, :dose_ends, :lag_ends, :concentration_ends,
-        :dose_amount, :dose_index, :treatment_map, :unique_dts,
-        :concentration_idxs, :dosing_time_idxs, :obs_map)
-
-const _VS_PKPD_SCHEDULE_FIELDS = (:reference_ends, :dose_ends, :lag_ends,
-    :concentration_ends, :dose_amount, :dose_index, :treatment_map, :unique_dts,
-    :concentration_idxs, :dosing_time_idxs, :obs_ends, :assay, :obs_map,
-    :pk_ends, :pk_idxs, :pd2_write_ends, :pd2_step_ends, :pd2_idxs, :pd2_dts,
-    :pd2_center_idxs, :pd3_write_ends, :pd3_step_ends, :pd3_idxs, :pd3_dts,
-    :pd3_center_idxs, :placebo_ends, :placebo_time)
-_sched_materialized_fields(::VaryingSourcePKPDScheduleSpec) = _VS_PKPD_SCHEDULE_FIELDS
-_sched_extra_fields(::VaryingSourcePKPDScheduleSpec, assignments) = Symbol[]
-_sched_available_maps(::VaryingSourcePKPDScheduleSpec, assignments) = Set([:obs_map])
-_sched_map_prereq(::VaryingSourcePKPDScheduleSpec, m, assignments) =
-    "varyingsource PK/PD schedules provide only `obs_map`"
-
-_sched_extra_fields(::VaryingSourcePKScheduleSpec, assignments) = Symbol[]
-_sched_available_maps(::VaryingSourcePKScheduleSpec, assignments) = Set([:obs_map])
-_sched_map_prereq(::VaryingSourcePKScheduleSpec, m, assignments) =
-    "varyingsource PK schedules provide only `obs_map` (PK slice)"
-
 """Per-axis row products, materialized only for declared extra axes."""
 const _SCHED_ECG_FIELDS = (:ecg_read, :ecg_map)
 const _SCHED_TGI_FIELDS = (:tgi_read, :tgi_map)
@@ -3051,37 +2990,19 @@ function _maybe_fill_strata(d::VaryingDraws, columns::AbstractDict{Symbol})
         VaryingStrata(st.by, collect(slevels)))
 end
 
-# Varying-source dose modifiers use raw dose rows. Other direct LP ports
-# use subject rows. One predictor cannot serve both axes.
-function _kernel_lp_axis(kp::KernelPlate, cell::Symbol)
-    axes = Set{Symbol}()
-    for (_, ex) in kp.assignments
-        ex isa Expr && ex.head === :call && ex.args[1] in CELL_FNS || continue
-        for (i, arg) in enumerate(ex.args)
-            arg === cell || continue
-            push!(axes, ex.args[1] in (:varyingsource_pk_read_locs,
-                :varyingsource_pkpd_read_locs) && i in 3:5 ? :dose : :subject)
-        end
-    end
-    length(axes) > 1 && _fail(kp.label,
-        "kernel LP `$cell` feeds both dose and subject arguments (split the predictor)")
-    return isempty(axes) ? :subject : only(axes)
-end
-
-"""Predictor axis: grouped kernel LP ports select subject or dose rows;
-response predictors use observation rows. Mixed use fails closed."""
+"""Predictor levels (grouped kernels): a predictor consumed ONLY as a
+kernel LP arg is SUBJECT-level (its design rows are subjects); any
+response use makes it obs-level. Mixed use fails closed — split the
+predictor instead."""
 function _predictor_level(plan::StructuralPlan, pname::Symbol)
-    axes = Set{Symbol}(_kernel_lp_axis(kp,c) for kp in plan.kernel_plates
-        for (p,c) in kp.lp_args if p === pname)
-    by_kernel = !isempty(axes)
+    by_kernel = any(kp -> any(((p, _),) -> p === pname, kp.lp_args),
+        plan.kernel_plates)
     by_resp = any(r -> _response_uses_predictor(r, pname), plan.responses)
     by_kernel && by_resp &&
         _fail(:plan, "predictor `$pname` feeds both a kernel LP arg and " *
               "a response (mixed-level predictors are not supported — " *
               "split it into a subject-level and an obs-level predictor)")
-    length(axes) > 1 && _fail(:plan,
-        "predictor `$pname` feeds both dose and subject kernel arguments (split the predictor)")
-    by_kernel && return only(axes)
+    by_kernel && return :subject
     return :obs
 end
 
@@ -3103,12 +3024,12 @@ function _response_uses_predictor(r::LikelihoodSpec, pname::Symbol)
     return false
 end
 
-"""Term columns of subject or dose predictors:
+"""Term columns of subject-level predictors (n_sub rows by design):
 exempt from the uniform-`n_obs` rule like kernel-managed columns (only
 bound columns count — a summand's basis id is not a column and fails
 loudly under kernel rules instead). Transitive through derived
-assignments: a data column feeding ONLY kernel LP consumers inherits
-their axis (in-graph `standardize`, etc.). A pulled column that ALSO
+assignments: a data column feeding ONLY subject-level consumers inherits
+subject level (in-graph `standardize`, etc.). A pulled column that ALSO
 feeds obs-level consumers (responses, slices, obs predictors, weights,
 evidence, trials) fails loudly — mixed-level lengths are genuinely
 ambiguous. (Directly-shared columns across levels predate this rule and
@@ -3118,7 +3039,7 @@ function _subject_predictor_columns(plan::StructuralPlan)
     out = Set{Symbol}()
     seed = Set{Symbol}()
     for pred in plan.predictors
-        _predictor_level(plan, pred.name) === :obs && continue
+        _predictor_level(plan, pred.name) === :subject || continue
         for t in pred.terms, c in t.columns
             push!(seed, c)
             haskey(plan.columns, c) && push!(out, c)
@@ -3196,8 +3117,11 @@ function _expr_names!(out::Set{Symbol}, ex)
     return nothing
 end
 
-function _validate_columns(plan::StructuralPlan)
-    plan.n_obs > 0 || _fail(:plan, "n_obs must be positive, got $(plan.n_obs)")
+"""Bound columns without an observation axis of their own: `(modelvals,
+managed)` — model-level values (bind-time data definitions and raw inputs
+read only whole) carry no axis; kernel-, subject- and mi-managed columns
+carry two lengths by design and validate under their own rules."""
+function _axis_exempt_columns(plan::StructuralPlan)
     managed = Set{Symbol}()
     for kp in plan.kernel_plates
         union!(managed, _kernel_managed_columns(kp))
@@ -3213,14 +3137,154 @@ function _validate_columns(plan::StructuralPlan)
     modelvals = union(
         intersect(computed, Set{Symbol}(a.name for a in plan.assignments)),
         intersect(computed, wholedefs), inputs)
+    return modelvals, managed
+end
+
+# ── Observation axes ─────────────────────────────────────────────────
+# A statement broadcasts over the columns it reads (standard Julia), so
+# the rows one observation statement reads need not be the rows another
+# reads: `y1 .~ Normal.(b0 .* x1, s)` over 4 rows beside `y2 .~
+# Poisson.(exp.(b0 .* x2))` over 3. Responses that read a common
+# per-observation column share an axis. When every per-observation column
+# has the same rows there is one axis, `n_obs`, and nothing below runs
+# (plans bind exactly as before); otherwise each column has the rows of
+# the one axis that reads it, and `n_obs` is the total observed rows (the
+# kernel-plate precedent: total likelihood lanes).
+
+"""Plan slots a plan with several observation axes may fill. Every other
+slot reads or sizes by the one `n_obs` axis (latent plates, scans, dar
+paths, varying draws, splines, HSGP and design matrices, R2D2 and
+horseshoe priors, array parameters, kernels, event LPs); per-axis
+versions are not built, so such a plan fails closed — and a slot added
+later does too until it is listed here."""
+const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
+    :parameters, :assignments, :derived, :columns, :n_obs, :roles,
+    :levelmaps, :vector_parameters)
+
+"""Per-observation columns (of `perobs`) a response reads: the names its
+own fields hold, then — transitively — the names every predictor, derived
+column and definition among them holds."""
+function _response_reads(plan::StructuralPlan, r::LikelihoodSpec,
+        perobs::Set{Symbol})
+    nodes = Dict{Symbol,Any}()
+    for p in plan.predictors
+        nodes[p.name] = p
+    end
+    for d in plan.derived
+        nodes[d.name] = d.expr
+    end
+    for a in plan.assignments
+        nodes[a.name] = a.expr
+    end
+    cands = union(perobs, keys(nodes))
+    function held(x)
+        free = copy(cands)
+        _drop_held_names!(free, x)
+        return setdiff(cands, free)
+    end
+    reads = Set{Symbol}()
+    seen = Set{Symbol}()
+    queue = collect(held(r))
+    while !isempty(queue)
+        s = pop!(queue)
+        s in seen && continue
+        push!(seen, s)
+        s in perobs && push!(reads, s)
+        haskey(nodes, s) && append!(queue, held(nodes[s]))
+    end
+    return reads
+end
+
+"""Observation axes of a plan whose `columns` are bound: `nothing` when
+every response column has the same rows (one axis — `n_obs`; any other
+column validates against it), otherwise `(; rows, total)` with `rows`
+mapping each per-observation column to the rows of the axis that reads it
+and `total` the observed rows summed over axes. Fails when the plan fills
+a slot outside [`_MULTI_AXIS_SLOTS`](@ref), when the columns one axis
+reads differ in rows, or when no observation statement reads a column."""
+function _observation_axes(plan::StructuralPlan)
+    isempty(plan.kernel_plates) || return nothing
+    modelvals, managed = _axis_exempt_columns(plan)
+    perobs = Set{Symbol}(k for (k, v) in plan.columns
+        if k ∉ modelvals && k ∉ managed &&
+            v isa Union{AbstractVector,AbstractMatrix})
+    resps = [r.response for r in plan.responses]
+    all(in(perobs), resps) || return nothing
+    rows = Dict{Symbol,Int}(c => _column_nrows(plan.columns[c]) for c in perobs)
+    length(unique(rows[c] for c in resps)) <= 1 && return nothing
+    lens = join(sort!(unique(rows[c] for c in resps)), ", ")
+    for f in fieldnames(StructuralPlan)
+        f in _MULTI_AXIS_SLOTS && continue
+        isempty(getfield(plan, f)) || _fail(:plan, "the responses " *
+            "observe $lens rows (several observation axes), and `$f` " *
+            "reads or sizes by a single observation axis — `$f` beside " *
+            "several observation axes is not built yet")
+    end
+    for r in plan.responses
+        r.mi_jobs === nothing || _fail(r.label, "mi() missingness on " *
+            "$(r.response) beside responses of $lens rows (several " *
+            "observation axes) is not built yet")
+    end
+    reads = [_response_reads(plan, r, perobs) for r in plan.responses]
+    # Union-find: responses reading a common column share an axis.
+    link = collect(eachindex(reads))
+    root(i) = link[i] == i ? i : (link[i] = root(link[i]))
+    owner = Dict{Symbol,Int}()
+    for (i, rd) in enumerate(reads), c in rd
+        link[root(i)] = root(get!(owner, c, i))
+    end
+    axisrows = Dict{Symbol,Int}()
+    total = 0
+    for i in eachindex(reads)
+        root(i) == i || continue
+        members = [j for j in eachindex(reads) if root(j) == i]
+        resp = resps[first(members)]
+        n = rows[resp]
+        total += n
+        for j in members, c in sort!(collect(reads[j]))
+            rows[c] == n || _fail(c, "column length $(rows[c]) ≠ the $n " *
+                "rows of $resp, which an observation statement reads " *
+                "beside it (one observation axis)")
+            axisrows[c] = n
+        end
+    end
+    for c in sort!(collect(perobs))
+        haskey(axisrows, c) || _fail(c, "column $c has $(rows[c]) rows, " *
+            "but the responses observe $lens rows (several observation " *
+            "axes) and no observation statement reads $c, so it has no axis")
+    end
+    return (; rows = axisrows, total)
+end
+
+"""Rows a response observes: its own column's rows — its observation
+axis. An mi() response observes `n_obs` rows through its packed column."""
+_response_rows(plan::StructuralPlan, r::LikelihoodSpec) =
+    r.mi_jobs === nothing && haskey(plan.columns, r.response) ?
+    _column_nrows(plan.columns[r.response]) : plan.n_obs
+
+function _validate_columns(plan::StructuralPlan)
+    plan.n_obs > 0 || _fail(:plan, "n_obs must be positive, got $(plan.n_obs)")
+    modelvals, managed = _axis_exempt_columns(plan)
+    axes = _observation_axes(plan)
     for (name, col) in plan.columns
         name in modelvals && continue
+        col isa Number && _fail(name, "data value $name is a number, but " *
+            "the model reads it per observation — lower with the values " *
+            "(`lower_rkppl(ast, data)`, which every `@rkppl` entry point " *
+            "does) so a number lowers as a model-level value")
+        col isa AbstractArray && ndims(col) > 2 && _fail(name, "data value " *
+            "$name is a $(ndims(col))-dimensional array read per " *
+            "observation; per-observation data are vectors (one entry per " *
+            "observation) or matrices (one row per observation), and other " *
+            "arrays read as whole values (module-call arguments, gathers)")
         # Kernel-managed columns (slices + scalar expansions) carry two
         # lengths by design — they validate under kernel rules, not here.
+        # On several observation axes a column has its axis's rows.
+        n = axes === nothing ? plan.n_obs : get(axes.rows, name, plan.n_obs)
         if col isa AbstractMatrix
-            size(col, 1) == plan.n_obs ||
+            size(col, 1) == n ||
                 _fail(name, "matrix column has $(size(col, 1)) rows ≠ " *
-                      "n_obs $(plan.n_obs)")
+                      "n_obs $n")
             size(col, 2) >= 1 ||
                 _fail(name, "design matrix has 0 columns " *
                       "(bind ≥ 1 predictor column)")
@@ -3228,8 +3292,8 @@ function _validate_columns(plan::StructuralPlan)
                 _fail(name, "matrix column must be numeric, " *
                       "got $(eltype(col))")
         else
-            name in managed || length(col) == plan.n_obs ||
-                _fail(name, "column length $(length(col)) ≠ n_obs $(plan.n_obs)")
+            name in managed || length(col) == n ||
+                _fail(name, "column length $(length(col)) ≠ n_obs $n")
         end
         !any(ismissing, col) ||
             _fail(name, "column contains missing (slice 1 has no missingness machinery)")
@@ -3962,11 +4026,6 @@ subject rows ARE subjects, so the draws' per-level `r` needs no gather —
 subject order; the joint parity harness proves it numerically)."""
 const _SUBJECT_TERM_KINDS =
     (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, VaryingEffectTerm)
-const _DOSE_TERM_KINDS =
-    (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, MonotonicTerm,
-        MonotonicSummandTerm)
-_kernel_lp_term_kinds(kp,cell) = _kernel_lp_axis(kp,cell) === :dose ?
-    _DOSE_TERM_KINDS : _SUBJECT_TERM_KINDS
 
 # Grouped-kernel structure (see `_validate_kernels`): schedules resolve,
 # LP args name subject-exclusive identity predictors with admitted terms,
@@ -4006,7 +4065,7 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
     cparams = [c for (_, c) in kp.lp_args]
     length(unique(cparams)) == length(cparams) ||
         _fail(kp.label, "duplicate LP-arg cell params $(cparams)")
-    for (p, cell) in kp.lp_args
+    for (p, _) in kp.lp_args
         i = findfirst(q -> q.name === p, plan.predictors)
         i === nothing &&
             _fail(kp.label, "kernel LP arg `$p` is not a predictor (LP " *
@@ -4016,16 +4075,15 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
         pred.link === IdentityLink ||
             _fail(kp.label, "kernel LP arg `$p` needs IdentityLink " *
                   "(got $(pred.link) — subject LPs feed the cell raw)")
-        _predictor_level(plan, p) in (:subject,:dose) ||
+        _predictor_level(plan, p) === :subject ||
             _fail(kp.label, "kernel LP arg `$p` is unreachable " *
                   "(internal: mixed-level predictors fail in " *
                   "`_predictor_level`)")
-        admitted = _kernel_lp_term_kinds(kp,cell)
         for t in pred.terms
-            t.kind in admitted ||
+            t.kind in _SUBJECT_TERM_KINDS ||
                 _fail(kp.label, "subject predictor `$p` carries a " *
                       "$(t.kind) term (grouped v1 admits " *
-                      "$admitted — unsupported summands and per-cell " *
+                      "$(_SUBJECT_TERM_KINDS) — summands and per-cell " *
                       "latents are sequenced after the PK slice)")
         end
     end
@@ -4044,28 +4102,6 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
             source isa Expr || continue
             all(a -> a isa Number || a isa Symbol && a in scalar_names,source.args) ||
                 _fail(kp.label,"literal gather entries must be numeric literals or model scalar names")
-        end
-        if ex isa Expr && ex.head === :call
-          for port in get(CELL_FN_VECTOR_PORTS, ex.args[1], ())
-            weights = ex.args[port.position]
-            weights isa Symbol || _fail(kp.label,
-                "varyingsource $(port.label) need a shared coefficient vector name")
-            wi = findfirst(v -> v.name === weights, plan.vector_parameters)
-            if weights in params
-                # Bind checks the coefficient vector's square dimension.
-            elseif wi !== nothing
-                v = plan.vector_parameters[wi]
-                k = v.size === nothing ? 0 :
-                    port.shape === :square ? isqrt(v.size) : v.size
-                v.family === :vector_normal && k >= port.minimum &&
-                    (port.shape !== :square || k * k == v.size) ||
-                    _fail(kp.label, "varyingsource $(port.label) need a " *
-                        "concrete $(port.shape) vector_normal parameter")
-            else
-                _fail(kp.label, "varyingsource $(port.label) must name a " *
-                    "bound coefficient vector or vector_normal parameter")
-            end
-          end
         end
         push!(known, nm)
         push!(cell_locals, nm)
@@ -4413,24 +4449,7 @@ function _collect_grouped_cell_refs!(refs, ex, kp::KernelPlate,
                 _fail(label, "cell call `$fn` takes a declared schedule " *
                       "first (got $(repr(s)) — admitted schedules: " *
                       "$(sort!(collect(schednames))))")
-            spec = only(q for q in kp.schedules if q.name === s)
-            _cell_schedule_compatible(fn,spec) ||
-                _fail(label, "cell call `$fn` has an incompatible schedule `$s`")
             rest = args[2:end]
-            if haskey(CELL_FN_VECTOR_PORTS,fn)
-                # Shared GP vectors have a dedicated port, not the scalar
-                # name environment. The plan-level cell validator proves
-                # the bound-vector / vector_normal declaration and size.
-                ports = CELL_FN_VECTOR_PORTS[fn]
-                for port in ports
-                    weights = ex.args[port.position]
-                    weights isa Symbol || _fail(label,
-                        "varyingsource $(port.label) need a shared coefficient vector name")
-                    push!(refs, weights)
-                end
-                rest = Any[a for (i,a) in enumerate(args[2:end])
-                    if all(p -> p.position != i+2,ports)]
-            end
             if (fn === :linear_pk_read_locs && seven) || fn === :linear_pk_read_locs_auc
                 # The event-LP second arg is the provider's flat
                 # vector: the fixed seam name only — structure
@@ -4650,17 +4669,6 @@ function _build_grouped_schedule(plan::StructuralPlan, kp::KernelPlate,
         haskey(columns, c) ||
             _fail(kp.label, "schedule `$(sched.name)` column `$c` is not bound")
     end
-    if sched isa VaryingSourcePKScheduleSpec
-        return build_varyingsource_pk_schedule(columns[sched.obs_subj],
-            columns[sched.obs_time], columns[sched.dose_subj],
-            columns[sched.dose_time], columns[sched.dose_amt],
-            columns[sched.treatment])
-    elseif sched isa VaryingSourcePKPDScheduleSpec
-        return build_varyingsource_pkpd_schedule(columns[sched.obs_subj],
-            columns[sched.obs_time],columns[sched.obs_assay],
-            columns[sched.dose_subj],columns[sched.dose_time],
-            columns[sched.dose_amt],columns[sched.treatment],columns[sched.discretization])
-    end
     combine = _schedule_combine_simultaneous(plan, sched.name)
     ecg = _grouped_schedule_axis(sched, columns, :ecg, kp)
     tgi = _grouped_schedule_axis(sched, columns, :tgi, kp)
@@ -4741,18 +4749,15 @@ function _validate_grouped_kernel_data(plan::StructuralPlan, kp::KernelPlate)
         _validate_kernel_obs_column(kp, obs, rcol, colv)
         _validate_kernel_bool_twin(kp, obs, rcol, plan)
     end
-    for (p, cell) in kp.lp_args
+    for (p, _) in kp.lp_args
         i = findfirst(q -> q.name === p, plan.predictors)
         i === nothing &&
             _fail(kp.label, "kernel LP arg `$p` is not a predictor")
-        axis = _kernel_lp_axis(kp,cell)
-        n_rows = axis === :dose ? length(plan.columns[sched.dose_subj]) : n_sub
-        admitted = _kernel_lp_term_kinds(kp,cell)
         for t in plan.predictors[i].terms
-            t.kind in admitted ||
+            t.kind in _SUBJECT_TERM_KINDS ||
                 _fail(kp.label, "subject predictor `$p` carries a " *
                       "$(t.kind) term (grouped v1 admits " *
-                      "$admitted)")
+                      "$(_SUBJECT_TERM_KINDS))")
             for c in t.columns
                 # In-graph deriveds compute at eval from bound sources
                 # (length-checked at their own level); no bind values exist.
@@ -4761,9 +4766,9 @@ function _validate_grouped_kernel_data(plan::StructuralPlan, kp::KernelPlate)
                     _fail(kp.label, "subject predictor `$p` column `$c` " *
                           "is not bound")
                 colv = plan.columns[c]
-                length(colv) == n_rows ||
-                    _fail(kp.label, "$axis predictor `$p` column `$c` " *
-                          "has length $(length(colv)), want $axis rows $n_rows")
+                length(colv) == n_sub ||
+                    _fail(kp.label, "subject predictor `$p` column `$c` " *
+                          "has length $(length(colv)), want n_sub $n_sub")
                 if t.kind in (ContinuousTerm, OffsetTerm)
                     eltype(colv) <: Real ||
                         _fail(kp.label, "subject predictor `$p` column " *
@@ -5989,8 +5994,7 @@ function _validate_vector_parameters(plan::StructuralPlan)
     # (as `thresholds` for ordered families, as `threshold_coefs` for
     # per-threshold Ordinal, as the simplex `predictor`, or as a joint
     # factor piece), by exactly one monotonic term (as its `increments`
-    # simplex), by exactly one R2D2 prior (as its share `phi`), or by
-    # one grouped varying-source PK plate (its shared GP coefficients).
+    # simplex), or by exactly one R2D2 prior (as its share `phi`).
     refs = Dict{Symbol,Vector{Symbol}}(
         p.name => Symbol[] for p in plan.vector_parameters)
     for r in plan.responses
@@ -6044,19 +6048,6 @@ function _validate_vector_parameters(plan::StructuralPlan)
             ":simplex_dirichlet vector parameter, got $(p.family)")
         push!(refs[rp.phi], rp.predictor)
     end
-    for kp in plan.kernel_plates
-        used = Set{Symbol}()
-        for (_, ex) in kp.assignments
-            ex isa Expr && ex.head === :call || continue
-            for port in get(CELL_FN_VECTOR_PORTS,ex.args[1],())
-                weights = ex.args[port.position]
-                weights isa Symbol && haskey(refs, weights) && push!(used, weights)
-            end
-        end
-        for weights in used
-            push!(refs[weights], kp.label)
-        end
-    end
     # Definitions read vector parameters as whole values (functions as
     # values); any number of definitions may read one, beside at most one
     # construct link.
@@ -6072,11 +6063,11 @@ function _validate_vector_parameters(plan::StructuralPlan)
         isempty(got) && p.name ∉ defreads && _fail(p.label,
             "vector parameter $(p.name) unused by any response, " *
             "monotonic term, joint-factor link, R2D2 prior, " *
-            "varying-source PK plate, or definition")
+            "or definition")
         length(got) <= 1 || _fail(p.label,
             "vector parameter $(p.name) shared by " *
             "$(join(got, ", ")) — one vector parameter per response, " *
-            "monotonic term, joint-factor link, R2D2 prior, or varying-source PK plate")
+            "monotonic term, joint-factor link, or R2D2 prior")
     end
     return nothing
 end
@@ -8356,9 +8347,10 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     haskey(plan.columns, r.response) ||
         _fail(r.label, "response column $(r.response) missing")
     if r.range !== nothing
-        last(r.range) == plan.n_obs || _fail(r.label,
+        n = _response_rows(plan, r)
+        last(r.range) == n || _fail(r.label,
             "response range $(r.range) covers $(length(r.range)) cells " *
-            "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
+            "but n_obs is $n — ranges cover eachindex exactly")
     end
     col = _vector_column(plan.columns, r.response, r.label, "response")
     if _is_bernoulli_family(r.family)
@@ -8770,8 +8762,9 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
         (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
             _fail(r.label, "per-observation scale $s must be finite positive numerics")
     end
-    length(col) == plan.n_obs ||
-        _fail(r.label, "scale column $s length $(length(col)) ≠ n_obs $(plan.n_obs)")
+    n = _response_rows(plan, r)
+    length(col) == n ||
+        _fail(r.label, "scale column $s length $(length(col)) ≠ n_obs $n")
     return nothing
 end
 
@@ -8934,8 +8927,9 @@ function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "trials column must hold integers")
     all(>=(0), col) ||
         _fail(r.label, "trials column must be non-negative")
-    length(col) == plan.n_obs ||
-        _fail(r.label, "trials column length $(length(col)) ≠ n_obs $(plan.n_obs)")
+    n = _response_rows(plan, r)
+    length(col) == n ||
+        _fail(r.label, "trials column length $(length(col)) ≠ n_obs $n")
     all(ycol .<= col) ||
         _fail(r.label, "$what exceeds trials in some row")
     return nothing
@@ -8949,7 +8943,7 @@ function _validate_multinomial_trials(r::LikelihoodSpec, plan::StructuralPlan)
     t === nothing && _fail(r.label,
         "Multinomial response requires trials (Int column or literal)")
     counts = [r.response; r.count_columns...]
-    rowsums = zeros(Int, plan.n_obs)
+    rowsums = zeros(Int, _response_rows(plan, r))
     for c in counts
         rowsums .+= plan.columns[c]
     end
@@ -9070,7 +9064,7 @@ function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
             isinteger(bound) || _fail(r.label,
                 "$side bound literal must be integer-valued for Poisson evidence")
         end
-        return fill(Float64(bound), plan.n_obs)
+        return fill(Float64(bound), _response_rows(plan, r))
     end
     bound isa Symbol || _fail(r.label, "$side bound must be a literal or column")
     _is_derived(plan, bound) && _fail(r.label,
@@ -9251,8 +9245,7 @@ end
 # per-subject `[conc; auc]` blocks (length 2R) — still read-space
 # (gathers move it to an axis first).
 const CELL_FN_RESULT_SPACE = Dict{Symbol,Symbol}(
-    :linear_pk_read_locs => :reads, :linear_pk_read_locs_auc => :reads,
-    :varyingsource_pk_read_locs => :reads, :varyingsource_pkpd_read_locs => :reads)
+    :linear_pk_read_locs => :reads, :linear_pk_read_locs_auc => :reads)
 
 # Bind-time grouped cell shapes: :scalar (LP cell params, model
 # scalars, literals, scalar arithmetic), (:obs, len) (response slices
@@ -9318,34 +9311,6 @@ function _grouped_cell_shape(ex, kp::KernelPlate, shapes::Dict{Symbol,Any},
         fn = ex.args[1]
         if fn isa Symbol && fn in CELL_FNS
             trailing = ex.args[3:end]
-            if haskey(CELL_FN_VECTOR_PORTS,fn)
-                sched = only(kp.schedules)
-                ndose = length(columns[sched.dose_subj])
-                # Three dose modifiers may be flat dose-row vectors or
-                # scalars. GP weights are one shared square coefficient
-                # vector; the runner checks its concrete dimension.
-                for arg in trailing[1:3]
-                    space = _grouped_cell_shape(arg, kp, shapes, columns)
-                    (space === :scalar || space == (:obs, ndose)) ||
-                        _fail(label, "varyingsource dose argument `$arg` needs " *
-                            "a scalar or the $ndose-row dose axis, got $space")
-                end
-              for port in CELL_FN_VECTOR_PORTS[fn]
-                weights = ex.args[port.position]
-                weights isa Symbol && !(weights in _lp_cell_params(kp)) ||
-                    _fail(label, "varyingsource $(port.label) need a shared " *
-                        "coefficient vector name")
-                space = _grouped_cell_shape(weights, kp, shapes, columns)
-                if _is_obs_shape(space)
-                    k = port.shape === :square ? isqrt(space[2]) : space[2]
-                    k >= port.minimum && (port.shape !== :square || k*k == space[2]) ||
-                        _fail(label, "varyingsource $(port.label) need a " *
-                            "nonempty $(port.shape) coefficient vector")
-                end
-              end
-                trailing = Any[a for (i,a) in enumerate(trailing) if i > 3 &&
-                    all(p -> p.position != i+2,CELL_FN_VECTOR_PORTS[fn])]
-            end
             if (fn === :linear_pk_read_locs &&
                     length(ex.args) == CELL_FN_ARITY[fn] + 2) ||
                     fn === :linear_pk_read_locs_auc
@@ -9547,11 +9512,10 @@ function _validate_grouped_gather_maps(kp::KernelPlate,
                 all(1 .<= mapv .<= bound) ||
                     _fail(kp.label,"gather map `$mapcol` has entries outside 1..$bound (scalar vector literal)")
             elseif src in _lp_cell_params(kp)
-                bound = _kernel_lp_axis(kp,src) === :dose ?
-                    length(columns[only(kp.schedules).dose_subj]) : n_sub
-                all(1 .<= mapv .<= bound) ||
+                all(1 .<= mapv .<= n_sub) ||
                     _fail(kp.label, "subject map `$mapcol` has entries " *
-                          "outside 1..$bound (gathered `$src` is a kernel LP)")
+                          "outside 1..$n_sub (gathered `$src` is " *
+                          "per-subject — one subject id per row)")
             else
                 srcshape = shapes[src]
                 bound = srcshape === :reads ?
@@ -9627,10 +9591,6 @@ function _validate_tgi_axis_order(kp::KernelPlate,
     return nothing
 end
 
-_validate_tgi_axis_order(kp::KernelPlate,
-    sched::Union{VaryingSourcePKScheduleSpec,VaryingSourcePKPDScheduleSpec},
-    columns::Dict{Symbol,ColumnData}) = nothing
-
 # Grouped-kernel bind resolution: dims keys resolve `subjects` (no
 # timepoints — leftover keys fail closed); the schedule builds from raw
 # columns and must cover exactly n_sub subjects; op columns + maps
@@ -9669,7 +9629,7 @@ function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
     # stay admitted — this gates only the global emptiness.
     ndose = length(columns[sched.dose_subj])
     if _cell_has_pk_call(kp.assignments)
-        (ndose > 0 || sched isa Union{VaryingSourcePKScheduleSpec,VaryingSourcePKPDScheduleSpec}) ||
+        ndose > 0 ||
             _fail(kp.label, "cell calls a PK recurrence but schedule " *
                   "`$(sched.name)` binds no dose rows (bind dose data " *
                   "or drop the call)")
@@ -9908,6 +9868,8 @@ and never sets `n_obs` (see `_model_level_inputs`).
 function _bind_nrows(columns::AbstractDict{Symbol}, managed::Set{Symbol})
     for (k, v) in columns
         k in managed && continue
+        # A number or a higher-dimensional array has no observation axis.
+        (v isa Number || ndims(v) > 2) && continue
         return _column_nrows(v)
     end
     throw(ContractValidationError(
@@ -10137,6 +10099,78 @@ function _drop_held_names!(out::Set{Symbol}, x::T) where {T}
     return nothing
 end
 
+# The `_bound_value` inputs a plan reads, wherever lowering moved their
+# definitions (a definition used only in a predictor is inlined there).
+function _bound_value_inputs(plan::StructuralPlan)
+    found = Set{Symbol}()
+    seen = Base.IdSet{Any}()
+    for f in fieldnames(StructuralPlan)
+        f === :columns && continue
+        _collect_bound_value_inputs!(found, getfield(plan, f), seen)
+    end
+    return found
+end
+function _collect_bound_value_inputs!(found, x::Expr, seen)
+    if _is_bound_value_call(x) && x.args[2] isa Symbol
+        push!(found, x.args[2])
+    end
+    for a in x.args
+        _collect_bound_value_inputs!(found, a, seen)
+    end
+    return nothing
+end
+function _collect_bound_value_inputs!(found,
+        x::Union{AbstractArray,Tuple,NamedTuple,AbstractSet,AbstractDict},
+        seen)
+    eltype(x) <: Union{Number,Symbol,AbstractString} && return nothing
+    x in seen && return nothing
+    push!(seen, x)
+    for v in (x isa AbstractDict ? values(x) : x)
+        _collect_bound_value_inputs!(found, v, seen)
+    end
+    return nothing
+end
+# Plan records (specs, terms, priors): walk their fields.
+const _PLAN_RECORD_MODULE = @__MODULE__
+function _collect_bound_value_inputs!(found, x::T, seen) where {T}
+    (isstructtype(T) && parentmodule(T) === _PLAN_RECORD_MODULE) ||
+        return nothing
+    x in seen && return nothing
+    push!(seen, x)
+    for f in fieldnames(T)
+        isdefined(x, f) &&
+            _collect_bound_value_inputs!(found, getfield(x, f), seen)
+    end
+    return nothing
+end
+
+# Route each caller value lowered as a scalar definition to its input name
+# (the caller passes `s`; the plan reads `_rkppl_value_s`).
+function _route_bound_values!(plan::StructuralPlan,
+        columns::Dict{Symbol,ColumnData})
+    for input in _bound_value_inputs(plan)
+        haskey(columns, input) && continue
+        name = Symbol(chopprefix(String(input), "_rkppl_value_"))
+        haskey(columns, name) || throw(ContractValidationError(
+            "[bind] data value $name is missing (the model reads it as a " *
+            "model-level value)"))
+        columns[input] = pop!(columns, name)
+    end
+    return columns
+end
+
+# A response bound to a number is one observation (`y .~ Normal.(mu, s)`
+# with a scalar `y`, as in Julia): it binds as a one-entry vector.
+function _scalar_responses_as_observations!(plan::StructuralPlan,
+        columns::Dict{Symbol,ColumnData})
+    for r in plan.responses, nm in (r.response, r.count_columns...,
+            r.extra_responses...)
+        v = get(columns, nm, nothing)
+        v isa Number && (columns[nm] = [v])
+    end
+    return columns
+end
+
 function _materialize_module_data!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData})
     names = _module_data_names(plan, Set{Symbol}(keys(columns)))
@@ -10180,7 +10214,7 @@ function _materialize_module_data!(plan::StructuralPlan,
         end
         # Dense storage: the kernel's data arguments are `Vector`/`Matrix`.
         columns[nm] = v isa AbstractVector ? collect(v) :
-            v isa AbstractMatrix ? Matrix(v) : v
+            v isa AbstractArray ? Array(v) : v
     end
     return names
 end
@@ -10377,6 +10411,8 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     isempty(columns) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
     columns = _checked_columns(columns)
+    _route_bound_values!(plan, columns)
+    _scalar_responses_as_observations!(plan, columns)
     raw = Set{Symbol}(keys(columns))
     computed = _materialize_module_data!(plan, columns)
     # Raw inputs read only as whole values (module-call arguments,
@@ -10460,10 +10496,12 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # NON-managed column's ROW count (length for vectors): mi packs
     # y_obs/Jobs short by design, and Dict order is not a crossing
     # contract (deriving from a packed column fails every full-length
-    # column by order luck).
+    # column by order luck). Observation columns of several lengths are
+    # several observation axes: n_obs is their total rows.
     n = if isempty(kbases)
-        _bind_nrows(columns,
-            union(_mi_managed_columns(plan), computed, inputs))
+        axes = _observation_axes(_with(plan; columns = columns))
+        axes === nothing ? _bind_nrows(columns,
+            union(_mi_managed_columns(plan), computed, inputs)) : axes.total
     else
         sum(kp -> _kernel_plate_nlanes(kp, columns), kbases)
     end
@@ -10588,9 +10626,8 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "concentration length $want")
             push!(out_v, _with(p; size = want))
         elseif p.family === :vector_normal && p.size !== nothing
-            # A grouped varying-source GP coefficient vector has a concrete
-            # structural size; its cell linkage and square size were proved
-            # by validate_structure before bind.
+            # A plain vector with a concrete structural size (read whole
+            # by definitions) passes through; structure proved its use.
             push!(out_v, p)
         elseif p.family === :ordered_normal && p.size !== nothing
             # A free-standing ordered vector (`c ~ Ordered(Normal(0, 1), 3)`
