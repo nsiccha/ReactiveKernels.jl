@@ -287,15 +287,18 @@ at their defaults:
   `nothing` otherwise.
 - `discrimination`: OrdinalFam positive latent scale
   (`nothing` = 1.0), `nothing` otherwise: a positive Real literal, a
-  finite-positive data column, or a modeled scale naming a LogLink plan
-  predictor (positivity is structural via `exp` — the `log(disc)`
-  recipe; any other link fails closed).
+  finite-positive data column, a legacy LogLink predictor name, or an
+  IdentityLink `ScalePredictorRef` reading an authored value directly.
+  The latter has finite-positive support checked by a lazy likelihood guard.
 - `threshold_columns`: OrdinalFam per-threshold design columns
   (StoppingRatio only), empty otherwise.
 - `threshold_coefs`: the (K−1)×p threshold-coefficient matrix packed as a
   `:vector_normal` [`VectorParameter`](@ref) (required exactly when
   `threshold_columns` is non-empty), `nothing` otherwise. Stage-major:
   stage j occupies entries `(j−1)*p+1 .. j*p`.
+- `threshold_effects`: an ordinary N×(K−1) matrix value for stopping-ratio
+  responses, subtracted from `thresholds[j] - eta[i]` before discrimination.
+  It replaces, and cannot accompany, the legacy threshold design fields.
 
 Multinomial/Categorical responses name their shared-simplex
 [`VectorParameter`](@ref) in `predictor` (no linear predictor — the
@@ -405,7 +408,7 @@ struct LikelihoodSpec
     extra_predictors::Vector{Symbol}
     count_columns::Vector{ColumnRef}
     ordinal_structure::Union{Nothing,Symbol}
-    discrimination::Union{Nothing,Real,ColumnRef}
+    discrimination::Union{Nothing,Real,ColumnRef,ScalePredictorRef}
     threshold_columns::Vector{ColumnRef}
     threshold_coefs::Union{Nothing,ParamName}
     extra_responses::Vector{ColumnRef}
@@ -421,6 +424,7 @@ struct LikelihoodSpec
     zi::Union{Nothing,ParamName,Real,ScalePredictorRef}
     mi_jobs::Union{Nothing,ColumnRef}
     interval::Union{Nothing,Tuple{Float64,Float64}}
+    threshold_effects::Union{Nothing,Symbol}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
@@ -439,7 +443,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         extra_predictors::Vector{Symbol} = Symbol[],
         count_columns::Vector{ColumnRef} = Symbol[],
         ordinal_structure::Union{Nothing,Symbol} = nothing,
-        discrimination::Union{Nothing,Real,ColumnRef} = nothing,
+        discrimination::Union{Nothing,Real,ColumnRef,ScalePredictorRef} = nothing,
         threshold_columns::Vector{ColumnRef} = Symbol[],
         threshold_coefs::Union{Nothing,ParamName} = nothing,
         extra_responses::Vector{ColumnRef} = Symbol[],
@@ -455,13 +459,15 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         nu::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         zi::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         mi_jobs::Union{Nothing,ColumnRef} = nothing,
-        interval::Union{Nothing,Tuple{Float64,Float64}} = nothing)
+        interval::Union{Nothing,Tuple{Float64,Float64}} = nothing,
+        threshold_effects::Union{Nothing,Symbol} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
         threshold_columns, threshold_coefs, extra_responses, factor_scales,
         factor_corr, glm_alpha, glm_beta, mixture_family, mixture_locs,
-        mixture_scales, mixture_weights, nu, zi, mi_jobs, interval)
+        mixture_scales, mixture_weights, nu, zi, mi_jobs, interval,
+        threshold_effects)
 end
 
 """
@@ -3120,6 +3126,9 @@ function _response_uses_predictor(r::LikelihoodSpec, pname::Symbol)
         return true
     r.zi isa ScalePredictorRef && r.zi.predictor === pname &&
         return true
+    r.discrimination isa ScalePredictorRef &&
+        r.discrimination.predictor === pname && return true
+    r.discrimination === pname && return true
     # Mixture slots ride dedicated fields (the anchor may name a
     # parameter, and non-anchor component predictors live in the slots).
     pname in r.mixture_locs && return true
@@ -7689,7 +7698,13 @@ function _validate_ordinal_extras(r::LikelihoodSpec, plan::StructuralPlan,
         return nothing
     end
     d = r.discrimination
-    if d isa Real
+    if d isa ScalePredictorRef
+        d.link === IdentityLink || _fail(r.label,
+            "an ordinal discrimination value uses IdentityLink")
+        any(p -> p.name === d.predictor, plan.predictors) || _fail(r.label,
+            "ordinal discrimination predictor $(d.predictor) is missing")
+        push!(used_predictors, d.predictor)
+    elseif d isa Real
         (isfinite(d) && d > 0) || _fail(r.label,
             "ordinal discrimination must be finite and strictly positive, " *
             "got $(repr(d))")
@@ -7733,6 +7748,19 @@ function _validate_ordinal_extras(r::LikelihoodSpec, plan::StructuralPlan,
     elseif r.threshold_coefs !== nothing
         _fail(r.label, "threshold_coefs without threshold_columns is " *
             "meaningless — drop it or add the design columns")
+    end
+    if r.threshold_effects !== nothing
+        r.ordinal_structure === :stopping || _fail(r.label,
+            "matrix threshold effects for cumulative responses are not " *
+            "built yet (row cutpoints must remain ordered)")
+        isempty(r.threshold_columns) && r.threshold_coefs === nothing ||
+            _fail(r.label, "use either a threshold-effect matrix or the " *
+                "legacy threshold design, never both")
+        name = r.threshold_effects
+        plan.n_obs == 0 || haskey(plan.columns, name) || _is_derived(plan, name) ||
+            any(a -> a.name === name, plan.assignments) ||
+            any(a -> a.name === name, plan.array_parameters) ||
+            _fail(r.label, "threshold-effect matrix $name is undeclared")
     end
     return nothing
 end
@@ -8324,6 +8352,8 @@ function _validate_responses(plan::StructuralPlan)
     scan_states = Set{Symbol}(st for s in plan.scans for st in s.states)
     used_predictors = Set{Symbol}()
     for r in plan.responses
+        r.threshold_effects === nothing || r.family === OrdinalFam ||
+            _fail(r.label, "only Ordinal takes threshold_effects")
         _validate_mi_structure(r, plan)
         _validate_glm_fields(r)
         # A mixture response validates whole (dedicated component slots;
@@ -9212,6 +9242,11 @@ function _validate_ordinal_data(r::LikelihoodSpec, plan::StructuralPlan)
         col = _vector_column(plan.columns, c, r.label, "threshold column")
         (eltype(col) <: Real && all(isfinite, col)) ||
             _fail(r.label, "threshold column $c must be finite numerics")
+    end
+    if r.threshold_effects !== nothing &&
+            haskey(plan.columns, r.threshold_effects)
+        _ordinal_effects_matrix(plan.columns[r.threshold_effects],
+            plan.columns[r.response], r.n_levels)
     end
     return nothing
 end
@@ -10329,6 +10364,20 @@ function _drop_held_names!(out::Set{Symbol}, x::Expr)
     return nothing
 end
 _drop_held_names!(::Set{Symbol}, ::SubmodelScope) = nothing
+# Sizing an innovation by a matrix axis reads its shape, not one value
+# per observation. Other array fields still pin their ordinary readers.
+function _drop_held_names!(out::Set{Symbol}, p::ArrayParameter)
+    for f in fieldnames(ArrayParameter)
+        if f === :dims
+            for d in p.dims
+                _is_axis_dim(d) || _drop_held_names!(out, d)
+            end
+        else
+            _drop_held_names!(out, getfield(p, f))
+        end
+    end
+    return nothing
+end
 function _drop_held_names!(out::Set{Symbol}, x::T) where {T}
     isstructtype(T) || return nothing
     for f in fieldnames(T)
@@ -10589,8 +10638,18 @@ function _materialize_derived_responses!(plan::StructuralPlan,
             "[bind] column $name is derived in the model — drop it from " *
             "bind_data (derived responses materialize from bound data)"))
         try
-            columns[name] = _eval_derived_name(plan, name, det_exprs, columns,
+            value = _eval_derived_name(plan, name, det_exprs, columns,
                 Dict{Symbol,Any}(), name)
+            # A gather from a partly-missing array retains its union
+            # eltype even when every selected observation is present.
+            # Narrow that representation without dropping any value;
+            # selected missing values still fail response validation.
+            if value isa AbstractArray && Missing <: eltype(value) &&
+                    Base.nonmissingtype(eltype(value)) <: Real &&
+                    !any(ismissing, value)
+                value = Base.nonmissingtype(eltype(value)).(value)
+            end
+            columns[name] = value
         catch e
             e isa ContractValidationError && rethrow()
             throw(ContractValidationError(
@@ -10645,6 +10704,11 @@ function _eval_derived_node(ex, plan::StructuralPlan, det_exprs, columns,
         # plain Julia over the resolved inputs.
         return _eval_value_expr(ex, nm -> _eval_derived_name(plan, nm,
             det_exprs, columns, memo, root), root)
+    end
+    if ex.head === :ref
+        vals = [_eval_derived_node(a, plan, det_exprs, columns, memo, root)
+            for a in ex.args]
+        return getindex(vals...)
     end
     if ex.head === :call
         fn = ex.args[1]
