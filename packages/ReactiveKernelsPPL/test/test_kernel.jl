@@ -355,9 +355,7 @@ end
     # refused: collected name `zz` is undeclared (P6, 05oe96l)
     @test_throws "not a cell name" lower_rkppl(
         plate_ast([good_cell[1], good_cell[2], :zz], [subj]), data; conditioned = data)
-    # Plate alongside a top-level response: the plate no longer carries
-    # the only likelihood (hand-built plan — the surface would trip on
-    # the response's predictor first).
+    # A plate may carry a likelihood beside a top-level response.
     resp = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s, nothing,
         ResponseEvidence(:none, nothing, nothing), :y_resp)
     pred_spec = PredictorSpec(:mu, IdentityLink,
@@ -373,8 +371,7 @@ end
         PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0)],
         [sparam], AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
         kernel_plates = [kp_hand])
-    # capability: kernel-plate likelihood alongside top-level responses (v2 contract; hand-built plan) (todo `1308iv0`)
-    @test_broken (validate_structure(both_plan); true)
+    @test validate_structure(both_plan) === nothing
     # Two panel plates in one model (v2: panels compose freely —
     # distinct cell names; shared names trip single-assignment first).
     # A shared subjects dims key consumes once.
@@ -903,7 +900,7 @@ end
     stray = merge(dims, Dict{Symbol,Int}(:kernel_T_preed => 3))
     # refused: stray dims key not consumed by any plate (wrong data)
     @test_throws "not consumed by any kernel plate" bind_data(unbound, columns; dims = stray)
-    # Top-level responses alongside plates name every plate result.
+    # Several plates may contribute beside a top-level response.
     resp = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s, nothing,
         ResponseEvidence(:none, nothing, nothing), :y_resp)
     pred_spec = PredictorSpec(:mu, IdentityLink,
@@ -920,16 +917,15 @@ end
         [sparam], AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
         kernel_plates = [mkplate(:pred1, :t, :ts),
             mkplate(:pred2, :t2, :ts2)])
-    # capability: kernel plates alongside top-level responses (v2 contract; hand-built plan) (todo `1308iv0`)
-    @test_broken (validate_structure(both2); true)
+    @test validate_structure(both2) === nothing
     # Hand-bound n_obs must be the lanes sum (positive control first).
     bound = bind_data(unbound, columns; dims = dims)
     mkhand(n) = StructuralPlan(bound.responses, bound.predictors,
         bound.population_priors, bound.parameters, bound.assignments,
         bound.columns, n; kernel_plates = bound.kernel_plates)
     @test validate_data(mkhand(7)) === nothing
-    # refused: hand-bound n_obs != total kernel lanes (IR contract)
-    @test_throws "total kernel lanes" validate_data(mkhand(6))
+    # refused: hand-bound n_obs differs from the total likelihood lanes.
+    @test_throws "total likelihood lanes" validate_data(mkhand(6))
     # A shared subjects key consumes once (all-scalar pair).
     shr = quote
         b0 ~ Normal(0.0, 1.0)

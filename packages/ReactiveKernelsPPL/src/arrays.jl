@@ -62,7 +62,7 @@ _is_axis_dim(d) = d isa Expr && d.head === :call && length(d.args) == 3 &&
     (d.args[3] === 1 || d.args[3] === 2)
 
 function _validate_array_dim(p::ArrayParameter, d)
-    d isa Int && d >= 1 && return nothing
+    d isa Int && d >= 0 && return nothing
     if _is_levels_dim(d)
         _validate_subset_shape(LevelMap(p.name, d.args[2], [], :levels,
             _levels_subset(d)))
@@ -71,7 +71,7 @@ function _validate_array_dim(p::ArrayParameter, d)
     (_is_levels_dim(d) || _is_axis_dim(d) || _levels_count(d) !== nothing) &&
         return nothing
     _fail(p.label, "array $(p.name) axis $(repr(d)) is not a size: axes " *
-          "are a literal `1:K` (K ≥ 1), `1:length(levels(g)) - k`, " *
+          "are a literal `1:K` (K ≥ 0), `1:length(levels(g)) - k`, " *
           "`levels(g)`, or `axes(M, d)` / `size(M, d)` of a matrix `M` " *
           "(d = 1 or 2)")
 end
@@ -85,8 +85,6 @@ function _array_axis_levels(plan::StructuralPlan, name::Symbol, label,
     haskey(plan.columns, g) || _fail(label, "array $name axis " *
         "`levels($g)` needs the bound grouping column $g")
     col = _vector_column(plan.columns, g, label, "`levels()` grouping column")
-    isempty(col) && _fail(label, "array $name axis `levels($g)`: " *
-        "column $g is empty")
     return _grouping_levels(col)
 end
 _array_axis_levels(plan::StructuralPlan, p::ArrayParameter, g::Symbol) =
@@ -103,14 +101,14 @@ function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d)
     if cnt !== nothing
         g, k = cnt
         n = length(_array_axis_levels(plan, name, label, g)) - k
-        n >= 1 || _fail(label, "array $name axis `1:$(repr(d))` is " *
-            "empty on the bound data ($g has $(n + k) levels)")
+        n >= 0 || _fail(label, "array $name axis `1:$(repr(d))` has " *
+            "negative size $n on the bound data ($g has $(n + k) levels)")
         return n
     end
     fn, M, k = d.args[1], d.args[2], d.args[3]
     m = _find_matrix(plan, M)
     if m !== nothing
-        return k == 2 ? length(m.columns) : plan.n_obs
+        return k == 2 ? length(m.columns) : _value_rows(plan, M)
     end
     haskey(plan.columns, M) || _fail(label, "array $name axis " *
         "`$fn($M, $k)` needs a bound matrix $M")
@@ -141,8 +139,6 @@ function _validate_array_arg(p::ArrayParameter, key::Symbol, a)
     end
     a isa Symbol && return nothing
     if a isa Expr && a.head === :vect
-        isempty(a.args) && _fail(p.label, "array $(p.name) prior $key is " *
-            "an empty vector")
         for x in a.args
             _validate_array_arg(p, key, x)
         end
@@ -240,8 +236,10 @@ function _validate_array_parameters_data(plan::StructuralPlan)
     known = union(Set{Symbol}(_all_names(plan)), Set{Symbol}(keys(plan.columns)))
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
-        all(>=(1), dims) || _fail(p.label, "array $(p.name) has an empty " *
-            "axis (sizes $(repr(dims)))")
+        all(>=(0), dims) || _fail(p.label, "array $(p.name) has a negative " *
+            "axis size (sizes $(repr(dims)))")
+        _is_structured_array(p) && !all(>=(1), dims) && _fail(p.label,
+            "structured array $(p.name) has an empty axis (sizes $(repr(dims)))")
         if p.family in (:lkj_cholesky, :lkj_cholesky_stack)
             dims[1] == dims[2] || _fail(p.label, "LKJCholesky factor " *
                 "$(p.name) is not square: $(repr(dims))")
@@ -276,7 +274,7 @@ function _array_arg_length(plan::StructuralPlan, a)
     a isa Symbol || return nothing
     _is_array_param(plan, a) &&
         return prod(_array_dims(plan, _array_param(plan, a)))
-    _is_derived(plan, a) && return plan.n_obs
+    _is_derived(plan, a) && return _value_rows(plan, a)
     if haskey(plan.columns, a)
         col = plan.columns[a]
         col isa Real && return nothing
@@ -1006,6 +1004,11 @@ _array_slices_packed_name(name::Symbol) = Symbol(:_ppl_arru_, name)
 # slice-transformed array reshapes its packed block and transforms every
 # slice in one call.
 function _array_transform_statements(e::LayoutEntry)
+    # There are no bijector cells in an empty elementwise array. Preserve its
+    # value shape with an owned empty output, without evaluating a cell.
+    e.size == 0 && !_is_slice_transform(e.transform) &&
+        e.transform !== :lkj_stack && return Expr[:($(e.name)::Array{Float64,$(length(e.dims))} =
+        zeros(Float64, $(e.dims...)))]
     e.transform === :lkj_stack && return _lkj_stack_transform_statements(e)
     if _is_slice_transform(e.transform)
         U = _array_slices_packed_name(e.name)
@@ -1029,6 +1032,7 @@ function _array_transform_statements(e::LayoutEntry)
 end
 
 function _array_jacobian_term(e::LayoutEntry)
+    e.size == 0 && return nothing
     e.transform === :lkj_stack &&
         return _lkj_vine_logjac(e.name, e.dims[1]; stacked = true)
     if _is_slice_transform(e.transform)
@@ -1189,6 +1193,13 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
         node = Symbol(:_ppl_prior_, p.name)
+        if prod(dims) == 0
+            # An elementwise declaration over no elements has no density
+            # cells. Scalar priors elsewhere in the model remain intact.
+            push!(stmts, :($node::Float64 = 0.0))
+            push!(terms, node)
+            continue
+        end
         if p.family === :lkj_cholesky
             push!(stmts, :($node::Float64 =
                 $(_lkj_prior_terms(p.name, dims[1], Float64(p.args.arg1)))))

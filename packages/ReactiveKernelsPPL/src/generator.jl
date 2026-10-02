@@ -146,9 +146,10 @@ function _affine_coefficient_statements(plan::StructuralPlan, layout::LayoutTabl
                 legacy_offset += b.width
             end
         end
+        terms = [t for (t, b) in zip(p.terms, shape.blocks) if b.width > 0]
         if length(chunks) == 1 && any(t -> _parameter_term(t) &&
-                t.kind in (FactorTerm, MatrixTerm), p.terms)
-            t = only(t for t in p.terms if _parameter_term(t))
+                t.kind in (FactorTerm, MatrixTerm), terms)
+            t = only(t for t in terms if _parameter_term(t))
             value = t.options.parameter
             rhs = t.options.sign == 1 ? value : :(-$value)
         else
@@ -1646,6 +1647,9 @@ end
 # selects the form. Branches are explicit per family; the else is a
 # fail-closed guard for enum members without an emitter (never silent).
 function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
+    # No cell is evaluated on an empty bound observation domain. Its sum is
+    # the additive identity, independently of the response family.
+    _response_rows(plan, r) == 0 && return Expr[:($(_lik_name(r.label))::Float64 = 0.0)]
     node = _lik_name(r.label)
     pw = _pw_name(r.label)
     if r.mi_jobs !== nothing && !(r.family === GaussianFam ||
@@ -1918,7 +1922,7 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
         :($obj($xaug, $bfull).pointwise($yf))
     return Expr[
         :($yf = $yconv.($y)),
-        :($xaug = hcat(ones($(plan.n_obs)), $X)),
+        :($xaug = hcat(ones($(_response_rows(plan, r))), $X)),
         :($bfull = [$(r.glm_alpha); $(r.glm_beta)]),
         :($pw = $call),
         :($node::Float64 = sum($pw)),

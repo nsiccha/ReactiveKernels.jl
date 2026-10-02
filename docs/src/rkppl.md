@@ -32,6 +32,16 @@ declared variable pins it: `model(; x, sigma = 0.3) | (; y)` removes the
 `build_kernel` generates the program, and `prepare_query(built, plan, :sampler)`
 returns the log-posterior over the packed unconstrained coordinates.
 
+An explicitly observed empty vector has zero observations and contributes
+zero log-likelihood. Scalar priors and their transforms still contribute as
+authored. An elementwise declaration such as `z[1:0] .~ Normal.(0, 1)` is an
+empty vector with no coordinates and zero prior and log-Jacobian. The same
+identity applies to empty matrix axes and empty data-sized elementwise arrays;
+negative declared sizes and out-of-bounds gathers remain errors.
+Native gradients also support a completely empty coordinate pack. Compiled
+values support it; compiled gradients currently fail at the backend's empty
+tensor export boundary (see [Core constraints](constraints.md)).
+
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("01_gaussian.jl", :rkppl_first_model; preamble = "using ReactiveKernelsPPL")
 ```
@@ -274,6 +284,17 @@ broadcast spelling.
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
 ```
+
+Responses may have different row counts. Each statement reads columns on its
+own observation axis; statements that read a common observation column must
+agree on its rows. A latent plate follows its authored range, while a scan
+with a symbolic length and a `dar` trajectory follow their consuming response.
+Varying effects, smooth bases, and design matrices follow their input rows.
+Declared `axes(X, 1)` arrays have X's rows; `axes(X, 2)` coefficient vectors
+have X's width. The total `n_obs` does not size these values. A trajectory used
+by responses of different lengths fails binding because its axis is ambiguous.
+Kernel plates may also contribute likelihoods beside ordinary responses;
+their subject/time or schedule dimensions retain their own rows.
 
 The stratified library body above uses both per-level and per-observation
 cells. `L[k] ~ LKJCholesky(K, eta)` inside a plate over `levels(s)` declares
