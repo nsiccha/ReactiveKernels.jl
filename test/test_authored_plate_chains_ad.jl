@@ -130,6 +130,7 @@ end
     U = [sin(0.01i) + l for i in 1:128, l in 1:2]
     units = view(U, :, 2)
     shifts, weights = [-7, 0, 300], [0.7, -0.3, 1.1]
+    original_U, original_shifts, original_weights = copy(U), copy(shifts), copy(weights)
     kernel = prepare(DenseColumnDoseOuterAD.cell)
     for n in (32, 257)
         args = (1:n, shifts, units, weights)
@@ -139,6 +140,24 @@ end
         @test kernel(args...) == kernel(reference_args...)
         ad = prepare_ad(kernel, backend, args...; active=:weights)
         reference = prepare_ad(kernel, backend, reference_args...; active=:weights)
-        @test ad_gradient(ad, args...) ≈ ad_gradient(reference, reference_args...) rtol=1e-12
+        value, gradient = ad_value_and_gradient(ad, args...)
+        @test gradient ≈ ad_gradient(reference, reference_args...) rtol=1e-12
+        @test value ≈ kernel(args...)
+        response = [sum(w * get(units, t - s, 0.0) for (s, w) in zip(shifts, weights))
+                    for t in 1:n]
+        analytic = [2 * sum(response[t] * get(units, t - s, 0.0) for t in 1:n)
+                    for s in shifts]
+        @test gradient ≈ analytic rtol=1e-12
+        # A prepared gradient must read each call's constant view, including
+        # its current parent contents, without capturing or mutating them.
+        replacement_U = U .+ 0.4
+        replacement_args = (1:n, shifts, view(replacement_U, :, 2), weights)
+        replacement_reference = (1:n, shifts, copy(replacement_args[3]), weights)
+        @test ad_gradient(ad, replacement_args...) ≈
+              ad_gradient(reference, replacement_reference...) rtol=1e-12
+        @test replacement_U == original_U .+ 0.4
     end
+    @test U == original_U
+    @test shifts == original_shifts
+    @test weights == original_weights
 end

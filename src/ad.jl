@@ -105,8 +105,8 @@ function _ad_restore_cotangent(point::Tuple, cotangent::Tuple)
 end
 _ad_restore_cotangent(point, cotangent) = cotangent
 
-@generated function (call::_ADNativeKernelCall{I})(
-        active, contexts::Vararg{Any,N}) where {I,N}
+@generated function (call::_ADNativeKernelCall{I,F})(
+        active, contexts::Vararg{Any,N}) where {I,F,N}
     indices = _ad_selector_indices(I)
     input_count = N + length(indices)
     all(index -> 1 <= index <= input_count, indices) || return :(throw(
@@ -123,6 +123,16 @@ _ad_restore_cotangent(point, cotangent) = cotangent
             push!(positional, :(getfield(contexts, $context_index)))
             context_index += 1
         end
+    end
+    if F <: Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction,
+                  _PrecompileWarmFunction}
+        # Enter the existing generated body directly. The RGF vararg wrapper
+        # first packs its arguments into a tuple; with forced bounds checks,
+        # packing a constant view beside active storage defeats static activity
+        # analysis. Keep the original view and inline the generated call, as
+        # the externalized bound-array boundary already does.
+        return :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+            call.native, call.ops, $(positional...)))
     end
     :(call.native(call.ops, $(positional...)))
 end
