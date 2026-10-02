@@ -188,6 +188,7 @@ end
     # global and local scales coincide with the built-in's.
     cols = _ls_cols()
     bb, builtb = _ls_build(quote
+            a ~ Normal(0, 1)
             b1 ~ Horseshoe()
             mu = a .+ b1 .* x1
             sigma ~ Exponential(1.0)
