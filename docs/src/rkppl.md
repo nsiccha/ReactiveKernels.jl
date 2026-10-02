@@ -76,13 +76,83 @@ Main.ReactiveKernelsDocs.render_rkppl_corpus_example("10_levels_prior.jl", :rkpp
 
 ## Group-level effects
 
-`varying_effect(g, [x])` draws a per-group slope (`[1]` for an intercept)
-together with its scale. `varying_draws` / `varying_slice` share correlated
-margins across several uses.
+Varying effects are library submodels. Each body states its priors and returns
+an array that the use site reads with ordinary Julia indexing. The default
+scale prior is `HalfNormal(1)`; correlated margins use `LKJCholesky(K, 1.0)`.
+`K` is a literal, at least two for a correlated entry.
+
+| Statement | Returned value | Observation-level read |
+|---|---|---|
+| `b ~ varying_coefs(g)` | One coefficient per group | `b[g]`, or slope `x .* b[g]` |
+| `b ~ varying_coefs_correlated(g, K)` | A groups × K matrix | `b[g, 1] .+ x .* b[g, 2]` |
+| `b ~ varying_coefs_centered(g)` | One directly sampled coefficient per group | `b[g]` |
+| `b ~ varying_coefs_centered_correlated(g, K)` | Directly sampled multivariate rows | `b[g, 1] .+ x .* b[g, 2]` |
+| `u ~ varying_stratified(g, s)` | One value per observation, with a scale per stratum | `u`, or slope `x .* u` |
+| `r ~ varying_stratified_correlated(g, s, K)` | One K-component row per observation, with scales and a correlation factor per stratum | `r[:, 1] .+ x .* r[:, 2]` |
+
+These are the actual library definitions, read from the loaded submodels:
 
 ```@eval
-Main.ReactiveKernelsDocs.render_rkppl_corpus_example("27_varying_slope.jl", :rkppl_varying_slope)
+Main.ReactiveKernelsDocs.render_rkppl_varying_definitions()
 ```
+
+To use a different prior, write the body at the use site and change its prior
+statement. With the priors unchanged, the library call and the written body
+lower to the same plan. Draw names carry the use-site prefix: `b_sd`, `b_z`,
+and, for correlated margins, `b_L`. Centered entries expose `b_c` instead of
+`b_z`; their coordinates are the coefficients themselves, so their densities
+at a packed point differ from the non-centered entries.
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_corpus_example("27_varying_slope_lib.jl", :rkppl_varying_slope)
+```
+
+The stratified correlated entry returns rows already aligned with the
+observations. Its draws contain S×K scales, a K×K×S stack of factors, and J×K
+standard-normal coordinates, where S and J count the sorted distinct strata
+and groups. Read stratum k's factor as `r_L[:, :, k]`. The returned rows
+currently support literal column reads; passing that result whole to a
+function or reading it by row is not supported yet.
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_corpus_example("65_stratified_lib.jl", :rkppl_stratified)
+```
+
+The stratified array cells run natively and compile under Reactant, including
+reverse-mode gradients. Centered multivariate row priors currently run
+natively; their Reactant density lowering remains unsupported. The older
+`varying_draws` / `varying_effect` statements still lower while their callers
+migrate to these library bodies.
+
+Multi-membership uses the union of the membership columns as one data-only
+definition, `gg = vcat(g1, g2)`. `levels(gg)` then sizes one shared set of
+coefficients. Each observation weights its gathers; the definition runs once
+at binding:
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_corpus_example("62_mm_intercept_lib.jl", :rkppl_membership)
+```
+
+## Declared arrays as values
+
+`z[levels(g), 1:K] .~ Normal.(0, 1)` declares a groups × K matrix;
+`L ~ LKJCholesky(K, eta)` declares a lower-triangular matrix. Sized vectors
+(`sd[1:K] .~ HalfNormal.(1)`) and multivariate rows
+(`eachrow(c[levels(g), 1:K]) .~ MvNormalCholesky(zeros(K), F)`) are also plain
+Julia values. Their priors are explicit, and their dimensions determine their
+packed coordinates.
+
+Array-valued definitions retain known axes: `b = z * (sd .* L)'` is groups ×
+K, so `b[g, 1]` gathers one margin per observation. Positional reads such as
+`L[2, 1]` and `M[:, 1]` remain ordinary Julia reads. A submodel's returned
+array follows the same rule. A data-only definition can size a declared array
+through `levels(gg)`, as in the multi-membership example above.
+
+Gathering by a derived column, or from a definition whose axes the layer cannot
+derive (such as a module function's result), is not supported yet. Pass a
+declared array whole to a model-level Julia function when it needs the full
+value; a bare array combined directly with observation data must first be
+indexed to the observation axis.
 
 ## Design matrices
 
@@ -97,7 +167,8 @@ Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :r
 ## Plates
 
 `@plate for i in R … end` writes a loop whose cells each mean one iteration
-of that Julia loop, so every value in a cell is a scalar and needs no dots.
+of that Julia loop. Scalar arithmetic needs no dots; vector and matrix
+intermediates use ordinary Julia broadcasts and matrix products.
 Shapes come from named data (the range, a data index column), never from a
 separate size argument. A cell holds observations, per-cell latents, per-cell
 submodel calls and cell locals. The whole loop lowers at once, exactly like its
@@ -106,6 +177,22 @@ broadcast spelling.
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
 ```
+
+The stratified library body above uses both per-level and per-observation
+cells. `L[k] ~ LKJCholesky(K, eta)` inside a plate over `levels(s)` declares
+one factor per stratum. An observation cell can then read `sd[s[i], :]`,
+`L[s[i]]` and `z[g[i], :]`, compute a matrix-vector product, and name a
+scalar output with `r[i] = ...` or a row with `b[i, 1:K] = ...`. Shared arrays
+enter the generated RK plates through `Ref`; increasing observations or
+strata does not multiply their compiled cell regions.
+
+A per-level row statement, `b[j, :] ~ MvNormalCholesky(zeros(2), F)` inside a
+plate over `levels(g)`, is equivalent to
+`eachrow(b[levels(g), 1:2]) .~ MvNormalCholesky(zeros(2), F)`.
+`b[j, 1:2]` and `MvNormal` also work. Per-level prior arguments are shared;
+arguments varying by level and deterministic per-level assignments are not
+built yet. In an array cell, an observation must read a named per-index output
+(`y[i] ~ Normal(r[i], sigma)`), rather than a cell local directly.
 
 `@scan begin … end` writes a sequential recurrence, such as an AR(1) state
 (corpus `38_scan_ar.jl`).

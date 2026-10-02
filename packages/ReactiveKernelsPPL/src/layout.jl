@@ -977,6 +977,8 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, e.name => Vector{Float64}(seg))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
+        elseif e.kind === :array && e.transform === :lkj_stack
+            push!(pairs, e.name => _lkj_stack_constrain(e, seg))
         elseif e.kind === :array && _is_slice_transform(e.transform)
             push!(pairs, e.name => _array_slices_constrain(e, seg))
         elseif e.kind === :array
@@ -1138,6 +1140,11 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             size(v) == Tuple(e.dims) || throw(ContractValidationError(
                 "[layout] array parameter $(e.name) has size $(size(v)), " *
                 "want $(Tuple(e.dims))"))
+            if e.transform === :lkj_stack
+                u[e.offset:(e.offset + e.size - 1)] .=
+                    _lkj_stack_unconstrain(e, v)
+                continue
+            end
             if _is_slice_transform(e.transform)
                 u[e.offset:(e.offset + e.size - 1)] .=
                     _array_slices_unconstrain(e, v)
@@ -1195,6 +1202,11 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             # Vector Jacobians couple coordinates (ordered sums, simplex
             # stick-breaking) — entry-level, never per-coordinate.
             total += _vector_logjac(e, seg)
+            continue
+        end
+        if e.kind === :array && e.transform === :lkj_stack
+            # Level by level, the vine's coupled thetas.
+            total += _lkj_stack_logjac(e, seg)
             continue
         end
         if e.kind === :array && _is_slice_transform(e.transform)

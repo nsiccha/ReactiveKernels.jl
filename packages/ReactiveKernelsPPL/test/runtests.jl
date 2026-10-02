@@ -88,6 +88,8 @@ include("test_sweep_failclosed.jl")
 include("test_functions_as_values.jl")
 include("test_data_values.jl")
 include("test_library_varying.jl")
+include("test_plate_cells.jl")
+include("test_plate_cells_reactant.jl")
 
 @testset "package skeleton" begin
     @test isdefined(ReactiveKernelsPPL, :ReactiveKernels)

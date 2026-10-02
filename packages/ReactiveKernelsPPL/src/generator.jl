@@ -306,6 +306,7 @@ function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
     count = 0
     function walk(node)
         node isa Expr || return node
+        _is_plate_column_expr(node) && return node
         if node.head in (:call, :ref, :.) && _contains_module_call(node) &&
                 _expr_value_symbols(node) ⊆ dataonly
             count += 1
