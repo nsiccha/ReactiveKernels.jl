@@ -317,8 +317,8 @@ end
     end
     @testset "dugongs (DUG0 zeros)" begin
         # SB: Linf ~ Normal(2,1), kk/t0 ~ Normal(0,1), sigma ~
-        # Exponential(1); von-Bertalanffy mean; u=zeros(4). Linf rides
-        # the synth coordinate; order-agnostic u, name-mapped grad.
+        # Exponential(1); von-Bertalanffy mean; u=zeros(4). Linf reports
+        # under its own name; order-agnostic u, name-mapped grad.
         bound, built, kern, lay = _sr_query(_SR_DUG_PROG, _sr_dug_cols())
         names = coordinate_names(lay)
         u = zeros(lay.total)
@@ -328,7 +328,7 @@ end
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
         want = _sr_sb_vec(names,
-            [Symbol("mu._rkppl_synth_1") => _SR_SB.DUG0.grad[1],
+            [:Linf => _SR_SB.DUG0.grad[1],
                 :kk => _SR_SB.DUG0.grad[2], :t0 => _SR_SB.DUG0.grad[3],
                 :sigma => _SR_SB.DUG0.grad[4]])
         @test maximum(abs.(g .- want)) < 1e-10
@@ -344,7 +344,7 @@ end
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
         want = _sr_sb_vec(names,
-            [Symbol("mu._rkppl_synth_1") => _SR_SB.DUG1.grad[1],
+            [:Linf => _SR_SB.DUG1.grad[1],
                 :kk => _SR_SB.DUG1.grad[2], :t0 => _SR_SB.DUG1.grad[3],
                 :sigma => _SR_SB.DUG1.grad[4]])
         @test maximum(abs.(g .- want)) < 1e-10

@@ -286,7 +286,8 @@ end
     bound = Base.merge(merge_base, (; s = 2.0))(; y = Y, x = X)
     built = build_kernel(bound)
     u = [0.2, -0.4]
-    a, b = ReactiveKernelsPPL.constrain(built.layout, u).mu
+    nt = ReactiveKernelsPPL.constrain(built.layout, u)
+    a, b = nt.a, nt.b
     @test Base.invokelatest(prepare_query(built, bound, :likelihood), u) ≈
         sum(logpdf.(Normal.(a .+ b .* X, 2.0), Y))
 end
