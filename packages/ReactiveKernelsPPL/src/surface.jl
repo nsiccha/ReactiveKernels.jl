@@ -744,7 +744,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # a parameter-dependent call may take it; each refusal that waiver
     # skips is re-checked once the plan shows no other slot reads it.
     whole = _whole_value_data(det, data,
-        _statement_names(ast, union(data, Set{Symbol}(keys(detmap)))))
+        _statement_names(ast, union(data, Set{Symbol}(keys(detmap))), kstmts))
     waived = _check_module_calls(det, detmap, data, shape_env; whole)
     # Whole-value data compose with array parameters before canonicalization,
     # exactly like a module call's model-level result. Their concrete shape
@@ -1840,10 +1840,13 @@ function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol})
     return setdiff!(inputs, held)
 end
 
-# Names read per observation by non-definition statements. A gathered
+# Names held by non-definition statements. A gathered
 # value is whole even in a response (`v[g]`); its index is aligned. Plates
-# and scans retain their conservative statement-wide alignment.
-function _statement_names(ast::Expr, known::Set{Symbol})
+# and scans retain their conservative statement-wide alignment. Extracted
+# kernel cells remain consumers too: a schedule-chain definition moved out
+# of `det` still reads its subject-level predictors. Otherwise those now
+# apparently unused definitions would be classified as whole values.
+function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ())
     out = Set{Symbol}()
     whole = Set{Symbol}()
     for st in ast.args
@@ -1855,7 +1858,9 @@ function _statement_names(ast::Expr, known::Set{Symbol})
             _classify_reads!(whole, out, st, known, false)
         end
     end
-    return out
+    free = copy(known)
+    _drop_held_names!(free, kernel_stmts)
+    return union!(out, setdiff(known, free))
 end
 
 # The names of `among` that `ex` reads, directly or through definitions.
