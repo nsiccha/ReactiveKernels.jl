@@ -1105,8 +1105,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # arguments, gathered values) is a model-level data input at bind, so
     # a parameter-dependent call may take it; each refusal that waiver
     # skips is re-checked once the plan shows no other slot reads it.
-    whole = _whole_value_data(det, data,
-        _statement_names(ast, union(data, Set{Symbol}(keys(detmap))), kstmts))
+    # An array prior consumes its arguments as whole values too. Seed that
+    # context before shaping definitions, then confirm it on the final plan.
+    prior_defs = Pair{Symbol,Any}[Symbol(:_ppl_prior_input_, s.lhs) => s.rhs
+        for s in sample if s.lhs in sized_decls]
+    whole = _whole_value_data(vcat(det, prior_defs), data,
+        _statement_names(ast, union(data, Set{Symbol}(keys(detmap))), kstmts;
+            whole_priors = sized_decls))
     waived = _check_module_calls(det, detmap, data, shape_env; whole)
     # Whole-value data compose with array parameters before canonicalization,
     # exactly like a module call's model-level result. Their concrete shape
@@ -2419,7 +2424,8 @@ end
 # kernel cells remain consumers too: a schedule-chain definition moved out
 # of `det` still reads its subject-level predictors. Otherwise those now
 # apparently unused definitions would be classified as whole values.
-function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ())
+function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ();
+        whole_priors::Set{Symbol} = Set{Symbol}())
     out = Set{Symbol}()
     whole = Set{Symbol}()
     for st in ast.args
@@ -2427,6 +2433,10 @@ function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ())
         st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
         if st isa Expr && st.head === :macrocall
             _all_symbols!(out, st)
+        elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
+                _merge_stem(_stmt_lhs(st)) in whole_priors
+            _classify_reads!(whole, out, _stmt_lhs(st), known, false)
+            _classify_reads!(whole, out, last(st.args), known, true)
         else
             _classify_reads!(whole, out, st, known, false)
         end
