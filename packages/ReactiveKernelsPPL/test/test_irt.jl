@@ -183,17 +183,18 @@ end
     # A product over a factor sub in an additive sum composes (LSAT).
     ls = lower_rkppl(_IRT_LSAT, (:y, :student, :question))
     @test only(ls.predictors[3].terms).options.tree == :(be .* th .- al)
-    # Fail-closed: unadmitted elementwise maps name the admitted set.
-    bad_map = quote
+    # Any dotted elementwise function composes over a sub, not only the
+    # link-shaped `exp.`/`logistic.` (snag `rkppl-predictor-f40e6808`).
+    log_map = lower_rkppl(quote
         c[levels(g)] .~ Normal.(0, 1)
         th = c[g]
         be ~ Normal(0, 1)
         eta = log.(th) .* be
         y .~ Bernoulli.(logistic.(eta))
-    end
-    err = try lower_rkppl(bad_map, (:y, :g)); nothing catch e; e end
-    @test err isa SurfaceLoweringError
-    @test occursin("exp.", sprint(showerror, err))
+    end, (:y, :g))
+    t = only(log_map.predictors[end].terms)
+    @test t.kind === ComposedTerm
+    @test t.options.tree == :(log.(th) .* be)
     # A bare varying contribution (not a sub alias) stays out of trees.
     bare = quote
         r ~ varying_effect(g, [1]; sd = Cauchy(0, 2))

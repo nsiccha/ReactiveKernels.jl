@@ -583,8 +583,12 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     vecdefs = Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :vector)
     taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names,
         plate_names)
+    # Interned predictors by name (shared with `ctx`: a composition over a
+    # definition already interned as a predictor reads its LP node).
+    pred_idx = Dict{Symbol,Int}()
     ctx = (; data, detmap = canonmap, prior_names, coef_priors, detshape,
         vecdefs, structural, derived_responses = derived_response_names,
+        pred_idx,
         plate_names, absorbed = Set{Symbol}(),
         predictor_pins = pins, pins_used = Set{Symbol}(),
         pin_owner = Dict{Symbol,Symbol}(),
@@ -624,7 +628,6 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         sized_decls = sized_decls)
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
-    pred_idx = Dict{Symbol,Int}()
     coefuse = Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}()
     glmuse = Dict{Symbol,Tuple{Symbol,Symbol}}()
     for s in sample
@@ -8045,6 +8048,18 @@ function _composed_has_sub(node, ctx, allow_factor::Bool = false)
     return any(a -> _composed_has_sub(a, ctx, allow_factor), node.args[2:end])
 end
 
+# A sub-predictor whose value exists only as an LP node: one that holds
+# coefficients (a structural definition — its coefficients live only in
+# the predictor's block, so an extracted column cannot recompute it) or
+# one already interned as a predictor (a response location or scale,
+# absorbed — never also a named local).
+function _composed_has_lp_sub(node, ctx)
+    node isa Symbol && return (node in ctx.structural ||
+        haskey(ctx.pred_idx, node)) && _is_composed_sub(node, ctx, true)
+    node isa Expr || return false
+    return any(a -> _composed_has_lp_sub(a, ctx), node.args)
+end
+
 function _composed_has_scalar_leaf(node, ctx)
     node isa Symbol && return _is_composed_scalar(node, ctx)
     node isa Expr || return false
@@ -8094,10 +8109,20 @@ function _composed_trigger(rhs, ctx)
     # (`resp = logistic.((log_dose .- dl) .* exp.(dls))`) is a composition.
     _is_composed_map(rhs) && rhs.args[1] in _COMPOSED_UNARY &&
         return _composed_has_sub(rhs, ctx, true)
+    # Any other elementwise map (`hypot.(s1, mu .* s2)`, `sqrt.(mu)`) or
+    # dotted operator (`mu ./ s`, `mu .^ 2`) reading a sub-predictor whose
+    # value exists only as an LP node composes too: the reader takes that
+    # LP value, evaluated once (`_composed_has_lp_sub`). Over other
+    # definitions the derived-column path already reads a named local, so
+    # it stays.
+    _is_composed_map(rhs) && _composed_map_fn(rhs.args[1]) &&
+        return _composed_has_lp_sub(rhs, ctx)
     rhs.head === :call || return false
     isempty(rhs.args) && return false
     op = rhs.args[1]
     op isa Symbol || return false
+    op in _COMPOSED_MORE_OPS && _composed_has_lp_sub(rhs, ctx) &&
+        return true
     if op === :.*
         return any(a -> _composed_has_sub(a, ctx, true), rhs.args[2:end])
     elseif op === :* && length(rhs.args) == 3
@@ -8147,9 +8172,13 @@ _composed_root(rhs, ctx) =
 
 """Extract + validate a combination tree (trigger already fired).
 Leaves: sub-predictors (vector defs) and scalars (sampled names,
-scalar definitions). Everything else fails closed with guidance."""
+scalar definitions); a numeric literal is a leaf where it is an operand
+of an elementwise map or of a dotted operator other than `.*`/`.+`/`.−`
+(`operand`: `hypot.(1.0, mu)`, `mu .^ 2`). Everything else fails closed
+with guidance."""
 function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
-        scalars::Vector{Symbol}, datas::Vector{Symbol} = Symbol[])
+        scalars::Vector{Symbol}, datas::Vector{Symbol} = Symbol[];
+        operand::Bool = false)
     where = "predictor $pname"
     if node isa Symbol
         # A name bound to a composition inlines its tree (the definition
@@ -8179,6 +8208,7 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
                 "declare it (`$node ~ Prior` or `$node = ...`)")
         end
     end
+    node isa Number && operand && return node
     node isa Number && return _sfail(
         "$where scales by the literal $node — fold literal scales " *
         "into a coefficient or prior instead")
@@ -8187,13 +8217,18 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         "sub-predictors and scalars)")
     if _is_composed_map(node)
         f = node.args[1]
-        f in _COMPOSED_UNARY || return _sfail("$where maps " *
+        _composed_map_fn(f) || return _sfail("$where maps " *
             "$(repr(f)). over a composition — admitted elementwise maps: " *
-            "$(join(string.(_COMPOSED_UNARY, "."), ", "))")
-        length(node.args[2].args) == 1 || return _sfail("$where " *
-            "$(repr(f)). takes one operand")
-        return Expr(:., f, Expr(:tuple, _extract_composed_tree(pname,
-            only(node.args[2].args), ctx, subs, scalars, datas)))
+            "$(join(string.(_COMPOSED_UNARY, "."), ", ")), the dotted " *
+            "built-in math functions, `ifelse.`, and dotted functions " *
+            "visible in the model module")
+        fargs = node.args[2].args
+        f in _COMPOSED_UNARY && length(fargs) != 1 && return _sfail(
+            "$where $(repr(f)). takes one operand")
+        isempty(fargs) && return _sfail("$where $(repr(f)). takes at " *
+            "least one operand")
+        return Expr(:., f, Expr(:tuple, (_extract_composed_tree(pname, a,
+            ctx, subs, scalars, datas; operand = true) for a in fargs)...))
     end
     node.head === :call || return _sfail("$where composition node " *
         "$(repr(node)) is not admitted (v1: `. .*`/`.+`/`.−` over " *
@@ -8212,6 +8247,11 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             (op === :.- ? "one or two operands" : "two operands"))
         return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
             subs, scalars, datas) for a in args)...)
+    elseif op in _COMPOSED_MORE_OPS
+        length(args) == 2 || return _sfail("$where `$op` takes two " *
+            "operands")
+        return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
+            subs, scalars, datas; operand = true) for a in args)...)
     elseif op === :* && length(args) == 2
         # Julia-valid scalar `*` normalizes to dotted (Base broadcasts —
         # behavior-preserving, the canonicalization doctrine).
@@ -8223,8 +8263,10 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             "(`. .*`/`.+`/`.−`) or bind scalar subexpressions to a name " *
             "first (`s = be + 1; eta = s .* th`)")
     else
-        return _sfail("$where applies `$op` inside a composition — v1 " *
-            "admits `. .*`/`.+`/`.−` over sub-predictors and scalars only")
+        return _sfail("$where applies `$op` inside a composition — " *
+            "compositions admit dotted operators and dotted elementwise " *
+            "functions over sub-predictors, scalars and data (write `$op` " *
+            "dotted, or bind the value to a name first)")
     end
 end
 
