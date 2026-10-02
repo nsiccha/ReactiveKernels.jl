@@ -32,6 +32,16 @@ declared variable pins it: `model(; x, sigma = 0.3) | (; y)` removes the
 `build_kernel` generates the program, and `prepare_query(built, plan, :sampler)`
 returns the log-posterior over the packed unconstrained coordinates.
 
+An explicitly observed empty vector has zero observations and contributes
+zero log-likelihood. Scalar priors and their transforms still contribute as
+authored. An elementwise declaration such as `z[1:0] .~ Normal.(0, 1)` is an
+empty vector with no coordinates and zero prior and log-Jacobian. The same
+identity applies to empty matrix axes and empty data-sized elementwise arrays;
+negative declared sizes and out-of-bounds gathers remain errors.
+Native gradients also support a completely empty coordinate pack. Compiled
+values support it; compiled gradients currently fail at the backend's empty
+tensor export boundary (see [Core constraints](constraints.md)).
+
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("01_gaussian.jl", :rkppl_first_model; preamble = "using ReactiveKernelsPPL")
 ```
