@@ -79,6 +79,7 @@ include("test_derived_response.jl")
 include("test_sweep_replicate.jl")
 include("test_sweep_failclosed.jl")
 include("test_functions_as_values.jl")
+include("test_data_values.jl")
 
 @testset "package skeleton" begin
     @test isdefined(ReactiveKernelsPPL, :ReactiveKernels)

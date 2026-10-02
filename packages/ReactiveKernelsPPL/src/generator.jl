@@ -110,6 +110,8 @@ _data_arg(name::Symbol, col::AbstractVector) =
 _data_arg(name::Symbol, col::AbstractMatrix) =
     Expr(:(::), name, Matrix{eltype(col)})
 _data_arg(name::Symbol, v::Number) = Expr(:(::), name, typeof(v))
+_data_arg(name::Symbol, col::AbstractArray) =
+    Expr(:(::), name, Array{eltype(col),ndims(col)})
 
 # Dedicated eval scope for generated models. The `using` lines resolve via
 # this package's own Project (by file location), so generated code loads in
