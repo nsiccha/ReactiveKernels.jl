@@ -143,9 +143,9 @@ function _validate_array_arg(p::ArrayParameter, key::Symbol, a)
     if a isa Expr && a.head === :vect
         isempty(a.args) && _fail(p.label, "array $(p.name) prior $key is " *
             "an empty vector")
-        all(x -> x isa Real && isfinite(x), a.args) || _fail(p.label,
-            "array $(p.name) prior $key: literal vectors hold finite " *
-            "numbers, got $(repr(a))")
+        for x in a.args
+            _validate_array_arg(p, key, x)
+        end
         return nothing
     end
     a isa Expr && return nothing

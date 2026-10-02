@@ -570,8 +570,7 @@ function _bind_parameter_terms!(predictors, structured)
         p.name in structured || continue
         # Explicit whole-predictor constructs own their coefficient pack.
         terms = TermSpec[_parameter_term(t) ? TermSpec(t.kind, t.columns,
-            (; (k => v for (k, v) in pairs(t.options)
-                if k ∉ (:parameter, :sign))...), t.addressee, t.label) : t
+            _term_structure_options(t), t.addressee, t.label) : t
             for t in p.terms]
         predictors[i] = PredictorSpec(p.name, p.link, terms, p.label)
     end
@@ -4388,7 +4387,7 @@ function _hcat_value_reads(det, detmap, sample, data, glms,
     # prior can make it an array (below).
     sized_by = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && s.broadcast && s.matrix !== nothing)
-    valued(X, w) = !(w isa Symbol && w in sized_by) &&
+    valued(X, w, composed) = (composed || !(w isa Symbol && w in sized_by)) &&
         (w isa Symbol || w isa Expr) && shape(w) === :array
     for (nm, rhs) in det
         nm in mats && continue
@@ -4417,7 +4416,7 @@ function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool;
     a = ex.args
     if ex.head === :call && length(a) == 3 && a[1] === :* &&
             a[2] isa Symbol && a[2] in mats
-        (!affine || valued(a[2], a[3])) && push!(out, a[2])
+        valued(a[2], a[3], !affine) && push!(out, a[2])
         return _matrix_value_reads!(out, a[3], mats, valued, indef;
             affine = false)
     end
@@ -4430,8 +4429,14 @@ function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool;
             push!(out, a[1])
         end
     end
-    child_affine = affine && ex.head === :call && !isempty(a) &&
-        a[1] in (:+, :.+, :-, :.-)
+    # Distribution constructors and their argument tuples preserve the
+    # affine context. Only a mathematical composition requires a declared
+    # array operand to take the ordinary matrix-value route.
+    fn = (ex.head === :call || _is_dotted_call(ex)) && !isempty(a) ? a[1] : nothing
+    composed = fn in _MATRIX_OPERAND_HEADS || fn in ELEMENTWISE_FNS ||
+        fn in ASSIGNMENT_FNS || fn in VECTOR_FNS || fn isa GlobalRef ||
+        (fn isa Expr && fn.head === :.)
+    child_affine = affine && !(composed && fn ∉ (:+, :.+, :-, :.-))
     for x in a
         _matrix_value_reads!(out, x, mats, valued, indef;
             affine = child_affine)
@@ -9035,7 +9040,7 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
                 "predictor $pname: coefficient $name is used twice")
             for a in addrs
                 haskey(addr_owner, a) && addr_owner[a] !== name &&
-                    !(name in ctx.ordinary_parameters &&
+                    !(name in ctx.ordinary_parameters ||
                         addr_owner[a] in ctx.ordinary_parameters) && _sfail(
                     "predictor $pname: column $a has two coefficients " *
                     "$(addr_owner[a]) and $name — one coefficient per column")
@@ -9923,6 +9928,8 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                 if t.kind === FactorTerm
                     name = t.options.parameter
                     s = stated[name]
+                    s.levels === nothing && _sfail("parameter $name is " *
+                        "read as a factor but needs a sized levels declaration")
                     gcol, subset = s.levels
                     col = only(t.columns)
                     gcol === col || _sfail("parameter $name: levels " *

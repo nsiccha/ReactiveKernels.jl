@@ -61,4 +61,36 @@ using Reactant
     end
     @test !isempty(factor_ops[1])
     @test factor_ops[1] == factor_ops[2]
+
+    @testset "mixed packs and transformed scalars" begin
+        for ast in (quote
+                b ~ Laplace(0, 2)
+                c[levels(g)] .~ Cauchy.(0, 1)
+                mu = c[g] .- b .* x
+                y .~ Normal.(mu, 1.0)
+            end, quote
+                a ~ Uniform(-2, 2)
+                b ~ HalfNormal(1)
+                mu = a .- b .* x
+                y .~ Normal.(mu, 1.0)
+            end)
+            g = [1, 2, 3, 1]
+            x = [-1.0, 0.5, 2.0, 0.2]
+            y = zeros(4)
+            plan, built = _affine_model(ast; g, x, y)
+            u = collect(range(-0.2, 0.3; length=built.layout.total))
+            _check_gradient(built.spec, plan, u)
+            post = prepare_query(built, plan, :sampler)
+            ru = Reactant.to_rarray(u)
+            compiled = Reactant.@compile post(ru)
+            @test Float64(compiled(ru)) ≈ post(u)
+            sampler = prepare_sampler(built, plan, u; backend=_GEN_BACKEND)
+            grad = similar(u)
+            val, _ = sampler_value_and_gradient!(sampler, grad, u)
+            cad = compile_ad_value_and_gradient(sampler.ad, ru)
+            rval, rgrad = cad(ru)
+            @test Float64(rval) ≈ val
+            @test Array(rgrad) ≈ grad
+        end
+    end
 end

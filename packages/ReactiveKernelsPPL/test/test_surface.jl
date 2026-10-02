@@ -25,6 +25,8 @@ _plans_equal(a::StructuralPlan, b::StructuralPlan) =
     all(_priors_equal.(a.population_priors, b.population_priors)) &&
     length(a.parameters) == length(b.parameters) &&
     all(_params_equal.(a.parameters, b.parameters)) &&
+    length(a.array_parameters) == length(b.array_parameters) &&
+    all(_arrays_equal.(a.array_parameters, b.array_parameters)) &&
     length(a.assignments) == length(b.assignments) &&
     all(_assigns_equal.(a.assignments, b.assignments)) &&
     length(a.derived) == length(b.derived) &&
@@ -100,6 +102,11 @@ _params_equal(a::SampledParameter, b::SampledParameter) =
     all(air -> air[1] === air[2], zip(values(a.args), values(b.args))) &&
     a.support_override === b.support_override && a.label === b.label
 
+_arrays_equal(a::ArrayParameter, b::ArrayParameter) =
+    a.name === b.name && a.family === b.family &&
+    repr(a.args) == repr(b.args) && repr(a.dims) == repr(b.dims) &&
+    a.support_override === b.support_override && a.label === b.label
+
 _assigns_equal(a::AssignmentSpec, b::AssignmentSpec) =
     a.name === b.name && repr(a.expr) == repr(b.expr) && a.label === b.label
 
@@ -109,9 +116,9 @@ _deriveds_equal(a::VectorAssignmentSpec, b::VectorAssignmentSpec) =
 _unexp(responses, predictors, priors, params = SampledParameter[],
         assigns = AssignmentSpec[],
         derived = VectorAssignmentSpec[],
-        maps = LevelMap[]) = StructuralPlan(responses,
+        maps = LevelMap[]; arrays = ArrayParameter[]) = StructuralPlan(responses,
     predictors, priors, params, assigns, Dict{Symbol,AbstractVector}(), 0;
-    derived = derived, levelmaps = maps)
+    derived = derived, levelmaps = maps, array_parameters = arrays)
 
 @testset "surface roundtrip gaussian end to end" begin
     m = @rkppl begin
@@ -636,7 +643,7 @@ end
     built = build_kernel(bound)
     u3 = [0.1, -0.2, 0.3]
     nt = constrain(built.layout, u3)
-    ref = _ref_zip(bound.columns, Vector(nt.eta), nt.zi)
+    ref = _ref_zip(bound.columns, [nt.a, nt.b], nt.zi)
     @test _query(built.spec, bound, :posterior, u3) ≈
         ref.ll + ref.pr + _zi_unit_jac(nt.zi)
     _check_gradient(built.spec, bound, u3)
@@ -1446,12 +1453,13 @@ end
         LikelihoodSpec[LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta,
             nothing, nothing, _none_evidence(), :y_resp)],
         PredictorSpec[PredictorSpec(:eta, IdentityLink,
-            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+            TermSpec[TermSpec(InterceptTerm, ColumnRef[], (parameter=:a, sign=1),
                     :Intercept, :intercept),
                 TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)],
             :eta)],
-        PopulationPrior[PopulationPrior(:eta, :Intercept, 0.0, 5.0),
-            PopulationPrior(:eta, :x, 0.0, 1.0)])
+        PopulationPrior[PopulationPrior(:eta, :x, 0.0, 1.0)],
+        SampledParameter[SampledParameter(:a, :normal,
+            (arg1=0, arg2=5), nothing, :a)])
     @test _plans_equal(got, want)
     # Factor (full-rank, no intercept) + offset + literal scale.
     got = lower_rkppl(quote
@@ -1463,12 +1471,14 @@ end
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, 1.5,
             nothing, _none_evidence(), :y_resp)],
         PredictorSpec[PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term),
+            TermSpec[TermSpec(FactorTerm, [:g], (parameter=:c, sign=1), :g, :g_term),
                 TermSpec(OffsetTerm, [:o], NamedTuple(), :o, :o_off)],
             :mu)],
-        PopulationPrior[PopulationPrior(:mu, :g, 0.0, 2.0)],
+        PopulationPrior[],
         SampledParameter[], AssignmentSpec[], VectorAssignmentSpec[],
-        LevelMap[LevelMap(:mu, :g, [], :levels, Colon())])
+        LevelMap[LevelMap(:mu, :g, [], :levels, Colon())];
+        arrays = [ArrayParameter(:c, :normal, (arg1=0, arg2=2),
+            Any[:(levels(g))], nothing)])
     @test _plans_equal(got, want)
     # Weighted response (object-first HOF, Distributions.jl argument order).
     got = lower_rkppl(quote
@@ -1766,11 +1776,11 @@ end
     built = build_kernel(bound)
     u = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u)
-    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    mu = nt.a .+ nt.b .* cols[:x]
     si = nt.s
     base = sum(logpdf.(Normal.(mu, si), cols[:y]))
     corr = sum(log.(cdf.(Normal.(mu, si), 4.0)))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 2), nt.b) +
         logpdf(Exponential(1), si)
     @test _query(built.spec, bound, :posterior, u) ≈ base - corr + pr + u[3]
     _check_gradient(built.spec, bound, u)
@@ -1797,7 +1807,7 @@ end
     @test only(got.parameters).name === :a
     @test only(got.array_parameters).name === :c
     # Intercept + full cover: the identifiability gate.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    @test_throws ContractValidationError lower_rkppl(quote
         a ~ Normal(0, 1)
         c[levels(g)] .~ Normal.(0, 2)
         mu = a .+ c[g]
@@ -1850,10 +1860,12 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(c[levels(g)]), :(Normal(0, 2))),
         :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
-    # Non-literal broadcast args are not per-level priors.
-    @test_throws ContractValidationError lower_rkppl(Expr(:block,
+    # An unresolved argument is validated when preparation binds data.
+    pending = lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(m, 2))),
         :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    @test_throws ContractValidationError bind_data(pending,
+        Dict(:y => [1.0, 2.0], :g => [1, 2]))
     # Levels prior on a non-factor coefficient.
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(a[levels(g)]), :(Normal.(0, 1))),
@@ -1988,14 +2000,15 @@ end
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s,
             nothing, _none_evidence(), :y_resp)],
         PredictorSpec[PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+            TermSpec[TermSpec(InterceptTerm, ColumnRef[], (parameter=:a, sign=1),
                     :Intercept, :intercept),
-                TermSpec(ContinuousTerm, [:z], NamedTuple(), :z, :z_term),
+                TermSpec(ContinuousTerm, [:z], (parameter=:b, sign=1), :z, :z_term),
                 TermSpec(OffsetTerm, [:lx], NamedTuple(), :lx, :lx_off)],
             :mu)],
-        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :z, 0.0, 2.0)],
-        SampledParameter[SampledParameter(:s, :exponential, (arg1 = 1,),
+        PopulationPrior[],
+        SampledParameter[SampledParameter(:a, :normal, (arg1=0, arg2=1), nothing, :a),
+            SampledParameter(:b, :normal, (arg1=0, arg2=2), nothing, :b),
+            SampledParameter(:s, :exponential, (arg1 = 1,),
             nothing, :s)],
         AssignmentSpec[],
         VectorAssignmentSpec[VectorAssignmentSpec(:lx, :(log.(e)), :lx),
@@ -2124,16 +2137,16 @@ end
     @test repr(got.derived[1].expr) ==
         repr(Expr(:call, :.-, :(log.(x))))
     @test got.predictors[1].terms[2].kind === OffsetTerm
-    # Non-coefficient parameters stay addressable inside derived locals.
+    # Affine scalar reads retain their ordinary declarations.
     got = lower_rkppl(quote
         s ~ Exponential(1)
         w = s .+ x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
     end, (:y, :x))
-    @test _terms_equal(got.predictors[1].terms[2],
-        TermSpec(OffsetTerm, [:w], NamedTuple(), :w, :w_off))
-    @test length(got.derived) == 1 && got.derived[1].name === :w
+    @test got.predictors[1].terms[2].kind === InterceptTerm
+    @test got.predictors[1].terms[2].options.parameter === :s
+    @test got.predictors[1].terms[3].kind === OffsetTerm
     @test length(got.parameters) == 1 && got.parameters[1].name === :s
 end
 
@@ -2297,20 +2310,21 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, s)
     end, Dn)
-    # Scalar structure that cannot identify: stray Normal names inline to
-    # a second intercept (degenerate), bare scalar parameters and staged
-    # reductions in predictors have no term slot.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # Explicit scalar declarations remain valid through affine reads.
+    admitted = lower_rkppl(quote
         m ~ Normal(0, 1)
         w = m .+ x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
     end, Dn)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    @test only(admitted.parameters).name === :m
+    admitted = lower_rkppl(quote
         s ~ Exponential(1)
         mu = a .+ s .+ x
         y .~ Normal.(mu, 1.0)
     end, Dn)
+    @test only(admitted.parameters).name === :s
+    # A reduction is still outside the admitted scalar-summand grammar.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         m = mean(x)
         mu = a .+ m

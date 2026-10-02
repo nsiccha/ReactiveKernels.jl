@@ -95,18 +95,25 @@ function _affine_coefficient_statements(plan::StructuralPlan, layout::LayoutTabl
             b.width == 0 && continue
             if _parameter_term(t)
                 value = t.options.parameter
-                push!(chunks, t.options.sign == 1 ? value : :(-$value))
+                value = t.options.sign == 1 ? value : :(-$value)
+                # All concatenation inputs are vectors. Mixing a traced
+                # scalar with a vector takes Julia's scalar-fill cat path.
+                push!(chunks, t.kind in (FactorTerm, MatrixTerm) ?
+                    :(Float64.($value)) : :([$value]))
             else
                 coef = block_name(p.name)
-                push!(chunks, Expr(:ref, coef,
+                slice = Expr(:ref, coef,
                     Expr(:call, :(:), legacy_offset + 1,
-                        legacy_offset + b.width)))
+                        legacy_offset + b.width))
+                push!(chunks, :(Float64.($slice)))
                 legacy_offset += b.width
             end
         end
         if length(chunks) == 1 && any(t -> _parameter_term(t) &&
                 t.kind in (FactorTerm, MatrixTerm), p.terms)
-            rhs = only(chunks)
+            t = only(t for t in p.terms if _parameter_term(t))
+            value = t.options.parameter
+            rhs = t.options.sign == 1 ? value : :(-$value)
         else
             rhs = _affine_coordinate_view(p, shape, layout)
             rhs === nothing && (rhs = :(vcat($(chunks...))))
@@ -3368,7 +3375,7 @@ function _parameter_prior_input(ps, plan, layout)
         return _affine_block_name(pred)
     end
     view = _parameter_coordinate_view([(n, 1) for n in names], layout)
-    return view === nothing ? :(vcat($(names...))) : view
+    return view === nothing ? :([$(names...)]) : view
 end
 
 function _parameter_prior_statements!(stmts, terms, plan, layout)

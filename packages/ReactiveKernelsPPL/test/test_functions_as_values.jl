@@ -276,7 +276,7 @@ end
         end, cols)
     for u in ([0.3, -0.4], [-1.1, 0.6])
         th = ReactiveKernelsPPL.constrain(built.layout, u)
-        a = only(th.mu)
+        a = th.a
         @test _fv_value(built, bound, :likelihood, u) ≈
             sum(logpdf(Normal(a + tanh(cols[:x][i]), th.sigma), cols[:y][i])
                 for i in eachindex(cols[:y]))
@@ -408,7 +408,7 @@ end
         bound = bind_data(plan, cols2)
         built = build_kernel(bound)
         th = ReactiveKernelsPPL.constrain(built.layout, u)
-        a, b = th.mu
+        a, b = th.a, th.b
         ll = sum(logpdf(Normal(a + b * x[i] / nrm, th.sigma), y[i])
             for i in eachindex(y))
         @test _fv_value(built, bound, :likelihood, u) ≈ ll
@@ -454,7 +454,7 @@ end
     u = [0.3, -0.2, 0.4]
     th = ReactiveKernelsPPL.constrain(built.layout, u)
     sig = log1p(exp(th.s_raw))
-    a, b = th.mu
+    a, b = th.a, th.b
     ll = sum(logpdf(Normal(a + b * cols[:x][i], sig), cols[:y][i])
         for i in eachindex(cols[:y]))
     @test _fv_value(built, bound, :likelihood, u) ≈ ll
@@ -493,7 +493,7 @@ end
     u = [0.4, -0.2]
     th = ReactiveKernelsPPL.constrain(built.layout, u)
     k = var(X[:, 1]) + var(X[:, 2])
-    b = only(th.mu)
+    b = th.b
     ll = sum(logpdf(Normal(b * (2 * cols[:x][i] + 1), th.sigma * k),
         cols[:y][i]) for i in 1:n)
     @test _fv_value(built, bound, :likelihood, u) ≈ ll
@@ -587,7 +587,7 @@ end
     built = build_kernel(bound)
     u = [0.3, -0.4, 0.2]
     th = ReactiveKernelsPPL.constrain(built.layout, u)
-    a, b = th.mu
+    a, b = th.a, th.b
     sd = th.sigma * sum(vx .+ 0.5) / sqrt(sum(abs2, vx))
     @test _fv_value(built, bound, :likelihood, u) ≈
         sum(logpdf(Normal(a + b * cols[:x][i], sd), cols[:y][i]) for i in 1:n)
@@ -818,7 +818,7 @@ end
             @test built.layout.total == K + 2
             u = [0.2 * cos(i) for i in 1:built.layout.total]
             th = constrain(built.layout, u)
-            want = sum(logpdf.(Normal.(only(th.mu) .+
+            want = sum(logpdf.(Normal.(th.a .+
                 2 .* exp.(th.s .* th.z)[cols[:g]], 1.0), cols[:y]))
             @test _fv_value(built, bound, :likelihood, u) ≈ want
             q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
@@ -863,14 +863,14 @@ end
         mu = a .+ B * b .+ w[c]
         y .~ Normal.(mu, 1.0)
     end, cols)
-    @test only(bound.array_parameters).name === :z
+    @test Set(p.name for p in bound.array_parameters) == Set((:z, :b))
     @test any(t -> t.kind === ReactiveKernelsPPL.MatrixTerm,
         only(bound.predictors).terms)
     u = [0.2 * cos(i) for i in 1:built.layout.total]
     th = constrain(built.layout, u)
     # The affine layout packs the intercept followed by the two slopes.
-    want = sum(logpdf.(Normal.(th.mu[1] .+
-        hcat(cols[:x], cols[:x2]) * th.mu[2:3] .+
+    want = sum(logpdf.(Normal.(th.a .+
+        hcat(cols[:x], cols[:x2]) * th.b .+
         2 .* exp.(th.s .* th.z)[cols[:c]], 1.0), cols[:y]))
     @test _fv_value(built, bound, :likelihood, u) ≈ want
 end
@@ -916,7 +916,7 @@ end
             @test built.layout.total == K + 2
             u = [0.2 * cos(i) for i in 1:built.layout.total]
             th = constrain(built.layout, u)
-            mu = only(th.mu) .+ cols[:B] *
+            mu = th.a .+ cols[:B] *
                 (th.sd .* exp.(-0.25 .* cols[:lam].^2) .* th.w)
             want = sum(logpdf.(Normal.(mu, 1.0), cols[:y]))
             @test _fv_value(built, bound, :likelihood, u) ≈ want
@@ -949,7 +949,7 @@ end
     end, cols)
     u = [0.3]
     th = constrain(built.layout, u)
-    want = sum(logpdf.(Normal.(only(th.mu) .+
+    want = sum(logpdf.(Normal.(th.a .+
         exp.(-0.25 .* cols[:lam][cols[:g]].^2), 1.0), cols[:y]))
     @test _fv_value(built, bound, :likelihood, u) ≈ want
 end

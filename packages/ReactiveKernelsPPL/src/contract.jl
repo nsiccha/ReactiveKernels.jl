@@ -497,6 +497,8 @@ end
 # An affine term reads an ordinary parameter; it never owns that
 # parameter's prior, transform, coordinates, or other readers.
 _parameter_term(t::TermSpec) = hasproperty(t.options, :parameter)
+_term_structure_options(t::TermSpec) = _parameter_term(t) ?
+    Base.structdiff(t.options, (parameter=nothing, sign=nothing)) : t.options
 _parameter_terms(p::PredictorSpec) = any(_parameter_term, p.terms)
 _legacy_predictor(p::PredictorSpec) = PredictorSpec(p.name, p.link,
     TermSpec[t for t in p.terms if !_parameter_term(t)], p.label)
@@ -6364,7 +6366,7 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
     if _parameter_term(t)
         _validate_parameter_term(t, plan)
         t = TermSpec(t.kind, t.columns,
-            Base.structdiff(t.options, (parameter = nothing, sign = nothing)),
+            _term_structure_options(t),
             t.addressee, t.label)
     end
     if t.kind === VaryingEffectTerm
@@ -6500,7 +6502,7 @@ end
 # vector-parameter linkage (which reads `options.increments` before
 # `_validate_predictors` runs, so it must establish the shape itself).
 function _monotonic_options(t::TermSpec)
-    o = t.options
+    o = _term_structure_options(t)
     Tuple(keys(o)) == (:increments,) ||
         _fail(t.label, "monotonic term options must be exactly " *
               "`(increments,)`, got $(Tuple(keys(o)))")
