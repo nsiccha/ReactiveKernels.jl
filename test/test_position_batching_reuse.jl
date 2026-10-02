@@ -1,6 +1,15 @@
 using Test
 using ReactiveKernels
 
+function _position_output_bytes(f::F, args...) where {F}
+    f(args...)
+    minimum(@allocated(f(args...)) for _ in 1:5)
+end
+_position_output_buffer(position, data) =
+    Matrix{eltype(data)}(undef, length(data), length(position))
+_position_output_scalar_control(position, data) = map(p -> p .* data, position)
+_position_output_copy(kernel, position, data) = copy(kernel(position, data))
+
 @testset "opt-in borrowed position outputs" begin
     @kernel reusable_positions(position, data) = begin
         result = position .* data
@@ -21,14 +30,52 @@ using ReactiveKernels
     @test batched_ports(borrowed) == (:position,)
     @test scalar_kernel(borrowed) isa PreparedKernel
 
-    call_batch(kernel, position, data) = kernel(position, data)
-    call_batch(owned, position, data)
-    call_batch(borrowed, position, data)
-    owned_bytes = @allocated call_batch(owned, position, data)
-    borrowed_bytes = @allocated call_batch(borrowed, position, data)
-    @test owned_bytes - borrowed_bytes >= sizeof(first_result)
-    println("BATCH_OUTPUT_ALLOC owned=", owned_bytes, " borrowed=", borrowed_bytes,
-            " output_bytes=", sizeof(first_result))
+    # @allocated counts usable heap blocks, not just array payloads. On
+    # Windows the aligned-block count depends on its address; subtracting two
+    # calls' scalar temporaries can undershoot the saved output by a few bytes.
+    # Match both the scalar allocations and the stacked output shape. Allow
+    # one cache line per array on each side, independent of the payload size.
+    accounting_slack = 2 * 64 * (length(position) + 1)
+    measurements = map((512, 4096)) do n
+        sample = collect(1.0:n)
+        saved_position, saved_data = copy(position), copy(sample)
+        retained = owned(position, sample)
+        saved_output = copy(retained)
+        @test borrowed(position, sample) == retained
+        @test owned(position .+ 1, sample) !== retained
+        @test retained == saved_output
+        @test position == saved_position && sample == saved_data
+
+        owned_bytes = _position_output_bytes(owned, position, sample)
+        borrowed_bytes = _position_output_bytes(borrowed, position, sample)
+        scalar_bytes = _position_output_bytes(_position_output_scalar_control,
+                                              position, sample)
+        buffer_bytes = _position_output_bytes(_position_output_buffer, position, sample)
+        copying_bytes = _position_output_bytes(_position_output_copy,
+                                               borrowed, position, sample)
+        payload = sizeof(retained)
+        @test buffer_bytes >= payload
+        @test owned_bytes - borrowed_bytes >= buffer_bytes - accounting_slack
+        @test borrowed_bytes <= scalar_bytes + accounting_slack
+        # Negative control: an otherwise identical reader copying its final
+        # output must fail both allocation bounds, even at the smaller size.
+        @test owned_bytes - copying_bytes < buffer_bytes - accounting_slack
+        @test copying_bytes > scalar_bytes + accounting_slack
+        println("BATCH_OUTPUT_ALLOC n=", n, " owned=", owned_bytes,
+                " borrowed=", borrowed_bytes, " scalar=", scalar_bytes,
+                " buffer=", buffer_bytes, " copying=", copying_bytes,
+                " output_bytes=", payload, " accounting_slack=", accounting_slack)
+        (; owned_bytes, borrowed_bytes, scalar_bytes, buffer_bytes, copying_bytes)
+    end
+    small, large = measurements
+    scalar_growth = large.scalar_bytes - small.scalar_bytes
+    buffer_growth = large.buffer_bytes - small.buffer_bytes
+    owned_growth = large.owned_bytes - small.owned_bytes
+    borrowed_growth = large.borrowed_bytes - small.borrowed_bytes
+    copying_growth = large.copying_bytes - small.copying_bytes
+    @test abs(borrowed_growth - scalar_growth) <= 2 * accounting_slack
+    @test abs(owned_growth - scalar_growth - buffer_growth) <= 2 * accounting_slack
+    @test abs(copying_growth - scalar_growth) > 2 * accounting_slack
 
     changed_shape = borrowed(position[1:1], data[1:3])
     @test size(changed_shape) == (3, 1)
