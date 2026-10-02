@@ -667,7 +667,7 @@ end
             s_eff = sigma * exp(first(sc))
             y .~ Normal.(m0 .+ x, s_eff)
         end, (:y, :x, :gx); mod = _FV)
-    @test any(d -> d.name === :sc, kept.derived)   # stays a named column
+    @test any(a -> a.name === :sc, kept.assignments) # named model-level value
     kbound = bind_data(kept, xcols)
     @test kbound.n_obs == 6
     kbuilt = build_kernel(kbound)
