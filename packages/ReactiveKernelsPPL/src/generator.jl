@@ -1866,7 +1866,7 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
         :($obj($xaug, $bfull).pointwise($yf))
     return Expr[
         :($yf = $yconv.($y)),
-        :($xaug = hcat(ones($(plan.n_obs)), $X)),
+        :($xaug = hcat(ones($(_response_rows(plan, r))), $X)),
         :($bfull = [$(r.glm_alpha); $(r.glm_beta)]),
         :($pw = $call),
         :($node::Float64 = sum($pw)),

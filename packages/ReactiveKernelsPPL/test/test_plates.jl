@@ -317,24 +317,24 @@ end
         lower_rkppl(shared, (:y1, :y2, :x); conditioned = (:y1, :y2, :x)), Dict{Symbol,AbstractVector}(
             :y1 => [0.1, 0.2, 0.3, 0.4], :y2 => [0.5, 0.6, 0.7],
             :x => [1.0, 2.0, 3.0, 4.0]))
-    # Not built yet (todo `0bv3atq`): a slot sized by one observation axis
-    # beside several axes — here a latent plate. Unexpected Pass once it
-    # is built: then assert its density instead.
+    # A latent plate owns its authored axis beside an unrelated response.
     lat = Expr(:block, :(tau ~ Exponential(1)), :(s ~ Exponential(1)),
         :(m ~ Normal(0, 1)),
         _pl_plate(:(eachindex(y1)), :(theta[i] ~ Normal(0, tau)),
             :(y1[i] ~ Normal(theta[i], s))),
         _pl_plate(:(eachindex(y2)), :(y2[i] ~ Normal(m * x2[i], s))))
     latplan = lower_rkppl(lat, (:y1, :y2, :x2); conditioned = (:y1, :y2, :x2))
-    try
-        bind_data(latplan, Dict{Symbol,AbstractVector}(:y1 => [0.1, 0.2, 0.3],
-            :y2 => [0.4, 0.5], :x2 => [1.0, 2.0]))
-        @test_broken true
-    catch e
-        e isa ContractValidationError && occursin("not built yet", e.message) ||
-            rethrow()
-        @test_broken false
-    end
+    cols = Dict{Symbol,AbstractVector}(:y1 => [0.1, 0.2, 0.3],
+        :y2 => [0.4, 0.5], :x2 => [1.0, 2.0])
+    bound = bind_data(latplan, cols)
+    built = build_kernel(bound)
+    u = collect(range(-0.3, 0.4; length = built.layout.total))
+    nt = constrain(built.layout, u)
+    @test bound.n_obs == 5
+    @test length(nt.theta) == 3
+    @test _pl_q(built, bound, :likelihood, u) ≈
+        sum(logpdf.(Normal.(nt.theta, nt.s), cols[:y1])) +
+        sum(logpdf.(Normal.(nt.m .* cols[:x2], nt.s), cols[:y2]))
 end
 
 @testset "dose-free grouped re-spellings need no schedule" begin

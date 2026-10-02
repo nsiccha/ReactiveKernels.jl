@@ -1463,9 +1463,11 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         Set{Symbol}(d.name for d in derived), _factor_coefs(coefuse, predictors),
         plate_names)
     for m in matrices
-        m.name in ctx.matrices_used || _sfail(
+        used_axis = any(p -> any(d -> _is_axis_dim(d) && d.args[2] === m.name,
+            p.dims), arrays)
+        m.name in ctx.matrices_used || used_axis || _sfail(
             "design matrix `$(m.name)` is never used in a predictor " *
-            "matmul — drop it or add the use (`mu = $(m.name) * b`)")
+            "matmul or array axis — drop it or add the use (`mu = $(m.name) * b`)")
     end
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
@@ -5577,12 +5579,12 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
 end
 
 # The per-cell latent's size follows the plate range: a literal `1:N` rides as
-# a UnitRange (validated to cover 1:n_obs at bind); `eachindex(v)` / `axes(v,
+# a UnitRange (validated against its response axis at bind); `eachindex(v)` / `axes(v,
 # 1)` over a data column ride as the column `v` (one cell per entry, proved
-# at bind); over a definition (an observation-aligned column) ⇒ n_obs.
+# at bind); over a definition ⇒ the definition's own observation axis.
 function _plate_param_range(name::Symbol, rkind, data::Set{Symbol})
     rkind[1] === :coloncall && return _lower_lhs_range(name, rkind[2])
-    return rkind[2] in data ? rkind[2] : nothing
+    return rkind[2]
 end
 
 function _cell_lhs_error(lhs, ivar)
@@ -5911,7 +5913,7 @@ _is_axes2_call(index) =
 # (each axis `1:K`, `levels(g)`, or `axes(M, d)`). One-axis
 # `z[levels(g)]` / `z[axes(X, 2)]` have separate parse arms but the same
 # ordinary array semantics. A `levels(gg)` axis over a definition `gg`
-# (data computed at bind, `gg = vcat(g1, g2)`) uses this arm too.
+# (data computed at bind, `gg = vcat(g1, g2)`) and `axes(X, 1)` use this arm too.
 # Returns `(name, dims)` or `nothing` (not an array).
 function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol},
         detnames::Set{Symbol} = Set{Symbol}())
@@ -5920,8 +5922,10 @@ function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol},
     target isa Symbol && target ∉ data || return nothing
     idx = lhs.args[2:end]
     if length(idx) == 1
+        row_axis = _is_axis_dim(idx[1]) && idx[1].args[1] === :axes &&
+            idx[1].args[3] == 1 && idx[1].args[2] !== target
         _is_literal_range(idx[1]) || _is_def_levels_call(idx[1], data,
-            detnames) || return nothing
+            detnames) || row_axis || return nothing
     elseif length(idx) != 2
         _sfail("array $target takes one or two axes, got $(repr(lhs))")
     end

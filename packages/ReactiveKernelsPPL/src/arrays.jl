@@ -108,7 +108,7 @@ function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d)
     fn, M, k = d.args[1], d.args[2], d.args[3]
     m = _find_matrix(plan, M)
     if m !== nothing
-        return k == 2 ? length(m.columns) : plan.n_obs
+        return k == 2 ? length(m.columns) : _value_rows(plan, M)
     end
     haskey(plan.columns, M) || _fail(label, "array $name axis " *
         "`$fn($M, $k)` needs a bound matrix $M")
@@ -274,7 +274,7 @@ function _array_arg_length(plan::StructuralPlan, a)
     a isa Symbol || return nothing
     _is_array_param(plan, a) &&
         return prod(_array_dims(plan, _array_param(plan, a)))
-    _is_derived(plan, a) && return plan.n_obs
+    _is_derived(plan, a) && return _value_rows(plan, a)
     if haskey(plan.columns, a)
         col = plan.columns[a]
         col isa Real && return nothing
