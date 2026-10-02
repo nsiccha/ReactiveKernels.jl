@@ -1407,6 +1407,22 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     union!(used_locs, kernel_lp_predictors)
     skip = _absorbed_skip(det, canonmap, responses, paramsyms, ctx.absorbed,
         used_locs)
+    # A definition inlined into a location may still be read by the raw
+    # recurrence body. Keep it and its definition dependencies as value nodes.
+    scan_reads = Symbol[]
+    for s in scans, st in (s.setup..., s.step...)
+        for ex in (st.kind === :sample ? st.args : (st.expr,))
+            append!(scan_reads, _value_symbols(ex))
+        end
+    end
+    kept = Set{Symbol}()
+    while !isempty(scan_reads)
+        nm = pop!(scan_reads)
+        (nm in kept || !haskey(canonmap, nm)) && continue
+        push!(kept, nm)
+        delete!(skip, nm)
+        append!(scan_reads, _value_symbols(canonmap[nm]))
+    end
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
     # Axes of every declared array an array-cell plate may read.
@@ -9241,6 +9257,7 @@ function _is_scalar_coef_def(s::Symbol, ctx, allow_stated::Bool)
     _derived_reads_latent(s, ctx) && return false
     get(ctx.detshape, s, :scalar) === :scalar || return false
     rhs = ctx.detmap[s]
+    _contains_scan(rhs, ctx.scan_states) && return false
     rhs isa Symbol || return false
     rhs in ctx.data && return false
     rhs in ctx.vecdefs && return false
@@ -10455,22 +10472,13 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
         end
         push!(terms, term)
     end
-    # Zero-coefficient predictors: bare-data affines (a non-empty all-
-    # offset summand list) and beta-free monotonic (`mo1`) predictors are
-    # admitted — both evaluate the likelihood over a coefficient-free LP
-    # (data for offsets, the increment-simplex contrast for `mo1`) with an
-    # empty coefficient layout. Any other coefficient-free shape
-    # (latent/effect/spline/hsgp/scan-only, or an empty summand list)
-    # stays fail-closed: a scan summand needs a sibling coefficient
-    # (SB's `ar` always pairs with an intercept).
-    # A composed sub-predictor may be varying-effect-only (brms
-    # `theta ~ 0 + (1 | person)`): its coefficients live in the draws.
-    # HSGP-summand-only predictors are admitted too (SB `0 + hsgp(x)`,
-    # brm_hsgp): the basis weights are self-priored.
+    # Coefficient-free values and self-priored trajectory/basis terms can
+    # feed a predictor directly; an empty predictor still has no value.
     if isempty(uses) && !(!isempty(terms) &&
             all(t -> t.kind === OffsetTerm ||
                 t.kind === MonotonicSummandTerm ||
                 t.kind === HSGPSummandTerm ||
+                t.kind === ScanSummandTerm ||
                 (composed_sub && t.kind === VaryingEffectTerm), terms))
         _sfail("predictor $pname has no estimated coefficients — add an " *
                "intercept or coefficient (bare-data offset affines and " *
@@ -10597,11 +10605,8 @@ function _classify_summand(pname, core, sign::Int, ctx)
         return _classify_dar(pname, core, sign, ctx)
     end
     if _contains_scan(core, ctx.scan_states)
-        _is_scan_product(core) ||
-            _sfail("predictor $pname: scan states lower only as direct " *
-                  "scaled summands (`mu = a .+ b .* u`), not nested in " *
-                  "$(repr(core))")
-        return _classify_scan(pname, core, sign, ctx)
+        return _is_scan_product(core) ? _classify_scan(pname, core, sign, ctx) :
+            _extract_summand(pname, core, sign, ctx)
     end
     if _contains_mo1(core)
         _is_mo1_call(core) ||
@@ -10816,46 +10821,24 @@ _is_scan_product(core) =
 # (checked disjoint from predictor coefficients after lowering) and lowers
 # to a `SampledParameter`, never a population prior.
 function _classify_scan(pname, core::Expr, sign::Int, ctx)
-    where = "predictor $pname"
     factors = core.args[2:end]
-    length(factors) == 2 ||
-        _sfail("$where scales a scan state with $(length(factors)) " *
-              "factors — write `coef .* state` exactly, got $(repr(core))")
+    length(factors) == 2 || return _extract_summand(pname, core, sign, ctx)
     stripped = [_strip_sign(f) for f in factors]
     inner = sign * prod(first, stripped)
-    inner > 0 ||
-        _sfail("$where negates a scan summand — summands are additive " *
-              "only (write `.+ b .* u`)")
     states = [g for (_, g) in stripped if g isa Symbol && g in ctx.scan_states]
-    if isempty(states)
-        _sfail("$where nests a scan read inside $(repr(core)) — scan " *
-              "states lower only as direct scaled summands " *
-              "(`mu = a .+ b .* u`)")
-    end
-    length(states) == 1 ||
-        _sfail("$where combines two scan states in $(repr(core)) — " *
-              "products of latents are nonlinear (one `coef .* state` " *
-              "summand per scan read)")
     others = [g for (_, g) in stripped if !(g isa Symbol && g in ctx.scan_states)]
+    (inner > 0 && length(states) == 1 && length(others) == 1) ||
+        return _extract_summand(pname, core, sign, ctx)
     coef = only(others)
-    coef isa Symbol ||
-        _sfail("$where scales scan state :$(only(states)) by " *
-              "$(repr(coef)) — scan coefficients are bare sampled " *
-              "scalars (`b .* u`)")
-    coef in ctx.data &&
-        _sfail("$where scales scan state :$(only(states)) by the data " *
-              "column $coef — data-varying (interaction) scalings are planned")
-    (coef in ctx.vecdefs || coef in ctx.plate_names) &&
-        _sfail("$where scales scan state :$(only(states)) by $coef, " *
-              "which is vector-valued — scan coefficients are scalars")
-    haskey(ctx.detmap, coef) &&
-        _sfail("$where scales scan state :$(only(states)) by the " *
-              "computed scalar $coef — computed coefficients are not " *
-              "in slice 1")
-    coef in ctx.prior_names ||
-        _sfail("$where scales scan state :$(only(states)) by $coef, " *
-              "which has no `~` statement — scan coefficients are " *
-              "sampled scalars (`$coef ~ Normal(0, 1)`)")
+    if coef isa Symbol && coef ∉ ctx.prior_names && coef ∉ ctx.data &&
+            !haskey(ctx.detmap, coef) && coef ∉ ctx.scan_states &&
+            coef ∉ ctx.plate_names
+        _sfail("predictor $pname reads undeclared coefficient $coef")
+    end
+    # Preserve the compact direct-splice IR for a sampled scalar. Other
+    # arithmetic over a trajectory is an ordinary derived vector value.
+    (coef isa Symbol && coef in ctx.prior_names && coef ∉ ctx.sized_decls) ||
+        return _extract_summand(pname, core, sign, ctx)
     push!(ctx.scan_coefs, coef)
     label = Symbol("scan_", pname, "_", only(states))
     return TermSpec(ScanSummandTerm, ColumnRef[],
@@ -11058,9 +11041,8 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
         "by a coefficient (`b .* $core`, the SB `me` mirror)")
     if core in ctx.scan_states
         # A bare scan state is a beta-free summand: the state spliced
-        # unscaled (`mu = a .+ x`, the dar/`mo1` shape). Additive only.
-        sign > 0 || _sfail("predictor $pname negates the scan state " *
-            "$core — scan summands are additive only (write `.+ $core`)")
+        # unscaled (`mu = a .+ x`, the dar/`mo1` shape). Negation is a value.
+        sign > 0 || return _extract_summand(pname, Expr(:call, :.-, core), 1, ctx)
         label = Symbol("scan_", pname, "_", core)
         return TermSpec(ScanSummandTerm, ColumnRef[],
             (scan_id = core, coef = nothing), label, label), nothing

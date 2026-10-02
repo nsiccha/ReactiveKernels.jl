@@ -64,3 +64,61 @@ end
         _scan_cap_check(f, oracle)
     end
 end
+
+function _scan_cap_values(n, form; response = :normal)
+    expression = Dict(
+        :bare => :(h), :literal => :(2.0 .* h), :data => :(x .* h),
+        :computed => :(c .* h), :coefficient => :(b .* h),
+        :negative => :(-b .* h), :nested => :(b .* (h .+ x)),
+        :product => :(h .* h), :alias => :(v))
+    likelihood = response === :normal ? :(y .~ Normal.(mu, 1.0)) :
+        :(y .~ Poisson.(exp.(mu)))
+    program = quote
+        b ~ Cauchy(0, 1)
+        phi ~ Normal(0, 1)
+        c = b * b
+        @scan begin
+            h[1] ~ Normal(0, 1)
+            for t in 2:T
+                e ~ Normal(0, 1)
+                h[t] = phi * h[t - 1] + e
+            end
+        end
+        v = 2.0 .* h
+        mu = $(expression[form])
+        $likelihood
+    end
+    y = response === :normal ? [0.3sin(t) for t in 1:n] : [t % 3 for t in 1:n]
+    x = [0.2cos(t) for t in 1:n]
+    f = _scan_cap_sampler(program, Dict{Symbol,Any}(:x => x, :y => y))
+    parameter(u, name) = u[only(e for e in f.built.layout.entries
+        if e.name === name).offset]
+    zentry = only(e for e in f.built.layout.entries if e.kind === :scan)
+    function oracle(u)
+        b, phi = parameter(u, :b), parameter(u, :phi)
+        z = u[zentry.offset:(zentry.offset + zentry.size - 1)]
+        h = z[1]
+        lp = logpdf(Cauchy(), b) + logpdf(Normal(), phi) + sum(logpdf.(Normal(), z))
+        for t in eachindex(y)
+            t == 1 || (h = phi * h + z[t])
+            mu = form === :literal || form === :alias ? 2h :
+                form === :data ? x[t] * h : form === :computed ? b^2 * h :
+                form === :coefficient ? b * h : form === :negative ? -b * h :
+                form === :nested ? b * (h + x[t]) : form === :product ? h^2 : h
+            dist = response === :normal ? Normal(mu, 1) : Poisson(exp(mu))
+            lp += logpdf(dist, y[t])
+        end
+        return lp
+    end
+    return f, oracle
+end
+
+@testset "scan capabilities: ordinary trajectory values" begin
+    for form in (:bare, :literal, :data, :computed, :coefficient, :negative,
+            :nested, :product, :alias), n in (1, 4)
+        f, oracle = _scan_cap_values(n, form)
+        _scan_cap_check(f, oracle)
+    end
+    f, oracle = _scan_cap_values(4, :bare; response = :poisson)
+    _scan_cap_check(f, oracle)
+end

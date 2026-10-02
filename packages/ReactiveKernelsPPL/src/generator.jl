@@ -784,8 +784,8 @@ function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSp
         "[generator] scan summand in predictor $(pred.name) addresses " *
         "unknown scan :$(o.scan_id)"))
     o.coef === nothing && return o.scan_id
-    any(p -> p.name === o.coef, plan.parameters) || throw(ContractValidationError(
-        "[generator] scan summand coef :$(o.coef) is not a sampled parameter"))
+    o.coef in _union_names(plan) || throw(ContractValidationError(
+        "[generator] scan summand coef :$(o.coef) is not a scalar name"))
     return Expr(:call, :.*, o.scan_id, o.coef)
 end
 
@@ -2155,7 +2155,7 @@ function _bernoulli_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::S
         pv = _thread_ref!(inputs, r.predictor)
         cell = :(bernoulli($pv).logpdf($yref))
     else
-        lp = _lp_name(_predictor(plan, r.predictor))
+        lp = _location_node(r, plan)
         push!(inputs, lp)
         etav = _dovar(2)
         cell = :(bernoulli(; logit = $etav).logpdf($yref))
@@ -2184,7 +2184,7 @@ _yfloat_name(label::Symbol) = Symbol(:_ppl_yf_, label)
 # and `sum(f, x)` treatment as the Poisson form. Gradient stays ordinary AD.
 function _bernoulli_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     yf = _yfloat_name(r.label)
     return Expr[
         :($yf = Float64.($y)),
@@ -2194,7 +2194,7 @@ end
 
 function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     ycol = plan.columns[y]
     cterm = sum(SpecialFunctions.loggamma(Float64(v) + 1.0) for v in ycol)
     yf = _yfloat_name(r.label)
@@ -2213,7 +2213,7 @@ function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
         ratev = _thread_ref!(inputs, r.predictor)
         cell = :(poisson($ratev).logpdf($yv))
     else
-        lp = _lp_name(_predictor(plan, r.predictor))
+        lp = _location_node(r, plan)
         push!(inputs, lp)
         etav = _dovar(2)
         lb, ub = _thread_bounds!(inputs, r.evidence, true)
@@ -2237,7 +2237,7 @@ end
 # plate iterates it per cell.
 function _zip_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     ziarg = _scale_use_plate_arg(r, plan, pre, r.zi, r.label)
     inputs = Any[y, lp]
@@ -2321,7 +2321,7 @@ end
 # slice.
 function _hurdle_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, lp]
@@ -2357,7 +2357,7 @@ end
 # perf-lane follow-up, not this slice.
 function _ig_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     mu = _mu_name(r.label)
     pre = Expr[:($mu = exp.($lp))]
     sarg = _scale_plate_arg(r, plan, pre)
@@ -2389,7 +2389,7 @@ end
 # No whole-vector fusion yet — a perf-lane follow-up, not this slice.
 function _exponential_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     mu = _mu_name(r.label)
     pre = Expr[:($mu = exp.($lp))]
     inputs = Any[y, mu]
@@ -2422,7 +2422,7 @@ end
 # a perf-lane follow-up, not this slice.
 function _vonmises_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, lp]
@@ -2459,7 +2459,7 @@ function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
         pv = _thread_ref!(inputs, r.predictor)
         cell = :(binomial($nref, $pv).logpdf($yv))
     else
-        lp = _lp_name(_predictor(plan, r.predictor))
+        lp = _location_node(r, plan)
         push!(inputs, lp)
         etav = _dovar(2)
         nref = _thread_ref!(inputs, r.trials, true)
@@ -2519,7 +2519,7 @@ _rate_name(label::Symbol) = Symbol(:_ppl_rate_, label)
 
 function _nb2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     mu = _mu_name(r.label)
     pre = Expr[:($mu = exp.($lp))]
     sarg = _scale_plate_arg(r, plan, pre)
@@ -2546,7 +2546,7 @@ _nb1_r_name(label::Symbol) = Symbol(:_ppl_r_, label)
 
 function _nb1_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     rr = _nb1_r_name(r.label)
     pre = Expr[:($rr = exp.($lp))]
     sarg = _scale_plate_arg(r, plan, pre)
@@ -2570,7 +2570,7 @@ end
 # follow-up, not this slice.
 function _weibull_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, lp]
@@ -2588,7 +2588,7 @@ end
 
 function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
     # Surface is Distributions-SCALE `Gamma(alpha, mu/alpha)`; the kernel
@@ -2671,7 +2671,7 @@ _shape_b_name(label::Symbol) = Symbol(:_ppl_b_, label)
 # activity on the const kernel object). Positional-p cell (primary form).
 function _bernoulli_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     p = _prob_name(r.label)
     pre = Expr[:($p = 0.5 .* erfc.(-$lp ./ sqrt(2)))]
     yv, pv = _dovar(1), _dovar(2)
@@ -2688,7 +2688,7 @@ end
 # Bernoulli cloglog: pure-arithmetic p precompute, positional-p cell.
 function _bernoulli_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     p = _prob_name(r.label)
     pre = Expr[:($p = 1 .- exp.(-exp.($lp)))]
     yv, pv = _dovar(1), _dovar(2)
@@ -2707,7 +2707,7 @@ end
 # the (:n, :logit) route is what slice-1 Binomial emits.
 function _binomial_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     p = _prob_name(r.label)
     logitp = _logitp_name(r.label)
     inputs = Any[y, logitp]
@@ -2725,7 +2725,7 @@ end
 
 function _binomial_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     p = _prob_name(r.label)
     logitp = _logitp_name(r.label)
     inputs = Any[y, logitp]
@@ -2749,7 +2749,7 @@ end
 # form).
 function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     mu = _mu_name(r.label)
     a = _shape_a_name(r.label)
     b = _shape_b_name(r.label)
@@ -2782,7 +2782,7 @@ end
 # (`_ppl_sc_`, the NB2 precedent) and broadcasts through `a`/`b`.
 function _betabinomial2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
     k = sarg isa Symbol ? sarg : Float64(sarg)
@@ -2920,7 +2920,7 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     structure = r.family === OrderedLogisticFam ? :cumulative : r.ordinal_structure
     structure === :cumulative ||
         return _ordinal_stopping_stmts(r, plan, node, pw, K)
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     inputs = Any[r.response, lp]
     yv, etav = _dovar(1), _dovar(2)
     prests = Expr[]
@@ -2979,7 +2979,7 @@ function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     if K == 1
         return _plate_sum_stmts(pw, node, Any[y], :(0.0 * $(_dovar(1))))
     end
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     obs, stage = _stage_lane(r.label, :obs), _stage_lane(r.label, :stage)
     prests = Expr[:($obs = _ordinal_stage_obs($y, $K)),
         :($stage = _ordinal_stage_idx($y, $K))]
@@ -4270,6 +4270,7 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
         push!(terms, lp)
     end
     for (j, st) in enumerate(innov)
+        T < s.lo && continue
         caps = Symbol[]
         for a in st.args
             _scan_cell_caps!(caps, a)

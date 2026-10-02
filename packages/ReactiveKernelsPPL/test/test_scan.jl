@@ -435,7 +435,7 @@ end
         PredictorSpec[], PopulationPrior[], SampledParameter[], AssignmentSpec[],
         Dict{Symbol,AbstractVector}(:y => zeros(3)), 3; scans = [ar1])
     # capability: non-Gaussian response over a scan state (slice 1; hand-built plan) (todo `0yc2qgp`)
-    @test_broken (validate_structure(bad); true)
+    @test validate_structure(bad) === nothing
 end
 
 # A non-centered AR(1) scan (SB-`ar` shape): `Normal(0, 1)` seed, one
@@ -466,7 +466,8 @@ function _scan_ar_plan(scan; coef = :beta_ar, coef_family = :normal,
         [SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma),
             SampledParameter(:phi, :normal, (arg1 = 0.0, arg2 = 1.0), nothing,
                 :phi),
-            SampledParameter(coef, coef_family, (arg1 = 0.0, arg2 = 2.0),
+            SampledParameter(coef, coef_family,
+                coef_family === :exponential ? (arg1 = 2.0,) : (arg1 = 0.0, arg2 = 2.0),
                 nothing, coef)],
         AssignmentSpec[],
         Dict{Symbol,AbstractVector}(:y => zeros(3)),
@@ -514,8 +515,8 @@ end
     end
     # non-Normal coefficient (v1 admits SB's Normal `ar` beta only)
     # capability: non-Normal scan-summand coefficient prior (v1 admits Normal only) (todo `0yc2qgp`)
-    @test_broken (validate_structure(
-        _scan_ar_plan(scan; coef_family = :exponential)); true)
+    @test validate_structure(
+        _scan_ar_plan(scan; coef_family = :exponential)) === nothing
     # a computed scalar is not a sampled coefficient
     p0 = _scan_ar_plan(scan)
     params = filter(p -> p.name !== :beta_ar, p0.parameters)
@@ -523,7 +524,7 @@ end
         params, [AssignmentSpec(:beta_ar, :(phi * phi), :beta_ar)],
         p0.columns, p0.n_obs; scans = p0.scans)
     # capability: computed (assignment) scan-summand coefficient (P8 admits computed coefficients) (todo `0yc2qgp`)
-    @test_broken (validate_structure(p); true)
+    @test validate_structure(p) === nothing
     # summands carry no columns and are self-addressed
     # refused: scan summand carrying columns (IR contract)
     @test_throws ContractValidationError validate_structure(
@@ -624,19 +625,15 @@ end
     # refused: q has no declaration (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(mu = a .+ q .* u)),
         (:x, :y); conditioned = (:x, :y))
-    # Valid Julia the emitter does not build yet (a scan state is spliced
-    # bare or scaled by one sampled scalar, additively): pinned as gaps so
-    # building one fails this file instead of a silent refusal surviving.
-    # capability: scan-state arithmetic composes as ordinary values (P8 1cmodra; todo `0yc2qgp`).
-    gap(loc, needle) = _scan_gap(needle) do
-        lower_rkppl(prog(loc), (:x, :y); conditioned = (:x, :y))
+    # Trajectory arithmetic composes as ordinary vector values. Independent
+    # density and gradient oracles live in test_scan_capabilities.jl.
+    for loc in (:(mu = a .+ 2.0 .* u), :(mu = a .+ x .* u),
+            :(mu = a .+ phi .* u), :(mu = a .- beta_ar .* u),
+            :(mu = a .+ beta_ar .* (u .+ x)), :(mu = beta_ar .* u))
+        p = bind_data(lower_rkppl(prog(loc), (:x, :y);
+            conditioned = (:x, :y)), Dict(:x => ones(3), :y => zeros(3)))
+        @test build_kernel(p).layout.total > 0
     end
-    gap(:(mu = a .+ 2.0 .* u), "scan coefficients are bare sampled scalars")
-    gap(:(mu = a .+ x .* u), "scales scan state")
-    gap(:(mu = a .+ phi .* u), "scan coefficients are bare sampled scalars")
-    gap(:(mu = a .- beta_ar .* u), "additive")
-    gap(:(mu = a .+ beta_ar .* (u .+ x)), "scan states lower only as direct")
-    gap(:(mu = beta_ar .* u), "no estimated coefficients")
     # One name as both a population coefficient and a scan coefficient is
     # one ordinary parameter read by both summands (test_fallback.jl).
     both = lower_rkppl(quote
