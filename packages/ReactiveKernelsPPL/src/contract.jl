@@ -10023,12 +10023,13 @@ end
 # ── Functions as values: bind-time data definitions ───────────────────
 # A definition whose expression calls a module function and reads only
 # data (raw columns or other data-only definitions) is data: `bind_data`
-# evaluates it once, as plain Julia, and binds the value under the
-# definition's name. Every consumer then reads it exactly like a bound
+# evaluates bind-time definitions once, as plain Julia, and binds each value
+# under the definition's name. Every consumer reads it exactly like a bound
 # column — the generated kernel takes it as a data argument (bound by
 # `prepare_query`), never recomputing it. A derived column (observation
 # aligned) must come out a length-n_obs vector and validates as a column;
-# a model-level assignment may be any number, vector or matrix.
+# a model-level assignment may be any number, vector or matrix. Whole-value
+# definitions used only by parameter-dependent calls fold at preparation.
 
 # Plan names an expression reads (call heads, keyword names and function
 # values are not reads).
@@ -10057,11 +10058,14 @@ function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
     return out
 end
 
-"""Names of the bind-materialized data definitions of `plan`, given the raw
+"""Names of the data-only definitions of `plan`, given the raw
 (caller-supplied) column names: assignments and derived columns that call a
 module function and read only raw columns or other data-only definitions.
-Derived responses keep their own materialization."""
-function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol})
+Derived responses keep their own materialization. `bind_only` excludes
+definitions used only during preparation, while preserving their names
+for caller-supplied column collision checks."""
+function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
+        bind_only = false)
     nodes = Dict{Symbol,Any}()
     for a in plan.assignments
         # Literal definitions can be dependencies of a module call, such
@@ -10083,9 +10087,60 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol})
         memo[nm] = ok
         return ok
     end
-    return Set{Symbol}(nm for (nm, ex) in nodes
+    names = Set{Symbol}(nm for (nm, ex) in nodes
         if nm ∉ resps && _contains_module_call(ex) &&
             dataonly(nm, Set{Symbol}()))
+    bind_only || return names
+    onlydata = union(raw, Set{Symbol}(nm for nm in keys(nodes)
+        if dataonly(nm, Set{Symbol}())))
+    return setdiff(names, _preparation_data_names(plan, nodes, raw, onlydata, names))
+end
+
+# Whole-value data definitions consumed by a parameter-dependent module
+# call belong to preparation, whether lowering inlined them or retained
+# them as assignments (notably beside declared arrays). They may return
+# arbitrary Julia values; the generated data-only statements fold once.
+# Keep every dependency needed by bind-time consumers at bind instead.
+function _preparation_data_names(plan, nodes, raw, onlydata, names)
+    isempty(names) && return Set{Symbol}()
+    _, wholedefs = _model_level_inputs(plan, raw)
+    function dependencies!(found, nm; data_only = false)
+        nm in found && return
+        haskey(nodes, nm) || return
+        data_only && nm ∉ onlydata && return
+        push!(found, nm)
+        for dep in _expr_value_symbols(nodes[nm])
+            dependencies!(found, dep; data_only)
+        end
+    end
+    runtime = Set{Symbol}()
+    for (nm, ex) in nodes
+        nm ∈ onlydata && continue
+        _contains_module_call(ex) || continue
+        dependencies!(runtime, nm)
+    end
+    prepared = intersect(names, wholedefs, runtime)
+    isempty(prepared) && return prepared
+
+    # Any other structural slot can require a value during binding (prior
+    # arguments, array dimensions, responses, matrices, ...). Follow its
+    # dependencies as well as those of all remaining bind-time calls, so
+    # a shared helper is never evaluated both at bind and at preparation.
+    free = Set{Symbol}(keys(nodes))
+    for f in fieldnames(StructuralPlan)
+        f in (:assignments, :derived, :columns, :submodel_scopes) && continue
+        _drop_held_names!(free, getfield(plan, f))
+    end
+    # Whole-value classification exempts `axes(M, d)` from observation
+    # alignment, but resolving an array's shape still needs M at bind.
+    for p in plan.array_parameters, d in p.dims
+        _drop_held_names!(free, d)
+    end
+    needed = Set{Symbol}()
+    for nm in union(setdiff(Set{Symbol}(keys(nodes)), free), setdiff(names, prepared))
+        dependencies!(needed, nm; data_only = true)
+    end
+    return setdiff!(prepared, needed)
 end
 
 """In a bound plan: the module data definitions bound as columns."""
@@ -10383,6 +10438,9 @@ function _materialize_module_data!(plan::StructuralPlan,
             "[bind] column $nm is computed by the model (`$nm = ...` calls " *
             "a module function on data) — drop it from bind_data"))
     end
+    names = setdiff(_module_data_names(plan, Set{Symbol}(keys(columns));
+        bind_only = true), already)
+    isempty(names) && return names
     exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
     for d in plan.derived
         exprs[d.name] = d.expr

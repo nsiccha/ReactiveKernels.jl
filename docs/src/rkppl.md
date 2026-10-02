@@ -104,6 +104,13 @@ Reactant limitation also applies to hierarchical Dirichlet priors.
 - Single assignment, no `if`, no `target +=`. Loops are written as
   `@plate` cells or `@scan` recurrences (see [Plates](#Plates)).
 
+A data-only call used only by a parameter-dependent function runs once when
+`prepare_query` or `prepare_sampler` prepares the graph. It may return a tuple or
+named tuple containing arrays. Named definitions, aliases and inline
+calls follow the same rule, including beside declared vector or matrix
+parameters. A value also needed during binding, such as a prior argument or an
+array dimension, keeps its bind-time evaluation and validation.
+
 ## Factor levels
 
 `c[levels(g)] .~ Normal.(0, 2)` declares one coefficient per level of `g`, and
