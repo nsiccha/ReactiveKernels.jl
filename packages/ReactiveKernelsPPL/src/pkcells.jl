@@ -23,16 +23,13 @@
 # Everything else (op codes, token order, read-before-dose, segment
 # compression, recurrence op order) mirrors SB exactly.
 #
-# The recurrence runs as PLAIN JULIA called from generated code (the
-# `gp_chol_latent` native+Enzyme precedent): the generator emits one
-# `linear_pk_read_locs` call per subject over bound op-column slices plus
-# traced LP scalars, then a vectorized `flat[obs_map]` gather
-# (`reactivekernels-use` §7d shape) and the Gaussian plate. All
-# intermediate 3- and 4-dimensional storage is static
-# (`SMatrix`/`SVector`: stack-allocated, immutable): a concrete
-# `Matrix{Float64}`/`Vector{Float64}` rejects traced stores
-# (`convert(Float64, ::TracedRNumber)` has no method — the pkcell
-# slice's measured Reactant failure). The matrix exponential is the
+# Grouped execution exposes an RK subject plate and scalar-output event
+# scans (pk_rectangular.jl). The graph builds the parameter-dependent
+# system, carries compartment amounts and accumulated dose, and gathers
+# each subject's reads before the observation-space gather. Host schedule
+# preprocessing only builds padded event indices and packing positions.
+# Intermediate 3- and 4-dimensional storage uses immutable SMatrix/SVector.
+# The matrix exponential is the
 # StaticArrays built-in `exp` on `SMatrix{3,3}` (Higham-2008 Padé,
 # no LAPACK balancing — faster and at least as accurate as Stan's
 # `matrix_exp_pade` on the PK range, measured 2026-09-25; the former
@@ -51,11 +48,9 @@ const LINEAR_EVENT_DOSE_SEGMENT = 3
 # so under Reactant it arrives as a `TracedRArray` — or a `view` of one — and
 # a plain `log_F[j]` is the scalar read the tracer refuses (`Scalar indexing
 # is disallowed`, measured on Reactant 0.2.285 compiling the joint fixture;
-# `test_reactant_joint.jl` pins the fix).  The cell is opaque Julia called
-# from generated code, so RK's `@kernel` tensorized rewrite cannot reach this
-# read and no Reactant-extension method can intercept `getindex` on a Base
-# `SubArray` without piracy; the read itself routes through RK's
-# tensorized-gather hook instead.  Natively that hook IS `Base.getindex`
+# `test_reactant_joint.jl` pins the fix). Standalone cell calls route reads
+# through RK's tensorized-gather hook; grouped scan bodies use the ordinary
+# @kernel indexing rewrite. Natively that hook IS `Base.getindex`
 # (bit-identical, zero overhead); the RK Reactant extension lowers the
 # concrete-index read on a traced vector/view to a 1-element slice.  The op
 # columns (`op_type`, `op_dt`, `op_amount`, …) are bound data and keep plain
@@ -64,12 +59,9 @@ const _traced_op_read = ReactiveKernels._tensorized_getindex
 
 # --- subject-batched cell runner --------------------------------------------
 #
-# The generator emits ONE statement per grouped cell assignment, whatever
-# the subject count: `<cell>_over_subjects(op_ends, opcols..., args...)`
-# loops over subjects at RUNTIME with `view(col, lo:hi)` slices from the
-# bound `op_ends` (the statement count of the generated program is O(1)
-# in the data; only layout, bound data and loop trip counts scale).  Each
-# extra argument carries its per-subject access mode explicitly:
+# Generated grouped assignments contain an RK plate, not a subject loop
+# hidden behind a runner call. The direct grouped API prepares the same
+# graph once. Each extra argument declares its axis explicitly:
 #
 #   `SubjectSlice(v)`  — `view(v, lo:hi)` over the subject's op range (the
 #                        flat event-frame vectors such as the W2 `log_F`
@@ -80,11 +72,8 @@ const _traced_op_read = ReactiveKernels._tensorized_getindex
 #   anything else      — passed verbatim to every subject (model scalars,
 #                        literals).
 #
-# Natively this is exactly the former per-subject unroll (same slices,
-# same scalars, `reduce(vcat, parts)` == the former `vcat(s1, s2, …)`);
-# the experimental Reactant path in pk_rectangular.jl promotes bound columns
-# to traced constants and combines subject and operation traversal in one
-# fixed-trip loop. It requires an explicit benchmark opt-in below.
+# Padded event indices keep the cell output rectangular; schedule-only
+# packing restores ragged subject order. Each subject starts from zero.
 """
     SubjectSlice(v)
 
@@ -114,43 +103,9 @@ end
     map(a -> _subject_arg(a, rng, s), args)
 @inline _subject_views(cols::Tuple, rng) = map(c -> view(c, rng), cols)
 
-# Experimental until Enzyme/MLIR can reverse the PK recurrence. The benchmark
-# opts in explicitly; compiled callers fail explicitly while it is disabled.
-# Native callers retain ordinary subject and operation iteration.
-const _rectangular_pk_enabled = Ref(false)
-
-function _pk_compiled_cell(cell, ends, opcols, args, marker)
-    _rectangular_pk_enabled[] || throw(ArgumentError(
-        "compiled PK recurrences are disabled: PK reverse compilation " *
-        "currently fails tracing the rectangular path's StaticArrays matrix " *
-        "exponential (see docs/src/scan.md, PK adapter note); " *
-        "data-derived loop unrolling is not a supported fallback"))
-    ReactiveKernels._dynamic_tensorized_marker(opcols) === nothing ||
-        throw(ArgumentError("rectangular PK requires bound operation columns"))
-    _pk_rectangular(cell, ends, opcols, args, marker)
-end
-
-function _cell_over_subjects(cell::F, op_ends::AbstractVector{<:Integer},
-        opcols::Tuple, args::Tuple) where {F}
-    marker = ReactiveKernels._dynamic_tensorized_marker((opcols..., map(_subject_value, args)...))
-    marker === nothing || return _pk_compiled_cell(cell, op_ends, opcols, args, marker)
-    n_sub = length(op_ends)
-    n_sub >= 1 || throw(ArgumentError(
-        "subject-batched cell call needs at least one subject (empty op_ends)"))
-    hi = Int(op_ends[1])
-    rng = 1:hi
-    first = cell(_subject_views(opcols, rng)..., _subject_args(args, rng, 1)...)
-    parts = [first]
-    prev = hi
-    for s in 2:n_sub
-        hi = Int(op_ends[s])
-        rng = (prev + 1):hi
-        push!(parts, cell(_subject_views(opcols, rng)...,
-            _subject_args(args, rng, s)...))
-        prev = hi
-    end
-    return reduce(vcat, parts)
-end
+# All grouped calls share the RK subject plate and retained event recipe.
+_cell_over_subjects(cell, op_ends, opcols::Tuple, args::Tuple) =
+    _pk_subject_call(cell, op_ends, opcols, args)
 
 """
     linear_pk_read_locs_over_subjects(op_ends, op_type, op_dt, op_amount,
@@ -158,15 +113,14 @@ end
     linear_pk_read_locs_auc_over_subjects(op_ends, op_type, op_dt, op_amount,
         op_interval, op_count, op_read_idx, args...)
 
-Run [`linear_pk_read_locs`](@ref) / [`linear_pk_read_locs_auc`](@ref) once
-per subject over the bound op columns and concatenate the per-subject
-results in subject order: subject `s` sees the op range
+Evaluate an RK subject plate of retained event scans over the bound op
+columns and concatenate the per-subject results in subject order:
+subject `s` sees the op range
 `op_ends[s-1]+1:op_ends[s]` (`view`s of the six op columns), and each
 extra argument by its marker — [`SubjectSlice`](@ref) (a `view` over the
 same range), [`SubjectScalar`](@ref) (entry `s`), or verbatim.  This is
-the generated-code spelling of a grouped cell assignment (one statement
-per assignment, independent of the subject count); the result equals
-`vcat` of the per-subject cell calls.
+the direct API for the same graph emitted by grouped model assignments;
+the result equals `vcat` of the per-subject cell calls.
 """
 linear_pk_read_locs_over_subjects(op_ends::AbstractVector{<:Integer},
         op_type, op_dt, op_amount, op_interval, op_count, op_read_idx,
@@ -574,19 +528,20 @@ function linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
         -k21)
 end
 
-"""
+@traceable function linear_pk_propagate_3(A::SMatrix{3,3}, state::SVector{3}, dt)
+    if dt > 0
+        _pk_propagate_positive(A, state, dt)
+    else
+        state
+    end
+end
+@doc """
     linear_pk_propagate_3(A, state, dt) -> SVector{3}
 
 Propagate a three-state linear PK system across one interval (SB
 `linear_pk_propagate`: identity at `dt <= 0`, else `exp(A*dt)*state`
 — the exponential is the StaticArrays built-in).
-"""
-function linear_pk_propagate_3(A::SMatrix{3,3}, state::SVector{3}, dt)
-    if dt > 0
-        return _pk_propagate_positive(A, state, dt)
-    end
-    return state
-end
+""" linear_pk_propagate_3
 
 @inline function _pk_propagate_positive(A, state, dt)
     exp(A * dt) * state
@@ -601,22 +556,25 @@ function linear_pk_add_dose_3(state::SVector{3}, amount)
     return SVector(state[1] + amount, state[2], state[3])
 end
 
-"""
+@traceable function linear_pk_add_regular_doses_3(A::SMatrix{3,3}, state::SVector{3},
+        amount, interval, count::Integer)
+    after_first = linear_pk_add_dose_3(state, amount)
+    if count > 1
+        Q = _pk_smat_pow4(_pk_dose_affine(A, amount, interval), count - 1)
+        q = Q * SVector(after_first[1], after_first[2], after_first[3], 1.0)
+        SVector(q[1], q[2], q[3])
+    else
+        after_first
+    end
+end
+@doc """
     linear_pk_add_regular_doses_3(A, state, amount, interval, count) -> SVector{3}
 
 `count` equal oral doses at a fixed interval, beginning now (SB
 `linear_pk_add_regular_doses`: immediate first jump, then the augmented
 affine transition `[P b; 0 1]^(count-1)` with `P = exp(A*interval)`
 and `b = [amount, 0, 0]`).
-"""
-function linear_pk_add_regular_doses_3(A::SMatrix{3,3}, state::SVector{3},
-        amount, interval, count::Integer)
-    after_first = linear_pk_add_dose_3(state, amount)
-    count > 1 || return after_first
-    Q = _pk_smat_pow4(_pk_dose_affine(A, amount, interval), count - 1)
-    q = Q * SVector(after_first[1], after_first[2], after_first[3], 1.0)
-    return SVector(q[1], q[2], q[3])
-end
+""" linear_pk_add_regular_doses_3
 
 # The dose-interval affine map from exp(A*interval): propagate, then add a dose.
 @inline function _pk_dose_affine(A, amount, interval)
@@ -627,7 +585,7 @@ end
 
 # Binary exponentiation for the 4x4 augmented dose transition (Stan's
 # `matrix_power` with a data-only integer exponent — same math).
-function _pk_smat_pow4(B::SMatrix{4,4}, n::Integer)
+@traceable function _pk_smat_pow4(B::SMatrix{4,4}, n::Integer)
     R = SMatrix{4,4}(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
     e = Int(n)
@@ -748,8 +706,8 @@ function linear_pk_read_locs(op_type::AbstractVector,
     cols = (op_type, op_dt, op_amount, op_interval, op_count, op_read_idx)
     args = (SubjectSlice(log_F), log_Vc, log_k10, log_k12, log_k21, log_ka)
     marker = ReactiveKernels._dynamic_tensorized_marker((cols..., map(_subject_value, args)...))
-    marker === nothing || return _pk_compiled_cell(linear_pk_read_locs,
-        [length(op_type)], cols, args, marker)
+    marker === nothing || return _pk_subject_call(linear_pk_read_locs,
+        [length(op_type)], cols, args)
     n_ops = length(op_type)
     (length(op_dt) == n_ops && length(op_amount) == n_ops &&
      length(op_interval) == n_ops && length(op_count) == n_ops &&
@@ -823,8 +781,8 @@ function linear_pk_read_locs_auc(op_type::AbstractVector,
     cols = (op_type, op_dt, op_amount, op_interval, op_count, op_read_idx)
     args = (SubjectSlice(log_F), log_Vc, log_k10, log_k12, log_k21, log_ka)
     marker = ReactiveKernels._dynamic_tensorized_marker((cols..., map(_subject_value, args)...))
-    marker === nothing || return _pk_compiled_cell(linear_pk_read_locs_auc,
-        [length(op_type)], cols, args, marker)
+    marker === nothing || return _pk_subject_call(linear_pk_read_locs_auc,
+        [length(op_type)], cols, args)
     n_ops = length(op_type)
     (length(op_dt) == n_ops && length(op_amount) == n_ops &&
      length(op_interval) == n_ops && length(op_count) == n_ops &&

@@ -264,6 +264,7 @@ import .._ordinal_stage_obs, .._ordinal_stage_idx, .._ordinal_effects_matrix
 import ..linear_pk_read_locs, ..linear_pk_read_locs_auc
 import ..linear_pk_read_locs_over_subjects,
     ..linear_pk_read_locs_auc_over_subjects, ..SubjectScalar, ..SubjectSlice
+import .._pk_subject_plan, .._pk_event_scan, .._pk_event_scan_auc, .._pk_pack_subjects
 # Multivariate slice priors (`mv_slices.jl`): orientations, per-slice
 # arguments, simplex / ordered slice transforms and the slice densities.
 import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
@@ -1398,46 +1399,41 @@ function _rewrite_grouped_gather(ex, sched::PKScheduleSpec,
             for a in ex.args)...)
 end
 
-# The subject-batched cell statement: `<fn>_over_subjects(<sched>_op_ends,
-# <sched>_<opfield>..., args...)` (pkcells.jl), each extra arg marked by
-# its per-subject access — LP cell params `SubjectScalar(<lp vector>)`
-# (entry `s`), flat event-frame vectors `SubjectSlice(v)` (the subject's
-# op range), everything else verbatim.  The runner slices the op columns
-# at runtime from the bound `op_ends`, so the statement is the same for
-# one subject or ten thousand.
-_over_subjects_name(fn::Symbol) = Symbol(fn, :_over_subjects)
+# Emit an RK subject plate with retained event scans. LP vectors are
+# subject operands; the positional event vector and model scalars are
+# shared operands. Schedule padding and result packing depend only on data.
 
 function _expand_grouped_cell_call(nm::Symbol, ex::Expr,
         sched::LinearPKScheduleSpec, lps::Dict{Symbol,Symbol}, flatmap)
     fn = ex.args[1]
     callargs = ex.args[2:end]
     opfields = CELL_FN_OP_FIELDS[fn]
-    sliced = get(CELL_FN_SLICED_ARGS, fn, Symbol[])
-    args = Any[_sched_col_name(sched.name, :op_ends)]
-    for field in opfields
-        push!(args, _sched_col_name(sched.name, field))
-    end
-    for a in callargs[2:end]
+    cols = [_sched_col_name(sched.name, field) for field in opfields]
+    auc = fn === :linear_pk_read_locs_auc
+    event = auc || length(callargs) == CELL_FN_ARITY[fn] + 1
+    # The event axis follows the argument position, independent of its name.
+    values = event ? Any[callargs[2:end]...] :
+        Any[:(zeros(length($(first(cols))))), callargs[2:end]...]
+    modes = Symbol[:event]
+    for i in 2:length(values)
+        a = values[i]
         if a isa Symbol && haskey(lps, a)
-            push!(args, :(SubjectScalar($(lps[a]))))
-        elseif a isa Symbol && a in sliced
-            push!(args, :(SubjectSlice($a)))
+            values[i] = lps[a]
+            push!(modes, :subject)
         else
-            push!(args, a)
+            push!(modes, :shared)
         end
     end
-    return Expr[:($nm = $(Expr(:call, _over_subjects_name(fn), args...)))]
+    return _pk_subject_statements(nm, auc,
+        _sched_col_name(sched.name, :op_ends), cols, values, modes)
 end
 
 # Grouped-kernel likelihood: the panel flat map cannot express sequential
-# recurrences, so each cell assignment emits ONE subject-batched call —
-# `linear_pk_read_locs*_over_subjects` over the bound op columns +
-# `op_ends` with per-subject LP vectors (`SubjectScalar`) and flat
-# event-frame vectors (`SubjectSlice`) — whose runtime loop runs the
-# per-subject event recurrence and concatenates the reads flat; schedule-
+# recurrences, so each cell assignment emits a subject plate whose cell
+# graph contains event scans. It packs the subject reads flat; schedule-
 # map gathers move reads to obs space, and each in-cell observation
 # lowers as a Gaussian plate reusing the plate-sum machinery. Cell calls
-# always rewrite to the batched spelling (never emit verbatim — a
+# always rewrite to this graph (never emit verbatim — a
 # verbatim schedule handle has no runtime binding); slice do-params
 # rewrite to their bound columns (kernel ports are column names — the
 # panel flatmap precedent); all other assignments emit verbatim under

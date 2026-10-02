@@ -2238,15 +2238,6 @@ const CELL_FN_OP_FIELDS = Dict{Symbol,Vector{Symbol}}(
     :linear_pk_read_locs_auc => [:op_type, :op_dt, :op_amount, :op_interval,
         :op_count, :op_read_idx])
 
-"""Call args (by NAME) each [`CELL_FNS`](@ref) entry slices per subject
-from a flat op-ordered vector (emitted as `SubjectSlice(name)` — the
-batched runner takes `view(name, lo:hi)` over the subject's op range —
-for computed event-frame vectors like the W2 `log_F` provider output,
-which are generated-code locals, not bind columns)."""
-const CELL_FN_SLICED_ARGS = Dict{Symbol,Vector{Symbol}}(
-    :linear_pk_read_locs => [:log_F],
-    :linear_pk_read_locs_auc => [:log_F])
-
 """Segmented-scan cell calls: per-subject scans over a row series with
 an explicit cumulative-ends vector (no schedule — the nadir runs over
 an obs-axis series, not the op stream). Only the nadir wires into the
@@ -4451,9 +4442,9 @@ function _collect_grouped_cell_refs!(refs, ex, kp::KernelPlate,
                 # vector: the fixed seam name only — structure
                 # verifies the NAME and skips collection (the
                 # provider output is a generated local, not a plan
-                # parameter/assignment, so it is not cell-known —
-                # the skip is load-bearing, not cosmetic). The
-                # per-subject expansion slices the call arg by NAME.
+                # parameter/assignment, so it is not cell-known).
+                # Lowering derives its event axis from this argument
+                # position and passes the value explicitly to each scan.
                 args[2] === EVENT_LP_NAME ||
                     _fail(label, "cell call `$fn` second argument must " *
                           "be the event-LP `$(EVENT_LP_NAME)` (got " *
@@ -9470,7 +9461,7 @@ function _grouped_cell_shape(ex, kp::KernelPlate, shapes::Dict{Symbol,Any},
                     length(ex.args) == CELL_FN_ARITY[fn] + 2) ||
                     fn === :linear_pk_read_locs_auc
                 # The event-LP second arg is the provider's flat
-                # event-axis vector (structure proved the name), not a
+                # event-axis vector (validated above), not a
                 # scalar — the LP scalars start one later.
                 trailing = ex.args[4:end]
             end

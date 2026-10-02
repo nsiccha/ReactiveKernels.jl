@@ -142,7 +142,7 @@ end
 
 function _ad_native_ops(kernel::PreparedKernel)
     ops = kernel.ops
-    any(op -> op isa _AuthoredScanOp, ops) || return ops
+    any(op -> op isa Union{_AuthoredScanOp,_AuthoredPlateOp}, ops) || return ops
     native = kernel.f.native
     _native_generated_function(native) isa
         RuntimeGeneratedFunctions.RuntimeGeneratedFunction || return ops
@@ -159,7 +159,7 @@ function _ad_native_ops(kernel::PreparedKernel)
     # that accesses the table dynamically conservatively retains the whole table.
     ntuple(length(ops)) do index
         op = ops[index]
-        op isa _AuthoredScanOp && !(index in used) ? nothing : op
+        op isa Union{_AuthoredScanOp,_AuthoredPlateOp} && !(index in used) ? nothing : op
     end
 end
 
