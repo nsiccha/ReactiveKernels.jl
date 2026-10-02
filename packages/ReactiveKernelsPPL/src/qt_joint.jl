@@ -188,7 +188,7 @@ end
 `lower_clamping` plate (at or below the bound takes the log-cdf arm,
 above-bound takes the logpdf arm). Prepared, clamped observations keep
 SB's `lower_clamping_normal_lpdf` behavior; raw below-bound observations
-follow the original varying-source Stan model. The log-cdf arm
+follow the reference Stan program. The log-cdf arm
 reuses the landed censored-Gaussian `log(normal(...).cdf(...))` form
 (`_gaussian_cell`; ≤2ulp from SB's `log(erfc) - log(2)` spelling, no new
 formula); the censored boundary differs deliberately from top-level
