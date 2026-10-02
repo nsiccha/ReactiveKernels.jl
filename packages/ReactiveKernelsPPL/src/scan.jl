@@ -446,9 +446,6 @@ function _scan_shape_gap(s::ScanSpec)
         st.family in _SCAN_LATENT_FAMILIES || return "$who: the innovation " *
             "`$(st.target)` must have $real; got :$(st.family)"
     end
-    isempty(innov) && return "$who: a non-centered scan needs a per-step " *
-        "innovation (`eps ~ Normal(0, 1)`); a fully deterministic recurrence " *
-        "is not supported yet"
     return nothing
 end
 

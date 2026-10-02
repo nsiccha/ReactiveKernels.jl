@@ -496,9 +496,9 @@ function assign_layout(plan::StructuralPlan)
     # deterministic recurrence) has no slice.
     for s in plan.scans
         T = _scan_length(plan, s)
-        T >= s.lo || throw(ContractValidationError(
-            "[layout] scan $(join(s.states, ", ")) length $(T) < loop start " *
-            "$(s.lo) — the recurrence must run at least once"))
+        T >= s.lo - 1 || throw(ContractValidationError(
+            "[layout] scan $(join(s.states, ", ")) length $(T) cannot hold " *
+            "the $(s.lo - 1) seed values"))
         if _is_noncentered_scan(s)
             n = _scan_latent_size(s, T)
             n == 0 && continue

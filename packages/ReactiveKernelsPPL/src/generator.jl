@@ -4204,7 +4204,8 @@ function _scan_reconstruction_statements(plan::StructuralPlan,
         innov = _scan_innovations(s)
         T = _scan_length(plan, s)
         zname = _scan_innovation_name(s)
-        any(e -> e.kind === :scan && e.name === zname, layout.entries) ||
+        (_scan_latent_size(s, T) == 0 ||
+            any(e -> e.kind === :scan && e.name === zname, layout.entries)) ||
             throw(ContractValidationError("$(_scan_where(s)): layout has no " *
                 "latent slice :$zname"))
         seedpos, ranges = _scan_latent_positions(s, innov, T)
@@ -4221,8 +4222,15 @@ function _scan_reconstruction_statements(plan::StructuralPlan,
                 _scan_init_name(a, m - k + 1)))
         end
         seqs = Any[:(view($zname, $(first(r)):$(last(r)))) for r in ranges]
+        isempty(seqs) && push!(seqs, :($(s.lo):$T))
         elems = Symbol[Symbol(:_ppl_e, j) for j in eachindex(innov)]
+        isempty(elems) && push!(elems, :_ppl_scan_index)
         for a in s.states
+            if T == m
+                seeds = [_scan_init_name(a, k) for k in 1:m]
+                push!(stmts, :($a = [$(seeds...)]))
+                continue
+            end
             body, refs = _scan_step_block(s, innov, a, scalars)
             lambda = Expr(:->, Expr(:tuple, :_ppl_carry, elems..., refs...),
                 Expr(:block, body...))
@@ -4292,7 +4300,7 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
         push!(terms, node)
     end
     total = Symbol(:_ppl_scan_, head)
-    push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms))))
+    push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms; init = 0.0))))
     push!(nodes, total)
     return nothing
 end

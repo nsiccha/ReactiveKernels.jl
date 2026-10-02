@@ -398,8 +398,8 @@ end
             h[t] ~ Normal(phi * h[t - 1], s)
         end
     end)
-    # capability: zero-step @scan (T equals the seed count) (todo `0yc2qgp`)
-    @test_broken (assign_layout(_scan_min_plan([ar_long]; n = 3)); true)
+    @test only(e for e in assign_layout(_scan_min_plan([ar_long]; n = 3)).entries
+        if e.kind === :scan).size == 3
 end
 
 @testset "scan surface: scan state as a response location (4a)" begin
@@ -741,11 +741,11 @@ end
             h[t] = phi * h[t - 1] + eps * t
         end))
     # a fully deterministic recurrence (no per-step innovation)
-    gap("needs a per-step innovation",
+    @test only(e for e in build_block(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             h[t] = phi * h[t - 1]
-        end))
+        end)).layout.entries if e.kind === :scan).size == 1
     # centered and non-centered carried writes mixed in one scan
     gap("mixing centered and non-centered",
         :(h[1] ~ Normal(0, 1)),
