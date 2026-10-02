@@ -557,7 +557,37 @@ function _lower_rkppl(ast, data_names, scalars::Set{Symbol},
     ast = Expr(:block, _desugar_destructuring(ast.args)...)
     ast, data = _scalar_value_definitions(ast, data, scalars)
     ast, pins, scopes = _expand_submodels(ast, data, mod; with_scopes = true)
+    ast = _indexed_observation_definitions(ast, data)
     return _lower_rkppl_once(ast, data, pins, mod; submodel_scopes = scopes)
+end
+
+# A data-indexed observation is an ordinary gather followed by an
+# observation of its result. Keep the RHS as authored: it explicitly
+# selects every likelihood input that needs selection too.
+function _indexed_observation_definitions(ast::Expr, data::Set{Symbol})
+    taken = union(data, _expr_names(ast))
+    out = Any[]
+    for st in ast.args
+        if st isa Expr && _is_broadcast_sample(st)
+            lhs = st.args[2]
+            if lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
+                    lhs.args[1] in data && lhs.args[2] isa Symbol &&
+                    lhs.args[2] in data
+                k = 1
+                name = Symbol(:_rkppl_observed_, lhs.args[1], :_, k)
+                while name in taken
+                    k += 1
+                    name = Symbol(:_rkppl_observed_, lhs.args[1], :_, k)
+                end
+                push!(taken, name)
+                push!(out, Expr(:(=), name, lhs))
+                push!(out, Expr(:call, st.args[1], name, st.args[3]))
+                continue
+            end
+        end
+        push!(out, st)
+    end
+    return Expr(:block, out...)
 end
 
 # Ordinary parameters may have any number of readers. Legacy
@@ -1039,6 +1069,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
             push!(used_locs, r.nu.predictor)
         r.zi isa ScalePredictorRef &&
             push!(used_locs, r.zi.predictor)
+        r.discrimination isa ScalePredictorRef &&
+            push!(used_locs, r.discrimination.predictor)
         # Mixture component predictors absorb like locations (non-predictor
         # slot names are not definitions — `_absorbed_skip` ignores them).
         if r.family === MixtureFam
@@ -2114,6 +2146,7 @@ function _absorbed_skip(det, canonmap, responses, paramsyms, absorbed,
         for r in responses
             r.scale isa Symbol && push!(refs, r.scale)
             r.nu isa Symbol && push!(refs, r.nu)
+            r.threshold_effects isa Symbol && push!(refs, r.threshold_effects)
             for s in r.mixture_scales
                 s isa Symbol && push!(refs, s)
             end
@@ -7597,15 +7630,15 @@ const _ORDINAL_LINKS = Dict{Symbol,LinkFunction}(
 # `y .~ Ordinal.(Cumulative(), LogitLink(), eta, Ref(c))` over declared
 # thresholds (ordered iff cumulative — see `_explicit_thresholds!`), or the
 # implicit three-positional form + minted thresholds (removed once BRM
-# emits the explicit form). Discrimination and per-threshold design are
-# plan-level only (the BRM emitter's path).
+# emits the explicit form). Optional positional arguments broadcast a
+# discrimination value and a threshold-effect row with ordinary Julia
+# semantics (decision 1m7stoc); broadcast keywords do not vary by row.
 function _lower_ordinal_response(lhs, call, range, weights, evidence,
         label, ctx, predictors, pred_idx, coefuse)
     args = _plain_args(call, "`Ordinal`")
-    3 <= length(args) <= 4 || _sfail("response $lhs: `Ordinal` takes " *
-        "`y .~ Ordinal.(Cumulative(), LogitLink(), eta, Ref(c))` " *
-        "(structure, link, eta, thresholds — discrimination and " *
-        "per-threshold design are plan-level only)")
+    3 <= length(args) <= 6 || _sfail("response $lhs: `Ordinal` takes " *
+        "(structure, link, eta, Ref(c), discrimination, eachrow(effects)); " *
+        "the last two arguments are optional")
     structure = _ordinal_tag(lhs, args[1], (:Cumulative, :StoppingRatio),
         "structure")
     linktag = _ordinal_tag(lhs, args[2],
@@ -7613,14 +7646,38 @@ function _lower_ordinal_response(lhs, call, range, weights, evidence,
     pname = _lower_location(lhs, args[3], IdentityLink, ctx, predictors,
         pred_idx, coefuse; value = true)
     vfam = structure === :Cumulative ? :ordered_normal : :vector_normal
-    thresh = length(args) == 4 ?
+    thresh = length(args) >= 4 ?
         _explicit_thresholds!(ctx, lhs, args[4], structure === :Cumulative,
             "`Ordinal`") :
         _implicit_vector!(ctx, Symbol(lhs, :_thresholds), vfam, lhs)
     structure_sym = structure === :Cumulative ? :cumulative : :stopping
+    disc = if length(args) < 5
+        nothing
+    elseif args[5] isa Real || args[5] isa Symbol && args[5] in ctx.data
+        args[5]
+    else
+        name = _lower_location(lhs, args[5], IdentityLink, ctx, predictors,
+            pred_idx, coefuse; value = true, synth = Symbol(lhs, :_disc))
+        ScalePredictorRef(name, IdentityLink)
+    end
+    effects = length(args) == 6 ? _ordinal_effects_source(lhs, args[6], ctx) :
+        nothing
     return LikelihoodSpec(OrdinalFam, _ORDINAL_LINKS[linktag], lhs, pname,
         nothing, weights, evidence, label, nothing, range;
-        thresholds = thresh, ordinal_structure = structure_sym)
+        thresholds = thresh, ordinal_structure = structure_sym,
+        discrimination = disc, threshold_effects = effects)
+end
+
+function _ordinal_effects_source(lhs, arg, ctx)
+    arg isa Expr && arg.head === :call && length(arg.args) == 2 &&
+        arg.args[1] === :eachrow && arg.args[2] isa Symbol ||
+        _sfail("response $lhs: threshold effects broadcast as `eachrow(E)`, " *
+            "where `E = X * delta` is an ordinary matrix value")
+    name = arg.args[2]
+    name in ctx.data || haskey(ctx.detmap, name) ||
+        haskey(ctx.array_dims, name) || _sfail("response $lhs: threshold " *
+            "effects $name are undeclared — define the matrix value first")
+    return name
 end
 
 # Shared-simplex multinomial: `c1 .~ Multinomial.(N, s, c2, ..., cK)` —

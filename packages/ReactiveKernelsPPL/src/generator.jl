@@ -217,7 +217,7 @@ import ..positive_bijector, ..unit_bijector
 import .._declared_codes
 # Stopping-ratio stage-lane tables (data-only recipes over the bound
 # response; `preprocessing.jl`).
-import .._ordinal_stage_obs, .._ordinal_stage_idx
+import .._ordinal_stage_obs, .._ordinal_stage_idx, .._ordinal_effects_matrix
 # Grouped-kernel cell vocabulary: the subject-batched runners (one call
 # per cell assignment over the bound op columns + `op_ends`, per-subject
 # args marked `SubjectScalar` / `SubjectSlice`) and the cells they run.
@@ -2863,6 +2863,9 @@ end
 function _ordinal_scale_source!(prests::Vector{Expr}, r::LikelihoodSpec,
         plan::StructuralPlan)
     d = r.discrimination
+    if d isa ScalePredictorRef
+        return _lp_name(_predictor(plan, d.predictor))
+    end
     if d isa Symbol && any(p -> p.name === d, plan.predictors)
         return _disc_pre!(prests, r, plan, d)
     end
@@ -2909,6 +2912,9 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     else
         push!(inputs, :(Ref($(r.thresholds))))
         _ordinal_cumulative_cell(r.link, K, yv, etav, dref, _dovar(length(inputs)))
+    end
+    if r.discrimination isa ScalePredictorRef
+        cell = :(isfinite($dref) && $dref > 0 ? $cell : -Inf)
     end
     if r.weights !== nothing
         cell = _weighted_cell(_thread_ref!(inputs, r.weights), cell)
@@ -2964,7 +2970,15 @@ function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     sv, yv, etav, tv = _dovar(1), _dovar(2), _dovar(3), _dovar(4)
     dref = _ordinal_lane_ref!(inputs, prests,
         _ordinal_scale_source!(prests, r, plan), obs, _stage_lane(r.label, :d))
-    z = if isempty(r.threshold_columns)
+    z = if r.threshold_effects !== nothing
+        matrix = _stage_lane(r.label, :effects_matrix)
+        eff = _stage_lane(r.label, :eff)
+        push!(prests,
+            :($matrix = _ordinal_effects_matrix($(r.threshold_effects), $y, $K)),
+            :($eff = $matrix[$obs .+ ($stage .- 1) .* length($y)]))
+        push!(inputs, eff)
+        :($dref * ($tv - $etav - $(_dovar(length(inputs)))))
+    elseif isempty(r.threshold_columns)
         :($dref * ($tv - $etav))
     else
         eff = _stage_lane(r.label, :eff)
@@ -2976,6 +2990,9 @@ function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         :($dref * ($tv - $etav - $(_dovar(length(inputs)))))
     end
     cell = :($sv < $yv ? $(_ordinal_logCC(r.link, z)) : $(_ordinal_logF(r.link, z)))
+    if r.discrimination isa ScalePredictorRef
+        cell = :(isfinite($dref) && $dref > 0 ? $cell : -Inf)
+    end
     if r.weights !== nothing
         cell = _weighted_cell(_ordinal_lane_ref!(inputs, prests, r.weights,
             obs, _stage_lane(r.label, :w)), cell)

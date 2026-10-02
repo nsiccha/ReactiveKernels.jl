@@ -519,6 +519,12 @@ end
 # stage count is data, so the stages flatten into one lane per
 # (observation, stage) pair, built from the bound response: the lane's
 # observation index and stage index. Data-only (folded under `bound=`).
+@inline function _ordinal_effects_matrix(effects, y, K)
+    ndims(effects) == 2 && size(effects) == (length(y), K - 1) ||
+        throw(DimensionMismatch("ordinal threshold effects require an N × (K-1) matrix"))
+    return effects
+end
+
 function _ordinal_stage_obs(y::AbstractVector{<:Integer}, K::Integer)
     out = Int[]
     for (i, v) in enumerate(y), _ in 1:min(v, K - 1)
