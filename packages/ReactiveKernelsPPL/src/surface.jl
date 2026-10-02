@@ -690,16 +690,30 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # matrix stay coefficient-capable (`c[g]`, `X * b`), independently of
     # their whole-value array shape below. `value_arrays` are never
     # coefficients: a bare `z[g]` summand gathers them.
+    # A one-axis `z[levels(g)]` that a definition reads as a whole value
+    # (`b = sd .* z`) also takes the array role (`array_decls`,
+    # `value_arrays`): a levels coefficient is only ever consumed indexed
+    # by its group (`c[g]`), never whole.
+    whole_reads = Set{Symbol}()
+    for (_, rhs) in det
+        _whole_name_reads!(whole_reads, rhs)
+    end
+    levels_values = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
+        s.dims === nothing && s.levels !== nothing && s.lhs in whole_reads)
     hcat_defs = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
     array_decls = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
-        (s.dims !== nothing ||
+        (s.dims !== nothing || s.lhs in levels_values ||
             (s.broadcast && s.matrix !== nothing && s.matrix ∉ hcat_defs) ||
             (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
     value_arrays = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
-        (s.dims !== nothing ||
+        (s.dims !== nothing || s.lhs in levels_values ||
             (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
+    # A whole-read levels declaration (`levels_values`) is an array, never
+    # a factor coefficient an alias (`th = c[g]`) can stand for.
     factor_decls = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
-        s.broadcast && s.levels !== nothing && s.dims === nothing)
+        s.broadcast && s.levels !== nothing && s.dims === nothing &&
+        s.lhs ∉ levels_values)
+    _check_definition_levels_axes(sample, det, data)
     # Every array-capable declaration (sized `.~`, LKJ, a `Dirichlet`
     # simplex or `Ordered` vector value): an expression that READS one by
     # index (`L[2, 1] .* x`, `tau .* z[g]`, `phi[1] .* x`) is a value, never
@@ -1212,7 +1226,11 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2].args)
     elseif ex.head === :ref
-        _is_gather(ex, data, detmap, env) || return false
+        # A gather from an array value (`z[g, 1]`, `b[g, 1]` with
+        # `b = z * M`) follows its first index, like a one-index gather.
+        array_base = ex.args[1] isa Symbol && length(ex.args) >= 2 &&
+            _shape_of(ex.args[1], data, detmap, memo, active, env) === :array
+        array_base || _is_gather(ex, data, detmap, env) || return false
         return _obs_axis(ex.args[2], data, detmap, memo, active, env)
     end
     return false
@@ -3968,7 +3986,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 continue
             end
             _reject_derived_ref_lhs(st.args[2], detnames)
-            arr = _array_sample_lhs(st.args[2], bc, tilde, data)
+            arr = _array_sample_lhs(st.args[2], bc, tilde, data, detnames)
             if arr !== nothing
                 alhs, adims = arr
                 _claim!(seen, seelines, alhs, line)
@@ -4959,20 +4977,89 @@ _is_axes2_call(index) =
 # (each axis `1:K`, `levels(g)`, or `axes(M, d)`). One-axis
 # `z[levels(g)]` / `z[axes(X, 2)]` keep their coefficient-prior parse:
 # they are arrays exactly when no predictor consumes them as
-# coefficients. Returns `(name, dims)` or `nothing` (not an array).
-function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol})
+# coefficients. A `levels(gg)` axis over a definition `gg` (data computed
+# at bind, `gg = vcat(g1, g2)`) is always an array axis: coefficients
+# group by raw data columns. Returns `(name, dims)` or `nothing` (not an
+# array).
+function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol},
+        detnames::Set{Symbol} = Set{Symbol}())
     lhs isa Expr && lhs.head === :ref || return nothing
     target = lhs.args[1]
     target isa Symbol && target ∉ data || return nothing
     idx = lhs.args[2:end]
     if length(idx) == 1
-        _is_literal_range(idx[1]) || return nothing
+        _is_literal_range(idx[1]) || _is_def_levels_call(idx[1], data,
+            detnames) || return nothing
     elseif length(idx) != 2
         _sfail("array $target takes one or two axes, got $(repr(lhs))")
     end
     bc || _sfail("array `$(repr(lhs))` is declared elementwise — use " *
                  "`.~`, not $tilde (`$(repr(lhs)) .~ Normal.(0, 1)`)")
-    return target, Any[_array_axis(target, a, data) for a in idx]
+    return target, Any[_array_axis(target, a, data, detnames) for a in idx]
+end
+
+# `levels(gg)` over a definition name (not data).
+_is_def_levels_call(a, data::Set{Symbol}, detnames::Set{Symbol}) =
+    _is_levels_call(a) && length(a.args) == 2 && a.args[2] isa Symbol &&
+    a.args[2] ∉ data && a.args[2] in detnames
+
+# A `levels(gg)` axis over a definition needs `gg` to be data that
+# `bind_data` computes: a definition calling a module function on data
+# only (`gg = vcat(g1, g2)`), whose distinct values the axis enumerates.
+# Runs on resolved definitions (module calls are `GlobalRef`s).
+function _check_definition_levels_axes(sample, det, data::Set{Symbol})
+    detmap = Dict{Symbol,Any}(det)
+    for s in sample
+        s.dims === nothing && continue
+        for d in s.dims
+            d isa Expr && d.head === :call && d.args[1] === :levels &&
+                d.args[2] ∉ data || continue
+            gg = d.args[2]
+            _is_bind_data_definition(gg, detmap, data, Set{Symbol}()) ||
+                _sfail("array $(s.lhs) axis `levels($gg)`: $gg must be " *
+                    "data — a raw column, or a definition that calls a " *
+                    "function on data only (`$gg = vcat(g1, g2)`), " *
+                    "computed once at bind")
+        end
+    end
+    return nothing
+end
+
+function _is_bind_data_definition(nm::Symbol, detmap, data::Set{Symbol},
+        active::Set{Symbol})
+    haskey(detmap, nm) && nm ∉ active || return false
+    rhs = detmap[nm]
+    _contains_module_call(rhs) || return false
+    push!(active, nm)
+    ok = all(v -> v in data ||
+            _is_bind_data_definition(v, detmap, data, active),
+        _expr_value_symbols(rhs))
+    delete!(active, nm)
+    return ok
+end
+
+# Names an expression reads as whole values: every Symbol except call
+# heads, dotted function names, keyword names and the base of an index
+# (`z` in `z[g]`, whose indices are still walked).
+function _whole_name_reads!(out::Set{Symbol}, ex)
+    if ex isa Symbol
+        push!(out, ex)
+    elseif ex isa Expr
+        if ex.head === :ref
+            ex.args[1] isa Symbol || _whole_name_reads!(out, ex.args[1])
+            foreach(a -> _whole_name_reads!(out, a), ex.args[2:end])
+        elseif ex.head === :call
+            foreach(a -> _whole_name_reads!(out, a), ex.args[2:end])
+        elseif ex.head === :kw
+            _whole_name_reads!(out, ex.args[2])
+        elseif ex.head === :. && length(ex.args) == 2 &&
+                ex.args[2] isa Expr && ex.args[2].head === :tuple
+            foreach(a -> _whole_name_reads!(out, a), ex.args[2].args)
+        else
+            foreach(a -> _whole_name_reads!(out, a), ex.args)
+        end
+    end
+    return out
 end
 
 _is_literal_range(r) = r isa Expr && r.head === :call && length(r.args) == 3 &&
@@ -5019,7 +5106,8 @@ function _array_slices_lhs(lhs, rhs, bc::Bool, tilde, data::Set{Symbol})
     return target, Any[_array_axis(target, lhs.args[2], data)], :vector
 end
 
-function _array_axis(target::Symbol, a, data::Set{Symbol})
+function _array_axis(target::Symbol, a, data::Set{Symbol},
+        detnames::Set{Symbol} = Set{Symbol}())
     if _is_literal_range(a)
         lo, hi = a.args[2], a.args[3]
         cnt = lo === 1 ? _levels_count(hi) : nothing
@@ -5038,6 +5126,7 @@ function _array_axis(target::Symbol, a, data::Set{Symbol})
             "K ≥ 1, or `1:length(levels(g)) - k`")
         return Int(hi)
     end
+    _is_def_levels_call(a, data, detnames) && return a
     if _is_levels_call(a)
         return Expr(:call, :levels,
             _levels_column(target, a, data, "array $target"))
@@ -5377,7 +5466,8 @@ end
 #   • Every name the body BINDS is renamed `<lhs>_<name>` everywhere in the
 #     body: the LHS of a `~` / `.~` / `=` statement (the base name of an
 #     indexed LHS — `c[levels(g)] .~ …` binds `c`, `b[axes(X, 2)] .~ …` binds
-#     `b`), a `@plate` result, cell or loop variable, a `@scan` carried state,
+#     `b`, a slice declaration `eachrow(B[levels(g), 1:K]) .~ …` binds `B`),
+#     a `@plate` result, cell or loop variable, a `@scan` carried state,
 #     step local or loop variable, and a `do`-block argument
 #     (`_collect_binders!`). Index expressions keep their shape; names inside
 #     them follow the same rule (`c[levels(gg)]` → `z_c[levels(group)]`).
@@ -5579,6 +5669,10 @@ _collect_lhs_binders!(out::Set{Symbol}, lhs::Symbol) = push!(out, lhs)
 function _collect_lhs_binders!(out::Set{Symbol}, lhs::Expr)
     if lhs.head === :ref && !isempty(lhs.args)
         _collect_lhs_binders!(out, lhs.args[1])
+    elseif lhs.head === :call && length(lhs.args) == 2 &&
+            lhs.args[1] in (:eachrow, :eachcol)
+        # A slice declaration (`eachrow(B[levels(g), 1:K]) .~ D`) binds `B`.
+        _collect_lhs_binders!(out, lhs.args[2])
     elseif lhs.head in (:vect, :tuple)
         for a in lhs.args
             _collect_lhs_binders!(out, a)
@@ -6262,14 +6356,14 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     # Prob-space families bypass the predictor-building location
     # lowering (their location names a Beta-sampled scalar parameter;
     # the Beta family is checked at contract). Every other family
-    # routes through `_lower_location` with its identity for the
-    # bare-location gate.
+    # routes through `_lower_location`, which admits a value location
+    # here (a scalar parameter or data column under the written link).
     pname = (family === BinomialProbFam ||
             family === ZeroInflatedBinomialFam) ?
         _lower_prob_location(lhs, loc, ctx,
             family === BinomialProbFam ? "Binomial" : "ZeroInflatedBinomial") :
         _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
-        coefuse; fam = family)
+        coefuse; value = true)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
     nu = _lower_nu_use(lhs, nu_raw, ctx, predictors, pred_idx, coefuse)
@@ -7246,6 +7340,15 @@ const _RESPONSE_BASE_MSG =
     "`GammaLog.(alpha, eta)`, `BetaLogit.(mu, kappa)`, which lower " *
     "identically to their decomposed spellings)"
 
+# A location written with no link wrapper in a constrained-scale slot
+# (`Bernoulli.(theta)`, `Binomial.(n, theta)`, `Poisson.(lambda)`): the
+# value IS the probability or rate. The base returns it marked, so
+# `_lower_location` never confuses it with the same name under a link
+# (`Poisson.(exp.(a))`, where `a` is the log rate).
+struct _BareSlot
+    name::Symbol
+end
+
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
                                  "got $(repr(rhs))")
@@ -7278,8 +7381,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
             # definition is a predictor, not a parameter — it falls
             # through to link lowering, which throws the link-required
             # error (bare predictors keep their link).
-            return BernoulliLogitFam, LogitLink, IdentityLink, args[1],
-            nothing, nothing, nothing, nothing, nothing
+            return BernoulliLogitFam, LogitLink, IdentityLink,
+            _BareSlot(args[1]), nothing, nothing, nothing, nothing, nothing
         end
         f, l, loc = _lower_bernoulli_link(lhs, args[1])
         return f, l, IdentityLink, loc, nothing, nothing, nothing, nothing,
@@ -7293,9 +7396,9 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
             # predictor, not a parameter — it falls through to link
             # lowering, which throws the link-required error (bare
             # predictors keep their link).
-            return BinomialLogitFam, LogitLink, IdentityLink, args[2],
-            nothing, _lower_trials(lhs, args[1], ctx), nothing, nothing,
-            nothing
+            return BinomialLogitFam, LogitLink, IdentityLink,
+            _BareSlot(args[2]), nothing, _lower_trials(lhs, args[1], ctx),
+            nothing, nothing, nothing
         end
         f, l, loc = _lower_binomial_link(lhs, args[2])
         return f, l, IdentityLink, loc, nothing,
@@ -7393,8 +7496,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
             # predictor, not a parameter — it falls through to link
             # lowering, which throws the link-required error (bare
             # predictors keep their link).
-            return PoissonLogFam, LogLink, LogLink, args[1], nothing,
-            nothing, nothing, nothing, nothing
+            return PoissonLogFam, LogLink, LogLink, _BareSlot(args[1]),
+            nothing, nothing, nothing, nothing, nothing
         end
         return PoissonLogFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
@@ -8018,9 +8121,16 @@ function _claim_pin!(lhs, pin, ctx, pred_idx)
     return nothing
 end
 
+# A location written bare in a constrained-scale slot lowers like any
+# name, except that a sampled parameter there IS the probability or rate.
+_lower_location(lhs, loc::_BareSlot, pred_link, ctx, predictors, pred_idx,
+        coefuse; kwargs...) =
+    _lower_location(lhs, loc.name, pred_link, ctx, predictors, pred_idx,
+        coefuse; kwargs..., bare = true)
+
 function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse; synth::Union{Nothing,Symbol} = nothing,
-        fam::Union{Nothing,LikelihoodFamily} = nothing)
+        bare::Bool = false, value::Bool = false)
     # A per-cell latent VECTOR is the whole location via a LatentTerm predictor
     # (`lp = theta`, identity design; the latent's prior lives on its
     # PlateParameter, so no coefficient use is recorded). Two spellings: a bare
@@ -8063,18 +8173,18 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             return target
         end
         if !haskey(ctx.detmap, loc)
-            # A bare sampled parameter (constrained-scale, no link
-            # inversion): the mixture bare-mean slots, single-family
-            # form — Bernoulli/Binomial-logit and Poisson-log ONLY
-            # (every other family rejects here with
-            # SurfaceLoweringError, never downstream). detmap-first
-            # preserves stated-prior aliases.
-            if loc in ctx.prior_names
-                (fam === BernoulliLogitFam || fam === BinomialLogitFam ||
-                    fam === PoissonLogFam) && return loc
-                return _lower_location_symbol_error(lhs, loc, ctx)
-            end
-            return _lower_location_symbol_error(lhs, loc, ctx)
+            # Written bare in a Bernoulli/Binomial/Poisson slot, a sampled
+            # parameter is the constrained-scale probability or rate (no
+            # link inversion): the mixture bare-mean slots, single-family
+            # form. detmap-first preserves stated-prior aliases.
+            bare && loc in ctx.prior_names && return loc
+            # Anywhere else a response reads a scalar parameter or a data
+            # column as a value under the written link.
+            value && !bare && _is_value_location(loc, ctx) &&
+                return _value_location!(lhs, loc, pred_link, ctx,
+                    predictors, pred_idx)
+            return _lower_location_symbol_error(lhs, loc, ctx; bare,
+                value)
         end
         pin = get(ctx.predictor_pins, lhs, nothing)
         if pin !== nothing && pin !== loc
@@ -8178,6 +8288,46 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
     return pname
 end
 
+# A name a response may read as its location value: a data column, or a
+# sampled scalar parameter of any prior (arrays, varying blocks, latents
+# and scan states carry their own location arms).
+_is_value_location(loc::Symbol, ctx) = loc in ctx.data ||
+    (loc in ctx.prior_names && loc ∉ ctx.sized_decls &&
+        loc ∉ ctx.vector_params && loc ∉ ctx.varying_contribs &&
+        loc ∉ ctx.varying_draws_names)
+
+# A value location (`y .~ Normal.(mu, s)`, `Poisson.(exp.(a))`,
+# `Normal.(x, s)`): as in Julia, broadcasting gives every observation the
+# value, read on the written link's scale. A data column is an offset (the
+# term its named twin `mu = x` lowers to); a scalar parameter is a one-leaf
+# composition with no coefficient — it keeps its own name and prior — which
+# the generator broadcasts over the rows.
+function _value_location!(lhs, loc::Symbol, pred_link, ctx, predictors,
+        pred_idx)
+    pin = get(ctx.predictor_pins, lhs, nothing)
+    if pin !== nothing
+        _claim_pin!(lhs, pin, ctx, pred_idx)
+        pname = pin
+    else
+        pname = Symbol(lhs, "_eta")
+        (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
+            "derived predictor name $pname collides with your definition — " *
+            "rename yours")
+    end
+    term = if loc in ctx.data
+        TermSpec(OffsetTerm, ColumnRef[loc], NamedTuple(), loc,
+            Symbol(loc, "_off"))
+    else
+        label = Symbol(pname, "_value")
+        TermSpec(ComposedTerm, ColumnRef[],
+            (tree = loc, subs = Symbol[], scalars = Symbol[loc]), label,
+            label)
+    end
+    push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
+    pred_idx[pname] = length(predictors)
+    return pname
+end
+
 # A latent-reading definition is a DESIGN predictor (not a latent transform)
 # when it has coefficient structure (a coef-priored or free coefficient
 # candidate), reads no scalar parameter (a non-coefficient sampled name
@@ -8267,7 +8417,8 @@ function _derived_reads_latent(name::Symbol, ctx)
     return false
 end
 
-function _lower_location_symbol_error(lhs, loc, ctx)
+function _lower_location_symbol_error(lhs, loc, ctx; bare::Bool = false,
+        value::Bool = false)
     loc in ctx.varying_contribs && _sfail(
         "response $lhs location is the varying contribution $loc — " *
         "locations must be predictors with estimated coefficients " *
@@ -8276,15 +8427,18 @@ function _lower_location_symbol_error(lhs, loc, ctx)
         _sfail("response $lhs location is the varying draws block $loc " *
               "— slice it (`r ~ varying_slice($loc, ...)`) and bind the " *
               "slice in a predictor with estimated coefficients")
-    loc in ctx.data && _sfail("response $lhs location is the data column " *
-                              "$loc — locations must be predictors with " *
-                              "estimated coefficients (wrap: " *
-                              "`eta = a .+ b .* $loc`)")
-    loc in ctx.prior_names && _sfail(
-        "response $lhs location is the bare scalar parameter $loc — a " *
-        "per-observation latent is a per-cell parameter (`@plate for i ...; " *
-        "$loc[i] ~ Normal(mu, tau); y[i] ~ Normal.($loc[i], s); end`); a " *
-        "scalar parameter cannot vary per observation")
+    bare && loc in ctx.data && _sfail("response $lhs location is the data " *
+        "column $loc written bare — a bare Bernoulli/Binomial/Poisson " *
+        "location is a sampled probability or rate; read data under its " *
+        "link (`Poisson.(exp.($loc))`, `Bernoulli.(logistic.($loc))`)")
+    !value && _is_value_location(loc, ctx) && _sfail("response $lhs " *
+        "location $loc: this response's locations are predictor " *
+        "definitions (`eta = a .+ b .* x`); a scalar parameter or data " *
+        "column as the whole location is admitted for single-family " *
+        "responses (`y .~ Normal.($loc, s)`)")
+    loc in ctx.prior_names && _sfail("response $lhs location $loc is a " *
+        "declared array, not one value per observation — read it by " *
+        "index (`$loc[g]`) or in a definition")
     return _sfail("response $lhs location $loc is not a predictor " *
                   "definition (`$loc = ...` affine in data)")
 end
@@ -8420,6 +8574,33 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     return true
 end
 
+# An array-valued DEFINITION (`b = z * (sd .* L)'`). `detshape` also
+# seeds every sized declaration as `:array` (its whole-value shape),
+# including coefficient-capable `c[levels(g)]`, whose role the
+# declaration sets (`array_decls`, `value_arrays`); so test `detmap` too.
+_is_array_def(name, ctx) = name isa Symbol && haskey(ctx.detmap, name) &&
+    get(ctx.detshape, name, :scalar) === :array
+
+# Whether `ex` reads an array that is a VALUE in every role — a value
+# array (`z` declared sized, read whole, or an LKJ factor), an
+# array-role declaration, or an array-valued definition — directly or
+# through definitions. Unlike `_reads_array_value`, an indexed read of a
+# coefficient-capable `c[levels(g)]` (`r = c[g]`, an aliased factor
+# coefficient) does not count.
+function _reads_value_array(ex, ctx, seen::Set{Symbol} = Set{Symbol}())
+    isval(nm) = nm isa Symbol && (nm in ctx.value_arrays ||
+        nm in ctx.array_decls || _is_array_def(nm, ctx))
+    if ex isa Symbol
+        isval(ex) && return true
+        haskey(ctx.detmap, ex) && ex ∉ seen || return false
+        push!(seen, ex)
+        return _reads_value_array(ctx.detmap[ex], ctx, seen)
+    end
+    ex isa Expr || return false
+    ex.head === :ref && isval(ex.args[1]) && return true
+    return any(a -> _reads_value_array(a, ctx, seen), ex.args)
+end
+
 # Whether `ex` reads a declared array value — a bare array name
 # (`B * w`), or an indexed read of any array-capable declaration
 # (`phi[1]`, `z[g]`, `L[2, 1]`) — directly, or (`follow`) through
@@ -8434,7 +8615,8 @@ function _reads_array_value(ex, ctx, seen::Set{Symbol} = Set{Symbol}();
     end
     ex isa Expr || return false
     ex.head === :ref && ex.args[1] isa Symbol &&
-        ex.args[1] in ctx.sized_decls && return true
+        (ex.args[1] in ctx.sized_decls || _is_array_def(ex.args[1], ctx)) &&
+        return true
     return any(a -> _reads_array_value(a, ctx, seen; follow), ex.args)
 end
 
@@ -8610,6 +8792,15 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             # A bound data column read elementwise in-graph (v3:
             # `(log_time .- loc) .* exp.(ls)`); it becomes a term column.
             node in datas || push!(datas, node)
+            return node
+        elseif get(ctx.detshape, node, :scalar) === :vector &&
+                _reads_value_array(ctx.detmap[node], ctx)
+            # A per-observation definition reading array values
+            # (`th = r[person]`, `b = b0 .+ r[item]`) is a sub-predictor:
+            # its array reads extract as offset columns beside any
+            # coefficients (affine, as `_lower_composed_predictor`
+            # checks).
+            node in subs || push!(subs, node)
             return node
         elseif haskey(ctx.detmap, node)
             return _sfail("$where combines $node, which is neither an " *
@@ -9601,9 +9792,11 @@ function _summand_kind(_, _)
 end
 
 function _classify_ref(pname, core::Expr, sign::Int, ctx)
-    # Reads of a declared array value (`z[g]`, `phi[1]`) are values, not
-    # factor coefficients: extracted as a per-observation column.
-    core.args[1] in ctx.value_arrays &&
+    # Reads of a declared array value (`z[g]`, `phi[1]`) or of an
+    # array-valued definition (`b[g, 1]`, `b = z * (sd .* L)'`) are
+    # values, not factor coefficients: extracted as a per-observation
+    # column.
+    (core.args[1] in ctx.value_arrays || _is_array_def(core.args[1], ctx)) &&
         return _extract_summand(pname, core, sign, ctx)
     length(core.args) == 2 || _sfail("predictor $pname: factor indexing " *
                                      "takes `coefficients[group]` exactly, " *
