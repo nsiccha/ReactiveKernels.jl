@@ -163,36 +163,27 @@ end
 
 Restore named constrained parameters from an unconstrained draws matrix `U`
 (`layout.total` rows × draws columns, e.g. HMC output). Returns a NamedTuple
-with one entry per layout entry — coefficient predictors map to
-`(size × draws)` matrices, sampled parameters to length-`draws` vectors,
-LKJ factors and derived correlated draws (`constrain`'s `L`/`b` matrices)
-to vectors of matrices — keyed exactly as [`constrain`](@ref). Each column
-is constrained independently through `constrain`, so transforms stay
-single-sourced.
+keyed exactly as [`constrain`](@ref) (so by the author's names under the
+default `:author` naming): scalars map to length-`draws` vectors, vectors
+(a coefficient vector `c`, a legacy predictor block, a sized vector) to
+`(length × draws)` matrices, and matrices (LKJ factors, derived
+correlated draws) to vectors of matrices. Each column is constrained
+independently through `constrain`, so transforms stay single-sourced.
 """
 function restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real})
     size(U, 1) == layout.total || throw(ContractValidationError(
         "[query] draws rows $(size(U, 1)) ≠ layout total $(layout.total)"))
     n = size(U, 2)
     if n == 0
-        pairs = Pair{Symbol,Any}[]
-        for e in layout.entries
-            if e.kind === :coefficient
-                push!(pairs, e.predictor => Matrix{Float64}(undef, e.size, 0))
-            elseif e.kind === :varying_corr
-                push!(pairs, e.name => Vector{Matrix{Float64}}(undef, 0))
-            else
-                push!(pairs, e.name => Vector{Float64}(undef, 0))
-            end
+        # Zero draws keep `constrain`'s keys and shapes (constrained at
+        # the origin, valid for every transform): scalars as empty
+        # vectors, vectors as `(length × 0)` matrices, matrices as empty
+        # vectors of matrices.
+        proto = constrain(layout, zeros(layout.total))
+        return map(proto) do v
+            v isa AbstractVector ? Matrix{Float64}(undef, length(v), 0) :
+            v isa AbstractMatrix ? Matrix{Float64}[] : Float64[]
         end
-        # Derived draws ride at the end, exactly as `constrain` orders them.
-        for e in layout.entries
-            e.kind === :varying_corr || continue
-            sfx = string(e.name)[3:end]
-            push!(pairs, Symbol("b_", sfx) =>
-                Vector{Matrix{Float64}}(undef, 0))
-        end
-        return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
     end
     nts = map(1:n) do j
         constrain(layout, view(U, :, j))

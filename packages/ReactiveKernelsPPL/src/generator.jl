@@ -13,12 +13,14 @@
 # (counter-suffixed binding per build).
 
 """
-    build_kernel(plan) -> (; spec, layout)
+    build_kernel(plan; naming = :author) -> (; spec, layout)
 
 Validate, assign layout, emit, and evaluate a self-contained `@kernel`
 program for `plan`. `spec` is the `KernelSpec` (callable after `prepare`
 with `have=(:unconstrained, data…)`); `layout` is its
-[`LayoutTable`](@ref) (R10 read API for the sampler side).
+[`LayoutTable`](@ref) (R10 read API for the sampler side), reporting
+coefficients under `naming` (`:author` names, or the legacy
+`:predictor` labels).
 
 Thread safety: concurrent `build_kernel` calls over independent plans are
 supported — the counter-suffixed `PPLGeneratedModels` binding is assigned
@@ -28,11 +30,11 @@ eval'd code: `prepare` it and call it through [`prepare_query`](@ref) /
 [`prepare_sampler`](@ref) (which carry the `Base.invokelatest` world-age
 barrier) or wrap those calls in `Base.invokelatest` yourself.
 """
-function build_kernel(plan::StructuralPlan)
+function build_kernel(plan::StructuralPlan; naming::Symbol = :author)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
-    layout = assign_layout(plan)
+    layout = assign_layout(plan; naming)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
     return (; spec, layout)
@@ -334,25 +336,29 @@ function _mo_block_terms(plan::StructuralPlan, shape::DesignShape)
     k = 1
     for b in shape.blocks
         if b.kind === InterceptTerm
-            push!(terms, Expr(:call, :.*, Expr(:call, :ones, _predictor_rows(plan,shape.predictor)),
+            push!(terms, Expr(:call, :.*, _signed_part(Expr(:call, :ones,
+                    _predictor_rows(plan, shape.predictor)), b),
                 _coef_coord(coef, k)))
             k += 1
         elseif b.kind === ContinuousTerm
-            push!(terms, :($(b.column) .* $(_coef_coord(coef, k))))
+            push!(terms, :($(_signed_part(b.column, b)) .*
+                $(_coef_coord(coef, k))))
             k += 1
         elseif b.kind === FactorTerm
             w = b.width
-            push!(terms, :($(_contrast_expr(b)) *
+            push!(terms, :($(_signed_part(_contrast_expr(b), b)) *
                 $(:(view($coef, $k:$(k + w - 1))))))
             k += w
         elseif b.kind === MatrixTerm
             w = b.width
-            push!(terms, :($(_matrix_block_expr(b, _predictor_rows(plan,shape.predictor))) *
+            push!(terms, :($(_signed_part(_matrix_block_expr(b,
+                    _predictor_rows(plan, shape.predictor)), b)) *
                 $(:(view($coef, $k:$(k + w - 1))))))
             k += w
         elseif b.kind === MonotonicTerm
             push!(terms,
-                :($(monotonic_name(b.column)) .* $(_coef_coord(coef, k))))
+                :($(_signed_part(monotonic_name(b.column), b)) .*
+                    $(_coef_coord(coef, k))))
             k += 1
         end
     end

@@ -443,7 +443,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
 end
 
 """
-    TermSpec(kind, columns, options, addressee, label)
+    TermSpec(kind, columns, options, addressee, label[, coef, sign])
 
 One additive predictor term: structure only, never materialized designs
 (D5a). `addressee` is the prior address (source column or `:Intercept`),
@@ -453,6 +453,14 @@ levels; no contrasts, no reference dropping — that machinery was
 BRM-specific and is gone). A `ContinuousTerm` may name a per-cell latent
 ([`PlateParameter`](@ref)) instead of a data column: the latent vector
 enters the design with a free coefficient (the SB `me` mirror).
+
+`coef` is the author's name for the term's coefficient (`b` in
+`mu = a .+ b .* x`, `c` in `c[g]`, `b` in `X * b`), or `nothing` for a
+hand-built plan or a term without a coefficient; draws and coordinates
+report it (see [`coordinate_names`](@ref)). `sign` is the use-site sign
+of the coefficient (`-1` in `a .- b .* x`): it negates the term's design
+columns, so the coefficient keeps the prior as written. Both default to
+`(nothing, 1)`.
 """
 struct TermSpec
     kind::TermKind
@@ -460,7 +468,16 @@ struct TermSpec
     options::NamedTuple
     addressee::Symbol
     label::Symbol
+    coef::Union{Nothing,Symbol}
+    sign::Int
 end
+TermSpec(kind, columns, options, addressee, label) =
+    TermSpec(kind, columns, options, addressee, label, nothing, 1)
+
+"""Term kinds whose design columns carry a free coefficient (the kinds
+that may name one in `TermSpec.coef` and negate it by `sign`)."""
+const COEFFICIENT_TERM_KINDS = (InterceptTerm, ContinuousTerm, FactorTerm,
+    MatrixTerm, MonotonicTerm)
 
 """One named linear predictor: additive terms over raw columns."""
 struct PredictorSpec
@@ -6220,8 +6237,44 @@ function _validate_predictors(plan::StructuralPlan)
         isempty(pred.terms) &&
             _fail(pred.label, "predictor $(pred.name) has no terms (empty design)")
         for t in pred.terms
+            _validate_term_coefficient(t)
             _validate_term(t, pred, plan)
         end
+    end
+    _validate_coefficient_names(plan)
+    return nothing
+end
+
+# A term's author coefficient name and use-site sign exist only where the
+# design carries a free coefficient (`COEFFICIENT_TERM_KINDS`); the sign
+# is a polarity.
+function _validate_term_coefficient(t::TermSpec)
+    (t.sign == 1 || t.sign == -1) || _fail(t.label,
+        "term sign must be 1 or -1 (the coefficient's use-site " *
+        "polarity), got $(t.sign)")
+    t.kind in COEFFICIENT_TERM_KINDS && return nothing
+    t.coef === nothing || _fail(t.label,
+        "a $(t.kind) carries no coefficient, so it names none " *
+        "(got coef = $(t.coef))")
+    t.sign == 1 || _fail(t.label,
+        "a $(t.kind) carries no coefficient, so it takes no sign " *
+        "(negate its column instead)")
+    return nothing
+end
+
+# One author name per coefficient: a name heads exactly one term, so the
+# reported draws (`coordinate_names`, `constrain`) never merge two
+# coefficient blocks under one key.
+function _validate_coefficient_names(plan::StructuralPlan)
+    owner = Dict{Symbol,Tuple{Symbol,Symbol}}()
+    for pred in plan.predictors, t in pred.terms
+        t.coef === nothing && continue
+        prev = get(owner, t.coef, nothing)
+        prev === nothing || _fail(t.label,
+            "coefficient name $(t.coef) heads two terms " *
+            "($(prev[1]).$(prev[2]) and $(pred.name).$(t.label)) — one " *
+            "coefficient per name")
+        owner[t.coef] = (pred.name, t.label)
     end
     return nothing
 end

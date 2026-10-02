@@ -310,14 +310,16 @@ function design_recipe(shape::DesignShape, n_rows::Int;
     parts = Any[]
     for b in shape.blocks
         if b.kind === InterceptTerm
-            push!(parts, :(ones($n_rows)))
+            push!(parts, _signed_part(:(ones($n_rows)), b))
         elseif b.kind === ContinuousTerm
-            push!(parts, b.column in plates ? :(Float64.($(b.column))) : b.column)
+            push!(parts, _signed_part(
+                b.column in plates ? :(Float64.($(b.column))) : b.column, b))
         elseif b.kind === FactorTerm
-            push!(parts, _contrast_expr(b))
+            push!(parts, _signed_part(_contrast_expr(b), b))
         elseif b.kind === MatrixTerm
             for e in b.elements
-                push!(parts, e === nothing ? :(ones($n_rows)) : e)
+                push!(parts,
+                    _signed_part(e === nothing ? :(ones($n_rows)) : e, b))
             end
         end
     end
@@ -326,6 +328,10 @@ function design_recipe(shape::DesignShape, n_rows::Int;
     name = design_name(shape.predictor)
     return :($name = Float64.($matrix))
 end
+
+# A block's design part under its use-site sign: a negated coefficient
+# (`a .- b .* x`) keeps its prior as written and reads the negated column.
+_signed_part(part, b::DesignBlock) = b.sign == 1 ? part : :(.-($part))
 
 """
     offset_recipe(shape) -> Union{Nothing,Expr}

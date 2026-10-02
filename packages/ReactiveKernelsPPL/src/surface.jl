@@ -647,7 +647,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         pin_source = Dict{Symbol,Tuple{Symbol,Symbol}}(),
         synth = Ref(0), synth_derived = VectorAssignmentSpec[], taken,
         synth_assigns = AssignmentSpec[],
-        negated = Dict{Symbol,Symbol}(),
         leaf_exprs = Dict{Any,Symbol}(),
         # Inline factor references inside compositions (`sg .* z[g]`)
         # intern as synthetic sub-predictors, one per `(base, index)`,
@@ -802,6 +801,11 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # support) for the admitted names.
     hyper_names = union(prior_names,
         Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :scalar))
+    # Each coefficient term records its author name and use-site sign
+    # (uses are final: a name used twice was demoted above). Draws report
+    # the name; the sign negates the design column, so priors stay as
+    # written.
+    _name_coefficient_terms!(predictors, coefuse)
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
         ctx.matrices, hyper_names, ctx, r2d2set, hsset)
     for (beta, (label, X)) in glmuse
@@ -9352,10 +9356,9 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
             use === nothing && _sfail("internal: no coefficient use for " *
                                       "($(pred.name), $addr)")
             name = use[1]
-            sign = use[3]
             if t.kind === FactorTerm
-                push!(priors, _lower_factor_prior(pred, t, name, sign,
-                    stated, levelmaps, hyper_names, ctx))
+                push!(priors, _lower_factor_prior(pred, t, name,
+                    stated, levelmaps, hyper_names))
                 continue
             end
             if !haskey(stated, name)
@@ -9368,7 +9371,6 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                                            "as $(t.kind), not a factor")
             fam, loc, scale, nu =
                 _coefficient_prior(name, s.rhs, pred.name, addr)
-            loc, scale = _signed_prior(fam, loc, scale, sign, ctx)
             push!(priors, PopulationPrior(pred.name, addr, fam, loc, scale,
                 nu))
         end
@@ -9392,7 +9394,7 @@ function _lower_matrix_priors(pred, t, coefuse, stated, matrices,
     use = _find_use(coefuse, pred.name, X)
     use === nothing && _sfail("internal: no coefficient use for " *
                               "($(pred.name), $X)")
-    name, _, sign = use
+    name = use[1]
     elems = _matrix_element_addressees(m)
     K = length(elems)
     haskey(stated, name) || return PopulationPrior[
@@ -9406,12 +9408,8 @@ function _lower_matrix_priors(pred, t, coefuse, stated, matrices,
                                    "lost its sizing matrix")
     fam, locs, scales, nus =
         _coefficient_matrix_prior(name, s.rhs, pred.name, K, hyper_names)
-    out = PopulationPrior[]
-    for (e, l, sc, n) in zip(elems, locs, scales, nus)
-        l, sc = _signed_prior(fam, l, sc, sign, ctx)
-        push!(out, PopulationPrior(pred.name, e, fam, l, sc, n))
-    end
-    return out
+    return PopulationPrior[PopulationPrior(pred.name, e, fam, l, sc, n)
+        for (e, l, sc, n) in zip(elems, locs, scales, nus)]
 end
 
 # Dotted matrix priors peel to one shared family plus K (location,
@@ -9570,7 +9568,7 @@ function _lower_horseshoe_priors(sample, coefuse, predictors,
             use = _find_use(coefuse, pred.name, addr)
             use === nothing && _sfail("internal: no coefficient use for " *
                                       "($(pred.name), $addr)")
-            name, _, sign = use
+            name = use[1]
             if !haskey(stated, name)
                 push!(params, _horseshoe_normal_param(pred.name, addr,
                     0.0, 1.0, taken))
@@ -9580,7 +9578,10 @@ function _lower_horseshoe_priors(sample, coefuse, predictors,
             if _is_horseshoe_call(s.rhs)
                 ls, gs = _coefficient_horseshoe(name, s.rhs, pred.name,
                     addr)
-                push!(out, HorseshoePrior(pred.name, addr, ls, gs, sign))
+                # The use-site sign negates the design column
+                # (`TermSpec.sign`), so the derived coefficient is the
+                # author's, unsigned.
+                push!(out, HorseshoePrior(pred.name, addr, ls, gs, 1))
                 for (nm, fam, args, ov) in (
                         (horseshoe_raw_name(pred.name, addr), :normal,
                             (arg1 = 0, arg2 = 1), nothing),
@@ -9606,14 +9607,14 @@ function _lower_horseshoe_priors(sample, coefuse, predictors,
                                       "$(pred.name) sits beside a horseshoe prior — " *
                                       "its scalar prior must be `Normal(...)`")
             push!(params, _horseshoe_normal_param(pred.name, addr,
-                sign * loc, scale, taken))
+                loc, scale, taken))
         end
     end
     return out, params
 end
 
 # One mixed-predictor Normal coordinate (the PopulationPrior convention:
-# the sign rides the location, the scalar IS the signed coordinate).
+# the prior as written; the use-site sign rides the design column).
 function _horseshoe_normal_param(pname, addr, loc, scale,
         taken::Set{Symbol})
     nm = horseshoe_normal_name(pname, addr)
@@ -9681,9 +9682,8 @@ function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
                 "are not in the flat slice (the mo contrast is " *
                 "parameter-derived, so no data variance exists)")
             name = use[1]
-            sign = use[3]
             if t.kind === FactorTerm
-                ov = _lower_r2d2_factor(pred, t, name, sign, stated,
+                ov = _lower_r2d2_factor(pred, t, name, stated,
                     levelmaps, hyper_names)
                 ov === nothing || (overrides[addr] = ov)
                 continue
@@ -9700,7 +9700,7 @@ function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
                                       "$(pred.name) carries an r2d2 prior — stated " *
                                       "scalar priors must be `Normal(...)` " *
                                       "(r2d2 overrides are Normal-only)")
-            overrides[addr] = (sign * loc, scale)
+            overrides[addr] = (loc, scale)
         end
         tau = d.tau
         if tau === nothing
@@ -9730,7 +9730,7 @@ function _lower_r2d2_matrix(pred, t, coefuse, stated, matrices,
     use = _find_use(coefuse, pred.name, X)
     use === nothing && _sfail("internal: no coefficient use for " *
                               "($(pred.name), $X)")
-    name, _, sign = use
+    name = use[1]
     elems = _matrix_element_addressees(m)
     K = length(elems)
     haskey(stated, name) || return Tuple{Symbol,Tuple{Float64,Float64}}[]
@@ -9748,13 +9748,13 @@ function _lower_r2d2_matrix(pred, t, coefuse, stated, matrices,
                "r2d2 prior — stated overrides must be literal " *
                "`Normal.(...)` (hyperparameter overrides are not in " *
                "slice 1)")
-    return [(e, (sign * l, sc)) for (e, l, sc) in zip(elems, locs, scales)]
+    return [(e, (l, sc)) for (e, l, sc) in zip(elems, locs, scales)]
 end
 
 # An R2D2 factor: a stated broadcast prior becomes a share-0 override
 # (with its levels subset, as on the PopulationPrior path); an
 # unstated factor joins the simplex under a full-cover LevelMap.
-function _lower_r2d2_factor(pred, t, name, sign, stated, levelmaps,
+function _lower_r2d2_factor(pred, t, name, stated, levelmaps,
         hyper_names::Set{Symbol})
     col = only(t.columns)
     haskey(stated, name) || begin
@@ -9781,11 +9781,11 @@ function _lower_r2d2_factor(pred, t, name, sign, stated, levelmaps,
                "`Normal.(...)` (hyperparameter overrides are not in " *
                "slice 1)")
     push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
-    return (sign * loc, scale)
+    return (loc, scale)
 end
 
-function _lower_factor_prior(pred, t, name, sign, stated, levelmaps,
-        hyper_names::Set{Symbol}, ctx)
+function _lower_factor_prior(pred, t, name, stated, levelmaps,
+        hyper_names::Set{Symbol})
     col = only(t.columns)
     haskey(stated, name) || _sfail("factor coefficient $name over $col " *
                                    "needs an explicit broadcast prior " *
@@ -9802,7 +9802,6 @@ function _lower_factor_prior(pred, t, name, sign, stated, levelmaps,
     fam, loc, scale, nu =
         _coefficient_broadcast_prior(name, s.rhs, pred.name, col, hyper_names)
     push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
-    loc, scale = _signed_prior(fam, loc, scale, sign, ctx)
     return PopulationPrior(pred.name, col, fam, loc, scale, nu)
 end
 
@@ -9893,6 +9892,35 @@ function _check_identified(predictors, levelmaps, matrices,
     return nothing
 end
 
+# Record each coefficient term's author name and use-site sign on the
+# term (`TermSpec.coef` / `.sign`), from the final coefficient uses: a
+# predictor's `(predictor, addressee)` pair has exactly one coefficient.
+function _name_coefficient_terms!(predictors::Vector{PredictorSpec},
+        coefuse)
+    byuse = Dict{Tuple{Symbol,Symbol},Tuple{Symbol,Int}}()
+    for (name, uses) in coefuse, (pname, addr, sign) in uses
+        key = (pname, addr)
+        haskey(byuse, key) && _sfail("predictor $pname: coefficients " *
+            "$(byuse[key][1]) and $name both scale $addr — one " *
+            "coefficient per column")
+        byuse[key] = (name, sign)
+    end
+    for (i, pred) in enumerate(predictors)
+        terms = map(pred.terms) do t
+            t.kind in COEFFICIENT_TERM_KINDS || return t
+            addr = t.kind === InterceptTerm ? :Intercept :
+                t.kind === MatrixTerm ? t.options.matrix : only(t.columns)
+            hit = get(byuse, (pred.name, addr), nothing)
+            hit === nothing && return t
+            return TermSpec(t.kind, t.columns, t.options, t.addressee,
+                t.label, hit[1], hit[2])
+        end
+        predictors[i] = PredictorSpec(pred.name, pred.link, terms,
+            pred.label)
+    end
+    return nothing
+end
+
 function _find_use(coefuse, pname, addr)
     for (name, uses) in coefuse
         for (p2, a2, s2) in uses
@@ -9957,29 +9985,6 @@ function _coefficient_arg(name, a, pname)
     a isa Symbol && return a
     _sfail("coefficient $name of predictor $pname: prior argument " *
            "$(repr(a)) must be a literal or a name")
-end
-
-# The signed coefficient's prior (a use `.- b .* x` stores `-b`):
-# symmetric families negate the location — a literal directly, a name
-# through one synthetic negating assignment — and `Uniform(lo, hi)`
-# becomes `Uniform(-hi, -lo)`.
-function _signed_prior(fam, loc, scale, sign::Int, ctx)
-    sign == 1 && return loc, scale
-    fam === :uniform && return -scale, -loc
-    fam === :flat && return loc, scale
-    loc isa Real && return -loc, scale
-    nm = get!(ctx.negated, loc) do
-        n = Symbol(:_rkppl_neg_, loc)
-        k = 1
-        while n in ctx.taken
-            k += 1
-            n = Symbol(:_rkppl_neg_, loc, :_, k)
-        end
-        push!(ctx.taken, n)
-        push!(ctx.synth_assigns, AssignmentSpec(n, Expr(:call, :-, loc), n))
-        n
-    end
-    return nm, scale
 end
 
 # A scalar coefficient prior the affine block can carry: a coefficient
