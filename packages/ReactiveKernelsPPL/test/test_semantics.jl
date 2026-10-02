@@ -1,7 +1,8 @@
 using CategoricalArrays
 using DataAPI
 using DifferentiationInterface: AutoEnzyme
-using Distributions: Normal, Poisson, TDist, censored, truncated, logpdf
+using Distributions: Normal, Bernoulli, Binomial, Poisson, TDist, censored,
+    truncated, cdf, logpdf
 using Enzyme
 using ReactiveKernelsPPL
 using Test
@@ -34,6 +35,51 @@ function _semantics_check(ast, data, oracle; names = nothing)
     @test grad ≈ fd rtol = 2e-5 atol = 2e-7
     @test data == original
     return (; bound, built, u)
+end
+
+@testset "Julia inverse-link function spellings" begin
+    x = [-1.0, 0.0, 0.5, 1.0]
+    for (link, inverse) in ((:normcdf, x -> cdf(Normal(), x)),
+            (:cexpexp, x -> -expm1(-exp(x))))
+        for (family, y) in ((:Bernoulli, [false, true, true, false]),
+                (:Binomial, [0, 1, 2, 1]))
+            prob = Expr(:., link, Expr(:tuple, :eta))
+            rhs = family === :Bernoulli ? Expr(:., family, Expr(:tuple, prob)) :
+                Expr(:., family, Expr(:tuple, :n, prob))
+            ast = quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                eta = a .+ b .* x
+                y .~ $rhs
+            end
+            data = Dict{Symbol,Any}(:x => x, :y => y, :n => fill(3, length(x)))
+            _semantics_check(ast, data, q -> sum(
+                logpdf(family === :Bernoulli ? Bernoulli(inverse(q.a + q.b * xi)) :
+                    Binomial(3, inverse(q.a + q.b * xi)), yi)
+                for (xi, yi) in zip(x, y)))
+        end
+    end
+    for (old, replacement, explanation) in ((:probit, "normcdf", "inverse normal CDF"),
+            (:cloglog, "cexpexp", "not its inverse")), family in (:Bernoulli, :Binomial)
+        prob = Expr(:., old, Expr(:tuple, :eta))
+        rhs = family === :Bernoulli ? Expr(:., family, Expr(:tuple, prob)) :
+            Expr(:., family, Expr(:tuple, :n, prob))
+        # refused: inverse links must have honest Julia names (0tz0qfu,
+        # links prong); these old names are not aliases for the new functions.
+        err = try
+            lower_rkppl(quote
+                a ~ Normal(0, 1)
+                eta = a .+ 0 .* x
+                y .~ $rhs
+            end, (:x, :y, :n))
+            nothing
+        catch e
+            e
+        end
+        @test err isa SurfaceLoweringError
+        @test occursin(replacement, sprint(showerror, err))
+        @test occursin(explanation, sprint(showerror, err))
+    end
 end
 
 @testset "evidence rejects impossible response data" begin

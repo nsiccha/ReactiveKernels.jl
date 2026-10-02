@@ -324,7 +324,7 @@ end
         d ~ Normal(0, 1)
         mu = a .+ b .* x
         sigma = c .+ d .* z
-        y .~ Normal.(mu, probit.(sigma))
+        y .~ Normal.(mu, normcdf.(sigma))
     end, (:y, :x, :z)); true)
     # The two slots take distinct predictors (contract gate, BRM-mirroring).
     # A same-link self-use reaches the contract rule; a wrapped self-use

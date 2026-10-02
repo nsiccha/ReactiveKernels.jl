@@ -7939,7 +7939,7 @@ function _dot2call_nested_object(lhs, a)
 end
 
 function _dot2call_nested_link(lhs, a, base)
-    want = (base === :Bernoulli || base === :Binomial) ? "logistic/probit/cloglog" :
+    want = (base === :Bernoulli || base === :Binomial) ? "logistic/normcdf/cexpexp" :
         (base === :Beta || base === :BetaBinomial2) ? "logistic" : "exp"
     a isa Expr && a.head === :. && length(a.args) == 2 &&
         a.args[1] isa Symbol && a.args[2] isa Expr &&
@@ -8035,10 +8035,10 @@ end
 const _RESPONSE_BASE_MSG =
     "response distribution must be `Normal.(mu, sigma)`, " *
     "`StudentT.(nu, mu, sigma)`, " *
-    "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link, " *
+    "`Bernoulli.(logistic.(eta))` (or `normcdf`/`cexpexp` for the inverse link, " *
     "or bare `Bernoulli.(theta)` over a sampled parameter), " *
     "`Poisson.(exp.(eta))` (or bare `Poisson.(lambda)` over a sampled " *
-    "parameter), `Binomial.(n, logistic.(mu))` (or `probit`/`cloglog` " *
+    "parameter), `Binomial.(n, logistic.(mu))` (or `normcdf`/`cexpexp` " *
     "for the link, or bare `Binomial.(n, theta)` over a sampled " *
     "parameter), " *
     "`NegativeBinomial2.(exp.(eta), phi)`, " *
@@ -8096,7 +8096,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         nothing, args[1], nothing, nothing
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
-                                    "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link)")
+                                    "`Bernoulli.(logistic.(eta))` (or `normcdf`/`cexpexp` for the inverse link)")
         if args[1] isa Symbol && !haskey(ctx.detmap, args[1])
             # Bare sampled parameter (constrained-scale, no link
             # inversion): the mixture bare-mean triple. A deterministic
@@ -8111,7 +8111,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         nothing
     elseif fam === :Binomial
         length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
-                                    "`Binomial.(n, logistic.(mu))` (or `probit`/`cloglog` for the link)")
+                                    "`Binomial.(n, logistic.(mu))` (or `normcdf`/`cexpexp` for the inverse link)")
         if args[2] isa Symbol && !haskey(ctx.detmap, args[2])
             # Bare sampled parameter (constrained-scale): the mixture
             # bare-mean triple. A deterministic definition is a
@@ -8405,26 +8405,28 @@ end
 # wrappers fail here (the spine converter is wrapper-generic).
 const _BERNOULLI_LINKS = Dict{Symbol,Tuple{LikelihoodFamily,LinkFunction}}(
     :logistic => (BernoulliLogitFam, LogitLink),
-    :probit => (BernoulliProbitFam, ProbitLink),
-    :cloglog => (BernoulliCloglogFam, CloglogLink),
+    :normcdf => (BernoulliProbitFam, ProbitLink),
+    :cexpexp => (BernoulliCloglogFam, CloglogLink),
 )
 const _BINOMIAL_LINKS = Dict{Symbol,Tuple{LikelihoodFamily,LinkFunction}}(
     :logistic => (BinomialLogitFam, LogitLink),
-    :probit => (BinomialProbitFam, ProbitLink),
-    :cloglog => (BinomialCloglogFam, CloglogLink),
+    :normcdf => (BinomialProbitFam, ProbitLink),
+    :cexpexp => (BinomialCloglogFam, CloglogLink),
 )
 
 function _lower_bernoulli_link(lhs, arg)
+    _reject_legacy_inverse_link(lhs, arg)
     arg isa Expr && arg.head === :call && !isempty(arg.args) &&
         haskey(_BERNOULLI_LINKS, arg.args[1]) ||
         _sfail("response $lhs: `Bernoulli` takes a link wrapper " *
-               "(`logistic.(eta)`, `probit.(eta)`, or `cloglog.(eta)`), " *
+               "(`logistic.(eta)`, `normcdf.(eta)`, or `cexpexp.(eta)`), " *
                "got $(repr(arg))")
     fam, link = _BERNOULLI_LINKS[arg.args[1]]
     return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
 end
 
 function _lower_binomial_link(lhs, arg)
+    _reject_legacy_inverse_link(lhs, arg)
     # Bare prob (a Beta-sampled parameter, constrained-scale — the
     # mixture bare-mean precedent): prob-space Binomial, no link.
     if arg isa Symbol || arg isa Real
@@ -8433,11 +8435,24 @@ function _lower_binomial_link(lhs, arg)
     arg isa Expr && arg.head === :call && !isempty(arg.args) &&
         haskey(_BINOMIAL_LINKS, arg.args[1]) ||
         _sfail("response $lhs: `Binomial` probability takes a link wrapper " *
-               "(`logistic.(mu)`, `probit.(mu)`, or `cloglog.(mu)`) or a " *
+               "(`logistic.(mu)`, `normcdf.(mu)`, or `cexpexp.(mu)`) or a " *
                "bare Beta parameter (`theta ~ Beta(...)`), " *
                "got $(repr(arg))")
     fam, link = _BINOMIAL_LINKS[arg.args[1]]
     return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
+end
+
+const _LEGACY_INVERSE_LINKS = Dict(
+    :probit => (:normcdf, "probit names the inverse normal CDF, not the normal CDF"),
+    :cloglog => (:cexpexp, "cloglog is the link log(-log(1-p)), not its inverse"),
+)
+
+function _reject_legacy_inverse_link(lhs, arg)
+    arg isa Expr && arg.head === :call && !isempty(arg.args) || return nothing
+    replacement = get(_LEGACY_INVERSE_LINKS, arg.args[1], nothing)
+    replacement === nothing && return nothing
+    inverse, reason = replacement
+    _sfail("response $lhs: $reason; use `$inverse.(eta)`")
 end
 
 # Prob-space Binomial-family location: a sampled parameter name (the Beta

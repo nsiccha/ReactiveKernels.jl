@@ -177,7 +177,7 @@ end
                 eta = a .+ b .* x
                 eta2 = c .+ d .* x
                 y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
-                    Bernoulli.(probit.(eta2))], [0.5, 0.5])
+                    Bernoulli.(normcdf.(eta2))], [0.5, 0.5])
             end), SurfaceLoweringError),
         # capability: probit component links (todo `1nb43fj`).
         ("probit outside v1",
@@ -188,8 +188,8 @@ end
                 d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 eta2 = c .+ d .* x
-                y .~ MixtureModel.([Bernoulli.(probit.(eta)),
-                    Bernoulli.(probit.(eta2))], [0.5, 0.5])
+                y .~ MixtureModel.([Bernoulli.(normcdf.(eta)),
+                    Bernoulli.(normcdf.(eta2))], [0.5, 0.5])
             end), SurfaceLoweringError),
         # refused: empty mixture (K = 0)
         ("K = 0",

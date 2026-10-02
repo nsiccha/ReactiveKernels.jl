@@ -318,7 +318,7 @@ end
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
-        y .~ Bernoulli.(probit.(eta))
+        y .~ Bernoulli.(normcdf.(eta))
     end
     yb = repeat([false, true], 3)
     bound = m(; y = yb, x = cols[:x])
@@ -335,7 +335,7 @@ end
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
-        y .~ Bernoulli.(cloglog.(eta))
+        y .~ Bernoulli.(cexpexp.(eta))
     end
     bound = m(; y = yb, x = cols[:x])
     built = build_kernel(bound)
@@ -350,7 +350,7 @@ end
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
-        y .~ Binomial.(n, probit.(mu))
+        y .~ Binomial.(n, normcdf.(mu))
     end
     cols[:y] = [1, 0, 2, 1, 3, 2]
     cols[:n] = [3, 2, 4, 3, 5, 4]
@@ -367,7 +367,7 @@ end
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
-        y .~ Binomial.(5, cloglog.(mu))
+        y .~ Binomial.(5, cexpexp.(mu))
     end
     bound = m(; y = cols[:y], x = cols[:x])
     built = build_kernel(bound)
@@ -1719,7 +1719,7 @@ end
         b ~ Normal(0, 1)
         kappa ~ Gamma(2.0, 1000.0)
         mu = a .+ b .* x
-        p .~ Beta.(probit.(mu) .* kappa, (1 .- probit.(mu)) .* kappa)
+        p .~ Beta.(normcdf.(mu) .* kappa, (1 .- normcdf.(mu)) .* kappa)
     end, Dp2); true)
     # Beta: canonical argument order only.
     # capability: Beta arguments in swapped order (a valid Beta(alpha, beta)) (todo `139j2uo`)
@@ -1750,13 +1750,13 @@ end
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
-        y .~ Poisson.(probit.(eta))
+        y .~ Poisson.(normcdf.(eta))
     end, Dn2); true)
     # Binomial probit still needs trials.
     # refused: one-arg Binomial(n) puts the probability in the trials slot (non-integer n; malformed)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
-        y .~ Binomial.(probit.(mu))
+        y .~ Binomial.(normcdf.(mu))
     end, Dn3)
 end
 
