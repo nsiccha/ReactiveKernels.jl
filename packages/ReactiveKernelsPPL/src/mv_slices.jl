@@ -81,6 +81,24 @@ end
 
 # ── multivariate normal slices (native) ──────────────────────────────
 
+# Sum the row densities by forward substitution. The inputs and factor
+# remain read-only; the solve buffer is fresh and local to this call.
+@inline function _lower_solve_rows_logpdf(input, factor, logdet, k, groups)
+    value = -groups*(0.5k*log(2pi)+logdet)
+    z = zeros(Float64,k)
+    for g in 1:groups
+        for i in 1:k
+            residual = input(g,i)
+            for j in 1:(i-1)
+                residual -= factor(i,j)*z[j]
+            end
+            z[i] = residual/factor(i,i)
+            value -= 0.5z[i]^2
+        end
+    end
+    return value
+end
+
 # Σ log F[i, i] of a K×K lower-triangular Cholesky factor, checking the
 # positive diagonal and the zero upper triangle.
 function _cholesky_factor_logdet(F, k)

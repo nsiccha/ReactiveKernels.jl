@@ -796,9 +796,8 @@ end
 
 One shared varying-effect draws block over
 `K = length(margins)` margins in `G` groups of raw column `group`.
-`kind` is `:correlated` (non-centered LKJ + tau + z_flat) or
-`:centered_correlated` (LKJ + tau + directly sampled b_flat, native
-only). There is one geometry for every K and every margin: a single
+`kind` is `:correlated` (non-centered LKJ + tau + z_flat).
+There is one geometry for every K and every margin: a single
 margin, intercept or slope, is the 1x1 case, whose LKJ factor is the
 fixed `[1]` (zero coordinates, a `0.0` prior node), so its sd is the
 same half-normal `tau` (`tau ~ Normal(0, 1)` on `tau > 0` plus the
@@ -2473,16 +2472,16 @@ end
 # Sampled names, derived purely from the draws suffix: the LKJ
 # Cholesky factor (`L_<s>`, KxK), the marginal-scale vector
 # (`tau_<s>`, K), and the standardized draws (`z_flat_<s>`, K*G
-# column-major; `b_flat_<s>` when centered). Single source for surface
+# column-major). Single source for surface
 # claims, name tables, layout, and the generator. K=1 draws own the
 # same three names (`L` packs zero coords).
 function _varying_corr_names(d::VaryingDraws)
     s = d.suffix
     return (Symbol("L_", s), Symbol("tau_", s),
-        Symbol(d.kind === :centered_correlated ? "b_flat_" : "z_flat_", s))
+        Symbol("z_flat_", s))
 end
 
-_is_correlated_kind(kind) = kind in (:correlated,:centered_correlated)
+_is_correlated_kind(kind) = kind === :correlated
 
 # Stratified sampled names, derived from the draws suffix + stratum
 # position: per-stratum LKJ factor (`L_<s>_s<k>`, KxK) and
@@ -2624,8 +2623,8 @@ end
 function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
         slices::Vector{VaryingSlice})
     _is_correlated_kind(d.kind) ||
-        _fail(d.label, "draws kind must be :correlated or " *
-              ":centered_correlated (one geometry for every K — a single " *
+        _fail(d.label, "draws kind must be :correlated " *
+              "(one geometry for every K — a single " *
               "margin is the 1x1 case), got $(repr(d.kind))")
     K = length(d.margins)
     K >= 1 || _fail(d.label, "draws block has zero margins")
@@ -2658,8 +2657,6 @@ function _validate_draws_grouping(d::VaryingDraws, K::Int)
     mm = d.mm
     st = d.strata
     mm === nothing && st === nothing && return nothing
-    d.kind === :centered_correlated && _fail(d.label,
-        "centered correlated draws require plain grouping (multi-membership and strata are unsupported)")
     mm !== nothing && st !== nothing &&
         _fail(d.label, "draws block is both multi-membership and " *
               "stratified (SB has no `mm(...)` × `gr(g, by=b)` shape — " *

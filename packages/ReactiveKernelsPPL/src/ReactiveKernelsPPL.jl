@@ -116,7 +116,6 @@ export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
     prepare_transit_twocmt_rule
 
 include("contract.jl")
-include("varying_centered.jl")
 include("expm_rule.jl")
 # Owned symmetric-eigendecomposition rules: defined in
 # ReactiveKernelsDistributionKernels (beside `loggamma` / `logbeta`),

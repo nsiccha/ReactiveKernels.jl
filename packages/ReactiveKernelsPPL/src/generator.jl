@@ -229,7 +229,6 @@ import .._ordinal_stage_obs, .._ordinal_stage_idx
 import ..linear_pk_read_locs, ..linear_pk_read_locs_auc
 import ..linear_pk_read_locs_over_subjects,
     ..linear_pk_read_locs_auc_over_subjects, ..SubjectScalar, ..SubjectSlice
-import .._centered_correlated_logpdf
 # Multivariate slice priors (`mv_slices.jl`): orientations, per-slice
 # arguments, simplex / ordered slice transforms and the slice densities.
 import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
@@ -1062,27 +1061,12 @@ end
 # One varying draws block's direct `r` summand (no `b` node, the draws
 # stay implicit): the K² implicit-draws arm (this slice's columns
 # only, every K); mm draws take the weighted-gather arm (same geometry,
-# per-slot gathers); centered draws read their sampled `b_flat`.
+# per-slot gathers).
 function _varying_effect_expr(plan::StructuralPlan, pred::PredictorSpec,
         t::TermSpec)
     d, s = _slice_draws(plan, pred, t)
     d.mm !== nothing && return _varying_mm_effect_expr(plan, d, s)
-    d.kind === :centered_correlated && return _varying_centered_effect_expr(d,s)
     return _varying_corr_effect_expr(plan, d, s)
-end
-
-function _varying_centered_effect_expr(d::VaryingDraws,s::VaryingSlice)
-    b = _varying_corr_names(d)[3]
-    K = length(d.margins)
-    gidx = Symbol(:_ppl_gidx_,d.group)
-    parts = Any[]
-    for j in s.columns
-        idx = :($j .+ ($gidx .- 1) .* $K)
-        effect = Expr(:ref,b,idx)
-        z = d.margins[j].z
-        push!(parts,z.kind === :ones ? effect : :($(_varying_z_expr(z)) .* $effect))
-    end
-    return foldl((a,c)->:($a .+ $c),parts)
 end
 
 # One mm draws block's direct `r` summand (SB `multi_membership_*`
@@ -3537,18 +3521,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(d))))
         push!(terms, lnode)
         _sd_prior_tau_stmts!(stmts, terms, d, tau)
-        if d.kind === :centered_correlated
-            K = length(d.margins)
-            lower = Symbol(:_ppl_centered_L_,d.suffix)
-            vals = Any[_rl_name(L,i,j) for i in 1:K for j in 1:i]
-            push!(stmts,:($lower = Float64[$(vals...)]))
-            node = Symbol(:_ppl_prior_,z)
-            push!(stmts,:($node::Float64 = _centered_correlated_logpdf($z,$tau,$lower)))
-            push!(terms,node)
-        else
-            _vector_prior_stmts!(stmts, terms, z, :normal,
-                (arg1 = 0, arg2 = 1), nothing)
-        end
+        _vector_prior_stmts!(stmts, terms, z, :normal,
+            (arg1 = 0, arg2 = 1), nothing)
     end
     # HSGP bases (SB `_sb_hsgp`/`_sb_hsgp_aniso`): the length scales and
     # marginal scale as scalar `lognormal(0, 1)` nodes plus the
