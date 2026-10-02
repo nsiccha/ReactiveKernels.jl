@@ -440,7 +440,7 @@ end""")
             ("y .~ Poisson.(exp.(a))", PoissonLogFam, LogLink, (:y,)),
             ("y .~ Bernoulli.(logistic.(a))", BernoulliLogitFam, LogitLink,
                 (:y,)),
-            ("y .~ Bernoulli.(probit.(a))", BernoulliProbitFam, ProbitLink,
+            ("y .~ Bernoulli.(normcdf.(a))", BernoulliProbitFam, ProbitLink,
                 (:y,)),
             ("k .~ Binomial.(n, logistic.(a))", BinomialLogitFam, LogitLink,
                 (:k, :n)),
@@ -518,7 +518,7 @@ end
             prior + sum(D.logpdf.(D.Bernoulli(lg(0.4)), yb))),
         (Meta.parse("""begin
             a ~ Normal(0, 1)
-            y .~ Bernoulli.(probit.(a))
+            y .~ Bernoulli.(normcdf.(a))
         end"""), Dict{Symbol,AbstractVector}(:y => yb), (; a = 0.4),
             prior + sum(D.logpdf.(D.Bernoulli(D.cdf(D.Normal(), 0.4)), yb))),
         (Meta.parse("""begin

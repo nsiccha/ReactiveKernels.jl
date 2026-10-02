@@ -90,7 +90,7 @@ end
     matrix = quote
         b[axes(X, 2)] .~ Normal.(0, 1)
         c[levels(g)] .~ Normal.(0, 2)
-        X = hcat(1, x)
+        X = hcat(ones(length(x)), x)
         mu = X * b .+ c[g]
         y .~ Normal.(mu, 1)
     end

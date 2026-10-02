@@ -136,10 +136,9 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
                 d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 lk = c .+ d .* z
-                prop .~ MixtureModel.([Beta.(logistic.(eta) .* exp.(lk),
+                prop .~ MixtureModel.(vcat.(Beta.(logistic.(eta) .* exp.(lk),
                         (1 .- logistic.(eta)) .* exp.(lk)),
-                    Beta.(0.7 .* exp.(lk), (1 .- 0.7) .* exp.(lk))],
-                    [0.5, 0.5])
+                    Beta.(0.7 .* exp.(lk), (1 .- 0.7) .* exp.(lk))), Ref([0.5, 0.5]))
             end, (:prop, :x, :z))
         r = only(plan.responses)
         @test r.mixture_family === BetaLogitFam
@@ -213,10 +212,9 @@ end
                 d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 lk = c .+ d .* z
-                prop .~ MixtureModel.([Beta.(logistic.(eta) .* exp.(lk),
+                prop .~ MixtureModel.(vcat.(Beta.(logistic.(eta) .* exp.(lk),
                         (1 .- logistic.(eta)) .* exp.(lk)),
-                    Beta.(0.7 .* exp.(lk), (1 .- 0.7) .* exp.(lk))],
-                    [0.5, 0.5])
+                    Beta.(0.7 .* exp.(lk), (1 .- 0.7) .* exp.(lk))), Ref([0.5, 0.5]))
             end, _bk_cols())
         q = (a = 0.2, b = -0.4, c = 0.3, d = 0.15)
         got = _bk_posterior(kern, lay, q)

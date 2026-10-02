@@ -92,7 +92,7 @@ _sb_posterior(kern, lay, u) = Base.invokelatest(kern, u)
         mu1 ~ Normal(0.0, 10.0)
         mu2 ~ Normal(0.0, 10.0)
         w ~ Dirichlet(2, 1.0)
-        y .~ MixtureModel.([Normal.(mu1, 1.0), Normal.(mu2, 1.0)], w)
+        y .~ MixtureModel.(vcat.(Normal.(mu1, 1.0), Normal.(mu2, 1.0)), Ref(w))
     end""")
     cols = Dict{Symbol,AbstractVector}(:y => [-2.0, -1.8, 1.9, 2.2])
     bound, built, kern, lay = _sb_query(prog, cols)
@@ -138,8 +138,8 @@ end
         s4 ~ Uniform(0.0, 10.0)
         s5 ~ Uniform(0.0, 10.0)
         w ~ Dirichlet(5, 1.0)
-        y .~ MixtureModel.([Normal.(mu1, s1), Normal.(mu2, s2),
-            Normal.(mu3, s3), Normal.(mu4, s4), Normal.(mu5, s5)], w)
+        y .~ MixtureModel.(vcat.(Normal.(mu1, s1), Normal.(mu2, s2),
+            Normal.(mu3, s3), Normal.(mu4, s4), Normal.(mu5, s5)), Ref(w))
     end""")
     y = [-3.0, -2.5, 0.1, 0.5, 2.0, 2.8]
     cols = Dict{Symbol,AbstractVector}(:y => y)
@@ -186,7 +186,7 @@ end
         s1 ~ Normal(0.0, 2.0)
         s2 ~ Normal(0.0, 2.0)
         w ~ Dirichlet(2, 5.0)
-        y .~ MixtureModel.([Normal.(mu1, s1), Normal.(mu2, s2)], w)
+        y .~ MixtureModel.(vcat.(Normal.(mu1, s1), Normal.(mu2, s2)), Ref(w))
     end""")
     y = [-1.5, -1.2, 0.9, 1.1]
     cols = Dict{Symbol,AbstractVector}(:y => y)

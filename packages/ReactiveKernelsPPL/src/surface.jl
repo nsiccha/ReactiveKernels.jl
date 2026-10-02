@@ -176,7 +176,7 @@ end
 (`@rkppl sm(args...) = begin ... end`; see [`RKPPLSubmodel`](@ref)).
 
 Design-matrix vocabulary (standard-Julia value semantics throughout):
-bind the matrix once (`X = hcat(1, x1, x2)` — the intercept `1` plus
+bind the matrix once (`X = hcat(ones(length(x1)), x1, x2)` — the intercept `ones(length(x))` plus
 bare data/derived columns), use it only as a predictor matmul
 (`mu = X * b`), and size the coefficient vector with an axes prior
 (`b[axes(X, 2)] .~ Normal.(loc, scale)` — scalar args share over
@@ -912,12 +912,12 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
             if s.lhs in data
                 push!(responses,
                     _lower_response(s.lhs, s.rhs, s.range, ctx, predictors,
-                        pred_idx, coefuse))
+                        pred_idx, coefuse; count_columns = s.count_columns))
             elseif s.lhs in ctx.vecdefs
                 _gate_derived_response!(s.lhs, ctx)
                 push!(responses,
                     _lower_response(s.lhs, s.rhs, s.range, ctx, predictors,
-                        pred_idx, coefuse))
+                        pred_idx, coefuse; count_columns = s.count_columns))
             else
                 _sfail(_broadcast_lhs_msg(s.lhs, detshape))
             end
@@ -1520,7 +1520,7 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
     nmat = count(==(:matrix), argshapes)
     if fn === :hcat
         # Design-matrix construction is always matrix-shaped (arg
-        # validation — intercept `1` plus vector columns — lives in
+        # validation — intercept `ones(length(x))` plus vector columns — lives in
         # matrix-def extraction, not here).
         return :matrix
     elseif nmat > 0 && fn !== :*
@@ -4248,6 +4248,16 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                        "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
                        "object owns eta over the whole column)")
             end
+            counts = _multinomial_rows_lhs(st.args[2], bc, data)
+            if counts !== nothing
+                for c in counts
+                    _claim!(seen, seelines, c, line)
+                end
+                _reject_target(st.args[3], counts[1])
+                push!(sample, SampleStmt(counts[1], st.args[3], true,
+                    nothing, nothing, nothing, nothing, nothing, counts[2:end]))
+                continue
+            end
             pl = _per_level_lhs(st.args[2], st.args[3], bc)
             if pl !== nothing
                 plhs, pdims = pl
@@ -4426,11 +4436,11 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
 end
 
 # ── Design-matrix extraction (slice D1) ─────────────────────────────
-# `X = hcat(1, x, ...)` definitions leave `det` for the plan-level
+# `X = hcat(ones(length(x)), x, ...)` definitions leave `det` for the plan-level
 # `matrices` table (the ranef-bucket/spline-basis precedent: special
 # statements lower to plan tables, not kernel assignments). The generator
 # emits each matrix once (`X = Float64.(hcat(...))`); predictor matmuls
-# (`mu = X * b`) reference it by name. Columns are the intercept `1`
+# (`mu = X * b`) reference it by name. Columns are the intercept `ones(length(x))`
 # plus bare data/derived-data columns — latent, scan, parameter, and
 # nested-matrix columns fail closed here; duplicate columns and double
 # intercepts fail in contract validation. Only named definitions are
@@ -4440,6 +4450,46 @@ end
 _is_hcat_def(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
     rhs.args[1] === :hcat
+
+# Only Base's ones/length have this recipe. A same-named module function
+# keeps its own meaning. The length anchor must also be a matrix column:
+# bind validates their equal lengths, so recreating the ones column is exact.
+_base_matrix_call(ex, name, f) =
+    ex isa Expr && ex.head === :call && length(ex.args) == 2 &&
+    (ex.args[1] === name || (ex.args[1] isa GlobalRef &&
+        getfield(ex.args[1].mod, ex.args[1].name) === f))
+
+function _matrix_intercept_anchor(ex)
+    _base_matrix_call(ex, :ones, Base.ones) || return nothing
+    len = ex.args[2]
+    _base_matrix_call(len, :length, Base.length) || return nothing
+    return len.args[2] isa Symbol ? len.args[2] : nothing
+end
+
+function _matrix_columns(nm, args, column)
+    isempty(args) && _sfail("matrix `$nm` calls `hcat` with no columns")
+    anchor = findfirst(a -> a isa Symbol, args)
+    example = anchor === nothing ? "x" : string(args[anchor])
+    cols = Union{Nothing,Symbol}[]
+    for a in args
+        if a isa Number && !(a isa Bool) && a == 1
+            _sfail("matrix `$nm`: scalar `1` is not a vector intercept " *
+                "in Julia's `hcat`; use `ones(length($example))`, or keep " *
+                "the intercept outside the matrix (`X = hcat($example, ...)`; " *
+                "`mu = a .+ X * b`)")
+        elseif a isa Symbol
+            push!(cols, column(a))
+        else
+            c = _matrix_intercept_anchor(a)
+            c !== nothing && c in args || _sfail("matrix `$nm` has a " *
+                "non-column argument $(repr(a)) — use bare vector columns " *
+                "or `ones(length($example))` anchored to one of them; " *
+                "bind richer expressions to a name first")
+            push!(cols, nothing)
+        end
+    end
+    return cols
+end
 
 # Any `hcat` call under `ex` (QuoteNodes opaque — a quoted `:hcat` is
 # not a call).
@@ -4521,25 +4571,8 @@ function _extract_matrices(det, detmap, detshape, data, prior_names,
         rhs = detmap[nm]
         _is_hcat_def(rhs) || (push!(kept, nm => rhs); continue)
         args = rhs.args[2:end]
-        isempty(args) && _sfail("design matrix `$nm = $(repr(rhs))` " *
-                                "calls `hcat` with no columns — a design " *
-                                "matrix needs at least one " *
-                                "(`$nm = hcat(1, x, ...)`)")
-        cols = Union{Nothing,Symbol}[]
-        for a in args
-            if a isa Number && !(a isa Bool) && a == 1
-                push!(cols, nothing)
-            elseif a isa Symbol
-                push!(cols, _matrix_column(nm, a, detshape, detmap, data,
-                    prior_names, plate_names, scans))
-            else
-                _sfail("design matrix `$nm` has a non-column argument " *
-                       "$(repr(a)) — columns are the intercept `1` or " *
-                       "bare data/derived columns " *
-                       "(`$nm = hcat(1, x, ...)`); bind richer " *
-                       "expressions to a name first")
-            end
-        end
+        cols = _matrix_columns(nm, args, c -> _matrix_column(nm, c,
+            detshape, detmap, data, prior_names, plate_names, scans))
         push!(matrices, DesignMatrix(nm, cols, nm))
     end
     # Strays in the remaining definitions: inline `hcat` binds to a name;
@@ -4548,7 +4581,7 @@ function _extract_matrices(det, detmap, detshape, data, prior_names,
     for (nm, rhs) in kept
         _find_hcat(rhs) && _sfail("definition `$nm` calls `hcat` outside " *
                                   "a matrix definition — bind the matrix " *
-                                  "to a name first (`X = hcat(1, x, ...)`)")
+                                  "to a name first (`X = hcat(ones(length(x)), x, ...)`)")
         hit = _find_matrix_use(rhs, matnames)
         hit === nothing || _sfail("definition `$nm` uses design matrix " *
                                   "`$hit` outside a predictor matmul — a " *
@@ -4567,7 +4600,7 @@ function _matrix_column(nm, c, detshape, detmap, data, prior_names,
     if haskey(detmap, c)
         detshape[c] === :vector && return c
         _sfail("design matrix `$nm` over `$c`, which is scalar — " *
-               "matrices take the intercept `1` plus vector columns")
+               "matrices take the intercept `ones(length(x))` plus vector columns")
     end
     c in prior_names && _sfail("design matrix `$nm` over sampled " *
                                "parameter `$c` is not in slice D1 " *
@@ -4580,7 +4613,7 @@ function _matrix_column(nm, c, detshape, detmap, data, prior_names,
                                              "slice D1 (data/derived " *
                                              "columns only)")
     _sfail("design matrix `$nm` over unknown name `$c` — columns are " *
-           "the intercept `1` or bare data/derived columns")
+           "the intercept `ones(length(x))` or bare data/derived columns")
 end
 
 # ── `hcat` matrices read as values ───────────────────────────────────
@@ -4597,7 +4630,7 @@ end
 # Such an `X` lowers exactly like a bound data matrix `X`: `w[axes(X, 2)]`
 # declarations are arrays, `X * w` is the data matrix-vector product, and
 # data-only definitions read the matrix. Both routes use the same matrix
-# (intercept `1` = a ones column), so the density is the same. Any other
+# (intercept `ones(length(x))` = a ones column), so the density is the same. Any other
 # use (`mu = X`, `a .+ X`, `X * s` with `s` a scalar, `X` as a location or
 # scale) keeps the design-matrix route and its refusal.
 
@@ -4704,27 +4737,21 @@ function _matrix_term_prior(rhs, scalar)
 end
 
 # The value matrices' plan records: `bind_data` builds each from its
-# columns (the intercept `1` is a ones column, as in a design matrix), so
-# a column is `1` or a bound data column.
+# columns (the intercept `ones(length(x))` is a ones column, as in a design matrix), so
+# a column is a ones column or a bound data column.
 function _value_design_matrices(defs, data::Set{Symbol})
     out = DesignMatrix[]
     for (nm, rhs) in defs
         args = rhs.args[2:end]
-        isempty(args) && _sfail("matrix `$nm = $rhs` calls `hcat` " *
-                                "with no columns")
-        cols = Union{Nothing,Symbol}[]
-        for a in args
-            if a isa Number && !(a isa Bool) && a == 1
-                push!(cols, nothing)
-            elseif a isa Symbol && a in data
-                push!(cols, a)
-            else
+        cols = _matrix_columns(nm, args, a -> begin
+            if a ∉ data
                 _sfail("matrix `$nm = $rhs` is read as a value, " *
                        "so `bind_data` builds it from its columns: each " *
-                       "is the intercept `1` or a bound data column, got " *
+                       "is a bound vector column, got " *
                        "$(repr(a)) (bind it as data)")
             end
-        end
+            a
+        end)
         push!(out, DesignMatrix(nm, cols, nm))
     end
     return out
@@ -5249,7 +5276,7 @@ function _rewrite_plate_rows(sample, det)
     newdet = Pair{Symbol,Any}[nm => rw(rhs) for (nm, rhs) in det
         if !haskey(rows, nm)]
     newsample = [SampleStmt(s.lhs, rw(s.rhs), s.broadcast, s.range, s.levels,
-        s.matrix, s.dims, s.slices) for s in sample]
+        s.matrix, s.dims, s.slices, s.count_columns) for s in sample]
     return newsample, newdet
 end
 
@@ -5558,6 +5585,21 @@ end
 _sample_lhs(lhs::Symbol, bc, tilde, data,
         level_bindings = Dict{Symbol,Tuple{Symbol,Any}}()) =
     (lhs, nothing, nothing, nothing)
+
+# Each row is one multivariate draw, exactly as in Julia. Only the
+# structural list of category columns is stored; observations stay a loop.
+function _multinomial_rows_lhs(lhs, bc, data)
+    lhs isa Expr && lhs.head === :call && length(lhs.args) == 2 &&
+        lhs.args[1] === :eachrow && _is_hcat_def(lhs.args[2]) || return nothing
+    bc || _sfail("multinomial rows broadcast with `.~`: " *
+        "`eachrow(hcat(c1, c2, ...)) .~ Multinomial.(N, Ref(s))`")
+    cols = lhs.args[2].args[2:end]
+    !isempty(cols) && all(c -> c isa Symbol && c in data, cols) ||
+        _sfail("multinomial rows take bare count data columns: " *
+            "`eachrow(hcat(c1, c2, ...))`, got $(repr(lhs))")
+    return Vector{Symbol}(cols)
+end
+
 function _sample_lhs(lhs, bc, tilde, data, level_bindings)
     lhs isa Expr || _sfail("$tilde left-hand side must be a bare Symbol, " *
                            "a range ref (`y[1:N]`), a levels ref " *
@@ -5994,7 +6036,8 @@ carries the axes of a declared array parameter (`z[1:K] .~ ...`,
 `nothing` otherwise). `slices` marks a multivariate slice declaration
 — `:rows` for `eachrow(B[a, b]) .~ D`, `:cols` for `eachcol(B[a, b]) .~
 D`, `:vector` for `b[ax] ~ D` (each slice one draw of the multivariate
-`D`) — and is `nothing` otherwise."""
+`D`) — and is `nothing` otherwise. `count_columns` carries the tail of
+`eachrow(hcat(c1, c2, ...))`, with `lhs` the lead count column."""
 struct SampleStmt
     lhs::Symbol
     rhs::Any
@@ -6004,7 +6047,10 @@ struct SampleStmt
     matrix::Union{Nothing,Symbol}
     dims::Union{Nothing,Vector{Any}}
     slices::Union{Nothing,Symbol}
+    count_columns::Union{Nothing,Vector{Symbol}}
 end
+SampleStmt(lhs::Symbol, rhs, broadcast::Bool, range, levels, matrix, dims, slices) =
+    SampleStmt(lhs, rhs, broadcast, range, levels, matrix, dims, slices, nothing)
 SampleStmt(lhs::Symbol, rhs, broadcast::Bool, range, levels, matrix, dims) =
     SampleStmt(lhs, rhs, broadcast, range, levels, matrix, dims, nothing)
 SampleStmt(lhs::Symbol, rhs, broadcast::Bool, range, levels, matrix) =
@@ -7094,17 +7140,20 @@ function _broadcast_lhs_msg(lhs::Symbol, detshape)
         "(scalar parameters use `~`)"
 end
 
-function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
+function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse;
+        count_columns = nothing)
     dotted = _desugar_fused_head(lhs, rhs)
     call = _dot2call_response(lhs, dotted)
     weights, call = _peel_weighted(lhs, call, ctx)
     evidence, call = _peel_evidence(lhs, call, ctx)
+    count_columns === nothing || call.args[1] === :Multinomial ||
+        _sfail("response $lhs: count rows use `Multinomial.(N, Ref(s))`")
     call.args[1] === :MixtureModel && return _lower_mixture_response(lhs,
         call, range, weights, evidence, ctx, predictors, pred_idx, coefuse)
     if call.args[1] in (:CategoricalLogit, :OrderedLogistic, :Ordinal,
             :Multinomial, :Categorical)
         return _lower_leveled_response(lhs, call, range, weights, evidence,
-            ctx, predictors, pred_idx, coefuse)
+            ctx, predictors, pred_idx, coefuse; count_columns)
     end
     family, lik_link, pred_link, loc, scale_raw, trials, nu_raw, zi_raw,
     interval_raw = _lower_response_base(lhs, call, ctx)
@@ -7145,7 +7194,7 @@ function _mixture_component_context(thunk, lhs, k::Int)
     end
 end
 
-# `y .~ MixtureModel.([C1, ..., CK], w)` — K same-family univariate
+# `y .~ MixtureModel.(vcat.(C1, ..., CK), Ref(w))` — K same-family univariate
 # components + mixing weights (SB `MixtureModel` mirror). Each component
 # lowers through the single-family base spelling (decomposed twin:
 # predictors wrapped, params/literals bare); locations route to predictors
@@ -7163,12 +7212,18 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         "range (v1 — mixtures cover the whole column)")
     args = _plain_args(call, "`MixtureModel`")
     length(args) == 2 || _sfail("response $lhs: `MixtureModel` takes " *
-        "`MixtureModel.([C1, ..., CK], w)` (a component vector + weights)")
+        "`MixtureModel.(vcat.(C1, ..., CK), Ref(w))` " *
+        "(per-observation component vectors + shared weights)")
     comps, wraw = args
-    comps isa Expr && comps.head === :vect || _sfail("response $lhs: " *
-        "`MixtureModel` components ride a vector literal " *
-        "(`[Normal.(mu1, s1), Normal.(mu2, s2)]`), got $(repr(comps))")
-    K = length(comps.args)
+    _is_dotted_call(comps) && comps.args[1] === :vcat ||
+        _sfail("response $lhs: `MixtureModel` needs per-observation " *
+            "component vectors; use `MixtureModel.(vcat.(Normal.(mu1, s), " *
+            "Normal.(mu2, s)), Ref(w))`, got $(repr(comps))")
+    _is_ref_call(wraw) || _sfail("response $lhs: mixture weights are " *
+        "shared as a vector — use `Ref(w)` in `MixtureModel.(..., Ref(w))`")
+    wraw = wraw.args[2]
+    components = comps.args[2].args
+    K = length(components)
     K >= 1 || _sfail("response $lhs: `MixtureModel` needs ≥ 1 component")
     fams = LikelihoodFamily[]
     llinks = LinkFunction[]
@@ -7177,7 +7232,7 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
     scales_raw = Any[]
     trials_raw = Any[]
     wrappeds = Bool[]
-    for (k, c) in enumerate(comps.args)
+    for (k, c) in enumerate(components)
         c isa Expr && c.head === :. && length(c.args) == 2 &&
             c.args[1] isa Symbol || _sfail("response $lhs: mixture " *
             "component $k is not a distribution call " *
@@ -7497,7 +7552,7 @@ const _LEVELED_FAMS =
     (:CategoricalLogit, :OrderedLogistic, :Ordinal, :Multinomial, :Categorical)
 
 function _lower_leveled_response(lhs, call, range, weights, evidence, ctx,
-        predictors, pred_idx, coefuse)
+        predictors, pred_idx, coefuse; count_columns = nothing)
     fam = call.args[1]
     label = Symbol(lhs, "_resp")
     if fam === :CategoricalLogit
@@ -7511,7 +7566,7 @@ function _lower_leveled_response(lhs, call, range, weights, evidence, ctx,
             label, ctx, predictors, pred_idx, coefuse)
     elseif fam === :Multinomial
         return _lower_multinomial_response(lhs, call, range, weights,
-            evidence, label, ctx)
+            evidence, label, ctx; count_columns)
     else
         return _lower_categorical_response(lhs, call, range, weights,
             evidence, label, ctx)
@@ -7680,18 +7735,21 @@ function _ordinal_effects_source(lhs, arg, ctx)
     return name
 end
 
-# Shared-simplex multinomial: `c1 .~ Multinomial.(N, s, c2, ..., cK)` —
+# Shared-simplex multinomial:
+# `eachrow(hcat(c1, ..., cK)) .~ Multinomial.(N, Ref(s))` —
 # the lead count column (LHS) plus the K−1 tail count columns, trials N
 # (Int literal or column), and the simplex parameter `s`
 # (`s ~ Dirichlet(...)` elsewhere in the model).
 function _lower_multinomial_response(lhs, call, range, weights, evidence,
-        label, ctx)
+        label, ctx; count_columns = nothing)
     args = _plain_args(call, "`Multinomial`")
-    length(args) >= 2 || _sfail("response $lhs: `Multinomial` takes " *
-                                "`c1 .~ Multinomial.(N, s, c2, ..., cK)` " *
-                                "(trials, simplex, tail count columns)")
+    count_columns !== nothing && length(args) == 2 && _is_ref_call(args[2]) ||
+        _sfail("response $lhs: observe count rows with " *
+            "`eachrow(hcat(c1, c2, ...)) .~ Multinomial.(N, Ref(s))`; " *
+            "the two distribution arguments are trials and a shared " *
+            "simplex vector")
     trials = _lower_trials(lhs, args[1], ctx)
-    s = args[2]
+    s = args[2].args[2]
     s isa Symbol || _sfail("response $lhs: multinomial probs $s must be " *
                            "a simplex parameter name " *
                            "(`s ~ Dirichlet(...)` in the model)")
@@ -7699,22 +7757,17 @@ function _lower_multinomial_response(lhs, call, range, weights, evidence,
                                       "$s is a design matrix — probs are a " *
                                       "simplex parameter " *
                                       "(`s ~ Dirichlet(...)` in the model)")
-    tail = args[3:end]
-    for c in tail
-        c isa Symbol || _sfail("response $lhs: multinomial tail column " *
-                               "$(repr(c)) must be a data column name")
-    end
     return LikelihoodSpec(MultinomialFam, IdentityLink, lhs, s,
         nothing, weights, evidence, label, trials, range;
-        count_columns = Vector{Symbol}(tail))
+        count_columns = count_columns)
 end
 
-# Plain categorical over simplex probabilities: `y .~ Categorical.(s)`.
+# Plain categorical over simplex probabilities: `y .~ Categorical(s)`.
 function _lower_categorical_response(lhs, call, range, weights, evidence,
         label, ctx)
     args = _plain_args(call, "`Categorical`")
     length(args) == 1 || _sfail("response $lhs: `Categorical` takes " *
-                                "`y .~ Categorical.(s)` (a simplex parameter)")
+                                "`y .~ Categorical(s)` (a simplex parameter)")
     s = only(args)
     s isa Symbol || _sfail("response $lhs: categorical probs $s must be " *
                            "a simplex parameter name " *
@@ -7910,6 +7963,8 @@ function _desugar_fused_base(lhs, f, targs)
 end
 
 function _dot2call_response(lhs, rhs)
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+        rhs.args[1] === :Categorical && return rhs
     rhs isa Expr && rhs.head === :. ||
         return _dot2call_object_error(lhs, rhs)
     length(rhs.args) == 2 && rhs.args[1] isa Symbol &&
@@ -7921,6 +7976,9 @@ function _dot2call_response(lhs, rhs)
         "response $lhs: dotted objects take positional arguments " *
         "only (no keywords)")
     f = rhs.args[1]
+    f === :Categorical && _sfail("response $lhs: `Categorical.(s)` " *
+        "broadcasts over scalar probabilities; share the vector distribution " *
+        "with `y .~ Categorical(s)`")
     return Expr(:call, f, _dot2call_spine_args(lhs, f, targs)...)
 end
 
@@ -7982,6 +8040,10 @@ function _dot2call_spine_arg(lhs, f, i, a)
 end
 
 function _dot2call_nested_object(lhs, a)
+    # A categorical distribution shares its whole simplex at every
+    # wrapper level, just as it does directly under the dotted tilde.
+    a isa Expr && !isempty(a.args) && a.args[1] === :Categorical &&
+        return _dot2call_response(lhs, a)
     a isa Expr && a.head === :. && length(a.args) == 2 &&
         a.args[1] isa Symbol && a.args[2] isa Expr &&
         a.args[2].head === :tuple ||
@@ -7996,7 +8058,7 @@ function _dot2call_nested_object(lhs, a)
 end
 
 function _dot2call_nested_link(lhs, a, base)
-    want = (base === :Bernoulli || base === :Binomial) ? "logistic/probit/cloglog" :
+    want = (base === :Bernoulli || base === :Binomial) ? "logistic/normcdf/cexpexp" :
         (base === :Beta || base === :BetaBinomial2) ? "logistic" : "exp"
     a isa Expr && a.head === :. && length(a.args) == 2 &&
         a.args[1] isa Symbol && a.args[2] isa Expr &&
@@ -8092,10 +8154,10 @@ end
 const _RESPONSE_BASE_MSG =
     "response distribution must be `Normal.(mu, sigma)`, " *
     "`StudentT.(nu, mu, sigma)`, " *
-    "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link, " *
+    "`Bernoulli.(logistic.(eta))` (or `normcdf`/`cexpexp` for the inverse link, " *
     "or bare `Bernoulli.(theta)` over a sampled parameter), " *
     "`Poisson.(exp.(eta))` (or bare `Poisson.(lambda)` over a sampled " *
-    "parameter), `Binomial.(n, logistic.(mu))` (or `probit`/`cloglog` " *
+    "parameter), `Binomial.(n, logistic.(mu))` (or `normcdf`/`cexpexp` " *
     "for the link, or bare `Binomial.(n, theta)` over a sampled " *
     "parameter), " *
     "`NegativeBinomial2.(exp.(eta), phi)`, " *
@@ -8113,7 +8175,8 @@ const _RESPONSE_BASE_MSG =
     "`LogNormal.(mu, sigma)`, " *
     "`CategoricalLogit.(eta_2, ..., eta_K)`, `OrderedLogistic.(eta)`, " *
     "`Ordinal.(Cumulative(), LogitLink(), eta)`, " *
-    "`Multinomial.(N, s, c2, ..., cK)`, or `Categorical.(s)` " *
+    "`Multinomial.(N, Ref(s))` over `eachrow(hcat(c1, ...))`, " *
+    "or `Categorical(s)` " *
     "(or the fused heads `BernoulliLogit.(eta)`, `PoissonLog.(eta)`, " *
     "`BinomialLogit.(n, mu)`, `NegativeBinomial2Log.(eta, phi)`, " *
     "`GammaLog.(alpha, eta)`, `BetaLogit.(mu, kappa)`, which lower " *
@@ -8153,7 +8216,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         nothing, args[1], nothing, nothing
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
-                                    "`Bernoulli.(logistic.(eta))` (or `probit`/`cloglog` for the link)")
+                                    "`Bernoulli.(logistic.(eta))` (or `normcdf`/`cexpexp` for the inverse link)")
         if args[1] isa Symbol && !haskey(ctx.detmap, args[1])
             # Bare sampled parameter (constrained-scale, no link
             # inversion): the mixture bare-mean triple. A deterministic
@@ -8168,7 +8231,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         nothing
     elseif fam === :Binomial
         length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
-                                    "`Binomial.(n, logistic.(mu))` (or `probit`/`cloglog` for the link)")
+                                    "`Binomial.(n, logistic.(mu))` (or `normcdf`/`cexpexp` for the inverse link)")
         if args[2] isa Symbol && !haskey(ctx.detmap, args[2])
             # Bare sampled parameter (constrained-scale): the mixture
             # bare-mean triple. A deterministic definition is a
@@ -8462,26 +8525,28 @@ end
 # wrappers fail here (the spine converter is wrapper-generic).
 const _BERNOULLI_LINKS = Dict{Symbol,Tuple{LikelihoodFamily,LinkFunction}}(
     :logistic => (BernoulliLogitFam, LogitLink),
-    :probit => (BernoulliProbitFam, ProbitLink),
-    :cloglog => (BernoulliCloglogFam, CloglogLink),
+    :normcdf => (BernoulliProbitFam, ProbitLink),
+    :cexpexp => (BernoulliCloglogFam, CloglogLink),
 )
 const _BINOMIAL_LINKS = Dict{Symbol,Tuple{LikelihoodFamily,LinkFunction}}(
     :logistic => (BinomialLogitFam, LogitLink),
-    :probit => (BinomialProbitFam, ProbitLink),
-    :cloglog => (BinomialCloglogFam, CloglogLink),
+    :normcdf => (BinomialProbitFam, ProbitLink),
+    :cexpexp => (BinomialCloglogFam, CloglogLink),
 )
 
 function _lower_bernoulli_link(lhs, arg)
+    _reject_legacy_inverse_link(lhs, arg)
     arg isa Expr && arg.head === :call && !isempty(arg.args) &&
         haskey(_BERNOULLI_LINKS, arg.args[1]) ||
         _sfail("response $lhs: `Bernoulli` takes a link wrapper " *
-               "(`logistic.(eta)`, `probit.(eta)`, or `cloglog.(eta)`), " *
+               "(`logistic.(eta)`, `normcdf.(eta)`, or `cexpexp.(eta)`), " *
                "got $(repr(arg))")
     fam, link = _BERNOULLI_LINKS[arg.args[1]]
     return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
 end
 
 function _lower_binomial_link(lhs, arg)
+    _reject_legacy_inverse_link(lhs, arg)
     # Bare prob (a Beta-sampled parameter, constrained-scale — the
     # mixture bare-mean precedent): prob-space Binomial, no link.
     if arg isa Symbol || arg isa Real
@@ -8490,11 +8555,24 @@ function _lower_binomial_link(lhs, arg)
     arg isa Expr && arg.head === :call && !isempty(arg.args) &&
         haskey(_BINOMIAL_LINKS, arg.args[1]) ||
         _sfail("response $lhs: `Binomial` probability takes a link wrapper " *
-               "(`logistic.(mu)`, `probit.(mu)`, or `cloglog.(mu)`) or a " *
+               "(`logistic.(mu)`, `normcdf.(mu)`, or `cexpexp.(mu)`) or a " *
                "bare Beta parameter (`theta ~ Beta(...)`), " *
                "got $(repr(arg))")
     fam, link = _BINOMIAL_LINKS[arg.args[1]]
     return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
+end
+
+const _LEGACY_INVERSE_LINKS = Dict(
+    :probit => (:normcdf, "probit names the inverse normal CDF, not the normal CDF"),
+    :cloglog => (:cexpexp, "cloglog is the link log(-log(1-p)), not its inverse"),
+)
+
+function _reject_legacy_inverse_link(lhs, arg)
+    arg isa Expr && arg.head === :call && !isempty(arg.args) || return nothing
+    replacement = get(_LEGACY_INVERSE_LINKS, arg.args[1], nothing)
+    replacement === nothing && return nothing
+    inverse, reason = replacement
+    _sfail("response $lhs: $reason; use `$inverse.(eta)`")
 end
 
 # Prob-space Binomial-family location: a sampled parameter name (the Beta
@@ -9937,7 +10015,7 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
     expanded = _inline_structure(rhs, ctx, Set{Symbol}([pname]), where)
     _find_hcat(expanded) && _sfail(
         "predictor $pname calls `hcat` outside a matrix definition — " *
-        "bind the matrix to a name first (`X = hcat(1, x, ...)`)")
+        "bind the matrix to a name first (`X = hcat(ones(length(x)), x, ...)`)")
     _reject_unknown_calls(where, expanded)
     canon = _canonical_expr(expanded, ctx.data, ctx.detmap, ctx.detshape,
         ctx.shape_env, where)
@@ -10244,7 +10322,7 @@ function _classify_matmul(pname, core::Expr, sign::Int, ctx)
         Smat === nothing && _sfail("predictor $pname: coefficient " *
                                    "vector `$r` is sized by `$S`, which is " *
                                    "not a design matrix " *
-                                   "(`$S = hcat(1, x, ...)`)")
+                                   "(`$S = hcat(ones(length(x)), x, ...)`)")
         length(Smat.columns) == K || _sfail(
             "predictor $pname: coefficient vector `$r` has " *
             "$(length(Smat.columns)) elements (sized by `$S`) but matrix " *
@@ -11663,7 +11741,7 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
         end
         rhs === s.rhs && continue
         sample[i] = SampleStmt(s.lhs, rhs, s.broadcast, s.range, s.levels,
-            s.matrix)
+            s.matrix, s.dims, s.slices, s.count_columns)
     end
     for (i, (nm, rhs, rng, line)) in enumerate(plate_specs)
         new = hoist_call(nm, rhs)

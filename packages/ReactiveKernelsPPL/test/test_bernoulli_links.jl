@@ -75,26 +75,26 @@ function _links_reactant_progs()
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             eta = a .+ b .* x
-            y .~ Bernoulli.(probit.(eta))
+            y .~ Bernoulli.(normcdf.(eta))
         end, Dict{Symbol,AbstractVector}(:y => _LINKS_Y8, :x => _LINKS_X8)),
         ("bernoulli-cloglog", quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             eta = a .+ b .* x
-            y .~ Bernoulli.(cloglog.(eta))
+            y .~ Bernoulli.(cexpexp.(eta))
         end, Dict{Symbol,AbstractVector}(:y => _LINKS_Y8, :x => _LINKS_X8)),
         ("binomial-probit", quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             mu = a .+ b .* x
-            y .~ Binomial.(n, probit.(mu))
+            y .~ Binomial.(n, normcdf.(mu))
         end, Dict{Symbol,AbstractVector}(:y => [1, 0, 2, 1, 3, 1, 0, 2],
             :x => _LINKS_X8, :n => [3, 2, 4, 3, 5, 4, 2, 3])),
         ("binomial-cloglog", quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             mu = a .+ b .* x
-            y .~ Binomial.(n, cloglog.(mu))
+            y .~ Binomial.(n, cexpexp.(mu))
         end, Dict{Symbol,AbstractVector}(:y => [1, 0, 2, 1, 3, 1, 0, 2],
             :x => _LINKS_X8, :n => [3, 2, 4, 3, 5, 4, 2, 3])),
     ]
@@ -147,13 +147,13 @@ function _links_parity_progs()
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             eta = a .+ b .* x
-            y .~ Bernoulli.(probit.(eta))
+            y .~ Bernoulli.(normcdf.(eta))
         end, (eta, yy) -> sum(logpdf.(Bernoulli.(cdf.(Ref(Normal()), eta)), yy))),
         ("cloglog", quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             eta = a .+ b .* x
-            y .~ Bernoulli.(cloglog.(eta))
+            y .~ Bernoulli.(cexpexp.(eta))
         end, (eta, yy) -> sum(logpdf.(Bernoulli.(1 .- exp.(-exp.(eta))), yy))),
     ]
 end
@@ -232,14 +232,14 @@ _links_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
-                y .~ Binomial.(n, probit.(mu))
+                y .~ Binomial.(n, normcdf.(mu))
             end, -141.05985441626325,
             [12.6379028940814, -9.979531779005764]),
             ("cloglog", cc, quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
-                y .~ Binomial.(n, cloglog.(mu))
+                y .~ Binomial.(n, cexpexp.(mu))
             end, -115.99032528998896,
             [-15.62227803566569, -17.65335024052007]),
         ]

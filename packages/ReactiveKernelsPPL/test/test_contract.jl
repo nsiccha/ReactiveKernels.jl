@@ -604,12 +604,12 @@ end
     # refused: non-numeric StudentT response (wrong eltype)
     @test_throws ContractValidationError validate_plan(bad)
     # Evidence wrappers admit Gaussian/Poisson/StudentT (slice 1):
-    # StudentT + truncated validates (the Gaussian clamp law over the
-    # `student_t` cdf).
+    # StudentT + truncated validates for data inside its support.
     good = _student_plan()
     good.responses[1] =
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
             ResponseEvidence(:truncated, -1.0, 1.0), :y_resp, nothing, nothing; nu = :nu)
+    good.columns[:y] = zeros(9)
     @test validate_plan(good) === nothing
     # Other families stay fail-closed at the evidence gate.
     bad = _hurdle_plan()

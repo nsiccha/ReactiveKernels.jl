@@ -289,7 +289,7 @@ end
     names = _ls_names(cols)
     # Read only as `X * b` with a coefficient prior: the design-matrix route.
     term = lower_rkppl(quote
-            X = hcat(1, x1, x2)
+            X = hcat(ones(length(x1)), x1, x2)
             b[axes(X, 2)] .~ Normal.(0, 2)
             mu = X * b
             sigma ~ Exponential(1.0)
@@ -301,7 +301,7 @@ end
     # column, as in the design matrix), with the same density as the same
     # program over a bound data matrix.
     valued = quote
-        X = hcat(1, x1, x2)
+        X = hcat(ones(length(x1)), x1, x2)
         v = var.(eachcol(X))
         b[axes(X, 2)] .~ Normal.(0, 1 .+ v)
         mu = X * b

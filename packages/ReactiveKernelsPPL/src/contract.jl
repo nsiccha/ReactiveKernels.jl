@@ -1659,7 +1659,7 @@ end
 Ordered level values sizing one full-rank factor term: `values` is the
 coefficient position↔level mapping (binder-evaluated from the grouping
 column, `[]` pre-bind). `source` is the levels function (`:levels`
-only). `subset` selects from `sort(unique(column))`: `:` (full cover),
+only). `subset` selects from `DataAPI.levels(column)`: `:` (full cover),
 a literal `UnitRange{Int}`, a literal `Vector{Int}` of positions, or
 `(lo, :end)`. Keyed by `(predictor, column)` — one map per factor term.
 """
@@ -1674,7 +1674,7 @@ end
 """
     DesignMatrix(name, columns, label)
 
-One user-bound design matrix (`X = hcat(1, x1, x2)`): `columns` in hcat
+One user-bound design matrix (`X = hcat(ones(length(x1)), x1, x2)`): `columns` in hcat
 order, `nothing` marking intercept-ones positions. Data/derived columns
 only (length-n by bind/construction); latent, scan, parameter, and
 nested-matrix names are rejected — the SB `me` mirror stays affine and
@@ -7041,19 +7041,10 @@ function _validate_monotonic_columns(t::TermSpec, plan::StructuralPlan)
     return nothing
 end
 
-"""Grouping levels for a raw factor column: sort-ordered uniques, with
-non-`String` strings (e.g. `CategoricalString`) and categorical values
-normalized via `string` (zero-dep duck-typing — `String`/`Number`/`Symbol`/
-`Bool`/`Char` behavior is unchanged)."""
-function _grouping_levels(col::AbstractVector)
-    isempty(col) && return []
-    v = first(col)
-    if (v isa AbstractString && !isa(v, String)) ||
-            string(nameof(typeof(v))) == "CategoricalValue"
-        return sort!(unique!(string.(col)))
-    end
-    return sort(unique(col))
-end
+"""Julia grouping levels, including a categorical column's pool order and
+unobserved levels. Copy the result so binder-owned metadata never aliases
+caller-owned pool storage. DataAPI's plain-vector fallback sorts uniques."""
+_grouping_levels(col::AbstractVector) = Vector(DataAPI.levels(col))
 
 # One map per factor term, keyed (predictor, column), so a factor lookup
 # resolves to exactly one map.
@@ -7112,8 +7103,8 @@ function _validate_subset_shape(m::LevelMap)
     return nothing
 end
 
-# Binder evaluation: sort-ordered uniques, then the subset selection
-# (bounds-checked against the observed count).
+# Binder evaluation: Julia levels, then the subset selection
+# (bounds-checked against the pool count).
 function _eval_levelmaps(levelmaps::Vector{LevelMap},
         columns::AbstractDict{Symbol})
     out = LevelMap[]
@@ -9333,9 +9324,16 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
             _fail(r.label, "interval evidence requires response < upper every row")
         return nothing
     end
-    (lo === nothing || hi === nothing) && return nothing
-    all(lo .< hi) ||
+    (lo === nothing || hi === nothing || all(lo .< hi)) ||
         _fail(r.label, "evidence requires strict lower < upper every row")
+    resp = _vector_column(plan.columns, r.response, r.label, "response")
+    bad = findall(eachindex(resp)) do i
+        (lo !== nothing && resp[i] < lo[i]) ||
+            (hi !== nothing && resp[i] > hi[i])
+    end
+    isempty(bad) || _fail(r.label,
+        "response $(r.response) is outside its $(ev.kind) bounds " *
+        "at rows $(join(bad, ", ")) (requires lower ≤ response ≤ upper)")
     return nothing
 end
 
@@ -10568,7 +10566,7 @@ end
 
 # Value matrices (`_value_design_matrix_names`): each binds under
 # its name as `Float64.(hcat(...))` of its bound columns, a ones column at
-# the intercept `1` (the design-matrix meaning).
+# the intercept `ones(length(x))` (the design-matrix meaning).
 function _materialize_value_matrices!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData})
     names = _value_design_matrix_names(plan)

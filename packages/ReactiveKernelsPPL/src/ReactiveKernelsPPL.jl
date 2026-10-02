@@ -14,6 +14,7 @@ BRM–RK backend plan; the emitter→layer input contract lives in
 module ReactiveKernelsPPL
 
 using ReactiveKernels
+import DataAPI
 import SpecialFunctions
 using SpecialFunctions: erfc, loggamma
 using LogExpFunctions: logaddexp

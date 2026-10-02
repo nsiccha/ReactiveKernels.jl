@@ -31,7 +31,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
         mu2 ~ Normal(0.0, 2.0)
         sigma ~ Exponential(1.0)
         theta ~ Beta(5.0, 5.0)
-        y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)], [theta, 1.0 - theta])
+        y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([theta, 1.0 - theta]))
     end"""), (:y,))
     r = only(plan.responses)
     @test r.family === MixtureFam
@@ -44,7 +44,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
         mu2 ~ Normal(0.0, 2.0)
         sigma ~ Exponential(1.0)
         theta ~ Beta(5.0, 5.0)
-        y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)], [1.0 - theta, theta])
+        y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([1.0 - theta, theta]))
     end"""), (:y,))
     rr = only(rplan.responses)
     @test rr.mixture_weights == MixtureComplementWeights(:theta, false)
@@ -57,7 +57,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
         sigma ~ Exponential(1.0)
         a ~ Beta(2.0, 2.0)
         b ~ Beta(2.0, 2.0)
-        y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)], [a, b])
+        y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([a, b]))
     end"""), (:y,))
 
     # Non-unit params fail at contract.
@@ -68,7 +68,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
             mu2 ~ Normal(0.0, 2.0)
             sigma ~ Exponential(1.0)
             s ~ Exponential(1.0)
-            y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)], [s, 1.0 - s])
+            y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([s, 1.0 - s]))
         end"""), (:y,)),
         Dict{Symbol,AbstractVector}(:y => [0.5, -1.0]))
 
@@ -81,7 +81,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
             mu3 ~ Normal(0.0, 2.0)
             sigma ~ Exponential(1.0)
             theta ~ Beta(5.0, 5.0)
-            y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma), Normal.(mu3, sigma)], [theta, 1.0 - theta])
+            y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma), Normal.(mu3, sigma)), Ref([theta, 1.0 - theta]))
         end"""), (:y,)),
         Dict{Symbol,AbstractVector}(:y => [0.5, -1.0]))
 end
@@ -96,7 +96,7 @@ _mixc_lse(a, b) = max(a, b) + log1p(exp(-abs(a - b)))
         sigma1 ~ Exponential(1.0)
         sigma2 ~ Exponential(1.0)
         theta ~ Beta(5.0, 5.0)
-        y .~ MixtureModel.([Normal.(mu1, sigma1), Normal.(mu2, sigma2)], [theta, 1.0 - theta])
+        y .~ MixtureModel.(vcat.(Normal.(mu1, sigma1), Normal.(mu2, sigma2)), Ref([theta, 1.0 - theta]))
     end""")
     cols = Dict{Symbol,AbstractVector}(:y => [0.5, -1.0, 2.0])
     _, _, kern, lay = _mixc_query(prog, cols)
@@ -117,7 +117,7 @@ end
         sigma1 ~ Exponential(1.0)
         sigma2 ~ Exponential(1.0)
         theta ~ Beta(5.0, 5.0)
-        y .~ MixtureModel.([Normal.(mu1, sigma1), Normal.(mu2, sigma2)], [theta, 1.0 - theta])
+        y .~ MixtureModel.(vcat.(Normal.(mu1, sigma1), Normal.(mu2, sigma2)), Ref([theta, 1.0 - theta]))
     end""")
     cols = Dict{Symbol,AbstractVector}(:y => [0.5, -1.0, 2.0])
     plan = lower_rkppl(prog, keys(cols))
@@ -159,7 +159,7 @@ end
         sigma1 ~ Exponential(1.0)
         sigma2 ~ Exponential(1.0)
         theta ~ Beta(5.0, 5.0)
-        y .~ MixtureModel.([Normal.(mu1, sigma1), Normal.(mu2, sigma2)], [theta, 1.0 - theta])
+        y .~ MixtureModel.(vcat.(Normal.(mu1, sigma1), Normal.(mu2, sigma2)), Ref([theta, 1.0 - theta]))
     end""")
     fx = _mixc_reactant(prog,
         Dict{Symbol,AbstractVector}(:y => [0.5, -1.0, 2.0]))

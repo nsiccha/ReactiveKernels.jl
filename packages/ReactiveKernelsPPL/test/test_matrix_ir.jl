@@ -224,7 +224,7 @@ end
     @test_throws ContractValidationError validate_data(bad)
 end
 
-# D2 surface: `X = hcat(1, x, ...)` definitions lower to the plan
+# D2 surface: `X = hcat(ones(length(x)), x, ...)` definitions lower to the plan
 # table, `mu = X * b` matmuls to MatrixTerms, and
 # `b[axes(X, 2)] .~ Normal.(...)` to per-element priors. Every
 # non-matmul matrix position fails loudly naming the spelling.
@@ -244,7 +244,7 @@ end
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(0, 1)
         sigma ~ Exponential(1)
-        X = hcat(1, x1, x2)
+        X = hcat(ones(length(x1)), x1, x2)
         mu = X * b
         y .~ Normal.(mu, sigma)
     end, (:y, :x1, :x2))
@@ -265,7 +265,7 @@ end
     # Per-element literal priors (real broadcast semantics).
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.([0, 0, 0], [1, 2, 3])
-        X = hcat(1, x1, x2)
+        X = hcat(ones(length(x1)), x1, x2)
         mu = X * b
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1, :x2))
@@ -275,7 +275,7 @@ end
     # Sized declarations keep their ordinary array priors.
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(0, 1)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = X * b
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1))
@@ -295,7 +295,7 @@ end
     # Dotted negation, disjoint matrices, reuse, factor combo.
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(0, 1)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = .-(X * b)
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1))
@@ -303,7 +303,7 @@ end
     # Undotted negation folds the sign (affine unary-minus precedent).
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(1.0, 2.0)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = -(X * b)
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1))
@@ -313,7 +313,7 @@ end
     plan = lower_rkppl(quote
         b1[axes(X, 2)] .~ Normal.(0, 1)
         b2[axes(Y, 2)] .~ Normal.(0, 1)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         Y = hcat(x2)
         mu = X * b1 .+ Y * b2
         y .~ Normal.(mu, 1.0)
@@ -323,7 +323,7 @@ end
     plan = lower_rkppl(quote
         b1[axes(X, 2)] .~ Normal.(0, 1)
         b2[axes(X, 2)] .~ Normal.(0, 1)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = X * b1
         nu = X * b2
         y .~ Normal.(mu, 1.0)
@@ -343,16 +343,16 @@ end
     # Links, inline locations, leveled responses, submodel streams.
     for ast in (quote
         b[axes(X, 2)] .~ Normal.(0, 1)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = X * b
         y .~ Bernoulli.(logistic.(mu))
     end, quote
         b[axes(X, 2)] .~ Normal.(0, 1)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         y .~ Normal.(X * b, 1.0)
     end, quote
         b[axes(X, 2)] .~ Normal.(0, 1)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = X * b
         y .~ CategoricalLogit.(mu)
     end)
@@ -360,7 +360,7 @@ end
     end
     m = @rkppl begin
         b[axes(X, 2)] .~ Normal.(0, 1)
-        X = hcat(1, x)
+        X = hcat(ones(length(x)), x)
         mu = X * b
         y ~ _mx_stream(mu, 1.0)
     end
@@ -371,14 +371,14 @@ end
     D = (:y, :x1)
     cases = [
         ("no columns", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("nests matrix", quote b[axes(Y, 2)] .~ Normal.(0, 1); X = hcat(1, x1); Y = hcat(X, x1); mu = Y * b; y .~ Normal.(mu, 1.0) end),
+        ("nests matrix", quote b[axes(Y, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); Y = hcat(X, x1); mu = Y * b; y .~ Normal.(mu, 1.0) end),
         ("which is scalar", quote b[axes(X, 2)] .~ Normal.(0, 1); s = 1.0; X = hcat(s, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         ("over sampled parameter", quote b[axes(X, 2)] .~ Normal.(0, 1); s ~ Normal(0, 1); X = hcat(s, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("over unknown name", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, foo); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("over unknown name", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(foo)), foo); mu = X * b; y .~ Normal.(mu, 1.0) end),
         ("non-column argument", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(2, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("outside a matrix definition", quote b[1:2] .~ Normal.(0, 1); mu = hcat(1, x1) * b; y .~ Normal.(mu, 1.0) end),
-        ("never used in a predictor matmul", quote X = hcat(1, x1); mu = a .+ c .* x1; a ~ Normal(0, 1); c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
-        ("never used in a predictor", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = a .+ c .* x1; a ~ Normal(0, 1); c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
+        ("outside a matrix definition", quote b[1:2] .~ Normal.(0, 1); mu = hcat(ones(length(x1)), x1) * b; y .~ Normal.(mu, 1.0) end),
+        ("never used in a predictor matmul", quote X = hcat(ones(length(x1)), x1); mu = a .+ c .* x1; a ~ Normal(0, 1); c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
+        ("never used in a predictor", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = a .+ c .* x1; a ~ Normal(0, 1); c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
     ]
     for (msg, ast) in cases
         err = _mx_err(ast, D)
@@ -397,18 +397,18 @@ end
     D = (:y, :x1, :x2)
     Dz = (:y, :z, :x1)
     cases = [
-        (D, "needs a bare 2-element coefficient vector", quote X = hcat(1, x1); mu = X * x1; y .~ Normal.(mu, 1.0) end),
-        (D, "is a sampled name", quote s ~ Normal(0, 1); X = hcat(1, x1); mu = X * s; y .~ Normal.(mu, 1.0) end),
-        (D, "is a sampled name", quote b ~ Normal(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        (D, "is a design matrix", quote X = hcat(1, x1); Y = hcat(x2); y .~ Normal.(X * Y, 1.0) end),
-        (D, "got 2", quote X = hcat(1, x1); y .~ Normal.(X * 2, 1.0) end),
-        (D, "has 2 elements (sized by `S`) but matrix `X` has 3 columns", quote b[axes(S, 2)] .~ Normal.(0, 1); S = hcat(1, x1); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        (D, "sized by `Z`, which is not a design matrix", quote b[axes(Z, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        (Dz, "shared across predictors", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; nu = X * b; y .~ Normal.(mu, 1.0); z .~ Normal.(nu, 1.0) end),
-        (D, "literal scaling of a matmul", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = 2 * (X * b); y .~ Normal.(mu, 1.0) end),
-        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = x2 .* (X * b); y .~ Normal.(mu, 1.0) end),
-        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = exp.(X * b); y .~ Normal.(mu, 1.0) end),
-        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); s ~ Exponential(1); X = hcat(1, x1); mu = s .* (X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "needs a bare 2-element coefficient vector", quote X = hcat(ones(length(x1)), x1); mu = X * x1; y .~ Normal.(mu, 1.0) end),
+        (D, "is a sampled name", quote s ~ Normal(0, 1); X = hcat(ones(length(x1)), x1); mu = X * s; y .~ Normal.(mu, 1.0) end),
+        (D, "is a sampled name", quote b ~ Normal(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        (D, "is a design matrix", quote X = hcat(ones(length(x1)), x1); Y = hcat(x2); y .~ Normal.(X * Y, 1.0) end),
+        (D, "got 2", quote X = hcat(ones(length(x1)), x1); y .~ Normal.(X * 2, 1.0) end),
+        (D, "has 2 elements (sized by `S`) but matrix `X` has 3 columns", quote b[axes(S, 2)] .~ Normal.(0, 1); S = hcat(ones(length(x1)), x1); X = hcat(ones(length(x1)), x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        (D, "sized by `Z`, which is not a design matrix", quote b[axes(Z, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        (Dz, "shared across predictors", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; nu = X * b; y .~ Normal.(mu, 1.0); z .~ Normal.(nu, 1.0) end),
+        (D, "literal scaling of a matmul", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = 2 * (X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = x2 .* (X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = exp.(X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); s ~ Exponential(1); X = hcat(ones(length(x1)), x1); mu = s .* (X * b); y .~ Normal.(mu, 1.0) end),
     ]
     for (data, msg, ast) in cases
         err = _mx_err(ast, data)
@@ -428,7 +428,7 @@ end
         end
     end
     # Named-definition RHS violations screen at extraction.
-    err = _mx_err(quote X = hcat(1, x1); mu = X * 2; y .~ Normal.(mu, 1.0) end, D)
+    err = _mx_err(quote X = hcat(ones(length(x1)), x1); mu = X * 2; y .~ Normal.(mu, 1.0) end, D)
     # capability: a scaled matrix-valued response (P3/P10a; todo `1qlbn5b`).
     @test_broken (err === nothing || throw(err))
 end
@@ -437,19 +437,19 @@ end
     D = (:y, :x1)
     Dm = (:c1, :c2, :x1)
     cases = [
-        (D, "location X is a design matrix", quote X = hcat(1, x1); y .~ Normal.(X, 1.0) end),
-        (D, "calls `hcat` outside a matrix definition", quote b[1:2] .~ Normal.(0, 1); y .~ Normal.(hcat(1, x1) * b, 1.0) end),
-        (D, "outside a predictor matmul", quote X = hcat(1, x1); mu = X; y .~ Normal.(mu, 1.0) end),
-        (D, "combines a matrix outside a matmul", quote X = hcat(1, x1); mu = a .+ X; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
-        (D, "combines a matrix outside a matmul", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X .* b; y .~ Normal.(mu, 1.0) end),
+        (D, "location X is a design matrix", quote X = hcat(ones(length(x1)), x1); y .~ Normal.(X, 1.0) end),
+        (D, "calls `hcat` outside a matrix definition", quote b[1:2] .~ Normal.(0, 1); y .~ Normal.(hcat(ones(length(x1)), x1) * b, 1.0) end),
+        (D, "outside a predictor matmul", quote X = hcat(ones(length(x1)), x1); mu = X; y .~ Normal.(mu, 1.0) end),
+        (D, "combines a matrix outside a matmul", quote X = hcat(ones(length(x1)), x1); mu = a .+ X; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
+        (D, "combines a matrix outside a matmul", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X .* b; y .~ Normal.(mu, 1.0) end),
         # `sum(X)` already reads the matrix as a scalar value.
-        (D, "is a scalar summand", quote X = hcat(1, x1); w = sum(X); mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
-        (D, "combines a matrix outside a matmul", quote X = hcat(1, x1); w = X; mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
-        (D, "scale X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, X) end),
-        (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); s ~ Normal(X, 1); mu = X * b; y .~ Normal.(mu, s) end),
-        (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); s ~ HalfNormal(X); mu = X * b; y .~ Normal.(mu, s) end),
-        (Dm, "multinomial probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; c1 .~ Multinomial.(10, X, c2) end),
-        (D, "categorical probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Categorical.(X) end),
+        (D, "is a scalar summand", quote X = hcat(ones(length(x1)), x1); w = sum(X); mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
+        (D, "combines a matrix outside a matmul", quote X = hcat(ones(length(x1)), x1); w = X; mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
+        (D, "scale X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, X) end),
+        (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); s ~ Normal(X, 1); mu = X * b; y .~ Normal.(mu, s) end),
+        (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); s ~ HalfNormal(X); mu = X * b; y .~ Normal.(mu, s) end),
+        (Dm, "multinomial probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; eachrow(hcat(c1, c2)) .~ Multinomial.(10, Ref(X)) end),
+        (D, "categorical probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Categorical(X) end),
     ]
     for (data, msg, ast) in cases
         err = _mx_err(ast, data)
@@ -467,7 +467,7 @@ end
     end
     # Submodel inlining routes matrices to the same arms.
     m = @rkppl begin
-        X = hcat(1, x)
+        X = hcat(ones(length(x)), x)
         mu = X * b
         y ~ _mx_stream(X, 1.0)
     end
@@ -493,12 +493,12 @@ end
     # the admitted hierarchical spelling (see "matrix hierarchical
     # prior values vs oracle" below), so the arg-gate rejection case
     # moves to an unknown hyper name.
-    ast = quote b[axes(X, 2)] ~ Normal(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end
+    ast = quote b[axes(X, 2)] ~ Normal(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, 1.0) end
     err = _mx_err(ast, D)
     # refused: a vector prior requires .~ (scalar/broadcast arity, P3).
     @test err isa SurfaceLoweringError && occursin("is a vector — use `.~`", err.message)
-    for ast in (quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end,
-            quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end)
+    for ast in (quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, 1.0) end,
+            quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(ones(length(x1)), x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end)
         plan = lower_rkppl(ast, D)
         # refused: unresolved prior name nope or width 2 against 3 coefficients (P3/P6).
         @test_throws ContractValidationError bind_data(plan, _mx_cols())
@@ -522,7 +522,7 @@ end
                 :(b[axes(X, 2)] .~ Gamma.(1, 1))))
         plan = lower_rkppl(quote
                 $decl
-                X = hcat(1, x1)
+                X = hcat(ones(length(x1)), x1)
                 mu = X * b
                 y .~ Normal.(mu, 1.0)
             end, (:y, :x1))
@@ -547,7 +547,7 @@ end
     prog = quote
         s ~ Exponential(1)
         b[axes(X, 2)] .~ Normal.(0, s)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = X * b
         y .~ Normal.(mu, s)
     end
@@ -590,7 +590,7 @@ end
     mmat = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.([0.0, 0.0], [1.0, 2.0])
         sigma ~ Exponential(1.0)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = X * b
         y .~ Normal.(mu, sigma)
     end, (:y, :x1))
@@ -621,7 +621,7 @@ end
     plan = bind_data(lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.([0.0, 0.0], [1.0, 2.0])
         sigma ~ Exponential(1.0)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = X * b
         y .~ Normal.(mu, sigma)
     end, (:y, :x1)), sub)
@@ -636,7 +636,7 @@ end
     mmat = lower_rkppl(quote
         R2 ~ Beta(1.0, 1.0)
         phi ~ Dirichlet([1.0, 1.0])
-        X = hcat(1, x1, x2)
+        X = hcat(ones(length(x1)), x1, x2)
         mu = X * b
         r2d2(mu, R2, phi)
         y .~ Normal.(mu, 1.0)
@@ -668,7 +668,7 @@ end
         b[axes(X, 2)] .~ Normal.(0, 1)
         s ~ Dirichlet([1.0, 2.0])
         d ~ Normal(0, 1)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = X * b .+ d .* mo(c, s)
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1, :c))
@@ -696,7 +696,7 @@ end
     plan = lower_rkppl(quote
         R2 ~ Beta(1.0, 1.0)
         phi ~ Dirichlet([1.0, 1.0])
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = X * b
         r2d2(mu, R2, phi)
         y .~ Normal.(mu, 1.0)
@@ -709,7 +709,7 @@ end
         R2 ~ Beta(1.0, 1.0)
         phi ~ Dirichlet([1.0, 1.0])
         b[axes(X, 2)] .~ Normal.(0, 2)
-        X = hcat(1, x1)
+        X = hcat(ones(length(x1)), x1)
         mu = X * b
         r2d2(mu, R2, phi)
         y .~ Normal.(mu, 1.0)

@@ -56,7 +56,7 @@ end
 
 @testset "strict declarations: undeclared matrix coefficient vector" begin
     err = _strict_err(() -> lower_rkppl(quote
-            X = hcat(1, x1, x2)
+            X = hcat(ones(length(x1)), x1, x2)
             mu = X * b
             y .~ Normal.(mu, 1.0)
         end, (:y, :x1, :x2)))

@@ -49,7 +49,7 @@ using Test
                 mu1 ~ Normal(0.0, 5.0)
                 mu2 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu2, s)], wcol)
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s), Normal.(mu2, s)), Ref(wcol))
             end), (:y, :wcol), ContractValidationError),
         # (The kronecker_gp `E = eigen(K)` case was removed: functions as
         # values admit any function visible in the model module from `=`,
