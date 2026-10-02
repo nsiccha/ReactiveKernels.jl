@@ -1,4 +1,4 @@
-using Distributions: Exponential, Normal, logpdf
+using Distributions: Exponential, Gamma, Normal, logpdf
 using ReactiveKernelsPPL
 using Test
 
@@ -368,7 +368,6 @@ end
         (D, "got 2", quote X = hcat(1, x1); y .~ Normal.(X * 2, 1.0) end),
         (D, "has 2 elements (sized by `S`) but matrix `X` has 3 columns", quote b[axes(S, 2)] .~ Normal.(0, 1); S = hcat(1, x1); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (D, "sized by `Z`, which is not a design matrix", quote b[axes(Z, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        (D, "is a declared array", quote b[1:2] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (D, "column x1 has two coefficients b and c", quote X = hcat(1, x1); mu = X * b .+ c .* x1; c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
         (D, "column Intercept has two coefficients", quote X = hcat(1, 1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (Dz, "shared across predictors", quote X = hcat(1, x1); mu = X * b; nu = X * b; y .~ Normal.(mu, 1.0); z .~ Normal.(nu, 1.0) end),
@@ -397,7 +396,9 @@ end
         (D, "outside a predictor matmul", quote X = hcat(1, x1); mu = X; y .~ Normal.(mu, 1.0) end),
         (D, "combines a matrix outside a matmul", quote X = hcat(1, x1); mu = a .+ X; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
         (D, "combines a matrix outside a matmul", quote X = hcat(1, x1); mu = X .* b; y .~ Normal.(mu, 1.0) end),
-        (D, "outside a predictor matmul", quote X = hcat(1, x1); w = sum(X); mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
+        # `sum(X)` reads the matrix as a value (valid Julia); the program
+        # fails for its scalar summand instead.
+        (D, "is a scalar summand", quote X = hcat(1, x1); w = sum(X); mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
         (D, "combines a matrix outside a matmul", quote X = hcat(1, x1); w = X; mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
         (D, "scale X is a design matrix", quote X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, X) end),
         (D, "argument X is a design matrix", quote X = hcat(1, x1); s ~ Normal(X, 1); mu = X * b; y .~ Normal.(mu, s) end),
@@ -429,21 +430,55 @@ end
     D = (:y, :x1, :x2)
     # `Cauchy.(0, 1)` broadcast was rejected under Normal-only admission;
     # the prior-vocab slice admits per-addressee Cauchy (see
-    # test_prior_vocab.jl), so the rejection case moves to Gamma (not a
-    # coefficient family). Likewise `Normal.(0, s)` with sampled `s`
+    # test_prior_vocab.jl). A non-coefficient family (`Gamma.(1, 1)`) now
+    # makes `b` an array over `X` read as a value ("matrix read as a
+    # value" below). Likewise `Normal.(0, s)` with sampled `s`
     # was rejected before the shared-hyperparameter slice; it is now
     # the admitted hierarchical spelling (see "matrix hierarchical
     # prior values vs oracle" below), so the arg-gate rejection case
     # moves to an unknown hyper name.
     cases = [
         ("is a vector — use `.~`", quote b[axes(X, 2)] ~ Normal(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("needs a broadcast prior", quote b[axes(X, 2)] .~ Gamma.(1, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         ("must be a literal, a scalar parameter or assignment name, or a 2-vector of those", quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         ("has 2 elements for 3 columns", quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
     ]
     for (msg, ast) in cases
         err = _mx_err(ast, D)
         @test err isa SurfaceLoweringError && occursin(msg, err.message)
+    end
+end
+
+@testset "matrix read as a value: declared arrays and array priors" begin
+    # `X * b` with `b` a declared array, or `b[axes(X, 2)]` under a prior
+    # the matrix term does not carry (a positive-support family), reads
+    # the `hcat` matrix as a value: a bound data matrix built at bind
+    # (`1` = a ones column) times an array (test_library_shrinkage.jl
+    # covers the rule).
+    Y = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    X1 = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    cols = Dict{Symbol,AbstractVector}(:y => Y, :x1 => X1)
+    Xv = hcat(ones(6), X1)
+    for (prior, decl) in (
+            (b -> sum(logpdf.(Normal(0, 1), b)),
+                :(b[1:2] .~ Normal.(0, 1))),
+            (b -> sum(logpdf.(Gamma(1, 1), b)),
+                :(b[axes(X, 2)] .~ Gamma.(1, 1))))
+        plan = lower_rkppl(quote
+                $decl
+                X = hcat(1, x1)
+                mu = X * b
+                y .~ Normal.(mu, 1.0)
+            end, (:y, :x1))
+        @test isempty(plan.population_priors)
+        @test ReactiveKernelsPPL._value_design_matrix_names(plan) == Set([:X])
+        bound = bind_data(plan, cols)
+        @test bound.columns[:X] == Xv
+        built = build_kernel(bound)
+        u = [0.3, -0.2]
+        b = constrain(built.layout, u).b
+        @test _query(built.spec, bound, :prior, u) ≈ prior(b)
+        @test _query(built.spec, bound, :likelihood, u) ≈
+            sum(logpdf.(Normal.(Xv * b, 1.0), Y))
     end
 end
 
