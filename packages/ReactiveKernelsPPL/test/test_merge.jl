@@ -207,9 +207,8 @@ end
         e
     end
     @test err isa SurfaceLoweringError
-    # Fixing an unknown name or a non-vector value fails closed.
+    # refused: a fix must name a statement to remove (merge docstring).
     @test_throws SurfaceLoweringError Base.merge(merge_base, (; nosuch = ones(6)))
-    @test_throws SurfaceLoweringError Base.merge(merge_base, (; s = 2.0))
     @test_throws SurfaceLoweringError Base.merge(lev, (; c = ones(6)))
     # A plate-cell name is invisible to the top-level matcher: the append
     # collides at lowering through the single-assignment gate (still loud).
@@ -277,4 +276,17 @@ end
     uf = [0.5, -0.25]
     @test _query(build_kernel(bf).spec, bf, :posterior, uf) ==
           _query(build_kernel(bhf).spec, bhf, :posterior, uf)
+end
+
+@testset "merge pins a number" begin
+    # A pinned number reads as the definition it replaces (decisions
+    # 18h1h54, 0dejlw1): `s` drops its submodel prior and scales the stream.
+    X = [0.5, -1.0, 1.5, 0.0]
+    Y = [0.3, -0.8, 1.9, 0.2]
+    bound = Base.merge(merge_base, (; s = 2.0))(; y = Y, x = X)
+    built = build_kernel(bound)
+    u = [0.2, -0.4]
+    a, b = ReactiveKernelsPPL.constrain(built.layout, u).mu
+    @test Base.invokelatest(prepare_query(built, bound, :likelihood), u) ≈
+        sum(logpdf.(Normal.(a .+ b .* X, 2.0), Y))
 end

@@ -254,6 +254,79 @@ end
     mu = (cols[:dose] ./ 10.0) .* exp.(cols[:ls])
     @test _pl_q(new[2], new[1], :likelihood, [0.3]) ≈
         sum(logpdf.(Normal.(mu, sigma), cols[:dv])) rtol = 1e-12
+    # Two plates over different rows, one shared coefficient (corpus 76):
+    # each observation statement reads its own rows (4 Gaussian, 3
+    # Poisson); the panel form needs one dims key per plate.
+    cols = Dict(:x1 => [0.5, 1.0, 1.5, 2.0], :y1 => [0.4, 1.1, 1.4, 2.2],
+        :x2 => [0.2, 0.4, 0.6], :y2 => [1, 0, 2])
+    legacy = _pl_corpus("76_kernel_plates_gaussian_poisson.jl", cols;
+        dims = Dict{Symbol,Int}(:kernel_nsub_pred1 => 4,
+            :kernel_nsub_pred2 => 3))
+    new = _pl_corpus("99_plate_76_gaussian_poisson.jl", cols)
+    @test coordinate_names(new[2].layout) ==
+        coordinate_names(legacy[2].layout) == [:b0, :sigma]
+    @test new[1].n_obs == legacy[1].n_obs == 7
+    _pl_same_density(legacy, new, [0.25, 0.3])
+    _pl_same_density(legacy, new, [-0.4, 0.1])
+    b0, sigma = 0.25, exp(0.3)
+    @test _pl_q(new[2], new[1], :likelihood, [0.25, 0.3]) ≈
+        sum(logpdf.(Normal.(b0 .* cols[:x1], sigma), cols[:y1])) +
+        sum(logpdf.(Poisson.(exp.(b0 .* cols[:x2])), cols[:y2])) rtol = 1e-12
+end
+
+@testset "responses observe their own rows" begin
+    # A statement broadcasts over the columns it reads (standard Julia), so
+    # two responses may observe different rows; n_obs is their total.
+    data = (:k1, :n1, :k2, :n2)
+    head = (:(theta1 ~ Beta(1.0, 1.0)), :(theta2 ~ Beta(1.0, 1.0)))
+    plates = Expr(:block, head...,
+        _pl_plate(:(eachindex(k1)), :(k1[i] ~ Binomial(n1[i], theta1))),
+        _pl_plate(:(eachindex(k2)), :(k2[i] ~ Binomial(n2[i], theta2))))
+    twin = Expr(:block, head..., :(k1 .~ Binomial.(n1, theta1)),
+        :(k2 .~ Binomial.(n2, theta2)))
+    @test _pl_canon(lower_rkppl(plates, data)) ==
+        _pl_canon(lower_rkppl(twin, data))
+    cols = Dict{Symbol,AbstractVector}(:k1 => [3, 1, 4], :n1 => [5, 5, 6],
+        :k2 => [0, 2, 2, 1, 3], :n2 => [4, 4, 3, 2, 5])
+    bound, built = _pl_bind(plates, data, cols)
+    @test bound.n_obs == 8
+    u = [0.3, -0.4]
+    nt = constrain(built.layout, u)
+    @test _pl_q(built, bound, :likelihood, u) ≈
+        sum(logpdf.(Binomial.(cols[:n1], nt.theta1), cols[:k1])) +
+        sum(logpdf.(Binomial.(cols[:n2], nt.theta2), cols[:k2])) rtol = 1e-12
+    # refused: the columns one statement reads share its rows — Julia's
+    # broadcast throws a DimensionMismatch there (standard-Julia semantics,
+    # language principle 3).
+    bad = merge(cols, Dict{Symbol,AbstractVector}(:n2 => [4, 4, 3]))
+    @test_throws "column length 3 ≠ the 5 rows of k2" _pl_bind(plates, data,
+        bad)
+    # refused: responses reading a common column observe one axis, so a
+    # shared covariate cannot serve rows of two lengths (principle 3).
+    shared = Expr(:block, :(b ~ Normal(0, 1)), :(s ~ Exponential(1)),
+        :(y1 .~ Normal.(b .* x, s)), :(y2 .~ Normal.(b .* x, s)))
+    @test_throws "column length 3 ≠ the 4 rows of" bind_data(
+        lower_rkppl(shared, (:y1, :y2, :x)), Dict{Symbol,AbstractVector}(
+            :y1 => [0.1, 0.2, 0.3, 0.4], :y2 => [0.5, 0.6, 0.7],
+            :x => [1.0, 2.0, 3.0, 4.0]))
+    # Not built yet (todo `0bv3atq`): a slot sized by one observation axis
+    # beside several axes — here a latent plate. Unexpected Pass once it
+    # is built: then assert its density instead.
+    lat = Expr(:block, :(tau ~ Exponential(1)), :(s ~ Exponential(1)),
+        :(m ~ Normal(0, 1)),
+        _pl_plate(:(eachindex(y1)), :(theta[i] ~ Normal(0, tau)),
+            :(y1[i] ~ Normal(theta[i], s))),
+        _pl_plate(:(eachindex(y2)), :(y2[i] ~ Normal(m * x2[i], s))))
+    latplan = lower_rkppl(lat, (:y1, :y2, :x2))
+    try
+        bind_data(latplan, Dict{Symbol,AbstractVector}(:y1 => [0.1, 0.2, 0.3],
+            :y2 => [0.4, 0.5], :x2 => [1.0, 2.0]))
+        @test_broken true
+    catch e
+        e isa ContractValidationError && occursin("not built yet", e.message) ||
+            rethrow()
+        @test_broken false
+    end
 end
 
 @testset "dose-free grouped re-spellings need no schedule" begin

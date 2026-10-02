@@ -2,14 +2,15 @@ using Distributions
 using ReactiveKernelsPPL
 using Test
 
-# Differenced-AR(1) trajectory (dar) contract tests: SB `_sb_dar1` mirror —
-# `beta ~ Normal(0.5, 0.2)` on `[0, 1]` under Stan-kernel semantics
-# (`(:interval_stan, 0, 1)`, unnormalized), positive `sigma ~ Normal(0, 0.2)`
-# under Stan-kernel semantics (`:positive_stan`, unnormalized),
-# `z[T-1] ~ std_normal`, and the zero-started integrated path
-# `x[t+1] = x[t] + d[t]` spliced beta-free into the linear predictor (the
-# formula intercept is the initial level). Corpus drift coverage lives in
-# 48_dar.
+# Differenced-AR(1) trajectory (dar) contract tests: SB `_sb_dar1`'s path —
+# `beta ~ truncated(Normal(0.5, 0.2), 0, 1)` (`(:interval, 0, 1)`) and
+# `sigma ~ HalfNormal(0.2)` (`:positive`), each keeping the meaning of its
+# statement as written (Distributions semantics, normalizers included: user
+# decision `0m1j3iz`, prong `dar-kernel`), `z[T-1] ~ std_normal`, and the
+# zero-started integrated path `x[t+1] = x[t] + d[t]` spliced beta-free into
+# the linear predictor (the formula intercept is the initial level). The
+# library spelling `x ~ differenced_ar1(beta, sigma)` is pinned at the end.
+# Corpus drift coverage lives in 48_dar and 48_dar_library.
 #
 # Helpers `_query`, `_check_gradient` (test_generator.jl) and
 # `_none_evidence` (test_contract.jl) are included first in runtests.jl.
@@ -17,9 +18,9 @@ using Test
 # the emitted forms.
 
 _dar_beta() = SampledParameter(:beta, :normal, (arg1 = 0.5, arg2 = 0.2),
-    (:interval_stan, 0.0, 1.0), :beta)
+    (:interval, 0.0, 1.0), :beta)
 _dar_sigma() = SampledParameter(:sigmad, :normal, (arg1 = 0.0, arg2 = 0.2),
-    :positive_stan, :sigmad)
+    :positive, :sigmad)
 
 function _dar_spec(; state = :dar_mu, beta = :beta, sigma = :sigmad)
     return DarSpec(state, beta, sigma, state)
@@ -104,12 +105,11 @@ end
     @test_throws ContractValidationError validate_structure(
         _dar_min_plan([DarSpec(:dar_mu, :beta, :beta, :dar_mu)]))
 
-    # persistence geometry: Normal on exactly (:interval_stan, 0, 1) —
-    # including the pre-migration normalized (:interval, 0, 1), which no
-    # longer validates as a dar persistence
+    # persistence geometry: a Normal truncated to exactly (:interval, 0, 1)
+    # — the retired Stan-kernel (:interval_stan, 0, 1) no longer validates
     for (fam, sup) in ((:normal, nothing), (:normal, :positive),
-            (:normal, (:interval, 0.0, 1.0)),
-            (:normal, (:interval_stan, 0.0, 2.0)), (:exponential, nothing))
+            (:normal, (:interval_stan, 0.0, 1.0)),
+            (:normal, (:interval, 0.0, 2.0)), (:exponential, nothing))
         p = _dar_min_plan([spec])
         i = findfirst(q -> q.name === :beta, p.parameters)
         p.parameters[i] = SampledParameter(:beta, fam,
@@ -117,9 +117,9 @@ end
         @test_throws ContractValidationError validate_structure(p)
     end
 
-    # scale geometry: Normal on :positive_stan — including the
-    # pre-migration normalized :positive, which no longer validates
-    for (fam, sup) in ((:normal, nothing), (:normal, :positive),
+    # scale geometry: a half-Normal on :positive — the retired Stan-kernel
+    # :positive_stan no longer validates
+    for (fam, sup) in ((:normal, nothing), (:normal, :positive_stan),
             (:exponential, nothing),
             (:normal, (:interval, 0.0, 1.0)), (:cauchy, :positive))
         p = _dar_min_plan([spec])
@@ -133,7 +133,7 @@ end
     p = _dar_min_plan([spec])
     i = findfirst(q -> q.name === :beta, p.parameters)
     p.parameters[i] = SampledParameter(:beta, :normal,
-        (arg1 = 0.7, arg2 = 0.1), (:interval_stan, 0.0, 1.0), :beta)
+        (arg1 = 0.7, arg2 = 0.1), (:interval, 0.0, 1.0), :beta)
     @test (validate_structure(p); true)
 end
 
@@ -235,13 +235,13 @@ end
     @test st.options == (dar_id = :dar_mu,)
     @test st.addressee === st.label === :dar_mu
     @test isempty(st.columns)
-    # both parameters are sampled scalars, never population priors,
-    # re-keyed to Stan-kernel overrides (same spellings, SB semantics)
+    # both parameters are sampled scalars, never population priors, with
+    # the meaning of their statements as written (no Stan-kernel re-key)
     byname = Dict(p.name => p for p in plan.parameters)
     @test byname[:beta].family === :normal
-    @test byname[:beta].support_override == (:interval_stan, 0.0, 1.0)
+    @test byname[:beta].support_override == (:interval, 0.0, 1.0)
     @test byname[:sigmad].family === :normal
-    @test byname[:sigmad].support_override === :positive_stan
+    @test byname[:sigmad].support_override === :positive
     @test all(pr -> pr.addressee !== :beta && pr.addressee !== :sigmad,
         plan.population_priors)
 
@@ -256,10 +256,10 @@ end
     end, (:y,))
     @test only(plan2.dar_paths).sigma === :sigmad
     byname2 = Dict(p.name => p for p in plan2.parameters)
-    @test byname2[:sigmad].support_override === :positive_stan
+    @test byname2[:sigmad].support_override === :positive
 
-    # use-keying: a dar-shaped `~` never consumed by `dar()` keeps
-    # Distributions semantics (no Stan re-key)
+    # a dar-shaped `~` never consumed by `dar()` lowers identically:
+    # `dar()` no longer changes what its parameters' statements mean
     plan3 = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
@@ -381,11 +381,40 @@ end
     end, (:y,))
 end
 
-@testset "dar: SB trajectory end to end (oracle + gradient)" begin
-    # SB `_sb_dar1` mirror: `beta ~ normal(0.5, 0.2; lower=0, upper=1)`,
-    # `sigma ~ normal(0, 0.2; lower=0)` — both UNNORMALIZED (Stan never
-    # renormalizes bounds) — `z ~ std_normal(; n=T-1)`, and the
-    # zero-started `differenced_ar1_path` spliced beta-free.
+# Independent oracle for the zero-started differenced-AR(1) model
+# `y ~ Normal(a + x, sigma)`: SB `differenced_ar1_path` ported line-for-line,
+# with the author's priors exactly as written, evaluated by Distributions.jl
+# (never the emitted forms). Layout order: a, beta, sigmad, sigma, z[1..T-1].
+function _dar_oracle(u, y; beta_prior = truncated(Normal(0.5, 0.2), 0, 1),
+        sigmad_prior = truncated(Normal(0, 0.2), 0, Inf))
+    T = length(y)
+    aa = u[1]
+    beta = 1 / (1 + exp(-u[2]))
+    sigmad = exp(u[3])
+    sigma = exp(u[4])
+    z = u[5:(5 + T - 2)]
+    x = zeros(T)
+    d = 0.0
+    for t in 1:(T - 1)
+        d = beta * d + sigmad * z[t]
+        x[t + 1] = x[t] + d
+    end
+    @test x[1] == 0.0   # the zero start is load-bearing, not incidental
+    mu = aa .+ x
+    ll = sum(logpdf(Normal(mu[t], sigma), y[t]) for t in 1:T)
+    pr = logpdf(Normal(0, 1), aa) +
+         logpdf(beta_prior, beta) +
+         logpdf(sigmad_prior, sigmad) +
+         logpdf(Exponential(1), sigma) +
+         sum(logpdf(Normal(0, 1), zt) for zt in z)
+    jac = log(beta) + log(1 - beta) + u[3] + u[4]
+    return ll + pr + jac
+end
+
+@testset "dar: trajectory end to end (oracle + gradient)" begin
+    # `beta ~ truncated(Normal(0.5, 0.2), 0, 1)` and `sigmad ~
+    # HalfNormal(0.2)` mean what they say (normalized), `z ~
+    # std_normal(; n=T-1)`, and the zero-started path spliced beta-free.
     m = @rkppl begin
         a ~ Normal(0, 1)
         beta ~ truncated(Normal(0.5, 0.2), 0, 1)
@@ -402,47 +431,21 @@ end
     @test built.layout.total == 4 + (length(ydata) - 1)
     @test coordinate_names(built.layout)[1:4] ==
         [Symbol("mu.Intercept"), :beta, :sigmad, :sigma]
-
-    # independent oracle: SB `differenced_ar1_path` ported line-for-line,
-    # priors and likelihood via Distributions.jl (never the emitted forms)
-    function dar_oracle(u, y)
-        T = length(y)
-        aa = u[1]
-        beta = 1 / (1 + exp(-u[2]))
-        sigmad = exp(u[3])
-        sigma = exp(u[4])
-        z = u[5:(5 + T - 2)]
-        x = zeros(T)
-        d = 0.0
-        for t in 1:(T - 1)
-            d = beta * d + sigmad * z[t]
-            x[t + 1] = x[t] + d
-        end
-        @test x[1] == 0.0   # the zero start is load-bearing, not incidental
-        mu = aa .+ x
-        ll = sum(logpdf(Normal(mu[t], sigma), y[t]) for t in 1:T)
-        zn = Normal(0.5, 0.2)
-        pr = logpdf(Normal(0, 1), aa) +
-             logpdf(zn, beta) +
-             logpdf(Normal(0, 0.2), sigmad) +
-             logpdf(Exponential(1), sigma) +
-             sum(logpdf(Normal(0, 1), zt) for zt in z)
-        jac = log(beta) + log(1 - beta) + u[3] + u[4]
-        return ll + pr + jac
-    end
-
     for u in ([0.1, 0.3, -0.5, -0.4, 0.2, -0.1, 0.4, 0.0],
               [-0.2, 0.6, 0.1, 0.3, -0.4, 0.2, -0.3, 0.1])
-        @test _query(built.spec, plan, :posterior, u) ≈ dar_oracle(u, ydata)
+        @test _query(built.spec, plan, :posterior, u) ≈ _dar_oracle(u, ydata)
         _check_gradient(built.spec, plan, u)
     end
 end
 
 # D1/D2 SB-parity pins (the `test/rk_parity.jl` dar corpus cases, mirrored
-# RK-natively): RK posterior vs the hand oracle (unnormalized priors),
-# vs the peer lane's BridgeStan full-posterior literal (propto=false,
-# jacobian=true), and RK Enzyme grads vs the SB grads in RK u-order
-# (brief 2026-09-27T12-50-22-591-v7kukl on
+# RK-natively). SB's literals (BridgeStan full posterior, propto=false,
+# jacobian=true) are Stan-kernel: its bounded `beta ~ normal(m, s;
+# lower=0, upper=1)` and `sigma ~ normal(0, s; lower=0)` drop the
+# truncation normalizers. RK keeps the author's statements as written, so
+# its posterior is SB's plus the two normalizers — a constant in `u`, so
+# the gradients equal SB's exactly (brief
+# 2026-09-27T12-50-22-591-v7kukl on
 # BayesianRegressionModels:rk:parity-term-ar-dar, BRM 97bb538,
 # StanBlocks 24578c3, BridgeStan 2.9.0, Julia 1.10.11). Shared columns
 # `y = [0.5, -0.2, 0.1, 0.9, 1.4, 1.1]` (the `t` axis is length-only on
@@ -452,29 +455,8 @@ end
 # of it peer-side). SB grad order
 # [pop_mu_beta_pop.1, dar_mu_t_beta, dar_mu_t_sigma, dar_mu_t_z.1..5, s]
 # permutes to RK u-order as [1, 2, 3, 9, 4, 5, 6, 7, 8].
-function _dar_sb_pins(u, y, bloc, bsca, sloc, ssca)
-    T = length(y)
-    aa = u[1]
-    beta = 1 / (1 + exp(-u[2]))
-    sigmad = exp(u[3])
-    s = exp(u[4])
-    z = u[5:(5 + T - 2)]
-    x = zeros(T)
-    d = 0.0
-    for t in 1:(T - 1)
-        d = beta * d + sigmad * z[t]
-        x[t + 1] = x[t] + d
-    end
-    mu = aa .+ x
-    ll = sum(logpdf(Normal(mu[t], s), y[t]) for t in 1:T)
-    pr = logpdf(Normal(0, 1), aa) +
-         logpdf(Normal(bloc, bsca), beta) +
-         logpdf(Normal(sloc, ssca), sigmad) +
-         logpdf(Exponential(1), s) +
-         sum(logpdf(Normal(0, 1), zt) for zt in z)
-    jac = log(beta) + log(1 - beta) + u[3] + u[4]
-    return ll + pr + jac
-end
+_dar_normalizers(bloc, bsca, ssca) =
+    -log(cdf(Normal(bloc, bsca), 1.0) - cdf(Normal(bloc, bsca), 0.0)) + log(2)
 
 @testset "dar D1/D2 SB-parity pins" begin
     ydata = [0.5, -0.2, 0.1, 0.9, 1.4, 1.1]
@@ -496,8 +478,9 @@ end
         @test coordinate_names(built.layout)[1:4] ==
             [Symbol("mu.Intercept"), :beta, :sigmad, :s]
         post = _query(built.spec, plan, :posterior, u)
-        @test post ≈ _dar_sb_pins(u, ydata, 0.5, 0.2, 0.0, 0.2)
-        @test abs(post - (-22.57116529873909)) < 1e-12
+        @test post ≈ _dar_oracle(u, ydata)
+        @test abs(post - (-22.57116529873909 +
+            _dar_normalizers(0.5, 0.2, 0.2))) < 1e-12
         sb = [5.466993138042674, 0.8344512151440091, -13.924728401033837,
             -1.4386732731205805, 5.160141062738464, 4.392079285424707,
             3.192200195514296, 1.4901788654922776, 0.021427806410332872]
@@ -524,8 +507,11 @@ end
         @test coordinate_names(built.layout)[1:4] ==
             [Symbol("mu.Intercept"), :beta, :sigmad, :s]
         post = _query(built.spec, plan, :posterior, u)
-        @test post ≈ _dar_sb_pins(u, ydata, 0.6, 0.1, 0.0, 0.3)
-        @test abs(post - (-19.08072138630899)) < 1e-12
+        @test post ≈ _dar_oracle(u, ydata;
+            beta_prior = truncated(Normal(0.6, 0.1), 0, 1),
+            sigmad_prior = truncated(Normal(0, 0.3), 0, Inf))
+        @test abs(post - (-19.08072138630899 +
+            _dar_normalizers(0.6, 0.1, 0.3))) < 1e-12
         sb = [5.466993138042674, 4.643891230385576, -4.614727761649957,
             -1.4386732731205805, 5.160141062738464, 4.392079285424707,
             3.192200195514296, 1.4901788654922776, 0.021427806410332872]
@@ -535,4 +521,70 @@ end
         @test maximum(abs.(g .- sb)) < 1e-10
         _check_gradient(built.spec, plan, u)
     end
+end
+
+# The library spelling: `x ~ differenced_ar1(beta, sigma)` is an ordinary
+# `@scan` submodel (tuple carry `(level, increment)`, deterministic zero
+# seeds) whose body states only the innovation prior; the author's
+# `beta`/`sigma` statements keep their meaning. Same layout order and the
+# same density as the built-in `dar()`, and as the oracle.
+@testset "dar library: differenced_ar1 matches the built-in and the oracle" begin
+    lib = @rkppl begin
+        a ~ Normal(0, 1)
+        beta ~ truncated(Normal(0.5, 0.2), 0, 1)
+        sigmad ~ HalfNormal(0.2)
+        sigma ~ Exponential(1)
+        x ~ differenced_ar1(beta, sigmad)
+        mu = a .+ x
+        y .~ Normal.(mu, sigma)
+    end
+    builtin = @rkppl begin
+        a ~ Normal(0, 1)
+        beta ~ truncated(Normal(0.5, 0.2), 0, 1)
+        sigmad ~ HalfNormal(0.2)
+        sigma ~ Exponential(1)
+        mu = a .+ dar(beta, sigmad)
+        y .~ Normal.(mu, sigma)
+    end
+    ydata = [0.3, -0.1, 0.5, 0.2, -0.4]
+    pl = lib(; y = ydata)
+    pb = builtin(; y = ydata)
+    sc = only(pl.scans)
+    @test sc.states == [:x_level, :x_increment]
+    @test [f.kind for f in sc.setup] == [:assign, :assign]
+    @test isempty(pl.dar_paths)
+    @test any(t -> t.kind === ScanSummandTerm &&
+        t.options == (scan_id = :x_level, coef = nothing),
+        only(pl.predictors).terms)
+    byname = Dict(p.name => p for p in pl.parameters)
+    @test byname[:beta].support_override == (:interval, 0.0, 1.0)
+    @test byname[:sigmad].support_override === :positive
+    bl = build_kernel(pl)
+    bb = build_kernel(pb)
+    @test coordinate_names(bl.layout)[1:4] ==
+        coordinate_names(bb.layout)[1:4]
+    @test bl.layout.total == bb.layout.total == 4 + (length(ydata) - 1)
+    for u in ([0.1, 0.3, -0.5, -0.4, 0.2, -0.1, 0.4, 0.0],
+              [-0.2, 0.6, 0.1, 0.3, -0.4, 0.2, -0.3, 0.1])
+        vl = _query(bl.spec, pl, :posterior, u)
+        @test vl ≈ _query(bb.spec, pb, :posterior, u)
+        @test vl ≈ _dar_oracle(u, ydata)
+        _check_gradient(bl.spec, pl, u)
+    end
+
+    # The library value is a plain value: an unscaled location works too.
+    direct = @rkppl begin
+        beta ~ truncated(Normal(0.5, 0.2), 0, 1)
+        sigmad ~ HalfNormal(0.2)
+        sigma ~ Exponential(1)
+        x ~ differenced_ar1(beta, sigmad)
+        y .~ Normal.(x, sigma)
+    end
+    pd = direct(; y = ydata)
+    @test only(pd.responses).predictor === :x_level
+    bd = build_kernel(pd)
+    ud = [0.3, -0.5, -0.4, 0.2, -0.1, 0.4, 0.0]
+    vd = _query(bd.spec, pd, :posterior, ud)
+    @test vd ≈ _dar_oracle([0.0; ud], ydata) - logpdf(Normal(0, 1), 0.0)
+    _check_gradient(bd.spec, pd, ud)
 end

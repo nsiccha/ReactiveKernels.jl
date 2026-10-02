@@ -96,8 +96,9 @@ using Test
                 y .~ Normal.(mu, 1.0)
             end), (:y,), SurfaceLoweringError),
         # arma11: ARMA(1,1) sequential error recursion is deterministic
-        # given data+params, but @scan setup must sample its state.
-        ("arma11", "deterministic scan setup",
+        # given data+params; a @scan seed and step that read the data
+        # column `y` (data-varying recurrences) are not built yet.
+        ("arma11", "data-varying scan recurrence",
             :(begin
                 mu ~ Normal(0.0, 5.0)
                 phi ~ Normal(0.0, 1.0)
@@ -136,8 +137,8 @@ using Test
             end), (:y, :t, :A1, :A2, :C1, :C2, :X1m, :X2m, :X1a, :X2a),
             SurfaceLoweringError),
         # garch11: GARCH(1,1) variance recursion is deterministic given
-        # data+params; same scan-setup gate.
-        ("garch11", "deterministic scan setup",
+        # data+params; same data-varying-recurrence gap.
+        ("garch11", "data-varying scan recurrence",
             :(begin
                 m ~ Normal(0.0, 1.0)
                 a0 ~ Exponential(1.0)
