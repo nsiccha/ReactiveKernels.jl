@@ -477,9 +477,11 @@ undefined one fails here naming it. An undotted call is a model-level value
 (no observation axis); a dotted call `f.(...)` is elementwise, observation
 aligned exactly when an argument is; `v[c]` with an observation index is a
 gather. A data-only definition calling such a function is evaluated once by
-[`bind_data`](@ref) and bound as data; any other runs in the generated
-kernel under generic AD (an RK-owned derivative rule, when the callee is
-one, is used by Enzyme). A parameter-dependent undotted call over an
+[`bind_data`](@ref) and bound as data; one that a parameter-dependent
+expression consumes (named or inline) is evaluated once by preparation and
+never differentiated. Any other call runs in the generated kernel under
+generic AD (an RK-owned derivative rule, when the callee is one, is used by
+Enzyme). A parameter-dependent undotted call over an
 observation column fails closed: its result shape is unknown before
 sampling, so broadcast it or bind its data-only part first. A data column
 the definitions read only inside undotted module-call arguments, and no
@@ -587,7 +589,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     model_names = union(data, Set{Symbol}(nm for (nm, _) in det),
         Set{Symbol}(s.lhs for s in sample),
         Set{Symbol}(nm for (nm, _, _, _) in plate_specs),
-        Set{Symbol}(s.state for s in scans),
+        Set{Symbol}(st for s in scans for st in s.states),
         Set{Symbol}(p.contrib for p in varying_pending),
         Set{Symbol}(p.draws_lhs for p in varying_pending),
         Set{Symbol}(s.name for s in schedules),
@@ -656,13 +658,31 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # 0, 1)`) and scale (`HalfNormal(s)` / `truncated(Normal(0, s), 0,
     # Inf)`) — the only names a `dar()` call accepts (checked during
     # response lowering, before `_lower_parameters` runs; the contract
-    # re-checks for hand-built plans). `_lower_parameters` re-keys both to
-    # Stan-kernel overrides (`_dar_stan_override`); the spellings stay
-    # Distributions-shaped.
+    # re-checks for hand-built plans). Both keep the meaning of the
+    # statement as written: Distributions semantics, truncation
+    # normalizers included.
     dar_beta_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dar_beta_rhs(s.rhs))
     dar_sigma_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dar_sigma_rhs(s.rhs))
+    # An `hcat` matrix the program reads as a value (`var.(eachcol(X))`,
+    # `X * v` over a computed or declared-array vector, a coefficient
+    # prior the matrix term cannot carry) lowers exactly like a bound data
+    # matrix `X`: its definition leaves `det`, its name joins `data`, and
+    # `bind_data` builds it from its columns (`_value_design_matrices`).
+    caller_data = data
+    value_mats = _hcat_value_reads(det, detmap, sample, data, glms,
+        union(dirichlet_names, ordered_names),
+        union(plate_names, Set{Symbol}(st for s in scans for st in s.states),
+            varying_names))
+    value_mat_defs = Pair{Symbol,Any}[p for p in det if first(p) in value_mats]
+    if !isempty(value_mats)
+        det = Pair{Symbol,Any}[p for p in det if first(p) ∉ value_mats]
+        for nm in value_mats
+            delete!(detmap, nm)
+        end
+        data = union(data, value_mats)
+    end
     # Declaration roles for predictor classification: sized positional
     # and two-axis arrays, LKJ Cholesky factors, and vectors sized by a
     # bound data matrix (not an `hcat` definition) always take the array
@@ -698,7 +718,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # an indexed/matmul use as a coefficient. Keep `array_decls` and
     # `value_arrays` separate: they control those coefficient use sites.
     shape_env = _ShapeEnv(
-        union(plate_names, Set{Symbol}(s.state for s in scans), varying_names),
+        union(plate_names, Set{Symbol}(st for s in scans for st in s.states),
+            varying_names),
         sized_decls)
     detshape = _def_shapes(det, data, detmap; arrays = sized_decls,
         env = shape_env)
@@ -724,6 +745,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     for m in matrices
         delete!(canonmap, m.name)
     end
+    value_matrices = _value_design_matrices(value_mat_defs, caller_data)
     # Structural definitions inline into predictors: anything transitively
     # referencing a coefficient candidate (coef-priored or free name).
     # All other vector definitions stay symbolic as named locals.
@@ -732,9 +754,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     vecdefs = Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :vector)
     taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names,
         plate_names)
+    # Interned predictors by name (shared with `ctx`: a composition over a
+    # definition already interned as a predictor reads its LP node).
+    pred_idx = Dict{Symbol,Int}()
     ctx = (; data, detmap = canonmap, prior_names, coef_priors, demotable,
         detshape,
         vecdefs, structural, derived_responses = derived_response_names,
+        pred_idx,
         plate_names, absorbed = Set{Symbol}(),
         predictor_pins = pins, pins_used = Set{Symbol}(),
         pin_owner = Dict{Symbol,Symbol}(),
@@ -746,7 +772,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         # Inline factor references inside compositions (`sg .* z[g]`)
         # intern as synthetic sub-predictors, one per `(base, index)`,
         # exactly like the named alias `zg = z[g]`.
-        scan_states = Set{Symbol}(s.state for s in scans),
+        scan_states = Set{Symbol}(st for s in scans for st in s.states),
         scan_coefs = Set{Symbol}(),
         varying_draws = Dict{Symbol,VaryingDraws}(
             d.label => d for d in varying_draws),
@@ -783,7 +809,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         sized_decls = sized_decls)
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
-    pred_idx = Dict{Symbol,Int}()
     coefuse = Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}()
     glmuse = Dict{Symbol,Tuple{Symbol,Symbol}}()
     for s in sample
@@ -998,7 +1023,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
-        matrices = matrices, event_lps = event_lps,
+        matrices = vcat(matrices, value_matrices), event_lps = event_lps,
         array_parameters = arrays)
     _confirm_whole_value_data(plan, data, waived)
     validate_structure(plan)
@@ -3874,13 +3899,16 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         arg isa Expr || _sfail("stray literal $(repr(arg)) at model level " *
                                "(only `~`, `.~`, `=` and reserved macros lower)")
         # `@scan begin <setup>; for … end end` — a sequential-recurrence block.
-        # Parsed into a `ScanSpec` here; its carried state is claimed as a
+        # Parsed into a `ScanSpec` here; each carried array is claimed as a
         # model-level latent name.
         if arg.head === :macrocall && arg.args[1] === Symbol("@scan")
             (length(arg.args) >= 3 && arg.args[end] isa Expr) ||
                 _sfail("@scan takes a `begin … end` block")
             sp = parse_scan_block(arg.args[end])
-            _claim!(seen, seelines, sp.state, line)
+            _screen_scan(sp, data)
+            for st in sp.states
+                _claim!(seen, seelines, st, line)
+            end
             push!(scans, sp)
             continue
         end
@@ -4263,12 +4291,148 @@ function _matrix_column(nm, c, detshape, detmap, data, prior_names,
     c in plate_names && _sfail("design matrix `$nm` over the latent " *
                                "vector `$c` is not in slice D1 (the me " *
                                "mirror stays affine)")
-    any(s -> s.state === c, scans) && _sfail("design matrix `$nm` over " *
+    any(s -> c in s.states, scans) && _sfail("design matrix `$nm` over " *
                                              "scan state `$c` is not in " *
                                              "slice D1 (data/derived " *
                                              "columns only)")
     _sfail("design matrix `$nm` over unknown name `$c` — columns are " *
            "the intercept `1` or bare data/derived columns")
+end
+
+# ── `hcat` matrices read as values ───────────────────────────────────
+# `X = hcat(...)` is a matrix. A program that uses it only as `X * w`,
+# with `w[axes(X, 2)] .~ Fam.(args...)` a coefficient prior the matrix
+# term carries (or `w` a free name), lowers it as a design matrix whose
+# coefficient vector is `w`. Three reads need the matrix as a VALUE:
+#
+# - a definition passing `X` to a function, indexing it or taking its
+#   adjoint (`var.(eachcol(X))`, `size(X, 2)`, `X[:, 1]`, `X'`);
+# - `X * v` with `v` array-valued (a declared array, `z .* s`);
+# - a coefficient prior on `w[axes(X, 2)]` the term cannot carry.
+#
+# Such an `X` lowers exactly like a bound data matrix `X`: `w[axes(X, 2)]`
+# declarations are arrays, `X * w` is the data matrix-vector product, and
+# data-only definitions read the matrix. Both routes use the same matrix
+# (intercept `1` = a ones column), so the density is the same. Any other
+# use (`mu = X`, `a .+ X`, `X * s` with `s` a scalar, `X` as a location or
+# scale) keeps the design-matrix route and its refusal.
+
+# The `hcat` definitions of `det` the program reads as values. GLM
+# response matrices stay design matrices (their families read them).
+function _hcat_value_reads(det, detmap, sample, data, glms,
+        simplexes::Set{Symbol}, aligned::Set{Symbol})
+    mats = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
+    for g in glms
+        delete!(mats, g.matrix)
+    end
+    out = Set{Symbol}()
+    isempty(mats) && return out
+    coefvec = Dict{Symbol,Symbol}(s.lhs => s.matrix for s in sample
+        if s.lhs ∉ data && s.broadcast && s.matrix !== nothing &&
+            s.matrix in mats)
+    arrays = union(simplexes, Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && (s.dims !== nothing ||
+            (s.broadcast && (s.matrix !== nothing || s.levels !== nothing)) ||
+            (!s.broadcast && _is_lkj_cholesky_call(s.rhs)))))
+    memo = Dict{Symbol,Symbol}(a => :array for a in arrays)
+    env = _ShapeEnv(aligned, arrays)
+    shape(ex) = _shape_of(ex, data, detmap, memo, Set{Symbol}(), env)
+    scalar(a::Symbol) = a ∉ data && a ∉ aligned && a ∉ arrays &&
+        shape(a) === :scalar
+    # `X * w` reads `X` as a value when `w` is array-valued. A vector
+    # declared over a matrix (`w[axes(S, 2)]`) stays with the design-matrix
+    # route, which checks its sizing against `X`; only the coefficient
+    # prior can make it an array (below).
+    sized_by = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && s.broadcast && s.matrix !== nothing)
+    valued(X, w) = !(w isa Symbol && w in sized_by) &&
+        (w isa Symbol || w isa Expr) && shape(w) === :array
+    for (nm, rhs) in det
+        nm in mats && continue
+        _matrix_value_reads!(out, rhs, mats, valued, true)
+    end
+    for s in sample
+        _matrix_value_reads!(out, s.rhs, mats, valued, false)
+    end
+    for s in sample
+        X = get(coefvec, s.lhs, nothing)
+        X === nothing && continue
+        _matrix_term_prior(s.rhs, scalar) || push!(out, X)
+    end
+    return out
+end
+
+# Arithmetic heads: `X` as one of their operands is not a value read.
+const _MATRIX_OPERAND_HEADS = (:+, :-, :*, :/, :^, :\, ELEMENTWISE_OPS...)
+
+# Value reads of the matrices `mats` in `ex`: `X * v` with `valued(X, v)`,
+# and, inside a definition (`indef`), `X` as an argument of a function call
+# (`eachcol(X)`, `size(X, 2)`), an indexed `X[...]`, or `X'`.
+function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool)
+    ex isa Expr || return out
+    a = ex.args
+    if ex.head === :call && length(a) == 3 && a[1] === :* &&
+            a[2] isa Symbol && a[2] in mats
+        valued(a[2], a[3]) && push!(out, a[2])
+        return _matrix_value_reads!(out, a[3], mats, valued, indef)
+    end
+    if indef
+        isarg(x) = x isa Symbol && x in mats
+        if ex.head === :call && !isempty(a) &&
+                !(a[1] isa Symbol && a[1] in _MATRIX_OPERAND_HEADS)
+            union!(out, Iterators.filter(isarg, a[2:end]))
+        elseif (ex.head === :ref || ex.head === Symbol("'")) && isarg(a[1])
+            push!(out, a[1])
+        end
+    end
+    for x in a
+        _matrix_value_reads!(out, x, mats, valued, indef)
+    end
+    return out
+end
+
+# Whether a matrix term carries the broadcast coefficient prior `rhs`: a
+# coefficient family over literals, scalar names, or literal vectors of
+# those (the `_matrix_prior_arg` grammar). A non-family head
+# (`truncated.(...)`, `Exponential.(...)`) or an array-valued argument
+# (`lambda .* tau`, `sd` over an array) is an array prior. A RHS that is
+# not a dotted call stays with the term, whose error names the fix.
+function _matrix_term_prior(rhs, scalar)
+    rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
+        rhs.args[1] isa Symbol && rhs.args[2] isa Expr &&
+        rhs.args[2].head === :tuple || return true
+    haskey(_COEF_FAMILIES, rhs.args[1]) || return false
+    elt(x) = x isa Real || x === :Inf || (x isa Symbol && scalar(x))
+    return all(a -> elt(a) ||
+        (a isa Expr && a.head === :vect && all(elt, a.args)),
+        rhs.args[2].args)
+end
+
+# The value matrices' plan records: `bind_data` builds each from its
+# columns (the intercept `1` is a ones column, as in a design matrix), so
+# a column is `1` or a bound data column.
+function _value_design_matrices(defs, data::Set{Symbol})
+    out = DesignMatrix[]
+    for (nm, rhs) in defs
+        args = rhs.args[2:end]
+        isempty(args) && _sfail("matrix `$nm = $rhs` calls `hcat` " *
+                                "with no columns")
+        cols = Union{Nothing,Symbol}[]
+        for a in args
+            if a isa Number && !(a isa Bool) && a == 1
+                push!(cols, nothing)
+            elseif a isa Symbol && a in data
+                push!(cols, a)
+            else
+                _sfail("matrix `$nm = $rhs` is read as a value, " *
+                       "so `bind_data` builds it from its columns: each " *
+                       "is the intercept `1` or a bound data column, got " *
+                       "$(repr(a)) (bind it as data)")
+            end
+        end
+        push!(out, DesignMatrix(nm, cols, nm))
+    end
+    return out
 end
 
 # Pre-pass: expand top-level `@plate for i in R ... end` blocks into
@@ -7838,8 +8002,20 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         # response mean IS the carried state (no linear predictor). Admitted
         # family/link is checked in `_validate_responses` (Gaussian-identity, v1).
         # A pin over a scan state claims nothing (no predictor is built) and
-        # falls through to the unconsumed-pin error.
+        # falls through to the unconsumed-pin error. A pure alias of one
+        # (`w = u`, a latent submodel's `x = x_level` binding) is that state:
+        # naming never changes legality.
         loc in ctx.scan_states && return loc
+        target = _scan_alias_target(loc, ctx)
+        if target !== nothing
+            # The alias chain vanishes like any absorbed location.
+            nm = loc
+            while nm !== target
+                push!(ctx.absorbed, nm)
+                nm = ctx.detmap[nm]
+            end
+            return target
+        end
         if !haskey(ctx.detmap, loc)
             # A bare sampled parameter (constrained-scale, no link
             # inversion): the mixture bare-mean slots, single-family
@@ -8275,6 +8451,24 @@ function _composed_has_sub(node, ctx, allow_factor::Bool = false)
     return any(a -> _composed_has_sub(a, ctx, allow_factor), node.args[2:end])
 end
 
+# A sub-predictor whose value exists only as an LP node: one already
+# interned as a predictor (a response location or scale, absorbed —
+# never also a named local). A definition that is not a predictor, even
+# one holding coefficient candidates, keeps the derived-column path,
+# which inlines it. A name bound to a composition reads what its tree
+# reads, since extraction inlines it (`prop = mu .* s2;
+# sd = hypot.(s1, prop)`).
+function _composed_has_lp_sub(node, ctx)
+    if node isa Symbol
+        haskey(ctx.pred_idx, node) && return _is_composed_sub(node, ctx, true)
+        return haskey(ctx.detmap, node) && ctx.detmap[node] !== node &&
+            _composed_trigger(node, ctx) &&
+            _composed_has_lp_sub(ctx.detmap[node], ctx)
+    end
+    node isa Expr || return false
+    return any(a -> _composed_has_lp_sub(a, ctx), node.args)
+end
+
 function _composed_has_scalar_leaf(node, ctx)
     node isa Symbol && return _is_composed_scalar(node, ctx)
     node isa Expr || return false
@@ -8324,10 +8518,20 @@ function _composed_trigger(rhs, ctx)
     # (`resp = logistic.((log_dose .- dl) .* exp.(dls))`) is a composition.
     _is_composed_map(rhs) && rhs.args[1] in _COMPOSED_UNARY &&
         return _composed_has_sub(rhs, ctx, true)
+    # Any other elementwise map (`hypot.(s1, mu .* s2)`, `sqrt.(mu)`) or
+    # dotted operator (`mu ./ s`, `mu .^ 2`) reading a sub-predictor whose
+    # value exists only as an LP node composes too: the reader takes that
+    # LP value, evaluated once (`_composed_has_lp_sub`). Over other
+    # definitions the derived-column path already reads a named local, so
+    # it stays.
+    _is_composed_map(rhs) && _composed_map_fn(rhs.args[1]) &&
+        return _composed_has_lp_sub(rhs, ctx)
     rhs.head === :call || return false
     isempty(rhs.args) && return false
     op = rhs.args[1]
     op isa Symbol || return false
+    op in _COMPOSED_MORE_OPS && _composed_has_lp_sub(rhs, ctx) &&
+        return true
     if op === :.*
         return any(a -> _composed_has_sub(a, ctx, true), rhs.args[2:end])
     elseif op === :* && length(rhs.args) == 3
@@ -8377,7 +8581,9 @@ _composed_root(rhs, ctx) =
 
 """Extract + validate a combination tree (trigger already fired).
 Leaves: sub-predictors (vector defs) and scalars (sampled names,
-scalar definitions). Everything else fails closed with guidance."""
+scalar definitions) and sub-free scalar subexpressions, a literal
+included (`hypot.(1.0, mu)`, `mu .^ 2`), each one scalar leaf.
+Everything else fails closed with guidance."""
 function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         scalars::Vector{Symbol}, datas::Vector{Symbol} = Symbol[])
     where = "predictor $pname"
@@ -8418,13 +8624,19 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         "sub-predictors and scalars)")
     if _is_composed_map(node)
         f = node.args[1]
-        f in _COMPOSED_UNARY || return _sfail("$where maps " *
+        _composed_map_fn(f) || return _sfail("$where maps " *
             "$(repr(f)). over a composition — admitted elementwise maps: " *
-            "$(join(string.(_COMPOSED_UNARY, "."), ", "))")
-        length(node.args[2].args) == 1 || return _sfail("$where " *
-            "$(repr(f)). takes one operand")
-        return Expr(:., f, Expr(:tuple, _extract_composed_tree(pname,
-            only(node.args[2].args), ctx, subs, scalars, datas)))
+            "$(join(string.(_COMPOSED_UNARY, "."), ", ")), the dotted " *
+            "built-in math functions, `ifelse.`, and dotted functions " *
+            "visible in the model module")
+        fargs = node.args[2].args
+        f isa Symbol && length(fargs) != _elementwise_arity(f) &&
+            return _sfail("$where $(repr(f)). takes " *
+                _operands_phrase(_elementwise_arity(f)))
+        isempty(fargs) && return _sfail("$where $(repr(f)). takes at " *
+            "least one operand")
+        return Expr(:., f, Expr(:tuple, (_extract_composed_tree(pname, a,
+            ctx, subs, scalars, datas) for a in fargs)...))
     end
     node.head === :call || return _sfail("$where composition node " *
         "$(repr(node)) is not admitted (v1: `. .*`/`.+`/`.−` over " *
@@ -8443,6 +8655,11 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             (op === :.- ? "one or two operands" : "two operands"))
         return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
             subs, scalars, datas) for a in args)...)
+    elseif op in _COMPOSED_MORE_OPS
+        length(args) == 2 || return _sfail("$where `$op` takes two " *
+            "operands")
+        return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
+            subs, scalars, datas) for a in args)...)
     elseif op === :* && length(args) >= 2
         # Julia-valid scalar `*` normalizes to dotted (Base broadcasts —
         # behavior-preserving, the canonicalization doctrine); an n-ary
@@ -8457,8 +8674,10 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             "(`. .*`/`.+`/`.−`) or bind scalar subexpressions to a name " *
             "first (`s = be + 1; eta = s .* th`)")
     else
-        return _sfail("$where applies `$op` inside a composition — v1 " *
-            "admits `. .*`/`.+`/`.−` over sub-predictors and scalars only")
+        return _sfail("$where applies `$op` inside a composition — " *
+            "compositions admit dotted operators and dotted elementwise " *
+            "functions over sub-predictors, scalars and data (write `$op` " *
+            "dotted, or bind the value to a name first)")
     end
 end
 
@@ -9084,10 +9303,11 @@ end
 # trajectory as a direct beta-free summand (SB's `dar(time)` shape —
 # the formula intercept is the initial level, the `mo1` splice shape).
 # Exactly two bare sampled scalars: a truncated-`[0, 1]`-Normal
-# persistence and a positive-Normal scale, both under Stan-kernel
-# semantics once lowered (`(:interval_stan, 0, 1)` / `:positive_stan`
-# via `_dar_stan_override` — SB never renormalizes bounds). Additive
-# only; one `dar()` call per predictor in v1. The state synthesizes as
+# persistence and a positive-Normal scale, each keeping the meaning of
+# its statement as written (Distributions semantics: the truncation and
+# half-Normal normalizers stay). The library spelling is the
+# `differenced_ar1` submodel (`src/library.jl`). Additive only; one
+# `dar()` call per predictor in v1. The state synthesizes as
 # `dar_<pname>` and claims the name up front (the
 # `_implicit_vector!` precedent). Both parameters record in `dar_coefs`
 # (checked disjoint from predictor coefficients after lowering) and
@@ -9143,6 +9363,18 @@ function _classify_dar(pname, core::Expr, sign::Int, ctx)
         state, state), nothing
 end
 
+# The scan state a pure alias chain (`w = u`, `v = w`) names, or nothing.
+function _scan_alias_target(nm::Symbol, ctx)
+    seen = Set{Symbol}()
+    while haskey(ctx.detmap, nm) && !(nm in seen)
+        push!(seen, nm)
+        nxt = ctx.detmap[nm]
+        nxt isa Symbol || return nothing
+        nm = nxt
+    end
+    return nm in ctx.scan_states && !isempty(seen) ? nm : nothing
+end
+
 function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     if core in ctx.varying_contribs
         sign < 0 && _sfail("predictor $pname: varying contribution " *
@@ -9172,10 +9404,15 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     core in ctx.plate_names && _sfail(
         "predictor $pname: bare latent $core is not a term — scale it " *
         "by a coefficient (`b .* $core`, the SB `me` mirror)")
-    core in ctx.scan_states && _sfail("predictor $pname: $core is a bare " *
-        "scan state — LP use needs a sampled coefficient (`b .* $core` " *
-        "in an additive position); a bare scan state is only a direct " *
-        "response location (`y .~ Normal.($core, s)`)")
+    if core in ctx.scan_states
+        # A bare scan state is a beta-free summand: the state spliced
+        # unscaled (`mu = a .+ x`, the dar/`mo1` shape). Additive only.
+        sign > 0 || _sfail("predictor $pname negates the scan state " *
+            "$core — scan summands are additive only (write `.+ $core`)")
+        label = Symbol("scan_", pname, "_", core)
+        return TermSpec(ScanSummandTerm, ColumnRef[],
+            (scan_id = core, coef = nothing), label, label), nothing
+    end
     haskey(ctx.detmap, core) && _scalar_summand_error(pname, core)
     core in ctx.prior_names && core ∉ ctx.coef_priors &&
         _scalar_summand_error(pname, core)
@@ -10273,25 +10510,6 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
 const _HOIST_FAMILIES = union(Set{Symbol}(keys(_PARAM_FAMILIES)),
     Set{Symbol}(keys(_COEF_FAMILIES)), Set{Symbol}((:HalfNormal, :HalfCauchy)))
 
-# A `dar()` trajectory parameter rides Stan-kernel semantics: the
-# persistence's `(:interval, 0, 1)` becomes `(:interval_stan, 0, 1)`
-# and the scale's `:positive` becomes `:positive_stan` — same
-# constrained transforms, NO truncation renormalizers (SB never
-# renormalizes bounds). Keyed on actual `dar()` USE (`dar_specs`), not
-# on RHS shape: a dar-shaped `~` never consumed by `dar()` keeps
-# Distributions semantics. `_classify_dar` already gated both shapes,
-# so a mismatch here is an internal inconsistency the contract
-# rejects downstream.
-function _dar_stan_override(p::SampledParameter, specs::Vector{DarSpec})
-    for s in specs
-        p.name === s.beta && return SampledParameter(p.name, p.family,
-            p.args, (:interval_stan, 0.0, 1.0), p.label)
-        p.name === s.sigma && return SampledParameter(p.name, p.family,
-            p.args, :positive_stan, p.label)
-    end
-    return p
-end
-
 function _lower_parameters(sample, coefuse, ctx, glmuse)
     params = SampledParameter[]
     syms = Set{Symbol}()
@@ -10356,7 +10574,6 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
             continue
         end
         p = _lower_parameter(s.lhs, s.rhs, coefuse, ctx.matrices)
-        p = _dar_stan_override(p, ctx.dar_specs)
         push!(params, p)
         for v in values(p.args)
             v isa Symbol && push!(syms, v)

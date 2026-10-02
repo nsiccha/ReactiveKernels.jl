@@ -318,3 +318,179 @@ end
         @test occursin("takes one operand", sprint(showerror, err))
     end
 end
+
+# Any elementwise map or dotted operator over a sub-predictor whose value
+# exists only as an LP node composes (snag `rkppl-predictor-f40e6808`): an
+# additive-proportional error model reads the location's value in its
+# scale. The scale takes the location's LP node; a coefficient stays in
+# the location's affine block, and the location is evaluated once.
+using Distributions: Normal, Exponential, logpdf
+_cmp_scaled(x, a) = a * x
+
+const _CMP_AP_COLS = Dict{Symbol,AbstractVector}(
+    :y => [0.3, -1.2, 0.8, 1.9, -0.4, 0.6, 1.1, -0.7, 0.2],
+    :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0, 0.25, -0.75, 2.0])
+
+# The additive-proportional log density at location `mu` (likelihood only).
+function _cmp_ap_loglik(mu, s1, s2)
+    y = Vector{Float64}(_CMP_AP_COLS[:y])
+    return sum(logpdf.(Normal.(mu, hypot.(s1, mu .* s2)), y))
+end
+_cmp_ap_x() = Vector{Float64}(_CMP_AP_COLS[:x])
+_cmp_ap_scales(q) = logpdf(Exponential(1), q.s1) + logpdf(Exponential(1), q.s2)
+
+# Posterior and Enzyme gradient at the constrained probe `q` against
+# `want(q)` (likelihood + priors) plus the layout's log-Jacobian.
+function _cmp_ap_check(prog, q::NamedTuple, want; cols = _CMP_AP_COLS)
+    plan = lower_rkppl(prog, keys(cols))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    lay = built.layout
+    u = unconstrain(lay, merge(constrain(lay, zeros(lay.total)), q))
+    kern = prepare_query(built, bound, :sampler)
+    @test Base.invokelatest(kern, u) ≈ want(q) + logjac(lay, u) rtol = 1e-12
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    sampler_value_and_gradient!(prep, g, u)
+    @test isapprox(g, _findiff_grad(w -> Base.invokelatest(kern, w), u);
+        rtol = 1e-5, atol = 1e-7)
+    return plan, bound, built
+end
+
+# `a` in the location's coefficient block `mu` (no intercept).
+const _CMP_AP_Q = (mu = [0.7], s1 = 0.5, s2 = 0.3)
+_cmp_ap_want(q) = _cmp_ap_loglik(q.mu[1] .* _cmp_ap_x(), q.s1, q.s2) +
+    logpdf(Normal(0, 1), q.mu[1]) + _cmp_ap_scales(q)
+
+@testset "composed scale reads a coefficient-holding location" begin
+    plan, bound, built = _cmp_ap_check(quote
+        a ~ Normal(0.0, 1.0); s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
+        mu = a .* x
+        sd = hypot.(s1, mu .* s2)
+        y .~ Normal.(mu, sd)
+    end, _CMP_AP_Q, _cmp_ap_want)
+    @test [p.name for p in plan.predictors] == [:mu, :sd]
+    mu, sd = plan.predictors
+    @test [t.kind for t in mu.terms] == [ContinuousTerm]
+    t = only(sd.terms)
+    @test t.kind === ComposedTerm
+    @test t.options.subs == [:mu]
+    @test t.options.scalars == [:s1, :s2]
+    @test t.options.tree == Expr(:., GlobalRef(Main, :hypot),
+        Expr(:tuple, :s1, :(mu .* s2)))
+    @test isempty(plan.derived)
+    @test [(p.predictor, p.addressee) for p in plan.population_priors] ==
+        [(:mu, :x)]
+    # The scale reads the location's LP node; nothing re-evaluates it.
+    src = string(kernel_expr(bound, built.layout))
+    @test occursin("_ppl_lp_sd = Main.hypot.(s1, _ppl_lp_mu .* s2)", src)
+    # A built-in map with literal exponents, and a named intermediate
+    # (naming never changes legality): the same density.
+    _cmp_ap_check(quote
+        a ~ Normal(0.0, 1.0); s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
+        mu = a .* x
+        sd = sqrt.(s1 .^ 2 .+ (mu .* s2) .^ 2)
+        y .~ Normal.(mu, sd)
+    end, _CMP_AP_Q, _cmp_ap_want)
+    named, _, _ = _cmp_ap_check(quote
+        a ~ Normal(0.0, 1.0); s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
+        mu = a .* x
+        prop = mu .* s2
+        sd = hypot.(s1, prop)
+        y .~ Normal.(mu, sd)
+    end, _CMP_AP_Q, _cmp_ap_want)
+    @test only(named.predictors[end].terms).options.tree ==
+        Expr(:., GlobalRef(Main, :hypot), Expr(:tuple, :s1, :(mu .* s2)))
+    # Intercept plus slope: the block is `[Intercept, x]`.
+    _cmp_ap_check(quote
+        b0 ~ Normal(0.0, 5.0); a ~ Normal(0.0, 1.0)
+        s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
+        mu = b0 .+ a .* x
+        sd = hypot.(s1, mu .* s2)
+        y .~ Normal.(mu, sd)
+    end, (mu = [0.4, 0.7], s1 = 0.5, s2 = 0.3),
+        q -> _cmp_ap_loglik(q.mu[1] .+ q.mu[2] .* _cmp_ap_x(), q.s1, q.s2) +
+            logpdf(Normal(0, 5), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2]) +
+            _cmp_ap_scales(q))
+end
+
+@testset "composed scale over a module-call location evaluates it once" begin
+    # A dotted module function makes the location an extracted column
+    # (`a` is its argument, not a coefficient); the scale reads the
+    # location's LP node instead of recomputing the call. With a
+    # coefficient-free definition (`c ~ Exponential`) the location used to
+    # be dropped from the kernel ("derived column references unknown
+    # name mu" at `bind_data`).
+    for (prog, q, want) in (
+            (quote
+                a ~ Normal(0.0, 1.0); s1 ~ Exponential(1.0)
+                s2 ~ Exponential(1.0)
+                mu = _cmp_scaled.(x, a)
+                sd = hypot.(s1, mu .* s2)
+                y .~ Normal.(mu, sd)
+            end, (a = 0.7, s1 = 0.5, s2 = 0.3),
+                q -> _cmp_ap_loglik(q.a .* _cmp_ap_x(), q.s1, q.s2) +
+                    logpdf(Normal(0, 1), q.a) + _cmp_ap_scales(q)),
+            (quote
+                c ~ Exponential(1.0); s1 ~ Exponential(1.0)
+                s2 ~ Exponential(1.0)
+                mu = _cmp_scaled.(x, c)
+                sd = hypot.(s1, mu .* s2)
+                y .~ Normal.(mu, sd)
+            end, (c = 0.7, s1 = 0.5, s2 = 0.3),
+                q -> _cmp_ap_loglik(q.c .* _cmp_ap_x(), q.s1, q.s2) +
+                    logpdf(Exponential(1), q.c) + _cmp_ap_scales(q)))
+        plan, bound, built = _cmp_ap_check(prog, q, want)
+        src = string(kernel_expr(bound, built.layout))
+        @test count("_cmp_scaled", src) == 1
+        @test only(plan.predictors[end].terms).kind === ComposedTerm
+    end
+end
+
+# A reader in another response takes the location's value only once that
+# location is a predictor: its response must come first. Reading it from
+# an earlier response still takes the derived-column path, which cannot
+# recompute a location holding a coefficient.
+const _CMP_XR_COLS = merge(_CMP_AP_COLS, Dict{Symbol,AbstractVector}(
+    :z => [1.1, -0.3, 0.9, 0.4, -1.4, 0.2, 0.7, -0.1, 1.6]))
+
+@testset "composed reader in a later response" begin
+    want(q) = begin
+        mu = q.mu[1] .* _cmp_ap_x()
+        sum(logpdf.(Normal.(mu, 1.0), Vector{Float64}(_CMP_XR_COLS[:y]))) +
+            sum(logpdf.(Normal.(q.m2[1] .* _cmp_ap_x(),
+                hypot.(q.s1, mu .* q.s2)),
+                Vector{Float64}(_CMP_XR_COLS[:z]))) +
+            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.m2[1]) +
+            _cmp_ap_scales(q)
+    end
+    plan, _, _ = _cmp_ap_check(quote
+        a ~ Normal(0.0, 1.0); b ~ Normal(0.0, 1.0)
+        s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
+        mu = a .* x
+        y .~ Normal.(mu, 1.0)
+        m2 = b .* x
+        sd = hypot.(s1, mu .* s2)
+        z .~ Normal.(m2, sd)
+    end, (mu = [0.7], m2 = [0.4], s1 = 0.5, s2 = 0.3), want;
+        cols = _CMP_XR_COLS)
+    @test only(plan.predictors[end].terms).kind === ComposedTerm
+    # The reader's response first: not built yet (residual of snag
+    # `rkppl-predictor-f40e6808`).
+    ok = try
+        bind_data(lower_rkppl(quote
+            a ~ Normal(0.0, 1.0); b ~ Normal(0.0, 1.0)
+            s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
+            mu = a .* x
+            m2 = b .* x
+            sd = hypot.(s1, mu .* s2)
+            z .~ Normal.(m2, sd)
+            y .~ Normal.(mu, 1.0)
+        end, keys(_CMP_XR_COLS)), _CMP_XR_COLS)
+        true
+    catch e
+        e isa Union{SurfaceLoweringError,ContractValidationError} || rethrow()
+        false
+    end
+    @test_broken ok
+end

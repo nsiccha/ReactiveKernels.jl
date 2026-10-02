@@ -114,10 +114,11 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
             t.addressee, 0, Symbol[], [])
     elseif t.kind === ScanSummandTerm
         # A scan summand is a direct `state .* coef` expression over the
-        # in-graph recurrence state and a scalar sampled coefficient — no
-        # design-matrix width (the state is sampled, not data). The state
-        # rides in `column`; the generator reads the TERMS for the full
-        # (scan_id, coef) key, which does not fit one Symbol.
+        # in-graph recurrence state and a scalar sampled coefficient (or
+        # the bare state when `coef === nothing`) — no design-matrix width
+        # (the state is sampled, not data). The state rides in `column`;
+        # the generator reads the TERMS for the full (scan_id, coef) key,
+        # which does not fit one Symbol.
         return DesignBlock(ScanSummandTerm, t.options.scan_id,
             t.addressee, 0, Symbol[], [])
     elseif t.kind === DarSummandTerm
