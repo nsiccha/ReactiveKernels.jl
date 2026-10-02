@@ -748,7 +748,7 @@ function _mm_k1_draws(nt, sfx)
     tau = only(getfield(nt, Symbol("tau_", sfx)))
     z = getfield(nt, Symbol("z_flat_", sfx))
     b = reshape(tau .* z, length(z), 1)
-    return b, logpdf(Normal(0, 1), tau) + sum(logpdf.(Normal(0, 1), z))
+    return b, logpdf(truncated(Normal(0, 1), 0, Inf), tau) + sum(logpdf.(Normal(0, 1), z))
 end
 
 @testset "mm intercept e2e values and gradient" begin
@@ -841,7 +841,7 @@ end
             b, Z)
         ll = sum(logpdf.(Normal.(nt.a .+ r, 1.0), _MM_Y))
         pr = logpdf(Normal(0, 5), nt.a) + lkj_logconst(2, 1.0) +
-            sum(logpdf.(Normal(0, 1), tau)) +
+            sum(logpdf.(truncated(Normal(0, 1), 0, Inf), tau)) +
             sum(logpdf.(Normal(0, 1), zf))
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
         @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -872,7 +872,7 @@ end
         r = _mm_ref_r([_MM_G1, _MM_G2], [_MM_W1, _MM_W2], b, Z)
         ll = sum(logpdf.(Normal.(nt.a .+ r, 1.0), _MM_Y))
         pr = logpdf(Normal(0, 5), nt.a) + lkj_logconst(2, 1.0) +
-            sum(logpdf.(Normal(0, 1), tau)) +
+            sum(logpdf.(truncated(Normal(0, 1), 0, Inf), tau)) +
             sum(logpdf.(Normal(0, 1), zf))
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
         @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -905,7 +905,7 @@ end
     r = _mm_ref_r([_MM_G1, _MM_G2], [fill(0.5, 4), fill(0.5, 4)], b, Z)
     ll = sum(logpdf.(Normal.(nt.a .+ r, 1.0), _MM_Y))
     pr = logpdf(Normal(0, 5), nt.a) + 0.0 +
-        sum(logpdf.(Normal(0, 1), tau)) + sum(logpdf.(Normal(0, 1), zf))
+        sum(logpdf.(truncated(Normal(0, 1), 0, Inf), tau)) + sum(logpdf.(Normal(0, 1), zf))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
     jac = only(u[_mm_seg(lay, Symbol("tau_", sfx))])
@@ -939,8 +939,8 @@ end
         ll = sum(logpdf.(Normal.(a .+ r, 1.0), _MM_Y))
         pr = logpdf(Normal(0, 5), a) + lkj_logconst(2, 1.0) +
             lkj_logconst(2, 1.0) +
-            sum(logpdf.(Normal(0, 1), t1)) +
-            sum(logpdf.(Normal(0, 1), t2)) +
+            sum(logpdf.(truncated(Normal(0, 1), 0, Inf), t1)) +
+            sum(logpdf.(truncated(Normal(0, 1), 0, Inf), t2)) +
             sum(logpdf.(Normal(0, 1), zmat))
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
         @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -974,8 +974,8 @@ end
         r = _mm_ref_strat_r([1, 2, 1, 3], [1, 1, 2], [b1, b2], ones(4, 1))
         ll = sum(logpdf.(Normal.(a .+ r, 1.0), _MM_Y))
         pr = logpdf(Normal(0, 5), a) + 0.0 + 0.0 +
-            sum(logpdf.(Normal(0, 1), t1)) +
-            sum(logpdf.(Normal(0, 1), t2)) +
+            sum(logpdf.(truncated(Normal(0, 1), 0, Inf), t1)) +
+            sum(logpdf.(truncated(Normal(0, 1), 0, Inf), t2)) +
             sum(logpdf.(Normal(0, 1), zf))
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
         @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -1011,7 +1011,7 @@ end
         ll = sum(logpdf.(Normal.(a .+ r, 1.0), y))
         pr = logpdf(Normal(0, 5), a) +
             sum(lkj_corr_cholesky_logpdf(Ls[k], 1.0) for k in 1:2) +
-            sum(sum(logpdf.(Normal(0, 1), ts[k])) for k in 1:2) +
+            sum(sum(logpdf.(truncated(Normal(0, 1), 0, Inf), ts[k])) for k in 1:2) +
             sum(logpdf.(Normal(0, 1), zmat))
         jac = sum(lkj_chol_logjac(us[k], 3) +
             sum(u[_mm_seg(lay, Symbol(:tau_g_s, k))]) for k in 1:2)
@@ -1224,6 +1224,7 @@ end
 _k1_sd_delta(u) = logpdf(Normal(), exp(u)) + u - logpdf(Normal(), u)
 _k1_sd_delta_grad(u) = 1 + u - exp(2u)
 
+# Historical SB probes below add log(2) per normalized scale.
 # One SB probe: RK posterior + Enzyme gradient at the remapped SB u
 # against the brief's jacT value + BridgeStan-AD gradient. `k1_scale`
 # names the SB position of a K=1 intercept's log-scale coordinate,
@@ -1260,7 +1261,7 @@ end
             r ~ varying_slice(d, 1)
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, _sb_mm_cols(), pairs, -15.58948984045714,
+        end, _sb_mm_cols(), pairs, -15.58948984045714 + 1log(2),
         [1.250881394124855, 0.29153139168734266, 0.4642299002163417,
             0.28655716611840265, -0.01939495660342591, -5.86641796738053];
         k1_scale = 2)
@@ -1277,7 +1278,7 @@ end
             r ~ varying_slice(d, 1)
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, _sb_mm_cols(), pairs, -15.574382310331188,
+        end, _sb_mm_cols(), pairs, -15.574382310331188 + 1log(2),
         [1.236743206846504, 0.3026598991134787, 0.4652073800224629,
             0.19836679706561827, 0.05669644062510948, -5.896633027632439];
         k1_scale = 2)
@@ -1295,7 +1296,7 @@ end
             r ~ varying_slice(d, 1)
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, _sb_mm_cols(), pairs, -15.492630101384526,
+        end, _sb_mm_cols(), pairs, -15.492630101384526 + 1log(2),
         [0.9963940231145335, 0.31276498503668976, 1.0513921097313184,
             0.7277672529115509, 0.11772905659279653, -6.06013744552576];
         k1_scale = 2)
@@ -1313,7 +1314,7 @@ end
             r ~ varying_slice(d, 1:2)
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, _sb_mm_cols(), pairs, -21.14276794489944,
+        end, _sb_mm_cols(), pairs, -21.14276794489944 + 2log(2),
         [1.2077376837444953, 0.630506832103128, 0.4380159250117601,
             0.28074249933394135, 0.4590194499479547, 0.008632321192932425,
             0.22583253802326175, -0.2162400184627247, 0.008988672674119819,
@@ -1331,7 +1332,7 @@ end
             r ~ varying_slice(d, 1)
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, _sb_mm_cols(), pairs, -16.150519243927082,
+        end, _sb_mm_cols(), pairs, -16.150519243927082 + 1log(2),
         [1.3390094281599112, 0.3962900564469555, 0.08969746080452912,
             -0.1351518971245377, -0.15557751296907585, -5.785542552246796])
 end
@@ -1346,7 +1347,7 @@ end
             r ~ varying_slice(d, 1)
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, _sb_gr_cols(), pairs, -18.507393826337786,
+        end, _sb_gr_cols(), pairs, -18.507393826337786 + 2log(2),
         [1.145341170105935, 0.42507826583901354, 0.34282266028297126,
             0.45756876030978466, 0.16471983334259416, 0.003138445644975174,
             -0.2064866000560754, -5.884658580828696])
@@ -1363,7 +1364,7 @@ end
             r ~ varying_slice(d, 1:2)
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, _sb_gr_cols(), pairs, -26.70296217977992,
+        end, _sb_gr_cols(), pairs, -26.70296217977992 + 4log(2),
         [1.0807184231225622, 0.6767830395897837, 0.5495863505829115,
             0.38756444882142826, 0.32100344408274084, 0.2871856402541647,
             0.13217327990018723, 0.4242400424375435, -0.012366222688957774,

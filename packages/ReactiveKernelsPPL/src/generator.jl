@@ -3542,15 +3542,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         _vector_prior_stmts!(stmts, terms, v.name, v.family, v.args,
             v.support_override)
     end
-    # Varying draws: the LKJ node plus the `tau` prior plus the
-    # `z_flat` plate (shared vector-prior helper), at every K (the 1x1
-    # LKJ node is the `0.0` literal). `tau` emits WITHOUT the thin
-    # layer's `+log(2)` half renormalizer: SB's `std_normal(; lower=0)`
-    # is Stan lower-bound kernel semantics (exp Jacobian only, no
-    # truncation normalizer). User-facing `HalfNormal` priors keep the
-    # proper-half convention; draws-internal `tau` follows SB — under
-    # every configured sd prior too (SB's generic path keeps the
-    # positive bound with no truncation normalizer).
+    # Varying scales are normalized halves in every geometry.
     for d in plan.varying_draws
         if d.strata !== nothing
             _stratified_prior_stmts!(stmts, terms, d, layout)
@@ -3564,14 +3556,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         _vector_prior_stmts!(stmts, terms, z, :normal,
             (arg1 = 0, arg2 = 1), nothing)
     end
-    # HSGP bases (SB `_sb_hsgp`/`_sb_hsgp_aniso`): the length scales and
-    # marginal scale as scalar `lognormal(0, 1)` nodes plus the
-    # standardized `beta_raw` plate (shared vector-prior helper). The
-    # floored rhos emit WITHOUT a truncation normalizer: SB's
-    # `lognormal(0,1; lower=rho_lower)` is Stan lower-bound kernel
-    # semantics (offset-exp Jacobian only — the varying-`tau` precedent).
-    # Stated hyper priors (`HyperPrior`) replace the defaults with the
-    # same Stan-kernel semantics (plain `_lpdf`, no normalizer).
+    # HSGP hyperparameters use normalized declared priors. A default
+    # length-scale prior is truncated at its actual fitted validity floor.
     for hb in plan.hsgp_bases
         names = _hsgp_names(hb)
         rfam, rargs = hb.rho_prior isa HyperPrior ?
@@ -3581,9 +3567,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             (hb.sigma_prior.family,
                 collect(Any, values(hb.sigma_prior.args))) :
             (:lognormal, Any[0, 1])
-        # Per-group hyper-predictors (BRM defaults): intercept
-        # `Normal(0, 1)`, sd `Normal(0, 1)` on the positive support
-        # (Stan kernel — plain `_lpdf`), non-centered `z` standard normal.
+        # Grouped hyper-predictors: Normal intercept, HalfNormal sd,
+        # and standard-normal non-centered coordinates.
         function hyper_priors!(h)
             if h.intercept
                 bnode = Symbol(:_ppl_prior_, h.beta0)
@@ -3593,7 +3578,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             end
             dnode = Symbol(:_ppl_prior_, h.sd)
             push!(stmts, :($dnode::Float64 =
-                $(_family_logpdf_expr(:normal, Any[0, 1], h.sd))))
+                $(_family_logpdf_expr(:normal, Any[0, 1], h.sd)) + log(2)))
             push!(terms, dnode)
             _vector_prior_stmts!(stmts, terms, h.z, :normal,
                 (arg1 = 0, arg2 = 1), nothing)
@@ -3603,7 +3588,12 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         else
             for rho in names.rhos
                 node = Symbol(:_ppl_prior_, rho)
-                cell = _family_logpdf_expr(rfam, rargs, rho)
+                entry = only(e for e in layout.entries if e.name === rho)
+                support = hb.rho_prior isa HyperPrior ? hb.rho_prior.support_override :
+                    (:truncated, entry.transform === :floored ? entry.lo : 0.0, Inf)
+                cell = _sampled_prior_expr(SampledParameter(rho, rfam,
+                    NamedTuple{ntuple(i -> Symbol(:arg, i), length(rargs))}(Tuple(rargs)),
+                    support, rho); pre = stmts)
                 push!(stmts, :($node::Float64 = $cell))
                 push!(terms, node)
             end
@@ -3612,7 +3602,10 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             hyper_priors!(names.sigma_hyper)
         else
             snode = Symbol(:_ppl_prior_, names.sigma)
-            scell = _family_logpdf_expr(sfam, sargs, names.sigma)
+            support = hb.sigma_prior isa HyperPrior ? hb.sigma_prior.support_override : nothing
+            scell = _sampled_prior_expr(SampledParameter(names.sigma, sfam,
+                NamedTuple{ntuple(i -> Symbol(:arg, i), length(sargs))}(Tuple(sargs)),
+                support, names.sigma); pre = stmts)
             push!(stmts, :($snode::Float64 = $scell))
             push!(terms, snode)
         end
@@ -3688,7 +3681,7 @@ function _stratified_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         $(_lkj_prior_terms(sL, g.K, d.lkj_eta; nstack = g.S))))
     push!(terms, lnode)
     _vector_prior_stmts!(stmts, terms, _strata_tau_name(d), :normal,
-        (arg1 = 0, arg2 = 1), nothing)
+        (arg1 = 0, arg2 = 1), :positive)
     z = _varying_corr_names(d)[3]
     _vector_prior_stmts!(stmts, terms, z, :normal,
         (arg1 = 0, arg2 = 1), nothing)
@@ -3717,32 +3710,27 @@ function _sd_prior_shapes(d::VaryingDraws)
     return [_sd_prior_shape(p) for p in d.sd_priors]
 end
 
-# One correlated draws block's `tau` prior (SB's homogeneous /
-# heterogeneous split): all-Normal(0, 1) keeps the historical plate
-# emission bit-identical; a uniform configured prior stays one plate
-# with the mapped family; mixed margins unroll to one scalar density
-# per margin over `tau[k]` refs (the LKJ-sandwich precedent). Every
-# path keeps `support = nothing` (Stan lower-bound kernel semantics —
-# the layout's `:exp` Jacobian, no truncation renormalizer).
+# A homogeneous prior stays one retained plate; structurally stated mixed
+# margins share the same normalized half densities.
 function _sd_prior_tau_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         d::VaryingDraws, tau::Symbol)
     shapes = _sd_prior_shapes(d)
     if all(s -> s == (:normal, (arg1 = 0.0, arg2 = 1.0)), shapes)
         _vector_prior_stmts!(stmts, terms, tau, :normal,
-            (arg1 = 0, arg2 = 1), nothing)
+            (arg1 = 0, arg2 = 1), :positive)
         return nothing
     end
     if all(s -> s == shapes[1], shapes)
         fam, args = shapes[1]
-        _vector_prior_stmts!(stmts, terms, tau, fam, args, nothing)
+        _vector_prior_stmts!(stmts, terms, tau, fam, args, fam === :exponential ? nothing : :positive)
         return nothing
     end
     node = Symbol(:_ppl_prior_, tau)
     cells = Any[]
     for k in eachindex(shapes)
         fam, args = shapes[k]
-        push!(cells, _family_logpdf_expr(fam, Any[values(args)...],
-            Expr(:ref, tau, k)))
+        cell = _family_logpdf_expr(fam, Any[values(args)...], Expr(:ref, tau, k))
+        push!(cells, fam === :exponential ? cell : :($cell + log(2)))
     end
     push!(stmts, :($node::Float64 = $(foldl((a, c) -> :($a + $c), cells))))
     push!(terms, node)
@@ -3797,11 +3785,8 @@ const _PRIOR_ENDPOINTS = Dict{Symbol,Symbol}(
 # setup/recurrence read, or a coefficient element read). Args are literals
 # (inlined) or parameter/assignment/threaded refs (Distributions.jl
 # semantics). Shared by scalar priors, per-cell plate priors, population
-# priors, and the scan density. `gamma` takes rate, so the contract's
-# scale inverts; `:flat` is the vacuous 0.0. Symmetric `:positive`
-# halves (`+log(2)`) and the `:interval` correction live in
-# `_support_correction` (the Stan-kernel `:positive_stan` /
-# `:interval_stan` / `:upper` overrides add nothing there).
+# priors, and the scan density. Gamma takes rate, so the contract's scale
+# inverts; Flat() contributes zero. Explicit support is normalized below.
 # Distribution kernels use Float64 ports. Promote at that boundary rather
 # than redeclaring the source name: bound data and ordinary Julia helpers
 # must retain their original numeric types. The same boundary applies to
@@ -3823,22 +3808,8 @@ function _family_logpdf_expr(family::Symbol, a, x)
     return _prior_endpoint_expr(family, a, :logpdf, x)
 end
 
-# The additive support-override correction for a prior log-density (or `nothing`
-# for no override): `:positive` (half-Normal/half-Cauchy) renormalizes by exactly
-# +log(2) (symmetry at literal 0); `:positive_stan` (the Stan-kernel half)
-# adds NOTHING — plain `_lpdf` plus the bare-`u` Jacobian;
-# `(:interval, lo, hi)` (a truncated Normal) renormalizes by
-# -log(cdf(hi) - cdf(lo)) at any location, where `argvals` are the family's
-# (mu, s) argument expressions (literals/refs for a scalar prior, or per-cell
-# do-vars for a plate prior — the CDF endpoints thread identically);
-# `(:interval_stan, lo, hi)` adds NOTHING — Stan's two-sided-bound kernel
-# is the plain normal_lpdf plus the bare-`u` Jacobian (the dar-beta
-# precedent: SB truncation never renormalizes) — and neither does
-# `:flat`, which is improper (Jacobian only, no renormalization,
-# matching Stan lower/interval-bound kernel semantics);
-# `(:upper, hi)` adds NOTHING — Stan's upper-bound kernel is the plain
-# normal_lpdf plus the bare-`u` Jacobian (the varying-`tau`/`:floored`
-# precedent: SB truncation never renormalizes).
+# Normalize the base density over the declared support. Symmetric halves
+# at literal zero add log(2); general bounds use the owned CDF endpoints.
 function _support_correction(family::Symbol, ov::SupportOverride, argvals;
         pre::Vector{Expr} = Expr[], stem::Symbol = :prior)
     ov === nothing && return nothing
@@ -3860,7 +3831,6 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
         # a rounded-to-zero inactive difference must never be logged or AD'd.
         return :($fl > 0.5 ? -log($sl - $sh) : -log($fh - $fl))
     end
-    ov === :positive_stan && return nothing  # Stan kernel semantics
     if ov isa Tuple
         if ov[1] === :lower
             # `truncated(LogNormal(m, s), lo, Inf)`: `-log P(X > lo)` =
@@ -3872,10 +3842,13 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
             tail = _prior_endpoint_expr(:normal, Any[:(-$m), s], :cdf, :(-log($lo)))
             return :(-log($tail))
         end
-        (ov[1] === :upper || ov[1] === :interval_stan) && return nothing  # Stan kernel semantics
+        if ov[1] === :upper
+            family === :flat && return nothing
+            return :(-log($(_prior_endpoint_expr(family, argvals, :cdf, ov[2]))))
+        end
         ov[1] === :interval || throw(ContractValidationError(
             "[generator] tuple support override must be (:interval, lo, hi), " *
-            "(:interval_stan, lo, hi), or (:upper, hi), got $ov"))
+            "or (:upper, hi), got $ov"))
         family === :flat && return nothing  # improper: Jacobian only
         lo, hi = ov[2], ov[3]
         mu, s = argvals[1], argvals[2]
@@ -3884,16 +3857,11 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
         return :(-log($upper - $lower))
     end
     ov === :positive || throw(ContractValidationError(
-        "[generator] support override must be :positive or " *
-        ":positive_stan, got $ov"))
+        "[generator] support override must be :positive, got $ov"))
     return :(log(2))  # :positive half
 end
 
-# Scalar prior log-density per family via distribution-kernel endpoints
-# (Distributions.jl semantics). The support override adds the +log(2) half or
-# the -log(cdf(hi)-cdf(lo)) truncated-interval renormalization (`_support_correction`;
-# `:positive_stan`/`(:interval_stan, lo, hi)`/`(:upper, hi)` overrides add
-# nothing — Stan kernel semantics).
+# One normalized scalar prior body, shared by parameter and hyper-prior slots.
 function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], conditioned = false)
     argvals = [v for v in values(p.args)]
     base = _family_logpdf_expr(p.family, argvals, p.name)
@@ -3932,7 +3900,7 @@ _conditioned_endpoint_calls(ex) = ex
 
 function _conditioned_support_guard(value, support, density)
     support === nothing && return density
-    valid = if support in (:positive, :positive_stan)
+    valid = if support === :positive
         :($value >= 0)
     elseif support[1] === :lower
         :($value >= $(support[2]))

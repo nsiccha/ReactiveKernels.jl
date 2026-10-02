@@ -509,8 +509,7 @@ end
 
 # Independent K=1 reference with explicit names/order (no contract
 # helpers — this pins them): effect `tau * (z[idx] .* Z)`, a half-normal
-# sd (`tau ~ Normal(0, 1)` on `tau > 0`, Stan lower-bound kernel: no
-# +log(2)) plus the `exp`-layout Jacobian, and no LKJ term (the 1x1
+# sd (`tau ~ HalfNormal(1)`) plus the `exp`-layout Jacobian, and no LKJ term (the 1x1
 # factor is the fixed `[1]`). One reference for intercept (`Z = 1`) and
 # slope margins: the geometry does not depend on the margin.
 function _tv_ref_k1(bound, nt, Z, levels)
@@ -518,7 +517,7 @@ function _tv_ref_k1(bound, nt, Z, levels)
     r = only(nt.tau_g) .* (nt.z_flat_g[idx] .* Z)
     ll = sum(logpdf.(Normal.(nt.a .+ r, nt.sigma), bound.columns[:y]))
     pr = logpdf(Normal(0, 5), nt.a) + logpdf(Exponential(1), nt.sigma) +
-        logpdf(Normal(0, 1), only(nt.tau_g)) +
+        logpdf(truncated(Normal(0, 1), 0, Inf), only(nt.tau_g)) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     return (; ll, pr)
 end
@@ -538,7 +537,7 @@ end
     nt = constrain(built.layout, u)
     ref = _tv_ref_k1(bound, nt, 1.0, ["a", "b", "c"])
     @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
-    # No +log(2): SB Stan-convention tau (see the generator comment).
+    # The positive tau prior is a normalized HalfNormal.
     @test _query(built.spec, bound, :prior, u) ≈ ref.pr
     @test _query(built.spec, bound, :posterior, u) ≈
         ref.ll + ref.pr + u[2] + u[3]
@@ -563,7 +562,7 @@ end
     nt = constrain(built.layout, u)
     ref = _tv_ref_k1(bound, nt, x2, [1, 2, 3])
     @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
-    # No +log(2): SB Stan-convention tau (see the generator comment).
+    # The positive tau prior is a normalized HalfNormal.
     @test _query(built.spec, bound, :prior, u) ≈ ref.pr
     @test _query(built.spec, bound, :posterior, u) ≈
         ref.ll + ref.pr + u[2] + u[3]
@@ -620,10 +619,10 @@ end
         @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + log(1.2)
         return pr - rest
     end
-    @test k1_sd(1) ≈ logpdf(Normal(), 1.2)
-    @test k1_sd(:x) ≈ logpdf(Normal(), 1.2)
+    @test k1_sd(1) ≈ logpdf(truncated(Normal(), 0, Inf), 1.2)
+    @test k1_sd(:x) ≈ logpdf(truncated(Normal(), 0, Inf), 1.2)
     # `sd=` is admitted at K=1, with no eta needed to unlock it.
-    @test k1_sd(1, :sd => :(Cauchy(0, 5))) ≈ logpdf(Cauchy(0, 5), 1.2)
+    @test k1_sd(1, :sd => :(HalfCauchy(5))) ≈ logpdf(truncated(Cauchy(0, 5), 0, Inf), 1.2)
     @test k1_sd(:x, :sd => :(Exponential(2))) ≈ logpdf(Exponential(2), 1.2)
 end
 
@@ -907,10 +906,10 @@ end
         pr = logpdf(Normal(0, 5), nt.a) +
             logpdf(Exponential(1), nt.sigma) +
             _tv_ref_lkj_k2(nt.L_g, eta) +
-            sum(logpdf.(Normal(0, 1), nt.tau_g)) +
+            sum(logpdf.(truncated(Normal(0, 1), 0, Inf), nt.tau_g)) +
             sum(logpdf.(Normal(0, 1), nt.z_flat_g))
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
-        # No +log(2): SB Stan-convention tau (see the generator comment).
+        # The positive tau prior is a normalized HalfNormal.
         @test _query(built.spec, bound, :prior, u) ≈ pr
         jac = u[2] + u[4] + u[5] + log(1 - tanh(u[3])^2)
         @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + jac
@@ -946,7 +945,7 @@ end
     lkj = log(2.0) - 2 * log(pi) + log(nt.L_g[2, 2])
     pr = logpdf(Normal(0, 5), nt.a) +
         logpdf(Exponential(1), nt.sigma) + lkj +
-        sum(logpdf.(Normal(0, 1), nt.tau_g)) +
+        sum(logpdf.(truncated(Normal(0, 1), 0, Inf), nt.tau_g)) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -984,7 +983,7 @@ end
     # No LKJ term: Stan's K=1 LKJ contributes exactly 0.0.
     pr = logpdf(Normal(0, 5), nt.a) +
         logpdf(Exponential(1), nt.sigma) +
-        logpdf(Normal(0, 1), nt.tau_g[1]) +
+        logpdf(truncated(Normal(0, 1), 0, Inf), nt.tau_g[1]) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -1028,7 +1027,7 @@ end
         sum(logpdf.(Normal.(nt.a2 .+ r2, nt.s), y2v))
     pr = logpdf(Normal(0, 5), nt.a1) + logpdf(Normal(0, 5), nt.a2) +
         logpdf(Exponential(1), nt.s) + _tv_ref_lkj_k2(nt.L_g, 1.0) +
-        sum(logpdf.(Normal(0, 1), nt.tau_g)) +
+        sum(logpdf.(truncated(Normal(0, 1), 0, Inf), nt.tau_g)) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -1478,7 +1477,7 @@ end
     pr = logpdf(Normal(0, 5), nt.a) +
         logpdf(Exponential(1), nt.sigma) +
         _tv_ref_lkj_k2(nt.L_g, 1.0) +
-        sum(logpdf.(Normal(0, 1), nt.tau_g)) +
+        sum(logpdf.(truncated(Normal(0, 1), 0, Inf), nt.tau_g)) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -1724,7 +1723,7 @@ end
         logpdf(Exponential(1), nt.sigma) +
         _tv_ref_lkj_k2(nt.L_g, 2.0) +
         logpdf(Exponential(0.5), nt.tau_g[1]) +
-        logpdf(Normal(0, 2.0), nt.tau_g[2]) +
+        logpdf(truncated(Normal(0, 2.0), 0, Inf), nt.tau_g[2]) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -1768,7 +1767,7 @@ end
 @testset "varying sd= keyword admission" begin
     k1 = lower_rkppl(quote
             mu ~ Normal(0, 5)
-            r ~ varying_effect(g, [1]; sd = Cauchy(0, 5))
+            r ~ varying_effect(g, [1]; sd = HalfCauchy(5))
             eta = mu .+ r
             y .~ Normal.(eta, sigma)
         end, (:y, :sigma, :g); conditioned = (:y, :sigma, :g))
@@ -1778,7 +1777,7 @@ end
     k2 = lower_rkppl(quote
             a ~ Normal(0, 5)
             sigma ~ Exponential(1)
-            r ~ varying_effect(g, [1, x]; eta = 2.0, sd = Normal(0, 2))
+            r ~ varying_effect(g, [1, x]; eta = 2.0, sd = HalfNormal(2))
             mu = a .+ r
             y .~ Normal.(mu, sigma)
         end, (:y, :x, :g); conditioned = (:y, :x, :g))
@@ -1798,7 +1797,7 @@ end
     kd = lower_rkppl(quote
             a ~ Normal(0, 5)
             sigma ~ Exponential(1)
-            r ~ varying_effect(g, [1, x]; sd = Normal(0, 1.0))
+            r ~ varying_effect(g, [1, x]; sd = HalfNormal(1.0))
             mu = a .+ r
             y .~ Normal.(mu, sigma)
         end, (:y, :x, :g); conditioned = (:y, :x, :g))
@@ -1808,13 +1807,13 @@ end
 @testset "varying sd= fail-closed battery" begin
     bad = (
         # (label, raw, message-fragment)
-        ("half-cauchy implies +log2", :(HalfCauchy(0, 5)), "bare form"),
-        ("half-normal implies +log2", :(HalfNormal(0, 2)), "bare form"),
-        ("nonzero location", :(Normal(1, 2)), "location must be literal 0"),
-        ("non-positive scale", :(Cauchy(0, -1)), "positive literal"),
-        ("exponential arity", :(Exponential()), "one scale argument"),
-        ("bare literal", :(5.0), "takes `Cauchy(0, σ)`"),
-        ("sampled name", :s, "takes `Cauchy(0, σ)`"),
+        ("half-cauchy arity", :(HalfCauchy(0, 5)), "exactly the scale"),
+        ("half-normal arity", :(HalfNormal(0, 2)), "exactly the scale"),
+        ("nonzero location", :(Normal(1, 2)), "explicit positive prior"),
+        ("non-positive scale", :(HalfCauchy(-1)), "positive finite literal"),
+        ("exponential arity", :(Exponential()), "takes 1 argument"),
+        ("bare literal", :(5.0), "distribution call"),
+        ("sampled name", :s, "distribution call"),
         ("per-margin tuple", :((Cauchy(0, 5), Normal(0, 2))),
             "per-margin sd priors are planned"),
     )
@@ -1835,7 +1834,7 @@ end
         catch e
             e
         end
-        if label in ("nonzero location", "exponential arity", "per-margin tuple")
+        if label == "per-margin tuple"
             # capability: ordinary SD priors, default Exponential and per-margin priors (P8 1cmodra; 10gzbm9 support-links; todo `1308iv0`).
             @test_broken (err === nothing || throw(err))
         else
@@ -1851,7 +1850,7 @@ const _TVSD_Y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
 const _TVSD_SG = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
 const _TVSD_NC = quote
     mu ~ Normal(0, 5)
-    r ~ varying_effect(g, [1]; sd = Cauchy(0, 5))
+    r ~ varying_effect(g, [1]; sd = HalfCauchy(5))
     eta = mu .+ r
     y .~ Normal.(eta, sigma)
 end
@@ -1896,9 +1895,9 @@ end
     nt = constrain(built.layout, u)
     theta = nt.mu .+ nt.tau_g[1] .* nt.z_flat_g
     ll = sum(logpdf.(Normal.(theta, cols[:sigma]), cols[:y]))
-    # Stan-kernel Cauchy (NO +log2) and NO LKJ term (K=1 exactly zero).
+    # Normalized HalfCauchy; the K=1 LKJ term is exactly zero.
     pr = logpdf(Normal(0, 5), nt.mu) +
-        logpdf(Cauchy(0, 5), nt.tau_g[1]) +
+        logpdf(truncated(Cauchy(0, 5), 0, Inf), nt.tau_g[1]) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
