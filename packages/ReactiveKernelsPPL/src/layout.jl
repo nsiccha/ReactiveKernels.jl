@@ -29,6 +29,11 @@ function support_of(family::Symbol, override::SupportOverride)
         "[layout] a uniform prior carries its own interval support — no " *
         "support override applies, got $override"))
     if override isa Tuple
+        if override[1] === :lower
+            inferred === :positive || throw(ContractValidationError(
+                "[layout] :lower override needs a positive-support family"))
+            return :floored
+        end
         if override[1] === :upper
             length(override) == 2 || throw(ContractValidationError(
                 "[layout] tuple support override must be (:upper, hi), got $override"))
@@ -55,6 +60,21 @@ function support_of(family::Symbol, override::SupportOverride)
     return :positive
 end
 
+# A `(:lower, name)` bound reads the bound model-level data value `name` (a
+# finite non-negative number); every other override passes through.
+_bound_override(::StructuralPlan, ov) = ov
+function _bound_override(plan::StructuralPlan, ov::Tuple{Symbol,Symbol})
+    ov[1] === :lower || return ov
+    haskey(plan.columns, ov[2]) || throw(ContractValidationError(
+        "[layout] lower bound $(ov[2]) is not bound data (bind the plan " *
+        "first, or define it from data)"))
+    v = plan.columns[ov[2]]
+    v isa Real && isfinite(v) && v >= 0 || throw(ContractValidationError(
+        "[layout] lower bound $(ov[2]) must be a finite non-negative " *
+        "number, got $(summary(v))"))
+    return (:lower, Float64(v))
+end
+
 # The transform kind and (for :interval/:upper) the constrained bounds a
 # layout entry needs, from a parameter's family + support override (+ args:
 # a uniform's bounds come from its literal args, not an override).
@@ -68,6 +88,12 @@ function _entry_transform(family::Symbol, override::SupportOverride,
     end
     if support === :upper
         return (:upper, NaN, Float64(override[2]))
+    end
+    if support === :floored
+        override[2] isa Real || throw(ContractValidationError(
+            "[layout] the lower bound `$(override[2])` is a data name — " *
+            "bind the plan first (`bind_data`)"))
+        return (:floored, Float64(override[2]), NaN)
     end
     transform =
         support === :real ? :identity :
@@ -231,8 +257,8 @@ function assign_layout(plan::StructuralPlan)
         offset += K
     end
     for p in plan.parameters
-        transform, lo, hi =
-            _entry_transform(p.family, p.support_override, p.args)
+        transform, lo, hi = _entry_transform(p.family,
+            _bound_override(plan, p.support_override), p.args)
         push!(entries,
             LayoutEntry(:sampled, nothing, p.name, [p.name], offset, 1, transform,
                 lo, hi))
@@ -973,6 +999,8 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, e.name => Vector{Float64}(seg))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
+        elseif e.kind === :array && e.transform === :lkj_stack
+            push!(pairs, e.name => _lkj_stack_constrain(e, seg))
         elseif e.kind === :array && _is_slice_transform(e.transform)
             push!(pairs, e.name => _array_slices_constrain(e, seg))
         elseif e.kind === :array
@@ -1134,6 +1162,11 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             size(v) == Tuple(e.dims) || throw(ContractValidationError(
                 "[layout] array parameter $(e.name) has size $(size(v)), " *
                 "want $(Tuple(e.dims))"))
+            if e.transform === :lkj_stack
+                u[e.offset:(e.offset + e.size - 1)] .=
+                    _lkj_stack_unconstrain(e, v)
+                continue
+            end
             if _is_slice_transform(e.transform)
                 u[e.offset:(e.offset + e.size - 1)] .=
                     _array_slices_unconstrain(e, v)
@@ -1191,6 +1224,11 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             # Vector Jacobians couple coordinates (ordered sums, simplex
             # stick-breaking) — entry-level, never per-coordinate.
             total += _vector_logjac(e, seg)
+            continue
+        end
+        if e.kind === :array && e.transform === :lkj_stack
+            # Level by level, the vine's coupled thetas.
+            total += _lkj_stack_logjac(e, seg)
             continue
         end
         if e.kind === :array && _is_slice_transform(e.transform)

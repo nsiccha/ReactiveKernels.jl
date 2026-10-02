@@ -36,6 +36,134 @@ using ReactiveKernels
     @test next_result == owned(position, data)
 end
 
+@kernel view_superpose(observations, shifts, units, weights) = begin
+    total = plate(observations, Ref(shifts), Ref(units), Ref(weights)) do t, s, u, w
+        sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return total
+end
+@kernel view_relax(drive, dts, q) = begin
+    trajectory = scan(drive, dts, Ref(q); init=q.r0, include_init=true) do previous, c, dt, p
+        steady = p.r * c
+        next = (previous - steady) * exp(-p.k * dt) + steady
+        (next, next)
+    end
+    return trajectory
+end
+@kernel view_history(xs) = begin
+    feedback = scan(xs, eachindex(xs); init=0, history=0.0) do carry, x, j, earlier
+        (carry, x + 0.5 * sum(earlier[i] for i in 1:(j - 1); init=0.0))
+    end
+    return feedback
+end
+
+@testset "zero-copy eligible position lanes" begin
+    @kernel inspect_lane(x, original) = begin
+        result = x isa SubArray && parent(x) === original
+    end
+    @kernel inspect_abstract_lane(x::AbstractVector{Float64}, original) = begin
+        result = x isa SubArray && parent(x) === original
+    end
+    @kernel inspect_concrete_lane(x::Vector{Float64}, original) = begin
+        result = x isa Vector && !Base.mightalias(x, original)
+    end
+    X = reshape(collect(1.0:24.0), 6, 4)
+    for graph in (inspect_lane, inspect_abstract_lane, inspect_concrete_lane), reuse in (false, true)
+        batch = prepare_batched(graph; batched=:x, reuse)
+        @test all(batch(X, X))
+    end
+
+    @kernel inspect_output_lane(x) = begin
+        points = plate(x) do value
+            value
+        end
+        is_column = points isa SubArray
+    end
+    @kernel inspect_concrete_output_lane(x) = begin
+        points::Vector{Float64} = plate(x) do value
+            value
+        end
+        is_column = points isa SubArray
+    end
+    for graph in (inspect_output_lane, inspect_concrete_output_lane), reuse in (false, true)
+        batch = prepare_batched(graph; batched=:x, want=(:points, :is_column), reuse)
+        points, is_column = batch(X)
+        @test points == X
+        @test is_column == (graph === inspect_output_lane ? [false, true, true, true] : falses(4))
+    end
+
+    # The dose-outer check accepts exactly dense column views, with a Vector
+    # positive control and a strided view that must keep the ordinary loop.
+    RK = ReactiveKernels
+    column = view(X, :, 2)
+    @test RK._plate_dense_source(Vector{Float64})
+    @test RK._plate_dense_source(typeof(column))
+    @test !RK._plate_dense_source(typeof(view(X, 1:2:6, 2)))
+    @test RK._lane_reuse(column, Float64, axes(column)) === column
+    @test RK._lane_reuse(column, Float32, axes(column)) === nothing
+    # refused: a position batch requires one uniform output shape.
+    @test_throws DimensionMismatch RK._lane_reuse(column, Float64, (Base.OneTo(3),))
+    @test RK._replicated_same_column(column, X, 2)
+    @test !RK._replicated_same_column(column, X, 1)
+
+    scalar = prepare(view_superpose)
+    reduction = scalar.ops[1].f
+    source_types = Tuple{typeof(column),typeof(column),Int,Vector{Int}}
+    @test RK._plate_reduction_ready(reduction, Float64, source_types)
+    @test RK._plate_reduction_ready(reduction, Float64,
+                                    Tuple{Vector{Float64},Vector{Float64},Int,Vector{Int}})
+    @test !RK._plate_reduction_ready(reduction, Float64,
+        Tuple{typeof(column),typeof(view(X, 1:2:6, 2)),Int,Vector{Int}})
+    for reuse in (false, true)
+        batch = prepare_batched(view_superpose; batched=(:units, :weights), reuse)
+        ast = code_expr(batch)
+        for (n, lanes) in ((32, 4), (1, 1), (0, 3), (97, 7), (32, 4))
+            shifts = [0, 7, -3]
+            U = [sin(0.01 * i) + 0.1 * l for i in 1:max(n, 1), l in 1:lanes]
+            W = [1.0 + 0.1 * j + 0.01 * l for j in 1:3, l in 1:lanes]
+            before = copy(U)
+            expected = stack(scalar(1:n, shifts, U[:, l], W[:, l]) for l in 1:lanes)
+            result = batch(1:n, shifts, U, W)
+            @test result == expected
+            @test U == before
+            @test code_expr(batch) === ast
+            if n > 0
+                snapshot = copy(result)
+                again = batch(1:n, shifts, result, W)
+                @test again == stack(scalar(1:n, shifts, snapshot[:, l], W[:, l]) for l in 1:lanes)
+                @test result == snapshot
+                @test !Base.mightalias(again, result)
+            end
+        end
+    end
+
+    # First-position scratch and output caches must retain dense buffers;
+    # later positions may write into columns of the stacked destination.
+    borrowed = prepare_batched(view_superpose; batched=(:units, :weights), reuse=true)
+    shifts = [0, 7, -3]
+    U = randn(4096, 16)
+    W = randn(3, 16)
+    borrowed(1:4096, shifts, U, W)
+    bytes = minimum(@allocated(borrowed(1:4096, shifts, U, W)) for _ in 1:3)
+    @test bytes < 4096
+    @test all(slot[] === nothing || slot[] isa Array for slot in borrowed.caches)
+
+    for (graph, args, batched) in (
+        (view_relax, (X, fill(0.2, 6), (; k=[0.1, 0.2, 0.3, 0.4],
+                                        r=[1.0, 2.0, 3.0, 4.0], r0=[0.0, 1.0, 2.0, 3.0])), (:drive, :q)),
+        (view_history, (X,), (:xs,)))
+        scalar = prepare(graph)
+        expected = graph === view_relax ?
+            stack(scalar(X[:, l], args[2], (; k=args[3].k[l], r=args[3].r[l], r0=args[3].r0[l])) for l in 1:4) :
+            stack(scalar(X[:, l]) for l in 1:4)
+        for reuse in (false, true)
+            batch = prepare_batched(graph; batched, reuse)
+            @test batch(args...) == expected
+            @test batch(args...) == expected
+        end
+    end
+end
+
 @testset "independent borrowed execution instances" begin
     @kernel instance_graph(position, data; amount=1.0) = begin
         curve = position .* data .* amount

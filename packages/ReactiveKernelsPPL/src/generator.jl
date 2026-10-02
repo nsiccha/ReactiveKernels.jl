@@ -235,6 +235,7 @@ function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
     count = 0
     function walk(node)
         node isa Expr || return node
+        _is_plate_column_expr(node) && return node
         if node.head in (:call, :ref, :.) && _contains_module_call(node) &&
                 _expr_value_symbols(node) ⊆ dataonly
             count += 1
@@ -508,7 +509,7 @@ function _hsgp_grouped_stmts(hb::HSGPBasis)
     K = only(hb.K)
     cols = Symbol[]
     for k in 1:K
-        lam_sqrt = sqrt((k * pi / (2.0 * L))^2)
+        lam_sqrt = sqrt(_hsgp_lambda(k, L))
         col = _hsgp_ax_name(id, 1, k)
         push!(stmts, :($col =
             $inv_sqrt_L .* sin.($lam_sqrt .* ($axis .- $mu .+ $L))))
@@ -539,7 +540,7 @@ function _hsgp_grouped_stmts(hb::HSGPBasis)
     sv = Symbol(:_ppl_hsgp_, id, :_sigma)
     push!(stmts, :($rv = $rho))
     push!(stmts, :($sv = $sigma))
-    lamrow = Expr(:hcat, ((k * pi / (2.0 * L))^2 for k in 1:K)...)
+    lamrow = Expr(:hcat, (_hsgp_lambda(k, L) for k in 1:K)...)
     SPD = _hsgp_S_name(id)
     push!(stmts, :($SPD = ($sv .* sqrt.($rv .* $_HSGP_SQRT2PI)) .*
         exp.(-0.25 .* ($rv .* $rv) .* $lamrow)))
@@ -562,7 +563,7 @@ function _hsgp_basis_stmts(hb::HSGPBasis)
         mu, L = Float64(mu), Float64(L)
         inv_sqrt_L = 1.0 / sqrt(L)
         for k in 1:hb.K[j]
-            lam_sqrt = sqrt((k * pi / (2.0 * L))^2)
+            lam_sqrt = sqrt(_hsgp_lambda(k, L))
             col = _hsgp_ax_name(id, j, k)
             push!(stmts, :($col =
                 $inv_sqrt_L .* sin.($lam_sqrt .* ($axis .- $mu .+ $L))))
@@ -600,7 +601,7 @@ function _hsgp_basis_stmts(hb::HSGPBasis)
     for (b, I) in enumerate(midcs)
         terms = Any[]
         for j in 1:d
-            lam = (I[j] * pi / (2.0 * hb.fits[j][2]))^2
+            lam = _hsgp_lambda(I[j], hb.fits[j][2])
             push!(terms, :($(rhos[j]) * $(rhos[j]) * $lam))
         end
         expsum = foldl((a, c) -> :($a + $c), terms)
@@ -3714,6 +3715,15 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals)
     ov === nothing && return nothing
     ov === :positive_stan && return nothing  # Stan kernel semantics
     if ov isa Tuple
+        if ov[1] === :lower
+            # `truncated(LogNormal(m, s), lo, Inf)`: `-log P(X > lo)` =
+            # `-log Φ((m - log(lo)) / s)`; nothing at `lo == 0`. A data
+            # name `lo` is a bound kernel argument.
+            lo = ov[2]
+            lo isa Real && lo == 0 && return nothing
+            m, s = argvals[1], argvals[2]
+            return :(-log(normal(-($m), $s).cdf(-log($lo))))
+        end
         (ov[1] === :upper || ov[1] === :interval_stan) && return nothing  # Stan kernel semantics
         ov[1] === :interval || throw(ContractValidationError(
             "[generator] tuple support override must be (:interval, lo, hi), " *

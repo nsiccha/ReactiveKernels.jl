@@ -618,11 +618,16 @@ Stan two-sided-bound kernel semantics — plain `_lpdf` plus the bare-`u`
 Jacobian, NO truncation renormalizer), or the tuple `(:upper, hi)` (an
 upper-only truncation `truncated(Normal(mu, s), -Inf, hi)` — Stan's
 upper-bound kernel `x = hi - exp(u)` with the bare-`u` Jacobian and NO
-truncation renormalizer). Shared by scalar [`SampledParameter`](@ref)s
-and per-cell [`PlateParameter`](@ref)s.
+truncation renormalizer), or the tuple `(:lower, lo)` (a lower-only
+truncation `truncated(LogNormal(m, s), lo, Inf)` of a positive-support base,
+renormalized as in Distributions — `x = lo + exp(u)` with the bare-`u`
+Jacobian; `lo` a literal, or the name of a model-level data value resolved
+from the bound columns, e.g. an HSGP validity floor). Shared by scalar
+[`SampledParameter`](@ref)s and per-cell [`PlateParameter`](@ref)s.
 """
 const SupportOverride =
-    Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64},Tuple{Symbol,Float64}}
+    Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64},Tuple{Symbol,Float64},
+        Tuple{Symbol,Symbol}}
 
 """
     SampledParameter(name, family, args, support_override, label)
@@ -2077,12 +2082,21 @@ storage on the IR (layout calls it on bound fits in Stage B).
 """
 function _hsgp_floors(K::Vector{Int}, fits::Vector{Tuple{Float64,Float64}},
         iso::Bool)
-    per = Float64[
-        k == 1 ? 0.0 :
-            (4 * L / pi) * sqrt(log(100.0) / (k * k - 1))
-        for (k, (_, L)) in zip(K, fits)]
+    per = Float64[_hsgp_axis_floor(k, L) for (k, (_, L)) in zip(K, fits)]
     return iso ? [maximum(per)] : per
 end
+
+"""One axis's length-scale validity floor for `K` basis functions on the
+half-width-`L` domain (SB `_brm_hsgp_rho_lower`): `(4L/pi) *
+sqrt(log(100)/(K^2-1))`, `0.0` (unbounded) at `K == 1`. Shared by the
+built-in layout floors and [`hsgp_rho_floors`](@ref)."""
+_hsgp_axis_floor(K::Integer, L::Real) =
+    K == 1 ? 0.0 : (4 * L / pi) * sqrt(log(100.0) / (K * K - 1))
+
+"""Exp-quad HSGP eigenvalue of basis function `k` on the half-width-`L`
+domain (SB `lambda`): `(k*pi/(2L))^2`. Shared by the in-graph built-in
+basis and the data-side [`hsgp_basis`](@ref)."""
+_hsgp_lambda(k::Integer, L::Real) = (k * pi / (2.0 * L))^2
 
 """
     _hsgp_periodic_rho_lower(K) -> Float64
@@ -5332,9 +5346,11 @@ function _validate_vector_structure(plan::StructuralPlan)
         d.expr isa Symbol && continue
         refs = Symbol[]
         _collect_vector_refs!(refs, d.expr, plan, d.label, false)
-        _is_vector_valued(d.expr, plan) || _fail(d.label,
-            "derived column is scalar-valued — write it as a scalar " *
-            "assignment instead")
+        # A data-only module value read per observation is checked at
+        # bind (its length or row count), not by its expression's shape.
+        _is_vector_valued(d.expr, plan) || _is_bind_data_derived(plan, d.name) ||
+            _fail(d.label, "derived column is scalar-valued — write it as " *
+                "a scalar assignment instead")
     end
     return nothing
 end
@@ -5349,9 +5365,11 @@ function _validate_vector_data(plan::StructuralPlan)
             r in _all_names(plan) ||
                 _fail(d.label, "derived column references unknown name $r")
         end
-        _is_vector_valued(d.expr, plan) || _fail(d.label,
-            "derived column is scalar-valued — write it as a scalar " *
-            "assignment instead")
+        # A data-only module value read per observation is checked at
+        # bind (its length or row count), not by its expression's shape.
+        _is_vector_valued(d.expr, plan) || _is_bind_data_derived(plan, d.name) ||
+            _fail(d.label, "derived column is scalar-valued — write it as " *
+                "a scalar assignment instead")
     end
     return nothing
 end
@@ -5466,6 +5484,12 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
                 "reduction $fn takes exactly one bare column or derived name",
             )
             arg = ex.args[2]
+            # A reduction of a module call's whole value is plain Julia
+            # (`maximum(hsgp_rho_floors(lambda))`), like the call itself.
+            if _is_module_value_call(arg)
+                _collect_opaque_refs!(refs, arg, plan, label, bound)
+                return nothing
+            end
             # A reduction of a model-level value is plain Julia
             # (`sum(zeta)`, `sum(abs2.(w))`); over a column it stays a bare
             # name (nested column transforms stage as their own definition).
@@ -5605,6 +5629,45 @@ end
 # to the scalar collector. With bound=true, direct column references in
 # math positions must be numeric and bare-Symbol `ifelse` conditions must be
 # Bool columns.
+# An array-cell plate column (a derived column's right-hand side
+# `plate(lanes..., Ref(shared)...) do args...; cell; end`, one value per
+# index — `_plate_column_expr` in the surface): the inputs are graph
+# values; the cell body is RK's to plan. Lanes are data columns or the
+# level codes `_ppl_codes(g, h)` of column `g` on `levels(h)`.
+_is_plate_column_expr(ex) = ex isa Expr && ex.head === :do &&
+    length(ex.args) == 2 && ex.args[1] isa Expr && ex.args[1].head === :call &&
+    !isempty(ex.args[1].args) && ex.args[1].args[1] === :plate
+
+function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
+    known = union(_union_names(plan), _vector_value_names(plan),
+        Set{Symbol}(d.name for d in plan.derived),
+        Set{Symbol}(p.name for p in plan.array_parameters))
+    for inp in ex.args[1].args[2:end]
+        if inp isa Symbol
+            bound && !haskey(plan.columns, inp) && !(inp in known) &&
+                _fail(label, "array plate column reads unknown name $inp")
+            push!(refs, inp)
+        elseif inp isa Expr && inp.head === :call && length(inp.args) == 3 &&
+                inp.args[1] === :_ppl_codes
+            for c in inp.args[2:3]
+                c isa Symbol || _fail(label, "array plate column codes " *
+                    "take data columns, got $(repr(c))")
+                bound && !haskey(plan.columns, c) && _fail(label,
+                    "array plate column codes read unknown column $c")
+            end
+        elseif inp isa Expr && inp.head === :call && length(inp.args) == 2 &&
+                inp.args[1] === :Ref && inp.args[2] isa Symbol
+            nm = inp.args[2]
+            bound && !haskey(plan.columns, nm) && !(nm in known) &&
+                _fail(label, "array plate column reads unknown name $nm")
+        else
+            _fail(label, "array plate column input $(repr(inp)) is not a " *
+                "column, level codes or `Ref(name)`")
+        end
+    end
+    return nothing
+end
+
 function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
@@ -5626,6 +5689,9 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     end
     ex isa Expr || _fail(label, "unsupported literal $(repr(ex)) (numeric literals only)")
     head = ex.head
+    if _is_plate_column_expr(ex)
+        return _collect_plate_column_refs!(refs, ex, plan, label, bound)
+    end
     if head === :call
         fn = ex.args[1]
         _is_data_matvec(ex, plan) &&
@@ -5794,6 +5860,7 @@ end
 # reductions and scalar calls collapse; unbound unknown symbols count as
 # (possibly-column) evidence and resolve at bind.
 function _is_vector_valued(ex, plan::StructuralPlan)
+    _is_plate_column_expr(ex) && return true
     ex isa Symbol && return !(ex in _union_names(plan) ||
         ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
     ex isa Expr && ex.head === :ref && ex.args[1] isa Symbol &&
@@ -5888,6 +5955,18 @@ function _validate_support_override(label, family::Symbol,
         "a uniform prior carries its own interval support — no support " *
         "override applies, got $ov")
     if ov isa Tuple
+        if ov[1] === :lower
+            length(ov) == 2 || _fail(label,
+                "tuple support override must be (:lower, lo), got $ov")
+            family === :lognormal || _fail(label,
+                "a :lower override is a lower-truncated LogNormal " *
+                "(`truncated(LogNormal(m, s), lo, Inf)`); got $family")
+            lo = ov[2]
+            lo isa Symbol || (isfinite(lo) && lo >= 0) || _fail(label,
+                ":lower bound must be a finite non-negative literal or a " *
+                "data name; got $lo")
+            return nothing
+        end
         if ov[1] === :upper
             length(ov) == 2 || _fail(label,
                 "tuple support override must be (:upper, hi), got $ov")
@@ -10268,12 +10347,15 @@ function _materialize_module_data!(plan::StructuralPlan,
     end
     vector_defs = Set{Symbol}(d.name for d in plan.derived)
     memo = Dict{Symbol,Any}()
+    # Identical module calls share one evaluation (`(Xf, Zp) = f(x)` reads
+    # `f(x)` twice): within one bind every name has one value.
+    calls = Dict{Any,Any}()
     function lookup(nm::Symbol)
         haskey(memo, nm) && return memo[nm]
         haskey(columns, nm) && return columns[nm]
         haskey(exprs, nm) || throw(ContractValidationError(
             "[bind] data definition reads $nm, which is not bound data"))
-        memo[nm] = _eval_value_expr(exprs[nm], lookup, nm)
+        memo[nm] = _eval_value_expr(exprs[nm], lookup, nm; calls)
         return memo[nm]
     end
     for nm in sort!(collect(names))
@@ -10286,9 +10368,11 @@ function _materialize_module_data!(plan::StructuralPlan,
                 sprint(showerror, e)))
         end
         if nm in vector_defs
-            v isa AbstractVector || throw(ContractValidationError(
-                "[bind] data definition $nm is an observation column " *
-                "(elementwise over data) but evaluated to $(summary(v))"))
+            v isa AbstractVector || v isa AbstractMatrix ||
+                throw(ContractValidationError(
+                "[bind] data definition $nm is read per observation (an " *
+                "observation column, or a matrix with one row per " *
+                "observation) but evaluated to $(summary(v))"))
         else
             v isa ColumnData || throw(ContractValidationError(
                 "[bind] data definition $nm evaluated to $(summary(v)); " *
@@ -10340,15 +10424,17 @@ end
 # Plain-Julia evaluation of a resolved definition expression (functions as
 # values): module calls through their `GlobalRef`s, built-in vocabulary
 # heads through the generated-model scope — the bindings the kernel uses.
-function _eval_value_expr(ex, lookup, label)
+function _eval_value_expr(ex, lookup, label; calls = nothing)
     ex isa Union{Number,String} && return ex
     ex isa QuoteNode && return ex.value
     ex isa GlobalRef && return getglobal(ex.mod, ex.name)
     ex isa Symbol && return lookup(ex)
     ex isa Expr || throw(ContractValidationError(
         "[bind] $label: unsupported literal $(repr(ex))"))
-    ev(a) = _eval_value_expr(a, lookup, label)
+    ev(a) = _eval_value_expr(a, lookup, label; calls)
     h = ex.head
+    cached = h === :call && calls !== nothing && ex.args[1] isa GlobalRef
+    cached && haskey(calls, ex) && return calls[ex]
     if h === :call
         f = _eval_callee(ex.args[1], label)
         pos = Any[]
@@ -10373,7 +10459,9 @@ function _eval_value_expr(ex, lookup, label)
         end
         # `invokelatest`: the model module's functions may postdate the
         # caller's world (bind_data is callable from any world).
-        return Base.invokelatest(f, pos...; kws...)
+        v = Base.invokelatest(f, pos...; kws...)
+        cached && (calls[ex] = v)
+        return v
     elseif h === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
             ex.args[2].head === :tuple
         f = _eval_callee(ex.args[1], label)
