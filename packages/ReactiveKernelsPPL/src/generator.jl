@@ -156,12 +156,6 @@ import .._ordinal_stage_obs, .._ordinal_stage_idx
 import ..linear_pk_read_locs, ..linear_pk_read_locs_auc
 import ..linear_pk_read_locs_over_subjects,
     ..linear_pk_read_locs_auc_over_subjects, ..SubjectScalar, ..SubjectSlice
-import ..varyingsource_pk_read_locs_over_subjects
-import ..varyingsource_pkpd_read_locs_over_subjects
-import .._varyingsource_pkpd_schedule_columns
-import .._varyingsource_pkpd_subject_columns
-import .._vs_pkpd_has_doses, .._vs_pkpd_placebo_times, .._vs_pkpd_csf_times
-import .._vs_gp_weights, .._vs_gp_normalizer, ..varyingsource_log_placebo
 import .._centered_correlated_logpdf
 # Event-LP provider (one call over the flat event axis — the flat
 # `log_F` local the batched cell runner slices per subject).
@@ -1272,67 +1266,6 @@ function _expand_grouped_cell_call(nm::Symbol, ex::Expr,
         end
     end
     return Expr[:($nm = $(Expr(:call, _over_subjects_name(fn), args...)))]
-end
-
-# Independent ragged axes stay bound vectors; the native runner traverses
-# subjects and dose/lag/reference ranges at runtime. Dose modifiers are in
-# caller dose-row order and the schedule's dose_index preserves that order.
-function _expand_grouped_cell_call(nm::Symbol, ex::Expr,
-        sched::VaryingSourcePKScheduleSpec, lps::Dict{Symbol,Symbol}, flatmap)
-    fields = (:reference_ends, :dose_ends, :lag_ends, :concentration_ends,
-        :dose_amount, :dose_index, :treatment_map, :unique_dts,
-        :concentration_idxs, :dosing_time_idxs)
-    args = Any[_sched_col_name(sched.name, f) for f in fields]
-    for (i,a) in enumerate(ex.args[3:end])
-        if a isa Symbol && haskey(lps, a)
-            push!(args, i <= 3 ? lps[a] : :(SubjectScalar($(lps[a]))))
-        else
-            push!(args, _rewrite_grouped_gather(a, sched, lps, flatmap))
-        end
-    end
-    return Expr[:($nm = varyingsource_pk_read_locs_over_subjects($(args...)))]
-end
-
-function _expand_grouped_cell_call(nm::Symbol, ex::Expr,
-        sched::VaryingSourcePKPDScheduleSpec, lps::Dict{Symbol,Symbol}, flatmap)
-    fields = Any[_sched_col_name(sched.name,f) for f in _VS_PKPD_SCHEDULE_FIELDS]
-    bound = Symbol(:_ppl_vs_schedule_,sched.name,:_,nm)
-    args = Any[]
-    for (i,a) in enumerate(ex.args[3:end])
-        push!(args,a isa Symbol && haskey(lps,a) ?
-            (i <= 3 ? lps[a] : :(SubjectScalar($(lps[a])))) :
-            _rewrite_grouped_gather(a,sched,lps,flatmap))
-    end
-    # Subject-specific GP inputs retain the general reader. Only genuinely
-    # shared mathematics can become one producer outside the subject loop.
-    if any(a -> a isa Expr && a.head === :call && a.args[1] === :SubjectScalar, args[4:17])
-        return Expr[:($bound = _varyingsource_pkpd_schedule_columns($(fields...))),
-            :($nm = varyingsource_pkpd_read_locs_over_subjects($bound,$(args...)))]
-    end
-    subject = Symbol(:_ppl_vs_subject_,sched.name,:_,nm)
-    has_doses = Symbol(:_ppl_vs_has_doses_,sched.name,:_,nm)
-    weights = Symbol(:_ppl_vs_weights_,sched.name,:_,nm)
-    normalizer = Symbol(:_ppl_vs_normalizer_,sched.name,:_,nm)
-    scalars = Symbol(:_ppl_vs_scalars_,sched.name,:_,nm)
-    times = Symbol(:_ppl_vs_times_,sched.name,:_,nm)
-    csf_times = Symbol(:_ppl_vs_csf_times_,sched.name,:_,nm)
-    primary = Symbol(:_ppl_vs_primary_,sched.name,:_,nm)
-    secondary = Symbol(:_ppl_vs_secondary_,sched.name,:_,nm)
-    columns = Any[a isa Symbol && haskey(lps,a) ? lps[a] :
-        _rewrite_grouped_gather(a,sched,lps,flatmap) for a in ex.args[20:32]]
-    ends = _sched_col_name(sched.name,:obs_ends)
-    return Expr[:($bound = _varyingsource_pkpd_schedule_columns($(fields...))),
-        :($subject = _varyingsource_pkpd_subject_columns(length($ends),$(columns...))),
-        :($has_doses = _vs_pkpd_has_doses($bound)),
-        :($weights = _vs_gp_weights($has_doses,$(args[4]),$(args[7:9]...))),
-        :($normalizer = _vs_gp_normalizer($has_doses,$weights,$(args[5:6]...))),
-        :($scalars = Float64[$(args[5:6]...),$normalizer]),
-        :($times = _vs_pkpd_placebo_times($bound)),
-        :($csf_times = _vs_pkpd_csf_times($bound)),
-        :($primary = varyingsource_log_placebo($times,$(args[10:12]...),$(args[16:17]...))),
-        :($secondary = varyingsource_log_placebo($csf_times,$(args[13:17]...))),
-        :($nm = varyingsource_pkpd_read_locs_over_subjects($bound,
-            $(args[1:3]...),$subject,$weights,$scalars,$primary,$secondary))]
 end
 
 # Grouped-kernel likelihood: the panel flat map cannot express sequential
