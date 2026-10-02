@@ -6074,14 +6074,14 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     # Prob-space families bypass the predictor-building location
     # lowering (their location names a Beta-sampled scalar parameter;
     # the Beta family is checked at contract). Every other family
-    # routes through `_lower_location` with its identity for the
-    # bare-location gate.
+    # routes through `_lower_location`, which admits a value location
+    # here (a scalar parameter or data column under the written link).
     pname = (family === BinomialProbFam ||
             family === ZeroInflatedBinomialFam) ?
         _lower_prob_location(lhs, loc, ctx,
             family === BinomialProbFam ? "Binomial" : "ZeroInflatedBinomial") :
         _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
-        coefuse; fam = family)
+        coefuse; value = true)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
         coefuse)
     nu = _lower_nu_use(lhs, nu_raw, ctx, predictors, pred_idx, coefuse)
@@ -7058,6 +7058,15 @@ const _RESPONSE_BASE_MSG =
     "`GammaLog.(alpha, eta)`, `BetaLogit.(mu, kappa)`, which lower " *
     "identically to their decomposed spellings)"
 
+# A location written with no link wrapper in a constrained-scale slot
+# (`Bernoulli.(theta)`, `Binomial.(n, theta)`, `Poisson.(lambda)`): the
+# value IS the probability or rate. The base returns it marked, so
+# `_lower_location` never confuses it with the same name under a link
+# (`Poisson.(exp.(a))`, where `a` is the log rate).
+struct _BareSlot
+    name::Symbol
+end
+
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
                                  "got $(repr(rhs))")
@@ -7090,8 +7099,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
             # definition is a predictor, not a parameter — it falls
             # through to link lowering, which throws the link-required
             # error (bare predictors keep their link).
-            return BernoulliLogitFam, LogitLink, IdentityLink, args[1],
-            nothing, nothing, nothing, nothing, nothing
+            return BernoulliLogitFam, LogitLink, IdentityLink,
+            _BareSlot(args[1]), nothing, nothing, nothing, nothing, nothing
         end
         f, l, loc = _lower_bernoulli_link(lhs, args[1])
         return f, l, IdentityLink, loc, nothing, nothing, nothing, nothing,
@@ -7105,9 +7114,9 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
             # predictor, not a parameter — it falls through to link
             # lowering, which throws the link-required error (bare
             # predictors keep their link).
-            return BinomialLogitFam, LogitLink, IdentityLink, args[2],
-            nothing, _lower_trials(lhs, args[1], ctx), nothing, nothing,
-            nothing
+            return BinomialLogitFam, LogitLink, IdentityLink,
+            _BareSlot(args[2]), nothing, _lower_trials(lhs, args[1], ctx),
+            nothing, nothing, nothing
         end
         f, l, loc = _lower_binomial_link(lhs, args[2])
         return f, l, IdentityLink, loc, nothing,
@@ -7205,8 +7214,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
             # predictor, not a parameter — it falls through to link
             # lowering, which throws the link-required error (bare
             # predictors keep their link).
-            return PoissonLogFam, LogLink, LogLink, args[1], nothing,
-            nothing, nothing, nothing, nothing
+            return PoissonLogFam, LogLink, LogLink, _BareSlot(args[1]),
+            nothing, nothing, nothing, nothing, nothing
         end
         return PoissonLogFam, LogLink, LogLink,
         _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
@@ -7816,9 +7825,16 @@ function _claim_pin!(lhs, pin, ctx, pred_idx)
     return nothing
 end
 
+# A location written bare in a constrained-scale slot lowers like any
+# name, except that a sampled parameter there IS the probability or rate.
+_lower_location(lhs, loc::_BareSlot, pred_link, ctx, predictors, pred_idx,
+        coefuse; kwargs...) =
+    _lower_location(lhs, loc.name, pred_link, ctx, predictors, pred_idx,
+        coefuse; kwargs..., bare = true)
+
 function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse; synth::Union{Nothing,Symbol} = nothing,
-        fam::Union{Nothing,LikelihoodFamily} = nothing)
+        bare::Bool = false, value::Bool = false)
     # A per-cell latent VECTOR is the whole location via a LatentTerm predictor
     # (`lp = theta`, identity design; the latent's prior lives on its
     # PlateParameter, so no coefficient use is recorded). Two spellings: a bare
@@ -7861,18 +7877,18 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             return target
         end
         if !haskey(ctx.detmap, loc)
-            # A bare sampled parameter (constrained-scale, no link
-            # inversion): the mixture bare-mean slots, single-family
-            # form — Bernoulli/Binomial-logit and Poisson-log ONLY
-            # (every other family rejects here with
-            # SurfaceLoweringError, never downstream). detmap-first
-            # preserves stated-prior aliases.
-            if loc in ctx.prior_names
-                (fam === BernoulliLogitFam || fam === BinomialLogitFam ||
-                    fam === PoissonLogFam) && return loc
-                return _lower_location_symbol_error(lhs, loc, ctx)
-            end
-            return _lower_location_symbol_error(lhs, loc, ctx)
+            # Written bare in a Bernoulli/Binomial/Poisson slot, a sampled
+            # parameter is the constrained-scale probability or rate (no
+            # link inversion): the mixture bare-mean slots, single-family
+            # form. detmap-first preserves stated-prior aliases.
+            bare && loc in ctx.prior_names && return loc
+            # Anywhere else a response reads a scalar parameter or a data
+            # column as a value under the written link.
+            value && !bare && _is_value_location(loc, ctx) &&
+                return _value_location!(lhs, loc, pred_link, ctx,
+                    predictors, pred_idx)
+            return _lower_location_symbol_error(lhs, loc, ctx; bare,
+                value)
         end
         pin = get(ctx.predictor_pins, lhs, nothing)
         if pin !== nothing && pin !== loc
@@ -7976,6 +7992,46 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
     return pname
 end
 
+# A name a response may read as its location value: a data column, or a
+# sampled scalar parameter of any prior (arrays, varying blocks, latents
+# and scan states carry their own location arms).
+_is_value_location(loc::Symbol, ctx) = loc in ctx.data ||
+    (loc in ctx.prior_names && loc ∉ ctx.sized_decls &&
+        loc ∉ ctx.vector_params && loc ∉ ctx.varying_contribs &&
+        loc ∉ ctx.varying_draws_names)
+
+# A value location (`y .~ Normal.(mu, s)`, `Poisson.(exp.(a))`,
+# `Normal.(x, s)`): as in Julia, broadcasting gives every observation the
+# value, read on the written link's scale. A data column is an offset (the
+# term its named twin `mu = x` lowers to); a scalar parameter is a one-leaf
+# composition with no coefficient — it keeps its own name and prior — which
+# the generator broadcasts over the rows.
+function _value_location!(lhs, loc::Symbol, pred_link, ctx, predictors,
+        pred_idx)
+    pin = get(ctx.predictor_pins, lhs, nothing)
+    if pin !== nothing
+        _claim_pin!(lhs, pin, ctx, pred_idx)
+        pname = pin
+    else
+        pname = Symbol(lhs, "_eta")
+        (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
+            "derived predictor name $pname collides with your definition — " *
+            "rename yours")
+    end
+    term = if loc in ctx.data
+        TermSpec(OffsetTerm, ColumnRef[loc], NamedTuple(), loc,
+            Symbol(loc, "_off"))
+    else
+        label = Symbol(pname, "_value")
+        TermSpec(ComposedTerm, ColumnRef[],
+            (tree = loc, subs = Symbol[], scalars = Symbol[loc]), label,
+            label)
+    end
+    push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
+    pred_idx[pname] = length(predictors)
+    return pname
+end
+
 # A latent-reading definition is a DESIGN predictor (not a latent transform)
 # when it has coefficient structure (a coef-priored or free coefficient
 # candidate), reads no scalar parameter (a non-coefficient sampled name
@@ -8065,7 +8121,8 @@ function _derived_reads_latent(name::Symbol, ctx)
     return false
 end
 
-function _lower_location_symbol_error(lhs, loc, ctx)
+function _lower_location_symbol_error(lhs, loc, ctx; bare::Bool = false,
+        value::Bool = false)
     loc in ctx.varying_contribs && _sfail(
         "response $lhs location is the varying contribution $loc — " *
         "locations must be predictors with estimated coefficients " *
@@ -8074,15 +8131,18 @@ function _lower_location_symbol_error(lhs, loc, ctx)
         _sfail("response $lhs location is the varying draws block $loc " *
               "— slice it (`r ~ varying_slice($loc, ...)`) and bind the " *
               "slice in a predictor with estimated coefficients")
-    loc in ctx.data && _sfail("response $lhs location is the data column " *
-                              "$loc — locations must be predictors with " *
-                              "estimated coefficients (wrap: " *
-                              "`eta = a .+ b .* $loc`)")
-    loc in ctx.prior_names && _sfail(
-        "response $lhs location is the bare scalar parameter $loc — a " *
-        "per-observation latent is a per-cell parameter (`@plate for i ...; " *
-        "$loc[i] ~ Normal(mu, tau); y[i] ~ Normal.($loc[i], s); end`); a " *
-        "scalar parameter cannot vary per observation")
+    bare && loc in ctx.data && _sfail("response $lhs location is the data " *
+        "column $loc written bare — a bare Bernoulli/Binomial/Poisson " *
+        "location is a sampled probability or rate; read data under its " *
+        "link (`Poisson.(exp.($loc))`, `Bernoulli.(logistic.($loc))`)")
+    !value && _is_value_location(loc, ctx) && _sfail("response $lhs " *
+        "location $loc: this response's locations are predictor " *
+        "definitions (`eta = a .+ b .* x`); a scalar parameter or data " *
+        "column as the whole location is admitted for single-family " *
+        "responses (`y .~ Normal.($loc, s)`)")
+    loc in ctx.prior_names && _sfail("response $lhs location $loc is a " *
+        "declared array, not one value per observation — read it by " *
+        "index (`$loc[g]`) or in a definition")
     return _sfail("response $lhs location $loc is not a predictor " *
                   "definition (`$loc = ...` affine in data)")
 end
