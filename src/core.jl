@@ -465,15 +465,35 @@ function _scan_history_buffer(xs, fill::Number)
     fill!(buffer, fill)
 end
 
-# A lane buffer handed back by the native position driver: the previous
-# position's output of the same authored plate or scan, already copied into the
-# stacked result. It is reused only when it is exactly the dense container the
-# fresh allocation would return, and is then overwritten in full; `nothing`
-# means allocate.
-@inline _lane_reuse(::Nothing, ::Type, output_axes) = nothing
-@inline _lane_reuse(buffer::Array{T,N}, ::Type{T}, output_axes::NTuple{N,Any}) where {T,N} =
-    axes(buffer) == output_axes ? buffer : nothing
+# The native position driver supplies either its first-position scratch or a
+# column of the owned output stack. A plate or scan overwrites the matching
+# dense buffer in full; `nothing` means allocate. Match element type and axes
+# before exposing storage to the generated body.
+_replicated_column_type(::Type{Array{T,N}}) where {T,N} =
+    SubArray{T,N - 1,Array{T,N},
+             Tuple{ntuple(_ -> Base.Slice{Base.OneTo{Int}}, N - 1)...,Int},true}
+_replicated_column_admitted(::Type{Array{T,N}}, ::Type{V}) where {T,N,V} =
+    N > 1 && _replicated_column_type(Array{T,N}) <: V
 @inline _lane_reuse(buffer, ::Type, output_axes) = nothing
+@inline @generated function _lane_reuse(buffer, ::Type{T}, output_axes::NTuple{N,Any}) where {T,N}
+    # An undeclared WANT's cache is heterogeneous. Narrow it here, where the
+    # allocation's element type and rank are known, before entering its loop.
+    column = _replicated_column_type(Array{T,N + 1})
+    quote
+        if buffer isa $column
+            # A destination column has the first position's shape. A later
+            # shape mismatch cannot be stacked, so reject it before writing.
+            # Returning the column unconditionally after that check keeps the
+            # hot loop's storage concrete instead of a view/Array union.
+            axes(buffer) == output_axes || throw(DimensionMismatch(
+                "position outputs must have the same shape at every position"))
+            buffer::$column
+        else
+            buffer isa Array{$T,$N} && axes(buffer) == output_axes ?
+                buffer::Array{$T,$N} : nothing
+        end
+    end
+end
 
 function _scan_history_buffer(recycled, xs, fill::Number)
     buffer = _lane_reuse(recycled, typeof(fill), axes(xs))
@@ -614,7 +634,8 @@ _KernelReduction(::Val{II}, ::Val{XI}, ::Val{KI}, ::Val{AI}, call::F,
 # Whether a plate's dose-outer lowering of `reduction` keeps the authored
 # semantics for these types: a concrete accumulator type `T` that the seed and
 # every step return unchanged, an `Int` gather index and a `Vector` gather
-# source. `S` is the tuple of the recipe's per-cell argument types. Everything
+# source (or a contiguous column of a dense matrix). `S` is the tuple of the
+# recipe's per-cell argument types. Everything
 # here is a type computation, folded when the plate body is compiled.
 @generated function _plate_reduction_ready(
         reduction::_KernelReduction{II,XI,KI,AI}, ::Type{T},
@@ -631,12 +652,16 @@ _KernelReduction(::Val{II}, ::Val{XI}, ::Val{KI}, ::Val{AI}, call::F,
         $promote(reduction.step, $T, element, $(types...)) === $T || return false
         $promote(reduction.index, element, $(select(KI)...)) === Int || return false
         source = $promote(reduction.array, $(select(AI)...))
-        source <: Vector || return false
+        _plate_dense_source(source) || return false
         $promote(reduction.step_in, $T, element, eltype(source), $(types...)) === $T ||
             return false
         $promote(reduction.step_out, $T, element, $(types...)) === $T
     end
 end
+_plate_dense_source(::Type) = false
+_plate_dense_source(::Type{<:Vector}) = true
+_plate_dense_source(::Type{S}) where {T,P<:Matrix,S<:SubArray{T,1,P}} =
+    S === _replicated_column_type(P)
 
 # The gather index of one dose-outer pass as a function of the cell: the
 # reduction's `index` part at the pass element over the cell's arguments, each
