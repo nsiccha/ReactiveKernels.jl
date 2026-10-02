@@ -158,6 +158,21 @@ and lock the one Reactant 0.2.289 lifted:
   rules generated from their pure-math graphs (the rule constraint above),
   which makes them primitives for Enzyme, so the failing body is never
   differentiated.
+- Native Enzyme reverse mode fails static activity analysis
+  (`EnzymeRuntimeActivityError`) when a non-inlined function returns a
+  `Float64` array read from constant data, bare or inside a tuple, named
+  tuple or struct, although its arguments are all constant. A non-inlined
+  identity on a constant named tuple raises nothing and instead accumulates
+  the adjoint into the constant data:
+  `repro_enzyme_noinline_const_aggregate_return.jl`. A guard whose error
+  message interpolates a value is enough to keep a helper from inlining. That
+  is the shape of a module function that unwraps a bound schedule column
+  inside a parameter-dependent `@rkppl` call. The PPL generator emits a
+  data-only call that a parameter-dependent call consumes as its own
+  statement, so preparation folds it once and the gradient never
+  differentiates it. A bound tuple or named tuple then crosses the
+  differentiated call as one operand per array leaf. Helpers inside a
+  parameter-dependent function remain the backend's limitation.
 - Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
   never finish on a reshape that inserts a unit dimension ahead of a dropped
   one: each creates a constant for the inserted dimension, fails a later
