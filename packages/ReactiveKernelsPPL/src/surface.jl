@@ -3827,6 +3827,15 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                        "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
                        "object owns eta over the whole column)")
             end
+            rows = _array_rows_lhs(st.args[2], bc, tilde, data)
+            if rows !== nothing
+                rlhs, rdims = rows
+                _claim!(seen, seelines, rlhs, line)
+                _reject_target(st.args[3], rlhs)
+                push!(sample, SampleStmt(rlhs, st.args[3], bc, nothing,
+                    nothing, nothing, rdims, true))
+                continue
+            end
             _reject_derived_ref_lhs(st.args[2], detnames)
             arr = _array_sample_lhs(st.args[2], bc, tilde, data)
             if arr !== nothing
@@ -4702,6 +4711,29 @@ end
 _is_literal_range(r) = r isa Expr && r.head === :call && length(r.args) == 3 &&
     r.args[1] === :(:)
 
+# Row-wise array declaration `eachrow(B[a, b]) .~ D`: Julia's `eachrow`
+# makes the rows of the two-axis array `B` the broadcast elements, and a
+# distribution broadcasts as a scalar (Distributions.jl), so every row is
+# one draw of the multivariate `D`. The axes are the two-axis array forms
+# (`1:K`, `levels(g)`, `axes(M, d)`). Returns `(name, dims)` or `nothing`
+# (not an `eachrow` LHS).
+function _array_rows_lhs(lhs, bc::Bool, tilde, data::Set{Symbol})
+    lhs isa Expr && lhs.head === :call && length(lhs.args) >= 1 &&
+        lhs.args[1] === :eachrow || return nothing
+    length(lhs.args) == 2 && lhs.args[2] isa Expr &&
+        lhs.args[2].head === :ref && length(lhs.args[2].args) == 3 &&
+        lhs.args[2].args[1] isa Symbol || _sfail("row-wise declaration " *
+            "`$(repr(lhs))` takes one two-axis array " *
+            "(`eachrow(B[levels(g), 1:K]) .~ MvNormalCholesky(mu, F)`)")
+    target = lhs.args[2].args[1]
+    target in data && _sfail("`$(repr(lhs))`: $target is data — a " *
+        "row-wise declaration declares a parameter array")
+    bc || _sfail("`$(repr(lhs))` broadcasts over the rows — use `.~`, " *
+        "not $tilde (`$(repr(lhs)) .~ MvNormalCholesky(mu, F)`)")
+    return target, Any[_array_axis(target, a, data)
+        for a in lhs.args[2].args[2:3]]
+end
+
 function _array_axis(target::Symbol, a, data::Set{Symbol})
     if _is_literal_range(a)
         lo, hi = a.args[2], a.args[3]
@@ -4910,7 +4942,9 @@ column: bare LHS, `eachindex`, `axes`). `levels` carries a
 `b[axes(X, 2)]` coefficient-vector priors (`nothing` otherwise). `dims`
 carries the axes of a declared array parameter (`z[1:K] .~ ...`,
 `z[levels(g), axes(Z, 2)] .~ ...` — see [`ArrayParameter`](@ref);
-`nothing` otherwise)."""
+`nothing` otherwise). `rows` marks a row-wise declaration
+`eachrow(B[a, b]) .~ D` (each row of the two-axis array one draw of the
+multivariate `D`)."""
 struct SampleStmt
     lhs::Symbol
     rhs::Any
@@ -4919,7 +4953,10 @@ struct SampleStmt
     levels::Any
     matrix::Union{Nothing,Symbol}
     dims::Union{Nothing,Vector{Any}}
+    rows::Bool
 end
+SampleStmt(lhs::Symbol, rhs, broadcast::Bool, range, levels, matrix, dims) =
+    SampleStmt(lhs, rhs, broadcast, range, levels, matrix, dims, false)
 SampleStmt(lhs::Symbol, rhs, broadcast::Bool, range, levels, matrix) =
     SampleStmt(lhs, rhs, broadcast, range, levels, matrix, nothing)
 SampleStmt(lhs::Symbol, rhs, broadcast::Bool) =
@@ -9790,6 +9827,11 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
     arrays = ArrayParameter[]
     for s in sample
         (s.lhs in ctx.data || s.lhs in ctx.derived_responses) && continue
+        if s.rows
+            push!(arrays, _lower_array_rows(s.lhs, s.dims, s.rhs, coefuse,
+                syms))
+            continue
+        end
         if s.dims !== nothing
             if haskey(ctx.threshold_uses, s.lhs)
                 push!(vectors, _lower_plain_thresholds(s, coefuse, ctx))
@@ -9917,6 +9959,43 @@ function _lower_array_parameter(lhs, dims::Vector{Any}, rhs, coefuse, ctx,
         end
     end
     return ArrayParameter(lhs, p.family, args, dims, p.support_override, lhs)
+end
+
+# `eachrow(B[a, b]) .~ MvNormalCholesky(mu, F)`: every row of `B` is
+# one draw of the multivariate normal with mean `mu` (a K-vector) and
+# covariance `F * F'`, `F` the lower-triangular Cholesky factor of the
+# covariance (Stan's `multi_normal_cholesky`; `F = sd .* L` for scales
+# `sd` and an `LKJCholesky` correlation factor `L`). `mu` and `F` are
+# model-level values: literal vectors, `zeros(K)`, array names or
+# expressions over them.
+function _lower_array_rows(lhs, dims::Vector{Any}, rhs, coefuse,
+        syms::Set{Symbol})
+    haskey(coefuse, lhs) && _sfail("array $lhs is used as a predictor " *
+        "coefficient — read it as a value (`$lhs[g, 1]`, `$lhs[g, :] * v`)")
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+        rhs.args[1] === :MvNormalCholesky || _sfail("row-wise array $lhs " *
+            "takes one multivariate distribution, " *
+            "`MvNormalCholesky(mu, F)` (each row one draw), got $(repr(rhs))")
+    args = _plain_args(rhs, "`MvNormalCholesky`")
+    length(args) == 2 || _sfail("row-wise array $lhs: " *
+        "`MvNormalCholesky` takes (mean vector, covariance Cholesky " *
+        "factor), got $(length(args)) arguments")
+    for a in args
+        a isa Bool && _sfail("row-wise array $lhs: `MvNormalCholesky` " *
+            "argument $(repr(a)) is not a value")
+        a isa Real && _sfail("row-wise array $lhs: `MvNormalCholesky` " *
+            "takes a mean VECTOR and a factor MATRIX, got the scalar " *
+            "$(repr(a)) (a zero mean is `zeros(K)`)")
+        a isa Expr || a isa Symbol || _sfail("row-wise array $lhs: " *
+            "`MvNormalCholesky` argument $(repr(a)) is not a value")
+        for r in _value_symbols(a)
+            haskey(coefuse, r) && _sfail("$r is a predictor coefficient " *
+                "and cannot also be a prior argument (array $lhs)")
+            push!(syms, r)
+        end
+    end
+    return ArrayParameter(lhs, :mvnormal_cholesky_rows,
+        (arg1 = args[1], arg2 = args[2]), dims, nothing, lhs)
 end
 
 # `Fam.(args...)` → `Fam(args...)`, recursively through the distribution

@@ -52,6 +52,49 @@ end
     @test_throws ArgumentError ReactiveKernelsPPL._centered_correlated_logpdf(ones(2),[-1.,1.],ones(3))
 end
 
+# `eachrow(B[a, b]) .~ MvNormalCholesky(mu, F)` shares the forward
+# substitution with the centered draws above (`_lower_solve_rows_logpdf`).
+function _rows_prior_point(k, g)
+    B = [.1sin(i + 3j) for i in 1:g, j in 1:k]
+    mu = [.05j - .1 for j in 1:k]
+    F = [i == j ? .8 + .05i : i > j ? .07cos(i - j) : 0. for i in 1:k, j in 1:k]
+    return B, mu, F
+end
+
+_rows_prior_value(B, mu, F) =
+    ReactiveKernelsPPL._mvnormal_cholesky_rows_logpdf(B, mu, F)
+
+@testset "row-wise MvNormalCholesky keeps runtime row and margin loops" begin
+    io = IOBuffer()
+    code_llvm(io, _rows_prior_value,
+        Tuple{Matrix{Float64},Vector{Float64},Matrix{Float64}}; debuginfo=:none)
+    ir = String(take!(io))
+    @test occursin(" phi i64 ", ir) && occursin("br i1", ir)
+end
+
+@testset "row-wise MvNormalCholesky density and ordinary native reverse" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    for (k, g) in ((1, 3), (2, 3), (13, 4))
+        B, mu, F = _rows_prior_point(k, g)
+        oracle(B, mu, F) =
+            sum(logpdf(MvNormal(mu, F * F'), B[j, :]) for j in 1:g)
+        @test _rows_prior_value(B, mu, F) ≈ oracle(B, mu, F) rtol=4e-14
+        q = vcat(vec(B), mu, vec(F))
+        unpack(q) = (reshape(q[1:g*k], g, k), q[g*k+1:g*k+k],
+            reshape(q[g*k+k+1:end], k, k))
+        objective(q) = _rows_prior_value(unpack(q)...)
+        free = [i for i in eachindex(q) if i <= g*k + k ||
+            (r = (i - g*k - k - 1) % k + 1; c = (i - g*k - k - 1) ÷ k + 1; r >= c)]
+        @test gradient(objective, backend, q)[free] ≈
+            _transit_fd_gradient(p -> oracle(unpack(p)...), q)[free] rtol=2e-6 atol=3e-8
+    end
+    B, mu, F = _rows_prior_point(2, 3)
+    @test_throws DimensionMismatch _rows_prior_value(B, [0.], F)
+    @test_throws DimensionMismatch _rows_prior_value(B, mu, ones(3, 3))
+    @test_throws ArgumentError _rows_prior_value(B, mu, [1. 0.; .5 -1.])
+    @test_throws ArgumentError _rows_prior_value(B, mu, [1. .2; .5 1.])
+end
+
 function _centered_test_plan()
     return lower_rkppl(quote
         a ~ Normal(0.,1.)

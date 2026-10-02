@@ -26,7 +26,8 @@ function _array_param(plan::StructuralPlan, name::Symbol)
     return plan.array_parameters[i]
 end
 
-_is_structured_array(p::ArrayParameter) = p.family === :lkj_cholesky
+_is_structured_array(p::ArrayParameter) =
+    p.family === :lkj_cholesky || p.family === :mvnormal_cholesky_rows
 
 # The flat (column-major) packed vector an elementwise array constrains
 # into: the array's own name for one axis, a hygienic local reshaped into
@@ -140,6 +141,8 @@ function _validate_array_parameters(plan::StructuralPlan)
                 "positive literal, got $(repr(eta))")
             p.support_override === nothing || _fail(p.label,
                 "LKJCholesky factor $(p.name) carries no support override")
+        elseif p.family === :mvnormal_cholesky_rows
+            _validate_array_rows(plan, p)
         else
             haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
                 "array $(p.name) family $(p.family) unknown (admitted: " *
@@ -191,6 +194,10 @@ function _validate_array_parameters_data(plan::StructuralPlan)
                 "$(p.name) is not square: $(repr(dims))")
             continue
         end
+        if p.family === :mvnormal_cholesky_rows
+            _validate_array_rows_data(plan, p, dims)
+            continue
+        end
         _is_structured_array(p) && continue
         length(dims) == 1 || continue
         K = dims[1]
@@ -218,6 +225,69 @@ function _array_arg_length(plan::StructuralPlan, a)
         col isa AbstractVector || _fail(:plan, "prior argument $a is a " *
             "matrix column (per-element arguments are vectors)")
         return length(col)
+    end
+    return nothing
+end
+
+# ── row-wise multivariate normal ─────────────────────────────────────
+
+# `zeros(K)`: a literal-length zero mean.
+_is_zeros_call(a) = a isa Expr && a.head === :call && length(a.args) == 2 &&
+    a.args[1] === :zeros && a.args[2] isa Int && a.args[2] >= 1
+
+# `eachrow(B[a, b]) .~ MvNormalCholesky(mu, F)`: two axes; `mu` (arg1)
+# and `F` (arg2) are model-level array values — never per-observation
+# data or gathers.
+function _validate_array_rows(plan::StructuralPlan, p::ArrayParameter)
+    length(p.dims) == 2 || _fail(p.label, "row-wise array $(p.name) has " *
+        "two axes (`eachrow($(p.name)[levels(g), 1:K])`)")
+    keys(p.args) == (:arg1, :arg2) || _fail(p.label, "row-wise array " *
+        "$(p.name) takes `MvNormalCholesky(mu, F)` (keys arg1, arg2), got " *
+        "$(Tuple(keys(p.args)))")
+    p.support_override === nothing || _fail(p.label, "row-wise array " *
+        "$(p.name) carries no support override")
+    for (k, a) in pairs(p.args)
+        (a isa Real || a isa Bool) && _fail(p.label, "row-wise array " *
+            "$(p.name): `MvNormalCholesky` argument $k is the scalar " *
+            "$(repr(a)) — the mean is a vector (`zeros(K)`) and the factor " *
+            "a matrix")
+        _is_zeros_call(a) && continue
+        if a isa Expr && a.head === :vect
+            k === :arg1 || _fail(p.label, "row-wise array $(p.name): the " *
+                "covariance factor is a matrix, got the vector $(repr(a))")
+            all(x -> x isa Real && !(x isa Bool) && isfinite(x), a.args) ||
+                _fail(p.label, "row-wise array $(p.name): a literal mean " *
+                    "holds finite numbers, got $(repr(a))")
+            continue
+        end
+        a isa Symbol && a === p.name && _fail(p.label, "row-wise array " *
+            "$(p.name) cannot parameterize its own prior")
+        _collect_array_value_refs!(Symbol[], a, plan, p.label,
+            isbound(plan))
+    end
+    return nothing
+end
+
+# Statically known shapes must agree with the row length `K = dims[2]`:
+# a literal or `zeros(K)` mean, a declared mean array, a bound data value
+# (a K-vector mean, a K×K factor), a declared factor array
+# (`L ~ LKJCholesky(K, eta)`). Computed values are checked when the
+# density is evaluated.
+function _validate_array_rows_data(plan::StructuralPlan, p::ArrayParameter,
+        dims::Vector{Int})
+    K = dims[2]
+    want = ((K,), (K, K))
+    for (a, what, w) in zip(values(p.args), ("mean", "covariance factor"),
+            want)
+        sz = a isa Expr && a.head === :vect ? (length(a.args),) :
+            _is_zeros_call(a) ? (a.args[2],) :
+            _is_array_param(plan, a) ?
+                Tuple(_array_dims(plan, _array_param(plan, a))) :
+            a isa Symbol && haskey(plan.columns, a) ?
+                size(plan.columns[a]) : nothing
+        sz === nothing || sz == w || _fail(p.label, "row-wise array " *
+            "$(p.name) has rows of length $K, so its $what has size " *
+            "$(repr(w)), but $(repr(a)) has size $(repr(sz))")
     end
     return nothing
 end
@@ -474,6 +544,13 @@ function _array_layout_entries!(entries::Vector{LayoutEntry},
             push!(entries, LayoutEntry(:cholesky_corr, nothing, p.name,
                 labels, offset, packed, :lkj))
             offset += packed
+        elseif p.family === :mvnormal_cholesky_rows
+            # Centered: the array's entries are its coordinates.
+            n = prod(dims)
+            push!(entries, LayoutEntry(:array, nothing, p.name,
+                _array_labels(p.name, dims), offset, n, :identity, NaN, NaN,
+                dims))
+            offset += n
         else
             transform, lo, hi =
                 _entry_transform(p.family, p.support_override, p.args)
@@ -584,6 +661,23 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         end
         if p.family === :flat
             push!(stmts, :($node::Float64 = 0.0))
+            push!(terms, node)
+            continue
+        end
+        if p.family === :mvnormal_cholesky_rows
+            vals = Any[]
+            for (i, a) in enumerate(values(p.args))
+                if a isa Symbol
+                    push!(vals, a)
+                    continue
+                end
+                local_name = Symbol(:_ppl_parg_, p.name, :_, i)
+                push!(stmts, :($local_name =
+                    $(a.head === :vect ? :(Float64[$(a.args...)]) : a)))
+                push!(vals, local_name)
+            end
+            push!(stmts, :($node::Float64 =
+                _mvnormal_cholesky_rows_logpdf($(p.name), $(vals...))))
             push!(terms, node)
             continue
         end
