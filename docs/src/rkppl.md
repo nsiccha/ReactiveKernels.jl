@@ -159,11 +159,21 @@ K, so `b[g, 1]` gathers one margin per observation. Positional reads such as
 array follows the same rule. A data-only definition can size a declared array
 through `levels(gg)`, as in the multi-membership example above.
 
-Gathering by a derived column, or from a definition whose axes the layer cannot
-derive (such as a module function's result), is not supported yet. Pass a
-declared array whole to a model-level Julia function when it needs the full
-value; a bare array combined directly with observation data must first be
-indexed to the observation axis.
+A single index on a multi-axis definition is linear and positional:
+`b = (z * sd)'` makes a row, and `b[g]` reads its column-major positions.
+A module function's result has no tracked level axes: `b = identity(z)`
+followed by `b[g, 1]` uses integer positions too. Binding checks that positional
+indices are positive integers and within known sizes. If the result's size
+depends on a function call, Julia checks its bounds when the result is read.
+Linear indexing of an adjoint row currently supports native execution and
+Enzyme gradients; Reactant tracing fails on that wrapper. Linear indexing of
+a plain matrix and positional gathers from module-produced arrays compile.
+See [backend limitations](constraints.md#acceptance-and-existing-limitations).
+
+Gathering by a derived column is not supported yet. Pass a declared array
+whole to a model-level Julia function when it needs the full value; a bare
+array combined directly with observation data must first be indexed to the
+observation axis.
 
 ## Design matrices
 

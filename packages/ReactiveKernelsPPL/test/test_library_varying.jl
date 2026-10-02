@@ -363,16 +363,28 @@ end
     g = cols[:g]
     @test _query(ki.spec, bi, :likelihood, u) ≈ sum(logpdf.(Normal.(
         nt.a .+ B[g, 1] .+ cols[:x] .* B[g, 2], nt.s), cols[:y]))
-    # Not built yet (todo 11e81k8): valid Julia, so these are capability
-    # gaps, not refusals. A single index on the 1×L row `(z * sd)'` is a
-    # linear, positional read; a module function's result has axes RKPPL
-    # cannot track, so `b[g, 1]` is positional too. Both lower today only
-    # with known level axes and one index per axis.
-    @test_broken (lower_rkppl(Expr(:block, head..., :(b = (z * sd)'),
+    # A single index on the 1×L row `(z * sd)'` is linear and positional.
+    # A module function's result has no tracked level axes, so its gather
+    # is positional too (todo 11e81k8).
+    @test (lower_rkppl(Expr(:block, head..., :(b = (z * sd)'),
         :(mu = a .+ b[g]), :(y .~ Normal.(mu, s))), data); true)
-    @test_broken (lower_rkppl(Expr(:block, head..., :(b = identity(z)),
+    @test (lower_rkppl(Expr(:block, head..., :(b = identity(z)),
         :(mu = a .+ b[g, 1]), :(y .~ Normal.(mu, s))), data;
         mod = @__MODULE__); true)
+    for (definition, read, value) in (
+            (:(b = (z * sd)'), :(b[g]), nt -> (nt.z * nt.sd)'),
+            (:(b = identity(z)), :(b[g, 1]), nt -> identity(nt.z)))
+        plan = _lv_lower(Expr(:block, head..., definition,
+            :(mu = a .+ $read), :(y .~ Normal.(mu, s))), data)
+        bound = bind_data(plan, cols)
+        built = build_kernel(bound)
+        nt = constrain(built.layout, u)
+        B = value(nt)
+        gathered = length(size(B)) == 2 && size(B, 1) == 1 ? B[g] : B[g, 1]
+        @test _query(built.spec, bound, :likelihood, u) ≈
+            sum(logpdf.(Normal.(nt.a .+ gathered, nt.s), cols[:y]))
+        _check_gradient(built.spec, bound, u)
+    end
 end
 
 @testset "centered correlated: library entry, oracle, explicit row priors" begin

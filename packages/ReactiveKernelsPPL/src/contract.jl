@@ -5912,11 +5912,7 @@ function _is_vector_valued(ex, plan::StructuralPlan)
 end
 
 function _observation_matrix_gather(ex, plan)
-    ex isa Expr && ex.head === :ref && length(ex.args) == 3 || return false
-    _is_array_param(plan, ex.args[1]) || return false
-    p = _array_param(plan, ex.args[1])
-    return length(p.dims) == 2 && _array_index_kind(plan, ex) === :gather &&
-        ex.args[3] === :(:)
+    return _is_row_gather(plan, ex)
 end
 
 function _model_vector_value(ex, plan)

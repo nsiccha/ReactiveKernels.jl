@@ -557,6 +557,15 @@ function _gather_axes(plan::StructuralPlan, base)
     return nothing
 end
 
+# Level lookup applies only to a read with one index per known axis.
+# A single index on a matrix is linear, and an opaque call's result has
+# no declared axis metadata: both use ordinary Julia positions.
+function _gather_axis(plan::StructuralPlan, ex::Expr)
+    axs = _gather_axes(plan, ex.args[1])
+    return axs !== nothing && !isempty(axs) &&
+        length(ex.args) - 1 == length(axs) ? first(axs) : nothing
+end
+
 # A per-observation gather `A[g, ...]` over a declared array or an
 # array-valued definition.
 _is_gather_ref(plan::StructuralPlan, ex) =
@@ -607,22 +616,28 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
             "observation — write it in a vector (per-observation) " *
             "definition, not a scalar one")
         axs = _value_axes(plan, base)
-        axs === nothing && _fail(label, "`$(repr(ex))` gathers from " *
-            "$base, whose axes RKPPL cannot derive (a module function's " *
-            "result). Positional gathers on such values are not supported " *
-            "yet; gather from the declared array, or compute $base with " *
-            "array arithmetic")
-        length(idx) == length(axs) || _fail(label, "`$(repr(ex))` " *
+        axs === nothing || length(idx) == 1 ||
+            length(idx) == length(axs) || _fail(label, "`$(repr(ex))` " *
             "gathers from the $(length(axs))-axis array value $base with " *
-            "$(length(idx)) indices. Linear (single-index) gathers on " *
-            "multi-axis values are not supported yet; give one index per " *
-            "axis")
+            "$(length(idx)) indices. Give one index per axis or one " *
+            "linear index")
         g = ex.args[2]
         _is_derived(plan, g) && _fail(label, "`$(repr(ex))` gathers by " *
             "the derived column $g. Gathers by derived columns are not " *
             "supported yet; gather by a raw data column")
         push!(refs, base)
-        bound && _validate_gather_axis(plan, base, label, axs[1], g)
+        if bound
+            d = _gather_axis(plan, ex)
+            if d === nothing
+                # An opaque result can depend on parameter values; its
+                # size is checked by Julia indexing at evaluation time.
+                K = axs === nothing ? nothing : prod(
+                    _array_dim_size(plan, base, label, a) for a in axs)
+                _validate_positional_gather(plan, base, label, g, K)
+            else
+                _validate_gather_axis(plan, base, label, d, g)
+            end
+        end
         return true
     end
     _is_array_param(plan, base) || return false
@@ -668,24 +683,33 @@ end
 # Julia indexing.
 function _validate_gather_axis(plan::StructuralPlan, name::Symbol, label,
         d, g::Symbol)
+    _is_levels_dim(d) || return _validate_positional_gather(plan, name,
+        label, g, _array_dim_size(plan, name, label, d))
+    col = _gather_index_column(plan, name, label, g)
+    lv = _array_axis_levels(plan, name, label, d.args[2])
+    codes = _declared_codes(col, lv)
+    any(==(0), codes) && _fail(label, "`$name[$g]` looks values of " *
+        "$g up on the axis `levels($(d.args[2]))` of $name, but " *
+        "$g holds values not on that axis")
+    return nothing
+end
+
+function _gather_index_column(plan::StructuralPlan, name::Symbol, label,
+        g::Symbol)
     haskey(plan.columns, g) || _fail(label, "array $name is read by " *
         "`$name[$g]`, but $g is not a bound column")
-    col = _vector_column(plan.columns, g, label, "gather index")
-    if _is_levels_dim(d)
-        lv = _array_axis_levels(plan, name, label, d.args[2])
-        codes = _declared_codes(col, lv)
-        any(==(0), codes) && _fail(label, "`$name[$g]` looks values of " *
-            "$g up on the axis `levels($(d.args[2]))` of $name, but " *
-            "$g holds values not on that axis")
-    else
-        K = _array_dim_size(plan, name, label, d)
-        eltype(col) <: Integer && eltype(col) !== Bool || _fail(label,
-            "`$name[$g]` indexes the integer axis of $name " *
-            "(size $K) by $g, which does not hold integers — declare the " *
-            "axis `levels($g)` to look values up by level")
-        all(i -> 1 <= i <= K, col) || _fail(label, "`$name[$g]`: " *
-            "$g holds indices outside 1:$K")
-    end
+    return _vector_column(plan.columns, g, label, "gather index")
+end
+
+function _validate_positional_gather(plan::StructuralPlan, name::Symbol,
+        label, g::Symbol, K::Union{Int,Nothing})
+    col = _gather_index_column(plan, name, label, g)
+    eltype(col) <: Integer && eltype(col) !== Bool || _fail(label,
+        "`$name[$g]` indexes $name by position, but $g does not hold " *
+        "integers — declare an axis `levels($g)` to look values up by level")
+    all(i -> i >= 1 && (K === nothing || i <= K), col) || _fail(label,
+        "`$name[$g]`: $g holds indices outside " *
+        (K === nothing ? "the positive integers" : "1:$K"))
     return nothing
 end
 
@@ -1052,7 +1076,7 @@ function _array_gather_rewrite(ex, plan::StructuralPlan,
         return _array_level_index_name(g, h)
     end
     if _is_gather_ref(plan, ex)
-        d = _gather_axes(plan, ex.args[1])[1]
+        d = _gather_axis(plan, ex)
         if _is_levels_dim(d)
             g, name = ex.args[2], ex.args[1]
             push!(needed, (g, name))
