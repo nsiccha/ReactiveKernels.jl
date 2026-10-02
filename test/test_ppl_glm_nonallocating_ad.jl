@@ -32,7 +32,7 @@ begin
         y ~ NormalIDGLM(X, alpha, beta, 2.0)
     end)
     yn = [1.5, -0.5, 2.0, 0.3, -1.2, 0.8]
-    nplan = lower_rkppl(nast, [:y, :x1, :x2])
+    nplan = lower_rkppl(nast, [:y, :x1, :x2]; conditioned = [:y, :x1, :x2])
     nbound = bind_data(nplan, Dict(:y => yn, :x1 => _GLM_X1, :x2 => _GLM_X2))
     nbuilt = build_kernel(nbound)
     ncols = sort!(collect(keys(nbound.columns)))
@@ -58,7 +58,7 @@ begin
         y ~ BernoulliLogitGLM(X, alpha, beta)
     end)
     yb = [1, 0, 1, 1, 0, 1]
-    bplan = lower_rkppl(bast, [:y, :x1, :x2])
+    bplan = lower_rkppl(bast, [:y, :x1, :x2]; conditioned = [:y, :x1, :x2])
     bbound = bind_data(bplan, Dict(:y => yb, :x1 => _GLM_X1, :x2 => _GLM_X2))
     bbuilt = build_kernel(bbound)
     bcols = sort!(collect(keys(bbound.columns)))
@@ -84,7 +84,7 @@ begin
         y ~ PoissonLogGLM(X, alpha, beta)
     end)
     yp = [3, 1, 5, 2, 0, 4]
-    pplan = lower_rkppl(past, [:y, :x1, :x2])
+    pplan = lower_rkppl(past, [:y, :x1, :x2]; conditioned = [:y, :x1, :x2])
     pbound = bind_data(pplan, Dict(:y => yp, :x1 => _GLM_X1, :x2 => _GLM_X2))
     pbuilt = build_kernel(pbound)
     pcols = sort!(collect(keys(pbound.columns)))

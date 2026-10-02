@@ -15,7 +15,7 @@ using Test
 # Lower + bind + build + query a mixture program; return
 # `(bound, built, kern, layout)`.
 function _mix_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -38,7 +38,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
                 mu2 ~ Normal(0.0, 5.0)
                 sigma ~ Exponential(1.0)
                 y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([0.3, 0.7]))
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.family === MixtureFam
         @test r.link === IdentityLink
@@ -58,7 +58,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
                 mu1 ~ Normal(0.0, 5.0)
                 sigma ~ Exponential(1.0)
                 y .~ MixtureModel.(vcat.(Normal.(mu1, sigma)), Ref([1.0]))
-            end, (:y,))
+            end, (:y,); conditioned = (:y,))
         r = only(plan.responses)
         @test r.mixture_family === GaussianFam
         @test r.mixture_locs == [:mu1]
@@ -70,7 +70,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
         plan = lower_rkppl(quote
                 w ~ Dirichlet([1.0, 1.0])
                 y .~ MixtureModel.(vcat.(Normal.(-1.0, 0.5), Normal.(1.0, 0.5)), Ref(w))
-            end, (:y,))
+            end, (:y,); conditioned = (:y,))
         r = only(plan.responses)
         @test r.mixture_weights === :w
         @test r.predictor === :w # Anchor: weights simplex name.
@@ -81,7 +81,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
         plan = lower_rkppl(quote
                 p1 ~ Beta(2.0, 2.0)
                 y .~ MixtureModel.(vcat.(Binomial.(10, p1), Binomial.(10, 0.2)), Ref([0.5, 0.5]))
-            end, (:y,))
+            end, (:y,); conditioned = (:y,))
         r = only(plan.responses)
         @test r.mixture_family === BinomialLogitFam
         @test r.mixture_locs == [:p1, 0.2]
@@ -95,7 +95,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
                 mu1 ~ Normal(0.0, 5.0)
                 y .~ MixtureModel.(vcat.(Normal.(mu1, exp.(ls)),
                     Normal.(0.0, exp.(ls))), Ref([0.5, 0.5]))
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.predictor === :ls # Anchor: first scale predictor.
         @test r.mixture_scales[1] isa ScalePredictorRef
@@ -108,7 +108,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
                 sigma = c
                 y .~ MixtureModel.(vcat.(Normal.(mu1, exp.(sigma)),
                     Normal.(mu2, exp.(sigma))), Ref([0.4, 0.6]))
-            end, (:y,))
+            end, (:y,); conditioned = (:y,))
         r = only(plan.responses)
         @test r.mixture_scales == [ScalePredictorRef(:sigma, LogLink),
             ScalePredictorRef(:sigma, LogLink)]
@@ -128,7 +128,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
                 sigma ~ Exponential(1.0)
                 y .~ MixtureModel.(vcat.(Normal.(mu1, sigma),
                     Normal.(mu2, sigma)), Ref([0.3, 0.7]))
-            end, (:y,))
+            end, (:y,); conditioned = (:y,))
         r = only(plan.responses)
         @test r.mixture_locs == [:mu1, :mu2]
         @test r.predictor === :mu1 # Anchor: first location.
@@ -144,7 +144,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
                 phi ~ Exponential(1.0)
                 y .~ MixtureModel.(vcat.(NegativeBinomial2Log.(mu, phi),
                     NegativeBinomial2Log.(mu, phi)), Ref([0.5, 0.5]))
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.mixture_family === NegativeBinomial2Fam
         @test r.mixture_locs == [:mu, :mu] # Sharing interns by name.
@@ -393,11 +393,11 @@ end
         @testset "$label" begin
             if label in capabilities
                 # capability: each entry above names the valid combination (todo `1nb43fj`).
-                @test_broken (lower_rkppl(prog, (:y, :x, :n1, :n2, :wt)); true)
+                @test_broken (lower_rkppl(prog, (:y, :x, :n1, :n2, :wt); conditioned = (:y, :x, :n1, :n2, :wt)); true)
             else
                 # refused: each remaining entry cites its Julia signature,
                 # declaration or distribution-domain violation above (P3/P6).
-                @test_throws E lower_rkppl(prog, (:y, :x, :n1, :n2, :wt))
+                @test_throws E lower_rkppl(prog, (:y, :x, :n1, :n2, :wt); conditioned = (:y, :x, :n1, :n2, :wt))
             end
         end
     end
@@ -787,7 +787,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): the mixture plate must not unroll over observations.
 function _mix_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -815,7 +815,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _mix_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

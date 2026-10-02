@@ -46,7 +46,7 @@ using Reactant
 using Test
 
 function _irt_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -165,7 +165,7 @@ end
 
 @testset "composed v2 lowering" begin
     # Varying-effect sub-predictors: effect-only and intercept+effect.
-    plan = lower_rkppl(_IRT_2PL, (:y, :person, :item))
+    plan = lower_rkppl(_IRT_2PL, (:y, :person, :item); conditioned = (:y, :person, :item))
     @test [(p.name, [t.kind for t in p.terms]) for p in plan.predictors] ==
         [(:la, [VaryingEffectTerm]), (:th, [VaryingEffectTerm]),
          (:b, [InterceptTerm, VaryingEffectTerm]), (:eta, [ComposedTerm])]
@@ -174,14 +174,14 @@ end
     @test t.options.subs == [:la, :th, :b]
     # A name bound to a composition inlines (and never emits).
     gp = lower_rkppl(_irt_gpcm(:(Normal(0, 1))),
-        (:y, :person, :item, :w1, :w2))
+        (:y, :person, :item, :w1, :w2); conditioned = (:y, :person, :item, :w1, :w2))
     names = [p.name for p in gp.predictors]
     @test :d ∉ names
     @test only(gp.predictors[findfirst(==(:eta1), names)].terms).options.tree ==
         :(exp.(la) .* th .- s1)
     @test isempty(gp.derived)
     # A product over a factor sub in an additive sum composes (LSAT).
-    ls = lower_rkppl(_IRT_LSAT, (:y, :student, :question))
+    ls = lower_rkppl(_IRT_LSAT, (:y, :student, :question); conditioned = (:y, :student, :question))
     @test only(ls.predictors[3].terms).options.tree == :(be .* th .- al)
     # Any dotted elementwise function composes over a sub, not only the
     # link-shaped `exp.`/`logistic.` (snag `rkppl-predictor-f40e6808`).
@@ -191,7 +191,7 @@ end
         be ~ Normal(0, 1)
         eta = log.(th) .* be
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :g))
+    end, (:y, :g); conditioned = (:y, :g))
     t = only(log_map.predictors[end].terms)
     @test t.kind === ComposedTerm
     @test t.options.tree == :(log.(th) .* be)
@@ -203,7 +203,7 @@ end
         y .~ Bernoulli.(logistic.(eta))
     end
     # capability: product of a coefficient with a varying_effect contribution in a composed predictor (values compose, P3/P8) (todo `1308iv0`)
-    @test_broken (lower_rkppl(bare, (:y, :g)); true)
+    @test_broken (lower_rkppl(bare, (:y, :g); conditioned = (:y, :g)); true)
 end
 
 @testset "IRT SB parity: direct (LSAT, 2PL, hier2pl)" begin

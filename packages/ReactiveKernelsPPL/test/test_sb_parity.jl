@@ -71,7 +71,7 @@ function _sb_logsumexp(ts::AbstractVector)
 end
 
 function _sb_query(prog::Expr, cols::Dict{Symbol,<:AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)

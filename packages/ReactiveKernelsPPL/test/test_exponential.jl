@@ -16,7 +16,7 @@ using Test
 # Lower + bind + build + query an exponential program; return
 # `(bound, built, kern, layout)`.
 function _exp_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -41,7 +41,7 @@ _exp_cols() = Dict{Symbol,AbstractVector}(:y => copy(_EXP_Y), :x => copy(_EXP_X)
             b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ Exponential.(exp.(eta))
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     r = only(plan.responses)
     @test r.family === ExponentialLogFam
     @test r.link === LogLink
@@ -113,7 +113,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): the exponential plate must not unroll over observations.
 function _exp_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -140,7 +140,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _exp_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

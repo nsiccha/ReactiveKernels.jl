@@ -11,7 +11,7 @@ using Test
 # generated likelihood. Every probe also checks caller-owned data stays intact.
 function _semantics_check(ast, data, oracle; names = nothing)
     original = deepcopy(data)
-    bound = bind_data(lower_rkppl(ast, data), data)
+    bound = bind_data(lower_rkppl(ast, data; conditioned = data), data)
     built = build_kernel(bound)
     names === nothing || @test coordinate_names(built.layout) == names
     u = collect(range(-0.2; step = 0.15, length = built.layout.total))
@@ -88,7 +88,7 @@ end
             a ~ Normal(0, 1)
             mu = a .+ 0 .* x
             y .~ $rhs
-        end, data); nothing catch e; e end
+        end, data; conditioned = data); nothing catch e; e end
         @test err isa SurfaceLoweringError
         @test occursin(hint, sprint(showerror, err))
     end
@@ -99,7 +99,7 @@ end
             s ~ Dirichlet([1.0, 2.0, 3.0])
             c1 .~ Multinomial.(N, s, c2, c3)
         end, counts, "eachrow(hcat"))
-        err = try lower_rkppl(ast, values); nothing catch e; e end
+        err = try lower_rkppl(ast, values; conditioned = values); nothing catch e; e end
         @test err isa SurfaceLoweringError
         @test occursin(hint, sprint(showerror, err))
     end
@@ -134,7 +134,7 @@ end
         mu = X * b
         y .~ Normal.(mu, 1)
     end
-    err = try lower_rkppl(bad, data); nothing catch e; e end
+    err = try lower_rkppl(bad, data; conditioned = data); nothing catch e; e end
     @test err isa SurfaceLoweringError
     @test occursin("ones(length(x1))", sprint(showerror, err))
     @test occursin("mu = a .+ X * b", sprint(showerror, err))
@@ -174,7 +174,7 @@ end
                 a ~ Normal(0, 1)
                 eta = a .+ 0 .* x
                 y .~ $rhs
-            end, (:x, :y, :n))
+            end, (:x, :y, :n); conditioned = (:x, :y, :n))
             nothing
         catch e
             e
@@ -199,7 +199,7 @@ end
             end
             data = Dict{Symbol,Any}(:x => x, :y => response,
                 :lo => [1, 1, 1], :hi => [4, 4, 4])
-            bound = bind_data(lower_rkppl(ast, data), data)
+            bound = bind_data(lower_rkppl(ast, data; conditioned = data), data)
             @test isbound(bound) # both endpoints are admitted
             invalid = copy(response)
             invalid[1], invalid[3] = 0, 5
@@ -207,7 +207,7 @@ end
             # refused: impossible evidence is rejected at bind (0tz0qfu,
             # evidence prong), rather than scored as clamped/in-range data.
             err = try
-                bind_data(lower_rkppl(ast, bad_data), bad_data)
+                bind_data(lower_rkppl(ast, bad_data; conditioned = bad_data), bad_data)
                 nothing
             catch e
                 e
@@ -227,7 +227,7 @@ end
                 end
                 values = merge(data, Dict(:y => bad_y))
                 @test_throws ContractValidationError bind_data(
-                    lower_rkppl(one, values), values)
+                    lower_rkppl(one, values; conditioned = values), values)
             end
         end
     end
@@ -274,7 +274,7 @@ end
             mu = c[g]
             y .~ Normal.(mu, 1)
         end
-        bound = bind_data(lower_rkppl(program, data), data)
+        bound = bind_data(lower_rkppl(program, data; conditioned = data), data)
         @test only(bound.levelmaps).values == selected
     end
 end

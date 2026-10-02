@@ -34,7 +34,7 @@ end
 _ls_pt(n) = [0.37 * sin(1.3 * i) - 0.2 for i in 1:n]
 
 function _ls_bind(ast, names; mod = _LS)
-    plan = lower_rkppl(ast, names; mod = mod)
+    plan = lower_rkppl(ast, names; mod = mod, conditioned = names)
     data = _ls_data()
     return bind_data(plan, Dict{Symbol,ColumnData}(k => data[k] for k in names))
 end
@@ -142,7 +142,7 @@ _ls_pair(x) = (_LS_CALLS[] += 1; (reshape(x, :, 1), hcat(x .^ 2, x .^ 3)))
         a ~ Normal(0, 1)
         mu = a .+ B * S
         y .~ Normal.(mu, 1.0)
-    end, (:y, :B, :lam); mod = _LS)
+    end, (:y, :B, :lam); mod = _LS, conditioned = (:y, :B, :lam))
     B = _ls_mat(x)
     bound = bind_data(plan, Dict{Symbol,ColumnData}(:y => y, :B => B,
         :lam => lam))
@@ -179,7 +179,7 @@ _ls_pair(x) = (_LS_CALLS[] += 1; (reshape(x, :, 1), hcat(x .^ 2, x .^ 3)))
         a ~ Normal(0, 1)
         mu = a .+ B * w
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x); mod = _LS)
+    end, (:y, :x); mod = _LS, conditioned = (:y, :x))
     err = try
         bind_data(plan, Dict{Symbol,ColumnData}(:y => y, :x => x))
         nothing
@@ -252,7 +252,7 @@ end
     return f
 end
 
-_ls_canon(ast, names) = sprint(_canon, _test_scope_math(lower_rkppl(ast, names; mod = _LS)))
+_ls_canon(ast, names) = sprint(_canon, _test_scope_math(lower_rkppl(ast, names; mod = _LS, conditioned = names)))
 
 @testset "library smooths: S5 shape and nesting are transparent" begin
     names = (:y, :x)

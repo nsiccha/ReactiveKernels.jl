@@ -23,7 +23,7 @@ using Test
 # `_load_corpus_case`, `_CORPUS_DIR` (test_corpus.jl), `_query`,
 # `_check_gradient` (test_generator.jl).
 
-_lv_lower(ex, data) = lower_rkppl(ex, data; mod = @__MODULE__)
+_lv_lower(ex, data) = lower_rkppl(ex, data; mod = @__MODULE__, conditioned = data)
 _lv_canon(ex, data) = sprint(_canon, _test_scope_math(_lv_lower(ex, data)))
 
 const _LV_N = 24
@@ -62,7 +62,7 @@ end
 
 function _lv_build(name::AbstractString; kw...)
     ast, data = _load_corpus_case(joinpath(_CORPUS_DIR, name * ".jl"))
-    bound = bind_data(lower_rkppl(ast, data), _lv_cols(data; kw...))
+    bound = bind_data(lower_rkppl(ast, data; conditioned = data), _lv_cols(data; kw...))
     return bound, build_kernel(bound)
 end
 
@@ -370,10 +370,10 @@ end
     # A module function's result has no tracked level axes, so its gather
     # is positional too (todo 11e81k8).
     @test (lower_rkppl(Expr(:block, head..., :(b = (z * sd)'),
-        :(mu = a .+ b[g]), :(y .~ Normal.(mu, s))), data); true)
+        :(mu = a .+ b[g]), :(y .~ Normal.(mu, s))), data; conditioned = data); true)
     @test (lower_rkppl(Expr(:block, head..., :(b = identity(z)),
         :(mu = a .+ b[g, 1]), :(y .~ Normal.(mu, s))), data;
-        mod = @__MODULE__); true)
+        mod = @__MODULE__, conditioned = data); true)
     for (definition, read, value) in (
             (:(b = (z * sd)'), :(b[g]), nt -> (nt.z * nt.sd)'),
             (:(b = identity(z)), :(b[g, 1]), nt -> identity(nt.z)))

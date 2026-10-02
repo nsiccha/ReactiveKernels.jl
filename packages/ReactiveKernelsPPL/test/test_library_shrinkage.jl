@@ -19,7 +19,7 @@ _ls_cols() = Dict{Symbol,Any}(
 _ls_names(cols) = Set{Symbol}(keys(cols))
 
 function _ls_build(ast, cols)
-    bound = bind_data(lower_rkppl(ast, _ls_names(cols)), cols)
+    bound = bind_data(lower_rkppl(ast, _ls_names(cols); conditioned = _ls_names(cols)), cols)
     return bound, build_kernel(bound)
 end
 
@@ -70,8 +70,8 @@ _ls_halfcauchy(s, x) = logpdf(truncated(Cauchy(0, s), 0, Inf), x)
     # The body's module calls (`eachcol`) resolve in the module that
     # defines the submodel, so the twin lowers there.
     names = Set([:x1, :x2, :y])
-    @test _ls_plan_canon(lower_rkppl(_LS_R2D2, names)) ==
-        _ls_plan_canon(lower_rkppl(twin, names; mod = ReactiveKernelsPPL))
+    @test _ls_plan_canon(lower_rkppl(_LS_R2D2, names; conditioned = names)) ==
+        _ls_plan_canon(lower_rkppl(twin, names; mod = ReactiveKernelsPPL, conditioned = names))
 end
 
 @testset "library r2d2_coefs: Distributions oracle and gradient" begin
@@ -141,11 +141,11 @@ end
         sigma ~ Exponential(1)
         y .~ Normal.(mu, sigma)
     end
-    @test _ls_plan_canon(lower_rkppl(nested, names; mod = @__MODULE__)) ==
-        _ls_plan_canon(lower_rkppl(twin, names; mod = ReactiveKernelsPPL))
+    @test _ls_plan_canon(lower_rkppl(nested, names; mod = @__MODULE__, conditioned = names)) ==
+        _ls_plan_canon(lower_rkppl(twin, names; mod = ReactiveKernelsPPL, conditioned = names))
     X = hcat(cols[:x1], cols[:x2])
     for (ast, path) in ((named, (:b,)), (nested, (:eta, :b)))
-        bound = bind_data(lower_rkppl(ast, names; mod = @__MODULE__), cols)
+        bound = bind_data(lower_rkppl(ast, names; mod = @__MODULE__, conditioned = names), cols)
         built = build_kernel(bound)
         u = _ls_u(built)
         nt = constrain(built.layout, u)
@@ -227,8 +227,8 @@ end
         y .~ Normal.(mu, sigma)
     end
     names = Set([:x1, :x2, :y])
-    @test _ls_plan_canon(lower_rkppl(_LS_HORSESHOE, names)) ==
-        _ls_plan_canon(lower_rkppl(twin, names))
+    @test _ls_plan_canon(lower_rkppl(_LS_HORSESHOE, names; conditioned = names)) ==
+        _ls_plan_canon(lower_rkppl(twin, names; conditioned = names))
 end
 
 @testset "library horseshoe_coefs: Distributions oracle and gradient" begin
@@ -294,7 +294,7 @@ end
             mu = X * b
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
-        end, names)
+        end, names; conditioned = names)
     @test any(t -> t.kind === MatrixTerm, only(term.predictors).terms)
     @test isempty(ReactiveKernelsPPL._value_design_matrix_names(term))
     # Read as a matrix elsewhere: a value, built at bind (`1` = a ones
@@ -308,7 +308,7 @@ end
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, sigma)
     end
-    plan = lower_rkppl(valued, names)
+    plan = lower_rkppl(valued, names; conditioned = names)
     @test !any(t -> t.kind === MatrixTerm, only(plan.predictors).terms)
     @test ReactiveKernelsPPL._value_design_matrix_names(plan) == Set([:X])
     bound, built = _ls_build(valued, cols)
@@ -340,7 +340,7 @@ end
             mu = X * (z .* s)
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
-        end, names)
+        end, names; conditioned = names)
     @test ReactiveKernelsPPL._value_design_matrix_names(ncp) == Set([:X])
     # A value matrix is plain data: a repeated column is a valid matrix.
     rep, _ = _ls_build(quote
@@ -387,7 +387,7 @@ end
             ("56_horseshoe_library", cols))
         ast, names = _load_corpus_case(joinpath(_CORPUS_DIR, name * ".jl"))
         @test Set(names) == Set(keys(data))
-        bound = bind_data(lower_rkppl(ast, names), data)
+        bound = bind_data(lower_rkppl(ast, names; conditioned = names), data)
         built = build_kernel(bound)
         u = _ls_u(built)
         @test isfinite(_query(built.spec, bound, :posterior, u))

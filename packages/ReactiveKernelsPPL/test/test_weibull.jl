@@ -17,7 +17,7 @@ using Test
 # Lower + bind + build + query a Weibull program; return
 # `(bound, built, kern, layout)`.
 function _wb_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -43,7 +43,7 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Weibull.(2.0, exp.(eta))
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.family === WeibullFam
         @test r.link === LogLink
@@ -61,7 +61,7 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
                 k ~ LogNormal(0.0, 0.3)
                 eta = a .+ b .* x
                 y .~ Weibull.(k, exp.(eta))
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test (r.family, r.scale) === (WeibullFam, :k)
         @test only(p for p in plan.parameters if p.name === :k).family === :lognormal
@@ -72,7 +72,7 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Weibull.(kc, exp.(eta))
-            end, (:y, :x, :kc))
+            end, (:y, :x, :kc); conditioned = (:y, :x, :kc))
         @test only(plan.responses).scale === :kc
     end
     @testset "modeled k deferred" begin
@@ -85,7 +85,7 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
                 eta = a .+ b .* x
                 ls = c .+ d .* x
                 y .~ Weibull.(exp.(ls), exp.(eta))
-            end, (:y, :x)); true)
+            end, (:y, :x); conditioned = (:y, :x)); true)
     end
 end
 
@@ -188,7 +188,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): the Weibull plate must not unroll over observations.
 function _wb_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -216,7 +216,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _wb_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

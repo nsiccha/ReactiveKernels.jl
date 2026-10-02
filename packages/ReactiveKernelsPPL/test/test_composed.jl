@@ -13,7 +13,7 @@
         be ~ Normal(0.0, 100.0)
         eta = be .* (th .- al)
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     @test [p.name for p in plan.predictors] == [:th, :al, :eta]
     @test all(p -> p.link === IdentityLink, plan.predictors)
     subs = plan.predictors[1:2]
@@ -44,7 +44,7 @@ end
         al = a_al .+ b_al .* xs
         eta = th .+ al
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     t = only(add.predictors[3].terms)
     @test t.kind === ComposedTerm
     @test t.options.tree == :(th .+ al)
@@ -57,7 +57,7 @@ end
         be ~ Normal(0.0, 100.0)
         eta = be * th
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     t = only(star.predictors[2].terms)
     @test t.kind === ComposedTerm
     @test t.options.tree == :(be .* th)
@@ -72,7 +72,7 @@ end
         be ~ Normal(0.0, 100.0)
         eta = be .* th
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :g))
+    end, (:y, :g); conditioned = (:y, :g))
     @test [p.name for p in plan.predictors] == [:th, :eta]
     @test only(plan.predictors[1].terms).kind === FactorTerm
     t = only(plan.predictors[2].terms)
@@ -88,7 +88,7 @@ end
         th = c[g]
         mu = th .+ b .* x
         y .~ Normal.(mu, 1.5)
-    end, (:y, :g, :x))
+    end, (:y, :g, :x); conditioned = (:y, :g, :x))
     @test [p.name for p in aff.predictors] == [:mu]
     @test [t.kind for t in only(aff.predictors).terms] ==
         [FactorTerm, ContinuousTerm]
@@ -101,7 +101,7 @@ end
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
         y .~ Bernoulli.(logistic.(be .* th))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     @test [p.name for p in inl.predictors] == [:th, :y_eta]
     @test only(inl.predictors[2].terms).kind === ComposedTerm
     vscale = lower_rkppl(quote
@@ -114,7 +114,7 @@ end
         be ~ Normal(0.0, 100.0)
         sg = be .* th
         y .~ Normal.(mu, exp.(sg))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     sg = only(p for p in vscale.predictors if p.name === :sg)
     @test only(sg.terms).kind === ComposedTerm
 end
@@ -131,7 +131,7 @@ end
         mid = be .* th
         eta = ga .* mid
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     @test [p.name for p in plan.predictors] == [:th, :eta]
     @test only(plan.predictors[2].terms).options.tree == :(ga .* (be .* th))
     @test isempty(plan.derived)
@@ -147,7 +147,7 @@ end
         y1 .~ Bernoulli.(logistic.(mid))
         eta2 = ga .* mid
         y2 .~ Bernoulli.(logistic.(eta2))
-    end, (:y1, :y2, :xs))
+    end, (:y1, :y2, :xs); conditioned = (:y1, :y2, :xs))
     @test [p.name for p in shared.predictors] == [:th, :mid, :eta2]
     @test only(shared.predictors[3].terms).options.tree ==
         :(ga .* (be .* th))
@@ -163,7 +163,7 @@ end
         be ~ Normal(0.0, 100.0)
         eta = be .* (th .+ xs)
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     t = only(plan.predictors[2].terms)
     @test t.kind === ComposedTerm
     @test t.options.tree == :(be .* (th .+ xs))
@@ -181,7 +181,7 @@ end
         m0 ~ Normal(0.0, 1.0)
         mu = m0 .+ resp
         y .~ Normal.(mu, 1.0)
-    end, (:y, :xs, :g))
+    end, (:y, :xs, :g); conditioned = (:y, :xs, :g))
     mt = only(curve.predictors[end].terms)
     @test mt.kind === ComposedTerm
     @test mt.options.tree ==
@@ -200,7 +200,7 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(exp.(mu), 1.5)
-    end, D), Dict1); true)
+    end, D; conditioned = D), Dict1); true)
     # admitted: Gaussian location under exp. through a named map
     @test (bind_data(lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -208,14 +208,14 @@ end
         mu = a .+ b .* x
         m = exp.(mu)
         y .~ Normal.(m, 1.5)
-    end, D), Dict1); true)
+    end, D; conditioned = D), Dict1); true)
     # ... while the Poisson log link still peels.
     pois = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Poisson.(exp.(mu))
-    end, D)
+    end, D; conditioned = D)
     @test only(pois.predictors).link === LogLink
     # A named map inside a real combination still inlines.
     plan = lower_rkppl(quote
@@ -228,7 +228,7 @@ end
         al = exp.(la)
         eta = al .* th
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     t = only(plan.predictors[end].terms)
     @test t.kind === ComposedTerm
     @test t.options.tree == :(exp.(la) .* th)
@@ -243,7 +243,7 @@ end
         be ~ Normal(0.0, 100.0)
         eta = be * th - al
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs)); true)
+    end, (:y, :xs); conditioned = (:y, :xs)); true)
     # A literal scale is one scalar leaf (a synthetic assignment), like
     # any sub-free scalar subexpression (test_fallback.jl).
     lit = lower_rkppl(quote
@@ -252,7 +252,7 @@ end
         th = a_th .+ b_th .* xs
         eta = 2.0 .* th
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     @test only(lit.predictors[2].terms).options.tree == :(_rkppl_leaf_1 .* th)
     @test only(lit.assignments).expr == 2.0
     # `logistic.` outside a composition keeps the link guidance (the
@@ -264,7 +264,7 @@ end
             mu = a .+ b .* xs
             p = logistic.(mu)
             y .~ Normal.(p, 1.0)
-        end, (:y, :xs))
+        end, (:y, :xs); conditioned = (:y, :xs))
         nothing
     catch e
         e
@@ -279,7 +279,7 @@ end
         th = a_th .+ b_th .* xs
         eta = be .* th
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     # A scalar leaf that is also a sub-predictor coefficient is one
     # ordinary parameter read twice (its sub-predictor summand lowers as a
     # derived column — test_fallback.jl).
@@ -289,7 +289,7 @@ end
         b ~ Normal(0, 1)
         eta = b .* th
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     @test any(p -> p.name === :b, twice.parameters)
     @test [t.kind for t in twice.predictors[1].terms] ==
         [InterceptTerm, ContinuousTerm]
@@ -306,7 +306,7 @@ end
         be ~ Normal(0.0, 100.0)
         eta = be .* th
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs); conditioned = (:y, :xs))
     # A dotted unary map over two operands fails closed with guidance,
     # never a raw `only` ArgumentError (robust G2/G3/G4 re-audit).
     for bad in (:(exp.(th, al)), :(logistic.(th, al)))
@@ -317,7 +317,7 @@ end
                 be ~ Normal(0.0, 100.0)
                 eta = $bad
                 y .~ Bernoulli.(logistic.(eta))
-            end, (:y, :xs))
+            end, (:y, :xs); conditioned = (:y, :xs))
             nothing
         catch e
             e
@@ -351,7 +351,7 @@ _cmp_ap_scales(q) = logpdf(Exponential(1), q.s1) + logpdf(Exponential(1), q.s2)
 # Posterior and Enzyme gradient at the constrained probe `q` against
 # `want(q)` (likelihood + priors) plus the layout's log-Jacobian.
 function _cmp_ap_check(prog, q::NamedTuple, want; cols = _CMP_AP_COLS)
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     lay = built.layout

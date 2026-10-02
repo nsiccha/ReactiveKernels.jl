@@ -16,7 +16,7 @@ using Test
 # Lower + bind + build + query a LogNormal program; return
 # `(bound, built, kern, layout)`.
 function _ln_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -42,7 +42,7 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, 0.5)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.family === LogNormalFam
         @test r.link === IdentityLink
@@ -60,7 +60,7 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
                 sigma ~ Exponential(1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, sigma)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test (r.family, r.scale) === (LogNormalFam, :sigma)
         @test only(p for p in plan.parameters if p.name === :sigma).family === :exponential
@@ -71,7 +71,7 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, sigmac)
-            end, (:y, :x, :sigmac))
+            end, (:y, :x, :sigmac); conditioned = (:y, :x, :sigmac))
         @test only(plan.responses).scale === :sigmac
     end
     @testset "modeled sigma deferred" begin
@@ -84,7 +84,7 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
                 mu = a .+ b .* x
                 ls = c .+ d .* x
                 y .~ LogNormal.(mu, exp.(ls))
-            end, (:y, :x)); true)
+            end, (:y, :x); conditioned = (:y, :x)); true)
     end
 end
 
@@ -177,7 +177,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): the LogNormal plate must not unroll over observations.
 function _ln_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -205,7 +205,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _ln_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

@@ -150,11 +150,11 @@ using Test
         @testset "$item: $label" begin
             if label in capabilities
                 # capability: each entry above names a valid model shape (todo `1qlbn5b`).
-                @test_broken (lower_rkppl(prog, datanames); true)
+                @test_broken (lower_rkppl(prog, datanames; conditioned = datanames); true)
             else
                 # refused: remaining entries cite a Julia signature,
                 # undeclared name or read-before-write violation (P3/P6).
-                @test_throws E lower_rkppl(prog, datanames)
+                @test_throws E lower_rkppl(prog, datanames; conditioned = datanames)
             end
         end
     end
@@ -200,7 +200,7 @@ end
     for n in (1, 3, 5)
         @testset "$n observations" begin
             cols = Dict{Symbol,AbstractVector}(k => v[1:n] for (k, v) in pairs(data))
-            bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+            bound = bind_data(lower_rkppl(prog, keys(cols); conditioned = keys(cols)), cols)
             built = build_kernel(bound)
             lay = built.layout
             @test lay.total == 7

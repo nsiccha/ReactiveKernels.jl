@@ -42,21 +42,21 @@ function _kinv_plans(K::Int)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ OrderedLogistic.(eta)
-            end, (:y, :x)), data(:y => y, :x => x)),
+            end, (:y, :x); conditioned = (:y, :x)), data(:y => y, :x => x)),
         "ordinal_cumulative_probit" => bind_data(lower_rkppl(quote
                 b ~ Normal(0, 1)
                 eta = b .* x
                 y .~ Ordinal.(Cumulative(), ProbitLink(), eta)
-            end, (:y, :x)), data(:y => y, :x => x)),
+            end, (:y, :x); conditioned = (:y, :x)), data(:y => y, :x => x)),
         "ordinal_stopping_logit" => bind_data(lower_rkppl(quote
                 b ~ Normal(0, 1)
                 eta = b .* x
                 y .~ Ordinal.(StoppingRatio(), LogitLink(), eta)
-            end, (:y, :x)), data(:y => y, :x => x)),
+            end, (:y, :x); conditioned = (:y, :x)), data(:y => y, :x => x)),
         "categorical_simplex" => bind_data(lower_rkppl(quote
                 s ~ Dirichlet($K, 1.0)
                 y .~ Categorical(s)
-            end, (:y,)), data(:y => y)),
+            end, (:y,); conditioned = (:y,)), data(:y => y)),
         "monotonic" => bind_data(lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
@@ -64,7 +64,7 @@ function _kinv_plans(K::Int)
                 mu = a .+ b .* mo(c, s)
                 sigma ~ Exponential(1.0)
                 yc .~ Normal.(mu, sigma)
-            end, (:yc, :c)), data(:yc => yc, :c => y)),
+            end, (:yc, :c); conditioned = (:yc, :c)), data(:yc => yc, :c => y)),
         "r2d2_factor" => bind_data(lower_rkppl(quote
                 R2 ~ Beta(1.0, 1.0)
                 phi ~ Dirichlet($phia)
@@ -72,7 +72,7 @@ function _kinv_plans(K::Int)
                 r2d2(mu, R2, phi)
                 sigma ~ Exponential(1.0)
                 yc .~ Normal.(mu, sigma)
-            end, Set([:x1, :g, :yc])), data(:x1 => x, :g => y, :yc => yc)),
+            end, Set([:x1, :g, :yc]); conditioned = Set([:x1, :g, :yc])), data(:x1 => x, :g => y, :yc => yc)),
     ]
 end
 

@@ -180,7 +180,7 @@ end
 
 function _run_pipeline(ast::Expr, cols::Dict{Symbol,AbstractVector}, u_probe;
         backend = nothing)
-    plan = lower_rkppl(ast, keys(cols))
+    plan = lower_rkppl(ast, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     prep = _prepare_bound_report(bound)
     pr = _run_report_probe(prep, u_probe; backend = backend)

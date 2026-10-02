@@ -18,7 +18,7 @@ using Test
 # Lower + bind + build + query an IG program; return
 # `(bound, built, kern, layout)`.
 function _ig_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -53,7 +53,7 @@ _ig_i1_cols() = Dict{Symbol,AbstractVector}(:y => copy(_IG_I1_Y),
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), 1.5)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.family === InverseGaussianFam
         @test r.link === LogLink
@@ -71,7 +71,7 @@ _ig_i1_cols() = Dict{Symbol,AbstractVector}(:y => copy(_IG_I1_Y),
                 lam ~ LogNormal(-0.3, 1.0)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lam)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test (r.family, r.scale) === (InverseGaussianFam, :lam)
         @test only(p for p in plan.parameters if p.name === :lam).family === :lognormal
@@ -82,7 +82,7 @@ _ig_i1_cols() = Dict{Symbol,AbstractVector}(:y => copy(_IG_I1_Y),
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lamc)
-            end, (:y, :x, :lamc))
+            end, (:y, :x, :lamc); conditioned = (:y, :x, :lamc))
         @test only(plan.responses).scale === :lamc
     end
     @testset "modeled lambda admitted" begin
@@ -94,7 +94,7 @@ _ig_i1_cols() = Dict{Symbol,AbstractVector}(:y => copy(_IG_I1_Y),
                 eta = a .+ b .* x
                 ls = c .+ d .* x
                 y .~ InverseGaussian.(exp.(eta), exp.(ls))
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         @test only(plan.responses).scale == ScalePredictorRef(:ls, LogLink)
     end
 end
@@ -219,7 +219,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): the IG plate must not unroll over observations.
 function _ig_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -247,7 +247,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _ig_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

@@ -33,7 +33,7 @@ _censored_addprop_fd(f, x; h = 1e-6) = [(f(x .+ h .* (eachindex(x) .== i)) -
         :dsubj=>Int[],:dtime=>Float64[],:damt=>Float64[],
         :location=>[.8,.9,1.2,.7,1.1],:assay=>[1,2,1,2,1],
         :dv=>[.3,.5,1.3,.2,1.4],:lloq=>fill(.5,5))
-    plan = lower_rkppl(_censored_addprop_ast(),Set(keys(cols)))
+    plan = lower_rkppl(_censored_addprop_ast(),Set(keys(cols)); conditioned = Set(keys(cols)))
     bound = bind_data(plan,cols;dims=Dict(:kernel_nsub_result=>2))
     built = build_kernel(bound)
     names = coordinate_names(built.layout)
@@ -68,7 +68,7 @@ _censored_addprop_fd(f, x; h = 1e-6) = [(f(x .+ h .* (eachindex(x) .== i)) -
             dims=Dict(:kernel_nsub_result=>2))
     end
     # refused: gather indices must be integers within a nonempty source axis (Julia indexing, P3)
-    @test_throws "empty" lower_rkppl(_censored_addprop_ast(:([])),Set(keys(cols)))
+    @test_throws "empty" lower_rkppl(_censored_addprop_ast(:([])),Set(keys(cols)); conditioned = Set(keys(cols)))
     # capability: a gathered vector mixing a data vector and a model scalar (ordinary values, P3/P10a 0dejlw1) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(_censored_addprop_ast(:([location,a1])),Set(keys(cols))); true)
+    @test_broken (lower_rkppl(_censored_addprop_ast(:([location,a1])),Set(keys(cols)); conditioned = Set(keys(cols))); true)
 end

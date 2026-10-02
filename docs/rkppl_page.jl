@@ -47,12 +47,17 @@ function _rkppl_displayed(name::Symbol, origin::AbstractString,
                           names::Vector{Symbol}, block::AbstractString;
                           preamble::AbstractString = "")
     data = join(("$n = $(_RKPPL_DATA[n])" for n in names), "\n")
-    kw = join(string.(names), ", ")
+    # Corpus headers declare inputs and observations. The examples' response
+    # names are y/obs/dv; other columns bind through the input call.
+    observations = filter(n -> n in (:y, :obs, :dv), names)
+    inputs = setdiff(names, observations)
+    kw = join(string.(inputs), ", ")
+    observed = join(string.(observations), ", ")
     string(
         isempty(preamble) ? "" : preamble * "\n\n",
         data, "\n\n",
         "model = @rkppl ", block, "\n\n",
-        "plan = model(; ", kw, ")\n",
+        "plan = model(; ", kw, ") | (; ", observed, ")\n",
         "built = build_kernel(plan)\n",
         "kernel = prepare_query(built, plan, :sampler)\n",
         "u = collect(range(-0.5, 0.5; length = built.layout.total))\n",
@@ -93,7 +98,7 @@ function render_rkppl_kernel_program(file::AbstractString)
     ast = Meta.parse(block)
     cols = Dict{Symbol,AbstractVector}(n => eval(Meta.parse(_RKPPL_DATA[n]))
         for n in names)
-    plan = ReactiveKernelsPPL.bind_data(lower_rkppl(ast, names), cols)
+    plan = ReactiveKernelsPPL.bind_data(lower_rkppl(ast, names; conditioned = names), cols)
     built = build_kernel(plan)
     program = sprint(Base.show_unquoted,
         Base.remove_linenums!(kernel_expr(plan, built.layout));
@@ -139,7 +144,8 @@ function render_rkppl_strict_error()
         x = eval(Meta.parse(_RKPPL_DATA[:x])))
     model = Core.eval(mod, :model)
     err = try
-        Base.invokelatest(model; data...)
+        binding = Base.invokelatest(model; x = data.x)
+        ReactiveKernelsPPL.condition(binding; y = data.y)
         nothing
     catch e
         e
@@ -148,7 +154,7 @@ function render_rkppl_strict_error()
         "the undeclared-name example did not raise a SurfaceLoweringError " *
         "(got $(repr(err)))")
     Markdown.MD(Any[
-        Markdown.Code("julia", _RKPPL_UNDECLARED * "\n\nmodel(; y, x)"),
+        Markdown.Code("julia", _RKPPL_UNDECLARED * "\n\nmodel(; x) | (; y)"),
         Markdown.Code("text", sprint(showerror, err)),
     ])
 end
@@ -177,3 +183,44 @@ function render_rkppl_submodel_example()
         _rkppl_displayed(:rkppl_submodel, "docs/rkppl_page.jl", [:y, :x],
             _RKPPL_SUBMODEL_BLOCK; preamble = _RKPPL_SUBMODEL_PREAMBLE))
 end
+
+const _RKPPL_REWRITE_SOURCE = raw"""
+using ReactiveKernelsPPL, Distributions
+
+@rkppl scale_prior(s) = begin
+    tau ~ HalfNormal(s)
+    tau
+end
+X = [1.0 0.5; 1.0 -1.0; 1.0 1.5]
+y = [0.2, -0.1, 0.4]
+b = [0.2, -0.1]
+model = @rkppl begin
+    b[axes(X, 2)] .~ Normal.(0, 1)
+    scale ~ scale_prior(1)
+    y .~ Normal.(X * b, scale)
+end
+
+changed = merge(model, :(b[axes(X, 2)] .~ Normal.(0, 2)),
+    :(scale.tau ~ HalfCauchy(0.5)))
+changed_plan = changed(; X) | (; y)
+variant = merge(scale_prior, :(tau ~ HalfNormal(2)))
+variant_plan = merge(model, :(scale ~ variant(1)))(; X) | (; y)
+
+pinned = merge(model, (; b, var"scale.tau" = 0.3))
+pinned_plan = pinned(; X) | (; y)
+observed_plan = model(; X) | (; y, b, var"scale.tau" = 0.3)
+
+built = build_kernel(observed_plan)
+kernel = prepare_query(built, observed_plan, :sampler)
+u = Float64[]  # every declared parameter was observed
+pinned_kernel = prepare_query(build_kernel(pinned_plan), pinned_plan, :sampler)
+retained_density = sum(logpdf.(Normal(), b)) +
+    logpdf(truncated(Normal(), 0, Inf), 0.3)
+@assert kernel(u) - pinned_kernel(u) ≈ retained_density
+docs_example = (; name = :rkppl_rewrites, origin = "docs/rkppl_page.jl",
+    inputs = (u,), kernel, output = kernel(u))
+"""
+
+"""Execute and render replacements, submodel variants, pins and observations."""
+render_rkppl_rewrites_example() =
+    execute_example(_rkppl_module(), _RKPPL_REWRITE_SOURCE)

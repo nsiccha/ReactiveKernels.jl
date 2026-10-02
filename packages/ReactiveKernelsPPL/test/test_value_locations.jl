@@ -53,18 +53,18 @@ _vl_probe(built) = [0.27 * sin(1.3i) for i in 1:built.layout.total]
         _check_gradient(built.spec, bound, _vl_probe(built))
     end
     # Naming, pins and the @plate twin compose with scalar data.
-    dot = lower_rkppl(_vl_program("y .~ Normal.(c, 1.0)"), (; y, c = 0.3))
+    dot = lower_rkppl(_vl_program("y .~ Normal.(c, 1.0)"), (; y, c = 0.3); conditioned = (; y, c = 0.3))
     plate = lower_rkppl(quote
         @plate for i in eachindex(y)
             y[i] ~ Normal(c, 1.0)
         end
-    end, (; y, c = 0.3))
+    end, (; y, c = 0.3); conditioned = (; y, c = 0.3))
     @test _plans_equal(dot, plate)
     model = @rkppl begin
         m ~ Normal(0, 1)
         y .~ Normal.(m, 1.0)
     end
-    pinned = Base.merge(model, (; m = 0.3))(; y)
+    pinned = Base.merge(model, (; m = 0.3))() | (; y)
     built = build_kernel(pinned)
     @test _query(built.spec, pinned, :likelihood, Float64[]) ≈
         sum(D.logpdf.(D.Normal(0.3, 1), y))
@@ -81,7 +81,7 @@ _vl_probe(built) = [0.27 * sin(1.3i) for i in 1:built.layout.total]
     for rhs in ("a", "-a", "+a", "alias")
         alias = rhs == "alias" ? "alias = -a; " : ""
         p = lower_rkppl(_vl_program("a ~ Normal(0,1); $alias" *
-            "m = $rhs; y .~ Normal.(m,1.0)"), (:y,))
+            "m = $rhs; y .~ Normal.(m,1.0)"), (:y,); conditioned = (:y,))
         @test only(only(p.predictors).terms).kind === InterceptTerm
         @test only(p.parameters).name === :a
     end
@@ -178,8 +178,8 @@ end
         bigger = Dict{Symbol,Any}(k => v isa AbstractVector ? repeat(v, 3) : v
             for (k, v) in data)
         prog = _vl_program(body)
-        small_plan = bind_data(lower_rkppl(prog, data), data)
-        large_plan = bind_data(lower_rkppl(prog, bigger), bigger)
+        small_plan = bind_data(lower_rkppl(prog, data; conditioned = data), data)
+        large_plan = bind_data(lower_rkppl(prog, bigger; conditioned = bigger), bigger)
         @test _kinv_program(small_plan) == _kinv_program(large_plan)
         large = _bare_reactant(_vl_program(body), bigger; optimize)
         @test large.lines == fx.lines

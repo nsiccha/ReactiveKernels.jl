@@ -43,7 +43,7 @@ _av_node(built, bound, node, u) = _query(built.spec, bound, node, u)
             y .~ Normal.(mu, sigma)
         end
         filter!(!isnothing, ast.args)
-        plan = lower_rkppl(ast, (:y, :x))
+        plan = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
         @test isempty(plan.derived)
         @test length(plan.assignments) == 1
         @test only(plan.predictors).terms[2].kind === OffsetTerm
@@ -82,7 +82,7 @@ end
     end
     y, x = _av_y(), _av_x()
     y2, x2 = _av_y(), _av_x2()
-    bound = bind_data(lower_rkppl(ast, (:y, :x, :y2, :x2)),
+    bound = bind_data(lower_rkppl(ast, (:y, :x, :y2, :x2); conditioned = (:y, :x, :y2, :x2)),
         Dict(:y => y, :x => x, :y2 => y2, :x2 => x2))
     built = build_kernel(bound)
     @test built.layout.total == 3
@@ -105,7 +105,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     y, x, x2 = _av_y(), _av_x(), _av_x2()
-    bound = m(; y, x, x2)
+    bound = (m(; x, x2) | (; y))
     @test only(bound.array_parameters).family === :lkj_cholesky
     built = build_kernel(bound)
     @test built.layout.total == 3 + 2
@@ -139,7 +139,7 @@ end
             mu = a .+ w
             y .~ Normal.(mu, sigma)
         end)
-        bound = bind_data(lower_rkppl(ast, (:y, :x)),
+        bound = bind_data(lower_rkppl(ast, (:y, :x); conditioned = (:y, :x)),
             Dict{Symbol,ColumnData}(:y => _av_y(), :x => _av_x()))
         built = build_kernel(bound)
         u = _av_point(built.layout.total)
@@ -164,7 +164,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     y, x, B = _av_y(), _av_x(), _av_B()
-    bound = m(; y, x, B)
+    bound = (m(; x, B) | (; y))
     @test Set(p.name for p in bound.array_parameters) == Set([:lambda, :w, :s])
     built = build_kernel(bound)
     @test built.layout.total == 1 + 3 + 3 + 3 + 2
@@ -199,7 +199,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     y, x, x2 = _av_y(), _av_x(), _av_x2()
-    bound = m(; y, x, x2)
+    bound = (m(; x, x2) | (; y))
     @test isempty(bound.array_parameters)
     @test only(bound.vector_parameters).name === :phi
     built = build_kernel(bound)
@@ -235,7 +235,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     y, x, g = _av_y(), _av_x(), _av_g()
-    bound = m(; y, x, g)
+    bound = (m(; x, g) | (; y))
     built = build_kernel(bound)
     u = _av_point(built.layout.total)
     nt = constrain(built.layout, u)
@@ -282,7 +282,7 @@ end
     end)
     y = _av_y()
     k = [1, 2, 3, 1, 2, 3, 1, 2]
-    bound = bind_data(lower_rkppl(ast, (:y, :k); mod = ArrayRowsModels),
+    bound = bind_data(lower_rkppl(ast, (:y, :k); mod = ArrayRowsModels, conditioned = (:y, :k)),
         Dict{Symbol,ColumnData}(:y => y, :k => k))
     built = build_kernel(bound)
     u = _av_point(built.layout.total)
@@ -308,7 +308,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     y, x, g = _av_y(), _av_x(), _av_g()
-    bound = m(; y, x, g)
+    bound = (m(; x, g) | (; y))
     p = only(q for q in bound.array_parameters if q.name === :B)
     @test p.family === :mvnormal_cholesky_rows
     built = build_kernel(bound)
@@ -353,7 +353,7 @@ end
     end)
     y = _av_y()
     k = [1, 2, 3, 1, 2, 3, 1, 2]
-    bound = bind_data(lower_rkppl(ast, (:y, :k); mod = ArrayRowsModels),
+    bound = bind_data(lower_rkppl(ast, (:y, :k); mod = ArrayRowsModels, conditioned = (:y, :k)),
         Dict{Symbol,ColumnData}(:y => y, :k => k))
     built = build_kernel(bound)
     @test built.layout.total == 1 + 3 + 3 + 9
@@ -397,7 +397,7 @@ end
     end)
     data = Dict{Symbol,ColumnData}(:y => _av_y(),
         :k => [1, 2, 3, 1, 2, 3, 1, 2])
-    br, bc = (bind_data(lower_rkppl(ast, (:y, :k); mod = ArrayRowsModels),
+    br, bc = (bind_data(lower_rkppl(ast, (:y, :k); mod = ArrayRowsModels, conditioned = (:y, :k)),
         data) for ast in (rows, chain))
     kr, kc = build_kernel(br), build_kernel(bc)
     @test kr.layout.total == kc.layout.total == 10
@@ -407,7 +407,7 @@ end
 end
 
 @testset "array values: row-wise MvNormalCholesky fail closed" begin
-    bindm(ast, data) = bind_data(lower_rkppl(ast, Tuple(keys(data))),
+    bindm(ast, data) = bind_data(lower_rkppl(ast, Tuple(keys(data)); conditioned = Tuple(keys(data))),
         Dict{Symbol,ColumnData}(pairs(data)))
     y, x, g = _av_y(), _av_x(), _av_g()
     prog(decl) = :(begin
@@ -424,19 +424,19 @@ end
     # statement broadcasts (`.~`); `~` would claim one draw for the whole
     # matrix (standard-Julia semantics, @rkppl principle 3).
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[levels(g),
-        1:2]) ~ MvNormalCholesky(zeros(2), F))), (:y, :x, :g))
+        1:2]) ~ MvNormalCholesky(zeros(2), F))), (:y, :x, :g); conditioned = (:y, :x, :g))
     # refused: a row is a vector, so a univariate family cannot draw it
     # (standard-Julia semantics, principle 3); elementwise priors are
     # `B[a, b] .~ Fam.(...)`.
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[levels(g),
-        1:2]) .~ Normal(0, 1))), (:y, :x, :g))
+        1:2]) .~ Normal(0, 1))), (:y, :x, :g); conditioned = (:y, :x, :g))
     # refused: eachrow of a vector produces length-1 rows, which disagree with the length-2 multivariate prior (P3 dimension contract)
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[1:2]) .~
-        MvNormalCholesky(zeros(2), F))), (:y, :x, :g))
+        MvNormalCholesky(zeros(2), F))), (:y, :x, :g); conditioned = (:y, :x, :g))
     # refused: the mean of a multivariate normal is a vector, as in
     # Distributions' `MvNormal` (principle 3); a zero mean is `zeros(K)`.
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[levels(g),
-        1:2]) .~ MvNormalCholesky(0, F))), (:y, :x, :g))
+        1:2]) .~ MvNormalCholesky(0, F))), (:y, :x, :g); conditioned = (:y, :x, :g))
     # A mean that is not a K-vector: here a column the predictor reads
     # per observation (8 values for rows of length 2).
     # refused: row, mean and covariance-factor dimensions must agree (distribution domain, P3)
@@ -467,7 +467,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     k = [1, 2, 3, 1, 2, 3, 3, 2]
-    bound = m(; y = _av_y(), k)
+    bound = (m(; k) | (; y = _av_y()))
     built = build_kernel(bound)
     u = _av_point(built.layout.total)
     nt = constrain(built.layout, u)
@@ -477,7 +477,7 @@ end
 end
 
 @testset "array values: fail closed" begin
-    bindm(ast, data) = bind_data(lower_rkppl(ast, Tuple(keys(data))),
+    bindm(ast, data) = bind_data(lower_rkppl(ast, Tuple(keys(data)); conditioned = Tuple(keys(data))),
         Dict{Symbol,ColumnData}(pairs(data)))
     y, x = _av_y(), _av_x()
     # `~` on a sized declaration.
@@ -485,7 +485,7 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(:(begin
         z[1:3] ~ Normal(0, 1)
         y .~ Normal.(z[1], 1.0)
-    end), (:y,))
+    end), (:y,); conditioned = (:y,))
     # A bare array combined with per-observation data.
     # capability: array parameter broadcast with observation data z .+ x (valid Julia when lengths agree; refused shape-blind at lowering) (todo `15lq8iu`)
     @test_broken (lower_rkppl(:(begin
@@ -494,7 +494,7 @@ end
         w = z .+ x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end), (:y, :x)); true)
+    end), (:y, :x); conditioned = (:y, :x)); true)
     # Undotted elementwise math over an array is a Julia error.
     # refused: undotted scalar + vector is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(:(begin
@@ -505,7 +505,7 @@ end
         w = v[1] .* x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end), (:y, :x))
+    end), (:y, :x); conditioned = (:y, :x))
     # LKJCholesky: non-literal eta, upper factor.
     # capability: sampled LKJCholesky eta (P8 1cmodra admits sampled prior args) (todo `1308iv0`)
     @test_broken (lower_rkppl(:(begin
@@ -515,7 +515,7 @@ end
         w = L[2, 1] .* x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end), (:y, :x)); true)
+    end), (:y, :x); conditioned = (:y, :x)); true)
     # capability: LKJCholesky upper factor (uplo = 'U') (todo `1308iv0`)
     @test_broken (lower_rkppl(:(begin
         L ~ LKJCholesky(2, 2.0, 'U')
@@ -523,7 +523,7 @@ end
         w = L[2, 1] .* x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end), (:y, :x)); true)
+    end), (:y, :x); conditioned = (:y, :x)); true)
     # A data matrix whose columns do not match the array.
     # refused: B * w column/length mismatch is a Julia DimensionMismatch (wrong data)
     @test_throws ContractValidationError bindm(:(begin

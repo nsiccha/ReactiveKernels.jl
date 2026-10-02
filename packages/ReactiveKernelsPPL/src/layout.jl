@@ -359,6 +359,7 @@ function assign_layout(plan::StructuralPlan)
         offset += K
     end
     for p in plan.parameters
+        p.name in plan.conditioned && continue
         transform, lo, hi = _entry_transform(p.family,
             _bound_override(plan, p.support_override),
             p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
@@ -368,6 +369,7 @@ function assign_layout(plan::StructuralPlan)
         offset += 1
     end
     for p in plan.plate_parameters
+        p.name in plan.conditioned && continue
         transform, lo, hi =
             _entry_transform(p.family, _bound_override(plan, p.support_override),
                 p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
@@ -379,6 +381,7 @@ function assign_layout(plan::StructuralPlan)
         offset += size
     end
     for p in plan.vector_parameters
+        p.name in plan.conditioned && continue
         p.size === nothing && throw(ContractValidationError(
             "[layout] vector parameter $(p.name) has unresolved size " *
             "(bind_data infers it from the linked response or " *

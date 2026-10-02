@@ -25,7 +25,7 @@ function _adg_plan(kind)
         $definition
         mu = a .+ $read
         y .~ Normal.(mu, 0.7)
-    end, (:y, :g, :h); mod = ArrayDefinitionGatherModels)
+    end, (:y, :g, :h); mod = ArrayDefinitionGatherModels, conditioned = (:y, :g, :h))
 end
 
 function _adg_columns(kind, G, n)

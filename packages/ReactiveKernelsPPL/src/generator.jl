@@ -53,12 +53,15 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     # vectors; collect them from every expression before emitting.
     gathers = Set{Tuple{Symbol,Symbol}}()
     assigns = _assignment_statements(plan; gathers)
-    priors = _prior_statements(plan, layout; gathers)
+    free = _density_selection(plan, n -> n ∉ plan.conditioned)
+    priors = _prior_statements(free, layout; gathers, context = plan)
+    likelihoods = _likelihood_statements(plan, layout; gathers)
     _each_layout_unit(plan, layout) do unit
         append!(stmts, unit isa LayoutEntry ? transform_statements(unit) :
             _stratified_transform_statements(unit, layout))
     end
     append!(stmts, _coef_reassembly_statements(plan, layout))
+    append!(stmts, _conditioned_value_statements(plan))
     append!(stmts, _array_value_statements(plan))
     append!(stmts, _array_level_index_statements(plan, gathers))
     append!(stmts, assigns)
@@ -70,7 +73,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _horseshoe_coef_statements(plan))
     append!(stmts, _affine_coefficient_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
-    append!(stmts, _likelihood_statements(plan))
+    append!(stmts, likelihoods)
     append!(stmts, priors)
     push!(stmts, _log_jacobian_statement(plan, layout))
     push!(stmts, :(posterior::Float64 = prior + likelihood + log_jacobian))
@@ -78,6 +81,39 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     sig = Expr(:call, name, :(unconstrained::Vector{Float64}),
         (_data_arg(colname, col) for (colname, col) in _ordered_columns(plan))...)
     return Expr(:(=), sig, Expr(:block, stmts...))
+end
+
+# Conditioning selects the same declaration-density graph as a prior. Its
+# constrained value is a read-only input, with no layout entry or Jacobian.
+function _density_selection(plan, selected)
+    return _with(plan;
+        parameters = filter(p -> selected(p.name), plan.parameters),
+        array_parameters = filter(p -> selected(p.name), plan.array_parameters),
+        vector_parameters = filter(p -> selected(p.name), plan.vector_parameters),
+        plate_parameters = filter(p -> selected(p.name), plan.plate_parameters))
+end
+
+function _conditioned_value_statements(plan)
+    stmts = Expr[]
+    for name in sort!(collect(plan.conditioned))
+        push!(stmts, :($name = $(_conditioned_input(name))))
+        for p in plan.array_parameters
+            p.name === name || continue
+            nd = length(_array_dims(plan, p))
+            if p.family in (:lkj_cholesky, :lkj_cholesky_stack)
+                # Only the intrinsic factor width expands; a stack's data axis
+                # stays a vector read and reduction in the existing LKJ graph.
+                K = _array_dims(plan, p)[1]
+                for i in 2:K
+                    rhs = nd == 3 ? :($name[$i, $i, :]) : :($name[$i, $i])
+                    push!(stmts, :($(_rl_name(name, i, i)) = $rhs))
+                end
+            elseif nd > 1 && !_is_slice_array(p)
+                push!(stmts, :($(_array_flat_name(name, nd)) = vec($name)))
+            end
+        end
+    end
+    return stmts
 end
 
 # Pack references to constrained parameter values for the affine matmul.
@@ -1140,7 +1176,7 @@ end
 
 _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
 
-function _likelihood_statements(plan::StructuralPlan)
+function _likelihood_statements(plan::StructuralPlan, layout; gathers)
     stmts = Expr[]
     terms = Any[]
     for r in plan.responses
@@ -1152,6 +1188,16 @@ function _likelihood_statements(plan::StructuralPlan)
         append!(stmts, kstmts)
         push!(terms, kterm)
     end
+    observed = _density_selection(plan, n -> n in plan.conditioned)
+    _parameter_prior_statements!(stmts, terms, observed, layout; prefix = :_ppl_condition_)
+    for p in observed.vector_parameters
+        _vector_parameter_prior_stmts!(stmts, terms, p)
+    end
+    for p in observed.plate_parameters
+        _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
+            p.support_override; conditioned = true)
+    end
+    _array_prior_stmts!(stmts, terms, observed, gathers; context = plan)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
     push!(stmts, :(likelihood::Float64 = $joint))
     return stmts
@@ -3356,7 +3402,7 @@ function _parameter_prior_input(ps, plan, layout)
     return view === nothing ? :([$(names...)]) : view
 end
 
-function _parameter_prior_statements!(stmts, terms, plan, layout)
+function _parameter_prior_statements!(stmts, terms, plan, layout; prefix = :_ppl_prior_)
     grouped = Set{Symbol}()
     for ps in _parameter_prior_groups(plan)
         family = first(ps).family
@@ -3365,7 +3411,7 @@ function _parameter_prior_statements!(stmts, terms, plan, layout)
         loc = Float64[a[li] for a in args]
         sca = Float64[a[si] for a in args]
         nus = ni == 0 ? fill(NaN, length(ps)) : Float64[a[ni] for a in args]
-        node = Symbol(:_ppl_prior_parameters_, family)
+        node = Symbol(prefix, :parameters_, family)
         _append_coef_plate!(stmts, _parameter_prior_input(ps, plan, layout),
             node, Symbol(node, :_pw), Symbol(node, :_mu), Symbol(node, :_sd),
             Symbol(node, :_nu), loc, sca, nus, family)
@@ -3375,7 +3421,7 @@ function _parameter_prior_statements!(stmts, terms, plan, layout)
     for p in plan.parameters
         p.name in grouped && continue
         node = Symbol(:_ppl_prior_, p.name)
-        prior = _sampled_prior_expr(p; pre = stmts)
+        prior = _sampled_prior_expr(p; pre = stmts, conditioned = p.name in plan.conditioned)
         push!(stmts, :($node::Float64 = $prior))
         push!(terms, node)
     end
@@ -3383,7 +3429,7 @@ function _parameter_prior_statements!(stmts, terms, plan, layout)
 end
 
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
-        gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}())
+        gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}(), context = plan)
     stmts = Expr[]
     terms = Any[]
     for pred in plan.predictors
@@ -3582,7 +3628,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
     append!(stmts, darstmts)
     append!(terms, darnodes)
     # Declared array parameters (`arrays.jl`).
-    _array_prior_stmts!(stmts, terms, plan, gathers)
+    _array_prior_stmts!(stmts, terms, plan, gathers; context)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
     push!(stmts, :(prior::Float64 = $joint))
     return stmts
@@ -3710,7 +3756,7 @@ end
 # expander, exactly as the Gaussian-likelihood scale is threaded.
 function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         name::Symbol, family::Symbol, args::NamedTuple,
-        support::SupportOverride)
+        support::SupportOverride; conditioned = false)
     node = Symbol(:_ppl_prior_, name)
     pw = Symbol(:_ppl_pw_prior_, name)
     inputs = Any[name]
@@ -3725,6 +3771,11 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     pre = Expr[]
     corr = _support_correction(family, threaded_support, argvals; pre, stem = name)
     corr === nothing || (cell = :($cell + $corr))
+    if conditioned
+        cell = _conditioned_support_guard(tv, threaded_support,
+            isempty(pre) ? cell : Expr(:block, pre..., cell))
+        empty!(pre)
+    end
     append!(stmts, _plate_sum_stmts(pw, node, inputs, Expr[pre..., cell]))
     push!(terms, node)
     return nothing
@@ -3831,12 +3882,59 @@ end
 # the -log(cdf(hi)-cdf(lo)) truncated-interval renormalization (`_support_correction`;
 # `:positive_stan`/`(:interval_stan, lo, hi)`/`(:upper, hi)` overrides add
 # nothing — Stan kernel semantics).
-function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[])
+function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], conditioned = false)
     argvals = [v for v in values(p.args)]
     base = _family_logpdf_expr(p.family, argvals, p.name)
-    corr = _support_correction(p.family, p.support_override, argvals; pre, stem = p.name)
-    corr === nothing && return base
-    return :($base + $corr)
+    local_pre = conditioned ? Expr[] : pre
+    corr = _support_correction(p.family, p.support_override, argvals; pre = local_pre, stem = p.name)
+    rhs = corr === nothing ? base : :($base + $corr)
+    return conditioned ? _conditioned_support_guard(p.name, p.support_override,
+        isempty(local_pre) ? rhs : Expr(:block, local_pre..., rhs)) : rhs
+end
+
+# Sampling transforms enforce support; observations use a lazy density guard.
+function _conditioned_endpoint_calls(ex::Expr)
+    # Branch locals are ordinary Julia assignments. Their annotations would
+    # convert traced numbers to Float64 during compiled execution; the enclosing
+    # kernel node already supplies the result type.
+    if ex.head === :(=) && first(ex.args) isa Expr && first(ex.args).head === :(::)
+        return Expr(:(=), first(first(ex.args).args),
+            _conditioned_endpoint_calls(ex.args[2]))
+    end
+    if ex.head === :call && first(ex.args) isa Expr
+        endpoint = first(ex.args)
+        if endpoint.head === :. && endpoint.args[2] isa QuoteNode &&
+                endpoint.args[2].value in (:cdf, :ccdf)
+            object = first(endpoint.args)
+            if object isa Expr && object.head === :call &&
+                    first(object.args) in values(_PRIOR_ENDPOINTS)
+                family = getfield(@__MODULE__, first(object.args))
+                callable = prepare(getproperty(family, endpoint.args[2].value))
+                return Expr(:call, QuoteNode(callable), object.args[2:end]..., ex.args[2:end]...)
+            end
+        end
+    end
+    return Expr(ex.head, map(_conditioned_endpoint_calls, ex.args)...)
+end
+_conditioned_endpoint_calls(ex) = ex
+
+function _conditioned_support_guard(value, support, density)
+    support === nothing && return density
+    valid = if support in (:positive, :positive_stan)
+        :($value >= 0)
+    elseif support[1] === :lower
+        :($value >= $(support[2]))
+    elseif support[1] === :upper
+        :($value <= $(support[2]))
+    else
+        :($(support[2]) <= $value && $value <= $(support[3]))
+    end
+    density = _conditioned_endpoint_calls(density)
+    return :(if $valid
+        $density
+    else
+        -Inf
+    end)
 end
 
 # Vector-latent prior node `_ppl_prior_<name>`: elementwise Normal for

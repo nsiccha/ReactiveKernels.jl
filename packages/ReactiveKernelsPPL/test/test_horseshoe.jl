@@ -24,7 +24,7 @@ function _horseshoe_cols()
 end
 
 @testset "horseshoe surface admission" begin
-    plan = lower_rkppl(_horseshoe_demo(), Set([:x1, :x2, :y]))
+    plan = lower_rkppl(_horseshoe_demo(), Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))
     @test length(plan.horseshoe_priors) == 2
     by_addr = Dict(h.addressee => h for h in plan.horseshoe_priors)
     @test by_addr[:x1].predictor === :mu
@@ -57,7 +57,7 @@ end
             mu = b0 .+ b1 .* x1
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
-        end, Set([:x1, :y]))
+        end, Set([:x1, :y]); conditioned = Set([:x1, :y]))
     @test length(mixed.horseshoe_priors) == 1
     @test isempty(mixed.population_priors)
     mgot = Dict(p.name => p for p in mixed.parameters)
@@ -70,7 +70,7 @@ end
             mu = a .+ b1 .* x1
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
-        end, Set([:x1, :y]))
+        end, Set([:x1, :y]); conditioned = Set([:x1, :y]))
     wentry = only(wrapped.horseshoe_priors)
     @test (wentry.local_scale, wentry.global_scale) == (1.0, 0.25)
     # Layout: the coefficient block is derived (no :coefficient entry);
@@ -87,7 +87,7 @@ end
 end
 
 @testset "horseshoe e2e values and gradient" begin
-    bound = bind_data(lower_rkppl(_horseshoe_demo(), Set([:x1, :x2, :y])),
+    bound = bind_data(lower_rkppl(_horseshoe_demo(), Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y])),
         _horseshoe_cols())
     built = build_kernel(bound)
     # Layout order (pinned above): sigma, intercept scalar, x1 triple, x2 triple.
@@ -123,7 +123,7 @@ end
                 mu = a .- b1 .* x1
                 sigma ~ Exponential(1.0)
                 y .~ Normal.(mu, sigma)
-            end, Set([:x1, :y])),
+            end, Set([:x1, :y]); conditioned = Set([:x1, :y])),
         Dict{Symbol,AbstractVector}(:x1 => [0.5, -1.0, 1.5, 0.0],
             :y => [1.0, 2.0, 1.5, 2.5]))
     entry = only(bound.horseshoe_priors)
@@ -156,7 +156,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     # capability: horseshoe on factor/indexed coefficients c[g]`) (todo `1308iv0`)
-    @test_broken (lower_rkppl(fac, Set([:g, :y])); true)
+    @test_broken (lower_rkppl(fac, Set([:g, :y]); conditioned = Set([:g, :y])); true)
     mo = quote
         a ~ Normal(0, 1)
         b1 ~ Normal(0, 1)
@@ -167,7 +167,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     # capability: horseshoe on an mo() term coefficient (flat-slice limit) (todo `1308iv0`)
-    @test_broken (lower_rkppl(mo, Set([:x1, :c, :y])); true)
+    @test_broken (lower_rkppl(mo, Set([:x1, :c, :y]); conditioned = Set([:x1, :c, :y])); true)
     # One structured prior per predictor.
     both = quote
         R2 ~ Beta(1.0, 1.0)
@@ -179,7 +179,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     # refused: a Horseshoe prior plus an r2d2 decomposition on one coefficient is a double prior
-    @test_throws SurfaceLoweringError lower_rkppl(both, Set([:x1, :x2, :y]))
+    @test_throws SurfaceLoweringError lower_rkppl(both, Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))
     # Unknown arguments and invalid scale literals violate the library
     # signature/domain; Bool and sampled scales are valid numeric values.
     for rhs in (:(Horseshoe(0.5)), :(Horseshoe(scale = 0.5)),
@@ -197,11 +197,11 @@ end
         if rhs in (:(Horseshoe(local_scale = true)), :(Horseshoe(local_scale = s)))
             # capability: Bool and sampled Horseshoe scale arguments
             # (10gzbm9 bool-values; P8 1cmodra; todo `0fkd9yk`).
-            @test_broken (lower_rkppl(bad, Set([:x1, :y])); true)
+            @test_broken (lower_rkppl(bad, Set([:x1, :y]); conditioned = Set([:x1, :y])); true)
         else
             # refused: unknown/positional arguments or a non-finite,
             # non-positive scale literal (Julia signature/domain, P3).
-            @test_throws SurfaceLoweringError lower_rkppl(bad, Set([:x1, :y]))
+            @test_throws SurfaceLoweringError lower_rkppl(bad, Set([:x1, :y]); conditioned = Set([:x1, :y]))
         end
     end
     # A horseshoe coefficient aliased as a scale stays loud (the
@@ -215,10 +215,10 @@ end
         y .~ Normal.(mu, s)
     end
     # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
-    @test_broken (lower_rkppl(aliased, Set([:x1, :y])); true)
+    @test_broken (lower_rkppl(aliased, Set([:x1, :y]); conditioned = Set([:x1, :y])); true)
     # Structural coverage (hand-built plans): exactly one prior per key,
     # triples present with half-Cauchy geometry.
-    good = lower_rkppl(_horseshoe_demo(), Set([:x1, :x2, :y]))
+    good = lower_rkppl(_horseshoe_demo(), Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))
     dup = StructuralPlan(good.responses, good.predictors,
         [PopulationPrior(:mu, :x1, 0.0, 1.0)], good.parameters,
         good.assignments, good.columns, good.n_obs;

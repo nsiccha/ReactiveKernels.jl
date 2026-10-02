@@ -17,14 +17,18 @@ an `@brm` formula. Hand-written and BRM-emitted models go through one pipeline:
    ─ build_kernel ─▶ (; spec, layout) ─ prepare_query / prepare_sampler
 ```
 
-Every example on this page runs at docs-build time, exactly as displayed. The
+Every example panel on this page runs at docs-build time, exactly as displayed. The
 canonical programs come verbatim from the package's corpus
 (`packages/ReactiveKernelsPPL/test/corpus/`), which also pins how each one
 lowers.
 
 ## A first model
 
-Bind data by keyword when calling the model; that lowers and binds in one step.
+Bind inputs by keyword, then observe responses with `model(; x) | (; y)`.
+`condition(model(; x); y)` is the same operation. A call keyword naming a
+declared variable pins it: `model(; x, sigma = 0.3) | (; y)` removes the
+`sigma` declaration and its density. Observing it instead,
+`model(; x) | (; y, sigma = 0.3)`, keeps its density as likelihood.
 `build_kernel` generates the program, and `prepare_query(built, plan, :sampler)`
 returns the log-posterior over the packed unconstrained coordinates.
 
@@ -292,7 +296,8 @@ Property access checks the local namespace first. If the scope has no local
 with that name, it reads a property of the returned value. Explicit
 `getproperty(z, :b)` always reads the returned value, even when `z.b` names
 a local. The caller can read sampled and deterministic locals, including
-data-only definitions, but cannot redefine them. Loop variables remain local
+data-only definitions. Ordinary caller assignments cannot redefine them;
+explicit `merge` operations replace their declarations. Loop variables remain local
 to their loop. Per-cell calls support `theta[i].b` and the whole local array
 `theta.b`; their scalar-body restrictions still apply.
 
@@ -329,6 +334,49 @@ This is the generated kernel for that program:
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_kernel_program("99_plate_50_grouped_pk_logf.jl")
 ```
+
+## Replace, pin, and condition
+
+Each operation returns a new model. The original program and shared submodel
+remain reusable. A statement replacement changes the declaration in place;
+an indexed replacement must match its complete left-hand side.
+
+For example, `merge(model, :(b[axes(X, 2)] .~ Normal.(0, 2)))` changes an
+array prior, and `merge(model, :(z.w.tau ~ HalfCauchy(0.5)))` changes a
+nested local's prior.
+
+Scoped replacements use the same dotted paths as ordinary reads. Derive a
+reusable submodel variant with `merge(submodel, :(tau ~ HalfNormal(2)))`;
+relative paths in a nested variant are expanded separately at each call.
+
+A pin removes the entire declaration and stores its number or array as input
+data. It adds no density and no sampled coordinate. A call keyword naming a
+declaration has the same meaning.
+
+Scoped keyword pins use `var"z.w.tau" = 0.3`.
+
+Conditioning keeps the sampling statement. Its density at the given
+constrained value contributes to `likelihood`; the observed variable has no
+sampled coordinate and no transform Jacobian. For example, observing
+`tau ~ HalfNormal(1)` at `0.3` contributes
+`logpdf(truncated(Normal(), 0, Inf), 0.3)`. A pin of `tau` contributes nothing.
+
+`model(; x) | (; y, tau = 0.3)` and
+`condition(model(; x); y, tau = 0.3)` are equivalent.
+`condition(plan; tau = 0.6)` rebinds that observation in a new bound plan.
+
+This example executes all four operations and checks the density retained by
+conditioning against Distributions.jl:
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_rewrites_example()
+```
+
+Direct lowering declares observation roles separately from supplied data:
+`lower_rkppl(ast, data; conditioned = (:y, :tau))`, then `bind_data(plan, data)`.
+Pass a captured model to `lower_rkppl` when it carries scoped merge edits.
+Sized array observations must have the declaration's shape. Partial indexed
+writes do not replace a complete declaration and fail explicitly.
 
 ## Querying and fitting
 

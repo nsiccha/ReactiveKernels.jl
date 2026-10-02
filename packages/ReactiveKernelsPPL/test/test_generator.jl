@@ -1627,7 +1627,7 @@ end
                 Expr(:block,
                     :(theta[i] ~ Normal(mu, tau)),
                     :(y[i] ~ Normal.(theta[i], se[i]))))))
-    plan0 = lower_rkppl(expr, (:y, :se))
+    plan0 = lower_rkppl(expr, (:y, :se); conditioned = (:y, :se))
     # The per-obs scale rides the response as a data-column name, not a scalar.
     @test plan0.responses[1].scale == :se
     plan = bind_data(plan0, Dict{Symbol,AbstractVector}(:y => y, :se => se))
@@ -1660,7 +1660,7 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ NegativeBinomial2.(exp.(mu), phi)
-    end, (:y, :x, :phi))
+    end, (:y, :x, :phi); conditioned = (:y, :x, :phi))
     @test only(plan0.responses).scale === :phi
     plan = bind_data(plan0,
         Dict{Symbol,AbstractVector}(:y => ycount, :x => x, :phi => phicol))
@@ -1689,7 +1689,7 @@ end
                 Expr(:block,
                     :(theta[i] ~ truncated(Normal(mu, tau), $lo, $hi)),
                     :(y[i] ~ Normal.(theta[i], 1.0))))))
-    plan = bind_data(lower_rkppl(expr, (:y,)),
+    plan = bind_data(lower_rkppl(expr, (:y,); conditioned = (:y,)),
         Dict{Symbol,AbstractVector}(:y => y))
     built = build_kernel(plan)
     @test built.layout.total == 2 + n
@@ -1722,7 +1722,7 @@ end
         :(mu = a .+ b .* x),
         :(y .~ Normal.(mu, s)),
         :(s ~ Exponential(1)))
-    plan = bind_data(lower_rkppl(expr, (:y, :x)), cols)
+    plan = bind_data(lower_rkppl(expr, (:y, :x); conditioned = (:y, :x)), cols)
     built = build_kernel(plan)
     @test coordinate_names(built.layout) == [:w, :a, :b, :s]
     u = [0.1, 0.3, -0.2, 0.25]
@@ -1745,7 +1745,7 @@ end
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(mu = a .+ b .* x),
             :(y .~ Normal.(mu, s)),
-            :(s ~ Exponential(1))), (:y, :x)), cols)
+            :(s ~ Exponential(1))), (:y, :x); conditioned = (:y, :x)), cols)
     built_i = build_kernel(interim)
     u_i = unconstrain(built_i.layout, (; w = c, a, b, s))
     @test _query(built.spec, plan, :prior, u) ≈
@@ -1766,7 +1766,7 @@ end
                 Expr(:block,
                     :(theta[i] ~ truncated(Normal(mu, tau), -Inf, $hi)),
                     :(y[i] ~ Normal.(theta[i], 1.0))))))
-    plan = bind_data(lower_rkppl(expr, (:y,)),
+    plan = bind_data(lower_rkppl(expr, (:y,); conditioned = (:y,)),
         Dict{Symbol,AbstractVector}(:y => y))
     built = build_kernel(plan)
     @test built.layout.total == 2 + n
@@ -1798,7 +1798,7 @@ end
         y .~ Normal.(h, sigma)
     end
     ydata = [0.3, -0.1, 0.5, 0.2, -0.4]
-    plan = m(; y = ydata)
+    plan = (m() | (; y = ydata))
     built = build_kernel(plan)
     @test built.layout.total == 8            # phi, s, sigma, h[1..5]
 
@@ -1837,7 +1837,7 @@ end
         y .~ Normal.(h, sigma)
     end
     y2 = [0.1, -0.2, 0.3, 0.0, -0.1, 0.25]
-    p2 = m2(; y = y2)
+    p2 = (m2() | (; y = y2))
     b2 = build_kernel(p2)
     @test b2.layout.total == 4 + length(y2)   # a, b, s, sigma, h[1..6]
     function ar2_oracle(u, y)
@@ -1873,7 +1873,7 @@ end
         end
         y .~ Normal.(h, sigma)
     end
-    pnc = mnc(; y = ydata)
+    pnc = (mnc() | (; y = ydata))
     bnc = build_kernel(pnc)
     @test bnc.layout.total == 3 + length(ydata)   # phi, s, sigma, z[1..5]
     @test only(e for e in bnc.layout.entries if e.kind === :scan).name ===
@@ -1918,7 +1918,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     ydata = [0.3, -0.1, 0.5, 0.2, -0.4]
-    plan = m(; y = ydata)
+    plan = (m() | (; y = ydata))
     @test only(plan.predictors).terms[2].kind === ScanSummandTerm
     built = build_kernel(plan)
     # Ordinary declaration order: phi_raw, beta_ar, a, sigma, z[1..5].

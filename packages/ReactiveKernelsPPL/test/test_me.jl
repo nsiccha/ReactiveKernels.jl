@@ -49,7 +49,7 @@ function _me_oracle(cols, a, b, sigma, x_true; loc = 0.5, scale = 1.5,
 end
 
 @testset "surface me lowering: LP use plus observation" begin
-    plan = lower_rkppl(_me_ast(), (:y, :x_obs))
+    plan = lower_rkppl(_me_ast(), (:y, :x_obs); conditioned = (:y, :x_obs))
     @test [p.name for p in plan.predictors] == [:mu, :x_obs_loc]
     mu = only(p for p in plan.predictors if p.name === :mu)
     @test [t.kind for t in mu.terms] == [InterceptTerm, ContinuousTerm]
@@ -85,7 +85,7 @@ end
         :(y .~ Normal.(mu, sigma)),
         :(x_obs .~ Normal.(x_true, 0.5)))
     err = try
-        lower_rkppl(undeclared, (:y, :x_obs))
+        lower_rkppl(undeclared, (:y, :x_obs); conditioned = (:y, :x_obs))
         nothing
     catch e
         e
@@ -103,7 +103,7 @@ end
                 Expr(:block, :(x_true[i] ~ Normal(0, 1))))),
         :(y .~ Normal.(mu, sigma)),
         :(x_obs .~ Normal.(x_true, 0.5)))
-    plan = lower_rkppl(ast, (:y, :x_obs))
+    plan = lower_rkppl(ast, (:y, :x_obs); conditioned = (:y, :x_obs))
     priors = Dict(p.name => p for p in plan.parameters)
     @test priors[:b].args == (arg1 = 0, arg2 = 1)
 end
@@ -118,25 +118,25 @@ end
     # capability: latent in an inline likelihood location Normal.(a .+ x_true, sigma) (named form admitted; naming never changes legality) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(sigma ~ Exponential(1)), plate,
-        :(y .~ Normal.(a .+ x_true, sigma))), Dn); true)
+        :(y .~ Normal.(a .+ x_true, sigma))), Dn; conditioned = Dn); true)
     # Two coefficients on one latent column.
     twice = lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)), :(c ~ Normal(0, 1)),
         :(sigma ~ Exponential(1)),
         :(mu = a .+ b .* x_true .+ c .* x_true), plate,
-        :(y .~ Normal.(mu, sigma))), Dn)
+        :(y .~ Normal.(mu, sigma))), Dn; conditioned = Dn)
     @test [t.options.parameter for t in only(p for p in twice.predictors if p.name === :mu).terms] == [:a, :b, :c]
     # A latent is not a factor index: the surface screens the inline
     # spelling, and the contract screens indexing in a named derived.
     # refused: real-valued latent as an index c[x_true] (non-integer index; c also undeclared, P6)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(sigma ~ Exponential(1)), plate,
-        :(y .~ Normal.(a .+ c[x_true], sigma))), Dn)
+        :(y .~ Normal.(a .+ c[x_true], sigma))), Dn; conditioned = Dn)
     # refused: real-valued latent as an index in a named derived (non-integer index; c also undeclared, P6)
     @test_throws ContractValidationError lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(sigma ~ Exponential(1)),
         :(mu = a .+ c[x_true]), plate,
-        :(y .~ Normal.(mu, sigma))), Dn)
+        :(y .~ Normal.(mu, sigma))), Dn; conditioned = Dn)
 end
 
 @testset "surface me lowering: unscaled latent stays a transform" begin
@@ -152,7 +152,7 @@ end
                 Expr(:block, :(x_true[i] ~ Normal(0, 1))))),
         :(y .~ Normal.(mu, sigma)),
         :(x_obs .~ Normal.(x_true, 0.5)))
-    plan = lower_rkppl(ast, (:y, :x_obs))
+    plan = lower_rkppl(ast, (:y, :x_obs); conditioned = (:y, :x_obs))
     yloc = only(p for p in plan.predictors if p.name === :y_loc)
     @test only(yloc.terms).kind === LatentTerm
     @test :a in [p.name for p in plan.parameters]
@@ -169,7 +169,7 @@ end
                 Expr(:block, :(x_true[i] ~ Normal(0, 1))))),
         :(y .~ Normal.(mu, sigma)),
         :(x_obs .~ Normal.(x_true, 0.5)))
-    plan2 = lower_rkppl(ast2, (:y, :x_obs))
+    plan2 = lower_rkppl(ast2, (:y, :x_obs); conditioned = (:y, :x_obs))
     yloc2 = only(p for p in plan2.predictors if p.name === :y_loc)
     @test only(yloc2.terms).kind === LatentTerm
     @test :b in [p.name for p in plan2.parameters]
@@ -186,7 +186,7 @@ end
                 Expr(:block, :(x_true[i] ~ Normal(0, 1))))),
         :(y .~ Normal.(eta, sigma)),
         :(x_obs .~ Normal.(x_true, 0.5)))
-    plan = lower_rkppl(ast, (:y, :x, :x_obs))
+    plan = lower_rkppl(ast, (:y, :x, :x_obs); conditioned = (:y, :x, :x_obs))
     yloc = only(p for p in plan.predictors if p.name === :y_loc)
     @test only(yloc.terms).kind === LatentTerm
     @test :eta in [d.name for d in plan.derived]
@@ -204,7 +204,7 @@ end
                 Expr(:block, :(x_true[i] ~ Normal(0, 1))))),
         :(y .~ Normal.(eta, sigma)),
         :(x_obs .~ Normal.(x_true, 0.5)))
-    plan = lower_rkppl(ast, (:y, :x_obs))
+    plan = lower_rkppl(ast, (:y, :x_obs); conditioned = (:y, :x_obs))
     eta = only(p for p in plan.predictors if p.name === :eta)
     @test [t.options.parameter for t in eta.terms] == [:mu, :tau]
     @test any(p -> p.name === :tau && p.family === :exponential, plan.parameters)
@@ -212,7 +212,7 @@ end
 
 function _me_bound_plan()
     cols, n = _me_columns()
-    return bind_data(lower_rkppl(_me_ast(), (:y, :x_obs)), cols)
+    return bind_data(lower_rkppl(_me_ast(), (:y, :x_obs); conditioned = (:y, :x_obs)), cols)
 end
 
 @testset "contract me: ContinuousTerm over a plate" begin
@@ -422,7 +422,7 @@ end
         :(y .~ Normal.(mu, sigma)),
         :(x_obs .~ Normal.(x_true, 0.5)))
     cols, n = _me_columns()
-    plan = bind_data(lower_rkppl(ast, (:y, :x_obs)), cols)
+    plan = bind_data(lower_rkppl(ast, (:y, :x_obs); conditioned = (:y, :x_obs)), cols)
     @test only(plan.plate_parameters).args == (arg1 = :xloc, arg2 = :xsca)
     built = build_kernel(plan)
     u = [0.1, -0.2, 0.3, -0.15, 0.25, 0.5, -0.4, 0.2, -0.1, 0.0, 0.15]

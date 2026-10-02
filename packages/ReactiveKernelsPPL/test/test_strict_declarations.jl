@@ -27,7 +27,7 @@ const _STRICT_COLS = (; y = [1.0, 2.0, 1.5, 2.5], x = [0.5, -1.0, 1.5, 0.0],
         mu = aa .+ b .* x
         y .~ Normal.(mu, 1.0)
     end
-    err = _strict_err(() -> lower_rkppl(body, (:y, :x)))
+    err = _strict_err(() -> lower_rkppl(body, (:y, :x); conditioned = (:y, :x)))
     # refused: every coefficient needs a declaration (P6, 05oe96l).
     @test err isa SurfaceLoweringError
     msg = sprint(showerror, err)
@@ -41,7 +41,7 @@ const _STRICT_COLS = (; y = [1.0, 2.0, 1.5, 2.5], x = [0.5, -1.0, 1.5, 0.0],
         y .~ Normal.(mu, 1.0)
     end
     # refused: the macro also refuses undeclared aa (P6, 05oe96l).
-    @test _strict_err(() -> m(; y = _STRICT_COLS.y, x = _STRICT_COLS.x)) isa
+    @test _strict_err(() -> (m(; x = _STRICT_COLS.x) | (; y = _STRICT_COLS.y))) isa
         SurfaceLoweringError
     # Declared, it lowers.
     ok = lower_rkppl(quote
@@ -49,7 +49,7 @@ const _STRICT_COLS = (; y = [1.0, 2.0, 1.5, 2.5], x = [0.5, -1.0, 1.5, 0.0],
             b ~ Normal(0, 1)
             mu = aa .+ b .* x
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     @test isempty(ok.population_priors)
     @test Set(p.name for p in ok.parameters) == Set((:aa, :b))
 end
@@ -59,7 +59,7 @@ end
             X = hcat(ones(length(x1)), x1, x2)
             mu = X * b
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x1, :x2)))
+        end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2)))
     # refused: every coefficient needs a declaration (P6, 05oe96l).
     @test err isa SurfaceLoweringError
     @test occursin("`b[axes(X, 2)] .~ Normal.(0, 1)`", sprint(showerror, err))
@@ -70,7 +70,7 @@ end
             X = hcat(x1, x2)
             alpha ~ Normal(0, 10)
             y ~ NormalIDGLM(X, alpha, beta, 1.0)
-        end, (:y, :x1, :x2)))
+        end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2)))
     # refused: every coefficient needs a declaration (P6, 05oe96l).
     @test err isa SurfaceLoweringError
     @test occursin("`beta[axes(X, 2)] .~ Normal.(0, 1)`", sprint(showerror, err))
@@ -82,7 +82,7 @@ end
             mu = a .+ b1 .* x1
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
-        end, (:y, :x1)))
+        end, (:y, :x1); conditioned = (:y, :x1)))
     # refused: every coefficient needs a declaration (P6, 05oe96l).
     @test err isa SurfaceLoweringError
     msg = sprint(showerror, err)

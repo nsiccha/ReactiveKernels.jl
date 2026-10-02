@@ -229,7 +229,7 @@ end
 # `b[axes(X, 2)] .~ Normal.(...)` to per-element priors. Every
 # non-matmul matrix position fails loudly naming the spelling.
 _mx_err(ast, data) = try
-    lower_rkppl(ast, data)
+    lower_rkppl(ast, data; conditioned = data)
     nothing
 catch e
     e
@@ -247,7 +247,7 @@ end
         X = hcat(ones(length(x1)), x1, x2)
         mu = X * b
         y .~ Normal.(mu, sigma)
-    end, (:y, :x1, :x2))
+    end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
     @test length(plan.matrices) == 1
     @test plan.matrices[1].name === :X
     @test plan.matrices[1].columns == Union{Nothing,Symbol}[nothing, :x1, :x2]
@@ -268,7 +268,7 @@ end
         X = hcat(ones(length(x1)), x1, x2)
         mu = X * b
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x1, :x2))
+    end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
     @test isempty(plan.population_priors)
     @test repr(only(plan.array_parameters).args.arg1) == repr(:([0, 0, 0]))
     @test repr(only(plan.array_parameters).args.arg2) == repr(:([1, 2, 3]))
@@ -278,7 +278,7 @@ end
         X = hcat(ones(length(x1)), x1)
         mu = X * b
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x1))
+    end, (:y, :x1); conditioned = (:y, :x1))
     @test isempty(plan.population_priors)
     # Dotted subtraction changes the use, preserving the declared prior.
     plan = lower_rkppl(quote
@@ -287,7 +287,7 @@ end
         X = hcat(x1)
         mu = a .- X * b
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x1))
+    end, (:y, :x1); conditioned = (:y, :x1))
     @test isempty(plan.population_priors)
     @test only(plan.parameters).name === :a
     @test only(plan.array_parameters).args == (arg1 = 1.0, arg2 = 2.0)
@@ -298,7 +298,7 @@ end
         X = hcat(ones(length(x1)), x1)
         mu = .-(X * b)
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x1))
+    end, (:y, :x1); conditioned = (:y, :x1))
     @test isempty(plan.population_priors)
     # Undotted negation folds the sign (affine unary-minus precedent).
     plan = lower_rkppl(quote
@@ -306,7 +306,7 @@ end
         X = hcat(ones(length(x1)), x1)
         mu = -(X * b)
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x1))
+    end, (:y, :x1); conditioned = (:y, :x1))
     @test isempty(plan.population_priors)
     @test only(plan.array_parameters).args == (arg1 = 1.0, arg2 = 2.0)
     @test only(only(plan.predictors).terms).options.sign == -1
@@ -317,7 +317,7 @@ end
         Y = hcat(x2)
         mu = X * b1 .+ Y * b2
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x1, :x2))
+    end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
     @test length(plan.matrices) == 2
     @test isempty(plan.population_priors)
     plan = lower_rkppl(quote
@@ -328,7 +328,7 @@ end
         nu = X * b2
         y .~ Normal.(mu, 1.0)
         z .~ Normal.(nu, 1.0)
-    end, (:y, :z, :x1))
+    end, (:y, :z, :x1); conditioned = (:y, :z, :x1))
     @test length(plan.matrices) == 1
     @test length(plan.predictors) == 2
     plan = lower_rkppl(quote
@@ -337,7 +337,7 @@ end
         X = hcat(x1)
         mu = X * b .+ c[g]
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x1, :g))
+    end, (:y, :x1, :g); conditioned = (:y, :x1, :g))
     @test only(plan.predictors).terms[1].kind === MatrixTerm
     @test only(plan.predictors).terms[2].kind === FactorTerm
     # Links, inline locations, leveled responses, submodel streams.
@@ -356,7 +356,7 @@ end
         mu = X * b
         y .~ CategoricalLogit.(mu)
     end)
-        @test lower_rkppl(ast, (:y, :x1)) isa StructuralPlan
+        @test lower_rkppl(ast, (:y, :x1); conditioned = (:y, :x1)) isa StructuralPlan
     end
     m = @rkppl begin
         b[axes(X, 2)] .~ Normal.(0, 1)
@@ -364,7 +364,7 @@ end
         mu = X * b
         y ~ _mx_stream(mu, 1.0)
     end
-    @test lower_rkppl(m.ast, (:y, :x); mod = @__MODULE__) isa StructuralPlan
+    @test lower_rkppl(m.ast, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x)) isa StructuralPlan
 end
 
 @testset "matrix surface definition errors" begin
@@ -384,7 +384,7 @@ end
         err = _mx_err(ast, D)
         if msg != "over unknown name"
             # capability: value-valued matrix construction and unused data/parameters (P3/P8, 10gzbm9 degenerate; todo `15lq8iu`).
-            @test_broken (lower_rkppl(ast, D); true)
+            @test_broken (lower_rkppl(ast, D; conditioned = D); true)
         else
             # refused: unknown names, dimension mismatch, unidentified
             # coefficients or non-scalar constructor arguments (P3/P6).
@@ -416,10 +416,10 @@ end
             if msg in ("shared across predictors", "literal scaling of a matmul",
                     "composes a matmul outside a term")
                 # Admitted: ordinary coefficient vectors retain all value readers.
-                @test (lower_rkppl(ast, data); true)
+                @test (lower_rkppl(ast, data; conditioned = data); true)
             else
                 # capability: other matrix value operands and shapes (P3/P8; todo `15lq8iu`).
-                @test_broken (lower_rkppl(ast, data); true)
+                @test_broken (lower_rkppl(ast, data; conditioned = data); true)
             end
         else
             # refused: coefficient dimensions or sizing source violate
@@ -455,10 +455,10 @@ end
         err = _mx_err(ast, data)
         if msg == "is a scalar summand"
             # admitted: a matrix reduction is an ordinary scalar value (P3/P10a).
-            @test (lower_rkppl(ast, data); true)
+            @test (lower_rkppl(ast, data; conditioned = data); true)
         elseif !(occursin("argument X", msg) || occursin("multinomial probs", msg) || occursin("categorical probs", msg))
             # capability: matrix values in broadcast locations/scales and expressions (P3/P10a 0dejlw1; todo `1qlbn5b`).
-            @test_broken (lower_rkppl(ast, data); true)
+            @test_broken (lower_rkppl(ast, data; conditioned = data); true)
         else
             # refused: unknown names, dimension mismatch, unidentified
             # coefficients or non-scalar constructor arguments (P3/P6).
@@ -472,7 +472,7 @@ end
         y ~ _mx_stream(X, 1.0)
     end
     err = try
-        lower_rkppl(m.ast, (:y, :x); mod = @__MODULE__)
+        lower_rkppl(m.ast, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
         nothing
     catch e
         e
@@ -499,7 +499,7 @@ end
     @test err isa SurfaceLoweringError && occursin("is a vector — use `.~`", err.message)
     for ast in (quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, 1.0) end,
             quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(ones(length(x1)), x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end)
-        plan = lower_rkppl(ast, D)
+        plan = lower_rkppl(ast, D; conditioned = D)
         # refused: unresolved prior name nope or width 2 against 3 coefficients (P3/P6).
         @test_throws ContractValidationError bind_data(plan, _mx_cols())
     end
@@ -525,7 +525,7 @@ end
                 X = hcat(ones(length(x1)), x1)
                 mu = X * b
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x1))
+            end, (:y, :x1); conditioned = (:y, :x1))
         @test isempty(plan.population_priors)
         @test ReactiveKernelsPPL._value_design_matrix_names(plan) == Set([:X])
         bound = bind_data(plan, cols)
@@ -554,7 +554,7 @@ end
     Y = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
     X1 = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
     cols = Dict{Symbol,AbstractVector}(:y => Y, :x1 => X1)
-    plan = lower_rkppl(prog, (:y, :x1))
+    plan = lower_rkppl(prog, (:y, :x1); conditioned = (:y, :x1))
     @test only(plan.array_parameters).args.arg2 === :s
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
@@ -593,14 +593,14 @@ end
         X = hcat(ones(length(x1)), x1)
         mu = X * b
         y .~ Normal.(mu, sigma)
-    end, (:y, :x1))
+    end, (:y, :x1); conditioned = (:y, :x1))
     maff = lower_rkppl(quote
         a ~ Normal(0.0, 1.0)
         c ~ Normal(0.0, 2.0)
         sigma ~ Exponential(1.0)
         mu = a .+ c .* x1
         y .~ Normal.(mu, sigma)
-    end, (:y, :x1))
+    end, (:y, :x1); conditioned = (:y, :x1))
     sub = Dict{Symbol,AbstractVector}(:y => cols[:y], :x1 => cols[:x1])
     pmat = bind_data(mmat, sub)
     paff = bind_data(maff, sub)
@@ -624,7 +624,7 @@ end
         X = hcat(ones(length(x1)), x1)
         mu = X * b
         y .~ Normal.(mu, sigma)
-    end, (:y, :x1)), sub)
+    end, (:y, :x1); conditioned = (:y, :x1)), sub)
     built = build_kernel(plan)
     _check_gradient(built.spec, plan, [0.5, -0.25, 0.1])
 end
@@ -640,14 +640,14 @@ end
         mu = X * b
         r2d2(mu, R2, phi)
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x1, :x2))
+    end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
     maff = lower_rkppl(quote
         R2 ~ Beta(1.0, 1.0)
         phi ~ Dirichlet([1.0, 1.0])
         mu = a .+ c1 .* x1 .+ c2 .* x2
         r2d2(mu, R2, phi)
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x1, :x2))
+    end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
     pmat = bind_data(mmat, sub)
     paff = bind_data(maff, sub)
     bmat = build_kernel(pmat)
@@ -671,7 +671,7 @@ end
         X = hcat(ones(length(x1)), x1)
         mu = X * b .+ d .* mo(c, s)
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x1, :c))
+    end, (:y, :x1, :c); conditioned = (:y, :x1, :c))
     maff = lower_rkppl(quote
         s ~ Dirichlet([1.0, 2.0])
         d ~ Normal(0, 1)
@@ -679,7 +679,7 @@ end
         e ~ Normal(0, 1)
         mu = a .+ e .* x1 .+ d .* mo(c, s)
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x1, :c))
+    end, (:y, :x1, :c); conditioned = (:y, :x1, :c))
     pmat = bind_data(mmat, cols)
     paff = bind_data(maff, cols)
     bmat = build_kernel(pmat)
@@ -700,7 +700,7 @@ end
         mu = X * b
         r2d2(mu, R2, phi)
         y .~ Normal.(mu, 1.0)
-    end, D)
+    end, D; conditioned = D)
     @test isempty(plan.population_priors)
     @test only(plan.r2d2_priors).overrides ==
         Dict{Symbol,Tuple{Float64,Float64}}()
@@ -713,7 +713,7 @@ end
         mu = X * b
         r2d2(mu, R2, phi)
         y .~ Normal.(mu, 1.0)
-    end, D)
+    end, D; conditioned = D)
     @test only(plan.r2d2_priors).overrides ==
         Dict(:Intercept => (0.0, 2.0), :x1 => (0.0, 2.0))
 end

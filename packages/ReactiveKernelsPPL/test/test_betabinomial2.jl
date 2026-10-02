@@ -18,7 +18,7 @@ using Test
 # Lower + bind + build + query a betabinomial program; return
 # `(bound, built, kern, layout)`.
 function _bb_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -73,7 +73,7 @@ end
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
-            end, (:c, :x, :n))
+            end, (:c, :x, :n); conditioned = (:c, :x, :n))
         r = only(plan.responses)
         @test r.family === BetaBinomial2Fam
         @test r.link === LogitLink
@@ -91,7 +91,7 @@ end
                 phi ~ Gamma(2.0, 0.1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), phi)
-            end, (:c, :x, :n))
+            end, (:c, :x, :n); conditioned = (:c, :x, :n))
         r = only(plan.responses)
         @test (r.family, r.scale, r.trials) === (BetaBinomial2Fam, :phi, :n)
         @test only(p for p in plan.parameters if p.name === :phi).family === :gamma
@@ -102,7 +102,7 @@ end
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(12, logistic.(mu), 4.0)
-            end, (:c, :x))
+            end, (:c, :x); conditioned = (:c, :x))
         r = only(plan.responses)
         @test (r.family, r.trials) === (BetaBinomial2Fam, 12)
     end
@@ -112,7 +112,7 @@ end
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), phic)
-            end, (:c, :x, :n, :phic))
+            end, (:c, :x, :n, :phic); conditioned = (:c, :x, :n, :phic))
         @test only(plan.responses).scale === :phic
     end
     @testset "predictor-fed precision" begin
@@ -124,7 +124,7 @@ end
                 mu = a .+ b .* x
                 hup = c .+ d .* z
                 y .~ BetaBinomial2.(n, logistic.(mu), exp.(hup))
-            end, (:y, :x, :z, :n))
+            end, (:y, :x, :z, :n); conditioned = (:y, :x, :z, :n))
         r = only(plan.responses)
         @test r.family === BetaBinomial2Fam
         @test r.scale == ScalePredictorRef(:hup, LogLink)
@@ -136,7 +136,7 @@ end
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(logistic.(mu), 4.0)
-            end, (:c, :x))
+            end, (:c, :x); conditioned = (:c, :x))
         # Bare mean (link-space predictors wrap; Beta precedent).
         # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
         @test_broken (lower_rkppl(quote
@@ -144,13 +144,13 @@ end
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, mu, 4.0)
-            end, (:c, :x, :n)); true)
+            end, (:c, :x, :n); conditioned = (:c, :x, :n)); true)
         # Kernel-endpoint spelling redirects.
         # refused: kernel lpmf endpoint beta_binomial2 is not a distribution constructor (P2)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 mu = a .+ b .* x
                 c .~ beta_binomial2.(n, logistic.(mu), 4.0)
-            end, (:c, :x, :n))
+            end, (:c, :x, :n); conditioned = (:c, :x, :n))
     end
 end
 
@@ -285,7 +285,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): the betabinomial plate must not unroll over observations.
 function _bb_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -314,7 +314,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _bb_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

@@ -15,7 +15,7 @@ using Test
 # Lower + bind + build + query a hurdle program; return
 # `(bound, built, kern, layout)`.
 function _hur_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -43,7 +43,7 @@ _hur_cols() = Dict{Symbol,AbstractVector}(:y => copy(_HUR_Y), :x => copy(_HUR_X)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 0.35)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.family === HurdlePoissonFam
         @test r.link === LogLink
@@ -61,7 +61,7 @@ _hur_cols() = Dict{Symbol,AbstractVector}(:y => copy(_HUR_Y), :x => copy(_HUR_X)
                 p_zero ~ Beta(2.0, 2.0)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p_zero)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test (r.family, r.scale) === (HurdlePoissonFam, :p_zero)
         @test only(p for p in plan.parameters if p.name === :p_zero).family === :beta
@@ -75,7 +75,7 @@ _hur_cols() = Dict{Symbol,AbstractVector}(:y => copy(_HUR_Y), :x => copy(_HUR_X)
                 eta = a .+ b .* x
                 hu = c .+ d .* x
                 y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.scale == ScalePredictorRef(:hu, LogitLink)
         pred = only(p for p in plan.predictors if p.name === :hu)
@@ -88,7 +88,7 @@ _hur_cols() = Dict{Symbol,AbstractVector}(:y => copy(_HUR_Y), :x => copy(_HUR_X)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p0c)
-            end, (:y, :x, :p0c))
+            end, (:y, :x, :p0c); conditioned = (:y, :x, :p0c))
         @test only(plan.responses).scale === :p0c
     end
 end
@@ -242,7 +242,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): the hurdle plate must not unroll over observations.
 function _hur_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -272,7 +272,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _hur_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

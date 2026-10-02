@@ -66,6 +66,7 @@ end
 # kernel takes the number as a typed scalar argument — exactly as a
 # definition `s = 2.0` would read, except the value binds at the call.
 _bound_value(x) = x
+_bound_array_value(x::AbstractArray) = x
 _bound_value_input(name::Symbol) = Symbol("_rkppl_value_", name)
 # Messages name a data value as its author wrote it, never its internal
 # input (`ReactiveKernelsPPL._bound_value(_rkppl_value_s)` reads `s`).
@@ -73,7 +74,10 @@ _author_names(msg::AbstractString) = replace(String(msg),
     r"(?:ReactiveKernelsPPL\.)?_bound_value\(_rkppl_value_([\p{L}\p{N}_!]+)\)" => s"\1",
     r"_rkppl_value_([\p{L}\p{N}_!]+)" => s"\1")
 _is_bound_value_call(ex) = ex isa Expr && ex.head === :call &&
-    length(ex.args) == 2 && ex.args[1] == GlobalRef(@__MODULE__, :_bound_value)
+    length(ex.args) == 2 && ex.args[1] in
+        (GlobalRef(@__MODULE__, :_bound_value), GlobalRef(@__MODULE__, :_bound_array_value))
+_is_bound_array_value_call(ex) = ex isa Expr && ex.head === :call &&
+    length(ex.args) == 2 && ex.args[1] == GlobalRef(@__MODULE__, :_bound_array_value)
 
 """Fetch a bound column that must be a VECTOR (every per-observation role —
 response, term, weights, trials, scales, bounds, grouping, axes, slices —
@@ -1745,7 +1749,20 @@ struct StructuralPlan
     event_lps::Vector{LinearPKEventLPSpec}
     array_parameters::Vector{ArrayParameter}
     submodel_scopes::Vector{SubmodelScope}
+    conditioned::Set{Symbol}
 end
+
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
+    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
+    horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, dar_paths, varying_draws, varying_slices, vector_parameters,
+        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
+        horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+        Set{Symbol}())
 
 # Existing full-positional plans have no lexical submodel metadata.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1829,14 +1846,15 @@ function StructuralPlan(
         matrices::Vector{DesignMatrix} = DesignMatrix[],
         event_lps::Vector{LinearPKEventLPSpec} = LinearPKEventLPSpec[],
         array_parameters::Vector{ArrayParameter} = ArrayParameter[],
-        submodel_scopes::Vector{SubmodelScope} = SubmodelScope[])
+        submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
+        conditioned::Set{Symbol} = Set{Symbol}())
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
         varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
         kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
-        array_parameters, submodel_scopes)
+        array_parameters, submodel_scopes, conditioned)
 end
 
 """The horseshoe entries covering `pred` (empty when the predictor keeps
@@ -1880,9 +1898,10 @@ end
 _matrix_element_addressees(m::DesignMatrix) =
     Symbol[c === nothing ? :Intercept : c for c in m.columns]
 
-"""Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
-only; [`bind_data`](@ref) attaches data (+ roles). Rebinding replaces."""
-isbound(plan::StructuralPlan) = !isempty(plan.columns)
+"""Bound plans carry columns or a resolved observation-free execution size.
+[`bind_data`](@ref) also binds prior-only programs with no input columns."""
+isbound(plan::StructuralPlan) = !isempty(plan.columns) ||
+    (plan.n_obs > 0 && !_has_observation_axis(plan))
 
 """Admitted (family, likelihood-link, predictor-link) triples (triple pin).
 Triples 2 and 3 lower identically; the triple is admission key + lowering
@@ -3260,7 +3279,7 @@ versions are not built, so such a plan fails closed — and a slot added
 later does too until it is listed here."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :parameters, :assignments, :derived, :columns, :n_obs, :roles,
-    :levelmaps, :vector_parameters, :submodel_scopes)
+    :levelmaps, :vector_parameters, :submodel_scopes, :conditioned)
 
 """Per-observation columns (of `perobs`) a response reads: the names its
 own fields hold, then — transitively — the names every predictor, derived
@@ -6207,7 +6226,8 @@ function _validate_vector_parameters(plan::StructuralPlan)
     end
     for p in plan.vector_parameters
         got = refs[p.name]
-        isempty(got) && p.name ∉ defreads && _fail(p.label,
+        isempty(got) && p.name ∉ defreads &&
+            p.family ∉ _JOINT_FACTOR_FAMILIES && _fail(p.label,
             "vector parameter $(p.name) unused by any response, " *
             "monotonic term, joint-factor link, R2D2 prior, " *
             "or definition")
@@ -8224,15 +8244,7 @@ function _validate_mi_data(r::LikelihoodSpec, plan::StructuralPlan)
 end
 
 function _validate_responses(plan::StructuralPlan)
-    # Kernel plates carry the only likelihood (v2): zero top-level
-    # responses are admitted iff at least one kernel plate is present.
-    # Responseless GLM plans still fail.
-    if isempty(plan.responses)
-        # `_validate_kernels` runs before this gate and owns the plate-count
-        # diagnosis; here any kernel plates excuse zero responses.
-        !isempty(plan.kernel_plates) ||
-            _fail(:plan, "plan has no responses")
-    end
+    # A program may contain only priors, or have every density removed by pins.
     rlabels = [r.label for r in plan.responses]
     length(unique(rlabels)) == length(rlabels) ||
         _fail(:plan, "duplicate response labels")
@@ -10112,6 +10124,8 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         p.family === :simplex_dirichlet || continue
         push!(defs, Symbol(:_ppl_prior_input_, p.name) => p.args.arg1)
     end
+    _has_observation_axis(plan) || return Set{Symbol}(raw), Set{Symbol}(first.(defs))
+
     # Pinning only shrinks the verdict: skip the slot walk when even the
     # unpinned pass finds nothing.
     inputs, _ = _whole_value_reads(defs, raw, Set{Symbol}())
@@ -10179,9 +10193,14 @@ end
 function _bound_model_level_inputs(plan::StructuralPlan)
     nodes = union(Set{Symbol}(a.name for a in plan.assignments),
         Set{Symbol}(d.name for d in plan.derived))
-    return _model_level_inputs(plan,
+    inputs, definitions = _model_level_inputs(plan,
         Set{Symbol}(k for k in keys(plan.columns) if k ∉ nodes))
+    return union(inputs, Set(_conditioned_input(n) for n in plan.conditioned)), definitions
 end
+
+_conditioned_input(name::Symbol) = Symbol("_rkppl_conditioned_", name)
+_has_observation_axis(plan) = !isempty(plan.responses) || !isempty(plan.kernel_plates) ||
+    !isempty(plan.plate_parameters) || !isempty(plan.scans) || !isempty(plan.dar_paths)
 
 # Reads of `raw` names in `ex` (the reads `_expr_value_symbols` sees):
 # inside an argument of an undotted module call into `whole`, anywhere
@@ -10650,11 +10669,17 @@ end
 
 function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
-        dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}())
+        dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}(),
+        conditioned = plan.conditioned)
+    sampled = Set(p.name for ps in (plan.parameters, plan.array_parameters,
+        plan.vector_parameters, plan.plate_parameters) for p in ps)
+    observing = intersect(sampled, Set{Symbol}(_conditioned_names(conditioned)))
+    plan = _with(plan; conditioned = union(plan.conditioned, observing))
     validate_structure(plan)
-    isempty(columns) && throw(ContractValidationError(
+    isempty(columns) && _has_observation_axis(plan) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
     columns = _checked_columns(columns)
+    _route_conditioned_values!(plan, columns)
     _route_bound_values!(plan, columns)
     _scalar_responses_as_observations!(plan, columns)
     # Value matrices bind next, as data: every later step reads them
@@ -10665,6 +10690,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # Raw inputs read only as whole values (module-call arguments,
     # gathered values): no n_obs anchor.
     inputs, _ = _model_level_inputs(plan, raw)
+    union!(inputs, (_conditioned_input(n) for n in plan.conditioned))
     _materialize_derived_responses!(plan, columns)
     bases = _materialize_splines!(plan, columns)
     hbases = _fit_hsgp_bases(plan, columns)
@@ -10743,7 +10769,9 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # contract (deriving from a packed column fails every full-length
     # column by order luck). Observation columns of several lengths are
     # several observation axes: n_obs is their total rows.
-    n = if isempty(kbases)
+    n = if !_has_observation_axis(plan)
+        1 # There is no observation axis; conditioned declarations have their own shapes.
+    elseif isempty(kbases)
         axes = _observation_axes(_with(plan; columns = columns))
         axes === nothing ? _bind_nrows(columns,
             union(_mi_managed_columns(plan), computed, inputs)) : axes.total
@@ -10759,8 +10787,55 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         n_obs = n, roles = merged, levelmaps = maps, varying_draws = draws,
         vector_parameters = vectors2, spline_bases = bases,
         hsgp_bases = hbases, kernel_plates = kbases)
+    _validate_conditioned_values(bound)
     validate_data(bound)
     return bound
+end
+
+function _route_conditioned_values!(plan, columns)
+    for name in plan.conditioned
+        input = _conditioned_input(name)
+        if haskey(columns, name)
+            columns[input] = pop!(columns, name)
+        end
+        haskey(columns, input) || _fail(:condition, "missing observed value $name")
+    end
+    return columns
+end
+
+function _validate_conditioned_values(plan)
+    known = Set{Symbol}()
+    for p in plan.parameters
+        p.name in plan.conditioned || continue
+        push!(known, p.name)
+        plan.columns[_conditioned_input(p.name)] isa Number ||
+            _fail(:condition, "$(p.name) is scalar; broadcast an observation vector with `.~`")
+    end
+    for p in plan.array_parameters
+        p.name in plan.conditioned || continue
+        push!(known, p.name)
+        value = plan.columns[_conditioned_input(p.name)]
+        value isa AbstractArray && size(value) == Tuple(_array_dims(plan, p)) ||
+            _fail(:condition, "$(p.name) needs shape $(Tuple(_array_dims(plan, p)))")
+    end
+    for p in plan.vector_parameters
+        p.name in plan.conditioned || continue
+        push!(known, p.name)
+        value = plan.columns[_conditioned_input(p.name)]
+        value isa AbstractVector && length(value) == p.size ||
+            _fail(:condition, "$(p.name) needs a vector of length $(p.size)")
+    end
+    for p in plan.plate_parameters
+        p.name in plan.conditioned || continue
+        push!(known, p.name)
+        value = plan.columns[_conditioned_input(p.name)]
+        n = p.range isa UnitRange ? length(p.range) : plan.n_obs
+        value isa AbstractVector && length(value) == n ||
+            _fail(:condition, "$(p.name) needs a vector of length $n")
+    end
+    isempty(setdiff(plan.conditioned, known)) || _fail(:condition,
+        "conditioned names must have sampling declarations")
+    return nothing
 end
 
 # Bind-time level inference (the LevelMap binder-evaluation precedent):

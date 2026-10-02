@@ -19,7 +19,7 @@ import ReactiveKernelsPPL: lkj_chol_constrain, lkj_logconst, lkj_chol_logjac,
 # Lower + bind + build + query a program; return
 # `(bound, built, kern, layout)`.
 function _mm_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = Base.invokelatest(prepare_query, built, bound, :sampler)
@@ -73,7 +73,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2))
+            end, (:y, :g1, :g2); conditioned = (:y, :g1, :g2))
         d = only(plan.varying_draws)
         # One geometry for every K: an intercept-only mm block is the
         # 1x1 correlated case.
@@ -92,7 +92,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1:2)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g1, :g2, :w1, :w2))
+            end, (:y, :x, :g1, :g2, :w1, :w2); conditioned = (:y, :x, :g1, :g2, :w1, :w2))
         d = only(plan.varying_draws)
         @test d.kind === :correlated
         @test d.lkj_eta == 1.0
@@ -108,7 +108,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1:2)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g1, :g2, :w1, :w2))
+            end, (:y, :x, :g1, :g2, :w1, :w2); conditioned = (:y, :x, :g1, :g2, :w1, :w2))
         d = only(plan.varying_draws)
         @test d.group === :mm__g1__g2__w__w1__w2__raw
         @test d.mm.normalize === false
@@ -120,7 +120,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1:2)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g1, :g2))
+            end, (:y, :x, :g1, :g2); conditioned = (:y, :x, :g1, :g2))
         d = only(plan.varying_draws)
         @test (d.kind, d.lkj_eta) === (:correlated, 1.0)
     end
@@ -131,7 +131,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g1, :g2))
+            end, (:y, :x, :g1, :g2); conditioned = (:y, :x, :g1, :g2))
         d = only(plan.varying_draws)
         @test (d.kind, d.lkj_eta) === (:correlated, 1.0)
     end
@@ -142,7 +142,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2, :g3))
+            end, (:y, :g1, :g2, :g3); conditioned = (:y, :g1, :g2, :g3))
         d = only(plan.varying_draws)
         @test d.mm.groups == [:g1, :g2, :g3]
         @test d.group === :mm__g1__g2__g3
@@ -153,7 +153,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_effect(mm(g1, g2), [1])
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2))
+            end, (:y, :g1, :g2); conditioned = (:y, :g1, :g2))
         d = only(plan.varying_draws)
         @test d.kind === :correlated
         @test d.mm.groups == [:g1, :g2]
@@ -167,7 +167,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1)); true)
+            end, (:y, :g1); conditioned = (:y, :g1)); true)
         # Weights as a vector, not a tuple.
         # capability: mm weights as a vector literal `[w1, w2]` (tuple vs vect collection kind; P3) (todo `1308iv0`)
         @test_broken (lower_rkppl(quote
@@ -176,7 +176,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2, :w1, :w2)); true)
+            end, (:y, :g1, :g2, :w1, :w2); conditioned = (:y, :g1, :g2, :w1, :w2)); true)
         # Weight arity mismatch.
         # refused: weight count != group count (malformed construct call)
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -185,7 +185,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2, :w1))
+            end, (:y, :g1, :g2, :w1); conditioned = (:y, :g1, :g2, :w1))
         # Non-data group.
         # refused: undeclared group name `ghost` (P6, 05oe96l)
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -194,7 +194,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1))
+            end, (:y, :g1); conditioned = (:y, :g1))
         # Non-Bool normalize.
         # refused: `normalize = 1` is not a Bool; Julia refuses Int in Bool context (P3)
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -203,7 +203,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2))
+            end, (:y, :g1, :g2); conditioned = (:y, :g1, :g2))
         # Unknown keyword.
         # refused: unknown keyword `id` (brms |ID| vocabulary, P10)
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -212,7 +212,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2))
+            end, (:y, :g1, :g2); conditioned = (:y, :g1, :g2))
         # Missing semicolon.
         # capability: comma keyword `mm(g1, g2, normalize = false)` (Julia treats it as `;` kwarg; P3) (todo `1308iv0`)
         @test_broken (lower_rkppl(quote
@@ -221,7 +221,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2)); true)
+            end, (:y, :g1, :g2); conditioned = (:y, :g1, :g2)); true)
         # eta != 1.0 on correlated.
         # capability: LKJ eta != 1 on multi-membership draws (SB-parity scope) (todo `1308iv0`)
         @test_broken (lower_rkppl(quote
@@ -230,7 +230,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1:2)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g1, :g2)); true)
+            end, (:y, :x, :g1, :g2); conditioned = (:y, :x, :g1, :g2)); true)
         # A non-default eta at K=1 (nothing to parameterize).
         # refused: K = 1 has no correlation; eta must be 1, whether explicit or omitted (user decisions 1hqmdas, 1nh2dia)
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -239,7 +239,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2))
+            end, (:y, :g1, :g2); conditioned = (:y, :g1, :g2))
     end
 end
 
@@ -251,7 +251,7 @@ end
                 r ~ varying_slice(d, 1:2)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g, :b))
+            end, (:y, :x, :g, :b); conditioned = (:y, :x, :g, :b))
         d = only(plan.varying_draws)
         @test d.kind === :correlated
         @test d.lkj_eta == 1.0
@@ -267,7 +267,7 @@ end
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g, :b))
+            end, (:y, :g, :b); conditioned = (:y, :g, :b))
         d = only(plan.varying_draws)
         @test (d.kind, d.lkj_eta) === (:correlated, 1.0)
     end
@@ -278,7 +278,7 @@ end
                 r ~ varying_slice(d, 1:2)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g, :b))
+            end, (:y, :x, :g, :b); conditioned = (:y, :x, :g, :b))
         @test only(plan.varying_draws).lkj_eta == 1.0
     end
     @testset "fused effect spelling" begin
@@ -287,7 +287,7 @@ end
                 r ~ varying_effect(gr(g; by = b), [1, x])
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g, :b))
+            end, (:y, :x, :g, :b); conditioned = (:y, :x, :g, :b))
         d = only(plan.varying_draws)
         @test d.kind === :correlated
         @test d.strata.by === :b
@@ -301,7 +301,7 @@ end
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g)); true)
+            end, (:y, :g); conditioned = (:y, :g)); true)
         # Two groups.
         # refused: `gr` takes one grouping; two groups have no stated meaning (P2)
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -310,7 +310,7 @@ end
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g, :h, :b))
+            end, (:y, :g, :h, :b); conditioned = (:y, :g, :h, :b))
         # Non-data by.
         # refused: undeclared by name `ghost` (P6, 05oe96l)
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -319,7 +319,7 @@ end
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g))
+            end, (:y, :g); conditioned = (:y, :g))
         # by === group.
         # refused: degenerate stratification (by === group: each stratum one group, per-stratum covariance unidentified)
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -328,7 +328,7 @@ end
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g))
+            end, (:y, :g); conditioned = (:y, :g))
         # id keyword (BRM-side spelling).
         # refused: brms `id` keyword (P10); unknown keyword
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -337,7 +337,7 @@ end
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g, :b))
+            end, (:y, :g, :b); conditioned = (:y, :g, :b))
         # eta != 1.0.
         # capability: LKJ eta != 1 on stratified draws (SB-parity scope) (todo `1308iv0`)
         @test_broken (lower_rkppl(quote
@@ -346,7 +346,7 @@ end
                 r ~ varying_slice(d, 1:2)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g, :b)); true)
+            end, (:y, :x, :g, :b); conditioned = (:y, :x, :g, :b)); true)
         # Missing semicolon.
         # capability: comma keyword `gr(g, by = b)` (Julia treats it as `;` kwarg; P3) (todo `1308iv0`)
         @test_broken (lower_rkppl(quote
@@ -355,7 +355,7 @@ end
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g, :b)); true)
+            end, (:y, :g, :b); conditioned = (:y, :g, :b)); true)
     end
     @testset "reserved grouping names" begin
         # refused: reserved name `mm`
@@ -364,14 +364,14 @@ end
                 a ~ Normal(0, 5)
                 mu = a
                 y .~ Normal.(mu, 1.0)
-            end, (:y,))
+            end, (:y,); conditioned = (:y,))
         # refused: reserved name `gr`
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 gr = 1.0
                 a ~ Normal(0, 5)
                 mu = a
                 y .~ Normal.(mu, 1.0)
-            end, (:y,))
+            end, (:y,); conditioned = (:y,))
     end
 end
 
@@ -395,7 +395,7 @@ function _mm_validate(d::VaryingDraws)
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.0)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     plan.varying_draws[1] = d
     K = length(d.margins)
     s = plan.varying_slices[1]
@@ -501,7 +501,7 @@ end
                 nu = c .+ r2
                 y .~ Normal.(mu, 1.0)
                 z .~ Normal.(nu, 1.0)
-            end, (:y, :z, :x, :g1, :g2)); true)
+            end, (:y, :z, :x, :g1, :g2); conditioned = (:y, :z, :x, :g1, :g2)); true)
     end
     @testset "stratified multi-slice allowed (ID+gr path)" begin
         plan = lower_rkppl(quote
@@ -514,7 +514,7 @@ end
                 nu = c .+ r2
                 y .~ Normal.(mu, 1.0)
                 z .~ Normal.(nu, 1.0)
-            end, (:y, :z, :x, :g, :b))
+            end, (:y, :z, :x, :g, :b); conditioned = (:y, :z, :x, :g, :b))
         @test validate_structure(plan) === nothing
     end
 end
@@ -528,7 +528,7 @@ end
         y .~ Normal.(mu, 1.0)
     end
     @testset "union fit" begin
-        plan = lower_rkppl(prog, (:y, :g1, :g2, :w1, :w2))
+        plan = lower_rkppl(prog, (:y, :g1, :g2, :w1, :w2); conditioned = (:y, :g1, :g2, :w1, :w2))
         bound = bind_data(plan, _mm_cols())
         @test only(bound.varying_draws).levels == [1, 2, 3]
     end
@@ -539,7 +539,7 @@ end
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2))
+            end, (:y, :g1, :g2); conditioned = (:y, :g1, :g2))
         bound = bind_data(plan, _mm_cols())
         @test only(bound.varying_draws).levels == [1, 2, 3, 4]
     end
@@ -550,19 +550,19 @@ end
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2))
+            end, (:y, :g1, :g2); conditioned = (:y, :g1, :g2))
         # refused: observed value outside declared levels (wrong data)
         @test_throws ContractValidationError bind_data(plan, _mm_cols())
     end
     @testset "unbound membership" begin
-        plan = lower_rkppl(prog, (:y, :g1, :g2, :w1, :w2))
+        plan = lower_rkppl(prog, (:y, :g1, :g2, :w1, :w2); conditioned = (:y, :g1, :g2, :w1, :w2))
         cols = _mm_cols()
         delete!(cols, :g2)
         # refused: missing data name (`g2`)
         @test_throws ContractValidationError bind_data(plan, cols)
     end
     @testset "weight failures" begin
-        plan = lower_rkppl(prog, (:y, :g1, :g2, :w1, :w2))
+        plan = lower_rkppl(prog, (:y, :g1, :g2, :w1, :w2); conditioned = (:y, :g1, :g2, :w1, :w2))
         # Non-finite.
         cols = _mm_cols()
         cols[:w1] = [0.7, Inf, 0.5, 0.9]
@@ -597,7 +597,7 @@ end
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2))
+            end, (:y, :g1, :g2); conditioned = (:y, :g1, :g2))
         cols = _mm_cols()
         cols[:g2] = ["a", "b", "c", "d"]
         # refused: mixed Int/String membership union is unorderable (wrong eltype; Julia sort MethodError, P3)
@@ -614,7 +614,7 @@ end
         y .~ Normal.(mu, 1.0)
     end
     @testset "strata fit" begin
-        plan = lower_rkppl(prog, (:y, :x, :g, :b))
+        plan = lower_rkppl(prog, (:y, :x, :g, :b); conditioned = (:y, :x, :g, :b))
         cols = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
             :x => copy(_MM_X), :g => [1, 2, 1, 3], :b => copy(_MM_B))
         bound = bind_data(plan, cols)
@@ -623,21 +623,21 @@ end
         @test d.strata.levels == [1, 2]
     end
     @testset "straddling group rejected" begin
-        plan = lower_rkppl(prog, (:y, :x, :g, :b))
+        plan = lower_rkppl(prog, (:y, :x, :g, :b); conditioned = (:y, :x, :g, :b))
         cols = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
             :x => copy(_MM_X), :g => [1, 2, 1, 3], :b => [1, 1, 2, 2])
         # refused: group straddles strata (wrong data: groups must nest in strata)
         @test_throws ContractValidationError bind_data(plan, cols)
     end
     @testset "unbound by" begin
-        plan = lower_rkppl(prog, (:y, :x, :g, :b))
+        plan = lower_rkppl(prog, (:y, :x, :g, :b); conditioned = (:y, :x, :g, :b))
         cols = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
             :x => copy(_MM_X), :g => [1, 2, 1, 3])
         # refused: missing data name (`b`)
         @test_throws ContractValidationError bind_data(plan, cols)
     end
     @testset "by wrong length" begin
-        plan = lower_rkppl(prog, (:y, :x, :g, :b))
+        plan = lower_rkppl(prog, (:y, :x, :g, :b); conditioned = (:y, :x, :g, :b))
         cols = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
             :x => copy(_MM_X), :g => [1, 2, 1, 3], :b => [1, 1, 1])
         # refused: length mismatch for `by` column
@@ -713,7 +713,7 @@ end
                 r ~ varying_slice(d, 1:2)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g, :b))
+            end, (:y, :x, :g, :b); conditioned = (:y, :x, :g, :b))
         @test validate_structure(plan) === nothing
     end
     @testset "bound per-stratum names proven unique" begin
@@ -728,7 +728,7 @@ end
                 nu = c .+ r2
                 y .~ Normal.(mu, 1.0)
                 z .~ Normal.(nu, 1.0)
-            end, (:y, :z, :x, :g, :b, :g_s1))
+            end, (:y, :z, :x, :g, :b, :g_s1); conditioned = (:y, :z, :x, :g, :b, :g_s1))
         # Unbound: only the shared z is tabled — no false positive.
         @test validate_structure(plan) === nothing
         cols = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
@@ -1025,7 +1025,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): mm/stratified plates must not unroll over observations.
 function _mm_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -1068,7 +1068,7 @@ end
 # must bind the same names whatever S is; per-stratum emission added an
 # `L_<s>_s<k>`/`tau_<s>_s<k>` chain per stratum.
 function _mm_bound_names(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     names = Symbol[]
@@ -1100,7 +1100,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _mm_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

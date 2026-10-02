@@ -16,7 +16,7 @@ using Test
 # Lower + bind + build + query a links program; return
 # `(bound, built, kern)`.
 function _links_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -26,7 +26,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (native vs
 # compiled), plus the traced program size.
 function _links_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector}, u)
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

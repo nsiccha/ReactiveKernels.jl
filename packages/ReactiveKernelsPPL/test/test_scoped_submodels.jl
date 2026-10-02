@@ -112,7 +112,7 @@ const _SC_ARRAY_RECORD = quote
 end
 
 function _sc_build(ast, data)
-    plan = lower_rkppl(ast, data; mod = @__MODULE__)
+    plan = lower_rkppl(ast, data; mod = @__MODULE__, conditioned = data)
     bound = bind_data(plan, Dict{Symbol,Any}(pairs(data)))
     built = build_kernel(bound)
     u = [0.27 * sin(i) - 0.15 for i in 1:built.layout.total]
@@ -212,7 +212,7 @@ end
 end
 
 @testset "scoped submodels: scope records and genuine redefinitions" begin
-    plan = lower_rkppl(_SC_NESTED, (:x, :y); mod = @__MODULE__)
+    plan = lower_rkppl(_SC_NESTED, (:x, :y); mod = @__MODULE__, conditioned = (:x, :y))
     @test Set(scope.path for scope in plan.submodel_scopes) ==
         Set([(:a,), (:a_b,), (:z,), (:z, :q)])
     @test haskey(only(filter(s -> s.path == (:a,), plan.submodel_scopes)).locals, :b_c)
@@ -237,28 +237,28 @@ end
         z ~ _sc_inner(x)
         z.b = 1
         y .~ Normal.(z, 1)
-    end, (:x, :y); mod = @__MODULE__)
+    end, (:x, :y); mod = @__MODULE__, conditioned = (:x, :y))
     # refused: duplicate call bindings are actual redefinitions (`1f0p0fx`).
     @test_throws "defined more than once" lower_rkppl(quote
         z ~ _sc_inner(x)
         z ~ _sc_inner(x)
         y .~ Normal.(z, 1)
-    end, (:x, :y); mod = @__MODULE__)
+    end, (:x, :y); mod = @__MODULE__, conditioned = (:x, :y))
     # refused: a local cannot redefine an argument (lexical binding contract).
     @test_throws "both an argument and a local" lower_rkppl(quote
         z ~ _sc_bad_argument(x)
         y .~ Normal.(z, 1)
-    end, (:x, :y); mod = @__MODULE__)
+    end, (:x, :y); mod = @__MODULE__, conditioned = (:x, :y))
     # refused: undeclared free names remain errors (`1f0p0fx`, strict `16yyy0t`).
     @test_throws "z_b" lower_rkppl(quote
         z ~ _sc_free(x)
         y .~ Normal.(z, 1)
-    end, (:x, :y); mod = @__MODULE__)
+    end, (:x, :y); mod = @__MODULE__, conditioned = (:x, :y))
     @test lower_rkppl(quote
         z_b ~ Normal(0, 1)
         z ~ _sc_free(x)
         y .~ Normal.(z, 1)
-    end, (:x, :y); mod = @__MODULE__) isa StructuralPlan
+    end, (:x, :y); mod = @__MODULE__, conditioned = (:x, :y)) isa StructuralPlan
 end
 
 @testset "scoped submodels: future free names cannot capture prior locals" begin
@@ -268,12 +268,12 @@ end
         z ~ _sc_inner(x)
         w ~ _sc_future_free(x)
         y .~ Normal.(z .+ w, 1)
-    end, (:x, :y); mod = @__MODULE__)
+    end, (:x, :y); mod = @__MODULE__, conditioned = (:x, :y))
     # refused: the same rule holds for a nested callee (`1f0p0fx`).
     @test_throws "##rkppl_scope#00000001" lower_rkppl(quote
         z ~ _sc_nested_future_free(x)
         y .~ Normal.(z, 1)
-    end, (:x, :y); mod = @__MODULE__)
+    end, (:x, :y); mod = @__MODULE__, conditioned = (:x, :y))
     data = (; x = [-0.5, 0.2, 1.0], y = [0.1, -0.2, 0.3])
     bound, built, u = _sc_build(quote
         var"##rkppl_scope#00000001" ~ Normal(0, 1)

@@ -78,7 +78,7 @@ end
 
 @testset "P2 Ex1: 1-cmt oral PK panel vs SB oracle" begin
     data_names = (:CL, :Ka, :Vc, :dose, :dv, :t)
-    unbound = lower_rkppl(_pk1cmt_ast(), data_names)
+    unbound = lower_rkppl(_pk1cmt_ast(), data_names; conditioned = data_names)
     @test isempty(unbound.responses)
     kp0 = only(unbound.kernel_plates)
     @test kp0.result === :pred
@@ -147,7 +147,7 @@ end
 
 @testset "P2 Ex2: scalar dose-response plate vs SB oracle" begin
     data_names = (:dose, :dv, :ls)
-    unbound = lower_rkppl(_doseplate_ast(), data_names)
+    unbound = lower_rkppl(_doseplate_ast(), data_names; conditioned = data_names)
     columns = Dict{Symbol,AbstractVector}(
         :dose => [100.0, 100.0, 100.0, 100.0],
         :dv => [0.5, 1.2, 2.1, 3.3],
@@ -196,7 +196,7 @@ end
         :dose => [10.0, 20.0],
         :obs => [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
     )
-    unbound = lower_rkppl(ast, (:dose, :obs, :t))
+    unbound = lower_rkppl(ast, (:dose, :obs, :t); conditioned = (:dose, :obs, :t))
     bound = bind_data(unbound, columns;
         dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :kernel_T_pred => 3))
     kp = only(bound.kernel_plates)
@@ -238,7 +238,7 @@ end
         :dose => [10.0, 20.0],
         :obs => [0.1, 0.4],
     )
-    unbound = lower_rkppl(ast, (:dose, :obs, :t))
+    unbound = lower_rkppl(ast, (:dose, :obs, :t); conditioned = (:dose, :obs, :t))
     bound = bind_data(unbound, columns; dims = Dict{Symbol,Int}(:kernel_T_pred => 1))
     kp = only(bound.kernel_plates)
     @test kp.subjects == 2
@@ -272,89 +272,89 @@ end
     subj = Expr(:kw, :subjects, :kernel_nsub_pred)
     # refused: `.~` on the plate statement; the plate yields one collected result, `~` is scalar, `.~` broadcasts (P3)
     @test_throws "carries a scalar `~`" lower_rkppl(
-        plate_ast(good_cell, [subj]; tilde = :.~), data)
+        plate_ast(good_cell, [subj]; tilde = :.~), data; conditioned = data)
     # refused: scalar `~` over vector slices; `.~` broadcasts (P3, explicit-dots ruling)
     @test_throws "scalar `~` over vectors" lower_rkppl(
-        plate_ast([good_cell[1], :(yy ~ Normal(mu, sigma)), :mu], [subj]), data)
+        plate_ast([good_cell[1], :(yy ~ Normal(mu, sigma)), :mu], [subj]), data; conditioned = data)
     # refused: the cell observes `yy` twice (single assignment)
     @test_throws "more than one `.~`" lower_rkppl(
-        plate_ast([good_cell[1], good_cell[2], good_cell[2], :mu], [subj]), data)
+        plate_ast([good_cell[1], good_cell[2], good_cell[2], :mu], [subj]), data; conditioned = data)
     # capability: observation-free panel cell (panel v1 needs exactly one in-cell likelihood) (todo `1qlbn5b`)
     @test_broken (lower_rkppl(
-        plate_ast([good_cell[1], :mu], [subj]), data); true)
+        plate_ast([good_cell[1], :mu], [subj]), data; conditioned = data); true)
     # refused: plate cell has no trailing collected name; a `.~` statement has no value to collect (P2, P3)
     @test_throws "collected result name" lower_rkppl(
-        plate_ast([good_cell[1], good_cell[2]], [subj]), data)
+        plate_ast([good_cell[1], good_cell[2]], [subj]), data; conditioned = data)
     # refused: bare `mu` read before its definition (Julia UndefVarError, P3)
     @test_throws "only the trailing statement" lower_rkppl(
-        plate_ast([:mu, good_cell[1], good_cell[2], :mu], [subj]), data)
+        plate_ast([:mu, good_cell[1], good_cell[2], :mu], [subj]), data; conditioned = data)
     # v2 (ordered contract change): panel admits the scalar
     # response-space set — Poisson lowers (1-arg, scaleless node).
     pois = lower_rkppl(
-        plate_ast([good_cell[1], :(yy .~ Poisson.(mu)), :mu], [subj]), data)
+        plate_ast([good_cell[1], :(yy .~ Poisson.(mu)), :mu], [subj]), data; conditioned = data)
     @test only(only(pois.kernel_plates).obs).family === PoissonLogFam
     @test only(only(pois.kernel_plates).obs).scale === nothing
     # Grouped-only joint heads fail closed in panel cells.
     # refused: TgiResponse is a BRM-specific joint head; domain functions use ordinary explicit parameters (P10, 1cmodra domain)
     @test_throws SurfaceLoweringError lower_rkppl(
         plate_ast([good_cell[1],
-            :(yy .~ TgiResponse.(mu, sigma, a, b, c, d)), :mu], [subj]), data)
+            :(yy .~ TgiResponse.(mu, sigma, a, b, c, d)), :mu], [subj]), data; conditioned = data)
     # Fused link-space heads fail closed naming the pre-assignment fix.
     # capability: fused link-space obs heads in cells (Distributions.BernoulliLogit) (todo `05fuzch`)
     @test_broken (lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ BernoulliLogit.(mu)), :mu],
-            [subj]), data); true)
+            [subj]), data; conditioned = data); true)
     # Binomial needs trials threading (sequenced follow-up).
     # capability: Binomial in-cell observations with explicit trials and probabilities (todo `1qlbn5b`)
     @test_broken (lower_rkppl(
-        plate_ast([good_cell[1], :(yy .~ Binomial.(2, logistic.(mu))), :mu], [subj]), data); true)
+        plate_ast([good_cell[1], :(yy .~ Binomial.(2, logistic.(mu))), :mu], [subj]), data; conditioned = data); true)
     # Unknown heads fail with the admitted list.
     # capability: arbitrary Distributions families as in-cell observations (Cauchy) (todo `1qlbn5b`)
     @test_broken (lower_rkppl(
-        plate_ast([good_cell[1], :(yy .~ Cauchy.(mu, sigma)), :mu], [subj]), data); true)
+        plate_ast([good_cell[1], :(yy .~ Cauchy.(mu, sigma)), :mu], [subj]), data; conditioned = data); true)
     # 1-arg arity pins.
     # refused: malformed distribution, Poisson takes one argument (Julia MethodError, P3)
     @test_throws "exactly 1 arguments" lower_rkppl(
-        plate_ast([good_cell[1], :(yy .~ Poisson.(mu, sigma)), :mu], [subj]), data)
+        plate_ast([good_cell[1], :(yy .~ Poisson.(mu, sigma)), :mu], [subj]), data; conditioned = data)
     # 3-arg StudentT arity pin (nu, mu, sigma — Distributions order).
     # refused: malformed distribution, StudentT takes (nu, mu, sigma)
     @test_throws "exactly 3 arguments" lower_rkppl(
-        plate_ast([good_cell[1], :(yy .~ StudentT.(mu, sigma)), :mu], [subj]), data)
+        plate_ast([good_cell[1], :(yy .~ StudentT.(mu, sigma)), :mu], [subj]), data; conditioned = data)
     # refused: undotted `Normal(mu, sigma)` over vector `mu` is a Julia MethodError (P3)
     @test_throws "obs broadcasts" lower_rkppl(
-        plate_ast([good_cell[1], :(yy .~ Normal(mu, sigma)), :mu], [subj]), data)
+        plate_ast([good_cell[1], :(yy .~ Normal(mu, sigma)), :mu], [subj]), data; conditioned = data)
     # Arity message generalized to digits when the joint families joined
     # the obs table (same fail-closed behavior).
     # capability: 1-arg `Normal.(mu)` (Distributions default sigma = 1) in cells (todo `139j2uo`)
     @test_broken (lower_rkppl(
-        plate_ast([good_cell[1], :(yy .~ Normal.(mu)), :mu], [subj]), data); true)
+        plate_ast([good_cell[1], :(yy .~ Normal.(mu)), :mu], [subj]), data; conditioned = data); true)
     # capability: inline expression arguments in in-cell observations (`Normal.(mu .+ 1.0, sigma)`) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(
-        plate_ast([good_cell[1], :(yy .~ Normal.(mu .+ 1.0, sigma)), :mu], [subj]), data); true)
+        plate_ast([good_cell[1], :(yy .~ Normal.(mu .+ 1.0, sigma)), :mu], [subj]), data; conditioned = data); true)
     # refused: undeclared name `zz` observed (P6, 05oe96l)
     @test_throws "not a slice param" lower_rkppl(
-        plate_ast([good_cell[1], :(zz .~ Normal.(mu, sigma)), :mu], [subj]), data)
+        plate_ast([good_cell[1], :(zz .~ Normal.(mu, sigma)), :mu], [subj]), data; conditioned = data)
     # refused: panel plate missing its required `subjects=` keyword (subject count underdetermined; P2, P3)
     @test_throws "needs `subjects=N`" lower_rkppl(
-        plate_ast(good_cell, []), data)
+        plate_ast(good_cell, []), data; conditioned = data)
     # refused: non-positive subject count (mathematically invalid input)
     @test_throws "must be positive" lower_rkppl(
-        plate_ast(good_cell, [Expr(:kw, :subjects, 0)]), data)
+        plate_ast(good_cell, [Expr(:kw, :subjects, 0)]), data; conditioned = data)
     # capability: computed `subjects=` expression (`1 + 1`) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(
-        plate_ast(good_cell, [Expr(:kw, :subjects, :(1 + 1))]), data); true)
+        plate_ast(good_cell, [Expr(:kw, :subjects, :(1 + 1))]), data; conditioned = data); true)
     # refused: unknown keyword `group` (Julia MethodError, P3)
     @test_throws "exactly one keyword" lower_rkppl(
-        plate_ast(good_cell, [subj, Expr(:kw, :group, :g)]), data)
+        plate_ast(good_cell, [subj, Expr(:kw, :group, :g)]), data; conditioned = data)
     # refused: slice column `zz` is not bound data (undeclared name, P6)
     @test_throws "not bound data" lower_rkppl(
-        plate_ast(good_cell, [subj]; cols = [:t, :dose, :zz]), data)
+        plate_ast(good_cell, [subj]; cols = [:t, :dose, :zz]), data; conditioned = data)
     # refused: do-block arity mismatch, 2 params for 3 columns (Julia MethodError, P3)
     @test_throws "one param per column" lower_rkppl(
-        plate_ast(good_cell, [subj]; params = [:ts, :d]), data)
+        plate_ast(good_cell, [subj]; params = [:ts, :d]), data; conditioned = data)
     # refused: collected name `zz` is undeclared (P6, 05oe96l)
     @test_throws "not a cell name" lower_rkppl(
-        plate_ast([good_cell[1], good_cell[2], :zz], [subj]), data)
+        plate_ast([good_cell[1], good_cell[2], :zz], [subj]), data; conditioned = data)
     # Plate alongside a top-level response: the plate no longer carries
     # the only likelihood (hand-built plan — the surface would trip on
     # the response's predictor first).
@@ -387,18 +387,18 @@ end
         plate_ast(good_cell, [subj]).args...,
         plate_ast(cell2, [subj]; lhs = :pred2,
             params = [:ts2, :d2, :yy2]).args[3])
-    two_plan = lower_rkppl(two, data)
+    two_plan = lower_rkppl(two, data; conditioned = data)
     @test [kp.result for kp in two_plan.kernel_plates] == [:pred, :pred2]
     # Duplicate plate results trip single-assignment at the surface.
     dupe = Expr(:block,
         plate_ast(good_cell, [subj]).args...,
         plate_ast(cell2, [subj]; params = [:ts2, :d2, :yy2]).args[3])
     # refused: plate result `pred` defined twice (single assignment)
-    @test_throws "defined twice" lower_rkppl(dupe, data)
+    @test_throws "defined twice" lower_rkppl(dupe, data; conditioned = data)
     # Responseless GLM plans (no plate) still fail as before.
     nolhs = Expr(:block, Expr(:call, :~, :sigma, Expr(:call, :Exponential, 1.0)))
     # capability: responseless (prior-only) model (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(nolhs, (:y,)); true)
+    @test_broken (lower_rkppl(nolhs, (:y,); conditioned = (:y,)); true)
 end
 
 @testset "kernel cell + bind fail-closed battery" begin
@@ -423,53 +423,53 @@ end
     # Series reductions are cross-timepoint (P3).
     # capability: per-subject series reductions (`mean(ts)`) in a panel cell (panel v1) (todo `1qlbn5b`)
     @test_broken (lower_rkppl(
-        plate_ast([:(m = mean(ts)), mu_stmt, obs_stmt, :mu]), data); true)
+        plate_ast([:(m = mean(ts)), mu_stmt, obs_stmt, :mu]), data; conditioned = data); true)
     # Whole-column GP functions are whole-model constructs.
     # capability: whole-column vocabulary functions (`gp_exp_quad_cov`) inside a panel cell (todo `0bfiemp`)
     @test_broken (lower_rkppl(
-        plate_ast([:(m = gp_exp_quad_cov(ts)), mu_stmt, obs_stmt, :mu]), data); true)
+        plate_ast([:(m = gp_exp_quad_cov(ts)), mu_stmt, obs_stmt, :mu]), data; conditioned = data); true)
     # Cross-cell refs fail closed.
     # refused: undeclared name `zz` (P6, 05oe96l)
     @test_throws "unknown name" lower_rkppl(
-        plate_ast([:(mu = (b0 .* d) .* zz), obs_stmt, :mu]), data)
+        plate_ast([:(mu = (b0 .* d) .* zz), obs_stmt, :mu]), data; conditioned = data)
     # Scalar-obs literal domains (v2 — response-space roles).
     # refused: Bernoulli probability 2.0 outside [0, 1] (mathematically invalid input)
     @test_throws "not a probability" lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ Bernoulli.(2.0)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ Bernoulli.(2.0)), :mu]), data; conditioned = data)
     # refused: negative Poisson mean (mathematically invalid input)
     @test_throws "not a nonnegative mean" lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ Poisson.(-1.0)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ Poisson.(-1.0)), :mu]), data; conditioned = data)
     # refused: NegativeBinomial2 phi = 0 (mathematically invalid input)
     @test_throws "response-space phi" lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ NegativeBinomial2.(mu, 0.0)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ NegativeBinomial2.(mu, 0.0)), :mu]), data; conditioned = data)
     # refused: Gamma alpha = 0 (mathematically invalid input)
     @test_throws "response-space alpha" lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ Gamma.(0.0, sigma)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ Gamma.(0.0, sigma)), :mu]), data; conditioned = data)
     # refused: negative Beta b (mathematically invalid input)
     @test_throws "response-space b" lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ Beta.(mu, -1.0)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ Beta.(mu, -1.0)), :mu]), data; conditioned = data)
     # refused: StudentT nu = 0 (mathematically invalid input)
     @test_throws "positive degrees of freedom" lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ StudentT.(0.0, mu, sigma)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ StudentT.(0.0, mu, sigma)), :mu]), data; conditioned = data)
     # refused: StudentT sigma = 0 (mathematically invalid input)
     @test_throws "response-space sigma" lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ StudentT.(4.0, mu, 0.0)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ StudentT.(4.0, mu, 0.0)), :mu]), data; conditioned = data)
     # v1 Gaussian scale message byte-preserved through the scalar path.
     # refused: Normal sigma = 0 (mathematically invalid input)
     @test_throws "must be finite positive" lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ Normal.(mu, 0.0)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ Normal.(mu, 0.0)), :mu]), data; conditioned = data)
     # Undotted over 2+ genuinely-vector operands fails at bind (kinds
     # resolve there): ts and yy are both vector slices here.
     two_vec_unbound = lower_rkppl(
-        plate_ast([:(mu = ts * yy), obs_stmt, :mu]), data)
+        plate_ast([:(mu = ts * yy), obs_stmt, :mu]), data; conditioned = data)
     # refused: undotted vector*vector `ts * yy` is a Julia MethodError (P3)
     @test_throws "write the dotted form" bind_data(two_vec_unbound, cols6; dims)
     # Scalar-context undotted canonicalizes instead (Ex1 shape).
     ok = bind_data(lower_rkppl(
-        plate_ast([:(ke = 2.0 * 3.0), mu_stmt, obs_stmt, :mu]), data), cols6; dims)
+        plate_ast([:(ke = 2.0 * 3.0), mu_stmt, obs_stmt, :mu]), data; conditioned = data), cols6; dims)
     @test only(ok.kernel_plates).assignments[1] == (:ke => :(2.0 * 3.0))
     # Unbound subjects dims key.
-    unbound = lower_rkppl(plate_ast([mu_stmt, obs_stmt, :mu]), data)
+    unbound = lower_rkppl(plate_ast([mu_stmt, obs_stmt, :mu]), data; conditioned = data)
     # refused: subjects dims key not bound (missing data)
     @test_throws "not bound" bind_data(unbound, cols6;
         dims = Dict{Symbol,Int}(:kernel_T_pred => 3))
@@ -537,11 +537,11 @@ end
         :obs => [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
     )
     pois_unbound = lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ Poisson.(mu)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ Poisson.(mu)), :mu]), data; conditioned = data)
     # refused: Poisson response not non-negative integers (wrong eltype)
     @test_throws "non-negative integers" bind_data(pois_unbound, float_cols; dims)
     bern_unbound = lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ Bernoulli.(mu)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ Bernoulli.(mu)), :mu]), data; conditioned = data)
     # refused: Bernoulli response not Bool/0-1 (wrong eltype)
     @test_throws "Bool or 0/1" bind_data(bern_unbound, float_cols; dims)
     # Scalar count slices in T-models fail closed (Float64 expansions).
@@ -554,7 +554,7 @@ end
     @test_broken (bind_data(pois_unbound, scalar_count_cols; dims); true)
     # Gamma/Beta response domains.
     gamma_unbound = lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ Gamma.(sigma, mu)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ Gamma.(sigma, mu)), :mu]), data; conditioned = data)
     zero_cols = Dict{Symbol,AbstractVector}(
         :t => [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
         :dose => [10.0, 20.0],
@@ -563,7 +563,7 @@ end
     # refused: Gamma response 0.0 outside support (invalid data)
     @test_throws "strictly positive" bind_data(gamma_unbound, zero_cols; dims)
     beta_unbound = lower_rkppl(
-        plate_ast([mu_stmt, :(yy .~ Beta.(sigma, mu)), :mu]), data)
+        plate_ast([mu_stmt, :(yy .~ Beta.(sigma, mu)), :mu]), data; conditioned = data)
     oob_cols = Dict{Symbol,AbstractVector}(
         :t => [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
         :dose => [10.0, 20.0],
@@ -589,7 +589,7 @@ end
                 :t, :dose, :obs),
             Expr(:->, Expr(:tuple, :ts, :d, :yy),
                 Expr(:block, mu_stmt, obs_stmt, :mu)))))
-    lit = bind_data(lower_rkppl(lit_ast, data), cols6;
+    lit = bind_data(lower_rkppl(lit_ast, data; conditioned = data), cols6;
         dims = Dict{Symbol,Int}(:kernel_T_pred => 3))
     kp_lit = only(lit.kernel_plates)
     @test kp_lit.subjects == 2
@@ -613,7 +613,7 @@ function _axis2_build(cell, obsy; params = [:(b0 ~ Normal(0.0, 1.0))])
                 Expr(:block, cell...)))))
     columns = Dict{Symbol,AbstractVector}(
         :t => _AXIS2_T, :dose => _AXIS2_DOSE, :obs => obsy)
-    bound = bind_data(lower_rkppl(ast, (:dose, :obs, :t)), columns;
+    bound = bind_data(lower_rkppl(ast, (:dose, :obs, :t); conditioned = (:dose, :obs, :t)), columns;
         dims = _AXIS2_DIMS)
     return build_kernel(bound), bound
 end
@@ -682,7 +682,7 @@ end
                 :(yy .~ Bernoulli.(p)), :p)))))
     columns = Dict{Symbol,AbstractVector}(
         :t => _AXIS2_T, :dose => _AXIS2_DOSE, :obs => Bool[1, 0])
-    bound = bind_data(lower_rkppl(ast, (:dose, :obs, :t)), columns;
+    bound = bind_data(lower_rkppl(ast, (:dose, :obs, :t); conditioned = (:dose, :obs, :t)), columns;
         dims = _AXIS2_DIMS)
     # Scalar Bool response → Float64 expansion → Bool twin.
     @test eltype(bound.columns[:pred_kexp_obs]) === Float64
@@ -827,9 +827,9 @@ end
                 Expr(:parameters, Expr(:kw, :subjects, :kernel_nsub_pred)),
                 :t, :dose, :obs),
             Expr(:->, Expr(:tuple, :ts, :d, :yy), Expr(:block, cell...)))))
-    b2 = bind_data(lower_rkppl(mkast(), (:dose, :obs, :t)), small;
+    b2 = bind_data(lower_rkppl(mkast(), (:dose, :obs, :t); conditioned = (:dose, :obs, :t)), small;
         dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :kernel_T_pred => 3))
-    b4 = bind_data(lower_rkppl(mkast(), (:dose, :obs, :t)), big;
+    b4 = bind_data(lower_rkppl(mkast(), (:dose, :obs, :t); conditioned = (:dose, :obs, :t)), big;
         dims = Dict{Symbol,Int}(:kernel_nsub_pred => 4, :kernel_T_pred => 3))
     @test _kernel_statement_heads(b2) == _kernel_statement_heads(b4)
 end
@@ -866,7 +866,7 @@ end
     x1, y1 = columns[:x1], columns[:y1]
     x2, y2 = columns[:x2], columns[:y2]
     bound =
-        bind_data(lower_rkppl(ast, (:x1, :y1, :x2, :y2)), columns; dims = dims)
+        bind_data(lower_rkppl(ast, (:x1, :y1, :x2, :y2); conditioned = (:x1, :y1, :x2, :y2)), columns; dims = dims)
     @test bound.n_obs == 7
     @test [kp.result for kp in bound.kernel_plates] == [:pred1, :pred2]
     @test [kp.timepoints for kp in bound.kernel_plates] == [nothing, nothing]
@@ -898,7 +898,7 @@ end
 
 @testset "axis3 multi-plate fail-closed battery" begin
     ast, columns, dims = _axis3_joint3()
-    unbound = lower_rkppl(ast, (:x1, :y1, :x2, :y2))
+    unbound = lower_rkppl(ast, (:x1, :y1, :x2, :y2); conditioned = (:x1, :y1, :x2, :y2))
     # Stray dims keys fail once, globally (a key for no plate at all).
     stray = merge(dims, Dict{Symbol,Int}(:kernel_T_preed => 3))
     # refused: stray dims key not consumed by any plate (wrong data)
@@ -946,7 +946,7 @@ end
         end
     end
     shr_cols = Dict{Symbol,AbstractVector}(:x => [1.0, 2.0], :y => [0.5, 1.5])
-    shr_bound = bind_data(lower_rkppl(shr, (:x, :y)), shr_cols;
+    shr_bound = bind_data(lower_rkppl(shr, (:x, :y); conditioned = (:x, :y)), shr_cols;
         dims = Dict{Symbol,Int}(:kernel_nsub => 2))
     @test shr_bound.n_obs == 4
     # Per-plate timepoints via the convention (bind-level, no values).
@@ -967,14 +967,14 @@ end
         :t => [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
         :dose => [10.0, 20.0],
         :obs => [1, 0, 2, 3, 1, 0])
-    t_bound = bind_data(lower_rkppl(t_ast, (:t, :dose, :obs)), t_cols;
+    t_bound = bind_data(lower_rkppl(t_ast, (:t, :dose, :obs); conditioned = (:t, :dose, :obs)), t_cols;
         dims = Dict{Symbol,Int}(:kernel_nsub_p1 => 2, :kernel_T_p1 => 3,
             :kernel_nsub_p2 => 2, :kernel_T_p2 => 3))
     @test t_bound.n_obs == 12
     @test [kp.timepoints for kp in t_bound.kernel_plates] == [3, 3]
     # A non-conventional T key with N plates: the T-needing plate names
     # its conventional key.
-    t_unbound = lower_rkppl(t_ast, (:t, :dose, :obs))
+    t_unbound = lower_rkppl(t_ast, (:t, :dose, :obs); conditioned = (:t, :dose, :obs))
     # refused: non-conventional T key, plate's `kernel_T_p1` unbound (wrong data)
     @test_throws "bind `kernel_T_p1`" bind_data(t_unbound, t_cols;
         dims = Dict{Symbol,Int}(:kernel_nsub_p1 => 2, :kernel_nsub_p2 => 2,

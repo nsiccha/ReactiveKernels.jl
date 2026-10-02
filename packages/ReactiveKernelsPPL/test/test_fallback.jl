@@ -34,7 +34,7 @@ end
 # Lower + bind + build; returns (plan, bound, built, sampler kernel).
 function _fb_build(prog::Expr, names)
     cols = _fb_cols(names)
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -108,12 +108,12 @@ end
     # both give one density.
     for (alias, inline, arr) in ((_FB_NC_ALIAS, _FB_NC_INLINE, :z),
             (_FB_SLOPE_ALIAS, _FB_SLOPE_INLINE, :c))
-        pa = lower_rkppl(alias, (:y, :x, :g))
-        pinl = lower_rkppl(inline, (:y, :x, :g))
+        pa = lower_rkppl(alias, (:y, :x, :g); conditioned = (:y, :x, :g))
+        pinl = lower_rkppl(inline, (:y, :x, :g); conditioned = (:y, :x, :g))
         @test arr in Set(p.name for p in pinl.array_parameters)
         @test any(t -> t.kind === ComposedTerm, last(pa.predictors).terms)
     end
-    plan = lower_rkppl(_FB_NC_INLINE, (:y, :g))
+    plan = lower_rkppl(_FB_NC_INLINE, (:y, :g); conditioned = (:y, :g))
     @test [t.kind for t in only(plan.predictors).terms] ==
         [InterceptTerm, OffsetTerm]
     @test only(plan.derived).expr == :(sg .* z[g])
@@ -122,7 +122,7 @@ end
 @testset "fallback: computed coefficients lower as derived columns" begin
     # P2/P5: a computed scalar times a column is an in-graph derived
     # column (offset term); its parameters are ordinary parameters.
-    plan = lower_rkppl(_FB_COMPUTED, (:y, :x))
+    plan = lower_rkppl(_FB_COMPUTED, (:y, :x); conditioned = (:y, :x))
     mu = only(plan.predictors)
     @test [t.kind for t in mu.terms] == [InterceptTerm, OffsetTerm]
     @test only(plan.derived).expr == :((z * lam * tau) .* x)
@@ -136,7 +136,7 @@ end
         sigma ~ Exponential(1)
         mu = a .+ b .* x ./ 1.0
         y .~ Normal.(mu, sigma)
-    end, (:y, :x))
+    end, (:y, :x), conditioned = (:y, :x))
     @test [t.kind for t in only(divided.predictors).terms] ==
         [InterceptTerm, OffsetTerm]
     # Ordinary scalar summands retain their priors and affine reads.
@@ -144,7 +144,7 @@ end
         a ~ Normal(0, 5); s ~ HalfNormal(1); sigma ~ Exponential(1)
         mu = a .+ s .+ 0.0 .* x
         y .~ Normal.(mu, sigma)
-    end, (:y, :x))
+    end, (:y, :x), conditioned = (:y, :x))
     @test Set(p.name for p in scalars.parameters) == Set((:a, :s, :sigma))
 end
 
@@ -333,7 +333,7 @@ end
             a ~ Normal(0, 1 / 2); sigma ~ Exponential(1)
             mu = a .+ 0.0 .* x
             y .~ Normal.(mu, sigma)
-        end, (:y, :x))
+        end, (:y, :x), conditioned = (:y, :x))
         @test only(p for p in lit.parameters if p.name === :a).args.arg2 == 0.5
     end
     @testset "positive-support coefficient is an ordinary parameter" begin
@@ -444,7 +444,7 @@ end
             sigma ~ Exponential(1)
             mu = a .+ phi .* x1
             y .~ Normal.(mu, sigma)
-        end, (:y, :x1)); true)
+        end, (:y, :x1), conditioned = (:y, :x1)); true)
     end
     # One predictor mixing an inline array gather, an n-ary computed
     # coefficient and a simplex element; the emitted kernel is the same
@@ -491,7 +491,7 @@ end
         sizes = map((9, 90)) do n
             cols = Dict{Symbol,AbstractVector}(:y => randn(n), :x => randn(n),
                 :x1 => randn(n), :g => repeat([1, 2, 3], n ÷ 3))
-            bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+            bound = bind_data(lower_rkppl(prog, keys(cols); conditioned = keys(cols)), cols)
             nodes(ReactiveKernelsPPL.kernel_expr(bound,
                 ReactiveKernelsPPL.assign_layout(bound)))
         end
@@ -510,7 +510,7 @@ end
         end
         function post(prog, ycol)
             cols = Dict{Symbol,AbstractVector}(:x => x, :y => ycol)
-            bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+            bound = bind_data(lower_rkppl(prog, keys(cols); conditioned = keys(cols)), cols)
             built = build_kernel(bound)
             return built.layout, prepare_query(built, bound, :sampler)
         end
@@ -532,7 +532,7 @@ end
     end
     for prior in (:(Normal.(0, s)), :(Normal.(0, 2 * s)),
             :(Normal.(0, 1)), :(Normal.(m, s)), :(Flat.()), :(Uniform.(-2, 2)))
-        @test lower_rkppl(hier(prior), (:y, :g)) isa StructuralPlan
+        @test lower_rkppl(hier(prior), (:y, :g); conditioned = (:y, :g)) isa StructuralPlan
     end
 end
 

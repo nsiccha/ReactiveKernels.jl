@@ -21,7 +21,7 @@ using Test
 # Lower + bind + build + query an interval program; return
 # `(bound, built, kern, layout)`.
 function _int_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -59,7 +59,7 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), 5.0)
                 s ~ Exponential(1)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.family === GaussianFam
         @test r.link === IdentityLink
@@ -79,7 +79,7 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), hi)
                 s ~ Exponential(1)
-            end, (:y, :x, :hi))
+            end, (:y, :x, :hi); conditioned = (:y, :x, :hi))
         r = only(plan.responses)
         @test r.family === GaussianFam
         @test r.evidence.kind === :interval_censored
@@ -92,7 +92,7 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), 4)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.family === PoissonLogFam
         @test r.link === LogLink
@@ -108,7 +108,7 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), ub)
-            end, (:y, :x, :ub))
+            end, (:y, :x, :ub); conditioned = (:y, :x, :ub))
         r = only(plan.responses)
         @test r.family === PoissonLogFam
         @test r.evidence.kind === :interval_censored
@@ -120,7 +120,7 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(PoissonLog.(eta), 4)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.family === PoissonLogFam
         @test r.link === LogLink
@@ -134,7 +134,7 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
                 mu = a .+ b .* x
                 y .~ weighted.(interval_censored.(Normal.(mu, s), hi), w)
                 s ~ Exponential(1)
-            end, (:y, :x, :hi, :w))
+            end, (:y, :x, :hi, :w); conditioned = (:y, :x, :hi, :w))
         r = only(plan.responses)
         @test r.weights === :w
         @test r.evidence.kind === :interval_censored
@@ -147,7 +147,7 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s))
                 s ~ Exponential(1)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         # Evidence is Gaussian/Poisson-only (slice 1 family gate).
         # capability: interval-censored evidence over Bernoulli (non-Gaussian/Poisson families; 'slice 1 family gate') (todo `0ze68k8`)
         @test_broken (lower_rkppl(quote
@@ -155,7 +155,7 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Bernoulli.(logistic.(eta)), 1)
-            end, (:y, :x)); true)
+            end, (:y, :x); conditioned = (:y, :x)); true)
         # Response must sit strictly below the upper every row (bind-time
         # data gate).
         plan = lower_rkppl(quote
@@ -164,7 +164,7 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), hi)
                 s ~ Exponential(1)
-            end, (:y, :x, :hi))
+            end, (:y, :x, :hi); conditioned = (:y, :x, :hi))
         bad = _int_gcols()
         bad[:y] = copy(_INT_HI)
         # refused: response not strictly below the upper endpoint (wrong data, empty interval)
@@ -317,7 +317,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _int_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
@@ -372,7 +372,7 @@ function _int_poisson_hlo_attempt()
             b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ interval_censored.(Poisson.(exp.(eta)), ub)
-        end, (:y, :x, :ub))
+        end, (:y, :x, :ub); conditioned = (:y, :x, :ub))
     bound = bind_data(plan, _int_pcols())
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

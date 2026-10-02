@@ -430,6 +430,7 @@ end
 # assignments computed from one.
 function _mentions_array(ex, plan::StructuralPlan,
         seen::Set{Symbol} = Set{Symbol}())
+    _is_bound_array_value_call(ex) && return true
     if ex isa Symbol
         _is_array_param(plan, ex) && return true
         ex in seen && return false
@@ -881,6 +882,7 @@ starting at `offset`; returns the next free offset."""
 function _array_layout_entries!(entries::Vector{LayoutEntry},
         plan::StructuralPlan, offset::Int)
     for p in plan.array_parameters
+        p.name in plan.conditioned && continue
         dims = _array_dims(plan, p)
         if p.family === :lkj_cholesky
             K = dims[1]
@@ -1148,6 +1150,7 @@ end
 function _array_value_statements(plan::StructuralPlan)
     stmts = Expr[]
     for p in plan.array_parameters
+        p.name in plan.conditioned && continue
         p.family === :lkj_cholesky || continue
         push!(stmts, _lkj_matrix_statement(p.name, _array_dims(plan, p)[1]))
     end
@@ -1156,7 +1159,7 @@ end
 
 # Prior nodes `_ppl_prior_<name>` of the plan's array parameters.
 function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
-        plan::StructuralPlan, needed::Set{Tuple{Symbol,Symbol}})
+        plan::StructuralPlan, needed::Set{Tuple{Symbol,Symbol}}; context = plan)
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
         node = Symbol(:_ppl_prior_, p.name)
@@ -1192,13 +1195,13 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             end
             local_name = Symbol(:_ppl_parg_, p.name, :_, i)
             val = a.head === :vect ? :(Float64[$(a.args...)]) :
-                _array_gather_rewrite(a, plan, needed)
+                _array_gather_rewrite(a, context, needed)
             push!(stmts, :($local_name = $val))
             push!(args, k => local_name)
         end
         _vector_prior_stmts!(stmts, terms, flat, p.family,
             NamedTuple{Tuple(first.(args))}(Tuple(last.(args))),
-            p.support_override)
+            p.support_override; conditioned = p.name in context.conditioned)
     end
     return nothing
 end

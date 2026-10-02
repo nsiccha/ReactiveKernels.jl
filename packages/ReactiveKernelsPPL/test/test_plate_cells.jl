@@ -11,7 +11,7 @@ include("fixtures/level_plate_values.jl")
 # values. Per-level cells (`@plate for k in levels(g)`) lower to the
 # whole-array declarations they mean. Helper: `_canon` (test_corpus.jl).
 
-_pc_canon(ex, data) = sprint(_canon, lower_rkppl(ex, data; mod = @__MODULE__))
+_pc_canon(ex, data) = sprint(_canon, lower_rkppl(ex, data; mod = @__MODULE__, conditioned = data))
 
 @testset "per-level plate cells are their whole-array declarations" begin
     data = (:y, :x, :g, :s)
@@ -89,7 +89,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     for prog in (cols_prog, rows_prog)
-        plan = bind_data(lower_rkppl(prog, data; mod = @__MODULE__), cols)
+        plan = bind_data(lower_rkppl(prog, data; mod = @__MODULE__, conditioned = data), cols)
         built = build_kernel(plan)
         u = [0.3 * sin(1.1 * i + 0.3) for i in 1:built.layout.total]
         nt = constrain(built.layout, u)
@@ -136,7 +136,7 @@ end
     lower(cell) = lower_rkppl(Expr(:block, :(a ~ Normal(0, 5)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(0),
             Expr(:for, :(k = levels(g)), Expr(:block, cell))),
-        :(mu = a .+ c[g]), :(y .~ Normal.(mu, 1.0))), data)
+        :(mu = a .+ c[g]), :(y .~ Normal.(mu, 1.0))), data; conditioned = data)
     @test lower(:(c[k] ~ Normal(m[k], 1))) isa StructuralPlan
     @test lower(:(c[k] = 2.0)) isa StructuralPlan
     selected = quote
@@ -146,7 +146,7 @@ end
         end
         y .~ Normal.(c[g], 1)
     end
-    @test_throws SurfaceLoweringError lower_rkppl(selected, (:y, :g))
+    @test_throws SurfaceLoweringError lower_rkppl(selected, (:y, :g); conditioned = (:y, :g))
     otheraxis = quote
         z[levels(h)] .~ Normal.(0, 1)
         @plate for k in levels(g)
@@ -154,7 +154,7 @@ end
         end
         y .~ Normal.(c[g], 1)
     end
-    @test_throws SurfaceLoweringError lower_rkppl(otheraxis, (:y, :g, :h))
+    @test_throws SurfaceLoweringError lower_rkppl(otheraxis, (:y, :g, :h); conditioned = (:y, :g, :h))
 end
 
 @testset "per-level assignments keep inactive branches inactive" begin

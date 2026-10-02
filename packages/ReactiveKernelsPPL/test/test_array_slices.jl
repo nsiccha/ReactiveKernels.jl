@@ -24,7 +24,7 @@ const _SL_K = [1, 2, 3, 1, 2, 3, 1, 2]
 
 function _sl_check(ast, refprior)
     data = Dict{Symbol,ColumnData}(:y => _av_y(), :k => _SL_K)
-    bound = bind_data(lower_rkppl(ast, (:y, :k); mod = SliceModels), data)
+    bound = bind_data(lower_rkppl(ast, (:y, :k); mod = SliceModels, conditioned = (:y, :k)), data)
     built = build_kernel(bound)
     u = _av_point(built.layout.total)
     nt = constrain(built.layout, u)
@@ -230,7 +230,7 @@ function _sl_refuses(T, f, needle)
 end
 
 @testset "array slices: fail closed" begin
-    lowerm(ast) = lower_rkppl(ast, (:y, :k); mod = SliceModels)
+    lowerm(ast) = lower_rkppl(ast, (:y, :k); mod = SliceModels, conditioned = (:y, :k))
     bindm(ast) = bind_data(lowerm(ast), Dict{Symbol,ColumnData}(
         :y => _av_y(), :k => _SL_K))
     prog(decl) = :(begin

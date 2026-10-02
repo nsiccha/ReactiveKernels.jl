@@ -25,7 +25,7 @@ const _EVENT_KEYWORD_DRAW = EventKeywordDefaults.draw
             draw ~ $call
             y .~ Normal.(draw, 1)
         end, @__MODULE__)
-        plan = model(; y=[0.4])
+        plan = model() | (; y=[0.4])
         built = build_kernel(plan)
         u = [0.3]
         @test Base.invokelatest(prepare_query(built, plan, :prior), u) ≈
@@ -54,9 +54,12 @@ end
 
 function _event_test_fixture(G; kwargs...)
     data = _event_test_data(G)
-    plan = _event_test_ast(; kwargs...)(; data...)
+    plan = _event_test_bound(_event_test_ast(; kwargs...), data)
     return plan, build_kernel(plan)
 end
+
+_event_test_bound(model, data) =
+    model(; (k => v for (k, v) in data if k !== :dv)...) | (; dv = data[:dv])
 
 function _event_test_curve(built, plan, u)
     names = sort!(collect(keys(plan.columns)))
@@ -135,7 +138,7 @@ end
     # omitting both keyword arguments exercises the declared defaults.
     for chain in (false, true)
         model = merge(_event_test_ast(; chain), :(log_F ~ linear_pk_log_f(pk_sched)))
-        p = model(; _event_test_data(2)...)
+        p = _event_test_bound(model, _event_test_data(2))
         b = build_kernel(p)
         @test b.layout.total == 19
         u = fill(0.2, b.layout.total)
@@ -144,7 +147,7 @@ end
         @test Base.invokelatest(prepare_query(b, p, :prior), u) ≈ prior
     end
     model = merge(_event_test_ast(), :(log_F ~ _EVENT_TEST_REF(pk_sched)))
-    p = model(; _event_test_data(2)...)
+    p = _event_test_bound(model, _event_test_data(2))
     b = build_kernel(p)
     u = fill(0.2, b.layout.total)
     curve, prior = _event_test_oracle(b, p, u; reference_dose=2)

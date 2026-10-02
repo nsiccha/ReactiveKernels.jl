@@ -10,7 +10,7 @@ using Test
 
 function _cb_query(prog::Expr, data)
     cols = Dict{Symbol,AbstractVector}(k => collect(v) for (k, v) in pairs(data))
-    bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+    bound = bind_data(lower_rkppl(prog, keys(cols); conditioned = keys(cols)), cols)
     built = build_kernel(bound)
     return bound, built, prepare_query(built, bound, :sampler), built.layout
 end
@@ -75,10 +75,10 @@ end
 @testset "composition matrix: fail-closed boundaries" begin
     # capability: compose measurement-error, DAR, horseshoe and smooth
     # values (P8 1cmodra; todo `1nb43fj`).
-    gap(prog, data) = @test_broken (lower_rkppl(prog, keys(data)); true)
+    gap(prog, data) = @test_broken (lower_rkppl(prog, keys(data); conditioned = keys(data)); true)
     # Admitted: ordinary coefficient reads now compose a measurement-error
     # latent with a direct DAR summand.
-    admit(prog, data) = @test (lower_rkppl(prog, keys(data)); true)
+    admit(prog, data) = @test (lower_rkppl(prog, keys(data); conditioned = keys(data)); true)
     admit(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)

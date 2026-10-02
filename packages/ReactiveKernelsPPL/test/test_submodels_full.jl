@@ -21,7 +21,7 @@ _smf_canon(plan) = sprint(_canon, _test_scope_math(plan))
 # submodel neither adds nor removes a refusal the hand-inlined program has.
 function _smf_outcome(ast, data; mod = _SMF)
     try
-        return _smf_canon(lower_rkppl(ast, data; mod = mod))
+        return _smf_canon(lower_rkppl(ast, data; mod = mod, conditioned = data))
     catch e
         e isa SurfaceLoweringError || rethrow()
         return "SurfaceLoweringError: " * e.message
@@ -258,8 +258,8 @@ end
         mu = a .+ ee
         y .~ Normal.(mu, sigma)
     end
-    @test _smf_canon(lower_rkppl(sub, D; mod = _SMF)) ==
-        _smf_canon(lower_rkppl(twin, D))
+    @test _smf_canon(lower_rkppl(sub, D; mod = _SMF, conditioned = D)) ==
+        _smf_canon(lower_rkppl(twin, D; conditioned = D))
 
     # Probe S7: a centered random intercept with an indexed prior in the body.
     sub7 = quote
@@ -276,9 +276,9 @@ end
         mu = r
         y .~ Normal.(mu, sigma)
     end
-    p7 = lower_rkppl(sub7, D; mod = _SMF)
-    @test _smf_canon(p7) == _smf_canon(lower_rkppl(twin7, D))
-    @test _plans_equal(p7, lower_rkppl(twin7, D))
+    p7 = lower_rkppl(sub7, D; mod = _SMF, conditioned = D)
+    @test _smf_canon(p7) == _smf_canon(lower_rkppl(twin7, D; conditioned = D))
+    @test _plans_equal(p7, lower_rkppl(twin7, D; conditioned = D))
 
     # Three-level nesting, the same inner twice.
     sub3 = quote
@@ -355,8 +355,8 @@ end
                 :(t_theta[t_i] ~ Normal(x[t_i], t_tau)),
                 :(y[t_i] ~ Normal.(t_theta[t_i], sigma))))),
         :(t = t_tau))
-    pp = lower_rkppl(subp, D; mod = _SMF)
-    @test _smf_canon(pp) == _smf_canon(lower_rkppl(twinp, D))
+    pp = lower_rkppl(subp, D; mod = _SMF, conditioned = D)
+    @test _smf_canon(pp) == _smf_canon(lower_rkppl(twinp, D; conditioned = D))
 
     # `@scan` inside a body.
     subs = quote
@@ -473,9 +473,9 @@ end
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, cells..., :(y[i] ~ Normal.(theta[i], sigma))))))
     @test _smf_canon(lower_rkppl(pc(:(theta[i] ~ smf_pcs_outer(mu, tau))),
-            (:y, :x); mod = _SMF)) ==
+            (:y, :x); mod = _SMF, conditioned = (:y, :x))) ==
         _smf_canon(lower_rkppl(pc(:(theta_w_z[i] ~ Normal(0, 1)),
-            :(theta[i] = mu .+ tau .* theta_w_z[i])), (:y, :x); mod = _SMF))
+            :(theta[i] = mu .+ tau .* theta_w_z[i])), (:y, :x); mod = _SMF, conditioned = (:y, :x)))
 end
 
 @testset "full submodels: hierarchical density vs Distributions.jl" begin
@@ -488,7 +488,7 @@ end
         mu = r
         y .~ Normal.(mu, sigma)
     end
-    bound = m(; y = cols[:y], g = cols[:g])
+    bound = (m(; g = cols[:g]) | (; y = cols[:y]))
     built = build_kernel(bound)
     ng = length(unique(cols[:g]))
     u = collect(range(-0.4, 0.5; length = built.layout.total))
@@ -511,7 +511,7 @@ end
         sigma ~ Exponential(1)
         t ~ smf_hier_obs(y, x, sigma)
     end
-    bp = mp(; y = cols[:y], x = cols[:x])
+    bp = (mp(; x = cols[:x]) | (; y = cols[:y]))
     builtp = build_kernel(bp)
     up = collect(range(-0.3, 0.6; length = builtp.layout.total))
     ntp = constrain(builtp.layout, up)
@@ -532,13 +532,13 @@ end
         z_b ~ Normal(0, 1)
         z ~ smf_inner(x)
         y .~ Normal.(z .+ z_b, 1.0)
-    end, D; mod = _SMF))
+    end, D; mod = _SMF, conditioned = D))
     @test isempty(msg)
     # ... or that is a data column.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         z ~ smf_inner(x)
         y .~ Normal.(z, 1.0)
-    end, (:y, :x, :z_b); mod = _SMF))
+    end, (:y, :x, :z_b); mod = _SMF, conditioned = (:y, :x, :z_b)))
     @test isempty(msg)
     # ... or that another expansion introduced (`a`'s local `b_c` and
     # `a_b`'s local `c` both namespace to `a_b_c`).
@@ -546,26 +546,26 @@ end
         a ~ smf_bc(x)
         a_b ~ smf_c(x)
         y .~ Normal.(a .+ a_b, 1.0)
-    end, D; mod = _SMF))
+    end, D; mod = _SMF, conditioned = D))
     @test isempty(msg)
     # ... or that appears in the call's arguments.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         z ~ smf_inner(z_b)
         y .~ Normal.(z, 1.0)
-    end, (:y, :z_b); mod = _SMF))
+    end, (:y, :z_b); mod = _SMF, conditioned = (:y, :z_b)))
     @test isempty(msg)
     # ... or that is a free name of the body (it would be captured).
     msg = _smf_errmsg(() -> lower_rkppl(quote
         z ~ smf_free(x)
         y .~ Normal.(z, 1.0)
-    end, D; mod = _SMF))
+    end, D; mod = _SMF, conditioned = D))
     # refused: free z_b has no caller or module declaration (P6, 05oe96l).
     @test !isempty(msg)
     # An argument called as a function.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         v ~ smf_head(exp)
         y .~ Normal.(v, 1.0)
-    end, D; mod = _SMF))
+    end, D; mod = _SMF, conditioned = D))
     # capability: a submodel may accept a Julia function value (P8 1cmodra; todo `15lq8iu`).
     @test_broken isempty(msg)
     # A body binding an argument name: a parameter declaration through an
@@ -573,27 +573,27 @@ end
     msg = _smf_errmsg(() -> lower_rkppl(quote
         v ~ smf_argbind(w)
         y .~ Normal.(v, 1.0)
-    end, D; mod = _SMF))
+    end, D; mod = _SMF, conditioned = D))
     # refused: a local redefines an actual argument (single assignment, P3).
     @test occursin("both an argument and a local", msg)
     msg = _smf_errmsg(() -> lower_rkppl(quote
         v ~ smf_argdef(x)
         y .~ Normal.(v, 1.0)
-    end, D; mod = _SMF))
+    end, D; mod = _SMF, conditioned = D))
     # refused: a local redefines an actual argument (single assignment, P3).
     @test occursin("both an argument and a local", msg)
     # Recursion.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         v ~ smf_rec_a(x)
         y .~ Normal.(v, 1.0)
-    end, D; mod = _SMF))
+    end, D; mod = _SMF, conditioned = D))
     # refused: recursive expansion has no finite static graph (P3).
     @test occursin("calls itself", msg)
     # A `predictor =` pin inside a body.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         v ~ smf_pinned(x)
         y .~ Normal.(v, 1.0)
-    end, D; mod = _SMF))
+    end, D; mod = _SMF, conditioned = D))
     # refused: predictor= is retired by the author-name contract (1cmodra names).
     @test !isempty(msg)
     # A per-cell body holds scalar statements only.
@@ -602,7 +602,7 @@ end
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
             Expr(:for, :(i = eachindex(y)), Expr(:block,
                 :(theta[i] ~ smf_pcs_plate(0.0)),
-                :(y[i] ~ Normal.(theta[i], sigma)))))), D; mod = _SMF))
+                :(y[i] ~ Normal.(theta[i], sigma)))))), D; mod = _SMF, conditioned = D))
     # capability: nested plates in a per-cell submodel (P8 1cmodra submodels; todo `15lq8iu`).
     @test_broken isempty(msg)
 end

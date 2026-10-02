@@ -20,7 +20,7 @@ end
 
 function _admission_check(program, data, oracle; names = nothing)
     original = deepcopy(data)
-    plan = program isa StructuralPlan ? program : lower_rkppl(program, data)
+    plan = program isa StructuralPlan ? program : lower_rkppl(program, data; conditioned = data)
     bound = bind_data(plan, data)
     built = build_kernel(bound)
     names === nothing || @test coordinate_names(built.layout) == names

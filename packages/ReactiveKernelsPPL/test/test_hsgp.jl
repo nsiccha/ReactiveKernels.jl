@@ -22,7 +22,7 @@ function _hvalid_plan(; aniso::Bool = false)
                 sigma ~ Exponential(1)
                 mu = a .+ hsgp(:h_xz)
                 y .~ Normal.(mu, sigma)
-            end, (:y, :x, :z))
+            end, (:y, :x, :z); conditioned = (:y, :x, :z))
     end
     return lower_rkppl(quote
             hsgp_basis(:h_x, x; k = 4)
@@ -30,7 +30,7 @@ function _hvalid_plan(; aniso::Bool = false)
             sigma ~ Exponential(1)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, sigma)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
 end
 
 function _hwith(plan::StructuralPlan; predictors = nothing, bases = nothing)
@@ -76,7 +76,7 @@ end
             hsgp_basis(:h_d, x)
             mu = a .+ hsgp(:h_d)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     hb = only(dflt.hsgp_bases)
     @test hb.K == [20] && hb.c == [1.5] && hb.iso
 end
@@ -98,69 +98,69 @@ end
             hsgp_basis(x)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: degenerate constant axis (literal 1.0 has no spread, L = 0)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, 1.0)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: undeclared name `q` as axis (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, q)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: unidentified, two axes on one column (x, x)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x, x; k = (2, 2))
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: single assignment, basis :h_x declared twice
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x)
             hsgp_basis(:h_x, x)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # k/c/iso literals.
     # refused: invalid basis count k = 0
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; k = 0)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: non-integer basis count k = 2.5
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; k = 2.5)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: k tuple length differs from axis count (malformed)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x, z; k = (2, 3, 4))
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z))
+        end, (:y, :x, :z); conditioned = (:y, :x, :z))
     # refused: expansion factor c must exceed 1 (c = 1 puts the boundary on the data)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; c = 1.0)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: non-finite expansion factor c = Inf
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; c = Inf)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: non-Bool `iso = 1` (Julia non-boolean-context TypeError, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; iso = 1)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # `by=` names a bound grouping column (grouped bases themselves:
     # test_smooth_sb.jl).
     # refused: undeclared name `g` in by= (P6, 05oe96l)
@@ -168,35 +168,35 @@ end
             hsgp_basis(:h_x, x; by = g)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # Use-site discipline.
     # refused: undeclared basis id :h_nope (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             mu = a .+ hsgp(:h_nope)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # capability: hsgp summand value reuse: same basis twice in one predictor (values compose, P3/P8) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
             mu = a .+ hsgp(:h_x) .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: negated hsgp summand (`a .- hsgp(:h)`) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
             mu = a .- hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: literal-scaled hsgp summand (`2.0 .* hsgp(:h)`) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
             mu = a .+ 2.0 .* hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # Never inside definitions; never redefined or sampled.
     # capability: hsgp value bound in a definition (`h = hsgp(:h)`; values compose, P3/P8) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
@@ -205,20 +205,20 @@ end
             mu = a .+ h
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # refused: reserved-name collision `hsgp` (then calls a Float64)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp = 1.0
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: reserved-name collision `hsgp_basis`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis = 1.0
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # Claims: user definitions cannot collide with sampled names.
     # refused: single assignment, user definition collides with basis-claimed `rho_h_x`
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -226,14 +226,14 @@ end
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: single assignment, `~` collides with basis-claimed `beta_raw_h_x`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
             beta_raw_h_x ~ Normal(0, 1)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
 end
 
 @testset "hsgp contract validation" begin
@@ -394,7 +394,7 @@ end
             sigma ~ Exponential(1)
             mu = a .+ hsgp(:h_1)
             y .~ Normal.(mu, sigma)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     k1layout = assign_layout(bind_data(k1, _hsgp_cols()))
     k1rho = only(e for e in k1layout.entries if e.name === :rho_h_1)
     @test (k1rho.kind, k1rho.transform) === (:sampled, :exp)
@@ -405,7 +405,7 @@ end
             a ~ Normal(0, 1)
             mu = a .+ hsgp(:h_a) .+ hsgp(:h_b)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     twolayout = assign_layout(bind_data(two, _hsgp_cols()))
     twokinds =
         [(e.kind, e.name, e.size, e.transform) for e in twolayout.entries]
@@ -553,7 +553,7 @@ end
             sigma ~ Exponential(1)
             mu = a .+ hsgp(:h_1)
             y .~ Normal.(mu, sigma)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     bound = bind_data(k1, _hsgp_cols())
     built = build_kernel(bound)
     u = [0.2, -0.1, 0.15, 0.05, 0.3]
@@ -569,7 +569,7 @@ function _hperiodic_plan(; k::Int = 4, period::Float64 = 2.0)
             sigma ~ Exponential(1)
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, sigma)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
 end
 
 @testset "hsgp periodic lowering" begin
@@ -593,7 +593,7 @@ end
             hsgp_basis(:h_d, x; cov = :periodic, period = 1.0)
             mu = a .+ hsgp(:h_d)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     dhb = only(dflt.hsgp_bases)
     @test dhb.K == [20] && dhb.cov === :periodic && dhb.period == 1.0
     @test ReactiveKernelsPPL._hsgp_n_basis(dhb) == 40
@@ -602,7 +602,7 @@ end
             hsgp_basis(:h_e, x; k = 3, cov = :exp_quad)
             mu = a .+ hsgp(:h_e)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     ehb = only(eq.hsgp_bases)
     @test ehb.cov === :exp_quad && isnan(ehb.period)
     # `c` is accepted with periodic (SB validates its form, ignores its
@@ -612,7 +612,7 @@ end
             hsgp_basis(:h_c, x; k = 3, c = 2.5, cov = :periodic, period = 1.0)
             mu = a .+ hsgp(:h_c)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     @test only(cacc.hsgp_bases).c == [2.5]
 end
 
@@ -624,39 +624,39 @@ end
             hsgp_basis(:h_p, x; k = 4, cov = :matern, period = 2.0)
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # refused: bare `periodic` is an undeclared name (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_p, x; k = 4, cov = periodic, period = 2.0)
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # period required iff periodic (SB `_brm_gp_period`).
     # refused: periodic kernel without its period; no defaulted/minted period (P2; P7, 0d5a67r)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_p, x; k = 4, cov = :periodic)
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: `period=` means nothing without cov=:periodic (P2)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; k = 4, period = 2.0)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: `period=` means nothing for cov=:exp_quad (P2)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; k = 4, cov = :exp_quad, period = 2.0)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     for bad in (0.0, -1.0, Inf, NaN, "2.0")
         # refused: invalid period literal (non-positive / non-finite / non-numeric)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 hsgp_basis(:h_p, x; k = 4, cov = :periodic, period = $bad)
                 mu = a .+ hsgp(:h_p)
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
     end
     # One isotropic axis (SB "periodic hsgp requires one isotropic axis").
     # capability: multi-axis periodic HSGP (the SB one-axis limit is not a principle, P10) (todo `0bfiemp`)
@@ -665,7 +665,7 @@ end
             hsgp_basis(:h_p, x, z; k = (4, 3), cov = :periodic, period = 2.0)
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z)); true)
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
     # capability: anisotropic (iso=false) periodic HSGP (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -673,7 +673,7 @@ end
                 iso = false)
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # Periodic claims the same names (collision still loud).
     # refused: single assignment, user definition collides with basis-claimed `rho_h_p`
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -681,7 +681,7 @@ end
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_p, x; k = 4, cov = :periodic, period = 2.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
 end
 
 @testset "hsgp periodic contract validation" begin
@@ -800,7 +800,7 @@ end
             sigma ~ Exponential(1)
             mu = a .+ hsgp(:h_1p)
             y .~ Normal.(mu, sigma)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     k1layout = assign_layout(bind_data(k1, _hsgp_cols()))
     k1rho = only(e for e in k1layout.entries if e.name === :rho_h_1p)
     @test (k1rho.kind, k1rho.transform) === (:sampled, :exp)
@@ -870,7 +870,7 @@ end
             sigma ~ Exponential(1)
             mu = a .+ hsgp(:h_1p)
             y .~ Normal.(mu, sigma)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     bound = bind_data(k1, _hsgp_cols())
     built = build_kernel(bound)
     u = [0.2, -0.1, 0.15, 0.05, 0.3, -0.2]
@@ -953,7 +953,7 @@ const _HSGP_UPSTREAM_PINNED = ("periodic",)
         @testset "$name" begin
             cols = _hsgp_xla_cols()
             keep = name == "aniso" ? (:y, :x, :z) : (:y, :x)
-            bound = bind_data(lower_rkppl(prog, keep), cols)
+            bound = bind_data(lower_rkppl(prog, keep; conditioned = keep), cols)
             try
                 fx = _hsgp_reactant(bound)
                 @test fx.primal ≈ fx.native rtol = 1e-9

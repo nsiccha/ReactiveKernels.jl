@@ -44,18 +44,29 @@ _sfail(msg) = throw(SurfaceLoweringError(msg))
 """
     RKPPLModel
 
-A captured `@rkppl` block (AST with call-site line numbers), not yet
-lowered. Call it with data keywords to lower and bind:
-`model(; y, x, g)::StructuralPlan` (bound). Mirrors StanBlocks `SlicModel`.
-`fixed` carries `Base.merge` NamedTuple fixes (name => data column); explicit
-call kwargs win over it.
+A captured `@rkppl` block. `model(; x, g)` binds inputs and pins any named
+declaration. Observe values explicitly: `model(; x, g) | (; y)`, or
+`condition(model(; x, g); y)`, returns a bound `StructuralPlan`.
+`fixed` stores merge pins, `rewrites` stores scoped statement replacements,
+and `conditioned` stores explicit observations. Operations return new models.
 """
 struct RKPPLModel
     ast::Expr
     mod::Module
     fixed::Dict{Symbol,ColumnData}
+    rewrites::Vector{Expr}
+    conditioned::Dict{Symbol,ColumnData}
 end
-RKPPLModel(ast, mod) = RKPPLModel(ast, mod, Dict{Symbol,ColumnData}())
+RKPPLModel(ast, mod) = RKPPLModel(ast, mod, Dict{Symbol,ColumnData}(), Expr[], Dict{Symbol,ColumnData}())
+RKPPLModel(ast, mod, fixed) = RKPPLModel(ast, mod, fixed, Expr[])
+RKPPLModel(ast, mod, fixed, rewrites) = RKPPLModel(ast, mod, fixed, rewrites, Dict{Symbol,ColumnData}())
+
+"""Inputs bound to a captured program, awaiting explicit observations.
+Use `binding | (; y)` or `condition(binding; y)` to lower and bind it."""
+struct RKPPLBoundModel
+    model::RKPPLModel
+    data::Dict{Symbol,ColumnData}
+end
 
 """
     RKPPLSubmodel(name, argnames, body, mod)
@@ -101,7 +112,8 @@ varying statements, and calls to other submodels. Scope access is static:
 Bare `z` denotes the actual return value, including in Julia function
 arguments. `z.b` is local-first: when `b` is absent from the scope it reads
 `getproperty(z, :b)` on that return value. Explicit `getproperty(z, :b)`
-always reads the return value. Locals are read-only from the caller and
+always reads the return value. Ordinary caller assignments cannot write locals;
+explicit `merge` operations replace their declarations. Locals
 never create unqualified caller bindings. `a.b_c`, `a_b.c`, and caller
 `a_b_c` coexist. A per-cell call (`col[i] ~ sm(…)` inside `@plate for i …`)
 admits scalar `~` / `=` statements over bare names; `col[i].b` reads local
@@ -142,9 +154,13 @@ struct RKPPLSubmodel
     body::Expr
     mod::Module
     kwdefaults::Vector{Pair{Symbol,Any}}
+    rewrites::Vector{Expr}
+    fixed::Dict{Symbol,ColumnData}
 end
-RKPPLSubmodel(name, argnames, body, mod) =
-    RKPPLSubmodel(name, argnames, body, mod, Pair{Symbol,Any}[])
+RKPPLSubmodel(name, args, body, mod) =
+    RKPPLSubmodel(name, args, body, mod, Pair{Symbol,Any}[])
+RKPPLSubmodel(name, args, body, mod, kwdefaults) =
+    RKPPLSubmodel(name, args, body, mod, kwdefaults, Expr[], Dict{Symbol,ColumnData}())
 _submodel_args(sm::RKPPLSubmodel) = [sm.argnames; first.(sm.kwdefaults)]
 
 """True for the submodel-definition head `sm(args...) = begin ... end`."""
@@ -218,7 +234,7 @@ macro rkppl(body)
     return Expr(:call, RKPPLModel, Meta.quot(body), __module__)
 end
 
-"""Capture a model block and immediately lower+bind caller-scope data
+"""Capture a model block and bind caller-scope inputs and pins
 (a `NamedTuple` or dict of columns)."""
 macro rkppl(data, body)
     _is_submodel_def(body) && _sfail("a submodel definition takes no data " *
@@ -237,8 +253,54 @@ function (m::RKPPLModel)(; kwargs...)
     for (k, v) in kwargs
         cols[k] = _check_col(k, v)
     end
-    return _bind_model(m, cols)
+    idx, _, blocked = _merge_base_index(m.ast.args)
+    fixes = (; (k => v for (k, v) in kwargs if haskey(idx, k) ||
+        k in blocked || occursin('.', String(k)))...)
+    program = isempty(fixes) ? m : Base.merge(m, fixes)
+    binding = RKPPLBoundModel(program, cols)
+    return isempty(program.conditioned) ? binding : bind_data(binding)
 end
+
+function condition(m::RKPPLModel; kwargs...)
+    observations = merge(copy(m.conditioned),
+        Dict{Symbol,ColumnData}(k => _check_col(k, v) for (k, v) in kwargs))
+    return RKPPLModel(m.ast, m.mod, copy(m.fixed), copy(m.rewrites), observations)
+end
+condition(m::RKPPLBoundModel; kwargs...) =
+    bind_data(RKPPLBoundModel(condition(m.model; kwargs...), copy(m.data)))
+Base.:|(m::Union{RKPPLModel,RKPPLBoundModel}, data::NamedTuple) = condition(m; data...)
+function condition(plan::StructuralPlan; kwargs...)
+    aliases = Dict(Symbol(join(path, ".")) => nm for (nm, path) in
+        _scope_name_paths(plan.submodel_scopes))
+    names = Set(p.name for ps in (plan.parameters, plan.array_parameters,
+        plan.vector_parameters, plan.plate_parameters) for p in ps)
+    computed = _bound_module_data_names(plan)
+    union!(computed, (d.name for d in plan.derived if
+        any(r -> r.response === d.name, plan.responses)))
+    columns = Dict{Symbol,ColumnData}(k => v for (k,v) in plan.columns if k ∉ computed)
+    observing = copy(plan.conditioned)
+    for (key, value) in kwargs
+        name = get(aliases, key, key)
+        if name in names
+            input = _conditioned_input(name)
+            name ∉ observing && (haskey(columns, input) || input in names ||
+                any(a -> a.name === input, plan.assignments) ||
+                any(d -> d.name === input, plan.derived)) &&
+                _sfail("condition `$key` needs internal input `$input`, already used by the model")
+            push!(observing, name)
+            columns[input] = _check_col(key, value)
+        elseif haskey(columns, name)
+            columns[name] = _check_col(key, value)
+        else
+            _sfail("condition `$key` matches no sampling statement")
+        end
+    end
+    return bind_data(plan, columns; conditioned = observing)
+end
+Base.:|(plan::StructuralPlan, data::NamedTuple) = condition(plan; data...)
+bind_data(m::RKPPLBoundModel) = _bind_model(m.model, m.data)
+build_kernel(m::RKPPLBoundModel) = build_kernel(bind_data(m))
+build_kernel(m::RKPPLModel) = build_kernel(m())
 
 function _bind_immediate(m::RKPPLModel, data)
     cols = if data isa NamedTuple
@@ -250,7 +312,7 @@ function _bind_immediate(m::RKPPLModel, data)
         _sfail("@rkppl data must be a NamedTuple or dict of columns, " *
                "got $(typeof(data))")
     end
-    return _bind_model(m, cols)
+    return m(; cols...)
 end
 
 _dict_key(k::Symbol) = k
@@ -261,8 +323,8 @@ _check_col(k, v) = v isa _SuppliedColumn ? v :
     _sfail("data value $k must be a number or an array, got $(typeof(v))")
 
 function _bind_model(m::RKPPLModel, cols::Dict{Symbol,ColumnData})
-    plan = lower_rkppl(m.ast, cols; mod = m.mod)
-    return bind_data(plan, cols)
+    plan, values = _lower_model(m, cols)
+    return bind_data(plan, values)
 end
 
 # ── Model merge (StanBlocks-style program composition) ─────────────────────
@@ -297,42 +359,58 @@ data, bound at the call; explicit call kwargs win over it (SB
 easily-rebound data). A pinned number reads as a model-level value
 (`merge(m, (; tau = 0.3))` reads `tau` exactly as `tau = 0.3` would).
 
-Fail-closed: non-statement overrides, non-bare LHS, duplicate base LHS,
-fixes naming no statement, and fix values that are neither numbers nor
-arrays throw `SurfaceLoweringError`. Ranged / levels / joint LHS (`y[R]`,
-`c[levels(g)]`, `[y1, y2]`) are unmatchable (indexed overrides deferred);
+Sized left-hand sides match their complete declaration, including its axes.
+A bare name replaces the whole declaration. Scoped names use author paths
+(`z.w.tau`); keyword pins use `var"z.w.tau" = value`. `merge(submodel, …)`
+derives a reusable variant, including replacements and pins in nested calls.
+Partial array writes, duplicate matches, and unknown pins fail explicitly.
+Joint responses match their whole vector left-hand side; pins must supply
+every member. Members cannot be rewritten separately;
 `@plate` / `@scan` cells are invisible to the top-level matcher, so a
 colliding append fails at lowering through the single-assignment gate.
 """
 function Base.merge(m::RKPPLModel, override::Expr)
     out = Any[a for a in m.ast.args]
     idx, dups, blocked = _merge_base_index(out)
+    rewrites = copy(m.rewrites)
+    fixed = copy(m.fixed)
     for raw in _merge_override_stmts(override)
+        idx, dups, blocked = _merge_base_index(out)
         st = _merge_unwrap_override(raw)
         lhs = _merge_override_lhs(st)
-        lhs in dups && _sfail("merge override `$lhs` matches more than " *
+        if lhs isa Expr && lhs.head === :vect
+            matches = findall(out) do a
+                a isa Expr && !_is_block_macro(a) || return false
+                st = _unwrap_trivia(a)
+                return (_is_sample(st) || _is_broadcast_sample(st)) &&
+                    isequal(_stmt_lhs(st), lhs)
+            end
+            length(matches) <= 1 || _sfail("merge joint target matches multiple statements")
+            isempty(matches) ? push!(out, raw) : (out[only(matches)] = raw)
+            foreach(n -> delete!(fixed, n), lhs.args)
+            continue
+        end
+        if _merge_path(lhs) !== nothing
+            push!(rewrites, st)
+            delete!(fixed, Symbol(join(_merge_path(lhs), ".")))
+            continue
+        end
+        nm = _merge_stem(lhs)
+        nm in dups && _sfail("merge override `$lhs` matches more than " *
                               "one base-model statement (the base is " *
                               "broken — lowering would reject it)")
-        lhs in blocked && _sfail("merge override `$lhs` names a ranged, " *
-                                 "levels, or joint LHS (indexed overrides " *
-                                 "are a deferred slice)")
-        if haskey(idx, lhs)
-            out[idx[lhs]] = raw
+        nm in blocked && _sfail("merge override `$lhs` names one member of a joint " *
+                                 "statement; replace its complete left-hand side")
+        if haskey(idx, nm)
+            _merge_check_lhs(lhs, _stmt_lhs(_merge_unwrap_override(out[idx[nm]])))
+            out[idx[nm]] = raw
         else
+            lhs isa Symbol || _sfail("merge indexed override `$lhs` matches no declaration")
             push!(out, raw)
         end
+        delete!(fixed, nm)
     end
-    return RKPPLModel(Expr(:block, out...), m.mod, copy(m.fixed))
-end
-
-# A library body's statements use the same matcher as a top-level model.
-# Keep the return expression last even when merge appends a new statement.
-function Base.merge(sm::RKPPLSubmodel, override::Expr)
-    stmts, ret = _submodel_body_parts(sm)
-    m = merge(RKPPLModel(Expr(:block, stmts...), sm.mod), override)
-    return RKPPLSubmodel(sm.name, copy(sm.argnames),
-        Expr(:block, m.ast.args..., Expr(:return, ret)), sm.mod,
-        copy(sm.kwdefaults))
+    return RKPPLModel(Expr(:block, out...), m.mod, fixed, rewrites, copy(m.conditioned))
 end
 
 function Base.merge(m::RKPPLModel, fix::NamedTuple)
@@ -340,24 +418,41 @@ function Base.merge(m::RKPPLModel, fix::NamedTuple)
     out = Any[a for a in m.ast.args]
     idx, dups, blocked = _merge_base_index(out)
     new_fixed = copy(m.fixed)
+    observations = copy(m.conditioned)
     drop = Set{Int}()
     for (nm, val) in pairs(fix)
+        delete!(observations, nm)
+        if occursin('.', String(nm))
+            new_fixed[nm] = _check_col(nm, val)
+            continue
+        end
         nm in dups && _sfail("merge fix `$nm` matches more than one " *
                              "base-model statement (the base is broken — " *
                              "lowering would reject it)")
-        nm in blocked && _sfail("merge fix `$nm` names a ranged, levels, " *
-                                "or joint LHS (indexed overrides are a " *
-                                "deferred slice)")
-        haskey(idx, nm) || _sfail("merge fix `$nm` matches no base-model " *
+        if nm in blocked
+            for (i, raw) in pairs(out)
+                raw isa Expr && !_is_block_macro(raw) || continue
+                st = _unwrap_trivia(raw)
+                (_is_sample(st) || _is_broadcast_sample(st)) || continue
+                lhs = _stmt_lhs(st)
+                lhs isa Expr && lhs.head === :vect && nm in lhs.args || continue
+                all(n -> haskey(fix, n), lhs.args) ||
+                    _sfail("merge pin of a joint response must supply every member of $(repr(lhs))")
+                push!(drop, i)
+            end
+            new_fixed[nm] = _check_col(nm, val)
+            continue
+        end
+        (haskey(idx, nm) || haskey(new_fixed, nm)) || _sfail("merge fix `$nm` matches no base-model " *
                                   "statement (a fixed name must name a " *
                                   "`~` / `.~` / `=` statement to remove)")
         val isa _SuppliedColumn || _sfail("merge fix `$nm` must be a " *
             "number or an array (a data value; got $(typeof(val)))")
-        push!(drop, idx[nm])
+        haskey(idx, nm) && push!(drop, idx[nm])
         new_fixed[nm] = val
     end
     kept = Any[a for (i, a) in enumerate(out) if i ∉ drop]
-    return RKPPLModel(Expr(:block, kept...), m.mod, new_fixed)
+    return RKPPLModel(Expr(:block, kept...), m.mod, new_fixed, copy(m.rewrites), observations)
 end
 
 function Base.merge(m::RKPPLModel, first, rest...)
@@ -373,8 +468,8 @@ function Base.merge(m::RKPPLModel, first, rest...)
 end
 
 # Index base top-level statements by bare LHS name: `idx` (name => position),
-# `dups` (broken-base duplicates), `blocked` (ref stems / joint outcomes —
-# indexed overrides deferred). Plate/scan blocks and unparseable statements
+# `dups` (broken-base duplicates), `blocked` (joint outcomes).
+# Plate/scan blocks and unparseable statements
 # are invisible (lowering owns their gates).
 function _merge_base_index(args)
     idx = Dict{Symbol,Int}()
@@ -403,8 +498,9 @@ _merge_claim!(idx::Dict{Symbol,Int}, dups::Set{Symbol}, nm::Symbol, i::Int) =
 function _merge_index_lhs!(idx, dups, blocked, lhs, i::Int)
     lhs isa Symbol && return _merge_claim!(idx, dups, lhs, i)
     lhs isa Expr || return nothing
-    if lhs.head === :ref && !isempty(lhs.args) && lhs.args[1] isa Symbol
-        push!(blocked, lhs.args[1])
+    stem = _merge_stem(lhs)
+    if stem isa Symbol
+        _merge_claim!(idx, dups, stem, i)
     elseif lhs.head === :vect
         for o in lhs.args
             o isa Symbol && push!(blocked, o)
@@ -415,7 +511,8 @@ end
 
 function _merge_override_stmts(override::Expr)
     override.head === :block || return Any[override]
-    return Any[a for a in override.args if !(a isa LineNumberNode)]
+    return Any[b for a in override.args if !(a isa LineNumberNode)
+        for b in (a isa Expr ? _merge_override_stmts(a) : Any[a])]
 end
 
 function _merge_unwrap_override(raw)
@@ -429,12 +526,157 @@ function _merge_unwrap_override(raw)
 end
 
 function _merge_override_lhs(st::Expr)
-    ok = ((_is_sample(st) || _is_broadcast_sample(st)) &&
-        st.args[2] isa Symbol) ||
-        (st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol)
+    ok = _is_sample(st) || _is_broadcast_sample(st) ||
+        (st.head === :(=) && length(st.args) == 2)
     ok || _sfail("merge override must be a `~`, `.~` or `name = ...` " *
                  "statement with a bare Symbol LHS, got $(repr(st))")
-    return _stmt_lhs(st)::Symbol
+    lhs = _stmt_lhs(st)
+    lhs isa Expr && lhs.head === :vect && all(a -> a isa Symbol, lhs.args) && return lhs
+    (_merge_stem(lhs) isa Symbol || _merge_path(lhs) !== nothing) ||
+        _sfail("merge override must name a declaration, got $(repr(lhs))")
+    return lhs
+end
+
+_merge_stem(lhs::Symbol) = lhs
+function _merge_stem(lhs::Expr)
+    lhs.head === :ref && return _merge_stem(first(lhs.args))
+    lhs.head === :call && length(lhs.args) == 2 &&
+        first(lhs.args) in (:eachrow, :eachcol) && return _merge_stem(lhs.args[2])
+    return nothing
+end
+_merge_stem(lhs) = nothing
+_merge_path(lhs::Symbol) = nothing
+function _merge_path(lhs::Expr)
+    lhs.head === :ref && return _merge_path(first(lhs.args))
+    lhs.head === :call && length(lhs.args) == 2 &&
+        first(lhs.args) in (:eachrow, :eachcol) && return _merge_path(lhs.args[2])
+    if lhs.head === :. && length(lhs.args) == 2 && lhs.args[2] isa QuoteNode
+        parent = first(lhs.args)
+        path = parent isa Symbol ? (parent,) : _merge_path(parent)
+        path === nothing || return (path..., lhs.args[2].value)
+    end
+    return nothing
+end
+_merge_path(lhs) = nothing
+
+function _merge_check_lhs(override, base)
+    override isa Symbol && return nothing # replacing the whole declaration
+    isequal(override, base) && return nothing
+    _sfail("merge indexed override $(repr(override)) must match the complete " *
+        "left-hand side $(repr(base)); a partial write is not a statement replacement")
+end
+
+function Base.merge(sm::RKPPLSubmodel, part::Union{Expr,NamedTuple}, rest...)
+    stmts, ret = _submodel_body_parts(sm)
+    model = Base.merge(RKPPLModel(Expr(:block, stmts...), sm.mod,
+        copy(sm.fixed), copy(sm.rewrites)), part, rest...)
+    # Pins become pure data-only definitions in the variant's own scope.
+    for (nm, value) in model.fixed
+        occursin('.', String(nm)) && continue
+        helper = value isa AbstractArray ? :_bound_array_value : :_bound_value
+        push!(model.ast.args, Expr(:(=), nm,
+            Expr(:call, GlobalRef(@__MODULE__, helper), QuoteNode(value))))
+    end
+    return RKPPLSubmodel(sm.name, copy(sm.argnames),
+        Expr(:block, model.ast.args..., ret), sm.mod, copy(sm.kwdefaults), copy(model.rewrites),
+        Dict(k => v for (k, v) in model.fixed if occursin('.', String(k))))
+end
+
+function _lower_model(m::RKPPLModel, supplied; conditioned = keys(m.conditioned))
+    values = merge(copy(m.fixed), Dict{Symbol,ColumnData}(pairs(supplied)), m.conditioned)
+    observing = Set{Symbol}(_conditioned_names(conditioned))
+    scoped = Dict(k => pop!(values, k) for k in collect(keys(values))
+        if occursin('.', String(k)) && k ∉ observing)
+    scoped_observed = Dict(k => pop!(values, k) for k in collect(keys(values))
+        if occursin('.', String(k)) && k in observing)
+    data = Set(keys(values))
+    ast = Expr(:block, _desugar_destructuring(m.ast.args)...)
+    scoped_values = Dict{Symbol,ColumnData}()
+    ast, pins, scopes = _expand_submodels(ast, data, m.mod; with_scopes = true,
+        rewrites = m.rewrites, fixes = scoped, bound_values = scoped_values)
+    merge!(values, scoped_values)
+    used = Set{Symbol}()
+    _all_symbols!(used, ast)
+    ctx = _ScopeExpansion(scopes, Dict(s.binding => s for s in scopes),
+        _scope_name_paths(scopes), used, 0)
+    expanded = RKPPLModel(ast, m.mod)
+    for (path, value) in scoped_observed
+        parts = Symbol.(split(String(path), '.'))
+        nm = _resolve_scope_properties(foldl((a,b) -> Expr(:., a, QuoteNode(b)), parts), ctx)
+        nm isa Symbol || _sfail("condition `$path` matches no scoped statement")
+        values[nm] = value
+        push!(observing, nm)
+        push!(data, nm)
+    end
+    observed_parameters = _conditioned_declarations(expanded.ast, observing)
+    setdiff!(data, observed_parameters)
+    # Response LHSs are data only through the explicit conditioning set.
+    _check_observed_inputs(expanded.ast, data, observing)
+    ast, data = _scalar_value_definitions(expanded.ast, data,
+        Set{Symbol}(k for (k, v) in values if v isa Number && k ∉ observed_parameters);
+        arrays = Set{Symbol}(k for (k, v) in values if v isa AbstractArray &&
+            (haskey(m.fixed, k) || haskey(scoped_values, k))))
+    ast = _indexed_observation_definitions(ast, data)
+    plan = _lower_rkppl_once(ast, data, pins, m.mod;
+        submodel_scopes = scopes, conditioned = observed_parameters)
+    for name in observed_parameters
+        values[_conditioned_input(name)] = pop!(values, name)
+    end
+    return plan, values
+end
+
+lower_rkppl(m::RKPPLModel, data::NamedTuple; conditioned=keys(m.conditioned)) = first(_lower_model(m, data; conditioned))
+lower_rkppl(m::RKPPLModel, data::AbstractDict; conditioned=keys(m.conditioned)) = first(_lower_model(m, data; conditioned))
+
+_conditioned_names(data::Union{NamedTuple,AbstractDict}) = keys(data)
+_conditioned_names(names) = names
+
+function _conditioned_declarations(ast, names)
+    out = Set{Symbol}()
+    definitions = Dict{Symbol,Any}()
+    for st in ast.args
+        st isa Expr && st.head === :(=) && first(st.args) isa Symbol || continue
+        definitions[first(st.args)] = st.args[2]
+    end
+    for raw in ast.args
+        raw isa Expr || continue
+        st = _is_block_macro(raw) ? raw : _unwrap_trivia(raw)
+        (_is_sample(st) || _is_broadcast_sample(st)) || continue
+        lhs = _stmt_lhs(st)
+        name = _merge_stem(lhs)
+        name in names || continue
+        # A positional slice of an observed stream remains a response.
+        # Sized level/matrix axes and matrix declarations retain array metadata.
+        array = lhs isa Expr && ((lhs.head === :ref &&
+            (length(lhs.args) > 2 || _is_levels_call(lhs.args[2]) ||
+                (lhs.args[2] isa Symbol && haskey(definitions, lhs.args[2]) &&
+                    _is_levels_call(definitions[lhs.args[2]])) ||
+                any(ast.args) do other
+                    other isa Expr && !_is_block_macro(other) || return false
+                    other = _unwrap_trivia(other)
+                    (_is_sample(other) || _is_broadcast_sample(other) ||
+                        other.head === :(=)) || return false
+                    return other !== st && _mentions_symbol(last(other.args), name)
+                end ||
+                (_is_axes2_call(lhs.args[2]) && lhs.args[2].args[2] !== name))) ||
+            (lhs.head === :call && first(lhs.args) in (:eachrow, :eachcol)))
+        (_is_sample(st) || array) && push!(out, name)
+    end
+    return out
+end
+
+function _check_observed_inputs(ast, inputs, observing)
+    ast isa Expr || return nothing
+    if _is_sample(ast) || _is_broadcast_sample(ast)
+        names = _collect_lhs_binders!(Set{Symbol}(), _stmt_lhs(ast))
+        for name in names
+            name in inputs && name ∉ observing && _sfail("$name names a sampling statement; " *
+                "observe it with `|` / `condition` or the `conditioned` lowering keyword, " *
+                "or remove its statement with a merge pin")
+        end
+    end
+    foreach(arg -> _check_observed_inputs(arg, inputs, observing), ast.args)
+    return nothing
 end
 
 # A number bound to a data name has no observation axis: it lowers as the
@@ -446,13 +688,13 @@ end
 # number bound to a response is one observation, and binding data to a
 # sampled or defined name keeps failing as an overlap.
 function _scalar_value_definitions(ast::Expr, data::Set{Symbol},
-        scalars::Set{Symbol})
-    isempty(scalars) && return ast, data
+        scalars::Set{Symbol}; arrays::Set{Symbol} = Set{Symbol}())
+    isempty(scalars) && isempty(arrays) && return ast, data
     bound = Set{Symbol}()
     _statement_lhs_names!(bound, ast)
     defs = Any[]
     data = copy(data)
-    for s in sort!(collect(scalars))
+    for s in sort!(collect(union(scalars, arrays)))
         s in bound && continue
         input = _bound_value_input(s)
         (input in data || _mentions_symbol(ast, input)) &&
@@ -460,8 +702,9 @@ function _scalar_value_definitions(ast::Expr, data::Set{Symbol},
                    "used by the model or its data")
         delete!(data, s)
         push!(data, input)
+        helper = s in arrays ? :_bound_array_value : :_bound_value
         push!(defs, Expr(:(=), s,
-            Expr(:call, GlobalRef(@__MODULE__, :_bound_value), input)))
+            Expr(:call, GlobalRef(@__MODULE__, helper), input)))
     end
     isempty(defs) && return ast, data
     return Expr(:block, ast.args..., defs...), data
@@ -501,12 +744,13 @@ _mentions_symbol(ex, s::Symbol) = ex === s ||
 
 Lower a captured `@rkppl` block AST to a data-free (unbound) plan.
 `data_names` (or the keys of `data`, a dict or `NamedTuple` of values)
-classifies every `~` / `.~` LHS: data under `.~` is a
-response, non-data under `~` is a prior (sampled parameter or, when the
-name sits in a predictor coefficient position, a population prior); the
-crossed spellings fail closed (`~` is scalar-only, `.~` broadcasts over
-data). Runs `validate_structure` before returning. The BRM emitter calls
-this entry point directly with ASTs.
+declares supplied values. Pass their observation roles separately with
+`conditioned = (:y, :tau)`. The keyword accepts names or the keys of a
+NamedTuple/dict. A conditioned sampling declaration contributes likelihood
+at its constrained value, with no sampled coordinate or transform Jacobian.
+Unconditioned supplied names must be inputs; remove a sampling declaration
+with a merge pin to supply it as an input instead. Runs `validate_structure`
+before returning. The BRM emitter calls this entry point directly with ASTs.
 
 `mod` is the module against which `latent ~ sm(args...)` call heads are
 resolved to [`RKPPLSubmodel`](@ref)s; a resolving call is expanded inline
@@ -559,10 +803,10 @@ lowers with the values. Given names only, a name the model reads per
 observation lowers as per-observation data, and binding a number to it
 fails naming this method. A number bound to a response is one observation.
 """
-lower_rkppl(ast, data::NamedTuple; mod::Module = Main) =
-    lower_rkppl(ast, Dict{Symbol,Any}(pairs(data)); mod)
+lower_rkppl(ast, data::NamedTuple; mod::Module = Main, conditioned=()) =
+    lower_rkppl(ast, Dict{Symbol,Any}(pairs(data)); mod, conditioned)
 
-function lower_rkppl(ast, data::AbstractDict; mod::Module = Main)
+function lower_rkppl(ast, data::AbstractDict; mod::Module = Main, conditioned=())
     names = Symbol[]
     scalars = Set{Symbol}()
     for (k, v) in data
@@ -570,14 +814,14 @@ function lower_rkppl(ast, data::AbstractDict; mod::Module = Main)
         push!(names, k)
         v isa Number && push!(scalars, k)
     end
-    return _lower_rkppl(ast, names, scalars, mod)
+    return _lower_rkppl(ast, names, scalars, mod; conditioned)
 end
 
-lower_rkppl(ast, data_names; mod::Module = Main) =
-    _lower_rkppl(ast, data_names, Set{Symbol}(), mod)
+lower_rkppl(ast, data_names; mod::Module = Main, conditioned=()) =
+    _lower_rkppl(ast, data_names, Set{Symbol}(), mod; conditioned)
 
 function _lower_rkppl(ast, data_names, scalars::Set{Symbol},
-        mod::Module)::StructuralPlan
+        mod::Module; conditioned=())::StructuralPlan
     data = Set{Symbol}()
     for n in data_names
         n isa Symbol || _sfail("data names must be Symbols, got $(repr(n))")
@@ -586,10 +830,21 @@ function _lower_rkppl(ast, data_names, scalars::Set{Symbol},
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = Expr(:block, _desugar_destructuring(ast.args)...)
-    ast, data = _scalar_value_definitions(ast, data, scalars)
+    observing = Set{Symbol}(_conditioned_names(conditioned))
+    # Submodel streams need their observation name during expansion.
+    primitive = Set(n for n in _conditioned_declarations(ast, observing)
+        if !any(a -> a isa Expr && _stmt_is_submodel_call(a, mod) &&
+            _merge_stem(_stmt_lhs(_unwrap_trivia(a))) === n, ast.args))
+    setdiff!(data, primitive)
     ast, pins, scopes = _expand_submodels(ast, data, mod; with_scopes = true)
+    observed_parameters = _conditioned_declarations(ast, observing)
+    setdiff!(data, observed_parameters)
+    _check_observed_inputs(ast, data, observing)
+    ast, data = _scalar_value_definitions(ast, data, setdiff(scalars, observed_parameters))
     ast = _indexed_observation_definitions(ast, data)
-    return _lower_rkppl_once(ast, data, pins, mod; submodel_scopes = scopes)
+    return _lower_rkppl_once(ast, data, pins, mod;
+        submodel_scopes = scopes, conditioned = observed_parameters)
+
 end
 
 # A data-indexed observation is an ordinary gather followed by an
@@ -651,7 +906,13 @@ function _bind_parameter_terms!(predictors, structured)
 end
 
 function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
-        submodel_scopes::Vector{SubmodelScope} = SubmodelScope[])
+        submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
+        conditioned::Set{Symbol} = Set{Symbol}())
+    for name in conditioned
+        input = _conditioned_input(name)
+        (input in data || _mentions_symbol(ast, input)) &&
+            _sfail("condition `$name` needs internal input `$input`, already used by the model or its data")
+    end
     sample, det, plate_ctx, plate_specs, scans, bases, vectors,
     hbases, kplates, kstmts, schedules, event_lps, r2d2decls, joints,
     varying_draws, varying_pending, glms = _partition_statements(ast, data)
@@ -712,6 +973,17 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     detnames_all = Set{Symbol}(nm for (nm, _) in det)
+    for s in sample
+        s.lhs in conditioned && !s.broadcast && s.dims === nothing || continue
+        rhs = s.rhs
+        rhs isa Expr && rhs.head === :call && first(rhs.args) in
+            union(keys(_PARAM_FAMILIES), (:HalfNormal, :HalfCauchy)) || continue
+        for argument in rhs.args[2:end]
+            _shape_of(argument, data, detmap, Dict{Symbol,Symbol}(), Set{Symbol}()) === :scalar ||
+                _sfail("conditioned scalar $(s.lhs) has a vector-valued distribution argument; " *
+                    "observe a vector with `.~`")
+        end
+    end
     # Derived responses (`.~` over a deterministic definition, either
     # order): data-like everywhere downstream — excluded from the sampled
     # name table (mixture/coef-prior/param positions keep treating them
@@ -1196,7 +1468,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
-        array_parameters = arrays, submodel_scopes = submodel_scopes)
+        array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned)
     _confirm_whole_value_data(plan, rawdata, waived; whole)
     validate_structure(plan)
     return plan
@@ -1458,6 +1730,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     head === :call || return :scalar  # exotic heads: downstream rejects
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
+    fn isa GlobalRef && fn.mod === (@__MODULE__) && fn.name === :_bound_array_value &&
+        return :array
     fn isa Symbol || return :scalar  # module/anonymous calls: model-level
     fn in REDUCTION_FNS && return :scalar
     fn === :_ppl_plate_column && return _plate_column_axis(ex) === nothing ?
@@ -6211,6 +6485,9 @@ end
 function _resolve_submodel(rhs, mod::Module)
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || return nothing
     head = rhs.args[1]
+    if head isa GlobalRef
+        mod, head = head.mod, head.name
+    end
     head isa Symbol || return nothing
     isdefined(mod, head) || return nothing
     val = getfield(mod, head)
@@ -6234,6 +6511,10 @@ function _reserve_submodel_names!(used::Set{Symbol}, ex, mod::Module,
             end
             _all_symbols!(used, sm.body)
             _reserve_submodel_names!(used, sm.body, sm.mod, seen)
+            for edit in sm.rewrites
+                _all_symbols!(used, edit)
+                _reserve_submodel_names!(used, edit, sm.mod, seen)
+            end
         end
     end
     for arg in ex.args
@@ -6268,7 +6549,13 @@ mutable struct _ScopeExpansion
     name_paths::Dict{Symbol,Tuple{Vararg{Symbol}}}
     used::Set{Symbol}
     next_identifier::Int
+    rewrites::Vector{Tuple{Expr,Module}}
+    fixes::Dict{Symbol,ColumnData}
+    bound_values::Union{Nothing,Dict{Symbol,ColumnData}}
 end
+_ScopeExpansion(scopes, bindings, paths, used, next) =
+    _ScopeExpansion(scopes, bindings, paths, used, next,
+        Tuple{Expr,Module}[], Dict{Symbol,ColumnData}(), nothing)
 
 function _new_submodel_scope!(ctx::_ScopeExpansion, binding::Symbol;
         per_cell::Bool = false)
@@ -6341,16 +6628,22 @@ function _resolve_scope_properties(ex::Expr, ctx::_ScopeExpansion)
 end
 
 function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
-        with_scopes::Bool = false)
+        with_scopes::Bool = false, rewrites = Expr[], fixes = Dict(), bound_values = nothing)
     pins = Dict{Symbol,Symbol}()
-    any(_stmt_is_submodel_call(a, mod) || _plate_has_submodel_cell(a, mod)
-        for a in ast.args) || return with_scopes ? (ast, pins, SubmodelScope[]) : (ast, pins)
+    if !any(_stmt_is_submodel_call(a, mod) || _plate_has_submodel_cell(a, mod) for a in ast.args)
+        isempty(rewrites) && isempty(fixes) || _sfail("merge scoped target matches no submodel declaration")
+        return with_scopes ? (ast, pins, SubmodelScope[]) : (ast, pins)
+    end
     # Names in use by the program (binders at every depth + data): a
     # namespaced name must be fresh against these, and every expansion adds
     # its own names (two expansions never collide).
     used = copy(data)
     _all_symbols!(used, ast)
     _reserve_submodel_names!(used, ast, mod, Set{RKPPLSubmodel}())
+    for edit in rewrites
+        _all_symbols!(used, edit)
+        _reserve_submodel_names!(used, edit, mod, Set{RKPPLSubmodel}())
+    end
     for a in ast.args
         _collect_binders!(used, a)
         a isa Expr && _collect_basis_ids!(used, a)
@@ -6358,10 +6651,15 @@ function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
     out = Any[]
     ctx = _ScopeExpansion(SubmodelScope[], Dict{Symbol,SubmodelScope}(),
         Dict{Symbol,Tuple{Vararg{Symbol}}}(), used, 0)
+    ctx.rewrites = Tuple{Expr,Module}[(edit, mod) for edit in rewrites]
+    ctx.fixes = Dict{Symbol,ColumnData}(fixes)
+    ctx.bound_values = bound_values
     for arg in ast.args
         _expand_submodel_stmt!(out, arg, mod, data, pins, ctx,
             RKPPLSubmodel[])
     end
+    isempty(ctx.rewrites) && isempty(ctx.fixes) ||
+        _sfail("merge scoped target matches no statement (or names an unsupported plate/scan cell)")
     expanded = _resolve_scope_properties(Expr(:block, out...), ctx)
     return with_scopes ? (expanded, pins, ctx.scopes) : (expanded, pins)
 end
@@ -6378,6 +6676,7 @@ function _expand_submodel_stmt!(out, arg, mod::Module, data::Set{Symbol},
         sm, gen = _expand_one_submodel(st.args[2], st.args[3], mod, data,
             pins, used, chain)
         inner = RKPPLSubmodel[chain; sm]
+        gen = _scope_program_edits(sm, gen, st, used, data)
         for g in gen
             _expand_submodel_stmt!(out, g, sm.mod, data, pins, used, inner)
         end
@@ -6387,6 +6686,77 @@ function _expand_submodel_stmt!(out, arg, mod::Module, data::Set{Symbol},
         push!(out, arg)
     end
     return out
+end
+
+_path_property(path) = foldl((a,b) -> Expr(:., a, QuoteNode(b)), path)
+_replace_statement(st, lhs, rhs) = _is_sample(st) || _is_broadcast_sample(st) ?
+    Expr(:call, first(st.args), lhs, rhs) : Expr(:(=), lhs, rhs)
+function _replace_scope_path(lhs, path)
+    if lhs isa Expr && lhs.head === :ref
+        return Expr(:ref, _path_property(path), lhs.args[2:end]...)
+    elseif lhs isa Expr && lhs.head === :call && first(lhs.args) in (:eachrow, :eachcol)
+        return Expr(:call, first(lhs.args), _replace_scope_path(lhs.args[2], path))
+    end
+    return _path_property(path)
+end
+
+# Rewrite the declaration before its child calls expand. Replacing or pinning
+# a submodel use site therefore removes the entire former child program.
+function _scope_program_edits(sm, gen, call, ctx, data)
+    scope = ctx.by_binding[call.args[2]]
+    args, _ = _peel_predictor_pin(call.args[3], sm)
+    substitutions = merge(Dict{Symbol,Any}(zip(_submodel_args(sm), args)), scope.locals)
+    variant_edits = Tuple{Expr,Module}[]
+    for raw in sm.rewrites
+        path = (scope.path..., _merge_path(_stmt_lhs(raw))...)
+        edit = _hsubst(raw, substitutions, Dict{Symbol,Symbol}())
+        lhs = _replace_scope_path(_stmt_lhs(edit), path)
+        push!(variant_edits, (_replace_statement(edit, lhs, last(edit.args)), sm.mod))
+    end
+    prepend!(ctx.rewrites, variant_edits)
+    for (relative, value) in sm.fixed
+        path = Symbol(join((scope.path..., Symbol.(split(String(relative), '.'))...), "."))
+        haskey(ctx.fixes, path) || (ctx.fixes[path] = value)
+    end
+    direct(path) = path !== nothing && length(path) == length(scope.path) + 1 &&
+        path[1:end-1] == scope.path
+    program = RKPPLModel(Expr(:block, gen...), sm.mod)
+    remaining = Tuple{Expr,Module}[]
+    for (edit, edit_mod) in ctx.rewrites
+        lhs = _stmt_lhs(edit)
+        path = _merge_path(lhs)
+        if !direct(path)
+            push!(remaining, (edit, edit_mod))
+            continue
+        end
+        local_name = last(path)
+        haskey(scope.locals, local_name) || _sfail("merge scope $(scope.path) has no local $local_name")
+        name = scope.locals[local_name]
+        lhs = _replace_scope_path(lhs, (name,))
+        rhs = last(edit.args)
+        callee = _resolve_submodel(rhs, edit_mod)
+        if callee !== nothing && first(rhs.args) isa Symbol
+            rhs = Expr(:call, GlobalRef(edit_mod, first(rhs.args)), rhs.args[2:end]...)
+        end
+        program = Base.merge(program, _replace_statement(edit, lhs, rhs))
+    end
+    ctx.rewrites = remaining
+    for key in collect(keys(ctx.fixes))
+        path = Tuple(Symbol.(split(String(key), '.')))
+        direct(path) || continue
+        haskey(scope.locals, last(path)) || _sfail("merge pin $key matches no scoped statement")
+        name, value = scope.locals[last(path)], pop!(ctx.fixes, key)
+        program = Base.merge(program, NamedTuple{(name,)}((value,)))
+        if ctx.bound_values === nothing
+            helper = value isa AbstractArray ? :_bound_array_value : :_bound_value
+            push!(program.ast.args, Expr(:(=), name,
+                Expr(:call, GlobalRef(@__MODULE__, helper), QuoteNode(value))))
+        else
+            ctx.bound_values[name] = value
+            push!(data, name)
+        end
+    end
+    return program.ast.args
 end
 
 # A submodel that (transitively) calls itself never terminates: fail naming
@@ -9629,6 +9999,7 @@ _is_model_value_def(name, ctx) = name isa Symbol &&
 # coefficient-capable `c[levels(g)]` (`r = c[g]`, an aliased factor
 # coefficient) does not count.
 function _reads_value_array(ex, ctx, seen::Set{Symbol} = Set{Symbol}())
+    _is_bound_array_value_call(ex) && return true
     isval(nm) = nm isa Symbol && (nm in ctx.value_arrays ||
         nm in ctx.array_decls || _is_array_def(nm, ctx))
     if ex isa Symbol
@@ -9648,8 +10019,9 @@ end
 # definitions.
 function _reads_array_value(ex, ctx, seen::Set{Symbol} = Set{Symbol}();
         follow::Bool = true)
+    _is_bound_array_value_call(ex) && return true
     if ex isa Symbol
-        ex in ctx.array_decls && return true
+        (ex in ctx.array_decls || _is_array_def(ex, ctx)) && return true
         follow && haskey(ctx.detmap, ex) && ex ∉ seen || return false
         push!(seen, ex)
         return _reads_array_value(ctx.detmap[ex], ctx, seen)

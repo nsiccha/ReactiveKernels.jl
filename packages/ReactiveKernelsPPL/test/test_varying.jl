@@ -35,7 +35,7 @@ function _tv_base(; with_effect::Bool = false)
             sigma ~ Exponential(1)
             mu = a .+ b .* x
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     if with_effect
         pred = plan.predictors[1]
         terms = vcat(pred.terms, _tv_effect_term(:g))
@@ -60,7 +60,7 @@ end
             r ~ varying_effect(g, [1, x]; eta = 1.0)
             mu = a .+ b .* x .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     @test _draws_equal(got.varying_draws, VaryingDraws[_tv_draws()])
     @test only(got.varying_draws).suffix == "g"
     @test got.varying_slices == [VaryingSlice(:draws_g, 1:2, :mu)]
@@ -80,7 +80,7 @@ end
             sg = c .+ r2
             y .~ Normal.(mu, 1.5)
             y2 .~ Normal.(sg, 1.5)
-        end, (:y, :y2, :g, :x))
+        end, (:y, :y2, :g, :x); conditioned = (:y, :y2, :g, :x))
     b = only(multi.varying_draws)
     @test multi.varying_slices ==
         [VaryingSlice(:draws_g, 1:2, :mu), VaryingSlice(:draws_g, 3:3, :sg)]
@@ -96,7 +96,7 @@ end
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     b = only(one.varying_draws)
     @test b.kind === :correlated
     @test b.lkj_eta == 1.0
@@ -107,7 +107,7 @@ end
             r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     bs = only(slope.varying_draws)
     @test bs.kind === :correlated
     @test bs.lkj_eta == 1.0
@@ -119,7 +119,7 @@ end
                 r ~ varying_effect(g, [1]; eta = 2.0)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.5)
-            end, (:y, :g))
+            end, (:y, :g); conditioned = (:y, :g))
         nothing
     catch e
         e
@@ -135,7 +135,7 @@ end
             r ~ varying_effect(g, [1, dummy(c, 2), dummy(s, "a")])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :c, :s, :g))
+        end, (:y, :c, :s, :g); conditioned = (:y, :c, :s, :g))
     b = only(got.varying_draws)
     @test b.kind === :correlated
     @test _vmargins_equal([b.margins[2]],
@@ -153,21 +153,21 @@ end
             r ~ varying_effect(:ID, g, [1, x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, D)
+        end, D; conditioned = D)
     # Non-data group.
     # refused: undeclared group name `h` (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             r ~ varying_effect(h, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, D)
+        end, D; conditioned = D)
     # Non-positive eta.
     # refused: LKJ eta must be > 0 (mathematically invalid input)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             r ~ varying_effect(g, [1, x]; eta = 0.0)
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, D)
+        end, D; conditioned = D)
     # Duplicate binding (single assignment).
     # refused: single assignment (`r` bound twice)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -175,7 +175,7 @@ end
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, D)
+        end, D; conditioned = D)
     # One slice per (draws, target): two slices of one draws into one
     # predictor.
     # capability: two slices of one draws summed into one predictor (`a .+ r1 .+ r2`) (todo `1308iv0`)
@@ -186,7 +186,7 @@ end
             r2 ~ varying_slice(d, 2)
             mu = a .+ r1 .+ r2
             y .~ Normal.(mu, 1.5)
-        end, D); true)
+        end, D; conditioned = D); true)
     # Tuple margin collections are valid Julia values; the other entries
     # have no admitted meaning or name declaration.
     for bad in (:([2]), :([zz]), :((1, x)), 1)
@@ -196,11 +196,11 @@ end
                 :(mu = a .+ r), :(y .~ Normal.(mu, 1.5)))
         if bad == :((1, x))
             # capability: tuple margin collections (P3; todo `1308iv0`).
-            @test_broken (lower_rkppl(prog, D); true)
+            @test_broken (lower_rkppl(prog, D; conditioned = D); true)
         else
             # refused: 2 has no intercept meaning, zz is undeclared, and
             # a scalar is not a margin collection (P2/P3/P6, 05oe96l).
-            @test_throws SurfaceLoweringError lower_rkppl(prog, D)
+            @test_throws SurfaceLoweringError lower_rkppl(prog, D; conditioned = D)
         end
     end
     # Unknown draws / unconsumed margins.
@@ -209,7 +209,7 @@ end
             r2 ~ varying_slice(zz, 1)
             mu = a .+ r2
             y .~ Normal.(mu, 1.5)
-        end, D)
+        end, D; conditioned = D)
     # capability: a draws margin no slice uses (10gzbm9 degenerate) (todo `1308iv0`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -217,7 +217,7 @@ end
             r1 ~ varying_slice(d, 1)
             mu = a .+ r1
             y .~ Normal.(mu, 1.5)
-        end, D); true)
+        end, D; conditioned = D); true)
     # Negated / nested contributions.
     # capability: negated varying contribution (`a .- r`) (todo `1308iv0`)
     @test_broken (lower_rkppl(quote
@@ -225,14 +225,14 @@ end
             r ~ varying_effect(g, [1])
             mu = a .- r
             y .~ Normal.(mu, 1.5)
-        end, D); true)
+        end, D; conditioned = D); true)
     # capability: varying contribution inside a product (`a .+ r .* x`) (todo `1308iv0`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             mu = a .+ r .* x
             y .~ Normal.(mu, 1.5)
-        end, D); true)
+        end, D; conditioned = D); true)
     # Contribution inside a non-predictor definition.
     # capability: varying contribution used in a non-predictor definition (`w = r .+ 1.0`) (todo `1308iv0`)
     @test_broken (lower_rkppl(quote
@@ -243,7 +243,7 @@ end
             mu = a .+ b .* x .+ r
             y .~ Normal.(mu, sigma)
             sigma ~ Exponential(1)
-        end, (:y, :x, :g)); true)
+        end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
     # Admitted: an intermediate predictor definition preserves the varying
     # contribution alongside its ordinary coefficient reads.
     @test (lower_rkppl(quote
@@ -254,13 +254,13 @@ end
             mu = a .+ w
             y .~ Normal.(mu, sigma)
             sigma ~ Exponential(1)
-        end, (:y, :x, :g)); true)
+        end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
     # Reserved names.
     # refused: reserved name `dummy`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             dummy ~ Normal(0, 1)
             y .~ Normal.(mu, 1.5)
-        end, (:y,))
+        end, (:y,); conditioned = (:y,))
 end
 
 @testset "varying contract validation" begin
@@ -337,7 +337,7 @@ end
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     bound = bind_data(plan, cols)
     @test bound.roles[:g] === :group
     # Group column missing.
@@ -350,7 +350,7 @@ end
             r ~ varying_effect(g, [s])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :s, :g))
+        end, (:y, :s, :g); conditioned = (:y, :s, :g))
     # refused: wrong eltype (non-numeric continuous Z column)
     @test_throws ContractValidationError bind_data(strz,
         Dict{Symbol,AbstractVector}(:y => cols[:y],
@@ -361,7 +361,7 @@ end
             r ~ varying_effect(g, [dummy(s, "a")])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :s, :g))
+        end, (:y, :s, :g); conditioned = (:y, :s, :g))
     bound2 = bind_data(dym, Dict{Symbol,AbstractVector}(:y => cols[:y],
         :s => ["a", "b", "a", "b"], :g => cols[:g]))
     @test isbound(bound2)
@@ -370,7 +370,7 @@ end
             r ~ varying_effect(g, [dummy(s, "z")])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :s, :g))
+        end, (:y, :s, :g); conditioned = (:y, :s, :g))
     # refused: dummy level absent from data (all-zero indicator column; unidentified)
     @test_throws ContractValidationError bind_data(dymbad,
         Dict{Symbol,AbstractVector}(:y => cols[:y],
@@ -386,7 +386,7 @@ end
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     ibuilt = build_kernel(bind_data(iplan, cols))
     # a + 0 thetas + 1 tau + 2 z cells.
     @test ibuilt.layout.total == 4
@@ -395,7 +395,7 @@ end
             r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     sbuilt = build_kernel(bind_data(splan, cols))
     @test sbuilt.layout.total == 4
     cplan = lower_rkppl(quote
@@ -403,7 +403,7 @@ end
             r ~ varying_effect(g, [1, x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     cbuilt = build_kernel(bind_data(cplan, cols))
     # a + 1 theta + 2 tau + 2*2 z cells.
     @test cbuilt.layout.total == 8
@@ -416,7 +416,7 @@ end
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     @test ReactiveKernelsPPL._varying_corr_names(only(iplan.varying_draws)) ===
         (:L_g, :tau_g, :z_flat_g)
     splan = lower_rkppl(quote
@@ -424,7 +424,7 @@ end
             r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     @test ReactiveKernelsPPL._varying_corr_names(only(splan.varying_draws)) ===
         (:L_g, :tau_g, :z_flat_g)
     # Claims: user definitions cannot collide with K=1 names.
@@ -435,7 +435,7 @@ end
             r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     # refused: name collides with construct-minted name `z_flat_g` (reserved)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -443,14 +443,14 @@ end
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
             z_flat_g ~ Normal(0, 1)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     # Name tables: a hand-built parameter under a K=1 name fails.
     clash = lower_rkppl(quote
             a ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     push!(clash.parameters, SampledParameter(:tau_g, :normal,
         (arg1 = 0, arg2 = 1), nothing, :tau_g))
     # refused: hand-built parameter under minted name `tau_g` (name-table IR contract)
@@ -471,7 +471,7 @@ end
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     bound = bind_data(plan, cols)
     layout = assign_layout(bound)
     # The 1x1 LKJ factor packs zero coordinates; tau rides :exp (Stan
@@ -494,7 +494,7 @@ end
             r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     scols = Dict{Symbol,AbstractVector}(:g => cols[:g], :y => cols[:y],
         :x => collect(1.0:8.0))
     slayout = assign_layout(bind_data(splan, scols))
@@ -531,7 +531,7 @@ end
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     u = [0.2, 0.1, -0.3, 0.4, 0.0, -0.1]
@@ -555,7 +555,7 @@ end
             r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     bound = bind_data(plan,
         Dict{Symbol,AbstractVector}(:g => g2, :y => y, :x => x2))
     built = build_kernel(bound)
@@ -576,7 +576,7 @@ end
             r ~ varying_effect(g, [dummy(c, 2)])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :c, :g))
+        end, (:y, :c, :g); conditioned = (:y, :c, :g))
     dbound = bind_data(dplan,
         Dict{Symbol,AbstractVector}(:g => g2, :y => y, :c => c3))
     dbuilt = build_kernel(dbound)
@@ -608,7 +608,7 @@ end
                 r ~ $call
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g))
+            end, (:y, :x, :g); conditioned = (:y, :x, :g))
         bound = bind_data(plan, cols)
         built = build_kernel(bound)
         lay = built.layout
@@ -633,7 +633,7 @@ end
             r ~ varying_effect(g, [1, x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     cb = only(cplan.varying_draws)
     @test cb.kind === :correlated
     @test ReactiveKernelsPPL._varying_corr_names(cb) ===
@@ -654,7 +654,7 @@ end
             y1 .~ Normal.(mu1, 1.5)
             y2 .~ Normal.(mu2, 1.5)
             y3 .~ Normal.(mu3, 1.5)
-        end, (:y1, :y2, :y3, :x, :g))
+        end, (:y1, :y2, :y3, :x, :g); conditioned = (:y1, :y2, :y3, :x, :g))
     second = only(d for d in two.varying_draws if d.label === :draws_g_e)
     @test second.suffix == "g_e"
     @test ReactiveKernelsPPL._varying_corr_names(second) ===
@@ -667,7 +667,7 @@ end
             r ~ varying_effect(g, [1, x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     # refused: name collides with construct-minted name `z_flat_g` (reserved)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -675,7 +675,7 @@ end
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
             z_flat_g ~ Normal(0, 1)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     # The derived draws are claimed too (constrain-output key).
     # refused: name collides with construct-minted derived draws `b_g` (reserved)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -684,14 +684,14 @@ end
             r ~ varying_effect(g, [1, x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     # Name tables: a hand-built parameter under a correlated name fails.
     clash = lower_rkppl(quote
             a ~ Normal(0, 1)
             r ~ varying_effect(g, [1, x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     push!(clash.parameters, SampledParameter(:tau_g, :normal,
         (arg1 = 0, arg2 = 1), nothing, :tau_g))
     # refused: hand-built parameter under minted name `tau_g` (name-table IR contract)
@@ -786,7 +786,7 @@ end
             r ~ varying_effect(g, [1, x])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     bound = bind_data(plan, cols)
     layout = assign_layout(bound)
     # `a` rides the intercept coefficient; sampled = [sigma, draws triple].
@@ -835,7 +835,7 @@ end
                 r ~ varying_effect(g, $margins; eta = 1.0)
                 mu = a .+ r
                 y .~ Normal.(mu, b_flat_g)
-            end, (:y, :x, :g))
+            end, (:y, :x, :g); conditioned = (:y, :x, :g))
         layout = assign_layout(bind_data(plan, cols))
         u = collect(range(-0.5, 0.5; length = layout.total))
         nt = constrain(layout, u)
@@ -896,7 +896,7 @@ end
                 r ~ varying_effect(g, [1, x]; eta = $eta)
                 mu = a .+ r
                 y .~ Normal.(mu, sigma)
-            end, (:y, :x, :g))
+            end, (:y, :x, :g); conditioned = (:y, :x, :g))
         bound = bind_data(plan, cols)
         built = build_kernel(bound)
         u = collect(range(-0.4, 0.4; length = built.layout.total))
@@ -931,7 +931,7 @@ end
             r ~ varying_effect(g, [1, x1, x2])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x1, :x2, :g))
+        end, (:y, :x1, :x2, :g); conditioned = (:y, :x1, :x2, :g))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     # coef + sigma + 3 thetas + 3 tau + 3*3 z cells.
@@ -970,7 +970,7 @@ end
             r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     # coef + sigma + 0 thetas + 1 tau + 2 z cells.
@@ -1010,7 +1010,7 @@ end
             mu2 = a2 .+ r2
             y1 .~ Normal.(mu1, s)
             y2 .~ Normal.(mu2, s)
-        end, (:y1, :y2, :x, :g))
+        end, (:y1, :y2, :x, :g); conditioned = (:y1, :y2, :x, :g))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     @test [e.kind for e in built.layout.entries] ==
@@ -1055,7 +1055,7 @@ end
             r ~ varying_effect(g, [w])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :z, :g))
+        end, (:y, :x, :z, :g); conditioned = (:y, :x, :z, :g))
     db = only(dplan.varying_draws)
     @test db.kind === :correlated
     @test only(db.margins).z == VaryingZRecipe(:column, :w, nothing)
@@ -1069,7 +1069,7 @@ end
             mu = a .+ r
             y .~ Normal.(mu, sigma)
             w = x .* z
-        end, (:y, :x, :z, :g))
+        end, (:y, :x, :z, :g); conditioned = (:y, :x, :z, :g))
     @test only(only(fwd.varying_draws).margins).z ==
         VaryingZRecipe(:column, :w, nothing)
     # Emitter-baked twin: `w` arrives as a raw column (option-A shape).
@@ -1079,7 +1079,7 @@ end
             r ~ varying_effect(g, [w])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :w, :g))
+        end, (:y, :w, :g); conditioned = (:y, :w, :g))
     dbound = bind_data(dplan, Dict{Symbol,AbstractVector}(:y => yv, :x => xv,
         :z => zv, :g => gv))
     tbound = bind_data(tplan, Dict{Symbol,AbstractVector}(:y => yv, :w => wv,
@@ -1106,7 +1106,7 @@ end
             r ~ varying_effect(g, [1, w])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :z, :g))
+        end, (:y, :x, :z, :g); conditioned = (:y, :x, :z, :g))
     db = only(dplan.varying_draws)
     @test db.kind === :correlated
     @test [m.z.kind for m in db.margins] == [:ones, :column]
@@ -1117,7 +1117,7 @@ end
             r ~ varying_effect(g, [1, w])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :w, :g))
+        end, (:y, :w, :g); conditioned = (:y, :w, :g))
     dbound = bind_data(dplan, Dict{Symbol,AbstractVector}(:y => yv, :x => xv,
         :z => zv, :g => gv))
     tbound = bind_data(tplan, Dict{Symbol,AbstractVector}(:y => yv, :w => wv,
@@ -1144,7 +1144,7 @@ end
             r ~ varying_effect(g, [m])
             mu = a .+ r
             y .~ Normal.(mu, m)
-        end, (:y, :x, :g)); true)
+        end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
     # Inline expressions bind via an assignment first.
     # capability: inline expression margin (`[x .* z]` without a binding) (todo `1308iv0`)
     @test_broken (lower_rkppl(quote
@@ -1152,7 +1152,7 @@ end
             r ~ varying_effect(g, [x .* z])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :z, :g)); true)
+        end, (:y, :x, :z, :g); conditioned = (:y, :x, :z, :g)); true)
     # A predictor location inlines and emits no Z column.
     # refused: cyclic definition (margin `mu` depends on `r`, which depends on `mu`)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -1160,7 +1160,7 @@ end
             r ~ varying_effect(g, [mu])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     # Sampled parameters are not Z columns.
     # capability: parameter-valued margin column (Z = sampled `a`; P8/P10a) (todo `1308iv0`)
     @test_broken (lower_rkppl(quote
@@ -1168,7 +1168,7 @@ end
             r ~ varying_effect(g, [a])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g)); true)
+        end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
     # Predictor structure absorbed into the LP emits no column either.
     # capability: parameter-dependent derived margin (`w = b .* x`) (todo `1308iv0`)
     @test_broken (lower_rkppl(quote
@@ -1179,7 +1179,7 @@ end
             r ~ varying_effect(g, [w])
             mu = a .+ w .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g)); true)
+        end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
     # `dummy` needs a raw column (level membership needs bound values).
     # capability: grouping/dummy coding over a derived data value (ordinary function composition, P8 1cmodra) (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote
@@ -1188,7 +1188,7 @@ end
             r ~ varying_effect(g, [dummy(w, 1)])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :z, :g)); true)
+        end, (:y, :x, :z, :g); conditioned = (:y, :x, :z, :g)); true)
     # Grouping columns stay raw.
     # capability: grouping/dummy coding over a derived data value (ordinary function composition, P8 1cmodra) (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote
@@ -1197,7 +1197,7 @@ end
             r ~ varying_effect(w, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :z, :g)); true)
+        end, (:y, :x, :z, :g); conditioned = (:y, :x, :z, :g)); true)
 end
 
 @testset "varying correlated restore_draws" begin
@@ -1208,7 +1208,7 @@ end
             r ~ varying_effect(g, [1, x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     layout = assign_layout(bind_data(plan, cols))
     U = hcat(collect(range(-0.4, 0.4; length = layout.total)),
         collect(range(0.4, -0.4; length = layout.total)))
@@ -1281,7 +1281,7 @@ end
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     # `nothing` fills sort-ordered observed levels (SB numbering for
     # plain vectors).
     bound = bind_data(mkplan(), cols)
@@ -1310,7 +1310,7 @@ end
             rB ~ varying_slice(dB, 1)
             mu = a .+ rA .+ rB
             y .~ Normal.(mu, 1.5)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     agree = bind_data(_tv_with_levels(_tv_with_levels(two, [2, 1, 3], 1),
         [2, 1, 3], 2), cols)
     @test agree.varying_draws[1].levels == agree.varying_draws[2].levels
@@ -1322,7 +1322,7 @@ end
             rB ~ varying_slice(dB, 1)
             mu = a .+ rA .+ rB
             y .~ Normal.(mu, 1.5)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     _tv_with_levels(_tv_with_levels(disagree, [2, 1, 3], 1), [1, 2, 3], 2)
     # refused: draws sharing one IR group-index map must use the same ordered levels (IR contract)
     @test_throws ContractValidationError bind_data(disagree, cols)
@@ -1338,7 +1338,7 @@ function _tv_levels_plan(lv)
     return lower_rkppl(Expr(:block,
             Expr(:call, :~, :r, call), :(a ~ Normal(0, 1)),
             :(mu = a .+ r), :(y .~ Normal.(mu, 1.5))),
-        (:y, :g))
+        (:y, :g); conditioned = (:y, :g))
 end
 _tv_levels_vals(vals::Vector) =
     _tv_levels_plan(Expr(:vect, (_tv_levels_lit(v) for v in vals)...))
@@ -1356,7 +1356,7 @@ _tv_levels_vals(vals::Vector) =
             r ~ varying_effect(g, [1, x]; eta = 2.0, levels = [:c, :a])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     b = only(combo.varying_draws)
     @test b.levels == [:c, :a] && b.lkj_eta == 2.0
     bare = lower_rkppl(quote
@@ -1364,7 +1364,7 @@ _tv_levels_vals(vals::Vector) =
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     @test only(bare.varying_draws).levels === nothing
 end
 
@@ -1401,7 +1401,7 @@ end
             r ~ varying_effect(g, [1]; foo = 1)
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     # The two guidance messages are pinned: literal-vector requirement and
     # the bare-name quote-it fix.
     err = try
@@ -1435,7 +1435,7 @@ end
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     bound = bind_data(_tv_with_levels(plan, levels),
         Dict{Symbol,AbstractVector}(:g => g, :y => y))
     built = build_kernel(bound)
@@ -1464,7 +1464,7 @@ end
             r ~ varying_effect(g, [1, x])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     bound = bind_data(_tv_with_levels(plan, levels),
         Dict{Symbol,AbstractVector}(:g => gv, :x => xv, :y => yv))
     built = build_kernel(bound)
@@ -1497,7 +1497,7 @@ end
             r ~ varying_effect(g, [1]; levels = ["c", "a", "b", "d"])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     # Surface text carries declared levels into the draws (the P2 channel).
     @test only(plan.varying_draws).levels == levels
     bound = bind_data(plan, Dict{Symbol,AbstractVector}(:g => g, :y => y))
@@ -1528,7 +1528,7 @@ end
             r ~ varying_effect(g, [1, x]; levels = ["c", "b", "a", "d"])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     @test only(plan.varying_draws).levels == levels
     bound = bind_data(plan,
         Dict{Symbol,AbstractVector}(:g => gv, :x => xv, :y => yv))
@@ -1588,7 +1588,7 @@ end
                 r ~ varying_effect(g, [$m])
                 mu = a .+ r
                 y .~ Normal.(mu, 1.5)
-            end, (:y, :x, :g))
+            end, (:y, :x, :g); conditioned = (:y, :x, :g))
         d = only(k1.varying_draws)
         k1.varying_draws[1] = VaryingDraws(d.group, d.kind,
             d.margins, d.lkj_eta, d.label, d.suffix, d.levels,
@@ -1609,7 +1609,7 @@ end
                 r ~ varying_effect(g, [1, x]; eta = 2.0)
                 mu = a .+ r
                 y .~ Normal.(mu, sigma)
-            end, (:y, :x, :g))
+            end, (:y, :x, :g); conditioned = (:y, :x, :g))
         bound = bind_data(_tv_with_sd(plan, sd), cols)
         def = kernel_expr(bound, assign_layout(bound))
         strs = [repr(st) for st in def.args[2].args]
@@ -1648,7 +1648,7 @@ end
             r ~ varying_effect(g, [1, x]; eta = 2.0)
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     sd = [VaryingSdPrior(:exponential, 1 / 3),
         VaryingSdPrior(:normal, 2.0)]
     bound = bind_data(_tv_with_sd(plan, sd), cols)
@@ -1670,7 +1670,7 @@ end
             r ~ varying_effect(g, [1, x]; eta = 2.0)
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     # SB `sd ~ Exponential(0.3333)`: rate 3.0 inverts to scale θ = 1/3.
     sd = [VaryingSdPrior(:exponential, 1 / 3),
         VaryingSdPrior(:exponential, 1 / 3)]
@@ -1709,7 +1709,7 @@ end
             r ~ varying_effect(g, [1, x]; eta = 2.0)
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     sd = [VaryingSdPrior(:exponential, 0.5),
         VaryingSdPrior(:normal, 2.0)]
     bound = bind_data(_tv_with_sd(plan, sd), cols)
@@ -1744,7 +1744,7 @@ end
             r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     # K=1 takes sd priors like any other K.
     bound = bind_data(
         _tv_with_sd(plan, [VaryingSdPrior(:exponential, 1.0)]), cols)
@@ -1771,7 +1771,7 @@ end
             r ~ varying_effect(g, [1]; sd = Cauchy(0, 5))
             eta = mu .+ r
             y .~ Normal.(eta, sigma)
-        end, (:y, :sigma, :g))
+        end, (:y, :sigma, :g); conditioned = (:y, :sigma, :g))
     d1 = only(k1.varying_draws)
     @test d1.kind === :correlated
     @test d1.sd_priors == [VaryingSdPrior(:cauchy, 5.0)]
@@ -1781,7 +1781,7 @@ end
             r ~ varying_effect(g, [1, x]; eta = 2.0, sd = Normal(0, 2))
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     d2 = only(k2.varying_draws)
     @test d2.sd_priors ==
         [VaryingSdPrior(:normal, 2.0), VaryingSdPrior(:normal, 2.0)]
@@ -1791,7 +1791,7 @@ end
             r ~ varying_effect(g, [x]; sd = Exponential(0.5))
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     de = only(ke.varying_draws)
     @test de.sd_priors == [VaryingSdPrior(:exponential, 0.5)]
     # The default spelled out is the empty all-default vector.
@@ -1801,7 +1801,7 @@ end
             r ~ varying_effect(g, [1, x]; sd = Normal(0, 1.0))
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g); conditioned = (:y, :x, :g))
     @test only(kd.varying_draws).sd_priors == VaryingSdPrior[]
 end
 
@@ -1830,7 +1830,7 @@ end
                     :(eta = mu .+ r),
                     Expr(:call, :.~, :y,
                         Expr(:., :Normal, Expr(:tuple, :eta, :sigma)))),
-                (:y, :sigma, :g, :x))
+                (:y, :sigma, :g, :x); conditioned = (:y, :sigma, :g, :x))
             nothing
         catch e
             e
@@ -1887,7 +1887,7 @@ end
 
 @testset "varying cauchy sd e2e values and gradient" begin
     cols = _tvsd_nc_cols()
-    plan = lower_rkppl(_TVSD_NC, (:y, :sigma, :g))
+    plan = lower_rkppl(_TVSD_NC, (:y, :sigma, :g); conditioned = (:y, :sigma, :g))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     # mu + tau + 8 innovations (K=1 LKJ carries no coordinates).
@@ -1914,7 +1914,7 @@ end
     # Vector-mu Normal-id: default pipeline (narrowed §7n scope —
     # scalar-mu only).
     cols = _tvsd_nc_cols()
-    plan = lower_rkppl(_TVSD_NC, (:y, :sigma, :g))
+    plan = lower_rkppl(_TVSD_NC, (:y, :sigma, :g); conditioned = (:y, :sigma, :g))
     bound = bind_data(plan, cols)
     fx = _tvsd_reactant(bound)
     @test fx.primal ≈ fx.native rtol = 1e-9

@@ -184,7 +184,7 @@ _unexp(responses, predictors, priors, params = SampledParameter[],
     end
     @test m isa RKPPLModel
     cols, _ = _gen_columns()
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     @test isbound(bound)
     @test bound.roles == Dict(:y => :response, :x => :predictor)
     built = build_kernel(bound)
@@ -204,7 +204,7 @@ end
     end
     cols, _ = _gen_columns()
     y = repeat([false, true], 3)
-    bound = m(; y = y, x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = y))
     built = build_kernel(bound)
     u = [0.25, 0.5]
     nt = constrain(built.layout, u)
@@ -222,7 +222,7 @@ end
     end
     cols, _ = _gen_columns()
     cols[:y] = [0, 1, 2, 1, 3, 2]
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     u = [0.1, -0.2]
     nt = constrain(built.layout, u)
@@ -244,7 +244,7 @@ end
     cols, _ = _gen_columns()
     cols[:y] = [1, 0, 2, 1, 3, 2]
     cols[:n] = [3, 2, 4, 3, 5, 4]
-    bound = m(; y = cols[:y], x = cols[:x], n = cols[:n])
+    bound = (m(; x = cols[:x], n = cols[:n]) | (; y = cols[:y]))
     built = build_kernel(bound)
     u = [0.25, 0.5]
     nt = constrain(built.layout, u)
@@ -262,7 +262,7 @@ end
         mu = a .+ b .* x
         y .~ Binomial.(5, logistic.(mu))
     end
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     nt = constrain(built.layout, u)
     eta = nt.a .+ nt.b .* cols[:x]
@@ -279,7 +279,7 @@ end
         y .~ NegativeBinomial2.(exp.(eta), phi)
     end
     cols[:y] = [0, 1, 2, 1, 3, 2]
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     u3 = [0.1, -0.2, 0.3]
     nt = constrain(built.layout, u3)
@@ -300,7 +300,7 @@ end
         y .~ Gamma.(alpha, exp.(eta) ./ alpha)
     end
     cols[:y] = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     nt = constrain(built.layout, u3)
     mu = exp.(nt.a .+ nt.b .* cols[:x])
@@ -321,7 +321,7 @@ end
         y .~ Bernoulli.(normcdf.(eta))
     end
     yb = repeat([false, true], 3)
-    bound = m(; y = yb, x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = yb))
     built = build_kernel(bound)
     u = [0.25, 0.5]
     nt = constrain(built.layout, u)
@@ -337,7 +337,7 @@ end
         eta = a .+ b .* x
         y .~ Bernoulli.(cexpexp.(eta))
     end
-    bound = m(; y = yb, x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = yb))
     built = build_kernel(bound)
     nt = constrain(built.layout, u)
     eta = nt.a .+ nt.b .* cols[:x]
@@ -354,7 +354,7 @@ end
     end
     cols[:y] = [1, 0, 2, 1, 3, 2]
     cols[:n] = [3, 2, 4, 3, 5, 4]
-    bound = m(; y = cols[:y], x = cols[:x], n = cols[:n])
+    bound = (m(; x = cols[:x], n = cols[:n]) | (; y = cols[:y]))
     built = build_kernel(bound)
     nt = constrain(built.layout, u)
     eta = nt.a .+ nt.b .* cols[:x]
@@ -369,7 +369,7 @@ end
         mu = a .+ b .* x
         y .~ Binomial.(5, cexpexp.(mu))
     end
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     nt = constrain(built.layout, u)
     eta = nt.a .+ nt.b .* cols[:x]
@@ -385,7 +385,7 @@ end
         p .~ Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)
     end
     cols[:p] = [0.2, 0.7, 0.4, 0.6, 0.3, 0.8]
-    bound = m(; p = cols[:p], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; p = cols[:p]))
     built = build_kernel(bound)
     u3 = [0.1, -0.2, 0.3]
     nt = constrain(built.layout, u3)
@@ -417,10 +417,10 @@ end
         nu ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         y .~ StudentT.(nu, mu, sigma)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.link, r.scale, r.nu) ===
         (StudentTFam, IdentityLink, :sigma, :nu)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     @test isbound(bound)
     built = build_kernel(bound)
     u4 = [0.1, -0.2, 0.3, 0.5]
@@ -440,9 +440,9 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ StudentT.(4.0, mu, 2.0)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.scale, r.nu) === (StudentTFam, 2.0, 4.0)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     u = [0.1, -0.2]
     nt = constrain(built.layout, u)
@@ -461,18 +461,18 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ StudentT.(mu, 2.0)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # refused: malformed distribution: wrong arity for the head
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ StudentT.(4.0, mu, 2.0, 1.0)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The kernel-endpoint spelling redirects to the response head.
     # refused: student_t kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ student_t.(4.0, mu, 2.0)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # nu takes no expressions (bind via an assignment first).
     # capability: expression argument in StudentT nu slot (P8 admits expression args) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(quote
@@ -480,7 +480,7 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ StudentT.(2.0 + 2.0, mu, 2.0)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # Predictor-fed nu is admitted (the modeled-nu vscale shape): bare
     # for identity, `exp.`/`logistic.` for log/logit.
     let r = only(lower_rkppl(quote
@@ -491,7 +491,7 @@ end
             mu = a .+ b .* x
             nupred = c .+ d .* x
             y .~ StudentT.(nupred, mu, 2.0)
-        end, Dn2).responses)
+        end, Dn2; conditioned = Dn2).responses)
         @test r.nu == ScalePredictorRef(:nupred, IdentityLink)
     end
     let r = only(lower_rkppl(quote
@@ -502,7 +502,7 @@ end
             mu = a .+ b .* x
             nupred = c .+ d .* x
             y .~ StudentT.(exp.(nupred), mu, 2.0)
-        end, Dn2).responses)
+        end, Dn2; conditioned = Dn2).responses)
         @test r.nu == ScalePredictorRef(:nupred, LogLink)
     end
     let r = only(lower_rkppl(quote
@@ -513,7 +513,7 @@ end
             mu = a .+ b .* x
             nupred = c .+ d .* x
             y .~ StudentT.(logistic.(nupred), mu, 2.0)
-        end, Dn2).responses)
+        end, Dn2; conditioned = Dn2).responses)
         @test r.nu == ScalePredictorRef(:nupred, LogitLink)
     end
 end
@@ -540,10 +540,10 @@ _hurdle_logpdf(y::Integer, lam::Real, p0::Real) =
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ HurdlePoisson.(exp.(eta), 0.35)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.link, r.predictor, r.scale) ===
         (HurdlePoissonFam, LogLink, :eta, 0.35)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     @test isbound(bound)
     built = build_kernel(bound)
     u = [0.5, -0.25]
@@ -571,10 +571,10 @@ _hurdle_logpdf(y::Integer, lam::Real, p0::Real) =
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test r.family === HurdlePoissonFam
     @test r.scale == ScalePredictorRef(:hu, LogitLink)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     u4 = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u4)
@@ -594,18 +594,18 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ HurdlePoisson.(exp.(eta))
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # refused: malformed distribution: wrong arity for the head
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ HurdlePoisson.(exp.(eta), 0.35, 1.0)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The kernel-endpoint spelling redirects to the response head.
     # refused: hurdle_poisson kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ hurdle_poisson.(exp.(eta), 0.35)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The lambda position needs its `exp.` link wrapper (NB2 precedent).
     # capability: identity-link (bare predictor) HurdlePoisson rate (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -613,7 +613,7 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ HurdlePoisson.(eta, 0.35)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # A non-logit p_zero predictor fails at the contract gate.
     # capability: log-link (exp.) predictor for HurdlePoisson p_zero (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -624,7 +624,7 @@ end
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ HurdlePoisson.(exp.(eta), exp.(hu))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # capability: identity-link (bare) predictor for HurdlePoisson p_zero (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -634,7 +634,7 @@ end
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ HurdlePoisson.(exp.(eta), hu)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
 end
 
 @testset "surface roundtrip nb1 end to end" begin
@@ -653,10 +653,10 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ NegativeBinomial.(exp.(eta), 0.4)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.link, r.predictor, r.scale) ===
         (NegativeBinomialFam, LogLink, :eta, 0.4)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     @test isbound(bound)
     built = build_kernel(bound)
     u = [0.5, -0.25]
@@ -681,9 +681,9 @@ end
         p ~ Beta(2.0, 2.0)
         eta = a .+ b .* x
         y .~ NegativeBinomial.(exp.(eta), p)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.scale) === (NegativeBinomialFam, :p)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 0.3]
     nt = constrain(built.layout, u3)
@@ -707,18 +707,18 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ NegativeBinomial.(exp.(eta))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # refused: malformed distribution: no such Distributions.jl method (wrong arity)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ NegativeBinomial.(exp.(eta), 0.4, 1.0)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The kernel-endpoint spelling redirects to the response head.
     # refused: negative_binomial kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ negative_binomial.(exp.(eta), 0.4)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The r position needs its `exp.` link wrapper (NB2 precedent).
     # capability: identity-link (bare) NegativeBinomial r (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -726,7 +726,7 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ NegativeBinomial.(eta, 0.4)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # NB1 p predictors are logit-only (a success probability, the
     # hurdle precedent): bare and log-link spellings fail closed.
     # capability: identity-link (bare) NB1 p predictor (todo `05fuzch`)
@@ -738,7 +738,7 @@ end
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ NegativeBinomial.(exp.(eta), hu)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # capability: log-link (exp.) NB1 p predictor (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -748,7 +748,7 @@ end
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ NegativeBinomial.(exp.(eta), exp.(hu))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
 end
 
 @testset "nb1 modeled-p surface admission" begin
@@ -760,7 +760,7 @@ end
             eta = a .+ b .* x
             hu = c .+ d .* z
             y .~ NegativeBinomial.(exp.(eta), logistic.(hu))
-        end, (:y, :x, :z))
+        end, (:y, :x, :z); conditioned = (:y, :x, :z))
     r = only(plan.responses)
     @test r.family === NegativeBinomialFam
     @test r.link === LogLink
@@ -789,10 +789,10 @@ end
         zi ~ Beta(2.0, 2.0)
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), zi)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.link, r.scale, r.trials, r.zi) ===
         (ZeroInflatedPoissonFam, LogLink, nothing, nothing, :zi)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     @test isbound(bound)
     built = build_kernel(bound)
     u3 = [0.1, -0.2, 0.3]
@@ -813,9 +813,9 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), 0.25)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.zi) === (ZeroInflatedPoissonFam, 0.25)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     u = [0.1, -0.2]
     nt = constrain(built.layout, u)
@@ -837,18 +837,18 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta))
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # refused: malformed distribution: wrong arity for the head
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), 0.2, 0.3)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The kernel-endpoint spelling redirects to the response head.
     # refused: zero_inflated_poisson kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ zero_inflated_poisson.(exp.(eta), 0.2)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The rate position needs its `exp` link wrapper.
     # capability: identity-link (bare) ZeroInflatedPoisson rate (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -856,7 +856,7 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(eta, 0.2)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # zi takes no expressions (bind via an assignment first).
     # capability: expression argument in zi slot (P8) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(quote
@@ -864,7 +864,7 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), 0.1 + 0.1)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # zi link wrappers broadcast over a predictor definition —
     # undotted wrappers fail closed (admission shapes live in
     # test_zip.jl).
@@ -873,7 +873,7 @@ end
         eta = a .+ b .* x
         zipred = c .+ d .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), logistic(zipred))
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # A zi wrapper over anything but a predictor definition fails
     # closed, as does a non-link wrapper.
     # capability: link-wrapped literal zi (logistic.(0.25)) - expression arg (P8) (todo `05fuzch`)
@@ -882,14 +882,14 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), logistic.(0.25))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # capability: data-derived zi (logistic.(x)) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), logistic.(x))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # capability: arbitrary non-link wrapper on zi predictor (sqrt.) (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -899,13 +899,13 @@ end
         eta = a .+ b .* x
         zipred = c .+ d .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), sqrt.(zipred))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # An unbracketed head names the broadcast fix.
     # refused: undotted ZeroInflatedPoisson over a vector argument is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson(exp.(eta), 0.2)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
 end
 
 @testset "zib response failures" begin
@@ -916,20 +916,20 @@ end
         p ~ Beta(1.0, 1.0)
         zi ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, p)
-    end, Ds)
+    end, Ds; conditioned = Ds)
     # refused: malformed distribution: wrong arity for the head
     @test_throws SurfaceLoweringError lower_rkppl(quote
         p ~ Beta(1.0, 1.0)
         zi ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, p, zi, 0.1)
-    end, Ds)
+    end, Ds; conditioned = Ds)
     # The kernel-endpoint spelling redirects to the response head.
     # refused: zero_inflated_binomial kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         p ~ Beta(1.0, 1.0)
         zi ~ Beta(1.0, 1.0)
         s .~ zero_inflated_binomial.(3, p, zi)
-    end, Ds)
+    end, Ds; conditioned = Ds)
     # v1 is prob-space only: link-wrapped probabilities fail closed.
     # capability: link-wrapped (logistic.) ZIB probability (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -939,21 +939,21 @@ end
         zi ~ Beta(1.0, 1.0)
         eta = a .+ b .* x
         s .~ ZeroInflatedBinomial.(3, logistic.(eta), zi)
-    end, (:s, :x)); true)
+    end, (:s, :x); conditioned = (:s, :x)); true)
     # Literal probabilities stay rejected (a fully fixed ZIB
     # contributes a constant).
     # capability: literal probability in ZeroInflatedBinomial (todo `1qlbn5b`)
     @test_broken (lower_rkppl(quote
         zi ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, 0.5, zi)
-    end, Ds); true)
+    end, Ds; conditioned = Ds); true)
     # An unbracketed head names the broadcast fix.
     # refused: undotted ZeroInflatedBinomial head over per-obs args (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         p ~ Beta(1.0, 1.0)
         zi ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial(3, p, zi)
-    end, Ds)
+    end, Ds; conditioned = Ds)
 end
 
 # Inverse-Gaussian scalar log-density (Distributions.jl oracle; SB
@@ -975,10 +975,10 @@ _ig_logpdf(y::Real, mu::Real, lam::Real) = logpdf(InverseGaussian(mu, lam), y)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta), 1.5)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.link, r.predictor, r.scale) ===
         (InverseGaussianFam, LogLink, :eta, 1.5)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     @test isbound(bound)
     built = build_kernel(bound)
     u = [0.5, -0.25]
@@ -1002,7 +1002,7 @@ _ig_logpdf(y::Real, mu::Real, lam::Real) = logpdf(InverseGaussian(mu, lam), y)
         lam ~ LogNormal(-0.3, 1.0)
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta), lam)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.scale) === (InverseGaussianFam, :lam)
     @test only(p for p in lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -1010,8 +1010,8 @@ _ig_logpdf(y::Real, mu::Real, lam::Real) = logpdf(InverseGaussian(mu, lam), y)
         lam ~ LogNormal(-0.3, 1.0)
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta), lam)
-    end, (:y, :x)).parameters if p.name === :lam).family === :lognormal
-    bound = m(; y = cols[:y], x = cols[:x])
+    end, (:y, :x); conditioned = (:y, :x)).parameters if p.name === :lam).family === :lognormal
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u3)
@@ -1042,10 +1042,10 @@ _weibull_logpdf(y::Real, k::Real, th::Real) = logpdf(Weibull(k, th), y)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Weibull.(2.0, exp.(eta))
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.link, r.predictor, r.scale) ===
         (WeibullFam, LogLink, :eta, 2.0)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     @test isbound(bound)
     built = build_kernel(bound)
     u = [0.5, -0.25]
@@ -1069,7 +1069,7 @@ _weibull_logpdf(y::Real, k::Real, th::Real) = logpdf(Weibull(k, th), y)
         k ~ LogNormal(0.0, 0.3)
         eta = a .+ b .* x
         y .~ Weibull.(k, exp.(eta))
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.scale) === (WeibullFam, :k)
     @test only(p for p in lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -1077,8 +1077,8 @@ _weibull_logpdf(y::Real, k::Real, th::Real) = logpdf(Weibull(k, th), y)
         k ~ LogNormal(0.0, 0.3)
         eta = a .+ b .* x
         y .~ Weibull.(k, exp.(eta))
-    end, (:y, :x)).parameters if p.name === :k).family === :lognormal
-    bound = m(; y = cols[:y], x = cols[:x])
+    end, (:y, :x); conditioned = (:y, :x)).parameters if p.name === :k).family === :lognormal
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u3)
@@ -1112,10 +1112,10 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
-    end, (:c, :x, :n)).responses)
+    end, (:c, :x, :n); conditioned = (:c, :x, :n)).responses)
     @test (r.family, r.link, r.predictor, r.scale, r.trials) ===
         (BetaBinomial2Fam, LogitLink, :mu, 4.0, :n)
-    bound = m(; c = cols[:c], x = cols[:x], n = cols[:n])
+    bound = (m(; x = cols[:x], n = cols[:n]) | (; c = cols[:c]))
     @test isbound(bound)
     built = build_kernel(bound)
     u = [0.5, -0.25]
@@ -1140,9 +1140,9 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
         phi ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, logistic.(mu), phi)
-    end, (:c, :x, :n)).responses)
+    end, (:c, :x, :n); conditioned = (:c, :x, :n)).responses)
     @test (r.family, r.scale, r.trials) === (BetaBinomial2Fam, :phi, :n)
-    bound = m(; c = cols[:c], x = cols[:x], n = cols[:n])
+    bound = (m(; x = cols[:x], n = cols[:n]) | (; c = cols[:c]))
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 1.0]
     nt = constrain(built.layout, u3)
@@ -1172,10 +1172,10 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
         mu = a .+ b .* x
         hup = e .+ f .* x
         c .~ BetaBinomial2.(n, logistic.(mu), exp.(hup))
-    end, (:c, :x, :n)).responses)
+    end, (:c, :x, :n); conditioned = (:c, :x, :n)).responses)
     @test (r.family, r.trials) === (BetaBinomial2Fam, :n)
     @test r.scale == ScalePredictorRef(:hup, LogLink)
-    bound = m(; c = cols[:c], x = cols[:x], n = cols[:n])
+    bound = (m(; x = cols[:x], n = cols[:n]) | (; c = cols[:c]))
     built = build_kernel(bound)
     u4 = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u4)
@@ -1214,10 +1214,10 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ VonMises.(mu, 1.7)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.link, r.predictor, r.scale, r.interval) ===
         (VonMisesFam, IdentityLink, :mu, 1.7, nothing)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     @test isbound(bound)
     built = build_kernel(bound)
     u = [0.5, -0.25]
@@ -1241,7 +1241,7 @@ end
         kappa ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         y .~ CircularVonMises.(mu, kappa, -pi, pi)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.scale, r.interval) ===
         (VonMisesFam, :kappa, (-Float64(pi), Float64(pi)))
     @test only(p for p in lower_rkppl(quote
@@ -1250,8 +1250,8 @@ end
         kappa ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         y .~ CircularVonMises.(mu, kappa, -pi, pi)
-    end, (:y, :x)).parameters if p.name === :kappa).family === :gamma
-    bound = m(; y = cols[:y], x = cols[:x])
+    end, (:y, :x); conditioned = (:y, :x)).parameters if p.name === :kappa).family === :gamma
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 1.0]
     nt = constrain(built.layout, u3)
@@ -1272,7 +1272,7 @@ end
         mu = a .+ b .* x
         lk = c .+ d .* x
         y .~ VonMises.(mu, exp.(lk))
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test r.scale == ScalePredictorRef(:lk, LogLink)
 end
 
@@ -1290,12 +1290,12 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Exponential.(exp.(eta))
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.link, r.predictor, r.scale) ===
         (ExponentialLogFam, LogLink, :eta, nothing)
     @test r.weights === nothing
     @test r.evidence.kind === :none
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     @test isbound(bound)
     built = build_kernel(bound)
     u = [0.5, -0.25]
@@ -1326,10 +1326,10 @@ _ln_logpdf(y::Real, mu::Real, sig::Real) = logpdf(LogNormal(mu, sig), y)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ LogNormal.(mu, 0.5)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.link, r.predictor, r.scale) ===
         (LogNormalFam, IdentityLink, :mu, 0.5)
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     @test isbound(bound)
     built = build_kernel(bound)
     u = [0.5, -0.25]
@@ -1353,7 +1353,7 @@ _ln_logpdf(y::Real, mu::Real, sig::Real) = logpdf(LogNormal(mu, sig), y)
         sigma ~ Exponential(1)
         mu = a .+ b .* x
         y .~ LogNormal.(mu, sigma)
-    end, (:y, :x)).responses)
+    end, (:y, :x); conditioned = (:y, :x)).responses)
     @test (r.family, r.scale) === (LogNormalFam, :sigma)
     @test only(p for p in lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -1361,8 +1361,8 @@ _ln_logpdf(y::Real, mu::Real, sig::Real) = logpdf(LogNormal(mu, sig), y)
         sigma ~ Exponential(1)
         mu = a .+ b .* x
         y .~ LogNormal.(mu, sigma)
-    end, (:y, :x)).parameters if p.name === :sigma).family === :exponential
-    bound = m(; y = cols[:y], x = cols[:x])
+    end, (:y, :x); conditioned = (:y, :x)).parameters if p.name === :sigma).family === :exponential
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u3)
@@ -1384,18 +1384,18 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # refused: malformed distribution: no such Distributions.jl method (wrong arity)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta), 1.5, 1.0)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The kernel-endpoint spelling redirects to the response head.
     # refused: inverse_gaussian kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ inverse_gaussian.(exp.(eta), 1.5)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The mu position needs its `exp.` link wrapper (NB2 precedent).
     # capability: identity-link (bare) InverseGaussian mean (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -1403,7 +1403,7 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ InverseGaussian.(eta, 1.5)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # A non-log lambda predictor fails at the contract gate (log-only).
     # capability: identity-link (bare) InverseGaussian lambda predictor (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -1414,7 +1414,7 @@ end
         eta = a .+ b .* x
         ls = c .+ d .* x
         y .~ InverseGaussian.(exp.(eta), ls)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # capability: logit-link InverseGaussian lambda predictor (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -1424,7 +1424,7 @@ end
         eta = a .+ b .* x
         ls = c .+ d .* x
         y .~ InverseGaussian.(exp.(eta), logistic.(ls))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
 end
 
 @testset "weibull response failures" begin
@@ -1436,18 +1436,18 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Weibull.(2.0)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # refused: malformed distribution: no such Distributions.jl method (wrong arity)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ Weibull.(2.0, exp.(eta), 1.0)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The kernel-endpoint spelling redirects to the response head.
     # refused: weibull kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ weibull.(2.0, exp.(eta))
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The scale position needs its `exp.` link wrapper (the Binomial
     # link-fed-second precedent).
     # capability: identity-link (bare) Weibull scale (todo `05fuzch`)
@@ -1456,7 +1456,7 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Weibull.(2.0, eta)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # A modeled-k predictor fails at the contract gate (deferred).
     # capability: modeled Weibull shape-k predictor (exp.) (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -1467,7 +1467,7 @@ end
         eta = a .+ b .* x
         ls = c .+ d .* x
         y .~ Weibull.(exp.(ls), exp.(eta))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # capability: modeled Weibull shape-k predictor (identity) (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -1477,7 +1477,7 @@ end
         eta = a .+ b .* x
         ls = c .+ d .* x
         y .~ Weibull.(ls, exp.(eta))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
 end
 
 @testset "betabinomial2 response failures" begin
@@ -1487,18 +1487,18 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         c .~ BetaBinomial2.(logistic.(mu), 4.0)
-    end, Dn3)
+    end, Dn3; conditioned = Dn3)
     # refused: malformed distribution: wrong arity for the head
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, logistic.(mu), 4.0, 1.0)
-    end, Dn3)
+    end, Dn3; conditioned = Dn3)
     # The kernel-endpoint spelling redirects to the response head.
     # refused: beta_binomial2 kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         c .~ beta_binomial2.(n, logistic.(mu), 4.0)
-    end, Dn3)
+    end, Dn3; conditioned = Dn3)
     # The mean position needs its `logistic.` link wrapper (Beta precedent).
     # capability: identity-link (bare) BetaBinomial2 mean (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -1506,25 +1506,25 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, mu, 4.0)
-    end, Dn3); true)
+    end, Dn3; conditioned = Dn3); true)
     # capability: log-link (exp.) BetaBinomial2 mean (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, exp.(mu), 4.0)
-    end, Dn3); true)
+    end, Dn3; conditioned = Dn3); true)
     # Trials are an Int column or Int literal (Binomial rule).
     # refused: non-integer trials (2.5)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         c .~ BetaBinomial2.(2.5, logistic.(mu), 4.0)
-    end, Dn3)
+    end, Dn3; conditioned = Dn3)
     # refused: undeclared trials name zzz (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         c .~ BetaBinomial2.(zzz, logistic.(mu), 4.0)
-    end, Dn3)
+    end, Dn3; conditioned = Dn3)
     # A precision predictor is never the response's own location
     # predictor (distinct slots — the bare self-use reaches the
     # contract gate).
@@ -1534,7 +1534,7 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, logistic.(mu), mu)
-    end, Dn3); true)
+    end, Dn3; conditioned = Dn3); true)
 end
 
 @testset "vm response failures" begin
@@ -1546,33 +1546,33 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ VonMises.(mu)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # refused: malformed distribution: no such Distributions.jl method (wrong arity)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ VonMises.(mu, 1.7, 0.0)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # refused: malformed distribution: wrong arity for the head (CircularVonMises takes mu, kappa, lo, hi)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ CircularVonMises.(mu, 1.7, -pi)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # refused: malformed distribution: wrong arity for the head
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ CircularVonMises.(mu, 1.7, -pi, pi, 0.0)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The kernel-endpoint spellings redirect to the response heads.
     # refused: von_mises kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ von_mises.(mu, 1.7)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # refused: circular_von_mises kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ circular_von_mises.(mu, 1.7, -pi, pi)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # Endpoints are compile-time literals, never names.
     # capability: named CircularVonMises endpoints (todo `0fkd9yk`)
     @test_broken (lower_rkppl(quote
@@ -1582,7 +1582,7 @@ end
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         y .~ CircularVonMises.(mu, 1.7, lo, hi)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # The location may be an exponentiated predictor value.
     # admitted: an exponentiated VonMises mean
     @test (bind_data(lower_rkppl(quote
@@ -1590,7 +1590,7 @@ end
             b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ VonMises.(exp.(mu), 1.7)
-        end, Dn2),
+        end, Dn2; conditioned = Dn2),
         Dict{Symbol,AbstractVector}(:y => [0.3], :x => [0.5])); true)
     # A non-log kappa predictor fails at the contract gate (log-only).
     # capability: identity-link (bare) VonMises kappa predictor (todo `05fuzch`)
@@ -1602,7 +1602,7 @@ end
         mu = a .+ b .* x
         lk = c .+ d .* x
         y .~ VonMises.(mu, lk)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
 end
 
 @testset "exponential response failures" begin
@@ -1612,13 +1612,13 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ Exponential.(exp.(eta), 1.5)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The kernel-endpoint spelling redirects to the response head.
     # refused: exponential kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ exponential.(exp.(eta))
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The mu position needs its `exp.` link wrapper (Poisson precedent).
     # capability: identity-link (bare) Exponential mean (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -1626,13 +1626,13 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Exponential.(eta)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # No fused `ExponentialLog` head (recent slices stay decomposed-only).
     # refused: ExponentialLog is an undefined head; decomposed spelling is canonical (P2)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ ExponentialLog.(eta)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
 end
 
 @testset "lognormal response failures" begin
@@ -1644,18 +1644,18 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ LogNormal.(mu)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # refused: malformed distribution: no such Distributions.jl method (wrong arity)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ LogNormal.(mu, 0.5, 1.0)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The kernel-endpoint spelling redirects to the response head.
     # refused: lognormal kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ lognormal.(mu, 0.5)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # The location may be an exponentiated predictor value.
     # admitted: an exponentiated LogNormal location
     @test (bind_data(lower_rkppl(quote
@@ -1663,7 +1663,7 @@ end
             b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ LogNormal.(exp.(mu), 0.5)
-        end, Dn2),
+        end, Dn2; conditioned = Dn2),
         Dict{Symbol,AbstractVector}(:y => [0.7], :x => [0.5])); true)
     # A modeled-sigma predictor fails at the contract gate (deferred).
     # capability: modeled LogNormal sigma predictor (exp.) (todo `05fuzch`)
@@ -1675,7 +1675,7 @@ end
         mu = a .+ b .* x
         ls = c .+ d .* x
         y .~ LogNormal.(mu, exp.(ls))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # capability: identity-link (bare) LogNormal sigma predictor (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -1685,7 +1685,7 @@ end
         mu = a .+ b .* x
         ls = c .+ d .* x
         y .~ LogNormal.(mu, ls)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
 end
 
 @testset "slice-2 response failures" begin
@@ -1701,7 +1701,7 @@ end
         kappa2 ~ Gamma(2.0, 1000.0)
         mu = a .+ b .* x
         p .~ Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa2)
-    end, Dp2); true)
+    end, Dp2; conditioned = Dp2); true)
     # Beta: mismatched mu expressions.
     # capability: general Beta(alpha, beta) expressions (mismatched mu) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(quote
@@ -1711,7 +1711,7 @@ end
         mu = a .+ b .* x
         mu2 = a .+ b .* x
         p .~ Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu2)) .* kappa)
-    end, Dp2); true)
+    end, Dp2; conditioned = Dp2); true)
     # Beta: mu link is logistic only in slice 2.
     # capability: probit link for Beta mean (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -1720,7 +1720,7 @@ end
         kappa ~ Gamma(2.0, 1000.0)
         mu = a .+ b .* x
         p .~ Beta.(normcdf.(mu) .* kappa, (1 .- normcdf.(mu)) .* kappa)
-    end, Dp2); true)
+    end, Dp2; conditioned = Dp2); true)
     # Beta: canonical argument order only.
     # capability: Beta arguments in swapped order (a valid Beta(alpha, beta)) (todo `139j2uo`)
     @test_broken (lower_rkppl(quote
@@ -1729,13 +1729,13 @@ end
         kappa ~ Gamma(2.0, 1000.0)
         mu = a .+ b .* x
         p .~ Beta.((1 .- logistic.(mu)) .* kappa, logistic.(mu) .* kappa)
-    end, Dp2); true)
+    end, Dp2; conditioned = Dp2); true)
     # Unknown link wrapper.
     # refused: undefined function foo (P8 admits only functions visible in the model module)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ Bernoulli.(foo.(eta))
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # Inline cloglog is not a recognized wrapper (surv_disc shape stays out).
     # capability: inline expression probability 1 .- exp.(-exp.(eta)) (todo `1308iv0`)
     @test_broken (lower_rkppl(quote
@@ -1743,7 +1743,7 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Bernoulli.(1 .- exp.(-exp.(eta)))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # Poisson keeps its exp link.
     # capability: probit-link Poisson rate (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -1751,13 +1751,13 @@ end
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Poisson.(normcdf.(eta))
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # Binomial probit still needs trials.
     # refused: one-arg Binomial(n) puts the probability in the trials slot (non-integer n; malformed)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Binomial.(normcdf.(mu))
-    end, Dn3)
+    end, Dn3; conditioned = Dn3)
 end
 
 @testset "slice-1 response failures" begin
@@ -1769,17 +1769,17 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Binomial.(n, mu)
-    end, Dn3); true)
+    end, Dn3; conditioned = Dn3); true)
     # refused: non-integer trials (2.5)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Binomial.(2.5, logistic.(mu))
-    end, Dn3)
+    end, Dn3; conditioned = Dn3)
     # refused: undeclared trials name zz (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Binomial.(zz, logistic.(mu))
-    end, Dn3)
+    end, Dn3; conditioned = Dn3)
     # capability: identity-link (bare) NegativeBinomial2 mean (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -1787,13 +1787,13 @@ end
         phi ~ Exponential(1.0)
         eta = a .+ b .* x
         y .~ NegativeBinomial2.(eta, phi)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # refused: negative_binomial2 kernel-endpoint name is not a Distributions.jl constructor (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         phi ~ Exponential(1.0)
         eta = a .+ b .* x
         y .~ negative_binomial2.(exp.(eta), phi)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # capability: identity-link (bare) Gamma mean (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -1801,7 +1801,7 @@ end
         alpha ~ Exponential(1.0)
         eta = a .+ b .* x
         y .~ Gamma.(alpha, eta ./ alpha)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # capability: general Gamma(alpha, theta) (mismatched alpha) beyond the mean template (todo `1qlbn5b`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -1810,13 +1810,13 @@ end
         alpha2 ~ Exponential(1.0)
         eta = a .+ b .* x
         y .~ Gamma.(alpha, exp.(eta) ./ alpha2)
-    end, Dn2); true)
+    end, Dn2; conditioned = Dn2); true)
     # refused: gamma is SpecialFunctions.gamma, not a distribution (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         alpha ~ Exponential(1.0)
         eta = a .+ b .* x
         y .~ gamma.(alpha, exp.(eta) ./ alpha)
-    end, Dn2)
+    end, Dn2; conditioned = Dn2)
     # (The fused `BinomialLogit.(n, mu)` head lowers as the decomposed twin —
     # pinned in "surface fused response heads", not here.)
 end
@@ -1828,7 +1828,7 @@ end
         a ~ Normal(0, 5)
         eta = a .+ b .* x
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta,
             nothing, nothing, _none_evidence(), :y_resp)],
@@ -1847,7 +1847,7 @@ end
         c[levels(g)] .~ Normal.(0, 2)
         mu = c[g] .+ o
         y .~ Normal.(mu, 1.5)
-    end, (:y, :g, :o))
+    end, (:y, :g, :o); conditioned = (:y, :g, :o))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, 1.5,
             nothing, _none_evidence(), :y_resp)],
@@ -1868,7 +1868,7 @@ end
         s ~ Exponential(1)
         mu = a .+ b .* x
         y .~ weighted.(Normal.(mu, s), w)
-    end, (:y, :x, :w))
+    end, (:y, :x, :w); conditioned = (:y, :x, :w))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s,
             :w, _none_evidence(), :y_resp)],
@@ -1890,7 +1890,7 @@ end
         mu = a .+ b .* x
         y .~ truncated.(Normal.(mu, s), 0, 10)
         s ~ Exponential(1)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s,
             nothing, ResponseEvidence(:truncated, 0, 10), :y_resp)],
@@ -1911,7 +1911,7 @@ end
         mu = a .+ b .* x
         y .~ censored.(Normal.(mu, s), lo, hi)
         s ~ Exponential(1)
-    end, (:y, :x, :lo, :hi))
+    end, (:y, :x, :lo, :hi); conditioned = (:y, :x, :lo, :hi))
     @test got.responses[1].evidence ==
         ResponseEvidence(:censored, :lo, :hi)
     # Interval (object + upper only; the response is the lower endpoint).
@@ -1921,7 +1921,7 @@ end
         mu = a .+ b .* x
         y .~ interval_censored.(Normal.(mu, s), hi)
         s ~ Exponential(1)
-    end, (:y, :x, :hi))
+    end, (:y, :x, :hi); conditioned = (:y, :x, :hi))
     @test got.responses[1].evidence ==
         ResponseEvidence(:interval_censored, nothing, :hi)
 end
@@ -1936,7 +1936,7 @@ end
                 Expr(:block,
                     :(theta[i] ~ Normal(z, 1.0)),
                     :(y[i] ~ Normal.(theta[i], 1.0))))))
-    got = lower_rkppl(_plate_z(:(truncated(Normal(0.5, 2.0), -1.0, 3.0))), (:y,))
+    got = lower_rkppl(_plate_z(:(truncated(Normal(0.5, 2.0), -1.0, 3.0))), (:y,); conditioned = (:y,))
     p = only(pp for pp in got.parameters if pp.name === :z)
     @test p.family === :normal
     @test p.args == (arg1 = 0.5, arg2 = 2.0)
@@ -1948,18 +1948,18 @@ end
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block,
                     :(theta[i] ~ truncated(Normal(mu, tau), -2.0, 5.0)),
-                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y,))
+                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y,); conditioned = (:y,))
     @test only(plate.plate_parameters).support_override === (:truncated, -2.0, 5.0)
     # Finite and lower-only truncation also admit non-Normal families.
     @test (lower_rkppl(
-        _plate_z(:(truncated(Cauchy(0.0, 1.0), -1.0, 2.0))), (:y,)); true)
+        _plate_z(:(truncated(Cauchy(0.0, 1.0), -1.0, 2.0))), (:y,); conditioned = (:y,)); true)
 
     @test (lower_rkppl(
-        _plate_z(:(truncated(Normal(0.0, 1.0), 1.0, Inf))), (:y,)); true)
+        _plate_z(:(truncated(Normal(0.0, 1.0), 1.0, Inf))), (:y,); conditioned = (:y,)); true)
     # Reversed bounds are rejected.
     # refused: reversed truncation bounds (lo > hi): mathematically invalid
     @test_throws SurfaceLoweringError lower_rkppl(
-        _plate_z(:(truncated(Normal(0.0, 1.0), 3.0, 1.0))), (:y,))
+        _plate_z(:(truncated(Normal(0.0, 1.0), 3.0, 1.0))), (:y,); conditioned = (:y,))
 end
 
 @testset "surface upper-truncated parameters" begin
@@ -1974,7 +1974,7 @@ end
                 Expr(:block,
                     :(theta[i] ~ Normal(z, 1.0)),
                     :(y[i] ~ Normal.(theta[i], 1.0))))))
-    got = lower_rkppl(_plate_z(:(truncated(Normal(-1.0, 1.0), -Inf, $hi))), (:y,))
+    got = lower_rkppl(_plate_z(:(truncated(Normal(-1.0, 1.0), -Inf, $hi))), (:y,); conditioned = (:y,))
     p = only(pp for pp in got.parameters if pp.name === :z)
     @test p.family === :normal
     @test p.args == (arg1 = -1.0, arg2 = 1.0)
@@ -1986,14 +1986,14 @@ end
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block,
                     :(theta[i] ~ truncated(Normal(mu, tau), -Inf, 2.0)),
-                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y,))
+                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y,); conditioned = (:y,))
     @test only(plate.plate_parameters).support_override === (:truncated, -Inf, 2.0)
     # Non-Normal families and expression bounds are ordinary values.
     @test (lower_rkppl(
-        _plate_z(:(truncated(Cauchy(0.0, 1.0), -Inf, 1.0))), (:y,)); true)
+        _plate_z(:(truncated(Cauchy(0.0, 1.0), -Inf, 1.0))), (:y,); conditioned = (:y,)); true)
 
     @test (lower_rkppl(
-        _plate_z(:(truncated(Normal(-1.0, 1.0), -Inf, log(0.6)))), (:y,)); true)
+        _plate_z(:(truncated(Normal(-1.0, 1.0), -Inf, log(0.6)))), (:y,); conditioned = (:y,)); true)
 end
 
 @testset "surface parameters and assignments" begin
@@ -2011,7 +2011,7 @@ end
         k = 2
         mu = a .+ b .* x
         y .~ Normal.(mu, s2)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s2,
             nothing, _none_evidence(), :y_resp)],
@@ -2041,7 +2041,7 @@ end
         b ~ Normal(3, 4)
         s ~ Exponential(1)
         y .~ Normal.(a .- b .* x, s)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test length(got.predictors) == 1
     @test got.predictors[1].name === :y_eta
     @test got.responses[1].predictor === :y_eta
@@ -2058,7 +2058,7 @@ end
         y1 .~ Normal.(mu, s)
         y2 .~ Normal.(mu, s)
         s ~ Exponential(1)
-    end, (:y1, :y2, :x))
+    end, (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
     @test length(got.predictors) == 1
     @test got.responses[1].predictor === :mu
     @test got.responses[2].predictor === :mu
@@ -2069,7 +2069,7 @@ end
         "my model"
         mu = a .+ b .* x
         y .~ Normal.(mu, 2.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test length(got.responses) == 1
     # Strip-list macros unwrap.
     got = lower_rkppl(quote
@@ -2077,7 +2077,7 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         @inbounds y .~ Normal.(mu, 2.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test length(got.responses) == 1
 end
 
@@ -2090,34 +2090,34 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, 2.0)
     end
-    b1 = m(; y = yv, x = xv)
+    b1 = (m(; x = xv) | (; y = yv))
     @test isbound(b1)
     @test b1.roles == Dict(:y => :response, :x => :predictor)
-    # Immediate NamedTuple form lowers+binds the same plan.
-    b2 = @rkppl (y = yv, x = xv) begin
+    # Immediate NamedTuple form binds inputs, then observes explicitly.
+    b2 = @rkppl (x = xv,) begin
         b ~ Normal(0, 1)
         a ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 2.0)
     end
-    @test _plans_equal(b1, b2)
+    @test _plans_equal(b1, b2 | (; y = yv))
     # Immediate dict form (String keys accepted).
-    b3 = @rkppl Dict("y" => yv, "x" => xv) begin
+    b3 = @rkppl Dict("x" => xv) begin
         b ~ Normal(0, 1)
         a ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 2.0)
     end
-    @test _plans_equal(b1, b3)
+    @test _plans_equal(b1, b3 | (; y = yv))
     # The captured model is reusable across binds.
-    b4 = m(; y = yv, x = xv)
+    b4 = (m(; x = xv) | (; y = yv))
     @test _plans_equal(b1, b4)
     # admitted: a scalar observed value beside an explicit predictor column (P10a 0dejlw1)
-    @test (m(; y = 1.0, x = [0.5]); true)
+    @test ((m(; x = [0.5]) | (; y = 1.0)); true)
     # refused: data-name list contains non-Symbol 42 (malformed call)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         y .~ Normal.(mu, 1.0)
-    end, (:y, 42))
+    end, (:y, 42); conditioned = (:y, 42))
 end
 
 @testset "surface one-sided bounds and factor refs" begin
@@ -2128,7 +2128,7 @@ end
         mu = a .+ b .* x
         y .~ truncated.(Normal.(mu, s), -Inf, 4)
         s ~ Exponential(1)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test got.responses[1].evidence == ResponseEvidence(:truncated, nothing, 4)
     got = lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2136,7 +2136,7 @@ end
         mu = a .+ b .* x
         y .~ truncated.(Normal.(mu, s), 0, Inf)
         s ~ Exponential(1)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test got.responses[1].evidence ==
         ResponseEvidence(:truncated, 0, nothing)
     # Emitter-built ASTs carry actual ±Inf floats, not Symbols.
@@ -2150,7 +2150,7 @@ end
         y .~ censored.(Normal.(mu, s), -999, 4)
         s ~ Exponential(1)
     end, -Inf)
-    got = lower_rkppl(ast, (:y, :x))
+    got = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
     @test got.responses[1].evidence == ResponseEvidence(:censored, nothing, 4)
     ast = _swap999(quote
         a ~ Normal(0, 1)
@@ -2159,7 +2159,7 @@ end
         y .~ censored.(Normal.(mu, s), 0, -999)
         s ~ Exponential(1)
     end, Inf)
-    got = lower_rkppl(ast, (:y, :x))
+    got = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
     @test got.responses[1].evidence ==
         ResponseEvidence(:censored, 0, nothing)
     # Crossed infinities are degenerate, not missing.
@@ -2168,13 +2168,13 @@ end
         mu = a .+ b .* x
         y .~ truncated.(Normal.(mu, s), Inf, 4)
         s ~ Exponential(1)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     # refused: crossed truncation bounds (0, -Inf): degenerate
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ truncated.(Normal.(mu, s), 0, -Inf)
         s ~ Exponential(1)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     # One-sided surface evidence binds, builds, and values end to end.
     m = @rkppl begin
         a ~ Normal(0, 1)
@@ -2184,7 +2184,7 @@ end
         y .~ truncated.(Normal.(mu, s), -Inf, 4.0)
     end
     cols, _ = _gen_columns()
-    bound = m(; y = cols[:y], x = cols[:x])
+    bound = (m(; x = cols[:x]) | (; y = cols[:y]))
     @test bound.responses[1].evidence ==
         ResponseEvidence(:truncated, nothing, 4.0)
     built = build_kernel(bound)
@@ -2204,7 +2204,7 @@ end
         # refused: BRM treatment() vocabulary (P10)
         @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             Expr(:(=), :mu, Expr(:call, :.+, :a, bad)),
-            Expr(:call, :.~, :y, :(Normal.(mu, 1.0)))), (:y, :x, :g))
+            Expr(:call, :.~, :y, :(Normal.(mu, 1.0)))), (:y, :x, :g); conditioned = (:y, :x, :g))
     end
 end
 
@@ -2215,7 +2215,7 @@ end
         c[levels(g)[2:end]] .~ Normal.(0, 2)
         mu = a .+ c[g]
         y .~ Normal.(mu, 1.5)
-    end, (:y, :x, :g))
+    end, (:y, :x, :g); conditioned = (:y, :x, :g))
     @test length(got.levelmaps) == 1 &&
         _maps_equal(got.levelmaps[1], LevelMap(:mu, :g, [], :levels, (2, :end)))
     @test isempty(got.population_priors)
@@ -2227,7 +2227,7 @@ end
         c[levels(g)] .~ Normal.(0, 2)
         mu = a .+ c[g]
         y .~ Normal.(mu, 1.5)
-    end, (:y, :x, :g))
+    end, (:y, :x, :g); conditioned = (:y, :x, :g))
     @test only(full.levelmaps).subset === Colon()
     @test only(full.array_parameters).name === :c
     # Scalar prior for a vector coefficient: migration error. Missing prior:
@@ -2237,7 +2237,7 @@ end
         block = Expr(:block, stmts...,
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
         # refused: scalar c gathered by a factor: scalar[vector] is a Julia MethodError (P3)
-        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g))
+        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g); conditioned = (:y, :g))
     end
     # Levels column must match the use column; levels() takes one data column.
     for lhs in (:(c[unique(g)]), :(c[sort(g)]),
@@ -2246,13 +2246,13 @@ end
         block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
         # refused: declared over levels(h) but gathered by g (key/size mismatch)
-        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :x, :g, :h))
+        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :x, :g, :h); conditioned = (:y, :x, :g, :h))
     end
     # Scalar tilde over a levels ref is crossed spelling.
     # refused: scalar ~ over a vector levels ref (P3)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         Expr(:call, :~, :(c[levels(g)]), :(Normal(0, 2))),
-        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g))
     # Subset violations: unbound/start-0/empty/non-literal selections.
     for sub in (:(1:n), :(0:2), :(3:2), :([]), :([1.5]), :([true]),
             :([i]), :(1:2:6), :(eachindex(g)))
@@ -2260,14 +2260,14 @@ end
         block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
         # refused: undeclared n (P6, 05oe96l)
-        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g))
+        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g); conditioned = (:y, :g))
     end
     # Valid subsets lower with their selectors.
     for (sub, want) in ((:(2:3), 2:3), (:([1, 3]), [1, 3]))
         lhs = Expr(:ref, :c, Expr(:ref, :(levels(g)), sub))
         block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
-        got = lower_rkppl(block, (:y, :g))
+        got = lower_rkppl(block, (:y, :g); conditioned = (:y, :g))
         @test got.levelmaps[1].subset == want
     end
     # Outside-chained subsets go inside instead (one way).
@@ -2277,21 +2277,21 @@ end
             Expr(:ref, Expr(:ref, :c, :(levels(g))),
                 Expr(:call, :(:), 2, :end)),
             :(Normal.(0, 2))),
-        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g))
     # Non-dotted prior object over a levels ref: broadcast it.
     # capability: undotted scalar distribution under .~ (Distributions broadcastable: c .~ Normal(0, 2)) (todo `15lq8iu`)
     @test_broken (lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(c[levels(g)]), :(Normal(0, 2))),
-        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g)); true)
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g)); true)
     # Non-literal broadcast args are not per-level priors.
     # admitted: sampled hyperparameter in a levels prior Normal.(m, 2) (P8)
     @test (lower_rkppl(Expr(:block,
         :(m ~ Normal(0, 1)),
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(m, 2))),
-        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g)); true)
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g)); true)
     pending = lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(m, 2))),
-        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g))
     # refused: m has no declaration or bound value (strict names, P6).
     @test_throws ContractValidationError bind_data(pending,
         Dict(:y => [1.0, 2.0], :g => [1, 2]))
@@ -2301,14 +2301,14 @@ end
         Expr(:call, :.~, :(a[levels(g)]), :(Normal.(0, 1))),
         :(mu = a .+ c[g]),
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
-        :(y .~ Normal.(mu, 1.5))), (:y, :g))
+        :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g))
     # A levels declaration no predictor consumes is a declared array
     # parameter (test_array_values.jl), not a refused coefficient prior.
     zplan = lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(z[levels(g)]), :(Normal.(0, 1))),
         :(mu = c[g]),
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
-        :(y .~ Normal.(mu, 1.5))), (:y, :g))
+        :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g))
     @test Set(p.name for p in zplan.array_parameters) == Set((:z, :c))
     # A bound levels-subset is plain metadata: it reuses the inline grammar
     # and is admitted by `=`, not by `~`.
@@ -2317,7 +2317,7 @@ end
         c[sel] .~ Normal.(0, 2)
         mu = c[g]
         y .~ Normal.(mu, 1.5)
-    end, (:y, :g))
+    end, (:y, :g); conditioned = (:y, :g))
     @test length(got.levelmaps) == 1 &&
         _maps_equal(got.levelmaps[1],
             LevelMap(:mu, :g, [], :levels, (2, :end)))
@@ -2329,7 +2329,7 @@ end
         bound = Expr(:block, Expr(:(=), :sel, rhs),
             Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
-        got = lower_rkppl(bound, (:y, :g))
+        got = lower_rkppl(bound, (:y, :g); conditioned = (:y, :g))
         @test got.levelmaps[1].subset == subset
     end
     # The bound path rejects exactly the subset spellings the inline path
@@ -2341,7 +2341,7 @@ end
             Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
         # refused: undeclared n (P6, 05oe96l)
-        @test_throws SurfaceLoweringError lower_rkppl(bound, (:y, :g))
+        @test_throws SurfaceLoweringError lower_rkppl(bound, (:y, :g); conditioned = (:y, :g))
     end
     # Unknown and non-levels index names fail closed; so does a binding over
     # a non-data grouping column.
@@ -2349,20 +2349,20 @@ end
         :(mu = c[g]), Expr(:call, :.~, :y, :(Normal.(mu, 1.5))))
     # refused: undeclared index name sel (P6, 05oe96l)
     @test_throws "index name sel must be a bound levels-subset" lower_rkppl(
-        unknown, (:y, :g))
+        unknown, (:y, :g); conditioned = (:y, :g))
     nonlevels = Expr(:block, :(sel = g),
         Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
         :(mu = c[g]), Expr(:call, :.~, :y, :(Normal.(mu, 1.5))))
     # refused: sel = g is an observation column, not a level set (duplicate keys)
     @test_throws "index name sel must be a bound levels-subset" lower_rkppl(
-        nonlevels, (:y, :g))
+        nonlevels, (:y, :g); conditioned = (:y, :g))
     for assignment in (nothing, :(x = 1.0), :(sel = g), :(sel = unique(g)))
         block = Expr(:block)
         assignment === nothing || push!(block.args, assignment)
         append!(block.args, (Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
             :(mu = c[g]), Expr(:call, :.~, :y, :(Normal.(mu, 1.5)))))
         # refused: sel undeclared (P6, 05oe96l)
-        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g, :x))
+        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g, :x); conditioned = (:y, :g, :x))
     end
     nongroup = quote
         sel = levels(z)
@@ -2372,7 +2372,7 @@ end
     end
     # refused: levels(z) over a non-data name z (P6, 05oe96l)
     @test_throws "levels binding sel: `levels(z)` needs a data grouping" lower_rkppl(
-        nongroup, (:y, :g))
+        nongroup, (:y, :g); conditioned = (:y, :g))
 end
 
 @testset "surface full-rank factor end to end" begin
@@ -2384,7 +2384,7 @@ end
         y .~ Normal.(mu, s)
     end
     cols, _ = _gen_columns()
-    bound = m(; y = cols[:y], g = cols[:g])
+    bound = (m(; g = cols[:g]) | (; y = cols[:y]))
     @test bound.levelmaps[1].values == [1, 2, 3]
     built = build_kernel(bound)
     u = [0.2, -0.1, 0.3, 0.0]
@@ -2404,7 +2404,7 @@ end
         mu = a .+ c[g]
         y .~ Normal.(mu, s)
     end
-    bound2 = m2(; y = cols[:y], g = cols[:g])
+    bound2 = (m2(; g = cols[:g]) | (; y = cols[:y]))
     @test bound2.levelmaps[1].values == [2, 3]
     built2 = build_kernel(bound2)
     u2 = [0.5, 0.2, -0.1, 0.0]
@@ -2430,7 +2430,7 @@ end
         z = (x .- mean(x)) ./ std(x)
         mu = a .+ b .* z .+ lx
         y .~ Normal.(mu, s)
-    end, (:y, :x, :e))
+    end, (:y, :x, :e); conditioned = (:y, :x, :e))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s,
             nothing, _none_evidence(), :y_resp)],
@@ -2462,7 +2462,7 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test Set(a.name for a in got.assignments) == Set([:m, :t, :u])
     @test Set(d.name for d in got.derived) == Set([:lx, :w, :v])
     # Nested reductions must stage (contract owns nesting).
@@ -2473,7 +2473,7 @@ end
         z = mean(log.(x))
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x)); true)
     # Undotted math over vectors fails at the surface, as in Julia.
     m = @rkppl begin
         lx = log(x)
@@ -2481,7 +2481,7 @@ end
         y .~ Normal.(mu, 1.0)
     end
     # refused: undotted log over a vector is a Julia MethodError (P3)
-    @test_throws SurfaceLoweringError m(; y = [1.0], x = [2.0])
+    @test_throws SurfaceLoweringError (m(; x = [2.0]) | (; y = [1.0]))
     # Factors, weights, and evidence take raw columns only.
     # capability: a computed factor column c[z], z = x .+ 1 (todo `0fkd9yk`)
     @test_broken (lower_rkppl(quote
@@ -2491,7 +2491,7 @@ end
         mu = a .+ c[z]
         y .~ Normal.(mu, 1.0)
         z = x .+ 1
-    end, (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: derived weights column (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2499,7 +2499,7 @@ end
         mu = a .+ b .* x
         y .~ weighted.(Normal.(mu, 1.0), w)
         w = x .+ 1
-    end, (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: derived evidence (truncation bound) column (todo `0ze68k8`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2507,7 +2507,7 @@ end
         mu = a .+ b .* x
         y .~ truncated.(Normal.(mu, 1.0), lo, 5.0)
         lo = x .+ 1
-    end, (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x)); true)
     # A coefficient a derived column also reads is an ordinary parameter
     # (its summand becomes a derived column too — test_fallback.jl).
     leak = lower_rkppl(quote
@@ -2516,7 +2516,7 @@ end
         mu = a .+ b .* x
         z = x .* b
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test any(p -> p.name === :b, leak.parameters)
     # Dotted-unknown calls fail at the surface with vocabulary guidance.
     # refused: undefined function myfun (P8 admits only visible functions)
@@ -2524,7 +2524,7 @@ end
         m = myfun.(x)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     # Chaining inlines: the factored and un-factored forms lower to the
     # SAME plan (naming a subexpression never changes legality).
     chained = lower_rkppl(quote
@@ -2535,7 +2535,7 @@ end
         mu = a .+ d .* z
         t = mu .+ c .* x
         y .~ Normal.(t, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     flat = lower_rkppl(quote
         a ~ Normal(0, 1)
         d ~ Normal(0, 1)
@@ -2543,7 +2543,7 @@ end
         z = x .- mean(x)
         t = a .+ d .* z .+ c .* x
         y .~ Normal.(t, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(chained, flat)
     @test length(chained.predictors) == 1
     @test chained.predictors[1].name === :t
@@ -2557,13 +2557,13 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     plain = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b * x
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(dotted, plain)
     got = lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2571,7 +2571,7 @@ end
         z = x / 2
         mu = a .+ b .* z
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test repr(got.derived[1].expr) == repr(:(x ./ 2))
     # Anonymous interactions extract to synthetic locals; the named form
     # addresses its own column.
@@ -2580,7 +2580,7 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* (x .* z)
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     @test length(got.derived) == 1
     @test got.derived[1].name === :_rkppl_synth_1
     @test repr(got.derived[1].expr) == repr(:(x .* z))
@@ -2593,14 +2593,14 @@ end
         w = x .* z
         mu = a .+ b .* w
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     @test named.predictors[1].terms[2].addressee === :w
     # Anonymous offsets extract too (sign folds into the column).
     got = lower_rkppl(quote
         a ~ Normal(0, 1)
         mu = a .- log.(x)
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test length(got.derived) == 1
     @test repr(got.derived[1].expr) ==
         repr(Expr(:call, :.-, :(log.(x))))
@@ -2612,7 +2612,7 @@ end
         w = s .+ x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     w = only(p for p in got.predictors if p.name === :w)
     mu = only(p for p in got.predictors if p.name === :mu)
     @test w.terms[1].options.parameter === :s
@@ -2632,38 +2632,38 @@ end
         for i in 1:3
             y .~ Normal.(mu, 1.0)
         end
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: Stan target += is not Julia/RKPPL vocabulary (target undefined; P2)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
         target += 1.0
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: malformed @plate (no per-index for) (P8, 1cmodra)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         @plate begin
             y .~ Normal.(mu, 1.0)
         end
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: malformed @scan (no for recurrence; ~ on data x[1]); comment '@scan still reserved' is stale
     @test_throws SurfaceLoweringError lower_rkppl(quote
         @scan begin
             x[1] ~ Normal(0, 1)
         end
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: parameter-dependent `if`: the graph is static; `ifelse` is the admitted spelling (10gzbm9)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         if a > 0
             y .~ Normal.(mu, 1.0)
         end
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: Stan type annotation theta::real (real undefined in Julia) (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         theta::real ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # Distributions must be Distributions.jl (julianic, never Stan):
     # CamelCase constructors with the link explicit (a link wrapper, or a
     # fused logit/log head naming the link — the fused heads lower as
@@ -2672,26 +2672,26 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # capability: identity-link (bare) Bernoulli probability (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Bernoulli.(mu)
-    end, Dn); true)
+    end, Dn; conditioned = Dn); true)
     # capability: identity-link (bare) Poisson rate (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Poisson.(mu)
-    end, Dn); true)
+    end, Dn; conditioned = Dn); true)
     # refused: MvNormal(scalar, scalar) is a Distributions MethodError (malformed)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ MvNormal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: positive(...) is not a Julia/Distributions function (undefined)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2699,12 +2699,12 @@ end
         s ~ positive(Normal(0, 1))
         mu = a .+ b .* x
         y .~ Normal.(mu, s)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: malformed truncated (old HOF form)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ truncated.(normal, 0, 10, mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: lowercase flat() is undefined (Flat() is the spelling)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2712,17 +2712,17 @@ end
         t ~ flat()
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: malformed weighted (old HOF argument order)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ weighted.(Normal, w, mu, 1.0)
-    end, (:y, :x, :w))
+    end, (:y, :x, :w); conditioned = (:y, :x, :w))
     # refused: malformed interval_censored (old HOF form)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ interval_censored.(Normal, y, hi, mu, 1.0)
-    end, (:y, :x, :hi))
+    end, (:y, :x, :hi); conditioned = (:y, :x, :hi))
     # A scalar sum is a value location (standard Julia broadcasting,
     # standing principle 10a / decision 0dejlw1), even with two priors.
     scalar_sum = lower_rkppl(quote
@@ -2730,7 +2730,7 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test only(only(scalar_sum.predictors).terms).kind === ComposedTerm
     # Predictor shape violations.
     # Admitted: explicit priors retain each coefficient across direct and nested affine uses.
@@ -2740,23 +2740,23 @@ end
         c ~ Normal(0, 1)
         mu = a .+ b .* x .+ c .* x
         y .~ Normal.(mu, 1.0)
-    end, Dn); true)
+    end, Dn; conditioned = Dn); true)
     # refused: undotted vector*vector x * z is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a + x * z
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     # refused: undeclared name d (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* d
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # capability: literal constant term in a predictor (1.5 .+ b .* x) (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote
         b ~ Normal(0, 1)
         mu = 1.5 .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, Dn); true)
+    end, Dn; conditioned = Dn); true)
     # capability: a crossed two-factor gather b[g, h] (todo `1308iv0`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2764,7 +2764,7 @@ end
         b[levels(g), levels(h)] .~ Normal.(0, sg)
         mu = a .+ b[g, h]
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :g, :h)); true)
+    end, (:y, :x, :g, :h); conditioned = (:y, :x, :g, :h)); true)
     # Admitted: explicit priors retain each coefficient across direct and nested affine uses.
     @test (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2773,27 +2773,27 @@ end
         mu = a .+ b .* x
         t = mu .+ c .* x
         y .~ Normal.(t, 1.0)
-    end, Dn); true)
+    end, Dn; conditioned = Dn); true)
     # Name discipline.
     # refused: rebinds data name x
     @test_throws SurfaceLoweringError lower_rkppl(quote
         x = 1.0
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: single assignment (a declared twice)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         a ~ Normal(0, 1)
         a ~ Normal(0, 2)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # A sampled scalar parameter is a location value, read for every
     # observation (test_bare_location.jl "value location lowering").
     vloc = lower_rkppl(quote
         theta ~ Normal(0, 1)
         y .~ Normal.(theta, 1.0)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
     @test only(only(vloc.predictors).terms).options.tree === :theta
     # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -2802,7 +2802,7 @@ end
         mu = a .+ b .* x
         y1 .~ Normal.(mu, 1.0)
         y2 .~ Poisson.(exp.(mu))
-    end, (:y1, :y2, :x)); true)
+    end, (:y1, :y2, :x); conditioned = (:y1, :y2, :x)); true)
     # Coefficient priors take any admitted family and sampled arguments
     # (coef_grammar A): a non-coefficient family makes `b` an ordinary
     # parameter whose summand is a derived column; a sampled location
@@ -2812,7 +2812,7 @@ end
         b ~ Gamma(1, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test any(p -> p.name === :b && p.family === :gamma, gam.parameters)
     hyp = lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2820,7 +2820,7 @@ end
         b ~ Normal(m, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test any(p -> p.name === :b && p.args.arg1 === :m, hyp.parameters)
     # admitted: a coefficient shared across two predictors (a in mu1 and mu2) (todo `1qlbn5b`)
     @test (lower_rkppl(quote
@@ -2831,7 +2831,7 @@ end
         mu2 = a .+ c .* x
         y1 .~ Normal.(mu1, 1.0)
         y2 .~ Normal.(mu2, 1.0)
-    end, (:y1, :y2, :x)); true)
+    end, (:y1, :y2, :x); conditioned = (:y1, :y2, :x)); true)
     # A coefficient another prior reads is an ordinary parameter (its
     # summand lowers as a derived column — coef_grammar A, test_fallback.jl).
     expb = lower_rkppl(quote
@@ -2840,7 +2840,7 @@ end
         s ~ Exponential(b)
         mu = a .+ b .* x
         y .~ Normal.(mu, s)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test any(p -> p.name === :b, expb.parameters)
     @test only(p for p in expb.parameters if p.name === :s).args.arg1 === :b
     # Explicit scalar declarations remain valid through affine reads.
@@ -2850,14 +2850,14 @@ end
         w = m .+ x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test Set(p.name for p in admitted.parameters) == Set((:a, :m))
     admitted = lower_rkppl(quote
         a ~ Normal(0, 1)
         s ~ Exponential(1)
         mu = a .+ s .+ x
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test Set(p.name for p in admitted.parameters) == Set((:a, :s))
     # admitted: data-derived scalar offset m = mean(x); a .+ m (todo `0fkd9yk`)
     @test (lower_rkppl(quote
@@ -2865,7 +2865,7 @@ end
         m = mean(x)
         mu = a .+ m
         y .~ Normal.(mu, 1.0)
-    end, Dn); true)
+    end, Dn; conditioned = Dn); true)
     # Wrappers, bounds, broadcast, miscellany.
     # capability: parameter-valued truncation bound (todo `0ze68k8`)
     @test_broken (lower_rkppl(quote
@@ -2874,51 +2874,51 @@ end
         mu = a .+ b .* x
         y .~ truncated.(Normal.(mu, 1.0), s, 10)
         s ~ Exponential(1)
-    end, Dn); true)
+    end, Dn; conditioned = Dn); true)
     # refused: interval_censored over a non-distribution (malformed)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ interval_censored.(mu, hi)
-    end, (:y, :x, :hi))
+    end, (:y, :x, :hi); conditioned = (:y, :x, :hi))
     # refused: @. turns mu = ... into in-place mu .= ... on an undefined name (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         @. mu = a + b * x
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # `~` over data is scalar-only: vector responses broadcast with `.~`
     # (even a dotted object under `~` fails the kind check).
     # refused: scalar ~ over vector data (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y ~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: Normal(vector, scalar) is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y ~ Normal(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # `.~` over a non-data name is not a response.
     # refused: unsized .~ declaration of non-data theta (no shape; y gets no likelihood)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         theta .~ Normal.(0, 1)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # Undotted objects and links under `.~` name the dotted fix.
     # refused: undotted Normal(vector, ...) under .~ (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Normal(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: undotted logistic(vector) (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y .~ Bernoulli.(logistic(eta))
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: undotted Normal(vector, ...) inside truncated. (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ truncated.(Normal(mu, 1.0), 0, 10)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # A RAW data-column per-observation scale (the eight-schools known SE) now
     # lowers — the response carries the column name and threads it per cell.
     got_obs_scale = lower_rkppl(quote
@@ -2926,7 +2926,7 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, x)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test only(got_obs_scale.responses).scale === :x
     # A DERIVED-column scale still needs shape metadata (planned): rejected.
     # capability: derived-column per-observation scale (todo `15lq8iu`)
@@ -2936,14 +2936,14 @@ end
         w = x .+ 1
         mu = a .+ b .* x
         y .~ Normal.(mu, w)
-    end, Dn); true)
+    end, Dn; conditioned = Dn); true)
     # N-ary undotted products with a vector operand do not lower.
     # capability: n-ary undotted scalar product 2 * 3 * x (valid Julia, P3) (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
         mu = a .+ 2 * 3 * x
         y .~ Normal.(mu, 1.0)
-    end, Dn); true)
+    end, Dn; conditioned = Dn); true)
     # Distributions and response-only wrappers are not values.
     # capability: distribution-valued definition m = Normal(0, 1) (P10a) (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote
@@ -2952,7 +2952,7 @@ end
         m = Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, Dn); true)
+    end, Dn; conditioned = Dn); true)
     # Synthetic names dodge user definitions (fresh-name generation).
     got = lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2960,7 +2960,7 @@ end
         _rkppl_synth_1 = x .+ 1
         mu = a .+ b .* (x .* _rkppl_synth_1)
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test Set(d.name for d in got.derived) ==
         Set([:_rkppl_synth_1, :_rkppl_synth_2])
     # refused: BRM treatment() vocabulary (P10)
@@ -2968,23 +2968,23 @@ end
         w = treatment(g, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :g))
+    end, (:y, :x, :g); conditioned = (:y, :x, :g))
     # refused: undefined function myfun (P8 admits only visible functions)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         m = myfun(x)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: Normal has no tol keyword (MethodError)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Normal.(mu, sigma; tol = 1)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     # refused: malformed truncated (old HOF form)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ weighted.(truncated(Normal, 0, 10, mu, 1.0), w)
-    end, (:y, :x, :w))
+    end, (:y, :x, :w); conditioned = (:y, :x, :w))
     # Expression prior arguments bind to a synthetic assignment.
     expr = lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2993,16 +2993,15 @@ end
         m ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test only(p for p in expr.parameters if p.name === :s).args.arg2 ===
         :_rkppl_s_arg2
-    # A response-less block fails structural validation, not lowering.
-    # capability: response-less (prior-only) model (P9: conditioning is separate) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    # Explicit prior-only declarations do not require an observation response.
+    @test (lower_rkppl(quote
         b ~ Normal(0, 1)
         a ~ Normal(0, 1)
         mu = a .+ b .* x
-    end, (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x)); true)
     # Macro-shape errors fire at expansion (parsed+evaled at runtime so the
     # throw is catchable here instead of at file parse; eval wraps the
     # expansion throw in LoadError). A well-formed submodel definition is now
@@ -3035,13 +3034,13 @@ end
         b ~ Normal(0, 2)
         mu = a .+ b .* x
         y .~ BernoulliLogit.(mu)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     decomposed = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
         mu = a .+ b .* x
         y .~ Bernoulli.(logistic.(mu))
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test _plans_equal(fused, decomposed)
     @test only(fused.responses).family === BernoulliLogitFam
     @test only(fused.responses).link === LogitLink
@@ -3050,13 +3049,13 @@ end
         b ~ Normal(0, 2)
         mu = a .+ b .* x
         y .~ PoissonLog.(mu)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     decomposed = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
         mu = a .+ b .* x
         y .~ Poisson.(exp.(mu))
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test _plans_equal(fused, decomposed)
     @test only(fused.responses).family === PoissonLogFam
     @test only(fused.responses).link === LogLink
@@ -3065,13 +3064,13 @@ end
         b ~ Normal(0, 2)
         mu = a .+ b .* x
         y .~ BinomialLogit.(10, mu)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     decomposed = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
         mu = a .+ b .* x
         y .~ Binomial.(10, logistic.(mu))
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test _plans_equal(fused, decomposed)
     @test only(fused.responses).family === BinomialLogitFam
     @test only(fused.responses).link === LogitLink
@@ -3081,14 +3080,14 @@ end
         phi ~ Exponential(1.0)
         mu = a .+ b .* x
         y .~ NegativeBinomial2Log.(mu, phi)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     decomposed = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
         phi ~ Exponential(1.0)
         mu = a .+ b .* x
         y .~ NegativeBinomial2.(exp.(mu), phi)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test _plans_equal(fused, decomposed)
     @test only(fused.responses).family === NegativeBinomial2Fam
     @test only(fused.responses).link === LogLink
@@ -3098,14 +3097,14 @@ end
         alpha ~ Exponential(1.0)
         mu = a .+ b .* x
         y .~ GammaLog.(alpha, mu)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     decomposed = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
         alpha ~ Exponential(1.0)
         mu = a .+ b .* x
         y .~ Gamma.(alpha, exp.(mu) ./ alpha)
-    end, Dn)
+    end, Dn; conditioned = Dn)
     @test _plans_equal(fused, decomposed)
     @test only(fused.responses).family === GammaLogFam
     @test only(fused.responses).link === LogLink
@@ -3116,14 +3115,14 @@ end
         kappa ~ Gamma(2.0, 1000.0)
         mu = a .+ b .* x
         p .~ BetaLogit.(mu, kappa)
-    end, Dp2)
+    end, Dp2; conditioned = Dp2)
     decomposed = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
         kappa ~ Gamma(2.0, 1000.0)
         mu = a .+ b .* x
         p .~ Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)
-    end, Dp2)
+    end, Dp2; conditioned = Dp2)
     @test _plans_equal(fused, decomposed)
     @test only(fused.responses).family === BetaLogitFam
     @test only(fused.responses).link === LogitLink
@@ -3135,13 +3134,13 @@ end
         b ~ Normal(0, 2)
         mu = a .+ b .* x
         y .~ weighted.(BernoulliLogit.(mu), w)
-    end, Wd)
+    end, Wd; conditioned = Wd)
     wdecomp = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
         mu = a .+ b .* x
         y .~ weighted.(Bernoulli.(logistic.(mu)), w)
-    end, Wd)
+    end, Wd; conditioned = Wd)
     @test _plans_equal(wfused, wdecomp)
     # Wrong-arity fused heads fail naming the FUSED spelling, never the
     # decomposed one.
@@ -3150,52 +3149,52 @@ end
         _fused_errmsg(() -> lower_rkppl(quote
             mu = a .+ b .* x
             y .~ BernoulliLogit.(mu, mu)
-        end, Dn)))
+        end, Dn; conditioned = Dn)))
     # refused: fused constructor arity/keyword signature (P3)
     @test occursin("`PoissonLog` takes `PoissonLog.(eta)`",
         _fused_errmsg(() -> lower_rkppl(quote
             mu = a .+ b .* x
             y .~ PoissonLog.()
-        end, Dn)))
+        end, Dn; conditioned = Dn)))
     # refused: fused constructor arity/keyword signature (P3)
     @test occursin("`BinomialLogit` takes `BinomialLogit.(n, mu)`",
         _fused_errmsg(() -> lower_rkppl(quote
             mu = a .+ b .* x
             y .~ BinomialLogit.(mu)
-        end, Dn)))
+        end, Dn; conditioned = Dn)))
     # refused: fused constructor arity/keyword signature (P3)
     @test occursin("`NegativeBinomial2Log` takes `NegativeBinomial2Log.(eta, phi)`",
         _fused_errmsg(() -> lower_rkppl(quote
             phi ~ Exponential(1.0)
             mu = a .+ b .* x
             y .~ NegativeBinomial2Log.(mu)
-        end, Dn)))
+        end, Dn; conditioned = Dn)))
     # refused: fused constructor arity/keyword signature (P3)
     @test occursin("`GammaLog` takes `GammaLog.(alpha, eta)`",
         _fused_errmsg(() -> lower_rkppl(quote
             mu = a .+ b .* x
             y .~ GammaLog.(mu)
-        end, Dn)))
+        end, Dn; conditioned = Dn)))
     # refused: fused constructor arity/keyword signature (P3)
     @test occursin("`BetaLogit` takes `BetaLogit.(mu, kappa)`",
         _fused_errmsg(() -> lower_rkppl(quote
             mu = a .+ b .* x
             p .~ BetaLogit.(mu)
-        end, Dp2)))
+        end, Dp2; conditioned = Dp2)))
     # Fused heads take positional arguments only, like every dotted object.
     # refused: fused constructor arity/keyword signature (P3)
     @test occursin("positional arguments only",
         _fused_errmsg(() -> lower_rkppl(quote
             mu = a .+ b .* x
             y .~ BernoulliLogit.(mu; foo = 1)
-        end, Dn)))
+        end, Dn; conditioned = Dn)))
     # An unbracketed fused head names the broadcast fix.
     # refused: fused constructor arity/keyword signature (P3)
     @test occursin("broadcast the object",
         _fused_errmsg(() -> lower_rkppl(quote
             mu = a .+ b .* x
             y .~ BernoulliLogit(mu)
-        end, Dn)))
+        end, Dn; conditioned = Dn)))
     # `OrderedLogit` is a near-miss name, not a fused head: it guides to the
     # admitted `OrderedLogistic` spelling instead of failing generically.
     # refused: OrderedLogit is not a defined distribution head (P6, 05oe96l)
@@ -3203,7 +3202,7 @@ end
         _fused_errmsg(() -> lower_rkppl(quote
             mu = a .+ b .* x
             y .~ OrderedLogit.(mu)
-        end, Dn)))
+        end, Dn; conditioned = Dn)))
 end
 
 @testset "surface offset-only predictors" begin
@@ -3213,14 +3212,14 @@ end
             mu = z
             s ~ Exponential(1.0)
             y .~ Normal.(mu, s)
-        end, (:y, :z))
+        end, (:y, :z); conditioned = (:y, :z))
     @test [t.kind for t in only(bare.predictors).terms] == [OffsetTerm]
     @test isempty(bare.population_priors)
     multi = lower_rkppl(quote
             mu = .+(z, x)
             s ~ Exponential(1.0)
             y .~ Normal.(mu, s)
-        end, (:y, :z, :x))
+        end, (:y, :z, :x); conditioned = (:y, :z, :x))
     @test [t.kind for t in only(multi.predictors).terms] ==
         [OffsetTerm, OffsetTerm]
     derived = lower_rkppl(quote
@@ -3228,7 +3227,7 @@ end
             mu = rkd_offset_log_z
             s ~ Exponential(1.0)
             y .~ Normal.(mu, s)
-        end, (:y, :z))
+        end, (:y, :z); conditioned = (:y, :z))
     @test [t.kind for t in only(derived.predictors).terms] == [OffsetTerm]
     # Layout: empty coefficient block + the sampled scale.
     cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5],
@@ -3267,7 +3266,7 @@ end
                 r ~ varying_effect(g, [1])
                 mu = r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g))
+            end, (:y, :g); conditioned = (:y, :g))
         nothing
     catch e
         e
@@ -3289,16 +3288,16 @@ _ranged_ast(lhs) = Expr(:block,
 @testset "surface ranged responses y[R]" begin
     cols, n = _gen_columns()
     @test n == 6
-    bare = lower_rkppl(_ranged_ast(:y), (:y, :x))
+    bare = lower_rkppl(_ranged_ast(:y), (:y, :x); conditioned = (:y, :x))
     @test bare.responses[1].range === nothing
     # Self-covering forms are plan-identical to bare.
     for lhs in (:(y[eachindex(y)]), :(y[axes(y, 1)]))
-        got = lower_rkppl(_ranged_ast(lhs), (:y, :x))
+        got = lower_rkppl(_ranged_ast(lhs), (:y, :x); conditioned = (:y, :x))
         @test _plans_equal(got, bare)
         @test got.responses[1].range === nothing
     end
     # Literal range rides the plan and values identically end to end.
-    lit = lower_rkppl(_ranged_ast(:(y[1:6])), (:y, :x))
+    lit = lower_rkppl(_ranged_ast(:(y[1:6])), (:y, :x); conditioned = (:y, :x))
     @test lit.responses[1].range == 1:6
     u = [0.5, -0.25, 0.1]
     @test _query(build_kernel(bind_data(lit, cols)).spec,
@@ -3306,7 +3305,7 @@ _ranged_ast(lhs) = Expr(:block,
         _query(build_kernel(bind_data(bare, cols)).spec,
             bind_data(bare, cols), :posterior, u)
     # Mismatched literal range fails at bind, naming both lengths.
-    badn = lower_rkppl(_ranged_ast(:(y[1:5])), (:y, :x))
+    badn = lower_rkppl(_ranged_ast(:(y[1:5])), (:y, :x); conditioned = (:y, :x))
     err = try
         bind_data(badn, cols)
         nothing
@@ -3320,24 +3319,24 @@ _ranged_ast(lhs) = Expr(:block,
             :(y[eachindex(x)]), :(y[axes(y, 2)]), :(y[axes(x, 1)]),
             :(y[axes(y)]), :(y[i]), :(y[3]), :(y[:]))
         # refused: length mismatch with obs-aligned likelihood (5 vs 6)
-        @test_throws SurfaceLoweringError lower_rkppl(_ranged_ast(lhs), (:y, :x))
+        @test_throws SurfaceLoweringError lower_rkppl(_ranged_ast(lhs), (:y, :x); conditioned = (:y, :x))
     end
     # Scalar tilde over a slice is crossed spelling; dotted LHS is out of scope.
     # refused: scalar ~ over a slice (P3)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         :(mu = a .+ b .* x),
-        Expr(:call, :~, :(y[1:6]), :(Normal.(mu, s)))), (:y, :x))
+        Expr(:call, :~, :(y[1:6]), :(Normal.(mu, s)))), (:y, :x); conditioned = (:y, :x))
     # refused: property-access LHS `a.b` names nothing (UndefVarError, P3)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         :(mu = a .+ b .* x),
-        Expr(:call, :.~, :(a.b), :(Normal.(mu, s)))), (:y, :x))
+        Expr(:call, :.~, :(a.b), :(Normal.(mu, s)))), (:y, :x); conditioned = (:y, :x))
     # Ownership: a second LHS for y fails naming the first statement's line.
     err = try
         lower_rkppl(Expr(:block,
             LineNumberNode(10), :(mu = a .+ b .* x),
             LineNumberNode(11), :(y .~ Normal.(mu, s)),
             LineNumberNode(12),
-            Expr(:call, :.~, :(y[eachindex(y)]), :(Normal.(mu, s)))), (:y, :x))
+            Expr(:call, :.~, :(y[eachindex(y)]), :(Normal.(mu, s)))), (:y, :x); conditioned = (:y, :x))
         nothing
     catch e
         e
@@ -3372,18 +3371,18 @@ _plate_gauss(R) = Expr(:block,
     cols, n = _gen_columns()
     bare = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
-            :(mu = a .+ b .* x), :(y .~ Normal.(mu, s))), (:y, :x))
+            :(mu = a .+ b .* x), :(y .~ Normal.(mu, s))), (:y, :x); conditioned = (:y, :x))
     # eachindex/axes plates are plan-identical to bare `.~`.
     for R in (:(eachindex(y)), :(axes(y, 1)))
-        @test _plans_equal(lower_rkppl(_plate_gauss(R), (:y, :x)), bare)
+        @test _plans_equal(lower_rkppl(_plate_gauss(R), (:y, :x); conditioned = (:y, :x)), bare)
     end
     # Literal-range plates carry the range like `y[1:N]`.
-    lit = lower_rkppl(_plate_gauss(:(1:6)), (:y, :x))
+    lit = lower_rkppl(_plate_gauss(:(1:6)), (:y, :x); conditioned = (:y, :x))
     @test lit.responses[1].range == 1:6
     ranged = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
             :(mu = a .+ b .* x),
-            Expr(:call, :.~, :(y[1:6]), :(Normal.(mu, s)))), (:y, :x))
+            Expr(:call, :.~, :(y[1:6]), :(Normal.(mu, s)))), (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(lit, ranged)
     # Deterministic cells: predictor-via-cell ≡ top-level predictor.
     cell = lower_rkppl(Expr(:block,
@@ -3392,15 +3391,15 @@ _plate_gauss(R) = Expr(:block,
                 Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                     Expr(:block, LineNumberNode(5),
                         :(t = a .+ b .* x[i]),
-                        :(y[i] ~ Normal.(t, s)))))), (:y, :x))
+                        :(y[i] ~ Normal.(t, s)))))), (:y, :x); conditioned = (:y, :x))
     top = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
-            :(t = a .+ b .* x), :(y .~ Normal.(t, s))), (:y, :x))
+            :(t = a .+ b .* x), :(y .~ Normal.(t, s))), (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(cell, top)
     # Values agree end to end.
     u = [0.5, -0.25, 0.1]
     bb, pb = bind_data(bare, cols), bind_data(
-        lower_rkppl(_plate_gauss(:(eachindex(y))), (:y, :x)), cols)
+        lower_rkppl(_plate_gauss(:(eachindex(y))), (:y, :x); conditioned = (:y, :x)), cols)
     @test _query(build_kernel(pb).spec, pb, :posterior, u) ==
         _query(build_kernel(bb).spec, bb, :posterior, u)
     # A scalar cell object is one draw per index, exactly what the
@@ -3411,7 +3410,7 @@ _plate_gauss(R) = Expr(:block,
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
                 Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                     Expr(:block, LineNumberNode(6),
-                        :(y[i] ~ Normal(mu[i], s)))))), (:y, :x)), bare)
+                        :(y[i] ~ Normal(mu[i], s)))))), (:y, :x); conditioned = (:y, :x)), bare)
     # Dotted wrappers strip through the desugar.
     wrap = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
@@ -3420,11 +3419,11 @@ _plate_gauss(R) = Expr(:block,
                 Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                     Expr(:block, LineNumberNode(6),
                         :(y[i] ~ truncated.(Normal.(mu[i], s), 0, 10)))))),
-        (:y, :x))
+        (:y, :x); conditioned = (:y, :x))
     wraptop = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
             :(mu = a .+ b .* x),
-            :(y .~ truncated.(Normal.(mu, s), 0, 10))), (:y, :x))
+            :(y .~ truncated.(Normal.(mu, s), 0, 10))), (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(wrap, wraptop)
 end
 
@@ -3473,11 +3472,11 @@ end
             :(s ~ Exponential(1)), :(mu = a .+ b .* x), bad)
         if i in (5, 6)
             # capability: a trailing singleton axis or an empty prior-only plate (P10a 0dejlw1; 10gzbm9 degenerate; todo `1qlbn5b`).
-            @test_broken (lower_rkppl(program, Dn); true)
+            @test_broken (lower_rkppl(program, Dn; conditioned = Dn); true)
         else
             # refused: non-for macro syntax, undeclared range names,
             # repeated observations in nested loops or parameter-dependent if (P3/P6; 05oe96l, 10gzbm9).
-            @test_throws SurfaceLoweringError lower_rkppl(program, Dn)
+            @test_throws SurfaceLoweringError lower_rkppl(program, Dn; conditioned = Dn)
         end
     end
     # Cell violations: broadcast, cross/lag index, bare loop var,
@@ -3503,11 +3502,11 @@ end
         if i in (1, 4, 6, 9)
             # capability: scalar .~, loop-index values, a prior-only latent
             # plate and singleton trailing dimensions (P3/P10a; 10gzbm9 degenerate; todo `1qlbn5b`).
-            @test_broken (lower_rkppl(program, Dn); true)
+            @test_broken (lower_rkppl(program, Dn; conditioned = Dn); true)
         else
             # refused: undeclared j/c, index 0 at the first iteration,
             # observing y[3] repeatedly or redefining scalar s (P3/P6, single assignment; 05oe96l).
-            @test_throws SurfaceLoweringError lower_rkppl(program, Dn)
+            @test_throws SurfaceLoweringError lower_rkppl(program, Dn; conditioned = Dn)
         end
     end
     # Bare whole vectors in cells (data, predictor, derived).
@@ -3518,7 +3517,7 @@ end
                 :(mu = a .+ b .* x),
                 Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                     Expr(:for, Expr(:(=), :i, :(eachindex(y))),
-                        Expr(:block, bad)))), Dn)
+                        Expr(:block, bad)))), Dn; conditioned = Dn)
     end
     # The predictor case names the fix (it would lower silently).
     err = try
@@ -3527,7 +3526,7 @@ end
                 :(mu = a .+ b .* x),
                 Expr(:macrocall, Symbol("@plate"), LineNumberNode(9),
                     Expr(:for, Expr(:(=), :i, :(eachindex(y))),
-                        Expr(:block, :(y[i] ~ Normal.(mu, s)))))), Dn)
+                        Expr(:block, :(y[i] ~ Normal.(mu, s)))))), Dn; conditioned = Dn)
         nothing
     catch e
         e
@@ -3543,35 +3542,35 @@ end
             :(mu = a .+ b .* x),
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                 Expr(:for, Expr(:(=), :i, :(eachindex(x))),
-                    Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))), Dn); true)
+                    Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))), Dn; conditioned = Dn); true)
     # refused: single assignment (a rebound in a cell)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)),
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                 Expr(:for, Expr(:(=), :i, :(eachindex(y))),
-                    Expr(:block, :(a = x[i]))))), Dn)
+                    Expr(:block, :(a = x[i]))))), Dn; conditioned = Dn)
     # refused: rebinds data name x
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                 Expr(:for, Expr(:(=), :i, :(eachindex(y))),
-                    Expr(:block, :(x = x[i]))))), Dn)
+                    Expr(:block, :(x = x[i]))))), Dn; conditioned = Dn)
     # refused: y observed twice (single assignment)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(y .~ Normal.(mu, s)),
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                 Expr(:for, Expr(:(=), :i, :(eachindex(y))),
-                    Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))), Dn)
+                    Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))), Dn; conditioned = Dn)
     # Docstrings on plates do not lower; @scan stays reserved.
     plate = Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
         Expr(:for, Expr(:(=), :i, :(eachindex(y))),
             Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))
     doc = Expr(:macrocall, Symbol("@doc"), LineNumberNode(1), "docs", plate)
     # refused: @doc on a loop is a Julia error ('cannot document the following expression') (P3)
-    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block, doc), Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block, doc), Dn; conditioned = Dn)
     # refused: malformed @scan (no for recurrence); comment '@scan stays reserved' is stale
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         Expr(:macrocall, Symbol("@scan"), LineNumberNode(1),
-            Expr(:block, :(y .~ Normal.(mu, s))))), Dn)
+            Expr(:block, :(y .~ Normal.(mu, s))))), Dn; conditioned = Dn)
 end
 
 # Slice: `@plate` per-cell sampling — `theta[i] ~ Normal(mu, tau)` declares a
@@ -3586,7 +3585,7 @@ _re_surface(R) = Expr(:block,
 
 @testset "surface plate per-cell sampling" begin
     cols, n = _gen_columns()
-    plan = lower_rkppl(_re_surface(:(eachindex(y))), (:y, :x))
+    plan = lower_rkppl(_re_surface(:(eachindex(y))), (:y, :x); conditioned = (:y, :x))
     # A per-cell latent parameter + a LatentTerm location predictor.
     @test length(plan.plate_parameters) == 1
     pp = plan.plate_parameters[1]
@@ -3618,9 +3617,9 @@ _re_surface(R) = Expr(:block,
                 :y)])
     @test _plans_equal(plan, hand)
     # eachindex/axes plates are plan-identical.
-    @test _plans_equal(lower_rkppl(_re_surface(:(axes(y, 1))), (:y, :x)), plan)
+    @test _plans_equal(lower_rkppl(_re_surface(:(axes(y, 1))), (:y, :x); conditioned = (:y, :x)), plan)
     # Literal range rides on the plate parameter and the response.
-    lit = lower_rkppl(_re_surface(:(1:6)), (:y, :x))
+    lit = lower_rkppl(_re_surface(:(1:6)), (:y, :x); conditioned = (:y, :x))
     @test lit.plate_parameters[1].range == 1:6
     @test lit.responses[1].range == 1:6
     # Values match a Distributions.jl oracle end to end.
@@ -3640,7 +3639,7 @@ _re_surface(R) = Expr(:block,
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block,
                     :(b[i] ~ HalfNormal(1)),
-                    :(y[i] ~ Normal.(b[i], sigma)))))), (:y,))
+                    :(y[i] ~ Normal.(b[i], sigma)))))), (:y,); conditioned = (:y,))
     @test hn.plate_parameters[1].support_override === :positive
 end
 
@@ -3652,14 +3651,14 @@ end
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ Normal.(0, 1)),
-                    :(y[i] ~ Normal.(theta[i], 1)))))), Dn); true)
+                    :(y[i] ~ Normal.(theta[i], 1)))))), Dn; conditioned = Dn); true)
     # Bare per-cell sample (must index the latent, or move the prior out).
     # refused: theta declared once per cell (single assignment)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta ~ Normal(0, 1)),
-                    :(y[i] ~ Normal.(theta, 1)))))), Dn)
+                    :(y[i] ~ Normal.(theta, 1)))))), Dn; conditioned = Dn)
     # A whole-vector per-cell prior arg must be indexed (`x[i]`, not bare `x`).
     # refused: Normal(vector, scalar) is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
@@ -3667,7 +3666,7 @@ end
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ Normal(x, tau)),
-                    :(y[i] ~ Normal.(theta[i], sigma)))))), Dn)
+                    :(y[i] ~ Normal.(theta[i], sigma)))))), Dn; conditioned = Dn)
     # A latent buried in a predictor expression (mixed latent + fixed) defers.
     # capability: mixed latent + fixed predictor expression in a plate cell (todo `0fkd9yk`)
     @test_broken (lower_rkppl(Expr(:block,
@@ -3675,7 +3674,7 @@ end
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ Normal(0, 1)),
-                    :(y[i] ~ Normal.(theta[i] .+ b .* x[i], sigma)))))), Dn); true)
+                    :(y[i] ~ Normal.(theta[i] .+ b .* x[i], sigma)))))), Dn; conditioned = Dn); true)
 end
 
 # Non-centered / latent-transform: a per-cell latent feeding a deterministic
@@ -3691,7 +3690,7 @@ end
                     :(z[i] ~ Normal(0, 1)),
                     :(theta[i] = mu .+ tau .* z[i]),
                     :(y[i] ~ Normal.(theta[i], sigma))))))
-    plan = lower_rkppl(ast, (:y, :x))
+    plan = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
     @test [p.name for p in plan.plate_parameters] == [:z]
     @test isempty(plan.derived)
     loc = only(plan.predictors)
@@ -3716,10 +3715,10 @@ end
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(4),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(mu[i] = a .+ b .* x[i]),
-                    :(y[i] ~ Normal.(mu[i], s)))))), (:y, :x))
+                    :(y[i] ~ Normal.(mu[i], s)))))), (:y, :x); conditioned = (:y, :x))
     bare = lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
-        :(mu = a .+ b .* x), :(y .~ Normal.(mu, s))), (:y, :x))
+        :(mu = a .+ b .* x), :(y .~ Normal.(mu, s))), (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(a, bare)
     @test all(t.kind !== LatentTerm for p in a.predictors for t in p.terms)
 end
@@ -3736,7 +3735,7 @@ end
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ Normal(x[i], tau)),
                     :(y[i] ~ Normal.(theta[i], sigma))))))
-    plan = lower_rkppl(ast, (:y, :x))
+    plan = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
     pp = only(plan.plate_parameters)
     @test collect(values(pp.args)) == [:x, :tau]     # per-cell x, shared tau
     bound = bind_data(plan, cols)
@@ -3755,7 +3754,7 @@ end
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ Normal(nope[i], tau)),
-                    :(y[i] ~ Normal.(theta[i], sigma)))))), (:y, :x))
+                    :(y[i] ~ Normal.(theta[i], sigma)))))), (:y, :x); conditioned = (:y, :x))
     # refused: unknown name nope (P6, 05oe96l)
     @test_throws ContractValidationError bind_data(bad, cols)
 end
@@ -3817,7 +3816,7 @@ end
         sig ~ sub_scale(1.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     want = lower_rkppl(quote
         b ~ Normal(0, 1)
         a ~ Normal(0, 5)
@@ -3825,7 +3824,7 @@ end
         sig = sig_r
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(got, want)
 
     # Namespacing under the LHS: the submodel local `r` becomes `sig_r`.
@@ -3839,7 +3838,7 @@ end
         sig ~ sub_scale_ret(1.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     @test _plans_equal(got_ret, want)
     @test _plans_equal(got_ret, got)
 
@@ -3851,14 +3850,14 @@ end
         m ~ sub_shift_ret(0.0, 2.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, m)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     gotvi = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         m ~ sub_shift(0.0, 2.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, m)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     wantv = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
@@ -3866,7 +3865,7 @@ end
         m = 0.0 + 2.0 * m_z
         eta = a .+ b .* x
         y .~ Normal.(eta, m)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(gotv, gotvi)
     @test _plans_equal(gotv, wantv)
 
@@ -3878,7 +3877,7 @@ end
         s2 ~ sub_scale(2.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, s1)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     @test any(p -> _test_scope_name(two, p.name) === :s1_r, two.parameters)
     @test any(p -> _test_scope_name(two, p.name) === :s2_r, two.parameters)
 
@@ -3900,8 +3899,8 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, sigma)
     end
-    bs = ms(; y = cols[:y], x = cols[:x])
-    bi = mi(; y = cols[:y], x = cols[:x])
+    bs = (ms(; x = cols[:x]) | (; y = cols[:y]))
+    bi = (mi(; x = cols[:x]) | (; y = cols[:y]))
     @test _plans_equal(bs, bi)
     built = build_kernel(bs)
     u = [0.5, -0.25, 0.1]
@@ -3915,14 +3914,14 @@ end
         sig ~ sub_scale(1.0, 2.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
 
     # Fail-closed: observation-stream form (data on the LHS) is the next slice.
     # refused: a data LHS observes a stream; a latent submodel value is conditioned through `|` / `condition` (P9, 18h1h54; 10gzbm9)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         eta = a .+ b .* x
         y ~ sub_scale(1.0)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
 
     # A nested submodel call expands after the enclosing body: names compose
     # under each use-site LHS (`sig` → `s` → `r` gives `sig_s_r`).
@@ -3932,7 +3931,7 @@ end
         sig ~ sub_nested(1.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     wantn = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
@@ -3941,7 +3940,7 @@ end
         sig = sig_s
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(gotn, wantn)
 
     # Fail-closed: a submodel body with no trailing return expression.
@@ -3950,7 +3949,7 @@ end
         sig ~ sub_noret(1.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
 
     # Fail-closed: an early (non-trailing) `return` and a bare `return`.
     # refused: non-trailing return leaves dead statements with no declarative meaning (P1, P2)
@@ -3958,13 +3957,13 @@ end
         sig ~ sub_earlyret(1.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     # refused: bare return yields nothing, used as a value
     @test_throws SurfaceLoweringError lower_rkppl(quote
         sig ~ sub_bare(1.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
 
     # Without a submodel binding in scope, `latent ~ foo(...)` stays an
     # ordinary (unknown-distribution) parameter error — no submodel capture.
@@ -3975,7 +3974,7 @@ end
         sig ~ not_a_submodel(1.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
 end
 
 # ── Observation-stream submodels (slice 2) ───────────────────────────────
@@ -4018,14 +4017,14 @@ end
     got = lower_rkppl(quote
         b ~ Normal(0, 1)
         y ~ obs_gstream(x)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     want = lower_rkppl(quote
         b ~ Normal(0, 1)
         y_a ~ Normal(0, 5)
         y_s ~ Exponential(1)
         y_eta = y_a .+ b .* x
         y .~ Normal.(y_eta, y_s)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(got, want)
 
     # slot→data, locals namespaced under the data column; one response over y.
@@ -4041,7 +4040,7 @@ end
     gotr = lower_rkppl(quote
         b ~ Normal(0, 1)
         y ~ obs_gstream_ret(x)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     @test _plans_equal(gotr, want)
     @test _plans_equal(gotr, got)
     @test length(gotr.responses) == 1
@@ -4052,7 +4051,7 @@ end
     two = lower_rkppl(quote
         y1 ~ obs_offstream(o1)
         y2 ~ obs_offstream(o2)
-    end, (:y1, :y2, :o1, :o2); mod = @__MODULE__)
+    end, (:y1, :y2, :o1, :o2); mod = @__MODULE__, conditioned = (:y1, :y2, :o1, :o2))
     @test Set(r.response for r in two.responses) == Set([:y1, :y2])
     @test any(p -> _test_scope_name(two, p.name) === :y1_s, two.parameters)
     @test any(p -> _test_scope_name(two, p.name) === :y2_s, two.parameters)
@@ -4071,8 +4070,8 @@ end
         y_eta = y_a .+ b .* x
         y .~ Normal.(y_eta, y_s)
     end
-    bs = ms(; y = cols[:y], x = cols[:x])
-    bi = mi(; y = cols[:y], x = cols[:x])
+    bs = (ms(; x = cols[:x]) | (; y = cols[:y]))
+    bi = (mi(; x = cols[:x]) | (; y = cols[:y]))
     @test _plans_equal(bs, bi)
     built = build_kernel(bs)
     u = [0.5, -0.25, 0.1]
@@ -4086,20 +4085,20 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y ~ Normal(mu, 1.0)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
 
     # A latent submodel on a data LHS is incompatible (scalar-shaped value).
     # refused: a data LHS observes a stream; a latent submodel value is conditioned through `|` / `condition` (P9, 18h1h54; 10gzbm9)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         y ~ obs_latent(1.0)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
 
     # A stream submodel on a non-data LHS is rejected (bind it to data).
     # capability: stream submodel on a latent (non-data) LHS (generative stream) (todo `1qlbn5b`)
     @test_broken (lower_rkppl(quote
         z ~ obs_gstream(x)
         w .~ Normal.(z, 1.0)
-    end, (:w, :x); mod = @__MODULE__); true)
+    end, (:w, :x); mod = @__MODULE__, conditioned = (:w, :x)); true)
 end
 
 # ── Fused-GLM stream fixtures for predictor pins ─────────────────────────
@@ -4151,12 +4150,12 @@ end
     got = lower_rkppl(quote
         b ~ Normal(0, 2)
         y ~ pin_fused(x, b; predictor = mu)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     want = lower_rkppl(quote
         b ~ Normal(0, 2)
         mu = b .* x
         y .~ Bernoulli.(logistic.(mu))
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(got, want)
     @test only(got.predictors).name === :mu
     @test got.responses[1].predictor === :mu
@@ -4166,32 +4165,32 @@ end
     goti = lower_rkppl(quote
         b ~ Normal(0, 2)
         y ~ pin_inline(x, b; predictor = mu)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     @test _plans_equal(goti, want)
     # A fused head inside a pinned def composes (the fused spelling rides
     # the pinned predictor).
     gotfh = lower_rkppl(quote
         b ~ Normal(0, 2)
         y ~ pin_fusedhead(x, b; predictor = mu)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     @test _plans_equal(gotfh, want)
     # Without a pin the default names are unchanged (namespaced local /
     # synthetic compound).
     unp = lower_rkppl(quote
         b ~ Normal(0, 2)
         y ~ pin_fused(x, b)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     @test _test_scope_name(unp, only(unp.predictors).name) === :y_mu
     unpi = lower_rkppl(quote
         b ~ Normal(0, 2)
         y ~ pin_inline(x, b)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     @test only(unpi.predictors).name === :y_eta
     # Pinning the name the default would synthesize is a no-op.
     noop = lower_rkppl(quote
         b ~ Normal(0, 2)
         y ~ pin_fused(x, b; predictor = y_mu)
-    end, (:y, :x); mod = @__MODULE__)
+    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     @test only(noop.predictors).name === :y_mu
     # Two use sites pin distinct predictors (multi-use stays safe; each
     # predictor keeps its own coefficient — blocks are per-predictor).
@@ -4200,7 +4199,7 @@ end
         b2 ~ Normal(0, 2)
         y1 ~ pin_fused(x, b1; predictor = mu1)
         y2 ~ pin_fused(x, b2; predictor = mu2)
-    end, (:y1, :y2, :x); mod = @__MODULE__)
+    end, (:y1, :y2, :x); mod = @__MODULE__, conditioned = (:y1, :y2, :x))
     @test Set(p.name for p in two.predictors) == Set([:mu1, :mu2])
     # A pin over a latent location names the latent predictor.
     gotl = lower_rkppl(quote
@@ -4209,7 +4208,7 @@ end
         end
         s ~ Exponential(1)
         y ~ pin_latloc(s; predictor = mu)
-    end, (:y,); mod = @__MODULE__)
+    end, (:y,); mod = @__MODULE__, conditioned = (:y,))
     @test only(gotl.predictors).name === :mu
     @test only(gotl.predictors).terms[1].kind === LatentTerm
     # End-to-end: the pinned program binds, builds and queries identically
@@ -4226,8 +4225,8 @@ end
         mu = b .* x
         y .~ Bernoulli.(logistic.(mu))
     end
-    bp = mp(; y = yb, x = cols[:x])
-    bd = md(; y = yb, x = cols[:x])
+    bp = (mp(; x = cols[:x]) | (; y = yb))
+    bd = (md(; x = cols[:x]) | (; y = yb))
     @test _plans_equal(bp, bd)
     builtp = build_kernel(bp)
     u = [0.5]
@@ -4241,21 +4240,21 @@ end
             b ~ Normal(0, 2)
             y1 ~ pin_fused(x, b; predictor = mu)
             y2 ~ pin_fused(x, b; predictor = mu)
-        end, (:y1, :y2, :x); mod = @__MODULE__)
+        end, (:y1, :y2, :x); mod = @__MODULE__, conditioned = (:y1, :y2, :x))
     # Fail-closed: one response pinning two predictors.
     # refused: predictor= pin is retired by the author-name contract (1cmodra names)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             b ~ Normal(0, 2)
             y ~ pin_fused(x, b; predictor = mu1)
             y ~ pin_inline(x, b; predictor = mu2)
-        end, (:y, :x); mod = @__MODULE__)
+        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     # Fail-closed: a pin on a latent (value-returning) call.
     # refused: predictor= pin is retired by the author-name contract (1cmodra names)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             sig ~ sub_scale(1.0; predictor = mu)
             mu = a .+ b .* x
             y .~ Normal.(mu, sig)
-        end, (:y, :x); mod = @__MODULE__)
+        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     # Fail-closed: a pin claiming a taken name.
     # refused: predictor= pin is retired by the author-name contract (1cmodra names)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -4263,30 +4262,30 @@ end
             b ~ Normal(0, 2)
             mu = a .+ b .* x
             y ~ pin_fused(x, b; predictor = mu)
-        end, (:y, :x); mod = @__MODULE__)
+        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     # Fail-closed: a pin on a multi-predictor (leveled) response.
     # refused: predictor= pin is retired by the author-name contract (1cmodra names)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             b ~ Normal(0, 2)
             y ~ pin_cat(x, b; predictor = mu)
-        end, (:y, :x); mod = @__MODULE__)
+        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     # Fail-closed: a pin on a predictorless (simplex) response.
     # refused: predictor= pin is retired by the author-name contract (1cmodra names)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             s ~ Dirichlet(2, 1.0)
             y ~ pin_simplex(s; predictor = mu)
-        end, (:y,); mod = @__MODULE__)
+        end, (:y,); mod = @__MODULE__, conditioned = (:y,))
     # Fail-closed: a non-Symbol pin and an unknown keyword.
     # refused: predictor= pin is retired by the author-name contract (1cmodra names)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             b ~ Normal(0, 2)
             y ~ pin_fused(x, b; predictor = "mu")
-        end, (:y, :x); mod = @__MODULE__)
+        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     # refused: foo is not a submodel keyword (Julia signature, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             b ~ Normal(0, 2)
             y ~ pin_fused(x, b; foo = 1)
-        end, (:y, :x); mod = @__MODULE__)
+        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
     # Fail-closed: a pin cannot fork a shared location (either order, either
     # claimant shape).
     # refused: predictor= pin is retired by the author-name contract (1cmodra names)
@@ -4295,28 +4294,28 @@ end
             z .~ Normal.(w, 1.0)
             s ~ Exponential(1)
             y ~ pin_sharedloc(s; predictor = mu)
-        end, (:z, :y, :x); mod = @__MODULE__)
+        end, (:z, :y, :x); mod = @__MODULE__, conditioned = (:z, :y, :x))
     # refused: predictor= pin is retired by the author-name contract (1cmodra names)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             w = a .+ b .* x
             s ~ Exponential(1)
             y ~ pin_sharedloc(s; predictor = mu)
             z .~ Normal.(w, 1.0)
-        end, (:y, :z, :x); mod = @__MODULE__)
+        end, (:y, :z, :x); mod = @__MODULE__, conditioned = (:y, :z, :x))
     # refused: predictor= pin is retired by the author-name contract (1cmodra names)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             w = a .+ b .* x
             s ~ Exponential(1)
             y1 ~ pin_sharedloc(s; predictor = mu1)
             y2 ~ pin_sharedloc(s; predictor = mu2)
-        end, (:y1, :y2, :x); mod = @__MODULE__)
+        end, (:y1, :y2, :x); mod = @__MODULE__, conditioned = (:y1, :y2, :x))
     # Fail-closed: a pin claiming a synthesized predictor name.
     # refused: predictor= pin is retired by the author-name contract (1cmodra names)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             b ~ Normal(0, 2)
             z .~ Bernoulli.(logistic.(b .* x))
             y ~ pin_fused(x, b; predictor = z_eta)
-        end, (:z, :y, :x); mod = @__MODULE__)
+        end, (:z, :y, :x); mod = @__MODULE__, conditioned = (:z, :y, :x))
 end
 
 # ── Per-cell submodels inside `@plate` (StanBlocks parity) ────────────────
@@ -4379,9 +4378,9 @@ _pcs(cells...) = Expr(:block,
 
     # ── Centered latent submodel == the hand-written per-cell parameter.
     sub = lower_rkppl(_pcs(:(theta[i] ~ pcs_centered(mu, tau)),
-                           :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); mod = M)
+                           :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); mod = M, conditioned = (:y, :x))
     hand = lower_rkppl(_pcs(:(theta[i] ~ Normal(mu, tau)),
-                            :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x))
+                            :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(sub, hand)
     pp = only(sub.plate_parameters)
     @test pp.name === :theta && pp.family === :normal &&
@@ -4391,16 +4390,16 @@ _pcs(cells...) = Expr(:block,
     # ── Explicit-`return` centered latent == the implicit twin and the
     # hand-written per-cell parameter.
     subr = lower_rkppl(_pcs(:(theta[i] ~ pcs_centered_ret(mu, tau)),
-                            :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); mod = M)
+                            :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); mod = M, conditioned = (:y, :x))
     @test _plans_equal(subr, sub)
     @test _plans_equal(subr, hand)
 
     # ── Non-centered latent submodel == the hand-inlined `z`-transform.
     subn = lower_rkppl(_pcs(:(theta[i] ~ pcs_ncp(mu, tau)),
-                            :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); mod = M)
+                            :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); mod = M, conditioned = (:y, :x))
     handn = lower_rkppl(_pcs(:(theta_z[i] ~ Normal(0, 1)),
                              :(theta[i] = mu .+ tau .* theta_z[i]),
-                             :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x))
+                             :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); conditioned = (:y, :x))
     @test _plans_equal(subn, handn)
     @test [_test_scope_name(subn, p.name) for p in subn.plate_parameters] == [:theta_z]
     @test isempty(subn.derived)
@@ -4427,7 +4426,7 @@ _pcs(cells...) = Expr(:block,
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ pcs_centered(x[i], tau)),
-                    :(y[i] ~ Normal.(theta[i], sigma)))))), (:y, :x); mod = M)
+                    :(y[i] ~ Normal.(theta[i], sigma)))))), (:y, :x); mod = M, conditioned = (:y, :x))
     @test collect(values(only(subv.plate_parameters).args)) == [:x, :tau]
     bv = bind_data(subv, cols)
     builtv = build_kernel(bv)
@@ -4446,7 +4445,7 @@ _pcs(cells...) = Expr(:block,
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(b[i] ~ pcs_hn(1)),
-                    :(y[i] ~ Normal.(b[i], sigma)))))), (:y,); mod = M)
+                    :(y[i] ~ Normal.(b[i], sigma)))))), (:y,); mod = M, conditioned = (:y,))
     @test only(subh.plate_parameters).support_override === :positive
 
     # ── Two use sites of the same submodel namespace independently (no clash).
@@ -4455,12 +4454,12 @@ _pcs(cells...) = Expr(:block,
     two = lower_rkppl(_pcs(:(a[i] ~ pcs_ncp(mu, tau)),
                            :(c[i] ~ pcs_ncp(mu, tau)),
                            :(s[i] = a[i] .+ c[i]),
-                           :(y[i] ~ Normal.(s[i], sigma))), (:y, :x); mod = M)
+                           :(y[i] ~ Normal.(s[i], sigma))), (:y, :x); mod = M, conditioned = (:y, :x))
     @test Set(_test_scope_name(two, p.name) for p in two.plate_parameters) == Set([:a_z, :c_z])
 
     # ── Observation-stream submodel on a DATA column: own per-cell offset +
     # derived location + dotted obs slot (shared scalar scale).
-    subo = lower_rkppl(_pcs(:(y[i] ~ pcs_obs(mu, sigma))), (:y, :x); mod = M)
+    subo = lower_rkppl(_pcs(:(y[i] ~ pcs_obs(mu, sigma))), (:y, :x); mod = M, conditioned = (:y, :x))
     @test _test_scope_name(subo, only(subo.plate_parameters).name) === :y_b
     @test :y_q in [_test_scope_name(subo, d.name) for d in subo.derived]
     @test only(subo.predictors).terms[1].kind === LatentTerm
@@ -4478,7 +4477,7 @@ _pcs(cells...) = Expr(:block,
     _check_gradient(builto.spec, bo, uo)
 
     # ── Explicit-`return` per-cell observation slot == the implicit twin.
-    subor = lower_rkppl(_pcs(:(y[i] ~ pcs_obs_ret(mu, sigma))), (:y, :x); mod = M)
+    subor = lower_rkppl(_pcs(:(y[i] ~ pcs_obs_ret(mu, sigma))), (:y, :x); mod = M, conditioned = (:y, :x))
     @test _plans_equal(subor, subo)
     @test _test_scope_name(subor, only(subor.plate_parameters).name) === :y_b
 end
@@ -4490,40 +4489,40 @@ end
     # refused: submodel arity mismatch (MethodError)
     @test_throws SurfaceLoweringError lower_rkppl(
         _pcs(:(theta[i] ~ pcs_centered(mu)),
-             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M)
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D)
     # A nested per-cell call expands per cell (the direct-bound slot `s` is a
     # per-cell call in turn): it equals the hand-written per-cell parameter.
     @test _plans_equal(lower_rkppl(
         _pcs(:(theta[i] ~ pcs_nested(tau)),
-             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M),
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D),
         lower_rkppl(_pcs(:(theta_s[i] ~ Normal(0, tau)),
              :(theta[i] = theta_s[i]),
-             :(y[i] ~ Normal.(theta[i], sigma))), D))
+             :(y[i] ~ Normal.(theta[i], sigma))), D; conditioned = D))
     # No trailing return expression.
     # refused: submodel used as a value has no return expression
     @test_throws SurfaceLoweringError lower_rkppl(
         _pcs(:(theta[i] ~ pcs_noret(tau)),
-             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M)
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D)
     # An observation submodel bound to a NON-data latent LHS.
     # capability: observation-stream submodel on a latent per-cell LHS (todo `1qlbn5b`)
     @test_broken (lower_rkppl(
         _pcs(:(theta[i] ~ pcs_obs(mu, sigma)),
-             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M); true)
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D); true)
     # A latent submodel bound to a DATA column (needs a dotted observation slot).
     # refused: a data LHS observes a stream; a latent submodel value is conditioned through `|` / `condition` (P9, 18h1h54; 10gzbm9)
     @test_throws SurfaceLoweringError lower_rkppl(
-        _pcs(:(y[i] ~ pcs_centered(mu, tau))), D; mod = M)
+        _pcs(:(y[i] ~ pcs_centered(mu, tau))), D; mod = M, conditioned = D)
     # A `predictor = ...` pin is top-level-only (per-cell predictors lower
     # through the plate path, not the pinned location path).
     # capability: predictor pin on a per-cell submodel; NB pins taken name mu, re-pin with a free name (todo `1qlbn5b`)
     @test_broken (lower_rkppl(
-        _pcs(:(y[i] ~ pcs_obs(mu, sigma; predictor = mu))), D; mod = M); true)
+        _pcs(:(y[i] ~ pcs_obs(mu, sigma; predictor = mu))), D; mod = M, conditioned = D); true)
     # Without a submodel binding in scope, an unknown call head stays an
     # ordinary per-cell distribution error (no submodel capture).
     # refused: undefined submodel/distribution not_a_submodel
     @test_throws SurfaceLoweringError lower_rkppl(
         _pcs(:(theta[i] ~ not_a_submodel(mu, tau)),
-             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M)
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D)
 end
 
 # ── Leveled responses (categorical / ordinal / multinomial) ─────────────
@@ -4540,7 +4539,7 @@ end
         :(eta2 = a2 .+ b2 .* x),
         :(eta3 = a3 .+ b3 .* x),
         :(y .~ CategoricalLogit.(eta2, eta3)))
-    plan = lower_rkppl(ast, (:y, :x))
+    plan = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
     r = only(plan.responses)
     @test r.family === CategoricalLogitFam
     @test r.link === LogitLink
@@ -4552,7 +4551,7 @@ end
             :(a2 ~ Normal(0, 1)), :(b2 ~ Normal(0, 2)),
             :(a3 ~ Normal(0, 1)), :(b3 ~ Normal(0, 2)),
             :(y .~ CategoricalLogit.(a2 .+ b2 .* x, a3 .+ b3 .* x))),
-        (:y, :x))
+        (:y, :x); conditioned = (:y, :x))
     ri = only(inline.responses)
     @test ri.predictor === :y_eta_1
     @test ri.extra_predictors == [:y_eta_2]
@@ -4576,7 +4575,7 @@ end
     # Zero etas is not a categorical.
     # refused: CategoricalLogit with zero etas (malformed)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
-        :(y .~ CategoricalLogit.())), (:y, :x))
+        :(y .~ CategoricalLogit.())), (:y, :x); conditioned = (:y, :x))
 end
 
 @testset "surface ordered logistic" begin
@@ -4584,7 +4583,7 @@ end
         :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
         :(eta = a .+ b .* x),
         :(y .~ OrderedLogistic.(eta)))
-    plan = lower_rkppl(ast, (:y, :x))
+    plan = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
     r = only(plan.responses)
     @test r.family === OrderedLogisticFam
     @test r.thresholds === :y_cutpoints
@@ -4598,13 +4597,13 @@ end
             :(y_cutpoints ~ Normal(0, 1)),
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(eta = a .+ b .* x),
-            :(y .~ OrderedLogistic.(eta))), (:y, :x))
+            :(y .~ OrderedLogistic.(eta))), (:y, :x); conditioned = (:y, :x))
     # Arity is exactly one eta.
     # refused: OrderedLogistic.(eta, eta): scalar cutpoints are malformed
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(eta = a .+ b .* x),
-            :(y .~ OrderedLogistic.(eta, eta))), (:y, :x))
+            :(y .~ OrderedLogistic.(eta, eta))), (:y, :x); conditioned = (:y, :x))
     # Bind + value roundtrip.
     cols = Dict{Symbol,AbstractVector}(:y => [1, 2, 3, 2, 1, 3],
         :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0])
@@ -4629,7 +4628,7 @@ end
         :(b ~ Normal(0, 1)),
         :(eta = b .* x),
         :(y .~ Ordinal.(Cumulative(), LogitLink(), eta)))
-    plan = lower_rkppl(ast, (:y, :x))
+    plan = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
     r = only(plan.responses)
     @test r.family === OrdinalFam
     @test r.link === LogitLink
@@ -4639,36 +4638,36 @@ end
     stopping = lower_rkppl(Expr(:block,
             :(b ~ Normal(0, 1)),
             :(eta = b .* x),
-            :(y .~ Ordinal.(StoppingRatio(), ProbitLink(), eta))), (:y, :x))
+            :(y .~ Ordinal.(StoppingRatio(), ProbitLink(), eta))), (:y, :x); conditioned = (:y, :x))
     rs = only(stopping.responses)
     @test rs.link === ProbitLink && rs.ordinal_structure === :stopping
     @test only(stopping.vector_parameters).family === :vector_normal
     clog = lower_rkppl(Expr(:block,
             :(b ~ Normal(0, 1)),
             :(eta = b .* x),
-            :(y .~ Ordinal.(Cumulative(), CloglogLink(), eta))), (:y, :x))
+            :(y .~ Ordinal.(Cumulative(), CloglogLink(), eta))), (:y, :x); conditioned = (:y, :x))
     @test only(clog.responses).link === CloglogLink
     # Tag misspellings, wrong arity, and discrimination/adhoc extras fail.
     # refused: malformed distribution: wrong arity for the head (Ordinal missing link)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(b ~ Normal(0, 1)),
             :(eta = b .* x),
-            :(y .~ Ordinal.(Cumulative(), eta))), (:y, :x))
+            :(y .~ Ordinal.(Cumulative(), eta))), (:y, :x); conditioned = (:y, :x))
     # refused: malformed distribution: wrong arity for the head (Ordinal extra positional arg)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(b ~ Normal(0, 1)),
             :(eta = b .* x),
-            :(y .~ Ordinal.(Cumulative(), LogitLink(), eta, 2.0))), (:y, :x))
+            :(y .~ Ordinal.(Cumulative(), LogitLink(), eta, 2.0))), (:y, :x); conditioned = (:y, :x))
     # refused: Sequential is not a defined ordinal structure (undefined)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(b ~ Normal(0, 1)),
             :(eta = b .* x),
-            :(y .~ Ordinal.(Sequential(), LogitLink(), eta))), (:y, :x))
+            :(y .~ Ordinal.(Sequential(), LogitLink(), eta))), (:y, :x); conditioned = (:y, :x))
     # Intercepts and thresholds are both part of the authored model.
     with_intercept = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(eta = a .+ b .* x),
-            :(y .~ Ordinal.(Cumulative(), LogitLink(), eta))), (:y, :x))
+            :(y .~ Ordinal.(Cumulative(), LogitLink(), eta))), (:y, :x); conditioned = (:y, :x))
     @test any(t -> t.kind === InterceptTerm,
         only(with_intercept.predictors).terms)
 end
@@ -4677,7 +4676,7 @@ end
     ast = Expr(:block,
         :(s ~ Dirichlet([2.0, 2.0, 2.0])),
         :(eachrow(hcat(c1, c2, c3)) .~ Multinomial.(N, Ref(s))))
-    plan = lower_rkppl(ast, (:c1, :c2, :c3, :N))
+    plan = lower_rkppl(ast, (:c1, :c2, :c3, :N); conditioned = (:c1, :c2, :c3, :N))
     r = only(plan.responses)
     @test r.family === MultinomialFam
     @test r.link === IdentityLink
@@ -4690,7 +4689,7 @@ end
     # Symmetric Dirichlet + literal trials + value roundtrip.
     lit = lower_rkppl(Expr(:block,
             :(s ~ Dirichlet(3, 1.0)),
-            :(eachrow(hcat(c1, c2, c3)) .~ Multinomial.(3, Ref(s)))), (:c1, :c2, :c3))
+            :(eachrow(hcat(c1, c2, c3)) .~ Multinomial.(3, Ref(s)))), (:c1, :c2, :c3); conditioned = (:c1, :c2, :c3))
     @test only(lit.vector_parameters).args.arg1 == [1.0, 1.0, 1.0]
     @test only(lit.responses).trials === 3
     cols = Dict{Symbol,AbstractVector}(:c1 => [1, 1, 1, 0],
@@ -4705,23 +4704,23 @@ end
     # An undeclared simplex fails at plan validation (not silently).
     # refused: undeclared simplex s (P6, 05oe96l)
     @test_throws ContractValidationError lower_rkppl(Expr(:block,
-            :(eachrow(hcat(c1, c2, c3)) .~ Multinomial.(N, Ref(s)))), (:c1, :c2, :c3, :N))
+            :(eachrow(hcat(c1, c2, c3)) .~ Multinomial.(N, Ref(s)))), (:c1, :c2, :c3, :N); conditioned = (:c1, :c2, :c3, :N))
     # Non-symbol probs and missing trials fail at lowering.
     # refused: s .+ 1 does not sum to 1 (invalid probabilities)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(s ~ Dirichlet(3, 1.0)),
-            :(eachrow(hcat(c1, c2, c3)) .~ Multinomial.(N, Ref(s .+ 1)))), (:c1, :c2, :c3, :N))
+            :(eachrow(hcat(c1, c2, c3)) .~ Multinomial.(N, Ref(s .+ 1)))), (:c1, :c2, :c3, :N); conditioned = (:c1, :c2, :c3, :N))
     # refused: Multinomial without trials (malformed)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(s ~ Dirichlet(3, 1.0)),
-            :(c1 .~ Multinomial.(s))), (:c1, :c2, :c3, :N))
+            :(c1 .~ Multinomial.(s))), (:c1, :c2, :c3, :N); conditioned = (:c1, :c2, :c3, :N))
 end
 
 @testset "surface categorical simplex" begin
     ast = Expr(:block,
         :(s ~ Dirichlet(3, 1.0)),
         :(y .~ Categorical(s)))
-    plan = lower_rkppl(ast, (:y,))
+    plan = lower_rkppl(ast, (:y,); conditioned = (:y,))
     r = only(plan.responses)
     @test r.family === CategoricalFam
     @test r.predictor === :s
@@ -4736,22 +4735,31 @@ end
     # refused: Categorical(p, p) is malformed
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(s ~ Dirichlet(3, 1.0)),
-            :(y .~ Categorical(s, s))), (:y,))
+            :(y .~ Categorical(s, s))), (:y,); conditioned = (:y,))
 end
 
 @testset "surface dirichlet failures" begin
-    # Concentrations are literal hyperparameters (vector or symmetric).
+    # Malformed constructors fail at lowering. Named concentrations are
+    # inputs whose values are required when binding.
     for rhs in (:(Dirichlet()), :(Dirichlet([1.0, 2.0], 1.0)),
-            :(Dirichlet(alpha)), :(Dirichlet(0, 1.0)), :(Dirichlet([1.0, s])))
+            :(Dirichlet(0, 1.0)), :(Dirichlet([1.0, s])))
         # refused: malformed Dirichlet (no args)
-        @test_throws SurfaceLoweringError lower_rkppl(
+        error_type = rhs == :(Dirichlet([1.0, s])) ?
+            ContractValidationError : SurfaceLoweringError
+        @test_throws error_type lower_rkppl(
             Expr(:block, Expr(:call, :~, :s, rhs),
-                :(y .~ Categorical(s))), (:y,))
+                :(y .~ Categorical(s))), (:y,); conditioned = (:y,))
     end
+    concentration_input = lower_rkppl(quote
+        s ~ Dirichlet(alpha)
+        y .~ Categorical(s)
+    end, (:y,); conditioned = (:y,))
+    @test_throws ContractValidationError bind_data(concentration_input,
+        Dict(:y => [1, 2]))
     # A Dirichlet cannot shadow a predictor coefficient.
     # refused: 2-simplex s .* x against the observation vector: Julia DimensionMismatch (P3)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(s ~ Dirichlet(2, 1.0)),
             :(eta = a .+ s .* x),
-            :(y .~ Normal.(eta, 1.0))), (:y, :x))
+            :(y .~ Normal.(eta, 1.0))), (:y, :x); conditioned = (:y, :x))
 end

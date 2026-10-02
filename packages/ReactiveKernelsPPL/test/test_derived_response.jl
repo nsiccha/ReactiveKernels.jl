@@ -32,7 +32,7 @@ function _dr_m1_oracle(b1::Real, b2::Real, s::Real)
 end
 
 @testset "derived response admission" begin
-    plan = lower_rkppl(_DR_M1, (:earn, :x))
+    plan = lower_rkppl(_DR_M1, (:earn, :x); conditioned = (:earn, :x))
     r = only(plan.responses)
     @test r.response === :ly
     @test r.label === :ly_resp
@@ -49,7 +49,7 @@ end
             ly .~ Normal.(mu, s)
             mu = b1 .+ b2 .* x
             ly = log.(earn)
-        end, (:earn, :x))
+        end, (:earn, :x); conditioned = (:earn, :x))
     @test [rr.response for rr in fwd.responses] == [:ly]
     @test [d.name for d in fwd.derived] == [:ly]
     # Bind materializes the response from bound data.
@@ -130,10 +130,10 @@ end
                 b2 ~ Normal(0, 1)
                 s ~ Exponential(1)
             end
-            @test_broken (lower_rkppl(Expr(:block, declarations.args..., prog.args...), (:earn, :x, :g)); true)
+            @test_broken (lower_rkppl(Expr(:block, declarations.args..., prog.args...), (:earn, :x, :g); conditioned = (:earn, :x, :g)); true)
         else
             err = try
-                lower_rkppl(prog, (:earn, :x, :g))
+                lower_rkppl(prog, (:earn, :x, :g); conditioned = (:earn, :x, :g))
                 nothing
             catch e
                 e
@@ -146,7 +146,7 @@ end
 end
 
 @testset "derived response bind" begin
-    plan = lower_rkppl(_DR_M1, (:earn, :x))
+    plan = lower_rkppl(_DR_M1, (:earn, :x); conditioned = (:earn, :x))
     # A caller column the model derives is a shadowing bug, not data.
     err = try
         bind_data(plan, Dict{Symbol,AbstractVector}(:earn => copy(_DR_EARN),
@@ -168,7 +168,7 @@ end
                 ly = earn .* t
                 mu = b1 .+ b2 .* x
                 ly .~ Normal.(mu, s)
-            end, (:earn, :x))
+            end, (:earn, :x); conditioned = (:earn, :x))
         bind_data(pplan, _dr_cols())
         nothing
     catch e
@@ -187,7 +187,7 @@ end
             ly = l2 .+ zc
             mu = b1 .+ b2 .* x
             ly .~ Normal.(mu, s)
-        end, (:earn, :x))
+        end, (:earn, :x); conditioned = (:earn, :x))
     cbound = bind_data(cplan, _dr_cols())
     using_mean = sum(_DR_X) / length(_DR_X)
     @test cbound.columns[:ly] ≈ log.(_DR_EARN) .+ (_DR_X .- using_mean)
@@ -200,7 +200,7 @@ end
                 yb = earn .- 1.0
                 mu = b1 .+ b2 .* x
                 yb .~ BernoulliLogit.(mu)
-            end, (:earn, :x))
+            end, (:earn, :x); conditioned = (:earn, :x))
         bind_data(bplan, _dr_cols())
         nothing
     catch e

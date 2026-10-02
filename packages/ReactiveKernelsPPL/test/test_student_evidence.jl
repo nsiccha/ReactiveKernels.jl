@@ -14,7 +14,7 @@ using Test
 # Lower + bind + build + query an evidence program; return
 # `(bound, built, kern, layout)`.
 function _stev_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -41,7 +41,7 @@ end
             sigma ~ Exponential(1.0)
             y .~ $wrap.(StudentT.(3.0, mu, sigma), lo, hi)
         end""")
-        plan = lower_rkppl(prog, (:y, :x, :lo, :hi))
+        plan = lower_rkppl(prog, (:y, :x, :lo, :hi); conditioned = (:y, :x, :lo, :hi))
         r = only(plan.responses)
         @test r.family === StudentTFam
         @test r.evidence.kind === Symbol(wrap)
@@ -54,7 +54,7 @@ end
         mu = a .+ b .* x
         sigma ~ Exponential(1.0)
         y .~ interval_censored.(StudentT.(3.0, mu, sigma), hi)
-    end"""), (:y, :x, :hi))
+    end"""), (:y, :x, :hi); conditioned = (:y, :x, :hi))
     ir = only(iplan.responses)
     @test ir.family === StudentTFam
     @test ir.evidence.kind === :interval_censored
@@ -67,7 +67,7 @@ end
             b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ censored.(HurdlePoisson.(exp.(mu), 0.1), lo, hi)
-        end"""), (:y, :x, :lo, :hi)),
+        end"""), (:y, :x, :lo, :hi); conditioned = (:y, :x, :lo, :hi)),
         Dict{Symbol,AbstractVector}(:y => [1, 2], :x => [0.5, 1.5],
             :lo => [0, 0], :hi => [5, 5])); true)
 end
@@ -169,7 +169,7 @@ end
         sigma ~ Exponential(1.0)
         y .~ censored.(StudentT.(3.0, mu, sigma), lo, hi)
     end""")
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
@@ -181,7 +181,7 @@ end
 # verified green on the default pipeline (robust baseline §7n scope
 # note), so no ladder-1 pin here.
 function _stev_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

@@ -14,7 +14,7 @@ using Test
 # Lower + bind + build + query a complement program; return
 # `(bound, built, kern, layout)`.
 function _mixc_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -32,7 +32,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
         sigma ~ Exponential(1.0)
         theta ~ Beta(5.0, 5.0)
         y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([theta, 1.0 - theta]))
-    end"""), (:y,))
+    end"""), (:y,); conditioned = (:y,))
     r = only(plan.responses)
     @test r.family === MixtureFam
     @test r.mixture_weights == MixtureComplementWeights(:theta, true)
@@ -45,7 +45,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
         sigma ~ Exponential(1.0)
         theta ~ Beta(5.0, 5.0)
         y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([1.0 - theta, theta]))
-    end"""), (:y,))
+    end"""), (:y,); conditioned = (:y,))
     rr = only(rplan.responses)
     @test rr.mixture_weights == MixtureComplementWeights(:theta, false)
 
@@ -58,7 +58,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
         a ~ Beta(2.0, 2.0)
         b ~ Beta(2.0, 2.0)
         y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([a, b]))
-    end"""), (:y,))
+    end"""), (:y,); conditioned = (:y,))
 
     # Non-unit params fail at contract.
     # refused: [s, 1 - s] with s ~ Exponential gives a negative weight (support mismatch)
@@ -69,7 +69,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
             sigma ~ Exponential(1.0)
             s ~ Exponential(1.0)
             y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([s, 1.0 - s]))
-        end"""), (:y,)),
+        end"""), (:y,); conditioned = (:y,)),
         Dict{Symbol,AbstractVector}(:y => [0.5, -1.0]))
 
     # K != 2 fails at contract.
@@ -82,7 +82,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
             sigma ~ Exponential(1.0)
             theta ~ Beta(5.0, 5.0)
             y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma), Normal.(mu3, sigma)), Ref([theta, 1.0 - theta]))
-        end"""), (:y,)),
+        end"""), (:y,); conditioned = (:y,)),
         Dict{Symbol,AbstractVector}(:y => [0.5, -1.0]))
 end
 
@@ -120,7 +120,7 @@ end
         y .~ MixtureModel.(vcat.(Normal.(mu1, sigma1), Normal.(mu2, sigma2)), Ref([theta, 1.0 - theta]))
     end""")
     cols = Dict{Symbol,AbstractVector}(:y => [0.5, -1.0, 2.0])
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
@@ -130,7 +130,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _mixc_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

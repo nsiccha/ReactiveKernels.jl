@@ -251,7 +251,7 @@ end
         sigma ~ Exponential(1)
         mu = a .+ dar(beta, sigmad)
         y .~ Normal.(mu, sigma)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
     @test length(plan.dar_paths) == 1
     ds = only(plan.dar_paths)
     @test (ds.state, ds.beta, ds.sigma) === (:dar_mu, :beta, :sigmad)
@@ -280,7 +280,7 @@ end
         sigma ~ Exponential(1)
         mu = a .+ dar(beta, sigmad)
         y .~ Normal.(mu, sigma)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
     @test only(plan2.dar_paths).sigma === :sigmad
     byname2 = Dict(p.name => p for p in plan2.parameters)
     @test byname2[:sigmad].support_override == (:truncated, 0.0, Inf)
@@ -295,7 +295,7 @@ end
         sigma ~ Exponential(1)
         mu = a .+ b .* x
         y .~ Normal.(mu, sigma)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test isempty(plan3.dar_paths)
     byname3 = Dict(p.name => p for p in plan3.parameters)
     @test byname3[:beta].support_override == (:truncated, 0.0, 1.0)
@@ -310,7 +310,7 @@ end
         sigma ~ Exponential(1)
         $(loc)
         y .~ Normal.(mu, sigma)
-    end, (:x, :y))
+    end, (:x, :y); conditioned = (:x, :y))
     # capability: ordinary DAR value composition (P8 1cmodra; todo `0yc2qgp`).
     capable(loc, decl = Expr(:block)) = @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -321,7 +321,7 @@ end
         $(decl)
         $(loc)
         y .~ Normal.(mu, sigma)
-    end, (:x, :y)); true)
+    end, (:x, :y); conditioned = (:x, :y)); true)
     # scaled dar (dar is beta-free — scaling is the ar shape, not dar)
     capable(:(mu = a .+ b .* dar(beta, sigmad)))
     # nested dar read (direct `dar(beta, sigma)` only)
@@ -349,7 +349,7 @@ end
         sigma ~ Exponential(1)
         mu = a .+ beta .* x .+ dar(beta, sigmad)
         y .~ Normal.(mu, sigma)
-    end, (:x, :y))
+    end, (:x, :y); conditioned = (:x, :y))
     @test :beta in Set(p.name for p in dplan.parameters)
     @test only(t for t in only(dplan.predictors).terms
         if t.kind === ContinuousTerm).options.parameter === :beta
@@ -366,7 +366,7 @@ end
         w = dar(beta, sigmad)
         mu = a .+ w
         y .~ Normal.(mu, sigma)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
     # refused: `w = dar(...)` mints latent innovations through `=`; parameters come from `~` (P2, P8 1cmodra; 10gzbm9)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -376,7 +376,7 @@ end
         w = dar(beta, sigmad)
         mu = a
         y .~ Normal.(mu, sigma)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
 
     # persistence geometry rejections (use-site spelling)
     for beta_rhs in (:(Normal(0.5, 0.2)),
@@ -391,7 +391,7 @@ end
             sigma ~ Exponential(1)
             mu = a .+ dar(beta, sigmad)
             y .~ Normal.(mu, sigma)
-        end, (:y,)); true)
+        end, (:y,); conditioned = (:y,)); true)
     end
     # scale geometry rejections (use-site spelling)
     for sigma_rhs in (:(Normal(0, 0.2)), :(Exponential(1)),
@@ -404,7 +404,7 @@ end
             sigma ~ Exponential(1)
             mu = a .+ dar(beta, sigmad)
             y .~ Normal.(mu, sigma)
-        end, (:y,)); true)
+        end, (:y,); conditioned = (:y,)); true)
     end
     # parameters with no `~` statement
     # refused: undeclared dar argument `q` (P6, 05oe96l)
@@ -414,7 +414,7 @@ end
         sigma ~ Exponential(1)
         mu = a .+ dar(q, sigmad)
         y .~ Normal.(mu, sigma)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
     # synthesized state colliding with a user definition
     # capability: a user name colliding with a synthesized `dar_<lhs>` state; synthesize no author-visible names (1cmodra names) (todo `0yc2qgp`)
     @test_broken (lower_rkppl(quote
@@ -425,7 +425,7 @@ end
         sigma ~ Exponential(1)
         mu = a .+ dar(beta, sigmad)
         y .~ Normal.(mu, sigma)
-    end, (:y,)); true)
+    end, (:y,); conditioned = (:y,)); true)
 end
 
 # Independent oracle for the zero-started differenced-AR(1) model
@@ -471,7 +471,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     ydata = [0.3, -0.1, 0.5, 0.2, -0.4]
-    plan = m(; y = ydata)
+    plan = (m() | (; y = ydata))
     @test only(plan.predictors).terms[2].kind === DarSummandTerm
     built = build_kernel(plan)
     # mu_coef(a) + beta + sigmad + sigma + z[1..4]
@@ -519,7 +519,7 @@ _dar_normalizers(bloc, bsca, ssca) =
             mu = a .+ dar(beta, sigmad)
             y .~ Normal.(mu, s)
         end
-        plan = m(; y = ydata)
+        plan = (m() | (; y = ydata))
         built = build_kernel(plan)
         @test built.layout.total == 9
         @test coordinate_names(built.layout)[1:4] ==
@@ -548,7 +548,7 @@ _dar_normalizers(bloc, bsca, ssca) =
             mu = a .+ dar(beta, sigmad)
             y .~ Normal.(mu, s)
         end
-        plan = m(; y = ydata)
+        plan = (m() | (; y = ydata))
         built = build_kernel(plan)
         @test built.layout.total == 9
         @test coordinate_names(built.layout)[1:4] ==
@@ -594,8 +594,8 @@ end
         y .~ Normal.(mu, sigma)
     end
     ydata = [0.3, -0.1, 0.5, 0.2, -0.4]
-    pl = lib(; y = ydata)
-    pb = builtin(; y = ydata)
+    pl = (lib() | (; y = ydata))
+    pb = (builtin() | (; y = ydata))
     sc = only(pl.scans)
     @test [_test_scope_name(pl, s) for s in sc.states] == [:x_level, :x_increment]
     @test [f.kind for f in sc.setup] == [:assign, :assign]
@@ -635,7 +635,7 @@ end
         x ~ differenced_ar1(beta, sigmad)
         y .~ Normal.(x, sigma)
     end
-    pd = direct(; y = ydata)
+    pd = (direct() | (; y = ydata))
     @test _test_scope_name(pd, only(pd.responses).predictor) === :x_level
     bd = build_kernel(pd)
     ud = [0.3, -0.5, -0.4, 0.2, -0.1, 0.4, 0.0]

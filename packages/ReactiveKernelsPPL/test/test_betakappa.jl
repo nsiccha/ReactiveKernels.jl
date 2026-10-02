@@ -18,7 +18,7 @@ using Test
 # Lower + bind + build + query a Beta program; return
 # `(bound, built, kern, layout)`.
 function _bk_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -52,7 +52,7 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
                 lk = c .+ d .* z
                 prop .~ Beta.(logistic.(mu) .* exp.(lk),
                     (1 .- logistic.(mu)) .* exp.(lk))
-            end, (:prop, :x, :z))
+            end, (:prop, :x, :z); conditioned = (:prop, :x, :z))
         r = only(plan.responses)
         @test r.family === BetaLogitFam
         @test r.link === LogitLink
@@ -72,7 +72,7 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
                 mu = a .+ b .* x
                 lk = c .+ d .* z
                 prop .~ BetaLogit.(mu, exp.(lk))
-            end, (:prop, :x, :z))
+            end, (:prop, :x, :z); conditioned = (:prop, :x, :z))
         r = only(plan.responses)
         @test (r.family, r.scale) ===
             (BetaLogitFam, ScalePredictorRef(:lk, LogLink))
@@ -87,7 +87,7 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
                 mu = a .+ b .* x
                 k = c .+ d .* z
                 prop .~ Beta.(logistic.(mu) .* k, (1 .- logistic.(mu)) .* k)
-            end, (:prop, :x, :z)); true)
+            end, (:prop, :x, :z); conditioned = (:prop, :x, :z)); true)
     end
     @testset "logit-wrapped predictor kappa fails closed" begin
         # capability: Beta precision under a positive non-log link (logistic.(lk) in (0,1)) (todo `05fuzch`)
@@ -100,7 +100,7 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
                 lk = c .+ d .* z
                 prop .~ Beta.(logistic.(mu) .* logistic.(lk),
                     (1 .- logistic.(mu)) .* logistic.(lk))
-            end, (:prop, :x, :z)); true)
+            end, (:prop, :x, :z); conditioned = (:prop, :x, :z)); true)
     end
     @testset "scalar kappa spellings unchanged" begin
         plan = lower_rkppl(quote
@@ -110,7 +110,7 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
                 mu = a .+ b .* x
                 prop .~ Beta.(logistic.(mu) .* kappa,
                     (1 .- logistic.(mu)) .* kappa)
-            end, (:prop, :x))
+            end, (:prop, :x); conditioned = (:prop, :x))
         @test only(plan.responses).scale === :kappa
         plan = lower_rkppl(quote
                 a ~ Normal(0, 1)
@@ -118,14 +118,14 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
                 mu = a .+ b .* x
                 prop .~ Beta.(logistic.(mu) .* 4.0,
                     (1 .- logistic.(mu)) .* 4.0)
-            end, (:prop, :x))
+            end, (:prop, :x); conditioned = (:prop, :x))
         @test only(plan.responses).scale === 4.0
         plan = lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 prop .~ Beta.(logistic.(mu) .* kc, (1 .- logistic.(mu)) .* kc)
-            end, (:prop, :x, :kc))
+            end, (:prop, :x, :kc); conditioned = (:prop, :x, :kc))
         @test only(plan.responses).scale === :kc
     end
     @testset "shared mixture-component kappa predictor admitted" begin
@@ -139,7 +139,7 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
                 prop .~ MixtureModel.(vcat.(Beta.(logistic.(eta) .* exp.(lk),
                         (1 .- logistic.(eta)) .* exp.(lk)),
                     Beta.(0.7 .* exp.(lk), (1 .- 0.7) .* exp.(lk))), Ref([0.5, 0.5]))
-            end, (:prop, :x, :z))
+            end, (:prop, :x, :z); conditioned = (:prop, :x, :z))
         r = only(plan.responses)
         @test r.mixture_family === BetaLogitFam
         @test r.mixture_scales == [ScalePredictorRef(:lk, LogLink),
@@ -275,7 +275,7 @@ end
 # O(1) pattern): the modeled-kappa plate must not unroll over
 # observations.
 function _bk_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -307,7 +307,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _bk_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
