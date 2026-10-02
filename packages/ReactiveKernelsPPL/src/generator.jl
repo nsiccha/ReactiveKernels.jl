@@ -51,7 +51,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     stmts = Expr[]
     # Level gathers (`z[g]` over a `levels(h)` axis) read level-code
     # vectors; collect them from every expression before emitting.
-    gathers = Set{Tuple{Symbol,Symbol}}()
+    gathers = Set{Tuple{Symbol,Symbol,Int}}()
     assigns = _assignment_statements(plan; gathers)
     free = _density_selection(plan, n -> n ∉ plan.conditioned)
     priors = _prior_statements(free, layout; gathers, context = plan)
@@ -231,7 +231,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     negative_binomial, weibull,
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson, zero_inflated_binomial,
-    gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
 using SpecialFunctions: besseli, besselix, erfc, loggamma
 # Selective (explicit imports win over any re-export chain, so no `using`
@@ -304,7 +303,7 @@ end
 # for the recipes below). Unannotated: Int temporaries (e.g. `length`)
 # must not meet a Float64 assertion.
 function _assignment_statements(plan::StructuralPlan;
-        gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}())
+        gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}())
     by_name = Dict{Symbol,Any}(a.name => a for a in plan.assignments)
     for d in plan.derived
         by_name[d.name] = d
@@ -3433,7 +3432,7 @@ function _parameter_prior_statements!(stmts, terms, plan, layout; prefix = :_ppl
 end
 
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
-        gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}(), context = plan)
+        gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}(), context = plan)
     stmts = Expr[]
     terms = Any[]
     for pred in plan.predictors

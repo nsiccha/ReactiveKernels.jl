@@ -645,6 +645,10 @@ function _conditioned_declarations(ast, names)
         lhs = _stmt_lhs(st)
         name = _merge_stem(lhs)
         name in names || continue
+        # Whole-data GLM `~` declares a response, not a parameter. Like a
+        # broadcast response, its observed value keeps its observation axis
+        # instead of becoming an internal conditioned-parameter input.
+        _is_glm_call(last(st.args)) && continue
         # A positional slice of an observed stream remains a response.
         # Sized level/matrix axes and matrix declarations retain array metadata.
         array = lhs isa Expr && ((lhs.head === :ref &&
@@ -1105,8 +1109,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # arguments, gathered values) is a model-level data input at bind, so
     # a parameter-dependent call may take it; each refusal that waiver
     # skips is re-checked once the plan shows no other slot reads it.
-    whole = _whole_value_data(det, data,
-        _statement_names(ast, union(data, Set{Symbol}(keys(detmap))), kstmts))
+    # An array prior consumes its arguments as whole values too. Seed that
+    # context before shaping definitions, then confirm it on the final plan.
+    prior_defs = Pair{Symbol,Any}[Symbol(:_ppl_prior_input_, s.lhs) => s.rhs
+        for s in sample if s.lhs in sized_decls]
+    whole = _whole_value_data(vcat(det, prior_defs), data,
+        _statement_names(ast, union(data, Set{Symbol}(keys(detmap))), kstmts;
+            whole_priors = sized_decls))
     waived = _check_module_calls(det, detmap, data, shape_env; whole)
     # Whole-value data compose with array parameters before canonicalization,
     # exactly like a module call's model-level result. Their concrete shape
@@ -1727,8 +1736,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         return _obs_axis(ex, data, detmap, memo, active, env) ?
             :vector : :scalar
     end
-    head === Symbol("'") && return shape(ex.args[1]) === :array ? :array :
-        :scalar
+    head === Symbol("'") && return shape(ex.args[1]) in (:array, :matrix) ?
+        shape(ex.args[1]) : :scalar
     head === :call || return :scalar  # exotic heads: downstream rejects
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
@@ -1766,9 +1775,9 @@ end
 function _ref_shape(ex, data)
     idx = ex.args[2:end]
     isempty(idx) && return :scalar
-    if idx[1] isa Symbol && idx[1] in data
-        # Per-observation gather: one value (or row) per observation.
-        length(idx) == 2 && idx[2] === :(:) && return :matrix
+    if any(i -> i isa Symbol && i in data, idx)
+        # Per-observation gather: scalar selection or an oriented matrix.
+        any(i -> i === :(:), idx) && return :matrix
         return :vector
     end
     any(i -> i === :(:), idx) && return :array
@@ -1817,13 +1826,16 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2].args)
     elseif ex.head === :ref
-        # A gather from an array value (`z[g, 1]`, `b[g, 1]` with
-        # `b = z * M`) follows its first index, like a one-index gather.
+        # A gather from an array value follows its observation index on
+        # either axis, including definitions such as `b = z * M`.
         array_base = ex.args[1] isa Symbol && length(ex.args) >= 2 &&
             (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
                 _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
         array_base || _is_gather(ex, data, detmap, env) || return false
-        return _obs_axis(ex.args[2], data, detmap, memo, active, env)
+        return any(i -> _obs_axis(i, data, detmap, memo, active, env),
+            ex.args[2:end])
+    elseif ex.head === Symbol("'")
+        return _obs_axis(ex.args[1], data, detmap, memo, active, env)
     end
     return false
 end
@@ -1895,8 +1907,6 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
     elseif fn === :^ || _is_plain_comparison(fn) || fn === :ifelse ||
             fn in ASSIGNMENT_FNS
         return nvec == 0 ? :scalar : :invalid
-    elseif fn in VECTOR_FNS
-        return :vector
     end
     return nvec == 0 ? :scalar : :vector  # unknown heads: follow the args
 end
@@ -2143,7 +2153,7 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
         # (responses) with bind-to-a-name guidance.
         fn === :_ppl_plate_column && return nothing  # array-cell plate
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
-                fn ∉ VECTOR_FNS && fn !== :spline &&
+                fn !== :spline &&
                 fn !== :hsgp && fn !== :mo && fn !== :mo1 &&
                 fn !== :hcat && fn !== :dar
             startswith(string(fn), ".") && _sfail(
@@ -2213,7 +2223,7 @@ end
 const _CONSTRUCT_VALUE_HEADS = (:spline, :hsgp, :mo, :mo1, :hcat, :dar)
 
 _builtin_value_head(fn::Symbol) =
-    fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS || fn in VECTOR_FNS ||
+    fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS ||
     fn in REDUCTION_FNS || fn in _CONSTRUCT_VALUE_HEADS ||
     fn in CELL_FNS || fn in SEGMENT_CELL_FNS ||
     startswith(string(fn), ".") || fn === :treatment || fn === :ifelse ||
@@ -2364,14 +2374,18 @@ end
 # `_confirm_whole_value_data`.
 function _check_module_calls(det, detmap, data, env::_ShapeEnv;
         whole::Set{Symbol} = Set{Symbol}())
-    # Whole columns are model-level values there: still gatherable
-    # (`gx[g]` follows its index), never aligned themselves.
+    # A sampled vector (plate, scan or varying result) passes whole to an
+    # undotted module call. Its alignment outside that call does not give
+    # the call an observation axis. Raw data still obey the whole-column
+    # check: `gx[g]` follows its index, while `gx` passes whole only when
+    # no other consumer needs it per observation.
     aligned = setdiff(data, whole)
-    wenv = _ShapeEnv(env.aligned, union(env.values, whole))
+    call_env = _ShapeEnv(Set{Symbol}(), env.values)
+    wenv = _ShapeEnv(call_env.aligned, union(env.values, whole))
     memos = (Dict{Symbol,Symbol}(), Dict{Symbol,Symbol}())
     waived = Tuple{String,Set{Symbol}}[]
     for (nm, rhs) in det
-        _check_module_calls(nm, rhs, detmap, data, aligned, whole, env, wenv,
+        _check_module_calls(nm, rhs, detmap, data, aligned, whole, call_env, wenv,
             memos, waived)
     end
     return waived
@@ -2421,7 +2435,8 @@ end
 # kernel cells remain consumers too: a schedule-chain definition moved out
 # of `det` still reads its subject-level predictors. Otherwise those now
 # apparently unused definitions would be classified as whole values.
-function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ())
+function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ();
+        whole_priors::Set{Symbol} = Set{Symbol}())
     out = Set{Symbol}()
     whole = Set{Symbol}()
     for st in ast.args
@@ -2429,6 +2444,10 @@ function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ())
         st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
         if st isa Expr && st.head === :macrocall
             _all_symbols!(out, st)
+        elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
+                _merge_stem(_stmt_lhs(st)) in whole_priors
+            _classify_reads!(whole, out, _stmt_lhs(st), known, false)
+            _classify_reads!(whole, out, last(st.args), known, true)
         else
             _classify_reads!(whole, out, st, known, false)
         end
@@ -4490,19 +4509,13 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 push!(joints, j)
                 continue
             end
-            if !bc && st.args[3] isa Expr && st.args[3].head === :call &&
-                    !isempty(st.args[3].args) &&
-                    st.args[3].args[1] isa Symbol &&
-                    st.args[3].args[1] in _GLM_HEADS
+            if !bc && _is_glm_call(st.args[3])
                 g = _parse_glm_stmt(st, line, data)
                 _claim!(seen, seelines, g.response, line)
                 push!(glms, g)
                 continue
             end
-            if bc && st.args[3] isa Expr && st.args[3].head === :call &&
-                    !isempty(st.args[3].args) &&
-                    st.args[3].args[1] isa Symbol &&
-                    st.args[3].args[1] in _GLM_HEADS
+            if bc && _is_glm_call(st.args[3])
                 _sfail("GLM-object heads use whole-data `~`, not `.~` " *
                        "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
                        "object owns eta over the whole column)")
@@ -4967,7 +4980,7 @@ function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool;
     # array operand to take the ordinary matrix-value route.
     fn = (ex.head === :call || _is_dotted_call(ex)) && !isempty(a) ? a[1] : nothing
     composed = fn in _MATRIX_OPERAND_HEADS || fn in ELEMENTWISE_FNS ||
-        fn in ASSIGNMENT_FNS || fn in VECTOR_FNS || fn isa GlobalRef ||
+        fn in ASSIGNMENT_FNS || fn isa GlobalRef ||
         (fn isa Expr && fn.head === :.)
     child_affine = affine && !(composed && fn ∉ (:+, :.+, :-, :.-))
     for x in a
@@ -6102,6 +6115,11 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
         return Int(hi)
     end
     _is_def_levels_call(a, data, detnames) && return a
+    if a isa Expr && a.head === :ref && !isempty(a.args) &&
+            _is_levels_call(a.args[1])
+        g, subset = _levels_subset_index(target, a, data)
+        return Expr(:call, :levels, g, QuoteNode(subset))
+    end
     if _is_levels_call(a)
         return Expr(:call, :levels,
             _levels_column(target, a, data, "array $target"))
@@ -6345,6 +6363,9 @@ end
 
 const _GLM_HEADS = (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
 
+_is_glm_call(rhs) = rhs isa Expr && rhs.head === :call &&
+    !isempty(rhs.args) && first(rhs.args) isa Symbol && first(rhs.args) in _GLM_HEADS
+
 function _parse_glm_stmt(st::Expr, line::Int, data::Set{Symbol})
     lhs, rhs = st.args[2], st.args[3]
     head = rhs.args[1]
@@ -6489,6 +6510,10 @@ function _resolve_submodel(rhs, mod::Module)
     head = rhs.args[1]
     if head isa GlobalRef
         mod, head = head.mod, head.name
+    elseif head isa Expr && head.head === :. && length(head.args) == 2 &&
+            head.args[2] isa QuoteNode && head.args[2].value isa Symbol
+        mod = _resolve_module_path(head.args[1], mod, "submodel call")
+        head = head.args[2].value
     end
     head isa Symbol || return nothing
     isdefined(mod, head) || return nothing

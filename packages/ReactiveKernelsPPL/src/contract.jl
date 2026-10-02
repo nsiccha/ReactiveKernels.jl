@@ -2237,10 +2237,6 @@ const ASSIGNMENT_FNS = (
     :sum, :mean, :std, :var, :minimum, :maximum, :length,
 )
 
-"""Vector-returning whole-column functions (exact-GP slice): admitted in
-derived columns and predictor locations only; always vector-shaped."""
-const VECTOR_FNS = (:gp_exp_quad_cov, :gp_periodic_cov, :gp_chol_latent)
-
 """Cell-callable functions (grouped kernels): admitted in grouped-kernel
 cell assignments ONLY, always with a declared schedule as the first
 argument. The generator emits ONE subject-batched call per assignment
@@ -2428,7 +2424,7 @@ the BUILT-IN vocabulary. Beyond it, an `=` definition may call any function
 visible in the model's module (functions as values): a data-only call is
 evaluated once by [`bind_data`](@ref), any other runs in the generated
 kernel."""
-admitted_functions() = (ASSIGNMENT_FNS..., VECTOR_FNS...)
+admitted_functions() = ASSIGNMENT_FNS
 
 """Elementwise vocabulary the thin layer can lower in derived columns:
 `(dotted operators, dotted math functions)` (ext handshake predicate)."""
@@ -4245,10 +4241,6 @@ function _collect_kernel_cell_refs!(refs, ex, kp::KernelPlate, known::Set{Symbol
             return _fail(label, "reduction `$fn` does not lower in a cell " *
                                 "(series reductions are cross-timepoint — P3)")
         end
-        if fn isa Symbol && fn in VECTOR_FNS
-            return _fail(label, "whole-column `$fn` does not lower in a " *
-                                "cell (whole-model constructs only)")
-        end
         if fn isa Symbol && fn in ASSIGNMENT_FNS
             # Undotted arithmetic is admitted syntactically here (the
             # emitter passes scalar-context user code verbatim — Ex1's
@@ -4511,10 +4503,6 @@ function _collect_grouped_cell_refs!(refs, ex, kp::KernelPlate,
             return _fail(label, "reduction `$fn` does not lower in a cell " *
                                 "(aggregate in the obs likelihood, not " *
                                 "the cell)")
-        end
-        if fn isa Symbol && fn in VECTOR_FNS
-            return _fail(label, "whole-column `$fn` does not lower in a " *
-                                "cell (whole-model constructs only)")
         end
         if fn isa Symbol && fn in CELL_FNS
             args = ex.args[2:end]
@@ -5767,12 +5755,6 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
             _collect_vector_reduction!(refs, ex, plan, label, bound)
             return nothing
         end
-        if fn isa Symbol && fn in VECTOR_FNS
-            for arg in ex.args[2:end]
-                _collect_vector_refs!(refs, arg, plan, label, bound)
-            end
-            return nothing
-        end
         if fn isa Symbol && fn in ASSIGNMENT_FNS
             for arg in ex.args[2:end]
                 _collect_assignment_refs!(refs, arg, plan, label, bound)
@@ -5921,7 +5903,7 @@ function _is_vector_valued(ex, plan::StructuralPlan)
         (_is_array_param(plan, ex.args[1]) ||
             _is_array_assignment(plan, ex.args[1])) &&
         return _array_index_kind(plan, ex) === :gather &&
-            all(i -> i isa Int, ex.args[3:end])
+            all(i -> i isa Int || _is_row_index(plan, i), ex.args[2:end])
     ex isa Number && return false
     ex isa LineNumberNode && return false
     ex isa Expr || return false
@@ -5941,7 +5923,6 @@ function _is_vector_valued(ex, plan::StructuralPlan)
             return true
         end
         fn in REDUCTION_FNS && return false
-        fn isa Symbol && fn in VECTOR_FNS && return true
         fn isa Symbol && (fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS) &&
             return any(a -> _is_vector_valued(a, plan), ex.args[2:end])
         return false
@@ -10203,10 +10184,10 @@ whole-context definitions (whose values may have any length too)."""
 function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
     append!(defs, Pair{Symbol,Any}[d.name => d.expr for d in plan.derived])
-    # A scalar prior's arguments and a Dirichlet concentration are whole
-    # model values. Propagate that context through their definitions just
-    # as for a module-call argument; their raw data have no observation axis.
-    for p in plan.parameters
+    # Scalar and declared-array prior arguments are whole model values.
+    # Propagate that context through their definitions just as for a
+    # module-call argument; their raw data have no observation axis.
+    for ps in (plan.parameters, plan.array_parameters), p in ps
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
             Expr(:tuple, values(p.args)..., _support_args(p.support_override)...))
     end
@@ -10233,6 +10214,11 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
             for p in plan.vector_parameters
                 delete!(free, p.name)
                 p.family === :simplex_dirichlet || _drop_held_names!(free, p.args)
+            end
+        elseif f === :array_parameters
+            for p in plan.array_parameters
+                delete!(free, p.name)
+                _drop_held_names!(free, p.dims)
             end
         else
             _drop_held_names!(free, getfield(plan, f))
