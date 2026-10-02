@@ -243,6 +243,15 @@ plus 8,160 B for its gathered matrix. In that step a broadcast
 about 7 µs over the 14 doses. A scan step runs its statements as written, so a
 per-step broadcast allocates every step.
 
+A nested reduction is the exception. Natively, a generator fold over a
+data-length iterator in the step, or in a `@traceable` helper the step calls,
+runs as its explicit loop (the [compiler](compiler.md) page, "Lowering and
+emitted ABI"). With the 4 × 4 surface written as a nested generator sum in a
+`@traceable` helper, the 14-dose step allocates its result vector only (176 B,
+synthetic step, Julia 1.10.11). Written in a plain helper, the same nest is
+left to Base's `sum`, which Julia 1.10 infers as `Any`: 6,208 B per call, the
+same as a hand-written loop calling that helper.
+
 Under Reactant the result buffer is the `while` loop's output buffer, filled
 with `h₀` before the loop; each step reads it before its own output is written.
 The step's sum over `1:j-1` is one retained loop with a traced bound (a
