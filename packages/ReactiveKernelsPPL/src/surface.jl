@@ -723,14 +723,19 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         union(plate_names, Set{Symbol}(st for s in scans for st in s.states),
             varying_names),
         sized_decls)
-    detshape = _def_shapes(det, data, detmap; arrays = sized_decls,
-        env = shape_env)
     # A data column the definitions read only as whole values (module-call
     # arguments, gathered values) is a model-level data input at bind, so
     # a parameter-dependent call may take it; each refusal that waiver
     # skips is re-checked once the plan shows no other slot reads it.
-    whole = _whole_value_data(det, data, _statement_names(ast))
+    whole = _whole_value_data(det, data,
+        _statement_names(ast, union(data, Set{Symbol}(keys(detmap)))))
     waived = _check_module_calls(det, detmap, data, shape_env; whole)
+    # Whole-value data compose with array parameters before canonicalization,
+    # exactly like a module call's model-level result. Their concrete shape
+    # remains Julia's business at bind/evaluation, never an observation axis.
+    shape_env = _ShapeEnv(shape_env.aligned, union(shape_env.values, whole))
+    detshape = _def_shapes(det, data, detmap; arrays = sized_decls,
+        env = shape_env)
     canonmap = Dict{Symbol,Any}()
     for nm in _det_topo_order(det, detmap)
         rhs = detmap[nm]
@@ -1028,7 +1033,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
         array_parameters = arrays)
-    _confirm_whole_value_data(plan, data, waived)
+    _confirm_whole_value_data(plan, data, waived; whole)
     validate_structure(plan)
     return plan
 end
@@ -1058,8 +1063,9 @@ end
 # Shape context beyond data and definitions (functions as values):
 # `aligned` holds the non-data names that carry the observation axis
 # (per-cell latents, scan states, varying bindings); `values` the
-# model-level array parameters (Dirichlet simplexes) definitions may
-# compute with.
+# model-level array parameters (Dirichlet simplexes) and whole-value data
+# inputs definitions may compute with. Whole data have unknown Julia
+# shape, like an undotted module call result (`:scalar` in this analysis).
 struct _ShapeEnv
     aligned::Set{Symbol}
     values::Set{Symbol}
@@ -1080,7 +1086,7 @@ function _shape_of(ex, data, detmap, memo, active::Set{Symbol},
         env::_ShapeEnv = _NO_SHAPE_ENV)
     ex isa Symbol ||
         return _shape_of_expr(ex, data, detmap, memo, active, env)
-    ex in data && return :vector
+    ex in data && return ex in env.values ? :scalar : :vector
     haskey(detmap, ex) || return get(memo, ex, :scalar)
     haskey(memo, ex) && return memo[ex]
     ex in active && return :scalar  # cyclic: errors downstream
@@ -1191,7 +1197,7 @@ _is_gather(ex::Expr, data, detmap, env::_ShapeEnv) =
 # follows its index.
 function _obs_axis(ex, data, detmap, memo, active, env)
     if ex isa Symbol
-        ex in data && return true
+        ex in data && return !(ex in env.values)
         ex in env.aligned && return true
         haskey(detmap, ex) || return false
         return _shape_of(ex, data, detmap, memo, active, env) in
@@ -1786,21 +1792,29 @@ end
 
 # Data columns the definitions read only as whole values — the bind-time
 # model-level data-input rule (`_model_level_inputs`) over the
-# definitions, with every name another statement mentions (`held`: a
+# definitions, with each per-observation statement read (`held`: a
 # response, prior, `@plate`, …) pinned observation-aligned.
-# `_confirm_whole_value_data` re-checks each waiver against the plan.
+# `_confirm_whole_value_data` re-checks the inputs and each waiver against
+# the finished plan.
 function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol})
     inputs, _ = _whole_value_reads(det, data, held)
     return setdiff!(inputs, held)
 end
 
-# Every name the non-definition statements of `ast` mention.
-function _statement_names(ast::Expr)
+# Names read per observation by non-definition statements. A gathered
+# value is whole even in a response (`v[g]`); its index is aligned. Plates
+# and scans retain their conservative statement-wide alignment.
+function _statement_names(ast::Expr, known::Set{Symbol})
     out = Set{Symbol}()
+    whole = Set{Symbol}()
     for st in ast.args
         st isa LineNumberNode && continue
         st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
-        _all_symbols!(out, st)
+        if st isa Expr && st.head === :macrocall
+            _all_symbols!(out, st)
+        else
+            _classify_reads!(whole, out, st, known, false)
+        end
     end
     return out
 end
@@ -1823,9 +1837,11 @@ end
 # (a response, predictor, plate, …) makes it observation-aligned after
 # all, and the call fails exactly as it would have without the waiver.
 function _confirm_whole_value_data(plan::StructuralPlan, data::Set{Symbol},
-        waived)
-    isempty(waived) && return nothing
+        waived; whole::Set{Symbol} = Set{Symbol}())
+    isempty(waived) && isempty(whole) && return nothing
     inputs, _ = _model_level_inputs(plan, data)
+    whole ⊆ inputs || _sfail("whole-value data also read per observation: " *
+        join(sort!(collect(setdiff(whole, inputs))), ", "))
     for (msg, needed) in waived
         needed ⊆ inputs || _sfail(msg)
     end

@@ -5424,6 +5424,9 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
         )
         # (A bound model-level data value — an assignment evaluated at
         # bind — is a column entry but no observation column.)
+        # A raw whole-value input is a bound operand, not a graph node.
+        bound && haskey(plan.columns, ex) &&
+            ex in first(_bound_model_level_inputs(plan)) && return nothing
         bound && haskey(plan.columns, ex) &&
             !any(a -> a.name === ex, plan.assignments) && _fail(
             label,
