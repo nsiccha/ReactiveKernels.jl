@@ -1,7 +1,9 @@
 # Sweep-owned F items (v1 inventory pair 4, RK half): fail-closed battery.
 # Each case quotes the natural surface spelling for a sweep F item and pins
-# the loud rejection. All spellings/error types confirmed against the
-# admission probes (probe/probe2/probe3).
+# the loud rejection. Previously refused spellings that now lower have
+# positive regression tests, including the prophet density oracle below.
+using Distributions: Normal, Laplace, truncated, logpdf
+using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
 
@@ -112,30 +114,8 @@ using Test
                 end
                 z .~ Normal.(e, sigma)
             end), (:y, :z), SurfaceLoweringError),
-        # prophet (out-of-scope, must still fail loudly): the changepoint
-        # trend with continuity correction plus shared-beta
-        # multiplicative/additive seasonality forces dual coef/param roles
-        # (a predictor coefficient inside an extracted column). The reduced
-        # bilinear-with-pure-value-factors shape lowers; the full model does
-        # not (sweep probe3 + corpus-71 attempts).
-        ("prophet", "dual coef/param roles in bilinear mean",
-            :(begin
-                k ~ Normal(0.0, 5.0)
-                m ~ Normal(0.0, 5.0)
-                d1 ~ Laplace(0.0, 1.0)
-                d2 ~ Laplace(0.0, 1.0)
-                sigma_obs ~ truncated(Normal(0.0, 0.5), 0.0, Inf)
-                b1 ~ Normal(0.0, 1.0)
-                b2 ~ Normal(0.0, 0.5)
-                Ad = A1 .* d1 .+ A2 .* d2
-                Atd = C1 .* d1 .+ C2 .* d2
-                trend = (k .+ Ad) .* t .+ (m .- Atd)
-                seas_m = X1m .* b1 .+ X2m .* b2
-                seas_a = X1a .* b1 .+ X2a .* b2
-                mu = trend .* (1.0 .+ seas_m) .+ seas_a
-                y .~ Normal.(mu, sigma_obs)
-            end), (:y, :t, :A1, :A2, :C1, :C2, :X1m, :X2m, :X1a, :X2a),
-            SurfaceLoweringError),
+        # Prophet is admitted by ordinary-parameter fallback and checked
+        # against an independent density oracle below.
         # garch11: GARCH(1,1) variance recursion is deterministic given
         # data+params; same data-varying-recurrence gap.
         ("garch11", "data-varying scan recurrence",
@@ -157,6 +137,77 @@ using Test
     for (item, label, prog, datanames, E) in cases
         @testset "$item: $label" begin
             @test_throws E lower_rkppl(prog, datanames)
+        end
+    end
+end
+
+# The fallback landing admits this previously refused surface: shared
+# seasonality coefficients and changepoint parameters are ordinary sampled
+# values wherever the affine coefficient block cannot own them exclusively.
+@testset "sweep admitted: prophet shared parameters in a bilinear mean" begin
+    prog = quote
+        k ~ Normal(0.0, 5.0)
+        m ~ Normal(0.0, 5.0)
+        d1 ~ Laplace(0.0, 1.0)
+        d2 ~ Laplace(0.0, 1.0)
+        sigma_obs ~ truncated(Normal(0.0, 0.5), 0.0, Inf)
+        b1 ~ Normal(0.0, 1.0)
+        b2 ~ Normal(0.0, 0.5)
+        Ad = A1 .* d1 .+ A2 .* d2
+        Atd = C1 .* d1 .+ C2 .* d2
+        trend = (k .+ Ad) .* t .+ (m .- Atd)
+        seas_m = X1m .* b1 .+ X2m .* b2
+        seas_a = X1a .* b1 .+ X2a .* b2
+        mu = trend .* (1.0 .+ seas_m) .+ seas_a
+        y .~ Normal.(mu, sigma_obs)
+    end
+    data = (y = [0.4, -0.2, 0.8, 1.1, -0.5],
+        t = [0.0, 0.2, 0.5, 0.8, 1.1],
+        A1 = [0.0, 0.0, 1.0, 1.0, 1.0],
+        A2 = [0.0, 0.0, 0.0, 1.0, 1.0],
+        C1 = [0.0, 0.0, 0.25, 0.25, 0.25],
+        C2 = [0.0, 0.0, 0.0, 0.7, 0.7],
+        X1m = [0.2, -0.4, 0.8, -0.3, 0.1],
+        X2m = [-0.6, 0.1, 0.2, 0.5, -0.2],
+        X1a = [0.9, 0.3, -0.2, 0.4, -0.7],
+        X2a = [0.1, -0.5, 0.6, -0.1, 0.8])
+    probes = (
+        (k = 0.7, m = -0.25, d1 = 0.3, d2 = -0.1,
+            sigma_obs = 0.6, b1 = 0.4, b2 = -0.2),
+        (k = -0.4, m = 0.6, d1 = -0.2, d2 = 0.5,
+            sigma_obs = 1.3, b1 = -0.3, b2 = 0.7),
+        (k = 1.1, m = -0.8, d1 = 0.6, d2 = -0.4,
+            sigma_obs = 0.2, b1 = 0.9, b2 = 0.3))
+    for n in (1, 3, 5)
+        @testset "$n observations" begin
+            cols = Dict{Symbol,AbstractVector}(k => v[1:n] for (k, v) in pairs(data))
+            bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+            built = build_kernel(bound)
+            lay = built.layout
+            @test lay.total == 7
+            likelihood = prepare_query(built, bound, :likelihood)
+            prior = prepare_query(built, bound, :prior)
+            posterior = prepare_query(built, bound, :sampler)
+            for q in probes
+                u = unconstrain(lay, merge(constrain(lay, zeros(lay.total)), q))
+                # Independent scalar, per-row calculation; no extracted
+                # columns or composed predictors from the lowered plan.
+                ll = sum(eachindex(cols[:y])) do i
+                    slope = q.k + cols[:A1][i] * q.d1 + cols[:A2][i] * q.d2
+                    intercept = q.m - cols[:C1][i] * q.d1 - cols[:C2][i] * q.d2
+                    multiplicative = cols[:X1m][i] * q.b1 + cols[:X2m][i] * q.b2
+                    additive = cols[:X1a][i] * q.b1 + cols[:X2a][i] * q.b2
+                    mu = (slope * cols[:t][i] + intercept) * (1 + multiplicative) + additive
+                    logpdf(Normal(mu, q.sigma_obs), cols[:y][i])
+                end
+                pr = logpdf(Normal(0, 5), q.k) + logpdf(Normal(0, 5), q.m) +
+                    logpdf(Laplace(0, 1), q.d1) + logpdf(Laplace(0, 1), q.d2) +
+                    logpdf(truncated(Normal(0, 0.5), 0, Inf), q.sigma_obs) +
+                    logpdf(Normal(0, 1), q.b1) + logpdf(Normal(0, 0.5), q.b2)
+                @test Base.invokelatest(likelihood, u) ≈ ll rtol = 1e-12
+                @test Base.invokelatest(prior, u) ≈ pr rtol = 1e-12
+                @test Base.invokelatest(posterior, u) ≈ ll + pr + log(q.sigma_obs) rtol = 1e-12
+            end
         end
     end
 end
