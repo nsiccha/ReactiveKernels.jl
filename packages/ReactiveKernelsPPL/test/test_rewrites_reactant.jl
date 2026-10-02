@@ -1,6 +1,40 @@
 using ReactiveKernels, ReactiveKernelsPPL, Distributions, Test
 using DifferentiationInterface, Enzyme, Reactant
 
+@testset "whole-data GLM conditioning: compiled parity and retained structure" begin
+    for head in (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
+        structures = Dict{String,Int}[]
+        for n in (4, 9)
+            data = _rewrite_glm_data(head, n)
+            model = ReactiveKernelsPPL.RKPPLModel(_rewrite_glm_ast(head), @__MODULE__)
+            plan = model(; data.x1, data.x2) | (; data.y)
+            built = build_kernel(plan)
+            u = [0.1, -0.2, 0.3]
+            kernel = prepare_query(built, plan, :sampler)
+            query = prepare_sampler(built, plan, u;
+                backend = AutoEnzyme(mode = Enzyme.Reverse,
+                    function_annotation = Enzyme.Const))
+            value, gradient = sampler_value_and_gradient!(query, similar(u), u)
+            @test value ≈ _rewrite_glm_oracle(head, data, u[1], u[2:3])
+            ru = Reactant.to_rarray(u)
+            hlo = repr(Reactant.@code_hlo optimize = false kernel(ru))
+            operations = Dict{String,Int}()
+            for m in eachmatch(r"stablehlo\.[a-z_]+", hlo)
+                operations[m.match] = get(operations, m.match, 0) + 1
+            end
+            @test get(operations, "stablehlo.reduce", 0) > 0
+            push!(structures, operations)
+            compiled = Reactant.@compile kernel(ru)
+            @test Float64(compiled(ru)) ≈ value rtol = 1e-8
+            cad = compile_ad_value_and_gradient(query.ad, ru)
+            rvalue, rgradient = cad(ru)
+            @test Float64(rvalue) ≈ value rtol = 1e-8
+            @test Array(rgradient) ≈ gradient rtol = 1e-6
+        end
+        @test structures[1] == structures[2]
+    end
+end
+
 @testset "conditioning: native and compiled density, gradients and structure" begin
     structures = Dict{String,Int}[]
     for K in (3, 13)

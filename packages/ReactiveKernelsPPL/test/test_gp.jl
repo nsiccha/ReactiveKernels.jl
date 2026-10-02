@@ -4,7 +4,20 @@
 using Distributions: LogNormal, Normal, logpdf
 using LinearAlgebra: Symmetric, cholesky
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    gp_exp_quad_cov, gp_periodic_cov
+    gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent
+
+function _gp_bad_add(cov)
+    cols = Dict{Symbol,Any}(:x => [0.0, 0.4], :oi => [1, 2], :y => [0.1, 0.2])
+    plan = lower_rkppl(quote
+        z[1:2] .~ Normal.(0, 1)
+        w = 1.0 + gp_chol_latent($cov, z)
+        y .~ Normal.(w[oi], 0.5)
+    end, cols; conditioned = (:y,))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    query = prepare_query(built, bound, :sampler)
+    return Base.invokelatest(query, zeros(built.layout.total))
+end
 
 @testset "exact gp end to end" begin
     plan = lower_rkppl(quote
@@ -16,12 +29,13 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
             end
             f_gp = gp_chol_latent(gp_exp_quad_cov(x, sigma_gp, rho_gp, 1e-9),
                 z_gp)
-            mu = a .+ f_gp
+            mu = a .+ f_gp[oi]
             y .~ Normal.(mu, 0.5)
-        end, (:y, :x); conditioned = (:y, :x))
+        end, (:y, :x, :oi); conditioned = (:y, :x))
     cols = Dict{Symbol,AbstractVector}(
         :y => [0.5, -0.2, 0.8, 0.1, -0.5, 0.3],
-        :x => [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+        :x => [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        :oi => collect(1:6))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     @test built.layout.total == 9 # a + rho + sigma + 6 z cells
@@ -43,15 +57,9 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
 end
 
 @testset "exact gp emission failures" begin
-    # A gp call in a scalar definition is ill-shaped (vector in scalar spot).
-    # refused: undotted scalar + vector is a Julia MethodError (P3)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            @plate for i in eachindex(y)
-                z[i] ~ Normal(0, 1)
-            end
-            w = 1.0 + gp_chol_latent(gp_exp_quad_cov(x, 1.0, 1.0, 1e-9), z)
-            y .~ Normal.(mu, 0.5)
-        end, (:y, :x); conditioned = (:y, :x))
+    # Undotted scalar + vector remains a Julia MethodError (P3). A module
+    # call's result shape is known at execution, rather than from its name.
+    @test_throws MethodError _gp_bad_add(:(gp_exp_quad_cov(x, 1.0, 1.0, 1e-9)))
     # Aniso/matrix locations fail at first eval (loud ArgumentError).
     # capability: matrix-location (multi-dimensional) gp_exp_quad_cov (todo `0bfiemp`)
     @test_broken (gp_exp_quad_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0,
@@ -68,12 +76,13 @@ end
             end
             f_gp = gp_chol_latent(gp_periodic_cov(x, sigma_gp, rho_gp, 1.0,
                     1e-9), z_gp)
-            mu = a .+ f_gp
+            mu = a .+ f_gp[oi]
             y .~ Normal.(mu, 0.5)
-        end, (:y, :x); conditioned = (:y, :x))
+        end, (:y, :x, :oi); conditioned = (:y, :x))
     cols = Dict{Symbol,AbstractVector}(
         :y => [0.5, -0.2, 0.8, 0.1, -0.5, 0.3],
-        :x => [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+        :x => [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        :oi => collect(1:6))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     @test built.layout.total == 9 # a + rho + sigma + 6 z cells
@@ -95,16 +104,8 @@ end
 end
 
 @testset "periodic gp emission failures" begin
-    # A periodic gp call in a scalar definition is ill-shaped too.
-    # refused: undotted scalar + vector is a Julia MethodError (P3)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            @plate for i in eachindex(y)
-                z[i] ~ Normal(0, 1)
-            end
-            w = 1.0 + gp_chol_latent(gp_periodic_cov(x, 1.0, 1.0, 1.0, 1e-9),
-                z)
-            y .~ Normal.(mu, 0.5)
-        end, (:y, :x); conditioned = (:y, :x))
+    # The same Julia arithmetic rule applies to a periodic covariance.
+    @test_throws MethodError _gp_bad_add(:(gp_periodic_cov(x, 1.0, 1.0, 1.0, 1e-9)))
     # Matrix locations and non-positive periods fail at first eval.
     # capability: matrix-location gp_periodic_cov") (todo `0bfiemp`)
     @test_broken (gp_periodic_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0,
