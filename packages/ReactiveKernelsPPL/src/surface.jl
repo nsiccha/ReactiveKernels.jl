@@ -665,6 +665,24 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         if s.lhs ∉ data && _is_dar_beta_rhs(s.rhs))
     dar_sigma_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dar_sigma_rhs(s.rhs))
+    # An `hcat` matrix the program reads as a value (`var.(eachcol(X))`,
+    # `X * v` over a computed or declared-array vector, a coefficient
+    # prior the matrix term cannot carry) lowers exactly like a bound data
+    # matrix `X`: its definition leaves `det`, its name joins `data`, and
+    # `bind_data` builds it from its columns (`_value_design_matrices`).
+    caller_data = data
+    value_mats = _hcat_value_reads(det, detmap, sample, data, glms,
+        union(dirichlet_names, ordered_names),
+        union(plate_names, Set{Symbol}(st for s in scans for st in s.states),
+            varying_names))
+    value_mat_defs = Pair{Symbol,Any}[p for p in det if first(p) in value_mats]
+    if !isempty(value_mats)
+        det = Pair{Symbol,Any}[p for p in det if first(p) ∉ value_mats]
+        for nm in value_mats
+            delete!(detmap, nm)
+        end
+        data = union(data, value_mats)
+    end
     # Declaration roles for predictor classification: sized positional
     # and two-axis arrays, LKJ Cholesky factors, and vectors sized by a
     # bound data matrix (not an `hcat` definition) always take the array
@@ -727,6 +745,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     for m in matrices
         delete!(canonmap, m.name)
     end
+    value_matrices = _value_design_matrices(value_mat_defs, caller_data)
     # Structural definitions inline into predictors: anything transitively
     # referencing a coefficient candidate (coef-priored or free name).
     # All other vector definitions stay symbolic as named locals.
@@ -1004,7 +1023,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
-        matrices = matrices, event_lps = event_lps,
+        matrices = vcat(matrices, value_matrices), event_lps = event_lps,
         array_parameters = arrays)
     _confirm_whole_value_data(plan, data, waived)
     validate_structure(plan)
@@ -4287,6 +4306,142 @@ function _matrix_column(nm, c, detshape, detmap, data, prior_names,
                                              "columns only)")
     _sfail("design matrix `$nm` over unknown name `$c` — columns are " *
            "the intercept `1` or bare data/derived columns")
+end
+
+# ── `hcat` matrices read as values ───────────────────────────────────
+# `X = hcat(...)` is a matrix. A program that uses it only as `X * w`,
+# with `w[axes(X, 2)] .~ Fam.(args...)` a coefficient prior the matrix
+# term carries (or `w` a free name), lowers it as a design matrix whose
+# coefficient vector is `w`. Three reads need the matrix as a VALUE:
+#
+# - a definition passing `X` to a function, indexing it or taking its
+#   adjoint (`var.(eachcol(X))`, `size(X, 2)`, `X[:, 1]`, `X'`);
+# - `X * v` with `v` array-valued (a declared array, `z .* s`);
+# - a coefficient prior on `w[axes(X, 2)]` the term cannot carry.
+#
+# Such an `X` lowers exactly like a bound data matrix `X`: `w[axes(X, 2)]`
+# declarations are arrays, `X * w` is the data matrix-vector product, and
+# data-only definitions read the matrix. Both routes use the same matrix
+# (intercept `1` = a ones column), so the density is the same. Any other
+# use (`mu = X`, `a .+ X`, `X * s` with `s` a scalar, `X` as a location or
+# scale) keeps the design-matrix route and its refusal.
+
+# The `hcat` definitions of `det` the program reads as values. GLM
+# response matrices stay design matrices (their families read them).
+function _hcat_value_reads(det, detmap, sample, data, glms,
+        simplexes::Set{Symbol}, aligned::Set{Symbol})
+    mats = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
+    for g in glms
+        delete!(mats, g.matrix)
+    end
+    out = Set{Symbol}()
+    isempty(mats) && return out
+    coefvec = Dict{Symbol,Symbol}(s.lhs => s.matrix for s in sample
+        if s.lhs ∉ data && s.broadcast && s.matrix !== nothing &&
+            s.matrix in mats)
+    arrays = union(simplexes, Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && (s.dims !== nothing ||
+            (s.broadcast && (s.matrix !== nothing || s.levels !== nothing)) ||
+            (!s.broadcast && _is_lkj_cholesky_call(s.rhs)))))
+    memo = Dict{Symbol,Symbol}(a => :array for a in arrays)
+    env = _ShapeEnv(aligned, arrays)
+    shape(ex) = _shape_of(ex, data, detmap, memo, Set{Symbol}(), env)
+    scalar(a::Symbol) = a ∉ data && a ∉ aligned && a ∉ arrays &&
+        shape(a) === :scalar
+    # `X * w` reads `X` as a value when `w` is array-valued. A vector
+    # declared over a matrix (`w[axes(S, 2)]`) stays with the design-matrix
+    # route, which checks its sizing against `X`; only the coefficient
+    # prior can make it an array (below).
+    sized_by = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && s.broadcast && s.matrix !== nothing)
+    valued(X, w) = !(w isa Symbol && w in sized_by) &&
+        (w isa Symbol || w isa Expr) && shape(w) === :array
+    for (nm, rhs) in det
+        nm in mats && continue
+        _matrix_value_reads!(out, rhs, mats, valued, true)
+    end
+    for s in sample
+        _matrix_value_reads!(out, s.rhs, mats, valued, false)
+    end
+    for s in sample
+        X = get(coefvec, s.lhs, nothing)
+        X === nothing && continue
+        _matrix_term_prior(s.rhs, scalar) || push!(out, X)
+    end
+    return out
+end
+
+# Arithmetic heads: `X` as one of their operands is not a value read.
+const _MATRIX_OPERAND_HEADS = (:+, :-, :*, :/, :^, :\, ELEMENTWISE_OPS...)
+
+# Value reads of the matrices `mats` in `ex`: `X * v` with `valued(X, v)`,
+# and, inside a definition (`indef`), `X` as an argument of a function call
+# (`eachcol(X)`, `size(X, 2)`), an indexed `X[...]`, or `X'`.
+function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool)
+    ex isa Expr || return out
+    a = ex.args
+    if ex.head === :call && length(a) == 3 && a[1] === :* &&
+            a[2] isa Symbol && a[2] in mats
+        valued(a[2], a[3]) && push!(out, a[2])
+        return _matrix_value_reads!(out, a[3], mats, valued, indef)
+    end
+    if indef
+        isarg(x) = x isa Symbol && x in mats
+        if ex.head === :call && !isempty(a) &&
+                !(a[1] isa Symbol && a[1] in _MATRIX_OPERAND_HEADS)
+            union!(out, Iterators.filter(isarg, a[2:end]))
+        elseif (ex.head === :ref || ex.head === Symbol("'")) && isarg(a[1])
+            push!(out, a[1])
+        end
+    end
+    for x in a
+        _matrix_value_reads!(out, x, mats, valued, indef)
+    end
+    return out
+end
+
+# Whether a matrix term carries the broadcast coefficient prior `rhs`: a
+# coefficient family over literals, scalar names, or literal vectors of
+# those (the `_matrix_prior_arg` grammar). A non-family head
+# (`truncated.(...)`, `Exponential.(...)`) or an array-valued argument
+# (`lambda .* tau`, `sd` over an array) is an array prior. A RHS that is
+# not a dotted call stays with the term, whose error names the fix.
+function _matrix_term_prior(rhs, scalar)
+    rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
+        rhs.args[1] isa Symbol && rhs.args[2] isa Expr &&
+        rhs.args[2].head === :tuple || return true
+    haskey(_COEF_FAMILIES, rhs.args[1]) || return false
+    elt(x) = x isa Real || x === :Inf || (x isa Symbol && scalar(x))
+    return all(a -> elt(a) ||
+        (a isa Expr && a.head === :vect && all(elt, a.args)),
+        rhs.args[2].args)
+end
+
+# The value matrices' plan records: `bind_data` builds each from its
+# columns (the intercept `1` is a ones column, as in a design matrix), so
+# a column is `1` or a bound data column.
+function _value_design_matrices(defs, data::Set{Symbol})
+    out = DesignMatrix[]
+    for (nm, rhs) in defs
+        args = rhs.args[2:end]
+        isempty(args) && _sfail("matrix `$nm = $rhs` calls `hcat` " *
+                                "with no columns")
+        cols = Union{Nothing,Symbol}[]
+        for a in args
+            if a isa Number && !(a isa Bool) && a == 1
+                push!(cols, nothing)
+            elseif a isa Symbol && a in data
+                push!(cols, a)
+            else
+                _sfail("matrix `$nm = $rhs` is read as a value, " *
+                       "so `bind_data` builds it from its columns: each " *
+                       "is the intercept `1` or a bound data column, got " *
+                       "$(repr(a)) (bind it as data)")
+            end
+        end
+        push!(out, DesignMatrix(nm, cols, nm))
+    end
+    return out
 end
 
 # Pre-pass: expand top-level `@plate for i in R ... end` blocks into
