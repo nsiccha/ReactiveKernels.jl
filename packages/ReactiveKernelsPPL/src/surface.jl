@@ -994,9 +994,21 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         used_locs)
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
+    # Axes of every declared array an array-cell plate may read.
+    pc_dims = Dict{Symbol,Vector{Any}}()
+    for s in sample
+        s.lhs in data && continue
+        if s.dims !== nothing
+            pc_dims[s.lhs] = s.dims
+        elseif s.levels isa Symbol
+            pc_dims[s.lhs] = Any[:(levels($(s.levels)))]
+        end
+    end
     for (nm, _) in det
         nm in skip && continue
         rhs = canonmap[nm]
+        _is_plate_column_call(rhs) &&
+            (rhs = _plate_column_expr(nm, rhs, pc_dims, data))
         if detshape[nm] === :vector
             push!(derived, _lower_vector_assignment(nm, rhs, coefuse))
         else
@@ -1142,6 +1154,7 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     fn = ex.args[1]
     fn isa Symbol || return :scalar  # module/anonymous calls: model-level
     fn in REDUCTION_FNS && return :scalar
+    fn === :_ppl_plate_column && return :vector  # one value per index
     argshapes = [shape(a) for a in ex.args[2:end]]
     if fn in ELEMENTWISE_OPS
         (:array in argshapes || :invalid in argshapes) &&
@@ -1216,6 +1229,7 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         fn = ex.args[1]
         fn isa Symbol || return false
         fn in REDUCTION_FNS && return false
+        fn === :_ppl_plate_column && return true
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2:end])
     elseif _is_dotted_call(ex)
@@ -1347,6 +1361,7 @@ function _canonical_expr(ex, data, detmap, detshape, env, where)
     fn = ex.args[1]
     fn isa Symbol || return ex
     fn in REDUCTION_FNS && return ex  # args validated downstream
+    fn === :_ppl_plate_column && return ex  # an RK plate (array cells)
     args = [_canonical_expr(a, data, detmap, detshape, env, where)
         for a in ex.args[2:end]]
     argshapes = [_canon_shape(a, data, detmap, detshape, env) for a in args]
@@ -1544,6 +1559,7 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
         # recurse below): matrix definitions validate at extraction;
         # strays fail there (definitions) or at predictor analysis
         # (responses) with bind-to-a-name guidance.
+        fn === :_ppl_plate_column && return nothing  # array-cell plate
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
                 fn ∉ VECTOR_FNS && fn !== :spline &&
                 fn !== :hsgp && fn !== :mo && fn !== :mo1 &&
@@ -1710,6 +1726,9 @@ _is_dotted_call(ex) =
 function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
     ex isa Expr || return ex
     ex.head === :quote && return ex
+    # An array-cell plate column: its cell runs inside an RK plate, in
+    # the generated kernel (the cell body is quoted, not resolved here).
+    _is_plate_column_call(ex) && return ex
     if ex.head === :call && !isempty(ex.args)
         head = _resolve_call_head(ex.args[1], mod, names, where)
         args = Any[_resolve_module_calls(a, mod, names, where)
@@ -4522,6 +4541,9 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
     params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+    rkind[1] !== :levels && _plate_has_array_cells(cells) &&
+        return _desugar_array_plate(cells, ivar, rkind, line, data,
+            plate_defs)
     # Cell locals bound from a per-index value (they vary with the loop
     # variable, so arithmetic over them vectorizes in the desugar).
     pidx = Set{Symbol}()
@@ -4530,6 +4552,101 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
             params, pidx)...)
     end
     return out, ctx, params
+end
+
+# A plate whose definitions hold arrays: some definition reads a whole
+# axis (`sd[s[i], :]`, `z[g[i], :]`). Such cells cannot be vectorized by
+# broadcasting their operators; they lower as RK plates (below).
+_plate_has_array_cells(cells) = any(c -> c isa Expr && c.head === :(=) &&
+    length(c.args) == 2 && _has_colon_index(c.args[2]), cells)
+_has_colon_index(ex) = ex isa Expr && ((ex.head === :ref &&
+    any(a -> a === :(:), ex.args[2:end])) || any(_has_colon_index, ex.args))
+
+# A per-index plate with array-valued cells. Every cell means one
+# iteration of the Julia loop: cell locals (`F = sd[s[i], :] .* L[s[i]]`)
+# may be arrays, and each per-index column a cell defines (`r1[i] = …`,
+# a scalar per index) becomes the derived column `r1` computed by one RK
+# plate — the cell body, run once per index by the loop RK generates
+# (the plate expression is built once array axes are known,
+# `_plate_column_expr`). Observations in the same plate read those
+# columns (`y[i] ~ Normal(r1[i], s)`) and lower as in a scalar plate.
+function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
+        plate_defs::Set{Symbol})
+    locals = Pair{Symbol,Any}[]
+    out = Expr[]
+    ctx = Tuple{Symbol,Int,Set{Symbol}}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+    samples = Any[]
+    for c in cells
+        c isa Expr || _sfail("cells hold `~` observations and `=` " *
+            "assignments only")
+        if _is_sample(c)
+            push!(samples, c)
+            continue
+        end
+        (c.head === :(=) && length(c.args) == 2) || _sfail("cells hold `~` " *
+            "observations and `=` assignments only")
+        lc, rhs = c.args
+        if lc isa Symbol
+            lc in data && _sfail("cell assignment `$lc = ...` redefines " *
+                "bound data")
+            push!(locals, lc => rhs)
+        elseif lc isa Expr && lc.head === :ref && length(lc.args) == 2 &&
+                lc.args[1] isa Symbol && lc.args[2] === ivar
+            col = lc.args[1]
+            col in data && _sfail("cell assignment `$col[$ivar] = ...` " *
+                "redefines bound data")
+            body = Expr(:block, (Expr(:(=), k, v) for (k, v) in locals)...)
+            deps = Set{Symbol}()
+            for (_, v) in locals
+                _cell_free_syms!(deps, v)
+            end
+            _cell_free_syms!(deps, rhs)
+            setdiff!(deps, Set{Symbol}(first.(locals)))
+            delete!(deps, ivar)
+            spec = Expr(:tuple, QuoteNode(ivar), QuoteNode(body),
+                QuoteNode(rhs))
+            push!(out, Expr(:(=), col, Expr(:call, :_ppl_plate_column, spec,
+                sort!(collect(deps))...)))
+        elseif lc isa Expr && lc.head === :ref
+            _sfail("cell `$(repr(c))`: a per-index output is one value per " *
+                "index (`$(lc.args[1])[$ivar] = ...`); a row per index " *
+                "(`$(repr(lc))`) is not supported yet — define one column " *
+                "per component (`r1[$ivar] = row[1]`)")
+        else
+            _sfail("cell assignment LHS is a local (`t = ...`) or an " *
+                "`$ivar`-indexed column, got $(repr(lc))")
+        end
+    end
+    lnames = Set{Symbol}(first.(locals))
+    pidx = Set{Symbol}()
+    for c in samples
+        any(nm -> _expr_has_sym(c.args[3], nm), lnames) && _sfail("cell " *
+            "`$(repr(c))` reads a cell local of an array plate; define a " *
+            "per-index column (`eta[$ivar] = ...`) and observe it")
+        append!(out, _desugar_cell_sample(c, ivar, rkind, line, data,
+            plate_defs, ctx, params, pidx))
+    end
+    return out, ctx, params
+end
+
+# Value names an expression reads (call heads, `:` and keywords skipped).
+function _cell_free_syms!(out::Set{Symbol}, ex)
+    if ex isa Symbol
+        ex === :(:) || ex === :end || push!(out, ex)
+    elseif ex isa Expr
+        if ex.head === :call && !isempty(ex.args)
+            foreach(a -> _cell_free_syms!(out, a), ex.args[2:end])
+        elseif ex.head === :. && length(ex.args) == 2
+            ex.args[2] isa Expr && foreach(a -> _cell_free_syms!(out, a),
+                ex.args[2].args)
+        elseif ex.head === :kw
+            _cell_free_syms!(out, ex.args[2])
+        else
+            foreach(a -> _cell_free_syms!(out, a), ex.args)
+        end
+    end
+    return out
 end
 
 # Plate ranges mirror the response ranges: literal `a:b` (validated via
@@ -4676,6 +4793,75 @@ function _mv_slice_len(obj)
         a.args[1] in (:zeros, :ones) && return lit(a.args[2])
     return nothing
 end
+
+# The RK plate an array-cell plate column runs: `plate(lanes...,
+# Ref(shared)...) do lane..., shared...; cell; end`, one cell per index.
+# Lanes are the per-index inputs: a data column read at the loop index
+# (`x[i]`), or the level codes of a column that indexes an array's levels
+# axis (`sd[s[i], :]`, `z[g[i], :]`, a per-level factor `L[s[i]]` —
+# `_ppl_codes(s, h)`, the codes of `s` on `levels(h)`). Every other name
+# the cell reads (arrays, parameters, definitions) is passed whole with
+# `Ref`. Inside the cell those reads are ordinary integer indexing
+# (`sd[c, :]`, `L[:, :, c]`); RK generates the loop.
+function _plate_column_expr(nm::Symbol, call::Expr,
+        dims::Dict{Symbol,Vector{Any}}, data::Set{Symbol})
+    spec = call.args[2]
+    ivar = spec.args[1].value
+    body = spec.args[2].value
+    out = spec.args[3].value
+    where = "array plate column `$nm`"
+    inputs = Any[]
+    lanevars = Symbol[]
+    lane(inp, var) = (var in lanevars || (push!(inputs, inp);
+        push!(lanevars, var)); var)
+    isidx(a) = a isa Expr && a.head === :ref && length(a.args) == 2 &&
+        a.args[1] isa Symbol && a.args[1] in data && a.args[2] === ivar
+    function code(a, d)
+        _is_levels_dim(d) && d.args[2] isa Symbol || _sfail("$where reads " *
+            "an array axis $(repr(d)) by `$(repr(a))`; per-index reads " *
+            "take a `levels(g)` axis")
+        col, h = a.args[1], d.args[2]
+        return lane(Expr(:call, :_ppl_codes, col, h),
+            Symbol(:_ppl_pc_, col, :_, h))
+    end
+    function rw(ex)
+        ex isa Expr || return ex
+        if ex.head === :ref && ex.args[1] isa Symbol
+            X, idx = ex.args[1], ex.args[2:end]
+            isidx(ex) && return lane(X, Symbol(:_ppl_pv_, X))
+            d = get(dims, X, nothing)
+            if d !== nothing && !isempty(idx) && isidx(idx[1])
+                if length(d) == 3 && length(idx) == 1
+                    return Expr(:ref, X, :(:), :(:), code(idx[1], d[3]))
+                end
+                return Expr(:ref, X, code(idx[1], d[1]), map(rw, idx[2:end])...)
+            end
+        end
+        return Expr(ex.head, map(rw, ex.args)...)
+    end
+    stmts = Any[rw(a) for a in body.args]
+    outx = rw(out)
+    isempty(lanevars) && _sfail("$where reads no per-index input " *
+        "(`x[$ivar]`, `z[g[$ivar], :]`): it does not vary with $ivar")
+    locals = Set{Symbol}(a.args[1] for a in stmts
+        if a isa Expr && a.head === :(=) && a.args[1] isa Symbol)
+    free = Set{Symbol}()
+    foreach(a -> _cell_free_syms!(free, a), stmts)
+    _cell_free_syms!(free, outx)
+    setdiff!(free, locals)
+    setdiff!(free, Set(lanevars))
+    ivar in free && _sfail("$where reads the loop index $ivar other than " *
+        "through a data column (`x[$ivar]`) or a levels gather " *
+        "(`z[g[$ivar], :]`)")
+    shared = sort!(collect(free))
+    append!(inputs, (Expr(:call, :Ref, nm2) for nm2 in shared))
+    lam = Expr(:->, Expr(:tuple, lanevars..., shared...),
+        Expr(:block, LineNumberNode(0, :rkppl_plate), stmts..., outx))
+    return Expr(:do, Expr(:call, :plate, inputs...), lam)
+end
+
+_is_plate_column_call(ex) = ex isa Expr && ex.head === :call &&
+    !isempty(ex.args) && ex.args[1] === :_ppl_plate_column
 
 _expr_has_sym(ex, s::Symbol) = ex === s ||
     (ex isa Expr && any(a -> _expr_has_sym(a, s), ex.args))
@@ -8826,6 +9012,11 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         elseif node in ctx.data
             # A bound data column read elementwise in-graph (v3:
             # `(log_time .- loc) .* exp.(ls)`); it becomes a term column.
+            node in datas || push!(datas, node)
+            return node
+        elseif _is_plate_column_call(get(ctx.detmap, node, nothing))
+            # An array-cell plate column: a per-observation value, read
+            # like a data column.
             node in datas || push!(datas, node)
             return node
         elseif get(ctx.detshape, node, :scalar) === :vector &&

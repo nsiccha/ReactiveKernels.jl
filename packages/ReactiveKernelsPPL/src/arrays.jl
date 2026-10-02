@@ -1001,6 +1001,15 @@ _array_level_index_name(g::Symbol, h::Symbol) = Symbol(:_ppl_lvx_, h, :_, g)
 function _array_gather_rewrite(ex, plan::StructuralPlan,
         needed::Set{Tuple{Symbol,Symbol}})
     ex isa Expr || return ex
+    # An array-cell plate column: its inputs carry the level codes; the
+    # cell body indexes by those codes and is RK's to plan.
+    _is_plate_column_expr(ex) && return Expr(:do,
+        _array_gather_rewrite(ex.args[1], plan, needed), ex.args[2])
+    if ex.head === :call && length(ex.args) == 3 && ex.args[1] === :_ppl_codes
+        g, h = ex.args[2], ex.args[3]
+        push!(needed, (g, h))
+        return _array_level_index_name(g, h)
+    end
     if _is_gather_ref(plan, ex)
         d = _gather_axes(plan, ex.args[1])[1]
         if _is_levels_dim(d)

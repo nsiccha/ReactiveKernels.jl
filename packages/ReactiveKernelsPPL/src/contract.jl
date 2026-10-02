@@ -5602,6 +5602,45 @@ end
 # to the scalar collector. With bound=true, direct column references in
 # math positions must be numeric and bare-Symbol `ifelse` conditions must be
 # Bool columns.
+# An array-cell plate column (a derived column's right-hand side
+# `plate(lanes..., Ref(shared)...) do args...; cell; end`, one value per
+# index — `_plate_column_expr` in the surface): the inputs are graph
+# values; the cell body is RK's to plan. Lanes are data columns or the
+# level codes `_ppl_codes(g, h)` of column `g` on `levels(h)`.
+_is_plate_column_expr(ex) = ex isa Expr && ex.head === :do &&
+    length(ex.args) == 2 && ex.args[1] isa Expr && ex.args[1].head === :call &&
+    !isempty(ex.args[1].args) && ex.args[1].args[1] === :plate
+
+function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
+    known = union(_union_names(plan), _vector_value_names(plan),
+        Set{Symbol}(d.name for d in plan.derived),
+        Set{Symbol}(p.name for p in plan.array_parameters))
+    for inp in ex.args[1].args[2:end]
+        if inp isa Symbol
+            bound && !haskey(plan.columns, inp) && !(inp in known) &&
+                _fail(label, "array plate column reads unknown name $inp")
+            push!(refs, inp)
+        elseif inp isa Expr && inp.head === :call && length(inp.args) == 3 &&
+                inp.args[1] === :_ppl_codes
+            for c in inp.args[2:3]
+                c isa Symbol || _fail(label, "array plate column codes " *
+                    "take data columns, got $(repr(c))")
+                bound && !haskey(plan.columns, c) && _fail(label,
+                    "array plate column codes read unknown column $c")
+            end
+        elseif inp isa Expr && inp.head === :call && length(inp.args) == 2 &&
+                inp.args[1] === :Ref && inp.args[2] isa Symbol
+            nm = inp.args[2]
+            bound && !haskey(plan.columns, nm) && !(nm in known) &&
+                _fail(label, "array plate column reads unknown name $nm")
+        else
+            _fail(label, "array plate column input $(repr(inp)) is not a " *
+                "column, level codes or `Ref(name)`")
+        end
+    end
+    return nothing
+end
+
 function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
@@ -5623,6 +5662,9 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     end
     ex isa Expr || _fail(label, "unsupported literal $(repr(ex)) (numeric literals only)")
     head = ex.head
+    if _is_plate_column_expr(ex)
+        return _collect_plate_column_refs!(refs, ex, plan, label, bound)
+    end
     if head === :call
         fn = ex.args[1]
         _is_data_matvec(ex, plan) &&
@@ -5791,6 +5833,7 @@ end
 # reductions and scalar calls collapse; unbound unknown symbols count as
 # (possibly-column) evidence and resolve at bind.
 function _is_vector_valued(ex, plan::StructuralPlan)
+    _is_plate_column_expr(ex) && return true
     ex isa Symbol && return !(ex in _union_names(plan) ||
         ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
     ex isa Expr && ex.head === :ref && ex.args[1] isa Symbol &&
