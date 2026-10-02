@@ -39,6 +39,8 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
 @testset "weibull surface admission" begin
     @testset "literal k" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Weibull.(2.0, exp.(eta))
             end, (:y, :x))
@@ -54,6 +56,8 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
     end
     @testset "LogNormal-sampled k" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 k ~ LogNormal(0.0, 0.3)
                 eta = a .+ b .* x
                 y .~ Weibull.(k, exp.(eta))
@@ -64,6 +68,8 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
     end
     @testset "per-observation k column" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Weibull.(kc, exp.(eta))
             end, (:y, :x, :kc))
@@ -71,6 +77,10 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
     end
     @testset "modeled k deferred" begin
         @test_throws ContractValidationError lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 ls = c .+ d .* x
                 y .~ Weibull.(exp.(ls), exp.(eta))
@@ -81,6 +91,8 @@ end
 @testset "weibull value parity" begin
     @testset "literal k" begin
         _, _, kern, lay = _wb_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Weibull.(2.0, exp.(eta))
             end, _wb_cols())
@@ -93,6 +105,8 @@ end
     end
     @testset "LogNormal-sampled k" begin
         _, _, kern, lay = _wb_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 k ~ LogNormal(0.0, 0.3)
                 eta = a .+ b .* x
                 y .~ Weibull.(k, exp.(eta))
@@ -110,6 +124,8 @@ end
         cols = _wb_cols()
         cols[:kc] = [1.5, 2.0, 2.5, 1.0, 3.0, 0.8]
         _, _, kern, lay = _wb_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Weibull.(kc, exp.(eta))
             end, cols)
@@ -141,12 +157,16 @@ end
 @testset "weibull Enzyme gradients" begin
     @testset "literal k" begin
         _wb_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Weibull.(2.0, exp.(eta))
             end, _wb_cols(), (eta = [0.5, -0.25],))
     end
     @testset "LogNormal-sampled k" begin
         _wb_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 k ~ LogNormal(0.0, 0.3)
                 eta = a .+ b .* x
                 y .~ Weibull.(k, exp.(eta))
@@ -156,6 +176,8 @@ end
         cols = _wb_cols()
         cols[:kc] = [1.5, 2.0, 2.5, 1.0, 3.0, 0.8]
         _wb_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Weibull.(kc, exp.(eta))
             end, cols, (eta = [0.5, -0.25],))
@@ -178,6 +200,8 @@ end
 
 @testset "weibull emission is O(1) in n_obs" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         k ~ LogNormal(0.0, 0.3)
         eta = a .+ b .* x
         y .~ Weibull.(k, exp.(eta))
@@ -216,10 +240,14 @@ end
 @testset "weibull under Reactant" begin
     progs = [
         ("literal k", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ Weibull.(2.0, exp.(eta))
         end, _wb_cols()),
         ("LogNormal-sampled k", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             k ~ LogNormal(0.0, 0.3)
             eta = a .+ b .* x
             y .~ Weibull.(k, exp.(eta))

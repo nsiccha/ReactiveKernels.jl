@@ -1,5 +1,7 @@
 # data: y x
 begin
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     t ~ StudentT(3, 1, 2)

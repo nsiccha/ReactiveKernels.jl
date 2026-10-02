@@ -57,6 +57,8 @@ end
     cols = _nb1_cols()
     cols[:pc] = [0.1, 0.5, 0.9, 0.2, 0.6, 0.3]
     _, _, kern, lay = _nb1_query(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ NegativeBinomial.(exp.(eta), pc)
         end, cols)
@@ -88,6 +90,8 @@ end
     # precedent) but kernel-impossible: -Inf, never NaN.
     for p in (0.0, 1.0)
         _, _, kern, lay = _nb1_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ NegativeBinomial.(exp.(eta), $p)
             end, _nb1_cols())
@@ -117,12 +121,16 @@ end
         cols = _nb1_cols()
         cols[:pc] = [0.1, 0.5, 0.9, 0.2, 0.6, 0.3]
         _nb1_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ NegativeBinomial.(exp.(eta), pc)
             end, cols, (eta = [0.5, -0.25],))
     end
     @testset "Beta-sampled p" begin
         _nb1_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 p ~ Beta(2.0, 2.0)
                 eta = a .+ b .* x
                 y .~ NegativeBinomial.(exp.(eta), p)
@@ -150,6 +158,8 @@ end
 
 @testset "nb1 emission is O(1) in n_obs" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         p ~ Beta(2.0, 2.0)
         eta = a .+ b .* x
         y .~ NegativeBinomial.(exp.(eta), p)

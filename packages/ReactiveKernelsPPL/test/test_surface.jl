@@ -154,6 +154,8 @@ end
 
 @testset "surface roundtrip poisson end to end" begin
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Poisson.(exp.(eta))
     end
@@ -173,6 +175,8 @@ end
 @testset "surface roundtrip slice-1 families end to end" begin
     # Binomial, column trials.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Binomial.(n, logistic.(mu))
     end
@@ -192,6 +196,8 @@ end
 
     # Binomial, literal trials.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Binomial.(5, logistic.(mu))
     end
@@ -205,6 +211,8 @@ end
 
     # NB2.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         phi ~ Exponential(1.0)
         eta = a .+ b .* x
         y .~ NegativeBinomial2.(exp.(eta), phi)
@@ -224,6 +232,8 @@ end
 
     # Gamma.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         alpha ~ Exponential(1.0)
         eta = a .+ b .* x
         y .~ Gamma.(alpha, exp.(eta) ./ alpha)
@@ -244,6 +254,8 @@ end
     cols, _ = _gen_columns()
     # Bernoulli probit.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Bernoulli.(probit.(eta))
     end
@@ -259,6 +271,8 @@ end
     _check_gradient(built.spec, bound, u)
     # Bernoulli cloglog.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Bernoulli.(cloglog.(eta))
     end
@@ -272,6 +286,8 @@ end
     _check_gradient(built.spec, bound, u)
     # Binomial probit, column trials.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Binomial.(n, probit.(mu))
     end
@@ -287,6 +303,8 @@ end
     _check_gradient(built.spec, bound, u)
     # Binomial cloglog, literal trials.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Binomial.(5, cloglog.(mu))
     end
@@ -299,6 +317,8 @@ end
     _check_gradient(built.spec, bound, u)
     # Beta, logit mu + kappa concentration.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         kappa ~ Gamma(2.0, 1000.0)
         mu = a .+ b .* x
         p .~ Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)
@@ -349,10 +369,14 @@ end
     _check_gradient(built.spec, bound, u4)
     # Literal nu and sigma.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ StudentT.(4.0, mu, 2.0)
     end
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ StudentT.(4.0, mu, 2.0)
     end, (:y, :x)).responses)
@@ -393,6 +417,10 @@ end
     # Predictor-fed nu is admitted (the modeled-nu vscale shape): bare
     # for identity, `exp.`/`logistic.` for log/logit.
     let r = only(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             nupred = c .+ d .* x
             y .~ StudentT.(nupred, mu, 2.0)
@@ -400,6 +428,10 @@ end
         @test r.nu == ScalePredictorRef(:nupred, IdentityLink)
     end
     let r = only(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             nupred = c .+ d .* x
             y .~ StudentT.(exp.(nupred), mu, 2.0)
@@ -407,6 +439,10 @@ end
         @test r.nu == ScalePredictorRef(:nupred, LogLink)
     end
     let r = only(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             nupred = c .+ d .* x
             y .~ StudentT.(logistic.(nupred), mu, 2.0)
@@ -426,11 +462,15 @@ _hurdle_logpdf(y::Integer, lam::Real, p0::Real) =
     cols[:y] = [0, 1, 2, 0, 3, 1]
     # Literal p_zero.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ HurdlePoisson.(exp.(eta), 0.35)
     end
     @test m isa RKPPLModel
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ HurdlePoisson.(exp.(eta), 0.35)
     end, (:y, :x)).responses)
@@ -448,11 +488,19 @@ _hurdle_logpdf(y::Integer, lam::Real, p0::Real) =
     _check_gradient(built.spec, bound, u)
     # Predictor-fed p_zero under `logistic.` (the hu submodel).
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
     end
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
@@ -495,11 +543,19 @@ end
     end, Dn2)
     # A non-logit p_zero predictor fails at the contract gate.
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ HurdlePoisson.(exp.(eta), exp.(hu))
     end, Dn2)
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ HurdlePoisson.(exp.(eta), hu)
@@ -511,11 +567,15 @@ end
     cols[:y] = [0, 1, 2, 0, 3, 1]
     # Literal p.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ NegativeBinomial.(exp.(eta), 0.4)
     end
     @test m isa RKPPLModel
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ NegativeBinomial.(exp.(eta), 0.4)
     end, (:y, :x)).responses)
@@ -534,11 +594,15 @@ end
     _check_gradient(built.spec, bound, u)
     # Beta-sampled p.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         p ~ Beta(2.0, 2.0)
         eta = a .+ b .* x
         y .~ NegativeBinomial.(exp.(eta), p)
     end
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         p ~ Beta(2.0, 2.0)
         eta = a .+ b .* x
         y .~ NegativeBinomial.(exp.(eta), p)
@@ -583,11 +647,19 @@ end
     # NB1 p predictors are logit-only (a success probability, the
     # hurdle precedent): bare and log-link spellings fail closed.
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ NegativeBinomial.(exp.(eta), hu)
     end, Dn2)
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ NegativeBinomial.(exp.(eta), exp.(hu))
@@ -596,6 +668,10 @@ end
 
 @testset "nb1 modeled-p surface admission" begin
     plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             eta = a .+ b .* x
             hu = c .+ d .* z
             y .~ NegativeBinomial.(exp.(eta), logistic.(hu))
@@ -642,10 +718,14 @@ end
     _check_gradient(built.spec, bound, u3)
     # Literal zi.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), 0.25)
     end
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), 0.25)
     end, (:y, :x)).responses)
@@ -769,11 +849,15 @@ _ig_logpdf(y::Real, mu::Real, lam::Real) = logpdf(InverseGaussian(mu, lam), y)
     cols, _ = _gen_columns()
     # Literal lambda.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta), 1.5)
     end
     @test m isa RKPPLModel
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta), 1.5)
     end, (:y, :x)).responses)
@@ -791,17 +875,23 @@ _ig_logpdf(y::Real, mu::Real, lam::Real) = logpdf(InverseGaussian(mu, lam), y)
     _check_gradient(built.spec, bound, u)
     # LogNormal-sampled lambda.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         lam ~ LogNormal(-0.3, 1.0)
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta), lam)
     end
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         lam ~ LogNormal(-0.3, 1.0)
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta), lam)
     end, (:y, :x)).responses)
     @test (r.family, r.scale) === (InverseGaussianFam, :lam)
     @test only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         lam ~ LogNormal(-0.3, 1.0)
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta), lam)
@@ -826,11 +916,15 @@ _weibull_logpdf(y::Real, k::Real, th::Real) = logpdf(Weibull(k, th), y)
     cols, _ = _gen_columns()
     # Literal k.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Weibull.(2.0, exp.(eta))
     end
     @test m isa RKPPLModel
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Weibull.(2.0, exp.(eta))
     end, (:y, :x)).responses)
@@ -848,17 +942,23 @@ _weibull_logpdf(y::Real, k::Real, th::Real) = logpdf(Weibull(k, th), y)
     _check_gradient(built.spec, bound, u)
     # LogNormal-sampled k.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         k ~ LogNormal(0.0, 0.3)
         eta = a .+ b .* x
         y .~ Weibull.(k, exp.(eta))
     end
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         k ~ LogNormal(0.0, 0.3)
         eta = a .+ b .* x
         y .~ Weibull.(k, exp.(eta))
     end, (:y, :x)).responses)
     @test (r.family, r.scale) === (WeibullFam, :k)
     @test only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         k ~ LogNormal(0.0, 0.3)
         eta = a .+ b .* x
         y .~ Weibull.(k, exp.(eta))
@@ -886,11 +986,15 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
     cols[:n] = [10, 12, 8, 15, 9, 11]
     # Literal phi.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
     end
     @test m isa RKPPLModel
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
     end, (:c, :x, :n)).responses)
@@ -909,11 +1013,15 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
     _check_gradient(built.spec, bound, u)
     # Gamma-sampled phi.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         phi ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, logistic.(mu), phi)
     end
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         phi ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, logistic.(mu), phi)
@@ -933,11 +1041,19 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
     _check_gradient(built.spec, bound, u3)
     # Predictor-fed precision under `exp.` (the log-precision submodel).
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        e ~ Normal(0, 1)
+        f ~ Normal(0, 1)
         mu = a .+ b .* x
         hup = e .+ f .* x
         c .~ BetaBinomial2.(n, logistic.(mu), exp.(hup))
     end
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        e ~ Normal(0, 1)
+        f ~ Normal(0, 1)
         mu = a .+ b .* x
         hup = e .+ f .* x
         c .~ BetaBinomial2.(n, logistic.(mu), exp.(hup))
@@ -972,11 +1088,15 @@ end
     cols[:y] = [0.3, -1.1, 2.0, -2.0, 0.5, 1.1]
     # Literal kappa, exact head.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ VonMises.(mu, 1.7)
     end
     @test m isa RKPPLModel
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ VonMises.(mu, 1.7)
     end, (:y, :x)).responses)
@@ -994,11 +1114,15 @@ end
     _check_gradient(built.spec, bound, u)
     # Gamma-sampled kappa, circular head.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         kappa ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         y .~ CircularVonMises.(mu, kappa, -pi, pi)
     end
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         kappa ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         y .~ CircularVonMises.(mu, kappa, -pi, pi)
@@ -1006,6 +1130,8 @@ end
     @test (r.family, r.scale, r.interval) ===
         (VonMisesFam, :kappa, (-Float64(pi), Float64(pi)))
     @test only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         kappa ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         y .~ CircularVonMises.(mu, kappa, -pi, pi)
@@ -1024,6 +1150,10 @@ end
     _check_gradient(built.spec, bound, u3)
     # Log-link predictor kappa (the `log(kappa) ~ 1` demand shape).
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         lk = c .+ d .* x
         y .~ VonMises.(mu, exp.(lk))
@@ -1034,11 +1164,15 @@ end
 @testset "surface roundtrip exponential end to end" begin
     cols, _ = _gen_columns()
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Exponential.(exp.(eta))
     end
     @test m isa RKPPLModel
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Exponential.(exp.(eta))
     end, (:y, :x)).responses)
@@ -1066,11 +1200,15 @@ _ln_logpdf(y::Real, mu::Real, sig::Real) = logpdf(LogNormal(mu, sig), y)
     cols, _ = _gen_columns()
     # Literal sigma.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ LogNormal.(mu, 0.5)
     end
     @test m isa RKPPLModel
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ LogNormal.(mu, 0.5)
     end, (:y, :x)).responses)
@@ -1088,17 +1226,23 @@ _ln_logpdf(y::Real, mu::Real, sig::Real) = logpdf(LogNormal(mu, sig), y)
     _check_gradient(built.spec, bound, u)
     # Exponential-sampled sigma.
     m = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         sigma ~ Exponential(1)
         mu = a .+ b .* x
         y .~ LogNormal.(mu, sigma)
     end
     r = only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         sigma ~ Exponential(1)
         mu = a .+ b .* x
         y .~ LogNormal.(mu, sigma)
     end, (:y, :x)).responses)
     @test (r.family, r.scale) === (LogNormalFam, :sigma)
     @test only(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         sigma ~ Exponential(1)
         mu = a .+ b .* x
         y .~ LogNormal.(mu, sigma)
@@ -1139,11 +1283,19 @@ end
     end, Dn2)
     # A non-log lambda predictor fails at the contract gate (log-only).
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         ls = c .+ d .* x
         y .~ InverseGaussian.(exp.(eta), ls)
     end, Dn2)
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         ls = c .+ d .* x
         y .~ InverseGaussian.(exp.(eta), logistic.(ls))
@@ -1174,11 +1326,19 @@ end
     end, Dn2)
     # A modeled-k predictor fails at the contract gate (deferred).
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         ls = c .+ d .* x
         y .~ Weibull.(exp.(ls), exp.(eta))
     end, Dn2)
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         ls = c .+ d .* x
         y .~ Weibull.(ls, exp.(eta))
@@ -1223,6 +1383,8 @@ end
     # predictor (distinct slots — the bare self-use reaches the
     # contract gate).
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, logistic.(mu), mu)
     end, Dn3)
@@ -1271,6 +1433,10 @@ end
         Dict{Symbol,AbstractVector}(:y => [0.3], :x => [0.5]))
     # A non-log kappa predictor fails at the contract gate (log-only).
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         lk = c .+ d .* x
         y .~ VonMises.(mu, lk)
@@ -1327,11 +1493,19 @@ end
         Dict{Symbol,AbstractVector}(:y => [0.7], :x => [0.5]))
     # A modeled-sigma predictor fails at the contract gate (deferred).
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         ls = c .+ d .* x
         y .~ LogNormal.(mu, exp.(ls))
     end, Dn2)
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         ls = c .+ d .* x
         y .~ LogNormal.(mu, ls)
@@ -1438,6 +1612,7 @@ end
 @testset "surface plan equality" begin
     # Bernoulli: stated intercept prior, defaulted slope prior.
     got = lower_rkppl(quote
+        b ~ Normal(0, 1)
         a ~ Normal(0, 5)
         eta = a .+ b .* x
         y .~ Bernoulli.(logistic.(eta))
@@ -1472,6 +1647,8 @@ end
     @test _plans_equal(got, want)
     # Weighted response (object-first HOF, Distributions.jl argument order).
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         s ~ Exponential(1)
         mu = a .+ b .* x
         y .~ weighted.(Normal.(mu, s), w)
@@ -1491,6 +1668,8 @@ end
     @test _plans_equal(got, want)
     # Truncated (object form, literal bounds) and censored (column bounds).
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ truncated.(Normal.(mu, s), 0, 10)
         s ~ Exponential(1)
@@ -1509,6 +1688,8 @@ end
             nothing, :s)])
     @test _plans_equal(got, want)
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ censored.(Normal.(mu, s), lo, hi)
         s ~ Exponential(1)
@@ -1517,6 +1698,8 @@ end
         ResponseEvidence(:censored, :lo, :hi)
     # Interval (object + upper only; the response is the lower endpoint).
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ interval_censored.(Normal.(mu, s), hi)
         s ~ Exponential(1)
@@ -1599,6 +1782,8 @@ end
 @testset "surface parameters and assignments" begin
     # Flat, half-Normal (both spellings), hierarchical refs, temporaries.
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         m ~ Normal(0, 1)
         s ~ Exponential(m)
         t ~ Flat()
@@ -1647,6 +1832,8 @@ end
             PopulationPrior(:y_eta, :x, -3.0, 4.0)]
     # Shared predictor across two responses lowers once.
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y1 .~ Normal.(mu, s)
         y2 .~ Normal.(mu, s)
@@ -1657,6 +1844,8 @@ end
     @test got.responses[2].predictor === :mu
     # Leading docstring-to-be is ignored in slice 1.
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         "my model"
         mu = a .+ b .* x
         y .~ Normal.(mu, 2.0)
@@ -1664,6 +1853,8 @@ end
     @test length(got.responses) == 1
     # Strip-list macros unwrap.
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         @inbounds y .~ Normal.(mu, 2.0)
     end, (:y, :x))
@@ -1674,6 +1865,7 @@ end
     cols, _ = _gen_columns()
     yv, xv = cols[:y], cols[:x]
     m = @rkppl begin
+        b ~ Normal(0, 1)
         a ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 2.0)
@@ -1683,6 +1875,7 @@ end
     @test b1.roles == Dict(:y => :response, :x => :predictor)
     # Immediate NamedTuple form lowers+binds the same plan.
     b2 = @rkppl (y = yv, x = xv) begin
+        b ~ Normal(0, 1)
         a ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 2.0)
@@ -1690,6 +1883,7 @@ end
     @test _plans_equal(b1, b2)
     # Immediate dict form (String keys accepted).
     b3 = @rkppl Dict("y" => yv, "x" => xv) begin
+        b ~ Normal(0, 1)
         a ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 2.0)
@@ -1707,12 +1901,16 @@ end
 @testset "surface one-sided bounds and factor refs" begin
     # ±Inf normalizes to a missing side (Distributions.jl one-sided spelling).
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ truncated.(Normal.(mu, s), -Inf, 4)
         s ~ Exponential(1)
     end, (:y, :x))
     @test got.responses[1].evidence == ResponseEvidence(:truncated, nothing, 4)
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ truncated.(Normal.(mu, s), 0, Inf)
         s ~ Exponential(1)
@@ -1724,6 +1922,8 @@ end
         Expr(ex.head, (_swap999(a, v) for a in ex.args)...) :
         (ex == -999 ? v : ex)
     ast = _swap999(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ censored.(Normal.(mu, s), -999, 4)
         s ~ Exponential(1)
@@ -1731,6 +1931,8 @@ end
     got = lower_rkppl(ast, (:y, :x))
     @test got.responses[1].evidence == ResponseEvidence(:censored, nothing, 4)
     ast = _swap999(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ censored.(Normal.(mu, s), 0, -999)
         s ~ Exponential(1)
@@ -2002,6 +2204,7 @@ end
     # Classification: reductions and scalar refs stay scalar, aliases and
     # dotted forms go vector, staged chains resolve.
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
         m = mean(x)
         t = m + 1
         lx = log.(x)
@@ -2016,6 +2219,8 @@ end
     @test Set(d.name for d in got.derived) == Set([:lx, :w, :v])
     # Nested reductions must stage (contract owns nesting).
     @test_throws ContractValidationError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         z = mean(log.(x))
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
@@ -2062,12 +2267,18 @@ end
     # Chaining inlines: the factored and un-factored forms lower to the
     # SAME plan (naming a subexpression never changes legality).
     chained = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        d ~ Normal(0, 1)
+        c ~ Normal(0, 1)
         z = x .- mean(x)
         mu = a .+ d .* z
         t = mu .+ c .* x
         y .~ Normal.(t, 1.0)
     end, (:y, :x))
     flat = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        d ~ Normal(0, 1)
+        c ~ Normal(0, 1)
         z = x .- mean(x)
         t = a .+ d .* z .+ c .* x
         y .~ Normal.(t, 1.0)
@@ -2081,15 +2292,21 @@ end
     @test length(chained.derived) == 1 && chained.derived[1].name === :z
     # Julia-valid undotted scalar-array ops normalize to the dotted form.
     dotted = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, (:y, :x))
     plain = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b * x
         y .~ Normal.(mu, 1.0)
     end, (:y, :x))
     @test _plans_equal(dotted, plain)
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         z = x / 2
         mu = a .+ b .* z
         y .~ Normal.(mu, 1.0)
@@ -2098,6 +2315,8 @@ end
     # Anonymous interactions extract to synthetic locals; the named form
     # addresses its own column.
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* (x .* z)
         y .~ Normal.(mu, 1.0)
     end, (:y, :x, :z))
@@ -2108,6 +2327,8 @@ end
         TermSpec(ContinuousTerm, [:_rkppl_synth_1], NamedTuple(),
             :_rkppl_synth_1, :_rkppl_synth_1_term))
     named = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         w = x .* z
         mu = a .+ b .* w
         y .~ Normal.(mu, 1.0)
@@ -2115,6 +2336,7 @@ end
     @test named.predictors[1].terms[2].addressee === :w
     # Anonymous offsets extract too (sign folds into the column).
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
         mu = a .- log.(x)
         y .~ Normal.(mu, 1.0)
     end, (:y, :x))
@@ -2124,6 +2346,7 @@ end
     @test got.predictors[1].terms[2].kind === OffsetTerm
     # Non-coefficient parameters stay addressable inside derived locals.
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
         s ~ Exponential(1)
         w = s .+ x
         mu = a .+ w
@@ -2192,6 +2415,8 @@ end
         y .~ MvNormal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         s ~ positive(Normal(0, 1))
         mu = a .+ b .* x
         y .~ Normal.(mu, s)
@@ -2201,6 +2426,8 @@ end
         y .~ truncated.(normal, 0, 10, mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         t ~ flat()
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
@@ -2272,12 +2499,14 @@ end
     # parameter whose summand is a derived column; a sampled location
     # stays in the coefficient block (test_fallback.jl has the oracles).
     gam = lower_rkppl(quote
+        a ~ Normal(0, 1)
         b ~ Gamma(1, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, Dn)
     @test any(p -> p.name === :b && p.family === :gamma, gam.parameters)
     hyp = lower_rkppl(quote
+        a ~ Normal(0, 1)
         m ~ Normal(0, 1)
         b ~ Normal(m, 1)
         mu = a .+ b .* x
@@ -2291,11 +2520,17 @@ end
         y1 .~ Normal.(mu1, 1.0)
         y2 .~ Normal.(mu2, 1.0)
     end, (:y1, :y2, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # A coefficient another prior reads is an ordinary parameter (its
+    # summand lowers as a derived column — coef_grammar A, test_fallback.jl).
+    expb = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         s ~ Exponential(b)
         mu = a .+ b .* x
         y .~ Normal.(mu, s)
     end, Dn)
+    @test any(p -> p.name === :b, expb.parameters)
+    @test only(p for p in expb.parameters if p.name === :s).args.arg1 === :b
     # Scalar structure that cannot identify: stray Normal names inline to
     # a second intercept (degenerate), bare scalar parameters and staged
     # reductions in predictors have no term slot.
@@ -2360,6 +2595,8 @@ end
     # A RAW data-column per-observation scale (the eight-schools known SE) now
     # lowers — the response carries the column name and threads it per cell.
     got_obs_scale = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, x)
     end, Dn)
@@ -2383,6 +2620,8 @@ end
     end, Dn)
     # Synthetic names dodge user definitions (fresh-name generation).
     got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         _rkppl_synth_1 = x .+ 1
         mu = a .+ b .* (x .* _rkppl_synth_1)
         y .~ Normal.(mu, 1.0)
@@ -2409,6 +2648,8 @@ end
     end, (:y, :x, :w))
     # Expression prior arguments bind to a synthetic assignment.
     expr = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         s ~ Normal(0, 2 * m)
         m ~ Normal(0, 1)
         mu = a .+ b .* x
@@ -2890,6 +3131,7 @@ end
     ]
     for bad in badcells
         @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+                :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
                 :(mu = a .+ b .* x),
                 Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                     Expr(:for, Expr(:(=), :i, :(eachindex(y))),
@@ -2898,6 +3140,7 @@ end
     # Bare whole vectors in cells (data, predictor, derived).
     for bad in (:(y[i] ~ Normal.(x, s)), :(y[i] ~ Normal.(mu, s)))
         @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+                :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
                 :(mu = a .+ b .* x),
                 Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                     Expr(:for, Expr(:(=), :i, :(eachindex(y))),
@@ -2906,6 +3149,7 @@ end
     # The predictor case names the fix (it would lower silently).
     err = try
         lower_rkppl(Expr(:block,
+                :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
                 :(mu = a .+ b .* x),
                 Expr(:macrocall, Symbol("@plate"), LineNumberNode(9),
                     Expr(:for, Expr(:(=), :i, :(eachindex(y))),
@@ -2919,6 +3163,7 @@ end
         occursin("line 9", err.message)
     # Cross-column ranges; write violations; ownership across forms.
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(mu = a .+ b .* x),
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                 Expr(:for, Expr(:(=), :i, :(eachindex(x))),
@@ -3180,12 +3425,14 @@ end
 
     # A latent submodel lowers exactly like the hand-inlined program.
     got = lower_rkppl(quote
+        b ~ Normal(0, 1)
         a ~ Normal(0, 5)
         sig ~ sub_scale(1.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
     end, (:y, :x); mod = @__MODULE__)
     want = lower_rkppl(quote
+        b ~ Normal(0, 1)
         a ~ Normal(0, 5)
         sig_r ~ Exponential(1.0)
         sig = sig_r
@@ -3200,6 +3447,7 @@ end
 
     # An explicit trailing `return` lowers identically to the implicit form.
     got_ret = lower_rkppl(quote
+        b ~ Normal(0, 1)
         a ~ Normal(0, 5)
         sig ~ sub_scale_ret(1.0)
         eta = a .+ b .* x
@@ -3211,16 +3459,22 @@ end
     # Explicit-`return` compound latent value == the implicit twin and the
     # hand-inlined transform.
     gotv = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         m ~ sub_shift_ret(0.0, 2.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, m)
     end, (:y, :x); mod = @__MODULE__)
     gotvi = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         m ~ sub_shift(0.0, 2.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, m)
     end, (:y, :x); mod = @__MODULE__)
     wantv = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         m_z ~ Normal(0, 1)
         m = 0.0 + 2.0 * m_z
         eta = a .+ b .* x
@@ -3231,6 +3485,8 @@ end
 
     # The same submodel used twice → per-use-site namespacing, no collision.
     two = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         s1 ~ sub_scale(1.0)
         s2 ~ sub_scale(2.0)
         eta = a .+ b .* x
@@ -3282,11 +3538,15 @@ end
     # A nested submodel call expands after the enclosing body: names compose
     # under each use-site LHS (`sig` → `s` → `r` gives `sig_s_r`).
     gotn = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         sig ~ sub_nested(1.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
     end, (:y, :x); mod = @__MODULE__)
     wantn = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         sig_s_r ~ Exponential(1.0)
         sig_s = sig_s_r
         sig = sig_s
@@ -3317,6 +3577,8 @@ end
     # Without a submodel binding in scope, `latent ~ foo(...)` stays an
     # ordinary (unknown-distribution) parameter error — no submodel capture.
     @test_throws SurfaceLoweringError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         sig ~ not_a_submodel(1.0)
         eta = a .+ b .* x
         y .~ Normal.(eta, sig)
@@ -3361,9 +3623,11 @@ end
 @testset "surface observation-stream submodels" begin
     # A stream lowers exactly like the hand-inlined program (transparent).
     got = lower_rkppl(quote
+        b ~ Normal(0, 1)
         y ~ obs_gstream(x)
     end, (:y, :x); mod = @__MODULE__)
     want = lower_rkppl(quote
+        b ~ Normal(0, 1)
         y_a ~ Normal(0, 5)
         y_s ~ Exponential(1)
         y_eta = y_a .+ b .* x
@@ -3382,6 +3646,7 @@ end
     # An explicit `return slot` reads as the stream response pointer, exactly
     # like the implicit trailing symbol.
     gotr = lower_rkppl(quote
+        b ~ Normal(0, 1)
         y ~ obs_gstream_ret(x)
     end, (:y, :x); mod = @__MODULE__)
     @test _plans_equal(gotr, want)
@@ -3403,9 +3668,11 @@ end
     # the hand-inlined program (equal plans ⇒ equal kernel/value/gradient).
     cols, _ = _gen_columns()
     ms = @rkppl begin
+        b ~ Normal(0, 1)
         y ~ obs_gstream(x)
     end
     mi = @rkppl begin
+        b ~ Normal(0, 1)
         y_a ~ Normal(0, 5)
         y_s ~ Exponential(1)
         y_eta = y_a .+ b .* x
@@ -3864,6 +4131,8 @@ end
 
 @testset "surface categorical logit" begin
     ast = Expr(:block,
+        :(a2 ~ Normal(0, 1)), :(b2 ~ Normal(0, 1)),
+        :(a3 ~ Normal(0, 1)), :(b3 ~ Normal(0, 1)),
         :(eta2 = a2 .+ b2 .* x),
         :(eta3 = a3 .+ b3 .* x),
         :(y .~ CategoricalLogit.(eta2, eta3)))
@@ -3907,6 +4176,7 @@ end
 
 @testset "surface ordered logistic" begin
     ast = Expr(:block,
+        :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
         :(eta = a .+ b .* x),
         :(y .~ OrderedLogistic.(eta)))
     plan = lower_rkppl(ast, (:y, :x))
@@ -3920,10 +4190,12 @@ end
     # An explicit `y_cutpoints` definition collides loudly.
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(y_cutpoints ~ Normal(0, 1)),
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(eta = a .+ b .* x),
             :(y .~ OrderedLogistic.(eta))), (:y, :x))
     # Arity is exactly one eta.
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(eta = a .+ b .* x),
             :(y .~ OrderedLogistic.(eta, eta))), (:y, :x))
     # Bind + value roundtrip.
@@ -3947,6 +4219,7 @@ end
 
 @testset "surface ordinal" begin
     ast = Expr(:block,
+        :(b ~ Normal(0, 1)),
         :(eta = b .* x),
         :(y .~ Ordinal.(Cumulative(), LogitLink(), eta)))
     plan = lower_rkppl(ast, (:y, :x))
@@ -3957,27 +4230,33 @@ end
     @test r.thresholds === :y_thresholds
     @test only(plan.vector_parameters).family === :ordered_normal
     stopping = lower_rkppl(Expr(:block,
+            :(b ~ Normal(0, 1)),
             :(eta = b .* x),
             :(y .~ Ordinal.(StoppingRatio(), ProbitLink(), eta))), (:y, :x))
     rs = only(stopping.responses)
     @test rs.link === ProbitLink && rs.ordinal_structure === :stopping
     @test only(stopping.vector_parameters).family === :vector_normal
     clog = lower_rkppl(Expr(:block,
+            :(b ~ Normal(0, 1)),
             :(eta = b .* x),
             :(y .~ Ordinal.(Cumulative(), CloglogLink(), eta))), (:y, :x))
     @test only(clog.responses).link === CloglogLink
     # Tag misspellings, wrong arity, and discrimination/adhoc extras fail.
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(b ~ Normal(0, 1)),
             :(eta = b .* x),
             :(y .~ Ordinal.(Cumulative(), eta))), (:y, :x))
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(b ~ Normal(0, 1)),
             :(eta = b .* x),
             :(y .~ Ordinal.(Cumulative(), LogitLink(), eta, 2.0))), (:y, :x))
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(b ~ Normal(0, 1)),
             :(eta = b .* x),
             :(y .~ Ordinal.(Sequential(), LogitLink(), eta))), (:y, :x))
     # A fixed intercept is non-identifiable (plan validation agrees).
     @test_throws ContractValidationError lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(eta = a .+ b .* x),
             :(y .~ Ordinal.(Cumulative(), LogitLink(), eta))), (:y, :x))
 end

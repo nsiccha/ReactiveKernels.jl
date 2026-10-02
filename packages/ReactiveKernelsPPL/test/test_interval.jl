@@ -54,6 +54,8 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
 @testset "interval surface admission" begin
     @testset "gaussian literal upper" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), 5.0)
                 s ~ Exponential(1)
@@ -72,6 +74,8 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
     end
     @testset "gaussian column upper" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), hi)
                 s ~ Exponential(1)
@@ -84,6 +88,8 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
     end
     @testset "poisson literal upper" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), 4)
             end, (:y, :x))
@@ -98,6 +104,8 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
     end
     @testset "poisson column upper" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), ub)
             end, (:y, :x, :ub))
@@ -108,6 +116,8 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
     end
     @testset "fused poisson head lowers identically" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(PoissonLog.(eta), 4)
             end, (:y, :x))
@@ -119,6 +129,8 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
     end
     @testset "weighted composition (weights outermost)" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ weighted.(interval_censored.(Normal.(mu, s), hi), w)
                 s ~ Exponential(1)
@@ -137,12 +149,16 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
             end, (:y, :x))
         # Evidence is Gaussian/Poisson-only (slice 1 family gate).
         @test_throws ContractValidationError lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Bernoulli.(logistic.(eta)), 1)
             end, (:y, :x))
         # Response must sit strictly below the upper every row (bind-time
         # data gate).
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), hi)
                 s ~ Exponential(1)
@@ -174,6 +190,8 @@ end
 @testset "interval values vs oracle" begin
     @testset "gaussian literal upper" begin
         _, _, kern, lay = _int_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), 5.0)
                 s ~ Exponential(1)
@@ -185,6 +203,8 @@ end
     end
     @testset "gaussian column upper" begin
         _, _, kern, lay = _int_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), hi)
                 s ~ Exponential(1)
@@ -198,6 +218,8 @@ end
         cols = _int_gcols()
         cols[:w] = copy(_INT_W)
         _, _, kern, lay = _int_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ weighted.(interval_censored.(Normal.(mu, s), hi), w)
                 s ~ Exponential(1)
@@ -213,6 +235,8 @@ end
     end
     @testset "poisson literal upper" begin
         _, _, kern, lay = _int_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), 4)
             end, _int_pcols())
@@ -223,6 +247,8 @@ end
     end
     @testset "poisson column upper" begin
         _, _, kern, lay = _int_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), ub)
             end, _int_pcols())
@@ -251,6 +277,8 @@ end
 @testset "interval Enzyme gradients" begin
     @testset "gaussian literal upper" begin
         _int_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), 5.0)
                 s ~ Exponential(1)
@@ -258,6 +286,8 @@ end
     end
     @testset "gaussian column upper" begin
         _int_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), hi)
                 s ~ Exponential(1)
@@ -265,12 +295,16 @@ end
     end
     @testset "poisson literal upper" begin
         _int_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), 4)
             end, _int_pcols(), (eta = [0.1, -0.2],))
     end
     @testset "poisson column upper" begin
         _int_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), ub)
             end, _int_pcols(), (eta = [0.1, -0.2],))
@@ -304,6 +338,8 @@ end
 
 @testset "interval under Reactant" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ interval_censored.(Normal.(mu, s), hi)
         s ~ Exponential(1)
@@ -329,6 +365,8 @@ end
 # the gap).
 function _int_poisson_hlo_attempt()
     plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ interval_censored.(Poisson.(exp.(eta)), ub)
         end, (:y, :x, :ub))
@@ -469,6 +507,8 @@ end
         # y1 ~ interval_censored(Normal(mu, s); upper=hi1);
         # u = [0.6, -0.2, 0.1].
         bound, built, kern, lay = _int_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), hi)
                 s ~ Exponential(1)
@@ -493,6 +533,8 @@ end
         # y2 ~ interval_censored(Poisson(exp(eta)); upper=ub2);
         # u = [0.35, 0.45].
         bound, built, kern, lay = _int_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), ub)
             end, _int_i2_cols())

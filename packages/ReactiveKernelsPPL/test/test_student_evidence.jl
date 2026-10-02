@@ -37,6 +37,8 @@ end
 @testset "student evidence lowering" begin
     for wrap in ("censored", "truncated")
         prog = Meta.parse("""begin
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             sigma ~ Exponential(1.0)
             y .~ $wrap.(StudentT.(3.0, mu, sigma), lo, hi)
@@ -49,6 +51,8 @@ end
     # interval_censored takes the object + upper only (the response
     # itself is the lower endpoint).
     iplan = lower_rkppl(Meta.parse("""begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         sigma ~ Exponential(1.0)
         y .~ interval_censored.(StudentT.(3.0, mu, sigma), hi)
@@ -60,6 +64,8 @@ end
     # Other families keep the fail-closed gate (new message).
     @test_throws ContractValidationError bind_data(
         lower_rkppl(Meta.parse("""begin
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ censored.(HurdlePoisson.(exp.(mu), 0.1), lo, hi)
         end"""), (:y, :x, :lo, :hi)),
@@ -158,6 +164,8 @@ end
         :x => [0.0, 1.0, 2.0, 3.0, 4.0], :lo => fill(0.0, 5),
         :hi => fill(10.0, 5))
     prog = Meta.parse("""begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         sigma ~ Exponential(1.0)
         y .~ censored.(StudentT.(3.0, mu, sigma), lo, hi)
@@ -204,6 +212,8 @@ end
 # (upstream Reactant placeholder, no backing MLIR op).
 @testset "student evidence under Reactant" begin
     prog = Meta.parse("""begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         sigma ~ Exponential(1.0)
         y .~ censored.(StudentT.(3.0, mu, sigma), lo, hi)

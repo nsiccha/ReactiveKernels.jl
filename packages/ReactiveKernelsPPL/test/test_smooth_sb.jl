@@ -114,6 +114,24 @@ const _SM_BRMHSGP = quote
     y .~ Normal.(mu, exp.(lsig))
 end
 
+# accel_splines SB pin vs RK's canonical TPS basis (decision 1vts6mb: each
+# penalized column's first significant entry is positive). The SB numbers
+# below were produced (strato2) on a raw-LAPACK basis whose column 3 has the
+# opposite sign. A column flip is a reparametrization under that column's
+# N(0, 1) raw prior, so the SB pin is reproduced exactly at the point with
+# that column's raw coordinates negated. Drop the mapping once BRM adopts the
+# canonical signs and re-derives the SB number (BRM todo 1wo7z27).
+const _SM_ACCELSPL_SB_FLIPS = (3,)
+function _sm_sb_signed(lay, u)
+    v = copy(u)
+    for (i, n) in enumerate(coordinate_names(lay))
+        m = match(r"^b_s_x2?_raw\.(\d+)$", string(n))
+        m !== nothing && parse(Int, m.captures[1]) in _SM_ACCELSPL_SB_FLIPS &&
+            (v[i] = -v[i])
+    end
+    return v
+end
+
 const _SM_ACCELSPL = quote
     spline_basis(:s_x, x; sd = StudentT(3, 0, 36))
     spline_basis(:s_x2, x2; sd = StudentT(3, 0, 10))
@@ -276,6 +294,9 @@ end
     # each) into the intercepts b0 and s0 makes the models identical: RK
     # at 0.3^22 with both intercepts at 0.6 equals the SB literal up to
     # those two priors, StudentT(3, -13, 36) and StudentT(3, 0, 10).
+    # Evaluated at the point that maps RK's canonical TPS basis onto the
+    # raw-LAPACK basis SB used (`_sm_sb_signed`, decision 1vts6mb); before
+    # canonical signs a CI runner's LAPACK flipped column 4 here.
     _, _, kern, lay = _sm_query(_SM_ACCELSPL, _sm_cols(_SM_DATA.accelspl))
     @test lay.total == 22
     names = coordinate_names(lay)
@@ -285,11 +306,13 @@ end
     t3(m, s, v) = logpdf(TDist(3), (v - m) / s) - log(s)
     bridge = t3(-13, 36, 0.6) - t3(-13, 36, 0.3) + t3(0, 10, 0.6) -
         t3(0, 10, 0.3)
-    @test _sm_val(kern, u) ≈ -68.72536513207879 + bridge atol = 1e-10
+    @test _sm_val(kern, _sm_sb_signed(lay, u)) ≈
+        -68.72536513207879 + bridge atol = 1e-10
 end
 
 @testset "grouped HSGP surface + contract" begin
     base(kws...) = quote
+        a ~ Normal(0, 1)
         hsgp_basis(:h, x; k = 6, $(kws...))
         mu = a .+ hsgp(:h)
         y .~ Normal.(mu, 1.0)
@@ -318,6 +341,7 @@ end
         @test_throws SurfaceLoweringError lower_rkppl(bad, cols)
     end
     @test_throws SurfaceLoweringError lower_rkppl(quote
+        a ~ Normal(0, 1)
         hsgp_basis(:h, x, q; k = (4, 4), by = g)
         mu = a .+ hsgp(:h)
         y .~ Normal.(mu, 1.0)
