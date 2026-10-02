@@ -43,7 +43,7 @@ _slice_stem(p::ArrayParameter) = _MV_SLICE_FAMILIES[p.family][1]
 _slice_kind(p::ArrayParameter) = _MV_SLICE_FAMILIES[p.family][2]
 
 _is_structured_array(p::ArrayParameter) =
-    p.family === :lkj_cholesky || _is_slice_array(p)
+    p.family in (:lkj_cholesky, :lkj_cholesky_stack) || _is_slice_array(p)
 
 # The flat (column-major) packed vector an elementwise array constrains
 # into: the array's own name for one axis, a hygienic local reshaped into
@@ -148,12 +148,30 @@ function _validate_array_parameters(plan::StructuralPlan)
     for p in plan.array_parameters
         _check_name_hygiene(p.name)
         nd = length(p.dims)
-        1 <= nd <= 2 || _fail(p.label, "array $(p.name) has $nd axes " *
-            "(arrays have one or two)")
+        stack = p.family === :lkj_cholesky_stack
+        (1 <= nd <= 2 || (stack && nd == 3)) || _fail(p.label,
+            "array $(p.name) has $nd axes (arrays have one or two; a " *
+            "per-level LKJ stack three)")
         for d in p.dims
             _validate_array_dim(p, d)
         end
-        if p.family === :lkj_cholesky
+        if stack
+            p.dims[1] isa Int && p.dims[1] >= 2 && p.dims[1] == p.dims[2] &&
+                _is_levels_dim(p.dims[3]) || _fail(p.label,
+                "per-level LKJCholesky factors $(p.name) have axes " *
+                "[K, K, levels(g)] with a literal K ≥ 2, got " *
+                "$(repr(p.dims))")
+            keys(p.args) == (:arg1,) || _fail(p.label,
+                "per-level LKJCholesky factors $(p.name) take the shape " *
+                "`eta` only")
+            eta = p.args.arg1
+            eta isa Real && isfinite(eta) && eta > 0 || _fail(p.label,
+                "per-level LKJCholesky factors $(p.name): `eta` must be a " *
+                "finite positive literal, got $(repr(eta))")
+            p.support_override === nothing || _fail(p.label,
+                "per-level LKJCholesky factors $(p.name) carry no support " *
+                "override")
+        elseif p.family === :lkj_cholesky
             nd == 2 && p.dims[1] == p.dims[2] || _fail(p.label,
                 "LKJCholesky factor $(p.name) is square (K×K), got axes " *
                 "$(repr(p.dims))")
@@ -213,7 +231,7 @@ function _validate_array_parameters_data(plan::StructuralPlan)
         dims = _array_dims(plan, p)
         all(>=(1), dims) || _fail(p.label, "array $(p.name) has an empty " *
             "axis (sizes $(repr(dims)))")
-        if p.family === :lkj_cholesky
+        if p.family in (:lkj_cholesky, :lkj_cholesky_stack)
             dims[1] == dims[2] || _fail(p.label, "LKJCholesky factor " *
                 "$(p.name) is not square: $(repr(dims))")
             continue
@@ -789,6 +807,16 @@ function _array_layout_entries!(entries::Vector{LayoutEntry},
             push!(entries, LayoutEntry(:cholesky_corr, nothing, p.name,
                 labels, offset, packed, :lkj))
             offset += packed
+        elseif p.family === :lkj_cholesky_stack
+            # Level k's K(K-1)/2 vine partials are contiguous (`L.p.k`,
+            # P × S column-major): partial p of every level is a strided
+            # view, so one broadcast vine serves all S levels.
+            K, S = dims[1], dims[3]
+            P = K * (K - 1) ÷ 2
+            labels = [Symbol(p.name, ".", i, ".", k) for k in 1:S for i in 1:P]
+            push!(entries, LayoutEntry(:array, nothing, p.name, labels,
+                offset, P * S, :lkj_stack, NaN, NaN, dims))
+            offset += P * S
         elseif _is_slice_array(p)
             # Multivariate normal slices are centered: the array's entries
             # are its coordinates. Simplex / ordered slices pack their
@@ -872,6 +900,7 @@ _array_slices_packed_name(name::Symbol) = Symbol(:_ppl_arru_, name)
 # slice-transformed array reshapes its packed block and transforms every
 # slice in one call.
 function _array_transform_statements(e::LayoutEntry)
+    e.transform === :lkj_stack && return _lkj_stack_transform_statements(e)
     if _is_slice_transform(e.transform)
         U = _array_slices_packed_name(e.name)
         lo, hi = e.offset, e.offset + e.size - 1
@@ -894,6 +923,8 @@ function _array_transform_statements(e::LayoutEntry)
 end
 
 function _array_jacobian_term(e::LayoutEntry)
+    e.transform === :lkj_stack &&
+        return _lkj_vine_logjac(e.name, e.dims[1]; stacked = true)
     if _is_slice_transform(e.transform)
         _, jfn = _slice_function_names(e.transform)
         o = _orientation_expr(_slice_transform_orientation(e.transform))
@@ -902,6 +933,50 @@ function _array_jacobian_term(e::LayoutEntry)
     flat = _array_flat_name(e.name, length(e.dims))
     return jacobian_term(LayoutEntry(:plate, nothing, flat, e.labels,
         e.offset, e.size, e.transform, e.lo, e.hi))
+end
+
+# A per-level LKJ stack (`:lkj_stack`, dims `[K, K, S]`): the stacked
+# vine over partial p of every level (a strided view of its packed block,
+# core constraint 1: S never multiplies statements), then the value
+# `L::Array{Float64,3}` (`L[:, :, k]` is level k's factor) assembled from
+# the S-vector entries, column-major over (i, j).
+function _lkj_stack_transform_statements(e::LayoutEntry)
+    K, S = e.dims[1], e.dims[3]
+    P = K * (K - 1) ÷ 2
+    read(p) = (lo = e.offset + p - 1;
+        :(view(unconstrained, $lo:$P:$(lo + (S - 1) * P))))
+    stmts = _lkj_vine_statements(e.name, K, read; stacked = true)
+    cols = Any[]
+    for j in 1:K, i in 1:K
+        push!(cols, i == 1 && j == 1 ? :(fill(1.0, $S)) :
+            i >= j ? _rl_name(e.name, i, j) : :(zeros($S)))
+    end
+    push!(stmts, :($(e.name)::Array{Float64,3} =
+        reshape(permutedims(hcat($(cols...))), $K, $K, $S)))
+    return stmts
+end
+
+# Host edges of a per-level LKJ stack: level by level, the single-factor
+# host functions (the same vine as the stacked graph edges).
+function _lkj_stack_constrain(e::LayoutEntry, seg)
+    K, S = e.dims[1], e.dims[3]
+    P = K * (K - 1) ÷ 2
+    U = reshape(Vector{Float64}(seg), P, S)
+    out = Array{Float64,3}(undef, K, K, S)
+    for k in 1:S
+        out[:, :, k] = lkj_chol_constrain(U[:, k], K)
+    end
+    return out
+end
+function _lkj_stack_unconstrain(e::LayoutEntry, X)
+    K, S = e.dims[1], e.dims[3]
+    return reduce(vcat, [lkj_chol_unconstrain(X[:, :, k], K) for k in 1:S])
+end
+function _lkj_stack_logjac(e::LayoutEntry, seg)
+    K, S = e.dims[1], e.dims[3]
+    P = K * (K - 1) ÷ 2
+    U = reshape(Vector{Float64}(seg), P, S)
+    return sum(lkj_chol_logjac(U[:, k], K) for k in 1:S)
 end
 
 # ── generator ────────────────────────────────────────────────────────
@@ -973,6 +1048,12 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         if p.family === :lkj_cholesky
             push!(stmts, :($node::Float64 =
                 $(_lkj_prior_terms(p.name, dims[1], Float64(p.args.arg1)))))
+            push!(terms, node)
+            continue
+        end
+        if p.family === :lkj_cholesky_stack
+            push!(stmts, :($node::Float64 = $(_lkj_prior_terms(p.name,
+                dims[1], Float64(p.args.arg1); nstack = dims[3]))))
             push!(terms, node)
             continue
         end

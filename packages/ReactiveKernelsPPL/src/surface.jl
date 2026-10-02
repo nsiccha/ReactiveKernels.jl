@@ -3972,6 +3972,15 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                        "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
                        "object owns eta over the whole column)")
             end
+            pl = _per_level_lhs(st.args[2], st.args[3], bc)
+            if pl !== nothing
+                plhs, pdims = pl
+                _claim!(seen, seelines, plhs, line)
+                _reject_target(st.args[3], plhs)
+                push!(sample, SampleStmt(plhs, st.args[3], false, nothing,
+                    nothing, nothing, pdims, :per_level))
+                continue
+            end
             sl = _array_slices_lhs(st.args[2], st.args[3], bc, tilde, data)
             if sl !== nothing
                 rlhs, rdims, slices = sl
@@ -4603,9 +4612,10 @@ end
 # per-level declaration means what the whole-array declaration means:
 # `c[k] ~ D` is `c[levels(g)] .~ D.` (one draw per level), and a row
 # `b[k, :] ~ D` (or `b[k, 1:K]`) with a multivariate `D` is the row
-# statement `eachrow(b[levels(g), 1:K]) .~ D` (§ array slices). Arguments
-# are shared across levels. Per-level arguments, per-level factors
-# (`L[k] ~ LKJCholesky(K, eta)`) and per-level definitions are not
+# statement `eachrow(b[levels(g), 1:K]) .~ D` (§ array slices), and
+# `L[k] ~ LKJCholesky(K, eta)` declares one correlation factor per level
+# (a stacked LKJ array, `:lkj_cholesky_stack`). Arguments are shared
+# across levels. Per-level arguments and per-level definitions are not
 # supported yet.
 function _desugar_levels_cell(c, ivar::Symbol, g::Symbol, data)
     where = "`@plate for $ivar in levels($g)` cell `$(repr(c))`"
@@ -4624,8 +4634,11 @@ function _desugar_levels_cell(c, ivar::Symbol, g::Symbol, data)
     if length(lhs.args) == 2
         _mv_head(obj) === nothing || _sfail("$where: a multivariate " *
             "per-level draw is a row, `$col[$ivar, :] ~ $(repr(obj))`")
-        _is_lkj_cholesky_call(obj) && _sfail("$where: one `LKJCholesky` " *
-            "factor per level is not supported yet")
+        # One correlation factor per level: an internal declaration the
+        # statement partitioner reads as a stacked LKJ array (users write
+        # the plate; `_ppl_` names are reserved).
+        _is_lkj_cholesky_call(obj) && return Expr[Expr(:call, :~,
+            Expr(:call, :_ppl_per_level, col, g), obj)]
         dobj, _ = _dotify_cell(obj, ivar, Set{Symbol}(), true)
         return Expr[Expr(:call, :.~, Expr(:ref, col, :(levels($g))), dobj)]
     end
@@ -5132,6 +5145,20 @@ end
 
 _is_literal_range(r) = r isa Expr && r.head === :call && length(r.args) == 3 &&
     r.args[1] === :(:)
+
+# The internal per-level declaration `_ppl_per_level(L, g) ~
+# LKJCholesky(K, eta)` that `@plate for k in levels(g); L[k] ~
+# LKJCholesky(K, eta); end` desugars to: `(L, dims)` with dims
+# `[K, K, levels(g)]` (`nothing` otherwise).
+function _per_level_lhs(lhs, rhs, bc::Bool)
+    (lhs isa Expr && lhs.head === :call && length(lhs.args) == 3 &&
+        lhs.args[1] === :_ppl_per_level) || return nothing
+    L, g = lhs.args[2], lhs.args[3]
+    (L isa Symbol && g isa Symbol && !bc && _is_lkj_cholesky_call(rhs)) ||
+        _sfail("internal: malformed per-level declaration $(repr(lhs))")
+    K = rhs.args[2]
+    return L, Any[K, K, :(levels($g))]
+end
 
 # Multivariate slice declarations ([`ArrayParameter`](@ref) slice
 # families, `mv_slices.jl`): `eachrow(B[a, b]) .~ D` / `eachcol(B[a, b])
@@ -10715,6 +10742,12 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
     arrays = ArrayParameter[]
     for s in sample
         (s.lhs in ctx.data || s.lhs in ctx.derived_responses) && continue
+        if s.slices === :per_level
+            haskey(coefuse, s.lhs) && _sfail("$(s.lhs) is a predictor " *
+                "coefficient and cannot also be an LKJCholesky factor")
+            push!(arrays, _lower_lkj_stack(s.lhs, s.dims, s.rhs))
+            continue
+        end
         if s.slices !== nothing
             push!(arrays, _lower_array_slices(s.lhs, s.dims, s.slices, s.rhs,
                 coefuse, syms))
@@ -10819,6 +10852,18 @@ function _lower_lkj_cholesky(lhs, rhs)
         "got $(repr(eta))")
     return ArrayParameter(lhs, :lkj_cholesky, (arg1 = Float64(eta),),
         Any[dim, dim], nothing, lhs)
+end
+
+# One LKJ correlation factor per level of `g` (a per-level `@plate` cell):
+# the stacked array `:lkj_cholesky_stack` with dims `[K, K, levels(g)]`.
+# K is a literal ≥ 2 (a 1×1 factor is the constant 1).
+function _lower_lkj_stack(lhs, dims::Vector{Any}, rhs)
+    one = _lower_lkj_cholesky(lhs, rhs)
+    K = one.dims[1]
+    K isa Int && K >= 2 || _sfail("per-level `$lhs[k] ~ LKJCholesky(K, " *
+        "eta)`: K is a literal ≥ 2, got $(repr(K))")
+    return ArrayParameter(lhs, :lkj_cholesky_stack, one.args,
+        Any[K, K, dims[3]], nothing, lhs)
 end
 
 # `z[axes...] .~ Fam.(args...)`: the elementwise prior is the scalar
