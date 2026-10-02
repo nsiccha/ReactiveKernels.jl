@@ -426,7 +426,7 @@ end
     bound = bind_data(_svalid_plan(), _spline_cols())
     layout = assign_layout(bound)
     @test [e.kind for e in layout.entries] ==
-        [:coefficient, :sampled, :spline, :spline, :spline]
+        [:sampled, :sampled, :spline, :spline, :spline]
     @test [e.size for e in layout.entries] == [1, 1, 1, 2, 1]
     @test [e.transform for e in layout.entries] ==
         [:identity, :exp, :identity, :identity, :exp]

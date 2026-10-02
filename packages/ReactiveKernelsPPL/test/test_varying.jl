@@ -438,7 +438,7 @@ end
     # The 1x1 LKJ factor packs zero coordinates; tau rides :exp (Stan
     # lower-bound Jacobian, no renorm) — the intercept and slope alike.
     @test [e.kind for e in layout.entries] ==
-        [:coefficient, :sampled, :varying_corr, :varying, :varying]
+        [:sampled, :sampled, :varying_corr, :varying, :varying]
     @test [e.size for e in layout.entries] == [1, 1, 0, 1, 3]
     @test [e.transform for e in layout.entries] ==
         [:identity, :exp, :lkj, :exp, :identity]
@@ -460,7 +460,7 @@ end
         :x => collect(1.0:8.0))
     slayout = assign_layout(bind_data(splan, scols))
     @test [e.kind for e in slayout.entries] ==
-        [:coefficient, :varying_corr, :varying, :varying]
+        [:sampled, :varying_corr, :varying, :varying]
     @test [e.transform for e in slayout.entries] ==
         [:identity, :lkj, :exp, :identity]
     @test coordinate_names(slayout)[2] === Symbol("tau_g.1")
@@ -741,9 +741,9 @@ end
     layout = assign_layout(bound)
     # `a` rides the intercept coefficient; sampled = [sigma, draws triple].
     @test [e.kind for e in layout.entries] ==
-        [:coefficient, :sampled, :varying_corr, :varying, :varying]
+        [:sampled, :sampled, :varying_corr, :varying, :varying]
     @test [e.name for e in layout.entries] ==
-        [:mu_coef, :sigma, :L_g, :tau_g, :z_flat_g]
+        [:a, :sigma, :L_g, :tau_g, :z_flat_g]
     @test [e.size for e in layout.entries] == [1, 1, 1, 2, 6]
     @test [e.transform for e in layout.entries] ==
         [:identity, :exp, :lkj, :exp, :identity]
@@ -974,7 +974,7 @@ end
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     @test [e.kind for e in built.layout.entries] ==
-        [:coefficient, :coefficient, :sampled, :varying_corr, :varying, :varying]
+        [:sampled, :sampled, :sampled, :varying_corr, :varying, :varying]
     # 2 coefs + s + 1 theta + 2 tau + 2*3 z cells.
     @test built.layout.total == 12
     u = collect(range(-0.4, 0.4; length = built.layout.total))
