@@ -76,6 +76,20 @@ function take_schedule(col)
     return only(col)
 end
 schedule_reads(sched, b) = b .* sched.a .+ sched.k
+schedule_weights(w::AbstractVector) = w
+schedule_weights(w::AbstractMatrix) = w[:, 1]
+weighted_reads(sched, w, b) = schedule_weights(w) .* sched.a .+ sched.k .+ b
+weighted_reads(sched::Tuple, w, b) =
+    schedule_weights(w) .* sched[1] .+ sched[2] .+ b
+function bind_scale(x)
+    UNWRAPS[] += 1
+    return 2.0
+end
+function bind_matrix(x)
+    UNWRAPS[] += 1
+    return reshape(copy(x), 1, length(x))
+end
+matrix_reads(M, w, b) = w .* vec(M) .+ b
 end
 const _FV = FunctionsAsValuesModels
 
@@ -561,6 +575,106 @@ end
             _fv_findiff(w -> Base.invokelatest(q.kernel, w), [0.7, 0.1]);
             rtol = 1e-5, atol = 1e-7)
         @test only(cols[:s]) == snapshot       # bound data untouched
+    end
+end
+
+@testset "functions as values: prepared records beside declared arrays" begin
+    # The same data-only call must fold at preparation when a declared
+    # array makes lowering retain its named assignment. Records are leaf
+    # function inputs, with no observation axis or numeric shape guard.
+    for n in (3, 7), kind in (:namedtuple, :tuple),
+            weights in (:data, :vector, :matrix), spelling in (:named, :alias, :inline)
+        a = collect(range(0.5, 1.5; length = n))
+        k = collect(1:n)
+        sched = kind === :namedtuple ? (; a, k) : (a, k)
+        oi = [n, 1, n, 2]
+        cols = Dict{Symbol,ColumnData}(:s => [sched], :oi => oi,
+            :y => [0.2, -0.1, 0.3, 0.5])
+        snapshot = deepcopy(cols)
+        ast = quote
+            b ~ Normal(0, 1)
+            y .~ Normal.(reads[oi], 1)
+        end
+        declarations = weights === :vector ? :(w[1:$n] .~ Normal.(0, 1)) :
+            weights === :matrix ? :(w[1:$n, 1:1] .~ Normal.(0, 1)) : nothing
+        declarations === nothing ? (cols[:w] = fill(0.2, n)) :
+            pushfirst!(ast.args, declarations)
+        definitions = spelling === :inline ? [:(reads = weighted_reads(take_schedule(s), w, b))] :
+            spelling === :alias ? [:(sc = take_schedule(s)), :(sc2 = identity(sc)),
+                :(reads = weighted_reads(sc2, w, b))] :
+            [:(sc = take_schedule(s)), :(reads = weighted_reads(sc, w, b))]
+        # Place definitions before the response (declaration order does
+        # not affect data staging or dependency order).
+        splice!(ast.args, length(ast.args):length(ast.args),
+            vcat(definitions, ast.args[end:end]))
+        _FV.UNWRAPS[] = 0
+        plan, bound, built = _fv_build(ast, cols)
+        @test _FV.UNWRAPS[] == 0
+        @test !haskey(bound.columns, :sc)
+        @test bound.n_obs == length(oi)
+        u = [0.1 * i - 0.2 for i in 1:built.layout.total]
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        @test _FV.UNWRAPS[] == 1
+        function reference(z)
+            th = ReactiveKernelsPPL.constrain(built.layout, z)
+            w = weights === :data ? cols[:w] : vec(th.w)
+            r = w .* a .+ k .+ th.b
+            ll = sum(logpdf(Normal(r[i], 1), y) for (i, y) in zip(oi, cols[:y]))
+            lp = logpdf(Normal(), th.b)
+            weights === :data || (lp += sum(logpdf.(Normal(), w)))
+            return ll + lp
+        end
+        for z in (u, reverse(u))
+            g = similar(z)
+            value, _ = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!, q.ad, g, z)
+            @test value ≈ reference(z)
+            @test isapprox(g, _fv_findiff(reference, z); rtol = 1e-5, atol = 1e-7)
+        end
+        @test _FV.UNWRAPS[] == 1
+        @test cols[:y] == snapshot[:y]
+        @test cols[:oi] == snapshot[:oi]
+        @test a == (kind === :tuple ? snapshot[:s][1][1] : snapshot[:s][1].a)
+        @test k == (kind === :tuple ? snapshot[:s][1][2] : snapshot[:s][1].k)
+        # refused: supplied data cannot shadow a computed assignment.
+        if any(a -> a.name === :sc, plan.assignments)
+            shadowed = copy(cols)
+            shadowed[:sc] = [1.0]
+            @test_throws ContractValidationError bind_data(plan, shadowed)
+        end
+    end
+end
+
+@testset "functions as values: shared bind and preparation consumers" begin
+    cols = Dict{Symbol,ColumnData}(:x => [0.5, 1.0, 1.5], :oi => [3, 1, 3, 2],
+        :y => [0.2, -0.1, 0.3, 0.5])
+    prior = quote
+        k = bind_scale(x)
+        b ~ Normal(0, k)
+        w[1:3] .~ Normal.(0, 1)
+        reads = shifted(scaled(w, k); by = b)
+        y .~ Normal.(reads[oi], 1)
+    end
+    dimension = quote
+        M = bind_matrix(x)
+        b ~ Normal(0, 1)
+        w[axes(M, 2)] .~ Normal.(0, 1)
+        reads = matrix_reads(M, w, b)
+        y .~ Normal.(reads[oi], 1)
+    end
+    for (ast, name) in ((prior, :k), (dimension, :M))
+        _FV.UNWRAPS[] = 0
+        _, bound, built = _fv_build(ast, cols)
+        @test _FV.UNWRAPS[] == 1
+        @test haskey(bound.columns, name)
+        u = [0.1 * i - 0.2 for i in 1:built.layout.total]
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        g = similar(u)
+        value, _ = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!, q.ad, g, u)
+        @test isfinite(value)
+        @test isapprox(g, _fv_findiff(z -> Base.invokelatest(q.kernel, z), u);
+            rtol = 1e-5, atol = 1e-7)
+        @test _FV.UNWRAPS[] == 1
+        @test cols[:x] == [0.5, 1.0, 1.5]
     end
 end
 
