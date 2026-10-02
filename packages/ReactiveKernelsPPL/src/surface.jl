@@ -1902,8 +1902,6 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
     elseif fn === :^ || _is_plain_comparison(fn) || fn === :ifelse ||
             fn in ASSIGNMENT_FNS
         return nvec == 0 ? :scalar : :invalid
-    elseif fn in VECTOR_FNS
-        return :vector
     end
     return nvec == 0 ? :scalar : :vector  # unknown heads: follow the args
 end
@@ -2150,7 +2148,7 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
         # (responses) with bind-to-a-name guidance.
         fn === :_ppl_plate_column && return nothing  # array-cell plate
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
-                fn ∉ VECTOR_FNS && fn !== :spline &&
+                fn !== :spline &&
                 fn !== :hsgp && fn !== :mo && fn !== :mo1 &&
                 fn !== :hcat && fn !== :dar
             startswith(string(fn), ".") && _sfail(
@@ -2220,7 +2218,7 @@ end
 const _CONSTRUCT_VALUE_HEADS = (:spline, :hsgp, :mo, :mo1, :hcat, :dar)
 
 _builtin_value_head(fn::Symbol) =
-    fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS || fn in VECTOR_FNS ||
+    fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS ||
     fn in REDUCTION_FNS || fn in _CONSTRUCT_VALUE_HEADS ||
     fn in CELL_FNS || fn in SEGMENT_CELL_FNS ||
     startswith(string(fn), ".") || fn === :treatment || fn === :ifelse ||
@@ -2371,14 +2369,18 @@ end
 # `_confirm_whole_value_data`.
 function _check_module_calls(det, detmap, data, env::_ShapeEnv;
         whole::Set{Symbol} = Set{Symbol}())
-    # Whole columns are model-level values there: still gatherable
-    # (`gx[g]` follows its index), never aligned themselves.
+    # A sampled vector (plate, scan or varying result) passes whole to an
+    # undotted module call. Its alignment outside that call does not give
+    # the call an observation axis. Raw data still obey the whole-column
+    # check: `gx[g]` follows its index, while `gx` passes whole only when
+    # no other consumer needs it per observation.
     aligned = setdiff(data, whole)
-    wenv = _ShapeEnv(env.aligned, union(env.values, whole))
+    call_env = _ShapeEnv(Set{Symbol}(), env.values)
+    wenv = _ShapeEnv(call_env.aligned, union(env.values, whole))
     memos = (Dict{Symbol,Symbol}(), Dict{Symbol,Symbol}())
     waived = Tuple{String,Set{Symbol}}[]
     for (nm, rhs) in det
-        _check_module_calls(nm, rhs, detmap, data, aligned, whole, env, wenv,
+        _check_module_calls(nm, rhs, detmap, data, aligned, whole, call_env, wenv,
             memos, waived)
     end
     return waived
@@ -4973,7 +4975,7 @@ function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool;
     # array operand to take the ordinary matrix-value route.
     fn = (ex.head === :call || _is_dotted_call(ex)) && !isempty(a) ? a[1] : nothing
     composed = fn in _MATRIX_OPERAND_HEADS || fn in ELEMENTWISE_FNS ||
-        fn in ASSIGNMENT_FNS || fn in VECTOR_FNS || fn isa GlobalRef ||
+        fn in ASSIGNMENT_FNS || fn isa GlobalRef ||
         (fn isa Expr && fn.head === :.)
     child_affine = affine && !(composed && fn ∉ (:+, :.+, :-, :.-))
     for x in a
