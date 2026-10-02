@@ -9107,6 +9107,10 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     s in ctx.varying_draws_names && return false
     _derived_reads_latent(s, ctx) && return false
     _composed_data_only(s, ctx, Set{Symbol}()) && return false
+    # An interned location already has an LP node, including an offset
+    # whose definition reads array values. Consumers must use that node
+    # rather than reclassifying and emitting the definition a second time.
+    haskey(ctx.pred_idx, s) && return true
     # A definition reading a declared array is a value (an in-graph
     # column), not an affine sub-predictor — except the bare factor alias
     # `th = c[g]` over a coefficient-capable `c[levels(g)]`, which keeps
