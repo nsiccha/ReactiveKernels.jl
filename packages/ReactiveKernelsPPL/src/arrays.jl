@@ -1160,7 +1160,8 @@ end
 
 # Prior nodes `_ppl_prior_<name>` of the plan's array parameters.
 function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
-        plan::StructuralPlan, needed::Set{Tuple{Symbol,Symbol}}; context = plan)
+        plan::StructuralPlan, needed::Set{Tuple{Symbol,Symbol}};
+        context = plan, pointwise = Pair{Symbol,Any}[])
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
         node = Symbol(:_ppl_prior_, p.name)
@@ -1168,23 +1169,42 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             push!(stmts, :($node::Float64 =
                 $(_lkj_prior_terms(p.name, dims[1], Float64(p.args.arg1)))))
             push!(terms, node)
+            push!(pointwise, p.name => node)
             continue
         end
         if p.family === :lkj_cholesky_stack
             push!(stmts, :($node::Float64 = $(_lkj_prior_terms(p.name,
                 dims[1], Float64(p.args.arg1); nstack = dims[3]))))
             push!(terms, node)
+            # A stack is a broadcast of factor draws, one density per slice.
+            if p.name in plan.conditioned
+                value = Symbol(:_ppl_pointwise_, p.name)
+                push!(stmts, :($value = $(_lkj_prior_terms(p.name,
+                    dims[1], Float64(p.args.arg1); nstack = dims[3], pointwise = true))))
+                push!(pointwise, p.name => value)
+            end
             continue
         end
         if p.family === :flat
             push!(stmts, :($node::Float64 = 0.0))
             push!(terms, node)
+            push!(pointwise, p.name => :(0.0 .* $(p.name)))
             continue
         end
         if _is_slice_array(p)
+            density = _slice_prior_call!(stmts, p)
             push!(stmts, :($node::Float64 =
-                $(_slice_prior_call!(stmts, p))))
+                $density))
             push!(terms, node)
+            if _slice_kind(p) === :vector
+                push!(pointwise, p.name => node)
+            elseif p.name in plan.conditioned
+                value = Symbol(:_ppl_pointwise_, p.name)
+                density = copy(density)
+                density.args[1] = Symbol(replace(string(density.args[1]), "_logpdf" => "_pointwise"))
+                push!(stmts, :($value = $density))
+                push!(pointwise, p.name => value)
+            end
             continue
         end
         flat = _array_flat_name(p.name, length(dims))
@@ -1203,6 +1223,7 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         _vector_prior_stmts!(stmts, terms, flat, p.family,
             NamedTuple{Tuple(first.(args))}(Tuple(last.(args))),
             p.support_override; conditioned = p.name in context.conditioned)
+        push!(pointwise, p.name => :(reshape($(Symbol(:_ppl_pw_prior_, flat)), size($(p.name)))))
     end
     return nothing
 end

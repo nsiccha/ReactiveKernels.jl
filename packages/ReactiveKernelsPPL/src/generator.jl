@@ -269,6 +269,8 @@ import ..linear_pk_read_locs_over_subjects,
 import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
 import .._mvnormal_cholesky_slices_logpdf, .._mvnormal_slices_logpdf
 import .._dirichlet_slices_logpdf, .._ordered_normal_slices_logpdf
+import .._mvnormal_cholesky_slices_pointwise, .._mvnormal_slices_pointwise
+import .._dirichlet_slices_pointwise, .._ordered_normal_slices_pointwise
 import .._simplex_slices_constrain, .._simplex_slices_logjac
 import .._ordered_slices_constrain, .._ordered_slices_logjac
 # Event-LP provider (one call over the flat event axis — the flat
@@ -1179,27 +1181,56 @@ _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
 function _likelihood_statements(plan::StructuralPlan, layout; gathers)
     stmts = Expr[]
     terms = Any[]
+    points = Pair{Symbol,Any}[]
     for r in plan.responses
         append!(stmts, _response_likelihood_stmts(r, plan))
         push!(terms, _lik_name(r.label))
+        pw = _pw_name(r.label)
+        if r.family === OrdinalFam && r.ordinal_structure === :stopping && r.n_levels > 1
+            # Stopping-ratio emits one lane per visited stage. Gather the
+            # prefix sum at each observation's last stage, then difference.
+            ends = Symbol(pw, :_ends)
+            cumulative = Symbol(pw, :_cumulative)
+            values = Symbol(pw, :_observations)
+            push!(stmts, :($ends = cumsum(min.($(r.response), $(r.n_levels-1)))),
+                :($cumulative = cumsum($pw)[$ends]),
+                :($values = $cumulative .- vcat(0.0, $cumulative[1:end-1])))
+            pw = values
+        end
+        push!(points, r.response => pw)
     end
     for kp in plan.kernel_plates
-        kstmts, kterm = _kernel_plate_likelihood(kp, plan)
+        kstmts, kterm = _kernel_plate_likelihood(kp, plan; pointwise = points)
         append!(stmts, kstmts)
         push!(terms, kterm)
     end
     observed = _density_selection(plan, n -> n in plan.conditioned)
-    _parameter_prior_statements!(stmts, terms, observed, layout; prefix = :_ppl_condition_)
+    _parameter_prior_statements!(stmts, terms, observed, layout;
+        prefix = :_ppl_condition_, group_scalars = false)
+    for p in observed.parameters
+        push!(points, p.name => Symbol(:_ppl_prior_, p.name))
+    end
     for p in observed.vector_parameters
         _vector_parameter_prior_stmts!(stmts, terms, p)
+        value = p.family === :vector_normal ?
+            (p.size == 0 ? :(zeros(0)) : Symbol(:_ppl_pw_prior_, p.name)) :
+            Symbol(:_ppl_prior_, p.name)
+        push!(points, p.name => value)
     end
     for p in observed.plate_parameters
         _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
             p.support_override; conditioned = true)
+        push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
     end
-    _array_prior_stmts!(stmts, terms, observed, gathers; context = plan)
+    _array_prior_stmts!(stmts, terms, observed, gathers; context = plan, pointwise = points)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
     push!(stmts, :(likelihood::Float64 = $joint))
+    names = first.(points)
+    length(unique(names)) == length(names) || throw(ContractValidationError(
+        "[query] pointwise observation names must be unique, got $names"))
+    values = isempty(points) ? :(NamedTuple()) :
+        Expr(:tuple, (Expr(:(=), name, value) for (name, value) in points)...)
+    push!(stmts, Expr(:(=), :pointwise, values))
     return stmts
 end
 
@@ -1211,7 +1242,7 @@ end
 # flat statements, and the single Gaussian obs lowers as a flat plate
 # reusing the plate-sum machinery. The collected name aliases its flat
 # value (future generated quantities read it).
-function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
+function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan; pointwise = Pair{Symbol,Any}[])
     isbound(plan) ||
         throw(ContractValidationError("[generator] kernel plates lower " *
               "from a bound plan (bind_data first)"))
@@ -1233,6 +1264,8 @@ function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
     rcol = _kernel_obs_rcol(kp, obs, flatmap[obs.response], plan)
     append!(stmts, _kernel_scalar_obs_stmts(obs, rcol,
         flatmap, plan, klabel, _pw_name(klabel), _lik_name(klabel)))
+    col = only(c for (c, p, _) in kp.slices if p === obs.response)
+    push!(pointwise, col => _pw_name(klabel))
     collected = haskey(flatmap, kp.collected) ? flatmap[kp.collected] : kp.collected
     collected === kp.result ||
         push!(stmts, :($(kp.result) = $collected))
@@ -1450,7 +1483,7 @@ end
 _grouped_flatmap(kp::KernelPlate) =
     Dict{Symbol,Symbol}(p => c for (c, p, _) in kp.slices)
 
-function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
+function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan; pointwise = Pair{Symbol,Any}[])
     isbound(plan) ||
         throw(ContractValidationError("[generator] kernel plates lower " *
               "from a bound plan (bind_data first)"))
@@ -1480,6 +1513,8 @@ function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
             _grouped_obs_likelihood_stmts(kp, obs, rcol, olabel, plan)
         append!(stmts, ostmts)
         push!(oterms, oterm)
+        # All in-cell observation builders end in a sum of their lanes.
+        push!(pointwise, rcol => last(ostmts).args[2].args[2])
     end
     joint = foldl((a, b) -> :($a + $b), oterms; init = :(0.0))
     push!(stmts, :($(_lik_name(klabel))::Float64 = $joint))
@@ -1553,9 +1588,9 @@ function _grouped_obs_likelihood_stmts(kp::KernelPlate, obs::KernelObs,
           "CensoredAddpropnormal, TgiCategory, TgiResponse, TgiCensored)"))
 end
 
-function _kernel_plate_likelihood(kp::KernelPlate, plan::StructuralPlan)
-    _is_grouped_kernel(kp) && return _grouped_kernel_likelihood(kp, plan)
-    return _panel_kernel_likelihood(kp, plan)
+function _kernel_plate_likelihood(kp::KernelPlate, plan::StructuralPlan; pointwise = Pair{Symbol,Any}[])
+    _is_grouped_kernel(kp) && return _grouped_kernel_likelihood(kp, plan; pointwise)
+    return _panel_kernel_likelihood(kp, plan; pointwise)
 end
 
 # Slice params to flat refs: vector slices ride their flat T-blocked
@@ -2187,6 +2222,7 @@ function _bernoulli_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node
     lp = _lp_name(_predictor(plan, r.predictor))
     yf = _yfloat_name(r.label)
     return Expr[
+        _bernoulli_plate_stmts(r, plan, node, _pw_name(r.label))[1:end-1]...,
         :($yf = Float64.($y)),
         :($node::Float64 = dot($yf, $lp) - sum(log1pexp, $lp)),
     ]
@@ -2199,6 +2235,7 @@ function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::
     cterm = sum(SpecialFunctions.loggamma(Float64(v) + 1.0) for v in ycol)
     yf = _yfloat_name(r.label)
     return Expr[
+        _poisson_plate_stmts(r, plan, node, _pw_name(r.label))[1:end-1]...,
         :($yf = Float64.($y)),
         :($node::Float64 = dot($yf, $lp) - sum(exp, $lp) - $cterm),
     ]
@@ -3402,9 +3439,10 @@ function _parameter_prior_input(ps, plan, layout)
     return view === nothing ? :([$(names...)]) : view
 end
 
-function _parameter_prior_statements!(stmts, terms, plan, layout; prefix = :_ppl_prior_)
+function _parameter_prior_statements!(stmts, terms, plan, layout;
+        prefix = :_ppl_prior_, group_scalars = true)
     grouped = Set{Symbol}()
-    for ps in _parameter_prior_groups(plan)
+    for ps in (group_scalars ? _parameter_prior_groups(plan) : Vector{SampledParameter}[])
         family = first(ps).family
         _, li, si, ni = _COEF_SHAPES[family]
         args = [collect(values(p.args)) for p in ps]
@@ -3646,12 +3684,12 @@ end
 # (one entry per stratum), so the constant counts S times and each `log`
 # term sums its vector.
 function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64;
-        nstack::Union{Nothing,Int} = nothing)
-    K == 1 && return :(0.0)
+        nstack::Union{Nothing,Int} = nothing, pointwise = false)
+    K == 1 && return pointwise ? :(zeros($nstack)) : :(0.0)
     c = lkj_logconst(K, eta)
-    terms = Any[nstack === nothing ? c : nstack * c]
+    terms = Any[pointwise ? :(fill($c, $nstack)) : nstack === nothing ? c : nstack * c]
     lg(i) = nstack === nothing ? :(log($(_rl_name(L, i, i)))) :
-        :(sum(log.($(_rl_name(L, i, i)))))
+        pointwise ? :(log.($(_rl_name(L, i, i)))) : :(sum(log.($(_rl_name(L, i, i)))))
     if eta == 1.0
         for i in 2:K
             push!(terms, :($(K - i) * $(lg(i))))
@@ -3663,7 +3701,7 @@ function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64;
             push!(terms, :($(K - 1 - k - 1) * $(lg(i)) + $bcoef * $(lg(i))))
         end
     end
-    return foldl((a, c) -> :($a + $c), terms)
+    return foldl((a, c) -> pointwise ? :($a .+ $c) : :($a + $c), terms)
 end
 
 # One correlated draws block's LKJ prior node (names/sizes from the draws).

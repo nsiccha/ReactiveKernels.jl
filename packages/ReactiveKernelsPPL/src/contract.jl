@@ -6233,7 +6233,7 @@ function _validate_vector_parameters(plan::StructuralPlan)
 end
 
 """Canonical in-graph node names: reserved across every plan namespace."""
-const RESERVED_NODES = (:prior, :likelihood, :log_jacobian, :posterior, :unconstrained)
+const RESERVED_NODES = (:prior, :likelihood, :log_jacobian, :posterior, :pointwise, :unconstrained)
 
 """
     topological_order(plan) -> Vector{Symbol}

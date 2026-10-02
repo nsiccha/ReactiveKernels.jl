@@ -11,13 +11,14 @@
 
 Canonical node names a generated `@kernel` program exposes, as a NamedTuple
 mapping role → node `Symbol`. Slice-1 subset of the `PPLWorkflow.PPL_NODES`
-vocabulary: every program built by [`build_kernel`](@ref) defines all four.
+vocabulary: every program built by [`build_kernel`](@ref) defines these nodes.
 """
 const PPL_NODES = (
     likelihood = :likelihood,
     prior = :prior,
     log_jacobian = :log_jacobian,
     posterior = :posterior,
+    pointwise = :pointwise,
 )
 
 """
@@ -26,12 +27,21 @@ const PPL_NODES = (
 Preset `want` selections over generated programs, as a NamedTuple mapping
 preset name → the `want` argument. Prefer [`workflow_wants`](@ref), which
 validates the preset name.
+
+`:pointwise` returns a `NamedTuple` keyed by observation name.
+Elementwise observations retain their array shape; scalar and
+joint-vector draws return scalars, and broadcast joint draws return one
+density per slice. In-cell observations use their caller's data-column
+name and flat data shape. Conditioned declarations contribute here as
+observations. Summing every field gives `:likelihood`; prior-only models
+return an empty `NamedTuple`.
 """
 const WORKFLOW_WANTS = (
     sampler = :posterior,
     likelihood = :likelihood,
     prior = :prior,
     log_jacobian = :log_jacobian,
+    pointwise = :pointwise,
 )
 
 """
