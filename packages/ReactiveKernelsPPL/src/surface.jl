@@ -6109,9 +6109,9 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
             n = Expr(:call, :length, Expr(:call, :levels, g))
             return k == 0 ? n : Expr(:call, :-, n, k)
         end
-        lo === 1 && hi isa Integer && !(hi isa Bool) && hi >= 1 || _sfail(
+        lo === 1 && hi isa Integer && !(hi isa Bool) && hi >= 0 || _sfail(
             "array $target axis $(repr(a)) must be a literal `1:K` with " *
-            "K ≥ 1, or `1:length(levels(g)) - k`")
+            "K ≥ 0, or `1:length(levels(g)) - k`")
         return Int(hi)
     end
     _is_def_levels_call(a, data, detnames) && return a

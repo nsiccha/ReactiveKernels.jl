@@ -133,10 +133,12 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
         m === nothing && throw(ContractValidationError(
             "[$label] factor term over $col has no LevelMap " *
             "(validate_levelmaps should have caught this)"))
-        isempty(m.values) && throw(ContractValidationError(
+        isempty(m.values) &&
+            !isempty(only(_eval_levelmaps(LevelMap[m], columns)).values) &&
+            throw(ContractValidationError(
             "[$label] LevelMap for $col has no evaluated values " *
             "(bind_data fills these)"))
-        labels = [Symbol(string(col) * "_" * string(level)) for level in m.values]
+        labels = Symbol[Symbol(string(col) * "_" * string(level)) for level in m.values]
         return DesignBlock(FactorTerm, col, t.addressee, length(labels), labels,
             collect(m.values))
     elseif t.kind === VaryingEffectTerm
