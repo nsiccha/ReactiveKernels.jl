@@ -645,6 +645,10 @@ function _conditioned_declarations(ast, names)
         lhs = _stmt_lhs(st)
         name = _merge_stem(lhs)
         name in names || continue
+        # Whole-data GLM `~` declares a response, not a parameter. Like a
+        # broadcast response, its observed value keeps its observation axis
+        # instead of becoming an internal conditioned-parameter input.
+        _is_glm_call(last(st.args)) && continue
         # A positional slice of an observed stream remains a response.
         # Sized level/matrix axes and matrix declarations retain array metadata.
         array = lhs isa Expr && ((lhs.head === :ref &&
@@ -1105,8 +1109,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # arguments, gathered values) is a model-level data input at bind, so
     # a parameter-dependent call may take it; each refusal that waiver
     # skips is re-checked once the plan shows no other slot reads it.
-    whole = _whole_value_data(det, data,
-        _statement_names(ast, union(data, Set{Symbol}(keys(detmap))), kstmts))
+    # An array prior consumes its arguments as whole values too. Seed that
+    # context before shaping definitions, then confirm it on the final plan.
+    prior_defs = Pair{Symbol,Any}[Symbol(:_ppl_prior_input_, s.lhs) => s.rhs
+        for s in sample if s.lhs in sized_decls]
+    whole = _whole_value_data(vcat(det, prior_defs), data,
+        _statement_names(ast, union(data, Set{Symbol}(keys(detmap))), kstmts;
+            whole_priors = sized_decls))
     waived = _check_module_calls(det, detmap, data, shape_env; whole)
     # Whole-value data compose with array parameters before canonicalization,
     # exactly like a module call's model-level result. Their concrete shape
@@ -2419,7 +2428,8 @@ end
 # kernel cells remain consumers too: a schedule-chain definition moved out
 # of `det` still reads its subject-level predictors. Otherwise those now
 # apparently unused definitions would be classified as whole values.
-function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ())
+function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ();
+        whole_priors::Set{Symbol} = Set{Symbol}())
     out = Set{Symbol}()
     whole = Set{Symbol}()
     for st in ast.args
@@ -2427,6 +2437,10 @@ function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ())
         st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
         if st isa Expr && st.head === :macrocall
             _all_symbols!(out, st)
+        elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
+                _merge_stem(_stmt_lhs(st)) in whole_priors
+            _classify_reads!(whole, out, _stmt_lhs(st), known, false)
+            _classify_reads!(whole, out, last(st.args), known, true)
         else
             _classify_reads!(whole, out, st, known, false)
         end
@@ -4448,19 +4462,13 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 push!(joints, j)
                 continue
             end
-            if !bc && st.args[3] isa Expr && st.args[3].head === :call &&
-                    !isempty(st.args[3].args) &&
-                    st.args[3].args[1] isa Symbol &&
-                    st.args[3].args[1] in _GLM_HEADS
+            if !bc && _is_glm_call(st.args[3])
                 g = _parse_glm_stmt(st, line, data)
                 _claim!(seen, seelines, g.response, line)
                 push!(glms, g)
                 continue
             end
-            if bc && st.args[3] isa Expr && st.args[3].head === :call &&
-                    !isempty(st.args[3].args) &&
-                    st.args[3].args[1] isa Symbol &&
-                    st.args[3].args[1] in _GLM_HEADS
+            if bc && _is_glm_call(st.args[3])
                 _sfail("GLM-object heads use whole-data `~`, not `.~` " *
                        "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
                        "object owns eta over the whole column)")
@@ -6302,6 +6310,9 @@ struct GLMSampleStmt
 end
 
 const _GLM_HEADS = (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
+
+_is_glm_call(rhs) = rhs isa Expr && rhs.head === :call &&
+    !isempty(rhs.args) && first(rhs.args) isa Symbol && first(rhs.args) in _GLM_HEADS
 
 function _parse_glm_stmt(st::Expr, line::Int, data::Set{Symbol})
     lhs, rhs = st.args[2], st.args[3]
