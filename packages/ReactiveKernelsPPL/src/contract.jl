@@ -17,6 +17,8 @@ offending node label for BRM-side attribution.
 """
 struct ContractValidationError <: Exception
     message::String
+    ContractValidationError(message::AbstractString) =
+        new(_author_names(message))
 end
 Base.showerror(io::IO, e::ContractValidationError) =
     print(io, "ContractValidationError: ", e.message)
@@ -26,33 +28,52 @@ const ColumnRef = Symbol
 """Reference to a sampled parameter or scalar assignment by name."""
 const ParamName = Symbol
 
-"""Bound column values: length-n vectors or n-row matrices (whole-design
-data, Stan `matrix[N,K]`). Matrices bind and validate beside vectors;
-every per-observation role (response, term, weights, trials, scales,
-bounds, grouping, axes, slices) reads vectors only — those readers fetch
-through [`_vector_column`](@ref) and fail closed on a matrix."""
-const ColumnData = Union{AbstractVector,AbstractMatrix,Number}
-# (`Number`: a model-level data value a data-only definition computes at
-# bind — functions as values. Caller-supplied columns stay vectors and
-# matrices, `_SuppliedColumn`: `_checked_columns` and `merge` fixes refuse
-# anything else.)
-const _SuppliedColumn = Union{AbstractVector,AbstractMatrix}
+"""Bound data values: numbers and arrays of any shape. A value read per
+observation is a length-n vector or an n-row matrix (whole-design data,
+Stan `matrix[N,K]`); every per-observation role (response, term, weights,
+trials, scales, bounds, grouping, axes, slices) reads vectors only — those
+readers fetch through [`_vector_column`](@ref) and fail closed on a
+matrix. Any other value — a number, or an array read only as a whole
+value — is model-level: it has no observation axis, so its shape is free."""
+const ColumnData = Union{AbstractArray,Number}
+# What a caller may pass at every entry point (the model call, `@rkppl data`,
+# `merge` pins, `bind_data`): anything `ColumnData` holds.
+const _SuppliedColumn = ColumnData
 
-# Row count of a bound column: length for vectors, row count for matrices.
+# Row count of a bound value read per observation: length for vectors, row
+# count for matrices. Numbers and higher-dimensional arrays carry no
+# observation axis.
 _column_nrows(col::AbstractVector) = length(col)
 _column_nrows(col::AbstractMatrix) = size(col, 1)
 
-"""Normalize caller-supplied columns to the plan's column table (vectors
-and matrices only — anything else fails closed here, not in a converter)."""
+"""Normalize caller-supplied data values to the plan's value table (numbers
+and arrays — anything else fails closed here, not in a converter)."""
 function _checked_columns(columns::AbstractDict{Symbol})
     out = Dict{Symbol,ColumnData}()
     for (k, v) in columns
         v isa _SuppliedColumn ||
-            _fail(:plan, "column $k must be a vector or matrix, got $(summary(v))")
+            _fail(:plan, "data value $k must be a number or an array, got " *
+                         "$(summary(v))")
         out[k] = v
     end
     return out
 end
+
+# ── Scalar data values ─────────────────────────────────────────────────
+# A data name whose value is a number has no observation axis: it lowers
+# as the model-level definition `s = _bound_value(_rkppl_value_s)` (see
+# `lower_rkppl`), a data-only call that `bind_data` evaluates once, so the
+# kernel takes the number as a typed scalar argument — exactly as a
+# definition `s = 2.0` would read, except the value binds at the call.
+_bound_value(x) = x
+_bound_value_input(name::Symbol) = Symbol("_rkppl_value_", name)
+# Messages name a data value as its author wrote it, never its internal
+# input (`ReactiveKernelsPPL._bound_value(_rkppl_value_s)` reads `s`).
+_author_names(msg::AbstractString) = replace(String(msg),
+    r"(?:ReactiveKernelsPPL\.)?_bound_value\(_rkppl_value_([\p{L}\p{N}_!]+)\)" => s"\1",
+    r"_rkppl_value_([\p{L}\p{N}_!]+)" => s"\1")
+_is_bound_value_call(ex) = ex isa Expr && ex.head === :call &&
+    length(ex.args) == 2 && ex.args[1] == GlobalRef(@__MODULE__, :_bound_value)
 
 """Fetch a bound column that must be a VECTOR (every per-observation role —
 response, term, weights, trials, scales, bounds, grouping, axes, slices —
@@ -3198,6 +3219,15 @@ function _validate_columns(plan::StructuralPlan)
         intersect(computed, wholedefs), inputs)
     for (name, col) in plan.columns
         name in modelvals && continue
+        col isa Number && _fail(name, "data value $name is a number, but " *
+            "the model reads it per observation — lower with the values " *
+            "(`lower_rkppl(ast, data)`, which every `@rkppl` entry point " *
+            "does) so a number lowers as a model-level value")
+        col isa AbstractArray && ndims(col) > 2 && _fail(name, "data value " *
+            "$name is a $(ndims(col))-dimensional array read per " *
+            "observation; per-observation data are vectors (one entry per " *
+            "observation) or matrices (one row per observation), and other " *
+            "arrays read as whole values (module-call arguments, gathers)")
         # Kernel-managed columns (slices + scalar expansions) carry two
         # lengths by design — they validate under kernel rules, not here.
         if col isa AbstractMatrix
@@ -9855,6 +9885,8 @@ and never sets `n_obs` (see `_model_level_inputs`).
 function _bind_nrows(columns::AbstractDict{Symbol}, managed::Set{Symbol})
     for (k, v) in columns
         k in managed && continue
+        # A number or a higher-dimensional array has no observation axis.
+        (v isa Number || ndims(v) > 2) && continue
         return _column_nrows(v)
     end
     throw(ContractValidationError(
@@ -10084,6 +10116,78 @@ function _drop_held_names!(out::Set{Symbol}, x::T) where {T}
     return nothing
 end
 
+# The `_bound_value` inputs a plan reads, wherever lowering moved their
+# definitions (a definition used only in a predictor is inlined there).
+function _bound_value_inputs(plan::StructuralPlan)
+    found = Set{Symbol}()
+    seen = Base.IdSet{Any}()
+    for f in fieldnames(StructuralPlan)
+        f === :columns && continue
+        _collect_bound_value_inputs!(found, getfield(plan, f), seen)
+    end
+    return found
+end
+function _collect_bound_value_inputs!(found, x::Expr, seen)
+    if _is_bound_value_call(x) && x.args[2] isa Symbol
+        push!(found, x.args[2])
+    end
+    for a in x.args
+        _collect_bound_value_inputs!(found, a, seen)
+    end
+    return nothing
+end
+function _collect_bound_value_inputs!(found,
+        x::Union{AbstractArray,Tuple,NamedTuple,AbstractSet,AbstractDict},
+        seen)
+    eltype(x) <: Union{Number,Symbol,AbstractString} && return nothing
+    x in seen && return nothing
+    push!(seen, x)
+    for v in (x isa AbstractDict ? values(x) : x)
+        _collect_bound_value_inputs!(found, v, seen)
+    end
+    return nothing
+end
+# Plan records (specs, terms, priors): walk their fields.
+const _PLAN_RECORD_MODULE = @__MODULE__
+function _collect_bound_value_inputs!(found, x::T, seen) where {T}
+    (isstructtype(T) && parentmodule(T) === _PLAN_RECORD_MODULE) ||
+        return nothing
+    x in seen && return nothing
+    push!(seen, x)
+    for f in fieldnames(T)
+        isdefined(x, f) &&
+            _collect_bound_value_inputs!(found, getfield(x, f), seen)
+    end
+    return nothing
+end
+
+# Route each caller value lowered as a scalar definition to its input name
+# (the caller passes `s`; the plan reads `_rkppl_value_s`).
+function _route_bound_values!(plan::StructuralPlan,
+        columns::Dict{Symbol,ColumnData})
+    for input in _bound_value_inputs(plan)
+        haskey(columns, input) && continue
+        name = Symbol(chopprefix(String(input), "_rkppl_value_"))
+        haskey(columns, name) || throw(ContractValidationError(
+            "[bind] data value $name is missing (the model reads it as a " *
+            "model-level value)"))
+        columns[input] = pop!(columns, name)
+    end
+    return columns
+end
+
+# A response bound to a number is one observation (`y .~ Normal.(mu, s)`
+# with a scalar `y`, as in Julia): it binds as a one-entry vector.
+function _scalar_responses_as_observations!(plan::StructuralPlan,
+        columns::Dict{Symbol,ColumnData})
+    for r in plan.responses, nm in (r.response, r.count_columns...,
+            r.extra_responses...)
+        v = get(columns, nm, nothing)
+        v isa Number && (columns[nm] = [v])
+    end
+    return columns
+end
+
 function _materialize_module_data!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData})
     names = _module_data_names(plan, Set{Symbol}(keys(columns)))
@@ -10127,7 +10231,7 @@ function _materialize_module_data!(plan::StructuralPlan,
         end
         # Dense storage: the kernel's data arguments are `Vector`/`Matrix`.
         columns[nm] = v isa AbstractVector ? collect(v) :
-            v isa AbstractMatrix ? Matrix(v) : v
+            v isa AbstractArray ? Array(v) : v
     end
     return names
 end
@@ -10324,6 +10428,8 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     isempty(columns) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
     columns = _checked_columns(columns)
+    _route_bound_values!(plan, columns)
+    _scalar_responses_as_observations!(plan, columns)
     raw = Set{Symbol}(keys(columns))
     computed = _materialize_module_data!(plan, columns)
     # Raw inputs read only as whole values (module-call arguments,
