@@ -252,7 +252,7 @@ end
     return f
 end
 
-_ls_canon(ast, names) = sprint(_canon, lower_rkppl(ast, names; mod = _LS))
+_ls_canon(ast, names) = sprint(_canon, _test_scope_math(lower_rkppl(ast, names; mod = _LS)))
 
 @testset "library smooths: S5 shape and nesting are transparent" begin
     names = (:y, :x)
@@ -344,36 +344,36 @@ function _ls_pairs()
     afl = hsgp_rho_floors(last(hsgp_basis(x, z; k = (4, 3), c = (1.5, 2.0))))
     return [
         ("24_spline_s_library", "24_spline_s",
-            nt -> (a = nt.a, sigma = nt.sigma, b_s_x_fixed = nt.f_b,
-                b_s_x_raw = nt.f_z, sd_s_x = [nt.f_sd]),
+            nt -> (a = nt.a, sigma = nt.sigma, b_s_x_fixed = nt.f.b,
+                b_s_x_raw = nt.f.z, sd_s_x = [nt.f.sd]),
             _ -> log(2)),
         ("25_spline_t2_library", "25_spline_t2",
-            nt -> (a = nt.a, sigma = nt.sigma, b_t2_xz_fixed = nt.f_b,
-                b_t2_xz_rr_raw = nt.f_z_rr, b_t2_xz_rn_raw = nt.f_z_rn,
-                b_t2_xz_nr_raw = nt.f_z_nr, sd_t2_xz = nt.f_sd),
+            nt -> (a = nt.a, sigma = nt.sigma, b_t2_xz_fixed = nt.f.b,
+                b_t2_xz_rr_raw = nt.f.z_rr, b_t2_xz_rn_raw = nt.f.z_rn,
+                b_t2_xz_nr_raw = nt.f.z_nr, sd_t2_xz = nt.f.sd),
             _ -> 3 * log(2)),
         ("30_hsgp_1d_library", "30_hsgp_1d",
-            nt -> (a = nt.a, rho_h_x = nt.f_rho, sigma_h_x = nt.f_sigma,
-                beta_raw_h_x = nt.f_z),
+            nt -> (a = nt.a, rho_h_x = nt.f.rho, sigma_h_x = nt.f.sigma,
+                beta_raw_h_x = nt.f.z),
             _ -> -_ls_lncc(fl(x; k = 4))),
         ("30_hsgp_domain_library", "30_hsgp_domain_library",
-            nt -> (a = nt.a, rho_h_x = nt.f_rho, sigma_h_x = nt.f_sigma,
-                beta_raw_h_x = nt.f_z),
+            nt -> (a = nt.a, rho_h_x = nt.f.rho, sigma_h_x = nt.f.sigma,
+                beta_raw_h_x = nt.f.z),
             _ -> -_ls_lncc(fl(x; k = 6, domain = (-5.0, 5.0)))),
         ("30_hsgp_by_library", "30_hsgp_by_library",
-            nt -> (a = nt.a, beta0_rho_h_x = nt.f_rho_mu,
-                sd_rho_h_x = nt.f_rho_sd, z_rho_h_x = nt.f_rho_z,
-                beta0_sigma_h_x = nt.f_sigma_mu,
-                sd_sigma_h_x = nt.f_sigma_sd, z_sigma_h_x = nt.f_sigma_z,
-                beta_raw_h_x = nt.f_z),
+            nt -> (a = nt.a, beta0_rho_h_x = nt.f.rho_mu,
+                sd_rho_h_x = nt.f.rho_sd, z_rho_h_x = nt.f.rho_z,
+                beta0_sigma_h_x = nt.f.sigma_mu,
+                sd_sigma_h_x = nt.f.sigma_sd, z_sigma_h_x = nt.f.sigma_z,
+                beta_raw_h_x = nt.f.z),
             _ -> 2 * log(2)),
         ("31_hsgp_aniso_library", "31_hsgp_aniso",
             nt -> (a = nt.a, rho_h_xz_1 = nt.rho_1, rho_h_xz_2 = nt.rho_2,
                 sigma_h_xz = nt.sigma_f, beta_raw_h_xz = nt.z_f),
             _ -> -_ls_lncc(afl[1]) - _ls_lncc(afl[2])),
         ("68_hsgp_periodic_library", "68_hsgp_periodic",
-            nt -> (a = nt.a, rho_h_p = nt.f_rho, sigma_h_p = nt.f_sigma,
-                beta_raw_h_p = nt.f_z),
+            nt -> (a = nt.a, rho_h_p = nt.f.rho, sigma_h_p = nt.f.sigma,
+                beta_raw_h_p = nt.f.z),
             _ -> -_ls_lncc(pf)),
         ("89_hsgp_hyper_priors_library", "89_hsgp_hyper_priors",
             nt -> (b0 = nt.b0, s0 = nt.s0, rho_h_x = nt.h_rho,
@@ -440,13 +440,13 @@ _ls_spd_eq(lam, sigma, rho) = sigma * sqrt(sqrt(2pi) * rho) * exp(-rho^2 * lam /
     nt = constrain(built.layout, u)
     PHI, lambda = hsgp_basis(x; k = 4)
     floor = maximum(hsgp_rho_floors(lambda))
-    w = [_ls_spd_eq(lambda[m, 1], nt.f_sigma, nt.f_rho) for m in 1:4] .* nt.f_z
+    w = [_ls_spd_eq(lambda[m, 1], nt.f.sigma, nt.f.rho) for m in 1:4] .* nt.f.z
     a = nt.a
     @test _ls_node(built, bound, :likelihood, u) ≈
         sum(logpdf.(Normal.(a .+ PHI * w, 1.5), y))
     @test _ls_node(built, bound, :prior, u) ≈ logpdf(Normal(0, 1), a) +
-        logpdf(truncated(LogNormal(0, 1), floor, Inf), nt.f_rho) +
-        logpdf(LogNormal(0, 1), nt.f_sigma) + sum(logpdf.(Normal(), nt.f_z))
+        logpdf(truncated(LogNormal(0, 1), floor, Inf), nt.f.rho) +
+        logpdf(LogNormal(0, 1), nt.f.sigma) + sum(logpdf.(Normal(), nt.f.z))
     # Periodic.
     bound = _ls_bind(first(_load_corpus_case(joinpath(_CORPUS_DIR,
         "68_hsgp_periodic_library.jl"))), (:y, :x))
@@ -454,10 +454,10 @@ _ls_spd_eq(lam, sigma, rho) = sigma * sqrt(sqrt(2pi) * rho) * exp(-rho^2 * lam /
     u = _ls_pt(built.layout.total)
     nt = constrain(built.layout, u)
     PHI, h = hsgp_periodic_basis(x; k = 4, period = 2.0)
-    q = [nt.f_sigma * sqrt(2 * exp(-1 / nt.f_rho^2) * besseli(j, 1 / nt.f_rho^2))
+    q = [nt.f.sigma * sqrt(2 * exp(-1 / nt.f.rho^2) * besseli(j, 1 / nt.f.rho^2))
         for j in h]
     @test _ls_node(built, bound, :likelihood, u) ≈
-        sum(logpdf.(Normal.(nt.a .+ PHI * (q .* nt.f_z), 1.5), y))
+        sum(logpdf.(Normal.(nt.a .+ PHI * (q .* nt.f.z), 1.5), y))
     # Grouped: one curve per level, per-group hypers.
     bound = _ls_bind(first(_load_corpus_case(joinpath(_CORPUS_DIR,
         "30_hsgp_by_library.jl"))), (:y, :x, :g))
@@ -467,18 +467,18 @@ _ls_spd_eq(lam, sigma, rho) = sigma * sqrt(sqrt(2pi) * rho) * exp(-rho^2 * lam /
     P1, lambda = hsgp_basis(x; k = 5)
     floor = maximum(hsgp_rho_floors(lambda))
     lv = sort(unique(g))
-    rho = max.(exp.(nt.f_rho_mu .+ nt.f_rho_sd .* nt.f_rho_z), floor)
-    sig = exp.(nt.f_sigma_mu .+ nt.f_sigma_sd .* nt.f_sigma_z)
-    Z = reshape(nt.f_z, 3, 5)
+    rho = max.(exp.(nt.f.rho_mu .+ nt.f.rho_sd .* nt.f.rho_z), floor)
+    sig = exp.(nt.f.sigma_mu .+ nt.f.sigma_sd .* nt.f.sigma_z)
+    Z = reshape(nt.f.z, 3, 5)
     f = [sum(P1[i, m] * _ls_spd_eq(lambda[m, 1], sig[gi], rho[gi]) * Z[gi, m]
         for m in 1:5) for (i, gi) in enumerate(indexin(g, lv))]
     @test _ls_node(built, bound, :likelihood, u) ≈
         sum(logpdf.(Normal.(nt.a .+ f, 1.5), y))
     @test _ls_node(built, bound, :prior, u) ≈ logpdf(Normal(0, 1),
-        nt.a) + logpdf(Normal(0, 1), nt.f_rho_mu) +
-        logpdf(truncated(Normal(0, 1), 0, Inf), nt.f_rho_sd) +
-        logpdf(Normal(0, 1), nt.f_sigma_mu) +
-        logpdf(truncated(Normal(0, 1), 0, Inf), nt.f_sigma_sd) +
-        sum(logpdf.(Normal(), nt.f_rho_z)) +
-        sum(logpdf.(Normal(), nt.f_sigma_z)) + sum(logpdf.(Normal(), nt.f_z))
+        nt.a) + logpdf(Normal(0, 1), nt.f.rho_mu) +
+        logpdf(truncated(Normal(0, 1), 0, Inf), nt.f.rho_sd) +
+        logpdf(Normal(0, 1), nt.f.sigma_mu) +
+        logpdf(truncated(Normal(0, 1), 0, Inf), nt.f.sigma_sd) +
+        sum(logpdf.(Normal(), nt.f.rho_z)) +
+        sum(logpdf.(Normal(), nt.f.sigma_z)) + sum(logpdf.(Normal(), nt.f.z))
 end

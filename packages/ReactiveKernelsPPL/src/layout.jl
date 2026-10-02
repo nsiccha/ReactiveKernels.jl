@@ -138,7 +138,10 @@ LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
 struct LayoutTable
     entries::Vector{LayoutEntry}
     total::Int
+    name_paths::Dict{Symbol,Tuple{Vararg{Symbol}}}
 end
+LayoutTable(entries::Vector{LayoutEntry}, total::Int) =
+    LayoutTable(entries, total, Dict{Symbol,Tuple{Vararg{Symbol}}}())
 
 """
     _coefficient_runs(plan, pred, shape) -> Vector{NamedTuple}
@@ -188,6 +191,66 @@ function _coef_position_key(rows::Dict{Symbol,PopulationPrior}, addr::Symbol)
     pr.family === :uniform &&
         return (:interval, Float64(pr.location), Float64(pr.scale))
     return (:identity, NaN, NaN)
+end
+
+# Legacy constructs own generated parameter blocks. Derive their displayed
+# names from the same naming helpers, using the authored local id, so private
+# identifiers cannot escape through spline/GP blocks or scan innovations.
+function _scope_layout_paths(plan::StructuralPlan)
+    paths = _scope_name_paths(plan.submodel_scopes)
+    isempty(paths) && return paths
+    occupied = Set(values(paths))
+    union!(occupied, (scope.path for scope in plan.submodel_scopes))
+    function generated!(owner, internal, authored)
+        path = get(paths, owner, nothing)
+        path === nothing && return nothing
+        for (name, shown) in zip(internal, authored)
+            candidate = (Base.front(path)..., shown)
+            get(paths, name, nothing) == candidate && continue
+            suffix = 0
+            while candidate in occupied
+                suffix += 1
+                candidate = (Base.front(path)..., Symbol(shown, :_, suffix))
+            end
+            paths[name] = candidate
+            push!(occupied, candidate)
+        end
+        return nothing
+    end
+    for basis in plan.spline_bases
+        path = get(paths, basis.id, nothing)
+        path === nothing && continue
+        generated!(basis.id,
+            first.(_spline_vector_specs(basis.id, basis.kind, basis.k)),
+            first.(_spline_vector_specs(last(path), basis.kind, basis.k)))
+    end
+    for basis in plan.hsgp_bases
+        path = get(paths, basis.id, nothing)
+        path === nothing && continue
+        generated!(basis.id, _hsgp_all_names(basis),
+            _hsgp_all_names(_with(basis; id = last(path))))
+    end
+    for scan in plan.scans
+        _is_noncentered_scan(scan) || continue
+        state = first(scan.states)
+        path = get(paths, state, nothing)
+        path === nothing && continue
+        generated!(state, [_scan_innovation_name(scan)],
+            [Symbol(:_ppl_scan_z_, last(path))])
+    end
+    for dar in plan.dar_paths
+        path = get(paths, dar.state, nothing)
+        path === nothing && continue
+        generated!(dar.state, [_dar_innovation_name(dar)],
+            [Symbol(:_ppl_dar_z_, last(path))])
+    end
+    for provider in plan.event_lps
+        path = get(paths, provider.name, nothing)
+        path === nothing && continue
+        generated!(provider.name, _event_lp_all_names(provider),
+            _event_lp_all_names(_with(provider; name = last(path))))
+    end
+    return paths
 end
 
 """
@@ -538,7 +601,8 @@ function assign_layout(plan::StructuralPlan)
     # simplexes reuse the `:cholesky_corr` / `:vector` edges, elementwise
     # arrays pack one `:array` block each.
     offset = _array_layout_entries!(entries, plan, offset)
-    return LayoutTable(entries, offset - 1)
+    return LayoutTable(entries, offset - 1,
+        _scope_layout_paths(plan))
 end
 
 """Constrained length of a `:vector` entry: simplex packs K−1 logits
@@ -904,50 +968,60 @@ function lkj_corr_cholesky_logpdf(L::AbstractMatrix{<:Real}, eta::Real)
     return lp
 end
 
+_scope_segment(name::Symbol) = Base.isidentifier(string(name)) ?
+    string(name) : "var" * repr(string(name))
+_scope_path_string(path::Tuple) = join(_scope_segment.(path), ".")
+
+function _draw_name(layout::LayoutTable, name::Symbol)
+    path = get(layout.name_paths, name, (name,))
+    return _scope_path_string(path)
+end
+
+function _authored_coordinate(layout::LayoutTable, name::Symbol, label::Symbol)
+    raw = string(name)
+    shown = _draw_name(layout, name)
+    string(label) == raw && return Symbol(shown)
+    prefix = raw * "."
+    startswith(string(label), prefix) || return label
+    return Symbol(shown, ".", string(label)[(lastindex(prefix) + 1):end])
+end
+
 """
     coordinate_names(layout) -> Vector{Symbol}
 
-Flat per-coordinate names (R10 read API): coefficients qualified
-`Symbol("predictor.coef")`, sampled parameters bare. Length == total.
+Flat per-coordinate author paths, such as `b`, `z.b`, and `z.w.1`.
+Scoped locals use dotted paths; literal identifier segments that contain
+punctuation use Julia's `var"..."` spelling. Length equals `layout.total`.
 """
 function coordinate_names(layout::LayoutTable)
     names = Symbol[]
     for e in layout.entries
         if e.kind === :coefficient
             for label in e.labels
-                push!(names, Symbol(string(e.predictor) * "." * string(label)))
+                push!(names, Symbol(_draw_name(layout, e.predictor) * "." * string(label)))
             end
         elseif e.kind === :plate || e.kind === :spline ||
                e.kind === :varying || e.kind === :hsgp || e.kind === :glm
             for i in 1:e.size
-                push!(names, Symbol(string(e.name) * "." * string(i)))
+                push!(names, Symbol(_draw_name(layout, e.name) * "." * string(i)))
             end
         elseif e.kind === :vector || e.kind === :array
-            append!(names, e.labels)
+            append!(names, [_authored_coordinate(layout, e.name, label)
+                for label in e.labels])
         elseif e.kind === :varying_corr || e.kind === :cholesky_corr
-            append!(names, e.labels)
+            append!(names, [_authored_coordinate(layout, e.name, label)
+                for label in e.labels])
         elseif e.kind === :scan
             for label in e.labels
-                push!(names, Symbol(string(e.name) * "." * string(label)))
+                push!(names, Symbol(_draw_name(layout, e.name) * "." * string(label)))
             end
         else
-            push!(names, e.name)
+            push!(names, Symbol(_draw_name(layout, e.name)))
         end
     end
     return names
 end
 
-"""
-    constrain(layout, unconstrained) -> NamedTuple
-
-Host-side constrain: packed vector → `(predictor => Vector, param => scalar,
-…)`. A correlated varying draw contributes its Cholesky factor `L` (K×K),
-its scale vector `tau`, its standardized draws `z_flat`, plus the DERIVED
-correlated draws `b_<suffix>` (G×K, SB `(diag_pre_multiply(tau,L)*z)'`
-— output mapping, ignored by [`unconstrain`](@ref)). For testing,
-output mapping, and future prediction; the generator emits the
-in-graph equivalent.
-"""
 # Coefficient entries grouped by predictor in offset order (split
 # blocks reassemble to one predictor vector in design order).
 function _coefficient_groups(layout::LayoutTable)
@@ -982,6 +1056,75 @@ function _constrain_coefficient(entries::Vector{LayoutEntry}, u)
     return out
 end
 
+# Preserve layout encounter order while forming nested author namespaces.
+function _scope_namedtuple(items)
+    names = Symbol[]
+    groups = Dict{Symbol,Vector{Any}}()
+    for (path, value) in items
+        name = first(path)
+        if !haskey(groups, name)
+            push!(names, name)
+            groups[name] = Any[]
+        end
+        push!(groups[name], (Base.tail(path), value))
+    end
+    values = map(names) do name
+        group = groups[name]
+        leaves = filter(item -> isempty(first(item)), group)
+        if !isempty(leaves)
+            length(group) == 1 || throw(ContractValidationError(
+                "[layout] author name $name is both a value and a namespace"))
+            return last(only(leaves))
+        end
+        return _scope_namedtuple(group)
+    end
+    return NamedTuple{Tuple(names)}(Tuple(values))
+end
+
+function _scoped_draw_values(layout::LayoutTable, pairs)
+    isempty(layout.name_paths) &&
+        return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
+    return _scope_namedtuple(Any[(get(layout.name_paths, name, (name,)), value)
+        for (name, value) in pairs])
+end
+
+struct _MissingScopedValue end
+const _MISSING_SCOPED_VALUE = _MissingScopedValue()
+function _scope_lookup(nt::NamedTuple, path::Tuple)
+    value = nt
+    for name in path
+        value isa NamedTuple && haskey(value, name) ||
+            return _MISSING_SCOPED_VALUE
+        value = value[name]
+    end
+    return value
+end
+
+function _flat_draw_values(layout::LayoutTable, nt::NamedTuple)
+    isempty(layout.name_paths) && return nt
+    pairs = Pair{Symbol,Any}[]
+    seen = Set{Symbol}()
+    for entry in layout.entries
+        name = entry.kind === :coefficient ? entry.predictor::Symbol : entry.name
+        name in seen && continue
+        push!(seen, name)
+        value = _scope_lookup(nt, get(layout.name_paths, name, (name,)))
+        value === _MISSING_SCOPED_VALUE || push!(pairs, name => value)
+    end
+    return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
+end
+
+"""
+    constrain(layout, unconstrained) -> NamedTuple
+
+Host-side constrain of the packed vector. Parameters keep their author
+names; submodel locals are nested (`nt.z.b`, `nt.z.w.b`). Scalar, vector,
+and array leaves retain their constrained shapes. Legacy correlated varying
+entries also contribute derived `b_<suffix>` matrices, ignored by
+[`unconstrain`](@ref). Deterministic submodel locals and return values are
+read in the model rather than included in this draw container. The generator
+emits the equivalent transforms inside the mathematical graph.
+"""
 function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     length(u) == layout.total ||
         throw(ContractValidationError("[layout] unconstrained length $(length(u)) ≠ $(layout.total)"))
@@ -1025,7 +1168,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     for (bname, b) in _varying_corr_draws(layout, u)
         push!(pairs, bname => b)
     end
-    return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
+    return _scoped_draw_values(layout, pairs)
 end
 
 # Derived correlated draws per `:varying_corr` entry: `b_<suffix>`
@@ -1092,6 +1235,7 @@ end
 Inverse of [`constrain`](@ref): named values → packed unconstrained vector.
 """
 function unconstrain(layout::LayoutTable, nt::NamedTuple)
+    nt = _flat_draw_values(layout, nt)
     u = Vector{Float64}(undef, layout.total)
     coef_groups = _coefficient_groups(layout)
     seen_coef = Set{Symbol}()
