@@ -5462,7 +5462,8 @@ end
 #   • Every name the body BINDS is renamed `<lhs>_<name>` everywhere in the
 #     body: the LHS of a `~` / `.~` / `=` statement (the base name of an
 #     indexed LHS — `c[levels(g)] .~ …` binds `c`, `b[axes(X, 2)] .~ …` binds
-#     `b`), a `@plate` result, cell or loop variable, a `@scan` carried state,
+#     `b`, a slice declaration `eachrow(B[levels(g), 1:K]) .~ …` binds `B`),
+#     a `@plate` result, cell or loop variable, a `@scan` carried state,
 #     step local or loop variable, and a `do`-block argument
 #     (`_collect_binders!`). Index expressions keep their shape; names inside
 #     them follow the same rule (`c[levels(gg)]` → `z_c[levels(group)]`).
@@ -5664,6 +5665,10 @@ _collect_lhs_binders!(out::Set{Symbol}, lhs::Symbol) = push!(out, lhs)
 function _collect_lhs_binders!(out::Set{Symbol}, lhs::Expr)
     if lhs.head === :ref && !isempty(lhs.args)
         _collect_lhs_binders!(out, lhs.args[1])
+    elseif lhs.head === :call && length(lhs.args) == 2 &&
+            lhs.args[1] in (:eachrow, :eachcol)
+        # A slice declaration (`eachrow(B[levels(g), 1:K]) .~ D`) binds `B`.
+        _collect_lhs_binders!(out, lhs.args[2])
     elseif lhs.head in (:vect, :tuple)
         for a in lhs.args
             _collect_lhs_binders!(out, a)
