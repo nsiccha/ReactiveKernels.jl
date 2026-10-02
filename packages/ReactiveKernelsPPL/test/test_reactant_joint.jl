@@ -29,6 +29,56 @@ function _rj_findiff(f, u::Vector{Float64}; h = 1e-6)
     end
 end
 
+function _rj_scalar_offset_measure(built, bound, u)
+    post = prepare_query(built, bound, :sampler)
+    ru = Reactant.to_rarray(u)
+    hlo = repr(Reactant.@code_hlo optimize = false post(ru))
+    operations = Dict{String,Int}()
+    for m in eachmatch(r"\b(?:stablehlo|chlo|func|arith)\.\w+", hlo)
+        operations[m.match] = get(operations, m.match, 0) + 1
+    end
+    @test !isempty(operations)
+    native = post(u)
+    compiled = Reactant.@compile post(ru)
+    @test Float64(compiled(ru)) ≈ native rtol = 1e-9
+    q = prepare_sampler(built, bound, u; backend = _RJ_BACKEND)
+    g = similar(u)
+    val, _ = sampler_value_and_gradient!(q, g, u)
+    @test val ≈ native rtol = 1e-12
+    @test g ≈ _rj_findiff(post, u) rtol = 1e-5 atol = 1e-7
+    cad = compile_ad_value_and_gradient(q.ad, ru)
+    rval, rgrad = cad(ru)
+    @test Float64(rval) ≈ native rtol = 1e-9
+    @test Array(rgrad) ≈ g rtol = 1e-8 atol = 1e-9
+    return operations
+end
+
+@testset "Reactant: positional scalar offsets retain broadcast structure" begin
+    for kind in (:vector, :matrix)
+        declaration, read = kind === :vector ?
+            (:(z[1:3] .~ Normal.(0, 1)), :(z[2])) :
+            (:(L ~ LKJCholesky(2, 1.0)), :(L[2, 1]))
+        # Fixed scale isolates the offset from the known scale-gradient
+        # compiler defect pinned by the tiny-model test below (§7n).
+        plan = lower_rkppl(quote
+            a ~ Normal(0, 5)
+            $declaration
+            mu = a .- $read .+ x
+            y .~ Normal.(mu, 0.7)
+        end, (:y, :x))
+        counts = Dict{String,Int}[]
+        for n in (3, 8)
+            x = collect(range(-0.8, 0.9; length = n))
+            y = sin.(x)
+            bound = bind_data(plan, Dict(:y => y, :x => x))
+            built = build_kernel(bound)
+            u = [0.37 * sin(1.3 * i) - 0.2 for i in 1:built.layout.total]
+            push!(counts, Base.invokelatest(_rj_scalar_offset_measure, built, bound, u))
+        end
+        @test counts[1] == counts[2]
+    end
+end
+
 function _rj_tiny_bound()
     plan = lower_rkppl(quote
             a ~ Normal(0, 5)

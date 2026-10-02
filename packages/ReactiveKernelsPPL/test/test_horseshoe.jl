@@ -7,6 +7,7 @@ using Test
 
 function _horseshoe_demo()
     return quote
+        a ~ Normal(0, 1)
         b1 ~ Horseshoe()
         b2 ~ Horseshoe(local_scale = 0.5, global_scale = 0.25)
         mu = a .+ b1 .* x1 .+ b2 .* x2
@@ -64,6 +65,7 @@ end
     # Both keyword spellings land on the entry (bare `:kw` and
     # `:parameters`-wrapped — neither may silently default).
     wrapped = lower_rkppl(quote
+            a ~ Normal(0, 1)
             b1 ~ Horseshoe(; global_scale = 0.25)
             mu = a .+ b1 .* x1
             sigma ~ Exponential(1.0)
@@ -116,6 +118,7 @@ end
 
 @testset "horseshoe negative use carries the sign" begin
     bound = bind_data(lower_rkppl(quote
+                a ~ Normal(0, 1)
                 b1 ~ Horseshoe()
                 mu = a .- b1 .* x1
                 sigma ~ Exponential(1.0)
@@ -178,6 +181,7 @@ end
             :(Horseshoe(local_scale = Inf)), :(Horseshoe(local_scale = true)),
             :(Horseshoe(local_scale = s)))
         bad = quote
+            a ~ Normal(0, 1)
             b1 ~ $rhs
             mu = a .+ b1 .* x1
             sigma ~ Exponential(1.0)
@@ -188,6 +192,7 @@ end
     # A horseshoe coefficient aliased as a scale stays loud (the
     # single-assignment gate, ahead of scale admission).
     aliased = quote
+        a ~ Normal(0, 1)
         b1 ~ Horseshoe()
         s = b1
         mu = a .+ b1 .* x1

@@ -38,14 +38,18 @@ function _kinv_plans(K::Int)
     data(pairs...) = Dict{Symbol,AbstractVector}(pairs...)
     return [
         "ordered_logistic" => bind_data(lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ OrderedLogistic.(eta)
             end, (:y, :x)), data(:y => y, :x => x)),
         "ordinal_cumulative_probit" => bind_data(lower_rkppl(quote
+                b ~ Normal(0, 1)
                 eta = b .* x
                 y .~ Ordinal.(Cumulative(), ProbitLink(), eta)
             end, (:y, :x)), data(:y => y, :x => x)),
         "ordinal_stopping_logit" => bind_data(lower_rkppl(quote
+                b ~ Normal(0, 1)
                 eta = b .* x
                 y .~ Ordinal.(StoppingRatio(), LogitLink(), eta)
             end, (:y, :x)), data(:y => y, :x => x)),
@@ -54,6 +58,8 @@ function _kinv_plans(K::Int)
                 y .~ Categorical.(s)
             end, (:y,)), data(:y => y)),
         "monotonic" => bind_data(lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 s ~ Dirichlet($alpha)
                 mu = a .+ b .* mo(c, s)
                 sigma ~ Exponential(1.0)

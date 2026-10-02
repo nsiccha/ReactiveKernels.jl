@@ -37,6 +37,7 @@ const _RENDERED_DOCS_PAGE_OWNERS = Dict(
     "distributions.md" => "ReactiveKernels:distributions",
     "nuts.md" => "ReactiveKernels:hmc",
     "walnuts.md" => "ReactiveKernels:hmc",
+    "rkppl.md" => "ReactiveKernels:rkppl",
 )
 
 _page_owner(page) = get(_RENDERED_DOCS_PAGE_OWNERS, page, "ReactiveKernels:docs")
@@ -320,6 +321,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "reactivehmc-corpus.md" => 6,
         "nuts.md" => 0,
         "nutpie-diagonal.md" => 2,
+        "rkppl.md" => 6,
         "eight-schools.md" => 1,
         "sum-to-zero.md" => 1,
         "linear-regression.md" => 1,

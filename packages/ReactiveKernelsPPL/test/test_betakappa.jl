@@ -44,6 +44,10 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
 @testset "bk surface admission" begin
     @testset "log-link predictor kappa admitted" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 mu = a .+ b .* x
                 lk = c .+ d .* z
                 prop .~ Beta.(logistic.(mu) .* exp.(lk),
@@ -61,6 +65,10 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
     end
     @testset "fused BetaLogit head admits log-link kappa" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 mu = a .+ b .* x
                 lk = c .+ d .* z
                 prop .~ BetaLogit.(mu, exp.(lk))
@@ -71,6 +79,10 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
     end
     @testset "bare predictor kappa fails closed" begin
         @test_throws ContractValidationError lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 mu = a .+ b .* x
                 k = c .+ d .* z
                 prop .~ Beta.(logistic.(mu) .* k, (1 .- logistic.(mu)) .* k)
@@ -78,6 +90,10 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
     end
     @testset "logit-wrapped predictor kappa fails closed" begin
         @test_throws ContractValidationError lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 mu = a .+ b .* x
                 lk = c .+ d .* z
                 prop .~ Beta.(logistic.(mu) .* logistic.(lk),
@@ -86,6 +102,8 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
     end
     @testset "scalar kappa spellings unchanged" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 kappa ~ Exponential(1.0)
                 mu = a .+ b .* x
                 prop .~ Beta.(logistic.(mu) .* kappa,
@@ -93,12 +111,16 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
             end, (:prop, :x))
         @test only(plan.responses).scale === :kappa
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 prop .~ Beta.(logistic.(mu) .* 4.0,
                     (1 .- logistic.(mu)) .* 4.0)
             end, (:prop, :x))
         @test only(plan.responses).scale === 4.0
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 prop .~ Beta.(logistic.(mu) .* kc, (1 .- logistic.(mu)) .* kc)
             end, (:prop, :x, :kc))
@@ -106,6 +128,10 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
     end
     @testset "shared mixture-component kappa predictor admitted" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 lk = c .+ d .* z
                 prop .~ MixtureModel.([Beta.(logistic.(eta) .* exp.(lk),
@@ -123,6 +149,10 @@ end
 @testset "bk value parity" begin
     @testset "log-kappa submodel" begin
         _, _, kern, lay = _bk_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 mu = a .+ b .* x
                 lk = c .+ d .* z
                 prop .~ Beta.(logistic.(mu) .* exp.(lk),
@@ -140,6 +170,9 @@ end
     end
     @testset "intercept-only log-kappa submodel" begin
         _, _, kern, lay = _bk_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
                 mu = a .+ b .* x
                 lk = c
                 prop .~ Beta.(logistic.(mu) .* exp.(lk),
@@ -156,6 +189,8 @@ end
     end
     @testset "literal kappa unchanged" begin
         _, _, kern, lay = _bk_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 prop .~ Beta.(logistic.(mu) .* 4.0,
                     (1 .- logistic.(mu)) .* 4.0)
@@ -170,6 +205,10 @@ end
     end
     @testset "shared mixture-component kappa predictor" begin
         _, _, kern, lay = _bk_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 lk = c .+ d .* z
                 prop .~ MixtureModel.([Beta.(logistic.(eta) .* exp.(lk),
@@ -209,6 +248,10 @@ end
 @testset "bk Enzyme gradients" begin
     @testset "log-kappa submodel" begin
         _bk_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 mu = a .+ b .* x
                 lk = c .+ d .* z
                 prop .~ Beta.(logistic.(mu) .* exp.(lk),
@@ -217,6 +260,9 @@ end
     end
     @testset "intercept-only log-kappa submodel" begin
         _bk_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
                 mu = a .+ b .* x
                 lk = c
                 prop .~ Beta.(logistic.(mu) .* exp.(lk),
@@ -242,6 +288,10 @@ end
 
 @testset "bk emission is O(1) in n_obs" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         lk = c .+ d .* z
         prop .~ Beta.(logistic.(mu) .* exp.(lk),
@@ -282,12 +332,18 @@ end
 @testset "bk under Reactant" begin
     progs = [
         ("log-kappa submodel", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             lk = c .+ d .* z
             prop .~ Beta.(logistic.(mu) .* exp.(lk),
                 (1 .- logistic.(mu)) .* exp.(lk))
         end, _bk_cols()),
         ("literal kappa", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             prop .~ Beta.(logistic.(mu) .* 4.0,
                 (1 .- logistic.(mu)) .* 4.0)
