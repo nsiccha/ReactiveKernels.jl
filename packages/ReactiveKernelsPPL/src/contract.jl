@@ -1650,7 +1650,7 @@ end
 Ordered level values sizing one full-rank factor term: `values` is the
 coefficient position↔level mapping (binder-evaluated from the grouping
 column, `[]` pre-bind). `source` is the levels function (`:levels`
-only). `subset` selects from `sort(unique(column))`: `:` (full cover),
+only). `subset` selects from `DataAPI.levels(column)`: `:` (full cover),
 a literal `UnitRange{Int}`, a literal `Vector{Int}` of positions, or
 `(lo, :end)`. Keyed by `(predictor, column)` — one map per factor term.
 """
@@ -7002,19 +7002,10 @@ function _validate_monotonic_columns(t::TermSpec, plan::StructuralPlan)
     return nothing
 end
 
-"""Grouping levels for a raw factor column: sort-ordered uniques, with
-non-`String` strings (e.g. `CategoricalString`) and categorical values
-normalized via `string` (zero-dep duck-typing — `String`/`Number`/`Symbol`/
-`Bool`/`Char` behavior is unchanged)."""
-function _grouping_levels(col::AbstractVector)
-    isempty(col) && return []
-    v = first(col)
-    if (v isa AbstractString && !isa(v, String)) ||
-            string(nameof(typeof(v))) == "CategoricalValue"
-        return sort!(unique!(string.(col)))
-    end
-    return sort(unique(col))
-end
+"""Julia grouping levels, including a categorical column's pool order and
+unobserved levels. Copy the result so binder-owned metadata never aliases
+caller-owned pool storage. DataAPI's plain-vector fallback sorts uniques."""
+_grouping_levels(col::AbstractVector) = Vector(DataAPI.levels(col))
 
 # One map per factor term, keyed (predictor, column), so a factor lookup
 # resolves to exactly one map.
@@ -7073,8 +7064,8 @@ function _validate_subset_shape(m::LevelMap)
     return nothing
 end
 
-# Binder evaluation: sort-ordered uniques, then the subset selection
-# (bounds-checked against the observed count).
+# Binder evaluation: Julia levels, then the subset selection
+# (bounds-checked against the pool count).
 function _eval_levelmaps(levelmaps::Vector{LevelMap},
         columns::AbstractDict{Symbol})
     out = LevelMap[]
