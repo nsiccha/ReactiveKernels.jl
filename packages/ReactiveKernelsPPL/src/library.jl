@@ -179,3 +179,144 @@ statements yourself.
     z[axes(X, 2)] .~ Normal.(0, 1)
     return z .* lambda .* tau
 end
+
+# ── Varying effects ──────────────────────────────────────────────────
+# Each submodel returns per-level coefficients over `levels(g)`: plain
+# array values the use site reads per observation with ordinary indexing
+# (`b[g]`, `x .* b[g]`, `b[g, 1] .+ x .* b[g, 2]`). Intercepts, slopes,
+# derived or indicator margins (`w .* b[g]`, `(c .== 2) .* b[g, 2]`),
+# multi-membership (`b[g1] ./ 2 .+ b[g2] ./ 2` over `gg = vcat(g1, g2)`)
+# and draws shared by several predictors are all plain Julia at the use
+# site. Defaults: `sd ~ HalfNormal(1)` per margin, `LKJCholesky(K, 1.0)`
+# for K ≥ 2 margins.
+
+"""
+    b ~ varying_coefs(g)
+
+Non-centered per-level coefficients for one margin: `b[j] = sd * z[j]`
+with `z[j] ~ Normal(0, 1)` for every level `j` of `g`. Its body:
+
+```julia
+@rkppl varying_coefs(g) = begin
+    sd ~ HalfNormal(1)
+    z[levels(g)] .~ Normal.(0, 1)
+    return sd .* z
+end
+```
+
+`b` is a vector over `levels(g)`: `b[g]` is each observation's
+coefficient (a varying intercept), `x .* b[g]` a varying slope. Draws are
+`b_sd` and `b_z`. For multi-membership, pass the union of the membership
+columns as one data definition (`gg = vcat(g1, g2)`; `b ~
+varying_coefs(gg)`) and weight the gathers (`b[g1] ./ 2 .+ b[g2] ./ 2`).
+"""
+@rkppl varying_coefs(g) = begin
+    sd ~ HalfNormal(1)
+    z[levels(g)] .~ Normal.(0, 1)
+    return sd .* z
+end
+
+"""
+    b ~ varying_coefs_correlated(g, K)
+
+Non-centered correlated per-level coefficients for `K ≥ 2` margins (`K` a
+literal): every level's row is `diagm(sd) * L * z[j, :]`, so rows are
+`MvNormal(0, (sd .* L) * (sd .* L)')`. Its body:
+
+```julia
+@rkppl varying_coefs_correlated(g, K) = begin
+    sd[1:K] .~ HalfNormal.(1)
+    L ~ LKJCholesky(K, 1.0)
+    z[levels(g), 1:K] .~ Normal.(0, 1)
+    return z * (sd .* L)'
+end
+```
+
+`b` is a `levels(g) × K` matrix: margin `k` of observation `i` is
+`b[g, k]`, so a correlated varying intercept and slope read
+`b[g, 1] .+ x .* b[g, 2]`. Draws are
+`b_sd`, `b_L` and `b_z`.
+"""
+@rkppl varying_coefs_correlated(g, K) = begin
+    sd[1:K] .~ HalfNormal.(1)
+    L ~ LKJCholesky(K, 1.0)
+    z[levels(g), 1:K] .~ Normal.(0, 1)
+    return z * (sd .* L)'
+end
+
+"""
+    b ~ varying_coefs_centered(g)
+
+Centered per-level coefficients for one margin: `b[j] ~ Normal(0, sd)`
+for every level `j` of `g`, the coefficients themselves sampled. Its
+body:
+
+```julia
+@rkppl varying_coefs_centered(g) = begin
+    sd ~ HalfNormal(1)
+    c[levels(g)] .~ Normal.(0, sd)
+    return c
+end
+```
+
+Read it like [`varying_coefs`](@ref): `b[g]`, `x .* b[g]`. Draws are
+`b_sd` and `b_c`.
+"""
+@rkppl varying_coefs_centered(g) = begin
+    sd ~ HalfNormal(1)
+    c[levels(g)] .~ Normal.(0, sd)
+    return c
+end
+
+"""
+    b ~ varying_coefs_centered_correlated(g, K)
+
+Centered correlated per-level coefficients for `K ≥ 2` margins (`K` a
+literal): every level's row is one draw of
+`MvNormal(0, (sd .* L) * (sd .* L)')`, the coefficients themselves
+sampled. Its body:
+
+```julia
+@rkppl varying_coefs_centered_correlated(g, K) = begin
+    sd[1:K] .~ HalfNormal.(1)
+    L ~ LKJCholesky(K, 1.0)
+    F = sd .* L
+    eachrow(c[levels(g), 1:K]) .~ MvNormalCholesky(zeros(K), F)
+    return c
+end
+```
+
+Read it like [`varying_coefs_correlated`](@ref): margin `k` of
+observation `i` is `b[g, k]`, so `b[g, 1] .+ x .* b[g, 2]`. Draws are
+`b_sd`, `b_L` and `b_c`.
+"""
+@rkppl varying_coefs_centered_correlated(g, K) = begin
+    sd[1:K] .~ HalfNormal.(1)
+    L ~ LKJCholesky(K, 1.0)
+    F = sd .* L
+    eachrow(c[levels(g), 1:K]) .~ MvNormalCholesky(zeros(K), F)
+    return c
+end
+
+"""
+    u ~ varying_stratified(g, s)
+
+One stratified margin: each stratum (level of `s`) has its own sd, and
+observation `i` reads `sd[s[i]] * z[g[i]]`. Its body:
+
+```julia
+@rkppl varying_stratified(g, s) = begin
+    sd[levels(s)] .~ HalfNormal.(1)
+    z[levels(g)] .~ Normal.(0, 1)
+    return sd[s] .* z[g]
+end
+```
+
+`u` is one value per observation: a varying intercept is `u`, a varying
+slope `x .* u`. Draws are `u_sd` and `u_z`.
+"""
+@rkppl varying_stratified(g, s) = begin
+    sd[levels(s)] .~ HalfNormal.(1)
+    z[levels(g)] .~ Normal.(0, 1)
+    return sd[s] .* z[g]
+end
