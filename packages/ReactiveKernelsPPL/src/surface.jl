@@ -72,41 +72,52 @@ to the data column at an observation-stream use site (`y ~ sm(...)`), so a
 stream body carries no trailing binding; any other return is a latent VALUE
 bound to a non-data LHS (`latent = <return>`). Invoked as
 `latent ~ sm(a, b)` and expanded inline by [`lower_rkppl`](@ref) (see
-`_expand_submodels`): the submodel's own names are namespaced under the LHS
-(`latent_…`) and spliced into the parent plan, so a submodel lowers exactly
+`_expand_submodels`): the submodel owns a lexical namespace under the LHS
+and its mathematics is spliced into the parent plan, so a submodel lowers
 like a hand-inlined model — transparent and reusable, never an opaque node.
 
 A body holds any statement a top-level program can: `~` / `.~` / `=`
 statements, indexed and sized priors (`c[levels(g)] .~ Normal.(0, s)`,
 `b[axes(X, 2)] .~ …`), `@plate` and `@scan` blocks, basis / `r2d2` /
-varying statements, and calls to other submodels. Namespacing is one rule:
+varying statements, and calls to other submodels. Scope access is static:
 
 - every name the body binds — a `~` / `.~` / `=` left-hand side (the base
   name of an indexed one), a `@plate` result, cell or loop variable, a
   `@scan` carried state, step local or loop variable, a `do`-block argument
-  — becomes `<lhs>_<name>` everywhere in the body; index expressions keep
-  their shape (`c[levels(gg)]` → `latent_c[levels(group)]`);
+  — receives a private identifier; its author path is retained separately.
+  `z.b` reads local `b` of call `z`. Index expressions keep their shape;
 - a basis id the body declares (`spline_basis(:s, …)`, `hsgp_basis(:s, …)`)
-  becomes `:<lhs>_s` at the declaration and at its `spline(:s)` /
+  receives a private identifier at the declaration and at its `spline(:s)` /
   `hsgp(:s)` uses; no other quoted symbol changes;
 - each argument is replaced by the call's argument expression; a body may
   observe (`~` / `.~`) an argument bound to a data column, and binding an
   argument name any other way fails;
 - function names, keyword names and every name the body does not bind are
   left as written (a free name refers to the calling program);
-- a nested call expands after the enclosing body is substituted, so names
-  compose (`z ~ outer(…)` → `w ~ inner(…)` → `b` gives `z_w_b`); it resolves
+- a nested call expands after the enclosing body is substituted, so paths
+  compose (`z ~ outer(…)` → `w ~ inner(…)` → `b` gives `z.w.b`); it resolves
   in the module that defined the enclosing submodel. Recursion fails.
 
-A namespaced name that is already a name in the program (a data column, a
-statement, another expansion), appears in the call's arguments, or is a free
-name of the body fails closed, so a local never captures a caller name.
-A per-cell call (`col[i] ~ sm(…)` inside `@plate for i …`) namespaces as
-`col_<name>[i]` and admits scalar `~` / `=` statements over bare names.
+Bare `z` denotes the actual return value, including in Julia function
+arguments. `z.b` is local-first: when `b` is absent from the scope it reads
+`getproperty(z, :b)` on that return value. Explicit `getproperty(z, :b)`
+always reads the return value. Locals are read-only from the caller and
+never create unqualified caller bindings. `a.b_c`, `a_b.c`, and caller
+`a_b_c` coexist. A per-cell call (`col[i] ~ sm(…)` inside `@plate for i …`)
+admits scalar `~` / `=` statements over bare names; `col[i].b` reads local
+`b` at cell `i`, and `col.b` is the array of those locals. Loop variables
+remain scoped to their loop and cannot be read outside it.
+
+[`constrain`](@ref) and [`restore_draws`](@ref) return nested NamedTuples
+of sampled locals (`nt.z.b`, `nt.z.w.b`); [`coordinate_names`](@ref) uses
+dotted author paths. These draw containers omit deterministic locals,
+observed slots and return values. [`unconstrain`](@ref) accepts the same
+nested containers. Rebuild prepared layouts and draw mappings when
+migrating from flattened submodel names.
 
 A fused stream def (design + coefficients inside, Stan
 `bernoulli_logit_glm`-style) keeps the response shell but NOT the predictor
-name: its affine local namespaces under the data LHS (`y_mu`), and an inline
+name: its affine local belongs to the data LHS's scope (`y.mu`), and an inline
 compound location synthesizes (`y_eta`) — both move the lowered predictor.
 Ordinary parameter names follow their declarations; legacy construct-owned
 coefficient blocks follow the predictor. To factor design + coefficients into a def
@@ -545,8 +556,8 @@ function _lower_rkppl(ast, data_names, scalars::Set{Symbol},
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = Expr(:block, _desugar_destructuring(ast.args)...)
     ast, data = _scalar_value_definitions(ast, data, scalars)
-    ast, pins = _expand_submodels(ast, data, mod)
-    return _lower_rkppl_once(ast, data, pins, mod)
+    ast, pins, scopes = _expand_submodels(ast, data, mod; with_scopes = true)
+    return _lower_rkppl_once(ast, data, pins, mod; submodel_scopes = scopes)
 end
 
 # Ordinary parameters may have any number of readers. Legacy
@@ -578,7 +589,8 @@ function _bind_parameter_terms!(predictors, structured)
     end
 end
 
-function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module)
+function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
+        submodel_scopes::Vector{SubmodelScope} = SubmodelScope[])
     sample, det, plate_ctx, plate_specs, scans, bases, vectors,
     hbases, kplates, kstmts, schedules, event_lps, r2d2decls, joints,
     varying_draws, varying_pending, glms = _partition_statements(ast, data)
@@ -1112,7 +1124,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module)
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
-        array_parameters = arrays)
+        array_parameters = arrays, submodel_scopes = submodel_scopes)
     _confirm_whole_value_data(plan, rawdata, waived; whole)
     validate_structure(plan)
     return plan
@@ -6083,7 +6095,7 @@ end
 # `return x` unwraps to `x` in `_submodel_body_parts`, so both spellings lower
 # identically):
 #   • latent (`latent ~ sm(a,b)`, `latent` NOT data) — returns a VALUE
-#     expression; every local is namespaced (`latent_…`) and a trailing
+#     expression; every local has a private identifier and a trailing
 #     `latent = <return>` binds the LHS.
 #   • observation stream (`y ~ sm(a,b)`, `y` a data column) — returns a bare
 #     `slot` that is the LHS of an internal `slot .~ family.(...)` response;
@@ -6093,16 +6105,16 @@ end
 #
 # The namespacing rule (one rule for every statement form, so a body holds
 # whatever a top-level program can):
-#   • Every name the body BINDS is renamed `<lhs>_<name>` everywhere in the
+#   • Every name the body BINDS receives one private identifier throughout the
 #     body: the LHS of a `~` / `.~` / `=` statement (the base name of an
 #     indexed LHS — `c[levels(g)] .~ …` binds `c`, `b[axes(X, 2)] .~ …` binds
 #     `b`, a slice declaration `eachrow(B[levels(g), 1:K]) .~ …` binds `B`),
 #     a `@plate` result, cell or loop variable, a `@scan` carried state,
 #     step local or loop variable, and a `do`-block argument
 #     (`_collect_binders!`). Index expressions keep their shape; names inside
-#     them follow the same rule (`c[levels(gg)]` → `z_c[levels(group)]`).
+#     them follow the same substitution. Author paths are separate metadata.
 #   • A basis id the body declares (`spline_basis(:s, …)`,
-#     `hsgp_basis(:s, …)`) is a body name too: it becomes `:<lhs>_s` at the
+#     `hsgp_basis(:s, …)`) is a body name too: its private id replaces `:s` at the
 #     declaration and at every `spline(:s)` / `hsgp(:s)` use in the body. No
 #     other quoted symbol is renamed (`kind = :tps` stays).
 #   • Each argument is replaced by the call's argument expression (the
@@ -6113,13 +6125,13 @@ end
 #     never renamed; every other name is left as written (a free name refers
 #     to the calling program).
 #   • A nested submodel call in a body expands after the enclosing body is
-#     substituted, so names compose: `z ~ outer(...)` whose body holds
-#     `w ~ inner(...)` whose body binds `b` yields `z_w_b`. A nested call
+#     substituted, so scopes compose: `z ~ outer(...)` whose body holds
+#     `w ~ inner(...)` whose body binds `b` exposes `z.w.b`. A nested call
 #     resolves in the module that defined the enclosing submodel.
-# Hygiene fails closed (`_check_submodel_hygiene`): a namespaced name may not
-# already be bound in the program, be a data column, appear in the call's
-# arguments, or appear as a free name in the body — so a local never captures
-# a caller name, and two expansions never collide.
+# Private identifiers are fresh against caller names, data, arguments and
+# free body names. A static `z.b` read resolves through the scope table;
+# bare `z` remains the actual returned value. Flat author spellings cannot
+# collide with locals, and no wrapper enters the mathematical graph.
 #
 # Admitting plain `~` on a data LHS is a SHAPE-COMPATIBILITY rule (dots follow
 # the callee, not the LHS), NOT a submodel type-exception: a data column is
@@ -6144,6 +6156,28 @@ function _resolve_submodel(rhs, mod::Module)
     return val isa RKPPLSubmodel ? val : nothing
 end
 
+# Reserve the complete reachable source vocabulary before allocating any
+# private name. A free name in a later/nested callee must not capture an
+# identifier already allocated for an earlier call. Visit each body once;
+# the expansion cycle check remains responsible for rejecting recursion.
+function _reserve_submodel_names!(used::Set{Symbol}, ex, mod::Module,
+        seen::Set{RKPPLSubmodel})
+    ex isa Expr || return nothing
+    if _is_sample(ex) || _is_broadcast_sample(ex)
+        sm = _resolve_submodel(ex.args[3], mod)
+        if sm !== nothing && !(sm in seen)
+            push!(seen, sm)
+            union!(used, sm.argnames)
+            _all_symbols!(used, sm.body)
+            _reserve_submodel_names!(used, sm.body, sm.mod, seen)
+        end
+    end
+    for arg in ex.args
+        _reserve_submodel_names!(used, arg, mod, seen)
+    end
+    return nothing
+end
+
 # A top-level statement that is a plain `~` whose RHS resolves to a submodel
 # (pure predicate; the latent/stream compatibility check happens on expansion).
 function _stmt_is_submodel_call(arg, mod::Module)
@@ -6164,24 +6198,108 @@ end
 _is_block_macro(st) = st isa Expr && st.head === :macrocall &&
     !isempty(st.args) && st.args[1] in (Symbol("@plate"), Symbol("@scan"))
 
-function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module)
+mutable struct _ScopeExpansion
+    scopes::Vector{SubmodelScope}
+    by_binding::Dict{Symbol,SubmodelScope}
+    name_paths::Dict{Symbol,Tuple{Vararg{Symbol}}}
+    used::Set{Symbol}
+    next_identifier::Int
+end
+
+function _new_submodel_scope!(ctx::_ScopeExpansion, binding::Symbol;
+        per_cell::Bool = false)
+    haskey(ctx.by_binding, binding) && _sfail(
+        "submodel binding `$binding` is defined more than once " *
+        "(a call owns one lexical namespace)")
+    path = get(ctx.name_paths, binding, (binding,))
+    scope = SubmodelScope(path, binding, Dict{Symbol,Symbol}(), per_cell)
+    push!(ctx.scopes, scope)
+    ctx.by_binding[binding] = scope
+    return scope
+end
+
+function _scope_private_name!(ctx::_ScopeExpansion, scope::SubmodelScope,
+        name::Symbol)
+    haskey(scope.locals, name) && return scope.locals[name]
+    while true
+        ctx.next_identifier += 1
+        identifier = Symbol("##rkppl_scope#", lpad(ctx.next_identifier, 8, '0'))
+        any(nm -> occursin(string(identifier), string(nm)), ctx.used) && continue
+        push!(ctx.used, identifier)
+        scope.locals[name] = identifier
+        ctx.name_paths[identifier] = (scope.path..., name)
+        return identifier
+    end
+end
+
+# Property reads of a call resolve lexically before mathematical lowering.
+# A nested call remains a scope; an ordinary local or the call's returned
+# value remains an ordinary Julia value. No runtime value wrapper is built.
+_resolve_scope_properties(x, ::_ScopeExpansion) = x
+function _resolve_scope_properties(ex::Expr, ctx::_ScopeExpansion)
+    if Meta.isexpr(ex, :(=), 2) || _is_sample(ex) || _is_broadcast_sample(ex)
+        lhs = _stmt_lhs(ex)
+        root = lhs
+        dotted = false
+        while root isa Expr && root.head in (:., :ref)
+            dotted |= root.head === :.
+            root = first(root.args)
+        end
+        dotted && root isa Symbol && haskey(ctx.by_binding, root) && _sfail(
+            "scoped local `$(repr(lhs))` is read-only: a submodel owns " *
+            "its declarations (bind a distinct caller name instead)")
+    end
+    if ex.head === :. && length(ex.args) == 2 &&
+            ex.args[2] isa QuoteNode && ex.args[2].value isa Symbol
+        parent = _resolve_scope_properties(ex.args[1], ctx)
+        field = ex.args[2].value
+        binding = parent isa Symbol ? parent :
+            Meta.isexpr(parent, :ref) && parent.args[1] isa Symbol ?
+            parent.args[1] : nothing
+        scope = binding === nothing ? nothing : get(ctx.by_binding, binding, nothing)
+        if scope !== nothing && haskey(scope.locals, field)
+            local_name = scope.locals[field]
+            if Meta.isexpr(parent, :ref) && scope.per_cell
+                return Expr(:ref, local_name, parent.args[2:end]...)
+            elseif parent isa Symbol
+                return local_name
+            end
+        end
+        # A property absent from the namespace is a property of the actual
+        # returned value. This also covers properties of ordinary local values.
+        if any(nm -> haskey(ctx.by_binding, nm) || haskey(ctx.name_paths, nm),
+                _value_symbols(parent))
+            return Expr(:call, GlobalRef(Base, :getproperty), parent, ex.args[2])
+        end
+        return Expr(:., parent, ex.args[2])
+    end
+    return Expr(ex.head, Any[_resolve_scope_properties(a, ctx) for a in ex.args]...)
+end
+
+function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
+        with_scopes::Bool = false)
     pins = Dict{Symbol,Symbol}()
     any(_stmt_is_submodel_call(a, mod) || _plate_has_submodel_cell(a, mod)
-        for a in ast.args) || return ast, pins
+        for a in ast.args) || return with_scopes ? (ast, pins, SubmodelScope[]) : (ast, pins)
     # Names in use by the program (binders at every depth + data): a
     # namespaced name must be fresh against these, and every expansion adds
     # its own names (two expansions never collide).
     used = copy(data)
+    _all_symbols!(used, ast)
+    _reserve_submodel_names!(used, ast, mod, Set{RKPPLSubmodel}())
     for a in ast.args
         _collect_binders!(used, a)
         a isa Expr && _collect_basis_ids!(used, a)
     end
     out = Any[]
+    ctx = _ScopeExpansion(SubmodelScope[], Dict{Symbol,SubmodelScope}(),
+        Dict{Symbol,Tuple{Vararg{Symbol}}}(), used, 0)
     for arg in ast.args
-        _expand_submodel_stmt!(out, arg, mod, data, pins, used,
+        _expand_submodel_stmt!(out, arg, mod, data, pins, ctx,
             RKPPLSubmodel[])
     end
-    return Expr(:block, out...), pins
+    expanded = _resolve_scope_properties(Expr(:block, out...), ctx)
+    return with_scopes ? (expanded, pins, ctx.scopes) : (expanded, pins)
 end
 
 # Expand one statement into `out`, recursively: a submodel call is inlined and
@@ -6189,7 +6307,7 @@ end
 # defining module of the enclosing submodel); a plate with per-cell submodel
 # cells is rewritten cell by cell; anything else passes through.
 function _expand_submodel_stmt!(out, arg, mod::Module, data::Set{Symbol},
-        pins::Dict{Symbol,Symbol}, used::Set{Symbol},
+        pins::Dict{Symbol,Symbol}, used::_ScopeExpansion,
         chain::Vector{RKPPLSubmodel})
     if _stmt_is_submodel_call(arg, mod)
         st = _unwrap_trivia(arg)
@@ -6206,8 +6324,6 @@ function _expand_submodel_stmt!(out, arg, mod::Module, data::Set{Symbol},
     end
     return out
 end
-
-_ns(lhs::Symbol, nm::Symbol) = Symbol(lhs, :_, nm)
 
 # A submodel that (transitively) calls itself never terminates: fail naming
 # the cycle.
@@ -6430,33 +6546,6 @@ function _check_call_heads(sm::RKPPLSubmodel, ex, names::Set{Symbol})
     return nothing
 end
 
-# Fail closed unless every namespaced name is fresh: not already bound in the
-# program or a data column (`used`), not a name inside the call's arguments,
-# and not a free name of the body. Then claim the names in `used`.
-function _check_submodel_hygiene!(sm::RKPPLSubmodel, site::String,
-        fresh::Vector{Pair{Symbol,Symbol}}, callargs, freebody::Set{Symbol},
-        used::Set{Symbol})
-    argsyms = Set{Symbol}()
-    for a in callargs
-        _all_symbols!(argsyms, a)
-    end
-    for (local_nm, nm) in fresh
-        why = nm in argsyms ? "appears in the call's arguments" :
-            nm in freebody ? "is a free name in the body of `$(sm.name)` " *
-                "(it would be captured by the local)" :
-            nm in used ? "is already a name in the program (a data column, " *
-                "a statement, or another submodel expansion)" : nothing
-        why === nothing && continue
-        _sfail("submodel `$(sm.name)` at `$site`: its local `$local_nm` " *
-               "namespaces to `$nm`, which $why — rename the use-site LHS " *
-               "or the local")
-    end
-    for (_, nm) in fresh
-        push!(used, nm)
-    end
-    return nothing
-end
-
 # A stream submodel returns a bare `slot` Symbol that is the LHS of exactly one
 # internal `.~` response statement. Returns that statement, or `nothing` for a
 # latent submodel (value return / non-response slot).
@@ -6505,7 +6594,7 @@ end
 
 # The substitution for one use site: arguments → call expressions, body
 # binders → `ns(name)` (except names `keep` maps itself), basis ids →
-# `:<lhs>_<id>`. Returns (map, idmap, fresh, freebody). Fails closed when a
+# private identifiers. Returns (map, idmap). Fails closed when a
 # binder is an argument name, except a `~` / `.~` observation of an argument
 # bound to a data column.
 function _submodel_substitution(sm::RKPPLSubmodel, stmts, ret, callargs,
@@ -6523,7 +6612,7 @@ function _submodel_substitution(sm::RKPPLSubmodel, stmts, ret, callargs,
     for (a, v) in zip(sm.argnames, callargs)
         submap[a] = v
     end
-    for nm in binders
+    for nm in sort!(collect(binders); by = string)
         if nm in argset
             v = submap[nm]
             observed = !(nm in defined)
@@ -6536,43 +6625,32 @@ function _submodel_substitution(sm::RKPPLSubmodel, stmts, ret, callargs,
             continue
         end
         submap[nm] = get(keep, nm, nothing) === nothing ? ns(nm) : keep[nm]
+        v = submap[nm]
+        ns.scope.locals[nm] = v isa Symbol ? v : v.args[1]::Symbol
     end
-    idmap = Dict{Symbol,Symbol}(id => _ns(_ns_root(ns), id) for id in ids)
-    # Free body names: every Symbol the body mentions that it neither binds
-    # nor takes as an argument (call heads included — harmless).
-    freebody = Set{Symbol}()
-    for st in stmts
-        _all_symbols!(freebody, st)
-    end
-    _all_symbols!(freebody, ret)
-    setdiff!(freebody, binders)
-    setdiff!(freebody, argset)
-    fresh = Pair{Symbol,Symbol}[]
-    for (nm, v) in submap
-        nm in argset && continue
-        haskey(keep, nm) && continue
-        push!(fresh, nm => (v isa Symbol ? v : v.args[1]::Symbol))
-    end
-    for (id, v) in idmap
-        push!(fresh, id => v)
-    end
-    sort!(fresh; by = p -> string(p.first))
+    idmap = Dict{Symbol,Symbol}(id =>
+        _scope_private_name!(ns.context, ns.scope, id)
+        for id in sort!(collect(ids); by = string))
     names = union(argset, binders)
     for st in stmts
         _check_call_heads(sm, st, names)
     end
     _check_call_heads(sm, ret, names)
-    return submap, idmap, fresh, freebody
+    return submap, idmap
 end
 
 # The namespace root of a use site: `ns` closes over it (`_NsRoot`).
 struct _NsRoot
     root::Symbol
     indexed::Union{Nothing,Symbol}   # per-cell: the plate loop variable
+    scope::SubmodelScope
+    context::_ScopeExpansion
 end
-(n::_NsRoot)(nm::Symbol) = n.indexed === nothing ? _ns(n.root, nm) :
-    Expr(:ref, _ns(n.root, nm), n.indexed)
-_ns_root(n::_NsRoot) = n.root
+function (n::_NsRoot)(nm::Symbol)
+    identifier = _scope_private_name!(n.context, n.scope, nm)
+    return n.indexed === nothing ? identifier :
+        Expr(:ref, identifier, n.indexed)
+end
 
 function _collect_basis_ids!(ids::Set{Symbol}, st::Expr)
     if st.head === :call && !isempty(st.args) && st.args[1] in _BASIS_DECL_HEADS
@@ -6587,7 +6665,7 @@ end
 
 function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
                               data::Set{Symbol}, pins::Dict{Symbol,Symbol},
-                              used::Set{Symbol}, chain)
+                              used::_ScopeExpansion, chain)
     sm = _resolve_submodel(callexpr, mod)::RKPPLSubmodel
     _check_submodel_cycle(sm, chain)
     callargs, pin = _peel_predictor_pin(callexpr, sm)
@@ -6601,6 +6679,10 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
         "$(Tuple(sm.argnames)), got $(length(callargs)) at `$lhs ~ " *
         "$(sm.name)(...)`")
     stmts, ret = _submodel_body_parts(sm)
+    for st in stmts
+        _all_symbols!(used.used, st)
+    end
+    _all_symbols!(used.used, ret)
     stream = _stream_response(sm, stmts, ret) !== nothing
     if pin !== nothing && !stream
         _sfail("`predictor = $pin` names a response predictor, but " *
@@ -6631,10 +6713,9 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     # The stream response slot binds to the data LHS; all other binders are
     # namespaced under the LHS.
     keep = stream ? Dict{Symbol,Any}(ret => lhs) : Dict{Symbol,Any}()
-    submap, idmap, fresh, freebody = _submodel_substitution(sm, stmts, ret,
-        callargs, data, _NsRoot(lhs, nothing), keep)
-    _check_submodel_hygiene!(sm, "$lhs ~ $(sm.name)(...)", fresh, callargs,
-        freebody, used)
+    scope = _new_submodel_scope!(used, lhs)
+    submap, idmap = _submodel_substitution(sm, stmts, ret,
+        callargs, data, _NsRoot(lhs, nothing, scope, used), keep)
     # Body definitions call functions visible in the submodel's OWN module
     # (functions as values); resolution precedes substitution (`GlobalRef`
     # heads and function values pass `_hsubst` intact).
@@ -6711,7 +6792,7 @@ end
 # Rewrite a `@plate` block, replacing each per-cell submodel-call cell with the
 # submodel's inlined `i`-indexed cell statements; other cells pass through.
 function _expand_plate_cell_submodels(pl::Expr, mod::Module, data::Set{Symbol},
-        used::Set{Symbol}, chain)
+        used::_ScopeExpansion, chain)
     loop = pl.args[end]::Expr
     asg = loop.args[1]::Expr
     ivar = asg.args[1]::Symbol
@@ -6727,7 +6808,7 @@ end
 # Expand one plate cell into `cells`, recursively (a per-cell body may call a
 # per-cell submodel in turn; it resolves in the enclosing submodel's module).
 function _expand_cell_stmt!(cells, c, ivar::Symbol, mod::Module,
-        data::Set{Symbol}, used::Set{Symbol}, chain)
+        data::Set{Symbol}, used::_ScopeExpansion, chain)
     call = _cell_submodel_call(c, ivar, mod)
     if call === nothing
         push!(cells, c)
@@ -6747,7 +6828,7 @@ _is_dotted_obj(st::Expr) =
 
 # Inline one per-cell submodel call `col[i] ~ sm(callargs…)` into a sequence of
 # `i`-indexed cell statements. The submodel's own `~`/`=` names are namespaced
-# under `col` and indexed per cell (`col_<nm>[i]`); its positional args bind to
+# under `col` with private identifiers indexed per cell; positional args bind to
 # the call arguments (written per-cell by the user, e.g. `x[i]`). The RETURN
 # selects what binds to `col[i]`:
 #   • a bare Symbol naming exactly one internal statement → that statement's LHS
@@ -6762,7 +6843,7 @@ _is_dotted_obj(st::Expr) =
 # desugar the inlined statements flow through.
 function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
                                mod::Module, data::Set{Symbol},
-                               used::Set{Symbol}, chain)
+                               used::_ScopeExpansion, chain)
     col = colref.args[1]::Symbol
     sm = _resolve_submodel(callexpr, mod)::RKPPLSubmodel
     _check_submodel_cycle(sm, chain)
@@ -6775,6 +6856,10 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
         "$(Tuple(sm.argnames)), got $(length(callargs)) at `$col[$ivar] ~ " *
         "$(sm.name)(...)`")
     stmts, ret = _submodel_body_parts(sm)
+    for st in stmts
+        _all_symbols!(used.used, st)
+    end
+    _all_symbols!(used.used, ret)
     # A cell is scalar: a per-cell body holds scalar `~` / `=` statements over
     # bare names (no indexed priors, plates, scans or varying statements).
     for st in stmts
@@ -6822,14 +6907,19 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
         nm in argset && _sfail("submodel `$(sm.name)`: `$nm` is both an " *
             "argument and a local statement — rename the local")
     end
+    # A returned nested call keeps its own scope instead of claiming the
+    # outer call's binding. The outer cell then reads that call's return.
+    if slot !== nothing && _is_sample(stmts[slot]) &&
+            _resolve_submodel(stmts[slot].args[3], sm.mod) !== nothing
+        slot = nothing
+    end
     # Build the substitution: args → call args; each internal name → its indexed
     # namespaced ref, except the direct-bound slot → `col[i]`.
     keep = slot === nothing ? Dict{Symbol,Any}() :
         Dict{Symbol,Any}(_stmt_lhs(stmts[slot]) => colref)
-    submap, idmap, fresh, freebody = _submodel_substitution(sm, stmts, ret,
-        callargs, data, _NsRoot(col, ivar), keep)
-    _check_submodel_hygiene!(sm, "$col[$ivar] ~ $(sm.name)(...)", fresh,
-        callargs, freebody, used)
+    scope = _new_submodel_scope!(used, col; per_cell = true)
+    submap, idmap = _submodel_substitution(sm, stmts, ret,
+        callargs, data, _NsRoot(col, ivar, scope, used), keep)
     out = Any[_hsubst(st, submap, idmap) for st in stmts]
     # Compound-return latent: bind `col[i]` to the substituted return value.
     slot === nothing && push!(out, Expr(:(=), colref, _hsubst(ret, submap, idmap)))
@@ -6865,6 +6955,7 @@ function _value_symbols!(out::Set{Symbol}, ex)
         return nothing
     end
     for a in ex.args
+        ex.head === :tuple && (a = _tuple_field_value(a))
         _value_symbols!(out, a)
     end
     return nothing
@@ -8915,6 +9006,19 @@ end
 # it like any design predictor; latent predictors stay per-response (no
 # interning here, pinned or not).
 function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
+    # A nested per-cell call can return a sampled local unchanged. The
+    # outer binding aliases that vector; it does not create another latent.
+    source = col
+    seen = Set{Symbol}()
+    while source isa Symbol && haskey(ctx.detmap, source) &&
+            ctx.detmap[source] isa Symbol && source ∉ seen
+        push!(seen, source)
+        source = ctx.detmap[source]
+    end
+    if source in ctx.plate_names
+        union!(ctx.absorbed, seen)
+        col = source
+    end
     pin = get(ctx.predictor_pins, lhs, nothing)
     if pin !== nothing
         _claim_pin!(lhs, pin, ctx, pred_idx)

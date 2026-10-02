@@ -22,8 +22,8 @@ response:
 end
 ```
 
-At `y ~ ordered_logistic(eta)` the cutpoints are `y_cutpoints`; the plan is
-the hand-written two statements above with `y_cutpoints`. To use a different
+At `y ~ ordered_logistic(eta)` the cutpoints are local `y.cutpoints` and
+restored as `nt.y.cutpoints`. To use a different
 prior, write those statements yourself.
 """
 @rkppl ordered_logistic(eta) = begin
@@ -48,8 +48,9 @@ penalized (whitened) range-space columns. Its body states every prior:
 end
 ```
 
-At `f ~ penalized_smooth(Xf, Zp)` the parameters are `f_b`, `f_sd` and
-`f_z`, and `f` is one value per observation:
+At `f ~ penalized_smooth(Xf, Zp)` the parameters are `f.b`, `f.sd` and
+`f.z` (restored as `nt.f.b`, `nt.f.sd`, `nt.f.z`), and bare `f` is one value
+per observation:
 
 ```julia
 (Xf, Zp) = tps_basis(x; k = 10)
@@ -116,8 +117,8 @@ prior, including the length scale's validity floor:
 end
 ```
 
-At `f ~ hsgp_effect(PHI, lambda)` the parameters are `f_rho`, `f_sigma` and
-`f_z`, and `f` is one value per observation:
+At `f ~ hsgp_effect(PHI, lambda)` the parameters are `f.rho`, `f.sigma` and
+`f.z` (restored under `nt.f`), and bare `f` is one value per observation:
 
 ```julia
 (PHI, lambda) = hsgp_basis(x; k = 20, c = 1.5)
@@ -271,9 +272,12 @@ x ~ differenced_ar1(beta, sigma_d)
 mu = a .+ x
 ```
 
-At `x ~ differenced_ar1(...)` the carried arrays are `x_level` and
-`x_increment` and the innovations are the `T - 1` coordinates of
-`_ppl_scan_z_x_level`.
+At `x ~ differenced_ar1(...)` the carried arrays are local `x.level` and
+`x.increment`. The existing non-centered scan packing stores its `T - 1`
+innovations as `nt.x._ppl_scan_z_level`; coordinate labels start with
+`x._ppl_scan_z_level`. Bare `x` returns the level trajectory.
+If an authored local already has a generated block's name, the generated
+draw name takes the first free numeric suffix; the authored local keeps its name.
 """
 @rkppl differenced_ar1(beta, sigma) = begin
     @scan begin
@@ -309,7 +313,7 @@ end
 
 Use it as `b ~ r2d2_coefs(X, [1.0, 1.0])` and `mu = a .+ X * b`, with the
 intercept `a` and its prior stated outside. At that use site the draws are
-`b_R2`, `b_phi`, `b_tau` and the coefficients `b_b`; `varx` is the sample
+`nt.b.R2`, `nt.b.phi`, `nt.b.tau` and the coefficients `nt.b.b`; `varx` is the sample
 variance (N − 1) of each column, computed once at `bind_data`.
 
 The coefficient sd is `tau * sqrt(phi_k * R2 / var(x_k))` with an
@@ -345,7 +349,8 @@ end
 
 Use it as `b ~ horseshoe_coefs(X)` and `mu = a .+ X * b`, with the
 intercept `a` and its prior stated outside. At that use site the draws are
-`b_tau`, `b_lambda` and `b_z`, and `b = b_z .* b_lambda .* b_tau` is the
+`nt.b.tau`, `nt.b.lambda` and `nt.b.z`, and bare `b` returns `z .* lambda .* tau`
+from that scope. This is the
 coefficient vector, so each coefficient is `Normal(0, lambda_k * tau)`
 given its scales. The halves are Distributions-normalized
 (`truncated(Cauchy(0, s), 0, Inf)`). For a different prior, write the
@@ -384,7 +389,7 @@ end
 
 `b` is a vector over `levels(g)`: `b[g]` is each observation's
 coefficient (a varying intercept), `x .* b[g]` a varying slope. Draws are
-`b_sd` and `b_z`. For multi-membership, pass the union of the membership
+`nt.b.sd` and `nt.b.z`. For multi-membership, pass the union of the membership
 columns as one data definition (`gg = vcat(g1, g2)`; `b ~
 varying_coefs(gg)`) and weight the gathers (`b[g1] ./ 2 .+ b[g2] ./ 2`).
 """
@@ -413,7 +418,7 @@ end
 `b` is a `levels(g) × K` matrix: margin `k` of observation `i` is
 `b[g, k]`, so a correlated varying intercept and slope read
 `b[g, 1] .+ x .* b[g, 2]`. Draws are
-`b_sd`, `b_L` and `b_z`.
+`nt.b.sd`, `nt.b.L` and `nt.b.z`.
 """
 @rkppl varying_coefs_correlated(g, K) = begin
     sd[1:K] .~ HalfNormal.(1)
@@ -438,7 +443,7 @@ end
 ```
 
 Read it like [`varying_coefs`](@ref): `b[g]`, `x .* b[g]`. Draws are
-`b_sd` and `b_c`.
+`nt.b.sd` and `nt.b.c`.
 """
 @rkppl varying_coefs_centered(g) = begin
     sd ~ HalfNormal(1)
@@ -466,7 +471,7 @@ end
 
 Read it like [`varying_coefs_correlated`](@ref): margin `k` of
 observation `i` is `b[g, k]`, so `b[g, 1] .+ x .* b[g, 2]`. Draws are
-`b_sd`, `b_L` and `b_c`.
+`nt.b.sd`, `nt.b.L` and `nt.b.c`.
 """
 @rkppl varying_coefs_centered_correlated(g, K) = begin
     sd[1:K] .~ HalfNormal.(1)
@@ -491,7 +496,7 @@ end
 ```
 
 `u` is one value per observation: a varying intercept is `u`, a varying
-slope `x .* u`. Draws are `u_sd` and `u_z`.
+slope `x .* u`. Draws are `nt.u.sd` and `nt.u.z`.
 """
 @rkppl varying_stratified(g, s) = begin
     sd[levels(s)] .~ HalfNormal.(1)
@@ -523,7 +528,7 @@ end
 
 `u` has one row per observation: margin `k` is the column `u[:, k]`, so a
 correlated intercept and slope read `u[:, 1] .+ x .* u[:, 2]`. Draws are
-`u_sd`, `u_L` (`u_L[:, :, k]` stratum k's factor) and `u_z`.
+`nt.u.sd`, `nt.u.L` (`nt.u.L[:, :, k]` stratum k's factor) and `nt.u.z`.
 """
 @rkppl varying_stratified_correlated(g, s, K) = begin
     sd[levels(s), 1:K] .~ HalfNormal.(1)

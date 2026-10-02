@@ -158,54 +158,51 @@ function sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::Abst
     return Base.invokelatest(ad_value_and_gradient!, q.ad, g, Vector{Float64}(u))
 end
 
+function _stack_restored_draws(values)
+    value = first(values)
+    if value isa NamedTuple
+        names = Tuple(keys(value))
+        columns = map(names) do name
+            _stack_restored_draws([draw[name] for draw in values])
+        end
+        return NamedTuple{names}(Tuple(columns))
+    elseif value isa AbstractVector
+        return hcat([Vector{Float64}(draw) for draw in values]...)
+    elseif value isa AbstractArray
+        return [Array{Float64,ndims(value)}(draw) for draw in values]
+    end
+    return Float64[draw for draw in values]
+end
+
+function _empty_restored_draws(value::NamedTuple)
+    return map(_empty_restored_draws, value)
+end
+_empty_restored_draws(value::AbstractVector) = zeros(Float64, length(value), 0)
+_empty_restored_draws(value::AbstractArray) = Array{Float64,ndims(value)}[]
+_empty_restored_draws(::Real) = Float64[]
+
 """
     restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real}) -> NamedTuple
 
-Restore named constrained parameters from an unconstrained draws matrix `U`
-(`layout.total` rows × draws columns, e.g. HMC output). Returns a NamedTuple
-with one entry per layout entry — coefficient predictors map to
-`(size × draws)` matrices, sampled parameters to length-`draws` vectors,
-LKJ factors and derived correlated draws (`constrain`'s `L`/`b` matrices)
-to vectors of matrices — keyed exactly as [`constrain`](@ref). Each column
-is constrained independently through `constrain`, so transforms stay
-single-sourced.
+Restore constrained parameters from `U` (`layout.total` rows × draws
+columns), with the same nested author paths as [`constrain`](@ref).
+Scalar leaves become length-`draws` vectors, vector leaves become
+`size × draws` matrices, and higher-rank array leaves become vectors of arrays.
+Empty draws retain those keys and leaf shapes. Each column is constrained
+independently through `constrain`, so transforms stay single-sourced.
 """
 function restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real})
     size(U, 1) == layout.total || throw(ContractValidationError(
         "[query] draws rows $(size(U, 1)) ≠ layout total $(layout.total)"))
     n = size(U, 2)
     if n == 0
-        pairs = Pair{Symbol,Any}[]
-        for e in layout.entries
-            if e.kind === :coefficient
-                push!(pairs, e.predictor => Matrix{Float64}(undef, e.size, 0))
-            elseif e.kind === :varying_corr
-                push!(pairs, e.name => Vector{Matrix{Float64}}(undef, 0))
-            else
-                push!(pairs, e.name => Vector{Float64}(undef, 0))
-            end
-        end
-        # Derived draws ride at the end, exactly as `constrain` orders them.
-        for e in layout.entries
-            e.kind === :varying_corr || continue
-            sfx = string(e.name)[3:end]
-            push!(pairs, Symbol("b_", sfx) =>
-                Vector{Matrix{Float64}}(undef, 0))
-        end
-        return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
+        # The host transform supplies keys/shapes without evaluating a
+        # density. It also handles split coefficient blocks and derived
+        # matrix draws exactly as the nonempty path does.
+        return _empty_restored_draws(constrain(layout, zeros(layout.total)))
     end
     nts = map(1:n) do j
         constrain(layout, view(U, :, j))
     end
-    first_nt = first(nts)
-    names = Tuple(keys(first_nt))
-    cols = map(names) do k
-        v = first_nt[k]
-        v isa AbstractVector ?
-            hcat([Vector{Float64}(nt[k]) for nt in nts]...) :
-            v isa AbstractMatrix ?
-            [Matrix{Float64}(nt[k]) for nt in nts] :
-            Float64[nt[k] for nt in nts]
-    end
-    return NamedTuple{names}(Tuple(cols))
+    return _stack_restored_draws(nts)
 end

@@ -14,7 +14,7 @@ using Test
 
 const _SMF = @__MODULE__
 
-_smf_canon(plan) = sprint(_canon, plan)
+_smf_canon(plan) = sprint(_canon, _test_scope_math(plan))
 
 # The lowering outcome: the canonical plan, or the error text when lowering
 # refuses. A twin pair is transparent when both outcomes are equal — the
@@ -28,8 +28,11 @@ function _smf_outcome(ast, data; mod = _SMF)
     end
 end
 
-_smf_expand(ast, data = Set{Symbol}()) =
-    first(ReactiveKernelsPPL._expand_submodels(ast, Set{Symbol}(data), _SMF))
+function _smf_expand(ast, data = Set{Symbol}())
+    expanded, _, scopes = ReactiveKernelsPPL._expand_submodels(ast,
+        Set{Symbol}(data), _SMF; with_scopes = true)
+    return _test_scope_alpha(expanded, _test_scope_renames(scopes))
+end
 
 _smf_stmts(ex) = Any[a for a in ex.args if !(a isa LineNumberNode)]
 
@@ -232,8 +235,8 @@ end
             Expr(:for, :(i = eachindex(y)),
                 Expr(:block, :(theta[i] ~ smf_pcs_outer(mu, tau)))))))
     cells = _smf_stmts(got.args[1].args[end].args[2])
-    @test cells == [:(theta_z[i] ~ Normal(0, 1)),
-        :(theta[i] = mu .+ tau .* theta_z[i])]
+    @test cells == [:(theta_w_z[i] ~ Normal(0, 1)),
+        :(theta_w[i] = mu .+ tau .* theta_w_z[i]), :(theta[i] = theta_w[i])]
 end
 
 @testset "full submodels: plans equal their hand-inlined twins" begin
@@ -462,16 +465,17 @@ end
     end, D)
     @test !startswith(s6, "SurfaceLoweringError")
 
-    # Per-cell: a nested per-cell call equals the direct per-cell program.
-    pc(cell) = Expr(:block,
+    # Per-cell: the nested call keeps its namespace and equals the
+    # hand-written math using that distinct local path.
+    pc(cells...) = Expr(:block,
         :(mu ~ Normal(0, 5)), :(sigma ~ Exponential(1)), :(tau ~ Exponential(1)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
-                Expr(:block, cell, :(y[i] ~ Normal.(theta[i], sigma))))))
+                Expr(:block, cells..., :(y[i] ~ Normal.(theta[i], sigma))))))
     @test _smf_canon(lower_rkppl(pc(:(theta[i] ~ smf_pcs_outer(mu, tau))),
             (:y, :x); mod = _SMF)) ==
-        _smf_canon(lower_rkppl(pc(:(theta[i] ~ smf_pcs_ncp(mu, tau))),
-            (:y, :x); mod = _SMF))
+        _smf_canon(lower_rkppl(pc(:(theta_w_z[i] ~ Normal(0, 1)),
+            :(theta[i] = mu .+ tau .* theta_w_z[i])), (:y, :x); mod = _SMF))
 end
 
 @testset "full submodels: hierarchical density vs Distributions.jl" begin
@@ -489,9 +493,8 @@ end
     ng = length(unique(cols[:g]))
     u = collect(range(-0.4, 0.5; length = built.layout.total))
     nt = constrain(built.layout, u)
-    sg, sigma = nt.r_sg, nt.sigma
-    c = Vector(getproperty(nt, only(k for k in keys(nt)
-        if k ∉ (:r_sg, :sigma))))
+    sg, sigma = nt.r.sg, nt.sigma
+    c = Vector(nt.r.c)
     @test length(c) == ng
     lev = sort(unique(cols[:g]))
     cg = c[indexin(cols[:g], lev)]
@@ -512,17 +515,17 @@ end
     builtp = build_kernel(bp)
     up = collect(range(-0.3, 0.6; length = builtp.layout.total))
     ntp = constrain(builtp.layout, up)
-    theta = Vector(ntp.t_theta)
+    theta = Vector(ntp.t.theta)
     llp = sum(logpdf.(Normal.(theta, ntp.sigma), cols[:y]))
-    prp = logpdf(Exponential(1), ntp.sigma) + logpdf(Exponential(1), ntp.t_tau) +
-        sum(logpdf.(Normal.(cols[:x], ntp.t_tau), theta))
+    prp = logpdf(Exponential(1), ntp.sigma) + logpdf(Exponential(1), ntp.t.tau) +
+        sum(logpdf.(Normal.(cols[:x], ntp.t.tau), theta))
     @test _query(builtp.spec, bp, :likelihood, up) ≈ llp
     @test _query(builtp.spec, bp, :posterior, up) ≈
-        llp + prp + log(ntp.sigma) + log(ntp.t_tau)
+        llp + prp + log(ntp.sigma) + log(ntp.t.tau)
     _check_gradient(builtp.spec, bp, up)
 end
 
-@testset "full submodels: hygiene fails closed" begin
+@testset "full submodels: lexical hygiene and invalid bindings" begin
     D = (:y, :x)
     # A namespaced local that the program already binds.
     msg = _smf_errmsg(() -> lower_rkppl(quote
@@ -530,15 +533,13 @@ end
         z ~ smf_inner(x)
         y .~ Normal.(z .+ z_b, 1.0)
     end, D; mod = _SMF))
-    # capability: distinct lexical submodel paths coexist with author names (1f0p0fx; todo `0ewgf66`).
-    @test_broken isempty(msg)
+    @test isempty(msg)
     # ... or that is a data column.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         z ~ smf_inner(x)
         y .~ Normal.(z, 1.0)
     end, (:y, :x, :z_b); mod = _SMF))
-    # capability: distinct lexical submodel paths coexist with author names (1f0p0fx; todo `0ewgf66`).
-    @test_broken isempty(msg)
+    @test isempty(msg)
     # ... or that another expansion introduced (`a`'s local `b_c` and
     # `a_b`'s local `c` both namespace to `a_b_c`).
     msg = _smf_errmsg(() -> lower_rkppl(quote
@@ -546,15 +547,13 @@ end
         a_b ~ smf_c(x)
         y .~ Normal.(a .+ a_b, 1.0)
     end, D; mod = _SMF))
-    # capability: distinct lexical submodel paths coexist with author names (1f0p0fx; todo `0ewgf66`).
-    @test_broken isempty(msg)
+    @test isempty(msg)
     # ... or that appears in the call's arguments.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         z ~ smf_inner(z_b)
         y .~ Normal.(z, 1.0)
     end, (:y, :z_b); mod = _SMF))
-    # capability: distinct lexical submodel paths coexist with author names (1f0p0fx; todo `0ewgf66`).
-    @test_broken isempty(msg)
+    @test isempty(msg)
     # ... or that is a free name of the body (it would be captured).
     msg = _smf_errmsg(() -> lower_rkppl(quote
         z ~ smf_free(x)

@@ -102,9 +102,10 @@ Main.ReactiveKernelsDocs.render_rkppl_varying_definitions()
 
 To use a different prior, write the body at the use site and change its prior
 statement. With the priors unchanged, the library call and the written body
-lower to the same plan. Draw names carry the use-site prefix: `b_sd`, `b_z`,
-and, for correlated margins, `b_L`. Centered entries expose `b_c` instead of
-`b_z`; their coordinates are the coefficients themselves, so their densities
+have the same mathematical plan. Library draws use the call's namespace:
+`nt.b.sd`, `nt.b.z`, and, for correlated margins, `nt.b.L`. Centered entries
+expose `nt.b.c` instead of `nt.b.z`; their coordinates are the coefficients
+themselves, so their densities
 at a packed point differ from the non-centered entries.
 
 Centered correlated coefficients use ordinary row priors:
@@ -121,7 +122,7 @@ Main.ReactiveKernelsDocs.render_rkppl_corpus_example("27_varying_slope_lib.jl", 
 The stratified correlated entry returns rows already aligned with the
 observations. Its draws contain S×K scales, a K×K×S stack of factors, and J×K
 standard-normal coordinates, where S and J count the sorted distinct strata
-and groups. Read stratum k's factor as `r_L[:, :, k]`. The returned rows
+and groups. Read stratum k's factor as `nt.r.L[:, :, k]`. The returned rows
 currently support literal column reads; passing that result whole to a
 function or reading it by row is not supported yet.
 
@@ -244,6 +245,20 @@ it lowers exactly like the hand-inlined program. A submodel whose result is a
 response pointer is used as an observation stream: `y ~ stream(x, g)`.
 `Base.merge(model, override)` replaces or appends statements by name.
 
+Each call owns a lexical namespace. For `z ~ sm(x)`, `z.b` reads the
+submodel's local `b`, and bare `z` is the actual returned Julia value in
+arithmetic and function arguments. Nested calls compose paths: `z.w.b`.
+Locals never create caller bindings, so `a.b_c`, `a_b.c`, and a caller
+parameter or data value `a_b_c` coexist.
+
+Property access checks the local namespace first. If the scope has no local
+with that name, it reads a property of the returned value. Explicit
+`getproperty(z, :b)` always reads the returned value, even when `z.b` names
+a local. The caller can read sampled and deterministic locals, including
+data-only definitions, but cannot redefine them. Loop variables remain local
+to their loop. Per-cell calls support `theta[i].b` and the whole local array
+`theta.b`; their scalar-body restrictions still apply.
+
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_submodel_example()
 ```
@@ -274,6 +289,20 @@ restore_draws(built.layout, U)           # U: layout.total × draws
   are `a`, `b` and the constrained values are `nt.a`, `nt.b`.
   A level-sized declaration `c[levels(g)]` gives `c.1`, `c.2`, … and `nt.c`.
   Adding another reader preserves those names and the single declared prior.
+  A submodel parameter `b` in call `z` has coordinate `z.b` (a vector has
+  `z.b.1`, `z.b.2`, …) and constrained value `nt.z.b`. Nested calls return
+  nested NamedTuples, such as `nt.z.w.b`; `unconstrain` accepts that same
+  structure, and `restore_draws` stacks its leaves across draws. These
+  containers include sampled locals; deterministic locals, observed slots,
+  and submodel return values are read in the model itself.
+  Generated draw blocks keep their existing names under the call. If an
+  author local claims that name, the generated block gets the first free
+  numeric suffix; the author local keeps its name. Read `coordinate_names`
+  for the resulting block labels.
+  Rebuild prepared layouts and draw mappings when migrating from old
+  flattened names such as `z_b`. Unusual identifiers use Julia's `var"…"`
+  spelling in coordinate labels, so a literal name `var"z.b"` stays distinct
+  from the scoped path `z.b`.
   Explicit whole-predictor R2D2 and Horseshoe constructs retain their own
   coefficient layouts. Read `coordinate_names(built.layout)` and `constrain`;
   rebuild old prepared models and packed-draw mappings when migrating.

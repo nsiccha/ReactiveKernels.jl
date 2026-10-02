@@ -583,11 +583,12 @@ end
     pl = lib(; y = ydata)
     pb = builtin(; y = ydata)
     sc = only(pl.scans)
-    @test sc.states == [:x_level, :x_increment]
+    @test [_test_scope_name(pl, s) for s in sc.states] == [:x_level, :x_increment]
     @test [f.kind for f in sc.setup] == [:assign, :assign]
     @test isempty(pl.dar_paths)
     @test any(t -> t.kind === ScanSummandTerm &&
-        t.options == (scan_id = :x_level, coef = nothing),
+        _test_scope_name(pl, t.options.scan_id) === :x_level &&
+        t.options.coef === nothing,
         only(pl.predictors).terms)
     byname = Dict(p.name => p for p in pl.parameters)
     @test byname[:beta].support_override == (:interval, 0.0, 1.0)
@@ -597,6 +598,13 @@ end
     @test coordinate_names(bl.layout)[1:4] ==
         coordinate_names(bb.layout)[1:4]
     @test bl.layout.total == bb.layout.total == 4 + (length(ydata) - 1)
+    @test all(!occursin("##", string(n)) for n in coordinate_names(bl.layout))
+    u0 = zeros(bl.layout.total)
+    draws = constrain(bl.layout, u0)
+    @test length(draws.x._ppl_scan_z_level) == length(ydata) - 1
+    @test unconstrain(bl.layout, draws) ≈ u0
+    @test size(restore_draws(bl.layout, zeros(bl.layout.total, 0)).x._ppl_scan_z_level) ==
+        (length(ydata) - 1, 0)
     for u in ([0.1, 0.3, -0.5, -0.4, 0.2, -0.1, 0.4, 0.0],
               [-0.2, 0.6, 0.1, 0.3, -0.4, 0.2, -0.3, 0.1])
         vl = _query(bl.spec, pl, :posterior, u)
@@ -614,7 +622,7 @@ end
         y .~ Normal.(x, sigma)
     end
     pd = direct(; y = ydata)
-    @test only(pd.responses).predictor === :x_level
+    @test _test_scope_name(pd, only(pd.responses).predictor) === :x_level
     bd = build_kernel(pd)
     ud = [0.3, -0.5, -0.4, 0.2, -0.1, 0.4, 0.0]
     vd = _query(bd.spec, pd, :posterior, ud)
