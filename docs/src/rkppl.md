@@ -63,6 +63,18 @@ Scalar parameter priors include `Normal`, `Cauchy`, `Exponential`, `Gamma`,
 `Uniform` and `Weibull`. Arguments can read data, sampled parameters and
 ordinary definitions; scalar expressions such as `1 + exp(a)` are values too.
 
+Positive priors have the same normalized meaning in every slot:
+`HalfNormal(s)`, `HalfCauchy(s)` and their equivalent truncated Normal/Cauchy
+forms work for sampled parameters and the built-in varying and smooth scales. A bare
+`Normal(0, s)` or `Cauchy(0, s)` keeps its full support and is rejected in a
+positive scale slot. Write the explicit half or truncation instead.
+
+Support keywords on distribution constructors, such as
+`Normal(0, s; lower=0)`, are rejected. Use `truncated(Normal(0, s), 0, Inf)`.
+`Flat()` is an improper real prior and accepts no support keywords; choose
+`Exponential(s)` for a positive prior or `Uniform(lo, hi)` for a bounded
+uniform. These are proper densities and change an improper prior's model.
+
 `x ~ truncated(D, lo, hi)` uses the normalized Distributions.jl density for
 any of these univariate families. Bounds may be literals, model-level data,
 sampled values or scalar expressions; use `-Inf` or `Inf` for an open end.
@@ -103,6 +115,13 @@ Reactant limitation also applies to hierarchical Dirichlet priors.
   priors are translated as written.
 - Single assignment, no `if`, no `target +=`. Loops are written as
   `@plate` cells or `@scan` recurrences (see [Plates](#Plates)).
+
+A data-only call used only by a parameter-dependent function runs once when
+`prepare_query` or `prepare_sampler` prepares the graph. It may return a tuple or
+named tuple containing arrays. Named definitions, aliases and inline
+calls follow the same rule, including beside declared vector or matrix
+parameters. A value also needed during binding, such as a prior argument or an
+array dimension, keeps its bind-time evaluation and validation.
 
 ## Factor levels
 

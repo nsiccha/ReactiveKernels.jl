@@ -69,7 +69,7 @@ end
 const _SM_GPREGR = quote
     b0 ~ Normal(0, 1)
     rho ~ Gamma(25, 4)
-    sig ~ Normal(0, 2; lower = 0)
+    sig ~ HalfNormal(2)
     @plate for i in eachindex(y)
         z[i] ~ Normal(0, 1)
     end
@@ -83,7 +83,7 @@ end
 const _SM_GPPOIS = quote
     b0 ~ Normal(0, 1)
     rho ~ Gamma(25, 4)
-    sig ~ Normal(0, 2; lower = 0)
+    sig ~ HalfNormal(2)
     @plate for i in eachindex(counts)
         z[i] ~ Normal(0, 1)
     end
@@ -97,12 +97,12 @@ const _SM_ACCELGP = quote
     mu = b0 .+ hsgp(:h_x)
     hsgp_basis(:h_x, x; k = 8,
         length_scale = InverseGamma(1.124909, 0.0177),
-        sd = StudentT(3, 0, 36))
+        sd = truncated(StudentT(3, 0, 36), 0, Inf))
     s0 ~ StudentT(3, 0, 10)
     lsig = s0 .+ hsgp(:h_x2)
     hsgp_basis(:h_x2, x2; k = 8,
         length_scale = InverseGamma(1.124909, 0.0177),
-        sd = StudentT(3, 0, 36))
+        sd = truncated(StudentT(3, 0, 36), 0, Inf))
     y .~ Normal.(mu, exp.(lsig))
 end
 
@@ -117,8 +117,8 @@ const _SM_BRMHSGP = quote
 end
 
 const _SM_ACCELSPL = quote
-    spline_basis(:s_x, x; sd = StudentT(3, 0, 36))
-    spline_basis(:s_x2, x2; sd = StudentT(3, 0, 10))
+    spline_basis(:s_x, x; sd = truncated(StudentT(3, 0, 36), 0, Inf))
+    spline_basis(:s_x2, x2; sd = truncated(StudentT(3, 0, 10), 0, Inf))
     b0 ~ StudentT(3, -13, 36)
     s0 ~ StudentT(3, 0, 10)
     mu = b0 .+ spline(:s_x)
@@ -144,7 +144,7 @@ const _SM_DATA = (
     @test hb.rho_prior == HyperPrior(:inverse_gamma,
         (arg1 = 1.124909, arg2 = 0.0177))
     @test hb.sigma_prior == HyperPrior(:student_t,
-        (arg1 = 3.0, arg2 = 0.0, arg3 = 36.0))
+        (arg1 = 3.0, arg2 = 0.0, arg3 = 36.0), (:truncated,0.0,Inf))
     bound = bind_data(plan, _sm_cols(_SM_DATA.accelgp))
     lay = assign_layout(bound)
     tr = Dict(e.name => e.transform for e in lay.entries)
@@ -160,16 +160,15 @@ const _SM_DATA = (
         y = _SM_DATA.accelgp.y))))
     @test Dict(e.name => e.transform for e in dlay.entries)[:rho_h_x] ===
         :floored
-    # Stated spline sd prior rides the sd vector (Stan-kernel support).
+    # The stated normalized spline sd prior rides the sd vector.
     splan = lower_rkppl(_SM_ACCELSPL, (:y, :x, :x2); conditioned = (:y, :x, :x2))
     sd = only(v for v in splan.spline_vectors if v.name === :sd_s_x)
     @test sd.family === :student_t
     @test sd.args == (arg1 = 3.0, arg2 = 0.0, arg3 = 36.0)
-    @test sd.support_override === :positive_stan
+    @test sd.support_override == (:truncated,0.0,Inf)
     # Fail-closed: proper halves, unadmitted families, non-literal args,
     # wrong arity, and unknown keywords.
-    for bad in (:(HalfNormal(2)), :(Beta(1, 1)), :(Normal(0, s)),
-                :(StudentT(3, 0)), :(truncated(Normal(0, 1), 0, Inf)))
+    for bad in (:(Beta(1, 1)), :(Normal(0, s)), :(StudentT(3, 0)))
         ex = quote
             a ~ Normal(0, 1)
             s ~ Exponential(1)
@@ -193,8 +192,8 @@ const _SM_DATA = (
         hsgp_basis(:h_x, x; k = 8, lengthscale = LogNormal(0, 1))
         y .~ Normal.(mu, 1.0)
     end, (:y, :x); conditioned = (:y, :x))
-    # capability: HalfCauchy spline-sd hyper prior (proper half-distribution, honest spelling) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+    # HalfCauchy has the same normalized meaning in the smoothing slot.
+    @test (lower_rkppl(quote
         spline_basis(:s_x, x; sd = HalfCauchy(2))
         a ~ Normal(0, 1)
         mu = a .+ spline(:s_x)
@@ -260,24 +259,24 @@ end
     end
 end
 
-@testset "smooth SB parity" begin
+@testset "smooth SB references with normalization offsets" begin
     # gp_regr: P-gpregr (zeros) / P-gpregr2 (0.3^10); SB names
     # pop_mu_beta_pop.1, gp_x_rho, gp_x_sigma, gp_x_z.1-6,
     # pop_log_sigma_beta_pop.1.
     _, _, kern, lay = _sm_query(_SM_GPREGR, _sm_cols(_SM_DATA.gpregr))
     @test lay.total == 10
-    @test _sm_val(kern, zeros(10)) ≈ -105.04931360473961 atol = 1e-10
-    @test _sm_val(kern, fill(0.3, 10)) ≈ -100.4985934677729 atol = 1e-10
+    @test _sm_val(kern, zeros(10)) ≈ -105.04931360473961 + log(2) atol = 1e-10
+    @test _sm_val(kern, fill(0.3, 10)) ≈ -100.4985934677729 + log(2) atol = 1e-10
     # gp_pois_regr: P-gppois / P-gppois2 (n = 9).
     _, _, kern, lay = _sm_query(_SM_GPPOIS, _sm_cols(_SM_DATA.gppois))
     @test lay.total == 9
-    @test _sm_val(kern, zeros(9)) ≈ -116.10395556445295 atol = 1e-10
-    @test _sm_val(kern, fill(0.3, 9)) ≈ -102.26650368609637 atol = 1e-10
+    @test _sm_val(kern, zeros(9)) ≈ -116.10395556445295 + log(2) atol = 1e-10
+    @test _sm_val(kern, fill(0.3, 9)) ≈ -102.26650368609637 + log(2) atol = 1e-10
     # accel_gp: P-accelgp / P-accelgp2 (n = 22, k = 8 per basis).
     _, _, kern, lay = _sm_query(_SM_ACCELGP, _sm_cols(_SM_DATA.accelgp))
     @test lay.total == 22
-    @test _sm_val(kern, zeros(22)) ≈ -51.40896763818961 atol = 1e-10
-    @test _sm_val(kern, fill(0.3, 22)) ≈ -55.66616092236859 atol = 1e-10
+    @test _sm_val(kern, zeros(22)) ≈ -51.40896763818961 + 2log(2) atol = 1e-10
+    @test _sm_val(kern, fill(0.3, 22)) ≈ -55.66616092236859 + 2log(2) atol = 1e-10
     # brm_hsgp: P-brmhsgp / P-brmhsgp2 (real mcycle, k = 20 per basis,
     # coefficient-free `0 + hsgp(x)` location and log-scale).
     _, _, kern, lay = _sm_query(_SM_BRMHSGP, _sm_cols(_sm_mcycle()))
@@ -302,8 +301,8 @@ end
     t3(m, s, v) = logpdf(TDist(3), (v - m) / s) - log(s)
     bridge = t3(-13, 36, 0.6) - t3(-13, 36, 0.3) + t3(0, 10, 0.6) -
         t3(0, 10, 0.3)
-    @test _sm_val(kern, zeros(22)) ≈ -46.468310103713605 atol = 1e-10
-    @test _sm_val(kern, u) ≈ -69.1125421088841 + bridge atol = 1e-10
+    @test _sm_val(kern, zeros(22)) ≈ -46.468310103713605 + 2log(2) atol = 1e-10
+    @test _sm_val(kern, u) ≈ -69.1125421088841 + bridge + 2log(2) atol = 1e-10
 end
 
 @testset "grouped HSGP surface + contract" begin
@@ -320,7 +319,7 @@ end
     hb = only(lower_rkppl(base(kw(:by, :g)), cols; conditioned = cols).hsgp_bases)
     @test hb.by == HSGPGrouping(:g, nothing) && hb.rho_prior === nothing
     hb = only(lower_rkppl(base(kw(:by, :g),
-        kw(:length_scale, :((1 | g))), kw(:sd, :(Normal(0, 1)))),
+        kw(:length_scale, :((1 | g))), kw(:sd, :(HalfNormal(1)))),
         cols; conditioned = cols).hsgp_bases)
     @test hb.rho_prior == HSGPHyperLP(false, :g)
     @test hb.sigma_prior isa HyperPrior

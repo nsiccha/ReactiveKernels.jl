@@ -70,7 +70,7 @@ end
         for v in plan.spline_vectors]
     @test got == [(:b_s_x_fixed, :flat, NamedTuple(), nothing, 1, :s_x),
         (:b_s_x_raw, :normal, (arg1 = 0, arg2 = 1), nothing, 2, :s_x),
-        (:sd_s_x, :normal, (arg1 = 0, arg2 = 1), :positive_stan, 1, :s_x)]
+        (:sd_s_x, :normal, (arg1 = 0, arg2 = 1), :positive, 1, :s_x)]
     terms = only(plan.predictors).terms
     @test length(terms) == 2
     t = terms[2]
@@ -97,7 +97,7 @@ end
         :b_t2_xz_nr_raw, :sd_t2_xz]
     sd = only(v for v in plan.spline_vectors if v.name === :sd_t2_xz)
     @test (sd.family, sd.support_override, sd.width) ===
-        (:normal, :positive_stan, 3)
+        (:normal, :positive, 3)
     # Explicit kind + default k on `s`.
     plain = lower_rkppl(quote
             spline_basis(:s_x, x; kind = :tps)
@@ -509,7 +509,7 @@ function _ref_spline_tps(bound, nt)
     ll = sum(logpdf.(Normal.(eta, nt.sigma), bound.columns[:y]))
     pr = logpdf(Normal(0, 5), nt.a) + logpdf(Exponential(1), nt.sigma) +
         sum(logpdf.(Normal(0, 1), nt.b_s_x_raw)) +
-        logpdf(Normal(0, 1), nt.sd_s_x[1])  # `:positive_stan`: no +log(2)
+        logpdf(truncated(Normal(0, 1), 0, Inf), nt.sd_s_x[1])
     return (; ll, pr)
 end
 
@@ -531,17 +531,12 @@ end
     @test sqrt(sum(abs2, ones(n) .- B * (B \ ones(n)))) > 0.1 * sqrt(n)
 end
 
-# A stated smoothing-sd prior's support follows its family: real-support
-# families ride the Stan-kernel half (`:positive_stan`, plain `_lpdf`, no
-# `+log(2)`); positive-support families and the bounding `Uniform` keep
-# their own support and density. Positive families used to pass lowering
-# and then die at `build_kernel` ("positive_stan override needs a
-# real-support family").
+# Stated smoothing scales carry their normalized prior and explicit support.
 @testset "spline stated sd prior support follows its family" begin
     u = [0.3, 0.2, -0.1, 0.4, 0.0, -0.2]
     cases = (
-        (:(Normal(0, 2)), Normal(0, 2), :positive_stan),
-        (:(StudentT(3, 0, 2)), nothing, :positive_stan),
+        (:(HalfNormal(2)), truncated(Normal(0, 2),0,Inf), :positive),
+        (:(truncated(StudentT(3, 0, 2),0,Inf)), nothing, (:truncated,0.0,Inf)),
         (:(LogNormal(0, 1)), LogNormal(0, 1), nothing),
         (:(Gamma(2, 0.5)), Gamma(2, 0.5), nothing),
         (:(Exponential(2)), Exponential(2), nothing),
@@ -557,7 +552,7 @@ end
                 y .~ Normal.(mu, sigma)
             end, (:y, :x); conditioned = (:y, :x))
         sd = only(v for v in plan.spline_vectors if v.name === :sd_s_x)
-        @test sd.support_override === support
+        @test sd.support_override == support
         @test validate_structure(plan) === nothing
         bound = bind_data(plan, _spline_cols())
         built = build_kernel(bound)
@@ -565,7 +560,7 @@ end
         nt = constrain(built.layout, u)
         ref = _ref_spline_tps(bound, nt)
         s = nt.sd_s_x[1]
-        pr = ref.pr - logpdf(Normal(0, 1), s) + logpdf(dist, s)
+        pr = ref.pr - logpdf(truncated(Normal(0, 1),0,Inf), s) + logpdf(dist, s)
         jac = dist isa Uniform ? log(s) + log(10 - s) - log(10) : u[6]
         @test _query(built.spec, bound, :likelihood, u) ≈ ref.ll
         @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -574,7 +569,7 @@ end
         _check_gradient(built.spec, bound, u)
     end
     # A hand-built plan whose positive-family sd still carries the
-    # Stan-kernel override is refused by the contract.
+    # half override is refused by the contract.
     plan = lower_rkppl(quote
             spline_basis(:s_x, x; k = 4, sd = LogNormal(0, 1))
             a ~ Normal(0, 5)
@@ -584,8 +579,8 @@ end
     vs = copy(plan.spline_vectors)
     i = findfirst(v -> v.name === :sd_s_x, vs)
     vs[i] = SplineVector(vs[i].name, vs[i].family, vs[i].args,
-        :positive_stan, vs[i].width, vs[i].basis, vs[i].label)
-    # refused: positive-support sd family carrying the Stan-kernel override (IR contract)
+        :positive, vs[i].width, vs[i].basis, vs[i].label)
+    # refused: positive-support sd family carrying the half override (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; vectors = vs))
 end
@@ -631,7 +626,7 @@ function _ref_spline_t2(bound, nt)
         sum(logpdf.(Normal(0, 1), nt.b_t2_xz_rr_raw)) +
         sum(logpdf.(Normal(0, 1), nt.b_t2_xz_rn_raw)) +
         sum(logpdf.(Normal(0, 1), nt.b_t2_xz_nr_raw)) +
-        sum(logpdf.(Normal(0, 1), sd))  # `:positive_stan`: no +3log(2)
+        sum(logpdf.(truncated(Normal(0, 1), 0, Inf), sd))
     return (; ll, pr)
 end
 
@@ -737,7 +732,7 @@ end
         @test post ≈ ref.ll + ref.pr + u[2] + u[6]
         # SB full posterior -22.244895346304787 at u_sb, bridged.
         bridged = -22.244895346304787 - logpdf(Normal(0, 5), 0.3) +
-            logpdf(Normal(0, 5), 0.4)
+            logpdf(Normal(0, 5), 0.4) + log(2)
         @test abs(post - bridged) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
@@ -787,9 +782,9 @@ end
         post = _query(built.spec, bound, :posterior, u)
         jac = u[2] + u[end-2] + u[end-1] + u[end]
         @test post ≈ ref.ll + ref.pr + jac
-        @test abs(post - (-27.739270897924577)) < 1e-12
+        @test abs(post - (-27.739270897924577 + 3log(2))) < 1e-12
         # SB full posterior -27.739270897924584, 1 ulp from RK.
-        @test abs(post - (-27.739270897924584)) < 1e-12
+        @test abs(post - (-27.739270897924584 + 3log(2))) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
