@@ -741,18 +741,38 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
     _fail(label, "unsupported expression head $head in an array expression")
 end
 
-# `B * w`: a per-observation matrix — a bound data matrix `B`, or the
-# rows of an array gathered per observation (`z[g, :]`) — times an
-# array-valued expression: one value per observation (standard Julia
-# matrix-vector product).
+# `B * w`: a per-observation matrix — a bound data matrix `B` (supplied, or
+# a data-only module value the model computes at bind), or the rows of an
+# array gathered per observation (`z[g, :]`) — times an array-valued
+# expression: one value per observation (standard Julia matrix-vector
+# product).
 function _is_data_matvec(ex, plan::StructuralPlan)
     ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
         ex.args[1] === :* || return false
     B, w = ex.args[2], ex.args[3]
     rows = (B isa Symbol && !_is_array_param(plan, B) &&
-            !(B in _union_names(plan)) && !_is_derived(plan, B)) ||
+            !(B in _union_names(plan)) &&
+            (!_is_derived(plan, B) || _is_bind_data_derived(plan, B))) ||
         _is_row_gather(plan, B)
     return rows && _mentions_array(w, plan)
+end
+
+# A derived column the model computes at bind from data alone (a module
+# call reading only raw columns or other such columns): bound data, so
+# its value may be a matrix with one row per observation.
+function _is_bind_data_derived(plan::StructuralPlan, name::Symbol,
+        active::Set{Symbol} = Set{Symbol}())
+    i = findfirst(d -> d.name === name, plan.derived)
+    i === nothing && return false
+    ex = plan.derived[i].expr
+    _contains_module_call(ex) || return false
+    name in active && return false
+    push!(active, name)
+    known = _all_names(plan)
+    ok = all(s -> !(s in known) || _is_bind_data_derived(plan, s, active),
+        _expr_value_symbols(ex))
+    delete!(active, name)
+    return ok
 end
 
 # `z[g, :]`: the rows of a two-axis array value, one per observation.

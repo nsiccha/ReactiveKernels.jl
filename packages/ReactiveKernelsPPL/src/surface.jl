@@ -542,6 +542,7 @@ function _lower_rkppl(ast, data_names, scalars::Set{Symbol},
     end
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
+    ast = Expr(:block, _desugar_destructuring(ast.args)...)
     ast, data = _scalar_value_definitions(ast, data, scalars)
     ast, pins = _expand_submodels(ast, data, mod)
     # Fixed point over demotions: a coefficient candidate the affine path
@@ -606,6 +607,17 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     det = _hoist_prior_args!(sample, det, data, plate_specs;
         resolve = a -> _resolve_module_calls(a, mod, model_names,
             "prior argument `$(repr(a))`"))
+    # A data-only module value a response reads per observation is that
+    # observation column or matrix (user decision `0z5bsqi`, prong
+    # `in_model`): it lowers as data, computed once by `bind_data`, which
+    # checks its length or row count. Read whole, it stays model-level.
+    rawdata = data
+    aligned = _aligned_module_data(sample, det, data)
+    aligned_defs = Pair{Symbol,Any}[p for p in det if first(p) in aligned]
+    if !isempty(aligned)
+        data = union(data, aligned)
+        det = Pair{Symbol,Any}[p for p in det if first(p) ∉ aligned]
+    end
     # Varying bindings (draws + contributions): contributions compose
     # only as direct predictor summands, never inside definitions.
     varying_names = Set{Symbol}()
@@ -1022,6 +1034,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
             push!(assigns, _lower_assignment(nm, rhs, coefuse))
         end
     end
+    for (nm, rhs) in aligned_defs
+        push!(derived, VectorAssignmentSpec(nm, rhs, nm))
+    end
     append!(derived, ctx.synth_derived)
     append!(assigns, ctx.synth_assigns)
     _check_coefficient_readers(coefuse, ctx, predictors, priors, params,
@@ -1061,9 +1076,154 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
         array_parameters = arrays)
-    _confirm_whole_value_data(plan, data, waived; whole)
+    _confirm_whole_value_data(plan, rawdata, waived; whole)
     validate_structure(plan)
     return plan
+end
+
+# ── Destructuring and in-model data values ───────────────────────────
+# `(a, b) = rhs` (standard Julia destructuring): each name binds its
+# element, `a = Base.getindex(rhs, 1)`, `b = Base.getindex(rhs, 2)`, Julia's
+# tuple semantics (an extra element is dropped, a missing one is a
+# `BoundsError`). A data-only `rhs` is evaluated once by `bind_data`
+# (identical calls share one evaluation), so `(Xf, Zp) = tps_basis(x; k = 4)`
+# fits the basis once.
+_is_destructuring(st) =
+    st isa Expr && st.head === :(=) && length(st.args) == 2 &&
+    Meta.isexpr(st.args[1], :tuple) && !isempty(st.args[1].args) &&
+    all(a -> a isa Symbol, st.args[1].args)
+
+function _desugar_destructuring(stmts)
+    out = Any[]
+    for st in stmts
+        if _is_destructuring(st)
+            lhs, rhs = st.args
+            for (i, nm) in enumerate(lhs.args)
+                push!(out, Expr(:(=), nm, Expr(:call,
+                    Expr(:., :Base, QuoteNode(:getindex)),
+                    rhs isa Expr ? copy(rhs) : rhs, i)))
+            end
+        else
+            push!(out, st)
+        end
+    end
+    return out
+end
+
+# Data-only module values (`B = tps_basis(x; k = 4)`, `z = f(x)`: an
+# undotted module call reading only data) that a response needs per
+# observation, found from every `.~` response's distribution arguments
+# through definitions. The arguments broadcast against the response, so a
+# model-level value fits there (`Normal.(mu, s)`). One is needed per
+# observation only where a model-level value never fits: the matrix of a
+# data product (`B * w`), a term of a sum (`a .+ z`; a predictor's terms
+# are per observation), or a factor of such a term whose other operands
+# are all model-level (`a .+ b .* z`). Beside a per-observation operand
+# (`m .* x`) a model-level value broadcasts and stays model-level.
+# Module-call arguments, reductions, gathered values and the vector of a
+# data product are whole reads. A number bound as data (`_bound_value`)
+# is known at lowering and never needs a column.
+function _aligned_module_data(sample, det, data)
+    detmap = Dict{Symbol,Any}(det)
+    cands = Set{Symbol}(nm for (nm, rhs) in det
+        if _is_module_value_call(rhs) && !_is_bound_value_call(rhs) &&
+            _data_only(rhs, data, detmap))
+    aligned = Set{Symbol}()
+    isempty(cands) && return aligned
+    visited = Set{Tuple{Symbol,Bool}}()
+    for s in sample
+        s.broadcast && s.levels === nothing && s.matrix === nothing &&
+            s.dims === nothing || continue
+        (s.lhs in data || haskey(detmap, s.lhs)) || continue
+        # Each distribution argument broadcasts against the response.
+        rhs = s.rhs
+        slots = _is_dotted_call(rhs) ? rhs.args[2].args :
+            (rhs isa Expr && rhs.head === :call ? rhs.args[2:end] : Any[rhs])
+        for a in slots
+            _column_reads!(aligned, a, cands, detmap, visited, data, false)
+        end
+    end
+    return aligned
+end
+
+_is_module_value_call(ex) =
+    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+    ex.args[1] isa GlobalRef
+
+const _WHOLE_READ_FNS = (:size, :axes, :levels, :eachindex, :Ref)
+const _ADDITIVE_OPS = (:+, :-, :.+, :.-)
+
+# Record the data-only module values `ex` needs as observation columns.
+# `need`: `ex` itself must carry the observations (a term of a sum); in a
+# distribution argument, or beside a per-observation operand, it need not,
+# though the matrix of a data product always must (a model-level product
+# never mixes with a column).
+function _column_reads!(aligned, ex, cands, detmap, visited, data,
+        need::Bool = true)
+    walk(a, nd = need) =
+        _column_reads!(aligned, a, cands, detmap, visited, data, nd)
+    if ex isa Symbol
+        if ex in cands
+            need && push!(aligned, ex)
+        elseif haskey(detmap, ex) && !((ex, need) in visited)
+            push!(visited, (ex, need))
+            walk(detmap[ex])
+        end
+        return nothing
+    end
+    ex isa Expr || return nothing
+    if ex.head === :ref
+        # A gather `v[c]`: the value whole, the index per observation.
+        foreach(walk, ex.args[2:end])
+        return nothing
+    end
+    dotted = _is_dotted_call(ex)
+    ex.head === :call || dotted || (foreach(walk, ex.args); return nothing)
+    fn = ex.args[1]
+    fn isa GlobalRef && !dotted && return nothing
+    fn isa Symbol && (fn in REDUCTION_FNS || fn in _WHOLE_READ_FNS) &&
+        return nothing
+    args = dotted ? ex.args[2].args : ex.args[2:end]
+    if fn === :* && !dotted && length(args) == 2
+        # A data matrix times a vector: rows from the matrix, the vector
+        # whole. (`s * z`, a scalar times a column, reads both.)
+        walk(args[1], true)
+        _symbols_in(args[1], union(cands, data)) || walk(args[2])
+        return nothing
+    end
+    # Each term of a sum carries the observations itself.
+    fn in _ADDITIVE_OPS && return foreach(a -> walk(a, true), args)
+    # A product (or other elementwise call) carries them when any operand
+    # does; then the others may be model-level and broadcast.
+    any(a -> _reads_obs(a, data, detmap, Set{Symbol}()), args) &&
+        return foreach(a -> walk(a, false), args)
+    foreach(walk, args)
+    return nothing
+end
+
+# Does `ex` read data per observation (outside whole reads)?
+function _reads_obs(ex, data, detmap, active::Set{Symbol})
+    if ex isa Symbol
+        ex in data && return true
+        (haskey(detmap, ex) && !(ex in active)) || return false
+        push!(active, ex)
+        r = _reads_obs(detmap[ex], data, detmap, active)
+        delete!(active, ex)
+        return r
+    end
+    ex isa Expr || return false
+    ex.head === :ref && return any(a -> _reads_obs(a, data, detmap, active),
+        ex.args[2:end])
+    dotted = _is_dotted_call(ex)
+    if ex.head === :call || dotted
+        fn = ex.args[1]
+        fn isa GlobalRef && !dotted && return false
+        fn isa Symbol && (fn in REDUCTION_FNS || fn in _WHOLE_READ_FNS) &&
+            return false
+        args = dotted ? ex.args[2].args : ex.args[2:end]
+        return any(a -> _reads_obs(a, data, detmap, active), args)
+    end
+    return any(a -> _reads_obs(a, data, detmap, active), ex.args)
 end
 
 # A per-cell latent declaration reuses the scalar-parameter distribution
@@ -5988,8 +6148,9 @@ function _submodel_body_parts(sm::RKPPLSubmodel)
             "the use-site LHS — a bare `return` returns nothing")
         ret = unwrap
     end
-    stmts = Any[(st isa Expr && !_is_block_macro(st)) ? _unwrap_trivia(st) :
-        st for st in items[1:end-1]]
+    stmts = _desugar_destructuring(Any[
+        (st isa Expr && !_is_block_macro(st)) ? _unwrap_trivia(st) : st
+        for st in items[1:end-1]])
     for st in stmts
         Meta.isexpr(st, :return) && _sfail(
             "submodel `$(sm.name)`: `return` is only admitted as the " *
@@ -11959,6 +12120,8 @@ function _lower_truncated_param(lhs, rhs, coefuse, matrices)
         "parameter $lhs: `truncated` wraps a distribution object, got " *
         "$(repr(obj))")
     fam = obj.args[1]
+    fam === :LogNormal && return _lower_truncated_lognormal(lhs, obj, lo_a,
+        hi_a, coefuse, matrices)
     haskey(_TRUNCATED_BASES, fam) || _sfail(
         "parameter $lhs: `truncated` wraps a symmetric base " *
         "(`truncated(Normal(mu, s), lo, hi)`; admitted: Normal, Cauchy, " *
@@ -12005,6 +12168,31 @@ function _lower_truncated_param(lhs, rhs, coefuse, matrices)
         "(`truncated(Normal(mu, s), lo, hi)`); got $fam")
     return SampledParameter(lhs, base,
         (arg1 = vals[1], arg2 = vals[2]), (:interval, lo, hi), lhs)
+end
+
+# A lower-only truncation of a positive-support base,
+# `truncated(LogNormal(m, s), lo, Inf)` (user decision `0z5bsqi`, prong
+# `floor`: the subset the HSGP validity floor needs ahead of the general
+# `truncated` lane): `x = lo + exp(u)`, renormalized as in Distributions
+# (`-log P(X > lo)`). `lo` is a non-negative literal or the name of a
+# model-level data value (`rho_floor = maximum(hsgp_rho_floors(lambda))`),
+# read from the bound data.
+function _lower_truncated_lognormal(lhs, obj::Expr, lo_a, hi_a, coefuse,
+        matrices)
+    oargs = _plain_args(obj, "`LogNormal`")
+    length(oargs) == 2 ||
+        _sfail("parameter $lhs: `LogNormal` takes 2 arguments")
+    vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in oargs]
+    hi = _truncation_bound(lhs, hi_a)
+    isinf(hi) && hi > 0 || _sfail("parameter $lhs: a truncated LogNormal " *
+        "takes `Inf` as its upper bound (`truncated(LogNormal(m, s), lo, " *
+        "Inf)`), got $(repr(hi_a))")
+    lo = lo_a isa Symbol && lo_a !== :Inf ? lo_a : _truncation_bound(lhs, lo_a)
+    lo isa Symbol || (isfinite(lo) && lo >= 0) || _sfail("parameter $lhs: " *
+        "a truncated LogNormal's lower bound is a finite non-negative " *
+        "literal or a data name, got $(repr(lo_a))")
+    return SampledParameter(lhs, :lognormal, (arg1 = vals[1], arg2 = vals[2]),
+        (:lower, lo isa Symbol ? lo : Float64(lo)), lhs)
 end
 
 function _lower_assignment(nm, rhs, coefuse)
