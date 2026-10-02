@@ -1468,7 +1468,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
-        array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned)
+        array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned,
+        indexed_observations = intersect(Set{Symbol}(first(c) for c in plate_ctx),
+            Set{Symbol}(r.response for r in responses)))
     _confirm_whole_value_data(plan, rawdata, waived; whole)
     validate_structure(plan)
     return plan

@@ -348,20 +348,22 @@ function design_recipe(shape::DesignShape, n_rows::Int;
 end
 
 """
-    offset_recipe(shape; scalars, n_rows) -> Union{Nothing,Expr}
+    offset_recipe(shape; scalars, n_rows, broadcast) -> Union{Nothing,Expr}
 
-`_ppl_offset_<pred> = col1 + col2 + …` over offset-term columns, or
+`_ppl_offset_<pred> = col1 .+ col2 .+ …` over offset-term columns, or
 `nothing` when the predictor has no offset terms. Scalar assignments in
-`scalars` broadcast over `n_rows`, retaining their model-level evaluation.
+`scalars` expand over `n_rows` unless `broadcast` retains their scalar shape.
 """
-function offset_recipe(shape::DesignShape; scalars = Set{Symbol}(), n_rows = 0)
+function offset_recipe(shape::DesignShape; scalars = Set{Symbol}(), n_rows = 0,
+        broadcast = false)
     cols = Any[]
     for b in shape.blocks
         b.kind === OffsetTerm || continue
-        push!(cols, b.column in scalars ? :(ones($n_rows) .* $(b.column)) : b.column)
+        push!(cols, b.column in scalars && !broadcast ?
+            :(ones($n_rows) .* $(b.column)) : b.column)
     end
     isempty(cols) && return nothing
-    total = foldl((a, c) -> :($a + $c), cols)
+    total = foldl((a, c) -> :($a .+ $c), cols)
     name = offset_name(shape.predictor)
     return :($name = $total)
 end
@@ -389,7 +391,8 @@ function preprocessing_recipes(plan::StructuralPlan)
             append!(stmts, monotonic_recipe(t.options.increments,
                 only(t.columns), _monotonic_K(plan, t)))
         end
-        if !any(b -> b.kind === MonotonicTerm, shape.blocks)
+        if !_broadcast_affine(plan, pred) &&
+                !any(b -> b.kind === MonotonicTerm, shape.blocks)
             rows = _predictor_rows(plan, pred.name)
             recipe = design_recipe(shape, rows; plates)
             recipe !== nothing && push!(stmts, recipe)
@@ -397,7 +400,8 @@ function preprocessing_recipes(plan::StructuralPlan)
         scalars = Set{Symbol}(only(t.columns) for t in pred.terms
             if _is_scalar_offset(t, plan))
         rows = isempty(scalars) ? 0 : _located_rows(plan, pred)
-        off = offset_recipe(shape; scalars, n_rows = rows)
+        off = offset_recipe(shape; scalars, n_rows = rows,
+            broadcast = _broadcast_affine(plan, pred))
         off !== nothing && push!(stmts, off)
     end
     # GLM-object response matrices: one `X = Float64.(hcat(...))` recipe
@@ -413,6 +417,27 @@ function preprocessing_recipes(plan::StructuralPlan)
         push!(stmts, :($(m.name) = Float64.(hcat($(m.columns...)))))
     end
     return stmts
+end
+
+# Affine predictors with singleton or non-vector operands use the same
+# per-block mathematics as monotonic predictors, retaining Julia's
+# broadcast axes instead of assembling an hcat with forced n_obs rows.
+function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
+    _predictor_level(plan, pred.name) === :obs || return false
+    for t in pred.terms
+        t.kind in (ContinuousTerm, OffsetTerm, FactorTerm, ComposedTerm) || continue
+        for c in t.columns
+            col = get(plan.columns, c, nothing)
+            col isa AbstractArray || continue
+            (ndims(col) != 1 || length(col) != plan.n_obs) && return true
+        end
+    end
+    observations = _observation_axes(plan)
+    observations === nothing && return false
+    # Scalar-only affine predictors also retain scalar shape beside an
+    # array response or several independent observation domains.
+    return any(a -> length(a) != 1 || length(only(a)) != plan.n_obs,
+        values(observations.domains))
 end
 
 """Design row count of a predictor (obs-level: `n_obs`; subject-level:
