@@ -84,11 +84,11 @@ end
                 eta = a .+ b .* x
                 y .~ Weibull.(2.0, exp.(eta))
             end, _wb_cols())
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _wb_posterior(kern, lay, q)
-        th = exp.(q.eta[1] .+ q.eta[2] .* _WB_X)
+        th = exp.(q.a .+ q.b .* _WB_X)
         want = sum(_wb_ref(y, 2.0, t) for (y, t) in zip(_WB_Y, th)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "LogNormal-sampled k" begin
@@ -97,11 +97,11 @@ end
                 eta = a .+ b .* x
                 y .~ Weibull.(k, exp.(eta))
             end, _wb_cols())
-        q = (eta = [0.5, -0.25], k = 1.8)
+        q = (a = 0.5, b = -0.25, k = 1.8)
         got = _wb_posterior(kern, lay, q)
-        th = exp.(q.eta[1] .+ q.eta[2] .* _WB_X)
+        th = exp.(q.a .+ q.b .* _WB_X)
         want = sum(_wb_ref(y, q.k, t) for (y, t) in zip(_WB_Y, th)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(LogNormal(0.0, 0.3), q.k) +
             logjac(lay, unconstrain(lay, q))
         @test got ≈ want rtol = 1e-12
@@ -113,12 +113,12 @@ end
                 eta = a .+ b .* x
                 y .~ Weibull.(kc, exp.(eta))
             end, cols)
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _wb_posterior(kern, lay, q)
-        th = exp.(q.eta[1] .+ q.eta[2] .* _WB_X)
+        th = exp.(q.a .+ q.b .* _WB_X)
         want = sum(_wb_ref(y, kk, t)
             for (y, kk, t) in zip(_WB_Y, cols[:kc], th)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -143,14 +143,14 @@ end
         _wb_enzyme_check(quote
                 eta = a .+ b .* x
                 y .~ Weibull.(2.0, exp.(eta))
-            end, _wb_cols(), (eta = [0.5, -0.25],))
+            end, _wb_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "LogNormal-sampled k" begin
         _wb_enzyme_check(quote
                 k ~ LogNormal(0.0, 0.3)
                 eta = a .+ b .* x
                 y .~ Weibull.(k, exp.(eta))
-            end, _wb_cols(), (eta = [0.5, -0.25], k = 1.8))
+            end, _wb_cols(), (a = 0.5, b = -0.25, k = 1.8))
     end
     @testset "per-observation k column" begin
         cols = _wb_cols()
@@ -158,7 +158,7 @@ end
         _wb_enzyme_check(quote
                 eta = a .+ b .* x
                 y .~ Weibull.(kc, exp.(eta))
-            end, cols, (eta = [0.5, -0.25],))
+            end, cols, (a = 0.5, b = -0.25,))
     end
 end
 

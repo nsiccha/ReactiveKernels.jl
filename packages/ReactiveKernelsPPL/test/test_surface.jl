@@ -469,10 +469,10 @@ _hurdle_logpdf(y::Integer, lam::Real, p0::Real) =
     u4 = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u4)
     lam = exp.(nt.a .+ nt.b .* cols[:x])
-    p0 = 1 ./ (1 .+ exp.(-(nt.hu[1] .+ nt.hu[2] .* cols[:x])))
+    p0 = 1 ./ (1 .+ exp.(-(nt.c .+ nt.d .* cols[:x])))
     ll = sum(_hurdle_logpdf(y, l, p) for (y, l, p) in zip(cols[:y], lam, p0))
     pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
-        logpdf(Normal(0, 1), nt.hu[1]) + logpdf(Normal(0, 1), nt.hu[2])
+        logpdf(Normal(0, 1), nt.c) + logpdf(Normal(0, 1), nt.d)
     @test _query(built.spec, bound, :posterior, u4) ≈ ll + pr
     _check_gradient(built.spec, bound, u4)
 end
@@ -954,11 +954,11 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
     u4 = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u4)
     mu = 1 ./ (1 .+ exp.(.-(nt.a .+ nt.b .* cols[:x])))
-    phi = exp.(nt.hup[1] .+ nt.hup[2] .* cols[:x])
+    phi = exp.(nt.e .+ nt.f .* cols[:x])
     ll = sum(_betabinomial2_logpdf(y, t, mm, p)
         for (y, t, mm, p) in zip(cols[:c], cols[:n], mu, phi))
     pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
-        logpdf(Normal(0, 1), nt.hup[1]) + logpdf(Normal(0, 1), nt.hup[2])
+        logpdf(Normal(0, 1), nt.e) + logpdf(Normal(0, 1), nt.f)
     @test _query(built.spec, bound, :posterior, u4) ≈ ll + pr
     _check_gradient(built.spec, bound, u4)
 end
@@ -1969,12 +1969,12 @@ end
     built2 = build_kernel(bound2)
     u2 = [0.5, 0.2, -0.1, 0.0]
     nt2 = constrain(built2.layout, u2)
-    coef = Dict(1 => 0.0, 2 => nt2.mu[2], 3 => nt2.mu[3])
-    mu2 = [nt2.mu[1] + coef[g] for g in cols[:g]]
+    coef = Dict(1 => 0.0, 2 => nt2.c[1], 3 => nt2.c[2])
+    mu2 = [nt2.a + coef[g] for g in cols[:g]]
     si2 = nt2.s
     ll2 = sum(logpdf.(Normal.(mu2, si2), cols[:y]))
-    pr2 = logpdf(Normal(0, 1), nt2.mu[1]) +
-        sum(logpdf.(Normal(0, 2), Vector(nt2.mu)[2:3])) +
+    pr2 = logpdf(Normal(0, 1), nt2.a) +
+        sum(logpdf.(Normal(0, 2), nt2.c)) +
         logpdf(Exponential(1), si2)
     @test _query(built2.spec, bound2, :posterior, u2) ≈ ll2 + pr2 + u2[4]
     _check_gradient(built2.spec, bound2, u2)

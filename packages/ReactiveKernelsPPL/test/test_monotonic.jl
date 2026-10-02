@@ -379,9 +379,9 @@ end
     u2 = [-1.0, 2.0, -0.5, -0.7]
     nt2 = constrain(built.layout, u2)
     s2 = Vector{Float64}(nt2.s)
-    mu2 = nt2.mu[1] .+ nt2.mu[2] .* _ref_contrast(s2, cols[:c])
+    mu2 = nt2.a .+ nt2.b .* _ref_contrast(s2, cols[:c])
     ll2 = _ref_gauss_ll(cols[:y], mu2, nt2.sigma)
-    pr2 = logpdf(Normal(0, 1), nt2.mu[1]) + logpdf(Normal(0, 1), nt2.mu[2]) +
+    pr2 = logpdf(Normal(0, 1), nt2.a) + logpdf(Normal(0, 1), nt2.b) +
         logpdf(Exponential(1), nt2.sigma) + logpdf(Dirichlet(alpha), s2)
     @test _query(built.spec, bound, :posterior, u2) ≈
         ll2 + pr2 + u2[3] + simplex_logjac([u2[4]])

@@ -95,11 +95,11 @@ end
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), 1.5)
             end, _ig_cols())
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _ig_posterior(kern, lay, q)
-        mu = exp.(q.eta[1] .+ q.eta[2] .* _IG_X)
+        mu = exp.(q.a .+ q.b .* _IG_X)
         want = sum(_ig_ref(y, m, 1.5) for (y, m) in zip(_IG_Y, mu)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "LogNormal-sampled lambda" begin
@@ -108,11 +108,11 @@ end
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lam)
             end, _ig_cols())
-        q = (eta = [0.5, -0.25], lam = 1.2)
+        q = (a = 0.5, b = -0.25, lam = 1.2)
         got = _ig_posterior(kern, lay, q)
-        mu = exp.(q.eta[1] .+ q.eta[2] .* _IG_X)
+        mu = exp.(q.a .+ q.b .* _IG_X)
         want = sum(_ig_ref(y, m, q.lam) for (y, m) in zip(_IG_Y, mu)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(LogNormal(-0.3, 1.0), q.lam) +
             logjac(lay, unconstrain(lay, q))
         @test got ≈ want rtol = 1e-12
@@ -124,12 +124,12 @@ end
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lamc)
             end, cols)
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _ig_posterior(kern, lay, q)
-        mu = exp.(q.eta[1] .+ q.eta[2] .* _IG_X)
+        mu = exp.(q.a .+ q.b .* _IG_X)
         want = sum(_ig_ref(y, m, l)
             for (y, m, l) in zip(_IG_Y, mu, cols[:lamc])) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "modeled lambda" begin
@@ -138,14 +138,14 @@ end
                 ls = c .+ d .* z
                 y .~ InverseGaussian.(exp.(eta), exp.(ls))
             end, _ig_i1_cols())
-        q = (eta = [0.5, -0.25], ls = [0.3, -0.1])
+        q = (a = 0.5, b = -0.25, c = 0.3, d = -0.1)
         got = _ig_posterior(kern, lay, q)
-        mu = exp.(q.eta[1] .+ q.eta[2] .* _IG_I1_X)
-        lam = exp.(q.ls[1] .+ q.ls[2] .* _IG_I1_Z)
+        mu = exp.(q.a .+ q.b .* _IG_I1_X)
+        lam = exp.(q.c .+ q.d .* _IG_I1_Z)
         want = sum(_ig_ref(y, m, l)
             for (y, m, l) in zip(_IG_I1_Y, mu, lam)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
-            logpdf(Normal(0, 1), q.ls[1]) + logpdf(Normal(0, 1), q.ls[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+            logpdf(Normal(0, 1), q.c) + logpdf(Normal(0, 1), q.d)
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -170,21 +170,21 @@ end
         _ig_enzyme_check(quote
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), 1.5)
-            end, _ig_cols(), (eta = [0.5, -0.25],))
+            end, _ig_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "LogNormal-sampled lambda" begin
         _ig_enzyme_check(quote
                 lam ~ LogNormal(-0.3, 1.0)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lam)
-            end, _ig_cols(), (eta = [0.5, -0.25], lam = 1.2))
+            end, _ig_cols(), (a = 0.5, b = -0.25, lam = 1.2))
     end
     @testset "modeled lambda" begin
         _ig_enzyme_check(quote
                 eta = a .+ b .* x
                 ls = c .+ d .* z
                 y .~ InverseGaussian.(exp.(eta), exp.(ls))
-            end, _ig_i1_cols(), (eta = [0.5, -0.25], ls = [0.3, -0.1]))
+            end, _ig_i1_cols(), (a = 0.5, b = -0.25, c = 0.3, d = -0.1))
     end
 end
 

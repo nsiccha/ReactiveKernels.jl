@@ -89,11 +89,11 @@ end
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 0.35)
             end, _hur_cols())
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _hur_posterior(kern, lay, q)
-        lam = exp.(q.eta[1] .+ q.eta[2] .* _HUR_X)
+        lam = exp.(q.a .+ q.b .* _HUR_X)
         want = sum(_hur_ref(y, l, 0.35) for (y, l) in zip(_HUR_Y, lam)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "Beta-sampled p_zero" begin
@@ -102,11 +102,11 @@ end
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p_zero)
             end, _hur_cols())
-        q = (eta = [0.5, -0.25], p_zero = 0.4)
+        q = (a = 0.5, b = -0.25, p_zero = 0.4)
         got = _hur_posterior(kern, lay, q)
-        lam = exp.(q.eta[1] .+ q.eta[2] .* _HUR_X)
+        lam = exp.(q.a .+ q.b .* _HUR_X)
         want = sum(_hur_ref(y, l, q.p_zero) for (y, l) in zip(_HUR_Y, lam)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(Beta(2.0, 2.0), q.p_zero) +
             logjac(lay, unconstrain(lay, q))
         @test got ≈ want rtol = 1e-12
@@ -117,13 +117,13 @@ end
                 hu = c .+ d .* x
                 y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
             end, _hur_cols())
-        q = (eta = [0.5, -0.25], hu = [0.1, 0.2])
+        q = (a = 0.5, b = -0.25, c = 0.1, d = 0.2)
         got = _hur_posterior(kern, lay, q)
-        lam = exp.(q.eta[1] .+ q.eta[2] .* _HUR_X)
-        p0 = 1 ./ (1 .+ exp.(-(q.hu[1] .+ q.hu[2] .* _HUR_X)))
+        lam = exp.(q.a .+ q.b .* _HUR_X)
+        p0 = 1 ./ (1 .+ exp.(-(q.c .+ q.d .* _HUR_X)))
         want = sum(_hur_ref(y, l, p) for (y, l, p) in zip(_HUR_Y, lam, p0)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
-            logpdf(Normal(0, 1), q.hu[1]) + logpdf(Normal(0, 1), q.hu[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+            logpdf(Normal(0, 1), q.c) + logpdf(Normal(0, 1), q.d)
         @test got ≈ want rtol = 1e-12
     end
     @testset "per-observation p_zero column" begin
@@ -133,12 +133,12 @@ end
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p0c)
             end, cols)
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _hur_posterior(kern, lay, q)
-        lam = exp.(q.eta[1] .+ q.eta[2] .* _HUR_X)
+        lam = exp.(q.a .+ q.b .* _HUR_X)
         want = sum(_hur_ref(y, l, p)
             for (y, l, p) in zip(_HUR_Y, lam, cols[:p0c])) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "degenerate endpoints" begin
@@ -149,19 +149,19 @@ end
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 0.0)
             end, _hur_cols())
-        @test _hur_posterior(kern0, lay0, (eta = [0.5, -0.25],)) === -Inf
+        @test _hur_posterior(kern0, lay0, (a = 0.5, b = -0.25,)) === -Inf
         _, _, kern1, lay1 = _hur_query(quote
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 1.0)
             end, _hur_cols())
-        @test _hur_posterior(kern1, lay1, (eta = [0.5, -0.25],)) === -Inf
+        @test _hur_posterior(kern1, lay1, (a = 0.5, b = -0.25,)) === -Inf
         allzero = Dict{Symbol,AbstractVector}(:y => zeros(Int, 6),
             :x => copy(_HUR_X))
         _, _, kernz, layz = _hur_query(quote
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 1.0)
             end, allzero)
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         @test _hur_posterior(kernz, layz, q) ≈
             logpdf(Normal(0, 1), 0.5) + logpdf(Normal(0, 1), -0.25)
     end
@@ -187,21 +187,21 @@ end
         _hur_enzyme_check(quote
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 0.35)
-            end, _hur_cols(), (eta = [0.5, -0.25],))
+            end, _hur_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "Beta-sampled p_zero" begin
         _hur_enzyme_check(quote
                 p_zero ~ Beta(2.0, 2.0)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p_zero)
-            end, _hur_cols(), (eta = [0.5, -0.25], p_zero = 0.4))
+            end, _hur_cols(), (a = 0.5, b = -0.25, p_zero = 0.4))
     end
     @testset "predictor-fed p_zero" begin
         _hur_enzyme_check(quote
                 eta = a .+ b .* x
                 hu = c .+ d .* x
                 y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
-            end, _hur_cols(), (eta = [0.5, -0.25], hu = [0.1, 0.2]))
+            end, _hur_cols(), (a = 0.5, b = -0.25, c = 0.1, d = 0.2))
     end
 end
 

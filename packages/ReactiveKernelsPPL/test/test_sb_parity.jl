@@ -337,20 +337,20 @@ end
         :year => df.year, :year2 => df.year2, :year3 => df.year3)
     bound, built, kern, lay = _sb_query(prog, cols)
     names = coordinate_names(lay)
-    @test Set(names) == Set([Symbol("mu.Intercept"), Symbol("mu.year"),
-        Symbol("mu.year2"), Symbol("mu.year3")])
-    u = _sb_vec(names, [Symbol("mu.Intercept") => 0.2,
-        Symbol("mu.year") => 0.1, Symbol("mu.year2") => -0.05,
-        Symbol("mu.year3") => 0.03])
+    @test Set(names) == Set([:a, :b1,
+        :b2, :b3])
+    u = _sb_vec(names, [:a => 0.2,
+        :b1 => 0.1, :b2 => -0.05,
+        :b3 => 0.03])
     @test abs(Base.invokelatest(kern, u) - (-17.788101912439263)) < 1e-12
     prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
     g = similar(u)
     sampler_value_and_gradient!(prep, g, u)
     @test all(isfinite, g)
-    want = _sb_vec(names, [Symbol("mu.Intercept") => 10.062859779706784,
-        Symbol("mu.year") => -3.8913188535023844,
-        Symbol("mu.year2") => 30.397137846772317,
-        Symbol("mu.year3") => -8.606116623948758])
+    want = _sb_vec(names, [:a => 10.062859779706784,
+        :b1 => -3.8913188535023844,
+        :b2 => 30.397137846772317,
+        :b3 => -8.606116623948758])
     @test maximum(abs.(g .- want)) < 1e-10
     eta = 0.2 .+ 0.1 .* df.year .- 0.05 .* df.year2 .+ 0.03 .* df.year3
     wantv = sum(logpdf(Poisson(exp(e)), k)

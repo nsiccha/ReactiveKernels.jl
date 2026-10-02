@@ -376,18 +376,18 @@ end
 
 @testset "prior vocab values vs Distributions oracles" begin
     _, _, kern, lay = _pv_query(_PV_M1, _pv_cols())
-    @test _pv_posterior(kern, lay, (mu = [0.5, -0.25], s = 1.3)) ≈
+    @test _pv_posterior(kern, lay, (a = 0.5, b = -0.25, s = 1.3)) ≈
         _pv_m1_oracle(0.5, -0.25, 1.3) rtol = 1e-12
     _, _, kern, lay = _pv_query(_PV_M2, _pv_cols())
-    q = (mu = [0.25, 0.5], t = 1.5, l = -0.5, g = 2.25, s = 0.8)
+    q = (a = 0.25, b = 0.5, t = 1.5, l = -0.5, g = 2.25, s = 0.8)
     @test _pv_posterior(kern, lay, q) ≈
         _pv_m2_oracle(0.25, 0.5, 1.5, -0.5, 2.25, 0.8) rtol = 1e-12
     _, _, kern, lay = _pv_query(_PV_M3, _pv_cols())
-    q = (mu = [-0.5, 1.25], u = 0.5, h = 1.1, s = 2.0)
+    q = (a = -0.5, b = 1.25, u = 0.5, h = 1.1, s = 2.0)
     @test _pv_posterior(kern, lay, q) ≈
         _pv_m3_oracle(-0.5, 1.25, 0.5, 1.1, 2.0) rtol = 1e-12
     _, _, kern, lay = _pv_query(_PV_M4, _pv_gcols())
-    q = (mu = [0.3, -0.4, 0.1, 0.75],)
+    q = (c = [0.3, -0.4, 0.1], b = 0.75)
     @test _pv_posterior(kern, lay, q) ≈
         _pv_m4_oracle([0.3, -0.4, 0.1], 0.75) rtol = 1e-12
 end
@@ -408,12 +408,12 @@ function _pv_enzyme_check(prog::Expr, cols::Dict{Symbol,AbstractVector},
 end
 
 @testset "prior vocab Enzyme gradients" begin
-    _pv_enzyme_check(_PV_M1, _pv_cols(), (mu = [0.5, -0.25], s = 1.3))
+    _pv_enzyme_check(_PV_M1, _pv_cols(), (a = 0.5, b = -0.25, s = 1.3))
     _pv_enzyme_check(_PV_M2, _pv_cols(),
-        (mu = [0.25, 0.5], t = 1.5, l = -0.5, g = 2.25, s = 0.8))
+        (a = 0.25, b = 0.5, t = 1.5, l = -0.5, g = 2.25, s = 0.8))
     _pv_enzyme_check(_PV_M3, _pv_cols(),
-        (mu = [-0.5, 1.25], u = 0.5, h = 1.1, s = 2.0))
-    _pv_enzyme_check(_PV_M4, _pv_gcols(), (mu = [0.3, -0.4, 0.1, 0.75],))
+        (a = -0.5, b = 1.25, u = 0.5, h = 1.1, s = 2.0))
+    _pv_enzyme_check(_PV_M4, _pv_gcols(), (c = [0.3, -0.4, 0.1], b = 0.75))
 end
 
 @testset "prior vocab SB parity" begin
@@ -429,7 +429,7 @@ end
         @test g ≈ sbg rtol = 1e-9
     end
     # P1: StudentT intercept + Laplace slope.
-    _pv_sb_check(_PV_M1, _pv_cols(), (mu = [0.5, -0.25], s = 1.3),
+    _pv_sb_check(_PV_M1, _pv_cols(), (a = 0.5, b = -0.25, s = 1.3),
         -15.676861749966013,
         [5.393491124260353, 1.998520710059171, 3.491050295857985])
     # P2: Cauchy intercept + Flat slope (Flat is exactly 0.0 both sides).
@@ -439,13 +439,13 @@ end
             a ~ Cauchy(0, 1)
             b ~ Flat()
             s ~ Exponential(1)
-        end, _pv_cols(), (mu = [0.5, -0.25], s = 1.3),
+        end, _pv_cols(), (a = 0.5, b = -0.25, s = 1.3),
         -14.388851106658095,
         [4.7473372781065075, 0.9985207100591711, 3.491050295857985])
     # P3: factor StudentT broadcast + Cauchy slope, fixed s = 1.5 (SB
     # native order is [slope, cats]; the literal below is already in RK
     # [c1, c2, c3, b] order).
-    _pv_sb_check(_PV_M4, _pv_gcols(), (mu = [0.3, -0.4, 0.1, 0.75],),
+    _pv_sb_check(_PV_M4, _pv_gcols(), (c = [0.3, -0.4, 0.1], b = 0.75),
         -21.633064049357102,
         [0.07852219465122685, 3.2093567251461983, 1.5444721990933479,
             -2.565555555555555])
@@ -455,7 +455,7 @@ end
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             s ~ Uniform(0.5, 1.5)
-        end, _pv_cols(), (mu = [0.5, -0.25], s = 1.3),
+        end, _pv_cols(), (a = 0.5, b = -0.25, s = 1.3),
         -15.810050464119632,
         [5.047337278106507, 1.248520710059171, -0.1334091943559405])
     # P5: half-StudentT(4, 0, 1) scale — SB's `truncated(...; lower=0)`
@@ -465,7 +465,7 @@ end
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             s ~ truncated(StudentT(4, 0, 1), 0, Inf)
-        end, _pv_cols(), (mu = [0.5, -0.25], s = 1.3),
+        end, _pv_cols(), (a = 0.5, b = -0.25, s = 1.3),
         -14.883826525901483,
         [5.047337278106507, 1.248520710059171, 3.305988784434435])
     # P5 Stan-kernel twin: `:positive_stan` (emitter/hand path) is the
@@ -484,7 +484,7 @@ end
     bound = bind_data(plan, _pv_cols())
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
-    q = (mu = [0.5, -0.25], s = 1.3)
+    q = (a = 0.5, b = -0.25, s = 1.3)
     @test _pv_posterior(kern, built.layout, q) ≈
         -14.883826525901483 - log(2) rtol = 1e-12
     u = unconstrain(built.layout, q)
@@ -665,7 +665,7 @@ end
 end
 
 @testset "stan-kernel halves values vs Distributions oracles" begin
-    q = (mu = [0.5, -0.25], s = 1.3, t = 2.1)
+    q = (a = 0.5, b = -0.25, s = 1.3, t = 2.1)
     _, _, kern, lay = _pv_query(_PV_M5, _pv_cols())
     @test _pv_posterior(kern, lay, q) ≈
         _pv_m5_oracle(0.5, -0.25, 1.3, 2.1) rtol = 1e-12
@@ -676,7 +676,7 @@ end
 end
 
 @testset "stan-kernel halves Enzyme gradients" begin
-    _pv_enzyme_check(_PV_M5, _pv_cols(), (mu = [0.5, -0.25], s = 1.3, t = 2.1))
+    _pv_enzyme_check(_PV_M5, _pv_cols(), (a = 0.5, b = -0.25, s = 1.3, t = 2.1))
 end
 
 # Ladder-1 Reactant measure for the scalar-mu Stan-half leg: a scalar
@@ -741,13 +741,13 @@ _pv_m6_oracle(a::Real, s::Real) =
 _pv_ycols() = Dict{Symbol,AbstractVector}(:y => copy(_PV_Y))
 
 @testset "stan-kernel halves scalar-mu values" begin
-    q = (mu = [0.5], s = 1.3)
+    q = (a = 0.5, s = 1.3)
     _, _, kern, lay = _pv_query(_PV_M6, _pv_ycols())
     @test _pv_posterior(kern, lay, q) ≈ _pv_m6_oracle(0.5, 1.3) rtol = 1e-12
 end
 
 @testset "stan-kernel halves scalar-mu Enzyme gradients" begin
-    _pv_enzyme_check(_PV_M6, _pv_ycols(), (mu = [0.5], s = 1.3))
+    _pv_enzyme_check(_PV_M6, _pv_ycols(), (a = 0.5, s = 1.3))
 end
 
 @testset "stan-kernel halves scalar-mu under Reactant" begin
@@ -836,7 +836,7 @@ _pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
 end
 
 @testset "flat support values vs oracles" begin
-    q = (mu = [0.5, -0.25], s = 1.3, u = 50.0, w = 2.0)
+    q = (a = 0.5, b = -0.25, s = 1.3, u = 50.0, w = 2.0)
     _, _, kern, lay = _pv_query(_PV_M7, _pv_cols())
     @test _pv_posterior(kern, lay, q) ≈
         _pv_m7_oracle(0.5, -0.25, 1.3, 50.0, 2.0) rtol = 1e-12
@@ -844,7 +844,7 @@ end
 
 @testset "flat support Enzyme gradients" begin
     _pv_enzyme_check(_PV_M7, _pv_cols(),
-        (mu = [0.5, -0.25], s = 1.3, u = 50.0, w = 2.0))
+        (a = 0.5, b = -0.25, s = 1.3, u = 50.0, w = 2.0))
 end
 
 @testset "flat support under Reactant" begin
@@ -879,7 +879,7 @@ function _pv_m8_oracle(c::AbstractVector, b::Real, mua::Real, saa::Real,
         for (gi, x, y) in zip(_PV_G, _PV_X, _PV_Y))
     return pr + ll + log(saa) + log(s)
 end
-_pv_m8_q() = (mu = [0.3, -0.4, 0.1, 0.75], mu_alpha = 0.5,
+_pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
     sigma_alpha = 1.3, s = 1.1)
 
 @testset "centered factor priors admission" begin
@@ -1098,12 +1098,12 @@ _pv_m9_oracle(a::Real, b::Real, s::Real) =
 @testset "mixed flat scalar offset values vs oracles" begin
     _, _, kern, lay = _pv_query(_PV_M9, _pv_cols())
     # a ≠ b, so a misaligned prior read cannot hide.
-    @test _pv_posterior(kern, lay, (mu = [0.5, -0.25], s = 1.3)) ≈
+    @test _pv_posterior(kern, lay, (a = 0.5, b = -0.25, s = 1.3)) ≈
         _pv_m9_oracle(0.5, -0.25, 1.3) rtol = 1e-12
 end
 
 @testset "mixed flat scalar offset Enzyme gradients" begin
-    _pv_enzyme_check(_PV_M9, _pv_cols(), (mu = [0.5, -0.25], s = 1.3))
+    _pv_enzyme_check(_PV_M9, _pv_cols(), (a = 0.5, b = -0.25, s = 1.3))
 end
 
 @testset "mixed flat scalar offset under Reactant" begin
@@ -1135,7 +1135,7 @@ function _pv_m10_oracle(a::Real, b1::Real, b2::Real)
     jac = _pv_interval_logjac(-100, 0, b1) + _pv_interval_logjac(0, 100, b2)
     return pr + ll + jac
 end
-_pv_m10_q() = (mu = [0.5, -1.0, 2.0],)
+_pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0)
 
 @testset "uniform coefficients admission" begin
     plan = lower_rkppl(_PV_M10, (:y, :x, :z))
@@ -1152,7 +1152,7 @@ _pv_m10_q() = (mu = [0.5, -1.0, 2.0],)
     @test [(e.lo, e.hi) for e in coefs[2:3]] ==
         [(-100.0, 0.0), (0.0, 100.0)]
     @test coordinate_names(lay) ==
-        [Symbol("mu.Intercept"), Symbol("mu.x"), Symbol("mu.z")]
+        [:a, :b1, :b2]
     # Uniform factor broadcast lowers with literal bounds.
     fplan = lower_rkppl(quote
             c[levels(g)] .~ Uniform.(0, 10)

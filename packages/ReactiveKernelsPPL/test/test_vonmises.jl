@@ -111,11 +111,11 @@ end
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, 1.7)
             end, _vm_cols())
-        q = (mu = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _vm_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _VM_X
+        mu = q.a .+ q.b .* _VM_X
         want = sum(_vm_ref(y, m, 1.7) for (y, m) in zip(_VM_Y, mu)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "Gamma-sampled kappa, circular" begin
@@ -124,12 +124,12 @@ end
                 mu = a .+ b .* x
                 y .~ CircularVonMises.(mu, kappa, -pi, pi)
             end, _vm_cols())
-        q = (mu = [0.5, -0.25], kappa = 2.0)
+        q = (a = 0.5, b = -0.25, kappa = 2.0)
         got = _vm_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _VM_X
+        mu = q.a .+ q.b .* _VM_X
         want = sum(_vm_circ_ref(y, m, q.kappa, -Float64(pi), Float64(pi))
             for (y, m) in zip(_VM_Y, mu)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2]) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(Gamma(2.0, 0.1), q.kappa) +
             logjac(lay, unconstrain(lay, q))
         @test got ≈ want rtol = 1e-12
@@ -141,12 +141,12 @@ end
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, kappac)
             end, cols)
-        q = (mu = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _vm_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _VM_X
+        mu = q.a .+ q.b .* _VM_X
         want = sum(_vm_ref(y, m, k)
             for (y, m, k) in zip(_VM_Y, mu, cols[:kappac])) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "intercept-only log-kappa submodel" begin
@@ -155,14 +155,14 @@ end
                 lk = c
                 y .~ CircularVonMises.(mu, exp.(lk), -pi, pi)
             end, _vm_cols())
-        q = (mu = [0.5, -0.25], lk = [0.3])
+        q = (a = 0.5, b = -0.25, c = 0.3)
         got = _vm_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _VM_X
-        kap = exp(q.lk[1])
+        mu = q.a .+ q.b .* _VM_X
+        kap = exp(q.c)
         want = sum(_vm_circ_ref(y, m, kap, -Float64(pi), Float64(pi))
             for (y, m) in zip(_VM_Y, mu)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2]) +
-            logpdf(Normal(0, 1), q.lk[1])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+            logpdf(Normal(0, 1), q.c)
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -187,21 +187,21 @@ end
         _vm_enzyme_check(quote
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, 1.7)
-            end, _vm_cols(), (mu = [0.5, -0.25],))
+            end, _vm_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "Gamma-sampled kappa, circular" begin
         _vm_enzyme_check(quote
                 kappa ~ Gamma(2.0, 0.1)
                 mu = a .+ b .* x
                 y .~ CircularVonMises.(mu, kappa, -pi, pi)
-            end, _vm_cols(), (mu = [0.5, -0.25], kappa = 2.0))
+            end, _vm_cols(), (a = 0.5, b = -0.25, kappa = 2.0))
     end
     @testset "intercept-only log-kappa submodel" begin
         _vm_enzyme_check(quote
                 mu = a .+ b .* x
                 lk = c
                 y .~ CircularVonMises.(mu, exp.(lk), -pi, pi)
-            end, _vm_cols(), (mu = [0.5, -0.25], lk = [0.3]))
+            end, _vm_cols(), (a = 0.5, b = -0.25, c = 0.3))
     end
 end
 

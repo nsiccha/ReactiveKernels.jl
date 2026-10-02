@@ -807,9 +807,9 @@ end
         only(bound.predictors).terms)
     u = [0.2 * cos(i) for i in 1:built.layout.total]
     th = constrain(built.layout, u)
-    # The affine layout packs the intercept followed by the two slopes.
-    want = sum(logpdf.(Normal.(th.mu[1] .+
-        hcat(cols[:x], cols[:x2]) * th.mu[2:3] .+
+    # Draws report the intercept `a` and the matrix coefficient `b`.
+    want = sum(logpdf.(Normal.(th.a .+
+        hcat(cols[:x], cols[:x2]) * th.b .+
         2 .* exp.(th.s .* th.z)[cols[:c]], 1.0), cols[:y]))
     @test _fv_value(built, bound, :likelihood, u) ≈ want
 end

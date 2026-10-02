@@ -103,13 +103,13 @@ _zip_ref(y::Integer, lam::Real, zi::Real) =
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
             end, _zip_cols())
-        q = (eta = [0.5, -0.25], zeta = [0.1, 0.2])
+        q = (a = 0.5, b = -0.25, d = 0.1, e = 0.2)
         got = _zip_posterior(kern, lay, q)
-        lam = exp.(q.eta[1] .+ q.eta[2] .* _ZIP_X)
-        zi = 1 ./ (1 .+ exp.(-(q.zeta[1] .+ q.zeta[2] .* _ZIP_Z)))
+        lam = exp.(q.a .+ q.b .* _ZIP_X)
+        zi = 1 ./ (1 .+ exp.(-(q.d .+ q.e .* _ZIP_Z)))
         want = sum(_zip_ref(y, l, p) for (y, l, p) in zip(_ZIP_C, lam, zi)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
-            logpdf(Normal(0, 1), q.zeta[1]) + logpdf(Normal(0, 1), q.zeta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+            logpdf(Normal(0, 1), q.d) + logpdf(Normal(0, 1), q.e)
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -135,7 +135,7 @@ end
                 eta = a .+ b .* x
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
-            end, _zip_cols(), (eta = [0.5, -0.25], zeta = [0.1, 0.2]))
+            end, _zip_cols(), (a = 0.5, b = -0.25, d = 0.1, e = 0.2))
     end
 end
 

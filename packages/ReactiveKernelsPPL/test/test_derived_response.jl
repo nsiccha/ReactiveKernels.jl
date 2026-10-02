@@ -196,12 +196,12 @@ end
 
 @testset "derived response values vs oracles" begin
     _, _, kern, lay = _pv_query(_DR_M1, _dr_cols())
-    @test _pv_posterior(kern, lay, (mu = [0.5, -0.25], s = 1.3)) ≈
+    @test _pv_posterior(kern, lay, (b1 = 0.5, b2 = -0.25, s = 1.3)) ≈
         _dr_m1_oracle(0.5, -0.25, 1.3) rtol = 1e-12
 end
 
 @testset "derived response Enzyme gradients" begin
-    _pv_enzyme_check(_DR_M1, _dr_cols(), (mu = [0.5, -0.25], s = 1.3))
+    _pv_enzyme_check(_DR_M1, _dr_cols(), (b1 = 0.5, b2 = -0.25, s = 1.3))
 end
 
 @testset "derived response under Reactant" begin

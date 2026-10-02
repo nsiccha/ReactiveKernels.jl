@@ -31,7 +31,7 @@ function _dv_check_regression(bound, sd)
     built = _dv_built(bound)
     a, b = ReactiveKernelsPPL.constrain(built.layout, _DV_U).mu
     @test coordinate_names(built.layout) ==
-        [Symbol("mu.Intercept"), Symbol("mu.x")]
+        [:a, :b]
     @test _dv_value(built, bound, :likelihood, _DV_U) ≈
         sum(logpdf.(Normal.(a .+ b .* _DV_X, sd), _DV_Y))
 end
