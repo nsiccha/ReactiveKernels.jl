@@ -38,6 +38,8 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
 @testset "ln surface admission" begin
     @testset "literal sigma" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, 0.5)
             end, (:y, :x))
@@ -53,6 +55,8 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
     end
     @testset "Exponential-sampled sigma" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 sigma ~ Exponential(1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, sigma)
@@ -63,6 +67,8 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
     end
     @testset "per-observation sigma column" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, sigmac)
             end, (:y, :x, :sigmac))
@@ -70,6 +76,10 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
     end
     @testset "modeled sigma deferred" begin
         @test_throws ContractValidationError lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 mu = a .+ b .* x
                 ls = c .+ d .* x
                 y .~ LogNormal.(mu, exp.(ls))
@@ -80,6 +90,8 @@ end
 @testset "ln value parity" begin
     @testset "literal sigma" begin
         _, _, kern, lay = _ln_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, 0.5)
             end, _ln_cols())
@@ -92,6 +104,8 @@ end
     end
     @testset "Exponential-sampled sigma" begin
         _, _, kern, lay = _ln_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 sigma ~ Exponential(1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, sigma)
@@ -109,6 +123,8 @@ end
         cols = _ln_cols()
         cols[:sigmac] = [0.5, 1.5, 2.5, 1.0, 2.0, 0.8]
         _, _, kern, lay = _ln_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, sigmac)
             end, cols)
@@ -140,12 +156,16 @@ end
 @testset "ln Enzyme gradients" begin
     @testset "literal sigma" begin
         _ln_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, 0.5)
             end, _ln_cols(), (mu = [0.5, -0.25],))
     end
     @testset "Exponential-sampled sigma" begin
         _ln_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 sigma ~ Exponential(1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, sigma)
@@ -169,6 +189,8 @@ end
 
 @testset "ln emission is O(1) in n_obs" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         sigma ~ Exponential(1)
         mu = a .+ b .* x
         y .~ LogNormal.(mu, sigma)
@@ -211,10 +233,14 @@ end
 @testset "ln under Reactant" begin
     progs = [
         ("literal sigma", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ LogNormal.(mu, 0.5)
         end, _ln_cols()),
         ("Exponential-sampled sigma", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             sigma ~ Exponential(1)
             mu = a .+ b .* x
             y .~ LogNormal.(mu, sigma)

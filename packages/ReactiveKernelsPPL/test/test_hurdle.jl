@@ -39,6 +39,8 @@ _hur_cols() = Dict{Symbol,AbstractVector}(:y => copy(_HUR_Y), :x => copy(_HUR_X)
 @testset "hurdle surface admission" begin
     @testset "literal p_zero" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 0.35)
             end, (:y, :x))
@@ -54,6 +56,8 @@ _hur_cols() = Dict{Symbol,AbstractVector}(:y => copy(_HUR_Y), :x => copy(_HUR_X)
     end
     @testset "Beta-sampled p_zero" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 p_zero ~ Beta(2.0, 2.0)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p_zero)
@@ -64,6 +68,10 @@ _hur_cols() = Dict{Symbol,AbstractVector}(:y => copy(_HUR_Y), :x => copy(_HUR_X)
     end
     @testset "predictor-fed p_zero (hu submodel)" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 hu = c .+ d .* x
                 y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
@@ -76,6 +84,8 @@ _hur_cols() = Dict{Symbol,AbstractVector}(:y => copy(_HUR_Y), :x => copy(_HUR_X)
     end
     @testset "per-observation p_zero column" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p0c)
             end, (:y, :x, :p0c))
@@ -86,6 +96,8 @@ end
 @testset "hurdle value parity" begin
     @testset "literal p_zero" begin
         _, _, kern, lay = _hur_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 0.35)
             end, _hur_cols())
@@ -98,6 +110,8 @@ end
     end
     @testset "Beta-sampled p_zero" begin
         _, _, kern, lay = _hur_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 p_zero ~ Beta(2.0, 2.0)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p_zero)
@@ -113,6 +127,10 @@ end
     end
     @testset "predictor-fed p_zero" begin
         _, _, kern, lay = _hur_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 hu = c .+ d .* x
                 y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
@@ -130,6 +148,8 @@ end
         cols = _hur_cols()
         cols[:p0c] = [0.1, 0.5, 0.9, 0.2, 0.6, 0.3]
         _, _, kern, lay = _hur_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p0c)
             end, cols)
@@ -146,11 +166,15 @@ end
         # zeros it is the zero-truncated Poisson. p_zero = 1 with any
         # positive y is -Inf; all-zero y is 0.0 likelihood.
         _, _, kern0, lay0 = _hur_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 0.0)
             end, _hur_cols())
         @test _hur_posterior(kern0, lay0, (eta = [0.5, -0.25],)) === -Inf
         _, _, kern1, lay1 = _hur_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 1.0)
             end, _hur_cols())
@@ -158,6 +182,8 @@ end
         allzero = Dict{Symbol,AbstractVector}(:y => zeros(Int, 6),
             :x => copy(_HUR_X))
         _, _, kernz, layz = _hur_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 1.0)
             end, allzero)
@@ -185,12 +211,16 @@ end
 @testset "hurdle Enzyme gradients" begin
     @testset "literal p_zero" begin
         _hur_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 0.35)
             end, _hur_cols(), (eta = [0.5, -0.25],))
     end
     @testset "Beta-sampled p_zero" begin
         _hur_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 p_zero ~ Beta(2.0, 2.0)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p_zero)
@@ -198,6 +228,10 @@ end
     end
     @testset "predictor-fed p_zero" begin
         _hur_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 hu = c .+ d .* x
                 y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
@@ -221,6 +255,10 @@ end
 
 @testset "hurdle emission is O(1) in n_obs" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         hu = c .+ d .* x
         y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
@@ -259,10 +297,16 @@ end
 @testset "hurdle under Reactant" begin
     progs = [
         ("literal p_zero", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ HurdlePoisson.(exp.(eta), 0.35)
         end, _hur_cols()),
         ("predictor-fed p_zero", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             eta = a .+ b .* x
             hu = c .+ d .* x
             y .~ HurdlePoisson.(exp.(eta), logistic.(hu))

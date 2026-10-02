@@ -25,6 +25,7 @@ const _CB_G = [isodd(i) ? 1 : 2 for i in 1:_CB_N]
 
 const _CB_ADMITTED = (
     ("horseshoe x mixture", quote
+        a1 ~ Normal(0, 1)
         b1 ~ Horseshoe()
         b2 ~ Horseshoe(local_scale = 0.5, global_scale = 0.25)
         mu1 = a1 .+ b1 .* x1 .+ b2 .* x2
@@ -34,6 +35,7 @@ const _CB_ADMITTED = (
             [0.3, 0.7])
     end, (; y = _CB_Y, x1 = _CB_X, x2 = _CB_X2), 9),
     ("hsgp x mixture", quote
+        a1 ~ Normal(0, 1)
         hsgp_basis(:h, x; k = 6)
         mu1 = a1 .+ hsgp(:h)
         mu2 ~ Normal(0.0, 5.0)
@@ -42,6 +44,7 @@ const _CB_ADMITTED = (
             [0.3, 0.7])
     end, (; y = _CB_Y, x = _CB_X), 11),
     ("hsgp x me", quote
+        a ~ Normal(0, 1)
         hsgp_basis(:h, x; k = 6)
         b ~ Normal(0, 2)
         sigma ~ Exponential(1)
@@ -53,6 +56,8 @@ const _CB_ADMITTED = (
         z_obs .~ Normal.(z_true, 0.5)
     end, (; y = _CB_Y, x = _CB_X, z_obs = _CB_X2), 23),
     ("grouped hsgp x student_t", quote
+        a ~ Normal(0, 1)
+        c0 ~ Normal(0, 1)
         hsgp_basis(:h, x; k = 6, by = grp, length_scale = 1 + (1 | grp),
             sd = (1 | grp))
         r ~ varying_effect(grp, [1])
@@ -96,6 +101,7 @@ end
     # horseshoe x hsgp: the horseshoe slice covers intercept/continuous
     # coefficients only.
     m = msg(quote
+        a ~ Normal(0, 1)
         b1 ~ Horseshoe()
         hsgp_basis(:h, x; k = 6)
         eta = a .+ b1 .* x2 .+ hsgp(:h)

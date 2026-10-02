@@ -6,6 +6,7 @@ using ReactiveKernelsKernelExamples
 using ReactiveKernelsHMCDiagnostics
 using ReactiveKernelsNUTSExamples
 using ReactiveKernelsPPLExamples
+using ReactiveKernelsPPL
 using ReactiveKernelsStreamingStats
 using ReactiveKernelsReactantODESolvers
 
@@ -37,6 +38,7 @@ include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_docs_interactions.jl"
 
 include("kernel_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
+Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "rkppl_page.jl"))
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "all80_comparison_tables.jl"))
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "all80_benchmark_plots.jl"))
 include("check_rendered.jl")
@@ -55,6 +57,8 @@ site_pages = [
         "Batched log densities" => "batched.md",
     ],
     "Probabilistic programming" => [
+        "Writing models with @rkppl" => "rkppl.md",
+        "Smooths and HSGPs with @rkppl" => "rkppl-smooths.md",
         "Eight schools" => "eight-schools.md",
         "Sum-to-zero recovery" => "sum-to-zero.md",
         "MNIST multinomial logistic" => "mnist-logistic.md",

@@ -164,6 +164,9 @@ end
     end
     @test_throws SurfaceLoweringError lower_rkppl(dup, Set([:x1, :x2, :y]))
     ghost = quote
+        a ~ Normal(0, 1)
+        b1 ~ Normal(0, 1)
+        b2 ~ Normal(0, 1)
         R2 ~ Beta(1.0, 1.0)
         phi ~ Dirichlet([1.0, 1.0])
         mu = a .+ b1 .* x1 .+ b2 .* x2

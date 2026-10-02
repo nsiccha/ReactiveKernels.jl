@@ -32,6 +32,8 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
 @testset "mixture surface admission" begin
     @testset "predictor + param locations, shared scale" begin
         plan = lower_rkppl(quote
+                a1 ~ Normal(0, 1)
+                b1 ~ Normal(0, 1)
                 mu1 = a1 .+ b1 .* x
                 mu2 ~ Normal(0.0, 5.0)
                 sigma ~ Exponential(1.0)
@@ -89,6 +91,8 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
     end
     @testset "scale-predictor anchor" begin
         plan = lower_rkppl(quote
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 ls = c .+ d .* x
                 mu1 ~ Normal(0.0, 5.0)
                 y .~ MixtureModel.([Normal.(mu1, exp.(ls)),
@@ -100,6 +104,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
     end
     @testset "intercept-only scale predictor (SB log(sigma) ~ 1)" begin
         plan = lower_rkppl(quote
+                c ~ Normal(0, 1)
                 mu1 ~ Normal(-2.0, 0.1)
                 mu2 ~ Normal(2.0, 0.1)
                 sigma = c
@@ -114,9 +119,13 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
         @test [t.kind for t in pred.terms] == [InterceptTerm]
         @test isempty(plan.derived)
     end
-    @testset "intercept-only location predictor (SB mu ~ 1)" begin
+    @testset "constant location is a declared parameter (SB mu ~ 1)" begin
+        # Strict declarations: the intercept-only location slot (an
+        # undeclared `mu1 = c`) is gone. A constant location is a declared
+        # scalar spelled bare; an alias of one fails (the battery's
+        # "stated scalar loc alias").
         plan = lower_rkppl(quote
-                mu1 = c
+                mu1 ~ Normal(0, 1)
                 mu2 ~ Normal(0.0, 5.0)
                 sigma ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(mu1, sigma),
@@ -124,13 +133,15 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
             end, (:y,))
         r = only(plan.responses)
         @test r.mixture_locs == [:mu1, :mu2]
-        @test r.predictor === :mu1 # Anchor: first location predictor.
-        pred = only(p for p in plan.predictors if p.name === :mu1)
-        @test [t.kind for t in pred.terms] == [InterceptTerm]
+        @test r.predictor === :mu1 # Anchor: first location.
+        @test isempty(plan.predictors)
+        @test [q.name for q in plan.parameters] == [:mu1, :mu2, :sigma]
         @test isempty(plan.derived)
     end
     @testset "alternate heads desugar per component" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 phi ~ Exponential(1.0)
                 y .~ MixtureModel.([NegativeBinomial2Log.(mu, phi),
@@ -309,6 +320,8 @@ end
             end), ContractValidationError),
         ("Bernoulli prob domain",
             :(begin
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                     Bernoulli.(1.5)], [0.5, 0.5])
@@ -339,8 +352,9 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s)], Float64[])
             end), SurfaceLoweringError),
         # A scalar alias over a stated prior reads like the name itself
-        # (a sampled parameter — spell it bare), so it never routes to
-        # the intercept-only location slot (undeclared `mu ~ 1` only).
+        # (a sampled parameter — spell it bare). It never routes to the
+        # intercept-only location slot, which only an undeclared name
+        # reached (gone under strict declarations).
         ("stated scalar loc alias",
             :(begin
                 c ~ Normal(0.0, 5.0)
@@ -447,6 +461,8 @@ end
     end
     @testset "gaussian predictor + param" begin
         prog = quote
+            a1 ~ Normal(0, 1)
+            b1 ~ Normal(0, 1)
             mu1 = a1 .+ b1 .* x
             mu2 ~ Normal(0.0, 5.0)
             sigma ~ Exponential(1.0)
@@ -472,6 +488,8 @@ end
     @testset "bernoulli predictor + literal" begin
         for ycol in ([0, 1, 1, 0], [false, true, true, false])
             prog = quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                     Bernoulli.(0.7)], [0.5, 0.5])
@@ -509,6 +527,8 @@ end
     end
     @testset "binomial predictor + literal, column trials" begin
         prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ MixtureModel.([Binomial.(n, logistic.(eta)),
                 Binomial.(n, 0.25)], [0.6, 0.4])
@@ -530,6 +550,8 @@ end
     end
     @testset "nb2 predictor + param means" begin
         prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             mu2 ~ Gamma(2.0, 1.0)
             phi1 ~ Exponential(1.0)
@@ -556,6 +578,8 @@ end
     end
     @testset "gamma predictor + param means, shared shape" begin
         prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             alpha ~ Exponential(1.0)
             mu2 ~ Gamma(2.0, 1.0)
@@ -580,6 +604,8 @@ end
     end
     @testset "beta predictor + literal means, shared kappa" begin
         prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             kappa ~ Exponential(1.0)
             y .~ MixtureModel.([Beta.(logistic.(eta) .* kappa,
@@ -649,6 +675,8 @@ end
     end
     @testset "bernoulli" begin
         _mix_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                     Bernoulli.(0.7)], [0.5, 0.5])
@@ -665,6 +693,8 @@ end
     end
     @testset "binomial" begin
         _mix_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Binomial.(n, logistic.(eta)),
                     Binomial.(n, 0.25)], [0.6, 0.4])
@@ -673,6 +703,8 @@ end
     end
     @testset "nb2" begin
         _mix_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 mu2 ~ Gamma(2.0, 1.0)
                 phi1 ~ Exponential(1.0)
@@ -684,6 +716,8 @@ end
     end
     @testset "gamma" begin
         _mix_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 alpha ~ Exponential(1.0)
                 mu2 ~ Gamma(2.0, 1.0)
@@ -694,6 +728,8 @@ end
     end
     @testset "beta" begin
         _mix_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 kappa ~ Exponential(1.0)
                 y .~ MixtureModel.([Beta.(logistic.(eta) .* kappa,
@@ -784,6 +820,8 @@ end
             y .~ MixtureModel.([Poisson.(lam1), Poisson.(4.0)], [0.3, 0.7])
         end, Dict{Symbol,AbstractVector}(:y => [1, 0, 3, 2])),
         ("bernoulli", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                 Bernoulli.(0.7)], [0.5, 0.5])
@@ -859,6 +897,7 @@ _mix_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         #     [0.4, 0.6]); y = [-2.0, -1.8, 1.9, 2.2];
         # u (SB order [mu1, mu2, sigma]) = [-2.0, 2.0, log(0.3)].
         prog = quote
+            c ~ Normal(0, 1)
             mu1 ~ Normal(-2.0, 0.1)
             mu2 ~ Normal(2.0, 0.1)
             sigma = c

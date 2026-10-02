@@ -1,5 +1,7 @@
 # data: y x
 begin
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     m ~ Normal(0, 1)
     s ~ Exponential(m)
     t ~ Flat()

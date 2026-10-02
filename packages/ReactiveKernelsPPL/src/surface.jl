@@ -168,10 +168,11 @@ bind the matrix once (`X = hcat(1, x1, x2)` — the intercept `1` plus
 bare data/derived columns), use it only as a predictor matmul
 (`mu = X * b`), and size the coefficient vector with an axes prior
 (`b[axes(X, 2)] .~ Normal.(loc, scale)` — scalar args share over
-elements, literal `[…]` vectors go per element). Unstated vectors
-default to `Normal(0, 1)` per element; under `r2d2(mu, R2, phi)` a
+elements, literal `[…]` vectors go per element). Declarations are
+strict: an undeclared coefficient name or vector fails naming the
+prior to write — nothing is defaulted. Under `r2d2(mu, R2, phi)` a
 stated vector becomes per-element share-0 overrides and an unstated
-one joins the simplex. Every other matrix position (scales, prior
+one joins the simplex (the `r2d2` statement is its prior). Every other matrix position (scales, prior
 arguments, indexing, arithmetic outside a matmul) fails loudly
 naming the spelling. Emitter guidance: matrix and affine spellings
 of one model evaluate bit-identically with identical coefficient
@@ -541,6 +542,7 @@ function _lower_rkppl(ast, data_names, scalars::Set{Symbol},
     end
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
+    ast = Expr(:block, _desugar_destructuring(ast.args)...)
     ast, data = _scalar_value_definitions(ast, data, scalars)
     ast, pins = _expand_submodels(ast, data, mod)
     # Fixed point over demotions: a coefficient candidate the affine path
@@ -581,6 +583,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     sample, det, plate_ctx, plate_specs, scans, bases, vectors,
     hbases, kplates, kstmts, schedules, event_lps, r2d2decls, joints,
     varying_draws, varying_pending, glms = _partition_statements(ast, data)
+    sample, det = _rewrite_plate_rows(sample, det)
     # Functions as values: definition call heads outside the built-in
     # vocabulary resolve in the model module (submodel bodies resolved in
     # their own module during expansion). Names are gathered before the
@@ -604,6 +607,17 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     det = _hoist_prior_args!(sample, det, data, plate_specs;
         resolve = a -> _resolve_module_calls(a, mod, model_names,
             "prior argument `$(repr(a))`"))
+    # A data-only module value a response reads per observation is that
+    # observation column or matrix (user decision `0z5bsqi`, prong
+    # `in_model`): it lowers as data, computed once by `bind_data`, which
+    # checks its length or row count. Read whole, it stays model-level.
+    rawdata = data
+    aligned = _aligned_module_data(sample, det, data)
+    aligned_defs = Pair{Symbol,Any}[p for p in det if first(p) in aligned]
+    if !isempty(aligned)
+        data = union(data, aligned)
+        det = Pair{Symbol,Any}[p for p in det if first(p) ∉ aligned]
+    end
     # Varying bindings (draws + contributions): contributions compose
     # only as direct predictor summands, never inside definitions.
     varying_names = Set{Symbol}()
@@ -742,7 +756,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # a parameter-dependent call may take it; each refusal that waiver
     # skips is re-checked once the plan shows no other slot reads it.
     whole = _whole_value_data(det, data,
-        _statement_names(ast, union(data, Set{Symbol}(keys(detmap)))))
+        _statement_names(ast, union(data, Set{Symbol}(keys(detmap))), kstmts))
     waived = _check_module_calls(det, detmap, data, shape_env; whole)
     # Whole-value data compose with array parameters before canonicalization,
     # exactly like a module call's model-level result. Their concrete shape
@@ -999,14 +1013,29 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         used_locs)
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
+    # Axes of every declared array an array-cell plate may read.
+    pc_dims = Dict{Symbol,Vector{Any}}()
+    for s in sample
+        s.lhs in data && continue
+        if s.dims !== nothing
+            pc_dims[s.lhs] = s.dims
+        elseif s.levels isa Symbol
+            pc_dims[s.lhs] = Any[:(levels($(s.levels)))]
+        end
+    end
     for (nm, _) in det
         nm in skip && continue
         rhs = canonmap[nm]
+        _is_plate_column_call(rhs) &&
+            (rhs = _plate_column_expr(nm, rhs, pc_dims, data))
         if detshape[nm] === :vector
             push!(derived, _lower_vector_assignment(nm, rhs, coefuse))
         else
             push!(assigns, _lower_assignment(nm, rhs, coefuse))
         end
+    end
+    for (nm, rhs) in aligned_defs
+        push!(derived, VectorAssignmentSpec(nm, rhs, nm))
     end
     append!(derived, ctx.synth_derived)
     append!(assigns, ctx.synth_assigns)
@@ -1047,9 +1076,154 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
         array_parameters = arrays)
-    _confirm_whole_value_data(plan, data, waived; whole)
+    _confirm_whole_value_data(plan, rawdata, waived; whole)
     validate_structure(plan)
     return plan
+end
+
+# ── Destructuring and in-model data values ───────────────────────────
+# `(a, b) = rhs` (standard Julia destructuring): each name binds its
+# element, `a = Base.getindex(rhs, 1)`, `b = Base.getindex(rhs, 2)`, Julia's
+# tuple semantics (an extra element is dropped, a missing one is a
+# `BoundsError`). A data-only `rhs` is evaluated once by `bind_data`
+# (identical calls share one evaluation), so `(Xf, Zp) = tps_basis(x; k = 4)`
+# fits the basis once.
+_is_destructuring(st) =
+    st isa Expr && st.head === :(=) && length(st.args) == 2 &&
+    Meta.isexpr(st.args[1], :tuple) && !isempty(st.args[1].args) &&
+    all(a -> a isa Symbol, st.args[1].args)
+
+function _desugar_destructuring(stmts)
+    out = Any[]
+    for st in stmts
+        if _is_destructuring(st)
+            lhs, rhs = st.args
+            for (i, nm) in enumerate(lhs.args)
+                push!(out, Expr(:(=), nm, Expr(:call,
+                    Expr(:., :Base, QuoteNode(:getindex)),
+                    rhs isa Expr ? copy(rhs) : rhs, i)))
+            end
+        else
+            push!(out, st)
+        end
+    end
+    return out
+end
+
+# Data-only module values (`B = tps_basis(x; k = 4)`, `z = f(x)`: an
+# undotted module call reading only data) that a response needs per
+# observation, found from every `.~` response's distribution arguments
+# through definitions. The arguments broadcast against the response, so a
+# model-level value fits there (`Normal.(mu, s)`). One is needed per
+# observation only where a model-level value never fits: the matrix of a
+# data product (`B * w`), a term of a sum (`a .+ z`; a predictor's terms
+# are per observation), or a factor of such a term whose other operands
+# are all model-level (`a .+ b .* z`). Beside a per-observation operand
+# (`m .* x`) a model-level value broadcasts and stays model-level.
+# Module-call arguments, reductions, gathered values and the vector of a
+# data product are whole reads. A number bound as data (`_bound_value`)
+# is known at lowering and never needs a column.
+function _aligned_module_data(sample, det, data)
+    detmap = Dict{Symbol,Any}(det)
+    cands = Set{Symbol}(nm for (nm, rhs) in det
+        if _is_module_value_call(rhs) && !_is_bound_value_call(rhs) &&
+            _data_only(rhs, data, detmap))
+    aligned = Set{Symbol}()
+    isempty(cands) && return aligned
+    visited = Set{Tuple{Symbol,Bool}}()
+    for s in sample
+        s.broadcast && s.levels === nothing && s.matrix === nothing &&
+            s.dims === nothing || continue
+        (s.lhs in data || haskey(detmap, s.lhs)) || continue
+        # Each distribution argument broadcasts against the response.
+        rhs = s.rhs
+        slots = _is_dotted_call(rhs) ? rhs.args[2].args :
+            (rhs isa Expr && rhs.head === :call ? rhs.args[2:end] : Any[rhs])
+        for a in slots
+            _column_reads!(aligned, a, cands, detmap, visited, data, false)
+        end
+    end
+    return aligned
+end
+
+_is_module_value_call(ex) =
+    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+    ex.args[1] isa GlobalRef
+
+const _WHOLE_READ_FNS = (:size, :axes, :levels, :eachindex, :Ref)
+const _ADDITIVE_OPS = (:+, :-, :.+, :.-)
+
+# Record the data-only module values `ex` needs as observation columns.
+# `need`: `ex` itself must carry the observations (a term of a sum); in a
+# distribution argument, or beside a per-observation operand, it need not,
+# though the matrix of a data product always must (a model-level product
+# never mixes with a column).
+function _column_reads!(aligned, ex, cands, detmap, visited, data,
+        need::Bool = true)
+    walk(a, nd = need) =
+        _column_reads!(aligned, a, cands, detmap, visited, data, nd)
+    if ex isa Symbol
+        if ex in cands
+            need && push!(aligned, ex)
+        elseif haskey(detmap, ex) && !((ex, need) in visited)
+            push!(visited, (ex, need))
+            walk(detmap[ex])
+        end
+        return nothing
+    end
+    ex isa Expr || return nothing
+    if ex.head === :ref
+        # A gather `v[c]`: the value whole, the index per observation.
+        foreach(walk, ex.args[2:end])
+        return nothing
+    end
+    dotted = _is_dotted_call(ex)
+    ex.head === :call || dotted || (foreach(walk, ex.args); return nothing)
+    fn = ex.args[1]
+    fn isa GlobalRef && !dotted && return nothing
+    fn isa Symbol && (fn in REDUCTION_FNS || fn in _WHOLE_READ_FNS) &&
+        return nothing
+    args = dotted ? ex.args[2].args : ex.args[2:end]
+    if fn === :* && !dotted && length(args) == 2
+        # A data matrix times a vector: rows from the matrix, the vector
+        # whole. (`s * z`, a scalar times a column, reads both.)
+        walk(args[1], true)
+        _symbols_in(args[1], union(cands, data)) || walk(args[2])
+        return nothing
+    end
+    # Each term of a sum carries the observations itself.
+    fn in _ADDITIVE_OPS && return foreach(a -> walk(a, true), args)
+    # A product (or other elementwise call) carries them when any operand
+    # does; then the others may be model-level and broadcast.
+    any(a -> _reads_obs(a, data, detmap, Set{Symbol}()), args) &&
+        return foreach(a -> walk(a, false), args)
+    foreach(walk, args)
+    return nothing
+end
+
+# Does `ex` read data per observation (outside whole reads)?
+function _reads_obs(ex, data, detmap, active::Set{Symbol})
+    if ex isa Symbol
+        ex in data && return true
+        (haskey(detmap, ex) && !(ex in active)) || return false
+        push!(active, ex)
+        r = _reads_obs(detmap[ex], data, detmap, active)
+        delete!(active, ex)
+        return r
+    end
+    ex isa Expr || return false
+    ex.head === :ref && return any(a -> _reads_obs(a, data, detmap, active),
+        ex.args[2:end])
+    dotted = _is_dotted_call(ex)
+    if ex.head === :call || dotted
+        fn = ex.args[1]
+        fn isa GlobalRef && !dotted && return false
+        fn isa Symbol && (fn in REDUCTION_FNS || fn in _WHOLE_READ_FNS) &&
+            return false
+        args = dotted ? ex.args[2].args : ex.args[2:end]
+        return any(a -> _reads_obs(a, data, detmap, active), args)
+    end
+    return any(a -> _reads_obs(a, data, detmap, active), ex.args)
 end
 
 # A per-cell latent declaration reuses the scalar-parameter distribution
@@ -1148,6 +1322,7 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     fn = ex.args[1]
     fn isa Symbol || return :scalar  # module/anonymous calls: model-level
     fn in REDUCTION_FNS && return :scalar
+    fn === :_ppl_plate_column && return :vector  # one value per index
     argshapes = [shape(a) for a in ex.args[2:end]]
     if fn in ELEMENTWISE_OPS
         (:array in argshapes || :invalid in argshapes) &&
@@ -1222,6 +1397,7 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         fn = ex.args[1]
         fn isa Symbol || return false
         fn in REDUCTION_FNS && return false
+        fn === :_ppl_plate_column && return true
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2:end])
     elseif _is_dotted_call(ex)
@@ -1353,6 +1529,7 @@ function _canonical_expr(ex, data, detmap, detshape, env, where)
     fn = ex.args[1]
     fn isa Symbol || return ex
     fn in REDUCTION_FNS && return ex  # args validated downstream
+    fn === :_ppl_plate_column && return ex  # an RK plate (array cells)
     args = [_canonical_expr(a, data, detmap, detshape, env, where)
         for a in ex.args[2:end]]
     argshapes = [_canon_shape(a, data, detmap, detshape, env) for a in args]
@@ -1550,6 +1727,7 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
         # recurse below): matrix definitions validate at extraction;
         # strays fail there (definitions) or at predictor analysis
         # (responses) with bind-to-a-name guidance.
+        fn === :_ppl_plate_column && return nothing  # array-cell plate
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
                 fn ∉ VECTOR_FNS && fn !== :spline &&
                 fn !== :hsgp && fn !== :mo && fn !== :mo1 &&
@@ -1716,6 +1894,9 @@ _is_dotted_call(ex) =
 function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
     ex isa Expr || return ex
     ex.head === :quote && return ex
+    # An array-cell plate column: its cell runs inside an RK plate, in
+    # the generated kernel (the cell body is quoted, not resolved here).
+    _is_plate_column_call(ex) && return ex
     if ex.head === :call && !isempty(ex.args)
         head = _resolve_call_head(ex.args[1], mod, names, where)
         args = Any[_resolve_module_calls(a, mod, names, where)
@@ -1819,10 +2000,13 @@ function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol})
     return setdiff!(inputs, held)
 end
 
-# Names read per observation by non-definition statements. A gathered
+# Names held by non-definition statements. A gathered
 # value is whole even in a response (`v[g]`); its index is aligned. Plates
-# and scans retain their conservative statement-wide alignment.
-function _statement_names(ast::Expr, known::Set{Symbol})
+# and scans retain their conservative statement-wide alignment. Extracted
+# kernel cells remain consumers too: a schedule-chain definition moved out
+# of `det` still reads its subject-level predictors. Otherwise those now
+# apparently unused definitions would be classified as whole values.
+function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ())
     out = Set{Symbol}()
     whole = Set{Symbol}()
     for st in ast.args
@@ -1834,7 +2018,9 @@ function _statement_names(ast::Expr, known::Set{Symbol})
             _classify_reads!(whole, out, st, known, false)
         end
     end
-    return out
+    free = copy(known)
+    _drop_held_names!(free, kernel_stmts)
+    return union!(out, setdiff(known, free))
 end
 
 # The names of `among` that `ex` reads, directly or through definitions.
@@ -3988,6 +4174,15 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                        "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
                        "object owns eta over the whole column)")
             end
+            pl = _per_level_lhs(st.args[2], st.args[3], bc)
+            if pl !== nothing
+                plhs, pdims = pl
+                _claim!(seen, seelines, plhs, line)
+                _reject_target(st.args[3], plhs)
+                push!(sample, SampleStmt(plhs, st.args[3], false, nothing,
+                    nothing, nothing, pdims, :per_level))
+                continue
+            end
             sl = _array_slices_lhs(st.args[2], st.args[3], bc, tilde, data)
             if sl !== nothing
                 rlhs, rdims, slices = sl
@@ -4529,6 +4724,9 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
     params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+    rkind[1] !== :levels && _plate_has_array_cells(cells) &&
+        return _desugar_array_plate(cells, ivar, rkind, line, data,
+            plate_defs)
     # Cell locals bound from a per-index value (they vary with the loop
     # variable, so arithmetic over them vectorizes in the desugar).
     pidx = Set{Symbol}()
@@ -4539,19 +4737,145 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     return out, ctx, params
 end
 
+# A plate whose definitions hold arrays: some definition reads a whole
+# axis (`sd[s[i], :]`, `z[g[i], :]`). Such cells cannot be vectorized by
+# broadcasting their operators; they lower as RK plates (below).
+_plate_has_array_cells(cells) = any(c -> c isa Expr && c.head === :(=) &&
+    length(c.args) == 2 && _has_colon_index(c.args[2]), cells)
+_has_colon_index(ex) = ex isa Expr && ((ex.head === :ref &&
+    any(a -> a === :(:), ex.args[2:end])) || any(_has_colon_index, ex.args))
+
+# A per-index plate with array-valued cells. Every cell means one
+# iteration of the Julia loop: cell locals (`F = sd[s[i], :] .* L[s[i]]`)
+# may be arrays, and each per-index column a cell defines (`r1[i] = …`,
+# a scalar per index) becomes the derived column `r1` computed by one RK
+# plate — the cell body, run once per index by the loop RK generates
+# (the plate expression is built once array axes are known,
+# `_plate_column_expr`). Observations in the same plate read those
+# columns (`y[i] ~ Normal(r1[i], s)`) and lower as in a scalar plate.
+function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
+        plate_defs::Set{Symbol})
+    locals = Pair{Symbol,Any}[]
+    out = Expr[]
+    ctx = Tuple{Symbol,Int,Set{Symbol}}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+    samples = Any[]
+    for c in cells
+        c isa Expr || _sfail("cells hold `~` observations and `=` " *
+            "assignments only")
+        if _is_sample(c)
+            push!(samples, c)
+            continue
+        end
+        (c.head === :(=) && length(c.args) == 2) || _sfail("cells hold `~` " *
+            "observations and `=` assignments only")
+        lc, rhs = c.args
+        if lc isa Symbol
+            lc in data && _sfail("cell assignment `$lc = ...` redefines " *
+                "bound data")
+            push!(locals, lc => rhs)
+        elseif lc isa Expr && lc.head === :ref && length(lc.args) == 2 &&
+                lc.args[1] isa Symbol && lc.args[2] === ivar
+            col = lc.args[1]
+            col in data && _sfail("cell assignment `$col[$ivar] = ...` " *
+                "redefines bound data")
+            body = Expr(:block, (Expr(:(=), k, v) for (k, v) in locals)...)
+            deps = Set{Symbol}()
+            for (_, v) in locals
+                _cell_free_syms!(deps, v)
+            end
+            _cell_free_syms!(deps, rhs)
+            setdiff!(deps, Set{Symbol}(first.(locals)))
+            delete!(deps, ivar)
+            spec = Expr(:tuple, QuoteNode(ivar), QuoteNode(body),
+                QuoteNode(rhs))
+            push!(out, Expr(:(=), col, Expr(:call, :_ppl_plate_column, spec,
+                sort!(collect(deps))...)))
+        elseif lc isa Expr && lc.head === :ref && length(lc.args) == 3 &&
+                lc.args[1] isa Symbol && lc.args[2] === ivar
+            # A row per index (`b[i, 1:K] = row`): one plate column per
+            # component, read back as the columns of `b` (`b[:, k]`).
+            col = lc.args[1]
+            col in data && _sfail("cell assignment `$(repr(lc)) = ...` " *
+                "redefines bound data")
+            K = _literal_range_len(lc.args[3])
+            K === nothing && _sfail("cell `$(repr(c))`: a row per index " *
+                "states its length, `$col[$ivar, 1:K] = ...` with a literal K")
+            rowv = Symbol(:_rkppl_rowv_, col)
+            body = Expr(:block, (Expr(:(=), k, v) for (k, v) in locals)...,
+                Expr(:(=), rowv, rhs))
+            deps = Set{Symbol}()
+            for (_, v) in locals
+                _cell_free_syms!(deps, v)
+            end
+            _cell_free_syms!(deps, rhs)
+            setdiff!(deps, Set{Symbol}(first.(locals)))
+            delete!(deps, ivar)
+            parts = Symbol[]
+            for k in 1:K
+                pk = Symbol(:_rkppl_row_, col, :_, k)
+                push!(parts, pk)
+                spec = Expr(:tuple, QuoteNode(ivar), QuoteNode(body),
+                    QuoteNode(:($rowv[$k])))
+                push!(out, Expr(:(=), pk, Expr(:call, :_ppl_plate_column,
+                    spec, sort!(collect(deps))...)))
+            end
+            push!(out, Expr(:(=), col, Expr(:call, :_ppl_rows, parts...)))
+        elseif lc isa Expr && lc.head === :ref
+            _sfail("cell `$(repr(c))`: a per-index output is a value " *
+                "(`$(lc.args[1])[$ivar] = ...`) or a row " *
+                "(`$(lc.args[1])[$ivar, 1:K] = ...`)")
+        else
+            _sfail("cell assignment LHS is a local (`t = ...`) or an " *
+                "`$ivar`-indexed column, got $(repr(lc))")
+        end
+    end
+    lnames = Set{Symbol}(first.(locals))
+    pidx = Set{Symbol}()
+    for c in samples
+        any(nm -> _expr_has_sym(c.args[3], nm), lnames) && _sfail("cell " *
+            "`$(repr(c))` reads a cell local of an array plate; define a " *
+            "per-index column (`eta[$ivar] = ...`) and observe it")
+        append!(out, _desugar_cell_sample(c, ivar, rkind, line, data,
+            plate_defs, ctx, params, pidx))
+    end
+    return out, ctx, params
+end
+
+# Value names an expression reads (call heads, `:` and keywords skipped).
+function _cell_free_syms!(out::Set{Symbol}, ex)
+    if ex isa Symbol
+        ex === :(:) || ex === :end || push!(out, ex)
+    elseif ex isa Expr
+        if ex.head === :call && !isempty(ex.args)
+            foreach(a -> _cell_free_syms!(out, a), ex.args[2:end])
+        elseif ex.head === :. && length(ex.args) == 2
+            ex.args[2] isa Expr && foreach(a -> _cell_free_syms!(out, a),
+                ex.args[2].args)
+        elseif ex.head === :kw
+            _cell_free_syms!(out, ex.args[2])
+        else
+            foreach(a -> _cell_free_syms!(out, a), ex.args)
+        end
+    end
+    return out
+end
+
 # Plate ranges mirror the response ranges: literal `a:b` (validated via
 # the desugared `y[a:b]` form), `eachindex(v)`, `axes(v, 1)`.
 function _plate_range_kind(R)
     R isa Expr && R.head === :call && !isempty(R.args) || return _sfail(
-        "`@plate` range must be `1:N`, `eachindex(v)`, or `axes(v, 1)` — " *
-        "got $(repr(R)) (values-iteration is planned)")
+        "`@plate` range must be `1:N`, `eachindex(v)`, `axes(v, 1)`, or " *
+        "`levels(g)` — got $(repr(R)) (values-iteration is planned)")
     R.args[1] === :(:) && return (:coloncall, R)
     R.args[1] === :eachindex && length(R.args) == 2 &&
         R.args[2] isa Symbol && return (:eachindex, R.args[2])
     R.args[1] === :axes && length(R.args) == 3 && R.args[2] isa Symbol &&
         R.args[3] == 1 && return (:axes, R.args[2])
-    return _sfail("`@plate` range must be `1:N`, `eachindex(v)`, or " *
-                  "`axes(v, 1)` — got $(repr(R))")
+    R.args[1] === :levels && length(R.args) == 2 && R.args[2] isa Symbol &&
+        return (:levels, R.args[2])
+    return _sfail("`@plate` range must be `1:N`, `eachindex(v)`, " *
+                  "`axes(v, 1)`, or `levels(g)` — got $(repr(R))")
 end
 
 # One cell statement → spliced top-level statement(s). A cell means what
@@ -4580,6 +4904,8 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params,
     if _is_broadcast_sample(c)
         _sfail("cells are scalar (`~`); broadcast (`.~`) at top level")
     end
+    rkind[1] === :levels && return _desugar_levels_cell(c, ivar, rkind[2],
+        data)
     if _is_sample(c)
         return _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs,
             ctx, params, pidx)
@@ -4610,6 +4936,194 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params,
     end
     return _sfail("cells hold `~` observations and `=` assignments only")
 end
+
+# A `@plate for k in levels(g)` cell: one iteration per level of `g`. A
+# per-level declaration means what the whole-array declaration means:
+# `c[k] ~ D` is `c[levels(g)] .~ D.` (one draw per level), and a row
+# `b[k, :] ~ D` (or `b[k, 1:K]`) with a multivariate `D` is the row
+# statement `eachrow(b[levels(g), 1:K]) .~ D` (§ array slices), and
+# `L[k] ~ LKJCholesky(K, eta)` declares one correlation factor per level
+# (a stacked LKJ array, `:lkj_cholesky_stack`). Arguments are shared
+# across levels. Per-level arguments and per-level definitions are not
+# supported yet.
+function _desugar_levels_cell(c, ivar::Symbol, g::Symbol, data)
+    where = "`@plate for $ivar in levels($g)` cell `$(repr(c))`"
+    _is_sample(c) || _sfail("$where: per-level `=` definitions are not " *
+        "supported yet; a levels plate holds per-level `~` declarations")
+    lhs, obj = c.args[2], c.args[3]
+    (lhs isa Expr && lhs.head === :ref && length(lhs.args) in (2, 3) &&
+        lhs.args[1] isa Symbol && lhs.args[2] === ivar) || _sfail("$where: " *
+        "a per-level cell declares `name[$ivar]` or a row `name[$ivar, :]`")
+    col = lhs.args[1]
+    col in data && _sfail("$where: $col is data; per-level observations " *
+        "are not supported yet")
+    _expr_has_sym(obj, ivar) && _sfail("$where: per-level distribution " *
+        "arguments are not supported yet; the arguments are shared across " *
+        "levels")
+    if length(lhs.args) == 2
+        _mv_head(obj) === nothing || _sfail("$where: a multivariate " *
+            "per-level draw is a row, `$col[$ivar, :] ~ $(repr(obj))`")
+        # One correlation factor per level: an internal declaration the
+        # statement partitioner reads as a stacked LKJ array (users write
+        # the plate; `_ppl_` names are reserved).
+        _is_lkj_cholesky_call(obj) && return Expr[Expr(:call, :~,
+            Expr(:call, :_ppl_per_level, col, g), obj)]
+        dobj, _ = _dotify_cell(obj, ivar, Set{Symbol}(), true)
+        return Expr[Expr(:call, :.~, Expr(:ref, col, :(levels($g))), dobj)]
+    end
+    _mv_head(obj) === nothing && _sfail("$where: a row `$col[$ivar, :]` " *
+        "is one draw of a multivariate distribution (`MvNormal`, " *
+        "`MvNormalCholesky`, `Dirichlet`, `Ordered`)")
+    ax = lhs.args[3]
+    if ax === :(:)
+        K = _mv_slice_len(obj)
+        K === nothing && _sfail("$where: the row length is not readable " *
+            "from the distribution; write it, `$col[$ivar, 1:K]`")
+        ax = :(1:$K)
+    end
+    return Expr[Expr(:call, :.~, Expr(:call, :eachrow,
+        Expr(:ref, col, :(levels($g)), ax)), obj)]
+end
+
+# The slice length of a multivariate distribution call whose arguments
+# state it literally: `MvNormal(zeros(K), …)` / `MvNormalCholesky(ones(K),
+# …)` / a literal mean vector, `Dirichlet(K, a)` / a literal concentration
+# vector, `Ordered(D, K)`. `nothing` when it is not literal.
+function _mv_slice_len(obj)
+    h = _mv_head(obj)
+    (h === nothing || obj.head !== :call || length(obj.args) < 2) &&
+        return nothing
+    a = obj.args[2]
+    lit(x) = x isa Int && x >= 1 ? x : nothing
+    if h === :Ordered
+        return length(obj.args) == 3 ? lit(obj.args[3]) : nothing
+    elseif h === :Dirichlet && length(obj.args) == 3
+        return lit(a)
+    end
+    a isa Expr && a.head === :vect && return length(a.args)
+    a isa Expr && a.head === :call && length(a.args) == 2 &&
+        a.args[1] in (:zeros, :ones) && return lit(a.args[2])
+    return nothing
+end
+
+# The RK plate an array-cell plate column runs: `plate(lanes...,
+# Ref(shared)...) do lane..., shared...; cell; end`, one cell per index.
+# Lanes are the per-index inputs: a data column read at the loop index
+# (`x[i]`), or the level codes of a column that indexes an array's levels
+# axis (`sd[s[i], :]`, `z[g[i], :]`, a per-level factor `L[s[i]]` —
+# `_ppl_codes(s, h)`, the codes of `s` on `levels(h)`). Every other name
+# the cell reads (arrays, parameters, definitions) is passed whole with
+# `Ref`. Inside the cell those reads are ordinary integer indexing
+# (`sd[c, :]`, `L[:, :, c]`); RK generates the loop.
+function _plate_column_expr(nm::Symbol, call::Expr,
+        dims::Dict{Symbol,Vector{Any}}, data::Set{Symbol})
+    spec = call.args[2]
+    ivar = spec.args[1].value
+    body = spec.args[2].value
+    out = spec.args[3].value
+    where = "array plate column `$nm`"
+    inputs = Any[]
+    lanevars = Symbol[]
+    lane(inp, var) = (var in lanevars || (push!(inputs, inp);
+        push!(lanevars, var)); var)
+    isidx(a) = a isa Expr && a.head === :ref && length(a.args) == 2 &&
+        a.args[1] isa Symbol && a.args[1] in data && a.args[2] === ivar
+    function code(a, d)
+        _is_levels_dim(d) && d.args[2] isa Symbol || _sfail("$where reads " *
+            "an array axis $(repr(d)) by `$(repr(a))`; per-index reads " *
+            "take a `levels(g)` axis")
+        col, h = a.args[1], d.args[2]
+        return lane(Expr(:call, :_ppl_codes, col, h),
+            Symbol(:_ppl_pc_, col, :_, h))
+    end
+    function rw(ex)
+        ex isa Expr || return ex
+        if ex.head === :ref && ex.args[1] isa Symbol
+            X, idx = ex.args[1], ex.args[2:end]
+            isidx(ex) && return lane(X, Symbol(:_ppl_pv_, X))
+            d = get(dims, X, nothing)
+            if d !== nothing && !isempty(idx) && isidx(idx[1])
+                if length(d) == 3 && length(idx) == 1
+                    return Expr(:ref, X, :(:), :(:), code(idx[1], d[3]))
+                end
+                return Expr(:ref, X, code(idx[1], d[1]), map(rw, idx[2:end])...)
+            end
+        end
+        return Expr(ex.head, map(rw, ex.args)...)
+    end
+    stmts = Any[rw(a) for a in body.args]
+    outx = rw(out)
+    isempty(lanevars) && _sfail("$where reads no per-index input " *
+        "(`x[$ivar]`, `z[g[$ivar], :]`): it does not vary with $ivar")
+    locals = Set{Symbol}(a.args[1] for a in stmts
+        if a isa Expr && a.head === :(=) && a.args[1] isa Symbol)
+    free = Set{Symbol}()
+    foreach(a -> _cell_free_syms!(free, a), stmts)
+    _cell_free_syms!(free, outx)
+    setdiff!(free, locals)
+    setdiff!(free, Set(lanevars))
+    ivar in free && _sfail("$where reads the loop index $ivar other than " *
+        "through a data column (`x[$ivar]`) or a levels gather " *
+        "(`z[g[$ivar], :]`)")
+    shared = sort!(collect(free))
+    append!(inputs, (Expr(:call, :Ref, nm2) for nm2 in shared))
+    lam = Expr(:->, Expr(:tuple, lanevars..., shared...),
+        Expr(:block, LineNumberNode(0, :rkppl_plate), stmts..., outx))
+    return Expr(:do, Expr(:call, :plate, inputs...), lam)
+end
+
+_literal_range_len(r) = (r isa Expr && r.head === :call && length(r.args) == 3 &&
+    r.args[1] === :(:) && r.args[2] == 1 && r.args[3] isa Int &&
+    r.args[3] >= 1) ? r.args[3] : nothing
+
+# Rows per index (`b[i, 1:K] = row` in an array plate): `b` stands for the
+# matrix whose column k is the plate column `_rkppl_row_b_k`. A read of a
+# column (`b[:, k]`, also through an alias `u = b`) becomes that plate
+# column; the `_ppl_rows` definition and its aliases leave the program.
+function _rewrite_plate_rows(sample, det)
+    rows = Dict{Symbol,Vector{Symbol}}()
+    for (nm, rhs) in det
+        rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+            rhs.args[1] === :_ppl_rows && (rows[nm] = Symbol[rhs.args[2:end]...])
+    end
+    isempty(rows) && return sample, det
+    changed = true
+    while changed
+        changed = false
+        for (nm, rhs) in det
+            if rhs isa Symbol && haskey(rows, rhs) && !haskey(rows, nm)
+                rows[nm] = rows[rhs]
+                changed = true
+            end
+        end
+    end
+    function rw(ex)
+        ex isa Symbol && haskey(rows, ex) && _sfail("rows per index `$ex` " *
+            "are read by column (`$ex[:, k]`)")
+        ex isa Expr || return ex
+        if ex.head === :ref && length(ex.args) == 3 && ex.args[1] isa Symbol &&
+                haskey(rows, ex.args[1]) && ex.args[2] === :(:)
+            k = ex.args[3]
+            parts = rows[ex.args[1]]
+            k isa Int && 1 <= k <= length(parts) || _sfail("`$(repr(ex))` " *
+                "reads column $(repr(k)) of rows with $(length(parts)) " *
+                "columns (a literal 1..$(length(parts)))")
+            return parts[k]
+        end
+        return Expr(ex.head, map(rw, ex.args)...)
+    end
+    newdet = Pair{Symbol,Any}[nm => rw(rhs) for (nm, rhs) in det
+        if !haskey(rows, nm)]
+    newsample = [SampleStmt(s.lhs, rw(s.rhs), s.broadcast, s.range, s.levels,
+        s.matrix, s.dims, s.slices) for s in sample]
+    return newsample, newdet
+end
+
+_is_plate_column_call(ex) = ex isa Expr && ex.head === :call &&
+    !isempty(ex.args) && ex.args[1] === :_ppl_plate_column
+
+_expr_has_sym(ex, s::Symbol) = ex === s ||
+    (ex isa Expr && any(a -> _expr_has_sym(a, s), ex.args))
 
 # A cell `~` statement is EITHER a per-cell latent parameter declaration
 # (`theta[i] ~ Normal(mu, tau)` — a non-data indexed LHS, scalar undotted
@@ -5076,6 +5590,20 @@ end
 
 _is_literal_range(r) = r isa Expr && r.head === :call && length(r.args) == 3 &&
     r.args[1] === :(:)
+
+# The internal per-level declaration `_ppl_per_level(L, g) ~
+# LKJCholesky(K, eta)` that `@plate for k in levels(g); L[k] ~
+# LKJCholesky(K, eta); end` desugars to: `(L, dims)` with dims
+# `[K, K, levels(g)]` (`nothing` otherwise).
+function _per_level_lhs(lhs, rhs, bc::Bool)
+    (lhs isa Expr && lhs.head === :call && length(lhs.args) == 3 &&
+        lhs.args[1] === :_ppl_per_level) || return nothing
+    L, g = lhs.args[2], lhs.args[3]
+    (L isa Symbol && g isa Symbol && !bc && _is_lkj_cholesky_call(rhs)) ||
+        _sfail("internal: malformed per-level declaration $(repr(lhs))")
+    K = rhs.args[2]
+    return L, Any[K, K, :(levels($g))]
+end
 
 # Multivariate slice declarations ([`ArrayParameter`](@ref) slice
 # families, `mv_slices.jl`): `eachrow(B[a, b]) .~ D` / `eachcol(B[a, b])
@@ -5620,8 +6148,9 @@ function _submodel_body_parts(sm::RKPPLSubmodel)
             "the use-site LHS — a bare `return` returns nothing")
         ret = unwrap
     end
-    stmts = Any[(st isa Expr && !_is_block_macro(st)) ? _unwrap_trivia(st) :
-        st for st in items[1:end-1]]
+    stmts = _desugar_destructuring(Any[
+        (st isa Expr && !_is_block_macro(st)) ? _unwrap_trivia(st) : st
+        for st in items[1:end-1]])
     for st in stmts
         Meta.isexpr(st, :return) && _sfail(
             "submodel `$(sm.name)`: `return` is only admitted as the " *
@@ -6643,8 +7172,10 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
             "component $k location $loc is a design matrix — locations " *
             "are predictors, sampled parameters, or literals")
         # A stated-prior alias reads like the name itself (a sampled
-        # parameter), so it never routes here — only undeclared
-        # intercept-only defs (the SB `mu ~ 1` mirror) qualify.
+        # parameter), so it never routes here. Only an undeclared
+        # intercept-only def (the SB `mu ~ 1` mirror) did, and strict
+        # declarations refuse that name at prior lowering: a constant
+        # location is a declared scalar spelled bare.
         if loc in ctx.vecdefs && haskey(ctx.detmap, loc) ||
                 _is_scalar_coef_def(loc, ctx, false)
             wrapped || _sfail("response $lhs: mixture component $k " *
@@ -7032,10 +7563,9 @@ function _lower_glm_response(g::GLMSampleStmt, sample, prior_names::Set{Symbol},
 end
 
 # A GLM coefficient vector: K per-element PopulationPriors over the
-# response matrix columns, addressed by response label. Unstated
-# vectors default to K× Normal(0, 1) (the matrix-prior emitter
-# convention — the width is static, so no declaration is needed to
-# size them). Stated vectors take `b[axes(X, 2)] .~ Normal.(loc,
+# response matrix columns, addressed by response label. An unstated
+# vector fails (`_undeclared_vector` — strict declarations, decision
+# 05oe96l). Stated vectors take `b[axes(X, 2)] .~ Normal.(loc,
 # scale)` with scalar (shared) or length-K literal-vector
 # (per-element) args — Normal-only (non-Normal betas use the
 # decomposed predictor form).
@@ -7050,8 +7580,7 @@ function _lower_glm_beta_priors(label::Symbol, beta::Symbol, X::Symbol,
         s.lhs === beta || continue
         stated = s
     end
-    stated === nothing && return PopulationPrior[
-        PopulationPrior(label, c, 0.0, 1.0) for c in cols]
+    stated === nothing && _undeclared_vector(beta, X, label)
     fam, locs, scales, _ =
         _coefficient_matrix_prior(beta, stated.rhs, label, K, hyper_names)
     fam === :normal || _sfail("response $label: GLM-object beta vectors " *
@@ -8558,8 +9087,9 @@ a latent/scan/varying object, or a pure data combination (those keep
 today's paths — data combos merge affinely, latents keep their arms).
 Under `.*` (`allow_factor`), a factor-coefficient alias (`th = c[g]`)
 qualifies too — vector-shaped as a value but an affine FactorTerm under
-analysis. Under `.+` it never qualifies, so `mu = a .+ th`
-keeps the affine merge (with unstated-intercept defaults)."""
+analysis. Under `.+` it never qualifies, so `mu = a .+ th` keeps the
+affine merge (its coefficients declared like any other — strict
+declarations)."""
 function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     haskey(ctx.detmap, s) || return false
     factor_alias = _is_factor_coefficient_alias(s, ctx)
@@ -8583,7 +9113,61 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     # its composed factor-sub meaning.
     rhs = ctx.detmap[s]
     _reads_array_value(rhs, ctx) && !factor_alias && return false
+    # Likewise a parameter offset: data and non-coefficient scalar
+    # parameters combined by sums only (`w = s .+ x`, `s ~ Exponential(1)`).
+    # It has no coefficient to compose, so it stays an offset local. Under
+    # strict declarations the intercept beside it (`mu = a .+ w`) is a
+    # declared scalar, which must not turn the sum into a composition.
+    _composed_param_value(s, ctx) && return false
     return true
+end
+
+# A plain scalar parameter: sampled, not coefficient-priored, and none of
+# the array / varying / latent / scan objects that carry their own arms.
+_composed_scalar_param(leaf::Symbol, ctx) =
+    leaf in ctx.prior_names && leaf ∉ ctx.coef_priors &&
+    leaf ∉ ctx.sized_decls && leaf ∉ ctx.varying_contribs &&
+    leaf ∉ ctx.varying_draws_names && leaf ∉ ctx.plate_names &&
+    leaf ∉ ctx.scan_states
+
+"""Whether a definition is a parameter offset: data (and data-only parts
+of any shape) plus plain scalar parameters (`_composed_scalar_param`),
+combined by sums and differences only, reading at least one parameter
+(`w = s .+ x`). A product or call over a parameter (`x .* b`,
+`f.(x, c)`) is not one: the composed path owns those."""
+function _composed_param_value(s::Symbol, ctx)
+    ok, reads = _param_offset_expr(ctx.detmap[s], ctx, Set{Symbol}([s]))
+    return ok && reads
+end
+
+const _PARAM_OFFSET_OPS = (:+, :-, :.+, :.-)
+
+# `(admissible, reads_param)` for one node of a parameter offset.
+function _param_offset_expr(ex, ctx, seen::Set{Symbol})
+    if ex isa Symbol
+        ex in ctx.data && return (true, false)
+        if haskey(ctx.detmap, ex)
+            _composed_data_only(ex, ctx, Set{Symbol}()) && return (true, false)
+            ex in seen && return (false, false)
+            push!(seen, ex)
+            return _param_offset_expr(ctx.detmap[ex], ctx, seen)
+        end
+        return _composed_scalar_param(ex, ctx) ? (true, true) : (false, false)
+    end
+    ex isa Expr || return (true, false)
+    # A subexpression that reads no parameter is one data part.
+    all(l -> l in ctx.data || (haskey(ctx.detmap, l) &&
+        _composed_data_only(l, ctx, Set{Symbol}())), _value_symbols(ex)) &&
+        return (true, false)
+    ex.head === :call && !isempty(ex.args) &&
+        ex.args[1] in _PARAM_OFFSET_OPS || return (false, false)
+    reads = false
+    for a in ex.args[2:end]
+        ok, r = _param_offset_expr(a, ctx, seen)
+        ok || return (false, false)
+        reads |= r
+    end
+    return (true, reads)
 end
 
 # An array-valued DEFINITION (`b = z * (sd .* L)'`). `detshape` also
@@ -8803,6 +9387,11 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         elseif node in ctx.data
             # A bound data column read elementwise in-graph (v3:
             # `(log_time .- loc) .* exp.(ls)`); it becomes a term column.
+            node in datas || push!(datas, node)
+            return node
+        elseif _is_plate_column_call(get(ctx.detmap, node, nothing))
+            # An array-cell plate column: a per-observation value, read
+            # like a data column.
             node in datas || push!(datas, node)
             return node
         elseif get(ctx.detshape, node, :scalar) === :vector &&
@@ -9248,7 +9837,8 @@ _scalar_summand_error(pname, core) = _sfail(
 
 # An `X * b` matmul: the design matrix's K columns take one coefficient
 # vector — declared (`b[axes(X, 2)] .~ ...`, width-checked against the
-# use matrix) or free (implicit, width follows the use). Coefficient-ness
+# use matrix) or free (classified here, then refused at prior lowering —
+# strict declarations, `_undeclared_vector`). Coefficient-ness
 # is by name role, not shape (the affine free-name precedent): data,
 # computed, sampled, latent, scan, and matrix names all fail naming the
 # spelling. Records `(b, X, sign)`; element priors lower per use-matrix
@@ -9677,9 +10267,15 @@ function _whole_value_symbols!(out::Set{Symbol}, ex)
     return nothing
 end
 
-# Anonymous non-affine vector substructure becomes a synthetic derived
-# local (offset term over it); the sign folds into the extracted column.
+# Anonymous value substructure becomes an offset. Model-level scalars
+# stay scalar assignments; preprocessing broadcasts them over the rows.
 function _extract_summand(pname, core::Expr, sign::Int, ctx)
+    if _canon_shape(core, ctx) === :scalar
+        e = sign < 0 ? Expr(:call, :-, core) : core
+        nm = _composed_scalar_leaf!(pname, e, ctx, Symbol[])
+        return TermSpec(OffsetTerm, [nm], NamedTuple(), nm,
+            Symbol(nm, "_off")), nothing
+    end
     e = sign < 0 ? Expr(:call, :.-, core) : core
     nm = _extract_column(pname, e, ctx)
     return TermSpec(OffsetTerm, [nm], NamedTuple(), nm,
@@ -9806,8 +10402,8 @@ end
 function _classify_ref(pname, core::Expr, sign::Int, ctx)
     # Reads of a declared array value (`z[g]`, `phi[1]`) or of an
     # array-valued definition (`b[g, 1]`, `b = z * (sd .* L)'`) are
-    # values, not factor coefficients: extracted as a per-observation
-    # column.
+    # values, not factor coefficients: scalar assignments by position,
+    # per-observation columns when gathered.
     (core.args[1] in ctx.value_arrays || _is_array_def(core.args[1], ctx)) &&
         return _extract_summand(pname, core, sign, ctx)
     length(core.args) == 2 || _sfail("predictor $pname: factor indexing " *
@@ -9855,9 +10451,26 @@ function _treatment_removed(idx)
     return "got $(repr(idx))"
 end
 
+# Strict declarations (user decision 05oe96l): a name that is not a data
+# column, a definition, or a declared parameter never becomes a parameter
+# with a default prior — on every entry point (`@rkppl` and direct
+# `lower_rkppl` alike). It fails naming the declaration to write.
+function _undeclared_coefficient(name::Symbol, pname::Symbol, alt = nothing)
+    _sfail("predictor $pname: `$name` is not a data column, a definition, " *
+           "or a declared parameter — declare its prior " *
+           "(`$name ~ Normal(0, 1)`" *
+           (alt === nothing ? "" : " or `$alt`") * ") or fix the name")
+end
+
+function _undeclared_vector(name::Symbol, X::Symbol, where::Symbol)
+    _sfail("$where: coefficient vector `$name` of design matrix $X has no " *
+           "prior — declare it (`$name[axes($X, 2)] .~ Normal.(0, 1)`) or " *
+           "fix the name")
+end
+
 # Coefficient priors: recovered by name from `coef ~ Fam(...)` statements
-# (one family per addressee — see `_COEF_FAMILIES`); missing scalar priors
-# default to Normal(0, 1) (emitter convention). Factor coefficients instead
+# (one family per addressee — see `_COEF_FAMILIES`); an undeclared scalar
+# coefficient fails (`_undeclared_coefficient`). Factor coefficients instead
 # take broadcast priors (`c[levels(g)] .~ Fam.(...)`), which also size the
 # block — required, never defaulted — and each one emits its LevelMap.
 # Plan order follows predictors, addressees in term order.
@@ -9913,10 +10526,7 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                     stated, levelmaps, hyper_names, ctx))
                 continue
             end
-            if !haskey(stated, name)
-                push!(priors, PopulationPrior(pred.name, addr, 0.0, 1.0))
-                continue
-            end
+            haskey(stated, name) || _undeclared_coefficient(name, pred.name)
             s = stated[name]
             s.levels !== nothing && _sfail("coefficient $name takes a " *
                                            "scalar prior, not a levels prior — it is used " *
@@ -9933,9 +10543,8 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
 end
 
 # A matrix coefficient vector: K per-element PopulationPriors over the
-# use-matrix columns (`:Intercept` at intercept positions). Unstated
-# vectors default to K× Normal(0, 1) (emitter convention — the width is
-# static, so no declaration is needed to size them). Stated vectors take
+# use-matrix columns (`:Intercept` at intercept positions). An unstated
+# vector fails (`_undeclared_vector` — strict declarations). Stated vectors take
 # `b[axes(S, 2)] .~ Fam.(args...)` — one shared family with scalar
 # (shared) or length-K literal-vector (per-element) args — real
 # broadcast semantics.
@@ -9950,13 +10559,12 @@ function _lower_matrix_priors(pred, t, coefuse, stated, matrices,
     name, _, sign = use
     elems = _matrix_element_addressees(m)
     K = length(elems)
-    haskey(stated, name) || return PopulationPrior[
-        PopulationPrior(pred.name, e, 0.0, 1.0) for e in elems]
+    haskey(stated, name) || _undeclared_vector(name, X, pred.name)
     s = stated[name]
     # Reachable only with a matrix marker sized for this use:
     # classification accepts a use only for declared vectors (width
-    # checked against the use matrix) or free names (unstated,
-    # defaulted above).
+    # checked against the use matrix) or free names (unstated, which
+    # fail above).
     s.matrix === nothing && _sfail("internal: matrix prior for $name " *
                                    "lost its sizing matrix")
     fam, locs, scales, nus =
@@ -10100,8 +10708,8 @@ function _coefficient_horseshoe(name, rhs, pname, addr)
 end
 
 # Horseshoe predictors to IR: one HorseshoePrior per stated `~ Horseshoe()`
-# addressee plus its synthesized triple; stated-Normal (or unstated)
-# scalar addressees ride Normal scalars (the mixed-predictor
+# addressee plus its synthesized triple; stated-Normal scalar addressees
+# ride Normal scalars (unstated ones fail — strict declarations) (the mixed-predictor
 # coordinate). Anything but intercept/continuous/offset terms fails
 # closed (the flat slice).
 function _lower_horseshoe_priors(sample, coefuse, predictors,
@@ -10126,11 +10734,8 @@ function _lower_horseshoe_priors(sample, coefuse, predictors,
             use === nothing && _sfail("internal: no coefficient use for " *
                                       "($(pred.name), $addr)")
             name, _, sign = use
-            if !haskey(stated, name)
-                push!(params, _horseshoe_normal_param(pred.name, addr,
-                    0.0, 1.0, taken))
-                continue
-            end
+            haskey(stated, name) || _undeclared_coefficient(name, pred.name,
+                "$name ~ Horseshoe()")
             s = stated[name]
             if _is_horseshoe_call(s.rhs)
                 ls, gs = _coefficient_horseshoe(name, s.rhs, pred.name,
@@ -10719,6 +11324,12 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
     arrays = ArrayParameter[]
     for s in sample
         (s.lhs in ctx.data || s.lhs in ctx.derived_responses) && continue
+        if s.slices === :per_level
+            haskey(coefuse, s.lhs) && _sfail("$(s.lhs) is a predictor " *
+                "coefficient and cannot also be an LKJCholesky factor")
+            push!(arrays, _lower_lkj_stack(s.lhs, s.dims, s.rhs))
+            continue
+        end
         if s.slices !== nothing
             push!(arrays, _lower_array_slices(s.lhs, s.dims, s.slices, s.rhs,
                 coefuse, syms))
@@ -10823,6 +11434,18 @@ function _lower_lkj_cholesky(lhs, rhs)
         "got $(repr(eta))")
     return ArrayParameter(lhs, :lkj_cholesky, (arg1 = Float64(eta),),
         Any[dim, dim], nothing, lhs)
+end
+
+# One LKJ correlation factor per level of `g` (a per-level `@plate` cell):
+# the stacked array `:lkj_cholesky_stack` with dims `[K, K, levels(g)]`.
+# K is a literal ≥ 2 (a 1×1 factor is the constant 1).
+function _lower_lkj_stack(lhs, dims::Vector{Any}, rhs)
+    one = _lower_lkj_cholesky(lhs, rhs)
+    K = one.dims[1]
+    K isa Int && K >= 2 || _sfail("per-level `$lhs[k] ~ LKJCholesky(K, " *
+        "eta)`: K is a literal ≥ 2, got $(repr(K))")
+    return ArrayParameter(lhs, :lkj_cholesky_stack, one.args,
+        Any[K, K, dims[3]], nothing, lhs)
 end
 
 # `z[axes...] .~ Fam.(args...)`: the elementwise prior is the scalar
@@ -11497,6 +12120,8 @@ function _lower_truncated_param(lhs, rhs, coefuse, matrices)
         "parameter $lhs: `truncated` wraps a distribution object, got " *
         "$(repr(obj))")
     fam = obj.args[1]
+    fam === :LogNormal && return _lower_truncated_lognormal(lhs, obj, lo_a,
+        hi_a, coefuse, matrices)
     haskey(_TRUNCATED_BASES, fam) || _sfail(
         "parameter $lhs: `truncated` wraps a symmetric base " *
         "(`truncated(Normal(mu, s), lo, hi)`; admitted: Normal, Cauchy, " *
@@ -11543,6 +12168,31 @@ function _lower_truncated_param(lhs, rhs, coefuse, matrices)
         "(`truncated(Normal(mu, s), lo, hi)`); got $fam")
     return SampledParameter(lhs, base,
         (arg1 = vals[1], arg2 = vals[2]), (:interval, lo, hi), lhs)
+end
+
+# A lower-only truncation of a positive-support base,
+# `truncated(LogNormal(m, s), lo, Inf)` (user decision `0z5bsqi`, prong
+# `floor`: the subset the HSGP validity floor needs ahead of the general
+# `truncated` lane): `x = lo + exp(u)`, renormalized as in Distributions
+# (`-log P(X > lo)`). `lo` is a non-negative literal or the name of a
+# model-level data value (`rho_floor = maximum(hsgp_rho_floors(lambda))`),
+# read from the bound data.
+function _lower_truncated_lognormal(lhs, obj::Expr, lo_a, hi_a, coefuse,
+        matrices)
+    oargs = _plain_args(obj, "`LogNormal`")
+    length(oargs) == 2 ||
+        _sfail("parameter $lhs: `LogNormal` takes 2 arguments")
+    vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in oargs]
+    hi = _truncation_bound(lhs, hi_a)
+    isinf(hi) && hi > 0 || _sfail("parameter $lhs: a truncated LogNormal " *
+        "takes `Inf` as its upper bound (`truncated(LogNormal(m, s), lo, " *
+        "Inf)`), got $(repr(hi_a))")
+    lo = lo_a isa Symbol && lo_a !== :Inf ? lo_a : _truncation_bound(lhs, lo_a)
+    lo isa Symbol || (isfinite(lo) && lo >= 0) || _sfail("parameter $lhs: " *
+        "a truncated LogNormal's lower bound is a finite non-negative " *
+        "literal or a data name, got $(repr(lo_a))")
+    return SampledParameter(lhs, :lognormal, (arg1 = vals[1], arg2 = vals[2]),
+        (:lower, lo isa Symbol ? lo : Float64(lo)), lhs)
 end
 
 function _lower_assignment(nm, rhs, coefuse)
