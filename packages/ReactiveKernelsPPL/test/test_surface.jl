@@ -2257,11 +2257,13 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, Dn)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # A sampled scalar parameter is a location value, read for every
+    # observation (test_bare_location.jl "value location lowering").
+    vloc = lower_rkppl(quote
         theta ~ Normal(0, 1)
-        mu = a .+ b .* x
         y .~ Normal.(theta, 1.0)
-    end, Dn)
+    end, (:y,))
+    @test only(only(vloc.predictors).terms).options.tree === :theta
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y1 .~ Normal.(mu, 1.0)

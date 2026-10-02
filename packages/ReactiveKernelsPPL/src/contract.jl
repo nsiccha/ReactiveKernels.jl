@@ -5435,6 +5435,9 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
         )
         # (A bound model-level data value — an assignment evaluated at
         # bind — is a column entry but no observation column.)
+        # A raw whole-value input is a bound operand, not a graph node.
+        bound && haskey(plan.columns, ex) &&
+            ex in first(_bound_model_level_inputs(plan)) && return nothing
         bound && haskey(plan.columns, ex) &&
             !any(a -> a.name === ex, plan.assignments) && _fail(
             label,
@@ -5804,7 +5807,9 @@ end
 function _is_vector_valued(ex, plan::StructuralPlan)
     ex isa Symbol && return !(ex in _union_names(plan) ||
         ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
-    ex isa Expr && ex.head === :ref && _is_array_param(plan, ex.args[1]) &&
+    ex isa Expr && ex.head === :ref && ex.args[1] isa Symbol &&
+        (_is_array_param(plan, ex.args[1]) ||
+            _is_array_assignment(plan, ex.args[1])) &&
         return _array_index_kind(plan, ex) === :gather &&
             all(i -> i isa Int, ex.args[3:end])
     ex isa Number && return false

@@ -814,7 +814,28 @@ end
 
 function _composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
     o = t.options
-    return _composed_rewrite(o.tree, o.subs, plan, pred.name)
+    ex = _composed_rewrite(o.tree, o.subs, plan, pred.name)
+    # A composition over scalars only (a value location, `y .~
+    # Normal.(mu, s)`) has no rows of its own: broadcast it over the rows
+    # of the response it locates like an intercept (the `mo` intercept
+    # shape), so every family emitter reads an ordinary LP vector.
+    isempty(o.subs) && isempty(t.columns) || return ex
+    return Expr(:call, :.*, Expr(:call, :ones, _located_rows(plan, pred)),
+        ex)
+end
+
+# Rows of the responses a predictor locates — their own observation axis,
+# which is not `n_obs` when responses observe different rows. Subject- or
+# dose-level predictors keep their kernel rows.
+function _located_rows(plan::StructuralPlan, pred::PredictorSpec)
+    _predictor_level(plan, pred.name) === :obs ||
+        return _predictor_rows(plan, pred.name)
+    rows = unique!([_response_rows(plan, r) for r in plan.responses
+        if _response_uses_predictor(r, pred.name)])
+    length(rows) == 1 || throw(ContractValidationError("[generator] " *
+        "predictor $(pred.name) locates responses with rows $rows " *
+        "(one row count per scalar-valued predictor)"))
+    return only(rows)
 end
 
 # Group-index encoder nodes, one per grouped column (`_ppl_gidx_<group>`):
