@@ -734,7 +734,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         rhs = detmap[nm]
         _reject_unknown_calls("definition `$nm = $(repr(rhs))`", rhs;
             composed_maps = true)
-        canonmap[nm] = _canonical_expr(rhs, data, detshape,
+        canonmap[nm] = _canonical_expr(rhs, data, detmap, detshape, shape_env,
             "definition `$nm = $(repr(rhs))`")
     end
     # Design matrices leave `det` for the plan-level table (validated
@@ -758,7 +758,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # definition already interned as a predictor reads its LP node).
     pred_idx = Dict{Symbol,Int}()
     ctx = (; data, detmap = canonmap, prior_names, coef_priors, demotable,
-        detshape,
+        detshape, shape_env,
         vecdefs, structural, derived_responses = derived_response_names,
         pred_idx,
         plate_names, absorbed = Set{Symbol}(),
@@ -1041,7 +1041,8 @@ end
 
 # Shape inference + canonicalization (data-free, Julia-truthful). Shapes:
 # data columns are vectors, sampled/det names resolve by position and memo,
-# dotted forms are vectors, reductions are scalars, `hcat` is a matrix,
+# dotted forms follow their operands' observation axis or model-level
+# provenance, reductions are scalars, `hcat` is a matrix,
 # undotted scalar-array combinations follow Julia exactly (`2*v`, `v*2`,
 # `v/2`, `-v` are vectors; `a+x`, `x*z`, `s/x`, `x^2`, `x>1`, `log(x)`
 # are `:invalid` — Julia `MethodError`s, reported with the dotted fix).
@@ -1049,9 +1050,8 @@ end
 # (`*`, `/`) to dotted-canonical form (Base implements them by broadcast —
 # behavior-preserving); matrices never dotted-rewrite (`X * b` keeps its
 # shape for predictor classification); every other head passes through.
-# Unknown call heads do not shape-route here (the vocabulary screen
-# rejects them first); their shape follows their arguments so the
-# downstream error names the function.
+# Module calls return model-level values; the remaining built-in call
+# heads follow their argument shapes, after the vocabulary screen.
 # Shape context beyond data and definitions (functions as values):
 # `aligned` holds the non-data names that carry the observation axis
 # (per-cell latents, scan states, varying bindings); `values` the
@@ -1316,7 +1316,7 @@ _is_plain_comparison(fn::Symbol) =
     fn === :< || fn === :> || fn === :(==) || fn === :(!=) ||
     fn === :(<=) || fn === :(>=)
 
-function _canonical_expr(ex, data, detshape, where)
+function _canonical_expr(ex, data, detmap, detshape, env, where)
     ex isa Symbol && return ex
     ex isa Expr || return ex
     ex.head === :parameters && _sfail("$where takes positional " *
@@ -1326,8 +1326,9 @@ function _canonical_expr(ex, data, detshape, where)
     fn = ex.args[1]
     fn isa Symbol || return ex
     fn in REDUCTION_FNS && return ex  # args validated downstream
-    args = [_canonical_expr(a, data, detshape, where) for a in ex.args[2:end]]
-    argshapes = [_canon_shape(a, data, detshape) for a in args]
+    args = [_canonical_expr(a, data, detmap, detshape, env, where)
+        for a in ex.args[2:end]]
+    argshapes = [_canon_shape(a, data, detmap, detshape, env) for a in args]
     if :invalid in argshapes
         return Expr(ex.head, ex.args[1], args...)  # broken ref: raises at its own def
     end
@@ -1354,47 +1355,15 @@ function _canonical_expr(ex, data, detshape, where)
     return Expr(ex.head, ex.args[1], args...)
 end
 
-function _canon_shape(ex, data, detshape)
-    ex isa Symbol || return _canon_shape_expr(ex, data, detshape)
-    ex in data && return :vector
-    return get(detshape, ex, :scalar)
-end
-
-function _canon_shape_expr(ex, data, detshape)
-    ex isa Expr || return :scalar
-    shape(a) = _canon_shape(a, data, detshape)
-    head = ex.head
-    if head === :.
-        if _is_dotted_call(ex)
-            argsh = [shape(a) for a in ex.args[2].args]
-            (:array in argsh || :invalid in argsh) &&
-                return _elementwise_shape(argsh)
-        end
-        (_is_dotted_call(ex) && ex.args[1] isa GlobalRef) || return :vector
-        return any(a -> _canon_shape(a, data, detshape) in
-            (:vector, :matrix), ex.args[2].args) ? :vector : :scalar
-    end
-    if head === :ref
-        base = ex.args[1]
-        base isa Symbol && shape(base) === :array &&
-            return _ref_shape(ex, data, shape)
-        (length(ex.args) == 2 && (ex.args[1] isa Expr ||
-            ex.args[1] in data || haskey(detshape, ex.args[1]))) ||
-            return :scalar
-        return _canon_shape(ex.args[2], data, detshape) === :vector ?
-            :vector : :scalar
-    end
-    head === Symbol("'") && return shape(ex.args[1]) === :array ? :array :
-        :scalar
-    head === :call || return :scalar
-    isempty(ex.args) && return :scalar
-    fn = ex.args[1]
-    fn isa Symbol || return :scalar
-    fn in REDUCTION_FNS && return :scalar
-    fn in ELEMENTWISE_OPS &&
-        return _elementwise_shape([shape(a) for a in ex.args[2:end]])
-    return _shape_of_call(fn, [shape(a) for a in ex.args[2:end]])
-end
+# Canonicalization and predictor classification use the same definition
+# context and rules as inference. A shape alone cannot distinguish a
+# scalar from a module call's model-level value: both are `:scalar`, but
+# only the latter keeps a built-in broadcast model-level. Re-running a
+# separate dotted => vector classifier here used to lose that provenance.
+_canon_shape(ex, data, detmap, detshape, env) =
+    _shape_of(ex, data, detmap, detshape, Set{Symbol}(), env)
+_canon_shape(ex, ctx) =
+    _canon_shape(ex, ctx.data, ctx.detmap, ctx.detshape, ctx.shape_env)
 
 function _julia_mismatch_msg(fn::Symbol, where, ex, argshapes)
     if :array in argshapes
@@ -8234,7 +8203,7 @@ function _summand_latent_scaled(core, ctx)
             elseif f isa Number
                 return false
             else
-                _canon_shape(f, ctx.data, ctx.detshape) === :vector ||
+                _canon_shape(f, ctx) === :vector ||
                     return false
                 any(s -> s in ctx.plate_names, _value_symbols(f)) &&
                     return false
@@ -8793,7 +8762,8 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
         "predictor $pname calls `hcat` outside a matrix definition — " *
         "bind the matrix to a name first (`X = hcat(1, x, ...)`)")
     _reject_unknown_calls(where, expanded)
-    canon = _canonical_expr(expanded, ctx.data, ctx.detshape, where)
+    canon = _canonical_expr(expanded, ctx.data, ctx.detmap, ctx.detshape,
+        ctx.shape_env, where)
     out = Tuple{Int,Any}[]
     _collect_signed!(out, canon, 1, pname)
     terms = TermSpec[]
@@ -9008,7 +8978,7 @@ function _classify_summand(pname, core, sign::Int, ctx)
             (core.args[1] isa Expr || core.args[1] in ctx.data ||
                 haskey(ctx.detmap, core.args[1]) ||
                 core.args[1] in ctx.dirichlet_names) &&
-            _canon_shape(core.args[2], ctx.data, ctx.detshape) === :vector
+            _canon_shape(core.args[2], ctx) === :vector
         # A gather of a value (`cum[c]`) is an observation column, exactly
         # as its named form `m = cum[c]`; a levels coefficient indexed by
         # its group (`c[g]`) stays a factor below.
@@ -9023,7 +8993,7 @@ function _classify_summand(pname, core, sign::Int, ctx)
     # Any other per-observation summand (a computed coefficient, a
     # parameter-scaled column, `exp.(s .* x)`) is an in-graph derived
     # column: the fallback, never a refusal.
-    if _canon_shape(core, ctx.data, ctx.detshape) === :vector
+    if _canon_shape(core, ctx) === :vector
         return _extract_summand(pname, core, sign, ctx)
     end
     # A number bound as data is a constant, read as its definition
@@ -9538,7 +9508,7 @@ function _classify_product(pname, core::Expr, sign::Int, ctx)
                 computed = true
             end
         elseif !(g isa Number) &&
-                _canon_shape(g, ctx.data, ctx.detshape) === :vector
+                _canon_shape(g, ctx) === :vector
             push!(values, g)
         else
             computed = true
