@@ -6083,9 +6083,7 @@ const _JOINT_FACTOR_FAMILIES = (:positive_exponential, :cholesky_corr_lkj)
 # closed). Sizes resolve at bind (`nothing` = infer from the linked leveled
 # response, or from the concentration length for a monotonic-linked
 # simplex); an explicit size is bounds-checked here and linked-checked in
-# `_validate_responses`. Each vector parameter serves exactly one response
-# or one monotonic term (SB allocates per response and per `mo` term;
-# sharing fails closed).
+# `_validate_responses`. Vector declarations can have several readers.
 function _validate_vector_parameters(plan::StructuralPlan)
     for p in plan.vector_parameters
         haskey(VECTOR_ARITY, p.family) || _fail(p.label,
@@ -6151,11 +6149,11 @@ function _validate_vector_parameters(plan::StructuralPlan)
                 "threshold size must be ≥ 0, got $(p.size)")
         end
     end
-    # Linkage: each vector parameter is referenced by exactly one response
+    # Linkage: a vector parameter may be referenced by several responses
     # (as `thresholds` for ordered families, as `threshold_coefs` for
     # per-threshold Ordinal, as the simplex `predictor`, or as a joint
-    # factor piece), by exactly one monotonic term (as its `increments`
-    # simplex), or by exactly one R2D2 prior (as its share `phi`).
+    # factor piece), by monotonic terms (as their `increments`
+    # simplex), or by an R2D2 prior (as its share `phi`).
     refs = Dict{Symbol,Vector{Symbol}}(
         p.name => Symbol[] for p in plan.vector_parameters)
     for r in plan.responses
@@ -6210,8 +6208,7 @@ function _validate_vector_parameters(plan::StructuralPlan)
         push!(refs[rp.phi], rp.predictor)
     end
     # Definitions read vector parameters as whole values (functions as
-    # values); any number of definitions may read one, beside at most one
-    # construct link.
+    # values); definitions and construct links read the same declared value.
     defreads = Set{Symbol}()
     for a in plan.assignments
         _expr_value_symbols(a.expr, defreads)
@@ -6231,10 +6228,6 @@ function _validate_vector_parameters(plan::StructuralPlan)
             "vector parameter $(p.name) unused by any response, " *
             "monotonic term, joint-factor link, R2D2 prior, " *
             "or definition")
-        length(got) <= 1 || _fail(p.label,
-            "vector parameter $(p.name) shared by " *
-            "$(join(got, ", ")) — one vector parameter per response, " *
-            "monotonic term, joint-factor link, or R2D2 prior")
     end
     return nothing
 end

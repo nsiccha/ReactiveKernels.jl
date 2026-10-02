@@ -300,13 +300,14 @@ end
         c[1:2, 1:2] .~ Normal.(0, 1)
         y .~ Ordinal.(StoppingRatio(), LogitLink(), b .* x, Ref(c))
     end))
-    # capability: ordinary cutpoint/vector priors, sizes and reuse (P8 1cmodra; 10gzbm9 shared-slots/level-coverage; todo `1qlbn5b`)
-    @test_broken (_oe_lower(quote
+    shared = _oe_lower(quote
         b ~ Normal(0, 1)
         c ~ Ordered(Normal(0, 1), 2)
         y .~ OrderedLogistic.(b .* x, Ref(c))
         y2 .~ OrderedLogistic.(b .* x, Ref(c))
-    end, data); true)
+    end, data)
+    @test length(shared.vector_parameters) == 1
+    @test all(r -> r.thresholds === :c, shared.responses)
     # The data-sized length names the response the cutpoints serve.
     for n in (:(length(levels(x)) - 1), :(length(levels(y)) - 2),
             :(length(unique(y)) - 1))

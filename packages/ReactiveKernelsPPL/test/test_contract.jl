@@ -2530,7 +2530,7 @@ end
         vector_parameters = base.vector_parameters)
     # refused: vector parameter name collides with a scalar parameter (single assignment / name collision)
     @test_throws ContractValidationError validate_structure(clash)
-    # Sharing one thresholds vector across two responses fails closed.
+    # Both responses read the same declaration, whose prior is counted once.
     r2 = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu, nothing,
         nothing, _none_evidence(), :y_resp2, nothing, nothing;
         thresholds = :y_cutpoints, n_levels = 3)
@@ -2538,8 +2538,7 @@ end
         base.population_priors, base.parameters, base.assignments,
         base.columns, base.n_obs;
         vector_parameters = base.vector_parameters)
-    # capability: one thresholds vector shared across two ordinal responses (todo `1qlbn5b`)
-    @test_broken (validate_structure(shared); true)
+    @test validate_structure(shared) === nothing
     # Roles: count tails are responses, threshold design is predictor.
     bound = _multinomial_plan()
     @test bound.roles[:c1] === :response

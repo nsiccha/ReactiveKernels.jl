@@ -7995,8 +7995,8 @@ end
 # (Distributions.jl `OrderedLogistic.(eta, Ref(c))` broadcast semantics).
 # Cumulative structures take an `Ordered(...)` vector; stopping-ratio
 # stage thresholds are unconstrained, a one-axis sized
-# `c[1:K] .~ Normal.(m, s)` declaration. Each vector serves exactly one
-# response (recorded for `_lower_parameters`, which sizes it).
+# `c[1:K] .~ Normal.(m, s)` declaration. A vector may serve several
+# responses; its first use records a size source for `_lower_parameters`.
 function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
         shown::String)
     name = arg isa Expr && arg.head === :call && length(arg.args) == 2 &&
@@ -8022,10 +8022,9 @@ function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
             "thresholds $name must be a one-axis vector declared in the " *
             "model (`$name[1:length(levels($lhs)) - 1] .~ Normal.(0, 1)`)")
     end
-    prev = get(ctx.threshold_uses, name, nothing)
-    prev === nothing || _sfail("response $lhs: cutpoints $name already " *
-        "serve response $(prev.response) — one response per cutpoint vector")
-    ctx.threshold_uses[name] = (response = lhs, ordered = ordered)
+    # A declaration owns its vector; responses only read it. Keep the first
+    # use for an inferred extent, then validate every reader's extent at bind.
+    get!(ctx.threshold_uses, name, (response = lhs, ordered = ordered))
     return name
 end
 
