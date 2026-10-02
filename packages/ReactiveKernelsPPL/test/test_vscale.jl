@@ -71,7 +71,7 @@ _vs_stdnormal_prior(coefs...) =
         mu = a .+ b .* x
         sigma = c .+ d .* z
         y .~ Normal.(mu, exp.(sigma))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     r = only(plan0.responses)
     @test r.scale == ScalePredictorRef(:sigma, LogLink)
     @test [(p.name, p.link) for p in plan0.predictors] ==
@@ -98,7 +98,7 @@ end
         mu = a .+ b .* x
         sg = c .+ d .* z
         y .~ Normal.(mu, sg)
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     @test only(bare.responses).scale == ScalePredictorRef(:sg, IdentityLink)
     @test only(p for p in bare.predictors if p.name === :sg).link ===
         IdentityLink
@@ -110,7 +110,7 @@ end
         mu = a .+ b .* x
         sg = c .+ d .* z
         y .~ Normal.(mu, logistic.(sg))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     @test only(logit.responses).scale == ScalePredictorRef(:sg, LogitLink)
     @test only(p for p in logit.predictors if p.name === :sg).link ===
         LogitLink
@@ -125,7 +125,7 @@ end
         eta = a .+ b .* x
         phi = c .+ d .* z
         y .~ NegativeBinomial2.(exp.(eta), exp.(phi))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     @test only(nb2.responses).scale == ScalePredictorRef(:phi, LogLink)
     gamma = lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -135,7 +135,7 @@ end
         eta = a .+ b .* x
         s = c .+ d .* z
         y .~ Gamma.(exp.(s), exp.(eta) ./ exp.(s))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     @test only(gamma.responses).scale == ScalePredictorRef(:s, LogLink)
     # Both Gamma positions must name the same alpha spelling — mixed
     # wrappers never merge.
@@ -148,7 +148,7 @@ end
         eta = a .+ b .* x
         s = c .+ d .* z
         y .~ Gamma.(s, exp.(eta) ./ exp.(s))
-    end, (:y, :x, :z)); true)
+    end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
     # capability: Gamma args beyond the (alpha, mu/alpha) template: different predictors in shape and mean divisor (todo `1qlbn5b`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -161,7 +161,7 @@ end
         s = c .+ d .* z
         t = e .+ f .* x
         y .~ Gamma.(exp.(s), exp.(eta) ./ exp.(t))
-    end, (:y, :x, :z)); true)
+    end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
 end
 
 @testset "surface: shared scale predictor" begin
@@ -177,7 +177,7 @@ end
         sigma = c .+ d .* z
         y1 .~ Normal.(mu1, exp.(sigma))
         y2 .~ Normal.(mu2, exp.(sigma))
-    end, (:y1, :y2, :x, :z))
+    end, (:y1, :y2, :x, :z); conditioned = (:y1, :y2, :x, :z))
     @test length(plan0.responses) == 2
     @test all(r -> r.scale == ScalePredictorRef(:sigma, LogLink),
         plan0.responses)
@@ -196,7 +196,7 @@ end
         sigma = c .+ d .* z
         y1 .~ Normal.(mu1, exp.(sigma))
         y2 .~ Normal.(mu2, sigma)
-    end, (:y1, :y2, :x, :z)); true)
+    end, (:y1, :y2, :x, :z); conditioned = (:y1, :y2, :x, :z)); true)
 end
 
 @testset "surface: intercept-only scale predictor" begin
@@ -210,7 +210,7 @@ end
         mu = a .+ b .* x
         sigma = c
         y .~ Normal.(mu, exp.(sigma))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     r = only(plan0.responses)
     @test r.scale == ScalePredictorRef(:sigma, LogLink)
     pred = only(p for p in plan0.predictors if p.name === :sigma)
@@ -226,7 +226,7 @@ end
         mu = a .+ b .* x
         sigma = c
         y .~ Normal.(mu, exp.(sigma))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     pr = only(p for p in stated.parameters if p.name === :c)
     @test pr.args == (arg1 = 0.0, arg2 = 5.0)
     # Strict declarations: the intercept-only scale's coefficient is
@@ -240,7 +240,7 @@ end
         mu = a .+ b .* x
         sg = c
         y .~ Normal.(mu, sg)
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     @test only(bare.responses).scale === :sg
     # Non-Normal parameter aliases stay scalar-path (no reroute).
     aliased = lower_rkppl(quote
@@ -250,7 +250,7 @@ end
         s ~ Exponential(1.0)
         s2 = s
         y .~ Normal.(mu, s2)
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     @test only(aliased.responses).scale === :s2
     # Normal-priored aliases stay scalar-path on a bare use too: naming a
     # stated name must not re-bucket it (a latent-submodel `s = s_r`
@@ -263,7 +263,7 @@ end
         s_r ~ Normal(0.0, 1.0)
         s = s_r
         y .~ Normal.(mu, s)
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     @test only(naliased.responses).scale === :s
     @test any(p -> p.name === :s_r, naliased.parameters)
     @test !any(p -> p.predictor === :s, naliased.population_priors)
@@ -277,7 +277,7 @@ end
         mu = a .+ b .* x
         ls = c .+ d .* z
         y .~ Normal.(mu, exp(ls))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     # Wrappers take exactly one predictor definition.
     # capability: constant-expression scale exp.(1.5) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(quote
@@ -285,7 +285,7 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(1.5))
-    end, (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: link-wrapped scalar parameter as scale exp.(tau) (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -293,19 +293,19 @@ end
         tau ~ Exponential(1.0)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(tau))
-    end, (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: data-expression scale exp.(x) (data-computed scales already admitted) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(x))
-    end, (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x)); true)
     # refused: undeclared name nosuch (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(nosuch))
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     # capability: arbitrary elementwise function on a scale predictor sqrt.(sigma) (P8, 1cmodra) (todo `1qlbn5b`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -315,7 +315,7 @@ end
         mu = a .+ b .* x
         sigma = c .+ d .* z
         y .~ Normal.(mu, sqrt.(sigma))
-    end, (:y, :x, :z)); true)
+    end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
     # capability: probit.-wrapped scale predictor (arbitrary scale wrapper) (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -325,7 +325,7 @@ end
         mu = a .+ b .* x
         sigma = c .+ d .* z
         y .~ Normal.(mu, normcdf.(sigma))
-    end, (:y, :x, :z)); true)
+    end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
     # The two slots take distinct predictors (contract gate, BRM-mirroring).
     # A same-link self-use reaches the contract rule; a wrapped self-use
     # trips the one-link-per-predictor rule first (same fail-closed).
@@ -335,14 +335,14 @@ end
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(mu))
-    end, (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, mu)
-    end, (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x)); true)
     # Beta-kappa predictors are log-only (a concentration — contract
     # gate): a bare predictor use fails closed.
     # capability: identity-link Beta concentration predictor (bare k) (todo `05fuzch`)
@@ -354,7 +354,7 @@ end
         mu = a .+ b .* x
         k = c .+ d .* z
         y .~ Beta.(logistic.(mu) .* k, (1 .- logistic.(mu)) .* k)
-    end, (:y, :x, :z)); true)
+    end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
     # Predictor-fed Binomial trials are deferred: trials stay
     # column-or-literal.
     # refused: Binomial trials from a real-valued affine predictor are non-integer (mathematically invalid; comment says deferred)
@@ -362,7 +362,7 @@ end
         mu = a .+ b .* x
         n = c .+ d .* z
         y .~ Binomial.(n, logistic.(mu))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     # Factor scale coefficients need their broadcast prior, exactly like
     # factor locations (required, never defaulted).
     # refused: undeclared factor scale coefficients cs (P6 05oe96l, P7 0d5a67r)
@@ -372,7 +372,7 @@ end
         mu = a .+ b .* x
         sg = cs[g]
         y .~ Normal.(mu, exp.(sg))
-    end, (:y, :x, :g))
+    end, (:y, :x, :g); conditioned = (:y, :x, :g))
     # A latent transform is not an affine predictor: it stays on the
     # scalar path and fails there, never analyzed for coefficients.
     expr = Expr(:block,
@@ -385,7 +385,7 @@ end
                     :(theta[i] ~ Normal(mu, tau)),
                     :(y[i] ~ Normal.(theta[i], _t2[i]))))))
     # capability: deterministic transform of a plate latent (_t2 = theta .+ 1) as per-cell scale (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(expr, (:y,)); true)
+    @test_broken (lower_rkppl(expr, (:y,); conditioned = (:y,)); true)
 end
 
 @testset "contract: hand-built scale-predictor plans" begin
@@ -466,7 +466,7 @@ end
             mu = a .+ b .* x
             sigma = c .+ d .* z
             y .~ Normal.(mu, exp.(sigma))
-        end, (:y, :x, :z)), _vs_cols())
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)), _vs_cols())
     built = build_kernel(plan)
     u = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u)
@@ -490,7 +490,7 @@ end
             mu = a .+ b .* x
             sigma = c
             y .~ Normal.(mu, exp.(sigma))
-        end, (:y, :x, :z)), _vs_cols())
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)), _vs_cols())
     built = build_kernel(plan)
     @test coordinate_names(built.layout) ==
         [:a, :b, :c]
@@ -519,7 +519,7 @@ end
             mu = a .+ b .* x
             sg = c .+ d .* z
             y .~ Normal.(mu, sg)
-        end, (:y, :x, :z)), cols)
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)), cols)
     built = build_kernel(plan)
     u = [0.5, -0.25, 1.0, 0.1]
     nt = constrain(built.layout, u)
@@ -542,7 +542,7 @@ end
             mu = a .+ b .* x
             sg = c .+ d .* z
             y .~ Normal.(mu, logistic.(sg))
-        end, (:y, :x, :z)), cols)
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)), cols)
     built = build_kernel(plan)
     u = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u)
@@ -569,7 +569,7 @@ end
             eta = a .+ b .* x
             phi = c .+ d .* z
             y .~ NegativeBinomial2.(exp.(eta), exp.(phi))
-        end, (:y, :x, :z)),
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)),
         Dict{Symbol,AbstractVector}(:y => [3, 1, 6, 2, 1, 4], :x => x,
             :z => z))
     built = build_kernel(plan)
@@ -597,7 +597,7 @@ end
             eta = a .+ b .* x
             s = c .+ d .* z
             y .~ Gamma.(exp.(s), exp.(eta) ./ exp.(s))
-        end, (:y, :x, :z)),
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)),
         Dict{Symbol,AbstractVector}(:y => yg, :x => x, :z => z))
     built = build_kernel(plan)
     u = [-0.2, 0.1, 0.4, -0.15]
@@ -623,7 +623,7 @@ end
             mu = a .+ b .* x
             sigma = c .+ d .* z
             y .~ StudentT.(4.0, mu, exp.(sigma))
-        end, (:y, :x, :z)), cols)
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)), cols)
     r = only(plan.responses)
     @test r.scale == ScalePredictorRef(:sigma, LogLink)
     @test r.nu == 4.0
@@ -651,7 +651,7 @@ end
                 mu = a .+ b .* x
                 sigma = c .+ d .* z
                 y .~ $ev
-            end, (:y, :x, :z)), cols)
+            end, (:y, :x, :z); conditioned = (:y, :x, :z)), cols)
     u = [0.5, -0.25, 0.1, 0.2]
     function _lps(built)
         nt = constrain(built.layout, u)
@@ -715,7 +715,7 @@ end
             mu = a .+ b .* x
             sigma = c .+ d .* z
             y .~ weighted.(Normal.(mu, exp.(sigma)), w)
-        end, (:y, :x, :z, :w)),
+        end, (:y, :x, :z, :w); conditioned = (:y, :x, :z, :w)),
         Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
             :x => x, :z => z, :w => w))
     built = build_kernel(plan)
@@ -748,7 +748,7 @@ end
             sigma = c .+ d .* z
             y1 .~ Normal.(mu1, exp.(sigma))
             y2 .~ Normal.(mu2, exp.(sigma))
-        end, (:y1, :y2, :x, :z)),
+        end, (:y1, :y2, :x, :z); conditioned = (:y1, :y2, :x, :z)),
         Dict{Symbol,AbstractVector}(:y1 => y1, :y2 => y2, :x => x, :z => z))
     built = build_kernel(plan)
     @test built.layout.total == 6
@@ -779,7 +779,7 @@ end
             mu = a .+ b .* x
             se2 = w .+ v
             y .~ Normal.(mu, se2)
-        end, (:y, :x, :w, :v)),
+        end, (:y, :x, :w, :v); conditioned = (:y, :x, :w, :v)),
         Dict{Symbol,AbstractVector}(:y => y, :x => x, :w => w, :v => v))
     @test only(plan.responses).scale == ScalePredictorRef(:se2, IdentityLink)
     built = build_kernel(plan)
@@ -804,7 +804,7 @@ end
             cs[levels(g)] .~ Normal.(0, 2)
             sg = cs[g]
             y .~ Normal.(mu, exp.(sg))
-        end, (:y, :x, :g)),
+        end, (:y, :x, :g); conditioned = (:y, :x, :g)),
         Dict{Symbol,AbstractVector}(:y => y, :x => x, :g => g))
     @test only(plan.responses).scale == ScalePredictorRef(:sg, LogLink)
     built = build_kernel(plan)
@@ -871,7 +871,7 @@ end
             mu = a .+ b .* x
             sigma = c .+ d .* z
             y .~ Normal.(mu, exp.(sigma))
-        end, (:y, :x, :z)), _vs_cols())
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)), _vs_cols())
     def = kernel_expr(plan, assign_layout(plan))
     found = Dict{Symbol,Any}()
     function _walk(ex)
@@ -925,7 +925,7 @@ _vs_u_by_name(names, pairs) = [Dict(pairs)[n] for n in names]
         mu = a .+ b .* x
         lognu = c .+ d .* z
         y .~ StudentT.(exp.(lognu), mu, 2.0)
-    end, (:y, :x, :z))
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))
     r = only(plan0.responses)
     @test r.nu == ScalePredictorRef(:lognu, LogLink)
     @test r.scale == 2.0
@@ -951,7 +951,7 @@ end
             mu = a .+ b .* x
             lognu = c .+ d .* z
             y .~ StudentT.(exp.(lognu), mu, 2.0)
-        end, (:y, :x, :z)), cols)
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)), cols)
     r = only(plan.responses)
     @test r.nu == ScalePredictorRef(:lognu, LogLink)
     @test r.scale == 2.0
@@ -980,7 +980,7 @@ end
             mu = a .+ b .* x
             lognu = c .+ d .* z
             y .~ StudentT.(exp.(lognu), mu, s)
-        end, (:y, :x, :z)), cols)
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)), cols)
     r = only(plan.responses)
     @test r.nu == ScalePredictorRef(:lognu, LogLink)
     @test r.scale == :s
@@ -1029,7 +1029,7 @@ end
             lognu = c .+ d .* z
             y .~ StudentT.(exp.(lognu), mu, 2.0)
         end
-        bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+        bound = bind_data(lower_rkppl(prog, keys(cols); conditioned = keys(cols)), cols)
         built = build_kernel(bound)
         kern = prepare_query(built, bound, :sampler)
         names = coordinate_names(built.layout)
@@ -1062,7 +1062,7 @@ end
             lognu = c .+ d .* z
             y .~ StudentT.(exp.(lognu), mu, s)
         end
-        bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+        bound = bind_data(lower_rkppl(prog, keys(cols); conditioned = keys(cols)), cols)
         built = build_kernel(bound)
         kern = prepare_query(built, bound, :sampler)
         names = coordinate_names(built.layout)

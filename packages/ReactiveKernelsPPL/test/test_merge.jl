@@ -39,7 +39,7 @@ merge_scale_base = @rkppl begin
     y .~ Normal.(mu, s)
 end
 
-_merge_lower(m) = lower_rkppl(m.ast, (:y, :x); mod = @__MODULE__)
+_merge_lower(m) = lower_rkppl(m.ast, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
 _merge_s_family(params) = first(p.family for p in params if p.name === :s)
 
 @testset "merge prior-swap transparency" begin
@@ -52,10 +52,9 @@ _merge_s_family(params) = first(p.family for p in params if p.name === :s)
         y ~ merge_normal_stream(mu, s)
     end
     @test _plans_equal(got, _merge_lower(hand))
-    # Role-carry: the swapped name keeps its Intercept coefficient row,
-    # with the new scale.
-    row = first(p for p in got.population_priors if p.addressee === :Intercept)
-    @test (row.predictor, row.location, row.scale) === (:mu, 0.0, 10.0)
+    # The declared scalar owns its density and coordinates even as a coefficient.
+    row = only(p for p in got.parameters if p.name === :a)
+    @test (row.args.arg1, row.args.arg2) == (0, 10)
 end
 
 @testset "merge family-swap transparency" begin
@@ -135,19 +134,25 @@ end
     cols, _ = _gen_columns()
     @test length(cols[:y]) == n
     # The fixed value travels: no `s` kwarg needed at the call.
-    bf = fixed(; y = cols[:y], x = cols[:x])
+    bf = (fixed(; x = cols[:x]) | (; y = cols[:y]))
     @test bf.columns[:s] == fill(2.0, n)
-    bh = hand(; y = cols[:y], x = cols[:x], s = fill(2.0, n))
-    @test _plans_equal(bf, bh)
+    bh = (hand(; x = cols[:x], s = fill(2.0, n)) | (; y = cols[:y]))
+    # A pin is a whole model-level array; the handwritten input is a row column.
+    # Both spellings retain the same mathematics and free coordinates.
+    u = [0.2, -0.1]
+    @test build_kernel(bf).layout.total == build_kernel(bh).layout.total
+    @test _query(build_kernel(bf).spec, bf, :posterior, u) ≈
+        _query(build_kernel(bh).spec, bh, :posterior, u)
     # Explicit kwargs win over fixed (SB easily-rebound data).
-    rebound = fixed(; y = cols[:y], x = cols[:x], s = ones(n))
+    rebound = (fixed(; x = cols[:x], s = ones(n)) | (; y = cols[:y]))
     @test rebound.columns[:s] == ones(n)
     # Fix-wins over a splice naming the same LHS in one call.
     both = Base.merge(merge_base, :(s ~ merge_latent_normal(2.0)),
         (; s = fill(2.0, n)))
     @test both.fixed[:s] == fill(2.0, n)
-    bb = both(; y = cols[:y], x = cols[:x])
-    @test _plans_equal(bb, bh)
+    bb = (both(; x = cols[:x]) | (; y = cols[:y]))
+    @test _query(build_kernel(bb).spec, bb, :posterior, u) ≈
+        _query(build_kernel(bh).spec, bh, :posterior, u)
 end
 
 @testset "merge chaining" begin
@@ -177,20 +182,18 @@ end
     @test_throws SurfaceLoweringError Base.merge(merge_base, :(x + 1))
     # refused: bare symbol is not a statement (P9, 18h1h54)
     @test_throws SurfaceLoweringError Base.merge(merge_base, :b)
-    # Not a bare-Symbol LHS (indexed overrides are deferred).
-    # capability: indexed merge pin `c[1] = 2` (10gzbm9 merge-partial) (todo `1qlbn5b`)
-    @test_broken (Base.merge(merge_base, :(c[1] = 2)); true)
+    # A partial element write names no complete declaration.
+    @test_throws SurfaceLoweringError Base.merge(merge_base, :(c[1] = 2))
     # refused: a ranged observation override double-observes y (10gzbm9 merge-partial)
     @test_throws SurfaceLoweringError Base.merge(merge_base,
         Expr(:call, :.~, :(y[1:3]), :(Normal.(mu, s))))
-    # Nested blocks do not splice.
-    # capability: nested begin-block in a merge override (Julia blocks are transparent) (todo `15lq8iu`)
-    @test_broken (Base.merge(merge_base,
+    # Julia blocks are transparent during statement splicing.
+    @test _plans_equal(_merge_lower(Base.merge(merge_base,
         quote
             begin
                 a ~ Normal(0, 10)
             end
-        end); true)
+        end)), _merge_lower(Base.merge(merge_base, :(a ~ Normal(0, 10)))))
     # A broken base (duplicate LHS) fails closed, naming the name.
     dup = RKPPLModel(quote
         a ~ Normal(0, 1)
@@ -199,7 +202,7 @@ end
     end, @__MODULE__)
     # refused: single assignment: base binds a twice
     @test_throws SurfaceLoweringError Base.merge(dup, :(a ~ Normal(0, 1)))
-    # Override naming a levels/ref stem: indexed overrides deferred.
+    # A bare stem replaces the complete indexed declaration.
     lev = @rkppl begin
         a ~ Normal(0, 1)
         c[levels(g)[2:end]] .~ Normal.(0, 2)
@@ -213,13 +216,14 @@ end
         e
     end
     # capability: replace an indexed declaration with a scalar statement; check uses at bind (P9 18h1h54; todo `1qlbn5b`).
-    @test_broken (err === nothing || throw(err))
+    @test err === nothing
 
     # refused: a fix must name a statement to remove (merge docstring).
     # refused: pin names no model statement (unknown name)
     @test_throws SurfaceLoweringError Base.merge(merge_base, (; nosuch = ones(6)))
-    # capability: pin a levels-declared array parameter c (indexed overrides deferred) (todo `1308iv0`)
-    @test_broken (Base.merge(lev, (; c = ones(6))); true)
+    fixed_array = Base.merge(lev, (; c = ones(6)))
+    @test fixed_array.fixed[:c] == ones(6)
+    @test !occursin("c[levels", sprint(Base.show_unquoted, fixed_array.ast))
     # A plate-cell name is invisible to the top-level matcher: the append
     # collides at lowering through the single-assignment gate (still loud).
     plated = RKPPLModel(Expr(:block,
@@ -231,7 +235,7 @@ end
                         :(y[i] ~ Normal.(t, s)))))), @__MODULE__)
     shadowed = Base.merge(plated, :(t = a .+ b .* x))
     # refused: single assignment: appended t collides with the plate-cell t
-    @test_throws SurfaceLoweringError lower_rkppl(shadowed.ast, (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(shadowed.ast, (:y, :x); conditioned = (:y, :x))
 end
 
 @testset "merge joint session over shared defs" begin
@@ -251,10 +255,10 @@ end
     end
     p1 = _merge_lower(m1)
     p2 = _merge_lower(m2)
-    @test any(p -> p.name === :s_r, p1.parameters)
-    @test !any(p -> p.name === :t_r, p1.parameters)
-    @test any(p -> p.name === :t_r, p2.parameters)
-    @test !any(p -> p.name === :s_r, p2.parameters)
+    @test any(p -> _test_scope_name(p1, p.name) === :s_r, p1.parameters)
+    @test !any(p -> _test_scope_name(p1, p.name) === :t_r, p1.parameters)
+    @test any(p -> _test_scope_name(p2, p.name) === :t_r, p2.parameters)
+    @test !any(p -> _test_scope_name(p2, p.name) === :s_r, p2.parameters)
 end
 
 @testset "merge demo end to end" begin
@@ -267,8 +271,8 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, s)
     end
-    bm = merged(; y = cols[:y], x = cols[:x])
-    bh = hand(; y = cols[:y], x = cols[:x])
+    bm = (merged(; x = cols[:x]) | (; y = cols[:y]))
+    bh = (hand(; x = cols[:x]) | (; y = cols[:y]))
     @test _plans_equal(bm, bh)
     u = [0.5, -0.25, 0.1]
     @test _query(build_kernel(bm).spec, bm, :posterior, u) ==
@@ -283,9 +287,9 @@ end
         mu = a .+ b .* x
         y ~ merge_normal_stream(mu, s)
     end
-    bf = fixed(; y = cols[:y], x = cols[:x])
-    bhf = handf(; y = cols[:y], x = cols[:x], s = fill(2.0, n))
-    @test _plans_equal(bf, bhf)
+    bf = (fixed(; x = cols[:x]) | (; y = cols[:y]))
+    bhf = (handf(; x = cols[:x], s = fill(2.0, n)) | (; y = cols[:y]))
+    @test build_kernel(bf).layout.total == build_kernel(bhf).layout.total
     uf = [0.5, -0.25]
     @test _query(build_kernel(bf).spec, bf, :posterior, uf) ==
           _query(build_kernel(bhf).spec, bhf, :posterior, uf)
@@ -296,10 +300,11 @@ end
     # 18h1h54, 0dejlw1): `s` drops its submodel prior and scales the stream.
     X = [0.5, -1.0, 1.5, 0.0]
     Y = [0.3, -0.8, 1.9, 0.2]
-    bound = Base.merge(merge_base, (; s = 2.0))(; y = Y, x = X)
+    bound = Base.merge(merge_base, (; s = 2.0))(; x = X) | (; y = Y)
     built = build_kernel(bound)
     u = [0.2, -0.4]
-    a, b = ReactiveKernelsPPL.constrain(built.layout, u).mu
+    values = ReactiveKernelsPPL.constrain(built.layout, u)
+    a, b = values.a, values.b
     @test Base.invokelatest(prepare_query(built, bound, :likelihood), u) ≈
         sum(logpdf.(Normal.(a .+ b .* X, 2.0), Y))
 end

@@ -74,7 +74,7 @@ export preprocessing_recipes
 export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
-export RKPPLModel, RKPPLSubmodel, lower_rkppl, @rkppl, SurfaceLoweringError
+export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
 export ordered_logistic, monotonic, differenced_ar1, r2d2_coefs,
     horseshoe_coefs, penalized_smooth, t2_smooth, hsgp_effect,
     hsgp_periodic_effect, hsgp_grouped_effect, linear_pk_log_f

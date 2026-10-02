@@ -65,7 +65,7 @@ function _sal_build(kind, route, dependent, censor; counted = true, K = 2, n = 3
         :obs_index => collect(1:n), :assay => [mod1(i, 2) for i in 1:n],
         :y => [i == 1 ? 0.1 : 0.3 * i for i in 1:n], :lower => fill(0.1, n))
     plan = lower_rkppl(_sal_model(kind, route, dependent, censor; counted),
-        keys(data); mod = SharedArrayLocationModels)
+        keys(data); mod = SharedArrayLocationModels, conditioned = keys(data))
     bound = bind_data(plan, data)
     built = build_kernel(bound)
     u = [0.2 * cos(i) for i in 1:built.layout.total]

@@ -33,7 +33,7 @@ end
     prior_structures = Dict{String,Int}[]
     for (G, k) in ((2, 3), (4, 5))
         model = merge(_event_test_ast(; k), :(curve_sum = sum(log_F)))
-        plan = model(; _event_test_data(G)...)
+        plan = _event_test_bound(model, _event_test_data(G))
         built = build_kernel(plan)
         println("EVENT_CURVE_COMPILED_BEGIN subjects=", G, " k=", k)
         flush(stdout)

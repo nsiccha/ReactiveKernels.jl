@@ -87,6 +87,9 @@ function _canon(io::IO, x, depth::Int = 0)
             (fs = filter(!=(:submodel_scopes), fs))
         x isa LikelihoodSpec && x.threshold_effects === nothing &&
             (fs = filter(!=(:threshold_effects), fs))
+        x isa StructuralPlan && isempty(x.conditioned) &&
+            (fs = filter(!=(:conditioned), fs))
+
         if isempty(fs)
             print(io, repr(x))
         else
@@ -125,7 +128,7 @@ end
     plan = lower_rkppl(quote
         a ~ Normal(0, 1)
         y .~ Normal.(a, 1)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
     response = only(plan.responses)
     @test !occursin("threshold_effects=", sprint(_canon, response))
     effects = ReactiveKernelsPPL._with(response; threshold_effects = :effects)
@@ -143,7 +146,7 @@ end
         name = splitext(basename(path))[1]
         @testset "$name" begin
             ast, data = _load_corpus_case(path)
-            plan = lower_rkppl(ast, data)
+            plan = lower_rkppl(ast, data; conditioned = data)
             canon = sprint(_canon, plan) * "\n"
             golden = joinpath(_CORPUS_GOLDEN_DIR, name * ".canon")
             if rebless
@@ -185,7 +188,7 @@ end
             :(y .~ Normal.(mu, 1.5)))
     end
     canon(group, margins, kws = Pair{Symbol,Any}[]) =
-        sprint(_canon, lower_rkppl(prog(group, margins, kws), data))
+        sprint(_canon, lower_rkppl(prog(group, margins, kws), data; conditioned = data))
     # Only supported defaults participate in parity. The removed centered
     # keyword's refusal is checked in test_varying_centered.jl.
     plain_defaults = Pair{Symbol,Any}[:eta => 1.0, :sd => :(Normal(0, 1))]
@@ -233,8 +236,8 @@ end
             :(mu = c[g] .+ k[h]),
             Expr(:call, :.~, :y, :(Normal.(mu, 1.5))))
         data = (:y, :g, :h)
-        inline_plan = lower_rkppl(inline, data)
-        bound_plan = lower_rkppl(bound, data)
+        inline_plan = lower_rkppl(inline, data; conditioned = data)
+        bound_plan = lower_rkppl(bound, data; conditioned = data)
         @test sprint(_canon, bound_plan) == sprint(_canon, inline_plan)
         @test length(bound_plan.levelmaps) == 2
         @test all(m -> m.subset == subset, bound_plan.levelmaps)

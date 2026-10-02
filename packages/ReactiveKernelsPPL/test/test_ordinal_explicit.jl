@@ -23,7 +23,7 @@ _oe_cols(; y = [1, 2, 3, 2, 1, 3, 3, 2]) = Dict{Symbol,AbstractVector}(
     :z => [0.1, 0.2, -0.3, 0.5, 0.0, 1.0, -1.0, 0.4],
     :g => ["b", "a", "c", "a", "b", "d", "a", "b"])
 _oe_point(n) = [0.37 * sin(1.3 * i) - 0.2 for i in 1:n]
-_oe_lower(ex, data = (:y, :x)) = lower_rkppl(ex, data; mod = @__MODULE__)
+_oe_lower(ex, data = (:y, :x)) = lower_rkppl(ex, data; mod = @__MODULE__, conditioned = data)
 _oe_canon(ex, data = (:y, :x)) = sprint(_canon, _oe_lower(ex, data))
 
 # log P(y = k) for a cumulative model with link CDF `F` (k = 1..length(c)+1).

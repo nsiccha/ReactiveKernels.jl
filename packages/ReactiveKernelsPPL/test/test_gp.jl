@@ -18,7 +18,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
                 z_gp)
             mu = a .+ f_gp
             y .~ Normal.(mu, 0.5)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     cols = Dict{Symbol,AbstractVector}(
         :y => [0.5, -0.2, 0.8, 0.1, -0.5, 0.3],
         :x => [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
@@ -51,7 +51,7 @@ end
             end
             w = 1.0 + gp_chol_latent(gp_exp_quad_cov(x, 1.0, 1.0, 1e-9), z)
             y .~ Normal.(mu, 0.5)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # Aniso/matrix locations fail at first eval (loud ArgumentError).
     # capability: matrix-location (multi-dimensional) gp_exp_quad_cov (todo `0bfiemp`)
     @test_broken (gp_exp_quad_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0,
@@ -70,7 +70,7 @@ end
                     1e-9), z_gp)
             mu = a .+ f_gp
             y .~ Normal.(mu, 0.5)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     cols = Dict{Symbol,AbstractVector}(
         :y => [0.5, -0.2, 0.8, 0.1, -0.5, 0.3],
         :x => [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
@@ -104,7 +104,7 @@ end
             w = 1.0 + gp_chol_latent(gp_periodic_cov(x, 1.0, 1.0, 1.0, 1e-9),
                 z)
             y .~ Normal.(mu, 0.5)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # Matrix locations and non-positive periods fail at first eval.
     # capability: matrix-location gp_periodic_cov") (todo `0bfiemp`)
     @test_broken (gp_periodic_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0,

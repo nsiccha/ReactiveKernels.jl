@@ -22,7 +22,7 @@ function _lsr_fixture(kind, K, n, G)
     ast = quote a ~ Normal(0, 1) end
     append!(ast.args, effect.args)
     push!(ast.args, :(mu = a .+ f), :(y .~ Normal.(mu, 1.5)))
-    bound = bind_data(lower_rkppl(ast, keys(data)), data)
+    bound = bind_data(lower_rkppl(ast, keys(data); conditioned = keys(data)), data)
     built = build_kernel(bound)
     return (; bound, built)
 end

@@ -16,9 +16,7 @@ function _pcr_build(n, S)
         mu = a .+ r[:, 1] .+ x .* r[:, 2]
         y .~ Normal.(mu, sigma)
     end
-    bound = model(; y = [0.8 * sin(0.7i) for i in 1:n],
-        x = collect(range(-1.3, 1.7; length = n)),
-        g = [mod1(i, 4) for i in 1:n], s = [mod1(i, S) for i in 1:n])
+    bound = (model(; x = collect(range(-1.3, 1.7; length = n)), g = [mod1(i, 4) for i in 1:n], s = [mod1(i, S) for i in 1:n]) | (; y = [0.8 * sin(0.7i) for i in 1:n]))
     built = build_kernel(bound)
     u = [0.3 * sin(1.1i + 0.3) for i in 1:built.layout.total]
     return Base.invokelatest(_pcr_measure, built, bound, u)

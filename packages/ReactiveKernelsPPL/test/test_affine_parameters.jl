@@ -11,7 +11,7 @@ _affine_whole(value) = value
     end
     data = Dict(:group_x => [0.2, -0.4], :obs_index => [2, 1, 2],
         :y => [0.1, -0.2, 0.3])
-    bound = bind_data(lower_rkppl(ast, keys(data); mod = @__MODULE__), data)
+    bound = bind_data(lower_rkppl(ast, keys(data); mod = @__MODULE__, conditioned = keys(data)), data)
     built = build_kernel(bound)
     u = [0.3, -0.1]
     @test bound.n_obs == 3
@@ -25,11 +25,11 @@ _affine_whole(value) = value
     push!(aligned.args, :(y2 .~ Normal.(group_x, 1.0)))
     # capability: the same array can serve whole-value and indexed observation consumers (P10a, 0dejlw1; todo `1qlbn5b`).
     @test_broken (lower_rkppl(aligned, (keys(data)..., :y2);
-        mod = @__MODULE__); true)
+        mod = @__MODULE__, conditioned = (keys(data)..., :y2)); true)
 end
 
 function _affine_model(ast; data...)
-    plan = RKPPLModel(ast, @__MODULE__)(; data...)
+    plan = condition(RKPPLModel(ast, @__MODULE__)(); data...)
     built = build_kernel(plan)
     return plan, built
 end
@@ -273,5 +273,5 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
         q = a^2
-    end, (:x, :y)); true)
+    end, (:x, :y); conditioned = (:x, :y)); true)
 end

@@ -18,7 +18,7 @@ using Test
 # Lower + bind + build + query a bare-location program; return
 # `(bound, built, kern, layout)`.
 function _bare_query(prog::Expr, cols::AbstractDict{Symbol})
-    plan = lower_rkppl(prog, cols)
+    plan = lower_rkppl(prog, cols; conditioned = cols)
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -34,7 +34,7 @@ _bare_posterior(kern, lay, q::NamedTuple) =
         theta ~ Beta(1.0, 1.0)
         k .~ Binomial.(n, theta)
     end""")
-    plan = lower_rkppl(prog, (:k, :n))
+    plan = lower_rkppl(prog, (:k, :n); conditioned = (:k, :n))
     r = only(plan.responses)
     @test r.family === BinomialLogitFam && r.link === LogitLink
     @test r.predictor === :theta
@@ -44,7 +44,7 @@ _bare_posterior(kern, lay, q::NamedTuple) =
     pplan = lower_rkppl(Meta.parse("""begin
         lambda ~ Gamma(2.0, 1.0)
         y .~ Poisson.(lambda)
-    end"""), (:y,))
+    end"""), (:y,); conditioned = (:y,))
     pr = only(pplan.responses)
     @test pr.family === PoissonLogFam && pr.link === LogLink
     @test pr.predictor === :lambda
@@ -53,7 +53,7 @@ _bare_posterior(kern, lay, q::NamedTuple) =
     bplan = lower_rkppl(Meta.parse("""begin
         theta ~ Beta(2.0, 2.0)
         y .~ Bernoulli.(theta)
-    end"""), (:y,))
+    end"""), (:y,); conditioned = (:y,))
     br = only(bplan.responses)
     @test br.family === BernoulliLogitFam && br.link === LogitLink
     @test br.predictor === :theta
@@ -63,28 +63,28 @@ _bare_posterior(kern, lay, q::NamedTuple) =
         theta ~ Beta(1.0, 1.0)
         thetaprior ~ Beta(1.0, 1.0)
         k .~ Binomial.(n, theta)
-    end"""), (:k, :n))
+    end"""), (:k, :n); conditioned = (:k, :n))
     @test Set(p.name for p in prior.parameters) == Set([:theta, :thetaprior])
 
     # Literals stay fail-closed (intercept-only predictor message).
     # capability: literal probability Binomial.(n, 0.3) (fixed-p likelihood) (todo `1qlbn5b`)
     @test_broken (lower_rkppl(Meta.parse("""begin
         k .~ Binomial.(n, 0.3)
-    end"""), (:k, :n)); true)
+    end"""), (:k, :n); conditioned = (:k, :n)); true)
 
     # Other families keep the strict broadcast-link message.
     # refused: undeclared phi (P6, 05oe96l); NB2 mean is also a real-support parameter with no link
     @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
         mu ~ Normal(0.0, 5.0)
         y .~ NegativeBinomial2.(mu, phi)
-    end"""), (:y,))
+    end"""), (:y,); conditioned = (:y,))
 
     # Unknown symbols fail as locations, not as predictors.
     # refused: undeclared name nosuch (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
         theta ~ Beta(1.0, 1.0)
         k .~ Binomial.(n, nosuch)
-    end"""), (:k, :n))
+    end"""), (:k, :n); conditioned = (:k, :n))
 
     # Bare predictors keep their link: the bare slot admits sampled
     # parameters only, so a deterministic definition still needs its
@@ -95,21 +95,21 @@ _bare_posterior(kern, lay, q::NamedTuple) =
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         k .~ Binomial.(n, mu)
-    end"""), (:k, :n, :x)); true)
+    end"""), (:k, :n, :x); conditioned = (:k, :n, :x)); true)
     # capability: identity-link Bernoulli probability from an affine predictor (todo `05fuzch`)
     @test_broken (lower_rkppl(Meta.parse("""begin
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Bernoulli.(mu)
-    end"""), (:y, :x)); true)
+    end"""), (:y, :x); conditioned = (:y, :x)); true)
     # capability: identity-link Poisson rate from an affine predictor (todo `05fuzch`)
     @test_broken (lower_rkppl(Meta.parse("""begin
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Poisson.(mu)
-    end"""), (:y, :x)); true)
+    end"""), (:y, :x); conditioned = (:y, :x)); true)
 
     # Evidence on a bare location fails closed (cdf arms are link-space).
     # capability: censoring evidence on a bare sampled-parameter location (todo `0ze68k8`)
@@ -121,7 +121,7 @@ _bare_posterior(kern, lay, q::NamedTuple) =
             sigma ~ Exponential(1.0)
             theta ~ Beta(1.0, 1.0)
             k .~ censored.(Binomial.(n, theta), lo, hi)
-        end"""), (:k, :n, :x, :lo, :hi)),
+        end"""), (:k, :n, :x, :lo, :hi); conditioned = (:k, :n, :x, :lo, :hi)),
         Dict{Symbol,AbstractVector}(:k => [3], :n => [10], :x => [0.5],
             :lo => [0], :hi => [10])); true)
 end
@@ -208,7 +208,7 @@ end
         end"""), Dict{Symbol,AbstractVector}(:y => [0, 1, 3, 5, 2])),
     ]
     for (prog, cols) in progs
-        plan = lower_rkppl(prog, keys(cols))
+        plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
         bound = bind_data(plan, cols)
         built = build_kernel(bound)
         u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
@@ -222,7 +222,7 @@ end
 # `optimize = :only_enzyme` pin).
 function _bare_reactant(prog::Expr, cols::AbstractDict{Symbol};
         ad_kw...)
-    plan = lower_rkppl(prog, cols)
+    plan = lower_rkppl(prog, cols; conditioned = cols)
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
@@ -307,7 +307,7 @@ _bare_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         bound = bind_data(lower_rkppl(Meta.parse("""begin
             theta ~ Beta(1.0, 1.0)
             k .~ Binomial.(n, theta)
-        end"""), (:k, :n)), Dict{Symbol,AbstractVector}(:k => [7], :n => [10]))
+        end"""), (:k, :n); conditioned = (:k, :n)), Dict{Symbol,AbstractVector}(:k => [7], :n => [10]))
         built = build_kernel(bound)
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
@@ -333,7 +333,7 @@ _bare_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         @test Set(names) == Set([:theta1, :theta2])
         u = _bare_sb_vec(names, [:theta1 => 0.1, :theta2 => -0.1])
         @test abs(Base.invokelatest(kern, u) - (-6.8465406046781885)) < 1e-12
-        bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+        bound = bind_data(lower_rkppl(prog, keys(cols); conditioned = keys(cols)), cols)
         built = build_kernel(bound)
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
@@ -356,7 +356,7 @@ _bare_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
             :k2 => [3], :n2 => [8])
         _, _, kern, lay = _bare_query(prog, cols)
         names = coordinate_names(lay)
-        bound = bind_data(lower_rkppl(prog, keys(cols)), cols)
+        bound = bind_data(lower_rkppl(prog, keys(cols); conditioned = keys(cols)), cols)
         built = build_kernel(bound)
         for (uu, val, grad) in (([0.2], -5.5400758893075075,
             [0.9036520591254853]),
@@ -396,7 +396,7 @@ const _VALUE_NORMAL = Meta.parse("""begin
 end""")
 
 @testset "value location lowering" begin
-    plan = lower_rkppl(_VALUE_NORMAL, (:y,))
+    plan = lower_rkppl(_VALUE_NORMAL, (:y,); conditioned = (:y,))
     r = only(plan.responses)
     @test r.family === GaussianFam && r.predictor === :y_eta
     t = only(only(plan.predictors).terms)
@@ -412,26 +412,26 @@ end""")
         @plate for i in eachindex(y)
             y[i] ~ Normal(mu, s)
         end
-    end"""), (:y,))
+    end"""), (:y,); conditioned = (:y,))
     @test _plans_equal(plan, twin)
     # Any prior family: the parameter is never a coefficient.
     ep = lower_rkppl(Meta.parse("""begin
         mu ~ Exponential(1)
         s ~ Exponential(1)
         y .~ Normal.(mu, s)
-    end"""), (:y,))
+    end"""), (:y,); conditioned = (:y,))
     @test [p.name for p in ep.parameters] == [:mu, :s]
     # A data column is an offset, the term its named twin lowers to
     # (corpus 29_offset_only).
     dt = only(only(lower_rkppl(Meta.parse("""begin
         s ~ Exponential(1)
         y .~ Normal.(x, s)
-    end"""), (:y, :x)).predictors).terms)
+    end"""), (:y, :x); conditioned = (:y, :x)).predictors).terms)
     nt = only(only(lower_rkppl(Meta.parse("""begin
         mu = x
         s ~ Exponential(1)
         y .~ Normal.(mu, s)
-    end"""), (:y, :x)).predictors).terms)
+    end"""), (:y, :x); conditioned = (:y, :x)).predictors).terms)
     @test dt.kind === OffsetTerm && dt.columns == [:x]
     @test (dt.kind, dt.columns, dt.options, dt.addressee, dt.label) ==
         (nt.kind, nt.columns, nt.options, nt.addressee, nt.label)
@@ -449,7 +449,7 @@ end""")
         lp = lower_rkppl(Meta.parse("""begin
             a ~ Normal(0, 1)
             $resp
-        end"""), cols)
+        end"""), cols; conditioned = cols)
         lr = only(lp.responses)
         @test (lr.family, lr.link) == (fam, link)
         @test lr.predictor === Symbol(lr.response, "_eta")
@@ -459,7 +459,7 @@ end""")
     bp = lower_rkppl(Meta.parse("""begin
         lambda ~ Gamma(2.0, 1.0)
         y .~ Poisson.(lambda)
-    end"""), (:y,))
+    end"""), (:y,); conditioned = (:y,))
     @test only(bp.responses).predictor === :lambda && isempty(bp.predictors)
 end
 
@@ -583,7 +583,7 @@ end
         end"""), Dict{Symbol,AbstractVector}(:y => [1, 0, 3, 2])),
     ]
     for (prog, cols) in progs
-        plan = lower_rkppl(prog, keys(cols))
+        plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
         bound = bind_data(plan, cols)
         built = build_kernel(bound)
         u = [0.3 * sin(1.7i) for i in 1:built.layout.total]

@@ -33,7 +33,7 @@ using Test
 # Lower + bind + build + query a ZIB program; return
 # `(bound, built, kern, layout)`.
 function _zib_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -76,7 +76,7 @@ _zib_trials_cols() = Dict{Symbol,AbstractVector}(:s => copy(_ZIB_S),
 
 @testset "zib admission" begin
     @testset "sampled zi" begin
-        plan = lower_rkppl(_ZIB_PROG, (:s,))
+        plan = lower_rkppl(_ZIB_PROG, (:s,); conditioned = (:s,))
         r = only(plan.responses)
         @test r.family === ZeroInflatedBinomialFam
         @test r.link === IdentityLink
@@ -87,13 +87,13 @@ _zib_trials_cols() = Dict{Symbol,AbstractVector}(:s => copy(_ZIB_S),
         @test all(p -> p.family === :beta, plan.parameters)
     end
     @testset "literal zi" begin
-        plan = lower_rkppl(_ZIB_LITERAL_PROG, (:s,))
+        plan = lower_rkppl(_ZIB_LITERAL_PROG, (:s,); conditioned = (:s,))
         r = only(plan.responses)
         @test r.family === ZeroInflatedBinomialFam
         @test r.zi === 0.25
     end
     @testset "trials column" begin
-        plan = lower_rkppl(_ZIB_TRIALS_COL_PROG, (:s, :n))
+        plan = lower_rkppl(_ZIB_TRIALS_COL_PROG, (:s, :n); conditioned = (:s, :n))
         r = only(plan.responses)
         @test r.family === ZeroInflatedBinomialFam
         @test r.trials === :n
@@ -107,21 +107,21 @@ end
         p ~ Normal(0.0, 1.0)
         zi ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, p, zi)
-    end, (:s,)); true)
+    end, (:s,); conditioned = (:s,)); true)
     # zi literal outside [0, 1].
     # refused: zi literal 1.5 outside [0,1]
     @test_throws ContractValidationError lower_rkppl(quote
         p ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, p, 1.5)
-    end, (:s,))
+    end, (:s,); conditioned = (:s,))
     # zi names nothing in the plan.
     # refused: undeclared name (P6, 05oe96l)
     @test_throws ContractValidationError lower_rkppl(quote
         p ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, p, nosuch)
-    end, (:s,))
+    end, (:s,); conditioned = (:s,))
     # Response exceeding trials fails at bind.
-    plan = lower_rkppl(_ZIB_PROG, (:s,))
+    plan = lower_rkppl(_ZIB_PROG, (:s,); conditioned = (:s,))
     bad = Dict{Symbol,AbstractVector}(:s => [1, 0, 4, 0])
     # refused: response exceeds trials (wrong data)
     @test_throws ContractValidationError bind_data(plan, bad)
@@ -185,7 +185,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): the ZIB plate must not unroll over observations.
 function _zib_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -206,7 +206,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _zib_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

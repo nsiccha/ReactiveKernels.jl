@@ -58,7 +58,7 @@ function _nm_bound(name)
     over = get(_NM_DATA, name, Dict{Symbol,Any}())
     cols = Dict{Symbol,Any}(k => get(() -> _NM_COLS[k], over, k)
         for k in data)
-    return bind_data(lower_rkppl(ast, data), cols)
+    return bind_data(lower_rkppl(ast, data; conditioned = data), cols)
 end
 
 # A submodel a call resolves to (the shipped library or this file's).
@@ -139,7 +139,7 @@ function _nm_pack(lay, q::NamedTuple)
 end
 
 function _nm_check(prog::Expr, cols, q::NamedTuple, want)
-    plan = lower_rkppl(prog, Tuple(keys(cols)))
+    plan = lower_rkppl(prog, Tuple(keys(cols)); conditioned = Tuple(keys(cols)))
     bound = bind_data(plan, Dict{Symbol,Any}(pairs(cols)))
     built = build_kernel(bound)
     lay = built.layout
@@ -287,7 +287,7 @@ end
         sigma ~ Exponential(1)
         y .~ Normal.(mu, sigma)
     end
-    plan = bind_data(lower_rkppl(prog, (:y, :x, :g); mod = @__MODULE__), cols)
+    plan = bind_data(lower_rkppl(prog, (:y, :x, :g); mod = @__MODULE__, conditioned = (:y, :x, :g)), cols)
     lay = assign_layout(plan)
     declared = _nm_declared(prog)
     @test Set([Symbol("mu.l.a"), Symbol("mu.l.b"),

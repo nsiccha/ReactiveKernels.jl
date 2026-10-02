@@ -76,7 +76,7 @@ function _semantics_compiled_fixture(kind, n)
             y .~ Normal.(a, 1)
         end
     end
-    bound = bind_data(lower_rkppl(ast, data), data)
+    bound = bind_data(lower_rkppl(ast, data; conditioned = data), data)
     built = build_kernel(bound)
     u = collect(range(-0.2; step = 0.15, length = built.layout.total))
     sampler = prepare_sampler(built, bound, u;

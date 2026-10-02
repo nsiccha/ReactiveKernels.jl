@@ -18,7 +18,7 @@ using Test
 # Lower + bind + build + query an NB1 program; return
 # `(bound, built, kern, layout)`.
 function _nb1_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -145,7 +145,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): the NB1 plate must not unroll over observations.
 function _nb1_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -180,7 +180,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _nb1_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

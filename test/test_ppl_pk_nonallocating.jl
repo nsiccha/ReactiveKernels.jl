@@ -32,7 +32,7 @@ end
             "log_k12, log_k21, log_ka)\n" *
             " mu = read_locs[pk_sched.obs_map]\n" *
             " dv .~ Normal.(mu, sigma)\n mu\nend\nend"),
-        (:subj, :time, :dsubj, :dtime, :damt, :dv, :age_s))
+        (:subj, :time, :dsubj, :dtime, :damt, :dv, :age_s); conditioned = (:subj, :time, :dsubj, :dtime, :damt, :dv, :age_s))
     cols = Dict{Symbol,AbstractVector}(
         :subj => [1, 1, 2, 2], :time => [96.0, 120.0, 0.0, 5.0],
         :dsubj => [1, 1, 1, 1, 2], :dtime => [0.0, 24.0, 48.0, 72.0, 0.0],

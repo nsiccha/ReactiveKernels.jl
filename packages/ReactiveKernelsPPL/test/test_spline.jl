@@ -18,7 +18,7 @@ function _svalid_plan(; t2::Bool = false)
                 sigma ~ Exponential(1)
                 mu = a .+ spline(:t2_xz)
                 y .~ Normal.(mu, sigma)
-            end, (:y, :x, :z))
+            end, (:y, :x, :z); conditioned = (:y, :x, :z))
     end
     return lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
@@ -26,7 +26,7 @@ function _svalid_plan(; t2::Bool = false)
             sigma ~ Exponential(1)
             mu = a .+ spline(:s_x)
             y .~ Normal.(mu, sigma)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
 end
 
 function _swith(plan::StructuralPlan; predictors = nothing, bases = nothing,
@@ -87,7 +87,7 @@ end
             a ~ Normal(0, 5)
             mu = a .+ spline(:t2_xz)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z))
+        end, (:y, :x, :z); conditioned = (:y, :x, :z))
     sb = only(plan.spline_bases)
     @test sb.kind === :t2 && sb.k == (5, 5)
     @test [(b.name, b.width) for b in sb.blocks] ==
@@ -104,7 +104,7 @@ end
             a ~ Normal(0, 5)
             mu = a .+ spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     @test only(plain.spline_bases).k == 10
 end
 
@@ -115,80 +115,80 @@ end
             spline_basis(s_x, x; k = 4)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # Non-data axis.
     # refused: undeclared name `w` as axis (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, w; k = 4)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # Three axes.
     # capability: 3-axis spline basis (tensor smooth over three margins) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             spline_basis(:s_x, x, z, w; k = 4)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z, :w)); true)
+        end, (:y, :x, :z, :w); conditioned = (:y, :x, :z, :w)); true)
     # Bad kind value.
     # capability: cubic-regression spline basis (kind = :cr) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             spline_basis(:s_x, x; kind = :cr)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # Kind/arity mismatch both ways.
     # capability: single-margin t2 spline (kind = :t2 on one axis; mgcv admits t2(x)) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             spline_basis(:s_x, x; kind = :t2)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: two-axis thin-plate spline (kind = :tps over (x, z), isotropic s(x, z)) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             spline_basis(:t2_xz, x, z; kind = :tps)
             mu = spline(:t2_xz)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z)); true)
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
     # k too small / non-literal / wrong shape.
     # refused: k = 2 leaves no penalized block (k must exceed the TPS null-space dimension 2)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 2)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # capability: data-derived basis size k (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             kk = length(x)
             spline_basis(:s_x, x; k = kk)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # refused: k tuple length differs from axis count (malformed)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = (4, 4))
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # capability: scalar k broadcast per margin for t2 (hsgp_basis already broadcasts scalars) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             spline_basis(:t2_xz, x, z; k = 5)
             mu = spline(:t2_xz)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z)); true)
+        end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
     # refused: margin k = 2 leaves no penalized block (degenerate)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:t2_xz, x, z; k = (5, 2))
             mu = spline(:t2_xz)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z))
+        end, (:y, :x, :z); conditioned = (:y, :x, :z))
     # Deferred options fail closed.
     # refused: `bs` is mgcv vocabulary duplicating `kind =` (P10, P2)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4, bs = :cr)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # Duplicate declaration.
     # refused: single assignment, basis :s_x declared twice
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -196,20 +196,20 @@ end
             spline_basis(:s_x, x; k = 5)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # Unknown / reused / negated / nested uses.
     # refused: undeclared basis id :nope (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             mu = spline(:nope)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # capability: spline summand value reuse: same basis twice in one predictor (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             mu = spline(:s_x) .+ spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: one spline basis shared by two predictors (value reuse) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -219,20 +219,20 @@ end
             nu = c .+ spline(:s_x)
             y .~ Normal.(mu, 1.0)
             z .~ Normal.(nu, 1.0)
-        end, (:y, :z, :x)); true)
+        end, (:y, :z, :x); conditioned = (:y, :z, :x)); true)
     # capability: negated spline summand (`a .- spline(:s)`) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
             spline_basis(:s_x, x; k = 4)
             mu = a .- spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # refused: a coefficient times a flat-prior spline block is an unidentified ridge
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             mu = a .+ b .* spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # spline() inside definitions (scalar + derived).
     # capability: spline value bound in a definition (`w = spline(:s)`) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
@@ -241,7 +241,7 @@ end
             w = spline(:s_x)
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: spline value combined with data in a definition (`w = spline(:s) .+ x`) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -249,7 +249,7 @@ end
             w = spline(:s_x) .+ x
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: spline value combined with coefficient terms in a definition (`w = spline(:s) .+ b .* x`) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -258,18 +258,18 @@ end
             w = spline(:s_x) .+ b .* x
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x)); true)
     # Reserved names.
     # refused: reserved-name collision `spline`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline = 1.0
             y .~ Normal.(mu, 1.0)
-        end, (:y,))
+        end, (:y,); conditioned = (:y,))
     # refused: reserved-name collision `spline_basis`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis ~ Normal(0, 1)
             y .~ Normal.(mu, 1.0)
-        end, (:y,))
+        end, (:y,); conditioned = (:y,))
     # Generated-name claims: user definitions cannot collide.
     # refused: single assignment, collides with basis-claimed `b_s_x_fixed`
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -277,21 +277,21 @@ end
             b_s_x_fixed = 1.0
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: single assignment, collides with materialized basis column `s_x_Xnull_1`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             s_x_Xnull_1 = 1.0
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     # refused: single assignment, collides with basis-claimed `sd_s_x`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             sd_s_x ~ Normal(0, 1)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
 end
 
 # Rebuild the valid plan's basis with mutated fields (hand-built-plan
@@ -555,7 +555,7 @@ end
                 sigma ~ Exponential(1)
                 mu = a .+ spline(:s_x)
                 y .~ Normal.(mu, sigma)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         sd = only(v for v in plan.spline_vectors if v.name === :sd_s_x)
         @test sd.support_override === support
         @test validate_structure(plan) === nothing
@@ -580,7 +580,7 @@ end
             a ~ Normal(0, 5)
             mu = a .+ spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     vs = copy(plan.spline_vectors)
     i = findfirst(v -> v.name === :sd_s_x, vs)
     vs[i] = SplineVector(vs[i].name, vs[i].family, vs[i].args,
@@ -642,7 +642,7 @@ end
             sigma ~ Exponential(1)
             mu = a .+ spline(:t2_xz)
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :z))
+        end, (:y, :x, :z); conditioned = (:y, :x, :z))
     bound = bind_data(plan, _spline_cols(; t2 = true))
     built = build_kernel(bound)
     @test built.layout.total == 13
@@ -770,7 +770,7 @@ end
                 sigma ~ Exponential(1)
                 mu = a .+ spline(:t2_xz)
                 y .~ Normal.(mu, sigma)
-            end, (:y, :x, :z))
+            end, (:y, :x, :z); conditioned = (:y, :x, :z))
         bound = bind_data(plan, _spline_cols(; t2 = true))
         built = build_kernel(bound)
         lay = built.layout

@@ -27,7 +27,7 @@ end
 _r2d2_scale(phi, r2, tau, vx) = sqrt(phi * r2 * tau^2 / vx)
 
 @testset "r2d2 surface admission" begin
-    plan = lower_rkppl(_r2d2_demo(), Set([:x1, :x2, :y]))
+    plan = lower_rkppl(_r2d2_demo(), Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))
     @test length(plan.r2d2_priors) == 1
     rp = only(plan.r2d2_priors)
     @test rp.predictor === :mu
@@ -48,10 +48,10 @@ _r2d2_scale(phi, r2, tau, vx) = sqrt(phi * r2 * tau^2 / vx)
             r2d2(mu, R2, phi, tau)
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
-        end, Set([:x1, :x2, :y]))
+        end, Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))
     @test only(plan2.r2d2_priors).tau === :tau
     @test !any(p -> p.name === :r2d2_mu_tau_bsv, plan2.parameters)
-    plan3 = lower_rkppl(_r2d2_demo(; tau_decl = 2.5), Set([:x1, :x2, :y]))
+    plan3 = lower_rkppl(_r2d2_demo(; tau_decl = 2.5), Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))
     @test only(plan3.r2d2_priors).tau == 2.5
 end
 
@@ -64,7 +64,7 @@ end
             r2d2(mu, R2, phi)
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
-        end, Set([:x1, :x2, :y]))
+        end, Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))
     rp = only(plan.r2d2_priors)
     @test rp.overrides == Dict(:x1 => (0.5, 2.0)) # b1 leaves the simplex
     cols = _r2d2_cols()
@@ -88,7 +88,7 @@ end
             r2d2(mu, R2, phi)
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
-        end, Set([:x1, :g, :y]))
+        end, Set([:x1, :g, :y]); conditioned = Set([:x1, :g, :y]))
     cols = Dict{Symbol,AbstractVector}(
         :x1 => [0.5, -1.0, 1.5, 0.0, 1.0, -0.5],
         :g => [1, 2, 1, 2, 1, 2],
@@ -110,7 +110,7 @@ end
 end
 
 @testset "r2d2 e2e values and gradient" begin
-    bound = bind_data(lower_rkppl(_r2d2_demo(), Set([:x1, :x2, :y])),
+    bound = bind_data(lower_rkppl(_r2d2_demo(), Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y])),
         _r2d2_cols())
     built = build_kernel(bound)
     # Layout: 3 coefs + R2 + sigma + tau + 1 phi stick.
@@ -153,7 +153,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     # refused: r2d2 arity, phi simplex missing; no minted/default simplex (P6, 05oe96l; P7, 0d5a67r)
-    @test_throws SurfaceLoweringError lower_rkppl(bad, Set([:x1, :x2, :y]))
+    @test_throws SurfaceLoweringError lower_rkppl(bad, Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))
     dup = quote
         R2 ~ Beta(1.0, 1.0)
         phi ~ Dirichlet([1.0, 1.0])
@@ -164,7 +164,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     # refused: single assignment, r2d2 declared twice on one predictor
-    @test_throws SurfaceLoweringError lower_rkppl(dup, Set([:x1, :x2, :y]))
+    @test_throws SurfaceLoweringError lower_rkppl(dup, Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))
     ghost = quote
         a ~ Normal(0, 1)
         b1 ~ Normal(0, 1)
@@ -177,9 +177,9 @@ end
         y .~ Normal.(mu, sigma)
     end
     # refused: undeclared predictor `nope` (P6, 05oe96l)
-    @test_throws SurfaceLoweringError lower_rkppl(ghost, Set([:x1, :x2, :y]))
+    @test_throws SurfaceLoweringError lower_rkppl(ghost, Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))
     # Parameter families (structural, via hand-built plans).
-    good = lower_rkppl(_r2d2_demo(), Set([:x1, :x2, :y]))
+    good = lower_rkppl(_r2d2_demo(), Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))
     notbeta = StructuralPlan(good.responses, good.predictors,
         good.population_priors,
         [p.name === :R2 ? SampledParameter(:R2, :normal, (arg1 = 0.0, arg2 = 1.0),
@@ -206,7 +206,7 @@ end
     end
     # refused: phi simplex size differs from decomposed column count
     @test_throws ContractValidationError bind_data(
-        lower_rkppl(small_phi, Set([:x1, :x2, :y])), cols)
+        lower_rkppl(small_phi, Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y])), cols)
     icpt = quote
         R2 ~ Beta(1.0, 1.0)
         phi ~ Dirichlet([1.0])
@@ -218,12 +218,12 @@ end
     end
     # refused: phi size differs from decomposed columns (none left after the stated override); vacuous decomposition
     @test_throws ContractValidationError bind_data(
-        lower_rkppl(icpt, Set([:x1, :x2, :y])), cols)
+        lower_rkppl(icpt, Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y])), cols)
     flat = Dict{Symbol,AbstractVector}(:x1 => ones(4),
         :x2 => [1.0, 0.5, -0.5, 2.0], :y => [1.0, 2.0, 1.5, 2.5])
     # refused: constant column has zero variance (R2D2 scale divides by var(x); unidentified with the intercept)
     @test_throws ContractValidationError bind_data(
-        lower_rkppl(_r2d2_demo(), Set([:x1, :x2, :y])), flat)
+        lower_rkppl(_r2d2_demo(), Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y])), flat)
     # Monotonic columns are out of the flat slice.
     momodel = quote
         R2 ~ Beta(1.0, 1.0)
@@ -236,5 +236,5 @@ end
     end
     # capability: r2d2 over predictors with mo() terms (todo `1308iv0`)
     @test_broken (lower_rkppl(momodel,
-        Set([:x1, :x2, :c, :y])); true)
+        Set([:x1, :x2, :c, :y]); conditioned = Set([:x1, :x2, :c, :y])); true)
 end

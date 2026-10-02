@@ -56,20 +56,20 @@ end
 @testset "data values: a number reads as a model-level value at every entry point" begin
     m = RKPPLModel(_dv_regression(), _DV)
     # The model call.
-    _dv_check_regression(m(; y = _DV_Y, x = _DV_X, s = 0.7), 0.7)
+    _dv_check_regression((m(; x = _DV_X, s = 0.7) | (; y = _DV_Y)), 0.7)
     # `@rkppl data`.
     y, x = _DV_Y, _DV_X
-    bound = @rkppl (; y, x, s = 0.7) begin
+    bound = (@rkppl (; x, s = 0.7) begin
         a ~ Normal(0, 5)
         b ~ Normal(0, 2)
         mu = a .+ b .* x
         y .~ Normal.(mu, s)
-    end
+    end) | (; y)
     _dv_check_regression(bound, 0.7)
     # `lower_rkppl(ast, data)` reads each value's shape; the plan then binds
     # any number for `s` without lowering again.
     plan = lower_rkppl(_dv_regression(),
-        Dict{Symbol,Any}(:y => y, :x => x, :s => 0.7))
+        Dict{Symbol,Any}(:y => y, :x => x, :s => 0.7); conditioned = Dict{Symbol,Any}(:y => y, :x => x, :s => 0.7))
     for sd in (0.7, 1.1)
         _dv_check_regression(bind_data(plan,
             Dict{Symbol,ColumnData}(:y => y, :x => x, :s => sd)), sd)
@@ -85,12 +85,12 @@ end
         y .~ Normal.(mu, s)
     end, _DV)
     pinned = Base.merge(base, (; s = 0.7))
-    _dv_check_regression(pinned(; y = _DV_Y, x = _DV_X), 0.7)
+    _dv_check_regression((pinned(; x = _DV_X) | (; y = _DV_Y)), 0.7)
     # An explicit call keyword wins over the pinned value.
-    _dv_check_regression(pinned(; y = _DV_Y, x = _DV_X, s = 1.3), 1.3)
+    _dv_check_regression((pinned(; x = _DV_X, s = 1.3) | (; y = _DV_Y)), 1.3)
     # The same density as the definition spelling of the pin.
-    defined = Base.merge(base, :(s = 0.7))(; y = _DV_Y, x = _DV_X)
-    bp = pinned(; y = _DV_Y, x = _DV_X)
+    defined = Base.merge(base, :(s = 0.7))(; x = _DV_X) | (; y = _DV_Y)
+    bp = (pinned(; x = _DV_X) | (; y = _DV_Y))
     @test _dv_value(_dv_built(bp), bp, :likelihood, _DV_U) ≈
         _dv_value(_dv_built(defined), defined, :likelihood, _DV_U)
 end
@@ -103,7 +103,7 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, t)
     end, _DV)
-    _dv_check_regression(twice(; y = _DV_Y, x = _DV_X, s = 0.35), 0.7)
+    _dv_check_regression((twice(; x = _DV_X, s = 0.35) | (; y = _DV_Y)), 0.7)
     root = RKPPLModel(quote
         a ~ Normal(0, 5)
         b ~ Normal(0, 2)
@@ -111,7 +111,7 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, t)
     end, _DV)
-    _dv_check_regression(root(; y = _DV_Y, x = _DV_X, s = 0.49), 0.7)
+    _dv_check_regression((root(; x = _DV_X, s = 0.49) | (; y = _DV_Y)), 0.7)
 end
 
 @testset "data values: a number is a prior argument, as its definition is" begin
@@ -124,7 +124,7 @@ end
         y .~ Normal.(mu, 1.0)
     end
     plan = lower_rkppl(coef,
-        Dict{Symbol,Any}(:y => _DV_Y, :x => _DV_X, :tau => 2.0))
+        Dict{Symbol,Any}(:y => _DV_Y, :x => _DV_X, :tau => 2.0); conditioned = Dict{Symbol,Any}(:y => _DV_Y, :x => _DV_X, :tau => 2.0))
     for tau in (2.0, 0.5)
         bound = bind_data(plan,
             Dict{Symbol,ColumnData}(:y => _DV_Y, :x => _DV_X, :tau => tau))
@@ -135,8 +135,8 @@ end
             logpdf(Normal(0, 5), a) + logpdf(Normal(0, tau), b)
     end
     defined = RKPPLModel(Expr(:block, :(tau = 2.0), coef.args...), _DV)(;
-        y = _DV_Y, x = _DV_X)
-    bound = RKPPLModel(coef, _DV)(; y = _DV_Y, x = _DV_X, tau = 2.0)
+        x = _DV_X) | (; y = _DV_Y)
+    bound = RKPPLModel(coef, _DV)(; x = _DV_X, tau = 2.0) | (; y = _DV_Y)
     @test _dv_value(_dv_built(bound), bound, :prior, _DV_U) ≈
         _dv_value(_dv_built(defined), defined, :prior, _DV_U)
     # A scalar parameter's prior argument.
@@ -147,7 +147,7 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, sigma)
     end, _DV)
-    bound = m(; y = _DV_Y, x = _DV_X, rate = 1.5)
+    bound = (m(; x = _DV_X, rate = 1.5) | (; y = _DV_Y))
     built = _dv_built(bound)
     u = [0.2, -0.4, 0.1]
     th = ReactiveKernelsPPL.constrain(built.layout, u)
@@ -163,7 +163,7 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, _DV)
-    bound = m(; y = 0.3, x = [0.5])
+    bound = (m(; x = [0.5]) | (; y = 0.3))
     built = _dv_built(bound)
     @test bound.n_obs == 1
     @test _dv_value(built, bound, :likelihood, _DV_U) ≈
@@ -178,12 +178,12 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, w)
     end, _DV)
-    _dv_check_regression(m(; y = _DV_Y, x = _DV_X, A = fill(0.035, 2, 2, 5)),
+    _dv_check_regression((m(; x = _DV_X, A = fill(0.035, 2, 2, 5)) | (; y = _DV_Y)),
         0.7)
 end
 
 @testset "data values: gradient through a number (Enzyme vs FD)" begin
-    bound = RKPPLModel(_dv_regression(), _DV)(; y = _DV_Y, x = _DV_X, s = 0.7)
+    bound = RKPPLModel(_dv_regression(), _DV)(; x = _DV_X, s = 0.7) | (; y = _DV_Y)
     built = _dv_built(bound)
     u = [0.2, -0.4]
     q = prepare_sampler(built, bound, u; backend =
@@ -201,7 +201,7 @@ end
     # its value exists, so the bound plan cannot take a number there;
     # lowering with the values is the spelling that reads its shape
     # (decision 0dejlw1). The message names that spelling.
-    plan = lower_rkppl(_dv_regression(), (:y, :x, :s))
+    plan = lower_rkppl(_dv_regression(), (:y, :x, :s); conditioned = (:y, :x, :s))
     err = try
         bind_data(plan, Dict{Symbol,ColumnData}(:y => _DV_Y, :x => _DV_X,
             :s => 0.7))

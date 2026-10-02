@@ -319,7 +319,7 @@ end
         end
         mu = a .+ b .* x
         y .~ Normal.(mu, sigma)
-    end, (:x, :y))
+    end, (:x, :y); conditioned = (:x, :y))
     @test length(plan.scans) == 1
     @test plan.scans[1].states == [:h]
     @test plan.scans[1].maxlag == 1
@@ -339,7 +339,7 @@ end
             end
         end
         y .~ Normal.(mu, 1.0)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
 
     # an invalid @scan block (no trailing recurrence `for`) still errors loudly
     # refused: @scan with no recurrence `for`; `h` has no declared extent (P6)
@@ -348,7 +348,7 @@ end
             h[1] ~ Normal(0, 1)
         end
         y .~ Normal.(mu, 1.0)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
 end
 
 @testset "scan layout: array-sampled entry" begin
@@ -414,7 +414,7 @@ end
             end
         end
         y .~ Normal.(h, sigma)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
     r = only(plan.responses)
     @test r.predictor === :h            # the location IS the scan state
     @test r.family === GaussianFam
@@ -583,7 +583,7 @@ end
         phi = tanh(phi_raw)
         mu = a .+ beta_ar .* u
         y .~ Normal.(mu, sigma)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
     terms = only(plan.predictors).terms
     @test length(terms) == 2
     st = terms[2]
@@ -615,7 +615,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     # A bare scan state is a beta-free summand (the dar/`mo1` shape).
-    bare = lower_rkppl(prog(:(mu = a .+ u)), (:x, :y))
+    bare = lower_rkppl(prog(:(mu = a .+ u)), (:x, :y); conditioned = (:x, :y))
     bt = only(bare.predictors).terms[2]
     @test bt.kind === ScanSummandTerm
     @test bt.options == (scan_id = :u, coef = nothing)
@@ -623,13 +623,13 @@ end
     # become parameters, decision `05oe96l`)
     # refused: q has no declaration (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(mu = a .+ q .* u)),
-        (:x, :y))
+        (:x, :y); conditioned = (:x, :y))
     # Valid Julia the emitter does not build yet (a scan state is spliced
     # bare or scaled by one sampled scalar, additively): pinned as gaps so
     # building one fails this file instead of a silent refusal surviving.
     # capability: scan-state arithmetic composes as ordinary values (P8 1cmodra; todo `0yc2qgp`).
     gap(loc, needle) = _scan_gap(needle) do
-        lower_rkppl(prog(loc), (:x, :y))
+        lower_rkppl(prog(loc), (:x, :y); conditioned = (:x, :y))
     end
     gap(:(mu = a .+ 2.0 .* u), "scan coefficients are bare sampled scalars")
     gap(:(mu = a .+ x .* u), "scales scan state")
@@ -654,7 +654,7 @@ end
         phi = tanh(phi_raw)
         mu = a .+ b .* x .+ b .* u
         y .~ Normal.(mu, sigma)
-    end, (:x, :y))
+    end, (:x, :y); conditioned = (:x, :y))
     @test any(p -> p.name === :b, both.parameters)
 end
 
@@ -667,7 +667,7 @@ end
         phi = tanh(phi_raw)
         mu = a
         y .~ Normal.(mu, sigma)
-    end, (:y,))
+    end, (:y,); conditioned = (:y,))
     @test only(a for a in plan.assignments if a.name === :phi).expr ==
         :(tanh(phi_raw))
     @test (validate_structure(plan); true)
@@ -679,7 +679,7 @@ end
         w = tanh.(x)
         mu = a .+ w
         y .~ Normal.(mu, sigma)
-    end, (:x, :y))
+    end, (:x, :y); conditioned = (:x, :y))
     w = only(d for d in dotted.derived if d.name === :w).expr
     @test w.head === :. && w.args[1] isa GlobalRef &&
         w.args[1].name === :tanh && w.args[2] == Expr(:tuple, :x)
@@ -697,7 +697,7 @@ end
             :(s ~ Exponential(1)),
             :(sigma ~ Exponential(1)),
             scan_block(stmts...),
-            :(y .~ Normal.(h, sigma))), (:y,)),
+            :(y .~ Normal.(h, sigma))), (:y,); conditioned = (:y,)),
         Dict{Symbol,AbstractVector}(:y => [0.1, 0.2, 0.3])))
     # a carry write that reads its innovation before the step drawing it
     # (refused: in a Julia loop body `eps` is not defined yet)
@@ -904,7 +904,7 @@ end
     path = joinpath(_CORPUS_DIR, "38_scan_tuple_carry.jl")
     ast, data = _load_corpus_case(path)
     ydata = [0.4, -0.2, 0.9, 0.3, 1.2, 0.8]
-    plan = bind_data(lower_rkppl(ast, data),
+    plan = bind_data(lower_rkppl(ast, data; conditioned = data),
         Dict{Symbol,AbstractVector}(:y => ydata))
     sc = only(plan.scans)
     @test sc.states == [:h, :level]
@@ -942,7 +942,7 @@ end
         y .~ Normal.(h, sigma)
     end
     ydata = [0.1, 0.5, -0.2, 0.3]
-    plan = m(; y = ydata)
+    plan = (m() | (; y = ydata))
     built = build_kernel(plan)
     T = length(ydata)
     z = only(e for e in built.layout.entries if e.kind === :scan)

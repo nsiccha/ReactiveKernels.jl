@@ -101,7 +101,7 @@ end
     # The multi-probe internals reproduce the single-probe numbers exactly.
     cols = _norm_cols(_report_demo_data())
     ast = _surface_block(_REPORT_SURFACE)
-    bound = bind_data(lower_rkppl(ast, keys(cols)), cols)
+    bound = bind_data(lower_rkppl(ast, keys(cols); conditioned = keys(cols)), cols)
     prep = _prepare_bound_report(bound)
     @test prep.n == 3
     pr = _run_report_probe(prep, _REPORT_U; backend = _GEN_BACKEND)

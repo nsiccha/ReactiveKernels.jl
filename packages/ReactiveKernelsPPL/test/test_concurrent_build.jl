@@ -61,9 +61,9 @@ end
     main_snap, def_snap = deepcopy(main), deepcopy(def)
     mod = _ccb_emit_module([def])
     unbound = lower_rkppl(main, (:y, :x);
-        mod = _ccb_emit_module([deepcopy(def)]))
+        mod = _ccb_emit_module([deepcopy(def)]), conditioned = (:y, :x))
     # The submodel path lowers through the same pipeline with a def module.
-    unbound_sm = lower_rkppl(_ccb_submodel_main(1.0), (:y, :x); mod = mod)
+    unbound_sm = lower_rkppl(_ccb_submodel_main(1.0), (:y, :x); mod = mod, conditioned = (:y, :x))
     @test main == main_snap
     @test def == def_snap
     bound = bind_data(unbound, _ccb_cols1())
@@ -80,7 +80,7 @@ end
     refs = Dict{Int,Int}()
     for v in (1, 2)
         ast, cols, dn = _ccb_variant(v)
-        refs[v] = build_kernel(bind_data(lower_rkppl(ast, dn), cols)).layout.total
+        refs[v] = build_kernel(bind_data(lower_rkppl(ast, dn; conditioned = dn), cols)).layout.total
     end
     @test refs[1] != refs[2] # variants must stay distinguishable
     n_tasks, n_rounds = 4, 3
@@ -90,7 +90,7 @@ end
             v = isodd(t) ? 1 : 2
             for r in 1:n_rounds
                 ast, cols, dn = _ccb_variant(v)
-                built = build_kernel(bind_data(lower_rkppl(ast, dn), cols))
+                built = build_kernel(bind_data(lower_rkppl(ast, dn; conditioned = dn), cols))
                 results[(t - 1) * n_rounds + r] =
                     (v, built.layout.total, objectid(built.spec))
             end
@@ -105,7 +105,7 @@ end
 @testset "concurrent build: fresh-module submodel builds" begin
     ref = build_kernel(bind_data(
         lower_rkppl(_ccb_submodel_main(1.0), (:y, :x);
-            mod = _ccb_emit_module([_ccb_submodel_def()])),
+            mod = _ccb_emit_module([_ccb_submodel_def()]), conditioned = (:y, :x)),
         _ccb_cols1())).layout.total
     n_tasks, n_rounds = 4, 3
     results = Vector{Any}(undef, n_tasks * n_rounds)
@@ -114,7 +114,7 @@ end
             for r in 1:n_rounds
                 mod = _ccb_emit_module([_ccb_submodel_def()])
                 unbound = lower_rkppl(_ccb_submodel_main(1.0), (:y, :x);
-                    mod = mod)
+                    mod = mod, conditioned = (:y, :x))
                 built = build_kernel(bind_data(unbound, _ccb_cols1()))
                 results[(t - 1) * n_rounds + r] =
                     (built.layout.total, objectid(built.spec))

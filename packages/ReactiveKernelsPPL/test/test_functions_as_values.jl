@@ -88,7 +88,7 @@ const _FV_BACKEND = DifferentiationInterface.AutoEnzyme(;
     mode = Enzyme.Reverse)
 
 function _fv_build(ast, cols; mod::Module = _FV)
-    plan = lower_rkppl(ast, Tuple(keys(cols)); mod)
+    plan = lower_rkppl(ast, Tuple(keys(cols)); mod, conditioned = Tuple(keys(cols)))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     return plan, bound, built
@@ -129,7 +129,7 @@ _fv_cum_model() = quote
 end
 
 @testset "functions as values: lowering" begin
-    plan = lower_rkppl(_fv_cum_model(), (:y, :c))
+    plan = lower_rkppl(_fv_cum_model(), (:y, :c); conditioned = (:y, :c))
     # `cumsum`/`vcat` resolve in the model module (Main here) as GlobalRefs.
     # `cum` and `m` feed only the predictor, so they inline into one
     # extracted observation column: the gather of the cumulative simplex.
@@ -147,7 +147,7 @@ end
             t = affine_helper(s)
             mu = m0 .+ bx .* x
             y .~ Normal.(mu, t)
-        end, (:y, :x); mod = _FV)
+        end, (:y, :x); mod = _FV, conditioned = (:y, :x))
     t = only(a for a in p2.assignments if a.name === :t)
     @test t.expr.args[1] == GlobalRef(_FV, :affine_helper)
 
@@ -158,7 +158,7 @@ end
                 s ~ Exponential(1.0)
                 t = no_such_helper(s)
                 y .~ Normal.(m0, t)
-            end, (:y,); mod = _FV)
+            end, (:y,); mod = _FV, conditioned = (:y,))
         nothing
     catch e
         e
@@ -177,7 +177,7 @@ end
                 t = shifted(x; by = s)
                 mu = m0 .+ x
                 y .~ Normal.(mu, t[1])
-            end, (:y, :x); mod = _FV)
+            end, (:y, :x); mod = _FV, conditioned = (:y, :x))
         nothing
     catch e
         e
@@ -192,7 +192,7 @@ end
                 s ~ Exponential(1.0)
                 t = shifted(x; by = s)
                 y .~ Normal.(t, 1.0)
-            end, (:y, :x); mod = _FV)
+            end, (:y, :x); mod = _FV, conditioned = (:y, :x))
         nothing
     catch e
         e
@@ -207,7 +207,7 @@ end
             s ~ Exponential(1.0)
             t = s(1.0)
             y .~ Normal.(m0, t)
-        end, (:y,); mod = _FV)
+        end, (:y,); mod = _FV, conditioned = (:y,))
 end
 
 @testset "functions as values: cumsum gather density matches Distributions" begin
@@ -253,17 +253,17 @@ end
                 Expr(:for, Expr(:(=), :i, :(eachindex(x))), Expr(:block,
                     :(x_true[i] ~ Normal(0, 1)),
                     :(x[i] ~ Normal.(x_true[i], 0.5)))))),
-        Tuple(keys(cols)); mod = _FV)
+        Tuple(keys(cols)); mod = _FV, conditioned = Tuple(keys(cols)))
     # So is a definition reading a parameter, however it is named.
     # refused: a gather index must be integer data; k = c .* b reads parameter b (user GO 0fzormv)
     @test_throws ContractValidationError lower_rkppl(
-        gathered(:k, :(k = c .* b)), Tuple(keys(cols)); mod = _FV)
+        gathered(:k, :(k = c .* b)), Tuple(keys(cols)); mod = _FV, conditioned = Tuple(keys(cols)))
     # A raw index column must hold integers (bind).
-    real_idx = lower_rkppl(gathered(:x), Tuple(keys(cols)); mod = _FV)
+    real_idx = lower_rkppl(gathered(:x), Tuple(keys(cols)); mod = _FV, conditioned = Tuple(keys(cols)))
     # refused: gather index column x holds non-integer reals (non-integer index, user GO 0fzormv)
     @test_throws ContractValidationError bind_data(real_idx, cols)
     # An integer data column gathers (the corpus 97 shape).
-    @test bind_data(lower_rkppl(gathered(:c), Tuple(keys(cols)); mod = _FV),
+    @test bind_data(lower_rkppl(gathered(:c), Tuple(keys(cols)); mod = _FV, conditioned = Tuple(keys(cols))),
         cols) isa StructuralPlan
 end
 
@@ -382,7 +382,7 @@ end
                 r1 = scaled(scale, k)
                 r2 = scaled(scale, 2 * k)
                 y .~ Normal.(r1[g] .+ r2[g], sigma)
-            end, (:y, :gx, :g); mod = _FV)
+            end, (:y, :gx, :g); mod = _FV, conditioned = (:y, :gx, :g))
         nothing
     catch e
         e
@@ -410,7 +410,7 @@ end
                 w = l2norm($v)
                 mu = a .+ b .* (x ./ w)
                 y .~ Normal.(mu, sigma)
-            end, (:y, :x); mod = _FV)
+            end, (:y, :x); mod = _FV, conditioned = (:y, :x))
         bound = bind_data(plan, cols2)
         built = build_kernel(bound)
         th = ReactiveKernelsPPL.constrain(built.layout, u)
@@ -488,7 +488,7 @@ end
         y .~ Normal.(mu, s_eff)
     end
     _FV.CALLS[] = 0
-    plan = lower_rkppl(ast, (:y, :X, :x); mod = _FV)
+    plan = lower_rkppl(ast, (:y, :X, :x); mod = _FV, conditioned = (:y, :X, :x))
     @test _FV.CALLS[] == 0                     # lowering is data-free
     bound = bind_data(plan, cols)
     @test _FV.CALLS[] == 1                     # evaluated once, at bind
@@ -583,7 +583,7 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, s_eff)
     end
-    plan = lower_rkppl(ast, (:y, :X, :x); mod = FunctionsAsValuesBare)
+    plan = lower_rkppl(ast, (:y, :X, :x); mod = FunctionsAsValuesBare, conditioned = (:y, :X, :x))
     @test !isdefined(FunctionsAsValuesBare, :var)
     bound = bind_data(plan, cols)
     vx = [var(X[:, j]) for j in 1:2]
@@ -612,7 +612,7 @@ end
         v = b .* gx_m
         y .~ Normal.(v[g], sigma)
     end
-    plan = lower_rkppl(ast, (:y, :g, :gx); mod = _FV)
+    plan = lower_rkppl(ast, (:y, :g, :gx); mod = _FV, conditioned = (:y, :g, :gx))
     for order in (collect(cols), reverse(collect(cols)))
         @test bind_data(plan, Dict{Symbol,ColumnData}(order)).n_obs == 6
     end
@@ -631,7 +631,7 @@ end
             sigma ~ Exponential(1.0)
             b ~ Normal(0, 1)
             y .~ Normal.(b .* gx[g], sigma)
-        end, (:y, :g, :gx); mod = _FV)
+        end, (:y, :g, :gx); mod = _FV, conditioned = (:y, :g, :gx))
     gbound = bind_data(gplan, cols)
     @test gbound.n_obs == 6
     gbuilt = build_kernel(gbound)
@@ -655,7 +655,7 @@ end
                 b ~ Normal(0, 1)
                 y .~ Normal.((b .* gx)[g], sigma)
             end)
-        vbound = bind_data(lower_rkppl(body, (:y, :g, :gx); mod = _FV), cols)
+        vbound = bind_data(lower_rkppl(body, (:y, :g, :gx); mod = _FV, conditioned = (:y, :g, :gx)), cols)
         vbuilt = build_kernel(vbound)
         for u in ([0.3, -0.2], [-1.1, 0.7])
             th = ReactiveKernelsPPL.constrain(vbuilt.layout, u)
@@ -673,7 +673,7 @@ end
             sc = b .* gx
             s_eff = sigma * exp(first(sc))
             y .~ Normal.(m0 .+ x, s_eff)
-        end, (:y, :x, :gx); mod = _FV)
+        end, (:y, :x, :gx); mod = _FV, conditioned = (:y, :x, :gx))
     @test any(a -> a.name === :sc, kept.assignments) # named model-level value
     kbound = bind_data(kept, xcols)
     @test kbound.n_obs == 6
@@ -694,7 +694,7 @@ end
             v = b .* gx_m
             mu = v[g] .+ gx
             y .~ Normal.(mu, sigma)
-        end, (:y, :g, :gx); mod = _FV)
+        end, (:y, :g, :gx); mod = _FV, conditioned = (:y, :g, :gx))
     # refused: gx is read per observation (`v[g] .+ gx`), so it is observation-aligned; its length 3 against 6 observations is a length mismatch (wrong data; a Julia DimensionMismatch, P3)
     @test_throws ContractValidationError bind_data(mixed, cols)
     # So does a name any other plan slot holds (here: response weights).
@@ -704,7 +704,7 @@ end
             gx_m = as_vector(gx)
             v = b .* gx_m
             y .~ weighted.(Normal.(v[g], sigma), gx)
-        end, (:y, :g, :gx); mod = _FV)
+        end, (:y, :g, :gx); mod = _FV, conditioned = (:y, :g, :gx))
     # refused: weights gx (length 3) do not match the 6 observations (wrong data: length mismatch; a broadcast DimensionMismatch, P3)
     @test_throws ContractValidationError bind_data(weighted_plan, cols)
 end
@@ -761,7 +761,7 @@ end
             r2 = decayed_events(g, t, eg, et, ea, w, scale, 2 * k)
             y .~ Normal.(r1[oi], sigma)
             y2 .~ Normal.(r2[oi], sigma)
-        end, (Tuple(keys(cols))..., :y2); mod = _FV),
+        end, (Tuple(keys(cols))..., :y2); mod = _FV, conditioned = (Tuple(keys(cols))..., :y2)),
         merge(cols, Dict{Symbol,ColumnData}(:y2 => reverse(cols[:y])))).n_obs == 8
     # ... unless something else reads one per observation.
     # capability: parameter-dependent undotted module call over an observation-aligned column (t is passed whole to decayed_events and also read per observation as weights; refused as "result shape unknown until sampling") (todo `15lq8iu`)
@@ -773,7 +773,7 @@ end
             scale = a .+ b .* as_vector(gx)
             reads = decayed_events(g, t, eg, et, ea, w, scale, k)
             y .~ weighted.(Normal.(reads[oi], sigma), t)
-        end, Tuple(keys(cols)); mod = _FV); true)
+        end, Tuple(keys(cols)); mod = _FV, conditioned = Tuple(keys(cols))); true)
     # A gather by a per-observation index is observation-aligned, even of
     # a whole column.
     # capability: parameter-dependent undotted module call over an observation-aligned value (`shifted(gx[g]; by = s)`, then gathered `t2[oi]`; refused as "result shape unknown until sampling") (todo `15lq8iu`)
@@ -784,7 +784,7 @@ end
             t2 = shifted(gx[g]; by = s)
             mu = m0 .+ c .* g .+ t2[oi]
             y .~ Normal.(mu, 1.0)
-        end, Tuple(keys(cols)); mod = _FV); true)
+        end, Tuple(keys(cols)); mod = _FV, conditioned = Tuple(keys(cols))); true)
     for u in ([0.3, -0.2, 0.5, 0.1], [-1.1, 0.7, -0.3, -0.4])
         th = ReactiveKernelsPPL.constrain(built.layout, u)
         reads = _FV.decayed_events(cols[:g], cols[:t], cols[:eg], cols[:et],

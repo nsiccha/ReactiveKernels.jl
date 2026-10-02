@@ -406,7 +406,7 @@ function _run_surface_case(c::SweepCase, mani::SweepManifest, out_dir;
     cols = _norm_cols(sf.data)
     # Bare lower→bind is correct here: surface-kind cases carry no BRM
     # plan, so no patches exist to apply.
-    bound = bind_data(lower_rkppl(ast, keys(cols)), cols)
+    bound = bind_data(lower_rkppl(ast, keys(cols); conditioned = keys(cols)), cols)
     prep = _prepare_bound_report(bound)
     expanded = c.uprobes === nothing ? [nothing] : c.uprobes
     prs = [_run_report_probe(prep, up; backend = backend) for up in expanded]

@@ -59,7 +59,7 @@ function _ref_gauss_ll(y, mu, sigma)
 end
 
 @testset "mo surface lowering" begin
-    plan = lower_rkppl(_mo_surface_mo(), (:y, :c))
+    plan = lower_rkppl(_mo_surface_mo(), (:y, :c); conditioned = (:y, :c))
     @test length(plan.predictors) == 1
     terms = plan.predictors[1].terms
     @test [t.kind for t in terms] == [InterceptTerm, MonotonicTerm]
@@ -83,7 +83,7 @@ end
 end
 
 @testset "mo1 surface lowering" begin
-    plan = lower_rkppl(_mo_surface_mo1(), (:y, :c))
+    plan = lower_rkppl(_mo_surface_mo1(), (:y, :c); conditioned = (:y, :c))
     terms = plan.predictors[1].terms
     @test [t.kind for t in terms] == [InterceptTerm, MonotonicSummandTerm]
     mot = terms[2]
@@ -99,14 +99,14 @@ end
             s ~ Dirichlet(2, 1.0)
             mu = mo1(c, s)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c))
+        end, (:y, :c); conditioned = (:y, :c))
     @test [t.kind for t in only1.predictors[1].terms] == [MonotonicSummandTerm]
     @test isempty(only1.population_priors)
     mixed = lower_rkppl(quote
             s ~ Dirichlet(2, 1.0)
             mu = z .+ mo1(c, s)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c, :z))
+        end, (:y, :c, :z); conditioned = (:y, :c, :z))
     @test [t.kind for t in mixed.predictors[1].terms] ==
         [OffsetTerm, MonotonicSummandTerm]
     # A spline summand keeps the coefficient requirement (the mo1
@@ -117,7 +117,7 @@ end
             mu = spline(:s_x) .+ mo1(c, s)
             y .~ Normal.(mu, 1.0)
             spline_basis(:s_x, x; k = 4)
-        end, (:y, :c, :x)); true)
+        end, (:y, :c, :x); conditioned = (:y, :c, :x)); true)
 end
 
 @testset "mo surface fail-closed" begin
@@ -128,7 +128,7 @@ end
                 s ~ Dirichlet(2, 1.0)
                 mu = a .+ mo(c, s)
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :c))
+            end, (:y, :c); conditioned = (:y, :c))
         nothing
     catch e
         e
@@ -143,14 +143,14 @@ end
             s ~ Dirichlet(2, 1.0)
             mu = a .+ b .* mo1(c, s)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c)); true)
+        end, (:y, :c); conditioned = (:y, :c)); true)
     # capability: a reduction of a monotonic value can feed an ordinary scalar offset (P8; todo `15lq8iu`).
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
             mu = a .+ sum(mo1(c, s))
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c)); true)
+        end, (:y, :c); conditioned = (:y, :c)); true)
     # Negated mo1 summands fail closed (additive only).
     # capability: negated mo1 summand (`a .- mo1(c, s)`) (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote
@@ -158,38 +158,38 @@ end
             s ~ Dirichlet(2, 1.0)
             mu = a .- mo1(c, s)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c)); true)
+        end, (:y, :c); conditioned = (:y, :c)); true)
     # Arity is exactly (index column, increments).
     # refused: mo arity, increments simplex missing; no minted simplex (P6, 05oe96l; P7, 0d5a67r)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             s ~ Dirichlet(2, 1.0)
             mu = a .+ b .* mo(c)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c))
+        end, (:y, :c); conditioned = (:y, :c))
     # refused: mo1 arity, extra argument (Julia MethodError analogue, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             s ~ Dirichlet(2, 1.0)
             mu = a .+ mo1(c, s, s)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c))
+        end, (:y, :c); conditioned = (:y, :c))
     # The index is a bare data column; the increments a Dirichlet simplex.
     # refused: undeclared name `q` as index (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             s ~ Dirichlet(2, 1.0)
             mu = a .+ b .* mo(q, s)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c))
+        end, (:y, :c); conditioned = (:y, :c))
     # refused: increments must be a simplex (scalar Normal `t`)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             t ~ Normal(0, 1)
             mu = a .+ b .* mo(c, t)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c))
+        end, (:y, :c); conditioned = (:y, :c))
     # refused: undeclared simplex `s` (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             mu = a .+ mo1(c, s)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c))
+        end, (:y, :c); conditioned = (:y, :c))
     # One monotonic term per simplex (SB allocates one submodel per term).
     # capability: one increments simplex shared by several mo/mo1 terms (SB one-submodel-per-term is not a principle, P10) (todo `1qlbn5b`)
     @test_broken (lower_rkppl(quote
@@ -201,7 +201,7 @@ end
             nu = d .+ mo1(c, s)
             y .~ Normal.(mu, 1.0)
             z .~ Normal.(nu, 1.0)
-        end, (:y, :z, :c)); true)
+        end, (:y, :z, :c); conditioned = (:y, :z, :c)); true)
     # `mo()` neither interacts nor nests.
     # capability: mo() interaction with a data column (`b .* mo(c, s) .* x`) (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote
@@ -210,7 +210,7 @@ end
             s ~ Dirichlet(2, 1.0)
             mu = a .+ b .* mo(c, s) .* x
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c, :x)); true)
+        end, (:y, :c, :x); conditioned = (:y, :c, :x)); true)
     # capability: mo() nested in an arithmetic subexpression (`b .* (mo(c, s) .+ x)`) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -218,7 +218,7 @@ end
             s ~ Dirichlet(2, 1.0)
             mu = a .+ b .* (mo(c, s) .+ x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c, :x)); true)
+        end, (:y, :c, :x); conditioned = (:y, :c, :x)); true)
     # Neither spelling hides in definitions.
     # capability: mo value in a definition (`w = b .* mo(c, s)`) (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote
@@ -228,7 +228,7 @@ end
             w = b .* mo(c, s)
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c)); true)
+        end, (:y, :c); conditioned = (:y, :c)); true)
     # capability: mo1 value in a definition (`w = mo1(c, s)`) (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -236,7 +236,7 @@ end
             w = mo1(c, s)
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c)); true)
+        end, (:y, :c); conditioned = (:y, :c)); true)
     # capability: mo value in an unused derived definition (`m = sum(mo(c, s))`) (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -244,7 +244,7 @@ end
             m = sum(mo(c, s))
             mu = a .+ x
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c, :x)); true)
+        end, (:y, :c, :x); conditioned = (:y, :c, :x)); true)
 end
 
 # Hand-built monotonic plan (structure-only): `like` selects the term
@@ -409,7 +409,7 @@ end
 @testset "mo end-to-end values and gradient" begin
     cols = _mo_cols()
     alpha = [1.0, 2.0]
-    bound = bind_data(lower_rkppl(_mo_surface_mo(), (:y, :c)), cols)
+    bound = bind_data(lower_rkppl(_mo_surface_mo(), (:y, :c); conditioned = (:y, :c)), cols)
     built = build_kernel(bound)
     @test built.layout.total == 4
     u = [0.5, -0.25, 0.1, 0.3]
@@ -441,7 +441,7 @@ end
 @testset "mo1 end-to-end values and gradient" begin
     cols = _mo_cols()
     alpha = [1.0, 2.0]
-    bound = bind_data(lower_rkppl(_mo_surface_mo1(), (:y, :c)), cols)
+    bound = bind_data(lower_rkppl(_mo_surface_mo1(), (:y, :c); conditioned = (:y, :c)), cols)
     built = build_kernel(bound)
     u = [0.5, 0.1, 0.3]
     nt = constrain(built.layout, u)
@@ -463,7 +463,7 @@ end
                 s ~ Dirichlet(2, 1.0)
                 mu = mo1(c, s)
                 y .~ Normal.(mu, 1.5)
-            end, (:y, :c)), cols)
+            end, (:y, :c); conditioned = (:y, :c)), cols)
     built = build_kernel(bound)
     @test built.layout.total == 1
     u = [0.4]
@@ -480,7 +480,7 @@ end
                 s ~ Dirichlet(2, 1.0)
                 mu = z .+ mo1(c, s)
                 y .~ Normal.(mu, 1.5)
-            end, (:y, :c, :z)), cols)
+            end, (:y, :c, :z); conditioned = (:y, :c, :z)), cols)
     built2 = build_kernel(bound2)
     mu2 = cols[:z] .+ _ref_contrast(s, cols[:c])
     ll2 = _ref_gauss_ll(cols[:y], mu2, 1.5)
@@ -501,7 +501,7 @@ end
                 mu = a .+ b .* mo(c, s)
                 sigma ~ Exponential(1.0)
                 y .~ Normal.(mu, sigma)
-            end, (:y, :c)), cols)
+            end, (:y, :c); conditioned = (:y, :c)), cols)
     built = build_kernel(bound)
     # The 1-simplex packs zero coordinates (deterministic [1.0]).
     @test built.layout.total == 3
@@ -529,7 +529,7 @@ end
                 mu = b .* mo(c, s) .+ d .* x .+ cf[g]
                 sigma ~ Exponential(1.0)
                 y .~ Normal.(mu, sigma)
-            end, (:y, :c, :x, :g)), cols)
+            end, (:y, :c, :x, :g); conditioned = (:y, :c, :x, :g)), cols)
     built = build_kernel(bound)
     @test coordinate_names(built.layout) == [:b, :d, :sigma, Symbol("s.1"),
         Symbol("cf.1"), Symbol("cf.2"), Symbol("cf.3")]
@@ -667,7 +667,7 @@ end
                     mu = a .+ b .* mo(c, s)
                     sigma ~ Exponential(1.0)
                     y .~ Normal.(mu, sigma)
-                end, (:y, :c)), cols)
+                end, (:y, :c); conditioned = (:y, :c)), cols)
         built = build_kernel(bound)
         lay = built.layout
         @test coordinate_names(lay) == [:a,
@@ -709,7 +709,7 @@ end
                     mu = a .+ mo1(c, s)
                     sigma ~ Exponential(1.0)
                     y .~ Normal.(mu, sigma)
-                end, (:y, :c)), cols)
+                end, (:y, :c); conditioned = (:y, :c)), cols)
         built = build_kernel(bound)
         lay = built.layout
         @test coordinate_names(lay) ==
@@ -748,7 +748,7 @@ end
                     mu = mo1(c, s)
                     sigma ~ Exponential(1.0)
                     y .~ Normal.(mu, sigma)
-                end, (:y, :c)), cols)
+                end, (:y, :c); conditioned = (:y, :c)), cols)
         built = build_kernel(bound)
         lay = built.layout
         @test coordinate_names(lay) ==
@@ -785,7 +785,7 @@ end
                     mu = mo1(c, s)
                     sigma ~ Exponential(1.0)
                     y .~ Normal.(mu, sigma)
-                end, (:y, :c)), cols)
+                end, (:y, :c); conditioned = (:y, :c)), cols)
         built = build_kernel(bound)
         lay = built.layout
         @test coordinate_names(lay) == [:sigma, Symbol("s.1")]
@@ -817,7 +817,7 @@ end
 # differences.
 @testset "monotonic library: parity with mo / mo1" begin
     cols = _mo_cols()
-    lower(ast) = bind_data(lower_rkppl(ast, (:y, :c)), cols)
+    lower(ast) = bind_data(lower_rkppl(ast, (:y, :c); conditioned = (:y, :c)), cols)
     cases = [
         ("mo", quote
             a ~ Normal(0, 1)

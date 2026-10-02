@@ -18,7 +18,7 @@ using Test
 # Lower + bind + build + query a prior-vocab program; return
 # `(bound, built, kern, layout)`.
 function _pv_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -65,7 +65,7 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
             g ~ Logistic(2, 0.5)
             u ~ Uniform(-1, 2)
             s ~ Exponential(1)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     t = _pv_param(plan, :t)
     @test t.family === :student_t
     @test t.args == (arg1 = 3, arg2 = 1, arg3 = 2)
@@ -87,7 +87,7 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                 y .~ Normal.(mu, s)
                 nu ~ Exponential(1)
                 t ~ StudentT(nu, 0, 1)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         t = _pv_param(plan, :t)
         @test t.family === :student_t
         @test t.args == (arg1 = :nu, arg2 = 0, arg3 = 1)
@@ -104,7 +104,7 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                         y .~ Normal.(mu, s)
                         t ~ $rhs
                         s ~ Exponential(1)
-                    end, (:y, :x))
+                    end, (:y, :x); conditioned = (:y, :x))
                 nothing
             catch e
                 e
@@ -131,7 +131,7 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                 lo ~ Normal(0, 1)
                 u ~ Uniform(lo, 2)
                 s ~ Exponential(1)
-            end, (:y, :x)); true)
+            end, (:y, :x); conditioned = (:y, :x)); true)
         # refused: Uniform bounds out of order (malformed distribution)
         for rhs in (:(Uniform(2, -1)), :(Uniform(0, Inf)))
             # refused: battery of malformed Uniform literals (all entries P)
@@ -142,7 +142,7 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                     y .~ Normal.(mu, s)
                     u ~ $rhs
                     s ~ Exponential(1)
-                end, (:y, :x))
+                end, (:y, :x); conditioned = (:y, :x))
         end
     end
 end
@@ -157,11 +157,11 @@ end
                 Expr(:block,
                     :(theta[i] ~ $rhs),
                     :(y[i] ~ Normal.(theta[i], 1.0))))))
-    plate = lower_rkppl(_plate_theta(:(StudentT(3, 0, 2))), (:y,))
+    plate = lower_rkppl(_plate_theta(:(StudentT(3, 0, 2))), (:y,); conditioned = (:y,))
     pp = only(plate.plate_parameters)
     @test pp.family === :student_t
     @test pp.args == (arg1 = 3, arg2 = 0, arg3 = 2)
-    plate = lower_rkppl(_plate_theta(:(Uniform(-1, 2))), (:y,))
+    plate = lower_rkppl(_plate_theta(:(Uniform(-1, 2))), (:y,); conditioned = (:y,))
     pp = only(plate.plate_parameters)
     @test pp.family === :uniform
     @test pp.support_override === nothing
@@ -174,7 +174,7 @@ end
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block,
                     :(theta[i] ~ Uniform(lo[i], hi[i])),
-                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y, :lo, :hi)); true)
+                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y, :lo, :hi); conditioned = (:y, :lo, :hi)); true)
 end
 
 @testset "prior vocab truncated halves" begin
@@ -188,7 +188,7 @@ end
             g ~ truncated(Logistic(0, 1), 0, Inf)
             n ~ truncated(Normal(0, 2), 0, Inf)
             s ~ Exponential(1)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     h = _pv_param(plan, :h)
     @test h.family === :student_t
     @test h.args == (arg1 = 3, arg2 = 0, arg3 = 2)
@@ -204,7 +204,7 @@ end
                 y .~ Normal.(mu, s)
                 h ~ truncated(StudentT(3, 1, 2), 0, Inf)
                 s ~ Exponential(1)
-            end, (:y, :x)); true)
+            end, (:y, :x); conditioned = (:y, :x)); true)
     end
     @testset "upper-only and finite intervals across families" begin
         @test (lower_rkppl(quote
@@ -214,7 +214,7 @@ end
                 y .~ Normal.(mu, s)
                 h ~ truncated(StudentT(3, 0, 2), -Inf, 1)
                 s ~ Exponential(1)
-            end, (:y, :x)); true)
+            end, (:y, :x); conditioned = (:y, :x)); true)
         @test (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
@@ -222,7 +222,7 @@ end
                 y .~ Normal.(mu, s)
                 h ~ truncated(Laplace(0, 1), -1, 1)
                 s ~ Exponential(1)
-            end, (:y, :x)); true)
+            end, (:y, :x); conditioned = (:y, :x)); true)
     end
 end
 
@@ -250,7 +250,7 @@ end
             a ~ StudentT(4, 0, 2)
             b ~ Laplace(0, 1)
             s ~ Exponential(1)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     pa = _pv_prior(plan, :mu, :Intercept)
     @test pa.family === :student_t
     @test (pa.location, pa.scale, pa.nu) == (0.0, 2.0, 4.0)
@@ -264,7 +264,7 @@ end
                 a ~ Cauchy(0, 1)
                 b ~ Flat()
                 s ~ Exponential(1)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         @test _pv_prior(plan, :mu, :Intercept).family === :cauchy
         @test _pv_prior(plan, :mu, :x).family === :flat
         plan = lower_rkppl(quote
@@ -273,7 +273,7 @@ end
                 y .~ Normal.(mu, s)
                 b ~ Logistic(1, 2)
                 s ~ Exponential(1)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         @test _pv_prior(plan, :mu, :x).family === :logistic
         @test _pv_prior(plan, :mu, :x).location == 1.0
         # Unstated coefficients keep the Normal(0, 1) default.
@@ -287,7 +287,7 @@ end
                 mu = c[g] .+ b .* x
                 b ~ Normal(0, 1)
                 y .~ Normal.(mu, 1.5)
-            end, (:y, :g, :x))
+            end, (:y, :g, :x); conditioned = (:y, :g, :x))
         pc = _pv_prior(plan, :mu, :g)
         @test pc.family === :student_t
         @test (pc.location, pc.scale, pc.nu) == (0.0, 2.0, 3.0)
@@ -295,7 +295,7 @@ end
                 c[levels(g)] .~ Laplace.(0, 1)
                 mu = c[g] .+ o
                 y .~ Normal.(mu, 1.5)
-            end, (:y, :g, :o))
+            end, (:y, :g, :o); conditioned = (:y, :g, :o))
         @test _pv_prior(plan, :mu, :g).family === :laplace
     end
     @testset "matrix broadcast families" begin
@@ -304,7 +304,7 @@ end
                 X = hcat(ones(length(x1)), x1, x2)
                 mu = X * b
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x1, :x2))
+            end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
         @test isempty(plan.population_priors)
         @test only(plan.array_parameters).name === :b
         @test only(plan.array_parameters).family === :laplace
@@ -317,7 +317,7 @@ end
                     y .~ Normal.(mu, s)
                     b ~ student_t(3, 0, 1)
                     s ~ Exponential(1)
-                end, (:y, :x))
+                end, (:y, :x); conditioned = (:y, :x))
             nothing
         catch e
             e
@@ -351,7 +351,7 @@ end
                     y ~ NormalIDGLM(X, alpha, beta, 1.0)
                     alpha ~ Normal(0, 10)
                     beta[axes(X, 2)] .~ Laplace.(0, 1)
-                end, (:y, :x1, :x2))
+                end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
         @test only(plan.array_parameters).name === :beta
         @test only(plan.array_parameters).family === :laplace
         @test isempty(plan.population_priors)
@@ -529,7 +529,7 @@ end
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             s ~ truncated(StudentT(4, 0, 1), 0, Inf)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     i = findfirst(p -> p.name === :s, plan.parameters)
     p = plan.parameters[i]
     plan.parameters[i] =
@@ -551,7 +551,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _pv_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
@@ -630,7 +630,7 @@ const _PV_M5_PROPER = quote
 end
 
 @testset "stan-kernel halves admission" begin
-    plan = lower_rkppl(_PV_M5, (:y, :x))
+    plan = lower_rkppl(_PV_M5, (:y, :x); conditioned = (:y, :x))
     s = _pv_param(plan, :s)
     @test s.family === :normal
     @test s.args == (arg1 = 0, arg2 = 2)
@@ -646,7 +646,7 @@ end
             y .~ Normal.(mu, s)
             v ~ StudentT(4, 0, 1; lower=0)
             s ~ Exponential(1)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     v = _pv_param(plan, :v)
     @test v.family === :student_t
     @test v.args == (arg1 = 4, arg2 = 0, arg3 = 1)
@@ -659,7 +659,7 @@ end
                 y .~ Normal.(mu, s)
                 sc ~ Exponential(1)
                 s ~ Normal(0, sc; lower=0)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         s = _pv_param(plan, :s)
         @test s.args == (arg1 = 0, arg2 = :sc)
         @test s.support_override === :positive_stan
@@ -700,7 +700,7 @@ end
                         y .~ Normal.(mu, s)
                         p ~ $rhs
                         s ~ Exponential(1)
-                    end, (:y, :x))
+                    end, (:y, :x); conditioned = (:y, :x))
                 nothing
             catch e
                 e
@@ -722,7 +722,7 @@ end
                         y .~ Normal.(mu, s)
                         p ~ $rhs
                         s ~ Exponential(1)
-                    end, (:y, :x))
+                    end, (:y, :x); conditioned = (:y, :x))
                 nothing
             catch e
                 e
@@ -763,7 +763,7 @@ end
 # coef count, scale prior, and n — so only scalar-mu legs take this
 # ladder, and the vector-mu M5 leg below asserts default directly.
 function _pv_sh_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
@@ -848,7 +848,7 @@ _pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
     _pv_interval_logjac(0, 100, u) + log(5 - w)
 
 @testset "flat support admission" begin
-    plan = lower_rkppl(_PV_M7, (:y, :x))
+    plan = lower_rkppl(_PV_M7, (:y, :x); conditioned = (:y, :x))
     s = _pv_param(plan, :s)
     @test s.family === :flat
     @test s.support_override === :positive_stan
@@ -865,7 +865,7 @@ _pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
             y .~ Normal.(mu, s)
             p ~ Flat()
             s ~ Exponential(1)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
     @test _pv_param(bare, :p).support_override === nothing
     @testset "narrow gate fails closed" begin
         cases = (
@@ -901,7 +901,7 @@ _pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
                         y .~ Normal.(mu, s)
                         p ~ $rhs
                         s ~ Exponential(1)
-                    end, (:y, :x))
+                    end, (:y, :x); conditioned = (:y, :x))
                 nothing
             catch e
                 e
@@ -967,7 +967,7 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
     sigma_alpha = 1.3, s = 1.1)
 
 @testset "centered factor priors admission" begin
-    plan = lower_rkppl(_PV_M8, (:y, :x, :g))
+    plan = lower_rkppl(_PV_M8, (:y, :x, :g); conditioned = (:y, :x, :g))
     row = _pv_prior(plan, :mu, :g)
     @test row.family === :normal
     @test row.location === :mu_alpha
@@ -980,7 +980,7 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
                     b ~ Normal(0, 10)
                     mu = c[g] .+ b .* x
                     y .~ Normal.(mu, 1.5)
-                end, (:y, :x, :g))
+                end, (:y, :x, :g); conditioned = (:y, :x, :g))
             @test only(admitted.array_parameters).name === :c
             @test bind_data(admitted, _pv_gcols()) isa StructuralPlan
         end
@@ -990,7 +990,7 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
                     b ~ Normal(0, 10)
                     mu = c[g] .+ b .* x
                     y .~ Normal.(mu, 1.5)
-                end, (:y, :x, :g))
+                end, (:y, :x, :g); conditioned = (:y, :x, :g))
             # refused: unknown nope or 6 location values for 3 levels (name/shape contract, P3/P6).
             @test_throws ContractValidationError bind_data(prepared, _pv_gcols())
         end
@@ -1000,7 +1000,7 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
                 b ~ Normal(0, 10)
                 mu = c[g] .+ b .* x
                 ly .~ Normal.(mu, 1.5)
-            end, (:earn, :x, :g))
+            end, (:earn, :x, :g); conditioned = (:earn, :x, :g))
         # refused: 6 derived location values cannot broadcast over 3 levels (P3).
         @test_throws ContractValidationError bind_data(prepared,
             Dict(:earn => exp.(_PV_Y), :x => copy(_PV_X), :g => copy(_PV_G)))
@@ -1020,19 +1020,19 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
             b ~ Normal(0, 10)
             y .~ Normal.(mu, s)
         end
-        computed = lower_rkppl(mk(:(Normal.(mu_alpha + 0, 2))), (:y, :x, :g))
+        computed = lower_rkppl(mk(:(Normal.(mu_alpha + 0, 2))), (:y, :x, :g); conditioned = (:y, :x, :g))
         row = _pv_prior(computed, :mu, :g)
         @test row.location === :_rkppl_c_arg1
         @test any(a -> a.name === :_rkppl_c_arg1, computed.assignments)
         flipped = lower_rkppl(mk(:(Normal.(mu_alpha, sigma_alpha)),
-            :(-c[g])), (:y, :x, :g))
+            :(-c[g])), (:y, :x, :g); conditioned = (:y, :x, :g))
         row = _pv_prior(flipped, :mu, :g)
         @test row.location === :mu_alpha
         @test isempty(filter(a -> a.name === :_rkppl_neg_mu_alpha, flipped.assignments))
-        assigned = lower_rkppl(mk(:(Normal.(mu_alpha, sc))), (:y, :x, :g))
+        assigned = lower_rkppl(mk(:(Normal.(mu_alpha, sc))), (:y, :x, :g); conditioned = (:y, :x, :g))
         row = _pv_prior(assigned, :mu, :g)
         @test row.scale === :sc
-        coefread = lower_rkppl(mk(:(Normal.(b, sigma_alpha))), (:y, :x, :g))
+        coefread = lower_rkppl(mk(:(Normal.(b, sigma_alpha))), (:y, :x, :g); conditioned = (:y, :x, :g))
         @test any(p -> p.name === :b, coefread.parameters)
         scalar = lower_rkppl(quote
                 mu_alpha ~ Normal(0, 10)
@@ -1041,7 +1041,7 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
                 mu = a .+ b .* x
                 b ~ Normal(mu_alpha, 2)
                 y .~ Normal.(mu, s)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         row = _pv_prior(scalar, :mu, :x)
         @test row.location === :mu_alpha
     end
@@ -1053,7 +1053,7 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
                 b ~ Normal(0, 10)
                 mu = c[g] .+ b .* x
                 y .~ Normal.(mu, 1.5)
-            end, (:y, :x, :g))
+            end, (:y, :x, :g); conditioned = (:y, :x, :g))
         @test only(plan.array_parameters).args.arg2 === :mu_beta
         @test _pv_param(plan, :mu_beta).family === :normal
     end
@@ -1072,7 +1072,7 @@ end
                 mu = c[g] .+ b .* x
                 b ~ Normal(0, 10)
                 y .~ Normal.(mu, s)
-            end, (:y, :x, :g))
+            end, (:y, :x, :g); conditioned = (:y, :x, :g))
         row = _pv_prior(plan, :mu, :g)
         @test row.scale === :sigma_alpha
         @test bind_data(plan, _pv_gcols()) isa StructuralPlan
@@ -1166,7 +1166,7 @@ end
 _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
 
 @testset "uniform coefficients admission" begin
-    plan = lower_rkppl(_PV_M10, (:y, :x, :z))
+    plan = lower_rkppl(_PV_M10, (:y, :x, :z); conditioned = (:y, :x, :z))
     rows = Dict(addr => _pv_prior(plan, :mu, addr) for addr in (:Intercept, :x, :z))
     @test rows[:x].family === :uniform
     @test (rows[:x].location, rows[:x].scale) == (-100.0, 0.0)
@@ -1186,7 +1186,7 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
             c[levels(g)] .~ Uniform.(0, 10)
             mu = c[g]
             y .~ Normal.(mu, 1.5)
-        end, (:y, :g))
+        end, (:y, :g); conditioned = (:y, :g))
     frow = _pv_prior(fplan, :mu, :g)
     @test frow.family === :uniform
     @test (frow.location, frow.scale) == (0.0, 10.0)
@@ -1215,7 +1215,7 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
                         b ~ $rhs
                         mu = a .+ b .* x
                         y .~ Normal.(mu, 1.5)
-                    end, (:y, :x))
+                    end, (:y, :x); conditioned = (:y, :x))
                 nothing
             catch e
                 e
@@ -1247,7 +1247,7 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
                         c[levels(g)] .~ $rhs
                         mu = c[g]
                         y .~ Normal.(mu, 1.5)
-                    end, (:y, :g))
+                    end, (:y, :g); conditioned = (:y, :g))
                 nothing
             catch e
                 e

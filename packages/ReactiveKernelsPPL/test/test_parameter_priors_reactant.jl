@@ -1,7 +1,7 @@
 using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme, Reactant
 
 function _pp_backend_check(expr, data, q)
-    bound = bind_data(lower_rkppl(expr, data), data)
+    bound = bind_data(lower_rkppl(expr, data; conditioned = data), data)
     built = build_kernel(bound)
     u = unconstrain(built.layout, q)
     kernel = prepare_query(built, bound, :sampler)

@@ -127,7 +127,7 @@ end
     end
     cols, n = _gen_columns()
     X = hcat(ones(n), cols[:x])
-    bound = m(; y = cols[:y], x = cols[:x], X = X)
+    bound = (m(; x = cols[:x], X = X) | (; y = cols[:y]))
     @test isbound(bound)
     @test bound.n_obs == n
     @test bound.roles[:X] === :data

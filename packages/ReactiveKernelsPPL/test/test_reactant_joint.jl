@@ -65,7 +65,7 @@ end
             $declaration
             mu = a .- $read .+ x
             y .~ Normal.(mu, 0.7)
-        end, (:y, :x))
+        end, (:y, :x); conditioned = (:y, :x))
         counts = Dict{String,Int}[]
         for n in (3, 8)
             x = collect(range(-0.8, 0.9; length = n))
@@ -85,7 +85,7 @@ function _rj_tiny_bound()
             sigma ~ Exponential(1)
             mu = a
             y .~ Normal.(mu, sigma)
-        end, (:y,))
+        end, (:y,); conditioned = (:y,))
     bind_data(plan, Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5]))
 end
 
@@ -143,7 +143,7 @@ end
             r ~ varying_effect(g, [1, dummy(c, 2)])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :c, :g))
+        end, (:y, :c, :g); conditioned = (:y, :c, :g))
     bound = bind_data(plan, Dict{Symbol,AbstractVector}(
         :y => [0.5, -1.2, 0.8, 1.5, -0.3, 0.9, -0.7, 1.1],
         :c => [1, 2, 2, 1, 2, 1, 2, 1],
@@ -177,7 +177,7 @@ function _rj_grouped_pk()
             "log_Vc, log_Vc, log_Vc)\n" *
             " mu = read_locs[pk_sched.obs_map]\n" *
             " dv .~ Normal.(mu, sigma)\n mu\nend\nend"),
-        (:subj, :time, :dsubj, :dtime, :damt, :dv))
+        (:subj, :time, :dsubj, :dtime, :damt, :dv); conditioned = (:subj, :time, :dsubj, :dtime, :damt, :dv))
     cols = Dict{Symbol,AbstractVector}(
         :subj => [1, 1, 2, 2], :time => [96.0, 120.0, 0.0, 5.0],
         :dsubj => [1, 1, 1, 1, 2], :dtime => [0.0, 24.0, 48.0, 72.0, 0.0],
@@ -208,7 +208,7 @@ colsums(B) = vec(sum(B; dims = 1))
 end
 
 function _rj_slices_bound(prog)
-    plan = lower_rkppl(prog, (:y, :k); mod = RJSliceModels)
+    plan = lower_rkppl(prog, (:y, :k); mod = RJSliceModels, conditioned = (:y, :k))
     return bind_data(plan, Dict{Symbol,AbstractVector}(
         :y => [0.3, -1.2, 2.1, 0.7, -0.4, 1.5, 0.2, -0.8],
         :k => [1, 2, 3, 1, 2, 3, 1, 2]))

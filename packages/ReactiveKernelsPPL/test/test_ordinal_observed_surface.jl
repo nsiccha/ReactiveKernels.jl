@@ -43,7 +43,7 @@ function _oos_ordinal(; structure = :stopping, disc = :modeled,
     else
         push!(ast.args, :(y .~ Ordinal.($tag, LogitLink(), eta, Ref(c), $d)))
     end
-    bound = bind_data(lower_rkppl(ast, keys(data)), data)
+    bound = bind_data(lower_rkppl(ast, keys(data); conditioned = keys(data)), data)
     built = build_kernel(bound)
     u = disc === :direct ? fill(0.1, built.layout.total) :
         [0.2 * cos(i) for i in 1:built.layout.total]
@@ -91,7 +91,7 @@ function _oos_observed(; n = 4, p = 2)
         mu = a .+ B * w
         y[rows] .~ Normal.(mu[rows], sigma)
     end
-    bound = bind_data(lower_rkppl(ast, keys(data)), data)
+    bound = bind_data(lower_rkppl(ast, keys(data); conditioned = keys(data)), data)
     built = build_kernel(bound)
     u = [0.2 * cos(i) for i in 1:built.layout.total]
     return (; bound, built, data, u)

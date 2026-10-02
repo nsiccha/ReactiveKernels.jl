@@ -52,7 +52,7 @@ end
 function _adv_build(kind, route, K = 3, n = 7)
     data = _adv_data(K, n)
     plan = lower_rkppl(_adv_model(kind, route), keys(data);
-        mod = ArrayDataValueModels)
+        mod = ArrayDataValueModels, conditioned = keys(data))
     bound = bind_data(plan, data)
     return (; plan, bound, built = build_kernel(bound), data)
 end
@@ -123,7 +123,7 @@ end
         # (standard Julia array-value contract, rkppl-use §2/§3).
         # capability: one whole array also read per observation; check its broadcast alignment at bind (P3, P10a 0dejlw1) (todo `1qlbn5b`)
         @test_broken (lower_rkppl(ast,
-            (:y, :y2, :g, :gx); mod = ArrayDataValueModels); true)
+            (:y, :y2, :g, :gx); mod = ArrayDataValueModels, conditioned = (:y, :y2, :g, :gx)); true)
     end
 end
 

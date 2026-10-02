@@ -17,7 +17,7 @@ using Test
 # Lower + bind + build + query a ZIP program; return
 # `(bound, built, kern, layout)`.
 function _zip_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -27,7 +27,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _zip_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
@@ -68,7 +68,7 @@ _zip_cols() = Dict{Symbol,AbstractVector}(:c => copy(_ZIP_C),
                 eta = a .+ b .* x
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
-            end, (:c, :x, :z))
+            end, (:c, :x, :z); conditioned = (:c, :x, :z))
         r = only(plan.responses)
         @test r.zi == ScalePredictorRef(:zeta, LogitLink)
         pred = only(p for p in plan.predictors if p.name === :zeta)
@@ -85,7 +85,7 @@ _zip_cols() = Dict{Symbol,AbstractVector}(:c => copy(_ZIP_C),
                 eta = a .+ b .* x
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), exp.(zeta))
-            end, (:c, :x, :z)); true)
+            end, (:c, :x, :z); conditioned = (:c, :x, :z)); true)
     end
     @testset "bare zi predictor fails the logit-only gate" begin
         # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
@@ -97,7 +97,7 @@ _zip_cols() = Dict{Symbol,AbstractVector}(:c => copy(_ZIP_C),
                 eta = a .+ b .* x
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), zeta)
-            end, (:c, :x, :z)); true)
+            end, (:c, :x, :z); conditioned = (:c, :x, :z)); true)
     end
 end
 

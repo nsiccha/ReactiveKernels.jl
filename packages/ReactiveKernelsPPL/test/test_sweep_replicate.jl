@@ -45,7 +45,7 @@ using Test
 # Lower + bind + build + query a sweep program; return
 # `(bound, built, kern, layout)`.
 function _sr_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -146,7 +146,7 @@ _sr_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         # Bare-location form (matrix-b): the bare Beta parameter lowers
         # as a BinomialLogitFam location with no link inversion and no
         # built predictor.
-        plan = lower_rkppl(_SR_RATE_PROG, (:k, :n))
+        plan = lower_rkppl(_SR_RATE_PROG, (:k, :n); conditioned = (:k, :n))
         r = only(plan.responses)
         @test r.family === BinomialLogitFam
         @test r.link === LogitLink
@@ -156,24 +156,24 @@ _sr_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         @test isempty(plan.predictors)
     end
     @testset "ark: lag design as data columns" begin
-        plan = lower_rkppl(_SR_ARK_PROG, (:yt, :ylag1, :ylag2))
+        plan = lower_rkppl(_SR_ARK_PROG, (:yt, :ylag1, :ylag2); conditioned = (:yt, :ylag1, :ylag2))
         r = only(plan.responses)
         @test r.family === GaussianFam
         @test r.predictor === :mu
     end
     @testset "rate_2: two independent prob responses" begin
-        plan = lower_rkppl(_SR_R2_PROG, (:k1, :n1, :k2, :n2))
+        plan = lower_rkppl(_SR_R2_PROG, (:k1, :n1, :k2, :n2); conditioned = (:k1, :n1, :k2, :n2))
         @test length(plan.responses) == 2
         @test all(r -> r.family === BinomialLogitFam, plan.responses)
         @test [r.predictor for r in plan.responses] == [:theta1, :theta2]
     end
     @testset "rate_4: prior-only parameter alongside" begin
-        plan = lower_rkppl(_SR_R4_PROG, (:k, :n))
+        plan = lower_rkppl(_SR_R4_PROG, (:k, :n); conditioned = (:k, :n))
         @test only(plan.responses).family === BinomialLogitFam
         @test Set(p.name for p in plan.parameters) == Set([:theta, :thetaprior])
     end
     @testset "dugongs: nonlinear mean via extracted column" begin
-        plan = lower_rkppl(_SR_DUG_PROG, (:y, :age))
+        plan = lower_rkppl(_SR_DUG_PROG, (:y, :age); conditioned = (:y, :age))
         r = only(plan.responses)
         @test r.family === GaussianFam
         @test length(plan.predictors) == 1
@@ -407,7 +407,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): sweep plates must not unroll over observations.
 function _sr_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -450,7 +450,7 @@ end
 # together the day `@test_broken` goes red (upstream fixed).
 function _sr_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector};
         ladder1::Bool = false)
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

@@ -6,7 +6,7 @@ import Distributions as D
 function _parameter_prior_check(expr, columns, q, density)
     names = ReactiveKernelsPPL._value_symbols(expr)
     columns = Dict(k => v for (k, v) in columns if k in names)
-    plan = lower_rkppl(expr, columns)
+    plan = lower_rkppl(expr, columns; conditioned = columns)
     bound = bind_data(plan, columns)
     built = build_kernel(bound)
     u = unconstrain(built.layout, q)
@@ -77,7 +77,7 @@ end
             :(truncated(Normal(0, 1), NaN, 1)),
             :(truncated(Flat(), 0, 1)))
         @test_throws Union{ContractValidationError,SurfaceLoweringError} begin
-            plan = lower_rkppl(quote x ~ $expr; y .~ Normal.(x, 1) end, [:y])
+            plan = lower_rkppl(quote x ~ $expr; y .~ Normal.(x, 1) end, [:y], conditioned = [:y])
             build_kernel(bind_data(plan, Dict(:y => [0.1])))
         end
     end
@@ -139,7 +139,7 @@ end
     expr = quote p ~ Dirichlet(alpha); mu = p[1] .* z; y .~ Normal.(mu, 1) end
     for alpha in ([-1.0, 2.0], [NaN, 2.0], Float64[], [0.0, 2.0])
         data = Dict(:alpha => alpha, :z => ones(3), :y => zeros(3))
-        @test_throws ContractValidationError bind_data(lower_rkppl(expr,data),data)
+        @test_throws ContractValidationError bind_data(lower_rkppl(expr,data; conditioned = data),data)
     end
     _parameter_prior_check(quote
         a ~ Normal(0, 1)

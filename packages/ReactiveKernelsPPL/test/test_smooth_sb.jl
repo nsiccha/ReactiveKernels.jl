@@ -37,7 +37,7 @@ using Statistics: std
 using Test
 
 function _sm_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -137,7 +137,7 @@ const _SM_DATA = (
 @testset "hyper-prior surface" begin
     # Stated HSGP priors land on the basis IR; a stated length scale
     # drops the validity floor (plain `exp`), the default keeps it.
-    plan = lower_rkppl(_SM_ACCELGP, (:y, :x, :x2))
+    plan = lower_rkppl(_SM_ACCELGP, (:y, :x, :x2); conditioned = (:y, :x, :x2))
     hb = first(plan.hsgp_bases)
     @test hb.rho_prior == HyperPrior(:inverse_gamma,
         (arg1 = 1.124909, arg2 = 0.0177))
@@ -152,14 +152,14 @@ const _SM_DATA = (
         mu = a .+ hsgp(:h_x)
         hsgp_basis(:h_x, x; k = 8)
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     @test only(dplan.hsgp_bases).rho_prior === nothing
     dlay = assign_layout(bind_data(dplan, _sm_cols((; x = _SM_AX,
         y = _SM_DATA.accelgp.y))))
     @test Dict(e.name => e.transform for e in dlay.entries)[:rho_h_x] ===
         :floored
     # Stated spline sd prior rides the sd vector (Stan-kernel support).
-    splan = lower_rkppl(_SM_ACCELSPL, (:y, :x, :x2))
+    splan = lower_rkppl(_SM_ACCELSPL, (:y, :x, :x2); conditioned = (:y, :x, :x2))
     sd = only(v for v in splan.spline_vectors if v.name === :sd_s_x)
     @test sd.family === :student_t
     @test sd.args == (arg1 = 3.0, arg2 = 0.0, arg3 = 36.0)
@@ -177,11 +177,11 @@ const _SM_DATA = (
         end
         if bad == :(StudentT(3, 0))
             # refused: StudentT is missing its scale argument (P3 arity).
-            @test_throws SurfaceLoweringError lower_rkppl(ex, (:y, :x))
+            @test_throws SurfaceLoweringError lower_rkppl(ex, (:y, :x); conditioned = (:y, :x))
         else
             # capability: proper, bounded and sampled-argument basis
             # hyper priors (P7/P8 1cmodra; todo `0bfiemp`).
-            @test_broken (lower_rkppl(ex, (:y, :x)); true)
+            @test_broken (lower_rkppl(ex, (:y, :x); conditioned = (:y, :x)); true)
         end
     end
     # refused: unknown keyword `lengthscale` (unsupported kwarg is a Julia MethodError, P3)
@@ -190,14 +190,14 @@ const _SM_DATA = (
         mu = a .+ hsgp(:h_x)
         hsgp_basis(:h_x, x; k = 8, lengthscale = LogNormal(0, 1))
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x))
+    end, (:y, :x); conditioned = (:y, :x))
     # capability: HalfCauchy spline-sd hyper prior (proper half-distribution, honest spelling) (todo `0bfiemp`)
     @test_broken (lower_rkppl(quote
         spline_basis(:s_x, x; sd = HalfCauchy(2))
         a ~ Normal(0, 1)
         mu = a .+ spline(:s_x)
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x)); true)
     # A hand-built plan's hyper prior is contract-validated too.
     bad = HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits, hb.label,
         hb.cov, hb.period, HyperPrior(:beta, (arg1 = 1.0, arg2 = 1.0)),
@@ -224,7 +224,7 @@ const _SM_DOMAIN_HSGP = quote
 end
 
 @testset "hsgp domain + bounding hyper prior" begin
-    plan = lower_rkppl(_SM_DOMAIN_HSGP, (:y, :x))
+    plan = lower_rkppl(_SM_DOMAIN_HSGP, (:y, :x); conditioned = (:y, :x))
     hb = only(plan.hsgp_bases)
     @test hb.domain == [(-1.5, 1.5)]
     @test hb.rho_prior == HyperPrior(:uniform,
@@ -253,7 +253,7 @@ end
         end
         # refused: over-determined boundary, domain and c both set it (P2)
         @test_throws Union{SurfaceLoweringError,ContractValidationError} bind_data(
-            lower_rkppl(ex, (:y, :x)),
+            lower_rkppl(ex, (:y, :x); conditioned = (:y, :x)),
             _sm_cols((; x = [-1.0, 0.0, 1.0], y = [0.1, 0.2, 0.3])))
     end
 end
@@ -315,11 +315,11 @@ end
     kw(k, v) = Expr(:kw, k, v)
     # `by` alone (shared hypers), `(1 | g)` without an intercept, and a
     # stated prior on the other hyper all lower.
-    hb = only(lower_rkppl(base(kw(:by, :g)), cols).hsgp_bases)
+    hb = only(lower_rkppl(base(kw(:by, :g)), cols; conditioned = cols).hsgp_bases)
     @test hb.by == HSGPGrouping(:g, nothing) && hb.rho_prior === nothing
     hb = only(lower_rkppl(base(kw(:by, :g),
         kw(:length_scale, :((1 | g))), kw(:sd, :(Normal(0, 1)))),
-        cols).hsgp_bases)
+        cols; conditioned = cols).hsgp_bases)
     @test hb.rho_prior == HSGPHyperLP(false, :g)
     @test hb.sigma_prior isa HyperPrior
     # Fail closed: a hyper-predictor without `by`, grouped by another
@@ -336,11 +336,11 @@ end
                 kw(:period, 1.0)), base(kw(:by, :(g .+ 1))))
             # capability: grouped periodic bases and computed groups
             # (P8 1cmodra; todo `0bfiemp`).
-            @test_broken (lower_rkppl(bad, cols); true)
+            @test_broken (lower_rkppl(bad, cols; conditioned = cols); true)
         else
             # refused: remaining hyper formulas lack a matching group or
             # contain an observation slope in a group-level slot (IR contract).
-            @test_throws SurfaceLoweringError lower_rkppl(bad, cols)
+            @test_throws SurfaceLoweringError lower_rkppl(bad, cols; conditioned = cols)
         end
     end
     # capability: grouped multi-axis HSGP (by= with two axes; source: "v1 ... planned") (todo `0bfiemp`)
@@ -349,10 +349,10 @@ end
         hsgp_basis(:h, x, q; k = (4, 4), by = g)
         mu = a .+ hsgp(:h)
         y .~ Normal.(mu, 1.0)
-    end, cols); true)
+    end, cols; conditioned = cols); true)
     # A hand-built hyper-predictor without a grouping is contract-invalid.
     plan = lower_rkppl(base(kw(:by, :g),
-        kw(:length_scale, :(1 + (1 | g)))), cols)
+        kw(:length_scale, :(1 + (1 | g)))), cols; conditioned = cols)
     hb = only(plan.hsgp_bases)
     bad = HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits, hb.label,
         hb.cov, hb.period, hb.rho_prior, hb.sigma_prior, hb.domain, nothing)

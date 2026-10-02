@@ -71,7 +71,7 @@ function _centered_test_plan()
         eachrow(B[levels(group),1:2]) .~ MvNormalCholesky(zeros(2),F)
         mu = a .+ B[group,1] .+ x .* B[group,2]
         y .~ Normal.(mu,1.5)
-    end,(:y,:group,:x))
+    end,(:y,:group,:x); conditioned = (:y,:group,:x))
 end
 
 function _centered_plan_oracle(u,layout,columns)
@@ -121,6 +121,6 @@ end
             r ~ varying_slice(d,1:2)
             mu = r
             y .~ Normal.(mu,1.)
-        end,(:y,:group,:x))
+        end,(:y,:group,:x); conditioned = (:y,:group,:x))
     end
 end

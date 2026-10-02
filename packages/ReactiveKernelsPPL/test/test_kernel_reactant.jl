@@ -19,7 +19,7 @@ const _KR_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 function _kernel_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector},
         dims::Dict{Symbol,Int}, u; ladder1::Bool = false,
         data = (:dose, :obs, :t))
-    bound = bind_data(lower_rkppl(prog, data), cols; dims)
+    bound = bind_data(lower_rkppl(prog, data; conditioned = data), cols; dims)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
     return Base.invokelatest(_kernel_reactant_measure, built, bound, post_q,
@@ -123,7 +123,7 @@ end
 @testset "axis2 panel plates under Reactant" begin
     for (name, prog, cols, fixed, ladder1) in _kr_progs()
         @testset "$name" begin
-            bound = bind_data(lower_rkppl(prog, (:dose, :obs, :t)),
+            bound = bind_data(lower_rkppl(prog, (:dose, :obs, :t); conditioned = (:dose, :obs, :t)),
                 cols; dims = _KR_DIMS)
             names = coordinate_names(build_kernel(bound).layout)
             u = [n === :b0 ? fixed[n] : log(fixed[n]) for n in names]
@@ -160,7 +160,7 @@ end
         :x2 => [0.5, 1.0, 1.5], :y2 => [1, 2, 3])
     dims = Dict{Symbol,Int}(:kernel_nsub_pred1 => 4, :kernel_nsub_pred2 => 3)
     data = (:x1, :y1, :x2, :y2)
-    bound = bind_data(lower_rkppl(prog, data), cols; dims)
+    bound = bind_data(lower_rkppl(prog, data; conditioned = data), cols; dims)
     names = coordinate_names(build_kernel(bound).layout)
     u = [n === :b0 ? 0.5 : log(1.5) for n in names]
     fx = _kernel_reactant(prog, cols, dims, u; data)
@@ -196,7 +196,7 @@ end
         :yy => [0.5, 1.1, -0.3, 0.8])
     data = (:county_id, :county_idx, :time, :dsubj, :dtime, :damt, :yy)
     dims = Dict{Symbol,Int}()
-    bound = bind_data(lower_rkppl(prog, data), cols; dims)
+    bound = bind_data(lower_rkppl(prog, data; conditioned = data), cols; dims)
     names = coordinate_names(build_kernel(bound).layout)
     @test length(names) == 5
     @test :mu_alpha in names

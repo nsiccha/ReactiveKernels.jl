@@ -5,7 +5,9 @@
 # binding (the caller's module sees it via `using ReactiveKernelsPPL`) and
 # lowers to the identical plan as the hand-inlined body (see
 # [`RKPPLSubmodel`](@ref)): body names namespace under the use-site
-# left-hand side.
+# left-hand side. Replace a local declaration with `merge(model, :(z.tau ~
+# HalfCauchy(0.5)))`, pin it with `merge(model, (; var"z.tau" = 0.3))`, or
+# derive a reusable variant with `merge(submodel, :(tau ~ HalfCauchy(0.5)))`.
 
 """
     log_F ~ linear_pk_log_f(sched; k = 5, c = 1.5)
@@ -46,8 +48,8 @@ end
 ```
 
 At `y ~ ordered_logistic(eta)` the cutpoints are local `y.cutpoints` and
-restored as `nt.y.cutpoints`. To use a different
-prior, write those statements yourself.
+restored as `nt.y.cutpoints`. Replace their prior through `y.cutpoints`
+with `merge`, or derive a variant of `ordered_logistic`.
 """
 @rkppl ordered_logistic(eta) = begin
     cutpoints ~ Ordered(Normal(0, 1), length(levels(y)) - 1)

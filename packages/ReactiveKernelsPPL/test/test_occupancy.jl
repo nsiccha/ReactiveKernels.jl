@@ -15,7 +15,7 @@ using Test
 # Lower + bind + build + query an occupancy program; return
 # `(bound, built, kern, layout)`.
 function _occ_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -35,7 +35,7 @@ _occ_posterior(kern, lay, q::NamedTuple) =
         mu = a .+ b .* x
         pick = ifelse.(det .== 1, mu, -30.0)
         y .~ Bernoulli.(logistic.(pick))
-    end"""), (:y, :x, :det))
+    end"""), (:y, :x, :det); conditioned = (:y, :x, :det))
     r = only(plan.responses)
     @test r.family === BernoulliLogitFam && r.link === LogitLink
 
@@ -47,7 +47,7 @@ _occ_posterior(kern, lay, q::NamedTuple) =
         mu = a .+ b .* x
         marg = logaddexp.(mu, lo)
         y .~ Normal.(marg, sigma)
-    end"""), (:y, :x, :lo))
+    end"""), (:y, :x, :lo); conditioned = (:y, :x, :lo))
     @test only(lplan.responses).family === GaussianFam
 
     # `logaddexp.` takes exactly two arguments.
@@ -58,7 +58,7 @@ _occ_posterior(kern, lay, q::NamedTuple) =
             mu = a .+ b .* x
             marg = logaddexp.(mu)
             y .~ Normal.(marg, 1.0)
-        end"""), (:y, :x)),
+        end"""), (:y, :x); conditioned = (:y, :x)),
         Dict{Symbol,AbstractVector}(:y => [1.0], :x => [0.0]))
 end
 
@@ -120,7 +120,7 @@ end
         pick = ifelse.(det .== 1, mu, -30.0)
         y .~ Bernoulli.(logistic.(pick))
     end""")
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
@@ -130,7 +130,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _occ_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

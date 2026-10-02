@@ -18,7 +18,7 @@ using Test
 # Lower + bind + build + query a VM program; return
 # `(bound, built, kern, layout)`.
 function _vm_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -53,7 +53,7 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, 1.7)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test r.family === VonMisesFam
         @test r.link === IdentityLink
@@ -72,7 +72,7 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
                 kappa ~ Gamma(2.0, 0.1)
                 mu = a .+ b .* x
                 y .~ CircularVonMises.(mu, kappa, -pi, pi)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         r = only(plan.responses)
         @test (r.family, r.scale, r.interval) ===
             (VonMisesFam, :kappa, (-Float64(pi), Float64(pi)))
@@ -84,7 +84,7 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, kappac)
-            end, (:y, :x, :kappac))
+            end, (:y, :x, :kappac); conditioned = (:y, :x, :kappac))
         @test only(plan.responses).scale === :kappac
     end
     @testset "log-link predictor kappa admitted" begin
@@ -96,7 +96,7 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
                 mu = a .+ b .* x
                 lk = c .+ d .* x
                 y .~ CircularVonMises.(mu, exp.(lk), -pi, pi)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         @test only(plan.responses).scale == ScalePredictorRef(:lk, LogLink)
     end
     @testset "non-log predictor kappa deferred" begin
@@ -109,7 +109,7 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
                 mu = a .+ b .* x
                 lk = c .+ d .* x
                 y .~ VonMises.(mu, lk)
-            end, (:y, :x)); true)
+            end, (:y, :x); conditioned = (:y, :x)); true)
     end
     @testset "shifted-interval literals" begin
         plan = lower_rkppl(quote
@@ -117,7 +117,7 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ CircularVonMises.(mu, 1.7, 0.0, 6.283185307179586)
-            end, (:y, :x))
+            end, (:y, :x); conditioned = (:y, :x))
         @test only(plan.responses).interval === (0.0, 6.283185307179586)
     end
 end
@@ -241,7 +241,7 @@ end
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): the VM plate must not unroll over observations.
 function _vm_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     def = ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound))
     heads = Dict{String,Int}()
@@ -269,7 +269,7 @@ end
 # Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
 # native vs compiled), plus the traced program size.
 function _vm_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
