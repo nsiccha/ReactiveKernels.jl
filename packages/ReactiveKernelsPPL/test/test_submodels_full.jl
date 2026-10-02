@@ -450,6 +450,17 @@ end
         # The refusal, if any, is the construct's own — never the expansion.
         @test !occursin("submodel", out)
     end
+    # Probe S6 lowers: a hierarchical (parameter-scale) prior identifies an
+    # intercept beside a full-cover factor (fallback lane; the density
+    # oracle is in test_fallback.jl).
+    s6 = _smf_outcome(quote
+        a ~ Normal(0, 5)
+        r ~ smf_cranef(g)
+        sigma ~ Exponential(1)
+        mu = a .+ r
+        y .~ Normal.(mu, sigma)
+    end, D)
+    @test !startswith(s6, "SurfaceLoweringError")
 
     # Per-cell: a nested per-cell call equals the direct per-cell program.
     pc(cell) = Expr(:block,
