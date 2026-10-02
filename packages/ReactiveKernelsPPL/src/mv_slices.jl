@@ -196,23 +196,30 @@ end
 
 # ── simplex and ordered slices (vectorized) ──────────────────────────
 
-"""
+@traceable function _dirichlet_slices_logpdf(o, B, alpha)
+    groups, k = _slice_count(o, B), _slice_length(o, B)
+    _check_slice_vector_arg("the Dirichlet concentration", alpha, groups, k)
+    X = _slice_rows(o, B)
+    A = _arg_rows(alpha)
+    # Invalid live concentrations have zero density. The loggamma branch
+    # stays inactive, including its derivative work.
+    if all(isfinite.(A) .& (A .> 0))
+        normalizer = DistributionKernelSources.loggamma.(sum(A; dims = 2)) .-
+            sum(DistributionKernelSources.loggamma.(A); dims = 2)
+        sum(normalizer .+ sum((A .- 1.0) .* log.(X); dims = 2))
+    else
+        -Inf
+    end
+end
+
+@doc """
     _dirichlet_slices_logpdf(o, B, alpha)
 
 Σ over the slices `x_g` of `B` of `logpdf(Dirichlet(alpha_g), x_g)`:
 `loggamma(Σ α) − Σ loggamma(α) + Σ (α − 1) log x` per slice. `alpha` is a
 shared K-vector or a per-slice argument. Whole-array broadcasts and
 reductions, no loop over the slices.
-"""
-function _dirichlet_slices_logpdf(o, B, alpha)
-    groups, k = _slice_count(o, B), _slice_length(o, B)
-    _check_slice_vector_arg("the Dirichlet concentration", alpha, groups, k)
-    X = _slice_rows(o, B)
-    A = _arg_rows(alpha)
-    normalizer = DistributionKernelSources.loggamma.(sum(A; dims = 2)) .-
-        sum(DistributionKernelSources.loggamma.(A); dims = 2)
-    return sum(normalizer .+ sum((A .- 1.0) .* log.(X); dims = 2))
-end
+""" _dirichlet_slices_logpdf
 
 """
     _ordered_normal_slices_logpdf(o, B, m, s)

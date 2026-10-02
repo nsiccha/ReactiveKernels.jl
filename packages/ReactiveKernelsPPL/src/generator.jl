@@ -3399,7 +3399,8 @@ function _parameter_prior_statements!(stmts, terms, plan, layout)
     for p in plan.parameters
         p.name in grouped && continue
         node = Symbol(:_ppl_prior_, p.name)
-        push!(stmts, :($node::Float64 = $(_sampled_prior_expr(p))))
+        prior = _sampled_prior_expr(p; pre = stmts)
+        push!(stmts, :($node::Float64 = $prior))
         push!(terms, node)
     end
     return nothing
@@ -3773,9 +3774,15 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     tv = _dovar(1)
     argvals = Any[_thread_ref!(inputs, v) for v in values(args)]
     cell = _family_logpdf_expr(family, argvals, tv)
-    corr = _support_correction(family, support, argvals)
+    thread(x) = x isa Expr ? Expr(x.head,
+        (i == 1 && x.head === :call ? a : thread(a) for (i, a) in enumerate(x.args))...) :
+        _thread_ref!(inputs, x)
+    threaded_support = support isa Tuple ?
+        (support[1], map(thread, support[2:end])...) : support
+    pre = Expr[]
+    corr = _support_correction(family, threaded_support, argvals; pre, stem = name)
     corr === nothing || (cell = :($cell + $corr))
-    append!(stmts, _plate_sum_stmts(pw, node, inputs, cell))
+    append!(stmts, _plate_sum_stmts(pw, node, inputs, Expr[pre..., cell]))
     push!(terms, node)
     return nothing
 end
@@ -3788,6 +3795,7 @@ const _PRIOR_ENDPOINTS = Dict{Symbol,Symbol}(
     :lognormal => :lognormal, :beta => :beta,
     :inverse_gamma => :inverse_gamma, :student_t => :student_t,
     :laplace => :laplace, :logistic => :logistic, :uniform => :uniform,
+    :weibull => :weibull,
 )
 
 # Shared `<endpoint>(remapped args…).logpdf(x)` splice for a variate
@@ -3825,8 +3833,30 @@ end
 # `(:upper, hi)` adds NOTHING — Stan's upper-bound kernel is the plain
 # normal_lpdf plus the bare-`u` Jacobian (the varying-`tau`/`:floored`
 # precedent: SB truncation never renormalizes).
-function _support_correction(family::Symbol, ov::SupportOverride, argvals)
+function _support_correction(family::Symbol, ov::SupportOverride, argvals;
+        pre::Vector{Expr} = Expr[], stem::Symbol = :prior)
     ov === nothing && return nothing
+    if ov isa Tuple && ov[1] === :truncated
+        lo, hi = ov[2], ov[3]
+        ep = _PRIOR_ENDPOINTS[family]
+        args = family === :gamma ?
+            (argvals[1], :(1 / $(argvals[2]))) : Tuple(argvals)
+        cdf(x) = :($ep($(args...)).cdf($x))
+        ccdf(x) = :($ep($(args...)).ccdf($x))
+        lo == -Inf && hi == Inf && return nothing
+        lo == -Inf && return :(-log($(cdf(hi))))
+        hi == Inf && return :(-log($(ccdf(lo))))
+        # Use the upper tails when both endpoints are in that tail. The
+        # branch is lazy, so an unused difference is never differentiated.
+        fl, fh, sl, sh = (Symbol(:_ppl_tail_, stem, suffix)
+            for suffix in (:_fl, :_fh, :_sl, :_sh))
+        append!(pre, Expr[:($fl::Float64 = $(cdf(lo))),
+            :($fh::Float64 = $(cdf(hi))), :($sl::Float64 = $(ccdf(lo))),
+            :($sh::Float64 = $(ccdf(hi)))])
+        # The CDF values are defined on both sides. Keep log itself lazy:
+        # a rounded-to-zero inactive difference must never be logged or AD'd.
+        return :($fl > 0.5 ? -log($sl - $sh) : -log($fh - $fl))
+    end
     ov === :positive_stan && return nothing  # Stan kernel semantics
     if ov isa Tuple
         if ov[1] === :lower
@@ -3858,10 +3888,10 @@ end
 # the -log(cdf(hi)-cdf(lo)) truncated-interval renormalization (`_support_correction`;
 # `:positive_stan`/`(:interval_stan, lo, hi)`/`(:upper, hi)` overrides add
 # nothing — Stan kernel semantics).
-function _sampled_prior_expr(p::SampledParameter)
+function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[])
     argvals = [v for v in values(p.args)]
     base = _family_logpdf_expr(p.family, argvals, p.name)
-    corr = _support_correction(p.family, p.support_override, argvals)
+    corr = _support_correction(p.family, p.support_override, argvals; pre, stem = p.name)
     corr === nothing && return base
     return :($base + $corr)
 end
@@ -3896,11 +3926,9 @@ function _vector_parameter_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         return nothing
     end
     rhs = if p.family === :simplex_dirichlet
-        alpha = Vector{Float64}(p.args.arg1)
-        normalizer = loggamma(sum(alpha)) - sum(loggamma, alpha)
-        am1 = alpha .- 1.0
-        weights = all(==(am1[1]), am1) ? am1[1] : :(Float64[$(am1...)])
-        :($normalizer + sum($weights .* log.($(p.name))))
+        alpha = p.args.arg1
+        arg = alpha isa AbstractVector ? :(Float64[$(alpha...)]) : alpha
+        :(_dirichlet_slices_logpdf(_SliceWhole(), $(p.name), $arg))
     elseif p.family === :cholesky_corr_lkj
         _lkj_prior_terms(p.name, m, Float64(p.args.arg1))
     elseif p.family === :positive_exponential

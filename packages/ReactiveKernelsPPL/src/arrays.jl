@@ -463,9 +463,13 @@ _is_array_assignment(plan::StructuralPlan, name) =
 # means not known before sampling (a module function's result, a data
 # value).
 function _value_axes(plan::StructuralPlan, ex,
-        seen::Set{Symbol} = Set{Symbol}())
+        seen::Set{Symbol} = Set{Symbol}(); data_axes::Bool = false)
     ex isa Number && return Any[]
     if ex isa Symbol
+        if data_axes && haskey(plan.columns, ex)
+            value = plan.columns[ex]
+            return value isa AbstractArray ? Any[size(value)...] : Any[]
+        end
         _is_array_param(plan, ex) && return Any[_array_param(plan, ex).dims...]
         i = findfirst(v -> v.name === ex, plan.vector_parameters)
         if i !== nothing
@@ -473,17 +477,18 @@ function _value_axes(plan::StructuralPlan, ex,
             return sz === nothing ? nothing : Any[sz]
         end
         any(p -> p.name === ex, plan.parameters) && return Any[]
-        j = findfirst(a -> a.name === ex, plan.assignments)
+        definitions = data_axes ? (plan.assignments..., plan.derived...) : plan.assignments
+        j = findfirst(a -> a.name === ex, definitions)
         (j === nothing || ex in seen) && return nothing
         push!(seen, ex)
-        r = _value_axes(plan, plan.assignments[j].expr, seen)
+        r = _value_axes(plan, definitions[j].expr, seen; data_axes)
         delete!(seen, ex)
         return r
     end
     ex isa Expr || return nothing
     levelaxis = _level_plate_axis(ex)
     levelaxis === nothing || return Any[:(levels($levelaxis))]
-    ax(a) = _value_axes(plan, a, seen)
+    ax(a) = _value_axes(plan, a, seen; data_axes)
     head = ex.head
     head === Symbol("'") && return _adjoint_axes(ax(ex.args[1]))
     if head === :.
@@ -908,7 +913,8 @@ function _array_layout_entries!(entries::Vector{LayoutEntry},
             offset += n
         else
             transform, lo, hi =
-                _entry_transform(p.family, p.support_override, p.args)
+                _entry_transform(p.family, _bound_override(plan, p.support_override),
+                    p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
             n = prod(dims)
             push!(entries, LayoutEntry(:array, nothing, p.name,
                 _array_labels(p.name, dims), offset, n, transform, lo, hi,

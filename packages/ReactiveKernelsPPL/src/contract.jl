@@ -646,7 +646,10 @@ from the bound columns, e.g. an HSGP validity floor). Shared by scalar
 """
 const SupportOverride =
     Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64},Tuple{Symbol,Float64},
-        Tuple{Symbol,Symbol}}
+        Tuple{Symbol,Symbol},
+        Tuple{Symbol,Union{Float64,Symbol,Expr},Union{Float64,Symbol,Expr}}}
+
+_support_args(ov) = ov isa Tuple ? ov[2:end] : ()
 
 """
     SampledParameter(name, family, args, support_override, label)
@@ -1947,6 +1950,7 @@ const SAMPLED_ARITY = Dict{Symbol,Int}(
     :laplace => 2,
     :logistic => 2,
     :uniform => 2,
+    :weibull => 2,
     :flat => 0,
 )
 
@@ -1965,6 +1969,7 @@ const SAMPLED_SUPPORT = Dict{Symbol,Symbol}(
     :inverse_gamma => :positive,
     :beta => :unit,
     :uniform => :interval,
+    :weibull => :positive,
 )
 
 """Admitted per-addressee population-prior families (prior-vocab slice)."""
@@ -6026,11 +6031,11 @@ end
 function _validate_uniform_args(label, family::Symbol, args::NamedTuple)
     family === :uniform || return nothing
     lo, hi = args.arg1, args.arg2
-    lo isa Real && hi isa Real && isfinite(lo) && isfinite(hi) || _fail(label,
-        "uniform bounds must be finite literals, got " *
-        "($(repr(lo)), $(repr(hi)))")
-    lo < hi || _fail(label,
-        "uniform needs lower < upper, got ($lo, $hi)")
+    all(x -> x isa Symbol || (x isa Real && isfinite(x)), (lo, hi)) ||
+        _fail(label, "uniform bounds must be finite values or declared names")
+    if lo isa Real && hi isa Real
+        lo < hi || _fail(label, "uniform needs lower < upper, got ($lo, $hi)")
+    end
     return nothing
 end
 
@@ -6047,6 +6052,18 @@ end
 function _validate_support_override(label, family::Symbol,
         ov::SupportOverride, args::NamedTuple)
     ov === nothing && return nothing
+    if ov isa Tuple && ov[1] === :truncated
+        family === :flat && _fail(label, "truncation requires a proper univariate distribution")
+        length(ov) == 3 || _fail(label, "truncated support takes (lo, hi)")
+        for x in ov[2:end]
+            x isa Symbol || x isa Expr || (x isa Real && !isnan(x)) ||
+                _fail(label, "truncation bounds must be values or declared names")
+        end
+        if ov[2] isa Real && ov[3] isa Real
+            ov[2] < ov[3] || _fail(label, "truncation needs lower < upper")
+        end
+        return nothing
+    end
     family === :uniform && _fail(label,
         "a uniform prior carries its own interval support — no support " *
         "override applies, got $ov")
@@ -6199,17 +6216,20 @@ function _validate_vector_parameters(plan::StructuralPlan)
             "$(Tuple(keys(p.args)))")
         if p.family === :simplex_dirichlet
             alpha = p.args.arg1
-            alpha isa AbstractVector || _fail(p.label,
-                "simplex_dirichlet takes a literal concentration vector " *
-                "`Dirichlet(alpha)` or symmetric `Dirichlet(K, a)` resolved " *
-                "to a vector; got $(repr(alpha))")
-            all(x -> x isa Real && isfinite(x) && x > 0, alpha) || _fail(
-                p.label,
-                "Dirichlet concentrations must be finite and strictly " *
-                "positive, got $(repr(alpha))")
-            p.size === nothing || p.size == length(alpha) || _fail(p.label,
-                "simplex size $(p.size) disagrees with its concentration " *
-                "length $(length(alpha))")
+            if alpha isa AbstractVector
+                isempty(alpha) && _fail(p.label, "Dirichlet concentration vector must be nonempty")
+                all(x -> x isa Real && isfinite(x) && x > 0, alpha) || _fail(
+                    p.label, "Dirichlet concentrations must be finite and strictly positive")
+                p.size === nothing || p.size == length(alpha) || _fail(p.label,
+                    "simplex size $(p.size) disagrees with its concentration length $(length(alpha))")
+            elseif alpha isa Symbol || alpha isa Expr
+                for ref in _value_symbols(alpha)
+                    (!isbound(plan) || ref in _all_names(plan) || haskey(plan.columns, ref)) ||
+                        _fail(p.label, "Dirichlet concentration references unknown name $ref")
+                end
+            else
+                _fail(p.label, "Dirichlet concentration must be a vector value")
+            end
             p.size === nothing || p.size >= 1 || _fail(p.label,
                 "simplex size must be ≥ 1, got $(p.size)")
         elseif p.family === :positive_exponential
@@ -6317,6 +6337,11 @@ function _validate_vector_parameters(plan::StructuralPlan)
     for d in plan.derived
         _expr_value_symbols(d.expr, defreads)
     end
+    for p in (plan.parameters..., plan.vector_parameters..., plan.array_parameters...)
+        for value in values(p.args)
+            _expr_value_symbols(value, defreads)
+        end
+    end
     for p in plan.vector_parameters
         got = refs[p.name]
         isempty(got) && p.name ∉ defreads && _fail(p.label,
@@ -6348,11 +6373,11 @@ function topological_order(plan::StructuralPlan)
     deps = Dict{Symbol,Set{Symbol}}()
     for p in plan.parameters
         refs = Set{Symbol}()
-        for v in values(p.args)
-            v isa Symbol || continue
-            v in names ||
-                _fail(p.label, "arg references unknown name $v")
-            push!(refs, v)
+        for v in (values(p.args)..., _support_args(p.support_override)...)
+            for ref in _value_symbols(v)
+                ref in names || _fail(p.label, "bound or arg references unknown name $ref")
+                push!(refs, ref)
+            end
         end
         deps[p.name] = refs
     end
@@ -6360,6 +6385,11 @@ function topological_order(plan::StructuralPlan)
     # every definition that reads them (functions as values).
     for v in _vector_value_names(plan)
         haskey(deps, v) || (deps[v] = Set{Symbol}())
+    end
+    for p in plan.vector_parameters
+        p.family === :simplex_dirichlet || continue
+        deps[p.name] = Set(ref for ref in _value_symbols(p.args.arg1)
+            if ref in allnames)
     end
     # Per-cell latent (plate) parameters: prior args are shared scalars,
     # per-cell derived columns, or raw data columns (never another latent).
@@ -6369,7 +6399,7 @@ function topological_order(plan::StructuralPlan)
     # node) and is validated at bind, so it adds no edge here.
     for p in plan.plate_parameters
         refs = Set{Symbol}()
-        for v in values(p.args)
+        for v in (values(p.args)..., _support_args(p.support_override)...)
             v isa Symbol || continue
             v in allnames && push!(refs, v)
         end
@@ -6380,7 +6410,7 @@ function topological_order(plan::StructuralPlan)
     # included).
     for p in plan.array_parameters
         refs = Set{Symbol}()
-        for v in values(p.args)
+        for v in (values(p.args)..., _support_args(p.support_override)...)
             (v isa Symbol || v isa Expr) || continue
             for r in _symbols_in(v)
                 r in allnames && push!(refs, r)
@@ -7004,7 +7034,7 @@ function _validate_monotonic_columns(t::TermSpec, plan::StructuralPlan)
     i = findfirst(p -> p.name === t.options.increments, plan.vector_parameters)
     i === nothing && _fail(t.label,
         "internal: monotonic increments $(t.options.increments) unlinked")
-    K = length(plan.vector_parameters[i].args.arg1) + 1
+    K = plan.vector_parameters[i].size + 1
     all(v -> 1 <= v <= K, col) ||
         _fail(t.label, "monotonic index $c holds codes outside 1..$K " *
               "(K − 1 = $(K - 1) is the linked increments simplex size)")
@@ -8172,9 +8202,9 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
         vp.family === :simplex_dirichlet || _fail(r.label,
             "mixture weights $w must be :simplex_dirichlet, got " *
             "$(vp.family)")
-        length(vp.args.arg1) == K || _fail(r.label,
-            "mixture weights concentration length " *
-            "$(length(vp.args.arg1)) disagrees with the $K components")
+        count = vp.args.arg1 isa AbstractVector ? length(vp.args.arg1) : vp.size
+        count === nothing || count == K || _fail(r.label,
+            "mixture weights concentration length $count disagrees with the $K components")
     elseif w isa MixtureComplementWeights
         K == 2 || _fail(r.label,
             "complement-pair mixture weights take exactly 2 components " *
@@ -10229,6 +10259,17 @@ whole-context definitions (whose values may have any length too)."""
 function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
     append!(defs, Pair{Symbol,Any}[d.name => d.expr for d in plan.derived])
+    # A scalar prior's arguments and a Dirichlet concentration are whole
+    # model values. Propagate that context through their definitions just
+    # as for a module-call argument; their raw data have no observation axis.
+    for p in plan.parameters
+        push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
+            Expr(:tuple, values(p.args)..., _support_args(p.support_override)...))
+    end
+    for p in plan.vector_parameters
+        p.family === :simplex_dirichlet || continue
+        push!(defs, Symbol(:_ppl_prior_input_, p.name) => p.args.arg1)
+    end
     # Pinning only shrinks the verdict: skip the slot walk when even the
     # unpinned pass finds nothing.
     inputs, _ = _whole_value_reads(defs, raw, Set{Symbol}())
@@ -10238,7 +10279,18 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :n_obs, :roles,
             :submodel_scopes) && continue
-        _drop_held_names!(free, getfield(plan, f))
+        if f === :parameters
+            for p in plan.parameters
+                delete!(free, p.name)
+            end
+        elseif f === :vector_parameters
+            for p in plan.vector_parameters
+                delete!(free, p.name)
+                p.family === :simplex_dirichlet || _drop_held_names!(free, p.args)
+            end
+        else
+            _drop_held_names!(free, getfield(plan, f))
+        end
     end
     held = setdiff!(named, free)
     inputs, ctx = _whole_value_reads(defs, raw, held)
@@ -10862,7 +10914,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     draws = _eval_draws_levels(plan.varying_draws, columns)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
-            plan.predictors, plan.r2d2_priors)
+            plan.predictors, plan.r2d2_priors, _with(plan; columns = columns, n_obs = n))
     bound = _with(plan; responses = responses2, columns = columns,
         n_obs = n, roles = merged, levelmaps = maps, varying_draws = draws,
         vector_parameters = vectors2, spline_bases = bases,
@@ -10881,10 +10933,34 @@ end
 # share simplex (K shares). Explicit values assert against the
 # inference. Returns new (immutable) vectors; unbound plans keep
 # `nothing`.
+function _dirichlet_size(plan, alpha, label)
+    alpha isa AbstractVector && return length(alpha)
+    alpha isa Expr && alpha.head === :vect && return length(alpha.args)
+    _is_fill_call(alpha) && return alpha.args[3]
+    plan === nothing && _fail(label, "Dirichlet concentration shape requires a bound plan")
+    if alpha isa Symbol
+        if haskey(plan.columns, alpha)
+            value = plan.columns[alpha]
+            value isa AbstractVector || _fail(label, "Dirichlet concentration $alpha must be a vector")
+            isempty(value) && _fail(label, "Dirichlet concentration vector $alpha must be nonempty")
+            all(x -> x isa Real && isfinite(x) && x > 0, value) || _fail(label,
+                "Dirichlet concentrations in $alpha must be finite and strictly positive")
+            return length(value)
+        end
+        definitions = (plan.assignments..., plan.derived...)
+        i = findfirst(a -> a.name === alpha, definitions)
+        i === nothing || return _dirichlet_size(plan, definitions[i].expr, label)
+    end
+    axes = _value_axes(plan, alpha; data_axes = true)
+    axes !== nothing && length(axes) == 1 || _fail(label,
+        "Dirichlet concentration must have a known vector shape; got $(repr(alpha))")
+    return _array_dim_size(plan, Symbol(label), label, only(axes))
+end
+
 function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         vectors::Vector{VectorParameter}, columns::AbstractDict{Symbol},
         predictors::Vector{PredictorSpec} = PredictorSpec[],
-        r2d2::Vector{R2D2Prior} = R2D2Prior[])
+        r2d2::Vector{R2D2Prior} = R2D2Prior[], plan = nothing)
     out_r = LikelihoodSpec[]
     for r in responses
         _is_leveled_family(r.family) || (push!(out_r, r); continue)
@@ -10918,6 +10994,8 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
     end
     out_v = VectorParameter[]
     for p in vectors
+        concentration_size = p.family === :simplex_dirichlet ?
+            _dirichlet_size(plan, p.args.arg1, p.label) : nothing
         if haskey(thresh_link, p.name)
             K = by_label[thresh_link[p.name]].n_levels
             K === nothing && _fail(p.label, "internal: linked n_levels unresolved")
@@ -10940,8 +11018,8 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             K === nothing && _fail(p.label, "internal: linked n_levels unresolved")
             p.size === nothing || p.size == K || _fail(p.label,
                 "simplex size $(p.size) disagrees with n_levels $K")
-            length(p.args.arg1) == K || _fail(p.label,
-                "Dirichlet concentration length $(length(p.args.arg1)) " *
+            concentration_size == K || _fail(p.label,
+                "Dirichlet concentration length $(concentration_size) " *
                 "disagrees with n_levels $K")
             push!(out_v, _with(p; size = K))
         elseif haskey(mixture_link, p.name)
@@ -10950,12 +11028,12 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             p.size === nothing || p.size == K || _fail(p.label,
                 "mixture weights size $(p.size) disagrees with the " *
                 "$K components")
-            length(p.args.arg1) == K || _fail(p.label,
-                "Dirichlet concentration length $(length(p.args.arg1)) " *
+            concentration_size == K || _fail(p.label,
+                "Dirichlet concentration length $(concentration_size) " *
                 "disagrees with the $K mixture components")
             push!(out_v, _with(p; size = K))
         elseif haskey(monotonic_link, p.name)
-            want = length(p.args.arg1)
+            want = concentration_size
             want >= 1 || _fail(p.label,
                 "monotonic increments need ≥ 1 increment " *
                 "(K=1 degenerates emitter-side and never reaches the thin layer)")
@@ -10970,7 +11048,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "internal: joint-factor size unresolved at bind")
             push!(out_v, p)
         elseif haskey(r2d2_link, p.name)
-            want = length(p.args.arg1)
+            want = concentration_size
             want >= 1 || _fail(p.label,
                 "R2D2 shares need ≥ 1 share (an empty concentration " *
                 "decomposes nothing)")
@@ -10990,7 +11068,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             # A free-standing simplex (functions as values: definitions
             # compute with it, `cumsum(vcat(0.0, zeta))`) sizes from its
             # literal concentration.
-            want = length(p.args.arg1)
+            want = concentration_size
             p.size === nothing || p.size == want || _fail(p.label,
                 "simplex size $(p.size) disagrees with its concentration " *
                 "length $want")

@@ -1927,9 +1927,8 @@ end
 end
 
 @testset "surface interval-truncated parameters" begin
-    # A two-sided FINITE truncation lowers to a `(:interval, lo, hi)` support
-    # override at ANY location; the half `truncated(_, 0, Inf)` at zero stays
-    # `:positive`. `z` feeds a per-cell prior mean (a supported shared arg).
+    # All admitted families share one truncation representation.
+    # `z` feeds a per-cell prior mean (a supported shared arg).
     _plate_z(rhs) = Expr(:block,
         :(z ~ $rhs),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
@@ -1941,7 +1940,7 @@ end
     p = only(pp for pp in got.parameters if pp.name === :z)
     @test p.family === :normal
     @test p.args == (arg1 = 0.5, arg2 = 2.0)
-    @test p.support_override === (:interval, -1.0, 3.0)
+    @test p.support_override === (:truncated, -1.0, 3.0)
     # A per-cell interval latent rides the plate the same way.
     plate = lower_rkppl(Expr(:block,
         :(mu ~ Normal(0, 3)), :(tau ~ HalfNormal(2)),
@@ -1950,14 +1949,12 @@ end
                 Expr(:block,
                     :(theta[i] ~ truncated(Normal(mu, tau), -2.0, 5.0)),
                     :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y,))
-    @test only(plate.plate_parameters).support_override === (:interval, -2.0, 5.0)
-    # A finite interval on a non-Normal family is rejected in slice 1.
-    # capability: two-sided truncation of a non-Normal prior (Cauchy) (todo `0ze68k8`)
-    @test_broken (lower_rkppl(
+    @test only(plate.plate_parameters).support_override === (:truncated, -2.0, 5.0)
+    # Finite and lower-only truncation also admit non-Normal families.
+    @test (lower_rkppl(
         _plate_z(:(truncated(Cauchy(0.0, 1.0), -1.0, 2.0))), (:y,)); true)
-    # A finite LOWER-only bound is still rejected (upper-only lowers below).
-    # capability: lower-only truncation at a nonzero bound (todo `0ze68k8`)
-    @test_broken (lower_rkppl(
+
+    @test (lower_rkppl(
         _plate_z(:(truncated(Normal(0.0, 1.0), 1.0, Inf))), (:y,)); true)
     # Reversed bounds are rejected.
     # refused: reversed truncation bounds (lo > hi): mathematically invalid
@@ -1966,7 +1963,7 @@ end
 end
 
 @testset "surface upper-truncated parameters" begin
-    # An upper-only truncation lowers to an `(:upper, hi)` support override at
+    # An upper-only truncation lowers to an `(:truncated, -Inf, hi)` support override at
     # ANY location (here a negative location under a negative ceiling). The
     # `-Inf` bound is the signed-`Inf` AST call.
     hi = -0.5
@@ -1981,7 +1978,7 @@ end
     p = only(pp for pp in got.parameters if pp.name === :z)
     @test p.family === :normal
     @test p.args == (arg1 = -1.0, arg2 = 1.0)
-    @test p.support_override === (:upper, hi)
+    @test p.support_override === (:truncated, -Inf, hi)
     # A per-cell upper latent rides the plate the same way.
     plate = lower_rkppl(Expr(:block,
         :(mu ~ Normal(0, 3)), :(tau ~ HalfNormal(2)),
@@ -1990,15 +1987,12 @@ end
                 Expr(:block,
                     :(theta[i] ~ truncated(Normal(mu, tau), -Inf, 2.0)),
                     :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y,))
-    @test only(plate.plate_parameters).support_override === (:upper, 2.0)
-    # An upper-only truncation on a non-Normal family is rejected in slice 1.
-    # capability: upper-only truncation of a non-Normal prior (Cauchy) (todo `0ze68k8`)
-    @test_broken (lower_rkppl(
+    @test only(plate.plate_parameters).support_override === (:truncated, -Inf, 2.0)
+    # Non-Normal families and expression bounds are ordinary values.
+    @test (lower_rkppl(
         _plate_z(:(truncated(Cauchy(0.0, 1.0), -Inf, 1.0))), (:y,)); true)
-    # Bounds are literals: an expression bound (the emitter folds `log(0.6)`)
-    # is rejected.
-    # capability: expression truncation bound log(0.6) (P8) (todo `0ze68k8`)
-    @test_broken (lower_rkppl(
+
+    @test (lower_rkppl(
         _plate_z(:(truncated(Normal(-1.0, 1.0), -Inf, log(0.6)))), (:y,)); true)
 end
 
@@ -2033,7 +2027,7 @@ end
                 nothing, :m),
             SampledParameter(:s, :exponential, (arg1 = :m,), nothing, :s),
             SampledParameter(:t, :flat, NamedTuple(), nothing, :t),
-            SampledParameter(:h, :normal, (arg1 = 0, arg2 = 2), :positive,
+            SampledParameter(:h, :normal, (arg1 = 0, arg2 = 2), (:truncated, 0.0, Inf),
                 :h),
             SampledParameter(:h2, :normal, (arg1 = 0, arg2 = 3), :positive,
                 :h2)],

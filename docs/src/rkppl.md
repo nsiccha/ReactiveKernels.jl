@@ -52,6 +52,40 @@ Main.ReactiveKernelsDocs.render_rkppl_strict_error()
 Coefficient vectors are declared the same way, sized by their design matrix:
 `b[axes(X, 2)] .~ Normal.(0, 1)`.
 
+## Parameter priors
+
+Scalar parameter priors include `Normal`, `Cauchy`, `Exponential`, `Gamma`,
+`LogNormal`, `Beta`, `InverseGamma`, `StudentT`, `Laplace`, `Logistic`,
+`Uniform` and `Weibull`. Arguments can read data, sampled parameters and
+ordinary definitions; scalar expressions such as `1 + exp(a)` are values too.
+
+`x ~ truncated(D, lo, hi)` uses the normalized Distributions.jl density for
+any of these univariate families. Bounds may be literals, model-level data,
+sampled values or scalar expressions; use `-Inf` or `Inf` for an open end.
+The transform uses the intersection with the base distribution's support.
+A parameter-dependent bound also determines `constrain`, `unconstrain` and
+`logjac`, independent of declaration order. Array and plate priors accept
+shared scalar bounds. Per-element bounds are not built yet.
+
+```julia
+a ~ Normal(0, 1)
+x ~ truncated(Weibull(2 + exp(a), 1), exp(a), 3 + exp(a))
+p ~ Dirichlet(3, exp(a))
+y .~ Normal.(x, 1)
+```
+
+`Dirichlet(alpha)` takes a concentration vector from data, a sampled array,
+a vector literal containing live values, or an array-valued definition.
+`Dirichlet(K, a)` takes a literal dimension and a live scalar concentration.
+The concentration shape determines the simplex size at binding; it does not
+replicate the density body. Concentrations must be positive.
+
+Dynamic Normal, Cauchy and Weibull truncation supports native and Reactant
+primal and reverse execution. Gamma, Beta and InverseGamma truncation calls
+incomplete gamma or beta functions whose traced methods are still unavailable;
+those normalizers support native execution. The existing simplex transform's
+Reactant limitation also applies to hierarchical Dirichlet priors.
+
 ## Julia semantics, written out
 
 - Use Distributions.jl constructors (`Normal`, `Exponential`, `Gamma`, …).
