@@ -240,12 +240,15 @@ end
         eta = be * th - al
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
-    # Literal scales fold into a coefficient or prior, not the tree.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # A literal scale is one scalar leaf (a synthetic assignment), like
+    # any sub-free scalar subexpression (test_fallback.jl).
+    lit = lower_rkppl(quote
         th = a_th .+ b_th .* xs
         eta = 2.0 .* th
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
+    @test only(lit.predictors[2].terms).options.tree == :(_rkppl_leaf_1 .* th)
+    @test only(lit.assignments).expr == 2.0
     # `logistic.` outside a composition keeps the link guidance (the
     # predictor analysis re-screens strictly).
     err = try
@@ -268,13 +271,18 @@ end
         eta = be .* th
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
-    # A scalar leaf cannot also be a sub-predictor coefficient.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # A scalar leaf that is also a sub-predictor coefficient is one
+    # ordinary parameter read twice (its sub-predictor summand lowers as a
+    # derived column — test_fallback.jl).
+    twice = lower_rkppl(quote
         th = a .+ b .* xs
         b ~ Normal(0, 1)
         eta = b .* th
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs))
+    @test any(p -> p.name === :b, twice.parameters)
+    @test [t.kind for t in twice.predictors[1].terms] ==
+        [InterceptTerm, OffsetTerm]
     # Shrinkage priors go on the coefficient-holding sub-predictors,
     # never the composed root.
     @test_throws SurfaceLoweringError lower_rkppl(quote
