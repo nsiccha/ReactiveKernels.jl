@@ -195,6 +195,197 @@ end
         findfirst(==(Symbol("Z.1.2")), names)
 end
 
+# Model-module helpers for whole-value calls over arrays (`group_sums`
+# needs one value per group: a model-level call over the whole array).
+module ArrayRowsModels
+group_sums(B) = vec(sum(B; dims = 2))
+addvec(a, b) = a .+ b
+end
+
+@testset "array values: column reads passed to a module call" begin
+    # `Z[:, j]` is the j-th column (one value per level); passed to a
+    # model-level call whose result is gathered per observation.
+    ast = :(begin
+        s ~ Exponential(1)
+        Z[levels(k), 1:2] .~ Normal.(0, 1)
+        v = addvec(Z[:, 1], Z[:, 2])
+        y .~ Normal.(v[k], s)
+    end)
+    y = _av_y()
+    k = [1, 2, 3, 1, 2, 3, 1, 2]
+    bound = bind_data(lower_rkppl(ast, (:y, :k); mod = ArrayRowsModels),
+        Dict{Symbol,ColumnData}(:y => y, :k => k))
+    built = build_kernel(bound)
+    u = _av_point(built.layout.total)
+    nt = constrain(built.layout, u)
+    v = nt.Z[:, 1] .+ nt.Z[:, 2]
+    @test _av_node(built, bound, :likelihood, u) ≈
+        sum(logpdf.(Normal.(v[k], nt.s), y))
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "array values: row-wise MvNormalCholesky (centered correlated)" begin
+    # Every row of `B` (one per level of `g`) is one draw of
+    # `MvNormal(mu, F * F')`; the entries of `B` are the coordinates.
+    m = @rkppl begin
+        L ~ LKJCholesky(2, 2.0)
+        sd[1:2] .~ HalfNormal.(1)
+        F = sd .* L
+        eachrow(B[levels(g), 1:2]) .~ MvNormalCholesky([0.5, -0.25], F)
+        a ~ Normal(0, 1)
+        sigma ~ Exponential(1)
+        r = B[g, 1] .+ B[g, 2] .* x
+        mu = a .+ r
+        y .~ Normal.(mu, sigma)
+    end
+    y, x, g = _av_y(), _av_x(), _av_g()
+    bound = m(; y, x, g)
+    p = only(q for q in bound.array_parameters if q.name === :B)
+    @test p.family === :mvnormal_cholesky_rows
+    built = build_kernel(bound)
+    @test built.layout.total == 1 + 2 + 6 + 1 + 1
+    u = _av_point(built.layout.total)
+    nt = constrain(built.layout, u)
+    @test nt.B isa Matrix{Float64} && size(nt.B) == (3, 2)
+    @test unconstrain(built.layout, nt) ≈ u
+    # Centered: the entries of `B` are its coordinates (column-major).
+    names = coordinate_names(built.layout)
+    iB = findfirst(==(Symbol("B.1.1")), names)
+    @test names[iB:iB + 5] == Symbol.(["B.1.1", "B.2.1", "B.3.1", "B.1.2",
+        "B.2.2", "B.3.2"])
+    @test u[iB:iB + 5] == vec(nt.B)
+    F = nt.sd .* nt.L
+    @test F ≈ Diagonal(nt.sd) * nt.L
+    rowprior = sum(logpdf(MvNormal([0.5, -0.25], F * F'), nt.B[j, :])
+        for j in 1:3)
+    prior = logpdf(LKJCholesky(2, 2.0), Cholesky(LowerTriangular(nt.L))) +
+        sum(logpdf.(truncated(Normal(0, 1), 0, Inf), nt.sd)) + rowprior +
+        logpdf(Normal(0, 1), only(nt.mu)) + logpdf(Exponential(1), nt.sigma)
+    @test _av_node(built, bound, :prior, u) ≈ prior
+    codes = [findfirst(==(v), ["a", "b", "c"]) for v in g]
+    lik = sum(logpdf.(Normal.(only(nt.mu) .+ nt.B[codes, 1] .+
+        nt.B[codes, 2] .* x, nt.sigma), y))
+    @test _av_node(built, bound, :likelihood, u) ≈ lik
+    @test _av_node(built, bound, :log_jacobian, u) ≈ logjac(built.layout, u)
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "array values: row-wise array read whole by a module call" begin
+    # The whole levels × K matrix reaches a model-level call (one value per
+    # group), whose result is gathered per observation.
+    ast = :(begin
+        s ~ Exponential(1)
+        L ~ LKJCholesky(3, 2.0)
+        sd[1:3] .~ Exponential.(1)
+        F = sd .* L
+        eachrow(B[levels(k), 1:3]) .~ MvNormalCholesky(zeros(3), F)
+        v = group_sums(B)
+        y .~ Normal.(v[k], s)
+    end)
+    y = _av_y()
+    k = [1, 2, 3, 1, 2, 3, 1, 2]
+    bound = bind_data(lower_rkppl(ast, (:y, :k); mod = ArrayRowsModels),
+        Dict{Symbol,ColumnData}(:y => y, :k => k))
+    built = build_kernel(bound)
+    @test built.layout.total == 1 + 3 + 3 + 9
+    u = _av_point(built.layout.total)
+    nt = constrain(built.layout, u)
+    F = nt.sd .* nt.L
+    prior = logpdf(Exponential(1), nt.s) +
+        logpdf(LKJCholesky(3, 2.0), Cholesky(LowerTriangular(nt.L))) +
+        sum(logpdf.(Exponential(1), nt.sd)) +
+        sum(logpdf(MvNormal(zeros(3), F * F'), nt.B[j, :]) for j in 1:3)
+    @test _av_node(built, bound, :prior, u) ≈ prior
+    v = vec(sum(nt.B; dims = 2))
+    @test _av_node(built, bound, :likelihood, u) ≈
+        sum(logpdf.(Normal.(v[k], nt.s), y))
+    _check_gradient(built.spec, bound, u)
+end
+
+@testset "array values: row-wise prior equals the centered conditional chain" begin
+    # The same centered model spelled two ways: rows of `B` drawn jointly,
+    # and margin by margin (`b2 | b1`). Both pack the levels × 2 values
+    # column-major after the same scalars, so the posteriors agree at
+    # every point.
+    rows = :(begin
+        s ~ Exponential(1)
+        L ~ LKJCholesky(2, 2.0)
+        sd[1:2] .~ HalfNormal.(1)
+        F = sd .* L
+        eachrow(B[levels(k), 1:2]) .~ MvNormalCholesky(zeros(2), F)
+        v = addvec(B[:, 1], B[:, 2])
+        y .~ Normal.(v[k], s)
+    end)
+    chain = :(begin
+        s ~ Exponential(1)
+        L ~ LKJCholesky(2, 2.0)
+        sd[1:2] .~ HalfNormal.(1)
+        b1[levels(k)] .~ Normal.(0, sd[1])
+        b2[levels(k)] .~ Normal.(L[2, 1] .* sd[2] ./ sd[1] .* b1,
+            sd[2] .* L[2, 2])
+        v = addvec(b1, b2)
+        y .~ Normal.(v[k], s)
+    end)
+    data = Dict{Symbol,ColumnData}(:y => _av_y(),
+        :k => [1, 2, 3, 1, 2, 3, 1, 2])
+    br, bc = (bind_data(lower_rkppl(ast, (:y, :k); mod = ArrayRowsModels),
+        data) for ast in (rows, chain))
+    kr, kc = build_kernel(br), build_kernel(bc)
+    @test kr.layout.total == kc.layout.total == 10
+    u = _av_point(10)
+    @test _av_node(kr, br, :posterior, u) ≈ _av_node(kc, bc, :posterior, u)
+    @test _av_node(kr, br, :prior, u) ≈ _av_node(kc, bc, :prior, u)
+end
+
+@testset "array values: row-wise MvNormalCholesky fail closed" begin
+    bindm(ast, data) = bind_data(lower_rkppl(ast, Tuple(keys(data))),
+        Dict{Symbol,ColumnData}(pairs(data)))
+    y, x, g = _av_y(), _av_x(), _av_g()
+    prog(decl) = :(begin
+        L ~ LKJCholesky(2, 2.0)
+        sd[1:2] .~ HalfNormal.(1)
+        F = sd .* L
+        $decl
+        a ~ Normal(0, 1)
+        r = B[g, 1] .* x
+        mu = a .+ r
+        y .~ Normal.(mu, 1.0)
+    end)
+    # refused: `eachrow` makes the rows the broadcast elements, so the
+    # statement broadcasts (`.~`); `~` would claim one draw for the whole
+    # matrix (standard-Julia semantics, @rkppl principle 3).
+    @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[levels(g),
+        1:2]) ~ MvNormalCholesky(zeros(2), F))), (:y, :x, :g))
+    # refused: a row is a vector, so a univariate family cannot draw it
+    # (standard-Julia semantics, principle 3); elementwise priors are
+    # `B[a, b] .~ Fam.(...)`.
+    @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[levels(g),
+        1:2]) .~ Normal(0, 1))), (:y, :x, :g))
+    # refused: a one-axis array has no rows to iterate (principle 3).
+    @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[1:2]) .~
+        MvNormalCholesky(zeros(2), F))), (:y, :x, :g))
+    # refused: the mean of a multivariate normal is a vector, as in
+    # Distributions' `MvNormal` (principle 3); a zero mean is `zeros(K)`.
+    @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[levels(g),
+        1:2]) .~ MvNormalCholesky(0, F))), (:y, :x, :g))
+    # A mean that is not a K-vector: here a column the predictor reads
+    # per observation (8 values for rows of length 2).
+    @test_throws ContractValidationError bindm(prog(:(eachrow(B[levels(g),
+        1:2]) .~ MvNormalCholesky(x, F))), (; y, x, g))
+    # A literal mean whose length differs from the rows.
+    @test_throws ContractValidationError bindm(prog(:(eachrow(B[levels(g),
+        1:2]) .~ MvNormalCholesky([0.0, 0.0, 0.0], F))), (; y, x, g))
+    # A declared factor whose size differs from the rows.
+    @test_throws ContractValidationError bindm(:(begin
+        L ~ LKJCholesky(3, 2.0)
+        eachrow(B[levels(g), 1:2]) .~ MvNormalCholesky(zeros(2), L)
+        a ~ Normal(0, 1)
+        r = B[g, 1] .* x
+        mu = a .+ r
+        y .~ Normal.(mu, 1.0)
+    end), (; y, x, g))
+end
+
 @testset "array values: an integer axis gathers by position" begin
     m = @rkppl begin
         z[1:3] .~ Normal.(0, 1)

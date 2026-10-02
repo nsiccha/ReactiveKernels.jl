@@ -161,6 +161,13 @@ import ..linear_pk_read_locs, ..linear_pk_read_locs_auc
 import ..linear_pk_read_locs_over_subjects,
     ..linear_pk_read_locs_auc_over_subjects, ..SubjectScalar, ..SubjectSlice
 import .._centered_correlated_logpdf
+# Multivariate slice priors (`mv_slices.jl`): orientations, per-slice
+# arguments, simplex / ordered slice transforms and the slice densities.
+import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
+import .._mvnormal_cholesky_slices_logpdf, .._mvnormal_slices_logpdf
+import .._dirichlet_slices_logpdf, .._ordered_normal_slices_logpdf
+import .._simplex_slices_constrain, .._simplex_slices_logjac
+import .._ordered_slices_constrain, .._ordered_slices_logjac
 # Event-LP provider (one call over the flat event axis — the flat
 # `log_F` local the batched cell runner slices per subject).
 import ..linear_pk_event_log_f
