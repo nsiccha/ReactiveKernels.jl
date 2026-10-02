@@ -285,12 +285,6 @@ function _scope_layout_paths(plan::StructuralPlan)
         generated!(dar.state, [_dar_innovation_name(dar)],
             [Symbol(:_ppl_dar_z_, last(path))])
     end
-    for provider in plan.event_lps
-        path = get(paths, provider.name, nothing)
-        path === nothing && continue
-        generated!(provider.name, _event_lp_all_names(provider),
-            _event_lp_all_names(_with(provider; name = last(path))))
-    end
     return paths
 end
 
@@ -613,32 +607,6 @@ function assign_layout(plan::StructuralPlan)
         push!(entries,
             LayoutEntry(:scan, nothing, nm, labels, offset, T - 1, :identity))
         offset += T - 1
-    end
-    # Event-LP providers in plan order: the dose slope as an identity
-    # scalar, then the HSGP triple in SB `_sb_hsgp` declaration order
-    # (rho, sigma, beta) — but with the V2 term priors' supports: rho
-    # on the parameterized `:interval` (truncation floor, the reference
-    # model's upper bound 2.0), sigma plain `:exp`, beta_raw
-    # one `:hsgp` identity block (the spline-vector shape).
-    for el in plan.event_lps
-        el.fit === nothing && throw(ContractValidationError(
-            "[layout] event-LP `$(el.name)`: fit not filled at bind " *
-            "(bind_data fits one (mu, L) over the event axis)"))
-        names = _event_lp_names(el)
-        push!(entries, LayoutEntry(:sampled, nothing, names.slope,
-            [names.slope], offset, 1, :identity))
-        offset += 1
-        floor = only(_hsgp_floors([el.k], [el.fit], true))
-        push!(entries, LayoutEntry(:sampled, nothing, names.rho,
-            [names.rho], offset, 1, :interval, floor,
-            _EVENT_LP_RHO_PRIOR_HI))
-        offset += 1
-        push!(entries, LayoutEntry(:sampled, nothing, names.sigma,
-            [names.sigma], offset, 1, :exp))
-        offset += 1
-        push!(entries, LayoutEntry(:hsgp, nothing, names.beta,
-            [names.beta], offset, el.k, :identity))
-        offset += el.k
     end
     # Declared array parameters last (`arrays.jl`): LKJ factors and
     # simplexes reuse the `:cholesky_corr` / `:vector` edges, elementwise

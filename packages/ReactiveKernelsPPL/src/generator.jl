@@ -70,7 +70,6 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _horseshoe_coef_statements(plan))
     append!(stmts, _affine_coefficient_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
-    append!(stmts, _event_lp_statements(plan))
     append!(stmts, _likelihood_statements(plan))
     append!(stmts, priors)
     push!(stmts, _log_jacobian_statement(plan, layout))
@@ -406,29 +405,6 @@ function _predictor_statements(plan::StructuralPlan)
         # zero LP, which broadcasts everywhere a vector LP would.
         rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
         push!(stmts, :($lp = $rhs))
-    end
-    return stmts
-end
-
-# One event-LP provider call (SB `log_F ~ 0 + op_log_dose +
-# hsgp(op_log_dose; k)`): the flat op-ordered `log_F` local over the
-# bound event-axis column + the frozen bind fit + the traced
-# hyperparameters — the same `linear_pk_event_log_f` the host-side
-# oracle path calls, so spec and graph agree by construction. Runs
-# with the predictors (it IS an LP node); the grouped expansion
-# slices the flat local per subject.
-function _event_lp_statements(plan::StructuralPlan)
-    stmts = Expr[]
-    for el in plan.event_lps
-        el.fit === nothing && throw(ContractValidationError(
-            "[generator] event-LP `$(el.name)`: fit not filled at bind " *
-            "(bind_data fits one (mu, L) over the event axis)"))
-        mu, L = el.fit
-        names = _event_lp_names(el)
-        axis = _sched_col_name(el.schedule, :op_log_dose)
-        push!(stmts, :($(el.name) = linear_pk_event_log_f($axis,
-            $(names.slope), $(names.rho), $(names.sigma), $(names.beta),
-            $(Float64(mu)), $(Float64(L)), $(el.k))))
     end
     return stmts
 end
@@ -3594,39 +3570,6 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             push!(stmts, :($snode::Float64 = $scell))
             push!(terms, snode)
         end
-        _vector_prior_stmts!(stmts, terms, names.beta, :normal,
-            (arg1 = 0, arg2 = 1), nothing)
-    end
-    # Event-LP providers (SB V2 term priors verbatim): the dose slope
-    # `Normal(0, 0.6676)` (the specific `effect(log_F, op_log_dose)`
-    # override — BRM specificity beats the wildcard), the length scale
-    # `Uniform(floor, 2.0)` over the `:interval` support (constant
-    # `-log(hi-lo)` — the support keeps it inside), the marginal scale
-    # `Normal(0, 1)` WITHOUT a half normalizer (Stan lower-bound
-    # kernel semantics — the varying-`tau` precedent), and the
-    # standardized `beta_raw` plate (shared vector-prior helper).
-    for el in plan.event_lps
-        el.fit === nothing && throw(ContractValidationError(
-            "[generator] event-LP `$(el.name)`: fit not filled at bind " *
-            "(bind_data fits one (mu, L) over the event axis)"))
-        names = _event_lp_names(el)
-        floor = only(_hsgp_floors([el.k], [el.fit], true))
-        slopesym = names.slope
-        slnode = Symbol(:_ppl_prior_, slopesym)
-        slcell = _family_logpdf_expr(:normal,
-            Any[0.0, _EVENT_LP_SLOPE_PRIOR_SD], slopesym)
-        push!(stmts, :($slnode::Float64 = $slcell))
-        push!(terms, slnode)
-        rhosym = names.rho
-        rnode = Symbol(:_ppl_prior_, rhosym)
-        rcell = :(uniform($floor, $(_EVENT_LP_RHO_PRIOR_HI)).logpdf($rhosym))
-        push!(stmts, :($rnode::Float64 = $rcell))
-        push!(terms, rnode)
-        sigsym = names.sigma
-        snode = Symbol(:_ppl_prior_, sigsym)
-        scell = _family_logpdf_expr(:normal, Any[0, 1], sigsym)
-        push!(stmts, :($snode::Float64 = $scell))
-        push!(terms, snode)
         _vector_prior_stmts!(stmts, terms, names.beta, :normal,
             (arg1 = 0, arg2 = 1), nothing)
     end

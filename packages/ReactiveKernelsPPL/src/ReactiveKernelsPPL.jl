@@ -77,7 +77,7 @@ export restore_draws
 export RKPPLModel, RKPPLSubmodel, lower_rkppl, @rkppl, SurfaceLoweringError
 export ordered_logistic, monotonic, differenced_ar1, r2d2_coefs,
     horseshoe_coefs, penalized_smooth, t2_smooth, hsgp_effect,
-    hsgp_periodic_effect, hsgp_grouped_effect
+    hsgp_periodic_effect, hsgp_grouped_effect, linear_pk_log_f
 export varying_coefs, varying_coefs_correlated, varying_coefs_centered,
     varying_coefs_centered_correlated, varying_stratified,
     varying_stratified_correlated

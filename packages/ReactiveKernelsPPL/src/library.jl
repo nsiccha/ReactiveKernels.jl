@@ -8,6 +8,29 @@
 # left-hand side.
 
 """
+    log_F ~ linear_pk_log_f(sched; k = 5, c = 1.5)
+
+Linear dose effect plus an exponentiated-quadratic HSGP over the schedule's
+log-dose axis, in schedule operation order. Every parameter and prior is
+stated in the library body; `rho_floor` is the data-derived validity floor.
+Use `merge(linear_pk_log_f, :(slope ~ Normal(0, 0.5)))` to make a new
+submodel with a different slope prior. The original body is unchanged.
+"""
+@rkppl linear_pk_log_f(sched; k = 5, c = 1.5) = begin
+    reference_dose = 1
+    op_log_dose = linear_pk_op_log_dose(sched.op_type, sched.op_amount;
+        reference_dose = reference_dose)
+    (PHI, lambda) = hsgp_basis(op_log_dose; k = k, c = c)
+    rho_floor = maximum(hsgp_rho_floors(lambda))
+    slope ~ Normal(0, 1)
+    rho ~ truncated(LogNormal(0, 1), rho_floor, Inf)
+    sigma ~ HalfNormal(1)
+    z[axes(PHI, 2)] .~ Normal.(0, 1)
+    return slope .* op_log_dose .+
+        PHI * (hsgp_sqrt_spd(lambda, sigma, rho) .* z)
+end
+
+"""
     y ~ ordered_logistic(eta)
 
 Shipped observation-stream submodel for a cumulative-logit ordinal response
