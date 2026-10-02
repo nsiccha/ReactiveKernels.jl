@@ -132,7 +132,7 @@ end
     shifts, weights = [-7, 0, 300], [0.7, -0.3, 1.1]
     original_U, original_shifts, original_weights = copy(U), copy(shifts), copy(weights)
     kernel = prepare(DenseColumnDoseOuterAD.cell)
-    for n in (32, 257)
+    for n in (0, 1, 32, 257, 4096)
         args = (1:n, shifts, units, weights)
         reference_args = (1:n, shifts, copy(units), weights)
         @test count(op -> op isa ReactiveKernels._KernelSourceOp &&
@@ -145,9 +145,27 @@ end
         @test value ≈ kernel(args...)
         response = [sum(w * get(units, t - s, 0.0) for (s, w) in zip(shifts, weights))
                     for t in 1:n]
-        analytic = [2 * sum(response[t] * get(units, t - s, 0.0) for t in 1:n)
+        analytic = [2 * sum((response[t] * get(units, t - s, 0.0) for t in 1:n); init=0.0)
                     for s in shifts]
         @test gradient ≈ analytic rtol=1e-12
+        for bound in ((; units), (; observations=args[1], shifts, units),
+                      (; observations=args[1], shifts))
+            residual = prepare(DenseColumnDoseOuterAD.cell; bound)
+            values = (; observations=args[1], shifts, units, weights)
+            residual_args = Tuple(getproperty(values, port.name) for port in inputs(residual))
+            bound_ad = prepare_ad(residual, backend, residual_args...; active=:weights)
+            bound_value, bound_gradient = ad_value_and_gradient(bound_ad, residual_args...)
+            @test bound_value ≈ value
+            @test bound_gradient ≈ gradient rtol=1e-12
+        end
+        # Consumer package images wrap the native body for their first use.
+        # After loading, that wrapper must also enter the body without packing
+        # a constant view beside the active weights.
+        warmed = ReactiveKernels._PrecompileWarmFunction(kernel.f.native)
+        warm_call = ReactiveKernels._ADNativeKernelCall{
+            4,typeof(warmed),typeof(kernel.ops)}(warmed, kernel.ops)
+        @test DifferentiationInterface.gradient(warm_call, backend, weights,
+            Constant(args[1]), Constant(shifts), Constant(units)) ≈ gradient rtol=1e-12
         # A prepared gradient must read each call's constant view, including
         # its current parent contents, without capturing or mutating them.
         replacement_U = U .+ 0.4

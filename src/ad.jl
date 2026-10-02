@@ -124,17 +124,9 @@ _ad_restore_cotangent(point, cotangent) = cotangent
             context_index += 1
         end
     end
-    if F <: Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction,
-                  _PrecompileWarmFunction}
-        # Enter the existing generated body directly. The RGF vararg wrapper
-        # first packs its arguments into a tuple; with forced bounds checks,
-        # packing a constant view beside active storage defeats static activity
-        # analysis. Keep the original view and inline the generated call, as
-        # the externalized bound-array boundary already does.
-        return :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
-            call.native, call.ops, $(positional...)))
-    end
-    :(call.native(call.ops, $(positional...)))
+    # Share the primal call boundary with externalized bound arrays: pass the
+    # original operands directly to the existing generated model body.
+    _native_body_call_expr(F, :(call.native), :(call.ops), positional)
 end
 
 function _ad_operation_slots!(used, node)
@@ -644,7 +636,9 @@ end
             context_index += 1
         end
     end
-    :(call.kernel($(arguments...)))
+    # Inline the positional adapter as well as its generated body, so hidden
+    # readonly operands do not get repacked beside the active point.
+    :(Base.@inline call.kernel($(arguments...)))
 end
 
 # The trailing context is the owned AD cache tuple; the leading N - 1 restore
