@@ -37,6 +37,41 @@ function _semantics_check(ast, data, oracle; names = nothing)
     return (; bound, built, u)
 end
 
+@testset "Julia matrix intercept columns" begin
+    x1, x2 = [-1.0, 0.0, 1.0], [0.5, -0.5, 0.2]
+    data = Dict{Symbol,Any}(:x1 => x1, :x2 => x2, :y => [0.2, 0.4, -0.1])
+    ast = quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        X = hcat(ones(length(x1)), x1, x2)
+        mu = X * b
+        y .~ Normal.(mu, 1)
+    end
+    _semantics_check(ast, data, q -> sum(logpdf.(
+        Normal.(hcat(ones(length(x1)), x1, x2) * q.b, 1), data[:y])))
+    # The intercept can instead be a scalar outside the matrix product.
+    outside = quote
+        a ~ Normal(0, 1)
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        X = hcat(x1, x2)
+        mu = a .+ X * b
+        y .~ Normal.(mu, 1)
+    end
+    _semantics_check(outside, data, q -> sum(logpdf.(
+        Normal.(q.a .+ hcat(x1, x2) * q.b, 1), data[:y])))
+    # refused: scalar hcat intercepts are Julia dimension errors (0tz0qfu,
+    # matrix prong). The error gives both approved migration choices.
+    bad = quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        X = hcat(1, x1, x2)
+        mu = X * b
+        y .~ Normal.(mu, 1)
+    end
+    err = try lower_rkppl(bad, data); nothing catch e; e end
+    @test err isa SurfaceLoweringError
+    @test occursin("ones(length(x1))", sprint(showerror, err))
+    @test occursin("mu = a .+ X * b", sprint(showerror, err))
+end
+
 @testset "Julia inverse-link function spellings" begin
     x = [-1.0, 0.0, 0.5, 1.0]
     for (link, inverse) in ((:normcdf, x -> cdf(Normal(), x)),

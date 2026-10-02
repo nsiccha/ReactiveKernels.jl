@@ -1665,7 +1665,7 @@ end
 """
     DesignMatrix(name, columns, label)
 
-One user-bound design matrix (`X = hcat(1, x1, x2)`): `columns` in hcat
+One user-bound design matrix (`X = hcat(ones(length(x1)), x1, x2)`): `columns` in hcat
 order, `nothing` marking intercept-ones positions. Data/derived columns
 only (length-n by bind/construction); latent, scan, parameter, and
 nested-matrix names are rejected — the SB `me` mirror stays affine and
@@ -10465,7 +10465,7 @@ end
 
 # Value matrices (`_value_design_matrix_names`): each binds under
 # its name as `Float64.(hcat(...))` of its bound columns, a ones column at
-# the intercept `1` (the design-matrix meaning).
+# the intercept `ones(length(x))` (the design-matrix meaning).
 function _materialize_value_matrices!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData})
     names = _value_design_matrix_names(plan)

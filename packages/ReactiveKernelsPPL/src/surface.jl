@@ -176,7 +176,7 @@ end
 (`@rkppl sm(args...) = begin ... end`; see [`RKPPLSubmodel`](@ref)).
 
 Design-matrix vocabulary (standard-Julia value semantics throughout):
-bind the matrix once (`X = hcat(1, x1, x2)` — the intercept `1` plus
+bind the matrix once (`X = hcat(ones(length(x1)), x1, x2)` — the intercept `ones(length(x))` plus
 bare data/derived columns), use it only as a predictor matmul
 (`mu = X * b`), and size the coefficient vector with an axes prior
 (`b[axes(X, 2)] .~ Normal.(loc, scale)` — scalar args share over
@@ -1488,7 +1488,7 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
     nmat = count(==(:matrix), argshapes)
     if fn === :hcat
         # Design-matrix construction is always matrix-shaped (arg
-        # validation — intercept `1` plus vector columns — lives in
+        # validation — intercept `ones(length(x))` plus vector columns — lives in
         # matrix-def extraction, not here).
         return :matrix
     elseif nmat > 0 && fn !== :*
@@ -4393,11 +4393,11 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
 end
 
 # ── Design-matrix extraction (slice D1) ─────────────────────────────
-# `X = hcat(1, x, ...)` definitions leave `det` for the plan-level
+# `X = hcat(ones(length(x)), x, ...)` definitions leave `det` for the plan-level
 # `matrices` table (the ranef-bucket/spline-basis precedent: special
 # statements lower to plan tables, not kernel assignments). The generator
 # emits each matrix once (`X = Float64.(hcat(...))`); predictor matmuls
-# (`mu = X * b`) reference it by name. Columns are the intercept `1`
+# (`mu = X * b`) reference it by name. Columns are the intercept `ones(length(x))`
 # plus bare data/derived-data columns — latent, scan, parameter, and
 # nested-matrix columns fail closed here; duplicate columns and double
 # intercepts fail in contract validation. Only named definitions are
@@ -4407,6 +4407,46 @@ end
 _is_hcat_def(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
     rhs.args[1] === :hcat
+
+# Only Base's ones/length have this recipe. A same-named module function
+# keeps its own meaning. The length anchor must also be a matrix column:
+# bind validates their equal lengths, so recreating the ones column is exact.
+_base_matrix_call(ex, name, f) =
+    ex isa Expr && ex.head === :call && length(ex.args) == 2 &&
+    (ex.args[1] === name || (ex.args[1] isa GlobalRef &&
+        getfield(ex.args[1].mod, ex.args[1].name) === f))
+
+function _matrix_intercept_anchor(ex)
+    _base_matrix_call(ex, :ones, Base.ones) || return nothing
+    len = ex.args[2]
+    _base_matrix_call(len, :length, Base.length) || return nothing
+    return len.args[2] isa Symbol ? len.args[2] : nothing
+end
+
+function _matrix_columns(nm, args, column)
+    isempty(args) && _sfail("matrix `$nm` calls `hcat` with no columns")
+    anchor = findfirst(a -> a isa Symbol, args)
+    example = anchor === nothing ? "x" : string(args[anchor])
+    cols = Union{Nothing,Symbol}[]
+    for a in args
+        if a isa Number && !(a isa Bool) && a == 1
+            _sfail("matrix `$nm`: scalar `1` is not a vector intercept " *
+                "in Julia's `hcat`; use `ones(length($example))`, or keep " *
+                "the intercept outside the matrix (`X = hcat($example, ...)`; " *
+                "`mu = a .+ X * b`)")
+        elseif a isa Symbol
+            push!(cols, column(a))
+        else
+            c = _matrix_intercept_anchor(a)
+            c !== nothing && c in args || _sfail("matrix `$nm` has a " *
+                "non-column argument $(repr(a)) — use bare vector columns " *
+                "or `ones(length($example))` anchored to one of them; " *
+                "bind richer expressions to a name first")
+            push!(cols, nothing)
+        end
+    end
+    return cols
+end
 
 # Any `hcat` call under `ex` (QuoteNodes opaque — a quoted `:hcat` is
 # not a call).
@@ -4488,25 +4528,8 @@ function _extract_matrices(det, detmap, detshape, data, prior_names,
         rhs = detmap[nm]
         _is_hcat_def(rhs) || (push!(kept, nm => rhs); continue)
         args = rhs.args[2:end]
-        isempty(args) && _sfail("design matrix `$nm = $(repr(rhs))` " *
-                                "calls `hcat` with no columns — a design " *
-                                "matrix needs at least one " *
-                                "(`$nm = hcat(1, x, ...)`)")
-        cols = Union{Nothing,Symbol}[]
-        for a in args
-            if a isa Number && !(a isa Bool) && a == 1
-                push!(cols, nothing)
-            elseif a isa Symbol
-                push!(cols, _matrix_column(nm, a, detshape, detmap, data,
-                    prior_names, plate_names, scans))
-            else
-                _sfail("design matrix `$nm` has a non-column argument " *
-                       "$(repr(a)) — columns are the intercept `1` or " *
-                       "bare data/derived columns " *
-                       "(`$nm = hcat(1, x, ...)`); bind richer " *
-                       "expressions to a name first")
-            end
-        end
+        cols = _matrix_columns(nm, args, c -> _matrix_column(nm, c,
+            detshape, detmap, data, prior_names, plate_names, scans))
         push!(matrices, DesignMatrix(nm, cols, nm))
     end
     # Strays in the remaining definitions: inline `hcat` binds to a name;
@@ -4515,7 +4538,7 @@ function _extract_matrices(det, detmap, detshape, data, prior_names,
     for (nm, rhs) in kept
         _find_hcat(rhs) && _sfail("definition `$nm` calls `hcat` outside " *
                                   "a matrix definition — bind the matrix " *
-                                  "to a name first (`X = hcat(1, x, ...)`)")
+                                  "to a name first (`X = hcat(ones(length(x)), x, ...)`)")
         hit = _find_matrix_use(rhs, matnames)
         hit === nothing || _sfail("definition `$nm` uses design matrix " *
                                   "`$hit` outside a predictor matmul — a " *
@@ -4534,7 +4557,7 @@ function _matrix_column(nm, c, detshape, detmap, data, prior_names,
     if haskey(detmap, c)
         detshape[c] === :vector && return c
         _sfail("design matrix `$nm` over `$c`, which is scalar — " *
-               "matrices take the intercept `1` plus vector columns")
+               "matrices take the intercept `ones(length(x))` plus vector columns")
     end
     c in prior_names && _sfail("design matrix `$nm` over sampled " *
                                "parameter `$c` is not in slice D1 " *
@@ -4547,7 +4570,7 @@ function _matrix_column(nm, c, detshape, detmap, data, prior_names,
                                              "slice D1 (data/derived " *
                                              "columns only)")
     _sfail("design matrix `$nm` over unknown name `$c` — columns are " *
-           "the intercept `1` or bare data/derived columns")
+           "the intercept `ones(length(x))` or bare data/derived columns")
 end
 
 # ── `hcat` matrices read as values ───────────────────────────────────
@@ -4564,7 +4587,7 @@ end
 # Such an `X` lowers exactly like a bound data matrix `X`: `w[axes(X, 2)]`
 # declarations are arrays, `X * w` is the data matrix-vector product, and
 # data-only definitions read the matrix. Both routes use the same matrix
-# (intercept `1` = a ones column), so the density is the same. Any other
+# (intercept `ones(length(x))` = a ones column), so the density is the same. Any other
 # use (`mu = X`, `a .+ X`, `X * s` with `s` a scalar, `X` as a location or
 # scale) keeps the design-matrix route and its refusal.
 
@@ -4671,27 +4694,21 @@ function _matrix_term_prior(rhs, scalar)
 end
 
 # The value matrices' plan records: `bind_data` builds each from its
-# columns (the intercept `1` is a ones column, as in a design matrix), so
-# a column is `1` or a bound data column.
+# columns (the intercept `ones(length(x))` is a ones column, as in a design matrix), so
+# a column is a ones column or a bound data column.
 function _value_design_matrices(defs, data::Set{Symbol})
     out = DesignMatrix[]
     for (nm, rhs) in defs
         args = rhs.args[2:end]
-        isempty(args) && _sfail("matrix `$nm = $rhs` calls `hcat` " *
-                                "with no columns")
-        cols = Union{Nothing,Symbol}[]
-        for a in args
-            if a isa Number && !(a isa Bool) && a == 1
-                push!(cols, nothing)
-            elseif a isa Symbol && a in data
-                push!(cols, a)
-            else
+        cols = _matrix_columns(nm, args, a -> begin
+            if a ∉ data
                 _sfail("matrix `$nm = $rhs` is read as a value, " *
                        "so `bind_data` builds it from its columns: each " *
-                       "is the intercept `1` or a bound data column, got " *
+                       "is a bound vector column, got " *
                        "$(repr(a)) (bind it as data)")
             end
-        end
+            a
+        end)
         push!(out, DesignMatrix(nm, cols, nm))
     end
     return out
@@ -9895,7 +9912,7 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
     expanded = _inline_structure(rhs, ctx, Set{Symbol}([pname]), where)
     _find_hcat(expanded) && _sfail(
         "predictor $pname calls `hcat` outside a matrix definition — " *
-        "bind the matrix to a name first (`X = hcat(1, x, ...)`)")
+        "bind the matrix to a name first (`X = hcat(ones(length(x)), x, ...)`)")
     _reject_unknown_calls(where, expanded)
     canon = _canonical_expr(expanded, ctx.data, ctx.detmap, ctx.detshape,
         ctx.shape_env, where)
@@ -10202,7 +10219,7 @@ function _classify_matmul(pname, core::Expr, sign::Int, ctx)
         Smat === nothing && _sfail("predictor $pname: coefficient " *
                                    "vector `$r` is sized by `$S`, which is " *
                                    "not a design matrix " *
-                                   "(`$S = hcat(1, x, ...)`)")
+                                   "(`$S = hcat(ones(length(x)), x, ...)`)")
         length(Smat.columns) == K || _sfail(
             "predictor $pname: coefficient vector `$r` has " *
             "$(length(Smat.columns)) elements (sized by `$S`) but matrix " *

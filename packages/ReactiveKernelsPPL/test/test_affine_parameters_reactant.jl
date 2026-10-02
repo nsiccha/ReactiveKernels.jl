@@ -76,7 +76,7 @@ using Reactant
                     y ~ NormalIDGLM(X, alpha, b, sigma)
                     q = sum(b .^ 2)
                 end : quote
-                    X = hcat(1, x)
+                    X = hcat(ones(length(x)), x)
                     b[axes(X, 2)] .~ Normal.(0, 2)
                     sigma ~ Exponential(1)
                     mu = X * b

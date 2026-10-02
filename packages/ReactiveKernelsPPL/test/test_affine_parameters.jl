@@ -103,7 +103,7 @@ end
     x = [-1.0, 0.5, 2.0]
     y = [0.3, -0.2, 0.7]
     plan, built = _affine_model(quote
-        X = hcat(1, x)
+        X = hcat(ones(length(x)), x)
         b[axes(X, 2)] .~ Normal.(0, 2)
         sigma ~ Exponential(1)
         mu = X * b
@@ -216,7 +216,7 @@ end
     x = [-1.0, 0.5, 2.0]
     y = [0.3, -0.2, 0.7]
     plan, built = _affine_model(quote
-        X = hcat(1, x)
+        X = hcat(ones(length(x)), x)
         b[axes(X, 2)] .~ Normal.(0, 1)
         mu = exp.(X * b)
         y .~ Normal.(mu, 1.0)

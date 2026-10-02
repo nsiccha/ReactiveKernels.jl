@@ -304,7 +304,7 @@ end
     @testset "matrix broadcast families" begin
         plan = lower_rkppl(quote
                 b[axes(X, 2)] .~ Laplace.(0, 1)
-                X = hcat(1, x1, x2)
+                X = hcat(ones(length(x1)), x1, x2)
                 mu = X * b
                 y .~ Normal.(mu, 1.0)
             end, (:y, :x1, :x2))

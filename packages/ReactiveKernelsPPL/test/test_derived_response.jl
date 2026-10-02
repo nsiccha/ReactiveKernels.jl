@@ -113,7 +113,7 @@ end
             "defined twice"),
         ("design matrix LHS",
             quote
-                X = hcat(1, x)
+                X = hcat(ones(length(x)), x)
                 mu = X * b
                 X .~ Normal.(mu, s)
             end,
