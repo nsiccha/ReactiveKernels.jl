@@ -348,15 +348,17 @@ function design_recipe(shape::DesignShape, n_rows::Int;
 end
 
 """
-    offset_recipe(shape) -> Union{Nothing,Expr}
+    offset_recipe(shape; scalars, n_rows) -> Union{Nothing,Expr}
 
 `_ppl_offset_<pred> = col1 + col2 + …` over offset-term columns, or
-`nothing` when the predictor has no offset terms.
+`nothing` when the predictor has no offset terms. Scalar assignments in
+`scalars` broadcast over `n_rows`, retaining their model-level evaluation.
 """
-function offset_recipe(shape::DesignShape)
-    cols = Symbol[]
+function offset_recipe(shape::DesignShape; scalars = Set{Symbol}(), n_rows = 0)
+    cols = Any[]
     for b in shape.blocks
-        b.kind === OffsetTerm && push!(cols, b.column)
+        b.kind === OffsetTerm || continue
+        push!(cols, b.column in scalars ? :(ones($n_rows) .* $(b.column)) : b.column)
     end
     isempty(cols) && return nothing
     total = foldl((a, c) -> :($a + $c), cols)
@@ -392,7 +394,10 @@ function preprocessing_recipes(plan::StructuralPlan)
             recipe = design_recipe(shape, rows; plates)
             recipe !== nothing && push!(stmts, recipe)
         end
-        off = offset_recipe(shape)
+        scalars = Set{Symbol}(only(t.columns) for t in pred.terms
+            if _is_scalar_offset(t, plan))
+        rows = isempty(scalars) ? 0 : _located_rows(plan, pred)
+        off = offset_recipe(shape; scalars, n_rows = rows)
         off !== nothing && push!(stmts, off)
     end
     # GLM-object response matrices: one `X = Float64.(hcat(...))` recipe

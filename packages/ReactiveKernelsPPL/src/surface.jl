@@ -9734,9 +9734,15 @@ function _whole_value_symbols!(out::Set{Symbol}, ex)
     return nothing
 end
 
-# Anonymous non-affine vector substructure becomes a synthetic derived
-# local (offset term over it); the sign folds into the extracted column.
+# Anonymous value substructure becomes an offset. Model-level scalars
+# stay scalar assignments; preprocessing broadcasts them over the rows.
 function _extract_summand(pname, core::Expr, sign::Int, ctx)
+    if _canon_shape(core, ctx) === :scalar
+        e = sign < 0 ? Expr(:call, :-, core) : core
+        nm = _composed_scalar_leaf!(pname, e, ctx, Symbol[])
+        return TermSpec(OffsetTerm, [nm], NamedTuple(), nm,
+            Symbol(nm, "_off")), nothing
+    end
     e = sign < 0 ? Expr(:call, :.-, core) : core
     nm = _extract_column(pname, e, ctx)
     return TermSpec(OffsetTerm, [nm], NamedTuple(), nm,
@@ -9863,8 +9869,8 @@ end
 function _classify_ref(pname, core::Expr, sign::Int, ctx)
     # Reads of a declared array value (`z[g]`, `phi[1]`) or of an
     # array-valued definition (`b[g, 1]`, `b = z * (sd .* L)'`) are
-    # values, not factor coefficients: extracted as a per-observation
-    # column.
+    # values, not factor coefficients: scalar assignments by position,
+    # per-observation columns when gathered.
     (core.args[1] in ctx.value_arrays || _is_array_def(core.args[1], ctx)) &&
         return _extract_summand(pname, core, sign, ctx)
     length(core.args) == 2 || _sfail("predictor $pname: factor indexing " *
