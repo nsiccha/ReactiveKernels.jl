@@ -542,17 +542,34 @@ end
     reject(:(mu = a .+ phi .* u))
     # coefficient with no `~` statement
     reject(:(mu = a .+ q .* u))
-    # one name as both a population coefficient and a scan coefficient
-    reject(:(mu = a .+ b .* x .+ b .* u))
     # subtracted summand (additive only)
     reject(:(mu = a .- beta_ar .* u))
     # nested scan read (direct `coef .* state` only)
     reject(:(mu = a .+ beta_ar .* (u .+ x)))
     # scan-only predictor (a summand needs a sibling coefficient)
     reject(:(mu = beta_ar .* u))
+    # One name as both a population coefficient and a scan coefficient is
+    # one ordinary parameter read by both summands (test_fallback.jl).
+    both = lower_rkppl(quote
+        phi_raw ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        a ~ Normal(0, 1)
+        sigma ~ Exponential(1)
+        @scan begin
+            u[1] ~ Normal(0, 1)
+            for t in 2:T
+                eps ~ Normal(0, 1)
+                u[t] = phi * u[t - 1] + eps
+            end
+        end
+        phi = tanh(phi_raw)
+        mu = a .+ b .* x .+ b .* u
+        y .~ Normal.(mu, sigma)
+    end, (:x, :y))
+    @test any(p -> p.name === :b, both.parameters)
 end
 
-@testset "tanh assignment: scalar admitted, dotted rejected" begin
+@testset "tanh assignment: scalar and dotted admitted" begin
     plan = lower_rkppl(quote
         phi_raw ~ Normal(0, 1)
         a ~ Normal(0, 1)
@@ -565,14 +582,19 @@ end
     @test only(a for a in plan.assignments if a.name === :phi).expr ==
         :(tanh(phi_raw))
     @test (validate_structure(plan); true)
-    # dotted `tanh.` stays fail-closed (scalar vocabulary only in v1)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # Dotted `tanh.` broadcasts the built-in itself (functions as values):
+    # an elementwise column over `x` (density: test_functions_as_values.jl).
+    dotted = lower_rkppl(quote
         a ~ Normal(0, 1)
         sigma ~ Exponential(1)
         w = tanh.(x)
         mu = a .+ w
         y .~ Normal.(mu, sigma)
     end, (:x, :y))
+    w = only(d for d in dotted.derived if d.name === :w).expr
+    @test w.head === :. && w.args[1] isa GlobalRef &&
+        w.args[1].name === :tanh && w.args[2] == Expr(:tuple, :x)
+    @test (validate_structure(dotted); true)
 end
 
 @testset "non-centered emission: fail-closed shapes" begin

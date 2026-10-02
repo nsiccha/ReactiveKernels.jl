@@ -9,6 +9,9 @@ using .AuthoredScanFixtures: authored_scan_arma, _authored_scan_reference,
     authored_scan_lazy_branch, prepared_authored_scan_nonempty
 
 _authored_scan_allocated(k, args::Vararg{Any,N}) where {N} = @allocated k(args...)
+# Specialized on a plain function's type, which Julia does not do for `k` above.
+_authored_scan_allocated_function(f::F, args::Vararg{Any,N}) where {F,N} =
+    @allocated f(args...)
 _authored_scan_mixed(x) = Base.inferencebarrier(x > 2 ? 1.5 : 1)
 
 @testset "authored scan composes with a lazy empty branch" begin
@@ -510,6 +513,48 @@ end
     batch = vectorize(F.authored_scan_history; batched = :units, want = :weights)
     @test batch(amounts, plan, U) == reduce(hcat,
         [F._authored_scan_history_reference(amounts, plan, U[:, s]) for s in 1:3])
+end
+
+@testset "nested generator folds run natively as loops" begin
+    F = AuthoredScanFixtures
+    W = [sin(a + 2b) / (a + b) for a in 1:4, b in 1:4]
+    k = (; W)
+    # The `@traceable` nest infers its element type and allocates nothing, with
+    # Base's value (on Julia 1.10 the unrewritten nest infers `Any` and boxes).
+    @test only(Base.return_types(F._scan_surface, Tuple{typeof(k),Float64,Float64})) ==
+        Float64
+    _authored_scan_allocated_function(F._scan_surface, k, 0.3, 0.8)
+    @test _authored_scan_allocated_function(F._scan_surface, k, 0.3, 0.8) == 0
+    @test F._scan_surface(k, 0.3, 0.8) === F._scan_surface_base(k, 0.3, 0.8)
+
+    # A history scan whose step calls it allocates its result vector only.
+    amounts = [2.0, 0.0, 1.5, 3.0, 1.0, 0.5, 2.5]
+    plan = F.HistoryLattice([0, 2, 3, 7, 12, 13, 18])
+    units = [exp(-0.3 * (l - 1)) for l in 1:10]
+    weights = prepare(F.authored_scan_history_surface)
+    @test weights(amounts, plan, units, k) ==
+        F._authored_scan_history_surface_reference(amounts, plan, units, k)
+    _authored_scan_allocated(weights, amounts, plan, units, k)
+    @test _authored_scan_allocated(weights, amounts, plan, units, k) ==
+        _authored_scan_allocated(similar, amounts)
+
+    # The nest written inline in a scan step and in a plate cell.
+    xs = collect(range(0.1, 1.4; length = 14))
+    expected = [F._scan_surface_base(k, x, x + 0.5) for x in xs]
+    for spec in (F.authored_scan_nested_inline, F.authored_plate_nested_inline)
+        values = prepare(spec)
+        @test values(xs, k) == expected
+        _authored_scan_allocated(values, xs, k)
+        @test _authored_scan_allocated(values, xs, k) == _authored_scan_allocated(similar, xs)
+    end
+
+    # Base's value and type: a filter, an empty range, an `Int` seed.
+    @test F._fold_filtered([1.5, -2.0, 0.25], 3) === 1.75
+    @test F._fold_filtered([1.5, -2.0, 0.25], 0) === 0
+    # Kept as written: a term that assigns, a fold over a tuple, another `sum`.
+    @test F._fold_assigning([1.0, 2.0]) === 5.0
+    @test F._fold_tuple((1, 2.5)) === 3.5
+    @test F.OwnSum.total([1.0, 2.0]) === -1.0
 end
 
 @testset "history scan contract" begin

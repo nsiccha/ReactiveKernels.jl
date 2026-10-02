@@ -300,8 +300,18 @@ end
     reject(:(mu = dar(beta, sigmad)))
     # two dar calls in one predictor (one per predictor in v1)
     reject(:(mu = a .+ dar(beta, sigmad) .+ dar(beta, sigmad)))
-    # a dar parameter as a population coefficient too
-    reject(:(mu = a .+ beta .* x .+ dar(beta, sigmad)))
+    # a dar parameter read as a computed coefficient is an ordinary
+    # parameter scaling a derived column (density: test_fallback.jl)
+    dplan = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        beta ~ truncated(Normal(0.5, 0.2), 0, 1)
+        sigmad ~ HalfNormal(0.2)
+        sigma ~ Exponential(1)
+        mu = a .+ beta .* x .+ dar(beta, sigmad)
+        y .~ Normal.(mu, sigma)
+    end, (:x, :y))
+    @test :beta in Set(p.name for p in dplan.parameters)
+    @test only(dplan.derived).expr == :(beta .* x)
     # bare dar-state name (splices via its call, not as a coefficient)
     reject(:(mu = a .+ dar(beta, sigmad) .+ dar_mu))
 

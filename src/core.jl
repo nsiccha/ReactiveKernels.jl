@@ -162,8 +162,24 @@ end
     forwarded = [:(getfield(args, $index)) for index in 1:N]
     :(op.tensor_f($(forwarded...)))
 end
-@inline (op::_KernelSourceOp)(args::Vararg{Any,N}) where {N} =
-    _kernel_source_call(_kernel_source_style(args), op, args...)
+# The entry call forwards positionally too, and folds the style the same way
+# `_kernel_source_style` does but spelled out per argument (that function
+# recurses through `Base.tail`, itself a splat). Julia's inliner rewrites an
+# `args...` splat into a direct call only up to 32 elements
+# (`max_tuple_splat`, 1.10 and 1.12 alike); past that the call stays a dynamic
+# `Core._apply_iterate`, codegen materializes the arguments in one tuple, and
+# Enzyme meets a constant array stored next to active values: a 32-argument
+# module call with a bound data vector failed reverse mode with
+# `EnzymeRuntimeActivityError` (snag `rkppl-module-cal-79cad594`).
+@inline @generated function (op::_KernelSourceOp)(args::Vararg{Any,N}) where {N}
+    style = :(Val(:native))
+    for index in N:-1:1
+        style = :(_kernel_source_merge(
+            _kernel_source_arg_style(getfield(args, $index)), $style))
+    end
+    forwarded = [:(getfield(args, $index)) for index in 1:N]
+    :(_kernel_source_call($style, op, $(forwarded...)))
+end
 kernel_sourceop_token(::_KernelSourceOp{DefToken}) where {DefToken} = DefToken
 kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = Form
 # Tensorized fused bodies may mix untraced constant arrays with traced operands.
@@ -792,8 +808,12 @@ one against the native one.
 # (`_loop_capture_traced`): `@trace` writes each loop result back into every
 # traced object the body reads, so the caller's own tracer would be rebound
 # and returned as an aliased program output, which XLA export rejects for a
-# zero-sized one.  Without a tracing backend the wrapper is opened again at
-# every use and nothing else changes.
+# zero-sized one.  A partly traced tuple or named tuple (a model holding
+# traced scalars beside a host matrix) is opened leaf by leaf, so its host
+# leaves cross wrapped too: handed bare to the tracer, a host matrix became a
+# matrix of traced scalars, one loop argument per element, which a traced
+# index cannot gather.  Without a tracing backend the wrapper is opened again
+# at every use and nothing else changes.
 struct _LoopHostValue{T}
     value::T
 end
@@ -802,8 +822,10 @@ ReactantCore.is_traced(::_LoopHostValue, ::Base.IdSet) = false
 @inline _loop_capture(x) =
     ReactantCore.is_traced(x) ? _loop_capture_traced(x) : _LoopHostValue(x)
 _loop_capture_traced(x) = x
+_loop_capture_traced(x::Union{Tuple,NamedTuple}) = map(_loop_capture, x)
 @inline _loop_open(x) = x
 @inline _loop_open(x::_LoopHostValue) = x.value
+@inline _loop_open(x::Union{Tuple,NamedTuple}) = map(_loop_open, x)
 
 # A carried local of a retained loop, re-bound just before the loop.  When
 # anything the loop reads is traced (the `witnesses`: its captures and its

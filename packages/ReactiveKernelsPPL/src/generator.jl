@@ -49,12 +49,19 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     isbound(plan) || throw(ContractValidationError(
         "[generator] kernel_expr requires a bound plan (bind_data first)"))
     stmts = Expr[]
+    # Level gathers (`z[g]` over a `levels(h)` axis) read level-code
+    # vectors; collect them from every expression before emitting.
+    gathers = Set{Tuple{Symbol,Symbol}}()
+    assigns = _assignment_statements(plan; gathers)
+    priors = _prior_statements(plan, layout; gathers)
     _each_layout_unit(plan, layout) do unit
         append!(stmts, unit isa LayoutEntry ? transform_statements(unit) :
             _stratified_transform_statements(unit, layout))
     end
     append!(stmts, _coef_reassembly_statements(plan, layout))
-    append!(stmts, _assignment_statements(plan))
+    append!(stmts, _array_value_statements(plan))
+    append!(stmts, _array_level_index_statements(plan, gathers))
+    append!(stmts, assigns)
     append!(stmts, preprocessing_recipes(plan))
     append!(stmts, _varying_statements(plan))
     append!(stmts, _hsgp_basis_statements(plan))
@@ -64,7 +71,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _event_lp_statements(plan))
     append!(stmts, _likelihood_statements(plan))
-    append!(stmts, _prior_statements(plan, layout))
+    append!(stmts, priors)
     push!(stmts, _log_jacobian_statement(plan, layout))
     push!(stmts, :(posterior::Float64 = prior + likelihood + log_jacobian))
     push!(stmts, :(return posterior))
@@ -182,7 +189,8 @@ end
 # above, so every scalar name resolves; derived columns resolve as locals
 # for the recipes below). Unannotated: Int temporaries (e.g. `length`)
 # must not meet a Float64 assertion.
-function _assignment_statements(plan::StructuralPlan)
+function _assignment_statements(plan::StructuralPlan;
+        gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}())
     by_name = Dict{Symbol,Any}(a.name => a for a in plan.assignments)
     for d in plan.derived
         by_name[d.name] = d
@@ -190,7 +198,8 @@ function _assignment_statements(plan::StructuralPlan)
     # Data definitions calling module functions were evaluated once at
     # bind and arrive as data arguments; the kernel never recomputes them.
     computed = _bound_module_data_names(plan)
-    return Expr[:($(name) = $(by_name[name].expr))
+    return Expr[:($(name) =
+            $(_array_gather_rewrite(by_name[name].expr, plan, gathers)))
         for name in topological_order(plan)
         if haskey(by_name, name) && name ∉ computed]
 end
@@ -3062,12 +3071,15 @@ _bind_plate_prior_arg!(stmts::Vector{Expr}, name::Symbol,
     v::Vector{Float64}) = push!(stmts, :($name = Float64[$(v...)]))
 _bind_plate_prior_arg!(stmts::Vector{Expr}, name::Symbol, v::Symbol) =
     push!(stmts, :($name = $v))
+# A per-element lane mixing literals and names (`Normal.(0, [s1, 2.0])`):
+# one in-graph vector over the constrained names.
+_bind_plate_prior_arg!(stmts::Vector{Expr}, name::Symbol, v::Vector{Any}) =
+    push!(stmts, :($name = [$(v...)]))
 
 # Collapse one prior-arg position across a block's rows to its plate
 # lane: all-literal rows give the literal lane vector; rows sharing one
-# hyper name give the name; anything else (mixed literal/hyper,
-# disagreeing hypers) is a loud internal error — the surface admits
-# shared hypers on factor broadcasts only.
+# hyper name give the name; per-element names (or names mixed with
+# literals) give one element per row.
 function _plate_prior_lane(rows::Vector{PopulationPrior}, field::Symbol,
         what::String)
     vals = map(r -> getfield(r, field), rows)
@@ -3075,15 +3087,13 @@ function _plate_prior_lane(rows::Vector{PopulationPrior}, field::Symbol,
         return Float64[v for v in vals]
     all(v -> v isa Symbol, vals) && allequal(vals) &&
         return vals[1]
-    throw(ContractValidationError(
-        "[generator] internal: $what mixes literal and hyperparameter " *
-        "priors across one coefficient block (shared hypers ride " *
-        "factor broadcasts only)"))
+    return Any[v isa Symbol ? v : Float64(v) for v in vals]
 end
 
 function _append_coef_plate!(stmts::Vector{Expr}, coefaccess::Any,
         node::Symbol, pw::Symbol, mut::Symbol, sdt::Symbol, nut::Symbol,
-        loc::Union{Vector{Float64},Symbol}, sca::Union{Vector{Float64},Symbol},
+        loc::Union{Vector{Float64},Symbol,Vector{Any}},
+        sca::Union{Vector{Float64},Symbol,Vector{Any}},
         nus::Vector{Float64}, fam::Symbol)
     fam === :flat && throw(ContractValidationError(
         "[generator] internal: flat coefficients contribute no plate"))
@@ -3104,10 +3114,15 @@ function _append_coef_plate!(stmts::Vector{Expr}, coefaccess::Any,
     return nothing
 end
 
-# Endpoint args for one population row (literals): StudentT carries nu.
+# Endpoint args for one population row: a literal, or a parameter /
+# assignment name read as its constrained local (transforms and
+# assignments precede the prior statements). StudentT carries nu.
+_prior_endpoint(v::Symbol) = v
+_prior_endpoint(v::Real) = Float64(v)
 _population_endpoint_args(pr::PopulationPrior) = pr.family === :student_t ?
-    Any[Float64(pr.nu), Float64(pr.location), Float64(pr.scale)] :
-    Any[Float64(pr.location), Float64(pr.scale)]
+    Any[Float64(pr.nu), _prior_endpoint(pr.location),
+        _prior_endpoint(pr.scale)] :
+    Any[_prior_endpoint(pr.location), _prior_endpoint(pr.scale)]
 
 # Per-addressee emission for a MIXED predictor (the homogeneous fast path
 # in `_prior_statements` keeps today's exact plate): width-1 blocks become
@@ -3145,12 +3160,6 @@ function _mixed_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             # block (a `continue` here would misalign every later
             # read).
             if pr.family !== :flat
-                (pr.location isa Real && pr.scale isa Real) ||
-                    throw(ContractValidationError(
-                        "[generator] internal: scalar coefficient " *
-                        "$(b.addressee) of $(pred.name) carries a " *
-                        "hyperparameter prior (shared hypers ride " *
-                        "factor broadcasts only)"))
                 node = Symbol(:_ppl_prior_, pred.name, :_, b.addressee)
                 expr = _family_logpdf_expr(pr.family,
                     _population_endpoint_args(pr),
@@ -3187,7 +3196,8 @@ function _mixed_wide_block_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     return nothing
 end
 
-function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
+function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
+        gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}())
     stmts = Expr[]
     terms = Any[]
     for pred in plan.predictors
@@ -3430,6 +3440,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable)
     darstmts, darnodes = _dar_prior_statements(plan, layout)
     append!(stmts, darstmts)
     append!(terms, darnodes)
+    # Declared array parameters (`arrays.jl`).
+    _array_prior_stmts!(stmts, terms, plan, gathers)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
     push!(stmts, :(prior::Float64 = $joint))
     return stmts

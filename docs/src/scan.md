@@ -243,6 +243,15 @@ plus 8,160 B for its gathered matrix. In that step a broadcast
 about 7 µs over the 14 doses. A scan step runs its statements as written, so a
 per-step broadcast allocates every step.
 
+A nested reduction is the exception. Natively, a generator fold over a
+data-length iterator in the step, or in a `@traceable` helper the step calls,
+runs as its explicit loop (the [compiler](compiler.md) page, "Lowering and
+emitted ABI"). With the 4 × 4 surface written as a nested generator sum in a
+`@traceable` helper, the 14-dose step allocates its result vector only (176 B,
+synthetic step, Julia 1.10.11). Written in a plain helper, the same nest is
+left to Base's `sum`, which Julia 1.10 infers as `Any`: 6,208 B per call, the
+same as a hand-written loop calling that helper.
+
 Under Reactant the result buffer is the `while` loop's output buffer, filled
 with `h₀` before the loop; each step reads it before its own output is written.
 The step's sum over `1:j-1` is one retained loop with a traced bound (a
@@ -327,12 +336,13 @@ using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
   unchanged, field by field for a tuple or named tuple. So a host schedule
   plan (a struct holding a `Vector{Int}`) reaches the step as itself, and a
   host matrix or `Int` in a partly traced model stays host instead of becoming
-  traced scalars. The carry — scalar, `NamedTuple`, or vector — is
-  threaded as a loop-carried value, the per-step outputs are written into a
-  preallocated traced buffer with a dynamic-update-slice, and the first step
-  runs eagerly to seed the carry and fix the output element type (`N == 1`
-  runs with an empty loop body). The emitted program is independent of the
-  sequence length and of the row width, as the [core
+  traced scalars, in the step and in the retained loops of a `@traceable`
+  helper the step passes the model to. The carry — scalar, `NamedTuple`, or
+  vector — is threaded as a loop-carried value, the per-step outputs are
+  written into a preallocated traced buffer with a dynamic-update-slice, and
+  the first step runs eagerly to seed the carry and fix the output element
+  type (`N == 1` runs with an empty loop body). The emitted program is
+  independent of the sequence length and of the row width, as the [core
   constraints](constraints.md) require; native and Reactant results match to
   floating-point tolerance (see `test/test_authored_scan_reactant.jl` and
   `test/test_ppl_examples_reactant.jl`). A scan whose every operand is host

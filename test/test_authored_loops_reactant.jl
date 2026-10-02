@@ -175,3 +175,67 @@ end
     compiled_step = Reactant.@compile kstep(_traced(x), _traced(0.5))
     @test _host(compiled_step(_traced(x), _traced(0.5))) ≈ kstep(x, 0.5)
 end
+
+# A data-length generator sum's index is traced, so an element read with one
+# index per dimension is a gather at traced indices: `W[i, j]` over a bound
+# host table and over a traced matrix, and `W[i, 1]` with one concrete index
+# (snag 2-d-traced-index-b107cbfc; before, only a vector read lowered and
+# these failed with `Scalar indexing is disallowed`).
+@kernel table_quadratic(W, x::Vector{Float64}) = begin
+    total::Float64 = sum(sum(x[i] * W[i, j] * x[j] for i in axes(W, 1); init = 0.0)
+                         for j in axes(W, 2); init = 0.0)
+    column::Float64 = sum(W[i, 1] * x[i] for i in axes(W, 1); init = 0.0)
+    return total
+end
+
+# A loop reading a partly traced named tuple keeps its host leaves host: the
+# matrix crosses the loop as itself, not as a matrix of traced scalars.
+@kernel model_quadratic(W, scale::Float64, x::Vector{Float64}) = begin
+    model = (; W, scale)
+    total::Float64 = sum(sum(model.scale * x[i] * model.W[i, j] * x[j]
+                             for i in axes(model.W, 1); init = 0.0)
+                         for j in axes(model.W, 2); init = 0.0)
+    return total
+end
+
+@testset "a 2-D read at traced loop indices is one gather" begin
+    for want in (:total, :column)
+        sizes = Int[]
+        for m in (3, 6)
+            W = [sin(a + 2b) / (a + b) for a in 1:m, b in 1:m]
+            x = collect(range(-1.0, 1.0; length = m))
+            k = prepare(table_quadratic; want)
+            native = k(W, x)
+            bound = prepare(table_quadratic; want, bound = (; W))
+            @test _host((Reactant.@compile bound(_traced(x)))(_traced(x))) ≈ native
+            @test _host((Reactant.@compile k(_traced(W), _traced(x)))(
+                _traced(W), _traced(x))) ≈ native
+            hlo = repr(Reactant.@code_hlo optimize = false bound(_traced(x)))
+            @test count("stablehlo.while", hlo) == (want === :total ? 2 : 1)
+            push!(sizes, count("\n", hlo))
+        end
+        # Twice the matrix side, the same program.
+        @test allequal(sizes)
+    end
+
+    k = prepare(model_quadratic)
+    W = [sin(a + 2b) / (a + b) for a in 1:4, b in 1:4]
+    x = [0.5, -1.0, 2.0, 0.25]
+    compiled = Reactant.@compile k(W, _traced(1.5), _traced(x))
+    @test _host(compiled(W, _traced(1.5), _traced(x))) ≈ k(W, 1.5, x)
+    @test _host(compiled(W, _traced(-0.5), _traced(x))) ≈ k(W, -0.5, x)
+
+    # Reverse through the gathers, against central differences.
+    h = 1e-6
+    fd_x = [(e = zeros(4); e[c] = h; (k(W, 1.5, x .+ e) - k(W, 1.5, x .- e)) / 2h)
+            for c in 1:4]
+    gradient_x(v) = Enzyme.gradient(Enzyme.Reverse, Enzyme.Const(w -> k(W, 1.5, w)), v)
+    @test isapprox(_host(only((Reactant.@compile gradient_x(_traced(x)))(_traced(x)))),
+                   fd_x; rtol = 1e-6)
+    t = prepare(table_quadratic)
+    fd_W = [(E = zeros(4, 4); E[c] = h; (t(W .+ E, x) - t(W .- E, x)) / 2h)
+            for c in CartesianIndices(W)]
+    gradient_W(w) = Enzyme.gradient(Enzyme.Reverse, Enzyme.Const(v -> t(v, x)), w)
+    @test isapprox(_host(only((Reactant.@compile gradient_W(_traced(W)))(_traced(W)))),
+                   fd_W; rtol = 1e-6)
+end

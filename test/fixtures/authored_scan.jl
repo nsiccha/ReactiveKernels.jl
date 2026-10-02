@@ -129,11 +129,111 @@ function _authored_scan_history_reference(amounts, plan, units)
         amounts[j] == 0 && continue
         exposure = 0.0
         for i in 1:j-1
-            exposure += weights[i] * get(units, plan.shifts[j] - plan.shifts[i] + 1, 0.0)
+            exposure += weights[i] * get(units, _history_lag(plan, j, i), 0.0)
         end
         weights[j] = amounts[j] / (1 + exposure)
     end
     weights
+end
+
+# The same lags stored as a 2-D host table (`lags[j, i]`, the stored-row plan
+# of the dose-feedback shape): under a tracing backend the scan's `j` and the
+# sum's `i` are both traced, so the read is a gather at two traced indices.
+struct HistoryTable
+    lags::Matrix{Int}
+end
+HistoryTable(p::HistoryLattice) = HistoryTable(
+    [i < j ? p.shifts[j] - p.shifts[i] + 1 : 0
+     for j in eachindex(p.shifts), i in eachindex(p.shifts)])
+ReactiveKernels.@traceable _history_lag(p::HistoryTable, j, i) = p.lags[j, i]
+
+# A step reading a partly traced named tuple: its scale is traced and its
+# matrix may stay host. A `@traceable` helper sums over both axes of the
+# matrix, each sum a retained loop with a traced index, so `k.W[i, j]` is a
+# gather at two traced indices; the host matrix must cross both loops as a host
+# value, not as a matrix of traced scalars.
+ReactiveKernels.@traceable _scan_surface(k, a, b) =
+    sum((sum((sin(a * i) * k.W[i, j] for i in axes(k.W, 1)); init = 0.0) * sin(b * j)
+         for j in axes(k.W, 2)); init = 0.0)
+
+@kernel authored_scan_surface(W, scale::Float64, xs::Vector{Float64}) = begin
+    model = (; W, scale)
+    ys::Vector{Float64} = scan(xs, Ref(model); init = 0.0) do carry, x, k
+        value = k.scale * _scan_surface(k, x, x + 0.5)
+        (carry + value, value)
+    end
+    total::Float64 = sum(ys)
+    return ys
+end
+
+# Nested generator folds natively.  Julia 1.10 infers a Base fold reached while
+# inferring another fold's term as `Any`, so a nested sum dispatches and boxes
+# per element; RK runs every authored data-length fold as its loop instead.
+# `_scan_surface_base` is the same nest as an ordinary (unrewritten) function:
+# Base's value, for bitwise comparison.
+_scan_surface_base(k, a, b) =
+    sum((sum((sin(a * i) * k.W[i, j] for i in axes(k.W, 1)); init = 0.0) * sin(b * j)
+         for j in axes(k.W, 2)); init = 0.0)
+
+# The dose-feedback shape whose effective amount reads the nested-sum surface.
+@kernel authored_scan_history_surface(amounts::Vector{Float64}, plan,
+                                      units::Vector{Float64}, k) = begin
+    weights::Vector{Float64} = scan(amounts, eachindex(amounts), Ref(plan), Ref(units), Ref(k);
+            init = 0, history = 0.0) do carry, amount, j, p, u, k, earlier
+        exposure = sum(earlier[i] * get(u, _history_lag(p, j, i), 0.0)
+                       for i in 1:j-1; init = 0.0)
+        weight = amount == 0 ? 0.0 :
+            amount / (1 + exposure * (1 + _scan_surface(k, amount, exposure)^2))
+        (carry + 1, weight)
+    end
+    return weights
+end
+
+function _authored_scan_history_surface_reference(amounts, plan, units, k)
+    weights = zeros(length(amounts))
+    for j in eachindex(amounts)
+        amounts[j] == 0 && continue
+        exposure = 0.0
+        for i in 1:j-1
+            exposure += weights[i] * get(units, _history_lag(plan, j, i), 0.0)
+        end
+        weights[j] = amounts[j] /
+            (1 + exposure * (1 + _scan_surface_base(k, amounts[j], exposure)^2))
+    end
+    weights
+end
+
+# The same nest written inline in a scan step and in a plate cell.
+@kernel authored_scan_nested_inline(xs::Vector{Float64}, k) = begin
+    ys::Vector{Float64} = scan(xs, Ref(k); init = 0.0) do carry, x, k
+        value = sum((sum((sin(x * i) * k.W[i, j] for i in axes(k.W, 1)); init = 0.0) *
+                     sin((x + 0.5) * j) for j in axes(k.W, 2)); init = 0.0)
+        (carry + value, value)
+    end
+    return ys
+end
+
+@kernel authored_plate_nested_inline(xs::Vector{Float64}, k) = begin
+    ys::Vector{Float64} = plate(xs, Ref(k)) do x, k
+        sum((sum((sin(x * i) * k.W[i, j] for i in axes(k.W, 1)); init = 0.0) *
+             sin((x + 0.5) * j) for j in axes(k.W, 2)); init = 0.0)
+    end
+    return ys
+end
+
+# Folds the native rewrite leaves to Base: a filter over an empty range and an
+# `Int` seed with `Float64` terms (rewritten; Base's value and type), a term
+# that assigns, and a fold over a tuple (both kept as written).
+ReactiveKernels.@traceable _fold_filtered(x, n) = sum(x[i] for i in 1:n if x[i] > 0; init = 0)
+ReactiveKernels.@traceable _fold_assigning(x) =
+    sum((y = x[i]; y * y) for i in eachindex(x); init = 0.0)
+ReactiveKernels.@traceable _fold_tuple(t) = sum(v for v in t; init = 0)
+
+# A module whose own `sum` is not Base's keeps its call.
+module OwnSum
+using ReactiveKernels
+sum(itr; init) = -1.0
+ReactiveKernels.@traceable total(x) = sum(x[i] for i in eachindex(x); init = 0.0)
 end
 
 # A plain scan sharing a host struct and a host named tuple by `Ref`: under a
