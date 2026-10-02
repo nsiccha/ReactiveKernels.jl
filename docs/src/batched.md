@@ -97,8 +97,8 @@ A reduction over a short inner axis can say what it means. The concentration
 from a few doses is the sum over the doses already given,
 `sum(w[j] * u[t - s[j]] for j in eachindex(s) if t > s[j]; init = 0.0)`, or,
 with the unit response extended by zero before its dose,
-`sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(s); init = 0.0)`. Both run
-as written natively. Under a tracing backend the sum over `eachindex(s)` is one
+`sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(s); init = 0.0)`. Natively
+both are the authored fold. Under a tracing backend the sum over `eachindex(s)` is one
 retained loop, so the program does not grow with the dose count, and the
 filter and the in-range test of `get` stay lazy branches: an out-of-range lag
 is never read. A filtered sum needs its `init`, because a traced condition

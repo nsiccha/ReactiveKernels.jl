@@ -1,8 +1,8 @@
 # Closed-form two-compartment unit response with Gamma-transit input.
 #
-# This replaces the per-subject-per-treatment `ode_bdf_tol` unit solve of the
-# varyingsource family (a StanBlocks `twocmt` + `transit_source` reference
-# program) with the exact closed form: a two-exponential
+# This replaces the per-subject-per-treatment `ode_bdf_tol` unit solve of a
+# StanBlocks `twocmt` + `transit_source` reference program with the exact
+# closed form: a two-exponential
 # disposition convolved with the Gamma-PDF input. The Stan program integrates
 # the forced 2-state system numerically (tol 1e-6/1e-6, max 10000 steps) with
 # full sensitivities; no canned analytic solver covers the
@@ -143,7 +143,7 @@ end
 
 Central-compartment amount at lag `t ≥ 0` for a unit dose at `t = 0` under
 the twocmt + Gamma-transit dynamics — the exact closed form of the
-varyingsource unit solve. All arguments are positive constants with
+reference program's unit solve. All arguments are positive constants with
 `shape ≥ 1` (`shape = 1 + rate*mode` in StanBlocks `params`). Native Enzyme
 reverses through the convergence-capped loops. Reactant primal execution
 retains those loops and the lazy numerical regimes.
