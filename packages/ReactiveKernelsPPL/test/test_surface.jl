@@ -14,9 +14,63 @@ using Test
 # Helpers from the earlier includes (_gen_columns, _ref_gaussian,
 # _ref_bernoulli, _query, _check_gradient, _unbind, _none_evidence) are reused.
 
-# Type-exact structural plan equality (Base == is egal on the mutable
-# containers; Exprs compare by repr).
+# Existing hand-inlined twins use underscore names. Compare their math
+# after a test-only alpha rename; production scopes never flatten paths.
+# Ambiguous flattened paths are rejected here and exercised independently
+# by test_scoped_submodels.jl. Scope metadata itself has dedicated tests.
+function _test_scope_renames(scopes)
+    out = Dict{Symbol,Symbol}()
+    claimed = Dict{Symbol,Symbol}()
+    for scope in scopes, (local_name, id) in scope.locals
+        id === scope.binding && continue # directly bound per-cell slot
+        name = Symbol(join(string.((scope.path..., local_name)), "_"))
+        haskey(claimed, name) && claimed[name] !== id &&
+            error("ambiguous test-only flattened scope $name")
+        claimed[name] = id
+        out[id] = name
+    end
+    return out
+end
+function _test_scope_alpha(x, names)
+    if x isa Union{Symbol,AbstractString}
+        text = string(x)
+        for id in sort!(collect(keys(names)); by = id -> -length(string(id)))
+            text = replace(text, string(id) => string(names[id]))
+        end
+        return x isa Symbol ? Symbol(text) : text
+    elseif x isa Expr
+        return Expr(x.head, [_test_scope_alpha(a, names) for a in x.args]...)
+    elseif x isa QuoteNode
+        return QuoteNode(_test_scope_alpha(x.value, names))
+    elseif x isa NamedTuple
+        return NamedTuple{keys(x)}(map(v -> _test_scope_alpha(v, names), values(x)))
+    elseif x isa AbstractRange
+        return x
+    elseif x isa Tuple || x isa AbstractArray
+        return map(v -> _test_scope_alpha(v, names), x)
+    elseif x isa AbstractDict
+        return typeof(x)(_test_scope_alpha(k, names) => _test_scope_alpha(v, names)
+            for (k, v) in x)
+    elseif parentmodule(typeof(x)) === ReactiveKernelsPPL &&
+            isstructtype(typeof(x)) && fieldcount(typeof(x)) > 0
+        return typeof(x)((_test_scope_alpha(getfield(x, f), names)
+            for f in fieldnames(typeof(x)))...)
+    end
+    return x
+end
+function _test_scope_math(plan::StructuralPlan)
+    names = _test_scope_renames(plan.submodel_scopes)
+    isempty(names) && return ReactiveKernelsPPL._with(plan; submodel_scopes = SubmodelScope[])
+    plain = ReactiveKernelsPPL._with(plan; submodel_scopes = SubmodelScope[])
+    return _test_scope_alpha(plain, names)
+end
+_test_scope_name(plan, id) = get(_test_scope_renames(plan.submodel_scopes), id, id)
 _plans_equal(a::StructuralPlan, b::StructuralPlan) =
+    _plans_equal_flat(_test_scope_math(a), _test_scope_math(b))
+
+# Type-exact equality after the alpha rename (Base == is egal on mutable
+# containers; Exprs compare by repr).
+_plans_equal_flat(a::StructuralPlan, b::StructuralPlan) =
     length(a.responses) == length(b.responses) &&
     all(_resps_equal.(a.responses, b.responses)) &&
     length(a.predictors) == length(b.predictors) &&
@@ -3781,7 +3835,7 @@ end
     @test _plans_equal(got, want)
 
     # Namespacing under the LHS: the submodel local `r` becomes `sig_r`.
-    @test any(p -> p.name === :sig_r, got.parameters)
+    @test any(p -> _test_scope_name(got, p.name) === :sig_r, got.parameters)
     @test !any(p -> p.name === :r, got.parameters)
 
     # An explicit trailing `return` lowers identically to the implicit form.
@@ -3831,8 +3885,8 @@ end
         eta = a .+ b .* x
         y .~ Normal.(eta, s1)
     end, (:y, :x); mod = @__MODULE__)
-    @test any(p -> p.name === :s1_r, two.parameters)
-    @test any(p -> p.name === :s2_r, two.parameters)
+    @test any(p -> _test_scope_name(two, p.name) === :s1_r, two.parameters)
+    @test any(p -> _test_scope_name(two, p.name) === :s2_r, two.parameters)
 
     # End-to-end: the submodel program binds, builds and queries identically
     # to the hand-inlined program (equal plans ⇒ equal kernel/value/gradient).
@@ -3984,9 +4038,9 @@ end
     @test length(got.responses) == 1
     @test got.responses[1].family === GaussianFam
     @test got.responses[1].response === :y
-    @test got.responses[1].predictor === :y_eta
-    @test got.responses[1].scale === :y_s
-    @test any(p -> p.name === :y_s, got.parameters)
+    @test _test_scope_name(got, got.responses[1].predictor) === :y_eta
+    @test _test_scope_name(got, got.responses[1].scale) === :y_s
+    @test any(p -> _test_scope_name(got, p.name) === :y_s, got.parameters)
 
     # An explicit `return slot` reads as the stream response pointer, exactly
     # like the implicit trailing symbol.
@@ -4006,8 +4060,8 @@ end
         y2 ~ obs_offstream(o2)
     end, (:y1, :y2, :o1, :o2); mod = @__MODULE__)
     @test Set(r.response for r in two.responses) == Set([:y1, :y2])
-    @test any(p -> p.name === :y1_s, two.parameters)
-    @test any(p -> p.name === :y2_s, two.parameters)
+    @test any(p -> _test_scope_name(two, p.name) === :y1_s, two.parameters)
+    @test any(p -> _test_scope_name(two, p.name) === :y2_s, two.parameters)
 
     # End-to-end: the stream program binds, builds and queries identically to
     # the hand-inlined program (equal plans ⇒ equal kernel/value/gradient).
@@ -4133,7 +4187,7 @@ end
         b ~ Normal(0, 2)
         y ~ pin_fused(x, b)
     end, (:y, :x); mod = @__MODULE__)
-    @test only(unp.predictors).name === :y_mu
+    @test _test_scope_name(unp, only(unp.predictors).name) === :y_mu
     unpi = lower_rkppl(quote
         b ~ Normal(0, 2)
         y ~ pin_inline(x, b)
@@ -4354,7 +4408,7 @@ _pcs(cells...) = Expr(:block,
                              :(theta[i] = mu .+ tau .* theta_z[i]),
                              :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x))
     @test _plans_equal(subn, handn)
-    @test [p.name for p in subn.plate_parameters] == [:theta_z]  # namespaced local
+    @test [_test_scope_name(subn, p.name) for p in subn.plate_parameters] == [:theta_z]
     @test isempty(subn.derived)
     @test [t.kind for t in only(subn.predictors).terms] ==
         [InterceptTerm, ContinuousTerm]
@@ -4363,7 +4417,7 @@ _pcs(cells...) = Expr(:block,
     built = build_kernel(bound)
     u = [0.3, -0.2, 0.1, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]
     nt = constrain(built.layout, u)
-    mu, sigma, tau, z = nt.mu, nt.sigma, nt.tau, Vector(nt.theta_z)
+    mu, sigma, tau, z = nt.mu, nt.sigma, nt.tau, Vector(nt.theta.z)
     theta = mu .+ tau .* z
     ll = sum(logpdf.(Normal.(theta, sigma), cols[:y]))
     pr = logpdf(Normal(0, 5), mu) + logpdf(Exponential(1), sigma) +
@@ -4385,7 +4439,7 @@ _pcs(cells...) = Expr(:block,
     builtv = build_kernel(bv)
     uv = [-0.1, -0.2, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]  # logtau, logsigma, theta[1:6]
     ntv = constrain(builtv.layout, uv)
-    tauv, sigmav, thetav = ntv.tau, ntv.sigma, Vector(ntv.theta)
+    tauv, sigmav, thetav = ntv.tau, ntv.sigma, Vector(ntv.theta.v)
     llv = sum(logpdf.(Normal.(thetav, sigmav), cols[:y]))
     prv = logpdf(Exponential(1), tauv) + logpdf(Exponential(1), sigmav) +
         sum(logpdf.(Normal.(cols[:x], tauv), thetav))
@@ -4408,19 +4462,19 @@ _pcs(cells...) = Expr(:block,
                            :(c[i] ~ pcs_ncp(mu, tau)),
                            :(s[i] = a[i] .+ c[i]),
                            :(y[i] ~ Normal.(s[i], sigma))), (:y, :x); mod = M)
-    @test Set(p.name for p in two.plate_parameters) == Set([:a_z, :c_z])
+    @test Set(_test_scope_name(two, p.name) for p in two.plate_parameters) == Set([:a_z, :c_z])
 
     # ── Observation-stream submodel on a DATA column: own per-cell offset +
     # derived location + dotted obs slot (shared scalar scale).
     subo = lower_rkppl(_pcs(:(y[i] ~ pcs_obs(mu, sigma))), (:y, :x); mod = M)
-    @test only(subo.plate_parameters).name === :y_b
-    @test :y_q in [d.name for d in subo.derived]
+    @test _test_scope_name(subo, only(subo.plate_parameters).name) === :y_b
+    @test :y_q in [_test_scope_name(subo, d.name) for d in subo.derived]
     @test only(subo.predictors).terms[1].kind === LatentTerm
     bo = bind_data(subo, cols)
     builto = build_kernel(bo)
     uo = [0.3, -0.2, 0.05, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]  # mu, logsig, logtau, y_b[1:6]
     nto = constrain(builto.layout, uo)
-    b = Vector(nto.y_b)
+    b = Vector(nto.y.b)
     q = nto.mu .+ b
     llo = sum(logpdf.(Normal.(q, nto.sigma), cols[:y]))
     pro = logpdf(Normal(0, 5), nto.mu) + logpdf(Exponential(1), nto.sigma) +
@@ -4432,7 +4486,7 @@ _pcs(cells...) = Expr(:block,
     # ── Explicit-`return` per-cell observation slot == the implicit twin.
     subor = lower_rkppl(_pcs(:(y[i] ~ pcs_obs_ret(mu, sigma))), (:y, :x); mod = M)
     @test _plans_equal(subor, subo)
-    @test only(subor.plate_parameters).name === :y_b
+    @test _test_scope_name(subor, only(subor.plate_parameters).name) === :y_b
 end
 
 @testset "surface plate per-cell submodels failures" begin
@@ -4448,7 +4502,8 @@ end
     @test _plans_equal(lower_rkppl(
         _pcs(:(theta[i] ~ pcs_nested(tau)),
              :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M),
-        lower_rkppl(_pcs(:(theta[i] ~ Normal(0, tau)),
+        lower_rkppl(_pcs(:(theta_s[i] ~ Normal(0, tau)),
+             :(theta[i] = theta_s[i]),
              :(y[i] ~ Normal.(theta[i], sigma))), D))
     # No trailing return expression.
     # refused: submodel used as a value has no return expression

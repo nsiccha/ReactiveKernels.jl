@@ -440,7 +440,8 @@ function _mentions_array(ex, plan::StructuralPlan,
     end
     ex isa Expr || return false
     _level_plate_axis(ex) === nothing || return true
-    return any(a -> _mentions_array(a, plan, seen), ex.args)
+    return any(a -> _mentions_array(ex.head === :tuple ?
+        _tuple_field_value(a) : a, plan, seen), ex.args)
 end
 
 # An assignment computed from array parameters (`M = (sd .* L)'`) is an
@@ -743,6 +744,13 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
     _is_plate_column_expr(ex) &&
         return _collect_plate_column_refs!(refs, ex, plan, label, bound)
     head = ex.head
+    if head === :tuple || head === :vect
+        for a in ex.args
+            head === :tuple && (a = _tuple_field_value(a))
+            _collect_array_value_refs!(refs, a, plan, label, bound)
+        end
+        return nothing
+    end
     if head === :ref
         _collect_array_ref!(refs, ex, plan, label, bound;
             allow_gather = false) || _fail(label, "indexing `$(repr(ex))` " *

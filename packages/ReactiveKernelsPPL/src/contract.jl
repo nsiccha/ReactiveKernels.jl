@@ -1686,6 +1686,24 @@ struct DesignMatrix
     label::Symbol
 end
 
+"""A lexical submodel call: its authored path, return-value binding, and
+local bindings. Identifiers are private plan names; `path` and local keys
+are author names. A per-cell call owns arrays of its scalar local values."""
+struct SubmodelScope
+    path::Tuple{Vararg{Symbol}}
+    binding::Symbol
+    locals::Dict{Symbol,Symbol}
+    per_cell::Bool
+end
+
+function _scope_name_paths(scopes::Vector{SubmodelScope})
+    paths = Dict{Symbol,Tuple{Vararg{Symbol}}}()
+    for scope in scopes, (local_name, identifier) in scope.locals
+        paths[identifier] = (scope.path..., local_name)
+    end
+    return paths
+end
+
 """
     StructuralPlan(responses, predictors, population_priors, parameters,
                    assignments, derived, columns, n_obs)
@@ -1704,7 +1722,8 @@ varying-effect draws blocks plus their per-target applications, and
 `matrices` user-bound design matrices referenced by [`MatrixTerm`](@ref)s
 (empty for a plain population-GLM plan). `array_parameters` are the
 declared array-valued parameters ([`ArrayParameter`](@ref)) the model reads
-by name.
+by name. `submodel_scopes` records lexical author paths separately from
+the private identifiers used by the mathematical plan.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -1732,7 +1751,21 @@ struct StructuralPlan
     matrices::Vector{DesignMatrix}
     event_lps::Vector{LinearPKEventLPSpec}
     array_parameters::Vector{ArrayParameter}
+    submodel_scopes::Vector{SubmodelScope}
 end
+
+# Existing full-positional plans have no lexical submodel metadata.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
+    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
+    horseshoe_priors, matrices, event_lps, array_parameters) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps,
+        plate_parameters, scans, dar_paths, varying_draws, varying_slices,
+        vector_parameters, spline_bases, spline_vectors, hsgp_bases,
+        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
+        array_parameters, SubmodelScope[])
 
 # Pre-array full-positional constructor (24-arg): plans built before
 # `array_parameters` existed keep working with none.
@@ -1802,14 +1835,15 @@ function StructuralPlan(
         horseshoe_priors::Vector{HorseshoePrior} = HorseshoePrior[],
         matrices::Vector{DesignMatrix} = DesignMatrix[],
         event_lps::Vector{LinearPKEventLPSpec} = LinearPKEventLPSpec[],
-        array_parameters::Vector{ArrayParameter} = ArrayParameter[])
+        array_parameters::Vector{ArrayParameter} = ArrayParameter[],
+        submodel_scopes::Vector{SubmodelScope} = SubmodelScope[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
         varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
         kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
-        array_parameters)
+        array_parameters, submodel_scopes)
 end
 
 """The horseshoe entries covering `pred` (empty when the predictor keeps
@@ -3230,7 +3264,7 @@ versions are not built, so such a plan fails closed — and a slot added
 later does too until it is listed here."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :parameters, :assignments, :derived, :columns, :n_obs, :roles,
-    :levelmaps, :vector_parameters)
+    :levelmaps, :vector_parameters, :submodel_scopes)
 
 """Per-observation columns (of `perobs`) a response reads: the names its
 own fields hold, then — transitively — the names every predictor, derived
@@ -5436,6 +5470,10 @@ _is_plate_param(plan::StructuralPlan, name::Symbol) =
 # columns fail (row-varying outside a reduction) and reduction args must be
 # bound columns or derived names. Derived names are known in both states,
 # so derived-outside-a-reduction fails at structure already.
+# `(name = value,)` stores a NamedTuple key, not a model assignment/read.
+_tuple_field_value(ex) = Meta.isexpr(ex, :(=), 2) && ex.args[1] isa Symbol ?
+    ex.args[2] : ex
+
 function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
@@ -5555,6 +5593,7 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     end
     if head === :vect || head === :tuple
         for a in ex.args
+            head === :tuple && (a = _tuple_field_value(a))
             _collect_assignment_refs!(refs, a, plan, label, bound)
         end
         return nothing
@@ -5588,6 +5627,7 @@ function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
         args = ex.args[2].args
     end
     for a in args
+        ex.head === :tuple && (a = _tuple_field_value(a))
         _collect_opaque_refs!(refs, a, plan, label, bound)
     end
     return nothing
@@ -10092,6 +10132,7 @@ function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
             end
         else
             for a in ex.args
+                ex.head === :tuple && (a = _tuple_field_value(a))
                 _expr_value_symbols(a, out)
             end
         end
@@ -10160,7 +10201,8 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     free = union(Set{Symbol}(raw), Set{Symbol}(first(d) for d in defs))
     named = copy(free)
     for f in fieldnames(StructuralPlan)
-        f in (:assignments, :derived, :columns, :n_obs, :roles) && continue
+        f in (:assignments, :derived, :columns, :n_obs, :roles,
+            :submodel_scopes) && continue
         _drop_held_names!(free, getfield(plan, f))
     end
     held = setdiff!(named, free)
@@ -10281,8 +10323,14 @@ function _drop_held_names!(out::Set{Symbol}, x::AbstractDict)
     end
     return nothing
 end
-_drop_held_names!(out::Set{Symbol}, x::Expr) =
-    _drop_held_names!(out, x.args)
+function _drop_held_names!(out::Set{Symbol}, x::Expr)
+    for a in x.args
+        x.head === :tuple && (a = _tuple_field_value(a))
+        _drop_held_names!(out, a)
+    end
+    return nothing
+end
+_drop_held_names!(::Set{Symbol}, ::SubmodelScope) = nothing
 function _drop_held_names!(out::Set{Symbol}, x::T) where {T}
     isstructtype(T) || return nothing
     for f in fieldnames(T)
@@ -10298,7 +10346,7 @@ function _bound_value_inputs(plan::StructuralPlan)
     found = Set{Symbol}()
     seen = Base.IdSet{Any}()
     for f in fieldnames(StructuralPlan)
-        f === :columns && continue
+        f in (:columns, :submodel_scopes) && continue
         _collect_bound_value_inputs!(found, getfield(plan, f), seen)
     end
     return found
