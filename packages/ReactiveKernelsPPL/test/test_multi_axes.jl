@@ -147,17 +147,9 @@ end
         X = hcat(x)
         alpha ~ Normal(0, 2)
         b[axes(X, 2)] .~ Normal.(0, 1)
-        mu = alpha .+ X * b
-        y .~ Normal.(mu, 1.0)
+        y ~ NormalIDGLM(X, alpha, b, 1.0)
     end, cols, (p, l, nt, u) -> nt.alpha .+ cols.x .* only(nt.b);
-        slots = (:matrices, :array_parameters),
-        # Exercise GLM-object IR while the separately tracked surface
-        # explicit-conditioning defect prevents y ~ NormalIDGLM(...).
-        transform = p -> ReactiveKernelsPPL._with(p;
-            predictors = [v for v in p.predictors if v.name !== :mu], responses =
-            [r.response === :y ? ReactiveKernelsPPL._with(r;
-                family = NormalIDGLMFam, predictor = :X, glm_alpha = :alpha, glm_beta = :b) : r
-                for r in p.responses]))
+        slots = (:matrices, :array_parameters))
     _ma_check(quote
         X = hcat(x)
         center = x .+ 0.2
