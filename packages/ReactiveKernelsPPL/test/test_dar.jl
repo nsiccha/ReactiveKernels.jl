@@ -401,7 +401,7 @@ end
     # mu_coef(a) + beta + sigmad + sigma + z[1..4]
     @test built.layout.total == 4 + (length(ydata) - 1)
     @test coordinate_names(built.layout)[1:4] ==
-        [Symbol("mu.Intercept"), :beta, :sigmad, :sigma]
+        [:a, :beta, :sigmad, :sigma]
 
     # independent oracle: SB `differenced_ar1_path` ported line-for-line,
     # priors and likelihood via Distributions.jl (never the emitted forms)
@@ -494,7 +494,7 @@ end
         built = build_kernel(plan)
         @test built.layout.total == 9
         @test coordinate_names(built.layout)[1:4] ==
-            [Symbol("mu.Intercept"), :beta, :sigmad, :s]
+            [:a, :beta, :sigmad, :s]
         post = _query(built.spec, plan, :posterior, u)
         @test post ≈ _dar_sb_pins(u, ydata, 0.5, 0.2, 0.0, 0.2)
         @test abs(post - (-22.57116529873909)) < 1e-12
@@ -522,7 +522,7 @@ end
         built = build_kernel(plan)
         @test built.layout.total == 9
         @test coordinate_names(built.layout)[1:4] ==
-            [Symbol("mu.Intercept"), :beta, :sigmad, :s]
+            [:a, :beta, :sigmad, :s]
         post = _query(built.spec, plan, :posterior, u)
         @test post ≈ _dar_sb_pins(u, ydata, 0.6, 0.1, 0.0, 0.3)
         @test abs(post - (-19.08072138630899)) < 1e-12

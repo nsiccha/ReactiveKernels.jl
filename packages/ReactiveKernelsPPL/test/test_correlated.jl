@@ -148,7 +148,7 @@ end
     u = [0.5, -0.25, 0.3]
     nt = constrain(built.layout, u)
     s1 = only(Vector(nt.L_scales))
-    c1 = Vector(nt.mu1)
+    c1 = [nt.a1, nt.b1]
     m1 = c1[1] .+ c1[2] .* cols[:x]
     ll = sum(logpdf(Normal(m1[i], s1), cols[:y1][i]) for i in 1:4)
     pr = sum(logpdf(Normal(0, 1), c) for c in c1) +
@@ -189,7 +189,7 @@ end
     s = Vector(nt.L_scales)
     Lc = Matrix(nt.L_L_corr)
     L = Diagonal(s) * Lc
-    cs = [Vector(nt.mu1), Vector(nt.mu2), Vector(nt.mu3)]
+    cs = [[nt.a1, nt.b1], [nt.a2, nt.b2], [nt.a3, nt.b3]]
     ms = [c[1] .+ c[2] .* cols[:x] for c in cs]
     ys = [cols[:y1], cols[:y2], cols[:y3]]
     Σ = L * L'

@@ -257,7 +257,7 @@ end
     @test lay.total == 11
     base = Dict{Symbol,Float64}(nm => 0.3 for nm in coordinate_names(lay))
     val, resid = _irt_intercept_integral(kern, lay, base,
-        Symbol("th.Intercept"), zs, Symbol("tau_person.1"), fill(0.3, 3),
+        :t0, zs, Symbol("tau_person.1"), fill(0.3, 3),
         1.0)
     @test resid < 1e-10
     @test val ≈ -17.61000720604677 atol = 1e-10
@@ -274,7 +274,7 @@ end
         @test lay.total == 13
         base = Dict{Symbol,Float64}(nm => 0.3 for nm in coordinate_names(lay))
         val, resid = _irt_intercept_integral(kern, lay, base,
-            Symbol("th.Intercept"), zs, Symbol("tau_person.1"),
+            :t0, zs, Symbol("tau_person.1"),
             fill(0.3, 3), s0)
         @test resid < 1e-10
         @test val + sbmix ≈ banked atol = 1e-10
@@ -287,8 +287,8 @@ end
     _, _, kern, lay = _irt_query(_IRT_LSAT, _irt_cols(_IRT_SD))
     u = _irt_probe(lay.total)
     c = Dict(zip(coordinate_names(lay), u))
-    th = [c[Symbol("th.student_$j")] for j in 1:3]
-    al = [c[Symbol("al.question_$k")] for k in 1:2]
+    th = [c[Symbol("c_th.$j")] for j in 1:3]
+    al = [c[Symbol("c_al.$k")] for k in 1:2]
     want = sum(logpdf.(Normal(0, 1), th)) + sum(logpdf.(Normal(0, 100), al)) +
         logpdf(Normal(0, 100), c[:be]) +
         sum(_irt_logit_lpmf(_IRT_SD.y[i],
@@ -308,8 +308,8 @@ end
     zb = [c[Symbol("z_flat_item_r_b.$k")] for k in 1:2]
     th = exp(lt) .* zt
     la = exp(la_) .* za
-    b = c[Symbol("b.Intercept")] .+ exp(lb) .* zb
-    want = logpdf(Normal(0, 5), c[Symbol("b.Intercept")]) +
+    b = c[:b0] .+ exp(lb) .* zb
+    want = logpdf(Normal(0, 5), c[:b0]) +
         sum(logpdf(Cauchy(0, 2), exp(l)) + l for l in (lt, la_, lb)) +
         sum(logpdf.(Normal(0, 1), vcat(zt, za, zb))) +
         sum(_irt_logit_lpmf(pd.y[i], exp(la[pd.item[i]]) *
@@ -321,13 +321,13 @@ end
         tau = exp(c[Symbol("tau_person.1")])
         z = [c[Symbol("z_flat_person.$j")] for j in 1:3]
         wp = [(0.5, 1.0), (-1.0, 0.5), (1.5, -0.5)]
-        th = [c[Symbol("th.Intercept")] + c[Symbol("th.w1")] * w[1] +
-              c[Symbol("th.w2")] * w[2] + tau * z[j]
+        th = [c[:t0] + c[:bw1] * w[1] +
+              c[:bw2] * w[2] + tau * z[j]
               for (j, w) in enumerate(wp)]
         pr = logpdf(Exponential(1), tau) + c[Symbol("tau_person.1")] +
             sum(logpdf.(Normal(0, 1), z)) +
-            _irt_t3(c[Symbol("th.w1")]) + _irt_t3(c[Symbol("th.w2")])
-        la = [c[Symbol("la.item_$k")] for k in 1:2]
+            _irt_t3(c[:bw1]) + _irt_t3(c[:bw2])
+        la = [c[Symbol("c_la.$k")] for k in 1:2]
         pr += sum(logpdf.(Normal(1, 1), la))
         return th, exp.(la), pr
     end
@@ -336,8 +336,8 @@ end
     u = _irt_probe(lay.total)
     c = Dict(zip(coordinate_names(lay), u))
     th, a, pr = theta_parts(c)
-    b = [c[Symbol("b.item_$k")] for k in 1:2]
-    want = pr + logpdf(Normal(0, 1), c[Symbol("th.Intercept")]) +
+    b = [c[Symbol("c_b.$k")] for k in 1:2]
+    want = pr + logpdf(Normal(0, 1), c[:t0]) +
         sum(logpdf.(Normal(0, 3), b)) +
         sum(_irt_logit_lpmf(pd.y[i],
             a[pd.item[i]] * (th[pd.person[i]] - b[pd.item[i]])) for i in 1:6)
@@ -349,9 +349,9 @@ end
     u = _irt_probe(lay.total)
     c = Dict(zip(coordinate_names(lay), u))
     th, a, pr = theta_parts(c)
-    s1 = [c[Symbol("s1.item_$k")] for k in 1:2]
-    s2 = [c[Symbol("s2.item_$k")] for k in 1:2]
-    want = pr + _irt_t3(c[Symbol("th.Intercept")]) +
+    s1 = [c[Symbol("c_s1.$k")] for k in 1:2]
+    s2 = [c[Symbol("c_s2.$k")] for k in 1:2]
+    want = pr + _irt_t3(c[:t0]) +
         sum(logpdf.(Normal(0, 3), vcat(s1, s2))) +
         sum(1:6) do i
             dd = a[cd.item[i]] * th[cd.person[i]]
@@ -365,9 +365,9 @@ end
     u = _irt_probe(lay.total)
     c = Dict(zip(coordinate_names(lay), u))
     th, a, pr = theta_parts(c)
-    b = [c[Symbol("b.item_$k")] for k in 1:2]
+    b = [c[Symbol("c_b.$k")] for k in 1:2]
     k1, k2 = c[:k1], c[:k2]
-    want = pr + _irt_t3(c[Symbol("th.Intercept")]) +
+    want = pr + _irt_t3(c[:t0]) +
         sum(logpdf.(Normal(0, 3), vcat(b, [k1, k2]))) +
         sum(1:6) do i
             dd = a[cd.item[i]] * th[cd.person[i]]
@@ -387,16 +387,16 @@ end
     t1, t2 = exp(c[Symbol("tau_item.1")]), exp(c[Symbol("tau_item.2")])
     zf = [c[Symbol("z_flat_item.$i")] for i in 1:6]
     B = ([t1 0.0; 0.0 t2] * [1.0 0.0; L21 L22] * reshape(zf, 2, 3))'
-    thv = [c[Symbol("th.person_$j")] for j in 1:4]
-    xi1 = c[Symbol("xi1.Intercept")] .+ B[:, 1]
-    xi2 = c[Symbol("xi2.Intercept")] .+ B[:, 2]
+    thv = [c[Symbol("c_th.$j")] for j in 1:4]
+    xi1 = c[:x1] .+ B[:, 1]
+    xi2 = c[:x2] .+ B[:, 2]
     want = logpdf(LKJ(2, 4.0), Symmetric([1.0 L21; L21 1.0])) +
         log(1 - L21^2) +
         logpdf(Exponential(10), t1) + logpdf(Exponential(10), t2) +
         c[Symbol("tau_item.1")] + c[Symbol("tau_item.2")] +
         sum(logpdf.(Normal(0, 1), zf)) + sum(logpdf.(Normal(0, 1), thv)) +
-        logpdf(Normal(0, 1), c[Symbol("xi1.Intercept")]) +
-        logpdf(Normal(0, 5), c[Symbol("xi2.Intercept")]) +
+        logpdf(Normal(0, 1), c[:x1]) +
+        logpdf(Normal(0, 5), c[:x2]) +
         sum(_irt_logit_lpmf(hd.y[n], exp(xi1[hd.item[n]]) *
             (thv[hd.person[n]] - xi2[hd.item[n]])) for n in 1:12)
     @test _irt_val(kern, u) ≈ want atol = 1e-12

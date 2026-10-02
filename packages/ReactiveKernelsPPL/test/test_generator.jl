@@ -1670,7 +1670,7 @@ end
     built = build_kernel(plan)
     u = [0.2, -0.1]
     nt = constrain(built.layout, u)
-    coef = nt[:mu]
+    coef = [nt.a, nt.b]
     mu = exp.(coef[1] .+ coef[2] .* x)
     ll = sum(logpdf.(NegativeBinomial.(phicol, phicol ./ (phicol .+ mu)), ycount))
     @test _query(built.spec, plan, :likelihood, u) ≈ ll
@@ -1731,7 +1731,7 @@ end
     @test built.layout.total == 4 # a, b, w, s
     u = [0.3, -0.2, 0.1, 0.25]
     nt = constrain(built.layout, u)
-    a, b, c, s = nt.mu[1], nt.mu[2], nt.w, nt.s
+    a, b, c, s = nt.a, nt.b, nt.w, nt.s
     @test c ≈ hi - exp(u[3])
     @test c < hi
     mu = a .+ b .* x

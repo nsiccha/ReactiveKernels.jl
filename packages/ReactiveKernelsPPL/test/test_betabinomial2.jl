@@ -403,8 +403,8 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _bb_query(prog, _bb_sb_cols())
         names = coordinate_names(lay)
-        u = _bb_sb_vec(names, [Symbol("mu.Intercept") => 0.5,
-            Symbol("mu.x") => -0.25, :phi => log(6.0)])
+        u = _bb_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :phi => log(6.0)])
         got = Base.invokelatest(kern, u)
         @test abs(got - (-225.22160684012368)) < 1e-12
         eta = 0.5 .- 0.25 .* _BB_SB_X
@@ -418,8 +418,8 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        sb = _bb_sb_vec(names, [Symbol("mu.Intercept") => -3.6814620132469567,
-            Symbol("mu.x") => -46.90221092744033,
+        sb = _bb_sb_vec(names, [:a => -3.6814620132469567,
+            :b => -46.90221092744033,
             :phi => -61.221213644655926])
         @test maximum(abs.(g .- sb)) < 1e-11
     end
@@ -431,8 +431,8 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         # (mean.Intercept, mean.x, precision.Intercept, precision.z).
         bound, built, kern, lay = _bb_query(_bb_p3_prog(), _bb_p3_cols())
         names = coordinate_names(lay)
-        u = _bb_sb_vec(names, [Symbol("mu.Intercept") => _BB_P3_U[1],
-            Symbol("mu.x") => _BB_P3_U[2],
+        u = _bb_sb_vec(names, [:a => _BB_P3_U[1],
+            :b => _BB_P3_U[2],
             Symbol("hup.Intercept") => _BB_P3_U[3],
             Symbol("hup.z") => _BB_P3_U[4]])
         got = Base.invokelatest(kern, u)
@@ -453,8 +453,8 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        sb = _bb_sb_vec(names, [Symbol("mu.Intercept") => _BB_P3_GRAD[1],
-            Symbol("mu.x") => _BB_P3_GRAD[2],
+        sb = _bb_sb_vec(names, [:a => _BB_P3_GRAD[1],
+            :b => _BB_P3_GRAD[2],
             Symbol("hup.Intercept") => _BB_P3_GRAD[3],
             Symbol("hup.z") => _BB_P3_GRAD[4]])
         @test maximum(abs.(g .- sb)) < 1e-11
@@ -472,7 +472,7 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _bb_query(prog, _bb_sb_cols())
         names = coordinate_names(lay)
-        u = _bb_sb_vec(names, [Symbol("mu.Intercept") => 0.5, :phi => log(6.0)])
+        u = _bb_sb_vec(names, [:a => 0.5, :phi => log(6.0)])
         got = Base.invokelatest(kern, u)
         @test abs(got - (-237.53203421116058)) < 1e-12
         mu = 1 / (1 + exp(-0.5))
@@ -485,7 +485,7 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        sb = _bb_sb_vec(names, [Symbol("mu.Intercept") => -2.311523209591776,
+        sb = _bb_sb_vec(names, [:a => -2.311523209591776,
             :phi => -67.54239489971626])
         @test maximum(abs.(g .- sb)) < 1e-11
     end

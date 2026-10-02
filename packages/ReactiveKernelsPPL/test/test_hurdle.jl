@@ -346,18 +346,18 @@ _hur_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _hur_query(prog, _hur_sb_cols())
         names = coordinate_names(lay)
-        u = _hur_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25, Symbol("hu.Intercept") => 0.1,
-            Symbol("hu.x") => 0.2])
+        u = _hur_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :e => 0.1,
+            :f => 0.2])
         @test abs(Base.invokelatest(kern, u) - (-162.24640396336227)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _hur_sb_vec(names, [Symbol("eta.Intercept") => -4.126658097925048,
-            Symbol("eta.x") => 50.24468439856483,
-            Symbol("hu.Intercept") => -23.01367609421922,
-            Symbol("hu.x") => 1.6109183772172553])
+        want = _hur_sb_vec(names, [:a => -4.126658097925048,
+            :b => 50.24468439856483,
+            :e => -23.01367609421922,
+            :f => 1.6109183772172553])
         @test maximum(abs.(g .- want)) < 1e-10
     end
     @testset "H2 hurdle_hu1" begin
@@ -374,16 +374,16 @@ _hur_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _hur_query(prog, _hur_sb_cols())
         names = coordinate_names(lay)
-        u = _hur_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25, Symbol("hu.Intercept") => 0.1])
+        u = _hur_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :e => 0.1])
         @test abs(Base.invokelatest(kern, u) - (-162.0618341297221)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _hur_sb_vec(names, [Symbol("eta.Intercept") => -4.126658097925048,
-            Symbol("eta.x") => 50.24468439856483,
-            Symbol("hu.Intercept") => -23.02333499831524])
+        want = _hur_sb_vec(names, [:a => -4.126658097925048,
+            :b => 50.24468439856483,
+            :e => -23.02333499831524])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end

@@ -277,15 +277,15 @@ _nb1_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _nb1_query(prog, cols)
         names = coordinate_names(lay)
-        u = _nb1_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25, :p => -0.8472978603872036])
+        u = _nb1_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :p => -0.8472978603872036])
         @test abs(Base.invokelatest(kern, u) - (-213.91078632350118)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _nb1_sb_vec(names, [Symbol("eta.Intercept") => -73.29459252387821,
-            Symbol("eta.x") => 33.857843540951656,
+        want = _nb1_sb_vec(names, [:a => -73.29459252387821,
+            :b => 33.857843540951656,
             :p => 59.39544975853501])
         @test maximum(abs.(g .- want)) < 1e-10
     end
@@ -301,15 +301,15 @@ _nb1_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _nb1_query(prog, cols)
         names = coordinate_names(lay)
-        u = _nb1_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25])
+        u = _nb1_sb_vec(names, [:a => 0.5,
+            :b => -0.25])
         @test abs(Base.invokelatest(kern, u) - (-194.73341045936672)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _nb1_sb_vec(names, [Symbol("eta.Intercept") => -24.308315361938934,
-            Symbol("eta.x") => 21.08901738421236])
+        want = _nb1_sb_vec(names, [:a => -24.308315361938934,
+            :b => 21.08901738421236])
         @test maximum(abs.(g .- want)) < 1e-10
     end
     @testset "B1 modeled p" begin
@@ -327,16 +327,16 @@ _nb1_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         # u = [0.2, -0.1, -0.5, 0.3].
         bound, built, kern, lay = _nb1_query(_b1_prog(), _b1_cols())
         names = coordinate_names(lay)
-        u = _nb1_sb_vec(names, [Symbol("eta.Intercept") => 0.2,
-            Symbol("eta.x") => -0.1, Symbol("hu.Intercept") => -0.5,
+        u = _nb1_sb_vec(names, [:a => 0.2,
+            :b => -0.1, Symbol("hu.Intercept") => -0.5,
             Symbol("hu.z") => 0.3])
         @test abs(Base.invokelatest(kern, u) - (-17.21077676236189)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _nb1_sb_vec(names, [Symbol("eta.Intercept") => 3.2359990802629035,
-            Symbol("eta.x") => 3.8226220328762897,
+        want = _nb1_sb_vec(names, [:a => 3.2359990802629035,
+            :b => 3.8226220328762897,
             Symbol("hu.Intercept") => -1.6053435570340273,
             Symbol("hu.z") => -0.18482410804380967])
         @test maximum(abs.(g .- want)) < 1e-10

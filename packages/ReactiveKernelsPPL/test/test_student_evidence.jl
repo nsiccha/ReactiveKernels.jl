@@ -25,14 +25,9 @@ end
 _stev_posterior(kern, lay, q::NamedTuple) =
     Base.invokelatest(kern, unconstrain(lay, q))
 
-# Constrained probe from (intercept, slope, sigma): `unconstrain`
-# takes the grouped form (one coefficient vector per predictor), with
-# coefficients in `coordinate_names` order.
-function _stev_q(lay, a, b, s)
-    coefs = Dict(Symbol("mu.Intercept") => a, Symbol("mu.x") => b)
-    muv = [coefs[n] for n in coordinate_names(lay) if startswith(string(n), "mu.")]
-    return (; mu = muv, sigma = s)
-end
+# Constrained probe from (intercept, slope, sigma): `unconstrain` takes
+# the draws keyed by the author's names.
+_stev_q(lay, a, b, s) = (; a, b, sigma = s)
 
 @testset "student evidence lowering" begin
     for wrap in ("censored", "truncated")

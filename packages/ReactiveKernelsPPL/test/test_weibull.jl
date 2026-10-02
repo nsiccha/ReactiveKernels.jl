@@ -322,8 +322,8 @@ _wb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _wb_query(prog, _wb_sb_cols())
         names = coordinate_names(lay)
-        u = _wb_sb_vec(names, [Symbol("eta.Intercept") => 1.0,
-            Symbol("eta.x") => 2.0, :k => 0.6931471805599453])
+        u = _wb_sb_vec(names, [:a => 1.0,
+            :b => 2.0, :k => 0.6931471805599453])
         # Measured dval 2.9e-11 (rel 2e-16; the probe oracle's own
         # association noise is 5.8e-11); the pin carries ~30x headroom.
         @test abs(Base.invokelatest(kern, u) - (-143289.1664852868)) < 1e-9
@@ -331,8 +331,8 @@ _wb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _wb_sb_vec(names, [Symbol("eta.Intercept") => 286073.3722212652,
-            Symbol("eta.x") => -769310.6965998452,
+        want = _wb_sb_vec(names, [:a => 286073.3722212652,
+            :b => -769310.6965998452,
             :k => -1.586342950116091e6])
         # Measured maxabs 2.3e-10 (rel 1.5e-16); the pin carries ~40x
         # headroom.

@@ -62,12 +62,9 @@ end
 function _vs_emit_point(names)
     values = Dict(:sigma => log(2.0), :d_rate => 0.15, :d_mode => -0.1,
         :d_f => -0.2, :dose_slope => 0.1, :conc_slope => -0.15,
-        Symbol("log_Vc.Intercept") => log(100.0), Symbol("log_Vc.age_s") => 0.1,
-        Symbol("log_k10.Intercept") => log(0.08),
-        Symbol("log_k12.Intercept") => log(0.15),
-        Symbol("log_k21.Intercept") => log(0.05),
-        Symbol("log_rate.Intercept") => log(0.2),
-        Symbol("log_mode.Intercept") => 0.0)
+        :b_vc => log(100.0), :b_age => 0.1, :b_k10 => log(0.08),
+        :b_k12 => log(0.15), :b_k21 => log(0.05), :b_rate => log(0.2),
+        :b_mode => 0.0)
     for (i, w) in enumerate(vec([0.02 -0.03; -0.01 0.04]))
         values[Symbol("gp_weights.", i)] = w
     end
@@ -86,10 +83,9 @@ function _vs_emit_oracle(u, names, cols)
         keys = unique(cols[:treatment][drows])
         treatments = [findfirst(==(cols[:treatment][i]), keys) for i in drows]
         d = _vs_pk_test_data(refs, cols[:dtime][drows], cols[:damt][drows], treatments)
-        q = vcat([p[Symbol("log_Vc.Intercept")] +
-            p[Symbol("log_Vc.age_s")] * cols[:age_s][s]],
-            [p[Symbol(x, ".Intercept")] for x in (:log_k10, :log_k12,
-                :log_k21, :log_rate, :log_mode)], [p[:dose_slope], p[:conc_slope]],
+        q = vcat([p[:b_vc] + p[:b_age] * cols[:age_s][s]],
+            [p[x] for x in (:b_k10, :b_k12, :b_k21, :b_rate, :b_mode)],
+            [p[:dose_slope], p[:conc_slope]],
             p[:d_rate] .* cols[:dose_x][drows], p[:d_mode] .* cols[:dose_x][drows],
             p[:d_f] .* cols[:dose_x][drows], weights, [0.0, 0.0])
         concentration = _vs_pk_oracle(q, d)

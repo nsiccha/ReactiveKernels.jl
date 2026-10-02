@@ -123,8 +123,12 @@ end
             end, Set([:x1, :y])),
         Dict{Symbol,AbstractVector}(:x1 => [0.5, -1.0, 1.5, 0.0],
             :y => [1.0, 2.0, 1.5, 2.5]))
+    # The sign negates the design column (`TermSpec.sign`), so the derived
+    # horseshoe coefficient is `b1` itself (user decision `0m1j3iz`).
     entry = only(bound.horseshoe_priors)
-    @test entry.sign == -1
+    @test entry.sign == 1
+    @test only(t for t in only(bound.predictors).terms
+        if t.kind === ContinuousTerm).sign == -1
     built = build_kernel(bound)
     # Layout: sigma, intercept scalar, x1 triple.
     u = [0.5, 0.1, -0.2, 0.3, 0.4]

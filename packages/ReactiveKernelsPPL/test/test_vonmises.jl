@@ -364,16 +364,16 @@ _vm_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
             :x => copy(_VM_SB_X))
         bound, built, kern, lay = _vm_query(prog, cols)
         names = coordinate_names(lay)
-        u = _vm_sb_vec(names, [Symbol("mu.Intercept") => 0.5,
-            Symbol("mu.x") => -0.25, Symbol("lk.Intercept") => 0.3])
+        u = _vm_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :c => 0.3])
         @test abs(Base.invokelatest(kern, u) - (-12.60537740226801)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _vm_sb_vec(names, [Symbol("mu.Intercept") => 0.4606828295664177,
-            Symbol("mu.x") => 1.0755814718931511,
-            Symbol("lk.Intercept") => -3.9533067855122037])
+        want = _vm_sb_vec(names, [:a => 0.4606828295664177,
+            :b => 1.0755814718931511,
+            :c => -3.9533067855122037])
         @test maximum(abs.(g .- want)) < 1e-10
     end
     @testset "VM2 exact + sampled kappa" begin
@@ -390,15 +390,15 @@ _vm_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
             :x => copy(_VM_SB_X))
         bound, built, kern, lay = _vm_query(prog, cols)
         names = coordinate_names(lay)
-        u = _vm_sb_vec(names, [Symbol("mu.Intercept") => 0.5,
-            Symbol("mu.x") => -0.25, :k => 0.2])
+        u = _vm_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :k => 0.2])
         @test abs(Base.invokelatest(kern, u) - (-10.932237952776804)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _vm_sb_vec(names, [Symbol("mu.Intercept") => -1.3935808349508612,
-            Symbol("mu.x") => 0.1339126643988171,
+        want = _vm_sb_vec(names, [:a => -1.3935808349508612,
+            :b => 0.1339126643988171,
             :k => -2.0129577913934957])
         @test maximum(abs.(g .- want)) < 1e-10
     end
@@ -416,15 +416,15 @@ _vm_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
             :x => copy(_VM_SB_X))
         bound, built, kern, lay = _vm_query(prog, cols)
         names = coordinate_names(lay)
-        u = _vm_sb_vec(names, [Symbol("mu.Intercept") => 1.0,
-            Symbol("mu.x") => -0.5])
+        u = _vm_sb_vec(names, [:a => 1.0,
+            :b => -0.5])
         @test abs(Base.invokelatest(kern, u) - (-7.934564762332648)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _vm_sb_vec(names, [Symbol("mu.Intercept") => -1.7708419435702396,
-            Symbol("mu.x") => 1.6892237819376545])
+        want = _vm_sb_vec(names, [:a => -1.7708419435702396,
+            :b => 1.6892237819376545])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end

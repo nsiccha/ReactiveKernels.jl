@@ -469,8 +469,8 @@ end
 function _tv_ref_k1(bound, nt, Z, levels)
     idx = [findfirst(==(v), levels) for v in bound.columns[:g]]
     r = only(nt.tau_g) .* (nt.z_flat_g[idx] .* Z)
-    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), bound.columns[:y]))
-    pr = logpdf(Normal(0, 5), nt.mu[1]) + logpdf(Exponential(1), nt.sigma) +
+    ll = sum(logpdf.(Normal.(nt.a .+ r, nt.sigma), bound.columns[:y]))
+    pr = logpdf(Normal(0, 5), nt.a) + logpdf(Exponential(1), nt.sigma) +
         logpdf(Normal(0, 1), only(nt.tau_g)) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     return (; ll, pr)
@@ -551,7 +551,7 @@ end
     x = [0.5, -1.0, 1.5, 0.0]
     cols = Dict{Symbol,AbstractVector}(:y => y, :g => g, :x => x)
     rest = logpdf(Normal(0, 5), 0.0) + 2 * logpdf(Normal(), 0.0)
-    q = (mu = [0.0], L_g = [1.0;;], tau_g = [1.2], z_flat_g = [0.0, 0.0])
+    q = (a = 0.0, L_g = [1.0;;], tau_g = [1.2], z_flat_g = [0.0, 0.0])
     function k1_sd(margin, kw...)
         call = Expr(:call, :varying_effect, :g, Expr(:vect, margin))
         isempty(kw) || insert!(call.args, 2, Expr(:parameters,
@@ -855,8 +855,8 @@ end
         nt = constrain(built.layout, u)
         r = _tv_ref_corr_r(bound, :g, nt.L_g, nt.tau_g, nt.z_flat_g,
             [ones(6), xv], 1:2)
-        ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
-        pr = logpdf(Normal(0, 5), nt.mu[1]) +
+        ll = sum(logpdf.(Normal.(nt.a .+ r, nt.sigma), yv))
+        pr = logpdf(Normal(0, 5), nt.a) +
             logpdf(Exponential(1), nt.sigma) +
             _tv_ref_lkj_k2(nt.L_g, eta) +
             sum(logpdf.(Normal(0, 1), nt.tau_g)) +
@@ -892,11 +892,11 @@ end
     nt = constrain(built.layout, u)
     r = _tv_ref_corr_r(bound, :g, nt.L_g, nt.tau_g, nt.z_flat_g,
         [ones(6), x1v, x2v], 1:3)
-    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
+    ll = sum(logpdf.(Normal.(nt.a .+ r, nt.sigma), yv))
     # K=3 eta==1.0 LKJ, hand-derived from Stan's do_lkj_constant
     # (const = log2 - 2logpi; diag (3-2)logL22 + 0*logL33).
     lkj = log(2.0) - 2 * log(pi) + log(nt.L_g[2, 2])
-    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+    pr = logpdf(Normal(0, 5), nt.a) +
         logpdf(Exponential(1), nt.sigma) + lkj +
         sum(logpdf.(Normal(0, 1), nt.tau_g)) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
@@ -932,9 +932,9 @@ end
     @test nt.L_g == [1.0;;]
     idx = [findfirst(==(v), [1, 2]) for v in gv]
     r = nt.tau_g[1] .* (nt.z_flat_g[idx] .* xv)
-    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
+    ll = sum(logpdf.(Normal.(nt.a .+ r, nt.sigma), yv))
     # No LKJ term: Stan's K=1 LKJ contributes exactly 0.0.
-    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+    pr = logpdf(Normal(0, 5), nt.a) +
         logpdf(Exponential(1), nt.sigma) +
         logpdf(Normal(0, 1), nt.tau_g[1]) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
@@ -976,9 +976,9 @@ end
         Zs, 1:1)
     r2 = _tv_ref_corr_r(bound, :g, nt.L_g, nt.tau_g, nt.z_flat_g,
         Zs, 2:2)
-    ll = sum(logpdf.(Normal.(nt.mu1[1] .+ r1, nt.s), y1v)) +
-        sum(logpdf.(Normal.(nt.mu2[1] .+ r2, nt.s), y2v))
-    pr = logpdf(Normal(0, 5), nt.mu1[1]) + logpdf(Normal(0, 5), nt.mu2[1]) +
+    ll = sum(logpdf.(Normal.(nt.a1 .+ r1, nt.s), y1v)) +
+        sum(logpdf.(Normal.(nt.a2 .+ r2, nt.s), y2v))
+    pr = logpdf(Normal(0, 5), nt.a1) + logpdf(Normal(0, 5), nt.a2) +
         logpdf(Exponential(1), nt.s) + _tv_ref_lkj_k2(nt.L_g, 1.0) +
         sum(logpdf.(Normal(0, 1), nt.tau_g)) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
@@ -1392,8 +1392,8 @@ end
     nt = constrain(built.layout, u)
     r = _tv_ref_corr_r(bound, :g, nt.L_g, nt.tau_g, nt.z_flat_g,
         [ones(6), xv], 1:2; levels)
-    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
-    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+    ll = sum(logpdf.(Normal.(nt.a .+ r, nt.sigma), yv))
+    pr = logpdf(Normal(0, 5), nt.a) +
         logpdf(Exponential(1), nt.sigma) +
         _tv_ref_lkj_k2(nt.L_g, 1.0) +
         sum(logpdf.(Normal(0, 1), nt.tau_g)) +
@@ -1596,8 +1596,8 @@ end
     nt = constrain(built.layout, u)
     r = _tv_ref_corr_r(bound, :g, nt.L_g, nt.tau_g, nt.z_flat_g,
         [ones(6), xv], 1:2)
-    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
-    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+    ll = sum(logpdf.(Normal.(nt.a .+ r, nt.sigma), yv))
+    pr = logpdf(Normal(0, 5), nt.a) +
         logpdf(Exponential(1), nt.sigma) +
         _tv_ref_lkj_k2(nt.L_g, 2.0) +
         sum(logpdf.(Exponential(1 / 3), nt.tau_g)) +
@@ -1631,8 +1631,8 @@ end
     nt = constrain(built.layout, u)
     r = _tv_ref_corr_r(bound, :g, nt.L_g, nt.tau_g, nt.z_flat_g,
         [ones(6), xv], 1:2)
-    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
-    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+    ll = sum(logpdf.(Normal.(nt.a .+ r, nt.sigma), yv))
+    pr = logpdf(Normal(0, 5), nt.a) +
         logpdf(Exponential(1), nt.sigma) +
         _tv_ref_lkj_k2(nt.L_g, 2.0) +
         logpdf(Exponential(0.5), nt.tau_g[1]) +
@@ -1666,8 +1666,8 @@ end
     nt = constrain(built.layout, u)
     idx = [findfirst(==(v), [1, 2]) for v in gv]
     r = nt.tau_g[1] .* (nt.z_flat_g[idx] .* xv)
-    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, nt.sigma), yv))
-    pr = logpdf(Normal(0, 5), nt.mu[1]) +
+    ll = sum(logpdf.(Normal.(nt.a .+ r, nt.sigma), yv))
+    pr = logpdf(Normal(0, 5), nt.a) +
         logpdf(Exponential(1), nt.sigma) +
         logpdf(Exponential(1.0), nt.tau_g[1]) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
@@ -1800,10 +1800,10 @@ end
     @test built.layout.total == 10
     u = [0.2, -0.3, 0.1, -0.1, 0.25, 0.0, -0.2, 0.15, 0.05, -0.05]
     nt = constrain(built.layout, u)
-    theta = nt.eta[1] .+ nt.tau_g[1] .* nt.z_flat_g
+    theta = nt.mu .+ nt.tau_g[1] .* nt.z_flat_g
     ll = sum(logpdf.(Normal.(theta, cols[:sigma]), cols[:y]))
     # Stan-kernel Cauchy (NO +log2) and NO LKJ term (K=1 exactly zero).
-    pr = logpdf(Normal(0, 5), nt.eta[1]) +
+    pr = logpdf(Normal(0, 5), nt.mu) +
         logpdf(Cauchy(0, 5), nt.tau_g[1]) +
         sum(logpdf.(Normal(0, 1), nt.z_flat_g))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll

@@ -959,12 +959,16 @@ _pv_m8_q() = (mu = [0.3, -0.4, 0.1, 0.75], mu_alpha = 0.5,
         row = only(p for p in computed.population_priors if p.addressee === :g)
         @test row.location === :_rkppl_c_arg1
         @test any(a -> a.name === :_rkppl_c_arg1, computed.assignments)
+        # A negated use keeps the prior as written; the sign negates the
+        # dummy columns (`TermSpec.sign`, user decision `0m1j3iz`).
         flipped = lower_rkppl(mk(:(Normal.(mu_alpha, sigma_alpha)),
             :(-c[g])), (:y, :x, :g))
         row = only(p for p in flipped.population_priors if p.addressee === :g)
-        @test row.location === :_rkppl_neg_mu_alpha
-        @test any(a -> a.name === :_rkppl_neg_mu_alpha &&
-            a.expr == :(-mu_alpha), flipped.assignments)
+        @test row.location === :mu_alpha
+        @test only(t for t in only(flipped.predictors).terms
+            if t.kind === FactorTerm).sign == -1
+        @test !any(a -> startswith(string(a.name), "_rkppl_neg"),
+            flipped.assignments)
         assigned = lower_rkppl(mk(:(Normal.(mu_alpha, sc))), (:y, :x, :g))
         row = only(p for p in assigned.population_priors if p.addressee === :g)
         @test row.scale === :sc

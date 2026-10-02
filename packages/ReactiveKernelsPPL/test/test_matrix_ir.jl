@@ -261,7 +261,8 @@ end
     @test plan.population_priors == PopulationPrior[
         PopulationPrior(:mu, :Intercept, 0.0, 1.0),
         PopulationPrior(:mu, :x1, 0.0, 1.0)]
-    # Dotted subtraction negates locations, keeps scales.
+    # Dotted subtraction keeps the prior as written and negates the
+    # matrix block's design columns (`TermSpec.sign`).
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(1.0, 2.0)
         a ~ Normal(0, 1)
@@ -271,7 +272,9 @@ end
     end, (:y, :x1))
     @test plan.population_priors == PopulationPrior[
         PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-        PopulationPrior(:mu, :x1, -1.0, 2.0)]
+        PopulationPrior(:mu, :x1, 1.0, 2.0)]
+    @test [(t.coef, t.sign) for t in only(plan.predictors).terms] ==
+          [(:a, 1), (:b, -1)]
     # Dotted negation, disjoint matrices, reuse, factor combo.
     plan = lower_rkppl(quote
         X = hcat(1, x1)
@@ -279,7 +282,8 @@ end
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1))
     @test length(plan.population_priors) == 2
-    # Undotted negation folds the sign (affine unary-minus precedent).
+    # Undotted negation negates the design the same way (affine unary-minus
+    # precedent); the prior stays as written.
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(1.0, 2.0)
         X = hcat(1, x1)
@@ -287,8 +291,9 @@ end
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1))
     @test plan.population_priors == PopulationPrior[
-        PopulationPrior(:mu, :Intercept, -1.0, 2.0),
-        PopulationPrior(:mu, :x1, -1.0, 2.0)]
+        PopulationPrior(:mu, :Intercept, 1.0, 2.0),
+        PopulationPrior(:mu, :x1, 1.0, 2.0)]
+    @test only(only(plan.predictors).terms).sign == -1
     plan = lower_rkppl(quote
         X = hcat(1, x1)
         Y = hcat(x2)
@@ -471,9 +476,9 @@ end
         sum(logpdf(Normal(0, s), bj) for bj in b) +
         sum(logpdf(Normal(b[1] + b[2] * x, s), y)
             for (x, y) in zip(X1, Y)) + log(s)
-    for q in ((mu = [0.5, -0.25], s = 1.3), (mu = [0.5, -0.25], s = 0.7))
+    for q in ((b = [0.5, -0.25], s = 1.3), (b = [0.5, -0.25], s = 0.7))
         @test Base.invokelatest(kern, unconstrain(built.layout, q)) ≈
-            oracle(q.mu, q.s)
+            oracle(q.b, q.s)
     end
 end
 

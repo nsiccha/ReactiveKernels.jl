@@ -178,9 +178,9 @@ end
                 y .~ interval_censored.(Normal.(mu, s), 5.0)
                 s ~ Exponential(1)
             end, _int_gcols())
-        q = (mu = [0.5, -0.25], s = 1.3)
-        want = _int_gauss_oracle(_INT_YG, _INT_X, fill(5.0, 6), q.mu[1],
-            q.mu[2], q.s)
+        q = (a = 0.5, b = -0.25, s = 1.3)
+        want = _int_gauss_oracle(_INT_YG, _INT_X, fill(5.0, 6), q.a,
+            q.b, q.s)
         @test _int_posterior(kern, lay, q) ≈ want rtol = 1e-12
     end
     @testset "gaussian column upper" begin
@@ -189,9 +189,9 @@ end
                 y .~ interval_censored.(Normal.(mu, s), hi)
                 s ~ Exponential(1)
             end, _int_gcols())
-        q = (mu = [0.5, -0.25], s = 1.3)
-        want = _int_gauss_oracle(_INT_YG, _INT_X, _INT_HI, q.mu[1],
-            q.mu[2], q.s)
+        q = (a = 0.5, b = -0.25, s = 1.3)
+        want = _int_gauss_oracle(_INT_YG, _INT_X, _INT_HI, q.a,
+            q.b, q.s)
         @test _int_posterior(kern, lay, q) ≈ want rtol = 1e-12
     end
     @testset "gaussian weighted" begin
@@ -202,12 +202,12 @@ end
                 y .~ weighted.(interval_censored.(Normal.(mu, s), hi), w)
                 s ~ Exponential(1)
             end, cols)
-        q = (mu = [0.5, -0.25], s = 1.3)
-        mu = q.mu[1] .+ q.mu[2] .* _INT_X
+        q = (a = 0.5, b = -0.25, s = 1.3)
+        mu = q.a .+ q.b .* _INT_X
         ll = sum(_INT_W[i] *
             _int_gref(_INT_YG[i], mu[i], q.s, _INT_HI[i]) for i in 1:6)
-        want = ll + logpdf(Normal(0, 1), q.mu[1]) +
-            logpdf(Normal(0, 1), q.mu[2]) + logpdf(Exponential(1), q.s) +
+        want = ll + logpdf(Normal(0, 1), q.a) +
+            logpdf(Normal(0, 1), q.b) + logpdf(Exponential(1), q.s) +
             log(q.s)
         @test _int_posterior(kern, lay, q) ≈ want rtol = 1e-12
     end
@@ -216,9 +216,9 @@ end
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), 4)
             end, _int_pcols())
-        q = (eta = [0.1, -0.2],)
-        want = _int_pois_oracle(_INT_YP, _INT_X, fill(4, 6), q.eta[1],
-            q.eta[2])
+        q = (a = 0.1, b = -0.2,)
+        want = _int_pois_oracle(_INT_YP, _INT_X, fill(4, 6), q.a,
+            q.b)
         @test _int_posterior(kern, lay, q) ≈ want rtol = 1e-12
     end
     @testset "poisson column upper" begin
@@ -226,9 +226,9 @@ end
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), ub)
             end, _int_pcols())
-        q = (eta = [0.1, -0.2],)
-        want = _int_pois_oracle(_INT_YP, _INT_X, _INT_UB, q.eta[1],
-            q.eta[2])
+        q = (a = 0.1, b = -0.2,)
+        want = _int_pois_oracle(_INT_YP, _INT_X, _INT_UB, q.a,
+            q.b)
         @test _int_posterior(kern, lay, q) ≈ want rtol = 1e-12
     end
 end
@@ -254,26 +254,26 @@ end
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), 5.0)
                 s ~ Exponential(1)
-            end, _int_gcols(), (mu = [0.5, -0.25], s = 1.3))
+            end, _int_gcols(), (a = 0.5, b = -0.25, s = 1.3))
     end
     @testset "gaussian column upper" begin
         _int_enzyme_check(quote
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s), hi)
                 s ~ Exponential(1)
-            end, _int_gcols(), (mu = [0.5, -0.25], s = 1.3))
+            end, _int_gcols(), (a = 0.5, b = -0.25, s = 1.3))
     end
     @testset "poisson literal upper" begin
         _int_enzyme_check(quote
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), 4)
-            end, _int_pcols(), (eta = [0.1, -0.2],))
+            end, _int_pcols(), (a = 0.1, b = -0.2,))
     end
     @testset "poisson column upper" begin
         _int_enzyme_check(quote
                 eta = a .+ b .* x
                 y .~ interval_censored.(Poisson.(exp.(eta)), ub)
-            end, _int_pcols(), (eta = [0.1, -0.2],))
+            end, _int_pcols(), (a = 0.1, b = -0.2,))
     end
 end
 
@@ -474,7 +474,7 @@ end
                 s ~ Exponential(1)
             end, _int_i1_cols())
         @test coordinate_names(lay) ==
-            [Symbol("mu.Intercept"), Symbol("mu.x"), :s]
+            [:a, :b, :s]
         u = [0.6, -0.2, 0.1]
         want = _int_gauss_oracle(_INT_I1_Y, _INT_I1_X, _INT_I1_HI, u[1],
             u[2], exp(u[3]))
@@ -497,7 +497,7 @@ end
                 y .~ interval_censored.(Poisson.(exp.(eta)), ub)
             end, _int_i2_cols())
         @test coordinate_names(lay) ==
-            [Symbol("eta.Intercept"), Symbol("eta.x")]
+            [:a, :b]
         u = [0.35, 0.45]
         want = _int_pois_oracle(_INT_I2_Y, _INT_I2_X, _INT_I2_UB, u[1],
             u[2])

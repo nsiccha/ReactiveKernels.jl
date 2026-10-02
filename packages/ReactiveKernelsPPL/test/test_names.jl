@@ -126,9 +126,12 @@ _nm_stem(n::Symbol) = Symbol(first(split(string(n), '.')))
 end
 
 # Constrained probe → packed vector (entries the probe leaves out come
-# from the layout itself).
-_nm_pack(lay, q::NamedTuple) =
-    unconstrain(lay, merge(constrain(lay, zeros(lay.total)), q))
+# from the layout itself; a probe key that is not a draws key fails).
+function _nm_pack(lay, q::NamedTuple)
+    base = constrain(lay, zeros(lay.total))
+    @test issubset(keys(q), keys(base))
+    return unconstrain(lay, merge(base, q))
+end
 
 function _nm_check(prog::Expr, cols, q::NamedTuple, want)
     plan = lower_rkppl(prog, Tuple(keys(cols)))

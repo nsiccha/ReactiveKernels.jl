@@ -202,8 +202,7 @@ _links_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
             # u (SB order [b0, b1]) = [0.5, -0.25].
             bound, built, kern = _links_query(prog, cols)
             names = coordinate_names(built.layout)
-            u = _links_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-                Symbol("eta.x") => -0.25])
+            u = _links_sb_vec(names, [:a => 0.5, :b => -0.25])
             want, wantg = sb[name]
             @test abs(Base.invokelatest(kern, u) - want) < 1e-12
             prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
@@ -251,8 +250,8 @@ _links_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
                     :n => n)
                 bound, built, kern = _links_query(prog, tcols)
                 names = coordinate_names(built.layout)
-                u = _links_sb_vec(names, [Symbol("mu.Intercept") => 0.5,
-                    Symbol("mu.x") => -0.25])
+                u = _links_sb_vec(names, [:a => 0.5,
+                    :b => -0.25])
                 @test abs(Base.invokelatest(kern, u) - want) < 1e-12
                 prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
                 g = similar(u)
@@ -280,7 +279,7 @@ end
         @testset "$name" begin
             _, built, kern = _links_query(prog, cols)
             nt = constrain(built.layout, u)
-            lp = Vector(nt.eta)
+            lp = [nt.a, nt.b]
             eta = lp[1] .+ lp[2] .* x
             pr = logpdf(Normal(0, 1), lp[1]) + logpdf(Normal(0, 1), lp[2])
             @test Base.invokelatest(kern, u) ≈ llfun(eta, y) + pr

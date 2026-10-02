@@ -280,7 +280,7 @@ end
     @test lay.total == 22
     names = coordinate_names(lay)
     @test names[1:3] ==
-        [Symbol("mu.Intercept"), Symbol("lsig.Intercept"), Symbol("b_s_x_fixed.1")]
+        [:b0, :s0, Symbol("b_s_x_fixed.1")]
     u = [0.6; 0.6; fill(0.3, 20)]
     t3(m, s, v) = logpdf(TDist(3), (v - m) / s) - log(s)
     bridge = t3(-13, 36, 0.6) - t3(-13, 36, 0.3) + t3(0, 10, 0.6) -

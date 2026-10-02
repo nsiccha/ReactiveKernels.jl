@@ -81,8 +81,8 @@ _vs_stdnormal_prior(coefs...) =
     built = build_kernel(plan)
     @test built.layout.total == 4
     @test coordinate_names(built.layout) ==
-        [Symbol("mu.Intercept"), Symbol("mu.x"),
-            Symbol("sigma.Intercept"), Symbol("sigma.z")]
+        [:a, :b,
+            :c, :d]
 end
 
 @testset "surface: bare scale is identity, logistic is logit" begin
@@ -362,10 +362,10 @@ end
     u = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u)
     cols = _vs_cols()
-    muv = _vs_lp(nt.mu, cols[:x])
-    sgv = exp.(_vs_lp(nt.sigma, cols[:z]))
+    muv = _vs_lp([nt.a, nt.b], cols[:x])
+    sgv = exp.(_vs_lp([nt.c, nt.d], cols[:z]))
     ll = _vs_oracle_gaussian(cols[:y], muv, sgv)
-    pr = _vs_stdnormal_prior(nt.mu, nt.sigma)
+    pr = _vs_stdnormal_prior([nt.a, nt.b], [nt.c, nt.d])
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -381,14 +381,14 @@ end
         end, (:y, :x, :z)), _vs_cols())
     built = build_kernel(plan)
     @test coordinate_names(built.layout) ==
-        [Symbol("mu.Intercept"), Symbol("mu.x"), Symbol("sigma.Intercept")]
+        [:a, :b, :c]
     u = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u)
     cols = _vs_cols()
-    muv = _vs_lp(nt.mu, cols[:x])
-    sgv = fill(exp(only(nt.sigma)), length(cols[:y]))
+    muv = _vs_lp([nt.a, nt.b], cols[:x])
+    sgv = fill(exp(only([nt.c])), length(cols[:y]))
     ll = _vs_oracle_gaussian(cols[:y], muv, sgv)
-    pr = _vs_stdnormal_prior(nt.mu, nt.sigma)
+    pr = _vs_stdnormal_prior([nt.a, nt.b], [nt.c])
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -407,11 +407,11 @@ end
     built = build_kernel(plan)
     u = [0.5, -0.25, 1.0, 0.1]
     nt = constrain(built.layout, u)
-    muv = _vs_lp(nt.mu, cols[:x])
-    sgv = _vs_lp(nt.sg, cols[:z])
+    muv = _vs_lp([nt.a, nt.b], cols[:x])
+    sgv = _vs_lp([nt.c, nt.d], cols[:z])
     @test all(>(0), sgv)
     ll = _vs_oracle_gaussian(cols[:y], muv, sgv)
-    pr = _vs_stdnormal_prior(nt.mu, nt.sg)
+    pr = _vs_stdnormal_prior([nt.a, nt.b], [nt.c, nt.d])
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -426,10 +426,10 @@ end
     built = build_kernel(plan)
     u = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u)
-    muv = _vs_lp(nt.mu, cols[:x])
-    sgv = 1 ./ (1 .+ exp.(-_vs_lp(nt.sg, cols[:z])))
+    muv = _vs_lp([nt.a, nt.b], cols[:x])
+    sgv = 1 ./ (1 .+ exp.(-_vs_lp([nt.c, nt.d], cols[:z])))
     ll = _vs_oracle_gaussian(cols[:y], muv, sgv)
-    pr = _vs_stdnormal_prior(nt.mu, nt.sg)
+    pr = _vs_stdnormal_prior([nt.a, nt.b], [nt.c, nt.d])
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -453,12 +453,12 @@ end
     u = [0.2, -0.1, 0.3, 0.15]
     nt = constrain(built.layout, u)
     y = [3, 1, 6, 2, 1, 4]
-    muv = exp.(_vs_lp(nt.eta, x))
-    phiv = exp.(_vs_lp(nt.phi, z))
+    muv = exp.(_vs_lp([nt.a, nt.b], x))
+    phiv = exp.(_vs_lp([nt.c, nt.d], z))
     ll = _vs_oracle_nb2(y, muv, phiv)
-    pr = (logpdf(Normal(0, 1), nt.eta[1]) +
-        logpdf(Normal(0, 1), nt.eta[2]) +
-        logpdf(Normal(0, 1), nt.phi[1]) + logpdf(Normal(1, 2), nt.phi[2]))
+    pr = (logpdf(Normal(0, 1), nt.a) +
+        logpdf(Normal(0, 1), nt.b) +
+        logpdf(Normal(0, 1), nt.c) + logpdf(Normal(1, 2), nt.d))
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -475,10 +475,10 @@ end
     built = build_kernel(plan)
     u = [-0.2, 0.1, 0.4, -0.15]
     nt = constrain(built.layout, u)
-    muv = exp.(_vs_lp(nt.eta, x))
-    av = exp.(_vs_lp(nt.s, z))
+    muv = exp.(_vs_lp([nt.a, nt.b], x))
+    av = exp.(_vs_lp([nt.c, nt.d], z))
     ll = _vs_oracle_gamma(yg, muv, av)
-    pr = _vs_stdnormal_prior(nt.eta, nt.s)
+    pr = _vs_stdnormal_prior([nt.a, nt.b], [nt.c, nt.d])
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -499,10 +499,10 @@ end
     built = build_kernel(plan)
     u = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u)
-    muv = _vs_lp(nt.mu, cols[:x])
-    sgv = exp.(_vs_lp(nt.sigma, cols[:z]))
+    muv = _vs_lp([nt.a, nt.b], cols[:x])
+    sgv = exp.(_vs_lp([nt.c, nt.d], cols[:z]))
     ll = _vs_oracle_student(cols[:y], muv, sgv, 4.0)
-    pr = _vs_stdnormal_prior(nt.mu, nt.sigma)
+    pr = _vs_stdnormal_prior([nt.a, nt.b], [nt.c, nt.d])
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -520,8 +520,8 @@ end
     u = [0.5, -0.25, 0.1, 0.2]
     function _lps(built)
         nt = constrain(built.layout, u)
-        return _vs_lp(nt.mu, cols[:x]), exp.(_vs_lp(nt.sigma, cols[:z])),
-            _vs_stdnormal_prior(nt.mu, nt.sigma)
+        return _vs_lp([nt.a, nt.b], cols[:x]), exp.(_vs_lp([nt.c, nt.d], cols[:z])),
+            _vs_stdnormal_prior([nt.a, nt.b], [nt.c, nt.d])
     end
     # Truncated (two-sided literal bounds).
     lo, hi = -1.0, 4.0
@@ -583,11 +583,11 @@ end
     u = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u)
     y = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
-    muv = _vs_lp(nt.mu, x)
-    sgv = exp.(_vs_lp(nt.sigma, z))
+    muv = _vs_lp([nt.a, nt.b], x)
+    sgv = exp.(_vs_lp([nt.c, nt.d], z))
     ll = sum(w[i] * logpdf(Normal(muv[i], sgv[i]), y[i])
         for i in eachindex(y))
-    pr = _vs_stdnormal_prior(nt.mu, nt.sigma)
+    pr = _vs_stdnormal_prior([nt.a, nt.b], [nt.c, nt.d])
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -609,10 +609,10 @@ end
     @test built.layout.total == 6
     u = [0.5, -0.25, 0.1, 0.3, 0.1, 0.2]
     nt = constrain(built.layout, u)
-    sgv = exp.(_vs_lp(nt.sigma, z))
-    ll = _vs_oracle_gaussian(y1, _vs_lp(nt.mu1, x), sgv) +
-        _vs_oracle_gaussian(y2, _vs_lp(nt.mu2, x), sgv)
-    pr = _vs_stdnormal_prior(nt.mu1, nt.mu2, nt.sigma)
+    sgv = exp.(_vs_lp([nt.c, nt.d], z))
+    ll = _vs_oracle_gaussian(y1, _vs_lp([nt.a1, nt.b1], x), sgv) +
+        _vs_oracle_gaussian(y2, _vs_lp([nt.a2, nt.b2], x), sgv)
+    pr = _vs_stdnormal_prior([nt.a1, nt.b1], [nt.a2, nt.b2], [nt.c, nt.d])
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -639,9 +639,9 @@ end
     @test built.layout.total == 2
     u = [0.5, -0.25]
     nt = constrain(built.layout, u)
-    muv = _vs_lp(nt.mu, x)
+    muv = _vs_lp([nt.a, nt.b], x)
     ll = _vs_oracle_gaussian(y, muv, Float64.(w .+ v))
-    pr = _vs_stdnormal_prior(nt.mu)
+    pr = _vs_stdnormal_prior([nt.a, nt.b])
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -662,11 +662,11 @@ end
     @test built.layout.total == 5
     u = [0.5, -0.25, 0.1, 0.2, 0.3]
     nt = constrain(built.layout, u)
-    muv = _vs_lp(nt.mu, x)
-    sgv = exp.(nt.sg[g])
+    muv = _vs_lp([nt.a, nt.b], x)
+    sgv = exp.(nt.cs[g])
     ll = _vs_oracle_gaussian(y, muv, sgv)
-    pr = _vs_stdnormal_prior(nt.mu) +
-        sum(logpdf(Normal(0, 2), c) for c in nt.sg)
+    pr = _vs_stdnormal_prior([nt.a, nt.b]) +
+        sum(logpdf(Normal(0, 2), c) for c in nt.cs)
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -797,10 +797,10 @@ end
     built = build_kernel(plan)
     u = [0.5, -0.25, 1.2, 0.2]
     nt = constrain(built.layout, u)
-    muv = _vs_lp(nt.mu, cols[:x])
-    nuv = exp.(_vs_lp(nt.lognu, cols[:z]))
+    muv = _vs_lp([nt.a, nt.b], cols[:x])
+    nuv = exp.(_vs_lp([nt.c, nt.d], cols[:z]))
     ll = _vs_oracle_student_nu(cols[:y], muv, fill(2.0, length(muv)), nuv)
-    pr = _vs_stdnormal_prior(nt.mu, nt.lognu)
+    pr = _vs_stdnormal_prior([nt.a, nt.b], [nt.c, nt.d])
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -821,14 +821,14 @@ end
     @test r.scale == :s
     built = build_kernel(plan)
     names = coordinate_names(built.layout)
-    u = _vs_u_by_name(names, [Symbol("mu.Intercept") => 0.5,
-        Symbol("mu.x") => -0.25, Symbol("lognu.Intercept") => 1.2,
-        Symbol("lognu.z") => 0.2, :s => 0.7])
+    u = _vs_u_by_name(names, [:a => 0.5,
+        :b => -0.25, :c => 1.2,
+        :d => 0.2, :s => 0.7])
     nt = constrain(built.layout, u)
-    muv = _vs_lp(nt.mu, cols[:x])
-    nuv = exp.(_vs_lp(nt.lognu, cols[:z]))
+    muv = _vs_lp([nt.a, nt.b], cols[:x])
+    nuv = exp.(_vs_lp([nt.c, nt.d], cols[:z]))
     ll = _vs_oracle_student_nu(cols[:y], muv, fill(nt.s, length(muv)), nuv)
-    pr = _vs_stdnormal_prior(nt.mu, nt.lognu) +
+    pr = _vs_stdnormal_prior([nt.a, nt.b], [nt.c, nt.d]) +
         logpdf(Exponential(1), nt.s)
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
@@ -868,18 +868,18 @@ end
         built = build_kernel(bound)
         kern = prepare_query(built, bound, :sampler)
         names = coordinate_names(built.layout)
-        u = _vs_u_by_name(names, [Symbol("mu.Intercept") => 0.5,
-            Symbol("mu.x") => -0.25, Symbol("lognu.Intercept") => 1.2,
-            Symbol("lognu.z") => 0.2])
+        u = _vs_u_by_name(names, [:a => 0.5,
+            :b => -0.25, :c => 1.2,
+            :d => 0.2])
         @test abs(Base.invokelatest(kern, u) - (-17.041416962231473)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _vs_u_by_name(names, [Symbol("mu.Intercept") => 1.9546920098655232,
-            Symbol("mu.x") => 0.7753262549863786,
-            Symbol("lognu.Intercept") => -0.501880184299718,
-            Symbol("lognu.z") => -0.14582439639267716])
+        want = _vs_u_by_name(names, [:a => 1.9546920098655232,
+            :b => 0.7753262549863786,
+            :c => -0.501880184299718,
+            :d => -0.14582439639267716])
         @test maximum(abs.(g .- want)) < 1e-10
     end
     @testset "N1b sampled scale" begin
@@ -901,18 +901,18 @@ end
         built = build_kernel(bound)
         kern = prepare_query(built, bound, :sampler)
         names = coordinate_names(built.layout)
-        u = _vs_u_by_name(names, [Symbol("mu.Intercept") => 0.5,
-            Symbol("mu.x") => -0.25, :s => 0.7,
-            Symbol("lognu.Intercept") => 1.2, Symbol("lognu.z") => 0.2])
+        u = _vs_u_by_name(names, [:a => 0.5,
+            :b => -0.25, :s => 0.7,
+            :c => 1.2, :d => 0.2])
         @test abs(Base.invokelatest(kern, u) - (-18.367541834521536)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _vs_u_by_name(names, [Symbol("mu.Intercept") => 1.9273163723789564,
-            Symbol("mu.x") => 0.769118716029698, :s => -2.8420059732707563,
-            Symbol("lognu.Intercept") => -0.5025236398819597,
-            Symbol("lognu.z") => -0.1456643951395858])
+        want = _vs_u_by_name(names, [:a => 1.9273163723789564,
+            :b => 0.769118716029698, :s => -2.8420059732707563,
+            :c => -0.5025236398819597,
+            :d => -0.1456643951395858])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end

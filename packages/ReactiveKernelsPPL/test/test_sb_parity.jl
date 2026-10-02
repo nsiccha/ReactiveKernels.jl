@@ -294,18 +294,18 @@ end
         :totals => df.totals, :year => df.year, :year2 => df.year2)
     bound, built, kern, lay = _sb_query(prog, cols)
     names = coordinate_names(lay)
-    @test Set(names) == Set([Symbol("eta.Intercept"), Symbol("eta.year"),
-        Symbol("eta.year2")])
-    u = _sb_vec(names, [Symbol("eta.Intercept") => 0.1,
-        Symbol("eta.year") => 0.2, Symbol("eta.year2") => -0.1])
+    @test Set(names) == Set([:a, :b1,
+        :b2])
+    u = _sb_vec(names, [:a => 0.1,
+        :b1 => 0.2, :b2 => -0.1])
     @test abs(Base.invokelatest(kern, u) - (-43.311049476871304)) < 1e-12
     prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
     g = similar(u)
     sampler_value_and_gradient!(prep, g, u)
     @test all(isfinite, g)
-    want = _sb_vec(names, [Symbol("eta.Intercept") => -3.683080936679581,
-        Symbol("eta.year") => -43.93322274728044,
-        Symbol("eta.year2") => 22.58426637610638])
+    want = _sb_vec(names, [:a => -3.683080936679581,
+        :b1 => -43.93322274728044,
+        :b2 => 22.58426637610638])
     @test maximum(abs.(g .- want)) < 1e-10
     # Independent oracle at the probe.
     eta = 0.1 .+ 0.2 .* df.year .- 0.1 .* df.year2

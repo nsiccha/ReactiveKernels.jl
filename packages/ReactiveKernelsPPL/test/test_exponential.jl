@@ -57,11 +57,11 @@ end
                 eta = a .+ b .* x
                 y .~ Exponential.(exp.(eta))
             end, _exp_cols())
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _exp_posterior(kern, lay, q)
-        mu = exp.(q.eta[1] .+ q.eta[2] .* _EXP_X)
+        mu = exp.(q.a .+ q.b .* _EXP_X)
         want = sum(_exp_ref(y, m) for (y, m) in zip(_EXP_Y, mu)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "zero response row" begin
@@ -71,11 +71,11 @@ end
                 eta = a .+ b .* x
                 y .~ Exponential.(exp.(eta))
             end, cols)
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _exp_posterior(kern, lay, q)
-        mu = exp.(q.eta[1] .+ q.eta[2] .* _EXP_X)
+        mu = exp.(q.a .+ q.b .* _EXP_X)
         want = sum(_exp_ref(y, m) for (y, m) in zip(cols[:y], mu)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -99,7 +99,7 @@ end
     _exp_enzyme_check(quote
             eta = a .+ b .* x
             y .~ Exponential.(exp.(eta))
-        end, _exp_cols(), (eta = [0.5, -0.25],))
+        end, _exp_cols(), (a = 0.5, b = -0.25,))
 end
 
 # Statement-head histogram of the generated kernel (the joint-parity
@@ -233,14 +233,14 @@ _exp_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
     end
     bound, built, kern, lay = _exp_query(prog, _exp_sb_cols())
     names = coordinate_names(lay)
-    u = _exp_sb_vec(names, [Symbol("eta.Intercept") => 1.0,
-        Symbol("eta.x") => 2.0])
+    u = _exp_sb_vec(names, [:a => 1.0,
+        :b => 2.0])
     @test abs(Base.invokelatest(kern, u) - (-1003.5844317680195)) < 1e-9
     prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
     g = similar(u)
     sampler_value_and_gradient!(prep, g, u)
     @test all(isfinite, g)
-    want = _exp_sb_vec(names, [Symbol("eta.Intercept") => 784.5874585864623,
-        Symbol("eta.x") => -1814.924922891652])
+    want = _exp_sb_vec(names, [:a => 784.5874585864623,
+        :b => -1814.924922891652])
     @test maximum(abs.(g .- want)) < 1e-8
 end

@@ -331,15 +331,15 @@ _ig_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _ig_query(prog, _ig_sb_cols())
         names = coordinate_names(lay)
-        u = _ig_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25, :lam => 0.1])
+        u = _ig_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :lam => 0.1])
         @test abs(Base.invokelatest(kern, u) - (-107.94448350852093)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _ig_sb_vec(names, [Symbol("eta.Intercept") => -5.801800479513927,
-            Symbol("eta.x") => 0.7403371085658694,
+        want = _ig_sb_vec(names, [:a => -5.801800479513927,
+            :b => 0.7403371085658694,
             :lam => 18.43769416175131])
         @test maximum(abs.(g .- want)) < 1e-10
     end
@@ -354,15 +354,15 @@ _ig_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _ig_query(prog, _ig_sb_cols())
         names = coordinate_names(lay)
-        u = _ig_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25])
+        u = _ig_sb_vec(names, [:a => 0.5,
+            :b => -0.25])
         @test abs(Base.invokelatest(kern, u) - (-102.28730407429342)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _ig_sb_vec(names, [Symbol("eta.Intercept") => -7.867384126223681,
-            Symbol("eta.x") => 0.9905368316042678])
+        want = _ig_sb_vec(names, [:a => -7.867384126223681,
+            :b => 0.9905368316042678])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end
@@ -382,17 +382,17 @@ end
     end
     bound, built, kern, lay = _ig_query(prog, _ig_i1_cols())
     names = coordinate_names(lay)
-    u = _ig_sb_vec(names, [Symbol("eta.Intercept") => 0.2,
-        Symbol("eta.x") => -0.1, Symbol("ls.Intercept") => 0.5,
-        Symbol("ls.z") => 0.1])
+    u = _ig_sb_vec(names, [:a => 0.2,
+        :b => -0.1, :c => 0.5,
+        :d => 0.1])
     @test abs(Base.invokelatest(kern, u) - (-10.804159781573498)) < 1e-12
     prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
     g = similar(u)
     sampler_value_and_gradient!(prep, g, u)
     @test all(isfinite, g)
-    want = _ig_sb_vec(names, [Symbol("eta.Intercept") => 1.4612006167004556,
-        Symbol("eta.x") => 4.193945941766732,
-        Symbol("ls.Intercept") => 1.3216386315587654,
-        Symbol("ls.z") => 0.8983364646506092])
+    want = _ig_sb_vec(names, [:a => 1.4612006167004556,
+        :b => 4.193945941766732,
+        :c => 1.3216386315587654,
+        :d => 0.8983364646506092])
     @test maximum(abs.(g .- want)) < 1e-10
 end

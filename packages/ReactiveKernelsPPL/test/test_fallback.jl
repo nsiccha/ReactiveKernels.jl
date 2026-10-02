@@ -41,11 +41,17 @@ function _fb_build(prog::Expr, names)
     return plan, bound, built, kern
 end
 
-# The packed vector at a constrained probe; entries the probe leaves out
-# (the empty coefficient block of a coefficient-free composed predictor)
-# come from the layout itself.
-_fb_unconstrain(lay, q::NamedTuple) =
-    unconstrain(lay, merge(constrain(lay, zeros(lay.total)), q))
+# The packed vector at a constrained probe (keyed by the author's names);
+# entries the probe leaves out (the empty coefficient block of a
+# coefficient-free composed predictor) come from the layout itself. A
+# probe key the layout does not report fails loudly, never silently
+# ignored by the merge.
+function _fb_unconstrain(lay, q::NamedTuple)
+    base = constrain(lay, zeros(lay.total))
+    extra = setdiff(keys(q), keys(base))
+    isempty(extra) || error("probe keys $(extra) are not draws keys $(keys(base))")
+    return unconstrain(lay, merge(base, q))
+end
 
 # Posterior at a constrained probe vs `want(q)` (likelihood + priors at
 # the constrained values) plus the layout's log-Jacobian.
@@ -59,12 +65,6 @@ function _fb_check(prog::Expr, names, q::NamedTuple, want)
 end
 
 _fb_normal_ll(mu, sigma) = sum(logpdf.(Normal.(mu, sigma), _fb_col(:y)))
-
-# The intercept and slope a probe reads: a predictor's coefficient block
-# (`mu`, in Intercept/column order) when the affine path owns them, else
-# the ordinary scalars (a composition keeps `a`, `b` as names).
-_fb_a(q) = haskey(q, :a) ? q.a : q.mu[1]
-_fb_b(q) = haskey(q, :b) ? q.b : q.mu[2]
 
 const _FB_NC_ALIAS = quote
     a ~ Normal(0, 5); sg ~ HalfNormal(1)
@@ -160,8 +160,8 @@ end
             sigma ~ Exponential(1)
             mu = a .+ b .* x
             y .~ Normal.(mu, sigma)
-        end, (:y, :x), (mu = [0.4, -0.7], s = 0.8, sigma = 1.3), q -> begin
-            a, b = q.mu
+        end, (:y, :x), (a = 0.4, b = -0.7, s = 0.8, sigma = 1.3), q -> begin
+            a, b = q.a, q.b
             _fb_normal_ll(a .+ b .* x, q.sigma) +
                 logpdf(_fb_halfnormal(1), q.s) + logpdf(Normal(0, 5), a) +
                 logpdf(Normal(0, q.s), b) + logpdf(Exponential(1), q.sigma)
@@ -174,19 +174,19 @@ end
             b = s * z; sigma ~ Exponential(1)
             mu = a .+ b .* x
             y .~ Normal.(mu, sigma)
-        end, (:y, :x), (mu = [0.4], s = 0.8, z = -0.6, sigma = 1.3), q -> begin
-            _fb_normal_ll(q.mu[1] .+ q.s * q.z .* x, q.sigma) +
+        end, (:y, :x), (a = 0.4, s = 0.8, z = -0.6, sigma = 1.3), q -> begin
+            _fb_normal_ll(q.a .+ q.s * q.z .* x, q.sigma) +
                 logpdf(_fb_halfnormal(1), q.s) +
-                logpdf(Normal(0, 5), q.mu[1]) + logpdf(Normal(0, 1), q.z) +
+                logpdf(Normal(0, 5), q.a) + logpdf(Normal(0, 1), q.z) +
                 logpdf(Exponential(1), q.sigma)
         end)
     end
-    nc_want(zv) = q -> _fb_normal_ll(_fb_a(q) .+ q.sg .* q[zv][g], q.sigma) +
-        logpdf(Normal(0, 5), _fb_a(q)) + logpdf(_fb_halfnormal(1), q.sg) +
+    nc_want(zv) = q -> _fb_normal_ll(q.a .+ q.sg .* q[zv][g], q.sigma) +
+        logpdf(Normal(0, 5), q.a) + logpdf(_fb_halfnormal(1), q.sg) +
         sum(logpdf.(Normal(0, 1), q[zv])) + logpdf(Exponential(1), q.sigma)
     @testset "P3 / A2 non-centered intercept, inline and alias" begin
         _fb_check(_FB_NC_INLINE, (:y, :g), (z = [0.3, -0.9, 1.4],
-            mu = [0.2], sg = 0.7, sigma = 1.1), nc_want(:z))
+            a = 0.2, sg = 0.7, sigma = 1.1), nc_want(:z))
         _fb_check(_FB_NC_ALIAS, (:y, :g), (zg = [0.3, -0.9, 1.4],
             a = 0.2, sg = 0.7, sigma = 1.1), nc_want(:zg))
     end
@@ -196,7 +196,7 @@ end
             z[levels(g)] .~ Normal.(0, 1); sigma ~ Exponential(1)
             mu = a .+ z[g] .* sg
             y .~ Normal.(mu, sigma)
-        end, (:y, :g), (z = [0.3, -0.9, 1.4], mu = [0.2], sg = 0.7,
+        end, (:y, :g), (z = [0.3, -0.9, 1.4], a = 0.2, sg = 0.7,
             sigma = 1.1), nc_want(:z))
     end
     @testset "P3c intercept + hierarchical full-cover factor" begin
@@ -205,9 +205,10 @@ end
             c[levels(g)] .~ Normal.(0, sg); sigma ~ Exponential(1)
             mu = a .+ c[g]
             y .~ Normal.(mu, sigma)
-        end, (:y, :g), (mu = [0.2, 0.3, -0.9, 1.4], sg = 0.7, sigma = 1.1),
+        end, (:y, :g), (a = 0.2, c = [0.3, -0.9, 1.4], sg = 0.7,
+            sigma = 1.1),
         q -> begin
-            a, c = q.mu[1], q.mu[2:4]
+            a, c = q.a, q.c
             _fb_normal_ll(a .+ c[g], q.sigma) + logpdf(Normal(0, 5), a) +
                 logpdf(_fb_halfnormal(1), q.sg) +
                 sum(logpdf.(Normal(0, q.sg), c)) +
@@ -228,9 +229,9 @@ end
             sigma ~ Exponential(1)
             mu = a .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :g), (mu = [0.2, 0.3, -0.9, 1.4], r_sg = 0.7,
+        end, (:y, :g), (a = 0.2, r_c = [0.3, -0.9, 1.4], r_sg = 0.7,
             sigma = 1.1), q -> begin
-            a, c = q.mu[1], q.mu[2:4]
+            a, c = q.a, q.r_c
             _fb_normal_ll(a .+ c[g], q.sigma) + logpdf(Normal(0, 5), a) +
                 logpdf(_fb_halfnormal(1), q.r_sg) +
                 sum(logpdf.(Normal(0, q.r_sg), c)) +
@@ -240,7 +241,7 @@ end
     @testset "P4 varying slope, inline and alias" begin
         slope_want(cv) = q -> begin
             c = q[cv]
-            a, b = _fb_a(q), _fb_b(q)
+            a, b = q.a, q.b
             _fb_normal_ll(a .+ b .* x .+ c[g] .* x, q.sigma) +
                 logpdf(Normal(0, 5), a) + logpdf(Normal(0, 1), b) +
                 logpdf(_fb_halfnormal(1), q.sg) +
@@ -248,16 +249,16 @@ end
                 logpdf(Exponential(1), q.sigma)
         end
         _fb_check(_FB_SLOPE_INLINE, (:y, :x, :g), (c = [0.3, -0.9, 1.4],
-            mu = [0.2, -0.4], sg = 0.7, sigma = 1.1), slope_want(:c))
+            a = 0.2, b = -0.4, sg = 0.7, sigma = 1.1), slope_want(:c))
         _fb_check(_FB_SLOPE_ALIAS, (:y, :x, :g), (cg = [0.3, -0.9, 1.4],
             a = 0.2, b = -0.4, sg = 0.7, sigma = 1.1), slope_want(:cg))
     end
-    hs_want(q) = _fb_normal_ll(q.mu[1] .+ (q.z * q.lam * q.tau) .* x,
-        q.sigma) + logpdf(Normal(0, 5), q.mu[1]) +
+    hs_want(q) = _fb_normal_ll(q.a .+ (q.z * q.lam * q.tau) .* x,
+        q.sigma) + logpdf(Normal(0, 5), q.a) +
         logpdf(_fb_halfcauchy(1), q.lam) + logpdf(_fb_halfcauchy(1), q.tau) +
         logpdf(Normal(0, 1), q.z) + logpdf(Exponential(1), q.sigma)
     @testset "P5 horseshoe spelled out" begin
-        _fb_check(_FB_COMPUTED, (:y, :x), (mu = [0.4], lam = 0.9, tau = 0.3,
+        _fb_check(_FB_COMPUTED, (:y, :x), (a = 0.4, lam = 0.9, tau = 0.3,
             z = -1.2, sigma = 1.3), hs_want)
     end
     @testset "Q1/Q4 reordered `x .* (z * lam * tau)`" begin
@@ -266,7 +267,7 @@ end
             z ~ Normal(0, 1); sigma ~ Exponential(1)
             mu = a .+ x .* (z * lam * tau)
             y .~ Normal.(mu, sigma)
-        end, (:y, :x), (mu = [0.4], lam = 0.9, tau = 0.3, z = -1.2,
+        end, (:y, :x), (a = 0.4, lam = 0.9, tau = 0.3, z = -1.2,
             sigma = 1.3), hs_want)
     end
     @testset "Q3 computed coefficient in a named column" begin
@@ -280,7 +281,7 @@ end
             mu = a .+ eff
             y .~ Normal.(mu, sigma)
         end, (:y, :x), (a = 0.4, lam = 0.9, tau = 0.3, z = -1.2,
-            sigma = 1.3), q -> hs_want(merge(q, (mu = [q.a],))))
+            sigma = 1.3), hs_want)
         @test only(plan.derived).expr == :((z * lam * tau) .* x)
         @test only(only(plan.predictors[1].terms).columns) ===
               only(plan.derived).name
@@ -291,17 +292,17 @@ end
             sigma ~ Exponential(1)
             mu = a .+ b .* x .+ s .* x1
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :x1), (mu = [0.4, -0.3], s = 0.8, sigma = 1.3),
-        q -> _fb_normal_ll(q.mu[1] .+ q.mu[2] .* x .+ q.s .* x1, q.sigma) +
-            logpdf(Normal(0, 5), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2]) +
+        end, (:y, :x, :x1), (a = 0.4, b = -0.3, s = 0.8, sigma = 1.3),
+        q -> _fb_normal_ll(q.a .+ q.b .* x .+ q.s .* x1, q.sigma) +
+            logpdf(Normal(0, 5), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(_fb_halfnormal(1), q.s) + logpdf(Exponential(1), q.sigma))
     end
     @testset "expression coefficient scale (assignment)" begin
-        plan = _fb_check(_FB_EXPR_SCALE, (:y, :x), (mu = [0.4, -0.3],
-            sigma = 1.3), q -> _fb_normal_ll(q.mu[1] .+ q.mu[2] .* x,
-            q.sigma) + logpdf(Normal(0, 5), q.mu[1]) +
+        plan = _fb_check(_FB_EXPR_SCALE, (:y, :x), (a = 0.4, b = -0.3,
+            sigma = 1.3), q -> _fb_normal_ll(q.a .+ q.b .* x,
+            q.sigma) + logpdf(Normal(0, 5), q.a) +
             logpdf(Normal(0, 1 / sqrt(sum(abs2, x .- sum(x) / length(x)) /
-                (length(x) - 1))), q.mu[2]) + logpdf(Exponential(1), q.sigma))
+                (length(x) - 1))), q.b) + logpdf(Exponential(1), q.sigma))
         @test plan.population_priors[2].scale === :_rkppl_b_arg2
         @test only(plan.assignments).expr == :(1 / sqrt(var(x)))
         # Literal arithmetic folds to a literal.
@@ -317,9 +318,9 @@ end
             a ~ Normal(0, 5); b ~ HalfNormal(2); sigma ~ Exponential(1)
             mu = a .+ b .* x
             y .~ Normal.(mu, sigma)
-        end, (:y, :x), (mu = [0.4], b = 0.6, sigma = 1.3),
-        q -> _fb_normal_ll(q.mu[1] .+ q.b .* x, q.sigma) +
-            logpdf(Normal(0, 5), q.mu[1]) + logpdf(_fb_halfnormal(2), q.b) +
+        end, (:y, :x), (a = 0.4, b = 0.6, sigma = 1.3),
+        q -> _fb_normal_ll(q.a .+ q.b .* x, q.sigma) +
+            logpdf(Normal(0, 5), q.a) + logpdf(_fb_halfnormal(2), q.b) +
             logpdf(Exponential(1), q.sigma))
     end
     @testset "a coefficient another prior reads is an ordinary parameter" begin
@@ -328,43 +329,43 @@ end
             sigma ~ Exponential(1)
             mu = a .+ b .* x .+ c .* x1
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :x1), (mu = [0.4, 0.9], b = -0.5, sigma = 1.3),
-        q -> _fb_normal_ll(q.mu[1] .+ q.b .* x .+ q.mu[2] .* x1, q.sigma) +
-            logpdf(Normal(0, 5), q.mu[1]) + logpdf(Normal(0, 1), q.b) +
-            logpdf(Normal(q.b, 1), q.mu[2]) + logpdf(Exponential(1), q.sigma))
+        end, (:y, :x, :x1), (a = 0.4, c = 0.9, b = -0.5, sigma = 1.3),
+        q -> _fb_normal_ll(q.a .+ q.b .* x .+ q.c .* x1, q.sigma) +
+            logpdf(Normal(0, 5), q.a) + logpdf(Normal(0, 1), q.b) +
+            logpdf(Normal(q.b, 1), q.c) + logpdf(Exponential(1), q.sigma))
         @test plan.population_priors[2].location === :b
         # One coefficient used on two columns: one parameter, two columns.
         _fb_check(quote
             a ~ Normal(0, 5); b ~ Normal(0, 1); sigma ~ Exponential(1)
             mu = a .+ b .* x .+ b .* x1
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :x1), (mu = [0.4], b = -0.5, sigma = 1.3),
-        q -> _fb_normal_ll(q.mu[1] .+ q.b .* (x .+ x1), q.sigma) +
-            logpdf(Normal(0, 5), q.mu[1]) + logpdf(Normal(0, 1), q.b) +
+        end, (:y, :x, :x1), (a = 0.4, b = -0.5, sigma = 1.3),
+        q -> _fb_normal_ll(q.a .+ q.b .* (x .+ x1), q.sigma) +
+            logpdf(Normal(0, 5), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(Exponential(1), q.sigma))
     end
     @testset "signed asymmetric and hierarchical priors" begin
-        # `Uniform(0, 2)` under `.-` keeps b in (0, 2): the stored
-        # coordinate is -b in (-2, 0).
+        # `Uniform(0, 2)` under `.-` keeps b in (0, 2): the coefficient is
+        # `b` itself and the sign negates its design column.
         _fb_check(quote
             a ~ Normal(0, 5); b ~ Uniform(0, 2); sigma ~ Exponential(1)
             mu = a .- b .* x
             y .~ Normal.(mu, sigma)
-        end, (:y, :x), (mu = [0.4, -1.5], sigma = 1.3),
-        q -> _fb_normal_ll(q.mu[1] .+ q.mu[2] .* x, q.sigma) +
-            logpdf(Normal(0, 5), q.mu[1]) +
-            logpdf(Uniform(0, 2), -q.mu[2]) + logpdf(Exponential(1), q.sigma))
-        # A sign-flipped hierarchical location negates through an
-        # assignment instead of refusing.
+        end, (:y, :x), (a = 0.4, b = 1.5, sigma = 1.3),
+        q -> _fb_normal_ll(q.a .- q.b .* x, q.sigma) +
+            logpdf(Normal(0, 5), q.a) +
+            logpdf(Uniform(0, 2), q.b) + logpdf(Exponential(1), q.sigma))
+        # A sign-flipped hierarchical factor keeps its prior as written
+        # (the sign negates its dummy columns).
         _fb_check(quote
             m ~ Normal(0, 1); s ~ HalfNormal(1)
             c[levels(g)] .~ Normal.(m, s); sigma ~ Exponential(1)
             mu = .-(c[g])
             y .~ Normal.(mu, sigma)
-        end, (:y, :g), (mu = [-0.3, 0.9, -1.4], m = 0.5, s = 0.7,
-            sigma = 1.1), q -> _fb_normal_ll(q.mu[g], q.sigma) +
+        end, (:y, :g), (c = [0.3, -0.9, 1.4], m = 0.5, s = 0.7,
+            sigma = 1.1), q -> _fb_normal_ll(.-q.c[g], q.sigma) +
             logpdf(Normal(0, 1), q.m) + logpdf(_fb_halfnormal(1), q.s) +
-            sum(logpdf.(Normal(q.m, q.s), .-q.mu)) +
+            sum(logpdf.(Normal(q.m, q.s), q.c)) +
             logpdf(Exponential(1), q.sigma))
     end
     # Element reads of a simplex (P6, P6b, Q6): `phi[1]` is a scalar in a
@@ -373,15 +374,17 @@ end
     @testset "simplex element reads" begin
         x1, x2 = _fb_col(:x1), _fb_col(:x2)
         v(c) = sum(abs2, c .- sum(c) / length(c)) / (length(c) - 1)
-        r2d2_want(q) = _fb_normal_ll(q.mu[1] .+ q.mu[2] .* x1 .+
-                q.mu[3] .* x2, q.sigma) + logpdf(Normal(0, 5), q.mu[1]) +
+        # The two coefficients: scalars `b1`, `b2` or one vector `b`.
+        bs(q) = haskey(q, :b) ? q.b : [q.b1, q.b2]
+        r2d2_want(q) = _fb_normal_ll(q.a .+ bs(q)[1] .* x1 .+
+                bs(q)[2] .* x2, q.sigma) + logpdf(Normal(0, 5), q.a) +
             logpdf(Beta(1, 1), q.R2) + logpdf(Dirichlet([1.0, 1.0]), q.phi) +
             logpdf(_fb_halfnormal(1), q.tau) +
             logpdf(Normal(0, sqrt(q.phi[1] * q.R2 * q.tau^2 / v(x1))),
-                q.mu[2]) +
+                bs(q)[1]) +
             logpdf(Normal(0, sqrt(q.phi[2] * q.R2 * q.tau^2 / v(x2))),
-                q.mu[3]) + logpdf(Exponential(1), q.sigma)
-        q = (mu = [0.4, 0.7, -0.5], R2 = 0.3, tau = 0.8, sigma = 1.3,
+                bs(q)[2]) + logpdf(Exponential(1), q.sigma)
+        q = (a = 0.4, b1 = 0.7, b2 = -0.5, R2 = 0.3, tau = 0.8, sigma = 1.3,
             phi = [0.35, 0.65])
         # P6: the R2D2 prior spelled out per coefficient.
         _fb_check(quote
@@ -401,16 +404,17 @@ end
                 sqrt(phi[2] * R2 * tau^2 / var(x2))])
             mu = a .+ X * b
             y .~ Normal.(mu, sigma)
-        end, (:y, :x1, :x2), q, r2d2_want)
+        end, (:y, :x1, :x2), merge(Base.structdiff(q, NamedTuple{(:b1, :b2)}),
+            (b = [q.b1, q.b2],)), r2d2_want)
         # Q6: simplex elements as computed coefficients.
         _fb_check(quote
             a ~ Normal(0, 5); phi ~ Dirichlet([1.0, 1.0])
             sigma ~ Exponential(1)
             mu = a .+ x1 .* phi[1] .+ x2 .* phi[2]
             y .~ Normal.(mu, sigma)
-        end, (:y, :x1, :x2), (mu = [0.4], sigma = 1.3, phi = [0.35, 0.65]),
-        q -> _fb_normal_ll(q.mu[1] .+ x1 .* q.phi[1] .+ x2 .* q.phi[2],
-                q.sigma) + logpdf(Normal(0, 5), q.mu[1]) +
+        end, (:y, :x1, :x2), (a = 0.4, sigma = 1.3, phi = [0.35, 0.65]),
+        q -> _fb_normal_ll(q.a .+ x1 .* q.phi[1] .+ x2 .* q.phi[2],
+                q.sigma) + logpdf(Normal(0, 5), q.a) +
             logpdf(Dirichlet([1.0, 1.0]), q.phi) +
             logpdf(Exponential(1), q.sigma))
         # The whole simplex read as a scalar stays refused.
@@ -434,11 +438,11 @@ end
             mu = a .+ x .* (z * lam * tau) .+ sg .* zz[g] .+ x1 .* phi[1]
             y .~ Normal.(mu, sigma)
         end
-        q = (mu = [0.4], lam = 0.9, tau = 0.3, z = -1.2, sg = 0.7,
+        q = (a = 0.4, lam = 0.9, tau = 0.3, z = -1.2, sg = 0.7,
             zz = [0.2, -0.5, 0.9], phi = [0.35, 0.65], sigma = 1.3)
-        _fb_check(prog, (:y, :x, :x1, :g), q, q -> _fb_normal_ll(_fb_a(q) .+
+        _fb_check(prog, (:y, :x, :x1, :g), q, q -> _fb_normal_ll(q.a .+
                 x .* (q.z * q.lam * q.tau) .+ q.sg .* q.zz[g] .+
-                x1 .* q.phi[1], q.sigma) + logpdf(Normal(0, 5), _fb_a(q)) +
+                x1 .* q.phi[1], q.sigma) + logpdf(Normal(0, 5), q.a) +
             logpdf(_fb_halfcauchy(1), q.lam) +
             logpdf(_fb_halfcauchy(1), q.tau) + logpdf(Normal(0, 1), q.z) +
             logpdf(_fb_halfnormal(1), q.sg) +
@@ -452,8 +456,7 @@ end
         insert!(alias.args, length(alias.args), :(zg = zz[g]))
         insert!(alias.args, length(alias.args), :(mu = a .+ x .* (z * lam *
             tau) .+ sg .* zg .+ x1 .* phi[1]))
-        qa = merge(Base.structdiff(q, NamedTuple{(:zz, :mu)}),
-            (zg = q.zz, a = q.mu[1]))
+        qa = merge(Base.structdiff(q, NamedTuple{(:zz,)}), (zg = q.zz,))
         _fb_check(alias, (:y, :x, :x1, :g), qa, q -> _fb_normal_ll(q.a .+
                 x .* (q.z * q.lam * q.tau) .+ q.sg .* q.zg[g] .+
                 x1 .* q.phi[1], q.sigma) + logpdf(Normal(0, 5), q.a) +
@@ -524,10 +527,10 @@ end
 @testset "fallback: Enzyme gradients" begin
     for (prog, names, q) in (
             (_FB_NC_INLINE, (:y, :g), (z = [0.3, -0.9, 1.4],
-                mu = [0.2], sg = 0.7, sigma = 1.1)),
-            (_FB_COMPUTED, (:y, :x), (mu = [0.4], lam = 0.9, tau = 0.3,
+                a = 0.2, sg = 0.7, sigma = 1.1)),
+            (_FB_COMPUTED, (:y, :x), (a = 0.4, lam = 0.9, tau = 0.3,
                 z = -1.2, sigma = 1.3)),
-            (_FB_EXPR_SCALE, (:y, :x), (mu = [0.4, -0.3], sigma = 1.3)))
+            (_FB_EXPR_SCALE, (:y, :x), (a = 0.4, b = -0.3, sigma = 1.3)))
         _, bound, built, kern = _fb_build(prog, names)
         u = _fb_unconstrain(built.layout, q)
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)

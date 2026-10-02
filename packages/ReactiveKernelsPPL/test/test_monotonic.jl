@@ -323,7 +323,7 @@ end
     layout = assign_layout(bound)
     @test layout.total == 4
     @test coordinate_names(layout) ==
-        [Symbol("mu.Intercept"), Symbol("mu.c"), :sigma, Symbol("s.1")]
+        [:a, :b, :sigma, Symbol("s.1")]
     # mo1 contributes no design width and no coefficient.
     bound1 = bind_data(_mo_struct_plan(MonotonicSummandTerm), _mo_cols())
     shape1 = design_shape(bound1.predictors[1], bound1.columns;
@@ -366,9 +366,9 @@ end
     nt = constrain(built.layout, u)
     s = Vector{Float64}(nt.s)
     contrast = _ref_contrast(s, cols[:c])
-    mu = nt.mu[1] .+ nt.mu[2] .* contrast
+    mu = nt.a .+ nt.b .* contrast
     ll = _ref_gauss_ll(cols[:y], mu, nt.sigma)
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
         logpdf(Exponential(1), nt.sigma) + logpdf(Dirichlet(alpha), s)
     jac = u[3] + simplex_logjac([u[4]])
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
@@ -396,9 +396,9 @@ end
     u = [0.5, 0.1, 0.3]
     nt = constrain(built.layout, u)
     s = Vector{Float64}(nt.s)
-    mu = nt.mu[1] .+ _ref_contrast(s, cols[:c])
+    mu = nt.a .+ _ref_contrast(s, cols[:c])
     ll = _ref_gauss_ll(cols[:y], mu, nt.sigma)
-    pr = logpdf(Normal(0, 1), nt.mu[1]) +
+    pr = logpdf(Normal(0, 1), nt.a) +
         logpdf(Exponential(1), nt.sigma) + logpdf(Dirichlet(alpha), s)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2] +
         simplex_logjac([u[3]])
@@ -456,9 +456,9 @@ end
     u = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u)
     @test Vector{Float64}(nt.s) == [1.0]
-    mu = nt.mu[1] .+ nt.mu[2] .* [0.0, 1.0, 0.0, 1.0]
+    mu = nt.a .+ nt.b .* [0.0, 1.0, 0.0, 1.0]
     ll = _ref_gauss_ll(cols[:y], mu, nt.sigma)
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
         logpdf(Exponential(1), nt.sigma) + logpdf(Dirichlet([1.0]), [1.0])
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[3]
     _check_gradient(built.spec, bound, u)
@@ -478,18 +478,17 @@ end
                 y .~ Normal.(mu, sigma)
             end, (:y, :c, :x, :g)), cols)
     built = build_kernel(bound)
-    @test coordinate_names(built.layout)[1:5] == [Symbol("mu.c"),
-        Symbol("mu.x"), Symbol("mu.g_1"), Symbol("mu.g_2"),
-        Symbol("mu.g_3")]
+    @test coordinate_names(built.layout)[1:5] == [:b, :d, Symbol("cf.1"),
+        Symbol("cf.2"), Symbol("cf.3")]
     u = [-0.25, 0.75, 0.1, -0.2, 0.3, 0.1, 0.3]
     nt = constrain(built.layout, u)
     s = Vector{Float64}(nt.s)
     contrast = _ref_contrast(s, cols[:c])
-    mu = nt.mu[1] .* contrast .+ nt.mu[2] .* cols[:x] .+
-        [nt.mu[2 + gi] for gi in cols[:g]]
+    mu = nt.b .* contrast .+ nt.d .* cols[:x] .+
+        [nt.cf[gi] for gi in cols[:g]]
     ll = _ref_gauss_ll(cols[:y], mu, nt.sigma)
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
-        sum(logpdf(Normal(0, 2), b) for b in nt.mu[3:5]) +
+    pr = logpdf(Normal(0, 1), nt.b) + logpdf(Normal(0, 1), nt.d) +
+        sum(logpdf(Normal(0, 2), b) for b in nt.cf) +
         logpdf(Exponential(1), nt.sigma) +
         logpdf(Dirichlet([1.0, 2.0]), s)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[6] +
@@ -617,15 +616,15 @@ end
                 end, (:y, :c)), cols)
         built = build_kernel(bound)
         lay = built.layout
-        @test coordinate_names(lay) == [Symbol("mu.Intercept"),
-            Symbol("mu.c"), :sigma, Symbol("s.1"), Symbol("s.2")]
+        @test coordinate_names(lay) == [:a,
+            :b, :sigma, Symbol("s.1"), Symbol("s.2")]
         u = [0.6, -0.2, 0.1, 0.3, -0.4]
         nt = constrain(lay, u)
         s = Vector{Float64}(nt.s)
-        mu = nt.mu[1] .+ nt.mu[2] .* _ref_contrast(s, cols[:c])
+        mu = nt.a .+ nt.b .* _ref_contrast(s, cols[:c])
         ll = _ref_gauss_ll(cols[:y], mu, nt.sigma)
-        pr = logpdf(Normal(0, 1), nt.mu[1]) +
-            logpdf(Normal(0, 1), nt.mu[2]) +
+        pr = logpdf(Normal(0, 1), nt.a) +
+            logpdf(Normal(0, 1), nt.b) +
             logpdf(Exponential(1), nt.sigma) +
             logpdf(Dirichlet([1.0, 2.0, 3.0]), s)
         post = _query(built.spec, bound, :posterior, u)
@@ -659,13 +658,13 @@ end
         built = build_kernel(bound)
         lay = built.layout
         @test coordinate_names(lay) ==
-            [Symbol("mu.Intercept"), :sigma, Symbol("s.1")]
+            [:a, :sigma, Symbol("s.1")]
         u = [0.5, 0.1, 0.3]
         nt = constrain(lay, u)
         s = Vector{Float64}(nt.s)
-        mu = nt.mu[1] .+ _ref_contrast(s, cols[:c])
+        mu = nt.a .+ _ref_contrast(s, cols[:c])
         ll = _ref_gauss_ll(cols[:y], mu, nt.sigma)
-        pr = logpdf(Normal(0, 1), nt.mu[1]) +
+        pr = logpdf(Normal(0, 1), nt.a) +
             logpdf(Exponential(1), nt.sigma) +
             logpdf(Dirichlet([1.0, 2.0]), s)
         post = _query(built.spec, bound, :posterior, u)
