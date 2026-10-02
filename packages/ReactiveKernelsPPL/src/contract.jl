@@ -6781,7 +6781,14 @@ function _validate_predictor_columns(plan::StructuralPlan)
     return nothing
 end
 
+# Scalar offset values have no observation axis until preprocessing
+# broadcasts them. They are assignments, never design coefficients.
+_is_scalar_offset(t::TermSpec, plan::StructuralPlan) =
+    t.kind === OffsetTerm && any(a -> a.name === only(t.columns), plan.assignments) &&
+    _value_axes(plan, only(t.columns)) == Any[]
+
 function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    _is_scalar_offset(t, plan) && return nothing
     # Latent terms name a per-cell latent VECTOR (a PlateParameter), not a
     # raw/derived data column; structure validation checked its presence.
     t.kind === LatentTerm && return nothing

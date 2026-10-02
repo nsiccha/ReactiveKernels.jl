@@ -26,6 +26,75 @@ _av_point(n) = [0.37 * sin(1.3 * i) - 0.2 for i in 1:n]
 
 _av_node(built, bound, node, u) = _query(built.spec, bound, node, u)
 
+@testset "array values: positional scalar offsets" begin
+    for kind in (:vector, :matrix), named in (false, true), sign in (1, -1)
+        declaration, read = kind === :vector ?
+            (:(z[1:3] .~ Normal.(0, 1)), :(z[2])) :
+            (:(L ~ LKJCholesky(2, 1.0)), :(L[2, 1]))
+        definition = named ? :(r = $read) : nothing
+        value = named ? :r : read
+        location = sign > 0 ? :(a .+ $value .+ x) : :(a .- $value .+ x)
+        ast = quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            $declaration
+            $definition
+            mu = $location
+            y .~ Normal.(mu, sigma)
+        end
+        filter!(!isnothing, ast.args)
+        plan = lower_rkppl(ast, (:y, :x))
+        @test isempty(plan.derived)
+        @test length(plan.assignments) == 1
+        @test only(plan.predictors).terms[2].kind === OffsetTerm
+        for n in (3, 8)
+            y, x = _av_y()[1:n], _av_x()[1:n]
+            bound = bind_data(plan, Dict(:y => y, :x => x))
+            built = build_kernel(bound)
+            @test built.layout.total == (kind === :vector ? 5 : 3)
+            u = _av_point(built.layout.total)
+            nt = constrain(built.layout, u)
+            offset = kind === :vector ? nt.z[2] : nt.L[2, 1]
+            array_prior = kind === :vector ? sum(logpdf.(Normal(), nt.z)) :
+                logpdf(LKJCholesky(2, 1.0), Cholesky(LowerTriangular(nt.L)))
+            prior = array_prior + logpdf(Normal(0, 5), only(nt.mu)) +
+                logpdf(Exponential(1), nt.sigma)
+            likelihood = sum(logpdf.(Normal.(only(nt.mu) .+ sign * offset .+ x,
+                nt.sigma), y))
+            @test _av_node(built, bound, :prior, u) ≈ prior
+            @test _av_node(built, bound, :likelihood, u) ≈ likelihood
+            @test _av_node(built, bound, :posterior, u) ≈
+                prior + likelihood + logjac(built.layout, u)
+            _check_gradient(built.spec, bound, u)
+        end
+    end
+end
+
+@testset "array values: composed positional scalar offsets" begin
+    # Multiple reads, an array-valued definition and no coefficient.
+    ast = quote
+        z[1:3] .~ Normal.(0, 1)
+        M = (2 .* z)'
+        mu = x .+ M[1, 2] .- z[1] .+ z[2]
+        nu = x2
+        y .~ Normal.(mu, 0.7)
+        y2 .~ Normal.(nu, 0.7)
+    end
+    y, x = _av_y(), _av_x()
+    y2, x2 = _av_y(), _av_x2()
+    bound = bind_data(lower_rkppl(ast, (:y, :x, :y2, :x2)),
+        Dict(:y => y, :x => x, :y2 => y2, :x2 => x2))
+    built = build_kernel(bound)
+    @test built.layout.total == 3
+    u = _av_point(3)
+    z = constrain(built.layout, u).z
+    want = sum(logpdf.(Normal(), z)) +
+        sum(logpdf.(Normal.(x .+ 3z[2] .- z[1], 0.7), y)) +
+        sum(logpdf.(Normal.(x2, 0.7), y2))
+    @test _av_node(built, bound, :posterior, u) ≈ want
+    _check_gradient(built.spec, bound, u)
+end
+
 @testset "array values: LKJCholesky factor read as a matrix" begin
     m = @rkppl begin
         L ~ LKJCholesky(3, 2.0)

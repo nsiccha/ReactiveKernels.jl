@@ -252,6 +252,7 @@ end
     @test repr(only(plan.array_parameters).args.arg2) == repr(:([1, 2, 3]))
     # Unstated vectors default to K× Normal(0, 1).
     plan = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
         X = hcat(1, x1)
         mu = X * b
         y .~ Normal.(mu, 1.0)
@@ -273,6 +274,7 @@ end
     @test only(plan.predictors).terms[2].options.sign == -1
     # Dotted negation, disjoint matrices, reuse, factor combo.
     plan = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
         X = hcat(1, x1)
         mu = .-(X * b)
         y .~ Normal.(mu, 1.0)
@@ -289,6 +291,8 @@ end
     @test only(plan.array_parameters).args == (arg1 = 1.0, arg2 = 2.0)
     @test only(only(plan.predictors).terms).options.sign == -1
     plan = lower_rkppl(quote
+        b1[axes(X, 2)] .~ Normal.(0, 1)
+        b2[axes(Y, 2)] .~ Normal.(0, 1)
         X = hcat(1, x1)
         Y = hcat(x2)
         mu = X * b1 .+ Y * b2
@@ -297,6 +301,8 @@ end
     @test length(plan.matrices) == 2
     @test length(plan.population_priors) == 3
     plan = lower_rkppl(quote
+        b1[axes(X, 2)] .~ Normal.(0, 1)
+        b2[axes(X, 2)] .~ Normal.(0, 1)
         X = hcat(1, x1)
         mu = X * b1
         nu = X * b2
@@ -306,6 +312,7 @@ end
     @test length(plan.matrices) == 1
     @test length(plan.predictors) == 2
     plan = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
         c[levels(g)] .~ Normal.(0, 2)
         X = hcat(x1)
         mu = X * b .+ c[g]
@@ -315,13 +322,16 @@ end
     @test only(plan.predictors).terms[2].kind === FactorTerm
     # Links, inline locations, leveled responses, submodel streams.
     for ast in (quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
         X = hcat(1, x1)
         mu = X * b
         y .~ Bernoulli.(logistic.(mu))
     end, quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
         X = hcat(1, x1)
         y .~ Normal.(X * b, 1.0)
     end, quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
         X = hcat(1, x1)
         mu = X * b
         y .~ CategoricalLogit.(mu)
@@ -329,6 +339,7 @@ end
         @test lower_rkppl(ast, (:y, :x1)) isa StructuralPlan
     end
     m = @rkppl begin
+        b[axes(X, 2)] .~ Normal.(0, 1)
         X = hcat(1, x)
         mu = X * b
         y ~ _mx_stream(mu, 1.0)
@@ -369,7 +380,7 @@ end
         (D, "sized by `Z`, which is not a design matrix", quote b[axes(Z, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (D, "column Intercept has two coefficients", quote X = hcat(1, 1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (Dz, "shared across predictors", quote X = hcat(1, x1); mu = X * b; nu = X * b; y .~ Normal.(mu, 1.0); z .~ Normal.(nu, 1.0) end),
-        (Dg, "unidentified: intercept + full-cover factor", quote c[levels(g)] .~ Normal.(0, 2); X = hcat(1, x1); mu = X * b .+ c[g]; y .~ Normal.(mu, 1.0) end),
+        (Dg, "unidentified: intercept + full-cover factor", quote b[axes(X, 2)] .~ Normal.(0, 1); c[levels(g)] .~ Normal.(0, 2); X = hcat(1, x1); mu = X * b .+ c[g]; y .~ Normal.(mu, 1.0) end),
         (D, "literal scaling of a matmul", quote X = hcat(1, x1); mu = 2 * (X * b); y .~ Normal.(mu, 1.0) end),
         (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = x2 .* (X * b); y .~ Normal.(mu, 1.0) end),
         (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = exp.(X * b); y .~ Normal.(mu, 1.0) end),
@@ -401,8 +412,8 @@ end
         (D, "is a scalar summand", quote X = hcat(1, x1); w = sum(X); mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
         (D, "combines a matrix outside a matmul", quote X = hcat(1, x1); w = X; mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
         (D, "scale X is a design matrix", quote X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, X) end),
-        (D, "argument X is a design matrix", quote X = hcat(1, x1); s ~ Normal(X, 1); mu = X * b; y .~ Normal.(mu, s) end),
-        (D, "argument X is a design matrix", quote X = hcat(1, x1); s ~ HalfNormal(X); mu = X * b; y .~ Normal.(mu, s) end),
+        (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); s ~ Normal(X, 1); mu = X * b; y .~ Normal.(mu, s) end),
+        (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); s ~ HalfNormal(X); mu = X * b; y .~ Normal.(mu, s) end),
         (Dm, "multinomial probs X is a design matrix", quote X = hcat(1, x1); mu = X * b; c1 .~ Multinomial.(10, X, c2) end),
         (D, "categorical probs X is a design matrix", quote X = hcat(1, x1); mu = X * b; y .~ Categorical.(X) end),
     ]
@@ -607,6 +618,7 @@ end
         :c => [1, 2, 1, 3, 2, 3],
     )
     mmat = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
         s ~ Dirichlet([1.0, 2.0])
         d ~ Normal(0, 1)
         X = hcat(1, x1)

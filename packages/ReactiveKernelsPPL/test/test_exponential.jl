@@ -37,6 +37,8 @@ _exp_cols() = Dict{Symbol,AbstractVector}(:y => copy(_EXP_Y), :x => copy(_EXP_X)
 
 @testset "exponential surface admission" begin
     plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ Exponential.(exp.(eta))
         end, (:y, :x))
@@ -54,6 +56,8 @@ end
 @testset "exponential value parity" begin
     @testset "positive responses" begin
         _, _, kern, lay = _exp_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Exponential.(exp.(eta))
             end, _exp_cols())
@@ -68,6 +72,8 @@ end
         cols = _exp_cols()
         cols[:y] = [0.0, 1.4, 2.6, 0.5, 1.0, 3.0]
         _, _, kern, lay = _exp_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Exponential.(exp.(eta))
             end, cols)
@@ -97,6 +103,8 @@ end
 
 @testset "exponential Enzyme gradients" begin
     _exp_enzyme_check(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ Exponential.(exp.(eta))
         end, _exp_cols(), (eta = [0.5, -0.25],))
@@ -118,6 +126,8 @@ end
 
 @testset "exponential emission is O(1) in n_obs" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Exponential.(exp.(eta))
     end
@@ -154,6 +164,8 @@ end
 
 @testset "exponential under Reactant" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Exponential.(exp.(eta))
     end

@@ -689,6 +689,12 @@ end
         sb = [-2.7161630767907803, -8.4332465153243046, -2.7041630767907803,
             5.9857744480450616, 2.7109163710758355, 4.5566881239299892,
             1.574046502394695]
+        # SB ran on strato2's raw-LAPACK basis; RK's canonical basis
+        # (decision 1vts6mb) has penalized column 2 flipped against it.
+        # b_s_x_raw.2 is 0 at this u, so the value is unchanged and only
+        # that gradient component changes sign. Drop once BRM adopts the
+        # canonical signs (BRM todo 1wo7z27).
+        sb[6] = -sb[6]
         # SB's constant-coefficient gradient is the likelihood's slope in
         # the intercept; add the moved intercept's prior slope -0.4/25.
         @test maximum(abs.(g .- [sb[3] - 0.4 / 25; sb[[2, 4, 5, 6, 7]]])) <

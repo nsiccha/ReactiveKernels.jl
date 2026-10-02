@@ -48,6 +48,8 @@ _oe_cloglog(z) = 1 - exp(-exp(z))
 
 @testset "explicit cutpoints: twins of the implicit form" begin
     implicit = _oe_canon(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ OrderedLogistic.(eta)
     end)
@@ -64,19 +66,23 @@ _oe_cloglog(z) = 1 - exp(-exp(z))
         :(y ~ ordered_logistic(eta)))) == implicit
     # Cumulative Ordinal: an Ordered vector, data-sized.
     @test _oe_canon(quote
+        b ~ Normal(0, 1)
         y_thresholds ~ Ordered(Normal(0, 1), length(levels(y)) - 1)
         eta = b .* x
         y .~ Ordinal.(Cumulative(), ProbitLink(), eta, Ref(y_thresholds))
     end) == _oe_canon(quote
+        b ~ Normal(0, 1)
         eta = b .* x
         y .~ Ordinal.(Cumulative(), ProbitLink(), eta)
     end)
     # Stopping ratio: unconstrained sized thresholds.
     stopping_implicit = quote
+        b ~ Normal(0, 1)
         eta = b .* x
         y .~ Ordinal.(StoppingRatio(), LogitLink(), eta)
     end
     @test _oe_canon(quote
+        b ~ Normal(0, 1)
         y_thresholds[1:length(levels(y)) - 1] .~ Normal.(0, 1)
         eta = b .* x
         y .~ Ordinal.(StoppingRatio(), LogitLink(), eta, Ref(y_thresholds))
@@ -88,10 +94,13 @@ _oe_cloglog(z) = 1 - exp(-exp(z))
         :(y_cutpoints ~ Ordered(Normal(0, 1), 2)),
         :(y .~ OrderedLogistic.(eta, Ref(y_cutpoints))))) ==
         bound(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ OrderedLogistic.(eta)
         end)
     @test bound(quote
+        b ~ Normal(0, 1)
         y_thresholds[1:2] .~ Normal.(0, 1)
         eta = b .* x
         y .~ Ordinal.(StoppingRatio(), LogitLink(), eta, Ref(y_thresholds))
@@ -288,6 +297,7 @@ end
     for n in (:(length(levels(x)) - 1), :(length(levels(y)) - 2),
             :(length(unique(y)) - 1))
         @test occursin("length(levels(y)) - 1", refused(quote
+            b ~ Normal(0, 1)
             c ~ Ordered(Normal(0, 1), $n)
             y .~ OrderedLogistic.(b .* x, Ref(c))
         end))
@@ -309,17 +319,20 @@ end
     # Element prior: a literal Normal.
     for d in (:(Cauchy(0, 1)), :(Normal(0, s)), :(Normal(0, -1)))
         @test occursin("element prior", refused(quote
+            b ~ Normal(0, 1)
             s ~ HalfNormal(1)
             c ~ Ordered($d, 2)
             y .~ OrderedLogistic.(b .* x, Ref(c))
         end))
     end
     @test occursin("element prior", refused(quote
+        b ~ Normal(0, 1)
         t[1:2] .~ Cauchy.(0, 1)
         y .~ Ordinal.(StoppingRatio(), LogitLink(), b .* x, Ref(t))
     end))
     @test occursin("takes the element distribution and the length",
         refused(quote
+            b ~ Normal(0, 1)
             c ~ Ordered(Normal(0, 1))
             y .~ OrderedLogistic.(b .* x, Ref(c))
         end))
