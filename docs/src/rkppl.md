@@ -242,6 +242,17 @@ broadcast spelling.
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
 ```
 
+Responses may have different row counts. Each statement reads columns on its
+own observation axis; statements that read a common observation column must
+agree on its rows. A latent plate follows its authored range, while a scan
+with a symbolic length and a `dar` trajectory follow their consuming response.
+Varying effects, smooth bases, and design matrices follow their input rows.
+Declared `axes(X, 1)` arrays have X's rows; `axes(X, 2)` coefficient vectors
+have X's width. The total `n_obs` does not size these values. A trajectory used
+by responses of different lengths fails binding because its axis is ambiguous.
+Kernel plates may also contribute likelihoods beside ordinary responses;
+their subject/time or schedule dimensions retain their own rows.
+
 The stratified library body above uses both per-level and per-observation
 cells. `L[k] ~ LKJCholesky(K, eta)` inside a plate over `levels(s)` declares
 one factor per stratum. An observation cell can then read `sd[s[i], :]`,

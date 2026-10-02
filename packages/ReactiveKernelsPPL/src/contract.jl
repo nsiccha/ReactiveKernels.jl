@@ -267,7 +267,7 @@ frequency/power-objective column (D1); analytic/precision weights fail
 closed emitter-side. `trials` is the Binomial/BetaBinomial2 trial count
 (Int column or Int literal), `nothing` otherwise. `range` carries a literal `y[1:N]`
 response range (`nothing` = whole column: bare `.~`, `eachindex`,
-`axes`); it must cover `1:n_obs` exactly (checked at bind).
+`axes`); it must cover that response's full observation axis (checked at bind).
 
 Leveled families (categorical / ordinal / multinomial) use the trailing
 fields, built with keywords (`n_levels=`, `thresholds=`,
@@ -377,7 +377,8 @@ index column in the trailing `mi_jobs` field, built with keywords (`mi_jobs=`);
 every other response leaves it at `nothing`:
 
 - `mi_jobs`: the `Jobs` column (sorted-ascending unique `Int` row indices,
-  a strict nonempty subset of `1:n_obs`). The response column itself crosses
+  a strict nonempty subset of the response's full observation axis). The
+  response column itself crosses
   PACKED (`y_obs`, aligned with `Jobs`); both ride the managed-columns
   exemption. The generator gathers every vector likelihood input by `Jobs`
   and runs the existing cell over the short plate — obs rows only, no
@@ -687,11 +688,10 @@ follow [`SampledParameter`](@ref) exactly (POSITIONAL `(arg1, …)` keys,
 Distributions.jl semantics), except the args are SHARED across cells — literals
 or scalar parameter/assignment names (per-cell vector args are a later
 increment). `range` is the plate's index set: the `Symbol` of the column `v`
-of an `eachindex(v)` / `axes(v, 1)` plate (one cell per entry of `v`; bind
-proves `length(v) == n_obs` — latents over another axis do not lower yet), a
-literal `UnitRange{Int}` that must cover `1:n_obs` exactly (the `1:N` case),
-mirroring [`LikelihoodSpec`](@ref)'s response range, or `nothing` (size =
-`n_obs`, hand-built plans). A
+of an `eachindex(v)` / `axes(v, 1)` plate (one cell per entry of bound or
+defined `v`), a literal `UnitRange{Int}` covering its consuming response's
+axis (the `1:N` case), or `nothing` (the consuming response establishes the
+axis in hand-built plans). A
 real-support prior (`normal`/`cauchy`/half-versions) lays out identity (an
 unconstrained block); positive/unit support constrains per element.
 """
@@ -703,7 +703,7 @@ struct PlateParameter
     range::Union{Nothing,UnitRange{Int},Symbol}
     label::Symbol
 end
-"""Provenance/range default to a whole-column (n_obs) plate under the name."""
+"""Provenance/range default to the consuming response's axis under the name."""
 PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
     support_override::SupportOverride) =
     PlateParameter(name, family, args, support_override, nothing, name)
@@ -1621,12 +1621,10 @@ increments `d[t] = beta*d[t-1] + sigma*z[t]` (`d[0] = 0`, `x[1] = 0`).
 and innovation-scale (half-Normal, including `truncated(Normal(0, s), 0, Inf)`)
 [`SampledParameter`](@ref)s, each with Distributions semantics (the
 truncation normalizers stay);
-the `z` innovations (length `n_obs - 1`) are owned internally under the
-reserved `_ppl_dar_z_<state>` name, like a non-centered scan's
-`_ppl_scan_z_<state>` slice. The path length is `n_obs` by construction
-(the LP direct summand adds elementwise to an `n_obs` predictor), so no
-length probe is carried — a `T ≠ n_obs` time axis needs the future
-gathering extension (the `rw` free rider), not this node.
+the `z` innovations (one fewer than the path's rows) are owned internally
+under the reserved `_ppl_dar_z_<state>` name, like a non-centered scan's
+`_ppl_scan_z_<state>` slice. The path length follows its consuming response's
+axis, because the LP direct summand adds elementwise to that predictor.
 
 A dedicated node rather than a `ScanSpec`: the v1 scan grammar threads
 one carried array from SAMPLED seeds with full-length innovations, while
@@ -2480,6 +2478,12 @@ function validate_data(plan::StructuralPlan)
     _validate_levelmaps_data(plan)
     _validate_response_data(plan)
     _validate_plate_parameters_data(plan)
+    for s in plan.scans
+        _scan_length(plan, s)
+    end
+    for s in plan.dar_paths
+        _value_rows(plan, s.state)
+    end
     _validate_varying_draws_data(plan)
     _validate_splines_data(plan)
     _validate_hsgp_data(plan)
@@ -2785,8 +2789,8 @@ function _validate_varying_levels_shape(d::VaryingDraws)
     return nothing
 end
 
-# A literal plate range covers 1:n_obs exactly (the size the latent vector
-# packs), mirroring the response-range cover check.
+# A literal plate range covers its consuming response's axis, mirroring
+# the response-range cover check.
 function _validate_plate_parameters_data(plan::StructuralPlan)
     scalarnames = _union_names(plan)
     derivednames = Set{Symbol}(d.name for d in plan.derived)
@@ -2803,18 +2807,16 @@ function _validate_plate_parameters_data(plan::StructuralPlan)
         if p.range isa Symbol
             # One cell per entry of the iterated column (Julia's
             # `eachindex(v)`), sized at the observation axis.
-            haskey(plan.columns, p.range) || _fail(p.label,
-                "plate over `eachindex($(p.range))`: `$(p.range)` is not bound")
-            n = length(plan.columns[p.range])
-            n == plan.n_obs || _fail(p.label,
-                "plate over `eachindex($(p.range))` has $n cells but n_obs " *
-                "is $(plan.n_obs) — a per-cell latent over another axis " *
-                "does not lower yet (iterate an observation-axis column)")
+            (haskey(plan.columns, p.range) || _is_derived(plan, p.range) ||
+                any(a -> a.name === p.range, plan.assignments)) || _fail(p.label,
+                "plate over `eachindex($(p.range))`: `$(p.range)` is not bound or defined")
+            _plate_rows(plan, p)
             continue
         end
-        last(p.range) == plan.n_obs || _fail(p.label,
+        n = _value_rows(plan, p.name)
+        last(p.range) == n || _fail(p.label,
             "plate range $(p.range) covers $(length(p.range)) cells " *
-            "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
+            "but its observation axis has $n rows — ranges cover eachindex exactly")
     end
     return nothing
 end
@@ -2910,7 +2912,7 @@ function _validate_mm_draws_data(d::VaryingDraws, plan::StructuralPlan)
         _fail(d.label, "draws block has no declared grouping levels " *
               "(bind_data fills the union — hand-built bound plans must too)")
     levels = d.levels::Vector
-    n_obs = plan.n_obs
+    n_obs = _value_rows(plan, first(mm.groups))
     for (mi, gcol) in enumerate(mm.groups)
         haskey(plan.columns, gcol) ||
             _fail(d.label, "membership column $gcol (slot $mi of $M) " *
@@ -2976,9 +2978,10 @@ function _validate_strata_draws_data(d::VaryingDraws, plan::StructuralPlan)
               "(bind_data fills these — hand-built bound plans must too)")
     slevels = st.levels::Vector
     bycol = _vector_column(plan.columns, st.by, d.label, "stratum column")
-    length(bycol) == plan.n_obs ||
+    n = _value_rows(plan, d.group)
+    length(bycol) == n ||
         _fail(d.label, "stratum column $(st.by) has $(length(bycol)) " *
-              "rows; expected $(plan.n_obs)")
+              "rows; expected $n")
     for v in bycol
         v in slevels ||
             _fail(d.label, "stratum value $(repr(v)) of $(st.by) " *
@@ -3271,24 +3274,26 @@ end
 # the one axis that reads it, and `n_obs` is the total observed rows (the
 # kernel-plate precedent: total likelihood lanes).
 
-"""Plan slots a plan with several observation axes may fill. Every other
-slot reads or sizes by the one `n_obs` axis (latent plates, scans, dar
-paths, varying draws, splines, HSGP and design matrices, R2D2 and
-horseshoe priors, array parameters, kernels, event LPs); per-axis
-versions are not built, so such a plan fails closed — and a slot added
-later does too until it is listed here."""
+"""Plan slots whose dimensions resolve from their authored inputs or uses.
+New slots must establish the same property before joining this list."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :parameters, :assignments, :derived, :columns, :n_obs, :roles,
-    :levelmaps, :vector_parameters, :submodel_scopes, :conditioned)
+    :levelmaps, :vector_parameters, :submodel_scopes, :conditioned,
+    :plate_parameters, :scans, :dar_paths, :varying_draws, :varying_slices,
+    :spline_bases, :spline_vectors, :hsgp_bases, :matrices,
+    :r2d2_priors, :horseshoe_priors, :array_parameters, :kernel_plates,
+    :event_lps)
 
-"""Per-observation columns (of `perobs`) a response reads: the names its
-own fields hold, then — transitively — the names every predictor, derived
-column and definition among them holds."""
-function _response_reads(plan::StructuralPlan, r::LikelihoodSpec,
-        perobs::Set{Symbol})
+# Observation-shaped values and their data dependencies. Parameters sized
+# by levels or coefficient width are shared values, so their priors do not
+# join observation axes. A draws application, basis or matrix does carry
+# rows and must expose its inputs through the same dependency walk.
+function _observation_nodes(plan::StructuralPlan)
     nodes = Dict{Symbol,Any}()
     for p in plan.predictors
-        nodes[p.name] = p
+        draws = [d for sl in plan.varying_slices if sl.target === p.name
+            for d in plan.varying_draws if d.label === sl.draws]
+        nodes[p.name] = (p, draws)
     end
     for d in plan.derived
         nodes[d.name] = d.expr
@@ -3296,6 +3301,38 @@ function _response_reads(plan::StructuralPlan, r::LikelihoodSpec,
     for a in plan.assignments
         nodes[a.name] = a.expr
     end
+    for m in plan.matrices
+        nodes[m.name] = m.columns
+    end
+    for sb in plan.spline_bases
+        nodes[sb.id] = (sb.axes, [b.columns for b in sb.blocks])
+    end
+    for hb in plan.hsgp_bases
+        nodes[hb.id] = (hb.axes, hb.by)
+    end
+    for p in plan.plate_parameters
+        nodes[p.name] = (p.range, p.args)
+    end
+    for s in plan.scans, state in s.states
+        nodes[state] = s.hi
+    end
+    for p in plan.array_parameters
+        # An axes(X, 1) vector has X's rows. Width- and level-sized
+        # coefficient arrays stay shared values rather than joining axes.
+        length(p.dims) == 1 || continue
+        d = only(p.dims)
+        _is_axis_dim(d) && d.args[3] == 1 || continue
+        nodes[p.name] = (d.args[2], p.args)
+    end
+    return nodes
+end
+
+"""Per-observation columns (of `perobs`) a response reads: the names its
+own fields hold, then — transitively — the names every predictor, derived
+column and definition among them holds."""
+function _response_reads(plan::StructuralPlan, r,
+        perobs::Set{Symbol})
+    nodes = _observation_nodes(plan)
     cands = union(perobs, keys(nodes))
     function held(x)
         free = copy(cands)
@@ -3323,16 +3360,18 @@ and `total` the observed rows summed over axes. Fails when the plan fills
 a slot outside [`_MULTI_AXIS_SLOTS`](@ref), when the columns one axis
 reads differ in rows, or when no observation statement reads a column."""
 function _observation_axes(plan::StructuralPlan)
-    isempty(plan.kernel_plates) || return nothing
+    isempty(plan.responses) && return nothing
     modelvals, managed = _axis_exempt_columns(plan)
+    mi_managed = _mi_managed_columns(plan)
     perobs = Set{Symbol}(k for (k, v) in plan.columns
-        if k ∉ modelvals && k ∉ managed &&
+        if k ∉ modelvals && k ∉ mi_managed &&
             v isa Union{AbstractVector,AbstractMatrix})
     resps = [r.response for r in plan.responses]
-    all(in(perobs), resps) || return nothing
+    all(r -> haskey(plan.columns, r.response), plan.responses) || return nothing
     rows = Dict{Symbol,Int}(c => _column_nrows(plan.columns[c]) for c in perobs)
-    length(unique(rows[c] for c in resps)) <= 1 && return nothing
-    lens = join(sort!(unique(rows[c] for c in resps)), ", ")
+    response_rows = [_response_rows(plan, r) for r in plan.responses]
+    length(unique(response_rows)) <= 1 && isempty(plan.kernel_plates) && return nothing
+    lens = join(sort!(unique(response_rows)), ", ")
     for f in fieldnames(StructuralPlan)
         f in _MULTI_AXIS_SLOTS && continue
         isempty(getfield(plan, f)) || _fail(:plan, "the responses " *
@@ -3340,12 +3379,11 @@ function _observation_axes(plan::StructuralPlan)
             "reads or sizes by a single observation axis — `$f` beside " *
             "several observation axes is not built yet")
     end
-    for r in plan.responses
-        r.mi_jobs === nothing || _fail(r.label, "mi() missingness on " *
-            "$(r.response) beside responses of $lens rows (several " *
-            "observation axes) is not built yet")
-    end
     reads = [_response_reads(plan, r, perobs) for r in plan.responses]
+    # A kernel-managed column used by an ordinary response also has to
+    # agree with that response's rows. Other kernel columns keep their
+    # own subject/time or schedule validation.
+    filter!(c -> c ∉ managed || any(cs -> c in cs, reads), perobs)
     # Union-find: responses reading a common column share an axis.
     link = collect(eachindex(reads))
     root(i) = link[i] == i ? i : (link[i] = root(link[i]))
@@ -3359,8 +3397,13 @@ function _observation_axes(plan::StructuralPlan)
         root(i) == i || continue
         members = [j for j in eachindex(reads) if root(j) == i]
         resp = resps[first(members)]
-        n = rows[resp]
+        n = response_rows[first(members)]
         total += n
+        for j in members
+            response_rows[j] == n || _fail(resps[j], "column length " *
+                "$(response_rows[j]) ≠ the $n rows of $resp, which an " *
+                "observation statement reads beside it (one observation axis)")
+        end
         for j in members, c in sort!(collect(reads[j]))
             rows[c] == n || _fail(c, "column length $(rows[c]) ≠ the $n " *
                 "rows of $resp, which an observation statement reads " *
@@ -3376,11 +3419,50 @@ function _observation_axes(plan::StructuralPlan)
     return (; rows = axisrows, total)
 end
 
-"""Rows a response observes: its own column's rows — its observation
-axis. An mi() response observes `n_obs` rows through its packed column."""
-_response_rows(plan::StructuralPlan, r::LikelihoodSpec) =
-    r.mi_jobs === nothing && haskey(plan.columns, r.response) ?
-    _column_nrows(plan.columns[r.response]) : plan.n_obs
+"""Rows of a response's full observation axis; mi() packs only its observed
+entries, so its location's data establishes the full axis."""
+function _response_rows(plan::StructuralPlan, r::LikelihoodSpec)
+    r.mi_jobs === nothing && haskey(plan.columns, r.response) &&
+        return _column_nrows(plan.columns[r.response])
+    modelvals, _ = _axis_exempt_columns(plan)
+    managed = _mi_managed_columns(plan)
+    perobs = Set{Symbol}(k for (k, v) in plan.columns
+        if k ∉ modelvals && k ∉ managed && v isa Union{AbstractVector,AbstractMatrix})
+    reads = _response_reads(plan, r, perobs)
+    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
+    length(ns) == 1 && return only(ns)
+    isempty(ns) && return plan.n_obs
+    _fail(r.label, "mi() location reads columns with different rows $ns")
+end
+
+"""Rows of an observation-shaped value, resolved from its bound inputs.
+Values with no data anchor (an intercept or dar path) use their response
+consumers. No dimension is inferred from the total of unrelated axes."""
+function _value_rows(plan::StructuralPlan, name::Symbol)
+    haskey(plan.columns, name) && return _column_nrows(plan.columns[name])
+    perobs = Set{Symbol}(k for (k, v) in plan.columns
+        if v isa Union{AbstractVector,AbstractMatrix} && k ∉ _mi_managed_columns(plan))
+    reads = _response_reads(plan, name, perobs)
+    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
+    if isempty(ns)
+        names = Set{Symbol}([name])
+        ns = unique!([_response_rows(plan, r) for r in plan.responses
+            if name in _response_reads(plan, r, names)])
+    end
+    length(ns) == 1 && return only(ns)
+    if isempty(ns)
+        axes = unique!(vcat([_response_rows(plan, r) for r in plan.responses],
+            [_kernel_plate_nlanes(kp, plan.columns) for kp in plan.kernel_plates]))
+        length(axes) == 1 && return only(axes)
+        isempty(axes) && return plan.n_obs
+        _fail(name, "value $name has no data range or response to establish its rows")
+    end
+    _fail(name, "value $name reads or feeds different row counts $ns")
+end
+
+_plate_rows(plan::StructuralPlan, p::PlateParameter) =
+    p.range isa UnitRange ? length(p.range) :
+    _value_rows(plan, p.range isa Symbol ? p.range : p.name)
 
 function _validate_columns(plan::StructuralPlan)
     plan.n_obs > 0 || _fail(:plan, "n_obs must be positive, got $(plan.n_obs)")
@@ -3741,25 +3823,19 @@ end
 # Kernel (KernelPlate) structure: everything provable without data.
 # v2: N kernel plates per model (panel plates compose freely; at most
 # one grouped plate — multi-schedule grouped models are a sequenced
-# follow-up). The plates jointly carry the ONLY likelihood (no
-# top-level responses alongside — BRM routes kernel models away from
-# the GLM flow). Panel plates (no schedules) follow
+# follow-up). Top-level responses retain their own axes beside the
+# kernel-managed likelihood lanes. Panel plates (no schedules) follow
 # `_validate_panel_kernel` (grouping ABSENT — implicit 1:n subjects,
 # structural, no sentinel, pinned here + tests); grouped plates follow
 # `_validate_grouped_kernel`.
 function _validate_kernels(plan::StructuralPlan)
     plates = plan.kernel_plates
     isempty(plates) && return nothing
-    # Mixed-level predictors (a response and a kernel LP arg sharing one
-    # definition) fail with the precise message before the only-likelihood
-    # gate below (which would otherwise mask the use-site confusion).
+    # A predictor shared by an observation and a subject-level kernel
+    # argument still has to satisfy the predictor-level contract.
     for kp in plates, (p, _) in kp.lp_args
         _predictor_level(plan, p)
     end
-    results = join(["`$(kp.result)`" for kp in plates], ", ")
-    isempty(plan.responses) ||
-        _fail(:plan, "kernel plates carry the only likelihood " *
-              "(v2: no top-level responses alongside $results)")
     ngrouped = count(_is_grouped_kernel, plates)
     ngrouped <= 1 ||
         _fail(:plan, "v2 admits at most one grouped kernel plate per " *
@@ -4807,12 +4883,14 @@ function _validate_kernels_data(plan::StructuralPlan)
             _validate_panel_kernel_data(plan, kp)
         end
     end
-    # n_obs is the total likelihood lanes across plates (bind_data sets
-    # the sum; a hand-bound plan must carry it).
+    # n_obs totals kernel lanes and ordinary observation axes (bind_data
+    # sets the sum; a hand-bound plan must carry it).
     lanes =
         [_kernel_plate_nlanes(kp, plan.columns) for kp in plan.kernel_plates]
-    plan.n_obs == sum(lanes) ||
-        _fail(:plan, "n_obs $(plan.n_obs) ≠ total kernel lanes $(sum(lanes)) " *
+    axes = _observation_axes(plan)
+    total = sum(lanes) + (axes === nothing ? 0 : axes.total)
+    plan.n_obs == total ||
+        _fail(:plan, "n_obs $(plan.n_obs) ≠ total likelihood lanes $total " *
               "($(join(["$(kp.result)=$n"
                            for (kp, n) in zip(plan.kernel_plates, lanes)], ", ")))")
     return nothing
@@ -5110,10 +5188,10 @@ end
 _is_noncentered_scan(s::ScanSpec) =
     any(st -> st.kind === :assign && st.indexed, s.step)
 
-# A scan's trajectory length T: the literal loop bound, or `n_obs` when the
-# bound is a data length name.
+# A scan's trajectory length T: the literal loop bound, or the rows of the
+# response that consumes the trajectory when the bound is a length name.
 _scan_length(plan::StructuralPlan, s::ScanSpec) =
-    s.hi isa Int ? s.hi : plan.n_obs
+    s.hi isa Int ? s.hi : _value_rows(plan, first(s.states))
 
 # A non-centered scan's latent slice length: one coordinate per sampled seed,
 # plus `T - m` per innovation local (one per loop iteration).
@@ -6020,8 +6098,8 @@ end
 # scalar SampledParameters. Prior args are either SHARED across cells (a
 # literal or a scalar parameter/assignment name) or PER-CELL (a derived column,
 # giving a varying prior mean/scale — the varying-intercept shape); never
-# another latent vector. `range` is `nothing` (whole-column, size n_obs) or a
-# literal UnitRange (validated to cover 1:n_obs at bind, mirroring responses).
+# another latent vector. The range names its own column or covers the
+# consuming response's axis; `nothing` infers that axis at binding.
 function _validate_plate_parameters(plan::StructuralPlan)
     for p in plan.plate_parameters
         haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
@@ -8224,12 +8302,13 @@ function _validate_mi_data(r::LikelihoodSpec, plan::StructuralPlan)
     o >= 1 || _fail(r.label,
         "mi() Jobs column $(r.mi_jobs) is empty (at least one observed " *
         "row is required)")
-    o < plan.n_obs || _fail(r.label,
+    n = _response_rows(plan, r)
+    o < n || _fail(r.label,
         "mi() Jobs column $(r.mi_jobs) covers every row (no missing " *
         "values — drop the mi() wrapper)")
-    all(j -> 1 <= j <= plan.n_obs, jobs) ||
+    all(j -> 1 <= j <= n, jobs) ||
         _fail(r.label, "mi() Jobs column $(r.mi_jobs) must index " *
-              "1:n_obs ($(plan.n_obs))")
+              "1:n_obs ($n)")
     length(unique(jobs)) == o ||
         _fail(r.label, "mi() Jobs column $(r.mi_jobs) must not repeat " *
               "rows (a repeated row would double-count its likelihood)")
@@ -10769,14 +10848,18 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # contract (deriving from a packed column fails every full-length
     # column by order luck). Observation columns of several lengths are
     # several observation axes: n_obs is their total rows.
+    axis_plan = _with(plan; columns = columns, spline_bases = bases,
+        hsgp_bases = hbases, kernel_plates = kbases)
     n = if !_has_observation_axis(plan)
         1 # There is no observation axis; conditioned declarations have their own shapes.
     elseif isempty(kbases)
-        axes = _observation_axes(_with(plan; columns = columns))
+        axes = _observation_axes(axis_plan)
         axes === nothing ? _bind_nrows(columns,
             union(_mi_managed_columns(plan), computed, inputs)) : axes.total
     else
-        sum(kp -> _kernel_plate_nlanes(kp, columns), kbases)
+        axes = _observation_axes(axis_plan)
+        sum(kp -> _kernel_plate_nlanes(kp, columns), kbases) +
+            (axes === nothing ? 0 : axes.total)
     end
     maps = _eval_levelmaps(plan.levelmaps, columns)
     draws = _eval_draws_levels(plan.varying_draws, columns)
@@ -10829,7 +10912,7 @@ function _validate_conditioned_values(plan)
         p.name in plan.conditioned || continue
         push!(known, p.name)
         value = plan.columns[_conditioned_input(p.name)]
-        n = p.range isa UnitRange ? length(p.range) : plan.n_obs
+        n = _plate_rows(plan, p)
         value isa AbstractVector && length(value) == n ||
             _fail(:condition, "$(p.name) needs a vector of length $n")
     end

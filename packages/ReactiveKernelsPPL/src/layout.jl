@@ -373,8 +373,8 @@ function assign_layout(plan::StructuralPlan)
         transform, lo, hi =
             _entry_transform(p.family, _bound_override(plan, p.support_override),
                 p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
-        # An `eachindex(v)` plate is proved at bind to have n_obs cells.
-        size = p.range isa UnitRange ? length(p.range) : plan.n_obs
+        # An `eachindex(v)` plate has the rows of its authored range.
+        size = _plate_rows(plan, p)
         push!(entries,
             LayoutEntry(:plate, nothing, p.name, [p.name], offset, size, transform,
                 lo, hi))
@@ -598,13 +598,13 @@ function assign_layout(plan::StructuralPlan)
     # (the non-centered-scan innovation-slice shape, so the `:scan` kind's
     # constrain/unconstrain/coordinate machinery applies untouched); the
     # state name binds the emitter's `scan(...)` reconstruction. The path
-    # length is `n_obs` by construction (the LP adds elementwise), so a
+    # length is its consuming response's rows (the LP adds elementwise), so a
     # single observation leaves no innovation — fail closed.
     for s in plan.dar_paths
-        T = plan.n_obs
+        T = _value_rows(plan, s.state)
         T >= 2 || throw(ContractValidationError(
-            "[layout] dar $(s.state) needs n_obs ≥ 2 (the innovations " *
-            "are length `n_obs - 1`), got n_obs = $(T)"))
+            "[layout] dar $(s.state) needs at least 2 rows on its axis " *
+            "(one fewer innovation than rows), got $T"))
         nm = _dar_innovation_name(s)
         labels = Symbol[Symbol(i) for i in 1:(T - 1)]
         push!(entries,
