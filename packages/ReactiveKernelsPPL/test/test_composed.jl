@@ -243,6 +243,8 @@ end
     # A literal scale is one scalar leaf (a synthetic assignment), like
     # any sub-free scalar subexpression (test_fallback.jl).
     lit = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         eta = 2.0 .* th
         y .~ Bernoulli.(logistic.(eta))
@@ -275,6 +277,7 @@ end
     # ordinary parameter read twice (its sub-predictor summand lowers as a
     # derived column — test_fallback.jl).
     twice = lower_rkppl(quote
+        a ~ Normal(0, 1)
         th = a .+ b .* xs
         b ~ Normal(0, 1)
         eta = b .* th

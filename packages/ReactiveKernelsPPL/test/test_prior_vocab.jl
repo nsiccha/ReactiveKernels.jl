@@ -287,6 +287,7 @@ _pv_prior(plan, pred::Symbol, addr::Symbol) =
     @testset "lowercase coefficient spelling rejected" begin
         err = try
             lower_rkppl(quote
+                    a ~ Normal(0, 1)
                     mu = a .+ b .* x
                     y .~ Normal.(mu, s)
                     b ~ student_t(3, 0, 1)

@@ -2518,13 +2518,17 @@ end
         y1 .~ Normal.(mu1, 1.0)
         y2 .~ Normal.(mu2, 1.0)
     end, (:y1, :y2, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # A coefficient another prior reads is an ordinary parameter (its
+    # summand lowers as a derived column — coef_grammar A, test_fallback.jl).
+    expb = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         s ~ Exponential(b)
         mu = a .+ b .* x
         y .~ Normal.(mu, s)
     end, Dn)
+    @test any(p -> p.name === :b, expb.parameters)
+    @test only(p for p in expb.parameters if p.name === :s).args.arg1 === :b
     # Scalar structure that cannot identify: stray Normal names inline to
     # a second intercept (degenerate), bare scalar parameters and staged
     # reductions in predictors have no term slot.
