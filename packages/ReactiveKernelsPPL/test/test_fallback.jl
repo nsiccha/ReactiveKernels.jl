@@ -237,6 +237,34 @@ end
                 logpdf(Exponential(1), q.sigma)
         end)
     end
+    @testset "S6 factor aliases preserve the coefficient role" begin
+        # Every alias reads the same observation-aligned vector, while
+        # predictor analysis keeps the declared levels-sized coefficient
+        # block. Naming the gather must not split its coordinates from mu.
+        for aliases in ([:(r = r_c[g])],
+                [:(r0 = r_c[g]), :(r1 = r0), :(r = r1)])
+            plan = _fb_check(quote
+                a ~ Normal(0, 5)
+                r_sg ~ HalfNormal(1)
+                r_c[levels(g)] .~ Normal.(0, r_sg)
+                $(aliases...)
+                sigma ~ Exponential(1)
+                mu = a .+ r
+                y .~ Normal.(mu, sigma)
+            end, (:y, :g), (mu = [0.2, 0.3, -0.9, 1.4], r_sg = 0.7,
+                sigma = 1.1), q -> begin
+                a, c = q.mu[1], q.mu[2:4]
+                _fb_normal_ll(a .+ c[g], q.sigma) +
+                    logpdf(Normal(0, 5), a) +
+                    logpdf(_fb_halfnormal(1), q.r_sg) +
+                    sum(logpdf.(Normal(0, q.r_sg), c)) +
+                    logpdf(Exponential(1), q.sigma)
+            end)
+            @test [t.kind for t in only(plan.predictors).terms] ==
+                [InterceptTerm, FactorTerm]
+            @test isempty(plan.array_parameters)
+        end
+    end
     @testset "P4 varying slope, inline and alias" begin
         slope_want(cv) = q -> begin
             c = q[cv]

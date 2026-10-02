@@ -916,6 +916,18 @@ coefficient block. Two kinds of family:
   Cholesky factor of a K×K correlation matrix (Distributions.jl
   `LKJCholesky(K, eta)` density, `uplo = 'L'`). `args = (arg1 = eta,)`, a
   finite positive literal; `dims` is `[K, K]`.
+- A multivariate slice family `<stem>_<slices>` (`mv_slices.jl`):
+  `eachrow(B[a, b]) .~ D` (`_rows`), `eachcol(B[a, b]) .~ D` (`_cols`) or
+  `b[ax] ~ D` (`_vector`) — every slice of the array one draw of the
+  multivariate `D`. Stems: `mvnormal_cholesky` (`args = (arg1 = mean,
+  arg2 = factor)`), `mvnormal` (`(arg1 = mean, arg2 = covariance)`),
+  `dirichlet` (`(arg1 = concentration,)`, rows/cols only) and
+  `ordered_normal` (`(arg1 = m, arg2 = s, arg3 = K)` for
+  `Ordered(Normal(m, s), K)`, rows/cols only). A vector argument is a
+  shared value or a per-slice `:(eachrow(M))` / `:(eachcol(M))`
+  expression; matrices and scalars are shared. Multivariate normal slices
+  are centered (the entries are the coordinates); simplex and ordered
+  slices constrain along each slice.
 
 A `phi ~ Dirichlet(alpha)` simplex is not an array parameter: it stays a
 [`VectorParameter`](@ref), which definitions already read as a model-level
@@ -1644,6 +1656,12 @@ nested `hcat` stays a follow-up. The generator emits each matrix once
 (`X = Float64.(hcat(...))`); [`MatrixTerm`](@ref)s reference it by name
 and splice `X * view(coef, ...)` matvecs. Width is static
 (`length(columns)`); the surface sizes coefficient vectors from it.
+
+A matrix no matrix term and no GLM response reads is a VALUE matrix (the
+program reads `X` as a matrix: `var.(eachcol(X))`, `X * v` over an array):
+[`bind_data`](@ref) builds it from its data columns and binds it under its
+name, so every reader sees a bound data matrix
+(`_value_design_matrix_names`).
 """
 struct DesignMatrix
     name::Symbol
@@ -1794,6 +1812,24 @@ _schedule_combine_simultaneous(plan::StructuralPlan, sched::Symbol) =
 function _find_matrix(plan::StructuralPlan, name::Symbol)
     i = findfirst(m -> m.name === name, plan.matrices)
     return i === nothing ? nothing : plan.matrices[i]
+end
+
+"""Value matrices of `plan`: design matrices no [`MatrixTerm`](@ref) and no
+GLM response reads. The program reads each as a matrix value, so
+[`bind_data`](@ref) builds it from its columns and binds it as data."""
+function _value_design_matrix_names(plan::StructuralPlan)
+    used = Set{Symbol}()
+    for pred in plan.predictors, t in pred.terms
+        # A malformed hand-built term (`_validate_matrix_term` names it)
+        # references no matrix here.
+        t.kind === MatrixTerm || continue
+        X = get(t.options, :matrix, nothing)
+        X isa Symbol && push!(used, X)
+    end
+    for r in plan.responses
+        _is_glm_family(r.family) && push!(used, r.predictor)
+    end
+    return Set{Symbol}(m.name for m in plan.matrices if m.name ∉ used)
 end
 
 """Per-element prior addressees of a design matrix in column order
@@ -5496,6 +5532,8 @@ function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String} &&
         return nothing
     if ex isa Symbol
+        # `:` in a positional read (`Z[:, 1]`) is a whole axis, not a name.
+        ex === :(:) && return nothing
         bound && haskey(plan.columns, ex) && return nothing
         push!(refs, ex)
         return nothing
@@ -5755,7 +5793,9 @@ end
 function _is_vector_valued(ex, plan::StructuralPlan)
     ex isa Symbol && return !(ex in _union_names(plan) ||
         ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
-    ex isa Expr && ex.head === :ref && _is_array_param(plan, ex.args[1]) &&
+    ex isa Expr && ex.head === :ref && ex.args[1] isa Symbol &&
+        (_is_array_param(plan, ex.args[1]) ||
+            _is_array_assignment(plan, ex.args[1])) &&
         return _array_index_kind(plan, ex) === :gather &&
             all(i -> i isa Int, ex.args[3:end])
     ex isa Number && return false
@@ -6223,6 +6263,9 @@ end
 
 function _validate_matrices(plan::StructuralPlan)
     matnames = Set{Symbol}(m.name for m in plan.matrices)
+    # One coefficient per column binds term matrices only: a value matrix
+    # is plain data (`hcat(x, x)` is a valid matrix).
+    values = _value_design_matrix_names(plan)
     for m in plan.matrices
         isempty(m.columns) && _fail(m.label,
             "design matrix $(m.name) has no columns " *
@@ -6232,12 +6275,12 @@ function _validate_matrices(plan::StructuralPlan)
         for c in m.columns
             if c === nothing
                 n_intercept += 1
-                n_intercept > 1 && _fail(m.label,
+                n_intercept > 1 && m.name ∉ values && _fail(m.label,
                     "design matrix $(m.name) has two intercept positions " *
                     "— one coefficient per column")
                 continue
             end
-            c in seen_cols && _fail(m.label,
+            c in seen_cols && m.name ∉ values && _fail(m.label,
                 "design matrix $(m.name) repeats column $c " *
                 "— one coefficient per column")
             push!(seen_cols, c)
@@ -10248,6 +10291,42 @@ function _materialize_module_data!(plan::StructuralPlan,
     return names
 end
 
+# Value matrices (`_value_design_matrix_names`): each binds under
+# its name as `Float64.(hcat(...))` of its bound columns, a ones column at
+# the intercept `1` (the design-matrix meaning).
+function _materialize_value_matrices!(plan::StructuralPlan,
+        columns::Dict{Symbol,ColumnData})
+    names = _value_design_matrix_names(plan)
+    isempty(names) && return names
+    for m in plan.matrices
+        m.name in names || continue
+        haskey(columns, m.name) && throw(ContractValidationError(
+            "[bind] column $(m.name) is computed by the model " *
+            "(`$(m.name) = hcat(...)`) — drop it from bind_data"))
+        datacols = Symbol[c for c in m.columns if c !== nothing]
+        isempty(datacols) && throw(ContractValidationError(
+            "[bind] matrix $(m.name) has no data column to size its " *
+            "intercept"))
+        for c in datacols
+            haskey(columns, c) || throw(ContractValidationError(
+                "[bind] matrix $(m.name) reads column $c, which is not " *
+                "bound"))
+            columns[c] isa AbstractVector || throw(ContractValidationError(
+                "[bind] matrix $(m.name): column $c must be a vector, got " *
+                "$(summary(columns[c]))"))
+        end
+        n = length(columns[first(datacols)])
+        parts = [c === nothing ? ones(n) : columns[c] for c in m.columns]
+        columns[m.name] = try
+            Float64.(hcat(parts...))
+        catch e
+            throw(ContractValidationError("[bind] matrix $(m.name) = " *
+                "hcat(...) failed: " * sprint(showerror, e)))
+        end
+    end
+    return names
+end
+
 # Plain-Julia evaluation of a resolved definition expression (functions as
 # values): module calls through their `GlobalRef`s, built-in vocabulary
 # heads through the generated-model scope — the bindings the kernel uses.
@@ -10442,6 +10521,9 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     columns = _checked_columns(columns)
     _route_bound_values!(plan, columns)
     _scalar_responses_as_observations!(plan, columns)
+    # Value matrices bind next, as data: every later step reads them
+    # exactly like a caller-supplied matrix.
+    _materialize_value_matrices!(plan, columns)
     raw = Set{Symbol}(keys(columns))
     computed = _materialize_module_data!(plan, columns)
     # Raw inputs read only as whole values (module-call arguments,
