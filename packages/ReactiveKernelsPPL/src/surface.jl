@@ -1050,9 +1050,15 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module)
         s.lhs in data && continue
         if s.dims !== nothing
             pc_dims[s.lhs] = s.dims
-        elseif s.levels isa Symbol
-            pc_dims[s.lhs] = Any[:(levels($(s.levels)))]
+        elseif s.levels !== nothing
+            gcol, subset = s.levels
+            pc_dims[s.lhs] = Any[subset === Colon() ? :(levels($gcol)) :
+                Expr(:call, :levels, gcol, QuoteNode(subset))]
         end
+    end
+    for (nm, rhs) in det
+        axis = _plate_column_axis(rhs)
+        axis === nothing || (pc_dims[nm] = Any[:(levels($axis))])
     end
     for (nm, _) in det
         nm in skip && continue
@@ -1354,7 +1360,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     fn = ex.args[1]
     fn isa Symbol || return :scalar  # module/anonymous calls: model-level
     fn in REDUCTION_FNS && return :scalar
-    fn === :_ppl_plate_column && return :vector  # one value per index
+    fn === :_ppl_plate_column && return _plate_column_axis(ex) === nothing ?
+        :vector : :array
     argshapes = [shape(a) for a in ex.args[2:end]]
     if fn in ELEMENTWISE_OPS
         (:array in argshapes || :invalid in argshapes) &&
@@ -1427,7 +1434,7 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         fn = ex.args[1]
         fn isa Symbol || return false
         fn in REDUCTION_FNS && return false
-        fn === :_ppl_plate_column && return true
+        fn === :_ppl_plate_column && return _plate_column_axis(ex) === nothing
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2:end])
     elseif _is_dotted_call(ex)
@@ -4757,7 +4764,7 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
     params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
-    rkind[1] !== :levels && _plate_has_array_cells(cells) &&
+    (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)
     # Cell locals bound from a per-index value (they vary with the loop
@@ -4788,6 +4795,7 @@ _has_colon_index(ex) = ex isa Expr && ((ex.head === :ref &&
 # columns (`y[i] ~ Normal(r1[i], s)`) and lower as in a scalar plate.
 function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
         plate_defs::Set{Symbol})
+    axis = rkind[1] === :levels ? rkind[2] : nothing
     locals = Pair{Symbol,Any}[]
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
@@ -4812,18 +4820,8 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
             col = lc.args[1]
             col in data && _sfail("cell assignment `$col[$ivar] = ...` " *
                 "redefines bound data")
-            body = Expr(:block, (Expr(:(=), k, v) for (k, v) in locals)...)
-            deps = Set{Symbol}()
-            for (_, v) in locals
-                _cell_free_syms!(deps, v)
-            end
-            _cell_free_syms!(deps, rhs)
-            setdiff!(deps, Set{Symbol}(first.(locals)))
-            delete!(deps, ivar)
-            spec = Expr(:tuple, QuoteNode(ivar), QuoteNode(body),
-                QuoteNode(rhs))
-            push!(out, Expr(:(=), col, Expr(:call, :_ppl_plate_column, spec,
-                sort!(collect(deps))...)))
+            push!(out, Expr(:(=), col,
+                _plate_column_call(ivar, locals, rhs, axis)))
         elseif lc isa Expr && lc.head === :ref && length(lc.args) == 3 &&
                 lc.args[1] isa Symbol && lc.args[2] === ivar
             # A row per index (`b[i, 1:K] = row`): one plate column per
@@ -4835,23 +4833,13 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
             K === nothing && _sfail("cell `$(repr(c))`: a row per index " *
                 "states its length, `$col[$ivar, 1:K] = ...` with a literal K")
             rowv = Symbol(:_rkppl_rowv_, col)
-            body = Expr(:block, (Expr(:(=), k, v) for (k, v) in locals)...,
-                Expr(:(=), rowv, rhs))
-            deps = Set{Symbol}()
-            for (_, v) in locals
-                _cell_free_syms!(deps, v)
-            end
-            _cell_free_syms!(deps, rhs)
-            setdiff!(deps, Set{Symbol}(first.(locals)))
-            delete!(deps, ivar)
+            rowlocals = [locals; rowv => rhs]
             parts = Symbol[]
             for k in 1:K
                 pk = Symbol(:_rkppl_row_, col, :_, k)
                 push!(parts, pk)
-                spec = Expr(:tuple, QuoteNode(ivar), QuoteNode(body),
-                    QuoteNode(:($rowv[$k])))
-                push!(out, Expr(:(=), pk, Expr(:call, :_ppl_plate_column,
-                    spec, sort!(collect(deps))...)))
+                push!(out, Expr(:(=), pk,
+                    _plate_column_call(ivar, rowlocals, :($rowv[$k]), axis)))
             end
             push!(out, Expr(:(=), col, Expr(:call, :_ppl_rows, parts...)))
         elseif lc isa Expr && lc.head === :ref
@@ -4866,6 +4854,31 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
     lnames = Set{Symbol}(first.(locals))
     pidx = Set{Symbol}()
     for c in samples
+        if axis !== nothing
+            obj = c.args[3]
+            if _expr_has_sym(obj, ivar) || any(nm -> _expr_has_sym(obj, nm), lnames)
+                # Each varying scalar argument is itself one RK plate
+                # column; the ordinary array prior pairs its elements
+                # with the draw. Shared arguments retain their spelling.
+                (obj isa Expr && obj.head === :call &&
+                    obj.args[1] in _HOIST_FAMILIES) || _sfail("per-level " *
+                    "varying arguments currently take an elementwise prior")
+                args = Any[]
+                for (i, arg) in enumerate(obj.args[2:end])
+                    if _expr_has_sym(arg, ivar) || any(nm -> _expr_has_sym(arg, nm), lnames)
+                        nm = Symbol(:_rkppl_level_, c.args[2].args[1], :_arg_, i)
+                        push!(out, Expr(:(=), nm,
+                            _plate_column_call(ivar, locals, arg, axis)))
+                        push!(args, nm)
+                    else
+                        push!(args, arg)
+                    end
+                end
+                c = Expr(:call, :~, c.args[2], Expr(:call, obj.args[1], args...))
+            end
+            append!(out, _desugar_levels_cell(c, ivar, axis, data))
+            continue
+        end
         any(nm -> _expr_has_sym(c.args[3], nm), lnames) && _sfail("cell " *
             "`$(repr(c))` reads a cell local of an array plate; define a " *
             "per-index column (`eta[$ivar] = ...`) and observe it")
@@ -4873,6 +4886,26 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
             plate_defs, ctx, params, pidx))
     end
     return out, ctx, params
+end
+
+# Shared cell construction for observation and level axes. The fourth
+# field records a level axis, so constant outputs still have one value
+# per level and subsequent gathers preserve that axis.
+function _plate_column_call(ivar, locals, rhs, axis)
+    body = Expr(:block, (Expr(:(=), k, v) for (k, v) in locals)...)
+    deps = Set{Symbol}()
+    for (_, v) in locals
+        _cell_free_syms!(deps, v)
+    end
+    _cell_free_syms!(deps, rhs)
+    setdiff!(deps, Set{Symbol}(first.(locals)))
+    delete!(deps, ivar)
+    spec = Expr(:tuple, QuoteNode(ivar), QuoteNode(body), QuoteNode(rhs))
+    if axis !== nothing
+        push!(spec.args, QuoteNode(axis))
+        push!(deps, axis)
+    end
+    return Expr(:call, :_ppl_plate_column, spec, sort!(collect(deps))...)
 end
 
 # Value names an expression reads (call heads, `:` and keywords skipped).
@@ -4976,13 +5009,11 @@ end
 # `b[k, :] ~ D` (or `b[k, 1:K]`) with a multivariate `D` is the row
 # statement `eachrow(b[levels(g), 1:K]) .~ D` (§ array slices), and
 # `L[k] ~ LKJCholesky(K, eta)` declares one correlation factor per level
-# (a stacked LKJ array, `:lkj_cholesky_stack`). Arguments are shared
-# across levels. Per-level arguments and per-level definitions are not
-# supported yet.
+# (a stacked LKJ array, `:lkj_cholesky_stack`). Varying arguments and
+# definitions are emitted as RK plate columns by `_desugar_array_plate`.
 function _desugar_levels_cell(c, ivar::Symbol, g::Symbol, data)
     where = "`@plate for $ivar in levels($g)` cell `$(repr(c))`"
-    _is_sample(c) || _sfail("$where: per-level `=` definitions are not " *
-        "supported yet; a levels plate holds per-level `~` declarations")
+    _is_sample(c) || _sfail("$where: expected a per-level prior")
     lhs, obj = c.args[2], c.args[3]
     (lhs isa Expr && lhs.head === :ref && length(lhs.args) in (2, 3) &&
         lhs.args[1] isa Symbol && lhs.args[2] === ivar) || _sfail("$where: " *
@@ -5054,12 +5085,17 @@ function _plate_column_expr(nm::Symbol, call::Expr,
     ivar = spec.args[1].value
     body = spec.args[2].value
     out = spec.args[3].value
+    axis = length(spec.args) == 4 ? spec.args[4].value : nothing
     where = "array plate column `$nm`"
     inputs = Any[]
     lanevars = Symbol[]
     lane(inp, var) = (var in lanevars || (push!(inputs, inp);
         push!(lanevars, var)); var)
-    isidx(a) = a isa Expr && a.head === :ref && length(a.args) == 2 &&
+    pos = axis === nothing ? nothing : lane(
+        Expr(:call, :_ppl_level_indices, axis), Symbol(:_ppl_pi_, axis))
+    level() = lane(Expr(:call, :_ppl_level_values, axis),
+        Symbol(:_ppl_pl_, axis))
+    isidx(a) = axis === nothing && a isa Expr && a.head === :ref && length(a.args) == 2 &&
         a.args[1] isa Symbol && a.args[1] in data && a.args[2] === ivar
     function code(a, d)
         _is_levels_dim(d) && d.args[2] isa Symbol || _sfail("$where reads " *
@@ -5070,11 +5106,31 @@ function _plate_column_expr(nm::Symbol, call::Expr,
             Symbol(:_ppl_pc_, col, :_, h))
     end
     function rw(ex)
+        axis !== nothing && ex === ivar && return level()
         ex isa Expr || return ex
         if ex.head === :ref && ex.args[1] isa Symbol
             X, idx = ex.args[1], ex.args[2:end]
-            isidx(ex) && return lane(X, Symbol(:_ppl_pv_, X))
             d = get(dims, X, nothing)
+            if axis !== nothing && d !== nothing && idx[1] === ivar
+                dim = length(d) == 3 && length(idx) == 1 ? d[3] : d[1]
+                _is_levels_dim(dim) || return Expr(:ref, X, map(rw, idx)...)
+                _levels_subset(dim) === Colon() || _sfail("$where reads " *
+                    "a selected level axis of $X; per-level cells currently " *
+                    "take full level axes")
+                h = dim.args[2]
+                h === axis || _sfail("$where reads $X on levels($h); " *
+                    "per-level cells currently take the same level axis")
+                # The same scalar level axis is already aligned with
+                # the plate lanes. Passing it directly also avoids an
+                # unnecessary dynamic gather from a parameter view.
+                h === axis && length(d) == 1 && length(idx) == 1 &&
+                    return lane(X, Symbol(:_ppl_pv_, X))
+                codevar = pos
+                length(d) == 3 && length(idx) == 1 &&
+                    return Expr(:ref, X, :(:), :(:), codevar)
+                return Expr(:ref, X, codevar, map(rw, idx[2:end])...)
+            end
+            isidx(ex) && return lane(X, Symbol(:_ppl_pv_, X))
             if d !== nothing && !isempty(idx) && isidx(idx[1])
                 if length(d) == 3 && length(idx) == 1
                     return Expr(:ref, X, :(:), :(:), code(idx[1], d[3]))
@@ -5154,6 +5210,9 @@ end
 
 _is_plate_column_call(ex) = ex isa Expr && ex.head === :call &&
     !isempty(ex.args) && ex.args[1] === :_ppl_plate_column
+
+_plate_column_axis(ex) = _is_plate_column_call(ex) &&
+    length(ex.args[2].args) == 4 ? ex.args[2].args[4].value : nothing
 
 _expr_has_sym(ex, s::Symbol) = ex === s ||
     (ex isa Expr && any(a -> _expr_has_sym(a, s), ex.args))

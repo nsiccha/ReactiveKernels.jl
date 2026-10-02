@@ -1,4 +1,5 @@
 using DifferentiationInterface
+using Distributions
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
@@ -23,7 +24,8 @@ function _pcr_build(n, S)
     return Base.invokelatest(_pcr_measure, built, bound, u)
 end
 
-function _pcr_measure(built, bound, u)
+function _pcr_measure(built, bound, u; expected = nothing, reference = nothing,
+        structure_ad = false)
     kern = prepare_query(built, bound, :sampler)
     ru = Reactant.to_rarray(u)
     hlo = repr(Reactant.@code_hlo optimize = false kern(ru))
@@ -42,6 +44,24 @@ function _pcr_measure(built, bound, u)
     @test value ≈ native rtol = 1e-12
     @test Float64(rvalue) ≈ value rtol = 1e-9
     @test Array(rgrad) ≈ grad rtol = 1e-8 atol = 1e-9
+    if expected !== nothing
+        @test Float64(rvalue) ≈ expected[1] rtol = 1e-9
+        @test Array(rgrad) ≈ expected[2] rtol = 1e-5 atol = 1e-7
+    end
+    if reference !== nothing
+        nextu = u .+ 0.03
+        nextvalue, nextgrad = cad(Reactant.to_rarray(nextu))
+        @test Float64(nextvalue) ≈ reference(nextu) rtol = 1e-9
+        @test Array(nextgrad) ≈ _findiff_grad(reference, nextu) rtol = 1e-5 atol = 1e-7
+    end
+    if structure_ad
+        both(w) = ad_value_and_gradient(q.ad, w)
+        adhlo = repr(Reactant.@code_hlo optimize = false both(ru))
+        for m in eachmatch(r"(?:stablehlo|enzyme)\.[a-z_]+", adhlo)
+            key = "ad." * m.match
+            ops[key] = get(ops, key, 0) + 1
+        end
+    end
     return ops
 end
 
@@ -52,4 +72,27 @@ end
     # ordinary compile above lowers it with the default optimizer.
     @test get(small, "enzyme.batch", 0) > 0
     @test small == large
+end
+
+@testset "Reactant: level values and varying priors retain one cell body" begin
+    for kind in (:varying, :latent, :deterministic, :constant)
+        histograms = map(((6, 2), (20, 5))) do (n, S)
+            built, bound, cols, u = _plv_build(kind, n, S)
+            oracle(w) = first(_plv_oracle(built, cols, kind, w))
+            expected = (oracle(u), _findiff_grad(oracle, u))
+            Base.invokelatest(_pcr_measure, built, bound, u; expected,
+                reference = oracle, structure_ad = true)
+        end
+        @test get(histograms[1], "enzyme.batch", 0) > 0
+        @test histograms[1] == histograms[2]
+    end
+    built, bound, u, oracle = _plv_lazy_build()
+    expected = (oracle(u), _findiff_grad(oracle, u))
+    Base.invokelatest(_pcr_measure, built, bound, u; expected,
+        reference = oracle, structure_ad = true)
+    built, bound, cols, u = _plv_build(:latent, 6, 3; labels = ["c", "a", "b"])
+    string_oracle(w) = first(_plv_oracle(built, cols, :latent, w))
+    expected = (string_oracle(u), _findiff_grad(string_oracle, u))
+    Base.invokelatest(_pcr_measure, built, bound, u; expected,
+        reference = string_oracle, structure_ad = true)
 end

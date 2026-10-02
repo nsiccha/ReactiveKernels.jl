@@ -4,6 +4,8 @@ using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
 
+include("fixtures/level_plate_values.jl")
+
 # `@plate` cells beyond scalars (user decision 01gqbsq, stratified prong):
 # a cell means one iteration of the Julia loop, whatever the shape of its
 # values. Per-level cells (`@plate for k in levels(g)`) lower to the
@@ -111,14 +113,52 @@ end
     end
 end
 
-@testset "per-level plate cells not built yet" begin
-    data = (:y, :g)
+@testset "per-level arguments and deterministic values" begin
+    for kind in (:varying, :latent, :deterministic, :constant), S in (1, 3)
+        built, bound, cols, u = _plv_build(kind, 12, S)
+        saved = deepcopy(cols)
+        value, c = _plv_oracle(built, cols, kind, u)
+        @test prepare_query(built, bound, :sampler)(u) ≈ value
+        @test _query(built.spec, bound, :c, u) ≈ c
+        @test unconstrain(built.layout, constrain(built.layout, u)) ≈ u
+        grad = _check_gradient(built.spec, bound, u)
+        @test grad ≈ _findiff_grad(w -> first(_plv_oracle(built, cols, kind, w)), u)
+        @test cols == saved
+    end
+    # Symbolic levels index declared arrays by level, without exposing
+    # ordinal positions as the loop's authored values.
+    built, bound, cols, u = _plv_build(:latent, 12, 3; labels = ["c", "a", "b"])
+    @test prepare_query(built, bound, :sampler)(u) ≈
+        first(_plv_oracle(built, cols, :latent, u))
+    _check_gradient(built.spec, bound, u)
+
+    data = (:y, :g, :m)
     lower(cell) = lower_rkppl(Expr(:block, :(a ~ Normal(0, 5)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(0),
             Expr(:for, :(k = levels(g)), Expr(:block, cell))),
         :(mu = a .+ c[g]), :(y .~ Normal.(mu, 1.0))), data)
-    # Not built yet (todo 069fxln): per-level arguments and per-level
-    # definitions are valid Julia loops.
-    @test_broken (lower(:(c[k] ~ Normal(m[k], 1))); true)
-    @test_broken (lower(:(c[k] = 2.0)); true)
+    @test lower(:(c[k] ~ Normal(m[k], 1))) isa StructuralPlan
+    @test lower(:(c[k] = 2.0)) isa StructuralPlan
+    selected = quote
+        z[levels(g)[2:end]] .~ Normal.(0, 1)
+        @plate for k in levels(g)
+            c[k] = z[k]
+        end
+        y .~ Normal.(c[g], 1)
+    end
+    @test_throws SurfaceLoweringError lower_rkppl(selected, (:y, :g))
+    otheraxis = quote
+        z[levels(h)] .~ Normal.(0, 1)
+        @plate for k in levels(g)
+            c[k] = z[k]
+        end
+        y .~ Normal.(c[g], 1)
+    end
+    @test_throws SurfaceLoweringError lower_rkppl(otheraxis, (:y, :g, :h))
+end
+
+@testset "per-level assignments keep inactive branches inactive" begin
+    built, bound, u, oracle = _plv_lazy_build()
+    @test prepare_query(built, bound, :sampler)(u) ≈ oracle(u)
+    @test _check_gradient(built.spec, bound, u) ≈ _findiff_grad(oracle, u)
 end
