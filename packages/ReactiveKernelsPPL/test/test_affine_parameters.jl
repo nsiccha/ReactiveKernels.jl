@@ -1,5 +1,32 @@
 using Distributions
 
+_affine_whole(value) = value
+
+@testset "ordinary array definitions retain whole-value data" begin
+    ast = quote
+        z[1:2] .~ Normal.(0, 1)
+        value = z .+ group_x
+        reads = _affine_whole(value)
+        y .~ Normal.(reads[obs_index], 1.0)
+    end
+    data = Dict(:group_x => [0.2, -0.4], :obs_index => [2, 1, 2],
+        :y => [0.1, -0.2, 0.3])
+    bound = bind_data(lower_rkppl(ast, keys(data); mod = @__MODULE__), data)
+    built = build_kernel(bound)
+    u = [0.3, -0.1]
+    @test bound.n_obs == 3
+    @test _query(built.spec, bound, :posterior, u) ≈
+        sum(logpdf.(Normal(), u)) + sum(logpdf.(
+            Normal.((u .+ data[:group_x])[data[:obs_index]], 1.0), data[:y]))
+    _check_gradient(built.spec, bound, u)
+    # A direct response read makes the same data observation-aligned;
+    # model-level array arithmetic must still refuse that combination.
+    aligned = copy(ast)
+    push!(aligned.args, :(y2 .~ Normal.(group_x, 1.0)))
+    @test_throws SurfaceLoweringError lower_rkppl(aligned, (keys(data)..., :y2);
+        mod = @__MODULE__)
+end
+
 function _affine_model(ast; data...)
     plan = RKPPLModel(ast, @__MODULE__)(; data...)
     built = build_kernel(plan)

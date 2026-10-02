@@ -701,6 +701,11 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
     if ex isa Symbol
         (_is_array_param(plan, ex) || ex in _union_names(plan)) &&
             return push!(refs, ex)
+        # Whole-value data have no observation axis. An array definition
+        # retained by lowering reads these as bound operands, just like a
+        # scalar assignment or an undotted module call.
+        bound && haskey(plan.columns, ex) &&
+            ex in first(_bound_model_level_inputs(plan)) && return nothing
         _is_derived(plan, ex) && _fail(label, "derived column $ex is " *
             "per-observation — it does not combine with arrays here")
         bound && haskey(plan.columns, ex) && _fail(label, "column $ex is " *

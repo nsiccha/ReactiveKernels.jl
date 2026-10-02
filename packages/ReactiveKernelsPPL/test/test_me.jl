@@ -188,7 +188,7 @@ end
     @test :eta in [d.name for d in plan.derived]
 end
 
-@testset "surface me lowering: scalar-param read stays a transform" begin
+@testset "surface me lowering: scalar-param read retains its affine declaration" begin
     # A non-coefficient sampled read (Exponential `tau`) marks a latent
     # transform even with coefficient structure elsewhere.
     ast = Expr(:block,
