@@ -199,12 +199,13 @@ end
     bound = bind_data(lower_rkppl(prog, data), cols; dims)
     names = coordinate_names(build_kernel(bound).layout)
     @test length(names) == 5
+    @test :mu_alpha in names
     u = map(names) do n
         s = String(n)
         startswith(s, "tau_") && return log(1.2)
         startswith(s, "z_flat_") &&
             return 0.1 * parse(Int, split(s, ".")[2])
-        n === Symbol("alpha.Intercept") && return 0.2
+        n === :mu_alpha && return 0.2
         n === :sigma_y && return log(0.9)
         error("unexpected coordinate $n")
     end
