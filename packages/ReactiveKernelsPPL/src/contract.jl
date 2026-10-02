@@ -916,6 +916,18 @@ coefficient block. Two kinds of family:
   Cholesky factor of a K×K correlation matrix (Distributions.jl
   `LKJCholesky(K, eta)` density, `uplo = 'L'`). `args = (arg1 = eta,)`, a
   finite positive literal; `dims` is `[K, K]`.
+- A multivariate slice family `<stem>_<slices>` (`mv_slices.jl`):
+  `eachrow(B[a, b]) .~ D` (`_rows`), `eachcol(B[a, b]) .~ D` (`_cols`) or
+  `b[ax] ~ D` (`_vector`) — every slice of the array one draw of the
+  multivariate `D`. Stems: `mvnormal_cholesky` (`args = (arg1 = mean,
+  arg2 = factor)`), `mvnormal` (`(arg1 = mean, arg2 = covariance)`),
+  `dirichlet` (`(arg1 = concentration,)`, rows/cols only) and
+  `ordered_normal` (`(arg1 = m, arg2 = s, arg3 = K)` for
+  `Ordered(Normal(m, s), K)`, rows/cols only). A vector argument is a
+  shared value or a per-slice `:(eachrow(M))` / `:(eachcol(M))`
+  expression; matrices and scalars are shared. Multivariate normal slices
+  are centered (the entries are the coordinates); simplex and ordered
+  slices constrain along each slice.
 
 A `phi ~ Dirichlet(alpha)` simplex is not an array parameter: it stays a
 [`VectorParameter`](@ref), which definitions already read as a model-level
@@ -5412,6 +5424,9 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
         )
         # (A bound model-level data value — an assignment evaluated at
         # bind — is a column entry but no observation column.)
+        # A raw whole-value input is a bound operand, not a graph node.
+        bound && haskey(plan.columns, ex) &&
+            ex in first(_bound_model_level_inputs(plan)) && return nothing
         bound && haskey(plan.columns, ex) &&
             !any(a -> a.name === ex, plan.assignments) && _fail(
             label,
@@ -5520,6 +5535,8 @@ function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String} &&
         return nothing
     if ex isa Symbol
+        # `:` in a positional read (`Z[:, 1]`) is a whole axis, not a name.
+        ex === :(:) && return nothing
         bound && haskey(plan.columns, ex) && return nothing
         push!(refs, ex)
         return nothing
@@ -5779,7 +5796,9 @@ end
 function _is_vector_valued(ex, plan::StructuralPlan)
     ex isa Symbol && return !(ex in _union_names(plan) ||
         ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
-    ex isa Expr && ex.head === :ref && _is_array_param(plan, ex.args[1]) &&
+    ex isa Expr && ex.head === :ref && ex.args[1] isa Symbol &&
+        (_is_array_param(plan, ex.args[1]) ||
+            _is_array_assignment(plan, ex.args[1])) &&
         return _array_index_kind(plan, ex) === :gather &&
             all(i -> i isa Int, ex.args[3:end])
     ex isa Number && return false

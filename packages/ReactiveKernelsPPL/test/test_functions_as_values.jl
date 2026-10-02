@@ -28,6 +28,8 @@ end
 shifted(v; by = 1.0) = v .+ by
 as_vector(x) = collect(x)
 scaled(v, k) = v .* k
+squared(v) = v .^ 2
+decay_weights(v, s) = s .* exp.(-0.25 .* v)
 l2norm(v) = sqrt(sum(abs2, v))
 # An RK-owned derivative rule (the optional registered rule): softplus with
 # its authored partial; Enzyme uses the generated rule.
@@ -665,7 +667,7 @@ end
             s_eff = sigma * exp(first(sc))
             y .~ Normal.(m0 .+ x, s_eff)
         end, (:y, :x, :gx); mod = _FV)
-    @test any(d -> d.name === :sc, kept.derived)   # stays a named column
+    @test any(a -> a.name === :sc, kept.assignments) # named model-level value
     kbound = bind_data(kept, xcols)
     @test kbound.n_obs == 6
     kbuilt = build_kernel(kbound)
@@ -870,6 +872,85 @@ end
     want = sum(logpdf.(Normal.(th.mu[1] .+
         hcat(cols[:x], cols[:x2]) * th.mu[2:3] .+
         2 .* exp.(th.s .* th.z)[cols[:c]], 1.0), cols[:y]))
+    @test _fv_value(built, bound, :likelihood, u) ≈ want
+end
+
+@testset "functions as values: built-in broadcasts over module values" begin
+    # Built-in math over a module value keeps its model-level shape, even
+    # when the result then meets a declared array. Naming an intermediate
+    # or moving the same leaf math to a helper does not change the density.
+    shapes = Tuple{Int,Int}[]
+    for (n, K) in ((7, 2), (13, 5))
+        cols = Dict{Symbol,ColumnData}(
+            :y => [0.3 * sin(i) for i in 1:n],
+            :B => [cos(i + j) for i in 1:n, j in 1:K],
+            :lam => [0.2 * j for j in 1:K])
+        bodies = (quote
+                L = squared(lam)
+                S = sd .* exp.(-0.25 .* L) .* w
+            end, quote
+                L = squared(lam)
+                E = exp.(-0.25 .* L)
+                S = sd .* E .* w
+            end, quote
+                S = sd .* exp.(-0.25 .* squared(lam)) .* w
+            end, quote
+                L = squared(lam)
+                S = decay_weights(L, sd) .* w
+            end, quote
+                L = squared(lam)
+                S = sd .* Base.exp.(-0.25 .* L) .* w
+            end, quote
+                L = squared(lam)
+                S = sd .* sqrt.(exp.(-0.5 .* L)) .* w
+            end)
+        builds = map(bodies) do body
+            _fv_build(Expr(:block,
+                :(w[axes(B, 2)] .~ Normal.(0, 1)),
+                :(sd ~ HalfNormal(1)), body.args...,
+                :(a ~ Normal(0, 1)), :(mu = a .+ B * S),
+                :(y .~ Normal.(mu, 1.0))), cols)
+        end
+        for (_, bound, built) in builds
+            @test bound.n_obs == n
+            @test built.layout.total == K + 2
+            u = [0.2 * cos(i) for i in 1:built.layout.total]
+            th = constrain(built.layout, u)
+            mu = only(th.mu) .+ cols[:B] *
+                (th.sd .* exp.(-0.25 .* cols[:lam].^2) .* th.w)
+            want = sum(logpdf.(Normal.(mu, 1.0), cols[:y]))
+            @test _fv_value(built, bound, :likelihood, u) ≈ want
+            @test _fv_value(built, bound, :sampler, u) ≈
+                _fv_value(builds[1][3], builds[1][2], :sampler, u)
+        end
+        _, bound, built = first(builds)
+        push!(shapes, (length(built.spec.graph.values),
+            length(built.spec.graph.recipes)))
+        u = [0.2 * cos(i) for i in 1:built.layout.total]
+        kern = prepare_query(built, bound, :sampler)
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        value, grad = sampler_value_and_gradient!(q, similar(u), u)
+        @test value ≈ Base.invokelatest(kern, u)
+        @test isapprox(grad,
+            _fv_findiff(v -> Base.invokelatest(kern, v), u);
+            rtol = 1e-5, atol = 1e-7)
+    end
+    @test shapes[1] == shapes[2]
+
+    # Model values may also be gathered before broadcasting. The index
+    # supplies the observation axis; it must survive the shared classifier.
+    cols = Dict{Symbol,ColumnData}(:y => [0.1, -0.2, 0.3, 0.4],
+        :g => [1, 2, 1, 2], :lam => [0.2, 0.5])
+    _, bound, built = _fv_build(quote
+        L = squared(lam)
+        a ~ Normal(0, 1)
+        mu = a .+ exp.(-0.25 .* L[g])
+        y .~ Normal.(mu, 1.0)
+    end, cols)
+    u = [0.3]
+    th = constrain(built.layout, u)
+    want = sum(logpdf.(Normal.(only(th.mu) .+
+        exp.(-0.25 .* cols[:lam][cols[:g]].^2), 1.0), cols[:y]))
     @test _fv_value(built, bound, :likelihood, u) ≈ want
 end
 

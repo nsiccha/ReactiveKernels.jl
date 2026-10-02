@@ -76,6 +76,8 @@ export restore_draws
 export RKPPLModel, RKPPLSubmodel, lower_rkppl, @rkppl, SurfaceLoweringError
 export ordered_logistic, monotonic, differenced_ar1, r2d2_coefs,
     horseshoe_coefs
+export varying_coefs, varying_coefs_correlated, varying_coefs_centered,
+    varying_coefs_centered_correlated, varying_stratified
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
 export DarSpec
 export LINEAR_EVENT_READ, LINEAR_EVENT_DOSE, LINEAR_EVENT_DOSE_SEGMENT
@@ -123,6 +125,7 @@ include("transit_twocmt_rule.jl")
 include("pk_rectangular.jl")
 include("design.jl")
 include("bijectors.jl")
+include("mv_slices.jl")
 include("layout.jl")
 include("preprocessing.jl")
 include("generator.jl")

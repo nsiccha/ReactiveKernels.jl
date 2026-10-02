@@ -95,6 +95,72 @@ end
     _check_gradient(built.spec, bound, u)
 end
 
+# Acceptance S2: the R2D2 result bound to a name and summed into the
+# predictor, and the library called from inside another submodel.
+@rkppl _ls_r2d2_effect(X, alpha) = begin
+    b ~ r2d2_coefs(X, alpha)
+    return X * b
+end
+
+@testset "library r2d2_coefs: named and nested uses (acceptance S2)" begin
+    cols = _ls_cols()
+    names = _ls_names(cols)
+    named = quote
+        a ~ Normal(0, 5)
+        X = hcat(x1, x2)
+        b ~ r2d2_coefs(X, [1.0, 1.0])
+        eta = X * b
+        mu = a .+ eta
+        sigma ~ Exponential(1)
+        y .~ Normal.(mu, sigma)
+    end
+    nested = quote
+        a ~ Normal(0, 5)
+        X = hcat(x1, x2)
+        eta ~ _ls_r2d2_effect(X, [1.0, 1.0])
+        mu = a .+ eta
+        sigma ~ Exponential(1)
+        y .~ Normal.(mu, sigma)
+    end
+    # Both levels inlined by hand; the library body's `eachcol` resolves in
+    # the module that defines it, so the twin lowers there.
+    twin = quote
+        a ~ Normal(0, 5)
+        X = hcat(x1, x2)
+        eta_b_R2 ~ Beta(1, 1)
+        eta_b_phi ~ Dirichlet([1.0, 1.0])
+        eta_b_tau ~ HalfNormal(1)
+        eta_b_varx = var.(eachcol(X))
+        eta_b_b[axes(X, 2)] .~ Normal.(0,
+            sqrt.(eta_b_phi .* eta_b_R2 .* eta_b_tau^2 ./ eta_b_varx))
+        eta_b = eta_b_b
+        eta = X * eta_b
+        mu = a .+ eta
+        sigma ~ Exponential(1)
+        y .~ Normal.(mu, sigma)
+    end
+    @test sprint(_canon, lower_rkppl(nested, names; mod = @__MODULE__)) ==
+        sprint(_canon, lower_rkppl(twin, names; mod = ReactiveKernelsPPL))
+    X = hcat(cols[:x1], cols[:x2])
+    for (ast, p) in ((named, :b), (nested, :eta_b))
+        bound = bind_data(lower_rkppl(ast, names; mod = @__MODULE__), cols)
+        built = build_kernel(bound)
+        u = _ls_u(built)
+        nt = constrain(built.layout, u)
+        R2, phi = nt[Symbol(p, :_R2)], nt[Symbol(p, :_phi)]
+        tau, b = nt[Symbol(p, :_tau)], nt[Symbol(p, :_b)]
+        a = only(nt.mu)
+        sd = sqrt.(phi .* R2 .* tau^2 ./ var.(eachcol(X)))
+        pr = logpdf(Normal(0, 5), a) + logpdf(Beta(1, 1), R2) +
+            logpdf(Dirichlet([1.0, 1.0]), phi) + _ls_halfnormal(1, tau) +
+            sum(logpdf.(Normal.(0, sd), b)) + logpdf(Exponential(1), nt.sigma)
+        @test _query(built.spec, bound, :prior, u) ≈ pr
+        @test _query(built.spec, bound, :likelihood, u) ≈
+            sum(logpdf.(Normal.(a .+ X * b, nt.sigma), cols[:y]))
+        _check_gradient(built.spec, bound, u)
+    end
+end
+
 @testset "library r2d2_coefs over a bound data matrix" begin
     cols = _ls_cols()
     X = hcat(cols[:x1], cols[:x2], cols[:x1] .* cols[:x2])

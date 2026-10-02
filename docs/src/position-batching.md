@@ -172,6 +172,20 @@ custom array layouts retain projection and stacking. These internal reductions
 leave the ownership, empty-batch, validation, and scalar dispatch contracts
 in place; allocating scalar recipes still allocate their intermediate arrays.
 
+The native position loop also keeps one lane buffer per batched dense numeric
+array port (`Array{T,N}` with `N > 1`): each position copies its slice into
+that buffer, so the scalar graph receives the same `Array{T,N-1}` it would as
+a fresh copy, declared types and the dose-outer plate lowering included. A
+WANT computed by an authored plate (its materialized pointwise result) or a
+scan refills the previous position's buffer, which was already copied into
+the stacked result, instead of allocating a new one. A borrowed reader also
+keeps both kinds of lane buffer between calls; the owning surface allocates
+each once per call. So a 32-position read of a superposition plate over a
+16321-observation response allocates a fixed few hundred bytes, where it
+allocated 8.4 MB (an input copy and an output per position). Each position
+still copies its input slice in and its result out; other recipes allocate as
+they do in the scalar kernel.
+
 By default every call owns fresh stacked output arrays, including record
 leaves. Later calls cannot change retained results. To consume bounded batches
 immediately on the native backend, opt into final output-buffer reuse:
@@ -194,9 +208,10 @@ callback, or kept in reactive state. A function return alone does not require
 copying. Use a separate instance per concurrent caller; the cache is not reentrant.
 Changing shapes or element types reseeds storage. Feeding a retained output back
 as an input detaches its buffer so the input is not overwritten. Reuse avoids
-allocation of compatible final stacked buffers; per-position projections and
-scalar intermediate arrays may still allocate. It does not make an allocating
-scalar kernel allocation-free, and it does not cache positions or unit solves.
+allocation of compatible final stacked buffers and of the lane buffers above;
+other projections and scalar intermediate arrays may still allocate. It does
+not make an allocating scalar kernel allocation-free, and it does not cache
+positions or unit solves.
 
 Prepare one native borrowed template, then use `copy(template)` to create an
 independent reader for each request or concurrent caller:
