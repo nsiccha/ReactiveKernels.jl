@@ -148,6 +148,14 @@ and lock the one Reactant 0.2.289 lifted:
   side is a `DerivativeRule` (the rule constraint above): the augmented
   system's vector-Jacobian products are the rule's authored reverse cut,
   evaluated inside the retained loop, so nothing differentiates anything.
+- A live branch with an out-of-bounds read of a host constant in its inactive
+  arm fails while Reactant traces that arm, before compilation:
+  `repro_reactant_inactive_constant_index.jl`. Native primal and Enzyme AD
+  retain the branch. Data-bound conditions split away the inactive arm, and
+  live branches around traced undefined arithmetic retain compiled primal
+  and AD parity. The invalid host-constant indexing shape remains unsupported;
+  its named acceptance case is excluded from compiled parity, with the exact
+  `BoundsError` pinned. No index clamping or dummy buffer is introduced.
 - Native Enzyme reverse mode aborts the process (an LLVM assertion in its
   shadow-allocation caching, reached while it differentiates SpecialFunctions'
   `logabsgamma` port) when lazily evaluated branches around
