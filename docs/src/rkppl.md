@@ -164,6 +164,10 @@ are shared across elements; literal vectors give one value per element.
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :rkppl_matrix)
 ```
 
+For spline and approximate GP terms, compute a data-side basis and use a
+library submodel whose body states every prior. See [Smooths and HSGPs with
+`@rkppl`](rkppl-smooths.md) for tensor, periodic and grouped variants.
+
 ## Plates
 
 `@plate for i in R … end` writes a loop whose cells each mean one iteration

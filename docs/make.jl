@@ -58,6 +58,7 @@ site_pages = [
     ],
     "Probabilistic programming" => [
         "Writing models with @rkppl" => "rkppl.md",
+        "Smooths and HSGPs with @rkppl" => "rkppl-smooths.md",
         "Eight schools" => "eight-schools.md",
         "Sum-to-zero recovery" => "sum-to-zero.md",
         "MNIST multinomial logistic" => "mnist-logistic.md",

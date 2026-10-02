@@ -543,6 +543,7 @@ function _lower_rkppl(ast, data_names, scalars::Set{Symbol},
     end
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
+    ast = Expr(:block, _desugar_destructuring(ast.args)...)
     ast, data = _scalar_value_definitions(ast, data, scalars)
     ast, pins = _expand_submodels(ast, data, mod)
     return _lower_rkppl_once(ast, data, pins, mod)
@@ -605,6 +606,17 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module)
     det = _hoist_prior_args!(sample, det, data, plate_specs;
         resolve = a -> _resolve_module_calls(a, mod, model_names,
             "prior argument `$(repr(a))`"))
+    # A data-only module value a response reads per observation is that
+    # observation column or matrix (user decision `0z5bsqi`, prong
+    # `in_model`): it lowers as data, computed once by `bind_data`, which
+    # checks its length or row count. Read whole, it stays model-level.
+    rawdata = data
+    aligned = _aligned_module_data(sample, det, data)
+    aligned_defs = Pair{Symbol,Any}[p for p in det if first(p) in aligned]
+    if !isempty(aligned)
+        data = union(data, aligned)
+        det = Pair{Symbol,Any}[p for p in det if first(p) ∉ aligned]
+    end
     # Varying bindings (draws + contributions): contributions compose
     # only as direct predictor summands, never inside definitions.
     varying_names = Set{Symbol}()
@@ -1053,6 +1065,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module)
             push!(assigns, _lower_assignment(nm, rhs, coefuse))
         end
     end
+    for (nm, rhs) in aligned_defs
+        push!(derived, VectorAssignmentSpec(nm, rhs, nm))
+    end
     append!(derived, ctx.synth_derived)
     append!(assigns, ctx.synth_assigns)
     _check_coefficient_readers(coefuse, ctx, predictors, priors, params,
@@ -1092,9 +1107,154 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module)
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
         array_parameters = arrays)
-    _confirm_whole_value_data(plan, data, waived; whole)
+    _confirm_whole_value_data(plan, rawdata, waived; whole)
     validate_structure(plan)
     return plan
+end
+
+# ── Destructuring and in-model data values ───────────────────────────
+# `(a, b) = rhs` (standard Julia destructuring): each name binds its
+# element, `a = Base.getindex(rhs, 1)`, `b = Base.getindex(rhs, 2)`, Julia's
+# tuple semantics (an extra element is dropped, a missing one is a
+# `BoundsError`). A data-only `rhs` is evaluated once by `bind_data`
+# (identical calls share one evaluation), so `(Xf, Zp) = tps_basis(x; k = 4)`
+# fits the basis once.
+_is_destructuring(st) =
+    st isa Expr && st.head === :(=) && length(st.args) == 2 &&
+    Meta.isexpr(st.args[1], :tuple) && !isempty(st.args[1].args) &&
+    all(a -> a isa Symbol, st.args[1].args)
+
+function _desugar_destructuring(stmts)
+    out = Any[]
+    for st in stmts
+        if _is_destructuring(st)
+            lhs, rhs = st.args
+            for (i, nm) in enumerate(lhs.args)
+                push!(out, Expr(:(=), nm, Expr(:call,
+                    Expr(:., :Base, QuoteNode(:getindex)),
+                    rhs isa Expr ? copy(rhs) : rhs, i)))
+            end
+        else
+            push!(out, st)
+        end
+    end
+    return out
+end
+
+# Data-only module values (`B = tps_basis(x; k = 4)`, `z = f(x)`: an
+# undotted module call reading only data) that a response needs per
+# observation, found from every `.~` response's distribution arguments
+# through definitions. The arguments broadcast against the response, so a
+# model-level value fits there (`Normal.(mu, s)`). One is needed per
+# observation only where a model-level value never fits: the matrix of a
+# data product (`B * w`), a term of a sum (`a .+ z`; a predictor's terms
+# are per observation), or a factor of such a term whose other operands
+# are all model-level (`a .+ b .* z`). Beside a per-observation operand
+# (`m .* x`) a model-level value broadcasts and stays model-level.
+# Module-call arguments, reductions, gathered values and the vector of a
+# data product are whole reads. A number bound as data (`_bound_value`)
+# is known at lowering and never needs a column.
+function _aligned_module_data(sample, det, data)
+    detmap = Dict{Symbol,Any}(det)
+    cands = Set{Symbol}(nm for (nm, rhs) in det
+        if _is_module_value_call(rhs) && !_is_bound_value_call(rhs) &&
+            _data_only(rhs, data, detmap))
+    aligned = Set{Symbol}()
+    isempty(cands) && return aligned
+    visited = Set{Tuple{Symbol,Bool}}()
+    for s in sample
+        s.broadcast && s.levels === nothing && s.matrix === nothing &&
+            s.dims === nothing || continue
+        (s.lhs in data || haskey(detmap, s.lhs)) || continue
+        # Each distribution argument broadcasts against the response.
+        rhs = s.rhs
+        slots = _is_dotted_call(rhs) ? rhs.args[2].args :
+            (rhs isa Expr && rhs.head === :call ? rhs.args[2:end] : Any[rhs])
+        for a in slots
+            _column_reads!(aligned, a, cands, detmap, visited, data, false)
+        end
+    end
+    return aligned
+end
+
+_is_module_value_call(ex) =
+    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+    ex.args[1] isa GlobalRef
+
+const _WHOLE_READ_FNS = (:size, :axes, :levels, :eachindex, :Ref)
+const _ADDITIVE_OPS = (:+, :-, :.+, :.-)
+
+# Record the data-only module values `ex` needs as observation columns.
+# `need`: `ex` itself must carry the observations (a term of a sum); in a
+# distribution argument, or beside a per-observation operand, it need not,
+# though the matrix of a data product always must (a model-level product
+# never mixes with a column).
+function _column_reads!(aligned, ex, cands, detmap, visited, data,
+        need::Bool = true)
+    walk(a, nd = need) =
+        _column_reads!(aligned, a, cands, detmap, visited, data, nd)
+    if ex isa Symbol
+        if ex in cands
+            need && push!(aligned, ex)
+        elseif haskey(detmap, ex) && !((ex, need) in visited)
+            push!(visited, (ex, need))
+            walk(detmap[ex])
+        end
+        return nothing
+    end
+    ex isa Expr || return nothing
+    if ex.head === :ref
+        # A gather `v[c]`: the value whole, the index per observation.
+        foreach(walk, ex.args[2:end])
+        return nothing
+    end
+    dotted = _is_dotted_call(ex)
+    ex.head === :call || dotted || (foreach(walk, ex.args); return nothing)
+    fn = ex.args[1]
+    fn isa GlobalRef && !dotted && return nothing
+    fn isa Symbol && (fn in REDUCTION_FNS || fn in _WHOLE_READ_FNS) &&
+        return nothing
+    args = dotted ? ex.args[2].args : ex.args[2:end]
+    if fn === :* && !dotted && length(args) == 2
+        # A data matrix times a vector: rows from the matrix, the vector
+        # whole. (`s * z`, a scalar times a column, reads both.)
+        walk(args[1], true)
+        _symbols_in(args[1], union(cands, data)) || walk(args[2])
+        return nothing
+    end
+    # Each term of a sum carries the observations itself.
+    fn in _ADDITIVE_OPS && return foreach(a -> walk(a, true), args)
+    # A product (or other elementwise call) carries them when any operand
+    # does; then the others may be model-level and broadcast.
+    any(a -> _reads_obs(a, data, detmap, Set{Symbol}()), args) &&
+        return foreach(a -> walk(a, false), args)
+    foreach(walk, args)
+    return nothing
+end
+
+# Does `ex` read data per observation (outside whole reads)?
+function _reads_obs(ex, data, detmap, active::Set{Symbol})
+    if ex isa Symbol
+        ex in data && return true
+        (haskey(detmap, ex) && !(ex in active)) || return false
+        push!(active, ex)
+        r = _reads_obs(detmap[ex], data, detmap, active)
+        delete!(active, ex)
+        return r
+    end
+    ex isa Expr || return false
+    ex.head === :ref && return any(a -> _reads_obs(a, data, detmap, active),
+        ex.args[2:end])
+    dotted = _is_dotted_call(ex)
+    if ex.head === :call || dotted
+        fn = ex.args[1]
+        fn isa GlobalRef && !dotted && return false
+        fn isa Symbol && (fn in REDUCTION_FNS || fn in _WHOLE_READ_FNS) &&
+            return false
+        args = dotted ? ex.args[2].args : ex.args[2:end]
+        return any(a -> _reads_obs(a, data, detmap, active), args)
+    end
+    return any(a -> _reads_obs(a, data, detmap, active), ex.args)
 end
 
 # A per-cell latent declaration reuses the scalar-parameter distribution
@@ -6028,8 +6188,9 @@ function _submodel_body_parts(sm::RKPPLSubmodel)
             "the use-site LHS — a bare `return` returns nothing")
         ret = unwrap
     end
-    stmts = Any[(st isa Expr && !_is_block_macro(st)) ? _unwrap_trivia(st) :
-        st for st in items[1:end-1]]
+    stmts = _desugar_destructuring(Any[
+        (st isa Expr && !_is_block_macro(st)) ? _unwrap_trivia(st) : st
+        for st in items[1:end-1]])
     for st in stmts
         Meta.isexpr(st, :return) && _sfail(
             "submodel `$(sm.name)`: `return` is only admitted as the " *
@@ -7195,7 +7356,7 @@ function _lower_categorical_logit_response(lhs, call, range, weights,
                             "K−1 non-reference etas " *
                             "(`y .~ CategoricalLogit.(eta_2, eta_3)` for K=3)")
     pnames = Symbol[_lower_location(lhs, a, IdentityLink, ctx, predictors,
-        pred_idx, coefuse; synth = Symbol(lhs, "_eta_", j))
+        pred_idx, coefuse; synth = Symbol(lhs, "_eta_", j), value = true)
         for (j, a) in enumerate(args)]
     return LikelihoodSpec(CategoricalLogitFam, LogitLink, lhs, pnames[1],
         nothing, weights, evidence, label, nothing, range;
@@ -7266,7 +7427,7 @@ function _lower_ordered_logistic_response(lhs, call, range, weights,
         "takes `y .~ OrderedLogistic.(eta, Ref(c))` with " *
         "`c ~ Ordered(Normal(0, 1), length(levels(y)) - 1)`")
     pname = _lower_location(lhs, args[1], IdentityLink, ctx, predictors,
-        pred_idx, coefuse)
+        pred_idx, coefuse; value = true)
     cut = length(args) == 2 ?
         _explicit_thresholds!(ctx, lhs, args[2], true, "`OrderedLogistic`") :
         _implicit_vector!(ctx, Symbol(lhs, :_cutpoints), :ordered_normal, lhs)
@@ -7309,7 +7470,7 @@ function _lower_ordinal_response(lhs, call, range, weights, evidence,
     linktag = _ordinal_tag(lhs, args[2],
         (:LogitLink, :ProbitLink, :CloglogLink), "link")
     pname = _lower_location(lhs, args[3], IdentityLink, ctx, predictors,
-        pred_idx, coefuse)
+        pred_idx, coefuse; value = true)
     vfam = structure === :Cumulative ? :ordered_normal : :vector_normal
     thresh = length(args) == 4 ?
         _explicit_thresholds!(ctx, lhs, args[4], structure === :Cumulative,
@@ -7381,7 +7542,7 @@ function _lower_joint_response(j::JointSampleStmt, factor_names::Set{Symbol},
         "`LKJCovarianceFactor` declaration " *
         "(`L ~ LKJCovarianceFactor(K, Exponential(1.0), eta)` in the model)")
     pnames = Symbol[_lower_location(o, m, IdentityLink, ctx, predictors,
-        pred_idx, coefuse; synth = Symbol(o, "_joint_", k))
+        pred_idx, coefuse; synth = Symbol(o, "_joint_", k), value = true)
         for (k, (o, m)) in enumerate(zip(j.outcomes, j.means))]
     scales, corr = _lkj_factor_names(j.factor)
     label = Symbol(join(j.outcomes, "_") * "_resp")
@@ -8602,10 +8763,16 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             # column as a value under the written link.
             value && !bare && _is_value_location(loc, ctx) &&
                 return _value_location!(lhs, loc, pred_link, ctx,
-                    predictors, pred_idx)
+                    predictors, pred_idx; synth)
             return _lower_location_symbol_error(lhs, loc, ctx; bare,
                 value)
         end
+        # Scalar definitions stay ordinary values, except for the already
+        # admitted signed coefficient aliases (their intercept plan stays).
+        value && !bare && _scalar_location_value(loc, ctx) &&
+            !_scalar_intercept_location(loc, ctx) &&
+            return _value_location!(lhs, loc, pred_link, ctx,
+                predictors, pred_idx; synth)
         pin = get(ctx.predictor_pins, lhs, nothing)
         if pin !== nothing && pin !== loc
             # A pin renames one response's predictor — the pinned location
@@ -8653,9 +8820,15 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         end
         terms, uses = _analyze_predictor(pname, ctx.detmap[loc], ctx, lhs)
     elseif loc isa Number
+        value && !bare && return _value_location!(lhs, loc, pred_link, ctx,
+            predictors, pred_idx; synth)
         _sfail("response $lhs location is a literal — use an intercept-only " *
                "predictor (`eta = a`)")
     else
+        value && !bare && _scalar_location_value(loc, ctx) &&
+            !_scalar_intercept_location(loc, ctx) &&
+            return _value_location!(lhs, loc, pred_link, ctx,
+                predictors, pred_idx; synth)
         # Per-cell latents classify inline like data columns: `b .* x_true`
         # is a ContinuousTerm over the latent (the SB `me` mirror); a bare
         # latent fails in `_classify_symbol`, never silently.
@@ -8716,31 +8889,122 @@ _is_value_location(loc::Symbol, ctx) = loc in ctx.data ||
         loc ∉ ctx.vector_params && loc ∉ ctx.varying_contribs &&
         loc ∉ ctx.varying_draws_names)
 
+# Scalar definitions/expressions, plus scalar sums the affine path refuses
+# (two intercepts or a literal summand). Other vector-shaped expressions
+# and declared array reads keep their established affine/composed plans.
+_scalar_location_value(loc, ctx) =
+    !_reads_array_value(loc, ctx) && _scalar_location_reads(loc, ctx) &&
+    ((_canon_shape(loc, ctx) === :scalar &&
+    !_obs_axis(loc, ctx.data, ctx.detmap, ctx.detshape, Set{Symbol}(),
+        ctx.shape_env)) || _scalar_sum_location(loc, ctx))
+
+# Require declared values: an implicit coefficient, factor reference or
+# basis/trajectory constructor belongs to the established predictor path.
+function _scalar_location_reads(loc, ctx,
+        seen::Set{Symbol} = Set{Symbol}(); allow_data::Bool = false)
+    if loc isa Symbol
+        haskey(ctx.detmap, loc) || return (allow_data && loc in ctx.data) ||
+            (loc in ctx.prior_names && loc ∉ ctx.sized_decls &&
+                loc ∉ ctx.vector_params)
+        loc in seen && return false
+        push!(seen, loc)
+        value = _scalar_location_reads(ctx.detmap[loc], ctx, seen; allow_data)
+        delete!(seen, loc)
+        return value
+    end
+    loc isa Expr || return true
+    _is_bound_value_call(loc) && return true
+    loc.head === :ref && return false
+    loc.head === :call && !isempty(loc.args) &&
+        loc.args[1] in _CONSTRUCT_VALUE_HEADS && return false
+    args = loc.head === :call ? loc.args[2:end] :
+        _is_dotted_call(loc) ? loc.args[2].args : loc.args
+    # A reduction returns a scalar from columns; an arbitrary whole-value
+    # call over columns has unknown shape and retains its existing guidance.
+    whole = allow_data || (loc.head === :call && !isempty(loc.args) &&
+        loc.args[1] in REDUCTION_FNS)
+    return all(a -> _scalar_location_reads(a, ctx, seen; allow_data = whole), args)
+end
+
+function _scalar_sum_location(loc::Symbol, ctx,
+        seen::Set{Symbol} = Set{Symbol}())
+    haskey(ctx.detmap, loc) && loc ∉ seen || return false
+    push!(seen, loc)
+    return _scalar_sum_location(ctx.detmap[loc], ctx, seen)
+end
+function _scalar_sum_location(loc::Expr, ctx,
+        seen::Set{Symbol} = Set{Symbol}())
+    return loc.head === :call && length(loc.args) >= 3 &&
+        loc.args[1] in (:+, :-, :.+, :.-) &&
+        _canon_shape(loc, ctx) in (:scalar, :vector) &&
+        !_obs_axis(loc, ctx.data, ctx.detmap, ctx.detshape, Set{Symbol}(),
+            ctx.shape_env)
+end
+_scalar_sum_location(loc, ctx, seen::Set{Symbol} = Set{Symbol}()) = false
+
+# Exactly the scalar shapes affine analysis already admits: one signed
+# coefficient (stated or implicit), behind aliases or unary +/-. Keep its
+# prior and coordinates when admitting the other scalar value shapes.
+function _scalar_intercept_location(loc::Symbol, ctx,
+        seen::Set{Symbol} = Set{Symbol}())
+    haskey(ctx.detmap, loc) || return _summand_kind(loc, ctx) === :coef
+    loc in seen && return false
+    push!(seen, loc)
+    return _scalar_intercept_location(ctx.detmap[loc], ctx, seen)
+end
+function _scalar_intercept_location(loc::Expr, ctx,
+        seen::Set{Symbol} = Set{Symbol}())
+    return loc.head === :call && length(loc.args) == 2 &&
+        loc.args[1] in (:+, :-, :.+, :.-) &&
+        _scalar_intercept_location(loc.args[2], ctx, seen)
+end
+_scalar_intercept_location(loc, ctx, seen::Set{Symbol} = Set{Symbol}()) = false
+
 # A value location (`y .~ Normal.(mu, s)`, `Poisson.(exp.(a))`,
 # `Normal.(x, s)`): as in Julia, broadcasting gives every observation the
 # value, read on the written link's scale. A data column is an offset (the
 # term its named twin `mu = x` lowers to); a scalar parameter is a one-leaf
 # composition with no coefficient — it keeps its own name and prior — which
 # the generator broadcasts over the rows.
-function _value_location!(lhs, loc::Symbol, pred_link, ctx, predictors,
-        pred_idx)
+function _value_location!(lhs, loc, pred_link, ctx, predictors,
+        pred_idx; synth::Union{Nothing,Symbol} = nothing)
+    # A previously refused scalar sum, including aliases of it, emits as
+    # ordinary scalar definitions, rather than observation columns.
+    source = loc
+    seen = Set{Symbol}()
+    while source isa Symbol && haskey(ctx.detmap, source) && source ∉ seen
+        push!(seen, source)
+        ctx.detshape[source] = :scalar
+        source = ctx.detmap[source]
+    end
     pin = get(ctx.predictor_pins, lhs, nothing)
     if pin !== nothing
+        synth === nothing || _sfail(
+            "response $lhs pins predictor $pin, but $lhs needs one " *
+            "predictor per index (multi-predictor response) — a pin " *
+            "names exactly one predictor")
         _claim_pin!(lhs, pin, ctx, pred_idx)
         pname = pin
     else
-        pname = Symbol(lhs, "_eta")
+        pname = synth === nothing ? Symbol(lhs, "_eta") : synth
         (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
             "derived predictor name $pname collides with your definition — " *
             "rename yours")
     end
-    term = if loc in ctx.data
+    term = if loc isa Symbol && loc in ctx.data
         TermSpec(OffsetTerm, ColumnRef[loc], NamedTuple(), loc,
             Symbol(loc, "_off"))
     else
         label = Symbol(pname, "_value")
+        scalars = Symbol[]
+        tree = if loc isa Symbol
+            push!(scalars, loc)
+            loc
+        else
+            _composed_scalar_leaf!(pname, loc, ctx, scalars)
+        end
         TermSpec(ComposedTerm, ColumnRef[],
-            (tree = loc, subs = Symbol[], scalars = Symbol[loc]), label,
+            (tree = tree, subs = Symbol[], scalars = scalars), label,
             label)
     end
     push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
@@ -8982,6 +9246,10 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     s in ctx.varying_draws_names && return false
     _derived_reads_latent(s, ctx) && return false
     _composed_data_only(s, ctx, Set{Symbol}()) && return false
+    # An interned location already has an LP node, including an offset
+    # whose definition reads array values. Consumers must use that node
+    # rather than reclassifying and emitting the definition a second time.
+    haskey(ctx.pred_idx, s) && return true
     # A definition reading a declared array is a value (an in-graph
     # column), not an affine sub-predictor — except the bare factor alias
     # `th = c[g]` over a coefficient-capable `c[levels(g)]`, which keeps
@@ -12033,6 +12301,8 @@ function _lower_truncated_param(lhs, rhs, coefuse, matrices)
         "parameter $lhs: `truncated` wraps a distribution object, got " *
         "$(repr(obj))")
     fam = obj.args[1]
+    fam === :LogNormal && return _lower_truncated_lognormal(lhs, obj, lo_a,
+        hi_a, coefuse, matrices)
     haskey(_TRUNCATED_BASES, fam) || _sfail(
         "parameter $lhs: `truncated` wraps a symmetric base " *
         "(`truncated(Normal(mu, s), lo, hi)`; admitted: Normal, Cauchy, " *
@@ -12079,6 +12349,31 @@ function _lower_truncated_param(lhs, rhs, coefuse, matrices)
         "(`truncated(Normal(mu, s), lo, hi)`); got $fam")
     return SampledParameter(lhs, base,
         (arg1 = vals[1], arg2 = vals[2]), (:interval, lo, hi), lhs)
+end
+
+# A lower-only truncation of a positive-support base,
+# `truncated(LogNormal(m, s), lo, Inf)` (user decision `0z5bsqi`, prong
+# `floor`: the subset the HSGP validity floor needs ahead of the general
+# `truncated` lane): `x = lo + exp(u)`, renormalized as in Distributions
+# (`-log P(X > lo)`). `lo` is a non-negative literal or the name of a
+# model-level data value (`rho_floor = maximum(hsgp_rho_floors(lambda))`),
+# read from the bound data.
+function _lower_truncated_lognormal(lhs, obj::Expr, lo_a, hi_a, coefuse,
+        matrices)
+    oargs = _plain_args(obj, "`LogNormal`")
+    length(oargs) == 2 ||
+        _sfail("parameter $lhs: `LogNormal` takes 2 arguments")
+    vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in oargs]
+    hi = _truncation_bound(lhs, hi_a)
+    isinf(hi) && hi > 0 || _sfail("parameter $lhs: a truncated LogNormal " *
+        "takes `Inf` as its upper bound (`truncated(LogNormal(m, s), lo, " *
+        "Inf)`), got $(repr(hi_a))")
+    lo = lo_a isa Symbol && lo_a !== :Inf ? lo_a : _truncation_bound(lhs, lo_a)
+    lo isa Symbol || (isfinite(lo) && lo >= 0) || _sfail("parameter $lhs: " *
+        "a truncated LogNormal's lower bound is a finite non-negative " *
+        "literal or a data name, got $(repr(lo_a))")
+    return SampledParameter(lhs, :lognormal, (arg1 = vals[1], arg2 = vals[2]),
+        (:lower, lo isa Symbol ? lo : Float64(lo)), lhs)
 end
 
 function _lower_assignment(nm, rhs, coefuse)

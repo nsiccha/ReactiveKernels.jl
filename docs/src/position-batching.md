@@ -146,8 +146,8 @@ between scalar calls is not a batchable contract.
 
 Native graph lowering validates ranks and equal batch lengths, evaluates
 recipes that depend only on shared ports once, then evaluates position-dependent
-recipes once per position. It stacks requested outputs and copies array-valued
-slices, so it is not the allocation-free reducing contract of a likelihood
+recipes once per position. It stacks requested outputs, so it is not the
+allocation-free reducing contract of a likelihood
 `plate`. The shared prefix and the per-position residual are each lowered as
 `prepare` lowers a scalar kernel: an authored plate emits its fused
 native loop, a scan inlines its step (and streams into a plate that consumes
@@ -172,19 +172,25 @@ custom array layouts retain projection and stacking. These internal reductions
 leave the ownership, empty-batch, validation, and scalar dispatch contracts
 in place; allocating scalar recipes still allocate their intermediate arrays.
 
-The native position loop also keeps one lane buffer per batched dense numeric
-array port (`Array{T,N}` with `N > 1`): each position copies its slice into
-that buffer, so the scalar graph receives the same `Array{T,N-1}` it would as
-a fresh copy, declared types and the dose-outer plate lowering included. A
-WANT computed by an authored plate (its materialized pointwise result) or a
-scan refills the previous position's buffer, which was already copied into
-the stacked result, instead of allocating a new one. A borrowed reader also
-keeps both kinds of lane buffer between calls; the owning surface allocates
-each once per call. So a 32-position read of a superposition plate over a
-16321-observation response allocates a fixed few hundred bytes, where it
-allocated 8.4 MB (an input copy and an output per position). Each position
-still copies its input slice in and its result out; other recipes allocate as
-they do in the scalar kernel.
+For a batched dense numeric array port (`Array{T,N}` with `N > 1`), the native
+driver passes a contiguous trailing-axis view when the scalar port's declared
+type admits it. Undeclared ports and abstract array ports can receive views;
+a concrete `Vector{Float64}` port receives a copied vector in one reusable
+lane buffer. Inputs remain read-only. Pure recipe dispatch can therefore see a
+`SubArray` at an eligible port. The dose-outer plate lowering accepts these
+contiguous column views as gather sources.
+
+A materialized WANT produced by an authored plate or scan similarly writes
+into its column of the stacked destination when its declared type admits a
+view. The first position establishes the destination's shape and element type
+using one scratch buffer and one copy. Later positions write directly into
+their columns; concrete array WANTs instead refill the scratch and copy it
+out. A borrowed reader keeps compatible scratch buffers between calls, without
+retaining destination views in its scratch cache. Pure recipes reading that
+WANT can observe a dense scratch array at the first position and a `SubArray`
+at later positions. Declare a concrete array type when recipe dispatch requires
+that container. Declared types keep their ordinary Julia conversion semantics.
+Other recipes allocate as they do in the scalar kernel.
 
 By default every call owns fresh stacked output arrays, including record
 leaves. Later calls cannot change retained results. To consume bounded batches

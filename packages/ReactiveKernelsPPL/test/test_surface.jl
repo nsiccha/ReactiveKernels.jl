@@ -2462,11 +2462,16 @@ end
         mu = a .+ b .* x
         y .~ interval_censored.(Normal, y, hi, mu, 1.0)
     end, (:y, :x, :hi))
-    # Predictor shape violations.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # A scalar sum is a value location (standard Julia broadcasting,
+    # standing principle 10a / decision 0dejlw1), even with two priors.
+    scalar_sum = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b
         y .~ Normal.(mu, 1.0)
     end, Dn)
+    @test only(only(scalar_sum.predictors).terms).kind === ComposedTerm
+    # Predictor shape violations.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x .+ c .* x
         y .~ Normal.(mu, 1.0)

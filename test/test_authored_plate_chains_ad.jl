@@ -113,3 +113,32 @@ end
                                             active = :weights), plan, units, weights)
     @test g ≈ [2 * sum(c[t] * get(units, t - s, 0.0) for t in 1:plan.nobs) for s in plan.shifts]
 end
+
+module DenseColumnDoseOuterAD
+using ReactiveKernels
+@kernel cell(observations::UnitRange{Int}, shifts::Vector{Int},
+             units::AbstractVector{Float64}, weights::Vector{Float64}) = begin
+    response::Vector{Float64} = plate(observations, Ref(shifts), Ref(units), Ref(weights)) do t, s, u, w
+        sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(w); init=0.0)
+    end
+    loss::Float64 = sum(abs2, response)
+end
+end
+
+@testset "Dense column dose-outer source under plain reverse Enzyme" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    U = [sin(0.01i) + l for i in 1:128, l in 1:2]
+    units = view(U, :, 2)
+    shifts, weights = [-7, 0, 300], [0.7, -0.3, 1.1]
+    kernel = prepare(DenseColumnDoseOuterAD.cell)
+    for n in (32, 257)
+        args = (1:n, shifts, units, weights)
+        reference_args = (1:n, shifts, copy(units), weights)
+        @test count(op -> op isa ReactiveKernels._KernelSourceOp &&
+                          op.f isa ReactiveKernels._KernelReduction, kernel.ops) == 1
+        @test kernel(args...) == kernel(reference_args...)
+        ad = prepare_ad(kernel, backend, args...; active=:weights)
+        reference = prepare_ad(kernel, backend, reference_args...; active=:weights)
+        @test ad_gradient(ad, args...) ≈ ad_gradient(reference, reference_args...) rtol=1e-12
+    end
+end

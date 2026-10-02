@@ -17,8 +17,8 @@ using Test
 
 # Lower + bind + build + query a bare-location program; return
 # `(bound, built, kern, layout)`.
-function _bare_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+function _bare_query(prog::Expr, cols::AbstractDict{Symbol})
+    plan = lower_rkppl(prog, cols)
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -205,9 +205,9 @@ end
 # native vs compiled), plus the traced program size.
 # `ad_kw` reaches `compile_ad_value_and_gradient` (e.g. the §7n
 # `optimize = :only_enzyme` pin).
-function _bare_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector};
+function _bare_reactant(prog::Expr, cols::AbstractDict{Symbol};
         ad_kw...)
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, cols)
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
