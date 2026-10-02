@@ -3321,7 +3321,7 @@ _response_rows(plan::StructuralPlan, r::LikelihoodSpec) =
     _column_nrows(plan.columns[r.response]) : plan.n_obs
 
 function _validate_columns(plan::StructuralPlan)
-    plan.n_obs > 0 || _fail(:plan, "n_obs must be positive, got $(plan.n_obs)")
+    plan.n_obs >= 0 || _fail(:plan, "n_obs must be nonnegative, got $(plan.n_obs)")
     modelvals, managed = _axis_exempt_columns(plan)
     axes = _observation_axes(plan)
     for (name, col) in plan.columns
@@ -6954,9 +6954,11 @@ function _validate_levelmaps_data(plan::StructuralPlan)
     # Rows whose codes fall outside the mapped levels contribute 0 (the
     # subset is explicit on the page — e.g. reference rows under an
     # intercept); unobserved mapped levels are allowed like any
-    # zero-variance column. The one failure is unfilled values.
+    # zero-variance column. An empty evaluated pool is valid; an unfilled
+    # map over a nonempty pool still fails.
     for m in plan.levelmaps
-        isempty(m.values) && _fail(:plan,
+        isempty(m.values) || continue
+        isempty(only(_eval_levelmaps(LevelMap[m], plan.columns)).values) || _fail(:plan,
             "LevelMap for ($(m.predictor), $(m.column)) has no evaluated " *
             "values (bind_data fills these — hand-built bound plans must too)")
     end

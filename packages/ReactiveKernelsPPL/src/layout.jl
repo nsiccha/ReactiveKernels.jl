@@ -1233,7 +1233,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         elseif e.kind === :array && _is_slice_transform(e.transform)
             push!(pairs, e.name => _array_slices_constrain(e, seg))
         elseif e.kind === :array
-            v = [_constrain_elt(e, Float64(x)) for x in seg]
+            v = Float64[_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name =>
                 (length(e.dims) == 1 ? v : reshape(v, e.dims...)))
         elseif e.kind === :varying_corr || e.kind === :cholesky_corr
