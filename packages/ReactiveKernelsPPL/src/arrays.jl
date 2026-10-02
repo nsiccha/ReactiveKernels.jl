@@ -379,6 +379,10 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
     end
     if head === :call
         fn = ex.args[1]
+        # A module call takes and returns whole values, just as it does
+        # inside scalar and observation expressions (functions as values).
+        fn isa GlobalRef &&
+            return _collect_opaque_refs!(refs, ex, plan, label, bound)
         # A reduction over a data column inside an array expression is a
         # scalar subterm (`mean(x) .* z`).
         fn isa Symbol && fn in REDUCTION_FNS && length(ex.args) == 2 &&
@@ -394,10 +398,11 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
         return nothing
     end
     if head === :.
-        length(ex.args) == 2 && ex.args[1] isa Symbol &&
+        length(ex.args) == 2 && ex.args[1] isa Union{Symbol,GlobalRef} &&
             ex.args[2] isa Expr && ex.args[2].head === :tuple || _fail(label,
             "field access does not lower in array expressions")
-        ex.args[1] in ELEMENTWISE_FNS || _fail(label, "`$(ex.args[1]).` " *
+        (ex.args[1] isa GlobalRef || ex.args[1] in ELEMENTWISE_FNS) ||
+            _fail(label, "`$(ex.args[1]).` " *
             "is not in the elementwise vocabulary")
         for a in ex.args[2].args
             _collect_array_value_refs!(refs, a, plan, label, bound)
