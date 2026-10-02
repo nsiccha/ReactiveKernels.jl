@@ -30,7 +30,7 @@ function _corr_oracle2(nt, cols)
     s = Vector(nt.L_scales)
     Lc = Matrix(nt.L_L_corr)
     L = Diagonal(s) * Lc
-    c1, c2 = Vector(nt.mu1), Vector(nt.mu2)
+    c1, c2 = [nt.a1, nt.b1], [nt.a2, nt.b2]
     m1 = c1[1] .+ c1[2] .* cols[:x]
     m2 = c2[1] .+ c2[2] .* cols[:x]
     Σ = L * L'
