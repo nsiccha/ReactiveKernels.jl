@@ -542,14 +542,31 @@ end
     reject(:(mu = a .+ phi .* u))
     # coefficient with no `~` statement
     reject(:(mu = a .+ q .* u))
-    # one name as both a population coefficient and a scan coefficient
-    reject(:(mu = a .+ b .* x .+ b .* u))
     # subtracted summand (additive only)
     reject(:(mu = a .- beta_ar .* u))
     # nested scan read (direct `coef .* state` only)
     reject(:(mu = a .+ beta_ar .* (u .+ x)))
     # scan-only predictor (a summand needs a sibling coefficient)
     reject(:(mu = beta_ar .* u))
+    # One name as both a population coefficient and a scan coefficient is
+    # one ordinary parameter read by both summands (test_fallback.jl).
+    both = lower_rkppl(quote
+        phi_raw ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        a ~ Normal(0, 1)
+        sigma ~ Exponential(1)
+        @scan begin
+            u[1] ~ Normal(0, 1)
+            for t in 2:T
+                eps ~ Normal(0, 1)
+                u[t] = phi * u[t - 1] + eps
+            end
+        end
+        phi = tanh(phi_raw)
+        mu = a .+ b .* x .+ b .* u
+        y .~ Normal.(mu, sigma)
+    end, (:x, :y))
+    @test any(p -> p.name === :b, both.parameters)
 end
 
 @testset "tanh assignment: scalar and dotted admitted" begin
