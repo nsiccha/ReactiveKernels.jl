@@ -412,9 +412,11 @@ undefined one fails here naming it. An undotted call is a model-level value
 (no observation axis); a dotted call `f.(...)` is elementwise, observation
 aligned exactly when an argument is; `v[c]` with an observation index is a
 gather. A data-only definition calling such a function is evaluated once by
-[`bind_data`](@ref) and bound as data; any other runs in the generated
-kernel under generic AD (an RK-owned derivative rule, when the callee is
-one, is used by Enzyme). A parameter-dependent undotted call over an
+[`bind_data`](@ref) and bound as data; one that a parameter-dependent
+expression consumes (named or inline) is evaluated once by preparation and
+never differentiated. Any other call runs in the generated kernel under
+generic AD (an RK-owned derivative rule, when the callee is one, is used by
+Enzyme). A parameter-dependent undotted call over an
 observation column fails closed: its result shape is unknown before
 sampling, so broadcast it or bind its data-only part first. A data column
 the definitions read only inside undotted module-call arguments, and no

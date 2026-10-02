@@ -204,10 +204,55 @@ function _assignment_statements(plan::StructuralPlan;
     # Data definitions calling module functions were evaluated once at
     # bind and arrive as data arguments; the kernel never recomputes them.
     computed = _bound_module_data_names(plan)
-    return Expr[:($(name) =
-            $(_array_gather_rewrite(by_name[name].expr, plan, gathers)))
-        for name in topological_order(plan)
-        if haskey(by_name, name) && name ∉ computed]
+    dataonly = Set{Symbol}(keys(plan.columns))
+    stmts = Expr[]
+    for name in topological_order(plan)
+        (haskey(by_name, name) && name ∉ computed) || continue
+        ex = _array_gather_rewrite(by_name[name].expr, plan, gathers)
+        if _expr_value_symbols(ex) ⊆ dataonly
+            push!(dataonly, name)
+        else
+            ex = _split_data_calls!(stmts, name, ex, dataonly)
+        end
+        push!(stmts, :($(name) = $(ex)))
+    end
+    return stmts
+end
+
+# Functions as values: a data-only module call nested in a parameter-
+# dependent statement — a data-only definition inlined into the call that
+# consumes it (`reads = f(g(s), b)`), or a gathered `(b .* g(gx))[oi]` —
+# becomes its own statement. Preparation's `bound=` folding then
+# evaluates it once, outside the differentiated program, rather than on
+# every evaluation inside it. Only value compositions are entered: an
+# operand of a lazy branch, a loop or a generator keeps its own
+# evaluation (snag `interpolated-err-41772e14`).
+function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
+        dataonly::Set{Symbol})
+    count = 0
+    function walk(node)
+        node isa Expr || return node
+        if node.head in (:call, :ref, :.) && _contains_module_call(node) &&
+                _expr_value_symbols(node) ⊆ dataonly
+            count += 1
+            tmp = Symbol(:_ppl_data_, name, :_, count)
+            push!(stmts, :($(tmp) = $(node)))
+            return tmp
+        end
+        if node.head === :call
+            return Expr(:call, node.args[1], map(walk, node.args[2:end])...)
+        elseif node.head === :. && length(node.args) == 2 &&
+                Meta.isexpr(node.args[2], :tuple)
+            return Expr(:., node.args[1],
+                Expr(:tuple, map(walk, node.args[2].args)...))
+        elseif node.head === :kw && length(node.args) == 2
+            return Expr(:kw, node.args[1], walk(node.args[2]))
+        elseif node.head in (:ref, :parameters, :tuple, :vect)
+            return Expr(node.head, map(walk, node.args)...)
+        end
+        return node
+    end
+    return walk(ex)
 end
 
 _lp_name(pred::PredictorSpec) = Symbol(:_ppl_lp_, pred.name)
