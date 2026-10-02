@@ -3,6 +3,81 @@ using ReactiveKernelsPPL, Distributions, Test, LinearAlgebra
 _rewrite_node(plan, node, u) = Base.invokelatest(
     prepare_query(build_kernel(plan), plan, node), u)
 
+function _rewrite_glm_ast(head)
+    rhs = Expr(:call, head, :X, :alpha, :beta)
+    head === :NormalIDGLM && push!(rhs.args, 2.0)
+    return quote
+        X = hcat(x1, x2)
+        alpha ~ Normal(0, 5)
+        beta[axes(X, 2)] .~ Normal.(0, 2)
+        y ~ $rhs
+    end
+end
+
+function _rewrite_glm_data(head, n)
+    x1 = collect(range(-0.8, 0.9; length = n))
+    x2 = fill(0.4, n)
+    y = head === :NormalIDGLM ? 0.2 .+ x1 :
+        head === :BernoulliLogitGLM ? Int.(x1 .> 0) : Int.(x1 .> 0) .+ 1
+    return (; x1, x2, y)
+end
+
+function _rewrite_glm_oracle(head, data, alpha, beta)
+    eta = alpha .+ hcat(data.x1, data.x2) * beta
+    family = head === :NormalIDGLM ? Normal.(eta, 2.0) :
+        head === :BernoulliLogitGLM ? Bernoulli.(1 ./ (1 .+ exp.(-eta))) :
+        Poisson.(exp.(eta))
+    return logpdf(Normal(0, 5), alpha) + sum(logpdf.(Normal(0, 2), beta)) +
+        sum(logpdf.(family, data.y))
+end
+
+@testset "whole-data GLM observations keep response roles" begin
+    for head in (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM), n in (2, 4, 9)
+        ast = _rewrite_glm_ast(head)
+        data = _rewrite_glm_data(head, n)
+        ast_before, data_before = deepcopy(ast), deepcopy(data)
+        model = ReactiveKernelsPPL.RKPPLModel(ast, @__MODULE__)
+        u = [0.1, -0.2, 0.3]
+        oracle = _rewrite_glm_oracle(head, data, u[1], u[2:3])
+        columns = Dict(pairs(data))
+        # Names-only, values, and model entry points share observation roles.
+        plans = (
+            bind_data(lower_rkppl(ast, keys(data); conditioned = (:y,)), columns),
+            bind_data(lower_rkppl(ast, data; conditioned = keys(data)), columns),
+            bind_data(lower_rkppl(ast, data; conditioned = (; y = data.y)), columns),
+            bind_data(lower_rkppl(model, data; conditioned = (:y,)), columns),
+            model(; data.x1, data.x2) | (; data.y),
+            condition(model(; data.x1, data.x2); data.y),
+        )
+        for plan in plans
+            @test isempty(plan.conditioned)
+            @test only(plan.responses).response === :y
+            @test plan.n_obs == n
+            @test build_kernel(plan).layout.total == 3
+            @test _rewrite_node(plan, :sampler, u) ≈ oracle
+        end
+        # Conditioning an ordinary parameter still retains its prior density.
+        fixed = model(; data.x1, data.x2) | (; data.y, alpha = u[1])
+        @test fixed.conditioned == Set([:alpha])
+        @test build_kernel(fixed).layout.total == 2
+        @test _rewrite_node(fixed, :sampler, u[2:3]) ≈ oracle
+        rebound = condition(first(plans); y = reverse(data.y))
+        @test _rewrite_node(rebound, :sampler, u) ≈
+            _rewrite_glm_oracle(head, merge(data, (; y = reverse(data.y))), u[1], u[2:3])
+        # Call pins remove the response statement (conditioning principle 9).
+        # Pin X too: only its shape is needed by the remaining beta prior.
+        pinned = bind_data(model(; X = hcat(data.x1, data.x2), y = data.y))
+        @test isempty(pinned.responses)
+        @test _rewrite_node(pinned, :sampler, u) ≈
+            logpdf(Normal(0, 5), u[1]) + sum(logpdf.(Normal(0, 2), u[2:3]))
+        # Refused: supplied sampling names require explicit observation or a
+        # merge pin, per standing conditioning principle 9 (decision 18h1h54).
+        @test_throws SurfaceLoweringError lower_rkppl(ast, keys(data))
+        @test ast == ast_before
+        @test data == data_before
+    end
+end
+
 @testset "shipped horseshoe defaults accept scoped operations" begin
     body = deepcopy(horseshoe_coefs.body)
     model = @rkppl begin

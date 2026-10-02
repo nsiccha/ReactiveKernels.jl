@@ -645,6 +645,10 @@ function _conditioned_declarations(ast, names)
         lhs = _stmt_lhs(st)
         name = _merge_stem(lhs)
         name in names || continue
+        # Whole-data GLM `~` declares a response, not a parameter. Like a
+        # broadcast response, its observed value keeps its observation axis
+        # instead of becoming an internal conditioned-parameter input.
+        _is_glm_call(last(st.args)) && continue
         # A positional slice of an observed stream remains a response.
         # Sized level/matrix axes and matrix declarations retain array metadata.
         array = lhs isa Expr && ((lhs.head === :ref &&
@@ -4498,19 +4502,13 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 push!(joints, j)
                 continue
             end
-            if !bc && st.args[3] isa Expr && st.args[3].head === :call &&
-                    !isempty(st.args[3].args) &&
-                    st.args[3].args[1] isa Symbol &&
-                    st.args[3].args[1] in _GLM_HEADS
+            if !bc && _is_glm_call(st.args[3])
                 g = _parse_glm_stmt(st, line, data)
                 _claim!(seen, seelines, g.response, line)
                 push!(glms, g)
                 continue
             end
-            if bc && st.args[3] isa Expr && st.args[3].head === :call &&
-                    !isempty(st.args[3].args) &&
-                    st.args[3].args[1] isa Symbol &&
-                    st.args[3].args[1] in _GLM_HEADS
+            if bc && _is_glm_call(st.args[3])
                 _sfail("GLM-object heads use whole-data `~`, not `.~` " *
                        "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
                        "object owns eta over the whole column)")
@@ -6352,6 +6350,9 @@ struct GLMSampleStmt
 end
 
 const _GLM_HEADS = (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
+
+_is_glm_call(rhs) = rhs isa Expr && rhs.head === :call &&
+    !isempty(rhs.args) && first(rhs.args) isa Symbol && first(rhs.args) in _GLM_HEADS
 
 function _parse_glm_stmt(st::Expr, line::Int, data::Set{Symbol})
     lhs, rhs = st.args[2], st.args[3]
