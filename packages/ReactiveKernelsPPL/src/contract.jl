@@ -5808,7 +5808,7 @@ function _is_vector_valued(ex, plan::StructuralPlan)
         (_is_array_param(plan, ex.args[1]) ||
             _is_array_assignment(plan, ex.args[1])) &&
         return _array_index_kind(plan, ex) === :gather &&
-            all(i -> i isa Int, ex.args[3:end])
+            all(i -> i isa Int || _is_row_index(plan, i), ex.args[2:end])
     ex isa Number && return false
     ex isa LineNumberNode && return false
     ex isa Expr || return false
