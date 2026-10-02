@@ -32,6 +32,8 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
 @testset "mixture surface admission" begin
     @testset "predictor + param locations, shared scale" begin
         plan = lower_rkppl(quote
+                a1 ~ Normal(0, 1)
+                b1 ~ Normal(0, 1)
                 mu1 = a1 .+ b1 .* x
                 mu2 ~ Normal(0.0, 5.0)
                 sigma ~ Exponential(1.0)
@@ -89,6 +91,8 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
     end
     @testset "scale-predictor anchor" begin
         plan = lower_rkppl(quote
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 ls = c .+ d .* x
                 mu1 ~ Normal(0.0, 5.0)
                 y .~ MixtureModel.([Normal.(mu1, exp.(ls)),
@@ -100,6 +104,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
     end
     @testset "intercept-only scale predictor (SB log(sigma) ~ 1)" begin
         plan = lower_rkppl(quote
+                c ~ Normal(0, 1)
                 mu1 ~ Normal(-2.0, 0.1)
                 mu2 ~ Normal(2.0, 0.1)
                 sigma = c
@@ -114,9 +119,13 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
         @test [t.kind for t in pred.terms] == [InterceptTerm]
         @test isempty(plan.derived)
     end
-    @testset "intercept-only location predictor (SB mu ~ 1)" begin
+    @testset "constant location is a declared parameter (SB mu ~ 1)" begin
+        # Strict declarations: the intercept-only location slot (an
+        # undeclared `mu1 = c`) is gone. A constant location is a declared
+        # scalar spelled bare; an alias of one fails (the battery's
+        # "stated scalar loc alias").
         plan = lower_rkppl(quote
-                mu1 = c
+                mu1 ~ Normal(0, 1)
                 mu2 ~ Normal(0.0, 5.0)
                 sigma ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(mu1, sigma),
@@ -124,13 +133,15 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
             end, (:y,))
         r = only(plan.responses)
         @test r.mixture_locs == [:mu1, :mu2]
-        @test r.predictor === :mu1 # Anchor: first location predictor.
-        pred = only(p for p in plan.predictors if p.name === :mu1)
-        @test [t.kind for t in pred.terms] == [InterceptTerm]
+        @test r.predictor === :mu1 # Anchor: first location.
+        @test isempty(plan.predictors)
+        @test [q.name for q in plan.parameters] == [:mu1, :mu2, :sigma]
         @test isempty(plan.derived)
     end
     @testset "alternate heads desugar per component" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 phi ~ Exponential(1.0)
                 y .~ MixtureModel.([NegativeBinomial2Log.(mu, phi),
@@ -142,11 +153,12 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
     end
 end
 
-@testset "mixture fail-closed battery" begin
+@testset "mixture refusals and capability gaps" begin
     # Each entry: (label, program, error type). Surface rejections throw
     # `SurfaceLoweringError`; contract rejections (parsed but invalid)
     # throw `ContractValidationError`.
     cases = [
+        # refused: mixture of a continuous and a discrete component has no common density (mathematically invalid)
         ("heterogeneous families",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -155,42 +167,57 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Poisson.(lam1)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: per-component links (todo `1nb43fj`).
         ("heterogeneous links, same base",
             :(begin
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 eta2 = c .+ d .* x
                 y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                     Bernoulli.(probit.(eta2))], [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: probit component links (todo `1nb43fj`).
         ("probit outside v1",
             :(begin
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 eta2 = c .+ d .* x
                 y .~ MixtureModel.([Bernoulli.(probit.(eta)),
                     Bernoulli.(probit.(eta2))], [0.5, 0.5])
             end), SurfaceLoweringError),
+        # refused: empty mixture (K = 0)
         ("K = 0",
             :(begin
                 y .~ MixtureModel.([], [1.0])
             end), SurfaceLoweringError),
+        # refused: MixtureModel.(Normal.(...), [1.0]) broadcasts MixtureModel(::Normal, ::Float64), a Julia MethodError (P3)
         ("components not a vector",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.(Normal.(mu1, s), [1.0])
             end), SurfaceLoweringError),
+        # capability: MixtureModel(components) with its standard uniform weights (todo `1nb43fj`).
         ("bad arity",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(mu1, s)])
             end), SurfaceLoweringError),
+        # refused: scalar mixture prior is a Julia MethodError; weights are a probability vector (P3)
         ("scalar weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(mu1, s)], 1.0)
             end), SurfaceLoweringError),
+        # refused: [0.5, x] is a Vector{Any} of a scalar and a data vector, not a probability vector (P3)
         ("non-numeric weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -198,6 +225,7 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [0.5, x])
             end), SurfaceLoweringError),
+        # capability: Bool numeric weights (10gzbm9 bool-values) (todo `1nb43fj`).
         ("boolean weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -205,6 +233,7 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [true, false])
             end), SurfaceLoweringError),
+        # capability: frequency-weighted mixture observations (todo `1nb43fj`).
         ("frequency weights rejected",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -212,6 +241,7 @@ end
                 y .~ weighted.(MixtureModel.([Normal.(mu1, s),
                     Normal.(mu1, s)], [0.5, 0.5]), wt)
             end), SurfaceLoweringError),
+        # capability: truncated mixture evidence (todo `1nb43fj`).
         ("evidence rejected",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -219,6 +249,7 @@ end
                 y .~ truncated.(MixtureModel.([Normal.(mu1, s),
                     Normal.(mu1, s)], [0.5, 0.5]), 0, 10)
             end), SurfaceLoweringError),
+        # capability: a partial observation range (todo `1nb43fj`).
         ("partial range rejected",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -226,17 +257,20 @@ end
                 y[1:2] .~ MixtureModel.([Normal.(mu1, s),
                     Normal.(mu1, s)], [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: parameter-free observations (10gzbm9 degenerate) (todo `1nb43fj`).
         ("fully fixed",
             :(begin
                 y .~ MixtureModel.([Normal.(-1.0, 0.5), Normal.(1.0, 0.5)],
                     [0.4, 0.6])
             end), SurfaceLoweringError),
+        # refused: undeclared name (P6, 05oe96l)
         ("unknown location",
             :(begin
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(nope, s), Normal.(0.0, s)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: an assigned scalar component location (todo `1nb43fj`).
         ("assignment location",
             :(begin
                 m = 2.0
@@ -244,35 +278,45 @@ end
                 y .~ MixtureModel.([Normal.(m, s), Normal.(0.0, s)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: a data-valued component location (todo `1nb43fj`).
         ("data-column location",
             :(begin
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(x, s), Normal.(0.0, s)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: a computed component location (P8 1cmodra) (todo `1nb43fj`).
         ("wrapped param",
             :(begin
                 lam1 ~ LogNormal(0.0, 1.0)
                 y .~ MixtureModel.([Poisson.(exp.(lam1)), Poisson.(4.0)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: an unconstrained component rate, with -Inf outside support (10gzbm9 support-links) (todo `1nb43fj`).
         ("bare predictor",
             :(begin
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Poisson.(eta), Poisson.(4.0)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # refused: foo is undefined (UndefVarError in Julia)
         ("unknown wrapper",
             :(begin
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Bernoulli.(foo.(eta)),
                     Bernoulli.(0.5)], [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: per-component trials columns (todo `1nb43fj`).
         ("split Binomial trials",
             :(begin
                 y .~ MixtureModel.([Binomial.(n1, 0.3), Binomial.(n2, 0.3)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # refused: weights length mismatches component count
         ("weights length",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -280,6 +324,7 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [0.5, 0.3, 0.2])
             end), ContractValidationError),
+        # refused: mixture probabilities do not sum to 1
         ("weights sum",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -287,6 +332,7 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [0.5, 0.6])
             end), ContractValidationError),
+        # refused: negative mixture weight
         ("negative weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -294,6 +340,7 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [1.5, -0.5])
             end), ContractValidationError),
+        # refused: non-finite (Inf) mixture weight
         ("non-literal weights element",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -301,24 +348,30 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [0.5, Inf])
             end), SurfaceLoweringError),
+        # refused: Dirichlet length mismatches component count
         ("concentration length",
             :(begin
                 w ~ Dirichlet([1.0, 1.0, 1.0])
                 y .~ MixtureModel.([Normal.(-1.0, 0.5), Normal.(1.0, 0.5)],
                     w)
             end), ContractValidationError),
+        # refused: Bernoulli probability 1.5 outside [0,1]
         ("Bernoulli prob domain",
             :(begin
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                     Bernoulli.(1.5)], [0.5, 0.5])
             end), ContractValidationError),
+        # refused: negative Poisson mean
         ("Poisson mean domain",
             :(begin
                 lam1 ~ LogNormal(0.0, 1.0)
                 y .~ MixtureModel.([Poisson.(lam1), Poisson.(-1.0)],
                     [0.5, 0.5])
             end), ContractValidationError),
+        # refused: zero Gamma scale (malformed distribution)
         ("Gamma mean domain",
             :(begin
                 a1 ~ Exponential(1.0)
@@ -326,12 +379,14 @@ end
                 y .~ MixtureModel.([Gamma.(a1, mu1 ./ a1),
                     Gamma.(a1, 0.0 ./ a1)], [0.5, 0.5])
             end), ContractValidationError),
+        # refused: negative Beta shape (malformed distribution)
         ("Beta mean domain",
             :(begin
                 k1 ~ Exponential(1.0)
                 y .~ MixtureModel.([Beta.(0.3 .* k1, (1 .- 0.3) .* k1),
                     Beta.(1.5 .* k1, (1 .- 1.5) .* k1)], [0.5, 0.5])
             end), ContractValidationError),
+        # refused: empty mixture weights
         ("empty weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -339,8 +394,10 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s)], Float64[])
             end), SurfaceLoweringError),
         # A scalar alias over a stated prior reads like the name itself
-        # (a sampled parameter — spell it bare), so it never routes to
-        # the intercept-only location slot (undeclared `mu ~ 1` only).
+        # (a sampled parameter — spell it bare). It never routes to the
+        # intercept-only location slot, which only an undeclared name
+        # reached (gone under strict declarations).
+        # capability: an alias of a declared scalar location (todo `1nb43fj`).
         ("stated scalar loc alias",
             :(begin
                 c ~ Normal(0.0, 5.0)
@@ -350,9 +407,17 @@ end
                     [0.5, 0.5])
             end), SurfaceLoweringError),
     ]
+    capabilities = Set(["heterogeneous links, same base", "probit outside v1", "bad arity", "boolean weights", "frequency weights rejected", "evidence rejected", "partial range rejected", "fully fixed", "assignment location", "data-column location", "wrapped param", "bare predictor", "split Binomial trials", "stated scalar loc alias"])
     for (label, prog, E) in cases
         @testset "$label" begin
-            @test_throws E lower_rkppl(prog, (:y, :x, :n1, :n2, :wt))
+            if label in capabilities
+                # capability: each entry above names the valid combination (todo `1nb43fj`).
+                @test_broken (lower_rkppl(prog, (:y, :x, :n1, :n2, :wt)); true)
+            else
+                # refused: each remaining entry cites its Julia signature,
+                # declaration or distribution-domain violation above (P3/P6).
+                @test_throws E lower_rkppl(prog, (:y, :x, :n1, :n2, :wt))
+            end
         end
     end
     @testset "programmatic shape errors" begin
@@ -390,9 +455,11 @@ end
         # Scale slots must match locations one-to-one.
         bad = _mixresp(scales = Union{Nothing,Symbol,Real,ScalePredictorRef}[
             :sigma])
+        # refused: scale slots must match locations one-to-one (IR contract)
         @test_throws ContractValidationError validate_structure(_mixplan(bad))
         # The response link is the components' canonical link.
         bad = _mixresp(link = LogLink)
+        # refused: mixture response link must be the components' canonical link (IR contract)
         @test_throws ContractValidationError validate_structure(_mixplan(bad))
         # Binomial mixtures require trials (surface always emits them, so
         # this is programmatic-only).
@@ -400,13 +467,16 @@ end
         bsc = Union{Nothing,Symbol,Real,ScalePredictorRef}[nothing, nothing]
         bad = _mixresp(f = BinomialLogitFam, link = LogitLink, locs = bloc,
             scales = bsc, trials = nothing)
+        # refused: Binomial mixture without trials (IR contract)
         @test_throws ContractValidationError validate_structure(_mixplan(bad))
         # ... and non-Binomial mixtures take none.
         bad = _mixresp(trials = 10)
+        # refused: non-Binomial mixture with trials (IR contract)
         @test_throws ContractValidationError validate_structure(_mixplan(bad))
         # Non-finite weights (surface literals are finite by
         # construction, so this is programmatic-only).
         bad = _mixresp(weights = [0.5, Inf])
+        # refused: non-finite mixture weights (IR contract)
         @test_throws ContractValidationError validate_structure(_mixplan(bad))
         # A non-simplex weights vector fails the family check.
         r = _mixresp(weights = :z)
@@ -415,6 +485,7 @@ end
             AssignmentSpec[], cols, 9; vector_parameters = VectorParameter[
                 VectorParameter(:z, :vector_normal, (arg1 = [0.0, 0.0],
                     arg2 = [1.0, 1.0]), 2, :z)])
+        # refused: mixture weights must name a simplex parameter (IR contract)
         @test_throws ContractValidationError validate_structure(plan)
         # And the valid programmatic shape passes.
         @test (validate_structure(_mixplan(_mixresp())); true)
@@ -447,6 +518,8 @@ end
     end
     @testset "gaussian predictor + param" begin
         prog = quote
+            a1 ~ Normal(0, 1)
+            b1 ~ Normal(0, 1)
             mu1 = a1 .+ b1 .* x
             mu2 ~ Normal(0.0, 5.0)
             sigma ~ Exponential(1.0)
@@ -464,7 +537,7 @@ end
             _mlogaddexp(log(0.3) + logpdf(Normal(etai, q.sigma), yi),
                 log(0.7) + logpdf(Normal(q.mu2, q.sigma), yi))
         end
-        want = ll + sum(logpdf.(Normal(0, 1), [q.a1, q.b1])) +
+        want = ll + sum(logpdf.(Normal(0, 1), (q.a1, q.b1))) +
             logpdf(Normal(0, 5), q.mu2) +
             logpdf(Exponential(1.0), q.sigma) + log(q.sigma)
         @test got ≈ want rtol = 1e-12
@@ -472,6 +545,8 @@ end
     @testset "bernoulli predictor + literal" begin
         for ycol in ([0, 1, 1, 0], [false, true, true, false])
             prog = quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                     Bernoulli.(0.7)], [0.5, 0.5])
@@ -487,7 +562,7 @@ end
                 _mlogaddexp(log(0.5) + logpdf(Bernoulli(pi), yi),
                     log(0.5) + logpdf(Bernoulli(0.7), yi))
             end
-            want = ll + sum(logpdf.(Normal(0, 1), [q.a, q.b]))
+            want = ll + sum(logpdf.(Normal(0, 1), (q.a, q.b)))
             @test got ≈ want rtol = 1e-12
         end
     end
@@ -509,6 +584,8 @@ end
     end
     @testset "binomial predictor + literal, column trials" begin
         prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ MixtureModel.([Binomial.(n, logistic.(eta)),
                 Binomial.(n, 0.25)], [0.6, 0.4])
@@ -525,11 +602,13 @@ end
             _mlogaddexp(log(0.6) + logpdf(Binomial(10, pi), yi),
                 log(0.4) + logpdf(Binomial(10, 0.25), yi))
         end
-        want = ll + sum(logpdf.(Normal(0, 1), [q.a, q.b]))
+        want = ll + sum(logpdf.(Normal(0, 1), (q.a, q.b)))
         @test got ≈ want rtol = 1e-12
     end
     @testset "nb2 predictor + param means" begin
         prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             mu2 ~ Gamma(2.0, 1.0)
             phi1 ~ Exponential(1.0)
@@ -548,7 +627,7 @@ end
             _mlogaddexp(log(0.5) + nb(m1, q.phi1, yi),
                 log(0.5) + nb(q.mu2, q.phi2, yi))
         end
-        want = ll + sum(logpdf.(Normal(0, 1), [q.a, q.b])) +
+        want = ll + sum(logpdf.(Normal(0, 1), (q.a, q.b))) +
             logpdf(Gamma(2, 1), q.mu2) + log(q.mu2) +
             logpdf(Exponential(1.0), q.phi1) + log(q.phi1) +
             logpdf(Exponential(1.0), q.phi2) + log(q.phi2)
@@ -556,6 +635,8 @@ end
     end
     @testset "gamma predictor + param means, shared shape" begin
         prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             alpha ~ Exponential(1.0)
             mu2 ~ Gamma(2.0, 1.0)
@@ -573,13 +654,15 @@ end
             _mlogaddexp(log(0.5) + logpdf(Gamma(q.alpha, m1 / q.alpha), yi),
                 log(0.5) + logpdf(Gamma(q.alpha, q.mu2 / q.alpha), yi))
         end
-        want = ll + sum(logpdf.(Normal(0, 1), [q.a, q.b])) +
+        want = ll + sum(logpdf.(Normal(0, 1), (q.a, q.b))) +
             logpdf(Exponential(1.0), q.alpha) + log(q.alpha) +
             logpdf(Gamma(2, 1), q.mu2) + log(q.mu2)
         @test got ≈ want rtol = 1e-12
     end
     @testset "beta predictor + literal means, shared kappa" begin
         prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             kappa ~ Exponential(1.0)
             y .~ MixtureModel.([Beta.(logistic.(eta) .* kappa,
@@ -598,7 +681,7 @@ end
                         (1 - m1) * q.kappa), yi),
                 log(0.5) + logpdf(Beta(0.7 * q.kappa, 0.3 * q.kappa), yi))
         end
-        want = ll + sum(logpdf.(Normal(0, 1), [q.a, q.b])) +
+        want = ll + sum(logpdf.(Normal(0, 1), (q.a, q.b))) +
             logpdf(Exponential(1.0), q.kappa) + log(q.kappa)
         @test got ≈ want rtol = 1e-12
     end
@@ -649,6 +732,8 @@ end
     end
     @testset "bernoulli" begin
         _mix_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                     Bernoulli.(0.7)], [0.5, 0.5])
@@ -665,6 +750,8 @@ end
     end
     @testset "binomial" begin
         _mix_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Binomial.(n, logistic.(eta)),
                     Binomial.(n, 0.25)], [0.6, 0.4])
@@ -673,6 +760,8 @@ end
     end
     @testset "nb2" begin
         _mix_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 mu2 ~ Gamma(2.0, 1.0)
                 phi1 ~ Exponential(1.0)
@@ -684,6 +773,8 @@ end
     end
     @testset "gamma" begin
         _mix_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 alpha ~ Exponential(1.0)
                 mu2 ~ Gamma(2.0, 1.0)
@@ -694,6 +785,8 @@ end
     end
     @testset "beta" begin
         _mix_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 kappa ~ Exponential(1.0)
                 y .~ MixtureModel.([Beta.(logistic.(eta) .* kappa,
@@ -784,6 +877,8 @@ end
             y .~ MixtureModel.([Poisson.(lam1), Poisson.(4.0)], [0.3, 0.7])
         end, Dict{Symbol,AbstractVector}(:y => [1, 0, 3, 2])),
         ("bernoulli", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                 Bernoulli.(0.7)], [0.5, 0.5])
@@ -859,6 +954,7 @@ _mix_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         #     [0.4, 0.6]); y = [-2.0, -1.8, 1.9, 2.2];
         # u (SB order [mu1, mu2, sigma]) = [-2.0, 2.0, log(0.3)].
         prog = quote
+            c ~ Normal(0, 1)
             mu1 ~ Normal(-2.0, 0.1)
             mu2 ~ Normal(2.0, 0.1)
             sigma = c

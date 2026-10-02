@@ -207,8 +207,10 @@ end
     @test ReactiveKernelsPPL._mvnormal_slices_logpdf(o, B, zeros(2),
         F * F') ≈ sum(logpdf(MvNormal(zeros(2), F * F'), B[j, :]) for j in 1:2)
     # A non-symmetric or indefinite covariance is not a covariance.
+    # refused: a covariance must be symmetric positive definite (distribution domain, P3)
     @test_throws ArgumentError ReactiveKernelsPPL._mvnormal_slices_logpdf(o,
         B, zeros(2), [1.0 0.5; 0.0 1.0])
+    # refused: a covariance must be symmetric positive definite (distribution domain, P3)
     @test_throws ArgumentError ReactiveKernelsPPL._mvnormal_slices_logpdf(o,
         B, zeros(2), [1.0 2.0; 2.0 1.0])
 end
@@ -222,6 +224,7 @@ function _sl_refuses(T, f, needle)
     catch e
         e
     end
+    # refused: each caller below identifies its invalid index, shape or declaration contract (P3/P6).
     @test err isa T
     @test err !== nothing && occursin(needle, sprint(showerror, err))
 end

@@ -465,24 +465,18 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
 end
 
 """
-    TermSpec(kind, columns, options, addressee, label[, coef, sign])
+    TermSpec(kind, columns, options, addressee, label)
 
 One additive predictor term: structure only, never materialized designs
 (D5a). `addressee` is the prior address (source column or `:Intercept`),
-never a per-level label. Terms take no options: factor sizing lives in
+never a per-level label. An optimized ordinary parameter read carries
+`parameter` (its declaration name) and `sign` in `options`; its declaration
+owns the prior and coordinates. Factor sizing lives in
 the plan's [`LevelMap`](@ref)s (full-rank over exactly the mapped
 levels; no contrasts, no reference dropping — that machinery was
 BRM-specific and is gone). A `ContinuousTerm` may name a per-cell latent
 ([`PlateParameter`](@ref)) instead of a data column: the latent vector
 enters the design with a free coefficient (the SB `me` mirror).
-
-`coef` is the author's name for the term's coefficient (`b` in
-`mu = a .+ b .* x`, `c` in `c[g]`, `b` in `X * b`), or `nothing` for a
-hand-built plan or a term without a coefficient; draws and coordinates
-report it (see [`coordinate_names`](@ref)). `sign` is the use-site sign
-of the coefficient (`-1` in `a .- b .* x`): it negates the term's design
-columns, so the coefficient keeps the prior as written. Both default to
-`(nothing, 1)`.
 """
 struct TermSpec
     kind::TermKind
@@ -490,16 +484,7 @@ struct TermSpec
     options::NamedTuple
     addressee::Symbol
     label::Symbol
-    coef::Union{Nothing,Symbol}
-    sign::Int
 end
-TermSpec(kind, columns, options, addressee, label) =
-    TermSpec(kind, columns, options, addressee, label, nothing, 1)
-
-"""Term kinds whose design columns carry a free coefficient (the kinds
-that may name one in `TermSpec.coef` and negate it by `sign`)."""
-const COEFFICIENT_TERM_KINDS = (InterceptTerm, ContinuousTerm, FactorTerm,
-    MatrixTerm, MonotonicTerm)
 
 """One named linear predictor: additive terms over raw columns."""
 struct PredictorSpec
@@ -508,6 +493,17 @@ struct PredictorSpec
     terms::Vector{TermSpec}
     label::Symbol
 end
+
+# An affine term reads an ordinary parameter; it never owns that
+# parameter's prior, transform, coordinates, or other readers.
+_parameter_term(t::TermSpec) = hasproperty(t.options, :parameter)
+_term_structure_options(t::TermSpec) = _parameter_term(t) ?
+    Base.structdiff(t.options, (parameter=nothing, sign=nothing)) : t.options
+_parameter_terms(p::PredictorSpec) = any(_parameter_term, p.terms)
+_legacy_predictor(p::PredictorSpec) = PredictorSpec(p.name, p.link,
+    TermSpec[t for t in p.terms if !_parameter_term(t)], p.label)
+_affine_block_name(p::PredictorSpec) = _parameter_terms(p) ?
+    Symbol(:_ppl_affine_coef_, p.name) : block_name(p.name)
 
 """
     PopulationPrior(predictor, addressee, location, scale)
@@ -635,11 +631,16 @@ Stan two-sided-bound kernel semantics — plain `_lpdf` plus the bare-`u`
 Jacobian, NO truncation renormalizer), or the tuple `(:upper, hi)` (an
 upper-only truncation `truncated(Normal(mu, s), -Inf, hi)` — Stan's
 upper-bound kernel `x = hi - exp(u)` with the bare-`u` Jacobian and NO
-truncation renormalizer). Shared by scalar [`SampledParameter`](@ref)s
-and per-cell [`PlateParameter`](@ref)s.
+truncation renormalizer), or the tuple `(:lower, lo)` (a lower-only
+truncation `truncated(LogNormal(m, s), lo, Inf)` of a positive-support base,
+renormalized as in Distributions — `x = lo + exp(u)` with the bare-`u`
+Jacobian; `lo` a literal, or the name of a model-level data value resolved
+from the bound columns, e.g. an HSGP validity floor). Shared by scalar
+[`SampledParameter`](@ref)s and per-cell [`PlateParameter`](@ref)s.
 """
 const SupportOverride =
-    Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64},Tuple{Symbol,Float64}}
+    Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64},Tuple{Symbol,Float64},
+        Tuple{Symbol,Symbol}}
 
 """
     SampledParameter(name, family, args, support_override, label)
@@ -795,9 +796,8 @@ end
 
 One shared varying-effect draws block over
 `K = length(margins)` margins in `G` groups of raw column `group`.
-`kind` is `:correlated` (non-centered LKJ + tau + z_flat) or
-`:centered_correlated` (LKJ + tau + directly sampled b_flat, native
-only). There is one geometry for every K and every margin: a single
+`kind` is `:correlated` (non-centered LKJ + tau + z_flat).
+There is one geometry for every K and every margin: a single
 margin, intercept or slope, is the 1x1 case, whose LKJ factor is the
 fixed `[1]` (zero coordinates, a `0.0` prior node), so its sd is the
 same half-normal `tau` (`tau ~ Normal(0, 1)` on `tau > 0` plus the
@@ -1686,6 +1686,24 @@ struct DesignMatrix
     label::Symbol
 end
 
+"""A lexical submodel call: its authored path, return-value binding, and
+local bindings. Identifiers are private plan names; `path` and local keys
+are author names. A per-cell call owns arrays of its scalar local values."""
+struct SubmodelScope
+    path::Tuple{Vararg{Symbol}}
+    binding::Symbol
+    locals::Dict{Symbol,Symbol}
+    per_cell::Bool
+end
+
+function _scope_name_paths(scopes::Vector{SubmodelScope})
+    paths = Dict{Symbol,Tuple{Vararg{Symbol}}}()
+    for scope in scopes, (local_name, identifier) in scope.locals
+        paths[identifier] = (scope.path..., local_name)
+    end
+    return paths
+end
+
 """
     StructuralPlan(responses, predictors, population_priors, parameters,
                    assignments, derived, columns, n_obs)
@@ -1704,7 +1722,8 @@ varying-effect draws blocks plus their per-target applications, and
 `matrices` user-bound design matrices referenced by [`MatrixTerm`](@ref)s
 (empty for a plain population-GLM plan). `array_parameters` are the
 declared array-valued parameters ([`ArrayParameter`](@ref)) the model reads
-by name.
+by name. `submodel_scopes` records lexical author paths separately from
+the private identifiers used by the mathematical plan.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -1732,7 +1751,21 @@ struct StructuralPlan
     matrices::Vector{DesignMatrix}
     event_lps::Vector{LinearPKEventLPSpec}
     array_parameters::Vector{ArrayParameter}
+    submodel_scopes::Vector{SubmodelScope}
 end
+
+# Existing full-positional plans have no lexical submodel metadata.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
+    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
+    horseshoe_priors, matrices, event_lps, array_parameters) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps,
+        plate_parameters, scans, dar_paths, varying_draws, varying_slices,
+        vector_parameters, spline_bases, spline_vectors, hsgp_bases,
+        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
+        array_parameters, SubmodelScope[])
 
 # Pre-array full-positional constructor (24-arg): plans built before
 # `array_parameters` existed keep working with none.
@@ -1802,14 +1835,15 @@ function StructuralPlan(
         horseshoe_priors::Vector{HorseshoePrior} = HorseshoePrior[],
         matrices::Vector{DesignMatrix} = DesignMatrix[],
         event_lps::Vector{LinearPKEventLPSpec} = LinearPKEventLPSpec[],
-        array_parameters::Vector{ArrayParameter} = ArrayParameter[])
+        array_parameters::Vector{ArrayParameter} = ArrayParameter[],
+        submodel_scopes::Vector{SubmodelScope} = SubmodelScope[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
         varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
         kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
-        array_parameters)
+        array_parameters, submodel_scopes)
 end
 
 """The horseshoe entries covering `pred` (empty when the predictor keeps
@@ -2094,12 +2128,21 @@ storage on the IR (layout calls it on bound fits in Stage B).
 """
 function _hsgp_floors(K::Vector{Int}, fits::Vector{Tuple{Float64,Float64}},
         iso::Bool)
-    per = Float64[
-        k == 1 ? 0.0 :
-            (4 * L / pi) * sqrt(log(100.0) / (k * k - 1))
-        for (k, (_, L)) in zip(K, fits)]
+    per = Float64[_hsgp_axis_floor(k, L) for (k, (_, L)) in zip(K, fits)]
     return iso ? [maximum(per)] : per
 end
+
+"""One axis's length-scale validity floor for `K` basis functions on the
+half-width-`L` domain (SB `_brm_hsgp_rho_lower`): `(4L/pi) *
+sqrt(log(100)/(K^2-1))`, `0.0` (unbounded) at `K == 1`. Shared by the
+built-in layout floors and [`hsgp_rho_floors`](@ref)."""
+_hsgp_axis_floor(K::Integer, L::Real) =
+    K == 1 ? 0.0 : (4 * L / pi) * sqrt(log(100.0) / (K * K - 1))
+
+"""Exp-quad HSGP eigenvalue of basis function `k` on the half-width-`L`
+domain (SB `lambda`): `(k*pi/(2L))^2`. Shared by the in-graph built-in
+basis and the data-side [`hsgp_basis`](@ref)."""
+_hsgp_lambda(k::Integer, L::Real) = (k * pi / (2.0 * L))^2
 
 """
     _hsgp_periodic_rho_lower(K) -> Float64
@@ -2463,16 +2506,16 @@ end
 # Sampled names, derived purely from the draws suffix: the LKJ
 # Cholesky factor (`L_<s>`, KxK), the marginal-scale vector
 # (`tau_<s>`, K), and the standardized draws (`z_flat_<s>`, K*G
-# column-major; `b_flat_<s>` when centered). Single source for surface
+# column-major). Single source for surface
 # claims, name tables, layout, and the generator. K=1 draws own the
 # same three names (`L` packs zero coords).
 function _varying_corr_names(d::VaryingDraws)
     s = d.suffix
     return (Symbol("L_", s), Symbol("tau_", s),
-        Symbol(d.kind === :centered_correlated ? "b_flat_" : "z_flat_", s))
+        Symbol("z_flat_", s))
 end
 
-_is_correlated_kind(kind) = kind in (:correlated,:centered_correlated)
+_is_correlated_kind(kind) = kind === :correlated
 
 # Stratified sampled names, derived from the draws suffix + stratum
 # position: per-stratum LKJ factor (`L_<s>_s<k>`, KxK) and
@@ -2614,8 +2657,8 @@ end
 function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
         slices::Vector{VaryingSlice})
     _is_correlated_kind(d.kind) ||
-        _fail(d.label, "draws kind must be :correlated or " *
-              ":centered_correlated (one geometry for every K — a single " *
+        _fail(d.label, "draws kind must be :correlated " *
+              "(one geometry for every K — a single " *
               "margin is the 1x1 case), got $(repr(d.kind))")
     K = length(d.margins)
     K >= 1 || _fail(d.label, "draws block has zero margins")
@@ -2648,8 +2691,6 @@ function _validate_draws_grouping(d::VaryingDraws, K::Int)
     mm = d.mm
     st = d.strata
     mm === nothing && st === nothing && return nothing
-    d.kind === :centered_correlated && _fail(d.label,
-        "centered correlated draws require plain grouping (multi-membership and strata are unsupported)")
     mm !== nothing && st !== nothing &&
         _fail(d.label, "draws block is both multi-membership and " *
               "stratified (SB has no `mm(...)` × `gr(g, by=b)` shape — " *
@@ -3223,7 +3264,7 @@ versions are not built, so such a plan fails closed — and a slot added
 later does too until it is listed here."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :parameters, :assignments, :derived, :columns, :n_obs, :roles,
-    :levelmaps, :vector_parameters)
+    :levelmaps, :vector_parameters, :submodel_scopes)
 
 """Per-observation columns (of `perobs`) a response reads: the names its
 own fields hold, then — transitively — the names every predictor, derived
@@ -5349,9 +5390,11 @@ function _validate_vector_structure(plan::StructuralPlan)
         d.expr isa Symbol && continue
         refs = Symbol[]
         _collect_vector_refs!(refs, d.expr, plan, d.label, false)
-        _is_vector_valued(d.expr, plan) || _fail(d.label,
-            "derived column is scalar-valued — write it as a scalar " *
-            "assignment instead")
+        # A data-only module value read per observation is checked at
+        # bind (its length or row count), not by its expression's shape.
+        _is_vector_valued(d.expr, plan) || _is_bind_data_derived(plan, d.name) ||
+            _fail(d.label, "derived column is scalar-valued — write it as " *
+                "a scalar assignment instead")
     end
     return nothing
 end
@@ -5366,9 +5409,11 @@ function _validate_vector_data(plan::StructuralPlan)
             r in _all_names(plan) ||
                 _fail(d.label, "derived column references unknown name $r")
         end
-        _is_vector_valued(d.expr, plan) || _fail(d.label,
-            "derived column is scalar-valued — write it as a scalar " *
-            "assignment instead")
+        # A data-only module value read per observation is checked at
+        # bind (its length or row count), not by its expression's shape.
+        _is_vector_valued(d.expr, plan) || _is_bind_data_derived(plan, d.name) ||
+            _fail(d.label, "derived column is scalar-valued — write it as " *
+                "a scalar assignment instead")
     end
     return nothing
 end
@@ -5425,9 +5470,15 @@ _is_plate_param(plan::StructuralPlan, name::Symbol) =
 # columns fail (row-varying outside a reduction) and reduction args must be
 # bound columns or derived names. Derived names are known in both states,
 # so derived-outside-a-reduction fails at structure already.
+# `(name = value,)` stores a NamedTuple key, not a model assignment/read.
+_tuple_field_value(ex) = Meta.isexpr(ex, :(=), 2) && ex.args[1] isa Symbol ?
+    ex.args[2] : ex
+
 function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
+    _is_plate_column_expr(ex) &&
+        return _collect_plate_column_refs!(refs, ex, plan, label, bound)
     # Expressions over declared array parameters (`phi[1]`, `sd .* z`,
     # `sum(z)`) follow the array-value vocabulary (`arrays.jl`).
     _mentions_array(ex, plan) &&
@@ -5441,6 +5492,9 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
         )
         # (A bound model-level data value — an assignment evaluated at
         # bind — is a column entry but no observation column.)
+        # A raw whole-value input is a bound operand, not a graph node.
+        bound && haskey(plan.columns, ex) &&
+            ex in first(_bound_model_level_inputs(plan)) && return nothing
         bound && haskey(plan.columns, ex) &&
             !any(a -> a.name === ex, plan.assignments) && _fail(
             label,
@@ -5480,6 +5534,12 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
                 "reduction $fn takes exactly one bare column or derived name",
             )
             arg = ex.args[2]
+            # A reduction of a module call's whole value is plain Julia
+            # (`maximum(hsgp_rho_floors(lambda))`), like the call itself.
+            if _is_module_value_call(arg)
+                _collect_opaque_refs!(refs, arg, plan, label, bound)
+                return nothing
+            end
             # A reduction of a model-level value is plain Julia
             # (`sum(zeta)`, `sum(abs2.(w))`); over a column it stays a bare
             # name (nested column transforms stage as their own definition).
@@ -5533,6 +5593,7 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     end
     if head === :vect || head === :tuple
         for a in ex.args
+            head === :tuple && (a = _tuple_field_value(a))
             _collect_assignment_refs!(refs, a, plan, label, bound)
         end
         return nothing
@@ -5566,6 +5627,7 @@ function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
         args = ex.args[2].args
     end
     for a in args
+        ex.head === :tuple && (a = _tuple_field_value(a))
         _collect_opaque_refs!(refs, a, plan, label, bound)
     end
     return nothing
@@ -5619,6 +5681,56 @@ end
 # to the scalar collector. With bound=true, direct column references in
 # math positions must be numeric and bare-Symbol `ifelse` conditions must be
 # Bool columns.
+# An array-cell plate column (a derived column's right-hand side
+# `plate(lanes..., Ref(shared)...) do args...; cell; end`, one value per
+# index — `_plate_column_expr` in the surface): the inputs are graph
+# values; the cell body is RK's to plan. Lanes are data columns or the
+# level codes `_ppl_codes(g, h)` of column `g` on `levels(h)`.
+_is_plate_column_expr(ex) = ex isa Expr && ex.head === :do &&
+    length(ex.args) == 2 && ex.args[1] isa Expr && ex.args[1].head === :call &&
+    !isempty(ex.args[1].args) && ex.args[1].args[1] === :plate
+
+# Level plate columns are array values with a declared level axis. Keep
+# that provenance in the first input until the generator binds the axis.
+function _level_plate_axis(ex)
+    _is_plate_column_expr(ex) || return nothing
+    inp = ex.args[1].args[2]
+    return inp isa Expr && inp.head === :call && length(inp.args) == 2 &&
+        inp.args[1] === :_ppl_level_indices ? inp.args[2] : nothing
+end
+
+function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
+    known = union(_union_names(plan), _vector_value_names(plan),
+        Set{Symbol}(d.name for d in plan.derived),
+        Set{Symbol}(p.name for p in plan.array_parameters))
+    for inp in ex.args[1].args[2:end]
+        if inp isa Symbol
+            bound && !haskey(plan.columns, inp) && !(inp in known) &&
+                _fail(label, "array plate column reads unknown name $inp")
+            push!(refs, inp)
+        elseif inp isa Expr && inp.head === :call &&
+                ((length(inp.args) == 3 && inp.args[1] === :_ppl_codes) ||
+                 (length(inp.args) == 2 && inp.args[1] in
+                    (:_ppl_level_indices, :_ppl_level_values)))
+            for c in inp.args[2:end]
+                c isa Symbol || _fail(label, "array plate column codes " *
+                    "take data columns, got $(repr(c))")
+                bound && !haskey(plan.columns, c) && _fail(label,
+                    "array plate column codes read unknown column $c")
+            end
+        elseif inp isa Expr && inp.head === :call && length(inp.args) == 2 &&
+                inp.args[1] === :Ref && inp.args[2] isa Symbol
+            nm = inp.args[2]
+            bound && !haskey(plan.columns, nm) && !(nm in known) &&
+                _fail(label, "array plate column reads unknown name $nm")
+        else
+            _fail(label, "array plate column input $(repr(inp)) is not a " *
+                "column, level codes or `Ref(name)`")
+        end
+    end
+    return nothing
+end
+
 function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
@@ -5640,6 +5752,9 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     end
     ex isa Expr || _fail(label, "unsupported literal $(repr(ex)) (numeric literals only)")
     head = ex.head
+    if _is_plate_column_expr(ex)
+        return _collect_plate_column_refs!(refs, ex, plan, label, bound)
+    end
     if head === :call
         fn = ex.args[1]
         _is_data_matvec(ex, plan) &&
@@ -5808,6 +5923,7 @@ end
 # reductions and scalar calls collapse; unbound unknown symbols count as
 # (possibly-column) evidence and resolve at bind.
 function _is_vector_valued(ex, plan::StructuralPlan)
+    _is_plate_column_expr(ex) && return true
     ex isa Symbol && return !(ex in _union_names(plan) ||
         ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
     ex isa Expr && ex.head === :ref && ex.args[1] isa Symbol &&
@@ -5825,6 +5941,14 @@ function _is_vector_valued(ex, plan::StructuralPlan)
         isempty(ex.args) && return false
         fn = ex.args[1]
         fn isa GlobalRef && return false  # undotted module call: model-level
+        if fn === :* && length(ex.args) == 3 &&
+                _observation_matrix_gather(ex.args[2], plan) &&
+                _model_vector_value(ex.args[3], plan)
+            # A gathered N×K array times a model-level K-vector is an
+            # observation vector, although neither operand is a vector
+            # column on its own.
+            return true
+        end
         fn in REDUCTION_FNS && return false
         fn isa Symbol && fn in VECTOR_FNS && return true
         fn isa Symbol && (fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS) &&
@@ -5838,6 +5962,22 @@ function _is_vector_valued(ex, plan::StructuralPlan)
         return any(a -> _is_vector_valued(a, plan), ex.args[2].args)
     end
     return false
+end
+
+function _observation_matrix_gather(ex, plan)
+    return _is_row_gather(plan, ex)
+end
+
+function _model_vector_value(ex, plan)
+    if ex isa Symbol
+        _is_array_param(plan, ex) && return length(_array_param(plan, ex).dims) == 1
+        return ex in _vector_value_names(plan)
+    end
+    ex isa Expr && ex.head === :ref || return false
+    (_is_array_param(plan, ex.args[1]) ||
+        _is_array_assignment(plan, ex.args[1])) || return false
+    return count(isequal(:(:)), ex.args[2:end]) == 1 &&
+        all(_is_position, ex.args[2:end])
 end
 
 function _validate_parameters(plan::StructuralPlan)
@@ -5902,6 +6042,18 @@ function _validate_support_override(label, family::Symbol,
         "a uniform prior carries its own interval support — no support " *
         "override applies, got $ov")
     if ov isa Tuple
+        if ov[1] === :lower
+            length(ov) == 2 || _fail(label,
+                "tuple support override must be (:lower, lo), got $ov")
+            family === :lognormal || _fail(label,
+                "a :lower override is a lower-truncated LogNormal " *
+                "(`truncated(LogNormal(m, s), lo, Inf)`); got $family")
+            lo = ov[2]
+            lo isa Symbol || (isfinite(lo) && lo >= 0) || _fail(label,
+                ":lower bound must be a finite non-negative literal or a " *
+                "data name; got $lo")
+            return nothing
+        end
         if ov[1] === :upper
             length(ov) == 2 || _fail(label,
                 "tuple support override must be (:upper, hi), got $ov")
@@ -6329,49 +6481,19 @@ function _validate_predictors(plan::StructuralPlan)
         isempty(pred.terms) &&
             _fail(pred.label, "predictor $(pred.name) has no terms (empty design)")
         for t in pred.terms
-            _validate_term_coefficient(t)
             _validate_term(t, pred, plan)
         end
-    end
-    _validate_coefficient_names(plan)
-    return nothing
-end
-
-# A term's author coefficient name and use-site sign exist only where the
-# design carries a free coefficient (`COEFFICIENT_TERM_KINDS`); the sign
-# is a polarity.
-function _validate_term_coefficient(t::TermSpec)
-    (t.sign == 1 || t.sign == -1) || _fail(t.label,
-        "term sign must be 1 or -1 (the coefficient's use-site " *
-        "polarity), got $(t.sign)")
-    t.kind in COEFFICIENT_TERM_KINDS && return nothing
-    t.coef === nothing || _fail(t.label,
-        "a $(t.kind) carries no coefficient, so it names none " *
-        "(got coef = $(t.coef))")
-    t.sign == 1 || _fail(t.label,
-        "a $(t.kind) carries no coefficient, so it takes no sign " *
-        "(negate its column instead)")
-    return nothing
-end
-
-# One author name per coefficient: a name heads exactly one term, so the
-# reported draws (`coordinate_names`, `constrain`) never merge two
-# coefficient blocks under one key.
-function _validate_coefficient_names(plan::StructuralPlan)
-    owner = Dict{Symbol,Tuple{Symbol,Symbol}}()
-    for pred in plan.predictors, t in pred.terms
-        t.coef === nothing && continue
-        prev = get(owner, t.coef, nothing)
-        prev === nothing || _fail(t.label,
-            "coefficient name $(t.coef) heads two terms " *
-            "($(prev[1]).$(prev[2]) and $(pred.name).$(t.label)) — one " *
-            "coefficient per name")
-        owner[t.coef] = (pred.name, t.label)
     end
     return nothing
 end
 
 function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    if _parameter_term(t)
+        _validate_parameter_term(t, plan)
+        t = TermSpec(t.kind, t.columns,
+            _term_structure_options(t),
+            t.addressee, t.label)
+    end
     if t.kind === VaryingEffectTerm
         _validate_effect_term(t, pred)
         return nothing
@@ -6434,6 +6556,21 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
     return nothing
 end
 
+function _validate_parameter_term(t::TermSpec, plan::StructuralPlan)
+    name = t.options.parameter
+    name isa Symbol || _fail(t.label, "affine parameter must be a name")
+    (hasproperty(t.options, :sign) && t.options.sign in (-1, 1)) || _fail(t.label,
+        "affine parameter sign must be -1 or 1")
+    if t.kind in (FactorTerm, MatrixTerm)
+        any(p -> p.name === name, plan.array_parameters) || _fail(t.label,
+            "affine term reads unknown array parameter $name")
+    else
+        any(p -> p.name === name, plan.parameters) || _fail(t.label,
+            "affine term reads unknown scalar parameter $name")
+    end
+    return nothing
+end
+
 # A matrix term names its design matrix in `options` (`(matrix,)` — the
 # gather/spline options precedent) and carries exactly the matrix's data
 # columns in order (intercept positions excluded — they take no column);
@@ -6490,7 +6627,7 @@ end
 # vector-parameter linkage (which reads `options.increments` before
 # `_validate_predictors` runs, so it must establish the shape itself).
 function _monotonic_options(t::TermSpec)
-    o = t.options
+    o = _term_structure_options(t)
     Tuple(keys(o)) == (:increments,) ||
         _fail(t.label, "monotonic term options must be exactly " *
               "`(increments,)`, got $(Tuple(keys(o)))")
@@ -6769,7 +6906,14 @@ function _validate_predictor_columns(plan::StructuralPlan)
     return nothing
 end
 
+# Scalar offset values have no observation axis until preprocessing
+# broadcasts them. They are assignments, never design coefficients.
+_is_scalar_offset(t::TermSpec, plan::StructuralPlan) =
+    t.kind === OffsetTerm && any(a -> a.name === only(t.columns), plan.assignments) &&
+    _value_axes(plan, only(t.columns)) == Any[]
+
 function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    _is_scalar_offset(t, plan) && return nothing
     # Latent terms name a per-cell latent VECTOR (a PlateParameter), not a
     # raw/derived data column; structure validation checked its presence.
     t.kind === LatentTerm && return nothing
@@ -6872,9 +7016,8 @@ function _grouping_levels(col::AbstractVector)
     return sort(unique(col))
 end
 
-# One map per factor term, keyed (predictor, column); duplicate keys mean
-# two factor terms over one column in one predictor (unidentified sums —
-# merge them).
+# One map per factor term, keyed (predictor, column), so a factor lookup
+# resolves to exactly one map.
 _map_key(m::LevelMap) = (m.predictor, m.column)
 
 function _validate_levelmaps(plan::StructuralPlan)
@@ -6891,26 +7034,6 @@ function _validate_levelmaps(plan::StructuralPlan)
                 "factor term over $col in predictor $(pred.name) has no " *
                 "LevelMap (surface: size it with a `c[levels($col)]` prior)")
         end
-        has_intercept = any(t -> t.kind === InterceptTerm, pred.terms)
-        if !has_intercept
-            for t in pred.terms
-                t.kind === MatrixTerm || continue
-                m = _find_matrix(plan, t.options.matrix)
-                m !== nothing && any(isnothing, m.columns) &&
-                    (has_intercept = true; break)
-            end
-        end
-        if has_intercept
-            for t in pred.terms
-                t.kind === FactorTerm || continue
-                col = only(t.columns)
-                m = _find_levelmap(plan.levelmaps, pred.name, col)
-                m === nothing && continue
-                msg = _full_cover_unidentified(pred.name, col, m,
-                    plan.population_priors)
-                msg === nothing || _fail(pred.label, msg)
-            end
-        end
     end
     for m in plan.levelmaps
         m.source === :levels ||
@@ -6919,32 +7042,6 @@ function _validate_levelmaps(plan::StructuralPlan)
         _validate_subset_shape(m)
     end
     return nothing
-end
-
-# Intercept + full-cover factor (the surface and contract gates share this
-# rule): a hierarchical prior — a parameter or assignment scale around a
-# literal location (`c[levels(g)] .~ Normal.(0, sg)`) — identifies the
-# level offsets against the intercept, so the pair is admitted. A literal
-# or flat prior leaves an exact likelihood ridge pinned only by fixed
-# priors, and a parameter location trades off with the intercept itself;
-# both stay refused. Returns the refusal message or `nothing`.
-function _full_cover_unidentified(pred::Symbol, col::Symbol, m::LevelMap,
-        priors::Vector{PopulationPrior})
-    m.subset === Colon() || return nothing
-    i = findfirst(p -> p.predictor === pred && p.addressee === col, priors)
-    pr = i === nothing ? nothing : priors[i]
-    if pr !== nothing && pr.family !== :flat && pr.family !== :uniform &&
-            pr.scale isa Symbol
-        pr.location isa Real && return nothing
-        return "predictor $pred is unidentified: intercept + full-cover " *
-            "factor over $col whose prior location $(pr.location) is a " *
-            "parameter — the intercept and $(pr.location) trade off " *
-            "exactly (drop one, or center the factor prior at a literal)"
-    end
-    return "predictor $pred is unidentified: intercept + full-cover " *
-        "factor over $col with a fixed prior (drop the intercept, index a " *
-        "strict subset of levels, or give the factor a hierarchical scale: " *
-        "`c[levels($col)] .~ Normal.(0, s)` with `s` a parameter)"
 end
 
 function _find_levelmap(maps::Vector{LevelMap}, pred::Symbol, col::Symbol)
@@ -7170,6 +7267,7 @@ function _validate_priors(plan::StructuralPlan)
         # per matrix column).
         addressees = Set{Symbol}()
         for t in pred.terms
+            _parameter_term(t) && continue
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
                 t.kind === VaryingEffectTerm ||
                 t.kind === SplineSummandTerm ||
@@ -7200,7 +7298,8 @@ function _validate_priors(plan::StructuralPlan)
             end
             push!(addressees, t.addressee)
         end
-        any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
+        any(t -> t.kind === InterceptTerm && !_parameter_term(t),
+            pred.terms) && push!(addressees, :Intercept)
         for a in addressees
             # A horseshoe predictor covers an addressee by its entry or by
             # a synthesized Normal scalar (family checked in
@@ -7214,6 +7313,7 @@ function _validate_priors(plan::StructuralPlan)
     end
     for r in plan.responses
         _is_glm_family(r.family) || continue
+        _is_array_param(plan, r.glm_beta) && continue
         m = _find_matrix(plan, r.predictor)
         m === nothing && continue
         for c in m.columns
@@ -7480,7 +7580,7 @@ function _validate_leveled_fields(r::LikelihoodSpec, plan::StructuralPlan,
     _is_leveled_family(r.family) || return _validate_unleveled_fields(r)
     r.family === CategoricalLogitFam &&
         return _validate_categorical_fields(r, plan, used_predictors)
-    return _validate_ordered_fields(r, plan, pred, used_predictors)
+    return _validate_ordered_fields(r, plan, used_predictors)
 end
 
 function _validate_categorical_fields(r::LikelihoodSpec, plan::StructuralPlan,
@@ -7528,7 +7628,7 @@ function _validate_categorical_fields(r::LikelihoodSpec, plan::StructuralPlan,
 end
 
 function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
-        pred::PredictorSpec, used_predictors::Set{Symbol})
+        used_predictors::Set{Symbol})
     r.thresholds === nothing && _fail(r.label,
         "an ordered response requires its thresholds vector parameter")
     tp = only(p for p in plan.vector_parameters if p.name === r.thresholds)
@@ -7539,9 +7639,6 @@ function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
         r.ordinal_structure in (:cumulative, :stopping) || _fail(r.label,
             "Ordinal takes ordinal_structure :cumulative or :stopping, got " *
             "$(repr(r.ordinal_structure))")
-        any(t -> t.kind === InterceptTerm, pred.terms) && _fail(r.label,
-            "an Ordinal eta cannot include a fixed intercept — the estimated " *
-            "thresholds already supply the location")
     else
         r.ordinal_structure === nothing ||
             _fail(r.label, "OrderedLogistic takes no ordinal_structure")
@@ -10035,6 +10132,7 @@ function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
             end
         else
             for a in ex.args
+                ex.head === :tuple && (a = _tuple_field_value(a))
                 _expr_value_symbols(a, out)
             end
         end
@@ -10103,7 +10201,8 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     free = union(Set{Symbol}(raw), Set{Symbol}(first(d) for d in defs))
     named = copy(free)
     for f in fieldnames(StructuralPlan)
-        f in (:assignments, :derived, :columns, :n_obs, :roles) && continue
+        f in (:assignments, :derived, :columns, :n_obs, :roles,
+            :submodel_scopes) && continue
         _drop_held_names!(free, getfield(plan, f))
     end
     held = setdiff!(named, free)
@@ -10163,7 +10262,18 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
     if ex isa Symbol
         ex in raw && push!(inside ? whole : per_obs, ex)
     elseif ex isa Expr
-        if ex.head === :kw && length(ex.args) == 2
+        if _is_plate_column_call(ex) && _plate_column_axis(ex) !== nothing
+            axis = _plate_column_axis(ex)
+            for a in ex.args[3:end]
+                _classify_reads!(whole, per_obs, a, raw, a !== axis)
+            end
+        elseif _is_plate_column_expr(ex)
+            for a in ex.args[1].args[2:end]
+                shared = _is_ref_call(a)
+                _classify_reads!(whole, per_obs, shared ? a.args[2] : a,
+                    raw, inside || shared)
+            end
+        elseif ex.head === :kw && length(ex.args) == 2
             _classify_reads!(whole, per_obs, ex.args[2], raw, inside)
         elseif ex.head === :call
             inner = inside || (!isempty(ex.args) && ex.args[1] isa GlobalRef)
@@ -10213,8 +10323,14 @@ function _drop_held_names!(out::Set{Symbol}, x::AbstractDict)
     end
     return nothing
 end
-_drop_held_names!(out::Set{Symbol}, x::Expr) =
-    _drop_held_names!(out, x.args)
+function _drop_held_names!(out::Set{Symbol}, x::Expr)
+    for a in x.args
+        x.head === :tuple && (a = _tuple_field_value(a))
+        _drop_held_names!(out, a)
+    end
+    return nothing
+end
+_drop_held_names!(::Set{Symbol}, ::SubmodelScope) = nothing
 function _drop_held_names!(out::Set{Symbol}, x::T) where {T}
     isstructtype(T) || return nothing
     for f in fieldnames(T)
@@ -10230,7 +10346,7 @@ function _bound_value_inputs(plan::StructuralPlan)
     found = Set{Symbol}()
     seen = Base.IdSet{Any}()
     for f in fieldnames(StructuralPlan)
-        f === :columns && continue
+        f in (:columns, :submodel_scopes) && continue
         _collect_bound_value_inputs!(found, getfield(plan, f), seen)
     end
     return found
@@ -10311,12 +10427,15 @@ function _materialize_module_data!(plan::StructuralPlan,
     end
     vector_defs = Set{Symbol}(d.name for d in plan.derived)
     memo = Dict{Symbol,Any}()
+    # Identical module calls share one evaluation (`(Xf, Zp) = f(x)` reads
+    # `f(x)` twice): within one bind every name has one value.
+    calls = Dict{Any,Any}()
     function lookup(nm::Symbol)
         haskey(memo, nm) && return memo[nm]
         haskey(columns, nm) && return columns[nm]
         haskey(exprs, nm) || throw(ContractValidationError(
             "[bind] data definition reads $nm, which is not bound data"))
-        memo[nm] = _eval_value_expr(exprs[nm], lookup, nm)
+        memo[nm] = _eval_value_expr(exprs[nm], lookup, nm; calls)
         return memo[nm]
     end
     for nm in sort!(collect(names))
@@ -10329,9 +10448,11 @@ function _materialize_module_data!(plan::StructuralPlan,
                 sprint(showerror, e)))
         end
         if nm in vector_defs
-            v isa AbstractVector || throw(ContractValidationError(
-                "[bind] data definition $nm is an observation column " *
-                "(elementwise over data) but evaluated to $(summary(v))"))
+            v isa AbstractVector || v isa AbstractMatrix ||
+                throw(ContractValidationError(
+                "[bind] data definition $nm is read per observation (an " *
+                "observation column, or a matrix with one row per " *
+                "observation) but evaluated to $(summary(v))"))
         else
             v isa ColumnData || throw(ContractValidationError(
                 "[bind] data definition $nm evaluated to $(summary(v)); " *
@@ -10383,15 +10504,17 @@ end
 # Plain-Julia evaluation of a resolved definition expression (functions as
 # values): module calls through their `GlobalRef`s, built-in vocabulary
 # heads through the generated-model scope — the bindings the kernel uses.
-function _eval_value_expr(ex, lookup, label)
+function _eval_value_expr(ex, lookup, label; calls = nothing)
     ex isa Union{Number,String} && return ex
     ex isa QuoteNode && return ex.value
     ex isa GlobalRef && return getglobal(ex.mod, ex.name)
     ex isa Symbol && return lookup(ex)
     ex isa Expr || throw(ContractValidationError(
         "[bind] $label: unsupported literal $(repr(ex))"))
-    ev(a) = _eval_value_expr(a, lookup, label)
+    ev(a) = _eval_value_expr(a, lookup, label; calls)
     h = ex.head
+    cached = h === :call && calls !== nothing && ex.args[1] isa GlobalRef
+    cached && haskey(calls, ex) && return calls[ex]
     if h === :call
         f = _eval_callee(ex.args[1], label)
         pos = Any[]
@@ -10416,7 +10539,9 @@ function _eval_value_expr(ex, lookup, label)
         end
         # `invokelatest`: the model module's functions may postdate the
         # caller's world (bind_data is callable from any world).
-        return Base.invokelatest(f, pos...; kws...)
+        v = Base.invokelatest(f, pos...; kws...)
+        cached && (calls[ex] = v)
+        return v
     elseif h === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
             ex.args[2].head === :tuple
         f = _eval_callee(ex.args[1], label)

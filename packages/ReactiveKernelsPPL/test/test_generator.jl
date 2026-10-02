@@ -1531,9 +1531,13 @@ end
     plan = _gen_gaussian_plan()
     built = build_kernel(plan)
     u = _unbind(plan)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError build_kernel(u)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError kernel_expr(u, built.layout)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError assign_layout(u)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError prepare_query(built, u, :sampler)
     # Rebinding the same columns reproduces the direct-build posterior.
     b = bind_data(u, plan.columns)
@@ -1661,6 +1665,8 @@ end
     ycount = [3, 1, 6, 2, 1, 4]
     phicol = [2.0, 3.0, 1.5, 2.5, 4.0, 1.0]
     plan0 = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ NegativeBinomial2.(exp.(mu), phi)
     end, (:y, :x, :phi))
@@ -1670,8 +1676,7 @@ end
     built = build_kernel(plan)
     u = [0.2, -0.1]
     nt = constrain(built.layout, u)
-    coef = [nt.a, nt.b]
-    mu = exp.(coef[1] .+ coef[2] .* x)
+    mu = exp.(nt.a .+ nt.b .* x)
     ll = sum(logpdf.(NegativeBinomial.(phicol, phicol ./ (phicol .+ mu)), ycount))
     @test _query(built.spec, plan, :likelihood, u) ≈ ll
     _check_gradient(built.spec, plan, u)
@@ -1723,16 +1728,18 @@ end
     cols = Dict{Symbol,AbstractVector}(:x => x, :y => y)
     expr = Expr(:block,
         :(w ~ truncated(Normal(-1.0, 1.0), -Inf, $hi)),
+        :(a ~ Normal(0, 1)),
+        :(b ~ Normal(0, 1)),
         :(mu = a .+ b .* x),
         :(y .~ Normal.(mu, s)),
         :(s ~ Exponential(1)))
     plan = bind_data(lower_rkppl(expr, (:y, :x)), cols)
     built = build_kernel(plan)
-    @test built.layout.total == 4 # a, b, w, s
-    u = [0.3, -0.2, 0.1, 0.25]
+    @test coordinate_names(built.layout) == [:w, :a, :b, :s]
+    u = [0.1, 0.3, -0.2, 0.25]
     nt = constrain(built.layout, u)
     a, b, c, s = nt.a, nt.b, nt.w, nt.s
-    @test c ≈ hi - exp(u[3])
+    @test c ≈ hi - exp(u[1])
     @test c < hi
     mu = a .+ b .* x
     ll = sum(logpdf.(Normal.(mu, s), y))
@@ -1740,22 +1747,23 @@ end
         logpdf(Normal(-1.0, 1.0), c) + logpdf(Exponential(1), s)
     @test _query(built.spec, plan, :likelihood, u) ≈ ll
     @test _query(built.spec, plan, :prior, u) ≈ pr
-    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3] + u[4]
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[1] + u[4]
     _check_gradient(built.spec, plan, u)
     # The untruncated interim is density-exact on the support interior: same
     # constrained value ⇒ same prior; the posterior differs by exactly the
     # Jacobian `u` (snag thin-layer-upper-c3c06483).
     interim = bind_data(lower_rkppl(Expr(:block,
             :(w ~ Normal(-1.0, 1.0)),
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(mu = a .+ b .* x),
             :(y .~ Normal.(mu, s)),
             :(s ~ Exponential(1))), (:y, :x)), cols)
     built_i = build_kernel(interim)
-    u_i = [u[1], u[2], c, u[4]]
+    u_i = unconstrain(built_i.layout, (; w = c, a, b, s))
     @test _query(built.spec, plan, :prior, u) ≈
         _query(built_i.spec, interim, :prior, u_i)
     @test (_query(built.spec, plan, :posterior, u) -
-           _query(built_i.spec, interim, :posterior, u_i)) ≈ u[3]
+           _query(built_i.spec, interim, :posterior, u_i)) ≈ u[1]
 end
 
 @testset "plate parameter upper-truncated latent" begin
@@ -1925,15 +1933,15 @@ end
     plan = m(; y = ydata)
     @test only(plan.predictors).terms[2].kind === ScanSummandTerm
     built = build_kernel(plan)
-    # mu_coef(a) + phi_raw + beta_ar + sigma + z[1..5]
+    # Ordinary declaration order: phi_raw, beta_ar, a, sigma, z[1..5].
     @test built.layout.total == 4 + length(ydata)
+    @test coordinate_names(built.layout)[1:4] == [:phi_raw, :beta_ar, :a, :sigma]
 
     # independent oracle: SB `ar1_recurse` ported line-for-line, priors and
     # likelihood via Distributions.jl (never the emitted forms)
     function ar_oracle(u, y)
         T = length(y)
-        aa = u[1]
-        phi_raw = u[2]; beta = u[3]; lsig = u[4]
+        phi_raw = u[1]; beta = u[2]; aa = u[3]; lsig = u[4]
         z = u[5:(5 + T - 1)]
         phi = tanh(phi_raw)
         sigma = exp(lsig)

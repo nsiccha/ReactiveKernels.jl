@@ -27,6 +27,8 @@ _mo_cols() = Dict{Symbol,AbstractVector}(
 )
 
 _mo_surface_mo() = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     s ~ Dirichlet([1.0, 2.0])
     mu = a .+ b .* mo(c, s)
     sigma ~ Exponential(1.0)
@@ -34,6 +36,7 @@ _mo_surface_mo() = quote
 end
 
 _mo_surface_mo1() = quote
+    a ~ Normal(0, 1)
     s ~ Dirichlet([1.0, 2.0])
     mu = a .+ mo1(c, s)
     sigma ~ Exponential(1.0)
@@ -62,11 +65,11 @@ end
     @test [t.kind for t in terms] == [InterceptTerm, MonotonicTerm]
     mot = terms[2]
     @test mot.columns == [:c]
-    @test mot.options == (increments = :s,)
+    @test mot.options == (increments = :s, parameter = :b, sign = 1)
     @test mot.addressee === :c
     # The mo beta takes a population prior addressed by its index column.
-    @test PopulationPrior(:mu, :c, 0.0, 1.0) in plan.population_priors
-    @test PopulationPrior(:mu, :Intercept, 0.0, 1.0) in plan.population_priors
+    @test isempty(plan.population_priors)
+    @test [p.name for p in plan.parameters] == [:a, :b, :sigma]
     # The increments lower as a size-deferred simplex Dirichlet.
     @test length(plan.vector_parameters) == 1
     p = only(plan.vector_parameters)
@@ -88,7 +91,8 @@ end
     @test mot.options == (increments = :s,)
     # Beta-free: self-addressed, and no population prior beyond the intercept.
     @test mot.addressee === mot.label
-    @test plan.population_priors == [PopulationPrior(:mu, :Intercept, 0.0, 1.0)]
+    @test isempty(plan.population_priors)
+    @test [p.name for p in plan.parameters] == [:a, :sigma]
     # Coefficient-free mo1 predictors lower (SB `y ~ 0 + mo1(c)`), alone
     # and mixed with offsets.
     only1 = lower_rkppl(quote
@@ -107,18 +111,20 @@ end
         [OffsetTerm, MonotonicSummandTerm]
     # A spline summand keeps the coefficient requirement (the mo1
     # exception covers only offset/mo1 shapes).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: coefficient-free predictor mixing spline and mo1 summands (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
             s ~ Dirichlet(2, 1.0)
             mu = spline(:s_x) .+ mo1(c, s)
             y .~ Normal.(mu, 1.0)
             spline_basis(:s_x, x; k = 4)
-        end, (:y, :c, :x))
+        end, (:y, :c, :x)); true)
 end
 
 @testset "mo surface fail-closed" begin
     # Bare `mo()` (no coefficient) names both spellings.
     err = try
         lower_rkppl(quote
+                a ~ Normal(0, 1)
                 s ~ Dirichlet(2, 1.0)
                 mu = a .+ mo(c, s)
                 y .~ Normal.(mu, 1.0)
@@ -127,90 +133,118 @@ end
     catch e
         e
     end
-    @test err isa SurfaceLoweringError &&
-        occursin("free coefficient", sprint(showerror, err)) &&
-        occursin("mo1(c, s)", sprint(showerror, err))
+    # capability: a library contrast is a value with coefficient one (P8 1cmodra mo-dar; todo `15lq8iu`).
+    @test_broken (err === nothing || throw(err))
     # `mo1()` under a coefficient (or any nesting) fails closed.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: mo1 contrast under a coefficient (`b .* mo1(c, s)`; values compose, P3/P8; same value as `b .* mo(c, s)`) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
             mu = a .+ b .* mo1(c, s)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :c)); true)
+    # capability: a reduction of a monotonic value can feed an ordinary scalar offset (P8; todo `15lq8iu`).
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
             mu = a .+ sum(mo1(c, s))
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c))
+        end, (:y, :c)); true)
     # Negated mo1 summands fail closed (additive only).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: negated mo1 summand (`a .- mo1(c, s)`) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
             mu = a .- mo1(c, s)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c))
+        end, (:y, :c)); true)
     # Arity is exactly (index column, increments).
+    # refused: mo arity, increments simplex missing; no minted simplex (P6, 05oe96l; P7, 0d5a67r)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             s ~ Dirichlet(2, 1.0)
             mu = a .+ b .* mo(c)
             y .~ Normal.(mu, 1.0)
         end, (:y, :c))
+    # refused: mo1 arity, extra argument (Julia MethodError analogue, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             s ~ Dirichlet(2, 1.0)
             mu = a .+ mo1(c, s, s)
             y .~ Normal.(mu, 1.0)
         end, (:y, :c))
     # The index is a bare data column; the increments a Dirichlet simplex.
+    # refused: undeclared name `q` as index (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             s ~ Dirichlet(2, 1.0)
             mu = a .+ b .* mo(q, s)
             y .~ Normal.(mu, 1.0)
         end, (:y, :c))
+    # refused: increments must be a simplex (scalar Normal `t`)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             t ~ Normal(0, 1)
             mu = a .+ b .* mo(c, t)
             y .~ Normal.(mu, 1.0)
         end, (:y, :c))
+    # refused: undeclared simplex `s` (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             mu = a .+ mo1(c, s)
             y .~ Normal.(mu, 1.0)
         end, (:y, :c))
     # One monotonic term per simplex (SB allocates one submodel per term).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: one increments simplex shared by several mo/mo1 terms (SB one-submodel-per-term is not a principle, P10) (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
             mu = a .+ b .* mo(c, s)
             nu = d .+ mo1(c, s)
             y .~ Normal.(mu, 1.0)
             z .~ Normal.(nu, 1.0)
-        end, (:y, :z, :c))
+        end, (:y, :z, :c)); true)
     # `mo()` neither interacts nor nests.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: mo() interaction with a data column (`b .* mo(c, s) .* x`) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
             mu = a .+ b .* mo(c, s) .* x
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :c, :x)); true)
+    # capability: mo() nested in an arithmetic subexpression (`b .* (mo(c, s) .+ x)`) (todo `0fkd9yk`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
             mu = a .+ b .* (mo(c, s) .+ x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c, :x))
+        end, (:y, :c, :x)); true)
     # Neither spelling hides in definitions.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: mo value in a definition (`w = b .* mo(c, s)`) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
             w = b .* mo(c, s)
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :c)); true)
+    # capability: mo1 value in a definition (`w = mo1(c, s)`) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
             w = mo1(c, s)
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :c)); true)
+    # capability: mo value in an unused derived definition (`m = sum(mo(c, s))`) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
             m = sum(mo(c, s))
             mu = a .+ x
             y .~ Normal.(mu, 1.0)
-        end, (:y, :c, :x))
+        end, (:y, :c, :x)); true)
 end
 
 # Hand-built monotonic plan (structure-only): `like` selects the term
@@ -247,38 +281,48 @@ end
     # Term shape: options exactly `(increments,)`, one index column,
     # summands self-addressed.
     bad = _mo_struct_plan(MonotonicTerm; vopts = NamedTuple())
+    # refused: mo term options missing increments (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     bad = _mo_struct_plan(MonotonicTerm; vopts = (increments = :s, k = 1))
+    # refused: extra mo term option (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     bad = _mo_struct_plan(MonotonicTerm; vopts = (increments = 3,))
+    # refused: non-symbol increments (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Increments must name a simplex-Dirichlet vector parameter.
     bad = _mo_struct_plan(MonotonicTerm; vopts = (increments = :sigma,))
+    # refused: increments name a non-simplex parameter (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     bad = _mo_struct_plan(MonotonicTerm; vopts = (increments = :nope,))
+    # refused: increments name an unknown parameter (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     plan = _mo_struct_plan()
     push!(plan.vector_parameters, VectorParameter(:t, :ordered_normal,
         (arg1 = 0.0, arg2 = 1.0), 2, :t))
     plan.predictors[1].terms[2] =
         TermSpec(MonotonicTerm, [:c], (increments = :t,), :c, :mo_mu_c)
+    # refused: increments name an ordered (non-simplex) vector (IR contract)
     @test_throws ContractValidationError validate_structure(plan)
     # One monotonic term per simplex; every simplex linked exactly once.
     plan = _mo_struct_plan()
     push!(plan.predictors[1].terms, TermSpec(MonotonicSummandTerm, [:c],
         (increments = :s,), :mo1_b, :mo1_b))
+    # refused: one simplex linked to two terms (IR contract; mirrors C at :180)
     @test_throws ContractValidationError validate_structure(plan)
     plan = _mo_struct_plan()
     push!(plan.vector_parameters, VectorParameter(:u, :simplex_dirichlet,
         (arg1 = [1.0],), nothing, :u))
+    # refused: unlinked simplex (IR contract)
     @test_throws ContractValidationError validate_structure(plan)
     # The mo beta needs its population prior; mo1 needs none.
     bad = _mo_struct_plan(MonotonicTerm;
         priors = PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0)])
+    # refused: mo beta missing its population prior (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     @test validate_structure(_mo_struct_plan(MonotonicSummandTerm)) === nothing
     # An explicit increments size asserts against the concentration.
     bad = _mo_struct_plan(MonotonicTerm; vsize = 3)
+    # refused: explicit increments size disagrees with concentration (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
 end
 
@@ -287,12 +331,15 @@ end
     # Codes are integers 1..K (K − 1 = concentration length).
     bad = copy(cols)
     bad[:c] = [1.0, 2.0, 3.0, 2.0, 1.0, 3.0]
+    # refused: wrong eltype, float codes for an integer level index
     @test_throws ContractValidationError bind_data(_mo_struct_plan(), bad)
     bad = copy(cols)
     bad[:c] = [1, 2, 4, 2, 1, 3]
+    # refused: level code 4 out of range 1..K
     @test_throws ContractValidationError bind_data(_mo_struct_plan(), bad)
     bad = copy(cols)
     bad[:c] = [0, 2, 3, 2, 1, 3]
+    # refused: level code 0 out of range 1..K
     @test_throws ContractValidationError bind_data(_mo_struct_plan(), bad)
     # The index is a bound raw column, never derived.
     plan = _mo_struct_plan(MonotonicTerm;
@@ -301,9 +348,11 @@ end
     push!(plan.derived, VectorAssignmentSpec(:dc, :(c .+ 0)))
     plan.predictors[1].terms[2] =
         TermSpec(MonotonicTerm, [:dc], (increments = :s,), :dc, :mo_mu_c)
+    # refused: mo index must be a bound raw data column (IR contract; may hide a capability: computed index, P8)
     @test_throws ContractValidationError bind_data(plan, cols)
     # Empty concentrations fail closed (K=1 degenerates emitter-side).
     bad = _mo_struct_plan(MonotonicTerm; vargs = (arg1 = Float64[],))
+    # refused: empty Dirichlet concentration (IR contract)
     @test_throws ContractValidationError bind_data(bad, cols)
     # Unobserved levels bind fine (level 3 absent below, K still 3).
     ok = copy(cols)
@@ -319,8 +368,7 @@ end
     @test shape.width == 2
     @test [b.kind for b in shape.blocks] == [InterceptTerm, MonotonicTerm]
     @test shape.blocks[2].labels == [:c]
-    # The mo beta rides the coefficient block, labeled by its column (a
-    # hand-built plan names no coefficient, so it reports predictor labels).
+    # The mo beta rides the coefficient block, labeled by its column.
     layout = assign_layout(bound)
     @test layout.total == 4
     @test coordinate_names(layout) ==
@@ -354,6 +402,7 @@ end
             :(_ppl_mo_s = _ppl_mo_cum_s[c]),
         ]
     end
+    # refused: monotonic_recipe with K = 1 (internal API contract)
     @test_throws ContractValidationError monotonic_recipe(:s, :c, 1)
 end
 
@@ -446,6 +495,8 @@ end
         :c => [1, 2, 1, 2],
     )
     bound = bind_data(lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 s ~ Dirichlet(1, 1.0)
                 mu = a .+ b .* mo(c, s)
                 sigma ~ Exponential(1.0)
@@ -466,12 +517,13 @@ end
 end
 
 @testset "mo mixed-predictor per-block splice" begin
-    # mo + continuous + full-cover factor (no intercept: full-cover
-    # factors are unidentified with one): the mo beta sits between static
+    # mo + continuous + full-cover factor: the mo beta sits between static
     # blocks (non-contiguous static coefficients), pinning the per-block
     # coefficient coordinates including the factor slice.
     cols = _mo_cols()
     bound = bind_data(lower_rkppl(quote
+                b ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 s ~ Dirichlet([1.0, 2.0])
                 cf[levels(g)] .~ Normal.(0.0, 2.0)
                 mu = b .* mo(c, s) .+ d .* x .+ cf[g]
@@ -479,21 +531,20 @@ end
                 y .~ Normal.(mu, sigma)
             end, (:y, :c, :x, :g)), cols)
     built = build_kernel(bound)
-    @test coordinate_names(built.layout)[1:5] == [:b, :d, Symbol("cf.1"),
-        Symbol("cf.2"), Symbol("cf.3")]
-    u = [-0.25, 0.75, 0.1, -0.2, 0.3, 0.1, 0.3]
+    @test coordinate_names(built.layout) == [:b, :d, :sigma, Symbol("s.1"),
+        Symbol("cf.1"), Symbol("cf.2"), Symbol("cf.3")]
+    u = unconstrain(built.layout, (b = -0.25, d = 0.75, sigma = exp(0.1),
+        s = simplex_constrain([0.3]), cf = [0.1, -0.2, 0.3]))
     nt = constrain(built.layout, u)
     s = Vector{Float64}(nt.s)
     contrast = _ref_contrast(s, cols[:c])
-    mu = nt.b .* contrast .+ nt.d .* cols[:x] .+
-        [nt.cf[gi] for gi in cols[:g]]
+    mu = nt.b .* contrast .+ nt.d .* cols[:x] .+ nt.cf[cols[:g]]
     ll = _ref_gauss_ll(cols[:y], mu, nt.sigma)
     pr = logpdf(Normal(0, 1), nt.b) + logpdf(Normal(0, 1), nt.d) +
         sum(logpdf(Normal(0, 2), b) for b in nt.cf) +
         logpdf(Exponential(1), nt.sigma) +
         logpdf(Dirichlet([1.0, 2.0]), s)
-    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[6] +
-        simplex_logjac([u[7]])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
     _check_gradient(built.spec, bound, u)
 end
 
@@ -610,6 +661,8 @@ end
         # u = [0.6, -0.2, 0.1, 0.3, -0.4]. SB full -102.66411213599827.
         cols = _mo_m1_cols()
         bound = bind_data(lower_rkppl(quote
+                    a ~ Normal(0, 1)
+                    b ~ Normal(0, 1)
                     s ~ Dirichlet([1.0, 2.0, 3.0])
                     mu = a .+ b .* mo(c, s)
                     sigma ~ Exponential(1.0)
@@ -651,6 +704,7 @@ end
         # u = [0.5, 0.1, 0.3]. SB full -88.588255516339331.
         cols = _mo_m2_cols()
         bound = bind_data(lower_rkppl(quote
+                    a ~ Normal(0, 1)
                     s ~ Dirichlet([1.0, 2.0])
                     mu = a .+ mo1(c, s)
                     sigma ~ Exponential(1.0)

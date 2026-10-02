@@ -22,14 +22,193 @@ response:
 end
 ```
 
-At `y ~ ordered_logistic(eta)` the cutpoints are `y_cutpoints`; the plan is
-the hand-written two statements above with `y_cutpoints`. To use a different
+At `y ~ ordered_logistic(eta)` the cutpoints are local `y.cutpoints` and
+restored as `nt.y.cutpoints`. To use a different
 prior, write those statements yourself.
 """
 @rkppl ordered_logistic(eta) = begin
     cutpoints ~ Ordered(Normal(0, 1), length(levels(y)) - 1)
     y .~ OrderedLogistic.(eta, Ref(cutpoints))
     return y
+end
+
+"""
+    f ~ penalized_smooth(X, Z)
+
+Shipped latent submodel for a penalized spline over the bases of
+[`tps_basis`](@ref): `X` the unpenalized null-space columns, `Z` the
+penalized (whitened) range-space columns. Its body states every prior:
+
+```julia
+@rkppl penalized_smooth(X, Z) = begin
+    b[axes(X, 2)] .~ Flat.()
+    sd ~ HalfNormal(1)
+    z[axes(Z, 2)] .~ Normal.(0, 1)
+    return X * b .+ Z * (sd .* z)
+end
+```
+
+At `f ~ penalized_smooth(Xf, Zp)` the parameters are `f.b`, `f.sd` and
+`f.z` (restored as `nt.f.b`, `nt.f.sd`, `nt.f.z`), and bare `f` is one value
+per observation:
+
+```julia
+(Xf, Zp) = tps_basis(x; k = 10)
+f ~ penalized_smooth(Xf, Zp)
+mu = a .+ f
+```
+
+The null-space coefficients are flat, as in the built-in `spline_basis`;
+the smoothing sd is a proper half-Normal (the built-in's is Stan's
+unnormalized half, `log(2)` lower). To change a prior, write the
+statements yourself.
+"""
+@rkppl penalized_smooth(X, Z) = begin
+    b[axes(X, 2)] .~ Flat.()
+    sd ~ HalfNormal(1)
+    z[axes(Z, 2)] .~ Normal.(0, 1)
+    return X * b .+ Z * (sd .* z)
+end
+
+"""
+    f ~ t2_smooth(X, Zrr, Zrn, Znr)
+
+Shipped latent submodel for a tensor-product (`t2`) spline over the bases
+of [`t2_basis`](@ref): one flat null-space block and three penalized
+blocks, each with its own smoothing sd. Its body:
+
+```julia
+@rkppl t2_smooth(X, Zrr, Zrn, Znr) = begin
+    b[axes(X, 2)] .~ Flat.()
+    sd[1:3] .~ HalfNormal.(1)
+    z_rr[axes(Zrr, 2)] .~ Normal.(0, 1)
+    z_rn[axes(Zrn, 2)] .~ Normal.(0, 1)
+    z_nr[axes(Znr, 2)] .~ Normal.(0, 1)
+    return X * b .+ Zrr * (sd[1] .* z_rr) .+ Zrn * (sd[2] .* z_rn) .+
+        Znr * (sd[3] .* z_nr)
+end
+```
+"""
+@rkppl t2_smooth(X, Zrr, Zrn, Znr) = begin
+    b[axes(X, 2)] .~ Flat.()
+    sd[1:3] .~ HalfNormal.(1)
+    z_rr[axes(Zrr, 2)] .~ Normal.(0, 1)
+    z_rn[axes(Zrn, 2)] .~ Normal.(0, 1)
+    z_nr[axes(Znr, 2)] .~ Normal.(0, 1)
+    return X * b .+ Zrr * (sd[1] .* z_rr) .+ Zrn * (sd[2] .* z_rn) .+
+        Znr * (sd[3] .* z_nr)
+end
+
+"""
+    f ~ hsgp_effect(PHI, lambda)
+
+Shipped latent submodel for an isotropic Hilbert-space approximate GP
+(exponentiated-quadratic kernel) over the basis of [`hsgp_basis`](@ref):
+`PHI` the basis columns, `lambda` their eigenvalues. Its body states every
+prior, including the length scale's validity floor:
+
+```julia
+@rkppl hsgp_effect(PHI, lambda) = begin
+    rho_floor = maximum(hsgp_rho_floors(lambda))
+    rho ~ truncated(LogNormal(0, 1), rho_floor, Inf)
+    sigma ~ LogNormal(0, 1)
+    z[axes(PHI, 2)] .~ Normal.(0, 1)
+    return PHI * (hsgp_sqrt_spd(lambda, sigma, rho) .* z)
+end
+```
+
+At `f ~ hsgp_effect(PHI, lambda)` the parameters are `f.rho`, `f.sigma` and
+`f.z` (restored under `nt.f`), and bare `f` is one value per observation:
+
+```julia
+(PHI, lambda) = hsgp_basis(x; k = 20, c = 1.5)
+f ~ hsgp_effect(PHI, lambda)
+mu = a .+ f
+```
+
+The floor `rho_floor` is the smallest length scale the `k`-term basis
+resolves; the built-in `hsgp_basis(:id, x)` applies the same floor with
+Stan's unnormalized lower-bound kernel (here the truncation is normalized,
+a data constant apart). Several axes take one shared length scale
+(`hsgp_basis(x, z; ...)`); for one length scale per axis, write the
+statements with `hsgp_sqrt_spd(lambda, sigma, [rho_1, rho_2])`.
+"""
+@rkppl hsgp_effect(PHI, lambda) = begin
+    rho_floor = maximum(hsgp_rho_floors(lambda))
+    rho ~ truncated(LogNormal(0, 1), rho_floor, Inf)
+    sigma ~ LogNormal(0, 1)
+    z[axes(PHI, 2)] .~ Normal.(0, 1)
+    return PHI * (hsgp_sqrt_spd(lambda, sigma, rho) .* z)
+end
+
+"""
+    f ~ hsgp_periodic_effect(PHI, harmonics)
+
+Shipped latent submodel for a periodic-kernel Hilbert-space approximate GP
+over the basis of [`hsgp_periodic_basis`](@ref). Its body:
+
+```julia
+@rkppl hsgp_periodic_effect(PHI, harmonics) = begin
+    rho_floor = hsgp_periodic_rho_floor(harmonics)
+    rho ~ truncated(LogNormal(0, 1), rho_floor, Inf)
+    sigma ~ LogNormal(0, 1)
+    z[axes(PHI, 2)] .~ Normal.(0, 1)
+    return PHI * (hsgp_periodic_sqrt_spd(harmonics, sigma, rho) .* z)
+end
+```
+"""
+@rkppl hsgp_periodic_effect(PHI, harmonics) = begin
+    rho_floor = hsgp_periodic_rho_floor(harmonics)
+    rho ~ truncated(LogNormal(0, 1), rho_floor, Inf)
+    sigma ~ LogNormal(0, 1)
+    z[axes(PHI, 2)] .~ Normal.(0, 1)
+    return PHI * (hsgp_periodic_sqrt_spd(harmonics, sigma, rho) .* z)
+end
+
+"""
+    f ~ hsgp_grouped_effect(PHI, lambda, g)
+
+Shipped latent submodel for a grouped Hilbert-space approximate GP: one
+curve per level of `g`, over the grouped basis `hsgp_basis(x; k, by = g)`
+(see [`hsgp_basis`](@ref)), with per-group length scales and marginal
+scales from log-linear hyper-predictors. Every prior is a statement:
+
+```julia
+@rkppl hsgp_grouped_effect(PHI, lambda, g) = begin
+    rho_floor = maximum(hsgp_rho_floors(lambda))
+    rho_mu ~ Normal(0, 1)
+    rho_sd ~ HalfNormal(1)
+    rho_z[levels(g)] .~ Normal.(0, 1)
+    rho = max.(exp.(rho_mu .+ rho_sd .* rho_z), rho_floor)
+    sigma_mu ~ Normal(0, 1)
+    sigma_sd ~ HalfNormal(1)
+    sigma_z[levels(g)] .~ Normal.(0, 1)
+    sigma = exp.(sigma_mu .+ sigma_sd .* sigma_z)
+    z[axes(PHI, 2)] .~ Normal.(0, 1)
+    return PHI * (hsgp_grouped_sqrt_spd(lambda, sigma, rho) .* z)
+end
+```
+
+The per-group offsets `rho_z` and `sigma_z` have one element per level of
+`g`, in `levels(g)` order (the grouped basis's group order). Each group's
+length scale is clamped at the validity floor, as in the
+built-in `hsgp_basis(...; by = g, length_scale = 1 + (1 | g))` (decision
+`0z5bsqi`, prong `group_floor`); the clamp has zero gradient below the
+floor. For a shared length scale or marginal scale, write the statements
+with a scalar `rho` or `sigma`.
+"""
+@rkppl hsgp_grouped_effect(PHI, lambda, g) = begin
+    rho_floor = maximum(hsgp_rho_floors(lambda))
+    rho_mu ~ Normal(0, 1)
+    rho_sd ~ HalfNormal(1)
+    rho_z[levels(g)] .~ Normal.(0, 1)
+    rho = max.(exp.(rho_mu .+ rho_sd .* rho_z), rho_floor)
+    sigma_mu ~ Normal(0, 1)
+    sigma_sd ~ HalfNormal(1)
+    sigma_z[levels(g)] .~ Normal.(0, 1)
+    sigma = exp.(sigma_mu .+ sigma_sd .* sigma_z)
+    z[axes(PHI, 2)] .~ Normal.(0, 1)
+    return PHI * (hsgp_grouped_sqrt_spd(lambda, sigma, rho) .* z)
 end
 
 """
@@ -93,9 +272,12 @@ x ~ differenced_ar1(beta, sigma_d)
 mu = a .+ x
 ```
 
-At `x ~ differenced_ar1(...)` the carried arrays are `x_level` and
-`x_increment` and the innovations are the `T - 1` coordinates of
-`_ppl_scan_z_x_level`.
+At `x ~ differenced_ar1(...)` the carried arrays are local `x.level` and
+`x.increment`. The existing non-centered scan packing stores its `T - 1`
+innovations as `nt.x._ppl_scan_z_level`; coordinate labels start with
+`x._ppl_scan_z_level`. Bare `x` returns the level trajectory.
+If an authored local already has a generated block's name, the generated
+draw name takes the first free numeric suffix; the authored local keeps its name.
 """
 @rkppl differenced_ar1(beta, sigma) = begin
     @scan begin
@@ -131,7 +313,7 @@ end
 
 Use it as `b ~ r2d2_coefs(X, [1.0, 1.0])` and `mu = a .+ X * b`, with the
 intercept `a` and its prior stated outside. At that use site the draws are
-`b_R2`, `b_phi`, `b_tau` and the coefficients `b_b`; `varx` is the sample
+`nt.b.R2`, `nt.b.phi`, `nt.b.tau` and the coefficients `nt.b.b`; `varx` is the sample
 variance (N − 1) of each column, computed once at `bind_data`.
 
 The coefficient sd is `tau * sqrt(phi_k * R2 / var(x_k))` with an
@@ -167,7 +349,8 @@ end
 
 Use it as `b ~ horseshoe_coefs(X)` and `mu = a .+ X * b`, with the
 intercept `a` and its prior stated outside. At that use site the draws are
-`b_tau`, `b_lambda` and `b_z`, and `b = b_z .* b_lambda .* b_tau` is the
+`nt.b.tau`, `nt.b.lambda` and `nt.b.z`, and bare `b` returns `z .* lambda .* tau`
+from that scope. This is the
 coefficient vector, so each coefficient is `Normal(0, lambda_k * tau)`
 given its scales. The halves are Distributions-normalized
 (`truncated(Cauchy(0, s), 0, Inf)`). For a different prior, write the
@@ -206,7 +389,7 @@ end
 
 `b` is a vector over `levels(g)`: `b[g]` is each observation's
 coefficient (a varying intercept), `x .* b[g]` a varying slope. Draws are
-`b_sd` and `b_z`. For multi-membership, pass the union of the membership
+`nt.b.sd` and `nt.b.z`. For multi-membership, pass the union of the membership
 columns as one data definition (`gg = vcat(g1, g2)`; `b ~
 varying_coefs(gg)`) and weight the gathers (`b[g1] ./ 2 .+ b[g2] ./ 2`).
 """
@@ -235,7 +418,7 @@ end
 `b` is a `levels(g) × K` matrix: margin `k` of observation `i` is
 `b[g, k]`, so a correlated varying intercept and slope read
 `b[g, 1] .+ x .* b[g, 2]`. Draws are
-`b_sd`, `b_L` and `b_z`.
+`nt.b.sd`, `nt.b.L` and `nt.b.z`.
 """
 @rkppl varying_coefs_correlated(g, K) = begin
     sd[1:K] .~ HalfNormal.(1)
@@ -260,7 +443,7 @@ end
 ```
 
 Read it like [`varying_coefs`](@ref): `b[g]`, `x .* b[g]`. Draws are
-`b_sd` and `b_c`.
+`nt.b.sd` and `nt.b.c`.
 """
 @rkppl varying_coefs_centered(g) = begin
     sd ~ HalfNormal(1)
@@ -288,7 +471,7 @@ end
 
 Read it like [`varying_coefs_correlated`](@ref): margin `k` of
 observation `i` is `b[g, k]`, so `b[g, 1] .+ x .* b[g, 2]`. Draws are
-`b_sd`, `b_L` and `b_c`.
+`nt.b.sd`, `nt.b.L` and `nt.b.c`.
 """
 @rkppl varying_coefs_centered_correlated(g, K) = begin
     sd[1:K] .~ HalfNormal.(1)
@@ -313,10 +496,48 @@ end
 ```
 
 `u` is one value per observation: a varying intercept is `u`, a varying
-slope `x .* u`. Draws are `u_sd` and `u_z`.
+slope `x .* u`. Draws are `nt.u.sd` and `nt.u.z`.
 """
 @rkppl varying_stratified(g, s) = begin
     sd[levels(s)] .~ HalfNormal.(1)
     z[levels(g)] .~ Normal.(0, 1)
     return sd[s] .* z[g]
+end
+
+"""
+    u ~ varying_stratified_correlated(g, s, K)
+
+Stratified correlated margins: each stratum (level of `s`) has its own
+`K` sds and its own `LKJCholesky(K, 1.0)` factor, the levels of `g` share
+`z`, and observation `i` reads the row
+`(sd[s[i], :] .* L[s[i]]) * z[g[i], :]`. Its body:
+
+```julia
+@rkppl varying_stratified_correlated(g, s, K) = begin
+    sd[levels(s), 1:K] .~ HalfNormal.(1)
+    @plate for k in levels(s)
+        L[k] ~ LKJCholesky(K, 1.0)
+    end
+    z[levels(g), 1:K] .~ Normal.(0, 1)
+    @plate for i in eachindex(g)
+        b[i, 1:K] = (sd[s[i], :] .* L[s[i]]) * z[g[i], :]
+    end
+    return b
+end
+```
+
+`u` has one row per observation: margin `k` is the column `u[:, k]`, so a
+correlated intercept and slope read `u[:, 1] .+ x .* u[:, 2]`. Draws are
+`nt.u.sd`, `nt.u.L` (`nt.u.L[:, :, k]` stratum k's factor) and `nt.u.z`.
+"""
+@rkppl varying_stratified_correlated(g, s, K) = begin
+    sd[levels(s), 1:K] .~ HalfNormal.(1)
+    @plate for k in levels(s)
+        L[k] ~ LKJCholesky(K, 1.0)
+    end
+    z[levels(g), 1:K] .~ Normal.(0, 1)
+    @plate for i in eachindex(g)
+        b[i, 1:K] = (sd[s[i], :] .* L[s[i]]) * z[g[i], :]
+    end
+    return b
 end

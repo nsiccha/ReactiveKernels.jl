@@ -2,10 +2,9 @@
 # `names`; hunt-emitter `0m1j3iz`, prong `coef-priors`). Every coordinate
 # and every constrained draw is named after an author declaration: a
 # scalar `b`, an element `c.2` of a declared vector, a submodel local by
-# its namespaced `<lhs>_<name>`. A coefficient's use-site sign negates its
-# design column, so its prior stays as written. The legacy
-# predictor-qualified labels (`mu.Intercept`) stay selectable with
-# `naming = :predictor` until the built-ins are removed.
+# its scoped `<lhs>.<name>` path. An ordinary coefficient keeps its
+# declared prior when a use-site sign negates its contribution. Legacy
+# hand-built coefficient packs retain their predictor-qualified labels.
 using ReactiveKernelsPPL
 using Test
 using Distributions
@@ -76,7 +75,7 @@ end
 
 # Every name a program declares: `~` / `.~` left-hand sides (through
 # `@plate` bodies), with a submodel call `lhs ~ sm(...)` contributing its
-# body's declarations namespaced as `lhs_<name>` (nesting composes).
+# body's declarations scoped as `lhs.<name>` (nesting composes).
 function _nm_declared(ex, prefix::String = "", out = Set{Symbol}())
     ex isa Expr || return out
     if ex.head === :call && length(ex.args) == 3 && ex.args[1] in (:~, :.~)
@@ -87,7 +86,7 @@ function _nm_declared(ex, prefix::String = "", out = Set{Symbol}())
         push!(out, Symbol(prefix, base))
         sm = _nm_submodel(ex.args[3])
         sm === nothing ||
-            _nm_declared(sm.body, string(prefix, base, "_"), out)
+            _nm_declared(sm.body, string(prefix, base, "."), out)
         return out
     end
     foreach(a -> _nm_declared(a, prefix, out), ex.args)
@@ -95,7 +94,16 @@ function _nm_declared(ex, prefix::String = "", out = Set{Symbol}())
 end
 
 # A coordinate name's declared stem: `b`, `c.2` → `c`, `Z.1.2` → `Z`.
-_nm_stem(n::Symbol) = Symbol(first(split(string(n), '.')))
+_nm_stem(n::Symbol) = Symbol(replace(string(n), r"(?:\.\d+)+$" => ""))
+
+function _nm_draw_paths(nt::NamedTuple, prefix::String = "", out = Set{Symbol}())
+    for (name, value) in pairs(nt)
+        path = string(prefix, name)
+        value isa NamedTuple ? _nm_draw_paths(value, path * ".", out) :
+            push!(out, Symbol(path))
+    end
+    return out
+end
 
 @testset "names battery: coordinates are author names" begin
     for name in _NM_BATTERY
@@ -112,15 +120,12 @@ _nm_stem(n::Symbol) = Symbol(first(split(string(n), '.')))
             end
             u = collect(range(-0.4, 0.4; length = lay.total))
             nt = constrain(lay, u)
-            for k in keys(nt)
-                @test k in declared
-            end
+            @test _nm_draw_paths(nt) ⊆ declared
             @test unconstrain(lay, nt) ≈ u
-            # The naming never changes the packing.
-            legacy = assign_layout(plan; naming = :predictor)
-            @test [(e.offset, e.size) for e in legacy.entries] ==
-                  [(e.offset, e.size) for e in lay.entries]
-            @test length(coordinate_names(legacy)) == lay.total
+            restored = restore_draws(lay, hcat(u, u))
+            @test _nm_draw_paths(restored) == _nm_draw_paths(nt)
+            @test _nm_draw_paths(restore_draws(lay, zeros(lay.total, 0))) ==
+                  _nm_draw_paths(nt)
         end
     end
 end
@@ -161,10 +166,6 @@ end
             logpdf(Exponential(1.0), q.sigma) +
             nll(q.a .- q.b .* x, q.sigma))
     @test coordinate_names(lay) == [:a, :b, :sigma]
-    pr = only(p for p in bound.population_priors if p.addressee === :x)
-    @test (pr.family, pr.location, pr.scale) == (:uniform, 0.0, 2.0)
-    @test only(t for t in only(bound.predictors).terms
-        if t.kind === ContinuousTerm).sign == -1
     draws = restore_draws(lay, randn(lay.total, 50))
     @test all(0 .< draws.b .< 2)
     # A negated intercept, factor and matrix, and a name-located prior.
@@ -224,32 +225,21 @@ end
     @test Base.invokelatest(kern, u) ≈ want + logjac(lay, u) rtol = 1e-12
 end
 
-@testset "names: legacy predictor labels stay selectable" begin
+@testset "names: restored draws preserve author keys and shapes" begin
     plan = _nm_bound("01_gaussian")
     lay = assign_layout(plan)
-    old = assign_layout(plan; naming = :predictor)
-    @test lay.naming === :author && old.naming === :predictor
     @test coordinate_names(lay) == [:a, :b, :sigma]
-    @test coordinate_names(old) ==
-          [Symbol("mu.Intercept"), Symbol("mu.x"), :sigma]
     u = [0.3, -0.2, 0.1]
     @test constrain(lay, u) == (a = 0.3, b = -0.2, sigma = exp(0.1))
-    @test constrain(old, u) == (mu = [0.3, -0.2], sigma = exp(0.1))
-    @test unconstrain(old, constrain(old, u)) ≈ u
-    @test build_kernel(plan; naming = :predictor).layout.naming === :predictor
     U = [0.3 0.1; -0.2 0.0; 0.1 -0.1]
     @test keys(restore_draws(lay, U)) == (:a, :b, :sigma)
     @test restore_draws(lay, U).b == [-0.2, 0.0]
-    @test restore_draws(old, U).mu == U[1:2, :]
-    # Zero draws keep the keys and shapes of one constrained draw.
     none = restore_draws(lay, zeros(3, 0))
     @test keys(none) == (:a, :b, :sigma)
     @test none.b == Float64[]
     vec_plan = _nm_bound("10_levels_prior")
     vnone = restore_draws(assign_layout(vec_plan), zeros(3, 0))
     @test size(vnone.c) == (3, 0)
-    # refused: a layout reports under one of the two naming schemes (`1cmodra` names)
-    @test_throws ContractValidationError assign_layout(plan; naming = :labels)
 end
 
 @testset "names: a hand-built plan without names keeps predictor keys" begin
@@ -272,13 +262,6 @@ end
     @test coordinate_names(lay) ==
           [Symbol("mu.Intercept"), Symbol("mu.x"), :sigma]
     @test keys(constrain(lay, zeros(3))) == (:mu, :sigma)
-    # refused: only a coefficient-carrying term names a coefficient (`1cmodra` names)
-    bad = PredictorSpec(:mu, IdentityLink,
-        TermSpec[TermSpec(OffsetTerm, [:x], NamedTuple(), :x, :x_off, :b, 1)],
-        :mu)
-    @test_throws ContractValidationError validate_plan(StructuralPlan(
-        plan.responses, [bad], PopulationPrior[], plan.parameters,
-        AssignmentSpec[], cols, 8))
 end
 
 @rkppl nm_line(xx) = begin
@@ -307,11 +290,12 @@ end
     plan = bind_data(lower_rkppl(prog, (:y, :x, :g); mod = @__MODULE__), cols)
     lay = assign_layout(plan)
     declared = _nm_declared(prog)
-    @test Set([:mu_l_a, :mu_l_b, :mu_r_sg, :mu_r_c]) ⊆ declared
+    @test Set([Symbol("mu.l.a"), Symbol("mu.l.b"),
+        Symbol("mu.r.sg"), Symbol("mu.r.c")]) ⊆ declared
     names = coordinate_names(lay)
-    @test Set(_nm_stem.(names)) == Set([:mu_l_a, :mu_l_b, :mu_r_sg, :mu_r_c,
-        :sigma])
+    @test Set(_nm_stem.(names)) == Set([Symbol("mu.l.a"), Symbol("mu.l.b"), Symbol("mu.r.sg"),
+        Symbol("mu.r.c"), :sigma])
     nt = constrain(lay, zeros(lay.total))
-    @test nt.mu_r_c isa Vector{Float64} && length(nt.mu_r_c) == 3
-    @test nt.mu_l_b isa Float64
+    @test nt.mu.r.c isa Vector{Float64} && length(nt.mu.r.c) == 3
+    @test nt.mu.l.b isa Float64
 end

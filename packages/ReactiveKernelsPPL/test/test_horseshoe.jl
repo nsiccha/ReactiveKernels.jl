@@ -7,6 +7,7 @@ using Test
 
 function _horseshoe_demo()
     return quote
+        a ~ Normal(0, 1)
         b1 ~ Horseshoe()
         b2 ~ Horseshoe(local_scale = 0.5, global_scale = 0.25)
         mu = a .+ b1 .* x1 .+ b2 .* x2
@@ -64,6 +65,7 @@ end
     # Both keyword spellings land on the entry (bare `:kw` and
     # `:parameters`-wrapped — neither may silently default).
     wrapped = lower_rkppl(quote
+            a ~ Normal(0, 1)
             b1 ~ Horseshoe(; global_scale = 0.25)
             mu = a .+ b1 .* x1
             sigma ~ Exponential(1.0)
@@ -116,6 +118,7 @@ end
 
 @testset "horseshoe negative use carries the sign" begin
     bound = bind_data(lower_rkppl(quote
+                a ~ Normal(0, 1)
                 b1 ~ Horseshoe()
                 mu = a .- b1 .* x1
                 sigma ~ Exponential(1.0)
@@ -123,12 +126,8 @@ end
             end, Set([:x1, :y])),
         Dict{Symbol,AbstractVector}(:x1 => [0.5, -1.0, 1.5, 0.0],
             :y => [1.0, 2.0, 1.5, 2.5]))
-    # The sign negates the design column (`TermSpec.sign`), so the derived
-    # horseshoe coefficient is `b1` itself (user decision `0m1j3iz`).
     entry = only(bound.horseshoe_priors)
-    @test entry.sign == 1
-    @test only(t for t in only(bound.predictors).terms
-        if t.kind === ContinuousTerm).sign == -1
+    @test entry.sign == -1
     built = build_kernel(bound)
     # Layout: sigma, intercept scalar, x1 triple.
     u = [0.5, 0.1, -0.2, 0.3, 0.4]
@@ -150,20 +149,25 @@ end
     cols = _horseshoe_cols()
     # Non-scalar terms are out of the slice.
     fac = quote
-        c ~ Horseshoe()
+        a ~ Normal(0, 1)
+        c[levels(g)] .~ Horseshoe()
         mu = a .+ c[g]
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, sigma)
     end
-    @test_throws SurfaceLoweringError lower_rkppl(fac, Set([:g, :y]))
+    # capability: horseshoe on factor/indexed coefficients c[g]`) (todo `1308iv0`)
+    @test_broken (lower_rkppl(fac, Set([:g, :y])); true)
     mo = quote
+        a ~ Normal(0, 1)
+        b1 ~ Normal(0, 1)
         s ~ Dirichlet([1.0, 1.0])
         b3 ~ Horseshoe()
         mu = a .+ b1 .* x1 .+ b3 .* mo(c, s)
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, sigma)
     end
-    @test_throws SurfaceLoweringError lower_rkppl(mo, Set([:x1, :c, :y]))
+    # capability: horseshoe on an mo() term coefficient (flat-slice limit) (todo `1308iv0`)
+    @test_broken (lower_rkppl(mo, Set([:x1, :c, :y])); true)
     # One structured prior per predictor.
     both = quote
         R2 ~ Beta(1.0, 1.0)
@@ -174,31 +178,44 @@ end
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, sigma)
     end
+    # refused: a Horseshoe prior plus an r2d2 decomposition on one coefficient is a double prior
     @test_throws SurfaceLoweringError lower_rkppl(both, Set([:x1, :x2, :y]))
-    # SB keyword contract: no positionals, known keywords only,
-    # finite strictly-positive literal scales (Bool rejected).
+    # Unknown arguments and invalid scale literals violate the library
+    # signature/domain; Bool and sampled scales are valid numeric values.
     for rhs in (:(Horseshoe(0.5)), :(Horseshoe(scale = 0.5)),
             :(Horseshoe(local_scale = 0.0)), :(Horseshoe(global_scale = -0.1)),
             :(Horseshoe(local_scale = Inf)), :(Horseshoe(local_scale = true)),
             :(Horseshoe(local_scale = s)))
         bad = quote
+            a ~ Normal(0, 1)
+            s ~ Exponential(1)
             b1 ~ $rhs
             mu = a .+ b1 .* x1
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
         end
-        @test_throws SurfaceLoweringError lower_rkppl(bad, Set([:x1, :y]))
+        if rhs in (:(Horseshoe(local_scale = true)), :(Horseshoe(local_scale = s)))
+            # capability: Bool and sampled Horseshoe scale arguments
+            # (10gzbm9 bool-values; P8 1cmodra; todo `0fkd9yk`).
+            @test_broken (lower_rkppl(bad, Set([:x1, :y])); true)
+        else
+            # refused: unknown/positional arguments or a non-finite,
+            # non-positive scale literal (Julia signature/domain, P3).
+            @test_throws SurfaceLoweringError lower_rkppl(bad, Set([:x1, :y]))
+        end
     end
     # A horseshoe coefficient aliased as a scale stays loud (the
     # single-assignment gate, ahead of scale admission).
     aliased = quote
+        a ~ Normal(0, 1)
         b1 ~ Horseshoe()
         s = b1
         mu = a .+ b1 .* x1
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, s)
     end
-    @test_throws SurfaceLoweringError lower_rkppl(aliased, Set([:x1, :y]))
+    # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (lower_rkppl(aliased, Set([:x1, :y])); true)
     # Structural coverage (hand-built plans): exactly one prior per key,
     # triples present with half-Cauchy geometry.
     good = lower_rkppl(_horseshoe_demo(), Set([:x1, :x2, :y]))
@@ -214,6 +231,7 @@ end
         spline_vectors = good.spline_vectors, hsgp_bases = good.hsgp_bases,
         kernel_plates = good.kernel_plates, r2d2_priors = good.r2d2_priors,
         horseshoe_priors = good.horseshoe_priors)
+    # refused: population prior duplicating a horseshoe key (IR contract)
     @test_throws ContractValidationError validate_structure(dup)
     dropped = StructuralPlan(good.responses, good.predictors,
         good.population_priors,
@@ -228,5 +246,6 @@ end
         spline_vectors = good.spline_vectors, hsgp_bases = good.hsgp_bases,
         kernel_plates = good.kernel_plates, r2d2_priors = good.r2d2_priors,
         horseshoe_priors = good.horseshoe_priors)
+    # refused: horseshoe triple missing lambda (IR contract)
     @test_throws ContractValidationError validate_structure(dropped)
 end

@@ -1787,7 +1787,7 @@ function _replicated_dependency_analysis(p::Plan, batched)
 end
 
 @inline function _replicated_validate_axes(
-        args::Tuple, ::Val{B}, ::Type{BT}) where {B,BT}
+        args::Tuple, ::Val{B}, ::Type{BT})::Int where {B,BT}
     replica_count = _replica_batch_count(getfield(args, first(B)), BT.parameters[1])
     for (position, index) in enumerate(B)
         count = _replica_batch_count(getfield(args, index), BT.parameters[position])
@@ -1803,10 +1803,24 @@ end
         arg::AbstractArray{T,N}, replica_index) where {T,N}
     copy(selectdim(arg, N, replica_index))
 end
-@inline _replicated_project(arg::NamedTuple, index) =
-    map(value -> _replicated_project(value, index), arg)
-@inline _replicated_project(arg::Tuple, index) =
-    map(value -> _replicated_project(value, index), arg)
+# Expand only the record's type-defined fields. Recursing through `map` at
+# runtime can widen nested leaf types inside a generated position residual,
+# turning the authored arithmetic loops into boxed dynamic dispatch. Array
+# lengths and the position count never participate in this structural walk.
+function _replicated_record_projection(arg, T, index, lane = nothing)
+    (T <: Union{Tuple,NamedTuple} && isconcretetype(T)) || return lane === nothing ?
+        :(_replicated_project($arg, $index)) :
+        :(_replicated_project!($lane, $arg, $index))
+    fields = Any[_replicated_record_projection(
+        :(getfield($arg, $i)), fieldtype(T, i), index,
+        lane === nothing ? nothing : :(getfield($lane, $i))) for i in 1:fieldcount(T)]
+    values = Expr(:tuple, fields...)
+    T <: NamedTuple ? :(NamedTuple{$(QuoteNode(fieldnames(T)))}($values)) : values
+end
+@inline @generated function _replicated_project(arg::T, index) where {T<:Union{Tuple,NamedTuple}}
+    isconcretetype(T) ? _replicated_record_projection(:arg, T, :index) :
+        :(map(value -> _replicated_project(value, index), arg))
+end
 
 # A batched dense numeric array port projects every position into one lane
 # buffer of the projection's own type (`Array{T,N-1}`), so the scalar residual
@@ -1820,6 +1834,15 @@ _replicated_lane(arg::Vector{<:Number}) = nothing
 _replicated_lane(arg::Array{T,N}) where {T<:Number,N} =
     Array{T,N - 1}(undef, Base.front(size(arg)))
 _replicated_lane(arg::Union{Tuple,NamedTuple}) = map(_replicated_lane, arg)
+
+# Dense trailing-axis slices are contiguous. Only expose one when the scalar
+# port admits its type; concrete Array ports retain their copying lane.
+struct _ReplicatedViewLane end
+_replicated_lane(arg, ::Type) = _replicated_lane(arg)
+@inline @generated function _replicated_lane(arg::Array{T,N}, ::Type{V}) where {T<:Number,N,V}
+    _replicated_column_admitted(Array{T,N}, V) ?
+        :(_ReplicatedViewLane()) : :(_replicated_lane(arg))
+end
 # A borrowed reader keeps its dense lanes between calls (`_borrowed_batch`).
 _replicated_lane!(slot, arg) = _replicated_lane(arg)
 _replicated_lane!(slot, arg::Vector{<:Number}) = nothing
@@ -1830,22 +1853,43 @@ _replicated_lane!(slot, arg::Vector{<:Number}) = nothing
     slot[] = fresh
     fresh
 end
+_replicated_lane!(slot, arg, ::Type) = _replicated_lane!(slot, arg)
+@inline @generated function _replicated_lane!(slot, arg::Array{T,N}, ::Type{V}) where {T<:Number,N,V}
+    _replicated_column_admitted(Array{T,N}, V) ?
+        :(_ReplicatedViewLane()) : :(_replicated_lane!(slot, arg))
+end
 @inline _replicated_project!(::Nothing, arg, index) = _replicated_project(arg, index)
+@inline _replicated_project!(::_ReplicatedViewLane, arg::Array{T,N}, index) where {T,N} =
+    selectdim(arg, N, index)
 @inline function _replicated_project!(lane::Array{T}, arg::Array{T,N}, index) where {T,N}
     count = length(lane)
     copyto!(lane, 1, arg, (index - 1) * count + 1, count)
 end
-@inline _replicated_project!(lane::Tuple, arg::Tuple, index) =
-    map((item, value) -> _replicated_project!(item, value, index), lane, arg)
-@inline _replicated_project!(lane::NamedTuple{K}, arg::NamedTuple{K}, index) where {K} =
-    map((item, value) -> _replicated_project!(item, value, index), lane, arg)
+@inline @generated function _replicated_project!(lane::Tuple, arg::T, index) where {T<:Tuple}
+    isconcretetype(T) ? _replicated_record_projection(:arg, T, :index, :lane) :
+        :(map((item, value) -> _replicated_project!(item, value, index), lane, arg))
+end
+@inline @generated function _replicated_project!(lane::NamedTuple{K}, arg::T, index) where {K,T<:NamedTuple{K}}
+    isconcretetype(T) ? _replicated_record_projection(:arg, T, :index, :lane) :
+        :(map((item, value) -> _replicated_project!(item, value, index), lane, arg))
+end
 
-# The previous call's lane buffer for a WANT declared as a dense array, kept by
-# a borrowed reader; any other WANT starts each call by allocating.
-@inline _replicated_recycled(slot, ::Type) = nothing
-@inline function _replicated_recycled(slot, ::Type{A}) where {A<:Array}
+# A borrowed reader's first-position scratch. Its producer checks element
+# type and shape in `_lane_reuse`, including for undeclared array WANTs.
+@inline function _replicated_recycled(slot, ::Type{V}) where {V}
     buffer = slot[]
-    buffer isa A ? buffer : nothing
+    buffer isa V ? buffer : nothing
+end
+_replicated_output_lane(destination, ::Type, index) = nothing
+@inline @generated function _replicated_output_lane(destination::Array{T,N}, ::Type{V}, index) where {T,N,V}
+    _replicated_column_admitted(Array{T,N}, V) ?
+        :(selectdim(destination, $N, index)) : nothing
+end
+
+@inline _replicated_same_column(value, destination, index) = false
+@inline function _replicated_same_column(value::SubArray, destination, index)
+    parent(value) === destination &&
+        parentindices(value) == (ntuple(d -> Base.Slice(Base.OneTo(size(destination, d))), ndims(destination) - 1)..., index)
 end
 
 @inline function _replicated_output(::Type{T}, replica_count) where {T<:Number}
@@ -1866,6 +1910,7 @@ end
         throw(DimensionMismatch("position outputs must have the same shape at every position"))
     eltype(destination) === eltype(value) || throw(ArgumentError(
         "position outputs must have the same numeric element type at every position"))
+    _replicated_same_column(value, destination, replica_index) && return destination
     copyto!(selectdim(destination, ndims(destination), replica_index), value)
     destination
 end
@@ -2016,10 +2061,10 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
         ast, ops
     end
     # A WANT whose residual producer is an authored plate or scan receives the
-    # previous position's value of that WANT as its buffer (`recycle`, see
-    # `_lower_with_ops`): it was copied into the stacked result, so the next
-    # position overwrites it instead of allocating. A borrowed reader keeps it
-    # between calls when the WANT is declared as a dense array.
+    # first position's value as scratch (`recycle`, see `_lower_with_ops`).
+    # Later positions write into the owned destination column when its type
+    # admits a view, or reuse the scratch. A borrowed reader keeps that scratch
+    # between calls, with its producer checking element type and axes.
     nout, nhave = length(p.want), length(p.have)
     recycle = Pair{Int,Symbol}[]
     recycle_wants = Int[]
@@ -2128,8 +2173,8 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
         lane === nothing && continue
         allocation = reuse ?
             Expr(:call, GlobalRef(@__MODULE__, :_replicated_lane!),
-                 slot(nout + position), nm(v)) :
-            Expr(:call, GlobalRef(@__MODULE__, :_replicated_lane), nm(v))
+                 slot(nout + position), nm(v), valtype(v)) :
+            Expr(:call, GlobalRef(@__MODULE__, :_replicated_lane), nm(v), valtype(v))
         push!(body.args, Expr(:(=), lane, allocation))
     end
     first_recycled = Any[reuse ?
@@ -2161,16 +2206,19 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
 
     rest_body = Expr(:block)
     rest_vars = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
-    position_block!(rest_body, :replica_index, rest_vars, recycle_vars)
+    rest_recycled = Any[:(let column = $(GlobalRef(@__MODULE__, :_replicated_output_lane))(
+        $(output_vars[canon_id(g, p.want[k].id)]), $(valtype(p.want[k])), replica_index)
+        column === nothing ? $lane : column
+    end) for (lane, k) in zip(recycle_vars, recycle_wants)]
+    position_block!(rest_body, :replica_index, rest_vars, rest_recycled)
     for (output_index, v) in enumerate(p.want)
         push!(rest_body.args,
               Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
                    output_vars[canon_id(g, v.id)], :replica_index,
                    rest_vars[output_index]))
     end
-    for (lane, k) in zip(recycle_vars, recycle_wants)
-        push!(rest_body.args, :($lane = $(rest_vars[k])))
-    end
+    # Keep the first lane as scratch across calls, never a view of an escaped
+    # output. All later positions use it or their own destination column.
     push!(body.args, Expr(:for,
         Expr(:(=), :replica_index,
              Expr(:call, GlobalRef(Base, :OneTo), :replica_count)),
@@ -2717,6 +2765,25 @@ struct _ExternalizedBoundArrayCall{F,O,I,H}
     ops::O
 end
 
+# Build a call to the existing body without the RGF vararg wrapper, which
+# packs all operands into one tuple. Keeping readonly structured operands
+# beside live storage in that temporary obscures their activity. This changes
+# only the call boundary, not the generated model body or its operands.
+function _native_body_call_expr(::Type{F}, f, ops, args) where {F}
+    if F <: RuntimeGeneratedFunctions.RuntimeGeneratedFunction
+        return :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+            $f, $ops, $(args...)))
+    elseif F <: _PrecompileWarmFunction
+        # Preserve latest-world execution while building a consumer image;
+        # after loading it, enter the wrapped generated body directly.
+        direct = :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+            getfield($f, :f), $ops, $(args...)))
+        return :(ccall(:jl_generating_output, Cint, ()) == 0 ?
+                 $direct : $f($ops, $(args...)))
+    end
+    :($f($ops, $(args...)))
+end
+
 @generated function (call::_ExternalizedBoundArrayCall{F,O,I,H})(
         args::Vararg{Any,N}) where {F,O,I,H,N}
     external_count = length(I)
@@ -2725,8 +2792,8 @@ end
         "externalized bound-array call is missing hidden operands")))
     if H
         forwarded = Any[:(getfield(args,$index)) for index in 1:N]
-        return :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
-            getfield(call,:f),getfield(call,:ops),$(forwarded...)))
+        return _native_body_call_expr(
+            F, :(getfield(call,:f)), :(getfield(call,:ops)), forwarded)
     end
     replacements = Dict(index => slot for (slot, index) in enumerate(I))
     operations = Any[]
@@ -2742,7 +2809,8 @@ end
     end
     public_args = Any[
         :(getfield(args, $index)) for index in 1:public_count]
-    :(getfield(call, :f)(($(operations...),), $(public_args...)))
+    _native_body_call_expr(
+        F, :(getfield(call, :f)), Expr(:tuple, operations...), public_args)
 end
 
 """
@@ -3202,6 +3270,10 @@ end
     cache isa Array{T,N+1} && size(cache) == (size(value)..., count) ?
         cache : _replicated_output(value, count)
 end
+@inline function _replicated_reuse(cache::AbstractArray, value::SubArray{T,N,P}, count) where {T,N,P<:Array}
+    cache isa Array{T,N+1} && size(cache) == (size(value)..., count) ?
+        cache : _replicated_output(value, count)
+end
 @inline function _replicated_reuse(cache::Tuple, value::Tuple, count)
     length(cache) == length(value) || return _replicated_output(value, count)
     map((out, item) -> _replicated_reuse(out, item, count), cache, value)
@@ -3214,6 +3286,7 @@ _replicated_destination_type(::Type) = Any
 _replicated_destination_type(::Type{T}) where {T<:Number} =
     isconcretetype(T) ? Vector{T} : Any
 _replicated_destination_type(::Type{Array{T,N}}) where {T,N} = Array{T,N+1}
+_replicated_destination_type(::Type{<:SubArray{T,N,P}}) where {T,N,P<:Array} = Array{T,N+1}
 function _replicated_destination_type(::Type{T}) where {T<:Tuple}
     isconcretetype(T) || return Any
     Tuple{map(_replicated_destination_type, fieldtypes(T))...}

@@ -49,6 +49,8 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
 @testset "vm surface admission" begin
     @testset "literal kappa, exact head" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, 1.7)
             end, (:y, :x))
@@ -65,6 +67,8 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
     end
     @testset "Gamma-sampled kappa, circular head" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 kappa ~ Gamma(2.0, 0.1)
                 mu = a .+ b .* x
                 y .~ CircularVonMises.(mu, kappa, -pi, pi)
@@ -72,10 +76,12 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
         r = only(plan.responses)
         @test (r.family, r.scale, r.interval) ===
             (VonMisesFam, :kappa, (-Float64(pi), Float64(pi)))
-        @test only(plan.parameters).family === :gamma
+        @test only(p for p in plan.parameters if p.name === :kappa).family === :gamma
     end
     @testset "per-observation kappa column" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, kappac)
             end, (:y, :x, :kappac))
@@ -83,6 +89,10 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
     end
     @testset "log-link predictor kappa admitted" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 mu = a .+ b .* x
                 lk = c .+ d .* x
                 y .~ CircularVonMises.(mu, exp.(lk), -pi, pi)
@@ -90,14 +100,21 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
         @test only(plan.responses).scale == ScalePredictorRef(:lk, LogLink)
     end
     @testset "non-log predictor kappa deferred" begin
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+        @test_broken (lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 mu = a .+ b .* x
                 lk = c .+ d .* x
                 y .~ VonMises.(mu, lk)
-            end, (:y, :x))
+            end, (:y, :x)); true)
     end
     @testset "shifted-interval literals" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ CircularVonMises.(mu, 1.7, 0.0, 6.283185307179586)
             end, (:y, :x))
@@ -108,6 +125,8 @@ end
 @testset "vm value parity" begin
     @testset "literal kappa, exact" begin
         _, _, kern, lay = _vm_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, 1.7)
             end, _vm_cols())
@@ -120,6 +139,8 @@ end
     end
     @testset "Gamma-sampled kappa, circular" begin
         _, _, kern, lay = _vm_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 kappa ~ Gamma(2.0, 0.1)
                 mu = a .+ b .* x
                 y .~ CircularVonMises.(mu, kappa, -pi, pi)
@@ -138,6 +159,8 @@ end
         cols = _vm_cols()
         cols[:kappac] = [0.5, 1.5, 2.5, 1.0, 2.0, 0.8]
         _, _, kern, lay = _vm_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, kappac)
             end, cols)
@@ -151,6 +174,9 @@ end
     end
     @testset "intercept-only log-kappa submodel" begin
         _, _, kern, lay = _vm_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
                 mu = a .+ b .* x
                 lk = c
                 y .~ CircularVonMises.(mu, exp.(lk), -pi, pi)
@@ -185,12 +211,16 @@ end
 @testset "vm Enzyme gradients" begin
     @testset "literal kappa, exact" begin
         _vm_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, 1.7)
             end, _vm_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "Gamma-sampled kappa, circular" begin
         _vm_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 kappa ~ Gamma(2.0, 0.1)
                 mu = a .+ b .* x
                 y .~ CircularVonMises.(mu, kappa, -pi, pi)
@@ -198,6 +228,9 @@ end
     end
     @testset "intercept-only log-kappa submodel" begin
         _vm_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
                 mu = a .+ b .* x
                 lk = c
                 y .~ CircularVonMises.(mu, exp.(lk), -pi, pi)
@@ -221,6 +254,8 @@ end
 
 @testset "vm emission is O(1) in n_obs" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         kappa ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         y .~ CircularVonMises.(mu, kappa, -pi, pi)
@@ -281,19 +316,28 @@ const _VM_UPSTREAM_PINNED = ("Gamma-sampled kappa, circular",
 @testset "vm under Reactant" begin
     progs = [
         ("literal kappa, exact", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ VonMises.(mu, 1.7)
         end, _vm_cols()),
         ("literal kappa, circular", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ CircularVonMises.(mu, 1.7, -pi, pi)
         end, _vm_cols()),
         ("Gamma-sampled kappa, circular", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             kappa ~ Gamma(2.0, 0.1)
             mu = a .+ b .* x
             y .~ CircularVonMises.(mu, kappa, -pi, pi)
         end, _vm_cols()),
         ("intercept-only log-kappa submodel", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
             mu = a .+ b .* x
             lk = c
             y .~ CircularVonMises.(mu, exp.(lk), -pi, pi)

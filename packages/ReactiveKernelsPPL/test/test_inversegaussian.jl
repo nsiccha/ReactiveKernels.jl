@@ -49,6 +49,8 @@ _ig_i1_cols() = Dict{Symbol,AbstractVector}(:y => copy(_IG_I1_Y),
 @testset "ig surface admission" begin
     @testset "literal lambda" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), 1.5)
             end, (:y, :x))
@@ -64,16 +66,20 @@ _ig_i1_cols() = Dict{Symbol,AbstractVector}(:y => copy(_IG_I1_Y),
     end
     @testset "LogNormal-sampled lambda" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 lam ~ LogNormal(-0.3, 1.0)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lam)
             end, (:y, :x))
         r = only(plan.responses)
         @test (r.family, r.scale) === (InverseGaussianFam, :lam)
-        @test only(plan.parameters).family === :lognormal
+        @test only(p for p in plan.parameters if p.name === :lam).family === :lognormal
     end
     @testset "per-observation lambda column" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lamc)
             end, (:y, :x, :lamc))
@@ -81,6 +87,10 @@ _ig_i1_cols() = Dict{Symbol,AbstractVector}(:y => copy(_IG_I1_Y),
     end
     @testset "modeled lambda admitted" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 ls = c .+ d .* x
                 y .~ InverseGaussian.(exp.(eta), exp.(ls))
@@ -92,6 +102,8 @@ end
 @testset "ig value parity" begin
     @testset "literal lambda" begin
         _, _, kern, lay = _ig_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), 1.5)
             end, _ig_cols())
@@ -104,6 +116,8 @@ end
     end
     @testset "LogNormal-sampled lambda" begin
         _, _, kern, lay = _ig_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 lam ~ LogNormal(-0.3, 1.0)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lam)
@@ -121,6 +135,8 @@ end
         cols = _ig_cols()
         cols[:lamc] = [0.5, 1.5, 2.5, 1.0, 2.0, 0.8]
         _, _, kern, lay = _ig_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lamc)
             end, cols)
@@ -134,6 +150,10 @@ end
     end
     @testset "modeled lambda" begin
         _, _, kern, lay = _ig_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 ls = c .+ d .* z
                 y .~ InverseGaussian.(exp.(eta), exp.(ls))
@@ -168,12 +188,16 @@ end
 @testset "ig Enzyme gradients" begin
     @testset "literal lambda" begin
         _ig_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), 1.5)
             end, _ig_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "LogNormal-sampled lambda" begin
         _ig_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 lam ~ LogNormal(-0.3, 1.0)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lam)
@@ -181,6 +205,10 @@ end
     end
     @testset "modeled lambda" begin
         _ig_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 ls = c .+ d .* z
                 y .~ InverseGaussian.(exp.(eta), exp.(ls))
@@ -204,6 +232,8 @@ end
 
 @testset "ig emission is O(1) in n_obs" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         lam ~ LogNormal(-0.3, 1.0)
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta), lam)
@@ -242,15 +272,23 @@ end
 @testset "ig under Reactant" begin
     progs = [
         ("literal lambda", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             eta = a .+ b .* x
             y .~ InverseGaussian.(exp.(eta), 1.5)
         end, _ig_cols()),
         ("LogNormal-sampled lambda", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             lam ~ LogNormal(-0.3, 1.0)
             eta = a .+ b .* x
             y .~ InverseGaussian.(exp.(eta), lam)
         end, _ig_cols()),
         ("modeled lambda", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             eta = a .+ b .* x
             ls = c .+ d .* z
             y .~ InverseGaussian.(exp.(eta), exp.(ls))
@@ -376,6 +414,10 @@ end
 # `y ~ InverseGaussian(mu, lam)`; u = [0.2, -0.1, 0.5, 0.1].
 @testset "ig I1 modeled-lam SB parity" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         ls = c .+ d .* z
         y .~ InverseGaussian.(exp.(eta), exp.(ls))

@@ -18,9 +18,7 @@ spline/hsgp summands (the basis id), monotonic blocks (the increments
 key naming the contrast recipe), and matrix blocks (the matrix name).
 `elements` is meaningful for matrix blocks only (the matrix columns in
 order, `nothing` at intercept positions — per-element prior addresses
-and intercept flags for consumers that fan out). `coef` and `sign` are
-the term's author coefficient name and use-site sign
-([`TermSpec`](@ref)): a `-1` block contributes its negated columns.
+and intercept flags for consumers that fan out).
 """
 struct DesignBlock
     kind::TermKind
@@ -30,20 +28,13 @@ struct DesignBlock
     labels::Vector{Symbol}
     levels::Vector
     elements::Vector{Union{Nothing,Symbol}}
-    coef::Union{Nothing,Symbol}
-    sign::Int
 end
 
-# Non-matrix blocks carry no elements; unnamed blocks no coefficient name.
+# Non-matrix blocks carry no elements.
 DesignBlock(kind::TermKind, column::Union{Nothing,Symbol}, addressee::Symbol,
     width::Int, labels::Vector{Symbol}, levels::Vector) =
     DesignBlock(kind, column, addressee, width, labels, levels,
         Union{Nothing,Symbol}[])
-DesignBlock(kind::TermKind, column::Union{Nothing,Symbol}, addressee::Symbol,
-    width::Int, labels::Vector{Symbol}, levels::Vector,
-    elements::Vector{Union{Nothing,Symbol}}) =
-    DesignBlock(kind, column, addressee, width, labels, levels, elements,
-        nothing, 1)
 
 """Full design shape of one predictor: ordered blocks + total width."""
 struct DesignShape
@@ -65,16 +56,14 @@ function design_shape(pred::PredictorSpec, columns::AbstractDict{Symbol};
         matrices::Vector{DesignMatrix} = DesignMatrix[])
     blocks = DesignBlock[]
     for t in pred.terms
-        b = _term_block(t, columns, pred.label, pred.name, levelmaps,
-            matrices)
-        push!(blocks, DesignBlock(b.kind, b.column, b.addressee, b.width,
-            b.labels, b.levels, b.elements, t.coef, t.sign))
+        push!(blocks, _term_block(t, columns, pred.label, pred.name, levelmaps,
+            matrices))
     end
     labels = Symbol[]
     for b in blocks
         append!(labels, b.labels)
     end
-    length(unique(labels)) == length(labels) ||
+    (_parameter_terms(pred) || length(unique(labels)) == length(labels)) ||
         throw(ContractValidationError("[$(pred.label)] duplicate coefficient labels"))
     width = sum(b.width for b in blocks; init = 0)
     return DesignShape(pred.name, blocks, width)

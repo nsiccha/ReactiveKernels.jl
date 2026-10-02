@@ -3,9 +3,9 @@
 # resolved maximal population + recommended sampled + per-addressee mixing;
 # scope confirmed by reconciliation `1ljidem`): surface admission for the new
 # population/sampled families, Distributions.jl hand-oracle value parity,
-# Enzyme-vs-findiff gradients, Reactant/XLA legs. Pair contract: GLM-object
-# beta vectors stay Normal-only (non-Normal betas use the decomposed
-# predictor path). SB-parity probes follow the BRM peer's BridgeStan brief
+# Enzyme-vs-findiff gradients, Reactant/XLA legs. Ordinary declarations
+# retain their priors through affine and GLM optimizations.
+# SB-parity probes follow the BRM peer's BridgeStan brief
 # (phase 2 of their todo). (`_findiff_grad` / `_GEN_BACKEND` come from
 # test_generator.jl, included first.)
 using Distributions: Normal, Cauchy, TDist, Laplace, Logistic, Uniform,
@@ -56,6 +56,8 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
 
 @testset "prior vocab sampled admission" begin
     plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             t ~ StudentT(3, 1, 2)
@@ -79,6 +81,8 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
     @test u.args == (arg1 = -1, arg2 = 2)
     @testset "sampled hyperparameters" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 nu ~ Exponential(1)
@@ -94,6 +98,8 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                 (:(TDist(3)), "unknown distribution"))
             err = try
                 lower_rkppl(quote
+                        a ~ Normal(0, 1)
+                        b ~ Normal(0, 1)
                         mu = a .+ b .* x
                         y .~ Normal.(mu, s)
                         t ~ $rhs
@@ -103,21 +109,35 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
             catch e
                 e
             end
-            @test err isa SurfaceLoweringError
-            @test occursin(msg, sprint(showerror, err))
+            if rhs == :(TDist(3))
+                # capability: standard TDist prior constructor (P3; todo `139j2uo`).
+                @test_broken (err === nothing || throw(err))
+            else
+                # refused: remaining entries violate constructor signature,
+                # strict declarations or distribution domains (P3/P6, 05oe96l).
+                @test err isa SurfaceLoweringError
+                @test occursin(msg, sprint(showerror, err))
+            end
         end
     end
     @testset "uniform bounds must be finite literals in order" begin
         # Sampled bound (a known parameter name — the literal-only rule).
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: sampled Uniform bound (Uniform(lo, 2) with lo sampled); P8 admits sampled prior arguments (todo `0fkd9yk`)
+        @test_broken (lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 lo ~ Normal(0, 1)
                 u ~ Uniform(lo, 2)
                 s ~ Exponential(1)
-            end, (:y, :x))
+            end, (:y, :x)); true)
+        # refused: Uniform bounds out of order (malformed distribution)
         for rhs in (:(Uniform(2, -1)), :(Uniform(0, Inf)))
+            # refused: battery of malformed Uniform literals (all entries P)
             @test_throws ContractValidationError lower_rkppl(quote
+                    a ~ Normal(0, 1)
+                    b ~ Normal(0, 1)
                     mu = a .+ b .* x
                     y .~ Normal.(mu, s)
                     u ~ $rhs
@@ -147,17 +167,20 @@ end
     @test pp.support_override === nothing
     # Per-cell (column) uniform bounds are rejected — one plate entry
     # shares one interval transform, so bounds stay finite literals.
-    @test_throws ContractValidationError lower_rkppl(Expr(:block,
+    # capability: per-index data Uniform bounds inside @plate (theta[i] ~ Uniform(lo[i], hi[i])); P8 per-index plate semantics (todo `0fkd9yk`)
+    @test_broken (lower_rkppl(Expr(:block,
         :(s ~ Exponential(1)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block,
                     :(theta[i] ~ Uniform(lo[i], hi[i])),
-                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y, :lo, :hi))
+                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y, :lo, :hi)); true)
 end
 
 @testset "prior vocab truncated halves" begin
     plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             h ~ truncated(StudentT(3, 0, 2), 0, Inf)
@@ -174,31 +197,54 @@ end
     @test _pv_param(plan, :g).support_override === :positive
     @test _pv_param(plan, :n).support_override === :positive
     @testset "non-zero-location half rejected" begin
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: truncated(StudentT(nu, mu!=0, s), 0, Inf): general (nonzero-location) truncation (todo `0ze68k8`)
+        @test_broken (lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 h ~ truncated(StudentT(3, 1, 2), 0, Inf)
                 s ~ Exponential(1)
-            end, (:y, :x))
+            end, (:y, :x)); true)
     end
     @testset "upper-only and finite intervals stay Normal-only" begin
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: upper-only truncation for non-Normal families (truncated(StudentT, -Inf, 1)) (todo `0ze68k8`)
+        @test_broken (lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 h ~ truncated(StudentT(3, 0, 2), -Inf, 1)
                 s ~ Exponential(1)
-            end, (:y, :x))
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+            end, (:y, :x)); true)
+        # capability: finite-interval truncation for non-Normal families (truncated(Laplace, -1, 1)) (todo `0ze68k8`)
+        @test_broken (lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 h ~ truncated(Laplace(0, 1), -1, 1)
                 s ~ Exponential(1)
-            end, (:y, :x))
+            end, (:y, :x)); true)
     end
 end
 
-_pv_prior(plan, pred::Symbol, addr::Symbol) =
-    only(p for p in plan.population_priors if p.predictor === pred && p.addressee === addr)
+function _pv_prior(plan, pred::Symbol, addr::Symbol)
+    legacy = filter(p -> p.predictor === pred && p.addressee === addr,
+        plan.population_priors)
+    isempty(legacy) || return only(legacy)
+    predictor = only(p for p in plan.predictors if p.name === pred)
+    term = only(t for t in predictor.terms if t.addressee === addr)
+    name = term.options.parameter
+    p = only(p for p in Iterators.flatten((plan.parameters, plan.array_parameters))
+        if p.name === name)
+    args = collect(values(p.args))
+    p.family === :flat && return (family = :flat, location = nothing,
+        scale = nothing, nu = nothing)
+    li, si, ni = p.family === :student_t ? (2, 3, 1) : (1, 2, 0)
+    return (family = p.family, location = args[li], scale = args[si],
+        nu = ni == 0 ? nothing : args[ni])
+end
 
 @testset "prior vocab coefficient admission" begin
     plan = lower_rkppl(quote
@@ -225,6 +271,7 @@ _pv_prior(plan, pred::Symbol, addr::Symbol) =
         @test _pv_prior(plan, :mu, :Intercept).family === :cauchy
         @test _pv_prior(plan, :mu, :x).family === :flat
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 b ~ Logistic(1, 2)
@@ -261,13 +308,14 @@ _pv_prior(plan, pred::Symbol, addr::Symbol) =
                 mu = X * b
                 y .~ Normal.(mu, 1.0)
             end, (:y, :x1, :x2))
-        rows = [p for p in plan.population_priors if p.predictor === :mu]
-        @test length(rows) == 3
-        @test all(p -> p.family === :laplace, rows)
+        @test isempty(plan.population_priors)
+        @test only(plan.array_parameters).name === :b
+        @test only(plan.array_parameters).family === :laplace
     end
     @testset "lowercase coefficient spelling rejected" begin
         err = try
             lower_rkppl(quote
+                    a ~ Normal(0, 1)
                     mu = a .+ b .* x
                     y .~ Normal.(mu, s)
                     b ~ student_t(3, 0, 1)
@@ -277,6 +325,7 @@ _pv_prior(plan, pred::Symbol, addr::Symbol) =
         catch e
             e
         end
+        # refused: lowercase student_t is a kernel constructor, not the Julia distribution constructor (P3).
         @test err isa SurfaceLoweringError
     end
 end
@@ -285,33 +334,30 @@ end
     # One family per wide (data-width) block: hand-mutated matrix-element
     # and GLM-vector rows fail validation (the surface can only state one
     # broadcast family, so only hand plans reach this).
-    plan = lower_rkppl(quote
-            b[axes(X, 2)] .~ Normal.(0, 1)
-            X = hcat(1, x1, x2)
-            mu = X * b
-            y .~ Normal.(mu, 1.0)
-        end, (:y, :x1, :x2))
+    plan = StructuralPlan(
+        [LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, 1.0, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:mu, IdentityLink,
+            [TermSpec(MatrixTerm, [:x1, :x2], (matrix=:X,), :X, :X_term)], :mu)],
+        [PopulationPrior(:mu, name, 0.0, 1.0) for name in (:Intercept, :x1, :x2)],
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        matrices = [DesignMatrix(:X, Union{Nothing,Symbol}[nothing, :x1, :x2], :X)])
     i = findfirst(p -> p.predictor === :mu && p.addressee === :x1,
         plan.population_priors)
     plan.population_priors[i] = PopulationPrior(:mu, :x1, :student_t,
         0.0, 1.0, 3.0)
+    # refused: one prior family per data-width coefficient block (IR contract)
     @test_throws ContractValidationError validate_structure(plan)
-    @testset "glm-object beta vectors stay Normal-only" begin
-        # Pair contract (peer: else decomposed): a stated non-Normal GLM
-        # beta prior fails closed at the surface naming the decomposed path.
-        err = try
-            lower_rkppl(quote
+    @testset "glm-object beta vectors retain ordinary priors" begin
+        plan = lower_rkppl(quote
                     X = hcat(x1, x2)
                     y ~ NormalIDGLM(X, alpha, beta, 1.0)
                     alpha ~ Normal(0, 10)
                     beta[axes(X, 2)] .~ Laplace.(0, 1)
                 end, (:y, :x1, :x2))
-            nothing
-        catch e
-            e
-        end
-        @test err isa SurfaceLoweringError
-        @test occursin("Normal-only", sprint(showerror, err))
+        @test only(plan.array_parameters).name === :beta
+        @test only(plan.array_parameters).family === :laplace
+        @test isempty(plan.population_priors)
     end
 end
 
@@ -327,9 +373,11 @@ _pv_m1_oracle(a::Real, b::Real, s::Real) =
     _pv_student(4, 0, 2, a) + logpdf(Laplace(0, 1), b) +
     logpdf(Exponential(1), s) + _pv_gauss_ll(a, b, s) + log(s)
 
-# M2: new sampled families as pure prior contributors (unstated a/b keep
-# their Normal(0, 1) defaults).
+# M2: new sampled families as pure prior contributors alongside ordinary
+# Normal declarations for the intercept and slope.
 const _PV_M2 = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     t ~ StudentT(3, 1, 2)
@@ -345,6 +393,8 @@ _pv_m2_oracle(a::Real, b::Real, t::Real, l::Real, g::Real, s::Real) =
 
 # M3: interval-constrained Uniform plus a half-StudentT (exact +log(2)).
 const _PV_M3 = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     u ~ Uniform(-1, 2)
@@ -358,8 +408,7 @@ _pv_m3_oracle(a::Real, b::Real, u::Real, h::Real, s::Real) =
     _pv_interval_logjac(-1, 2, u) + log(h) + log(s)
 
 # M4: mixed predictor with a wide homogeneous factor plate (StudentT
-# levels) plus a Cauchy width-1 block (no intercept: intercept +
-# full-cover factor is unidentified).
+# levels) plus a Cauchy width-1 block.
 const _PV_M4 = quote
     c[levels(g)] .~ StudentT.(3, 0, 2)
     mu = c[g] .+ b .* x
@@ -387,7 +436,7 @@ end
     @test _pv_posterior(kern, lay, q) ≈
         _pv_m3_oracle(-0.5, 1.25, 0.5, 1.1, 2.0) rtol = 1e-12
     _, _, kern, lay = _pv_query(_PV_M4, _pv_gcols())
-    q = (c = [0.3, -0.4, 0.1], b = 0.75)
+    q = (c = [0.3, -0.4, 0.1], b = 0.75,)
     @test _pv_posterior(kern, lay, q) ≈
         _pv_m4_oracle([0.3, -0.4, 0.1], 0.75) rtol = 1e-12
 end
@@ -413,7 +462,7 @@ end
         (a = 0.25, b = 0.5, t = 1.5, l = -0.5, g = 2.25, s = 0.8))
     _pv_enzyme_check(_PV_M3, _pv_cols(),
         (a = -0.5, b = 1.25, u = 0.5, h = 1.1, s = 2.0))
-    _pv_enzyme_check(_PV_M4, _pv_gcols(), (c = [0.3, -0.4, 0.1], b = 0.75))
+    _pv_enzyme_check(_PV_M4, _pv_gcols(), (c = [0.3, -0.4, 0.1], b = 0.75,))
 end
 
 @testset "prior vocab SB parity" begin
@@ -422,11 +471,13 @@ end
     # BridgeStan 2.9.0; `propto=false`, `jacobian=true`; SB-vs-oracle
     # ~1e-15, central-diff ≤7e-10). RK lane `fade3b9`. Conventions:
     # full posterior with constants, log-Jacobian included.
-    _pv_sb_check(prog, cols, q, sbv, sbg) = begin
+    _pv_sb_check(prog, cols, q, sbv, sbg; names = [:a, :b, :s]) = begin
         _, _, kern, lay = _pv_query(prog, cols)
         @test _pv_posterior(kern, lay, q) ≈ sbv rtol = 1e-12
         g = _pv_enzyme_check(prog, cols, q)
-        @test g ≈ sbg rtol = 1e-9
+        coords = coordinate_names(lay)
+        @test [g[only(findall(isequal(name), coords))] for name in names] ≈
+            sbg rtol = 1e-9
     end
     # P1: StudentT intercept + Laplace slope.
     _pv_sb_check(_PV_M1, _pv_cols(), (a = 0.5, b = -0.25, s = 1.3),
@@ -445,13 +496,15 @@ end
     # P3: factor StudentT broadcast + Cauchy slope, fixed s = 1.5 (SB
     # native order is [slope, cats]; the literal below is already in RK
     # [c1, c2, c3, b] order).
-    _pv_sb_check(_PV_M4, _pv_gcols(), (c = [0.3, -0.4, 0.1], b = 0.75),
+    _pv_sb_check(_PV_M4, _pv_gcols(), (c = [0.3, -0.4, 0.1], b = 0.75,),
         -21.633064049357102,
         [0.07852219465122685, 3.2093567251461983, 1.5444721990933479,
-            -2.565555555555555])
+            -2.565555555555555]; names = [Symbol("c.1"), Symbol("c.2"), Symbol("c.3"), :b])
     # P4: Uniform(0.5, 1.5) response scale, default Normal population
     # priors (SB `real<0.5,1.5>` is the same affine-logit leg).
     _pv_sb_check(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             s ~ Uniform(0.5, 1.5)
@@ -462,6 +515,8 @@ end
     # is the renormalized truncated distribution, matching RK
     # `:positive` (exact +log(2)).
     _pv_sb_check(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             s ~ truncated(StudentT(4, 0, 1), 0, Inf)
@@ -472,6 +527,8 @@ end
     # unrenormalized declaration kernel — exactly SB minus log(2), same
     # grads.
     plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             s ~ truncated(StudentT(4, 0, 1), 0, Inf)
@@ -553,6 +610,8 @@ end
 # posteriordb reference kernels). Complement of the proper halves
 # (`HalfNormal`, `truncated(..., 0, Inf)`).
 const _PV_M5 = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     s ~ Normal(0, 2; lower=0)
@@ -565,6 +624,8 @@ _pv_m5_oracle(a::Real, b::Real, s::Real, t::Real) =
 
 # M5 twin with proper halves: identical except the +log(2) per half.
 const _PV_M5_PROPER = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     s ~ HalfNormal(2)
@@ -582,6 +643,8 @@ end
     @test t.args == (arg1 = 0, arg2 = 5)
     @test t.support_override === :positive_stan
     plan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             v ~ StudentT(4, 0, 1; lower=0)
@@ -593,6 +656,8 @@ end
     @test v.support_override === :positive_stan
     @testset "sampled scale" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 sc ~ Exponential(1)
@@ -632,6 +697,8 @@ end
         for (label, rhs, msg) in cases
             err = try
                 lower_rkppl(quote
+                        a ~ Normal(0, 1)
+                        b ~ Normal(0, 1)
                         mu = a .+ b .* x
                         y .~ Normal.(mu, s)
                         p ~ $rhs
@@ -641,6 +708,8 @@ end
             catch e
                 e
             end
+            # refused: remaining entries violate constructor signature,
+            # strict declarations or distribution domains (P3/P6, 05oe96l).
             @test err isa SurfaceLoweringError
             @test occursin(msg, sprint(showerror, err))
         end
@@ -650,6 +719,8 @@ end
                 :(truncated(Normal(0, 2), 0, Inf; lower = 0)))
             err = try
                 lower_rkppl(quote
+                        a ~ Normal(0, 1)
+                        b ~ Normal(0, 1)
                         mu = a .+ b .* x
                         y .~ Normal.(mu, s)
                         p ~ $rhs
@@ -659,6 +730,8 @@ end
             catch e
                 e
             end
+            # refused: remaining entries violate constructor signature,
+            # strict declarations or distribution domains (P3/P6, 05oe96l).
             @test err isa SurfaceLoweringError
         end
     end
@@ -764,6 +837,8 @@ end
 # (upper-bounded). Improper throughout: density 0.0, Jacobian only —
 # the posteriordb flat-sigma / flat-interval shape.
 const _PV_M7 = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     s ~ Flat(; lower=0)
@@ -787,6 +862,8 @@ _pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
     @test w.family === :flat
     @test w.support_override == (:upper, 5.0)
     bare = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             y .~ Normal.(mu, s)
             p ~ Flat()
@@ -820,6 +897,9 @@ _pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
         for (label, rhs, msg) in cases
             err = try
                 lower_rkppl(quote
+                        a ~ Normal(0, 1)
+                        lo ~ Normal(0, 1)
+                        b ~ Normal(0, 1)
                         mu = a .+ b .* x
                         y .~ Normal.(mu, s)
                         p ~ $rhs
@@ -829,8 +909,15 @@ _pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
             catch e
                 e
             end
-            @test err isa SurfaceLoweringError
-            @test occursin(msg, sprint(showerror, err))
+            if label in ("nonzero one-sided lower", "non-literal lower", "infinite upper", "infinite paired upper")
+                # capability: ordinary one-sided and sampled Flat bounds (P3/P8; todo `0fkd9yk`).
+                @test_broken (err === nothing || throw(err))
+            else
+                # refused: remaining entries violate constructor signature,
+                # strict declarations or distribution domains (P3/P6, 05oe96l).
+                @test err isa SurfaceLoweringError
+                @test occursin(msg, sprint(showerror, err))
+            end
         end
     end
 end
@@ -884,61 +971,42 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
 
 @testset "centered factor priors admission" begin
     plan = lower_rkppl(_PV_M8, (:y, :x, :g))
-    row = only(p for p in plan.population_priors if p.addressee === :g)
+    row = _pv_prior(plan, :mu, :g)
     @test row.family === :normal
     @test row.location === :mu_alpha
     @test row.scale === :sigma_alpha
-    @testset "surface gate fails closed" begin
-        cases = (
-            ("symbol nu",
-                :(StudentT.(ndf, 0, 2)),
-                "nu hyperparameter must be a literal"),
-            ("per-level vector",
-                :(Normal.([0, 0, 0], 2)),
-                "per-level priors are not in slice 1"),
-            ("unknown location hyper",
-                :(Normal.(nope, sigma_alpha)),
-                "must be a literal or shared-hyperparameter name"),
-            ("data location hyper",
-                :(Normal.(x, sigma_alpha)),
-                "must be a literal or shared-hyperparameter name"),
-            ("derived-response location hyper",
-                :derivedhyper,
-                "must be a literal or shared-hyperparameter name"),
-        )
-        for (label, rhs, msg) in cases
-            err = try
-                if rhs === :derivedhyper
-                    # A derived response is an n-vector, not a scalar
-                    # hyperparameter — rejected at the surface with the
-                    # spelling message (robust G1).
-                    lower_rkppl(quote
-                            sigma_alpha ~ Exponential(1)
-                            s ~ Exponential(1)
-                            b ~ Normal(0, 10)
-                            ly = log.(earn)
-                            c[levels(g)] .~ Normal.(ly, sigma_alpha)
-                            mu = c[g] .+ b .* x
-                            ly .~ Normal.(mu, s)
-                        end, (:earn, :x, :g))
-                else
-                    lower_rkppl(quote
-                            mu_alpha ~ Normal(0, 10)
-                            sigma_alpha ~ Exponential(1)
-                            s ~ Exponential(1)
-                            c[levels(g)] .~ $rhs
-                            mu = c[g] .+ b .* x
-                            b ~ Normal(0, 10)
-                            y .~ Normal.(mu, s)
-                        end, (:y, :x, :g))
-                end
-                nothing
-            catch e
-                e
-            end
-            @test err isa SurfaceLoweringError
-            @test occursin(msg, sprint(showerror, err))
+    @testset "ordinary array arguments and preparation validation" begin
+        for rhs in (:(StudentT.(ndf, 0, 2)), :(Normal.([0, 0, 0], 2)))
+            admitted = lower_rkppl(quote
+                    ndf ~ Exponential(1)
+                    c[levels(g)] .~ $rhs
+                    b ~ Normal(0, 10)
+                    mu = c[g] .+ b .* x
+                    y .~ Normal.(mu, 1.5)
+                end, (:y, :x, :g))
+            @test only(admitted.array_parameters).name === :c
+            @test bind_data(admitted, _pv_gcols()) isa StructuralPlan
         end
+        for rhs in (:(Normal.(nope, 2)), :(Normal.(x, 2)))
+            prepared = lower_rkppl(quote
+                    c[levels(g)] .~ $rhs
+                    b ~ Normal(0, 10)
+                    mu = c[g] .+ b .* x
+                    y .~ Normal.(mu, 1.5)
+                end, (:y, :x, :g))
+            # refused: unknown nope or 6 location values for 3 levels (name/shape contract, P3/P6).
+            @test_throws ContractValidationError bind_data(prepared, _pv_gcols())
+        end
+        prepared = lower_rkppl(quote
+                ly = log.(earn)
+                c[levels(g)] .~ Normal.(ly, 2)
+                b ~ Normal(0, 10)
+                mu = c[g] .+ b .* x
+                ly .~ Normal.(mu, 1.5)
+            end, (:earn, :x, :g))
+        # refused: 6 derived location values cannot broadcast over 3 levels (P3).
+        @test_throws ContractValidationError bind_data(prepared,
+            Dict(:earn => exp.(_PV_Y), :x => copy(_PV_X), :g => copy(_PV_G)))
     end
     # Expression arguments, scalar-coefficient hyper names, sign-flipped
     # hierarchical locations, a coefficient another prior reads, and
@@ -956,21 +1024,16 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
             y .~ Normal.(mu, s)
         end
         computed = lower_rkppl(mk(:(Normal.(mu_alpha + 0, 2))), (:y, :x, :g))
-        row = only(p for p in computed.population_priors if p.addressee === :g)
+        row = _pv_prior(computed, :mu, :g)
         @test row.location === :_rkppl_c_arg1
         @test any(a -> a.name === :_rkppl_c_arg1, computed.assignments)
-        # A negated use keeps the prior as written; the sign negates the
-        # dummy columns (`TermSpec.sign`, user decision `0m1j3iz`).
         flipped = lower_rkppl(mk(:(Normal.(mu_alpha, sigma_alpha)),
             :(-c[g])), (:y, :x, :g))
-        row = only(p for p in flipped.population_priors if p.addressee === :g)
+        row = _pv_prior(flipped, :mu, :g)
         @test row.location === :mu_alpha
-        @test only(t for t in only(flipped.predictors).terms
-            if t.kind === FactorTerm).sign == -1
-        @test !any(a -> startswith(string(a.name), "_rkppl_neg"),
-            flipped.assignments)
+        @test isempty(filter(a -> a.name === :_rkppl_neg_mu_alpha, flipped.assignments))
         assigned = lower_rkppl(mk(:(Normal.(mu_alpha, sc))), (:y, :x, :g))
-        row = only(p for p in assigned.population_priors if p.addressee === :g)
+        row = _pv_prior(assigned, :mu, :g)
         @test row.scale === :sc
         coefread = lower_rkppl(mk(:(Normal.(b, sigma_alpha))), (:y, :x, :g))
         @test any(p -> p.name === :b, coefread.parameters)
@@ -982,42 +1045,28 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
                 b ~ Normal(mu_alpha, 2)
                 y .~ Normal.(mu, s)
             end, (:y, :x))
-        row = only(p for p in scalar.population_priors if p.addressee === :x)
+        row = _pv_prior(scalar, :mu, :x)
         @test row.location === :mu_alpha
     end
-    @testset "contract resolution fails closed" begin
-        cases = (
-            ("real-support scale hyper",
-                :(Normal.(mu_alpha, mu_beta)),
-                "positive-support sampled parameter"),
-        )
-        for (label, rhs, msg) in cases
-            err = try
-                lower_rkppl(quote
-                        mu_alpha ~ Normal(0, 10)
-                        mu_beta ~ Normal(0, 10)
-                        sigma_alpha ~ Exponential(1)
-                        s ~ Exponential(1)
-                        sc = 1.0
-                        c[levels(g)] .~ $rhs
-                        mu = c[g] .+ b .* x
-                        b ~ Normal(0, 10)
-                        y .~ Normal.(mu, s)
-                    end, (:y, :x, :g))
-                nothing
-            catch e
-                e
-            end
-            @test err isa ContractValidationError
-            @test occursin(msg, sprint(showerror, err))
-        end
+    @testset "ordinary prior arguments retain scalar declarations" begin
+        plan = lower_rkppl(quote
+                mu_alpha ~ Normal(0, 10)
+                mu_beta ~ Normal(0, 10)
+                c[levels(g)] .~ Normal.(mu_alpha, mu_beta)
+                b ~ Normal(0, 10)
+                mu = c[g] .+ b .* x
+                y .~ Normal.(mu, 1.5)
+            end, (:y, :x, :g))
+        @test only(plan.array_parameters).args.arg2 === :mu_beta
+        @test _pv_param(plan, :mu_beta).family === :normal
     end
 end
 
 @testset "centered factor priors interval scale hypers" begin
-    # Non-negative intervals count (radon_county `Flat(; lower=0,
-    # upper=100)`); negative lower bounds stay rejected.
-    for hyper in (:(Flat(; lower = 0, upper = 100)), :(Uniform(0, 100)))
+    # The array prior reads the scalar value; its declaration's support
+    # remains independent of affine recognition.
+    for hyper in (:(Flat(; lower = 0, upper = 100)), :(Uniform(0, 100)),
+            :(Flat(; lower = -1, upper = 100)), :(Uniform(-1, 100)))
         plan = lower_rkppl(quote
                 mu_alpha ~ Normal(0, 10)
                 sigma_alpha ~ $hyper
@@ -1027,27 +1076,9 @@ end
                 b ~ Normal(0, 10)
                 y .~ Normal.(mu, s)
             end, (:y, :x, :g))
-        row = only(p for p in plan.population_priors if p.addressee === :g)
+        row = _pv_prior(plan, :mu, :g)
         @test row.scale === :sigma_alpha
-    end
-    for hyper in (:(Flat(; lower = -1, upper = 100)), :(Uniform(-1, 100)))
-        err = try
-            lower_rkppl(quote
-                    mu_alpha ~ Normal(0, 10)
-                    sigma_alpha ~ $hyper
-                    s ~ Exponential(1)
-                    c[levels(g)] .~ Normal.(mu_alpha, sigma_alpha)
-                    mu = c[g] .+ b .* x
-                    b ~ Normal(0, 10)
-                    y .~ Normal.(mu, s)
-                end, (:y, :x, :g))
-            nothing
-        catch e
-            e
-        end
-        @test err isa ContractValidationError
-        @test occursin("positive-support sampled parameter",
-            sprint(showerror, err))
+        @test bind_data(plan, _pv_gcols()) isa StructuralPlan
     end
 end
 
@@ -1135,18 +1166,18 @@ function _pv_m10_oracle(a::Real, b1::Real, b2::Real)
     jac = _pv_interval_logjac(-100, 0, b1) + _pv_interval_logjac(0, 100, b2)
     return pr + ll + jac
 end
-_pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0)
+_pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
 
 @testset "uniform coefficients admission" begin
     plan = lower_rkppl(_PV_M10, (:y, :x, :z))
-    rows = Dict(p.addressee => p for p in plan.population_priors)
+    rows = Dict(addr => _pv_prior(plan, :mu, addr) for addr in (:Intercept, :x, :z))
     @test rows[:x].family === :uniform
     @test (rows[:x].location, rows[:x].scale) == (-100.0, 0.0)
     @test rows[:z].family === :uniform
     @test (rows[:z].location, rows[:z].scale) == (0.0, 100.0)
     bound = bind_data(plan, _pv_m10_cols())
     lay = assign_layout(bound)
-    coefs = [e for e in lay.entries if e.kind === :coefficient]
+    coefs = [e for e in lay.entries if e.kind === :sampled]
     @test length(coefs) == 3
     @test [e.transform for e in coefs] == [:identity, :interval, :interval]
     @test [(e.lo, e.hi) for e in coefs[2:3]] ==
@@ -1159,7 +1190,7 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0)
             mu = c[g]
             y .~ Normal.(mu, 1.5)
         end, (:y, :g))
-    frow = only(p for p in fplan.population_priors if p.addressee === :g)
+    frow = _pv_prior(fplan, :mu, :g)
     @test frow.family === :uniform
     @test (frow.location, frow.scale) == (0.0, 10.0)
     @testset "bounds gate fails closed" begin
@@ -1173,11 +1204,11 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0)
             ("scalar inverted",
                 :(Uniform(10, 5)),
                 ContractValidationError,
-                "lo < hi"),
+                "lower < upper"),
             ("scalar infinite",
                 :(Uniform(0, Inf)),
                 ContractValidationError,
-                "lo < hi"),
+                "bounds must be finite literals"),
         )
         for (label, rhs, ex, msg) in scalar_cases
             err = try
@@ -1192,14 +1223,21 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0)
             catch e
                 e
             end
-            @test err isa ex
-            @test occursin(msg, sprint(showerror, err))
+            if occursin("hyper bound", label)
+                # capability: sampled Uniform bounds (P8 1cmodra; todo `0fkd9yk`).
+                @test_broken (err === nothing || throw(err))
+            else
+                # refused: remaining entries violate constructor signature,
+                # strict declarations or distribution domains (P3/P6, 05oe96l).
+                @test err isa ex
+                @test occursin(msg, sprint(showerror, err))
+            end
         end
         broad_cases = (
             ("broadcast hyper bound",
                 :(Uniform.(lo, 3)),
-                SurfaceLoweringError,
-                "bounds must be finite literals"),
+                ContractValidationError,
+                "bounds are literals"),
             ("broadcast inverted",
                 :(Uniform.(10, 5)),
                 ContractValidationError,
@@ -1208,6 +1246,7 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0)
         for (label, rhs, ex, msg) in broad_cases
             err = try
                 lower_rkppl(quote
+                        lo ~ Normal(0, 1)
                         c[levels(g)] .~ $rhs
                         mu = c[g]
                         y .~ Normal.(mu, 1.5)
@@ -1216,8 +1255,15 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0)
             catch e
                 e
             end
-            @test err isa ex
-            @test occursin(msg, sprint(showerror, err))
+            if occursin("hyper bound", label)
+                # capability: sampled Uniform bounds (P8 1cmodra; todo `0fkd9yk`).
+                @test_broken (err === nothing || throw(err))
+            else
+                # refused: remaining entries violate constructor signature,
+                # strict declarations or distribution domains (P3/P6, 05oe96l).
+                @test err isa ex
+                @test occursin(msg, sprint(showerror, err))
+            end
         end
     end
 end
@@ -1245,4 +1291,3 @@ end
         :z => vcat(_PV_Z, _PV_Z))
     @test _pv_reactant(_PV_M10, bigcols).lines == fx.lines
 end
-

@@ -71,6 +71,8 @@ end
     @test t.addressee === t.label === :r_mu_g
     # Multi-target slices: the split form with explicit column ranges.
     multi = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            c ~ Normal(0, 1)
             d ~ varying_draws(g, [1, x, 1])
             r1 ~ varying_slice(d, 1:2)
             r2 ~ varying_slice(d, 3)
@@ -90,6 +92,7 @@ end
     # One geometry for every K: a single margin, intercept or slope, is
     # the 1x1 correlated case with the canonical eta 1.0.
     one = lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
@@ -100,6 +103,7 @@ end
     @test b.label === :draws_g
     @test b.suffix == "g"
     slope = lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
@@ -111,6 +115,7 @@ end
     # refused rather than silently ignored.
     err = try
         lower_rkppl(quote
+                a ~ Normal(0, 1)
                 r ~ varying_effect(g, [1]; eta = 2.0)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.5)
@@ -119,12 +124,14 @@ end
     catch e
         e
     end
+    # refused: K=1 has no eta-bearing correlation; nondefault eta must not be ignored (1hqmdas, 1nh2dia).
     @test err isa SurfaceLoweringError &&
         occursin("no correlation for eta", sprint(showerror, err))
 end
 
 @testset "varying dummy margins" begin
     got = lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [1, dummy(c, 2), dummy(s, "a")])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
@@ -141,24 +148,28 @@ end
     D = (:y, :x, :g)
     # Quoted id position is gone (blocks on one grouping disambiguate by
     # binding name, not labels).
+    # refused: retired quoted `:ID` label arg (brms |ID| vocabulary, P10); bindings disambiguate (malformed construct signature)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             r ~ varying_effect(:ID, g, [1, x])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, D)
     # Non-data group.
+    # refused: undeclared group name `h` (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             r ~ varying_effect(h, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, D)
     # Non-positive eta.
+    # refused: LKJ eta must be > 0 (mathematically invalid input)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             r ~ varying_effect(g, [1, x]; eta = 0.0)
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, D)
     # Duplicate binding (single assignment).
+    # refused: single assignment (`r` bound twice)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             r ~ varying_effect(g, [1])
             r ~ varying_effect(g, [1])
@@ -167,62 +178,85 @@ end
         end, D)
     # One slice per (draws, target): two slices of one draws into one
     # predictor.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: two slices of one draws summed into one predictor (`a .+ r1 .+ r2`) (todo `1308iv0`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             d ~ varying_draws(g, [1, x])
             r1 ~ varying_slice(d, 1)
             r2 ~ varying_slice(d, 2)
             mu = a .+ r1 .+ r2
             y .~ Normal.(mu, 1.5)
-        end, D)
-    # Bad margin integer / unknown margin / tuple-not-vect / bare margin.
+        end, D); true)
+    # Tuple margin collections are valid Julia values; the other entries
+    # have no admitted meaning or name declaration.
     for bad in (:([2]), :([zz]), :((1, x)), 1)
-        @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        prog = Expr(:block, :(a ~ Normal(0, 1)),
                 Expr(:call, :~, :r,
                     Expr(:call, :varying_effect, :g, bad)),
-                :(mu = a .+ r), :(y .~ Normal.(mu, 1.5))), D)
+                :(mu = a .+ r), :(y .~ Normal.(mu, 1.5)))
+        if bad == :((1, x))
+            # capability: tuple margin collections (P3; todo `1308iv0`).
+            @test_broken (lower_rkppl(prog, D); true)
+        else
+            # refused: 2 has no intercept meaning, zz is undeclared, and
+            # a scalar is not a margin collection (P2/P3/P6, 05oe96l).
+            @test_throws SurfaceLoweringError lower_rkppl(prog, D)
+        end
     end
     # Unknown draws / unconsumed margins.
+    # refused: undeclared draws name `zz` (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             r2 ~ varying_slice(zz, 1)
             mu = a .+ r2
             y .~ Normal.(mu, 1.5)
         end, D)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: a draws margin no slice uses (10gzbm9 degenerate) (todo `1308iv0`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             d ~ varying_draws(g, [1, x])
             r1 ~ varying_slice(d, 1)
             mu = a .+ r1
             y .~ Normal.(mu, 1.5)
-        end, D)
+        end, D); true)
     # Negated / nested contributions.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: negated varying contribution (`a .- r`) (todo `1308iv0`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             mu = a .- r
             y .~ Normal.(mu, 1.5)
-        end, D)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, D); true)
+    # capability: varying contribution inside a product (`a .+ r .* x`) (todo `1308iv0`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             mu = a .+ r .* x
             y .~ Normal.(mu, 1.5)
-        end, D)
+        end, D); true)
     # Contribution inside a non-predictor definition.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: varying contribution used in a non-predictor definition (`w = r .+ 1.0`) (todo `1308iv0`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             w = r .+ 1.0
             mu = a .+ b .* x .+ r
             y .~ Normal.(mu, sigma)
             sigma ~ Exponential(1)
-        end, (:y, :x, :g))
-    # Contribution inside a STRUCTURAL definition (coefficient reference inlines
-    # even vector defs — the statement-level screen must catch it before
-    # absorption silently turns the alias into a direct summand).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :x, :g)); true)
+    # Admitted: an intermediate predictor definition preserves the varying
+    # contribution alongside its ordinary coefficient reads.
+    @test (lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             w = r .+ b .* x
             mu = a .+ w
             y .~ Normal.(mu, sigma)
             sigma ~ Exponential(1)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g)); true)
     # Reserved names.
+    # refused: reserved name `dummy`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             dummy ~ Normal(0, 1)
             y .~ Normal.(mu, 1.5)
@@ -236,22 +270,26 @@ end
     # Duplicate labels / bad kind / non-partition slices / margin mismatch.
     dup = _tv_base(; with_effect = true)
     push!(dup.varying_draws, _tv_draws())
+    # refused: duplicate draws labels (IR contract)
     @test_throws ContractValidationError validate_structure(dup)
     badkind = _tv_base(; with_effect = true)
     badkind.varying_draws[1] = VaryingDraws(:g, :slope1,
         _tv_draws().margins, NaN, :draws_g, "g")
+    # refused: unknown draws kind (IR contract)
     @test_throws ContractValidationError validate_structure(badkind)
     # The retired K=1 kinds are refused on hand-built plans too.
     k1m = [VaryingMargin(:Intercept, VaryingZRecipe(:ones, :none, nothing))]
     retired = _tv_base(; with_effect = true)
     retired.varying_draws[1] = VaryingDraws(:g, :intercept1, k1m, NaN,
         :draws_g, "g")
+    # refused: retired K=1 kind `:intercept1` (IR contract)
     @test_throws ContractValidationError validate_structure(retired)
     # K=1 draws carry the canonical eta 1.0.
     k1eta = _tv_base(; with_effect = true)
     k1eta.varying_draws[1] = VaryingDraws(:g, :correlated, k1m, 2.0,
         :draws_g, "g")
     k1eta.varying_slices[1] = VaryingSlice(:draws_g, 1:1, :mu)
+    # refused: K=1 draws carry canonical eta 1.0 (IR contract)
     @test_throws ContractValidationError validate_structure(k1eta)
     k1ok = _tv_base(; with_effect = true)
     k1ok.varying_draws[1] = VaryingDraws(:g, :correlated, k1m, 1.0,
@@ -260,6 +298,7 @@ end
     @test validate_structure(k1ok) === nothing
     badslice = _tv_base(; with_effect = true)
     badslice.varying_slices[1] = VaryingSlice(:draws_g, 1:1, :mu)
+    # refused: slices must partition 1:K exactly once (IR contract)
     @test_throws ContractValidationError validate_structure(badslice)
     # Effect term over unknown draws / dangling slice.
     noeffect = _tv_base()
@@ -276,6 +315,7 @@ end
         plate_parameters = noeffect.plate_parameters, scans = noeffect.scans,
         varying_draws = VaryingDraws[_tv_draws()],
         varying_slices = VaryingSlice[VaryingSlice(:draws_g, 1:2, :mu)])
+    # refused: effect term references unknown draws (IR contract)
     @test_throws ContractValidationError validate_structure(orphan)
     dangling = _tv_base()
     dangling2 = StructuralPlan(dangling.responses, dangling.predictors,
@@ -285,6 +325,7 @@ end
         plate_parameters = dangling.plate_parameters, scans = dangling.scans,
         varying_draws = VaryingDraws[_tv_draws()],
         varying_slices = VaryingSlice[VaryingSlice(:draws_g, 1:2, :mu)])
+    # refused: dangling slice with no effect term (IR contract)
     @test_throws ContractValidationError validate_structure(dangling2)
 end
 
@@ -300,6 +341,7 @@ end
     bound = bind_data(plan, cols)
     @test bound.roles[:g] === :group
     # Group column missing.
+    # refused: missing data name (group column `g`)
     @test_throws ContractValidationError bind_data(plan,
         Dict{Symbol,AbstractVector}(:y => cols[:y], :x => cols[:x]))
     # Non-numeric continuous Z.
@@ -309,6 +351,7 @@ end
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :s, :g))
+    # refused: wrong eltype (non-numeric continuous Z column)
     @test_throws ContractValidationError bind_data(strz,
         Dict{Symbol,AbstractVector}(:y => cols[:y],
             :s => ["a", "b", "a", "b"], :g => cols[:g]))
@@ -328,6 +371,7 @@ end
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :s, :g))
+    # refused: dummy level absent from data (all-zero indicator column; unidentified)
     @test_throws ContractValidationError bind_data(dymbad,
         Dict{Symbol,AbstractVector}(:y => cols[:y],
             :s => ["a", "b", "a", "b"], :g => cols[:g]))
@@ -384,6 +428,7 @@ end
     @test ReactiveKernelsPPL._varying_corr_names(only(splan.varying_draws)) ===
         (:L_g, :tau_g, :z_flat_g)
     # Claims: user definitions cannot collide with K=1 names.
+    # refused: name collides with construct-minted name `tau_g` (reserved)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             a ~ Normal(0, 1)
             tau_g = 1.0
@@ -391,6 +436,7 @@ end
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :g))
+    # refused: name collides with construct-minted name `z_flat_g` (reserved)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             a ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
@@ -407,6 +453,7 @@ end
         end, (:y, :x, :g))
     push!(clash.parameters, SampledParameter(:tau_g, :normal,
         (arg1 = 0, arg2 = 1), nothing, :tau_g))
+    # refused: hand-built parameter under minted name `tau_g` (name-table IR contract)
     @test_throws ContractValidationError validate_structure(clash)
 end
 
@@ -430,7 +477,7 @@ end
     # The 1x1 LKJ factor packs zero coordinates; tau rides :exp (Stan
     # lower-bound Jacobian, no renorm) — the intercept and slope alike.
     @test [e.kind for e in layout.entries] ==
-        [:coefficient, :sampled, :varying_corr, :varying, :varying]
+        [:sampled, :sampled, :varying_corr, :varying, :varying]
     @test [e.size for e in layout.entries] == [1, 1, 0, 1, 3]
     @test [e.transform for e in layout.entries] ==
         [:identity, :exp, :lkj, :exp, :identity]
@@ -452,7 +499,7 @@ end
         :x => collect(1.0:8.0))
     slayout = assign_layout(bind_data(splan, scols))
     @test [e.kind for e in slayout.entries] ==
-        [:coefficient, :varying_corr, :varying, :varying]
+        [:sampled, :varying_corr, :varying, :varying]
     @test [e.transform for e in slayout.entries] ==
         [:identity, :lkj, :exp, :identity]
     @test coordinate_names(slayout)[2] === Symbol("tau_g.1")
@@ -613,6 +660,7 @@ end
     @test ReactiveKernelsPPL._varying_corr_names(second) ===
         (:L_g_e, :tau_g_e, :z_flat_g_e)
     # Claims: user definitions cannot collide with correlated names.
+    # refused: name collides with construct-minted name `L_g` (reserved)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             a ~ Normal(0, 1)
             L_g = 1.0
@@ -620,6 +668,7 @@ end
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :g))
+    # refused: name collides with construct-minted name `z_flat_g` (reserved)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             a ~ Normal(0, 1)
             r ~ varying_effect(g, [1, x])
@@ -628,6 +677,7 @@ end
             z_flat_g ~ Normal(0, 1)
         end, (:y, :x, :g))
     # The derived draws are claimed too (constrain-output key).
+    # refused: name collides with construct-minted derived draws `b_g` (reserved)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             a ~ Normal(0, 1)
             b_g = 1.0
@@ -644,10 +694,12 @@ end
         end, (:y, :x, :g))
     push!(clash.parameters, SampledParameter(:tau_g, :normal,
         (arg1 = 0, arg2 = 1), nothing, :tau_g))
+    # refused: hand-built parameter under minted name `tau_g` (name-table IR contract)
     @test_throws ContractValidationError validate_structure(clash)
     # Empty slice ranges fail closed (a vacuous slice).
     empty = _tv_base(; with_effect = true)
     empty.varying_slices[1] = VaryingSlice(:draws_g, 2:1, :mu)
+    # refused: empty slice range (IR contract)
     @test_throws ContractValidationError validate_structure(empty)
 end
 
@@ -668,7 +720,9 @@ end
     @test ReactiveKernelsPPL._lkj_dim(1) == 2
     @test ReactiveKernelsPPL._lkj_dim(3) == 3
     @test ReactiveKernelsPPL._lkj_dim(6) == 4
+    # refused: mathematically invalid input (packed LKJ length 2 is not triangular)
     @test_throws ContractValidationError ReactiveKernelsPPL._lkj_dim(2)
+    # refused: mathematically invalid input (packed LKJ length 5 is not triangular)
     @test_throws ContractValidationError ReactiveKernelsPPL._lkj_dim(5)
     # Roundtrip + Cholesky validity, K = 1..4.
     for (K, u) in ((1, Float64[]), (2, [0.3]), (3, [0.3, -0.5, 0.7]),
@@ -688,8 +742,11 @@ end
     # Log-Jacobian oracle: test_lkj_jacobian.jl (see NOTE above).
     @test lkj_chol_logjac(Float64[], 1) == 0.0
     # Fail-closed: length mismatch, non-square, off-hemisphere.
+    # refused: mathematically invalid input (packed length != K(K-1)/2)
     @test_throws ContractValidationError lkj_chol_constrain([0.1], 3)
+    # refused: mathematically invalid input (non-square Cholesky factor)
     @test_throws ContractValidationError lkj_chol_unconstrain([1.0 0.0], 2)
+    # refused: mathematically invalid input (negative diagonal: not a correlation Cholesky factor)
     @test_throws ContractValidationError lkj_chol_unconstrain(
         [1.0 0.0; 0.5 -0.5], 2)
 end
@@ -714,6 +771,7 @@ end
     @test lkj_corr_cholesky_logpdf(L, 1.0) ≈ -log(2.0)
     # K=2 general branch: const + (2η-2) log L22.
     @test lkj_corr_cholesky_logpdf(L, 2.0) ≈ log(0.75) + 2 * log(L[2, 2])
+    # refused: mathematically invalid input (non-square factor to LKJ logpdf)
     @test_throws ContractValidationError lkj_corr_cholesky_logpdf(
         [1.0 0.0], 1.0)
 end
@@ -733,9 +791,9 @@ end
     layout = assign_layout(bound)
     # `a` rides the intercept coefficient; sampled = [sigma, draws triple].
     @test [e.kind for e in layout.entries] ==
-        [:coefficient, :sampled, :varying_corr, :varying, :varying]
+        [:sampled, :sampled, :varying_corr, :varying, :varying]
     @test [e.name for e in layout.entries] ==
-        [:mu_coef, :sigma, :L_g, :tau_g, :z_flat_g]
+        [:a, :sigma, :L_g, :tau_g, :z_flat_g]
     @test [e.size for e in layout.entries] == [1, 1, 1, 2, 6]
     @test [e.transform for e in layout.entries] ==
         [:identity, :exp, :lkj, :exp, :identity]
@@ -791,17 +849,7 @@ end
                 nt.z_flat_g[s + (gi - 1) * K] for s in 1:j)
         end
     end
-    # A centered block owns `b_flat_<s>` (its sampled draws), so the same
-    # spelling there is a duplicate definition at lowering.
-    @test_throws "b_flat_g is defined twice" lower_rkppl(quote
-            a ~ Normal(0, 5)
-            b_flat_g ~ Exponential(1)
-            d ~ varying_draws(g, [1, x]; centered = true, eta = 1.5,
-                sd = Exponential(2.0))
-            r ~ varying_slice(d, 1:2)
-            mu = a .+ r
-            y .~ Normal.(mu, b_flat_g)
-        end, (:y, :x, :g))
+
 end
 
 # Independent correlated-contribution reference: SB `(diag(tau)*L*z)'`
@@ -966,7 +1014,7 @@ end
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     @test [e.kind for e in built.layout.entries] ==
-        [:coefficient, :coefficient, :sampled, :varying_corr, :varying, :varying]
+        [:sampled, :sampled, :sampled, :varying_corr, :varying, :varying]
     # 2 coefs + s + 1 theta + 2 tau + 2*3 z cells.
     @test built.layout.total == 12
     u = collect(range(-0.4, 0.4; length = built.layout.total))
@@ -1089,34 +1137,41 @@ end
 
 @testset "varying derived margin failures" begin
     # Scalar derived local stays rejected (vector-shaped only).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: scalar derived margin (`m = mean(x)`; Z broadcast) — 0dejlw1 lane (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(quote
             a ~ Normal(0, 5)
             m = mean(x)
             r ~ varying_effect(g, [m])
             mu = a .+ r
             y .~ Normal.(mu, m)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g)); true)
     # Inline expressions bind via an assignment first.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: inline expression margin (`[x .* z]` without a binding) (todo `1308iv0`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [x .* z])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :z, :g))
+        end, (:y, :x, :z, :g)); true)
     # A predictor location inlines and emits no Z column.
+    # refused: cyclic definition (margin `mu` depends on `r`, which depends on `mu`)
     @test_throws SurfaceLoweringError lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [mu])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :g))
     # Sampled parameters are not Z columns.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: parameter-valued margin column (Z = sampled `a`; P8/P10a) (todo `1308iv0`)
+    @test_broken (lower_rkppl(quote
             a ~ Normal(0, 5)
             r ~ varying_effect(g, [a])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g)); true)
     # Predictor structure absorbed into the LP emits no column either.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: parameter-dependent derived margin (`w = b .* x`) (todo `1308iv0`)
+    @test_broken (lower_rkppl(quote
             a ~ Normal(0, 5)
             b ~ Normal(0, 2)
             sigma ~ Exponential(1)
@@ -1124,21 +1179,25 @@ end
             r ~ varying_effect(g, [w])
             mu = a .+ w .+ r
             y .~ Normal.(mu, sigma)
-        end, (:y, :x, :g))
+        end, (:y, :x, :g)); true)
     # `dummy` needs a raw column (level membership needs bound values).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: grouping/dummy coding over a derived data value (ordinary function composition, P8 1cmodra) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             w = x .* z
             r ~ varying_effect(g, [dummy(w, 1)])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :z, :g))
+        end, (:y, :x, :z, :g)); true)
     # Grouping columns stay raw.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: grouping/dummy coding over a derived data value (ordinary function composition, P8 1cmodra) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             w = x .* z
             r ~ varying_effect(w, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
-        end, (:y, :x, :z, :g))
+        end, (:y, :x, :z, :g)); true)
 end
 
 @testset "varying correlated restore_draws" begin
@@ -1196,15 +1255,18 @@ end
     # Empty levels fail.
     bad = _tv_base(; with_effect = true)
     bad.varying_draws[1] = mklevels([])
+    # refused: this used draws block requires a nonempty, unique group-index map (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Duplicate levels fail.
     dup = _tv_base(; with_effect = true)
     dup.varying_draws[1] = mklevels([1, 2, 1])
+    # refused: this used draws block requires a nonempty, unique group-index map (IR contract)
     @test_throws ContractValidationError validate_structure(dup)
     # Non-literal-embeddable levels fail.
     nonemb = _tv_base(; with_effect = true)
     nonemb.varying_draws[1] = mklevels([1, missing])
-    @test_throws ContractValidationError validate_structure(nonemb)
+    # capability: non-literal-embeddable level values are ordinary data values (P10a 0dejlw1) (todo `1308iv0`)
+    @test_broken (validate_structure(nonemb); true)
     # Valid declared levels (order ≠ sorted) pass.
     ok = _tv_base(; with_effect = true)
     ok.varying_draws[1] = mklevels(["b", "a"])
@@ -1230,12 +1292,14 @@ end
     @test assign_layout(bound2).total == 6 # a + 0 thetas + tau + 4 z cells
     # Observed-but-undeclared values fail closed (they would encode 0).
     bad = _tv_with_levels(mkplan(), [1, 2])
+    # refused: an observed group value is absent from its declared index map (Julia indexing, P3)
     @test_throws ContractValidationError bind_data(bad, cols)
     # Hand-built bound plans with `levels === nothing` fail loud.
     hand = bind_data(mkplan(), cols)
     hb = only(hand.varying_draws)
     hand.varying_draws[1] = VaryingDraws(hb.group, hb.kind, hb.margins,
         hb.lkj_eta, hb.label, hb.suffix, nothing)
+    # refused: a bound draws block must have its resolved level map (IR contract)
     @test_throws ContractValidationError validate_data(hand)
     # Same-group draws must agree on levels (order included).
     two = lower_rkppl(quote
@@ -1260,6 +1324,7 @@ end
             y .~ Normal.(mu, 1.5)
         end, (:y, :g))
     _tv_with_levels(_tv_with_levels(disagree, [2, 1, 3], 1), [1, 2, 3], 2)
+    # refused: draws sharing one IR group-index map must use the same ordered levels (IR contract)
     @test_throws ContractValidationError bind_data(disagree, cols)
 end
 
@@ -1271,7 +1336,7 @@ function _tv_levels_plan(lv)
     call = Expr(:call, :varying_effect,
         Expr(:parameters, Expr(:kw, :levels, lv)), :g, Expr(:vect, 1))
     return lower_rkppl(Expr(:block,
-            Expr(:call, :~, :r, call),
+            Expr(:call, :~, :r, call), :(a ~ Normal(0, 1)),
             :(mu = a .+ r), :(y .~ Normal.(mu, 1.5))),
         (:y, :g))
 end
@@ -1287,6 +1352,7 @@ _tv_levels_vals(vals::Vector) =
     end
     # Eta combo; omitted levels stay `nothing` (bind derives).
     combo = lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [1, x]; eta = 2.0, levels = [:c, :a])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
@@ -1294,6 +1360,7 @@ _tv_levels_vals(vals::Vector) =
     b = only(combo.varying_draws)
     @test b.levels == [:c, :a] && b.lkj_eta == 2.0
     bare = lower_rkppl(quote
+            a ~ Normal(0, 1)
             r ~ varying_effect(g, [1])
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
@@ -1304,19 +1371,32 @@ end
 @testset "varying levels surface failures" begin
     # Not a literal vector: string / bare column / range.
     for lv in ("ab", :g, Expr(:call, :(:), 1, 3))
-        @test_throws SurfaceLoweringError _tv_levels_plan(lv)
+        if lv isa String
+            # refused: a String is one value, not a level collection (P2/P3).
+            @test_throws SurfaceLoweringError _tv_levels_plan(lv)
+        else
+            # capability: data-valued and range-valued level collections (P10a 0dejlw1; todo `1308iv0`).
+            @test_broken (_tv_levels_plan(lv); true)
+        end
     end
     # Empty / duplicates.
+    # refused: a used grouping map cannot be empty (group-index domain, P3)
     @test_throws SurfaceLoweringError _tv_levels_plan(Expr(:vect))
+    # refused: a level-index map needs unique keys (group-index domain, P3).
     @test_throws SurfaceLoweringError _tv_levels_plan(Expr(:vect, "a", "a"))
     # Bare names are not level values (one or all).
+    # refused: bare a and b are undeclared names, not quoted level values (P6, 05oe96l)
     @test_throws SurfaceLoweringError _tv_levels_plan(Expr(:vect, :a, :b))
     @test_throws SurfaceLoweringError _tv_levels_plan(Expr(:vect, 1, "a", :b))
     # Non-literal elements: nested vector / call / non-embeddable value.
-    @test_throws SurfaceLoweringError _tv_levels_plan(Expr(:vect, 1, Expr(:vect, 2)))
-    @test_throws SurfaceLoweringError _tv_levels_plan(Expr(:vect, 1, Expr(:call, :f, 2)))
-    @test_throws SurfaceLoweringError _tv_levels_plan(Expr(:vect, 1, missing))
+    # capability: a nested vector is a level value (P10a 0dejlw1) (todo `1308iv0`)
+    @test_broken (_tv_levels_plan(Expr(:vect, 1, Expr(:vect, 2))); true)
+    # capability: computed level values from ordinary Julia calls (P8 1cmodra; todo `1308iv0`)
+    @test_broken (_tv_levels_plan(Expr(:vect, 1, Expr(:call, :identity, 2))); true)
+    # capability: Missing as an ordinary level value (P10a 0dejlw1; todo `1308iv0`)
+    @test_broken (_tv_levels_plan(Expr(:vect, 1, missing)); true)
     # Unknown keyword (the reworded two-keyword gate).
+    # refused: foo is not a keyword of varying_effect (Julia keyword contract, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             r ~ varying_effect(g, [1]; foo = 1)
             mu = a .+ r
@@ -1330,6 +1410,7 @@ end
     catch e
         e
     end
+    # refused: a String is not a level collection (P2/P3).
     @test err isa SurfaceLoweringError &&
         occursin("takes a literal level vector", sprint(showerror, err))
     err = try
@@ -1338,6 +1419,7 @@ end
     catch e
         e
     end
+    # refused: a is undeclared, whereas :a is a quoted level value (P6, 05oe96l).
     @test err isa SurfaceLoweringError &&
         occursin("is a bare name", sprint(showerror, err)) &&
         occursin("`:a`", sprint(showerror, err))
@@ -1474,17 +1556,23 @@ end
         b.suffix, [1, 2]).sd_priors == VaryingSdPrior[]
     mksd(sd) = _tv_with_sd(_tv_base(; with_effect = true), sd)
     # Wrong length fails (K = 2 here).
+    # refused: the sd-prior vector must match the declared margin count (IR contract)
     @test_throws ContractValidationError validate_structure(
         mksd([VaryingSdPrior(:exponential, 1 / 3)]))
     # Unknown family fails.
+    # refused: gamma is not a family in this one-parameter sd-prior IR enum
+    # (IR contract); general library priors use ordinary parameter statements.
     @test_throws ContractValidationError validate_structure(mksd(
         [VaryingSdPrior(:gamma, 2.0), VaryingSdPrior(:std_normal, 1.0)]))
     # Non-finite params fail, even on `:std_normal`.
+    # refused: a distribution scale/rate must be finite and strictly positive (distribution domain, P3)
     @test_throws ContractValidationError validate_structure(mksd(
         [VaryingSdPrior(:std_normal, NaN), VaryingSdPrior(:std_normal, 1.0)]))
     # Non-positive scale/sd fail.
+    # refused: a distribution scale/rate must be finite and strictly positive (distribution domain, P3)
     @test_throws ContractValidationError validate_structure(mksd(
         [VaryingSdPrior(:exponential, 0.0), VaryingSdPrior(:std_normal, 1.0)]))
+    # refused: a distribution scale/rate must be finite and strictly positive (distribution domain, P3)
     @test_throws ContractValidationError validate_structure(mksd(
         [VaryingSdPrior(:normal, -1.0), VaryingSdPrior(:std_normal, 1.0)]))
     # A finite `:std_normal` param is ignored, not rejected.
@@ -1730,25 +1818,31 @@ end
         ("per-margin tuple", :((Cauchy(0, 5), Normal(0, 2))),
             "per-margin sd priors are planned"),
     )
-    for (_, raw, msg) in bad
+    for (label, raw, msg) in bad
         err = try
             lower_rkppl(Expr(:block,
                     :(mu ~ Normal(0, 5)),
                     Expr(:call, :~, :r, Expr(:call, :varying_effect, :g,
-                            Expr(:vect, 1),
+                            (label == "per-margin tuple" ? Expr(:vect, 1, :x) : Expr(:vect, 1)),
                             Expr(:parameters,
                                 Expr(:kw, :eta, 1.0),
                                 Expr(:kw, :sd, raw)))),
                     :(eta = mu .+ r),
                     Expr(:call, :.~, :y,
                         Expr(:., :Normal, Expr(:tuple, :eta, :sigma)))),
-                (:y, :sigma, :g))
+                (:y, :sigma, :g, :x))
             nothing
         catch e
             e
         end
-        @test err isa SurfaceLoweringError
-        @test occursin(msg, sprint(showerror, err))
+        if label in ("nonzero location", "exponential arity", "per-margin tuple")
+            # capability: ordinary SD priors, default Exponential and per-margin priors (P8 1cmodra; 10gzbm9 support-links; todo `1308iv0`).
+            @test_broken (err === nothing || throw(err))
+        else
+            # refused: constructor arity/domain, non-distribution literal or undeclared s (P3/P6, 05oe96l).
+            @test err isa SurfaceLoweringError
+            @test occursin(msg, sprint(showerror, err))
+        end
     end
 end
 

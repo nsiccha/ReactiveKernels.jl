@@ -197,3 +197,21 @@ and lock the one Reactant 0.2.289 lifted:
   Kronecker-eigenspace marginal likelihood: its owned
   `rk_symmetric_eigvals`/`rk_symmetric_eigvecs` margins call
   `eigen(Symmetric(·))` as their primal and fail the same way.
+- Arbitrary-order `SpecialFunctions.besselix(order, x)` has no method for
+  a traced scalar `x` in Reactant 0.2.289:
+  `repro_reactant_besselix_order.jl` isolates the missing method without
+  ReactiveKernels. The periodic HSGP library's spectral weights require
+  this function, so that effect supports native primal and Enzyme gradients
+  but cannot compile with Reactant. Its acceptance test pins this exact
+  `MethodError`; other failures remain errors. The ordinary formula stays
+  intact, with no foreign-function derivative rule or tracing workaround.
+- Linear indexing of an adjoint vector (`b = (z * sd)'`, then `b[g]`)
+  fails during Reactant 0.2.290 tracing: the adjoint converts the integer
+  positions to two-dimensional Cartesian indices, which the backend applies
+  to its underlying one-dimensional `LinearIndices`:
+  `repro_reactant_adjoint_linear_gather.jl`. Ordinary matrix linear indexing
+  compiles in the same standalone reproducer. RKPPL keeps ordinary Julia
+  indexing; this row gather supports native primal and Enzyme reverse but is
+  excluded by name from compiled parity and structure acceptance. Linear
+  matrix gathers and positional gathers from module-produced arrays pass
+  compiled primal, reverse and fixed-operation-count checks.

@@ -4,6 +4,10 @@
 # affine under IdentityLink; the combination tree evaluates in-graph.
 @testset "composed product lowers" begin
     plan = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
+        a_al ~ Normal(0, 1)
+        b_al ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         al = a_al .+ b_al .* xs
         be ~ Normal(0.0, 100.0)
@@ -22,17 +26,20 @@
     @test t.options.subs == [:th, :al]
     @test t.options.scalars == [:be]
     @test t.options.tree == :(be .* (th .- al))
-    @test Set([(p.predictor, p.addressee)
-        for p in plan.population_priors]) ==
-        Set([(:th, :Intercept), (:th, :xs), (:al, :Intercept), (:al, :xs)])
+    @test isempty(plan.population_priors)
     @test [(p.name, p.family) for p in plan.parameters] ==
-        [(:be, :normal)]
+        [(:a_th, :normal), (:b_th, :normal), (:a_al, :normal),
+            (:b_al, :normal), (:be, :normal)]
     @test isempty(plan.derived)
     @test isempty(plan.assignments)
 end
 
 @testset "composed additive and scalar-star" begin
     add = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
+        a_al ~ Normal(0, 1)
+        b_al ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         al = a_al .+ b_al .* xs
         eta = th .+ al
@@ -44,6 +51,8 @@ end
     @test isempty(t.options.scalars)
     # Julia-valid scalar `*` normalizes to dotted (Base broadcasts).
     star = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
         eta = be * th
@@ -69,11 +78,12 @@ end
     t = only(plan.predictors[2].terms)
     @test t.kind === ComposedTerm
     @test t.options.subs == [:th]
-    @test [(p.predictor, p.addressee) for p in plan.population_priors] ==
-        [(:th, :g)]
+    @test isempty(plan.population_priors)
+    @test only(plan.array_parameters).name === :c
     # Under `.+` the same alias keeps the affine merge (with
     # unstated-coefficient defaults) — never reroutes into a composition.
     aff = lower_rkppl(quote
+        b ~ Normal(0, 1)
         c[levels(g)] .~ Normal.(0, 2)
         th = c[g]
         mu = th .+ b .* x
@@ -86,6 +96,8 @@ end
 
 @testset "composed inline and scale locations" begin
     inl = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
         y .~ Bernoulli.(logistic.(be .* th))
@@ -93,6 +105,10 @@ end
     @test [p.name for p in inl.predictors] == [:th, :y_eta]
     @test only(inl.predictors[2].terms).kind === ComposedTerm
     vscale = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         mu = a .+ b .* xs
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
@@ -107,6 +123,8 @@ end
     # A name bound to a composition inlines at its use (naming a
     # subexpression never changes legality; v1 failed these closed).
     plan = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
         ga ~ Normal(0.0, 100.0)
@@ -120,6 +138,8 @@ end
     # ... including through a shared composed root that is also a
     # response location (the root interns; the use site inlines it).
     shared = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
         ga ~ Normal(0.0, 100.0)
@@ -137,6 +157,8 @@ end
     # A bound data column reads elementwise in-graph as a tree leaf and
     # rides the composed term's columns (v1/v2 failed these closed).
     plan = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         be ~ Normal(0.0, 100.0)
         eta = be .* (th .+ xs)
@@ -148,6 +170,10 @@ end
     @test t.columns == [:xs]
     # `logistic.` maps (and a name bound to a map composition) inline.
     curve = lower_rkppl(quote
+        a_l ~ Normal(0, 1)
+        b_l ~ Normal(0, 1)
+        a_s ~ Normal(0, 1)
+        b_s ~ Normal(0, 1)
         loc = a_l .+ b_l .* g
         ls = a_s .+ b_s .* g
         xi = (xs .- loc) .* exp.(ls)
@@ -165,28 +191,38 @@ end
 end
 
 @testset "composed bare maps stay link spellings" begin
-    # A map over ONE bare sub-predictor at a location (inline or through
-    # a name) is a link spelling, never a composition: families without
-    # that link fail closed exactly as before compositions existed.
+    # A map over a predictor is an ordinary computed location value.
     D = (:y, :x)
     Dict1 = Dict{Symbol,AbstractVector}(:y => [0.3], :x => [0.5])
-    @test_throws ContractValidationError bind_data(lower_rkppl(quote
+    # admitted: Gaussian location under exp. (log-link Normal)
+    @test (bind_data(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(exp.(mu), 1.5)
-    end, D), Dict1)
-    @test_throws ContractValidationError bind_data(lower_rkppl(quote
+    end, D), Dict1); true)
+    # admitted: Gaussian location under exp. through a named map
+    @test (bind_data(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         m = exp.(mu)
         y .~ Normal.(m, 1.5)
-    end, D), Dict1)
+    end, D), Dict1); true)
     # ... while the Poisson log link still peels.
     pois = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Poisson.(exp.(mu))
     end, D)
     @test only(pois.predictors).link === LogLink
     # A named map inside a real combination still inlines.
     plan = lower_rkppl(quote
+        a_la ~ Normal(0, 1)
+        b_la ~ Normal(0, 1)
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         la = a_la .+ b_la .* xs
         al = exp.(la)
@@ -200,16 +236,19 @@ end
 
 @testset "composed fail-closed" begin
     # Undotted vector combination: Julia-truthful, write the dots.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: undotted array arithmetic be * th - al (valid Julia: scalar*vector and vector-vector) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
         th = a_th .+ b_th .* xs
         al = a_al .+ b_al .* xs
         be ~ Normal(0.0, 100.0)
         eta = be * th - al
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs)); true)
     # A literal scale is one scalar leaf (a synthetic assignment), like
     # any sub-free scalar subexpression (test_fallback.jl).
     lit = lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         eta = 2.0 .* th
         y .~ Bernoulli.(logistic.(eta))
@@ -220,6 +259,8 @@ end
     # predictor analysis re-screens strictly).
     err = try
         lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* xs
             p = logistic.(mu)
             y .~ Normal.(p, 1.0)
@@ -228,10 +269,13 @@ end
     catch e
         e
     end
-    @test err isa SurfaceLoweringError
-    @test occursin("`.~` link", sprint(showerror, err))
+    # capability: valid ordinary value composition (P8 1cmodra; todo `15lq8iu`).
+    @test_broken (err === nothing || throw(err))
     # A scalar leaf names a sampled name or scalar definition — or fails.
+    # refused: be has no declaration (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         eta = be .* th
         y .~ Bernoulli.(logistic.(eta))
@@ -240,6 +284,7 @@ end
     # ordinary parameter read twice (its sub-predictor summand lowers as a
     # derived column — test_fallback.jl).
     twice = lower_rkppl(quote
+        a ~ Normal(0, 1)
         th = a .+ b .* xs
         b ~ Normal(0, 1)
         eta = b .* th
@@ -247,10 +292,13 @@ end
     end, (:y, :xs))
     @test any(p -> p.name === :b, twice.parameters)
     @test [t.kind for t in twice.predictors[1].terms] ==
-        [InterceptTerm, OffsetTerm]
+        [InterceptTerm, ContinuousTerm]
     # Shrinkage priors go on the coefficient-holding sub-predictors,
     # never the composed root.
+    # refused: r2d2 decomposes a coefficient-holding predictor; a nonlinear root has no coefficient block (one stated prior per coefficient, P7/P8 1cmodra)
     @test_throws SurfaceLoweringError lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
         r2d2(eta, R2, phi)
         R2 ~ Beta(1, 1)
         phi ~ Dirichlet(2, 1.0)
@@ -274,6 +322,7 @@ end
         catch e
             e
         end
+        # refused: exp and logistic each take one operand (Julia MethodError, P3).
         @test err isa SurfaceLoweringError
         @test occursin("takes one operand", sprint(showerror, err))
     end
@@ -306,9 +355,7 @@ function _cmp_ap_check(prog, q::NamedTuple, want; cols = _CMP_AP_COLS)
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     lay = built.layout
-    base = constrain(lay, zeros(lay.total))
-    @test issubset(keys(q), keys(base))  # probe keys are draws keys
-    u = unconstrain(lay, merge(base, q))
+    u = unconstrain(lay, q)
     kern = prepare_query(built, bound, :sampler)
     @test Base.invokelatest(kern, u) ≈ want(q) + logjac(lay, u) rtol = 1e-12
     prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
@@ -319,7 +366,7 @@ function _cmp_ap_check(prog, q::NamedTuple, want; cols = _CMP_AP_COLS)
     return plan, bound, built
 end
 
-# `a`: the location's coefficient (no intercept).
+# `a` in the location's coefficient block `mu` (no intercept).
 const _CMP_AP_Q = (a = 0.7, s1 = 0.5, s2 = 0.3)
 _cmp_ap_want(q) = _cmp_ap_loglik(q.a .* _cmp_ap_x(), q.s1, q.s2) +
     logpdf(Normal(0, 1), q.a) + _cmp_ap_scales(q)
@@ -341,8 +388,7 @@ _cmp_ap_want(q) = _cmp_ap_loglik(q.a .* _cmp_ap_x(), q.s1, q.s2) +
     @test t.options.tree == Expr(:., GlobalRef(Main, :hypot),
         Expr(:tuple, :s1, :(mu .* s2)))
     @test isempty(plan.derived)
-    @test [(p.predictor, p.addressee) for p in plan.population_priors] ==
-        [(:mu, :x)]
+    @test isempty(plan.population_priors)
     # The scale reads the location's LP node; nothing re-evaluates it.
     src = string(kernel_expr(bound, built.layout))
     @test occursin("_ppl_lp_sd = Main.hypot.(s1, _ppl_lp_mu .* s2)", src)
@@ -363,7 +409,7 @@ _cmp_ap_want(q) = _cmp_ap_loglik(q.a .* _cmp_ap_x(), q.s1, q.s2) +
     end, _CMP_AP_Q, _cmp_ap_want)
     @test only(named.predictors[end].terms).options.tree ==
         Expr(:., GlobalRef(Main, :hypot), Expr(:tuple, :s1, :(mu .* s2)))
-    # Intercept plus slope: `b0` and `a`.
+    # Intercept plus slope: the block is `[Intercept, x]`.
     _cmp_ap_check(quote
         b0 ~ Normal(0.0, 5.0); a ~ Normal(0.0, 1.0)
         s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
@@ -437,22 +483,15 @@ const _CMP_XR_COLS = merge(_CMP_AP_COLS, Dict{Symbol,AbstractVector}(
     end, (a = 0.7, b = 0.4, s1 = 0.5, s2 = 0.3), want;
         cols = _CMP_XR_COLS)
     @test only(plan.predictors[end].terms).kind === ComposedTerm
-    # The reader's response first: not built yet (residual of snag
-    # `rkppl-predictor-f40e6808`).
-    ok = try
-        bind_data(lower_rkppl(quote
-            a ~ Normal(0.0, 1.0); b ~ Normal(0.0, 1.0)
-            s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
-            mu = a .* x
-            m2 = b .* x
-            sd = hypot.(s1, mu .* s2)
-            z .~ Normal.(m2, sd)
-            y .~ Normal.(mu, 1.0)
-        end, keys(_CMP_XR_COLS)), _CMP_XR_COLS)
-        true
-    catch e
-        e isa Union{SurfaceLoweringError,ContractValidationError} || rethrow()
-        false
-    end
-    @test_broken ok
+    # Ordinary declarations also preserve the density with the reader first.
+    _cmp_ap_check(quote
+        a ~ Normal(0.0, 1.0); b ~ Normal(0.0, 1.0)
+        s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
+        mu = a .* x
+        m2 = b .* x
+        sd = hypot.(s1, mu .* s2)
+        z .~ Normal.(m2, sd)
+        y .~ Normal.(mu, 1.0)
+    end, (a = 0.7, b = 0.4, s1 = 0.5, s2 = 0.3), want;
+        cols = _CMP_XR_COLS)
 end

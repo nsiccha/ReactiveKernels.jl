@@ -110,73 +110,87 @@ end
 
 @testset "spline surface fail-closed" begin
     # Unquoted id.
+    # refused: unquoted id `s_x` is an undeclared name (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(s_x, x; k = 4)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
     # Non-data axis.
+    # refused: undeclared name `w` as axis (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, w; k = 4)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
     # Three axes.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: 3-axis spline basis (tensor smooth over three margins) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
             spline_basis(:s_x, x, z, w; k = 4)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z, :w))
+        end, (:y, :x, :z, :w)); true)
     # Bad kind value.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: cubic-regression spline basis (kind = :cr) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
             spline_basis(:s_x, x; kind = :cr)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x)); true)
     # Kind/arity mismatch both ways.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: single-margin t2 spline (kind = :t2 on one axis; mgcv admits t2(x)) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
             spline_basis(:s_x, x; kind = :t2)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :x)); true)
+    # capability: two-axis thin-plate spline (kind = :tps over (x, z), isotropic s(x, z)) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
             spline_basis(:t2_xz, x, z; kind = :tps)
             mu = spline(:t2_xz)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z))
+        end, (:y, :x, :z)); true)
     # k too small / non-literal / wrong shape.
+    # refused: k = 2 leaves no penalized block (k must exceed the TPS null-space dimension 2)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 2)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: data-derived basis size k (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            kk = length(x)
             spline_basis(:s_x, x; k = kk)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x)); true)
+    # refused: k tuple length differs from axis count (malformed)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = (4, 4))
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: scalar k broadcast per margin for t2 (hsgp_basis already broadcasts scalars) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
             spline_basis(:t2_xz, x, z; k = 5)
             mu = spline(:t2_xz)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z))
+        end, (:y, :x, :z)); true)
+    # refused: margin k = 2 leaves no penalized block (degenerate)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:t2_xz, x, z; k = (5, 2))
             mu = spline(:t2_xz)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x, :z))
     # Deferred options fail closed.
+    # refused: `bs` is mgcv vocabulary duplicating `kind =` (P10, P2)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4, bs = :cr)
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
     # Duplicate declaration.
+    # refused: single assignment, basis :s_x declared twice
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             spline_basis(:s_x, x; k = 5)
@@ -184,74 +198,94 @@ end
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
     # Unknown / reused / negated / nested uses.
+    # refused: undeclared basis id :nope (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             mu = spline(:nope)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: spline summand value reuse: same basis twice in one predictor (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             mu = spline(:s_x) .+ spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :x)); true)
+    # capability: one spline basis shared by two predictors (value reuse) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
+            c ~ Normal(0, 1)
             spline_basis(:s_x, x; k = 4)
             mu = a .+ spline(:s_x)
             nu = c .+ spline(:s_x)
             y .~ Normal.(mu, 1.0)
             z .~ Normal.(nu, 1.0)
-        end, (:y, :z, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :z, :x)); true)
+    # capability: negated spline summand (`a .- spline(:s)`) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             spline_basis(:s_x, x; k = 4)
             mu = a .- spline(:s_x)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x)); true)
+    # refused: a coefficient times a flat-prior spline block is an unidentified ridge
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             mu = a .+ b .* spline(:s_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
     # spline() inside definitions (scalar + derived).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: spline value bound in a definition (`w = spline(:s)`) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             spline_basis(:s_x, x; k = 4)
             w = spline(:s_x)
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :x)); true)
+    # capability: spline value combined with data in a definition (`w = spline(:s) .+ x`) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             spline_basis(:s_x, x; k = 4)
             w = spline(:s_x) .+ x
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :x)); true)
+    # capability: spline value combined with coefficient terms in a definition (`w = spline(:s) .+ b .* x`) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             spline_basis(:s_x, x; k = 4)
             w = spline(:s_x) .+ b .* x
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x)); true)
     # Reserved names.
+    # refused: reserved-name collision `spline`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline = 1.0
             y .~ Normal.(mu, 1.0)
         end, (:y,))
+    # refused: reserved-name collision `spline_basis`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis ~ Normal(0, 1)
             y .~ Normal.(mu, 1.0)
         end, (:y,))
     # Generated-name claims: user definitions cannot collide.
+    # refused: single assignment, collides with basis-claimed `b_s_x_fixed`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             b_s_x_fixed = 1.0
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: single assignment, collides with materialized basis column `s_x_Xnull_1`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             s_x_Xnull_1 = 1.0
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: single assignment, collides with basis-claimed `sd_s_x`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
             sd_s_x ~ Normal(0, 1)
@@ -280,78 +314,95 @@ end
     # Block structure must match (kind, k) exactly.
     badblocks = SplineBasisBlock[SplineBasisBlock(:fixed, 2, Symbol[]),
         SplineBasisBlock(:pen, 3, Symbol[])]
+    # refused: block structure does not match (kind, k) (IR contract)
     @test_throws ContractValidationError validate_structure(
         _smutant(; blocks = badblocks))
     # Vector set: dropped / extra / orphan.
     plan = _svalid_plan()
+    # refused: dropped spline vector (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; vectors = plan.spline_vectors[1:2]))
     extra = vcat(plan.spline_vectors,
         SplineVector[SplineVector(:bogus, :normal, (arg1 = 0, arg2 = 1),
             nothing, 1, :s_x, :bogus)])
+    # refused: extra spline vector (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; vectors = extra))
     orphan = vcat(plan.spline_vectors,
         SplineVector[SplineVector(:b_nope_fixed, :flat, NamedTuple(), nothing,
             2, :nope, :b_nope_fixed)])
+    # refused: orphan spline vector (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; vectors = orphan))
     # Vector shape: family / args / support / width pinned.
     vs = copy(plan.spline_vectors)
     vs[1] = SplineVector(vs[1].name, :normal, (arg1 = 0, arg2 = 1), nothing,
         vs[1].width, vs[1].basis, vs[1].label)
+    # refused: fixed-vector family pinned (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; vectors = vs))
     vs = copy(plan.spline_vectors)
     vs[2] = SplineVector(vs[2].name, vs[2].family, (arg1 = 0, arg2 = 2),
         nothing, vs[2].width, vs[2].basis, vs[2].label)
+    # refused: raw-vector args pinned (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; vectors = vs))
     vs = copy(plan.spline_vectors)
     vs[3] = SplineVector(vs[3].name, vs[3].family, vs[3].args, nothing,
         vs[3].width, vs[3].basis, vs[3].label)
+    # refused: sd support override pinned (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; vectors = vs))
     vs = copy(plan.spline_vectors)
     vs[2] = SplineVector(vs[2].name, vs[2].family, vs[2].args,
         vs[2].support_override, 3, vs[2].basis, vs[2].label)
+    # refused: vector width pinned (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; vectors = vs))
     # Linkage: dangling basis / double use / unknown summand target.
     nopred = PredictorSpec(plan.predictors[1].name,
         plan.predictors[1].link, plan.predictors[1].terms[1:1],
         plan.predictors[1].label)
+    # refused: dangling basis with no summand (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; predictors = PredictorSpec[nopred]))
     two = PredictorSpec(plan.predictors[1].name, plan.predictors[1].link,
         vcat(plan.predictors[1].terms, _summand(:mu, :s_x)),
         plan.predictors[1].label)
+    # refused: basis used twice (IR contract; mirrors C at :192)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; predictors = PredictorSpec[two]))
     bad = PredictorSpec(plan.predictors[1].name, plan.predictors[1].link,
         vcat(plan.predictors[1].terms[1:1], _summand(:mu, :nope)),
         plan.predictors[1].label)
+    # refused: summand names an unknown basis (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; predictors = PredictorSpec[bad]))
     # kind/k/axes shape.
+    # refused: kind :cr (IR contract; mirrors C at :131)
     @test_throws ContractValidationError validate_structure(
         _smutant(; kind = :cr))
+    # refused: tuple k on a tps basis (IR contract)
     @test_throws ContractValidationError validate_structure(
         _smutant(; k = (4, 4)))
+    # refused: k = 2 (IR contract)
     @test_throws ContractValidationError validate_structure(
         _smutant(; k = 2))
+    # refused: tps basis with two axes (IR contract; mirrors C at :142)
     @test_throws ContractValidationError validate_structure(
         _smutant(; axes = [:x, :z]))
     # Materialized-name clash with a parameter: rename the id.
     clash = vcat(plan.parameters,
         SampledParameter[SampledParameter(:s_x_Xnull_1, :normal,
             (arg1 = 0, arg2 = 1), nothing, :s_x_Xnull_1)])
+    # refused: materialized-name clash with a parameter (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; parameters = clash))
     # Spline-vector names join the name tables.
     dup = copy(plan.spline_vectors)
     dup[1] = SplineVector(:a, dup[1].family, dup[1].args,
         dup[1].support_override, dup[1].width, dup[1].basis, dup[1].label)
+    # refused: spline-vector name clashes with a name table (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; vectors = dup))
 end
@@ -378,16 +429,20 @@ end
     # Reserved-name exclusivity: caller columns cannot squat basis names.
     cols = _spline_cols()
     cols[:s_x_Xnull_1] = ones(12)
+    # refused: caller column squats a generated basis-column name (name collision)
     @test_throws ContractValidationError bind_data(plan, cols)
     # Missing / non-numeric axes.
+    # refused: missing axis data column
     @test_throws ContractValidationError bind_data(plan,
         Dict{Symbol,AbstractVector}(:y => _spline_cols()[:y]))
     cols = _spline_cols()
     cols[:x] = fill("a", 12)
+    # refused: wrong eltype, non-numeric axis column
     @test_throws ContractValidationError bind_data(plan, cols)
     # Fit errors surface as bind errors (k=4 needs 4 unique x).
     few = Dict{Symbol,AbstractVector}(:x => [1.0, 1.0, 2.0],
         :y => [1.0, 2.0, 3.0])
+    # refused: fewer unique axis values than k (basis fit impossible)
     @test_throws ContractValidationError bind_data(plan, few)
     # t2 materializes four blocks in SB order.
     t2 = bind_data(_svalid_plan(; t2 = true), _spline_cols(; t2 = true))
@@ -426,7 +481,7 @@ end
     bound = bind_data(_svalid_plan(), _spline_cols())
     layout = assign_layout(bound)
     @test [e.kind for e in layout.entries] ==
-        [:coefficient, :sampled, :spline, :spline, :spline]
+        [:sampled, :sampled, :spline, :spline, :spline]
     @test [e.size for e in layout.entries] == [1, 1, 1, 2, 1]
     @test [e.transform for e in layout.entries] ==
         [:identity, :exp, :identity, :identity, :exp]
@@ -530,6 +585,7 @@ end
     i = findfirst(v -> v.name === :sd_s_x, vs)
     vs[i] = SplineVector(vs[i].name, vs[i].family, vs[i].args,
         :positive_stan, vs[i].width, vs[i].basis, vs[i].label)
+    # refused: positive-support sd family carrying the Stan-kernel override (IR contract)
     @test_throws ContractValidationError validate_structure(
         _swith(plan; vectors = vs))
 end
@@ -689,6 +745,12 @@ end
         sb = [-2.7161630767907803, -8.4332465153243046, -2.7041630767907803,
             5.9857744480450616, 2.7109163710758355, 4.5566881239299892,
             1.574046502394695]
+        # SB ran on strato2's raw-LAPACK basis; RK's canonical basis
+        # (decision 1vts6mb) has penalized column 2 flipped against it.
+        # b_s_x_raw.2 is 0 at this u, so the value is unchanged and only
+        # that gradient component changes sign. Drop once BRM adopts the
+        # canonical signs (BRM todo 1wo7z27).
+        sb[6] = -sb[6]
         # SB's constant-coefficient gradient is the likelihood's slope in
         # the intercept; add the moved intercept's prior slope -0.4/25.
         @test maximum(abs.(g .- [sb[3] - 0.4 / 25; sb[[2, 4, 5, 6, 7]]])) <

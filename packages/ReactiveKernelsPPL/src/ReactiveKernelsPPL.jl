@@ -48,7 +48,7 @@ export KernelPlate, LinearPKScheduleSpec, LinearPKEventLPSpec
 export EVENT_LP_NAME
 export LevelMap
 export DesignMatrix
-export StructuralPlan
+export StructuralPlan, SubmodelScope
 export ContractValidationError, validate_plan, validate_structure, validate_data
 export topological_order, isbound, bind_data, COLUMN_ROLES
 export admitted_families, admitted_terms, admitted_functions, admitted_elementwise
@@ -75,9 +75,14 @@ export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
 export RKPPLModel, RKPPLSubmodel, lower_rkppl, @rkppl, SurfaceLoweringError
 export ordered_logistic, monotonic, differenced_ar1, r2d2_coefs,
-    horseshoe_coefs
+    horseshoe_coefs, penalized_smooth, t2_smooth, hsgp_effect,
+    hsgp_periodic_effect, hsgp_grouped_effect
 export varying_coefs, varying_coefs_correlated, varying_coefs_centered,
-    varying_coefs_centered_correlated, varying_stratified
+    varying_coefs_centered_correlated, varying_stratified,
+    varying_stratified_correlated
+export tps_basis, t2_basis, hsgp_basis, hsgp_periodic_basis, hsgp_sqrt_spd,
+    hsgp_grouped_sqrt_spd, hsgp_periodic_sqrt_spd, hsgp_rho_floors,
+    hsgp_periodic_rho_floor
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
 export DarSpec
 export LINEAR_EVENT_READ, LINEAR_EVENT_DOSE, LINEAR_EVENT_DOSE_SEGMENT
@@ -111,7 +116,6 @@ export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
     prepare_transit_twocmt_rule
 
 include("contract.jl")
-include("varying_centered.jl")
 include("expm_rule.jl")
 # Owned symmetric-eigendecomposition rules: defined in
 # ReactiveKernelsDistributionKernels (beside `loggamma` / `logbeta`),
@@ -135,6 +139,7 @@ include("surface.jl")
 include("scan.jl")
 include("qt_joint.jl")
 include("tgi.jl")
+include("smooth_bases.jl")
 include("library.jl")
 
 # Late import into the generated-models scope: `PPLGeneratedModels`

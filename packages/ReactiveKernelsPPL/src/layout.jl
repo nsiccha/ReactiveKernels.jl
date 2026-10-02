@@ -29,6 +29,11 @@ function support_of(family::Symbol, override::SupportOverride)
         "[layout] a uniform prior carries its own interval support — no " *
         "support override applies, got $override"))
     if override isa Tuple
+        if override[1] === :lower
+            inferred === :positive || throw(ContractValidationError(
+                "[layout] :lower override needs a positive-support family"))
+            return :floored
+        end
         if override[1] === :upper
             length(override) == 2 || throw(ContractValidationError(
                 "[layout] tuple support override must be (:upper, hi), got $override"))
@@ -55,6 +60,21 @@ function support_of(family::Symbol, override::SupportOverride)
     return :positive
 end
 
+# A `(:lower, name)` bound reads the bound model-level data value `name` (a
+# finite non-negative number); every other override passes through.
+_bound_override(::StructuralPlan, ov) = ov
+function _bound_override(plan::StructuralPlan, ov::Tuple{Symbol,Symbol})
+    ov[1] === :lower || return ov
+    haskey(plan.columns, ov[2]) || throw(ContractValidationError(
+        "[layout] lower bound $(ov[2]) is not bound data (bind the plan " *
+        "first, or define it from data)"))
+    v = plan.columns[ov[2]]
+    v isa Real && isfinite(v) && v >= 0 || throw(ContractValidationError(
+        "[layout] lower bound $(ov[2]) must be a finite non-negative " *
+        "number, got $(summary(v))"))
+    return (:lower, Float64(v))
+end
+
 # The transform kind and (for :interval/:upper) the constrained bounds a
 # layout entry needs, from a parameter's family + support override (+ args:
 # a uniform's bounds come from its literal args, not an override).
@@ -68,6 +88,12 @@ function _entry_transform(family::Symbol, override::SupportOverride,
     end
     if support === :upper
         return (:upper, NaN, Float64(override[2]))
+    end
+    if support === :floored
+        override[2] isa Real || throw(ContractValidationError(
+            "[layout] the lower bound `$(override[2])` is a data name — " *
+            "bind the plan first (`bind_data`)"))
+        return (:floored, Float64(override[2]), NaN)
     end
     transform =
         support === :real ? :identity :
@@ -84,12 +110,7 @@ coefficient-vector block (`beta_raw`), or an elementwise array parameter
 (`:array`, column-major over `dims`). `lo` is the constrained lower
 bound of an `:interval`/`:floored` transform (`:interval` also sets
 `hi`; an `:upper` transform sets `hi` only; `NaN` otherwise). `dims` is
-the axis lengths of an `:array` entry (empty for every other kind).
-`coefs` names a `:coefficient` entry's coordinates after the author's
-coefficients, one slot per coordinate: `(name, 0)` for a scalar
-coefficient (`b` in `b .* x`), `(name, k)` for element `k` of a vector
-one (`c[g]`, `X * b`), `nothing` where the term names none (a hand-built
-plan); empty for every other kind."""
+the axis lengths of an `:array` entry (empty for every other kind)."""
 struct LayoutEntry
     kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :varying | :varying_corr | :cholesky_corr | :hsgp | :glm | :array
     predictor::Union{Nothing,Symbol}
@@ -101,14 +122,7 @@ struct LayoutEntry
     lo::Float64 # :interval/:floored lower bound (else NaN)
     hi::Float64 # :interval/:upper upper bound (else NaN)
     dims::Vector{Int} # :array axis lengths (else empty)
-    coefs::Vector{Union{Nothing,Tuple{Symbol,Int}}} # :coefficient author slots (else empty)
 end
-# Entries other than coefficients carry no author slots.
-LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
-    labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol,
-    lo, hi, dims::Vector{Int}) =
-    LayoutEntry(kind, predictor, name, labels, offset, size, transform, lo,
-        hi, dims, Union{Nothing,Tuple{Symbol,Int}}[])
 # Entries other than arrays carry no axes.
 LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
     labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol,
@@ -120,34 +134,14 @@ LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
     labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol) =
     LayoutEntry(kind, predictor, name, labels, offset, size, transform, NaN, NaN)
 
-"""
-    LayoutTable(entries, total[, naming])
-
-Packed unconstrained layout: ordered entries + total dimension. `naming`
-selects how [`coordinate_names`](@ref), [`constrain`](@ref),
-[`unconstrain`](@ref) and [`restore_draws`](@ref) key coefficients:
-`:author` (default) by the author's names (`a`, `b`, `c.1`), or
-`:predictor` by the legacy predictor-qualified design labels
-(`mu.Intercept`, `mu.x`, `mu.g_1`), kept for consumers that still read
-them until the built-ins are removed.
-"""
+"""Packed unconstrained layout: ordered entries + total dimension."""
 struct LayoutTable
     entries::Vector{LayoutEntry}
     total::Int
-    naming::Symbol
-    function LayoutTable(entries::Vector{LayoutEntry}, total::Int,
-            naming::Symbol)
-        naming in LAYOUT_NAMINGS || throw(ContractValidationError(
-            "[layout] naming must be one of $(LAYOUT_NAMINGS), got " *
-            ":$naming"))
-        return new(entries, total, naming)
-    end
+    name_paths::Dict{Symbol,Tuple{Vararg{Symbol}}}
 end
 LayoutTable(entries::Vector{LayoutEntry}, total::Int) =
-    LayoutTable(entries, total, :author)
-
-"""Coefficient naming schemes a [`LayoutTable`](@ref) reports under."""
-const LAYOUT_NAMINGS = (:author, :predictor)
+    LayoutTable(entries, total, Dict{Symbol,Tuple{Vararg{Symbol}}}())
 
 """
     _coefficient_runs(plan, pred, shape) -> Vector{NamedTuple}
@@ -155,9 +149,8 @@ const LAYOUT_NAMINGS = (:author, :predictor)
 Maximal transform runs over a predictor's design positions: uniform
 prior rows mark interval elements (bounds from the row — validated
 finite lo < hi by the time layout runs); everything else, including
-blocks with no prior row, is identity. Each run is `(labels, coefs,
-transform, lo, hi)` with per-position labels and author slots
-([`LayoutEntry`](@ref) `coefs`) in design order.
+blocks with no prior row, is identity. Each run is `(labels,
+transform, lo, hi)` with per-position labels in design order.
 """
 function _coefficient_runs(plan::StructuralPlan, pred, shape)
     rows = Dict{Symbol,PopulationPrior}()
@@ -165,49 +158,31 @@ function _coefficient_runs(plan::StructuralPlan, pred, shape)
         pr.predictor === pred.name || continue
         rows[pr.addressee] = pr
     end
-    Slot = Union{Nothing,Tuple{Symbol,Int}}
-    runs = NamedTuple{(:labels, :coefs, :transform, :lo, :hi),
-        Tuple{Vector{Symbol},Vector{Slot},Symbol,Float64,Float64}}[]
-    pushkey(lab, slot, tr, lo, hi) = begin
+    runs = NamedTuple{(:labels, :transform, :lo, :hi),
+        Tuple{Vector{Symbol},Symbol,Float64,Float64}}[]
+    pushkey(lab, tr, lo, hi) = begin
         if !isempty(runs) && runs[end].transform === tr &&
                 (tr === :identity ||
                     (runs[end].lo == lo && runs[end].hi == hi))
             push!(runs[end].labels, lab)
-            push!(runs[end].coefs, slot)
         else
-            push!(runs, (labels = [lab], coefs = Slot[slot], transform = tr,
-                lo = lo, hi = hi))
+            push!(runs, (labels = [lab], transform = tr, lo = lo, hi = hi))
         end
     end
     for b in shape.blocks
         b.width == 0 && continue
-        slots = _coefficient_slots(b)
         if b.kind === MatrixTerm
-            for (e, lab, slot) in zip(b.elements, b.labels, slots)
+            for (e, lab) in zip(b.elements, b.labels)
                 addr = e === nothing ? :Intercept : e
-                pushkey(lab, slot, _coef_position_key(rows, addr)...)
+                pushkey(lab, _coef_position_key(rows, addr)...)
             end
         else
-            for (lab, slot) in zip(b.labels, slots)
-                pushkey(lab, slot, _coef_position_key(rows, b.addressee)...)
+            for lab in b.labels
+                pushkey(lab, _coef_position_key(rows, b.addressee)...)
             end
         end
     end
     return runs
-end
-
-# A block's author slots: a factor or matrix coefficient is a vector
-# (`c.1 … c.G`, `b.1 … b.K` — its declaration is sized), every other
-# coefficient a scalar; an unnamed block has none.
-function _coefficient_slots(b::DesignBlock)
-    Slot = Union{Nothing,Tuple{Symbol,Int}}
-    b.coef === nothing && return Slot[nothing for _ in 1:b.width]
-    (b.kind === FactorTerm || b.kind === MatrixTerm) &&
-        return Slot[(b.coef, k) for k in 1:b.width]
-    b.width == 1 || throw(ContractValidationError(
-        "[layout] scalar coefficient $(b.coef) spans $(b.width) design " *
-        "columns"))
-    return Slot[(b.coef, 0)]
 end
 
 function _coef_position_key(rows::Dict{Symbol,PopulationPrior}, addr::Symbol)
@@ -218,40 +193,98 @@ function _coef_position_key(rows::Dict{Symbol,PopulationPrior}, addr::Symbol)
     return (:identity, NaN, NaN)
 end
 
-"""
-    assign_layout(plan; naming = :author) -> LayoutTable
+# Legacy constructs own generated parameter blocks. Derive their displayed
+# names from the same naming helpers, using the authored local id, so private
+# identifiers cannot escape through spline/GP blocks or scan innovations.
+function _scope_layout_paths(plan::StructuralPlan)
+    paths = _scope_name_paths(plan.submodel_scopes)
+    isempty(paths) && return paths
+    occupied = Set(values(paths))
+    union!(occupied, (scope.path for scope in plan.submodel_scopes))
+    function generated!(owner, internal, authored)
+        path = get(paths, owner, nothing)
+        path === nothing && return nothing
+        for (name, shown) in zip(internal, authored)
+            candidate = (Base.front(path)..., shown)
+            get(paths, name, nothing) == candidate && continue
+            suffix = 0
+            while candidate in occupied
+                suffix += 1
+                candidate = (Base.front(path)..., Symbol(shown, :_, suffix))
+            end
+            paths[name] = candidate
+            push!(occupied, candidate)
+        end
+        return nothing
+    end
+    for basis in plan.spline_bases
+        path = get(paths, basis.id, nothing)
+        path === nothing && continue
+        generated!(basis.id,
+            first.(_spline_vector_specs(basis.id, basis.kind, basis.k)),
+            first.(_spline_vector_specs(last(path), basis.kind, basis.k)))
+    end
+    for basis in plan.hsgp_bases
+        path = get(paths, basis.id, nothing)
+        path === nothing && continue
+        generated!(basis.id, _hsgp_all_names(basis),
+            _hsgp_all_names(_with(basis; id = last(path))))
+    end
+    for scan in plan.scans
+        _is_noncentered_scan(scan) || continue
+        state = first(scan.states)
+        path = get(paths, state, nothing)
+        path === nothing && continue
+        generated!(state, [_scan_innovation_name(scan)],
+            [Symbol(:_ppl_scan_z_, last(path))])
+    end
+    for dar in plan.dar_paths
+        path = get(paths, dar.state, nothing)
+        path === nothing && continue
+        generated!(dar.state, [_dar_innovation_name(dar)],
+            [Symbol(:_ppl_dar_z_, last(path))])
+    end
+    for provider in plan.event_lps
+        path = get(paths, provider.name, nothing)
+        path === nothing && continue
+        generated!(provider.name, _event_lp_all_names(provider),
+            _event_lp_all_names(_with(provider; name = last(path))))
+    end
+    return paths
+end
 
-Assign packed coordinates: coefficient blocks in `plan.predictors` order,
-then sampled parameters, plate parameters, and vector parameters in plan
-order (pinned, deterministic). Assumes `validate_plan` passed. `naming`
-is the layout's coefficient naming ([`LayoutTable`](@ref)); it never
-changes the packing.
 """
-function assign_layout(plan::StructuralPlan; naming::Symbol = :author)
+    assign_layout(plan) -> LayoutTable
+
+Assign packed coordinates: legacy coefficient blocks in `plan.predictors`
+order, then ordinary sampled, plate, vector and array parameters in plan
+order (pinned, deterministic). Affine readers add no coordinates.
+Assumes `validate_plan` passed.
+"""
+function assign_layout(plan::StructuralPlan)
     isbound(plan) || throw(ContractValidationError(
         "[layout] assign_layout requires a bound plan (bind_data first)"))
     entries = LayoutEntry[]
     offset = 1
     for pred in plan.predictors
+        pred = _legacy_predictor(pred)
         # A horseshoe predictor lays out no coefficient block: every
         # coordinate derives in-graph from its triple/Normal scalar (the
         # generator binds the same block name as a local).
         isempty(_horseshoe_for(plan, pred.name)) || continue
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
+        shape.width == 0 && continue
         runs = _coefficient_runs(plan, pred, shape)
         if isempty(runs) ||
                 (length(runs) == 1 && runs[1].transform === :identity)
             labels = Symbol[]
-            coefs = Union{Nothing,Tuple{Symbol,Int}}[]
-            for run in runs
-                append!(labels, run.labels)
-                append!(coefs, run.coefs)
+            for b in shape.blocks
+                append!(labels, b.labels)
             end
             push!(entries,
                 LayoutEntry(:coefficient, pred.name, block_name(pred.name),
-                    labels, offset, shape.width, :identity, NaN, NaN, Int[],
-                    coefs))
+                    labels, offset, shape.width, :identity))
             offset += shape.width
             continue
         end
@@ -264,7 +297,7 @@ function assign_layout(plan::StructuralPlan; naming::Symbol = :author)
             push!(entries,
                 LayoutEntry(:coefficient, pred.name, seg, run.labels,
                     offset, length(run.labels), run.transform, run.lo,
-                    run.hi, Int[], run.coefs))
+                    run.hi))
             offset += length(run.labels)
         end
     end
@@ -275,6 +308,7 @@ function assign_layout(plan::StructuralPlan; naming::Symbol = :author)
     glm_widths = Dict{Symbol,Int}()
     for r in plan.responses
         _is_glm_family(r.family) || continue
+        _is_array_param(plan, r.glm_beta) && continue
         m = _find_matrix(plan, r.predictor)
         K = count(c -> c !== nothing, m.columns)
         if haskey(glm_widths, r.glm_beta)
@@ -290,8 +324,8 @@ function assign_layout(plan::StructuralPlan; naming::Symbol = :author)
         offset += K
     end
     for p in plan.parameters
-        transform, lo, hi =
-            _entry_transform(p.family, p.support_override, p.args)
+        transform, lo, hi = _entry_transform(p.family,
+            _bound_override(plan, p.support_override), p.args)
         push!(entries,
             LayoutEntry(:sampled, nothing, p.name, [p.name], offset, 1, transform,
                 lo, hi))
@@ -567,7 +601,8 @@ function assign_layout(plan::StructuralPlan; naming::Symbol = :author)
     # simplexes reuse the `:cholesky_corr` / `:vector` edges, elementwise
     # arrays pack one `:array` block each.
     offset = _array_layout_entries!(entries, plan, offset)
-    return LayoutTable(entries, offset - 1, naming)
+    return LayoutTable(entries, offset - 1,
+        _scope_layout_paths(plan))
 end
 
 """Constrained length of a `:vector` entry: simplex packs K−1 logits
@@ -933,141 +968,176 @@ function lkj_corr_cholesky_logpdf(L::AbstractMatrix{<:Real}, eta::Real)
     return lp
 end
 
-# One reported coefficient coordinate: the key draws report it under
-# (the author's name, or the predictor for a legacy/unnamed slot), its
-# element (`0` = a scalar, `k` = element `k` of a vector), its entry and
-# packed offset, and its coordinate name (`b`, `c.2`, or the legacy
-# `mu.x`). In packed order; an unnamed slot numbers within its
-# predictor's vector.
-const _CoefReport = NamedTuple{(:key, :k, :entry, :j, :name),
-    Tuple{Symbol,Int,LayoutEntry,Int,Symbol}}
+_scope_segment(name::Symbol) = Base.isidentifier(string(name)) ?
+    string(name) : "var" * repr(string(name))
+_scope_path_string(path::Tuple) = join(_scope_segment.(path), ".")
 
-function _coefficient_reports(layout::LayoutTable)
-    out = _CoefReport[]
-    running = Dict{Symbol,Int}()
-    for e in layout.entries
-        e.kind === :coefficient || continue
-        p = e.predictor::Symbol
-        for (i, lab) in enumerate(e.labels)
-            legacy = Symbol(string(p) * "." * string(lab))
-            slot = layout.naming === :author && !isempty(e.coefs) ?
-                e.coefs[i] : nothing
-            if slot === nothing
-                k = running[p] = get(running, p, 0) + 1
-                push!(out, (key = p, k = k, entry = e,
-                    j = e.offset + i - 1, name = legacy))
-            else
-                key, k = slot
-                name = k == 0 ? key : Symbol(string(key) * "." * string(k))
-                push!(out, (key = key, k = k, entry = e,
-                    j = e.offset + i - 1, name = name))
-            end
-        end
-    end
-    return out
+function _draw_name(layout::LayoutTable, name::Symbol)
+    path = get(layout.name_paths, name, (name,))
+    return _scope_path_string(path)
 end
 
-# Reported coefficients grouped by key in first-appearance order: each
-# key's reports sorted by element, checked to be one scalar (`k == 0`)
-# or the elements `1:n` of one vector.
-function _coefficient_report_groups(layout::LayoutTable)
-    groups = Pair{Symbol,Vector{_CoefReport}}[]
-    index = Dict{Symbol,Int}()
-    for r in _coefficient_reports(layout)
-        i = get!(index, r.key) do
-            push!(groups, r.key => _CoefReport[])
-            length(groups)
-        end
-        push!(groups[i][2], r)
-    end
-    for (key, rs) in groups
-        sort!(rs; by = r -> r.k)
-        ks = map(r -> r.k, rs)
-        (ks == [0] || ks == collect(1:length(rs))) ||
-            throw(ContractValidationError(
-                "[layout] coefficient $key reports elements $ks (want one " *
-                "scalar or the elements 1:n of one vector)"))
-    end
-    return groups
+function _authored_coordinate(layout::LayoutTable, name::Symbol, label::Symbol)
+    raw = string(name)
+    shown = _draw_name(layout, name)
+    string(label) == raw && return Symbol(shown)
+    prefix = raw * "."
+    startswith(string(label), prefix) || return label
+    return Symbol(shown, ".", string(label)[(lastindex(prefix) + 1):end])
 end
 
 """
     coordinate_names(layout) -> Vector{Symbol}
 
-Flat per-coordinate names (R10 read API), length `layout.total`. Under
-the default `:author` naming ([`LayoutTable`](@ref)) a coefficient is
-named after the author's coefficient (`b`, or `c.1 … c.G` for a vector
-`c[levels(g)]` / `b[axes(X, 2)]`); under `:predictor` it is qualified by
-its predictor and design label (`Symbol("mu.x")`). Every other
-parameter reports its own name: scalars bare, vectors and arrays by
-element (`z.1`), submodel locals by their namespaced name.
+Flat per-coordinate author paths, such as `b`, `z.b`, and `z.w.1`.
+Scoped locals use dotted paths; literal identifier segments that contain
+punctuation use Julia's `var"..."` spelling. Length equals `layout.total`.
 """
 function coordinate_names(layout::LayoutTable)
     names = Symbol[]
-    reports = _coefficient_reports(layout)
     for e in layout.entries
         if e.kind === :coefficient
-            for r in reports
-                r.entry === e && push!(names, r.name)
+            for label in e.labels
+                push!(names, Symbol(_draw_name(layout, e.predictor) * "." * string(label)))
             end
         elseif e.kind === :plate || e.kind === :spline ||
                e.kind === :varying || e.kind === :hsgp || e.kind === :glm
             for i in 1:e.size
-                push!(names, Symbol(string(e.name) * "." * string(i)))
+                push!(names, Symbol(_draw_name(layout, e.name) * "." * string(i)))
             end
         elseif e.kind === :vector || e.kind === :array
-            append!(names, e.labels)
+            append!(names, [_authored_coordinate(layout, e.name, label)
+                for label in e.labels])
         elseif e.kind === :varying_corr || e.kind === :cholesky_corr
-            append!(names, e.labels)
+            append!(names, [_authored_coordinate(layout, e.name, label)
+                for label in e.labels])
         elseif e.kind === :scan
             for label in e.labels
-                push!(names, Symbol(string(e.name) * "." * string(label)))
+                push!(names, Symbol(_draw_name(layout, e.name) * "." * string(label)))
             end
         else
-            push!(names, e.name)
+            push!(names, Symbol(_draw_name(layout, e.name)))
         end
     end
     return names
 end
 
+# Coefficient entries grouped by predictor in offset order (split
+# blocks reassemble to one predictor vector in design order).
+function _coefficient_groups(layout::LayoutTable)
+    groups = Dict{Symbol,Vector{LayoutEntry}}()
+    for e in layout.entries
+        e.kind === :coefficient || continue
+        p = e.predictor::Symbol
+        push!(get!(groups, p, LayoutEntry[]), e)
+    end
+    for g in values(groups)
+        sort!(g; by = e -> e.offset)
+    end
+    return groups
+end
+
+# One predictor's constrained coefficient vector from its entries:
+# identity runs copy through, interval runs constrain per element.
+function _constrain_coefficient(entries::Vector{LayoutEntry}, u)
+    if length(entries) == 1 && entries[1].transform === :identity
+        e = entries[1]
+        return Vector{Float64}(u[e.offset:(e.offset + e.size - 1)])
+    end
+    out = Float64[]
+    for e in entries
+        seg = u[e.offset:(e.offset + e.size - 1)]
+        if e.transform === :identity
+            append!(out, Float64.(seg))
+        else
+            append!(out, [_constrain_elt(e, Float64(x)) for x in seg])
+        end
+    end
+    return out
+end
+
+# Preserve layout encounter order while forming nested author namespaces.
+function _scope_namedtuple(items)
+    names = Symbol[]
+    groups = Dict{Symbol,Vector{Any}}()
+    for (path, value) in items
+        name = first(path)
+        if !haskey(groups, name)
+            push!(names, name)
+            groups[name] = Any[]
+        end
+        push!(groups[name], (Base.tail(path), value))
+    end
+    values = map(names) do name
+        group = groups[name]
+        leaves = filter(item -> isempty(first(item)), group)
+        if !isempty(leaves)
+            length(group) == 1 || throw(ContractValidationError(
+                "[layout] author name $name is both a value and a namespace"))
+            return last(only(leaves))
+        end
+        return _scope_namedtuple(group)
+    end
+    return NamedTuple{Tuple(names)}(Tuple(values))
+end
+
+function _scoped_draw_values(layout::LayoutTable, pairs)
+    isempty(layout.name_paths) &&
+        return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
+    return _scope_namedtuple(Any[(get(layout.name_paths, name, (name,)), value)
+        for (name, value) in pairs])
+end
+
+struct _MissingScopedValue end
+const _MISSING_SCOPED_VALUE = _MissingScopedValue()
+function _scope_lookup(nt::NamedTuple, path::Tuple)
+    value = nt
+    for name in path
+        value isa NamedTuple && haskey(value, name) ||
+            return _MISSING_SCOPED_VALUE
+        value = value[name]
+    end
+    return value
+end
+
+function _flat_draw_values(layout::LayoutTable, nt::NamedTuple)
+    isempty(layout.name_paths) && return nt
+    pairs = Pair{Symbol,Any}[]
+    seen = Set{Symbol}()
+    for entry in layout.entries
+        name = entry.kind === :coefficient ? entry.predictor::Symbol : entry.name
+        name in seen && continue
+        push!(seen, name)
+        value = _scope_lookup(nt, get(layout.name_paths, name, (name,)))
+        value === _MISSING_SCOPED_VALUE || push!(pairs, name => value)
+    end
+    return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
+end
+
 """
     constrain(layout, unconstrained) -> NamedTuple
 
-Host-side constrain: packed vector → `(name => value, …)`. Coefficients
-report under the layout's naming ([`LayoutTable`](@ref)): by the
-author's name (`b => scalar`, `c => Vector`) under `:author`, by
-predictor (`mu => Vector` in design order) under `:predictor`. A
-correlated varying draw contributes its Cholesky factor `L` (K×K),
-its scale vector `tau`, its standardized draws `z_flat`, plus the DERIVED
-correlated draws `b_<suffix>` (G×K, SB `(diag_pre_multiply(tau,L)*z)'`
-— output mapping, ignored by [`unconstrain`](@ref)). For testing,
-output mapping, and future prediction; the generator emits the
-in-graph equivalent.
+Host-side constrain of the packed vector. Parameters keep their author
+names; submodel locals are nested (`nt.z.b`, `nt.z.w.b`). Scalar, vector,
+and array leaves retain their constrained shapes. Legacy correlated varying
+entries also contribute derived `b_<suffix>` matrices, ignored by
+[`unconstrain`](@ref). Deterministic submodel locals and return values are
+read in the model rather than included in this draw container. The generator
+emits the equivalent transforms inside the mathematical graph.
 """
-# One reported coefficient's constrained value: a scalar, or the vector
-# of its elements (identity runs copy through, interval runs constrain
-# per element).
-function _constrain_report(rs::Vector{_CoefReport}, u)
-    val(r) = r.entry.transform === :identity ? Float64(u[r.j]) :
-        _constrain_elt(r.entry, Float64(u[r.j]))
-    first(rs).k == 0 && return val(only(rs))
-    return Float64[val(r) for r in rs]
-end
-
 function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     length(u) == layout.total ||
         throw(ContractValidationError("[layout] unconstrained length $(length(u)) ≠ $(layout.total)"))
     pairs = Pair{Symbol,Any}[]
-    coef_groups = _coefficient_report_groups(layout)
+    coef_groups = _coefficient_groups(layout)
+    seen_coef = Set{Symbol}()
     for e in layout.entries
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :coefficient
-            # Each coefficient reports at its first entry, in key order.
-            for (key, rs) in coef_groups
-                minimum(r -> r.j, rs) in e.offset:(e.offset + e.size - 1) ||
-                    continue
-                push!(pairs, key => _constrain_report(rs, u))
-            end
+            p = e.predictor::Symbol
+            p in seen_coef && continue
+            push!(seen_coef, p)
+            push!(pairs, p => _constrain_coefficient(coef_groups[p], u))
         elseif e.kind === :plate || e.kind === :spline ||
                e.kind === :varying || e.kind === :hsgp || e.kind === :glm
             v = [_constrain_elt(e, Float64(x)) for x in seg]
@@ -1076,6 +1146,8 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, e.name => Vector{Float64}(seg))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
+        elseif e.kind === :array && e.transform === :lkj_stack
+            push!(pairs, e.name => _lkj_stack_constrain(e, seg))
         elseif e.kind === :array && _is_slice_transform(e.transform)
             push!(pairs, e.name => _array_slices_constrain(e, seg))
         elseif e.kind === :array
@@ -1096,25 +1168,14 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     for (bname, b) in _varying_corr_draws(layout, u)
         push!(pairs, bname => b)
     end
-    _check_unique_keys(first.(pairs))
-    return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
-end
-
-# Reported draws keys are unique: an author name never shares a key with
-# another reported value.
-function _check_unique_keys(keys::Vector{Symbol})
-    allunique(keys) && return nothing
-    dups = unique!([k for k in keys if count(==(k), keys) > 1])
-    throw(ContractValidationError(
-        "[layout] draws report $(join(dups, ", ")) twice — rename the " *
-        "author parameter that collides"))
+    return _scoped_draw_values(layout, pairs)
 end
 
 # Derived correlated draws per `:varying_corr` entry: `b_<suffix>`
 # (G×K), SB `(diag_pre_multiply(tau,L)*z)'` with `z_flat` in SB
 # column-major order. Sibling entries are found by the canonical
 # `_varying_corr_names` spelling (`L_<s>` → `tau_<s>` /
-# `z_flat_<s>`, or `b_flat_<s>` for the centered kind), never by
+# `z_flat_<s>`), never by
 # adjacency, so entry-order changes cannot miswire it — and only among
 # `:varying` entries, the kind that varying-draws blocks alone pack, so
 # an author's parameter spelled like a sibling (`b_flat_g ~ ...` beside
@@ -1146,17 +1207,6 @@ function _varying_corr_draws(layout::LayoutTable, u::AbstractVector{<:Real})
         e.kind === :varying_corr || continue
         sfx = string(e.name)[3:end]
         tau_e = get(byname, Symbol("tau_", sfx), nothing)
-        b_e = get(byname,Symbol("b_flat_",sfx),nothing)
-        if b_e !== nothing
-            tau_e !== nothing || throw(ContractValidationError(
-                "[layout] centered LKJ entry $(e.name) has no tau sibling"))
-            K = _lkj_dim(e.size)
-            b_e.size % K == 0 || throw(ContractValidationError(
-                "[layout] centered b_flat length is not a multiple of K=$K"))
-            b = Float64.(u[b_e.offset:(b_e.offset+b_e.size-1)])
-            push!(out,Symbol("b_",sfx)=>Matrix(reshape(b,K,b_e.size÷K)'))
-            continue
-        end
         z_e = get(byname, Symbol("z_flat_", sfx), nothing)
         if tau_e === nothing || z_e === nothing
             _stratified_draws_refusal(e.name, sfx, byname)
@@ -1185,31 +1235,37 @@ end
 Inverse of [`constrain`](@ref): named values → packed unconstrained vector.
 """
 function unconstrain(layout::LayoutTable, nt::NamedTuple)
+    nt = _flat_draw_values(layout, nt)
     u = Vector{Float64}(undef, layout.total)
-    for (key, rs) in _coefficient_report_groups(layout)
-        what = layout.naming === :predictor ||
-            key === first(rs).entry.predictor ? "predictor" : "coefficient"
-        haskey(nt, key) || throw(
-            ContractValidationError("[layout] missing $what $key"),
-        )
-        v = nt[key]
-        if first(rs).k == 0
-            v isa Real || throw(ContractValidationError(
-                "[layout] coefficient $key is a scalar, got $(typeof(v))"))
-        else
-            length(v) == length(rs) || throw(
-                ContractValidationError("[layout] $what $key length mismatch"),
-            )
-        end
-        for r in rs
-            x = Float64(r.k == 0 ? v : v[r.k])
-            u[r.j] = r.entry.transform === :identity ? x :
-                _unconstrain_elt(r.entry, x)
-        end
-    end
+    coef_groups = _coefficient_groups(layout)
+    seen_coef = Set{Symbol}()
     for e in layout.entries
         if e.kind === :coefficient
-            continue
+            p = e.predictor::Symbol
+            p in seen_coef && continue
+            push!(seen_coef, p)
+            haskey(nt, p) || throw(
+                ContractValidationError("[layout] missing predictor $p"),
+            )
+            v = nt[p]
+            entries = coef_groups[p]
+            total = sum(e2.size for e2 in entries)
+            length(v) == total || throw(
+                ContractValidationError("[layout] predictor $p length mismatch"),
+            )
+            pos = 1
+            for e2 in entries
+                seg = v[pos:(pos + e2.size - 1)]
+                if e2.transform === :identity
+                    u[e2.offset:(e2.offset + e2.size - 1)] .= Float64.(seg)
+                else
+                    for (k, x) in enumerate(seg)
+                        u[e2.offset + k - 1] =
+                            _unconstrain_elt(e2, Float64(x))
+                    end
+                end
+                pos += e2.size
+            end
         elseif e.kind === :plate || e.kind === :spline ||
                e.kind === :varying || e.kind === :hsgp || e.kind === :glm
             what = e.kind === :plate ? "plate parameter" :
@@ -1243,6 +1299,11 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             size(v) == Tuple(e.dims) || throw(ContractValidationError(
                 "[layout] array parameter $(e.name) has size $(size(v)), " *
                 "want $(Tuple(e.dims))"))
+            if e.transform === :lkj_stack
+                u[e.offset:(e.offset + e.size - 1)] .=
+                    _lkj_stack_unconstrain(e, v)
+                continue
+            end
             if _is_slice_transform(e.transform)
                 u[e.offset:(e.offset + e.size - 1)] .=
                     _array_slices_unconstrain(e, v)
@@ -1300,6 +1361,11 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             # Vector Jacobians couple coordinates (ordered sums, simplex
             # stick-breaking) — entry-level, never per-coordinate.
             total += _vector_logjac(e, seg)
+            continue
+        end
+        if e.kind === :array && e.transform === :lkj_stack
+            # Level by level, the vine's coupled thetas.
+            total += _lkj_stack_logjac(e, seg)
             continue
         end
         if e.kind === :array && _is_slice_transform(e.transform)

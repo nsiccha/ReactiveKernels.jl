@@ -37,9 +37,10 @@ end
     @test r.response === :ly
     @test r.label === :ly_resp
     @test [d.name for d in plan.derived] == [:ly]
-    @test [p.name for p in plan.parameters] == [:s]
-    fams = Dict(p.addressee => p.family for p in plan.population_priors)
-    @test fams == Dict(:Intercept => :flat, :x => :flat)
+    @test [p.name for p in plan.parameters] == [:b1, :b2, :s]
+    @test isempty(plan.population_priors)
+    fams = Dict(p.name => p.family for p in plan.parameters)
+    @test fams == Dict(:b1 => :flat, :b2 => :flat, :s => :exponential)
     # Forward order lowers identically.
     fwd = lower_rkppl(quote
             b1 ~ Flat()
@@ -102,7 +103,7 @@ end
                 mu = b1 .+ b2 .* x
                 ly .~ Normal.(mu, s)
             end,
-            "reads the sampled name s"),
+            "response ly is a predictor definition"),
         ("scalar tilde over definition",
             quote
                 ly = log.(earn)
@@ -119,14 +120,28 @@ end
             "is a design matrix"),
     )
     for (label, prog, msg) in cases
-        err = try
-            lower_rkppl(prog, (:earn, :x, :g))
-            nothing
-        catch e
-            e
+        if label in ("scalar definition", "range over derived", "design matrix LHS")
+            # capability: scalar/matrix data values and valid indexed derived observations (P10a 0dejlw1; todo `1qlbn5b`).
+            declarations = label == "design matrix LHS" ? quote
+                b[axes(X, 2)] .~ Normal.(0, 1)
+                s ~ Exponential(1)
+            end : quote
+                b1 ~ Normal(0, 1)
+                b2 ~ Normal(0, 1)
+                s ~ Exponential(1)
+            end
+            @test_broken (lower_rkppl(Expr(:block, declarations.args..., prog.args...), (:earn, :x, :g)); true)
+        else
+            err = try
+                lower_rkppl(prog, (:earn, :x, :g))
+                nothing
+            catch e
+                e
+            end
+            # refused: duplicate/ambiguous observed LHS or parameter-dependent observed value (single assignment; data-only observation contract, P3/P9).
+            @test err isa SurfaceLoweringError
+            @test occursin(msg, sprint(showerror, err))
         end
-        @test err isa SurfaceLoweringError
-        @test occursin(msg, sprint(showerror, err))
     end
 end
 
@@ -140,9 +155,10 @@ end
     catch e
         e
     end
+    # refused: caller data shadows a value the model derives (single assignment, P3).
     @test err isa ContractValidationError
     @test occursin("drop it from bind_data", sprint(showerror, err))
-    # A scalar-definition chain into a parameter fails at bind naming it.
+    # A parameter-dependent response definition is rejected during lowering.
     perr = try
         pplan = lower_rkppl(quote
                 b1 ~ Flat()
@@ -158,8 +174,9 @@ end
     catch e
         e
     end
-    @test perr isa ContractValidationError
-    @test occursin("reads s which is not bound data", sprint(showerror, perr))
+    # refused: observed data cannot depend on a sampled value (P9, bind-time observation contract).
+    @test perr isa SurfaceLoweringError
+    @test occursin("response ly is a predictor definition", sprint(showerror, perr))
     # Transitive data-only chains materialize (centering included).
     cplan = lower_rkppl(quote
             b1 ~ Flat()
@@ -189,6 +206,7 @@ end
     catch e
         e
     end
+    # refused: these observed Bernoulli values are outside {0,1} (response domain, P3).
     @test berr isa ContractValidationError
     @test occursin("Bernoulli response must be Bool or 0/1 integers",
         sprint(showerror, berr))

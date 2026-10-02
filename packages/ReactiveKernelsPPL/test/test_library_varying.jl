@@ -24,7 +24,7 @@ using Test
 # `_check_gradient` (test_generator.jl).
 
 _lv_lower(ex, data) = lower_rkppl(ex, data; mod = @__MODULE__)
-_lv_canon(ex, data) = sprint(_canon, _lv_lower(ex, data))
+_lv_canon(ex, data) = sprint(_canon, _test_scope_math(_lv_lower(ex, data)))
 
 const _LV_N = 24
 
@@ -68,25 +68,26 @@ end
 
 _lv_point(n; scale = 0.4) = [scale * sin(1.1 * i + 0.3) for i in 1:n]
 
-# Coordinate-name map from a library draws block (`P_sd`, `P_L`, `P_z`)
+# Coordinate-name map from a library draws block (`P.sd`, `P.L`, `P.z`)
 # to a built-in draws block (`tau_S`, `L_S`, `z_flat_S`, the z block
 # K × G column-major) over G levels and K margins.
-function _lv_block_map(P, S, K, G; levels = 1:G)
+function _lv_block_map(P, S, K, G; levels = 1:G, scoped::Bool = true)
     m = Dict{Symbol,Symbol}()
+    prefix = string(P) * (scoped ? "." : "_")
     if K == 1
-        m[Symbol(P, "_sd")] = Symbol("tau_", S, ".1")
+        m[Symbol(prefix, "sd")] = Symbol("tau_", S, ".1")
         for (j, jb) in zip(1:G, levels)
-            m[Symbol(P, "_z.", j)] = Symbol("z_flat_", S, ".", jb)
+            m[Symbol(prefix, "z.", j)] = Symbol("z_flat_", S, ".", jb)
         end
     else
         for k in 1:K
-            m[Symbol(P, "_sd.", k)] = Symbol("tau_", S, ".", k)
+            m[Symbol(prefix, "sd.", k)] = Symbol("tau_", S, ".", k)
         end
         for p in 1:(K * (K - 1) ÷ 2)
-            m[Symbol(P, "_L.", p)] = Symbol("L_", S, ".", p)
+            m[Symbol(prefix, "L.", p)] = Symbol("L_", S, ".", p)
         end
         for j in 1:G, q in 1:K
-            m[Symbol(P, "_z.", j, ".", q)] =
+            m[Symbol(prefix, "z.", j, ".", q)] =
                 Symbol("z_flat_", S, ".", q + (j - 1) * K)
         end
     end
@@ -208,7 +209,7 @@ end
     end
     # Shared draws sliced into two predictors (LKJ shape 2.0, stated).
     _lv_parity("28_varying_multislice", "28_varying_multislice_lib",
-        _lv_block_map(:d, :g, 2, G), _lv_halves(2))
+        _lv_block_map(:d, :g, 2, G; scoped = false), _lv_halves(2))
     # Declared levels ["c", "a", "b", "d"]: the library reads the sorted
     # observed levels; the built-in's prior-only level "d" (coordinate 4,
     # held at 0) adds its standard-normal term.
@@ -225,28 +226,43 @@ end
     _lv_parity("63_mm_correlated", "63_mm_correlated_lib",
         _lv_block_map(:r, :mm__g1__g2__w__w1__w2, 2, G), _lv_halves(2))
     # Stratified, one margin: one sd per stratum.
-    strat = Dict{Symbol,Symbol}(Symbol("r_sd.", k) => Symbol("tau_g_s", k, ".1")
+    strat = Dict{Symbol,Symbol}(Symbol("r.sd.", k) => Symbol("tau_g_s", k, ".1")
         for k in 1:2)
     for j in 1:G
-        strat[Symbol("r_z.", j)] = Symbol("z_flat_g.", j)
+        strat[Symbol("r.z.", j)] = Symbol("z_flat_g.", j)
     end
     _lv_parity("66_stratified_k1", "66_stratified_k1_lib", strat,
         _lv_halves(2))
     # Stated non-default sd priors: half-Cauchy (proper vs the built-in's
     # unnormalized half) and Exponential (identical).
     _lv_parity("75_varying_sd_cauchy", "75_varying_sd_cauchy_lib",
-        _lv_block_map(:r, :g, 1, G), _lv_halves(1))
+        _lv_block_map(:r, :g, 1, G; scoped = false), _lv_halves(1))
     # `b0` is a plain parameter in the library spelling (its `eta` lowers
     # as one computed column) and the intercept of the composed `b`
     # sub-predictor in the built-in.
-    m85 = merge(_lv_block_map(:r_t, :person, 1, G),
-        _lv_block_map(:r_a, :item, 1, G), _lv_block_map(:r_b, :item_r_b, 1, G),
-        Dict(:b0 => Symbol("b.Intercept")))
+    m85 = merge(_lv_block_map(:r_t, :person, 1, G; scoped = false),
+        _lv_block_map(:r_a, :item, 1, G; scoped = false),
+        _lv_block_map(:r_b, :item_r_b, 1, G; scoped = false),
+        Dict(:b0 => :b0))
     _lv_parity("85_composed_varying_exp", "85_composed_varying_exp_lib", m85,
         _lv_halves(3); bernoulli = true)
     _lv_parity("87_composed_correlated_slices",
         "87_composed_correlated_slices_lib",
-        _lv_block_map(:dx, :item, 2, G), (_, _) -> 0.0; bernoulli = true)
+        _lv_block_map(:dx, :item, 2, G; scoped = false), (_, _) -> 0.0;
+        bernoulli = true)
+    # Stratified correlated (corpus 65): per stratum k its sds
+    # (`r_sd.k.j`) and LKJ factor (`r_L.p.k`); the levels of g share z.
+    m65 = Dict{Symbol,Symbol}()
+    for k in 1:2, j in 1:2
+        m65[Symbol("r.sd.", k, ".", j)] = Symbol("tau_g_s", k, ".", j)
+    end
+    for k in 1:2
+        m65[Symbol("r.L.1.", k)] = Symbol("L_g_s", k, ".1")
+    end
+    for j in 1:G, q in 1:2
+        m65[Symbol("r.z.", j, ".", q)] = Symbol("z_flat_g.", q + (j - 1) * 2)
+    end
+    _lv_parity("65_stratified", "65_stratified_lib", m65, _lv_halves(4))
 end
 
 _lv_halfnormal(s) = logpdf(truncated(Normal(0, 1), 0, Inf), s)
@@ -259,15 +275,15 @@ _lv_lkj(L, eta) = logpdf(LKJCholesky(size(L, 1), eta),
     u = _lv_point(k16.layout.total)
     nt = constrain(k16.layout, u)
     x, y, g = b16.columns[:x], b16.columns[:y], b16.columns[:g]
-    B = nt.r_z * (nt.r_sd .* nt.r_L)'
-    a, bx = nt.mu
+    B = nt.r.z * (nt.r.sd .* nt.r.L)'
+    a, bx = nt.a, nt.b
     mu = a .+ bx .* x .+ B[g, 1] .+ x .* B[g, 2]
     @test _query(k16.spec, b16, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.sigma), y))
     @test _query(k16.spec, b16, :prior, u) ≈ logpdf(Normal(0, 1), a) +
         logpdf(Normal(0, 2), bx) + logpdf(Exponential(1), nt.sigma) +
-        sum(_lv_halfnormal, nt.r_sd) + _lv_lkj(nt.r_L, 1.0) +
-        sum(logpdf.(Normal(0, 1), nt.r_z))
+        sum(_lv_halfnormal, nt.r.sd) + _lv_lkj(nt.r.L, 1.0) +
+        sum(logpdf.(Normal(0, 1), nt.r.z))
     _check_gradient(k16.spec, b16, u)
     # Multi-membership with normalized weights (corpus 63).
     b63, k63 = _lv_build("63_mm_correlated_lib")
@@ -275,43 +291,43 @@ _lv_lkj(L, eta) = logpdf(LKJCholesky(size(L, 1), eta),
     nt = constrain(k63.layout, u)
     c = b63.columns
     lv = sort(unique(vcat(c[:g1], c[:g2])))
-    B = nt.r_z * (nt.r_sd .* nt.r_L)'
+    B = nt.r.z * (nt.r.sd .* nt.r.L)'
     row(gcol) = [findfirst(==(v), lv) for v in gcol]
     i1, i2 = row(c[:g1]), row(c[:g2])
     wt = c[:w1] .+ c[:w2]
-    mu = only(nt.mu) .+ (c[:w1] ./ wt) .* (B[i1, 1] .+ c[:x] .* B[i1, 2]) .+
+    mu = nt.a .+ (c[:w1] ./ wt) .* (B[i1, 1] .+ c[:x] .* B[i1, 2]) .+
         (c[:w2] ./ wt) .* (B[i2, 1] .+ c[:x] .* B[i2, 2])
     @test _query(k63.spec, b63, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.sigma), c[:y]))
     @test _query(k63.spec, b63, :prior, u) ≈ logpdf(Normal(0, 5),
-        only(nt.mu)) + logpdf(Exponential(1), nt.sigma) +
-        sum(_lv_halfnormal, nt.r_sd) + _lv_lkj(nt.r_L, 1.0) +
-        sum(logpdf.(Normal(0, 1), nt.r_z))
+        nt.a) + logpdf(Exponential(1), nt.sigma) +
+        sum(_lv_halfnormal, nt.r.sd) + _lv_lkj(nt.r.L, 1.0) +
+        sum(logpdf.(Normal(0, 1), nt.r.z))
     _check_gradient(k63.spec, b63, u)
     # Stratified, one margin (corpus 66).
     b66, k66 = _lv_build("66_stratified_k1_lib")
     u = _lv_point(k66.layout.total)
     nt = constrain(k66.layout, u)
     c = b66.columns
-    mu = only(nt.mu) .+ nt.r_sd[c[:b]] .* nt.r_z[c[:g]]
+    mu = nt.a .+ nt.r.sd[c[:b]] .* nt.r.z[c[:g]]
     @test _query(k66.spec, b66, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.sigma), c[:y]))
     @test _query(k66.spec, b66, :prior, u) ≈ logpdf(Normal(0, 5),
-        only(nt.mu)) + logpdf(Exponential(1), nt.sigma) +
-        sum(_lv_halfnormal, nt.r_sd) + sum(logpdf.(Normal(0, 1), nt.r_z))
+        nt.a) + logpdf(Exponential(1), nt.sigma) +
+        sum(_lv_halfnormal, nt.r.sd) + sum(logpdf.(Normal(0, 1), nt.r.z))
     _check_gradient(k66.spec, b66, u)
     # Centered, one margin (corpus 72, library spelling).
     b72, k72 = _lv_build("72_centered_levels_lib")
     u = _lv_point(k72.layout.total)
     nt = constrain(k72.layout, u)
     c = b72.columns
-    mu_alpha = only(nt.mu)
-    mu = mu_alpha .+ nt.c_c[c[:g]]
+    mu_alpha = nt.mu_alpha
+    mu = mu_alpha .+ nt.c.c[c[:g]]
     @test _query(k72.spec, b72, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.s), c[:y]))
     @test _query(k72.spec, b72, :prior, u) ≈ logpdf(Normal(0, 10),
         mu_alpha) + logpdf(Exponential(1), nt.s) +
-        _lv_halfnormal(nt.c_sd) + sum(logpdf.(Normal(0, nt.c_sd), nt.c_c))
+        _lv_halfnormal(nt.c.sd) + sum(logpdf.(Normal(0, nt.c.sd), nt.c.c))
     _check_gradient(k72.spec, b72, u)
     # Gradients of every other re-spelling.
     for (name, kw) in (("15_varying_plain_lib", ()),
@@ -349,20 +365,32 @@ end
     B = nt.z .* nt.sd'
     g = cols[:g]
     @test _query(ki.spec, bi, :likelihood, u) ≈ sum(logpdf.(Normal.(
-        only(nt.mu) .+ B[g, 1] .+ cols[:x] .* B[g, 2], nt.s), cols[:y]))
-    # Not built yet (todo 11e81k8): valid Julia, so these are capability
-    # gaps, not refusals. A single index on the 1×L row `(z * sd)'` is a
-    # linear, positional read; a module function's result has axes RKPPL
-    # cannot track, so `b[g, 1]` is positional too. Both lower today only
-    # with known level axes and one index per axis.
-    @test_broken (lower_rkppl(Expr(:block, head..., :(b = (z * sd)'),
+        nt.a .+ B[g, 1] .+ cols[:x] .* B[g, 2], nt.s), cols[:y]))
+    # A single index on the 1×L row `(z * sd)'` is linear and positional.
+    # A module function's result has no tracked level axes, so its gather
+    # is positional too (todo 11e81k8).
+    @test (lower_rkppl(Expr(:block, head..., :(b = (z * sd)'),
         :(mu = a .+ b[g]), :(y .~ Normal.(mu, s))), data); true)
-    @test_broken (lower_rkppl(Expr(:block, head..., :(b = identity(z)),
+    @test (lower_rkppl(Expr(:block, head..., :(b = identity(z)),
         :(mu = a .+ b[g, 1]), :(y .~ Normal.(mu, s))), data;
         mod = @__MODULE__); true)
+    for (definition, read, value) in (
+            (:(b = (z * sd)'), :(b[g]), nt -> (nt.z * nt.sd)'),
+            (:(b = identity(z)), :(b[g, 1]), nt -> identity(nt.z)))
+        plan = _lv_lower(Expr(:block, head..., definition,
+            :(mu = a .+ $read), :(y .~ Normal.(mu, s))), data)
+        bound = bind_data(plan, cols)
+        built = build_kernel(bound)
+        nt = constrain(built.layout, u)
+        B = value(nt)
+        gathered = length(size(B)) == 2 && size(B, 1) == 1 ? B[g] : B[g, 1]
+        @test _query(built.spec, bound, :likelihood, u) ≈
+            sum(logpdf.(Normal.(nt.a .+ gathered, nt.s), cols[:y]))
+        _check_gradient(built.spec, bound, u)
+    end
 end
 
-@testset "centered correlated: library entry, oracle, built-in parity" begin
+@testset "centered correlated: library entry, oracle, explicit row priors" begin
     data = (:y, :x, :g)
     head = (:(a ~ Normal(0, 5)), :(sigma ~ Exponential(1)))
     tail = :(y .~ Normal.(mu, sigma))
@@ -382,40 +410,109 @@ end
     nt = constrain(kl.layout, u)
     lv = sort(unique(cols[:g]))
     gi = [findfirst(==(v), lv) for v in cols[:g]]
-    F = Diagonal(nt.b_sd) * nt.b_L
-    C = nt.b_c
-    mu = only(nt.mu) .+ C[gi, 1] .+ cols[:x] .* C[gi, 2]
+    F = Diagonal(nt.b.sd) * nt.b.L
+    C = nt.b.c
+    mu = nt.a .+ C[gi, 1] .+ cols[:x] .* C[gi, 2]
     @test _query(kl.spec, bl, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.sigma), cols[:y]))
     @test _query(kl.spec, bl, :prior, u) ≈ logpdf(Normal(0, 5),
-        only(nt.mu)) + logpdf(Exponential(1), nt.sigma) +
-        sum(_lv_halfnormal, nt.b_sd) + _lv_lkj(nt.b_L, 1.0) +
+        nt.a) + logpdf(Exponential(1), nt.sigma) +
+        sum(_lv_halfnormal, nt.b.sd) + _lv_lkj(nt.b.L, 1.0) +
         sum(logpdf(MvNormal(zeros(2), F * F'), C[j, :]) for j in axes(C, 1))
     _check_gradient(kl.spec, bl, u)
-    # Parity with the built-in centered geometry (`varying_draws(...;
-    # centered = true)`) under the same priors, at matching values: the
-    # written-out body with those priors gives the same likelihood, prior
-    # and log-Jacobian.
-    builtin = Expr(:block, head..., :(d ~ varying_draws(g, [1, x];
-        centered = true, eta = 1.5, sd = Exponential(2.0))),
-        :(r ~ varying_slice(d, 1:2)), :(mu = a .+ r), tail)
+    # Different sd and LKJ priors are ordinary statements in the body.
     written = prog(:(d_sd[1:2] .~ Exponential.(2.0)),
         :(d_L ~ LKJCholesky(2, 1.5)), :(d_F = d_sd .* d_L),
         :(eachrow(d_c[levels(g), 1:2]) .~ MvNormalCholesky(zeros(2), d_F)),
         :(mu = a .+ d_c[g, 1] .+ x .* d_c[g, 2]))
-    bb = bind_data(_lv_lower(builtin, data), cols)
-    kb = build_kernel(bb)
     bw = bind_data(_lv_lower(written, data), cols)
     kw = build_kernel(bw)
     uw = _lv_point(kw.layout.total)
     w = constrain(kw.layout, uw)
-    base = constrain(kb.layout, zeros(kb.layout.total))
-    # The built-in stores the centered rows as `b_flat_g` (K × G
-    # column-major) and exposes `b_g` as their matrix view.
-    ub = unconstrain(kb.layout, merge(base, (mu = w.mu, sigma = w.sigma,
-        tau_g = w.d_sd, L_g = w.d_L, b_flat_g = vec(permutedims(w.d_c)),
-        b_g = w.d_c)))
-    for port in (:likelihood, :prior, :log_jacobian)
-        @test _query(kw.spec, bw, port, uw) ≈ _query(kb.spec, bb, port, ub)
+    Fw = Diagonal(w.d_sd) * w.d_L
+    muw = w.a .+ w.d_c[gi, 1] .+ cols[:x] .* w.d_c[gi, 2]
+    @test _query(kw.spec, bw, :likelihood, uw) ≈
+        sum(logpdf.(Normal.(muw, w.sigma), cols[:y]))
+    @test _query(kw.spec, bw, :prior, uw) ≈
+        logpdf(Normal(0, 5), w.a) + logpdf(Exponential(1), w.sigma) +
+        sum(logpdf.(Exponential(2.0), w.d_sd)) + _lv_lkj(w.d_L, 1.5) +
+        sum(logpdf(MvNormal(zeros(2), Fw * Fw'), w.d_c[j, :]) for j in axes(w.d_c, 1))
+    _check_gradient(kw.spec, bw, uw)
+end
+
+@testset "stratified correlated: library entry and Distributions.jl oracle" begin
+    data = (:y, :x, :g, :s)
+    head = (:(a ~ Normal(0, 5)), :(sigma ~ Exponential(1)))
+    use = :(mu = a .+ r[:, 1] .+ x .* r[:, 2])
+    tail = :(y .~ Normal.(mu, sigma))
+    lib = Expr(:block, head..., :(r ~ varying_stratified_correlated(g, s, 2)), use, tail)
+    written = quote
+        a ~ Normal(0, 5); sigma ~ Exponential(1)
+        r_sd[levels(s), 1:2] .~ HalfNormal.(1)
+        @plate for k in levels(s)
+            r_L[k] ~ LKJCholesky(2, 1.0)
+        end
+        r_z[levels(g), 1:2] .~ Normal.(0, 1)
+        @plate for i in eachindex(g)
+            r_b[i, 1:2] = (r_sd[s[i], :] .* r_L[s[i]]) * r_z[g[i], :]
+        end
+        r = r_b
+        mu = a .+ r[:, 1] .+ x .* r[:, 2]
+        y .~ Normal.(mu, sigma)
     end
+    @test _lv_canon(lib, data) == _lv_canon(written, data)
+    b65, k65 = _lv_build("65_stratified_lib")
+    u = _lv_point(k65.layout.total)
+    nt = constrain(k65.layout, u)
+    c = b65.columns
+    mu = map(eachindex(c[:y])) do i
+        si, gi = c[:b][i], c[:g][i]
+        row = (Diagonal(nt.r.sd[si, :]) * nt.r.L[:, :, si]) * nt.r.z[gi, :]
+        nt.a + row[1] + c[:x][i] * row[2]
+    end
+    @test _query(k65.spec, b65, :likelihood, u) ≈
+        sum(logpdf.(Normal.(mu, nt.sigma), c[:y]))
+    @test _query(k65.spec, b65, :prior, u) ≈ logpdf(Normal(0, 5),
+        nt.a) + logpdf(Exponential(1), nt.sigma) +
+        sum(_lv_halfnormal, nt.r.sd) +
+        sum(_lv_lkj(nt.r.L[:, :, k], 1.0) for k in 1:2) +
+        sum(logpdf.(Normal(0, 1), nt.r.z))
+    _check_gradient(k65.spec, b65, u)
+    # A third structural margin exercises the full stacked vine, rather than
+    # just K=2's single partial correlation. Its final margin affects y too.
+    ex3 = quote
+        a ~ Normal(0, 5); sigma ~ Exponential(1)
+        r ~ varying_stratified_correlated(g, s, 3)
+        mu = a .+ r[:, 1] .+ x .* r[:, 2] .+ r[:, 3]
+        y .~ Normal.(mu, sigma)
+    end
+    cols3 = _lv_cols(data)
+    cols3[:s] = repeat([10, 30, 20], _LV_N ÷ 3)
+    b3 = bind_data(_lv_lower(ex3, data), cols3)
+    k3 = build_kernel(b3)
+    u3 = _lv_point(k3.layout.total)
+    nt3 = constrain(k3.layout, u3)
+    @test size(nt3.r.L) == (3, 3, length(unique(cols3[:s])))
+    @test unconstrain(k3.layout, nt3) ≈ u3
+    restored = restore_draws(k3.layout, hcat(u3, u3))
+    @test restored.r.L == [nt3.r.L, nt3.r.L]
+    @test restored.r.sd == [nt3.r.sd, nt3.r.sd]
+    empty_restored = restore_draws(k3.layout, zeros(length(u3), 0))
+    @test empty_restored.r.L isa Vector{Array{Float64,3}}
+    @test empty_restored.r.sd isa Vector{Matrix{Float64}}
+    @test isempty(empty_restored.r.L) && isempty(empty_restored.r.sd)
+    sl = sort(unique(cols3[:s]))
+    mu3 = map(eachindex(cols3[:y])) do i
+        si, gi = findfirst(==(cols3[:s][i]), sl), cols3[:g][i]
+        row = (Diagonal(nt3.r.sd[si, :]) * nt3.r.L[:, :, si]) * nt3.r.z[gi, :]
+        nt3.a + row[1] + cols3[:x][i] * row[2] + row[3]
+    end
+    @test _query(k3.spec, b3, :likelihood, u3) ≈
+        sum(logpdf.(Normal.(mu3, nt3.sigma), cols3[:y]))
+    @test _query(k3.spec, b3, :prior, u3) ≈
+        logpdf(Normal(0, 5), nt3.a) + logpdf(Exponential(1), nt3.sigma) +
+        sum(_lv_halfnormal, nt3.r.sd) +
+        sum(_lv_lkj(nt3.r.L[:, :, k], 1.0) for k in axes(nt3.r.L, 3)) +
+        sum(logpdf.(Normal(0, 1), nt3.r.z))
+    _check_gradient(k3.spec, b3, u3)
 end

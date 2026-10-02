@@ -415,66 +415,82 @@ end
     # Gaussian + non-identity predictor link is not an admitted triple.
     bad = _gaussian_plan()
     bad.predictors[1] = PredictorSpec(:mu, LogLink, _terms(), :mu)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # Poisson + identity predictor link is not admitted either.
     bad = _poisson_plan()
     bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # NB2 + identity predictor link is not admitted either.
     bad = _nb2_plan()
     bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # Binomial + log predictor link is not admitted either.
     bad = _binomial_plan()
     bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # Slice-2 triples admit Identity predictor link only.
     bad = _bernoulli_probit_plan()
     bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     bad = _binomial_cloglog_plan()
     bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     bad = _beta_plan()
     bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # Struct-path link-matching predlinks fail closed (same latent gap as
     # slice-1 Binomial; the AST path is the real path).
     bad = _bernoulli_probit_plan()
     bad.predictors[1] = PredictorSpec(:eta, ProbitLink, _terms(), :eta)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # Student admits the identity predictor link only.
     bad = _student_plan()
     bad.predictors[1] = PredictorSpec(:mu, LogLink, _terms(), :mu)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # Hurdle admits the log predictor link only.
     bad = _hurdle_plan()
     bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # ZIP admits the log predictor link only.
     bad = _zip_plan()
     bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # InverseGaussian admits the log predictor link only.
     bad = _ig_plan()
     bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # BetaBinomial2 admits the identity predictor link only (Beta precedent).
     bad = _betabinomial2_plan()
     bad.predictors[1] = PredictorSpec(:mu, LogLink, _terms(), :mu)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # VonMises admits the identity predictor link only.
     bad = _vm_plan()
     bad.predictors[1] = PredictorSpec(:mu, LogLink, _terms(), :mu)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # Exponential admits the log predictor link only (Poisson precedent).
     bad = _exp_plan()
     bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # LogNormal admits the identity predictor link only.
     bad = _ln_plan()
     bad.predictors[1] = PredictorSpec(:mu, LogLink, _terms(), :mu)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a noncanonical likelihood/predictor link composition (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
 end
 
 @testset "slice-2 response validation" begin
@@ -483,45 +499,54 @@ end
     bad.responses[1] =
         LikelihoodSpec(BinomialProbitFam, ProbitLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: Binomial-family likelihood without its required trials slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _binomial_cloglog_plan()
     bad.responses[1] =
         LikelihoodSpec(BinomialCloglogFam, CloglogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: Binomial-family likelihood without its required trials slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Probit/cloglog Bernoulli takes no trials.
     bad = _bernoulli_probit_plan()
     bad.responses[1] =
         LikelihoodSpec(BernoulliProbitFam, ProbitLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp, :n, nothing)
+    # refused: trials slot on a non-Binomial family (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Beta requires its concentration kappa.
     bad = _beta_plan()
     bad.responses[1] =
         LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: Beta likelihood without its required kappa slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Beta response must be strictly inside (0, 1).
     bad = _beta_plan()
     bad.columns[:y] = fill(2, 9)
+    # refused: Beta response outside the open support (0, 1) (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _beta_plan()
     bad.columns[:y] = fill(0.0, 9)
+    # refused: Beta response at the support boundary 0 (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _beta_plan()
     bad.columns[:y] = fill(1.0, 9)
+    # refused: Beta response at the support boundary 1 (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _beta_plan()
     bad.responses[1] =
         LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, :kappa, nothing,
             ResponseEvidence(:truncated, 0.1, 0.9), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (Beta) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     bad = _bernoulli_probit_plan()
     bad.responses[1] =
         LikelihoodSpec(BernoulliProbitFam, ProbitLink, :y, :eta, nothing, nothing,
             ResponseEvidence(:censored, 0, 1), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (Bernoulli probit) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
 end
 
 @testset "student response validation" begin
@@ -530,18 +555,21 @@ end
     bad.responses[1] =
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, nothing, nothing,
             _none_evidence(), :y_resp, nothing, nothing; nu = :nu)
+    # refused: StudentT likelihood without its required sigma slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Student requires its degrees of freedom nu.
     bad = _student_plan()
     bad.responses[1] =
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp)
+    # refused: StudentT likelihood without its required nu slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Only Student responses take nu.
     bad = _gaussian_plan()
     bad.responses[1] =
         LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp, nothing, nothing; nu = 4.0)
+    # refused: nu slot on a non-StudentT family (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # nu literals must be finite positive.
     for lit in (0.0, -2.0, Inf, NaN)
@@ -549,6 +577,7 @@ end
         bad.responses[1] =
             LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
                 _none_evidence(), :y_resp, nothing, nothing; nu = lit)
+        # refused: nu literal not finite positive (mathematically invalid input)
         @test_throws ContractValidationError validate_plan(bad)
     end
     good = _student_plan()
@@ -561,15 +590,18 @@ end
     bad.responses[1] =
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp, nothing, nothing; nu = :nosuch)
+    # refused: nu names an unknown name (IR contract: dangling reference)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _student_plan()
     bad.responses[1] =
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp, nothing, nothing; nu = :x)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: per-observation data column for StudentT nu (scalar-only today; P10a, 0dejlw1) (todo `1qlbn5b`)
+    @test_broken (validate_plan(bad); true)
     # Student response must be numeric.
     bad = _student_plan()
     bad.columns[:y] = fill("a", 9)
+    # refused: non-numeric StudentT response (wrong eltype)
     @test_throws ContractValidationError validate_plan(bad)
     # Evidence wrappers admit Gaussian/Poisson/StudentT (slice 1):
     # StudentT + truncated validates (the Gaussian clamp law over the
@@ -584,7 +616,8 @@ end
     bad.responses[1] =
         LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, :p_zero, nothing,
             ResponseEvidence(:truncated, 0, 5), :y_resp, nothing, nothing)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (HurdlePoisson) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     # A predictor-fed sigma is admitted (the Gaussian vscale shape).
     good = _student_plan()
     push!(good.predictors, PredictorSpec(:sc, LogLink, _terms(), :sc))
@@ -600,7 +633,8 @@ end
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu,
             ScalePredictorRef(:mu, IdentityLink), nothing,
             _none_evidence(), :y_resp, nothing, nothing; nu = :nu)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # A predictor-fed nu is admitted on every link (the modeled-nu
     # vscale shape — the sigma precedent above).
     for link in (IdentityLink, LogLink, LogitLink)
@@ -619,7 +653,8 @@ end
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp, nothing, nothing;
             nu = ScalePredictorRef(:mu, IdentityLink))
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # Nor the response's own scale predictor (all three slots distinct).
     bad = _student_plan()
     push!(bad.predictors, PredictorSpec(:sc, LogLink, _terms(), :sc))
@@ -629,13 +664,15 @@ end
             ScalePredictorRef(:sc, LogLink), nothing,
             _none_evidence(), :y_resp, nothing, nothing;
             nu = ScalePredictorRef(:sc, LogLink))
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # The nu predictor must exist and carry the use-site link.
     bad = _student_plan()
     bad.responses[1] =
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp, nothing, nothing;
             nu = ScalePredictorRef(:nosuch, LogLink))
+    # refused: nu predictor ref names an unknown predictor (IR contract: dangling reference)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _student_plan()
     push!(bad.predictors, PredictorSpec(:nup, IdentityLink, _terms(), :nup))
@@ -644,6 +681,7 @@ end
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp, nothing, nothing;
             nu = ScalePredictorRef(:nup, LogLink))
+    # refused: use-site link differs from the predictor's own link (IR contract: one link per predictor)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -653,6 +691,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: HurdlePoisson likelihood without its required p_zero slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # A p_zero literal must lie in [0, 1] — but both endpoints are valid
     # (degenerate all-positive / all-zero hurdle).
@@ -668,6 +707,7 @@ end
         bad.responses[1] =
             LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, lit, nothing,
                 _none_evidence(), :y_resp)
+        # refused: p_zero literal outside [0, 1] or non-finite (mathematically invalid input)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # A logit-link p_zero predictor is admitted (the hu submodel).
@@ -688,6 +728,7 @@ end
             LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta,
                 ScalePredictorRef(:hu, link), nothing,
                 _none_evidence(), :y_resp)
+        # refused: probability slot (hurdle p_zero) fed through a non-logit link (IR contract: probability slot is logit-only)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # But not the response's own location predictor.
@@ -696,23 +737,28 @@ end
         LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta,
             ScalePredictorRef(:eta, LogLink), nothing,
             _none_evidence(), :y_resp)
+    # refused: location predictor reused as p_zero under a log link — fails the logit-only probability gate (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Hurdle response must be non-negative integers (Bool excluded).
     bad = _hurdle_plan()
     bad.columns[:y] = [0, 1, -1, 2, 0, 1, 3, 0, 2]
+    # refused: negative count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _hurdle_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test_broken (validate_plan(bad); true)
     bad = _hurdle_plan()
     bad.columns[:y] = collect(1.0:9.0)
+    # refused: non-integer count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _hurdle_plan()
     bad.responses[1] =
         LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, :p_zero, nothing,
             ResponseEvidence(:truncated, 0, 4), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (HurdlePoisson) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     # A per-observation p_zero column binds in [0, 1].
     good = _hurdle_plan()
     good.columns[:p0c] = repeat([0.0, 0.5, 1.0], 3)
@@ -725,6 +771,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta, :p0c, nothing,
             _none_evidence(), :y_resp)
+    # refused: per-observation p_zero column outside [0, 1] (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -734,6 +781,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: NB1 likelihood without its required p slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # A p literal must lie in [0, 1] (the hurdle precedent; the kernel
     # guards the open interval and returns -Inf at the endpoints).
@@ -749,6 +797,7 @@ end
         bad.responses[1] =
             LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta, lit, nothing,
                 _none_evidence(), :y_resp)
+        # refused: NB1 p literal outside [0, 1] or non-finite (mathematically invalid input)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # Predictor-fed p is logit-only (a success probability, the hurdle
@@ -769,24 +818,29 @@ end
             LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta,
                 ScalePredictorRef(:ls, link), nothing,
                 _none_evidence(), :y_resp)
+        # refused: probability slot (NB1 p) fed through a non-logit link (IR contract: probability slot is logit-only)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # NB1 response must be non-negative integers (Bool excluded).
     bad = _nb1_plan()
     bad.columns[:y] = [0, 1, -1, 2, 0, 1, 3, 0, 2]
+    # refused: negative count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _nb1_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test_broken (validate_plan(bad); true)
     bad = _nb1_plan()
     bad.columns[:y] = collect(1.0:9.0)
+    # refused: non-integer count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _nb1_plan()
     bad.responses[1] =
         LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta, :p, nothing,
             ResponseEvidence(:truncated, 0, 4), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (NB1) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     # A per-observation p column binds in [0, 1].
     good = _nb1_plan()
     good.columns[:pc] = repeat([0.0, 0.5, 1.0], 3)
@@ -799,6 +853,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta, :pc, nothing,
             _none_evidence(), :y_resp)
+    # refused: per-observation p column outside [0, 1] (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -808,12 +863,14 @@ end
     bad.responses[1] =
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: ZIP likelihood without its required zi slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Only ZIP responses take zi.
     bad = _poisson_plan()
     bad.responses[1] =
         LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp, nothing, nothing; zi = 0.2)
+    # refused: zi slot on a non-zero-inflated family (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # zi literals must lie in [0, 1].
     for lit in (-0.1, 1.5, Inf, NaN)
@@ -821,6 +878,7 @@ end
         bad.responses[1] =
             LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
                 _none_evidence(), :y_resp, nothing, nothing; zi = lit)
+        # refused: zi literal outside [0, 1] or non-finite (mathematically invalid input)
         @test_throws ContractValidationError validate_plan(bad)
     end
     for lit in (0.0, 0.2, 1.0)
@@ -835,31 +893,37 @@ end
     bad.responses[1] =
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp, nothing, nothing; zi = :nosuch)
+    # refused: zi names an unknown name (IR contract: dangling reference)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _zip_plan()
     bad.responses[1] =
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp, nothing, nothing; zi = :x)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: per-observation data column for ZIP zi (scalar/predictor-only today; P10a, 0dejlw1) (todo `1qlbn5b`)
+    @test_broken (validate_plan(bad); true)
     # ZIP takes no scale auxiliary.
     bad = _zip_plan()
     bad.responses[1] =
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, 1.0, nothing,
             _none_evidence(), :y_resp, nothing, nothing; zi = :zi)
+    # refused: scale slot on ZIP, which has no scale auxiliary (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # ZIP response must be non-negative integers.
     bad = _zip_plan()
     bad.columns[:y] = fill(1.5, 9)
+    # refused: non-integer count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _zip_plan()
     bad.columns[:y] = fill(-1, 9)
+    # refused: negative count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _zip_plan()
     bad.responses[1] =
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
             ResponseEvidence(:truncated, 0, 5), :y_resp, nothing, nothing; zi = :zi)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (ZIP) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     # A logit-link zi predictor is admitted (the zi submodel, the
     # hurdle p_zero precedent).
     good = _zip_plan()
@@ -879,6 +943,7 @@ end
             LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
                 _none_evidence(), :y_resp, nothing, nothing;
                 zi = ScalePredictorRef(:zeta, link))
+        # refused: probability slot (ZIP zi) fed through a non-logit link (IR contract: probability slot is logit-only)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # Unknown zi predictor.
@@ -887,6 +952,7 @@ end
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp, nothing, nothing;
             zi = ScalePredictorRef(:nosuch, LogitLink))
+    # refused: zi predictor ref names an unknown predictor (IR contract: dangling reference)
     @test_throws ContractValidationError validate_plan(bad)
     # The use-site link must match the predictor's own link.
     bad = _zip_plan()
@@ -896,6 +962,7 @@ end
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp, nothing, nothing;
             zi = ScalePredictorRef(:zeta, LogitLink))
+    # refused: use-site link differs from the predictor's own link (IR contract: one link per predictor)
     @test_throws ContractValidationError validate_plan(bad)
     # But not the response's own location predictor (fails at the
     # logit-only gate here — the shared-predictor shape never carries
@@ -905,6 +972,7 @@ end
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp, nothing, nothing;
             zi = ScalePredictorRef(:eta, LogLink))
+    # refused: location predictor reused as zi under a log link — fails the logit-only probability gate (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -914,6 +982,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: InverseGaussian likelihood without its required lambda slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # A lambda literal must be finite positive (unlike hurdle p_zero,
     # the 0 endpoint is not a degenerate-but-valid shape).
@@ -929,6 +998,7 @@ end
         bad.responses[1] =
             LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, lit, nothing,
                 _none_evidence(), :y_resp)
+        # refused: lambda literal not finite positive (mathematically invalid input)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # A log-link lambda predictor is admitted (the `log(lam) ~ 1` demand).
@@ -949,7 +1019,8 @@ end
             LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
                 ScalePredictorRef(:ls, link), nothing,
                 _none_evidence(), :y_resp)
-        @test_throws ContractValidationError validate_plan(bad)
+        # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+        @test_broken (validate_plan(bad); true)
     end
     # But not the response's own location predictor.
     bad = _ig_plan()
@@ -957,23 +1028,28 @@ end
         LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
             ScalePredictorRef(:eta, LogLink), nothing,
             _none_evidence(), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # InverseGaussian response must be strictly positive (Bool excluded).
     bad = _ig_plan()
     bad.columns[:y] = [0.7, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
+    # refused: InverseGaussian response not strictly positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _ig_plan()
     bad.columns[:y] = [0.7, 1.4, -2.6, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
+    # refused: InverseGaussian response not strictly positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _ig_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test_broken (validate_plan(bad); true)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _ig_plan()
     bad.responses[1] =
         LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, :lam, nothing,
             ResponseEvidence(:truncated, 0, 4), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (InverseGaussian) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     # A per-observation lambda column binds finite positive.
     good = _ig_plan()
     good.columns[:lamc] = repeat([0.5, 1.5, 2.5], 3)
@@ -986,6 +1062,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta, :lamc, nothing,
             _none_evidence(), :y_resp)
+    # refused: per-observation lambda column not positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -995,6 +1072,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(WeibullFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: Weibull likelihood without its required shape k slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # A k literal must be finite positive (the IG precedent: the 0
     # endpoint is not a degenerate-but-valid shape).
@@ -1010,6 +1088,7 @@ end
         bad.responses[1] =
             LikelihoodSpec(WeibullFam, LogLink, :y, :eta, lit, nothing,
                 _none_evidence(), :y_resp)
+        # refused: Weibull k literal not finite positive (mathematically invalid input)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # Predictor-fed k is deferred, on every link.
@@ -1021,24 +1100,29 @@ end
             LikelihoodSpec(WeibullFam, LogLink, :y, :eta,
                 ScalePredictorRef(:ls, link), nothing,
                 _none_evidence(), :y_resp)
-        @test_throws ContractValidationError validate_plan(bad)
+        # capability: predictor-fed Weibull shape k (todo `05fuzch`)
+        @test_broken (validate_plan(bad); true)
     end
     # Weibull response must be strictly positive (Bool excluded).
     bad = _weibull_plan()
     bad.columns[:y] = [0.7, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
+    # refused: Weibull response not strictly positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _weibull_plan()
     bad.columns[:y] = [0.7, 1.4, -2.6, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
+    # refused: Weibull response not strictly positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _weibull_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test_broken (validate_plan(bad); true)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _weibull_plan()
     bad.responses[1] =
         LikelihoodSpec(WeibullFam, LogLink, :y, :eta, :k, nothing,
             ResponseEvidence(:truncated, 0, 4), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (Weibull) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     # A per-observation k column binds finite positive.
     good = _weibull_plan()
     good.columns[:kc] = repeat([0.5, 1.5, 2.5], 3)
@@ -1051,6 +1135,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(WeibullFam, LogLink, :y, :eta, :kc, nothing,
             _none_evidence(), :y_resp)
+    # refused: per-observation k column not positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -1060,6 +1145,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, nothing, nothing,
             _none_evidence(), :y_resp, :n, nothing)
+    # refused: BetaBinomial2 likelihood without its required phi slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # A phi literal must be finite positive.
     for lit in (0.5, 4.0)
@@ -1074,6 +1160,7 @@ end
         bad.responses[1] =
             LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, lit, nothing,
                 _none_evidence(), :y_resp, :n, nothing)
+        # refused: phi literal not finite positive (mathematically invalid input)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # A predictor-fed precision is admitted (identity/log/logit — the
@@ -1094,12 +1181,14 @@ end
         LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu,
             ScalePredictorRef(:mu, IdentityLink), nothing,
             _none_evidence(), :y_resp, :n, nothing)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
+    @test_broken (validate_plan(bad); true)
     # BetaBinomial2 requires trials (Binomial rule).
     bad = _betabinomial2_plan()
     bad.responses[1] =
         LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phi, nothing,
             _none_evidence(), :y_resp)
+    # refused: BetaBinomial2 likelihood without its required trials slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # A trials literal binds (non-negative, y ≤ n).
     good = _betabinomial2_plan()
@@ -1111,38 +1200,47 @@ end
     bad.responses[1] =
         LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phi, nothing,
             _none_evidence(), :y_resp, -1, nothing)
+    # refused: negative trials literal (mathematically invalid input)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _betabinomial2_plan()
     bad.responses[1] =
         LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phi, nothing,
             _none_evidence(), :y_resp, 1, nothing)
+    # refused: response exceeds trials literal (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # Trials columns: Int, non-negative, n_obs-long, y ≤ n row-wise.
     bad = _betabinomial2_plan()
     bad.columns[:n] = fill(4.0, 9)
+    # refused: non-integer-typed trials column (wrong eltype)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _betabinomial2_plan()
     bad.columns[:n] = fill(-2, 9)
+    # refused: negative trials column (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _betabinomial2_plan()
     bad.columns[:n] = fill(1, 9)
+    # refused: response exceeds trials row-wise (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # BetaBinomial2 response must be non-negative integers (Bool excluded).
     bad = _betabinomial2_plan()
     bad.columns[:y] = [0, 1, -1, 2, 0, 1, 3, 0, 2]
+    # refused: negative count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _betabinomial2_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test_broken (validate_plan(bad); true)
     bad = _betabinomial2_plan()
     bad.columns[:y] = collect(1.0:9.0)
+    # refused: non-integer count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _betabinomial2_plan()
     bad.responses[1] =
         LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phi, nothing,
             ResponseEvidence(:truncated, 0, 4), :y_resp, :n, nothing)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (BetaBinomial2) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     # A per-observation phi column binds finite-positive.
     good = _betabinomial2_plan()
     good.columns[:phic] = repeat([1.0, 2.0, 4.0], 3)
@@ -1155,12 +1253,14 @@ end
     bad.responses[1] =
         LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu, :phic, nothing,
             _none_evidence(), :y_resp, :n, nothing)
+    # refused: per-observation phi column not positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # Only Binomial/BetaBinomial2/Multinomial responses take trials.
     bad = _gaussian_plan()
     bad.responses[1] =
         LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp, 4, nothing)
+    # refused: trials slot on a non-Binomial family (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -1170,6 +1270,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: VonMises likelihood without its required kappa slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # A kappa literal must be finite positive.
     for lit in (0.5, 2.0)
@@ -1184,6 +1285,7 @@ end
         bad.responses[1] =
             LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu, lit, nothing,
                 _none_evidence(), :y_resp)
+        # refused: kappa literal not finite positive (mathematically invalid input)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # A log-link kappa predictor is admitted (the `log(kappa) ~ 1` demand).
@@ -1204,7 +1306,8 @@ end
             LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu,
                 ScalePredictorRef(:lk, link), nothing,
                 _none_evidence(), :y_resp)
-        @test_throws ContractValidationError validate_plan(bad)
+        # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+        @test_broken (validate_plan(bad); true)
     end
     # But not the response's own location predictor.
     bad = _vm_plan()
@@ -1212,6 +1315,7 @@ end
         LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu,
             ScalePredictorRef(:mu, LogLink), nothing,
             _none_evidence(), :y_resp)
+    # refused: use-site link differs from the predictor's own link (IR contract: one link per predictor)
     @test_throws ContractValidationError validate_plan(bad)
     # Interval: finite, lo < hi, width 2pi (the BRM rule).
     good = _vm_plan(; interval = (-Float64(pi), Float64(pi)))
@@ -1222,6 +1326,7 @@ end
     for iv in ((0.0, 1.0), (Float64(pi), -Float64(pi)), (0.0, Inf),
             (NaN, Float64(pi)))
         bad = _vm_plan(; interval = iv)
+        # refused: malformed circular interval (not finite, lo >= hi, or width != 2pi) (malformed distribution)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # Only VonMises responses take interval.
@@ -1230,31 +1335,38 @@ end
         LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp, nothing, nothing;
             interval = (-Float64(pi), Float64(pi)))
+    # refused: interval slot on a non-VonMises family (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Exact response must be finite numerics (Bool excluded).
     bad = _vm_plan()
     bad.columns[:y] = [0.3, -1.1, 2.0, -2.8, 0.5, 1.1, -0.4, 2.9, Inf]
+    # refused: non-finite response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _vm_plan()
     bad.columns[:y] = [0.3, -1.1, 2.0, -2.8, 0.5, 1.1, -0.4, 2.9, NaN]
+    # refused: non-finite response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _vm_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test_broken (validate_plan(bad); true)
     # Circular response honors the half-open [lo, hi).
     bad = _vm_plan(; interval = (-Float64(pi), Float64(pi)))
     bad.columns[:y] = [0.3, -1.1, 2.0, -2.8, 0.5, 1.1, -0.4, 2.9, Float64(pi)]
+    # refused: circular response outside the half-open interval [lo, hi) (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _vm_plan(; interval = (-Float64(pi), Float64(pi)))
     bad.columns[:y] =
         [0.3, -1.1, 2.0, -2.8, 0.5, 1.1, -0.4, 2.9, -Float64(pi) - 0.1]
+    # refused: circular response outside the half-open interval [lo, hi) (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _vm_plan()
     bad.responses[1] =
         LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu, :kappa, nothing,
             ResponseEvidence(:truncated, -1.0, 1.0), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (VonMises) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     # A per-observation kappa column binds finite positive.
     good = _vm_plan()
     good.columns[:kappac] = repeat([0.5, 1.5, 2.5], 3)
@@ -1267,6 +1379,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu, :kappac, nothing,
             _none_evidence(), :y_resp)
+    # refused: per-observation kappa column not positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -1278,6 +1391,7 @@ end
         bad.responses[1] =
             LikelihoodSpec(ExponentialLogFam, LogLink, :y, :eta, sc, nothing,
                 _none_evidence(), :y_resp)
+        # refused: scale slot on Exponential, which has no scale auxiliary (IR contract)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # Exponential response must be non-negative numerics (Bool excluded);
@@ -1287,19 +1401,23 @@ end
     @test validate_plan(good) === nothing
     bad = _exp_plan()
     bad.columns[:y] = [0.7, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, -0.1]
+    # refused: negative Exponential response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _exp_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test_broken (validate_plan(bad); true)
     bad = _exp_plan()
     bad.columns[:y] = trues(9)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test_broken (validate_plan(bad); true)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _exp_plan()
     bad.responses[1] =
         LikelihoodSpec(ExponentialLogFam, LogLink, :y, :eta, nothing, nothing,
             ResponseEvidence(:truncated, 0.0, 4.0), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (Exponential) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
 end
 
 @testset "lognormal response validation" begin
@@ -1308,6 +1426,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(LogNormalFam, IdentityLink, :y, :mu, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: LogNormal likelihood without its required sigma slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # A sigma literal must be finite positive.
     for lit in (0.5, 2.0)
@@ -1322,6 +1441,7 @@ end
         bad.responses[1] =
             LikelihoodSpec(LogNormalFam, IdentityLink, :y, :mu, lit, nothing,
                 _none_evidence(), :y_resp)
+        # refused: sigma literal not finite positive (mathematically invalid input)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # Predictor-fed sigma is deferred (the Beta-kappa precedent), on
@@ -1334,24 +1454,29 @@ end
             LikelihoodSpec(LogNormalFam, IdentityLink, :y, :mu,
                 ScalePredictorRef(:ls, link), nothing,
                 _none_evidence(), :y_resp)
-        @test_throws ContractValidationError validate_plan(bad)
+        # capability: predictor-fed LogNormal sigma (todo `05fuzch`)
+        @test_broken (validate_plan(bad); true)
     end
     # LogNormal response must be strictly positive (Bool excluded).
     bad = _ln_plan()
     bad.columns[:y] = [0.7, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
+    # refused: LogNormal response not strictly positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _ln_plan()
     bad.columns[:y] = [0.7, 1.4, -2.6, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
+    # refused: LogNormal response not strictly positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _ln_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test_broken (validate_plan(bad); true)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _ln_plan()
     bad.responses[1] =
         LikelihoodSpec(LogNormalFam, IdentityLink, :y, :mu, :sigma, nothing,
             ResponseEvidence(:truncated, 0, 4), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (LogNormal) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     # A per-observation sigma column binds finite positive.
     good = _ln_plan()
     good.columns[:sigmac] = repeat([0.5, 1.5, 2.5], 3)
@@ -1364,6 +1489,7 @@ end
     bad.responses[1] =
         LikelihoodSpec(LogNormalFam, IdentityLink, :y, :mu, :sigmac, nothing,
             _none_evidence(), :y_resp)
+    # refused: per-observation sigma column not positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -1372,30 +1498,36 @@ end
     bad.responses[1] =
         LikelihoodSpec(GaussianFam, IdentityLink, :nope, :mu, :sigma, nothing,
             _none_evidence(), :y_resp)
+    # refused: response names a missing column (IR contract: dangling reference)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     bad.responses[1] =
         LikelihoodSpec(GaussianFam, IdentityLink, :y, :nope, :sigma, nothing,
             _none_evidence(), :y_resp)
+    # refused: likelihood names an unknown predictor (IR contract: dangling reference)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
 @testset "response value checks" begin
     bad = _bernoulli_plan()
     bad.columns[:y] = fill(2, 9)
+    # refused: Bernoulli response outside {0, 1} (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _poisson_plan()
     bad.columns[:y] = fill(-1, 9)
+    # refused: negative count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     bad.responses[1] =
         LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: Gaussian likelihood without its required sigma slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _bernoulli_plan()
     bad.responses[1] =
         LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta, 1.0, nothing,
             _none_evidence(), :y_resp)
+    # refused: scale slot on Bernoulli, which has no scale auxiliary (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -1405,50 +1537,60 @@ end
     bad.responses[1] =
         LikelihoodSpec(BinomialLogitFam, LogitLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: Binomial likelihood without its required trials slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Non-Binomial responses take no trials.
     bad = _poisson_plan()
     bad.responses[1] =
         LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp, :n, nothing)
+    # refused: trials slot on a non-Binomial family (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Non-integer trials column.
     bad = _binomial_plan()
     bad.columns[:n] = fill(2.5, 9)
+    # refused: non-integer trials column (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # Response exceeds trials.
     bad = _binomial_plan()
     bad.columns[:y] = fill(9, 9)
+    # refused: response exceeds trials (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # Bool is not a count column.
     bad = _binomial_plan()
     bad.columns[:y] = fill(true, 9)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test_broken (validate_plan(bad); true)
     # NB2/Gamma require their auxiliary.
     bad = _nb2_plan()
     bad.responses[1] =
         LikelihoodSpec(NegativeBinomial2Fam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: NB2 likelihood without its required phi slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gamma_plan()
     bad.responses[1] =
         LikelihoodSpec(GammaLogFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp)
+    # refused: Gamma likelihood without its required shape slot (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Gamma response must be strictly positive.
     bad = _gamma_plan()
     bad.columns[:y] = zeros(9)
+    # refused: Gamma response not strictly positive (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # NB2 rejects non-count response.
     bad = _nb2_plan()
     bad.columns[:y] = fill(1.5, 9)
+    # refused: non-integer count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _nb2_plan()
     bad.responses[1] =
         LikelihoodSpec(NegativeBinomial2Fam, LogLink, :y, :eta, :phi, nothing,
             ResponseEvidence(:truncated, 0.0, 9.0), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (NB2) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
 end
 
 @testset "per-observation known scale" begin
@@ -1463,11 +1605,13 @@ end
     bad.columns[:se] = vcat(0.0, collect(2.0:9.0))
     bad.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :se,
         nothing, _none_evidence(), :y_resp)
+    # refused: non-positive known-scale column (wrong data: a scale is strictly > 0)
     @test_throws ContractValidationError validate_plan(bad)
     # An unknown scale name (neither scalar parameter nor data column) is caught.
     bad3 = _gaussian_plan()
     bad3.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :nope,
         nothing, _none_evidence(), :y_resp)
+    # refused: scale names neither a parameter nor a data column (IR contract: dangling reference)
     @test_throws ContractValidationError validate_plan(bad3)
 end
 
@@ -1475,22 +1619,27 @@ end
     bad = _gaussian_plan()
     bad.parameters[1] =
         SampledParameter(:sigma, :student_t, (arg1 = 1.0,), nothing, :sigma)
+    # refused: wrong positional arity for the sampled family (IR contract: positional-args pin)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     bad.parameters[1] =
         SampledParameter(:sigma, :exponential, (arg1 = 1.0, arg2 = 2.0,), nothing, :sigma)
+    # refused: wrong positional arity for the sampled family (IR contract: positional-args pin)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     bad.parameters[1] =
         SampledParameter(:sigma, :exponential, (rate = 1.0,), nothing, :sigma)
+    # refused: named (non-positional) prior arg key (IR contract: positional-args pin)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     bad.parameters[1] =
         SampledParameter(:sigma, :exponential, (arg1 = :nope,), nothing, :sigma)
+    # refused: prior arg names an unknown name (IR contract: dangling reference)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     bad.parameters[1] =
         SampledParameter(:sigma, :exponential, (arg1 = 1.0,), :positive, :sigma)
+    # refused: :positive half-override on a non-symmetric (already positive) family (IR contract: support-override rule)
     @test_throws ContractValidationError validate_plan(bad)
     ok = _gaussian_plan()
     ok.parameters[1] =
@@ -1502,29 +1651,35 @@ end
     bad = _gaussian_plan()
     bad.parameters[1] =
         SampledParameter(:tau, :normal, (arg1 = 2.0, arg2 = 1.0), :positive, :tau)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: one-sided truncation at a non-zero location (truncated(Normal(2, 1), 0, Inf)); :positive is the zero-location half only (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     bad = _gaussian_plan()
     bad.parameters[1] =
         SampledParameter(:mu0, :normal, (arg1 = 0.0, arg2 = 1.0), nothing, :mu0)
     push!(bad.parameters,
         SampledParameter(:tau, :cauchy, (arg1 = :mu0, arg2 = 1.0), :positive, :tau))
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: one-sided truncation at a parameter location (truncated(Cauchy(mu0, 1), 0, Inf)) with a parameter-dependent normalizer (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     bad = _gaussian_plan()
     bad.parameters[1] =
         SampledParameter(:tau, :flat, (;), :positive, :tau)
+    # refused: :positive (renormalized half) on an improper flat; flat takes :positive_stan (IR contract: support-override rule)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
 @testset "name tables and topo order" begin
     bad = _gaussian_plan()
     push!(bad.assignments, AssignmentSpec(:sigma, :(1.0 + 0.0)))
+    # refused: assignment rebinds a sampled parameter name (single assignment)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     push!(bad.assignments, AssignmentSpec(:a, :b))
     push!(bad.assignments, AssignmentSpec(:b, :a))
+    # refused: cyclic definitions a = b, b = a (single assignment / topo order)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     push!(bad.assignments, AssignmentSpec(:s, :s))
+    # refused: self-referential definition s = s (single assignment / topo order)
     @test_throws ContractValidationError validate_plan(bad)
     ok = _gaussian_plan()
     push!(ok.assignments, AssignmentSpec(:half_n, :(length(:x) / 2)))
@@ -1532,6 +1687,7 @@ end
         SampledParameter(:lam, :exponential, (arg1 = :half_n,), nothing, :lam))
     # :half_n references a column inside length(); the length call must take
     # a bare column — :(length(:x)) quotes :x instead. Fix and re-test below.
+    # refused: reduction over a quoted symbol instead of a bare column (IR contract: malformed assignment expression)
     @test_throws ContractValidationError validate_plan(ok)
     ok2 = _gaussian_plan()
     push!(ok2.assignments, AssignmentSpec(:half_n, :(length(x) / 2)))
@@ -1543,15 +1699,19 @@ end
 @testset "assignment expressions" begin
     bad = _gaussian_plan()
     push!(bad.assignments, AssignmentSpec(:v, :(x .+ 1)))
+    # refused: row-varying column in a scalar AssignmentSpec; vector values go through derived-column nodes (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     push!(bad.assignments, AssignmentSpec(:v, :(x + 1)))
+    # refused: undotted column + scalar is a Julia MethodError (P3)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     push!(bad.assignments, AssignmentSpec(:v, :(sum(x, y))))
+    # refused: sum(x, y) calls a vector as a function — a Julia MethodError (P3)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     push!(bad.assignments, AssignmentSpec(:v, :(lgamma(x))))
+    # refused: undotted scalar function over a column is a Julia MethodError (P3); non-builtin callees enter as GlobalRef (P8)
     @test_throws ContractValidationError validate_plan(bad)
     # One element of a column is a model-level value (standard Julia
     # indexing — functions as values); a whole column is not.
@@ -1560,18 +1720,22 @@ end
     @test validate_plan(ok) === nothing
     bad = _gaussian_plan()
     push!(bad.assignments, AssignmentSpec(:v, :(nope + 1)))
+    # refused: assignment references an unknown name (IR contract: dangling reference)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
 @testset "priors and predictors" begin
     bad = _gaussian_plan()
     popfirst!(bad.population_priors)
+    # refused: coefficient without a stated prior (P7, 0d5a67r)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     push!(bad.population_priors, PopulationPrior(:mu, :x, 0.0, 1.0))
+    # refused: coefficient given two priors (single assignment)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     push!(bad.predictors, PredictorSpec(:unused, IdentityLink, _terms(), :unused))
+    # refused: predictor feeds no likelihood (IR contract: no dangling predictors)
     @test_throws ContractValidationError validate_plan(bad)
     ok = _gaussian_plan()
     push!(ok.predictors[1].terms,
@@ -1602,67 +1766,77 @@ end
         return StructuralPlan(plan.responses, preds, priors, plan.parameters,
             plan.assignments, plan.columns, plan.n_obs; levelmaps = ms)
     end
-    # Intercept + strict subset: identified. Full cover alone: identified.
+    # Both subsets and full-cover factors are legal with an intercept.
     @test validate_plan(_factor_plan()) === nothing
     @test validate_plan(_factor_plan(; intercept = false,
         subset = Colon())) === nothing
-    # Intercept + full cover: the identifiability gate.
-    bad = _factor_plan(; subset = Colon())
-    @test_throws ContractValidationError validate_plan(bad)
+    @test validate_plan(_factor_plan(; subset = Colon())) === nothing
     # Missing / duplicate maps.
+    # refused: factor term without its level map (IR contract)
     @test_throws ContractValidationError validate_plan(_factor_plan(;
         maps = :none))
+    # refused: duplicate level maps for one factor (IR contract)
     @test_throws ContractValidationError validate_plan(_factor_plan(;
         maps = :two))
     # Non-empty term options are gone with treatment.
     bad = _factor_plan()
     bad.predictors[1].terms[end] =
         TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 1), :g, :g_term)
+    # refused: factor term options (treatment contrasts) removed; level maps carry coding (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     # Bad sources and subset shapes.
     for (src, sub) in ((:unique, (2, :end)), (:levels, 0:2),
             (:levels, Int[]), (:levels, (0, :end)), (:levels, (1, :foo)))
         bad = _factor_plan()
         bad.levelmaps[1] = LevelMap(:mu, :g, [2, 3], src, sub)
+        # refused: malformed LevelMap source/subset (IR contract)
         @test_throws ContractValidationError validate_plan(bad)
     end
     # Unfilled values on a bound plan.
     bad = _factor_plan()
     bad.levelmaps[1] = LevelMap(:mu, :g, [], :levels, (2, :end))
+    # refused: unfilled level values on a bound plan (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
 @testset "labels and reserved names" begin
     bad = _gaussian_plan()
     push!(bad.responses, bad.responses[1])
+    # refused: duplicate response label (IR contract: unique labels)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     bad.parameters[1] =
         SampledParameter(:posterior, :exponential, (arg1 = 1.0,), nothing, :m)
+    # refused: parameter named with the reserved name :posterior (reserved names)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     bad.responses[1] =
         LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :prior)
+    # refused: response labelled with the reserved name :prior (reserved names)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
 @testset "columns and evidence" begin
     bad = _gaussian_plan()
     bad.columns[:x] = [1.0, 2.0]
+    # refused: column length mismatch with n_obs (wrong data: length mismatch)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _gaussian_plan()
     bad.columns[:x] = Union{Missing,Float64}[1.0, missing, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    # refused: missing values in a predictor column (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _bernoulli_plan()
     bad.responses[1] =
         LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta, nothing, nothing,
             ResponseEvidence(:truncated, 0.0, 1.0), :y_resp)
-    @test_throws ContractValidationError validate_plan(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (Bernoulli logit) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_plan(bad); true)
     bad = _gaussian_plan()
     bad.responses[1] =
         LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
             ResponseEvidence(:truncated, 2.0, 1.0), :y_resp)
+    # refused: truncation lower bound above upper bound (mathematically invalid input)
     @test_throws ContractValidationError validate_plan(bad)
     ok = _gaussian_plan()
     ok.responses[1] =
@@ -1673,17 +1847,20 @@ end
     bad.responses[1] =
         LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
             ResponseEvidence(:interval_censored, 0.0, 10.0), :y_resp)
+    # refused: interval_censored takes no lower (the response is the lower endpoint) (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _poisson_plan()
     bad.responses[1] =
         LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta, nothing, nothing,
             ResponseEvidence(:truncated, nothing, 4.5), :y_resp)
+    # refused: non-integer truncation bound for a count family (malformed distribution)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _poisson_plan()
     bad.columns[:b] = fill(4.0, 9)
     bad.responses[1] =
         LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta, nothing, nothing,
             ResponseEvidence(:truncated, nothing, :b), :y_resp)
+    # refused: non-integer-typed bound column for a count family (wrong eltype)
     @test_throws ContractValidationError validate_plan(bad)
     ok = _poisson_plan()
     ok.responses[1] =
@@ -1701,13 +1878,15 @@ _unbind(p::StructuralPlan) = StructuralPlan(p.responses, p.predictors,
     @test !isbound(u)
     @test validate_structure(u) === nothing
     @test validate_plan(u) === nothing
+    # refused: validate_data on an unbound plan (IR contract: data checks need bound columns)
     @test_throws ContractValidationError validate_data(u)
     # A structural defect still fails unbound.
     bad = _unbind(_bernoulli_plan())
     bad.responses[1] =
         LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta, nothing, nothing,
             ResponseEvidence(:truncated, 0.0, 1.0), :y_resp)
-    @test_throws ContractValidationError validate_structure(bad)
+    # capability: truncation/censoring evidence on non-Gaussian/Poisson/StudentT families (Bernoulli logit, unbound) — error says "(slice 1)" (todo `0ze68k8`)
+    @test_broken (validate_structure(bad); true)
     # Bind happy path: same plan, roles inferred.
     cols = _columns(9)
     b = bind_data(u, cols)
@@ -1722,15 +1901,20 @@ _unbind(p::StructuralPlan) = StructuralPlan(p.responses, p.predictors,
     @test b2.n_obs == 6
     @test validate_plan(b2) === nothing
     # Bind errors fail closed.
+    # refused: bind with no data columns (wrong data: missing data names)
     @test_throws ContractValidationError bind_data(u, Dict{Symbol,AbstractVector}())
     ragged = _columns(9)
     ragged[:x] = [1.0, 2.0]
+    # refused: ragged column length (wrong data: length mismatch)
     @test_throws ContractValidationError bind_data(u, ragged)
     missing = _columns(9)
     delete!(missing, :x)
+    # refused: required column missing at bind (wrong data: missing data name)
     @test_throws ContractValidationError bind_data(u, missing)
+    # refused: unknown role value (bind_data API contract: role vocabulary)
     @test_throws ContractValidationError bind_data(u, _columns(9);
         roles = Dict(:y => :nonsense))
+    # refused: role given for a column not in the plan (bind_data API contract)
     @test_throws ContractValidationError bind_data(u, _columns(9);
         roles = Dict(:nope => :data))
 end
@@ -1777,17 +1961,21 @@ end
     # A valid random-effects plan passes structure + data validation.
     @test (validate_plan(_re_plan()); true)
     # Unknown family.
+    # refused: unknown plate family :studentt (IR contract: family vocabulary)
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :studentt,
             (arg1 = :mu, arg2 = :tau), nothing)))
     # `flat()` per-cell latent has no proper prior to draw a cell from.
-    @test_throws ContractValidationError validate_structure(
-        _re_plan(; plate = PlateParameter(:theta, :flat, NamedTuple(), nothing)))
+    # capability: a per-cell flat latent (an improper prior like the admitted scalar flat; P3) (todo `1qlbn5b`)
+    @test_broken (validate_structure(
+        _re_plan(; plate = PlateParameter(:theta, :flat, NamedTuple(), nothing))); true)
     # Wrong arity keys.
+    # refused: wrong positional arity for the plate family (IR contract: positional-args pin)
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :normal, (arg1 = :mu,), nothing)))
     # Prior arg references a genuinely unknown name (not scalar/derived/data);
     # resolved at bind, so it surfaces from validate_data (validate_plan runs it).
+    # refused: plate prior arg names an unknown name (IR contract: dangling reference)
     @test_throws ContractValidationError validate_plan(
         _re_plan(; plate = PlateParameter(:theta, :normal,
             (arg1 = :nope, arg2 = :tau), nothing)))
@@ -1795,10 +1983,12 @@ end
     @test (validate_plan(_re_plan(; plate = PlateParameter(:theta, :normal,
         (arg1 = :x, arg2 = :tau), nothing))); true)
     # A latent VECTOR cannot be a prior arg (never another latent).
+    # refused: plate latent's prior references itself (single assignment / cyclic definition)
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :normal,
             (arg1 = :theta, arg2 = :tau), nothing)))
     # :positive override only applies to normal/cauchy.
+    # refused: :positive half-override on a non-symmetric (already positive) family (IR contract: support-override rule)
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :exponential, (arg1 = 1.0,),
             :positive)))
@@ -1806,18 +1996,22 @@ end
     @test (validate_plan(_re_plan(; plate = PlateParameter(:theta, :normal,
         (arg1 = :mu, arg2 = :tau), (:interval, -2.0, 5.0)))); true)
     # :interval is a truncated Normal — a non-Normal family is rejected.
-    @test_throws ContractValidationError validate_structure(
+    # capability: interval truncation of a non-Normal (Cauchy) plate latent — error: "truncated Normal ... in slice 1" (todo `0ze68k8`)
+    @test_broken (validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :cauchy,
-            (arg1 = :mu, arg2 = :tau), (:interval, -1.0, 1.0))))
+            (arg1 = :mu, arg2 = :tau), (:interval, -1.0, 1.0)))); true)
     # :interval bounds must be finite.
-    @test_throws ContractValidationError validate_structure(
+    # capability: one-sided lower truncation at a parameter location (truncated(Normal(mu, tau), 0, Inf)); :interval needs finite bounds, :positive needs literal zero location (todo `0ze68k8`)
+    @test_broken (validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :normal,
-            (arg1 = :mu, arg2 = :tau), (:interval, 0.0, Inf))))
+            (arg1 = :mu, arg2 = :tau), (:interval, 0.0, Inf)))); true)
     # :interval lower < upper.
+    # refused: interval lower bound above upper bound (mathematically invalid input)
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :normal,
             (arg1 = :mu, arg2 = :tau), (:interval, 3.0, 1.0))))
     # A tuple override whose head is neither :interval nor :upper is rejected.
+    # refused: unknown support-override tuple head (IR contract)
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :normal,
             (arg1 = :mu, arg2 = :tau), (:bogus, 0.0, 1.0))))
@@ -1825,23 +2019,28 @@ end
     @test (validate_plan(_re_plan(; plate = PlateParameter(:theta, :normal,
         (arg1 = :mu, arg2 = :tau), (:upper, 1.0)))); true)
     # :upper is a truncated Normal — a non-Normal family is rejected.
-    @test_throws ContractValidationError validate_structure(
+    # capability: upper truncation of a non-Normal (Cauchy) plate latent — error: "truncated Normal ... in slice 1" (todo `0ze68k8`)
+    @test_broken (validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :cauchy,
-            (arg1 = :mu, arg2 = :tau), (:upper, 1.0))))
+            (arg1 = :mu, arg2 = :tau), (:upper, 1.0)))); true)
     # :upper bound must be finite.
+    # refused: infinite :upper bound (untruncated; use no override) (IR contract)
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :normal,
             (arg1 = :mu, arg2 = :tau), (:upper, Inf))))
     # :upper takes exactly one bound.
+    # refused: :upper override with two bounds (IR contract)
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :normal,
             (arg1 = :mu, arg2 = :tau), (:upper, 0.0, 1.0))))
     # Plate name collides with a scalar parameter.
+    # refused: plate name collides with a scalar parameter (single assignment / name collision)
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:mu, :normal, (arg1 = 0.0, arg2 = 1.0),
             nothing),
             term = TermSpec(LatentTerm, [:mu], NamedTuple(), :mu, :mu_lat)))
     # Latent term with no matching plate parameter.
+    # refused: latent term names no plate parameter (IR contract: dangling reference)
     @test_throws ContractValidationError validate_structure(
         _re_plan(; term = TermSpec(LatentTerm, [:absent], NamedTuple(), :absent,
             :absent_lat)))
@@ -1849,10 +2048,12 @@ end
     good = _re_plan(9; plate = PlateParameter(:theta, :normal,
         (arg1 = :mu, arg2 = :tau), nothing, 1:9))
     @test (validate_plan(good); true)
+    # refused: plate range does not cover 1:n_obs (wrong data: length mismatch)
     @test_throws ContractValidationError validate_data(
         _re_plan(9; plate = PlateParameter(:theta, :normal,
             (arg1 = :mu, arg2 = :tau), nothing, 1:8)))
     # A range not starting at 1 is a structure error.
+    # refused: plate range not starting at 1 (IR contract)
     @test_throws ContractValidationError validate_structure(
         _re_plan(9; plate = PlateParameter(:theta, :normal,
             (arg1 = :mu, arg2 = :tau), nothing, 2:9)))
@@ -1903,11 +2104,14 @@ end
     @test two.responses[1].n_levels == 2
     # Tail predictors count as used (no unused-predictor failure above).
     # Unknown tail predictor.
+    # refused: unknown categorical tail predictor (IR contract: dangling reference)
     @test_throws ContractValidationError _categorical_plan(; extra = [:nope])
     # Repeated predictor across lead + tail.
+    # refused: predictor repeated across lead + tail (IR contract)
     @test_throws ContractValidationError _categorical_plan(; extra = [:mu2])
     # Explicit n_levels asserting against the structural K.
     @test (validate_plan(_categorical_plan(; n_levels = 3)); true)
+    # refused: explicit n_levels disagrees with the structural K (IR contract: size assertion)
     @test_throws ContractValidationError _categorical_plan(; n_levels = 2)
     # Stray leveled fields fail closed.
     for kw in (:thresholds, :count_columns, :ordinal_structure,
@@ -1919,18 +2123,21 @@ end
         r = LikelihoodSpec(CategoricalLogitFam, LogitLink, :y, :mu2, nothing,
             nothing, _none_evidence(), :y_resp, nothing, nothing;
             extra_predictors = [:mu3], kw => val)
+        # refused: stray leveled field on a categorical response (IR contract)
         @test_throws ContractValidationError _categorical_plan(; resp = r)
     end
     # Scale / trials / evidence are not categorical auxiliaries.
     r = LikelihoodSpec(CategoricalLogitFam, LogitLink, :y, :mu2, :sigma,
         nothing, _none_evidence(), :y_resp, nothing, nothing;
         extra_predictors = [:mu3])
+    # refused: scale slot on a categorical response (IR contract)
     @test_throws ContractValidationError _categorical_plan(; resp = r)
     # Non-identity predictor link is not an admitted triple.
     badpred = PredictorSpec(:mu2, LogitLink, _terms(), :mu2)
     bad = StructuralPlan(good.responses, [badpred, good.predictors[2]],
         good.population_priors, good.parameters, good.assignments,
         good.columns, good.n_obs)
+    # refused: non-identity predictor link on categorical (IR contract: link-triple pin)
     @test_throws ContractValidationError validate_structure(bad)
     # Response must be recoded 1..K integers: floats, gaps, and level
     # overflow all fail.
@@ -1942,6 +2149,7 @@ end
         bad = StructuralPlan(good.responses, good.predictors,
             good.population_priors, good.parameters, good.assignments,
             badcols, good.n_obs)
+        # refused: float-typed leveled response (wrong eltype)
         @test_throws ContractValidationError validate_data(bad)
     end
 end
@@ -1972,17 +2180,22 @@ end
     # Missing thresholds.
     r = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu, nothing,
         nothing, _none_evidence(), :y_resp, nothing, nothing)
+    # refused: OrderedLogistic without its thresholds (IR contract)
     @test_throws ContractValidationError _ordered_plan(;
         resp = r, vecs = VectorParameter[])
     # Thresholds must be ordered_normal for OrderedLogistic.
+    # refused: cumulative cutpoints not an ordered vector (vector_normal) (malformed distribution)
     @test_throws ContractValidationError _ordered_plan(;
         vecfam = :vector_normal)
+    # refused: cumulative cutpoints not an ordered vector (simplex) (malformed distribution)
     @test_throws ContractValidationError _ordered_plan(;
         vecfam = :simplex_dirichlet)
     # Explicit sizes assert both ways.
     @test (validate_plan(_ordered_plan(; vecsize = 2)); true)
+    # refused: explicit threshold size disagrees with K-1 (IR contract: size assertion)
     @test_throws ContractValidationError _ordered_plan(; vecsize = 3)
     @test (validate_plan(_ordered_plan(; n_levels = 3, vecsize = 2)); true)
+    # refused: explicit n_levels disagrees with the data's K (IR contract: size assertion)
     @test_throws ContractValidationError _ordered_plan(; n_levels = 2,
         vecsize = 2)
     # K=1 is uniform: zero thresholds, zero-information likelihood.
@@ -1996,6 +2209,7 @@ end
     r = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu, nothing,
         nothing, _none_evidence(), :y_resp, nothing, nothing;
         thresholds = :y_cutpoints, ordinal_structure = :cumulative)
+    # refused: ordinal_structure on OrderedLogistic (IR contract)
     @test_throws ContractValidationError _ordered_plan(; resp = r)
 end
 
@@ -2013,6 +2227,7 @@ _all_fields_spec() = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
     @test r2.n_levels == 3
     @test [f for f in fieldnames(LikelihoodSpec)
         if f !== :n_levels && getfield(r2, f) != getfield(r, f)] == Symbol[]
+    # refused: unknown field name in the internal _with rebuild helper (IR contract)
     @test_throws ArgumentError ReactiveKernelsPPL._with(r; n_level = 3)
     # Plan-level copies keep every field they do not override.
     good = _ordered_plan()
@@ -2026,6 +2241,7 @@ _all_fields_spec() = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
         rg = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu, nothing,
             nothing, _none_evidence(), :y_resp, nothing, nothing;
             thresholds = :y_cutpoints, (k => v,)...)
+        # refused: GLM-object field on a non-GLM response (IR contract)
         @test_throws ContractValidationError _ordered_plan(; resp = rg)
     end
 end
@@ -2039,6 +2255,8 @@ function _ordinal_plan(n = 9; link = LogitLink, structure = :cumulative,
         [TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)] : terms
     preds = PredictorSpec[PredictorSpec(:mu, IdentityLink, terms, :mu)]
     priors = PopulationPrior[PopulationPrior(:mu, :x, 0.0, 2.0)]
+    any(t -> t.kind === InterceptTerm, terms) &&
+        push!(priors, PopulationPrior(:mu, :Intercept, 0.0, 1.0))
     r = resp === nothing ? LikelihoodSpec(OrdinalFam, link, :y, :mu, nothing,
         nothing, _none_evidence(), :y_resp, nothing, nothing;
         thresholds = :y_thresholds, ordinal_structure = structure,
@@ -2066,22 +2284,32 @@ end
     r = LikelihoodSpec(OrdinalFam, LogitLink, :y, :mu, nothing,
         nothing, _none_evidence(), :y_resp, nothing, nothing;
         thresholds = :y_thresholds)
+    # refused: Ordinal without its ordinal_structure (IR contract)
     @test_throws ContractValidationError _ordinal_plan(; resp = r)
     r = LikelihoodSpec(OrdinalFam, LogitLink, :y, :mu, nothing,
         nothing, _none_evidence(), :y_resp, nothing, nothing;
         thresholds = :y_thresholds, ordinal_structure = :bogus)
+    # refused: unknown ordinal_structure (IR contract)
     @test_throws ContractValidationError _ordinal_plan(; resp = r)
     # Threshold family must match the structure.
+    # refused: threshold family does not match the structure (stopping takes vector_normal) (IR contract)
     @test_throws ContractValidationError _ordinal_plan(;
         structure = :stopping, vecfam = :ordered_normal)
+    # refused: cumulative thresholds not ordered (malformed distribution)
     @test_throws ContractValidationError _ordinal_plan(;
         structure = :cumulative, vecfam = :vector_normal)
-    # A fixed intercept is non-identifiable with the thresholds (SB rule).
-    @test_throws ContractValidationError _ordinal_plan(; terms = _terms())
+    # An intercept is legal alongside thresholds for either structure.
+    for (structure, vfam) in
+            ((:cumulative, :ordered_normal), (:stopping, :vector_normal))
+        @test validate_plan(_ordinal_plan(; terms = _terms(),
+            structure = structure, vecfam = vfam)) === nothing
+    end
     # Discrimination: positive literal or data column only.
     @test (validate_plan(_ordinal_plan(; discrimination = 2.0)); true)
     @test (validate_plan(_ordinal_plan(; discrimination = :d)); true)
+    # refused: zero discrimination (mathematically invalid input)
     @test_throws ContractValidationError _ordinal_plan(; discrimination = 0.0)
+    # refused: negative discrimination (mathematically invalid input)
     @test_throws ContractValidationError _ordinal_plan(; discrimination = -1.0)
     good = _ordinal_plan(; discrimination = :d)
     badcols = Dict{Symbol,AbstractVector}(good.columns)
@@ -2089,19 +2317,24 @@ end
     bad = StructuralPlan(good.responses, good.predictors,
         good.population_priors, good.parameters, good.assignments, badcols,
         good.n_obs; vector_parameters = good.vector_parameters)
+    # refused: non-positive discrimination column (wrong data)
     @test_throws ContractValidationError validate_data(bad)
     # A sampled parameter is not an admitted discrimination (SB takes
     # literals and data columns only).
+    # refused: discrimination predictor not log-linked (positive slot) (IR contract)
     @test_throws ContractValidationError _ordinal_plan(; discrimination = :mu)
     # per_threshold: stopping-only, coefs required exactly with columns.
     good = _ordinal_plan(; structure = :stopping, vecfam = :vector_normal,
         tcols = [:z1, :z2], coefs = :y_beta)
     @test (validate_plan(good); true)
     @test good.vector_parameters[2].size == 4 # (K−1)×p
+    # refused: category-specific effects on a cumulative model break threshold monotonicity (mathematically invalid)
     @test_throws ContractValidationError _ordinal_plan(;
         structure = :cumulative, tcols = [:z1], coefs = :y_beta)
+    # refused: threshold columns without their coefficient vector (IR contract)
     @test_throws ContractValidationError _ordinal_plan(;
         structure = :stopping, vecfam = :vector_normal, tcols = [:z1])
+    # refused: threshold coefficients without threshold columns (IR contract)
     @test_throws ContractValidationError _ordinal_plan(;
         structure = :stopping, vecfam = :vector_normal, coefs = :y_beta)
     # Threshold design columns are raw finite numerics.
@@ -2110,6 +2343,7 @@ end
     bad = StructuralPlan(good.responses, good.predictors,
         good.population_priors, good.parameters, good.assignments, badcols,
         good.n_obs; vector_parameters = good.vector_parameters)
+    # refused: non-finite threshold design column (wrong data)
     @test_throws ContractValidationError validate_data(bad)
     # Non-identity predictor link is not an admitted ordinal triple.
     base = _ordinal_plan()
@@ -2117,6 +2351,7 @@ end
     bad = StructuralPlan(base.responses, [badpred], base.population_priors,
         base.parameters, base.assignments, base.columns, base.n_obs;
         vector_parameters = base.vector_parameters)
+    # refused: non-identity predictor link on ordinal (IR contract: link-triple pin)
     @test_throws ContractValidationError validate_structure(bad)
 end
 
@@ -2153,25 +2388,31 @@ end
         :c2 => [1, 2, 0, 1], :c3 => [0, 1, 2, 2])
     @test (validate_plan(_multinomial_plan(; trials = 3, cols = cols3)); true)
     # Row sums must meet N in every row (Stan errors otherwise).
+    # refused: count rows do not sum to trials (wrong data)
     @test_throws ContractValidationError _multinomial_plan(; trials = 2)
     # Trials required; non-identity link rejected.
     r = LikelihoodSpec(MultinomialFam, IdentityLink, :c1, :s, nothing,
         nothing, _none_evidence(), :y_resp, nothing, nothing;
         count_columns = [:c2, :c3])
+    # refused: Multinomial without its required trials (IR contract)
     @test_throws ContractValidationError _multinomial_plan(; resp = r)
     r = LikelihoodSpec(MultinomialFam, LogitLink, :c1, :s, nothing,
         nothing, _none_evidence(), :y_resp, :N, nothing;
         count_columns = [:c2, :c3])
+    # refused: non-identity link on Multinomial (IR contract: link-triple pin)
     @test_throws ContractValidationError _multinomial_plan(; resp = r)
     # The predictor names the :simplex_dirichlet vector parameter.
     r = LikelihoodSpec(MultinomialFam, IdentityLink, :c1, :mu, nothing,
         nothing, _none_evidence(), :y_resp, :N, nothing;
         count_columns = [:c2, :c3])
+    # refused: Multinomial predictor does not name a simplex vector parameter (IR contract)
     @test_throws ContractValidationError _multinomial_plan(; resp = r)
     # Count columns are distinct; n_levels asserts structurally.
+    # refused: duplicate count columns (IR contract)
     @test_throws ContractValidationError _multinomial_plan(;
         counts = [:c2, :c2])
     @test (validate_plan(_multinomial_plan(; n_levels = 3)); true)
+    # refused: explicit n_levels disagrees with the structural K (IR contract: size assertion)
     @test_throws ContractValidationError _multinomial_plan(; n_levels = 2)
     # Counts are non-negative integers.
     badcols = Dict{Symbol,AbstractVector}(good.columns)
@@ -2179,6 +2420,7 @@ end
     bad = StructuralPlan(good.responses, good.predictors,
         good.population_priors, good.parameters, good.assignments, badcols,
         good.n_obs; vector_parameters = good.vector_parameters)
+    # refused: non-integer counts (wrong data)
     @test_throws ContractValidationError validate_data(bad)
     # K=1: one count column, deterministic 1-simplex.
     cols1 = Dict{Symbol,AbstractVector}(:c1 => [3, 2], :N => [3, 2])
@@ -2216,10 +2458,12 @@ end
     # Categorical takes no trials / count columns / thresholds.
     r = LikelihoodSpec(CategoricalFam, IdentityLink, :y, :s, nothing,
         nothing, _none_evidence(), :y_resp, :N, nothing)
+    # refused: trials slot on a categorical-simplex response (IR contract)
     @test_throws ContractValidationError _categorical_plain_plan(; resp = r)
     r = LikelihoodSpec(CategoricalFam, IdentityLink, :y, :s, nothing,
         nothing, _none_evidence(), :y_resp, nothing, nothing;
         count_columns = [:c2])
+    # refused: count columns on a categorical-simplex response (IR contract)
     @test_throws ContractValidationError _categorical_plain_plan(; resp = r)
 end
 
@@ -2236,23 +2480,31 @@ end
     # Unknown family / bad arity.
     bad = _with_vectors(base, [VectorParameter(:y_cutpoints, :bogus,
         (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints)])
+    # refused: unknown vector-parameter family (IR contract: family vocabulary)
     @test_throws ContractValidationError validate_structure(bad)
     bad = _with_vectors(base, [VectorParameter(:y_cutpoints, :ordered_normal,
         (arg1 = 0.0,), nothing, :y_cutpoints)])
+    # refused: wrong positional arity for the vector family (IR contract: positional-args pin)
     @test_throws ContractValidationError validate_structure(bad)
     # Non-literal / non-positive threshold args.
     bad = _with_vectors(base, [VectorParameter(:y_cutpoints, :ordered_normal,
         (arg1 = :mu, arg2 = 1.0), nothing, :y_cutpoints)])
-    @test_throws ContractValidationError validate_structure(bad)
+    # capability: hierarchical (parameter-valued) threshold prior location (todo `0fkd9yk`)
+    @test_broken (validate_structure(bad); true)
     bad = _with_vectors(base, [VectorParameter(:y_cutpoints, :ordered_normal,
         (arg1 = 0.0, arg2 = 0.0), nothing, :y_cutpoints)])
+    # refused: zero threshold prior scale (mathematically invalid input)
     @test_throws ContractValidationError validate_structure(bad)
     # Dirichlet: vector concentration, finite positive, size agreement.
-    @test_throws ContractValidationError _multinomial_plan(; alpha = :alpha_col)
+    # capability: non-literal (named/data) Dirichlet concentration (todo `0fkd9yk`)
+    @test_broken (_multinomial_plan(; alpha = :alpha_col); true)
+    # refused: zero Dirichlet concentration (mathematically invalid input)
     @test_throws ContractValidationError _multinomial_plan(;
         alpha = [1.0, 0.0, 2.0])
+    # refused: Dirichlet concentration length != simplex size K (malformed distribution)
     @test_throws ContractValidationError _multinomial_plan(;
         alpha = [1.0, 1.0])
+    # refused: explicit simplex size disagrees with K (IR contract: size assertion)
     @test_throws ContractValidationError _multinomial_plan(; vecsize = 2)
     # Unused / duplicate vector parameters.
     orphan = _with_vectors(base, VectorParameter[
@@ -2261,11 +2513,13 @@ end
         VectorParameter(:stray, :ordered_normal, (arg1 = 0.0, arg2 = 1.0),
             nothing, :stray),
     ])
+    # refused: vector parameter consumed by no response (IR contract: no dangling parameters)
     @test_throws ContractValidationError validate_structure(orphan)
     dup = _with_vectors(base, [VectorParameter(:y_cutpoints, :ordered_normal,
             (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints),
         VectorParameter(:y_cutpoints, :ordered_normal,
             (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints)])
+    # refused: duplicate vector parameter name (single assignment)
     @test_throws ContractValidationError validate_structure(dup)
     # A vector name colliding with a scalar parameter.
     clash = StructuralPlan(base.responses, base.predictors,
@@ -2274,6 +2528,7 @@ end
             nothing, :y_cutpoints)],
         base.assignments, base.columns, base.n_obs;
         vector_parameters = base.vector_parameters)
+    # refused: vector parameter name collides with a scalar parameter (single assignment / name collision)
     @test_throws ContractValidationError validate_structure(clash)
     # Sharing one thresholds vector across two responses fails closed.
     r2 = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu, nothing,
@@ -2283,7 +2538,8 @@ end
         base.population_priors, base.parameters, base.assignments,
         base.columns, base.n_obs;
         vector_parameters = base.vector_parameters)
-    @test_throws ContractValidationError validate_structure(shared)
+    # capability: one thresholds vector shared across two ordinal responses (todo `1qlbn5b`)
+    @test_broken (validate_structure(shared); true)
     # Roles: count tails are responses, threshold design is predictor.
     bound = _multinomial_plan()
     @test bound.roles[:c1] === :response

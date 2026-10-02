@@ -152,6 +152,7 @@ end
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, sigma)
     end
+    # refused: r2d2 arity, phi simplex missing; no minted/default simplex (P6, 05oe96l; P7, 0d5a67r)
     @test_throws SurfaceLoweringError lower_rkppl(bad, Set([:x1, :x2, :y]))
     dup = quote
         R2 ~ Beta(1.0, 1.0)
@@ -162,8 +163,12 @@ end
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, sigma)
     end
+    # refused: single assignment, r2d2 declared twice on one predictor
     @test_throws SurfaceLoweringError lower_rkppl(dup, Set([:x1, :x2, :y]))
     ghost = quote
+        a ~ Normal(0, 1)
+        b1 ~ Normal(0, 1)
+        b2 ~ Normal(0, 1)
         R2 ~ Beta(1.0, 1.0)
         phi ~ Dirichlet([1.0, 1.0])
         mu = a .+ b1 .* x1 .+ b2 .* x2
@@ -171,6 +176,7 @@ end
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, sigma)
     end
+    # refused: undeclared predictor `nope` (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(ghost, Set([:x1, :x2, :y]))
     # Parameter families (structural, via hand-built plans).
     good = lower_rkppl(_r2d2_demo(), Set([:x1, :x2, :y]))
@@ -187,6 +193,7 @@ end
         spline_bases = good.spline_bases,
         spline_vectors = good.spline_vectors, hsgp_bases = good.hsgp_bases,
         kernel_plates = good.kernel_plates, r2d2_priors = good.r2d2_priors)
+    # refused: R2 not Beta (IR contract)
     @test_throws ContractValidationError validate_structure(notbeta)
     # Bind-time: phi size mismatch, decomposed-nothing, constant column.
     small_phi = quote
@@ -197,6 +204,7 @@ end
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, sigma)
     end
+    # refused: phi simplex size differs from decomposed column count
     @test_throws ContractValidationError bind_data(
         lower_rkppl(small_phi, Set([:x1, :x2, :y])), cols)
     icpt = quote
@@ -208,10 +216,12 @@ end
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, sigma)
     end
+    # refused: phi size differs from decomposed columns (none left after the stated override); vacuous decomposition
     @test_throws ContractValidationError bind_data(
         lower_rkppl(icpt, Set([:x1, :x2, :y])), cols)
     flat = Dict{Symbol,AbstractVector}(:x1 => ones(4),
         :x2 => [1.0, 0.5, -0.5, 2.0], :y => [1.0, 2.0, 1.5, 2.5])
+    # refused: constant column has zero variance (R2D2 scale divides by var(x); unidentified with the intercept)
     @test_throws ContractValidationError bind_data(
         lower_rkppl(_r2d2_demo(), Set([:x1, :x2, :y])), flat)
     # Monotonic columns are out of the flat slice.
@@ -224,6 +234,7 @@ end
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, sigma)
     end
-    @test_throws SurfaceLoweringError lower_rkppl(momodel,
-        Set([:x1, :x2, :c, :y]))
+    # capability: r2d2 over predictors with mo() terms (todo `1308iv0`)
+    @test_broken (lower_rkppl(momodel,
+        Set([:x1, :x2, :c, :y])); true)
 end

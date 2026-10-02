@@ -248,7 +248,7 @@ end
         # (+log 2, Stan-faithful); sigma rides exp (log Jacobian).
         want = sum(logpdf(Normal(m, 1.5), y)
             for (m, y) in zip(mu, _SR_ARK_YT)) +
-            sum(logpdf(Normal(0.0, 10.0), c) for c in [q.alpha, q.b1, q.b2]) +
+            sum(logpdf(Normal(0.0, 10.0), c) for c in (q.alpha, q.b1, q.b2)) +
             logpdf(Cauchy(0.0, 2.5), 1.5) + log(2) + log(1.5)
         @test got ≈ want rtol = 1e-12
     end
@@ -317,8 +317,8 @@ end
     end
     @testset "dugongs (DUG0 zeros)" begin
         # SB: Linf ~ Normal(2,1), kk/t0 ~ Normal(0,1), sigma ~
-        # Exponential(1); von-Bertalanffy mean; u=zeros(4). Linf reports
-        # under its own name; order-agnostic u, name-mapped grad.
+        # Exponential(1); von-Bertalanffy mean; u=zeros(4). Linf rides
+        # the synth coordinate; order-agnostic u, name-mapped grad.
         bound, built, kern, lay = _sr_query(_SR_DUG_PROG, _sr_dug_cols())
         names = coordinate_names(lay)
         u = zeros(lay.total)

@@ -14,16 +14,36 @@
 using LinearAlgebra: Diagonal, Symmetric, eigen, norm, nullspace
 
 # Spline fits (verbatim port of BRM `src/preparation_basis.jl`, `_brm_` →
-# `_rk_` + `ContractValidationError`): same op order, so bit-identical
-# bases on identical input (verified by a /tmp differential, not committed
-# — BRM is not a test dep), except that `s(x)` drops BRM's constant
-# null-space column (`_rk_apply_spline`). Eigen/nullspace/quantile are
-# inexpressible in the kernel graph, so the fit runs at BIND (host, full
+# `_rk_` + `ContractValidationError`, plus the canonical column signs of
+# decision 1vts6mb — BRM adopts the same rule in its half): same op order,
+# so bit-identical bases on identical input (verified by a /tmp differential,
+# not committed — BRM is not a test dep), except that `s(x)` drops BRM's
+# constant null-space column (`_rk_apply_spline`). Eigen/nullspace/quantile
+# are inexpressible in the kernel graph, so the fit runs at BIND (host, full
 # LAPACK) — the exact Stan transformed-data mirror — and materializes basis
 # COLUMNS as bound vectors; the graph sees only vector ops. Fit/apply stay
 # split (slice-2 replay reuses the fit object); density+gradient-only binds
 # call both.
 _rk_spline_fail(msg) = throw(ContractValidationError("[spline] " * msg))
+
+# Canonical basis column signs (user decision 1vts6mb). LAPACK `eigen` /
+# `nullspace` fix each penalized column only up to sign, and which sign comes
+# back depends on the BLAS build and CPU (a CI runner flipped column 4 of the
+# accel_splines TPS bases). Each column is flipped so its first significant
+# entry (|v| > 1e-8 max|col|, robust to rounding) is positive — a pure
+# reparametrization under the column's symmetric N(0, 1) raw prior, so every
+# machine gets the same coordinates. Returns a fresh, exclusively owned matrix.
+function _rk_canonical_column_signs(M::AbstractMatrix{<:Real})
+    out = Matrix{Float64}(M)
+    for j in axes(out, 2)
+        col = view(out, :, j)
+        peak = maximum(abs, col)
+        peak > 0 || continue
+        i = findfirst(v -> abs(v) > 1e-8 * peak, col)
+        col[i] < 0 && (col .= .-col)
+    end
+    out
+end
 
 function _rk_tps_kernel(x::AbstractVector{<:Real}, centers::AbstractVector{<:Real})
     E = Matrix{Float64}(undef, length(x), length(centers))
@@ -63,7 +83,7 @@ function _rk_fit_spline(x::AbstractVector{<:Real}; k::Int=10)
         "`s(x)` produced a non-positive range-space penalty")
     penalty_values = max.(eig_S.values, tol)
     penalty_whitener = eig_S.vectors * Diagonal(inv.(sqrt.(penalty_values)))
-    range_projection = U * Z * penalty_whitener
+    range_projection = _rk_canonical_column_signs(U * Z * penalty_whitener)
 
     (; shift, centers, range_projection, k)
 end
@@ -188,8 +208,8 @@ function _rk_fit_cr_spline(x::AbstractVector{<:Real}; k::Int=5)
         "`t2` cubic-regression-spline penalty is not positive semidefinite")
     minimum(eig_penalty.values[keep]) > tol || _rk_spline_fail(
         "`t2` could not isolate the two-dimensional marginal null space")
-    range_projection = eig_penalty.vectors[:, keep] *
-                       Diagonal(inv.(sqrt.(eig_penalty.values[keep])))
+    range_projection = _rk_canonical_column_signs(eig_penalty.vectors[:, keep] *
+                       Diagonal(inv.(sqrt.(eig_penalty.values[keep]))))
 
     null_const_scale = inv(sqrt(length(xs)))
     slope_norm = norm(normalized)
@@ -310,16 +330,14 @@ function design_recipe(shape::DesignShape, n_rows::Int;
     parts = Any[]
     for b in shape.blocks
         if b.kind === InterceptTerm
-            push!(parts, _signed_part(:(ones($n_rows)), b))
+            push!(parts, :(ones($n_rows)))
         elseif b.kind === ContinuousTerm
-            push!(parts, _signed_part(
-                b.column in plates ? :(Float64.($(b.column))) : b.column, b))
+            push!(parts, b.column in plates ? :(Float64.($(b.column))) : b.column)
         elseif b.kind === FactorTerm
-            push!(parts, _signed_part(_contrast_expr(b), b))
+            push!(parts, _contrast_expr(b))
         elseif b.kind === MatrixTerm
             for e in b.elements
-                push!(parts,
-                    _signed_part(e === nothing ? :(ones($n_rows)) : e, b))
+                push!(parts, e === nothing ? :(ones($n_rows)) : e)
             end
         end
     end
@@ -329,20 +347,18 @@ function design_recipe(shape::DesignShape, n_rows::Int;
     return :($name = Float64.($matrix))
 end
 
-# A block's design part under its use-site sign: a negated coefficient
-# (`a .- b .* x`) keeps its prior as written and reads the negated column.
-_signed_part(part, b::DesignBlock) = b.sign == 1 ? part : :(.-($part))
-
 """
-    offset_recipe(shape) -> Union{Nothing,Expr}
+    offset_recipe(shape; scalars, n_rows) -> Union{Nothing,Expr}
 
 `_ppl_offset_<pred> = col1 + col2 + …` over offset-term columns, or
-`nothing` when the predictor has no offset terms.
+`nothing` when the predictor has no offset terms. Scalar assignments in
+`scalars` broadcast over `n_rows`, retaining their model-level evaluation.
 """
-function offset_recipe(shape::DesignShape)
-    cols = Symbol[]
+function offset_recipe(shape::DesignShape; scalars = Set{Symbol}(), n_rows = 0)
+    cols = Any[]
     for b in shape.blocks
-        b.kind === OffsetTerm && push!(cols, b.column)
+        b.kind === OffsetTerm || continue
+        push!(cols, b.column in scalars ? :(ones($n_rows) .* $(b.column)) : b.column)
     end
     isempty(cols) && return nothing
     total = foldl((a, c) -> :($a + $c), cols)
@@ -378,7 +394,10 @@ function preprocessing_recipes(plan::StructuralPlan)
             recipe = design_recipe(shape, rows; plates)
             recipe !== nothing && push!(stmts, recipe)
         end
-        off = offset_recipe(shape)
+        scalars = Set{Symbol}(only(t.columns) for t in pred.terms
+            if _is_scalar_offset(t, plan))
+        rows = isempty(scalars) ? 0 : _located_rows(plan, pred)
+        off = offset_recipe(shape; scalars, n_rows = rows)
         off !== nothing && push!(stmts, off)
     end
     # GLM-object response matrices: one `X = Float64.(hcat(...))` recipe

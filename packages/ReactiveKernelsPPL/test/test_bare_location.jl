@@ -17,8 +17,8 @@ using Test
 
 # Lower + bind + build + query a bare-location program; return
 # `(bound, built, kern, layout)`.
-function _bare_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols))
+function _bare_query(prog::Expr, cols::AbstractDict{Symbol})
+    plan = lower_rkppl(prog, cols)
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -67,17 +67,20 @@ _bare_posterior(kern, lay, q::NamedTuple) =
     @test Set(p.name for p in prior.parameters) == Set([:theta, :thetaprior])
 
     # Literals stay fail-closed (intercept-only predictor message).
-    @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
+    # capability: literal probability Binomial.(n, 0.3) (fixed-p likelihood) (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(Meta.parse("""begin
         k .~ Binomial.(n, 0.3)
-    end"""), (:k, :n))
+    end"""), (:k, :n)); true)
 
     # Other families keep the strict broadcast-link message.
+    # refused: undeclared phi (P6, 05oe96l); NB2 mean is also a real-support parameter with no link
     @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
         mu ~ Normal(0.0, 5.0)
         y .~ NegativeBinomial2.(mu, phi)
     end"""), (:y,))
 
     # Unknown symbols fail as locations, not as predictors.
+    # refused: undeclared name nosuch (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
         theta ~ Beta(1.0, 1.0)
         k .~ Binomial.(n, nosuch)
@@ -86,29 +89,41 @@ _bare_posterior(kern, lay, q::NamedTuple) =
     # Bare predictors keep their link: the bare slot admits sampled
     # parameters only, so a deterministic definition still needs its
     # link wrapper (mirrors the slice-1 / error-paths pins).
-    @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
+    # capability: identity-link Binomial probability from an affine predictor (identity-scale precedent) (todo `05fuzch`)
+    @test_broken (lower_rkppl(Meta.parse("""begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         k .~ Binomial.(n, mu)
-    end"""), (:k, :n, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
+    end"""), (:k, :n, :x)); true)
+    # capability: identity-link Bernoulli probability from an affine predictor (todo `05fuzch`)
+    @test_broken (lower_rkppl(Meta.parse("""begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Bernoulli.(mu)
-    end"""), (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
+    end"""), (:y, :x)); true)
+    # capability: identity-link Poisson rate from an affine predictor (todo `05fuzch`)
+    @test_broken (lower_rkppl(Meta.parse("""begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Poisson.(mu)
-    end"""), (:y, :x))
+    end"""), (:y, :x)); true)
 
     # Evidence on a bare location fails closed (cdf arms are link-space).
-    @test_throws ContractValidationError bind_data(
+    # capability: censoring evidence on a bare sampled-parameter location (todo `0ze68k8`)
+    @test_broken (bind_data(
         lower_rkppl(Meta.parse("""begin
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             sigma ~ Exponential(1.0)
             theta ~ Beta(1.0, 1.0)
             k .~ censored.(Binomial.(n, theta), lo, hi)
         end"""), (:k, :n, :x, :lo, :hi)),
         Dict{Symbol,AbstractVector}(:k => [3], :n => [10], :x => [0.5],
-            :lo => [0], :hi => [10]))
+            :lo => [0], :hi => [10])); true)
 end
 
 @testset "bare rate values" begin
@@ -205,9 +220,9 @@ end
 # native vs compiled), plus the traced program size.
 # `ad_kw` reaches `compile_ad_value_and_gradient` (e.g. the §7n
 # `optimize = :only_enzyme` pin).
-function _bare_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector};
+function _bare_reactant(prog::Expr, cols::AbstractDict{Symbol};
         ad_kw...)
-    plan = lower_rkppl(prog, keys(cols))
+    plan = lower_rkppl(prog, cols)
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)

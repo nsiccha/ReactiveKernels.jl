@@ -25,6 +25,7 @@ const _CB_G = [isodd(i) ? 1 : 2 for i in 1:_CB_N]
 
 const _CB_ADMITTED = (
     ("horseshoe x mixture", quote
+        a1 ~ Normal(0, 1)
         b1 ~ Horseshoe()
         b2 ~ Horseshoe(local_scale = 0.5, global_scale = 0.25)
         mu1 = a1 .+ b1 .* x1 .+ b2 .* x2
@@ -34,6 +35,7 @@ const _CB_ADMITTED = (
             [0.3, 0.7])
     end, (; y = _CB_Y, x1 = _CB_X, x2 = _CB_X2), 9),
     ("hsgp x mixture", quote
+        a1 ~ Normal(0, 1)
         hsgp_basis(:h, x; k = 6)
         mu1 = a1 .+ hsgp(:h)
         mu2 ~ Normal(0.0, 5.0)
@@ -42,6 +44,7 @@ const _CB_ADMITTED = (
             [0.3, 0.7])
     end, (; y = _CB_Y, x = _CB_X), 11),
     ("hsgp x me", quote
+        a ~ Normal(0, 1)
         hsgp_basis(:h, x; k = 6)
         b ~ Normal(0, 2)
         sigma ~ Exponential(1)
@@ -53,6 +56,8 @@ const _CB_ADMITTED = (
         z_obs .~ Normal.(z_true, 0.5)
     end, (; y = _CB_Y, x = _CB_X, z_obs = _CB_X2), 23),
     ("grouped hsgp x student_t", quote
+        a ~ Normal(0, 1)
+        c0 ~ Normal(0, 1)
         hsgp_basis(:h, x; k = 6, by = grp, length_scale = 1 + (1 | grp),
             sd = (1 | grp))
         r ~ varying_effect(grp, [1])
@@ -70,16 +75,13 @@ const _CB_ADMITTED = (
 end
 
 @testset "composition matrix: fail-closed boundaries" begin
-    msg(prog, data) = try
-        lower_rkppl(prog, keys(data))
-        ""
-    catch e
-        e isa SurfaceLoweringError || rethrow()
-        sprint(showerror, e)
-    end
-    # me x dar: `dar()` lowers only as a direct predictor summand; a
-    # measurement-error latent makes the mean a derived column.
-    m = msg(quote
+    # capability: compose measurement-error, DAR, horseshoe and smooth
+    # values (P8 1cmodra; todo `1nb43fj`).
+    gap(prog, data) = @test_broken (lower_rkppl(prog, keys(data)); true)
+    # Admitted: ordinary coefficient reads now compose a measurement-error
+    # latent with a direct DAR summand.
+    admit(prog, data) = @test (lower_rkppl(prog, keys(data)); true)
+    admit(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
         beta ~ truncated(Normal(0.5, 0.2), 0, 1)
@@ -92,15 +94,14 @@ end
         y .~ Normal.(mu, sigma)
         x_obs .~ Normal.(x_true, 0.5)
     end, (; y = _CB_Y, x_obs = _CB_X))
-    @test occursin("dar()", m) && occursin("direct predictor summand", m)
     # horseshoe x hsgp: the horseshoe slice covers intercept/continuous
     # coefficients only.
-    m = msg(quote
+    gap(quote
+        a ~ Normal(0, 1)
         b1 ~ Horseshoe()
         hsgp_basis(:h, x; k = 6)
         eta = a .+ b1 .* x2 .+ hsgp(:h)
         cnt .~ Poisson.(exp.(eta))
     end, (; cnt = [round(Int, 2 + sin(i)) for i in 1:_CB_N], x = _CB_X,
         x2 = _CB_X2))
-    @test occursin("horseshoe", m) && occursin("HSGPSummandTerm", m)
 end

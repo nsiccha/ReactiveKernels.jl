@@ -113,3 +113,69 @@ end
                                             active = :weights), plan, units, weights)
     @test g ≈ [2 * sum(c[t] * get(units, t - s, 0.0) for t in 1:plan.nobs) for s in plan.shifts]
 end
+
+module DenseColumnDoseOuterAD
+using ReactiveKernels
+@kernel cell(observations::UnitRange{Int}, shifts::Vector{Int},
+             units::AbstractVector{Float64}, weights::Vector{Float64}) = begin
+    response::Vector{Float64} = plate(observations, Ref(shifts), Ref(units), Ref(weights)) do t, s, u, w
+        sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(w); init=0.0)
+    end
+    loss::Float64 = sum(abs2, response)
+end
+end
+
+@testset "Dense column dose-outer source under plain reverse Enzyme" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    U = [sin(0.01i) + l for i in 1:128, l in 1:2]
+    units = view(U, :, 2)
+    shifts, weights = [-7, 0, 300], [0.7, -0.3, 1.1]
+    original_U, original_shifts, original_weights = copy(U), copy(shifts), copy(weights)
+    kernel = prepare(DenseColumnDoseOuterAD.cell)
+    for n in (0, 1, 32, 257, 4096)
+        args = (1:n, shifts, units, weights)
+        reference_args = (1:n, shifts, copy(units), weights)
+        @test count(op -> op isa ReactiveKernels._KernelSourceOp &&
+                          op.f isa ReactiveKernels._KernelReduction, kernel.ops) == 1
+        @test kernel(args...) == kernel(reference_args...)
+        ad = prepare_ad(kernel, backend, args...; active=:weights)
+        reference = prepare_ad(kernel, backend, reference_args...; active=:weights)
+        value, gradient = ad_value_and_gradient(ad, args...)
+        @test gradient ≈ ad_gradient(reference, reference_args...) rtol=1e-12
+        @test value ≈ kernel(args...)
+        response = [sum(w * get(units, t - s, 0.0) for (s, w) in zip(shifts, weights))
+                    for t in 1:n]
+        analytic = [2 * sum((response[t] * get(units, t - s, 0.0) for t in 1:n); init=0.0)
+                    for s in shifts]
+        @test gradient ≈ analytic rtol=1e-12
+        for bound in ((; units), (; observations=args[1], shifts, units),
+                      (; observations=args[1], shifts))
+            residual = prepare(DenseColumnDoseOuterAD.cell; bound)
+            values = (; observations=args[1], shifts, units, weights)
+            residual_args = Tuple(getproperty(values, port.name) for port in inputs(residual))
+            bound_ad = prepare_ad(residual, backend, residual_args...; active=:weights)
+            bound_value, bound_gradient = ad_value_and_gradient(bound_ad, residual_args...)
+            @test bound_value ≈ value
+            @test bound_gradient ≈ gradient rtol=1e-12
+        end
+        # Consumer package images wrap the native body for their first use.
+        # After loading, that wrapper must also enter the body without packing
+        # a constant view beside the active weights.
+        warmed = ReactiveKernels._PrecompileWarmFunction(kernel.f.native)
+        warm_call = ReactiveKernels._ADNativeKernelCall{
+            4,typeof(warmed),typeof(kernel.ops)}(warmed, kernel.ops)
+        @test DifferentiationInterface.gradient(warm_call, backend, weights,
+            Constant(args[1]), Constant(shifts), Constant(units)) ≈ gradient rtol=1e-12
+        # A prepared gradient must read each call's constant view, including
+        # its current parent contents, without capturing or mutating them.
+        replacement_U = U .+ 0.4
+        replacement_args = (1:n, shifts, view(replacement_U, :, 2), weights)
+        replacement_reference = (1:n, shifts, copy(replacement_args[3]), weights)
+        @test ad_gradient(ad, replacement_args...) ≈
+              ad_gradient(reference, replacement_reference...) rtol=1e-12
+        @test replacement_U == original_U .+ 0.4
+    end
+    @test U == original_U
+    @test shifts == original_shifts
+    @test weights == original_weights
+end

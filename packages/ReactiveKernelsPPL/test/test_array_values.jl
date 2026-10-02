@@ -26,6 +26,75 @@ _av_point(n) = [0.37 * sin(1.3 * i) - 0.2 for i in 1:n]
 
 _av_node(built, bound, node, u) = _query(built.spec, bound, node, u)
 
+@testset "array values: positional scalar offsets" begin
+    for kind in (:vector, :matrix), named in (false, true), sign in (1, -1)
+        declaration, read = kind === :vector ?
+            (:(z[1:3] .~ Normal.(0, 1)), :(z[2])) :
+            (:(L ~ LKJCholesky(2, 1.0)), :(L[2, 1]))
+        definition = named ? :(r = $read) : nothing
+        value = named ? :r : read
+        location = sign > 0 ? :(a .+ $value .+ x) : :(a .- $value .+ x)
+        ast = quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1)
+            $declaration
+            $definition
+            mu = $location
+            y .~ Normal.(mu, sigma)
+        end
+        filter!(!isnothing, ast.args)
+        plan = lower_rkppl(ast, (:y, :x))
+        @test isempty(plan.derived)
+        @test length(plan.assignments) == 1
+        @test only(plan.predictors).terms[2].kind === OffsetTerm
+        for n in (3, 8)
+            y, x = _av_y()[1:n], _av_x()[1:n]
+            bound = bind_data(plan, Dict(:y => y, :x => x))
+            built = build_kernel(bound)
+            @test built.layout.total == (kind === :vector ? 5 : 3)
+            u = _av_point(built.layout.total)
+            nt = constrain(built.layout, u)
+            offset = kind === :vector ? nt.z[2] : nt.L[2, 1]
+            array_prior = kind === :vector ? sum(logpdf.(Normal(), nt.z)) :
+                logpdf(LKJCholesky(2, 1.0), Cholesky(LowerTriangular(nt.L)))
+            prior = array_prior + logpdf(Normal(0, 5), nt.a) +
+                logpdf(Exponential(1), nt.sigma)
+            likelihood = sum(logpdf.(Normal.(nt.a .+ sign * offset .+ x,
+                nt.sigma), y))
+            @test _av_node(built, bound, :prior, u) ≈ prior
+            @test _av_node(built, bound, :likelihood, u) ≈ likelihood
+            @test _av_node(built, bound, :posterior, u) ≈
+                prior + likelihood + logjac(built.layout, u)
+            _check_gradient(built.spec, bound, u)
+        end
+    end
+end
+
+@testset "array values: composed positional scalar offsets" begin
+    # Multiple reads, an array-valued definition and no coefficient.
+    ast = quote
+        z[1:3] .~ Normal.(0, 1)
+        M = (2 .* z)'
+        mu = x .+ M[1, 2] .- z[1] .+ z[2]
+        nu = x2
+        y .~ Normal.(mu, 0.7)
+        y2 .~ Normal.(nu, 0.7)
+    end
+    y, x = _av_y(), _av_x()
+    y2, x2 = _av_y(), _av_x2()
+    bound = bind_data(lower_rkppl(ast, (:y, :x, :y2, :x2)),
+        Dict(:y => y, :x => x, :y2 => y2, :x2 => x2))
+    built = build_kernel(bound)
+    @test built.layout.total == 3
+    u = _av_point(3)
+    z = constrain(built.layout, u).z
+    want = sum(logpdf.(Normal(), z)) +
+        sum(logpdf.(Normal.(x .+ 3z[2] .- z[1], 0.7), y)) +
+        sum(logpdf.(Normal.(x2, 0.7), y2))
+    @test _av_node(built, bound, :posterior, u) ≈ want
+    _check_gradient(built.spec, bound, u)
+end
+
 @testset "array values: LKJCholesky factor read as a matrix" begin
     m = @rkppl begin
         L ~ LKJCholesky(3, 2.0)
@@ -47,7 +116,7 @@ _av_node(built, bound, node, u) = _query(built.spec, bound, node, u)
     @test istril(L)
     @test all(i -> norm(L[i, :]) ≈ 1, 1:3)
     @test unconstrain(built.layout, nt) ≈ u
-    a = nt.a  # the intercept coefficient of `mu`
+    a = nt.a  # the declared scalar intercept
     prior = logpdf(LKJCholesky(3, 2.0), Cholesky(LowerTriangular(L))) +
         logpdf(Normal(0, 1), a) + logpdf(Exponential(1), nt.sigma)
     @test _av_node(built, bound, :prior, u) ≈ prior
@@ -260,10 +329,10 @@ end
         for j in 1:3)
     prior = logpdf(LKJCholesky(2, 2.0), Cholesky(LowerTriangular(nt.L))) +
         sum(logpdf.(truncated(Normal(0, 1), 0, Inf), nt.sd)) + rowprior +
-        logpdf(Normal(0, 1), only(nt.mu)) + logpdf(Exponential(1), nt.sigma)
+        logpdf(Normal(0, 1), nt.a) + logpdf(Exponential(1), nt.sigma)
     @test _av_node(built, bound, :prior, u) ≈ prior
     codes = [findfirst(==(v), ["a", "b", "c"]) for v in g]
-    lik = sum(logpdf.(Normal.(only(nt.mu) .+ nt.B[codes, 1] .+
+    lik = sum(logpdf.(Normal.(nt.a .+ nt.B[codes, 1] .+
         nt.B[codes, 2] .* x, nt.sigma), y))
     @test _av_node(built, bound, :likelihood, u) ≈ lik
     @test _av_node(built, bound, :log_jacobian, u) ≈ logjac(built.layout, u)
@@ -361,7 +430,7 @@ end
     # `B[a, b] .~ Fam.(...)`.
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[levels(g),
         1:2]) .~ Normal(0, 1))), (:y, :x, :g))
-    # refused: a one-axis array has no rows to iterate (principle 3).
+    # refused: eachrow of a vector produces length-1 rows, which disagree with the length-2 multivariate prior (P3 dimension contract)
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[1:2]) .~
         MvNormalCholesky(zeros(2), F))), (:y, :x, :g))
     # refused: the mean of a multivariate normal is a vector, as in
@@ -370,12 +439,15 @@ end
         1:2]) .~ MvNormalCholesky(0, F))), (:y, :x, :g))
     # A mean that is not a K-vector: here a column the predictor reads
     # per observation (8 values for rows of length 2).
+    # refused: row, mean and covariance-factor dimensions must agree (distribution domain, P3)
     @test_throws ContractValidationError bindm(prog(:(eachrow(B[levels(g),
         1:2]) .~ MvNormalCholesky(x, F))), (; y, x, g))
     # A literal mean whose length differs from the rows.
+    # refused: row, mean and covariance-factor dimensions must agree (distribution domain, P3)
     @test_throws ContractValidationError bindm(prog(:(eachrow(B[levels(g),
         1:2]) .~ MvNormalCholesky([0.0, 0.0, 0.0], F))), (; y, x, g))
     # A declared factor whose size differs from the rows.
+    # refused: row, mean and covariance-factor dimensions must agree (distribution domain, P3)
     @test_throws ContractValidationError bindm(:(begin
         L ~ LKJCholesky(3, 2.0)
         eachrow(B[levels(g), 1:2]) .~ MvNormalCholesky(zeros(2), L)
@@ -409,19 +481,22 @@ end
         Dict{Symbol,ColumnData}(pairs(data)))
     y, x = _av_y(), _av_x()
     # `~` on a sized declaration.
+    # refused: scalar ~ on a sized array declaration; ~ is scalar, .~ broadcasts (P3)
     @test_throws SurfaceLoweringError lower_rkppl(:(begin
         z[1:3] ~ Normal(0, 1)
         y .~ Normal.(z[1], 1.0)
     end), (:y,))
     # A bare array combined with per-observation data.
-    @test_throws SurfaceLoweringError lower_rkppl(:(begin
+    # capability: array parameter broadcast with observation data z .+ x (valid Julia when lengths agree; refused shape-blind at lowering) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(:(begin
         z[1:3] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
         w = z .+ x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end), (:y, :x))
+    end), (:y, :x)); true)
     # Undotted elementwise math over an array is a Julia error.
+    # refused: undotted scalar + vector is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(:(begin
         z[1:3] .~ Normal.(0, 1)
         s ~ Exponential(1)
@@ -432,22 +507,25 @@ end
         y .~ Normal.(mu, 1.0)
     end), (:y, :x))
     # LKJCholesky: non-literal eta, upper factor.
-    @test_throws SurfaceLoweringError lower_rkppl(:(begin
+    # capability: sampled LKJCholesky eta (P8 1cmodra admits sampled prior args) (todo `1308iv0`)
+    @test_broken (lower_rkppl(:(begin
         e ~ Exponential(1)
         L ~ LKJCholesky(2, e)
         a ~ Normal(0, 1)
         w = L[2, 1] .* x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end), (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(:(begin
+    end), (:y, :x)); true)
+    # capability: LKJCholesky upper factor (uplo = 'U') (todo `1308iv0`)
+    @test_broken (lower_rkppl(:(begin
         L ~ LKJCholesky(2, 2.0, 'U')
         a ~ Normal(0, 1)
         w = L[2, 1] .* x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end), (:y, :x))
+    end), (:y, :x)); true)
     # A data matrix whose columns do not match the array.
+    # refused: B * w column/length mismatch is a Julia DimensionMismatch (wrong data)
     @test_throws ContractValidationError bindm(:(begin
         w[1:2] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
@@ -455,6 +533,7 @@ end
         y .~ Normal.(mu, 1.0)
     end), (; y, B = _av_B()))
     # A vector where `B * w` needs a matrix.
+    # refused: vector * vector for B * w is a Julia MethodError (wrong data, P3)
     @test_throws ContractValidationError bindm(:(begin
         w[1:3] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
@@ -462,6 +541,7 @@ end
         y .~ Normal.(mu, 1.0)
     end), (; y, B = x))
     # Out-of-bounds literal position.
+    # refused: out-of-bounds literal index z[4] (BoundsError)
     @test_throws ContractValidationError bindm(:(begin
         z[1:3] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
@@ -470,6 +550,7 @@ end
         y .~ Normal.(mu, 1.0)
     end), (; y, x))
     # A gather by values not on the levels axis.
+    # refused: gather by values not on the levels axis (invalid index)
     @test_throws ContractValidationError bindm(:(begin
         z[levels(g)] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
@@ -478,6 +559,7 @@ end
         y .~ Normal.(mu, 1.0)
     end), (; y, x, g = _av_g(), h = ["a", "b", "z", "a", "b", "c", "a", "b"]))
     # An integer axis gathered by non-integers.
+    # refused: integer axis gathered by non-integers (non-integer index)
     @test_throws ContractValidationError bindm(:(begin
         z[1:3] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
@@ -485,6 +567,7 @@ end
         y .~ Normal.(mu, 1.0)
     end), (; y, g = _av_g()))
     # Per-element literal arguments of the wrong length.
+    # refused: per-element prior args of the wrong length (DimensionMismatch)
     @test_throws ContractValidationError bindm(:(begin
         z[1:3] .~ Normal.(0, [1.0, 2.0])
         a ~ Normal(0, 1)

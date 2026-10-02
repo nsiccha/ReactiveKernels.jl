@@ -199,6 +199,7 @@ end
     bound = bind_data(lower_rkppl(prog, data), cols; dims)
     names = coordinate_names(build_kernel(bound).layout)
     @test length(names) == 5
+    @test :mu_alpha in names
     u = map(names) do n
         s = String(n)
         startswith(s, "tau_") && return log(1.2)

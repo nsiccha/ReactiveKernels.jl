@@ -72,6 +72,7 @@ end
     @test t.options.hsgp_id === :h_x
     # Defaults: k=20, c=1.5, iso=true (SB `_brm_axis_option` defaults).
     dflt = lower_rkppl(quote
+            a ~ Normal(0, 1)
             hsgp_basis(:h_d, x)
             mu = a .+ hsgp(:h_d)
             y .~ Normal.(mu, 1.0)
@@ -92,26 +93,31 @@ end
 
 @testset "hsgp surface fail-closed" begin
     # Declaration shape.
+    # refused: malformed hsgp_basis call, basis id missing (arity; Julia MethodError analogue, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(x)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: degenerate constant axis (literal 1.0 has no spread, L = 0)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, 1.0)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: undeclared name `q` as axis (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, q)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: unidentified, two axes on one column (x, x)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x, x; k = (2, 2))
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: single assignment, basis :h_x declared twice
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x)
             hsgp_basis(:h_x, x)
@@ -119,31 +125,37 @@ end
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
     # k/c/iso literals.
+    # refused: invalid basis count k = 0
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; k = 0)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: non-integer basis count k = 2.5
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; k = 2.5)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: k tuple length differs from axis count (malformed)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x, z; k = (2, 3, 4))
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x, :z))
+    # refused: expansion factor c must exceed 1 (c = 1 puts the boundary on the data)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; c = 1.0)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: non-finite expansion factor c = Inf
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; c = Inf)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: non-Bool `iso = 1` (Julia non-boolean-context TypeError, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; iso = 1)
             mu = a .+ hsgp(:h_x)
@@ -151,57 +163,71 @@ end
         end, (:y, :x))
     # `by=` names a bound grouping column (grouped bases themselves:
     # test_smooth_sb.jl).
+    # refused: undeclared name `g` in by= (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; by = g)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
     # Use-site discipline.
+    # refused: undeclared basis id :h_nope (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             mu = a .+ hsgp(:h_nope)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
         end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: hsgp summand value reuse: same basis twice in one predictor (values compose, P3/P8) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             mu = a .+ hsgp(:h_x) .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
-        end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :x)); true)
+    # capability: negated hsgp summand (`a .- hsgp(:h)`) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             mu = a .- hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
-        end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :x)); true)
+    # capability: literal-scaled hsgp summand (`2.0 .* hsgp(:h)`) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             mu = a .+ 2.0 .* hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
-        end, (:y, :x))
+        end, (:y, :x)); true)
     # Never inside definitions; never redefined or sampled.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: hsgp value bound in a definition (`h = hsgp(:h)`; values compose, P3/P8) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             h = hsgp(:h_x)
             mu = a .+ h
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
-        end, (:y, :x))
+        end, (:y, :x)); true)
+    # refused: reserved-name collision `hsgp` (then calls a Float64)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp = 1.0
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
         end, (:y, :x))
+    # refused: reserved-name collision `hsgp_basis`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis = 1.0
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
     # Claims: user definitions cannot collide with sampled names.
+    # refused: single assignment, user definition collides with basis-claimed `rho_h_x`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             rho_h_x = 1.0
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
         end, (:y, :x))
+    # refused: single assignment, `~` collides with basis-claimed `beta_raw_h_x`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
@@ -216,25 +242,32 @@ end
     # Duplicate ids / labels.
     dup = HSGPBasis(:h_x, [:x], [2], [1.5], true,
         Tuple{Float64,Float64}[], :hsgp_h_x)
+    # refused: duplicate basis id/label (IR contract)
     @test_throws ContractValidationError validate_structure(
         _hwith(good; bases = [hb, dup]))
     # K/c shape and values.
+    # refused: K length differs from axes (IR contract)
     @test_throws ContractValidationError validate_structure(_hwith(good;
         bases = [HSGPBasis(:h_x, [:x], [2, 3], [1.5], true,
             Tuple{Float64,Float64}[], :hsgp_h_x)]))
+    # refused: K = 0 (IR contract)
     @test_throws ContractValidationError validate_structure(_hwith(good;
         bases = [HSGPBasis(:h_x, [:x], [0], [1.5], true,
             Tuple{Float64,Float64}[], :hsgp_h_x)]))
+    # refused: c <= 1 (IR contract)
     @test_throws ContractValidationError validate_structure(_hwith(good;
         bases = [HSGPBasis(:h_x, [:x], [2], [1.0], true,
             Tuple{Float64,Float64}[], :hsgp_h_x)]))
+    # refused: empty axes (IR contract)
     @test_throws ContractValidationError validate_structure(_hwith(good;
         bases = [HSGPBasis(:h_x, Symbol[], Int[], Float64[], true,
             Tuple{Float64,Float64}[], :hsgp_h_x)]))
     # Fits: wrong count / non-positive L.
+    # refused: fits count differs from axes (IR contract)
     @test_throws ContractValidationError validate_structure(_hwith(good;
         bases = [HSGPBasis(:h_x, [:x], [2], [1.5], true,
             [(0.0, 1.0), (0.0, 1.0)], :hsgp_h_x)]))
+    # refused: non-positive fit L (IR contract)
     @test_throws ContractValidationError validate_structure(_hwith(good;
         bases = [HSGPBasis(:h_x, [:x], [2], [1.5], true,
             [(0.0, 0.0)], :hsgp_h_x)]))
@@ -243,16 +276,19 @@ end
         PredictorSpec(:mu, IdentityLink,
             TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
                 :Intercept, :mu_intercept)], :mu)])
+    # refused: dangling basis with no summand (IR contract)
     @test_throws ContractValidationError validate_structure(nopred)
     twopred = _hwith(good; predictors = vcat(good.predictors,
         [PredictorSpec(:sg, IdentityLink, TermSpec[_hsummand(:sg, :h_x)],
             :sg)]))
+    # refused: one basis feeding two predictors (IR contract; mirrors capability C at :166)
     @test_throws ContractValidationError validate_structure(twopred)
     baduse = _hwith(good; predictors = PredictorSpec[
         PredictorSpec(:mu, IdentityLink,
             TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
                 :Intercept, :mu_intercept), _hsummand(:mu, :h_nope)],
             :mu)])
+    # refused: summand names an unknown basis (IR contract)
     @test_throws ContractValidationError validate_structure(baduse)
     # Summand shape: options / columns / addressee.
     for (opts, cols, addr) in (((foo = 1,), Symbol[], :hsgp_mu_h_x),
@@ -263,12 +299,14 @@ end
             PredictorSpec(:mu, IdentityLink,
                 TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
                     :Intercept, :mu_intercept), t], :mu)])
+        # refused: malformed HSGP summand options/columns/addressee (IR contract)
         @test_throws ContractValidationError validate_structure(badpred)
     end
     # Name tables: a hand-built parameter under an hsgp name fails.
     clash = _hwith(good)
     push!(clash.parameters, SampledParameter(:rho_h_x, :normal,
         (arg1 = 0, arg2 = 1), nothing, :rho_h_x))
+    # refused: hand-built parameter under an hsgp-claimed name (IR contract)
     @test_throws ContractValidationError validate_structure(clash)
 end
 
@@ -295,12 +333,15 @@ end
     # Bind fail-closed: degenerate / non-numeric / unbound axes.
     constcols = Dict{Symbol,AbstractVector}(:y => cols[:y],
         :x => fill(2.0, 4))
+    # refused: degenerate constant axis column at bind (L = 0)
     @test_throws ContractValidationError bind_data(_hvalid_plan(), constcols)
     strcols = Dict{Symbol,AbstractVector}(:y => cols[:y],
         :x => ["a", "b", "c", "d"])
+    # refused: wrong eltype, non-numeric axis column
     @test_throws ContractValidationError bind_data(_hvalid_plan(), strcols)
     nancols = Dict{Symbol,AbstractVector}(:y => cols[:y],
         :x => [0.5, NaN, 1.5, 0.0])
+    # refused: non-finite (NaN) axis data
     @test_throws ContractValidationError bind_data(_hvalid_plan(), nancols)
 end
 
@@ -310,7 +351,7 @@ end
     # SB `_sb_hsgp` declaration order per basis (rho, sigma, beta),
     # appended after the slice-1 entries so peer offsets never move.
     kinds = [(e.kind, e.name, e.size, e.transform) for e in layout.entries]
-    @test kinds == [(:coefficient, :mu_coef, 1, :identity),
+    @test kinds == [(:sampled, :a, 1, :identity),
         (:sampled, :sigma, 1, :exp),
         (:sampled, :rho_h_x, 1, :floored),
         (:sampled, :sigma_h_x, 1, :exp),
@@ -335,7 +376,7 @@ end
     abound = bind_data(_hvalid_plan(; aniso = true), _hsgp_cols())
     alayout = assign_layout(abound)
     akinds = [(e.kind, e.name, e.size, e.transform) for e in alayout.entries]
-    @test akinds == [(:coefficient, :mu_coef, 1, :identity),
+    @test akinds == [(:sampled, :a, 1, :identity),
         (:sampled, :sigma, 1, :exp),
         (:sampled, :rho_h_xz_1, 1, :floored),
         (:sampled, :rho_h_xz_2, 1, :floored),
@@ -368,7 +409,7 @@ end
     twolayout = assign_layout(bind_data(two, _hsgp_cols()))
     twokinds =
         [(e.kind, e.name, e.size, e.transform) for e in twolayout.entries]
-    @test twokinds == [(:coefficient, :mu_coef, 1, :identity),
+    @test twokinds == [(:sampled, :a, 1, :identity),
         (:sampled, :rho_h_a, 1, :floored),
         (:sampled, :sigma_h_a, 1, :exp),
         (:hsgp, :beta_raw_h_a, 2, :identity),
@@ -407,9 +448,13 @@ _hsgp_summand_expr_bad(bound) =
     bad = _hwith(bound; bases = [emptyfits])
     # The public path fails at validation; the layout/emitter guards are
     # loud defense in depth behind it.
+    # refused: bound basis with empty fits (IR contract)
     @test_throws ContractValidationError build_kernel(bad)
+    # refused: bound basis with empty fits, layout guard (IR contract)
     @test_throws ContractValidationError assign_layout(bad)
+    # refused: bound basis with empty fits, emitter guard (IR contract)
     @test_throws ContractValidationError _hsgp_basis_statements_bad(bad)
+    # refused: summand for unknown basis id, emitter guard (IR contract)
     @test_throws ContractValidationError _hsgp_summand_expr_bad(bound)
 end
 
@@ -544,6 +589,7 @@ end
     @test t.options.hsgp_id === :h_p
     # Defaults: k=20 like exp-quad; explicit cov=:exp_quad keeps NaN period.
     dflt = lower_rkppl(quote
+            a ~ Normal(0, 1)
             hsgp_basis(:h_d, x; cov = :periodic, period = 1.0)
             mu = a .+ hsgp(:h_d)
             y .~ Normal.(mu, 1.0)
@@ -552,6 +598,7 @@ end
     @test dhb.K == [20] && dhb.cov === :periodic && dhb.period == 1.0
     @test ReactiveKernelsPPL._hsgp_n_basis(dhb) == 40
     eq = lower_rkppl(quote
+            a ~ Normal(0, 1)
             hsgp_basis(:h_e, x; k = 3, cov = :exp_quad)
             mu = a .+ hsgp(:h_e)
             y .~ Normal.(mu, 1.0)
@@ -561,6 +608,7 @@ end
     # `c` is accepted with periodic (SB validates its form, ignores its
     # value — no domain).
     cacc = lower_rkppl(quote
+            a ~ Normal(0, 1)
             hsgp_basis(:h_c, x; k = 3, c = 2.5, cov = :periodic, period = 1.0)
             mu = a .+ hsgp(:h_c)
             y .~ Normal.(mu, 1.0)
@@ -570,33 +618,40 @@ end
 
 @testset "hsgp periodic surface fail-closed" begin
     # cov spelling.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: Matern-covariance HSGP (cov = :matern; nu should be explicit, e.g. :matern32/:matern52) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             hsgp_basis(:h_p, x; k = 4, cov = :matern, period = 2.0)
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x)); true)
+    # refused: bare `periodic` is an undeclared name (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_p, x; k = 4, cov = periodic, period = 2.0)
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
     # period required iff periodic (SB `_brm_gp_period`).
+    # refused: periodic kernel without its period; no defaulted/minted period (P2; P7, 0d5a67r)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_p, x; k = 4, cov = :periodic)
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: `period=` means nothing without cov=:periodic (P2)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; k = 4, period = 2.0)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
+    # refused: `period=` means nothing for cov=:exp_quad (P2)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_x, x; k = 4, cov = :exp_quad, period = 2.0)
             mu = a .+ hsgp(:h_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
     for bad in (0.0, -1.0, Inf, NaN, "2.0")
+        # refused: invalid period literal (non-positive / non-finite / non-numeric)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 hsgp_basis(:h_p, x; k = 4, cov = :periodic, period = $bad)
                 mu = a .+ hsgp(:h_p)
@@ -604,18 +659,23 @@ end
             end, (:y, :x))
     end
     # One isotropic axis (SB "periodic hsgp requires one isotropic axis").
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: multi-axis periodic HSGP (the SB one-axis limit is not a principle, P10) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             hsgp_basis(:h_p, x, z; k = (4, 3), cov = :periodic, period = 2.0)
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+        end, (:y, :x, :z)); true)
+    # capability: anisotropic (iso=false) periodic HSGP (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
+            a ~ Normal(0, 1)
             hsgp_basis(:h_p, x; k = 4, cov = :periodic, period = 2.0,
                 iso = false)
             mu = a .+ hsgp(:h_p)
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x))
+        end, (:y, :x)); true)
     # Periodic claims the same names (collision still loud).
+    # refused: single assignment, user definition collides with basis-claimed `rho_h_p`
     @test_throws SurfaceLoweringError lower_rkppl(quote
             rho_h_p = 1.0
             mu = a .+ hsgp(:h_p)
@@ -629,24 +689,30 @@ end
     hb = only(good.hsgp_bases)
     per(args...) = HSGPBasis(args..., :periodic, 2.0)
     # cov membership / periodic shape / period / fits.
+    # refused: unknown cov :matern (IR contract; mirrors C at :577)
     @test_throws ContractValidationError validate_structure(_hwith(good;
         bases = [HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits,
             hb.label, :matern, 2.0)]))
+    # refused: periodic with two axes (IR contract; mirrors C at :611)
     @test_throws ContractValidationError validate_structure(_hwith(good;
         bases = [per(hb.id, [:x, :z], [4, 3], [1.5, 2.0], true,
             Tuple{Float64,Float64}[], hb.label)]))
+    # refused: periodic with iso=false (IR contract; mirrors C at :616)
     @test_throws ContractValidationError validate_structure(_hwith(good;
         bases = [per(hb.id, [:x], [4], [1.5], false,
             Tuple{Float64,Float64}[], hb.label)]))
     for badperiod in (NaN, 0.0, -2.0, Inf)
+        # refused: invalid period (IR contract)
         @test_throws ContractValidationError validate_structure(_hwith(good;
             bases = [HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits,
                 hb.label, :periodic, badperiod)]))
     end
+    # refused: fits on a periodic basis (IR contract)
     @test_throws ContractValidationError validate_structure(_hwith(good;
         bases = [per(hb.id, hb.axes, hb.K, hb.c, hb.iso, [(0.0, 1.0)],
             hb.label)]))
     # exp_quad with a period set is inconsistent (period iff periodic).
+    # refused: exp_quad basis carrying a period (IR contract)
     @test_throws ContractValidationError validate_structure(_hwith(good;
         bases = [HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits,
             hb.label, :exp_quad, 2.0)]))
@@ -668,15 +734,19 @@ end
     # Bind fail-closed: non-numeric / non-finite axes.
     strcols = Dict{Symbol,AbstractVector}(:y => cols[:y],
         :x => ["a", "b", "c", "d"])
+    # refused: wrong eltype, non-numeric axis column
     @test_throws ContractValidationError bind_data(_hperiodic_plan(), strcols)
     nancols = Dict{Symbol,AbstractVector}(:y => cols[:y],
         :x => [0.5, NaN, 1.5, 0.0])
+    # refused: non-finite (NaN) axis data
     @test_throws ContractValidationError bind_data(_hperiodic_plan(), nancols)
     # Codegen/layout guards behind validation: fits on a periodic basis.
     withfits = HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, [(0.0, 1.0)],
         hb.label, :periodic, 2.0)
     bad = _hwith(bound; bases = [withfits])
+    # refused: fits on a periodic basis, build guard (IR contract)
     @test_throws ContractValidationError build_kernel(bad)
+    # refused: fits on a periodic basis, layout guard (IR contract)
     @test_throws ContractValidationError assign_layout(bad)
 end
 
@@ -703,7 +773,7 @@ end
     # SB `_sb_hsgp_periodic` declaration order (rho, sigma, beta),
     # appended after the slice-1 entries like the exp-quad triple.
     kinds = [(e.kind, e.name, e.size, e.transform) for e in layout.entries]
-    @test kinds == [(:coefficient, :mu_coef, 1, :identity),
+    @test kinds == [(:sampled, :a, 1, :identity),
         (:sampled, :sigma, 1, :exp),
         (:sampled, :rho_h_p, 1, :floored),
         (:sampled, :sigma_h_p, 1, :exp),

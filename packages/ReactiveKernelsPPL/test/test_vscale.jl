@@ -64,6 +64,10 @@ _vs_stdnormal_prior(coefs...) =
 
 @testset "surface: gaussian log-link scale" begin
     plan0 = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         sigma = c .+ d .* z
         y .~ Normal.(mu, exp.(sigma))
@@ -73,8 +77,8 @@ _vs_stdnormal_prior(coefs...) =
     @test [(p.name, p.link) for p in plan0.predictors] ==
         [(:mu, IdentityLink), (:sigma, LogLink)]
     # Scale coefficients take population priors exactly like location ones.
-    @test [(p.predictor, p.addressee) for p in plan0.population_priors] ==
-        [(:mu, :Intercept), (:mu, :x), (:sigma, :Intercept), (:sigma, :z)]
+    @test isempty(plan0.population_priors)
+    @test [p.name for p in plan0.parameters] == [:a, :b, :c, :d]
     # Absorbed definitions never also emit as derived columns.
     @test isempty(plan0.derived)
     plan = bind_data(plan0, _vs_cols())
@@ -87,6 +91,10 @@ end
 
 @testset "surface: bare scale is identity, logistic is logit" begin
     bare = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         sg = c .+ d .* z
         y .~ Normal.(mu, sg)
@@ -95,6 +103,10 @@ end
     @test only(p for p in bare.predictors if p.name === :sg).link ===
         IdentityLink
     logit = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         sg = c .+ d .* z
         y .~ Normal.(mu, logistic.(sg))
@@ -106,12 +118,20 @@ end
 
 @testset "surface: nb2/gamma predictor scales" begin
     nb2 = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         phi = c .+ d .* z
         y .~ NegativeBinomial2.(exp.(eta), exp.(phi))
     end, (:y, :x, :z))
     @test only(nb2.responses).scale == ScalePredictorRef(:phi, LogLink)
     gamma = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         s = c .+ d .* z
         y .~ Gamma.(exp.(s), exp.(eta) ./ exp.(s))
@@ -119,21 +139,39 @@ end
     @test only(gamma.responses).scale == ScalePredictorRef(:s, LogLink)
     # Both Gamma positions must name the same alpha spelling — mixed
     # wrappers never merge.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: Gamma args beyond the Gamma.(A, M ./ A) template: mixed alpha spellings s vs exp.(s) (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         s = c .+ d .* z
         y .~ Gamma.(s, exp.(eta) ./ exp.(s))
-    end, (:y, :x, :z))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    end, (:y, :x, :z)); true)
+    # capability: Gamma args beyond the (alpha, mu/alpha) template: different predictors in shape and mean divisor (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
+        e ~ Normal(0, 1)
+        f ~ Normal(0, 1)
         eta = a .+ b .* x
         s = c .+ d .* z
         t = e .+ f .* x
         y .~ Gamma.(exp.(s), exp.(eta) ./ exp.(t))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z)); true)
 end
 
 @testset "surface: shared scale predictor" begin
     plan0 = lower_rkppl(quote
+        a1 ~ Normal(0, 1)
+        b1 ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
+        a2 ~ Normal(0, 1)
+        b2 ~ Normal(0, 1)
         mu1 = a1 .+ b1 .* x
         mu2 = a2 .+ b2 .* x
         sigma = c .+ d .* z
@@ -145,13 +183,20 @@ end
         plan0.responses)
     @test count(p -> p.name === :sigma, plan0.predictors) == 1
     # One link per predictor across slots: a second use-site link fails.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: one predictor used under two use-site links (exp.(sigma) and bare sigma) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
+        a1 ~ Normal(0, 1)
+        a2 ~ Normal(0, 1)
+        b1 ~ Normal(0, 1)
+        b2 ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu1 = a1 .+ b1 .* x
         mu2 = a2 .+ b2 .* x
         sigma = c .+ d .* z
         y1 .~ Normal.(mu1, exp.(sigma))
         y2 .~ Normal.(mu2, sigma)
-    end, (:y1, :y2, :x, :z))
+    end, (:y1, :y2, :x, :z)); true)
 end
 
 @testset "surface: intercept-only scale predictor" begin
@@ -159,6 +204,9 @@ end
     # the scale-predictor slot; the design carries the `ones(n)` intercept
     # block, so the LP still evaluates per cell.
     plan0 = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
         mu = a .+ b .* x
         sigma = c
         y .~ Normal.(mu, exp.(sigma))
@@ -168,26 +216,36 @@ end
     pred = only(p for p in plan0.predictors if p.name === :sigma)
     @test pred.link === LogLink
     @test [t.kind for t in pred.terms] == [InterceptTerm]
-    @test (only(p for p in plan0.population_priors if p.predictor === :sigma).addressee) == :Intercept
+    @test only(pred.terms).options.parameter === :c
     @test isempty(plan0.derived)
     # A stated Normal prior rides the intercept (the location precedent).
     stated = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         c ~ Normal(0.0, 5.0)
         mu = a .+ b .* x
         sigma = c
         y .~ Normal.(mu, exp.(sigma))
     end, (:y, :x, :z))
-    pr = only(p for p in stated.population_priors if p.predictor === :sigma)
-    @test (pr.addressee, pr.location, pr.scale) == (:Intercept, 0.0, 5.0)
-    # Bare intercept-only scale is identity link, like the vector shape.
+    pr = only(p for p in stated.parameters if p.name === :c)
+    @test pr.args == (arg1 = 0.0, arg2 = 5.0)
+    # Strict declarations: the intercept-only scale's coefficient is
+    # declared, and a declared Normal name aliased into the scale stays
+    # scalar-path (the alias rule below) — the free-name intercept-only
+    # scale predictor no longer exists.
     bare = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
         mu = a .+ b .* x
         sg = c
         y .~ Normal.(mu, sg)
     end, (:y, :x, :z))
-    @test only(bare.responses).scale == ScalePredictorRef(:sg, IdentityLink)
+    @test only(bare.responses).scale === :sg
     # Non-Normal parameter aliases stay scalar-path (no reroute).
     aliased = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         s ~ Exponential(1.0)
         s2 = s
@@ -199,6 +257,8 @@ end
     # expansion keeps `s_r` a parameter — the merge joint-session
     # contract). Only link-wrapped uses admit stated coefficients.
     naliased = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         s_r ~ Normal(0.0, 1.0)
         s = s_r
@@ -212,59 +272,92 @@ end
 @testset "surface: scale fail-closed battery" begin
     # Undotted wrappers are never silently reinterpreted (scalar
     # `exp(log_sigma)` use-site wrappers are deferred).
+    # refused: undotted exp on a vector predictor is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         ls = c .+ d .* z
         y .~ Normal.(mu, exp(ls))
     end, (:y, :x, :z))
     # Wrappers take exactly one predictor definition.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: constant-expression scale exp.(1.5) (todo `0fkd9yk`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(1.5))
-    end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    end, (:y, :x)); true)
+    # capability: link-wrapped scalar parameter as scale exp.(tau) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         tau ~ Exponential(1.0)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(tau))
-    end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    end, (:y, :x)); true)
+    # capability: data-expression scale exp.(x) (data-computed scales already admitted) (todo `0fkd9yk`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(x))
-    end, (:y, :x))
+    end, (:y, :x)); true)
+    # refused: undeclared name nosuch (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(nosuch))
     end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: arbitrary elementwise function on a scale predictor sqrt.(sigma) (P8, 1cmodra) (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         sigma = c .+ d .* z
         y .~ Normal.(mu, sqrt.(sigma))
-    end, (:y, :x, :z))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    end, (:y, :x, :z)); true)
+    # capability: probit.-wrapped scale predictor (arbitrary scale wrapper) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         sigma = c .+ d .* z
         y .~ Normal.(mu, probit.(sigma))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z)); true)
     # The two slots take distinct predictors (contract gate, BRM-mirroring).
     # A same-link self-use reaches the contract rule; a wrapped self-use
     # trips the one-link-per-predictor rule first (same fail-closed).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(mu))
-    end, (:y, :x))
-    @test_throws ContractValidationError lower_rkppl(quote
+    end, (:y, :x)); true)
+    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, mu)
-    end, (:y, :x))
+    end, (:y, :x)); true)
     # Beta-kappa predictors are log-only (a concentration — contract
     # gate): a bare predictor use fails closed.
-    @test_throws ContractValidationError lower_rkppl(quote
+    # capability: identity-link Beta concentration predictor (bare k) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         k = c .+ d .* z
         y .~ Beta.(logistic.(mu) .* k, (1 .- logistic.(mu)) .* k)
-    end, (:y, :x, :z))
+    end, (:y, :x, :z)); true)
     # Predictor-fed Binomial trials are deferred: trials stay
     # column-or-literal.
+    # refused: Binomial trials from a real-valued affine predictor are non-integer (mathematically invalid; comment says deferred)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         n = c .+ d .* z
@@ -272,7 +365,10 @@ end
     end, (:y, :x, :z))
     # Factor scale coefficients need their broadcast prior, exactly like
     # factor locations (required, never defaulted).
+    # refused: undeclared factor scale coefficients cs (P6 05oe96l, P7 0d5a67r)
     @test_throws SurfaceLoweringError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         sg = cs[g]
         y .~ Normal.(mu, exp.(sg))
@@ -288,7 +384,8 @@ end
                 Expr(:block,
                     :(theta[i] ~ Normal(mu, tau)),
                     :(y[i] ~ Normal.(theta[i], _t2[i]))))))
-    @test_throws SurfaceLoweringError lower_rkppl(expr, (:y,))
+    # capability: deterministic transform of a plate latent (_t2 = theta .+ 1) as per-cell scale (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(expr, (:y,)); true)
 end
 
 @testset "contract: hand-built scale-predictor plans" begin
@@ -319,25 +416,32 @@ end
     # Positive case: a scale-only predictor counts as used and validates.
     validate_plan(_mk(ScalePredictorRef(:sigma, LogLink)))
     # Unknown predictor, link mismatch, non-logit-or-narrower link.
+    # refused: scale ref names an unknown predictor (IR contract)
     @test_throws ContractValidationError validate_structure(
         _mk(ScalePredictorRef(:nosuch, LogLink)))
+    # refused: scale ref link disagrees with its PredictorSpec link (IR contract)
     @test_throws ContractValidationError validate_structure(
         _mk(ScalePredictorRef(:sigma, IdentityLink)))
+    # refused: scale ref ProbitLink disagrees with predictor LogLink; scale links identity/log/logit only (IR contract)
     @test_throws ContractValidationError validate_structure(
         _mk(ScalePredictorRef(:sigma, ProbitLink)))
     # Scale is the response's own location predictor.
-    @test_throws ContractValidationError validate_structure(
-        _mk(ScalePredictorRef(:mu, IdentityLink)))
+    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
+    @test_broken (validate_structure(
+        _mk(ScalePredictorRef(:mu, IdentityLink))); true)
     # Beta-kappa predictors admitted log-only (a concentration);
     # scaleless families take no ref.
     validate_structure(_mk(ScalePredictorRef(:sigma, LogLink);
         family = BetaLogitFam, link = LogitLink))
-    @test_throws ContractValidationError validate_structure(
+    # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_structure(
         _mk(ScalePredictorRef(:sigma, IdentityLink); family = BetaLogitFam,
-            link = LogitLink))
-    @test_throws ContractValidationError validate_structure(
+            link = LogitLink)); true)
+    # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_structure(
         _mk(ScalePredictorRef(:sigma, LogitLink); family = BetaLogitFam,
-            link = LogitLink))
+            link = LogitLink)); true)
+    # refused: scaleless family (Poisson) takes no scale ref (IR contract)
     @test_throws ContractValidationError validate_structure(
         _mk(ScalePredictorRef(:sigma, LogLink); family = PoissonLogFam,
             link = LogLink, predictor = :eta,
@@ -349,11 +453,16 @@ end
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu,
             1.0, nothing, _none_evidence(), :y_resp)],
         preds, priors, SampledParameter[], AssignmentSpec[], _vs_cols(), 6)
+    # refused: unused (orphan) predictor (IR contract)
     @test_throws ContractValidationError validate_structure(orphan)
 end
 
 @testset "vscale: gaussian log-link values + gradient" begin
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             sigma = c .+ d .* z
             y .~ Normal.(mu, exp.(sigma))
@@ -375,6 +484,9 @@ end
 
 @testset "vscale: intercept-only scale values + gradient" begin
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
             mu = a .+ b .* x
             sigma = c
             y .~ Normal.(mu, exp.(sigma))
@@ -386,7 +498,7 @@ end
     nt = constrain(built.layout, u)
     cols = _vs_cols()
     muv = _vs_lp([nt.a, nt.b], cols[:x])
-    sgv = fill(exp(only([nt.c])), length(cols[:y]))
+    sgv = fill(exp(nt.c), length(cols[:y]))
     ll = _vs_oracle_gaussian(cols[:y], muv, sgv)
     pr = _vs_stdnormal_prior([nt.a, nt.b], [nt.c])
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
@@ -400,6 +512,10 @@ end
     cols = _vs_cols()
     # Identity link: coefficients stay in the positive-LP region at u.
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             sg = c .+ d .* z
             y .~ Normal.(mu, sg)
@@ -419,6 +535,10 @@ end
     _check_gradient(built.spec, plan, u)
     # Logit link: sigma in (0, 1) via the inlined Beta-precedent form.
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             sg = c .+ d .* z
             y .~ Normal.(mu, logistic.(sg))
@@ -442,6 +562,9 @@ end
     z = [1.0, 0.5, -0.5, 1.5, 0.0, -1.0]
     # NB2 with a stated scale-coefficient prior (pins the prior path too).
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
             d ~ Normal(1, 2)
             eta = a .+ b .* x
             phi = c .+ d .* z
@@ -456,9 +579,9 @@ end
     muv = exp.(_vs_lp([nt.a, nt.b], x))
     phiv = exp.(_vs_lp([nt.c, nt.d], z))
     ll = _vs_oracle_nb2(y, muv, phiv)
-    pr = (logpdf(Normal(0, 1), nt.a) +
-        logpdf(Normal(0, 1), nt.b) +
-        logpdf(Normal(0, 1), nt.c) + logpdf(Normal(1, 2), nt.d))
+    pr = (logpdf(Normal(0, 1), [nt.a, nt.b][1]) +
+        logpdf(Normal(0, 1), [nt.a, nt.b][2]) +
+        logpdf(Normal(0, 1), [nt.c, nt.d][1]) + logpdf(Normal(1, 2), [nt.c, nt.d][2]))
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
@@ -467,6 +590,10 @@ end
     # Gamma shape on the log link.
     yg = [1.2, 0.8, 2.1, 1.5, 0.6, 1.9]
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             eta = a .+ b .* x
             s = c .+ d .* z
             y .~ Gamma.(exp.(s), exp.(eta) ./ exp.(s))
@@ -489,6 +616,10 @@ end
 @testset "vscale: student log-link sigma values + gradient" begin
     cols = _vs_cols()
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             sigma = c .+ d .* z
             y .~ StudentT.(4.0, mu, exp.(sigma))
@@ -513,6 +644,10 @@ end
 @testset "vscale: gaussian evidence reads the per-cell scale" begin
     cols = _vs_cols()
     mk(ev) = bind_data(lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 mu = a .+ b .* x
                 sigma = c .+ d .* z
                 y .~ $ev
@@ -573,6 +708,10 @@ end
     z = [1.0, 0.5, -0.5, 1.5, 0.0, -1.0]
     w = [1.0, 2.0, 1.0, 0.5, 1.5, 1.0]
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             sigma = c .+ d .* z
             y .~ weighted.(Normal.(mu, exp.(sigma)), w)
@@ -598,6 +737,12 @@ end
     y1 = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
     y2 = [0.5, 1.0, 2.0, 1.5, 2.5, 1.0]
     plan = bind_data(lower_rkppl(quote
+            a1 ~ Normal(0, 1)
+            b1 ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
+            a2 ~ Normal(0, 1)
+            b2 ~ Normal(0, 1)
             mu1 = a1 .+ b1 .* x
             mu2 = a2 .+ b2 .* x
             sigma = c .+ d .* z
@@ -629,6 +774,8 @@ end
     y = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
     x = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             se2 = w .+ v
             y .~ Normal.(mu, se2)
@@ -651,6 +798,8 @@ end
     # column, broadcast prior sizing the block — the location rule.
     g = [1, 2, 1, 3, 2, 3]
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             cs[levels(g)] .~ Normal.(0, 2)
             sg = cs[g]
@@ -715,6 +864,10 @@ end
 
 @testset "vscale: emitted scale node is explicit dotted code" begin
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             sigma = c .+ d .* z
             y .~ Normal.(mu, exp.(sigma))
@@ -765,6 +918,10 @@ _vs_u_by_name(names, pairs) = [Dict(pairs)[n] for n in names]
 
 @testset "surface: student log-link nu" begin
     plan0 = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         lognu = c .+ d .* z
         y .~ StudentT.(exp.(lognu), mu, 2.0)
@@ -775,8 +932,8 @@ _vs_u_by_name(names, pairs) = [Dict(pairs)[n] for n in names]
     @test [(p.name, p.link) for p in plan0.predictors] ==
         [(:mu, IdentityLink), (:lognu, LogLink)]
     # Nu coefficients take population priors exactly like location ones.
-    @test [(p.predictor, p.addressee) for p in plan0.population_priors] ==
-        [(:mu, :Intercept), (:mu, :x), (:lognu, :Intercept), (:lognu, :z)]
+    @test isempty(plan0.population_priors)
+    @test [p.name for p in plan0.parameters] == [:a, :b, :c, :d]
     # Absorbed definitions never also emit as derived columns.
     @test isempty(plan0.derived)
     plan = bind_data(plan0, _vs_cols())
@@ -787,6 +944,10 @@ end
 @testset "vscale: student log-link nu values + gradient" begin
     cols = _vs_cols()
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             mu = a .+ b .* x
             lognu = c .+ d .* z
             y .~ StudentT.(exp.(lognu), mu, 2.0)
@@ -811,6 +972,10 @@ end
 @testset "vscale: student sampled-scale + predictor nu values + gradient" begin
     cols = _vs_cols()
     plan = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            d ~ Normal(0, 1)
             s ~ Exponential(1)
             mu = a .+ b .* x
             lognu = c .+ d .* z

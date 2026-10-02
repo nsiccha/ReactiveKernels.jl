@@ -57,6 +57,10 @@ const _BB_P3_GRAD =
 _bb_p3_cols() = Dict{Symbol,AbstractVector}(:y => copy(_BB_P3_Y),
     :x => copy(_BB_P3_X), :z => copy(_BB_P3_Z), :n => copy(_BB_P3_N))
 _bb_p3_prog() = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
+    c ~ Normal(0, 1)
+    d ~ Normal(0, 1)
     mu = a .+ b .* x
     hup = c .+ d .* z
     y .~ BetaBinomial2.(n, logistic.(mu), exp.(hup))
@@ -65,6 +69,8 @@ end
 @testset "betabinomial surface admission" begin
     @testset "literal phi, column trials" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
             end, (:c, :x, :n))
@@ -80,16 +86,20 @@ end
     end
     @testset "Gamma-sampled phi" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 phi ~ Gamma(2.0, 0.1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), phi)
             end, (:c, :x, :n))
         r = only(plan.responses)
         @test (r.family, r.scale, r.trials) === (BetaBinomial2Fam, :phi, :n)
-        @test only(plan.parameters).family === :gamma
+        @test only(p for p in plan.parameters if p.name === :phi).family === :gamma
     end
     @testset "literal trials" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(12, logistic.(mu), 4.0)
             end, (:c, :x))
@@ -98,6 +108,8 @@ end
     end
     @testset "per-observation phi column" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), phic)
             end, (:c, :x, :n, :phic))
@@ -105,6 +117,10 @@ end
     end
     @testset "predictor-fed precision" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 mu = a .+ b .* x
                 hup = c .+ d .* z
                 y .~ BetaBinomial2.(n, logistic.(mu), exp.(hup))
@@ -116,16 +132,21 @@ end
     end
     @testset "error spellings" begin
         # Wrong arity.
+        # refused: BetaBinomial2 called with the wrong arity (malformed distribution)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(logistic.(mu), 4.0)
             end, (:c, :x))
         # Bare mean (link-space predictors wrap; Beta precedent).
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+        @test_broken (lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, mu, 4.0)
-            end, (:c, :x, :n))
+            end, (:c, :x, :n)); true)
         # Kernel-endpoint spelling redirects.
+        # refused: kernel lpmf endpoint beta_binomial2 is not a distribution constructor (P2)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 mu = a .+ b .* x
                 c .~ beta_binomial2.(n, logistic.(mu), 4.0)
@@ -136,6 +157,8 @@ end
 @testset "betabinomial value parity" begin
     @testset "literal phi" begin
         _, _, kern, lay = _bb_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
             end, _bb_cols())
@@ -150,6 +173,8 @@ end
     end
     @testset "Gamma-sampled phi" begin
         _, _, kern, lay = _bb_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 phi ~ Gamma(2.0, 0.1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), phi)
@@ -169,6 +194,8 @@ end
         cols = Dict{Symbol,AbstractVector}(:c => [6, 8, 5, 9, 4, 7],
             :x => copy(_BB_X))
         _, _, kern, lay = _bb_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(12, logistic.(mu), 4.0)
             end, cols)
@@ -185,6 +212,8 @@ end
         cols = _bb_cols()
         cols[:phic] = [1.0, 2.0, 4.0, 8.0, 3.0, 5.0]
         _, _, kern, lay = _bb_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), phic)
             end, cols)
@@ -231,12 +260,16 @@ end
 @testset "betabinomial Enzyme gradients" begin
     @testset "literal phi" begin
         _bb_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
             end, _bb_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "Gamma-sampled phi" begin
         _bb_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 phi ~ Gamma(2.0, 0.1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), phi)
@@ -265,6 +298,8 @@ end
 
 @testset "betabinomial emission is O(1) in n_obs" begin
     prog = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         phi ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         c .~ BetaBinomial2.(n, logistic.(mu), phi)
@@ -304,10 +339,14 @@ end
 @testset "betabinomial under Reactant" begin
     progs = [
         ("literal phi", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* x
             c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
         end, _bb_cols()),
         ("Gamma-sampled phi", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             phi ~ Gamma(2.0, 0.1)
             mu = a .+ b .* x
             c .~ BetaBinomial2.(n, logistic.(mu), phi)

@@ -75,6 +75,15 @@ end
 @inline ReactiveKernels._kernel_source_arg_style(
     arg::SubArray{T,N,P}) where {T,N,P<:Reactant.TracedType} = Val(:tensorized)
 
+# reshape can keep a Base view over a traced parent instead of returning a
+# TracedRArray. It carries the same live values and must select the tensorized
+# recipe and plate paths; otherwise a Ref(view) beside bound lane data runs
+# host broadcast once per lane and produces a host collection of traced arrays.
+const _TracedReshapedArray =
+    Base.ReshapedArray{T,N,P} where {T,N,P<:Reactant.TracedRArray}
+@inline ReactiveKernels._kernel_source_arg_style(::_TracedReshapedArray) =
+    Val(:tensorized)
+
 # Prepared kernels are immutable compiled programs.  Their graph/plan/AST
 # fields are inspection metadata, not runtime arguments.  Leaving Reactant's
 # generic struct traversal in charge would recursively trace that metadata (and
@@ -1054,6 +1063,7 @@ end
 # separately generated eager broadcast/reduction body, avoiding forbidden
 # scalar indexing while leaving XLA free to fuse the tensor operations.
 @inline ReactiveKernels._requires_tensorized_marker(::Reactant.RArray) = true
+@inline ReactiveKernels._requires_tensorized_marker(::_TracedReshapedArray) = true
 
 # A traced SCALAR HAVE beside all-bound plate data is also a Reactant argument:
 # a scalar-parameter model (`logit_rate`/`log_rate`) with every array port
@@ -1073,6 +1083,9 @@ end
 # the concatenation stays inside Reactant's native lowering.
 @inline ReactiveKernels._tensorized_cat_operand(
         marker::Reactant.TracedType, arg::AbstractArray) =
+    Reactant.promote_to(Reactant.TracedRArray, arg)
+@inline ReactiveKernels._tensorized_cat_operand(
+        marker::_TracedReshapedArray, arg::AbstractArray) =
     Reactant.promote_to(Reactant.TracedRArray, arg)
 
 # A traced scalar index is a deliberate gather at this compiler boundary: one
@@ -1138,6 +1151,10 @@ end
         {T,N,P<:Reactant.TracedRArray}
     Reactant.@allowscalar getindex(array, indices...)
 end
+@inline ReactiveKernels._tensorized_getindex(
+    array::_TracedReshapedArray, indices...) =
+    ReactiveKernels._tensorized_getindex(
+        Reactant.promote_to(Reactant.TracedRArray, array), indices...)
 
 # `get(A, i, default)` at a TRACED index: Base's lazy branch on the bounds test
 # stays a lazy branch (`stablehlo.if`), so the gather runs only in the in-range
@@ -1891,13 +1908,17 @@ ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
         _reactant_structural_marker(Base.tail(args))
 end
 
-# A Ref contributes no broadcast axis, but its traced array still selects the
-# backend when every axis operand is bound host data. Generic Reactant broadcast
+# A Ref contributes no broadcast axis, but its traced payload still selects the
+# backend when every axis operand is bound host data. This includes shared
+# traced scalars: host broadcasting would otherwise construct one traced scalar
+# per lane, whose later promotion replicates reads and whose gathers recurse.
+# Generic Reactant broadcast
 # expands Ref payloads as scalars (broadcast_in_dim with no source dimensions),
 # which is invalid for an array payload. Ops.batch already preserves the full
 # shape of arrays captured by the callable, as in the eachcol lowering above.
 ReactiveKernels._tensorized_plate_is_marker(
-    ::Base.RefValue{<:Reactant.TracedRArray}) = true
+    ::Base.RefValue{<:Union{Reactant.TracedRArray,Reactant.TracedRNumber,
+        _TracedReshapedArray}}) = true
 @inline _reactant_plate_ref_array(arg) = false
 @inline _reactant_plate_ref_array(::Base.RefValue{<:AbstractArray}) = true
 @inline _reactant_plate_broadcast_input(arg::AbstractArray) =
@@ -1936,7 +1957,9 @@ function _reactant_ref_plate_call(operation, args::Tuple)
 end
 
 function ReactiveKernels._tensorized_plate_call(
-        marker::Base.RefValue{<:Reactant.TracedRArray}, operation, args::Tuple)
+        marker::Base.RefValue{<:Union{Reactant.TracedRArray,Reactant.TracedRNumber,
+            _TracedReshapedArray}},
+        operation, args::Tuple)
     structural = _reactant_structural_marker(args)
     structural === nothing ? _reactant_ref_plate_call(operation, args) :
         _reactant_authored_plate_call(structural, operation, args)
@@ -1955,6 +1978,11 @@ end
 @inline function ReactiveKernels._batched_call(
         f::ReactiveKernels._ArrayFunctionPair, ops, args,
         marker::Reactant.RArray)
+    f.tensorized(ops, args...)
+end
+@inline function ReactiveKernels._batched_call(
+        f::ReactiveKernels._ArrayFunctionPair, ops, args,
+        marker::_TracedReshapedArray)
     f.tensorized(ops, args...)
 end
 

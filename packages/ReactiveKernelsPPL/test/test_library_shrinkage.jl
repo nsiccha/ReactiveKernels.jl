@@ -1,3 +1,5 @@
+_ls_plan_canon(plan) = sprint(_canon, _test_scope_math(plan))
+
 # Shipped shrinkage submodels (`src/library.jl`): `r2d2_coefs` and
 # `horseshoe_coefs` state every prior in their bodies, lower to their
 # hand-inlined twins, match Distributions.jl oracles and the built-ins
@@ -68,8 +70,8 @@ _ls_halfcauchy(s, x) = logpdf(truncated(Cauchy(0, s), 0, Inf), x)
     # The body's module calls (`eachcol`) resolve in the module that
     # defines the submodel, so the twin lowers there.
     names = Set([:x1, :x2, :y])
-    @test sprint(_canon, lower_rkppl(_LS_R2D2, names)) ==
-        sprint(_canon, lower_rkppl(twin, names; mod = ReactiveKernelsPPL))
+    @test _ls_plan_canon(lower_rkppl(_LS_R2D2, names)) ==
+        _ls_plan_canon(lower_rkppl(twin, names; mod = ReactiveKernelsPPL))
 end
 
 @testset "library r2d2_coefs: Distributions oracle and gradient" begin
@@ -77,19 +79,19 @@ end
     bound, built = _ls_build(_LS_R2D2, cols)
     # The hcat matrix is read as a value (`var.(eachcol(X))`): bound data.
     @test bound.columns[:X] == hcat(cols[:x1], cols[:x2])
-    @test Set(coordinate_names(built.layout)) == Set([Symbol("mu.Intercept"),
-        :b_R2, :b_tau, :sigma, Symbol("b_phi.1"), Symbol("b_b.1"),
-        Symbol("b_b.2")])
+    @test Set(coordinate_names(built.layout)) == Set([:a,
+        Symbol("b.R2"), Symbol("b.tau"), :sigma, Symbol("b.phi.1"),
+        Symbol("b.b.1"), Symbol("b.b.2")])
     u = _ls_u(built)
     nt = constrain(built.layout, u)
     X = hcat(cols[:x1], cols[:x2])
-    a = only(nt.mu)
-    sd = sqrt.(nt.b_phi .* nt.b_R2 .* nt.b_tau^2 ./ var.(eachcol(X)))
-    pr = logpdf(Normal(0, 1), a) + logpdf(Beta(1, 1), nt.b_R2) +
-        logpdf(Dirichlet([1.0, 1.0]), nt.b_phi) +
-        _ls_halfnormal(1, nt.b_tau) + sum(logpdf.(Normal.(0, sd), nt.b_b)) +
+    a = nt.a
+    sd = sqrt.(nt.b.phi .* nt.b.R2 .* nt.b.tau^2 ./ var.(eachcol(X)))
+    pr = logpdf(Normal(0, 1), a) + logpdf(Beta(1, 1), nt.b.R2) +
+        logpdf(Dirichlet([1.0, 1.0]), nt.b.phi) +
+        _ls_halfnormal(1, nt.b.tau) + sum(logpdf.(Normal.(0, sd), nt.b.b)) +
         logpdf(Exponential(1.0), nt.sigma)
-    ll = sum(logpdf.(Normal.(a .+ X * nt.b_b, nt.sigma), cols[:y]))
+    ll = sum(logpdf.(Normal.(a .+ X * nt.b.b, nt.sigma), cols[:y]))
     @test _query(built.spec, bound, :prior, u) ≈ pr
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     _check_gradient(built.spec, bound, u)
@@ -139,17 +141,18 @@ end
         sigma ~ Exponential(1)
         y .~ Normal.(mu, sigma)
     end
-    @test sprint(_canon, lower_rkppl(nested, names; mod = @__MODULE__)) ==
-        sprint(_canon, lower_rkppl(twin, names; mod = ReactiveKernelsPPL))
+    @test _ls_plan_canon(lower_rkppl(nested, names; mod = @__MODULE__)) ==
+        _ls_plan_canon(lower_rkppl(twin, names; mod = ReactiveKernelsPPL))
     X = hcat(cols[:x1], cols[:x2])
-    for (ast, p) in ((named, :b), (nested, :eta_b))
+    for (ast, path) in ((named, (:b,)), (nested, (:eta, :b)))
         bound = bind_data(lower_rkppl(ast, names; mod = @__MODULE__), cols)
         built = build_kernel(bound)
         u = _ls_u(built)
         nt = constrain(built.layout, u)
-        R2, phi = nt[Symbol(p, :_R2)], nt[Symbol(p, :_phi)]
-        tau, b = nt[Symbol(p, :_tau)], nt[Symbol(p, :_b)]
-        a = only(nt.mu)
+        local_draws = foldl(getproperty, path; init = nt)
+        R2, phi = local_draws.R2, local_draws.phi
+        tau, b = local_draws.tau, local_draws.b
+        a = nt.a
         sd = sqrt.(phi .* R2 .* tau^2 ./ var.(eachcol(X)))
         pr = logpdf(Normal(0, 5), a) + logpdf(Beta(1, 1), R2) +
             logpdf(Dirichlet([1.0, 1.0]), phi) + _ls_halfnormal(1, tau) +
@@ -174,14 +177,14 @@ end
         end, data)
     u = _ls_u(built)
     nt = constrain(built.layout, u)
-    @test length(nt.b_b) == 3 && length(nt.b_phi) == 3
-    a = only(nt.mu)
-    sd = sqrt.(nt.b_phi .* nt.b_R2 .* nt.b_tau^2 ./ var.(eachcol(X)))
-    pr = logpdf(Normal(0, 1), a) + logpdf(Beta(1, 1), nt.b_R2) +
-        logpdf(Dirichlet([1.0, 2.0, 3.0]), nt.b_phi) +
-        _ls_halfnormal(1, nt.b_tau) + sum(logpdf.(Normal.(0, sd), nt.b_b)) +
+    @test length(nt.b.b) == 3 && length(nt.b.phi) == 3
+    a = nt.a
+    sd = sqrt.(nt.b.phi .* nt.b.R2 .* nt.b.tau^2 ./ var.(eachcol(X)))
+    pr = logpdf(Normal(0, 1), a) + logpdf(Beta(1, 1), nt.b.R2) +
+        logpdf(Dirichlet([1.0, 2.0, 3.0]), nt.b.phi) +
+        _ls_halfnormal(1, nt.b.tau) + sum(logpdf.(Normal.(0, sd), nt.b.b)) +
         logpdf(Exponential(1.0), nt.sigma)
-    ll = sum(logpdf.(Normal.(a .+ X * nt.b_b, nt.sigma), cols[:y]))
+    ll = sum(logpdf.(Normal.(a .+ X * nt.b.b, nt.sigma), cols[:y]))
     @test _query(built.spec, bound, :prior, u) ≈ pr
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     _check_gradient(built.spec, bound, u)
@@ -202,9 +205,9 @@ end
     bl, builtl = _ls_build(_LS_R2D2, cols)
     ub = _ls_u(builtb)
     v = constrain(builtb.layout, ub)
-    ul = _ls_unconstrain(builtl.layout, (; mu = v.mu[1:1], b_R2 = v.R2,
-        b_tau = v.r2d2_mu_tau_bsv, sigma = v.sigma, b_phi = v.phi,
-        b_b = v.mu[2:3]))
+    ul = _ls_unconstrain(builtl.layout, (; a = v.mu[1], sigma = v.sigma,
+        b = (; R2 = v.R2, tau = v.r2d2_mu_tau_bsv, phi = v.phi,
+            b = v.mu[2:3])))
     for want in (:prior, :likelihood, :posterior)
         @test _query(builtl.spec, bl, want, ul) ≈
             _query(builtb.spec, bb, want, ub)
@@ -224,8 +227,8 @@ end
         y .~ Normal.(mu, sigma)
     end
     names = Set([:x1, :x2, :y])
-    @test sprint(_canon, lower_rkppl(_LS_HORSESHOE, names)) ==
-        sprint(_canon, lower_rkppl(twin, names))
+    @test _ls_plan_canon(lower_rkppl(_LS_HORSESHOE, names)) ==
+        _ls_plan_canon(lower_rkppl(twin, names))
 end
 
 @testset "library horseshoe_coefs: Distributions oracle and gradient" begin
@@ -235,11 +238,11 @@ end
     u = _ls_u(built)
     nt = constrain(built.layout, u)
     X = hcat(cols[:x1], cols[:x2])
-    a = only(nt.mu)
-    b = nt.b_z .* nt.b_lambda .* nt.b_tau
-    pr = logpdf(Normal(0, 1), a) + _ls_halfcauchy(1, nt.b_tau) +
-        sum(_ls_halfcauchy.(1, nt.b_lambda)) +
-        sum(logpdf.(Normal(0, 1), nt.b_z)) +
+    a = nt.a
+    b = nt.b.z .* nt.b.lambda .* nt.b.tau
+    pr = logpdf(Normal(0, 1), a) + _ls_halfcauchy(1, nt.b.tau) +
+        sum(_ls_halfcauchy.(1, nt.b.lambda)) +
+        sum(logpdf.(Normal(0, 1), nt.b.z)) +
         logpdf(Exponential(1.0), nt.sigma)
     ll = sum(logpdf.(Normal.(a .+ X * b, nt.sigma), cols[:y]))
     @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -254,6 +257,7 @@ end
     # global and local scales coincide with the built-in's.
     cols = _ls_cols()
     bb, builtb = _ls_build(quote
+            a ~ Normal(0, 1)
             b1 ~ Horseshoe()
             mu = a .+ b1 .* x1
             sigma ~ Exponential(1.0)
@@ -269,9 +273,9 @@ end
         end, cols)
     ub = _ls_u(builtb)
     v = constrain(builtb.layout, ub)
-    ul = _ls_unconstrain(builtl.layout, (; mu = [v.horseshoe_mu_Intercept_normal],
-        b_tau = v.horseshoe_mu_x1_tau, b_lambda = [v.horseshoe_mu_x1_lambda],
-        b_z = [v.horseshoe_mu_x1_raw], sigma = v.sigma))
+    ul = _ls_unconstrain(builtl.layout, (; a = v.horseshoe_mu_Intercept_normal,
+        b = (; tau = v.horseshoe_mu_x1_tau, lambda = [v.horseshoe_mu_x1_lambda],
+            z = [v.horseshoe_mu_x1_raw]), sigma = v.sigma))
     @test _query(builtl.spec, bl, :likelihood, ul) ≈
         _query(builtb.spec, bb, :likelihood, ub)
     for want in (:prior, :posterior)
@@ -350,6 +354,7 @@ end
     @test rep.columns[:X] == hcat(cols[:x1], cols[:x1])
     # refused: the model computes X, so a caller column X is a second
     # source for one value (the module-data precedent).
+    # refused: caller X collides with the computed X definition (single assignment)
     @test_throws ContractValidationError bind_data(plan,
         merge(cols, Dict{Symbol,Any}(:X => Xv)))
     # Capability gap: a value matrix over a column the model derives

@@ -63,9 +63,12 @@ _censored_addprop_fd(f, x; h = 1e-6) = [(f(x .+ h .* (eachindex(x) .== i)) -
     @test value ≈ oracle(u) rtol=2e-13
     @test g ≈ _censored_addprop_fd(oracle,u) rtol=2e-6 atol=2e-8
     for bad in ([0,2,1,2,1],[1,3,1,2,1],[1.,2.,1.,2.,1.])
+        # refused: gather indices must be integers within a nonempty source axis (Julia indexing, P3)
         @test_throws ContractValidationError bind_data(plan,merge(cols,Dict(:assay=>bad));
             dims=Dict(:kernel_nsub_result=>2))
     end
+    # refused: gather indices must be integers within a nonempty source axis (Julia indexing, P3)
     @test_throws "empty" lower_rkppl(_censored_addprop_ast(:([])),Set(keys(cols)))
-    @test_throws "model scalar" lower_rkppl(_censored_addprop_ast(:([location,a1])),Set(keys(cols)))
+    # capability: a gathered vector mixing a data vector and a model scalar (ordinary values, P3/P10a 0dejlw1) (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(_censored_addprop_ast(:([location,a1])),Set(keys(cols))); true)
 end

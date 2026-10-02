@@ -61,6 +61,10 @@ _zip_cols() = Dict{Symbol,AbstractVector}(:c => copy(_ZIP_C),
 @testset "zip surface admission" begin
     @testset "logit-wrapped zi submodel" begin
         plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                d ~ Normal(0, 1)
+                e ~ Normal(0, 1)
                 eta = a .+ b .* x
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
@@ -72,18 +76,28 @@ _zip_cols() = Dict{Symbol,AbstractVector}(:c => copy(_ZIP_C),
         @test count(p -> p.name === :zeta, plan.predictors) == 1
     end
     @testset "exp-wrapped zi fails the logit-only gate" begin
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+        @test_broken (lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                d ~ Normal(0, 1)
+                e ~ Normal(0, 1)
                 eta = a .+ b .* x
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), exp.(zeta))
-            end, (:c, :x, :z))
+            end, (:c, :x, :z)); true)
     end
     @testset "bare zi predictor fails the logit-only gate" begin
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+        @test_broken (lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                d ~ Normal(0, 1)
+                e ~ Normal(0, 1)
                 eta = a .+ b .* x
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), zeta)
-            end, (:c, :x, :z))
+            end, (:c, :x, :z)); true)
     end
 end
 
@@ -99,6 +113,10 @@ _zip_ref(y::Integer, lam::Real, zi::Real) =
 @testset "zip value parity" begin
     @testset "modeled zi" begin
         _, _, kern, lay = _zip_query(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                d ~ Normal(0, 1)
+                e ~ Normal(0, 1)
                 eta = a .+ b .* x
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
@@ -132,6 +150,10 @@ end
 @testset "zip Enzyme gradients" begin
     @testset "modeled zi" begin
         _zip_enzyme_check(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                d ~ Normal(0, 1)
+                e ~ Normal(0, 1)
                 eta = a .+ b .* x
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))

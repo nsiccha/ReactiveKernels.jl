@@ -13,14 +13,12 @@
 # (counter-suffixed binding per build).
 
 """
-    build_kernel(plan; naming = :author) -> (; spec, layout)
+    build_kernel(plan) -> (; spec, layout)
 
 Validate, assign layout, emit, and evaluate a self-contained `@kernel`
 program for `plan`. `spec` is the `KernelSpec` (callable after `prepare`
 with `have=(:unconstrained, data…)`); `layout` is its
-[`LayoutTable`](@ref) (R10 read API for the sampler side), reporting
-coefficients under `naming` (`:author` names, or the legacy
-`:predictor` labels).
+[`LayoutTable`](@ref) (R10 read API for the sampler side).
 
 Thread safety: concurrent `build_kernel` calls over independent plans are
 supported — the counter-suffixed `PPLGeneratedModels` binding is assigned
@@ -30,11 +28,11 @@ eval'd code: `prepare` it and call it through [`prepare_query`](@ref) /
 [`prepare_sampler`](@ref) (which carry the `Base.invokelatest` world-age
 barrier) or wrap those calls in `Base.invokelatest` yourself.
 """
-function build_kernel(plan::StructuralPlan; naming::Symbol = :author)
+function build_kernel(plan::StructuralPlan)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
-    layout = assign_layout(plan; naming)
+    layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
     return (; spec, layout)
@@ -70,6 +68,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _scan_reconstruction_statements(plan, layout))
     append!(stmts, _dar_reconstruction_statements(plan, layout))
     append!(stmts, _horseshoe_coef_statements(plan))
+    append!(stmts, _affine_coefficient_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _event_lp_statements(plan))
     append!(stmts, _likelihood_statements(plan))
@@ -80,6 +79,76 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     sig = Expr(:call, name, :(unconstrained::Vector{Float64}),
         (_data_arg(colname, col) for (colname, col) in _ordered_columns(plan))...)
     return Expr(:(=), sig, Expr(:block, stmts...))
+end
+
+# Pack references to constrained parameter values for the affine matmul.
+# Only authored terms are expanded; array sizes remain array operations.
+function _affine_coefficient_statements(plan::StructuralPlan, layout::LayoutTable)
+    stmts = Expr[]
+    for p in plan.predictors
+        _parameter_terms(p) || continue
+        shape = design_shape(p, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
+        chunks = Any[]
+        legacy_offset = 0
+        for (t, b) in zip(p.terms, shape.blocks)
+            b.width == 0 && continue
+            if _parameter_term(t)
+                value = t.options.parameter
+                value = t.options.sign == 1 ? value : :(-$value)
+                # All concatenation inputs are vectors. Mixing a traced
+                # scalar with a vector takes Julia's scalar-fill cat path.
+                push!(chunks, t.kind in (FactorTerm, MatrixTerm) ?
+                    :(Float64.($value)) : :([$value]))
+            else
+                coef = block_name(p.name)
+                slice = Expr(:ref, coef,
+                    Expr(:call, :(:), legacy_offset + 1,
+                        legacy_offset + b.width))
+                push!(chunks, :(Float64.($slice)))
+                legacy_offset += b.width
+            end
+        end
+        if length(chunks) == 1 && any(t -> _parameter_term(t) &&
+                t.kind in (FactorTerm, MatrixTerm), p.terms)
+            t = only(t for t in p.terms if _parameter_term(t))
+            value = t.options.parameter
+            rhs = t.options.sign == 1 ? value : :(-$value)
+        else
+            rhs = _affine_coordinate_view(p, shape, layout)
+            rhs === nothing && (rhs = :(vcat($(chunks...))))
+        end
+        push!(stmts, :($(_affine_block_name(p)) = $rhs))
+    end
+    return stmts
+end
+
+# A contiguous run of identity-transformed declarations needs no packing
+# allocation. This is an optimization of parameter reads, not their layout.
+function _affine_coordinate_view(pred, shape, layout)
+    reads = Tuple{Symbol,Int}[]
+    for (t, b) in zip(pred.terms, shape.blocks)
+        b.width == 0 && continue
+        _parameter_term(t) && t.options.sign == 1 || return nothing
+        push!(reads, (t.options.parameter, b.width))
+    end
+    return _parameter_coordinate_view(reads, layout)
+end
+
+function _parameter_coordinate_view(reads, layout)
+    start = nothing
+    stop = nothing
+    for (name, width) in reads
+        i = findfirst(e -> e.name === name, layout.entries)
+        i === nothing && return nothing
+        e = layout.entries[i]
+        e.transform === :identity && e.size == width || return nothing
+        stop === nothing || e.offset == stop + 1 || return nothing
+        start === nothing && (start = e.offset)
+        stop = e.offset + e.size - 1
+    end
+    start === nothing && return nothing
+    return :(view(unconstrained, $start:$stop))
 end
 
 # Reassemble split coefficient blocks: predictors whose layout holds
@@ -160,7 +229,6 @@ import .._ordinal_stage_obs, .._ordinal_stage_idx
 import ..linear_pk_read_locs, ..linear_pk_read_locs_auc
 import ..linear_pk_read_locs_over_subjects,
     ..linear_pk_read_locs_auc_over_subjects, ..SubjectScalar, ..SubjectSlice
-import .._centered_correlated_logpdf
 # Multivariate slice priors (`mv_slices.jl`): orientations, per-slice
 # arguments, simplex / ordered slice transforms and the slice densities.
 import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
@@ -237,6 +305,7 @@ function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
     count = 0
     function walk(node)
         node isa Expr || return node
+        _is_plate_column_expr(node) && return node
         if node.head in (:call, :ref, :.) && _contains_module_call(node) &&
                 _expr_value_symbols(node) ⊆ dataonly
             count += 1
@@ -272,7 +341,7 @@ function _predictor_statements(plan::StructuralPlan)
         if any(b -> b.kind === MonotonicTerm, shape.blocks)
             append!(terms, _mo_block_terms(plan, shape))
         elseif shape.width > 0
-            push!(terms, :($(design_name(pred.name)) * $(block_name(pred.name))))
+            push!(terms, :($(design_name(pred.name)) * $(_affine_block_name(pred))))
         end
         if any(b -> b.kind === OffsetTerm, shape.blocks)
             push!(terms, offset_name(pred.name))
@@ -379,34 +448,31 @@ _coef_coord(coef::Symbol, k::Int) = :(sum(view($coef, $k:$k)))
 # blocks keep the data-matrix × coefficient-slice matvec. Predictors
 # without `mo` keep the fused form above, untouched.
 function _mo_block_terms(plan::StructuralPlan, shape::DesignShape)
-    coef = block_name(shape.predictor)
+    pred = only(p for p in plan.predictors if p.name === shape.predictor)
+    coef = _affine_block_name(pred)
     terms = Any[]
     k = 1
     for b in shape.blocks
         if b.kind === InterceptTerm
-            push!(terms, Expr(:call, :.*, _signed_part(Expr(:call, :ones,
-                    _predictor_rows(plan, shape.predictor)), b),
+            push!(terms, Expr(:call, :.*, Expr(:call, :ones, _predictor_rows(plan,shape.predictor)),
                 _coef_coord(coef, k)))
             k += 1
         elseif b.kind === ContinuousTerm
-            push!(terms, :($(_signed_part(b.column, b)) .*
-                $(_coef_coord(coef, k))))
+            push!(terms, :($(b.column) .* $(_coef_coord(coef, k))))
             k += 1
         elseif b.kind === FactorTerm
             w = b.width
-            push!(terms, :($(_signed_part(_contrast_expr(b), b)) *
+            push!(terms, :($(_contrast_expr(b)) *
                 $(:(view($coef, $k:$(k + w - 1))))))
             k += w
         elseif b.kind === MatrixTerm
             w = b.width
-            push!(terms, :($(_signed_part(_matrix_block_expr(b,
-                    _predictor_rows(plan, shape.predictor)), b)) *
+            push!(terms, :($(_matrix_block_expr(b, _predictor_rows(plan,shape.predictor))) *
                 $(:(view($coef, $k:$(k + w - 1))))))
             k += w
         elseif b.kind === MonotonicTerm
             push!(terms,
-                :($(_signed_part(monotonic_name(b.column), b)) .*
-                    $(_coef_coord(coef, k))))
+                :($(monotonic_name(b.column)) .* $(_coef_coord(coef, k))))
             k += 1
         end
     end
@@ -514,7 +580,7 @@ function _hsgp_grouped_stmts(hb::HSGPBasis)
     K = only(hb.K)
     cols = Symbol[]
     for k in 1:K
-        lam_sqrt = sqrt((k * pi / (2.0 * L))^2)
+        lam_sqrt = sqrt(_hsgp_lambda(k, L))
         col = _hsgp_ax_name(id, 1, k)
         push!(stmts, :($col =
             $inv_sqrt_L .* sin.($lam_sqrt .* ($axis .- $mu .+ $L))))
@@ -545,7 +611,7 @@ function _hsgp_grouped_stmts(hb::HSGPBasis)
     sv = Symbol(:_ppl_hsgp_, id, :_sigma)
     push!(stmts, :($rv = $rho))
     push!(stmts, :($sv = $sigma))
-    lamrow = Expr(:hcat, ((k * pi / (2.0 * L))^2 for k in 1:K)...)
+    lamrow = Expr(:hcat, (_hsgp_lambda(k, L) for k in 1:K)...)
     SPD = _hsgp_S_name(id)
     push!(stmts, :($SPD = ($sv .* sqrt.($rv .* $_HSGP_SQRT2PI)) .*
         exp.(-0.25 .* ($rv .* $rv) .* $lamrow)))
@@ -568,7 +634,7 @@ function _hsgp_basis_stmts(hb::HSGPBasis)
         mu, L = Float64(mu), Float64(L)
         inv_sqrt_L = 1.0 / sqrt(L)
         for k in 1:hb.K[j]
-            lam_sqrt = sqrt((k * pi / (2.0 * L))^2)
+            lam_sqrt = sqrt(_hsgp_lambda(k, L))
             col = _hsgp_ax_name(id, j, k)
             push!(stmts, :($col =
                 $inv_sqrt_L .* sin.($lam_sqrt .* ($axis .- $mu .+ $L))))
@@ -606,7 +672,7 @@ function _hsgp_basis_stmts(hb::HSGPBasis)
     for (b, I) in enumerate(midcs)
         terms = Any[]
         for j in 1:d
-            lam = (I[j] * pi / (2.0 * hb.fits[j][2]))^2
+            lam = _hsgp_lambda(I[j], hb.fits[j][2])
             push!(terms, :($(rhos[j]) * $(rhos[j]) * $lam))
         end
         expsum = foldl((a, c) -> :($a + $c), terms)
@@ -995,27 +1061,12 @@ end
 # One varying draws block's direct `r` summand (no `b` node, the draws
 # stay implicit): the K² implicit-draws arm (this slice's columns
 # only, every K); mm draws take the weighted-gather arm (same geometry,
-# per-slot gathers); centered draws read their sampled `b_flat`.
+# per-slot gathers).
 function _varying_effect_expr(plan::StructuralPlan, pred::PredictorSpec,
         t::TermSpec)
     d, s = _slice_draws(plan, pred, t)
     d.mm !== nothing && return _varying_mm_effect_expr(plan, d, s)
-    d.kind === :centered_correlated && return _varying_centered_effect_expr(d,s)
     return _varying_corr_effect_expr(plan, d, s)
-end
-
-function _varying_centered_effect_expr(d::VaryingDraws,s::VaryingSlice)
-    b = _varying_corr_names(d)[3]
-    K = length(d.margins)
-    gidx = Symbol(:_ppl_gidx_,d.group)
-    parts = Any[]
-    for j in s.columns
-        idx = :($j .+ ($gidx .- 1) .* $K)
-        effect = Expr(:ref,b,idx)
-        z = d.margins[j].z
-        push!(parts,z.kind === :ones ? effect : :($(_varying_z_expr(z)) .* $effect))
-    end
-    return foldl((a,c)->:($a .+ $c),parts)
 end
 
 # One mm draws block's direct `r` summand (SB `multi_membership_*`
@@ -3284,11 +3335,65 @@ function _mixed_wide_block_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     return nothing
 end
 
+# Group compatible literal scalar priors as an evaluation optimization.
+# Declarations remain the owners of names, transforms and prior arguments.
+function _parameter_prior_groups(plan)
+    groups = Vector{SampledParameter}[]
+    for family in (:normal, :cauchy, :laplace, :logistic, :student_t)
+        ps = SampledParameter[p for p in plan.parameters
+            if p.family === family && p.support_override === nothing &&
+                all(v -> v isa Real, values(p.args))]
+        length(ps) > 1 && push!(groups, ps)
+    end
+    return groups
+end
+
+function _parameter_prior_input(ps, plan, layout)
+    names = [p.name for p in ps]
+    for pred in plan.predictors
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
+        terms = [t for (t, b) in zip(pred.terms, shape.blocks) if b.width > 0]
+        all(t -> _parameter_term(t) && t.options.sign == 1, terms) || continue
+        [t.options.parameter for t in terms] == names || continue
+        all(b -> b.width <= 1, shape.blocks) || continue
+        return _affine_block_name(pred)
+    end
+    view = _parameter_coordinate_view([(n, 1) for n in names], layout)
+    return view === nothing ? :([$(names...)]) : view
+end
+
+function _parameter_prior_statements!(stmts, terms, plan, layout)
+    grouped = Set{Symbol}()
+    for ps in _parameter_prior_groups(plan)
+        family = first(ps).family
+        _, li, si, ni = _COEF_SHAPES[family]
+        args = [collect(values(p.args)) for p in ps]
+        loc = Float64[a[li] for a in args]
+        sca = Float64[a[si] for a in args]
+        nus = ni == 0 ? fill(NaN, length(ps)) : Float64[a[ni] for a in args]
+        node = Symbol(:_ppl_prior_parameters_, family)
+        _append_coef_plate!(stmts, _parameter_prior_input(ps, plan, layout),
+            node, Symbol(node, :_pw), Symbol(node, :_mu), Symbol(node, :_sd),
+            Symbol(node, :_nu), loc, sca, nus, family)
+        push!(terms, node)
+        union!(grouped, (p.name for p in ps))
+    end
+    for p in plan.parameters
+        p.name in grouped && continue
+        node = Symbol(:_ppl_prior_, p.name)
+        push!(stmts, :($node::Float64 = $(_sampled_prior_expr(p))))
+        push!(terms, node)
+    end
+    return nothing
+end
+
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}())
     stmts = Expr[]
     terms = Any[]
     for pred in plan.predictors
+        pred = _legacy_predictor(pred)
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         shape.width == 0 && continue
@@ -3330,17 +3435,14 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         append!(stmts, _plate_sum_stmts(pw, node, Any[coef, mut, sdt], cell))
         push!(terms, node)
     end
-    for p in plan.parameters
-        node = Symbol(:_ppl_prior_, p.name)
-        push!(stmts, :($node::Float64 = $(_sampled_prior_expr(p))))
-        push!(terms, node)
-    end
+    _parameter_prior_statements!(stmts, terms, plan, layout)
     # GLM-object coefficient vectors: the same plate-prior shape as a
     # population-prior coefficient block, driven by the response matrix
     # columns (priors addressed by response label — validation pins
     # full coverage).
     for r in plan.responses
         _is_glm_family(r.family) || continue
+        _is_array_param(plan, r.glm_beta) && continue
         m = _find_matrix(plan, r.predictor)
         cols = Symbol[c for c in m.columns if c !== nothing]
         loc = Float64[]
@@ -3419,18 +3521,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(d))))
         push!(terms, lnode)
         _sd_prior_tau_stmts!(stmts, terms, d, tau)
-        if d.kind === :centered_correlated
-            K = length(d.margins)
-            lower = Symbol(:_ppl_centered_L_,d.suffix)
-            vals = Any[_rl_name(L,i,j) for i in 1:K for j in 1:i]
-            push!(stmts,:($lower = Float64[$(vals...)]))
-            node = Symbol(:_ppl_prior_,z)
-            push!(stmts,:($node::Float64 = _centered_correlated_logpdf($z,$tau,$lower)))
-            push!(terms,node)
-        else
-            _vector_prior_stmts!(stmts, terms, z, :normal,
-                (arg1 = 0, arg2 = 1), nothing)
-        end
+        _vector_prior_stmts!(stmts, terms, z, :normal,
+            (arg1 = 0, arg2 = 1), nothing)
     end
     # HSGP bases (SB `_sb_hsgp`/`_sb_hsgp_aniso`): the length scales and
     # marginal scale as scalar `lognormal(0, 1)` nodes plus the
@@ -3720,6 +3812,15 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals)
     ov === nothing && return nothing
     ov === :positive_stan && return nothing  # Stan kernel semantics
     if ov isa Tuple
+        if ov[1] === :lower
+            # `truncated(LogNormal(m, s), lo, Inf)`: `-log P(X > lo)` =
+            # `-log Φ((m - log(lo)) / s)`; nothing at `lo == 0`. A data
+            # name `lo` is a bound kernel argument.
+            lo = ov[2]
+            lo isa Real && lo == 0 && return nothing
+            m, s = argvals[1], argvals[2]
+            return :(-log(normal(-($m), $s).cdf(-log($lo))))
+        end
         (ov[1] === :upper || ov[1] === :interval_stan) && return nothing  # Stan kernel semantics
         ov[1] === :interval || throw(ContractValidationError(
             "[generator] tuple support override must be (:interval, lo, hi), " *
