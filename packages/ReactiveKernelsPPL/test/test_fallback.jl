@@ -187,8 +187,10 @@ end
     @testset "P3 / A2 non-centered intercept, inline and alias" begin
         _fb_check(_FB_NC_INLINE, (:y, :g), (z = [0.3, -0.9, 1.4],
             a = 0.2, sg = 0.7, sigma = 1.1), nc_want(:z))
-        _fb_check(_FB_NC_ALIAS, (:y, :g), (zg = [0.3, -0.9, 1.4],
-            a = 0.2, sg = 0.7, sigma = 1.1), nc_want(:zg))
+        # The alias reports the declared array `z`, as the inline spelling
+        # does: naming a subexpression never renames the draws.
+        _fb_check(_FB_NC_ALIAS, (:y, :g), (z = [0.3, -0.9, 1.4],
+            a = 0.2, sg = 0.7, sigma = 1.1), nc_want(:z))
     end
     @testset "Q5 reordered `z[g] .* sg`" begin
         _fb_check(quote
@@ -250,8 +252,8 @@ end
         end
         _fb_check(_FB_SLOPE_INLINE, (:y, :x, :g), (c = [0.3, -0.9, 1.4],
             a = 0.2, b = -0.4, sg = 0.7, sigma = 1.1), slope_want(:c))
-        _fb_check(_FB_SLOPE_ALIAS, (:y, :x, :g), (cg = [0.3, -0.9, 1.4],
-            a = 0.2, b = -0.4, sg = 0.7, sigma = 1.1), slope_want(:cg))
+        _fb_check(_FB_SLOPE_ALIAS, (:y, :x, :g), (c = [0.3, -0.9, 1.4],
+            a = 0.2, b = -0.4, sg = 0.7, sigma = 1.1), slope_want(:c))
     end
     hs_want(q) = _fb_normal_ll(q.a .+ (q.z * q.lam * q.tau) .* x,
         q.sigma) + logpdf(Normal(0, 5), q.a) +
@@ -456,14 +458,13 @@ end
         insert!(alias.args, length(alias.args), :(zg = zz[g]))
         insert!(alias.args, length(alias.args), :(mu = a .+ x .* (z * lam *
             tau) .+ sg .* zg .+ x1 .* phi[1]))
-        qa = merge(Base.structdiff(q, NamedTuple{(:zz,)}), (zg = q.zz,))
-        _fb_check(alias, (:y, :x, :x1, :g), qa, q -> _fb_normal_ll(q.a .+
-                x .* (q.z * q.lam * q.tau) .+ q.sg .* q.zg[g] .+
+        _fb_check(alias, (:y, :x, :x1, :g), q, q -> _fb_normal_ll(q.a .+
+                x .* (q.z * q.lam * q.tau) .+ q.sg .* q.zz[g] .+
                 x1 .* q.phi[1], q.sigma) + logpdf(Normal(0, 5), q.a) +
             logpdf(_fb_halfcauchy(1), q.lam) +
             logpdf(_fb_halfcauchy(1), q.tau) + logpdf(Normal(0, 1), q.z) +
             logpdf(_fb_halfnormal(1), q.sg) +
-            sum(logpdf.(Normal(0, 1), q.zg)) +
+            sum(logpdf.(Normal(0, 1), q.zz)) +
             logpdf(Dirichlet([1.0, 1.0]), q.phi) +
             logpdf(Exponential(1), q.sigma))
         nodes(e) = e isa Expr ? 1 + sum(nodes, e.args; init = 0) : 1

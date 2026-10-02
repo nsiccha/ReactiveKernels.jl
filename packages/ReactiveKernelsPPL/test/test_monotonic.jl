@@ -319,11 +319,12 @@ end
     @test shape.width == 2
     @test [b.kind for b in shape.blocks] == [InterceptTerm, MonotonicTerm]
     @test shape.blocks[2].labels == [:c]
-    # The mo beta rides the coefficient block, labeled by its column.
+    # The mo beta rides the coefficient block, labeled by its column (a
+    # hand-built plan names no coefficient, so it reports predictor labels).
     layout = assign_layout(bound)
     @test layout.total == 4
     @test coordinate_names(layout) ==
-        [:a, :b, :sigma, Symbol("s.1")]
+        [Symbol("mu.Intercept"), Symbol("mu.c"), :sigma, Symbol("s.1")]
     # mo1 contributes no design width and no coefficient.
     bound1 = bind_data(_mo_struct_plan(MonotonicSummandTerm), _mo_cols())
     shape1 = design_shape(bound1.predictors[1], bound1.columns;
