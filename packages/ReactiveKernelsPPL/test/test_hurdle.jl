@@ -64,7 +64,7 @@ _hur_cols() = Dict{Symbol,AbstractVector}(:y => copy(_HUR_Y), :x => copy(_HUR_X)
             end, (:y, :x))
         r = only(plan.responses)
         @test (r.family, r.scale) === (HurdlePoissonFam, :p_zero)
-        @test only(plan.parameters).family === :beta
+        @test only(p for p in plan.parameters if p.name === :p_zero).family === :beta
     end
     @testset "predictor-fed p_zero (hu submodel)" begin
         plan = lower_rkppl(quote
@@ -101,11 +101,11 @@ end
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 0.35)
             end, _hur_cols())
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _hur_posterior(kern, lay, q)
-        lam = exp.(q.eta[1] .+ q.eta[2] .* _HUR_X)
+        lam = exp.(q.a .+ q.b .* _HUR_X)
         want = sum(_hur_ref(y, l, 0.35) for (y, l) in zip(_HUR_Y, lam)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "Beta-sampled p_zero" begin
@@ -116,11 +116,11 @@ end
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p_zero)
             end, _hur_cols())
-        q = (eta = [0.5, -0.25], p_zero = 0.4)
+        q = (a = 0.5, b = -0.25, p_zero = 0.4)
         got = _hur_posterior(kern, lay, q)
-        lam = exp.(q.eta[1] .+ q.eta[2] .* _HUR_X)
+        lam = exp.(q.a .+ q.b .* _HUR_X)
         want = sum(_hur_ref(y, l, q.p_zero) for (y, l) in zip(_HUR_Y, lam)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(Beta(2.0, 2.0), q.p_zero) +
             logjac(lay, unconstrain(lay, q))
         @test got ≈ want rtol = 1e-12
@@ -135,13 +135,13 @@ end
                 hu = c .+ d .* x
                 y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
             end, _hur_cols())
-        q = (eta = [0.5, -0.25], hu = [0.1, 0.2])
+        q = (a = 0.5, b = -0.25, c = 0.1, d = 0.2)
         got = _hur_posterior(kern, lay, q)
-        lam = exp.(q.eta[1] .+ q.eta[2] .* _HUR_X)
-        p0 = 1 ./ (1 .+ exp.(-(q.hu[1] .+ q.hu[2] .* _HUR_X)))
+        lam = exp.(q.a .+ q.b .* _HUR_X)
+        p0 = 1 ./ (1 .+ exp.(-(q.c .+ q.d .* _HUR_X)))
         want = sum(_hur_ref(y, l, p) for (y, l, p) in zip(_HUR_Y, lam, p0)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
-            logpdf(Normal(0, 1), q.hu[1]) + logpdf(Normal(0, 1), q.hu[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+            logpdf(Normal(0, 1), q.c) + logpdf(Normal(0, 1), q.d)
         @test got ≈ want rtol = 1e-12
     end
     @testset "per-observation p_zero column" begin
@@ -153,12 +153,12 @@ end
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p0c)
             end, cols)
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _hur_posterior(kern, lay, q)
-        lam = exp.(q.eta[1] .+ q.eta[2] .* _HUR_X)
+        lam = exp.(q.a .+ q.b .* _HUR_X)
         want = sum(_hur_ref(y, l, p)
             for (y, l, p) in zip(_HUR_Y, lam, cols[:p0c])) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "degenerate endpoints" begin
@@ -171,14 +171,14 @@ end
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 0.0)
             end, _hur_cols())
-        @test _hur_posterior(kern0, lay0, (eta = [0.5, -0.25],)) === -Inf
+        @test _hur_posterior(kern0, lay0, (a = 0.5, b = -0.25,)) === -Inf
         _, _, kern1, lay1 = _hur_query(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 1.0)
             end, _hur_cols())
-        @test _hur_posterior(kern1, lay1, (eta = [0.5, -0.25],)) === -Inf
+        @test _hur_posterior(kern1, lay1, (a = 0.5, b = -0.25,)) === -Inf
         allzero = Dict{Symbol,AbstractVector}(:y => zeros(Int, 6),
             :x => copy(_HUR_X))
         _, _, kernz, layz = _hur_query(quote
@@ -187,7 +187,7 @@ end
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 1.0)
             end, allzero)
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         @test _hur_posterior(kernz, layz, q) ≈
             logpdf(Normal(0, 1), 0.5) + logpdf(Normal(0, 1), -0.25)
     end
@@ -215,7 +215,7 @@ end
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), 0.35)
-            end, _hur_cols(), (eta = [0.5, -0.25],))
+            end, _hur_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "Beta-sampled p_zero" begin
         _hur_enzyme_check(quote
@@ -224,7 +224,7 @@ end
                 p_zero ~ Beta(2.0, 2.0)
                 eta = a .+ b .* x
                 y .~ HurdlePoisson.(exp.(eta), p_zero)
-            end, _hur_cols(), (eta = [0.5, -0.25], p_zero = 0.4))
+            end, _hur_cols(), (a = 0.5, b = -0.25, p_zero = 0.4))
     end
     @testset "predictor-fed p_zero" begin
         _hur_enzyme_check(quote
@@ -235,7 +235,7 @@ end
                 eta = a .+ b .* x
                 hu = c .+ d .* x
                 y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
-            end, _hur_cols(), (eta = [0.5, -0.25], hu = [0.1, 0.2]))
+            end, _hur_cols(), (a = 0.5, b = -0.25, c = 0.1, d = 0.2))
     end
 end
 
@@ -390,18 +390,18 @@ _hur_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _hur_query(prog, _hur_sb_cols())
         names = coordinate_names(lay)
-        u = _hur_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25, Symbol("hu.Intercept") => 0.1,
-            Symbol("hu.x") => 0.2])
+        u = _hur_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :e => 0.1,
+            :f => 0.2])
         @test abs(Base.invokelatest(kern, u) - (-162.24640396336227)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _hur_sb_vec(names, [Symbol("eta.Intercept") => -4.126658097925048,
-            Symbol("eta.x") => 50.24468439856483,
-            Symbol("hu.Intercept") => -23.01367609421922,
-            Symbol("hu.x") => 1.6109183772172553])
+        want = _hur_sb_vec(names, [:a => -4.126658097925048,
+            :b => 50.24468439856483,
+            :e => -23.01367609421922,
+            :f => 1.6109183772172553])
         @test maximum(abs.(g .- want)) < 1e-10
     end
     @testset "H2 hurdle_hu1" begin
@@ -418,16 +418,16 @@ _hur_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _hur_query(prog, _hur_sb_cols())
         names = coordinate_names(lay)
-        u = _hur_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25, Symbol("hu.Intercept") => 0.1])
+        u = _hur_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :e => 0.1])
         @test abs(Base.invokelatest(kern, u) - (-162.0618341297221)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _hur_sb_vec(names, [Symbol("eta.Intercept") => -4.126658097925048,
-            Symbol("eta.x") => 50.24468439856483,
-            Symbol("hu.Intercept") => -23.02333499831524])
+        want = _hur_sb_vec(names, [:a => -4.126658097925048,
+            :b => 50.24468439856483,
+            :e => -23.02333499831524])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end

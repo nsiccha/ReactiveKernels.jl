@@ -430,7 +430,7 @@ end
     # mu_coef(a) + beta + sigmad + sigma + z[1..4]
     @test built.layout.total == 4 + (length(ydata) - 1)
     @test coordinate_names(built.layout)[1:4] ==
-        [Symbol("mu.Intercept"), :beta, :sigmad, :sigma]
+        [:a, :beta, :sigmad, :sigma]
     for u in ([0.1, 0.3, -0.5, -0.4, 0.2, -0.1, 0.4, 0.0],
               [-0.2, 0.6, 0.1, 0.3, -0.4, 0.2, -0.3, 0.1])
         @test _query(built.spec, plan, :posterior, u) ≈ _dar_oracle(u, ydata)
@@ -476,7 +476,7 @@ _dar_normalizers(bloc, bsca, ssca) =
         built = build_kernel(plan)
         @test built.layout.total == 9
         @test coordinate_names(built.layout)[1:4] ==
-            [Symbol("mu.Intercept"), :beta, :sigmad, :s]
+            [:a, :beta, :sigmad, :s]
         post = _query(built.spec, plan, :posterior, u)
         @test post ≈ _dar_oracle(u, ydata)
         @test abs(post - (-22.57116529873909 +
@@ -505,7 +505,7 @@ _dar_normalizers(bloc, bsca, ssca) =
         built = build_kernel(plan)
         @test built.layout.total == 9
         @test coordinate_names(built.layout)[1:4] ==
-            [Symbol("mu.Intercept"), :beta, :sigmad, :s]
+            [:a, :beta, :sigmad, :s]
         post = _query(built.spec, plan, :posterior, u)
         @test post ≈ _dar_oracle(u, ydata;
             beta_prior = truncated(Normal(0.6, 0.1), 0, 1),

@@ -453,7 +453,7 @@ end
             mix = MixtureModel([Normal(q.mu1, q.sigma), Normal(q.mu2, q.sigma)],
                 [0.4, 0.6])
             want = sum(logpdf.(mix, cols[:y])) +
-                logpdf(Normal(-2, 0.1), q.mu1) +
+                logpdf(Normal(-2, 0.1), (q.a1, q.b1)) +
                 logpdf(Normal(2, 0.1), q.mu2) +
                 logpdf(Exponential(1.0), q.sigma) + log(q.sigma)
             @test got ≈ want rtol = 1e-12
@@ -473,14 +473,14 @@ end
         cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 0.5, -1.0],
             :x => x)
         _, _, kern, lay = _mix_query(prog, cols)
-        q = (mu1 = [0.5, -0.25], mu2 = 1.0, sigma = 1.5)
+        q = (a1 = 0.5, b1 = -0.25, mu2 = 1.0, sigma = 1.5)
         got = _mix_posterior(kern, lay, q)
-        eta = q.mu1[1] .+ q.mu1[2] .* x
+        eta = q.a1 .+ q.b1 .* x
         ll = sum(zip(cols[:y], eta)) do (yi, etai)
             _mlogaddexp(log(0.3) + logpdf(Normal(etai, q.sigma), yi),
                 log(0.7) + logpdf(Normal(q.mu2, q.sigma), yi))
         end
-        want = ll + sum(logpdf.(Normal(0, 1), q.mu1)) +
+        want = ll + sum(logpdf.(Normal(0, 1), (q.a1, q.b1))) +
             logpdf(Normal(0, 5), q.mu2) +
             logpdf(Exponential(1.0), q.sigma) + log(q.sigma)
         @test got ≈ want rtol = 1e-12
@@ -497,15 +497,15 @@ end
             x = [0.5, -1.0, 1.5, 0.0]
             cols = Dict{Symbol,AbstractVector}(:y => ycol, :x => x)
             _, _, kern, lay = _mix_query(prog, cols)
-            q = (eta = [0.2, -0.4],)
+            q = (a = 0.2, b = -0.4,)
             got = _mix_posterior(kern, lay, q)
-            eta = q.eta[1] .+ q.eta[2] .* x
+            eta = q.a .+ q.b .* x
             p1 = 1 ./ (1 .+ exp.(-eta))
             ll = sum(zip(ycol, p1)) do (yi, pi)
                 _mlogaddexp(log(0.5) + logpdf(Bernoulli(pi), yi),
                     log(0.5) + logpdf(Bernoulli(0.7), yi))
             end
-            want = ll + sum(logpdf.(Normal(0, 1), q.eta))
+            want = ll + sum(logpdf.(Normal(0, 1), (q.a, q.b)))
             @test got ≈ want rtol = 1e-12
         end
     end
@@ -537,15 +537,15 @@ end
         cols = Dict{Symbol,AbstractVector}(:y => [3, 7, 5, 8],
             :x => x, :n => [10, 10, 10, 10])
         _, _, kern, lay = _mix_query(prog, cols)
-        q = (eta = [0.2, -0.4],)
+        q = (a = 0.2, b = -0.4,)
         got = _mix_posterior(kern, lay, q)
-        eta = q.eta[1] .+ q.eta[2] .* x
+        eta = q.a .+ q.b .* x
         p1 = 1 ./ (1 .+ exp.(-eta))
         ll = sum(zip(cols[:y], p1)) do (yi, pi)
             _mlogaddexp(log(0.6) + logpdf(Binomial(10, pi), yi),
                 log(0.4) + logpdf(Binomial(10, 0.25), yi))
         end
-        want = ll + sum(logpdf.(Normal(0, 1), q.eta))
+        want = ll + sum(logpdf.(Normal(0, 1), (q.a, q.b)))
         @test got ≈ want rtol = 1e-12
     end
     @testset "nb2 predictor + param means" begin
@@ -562,15 +562,15 @@ end
         x = [0.5, -1.0, 1.5, 0.0]
         cols = Dict{Symbol,AbstractVector}(:y => [2, 0, 4, 1], :x => x)
         _, _, kern, lay = _mix_query(prog, cols)
-        q = (eta = [0.3, 0.1], mu2 = 2.0, phi1 = 1.5, phi2 = 0.5)
+        q = (a = 0.3, b = 0.1, mu2 = 2.0, phi1 = 1.5, phi2 = 0.5)
         got = _mix_posterior(kern, lay, q)
-        mu1 = exp.(q.eta[1] .+ q.eta[2] .* x)
+        mu1 = exp.(q.a .+ q.b .* x)
         nb(mu, phi, y) = logpdf(NegativeBinomial(phi, phi / (phi + mu)), y)
         ll = sum(zip(cols[:y], mu1)) do (yi, m1)
             _mlogaddexp(log(0.5) + nb(m1, q.phi1, yi),
                 log(0.5) + nb(q.mu2, q.phi2, yi))
         end
-        want = ll + sum(logpdf.(Normal(0, 1), q.eta)) +
+        want = ll + sum(logpdf.(Normal(0, 1), (q.a, q.b))) +
             logpdf(Gamma(2, 1), q.mu2) + log(q.mu2) +
             logpdf(Exponential(1.0), q.phi1) + log(q.phi1) +
             logpdf(Exponential(1.0), q.phi2) + log(q.phi2)
@@ -590,14 +590,14 @@ end
         cols = Dict{Symbol,AbstractVector}(:y => [1.5, 0.5, 2.0, 1.0],
             :x => x)
         _, _, kern, lay = _mix_query(prog, cols)
-        q = (eta = [0.2, -0.1], alpha = 2.0, mu2 = 1.5)
+        q = (a = 0.2, b = -0.1, alpha = 2.0, mu2 = 1.5)
         got = _mix_posterior(kern, lay, q)
-        mu1 = exp.(q.eta[1] .+ q.eta[2] .* x)
+        mu1 = exp.(q.a .+ q.b .* x)
         ll = sum(zip(cols[:y], mu1)) do (yi, m1)
             _mlogaddexp(log(0.5) + logpdf(Gamma(q.alpha, m1 / q.alpha), yi),
                 log(0.5) + logpdf(Gamma(q.alpha, q.mu2 / q.alpha), yi))
         end
-        want = ll + sum(logpdf.(Normal(0, 1), q.eta)) +
+        want = ll + sum(logpdf.(Normal(0, 1), (q.a, q.b))) +
             logpdf(Exponential(1.0), q.alpha) + log(q.alpha) +
             logpdf(Gamma(2, 1), q.mu2) + log(q.mu2)
         @test got ≈ want rtol = 1e-12
@@ -616,15 +616,15 @@ end
         cols = Dict{Symbol,AbstractVector}(:y => [0.2, 0.8, 0.4, 0.6],
             :x => x)
         _, _, kern, lay = _mix_query(prog, cols)
-        q = (eta = [0.2, -0.4], kappa = 5.0)
+        q = (a = 0.2, b = -0.4, kappa = 5.0)
         got = _mix_posterior(kern, lay, q)
-        mu1 = 1 ./ (1 .+ exp.(-(q.eta[1] .+ q.eta[2] .* x)))
+        mu1 = 1 ./ (1 .+ exp.(-(q.a .+ q.b .* x)))
         ll = sum(zip(cols[:y], mu1)) do (yi, m1)
             _mlogaddexp(log(0.5) + logpdf(Beta(m1 * q.kappa,
                         (1 - m1) * q.kappa), yi),
                 log(0.5) + logpdf(Beta(0.7 * q.kappa, 0.3 * q.kappa), yi))
         end
-        want = ll + sum(logpdf.(Normal(0, 1), q.eta)) +
+        want = ll + sum(logpdf.(Normal(0, 1), (q.a, q.b))) +
             logpdf(Exponential(1.0), q.kappa) + log(q.kappa)
         @test got ≈ want rtol = 1e-12
     end
@@ -639,7 +639,7 @@ end
         q = (mu1 = -2.0, sigma = 0.3)
         got = _mix_posterior(kern, lay, q)
         want = sum(logpdf.(Normal(q.mu1, q.sigma), cols[:y])) +
-            logpdf(Normal(-2, 0.1), q.mu1) +
+            logpdf(Normal(-2, 0.1), (q.a1, q.b1)) +
             logpdf(Exponential(1.0), q.sigma) + log(q.sigma)
         @test got ≈ want rtol = 1e-12
     end
@@ -681,7 +681,7 @@ end
                 y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                     Bernoulli.(0.7)], [0.5, 0.5])
             end, Dict{Symbol,AbstractVector}(:y => [0, 1, 1, 0], :x => x),
-            (eta = [0.2, -0.4],))
+            (a = 0.2, b = -0.4,))
     end
     @testset "poisson" begin
         _mix_enzyme_check(quote
@@ -699,7 +699,7 @@ end
                 y .~ MixtureModel.([Binomial.(n, logistic.(eta)),
                     Binomial.(n, 0.25)], [0.6, 0.4])
             end, Dict{Symbol,AbstractVector}(:y => [3, 7, 5, 8], :x => x,
-                :n => [10, 10, 10, 10]), (eta = [0.2, -0.4],))
+                :n => [10, 10, 10, 10]), (a = 0.2, b = -0.4,))
     end
     @testset "nb2" begin
         _mix_enzyme_check(quote
@@ -712,7 +712,7 @@ end
                 y .~ MixtureModel.([NegativeBinomial2.(exp.(eta), phi1),
                     NegativeBinomial2.(mu2, phi2)], [0.5, 0.5])
             end, Dict{Symbol,AbstractVector}(:y => [2, 0, 4, 1], :x => x),
-            (eta = [0.3, 0.1], mu2 = 2.0, phi1 = 1.5, phi2 = 0.5))
+            (a = 0.3, b = 0.1, mu2 = 2.0, phi1 = 1.5, phi2 = 0.5))
     end
     @testset "gamma" begin
         _mix_enzyme_check(quote
@@ -724,7 +724,7 @@ end
                 y .~ MixtureModel.([Gamma.(alpha, exp.(eta) ./ alpha),
                     Gamma.(alpha, mu2 ./ alpha)], [0.5, 0.5])
             end, Dict{Symbol,AbstractVector}(:y => [1.5, 0.5, 2.0, 1.0],
-                :x => x), (eta = [0.2, -0.1], alpha = 2.0, mu2 = 1.5))
+                :x => x), (a = 0.2, b = -0.1, alpha = 2.0, mu2 = 1.5))
     end
     @testset "beta" begin
         _mix_enzyme_check(quote
@@ -736,7 +736,7 @@ end
                         (1 .- logistic.(eta)) .* kappa),
                     Beta.(0.7 .* kappa, (1 .- 0.7) .* kappa)], [0.5, 0.5])
             end, Dict{Symbol,AbstractVector}(:y => [0.2, 0.8, 0.4, 0.6],
-                :x => x), (eta = [0.2, -0.4], kappa = 5.0))
+                :x => x), (a = 0.2, b = -0.4, kappa = 5.0))
     end
     @testset "simplex weights" begin
         _mix_enzyme_check(quote
@@ -908,7 +908,7 @@ _mix_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
             Dict{Symbol,AbstractVector}(:y => [-2.0, -1.8, 1.9, 2.2]))
         names = coordinate_names(lay)
         u = _mix_sb_vec(names, [:mu1 => -2.0, :mu2 => 2.0,
-            Symbol("sigma.Intercept") => log(0.3)])
+            :c => log(0.3)])
         @test abs(Base.invokelatest(kern, u) - (-1.0905162971993954)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
@@ -916,7 +916,7 @@ _mix_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         @test all(isfinite, g)
         want = _mix_sb_vec(names, [:mu1 => 2.222222222222222,
             :mu2 => 1.1111111111111123,
-            Symbol("sigma.Intercept") => -1.796027195674063])
+            :c => -1.796027195674063])
         @test maximum(abs.(g .- want)) < 1e-10
     end
     @testset "poisson count leg" begin

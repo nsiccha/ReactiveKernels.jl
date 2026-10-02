@@ -62,12 +62,12 @@ end
             eta = a .+ b .* x
             y .~ NegativeBinomial.(exp.(eta), pc)
         end, cols)
-    q = (eta = [0.5, -0.25],)
+    q = (a = 0.5, b = -0.25,)
     got = _nb1_posterior(kern, lay, q)
-    rr = exp.(q.eta[1] .+ q.eta[2] .* _NB1_X)
+    rr = exp.(q.a .+ q.b .* _NB1_X)
     want = sum(logpdf(NegativeBinomial(v, p), y)
         for (y, v, p) in zip(_NB1_Y, rr, cols[:pc])) +
-        logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+        logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
     @test got ≈ want rtol = 1e-12
 end
 
@@ -75,13 +75,13 @@ end
     # B1 probe shape: value parity vs the Distributions.jl oracle at a
     # constrained probe (all-Normal, so constrained == unconstrained).
     _, _, kern, lay = _nb1_query(_b1_prog(), _b1_cols())
-    q = (eta = [0.2, -0.1], hu = [-0.5, 0.3])
+    q = (a = 0.2, b = -0.1, e = -0.5, f = 0.3)
     got = _nb1_posterior(kern, lay, q)
-    rr = exp.(q.eta[1] .+ q.eta[2] .* _B1_X)
-    pp = 1 ./ (1 .+ exp.(-(q.hu[1] .+ q.hu[2] .* _B1_Z)))
+    rr = exp.(q.a .+ q.b .* _B1_X)
+    pp = 1 ./ (1 .+ exp.(-(q.e .+ q.f .* _B1_Z)))
     want = sum(logpdf(NegativeBinomial(v, p), y)
         for (y, v, p) in zip(_B1_C, rr, pp)) +
-        sum(logpdf(Normal(0, 1), t) for t in (q.eta..., q.hu...))
+        sum(logpdf(Normal(0, 1), t) for t in (q.a, q.b, q.e, q.f))
     @test got ≈ want rtol = 1e-12
 end
 
@@ -95,7 +95,7 @@ end
                 eta = a .+ b .* x
                 y .~ NegativeBinomial.(exp.(eta), $p)
             end, _nb1_cols())
-        v = _nb1_posterior(kern, lay, (eta = [0.5, -0.25],))
+        v = _nb1_posterior(kern, lay, (a = 0.5, b = -0.25,))
         @test v === -Inf
         @test !isnan(v)
     end
@@ -125,7 +125,7 @@ end
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ NegativeBinomial.(exp.(eta), pc)
-            end, cols, (eta = [0.5, -0.25],))
+            end, cols, (a = 0.5, b = -0.25,))
     end
     @testset "Beta-sampled p" begin
         _nb1_enzyme_check(quote
@@ -134,11 +134,11 @@ end
                 p ~ Beta(2.0, 2.0)
                 eta = a .+ b .* x
                 y .~ NegativeBinomial.(exp.(eta), p)
-            end, _nb1_cols(), (eta = [0.5, -0.25], p = 0.4))
+            end, _nb1_cols(), (a = 0.5, b = -0.25, p = 0.4))
     end
     @testset "modeled p (B1)" begin
         _nb1_enzyme_check(_b1_prog(), _b1_cols(),
-            (eta = [0.2, -0.1], hu = [-0.5, 0.3]))
+            (a = 0.2, b = -0.1, e = -0.5, f = 0.3))
     end
 end
 
@@ -287,15 +287,15 @@ _nb1_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _nb1_query(prog, cols)
         names = coordinate_names(lay)
-        u = _nb1_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25, :p => -0.8472978603872036])
+        u = _nb1_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :p => -0.8472978603872036])
         @test abs(Base.invokelatest(kern, u) - (-213.91078632350118)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _nb1_sb_vec(names, [Symbol("eta.Intercept") => -73.29459252387821,
-            Symbol("eta.x") => 33.857843540951656,
+        want = _nb1_sb_vec(names, [:a => -73.29459252387821,
+            :b => 33.857843540951656,
             :p => 59.39544975853501])
         @test maximum(abs.(g .- want)) < 1e-10
     end
@@ -311,15 +311,15 @@ _nb1_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _nb1_query(prog, cols)
         names = coordinate_names(lay)
-        u = _nb1_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25])
+        u = _nb1_sb_vec(names, [:a => 0.5,
+            :b => -0.25])
         @test abs(Base.invokelatest(kern, u) - (-194.73341045936672)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _nb1_sb_vec(names, [Symbol("eta.Intercept") => -24.308315361938934,
-            Symbol("eta.x") => 21.08901738421236])
+        want = _nb1_sb_vec(names, [:a => -24.308315361938934,
+            :b => 21.08901738421236])
         @test maximum(abs.(g .- want)) < 1e-10
     end
     @testset "B1 modeled p" begin
@@ -337,18 +337,18 @@ _nb1_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         # u = [0.2, -0.1, -0.5, 0.3].
         bound, built, kern, lay = _nb1_query(_b1_prog(), _b1_cols())
         names = coordinate_names(lay)
-        u = _nb1_sb_vec(names, [Symbol("eta.Intercept") => 0.2,
-            Symbol("eta.x") => -0.1, Symbol("hu.Intercept") => -0.5,
-            Symbol("hu.z") => 0.3])
+        u = _nb1_sb_vec(names, [:a => 0.2,
+            :b => -0.1, :e => -0.5,
+            :f => 0.3])
         @test abs(Base.invokelatest(kern, u) - (-17.21077676236189)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _nb1_sb_vec(names, [Symbol("eta.Intercept") => 3.2359990802629035,
-            Symbol("eta.x") => 3.8226220328762897,
-            Symbol("hu.Intercept") => -1.6053435570340273,
-            Symbol("hu.z") => -0.18482410804380967])
+        want = _nb1_sb_vec(names, [:a => 3.2359990802629035,
+            :b => 3.8226220328762897,
+            :e => -1.6053435570340273,
+            :f => -0.18482410804380967])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end

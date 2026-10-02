@@ -729,8 +729,8 @@ end
         b, bpr = _mm_k1_draws(nt, "mm__g1__g2")
         r = _mm_ref_r([_MM_G1, _MM_G2],
             [fill(0.5, 4), fill(0.5, 4)], b, ones(4, 1))
-        ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, 1.0), _MM_Y))
-        pr = logpdf(Normal(0, 5), nt.mu[1]) + bpr
+        ll = sum(logpdf.(Normal.(nt.a .+ r, 1.0), _MM_Y))
+        pr = logpdf(Normal(0, 5), nt.a) + bpr
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
         @test _query(built.spec, bound, :prior, u) ≈ pr
         @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2]
@@ -750,8 +750,8 @@ end
         tot = _MM_W1 .+ _MM_W2
         r = _mm_ref_r([_MM_G1, _MM_G2], [_MM_W1 ./ tot, _MM_W2 ./ tot],
             b, ones(4, 1))
-        ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, 1.0), _MM_Y))
-        pr = logpdf(Normal(0, 5), nt.mu[1]) + bpr
+        ll = sum(logpdf.(Normal.(nt.a .+ r, 1.0), _MM_Y))
+        pr = logpdf(Normal(0, 5), nt.a) + bpr
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
         @test _query(built.spec, bound, :prior, u) ≈ pr
         @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2]
@@ -770,8 +770,8 @@ end
         nt = constrain(lay, u)
         b, bpr = _mm_k1_draws(nt, "mm__g1__g2__w__w1__w2__raw")
         r = _mm_ref_r([_MM_G1, _MM_G2], [_MM_W1, _MM_W2], b, ones(4, 1))
-        ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, 1.0), _MM_Y))
-        pr = logpdf(Normal(0, 5), nt.mu[1]) + bpr
+        ll = sum(logpdf.(Normal.(nt.a .+ r, 1.0), _MM_Y))
+        pr = logpdf(Normal(0, 5), nt.a) + bpr
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
         @test _query(built.spec, bound, :prior, u) ≈ pr
         @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2]
@@ -801,8 +801,8 @@ end
         tot = _MM_W1 .+ _MM_W2
         r = _mm_ref_r([_MM_G1, _MM_G2], [_MM_W1 ./ tot, _MM_W2 ./ tot],
             b, Z)
-        ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, 1.0), _MM_Y))
-        pr = logpdf(Normal(0, 5), nt.mu[1]) + lkj_logconst(2, 1.0) +
+        ll = sum(logpdf.(Normal.(nt.a .+ r, 1.0), _MM_Y))
+        pr = logpdf(Normal(0, 5), nt.a) + lkj_logconst(2, 1.0) +
             sum(logpdf.(Normal(0, 1), tau)) +
             sum(logpdf.(Normal(0, 1), zf))
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
@@ -832,8 +832,8 @@ end
         b = Matrix((Diagonal(tau) * L * reshape(zf, 2, 3))')
         Z = hcat(ones(4), _MM_X)
         r = _mm_ref_r([_MM_G1, _MM_G2], [_MM_W1, _MM_W2], b, Z)
-        ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, 1.0), _MM_Y))
-        pr = logpdf(Normal(0, 5), nt.mu[1]) + lkj_logconst(2, 1.0) +
+        ll = sum(logpdf.(Normal.(nt.a .+ r, 1.0), _MM_Y))
+        pr = logpdf(Normal(0, 5), nt.a) + lkj_logconst(2, 1.0) +
             sum(logpdf.(Normal(0, 1), tau)) +
             sum(logpdf.(Normal(0, 1), zf))
         @test _query(built.spec, bound, :likelihood, u) ≈ ll
@@ -865,8 +865,8 @@ end
     b = reshape(tau[1] .* zf, 3, 1)
     Z = reshape(_MM_X, 4, 1)
     r = _mm_ref_r([_MM_G1, _MM_G2], [fill(0.5, 4), fill(0.5, 4)], b, Z)
-    ll = sum(logpdf.(Normal.(nt.mu[1] .+ r, 1.0), _MM_Y))
-    pr = logpdf(Normal(0, 5), nt.mu[1]) + 0.0 +
+    ll = sum(logpdf.(Normal.(nt.a .+ r, 1.0), _MM_Y))
+    pr = logpdf(Normal(0, 5), nt.a) + 0.0 +
         sum(logpdf.(Normal(0, 1), tau)) + sum(logpdf.(Normal(0, 1), zf))
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     @test _query(built.spec, bound, :prior, u) ≈ pr
@@ -1213,7 +1213,7 @@ end
 
 @testset "SB parity M1 mm-equal" begin
     sfx = "mm__g1__g2"
-    pairs = [:mu => 1:1, Symbol("tau_", sfx) => 2:2,
+    pairs = [:a => 1:1, Symbol("tau_", sfx) => 2:2,
         Symbol("z_flat_", sfx) => 3:5, :sigma => 6:6]
     _mm_sb_check(quote
             a ~ Normal(0, 5)
@@ -1230,7 +1230,7 @@ end
 
 @testset "SB parity M5 mm-weighted" begin
     sfx = "mm__g1__g2__w__w1__w2"
-    pairs = [:mu => 1:1, Symbol("tau_", sfx) => 2:2,
+    pairs = [:a => 1:1, Symbol("tau_", sfx) => 2:2,
         Symbol("z_flat_", sfx) => 3:5, :sigma => 6:6]
     _mm_sb_check(quote
             a ~ Normal(0, 5)
@@ -1247,7 +1247,7 @@ end
 
 @testset "SB parity M3 mm-raw" begin
     sfx = "mm__g1__g2__w__w1__w2__raw"
-    pairs = [:mu => 1:1, Symbol("tau_", sfx) => 2:2,
+    pairs = [:a => 1:1, Symbol("tau_", sfx) => 2:2,
         Symbol("z_flat_", sfx) => 3:5, :sigma => 6:6]
     _mm_sb_check(quote
             a ~ Normal(0, 5)
@@ -1265,7 +1265,7 @@ end
 
 @testset "SB parity M2 mm-corr" begin
     sfx = "mm__g1__g2__w__w1__w2"
-    pairs = [:mu => 1:1, Symbol("L_", sfx) => 2:2,
+    pairs = [:a => 1:1, Symbol("L_", sfx) => 2:2,
         Symbol("tau_", sfx) => 3:4, Symbol("z_flat_", sfx) => 5:10,
         :sigma => 11:11]
     _mm_sb_check(quote
@@ -1284,7 +1284,7 @@ end
 
 @testset "SB parity M4 mm-slope" begin
     sfx = "mm__g1__g2__w__w1__w2"
-    pairs = [:mu => 1:1, Symbol("tau_", sfx) => 2:2,
+    pairs = [:a => 1:1, Symbol("tau_", sfx) => 2:2,
         Symbol("z_flat_", sfx) => 3:5, :sigma => 6:6]
     _mm_sb_check(quote
             a ~ Normal(0, 5)
@@ -1299,7 +1299,7 @@ end
 end
 
 @testset "SB parity S2 gr-int" begin
-    pairs = [:mu => 1:1, :tau_g_s1 => 2:2, :tau_g_s2 => 3:3,
+    pairs = [:a => 1:1, :tau_g_s1 => 2:2, :tau_g_s2 => 3:3,
         :z_flat_g => 4:7, :sigma => 8:8]
     _mm_sb_check(quote
             a ~ Normal(0, 5)
@@ -1315,7 +1315,7 @@ end
 end
 
 @testset "SB parity S1 gr-corr" begin
-    pairs = [:mu => 1:1, :L_g_s1 => 2:2, :L_g_s2 => 3:3,
+    pairs = [:a => 1:1, :L_g_s1 => 2:2, :L_g_s2 => 3:3,
         :tau_g_s1 => 4:5, :tau_g_s2 => 6:7, :z_flat_g => 8:15,
         :sigma => 16:16]
     _mm_sb_check(quote

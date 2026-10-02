@@ -158,14 +158,14 @@ end
                 prop .~ Beta.(logistic.(mu) .* exp.(lk),
                     (1 .- logistic.(mu)) .* exp.(lk))
             end, _bk_cols())
-        q = (mu = [0.2, -0.1], lk = [0.3, 0.15])
+        q = (a = 0.2, b = -0.1, c = 0.3, d = 0.15)
         got = _bk_posterior(kern, lay, q)
-        eta = q.mu[1] .+ q.mu[2] .* _BK_X
+        eta = q.a .+ q.b .* _BK_X
         mu = 1 ./ (1 .+ exp.(-eta))
-        kap = exp.(q.lk[1] .+ q.lk[2] .* _BK_Z)
+        kap = exp.(q.c .+ q.d .* _BK_Z)
         want = sum(_bk_ref(y, m, k)
             for (y, m, k) in zip(_BK_PROP, mu, kap)) +
-            sum(logpdf.(Normal(0, 1), q.mu)) + sum(logpdf.(Normal(0, 1), q.lk))
+            sum(logpdf.(Normal(0, 1), (q.a, q.b))) + sum(logpdf.(Normal(0, 1), (q.c, q.d)))
         @test got ≈ want rtol = 1e-12
     end
     @testset "intercept-only log-kappa submodel" begin
@@ -178,13 +178,13 @@ end
                 prop .~ Beta.(logistic.(mu) .* exp.(lk),
                     (1 .- logistic.(mu)) .* exp.(lk))
             end, _bk_cols())
-        q = (mu = [0.2, -0.1], lk = [0.3])
+        q = (a = 0.2, b = -0.1, c = 0.3)
         got = _bk_posterior(kern, lay, q)
-        eta = q.mu[1] .+ q.mu[2] .* _BK_X
+        eta = q.a .+ q.b .* _BK_X
         mu = 1 ./ (1 .+ exp.(-eta))
-        kap = exp(q.lk[1])
+        kap = exp(q.c)
         want = sum(_bk_ref(y, m, kap) for (y, m) in zip(_BK_PROP, mu)) +
-            sum(logpdf.(Normal(0, 1), q.mu)) + logpdf(Normal(0, 1), q.lk[1])
+            sum(logpdf.(Normal(0, 1), (q.a, q.b))) + logpdf(Normal(0, 1), q.c)
         @test got ≈ want rtol = 1e-12
     end
     @testset "literal kappa unchanged" begin
@@ -195,12 +195,12 @@ end
                 prop .~ Beta.(logistic.(mu) .* 4.0,
                     (1 .- logistic.(mu)) .* 4.0)
             end, _bk_cols())
-        q = (mu = [0.2, -0.1],)
+        q = (a = 0.2, b = -0.1,)
         got = _bk_posterior(kern, lay, q)
-        eta = q.mu[1] .+ q.mu[2] .* _BK_X
+        eta = q.a .+ q.b .* _BK_X
         mu = 1 ./ (1 .+ exp.(-eta))
         want = sum(_bk_ref(y, m, 4.0) for (y, m) in zip(_BK_PROP, mu)) +
-            sum(logpdf.(Normal(0, 1), q.mu))
+            sum(logpdf.(Normal(0, 1), (q.a, q.b)))
         @test got ≈ want rtol = 1e-12
     end
     @testset "shared mixture-component kappa predictor" begin
@@ -216,16 +216,16 @@ end
                     Beta.(0.7 .* exp.(lk), (1 .- 0.7) .* exp.(lk))],
                     [0.5, 0.5])
             end, _bk_cols())
-        q = (eta = [0.2, -0.4], lk = [0.3, 0.15])
+        q = (a = 0.2, b = -0.4, c = 0.3, d = 0.15)
         got = _bk_posterior(kern, lay, q)
-        mu1 = 1 ./ (1 .+ exp.(-(q.eta[1] .+ q.eta[2] .* _BK_X)))
-        kap = exp.(q.lk[1] .+ q.lk[2] .* _BK_Z)
+        mu1 = 1 ./ (1 .+ exp.(-(q.a .+ q.b .* _BK_X)))
+        kap = exp.(q.c .+ q.d .* _BK_Z)
         ll = sum(zip(_BK_PROP, mu1, kap)) do (yi, m1, k)
             logaddexp(log(0.5) + _bk_ref(yi, m1, k),
                 log(0.5) + _bk_ref(yi, 0.7, k))
         end
-        want = ll + sum(logpdf.(Normal(0, 1), q.eta)) +
-            sum(logpdf.(Normal(0, 1), q.lk))
+        want = ll + sum(logpdf.(Normal(0, 1), (q.a, q.b))) +
+            sum(logpdf.(Normal(0, 1), (q.c, q.d)))
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -256,7 +256,7 @@ end
                 lk = c .+ d .* z
                 prop .~ Beta.(logistic.(mu) .* exp.(lk),
                     (1 .- logistic.(mu)) .* exp.(lk))
-            end, _bk_cols(), (mu = [0.2, -0.1], lk = [0.3, 0.15]))
+            end, _bk_cols(), (a = 0.2, b = -0.1, c = 0.3, d = 0.15))
     end
     @testset "intercept-only log-kappa submodel" begin
         _bk_enzyme_check(quote
@@ -267,7 +267,7 @@ end
                 lk = c
                 prop .~ Beta.(logistic.(mu) .* exp.(lk),
                     (1 .- logistic.(mu)) .* exp.(lk))
-            end, _bk_cols(), (mu = [0.2, -0.1], lk = [0.3]))
+            end, _bk_cols(), (a = 0.2, b = -0.1, c = 0.3))
     end
 end
 
@@ -396,18 +396,18 @@ _bk_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _bk_query(prog, _bk_cols())
         names = coordinate_names(lay)
-        u = _bk_sb_vec(names, [Symbol("mu.Intercept") => 0.2,
-            Symbol("mu.x") => -0.1, Symbol("lk.Intercept") => 0.3,
-            Symbol("lk.z") => 0.15])
+        u = _bk_sb_vec(names, [:a => 0.2,
+            :b => -0.1, :c => 0.3,
+            :d => 0.15])
         @test abs(Base.invokelatest(kern, u) - (-5.002382720244465)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _bk_sb_vec(names, [Symbol("mu.Intercept") => -1.4131391267067588,
-            Symbol("mu.x") => -0.3964863657710521,
-            Symbol("lk.Intercept") => 2.890345225055256,
-            Symbol("lk.z") => 0.2987243791614794])
+        want = _bk_sb_vec(names, [:a => -1.4131391267067588,
+            :b => -0.3964863657710521,
+            :c => 2.890345225055256,
+            :d => 0.2987243791614794])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end

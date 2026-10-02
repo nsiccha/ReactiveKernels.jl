@@ -26,11 +26,10 @@
     @test t.options.subs == [:th, :al]
     @test t.options.scalars == [:be]
     @test t.options.tree == :(be .* (th .- al))
-    @test Set([(p.predictor, p.addressee)
-        for p in plan.population_priors]) ==
-        Set([(:th, :Intercept), (:th, :xs), (:al, :Intercept), (:al, :xs)])
+    @test isempty(plan.population_priors)
     @test [(p.name, p.family) for p in plan.parameters] ==
-        [(:be, :normal)]
+        [(:a_th, :normal), (:b_th, :normal), (:a_al, :normal),
+            (:b_al, :normal), (:be, :normal)]
     @test isempty(plan.derived)
     @test isempty(plan.assignments)
 end
@@ -79,8 +78,8 @@ end
     t = only(plan.predictors[2].terms)
     @test t.kind === ComposedTerm
     @test t.options.subs == [:th]
-    @test [(p.predictor, p.addressee) for p in plan.population_priors] ==
-        [(:th, :g)]
+    @test isempty(plan.population_priors)
+    @test only(plan.array_parameters).name === :c
     # Under `.+` the same alias keeps the affine merge (with
     # unstated-coefficient defaults) — never reroutes into a composition.
     aff = lower_rkppl(quote
@@ -285,7 +284,7 @@ end
     end, (:y, :xs))
     @test any(p -> p.name === :b, twice.parameters)
     @test [t.kind for t in twice.predictors[1].terms] ==
-        [InterceptTerm, OffsetTerm]
+        [InterceptTerm, ContinuousTerm]
     # Shrinkage priors go on the coefficient-holding sub-predictors,
     # never the composed root.
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -346,7 +345,7 @@ function _cmp_ap_check(prog, q::NamedTuple, want; cols = _CMP_AP_COLS)
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     lay = built.layout
-    u = unconstrain(lay, merge(constrain(lay, zeros(lay.total)), q))
+    u = unconstrain(lay, q)
     kern = prepare_query(built, bound, :sampler)
     @test Base.invokelatest(kern, u) ≈ want(q) + logjac(lay, u) rtol = 1e-12
     prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
@@ -358,9 +357,9 @@ function _cmp_ap_check(prog, q::NamedTuple, want; cols = _CMP_AP_COLS)
 end
 
 # `a` in the location's coefficient block `mu` (no intercept).
-const _CMP_AP_Q = (mu = [0.7], s1 = 0.5, s2 = 0.3)
-_cmp_ap_want(q) = _cmp_ap_loglik(q.mu[1] .* _cmp_ap_x(), q.s1, q.s2) +
-    logpdf(Normal(0, 1), q.mu[1]) + _cmp_ap_scales(q)
+const _CMP_AP_Q = (a = 0.7, s1 = 0.5, s2 = 0.3)
+_cmp_ap_want(q) = _cmp_ap_loglik(q.a .* _cmp_ap_x(), q.s1, q.s2) +
+    logpdf(Normal(0, 1), q.a) + _cmp_ap_scales(q)
 
 @testset "composed scale reads a coefficient-holding location" begin
     plan, bound, built = _cmp_ap_check(quote
@@ -379,8 +378,7 @@ _cmp_ap_want(q) = _cmp_ap_loglik(q.mu[1] .* _cmp_ap_x(), q.s1, q.s2) +
     @test t.options.tree == Expr(:., GlobalRef(Main, :hypot),
         Expr(:tuple, :s1, :(mu .* s2)))
     @test isempty(plan.derived)
-    @test [(p.predictor, p.addressee) for p in plan.population_priors] ==
-        [(:mu, :x)]
+    @test isempty(plan.population_priors)
     # The scale reads the location's LP node; nothing re-evaluates it.
     src = string(kernel_expr(bound, built.layout))
     @test occursin("_ppl_lp_sd = Main.hypot.(s1, _ppl_lp_mu .* s2)", src)
@@ -408,9 +406,9 @@ _cmp_ap_want(q) = _cmp_ap_loglik(q.mu[1] .* _cmp_ap_x(), q.s1, q.s2) +
         mu = b0 .+ a .* x
         sd = hypot.(s1, mu .* s2)
         y .~ Normal.(mu, sd)
-    end, (mu = [0.4, 0.7], s1 = 0.5, s2 = 0.3),
-        q -> _cmp_ap_loglik(q.mu[1] .+ q.mu[2] .* _cmp_ap_x(), q.s1, q.s2) +
-            logpdf(Normal(0, 5), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2]) +
+    end, (b0 = 0.4, a = 0.7, s1 = 0.5, s2 = 0.3),
+        q -> _cmp_ap_loglik(q.b0 .+ q.a .* _cmp_ap_x(), q.s1, q.s2) +
+            logpdf(Normal(0, 5), q.b0) + logpdf(Normal(0, 1), q.a) +
             _cmp_ap_scales(q))
 end
 
@@ -456,12 +454,12 @@ const _CMP_XR_COLS = merge(_CMP_AP_COLS, Dict{Symbol,AbstractVector}(
 
 @testset "composed reader in a later response" begin
     want(q) = begin
-        mu = q.mu[1] .* _cmp_ap_x()
+        mu = q.a .* _cmp_ap_x()
         sum(logpdf.(Normal.(mu, 1.0), Vector{Float64}(_CMP_XR_COLS[:y]))) +
-            sum(logpdf.(Normal.(q.m2[1] .* _cmp_ap_x(),
+            sum(logpdf.(Normal.(q.b .* _cmp_ap_x(),
                 hypot.(q.s1, mu .* q.s2)),
                 Vector{Float64}(_CMP_XR_COLS[:z]))) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.m2[1]) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
             _cmp_ap_scales(q)
     end
     plan, _, _ = _cmp_ap_check(quote
@@ -472,25 +470,18 @@ const _CMP_XR_COLS = merge(_CMP_AP_COLS, Dict{Symbol,AbstractVector}(
         m2 = b .* x
         sd = hypot.(s1, mu .* s2)
         z .~ Normal.(m2, sd)
-    end, (mu = [0.7], m2 = [0.4], s1 = 0.5, s2 = 0.3), want;
+    end, (a = 0.7, b = 0.4, s1 = 0.5, s2 = 0.3), want;
         cols = _CMP_XR_COLS)
     @test only(plan.predictors[end].terms).kind === ComposedTerm
-    # The reader's response first: not built yet (residual of snag
-    # `rkppl-predictor-f40e6808`).
-    ok = try
-        bind_data(lower_rkppl(quote
-            a ~ Normal(0.0, 1.0); b ~ Normal(0.0, 1.0)
-            s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
-            mu = a .* x
-            m2 = b .* x
-            sd = hypot.(s1, mu .* s2)
-            z .~ Normal.(m2, sd)
-            y .~ Normal.(mu, 1.0)
-        end, keys(_CMP_XR_COLS)), _CMP_XR_COLS)
-        true
-    catch e
-        e isa Union{SurfaceLoweringError,ContractValidationError} || rethrow()
-        false
-    end
-    @test_broken ok
+    # Ordinary declarations also preserve the density with the reader first.
+    _cmp_ap_check(quote
+        a ~ Normal(0.0, 1.0); b ~ Normal(0.0, 1.0)
+        s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
+        mu = a .* x
+        m2 = b .* x
+        sd = hypot.(s1, mu .* s2)
+        z .~ Normal.(m2, sd)
+        y .~ Normal.(mu, 1.0)
+    end, (a = 0.7, b = 0.4, s1 = 0.5, s2 = 0.3), want;
+        cols = _CMP_XR_COLS)
 end

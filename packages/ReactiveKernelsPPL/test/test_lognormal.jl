@@ -63,7 +63,7 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
             end, (:y, :x))
         r = only(plan.responses)
         @test (r.family, r.scale) === (LogNormalFam, :sigma)
-        @test only(plan.parameters).family === :exponential
+        @test only(p for p in plan.parameters if p.name === :sigma).family === :exponential
     end
     @testset "per-observation sigma column" begin
         plan = lower_rkppl(quote
@@ -95,11 +95,11 @@ end
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, 0.5)
             end, _ln_cols())
-        q = (mu = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _ln_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _LN_X
+        mu = q.a .+ q.b .* _LN_X
         want = sum(_ln_ref(y, m, 0.5) for (y, m) in zip(_LN_Y, mu)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "Exponential-sampled sigma" begin
@@ -110,11 +110,11 @@ end
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, sigma)
             end, _ln_cols())
-        q = (mu = [0.5, -0.25], sigma = 1.2)
+        q = (a = 0.5, b = -0.25, sigma = 1.2)
         got = _ln_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _LN_X
+        mu = q.a .+ q.b .* _LN_X
         want = sum(_ln_ref(y, m, q.sigma) for (y, m) in zip(_LN_Y, mu)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2]) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(Exponential(1), q.sigma) +
             logjac(lay, unconstrain(lay, q))
         @test got ≈ want rtol = 1e-12
@@ -128,12 +128,12 @@ end
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, sigmac)
             end, cols)
-        q = (mu = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _ln_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _LN_X
+        mu = q.a .+ q.b .* _LN_X
         want = sum(_ln_ref(y, m, s)
             for (y, m, s) in zip(_LN_Y, mu, cols[:sigmac])) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -160,7 +160,7 @@ end
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, 0.5)
-            end, _ln_cols(), (mu = [0.5, -0.25],))
+            end, _ln_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "Exponential-sampled sigma" begin
         _ln_enzyme_check(quote
@@ -169,7 +169,7 @@ end
                 sigma ~ Exponential(1)
                 mu = a .+ b .* x
                 y .~ LogNormal.(mu, sigma)
-            end, _ln_cols(), (mu = [0.5, -0.25], sigma = 1.2))
+            end, _ln_cols(), (a = 0.5, b = -0.25, sigma = 1.2))
     end
 end
 
@@ -327,15 +327,15 @@ _ln_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _ln_query(prog, _ln_sb_cols())
         names = coordinate_names(lay)
-        u = _ln_sb_vec(names, [Symbol("mu.Intercept") => 1.0,
-            Symbol("mu.x") => 2.0, :sigma => log(0.5)])
+        u = _ln_sb_vec(names, [:a => 1.0,
+            :b => 2.0, :sigma => log(0.5)])
         @test abs(Base.invokelatest(kern, u) - (-1489.5645028547622)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _ln_sb_vec(names, [Symbol("mu.Intercept") => -236.30033176780262,
-            Symbol("mu.x") => -1122.4370666744812,
+        want = _ln_sb_vec(names, [:a => -236.30033176780262,
+            :b => -1122.4370666744812,
             :sigma => 2713.740660340244])
         @test maximum(abs.(g .- want)) < 1e-10
     end

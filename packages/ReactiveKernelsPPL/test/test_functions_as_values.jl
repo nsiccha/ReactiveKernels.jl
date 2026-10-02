@@ -630,7 +630,7 @@ end
     gbuilt = build_kernel(gbound)
     for u in ([0.3, -0.2], [-1.1, 0.7])
         th = ReactiveKernelsPPL.constrain(gbuilt.layout, u)
-        b = only(th.y_eta)
+        b = th.b
         ll = sum(logpdf(Normal(b * cols[:gx][cols[:g][i]], th.sigma),
             cols[:y][i]) for i in 1:6)
         @test _fv_value(gbuilt, gbound, :likelihood, u) ≈ ll
@@ -674,7 +674,7 @@ end
     for u in ([0.3, -0.2, 0.1], [-1.1, 0.7, 0.4])
         th = ReactiveKernelsPPL.constrain(kbuilt.layout, u)
         s_eff = th.sigma * exp(th.b * xcols[:gx][1])
-        ll = sum(logpdf(Normal(only(th.y_eta) + xcols[:x][i], s_eff),
+        ll = sum(logpdf(Normal(th.m0 + xcols[:x][i], s_eff),
             xcols[:y][i]) for i in 1:6)
         @test _fv_value(kbuilt, kbound, :likelihood, u) ≈ ll
     end

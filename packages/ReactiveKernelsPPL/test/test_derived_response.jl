@@ -37,9 +37,10 @@ end
     @test r.response === :ly
     @test r.label === :ly_resp
     @test [d.name for d in plan.derived] == [:ly]
-    @test [p.name for p in plan.parameters] == [:s]
-    fams = Dict(p.addressee => p.family for p in plan.population_priors)
-    @test fams == Dict(:Intercept => :flat, :x => :flat)
+    @test [p.name for p in plan.parameters] == [:b1, :b2, :s]
+    @test isempty(plan.population_priors)
+    fams = Dict(p.name => p.family for p in plan.parameters)
+    @test fams == Dict(:b1 => :flat, :b2 => :flat, :s => :exponential)
     # Forward order lowers identically.
     fwd = lower_rkppl(quote
             b1 ~ Flat()

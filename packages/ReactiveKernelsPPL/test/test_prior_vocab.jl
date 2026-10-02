@@ -319,11 +319,14 @@ end
     # One family per wide (data-width) block: hand-mutated matrix-element
     # and GLM-vector rows fail validation (the surface can only state one
     # broadcast family, so only hand plans reach this).
-    plan = lower_rkppl(quote
-            X = hcat(1, x1, x2)
-            mu = X * b
-            y .~ Normal.(mu, 1.0)
-        end, (:y, :x1, :x2))
+    plan = StructuralPlan(
+        [LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, 1.0, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:mu, IdentityLink,
+            [TermSpec(MatrixTerm, [:x1, :x2], (matrix=:X,), :X, :X_term)], :mu)],
+        [PopulationPrior(:mu, name, 0.0, 1.0) for name in (:Intercept, :x1, :x2)],
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        matrices = [DesignMatrix(:X, Union{Nothing,Symbol}[nothing, :x1, :x2], :X)])
     i = findfirst(p -> p.predictor === :mu && p.addressee === :x1,
         plan.population_priors)
     plan.population_priors[i] = PopulationPrior(:mu, :x1, :student_t,
@@ -453,11 +456,13 @@ end
     # BridgeStan 2.9.0; `propto=false`, `jacobian=true`; SB-vs-oracle
     # ~1e-15, central-diff ≤7e-10). RK lane `fade3b9`. Conventions:
     # full posterior with constants, log-Jacobian included.
-    _pv_sb_check(prog, cols, q, sbv, sbg) = begin
+    _pv_sb_check(prog, cols, q, sbv, sbg; names = [:a, :b, :s]) = begin
         _, _, kern, lay = _pv_query(prog, cols)
         @test _pv_posterior(kern, lay, q) ≈ sbv rtol = 1e-12
         g = _pv_enzyme_check(prog, cols, q)
-        @test g ≈ sbg rtol = 1e-9
+        coords = coordinate_names(lay)
+        @test [g[only(findall(isequal(name), coords))] for name in names] ≈
+            sbg rtol = 1e-9
     end
     # P1: StudentT intercept + Laplace slope.
     _pv_sb_check(_PV_M1, _pv_cols(), (a = 0.5, b = -0.25, s = 1.3),
@@ -479,7 +484,7 @@ end
     _pv_sb_check(_PV_M4, _pv_gcols(), (c = [0.3, -0.4, 0.1], b = 0.75,),
         -21.633064049357102,
         [0.07852219465122685, 3.2093567251461983, 1.5444721990933479,
-            -2.565555555555555])
+            -2.565555555555555]; names = [Symbol("c.1"), Symbol("c.2"), Symbol("c.3"), :b])
     # P4: Uniform(0.5, 1.5) response scale, default Normal population
     # priors (SB `real<0.5,1.5>` is the same affine-logit leg).
     _pv_sb_check(quote
@@ -1014,39 +1019,25 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
         row = _pv_prior(scalar, :mu, :x)
         @test row.location === :mu_alpha
     end
-    @testset "contract resolution fails closed" begin
-        cases = (
-            ("real-support scale hyper",
-                :(Normal.(mu_alpha, mu_beta)),
-                "positive-support sampled parameter"),
-        )
-        for (label, rhs, msg) in cases
-            err = try
-                lower_rkppl(quote
-                        mu_alpha ~ Normal(0, 10)
-                        mu_beta ~ Normal(0, 10)
-                        sigma_alpha ~ Exponential(1)
-                        s ~ Exponential(1)
-                        sc = 1.0
-                        c[levels(g)] .~ $rhs
-                        mu = c[g] .+ b .* x
-                        b ~ Normal(0, 10)
-                        y .~ Normal.(mu, s)
-                    end, (:y, :x, :g))
-                nothing
-            catch e
-                e
-            end
-            @test err isa ContractValidationError
-            @test occursin(msg, sprint(showerror, err))
-        end
+    @testset "ordinary prior arguments retain scalar declarations" begin
+        plan = lower_rkppl(quote
+                mu_alpha ~ Normal(0, 10)
+                mu_beta ~ Normal(0, 10)
+                c[levels(g)] .~ Normal.(mu_alpha, mu_beta)
+                b ~ Normal(0, 10)
+                mu = c[g] .+ b .* x
+                y .~ Normal.(mu, 1.5)
+            end, (:y, :x, :g))
+        @test only(plan.array_parameters).args.arg2 === :mu_beta
+        @test _pv_param(plan, :mu_beta).family === :normal
     end
 end
 
 @testset "centered factor priors interval scale hypers" begin
-    # Non-negative intervals count (radon_county `Flat(; lower=0,
-    # upper=100)`); negative lower bounds stay rejected.
-    for hyper in (:(Flat(; lower = 0, upper = 100)), :(Uniform(0, 100)))
+    # The array prior reads the scalar value; its declaration's support
+    # remains independent of affine recognition.
+    for hyper in (:(Flat(; lower = 0, upper = 100)), :(Uniform(0, 100)),
+            :(Flat(; lower = -1, upper = 100)), :(Uniform(-1, 100)))
         plan = lower_rkppl(quote
                 mu_alpha ~ Normal(0, 10)
                 sigma_alpha ~ $hyper
@@ -1058,25 +1049,7 @@ end
             end, (:y, :x, :g))
         row = _pv_prior(plan, :mu, :g)
         @test row.scale === :sigma_alpha
-    end
-    for hyper in (:(Flat(; lower = -1, upper = 100)), :(Uniform(-1, 100)))
-        err = try
-            lower_rkppl(quote
-                    mu_alpha ~ Normal(0, 10)
-                    sigma_alpha ~ $hyper
-                    s ~ Exponential(1)
-                    c[levels(g)] .~ Normal.(mu_alpha, sigma_alpha)
-                    mu = c[g] .+ b .* x
-                    b ~ Normal(0, 10)
-                    y .~ Normal.(mu, s)
-                end, (:y, :x, :g))
-            nothing
-        catch e
-            e
-        end
-        @test err isa ContractValidationError
-        @test occursin("positive-support sampled parameter",
-            sprint(showerror, err))
+        @test bind_data(plan, _pv_gcols()) isa StructuralPlan
     end
 end
 
@@ -1202,11 +1175,11 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
             ("scalar inverted",
                 :(Uniform(10, 5)),
                 ContractValidationError,
-                "lo < hi"),
+                "lower < upper"),
             ("scalar infinite",
                 :(Uniform(0, Inf)),
                 ContractValidationError,
-                "lo < hi"),
+                "bounds must be finite literals"),
         )
         for (label, rhs, ex, msg) in scalar_cases
             err = try
@@ -1227,8 +1200,8 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
         broad_cases = (
             ("broadcast hyper bound",
                 :(Uniform.(lo, 3)),
-                SurfaceLoweringError,
-                "bounds must be finite literals"),
+                ContractValidationError,
+                "bounds are literals"),
             ("broadcast inverted",
                 :(Uniform.(10, 5)),
                 ContractValidationError,

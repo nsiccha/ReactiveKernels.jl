@@ -139,12 +139,13 @@ end
     end, (:y, :x))
     @test [t.kind for t in only(divided.predictors).terms] ==
         [InterceptTerm, OffsetTerm]
-    # A scalar summand has no column to scale.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # Ordinary scalar summands retain their priors and affine reads.
+    scalars = lower_rkppl(quote
         a ~ Normal(0, 5); s ~ HalfNormal(1); sigma ~ Exponential(1)
         mu = a .+ s .+ 0.0 .* x
         y .~ Normal.(mu, sigma)
     end, (:y, :x))
+    @test Set(p.name for p in scalars.parameters) == Set((:a, :s, :sigma))
 end
 
 @testset "fallback: Distributions oracles" begin

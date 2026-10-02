@@ -6434,7 +6434,7 @@ end
 function _validate_parameter_term(t::TermSpec, plan::StructuralPlan)
     name = t.options.parameter
     name isa Symbol || _fail(t.label, "affine parameter must be a name")
-    t.options.sign in (-1, 1) || _fail(t.label,
+    (hasproperty(t.options, :sign) && t.options.sign in (-1, 1)) || _fail(t.label,
         "affine parameter sign must be -1 or 1")
     if t.kind in (FactorTerm, MatrixTerm)
         any(p -> p.name === name, plan.array_parameters) || _fail(t.label,

@@ -449,10 +449,10 @@ function _ref_spline_tps(bound, nt)
     x = bound.columns[:x]
     X = reshape(x .- sum(x) / length(x), :, 1)
     Z = hcat(bound.columns[:s_x_Zpen_1], bound.columns[:s_x_Zpen_2])
-    eta = nt.mu[1] .+ X * nt.b_s_x_fixed .+
+    eta = nt.a .+ X * nt.b_s_x_fixed .+
         Z * (nt.sd_s_x[1] .* nt.b_s_x_raw)
     ll = sum(logpdf.(Normal.(eta, nt.sigma), bound.columns[:y]))
-    pr = logpdf(Normal(0, 5), nt.mu[1]) + logpdf(Exponential(1), nt.sigma) +
+    pr = logpdf(Normal(0, 5), nt.a) + logpdf(Exponential(1), nt.sigma) +
         sum(logpdf.(Normal(0, 1), nt.b_s_x_raw)) +
         logpdf(Normal(0, 1), nt.sd_s_x[1])  # `:positive_stan`: no +log(2)
     return (; ll, pr)
@@ -566,12 +566,12 @@ function _ref_spline_t2(bound, nt)
     RN = hcat(bound.columns[:t2_xz_Zrn_1], bound.columns[:t2_xz_Zrn_2])
     NR = hcat(bound.columns[:t2_xz_Znr_1], bound.columns[:t2_xz_Znr_2])
     sd = nt.sd_t2_xz
-    eta = nt.mu[1] .+ X * nt.b_t2_xz_fixed .+
+    eta = nt.a .+ X * nt.b_t2_xz_fixed .+
         RR * (sd[1] .* nt.b_t2_xz_rr_raw) .+
         RN * (sd[2] .* nt.b_t2_xz_rn_raw) .+
         NR * (sd[3] .* nt.b_t2_xz_nr_raw)
     ll = sum(logpdf.(Normal.(eta, nt.sigma), bound.columns[:y]))
-    pr = logpdf(Normal(0, 5), nt.mu[1]) + logpdf(Exponential(1), nt.sigma) +
+    pr = logpdf(Normal(0, 5), nt.a) + logpdf(Exponential(1), nt.sigma) +
         sum(logpdf.(Normal(0, 1), nt.b_t2_xz_rr_raw)) +
         sum(logpdf.(Normal(0, 1), nt.b_t2_xz_rn_raw)) +
         sum(logpdf.(Normal(0, 1), nt.b_t2_xz_nr_raw)) +
@@ -671,7 +671,7 @@ end
         bound = bind_data(_svalid_plan(), _spline_cols())
         built = build_kernel(bound)
         lay = built.layout
-        @test coordinate_names(lay) == [Symbol("mu.Intercept"), :sigma,
+        @test coordinate_names(lay) == [:a, :sigma,
             Symbol("b_s_x_fixed.1"), Symbol("b_s_x_raw.1"),
             Symbol("b_s_x_raw.2"), Symbol("sd_s_x.1")]
         u = [0.4, 0.2, -0.1, 0.4, 0.0, -0.2]
@@ -719,7 +719,7 @@ end
         built = build_kernel(bound)
         lay = built.layout
         @test coordinate_names(lay) ==
-            [Symbol("mu.Intercept"), :sigma, Symbol("b_t2_xz_fixed.1"),
+            [:a, :sigma, Symbol("b_t2_xz_fixed.1"),
                 Symbol("b_t2_xz_fixed.2"), Symbol("b_t2_xz_fixed.3"),
                 Symbol("b_t2_xz_rr_raw.1"), Symbol("b_t2_xz_rn_raw.1"),
                 Symbol("b_t2_xz_rn_raw.2"), Symbol("b_t2_xz_nr_raw.1"),

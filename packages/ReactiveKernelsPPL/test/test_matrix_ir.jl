@@ -250,16 +250,14 @@ end
     @test isempty(plan.population_priors)
     @test repr(only(plan.array_parameters).args.arg1) == repr(:([0, 0, 0]))
     @test repr(only(plan.array_parameters).args.arg2) == repr(:([1, 2, 3]))
-    # Unstated vectors default to K× Normal(0, 1).
+    # Sized declarations keep their ordinary array priors.
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(0, 1)
         X = hcat(1, x1)
         mu = X * b
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1))
-    @test plan.population_priors == PopulationPrior[
-        PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-        PopulationPrior(:mu, :x1, 0.0, 1.0)]
+    @test isempty(plan.population_priors)
     # Dotted subtraction changes the use, preserving the declared prior.
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(1.0, 2.0)
@@ -279,7 +277,7 @@ end
         mu = .-(X * b)
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1))
-    @test length(plan.population_priors) == 2
+    @test isempty(plan.population_priors)
     # Undotted negation folds the sign (affine unary-minus precedent).
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(1.0, 2.0)
@@ -299,7 +297,7 @@ end
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1, :x2))
     @test length(plan.matrices) == 2
-    @test length(plan.population_priors) == 3
+    @test isempty(plan.population_priors)
     plan = lower_rkppl(quote
         b1[axes(X, 2)] .~ Normal.(0, 1)
         b2[axes(X, 2)] .~ Normal.(0, 1)
@@ -378,17 +376,16 @@ end
         (D, "got 2", quote X = hcat(1, x1); y .~ Normal.(X * 2, 1.0) end),
         (D, "has 2 elements (sized by `S`) but matrix `X` has 3 columns", quote b[axes(S, 2)] .~ Normal.(0, 1); S = hcat(1, x1); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (D, "sized by `Z`, which is not a design matrix", quote b[axes(Z, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        (D, "column Intercept has two coefficients", quote X = hcat(1, 1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (Dz, "shared across predictors", quote X = hcat(1, x1); mu = X * b; nu = X * b; y .~ Normal.(mu, 1.0); z .~ Normal.(nu, 1.0) end),
         (Dg, "unidentified: intercept + full-cover factor", quote b[axes(X, 2)] .~ Normal.(0, 1); c[levels(g)] .~ Normal.(0, 2); X = hcat(1, x1); mu = X * b .+ c[g]; y .~ Normal.(mu, 1.0) end),
         (D, "literal scaling of a matmul", quote X = hcat(1, x1); mu = 2 * (X * b); y .~ Normal.(mu, 1.0) end),
         (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = x2 .* (X * b); y .~ Normal.(mu, 1.0) end),
         (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = exp.(X * b); y .~ Normal.(mu, 1.0) end),
-        (D, "scales a matmul by the parameter s", quote s ~ Exponential(1); X = hcat(1, x1); mu = s .* (X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "composes a matmul outside a term", quote s ~ Exponential(1); X = hcat(1, x1); mu = s .* (X * b); y .~ Normal.(mu, 1.0) end),
     ]
     for (data, msg, ast) in cases
         err = _mx_err(ast, data)
-        expected = startswith(msg, "column Intercept") || startswith(msg, "unidentified:") ?
+        expected = startswith(msg, "unidentified:") ?
             ContractValidationError : SurfaceLoweringError
         @test err isa expected && occursin(msg, sprint(showerror, err))
     end
@@ -638,7 +635,7 @@ end
     bmat = build_kernel(pmat)
     baff = build_kernel(paff)
     @test bmat.layout.total == baff.layout.total == 4
-    umat = unconstrain(bmat.layout, (mu = [0.5, -0.25], d = 0.1, s = [0.4, 0.6]))
+    umat = unconstrain(bmat.layout, (b = [0.5, -0.25], d = 0.1, s = [0.4, 0.6]))
     uaff = unconstrain(baff.layout, (a = 0.5, e = -0.25, d = 0.1, s = [0.4, 0.6]))
     @test _query(bmat.spec, pmat, :posterior, umat) ≈
         _query(baff.spec, paff, :posterior, uaff)

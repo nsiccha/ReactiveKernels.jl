@@ -358,7 +358,7 @@ end
     @test built.layout.total == 9
     u = [0.1, -0.2, 0.3, 0.5, -0.4, 0.2, -0.1, 0.0, 0.15]
     nt = constrain(built.layout, u)
-    a, b = nt.mu[1], nt.mu[2]
+    a, b = nt.a, nt.b
     ref = _me_oracle(plan.columns, a, b, nt.sigma, Vector(nt.x_true))
     @test abs(_query(built.spec, plan, :likelihood, u) -
         (ref.ll_main + ref.ll_obs)) < 1e-12
@@ -412,7 +412,7 @@ end
     u = [0.1, -0.2, 0.3, -0.15, 0.25, 0.5, -0.4, 0.2, -0.1, 0.0, 0.15]
     @test length(u) == built.layout.total
     nt = constrain(built.layout, u)
-    ref = _me_oracle(plan.columns, nt.mu[1], nt.mu[2], nt.sigma,
+    ref = _me_oracle(plan.columns, nt.a, nt.b, nt.sigma,
         Vector(nt.x_true); loc = nt.xloc, scale = nt.xsca)
     pr_extra = logpdf(Normal(0, 1), nt.xloc) + logpdf(Exponential(1), nt.xsca)
     @test _query(built.spec, plan, :likelihood, u) ≈

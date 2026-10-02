@@ -203,4 +203,28 @@ end
         sum(logpdf.(Normal.(u[[3, 1, 2]], 1.0), y))
     @test _query(bf.spec, factor, :posterior, u) ≈ expected
     _check_gradient(bf.spec, factor, u)
+
+    g_mixed = ["a", "b", "c"]
+    mixed, bm = _affine_model(quote
+        c[levels(g)] .~ Normal.(0, 1)
+        d[levels(g)[2:end]] .~ Normal.(0, 2)
+        mu = c[g] .+ d[g]
+        y .~ Normal.(mu, 1.0)
+    end; g = g_mixed, y)
+    um = unconstrain(bm.layout, (c = [0.2, -0.3, 0.4], d = [0.1, -0.2]))
+    expected_mixed = sum(logpdf.(Normal(), [0.2, -0.3, 0.4])) +
+        sum(logpdf.(Normal(0, 2), [0.1, -0.2])) +
+        sum(logpdf.(Normal.([0.2, -0.2, 0.2], 1.0), y))
+    @test coordinate_names(bm.layout) ==
+        Symbol.(["c.1", "c.2", "c.3", "d.1", "d.2"])
+    @test _query(bm.spec, mixed, :posterior, um) ≈ expected_mixed
+    _check_gradient(bm.spec, mixed, um)
+
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Horseshoe()
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
+        q = a^2
+    end, (:x, :y))
 end

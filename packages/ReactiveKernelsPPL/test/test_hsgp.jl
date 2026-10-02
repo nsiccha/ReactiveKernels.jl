@@ -427,7 +427,7 @@ function _hsgp_ref_posterior(bound::StructuralPlan, layout::LayoutTable,
     y = Vector{Float64}(bound.columns[:y])
     nt = constrain(layout, u)
     hsgp = ReactiveKernelsPPL._hsgp_names(hb)
-    a = only(nt.mu)
+    a = nt.a
     sig = Float64(nt.sigma)
     rhos = [Float64(getproperty(nt, r)) for r in hsgp.rhos]
     sigh = Float64(getproperty(nt, hsgp.sigma))
@@ -758,7 +758,7 @@ function _hsgp_periodic_ref_posterior(bound::StructuralPlan,
     y = Vector{Float64}(bound.columns[:y])
     nt = constrain(layout, u)
     hsgp = ReactiveKernelsPPL._hsgp_names(hb)
-    a = only(nt.mu)
+    a = nt.a
     sig = Float64(nt.sigma)
     rho = Float64(only(getproperty(nt, r) for r in hsgp.rhos))
     sigh = Float64(getproperty(nt, hsgp.sigma))

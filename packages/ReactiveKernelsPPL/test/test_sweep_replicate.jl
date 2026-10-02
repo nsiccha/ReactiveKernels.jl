@@ -241,14 +241,14 @@ end
     end
             @testset "ark (AR(2) lag regression)" begin
         _, _, kern, lay = _sr_query(_SR_ARK_PROG, _sr_ark_cols())
-        q = (mu = [1.0, 0.5, -0.25], sigma = 1.5)
+        q = (alpha = 1.0, b1 = 0.5, b2 = -0.25, sigma = 1.5)
         got = _sr_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _SR_ARK_L1 .+ q.mu[3] .* _SR_ARK_L2
+        mu = q.alpha .+ q.b1 .* _SR_ARK_L1 .+ q.b2 .* _SR_ARK_L2
         # Truncated-Cauchy(0, 2.5) on (0, Inf): half-mass normalization
         # (+log 2, Stan-faithful); sigma rides exp (log Jacobian).
         want = sum(logpdf(Normal(m, 1.5), y)
             for (m, y) in zip(mu, _SR_ARK_YT)) +
-            sum(logpdf(Normal(0.0, 10.0), c) for c in q.mu) +
+            sum(logpdf(Normal(0.0, 10.0), c) for c in (q.alpha, q.b1, q.b2)) +
             logpdf(Cauchy(0.0, 2.5), 1.5) + log(2) + log(1.5)
         @test got ≈ want rtol = 1e-12
     end
@@ -309,10 +309,10 @@ end
         # truncated-Cauchy(0,2.5); probe (1.0, 0.5, -0.25, 1.5) in
         # [pop.1, pop.2, pop.3, sigma] order.
         _sr_sb_check(_SR_ARK_PROG, _sr_ark_cols(),
-            (mu = [1.0, 0.5, -0.25], sigma = 1.5), _SR_SB.ARK,
-            [Symbol("mu.Intercept") => _SR_SB.ARK.grad[2],
-                Symbol("mu.ylag1") => _SR_SB.ARK.grad[3],
-                Symbol("mu.ylag2") => _SR_SB.ARK.grad[4],
+            (alpha = 1.0, b1 = 0.5, b2 = -0.25, sigma = 1.5), _SR_SB.ARK,
+            [:alpha => _SR_SB.ARK.grad[2],
+                :b1 => _SR_SB.ARK.grad[3],
+                :b2 => _SR_SB.ARK.grad[4],
                 :sigma => _SR_SB.ARK.grad[1]])
     end
     @testset "dugongs (DUG0 zeros)" begin
@@ -328,7 +328,7 @@ end
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
         want = _sr_sb_vec(names,
-            [Symbol("mu._rkppl_synth_1") => _SR_SB.DUG0.grad[1],
+            [:Linf => _SR_SB.DUG0.grad[1],
                 :kk => _SR_SB.DUG0.grad[2], :t0 => _SR_SB.DUG0.grad[3],
                 :sigma => _SR_SB.DUG0.grad[4]])
         @test maximum(abs.(g .- want)) < 1e-10
@@ -344,7 +344,7 @@ end
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
         want = _sr_sb_vec(names,
-            [Symbol("mu._rkppl_synth_1") => _SR_SB.DUG1.grad[1],
+            [:Linf => _SR_SB.DUG1.grad[1],
                 :kk => _SR_SB.DUG1.grad[2], :t0 => _SR_SB.DUG1.grad[3],
                 :sigma => _SR_SB.DUG1.grad[4]])
         @test maximum(abs.(g .- want)) < 1e-10
@@ -400,7 +400,7 @@ end
     end
         @testset "ark" begin
         _sr_enzyme_check(_SR_ARK_PROG, _sr_ark_cols(),
-            (mu = [1.0, 0.5, -0.25], sigma = 1.5))
+            (alpha = 1.0, b1 = 0.5, b2 = -0.25, sigma = 1.5))
     end
 end
 

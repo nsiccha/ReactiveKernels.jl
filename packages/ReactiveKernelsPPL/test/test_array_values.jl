@@ -57,9 +57,9 @@ _av_node(built, bound, node, u) = _query(built.spec, bound, node, u)
             offset = kind === :vector ? nt.z[2] : nt.L[2, 1]
             array_prior = kind === :vector ? sum(logpdf.(Normal(), nt.z)) :
                 logpdf(LKJCholesky(2, 1.0), Cholesky(LowerTriangular(nt.L)))
-            prior = array_prior + logpdf(Normal(0, 5), only(nt.mu)) +
+            prior = array_prior + logpdf(Normal(0, 5), nt.a) +
                 logpdf(Exponential(1), nt.sigma)
-            likelihood = sum(logpdf.(Normal.(only(nt.mu) .+ sign * offset .+ x,
+            likelihood = sum(logpdf.(Normal.(nt.a .+ sign * offset .+ x,
                 nt.sigma), y))
             @test _av_node(built, bound, :prior, u) ≈ prior
             @test _av_node(built, bound, :likelihood, u) ≈ likelihood

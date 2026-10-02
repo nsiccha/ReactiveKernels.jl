@@ -944,6 +944,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module)
     owned_coefs = Dict(k => v for (k, v) in coefuse
         if k ∉ ordinary_parameters || any(u -> u[1] in r2d2set ||
             u[1] in hsset, v))
+    # A legacy construct takes ownership of its whole coefficient pack.
+    # Its removed declaration names cannot acquire ordinary outside readers.
+    setdiff!(ordinary_parameters, keys(owned_coefs))
+    _check_coefficient_uses(coefuse, ctx)
     for c in ctx.dar_coefs
         haskey(coefuse, c) && _check_owned_coefficient(c, ctx, "$c is both a " *
             "predictor coefficient and a dar trajectory parameter — dar " *
@@ -9084,6 +9088,16 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
     addr_owner = Dict{Symbol,Symbol}()
     for (sign, core) in out
         term, use = _classify_summand(pname, core, sign, ctx)
+        if term.kind === FactorTerm && use !== nothing &&
+                use[1] in ctx.ordinary_parameters && haskey(ctx.factor_axes, use[1]) &&
+                any(t -> t.kind === FactorTerm && _parameter_term(t) &&
+                    t.columns == term.columns && haskey(ctx.factor_axes, t.options.parameter) &&
+                    ctx.factor_axes[t.options.parameter] != ctx.factor_axes[use[1]],
+                    terms)
+            # LevelMaps describe one design block per predictor/column.
+            # A different declared subset keeps its ordinary gather value.
+            term, use = _extract_summand(pname, core, sign, ctx)
+        end
         if use !== nothing
             name, addr, _ = use
             # Matrix uses claim every element addressee (one coefficient

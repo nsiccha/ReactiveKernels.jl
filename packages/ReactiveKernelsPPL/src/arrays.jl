@@ -219,6 +219,7 @@ end
 # ── data validation ──────────────────────────────────────────────────
 
 function _validate_array_parameters_data(plan::StructuralPlan)
+    known = union(Set{Symbol}(_all_names(plan)), Set{Symbol}(keys(plan.columns)))
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
         all(>=(1), dims) || _fail(p.label, "array $(p.name) has an empty " *
@@ -233,6 +234,10 @@ function _validate_array_parameters_data(plan::StructuralPlan)
             continue
         end
         _is_structured_array(p) && continue
+        for (key, arg) in pairs(p.args), name in _expr_value_symbols(arg)
+            name in known || _fail(p.label,
+                "array $(p.name) prior $key references unknown name $name")
+        end
         length(dims) == 1 || continue
         K = dims[1]
         for (k, a) in pairs(p.args)
