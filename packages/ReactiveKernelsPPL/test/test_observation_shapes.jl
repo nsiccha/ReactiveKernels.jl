@@ -46,6 +46,9 @@ end
         (reshape([0.5, -0.3], 1, 2, 1), reshape(collect(0.1:0.1:0.8), 2, 2, 2)),
         ([0.5, -0.3], [0.2]),
         (fill(0.5), reshape([0.2, -0.1], 1, 2)),
+        ([0.5], Float64[]),
+        (ones(1, 1), zeros(0, 2)),
+        (ones(1, 2, 1), zeros(0, 2, 2)),
     )
     for (x, y) in cases
         before = deepcopy((x, y))
@@ -74,6 +77,8 @@ end
     # lowering; silently broadcasting would change this loop's density.
     @test_throws "different operand axes is not built yet" (indexed(;
         x = zeros(1, 2)) | (; y = zeros(2)))
+    empty_loop = indexed(; x = ones(3)) | (; y = Float64[])
+    _os_check(empty_loop, logpdf(Normal(), 0.3), [-0.3], [0.3])
 
     bare = @rkppl begin
         a ~ Normal(0, 1)
@@ -116,6 +121,7 @@ end
         ([0.5], [0.2, -0.1, 0.4], [0.2, 0.3]),
         (ones(1, 1, 1), zeros(2, 2, 2), zeros(3, 2, 2)),
         (reshape([0.5, -0.3], 2, 1), zeros(2, 3), zeros(2, 4)),
+        ([0.5], Float64[], zeros(3)),
     )
         original = deepcopy((x, y1, y2))
         bound = model(; x) | (; y1, y2)

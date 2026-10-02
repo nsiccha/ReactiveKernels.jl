@@ -77,3 +77,11 @@ end
         @test counts[1] == counts[2]
     end
 end
+
+@testset "empty broadcast domains retain scalar prior gradients" begin
+    model = _os_model()
+    for (x, y) in (([0.5], Float64[]),
+        (ones(1, 1), zeros(0, 2)), (ones(1, 2, 1), zeros(0, 2, 2)))
+        _os_compiled_fixture(model(; x) | (; y), x, y)
+    end
+end

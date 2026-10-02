@@ -3452,7 +3452,11 @@ function _observation_design_columns(plan::StructuralPlan)
                 ex.args[2] isa Symbol &&
                 get(plan.columns, ex.args[2], nothing) isa AbstractMatrix
             rhs = _value_axes(plan, ex.args[3]; data_axes = true)
-            rhs === nothing || isempty(rhs) || push!(out, ex.args[2])
+            # Opaque helper results may have unknown sizes while their
+            # model-vector role is already established by lowering.
+            ((rhs !== nothing && !isempty(rhs)) ||
+                (rhs === nothing && _model_vector_value(ex.args[3], plan))) &&
+                push!(out, ex.args[2])
         end
         foreach(visit, ex.args)
     end
