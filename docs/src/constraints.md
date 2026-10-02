@@ -197,3 +197,11 @@ and lock the one Reactant 0.2.289 lifted:
   Kronecker-eigenspace marginal likelihood: its owned
   `rk_symmetric_eigvals`/`rk_symmetric_eigvecs` margins call
   `eigen(Symmetric(·))` as their primal and fail the same way.
+- Arbitrary-order `SpecialFunctions.besselix(order, x)` has no method for
+  a traced scalar `x` in Reactant 0.2.289:
+  `repro_reactant_besselix_order.jl` isolates the missing method without
+  ReactiveKernels. The periodic HSGP library's spectral weights require
+  this function, so that effect supports native primal and Enzyme gradients
+  but cannot compile with Reactant. Its acceptance test pins this exact
+  `MethodError`; other failures remain errors. The ordinary formula stays
+  intact, with no foreign-function derivative rule or tracing workaround.

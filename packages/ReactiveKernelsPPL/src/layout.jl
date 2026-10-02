@@ -29,6 +29,11 @@ function support_of(family::Symbol, override::SupportOverride)
         "[layout] a uniform prior carries its own interval support — no " *
         "support override applies, got $override"))
     if override isa Tuple
+        if override[1] === :lower
+            inferred === :positive || throw(ContractValidationError(
+                "[layout] :lower override needs a positive-support family"))
+            return :floored
+        end
         if override[1] === :upper
             length(override) == 2 || throw(ContractValidationError(
                 "[layout] tuple support override must be (:upper, hi), got $override"))
@@ -55,6 +60,21 @@ function support_of(family::Symbol, override::SupportOverride)
     return :positive
 end
 
+# A `(:lower, name)` bound reads the bound model-level data value `name` (a
+# finite non-negative number); every other override passes through.
+_bound_override(::StructuralPlan, ov) = ov
+function _bound_override(plan::StructuralPlan, ov::Tuple{Symbol,Symbol})
+    ov[1] === :lower || return ov
+    haskey(plan.columns, ov[2]) || throw(ContractValidationError(
+        "[layout] lower bound $(ov[2]) is not bound data (bind the plan " *
+        "first, or define it from data)"))
+    v = plan.columns[ov[2]]
+    v isa Real && isfinite(v) && v >= 0 || throw(ContractValidationError(
+        "[layout] lower bound $(ov[2]) must be a finite non-negative " *
+        "number, got $(summary(v))"))
+    return (:lower, Float64(v))
+end
+
 # The transform kind and (for :interval/:upper) the constrained bounds a
 # layout entry needs, from a parameter's family + support override (+ args:
 # a uniform's bounds come from its literal args, not an override).
@@ -68,6 +88,12 @@ function _entry_transform(family::Symbol, override::SupportOverride,
     end
     if support === :upper
         return (:upper, NaN, Float64(override[2]))
+    end
+    if support === :floored
+        override[2] isa Real || throw(ContractValidationError(
+            "[layout] the lower bound `$(override[2])` is a data name — " *
+            "bind the plan first (`bind_data`)"))
+        return (:floored, Float64(override[2]), NaN)
     end
     transform =
         support === :real ? :identity :
@@ -231,8 +257,8 @@ function assign_layout(plan::StructuralPlan)
         offset += K
     end
     for p in plan.parameters
-        transform, lo, hi =
-            _entry_transform(p.family, p.support_override, p.args)
+        transform, lo, hi = _entry_transform(p.family,
+            _bound_override(plan, p.support_override), p.args)
         push!(entries,
             LayoutEntry(:sampled, nothing, p.name, [p.name], offset, 1, transform,
                 lo, hi))
