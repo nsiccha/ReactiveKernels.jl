@@ -366,7 +366,6 @@ end
 
 @testset "matrix surface use errors" begin
     D = (:y, :x1, :x2)
-    Dg = (:y, :x1, :g)
     Dz = (:y, :z, :x1)
     cases = [
         (D, "needs a bare 2-element coefficient vector", quote X = hcat(1, x1); mu = X * x1; y .~ Normal.(mu, 1.0) end),
@@ -377,7 +376,6 @@ end
         (D, "has 2 elements (sized by `S`) but matrix `X` has 3 columns", quote b[axes(S, 2)] .~ Normal.(0, 1); S = hcat(1, x1); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (D, "sized by `Z`, which is not a design matrix", quote b[axes(Z, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (Dz, "shared across predictors", quote X = hcat(1, x1); mu = X * b; nu = X * b; y .~ Normal.(mu, 1.0); z .~ Normal.(nu, 1.0) end),
-        (Dg, "unidentified: intercept + full-cover factor", quote b[axes(X, 2)] .~ Normal.(0, 1); c[levels(g)] .~ Normal.(0, 2); X = hcat(1, x1); mu = X * b .+ c[g]; y .~ Normal.(mu, 1.0) end),
         (D, "literal scaling of a matmul", quote X = hcat(1, x1); mu = 2 * (X * b); y .~ Normal.(mu, 1.0) end),
         (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = x2 .* (X * b); y .~ Normal.(mu, 1.0) end),
         (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = exp.(X * b); y .~ Normal.(mu, 1.0) end),
@@ -385,9 +383,7 @@ end
     ]
     for (data, msg, ast) in cases
         err = _mx_err(ast, data)
-        expected = startswith(msg, "unidentified:") ?
-            ContractValidationError : SurfaceLoweringError
-        @test err isa expected && occursin(msg, sprint(showerror, err))
+        @test err isa SurfaceLoweringError && occursin(msg, sprint(showerror, err))
     end
     # Named-definition RHS violations screen at extraction.
     err = _mx_err(quote X = hcat(1, x1); mu = X * 2; y .~ Normal.(mu, 1.0) end, D)

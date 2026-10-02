@@ -1,13 +1,13 @@
 # Computed coefficients, expression-valued coefficient priors and
-# hierarchical identifiability (decision `1cmodra` prong `fallback`;
+# hierarchical priors (decision `1cmodra` prong `fallback`;
 # hunt-priors `coef_grammar`; hunt-emitter `coef-priors`): a predictor
 # summand that is not an affine term lowers as an in-graph derived column
 # (an inline `z[g]` reads the declared array `z` as a value; its named
 # alias `zg = z[g]` is a factor sub-predictor — one density, both legal);
 # coefficient priors take names and
 # expressions; a coefficient another statement reads is an ordinary
-# parameter; intercept + full-cover factor is identified by a hierarchical
-# scale. Every density is checked against a Distributions.jl oracle.
+# parameter. Intercept + full-cover factors preserve fixed or hierarchical
+# priors alike. Every density is checked against a Distributions.jl oracle.
 # (`_findiff_grad` / `_GEN_BACKEND` come from test_generator.jl, included
 # first.)
 using Distributions: Normal, Exponential, Cauchy, Uniform, Beta, Dirichlet,
@@ -522,25 +522,16 @@ end
     end
 end
 
-@testset "fallback: identifiability counts hierarchical priors" begin
+@testset "fallback: full-cover factors admit fixed and hierarchical priors" begin
     hier(prior) = quote
         a ~ Normal(0, 5); s ~ HalfNormal(1); m ~ Normal(0, 1)
         c[levels(g)] .~ $prior; sigma ~ Exponential(1)
         mu = a .+ c[g]
         y .~ Normal.(mu, sigma)
     end
-    @test lower_rkppl(hier(:(Normal.(0, s))), (:y, :g)) isa StructuralPlan
-    @test lower_rkppl(hier(:(Normal.(0, 2 * s))), (:y, :g)) isa StructuralPlan
-    for (prior, msg) in ((:(Normal.(0, 1)), "fixed prior"),
-            (:(Normal.(m, s)), "trade off"))
-        err = try
-            lower_rkppl(hier(prior), (:y, :g))
-            nothing
-        catch e
-            e
-        end
-        @test err isa ContractValidationError
-        @test occursin(msg, sprint(showerror, err))
+    for prior in (:(Normal.(0, s)), :(Normal.(0, 2 * s)),
+            :(Normal.(0, 1)), :(Normal.(m, s)), :(Flat.()), :(Uniform.(-2, 2)))
+        @test lower_rkppl(hier(prior), (:y, :g)) isa StructuralPlan
     end
 end
 

@@ -60,15 +60,19 @@ Coefficient vectors are declared the same way, sized by their design matrix:
   `y ~ Normal(...)` on a data vector is rejected.
 - A `~` whose left-hand side is a bound data column is an observation; every
   other `~` declares a parameter.
+- `Ordinal` permits an intercept alongside its thresholds, for both
+  cumulative and stopping-ratio responses. Both declarations and their
+  priors are translated as written.
 - Single assignment, no `if`, no `target +=`. Loops are written as
   `@plate` cells or `@scan` recurrences (see [Plates](#Plates)).
 
 ## Factor levels
 
 `c[levels(g)] .~ Normal.(0, 2)` declares one coefficient per level of `g`, and
-`c[g]` gathers them per observation. Levels are full rank, so an intercept plus
-a full-cover factor is rejected as unidentified. Offsets are plain data
-summands.
+`c[g]` gathers them per observation. A full-cover factor may appear alongside
+an intercept, with the fixed or hierarchical priors written in the model.
+RK-PPL translates these declarations without imposing an identifiability or
+posterior-propriety test. Offsets are plain data summands.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("10_levels_prior.jl", :rkppl_levels)

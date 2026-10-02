@@ -2000,7 +2000,7 @@ end
 end
 
 @testset "surface levels priors" begin
-    # Subset + intercept: identified; the map carries the (2, :end) selector.
+    # Subset + intercept: the map carries the (2, :end) selector.
     got = lower_rkppl(quote
         a ~ Normal(0, 1)
         c[levels(g)[2:end]] .~ Normal.(0, 2)
@@ -2012,13 +2012,15 @@ end
     @test isempty(got.population_priors)
     @test only(got.parameters).name === :a
     @test only(got.array_parameters).name === :c
-    # Intercept + full cover: the identifiability gate.
-    @test_throws ContractValidationError lower_rkppl(quote
+    # A full-cover factor preserves all authored coefficients and priors.
+    full = lower_rkppl(quote
         a ~ Normal(0, 1)
         c[levels(g)] .~ Normal.(0, 2)
         mu = a .+ c[g]
         y .~ Normal.(mu, 1.5)
     end, (:y, :x, :g))
+    @test only(full.levelmaps).subset === Colon()
+    @test only(full.array_parameters).name === :c
     # Scalar prior for a vector coefficient: migration error. Missing prior:
     # required error (no default sizes the block).
     for stmts in ((:(c ~ Normal(0, 2)),), (:($(Expr(:call, :~,
@@ -4285,11 +4287,13 @@ end
             :(b ~ Normal(0, 1)),
             :(eta = b .* x),
             :(y .~ Ordinal.(Sequential(), LogitLink(), eta))), (:y, :x))
-    # A fixed intercept is non-identifiable (plan validation agrees).
-    @test_throws ContractValidationError lower_rkppl(Expr(:block,
+    # Intercepts and thresholds are both part of the authored model.
+    with_intercept = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(eta = a .+ b .* x),
             :(y .~ Ordinal.(Cumulative(), LogitLink(), eta))), (:y, :x))
+    @test any(t -> t.kind === InterceptTerm,
+        only(with_intercept.predictors).terms)
 end
 
 @testset "surface multinomial" begin

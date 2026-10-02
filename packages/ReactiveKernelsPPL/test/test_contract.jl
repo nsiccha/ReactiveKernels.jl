@@ -1602,13 +1602,11 @@ end
         return StructuralPlan(plan.responses, preds, priors, plan.parameters,
             plan.assignments, plan.columns, plan.n_obs; levelmaps = ms)
     end
-    # Intercept + strict subset: identified. Full cover alone: identified.
+    # Both subsets and full-cover factors are legal with an intercept.
     @test validate_plan(_factor_plan()) === nothing
     @test validate_plan(_factor_plan(; intercept = false,
         subset = Colon())) === nothing
-    # Intercept + full cover: the identifiability gate.
-    bad = _factor_plan(; subset = Colon())
-    @test_throws ContractValidationError validate_plan(bad)
+    @test validate_plan(_factor_plan(; subset = Colon())) === nothing
     # Missing / duplicate maps.
     @test_throws ContractValidationError validate_plan(_factor_plan(;
         maps = :none))
@@ -2039,6 +2037,8 @@ function _ordinal_plan(n = 9; link = LogitLink, structure = :cumulative,
         [TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)] : terms
     preds = PredictorSpec[PredictorSpec(:mu, IdentityLink, terms, :mu)]
     priors = PopulationPrior[PopulationPrior(:mu, :x, 0.0, 2.0)]
+    any(t -> t.kind === InterceptTerm, terms) &&
+        push!(priors, PopulationPrior(:mu, :Intercept, 0.0, 1.0))
     r = resp === nothing ? LikelihoodSpec(OrdinalFam, link, :y, :mu, nothing,
         nothing, _none_evidence(), :y_resp, nothing, nothing;
         thresholds = :y_thresholds, ordinal_structure = structure,
@@ -2076,8 +2076,12 @@ end
         structure = :stopping, vecfam = :ordered_normal)
     @test_throws ContractValidationError _ordinal_plan(;
         structure = :cumulative, vecfam = :vector_normal)
-    # A fixed intercept is non-identifiable with the thresholds (SB rule).
-    @test_throws ContractValidationError _ordinal_plan(; terms = _terms())
+    # An intercept is legal alongside thresholds for either structure.
+    for (structure, vfam) in
+            ((:cumulative, :ordered_normal), (:stopping, :vector_normal))
+        @test validate_plan(_ordinal_plan(; terms = _terms(),
+            structure = structure, vecfam = vfam)) === nothing
+    end
     # Discrimination: positive literal or data column only.
     @test (validate_plan(_ordinal_plan(; discrimination = 2.0)); true)
     @test (validate_plan(_ordinal_plan(; discrimination = :d)); true)
