@@ -57,6 +57,13 @@ end
     end
     cats = Dict{Symbol,Any}(:y => [1, 3, 2, 3])
     _semantics_check(categorical_ast, cats, q -> sum(logpdf.(Categorical(q.s), cats[:y])))
+    # The shared object keeps its shape inside a frequency-weight wrapper.
+    weighted_cats = merge(cats, Dict(:frequency => [1.0, 2.0, 3.0, 1.0]))
+    _semantics_check(quote
+        s ~ Dirichlet([1.0, 2.0, 3.0])
+        y .~ weighted.(Categorical(s), frequency)
+    end, weighted_cats, q -> sum(weighted_cats[:frequency] .*
+        logpdf.(Categorical(q.s), cats[:y])))
     multinomial_ast = quote
         s ~ Dirichlet([1.0, 2.0, 3.0])
         eachrow(hcat(c1, c2, c3)) .~ Multinomial.(N, Ref(s))

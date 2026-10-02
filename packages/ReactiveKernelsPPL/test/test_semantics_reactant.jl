@@ -13,7 +13,10 @@ function _semantics_compiled_fixture(kind, n)
     y = [cos(0.3i) for i in 1:n]
     data = Dict{Symbol,Any}(:x => x, :y => y)
     if kind === :factor
-        pool = ["low", "mid", "high", "extra"]
+        # Grow the unobserved categorical pool too: its prior dimension is
+        # data-dependent and must not replicate the generated prior body.
+        pool = vcat(["low", "mid", "high"],
+            ["extra$i" for i in 1:(n ÷ 4 - 2)])
         g = categorical([pool[mod1(i, 3)] for i in 1:n]; levels = pool)
         data[:g] = g
         ast = quote
