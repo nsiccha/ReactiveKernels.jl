@@ -63,7 +63,7 @@ function design_shape(pred::PredictorSpec, columns::AbstractDict{Symbol};
     for b in blocks
         append!(labels, b.labels)
     end
-    length(unique(labels)) == length(labels) ||
+    (_parameter_terms(pred) || length(unique(labels)) == length(labels)) ||
         throw(ContractValidationError("[$(pred.label)] duplicate coefficient labels"))
     width = sum(b.width for b in blocks; init = 0)
     return DesignShape(pred.name, blocks, width)

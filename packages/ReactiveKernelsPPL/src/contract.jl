@@ -469,7 +469,9 @@ end
 
 One additive predictor term: structure only, never materialized designs
 (D5a). `addressee` is the prior address (source column or `:Intercept`),
-never a per-level label. Terms take no options: factor sizing lives in
+never a per-level label. An optimized ordinary parameter read carries
+`parameter` (its declaration name) and `sign` in `options`; its declaration
+owns the prior and coordinates. Factor sizing lives in
 the plan's [`LevelMap`](@ref)s (full-rank over exactly the mapped
 levels; no contrasts, no reference dropping — that machinery was
 BRM-specific and is gone). A `ContinuousTerm` may name a per-cell latent
@@ -491,6 +493,15 @@ struct PredictorSpec
     terms::Vector{TermSpec}
     label::Symbol
 end
+
+# An affine term reads an ordinary parameter; it never owns that
+# parameter's prior, transform, coordinates, or other readers.
+_parameter_term(t::TermSpec) = hasproperty(t.options, :parameter)
+_parameter_terms(p::PredictorSpec) = any(_parameter_term, p.terms)
+_legacy_predictor(p::PredictorSpec) = PredictorSpec(p.name, p.link,
+    TermSpec[t for t in p.terms if !_parameter_term(t)], p.label)
+_affine_block_name(p::PredictorSpec) = _parameter_terms(p) ?
+    Symbol(:_ppl_affine_coef_, p.name) : block_name(p.name)
 
 """
     PopulationPrior(predictor, addressee, location, scale)
@@ -5806,6 +5817,14 @@ function _is_vector_valued(ex, plan::StructuralPlan)
         isempty(ex.args) && return false
         fn = ex.args[1]
         fn isa GlobalRef && return false  # undotted module call: model-level
+        if fn === :* && length(ex.args) == 3 &&
+                _observation_matrix_gather(ex.args[2], plan) &&
+                _model_vector_value(ex.args[3], plan)
+            # A gathered N×K array times a model-level K-vector is an
+            # observation vector, although neither operand is a vector
+            # column on its own.
+            return true
+        end
         fn in REDUCTION_FNS && return false
         fn isa Symbol && fn in VECTOR_FNS && return true
         fn isa Symbol && (fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS) &&
@@ -5819,6 +5838,26 @@ function _is_vector_valued(ex, plan::StructuralPlan)
         return any(a -> _is_vector_valued(a, plan), ex.args[2].args)
     end
     return false
+end
+
+function _observation_matrix_gather(ex, plan)
+    ex isa Expr && ex.head === :ref && length(ex.args) == 3 || return false
+    _is_array_param(plan, ex.args[1]) || return false
+    p = _array_param(plan, ex.args[1])
+    return length(p.dims) == 2 && _array_index_kind(plan, ex) === :gather &&
+        ex.args[3] === :(:)
+end
+
+function _model_vector_value(ex, plan)
+    if ex isa Symbol
+        _is_array_param(plan, ex) && return length(_array_param(plan, ex).dims) == 1
+        return ex in _vector_value_names(plan)
+    end
+    ex isa Expr && ex.head === :ref || return false
+    (_is_array_param(plan, ex.args[1]) ||
+        _is_array_assignment(plan, ex.args[1])) || return false
+    return count(isequal(:(:)), ex.args[2:end]) == 1 &&
+        all(_is_position, ex.args[2:end])
 end
 
 function _validate_parameters(plan::StructuralPlan)
@@ -6317,6 +6356,12 @@ function _validate_predictors(plan::StructuralPlan)
 end
 
 function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    if _parameter_term(t)
+        _validate_parameter_term(t, plan)
+        t = TermSpec(t.kind, t.columns,
+            Base.structdiff(t.options, (parameter = nothing, sign = nothing)),
+            t.addressee, t.label)
+    end
     if t.kind === VaryingEffectTerm
         _validate_effect_term(t, pred)
         return nothing
@@ -6375,6 +6420,21 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
             isempty(t.columns) ||
                 _fail(t.label, "intercept term takes no columns")
         end
+    end
+    return nothing
+end
+
+function _validate_parameter_term(t::TermSpec, plan::StructuralPlan)
+    name = t.options.parameter
+    name isa Symbol || _fail(t.label, "affine parameter must be a name")
+    t.options.sign in (-1, 1) || _fail(t.label,
+        "affine parameter sign must be -1 or 1")
+    if t.kind in (FactorTerm, MatrixTerm)
+        any(p -> p.name === name, plan.array_parameters) || _fail(t.label,
+            "affine term reads unknown array parameter $name")
+    else
+        any(p -> p.name === name, plan.parameters) || _fail(t.label,
+            "affine term reads unknown scalar parameter $name")
     end
     return nothing
 end
@@ -6851,8 +6911,10 @@ function _validate_levelmaps(plan::StructuralPlan)
                 col = only(t.columns)
                 m = _find_levelmap(plan.levelmaps, pred.name, col)
                 m === nothing && continue
-                msg = _full_cover_unidentified(pred.name, col, m,
-                    plan.population_priors)
+                msg = _parameter_term(t) ?
+                    _parameter_factor_unidentified(pred, t, m, plan) :
+                    _full_cover_unidentified(pred.name, col, m,
+                        plan.population_priors)
                 msg === nothing || _fail(pred.label, msg)
             end
         end
@@ -6864,6 +6926,24 @@ function _validate_levelmaps(plan::StructuralPlan)
         _validate_subset_shape(m)
     end
     return nothing
+end
+
+function _parameter_factor_unidentified(pred, t, m, plan)
+    m.subset === Colon() || return nothing
+    p = only(p for p in plan.array_parameters
+        if p.name === t.options.parameter)
+    shape = get(_COEF_SHAPES, p.family, nothing)
+    rows = PopulationPrior[]
+    if shape !== nothing
+        _, loc, scale, _ = shape
+        vs = values(p.args)
+        l, s = vs[loc], vs[scale]
+        if (l isa Real || l isa Symbol) && (s isa Real || s isa Symbol)
+            push!(rows, PopulationPrior(pred.name, only(t.columns),
+                p.family, l, s))
+        end
+    end
+    return _full_cover_unidentified(pred.name, only(t.columns), m, rows)
 end
 
 # Intercept + full-cover factor (the surface and contract gates share this
@@ -7115,6 +7195,7 @@ function _validate_priors(plan::StructuralPlan)
         # per matrix column).
         addressees = Set{Symbol}()
         for t in pred.terms
+            _parameter_term(t) && continue
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
                 t.kind === VaryingEffectTerm ||
                 t.kind === SplineSummandTerm ||
@@ -7145,7 +7226,8 @@ function _validate_priors(plan::StructuralPlan)
             end
             push!(addressees, t.addressee)
         end
-        any(t -> t.kind === InterceptTerm, pred.terms) && push!(addressees, :Intercept)
+        any(t -> t.kind === InterceptTerm && !_parameter_term(t),
+            pred.terms) && push!(addressees, :Intercept)
         for a in addressees
             # A horseshoe predictor covers an addressee by its entry or by
             # a synthesized Normal scalar (family checked in
@@ -7159,6 +7241,7 @@ function _validate_priors(plan::StructuralPlan)
     end
     for r in plan.responses
         _is_glm_family(r.family) || continue
+        _is_array_param(plan, r.glm_beta) && continue
         m = _find_matrix(plan, r.predictor)
         m === nothing && continue
         for c in m.columns

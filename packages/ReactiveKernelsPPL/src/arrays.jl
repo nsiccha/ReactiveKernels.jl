@@ -53,14 +53,21 @@ _array_flat_name(name::Symbol, ndims::Int) =
 
 # ── dims: forms and bind-time sizes ──────────────────────────────────
 
-_is_levels_dim(d) = d isa Expr && d.head === :call && length(d.args) == 2 &&
-    d.args[1] === :levels && d.args[2] isa Symbol
+_is_levels_dim(d) = d isa Expr && d.head === :call &&
+    length(d.args) in (2, 3) && d.args[1] === :levels &&
+    d.args[2] isa Symbol && (length(d.args) == 2 || d.args[3] isa QuoteNode)
+_levels_subset(d) = length(d.args) == 2 ? Colon() : d.args[3].value
 _is_axis_dim(d) = d isa Expr && d.head === :call && length(d.args) == 3 &&
     (d.args[1] === :axes || d.args[1] === :size) && d.args[2] isa Symbol &&
     (d.args[3] === 1 || d.args[3] === 2)
 
 function _validate_array_dim(p::ArrayParameter, d)
     d isa Int && d >= 1 && return nothing
+    if _is_levels_dim(d)
+        _validate_subset_shape(LevelMap(p.name, d.args[2], [], :levels,
+            _levels_subset(d)))
+        return nothing
+    end
     (_is_levels_dim(d) || _is_axis_dim(d) || _levels_count(d) !== nothing) &&
         return nothing
     _fail(p.label, "array $(p.name) axis $(repr(d)) is not a size: axes " *
@@ -82,7 +89,11 @@ end
 
 function _array_dim_size(plan::StructuralPlan, p::ArrayParameter, d)
     d isa Int && return d
-    _is_levels_dim(d) && return length(_array_axis_levels(plan, p, d.args[2]))
+    if _is_levels_dim(d)
+        levels = _array_axis_levels(plan, p, d.args[2])
+        return length(_apply_subset(levels,
+            LevelMap(p.name, d.args[2], [], :levels, _levels_subset(d))))
+    end
     cnt = _levels_count(d)
     if cnt !== nothing
         g, k = cnt
@@ -783,8 +794,13 @@ function _array_gather_rewrite(ex, plan::StructuralPlan,
         d = p.dims[1]
         if _is_levels_dim(d)
             g, h = ex.args[2], d.args[2]
-            push!(needed, (g, h))
-            return Expr(:ref, p.name, _array_level_index_name(g, h),
+            push!(needed, (g, p.name))
+            codes = _array_level_index_name(g, p.name)
+            if _levels_subset(d) !== Colon()
+                return Expr(:ref, Expr(:call, :vcat, 0.0, p.name),
+                    Expr(:call, :.+, codes, 1))
+            end
+            return Expr(:ref, p.name, codes,
                 ex.args[3:end]...)
         end
         return ex
@@ -798,12 +814,15 @@ end
 function _array_level_index_statements(plan::StructuralPlan,
         needed::Set{Tuple{Symbol,Symbol}})
     stmts = Expr[]
-    for (g, h) in sort!(collect(needed))
-        p = first(q for q in plan.array_parameters
-            if _is_levels_dim(q.dims[1]) && q.dims[1].args[2] === h)
+    for (g, name) in sort!(collect(needed))
+        p = _array_param(plan, name)
+        d = p.dims[1]
+        h = d.args[2]
         lv = _array_axis_levels(plan, p, h)
+        lv = _apply_subset(lv, LevelMap(p.name, h, [], :levels,
+            _levels_subset(d)))
         lvlvec = Expr(:vect, (_level_literal(l) for l in lv)...)
-        push!(stmts, :($(_array_level_index_name(g, h)) =
+        push!(stmts, :($(_array_level_index_name(g, name)) =
             _declared_codes($g, $lvlvec)))
     end
     return stmts

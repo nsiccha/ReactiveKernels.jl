@@ -68,6 +68,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _scan_reconstruction_statements(plan, layout))
     append!(stmts, _dar_reconstruction_statements(plan, layout))
     append!(stmts, _horseshoe_coef_statements(plan))
+    append!(stmts, _affine_coefficient_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _event_lp_statements(plan))
     append!(stmts, _likelihood_statements(plan))
@@ -78,6 +79,69 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     sig = Expr(:call, name, :(unconstrained::Vector{Float64}),
         (_data_arg(colname, col) for (colname, col) in _ordered_columns(plan))...)
     return Expr(:(=), sig, Expr(:block, stmts...))
+end
+
+# Pack references to constrained parameter values for the affine matmul.
+# Only authored terms are expanded; array sizes remain array operations.
+function _affine_coefficient_statements(plan::StructuralPlan, layout::LayoutTable)
+    stmts = Expr[]
+    for p in plan.predictors
+        _parameter_terms(p) || continue
+        shape = design_shape(p, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
+        chunks = Any[]
+        legacy_offset = 0
+        for (t, b) in zip(p.terms, shape.blocks)
+            b.width == 0 && continue
+            if _parameter_term(t)
+                value = t.options.parameter
+                push!(chunks, t.options.sign == 1 ? value : :(-$value))
+            else
+                coef = block_name(p.name)
+                push!(chunks, Expr(:ref, coef,
+                    Expr(:call, :(:), legacy_offset + 1,
+                        legacy_offset + b.width)))
+                legacy_offset += b.width
+            end
+        end
+        if length(chunks) == 1 && any(t -> _parameter_term(t) &&
+                t.kind in (FactorTerm, MatrixTerm), p.terms)
+            rhs = only(chunks)
+        else
+            rhs = _affine_coordinate_view(p, shape, layout)
+            rhs === nothing && (rhs = :(vcat($(chunks...))))
+        end
+        push!(stmts, :($(_affine_block_name(p)) = $rhs))
+    end
+    return stmts
+end
+
+# A contiguous run of identity-transformed declarations needs no packing
+# allocation. This is an optimization of parameter reads, not their layout.
+function _affine_coordinate_view(pred, shape, layout)
+    reads = Tuple{Symbol,Int}[]
+    for (t, b) in zip(pred.terms, shape.blocks)
+        b.width == 0 && continue
+        _parameter_term(t) && t.options.sign == 1 || return nothing
+        push!(reads, (t.options.parameter, b.width))
+    end
+    return _parameter_coordinate_view(reads, layout)
+end
+
+function _parameter_coordinate_view(reads, layout)
+    start = nothing
+    stop = nothing
+    for (name, width) in reads
+        i = findfirst(e -> e.name === name, layout.entries)
+        i === nothing && return nothing
+        e = layout.entries[i]
+        e.transform === :identity && e.size == width || return nothing
+        stop === nothing || e.offset == stop + 1 || return nothing
+        start === nothing && (start = e.offset)
+        stop = e.offset + e.size - 1
+    end
+    start === nothing && return nothing
+    return :(view(unconstrained, $start:$stop))
 end
 
 # Reassemble split coefficient blocks: predictors whose layout holds
@@ -270,7 +334,7 @@ function _predictor_statements(plan::StructuralPlan)
         if any(b -> b.kind === MonotonicTerm, shape.blocks)
             append!(terms, _mo_block_terms(plan, shape))
         elseif shape.width > 0
-            push!(terms, :($(design_name(pred.name)) * $(block_name(pred.name))))
+            push!(terms, :($(design_name(pred.name)) * $(_affine_block_name(pred))))
         end
         if any(b -> b.kind === OffsetTerm, shape.blocks)
             push!(terms, offset_name(pred.name))
@@ -377,7 +441,8 @@ _coef_coord(coef::Symbol, k::Int) = :(sum(view($coef, $k:$k)))
 # blocks keep the data-matrix × coefficient-slice matvec. Predictors
 # without `mo` keep the fused form above, untouched.
 function _mo_block_terms(plan::StructuralPlan, shape::DesignShape)
-    coef = block_name(shape.predictor)
+    pred = only(p for p in plan.predictors if p.name === shape.predictor)
+    coef = _affine_block_name(pred)
     terms = Any[]
     k = 1
     for b in shape.blocks
@@ -3257,11 +3322,65 @@ function _mixed_wide_block_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     return nothing
 end
 
+# Group compatible literal scalar priors as an evaluation optimization.
+# Declarations remain the owners of names, transforms and prior arguments.
+function _parameter_prior_groups(plan)
+    groups = Vector{SampledParameter}[]
+    for family in (:normal, :cauchy, :laplace, :logistic, :student_t)
+        ps = SampledParameter[p for p in plan.parameters
+            if p.family === family && p.support_override === nothing &&
+                all(v -> v isa Real, values(p.args))]
+        length(ps) > 1 && push!(groups, ps)
+    end
+    return groups
+end
+
+function _parameter_prior_input(ps, plan, layout)
+    names = [p.name for p in ps]
+    for pred in plan.predictors
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
+        terms = [t for (t, b) in zip(pred.terms, shape.blocks) if b.width > 0]
+        all(t -> _parameter_term(t) && t.options.sign == 1, terms) || continue
+        [t.options.parameter for t in terms] == names || continue
+        all(b -> b.width <= 1, shape.blocks) || continue
+        return _affine_block_name(pred)
+    end
+    view = _parameter_coordinate_view([(n, 1) for n in names], layout)
+    return view === nothing ? :(vcat($(names...))) : view
+end
+
+function _parameter_prior_statements!(stmts, terms, plan, layout)
+    grouped = Set{Symbol}()
+    for ps in _parameter_prior_groups(plan)
+        family = first(ps).family
+        _, li, si, ni = _COEF_SHAPES[family]
+        args = [collect(values(p.args)) for p in ps]
+        loc = Float64[a[li] for a in args]
+        sca = Float64[a[si] for a in args]
+        nus = ni == 0 ? fill(NaN, length(ps)) : Float64[a[ni] for a in args]
+        node = Symbol(:_ppl_prior_parameters_, family)
+        _append_coef_plate!(stmts, _parameter_prior_input(ps, plan, layout),
+            node, Symbol(node, :_pw), Symbol(node, :_mu), Symbol(node, :_sd),
+            Symbol(node, :_nu), loc, sca, nus, family)
+        push!(terms, node)
+        union!(grouped, (p.name for p in ps))
+    end
+    for p in plan.parameters
+        p.name in grouped && continue
+        node = Symbol(:_ppl_prior_, p.name)
+        push!(stmts, :($node::Float64 = $(_sampled_prior_expr(p))))
+        push!(terms, node)
+    end
+    return nothing
+end
+
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}())
     stmts = Expr[]
     terms = Any[]
     for pred in plan.predictors
+        pred = _legacy_predictor(pred)
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         shape.width == 0 && continue
@@ -3303,17 +3422,14 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         append!(stmts, _plate_sum_stmts(pw, node, Any[coef, mut, sdt], cell))
         push!(terms, node)
     end
-    for p in plan.parameters
-        node = Symbol(:_ppl_prior_, p.name)
-        push!(stmts, :($node::Float64 = $(_sampled_prior_expr(p))))
-        push!(terms, node)
-    end
+    _parameter_prior_statements!(stmts, terms, plan, layout)
     # GLM-object coefficient vectors: the same plate-prior shape as a
     # population-prior coefficient block, driven by the response matrix
     # columns (priors addressed by response label — validation pins
     # full coverage).
     for r in plan.responses
         _is_glm_family(r.family) || continue
+        _is_array_param(plan, r.glm_beta) && continue
         m = _find_matrix(plan, r.predictor)
         cols = Symbol[c for c in m.columns if c !== nothing]
         loc = Float64[]

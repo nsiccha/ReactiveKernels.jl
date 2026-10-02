@@ -107,8 +107,9 @@ A per-cell call (`col[i] ~ sm(…)` inside `@plate for i …`) namespaces as
 A fused stream def (design + coefficients inside, Stan
 `bernoulli_logit_glm`-style) keeps the response shell but NOT the predictor
 name: its affine local namespaces under the data LHS (`y_mu`), and an inline
-compound location synthesizes (`y_eta`) — both move the lowered predictor and
-its `<predictor>_coef` block. To factor design + coefficients into a def
+compound location synthesizes (`y_eta`) — both move the lowered predictor.
+Ordinary parameter names follow their declarations; legacy construct-owned
+coefficient blocks follow the predictor. To factor design + coefficients into a def
 WITHOUT moving names, return the affine from a latent def and bind it at a
 named use site (`mu ~ affine_def(X, b)`, then `y .~ family.(...mu...)`): the
 use-site LHS names the predictor, and the plan is identical to the
@@ -495,15 +496,15 @@ distinct private modules never collide: one fresh `Module` per lowering,
 each holding its own `@rkppl name(args...) = ...` defs, is sufficient for
 concurrent independent lowerings with no shared lock.
 
-Coefficients are ordinary named parameters. A scalar `b ~ Fam(...)` used as
-`b .* x` lowers into its predictor's coefficient block (the fast affine
-path) only when its prior is a coefficient prior (`Normal`, `StudentT`,
-`Cauchy`, `Laplace`, `Logistic`, `Flat`, `Uniform` over literal, name or
-expression arguments) and the predictor is its only reader. Any other
-`b` — a positive-support prior, or a name another prior, assignment,
-column or predictor also reads — is an ordinary sampled parameter, and
-each summand that reads it lowers as an in-graph derived column. The
-density is the same either way.
+Declared coefficients are ordinary named parameters. A scalar
+`b ~ Fam(...)` keeps its name, prior and transform when an affine term
+reads it as `b .* x`. A sized declaration such as `c[levels(g)]` or
+`b[axes(X, 2)]` remains an array parameter when read as `c[g]` or `X * b`.
+Affine optimization records references to those values and may pack their
+reads for a matrix multiply. Other predictors, assignments and prior
+arguments can read the same declaration without changing its coordinates
+or adding another prior. Explicit whole-predictor R2D2 and Horseshoe
+constructs retain their construct-owned coefficient packs.
 
 Data are values of any shape. Given the values (`data`), lowering reads
 each one's shape: a number has no observation axis, so it lowers as a
@@ -543,41 +544,40 @@ function _lower_rkppl(ast, data_names, scalars::Set{Symbol},
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast, data = _scalar_value_definitions(ast, data, scalars)
     ast, pins = _expand_submodels(ast, data, mod)
-    # Fixed point over demotions: a coefficient candidate the affine path
-    # cannot own (another reader, a second predictor or column) is demoted
-    # to an ordinary sampled parameter and lowering restarts. Each round
-    # removes one name, so this terminates within the candidate count.
-    demoted = Set{Symbol}()
-    while true
-        try
-            return _lower_rkppl_once(ast, data, copy(pins), demoted, mod)
-        catch e
-            e isa _DemoteCoefficient || rethrow()
-            e.name in demoted && _sfail("internal: coefficient $(e.name) " *
-                                        "demoted twice")
-            push!(demoted, e.name)
-        end
-    end
+    return _lower_rkppl_once(ast, data, pins, mod)
 end
 
-"""Internal control flow of [`lower_rkppl`](@ref): the scalar coefficient
-candidate `name` must lower as an ordinary sampled parameter (it has a
-reader outside its coefficient position). Never escapes `lower_rkppl`."""
-struct _DemoteCoefficient <: Exception
-    name::Symbol
-end
-
-# Demote a scalar coefficient candidate (restart lowering with `name` as an
-# ordinary parameter) — or, for a name the affine path cannot demote
-# (factor/matrix coefficient vectors, construct-owned coefficients), fail
-# with `msg`.
-function _demote_or_fail(name::Symbol, ctx, msg)
-    name in ctx.demotable && throw(_DemoteCoefficient(name))
+# Ordinary parameters may have any number of readers. Legacy
+# construct-owned coefficients retain their ownership checks.
+function _check_owned_coefficient(name::Symbol, ctx, msg)
+    name in ctx.ordinary_parameters && return nothing
     return _sfail(msg)
 end
 
-function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
-        mod::Module)
+function _ordinary_sampling(s)
+    s.dims !== nothing && return true
+    s.matrix !== nothing && return true
+    s.levels !== nothing && return true
+    s.broadcast && return false
+    rhs = s.rhs
+    return rhs isa Expr && rhs.head === :call &&
+        rhs.args[1] in union(keys(_PARAM_FAMILIES),
+            (:HalfNormal, :HalfCauchy, :Flat, :truncated))
+end
+
+function _bind_parameter_terms!(predictors, structured)
+    for (i, p) in enumerate(predictors)
+        p.name in structured || continue
+        # Explicit whole-predictor constructs own their coefficient pack.
+        terms = TermSpec[_parameter_term(t) ? TermSpec(t.kind, t.columns,
+            (; (k => v for (k, v) in pairs(t.options)
+                if k ∉ (:parameter, :sign))...), t.addressee, t.label) : t
+            for t in p.terms]
+        predictors[i] = PredictorSpec(p.name, p.link, terms, p.label)
+    end
+end
+
+function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module)
     sample, det, plate_ctx, plate_specs, scans, bases, vectors,
     hbases, kplates, kstmts, schedules, event_lps, r2d2decls, joints,
     varying_draws, varying_pending, glms = _partition_statements(ast, data)
@@ -626,17 +626,14 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
             s.lhs ∉ data && s.lhs in detnames_all)
     sampled_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     prior_names = setdiff(sampled_names, derived_response_names)
-    # Sampled names usable as predictor coefficients: coefficient-priored
-    # scalars (see `_COEF_FAMILIES`, arguments a coefficient prior can
-    # carry — `_coef_prior_expressible`) plus per-coefficient
-    # `~ Horseshoe()` scalars (the horseshoe triple synthesis in
-    # `_lower_horseshoe_priors`). Demoted names are ordinary parameters.
-    # Only the plain scalar candidates are demotable (vector coefficients
-    # and horseshoe scalars have no ordinary-parameter spelling).
-    demotable = Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data && s.lhs ∉ demoted && !s.broadcast &&
-            _is_coef_prior_call(s.rhs) && _coef_prior_expressible(s.rhs))
-    coef_priors = union(demotable, Set{Symbol}(s.lhs for s in sample
+    # Declarations determine value/prior semantics. Affine recognition
+    # may use these values regardless of their prior or other readers.
+    ordinary_parameters = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && _ordinary_sampling(s))
+    scalar_parameters = Set{Symbol}(s.lhs for s in sample
+        if s.lhs in ordinary_parameters && !s.broadcast &&
+            s.dims === nothing)
+    coef_priors = union(scalar_parameters, Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_horseshoe_call(s.rhs)))
     # Simplex parameters (`s ~ Dirichlet(...)`): the only names a
     # monotonic term accepts as its increments (checked during response
@@ -759,7 +756,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # Interned predictors by name (shared with `ctx`: a composition over a
     # definition already interned as a predictor reads its LP node).
     pred_idx = Dict{Symbol,Int}()
-    ctx = (; data, detmap = canonmap, prior_names, coef_priors, demotable,
+    ctx = (; data, detmap = canonmap, prior_names, coef_priors,
+        ordinary_parameters,
         detshape, shape_env,
         vecdefs, structural, derived_responses = derived_response_names,
         pred_idx,
@@ -809,7 +807,22 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         array_decls = array_decls,
         value_arrays = value_arrays,
         factor_decls = factor_decls,
+        factor_axes = Dict{Symbol,Any}(s.lhs => s.levels for s in sample
+            if s.levels !== nothing),
         sized_decls = sized_decls)
+    # Lower ordinary declarations before the optional affine analysis.
+    # Whole-predictor legacy priors retain their explicit construction
+    # path; sized positional declarations wait for response-specific
+    # threshold validation, independently of affine recognition.
+    semantic_first = isempty(r2d2decls) &&
+        !any(s -> _is_horseshoe_call(s.rhs), sample)
+    declarations = [s for s in sample if semantic_first &&
+        s.lhs in ordinary_parameters && s.dims === nothing]
+    declared_names = Set(s.lhs for s in declarations)
+    declared_params, declared_syms, declared_vectors, declared_arrays =
+        _lower_parameters(declarations,
+            Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}(), ctx,
+            Dict{Symbol,Tuple{Symbol,Symbol}}())
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
     coefuse = Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}()
@@ -893,7 +906,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     end
     _check_coefficient_uses(coefuse, ctx)
     for c in ctx.scan_coefs
-        haskey(coefuse, c) && _demote_or_fail(c, ctx, "$c is both a " *
+        haskey(coefuse, c) && _check_owned_coefficient(c, ctx, "$c is both a " *
             "predictor coefficient and a scan coefficient — scan " *
             "coefficients are sampled scalars, not population " *
             "coefficients (rename one)")
@@ -906,8 +919,14 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     varying_slices = _finalize_varying_slices(ctx)
     r2d2set = Set{Symbol}(d.predictor for d in r2d2decls)
     hsset = _horseshoe_predictors(sample, coefuse, predictors, r2d2set)
+    # Affine analysis has finished. Bind its uses to the declarations,
+    # leaving the declaration's prior and every other reader untouched.
+    _bind_parameter_terms!(predictors, union(r2d2set, hsset))
+    owned_coefs = Dict(k => v for (k, v) in coefuse
+        if k ∉ ordinary_parameters || any(u -> u[1] in r2d2set ||
+            u[1] in hsset, v))
     for c in ctx.dar_coefs
-        haskey(coefuse, c) && _demote_or_fail(c, ctx, "$c is both a " *
+        haskey(coefuse, c) && _check_owned_coefficient(c, ctx, "$c is both a " *
             "predictor coefficient and a dar trajectory parameter — dar " *
             "parameters are sampled scalars, not population coefficients " *
             "(rename one)")
@@ -927,6 +946,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
         ctx.matrices, hyper_names, ctx, r2d2set, hsset)
     for (beta, (label, X)) in glmuse
+        beta in ordinary_parameters && continue
         append!(priors, _lower_glm_beta_priors(label, beta, X, sample,
             ctx.matrices, hyper_names))
     end
@@ -935,7 +955,15 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     hses, hsparams = _lower_horseshoe_priors(sample, coefuse, predictors,
         hsset, taken)
     params, paramsyms, dirichlets, arrays =
-        _lower_parameters(sample, coefuse, ctx, glmuse)
+        _lower_parameters([s for s in sample if s.lhs ∉ declared_names],
+            owned_coefs, ctx, glmuse)
+    prepend!(params, declared_params)
+    union!(paramsyms, declared_syms)
+    prepend!(dirichlets, declared_vectors)
+    prepend!(arrays, declared_arrays)
+    # Declaration order is independent of which values the optimizer used.
+    declaration_order = Dict(s.lhs => i for (i, s) in enumerate(sample))
+    sort!(arrays; by = p -> declaration_order[p.name])
     # Coefficient-prior hyperparameters read their names too (an inlined
     # scalar definition that is also a prior scale must still emit).
     for pr in priors, v in (pr.location, pr.scale)
@@ -4349,13 +4377,15 @@ const _MATRIX_OPERAND_HEADS = (:+, :-, :*, :/, :^, :\, ELEMENTWISE_OPS...)
 # Value reads of the matrices `mats` in `ex`: `X * v` with `valued(X, v)`,
 # and, inside a definition (`indef`), `X` as an argument of a function call
 # (`eachcol(X)`, `size(X, 2)`), an indexed `X[...]`, or `X'`.
-function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool)
+function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool;
+        affine::Bool = true)
     ex isa Expr || return out
     a = ex.args
     if ex.head === :call && length(a) == 3 && a[1] === :* &&
             a[2] isa Symbol && a[2] in mats
-        valued(a[2], a[3]) && push!(out, a[2])
-        return _matrix_value_reads!(out, a[3], mats, valued, indef)
+        (!affine || valued(a[2], a[3])) && push!(out, a[2])
+        return _matrix_value_reads!(out, a[3], mats, valued, indef;
+            affine = false)
     end
     if indef
         isarg(x) = x isa Symbol && x in mats
@@ -4366,8 +4396,11 @@ function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool)
             push!(out, a[1])
         end
     end
+    child_affine = affine && ex.head === :call && !isempty(a) &&
+        a[1] in (:+, :.+, :-, :.-)
     for x in a
-        _matrix_value_reads!(out, x, mats, valued, indef)
+        _matrix_value_reads!(out, x, mats, valued, indef;
+            affine = child_affine)
     end
     return out
 end
@@ -4953,9 +4986,8 @@ _is_axes2_call(index) =
 # Declared array parameters ([`ArrayParameter`](@ref)): `z[1:K] .~ ...`
 # (a literal range over a non-data name) and two-axis `z[a, b] .~ ...`
 # (each axis `1:K`, `levels(g)`, or `axes(M, d)`). One-axis
-# `z[levels(g)]` / `z[axes(X, 2)]` keep their coefficient-prior parse:
-# they are arrays exactly when no predictor consumes them as
-# coefficients. Returns `(name, dims)` or `nothing` (not an array).
+# `z[levels(g)]` / `z[axes(X, 2)]` have separate parse arms but the same
+# ordinary array semantics. Returns `(name, dims)` or `nothing`.
 function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol})
     lhs isa Expr && lhs.head === :ref || return nothing
     target = lhs.args[1]
@@ -6886,7 +6918,7 @@ function _lower_glm_response(g::GLMSampleStmt, sample, prior_names::Set{Symbol},
         "has an intercept-ones position — pass intercept-free X and a " *
         "separate alpha")
     for (nm, role) in ((g.alpha, "intercept"), (g.beta, "coefficients"))
-        haskey(coefuse, nm) && _sfail(
+        haskey(coefuse, nm) && nm ∉ ctx.ordinary_parameters && _sfail(
             "response $(g.response): `$(g.head)` $role $nm is also a " *
             "predictor coefficient — one use per name")
     end
@@ -6909,7 +6941,7 @@ function _lower_glm_response(g::GLMSampleStmt, sample, prior_names::Set{Symbol},
         sigma in prior_names || _sfail(
             "response $(g.response): `$(g.head)` sigma $sigma needs " *
             "a prior statement or a positive literal")
-        haskey(coefuse, sigma) && _sfail(
+        haskey(coefuse, sigma) && sigma ∉ ctx.ordinary_parameters && _sfail(
             "response $(g.response): `$(g.head)` sigma $sigma is also " *
             "a predictor coefficient — one use per name")
     end
@@ -8293,10 +8325,8 @@ function _record_coefuses!(coefuse, pname, uses, lhs)
     return nothing
 end
 
-# One coefficient block owns each coefficient: a name used twice (in one
-# predictor, across predictors, or on two columns) is an ordinary
-# parameter read by several summands — a scalar candidate demotes; a
-# vector coefficient fails naming the uses.
+# Multiple reads are legal for ordinary parameters. Legacy coefficient
+# packs require unique ownership, checked here after predictor analysis.
 function _check_coefficient_uses(coefuse, ctx)
     for (name, uses) in coefuse
         length(uses) > 1 || continue
@@ -8308,21 +8338,19 @@ function _check_coefficient_uses(coefuse, ctx)
             "coefficient $name is used twice in predictor $(only(preds)) " *
             "($(join(unique!(map(u -> u[2], copy(uses))), ", "))) — one " *
             "coefficient per column"
-        _demote_or_fail(name, ctx, msg)
+        _check_owned_coefficient(name, ctx, msg)
     end
     return nothing
 end
 
-# Every other reader of a coefficient — a prior or parameter argument, an
-# assignment, a derived column, a response slot — demotes a scalar
-# candidate to an ordinary parameter (its summands then lower as derived
-# columns); a vector coefficient fails naming the reader.
+# Other readers do not alter ordinary parameter semantics. Reject readers
+# of legacy construct-owned coefficient packs that cannot represent them.
 function _check_coefficient_readers(coefuse, ctx, predictors, priors,
         params, plate_parameters, assigns, derived, responses)
     isempty(coefuse) && return nothing
     function read!(who, s)
         s isa Symbol && haskey(coefuse, s) || return nothing
-        return _demote_or_fail(s, ctx, "$s is a predictor coefficient and " *
+        return _check_owned_coefficient(s, ctx, "$s is a predictor coefficient and " *
                                "cannot also be read by $who")
     end
     for p in predictors, t in p.terms
@@ -8755,7 +8783,7 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
     for c in scalars
         if haskey(coefuse, c)
             owners = join(unique!(map(first, copy(coefuse[c]))), ", ")
-            _demote_or_fail(c, ctx, "predictor $pname: scalar $c is a " *
+            _check_owned_coefficient(c, ctx, "predictor $pname: scalar $c is a " *
                 "coefficient of predictor $owners — a scalar leaf cannot " *
                 "also be a coefficient (rename one)")
         end
@@ -8795,19 +8823,28 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
             # per column, across matrix and affine terms alike).
             addrs = addr in keys(ctx.matrices) ?
                 _matrix_element_addressees(ctx.matrices[addr]) : (addr,)
-            # One name reused on another column (`b .* x .+ b .* x1`) is
-            # one ordinary parameter read twice. Two names on one column
-            # (`b .* x .+ c .* x`, a stray second intercept) are an exact
-            # likelihood ridge and stay refused.
-            any(u -> u[1] === name, uses) && _demote_or_fail(name, ctx,
+            # Ordinary parameters can share columns and have multiple readers.
+            # Legacy construct-owned coefficients retain one-owner checks.
+            any(u -> u[1] === name, uses) && _check_owned_coefficient(name, ctx,
                 "predictor $pname: coefficient $name is used twice")
             for a in addrs
-                haskey(addr_owner, a) && _sfail(
+                haskey(addr_owner, a) && addr_owner[a] !== name &&
+                    !(name in ctx.ordinary_parameters &&
+                        addr_owner[a] in ctx.ordinary_parameters) && _sfail(
                     "predictor $pname: column $a has two coefficients " *
                     "$(addr_owner[a]) and $name — one coefficient per column")
                 addr_owner[a] = name
             end
             push!(uses, use)
+            if name in ctx.ordinary_parameters && term.kind in
+                    (InterceptTerm, ContinuousTerm, FactorTerm,
+                     MatrixTerm, MonotonicTerm)
+                # Record the exact use here: an addressee lookup loses identity
+                # when distinct parameters multiply the same column.
+                term = TermSpec(term.kind, term.columns,
+                    merge(term.options, (; parameter = name, sign)),
+                    term.addressee, term.label)
+            end
         end
         push!(terms, term)
     end
@@ -9605,6 +9642,10 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
                                      "takes `coefficients[group]` exactly, " *
                                      "got $(repr(core))")
     base, idx = core.args
+    if haskey(ctx.factor_axes, base) &&
+            idx !== ctx.factor_axes[base][1]
+        return _extract_summand(pname, core, sign, ctx)
+    end
     # A literal element (`phi[1]`) is one scalar, not a per-level column.
     idx isa Integer && return _scalar_summand_error(pname, core)
     base isa Symbol || _sfail("predictor $pname: factor base must be a " *
@@ -9660,8 +9701,7 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
     for s in sample
         haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
     end
-    # (Multiple uses of one coefficient were settled by
-    # `_check_coefficient_uses` — demoted or refused.)
+    # Multiple reads were validated by `_check_coefficient_uses`.
     priors = PopulationPrior[]
     levelmaps = LevelMap[]
     for pred in predictors
@@ -9671,6 +9711,20 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
         pred.name in r2d2 && continue
         pred.name in hs && continue
         for t in pred.terms
+            if _parameter_term(t)
+                if t.kind === FactorTerm
+                    name = t.options.parameter
+                    s = stated[name]
+                    gcol, subset = s.levels
+                    col = only(t.columns)
+                    gcol === col || _sfail("parameter $name: levels " *
+                        "column $gcol differs from use column $col")
+                    any(m -> m.predictor === pred.name && m.column === col,
+                        levelmaps) || push!(levelmaps,
+                        LevelMap(pred.name, col, [], :levels, subset))
+                end
+                continue
+            end
             # Offsets carry no coefficient; latent terms carry a PlateParameter
             # whose prior lives on the plate parameter, not as a coefficient;
             # effect terms carry a VaryingDraws, whose geometry is
@@ -9719,7 +9773,8 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                 nu))
         end
     end
-    _check_identified(predictors, levelmaps, matrices, priors)
+    _check_identified(PredictorSpec[_legacy_predictor(p) for p in predictors],
+        levelmaps, matrices, priors)
     return priors, levelmaps
 end
 
@@ -10553,16 +10608,14 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
             continue
         end
         haskey(coefuse, s.lhs) && continue
-        haskey(glmuse, s.lhs) && continue
-        # A sized declaration no predictor consumes as coefficients is a
-        # declared array parameter (a value the model reads by name).
+        haskey(glmuse, s.lhs) && s.lhs ∉ ctx.ordinary_parameters && continue
+        # Sized declarations are ordinary array parameters.
         if s.levels !== nothing
             gcol, sub = s.levels
-            sub === Colon() || _sfail("array $(s.lhs) declares a level " *
-                "subset `$(s.lhs)[levels($gcol)[...]]` — subsets size " *
-                "factor coefficients; an array spans all of `levels($gcol)`")
+            dim = sub === Colon() ? Expr(:call, :levels, gcol) :
+                Expr(:call, :levels, gcol, QuoteNode(sub))
             push!(arrays, _lower_array_parameter(s.lhs,
-                Any[Expr(:call, :levels, gcol)], s.rhs, coefuse, ctx, syms))
+                Any[dim], s.rhs, coefuse, ctx, syms))
             continue
         end
         if s.matrix !== nothing

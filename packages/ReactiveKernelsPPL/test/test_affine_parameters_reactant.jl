@@ -1,0 +1,64 @@
+using Reactant
+
+@testset "ordinary affine parameters compile with their gradients" begin
+    scalar_ops = Vector{String}[]
+    for n in (4, 9)
+        x = collect(range(-1.0, 1.0; length=n))
+        y = 0.2 .+ 0.3 .* x
+        plan, built = _affine_model(quote
+            a ~ Normal(0, 2)
+            b ~ Normal(0, 1)
+            sigma ~ Exponential(1)
+            mu = a .+ b .* x
+            q = b^2
+            y .~ Normal.(mu, sigma)
+        end; x, y)
+        u = [0.2, -0.3, log(0.8)]
+        post = prepare_query(built, plan, :sampler)
+        ru = Reactant.to_rarray(u)
+        compiled = Reactant.@compile post(ru)
+        push!(scalar_ops, [m.match for m in eachmatch(r"stablehlo\.[a-z_]+",
+            string(Reactant.@code_hlo post(ru)))])
+        @test Float64(compiled(ru)) ≈ post(u)
+        sampler = prepare_sampler(built, plan, u; backend=_GEN_BACKEND)
+        grad = similar(u)
+        val, _ = sampler_value_and_gradient!(sampler, grad, u)
+        cad = compile_ad_value_and_gradient(sampler.ad, ru)
+        rval, rgrad = cad(ru)
+        @test Float64(rval) ≈ val
+        @test Array(rgrad) ≈ grad
+    end
+    @test !isempty(scalar_ops[1])
+    @test scalar_ops[1] == scalar_ops[2]
+
+    factor_ops = Vector{String}[]
+    for k in (3, 6)
+        g = collect(1:k)
+        y = zeros(k)
+        x = collect(range(0.5, 1.5; length=k))
+        plan, built = _affine_model(quote
+            a ~ Normal(0, 2)
+            c[levels(g)[2:end]] .~ Normal.(0, 1)
+            mu = a .+ c[g]
+            shifted = c[g] .* x
+            y .~ Normal.(mu, 1.0)
+            y2 .~ Normal.(shifted, 1.0)
+        end; g, y, x, y2=y)
+        u = collect(range(-0.2, 0.3; length=k))
+        post = prepare_query(built, plan, :sampler)
+        ru = Reactant.to_rarray(u)
+        compiled = Reactant.@compile post(ru)
+        push!(factor_ops, [m.match for m in eachmatch(r"stablehlo\.[a-z_]+",
+            string(Reactant.@code_hlo post(ru)))])
+        @test Float64(compiled(ru)) ≈ post(u)
+        sampler = prepare_sampler(built, plan, u; backend=_GEN_BACKEND)
+        grad = similar(u)
+        val, _ = sampler_value_and_gradient!(sampler, grad, u)
+        cad = compile_ad_value_and_gradient(sampler.ad, ru)
+        rval, rgrad = cad(ru)
+        @test Float64(rval) ≈ val
+        @test Array(rgrad) ≈ grad
+    end
+    @test !isempty(factor_ops[1])
+    @test factor_ops[1] == factor_ops[2]
+end

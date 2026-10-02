@@ -129,7 +129,7 @@ _unexp(responses, predictors, priors, params = SampledParameter[],
     built = build_kernel(bound)
     u = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u)
-    ref = _ref_gaussian(bound.columns, Vector(nt.mu), nt.sigma)
+    ref = _ref_gaussian(bound.columns, [nt.a, nt.b], nt.sigma)
     @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + u[3]
     _check_gradient(built.spec, bound, u)
 end
@@ -147,7 +147,7 @@ end
     built = build_kernel(bound)
     u = [0.25, 0.5]
     nt = constrain(built.layout, u)
-    ref = _ref_bernoulli(bound.columns, Vector(nt.eta))
+    ref = _ref_bernoulli(bound.columns, [nt.a, nt.b])
     @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr
     _check_gradient(built.spec, bound, u)
 end
@@ -344,7 +344,7 @@ end
     built = build_kernel(bound)
     u4 = [0.1, -0.2, 0.3, 0.5]
     nt = constrain(built.layout, u4)
-    ref = _ref_student(bound.columns, Vector(nt.mu), nt.sigma, nt.nu)
+    ref = _ref_student(bound.columns, [nt.a, nt.b], nt.sigma, nt.nu)
     @test _query(built.spec, bound, :posterior, u4) ≈ ref.ll + ref.pr + u4[3] + u4[4]
     _check_gradient(built.spec, bound, u4)
     # Literal nu and sigma.
@@ -1632,7 +1632,7 @@ end
             AssignmentSpec(:s2, :s, :s2),
             AssignmentSpec(:k, 2, :k)])
     @test _plans_equal(got, want)
-    # Inline predictor, negated slope (sign folds into the prior location).
+    # Inline predictor: sign belongs to the read, not the declared prior.
     got = lower_rkppl(quote
         a ~ Normal(1, 2)
         b ~ Normal(3, 4)
@@ -1642,9 +1642,11 @@ end
     @test length(got.predictors) == 1
     @test got.predictors[1].name === :y_eta
     @test got.responses[1].predictor === :y_eta
-    @test got.population_priors ==
-        PopulationPrior[PopulationPrior(:y_eta, :Intercept, 1.0, 2.0),
-            PopulationPrior(:y_eta, :x, -3.0, 4.0)]
+    @test isempty(got.population_priors)
+    @test [p.args for p in got.parameters] ==
+        [(arg1=1, arg2=2), (arg1=3, arg2=4), (arg1=1,)]
+    @test [t.options for t in only(got.predictors).terms] ==
+        [(parameter=:a, sign=1), (parameter=:b, sign=-1)]
     # Shared predictor across two responses lowers once.
     got = lower_rkppl(quote
         mu = a .+ b .* x
@@ -1791,9 +1793,9 @@ end
     end, (:y, :x, :g))
     @test length(got.levelmaps) == 1 &&
         _maps_equal(got.levelmaps[1], LevelMap(:mu, :g, [], :levels, (2, :end)))
-    @test got.population_priors ==
-        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :g, 0.0, 2.0)]
+    @test isempty(got.population_priors)
+    @test only(got.parameters).name === :a
+    @test only(got.array_parameters).name === :c
     # Intercept + full cover: the identifiability gate.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -1810,8 +1812,8 @@ end
         @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g))
     end
     # Levels column must match the use column; levels() takes one data column.
-    for lhs in (:(c[levels(h)]), :(c[unique(g)]), :(c[sort(g)]),
-            :(c[levels()]), :(c[levels(g, 1)]), :(c[levels(x)]),
+    for lhs in (:(c[unique(g)]), :(c[sort(g)]),
+            :(c[levels()]), :(c[levels(g, 1)]),
             :(c[f(g)]), :(y[levels(g)]))
         block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
@@ -1849,7 +1851,7 @@ end
         Expr(:call, :.~, :(c[levels(g)]), :(Normal(0, 2))),
         :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
     # Non-literal broadcast args are not per-level priors.
-    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+    @test_throws ContractValidationError lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(m, 2))),
         :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
     # Levels prior on a non-factor coefficient.
@@ -1865,7 +1867,7 @@ end
         :(mu = c[g]),
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
         :(y .~ Normal.(mu, 1.5))), (:y, :g))
-    @test only(zplan.array_parameters).name === :z
+    @test Set(p.name for p in zplan.array_parameters) == Set((:z, :c))
     # A bound levels-subset is plain metadata: it reuses the inline grammar
     # and is admitted by `=`, not by `~`.
     got = lower_rkppl(quote
@@ -1940,12 +1942,12 @@ end
     built = build_kernel(bound)
     u = [0.2, -0.1, 0.3, 0.0]
     nt = constrain(built.layout, u)
-    mu = Vector(nt.mu)[cols[:g]]
+    mu = Vector(nt.c)[cols[:g]]
     si = nt.s
     ll = sum(logpdf.(Normal.(mu, si), cols[:y]))
-    pr = sum(logpdf.(Normal(0, 2), Vector(nt.mu))) +
+    pr = sum(logpdf.(Normal(0, 2), Vector(nt.c))) +
         logpdf(Exponential(1), si)
-    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[4]
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
     _check_gradient(built.spec, bound, u)
     # Subset + intercept: reference rows ride the intercept.
     m2 = @rkppl begin
@@ -1960,14 +1962,14 @@ end
     built2 = build_kernel(bound2)
     u2 = [0.5, 0.2, -0.1, 0.0]
     nt2 = constrain(built2.layout, u2)
-    coef = Dict(1 => 0.0, 2 => nt2.mu[2], 3 => nt2.mu[3])
-    mu2 = [nt2.mu[1] + coef[g] for g in cols[:g]]
+    coef = Dict(1 => 0.0, 2 => nt2.c[1], 3 => nt2.c[2])
+    mu2 = [nt2.a + coef[g] for g in cols[:g]]
     si2 = nt2.s
     ll2 = sum(logpdf.(Normal.(mu2, si2), cols[:y]))
-    pr2 = logpdf(Normal(0, 1), nt2.mu[1]) +
-        sum(logpdf.(Normal(0, 2), Vector(nt2.mu)[2:3])) +
+    pr2 = logpdf(Normal(0, 1), nt2.a) +
+        sum(logpdf.(Normal(0, 2), Vector(nt2.c))) +
         logpdf(Exponential(1), si2)
-    @test _query(built2.spec, bound2, :posterior, u2) ≈ ll2 + pr2 + u2[4]
+    @test _query(built2.spec, bound2, :posterior, u2) ≈ ll2 + pr2 + logjac(built2.layout, u2)
     _check_gradient(built2.spec, bound2, u2)
 end
 
@@ -2281,8 +2283,7 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, Dn)
-    @test any(p -> p.addressee === :x && p.location === :m,
-        hyp.population_priors)
+    @test any(p -> p.name === :b && p.args.arg1 === :m, hyp.parameters)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu1 = a .+ b .* x
         mu2 = a .+ c .* x
@@ -2641,8 +2642,8 @@ end
         :z => [0.5, -1.0, 1.5, 0.0])
     bound = bind_data(bare, cols)
     layout = assign_layout(bound)
-    @test [e.kind for e in layout.entries] == [:coefficient, :sampled]
-    @test [e.size for e in layout.entries] == [0, 1]
+    @test [e.kind for e in layout.entries] == [:sampled]
+    @test [e.size for e in layout.entries] == [1]
     @test layout.total == 1
     # End to end: likelihood over the data affine + gradient.
     built = build_kernel(bound)
@@ -3061,9 +3062,10 @@ end
                     :(y[i] ~ Normal.(theta[i], sigma))))))
     plan = lower_rkppl(ast, (:y, :x))
     @test [p.name for p in plan.plate_parameters] == [:z]
-    @test :theta in [d.name for d in plan.derived]      # emitted, not decomposed
+    @test isempty(plan.derived)
     loc = only(plan.predictors)
-    @test loc.terms[1].kind === LatentTerm && loc.terms[1].columns == [:theta]
+    @test [t.kind for t in loc.terms] == [InterceptTerm, ContinuousTerm]
+    @test [t.options.parameter for t in loc.terms] == [:mu, :tau]
     # Value + gradient vs an independent oracle.
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
@@ -3566,7 +3568,7 @@ end
     @test _plans_equal(bp, bd)
     builtp = build_kernel(bp)
     u = [0.5]
-    @test propertynames(constrain(builtp.layout, u)) == (:mu,)
+    @test propertynames(constrain(builtp.layout, u)) == (:b,)
     @test _query(builtp.spec, bp, :posterior, u) ≈
         _query(build_kernel(bd).spec, bd, :posterior, u)
     _check_gradient(builtp.spec, bp, u)
@@ -3738,8 +3740,9 @@ _pcs(cells...) = Expr(:block,
                              :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x))
     @test _plans_equal(subn, handn)
     @test [p.name for p in subn.plate_parameters] == [:theta_z]  # namespaced local
-    @test :theta in [d.name for d in subn.derived]
-    @test only(subn.predictors).terms[1].kind === LatentTerm
+    @test isempty(subn.derived)
+    @test [t.kind for t in only(subn.predictors).terms] ==
+        [InterceptTerm, ContinuousTerm]
     # Value + gradient vs an independent Distributions.jl oracle.
     bound = bind_data(subn, cols)
     built = build_kernel(bound)
