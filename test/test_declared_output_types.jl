@@ -99,7 +99,9 @@ _dot_decl(name::Symbol, T) = Expr(:(::), name, T)
     @test _dot_return_type(p, Vector{Float64}, Float64, Int) === Float64
     branch_index = findfirst(op -> op isa ReactiveKernels._KernelSourceOp &&
                                    op.f isa ReactiveKernels._KernelBranch, p.ops)
-    @test only(Base.return_types(p.ops[branch_index], (Int, Vector{Float64}, Float64))) ===
+    # `code_typed` includes the callable type when checking a generated method;
+    # `return_types` omits it on Julia 1.10 and rejects this concrete signature.
+    @test last(only(code_typed(p.ops[branch_index], (Int, Vector{Float64}, Float64)))) ===
           Vector{Float64}
     # Value parity with the typed-HAVE cut, and the empty arm.
     q = prepare(_dot_parent; have = (:weights, :idx, :units), want = :total,
