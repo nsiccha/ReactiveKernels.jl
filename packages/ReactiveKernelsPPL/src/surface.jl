@@ -1340,8 +1340,9 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     end
     if head === :ref
         base = ex.args[1]
-        base isa Symbol && shape(base) === :array &&
-            return _ref_shape(ex, data, shape)
+        base isa Symbol && (shape(base) === :array ||
+            _model_valued(base, detmap, env, Set{Symbol}())) &&
+            return _ref_shape(ex, data)
         _is_gather(ex, data, detmap, env) || return :scalar
         return _obs_axis(ex, data, detmap, memo, active, env) ?
             :vector : :scalar
@@ -1379,9 +1380,7 @@ end
 # Reads of an array (`z[g]` per observation, `phi[1]` scalar, `L[:, 1]`
 # array); every other ref keeps the slice-1 scalar shape. Predictor
 # coefficient roles classify by use site, independently of this shape.
-function _ref_shape(ex, data, shape)
-    base = ex.args[1]
-    base isa Symbol && shape(base) === :array || return :scalar
+function _ref_shape(ex, data)
     idx = ex.args[2:end]
     isempty(idx) && return :scalar
     if idx[1] isa Symbol && idx[1] in data
@@ -1438,7 +1437,8 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         # A gather from an array value (`z[g, 1]`, `b[g, 1]` with
         # `b = z * M`) follows its first index, like a one-index gather.
         array_base = ex.args[1] isa Symbol && length(ex.args) >= 2 &&
-            _shape_of(ex.args[1], data, detmap, memo, active, env) === :array
+            (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
+                _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
         array_base || _is_gather(ex, data, detmap, env) || return false
         return _obs_axis(ex.args[2], data, detmap, memo, active, env)
     end
@@ -9320,6 +9320,15 @@ end
 _is_array_def(name, ctx) = name isa Symbol && haskey(ctx.detmap, name) &&
     get(ctx.detshape, name, :scalar) === :array
 
+# An opaque module result computed from an array value has unknown shape.
+# Keep its name under indexing so contract validation can follow the
+# array dependencies. Other function values retain their existing inlining
+# and gather validation.
+_is_model_value_def(name, ctx) = name isa Symbol &&
+    haskey(ctx.detmap, name) && _reads_array_value(ctx.detmap[name], ctx) &&
+    _model_valued(name, ctx.detmap,
+        ctx.shape_env, Set{Symbol}())
+
 # Whether `ex` reads an array that is a VALUE in every role — a value
 # array (`z` declared sized, read whole, or an LKJ factor), an
 # array-role declaration, or an array-valued definition — directly or
@@ -9839,6 +9848,10 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
 end
 function _inline_structure_expr(ex, ctx, visited, where)
     ex isa Expr || return ex
+    if ex.head === :ref && _is_model_value_def(ex.args[1], ctx)
+        return Expr(:ref, ex.args[1],
+            (_inline_structure(a, ctx, visited, where) for a in ex.args[2:end])...)
+    end
     return Expr(ex.head, (_inline_structure(a, ctx, visited, where)
                           for a in ex.args)...)
 end
@@ -10568,7 +10581,8 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
     # array-valued definition (`b[g, 1]`, `b = z * (sd .* L)'`) are
     # values, not factor coefficients: scalar assignments by position,
     # per-observation columns when gathered.
-    (core.args[1] in ctx.value_arrays || _is_array_def(core.args[1], ctx)) &&
+    (core.args[1] in ctx.value_arrays || _is_array_def(core.args[1], ctx) ||
+        _is_model_value_def(core.args[1], ctx)) &&
         return _extract_summand(pname, core, sign, ctx)
     length(core.args) == 2 || _sfail("predictor $pname: factor indexing " *
                                      "takes `coefficients[group]` exactly, " *
