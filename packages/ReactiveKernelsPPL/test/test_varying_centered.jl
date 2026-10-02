@@ -48,7 +48,9 @@ end
         @test gradient(objective,backend,q,Constant(k),Constant(g)) ≈
             _transit_fd_gradient(p -> _centered_prior_oracle(p,k,g),q) rtol=2e-6 atol=3e-8
     end
+    # refused: mathematically invalid input (dimension mismatch)
     @test_throws DimensionMismatch ReactiveKernelsPPL._centered_correlated_logpdf(ones(3),ones(2),ones(3))
+    # refused: mathematically invalid input (negative scale)
     @test_throws ArgumentError ReactiveKernelsPPL._centered_correlated_logpdf(ones(2),[-1.,1.],ones(3))
 end
 
@@ -101,9 +103,13 @@ end
             _rows_prior_value(B, mu, F) rtol=1e-10
     end
     B, mu, F = _rows_prior_point(2, 3)
+    # refused: row, mean and covariance-factor dimensions must agree (distribution domain, P3)
     @test_throws DimensionMismatch _rows_prior_value(B, [0.], F)
+    # refused: row, mean and covariance-factor dimensions must agree (distribution domain, P3)
     @test_throws DimensionMismatch _rows_prior_value(B, mu, ones(3, 3))
+    # refused: a Cholesky factor must be lower triangular with positive diagonal (distribution domain, P3)
     @test_throws ArgumentError _rows_prior_value(B, mu, [1. 0.; .5 -1.])
+    # refused: a Cholesky factor must be lower triangular with positive diagonal (distribution domain, P3)
     @test_throws ArgumentError _rows_prior_value(B, mu, [1. .2; .5 1.])
 end
 
@@ -152,6 +158,7 @@ end
     value,_ = sampler_value_and_gradient!(sampler,g,u)
     @test value ≈ query(u) rtol=2e-13
     @test g ≈ _transit_fd_gradient(p -> _centered_plan_oracle(p,built.layout,columns),u) rtol=2e-6 atol=3e-8
+    # refused: `centered = 1` is not a Bool; Julia refuses Int in Bool context (P3)
     @test_throws "Bool literal" lower_rkppl(quote
         d ~ varying_draws(group,[1,x];centered=1)
         r ~ varying_slice(d,1:2)

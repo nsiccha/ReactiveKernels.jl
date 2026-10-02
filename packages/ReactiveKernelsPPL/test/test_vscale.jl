@@ -139,17 +139,29 @@ end
     @test only(gamma.responses).scale == ScalePredictorRef(:s, LogLink)
     # Both Gamma positions must name the same alpha spelling — mixed
     # wrappers never merge.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: Gamma args beyond the Gamma.(A, M ./ A) template: mixed alpha spellings s vs exp.(s) (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         eta = a .+ b .* x
         s = c .+ d .* z
         y .~ Gamma.(s, exp.(eta) ./ exp.(s))
-    end, (:y, :x, :z))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    end, (:y, :x, :z)); true)
+    # capability: Gamma args beyond the (alpha, mu/alpha) template: different predictors in shape and mean divisor (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
+        e ~ Normal(0, 1)
+        f ~ Normal(0, 1)
         eta = a .+ b .* x
         s = c .+ d .* z
         t = e .+ f .* x
         y .~ Gamma.(exp.(s), exp.(eta) ./ exp.(t))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z)); true)
 end
 
 @testset "surface: shared scale predictor" begin
@@ -171,13 +183,20 @@ end
         plan0.responses)
     @test count(p -> p.name === :sigma, plan0.predictors) == 1
     # One link per predictor across slots: a second use-site link fails.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: one predictor used under two use-site links (exp.(sigma) and bare sigma) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
+        a1 ~ Normal(0, 1)
+        a2 ~ Normal(0, 1)
+        b1 ~ Normal(0, 1)
+        b2 ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu1 = a1 .+ b1 .* x
         mu2 = a2 .+ b2 .* x
         sigma = c .+ d .* z
         y1 .~ Normal.(mu1, exp.(sigma))
         y2 .~ Normal.(mu2, sigma)
-    end, (:y1, :y2, :x, :z))
+    end, (:y1, :y2, :x, :z)); true)
 end
 
 @testset "surface: intercept-only scale predictor" begin
@@ -253,55 +272,81 @@ end
 @testset "surface: scale fail-closed battery" begin
     # Undotted wrappers are never silently reinterpreted (scalar
     # `exp(log_sigma)` use-site wrappers are deferred).
+    # refused: undotted exp on a vector predictor is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         ls = c .+ d .* z
         y .~ Normal.(mu, exp(ls))
     end, (:y, :x, :z))
     # Wrappers take exactly one predictor definition.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: constant-expression scale exp.(1.5) (todo `0fkd9yk`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(1.5))
-    end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    end, (:y, :x)); true)
+    # capability: link-wrapped scalar parameter as scale exp.(tau) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         tau ~ Exponential(1.0)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(tau))
-    end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    end, (:y, :x)); true)
+    # capability: data-expression scale exp.(x) (data-computed scales already admitted) (todo `0fkd9yk`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(x))
-    end, (:y, :x))
+    end, (:y, :x)); true)
+    # refused: undeclared name nosuch (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(nosuch))
     end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: arbitrary elementwise function on a scale predictor sqrt.(sigma) (P8, 1cmodra) (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         sigma = c .+ d .* z
         y .~ Normal.(mu, sqrt.(sigma))
-    end, (:y, :x, :z))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    end, (:y, :x, :z)); true)
+    # capability: probit.-wrapped scale predictor (arbitrary scale wrapper) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        d ~ Normal(0, 1)
         mu = a .+ b .* x
         sigma = c .+ d .* z
         y .~ Normal.(mu, probit.(sigma))
-    end, (:y, :x, :z))
+    end, (:y, :x, :z)); true)
     # The two slots take distinct predictors (contract gate, BRM-mirroring).
     # A same-link self-use reaches the contract rule; a wrapped self-use
     # trips the one-link-per-predictor rule first (same fail-closed).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(mu))
-    end, (:y, :x))
-    @test_throws ContractValidationError lower_rkppl(quote
+    end, (:y, :x)); true)
+    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, mu)
-    end, (:y, :x))
+    end, (:y, :x)); true)
     # Beta-kappa predictors are log-only (a concentration — contract
     # gate): a bare predictor use fails closed.
-    @test_throws ContractValidationError lower_rkppl(quote
+    # capability: identity-link Beta concentration predictor (bare k) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         c ~ Normal(0, 1)
@@ -309,9 +354,10 @@ end
         mu = a .+ b .* x
         k = c .+ d .* z
         y .~ Beta.(logistic.(mu) .* k, (1 .- logistic.(mu)) .* k)
-    end, (:y, :x, :z))
+    end, (:y, :x, :z)); true)
     # Predictor-fed Binomial trials are deferred: trials stay
     # column-or-literal.
+    # refused: Binomial trials from a real-valued affine predictor are non-integer (mathematically invalid; comment says deferred)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         n = c .+ d .* z
@@ -319,6 +365,7 @@ end
     end, (:y, :x, :z))
     # Factor scale coefficients need their broadcast prior, exactly like
     # factor locations (required, never defaulted).
+    # refused: undeclared factor scale coefficients cs (P6 05oe96l, P7 0d5a67r)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
@@ -337,7 +384,8 @@ end
                 Expr(:block,
                     :(theta[i] ~ Normal(mu, tau)),
                     :(y[i] ~ Normal.(theta[i], _t2[i]))))))
-    @test_throws SurfaceLoweringError lower_rkppl(expr, (:y,))
+    # capability: deterministic transform of a plate latent (_t2 = theta .+ 1) as per-cell scale (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(expr, (:y,)); true)
 end
 
 @testset "contract: hand-built scale-predictor plans" begin
@@ -368,25 +416,32 @@ end
     # Positive case: a scale-only predictor counts as used and validates.
     validate_plan(_mk(ScalePredictorRef(:sigma, LogLink)))
     # Unknown predictor, link mismatch, non-logit-or-narrower link.
+    # refused: scale ref names an unknown predictor (IR contract)
     @test_throws ContractValidationError validate_structure(
         _mk(ScalePredictorRef(:nosuch, LogLink)))
+    # refused: scale ref link disagrees with its PredictorSpec link (IR contract)
     @test_throws ContractValidationError validate_structure(
         _mk(ScalePredictorRef(:sigma, IdentityLink)))
+    # refused: scale ref ProbitLink disagrees with predictor LogLink; scale links identity/log/logit only (IR contract)
     @test_throws ContractValidationError validate_structure(
         _mk(ScalePredictorRef(:sigma, ProbitLink)))
     # Scale is the response's own location predictor.
-    @test_throws ContractValidationError validate_structure(
-        _mk(ScalePredictorRef(:mu, IdentityLink)))
+    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
+    @test_broken (validate_structure(
+        _mk(ScalePredictorRef(:mu, IdentityLink))); true)
     # Beta-kappa predictors admitted log-only (a concentration);
     # scaleless families take no ref.
     validate_structure(_mk(ScalePredictorRef(:sigma, LogLink);
         family = BetaLogitFam, link = LogitLink))
-    @test_throws ContractValidationError validate_structure(
+    # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_structure(
         _mk(ScalePredictorRef(:sigma, IdentityLink); family = BetaLogitFam,
-            link = LogitLink))
-    @test_throws ContractValidationError validate_structure(
+            link = LogitLink)); true)
+    # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (validate_structure(
         _mk(ScalePredictorRef(:sigma, LogitLink); family = BetaLogitFam,
-            link = LogitLink))
+            link = LogitLink)); true)
+    # refused: scaleless family (Poisson) takes no scale ref (IR contract)
     @test_throws ContractValidationError validate_structure(
         _mk(ScalePredictorRef(:sigma, LogLink); family = PoissonLogFam,
             link = LogLink, predictor = :eta,
@@ -398,6 +453,7 @@ end
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu,
             1.0, nothing, _none_evidence(), :y_resp)],
         preds, priors, SampledParameter[], AssignmentSpec[], _vs_cols(), 6)
+    # refused: unused (orphan) predictor (IR contract)
     @test_throws ContractValidationError validate_structure(orphan)
 end
 

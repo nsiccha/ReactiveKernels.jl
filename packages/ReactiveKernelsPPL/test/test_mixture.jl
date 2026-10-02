@@ -153,11 +153,12 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
     end
 end
 
-@testset "mixture fail-closed battery" begin
+@testset "mixture refusals and capability gaps" begin
     # Each entry: (label, program, error type). Surface rejections throw
     # `SurfaceLoweringError`; contract rejections (parsed but invalid)
     # throw `ContractValidationError`.
     cases = [
+        # refused: mixture of a continuous and a discrete component has no common density (mathematically invalid)
         ("heterogeneous families",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -166,42 +167,57 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Poisson.(lam1)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: per-component links (todo `1nb43fj`).
         ("heterogeneous links, same base",
             :(begin
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 eta2 = c .+ d .* x
                 y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                     Bernoulli.(probit.(eta2))], [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: probit component links (todo `1nb43fj`).
         ("probit outside v1",
             :(begin
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                c ~ Normal(0, 1)
+                d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 eta2 = c .+ d .* x
                 y .~ MixtureModel.([Bernoulli.(probit.(eta)),
                     Bernoulli.(probit.(eta2))], [0.5, 0.5])
             end), SurfaceLoweringError),
+        # refused: empty mixture (K = 0)
         ("K = 0",
             :(begin
                 y .~ MixtureModel.([], [1.0])
             end), SurfaceLoweringError),
+        # refused: MixtureModel.(Normal.(...), [1.0]) broadcasts MixtureModel(::Normal, ::Float64), a Julia MethodError (P3)
         ("components not a vector",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.(Normal.(mu1, s), [1.0])
             end), SurfaceLoweringError),
+        # capability: MixtureModel(components) with its standard uniform weights (todo `1nb43fj`).
         ("bad arity",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(mu1, s)])
             end), SurfaceLoweringError),
+        # refused: scalar mixture prior is a Julia MethodError; weights are a probability vector (P3)
         ("scalar weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(mu1, s)], 1.0)
             end), SurfaceLoweringError),
+        # refused: [0.5, x] is a Vector{Any} of a scalar and a data vector, not a probability vector (P3)
         ("non-numeric weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -209,6 +225,7 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [0.5, x])
             end), SurfaceLoweringError),
+        # capability: Bool numeric weights (10gzbm9 bool-values) (todo `1nb43fj`).
         ("boolean weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -216,6 +233,7 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [true, false])
             end), SurfaceLoweringError),
+        # capability: frequency-weighted mixture observations (todo `1nb43fj`).
         ("frequency weights rejected",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -223,6 +241,7 @@ end
                 y .~ weighted.(MixtureModel.([Normal.(mu1, s),
                     Normal.(mu1, s)], [0.5, 0.5]), wt)
             end), SurfaceLoweringError),
+        # capability: truncated mixture evidence (todo `1nb43fj`).
         ("evidence rejected",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -230,6 +249,7 @@ end
                 y .~ truncated.(MixtureModel.([Normal.(mu1, s),
                     Normal.(mu1, s)], [0.5, 0.5]), 0, 10)
             end), SurfaceLoweringError),
+        # capability: a partial observation range (todo `1nb43fj`).
         ("partial range rejected",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -237,17 +257,20 @@ end
                 y[1:2] .~ MixtureModel.([Normal.(mu1, s),
                     Normal.(mu1, s)], [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: parameter-free observations (10gzbm9 degenerate) (todo `1nb43fj`).
         ("fully fixed",
             :(begin
                 y .~ MixtureModel.([Normal.(-1.0, 0.5), Normal.(1.0, 0.5)],
                     [0.4, 0.6])
             end), SurfaceLoweringError),
+        # refused: undeclared name (P6, 05oe96l)
         ("unknown location",
             :(begin
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(nope, s), Normal.(0.0, s)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: an assigned scalar component location (todo `1nb43fj`).
         ("assignment location",
             :(begin
                 m = 2.0
@@ -255,35 +278,45 @@ end
                 y .~ MixtureModel.([Normal.(m, s), Normal.(0.0, s)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: a data-valued component location (todo `1nb43fj`).
         ("data-column location",
             :(begin
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.([Normal.(x, s), Normal.(0.0, s)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: a computed component location (P8 1cmodra) (todo `1nb43fj`).
         ("wrapped param",
             :(begin
                 lam1 ~ LogNormal(0.0, 1.0)
                 y .~ MixtureModel.([Poisson.(exp.(lam1)), Poisson.(4.0)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: an unconstrained component rate, with -Inf outside support (10gzbm9 support-links) (todo `1nb43fj`).
         ("bare predictor",
             :(begin
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Poisson.(eta), Poisson.(4.0)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # refused: foo is undefined (UndefVarError in Julia)
         ("unknown wrapper",
             :(begin
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ MixtureModel.([Bernoulli.(foo.(eta)),
                     Bernoulli.(0.5)], [0.5, 0.5])
             end), SurfaceLoweringError),
+        # capability: per-component trials columns (todo `1nb43fj`).
         ("split Binomial trials",
             :(begin
                 y .~ MixtureModel.([Binomial.(n1, 0.3), Binomial.(n2, 0.3)],
                     [0.5, 0.5])
             end), SurfaceLoweringError),
+        # refused: weights length mismatches component count
         ("weights length",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -291,6 +324,7 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [0.5, 0.3, 0.2])
             end), ContractValidationError),
+        # refused: mixture probabilities do not sum to 1
         ("weights sum",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -298,6 +332,7 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [0.5, 0.6])
             end), ContractValidationError),
+        # refused: negative mixture weight
         ("negative weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -305,6 +340,7 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [1.5, -0.5])
             end), ContractValidationError),
+        # refused: non-finite (Inf) mixture weight
         ("non-literal weights element",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -312,12 +348,14 @@ end
                 y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
                     [0.5, Inf])
             end), SurfaceLoweringError),
+        # refused: Dirichlet length mismatches component count
         ("concentration length",
             :(begin
                 w ~ Dirichlet([1.0, 1.0, 1.0])
                 y .~ MixtureModel.([Normal.(-1.0, 0.5), Normal.(1.0, 0.5)],
                     w)
             end), ContractValidationError),
+        # refused: Bernoulli probability 1.5 outside [0,1]
         ("Bernoulli prob domain",
             :(begin
                 a ~ Normal(0, 1)
@@ -326,12 +364,14 @@ end
                 y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
                     Bernoulli.(1.5)], [0.5, 0.5])
             end), ContractValidationError),
+        # refused: negative Poisson mean
         ("Poisson mean domain",
             :(begin
                 lam1 ~ LogNormal(0.0, 1.0)
                 y .~ MixtureModel.([Poisson.(lam1), Poisson.(-1.0)],
                     [0.5, 0.5])
             end), ContractValidationError),
+        # refused: zero Gamma scale (malformed distribution)
         ("Gamma mean domain",
             :(begin
                 a1 ~ Exponential(1.0)
@@ -339,12 +379,14 @@ end
                 y .~ MixtureModel.([Gamma.(a1, mu1 ./ a1),
                     Gamma.(a1, 0.0 ./ a1)], [0.5, 0.5])
             end), ContractValidationError),
+        # refused: negative Beta shape (malformed distribution)
         ("Beta mean domain",
             :(begin
                 k1 ~ Exponential(1.0)
                 y .~ MixtureModel.([Beta.(0.3 .* k1, (1 .- 0.3) .* k1),
                     Beta.(1.5 .* k1, (1 .- 1.5) .* k1)], [0.5, 0.5])
             end), ContractValidationError),
+        # refused: empty mixture weights
         ("empty weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -355,6 +397,7 @@ end
         # (a sampled parameter — spell it bare). It never routes to the
         # intercept-only location slot, which only an undeclared name
         # reached (gone under strict declarations).
+        # capability: an alias of a declared scalar location (todo `1nb43fj`).
         ("stated scalar loc alias",
             :(begin
                 c ~ Normal(0.0, 5.0)
@@ -364,9 +407,17 @@ end
                     [0.5, 0.5])
             end), SurfaceLoweringError),
     ]
+    capabilities = Set(["heterogeneous links, same base", "probit outside v1", "bad arity", "boolean weights", "frequency weights rejected", "evidence rejected", "partial range rejected", "fully fixed", "assignment location", "data-column location", "wrapped param", "bare predictor", "split Binomial trials", "stated scalar loc alias"])
     for (label, prog, E) in cases
         @testset "$label" begin
-            @test_throws E lower_rkppl(prog, (:y, :x, :n1, :n2, :wt))
+            if label in capabilities
+                # capability: each entry above names the valid combination (todo `1nb43fj`).
+                @test_broken (lower_rkppl(prog, (:y, :x, :n1, :n2, :wt)); true)
+            else
+                # refused: each remaining entry cites its Julia signature,
+                # declaration or distribution-domain violation above (P3/P6).
+                @test_throws E lower_rkppl(prog, (:y, :x, :n1, :n2, :wt))
+            end
         end
     end
     @testset "programmatic shape errors" begin
@@ -404,9 +455,11 @@ end
         # Scale slots must match locations one-to-one.
         bad = _mixresp(scales = Union{Nothing,Symbol,Real,ScalePredictorRef}[
             :sigma])
+        # refused: scale slots must match locations one-to-one (IR contract)
         @test_throws ContractValidationError validate_structure(_mixplan(bad))
         # The response link is the components' canonical link.
         bad = _mixresp(link = LogLink)
+        # refused: mixture response link must be the components' canonical link (IR contract)
         @test_throws ContractValidationError validate_structure(_mixplan(bad))
         # Binomial mixtures require trials (surface always emits them, so
         # this is programmatic-only).
@@ -414,13 +467,16 @@ end
         bsc = Union{Nothing,Symbol,Real,ScalePredictorRef}[nothing, nothing]
         bad = _mixresp(f = BinomialLogitFam, link = LogitLink, locs = bloc,
             scales = bsc, trials = nothing)
+        # refused: Binomial mixture without trials (IR contract)
         @test_throws ContractValidationError validate_structure(_mixplan(bad))
         # ... and non-Binomial mixtures take none.
         bad = _mixresp(trials = 10)
+        # refused: non-Binomial mixture with trials (IR contract)
         @test_throws ContractValidationError validate_structure(_mixplan(bad))
         # Non-finite weights (surface literals are finite by
         # construction, so this is programmatic-only).
         bad = _mixresp(weights = [0.5, Inf])
+        # refused: non-finite mixture weights (IR contract)
         @test_throws ContractValidationError validate_structure(_mixplan(bad))
         # A non-simplex weights vector fails the family check.
         r = _mixresp(weights = :z)
@@ -429,6 +485,7 @@ end
             AssignmentSpec[], cols, 9; vector_parameters = VectorParameter[
                 VectorParameter(:z, :vector_normal, (arg1 = [0.0, 0.0],
                     arg2 = [1.0, 1.0]), 2, :z)])
+        # refused: mixture weights must name a simplex parameter (IR contract)
         @test_throws ContractValidationError validate_structure(plan)
         # And the valid programmatic shape passes.
         @test (validate_structure(_mixplan(_mixresp())); true)

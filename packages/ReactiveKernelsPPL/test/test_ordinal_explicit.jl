@@ -138,7 +138,8 @@ end
         c ~ Ordered(Normal(0, 1), 3)
         y .~ OrderedLogistic.(b .* x, Ref(c))
     end)
-    @test_throws ContractValidationError bind_data(long, cols)
+    # capability: declared categories beyond the observed levels (10gzbm9 level-coverage) (todo `1308iv0`)
+    @test_broken (bind_data(long, cols); true)
 end
 
 @testset "explicit cutpoints: Ordinal cumulative and stopping densities" begin
@@ -256,6 +257,7 @@ end
         mu = a .+ w[1] .* x
         z .~ Normal.(mu, 1.0)
     end, (:z, :x, :g))
+    # refused: w[1] indexes an empty bound axis (Julia BoundsError, P3)
     @test_throws ContractValidationError bind_data(empty, cols)
 end
 
@@ -269,77 +271,101 @@ end
         sprint(showerror, e)
     end
     # Cutpoints are one shared vector: standard broadcasting needs `Ref`.
+    # refused: remaining entries violate broadcast argument shape, strict declarations or constructor arity (P3/P6, 05oe96l)
     @test occursin("write `Ref(c)`", refused(quote
+        b ~ Normal(0, 1)
         c ~ Ordered(Normal(0, 1), 2)
         y .~ OrderedLogistic.(b .* x, c)
     end))
+    # refused: remaining entries violate broadcast argument shape, strict declarations or constructor arity (P3/P6, 05oe96l)
     @test occursin("must be an ordered vector declared", refused(quote
+        b ~ Normal(0, 1)
         y .~ OrderedLogistic.(b .* x, Ref(c))
     end))
-    @test occursin("must be an ordered vector declared", refused(quote
+    # capability: cutpoints with an ordinary vector prior; unordered points have -Inf density (10gzbm9 support-links; todo `1qlbn5b`).
+    @test_broken (_oe_lower(quote
+        b ~ Normal(0, 1)
         c[1:2] .~ Normal.(0, 1)
         y .~ OrderedLogistic.(b .* x, Ref(c))
-    end))
-    @test occursin("stopping-ratio thresholds are unconstrained", refused(quote
+    end, data); true)
+    # capability: an ordered prior is also a valid prior on stopping-ratio thresholds (P3/P8; todo `1qlbn5b`)
+    @test_broken (_oe_lower(quote
+        b ~ Normal(0, 1)
         c ~ Ordered(Normal(0, 1), 2)
         y .~ Ordinal.(StoppingRatio(), LogitLink(), b .* x, Ref(c))
-    end))
+    end, data); true)
+    # refused: remaining entries violate broadcast argument shape, strict declarations or constructor arity (P3/P6, 05oe96l)
     @test occursin("one-axis vector", refused(quote
+        b ~ Normal(0, 1)
         c[1:2, 1:2] .~ Normal.(0, 1)
         y .~ Ordinal.(StoppingRatio(), LogitLink(), b .* x, Ref(c))
     end))
-    @test occursin("one response per cutpoint vector", refused(quote
+    # capability: ordinary cutpoint/vector priors, sizes and reuse (P8 1cmodra; 10gzbm9 shared-slots/level-coverage; todo `1qlbn5b`)
+    @test_broken (_oe_lower(quote
+        b ~ Normal(0, 1)
         c ~ Ordered(Normal(0, 1), 2)
         y .~ OrderedLogistic.(b .* x, Ref(c))
         y2 .~ OrderedLogistic.(b .* x, Ref(c))
-    end))
+    end, data); true)
     # The data-sized length names the response the cutpoints serve.
     for n in (:(length(levels(x)) - 1), :(length(levels(y)) - 2),
             :(length(unique(y)) - 1))
-        @test occursin("length(levels(y)) - 1", refused(quote
+        # capability: ordinary cutpoint/vector priors, sizes and reuse (P8 1cmodra; 10gzbm9 shared-slots/level-coverage; todo `1qlbn5b`)
+        @test_broken (_oe_lower(quote
             b ~ Normal(0, 1)
             c ~ Ordered(Normal(0, 1), $n)
             y .~ OrderedLogistic.(b .* x, Ref(c))
-        end))
+        end, data); true)
     end
-    @test occursin("serves no ordinal response", refused(quote
+    # capability: ordinary cutpoint/vector priors, sizes and reuse (P8 1cmodra; 10gzbm9 shared-slots/level-coverage; todo `1qlbn5b`)
+    @test_broken (_oe_lower(quote
         a ~ Normal(0, 1)
         c ~ Ordered(Normal(0, 1), length(levels(y)) - 1)
         mu = a .+ c[1] .* x
         y2 .~ Normal.(mu, 1.0)
-    end))
+    end, data); true)
     # Nothing reads or consumes it: unused, like an unused simplex.
-    @test_throws ContractValidationError _oe_lower(quote
+    # capability: an unused declared parameter is a prior-only draw (10gzbm9 degenerate) (todo `1qlbn5b`)
+    @test_broken (_oe_lower(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         k ~ Ordered(Normal(0, 1), 2)
         mu = a .+ b .* x
         y2 .~ Normal.(mu, 1.0)
-    end, data)
+    end, data); true)
     # Element prior: a literal Normal.
     for d in (:(Cauchy(0, 1)), :(Normal(0, s)), :(Normal(0, -1)))
-        @test occursin("element prior", refused(quote
+        program = quote
             b ~ Normal(0, 1)
             s ~ HalfNormal(1)
             c ~ Ordered($d, 2)
             y .~ OrderedLogistic.(b .* x, Ref(c))
-        end))
+        end
+        if d == :(Normal(0, -1))
+            # refused: Normal's scale must be positive (distribution domain, P3).
+            @test occursin("element prior", refused(program))
+        else
+            # capability: non-Normal and sampled-argument ordered priors (P8 1cmodra; todo `0fkd9yk`).
+            @test_broken (_oe_lower(program, data); true)
+        end
     end
-    @test occursin("element prior", refused(quote
+    # capability: ordinary cutpoint/vector priors, sizes and reuse (P8 1cmodra; 10gzbm9 shared-slots/level-coverage; todo `1qlbn5b`)
+    @test_broken (_oe_lower(quote
         b ~ Normal(0, 1)
         t[1:2] .~ Cauchy.(0, 1)
         y .~ Ordinal.(StoppingRatio(), LogitLink(), b .* x, Ref(t))
-    end))
+    end, data); true)
+    # refused: remaining entries violate broadcast argument shape, strict declarations or constructor arity (P3/P6, 05oe96l)
     @test occursin("takes the element distribution and the length",
         refused(quote
             b ~ Normal(0, 1)
             c ~ Ordered(Normal(0, 1))
             y .~ OrderedLogistic.(b .* x, Ref(c))
         end))
-    # An ordered vector is a value, never a predictor coefficient.
-    @test !isempty(refused(quote
+    # capability: a vector draw participates in ordinary broadcast arithmetic (P10a 0dejlw1; todo `1qlbn5b`).
+    @test_broken (_oe_lower(quote
         c ~ Ordered(Normal(0, 1), 2)
         mu = c .* x
         y2 .~ Normal.(mu, 1.0)
-    end))
+    end, data); true)
 end

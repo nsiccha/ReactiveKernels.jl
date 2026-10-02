@@ -351,6 +351,7 @@ end
     @test rep.columns[:X] == hcat(cols[:x1], cols[:x1])
     # refused: the model computes X, so a caller column X is a second
     # source for one value (the module-data precedent).
+    # refused: caller X collides with the computed X definition (single assignment)
     @test_throws ContractValidationError bind_data(plan,
         merge(cols, Dict{Symbol,Any}(:X => Xv)))
     # Capability gap: a value matrix over a column the model derives

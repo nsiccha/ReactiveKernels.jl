@@ -50,27 +50,33 @@ end
     u = _unbind(_gaussian_plan(n))
     # Ragged rows.
     bad = _md_columns(n, ones(n + 1, 2))
-    @test_throws ContractValidationError bind_data(u, bad)
+    # capability: matrix datum whose row count differs from n_obs, unreferenced (0dejlw1 lane) (todo `1qlbn5b`)
+    @test_broken (bind_data(u, bad); true)
     # Non-numeric.
     bad = _md_columns(n, fill("a", n, 2))
-    @test_throws ContractValidationError bind_data(u, bad)
+    # capability: a String matrix datum (data are values of any shape, P10a 0dejlw1) (todo `1qlbn5b`)
+    @test_broken (bind_data(u, bad); true)
     # Zero columns.
     bad = _md_columns(n, ones(n, 0))
-    @test_throws ContractValidationError bind_data(u, bad)
+    # capability: zero-column matrix datum (0dejlw1 lane) (todo `1qlbn5b`)
+    @test_broken (bind_data(u, bad); true)
     # Missing entries (non-numeric eltype).
     bad = _md_columns(n, Matrix{Union{Missing,Float64}}(ones(n, 2)))
     bad[:X][1, 1] = missing
-    @test_throws ContractValidationError bind_data(u, bad)
+    # capability: unused data may contain Missing values (P10a 0dejlw1; todo `1qlbn5b`).
+    @test_broken (bind_data(u, bad); true)
     # 3-D arrays and scalars fail with a contract error, not MethodError.
     bad = Dict{Symbol,Any}(_columns(n))
     bad[:X] = ones(n, 2, 2)
-    @test_throws ContractValidationError bind_data(u, bad)
+    # capability: 3-D array datum (0dejlw1 lane) (todo `1qlbn5b`)
+    @test_broken (bind_data(u, bad); true)
     bad = Dict{Symbol,Any}(_columns(n))
     bad[:c] = 1.5
-    @test_throws ContractValidationError bind_data(u, bad)
+    # capability: scalar datum (0dejlw1 lane) (todo `1qlbn5b`)
+    @test_broken (bind_data(u, bad); true)
 end
 
-@testset "per-observation roles reject matrices" begin
+@testset "matrix values in observation and predictor roles" begin
     n = 9
     X = hcat(ones(n), collect(1.0:n))
     cols = _md_columns(n, X)
@@ -78,7 +84,8 @@ end
     u = _unbind(_gaussian_plan(n))
     u.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :X, :mu,
         :sigma, nothing, _none_evidence(), :y_resp)
-    @test_throws ContractValidationError bind_data(u, cols)
+    # capability: per-observation response role bound to a matrix with ordinary broadcast dimensions (P10a 0dejlw1; todo `1qlbn5b`).
+    @test_broken (bind_data(u, cols); true)
     # Term column (with a matching prior, so only the shape guard can fire).
     u = _unbind(_gaussian_plan(n))
     u.predictors[1] = PredictorSpec(:mu, IdentityLink, TermSpec[
@@ -87,23 +94,27 @@ end
             TermSpec(ContinuousTerm, [:X], NamedTuple(), :X, :x_term),
         ], :mu)
     u.population_priors[2] = PopulationPrior(:mu, :X, 0.0, 1.0)
-    @test_throws ContractValidationError bind_data(u, cols)
+    # capability: ContinuousTerm column bound to a matrix with ordinary broadcast dimensions (P10a 0dejlw1; todo `1qlbn5b`).
+    @test_broken (bind_data(u, cols); true)
     # Weights.
     u = _unbind(_gaussian_plan(n))
     u.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu,
         :sigma, :X, _none_evidence(), :y_resp)
-    @test_throws ContractValidationError bind_data(u, cols)
+    # capability: weights role bound to a matrix with ordinary broadcast dimensions (P10a 0dejlw1; todo `1qlbn5b`).
+    @test_broken (bind_data(u, cols); true)
     # Per-observation scale.
     u = _unbind(_gaussian_plan(n))
     u.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu,
         :X, nothing, _none_evidence(), :y_resp)
-    @test_throws ContractValidationError bind_data(u, cols)
+    # capability: per-observation scale role bound to a matrix with ordinary broadcast dimensions (P10a 0dejlw1; todo `1qlbn5b`).
+    @test_broken (bind_data(u, cols); true)
     # Grouping column (the LevelMap forces binder evaluation over :X).
     g = _gaussian_plan(n)
     u = StructuralPlan(g.responses, g.predictors, g.population_priors,
         g.parameters, g.assignments, Dict{Symbol,AbstractVector}(), 0;
         levelmaps = LevelMap[LevelMap(:mu, :X, [], :levels, Colon())])
-    @test_throws ContractValidationError bind_data(u, cols)
+    # capability: grouping (LevelMap) column bound to a matrix with ordinary broadcast dimensions (P10a 0dejlw1; todo `1qlbn5b`).
+    @test_broken (bind_data(u, cols); true)
 end
 
 @testset "matrix datum end to end (surface to kernel value)" begin

@@ -30,6 +30,7 @@ function _scan_gap(f, needle)
         occursin(needle, sprint(showerror, e)) || rethrow()
         false
     end
+    # capability: generalized scan values and recurrence shapes (P8 1cmodra; todo `0yc2qgp`).
     @test_broken ok
 end
 
@@ -120,8 +121,14 @@ end
 end
 
 @testset "scan front-end: rejections" begin
+    # refused: remaining entries violate Julia statement/index order or
+    # the explicit carry/seed declaration (P3; IR contract).
     reject(blk) = @test_throws SurfaceLoweringError parse_scan_block(blk)
+    # capability: lag-free and data-integer-lag scans (10gzbm9 degenerate;
+    # P8 1cmodra; todo `0yc2qgp`).
+    capable(blk) = @test_broken (parse_scan_block(blk); true)
 
+    # refused: forward read `h[t + 1]` before it is written (P3)
     # forward reference
     reject(quote
         h[1] ~ Normal(0, 1)
@@ -129,6 +136,7 @@ end
             h[t] ~ Normal(phi * h[t + 1], s)
         end
     end)
+    # refused: reads `h[t]` before it is defined (P3)
     # current-index self-read on the RHS
     reject(quote
         h[1] ~ Normal(0, 1)
@@ -136,6 +144,7 @@ end
             h[t] ~ Normal(phi * h[t], s)
         end
     end)
+    # refused: `h[2]` never defined nor given a prior (P7, P3)
     # loop start not one past the seeds
     reject(quote
         h[1] ~ Normal(0, 1)
@@ -143,6 +152,7 @@ end
             h[t] ~ Normal(phi * h[t - 1], s)
         end
     end)
+    # refused: `h[3]` seeded then rewritten by the loop (single assignment); `h[2]` undefined
     # non-contiguous seeds
     reject(quote
         h[1] ~ Normal(0, 1)
@@ -151,6 +161,7 @@ end
             h[t] ~ Normal(phi * h[t - 1], s)
         end
     end)
+    # refused: reads `h[0]` at t = 2 (Julia BoundsError, P3)
     # lag deeper than the seed depth
     reject(quote
         h[1] ~ Normal(0, 1)
@@ -158,13 +169,14 @@ end
             h[t] ~ Normal(a * h[t - 2], s)
         end
     end)
-    # no lag at all → that is `@plate`, not `@scan`
-    reject(quote
+    # A scan may degenerate to independent draws.
+    capable(quote
         h[1] ~ Normal(0, 1)
         for t in 2:T
             h[t] ~ Normal(mu, s)
         end
     end)
+    # refused: `sum(h)` reads unwritten elements of the carried array (P3)
     # bare read of the carried array inside its own loop
     reject(quote
         h[1] ~ Normal(0, 1)
@@ -173,10 +185,12 @@ end
             h[t] ~ Normal(z, s)
         end
     end)
+    # refused: @scan with no recurrence `for`; `h` has no declared extent (P6)
     # no trailing `for`
     reject(quote
         h[1] ~ Normal(0, 1)
     end)
+    # refused: rebinds the carried array `h` (single assignment)
     # rebinding the whole carried array
     reject(quote
         h[1] ~ Normal(0, 1)
@@ -184,6 +198,7 @@ end
             h = phi
         end
     end)
+    # refused: Stan-style `normal` is not a Julia distribution (P3, P10)
     # Stan-style family spelling
     reject(quote
         h[1] ~ normal(0, 1)
@@ -191,6 +206,7 @@ end
             h[t] ~ Normal(phi * h[t - 1], s)
         end
     end)
+    # refused: writes `h[t - 1]`, rewriting `h[1]` (single assignment)
     # write at a non-loop index
     reject(quote
         h[1] ~ Normal(0, 1)
@@ -207,8 +223,8 @@ end
             h[t] ~ Normal(g[t], s)
         end
     end)
-    # symbolic (data-int) lag depth is not supported in v1
-    reject(quote
+    # A data-integer lag is a retained runtime index.
+    capable(quote
         h[1] ~ Normal(0, 1)
         for t in 2:T
             h[t] ~ Normal(phi * h[t - k], s)
@@ -251,6 +267,7 @@ end
             sigma[t] ~ Normal(phi * sigma[t - 1], s)
         end
     end)
+    # refused: scan state name collides with a parameter (IR name-table contract)
     @test_throws ContractValidationError validate_structure(plan([bad_state]))
     # ... including a second carried array of a tuple carry
     bad_tuple = parse_scan_block(quote
@@ -262,6 +279,7 @@ end
             sigma[t] = sigma[t - 1] + h[t]
         end
     end)
+    # refused: carry states, seeds and step writes must agree with the ScanSpec declaration (IR contract)
     @test_throws ContractValidationError validate_structure(plan([bad_tuple]))
 
     # malformed ScanSpecs caught by _validate_scans: loop start not one past
@@ -280,6 +298,7 @@ end
             1, :g),
     ]
     for bad in malformed
+        # refused: carry states, seeds and step writes must agree with the ScanSpec declaration (IR contract)
         @test_throws ContractValidationError validate_structure(plan([bad]))
     end
 end
@@ -310,6 +329,7 @@ end
     @test :sigma in [p.name for p in plan.parameters]
 
     # scan-state name colliding with a declared parameter is a double-definition
+    # refused: `h` declared by `~` and as the scan state (single assignment)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         h ~ Normal(0, 1)
         @scan begin
@@ -322,6 +342,7 @@ end
     end, (:y,))
 
     # an invalid @scan block (no trailing recurrence `for`) still errors loudly
+    # refused: @scan with no recurrence `for`; `h` has no declared extent (P6)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         @scan begin
             h[1] ~ Normal(0, 1)
@@ -377,7 +398,8 @@ end
             h[t] ~ Normal(phi * h[t - 1], s)
         end
     end)
-    @test_throws ContractValidationError assign_layout(_scan_min_plan([ar_long]; n = 3))
+    # capability: zero-step @scan (T equals the seed count) (todo `0yc2qgp`)
+    @test_broken (assign_layout(_scan_min_plan([ar_long]; n = 3)); true)
 end
 
 @testset "scan surface: scan state as a response location (4a)" begin
@@ -412,7 +434,8 @@ end
             ResponseEvidence(:none, nothing, nothing), :y_resp)],
         PredictorSpec[], PopulationPrior[], SampledParameter[], AssignmentSpec[],
         Dict{Symbol,AbstractVector}(:y => zeros(3)), 3; scans = [ar1])
-    @test_throws ContractValidationError validate_structure(bad)
+    # capability: non-Gaussian response over a scan state (slice 1; hand-built plan) (todo `0yc2qgp`)
+    @test_broken (validate_structure(bad); true)
 end
 
 # A non-centered AR(1) scan (SB-`ar` shape): `Normal(0, 1)` seed, one
@@ -475,28 +498,37 @@ end
     @test build_kernel(free).layout.total == 1 + 3 + 3
 
     bad_opts = [
+        # refused: scan-summand options `unknown scan` (IR contract)
         ("unknown scan", (scan_id = :nope, coef = :beta_ar)),
+        # refused: scan-summand options `unknown coef` (IR contract)
         ("unknown coef", (scan_id = :u, coef = :nope)),
+        # refused: scan-summand options `wrong keys` (IR contract)
         ("wrong keys", (scan_id = :u,)) ,
+        # refused: scan-summand options `swapped keys` (IR contract)
         ("swapped keys", (coef = :beta_ar, scan_id = :u)),
     ]
     for (what, opts) in bad_opts
+        # refused: malformed scan-summand options (IR contract)
         @test_throws ContractValidationError validate_structure(
             _scan_ar_plan(scan; options = opts))
     end
     # non-Normal coefficient (v1 admits SB's Normal `ar` beta only)
-    @test_throws ContractValidationError validate_structure(
-        _scan_ar_plan(scan; coef_family = :exponential))
+    # capability: non-Normal scan-summand coefficient prior (v1 admits Normal only) (todo `0yc2qgp`)
+    @test_broken (validate_structure(
+        _scan_ar_plan(scan; coef_family = :exponential)); true)
     # a computed scalar is not a sampled coefficient
     p0 = _scan_ar_plan(scan)
     params = filter(p -> p.name !== :beta_ar, p0.parameters)
     p = StructuralPlan(p0.responses, p0.predictors, p0.population_priors,
         params, [AssignmentSpec(:beta_ar, :(phi * phi), :beta_ar)],
         p0.columns, p0.n_obs; scans = p0.scans)
-    @test_throws ContractValidationError validate_structure(p)
+    # capability: computed (assignment) scan-summand coefficient (P8 admits computed coefficients) (todo `0yc2qgp`)
+    @test_broken (validate_structure(p); true)
     # summands carry no columns and are self-addressed
+    # refused: scan summand carrying columns (IR contract)
     @test_throws ContractValidationError validate_structure(
         _scan_ar_plan(scan; columns = [:u]))
+    # refused: scan summand not self-addressed (IR contract)
     @test_throws ContractValidationError validate_structure(
         _scan_ar_plan(scan; addressee = :u))
 end
@@ -589,11 +621,13 @@ end
     @test bt.options == (scan_id = :u, coef = nothing)
     # coefficient with no `~` statement (refused: undeclared names never
     # become parameters, decision `05oe96l`)
+    # refused: q has no declaration (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(mu = a .+ q .* u)),
         (:x, :y))
     # Valid Julia the emitter does not build yet (a scan state is spliced
     # bare or scaled by one sampled scalar, additively): pinned as gaps so
     # building one fails this file instead of a silent refusal surviving.
+    # capability: scan-state arithmetic composes as ordinary values (P8 1cmodra; todo `0yc2qgp`).
     gap(loc, needle) = _scan_gap(needle) do
         lower_rkppl(prog(loc), (:x, :y))
     end
@@ -667,6 +701,7 @@ end
         Dict{Symbol,AbstractVector}(:y => [0.1, 0.2, 0.3])))
     # a carry write that reads its innovation before the step drawing it
     # (refused: in a Julia loop body `eps` is not defined yet)
+    # refused: the carry write reads its innovation before the step drawing it (Julia statement order, P3)
     @test_throws SurfaceLoweringError build_block(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
@@ -675,6 +710,7 @@ end
         end))
     # an unknown leaf in the carry write (refused: undeclared names never
     # become parameters, decision `05oe96l`)
+    # refused: undeclared name `nosuch` (P6, 05oe96l)
     @test_throws ContractValidationError build_block(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
@@ -682,6 +718,7 @@ end
             h[t] = nosuch * h[t - 1] + eps
         end))
     # Valid recurrences the emitter does not build yet.
+    # capability: arbitrary-support innovations and retained deterministic/data-dependent scans (P8 1cmodra; todo `0yc2qgp`).
     gap(needle, stmts...) = _scan_gap(() -> build_block(stmts...), needle)
     # a positive-support innovation or seed (the latent slice is identity)
     gap("must have real support",
@@ -768,6 +805,7 @@ end
     @test sp2.maxlag == 2
     @test sp2.lo == 3
 
+    # refused: each remaining entry violates statement order, single assignment or the declared carry/seed contract (P3; IR contract)
     reject(blk) = @test_throws SurfaceLoweringError parse_scan_block(blk)
     # a current value read before the step that writes it
     reject(quote

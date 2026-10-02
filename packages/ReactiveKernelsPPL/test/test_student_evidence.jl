@@ -60,7 +60,8 @@ end
     @test ir.evidence.kind === :interval_censored
 
     # Other families keep the fail-closed gate (new message).
-    @test_throws ContractValidationError bind_data(
+    # capability: censored evidence over HurdlePoisson (families beyond Gaussian/Student-t) (todo `0ze68k8`)
+    @test_broken (bind_data(
         lower_rkppl(Meta.parse("""begin
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
@@ -68,7 +69,7 @@ end
             y .~ censored.(HurdlePoisson.(exp.(mu), 0.1), lo, hi)
         end"""), (:y, :x, :lo, :hi)),
         Dict{Symbol,AbstractVector}(:y => [1, 2], :x => [0.5, 1.5],
-            :lo => [0, 0], :hi => [5, 5]))
+            :lo => [0, 0], :hi => [5, 5])); true)
 end
 
 # Clamp-law oracle over a location-scale TDist: at-bound rows take CDF

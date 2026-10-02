@@ -66,12 +66,14 @@ end
     shape2 = design_shape(pred2, plan.columns; levelmaps = maps2)
     @test shape2.blocks[1].labels == [:g_1, :g_3]
     # Factor terms without a map are loud.
+    # refused: FactorTerm without a LevelMap (IR contract)
     @test_throws ContractValidationError design_shape(pred2, plan.columns)
     # Duplicate coefficient labels are loud.
     preddup = PredictorSpec(:mu, IdentityLink,
         TermSpec[TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x1),
             TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x2)],
         :mu)
+    # refused: duplicate coefficient labels (IR contract)
     @test_throws ContractValidationError design_shape(preddup, plan.columns)
 end
 
@@ -86,12 +88,17 @@ end
     @test support_of(:normal, :positive) === :positive
     @test support_of(:normal, (:interval, -1.0, 2.0)) === :interval
     @test support_of(:normal, (:upper, 2.0)) === :upper
+    # refused: support override :positive on a non-real family (support_of contract)
     @test_throws ContractValidationError support_of(:exponential, :positive)
+    # refused: support override :positive on Uniform (support_of contract)
     @test_throws ContractValidationError support_of(:uniform, :positive)
     # An :interval override needs a real-support family.
+    # refused: interval override needs a real-support family (support_of contract)
     @test_throws ContractValidationError support_of(:exponential, (:interval, 0.0, 1.0))
     # So does an :upper override.
+    # refused: upper override needs a real-support family (support_of contract)
     @test_throws ContractValidationError support_of(:exponential, (:upper, 1.0))
+    # refused: unknown family :nope (support_of contract)
     @test_throws ContractValidationError support_of(:nope, nothing)
 end
 
@@ -147,6 +154,7 @@ end
     @test constrain(clay, cu).c < uhi
     @test unconstrain(clay, constrain(clay, cu)) ≈ cu
     @test logjac(clay, cu) ≈ 0.4
+    # refused: constrain with wrong-length unconstrained vector (layout contract)
     @test_throws ContractValidationError constrain(layout, [1.0])
 end
 
@@ -202,10 +210,12 @@ end
     bad = StructuralPlan(plan.responses, plan.predictors, plan.population_priors,
         [SampledParameter(:mu_coef, :exponential, (arg1 = 1.0,), nothing, :m)],
         plan.assignments, plan.columns, plan.n_obs)
+    # refused: parameter name collides with layout-internal name mu_coef (name hygiene, IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     bad = StructuralPlan(plan.responses, plan.predictors, plan.population_priors,
         [SampledParameter(:_ppl_x, :exponential, (arg1 = 1.0,), nothing, :m)],
         plan.assignments, plan.columns, plan.n_obs)
+    # refused: parameter uses reserved _ppl_ prefix (name hygiene, IR contract)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -311,6 +321,7 @@ end
     @test logjac(empty, Float64[]) == 0.0
     # Length mismatches are loud.
     badnt = (mu = [0.4], y_cutpoints = [1.0])
+    # refused: unconstrain with wrong-length value (layout contract)
     @test_throws ContractValidationError unconstrain(layout, badnt)
 end
 

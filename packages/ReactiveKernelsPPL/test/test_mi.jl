@@ -134,7 +134,8 @@ end
                 nothing; mi_jobs = :Jobs_y)],
             PredictorSpec[pred], _mi_priors(:mu), SampledParameter[],
             AssignmentSpec[], cols, n)
-        @test_throws ContractValidationError validate_plan(plan)
+        # capability: (IR-level) Case-A mi (obs-only rows) for families beyond Gaussian/Gamma/Beta; entries also use IdentityLink/no scale, so link/scale gates may fire first (todo `1308iv0`)
+        @test_broken (validate_plan(plan); true)
     end
     # mi is uncomposed in v1: weights/evidence/range/trials fail closed.
     struct_args = (GaussianFam, IdentityLink, :y, :mu, :sigma)
@@ -146,7 +147,8 @@ end
             SampledParameter[SampledParameter(:sigma, :exponential,
                 (arg1 = 1.0,), nothing, :sigma)],
             AssignmentSpec[], cols, n)
-        @test_throws ContractValidationError validate_plan(plan)
+        # capability: mi composed with weights (uncomposed in v1) (todo `1nb43fj`)
+        @test_broken (validate_plan(plan); true)
     end
     let r = LikelihoodSpec(struct_args..., nothing,
             ResponseEvidence(:truncated, 0.0, nothing), :y_resp, nothing,
@@ -157,7 +159,8 @@ end
             SampledParameter[SampledParameter(:sigma, :exponential,
                 (arg1 = 1.0,), nothing, :sigma)],
             AssignmentSpec[], cols, n)
-        @test_throws ContractValidationError validate_plan(plan)
+        # capability: mi composed with truncation evidence (uncomposed in v1) (todo `0ze68k8`)
+        @test_broken (validate_plan(plan); true)
     end
     let r = LikelihoodSpec(struct_args..., nothing, _mi_none_evidence(),
             :y_resp, nothing, 1:4; mi_jobs = :Jobs_y)
@@ -167,7 +170,8 @@ end
             SampledParameter[SampledParameter(:sigma, :exponential,
                 (arg1 = 1.0,), nothing, :sigma)],
             AssignmentSpec[], cols, n)
-        @test_throws ContractValidationError validate_plan(plan)
+        # capability: mi composed with a row range (uncomposed in v1) (todo `1nb43fj`)
+        @test_broken (validate_plan(plan); true)
     end
     # mi + intercept-only location: nothing full-length would cross,
     # so n is underivable (deferred, fails closed with attribution).
@@ -181,7 +185,8 @@ end
             SampledParameter[SampledParameter(:sigma, :exponential,
                 (arg1 = 1.0,), nothing, :sigma)],
             AssignmentSpec[], cols, n)
-        @test_throws ContractValidationError validate_plan(plan)
+        # capability: mi with an intercept-only location (n underivable; deferred) (todo `1nb43fj`)
+        @test_broken (validate_plan(plan); true)
     end
     # mi_jobs naming its own response is not an index column.
     let r = LikelihoodSpec(struct_args..., nothing, _mi_none_evidence(),
@@ -192,6 +197,7 @@ end
             SampledParameter[SampledParameter(:sigma, :exponential,
                 (arg1 = 1.0,), nothing, :sigma)],
             AssignmentSpec[], cols, n)
+        # refused: mi_jobs names the response itself, not an index column (IR contract)
         @test_throws ContractValidationError validate_plan(plan)
     end
 end
@@ -217,12 +223,14 @@ end
         bad = copy(cols)
         bad_jobs === nothing ? delete!(bad, :Jobs_y) :
             (bad[:Jobs_y] = bad_jobs)
+        # refused: Jobs index-column contract (mixed entries, see below)
         @test_throws ContractValidationError validate_plan(_mi_data_plan(bad))
     end
     # y_obs must align with Jobs exactly.
     for bad_y in ([0.2, -0.4, 0.1], [0.2])
         bad = copy(cols)
         bad[:y] = bad_y
+        # refused: y_obs length must equal length(Jobs) (length mismatch for observation-aligned data)
         @test_throws ContractValidationError validate_plan(_mi_data_plan(bad))
     end
     # Family value rules apply to y_obs directly (Gamma strictly positive).
@@ -234,10 +242,12 @@ end
         SampledParameter[SampledParameter(:alpha, :exponential, (arg1 = 1.0,),
             nothing, :alpha)],
         AssignmentSpec[], gcols, n)
+    # refused: Gamma response value 0.0 outside the family support
     @test_throws ContractValidationError validate_plan(gplan)
     # Raw missing columns never cross, even under mi.
     mcols = copy(cols)
     mcols[:y] = Union{Missing,Float64}[0.2, missing]
+    # refused: raw missing values in data (missing never crosses)
     @test_throws ContractValidationError validate_plan(_mi_data_plan(mcols))
 end
 
@@ -267,6 +277,7 @@ end
     catch e
         e
     end
+    # refused: the predictor requires x, which these columns omit (data binding contract, P6).
     @test err isa ContractValidationError && occursin("mi-managed", err.message)
 end
 

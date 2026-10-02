@@ -51,6 +51,7 @@ _occ_posterior(kern, lay, q::NamedTuple) =
     @test only(lplan.responses).family === GaussianFam
 
     # `logaddexp.` takes exactly two arguments.
+    # refused: one-argument logaddexp is a Julia MethodError (P3)
     @test_throws ContractValidationError bind_data(
         lower_rkppl(Meta.parse("""begin
             a ~ Normal(0, 1)

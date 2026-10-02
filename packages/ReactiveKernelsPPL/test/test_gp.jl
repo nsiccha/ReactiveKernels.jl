@@ -44,6 +44,7 @@ end
 
 @testset "exact gp emission failures" begin
     # A gp call in a scalar definition is ill-shaped (vector in scalar spot).
+    # refused: undotted scalar + vector is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             @plate for i in eachindex(y)
                 z[i] ~ Normal(0, 1)
@@ -52,8 +53,9 @@ end
             y .~ Normal.(mu, 0.5)
         end, (:y, :x))
     # Aniso/matrix locations fail at first eval (loud ArgumentError).
-    @test_throws ArgumentError gp_exp_quad_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0,
-        1e-9)
+    # capability: matrix-location (multi-dimensional) gp_exp_quad_cov (todo `0bfiemp`)
+    @test_broken (gp_exp_quad_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0,
+        1e-9); true)
 end
 
 @testset "periodic gp end to end" begin
@@ -94,6 +96,7 @@ end
 
 @testset "periodic gp emission failures" begin
     # A periodic gp call in a scalar definition is ill-shaped too.
+    # refused: undotted scalar + vector is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             @plate for i in eachindex(y)
                 z[i] ~ Normal(0, 1)
@@ -103,7 +106,9 @@ end
             y .~ Normal.(mu, 0.5)
         end, (:y, :x))
     # Matrix locations and non-positive periods fail at first eval.
-    @test_throws ArgumentError gp_periodic_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0,
-        1.0, 1e-9)
+    # capability: matrix-location gp_periodic_cov") (todo `0bfiemp`)
+    @test_broken (gp_periodic_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0,
+        1.0, 1e-9); true)
+    # refused: period = 0
     @test_throws ArgumentError gp_periodic_cov([0.0, 1.0], 1.0, 1.0, 0.0, 1e-9)
 end

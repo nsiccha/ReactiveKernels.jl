@@ -193,19 +193,10 @@ end
 @testset "Reactant ladder 2: grouped PK rejects the unrolled fallback" begin
     fx = _rj_grouped_pk()
     @test isfinite(fx.post_q(fx.u))
-    @test_throws "compiled PK recurrences are disabled" Reactant.@code_hlo fx.post_q(
-        Reactant.to_rarray(fx.u))
-    # The refusal names the live blocker (scan.md PK adapter note), not the
-    # closed issue #13.
-    err = try
-        Reactant.@code_hlo fx.post_q(Reactant.to_rarray(fx.u))
-        nothing
-    catch e
-        e
-    end
-    @test err isa ArgumentError
-    @test occursin("scan.md", sprint(showerror, err))
-    @test !occursin("issues/13", sprint(showerror, err))
+    # capability: Reactant-compiled grouped PK recurrences (unrolled fallback refused per core constraints; scan.md PK adapter) (todo `0yc2qgp`)
+    @test_broken (Reactant.@code_hlo fx.post_q(
+        Reactant.to_rarray(fx.u)); true)
+
 end
 
 # Multivariate slice priors (`mv_slices.jl`) under Reactant: simplex and

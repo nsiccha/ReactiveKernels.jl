@@ -75,16 +75,13 @@ const _CB_ADMITTED = (
 end
 
 @testset "composition matrix: fail-closed boundaries" begin
-    msg(prog, data) = try
-        lower_rkppl(prog, keys(data))
-        ""
-    catch e
-        e isa SurfaceLoweringError || rethrow()
-        sprint(showerror, e)
-    end
-    # me x dar: `dar()` lowers only as a direct predictor summand; a
-    # measurement-error latent makes the mean a derived column.
-    m = msg(quote
+    # capability: compose measurement-error, DAR, horseshoe and smooth
+    # values (P8 1cmodra; todo `1nb43fj`).
+    gap(prog, data) = @test_broken (lower_rkppl(prog, keys(data)); true)
+    # Admitted: ordinary coefficient reads now compose a measurement-error
+    # latent with a direct DAR summand.
+    admit(prog, data) = @test (lower_rkppl(prog, keys(data)); true)
+    admit(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
         beta ~ truncated(Normal(0.5, 0.2), 0, 1)
@@ -97,10 +94,9 @@ end
         y .~ Normal.(mu, sigma)
         x_obs .~ Normal.(x_true, 0.5)
     end, (; y = _CB_Y, x_obs = _CB_X))
-    @test occursin("dar()", m) && occursin("direct predictor summand", m)
     # horseshoe x hsgp: the horseshoe slice covers intercept/continuous
     # coefficients only.
-    m = msg(quote
+    gap(quote
         a ~ Normal(0, 1)
         b1 ~ Horseshoe()
         hsgp_basis(:h, x; k = 6)
@@ -108,5 +104,4 @@ end
         cnt .~ Poisson.(exp.(eta))
     end, (; cnt = [round(Int, 2 + sin(i)) for i in 1:_CB_N], x = _CB_X,
         x2 = _CB_X2))
-    @test occursin("horseshoe", m) && occursin("HSGPSummandTerm", m)
 end

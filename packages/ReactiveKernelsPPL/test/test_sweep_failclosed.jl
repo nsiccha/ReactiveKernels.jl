@@ -7,11 +7,12 @@ using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
 
-@testset "sweep fail-closed battery" begin
+@testset "sweep refusals and capability gaps" begin
     # Each entry: (sweep item, label, program, data names, error type).
     cases = [
         # Rate scalar spelling: the thin layer is column-oriented; scalar
         # data has no admission (rate replicates via 1-element columns).
+        # capability: scalar data at every model door (P10a 0dejlw1) (todo `1qlbn5b`).
         ("rate_1", "scalar-data likelihood",
             :(begin
                 theta ~ Beta(1.0, 1.0)
@@ -22,6 +23,7 @@ using Test
         # a sampled parameter). (The old non-Beta-prob pin is gone with
         # the BinomialProb surface path: bare locations admit any
         # sampled prior, matrix-b.)
+        # capability: a parameter-free density statement (10gzbm9 degenerate) (todo `1qlbn5b`).
         ("rate_1", "literal prob rejected",
             :(begin
                 k .~ Binomial.(n, 0.3)
@@ -32,6 +34,7 @@ using Test
         # distribution objects only. (m0 itself replicates via the
         # ZeroInflatedBinomial head; this pins the branch spelling's
         # rejection, not the item.)
+        # refused: `.~` right-hand side must be a distribution; `ifelse.(…, a, b)` yields reals (P3)
         ("m0", "response-position branch",
             :(begin
                 a ~ Normal(0, 1)
@@ -40,6 +43,7 @@ using Test
             end), (:s,), SurfaceLoweringError),
         # survey_model: discrete-n marginal needs data-sized mixture
         # support; mixture weights are literal vectors or simplex names.
+        # capability: data-supplied mixture weights (P10a 0dejlw1) (todo `1qlbn5b`).
         ("survey_model", "data-column mixture weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
@@ -52,6 +56,7 @@ using Test
         # a data-only call evaluated once at bind — test_functions_as_values.jl.)
         # bym2_offset_only: ICAR pairwise-difference prior needs
         # sampled-vector gathers plus a custom edge reduction.
+        # refused: indexes scalar-declared `phi` with data index vectors (Julia BoundsError, P3); declared-array gathers are admitted
         ("bym2_offset_only", "sampled-vector gather",
             :(begin
                 phi ~ Normal(0, 1)
@@ -60,6 +65,7 @@ using Test
             end), (:y, :node1, :node2), SurfaceLoweringError),
         # losscurve_sislob: Weibull/log-logistic CDF growth curve; no
         # Weibull in the response vocabulary.
+        # capability: a Weibull observation with an ordinary parameter (todo `1qlbn5b`).
         ("losscurve_sislob", "Weibull response",
             :(begin
                 a ~ Normal(0, 1)
@@ -67,6 +73,7 @@ using Test
             end), (:y,), SurfaceLoweringError),
         # sum_to_zero: orthonormal-pivot constraint transform; no
         # constraint head in the sampling vocabulary.
+        # refused: `sum_to_zero_effect` is not a visible distribution/function (Julia UndefVarError, P3); sum-to-zero becomes a library submodel (P8)
         ("sum_to_zero", "constraint sampling head",
             :(begin
                 alpha ~ Normal(0.0, 10.0)
@@ -78,6 +85,7 @@ using Test
             end), (:yt, :ylag1, :g), SurfaceLoweringError),
         # covid19imperial: renewal-equation convolution recursion; no
         # convolution primitive.
+        # refused: calls `conv`, undefined in the model module (Julia UndefVarError, P3)
         ("covid19imperial", "convolution call",
             :(begin
                 a ~ Normal(0, 1)
@@ -91,6 +99,7 @@ using Test
         # state_space_stochastic: latent random-walk prior over a sampled
         # vector (vectorized reductions over free states); ranges cover
         # eachindex exactly, never a 2:T window.
+        # refused: undeclared `mu`/`T` (P6, 05oe96l) and `mu[1]` has no prior (P7, 0d5a67r); random walks spell as @scan
         ("state_space_stochastic", "indexed self-prior",
             :(begin
                 s ~ Exponential(1.0)
@@ -100,6 +109,7 @@ using Test
         # arma11: ARMA(1,1) sequential error recursion is deterministic
         # given data+params; a @scan seed and step that read the data
         # column `y` (data-varying recurrences) are not built yet.
+        # capability: data-varying retained recurrences (P8 1cmodra) (todo `1qlbn5b`).
         ("arma11", "data-varying scan recurrence",
             :(begin
                 mu ~ Normal(0.0, 5.0)
@@ -118,6 +128,7 @@ using Test
         # against an independent density oracle below.
         # garch11: GARCH(1,1) variance recursion is deterministic given
         # data+params; same data-varying-recurrence gap.
+        # capability: data-varying retained recurrences (P8 1cmodra) (todo `1qlbn5b`).
         ("garch11", "data-varying scan recurrence",
             :(begin
                 m ~ Normal(0.0, 1.0)
@@ -134,9 +145,17 @@ using Test
                 y .~ Normal.(m, sigma)
             end), (:y,), SurfaceLoweringError),
     ]
+    capabilities = Set(["scalar-data likelihood", "literal prob rejected", "data-column mixture weights", "Weibull response", "data-varying scan recurrence"])
     for (item, label, prog, datanames, E) in cases
         @testset "$item: $label" begin
-            @test_throws E lower_rkppl(prog, datanames)
+            if label in capabilities
+                # capability: each entry above names a valid model shape (todo `1qlbn5b`).
+                @test_broken (lower_rkppl(prog, datanames); true)
+            else
+                # refused: remaining entries cite a Julia signature,
+                # undeclared name or read-before-write violation (P3/P6).
+                @test_throws E lower_rkppl(prog, datanames)
+            end
         end
     end
 end

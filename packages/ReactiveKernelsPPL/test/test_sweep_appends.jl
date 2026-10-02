@@ -148,6 +148,7 @@ end
             u_probes = [[0.5, -0.25, 0.1], [0.0, 0.0, 0.0]]
             expected = [-15.886646898631646]
             """)
+        # refused: surface `expected` length != u_probes count (sweep manifest contract)
         @test_throws ArgumentError load_manifest(mani)
     end
 end
@@ -242,13 +243,17 @@ end
         write(joinpath(dir, "m.toml"), good)
         @test_nowarn load_manifest(joinpath(dir, "m.toml"))
         # Missing file / bad TOML / empty cases.
+        # refused: manifest file missing (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "nope.toml"))
         write(joinpath(dir, "bad.toml"), "[[case\n")
+        # refused: malformed TOML (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "bad.toml"))
         write(joinpath(dir, "empty.toml"), "[meta]\n")
+        # refused: manifest with no cases (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "empty.toml"))
         # Duplicate ids — one namespace across kinds (cross-kind collides).
         write(joinpath(dir, "dup.toml"), good * good)
+        # refused: duplicate case ids (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "dup.toml"))
         write(joinpath(dir, "dup2.toml"), good * """
             [[case]]
@@ -257,11 +262,14 @@ end
             brm_inputs = "x"
             worker = ["true"]
             """)
+        # refused: duplicate case id across kinds (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "dup2.toml"))
         # Bad id charset (escapes fail closed); slash segments pass.
+        # refused: unsafe case-id charset `../escape` (sweep manifest contract)
         for bad in ("../escape", "a//b", "/lead", "trail/", "has space")
             write(joinpath(dir, "id.toml"),
                 replace(good, "demo-gaussian" => bad))
+            # refused: unsafe case-id charset (sweep manifest contract)
             @test_throws ArgumentError load_manifest(joinpath(dir, "id.toml"))
         end
         write(joinpath(dir, "slash.toml"),
@@ -274,11 +282,14 @@ end
             surface = $surf
             data = $dat
             """)
+        # refused: case missing `kind` (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "nk.toml"))
         write(joinpath(dir, "bk.toml"),
             replace(good, "\"surface\"" => "\"bogus\""))
+        # refused: unknown case kind (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "bk.toml"))
         write(joinpath(dir, "sw.toml"), good * "worker = [\"x\"]\n")
+        # refused: `worker` key on a surface case (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "sw.toml"))
         write(joinpath(dir, "bs.toml"), """
             [[case]]
@@ -288,6 +299,7 @@ end
             worker = ["true"]
             surface = $surf
             """)
+        # refused: `surface` key on a brm-probe case (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "bs.toml"))
         write(joinpath(dir, "bw.toml"), """
             [[case]]
@@ -295,6 +307,7 @@ end
             kind = "brm-probe"
             brm_inputs = "x"
             """)
+        # refused: brm-probe case missing `worker` (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "bw.toml"))
         write(joinpath(dir, "bi.toml"), """
             [[case]]
@@ -303,6 +316,7 @@ end
             brm_inputs = ""
             worker = ["true"]
             """)
+        # refused: empty `brm_inputs` (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "bi.toml"))
         write(joinpath(dir, "wn.toml"), """
             [[case]]
@@ -311,6 +325,7 @@ end
             brm_inputs = "x"
             worker = ["true", 7]
             """)
+        # refused: non-string worker argv entry (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "wn.toml"))
         write(joinpath(dir, "wf.toml"), """
             [[case]]
@@ -319,17 +334,22 @@ end
             brm_inputs = "x"
             worker = ["/nonexistent/worker.jl"]
             """)
+        # refused: nonexistent worker script (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "wf.toml"))
         # Unknown keys (top level, meta, case).
         write(joinpath(dir, "k1.toml"), good * "[bogus]\n")
+        # refused: unknown top-level table (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "k1.toml"))
         write(joinpath(dir, "k2.toml"), "[meta]\nnope = 1\n" * good)
+        # refused: unknown meta key (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "k2.toml"))
         write(joinpath(dir, "k3.toml"), good * "bogus = 1\n")
+        # refused: unknown case key (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "k3.toml"))
         # Missing surface / data files; missing required key.
         write(joinpath(dir, "sf.toml"),
             replace(good, "demo_gaussian.jl" => "nope.jl"))
+        # refused: missing surface file (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "sf.toml"))
         write(joinpath(dir, "rk.toml"), """
             [[case]]
@@ -337,30 +357,42 @@ end
             kind = "surface"
             surface = $surf
             """)
+        # refused: surface case missing required `data` (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "rk.toml"))
         # Non-finite / malformed u_probes / expected.
         write(joinpath(dir, "u1.toml"), good * "u_probes = []\n")
+        # refused: empty u_probes (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "u1.toml"))
         write(joinpath(dir, "u2.toml"), good * "u_probes = [[1.0, inf]]\n")
+        # refused: non-finite u_probes value (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "u2.toml"))
         write(joinpath(dir, "u3.toml"), good * "u_probes = [\"x\"]\n")
+        # refused: non-numeric u_probes (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "u3.toml"))
         write(joinpath(dir, "e1.toml"), good * "expected = [inf]\n")
+        # refused: non-finite expected value (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "e1.toml"))
         write(joinpath(dir, "e2.toml"), good * "expected = 7.0\n")
+        # refused: scalar `expected` (must be a list) (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "e2.toml"))
         # Malformed refs.
         write(joinpath(dir, "s.toml"), good * "supersedes_ref = \"has space\"\n")
+        # refused: malformed supersedes_ref (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "s.toml"))
         write(joinpath(dir, "b.toml"), good * "based_on = \"has space\"\n")
+        # refused: malformed based_on ref (sweep manifest contract)
         @test_throws ArgumentError load_manifest(joinpath(dir, "b.toml"))
         # CLI flag errors.
+        # refused: `--manifest` flag without value (sweep CLI contract)
         @test_throws ArgumentError sweep_main(["--manifest"])
+        # refused: unknown CLI flag (sweep CLI contract)
         @test_throws ArgumentError sweep_main(["--bogus", "x"])
+        # refused: missing `--out` (sweep CLI contract)
         @test_throws ArgumentError sweep_main(
             ["--manifest", joinpath(dir, "m.toml")])
         # Nothing is written when the manifest is bad.
         out = joinpath(dir, "out")
+        # refused: missing manifest, nothing written (sweep CLI contract)
         @test_throws ArgumentError sweep_appends(
             joinpath(dir, "nope.toml"), out)
         @test !isdir(out)
@@ -496,6 +528,7 @@ end
     @test args.wrap_token == true
     @test args.manifest_path == "m.toml"
     @test args.out_dir == "o"
+    # refused: missing `--out` (sweep CLI contract)
     @test_throws ArgumentError _sweep_cli_args(["--manifest", "m.toml"])
 end
 

@@ -121,8 +121,9 @@ end
         # Refused: any observation read retains the data's observation
         # axis; a bare declared array cannot broadcast over that axis
         # (standard Julia array-value contract, rkppl-use §2/§3).
-        @test_throws SurfaceLoweringError lower_rkppl(ast,
-            (:y, :y2, :g, :gx); mod = ArrayDataValueModels)
+        # capability: one whole array also read per observation; check its broadcast alignment at bind (P3, P10a 0dejlw1) (todo `1qlbn5b`)
+        @test_broken (lower_rkppl(ast,
+            (:y, :y2, :g, :gx); mod = ArrayDataValueModels); true)
     end
 end
 

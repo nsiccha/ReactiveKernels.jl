@@ -202,7 +202,8 @@ end
         eta = be .* r
         y .~ Bernoulli.(logistic.(eta))
     end
-    @test_throws SurfaceLoweringError lower_rkppl(bare, (:y, :g))
+    # capability: product of a coefficient with a varying_effect contribution in a composed predictor (values compose, P3/P8) (todo `1308iv0`)
+    @test_broken (lower_rkppl(bare, (:y, :g)); true)
 end
 
 @testset "IRT SB parity: direct (LSAT, 2PL, hier2pl)" begin

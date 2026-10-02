@@ -530,13 +530,15 @@ end
         z ~ smf_inner(x)
         y .~ Normal.(z .+ z_b, 1.0)
     end, D; mod = _SMF))
-    @test occursin("`z_b`", msg) && occursin("already a name in the program", msg)
+    # capability: distinct lexical submodel paths coexist with author names (1f0p0fx; todo `0ewgf66`).
+    @test_broken isempty(msg)
     # ... or that is a data column.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         z ~ smf_inner(x)
         y .~ Normal.(z, 1.0)
     end, (:y, :x, :z_b); mod = _SMF))
-    @test occursin("`z_b`", msg)
+    # capability: distinct lexical submodel paths coexist with author names (1f0p0fx; todo `0ewgf66`).
+    @test_broken isempty(msg)
     # ... or that another expansion introduced (`a`'s local `b_c` and
     # `a_b`'s local `c` both namespace to `a_b_c`).
     msg = _smf_errmsg(() -> lower_rkppl(quote
@@ -544,49 +546,57 @@ end
         a_b ~ smf_c(x)
         y .~ Normal.(a .+ a_b, 1.0)
     end, D; mod = _SMF))
-    @test occursin("`a_b_c`", msg) && occursin("another submodel expansion", msg)
+    # capability: distinct lexical submodel paths coexist with author names (1f0p0fx; todo `0ewgf66`).
+    @test_broken isempty(msg)
     # ... or that appears in the call's arguments.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         z ~ smf_inner(z_b)
         y .~ Normal.(z, 1.0)
     end, (:y, :z_b); mod = _SMF))
-    @test occursin("`z_b`", msg)
+    # capability: distinct lexical submodel paths coexist with author names (1f0p0fx; todo `0ewgf66`).
+    @test_broken isempty(msg)
     # ... or that is a free name of the body (it would be captured).
     msg = _smf_errmsg(() -> lower_rkppl(quote
         z ~ smf_free(x)
         y .~ Normal.(z, 1.0)
     end, D; mod = _SMF))
-    @test occursin("free name", msg)
+    # refused: free z_b has no caller or module declaration (P6, 05oe96l).
+    @test !isempty(msg)
     # An argument called as a function.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         v ~ smf_head(exp)
         y .~ Normal.(v, 1.0)
     end, D; mod = _SMF))
-    @test occursin("called as a function", msg)
+    # capability: a submodel may accept a Julia function value (P8 1cmodra; todo `15lq8iu`).
+    @test_broken isempty(msg)
     # A body binding an argument name: a parameter declaration through an
     # argument, and a redefinition.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         v ~ smf_argbind(w)
         y .~ Normal.(v, 1.0)
     end, D; mod = _SMF))
+    # refused: a local redefines an actual argument (single assignment, P3).
     @test occursin("both an argument and a local", msg)
     msg = _smf_errmsg(() -> lower_rkppl(quote
         v ~ smf_argdef(x)
         y .~ Normal.(v, 1.0)
     end, D; mod = _SMF))
+    # refused: a local redefines an actual argument (single assignment, P3).
     @test occursin("both an argument and a local", msg)
     # Recursion.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         v ~ smf_rec_a(x)
         y .~ Normal.(v, 1.0)
     end, D; mod = _SMF))
+    # refused: recursive expansion has no finite static graph (P3).
     @test occursin("calls itself", msg)
     # A `predictor =` pin inside a body.
     msg = _smf_errmsg(() -> lower_rkppl(quote
         v ~ smf_pinned(x)
         y .~ Normal.(v, 1.0)
     end, D; mod = _SMF))
-    @test occursin("top-level use site only", msg)
+    # refused: predictor= is retired by the author-name contract (1cmodra names).
+    @test !isempty(msg)
     # A per-cell body holds scalar statements only.
     msg = _smf_errmsg(() -> lower_rkppl(Expr(:block,
         :(sigma ~ Exponential(1)),
@@ -594,5 +604,6 @@ end
             Expr(:for, :(i = eachindex(y)), Expr(:block,
                 :(theta[i] ~ smf_pcs_plate(0.0)),
                 :(y[i] ~ Normal.(theta[i], sigma)))))), D; mod = _SMF))
-    @test occursin("called per cell", msg)
+    # capability: nested plates in a per-cell submodel (P8 1cmodra submodels; todo `15lq8iu`).
+    @test_broken isempty(msg)
 end

@@ -100,7 +100,8 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
         @test only(plan.responses).scale == ScalePredictorRef(:lk, LogLink)
     end
     @testset "non-log predictor kappa deferred" begin
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 c ~ Normal(0, 1)
@@ -108,7 +109,7 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
                 mu = a .+ b .* x
                 lk = c .+ d .* x
                 y .~ VonMises.(mu, lk)
-            end, (:y, :x))
+            end, (:y, :x)); true)
     end
     @testset "shifted-interval literals" begin
         plan = lower_rkppl(quote

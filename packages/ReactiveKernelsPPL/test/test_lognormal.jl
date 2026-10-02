@@ -75,7 +75,8 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
         @test only(plan.responses).scale === :sigmac
     end
     @testset "modeled sigma deferred" begin
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: modeled LogNormal sigma via a log-link predictor (exp.(ls)); 'deferred' (todo `05fuzch`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 c ~ Normal(0, 1)
@@ -83,7 +84,7 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
                 mu = a .+ b .* x
                 ls = c .+ d .* x
                 y .~ LogNormal.(mu, exp.(ls))
-            end, (:y, :x))
+            end, (:y, :x)); true)
     end
 end
 

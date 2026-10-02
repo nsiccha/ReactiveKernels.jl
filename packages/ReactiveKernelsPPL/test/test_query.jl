@@ -53,7 +53,8 @@ end
     @test workflow_wants(:likelihood) === :likelihood
     @test workflow_wants(:prior) === :prior
     @test workflow_wants(:log_jacobian) === :log_jacobian
-    @test_throws ArgumentError workflow_wants(:pointwise)
+    # capability: pointwise (per-observation) log-likelihood query preset; if the intent is 'unknown preset', use a nonsense name (todo `1qlbn5b`)
+    @test_broken (workflow_wants(:pointwise); true)
 end
 
 @testset "prepare_query cuts" begin
@@ -70,7 +71,8 @@ end
             bound = (; x = plan.columns[:x], y = plan.columns[:y]))
         @test prepare_query(built, plan, preset)(u) ≈ ref(u)
     end
-    @test_throws ArgumentError prepare_query(built, plan, :pointwise)
+    # capability: pointwise (per-observation) log-likelihood query preset; if the intent is 'unknown preset', use a nonsense name (todo `1qlbn5b`)
+    @test_broken (prepare_query(built, plan, :pointwise); true)
 end
 
 @testset "sampler value and gradient" begin
@@ -95,6 +97,7 @@ end
     # Friendly path: views convert.
     uv = view([9.9, 0.5, -0.25, 0.1, 9.9], 2:4)
     @test q(uv) ≈ ref(u)
+    # refused: unconstrained vector length mismatches layout
     @test_throws ContractValidationError prepare_sampler(built, plan, [0.1, 0.2];
         backend = _QUERY_BACKEND)
 end
@@ -121,6 +124,7 @@ end
     @test Tuple(keys(empty_nt)) === (:mu, :sigma)
     @test size(empty_nt.mu) == (2, 0)
     @test length(empty_nt.sigma) == 0
+    # refused: draws matrix row count mismatches layout
     @test_throws ContractValidationError restore_draws(built.layout, U[1:2, :])
 end
 

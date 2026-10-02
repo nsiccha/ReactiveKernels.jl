@@ -120,14 +120,28 @@ end
             "is a design matrix"),
     )
     for (label, prog, msg) in cases
-        err = try
-            lower_rkppl(prog, (:earn, :x, :g))
-            nothing
-        catch e
-            e
+        if label in ("scalar definition", "range over derived", "design matrix LHS")
+            # capability: scalar/matrix data values and valid indexed derived observations (P10a 0dejlw1; todo `1qlbn5b`).
+            declarations = label == "design matrix LHS" ? quote
+                b[axes(X, 2)] .~ Normal.(0, 1)
+                s ~ Exponential(1)
+            end : quote
+                b1 ~ Normal(0, 1)
+                b2 ~ Normal(0, 1)
+                s ~ Exponential(1)
+            end
+            @test_broken (lower_rkppl(Expr(:block, declarations.args..., prog.args...), (:earn, :x, :g)); true)
+        else
+            err = try
+                lower_rkppl(prog, (:earn, :x, :g))
+                nothing
+            catch e
+                e
+            end
+            # refused: duplicate/ambiguous observed LHS or parameter-dependent observed value (single assignment; data-only observation contract, P3/P9).
+            @test err isa SurfaceLoweringError
+            @test occursin(msg, sprint(showerror, err))
         end
-        @test err isa SurfaceLoweringError
-        @test occursin(msg, sprint(showerror, err))
     end
 end
 
@@ -141,6 +155,7 @@ end
     catch e
         e
     end
+    # refused: caller data shadows a value the model derives (single assignment, P3).
     @test err isa ContractValidationError
     @test occursin("drop it from bind_data", sprint(showerror, err))
     # A parameter-dependent response definition is rejected during lowering.
@@ -159,6 +174,7 @@ end
     catch e
         e
     end
+    # refused: observed data cannot depend on a sampled value (P9, bind-time observation contract).
     @test perr isa SurfaceLoweringError
     @test occursin("response ly is a predictor definition", sprint(showerror, perr))
     # Transitive data-only chains materialize (centering included).
@@ -190,6 +206,7 @@ end
     catch e
         e
     end
+    # refused: these observed Bernoulli values are outside {0,1} (response domain, P3).
     @test berr isa ContractValidationError
     @test occursin("Bernoulli response must be Bool or 0/1 integers",
         sprint(showerror, berr))

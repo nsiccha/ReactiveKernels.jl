@@ -90,6 +90,7 @@ end
     catch e
         e
     end
+    # refused: b is undeclared (P6, 05oe96l).
     @test err isa SurfaceLoweringError
     @test occursin("`b ~ Normal(0, 1)`", sprint(showerror, err))
     ast = Expr(:block,
@@ -114,9 +115,10 @@ end
             Expr(:block, :(x_true[i] ~ Normal(0, 1)),
                 :(x_obs[i] ~ Normal.(x_true[i], 0.5)))))
     # Bare latent in an inline location (no named derived to transform).
-    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+    # capability: latent in an inline likelihood location Normal.(a .+ x_true, sigma) (named form admitted; naming never changes legality) (todo `0fkd9yk`)
+    @test_broken (lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(sigma ~ Exponential(1)), plate,
-        :(y .~ Normal.(a .+ x_true, sigma))), Dn)
+        :(y .~ Normal.(a .+ x_true, sigma))), Dn); true)
     # Two coefficients on one latent column.
     twice = lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)), :(c ~ Normal(0, 1)),
@@ -126,9 +128,11 @@ end
     @test [t.options.parameter for t in only(p for p in twice.predictors if p.name === :mu).terms] == [:a, :b, :c]
     # A latent is not a factor index: the surface screens the inline
     # spelling, and the contract screens indexing in a named derived.
+    # refused: real-valued latent as an index c[x_true] (non-integer index; c also undeclared, P6)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(sigma ~ Exponential(1)), plate,
         :(y .~ Normal.(a .+ c[x_true], sigma))), Dn)
+    # refused: real-valued latent as an index in a named derived (non-integer index; c also undeclared, P6)
     @test_throws ContractValidationError lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(sigma ~ Exponential(1)),
         :(mu = a .+ c[x_true]), plate,
@@ -252,6 +256,7 @@ end
         TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
             :intercept),
         TermSpec(OffsetTerm, [:x_true], NamedTuple(), :x_true, :x_true_off)])
+    # refused: OffsetTerm over a plate latent (IR contract)
     @test_throws ContractValidationError validate_plan(off)
     # Factor over a latent: latents carry no levels. (The LevelMap gets
     # the plan past structure validation so the term check fires.)
@@ -268,6 +273,7 @@ end
         levelmaps = LevelMap[LevelMap(:mu, :x_true, [1, 2], :levels, :)],
         plate_parameters = PlateParameter[PlateParameter(:x_true, :normal,
             (arg1 = 0.0, arg2 = 1.0), nothing)])
+    # refused: FactorTerm over a plate latent; latents carry no levels (IR contract)
     @test_throws ContractValidationError validate_plan(fac)
     # The free coefficient needs its population prior.
     noprior = StructuralPlan(good.responses, good.predictors,
@@ -275,6 +281,7 @@ end
         good.parameters, good.assignments, cols, n;
         roles = good.roles, levelmaps = good.levelmaps,
         plate_parameters = good.plate_parameters)
+    # refused: free coefficient without its population prior (IR contract)
     @test_throws ContractValidationError validate_plan(noprior)
 end
 
@@ -305,8 +312,11 @@ end
     cols, n = _me_columns()
     @test validate_plan(_me_direct_plan(cols, n)) === nothing
     # A non-literal sd fails closed (SB: sd is a positive constant).
-    @test_throws ContractValidationError validate_plan(
-        _me_direct_plan(cols, n; sd = :sd_p))
+    # capability: (IR-level) plate-mean observation with a parameter (non-literal) sd (SB-mirroring gate) (todo `1308iv0`)
+    named_sd = _me_direct_plan(cols, n; sd = :sd_p)
+    push!(named_sd.parameters, SampledParameter(:sd_p, :exponential,
+        (arg1 = 1.0,), nothing, :sd_p))
+    @test_broken (validate_plan(named_sd); true)
     # Non-Gaussian plate-mean locations fail closed.
     badfam = StructuralPlan(
         LikelihoodSpec[LikelihoodSpec(BernoulliLogitFam, LogitLink, :yb,
@@ -320,7 +330,8 @@ end
             true, false]),
         n; plate_parameters = PlateParameter[PlateParameter(:x_true,
             :normal, (arg1 = 0.0, arg2 = 1.0), nothing)])
-    @test_throws ContractValidationError validate_structure(badfam)
+    # capability: (IR-level) non-Gaussian plate-mean response (todo `1308iv0`)
+    @test_broken (validate_structure(badfam); true)
     # Weights, evidence, and ranges fail closed on a plate-mean response.
     wplan = _me_direct_plan(cols, n)
     wresp = wplan.responses[2]
@@ -333,7 +344,8 @@ end
         wplan.predictors, wplan.population_priors, wplan.parameters,
         wplan.assignments, wcols, n;
         plate_parameters = wplan.plate_parameters)
-    @test_throws ContractValidationError validate_plan(wbad)
+    # capability: (IR-level) weights on a plate-mean response (todo `1308iv0`)
+    @test_broken (validate_plan(wbad); true)
     ev = ResponseEvidence(:truncated, 0.0, nothing)
     evbad = StructuralPlan(
         LikelihoodSpec[wplan.responses[1], LikelihoodSpec(wresp.family,
@@ -342,7 +354,8 @@ end
         wplan.predictors, wplan.population_priors, wplan.parameters,
         wplan.assignments, cols, n;
         plate_parameters = wplan.plate_parameters)
-    @test_throws ContractValidationError validate_plan(evbad)
+    # capability: (IR-level) truncation evidence on a plate-mean response (todo `0ze68k8`)
+    @test_broken (validate_plan(evbad); true)
     rbad = StructuralPlan(
         LikelihoodSpec[wplan.responses[1], LikelihoodSpec(wresp.family,
             wresp.link, wresp.response, wresp.predictor, wresp.scale,
@@ -351,7 +364,8 @@ end
         wplan.predictors, wplan.population_priors, wplan.parameters,
         wplan.assignments, cols, n;
         plate_parameters = wplan.plate_parameters)
-    @test_throws ContractValidationError validate_plan(rbad)
+    # capability: (IR-level) row range on a plate-mean response (todo `1308iv0`)
+    @test_broken (validate_plan(rbad); true)
 end
 
 @testset "generator me: surface-model values and gradient" begin

@@ -76,7 +76,8 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
         @test only(plan.responses).scale === :kc
     end
     @testset "modeled k deferred" begin
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: modeled Weibull shape via a log-link predictor (exp.(ls)); 'deferred' (todo `05fuzch`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 c ~ Normal(0, 1)
@@ -84,7 +85,7 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
                 eta = a .+ b .* x
                 ls = c .+ d .* x
                 y .~ Weibull.(exp.(ls), exp.(eta))
-            end, (:y, :x))
+            end, (:y, :x)); true)
     end
 end
 

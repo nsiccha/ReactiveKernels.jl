@@ -151,7 +151,7 @@ end
     t = only(a for a in p2.assignments if a.name === :t)
     @test t.expr.args[1] == GlobalRef(_FV, :affine_helper)
 
-    # An undefined function fails at lowering, naming it and the module.
+    # refused: the called function is absent from the model module (P6, 05oe96l).
     err = try
         lower_rkppl(quote
                 m0 ~ Normal(0, 1)
@@ -163,6 +163,7 @@ end
     catch e
         e
     end
+    # refused: the first case calls an undeclared function; the later case has a cyclic graph (P6/P3, 05oe96l).
     @test err isa SurfaceLoweringError
     @test occursin("no_such_helper", err.message)
     @test occursin("not defined", err.message)
@@ -181,9 +182,9 @@ end
     catch e
         e
     end
-    @test err isa SurfaceLoweringError
-    @test occursin("shifted", err.message)
-    @test occursin("broadcast", err.message)
+    # capability: valid ordinary value composition (P8 1cmodra; todo `15lq8iu`).
+    @test_broken (err === nothing || throw(err))
+
     # Read only inside the call, the column is a whole value and so is the
     # result: using it as the location says so, with the same spellings.
     err = try
@@ -196,11 +197,11 @@ end
     catch e
         e
     end
-    @test err isa SurfaceLoweringError
-    @test occursin("model-level value", err.message)
-    @test occursin("broadcast", err.message)
+    # capability: valid ordinary value composition (P8 1cmodra; todo `15lq8iu`).
+    @test_broken (err === nothing || throw(err))
 
     # Calling a model value is not a function call.
+    # refused: calling the scalar parameter value `s(1.0)` is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             m0 ~ Normal(0, 1)
             s ~ Exponential(1.0)
@@ -246,6 +247,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     # A per-cell latent is a value, never an index (contract, at lowering).
+    # refused: a gather index must be integer data; the per-cell latent x_true is a parameter (user GO 0fzormv)
     @test_throws ContractValidationError lower_rkppl(gathered(:x_true,
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                 Expr(:for, Expr(:(=), :i, :(eachindex(x))), Expr(:block,
@@ -253,10 +255,12 @@ end
                     :(x[i] ~ Normal.(x_true[i], 0.5)))))),
         Tuple(keys(cols)); mod = _FV)
     # So is a definition reading a parameter, however it is named.
+    # refused: a gather index must be integer data; k = c .* b reads parameter b (user GO 0fzormv)
     @test_throws ContractValidationError lower_rkppl(
         gathered(:k, :(k = c .* b)), Tuple(keys(cols)); mod = _FV)
     # A raw index column must hold integers (bind).
     real_idx = lower_rkppl(gathered(:x), Tuple(keys(cols)); mod = _FV)
+    # refused: gather index column x holds non-integer reals (non-integer index, user GO 0fzormv)
     @test_throws ContractValidationError bind_data(real_idx, cols)
     # An integer data column gathers (the corpus 97 shape).
     @test bind_data(lower_rkppl(gathered(:c), Tuple(keys(cols)); mod = _FV),
@@ -383,7 +387,9 @@ end
     catch e
         e
     end
+    # refused: the first case calls an undeclared function; the later case has a cyclic graph (P6/P3, 05oe96l).
     @test err isa SurfaceLoweringError
+    # refused: a static value graph must be acyclic (single assignment, P3).
     @test occursin("cyclic definition", err.message)
     # Data-only definitions reached twice stay data-only, so a module call
     # over their observation-aligned result binds once instead of being
@@ -506,6 +512,7 @@ end
     # A caller column under a computed name is refused, not shadowed.
     cols2 = copy(cols)
     cols2[:vx] = [1.0, 2.0]
+    # refused: caller column vx collides with the computed definition vx (single assignment; names must not collide with data names)
     @test_throws ContractValidationError bind_data(plan, cols2)
 end
 
@@ -688,6 +695,7 @@ end
             mu = v[g] .+ gx
             y .~ Normal.(mu, sigma)
         end, (:y, :g, :gx); mod = _FV)
+    # refused: gx is read per observation (`v[g] .+ gx`), so it is observation-aligned; its length 3 against 6 observations is a length mismatch (wrong data; a Julia DimensionMismatch, P3)
     @test_throws ContractValidationError bind_data(mixed, cols)
     # So does a name any other plan slot holds (here: response weights).
     weighted_plan = lower_rkppl(quote
@@ -697,6 +705,7 @@ end
             v = b .* gx_m
             y .~ weighted.(Normal.(v[g], sigma), gx)
         end, (:y, :g, :gx); mod = _FV)
+    # refused: weights gx (length 3) do not match the 6 observations (wrong data: length mismatch; a broadcast DimensionMismatch, P3)
     @test_throws ContractValidationError bind_data(weighted_plan, cols)
 end
 
@@ -755,7 +764,8 @@ end
         end, (Tuple(keys(cols))..., :y2); mod = _FV),
         merge(cols, Dict{Symbol,ColumnData}(:y2 => reverse(cols[:y])))).n_obs == 8
     # ... unless something else reads one per observation.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: parameter-dependent undotted module call over an observation-aligned column (t is passed whole to decayed_events and also read per observation as weights; refused as "result shape unknown until sampling") (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
             sigma ~ Exponential(1.0)
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
@@ -763,17 +773,18 @@ end
             scale = a .+ b .* as_vector(gx)
             reads = decayed_events(g, t, eg, et, ea, w, scale, k)
             y .~ weighted.(Normal.(reads[oi], sigma), t)
-        end, Tuple(keys(cols)); mod = _FV)
+        end, Tuple(keys(cols)); mod = _FV); true)
     # A gather by a per-observation index is observation-aligned, even of
     # a whole column.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: parameter-dependent undotted module call over an observation-aligned value (`shifted(gx[g]; by = s)`, then gathered `t2[oi]`; refused as "result shape unknown until sampling") (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
             s ~ Exponential(1.0)
             m0 ~ Normal(0, 1)
             c ~ Normal(0, 1)
             t2 = shifted(gx[g]; by = s)
             mu = m0 .+ c .* g .+ t2[oi]
             y .~ Normal.(mu, 1.0)
-        end, Tuple(keys(cols)); mod = _FV)
+        end, Tuple(keys(cols)); mod = _FV); true)
     for u in ([0.3, -0.2, 0.5, 0.1], [-1.1, 0.7, -0.3, -0.4])
         th = ReactiveKernelsPPL.constrain(built.layout, u)
         reads = _FV.decayed_events(cols[:g], cols[:t], cols[:eg], cols[:et],

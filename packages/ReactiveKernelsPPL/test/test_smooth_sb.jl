@@ -114,24 +114,6 @@ const _SM_BRMHSGP = quote
     y .~ Normal.(mu, exp.(lsig))
 end
 
-# accel_splines SB pin vs RK's canonical TPS basis (decision 1vts6mb: each
-# penalized column's first significant entry is positive). The SB numbers
-# below were produced (strato2) on a raw-LAPACK basis whose column 3 has the
-# opposite sign. A column flip is a reparametrization under that column's
-# N(0, 1) raw prior, so the SB pin is reproduced exactly at the point with
-# that column's raw coordinates negated. Drop the mapping once BRM adopts the
-# canonical signs and re-derives the SB number (BRM todo 1wo7z27).
-const _SM_ACCELSPL_SB_FLIPS = (3,)
-function _sm_sb_signed(lay, u)
-    v = copy(u)
-    for (i, n) in enumerate(coordinate_names(lay))
-        m = match(r"^b_s_x2?_raw\.(\d+)$", string(n))
-        m !== nothing && parse(Int, m.captures[1]) in _SM_ACCELSPL_SB_FLIPS &&
-            (v[i] = -v[i])
-    end
-    return v
-end
-
 const _SM_ACCELSPL = quote
     spline_basis(:s_x, x; sd = StudentT(3, 0, 36))
     spline_basis(:s_x2, x2; sd = StudentT(3, 0, 10))
@@ -188,33 +170,44 @@ const _SM_DATA = (
                 :(StudentT(3, 0)), :(truncated(Normal(0, 1), 0, Inf)))
         ex = quote
             a ~ Normal(0, 1)
+            s ~ Exponential(1)
             mu = a .+ hsgp(:h_x)
             hsgp_basis(:h_x, x; k = 8, sd = $bad)
             y .~ Normal.(mu, 1.0)
         end
-        @test_throws SurfaceLoweringError lower_rkppl(ex, (:y, :x))
+        if bad == :(StudentT(3, 0))
+            # refused: StudentT is missing its scale argument (P3 arity).
+            @test_throws SurfaceLoweringError lower_rkppl(ex, (:y, :x))
+        else
+            # capability: proper, bounded and sampled-argument basis
+            # hyper priors (P7/P8 1cmodra; todo `0bfiemp`).
+            @test_broken (lower_rkppl(ex, (:y, :x)); true)
+        end
     end
+    # refused: unknown keyword `lengthscale` (unsupported kwarg is a Julia MethodError, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         a ~ Normal(0, 1)
         mu = a .+ hsgp(:h_x)
         hsgp_basis(:h_x, x; k = 8, lengthscale = LogNormal(0, 1))
         y .~ Normal.(mu, 1.0)
     end, (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: HalfCauchy spline-sd hyper prior (proper half-distribution, honest spelling) (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
         spline_basis(:s_x, x; sd = HalfCauchy(2))
         a ~ Normal(0, 1)
         mu = a .+ spline(:s_x)
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x))
+    end, (:y, :x)); true)
     # A hand-built plan's hyper prior is contract-validated too.
     bad = HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits, hb.label,
         hb.cov, hb.period, HyperPrior(:beta, (arg1 = 1.0, arg2 = 1.0)),
         nothing)
-    @test_throws ContractValidationError validate_structure(
+    # capability: a Beta smooth-SD prior with explicit shape arguments (P8 1cmodra; todo `0bfiemp`).
+    @test_broken (validate_structure(
         StructuralPlan(plan.responses, plan.predictors,
             plan.population_priors, plan.parameters, plan.assignments,
             plan.columns, plan.n_obs; derived = plan.derived,
-            hsgp_bases = [bad, plan.hsgp_bases[2]]))
+            hsgp_bases = [bad, plan.hsgp_bases[2]])); true)
 end
 
 const _SM_DOMAIN_X = [-1.0, -0.7, -0.4, -0.1, 0.2, 0.5, 0.8, 1.0]
@@ -243,6 +236,7 @@ end
     @test (e.transform, e.lo, e.hi) == (:interval, 0.4119140661125232, 2.0)
     # Data outside the fixed domain fails at bind; `domain` excludes `c`
     # and periodic; malformed pairs fail at the surface.
+    # refused: data outside the fixed approximation domain
     @test_throws ContractValidationError bind_data(plan,
         _sm_cols((; x = [-2.0, 0.0, 1.0], y = [0.1, 0.2, 0.3])))
     for kws in (:((; k = 4, domain = (-1.5, 1.5), c = 1.5)),
@@ -257,6 +251,7 @@ end
             hsgp_basis(:h, x; $(kws.args[1].args...))
             y .~ Normal.(mu, 1.0)
         end
+        # refused: over-determined boundary, domain and c both set it (P2)
         @test_throws Union{SurfaceLoweringError,ContractValidationError} bind_data(
             lower_rkppl(ex, (:y, :x)),
             _sm_cols((; x = [-1.0, 0.0, 1.0], y = [0.1, 0.2, 0.3])))
@@ -294,9 +289,8 @@ end
     # each) into the intercepts b0 and s0 makes the models identical: RK
     # at 0.3^22 with both intercepts at 0.6 equals the SB literal up to
     # those two priors, StudentT(3, -13, 36) and StudentT(3, 0, 10).
-    # Evaluated at the point that maps RK's canonical TPS basis onto the
-    # raw-LAPACK basis SB used (`_sm_sb_signed`, decision 1vts6mb); before
-    # canonical signs a CI runner's LAPACK flipped column 4 here.
+    # Both bases use canonical signs (1vts6mb); BRM's independently compiled
+    # reference is spline_accel_parity_case at canonical 040a759f8a056a3f07f59f851b440db607e9a7d7.
     _, _, kern, lay = _sm_query(_SM_ACCELSPL, _sm_cols(_SM_DATA.accelspl))
     @test lay.total == 22
     names = coordinate_names(lay)
@@ -306,8 +300,8 @@ end
     t3(m, s, v) = logpdf(TDist(3), (v - m) / s) - log(s)
     bridge = t3(-13, 36, 0.6) - t3(-13, 36, 0.3) + t3(0, 10, 0.6) -
         t3(0, 10, 0.3)
-    @test _sm_val(kern, _sm_sb_signed(lay, u)) ≈
-        -68.72536513207879 + bridge atol = 1e-10
+    @test _sm_val(kern, zeros(22)) ≈ -46.468310103713605 atol = 1e-10
+    @test _sm_val(kern, u) ≈ -69.1125421088841 + bridge atol = 1e-10
 end
 
 @testset "grouped HSGP surface + contract" begin
@@ -338,20 +332,31 @@ end
             base(kw(:by, :g), kw(:cov, QuoteNode(:periodic)),
                 kw(:period, 1.0)),
             base(kw(:by, :(g .+ 1))))
-        @test_throws SurfaceLoweringError lower_rkppl(bad, cols)
+        if bad in (base(kw(:by, :g), kw(:cov, QuoteNode(:periodic)),
+                kw(:period, 1.0)), base(kw(:by, :(g .+ 1))))
+            # capability: grouped periodic bases and computed groups
+            # (P8 1cmodra; todo `0bfiemp`).
+            @test_broken (lower_rkppl(bad, cols); true)
+        else
+            # refused: remaining hyper formulas lack a matching group or
+            # contain an observation slope in a group-level slot (IR contract).
+            @test_throws SurfaceLoweringError lower_rkppl(bad, cols)
+        end
     end
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: grouped multi-axis HSGP (by= with two axes; source: "v1 ... planned") (todo `0bfiemp`)
+    @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
         hsgp_basis(:h, x, q; k = (4, 4), by = g)
         mu = a .+ hsgp(:h)
         y .~ Normal.(mu, 1.0)
-    end, cols)
+    end, cols); true)
     # A hand-built hyper-predictor without a grouping is contract-invalid.
     plan = lower_rkppl(base(kw(:by, :g),
         kw(:length_scale, :(1 + (1 | g)))), cols)
     hb = only(plan.hsgp_bases)
     bad = HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits, hb.label,
         hb.cov, hb.period, hb.rho_prior, hb.sigma_prior, hb.domain, nothing)
+    # refused: hyper-predictor without a grouping (IR contract)
     @test_throws ContractValidationError validate_structure(
         StructuralPlan(plan.responses, plan.predictors,
             plan.population_priors, plan.parameters, plan.assignments,

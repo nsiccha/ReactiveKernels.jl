@@ -430,7 +430,7 @@ end
     # `B[a, b] .~ Fam.(...)`.
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[levels(g),
         1:2]) .~ Normal(0, 1))), (:y, :x, :g))
-    # refused: a one-axis array has no rows to iterate (principle 3).
+    # refused: eachrow of a vector produces length-1 rows, which disagree with the length-2 multivariate prior (P3 dimension contract)
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(eachrow(B[1:2]) .~
         MvNormalCholesky(zeros(2), F))), (:y, :x, :g))
     # refused: the mean of a multivariate normal is a vector, as in
@@ -439,12 +439,15 @@ end
         1:2]) .~ MvNormalCholesky(0, F))), (:y, :x, :g))
     # A mean that is not a K-vector: here a column the predictor reads
     # per observation (8 values for rows of length 2).
+    # refused: row, mean and covariance-factor dimensions must agree (distribution domain, P3)
     @test_throws ContractValidationError bindm(prog(:(eachrow(B[levels(g),
         1:2]) .~ MvNormalCholesky(x, F))), (; y, x, g))
     # A literal mean whose length differs from the rows.
+    # refused: row, mean and covariance-factor dimensions must agree (distribution domain, P3)
     @test_throws ContractValidationError bindm(prog(:(eachrow(B[levels(g),
         1:2]) .~ MvNormalCholesky([0.0, 0.0, 0.0], F))), (; y, x, g))
     # A declared factor whose size differs from the rows.
+    # refused: row, mean and covariance-factor dimensions must agree (distribution domain, P3)
     @test_throws ContractValidationError bindm(:(begin
         L ~ LKJCholesky(3, 2.0)
         eachrow(B[levels(g), 1:2]) .~ MvNormalCholesky(zeros(2), L)
@@ -478,19 +481,22 @@ end
         Dict{Symbol,ColumnData}(pairs(data)))
     y, x = _av_y(), _av_x()
     # `~` on a sized declaration.
+    # refused: scalar ~ on a sized array declaration; ~ is scalar, .~ broadcasts (P3)
     @test_throws SurfaceLoweringError lower_rkppl(:(begin
         z[1:3] ~ Normal(0, 1)
         y .~ Normal.(z[1], 1.0)
     end), (:y,))
     # A bare array combined with per-observation data.
-    @test_throws SurfaceLoweringError lower_rkppl(:(begin
+    # capability: array parameter broadcast with observation data z .+ x (valid Julia when lengths agree; refused shape-blind at lowering) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(:(begin
         z[1:3] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
         w = z .+ x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end), (:y, :x))
+    end), (:y, :x)); true)
     # Undotted elementwise math over an array is a Julia error.
+    # refused: undotted scalar + vector is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError lower_rkppl(:(begin
         z[1:3] .~ Normal.(0, 1)
         s ~ Exponential(1)
@@ -501,22 +507,25 @@ end
         y .~ Normal.(mu, 1.0)
     end), (:y, :x))
     # LKJCholesky: non-literal eta, upper factor.
-    @test_throws SurfaceLoweringError lower_rkppl(:(begin
+    # capability: sampled LKJCholesky eta (P8 1cmodra admits sampled prior args) (todo `1308iv0`)
+    @test_broken (lower_rkppl(:(begin
         e ~ Exponential(1)
         L ~ LKJCholesky(2, e)
         a ~ Normal(0, 1)
         w = L[2, 1] .* x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end), (:y, :x))
-    @test_throws SurfaceLoweringError lower_rkppl(:(begin
+    end), (:y, :x)); true)
+    # capability: LKJCholesky upper factor (uplo = 'U') (todo `1308iv0`)
+    @test_broken (lower_rkppl(:(begin
         L ~ LKJCholesky(2, 2.0, 'U')
         a ~ Normal(0, 1)
         w = L[2, 1] .* x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
-    end), (:y, :x))
+    end), (:y, :x)); true)
     # A data matrix whose columns do not match the array.
+    # refused: B * w column/length mismatch is a Julia DimensionMismatch (wrong data)
     @test_throws ContractValidationError bindm(:(begin
         w[1:2] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
@@ -524,6 +533,7 @@ end
         y .~ Normal.(mu, 1.0)
     end), (; y, B = _av_B()))
     # A vector where `B * w` needs a matrix.
+    # refused: vector * vector for B * w is a Julia MethodError (wrong data, P3)
     @test_throws ContractValidationError bindm(:(begin
         w[1:3] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
@@ -531,6 +541,7 @@ end
         y .~ Normal.(mu, 1.0)
     end), (; y, B = x))
     # Out-of-bounds literal position.
+    # refused: out-of-bounds literal index z[4] (BoundsError)
     @test_throws ContractValidationError bindm(:(begin
         z[1:3] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
@@ -539,6 +550,7 @@ end
         y .~ Normal.(mu, 1.0)
     end), (; y, x))
     # A gather by values not on the levels axis.
+    # refused: gather by values not on the levels axis (invalid index)
     @test_throws ContractValidationError bindm(:(begin
         z[levels(g)] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
@@ -547,6 +559,7 @@ end
         y .~ Normal.(mu, 1.0)
     end), (; y, x, g = _av_g(), h = ["a", "b", "z", "a", "b", "c", "a", "b"]))
     # An integer axis gathered by non-integers.
+    # refused: integer axis gathered by non-integers (non-integer index)
     @test_throws ContractValidationError bindm(:(begin
         z[1:3] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
@@ -554,6 +567,7 @@ end
         y .~ Normal.(mu, 1.0)
     end), (; y, g = _av_g()))
     # Per-element literal arguments of the wrong length.
+    # refused: per-element prior args of the wrong length (DimensionMismatch)
     @test_throws ContractValidationError bindm(:(begin
         z[1:3] .~ Normal.(0, [1.0, 2.0])
         a ~ Normal(0, 1)

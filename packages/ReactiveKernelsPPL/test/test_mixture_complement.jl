@@ -50,6 +50,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
     @test rr.mixture_weights == MixtureComplementWeights(:theta, false)
 
     # Non-complement sampled vectors stay fail-closed.
+    # refused: [a, b] from independent Betas does not sum to 1 (probabilities not summing to 1)
     @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
         mu1 ~ Normal(0.0, 2.0)
         mu2 ~ Normal(0.0, 2.0)
@@ -60,6 +61,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
     end"""), (:y,))
 
     # Non-unit params fail at contract.
+    # refused: [s, 1 - s] with s ~ Exponential gives a negative weight (support mismatch)
     @test_throws ContractValidationError bind_data(
         lower_rkppl(Meta.parse("""begin
             mu1 ~ Normal(0.0, 2.0)
@@ -71,6 +73,7 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
         Dict{Symbol,AbstractVector}(:y => [0.5, -1.0]))
 
     # K != 2 fails at contract.
+    # refused: 2 weights for 3 components (length mismatch)
     @test_throws ContractValidationError bind_data(
         lower_rkppl(Meta.parse("""begin
             mu1 ~ Normal(0.0, 2.0)

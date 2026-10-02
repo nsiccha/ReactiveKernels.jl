@@ -75,6 +75,7 @@ end
     @test loc == [0.0, 0.0, 0.0]
     @test sca == [1.0, 2.0, 3.0]
     # Missing table entry fails loudly (defense in depth).
+    # refused: MatrixTerm with no matrices table entry (IR contract)
     @test_throws ContractValidationError design_shape(plan.predictors[1],
         plan.columns)
     # Cross-term duplicate columns fail at design time (behind the
@@ -85,6 +86,7 @@ end
         TermSpec(ContinuousTerm, [:x1], NamedTuple(), :x1, :x1_term)],
         matrices = DesignMatrix[DesignMatrix(:Y,
             Union{Nothing,Symbol}[:x1], :Y)])
+    # refused: duplicate column across matrix and affine term (one coefficient per column) (IR contract)
     @test_throws ContractValidationError design_shape(dup.predictors[1],
         dup.columns; matrices = dup.matrices)
 end
@@ -115,48 +117,60 @@ end
     # Unknown matrix.
     bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1, :x2],
         (matrix = :Z,), :Z, :Z_term)])
+    # refused: MatrixTerm names an unknown matrix (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Malformed options.
     bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1, :x2],
         (matrix = :X, extra = 1), :X, :X_term)])
+    # refused: malformed MatrixTerm options (extra key) (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1, :x2],
         NamedTuple(), :X, :X_term)])
+    # refused: MatrixTerm options missing :matrix (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Non-symbol matrix ref.
     bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1, :x2],
         (matrix = 42,), :X, :X_term)])
+    # refused: non-Symbol matrix ref (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Term columns must match the matrix data columns in order.
     bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x2, :x1],
         (matrix = :X,), :X, :X_term)])
+    # refused: term columns must match matrix columns in order (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1],
         (matrix = :X,), :X, :X_term)])
+    # refused: term columns must match matrix columns (missing column) (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Addressee must be the matrix name.
     bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1, :x2],
         (matrix = :X,), :x1, :X_term)])
+    # refused: MatrixTerm addressee must be the matrix name (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Empty matrix.
     bad = _mx_plan(
         matrices = DesignMatrix[DesignMatrix(:X, Union{Nothing,Symbol}[], :X)])
+    # refused: empty DesignMatrix (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Duplicate matrix names.
     bad = _mx_plan(matrices = DesignMatrix[_mx_matrix(), _mx_matrix()])
+    # refused: duplicate matrix names (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Duplicate column within one matrix.
     bad = _mx_plan(matrices = DesignMatrix[DesignMatrix(:X,
         Union{Nothing,Symbol}[nothing, :x1, :x1], :X)])
+    # refused: duplicate column within one matrix (identifiability) (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Two intercept positions.
     bad = _mx_plan(matrices = DesignMatrix[DesignMatrix(:X,
         Union{Nothing,Symbol}[nothing, nothing, :x1], :X)])
+    # refused: two intercept columns (identifiability) (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Nested matrix.
     bad = _mx_plan(matrices = DesignMatrix[
         DesignMatrix(:X, Union{Nothing,Symbol}[nothing, :x1], :X),
         DesignMatrix(:Y, Union{Nothing,Symbol}[:X, :x2], :Y)])
+    # refused: nested matrix column (DesignMatrix columns are data columns) (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Latent column (me mirror stays affine).
     bad = _mx_plan(
@@ -166,39 +180,47 @@ end
             (matrix = :X,), :X, :X_term)],
         plate_parameters = PlateParameter[PlateParameter(:x_true, :normal,
             (arg1 = 0.0, arg2 = 1.0), nothing)])
+    # refused: latent column in a DesignMatrix (data-only table) (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Sampled-parameter column.
     bad = _mx_plan(matrices = DesignMatrix[DesignMatrix(:X,
         Union{Nothing,Symbol}[nothing, :sigma], :X)])
+    # refused: sampled-parameter column in a DesignMatrix (data-only table) (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Scalar-assignment column.
     bad = _mx_plan()
     push!(bad.assignments, AssignmentSpec(:s, :(1.0 + 0.0)))
     bad.matrices[1] = DesignMatrix(:X,
         Union{Nothing,Symbol}[nothing, :s], :X)
+    # refused: scalar-assignment column in a DesignMatrix (data-only table) (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Missing element prior (x2 row dropped).
     bad = _mx_plan(priors = PopulationPrior[
         PopulationPrior(:mu, :Intercept, 0.0, 1.0),
         PopulationPrior(:mu, :x1, 0.0, 2.0)])
+    # refused: missing per-element prior (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Duplicate element prior.
     bad = _mx_plan(priors = PopulationPrior[
         _mx_priors(:mu)...,
         PopulationPrior(:mu, :x1, 0.0, 5.0)])
+    # refused: duplicate per-element prior (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Matrix name collides with a parameter name.
     bad = _mx_plan(
         matrices = DesignMatrix[DesignMatrix(:sigma,
             Union{Nothing,Symbol}[nothing, :x1], :sigma)])
+    # refused: matrix name collides with a parameter name (IR contract)
     @test_throws ContractValidationError validate_structure(bad)
     # Non-numeric data column.
     bad = _mx_plan()
     bad.columns[:x1] = ["a", "b", "c", "d", "e", "f"]
+    # refused: non-numeric data column under a matrix (IR contract)
     @test_throws ContractValidationError validate_data(bad)
     # Missing data column.
     bad = _mx_plan()
     delete!(bad.columns, :x2)
+    # refused: missing data column referenced by a matrix (IR contract)
     @test_throws ContractValidationError validate_data(bad)
 end
 
@@ -348,19 +370,26 @@ end
 @testset "matrix surface definition errors" begin
     D = (:y, :x1)
     cases = [
-        ("no columns", quote X = hcat(); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("nests matrix", quote X = hcat(1, x1); Y = hcat(X, x1); mu = Y * b; y .~ Normal.(mu, 1.0) end),
-        ("which is scalar", quote s = 1.0; X = hcat(s, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("over sampled parameter", quote s ~ Normal(0, 1); X = hcat(s, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("over unknown name", quote X = hcat(1, foo); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("non-column argument", quote X = hcat(2, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("outside a matrix definition", quote mu = hcat(1, x1) * b; y .~ Normal.(mu, 1.0) end),
+        ("no columns", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("nests matrix", quote b[axes(Y, 2)] .~ Normal.(0, 1); X = hcat(1, x1); Y = hcat(X, x1); mu = Y * b; y .~ Normal.(mu, 1.0) end),
+        ("which is scalar", quote b[axes(X, 2)] .~ Normal.(0, 1); s = 1.0; X = hcat(s, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("over sampled parameter", quote b[axes(X, 2)] .~ Normal.(0, 1); s ~ Normal(0, 1); X = hcat(s, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("over unknown name", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, foo); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("non-column argument", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(2, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("outside a matrix definition", quote b[1:2] .~ Normal.(0, 1); mu = hcat(1, x1) * b; y .~ Normal.(mu, 1.0) end),
         ("never used in a predictor matmul", quote X = hcat(1, x1); mu = a .+ c .* x1; a ~ Normal(0, 1); c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
         ("never used in a predictor", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = a .+ c .* x1; a ~ Normal(0, 1); c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
     ]
     for (msg, ast) in cases
         err = _mx_err(ast, D)
-        @test err isa SurfaceLoweringError && occursin(msg, err.message)
+        if msg != "over unknown name"
+            # capability: value-valued matrix construction and unused data/parameters (P3/P8, 10gzbm9 degenerate; todo `15lq8iu`).
+            @test_broken (lower_rkppl(ast, D); true)
+        else
+            # refused: unknown names, dimension mismatch, unidentified
+            # coefficients or non-scalar constructor arguments (P3/P6).
+            @test err isa SurfaceLoweringError && occursin(msg, err.message)
+        end
     end
 end
 
@@ -375,20 +404,33 @@ end
         (D, "got 2", quote X = hcat(1, x1); y .~ Normal.(X * 2, 1.0) end),
         (D, "has 2 elements (sized by `S`) but matrix `X` has 3 columns", quote b[axes(S, 2)] .~ Normal.(0, 1); S = hcat(1, x1); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (D, "sized by `Z`, which is not a design matrix", quote b[axes(Z, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        (Dz, "shared across predictors", quote X = hcat(1, x1); mu = X * b; nu = X * b; y .~ Normal.(mu, 1.0); z .~ Normal.(nu, 1.0) end),
-        (D, "literal scaling of a matmul", quote X = hcat(1, x1); mu = 2 * (X * b); y .~ Normal.(mu, 1.0) end),
-        (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = x2 .* (X * b); y .~ Normal.(mu, 1.0) end),
-        (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = exp.(X * b); y .~ Normal.(mu, 1.0) end),
-        (D, "composes a matmul outside a term", quote s ~ Exponential(1); X = hcat(1, x1); mu = s .* (X * b); y .~ Normal.(mu, 1.0) end),
+        (Dz, "shared across predictors", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; nu = X * b; y .~ Normal.(mu, 1.0); z .~ Normal.(nu, 1.0) end),
+        (D, "literal scaling of a matmul", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = 2 * (X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = x2 .* (X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = exp.(X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); s ~ Exponential(1); X = hcat(1, x1); mu = s .* (X * b); y .~ Normal.(mu, 1.0) end),
     ]
     for (data, msg, ast) in cases
         err = _mx_err(ast, data)
-        @test err isa SurfaceLoweringError && occursin(msg, sprint(showerror, err))
+        if !(occursin("has 2 elements", msg) || occursin("sized by `Z`", msg) || occursin("two coefficients", msg))
+            if msg in ("shared across predictors", "literal scaling of a matmul",
+                    "composes a matmul outside a term")
+                # Admitted: ordinary coefficient vectors retain all value readers.
+                @test (lower_rkppl(ast, data); true)
+            else
+                # capability: other matrix value operands and shapes (P3/P8; todo `15lq8iu`).
+                @test_broken (lower_rkppl(ast, data); true)
+            end
+        else
+            # refused: coefficient dimensions or sizing source violate
+            # the declared matrix contract (P3/P6).
+            @test err isa SurfaceLoweringError && occursin(msg, sprint(showerror, err))
+        end
     end
     # Named-definition RHS violations screen at extraction.
     err = _mx_err(quote X = hcat(1, x1); mu = X * 2; y .~ Normal.(mu, 1.0) end, D)
-    @test err isa SurfaceLoweringError &&
-        occursin("outside a predictor matmul", err.message)
+    # capability: a scaled matrix-valued response (P3/P10a; todo `1qlbn5b`).
+    @test_broken (err === nothing || throw(err))
 end
 
 @testset "matrix surface stray positions" begin
@@ -396,23 +438,32 @@ end
     Dm = (:c1, :c2, :x1)
     cases = [
         (D, "location X is a design matrix", quote X = hcat(1, x1); y .~ Normal.(X, 1.0) end),
-        (D, "calls `hcat` outside a matrix definition", quote y .~ Normal.(hcat(1, x1) * b, 1.0) end),
+        (D, "calls `hcat` outside a matrix definition", quote b[1:2] .~ Normal.(0, 1); y .~ Normal.(hcat(1, x1) * b, 1.0) end),
         (D, "outside a predictor matmul", quote X = hcat(1, x1); mu = X; y .~ Normal.(mu, 1.0) end),
         (D, "combines a matrix outside a matmul", quote X = hcat(1, x1); mu = a .+ X; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
-        (D, "combines a matrix outside a matmul", quote X = hcat(1, x1); mu = X .* b; y .~ Normal.(mu, 1.0) end),
-        # `sum(X)` reads the matrix as a value (valid Julia); the program
-        # fails for its scalar summand instead.
+        (D, "combines a matrix outside a matmul", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X .* b; y .~ Normal.(mu, 1.0) end),
+        # `sum(X)` already reads the matrix as a scalar value.
         (D, "is a scalar summand", quote X = hcat(1, x1); w = sum(X); mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
         (D, "combines a matrix outside a matmul", quote X = hcat(1, x1); w = X; mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
-        (D, "scale X is a design matrix", quote X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, X) end),
+        (D, "scale X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, X) end),
         (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); s ~ Normal(X, 1); mu = X * b; y .~ Normal.(mu, s) end),
         (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); s ~ HalfNormal(X); mu = X * b; y .~ Normal.(mu, s) end),
-        (Dm, "multinomial probs X is a design matrix", quote X = hcat(1, x1); mu = X * b; c1 .~ Multinomial.(10, X, c2) end),
-        (D, "categorical probs X is a design matrix", quote X = hcat(1, x1); mu = X * b; y .~ Categorical.(X) end),
+        (Dm, "multinomial probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; c1 .~ Multinomial.(10, X, c2) end),
+        (D, "categorical probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Categorical.(X) end),
     ]
     for (data, msg, ast) in cases
         err = _mx_err(ast, data)
-        @test err isa SurfaceLoweringError && occursin(msg, err.message)
+        if msg == "is a scalar summand"
+            # admitted: a matrix reduction is an ordinary scalar value (P3/P10a).
+            @test (lower_rkppl(ast, data); true)
+        elseif !(occursin("argument X", msg) || occursin("multinomial probs", msg) || occursin("categorical probs", msg))
+            # capability: matrix values in broadcast locations/scales and expressions (P3/P10a 0dejlw1; todo `1qlbn5b`).
+            @test_broken (lower_rkppl(ast, data); true)
+        else
+            # refused: unknown names, dimension mismatch, unidentified
+            # coefficients or non-scalar constructor arguments (P3/P6).
+            @test err isa SurfaceLoweringError && occursin(msg, err.message)
+        end
     end
     # Submodel inlining routes matrices to the same arms.
     m = @rkppl begin
@@ -426,8 +477,9 @@ end
     catch e
         e
     end
-    @test err isa SurfaceLoweringError &&
-        occursin("location X is a design matrix", err.message)
+    # capability: pass a matrix-valued location through a submodel (P8/P10a;
+    # todo `1qlbn5b`).
+    @test_broken (err === nothing || throw(err))
 end
 
 @testset "matrix surface prior errors" begin
@@ -443,10 +495,12 @@ end
     # moves to an unknown hyper name.
     ast = quote b[axes(X, 2)] ~ Normal(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end
     err = _mx_err(ast, D)
+    # refused: a vector prior requires .~ (scalar/broadcast arity, P3).
     @test err isa SurfaceLoweringError && occursin("is a vector — use `.~`", err.message)
     for ast in (quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end,
             quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end)
         plan = lower_rkppl(ast, D)
+        # refused: unresolved prior name nope or width 2 against 3 coefficients (P3/P6).
         @test_throws ContractValidationError bind_data(plan, _mx_cols())
     end
 end
