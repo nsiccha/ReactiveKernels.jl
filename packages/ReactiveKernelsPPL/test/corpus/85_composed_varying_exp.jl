@@ -3,9 +3,9 @@
 # `b ~ 1 + (1 | item)`): varying-effect sub-predictors + a dotted
 # `exp.` map in the composition.
 begin
-    r_t ~ varying_effect(person, [1]; sd = Cauchy(0, 2))
-    r_a ~ varying_effect(item, [1]; sd = Cauchy(0, 2))
-    r_b ~ varying_effect(item, [1]; sd = Cauchy(0, 2))
+    r_t ~ varying_effect(person, [1]; sd = HalfCauchy(2))
+    r_a ~ varying_effect(item, [1]; sd = HalfCauchy(2))
+    r_b ~ varying_effect(item, [1]; sd = HalfCauchy(2))
     b0 ~ Normal(0, 5)
     th = r_t
     la = r_a
