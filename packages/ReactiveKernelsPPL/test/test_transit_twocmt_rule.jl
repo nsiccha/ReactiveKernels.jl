@@ -67,11 +67,16 @@ end
     end
     p = [0.08, 0.15, 0.05, 0.2, 1.2]
     @test isempty(transit_twocmt_rule(Float64[], p))
+    # refused: rule takes 5 rate parameters, got 4 (length mismatch)
     @test_throws DimensionMismatch transit_twocmt_rule([1.0], p[1:4])
+    # refused: series tolerance must be positive (mathematically invalid)
     @test_throws ArgumentError prepare_transit_twocmt_rule(; series_rtol = 0.0)
+    # refused: Watson series needs >=1 term (mathematically invalid)
     @test_throws ArgumentError prepare_transit_twocmt_rule(; watson_terms = 0)
+    # refused: series tolerance must be positive (mathematically invalid)
     @test_throws ArgumentError transit_twocmt_unit_response([1.0], p...;
         series_rtol = 0.0)
+    # refused: Watson series needs >=1 term (mathematically invalid)
     @test_throws ArgumentError transit_twocmt_unit_response([1.0], p...;
         watson_terms = 0)
     # Nonuniform output seeds and active lag inputs exercise the second cut.

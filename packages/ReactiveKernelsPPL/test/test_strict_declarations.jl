@@ -28,6 +28,7 @@ const _STRICT_COLS = (; y = [1.0, 2.0, 1.5, 2.5], x = [0.5, -1.0, 1.5, 0.0],
         y .~ Normal.(mu, 1.0)
     end
     err = _strict_err(() -> lower_rkppl(body, (:y, :x)))
+    # refused: every coefficient needs a declaration (P6, 05oe96l).
     @test err isa SurfaceLoweringError
     msg = sprint(showerror, err)
     @test occursin("`aa` is not a data column, a definition, or a declared " *
@@ -39,6 +40,7 @@ const _STRICT_COLS = (; y = [1.0, 2.0, 1.5, 2.5], x = [0.5, -1.0, 1.5, 0.0],
         mu = aa .+ b .* x
         y .~ Normal.(mu, 1.0)
     end
+    # refused: the macro also refuses undeclared aa (P6, 05oe96l).
     @test _strict_err(() -> m(; y = _STRICT_COLS.y, x = _STRICT_COLS.x)) isa
         SurfaceLoweringError
     # Declared, it lowers.
@@ -58,6 +60,7 @@ end
             mu = X * b
             y .~ Normal.(mu, 1.0)
         end, (:y, :x1, :x2)))
+    # refused: every coefficient needs a declaration (P6, 05oe96l).
     @test err isa SurfaceLoweringError
     @test occursin("`b[axes(X, 2)] .~ Normal.(0, 1)`", sprint(showerror, err))
 end
@@ -68,6 +71,7 @@ end
             alpha ~ Normal(0, 10)
             y ~ NormalIDGLM(X, alpha, beta, 1.0)
         end, (:y, :x1, :x2)))
+    # refused: every coefficient needs a declaration (P6, 05oe96l).
     @test err isa SurfaceLoweringError
     @test occursin("`beta[axes(X, 2)] .~ Normal.(0, 1)`", sprint(showerror, err))
 end
@@ -79,6 +83,7 @@ end
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
         end, (:y, :x1)))
+    # refused: every coefficient needs a declaration (P6, 05oe96l).
     @test err isa SurfaceLoweringError
     msg = sprint(showerror, err)
     @test occursin("`a ~ Normal(0, 1)`", msg)

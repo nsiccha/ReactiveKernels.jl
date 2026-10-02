@@ -102,17 +102,20 @@ end
 
 @testset "zib contract failures" begin
     # Non-Beta p fails at contract (surface admits sampled params).
-    @test_throws ContractValidationError lower_rkppl(quote
+    # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+    @test_broken (lower_rkppl(quote
         p ~ Normal(0.0, 1.0)
         zi ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, p, zi)
-    end, (:s,))
+    end, (:s,)); true)
     # zi literal outside [0, 1].
+    # refused: zi literal 1.5 outside [0,1]
     @test_throws ContractValidationError lower_rkppl(quote
         p ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, p, 1.5)
     end, (:s,))
     # zi names nothing in the plan.
+    # refused: undeclared name (P6, 05oe96l)
     @test_throws ContractValidationError lower_rkppl(quote
         p ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, p, nosuch)
@@ -120,6 +123,7 @@ end
     # Response exceeding trials fails at bind.
     plan = lower_rkppl(_ZIB_PROG, (:s,))
     bad = Dict{Symbol,AbstractVector}(:s => [1, 0, 4, 0])
+    # refused: response exceeds trials (wrong data)
     @test_throws ContractValidationError bind_data(plan, bad)
 end
 

@@ -78,8 +78,10 @@ end
     catch e
         e
     end
-    @test err isa SurfaceLoweringError && occursin("not bound data", err.message)
+    # capability: a data-index alias is an ordinary value (P8 1cmodra; todo `15lq8iu`).
+    @test_broken (err === nothing || throw(err))
     # Other cross-index reads stay refused.
+    # refused: reads `g[i - 1]`, out of bounds at i = 1 in the Julia loop (P3)
     @test_throws "cross-index reads" lower_rkppl(Expr(:block, head...,
         _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(c[g[i - 1]], s)))), data)
 end
@@ -149,7 +151,9 @@ _pl_pk_chain(obs...) = Expr(:block, _pl_pk_head().args...,
                 _pl_q(lb, legacy, preset, u) rtol = 1e-12
         end
         # No dims key is consumed: any key is refused, typo'd or not.
+        # refused: legacy `kernel_nsub_conc` key not consumed (wrong data)
         for dims in (Dict(:kernel_nsub_conc => 2), Dict(:nsub => 2))
+            # refused: dims key not consumed by a dims-free schedule chain (wrong data)
             @test_throws "not consumed" bind_data(plan, cols;
                 dims = Dict{Symbol,Int}(dims))
         end
@@ -182,11 +186,13 @@ end
     @test _pl_q(built, bound, :likelihood, u) ≈
         _pl_q(gb, gauss, :likelihood, u) + _pl_q(pb, pois, :likelihood, up) rtol = 1e-12
     # A chain value is a cell value, never a sampled name or a response.
+    # refused: `conc` bound by `=` then sampled with `.~` (single assignment)
     @test_throws "schedule-chain value" lower_rkppl(_pl_pk_chain(
         :(dv .~ Normal.(conc, sigma)), :(conc .~ Normal.(0.0, 1.0))),
         _PL_PK_DATA)
-    @test_throws "feeds no observation" lower_rkppl(_pl_pk_chain(
-        :(dv .~ Normal.(log_Vc, sigma))), _PL_PK_DATA)
+    # capability: schedule chain that feeds no observation (unused deterministic value) (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(_pl_pk_chain(
+        :(dv .~ Normal.(log_Vc, sigma))), _PL_PK_DATA); true)
 end
 
 # --- The 99_plate_* corpus re-spellings against the forms they replace ----
@@ -448,7 +454,8 @@ end
                 :(eta[s] ~ Normal(0, 1))))))
     plan = lower_rkppl(ast, _PL_PK_DATA)
     @test only(plan.plate_parameters).range === :age_s
-    @test_throws "has 2 cells but n_obs is 4" bind_data(plan, cols)
+    # capability: latent @plate over a non-observation axis (subject-level range) (todo `1308iv0`)
+    @test_broken (bind_data(plan, cols); true)
     # Over the observation axis it binds with one cell per row.
     ast = Expr(:block, :(tau ~ Exponential(1)), :(s ~ Exponential(1)),
         _pl_plate(:(eachindex(y)), :(theta[i] ~ Normal(0, tau)),
@@ -464,6 +471,7 @@ end
         :(b ~ Normal(0, 1)), :(s ~ Exponential(1)),
         _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(a + b * x[i], s)))),
         (:y, :x))
+    # refused: dims keys on a plan with no kernel (wrong data)
     @test_throws "not consumed" bind_data(plan,
         Dict{Symbol,AbstractVector}(:y => [0.1, 0.2], :x => [1.0, 2.0]);
         dims = Dict{Symbol,Int}(:nsub => 2, :whatever_typo => 3))

@@ -160,22 +160,25 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
     end
     @testset "error spellings" begin
         # One group.
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: one-group `mm(g1)` lowers as plain grouping (10gzbm9 degenerate) (todo `1308iv0`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(mm(g1), [1])
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1))
+            end, (:y, :g1)); true)
         # Weights as a vector, not a tuple.
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: mm weights as a vector literal `[w1, w2]` (tuple vs vect collection kind; P3) (todo `1308iv0`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(mm(g1, g2; weights = [w1, w2]), [1])
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2, :w1, :w2))
+            end, (:y, :g1, :g2, :w1, :w2)); true)
         # Weight arity mismatch.
+        # refused: weight count != group count (malformed construct call)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(mm(g1, g2; weights = (w1,)), [1])
@@ -184,6 +187,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g1, :g2, :w1))
         # Non-data group.
+        # refused: undeclared group name `ghost` (P6, 05oe96l)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(mm(g1, ghost), [1])
@@ -192,6 +196,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g1))
         # Non-Bool normalize.
+        # refused: `normalize = 1` is not a Bool; Julia refuses Int in Bool context (P3)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(mm(g1, g2; normalize = 1), [1])
@@ -200,6 +205,7 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g1, :g2))
         # Unknown keyword.
+        # refused: unknown keyword `id` (brms |ID| vocabulary, P10)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(mm(g1, g2; id = 1), [1])
@@ -208,22 +214,25 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g1, :g2))
         # Missing semicolon.
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: comma keyword `mm(g1, g2, normalize = false)` (Julia treats it as `;` kwarg; P3) (todo `1308iv0`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(mm(g1, g2, normalize = false), [1])
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2))
+            end, (:y, :g1, :g2)); true)
         # eta != 1.0 on correlated.
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: LKJ eta != 1 on multi-membership draws (SB-parity scope) (todo `1308iv0`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(mm(g1, g2), [1, x]; eta = 2.0)
                 r ~ varying_slice(d, 1:2)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g1, :g2))
+            end, (:y, :x, :g1, :g2)); true)
         # A non-default eta at K=1 (nothing to parameterize).
+        # refused: K = 1 has no correlation; eta must be 1, whether explicit or omitted (user decisions 1hqmdas, 1nh2dia)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(mm(g1, g2), [1]; eta = 2.0)
@@ -285,14 +294,16 @@ end
     end
     @testset "error spellings" begin
         # Bare gr(g).
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: `gr(g)` without `by` lowers as plain grouping (10gzbm9 degenerate) (todo `1308iv0`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(gr(g), [1])
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g))
+            end, (:y, :g)); true)
         # Two groups.
+        # refused: `gr` takes one grouping; two groups have no stated meaning (P2)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(gr(g, h; by = b), [1])
@@ -301,6 +312,7 @@ end
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g, :h, :b))
         # Non-data by.
+        # refused: undeclared by name `ghost` (P6, 05oe96l)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(gr(g; by = ghost), [1])
@@ -309,6 +321,7 @@ end
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g))
         # by === group.
+        # refused: degenerate stratification (by === group: each stratum one group, per-stratum covariance unidentified)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(gr(g; by = g), [1])
@@ -317,6 +330,7 @@ end
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g))
         # id keyword (BRM-side spelling).
+        # refused: brms `id` keyword (P10); unknown keyword
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(gr(g; by = b, id = 1), [1])
@@ -325,29 +339,33 @@ end
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g, :b))
         # eta != 1.0.
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: LKJ eta != 1 on stratified draws (SB-parity scope) (todo `1308iv0`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(gr(g; by = b), [1, x]; eta = 2.0)
                 r ~ varying_slice(d, 1:2)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g, :b))
+            end, (:y, :x, :g, :b)); true)
         # Missing semicolon.
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: comma keyword `gr(g, by = b)` (Julia treats it as `;` kwarg; P3) (todo `1308iv0`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 5)
                 d ~ varying_draws(gr(g, by = b), [1])
                 r ~ varying_slice(d, 1)
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
-            end, (:y, :g, :b))
+            end, (:y, :g, :b)); true)
     end
     @testset "reserved grouping names" begin
+        # refused: reserved name `mm`
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 mm = 1.0
                 a ~ Normal(0, 5)
                 mu = a
                 y .~ Normal.(mu, 1.0)
             end, (:y,))
+        # refused: reserved name `gr`
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 gr = 1.0
                 a ~ Normal(0, 5)
@@ -392,47 +410,56 @@ end
         VaryingZRecipe(:column, :x, nothing))]
     @testset "mm one group rejected" begin
         d = _mm_draws(mm = VaryingMultiMembership([:g1], nothing, true))
+        # refused: mm needs >= 2 groups (IR contract; surface twin is U at 163)
         @test_throws ContractValidationError _mm_validate(d)
     end
     @testset "mm weight arity rejected" begin
         d = _mm_draws(
             mm = VaryingMultiMembership([:g1, :g2], [:w1], true))
+        # refused: weight arity != group count (IR contract)
         @test_throws ContractValidationError _mm_validate(d)
     end
     @testset "mm retired K=1 kinds rejected" begin
+        # refused: retired K=1 kind (IR contract)
         for (kind, margins) in ((:intercept1, ones1()), (:slope1, slope1()))
             d = _mm_draws(; kind, margins, lkj_eta = NaN)
+            # refused: retired K=1 kinds (IR contract); see per-entry lines
             @test_throws ContractValidationError _mm_validate(d)
         end
     end
     @testset "mm K=1 is the 1x1 correlated case" begin
         @test _mm_validate(_mm_draws()) === nothing
         @test _mm_validate(_mm_draws(margins = slope1())) === nothing
+        # refused: K=1 draws carry canonical eta 1.0 (IR contract)
         @test_throws ContractValidationError _mm_validate(
             _mm_draws(lkj_eta = 2.0))
     end
     @testset "mm eta != 1.0 rejected" begin
         d = _mm_draws(kind = :correlated, lkj_eta = 2.0,
             margins = vcat(ones1(), slope1()))
-        @test_throws ContractValidationError _mm_validate(d)
+        # capability: multi-membership/stratified geometry beyond the current SB parity subset (1cmodra varying) (todo `1308iv0`)
+        @test_broken (_mm_validate(d); true)
     end
     @testset "mm sd priors rejected" begin
         d = _mm_draws(kind = :correlated, lkj_eta = 1.0,
             margins = vcat(ones1(), slope1()),
             sd_priors = [VaryingSdPrior(:std_normal, 1.0),
                 VaryingSdPrior(:std_normal, 1.0)])
-        @test_throws ContractValidationError _mm_validate(d)
+        # capability: multi-membership/stratified geometry beyond the current SB parity subset (1cmodra varying) (todo `1308iv0`)
+        @test_broken (_mm_validate(d); true)
     end
     @testset "mm x strata rejected" begin
         d = _mm_draws(kind = :correlated, lkj_eta = 1.0,
             margins = vcat(ones1(), slope1()),
             strata = VaryingStrata(:b, nothing))
-        @test_throws ContractValidationError _mm_validate(d)
+        # capability: multi-membership/stratified geometry beyond the current SB parity subset (1cmodra varying) (todo `1308iv0`)
+        @test_broken (_mm_validate(d); true)
     end
     @testset "stratified non-correlated rejected" begin
         d = _mm_draws(group = :g, kind = :intercept1, lkj_eta = NaN,
             mm = nothing, label = :draws_g, suffix = "g",
             strata = VaryingStrata(:b, nothing))
+        # refused: retired kind on stratified draws (IR contract)
         @test_throws ContractValidationError _mm_validate(d)
     end
     @testset "stratified eta != 1.0 rejected" begin
@@ -440,7 +467,8 @@ end
             margins = vcat(ones1(), slope1()), mm = nothing,
             label = :draws_g, suffix = "g",
             strata = VaryingStrata(:b, nothing))
-        @test_throws ContractValidationError _mm_validate(d)
+        # capability: multi-membership/stratified geometry beyond the current SB parity subset (1cmodra varying) (todo `1308iv0`)
+        @test_broken (_mm_validate(d); true)
     end
     @testset "stratified sd priors rejected" begin
         d = _mm_draws(group = :g, kind = :correlated, lkj_eta = 1.0,
@@ -449,18 +477,21 @@ end
             sd_priors = [VaryingSdPrior(:std_normal, 1.0),
                 VaryingSdPrior(:std_normal, 1.0)],
             strata = VaryingStrata(:b, nothing))
-        @test_throws ContractValidationError _mm_validate(d)
+        # capability: multi-membership/stratified geometry beyond the current SB parity subset (1cmodra varying) (todo `1308iv0`)
+        @test_broken (_mm_validate(d); true)
     end
     @testset "stratified by === group rejected" begin
         d = _mm_draws(group = :g, kind = :correlated, lkj_eta = 1.0,
             margins = vcat(ones1(), slope1()), mm = nothing,
             label = :draws_g, suffix = "g",
             strata = VaryingStrata(:g, nothing))
+        # refused: by === group (IR contract; surface twin 312)
         @test_throws ContractValidationError _mm_validate(d)
     end
     @testset "mm multi-slice rejected (ID defense)" begin
         # Lowering validates structure, so the rejection fires here.
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: mm draws sliced into multiple targets (SB-parity "ID defense") (todo `1308iv0`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 5)
                 c ~ Normal(0, 5)
                 d ~ varying_draws(mm(g1, g2), [1, x])
@@ -470,7 +501,7 @@ end
                 nu = c .+ r2
                 y .~ Normal.(mu, 1.0)
                 z .~ Normal.(nu, 1.0)
-            end, (:y, :z, :x, :g1, :g2))
+            end, (:y, :z, :x, :g1, :g2)); true)
     end
     @testset "stratified multi-slice allowed (ID+gr path)" begin
         plan = lower_rkppl(quote
@@ -520,12 +551,14 @@ end
                 mu = a .+ r
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g1, :g2))
+        # refused: observed value outside declared levels (wrong data)
         @test_throws ContractValidationError bind_data(plan, _mm_cols())
     end
     @testset "unbound membership" begin
         plan = lower_rkppl(prog, (:y, :g1, :g2, :w1, :w2))
         cols = _mm_cols()
         delete!(cols, :g2)
+        # refused: missing data name (`g2`)
         @test_throws ContractValidationError bind_data(plan, cols)
     end
     @testset "weight failures" begin
@@ -533,23 +566,28 @@ end
         # Non-finite.
         cols = _mm_cols()
         cols[:w1] = [0.7, Inf, 0.5, 0.9]
+        # refused: non-finite weight (mathematically invalid input)
         @test_throws ContractValidationError bind_data(plan, cols)
         # Negative.
         cols = _mm_cols()
         cols[:w2] = [0.3, -0.8, 0.5, 0.1]
+        # refused: negative weight (mathematically invalid input)
         @test_throws ContractValidationError bind_data(plan, cols)
         # Zero row total.
         cols = _mm_cols()
         cols[:w1] = [0.0, 0.2, 0.5, 0.9]
         cols[:w2] = [0.0, 0.8, 0.5, 0.1]
+        # refused: zero weight row total, normalization undefined (mathematically invalid input)
         @test_throws ContractValidationError bind_data(plan, cols)
         # Wrong length.
         cols = _mm_cols()
         cols[:w1] = [0.7, 0.2, 0.5]
+        # refused: weight length mismatch (wrong data)
         @test_throws ContractValidationError bind_data(plan, cols)
         # Non-real eltype.
         cols = _mm_cols()
         cols[:w1] = ["a", "b", "c", "d"]
+        # refused: wrong eltype for weights
         @test_throws ContractValidationError bind_data(plan, cols)
     end
     @testset "unorderable union" begin
@@ -562,6 +600,7 @@ end
             end, (:y, :g1, :g2))
         cols = _mm_cols()
         cols[:g2] = ["a", "b", "c", "d"]
+        # refused: mixed Int/String membership union is unorderable (wrong eltype; Julia sort MethodError, P3)
         @test_throws ContractValidationError bind_data(plan, cols)
     end
 end
@@ -587,18 +626,21 @@ end
         plan = lower_rkppl(prog, (:y, :x, :g, :b))
         cols = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
             :x => copy(_MM_X), :g => [1, 2, 1, 3], :b => [1, 1, 2, 2])
+        # refused: group straddles strata (wrong data: groups must nest in strata)
         @test_throws ContractValidationError bind_data(plan, cols)
     end
     @testset "unbound by" begin
         plan = lower_rkppl(prog, (:y, :x, :g, :b))
         cols = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
             :x => copy(_MM_X), :g => [1, 2, 1, 3])
+        # refused: missing data name (`b`)
         @test_throws ContractValidationError bind_data(plan, cols)
     end
     @testset "by wrong length" begin
         plan = lower_rkppl(prog, (:y, :x, :g, :b))
         cols = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
             :x => copy(_MM_X), :g => [1, 2, 1, 3], :b => [1, 1, 1])
+        # refused: length mismatch for `by` column
         @test_throws ContractValidationError bind_data(plan, cols)
     end
 end
@@ -656,14 +698,9 @@ end
             end, Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
             :x => copy(_MM_X), :g => [1, 2, 1, 3], :b => copy(_MM_B)))
         u = collect(range(-0.4, 0.4; length = lay.total))
-        err = try
-            constrain(lay, u)
-            nothing
-        catch e
-            e
-        end
-        @test err isa ContractValidationError
-        @test occursin("gr(g, by=b)", sprint(showerror, err))
+        # capability: restore constrained stratified draws (ordinary values;
+        # P8 1cmodra; todo `1308iv0`).
+        @test_broken (constrain(lay, u); true)
     end
 end
 
@@ -699,7 +736,8 @@ end
             :b => copy(_MM_B), :g_s1 => [1, 1, 2, 2])
         bound = bind_data(plan, cols)
         # Bound: per-stratum `L_g_s1` vs plain `L_g_s1` collide loudly.
-        @test_throws ContractValidationError build_kernel(bound)
+        # capability: distinct draws whose minted names collide (`gr(g; by=b)` stratum s1 vs group `g_s1`); names should key off author bindings (P8) (todo `1308iv0`)
+        @test_broken (build_kernel(bound); true)
     end
 end
 

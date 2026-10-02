@@ -173,25 +173,31 @@ end
 
 @testset "merge loud failures" begin
     # Not a statement.
+    # refused: merge override is not a statement (P9, 18h1h54: merge replaces a statement)
     @test_throws SurfaceLoweringError Base.merge(merge_base, :(x + 1))
+    # refused: bare symbol is not a statement (P9, 18h1h54)
     @test_throws SurfaceLoweringError Base.merge(merge_base, :b)
     # Not a bare-Symbol LHS (indexed overrides are deferred).
-    @test_throws SurfaceLoweringError Base.merge(merge_base, :(c[1] = 2))
+    # capability: indexed merge pin `c[1] = 2` (10gzbm9 merge-partial) (todo `1qlbn5b`)
+    @test_broken (Base.merge(merge_base, :(c[1] = 2)); true)
+    # refused: a ranged observation override double-observes y (10gzbm9 merge-partial)
     @test_throws SurfaceLoweringError Base.merge(merge_base,
         Expr(:call, :.~, :(y[1:3]), :(Normal.(mu, s))))
     # Nested blocks do not splice.
-    @test_throws SurfaceLoweringError Base.merge(merge_base,
+    # capability: nested begin-block in a merge override (Julia blocks are transparent) (todo `15lq8iu`)
+    @test_broken (Base.merge(merge_base,
         quote
             begin
                 a ~ Normal(0, 10)
             end
-        end)
+        end); true)
     # A broken base (duplicate LHS) fails closed, naming the name.
     dup = RKPPLModel(quote
         a ~ Normal(0, 1)
         a ~ Normal(0, 2)
         y .~ Normal.(a, 1.0)
     end, @__MODULE__)
+    # refused: single assignment: base binds a twice
     @test_throws SurfaceLoweringError Base.merge(dup, :(a ~ Normal(0, 1)))
     # Override naming a levels/ref stem: indexed overrides deferred.
     lev = @rkppl begin
@@ -206,10 +212,14 @@ end
     catch e
         e
     end
-    @test err isa SurfaceLoweringError
+    # capability: replace an indexed declaration with a scalar statement; check uses at bind (P9 18h1h54; todo `1qlbn5b`).
+    @test_broken (err === nothing || throw(err))
+
     # refused: a fix must name a statement to remove (merge docstring).
+    # refused: pin names no model statement (unknown name)
     @test_throws SurfaceLoweringError Base.merge(merge_base, (; nosuch = ones(6)))
-    @test_throws SurfaceLoweringError Base.merge(lev, (; c = ones(6)))
+    # capability: pin a levels-declared array parameter c (indexed overrides deferred) (todo `1308iv0`)
+    @test_broken (Base.merge(lev, (; c = ones(6))); true)
     # A plate-cell name is invisible to the top-level matcher: the append
     # collides at lowering through the single-assignment gate (still loud).
     plated = RKPPLModel(Expr(:block,
@@ -220,6 +230,7 @@ end
                         :(t = a .+ b .* x[i]),
                         :(y[i] ~ Normal.(t, s)))))), @__MODULE__)
     shadowed = Base.merge(plated, :(t = a .+ b .* x))
+    # refused: single assignment: appended t collides with the plate-cell t
     @test_throws SurfaceLoweringError lower_rkppl(shadowed.ast, (:y, :x))
 end
 

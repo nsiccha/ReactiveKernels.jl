@@ -142,18 +142,20 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
     end
     @testset "rejections" begin
         # Missing upper.
+        # refused: interval_censored without an upper endpoint (malformed call)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 mu = a .+ b .* x
                 y .~ interval_censored.(Normal.(mu, s))
                 s ~ Exponential(1)
             end, (:y, :x))
         # Evidence is Gaussian/Poisson-only (slice 1 family gate).
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: interval-censored evidence over Bernoulli (non-Gaussian/Poisson families; 'slice 1 family gate') (todo `0ze68k8`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ interval_censored.(Bernoulli.(logistic.(eta)), 1)
-            end, (:y, :x))
+            end, (:y, :x)); true)
         # Response must sit strictly below the upper every row (bind-time
         # data gate).
         plan = lower_rkppl(quote
@@ -165,6 +167,7 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
             end, (:y, :x, :hi))
         bad = _int_gcols()
         bad[:y] = copy(_INT_HI)
+        # refused: response not strictly below the upper endpoint (wrong data, empty interval)
         @test_throws ContractValidationError bind_data(plan, bad)
     end
 end
@@ -392,10 +395,9 @@ end
     # If this test starts failing, the gap closed: promote Poisson
     # interval to the trio testset above and delete this pin.
     err = _int_poisson_hlo_attempt()
-    @test err isa MethodError
-    if err isa MethodError
-        @test nameof(err.f) === :gamma_inc
-    end
+    # capability: Poisson interval probabilities under XLA (generic AD;
+    # todo `0ze68k8`). A tracing failure is a gap, not a forbidden model.
+    @test_broken err === :traced
 end
 
 # I1/I2 parity probes (N=80; Xoshiro(90210)/Xoshiro(90211) recipes — see

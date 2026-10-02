@@ -109,13 +109,21 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
             catch e
                 e
             end
-            @test err isa SurfaceLoweringError
-            @test occursin(msg, sprint(showerror, err))
+            if rhs == :(TDist(3))
+                # capability: standard TDist prior constructor (P3; todo `139j2uo`).
+                @test_broken (err === nothing || throw(err))
+            else
+                # refused: remaining entries violate constructor signature,
+                # strict declarations or distribution domains (P3/P6, 05oe96l).
+                @test err isa SurfaceLoweringError
+                @test occursin(msg, sprint(showerror, err))
+            end
         end
     end
     @testset "uniform bounds must be finite literals in order" begin
         # Sampled bound (a known parameter name — the literal-only rule).
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: sampled Uniform bound (Uniform(lo, 2) with lo sampled); P8 admits sampled prior arguments (todo `0fkd9yk`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
@@ -123,8 +131,10 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                 lo ~ Normal(0, 1)
                 u ~ Uniform(lo, 2)
                 s ~ Exponential(1)
-            end, (:y, :x))
+            end, (:y, :x)); true)
+        # refused: Uniform bounds out of order (malformed distribution)
         for rhs in (:(Uniform(2, -1)), :(Uniform(0, Inf)))
+            # refused: battery of malformed Uniform literals (all entries P)
             @test_throws ContractValidationError lower_rkppl(quote
                     a ~ Normal(0, 1)
                     b ~ Normal(0, 1)
@@ -157,13 +167,14 @@ end
     @test pp.support_override === nothing
     # Per-cell (column) uniform bounds are rejected — one plate entry
     # shares one interval transform, so bounds stay finite literals.
-    @test_throws ContractValidationError lower_rkppl(Expr(:block,
+    # capability: per-index data Uniform bounds inside @plate (theta[i] ~ Uniform(lo[i], hi[i])); P8 per-index plate semantics (todo `0fkd9yk`)
+    @test_broken (lower_rkppl(Expr(:block,
         :(s ~ Exponential(1)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block,
                     :(theta[i] ~ Uniform(lo[i], hi[i])),
-                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y, :lo, :hi))
+                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y, :lo, :hi)); true)
 end
 
 @testset "prior vocab truncated halves" begin
@@ -186,32 +197,35 @@ end
     @test _pv_param(plan, :g).support_override === :positive
     @test _pv_param(plan, :n).support_override === :positive
     @testset "non-zero-location half rejected" begin
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: truncated(StudentT(nu, mu!=0, s), 0, Inf): general (nonzero-location) truncation (todo `0ze68k8`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 h ~ truncated(StudentT(3, 1, 2), 0, Inf)
                 s ~ Exponential(1)
-            end, (:y, :x))
+            end, (:y, :x)); true)
     end
     @testset "upper-only and finite intervals stay Normal-only" begin
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: upper-only truncation for non-Normal families (truncated(StudentT, -Inf, 1)) (todo `0ze68k8`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 h ~ truncated(StudentT(3, 0, 2), -Inf, 1)
                 s ~ Exponential(1)
-            end, (:y, :x))
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+            end, (:y, :x)); true)
+        # capability: finite-interval truncation for non-Normal families (truncated(Laplace, -1, 1)) (todo `0ze68k8`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ Normal.(mu, s)
                 h ~ truncated(Laplace(0, 1), -1, 1)
                 s ~ Exponential(1)
-            end, (:y, :x))
+            end, (:y, :x)); true)
     end
 end
 
@@ -311,6 +325,7 @@ end
         catch e
             e
         end
+        # refused: lowercase student_t is a kernel constructor, not the Julia distribution constructor (P3).
         @test err isa SurfaceLoweringError
     end
 end
@@ -331,6 +346,7 @@ end
         plan.population_priors)
     plan.population_priors[i] = PopulationPrior(:mu, :x1, :student_t,
         0.0, 1.0, 3.0)
+    # refused: one prior family per data-width coefficient block (IR contract)
     @test_throws ContractValidationError validate_structure(plan)
     @testset "glm-object beta vectors retain ordinary priors" begin
         plan = lower_rkppl(quote
@@ -692,6 +708,8 @@ end
             catch e
                 e
             end
+            # refused: remaining entries violate constructor signature,
+            # strict declarations or distribution domains (P3/P6, 05oe96l).
             @test err isa SurfaceLoweringError
             @test occursin(msg, sprint(showerror, err))
         end
@@ -712,6 +730,8 @@ end
             catch e
                 e
             end
+            # refused: remaining entries violate constructor signature,
+            # strict declarations or distribution domains (P3/P6, 05oe96l).
             @test err isa SurfaceLoweringError
         end
     end
@@ -878,6 +898,7 @@ _pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
             err = try
                 lower_rkppl(quote
                         a ~ Normal(0, 1)
+                        lo ~ Normal(0, 1)
                         b ~ Normal(0, 1)
                         mu = a .+ b .* x
                         y .~ Normal.(mu, s)
@@ -888,8 +909,15 @@ _pv_m7_oracle(a::Real, b::Real, s::Real, u::Real, w::Real) =
             catch e
                 e
             end
-            @test err isa SurfaceLoweringError
-            @test occursin(msg, sprint(showerror, err))
+            if label in ("nonzero one-sided lower", "non-literal lower", "infinite upper", "infinite paired upper")
+                # capability: ordinary one-sided and sampled Flat bounds (P3/P8; todo `0fkd9yk`).
+                @test_broken (err === nothing || throw(err))
+            else
+                # refused: remaining entries violate constructor signature,
+                # strict declarations or distribution domains (P3/P6, 05oe96l).
+                @test err isa SurfaceLoweringError
+                @test occursin(msg, sprint(showerror, err))
+            end
         end
     end
 end
@@ -966,6 +994,7 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
                     mu = c[g] .+ b .* x
                     y .~ Normal.(mu, 1.5)
                 end, (:y, :x, :g))
+            # refused: unknown nope or 6 location values for 3 levels (name/shape contract, P3/P6).
             @test_throws ContractValidationError bind_data(prepared, _pv_gcols())
         end
         prepared = lower_rkppl(quote
@@ -975,6 +1004,7 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
                 mu = c[g] .+ b .* x
                 ly .~ Normal.(mu, 1.5)
             end, (:earn, :x, :g))
+        # refused: 6 derived location values cannot broadcast over 3 levels (P3).
         @test_throws ContractValidationError bind_data(prepared,
             Dict(:earn => exp.(_PV_Y), :x => copy(_PV_X), :g => copy(_PV_G)))
     end
@@ -1193,8 +1223,15 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
             catch e
                 e
             end
-            @test err isa ex
-            @test occursin(msg, sprint(showerror, err))
+            if occursin("hyper bound", label)
+                # capability: sampled Uniform bounds (P8 1cmodra; todo `0fkd9yk`).
+                @test_broken (err === nothing || throw(err))
+            else
+                # refused: remaining entries violate constructor signature,
+                # strict declarations or distribution domains (P3/P6, 05oe96l).
+                @test err isa ex
+                @test occursin(msg, sprint(showerror, err))
+            end
         end
         broad_cases = (
             ("broadcast hyper bound",
@@ -1209,6 +1246,7 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
         for (label, rhs, ex, msg) in broad_cases
             err = try
                 lower_rkppl(quote
+                        lo ~ Normal(0, 1)
                         c[levels(g)] .~ $rhs
                         mu = c[g]
                         y .~ Normal.(mu, 1.5)
@@ -1217,8 +1255,15 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
             catch e
                 e
             end
-            @test err isa ex
-            @test occursin(msg, sprint(showerror, err))
+            if occursin("hyper bound", label)
+                # capability: sampled Uniform bounds (P8 1cmodra; todo `0fkd9yk`).
+                @test_broken (err === nothing || throw(err))
+            else
+                # refused: remaining entries violate constructor signature,
+                # strict declarations or distribution domains (P3/P6, 05oe96l).
+                @test err isa ex
+                @test occursin(msg, sprint(showerror, err))
+            end
         end
     end
 end

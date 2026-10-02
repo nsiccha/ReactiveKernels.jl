@@ -186,6 +186,7 @@ _ls_pair(x) = (_LS_CALLS[] += 1; (reshape(x, :, 1), hcat(x .^ 2, x .^ 3)))
     catch e
         e
     end
+    # refused: B * w has rows that cannot broadcast with the observed y axis (Julia dimensions, P3).
     @test err isa ContractValidationError
     @test occursin("B", err.message) && occursin("rows", err.message)
 end

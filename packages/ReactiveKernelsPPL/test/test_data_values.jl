@@ -209,6 +209,7 @@ end
     catch e
         e
     end
-    @test err isa ContractValidationError
-    @test occursin("lower_rkppl(ast, data)", err.message)
+    # capability: bind scalar data to a names-only plan at the same model door (P10a 0dejlw1; todo `1qlbn5b`).
+    @test_broken (err === nothing || throw(err))
+
 end

@@ -1531,9 +1531,13 @@ end
     plan = _gen_gaussian_plan()
     built = build_kernel(plan)
     u = _unbind(plan)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError build_kernel(u)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError kernel_expr(u, built.layout)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError assign_layout(u)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError prepare_query(built, u, :sampler)
     # Rebinding the same columns reproduces the direct-build posterior.
     b = bind_data(u, plan.columns)

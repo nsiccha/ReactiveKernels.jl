@@ -102,22 +102,28 @@ end
     @test (validate_plan(_os_plan(; scale_kind = :factor)); true)
     # A modeled scale under any other link fails closed (the Identity
     # case keeps the leveled slice's predictor rejection).
+    # refused: modeled ordinal discrimination must be positive by construction; identity link is not (IR contract)
     @test_throws ContractValidationError _os_plan(; scale_link = IdentityLink)
-    @test_throws ContractValidationError _os_plan(; scale_link = LogitLink)
+    # capability: modeled ordinal discrimination under a positive non-log link (logit gives (0,1)) (todo `05fuzch`)
+    @test_broken (_os_plan(; scale_link = LogitLink); true)
     # Unknown names still fail at bind.
+    # refused: discrimination names a missing data column (missing data name)
     @test_throws ContractValidationError _os_plan(; discrimination = :nope)
     # A predictor that is also a data column is ambiguous, never silently
     # resolved either way.
     cols = _os_columns()
     cols[:disc] = fill(1.5, 9)
+    # refused: predictor name collides with a data column (name collision)
     @test_throws ContractValidationError _os_plan(; cols = cols)
     # Scale coefficients need priors like any predictor's.
+    # refused: scale coefficients without stated priors (P7, 0d5a67r)
     @test_throws ContractValidationError _os_plan(; scale_priors = false)
     # Modeled scale composes with per-threshold design (stopping).
     good = _os_plan(; structure = :stopping, tcols = [:z1, :z2],
         coefs = :y_beta)
     @test (validate_plan(good); true)
     # ... but cumulative + stage effects still refuses with a modeled scale.
+    # refused: cumulative category-specific effects make cumulative probabilities non-monotone (mathematically invalid)
     @test_throws ContractValidationError _os_plan(; structure = :cumulative,
         tcols = [:z1], coefs = :y_beta)
 end
@@ -140,6 +146,7 @@ end
     kw = (; structure = :stopping, discrimination = nothing,
         tcols = [:z1, :z2], coefs = :y_beta, cols = cols4)
     @test (validate_plan(_os_plan(; kw..., coefsize = 6)); true)
+    # refused: explicit threshold_coefs size disagrees with (K-1)*p (IR contract)
     @test_throws ContractValidationError _os_plan(; kw..., coefsize = 5)
     # Stage-major orientation pins at a second shape (p=1, K=4): stage j
     # reads beta[j].

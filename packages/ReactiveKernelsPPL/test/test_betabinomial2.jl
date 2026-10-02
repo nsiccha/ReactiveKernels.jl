@@ -132,16 +132,21 @@ end
     end
     @testset "error spellings" begin
         # Wrong arity.
+        # refused: BetaBinomial2 called with the wrong arity (malformed distribution)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(logistic.(mu), 4.0)
             end, (:c, :x))
         # Bare mean (link-space predictors wrap; Beta precedent).
-        @test_throws SurfaceLoweringError lower_rkppl(quote
+        # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+        @test_broken (lower_rkppl(quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, mu, 4.0)
-            end, (:c, :x, :n))
+            end, (:c, :x, :n)); true)
         # Kernel-endpoint spelling redirects.
+        # refused: kernel lpmf endpoint beta_binomial2 is not a distribution constructor (P2)
         @test_throws SurfaceLoweringError lower_rkppl(quote
                 mu = a .+ b .* x
                 c .~ beta_binomial2.(n, logistic.(mu), 4.0)

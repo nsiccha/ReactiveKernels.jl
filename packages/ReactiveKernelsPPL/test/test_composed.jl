@@ -191,20 +191,24 @@ end
 end
 
 @testset "composed bare maps stay link spellings" begin
-    # A map over ONE bare sub-predictor at a location (inline or through
-    # a name) is a link spelling, never a composition: families without
-    # that link fail closed exactly as before compositions existed.
+    # A map over a predictor is an ordinary computed location value.
     D = (:y, :x)
     Dict1 = Dict{Symbol,AbstractVector}(:y => [0.3], :x => [0.5])
-    @test_throws ContractValidationError bind_data(lower_rkppl(quote
+    # admitted: Gaussian location under exp. (log-link Normal)
+    @test (bind_data(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(exp.(mu), 1.5)
-    end, D), Dict1)
-    @test_throws ContractValidationError bind_data(lower_rkppl(quote
+    end, D), Dict1); true)
+    # admitted: Gaussian location under exp. through a named map
+    @test (bind_data(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
         mu = a .+ b .* x
         m = exp.(mu)
         y .~ Normal.(m, 1.5)
-    end, D), Dict1)
+    end, D), Dict1); true)
     # ... while the Poisson log link still peels.
     pois = lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -232,13 +236,14 @@ end
 
 @testset "composed fail-closed" begin
     # Undotted vector combination: Julia-truthful, write the dots.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: undotted array arithmetic be * th - al (valid Julia: scalar*vector and vector-vector) (todo `15lq8iu`)
+    @test_broken (lower_rkppl(quote
         th = a_th .+ b_th .* xs
         al = a_al .+ b_al .* xs
         be ~ Normal(0.0, 100.0)
         eta = be * th - al
         y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs))
+    end, (:y, :xs)); true)
     # A literal scale is one scalar leaf (a synthetic assignment), like
     # any sub-free scalar subexpression (test_fallback.jl).
     lit = lower_rkppl(quote
@@ -254,6 +259,8 @@ end
     # predictor analysis re-screens strictly).
     err = try
         lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
             mu = a .+ b .* xs
             p = logistic.(mu)
             y .~ Normal.(p, 1.0)
@@ -262,9 +269,10 @@ end
     catch e
         e
     end
-    @test err isa SurfaceLoweringError
-    @test occursin("`.~` link", sprint(showerror, err))
+    # capability: valid ordinary value composition (P8 1cmodra; todo `15lq8iu`).
+    @test_broken (err === nothing || throw(err))
     # A scalar leaf names a sampled name or scalar definition — or fails.
+    # refused: be has no declaration (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         a_th ~ Normal(0, 1)
         b_th ~ Normal(0, 1)
@@ -287,6 +295,7 @@ end
         [InterceptTerm, ContinuousTerm]
     # Shrinkage priors go on the coefficient-holding sub-predictors,
     # never the composed root.
+    # refused: r2d2 decomposes a coefficient-holding predictor; a nonlinear root has no coefficient block (one stated prior per coefficient, P7/P8 1cmodra)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         a_th ~ Normal(0, 1)
         b_th ~ Normal(0, 1)
@@ -313,6 +322,7 @@ end
         catch e
             e
         end
+        # refused: exp and logistic each take one operand (Julia MethodError, P3).
         @test err isa SurfaceLoweringError
         @test occursin("takes one operand", sprint(showerror, err))
     end

@@ -78,7 +78,8 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
             (BetaLogitFam, ScalePredictorRef(:lk, LogLink))
     end
     @testset "bare predictor kappa fails closed" begin
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 c ~ Normal(0, 1)
@@ -86,10 +87,11 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
                 mu = a .+ b .* x
                 k = c .+ d .* z
                 prop .~ Beta.(logistic.(mu) .* k, (1 .- logistic.(mu)) .* k)
-            end, (:prop, :x, :z))
+            end, (:prop, :x, :z)); true)
     end
     @testset "logit-wrapped predictor kappa fails closed" begin
-        @test_throws ContractValidationError lower_rkppl(quote
+        # capability: Beta precision under a positive non-log link (logistic.(lk) in (0,1)) (todo `05fuzch`)
+        @test_broken (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 c ~ Normal(0, 1)
@@ -98,7 +100,7 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
                 lk = c .+ d .* z
                 prop .~ Beta.(logistic.(mu) .* logistic.(lk),
                     (1 .- logistic.(mu)) .* logistic.(lk))
-            end, (:prop, :x, :z))
+            end, (:prop, :x, :z)); true)
     end
     @testset "scalar kappa spellings unchanged" begin
         plan = lower_rkppl(quote

@@ -38,17 +38,17 @@ _censored_addprop_fd(f, x; h = 1e-6) = [(f(x .+ h .* (eachindex(x) .== i)) -
     built = build_kernel(bound)
     names = coordinate_names(built.layout)
     values = Dict(:a1=>log(.4),:a2=>log(.6),:p1=>log(.15),:p2=>log(.2),
-        Symbol("mu_lp.Intercept")=>.9)
+        :a=>.9)
     u = [values[n] for n in names]
     function oracle(p)
         coords = Dict(zip(names,p))
         scales = Dict(n=>exp(coords[n]) for n in (:a1,:a2,:p1,:p2))
         prior = sum(-v for v in Base.values(scales))+
-            sum(coords[n] for n in keys(scales))+logpdf(Normal(0.,1.),coords[Symbol("mu_lp.Intercept")])
+            sum(coords[n] for n in keys(scales))+logpdf(Normal(0.,1.),coords[:a])
         likelihood = 0.
         for i in eachindex(cols[:dv])
             j = cols[:assay][i]
-            mu = coords[Symbol("mu_lp.Intercept")]
+            mu = coords[:a]
             sd = hypot(scales[Symbol(:a,j)],mu*scales[Symbol(:p,j)])
             likelihood += cols[:dv][i] <= cols[:lloq][i] ?
                 logcdf(Normal(mu,sd),cols[:lloq][i]) : logpdf(Normal(mu,sd),cols[:dv][i])
@@ -63,9 +63,12 @@ _censored_addprop_fd(f, x; h = 1e-6) = [(f(x .+ h .* (eachindex(x) .== i)) -
     @test value ≈ oracle(u) rtol=2e-13
     @test g ≈ _censored_addprop_fd(oracle,u) rtol=2e-6 atol=2e-8
     for bad in ([0,2,1,2,1],[1,3,1,2,1],[1.,2.,1.,2.,1.])
+        # refused: gather indices must be integers within a nonempty source axis (Julia indexing, P3)
         @test_throws ContractValidationError bind_data(plan,merge(cols,Dict(:assay=>bad));
             dims=Dict(:kernel_nsub_result=>2))
     end
+    # refused: gather indices must be integers within a nonempty source axis (Julia indexing, P3)
     @test_throws "empty" lower_rkppl(_censored_addprop_ast(:([])),Set(keys(cols)))
-    @test_throws "model scalar" lower_rkppl(_censored_addprop_ast(:([location,a1])),Set(keys(cols)))
+    # capability: a gathered vector mixing a data vector and a model scalar (ordinary values, P3/P10a 0dejlw1) (todo `1qlbn5b`)
+    @test_broken (lower_rkppl(_censored_addprop_ast(:([location,a1])),Set(keys(cols))); true)
 end

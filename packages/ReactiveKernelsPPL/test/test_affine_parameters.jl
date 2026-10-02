@@ -19,12 +19,13 @@ _affine_whole(value) = value
         sum(logpdf.(Normal(), u)) + sum(logpdf.(
             Normal.((u .+ data[:group_x])[data[:obs_index]], 1.0), data[:y]))
     _check_gradient(built.spec, bound, u)
-    # A direct response read makes the same data observation-aligned;
-    # model-level array arithmetic must still refuse that combination.
+    # A direct response read adds an observation consumer to the same data;
+    # the whole-value expression also needs to retain its independent axis.
     aligned = copy(ast)
     push!(aligned.args, :(y2 .~ Normal.(group_x, 1.0)))
-    @test_throws SurfaceLoweringError lower_rkppl(aligned, (keys(data)..., :y2);
-        mod = @__MODULE__)
+    # capability: the same array can serve whole-value and indexed observation consumers (P10a, 0dejlw1; todo `1qlbn5b`).
+    @test_broken (lower_rkppl(aligned, (keys(data)..., :y2);
+        mod = @__MODULE__); true)
 end
 
 function _affine_model(ast; data...)
@@ -265,11 +266,12 @@ end
     @test _query(bm.spec, mixed, :posterior, um) ≈ expected_mixed
     _check_gradient(bm.spec, mixed, um)
 
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # capability: a declared coefficient can also feed a scalar definition beside a Horseshoe coefficient (P8; todo `15lq8iu`).
+    @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Horseshoe()
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
         q = a^2
-    end, (:x, :y))
+    end, (:x, :y)); true)
 end

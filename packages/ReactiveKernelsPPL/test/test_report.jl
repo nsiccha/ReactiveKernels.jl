@@ -92,6 +92,7 @@ end
         # Malformed artifacts fail closed.
         bad = joinpath(dir, "bad.jls")
         Serialization.serialize(bad, (; nope = 1))
+        # refused: malformed report artifact (artifact schema contract)
         @test_throws ArgumentError load_artifact(bad)
     end
 end
@@ -141,22 +142,27 @@ end
         catch e
             e
         end
+        # refused: the v2 translation seam requires the BRM package in this environment (dependency contract).
         @test err isa ArgumentError
         @test occursin("BayesianRegressionModels", sprint(showerror, err))
         # Malformed v2 fails closed at load.
         bad = joinpath(dir, "bad.jls")
         Serialization.serialize(bad,
             (; case_id = "x", ast, defs = Expr[], plan = nothing))
+        # refused: v2 artifact missing meta (artifact schema contract)
         @test_throws ArgumentError load_artifact(bad)
         Serialization.serialize(bad, (; case_id = "x", ast = "not-expr",
             defs = Expr[], plan = nothing, meta = (;)))
+        # refused: v2 artifact ast is not an Expr (artifact schema contract)
         @test_throws ArgumentError load_artifact(bad)
         # CLI --artifact dispatches v2 (and fails closed without BRM here).
+        # refused: v2 translate seam needs BRM, absent in this env (fails closed with guidance)
         @test_throws ArgumentError main(["--artifact", v2])
         try
             main(["--artifact", v2])
             @test false
         catch e
+            # refused: the v2 translation seam requires BRM (dependency contract).
             @test occursin("BayesianRegressionModels", sprint(showerror, e))
         end
     end
@@ -182,12 +188,17 @@ end
         @test main(["--surface", model, "--data", data, "--out", out]) == 0
         @test occursin("n_obs = 2", read(out, String))
         # Errors fail closed, never half a report.
+        # refused: mutually exclusive CLI flags --artifact and --surface
         @test_throws ArgumentError main(
             ["--artifact", "a", "--surface", model, "--data", data])
+        # refused: missing required --data argument
         @test_throws ArgumentError main(["--surface", model])
+        # refused: unknown CLI flag
         @test_throws ArgumentError main(["--bogus"])
         write(data, "NOTDATA = 1\n")
+        # refused: data file defines no DATA
         @test_throws ArgumentError load_surface_files(model, data)
+        # refused: u length != layout dimension
         @test_throws ArgumentError transpile_report(
             _REPORT_SURFACE, _report_demo_data(); u = [0.0])
     end
