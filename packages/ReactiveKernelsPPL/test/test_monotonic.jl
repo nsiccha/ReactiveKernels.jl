@@ -751,3 +751,77 @@ end
         _check_gradient(built.spec, bound, u)
     end
 end
+
+# The library spelling: `m ~ monotonic(c, zeta)` is an ordinary latent
+# submodel whose body is the value `cumsum(vcat(0.0, zeta))[c]` over the
+# caller's simplex; `b .* m` is the `mo` shape and a bare `m` the `mo1`
+# shape. Corpus re-spells: 39_mo_library / 40_mo1_library /
+# 41_mo1_only_library, each beside its built-in original. With the same
+# stated priors both spellings give the same coordinates (in the same
+# order) and bitwise-equal posteriors; the library one is also checked
+# against the independent reference and its gradient against finite
+# differences.
+@testset "monotonic library: parity with mo / mo1" begin
+    cols = _mo_cols()
+    lower(ast) = bind_data(lower_rkppl(ast, (:y, :c)), cols)
+    cases = [
+        ("mo", quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            s ~ Dirichlet([1.0, 2.0])
+            mu = a .+ b .* mo(c, s)
+            sigma ~ Exponential(1.0)
+            y .~ Normal.(mu, sigma)
+        end, quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            s ~ Dirichlet([1.0, 2.0])
+            m ~ monotonic(c, s)
+            mu = a .+ b .* m
+            sigma ~ Exponential(1.0)
+            y .~ Normal.(mu, sigma)
+        end, (nt, s) -> nt.a .+ nt.b .* _ref_contrast(s, cols[:c]), nt -> nt.sigma),
+        ("mo1", quote
+            a ~ Normal(0, 1)
+            s ~ Dirichlet([1.0, 2.0])
+            mu = a .+ mo1(c, s)
+            sigma ~ Exponential(1.0)
+            y .~ Normal.(mu, sigma)
+        end, quote
+            a ~ Normal(0, 1)
+            s ~ Dirichlet([1.0, 2.0])
+            m ~ monotonic(c, s)
+            mu = a .+ m
+            sigma ~ Exponential(1.0)
+            y .~ Normal.(mu, sigma)
+        end, (nt, s) -> nt.a .+ _ref_contrast(s, cols[:c]), nt -> nt.sigma),
+        ("mo1 only", quote
+            s ~ Dirichlet(2, 1.0)
+            mu = mo1(c, s)
+            y .~ Normal.(mu, 1.5)
+        end, quote
+            s ~ Dirichlet(2, 1.0)
+            m ~ monotonic(c, s)
+            y .~ Normal.(m, 1.5)
+        end, (nt, s) -> _ref_contrast(s, cols[:c]), nt -> 1.5),
+    ]
+    for (name, builtin, library, mean, scale) in cases
+        @testset "$name" begin
+            pb = lower(builtin)
+            pl = lower(library)
+            bb = build_kernel(pb)
+            bl = build_kernel(pl)
+            n = bl.layout.total
+            @test n == bb.layout.total
+            for u in ([-0.4, 0.5, 0.1, -0.2][1:n], [0.3, -0.6, 0.2, 0.4][1:n])
+                vl = _query(bl.spec, pl, :posterior, u)
+                @test vl == _query(bb.spec, pb, :posterior, u)
+                nt = constrain(bl.layout, u)
+                s = Vector{Float64}(nt.s)
+                @test _query(bl.spec, pl, :likelihood, u) ≈
+                    _ref_gauss_ll(cols[:y], mean(nt, s), scale(nt))
+                _check_gradient(bl.spec, pl, u)
+            end
+        end
+    end
+end
