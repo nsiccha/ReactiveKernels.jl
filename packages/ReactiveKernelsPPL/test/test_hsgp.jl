@@ -519,7 +519,9 @@ function _hsgp_ref_posterior(bound::StructuralPlan, layout::LayoutTable,
     muv = a .+ PHI * (sspd .* beta)
     ll = sum(logpdf.(Normal.(muv, sig), y))
     pr = logpdf(Normal(0, 5), a) + logpdf(Exponential(1), sig) +
-        sum(logpdf(LogNormal(0, 1), r) for r in rhos) +
+        sum(logpdf(LogNormal(0, 1), r) for r in rhos) -
+        sum(logccdf(LogNormal(0,1), e.transform === :floored ? e.lo : 0.0)
+            for e in assign_layout(bound).entries if e.name in hsgp.rhos) +
         logpdf(LogNormal(0, 1), sigh) + sum(logpdf.(Normal(0, 1), beta))
     cnames = coordinate_names(layout)
     jac = sum(u[findfirst(==(s), cnames)]
@@ -846,7 +848,7 @@ function _hsgp_periodic_ref_posterior(bound::StructuralPlan,
     muv = a .+ PHI * (sspd .* beta)
     ll = sum(logpdf.(Normal.(muv, sig), y))
     pr = logpdf(Normal(0, 5), a) + logpdf(Exponential(1), sig) +
-        logpdf(LogNormal(0, 1), rho) +
+        logpdf(truncated(LogNormal(0,1), ReactiveKernelsPPL._hsgp_periodic_rho_lower(only(hb.K)), Inf), rho) +
         logpdf(LogNormal(0, 1), sigh) + sum(logpdf.(Normal(0, 1), beta))
     cnames = coordinate_names(layout)
     jac = sum(u[findfirst(==(s), cnames)]
