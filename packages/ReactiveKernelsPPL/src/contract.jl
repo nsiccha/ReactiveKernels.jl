@@ -5796,7 +5796,9 @@ end
 function _is_vector_valued(ex, plan::StructuralPlan)
     ex isa Symbol && return !(ex in _union_names(plan) ||
         ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
-    ex isa Expr && ex.head === :ref && _is_array_param(plan, ex.args[1]) &&
+    ex isa Expr && ex.head === :ref && ex.args[1] isa Symbol &&
+        (_is_array_param(plan, ex.args[1]) ||
+            _is_array_assignment(plan, ex.args[1])) &&
         return _array_index_kind(plan, ex) === :gather &&
             all(i -> i isa Int, ex.args[3:end])
     ex isa Number && return false

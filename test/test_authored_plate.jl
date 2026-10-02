@@ -1537,6 +1537,37 @@ _dose_outer_same(a, b) = length(a) == length(b) && all(map(===, a, b))
           _natural_sup_parity_margin
 end
 
+# A domain with two axes runs the same passes over its Cartesian cells
+# (`_plate_cells`), in coordinate order.
+@kernel dose_outer_grid(observations, shifts, units, weights) = begin
+    concentration = plate(observations, Ref(shifts), Ref(units), Ref(weights)) do t, s, u, w
+        sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(w); init = 0.0)
+    end
+    total = sum(concentration)
+    return concentration, total
+end
+@kernel dose_outer_grid_control(observations, shifts, units, weights) = begin
+    concentration = plate(observations, Ref(shifts), Ref(units), Ref(weights)) do t, s, u, w
+        sum(w[j] * _dose_outer_fetch(u, t - s[j], 0.0) for j in eachindex(w); init = 0.0)
+    end
+    total = sum(concentration)
+    return concentration, total
+end
+
+@testset "authored plate block: dose-outer over a two-axis domain" begin
+    grid, control = prepare(dose_outer_grid), prepare(dose_outer_grid_control)
+    @test _dose_outer_reductions(grid) == 1
+    units = collect(range(0.5, 2.0; length = 200))
+    for (shifts, weights) in (([0, 40, 100], [3.0, 1.5, 0.25]), ([0, 40], [-0.0, Inf]))
+        observations = reshape(collect(1:255), 15, 17)
+        got, expected = grid(observations, shifts, units, weights),
+                        control(observations, shifts, units, weights)
+        @test size(got[1]) == (15, 17)
+        @test _dose_outer_same(vec(got[1]), vec(expected[1]))
+        @test got[2] === expected[2]
+    end
+end
+
 @testset "tensorized companion: filtered sums and get keep their branches lazy" begin
     # The tensorized rewrite, evaluated on host values, is Base's own fold: the
     # filter is a branch on the accumulator and `get` stays `Base.get`. Over a
