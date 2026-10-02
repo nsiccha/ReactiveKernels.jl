@@ -569,16 +569,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         if s.lhs ∉ data && _is_dar_beta_rhs(s.rhs))
     dar_sigma_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dar_sigma_rhs(s.rhs))
-    # Array-valued declarations shape as `:array` (values, never
-    # per-observation columns, so `B * w` stays a matrix product): declared
-    # arrays (`z[1:K] .~ ...`, two-axis), LKJ Cholesky factors, simplexes,
-    # and vectors sized by a bound data matrix (`w[axes(B, 2)]`, `B` not an
-    # `hcat` definition — never a coefficient vector). A one-axis
-    # `c[levels(g)]` / `b[axes(X, 2)]` declaration over an `hcat` matrix
-    # keeps the slice-1 scalar name shape: it is a coefficient when a
-    # predictor consumes it as one (`c[g]`, `X * b`), and an array (read
-    # by `c[g]`, `c[1]`) otherwise. `value_arrays` are never coefficients:
-    # a bare `z[g]` summand gathers them.
+    # Declaration roles for predictor classification: sized positional
+    # and two-axis arrays, LKJ Cholesky factors, and vectors sized by a
+    # bound data matrix (not an `hcat` definition) always take the array
+    # route. One-axis `c[levels(g)]` / `b[axes(X, 2)]` over an `hcat`
+    # matrix stay coefficient-capable (`c[g]`, `X * b`), independently of
+    # their whole-value array shape below. `value_arrays` are never
+    # coefficients: a bare `z[g]` summand gathers them.
     hcat_defs = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
     array_decls = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
         (s.dims !== nothing ||
@@ -601,12 +598,15 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # scalar-array ops take dotted-canonical form; Julia-invalid vector
     # combinations fail here naming the definition). Everything downstream
     # sees canonical RHSs.
-    # Model-level array values: upstream's simplexes, ordered vectors, and
-    # declared array parameters (`z[1:K] .~`, `L ~ LKJCholesky`, ...).
+    # Every sized declaration is an array when read as a whole value,
+    # including coefficient-capable `z[levels(g)]` / `b[axes(X, 2)]`.
+    # Shape is independent of whether predictor lowering later consumes
+    # an indexed/matmul use as a coefficient. Keep `array_decls` and
+    # `value_arrays` separate: they control those coefficient use sites.
     shape_env = _ShapeEnv(
         union(plate_names, Set{Symbol}(s.state for s in scans), varying_names),
-        union(dirichlet_names, ordered_names, array_decls))
-    detshape = _def_shapes(det, data, detmap; arrays = array_decls,
+        sized_decls)
+    detshape = _def_shapes(det, data, detmap; arrays = sized_decls,
         env = shape_env)
     # A data column the definitions read only as whole values (module-call
     # arguments, gathered values) is a model-level data input at bind, so
@@ -1029,8 +1029,8 @@ function _elementwise_shape(argshapes)
 end
 
 # Reads of an array (`z[g]` per observation, `phi[1]` scalar, `L[:, 1]`
-# array); every other ref keeps the slice-1 scalar shape (factor
-# coefficients `c[g]` classify by position, not shape).
+# array); every other ref keeps the slice-1 scalar shape. Predictor
+# coefficient roles classify by use site, independently of this shape.
 function _ref_shape(ex, data, shape)
     base = ex.args[1]
     base isa Symbol && shape(base) === :array || return :scalar
@@ -1057,8 +1057,8 @@ end
 
 # `A[i]` with one index over a value (data, a definition, a call result,
 # or a model-level array parameter) is a gather: it carries the
-# observation axis exactly when its index does. Indexing a levels
-# coefficient (`z[g]`) stays a factor reference.
+# observation axis exactly when its index does. Its predictor role is
+# decided separately (`z[g]` may be a factor coefficient there).
 _is_gather(ex::Expr, data, detmap, env::_ShapeEnv) =
     ex.head === :ref && length(ex.args) == 2 &&
     (ex.args[1] isa Expr || ex.args[1] in data ||
