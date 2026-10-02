@@ -195,6 +195,33 @@ end
         findfirst(==(Symbol("Z.1.2")), names)
 end
 
+# Model-module helpers for whole-value calls over arrays.
+module ArrayRowsModels
+addvec(a, b) = a .+ b
+end
+
+@testset "array values: column reads passed to a module call" begin
+    # `Z[:, j]` is the j-th column (one value per level); passed to a
+    # model-level call whose result is gathered per observation.
+    ast = :(begin
+        s ~ Exponential(1)
+        Z[levels(k), 1:2] .~ Normal.(0, 1)
+        v = addvec(Z[:, 1], Z[:, 2])
+        y .~ Normal.(v[k], s)
+    end)
+    y = _av_y()
+    k = [1, 2, 3, 1, 2, 3, 1, 2]
+    bound = bind_data(lower_rkppl(ast, (:y, :k); mod = ArrayRowsModels),
+        Dict{Symbol,ColumnData}(:y => y, :k => k))
+    built = build_kernel(bound)
+    u = _av_point(built.layout.total)
+    nt = constrain(built.layout, u)
+    v = nt.Z[:, 1] .+ nt.Z[:, 2]
+    @test _av_node(built, bound, :likelihood, u) ≈
+        sum(logpdf.(Normal.(v[k], nt.s), y))
+    _check_gradient(built.spec, bound, u)
+end
+
 @testset "array values: an integer axis gathers by position" begin
     m = @rkppl begin
         z[1:3] .~ Normal.(0, 1)

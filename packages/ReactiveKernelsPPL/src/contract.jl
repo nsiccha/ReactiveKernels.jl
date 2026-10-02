@@ -5429,6 +5429,8 @@ function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String} &&
         return nothing
     if ex isa Symbol
+        # `:` in a positional read (`Z[:, 1]`) is a whole axis, not a name.
+        ex === :(:) && return nothing
         bound && haskey(plan.columns, ex) && return nothing
         push!(refs, ex)
         return nothing
