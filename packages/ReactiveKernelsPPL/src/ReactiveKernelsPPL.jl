@@ -44,8 +44,7 @@ export VaryingZRecipe, VaryingMargin, VaryingSdPrior, VaryingDraws, VaryingSlice
 export VaryingMultiMembership, VaryingStrata
 export SplineBasisBlock, SplineBasis, SplineVector
 export HSGPBasis, HyperPrior, HSGPHyperLP, HSGPGrouping
-export KernelPlate, LinearPKScheduleSpec, LinearPKEventLPSpec,
-    VaryingSourcePKScheduleSpec, VaryingSourcePKPDScheduleSpec
+export KernelPlate, LinearPKScheduleSpec, LinearPKEventLPSpec
 export EVENT_LP_NAME
 export LevelMap
 export DesignMatrix
@@ -107,12 +106,6 @@ export rk_expm
 export rk_symmetric_eigvals, rk_symmetric_eigvecs
 export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
     prepare_transit_twocmt_rule
-export varyingsource_effectiveness, varyingsource_effective_dose,
-    prepare_varyingsource_pk, varyingsource_pk_concentration, varyingsource_pk_locs
-export build_varyingsource_pk_schedule, varyingsource_pk_read_locs_over_subjects
-export varyingsource_gp_weights, varyingsource_log_placebo, varyingsource_pd_locs,
-    prepare_varyingsource_pkpd, varyingsource_pkpd_locs
-export build_varyingsource_pkpd_schedule, varyingsource_pkpd_read_locs_over_subjects
 
 include("contract.jl")
 include("varying_centered.jl")
@@ -126,10 +119,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
 include("pkcells.jl")
 include("transit_twocmt.jl")
 include("transit_twocmt_rule.jl")
-include("varyingsource_pk.jl")
-include("varyingsource_pd.jl")
-include("varyingsource_schedule.jl")
-include("varyingsource_pkpd_schedule.jl")
 include("pk_rectangular.jl")
 include("design.jl")
 include("bijectors.jl")

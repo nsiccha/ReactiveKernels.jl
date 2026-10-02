@@ -2406,6 +2406,97 @@ function _kernel_tensorized_generator_sum(parts, known, mod, scope)
          step, _kernel_tensorized_rhs(parts.iterator, known, mod, scope))
 end
 
+# The NATIVE body of authored source (a recipe, a plate cell, a scan step, a
+# `@traceable` method) with each generator fold over a data-length iterator,
+# `sum(term for i in iter [if condition]; init = x)` with `iter` matching
+# `_kernel_range_iterator`, spelled as its explicit-accumulator loop:
+#
+#     let it = iter, acc = x
+#         for i in it
+#             [if condition] acc = add_sum(acc, term) [end]
+#         end
+#         acc
+#     end
+#
+# That is Base's evaluation of the fold — `sum` with `init` is the left fold
+# `foldl(add_sum, …; init)` on Julia 1.10 through 1.13, evaluating the
+# iterator, then `init`, then per element the condition and the term — so the
+# value is Base's, bitwise.  It exists for Julia 1.10's inference: a Base fold
+# inferred while inferring another fold's term (a nested sum, or a sum inside a
+# helper that term calls) re-enters `mapfoldl` with a larger signature, and
+# inference widens that frame to `Any`.  Every element then dispatches
+# dynamically and boxes (a 4 × 4 nested sum: 10 allocations per call), though
+# Julia 1.12 infers the same nest concretely.  The loop has no such
+# frame, so a fold the rewrite reaches never re-enters `mapfoldl`, and a nest
+# keeps at most one Base fold.  The tensorized companion keeps its own lowering
+# (`_kernel_tensorized_generator_sum`).
+#
+# The rewrite keeps to terms and conditions that are plain expressions.  One
+# that assigns, declares, returns, jumps, loops, or holds a macro call keeps
+# Base's `sum`: a `return` or `break` there belongs to the generator's closure,
+# and in the loop it would leave the enclosing method or loop.  So does a fold
+# whose `sum` is not Base's (a local, a port, or a module binding of that
+# name), a fold without `init`, and one over any other iterator: a tuple's
+# fold is Base's unrolled one, which a loop over a heterogeneous tuple is not.
+_kernel_native_body(ex, mod, names) = _kernel_native_folds(ex, mod,
+    _local_symbols!(Set{Symbol}(names), ex))
+
+function _kernel_native_folds(ex, mod, shadowed::Set{Symbol})
+    mod isa Module || return ex
+    :sum in shadowed && return ex
+    (isdefined(mod, :sum) && getglobal(mod, :sum) !== Base.sum) && return ex
+    _kernel_native_folds_walk(ex)
+end
+
+function _kernel_native_folds_walk(ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert, :meta, :macrocall) && return ex
+    parts = _kernel_generator_sum_parts(ex)
+    if parts !== nothing && _kernel_range_iterator(parts.iterator) &&
+       !_kernel_fold_term_escapes(parts.term) &&
+       (parts.condition === nothing || !_kernel_fold_term_escapes(parts.condition))
+        iterator = gensym(:native_sum_iterator)
+        accumulator = gensym(:native_sum)
+        update = Expr(:(=), accumulator, Expr(:call, GlobalRef(Base, :add_sum),
+                                              accumulator,
+                                              _kernel_native_folds_walk(parts.term)))
+        parts.condition === nothing ||
+            (update = Expr(:if, _kernel_native_folds_walk(parts.condition), update))
+        return Expr(:let,
+            Expr(:block,
+                 Expr(:(=), iterator, _kernel_native_folds_walk(parts.iterator)),
+                 Expr(:(=), accumulator, _kernel_native_folds_walk(parts.init))),
+            Expr(:block,
+                 Expr(:for, Expr(:(=), parts.variable, iterator), Expr(:block, update)),
+                 accumulator))
+    end
+    Expr(ex.head, (_kernel_native_folds_walk(arg) for arg in ex.args)...)
+end
+
+# Whether a fold's term (or condition) is anything but a plain expression: an
+# assignment or declaration (scoping the rewrite does not reason about),
+# `return`/`break`/`continue`/a label (they belong to the generator's closure),
+# a loop, `let`, `try`, or a macro call (opaque syntax).  A nested generator's
+# `for` clauses bind its own variables and are not assignments; their
+# iterators and the generator's term are checked.
+function _kernel_fold_term_escapes(ex)
+    ex isa Expr || return false
+    ex.head in (:quote, :inert, :meta) && return false
+    ex.head in (:return, :break, :continue, :local, :global, :const, :for, :while,
+                :try, :macrocall, :let, :function, :symboliclabel, :symbolicgoto) &&
+        return true
+    _kernel_tensorized_assignment_head(ex.head) && return true
+    if ex.head === :kw && length(ex.args) == 2
+        return _kernel_fold_term_escapes(ex.args[2])
+    elseif ex.head === :generator || ex.head === :filter
+        return any(ex.args) do arg
+            arg isa Expr && arg.head === :(=) && length(arg.args) == 2 ?
+                _kernel_fold_term_escapes(arg.args[2]) : _kernel_fold_term_escapes(arg)
+        end
+    end
+    any(_kernel_fold_term_escapes, ex.args)
+end
+
 # `begin`/`end` inside an index denote the indexed array's first/last index;
 # Julia resolves them while lowering `a[...]`. Once the tensorized body turns
 # the indexing into a call they would be free variables, so resolve them
@@ -2618,7 +2709,12 @@ end
 
 Define an ordinary method of `f`, plus the [`ReactiveKernels.traced`](@ref)
 method with the same signature whose body is this body rewritten as a
-`@kernel` recipe body is.  Native execution calls the method as written.
+`@kernel` recipe body is.  Native execution calls the method as written,
+except that a generator fold over a data-length iterator,
+`sum(term for i in iter [if condition]; init = x)` with `iter` an `eachindex`,
+`axes`, `range` or `a:b` call, runs as its explicit-accumulator loop: Base's
+value, bitwise, without the `Any` that Julia 1.10 infers for a nested Base fold
+(the compiler page, "Lowering and emitted ABI").
 Under a tracing backend (Reactant), a recipe calling `f` reaches the rewritten
 body, so indexing, `get`, lazy branches and data-length loops inside the helper
 lower as they do written in the recipe.  One body serves both; write a
@@ -2705,7 +2801,8 @@ function _traceable_definition(def, mod::Module)
     for layer in reverse(wheres)
         companion = Expr(:where, companion, layer...)
     end
-    esc(Expr(:block, def, Expr(:(=), companion, rewritten), callee))
+    native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
+    esc(Expr(:block, native, Expr(:(=), companion, rewritten), callee))
 end
 
 # The body with its tail-position `return`s replaced by their values: the
@@ -2783,7 +2880,7 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
              Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
              Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), native, tensor)
     end
-    reduction = _kernel_reduction_callable(rhs, deps, mod)
+    reduction = _kernel_reduction_callable(rhs, deps, mod, known)
     if reduction !== nothing
         # A gathered generator sum keeps its parts as `_KernelReduction`
         # metadata (same call semantics) for the native plate lowering; the
@@ -2797,7 +2894,7 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
     Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
-         Expr(:->, Expr(:tuple, deps...), rhs),
+         Expr(:->, Expr(:tuple, deps...), _kernel_native_body(rhs, mod, known)),
          Expr(:->, Expr(:tuple, deps...),
               tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs))
 end
@@ -2838,13 +2935,15 @@ function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
         read = Set(_kernel_free_ports(part, Set{Symbol}(deps)))
         ports = Symbol[d for d in deps if d in read]
         body = tensorize ?
-            _kernel_tensorized_rhs(part, known, mod, Set{Symbol}(ports)) : part
+            _kernel_tensorized_rhs(part, known, mod, Set{Symbol}(ports)) :
+            _kernel_native_body(part, mod, known)
         return Expr(:->, Expr(:tuple, ports...), body), ports
     end
     condition, then_side, else_side = parts
     positions(ports) = Tuple(findfirst(==(p), deps) for p in ports)
     call = Expr(:->, Expr(:tuple, deps...), tensorize ?
-        _kernel_tensorized_rhs(part, known, mod, Set{Symbol}(deps)) : part)
+        _kernel_tensorized_rhs(part, known, mod, Set{Symbol}(deps)) :
+        _kernel_native_body(part, mod, known))
     cex, cports = _kernel_branch_callable(condition, deps, known, mod, tensorize;
                                           leaf = true)
     tex, tports = _kernel_branch_callable(then_side, deps, known, mod, tensorize)
@@ -2860,7 +2959,8 @@ end
 # which the dose-outer check evaluates at every cell) whose term evaluates a
 # call `get(A, K, D)` of Base's `get` unconditionally — reached through eager
 # call arguments only — with an `A` that does not read `j`.
-function _kernel_reduction_callable(rhs, deps::Vector{Symbol}, mod)
+function _kernel_reduction_callable(rhs, deps::Vector{Symbol}, mod,
+                                    known::Set{Symbol} = Set{Symbol}(deps))
     mod isa Module || return nothing
     parts = _kernel_generator_sum_parts(rhs)
     parts === nothing && return nothing
@@ -2885,7 +2985,8 @@ function _kernel_reduction_callable(rhs, deps::Vector{Symbol}, mod)
     gathered = gensym(:reduction_gathered)
     bind(body) = Expr(:let, Expr(:(=), variable, element), body)
     add(term) = Expr(:call, GlobalRef(Base, :add_sum), accumulator, term)
-    closure(formals, body) = Expr(:->, Expr(:tuple, formals...), body)
+    closure(formals, body) = Expr(:->, Expr(:tuple, formals...),
+                                  _kernel_native_body(body, mod, known))
     Expr(:call, GlobalRef(@__MODULE__, :_KernelReduction),
          positions(iterator_ports), positions(init_ports),
          positions(index_ports), positions(source_ports),
