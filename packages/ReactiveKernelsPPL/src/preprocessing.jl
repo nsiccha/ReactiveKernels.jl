@@ -410,11 +410,10 @@ function preprocessing_recipes(plan::StructuralPlan)
     return stmts
 end
 
-"""Design row count: observations, subjects or raw dose rows, according
-to the predictor's consumers. Bound plans only."""
+"""Design row count of a predictor (obs-level: `n_obs`; subject-level:
+the using kernel plate's subject count — bound plans only)."""
 function _predictor_rows(plan::StructuralPlan, pname::Symbol)
-    axis = _predictor_level(plan,pname)
-    axis === :obs && return plan.n_obs
+    _predictor_level(plan, pname) === :obs && return plan.n_obs
     users = KernelPlate[kp for kp in plan.kernel_plates
         if any(pr -> pr[1] === pname, kp.lp_args)]
     isempty(users) &&
@@ -426,8 +425,7 @@ function _predictor_rows(plan::StructuralPlan, pname::Symbol)
             throw(ContractValidationError("[preprocessing] subject predictor " *
                   "`$pname` needs resolved kernel subjects (bind_data first)"))
     end
-    ns = unique!([axis === :dose ?
-        length(plan.columns[only(kp.schedules).dose_subj]) : kp.subjects for kp in users])
+    ns = unique!([kp.subjects for kp in users])
     length(ns) == 1 && return ns[1]
     throw(ContractValidationError("[preprocessing] subject predictor " *
           "`$pname` feeds kernel plates with different subject counts " *
