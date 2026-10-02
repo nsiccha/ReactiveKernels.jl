@@ -1663,7 +1663,7 @@ end
     bad = _gaussian_plan()
     bad.parameters[1] =
         SampledParameter(:tau, :flat, (;), :positive, :tau)
-    # refused: :positive (renormalized half) on an improper flat; flat takes :positive_stan (IR contract: support-override rule)
+    # refused: :positive (renormalized half) on an improper flat; Flat() has real support (IR contract: support-override rule)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
