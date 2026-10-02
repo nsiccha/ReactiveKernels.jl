@@ -417,7 +417,10 @@ gather. A data-only definition calling such a function is evaluated once by
 kernel under generic AD (an RK-owned derivative rule, when the callee is
 one, is used by Enzyme). A parameter-dependent undotted call over an
 observation column fails closed: its result shape is unknown before
-sampling, so broadcast it or bind its data-only part first.
+sampling, so broadcast it or bind its data-only part first. A data column
+the definitions read only inside undotted module-call arguments, and no
+other statement names, is a whole value instead (a model-level data input
+of any length at bind), so such a call may take it directly.
 
 Input ownership and concurrency: neither `ast` nor the submodel bodies
 reachable through `mod` is mutated, so one AST may be lowered repeatedly
@@ -491,6 +494,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # lowering, before `_lower_parameters` runs).
     dirichlet_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dirichlet_call(s.rhs))
+    # Ordered vectors (`c ~ Ordered(Normal(0, 1), K)`): the only names a
+    # cumulative ordinal response takes as explicit cutpoints (checked
+    # during response lowering, before `_lower_parameters` runs).
+    ordered_names = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && !s.broadcast && _is_ordered_call(s.rhs))
     # Covariance-factor declarations (`L ~ LKJCovarianceFactor(...)`): the
     # only stems a joint response accepts as its factor (checked during
     # joint lowering, before `_lower_parameters` runs).
@@ -526,10 +534,10 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         (s.dims !== nothing ||
             (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
     # Every array-capable declaration (sized `.~`, LKJ, a `Dirichlet`
-    # simplex value): an expression that READS one by index (`L[2, 1] .* x`,
-    # `tau .* z[g]`, `phi[1] .* x`) is a value, never an affine
-    # sub-predictor over coefficients.
-    sized_decls = union(array_decls, dirichlet_names,
+    # simplex or `Ordered` vector value): an expression that READS one by
+    # index (`L[2, 1] .* x`, `tau .* z[g]`, `phi[1] .* x`) is a value, never
+    # an affine sub-predictor over coefficients.
+    sized_decls = union(array_decls, dirichlet_names, ordered_names,
         Set{Symbol}(s.lhs for s in sample
             if s.lhs ∉ data && s.broadcast &&
                 (s.levels !== nothing || s.matrix !== nothing)))
@@ -539,14 +547,19 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     # scalar-array ops take dotted-canonical form; Julia-invalid vector
     # combinations fail here naming the definition). Everything downstream
     # sees canonical RHSs.
-    # Model-level array values: upstream's simplexes plus this lane's
+    # Model-level array values: upstream's simplexes, ordered vectors, and
     # declared array parameters (`z[1:K] .~`, `L ~ LKJCholesky`, ...).
     shape_env = _ShapeEnv(
         union(plate_names, Set{Symbol}(s.state for s in scans), varying_names),
-        union(dirichlet_names, array_decls))
+        union(dirichlet_names, ordered_names, array_decls))
     detshape = _def_shapes(det, data, detmap; arrays = array_decls,
         env = shape_env)
-    _check_module_calls(det, detmap, data, shape_env)
+    # A data column the definitions read only as whole values (module-call
+    # arguments, gathered values) is a model-level data input at bind, so
+    # a parameter-dependent call may take it; each refusal that waiver
+    # skips is re-checked once the plan shows no other slot reads it.
+    whole = _whole_value_data(det, data, _statement_names(ast))
+    waived = _check_module_calls(det, detmap, data, shape_env; whole)
     canonmap = Dict{Symbol,Any}()
     for nm in _det_topo_order(det, detmap)
         rhs = detmap[nm]
@@ -592,6 +605,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         hsgps = Dict{Symbol,HSGPBasis}(b.id => b for b in hbases),
         hsgp_uses = Dict{Symbol,Symbol}(),
         dirichlet_names = dirichlet_names,
+        ordered_names = ordered_names,
+        array_dims = Dict{Symbol,Vector{Any}}(s.lhs => s.dims for s in sample
+            if s.lhs ∉ data && s.dims !== nothing),
+        threshold_uses = Dict{Symbol,NamedTuple{(:response, :ordered),
+            Tuple{Symbol,Bool}}}(),
         mo_uses = Dict{Symbol,Symbol}(),
         matrices = Dict{Symbol,DesignMatrix}(m.name => m for m in matrices),
         matrices_used = Set{Symbol}(),
@@ -820,6 +838,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = matrices, event_lps = event_lps,
         array_parameters = arrays)
+    _confirm_whole_value_data(plan, data, waived)
     validate_structure(plan)
     return plan
 end
@@ -877,7 +896,7 @@ function _shape_of(ex, data, detmap, memo, active::Set{Symbol},
     ex in active && return :scalar  # cyclic: errors downstream
     push!(active, ex)
     sh = _shape_of(detmap[ex], data, detmap, memo, active, env)
-    pop!(active)
+    delete!(active, ex)
     memo[ex] = sh
     return sh
 end
@@ -1014,7 +1033,7 @@ function _model_valued(ex, detmap, env, active::Set{Symbol})
         (haskey(detmap, ex) && !(ex in active)) || return false
         push!(active, ex)
         r = _model_valued(detmap[ex], detmap, env, active)
-        pop!(active)
+        delete!(active, ex)
         return r
     end
     ex isa Expr || return false
@@ -1261,7 +1280,7 @@ function _det_topo_order(det, detmap)
         for s in _symbols_in(detmap[nm])
             s in detkeys && s != nm && visit(s)
         end
-        pop!(active)
+        delete!(active, nm)
         push!(done, nm)
         push!(order, nm)
         return nothing
@@ -1550,7 +1569,7 @@ function _data_only(ex, data, detmap, active::Set{Symbol} = Set{Symbol}())
         (haskey(detmap, s) && !(s in active)) || return false
         push!(active, s)
         ok = _data_only(detmap[s], data, detmap, active)
-        pop!(active)
+        delete!(active, s)
         ok || return false
     end
     return true
@@ -1559,32 +1578,97 @@ end
 # An undotted module call takes whole values, so over an observation
 # column its result shape is the function's business: known once its
 # data-only inputs are bound, but never guessed for a parameter-dependent
-# call. Such a call fails here with the honest spellings.
-function _check_module_calls(det, detmap, data, env::_ShapeEnv)
-    memo = Dict{Symbol,Symbol}()
+# call. Such a call fails here with the honest spellings. A data column
+# in `whole` (read only as module-call arguments) has no observation axis;
+# a refusal that only its alignment would raise is returned as waived —
+# (message, the whole columns it rests on) — for
+# `_confirm_whole_value_data`.
+function _check_module_calls(det, detmap, data, env::_ShapeEnv;
+        whole::Set{Symbol} = Set{Symbol}())
+    # Whole columns are model-level values there: still gatherable
+    # (`gx[g]` follows its index), never aligned themselves.
+    aligned = setdiff(data, whole)
+    wenv = _ShapeEnv(env.aligned, union(env.values, whole))
+    memos = (Dict{Symbol,Symbol}(), Dict{Symbol,Symbol}())
+    waived = Tuple{String,Set{Symbol}}[]
     for (nm, rhs) in det
-        _check_module_calls(nm, rhs, detmap, data, env, memo)
+        _check_module_calls(nm, rhs, detmap, data, aligned, whole, env, wenv,
+            memos, waived)
     end
-    return nothing
+    return waived
 end
 
-function _check_module_calls(nm, ex, detmap, data, env, memo)
+function _check_module_calls(nm, ex, detmap, data, aligned, whole, env, wenv,
+        memos, waived)
     ex isa Expr || return nothing
     if ex.head === :call && !isempty(ex.args) && ex.args[1] isa GlobalRef
         for a in ex.args[2:end]
-            _obs_axis(a, data, detmap, memo, Set{Symbol}(), env) || continue
+            _obs_axis(a, data, detmap, memos[1], Set{Symbol}(), env) ||
+                continue
             _data_only(ex, data, detmap) && break
             f = ex.args[1].name
-            _sfail("definition `$nm = $(repr(ex))` calls `$f` on the " *
+            msg = "definition `$nm = $(repr(ex))` calls `$f` on the " *
                 "observation-aligned value `$(repr(a))` together with " *
                 "parameters, so its result shape is unknown until " *
                 "sampling — broadcast it for an elementwise column " *
                 "(`$f.(...)`), or compute the data-only part in its own " *
-                "definition (evaluated once at bind)")
+                "definition (evaluated once at bind)"
+            _obs_axis(a, aligned, detmap, memos[2], Set{Symbol}(), wenv) &&
+                _sfail(msg)
+            push!(waived, (msg, _reached_names(a, detmap, whole)))
         end
     end
     for a in ex.args
-        _check_module_calls(nm, a, detmap, data, env, memo)
+        _check_module_calls(nm, a, detmap, data, aligned, whole, env, wenv,
+            memos, waived)
+    end
+    return nothing
+end
+
+# Data columns the definitions read only as whole values — the bind-time
+# model-level data-input rule (`_model_level_inputs`) over the
+# definitions, with every name another statement mentions (`held`: a
+# response, prior, `@plate`, …) pinned observation-aligned.
+# `_confirm_whole_value_data` re-checks each waiver against the plan.
+function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol})
+    inputs, _ = _whole_value_reads(det, data, held)
+    return setdiff!(inputs, held)
+end
+
+# Every name the non-definition statements of `ast` mention.
+function _statement_names(ast::Expr)
+    out = Set{Symbol}()
+    for st in ast.args
+        st isa LineNumberNode && continue
+        st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
+        _all_symbols!(out, st)
+    end
+    return out
+end
+
+# The names of `among` that `ex` reads, directly or through definitions.
+function _reached_names(ex, detmap, among::Set{Symbol},
+        out::Set{Symbol} = Set{Symbol}(), seen::Set{Symbol} = Set{Symbol}())
+    for s in _value_symbols(ex)
+        s in among && push!(out, s)
+        if haskey(detmap, s) && !(s in seen)
+            push!(seen, s)
+            _reached_names(detmap[s], detmap, among, out, seen)
+        end
+    end
+    return out
+end
+
+# A waived refusal stands unless every whole column it rests on is a
+# model-level data input of the finished plan: any other slot reading one
+# (a response, predictor, plate, …) makes it observation-aligned after
+# all, and the call fails exactly as it would have without the waiver.
+function _confirm_whole_value_data(plan::StructuralPlan, data::Set{Symbol},
+        waived)
+    isempty(waived) && return nothing
+    inputs, _ = _model_level_inputs(plan, data)
+    for (msg, needed) in waived
+        needed ⊆ inputs || _sfail(msg)
     end
     return nothing
 end
@@ -4622,9 +4706,20 @@ _is_literal_range(r) = r isa Expr && r.head === :call && length(r.args) == 3 &&
 function _array_axis(target::Symbol, a, data::Set{Symbol})
     if _is_literal_range(a)
         lo, hi = a.args[2], a.args[3]
+        cnt = lo === 1 ? _levels_count(hi) : nothing
+        if cnt !== nothing
+            # `1:length(levels(g)) - k`: a positional axis whose length is
+            # the number of distinct values of `g`, less k (resolved at
+            # bind).
+            g, k = cnt
+            g in data || _sfail("array $target axis $(repr(a)): " *
+                "`levels($g)` needs a data grouping column — $g is not data")
+            n = Expr(:call, :length, Expr(:call, :levels, g))
+            return k == 0 ? n : Expr(:call, :-, n, k)
+        end
         lo === 1 && hi isa Integer && !(hi isa Bool) && hi >= 1 || _sfail(
             "array $target axis $(repr(a)) must be a literal `1:K` with " *
-            "K ≥ 1")
+            "K ≥ 1, or `1:length(levels(g)) - k`")
         return Int(hi)
     end
     if _is_levels_call(a)
@@ -6284,16 +6379,61 @@ function _implicit_vector!(ctx, name::Symbol, family::Symbol, lhs::Symbol)
     return name
 end
 
-# Cumulative-logit ordinal: `y .~ OrderedLogistic.(eta)` + implicit
-# ordered cutpoints (SB's `y_cutpoints::ordered[K-1] ~ std_normal()`).
+# Explicit cutpoints/thresholds of an ordinal response: the trailing
+# argument `Ref(c)` names one declared vector shared by every observation
+# (Distributions.jl `OrderedLogistic.(eta, Ref(c))` broadcast semantics).
+# Cumulative structures take an `Ordered(...)` vector; stopping-ratio
+# stage thresholds are unconstrained, a one-axis sized
+# `c[1:K] .~ Normal.(m, s)` declaration. Each vector serves exactly one
+# response (recorded for `_lower_parameters`, which sizes it).
+function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
+        shown::String)
+    name = arg isa Expr && arg.head === :call && length(arg.args) == 2 &&
+        arg.args[1] === :Ref && arg.args[2] isa Symbol ? arg.args[2] : nothing
+    if name === nothing
+        arg isa Symbol && _sfail("response $lhs: the cutpoints $arg are " *
+            "one vector shared by every observation — write `Ref($arg)` " *
+            "(standard broadcasting would pair each observation with one " *
+            "element of $arg)")
+        _sfail("response $lhs: $shown takes its cutpoints as `Ref(c)` of " *
+               "a declared vector, got $(repr(arg))")
+    end
+    if ordered
+        name in ctx.ordered_names || _sfail("response $lhs: cutpoints " *
+            "$name must be an ordered vector declared in the model " *
+            "(`$name ~ Ordered(Normal(0, 1), length(levels($lhs)) - 1)`)")
+    else
+        name in ctx.ordered_names && _sfail("response $lhs: stopping-ratio " *
+            "thresholds are unconstrained, not ordered — declare " *
+            "`$name[1:length(levels($lhs)) - 1] .~ Normal.(0, 1)`")
+        dims = get(ctx.array_dims, name, nothing)
+        dims !== nothing && length(dims) == 1 || _sfail("response $lhs: " *
+            "thresholds $name must be a one-axis vector declared in the " *
+            "model (`$name[1:length(levels($lhs)) - 1] .~ Normal.(0, 1)`)")
+    end
+    prev = get(ctx.threshold_uses, name, nothing)
+    prev === nothing || _sfail("response $lhs: cutpoints $name already " *
+        "serve response $(prev.response) — one response per cutpoint vector")
+    ctx.threshold_uses[name] = (response = lhs, ordered = ordered)
+    return name
+end
+
+# Cumulative-logit ordinal: `y .~ OrderedLogistic.(eta, Ref(c))` over
+# declared cutpoints `c ~ Ordered(...)`, or the implicit form
+# `y .~ OrderedLogistic.(eta)` + minted ordered cutpoints (SB's
+# `y_cutpoints::ordered[K-1] ~ std_normal()`; removed once BRM emits the
+# explicit form).
 function _lower_ordered_logistic_response(lhs, call, range, weights,
         evidence, label, ctx, predictors, pred_idx, coefuse)
     args = _plain_args(call, "`OrderedLogistic`")
-    length(args) == 1 || _sfail("response $lhs: `OrderedLogistic` takes " *
-                                "`y .~ OrderedLogistic.(eta)`")
+    1 <= length(args) <= 2 || _sfail("response $lhs: `OrderedLogistic` " *
+        "takes `y .~ OrderedLogistic.(eta, Ref(c))` with " *
+        "`c ~ Ordered(Normal(0, 1), length(levels(y)) - 1)`")
     pname = _lower_location(lhs, args[1], IdentityLink, ctx, predictors,
         pred_idx, coefuse)
-    cut = _implicit_vector!(ctx, Symbol(lhs, :_cutpoints), :ordered_normal, lhs)
+    cut = length(args) == 2 ?
+        _explicit_thresholds!(ctx, lhs, args[2], true, "`OrderedLogistic`") :
+        _implicit_vector!(ctx, Symbol(lhs, :_cutpoints), :ordered_normal, lhs)
     return LikelihoodSpec(OrderedLogisticFam, LogitLink, lhs, pname,
         nothing, weights, evidence, label, nothing, range; thresholds = cut)
 end
@@ -6315,17 +6455,19 @@ const _ORDINAL_LINKS = Dict{Symbol,LinkFunction}(
     :CloglogLink => CloglogLink,
 )
 
-# General typed ordinal: `y .~ Ordinal.(Cumulative(), LogitLink(), eta)`
-# (+ implicit thresholds — ordered iff cumulative). Discrimination and
-# per-threshold design are plan-level only (the BRM emitter's path):
-# the dotted object takes exactly three positionals.
+# General typed ordinal:
+# `y .~ Ordinal.(Cumulative(), LogitLink(), eta, Ref(c))` over declared
+# thresholds (ordered iff cumulative — see `_explicit_thresholds!`), or the
+# implicit three-positional form + minted thresholds (removed once BRM
+# emits the explicit form). Discrimination and per-threshold design are
+# plan-level only (the BRM emitter's path).
 function _lower_ordinal_response(lhs, call, range, weights, evidence,
         label, ctx, predictors, pred_idx, coefuse)
     args = _plain_args(call, "`Ordinal`")
-    length(args) == 3 || _sfail("response $lhs: `Ordinal` takes " *
-                                "`y .~ Ordinal.(Cumulative(), LogitLink(), eta)` " *
-                                "(structure, link, eta — discrimination and " *
-                                "per-threshold design are plan-level only)")
+    3 <= length(args) <= 4 || _sfail("response $lhs: `Ordinal` takes " *
+        "`y .~ Ordinal.(Cumulative(), LogitLink(), eta, Ref(c))` " *
+        "(structure, link, eta, thresholds — discrimination and " *
+        "per-threshold design are plan-level only)")
     structure = _ordinal_tag(lhs, args[1], (:Cumulative, :StoppingRatio),
         "structure")
     linktag = _ordinal_tag(lhs, args[2],
@@ -6333,7 +6475,10 @@ function _lower_ordinal_response(lhs, call, range, weights, evidence,
     pname = _lower_location(lhs, args[3], IdentityLink, ctx, predictors,
         pred_idx, coefuse)
     vfam = structure === :Cumulative ? :ordered_normal : :vector_normal
-    thresh = _implicit_vector!(ctx, Symbol(lhs, :_thresholds), vfam, lhs)
+    thresh = length(args) == 4 ?
+        _explicit_thresholds!(ctx, lhs, args[4], structure === :Cumulative,
+            "`Ordinal`") :
+        _implicit_vector!(ctx, Symbol(lhs, :_thresholds), vfam, lhs)
     structure_sym = structure === :Cumulative ? :cumulative : :stopping
     return LikelihoodSpec(OrdinalFam, _ORDINAL_LINKS[linktag], lhs, pname,
         nothing, weights, evidence, label, nothing, range;
@@ -8275,7 +8420,7 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
         push!(ctx.absorbed, ex)
         push!(visited, ex)
         out = _inline_structure(ctx.detmap[ex], ctx, visited, where)
-        pop!(visited)
+        delete!(visited, ex)
         return out
     end
     return ex
@@ -8424,6 +8569,13 @@ function _classify_summand(pname, core, sign::Int, ctx)
     length(coefrefs) == 1 && _sfail(
         "predictor $pname: $(repr(core)) computes over the coefficient " *
         "$(only(coefrefs)) — computed coefficients are not in slice 1")
+    # An undotted module call returns a whole (model-level) value, even
+    # over columns it reads whole.
+    _contains_module_call(core) && _sfail("predictor $pname: " *
+        "$(repr(core)) is a model-level value (an undotted module call " *
+        "takes and returns whole values), not an observation column — " *
+        "gather it with an observation index (`v[c]`), or broadcast the " *
+        "call (`f.(...)`) for an elementwise column")
     return _sfail("predictor $pname: $(repr(core)) is a scalar, not a " *
                   "term — scalar parameters are not identified " *
                   "separately from the intercept (bind the value to a " *
@@ -9692,8 +9844,16 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
     for s in sample
         (s.lhs in ctx.data || s.lhs in ctx.derived_responses) && continue
         if s.dims !== nothing
+            if haskey(ctx.threshold_uses, s.lhs)
+                push!(vectors, _lower_plain_thresholds(s, coefuse, ctx))
+                continue
+            end
             push!(arrays, _lower_array_parameter(s.lhs, s.dims, s.rhs,
                 coefuse, ctx, syms))
+            continue
+        end
+        if !s.broadcast && _is_ordered_call(s.rhs)
+            push!(vectors, _lower_ordered(s.lhs, s.rhs, coefuse, ctx))
             continue
         end
         if !s.broadcast && _is_lkj_cholesky_call(s.rhs)
@@ -9881,6 +10041,109 @@ function _lower_dirichlet(lhs, rhs)
                "$(length(args)) arguments")
     end
     return VectorParameter(lhs, :simplex_dirichlet, (arg1 = alpha,), nothing,
+        lhs)
+end
+
+_is_ordered_call(rhs) =
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+    rhs.args[1] === :Ordered
+
+# `length(levels(g)) - k` (k a literal Int ≥ 0; bare `length(levels(g))`
+# is k = 0) → `(g, k)`, else `nothing`.
+function _levels_count(ex)
+    k = 0
+    if ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
+            ex.args[1] === :- && ex.args[3] isa Integer &&
+            !(ex.args[3] isa Bool) && ex.args[3] >= 0
+        k = Int(ex.args[3])
+        ex = ex.args[2]
+    end
+    ex isa Expr && ex.head === :call && length(ex.args) == 2 &&
+        ex.args[1] === :length && ex.args[2] isa Expr &&
+        ex.args[2].head === :call && length(ex.args[2].args) == 2 &&
+        ex.args[2].args[1] === :levels && ex.args[2].args[2] isa Symbol ||
+        return nothing
+    return (ex.args[2].args[2], k)
+end
+
+# A cutpoint vector's length: a literal `K − 1` (concrete size), or
+# `length(levels(y)) - 1` over the response `y` it serves (`nothing`: bind
+# infers K − 1 from `y`, whose level codes `validate_data` proves are
+# exactly 1..K, so the two counts agree on every bound data set). Any other
+# count fails closed.
+function _threshold_size(lhs::Symbol, n, response::Symbol)
+    n isa Integer && !(n isa Bool) && n >= 0 && return Int(n)
+    _levels_count(n) == (response, 1) && return nothing
+    _sfail("$lhs serves response $response, so its length is a literal or " *
+           "`length(levels($response)) - 1` (one cutpoint between each " *
+           "pair of adjacent levels), got $(repr(n))")
+end
+
+# `Normal(m, s)` with finite literal arguments (`Normal()` and `Normal(m)`
+# take Distributions.jl's defaults) → `(m, s)`: the iid element prior of a
+# cutpoint vector.
+function _threshold_normal_args(lhs::Symbol, d, what::String)
+    d isa Expr && d.head === :call && !isempty(d.args) &&
+        d.args[1] === :Normal && length(d.args) <= 3 &&
+        all(a -> a isa Real && !(a isa Bool) && isfinite(a), d.args[2:end]) ||
+        _sfail("$what $lhs: the element prior is `Normal(m, s)` with " *
+               "finite literal arguments (other families and parameter " *
+               "arguments are not admitted for cutpoints yet), got " *
+               "$(repr(d))")
+    m = length(d.args) >= 2 ? Float64(d.args[2]) : 0.0
+    s = length(d.args) == 3 ? Float64(d.args[3]) : 1.0
+    s > 0 || _sfail("$what $lhs: the element prior scale must be positive, " *
+                    "got $s")
+    return m, s
+end
+
+# `c ~ Ordered(Normal(m, s), n)`: n iid `Normal(m, s)` elements restricted
+# to increasing order — the `ordered_constrain` transform plus its
+# Jacobian, and the elementwise prior with no `log(n!)` normalizer (Stan's
+# `ordered[n] c; c ~ normal(m, s)`, Bijectors.jl's `ordered`). `c` is a
+# plain `Vector{Float64}` value (`c[1]`, `c[2] - c[1]`); a cumulative
+# ordinal response consumes it as its cutpoints
+# (`OrderedLogistic.(eta, Ref(c))`), which also admits the data-sized
+# length `length(levels(y)) - 1`. Unconsumed, the length is a literal.
+function _lower_ordered(lhs, rhs, coefuse, ctx)
+    haskey(coefuse, lhs) && _sfail("$lhs is a predictor coefficient and " *
+        "cannot also be an Ordered vector")
+    args = _plain_args(rhs, "`Ordered`")
+    length(args) == 2 || _sfail("parameter $lhs: `Ordered` takes the " *
+        "element distribution and the length " *
+        "(`$lhs ~ Ordered(Normal(0, 1), length(levels(y)) - 1)`), got " *
+        "$(length(args)) arguments")
+    m, s = _threshold_normal_args(lhs, args[1], "Ordered vector")
+    n = args[2]
+    use = get(ctx.threshold_uses, lhs, nothing)
+    size = if use !== nothing
+        _threshold_size(lhs, n, use.response)
+    elseif n isa Integer && !(n isa Bool) && n >= 1
+        Int(n)
+    else
+        _sfail("Ordered vector $lhs serves no ordinal response, so its " *
+               "length is a literal ≥ 1 (`$lhs ~ Ordered(Normal(0, 1), 3)`) " *
+               "— `length(levels(y)) - 1` sizes the cutpoints of the " *
+               "response `y` they serve (`y .~ OrderedLogistic.(eta, " *
+               "Ref($lhs))`), got $(repr(n))")
+    end
+    return VectorParameter(lhs, :ordered_normal, (arg1 = m, arg2 = s), size,
+        lhs)
+end
+
+# Stopping-ratio stage thresholds `c[1:n] .~ Normal.(m, s)`: one
+# unconstrained vector with an iid `Normal(m, s)` prior (the response
+# consumes it as `Ordinal.(StoppingRatio(), link, eta, Ref(c))`).
+function _lower_plain_thresholds(s, coefuse, ctx)
+    lhs = s.lhs
+    haskey(coefuse, lhs) && _sfail("$lhs is a predictor coefficient and " *
+        "cannot also be thresholds")
+    m, sc = _threshold_normal_args(lhs, _undot_distribution(lhs, s.rhs),
+        "thresholds")
+    n = only(s.dims)
+    size = n isa Int ? n : _threshold_size(lhs, n,
+        ctx.threshold_uses[lhs].response)
+    return VectorParameter(lhs, :vector_normal, (arg1 = m, arg2 = sc), size,
         lhs)
 end
 

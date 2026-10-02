@@ -44,10 +44,12 @@ _is_axis_dim(d) = d isa Expr && d.head === :call && length(d.args) == 3 &&
 
 function _validate_array_dim(p::ArrayParameter, d)
     d isa Int && d >= 1 && return nothing
-    (_is_levels_dim(d) || _is_axis_dim(d)) && return nothing
+    (_is_levels_dim(d) || _is_axis_dim(d) || _levels_count(d) !== nothing) &&
+        return nothing
     _fail(p.label, "array $(p.name) axis $(repr(d)) is not a size: axes " *
-          "are a literal `1:K` (K ≥ 1), `levels(g)`, or `axes(M, d)` / " *
-          "`size(M, d)` of a matrix `M` (d = 1 or 2)")
+          "are a literal `1:K` (K ≥ 1), `1:length(levels(g)) - k`, " *
+          "`levels(g)`, or `axes(M, d)` / `size(M, d)` of a matrix `M` " *
+          "(d = 1 or 2)")
 end
 
 # Distinct values of a `levels(g)` axis, in the `levels` order every other
@@ -64,6 +66,14 @@ end
 function _array_dim_size(plan::StructuralPlan, p::ArrayParameter, d)
     d isa Int && return d
     _is_levels_dim(d) && return length(_array_axis_levels(plan, p, d.args[2]))
+    cnt = _levels_count(d)
+    if cnt !== nothing
+        g, k = cnt
+        n = length(_array_axis_levels(plan, p, g)) - k
+        n >= 1 || _fail(p.label, "array $(p.name) axis `1:$(repr(d))` is " *
+            "empty on the bound data ($g has $(n + k) levels)")
+        return n
+    end
     fn, M, k = d.args[1], d.args[2], d.args[3]
     m = _find_matrix(plan, M)
     if m !== nothing

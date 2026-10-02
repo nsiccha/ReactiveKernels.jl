@@ -26,6 +26,9 @@ function column_variances(X)
     return var.(eachcol(X))
 end
 shifted(v; by = 1.0) = v .+ by
+as_vector(x) = collect(x)
+scaled(v, k) = v .* k
+l2norm(v) = sqrt(sum(abs2, v))
 # An RK-owned derivative rule (the optional registered rule): softplus with
 # its authored partial; Enzyme uses the generated rule.
 import ReactiveKernels
@@ -36,6 +39,24 @@ ReactiveKernels.@kernel softplus_graph(x::Float64) = begin
 end
 const softplus_rule = ReactiveKernels.scalar_derivative_rule(softplus_graph;
     primal = :y, partials = (x = :dy_dx,), name = :softplus_rule)
+# Whole-value helpers for data off the observation axis: an identity, and
+# a generic decayed-event response — observation i (group g, time t) sums
+# the earlier events (group eg, time et, amount ea) of its group.
+as_vector(x) = collect(x)
+function decayed_events(g, t, eg, et, ea, w, scale, k)
+    T = promote_type(eltype(scale), typeof(k))
+    out = Vector{T}(undef, length(t))
+    for i in eachindex(t)
+        acc = zero(T)
+        for j in eachindex(eg)
+            if eg[j] == g[i] && et[j] <= t[i]
+                acc += ea[j] * exp(-exp(k) * (t[i] - et[j]))
+            end
+        end
+        out[i] = acc * scale[g[i]] + sum(w) / length(w)
+    end
+    return out
+end
 end
 const _FV = FunctionsAsValuesModels
 
@@ -132,6 +153,23 @@ end
     err = try
         lower_rkppl(quote
                 s ~ Exponential(1.0)
+                m0 ~ Normal(0, 1)
+                t = shifted(x; by = s)
+                mu = m0 .+ x
+                y .~ Normal.(mu, t[1])
+            end, (:y, :x); mod = _FV)
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError
+    @test occursin("shifted", err.message)
+    @test occursin("broadcast", err.message)
+    # Read only inside the call, the column is a whole value and so is the
+    # result: using it as the location says so, with the same spellings.
+    err = try
+        lower_rkppl(quote
+                s ~ Exponential(1.0)
                 t = shifted(x; by = s)
                 y .~ Normal.(t, 1.0)
             end, (:y, :x); mod = _FV)
@@ -140,7 +178,7 @@ end
         e
     end
     @test err isa SurfaceLoweringError
-    @test occursin("shifted", err.message)
+    @test occursin("model-level value", err.message)
     @test occursin("broadcast", err.message)
 
     # Calling a model value is not a function call.
@@ -282,6 +320,82 @@ end
     @test _fv_value(k1, b1, :sampler, w) ≈ _fv_value(k2, b2, :sampler, w)
 end
 
+@testset "functions as values: a definition reached twice (diamond)" begin
+    # A definition read by two definitions that both inline into one
+    # location is a DAG, not a cycle. The definition walks once unwound
+    # their path with `pop!` on a `Set`, which drops an arbitrary element,
+    # so legality depended on the names' hashes. Each name below failed
+    # under that unwinding in at least one of the two shapes tested here.
+    names = (:scale, :base, :q, :tmp, :core, :mid, :alpha2)
+    y = [0.1, 0.4, -0.2, 0.3, 0.0, 0.5]
+    gx = [0.3, -0.1, 0.2, 0.7, -0.4, 0.05]
+    g = [1, 2, 3, 1, 2, 3]
+    cols = Dict{Symbol,ColumnData}(:y => y, :gx => gx, :g => g)
+    u = [0.2, -0.3, 0.5]
+    for s in names
+        r1, r2 = Symbol(s, :_1), Symbol(s, :_2)
+        _, bound, built = _fv_build(quote
+                sigma ~ Exponential(1.0)
+                a ~ Normal(0, 1)
+                k ~ Normal(0, 1)
+                $s = a .+ as_vector(gx)
+                $r1 = scaled($s, k)
+                $r2 = scaled($s, 2 * k)
+                y .~ Normal.($r1[g] .+ $r2[g], sigma)
+            end, cols)
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        sc = th.a .+ gx
+        ll = sum(logpdf(Normal(3 * th.k * sc[g[i]], th.sigma), y[i])
+            for i in eachindex(y))
+        @test _fv_value(built, bound, :likelihood, u) ≈ ll
+    end
+    # A real cycle through the shared definition still fails as one.
+    err = try
+        lower_rkppl(quote
+                sigma ~ Exponential(1.0)
+                a ~ Normal(0, 1)
+                k ~ Normal(0, 1)
+                scale = a .+ as_vector(gx) .+ sum(r2)
+                r1 = scaled(scale, k)
+                r2 = scaled(scale, 2 * k)
+                y .~ Normal.(r1[g] .+ r2[g], sigma)
+            end, (:y, :gx, :g); mod = _FV)
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError
+    @test occursin("cyclic definition", err.message)
+    # Data-only definitions reached twice stay data-only, so a module call
+    # over their observation-aligned result binds once instead of being
+    # refused as parameter-dependent.
+    x = [0.3, -0.1, 0.2, 0.5, 0.1, 0.0]
+    cols2 = Dict{Symbol,ColumnData}(:y => y, :x => x)
+    nrm = sqrt(sum(abs2, (x .+ 1.0) .* 2.0 .+ (x .+ 1.0 .+ 1.0)))
+    for s in names
+        u1, u2, v = Symbol(s, :_1), Symbol(s, :_2), Symbol(s, :_v)
+        plan = lower_rkppl(quote
+                sigma ~ Exponential(1.0)
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                $s = x .+ 1.0
+                $u1 = $s .* 2.0
+                $u2 = $s .+ 1.0
+                $v = $u1 .+ $u2
+                w = l2norm($v)
+                mu = a .+ b .* (x ./ w)
+                y .~ Normal.(mu, sigma)
+            end, (:y, :x); mod = _FV)
+        bound = bind_data(plan, cols2)
+        built = build_kernel(bound)
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        a, b = th.mu
+        ll = sum(logpdf(Normal(a + b * x[i] / nrm, th.sigma), y[i])
+            for i in eachindex(y))
+        @test _fv_value(built, bound, :likelihood, u) ≈ ll
+    end
+end
+
 @testset "functions as values: parameter-dependent gradient (Enzyme vs FD)" begin
     cols = _fv_cols()
     ast = quote
@@ -410,4 +524,205 @@ end
     sd = th.sigma * sum(vx .+ 0.5) / sqrt(sum(abs2, vx))
     @test _fv_value(built, bound, :likelihood, u) ≈
         sum(logpdf(Normal(a + b * cols[:x][i], sd), cols[:y][i]) for i in 1:n)
+end
+
+@testset "functions as values: model-level data inputs" begin
+    # A column read only as a module-call argument is a whole value: no
+    # observation axis, any length, and never the n_obs anchor.
+    cols = Dict{Symbol,ColumnData}(:y => [0.1, 0.4, -0.2, 0.3, 0.0, 0.5],
+        :g => [1, 2, 3, 1, 2, 3], :gx => [0.5, -1.0, 2.0])
+    ast = quote
+        sigma ~ Exponential(1.0)
+        b ~ Normal(0, 1)
+        gx_m = as_vector(gx)
+        v = b .* gx_m
+        y .~ Normal.(v[g], sigma)
+    end
+    plan = lower_rkppl(ast, (:y, :g, :gx); mod = _FV)
+    for order in (collect(cols), reverse(collect(cols)))
+        @test bind_data(plan, Dict{Symbol,ColumnData}(order)).n_obs == 6
+    end
+    bound = bind_data(plan, cols)
+    @test bound.columns[:gx] == [0.5, -1.0, 2.0]
+    built = build_kernel(bound)
+    for u in ([0.3, -0.2], [-1.1, 0.7])
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        ll = sum(logpdf(Normal(th.b * cols[:gx][cols[:g][i]], th.sigma),
+            cols[:y][i]) for i in 1:6)
+        @test _fv_value(built, bound, :likelihood, u) ≈ ll
+    end
+    # A gather takes the gathered column whole, too: the per-group
+    # covariate needs no call.
+    gplan = lower_rkppl(quote
+            sigma ~ Exponential(1.0)
+            b ~ Normal(0, 1)
+            y .~ Normal.(b .* gx[g], sigma)
+        end, (:y, :g, :gx); mod = _FV)
+    gbound = bind_data(gplan, cols)
+    @test gbound.n_obs == 6
+    gbuilt = build_kernel(gbound)
+    for u in ([0.3, -0.2], [-1.1, 0.7])
+        th = ReactiveKernelsPPL.constrain(gbuilt.layout, u)
+        b = only(th.y_eta)
+        ll = sum(logpdf(Normal(b * cols[:gx][cols[:g][i]], th.sigma),
+            cols[:y][i]) for i in 1:6)
+        @test _fv_value(gbuilt, gbound, :likelihood, u) ≈ ll
+    end
+    # Whole-ness follows the value, not the spelling: a definition used
+    # only whole (gathered, or passed to calls) reads its columns whole,
+    # named or inlined.
+    for body in (quote
+                sigma ~ Exponential(1.0)
+                b ~ Normal(0, 1)
+                v = b .* gx
+                y .~ Normal.(v[g], sigma)
+            end, quote
+                sigma ~ Exponential(1.0)
+                b ~ Normal(0, 1)
+                y .~ Normal.((b .* gx)[g], sigma)
+            end)
+        vbound = bind_data(lower_rkppl(body, (:y, :g, :gx); mod = _FV), cols)
+        vbuilt = build_kernel(vbound)
+        for u in ([0.3, -0.2], [-1.1, 0.7])
+            th = ReactiveKernelsPPL.constrain(vbuilt.layout, u)
+            ll = sum(logpdf(Normal(th.b * cols[:gx][cols[:g][i]], th.sigma),
+                cols[:y][i]) for i in 1:6)
+            @test _fv_value(vbuilt, vbound, :likelihood, u) ≈ ll
+        end
+    end
+    xcols = Dict{Symbol,ColumnData}(:y => cols[:y], :gx => cols[:gx],
+        :x => [0.3, -0.1, 0.2, 0.8, -0.5, 0.1])
+    kept = lower_rkppl(quote
+            b ~ Normal(0, 1)
+            sigma ~ Exponential(1.0)
+            m0 ~ Normal(0, 1)
+            sc = b .* gx
+            s_eff = sigma * exp(first(sc))
+            y .~ Normal.(m0 .+ x, s_eff)
+        end, (:y, :x, :gx); mod = _FV)
+    @test any(d -> d.name === :sc, kept.derived)   # stays a named column
+    kbound = bind_data(kept, xcols)
+    @test kbound.n_obs == 6
+    kbuilt = build_kernel(kbound)
+    for u in ([0.3, -0.2, 0.1], [-1.1, 0.7, 0.4])
+        th = ReactiveKernelsPPL.constrain(kbuilt.layout, u)
+        s_eff = th.sigma * exp(th.b * xcols[:gx][1])
+        ll = sum(logpdf(Normal(only(th.y_eta) + xcols[:x][i], s_eff),
+            xcols[:y][i]) for i in 1:6)
+        @test _fv_value(kbuilt, kbound, :likelihood, u) ≈ ll
+    end
+    # Any per-observation read keeps the column observation-aligned, so
+    # its length is checked as before.
+    mixed = lower_rkppl(quote
+            sigma ~ Exponential(1.0)
+            b ~ Normal(0, 1)
+            gx_m = as_vector(gx)
+            v = b .* gx_m
+            mu = v[g] .+ gx
+            y .~ Normal.(mu, sigma)
+        end, (:y, :g, :gx); mod = _FV)
+    @test_throws ContractValidationError bind_data(mixed, cols)
+    # So does a name any other plan slot holds (here: response weights).
+    weighted_plan = lower_rkppl(quote
+            sigma ~ Exponential(1.0)
+            b ~ Normal(0, 1)
+            gx_m = as_vector(gx)
+            v = b .* gx_m
+            y .~ weighted.(Normal.(v[g], sigma), gx)
+        end, (:y, :g, :gx); mod = _FV)
+    @test_throws ContractValidationError bind_data(weighted_plan, cols)
+end
+
+@testset "functions as values: data on several axes (Enzyme vs FD)" begin
+    # Observations (8), events (5), groups (3) and weights (4): every
+    # column off the observation axis reaches the kernel through module
+    # calls; the observation index `oi` gathers the model-level reads.
+    cols = Dict{Symbol,ColumnData}(
+        :y => [0.2, 0.9, 1.4, 0.3, 0.7, 1.1, 0.5, 0.95],
+        :oi => collect(1:8), :g => [1, 1, 1, 2, 2, 3, 3, 3],
+        :t => [0.5, 1.0, 2.0, 0.5, 1.5, 0.25, 1.0, 3.0],
+        :eg => [1, 1, 2, 3, 3], :et => [0.0, 1.0, 0.0, 0.0, 0.5],
+        :ea => [1.0, 0.5, 2.0, 1.0, 1.5],
+        :gx => [0.2, -0.4, 1.0], :w => [0.1, 0.2, -0.1, 0.4])
+    ast = quote
+        sigma ~ Exponential(1.0)
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        k ~ Normal(0, 1)
+        gm = as_vector(g)
+        tm = as_vector(t)
+        egm = as_vector(eg)
+        etm = as_vector(et)
+        eam = as_vector(ea)
+        wm = as_vector(w)
+        scale = a .+ b .* as_vector(gx)
+        reads = decayed_events(gm, tm, egm, etm, eam, wm, scale, k)
+        y .~ Normal.(reads[oi], sigma)
+    end
+    _, bound, built = _fv_build(ast, cols)
+    @test bound.n_obs == 8
+    kern = prepare_query(built, bound, :sampler)
+    # The parameter-dependent call takes the columns directly, too: each is
+    # read only as a whole value, so lowering admits the call.
+    _, dbound, dbuilt = _fv_build(quote
+            sigma ~ Exponential(1.0)
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            k ~ Normal(0, 1)
+            reads = decayed_events(g, t, eg, et, ea, w, a .+ b .* gx, k)
+            y .~ Normal.(reads[oi], sigma)
+        end, cols)
+    @test dbound.n_obs == 8
+    dkern = prepare_query(dbuilt, dbound, :sampler)
+    # A definition passed to several calls is read whole as well.
+    @test bind_data(lower_rkppl(quote
+            sigma ~ Exponential(1.0)
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            k ~ Normal(0, 1)
+            scale = a .+ b .* gx
+            r1 = decayed_events(g, t, eg, et, ea, w, scale, k)
+            r2 = decayed_events(g, t, eg, et, ea, w, scale, 2 * k)
+            y .~ Normal.(r1[oi], sigma)
+            y2 .~ Normal.(r2[oi], sigma)
+        end, (Tuple(keys(cols))..., :y2); mod = _FV),
+        merge(cols, Dict{Symbol,ColumnData}(:y2 => reverse(cols[:y])))).n_obs == 8
+    # ... unless something else reads one per observation.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            sigma ~ Exponential(1.0)
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            k ~ Normal(0, 1)
+            scale = a .+ b .* as_vector(gx)
+            reads = decayed_events(g, t, eg, et, ea, w, scale, k)
+            y .~ weighted.(Normal.(reads[oi], sigma), t)
+        end, Tuple(keys(cols)); mod = _FV)
+    # A gather by a per-observation index is observation-aligned, even of
+    # a whole column.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+            s ~ Exponential(1.0)
+            m0 ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            t2 = shifted(gx[g]; by = s)
+            mu = m0 .+ c .* g .+ t2[oi]
+            y .~ Normal.(mu, 1.0)
+        end, Tuple(keys(cols)); mod = _FV)
+    for u in ([0.3, -0.2, 0.5, 0.1], [-1.1, 0.7, -0.3, -0.4])
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        reads = _FV.decayed_events(cols[:g], cols[:t], cols[:eg], cols[:et],
+            cols[:ea], cols[:w], th.a .+ th.b .* cols[:gx], th.k)
+        ll = sum(logpdf(Normal(reads[i], th.sigma), cols[:y][i]) for i in 1:8)
+        @test _fv_value(built, bound, :likelihood, u) ≈ ll
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        v, g = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            q.ad, similar(u), u)
+        @test v ≈ Base.invokelatest(kern, u)
+        @test isapprox(g, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
+        @test Base.invokelatest(dkern, u) ≈ v
+        dq = prepare_sampler(dbuilt, dbound, u; backend = _FV_BACKEND)
+        _, dg = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            dq.ad, similar(u), u)
+        @test dg ≈ g
+    end
 end
