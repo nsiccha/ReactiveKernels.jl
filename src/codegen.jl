@@ -1787,7 +1787,7 @@ function _replicated_dependency_analysis(p::Plan, batched)
 end
 
 @inline function _replicated_validate_axes(
-        args::Tuple, ::Val{B}, ::Type{BT}) where {B,BT}
+        args::Tuple, ::Val{B}, ::Type{BT})::Int where {B,BT}
     replica_count = _replica_batch_count(getfield(args, first(B)), BT.parameters[1])
     for (position, index) in enumerate(B)
         count = _replica_batch_count(getfield(args, index), BT.parameters[position])
@@ -1803,10 +1803,24 @@ end
         arg::AbstractArray{T,N}, replica_index) where {T,N}
     copy(selectdim(arg, N, replica_index))
 end
-@inline _replicated_project(arg::NamedTuple, index) =
-    map(value -> _replicated_project(value, index), arg)
-@inline _replicated_project(arg::Tuple, index) =
-    map(value -> _replicated_project(value, index), arg)
+# Expand only the record's type-defined fields. Recursing through `map` at
+# runtime can widen nested leaf types inside a generated position residual,
+# turning the authored arithmetic loops into boxed dynamic dispatch. Array
+# lengths and the position count never participate in this structural walk.
+function _replicated_record_projection(arg, T, index, lane = nothing)
+    (T <: Union{Tuple,NamedTuple} && isconcretetype(T)) || return lane === nothing ?
+        :(_replicated_project($arg, $index)) :
+        :(_replicated_project!($lane, $arg, $index))
+    fields = Any[_replicated_record_projection(
+        :(getfield($arg, $i)), fieldtype(T, i), index,
+        lane === nothing ? nothing : :(getfield($lane, $i))) for i in 1:fieldcount(T)]
+    values = Expr(:tuple, fields...)
+    T <: NamedTuple ? :(NamedTuple{$(QuoteNode(fieldnames(T)))}($values)) : values
+end
+@inline @generated function _replicated_project(arg::T, index) where {T<:Union{Tuple,NamedTuple}}
+    isconcretetype(T) ? _replicated_record_projection(:arg, T, :index) :
+        :(map(value -> _replicated_project(value, index), arg))
+end
 
 # A batched dense numeric array port projects every position into one lane
 # buffer of the projection's own type (`Array{T,N-1}`), so the scalar residual
@@ -1851,10 +1865,14 @@ end
     count = length(lane)
     copyto!(lane, 1, arg, (index - 1) * count + 1, count)
 end
-@inline _replicated_project!(lane::Tuple, arg::Tuple, index) =
-    map((item, value) -> _replicated_project!(item, value, index), lane, arg)
-@inline _replicated_project!(lane::NamedTuple{K}, arg::NamedTuple{K}, index) where {K} =
-    map((item, value) -> _replicated_project!(item, value, index), lane, arg)
+@inline @generated function _replicated_project!(lane::Tuple, arg::T, index) where {T<:Tuple}
+    isconcretetype(T) ? _replicated_record_projection(:arg, T, :index, :lane) :
+        :(map((item, value) -> _replicated_project!(item, value, index), lane, arg))
+end
+@inline @generated function _replicated_project!(lane::NamedTuple{K}, arg::T, index) where {K,T<:NamedTuple{K}}
+    isconcretetype(T) ? _replicated_record_projection(:arg, T, :index, :lane) :
+        :(map((item, value) -> _replicated_project!(item, value, index), lane, arg))
+end
 
 # A borrowed reader's first-position scratch. Its producer checks element
 # type and shape in `_lane_reuse`, including for undeclared array WANTs.

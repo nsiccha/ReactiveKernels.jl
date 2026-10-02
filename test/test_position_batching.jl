@@ -1,6 +1,7 @@
 using Test
 using ReactiveKernels
 using LinearAlgebra
+using InteractiveUtils: code_typed
 
 struct PositionRankArray{T,A,N} <: AbstractArray{T,N}
     storage::A
@@ -216,4 +217,69 @@ end
         result::NamedTuple = (; value=position^2)
     end
     @test replica(broad_record; batched=:position)([2.0, 3.0]).value == [4.0, 9.0]
+end
+
+# Structural record depth must not erase scalar types inside the retained
+# position/scan loops. The recurrence has an independent, exact prefix oracle.
+@kernel nested_position_scan(position, xs) = begin
+    trajectory = scan(xs, Ref(position.group.response);
+                      init=position.group.response.seed, include_init=true) do previous, x, p
+        next = previous + p.rate * x
+        (next, next)
+    end
+    return trajectory
+end
+_nested_position_bytes(kernel, args...) =
+    (kernel(args...); minimum(@allocated(kernel(args...)) for _ in 1:5))
+
+@testset "nested record positions retain concrete loop arithmetic" begin
+    position = (; group=(; response=(; seed=[1.0, 2.0, 3.0], rate=[0.5, -0.5, 2.0]),
+                            unused=[4, 5, 6]), unused=[7.0, 8.0, 9.0])
+    before = deepcopy(position)
+    short, long = ones(8), ones(8192)
+    expected(xs) = hcat([position.group.response.seed[i] .+
+                        position.group.response.rate[i] .* (0:length(xs))
+                        for i in 1:3]...)
+    for reuse in (false, true)
+        batch = vectorize(nested_position_scan; batched=:position, reuse)
+        @test batch(position, short) == expected(short)
+        @test batch(position, long) == expected(long)
+        # Inspect the generated entry rather than only its wrapper.
+        argtypes = reuse ?
+            Tuple{typeof(batch.native), typeof(batch.ops), typeof(batch.caches),
+                  typeof(position), typeof(long)} :
+            Tuple{typeof(batch.native), typeof(batch.ops), typeof(position), typeof(long)}
+        @test last(only(code_typed(ReactiveKernels.RuntimeGeneratedFunctions.generated_callfunc,
+                                   argtypes))) === Matrix{Float64}
+        short_bytes = _nested_position_bytes(batch, position, short)
+        long_bytes = _nested_position_bytes(batch, position, long)
+        # Owning execution also constructs one first-position scratch lane.
+        output_growth = reuse ? 0 :
+            sizeof(expected(long)) - sizeof(expected(short)) +
+            sizeof(Float64) * (length(long) - length(short))
+        @test long_bytes - short_bytes <= output_growth + 4096
+        @test batch(position, Float64[]) == reshape(position.group.response.seed, 1, :)
+        @test position == before
+        bad = (; group=(; response=(; seed=[1.0], rate=[0.5, -0.5, 2.0]),
+                          unused=[4, 5, 6]), unused=position.unused)
+        @test_throws DimensionMismatch batch(bad, short)
+    end
+end
+
+@testset "nested tuple projection preserves layouts and dynamic fields" begin
+    @kernel nested_record_sum(position) = begin
+        result = sum(position.payload[1].values) + position.payload[2]
+    end
+    values = reshape(collect(1.0:12.0), 4, 3)
+    tree = (; payload=((; values), [1, 2, 3]))
+    expected = vec(sum(values; dims=1)) .+ [1, 2, 3]
+    broad = NamedTuple{(:payload,),Tuple{Any}}((tree.payload,))
+    for reuse in (false, true)
+        batch = vectorize(nested_record_sum; batched=:position, reuse)
+        @test batch(tree) == expected
+        @test batch(broad) == expected
+        retained = copy(batch(tree))
+        @test batch((; payload=((; values=values[:, 1:1]), [1]))) == expected[1:1]
+        @test retained == expected
+    end
 end
