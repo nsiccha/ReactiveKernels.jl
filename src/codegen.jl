@@ -470,13 +470,19 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     seqs = Any[callargs[i] for i in iterated_positions]
     xs = first(seqs)                                    # the axis-defining sequence
     arguments = Any[carry]
+    # One element of each sequence per step. The index comes from
+    # `eachindex(seqs...)`, valid for every sequence, so the read needs no
+    # bounds check (the hand loop's `@inbounds`).
+    elements = Any[]
     for i in iterated_positions
-        push!(arguments, Expr(:ref, callargs[i], index))
+        element = gensym(:scan_element)
+        push!(elements, :($element = $(_inbounds_value(:($(callargs[i])[$index])))))
+        push!(arguments, element)
     end
     for i in shared_positions
         push!(arguments, callargs[i])
     end
-    step_body = Expr(:block, _embedded_statements(
+    step_body = Expr(:block, elements..., _embedded_statements(
         step.ast, arguments, Expr(:tuple, carry, output), offset)...)
     # The step's static output type for an empty sequence: the step's argument
     # types are the carry seed, one element of each sequence and the shared
@@ -504,7 +510,8 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         push!(initial_output.args, :($lhs[2] = $output))
         push!(initial_output.args, :($position = 2))
         push!(loop_output.args, :($position += 1))
-        push!(loop_output.args, :($lhs[$position] = $output))
+        # `position` stays within the `length(indices) + 1` buffer.
+        push!(loop_output.args, _inbounds_expr(:($lhs[$position] = $output)))
         push!(empty_output.args, :($lhs = $similar_ref($xs,
             $promote_ref($typeof_ref($seed), $output_type), 1)))
         push!(empty_output.args, :($lhs[1] = $seed))
@@ -512,7 +519,8 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         push!(initial_output.args, :($lhs = $(GlobalRef(Base, :similar))(
             $xs, $typeof_ref($output))))
         push!(initial_output.args, :($lhs[$index] = $output))
-        push!(loop_output.args, :($lhs[$index] = $output))
+        # The buffer shares the sequences' axes, which `index` comes from.
+        push!(loop_output.args, _inbounds_expr(:($lhs[$index] = $output)))
         push!(empty_output.args, :($lhs = $(GlobalRef(Base, :similar))(
             $xs, $output_type)))
     end
