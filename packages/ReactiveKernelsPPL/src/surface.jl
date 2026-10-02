@@ -672,7 +672,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     caller_data = data
     value_mats = _hcat_value_reads(det, detmap, sample, data, glms,
         union(dirichlet_names, ordered_names),
-        union(plate_names, Set{Symbol}(s.state for s in scans),
+        union(plate_names, Set{Symbol}(st for s in scans for st in s.states),
             varying_names))
     value_mat_defs = Pair{Symbol,Any}[p for p in det if first(p) in value_mats]
     if !isempty(value_mats)
