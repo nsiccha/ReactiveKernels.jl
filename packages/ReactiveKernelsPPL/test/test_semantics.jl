@@ -1,7 +1,7 @@
 using CategoricalArrays
 using DataAPI
 using DifferentiationInterface: AutoEnzyme
-using Distributions: Normal, logpdf
+using Distributions: Normal, Poisson, TDist, censored, truncated, logpdf
 using Enzyme
 using ReactiveKernelsPPL
 using Test
@@ -13,7 +13,7 @@ function _semantics_check(ast, data, oracle; names = nothing)
     bound = bind_data(lower_rkppl(ast, data), data)
     built = build_kernel(bound)
     names === nothing || @test coordinate_names(built.layout) == names
-    u = collect(range(-0.2, 0.4; length = built.layout.total))
+    u = collect(range(-0.2; step = 0.15, length = built.layout.total))
     q = prepare_query(built, bound, :likelihood)
     reference(v) = oracle(constrain(built.layout, v))
     @test Base.invokelatest(q, u) ≈ reference(u) rtol = 1e-12 atol = 1e-12
@@ -34,6 +34,66 @@ function _semantics_check(ast, data, oracle; names = nothing)
     @test grad ≈ fd rtol = 2e-5 atol = 2e-7
     @test data == original
     return (; bound, built, u)
+end
+
+@testset "evidence rejects impossible response data" begin
+    x = [-1.0, 0.0, 1.0]
+    for (family, response) in ((:(Normal.(mu, 1)), [1.0, 2.0, 4.0]),
+            (:(StudentT.(3.0, mu, 1)), [1.0, 2.0, 4.0]),
+            (:(Poisson.(exp.(mu))), [1, 2, 4]))
+        for wrap in (:truncated, :censored)
+            distribution = Expr(:., wrap, Expr(:tuple, family, :lo, :hi))
+            ast = quote
+                a ~ Normal(0, 1)
+                mu = a .+ 0 .* x
+                y .~ $distribution
+            end
+            data = Dict{Symbol,Any}(:x => x, :y => response,
+                :lo => [1, 1, 1], :hi => [4, 4, 4])
+            bound = bind_data(lower_rkppl(ast, data), data)
+            @test isbound(bound) # both endpoints are admitted
+            invalid = copy(response)
+            invalid[1], invalid[3] = 0, 5
+            bad_data = merge(data, Dict(:y => invalid))
+            # refused: impossible evidence is rejected at bind (0tz0qfu,
+            # evidence prong), rather than scored as clamped/in-range data.
+            err = try
+                bind_data(lower_rkppl(ast, bad_data), bad_data)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ContractValidationError
+            message = sprint(showerror, err)
+            @test occursin("response y", message)
+            @test occursin("rows 1, 3", message)
+            # One-sided bounds check only their own side.
+            for (lo, hi, bad_y) in ((:lo, Inf, [0, 2, 4]),
+                    (-Inf, :hi, [1, 2, 5]))
+                dist = Expr(:., wrap, Expr(:tuple, family, lo, hi))
+                one = quote
+                    a ~ Normal(0, 1)
+                    mu = a .+ 0 .* x
+                    y .~ $dist
+                end
+                values = merge(data, Dict(:y => bad_y))
+                @test_throws ContractValidationError bind_data(
+                    lower_rkppl(one, values), values)
+            end
+        end
+    end
+    # In-range Gaussian evidence still agrees with Distributions, including
+    # the mass at either censored endpoint and truncation normalization.
+    for (wrap, ctor) in ((:censored, censored), (:truncated, truncated))
+        ast = quote
+            a ~ Normal(0, 1)
+            mu = a .+ 0 .* x
+            y .~ $(Expr(:., wrap, Expr(:tuple, :(Normal.(mu, 1)), 1, 4)))
+        end
+        data = Dict{Symbol,Any}(:x => x, :y => [1.0, 2.0, 4.0])
+        _semantics_check(ast, data, q ->
+            sum(logpdf.(ctor(Normal(q.a, 1), 1, 4), data[:y])))
+    end
 end
 
 @testset "Julia factor pool order and unobserved levels" begin

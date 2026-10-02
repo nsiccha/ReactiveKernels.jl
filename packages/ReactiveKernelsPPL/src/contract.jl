@@ -9259,9 +9259,16 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
             _fail(r.label, "interval evidence requires response < upper every row")
         return nothing
     end
-    (lo === nothing || hi === nothing) && return nothing
-    all(lo .< hi) ||
+    (lo === nothing || hi === nothing || all(lo .< hi)) ||
         _fail(r.label, "evidence requires strict lower < upper every row")
+    resp = _vector_column(plan.columns, r.response, r.label, "response")
+    bad = findall(eachindex(resp)) do i
+        (lo !== nothing && resp[i] < lo[i]) ||
+            (hi !== nothing && resp[i] > hi[i])
+    end
+    isempty(bad) || _fail(r.label,
+        "response $(r.response) is outside its $(ev.kind) bounds " *
+        "at rows $(join(bad, ", ")) (requires lower ≤ response ≤ upper)")
     return nothing
 end
 
