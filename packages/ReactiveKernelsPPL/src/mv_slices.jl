@@ -224,36 +224,45 @@ _ordered_slices_unconstrain(::_SliceCols, X) =
 # Simplex slices: stick-breaking along each slice, the vector
 # `simplex_constrain` per slice. `U` holds K − 1 coordinates per slice.
 # The break fractions `z` and the log stick remainders `lr` feed both the
-# value and the log-Jacobian.
-function _simplex_slices_breaks(::_SliceRows, U)
-    K = size(U, 2) + 1
-    z = 1.0 ./ (1.0 .+ exp.(-(U .+ log.(K .- (1:(K - 1)))')))
+# value and the log-Jacobian. The constant leading column of `lr` and
+# trailing column of the value are built from `U` (`0.0 .* U[:, 1:1]`),
+# never as a host array, so the transform is broadcasts and reductions
+# over `U` alone and traces under Reactant (a host column concatenated
+# with a traced one falls back to scalar indexing). `U` is finite, so the
+# column is exactly zero. A one-entry simplex (K = 1, no coordinates) is
+# the constant 1.
+_slice_zero(::_SliceRows, U) = 0.0 .* U[:, 1:1]
+_slice_zero(::_SliceCols, U) = 0.0 .* U[1:1, :]
+_slice_hcat(::_SliceRows, a, b) = hcat(a, b)
+_slice_hcat(::_SliceCols, a, b) = vcat(a, b)
+_slice_dims(::_SliceRows) = 2
+_slice_dims(::_SliceCols) = 1
+_slice_width(o, U) = size(U, _slice_dims(o))
+# The K − 1 stick-breaking offsets `log(K − j)`, laid along the slices.
+_simplex_offsets(::_SliceRows, K) = permutedims(log.(K .- (1:(K - 1))))
+_simplex_offsets(::_SliceCols, K) = log.(K .- (1:(K - 1)))
+
+function _simplex_slices_breaks(o, U)
+    K = _slice_width(o, U) + 1
+    z = 1.0 ./ (1.0 .+ exp.(-(U .+ _simplex_offsets(o, K))))
     l = log1p.(-z)
-    lr = cumsum(hcat(zeros(size(U, 1)), l); dims = 2)
+    lr = cumsum(_slice_hcat(o, _slice_zero(o, U), l); dims = _slice_dims(o))
     return z, l, lr
 end
-function _simplex_slices_breaks(::_SliceCols, U)
-    K = size(U, 1) + 1
-    z = 1.0 ./ (1.0 .+ exp.(-(U .+ log.(K .- (1:(K - 1))))))
-    l = log1p.(-z)
-    lr = cumsum(vcat(zeros(1, size(U, 2)), l); dims = 1)
-    return z, l, lr
-end
-function _simplex_slices_constrain(o::_SliceRows, U)
+_slice_ones(::_SliceRows, G) = ones(G, 1)
+_slice_ones(::_SliceCols, G) = ones(1, G)
+_simplex_lr_head(::_SliceRows, lr) = lr[:, 1:(end - 1)]
+_simplex_lr_head(::_SliceCols, lr) = lr[1:(end - 1), :]
+
+function _simplex_slices_constrain(o, U)
+    _slice_width(o, U) == 0 && return _slice_ones(o, _slice_count(o, U))
     z, _, lr = _simplex_slices_breaks(o, U)
-    return exp.(lr) .* hcat(z, ones(size(U, 1)))
+    return exp.(lr) .* _slice_hcat(o, z, 1.0 .+ _slice_zero(o, U))
 end
-function _simplex_slices_constrain(o::_SliceCols, U)
-    z, _, lr = _simplex_slices_breaks(o, U)
-    return exp.(lr) .* vcat(z, ones(1, size(U, 2)))
-end
-function _simplex_slices_logjac(o::_SliceRows, U)
+function _simplex_slices_logjac(o, U)
+    _slice_width(o, U) == 0 && return 0.0
     z, l, lr = _simplex_slices_breaks(o, U)
-    return sum(lr[:, 1:(end - 1)] .+ log.(z) .+ l)
-end
-function _simplex_slices_logjac(o::_SliceCols, U)
-    z, l, lr = _simplex_slices_breaks(o, U)
-    return sum(lr[1:(end - 1), :] .+ log.(z) .+ l)
+    return sum(_simplex_lr_head(o, lr) .+ log.(z) .+ l)
 end
 # Host inverse: per slice, the vector `simplex_unconstrain`.
 _simplex_slices_unconstrain(::_SliceRows, X) =

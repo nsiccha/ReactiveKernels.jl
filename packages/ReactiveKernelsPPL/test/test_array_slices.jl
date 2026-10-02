@@ -198,7 +198,7 @@ end
     @test all(j -> issorted(r.nt.C[:, j]), 1:3)
 end
 
-@testset "array slices: MvNormal slices refuse Reactant tracing" begin
+@testset "array slices: multivariate normal slice densities" begin
     o = ReactiveKernelsPPL._SliceRows()
     B = [0.1 0.2; 0.3 -0.4]
     F = [1.0 0.0; 0.5 0.8]
