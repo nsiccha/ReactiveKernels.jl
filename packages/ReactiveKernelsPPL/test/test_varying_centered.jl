@@ -119,7 +119,7 @@ end
 
 function _centered_plan_oracle(u,layout,columns)
     nt = constrain(layout,u)
-    a,L,tau,b = nt.mu[1],nt.L_group,nt.tau_group,nt.b_group
+    a,L,tau,b = nt.a,nt.L_group,nt.tau_group,nt.b_group
     groups = sort(unique(columns[:group]))
     means = [a+b[findfirst(==(group),groups),1]+
         b[findfirst(==(group),groups),2]*x for (group,x) in zip(columns[:group],columns[:x])]

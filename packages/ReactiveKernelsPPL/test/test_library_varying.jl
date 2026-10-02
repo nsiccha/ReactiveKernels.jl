@@ -241,7 +241,7 @@ end
     # sub-predictor in the built-in.
     m85 = merge(_lv_block_map(:r_t, :person, 1, G),
         _lv_block_map(:r_a, :item, 1, G), _lv_block_map(:r_b, :item_r_b, 1, G),
-        Dict(:b0 => Symbol("b.Intercept")))
+        Dict(:b0 => :b0))
     _lv_parity("85_composed_varying_exp", "85_composed_varying_exp_lib", m85,
         _lv_halves(3); bernoulli = true)
     _lv_parity("87_composed_correlated_slices",
@@ -273,7 +273,7 @@ _lv_lkj(L, eta) = logpdf(LKJCholesky(size(L, 1), eta),
     nt = constrain(k16.layout, u)
     x, y, g = b16.columns[:x], b16.columns[:y], b16.columns[:g]
     B = nt.r_z * (nt.r_sd .* nt.r_L)'
-    a, bx = nt.mu
+    a, bx = nt.a, nt.b
     mu = a .+ bx .* x .+ B[g, 1] .+ x .* B[g, 2]
     @test _query(k16.spec, b16, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.sigma), y))
@@ -292,12 +292,12 @@ _lv_lkj(L, eta) = logpdf(LKJCholesky(size(L, 1), eta),
     row(gcol) = [findfirst(==(v), lv) for v in gcol]
     i1, i2 = row(c[:g1]), row(c[:g2])
     wt = c[:w1] .+ c[:w2]
-    mu = only(nt.mu) .+ (c[:w1] ./ wt) .* (B[i1, 1] .+ c[:x] .* B[i1, 2]) .+
+    mu = nt.a .+ (c[:w1] ./ wt) .* (B[i1, 1] .+ c[:x] .* B[i1, 2]) .+
         (c[:w2] ./ wt) .* (B[i2, 1] .+ c[:x] .* B[i2, 2])
     @test _query(k63.spec, b63, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.sigma), c[:y]))
     @test _query(k63.spec, b63, :prior, u) ≈ logpdf(Normal(0, 5),
-        only(nt.mu)) + logpdf(Exponential(1), nt.sigma) +
+        nt.a) + logpdf(Exponential(1), nt.sigma) +
         sum(_lv_halfnormal, nt.r_sd) + _lv_lkj(nt.r_L, 1.0) +
         sum(logpdf.(Normal(0, 1), nt.r_z))
     _check_gradient(k63.spec, b63, u)
@@ -306,11 +306,11 @@ _lv_lkj(L, eta) = logpdf(LKJCholesky(size(L, 1), eta),
     u = _lv_point(k66.layout.total)
     nt = constrain(k66.layout, u)
     c = b66.columns
-    mu = only(nt.mu) .+ nt.r_sd[c[:b]] .* nt.r_z[c[:g]]
+    mu = nt.a .+ nt.r_sd[c[:b]] .* nt.r_z[c[:g]]
     @test _query(k66.spec, b66, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.sigma), c[:y]))
     @test _query(k66.spec, b66, :prior, u) ≈ logpdf(Normal(0, 5),
-        only(nt.mu)) + logpdf(Exponential(1), nt.sigma) +
+        nt.a) + logpdf(Exponential(1), nt.sigma) +
         sum(_lv_halfnormal, nt.r_sd) + sum(logpdf.(Normal(0, 1), nt.r_z))
     _check_gradient(k66.spec, b66, u)
     # Centered, one margin (corpus 72, library spelling).
@@ -318,7 +318,7 @@ _lv_lkj(L, eta) = logpdf(LKJCholesky(size(L, 1), eta),
     u = _lv_point(k72.layout.total)
     nt = constrain(k72.layout, u)
     c = b72.columns
-    mu_alpha = only(nt.mu)
+    mu_alpha = nt.mu_alpha
     mu = mu_alpha .+ nt.c_c[c[:g]]
     @test _query(k72.spec, b72, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.s), c[:y]))
@@ -362,7 +362,7 @@ end
     B = nt.z .* nt.sd'
     g = cols[:g]
     @test _query(ki.spec, bi, :likelihood, u) ≈ sum(logpdf.(Normal.(
-        only(nt.mu) .+ B[g, 1] .+ cols[:x] .* B[g, 2], nt.s), cols[:y]))
+        nt.a .+ B[g, 1] .+ cols[:x] .* B[g, 2], nt.s), cols[:y]))
     # Not built yet (todo 11e81k8): valid Julia, so these are capability
     # gaps, not refusals. A single index on the 1×L row `(z * sd)'` is a
     # linear, positional read; a module function's result has axes RKPPL
@@ -397,11 +397,11 @@ end
     gi = [findfirst(==(v), lv) for v in cols[:g]]
     F = Diagonal(nt.b_sd) * nt.b_L
     C = nt.b_c
-    mu = only(nt.mu) .+ C[gi, 1] .+ cols[:x] .* C[gi, 2]
+    mu = nt.a .+ C[gi, 1] .+ cols[:x] .* C[gi, 2]
     @test _query(kl.spec, bl, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.sigma), cols[:y]))
     @test _query(kl.spec, bl, :prior, u) ≈ logpdf(Normal(0, 5),
-        only(nt.mu)) + logpdf(Exponential(1), nt.sigma) +
+        nt.a) + logpdf(Exponential(1), nt.sigma) +
         sum(_lv_halfnormal, nt.b_sd) + _lv_lkj(nt.b_L, 1.0) +
         sum(logpdf(MvNormal(zeros(2), F * F'), C[j, :]) for j in axes(C, 1))
     _check_gradient(kl.spec, bl, u)
@@ -425,7 +425,7 @@ end
     base = constrain(kb.layout, zeros(kb.layout.total))
     # The built-in stores the centered rows as `b_flat_g` (K × G
     # column-major) and exposes `b_g` as their matrix view.
-    ub = unconstrain(kb.layout, merge(base, (mu = w.mu, sigma = w.sigma,
+    ub = unconstrain(kb.layout, merge(base, (a = w.a, sigma = w.sigma,
         tau_g = w.d_sd, L_g = w.d_L, b_flat_g = vec(permutedims(w.d_c)),
         b_g = w.d_c)))
     for port in (:likelihood, :prior, :log_jacobian)
@@ -461,12 +461,12 @@ end
     mu = map(eachindex(c[:y])) do i
         si, gi = c[:b][i], c[:g][i]
         row = (Diagonal(nt.r_sd[si, :]) * nt.r_L[:, :, si]) * nt.r_z[gi, :]
-        only(nt.mu) + row[1] + c[:x][i] * row[2]
+        nt.a + row[1] + c[:x][i] * row[2]
     end
     @test _query(k65.spec, b65, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.sigma), c[:y]))
     @test _query(k65.spec, b65, :prior, u) ≈ logpdf(Normal(0, 5),
-        only(nt.mu)) + logpdf(Exponential(1), nt.sigma) +
+        nt.a) + logpdf(Exponential(1), nt.sigma) +
         sum(_lv_halfnormal, nt.r_sd) +
         sum(_lv_lkj(nt.r_L[:, :, k], 1.0) for k in 1:2) +
         sum(logpdf.(Normal(0, 1), nt.r_z))
@@ -491,12 +491,12 @@ end
     mu3 = map(eachindex(cols3[:y])) do i
         si, gi = findfirst(==(cols3[:s][i]), sl), cols3[:g][i]
         row = (Diagonal(nt3.r_sd[si, :]) * nt3.r_L[:, :, si]) * nt3.r_z[gi, :]
-        only(nt3.mu) + row[1] + cols3[:x][i] * row[2] + row[3]
+        nt3.a + row[1] + cols3[:x][i] * row[2] + row[3]
     end
     @test _query(k3.spec, b3, :likelihood, u3) ≈
         sum(logpdf.(Normal.(mu3, nt3.sigma), cols3[:y]))
     @test _query(k3.spec, b3, :prior, u3) ≈
-        logpdf(Normal(0, 5), only(nt3.mu)) + logpdf(Exponential(1), nt3.sigma) +
+        logpdf(Normal(0, 5), nt3.a) + logpdf(Exponential(1), nt3.sigma) +
         sum(_lv_halfnormal, nt3.r_sd) +
         sum(_lv_lkj(nt3.r_L[:, :, k], 1.0) for k in axes(nt3.r_L, 3)) +
         sum(logpdf.(Normal(0, 1), nt3.r_z))

@@ -57,9 +57,9 @@ _av_node(built, bound, node, u) = _query(built.spec, bound, node, u)
             offset = kind === :vector ? nt.z[2] : nt.L[2, 1]
             array_prior = kind === :vector ? sum(logpdf.(Normal(), nt.z)) :
                 logpdf(LKJCholesky(2, 1.0), Cholesky(LowerTriangular(nt.L)))
-            prior = array_prior + logpdf(Normal(0, 5), only(nt.mu)) +
+            prior = array_prior + logpdf(Normal(0, 5), nt.a) +
                 logpdf(Exponential(1), nt.sigma)
-            likelihood = sum(logpdf.(Normal.(only(nt.mu) .+ sign * offset .+ x,
+            likelihood = sum(logpdf.(Normal.(nt.a .+ sign * offset .+ x,
                 nt.sigma), y))
             @test _av_node(built, bound, :prior, u) ≈ prior
             @test _av_node(built, bound, :likelihood, u) ≈ likelihood
@@ -116,7 +116,7 @@ end
     @test istril(L)
     @test all(i -> norm(L[i, :]) ≈ 1, 1:3)
     @test unconstrain(built.layout, nt) ≈ u
-    a = only(nt.mu)  # the intercept coefficient of `mu`
+    a = nt.a  # the declared scalar intercept
     prior = logpdf(LKJCholesky(3, 2.0), Cholesky(LowerTriangular(L))) +
         logpdf(Normal(0, 1), a) + logpdf(Exponential(1), nt.sigma)
     @test _av_node(built, bound, :prior, u) ≈ prior
@@ -145,7 +145,7 @@ end
         u = _av_point(built.layout.total)
         nt = constrain(built.layout, u)
         want = logpdf(LKJCholesky(K, eta), Cholesky(LowerTriangular(nt.L))) +
-            logpdf(Normal(0, 1), only(nt.mu)) +
+            logpdf(Normal(0, 1), nt.a) +
             logpdf(Exponential(1), nt.sigma)
         @test _av_node(built, bound, :prior, u) ≈ want
     end
@@ -177,9 +177,9 @@ end
         sum(logpdf.(truncated.(Cauchy.(0, 1), 0, Inf), nt.lambda)) +
         sum(logpdf.(Normal.(0, nt.lambda .* nt.tau), nt.w)) +
         sum(logpdf.(Normal.([0.0, 1.0, -1.0], [1.0, 2.0, 0.5]), nt.s)) +
-        logpdf(Normal(0, 1), only(nt.mu)) + logpdf(Exponential(1), nt.sigma)
+        logpdf(Normal(0, 1), nt.a) + logpdf(Exponential(1), nt.sigma)
     @test _av_node(built, bound, :prior, u) ≈ prior
-    lik = sum(logpdf.(Normal.(only(nt.mu) .+ B * nt.w .+ nt.s[2] .* x,
+    lik = sum(logpdf.(Normal.(nt.a .+ B * nt.w .+ nt.s[2] .* x,
         nt.sigma), y))
     @test _av_node(built, bound, :likelihood, u) ≈ lik
     @test _av_node(built, bound, :log_jacobian, u) ≈ logjac(built.layout, u)
@@ -207,11 +207,11 @@ end
     nt = constrain(built.layout, u)
     @test sum(nt.phi) ≈ 1 && all(>(0), nt.phi)
     prior = logpdf(Dirichlet([2.0, 1.0, 3.0]), nt.phi) +
-        logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 2), nt.b) +
         logpdf(Exponential(1), nt.sigma)
     @test _av_node(built, bound, :prior, u) ≈ prior
     w = nt.phi[1] .* x .+ nt.phi[2] .* x2 .+ nt.phi[3]
-    lik = sum(logpdf.(Normal.(nt.mu[1] .+ nt.mu[2] .* w, nt.sigma), y))
+    lik = sum(logpdf.(Normal.(nt.a .+ nt.b .* w, nt.sigma), y))
     @test _av_node(built, bound, :likelihood, u) ≈ lik
     @test _av_node(built, bound, :log_jacobian, u) ≈ logjac(built.layout, u)
     _check_gradient(built.spec, bound, u)
@@ -246,14 +246,14 @@ end
     @test M ≈ (Diagonal(nt.sd) * nt.L)'
     r = nt.tau .* nt.z[codes] .+ nt.Z[codes, :] * M[:, 1] .+
         (nt.Z[codes, :] * M[:, 2]) .* x
-    lik = sum(logpdf.(Normal.(only(nt.mu) .+ r, nt.sigma), y))
+    lik = sum(logpdf.(Normal.(nt.a .+ r, nt.sigma), y))
     @test _av_node(built, bound, :likelihood, u) ≈ lik
     prior = logpdf(truncated(Normal(0, 1), 0, Inf), nt.tau) +
         sum(logpdf.(Normal(0, 1), nt.z)) +
         logpdf(LKJCholesky(2, 2.0), Cholesky(LowerTriangular(nt.L))) +
         sum(logpdf.(truncated(Normal(0, 1), 0, Inf), nt.sd)) +
         sum(logpdf.(Normal(0, 1), nt.Z)) +
-        logpdf(Normal(0, 1), only(nt.mu)) + logpdf(Exponential(1), nt.sigma)
+        logpdf(Normal(0, 1), nt.a) + logpdf(Exponential(1), nt.sigma)
     @test _av_node(built, bound, :prior, u) ≈ prior
     @test _av_node(built, bound, :log_jacobian, u) ≈ logjac(built.layout, u)
     _check_gradient(built.spec, bound, u)
@@ -329,10 +329,10 @@ end
         for j in 1:3)
     prior = logpdf(LKJCholesky(2, 2.0), Cholesky(LowerTriangular(nt.L))) +
         sum(logpdf.(truncated(Normal(0, 1), 0, Inf), nt.sd)) + rowprior +
-        logpdf(Normal(0, 1), only(nt.mu)) + logpdf(Exponential(1), nt.sigma)
+        logpdf(Normal(0, 1), nt.a) + logpdf(Exponential(1), nt.sigma)
     @test _av_node(built, bound, :prior, u) ≈ prior
     codes = [findfirst(==(v), ["a", "b", "c"]) for v in g]
-    lik = sum(logpdf.(Normal.(only(nt.mu) .+ nt.B[codes, 1] .+
+    lik = sum(logpdf.(Normal.(nt.a .+ nt.B[codes, 1] .+
         nt.B[codes, 2] .* x, nt.sigma), y))
     @test _av_node(built, bound, :likelihood, u) ≈ lik
     @test _av_node(built, bound, :log_jacobian, u) ≈ logjac(built.layout, u)
@@ -468,7 +468,7 @@ end
     built = build_kernel(bound)
     u = _av_point(built.layout.total)
     nt = constrain(built.layout, u)
-    lik = sum(logpdf.(Normal.(only(nt.mu) .+ nt.z[k], nt.sigma), _av_y()))
+    lik = sum(logpdf.(Normal.(nt.a .+ nt.z[k], nt.sigma), _av_y()))
     @test _av_node(built, bound, :likelihood, u) ≈ lik
     _check_gradient(built.spec, bound, u)
 end

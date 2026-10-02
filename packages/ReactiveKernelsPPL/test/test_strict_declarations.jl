@@ -48,7 +48,8 @@ const _STRICT_COLS = (; y = [1.0, 2.0, 1.5, 2.5], x = [0.5, -1.0, 1.5, 0.0],
             mu = aa .+ b .* x
             y .~ Normal.(mu, 1.0)
         end, (:y, :x))
-    @test length(ok.population_priors) == 2
+    @test isempty(ok.population_priors)
+    @test Set(p.name for p in ok.parameters) == Set((:aa, :b))
 end
 
 @testset "strict declarations: undeclared matrix coefficient vector" begin

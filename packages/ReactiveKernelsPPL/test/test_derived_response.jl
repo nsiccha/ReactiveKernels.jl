@@ -37,9 +37,10 @@ end
     @test r.response === :ly
     @test r.label === :ly_resp
     @test [d.name for d in plan.derived] == [:ly]
-    @test [p.name for p in plan.parameters] == [:s]
-    fams = Dict(p.addressee => p.family for p in plan.population_priors)
-    @test fams == Dict(:Intercept => :flat, :x => :flat)
+    @test [p.name for p in plan.parameters] == [:b1, :b2, :s]
+    @test isempty(plan.population_priors)
+    fams = Dict(p.name => p.family for p in plan.parameters)
+    @test fams == Dict(:b1 => :flat, :b2 => :flat, :s => :exponential)
     # Forward order lowers identically.
     fwd = lower_rkppl(quote
             b1 ~ Flat()
@@ -102,7 +103,7 @@ end
                 mu = b1 .+ b2 .* x
                 ly .~ Normal.(mu, s)
             end,
-            "reads the sampled name s"),
+            "response ly is a predictor definition"),
         ("scalar tilde over definition",
             quote
                 ly = log.(earn)
@@ -142,7 +143,7 @@ end
     end
     @test err isa ContractValidationError
     @test occursin("drop it from bind_data", sprint(showerror, err))
-    # A scalar-definition chain into a parameter fails at bind naming it.
+    # A parameter-dependent response definition is rejected during lowering.
     perr = try
         pplan = lower_rkppl(quote
                 b1 ~ Flat()
@@ -158,8 +159,8 @@ end
     catch e
         e
     end
-    @test perr isa ContractValidationError
-    @test occursin("reads s which is not bound data", sprint(showerror, perr))
+    @test perr isa SurfaceLoweringError
+    @test occursin("response ly is a predictor definition", sprint(showerror, perr))
     # Transitive data-only chains materialize (centering included).
     cplan = lower_rkppl(quote
             b1 ~ Flat()
@@ -196,12 +197,12 @@ end
 
 @testset "derived response values vs oracles" begin
     _, _, kern, lay = _pv_query(_DR_M1, _dr_cols())
-    @test _pv_posterior(kern, lay, (mu = [0.5, -0.25], s = 1.3)) ≈
+    @test _pv_posterior(kern, lay, (b1 = 0.5, b2 = -0.25, s = 1.3)) ≈
         _dr_m1_oracle(0.5, -0.25, 1.3) rtol = 1e-12
 end
 
 @testset "derived response Enzyme gradients" begin
-    _pv_enzyme_check(_DR_M1, _dr_cols(), (mu = [0.5, -0.25], s = 1.3))
+    _pv_enzyme_check(_DR_M1, _dr_cols(), (b1 = 0.5, b2 = -0.25, s = 1.3))
 end
 
 @testset "derived response under Reactant" begin

@@ -25,6 +25,8 @@ _plans_equal(a::StructuralPlan, b::StructuralPlan) =
     all(_priors_equal.(a.population_priors, b.population_priors)) &&
     length(a.parameters) == length(b.parameters) &&
     all(_params_equal.(a.parameters, b.parameters)) &&
+    length(a.array_parameters) == length(b.array_parameters) &&
+    all(_arrays_equal.(a.array_parameters, b.array_parameters)) &&
     length(a.assignments) == length(b.assignments) &&
     all(_assigns_equal.(a.assignments, b.assignments)) &&
     length(a.derived) == length(b.derived) &&
@@ -100,6 +102,11 @@ _params_equal(a::SampledParameter, b::SampledParameter) =
     all(air -> air[1] === air[2], zip(values(a.args), values(b.args))) &&
     a.support_override === b.support_override && a.label === b.label
 
+_arrays_equal(a::ArrayParameter, b::ArrayParameter) =
+    a.name === b.name && a.family === b.family &&
+    repr(a.args) == repr(b.args) && repr(a.dims) == repr(b.dims) &&
+    a.support_override === b.support_override && a.label === b.label
+
 _assigns_equal(a::AssignmentSpec, b::AssignmentSpec) =
     a.name === b.name && repr(a.expr) == repr(b.expr) && a.label === b.label
 
@@ -109,9 +116,9 @@ _deriveds_equal(a::VectorAssignmentSpec, b::VectorAssignmentSpec) =
 _unexp(responses, predictors, priors, params = SampledParameter[],
         assigns = AssignmentSpec[],
         derived = VectorAssignmentSpec[],
-        maps = LevelMap[]) = StructuralPlan(responses,
+        maps = LevelMap[]; arrays = ArrayParameter[]) = StructuralPlan(responses,
     predictors, priors, params, assigns, Dict{Symbol,AbstractVector}(), 0;
-    derived = derived, levelmaps = maps)
+    derived = derived, levelmaps = maps, array_parameters = arrays)
 
 @testset "surface roundtrip gaussian end to end" begin
     m = @rkppl begin
@@ -129,7 +136,7 @@ _unexp(responses, predictors, priors, params = SampledParameter[],
     built = build_kernel(bound)
     u = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u)
-    ref = _ref_gaussian(bound.columns, Vector(nt.mu), nt.sigma)
+    ref = _ref_gaussian(bound.columns, [nt.a, nt.b], nt.sigma)
     @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + u[3]
     _check_gradient(built.spec, bound, u)
 end
@@ -147,7 +154,7 @@ end
     built = build_kernel(bound)
     u = [0.25, 0.5]
     nt = constrain(built.layout, u)
-    ref = _ref_bernoulli(bound.columns, Vector(nt.eta))
+    ref = _ref_bernoulli(bound.columns, [nt.a, nt.b])
     @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr
     _check_gradient(built.spec, bound, u)
 end
@@ -165,9 +172,9 @@ end
     built = build_kernel(bound)
     u = [0.1, -0.2]
     nt = constrain(built.layout, u)
-    eta = nt.eta[1] .+ nt.eta[2] .* cols[:x]
+    eta = nt.a .+ nt.b .* cols[:x]
     ll = sum(logpdf.(Poisson.(exp.(eta)), cols[:y]))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
 end
@@ -187,9 +194,9 @@ end
     built = build_kernel(bound)
     u = [0.25, 0.5]
     nt = constrain(built.layout, u)
-    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    eta = nt.a .+ nt.b .* cols[:x]
     ll = sum(logpdf.(Binomial.(cols[:n], 1 ./ (1 .+ exp.(-eta))), cols[:y]))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
     @test bound.roles[:n] === :trials
@@ -204,7 +211,7 @@ end
     bound = m(; y = cols[:y], x = cols[:x])
     built = build_kernel(bound)
     nt = constrain(built.layout, u)
-    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    eta = nt.a .+ nt.b .* cols[:x]
     ll = sum(logpdf.(Binomial.(5, 1 ./ (1 .+ exp.(-eta))), cols[:y]))
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
@@ -222,10 +229,10 @@ end
     built = build_kernel(bound)
     u3 = [0.1, -0.2, 0.3]
     nt = constrain(built.layout, u3)
-    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    mu = exp.(nt.a .+ nt.b .* cols[:x])
     ll = sum(logpdf.(NegativeBinomial.(nt.phi, nt.phi ./ (nt.phi .+ mu)),
         cols[:y]))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
         logpdf(Exponential(1), nt.phi)
     @test _query(built.spec, bound, :posterior, u3) ≈ ll + pr + u3[3]
     _check_gradient(built.spec, bound, u3)
@@ -242,9 +249,9 @@ end
     bound = m(; y = cols[:y], x = cols[:x])
     built = build_kernel(bound)
     nt = constrain(built.layout, u3)
-    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    mu = exp.(nt.a .+ nt.b .* cols[:x])
     ll = sum(logpdf.(Gamma.(nt.alpha, mu ./ nt.alpha), cols[:y]))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
         logpdf(Exponential(1), nt.alpha)
     @test _query(built.spec, bound, :posterior, u3) ≈ ll + pr + u3[3]
     _check_gradient(built.spec, bound, u3)
@@ -264,9 +271,9 @@ end
     built = build_kernel(bound)
     u = [0.25, 0.5]
     nt = constrain(built.layout, u)
-    eta = nt.eta[1] .+ nt.eta[2] .* cols[:x]
+    eta = nt.a .+ nt.b .* cols[:x]
     ll = sum(logpdf.(Bernoulli.(cdf.(Ref(Normal()), eta)), yb))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
     # Bernoulli cloglog.
@@ -279,9 +286,9 @@ end
     bound = m(; y = yb, x = cols[:x])
     built = build_kernel(bound)
     nt = constrain(built.layout, u)
-    eta = nt.eta[1] .+ nt.eta[2] .* cols[:x]
+    eta = nt.a .+ nt.b .* cols[:x]
     ll = sum(logpdf.(Bernoulli.(1 .- exp.(-exp.(eta))), yb))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
     # Binomial probit, column trials.
@@ -296,9 +303,9 @@ end
     bound = m(; y = cols[:y], x = cols[:x], n = cols[:n])
     built = build_kernel(bound)
     nt = constrain(built.layout, u)
-    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    eta = nt.a .+ nt.b .* cols[:x]
     ll = sum(logpdf.(Binomial.(cols[:n], cdf.(Ref(Normal()), eta)), cols[:y]))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
     # Binomial cloglog, literal trials.
@@ -311,7 +318,7 @@ end
     bound = m(; y = cols[:y], x = cols[:x])
     built = build_kernel(bound)
     nt = constrain(built.layout, u)
-    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    eta = nt.a .+ nt.b .* cols[:x]
     ll = sum(logpdf.(Binomial.(5, 1 .- exp.(-exp.(eta))), cols[:y]))
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
@@ -328,10 +335,10 @@ end
     built = build_kernel(bound)
     u3 = [0.1, -0.2, 0.3]
     nt = constrain(built.layout, u3)
-    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    eta = nt.a .+ nt.b .* cols[:x]
     mloc = 1 ./ (1 .+ exp.(-eta))
     ll = sum(logpdf.(Beta.(mloc .* nt.kappa, (1 .- mloc) .* nt.kappa), cols[:p]))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
         logpdf(Gamma(2.0, 1000.0), nt.kappa)
     @test _query(built.spec, bound, :posterior, u3) ≈ ll + pr + u3[3]
     _check_gradient(built.spec, bound, u3)
@@ -364,7 +371,7 @@ end
     built = build_kernel(bound)
     u4 = [0.1, -0.2, 0.3, 0.5]
     nt = constrain(built.layout, u4)
-    ref = _ref_student(bound.columns, Vector(nt.mu), nt.sigma, nt.nu)
+    ref = _ref_student(bound.columns, [nt.a, nt.b], nt.sigma, nt.nu)
     @test _query(built.spec, bound, :posterior, u4) ≈ ref.ll + ref.pr + u4[3] + u4[4]
     _check_gradient(built.spec, bound, u4)
     # Literal nu and sigma.
@@ -385,10 +392,10 @@ end
     built = build_kernel(bound)
     u = [0.1, -0.2]
     nt = constrain(built.layout, u)
-    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    mu = nt.a .+ nt.b .* cols[:x]
     ll = sum(logpdf(LocationScale(mm, 2.0, TDist(4.0)), yy)
         for (mm, yy) in zip(mu, cols[:y]))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
 end
@@ -481,9 +488,9 @@ _hurdle_logpdf(y::Integer, lam::Real, p0::Real) =
     built = build_kernel(bound)
     u = [0.5, -0.25]
     nt = constrain(built.layout, u)
-    lam = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    lam = exp.(nt.a .+ nt.b .* cols[:x])
     ll = sum(_hurdle_logpdf(y, l, 0.35) for (y, l) in zip(cols[:y], lam))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
     # Predictor-fed p_zero under `logistic.` (the hu submodel).
@@ -511,11 +518,11 @@ _hurdle_logpdf(y::Integer, lam::Real, p0::Real) =
     built = build_kernel(bound)
     u4 = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u4)
-    lam = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
-    p0 = 1 ./ (1 .+ exp.(-(nt.hu[1] .+ nt.hu[2] .* cols[:x])))
+    lam = exp.(nt.a .+ nt.b .* cols[:x])
+    p0 = 1 ./ (1 .+ exp.(-(nt.c .+ nt.d .* cols[:x])))
     ll = sum(_hurdle_logpdf(y, l, p) for (y, l, p) in zip(cols[:y], lam, p0))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
-        logpdf(Normal(0, 1), nt.hu[1]) + logpdf(Normal(0, 1), nt.hu[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
+        logpdf(Normal(0, 1), nt.c) + logpdf(Normal(0, 1), nt.d)
     @test _query(built.spec, bound, :posterior, u4) ≈ ll + pr
     _check_gradient(built.spec, bound, u4)
 end
@@ -586,10 +593,10 @@ end
     built = build_kernel(bound)
     u = [0.5, -0.25]
     nt = constrain(built.layout, u)
-    rr = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    rr = exp.(nt.a .+ nt.b .* cols[:x])
     ll = sum(logpdf(NegativeBinomial(v, 0.4), y)
         for (y, v) in zip(cols[:y], rr))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
     # Beta-sampled p.
@@ -612,10 +619,10 @@ end
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 0.3]
     nt = constrain(built.layout, u3)
-    rr = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    rr = exp.(nt.a .+ nt.b .* cols[:x])
     ll = sum(logpdf(NegativeBinomial(v, nt.p), y)
         for (y, v) in zip(cols[:y], rr))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
         logpdf(Beta(2.0, 2.0), nt.p)
     # Unit-transform Jacobian, explicit (the zip `_zi_unit_jac` precedent).
     lj = log(nt.p) + log1p(-nt.p)
@@ -712,7 +719,7 @@ end
     built = build_kernel(bound)
     u3 = [0.1, -0.2, 0.3]
     nt = constrain(built.layout, u3)
-    ref = _ref_zip(bound.columns, Vector(nt.eta), nt.zi)
+    ref = _ref_zip(bound.columns, [nt.a, nt.b], nt.zi)
     @test _query(built.spec, bound, :posterior, u3) ≈
         ref.ll + ref.pr + _zi_unit_jac(nt.zi)
     _check_gradient(built.spec, bound, u3)
@@ -734,13 +741,13 @@ end
     built = build_kernel(bound)
     u = [0.1, -0.2]
     nt = constrain(built.layout, u)
-    eta = nt.eta[1] .+ nt.eta[2] .* cols[:x]
+    eta = nt.a .+ nt.b .* cols[:x]
     ll = sum(zip(eta, cols[:y])) do (e, yy)
         pp = logpdf(Poisson(exp(e)), yy)
         yy == 0 ? _zi_logaddexp(log(0.25), log1p(-0.25) + pp) :
             log1p(-0.25) + pp
     end
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
 end
@@ -868,9 +875,9 @@ _ig_logpdf(y::Real, mu::Real, lam::Real) = logpdf(InverseGaussian(mu, lam), y)
     built = build_kernel(bound)
     u = [0.5, -0.25]
     nt = constrain(built.layout, u)
-    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    mu = exp.(nt.a .+ nt.b .* cols[:x])
     ll = sum(_ig_logpdf(y, m, 1.5) for (y, m) in zip(cols[:y], mu))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
     # LogNormal-sampled lambda.
@@ -889,20 +896,20 @@ _ig_logpdf(y::Real, mu::Real, lam::Real) = logpdf(InverseGaussian(mu, lam), y)
         y .~ InverseGaussian.(exp.(eta), lam)
     end, (:y, :x)).responses)
     @test (r.family, r.scale) === (InverseGaussianFam, :lam)
-    @test only(lower_rkppl(quote
+    @test only(p for p in lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         lam ~ LogNormal(-0.3, 1.0)
         eta = a .+ b .* x
         y .~ InverseGaussian.(exp.(eta), lam)
-    end, (:y, :x)).parameters).family === :lognormal
+    end, (:y, :x)).parameters if p.name === :lam).family === :lognormal
     bound = m(; y = cols[:y], x = cols[:x])
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u3)
-    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    mu = exp.(nt.a .+ nt.b .* cols[:x])
     ll = sum(_ig_logpdf(y, m, nt.lam) for (y, m) in zip(cols[:y], mu))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
         logpdf(LogNormal(-0.3, 1.0), nt.lam)
     @test _query(built.spec, bound, :posterior, u3) ≈
         ll + pr + logjac(built.layout, u3)
@@ -935,9 +942,9 @@ _weibull_logpdf(y::Real, k::Real, th::Real) = logpdf(Weibull(k, th), y)
     built = build_kernel(bound)
     u = [0.5, -0.25]
     nt = constrain(built.layout, u)
-    th = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    th = exp.(nt.a .+ nt.b .* cols[:x])
     ll = sum(_weibull_logpdf(y, 2.0, t) for (y, t) in zip(cols[:y], th))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
     # LogNormal-sampled k.
@@ -956,20 +963,20 @@ _weibull_logpdf(y::Real, k::Real, th::Real) = logpdf(Weibull(k, th), y)
         y .~ Weibull.(k, exp.(eta))
     end, (:y, :x)).responses)
     @test (r.family, r.scale) === (WeibullFam, :k)
-    @test only(lower_rkppl(quote
+    @test only(p for p in lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         k ~ LogNormal(0.0, 0.3)
         eta = a .+ b .* x
         y .~ Weibull.(k, exp.(eta))
-    end, (:y, :x)).parameters).family === :lognormal
+    end, (:y, :x)).parameters if p.name === :k).family === :lognormal
     bound = m(; y = cols[:y], x = cols[:x])
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u3)
-    th = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    th = exp.(nt.a .+ nt.b .* cols[:x])
     ll = sum(_weibull_logpdf(y, nt.k, t) for (y, t) in zip(cols[:y], th))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
         logpdf(LogNormal(0.0, 0.3), nt.k)
     @test _query(built.spec, bound, :posterior, u3) ≈
         ll + pr + logjac(built.layout, u3)
@@ -1005,10 +1012,10 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
     built = build_kernel(bound)
     u = [0.5, -0.25]
     nt = constrain(built.layout, u)
-    mu = 1 ./ (1 .+ exp.(.-(nt.mu[1] .+ nt.mu[2] .* cols[:x])))
+    mu = 1 ./ (1 .+ exp.(.-(nt.a .+ nt.b .* cols[:x])))
     ll = sum(_betabinomial2_logpdf(y, t, mm, 4.0)
         for (y, t, mm) in zip(cols[:c], cols[:n], mu))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
     # Gamma-sampled phi.
@@ -1031,10 +1038,10 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 1.0]
     nt = constrain(built.layout, u3)
-    mu = 1 ./ (1 .+ exp.(.-(nt.mu[1] .+ nt.mu[2] .* cols[:x])))
+    mu = 1 ./ (1 .+ exp.(.-(nt.a .+ nt.b .* cols[:x])))
     ll = sum(_betabinomial2_logpdf(y, t, mm, nt.phi)
         for (y, t, mm) in zip(cols[:c], cols[:n], mu))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
         logpdf(Gamma(2.0, 0.1), nt.phi)
     @test _query(built.spec, bound, :posterior, u3) ≈
         ll + pr + logjac(built.layout, u3)
@@ -1064,12 +1071,12 @@ _betabinomial2_logpdf(y::Integer, n::Integer, mu::Real, phi::Real) =
     built = build_kernel(bound)
     u4 = [0.5, -0.25, 0.1, 0.2]
     nt = constrain(built.layout, u4)
-    mu = 1 ./ (1 .+ exp.(.-(nt.mu[1] .+ nt.mu[2] .* cols[:x])))
-    phi = exp.(nt.hup[1] .+ nt.hup[2] .* cols[:x])
+    mu = 1 ./ (1 .+ exp.(.-(nt.a .+ nt.b .* cols[:x])))
+    phi = exp.(nt.e .+ nt.f .* cols[:x])
     ll = sum(_betabinomial2_logpdf(y, t, mm, p)
         for (y, t, mm, p) in zip(cols[:c], cols[:n], mu, phi))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
-        logpdf(Normal(0, 1), nt.hup[1]) + logpdf(Normal(0, 1), nt.hup[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
+        logpdf(Normal(0, 1), nt.e) + logpdf(Normal(0, 1), nt.f)
     @test _query(built.spec, bound, :posterior, u4) ≈ ll + pr
     _check_gradient(built.spec, bound, u4)
 end
@@ -1107,9 +1114,9 @@ end
     built = build_kernel(bound)
     u = [0.5, -0.25]
     nt = constrain(built.layout, u)
-    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    mu = nt.a .+ nt.b .* cols[:x]
     ll = sum(_vm_logpdf(y, mm, 1.7) for (y, mm) in zip(cols[:y], mu))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
     # Gamma-sampled kappa, circular head.
@@ -1129,21 +1136,21 @@ end
     end, (:y, :x)).responses)
     @test (r.family, r.scale, r.interval) ===
         (VonMisesFam, :kappa, (-Float64(pi), Float64(pi)))
-    @test only(lower_rkppl(quote
+    @test only(p for p in lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         kappa ~ Gamma(2.0, 0.1)
         mu = a .+ b .* x
         y .~ CircularVonMises.(mu, kappa, -pi, pi)
-    end, (:y, :x)).parameters).family === :gamma
+    end, (:y, :x)).parameters if p.name === :kappa).family === :gamma
     bound = m(; y = cols[:y], x = cols[:x])
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 1.0]
     nt = constrain(built.layout, u3)
-    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    mu = nt.a .+ nt.b .* cols[:x]
     ll = sum(_vm_circ_logpdf(y, mm, nt.kappa, -Float64(pi), Float64(pi))
         for (y, mm) in zip(cols[:y], mu))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
         logpdf(Gamma(2.0, 0.1), nt.kappa)
     @test _query(built.spec, bound, :posterior, u3) ≈
         ll + pr + logjac(built.layout, u3)
@@ -1185,9 +1192,9 @@ end
     built = build_kernel(bound)
     u = [0.5, -0.25]
     nt = constrain(built.layout, u)
-    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    mu = exp.(nt.a .+ nt.b .* cols[:x])
     ll = sum(logpdf(Exponential(m), y) for (y, m) in zip(cols[:y], mu))
-    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
 end
@@ -1219,9 +1226,9 @@ _ln_logpdf(y::Real, mu::Real, sig::Real) = logpdf(LogNormal(mu, sig), y)
     built = build_kernel(bound)
     u = [0.5, -0.25]
     nt = constrain(built.layout, u)
-    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    mu = nt.a .+ nt.b .* cols[:x]
     ll = sum(_ln_logpdf(y, mm, 0.5) for (y, mm) in zip(cols[:y], mu))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, bound, u)
     # Exponential-sampled sigma.
@@ -1240,20 +1247,20 @@ _ln_logpdf(y::Real, mu::Real, sig::Real) = logpdf(LogNormal(mu, sig), y)
         y .~ LogNormal.(mu, sigma)
     end, (:y, :x)).responses)
     @test (r.family, r.scale) === (LogNormalFam, :sigma)
-    @test only(lower_rkppl(quote
+    @test only(p for p in lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         sigma ~ Exponential(1)
         mu = a .+ b .* x
         y .~ LogNormal.(mu, sigma)
-    end, (:y, :x)).parameters).family === :exponential
+    end, (:y, :x)).parameters if p.name === :sigma).family === :exponential
     bound = m(; y = cols[:y], x = cols[:x])
     built = build_kernel(bound)
     u3 = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u3)
-    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    mu = nt.a .+ nt.b .* cols[:x]
     ll = sum(_ln_logpdf(y, mm, nt.sigma) for (y, mm) in zip(cols[:y], mu))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
         logpdf(Exponential(1), nt.sigma)
     @test _query(built.spec, bound, :posterior, u3) ≈
         ll + pr + logjac(built.layout, u3)
@@ -1610,7 +1617,7 @@ end
 end
 
 @testset "surface plan equality" begin
-    # Bernoulli: stated intercept prior, defaulted slope prior.
+    # Bernoulli: both scalar declarations own their priors.
     got = lower_rkppl(quote
         b ~ Normal(0, 1)
         a ~ Normal(0, 5)
@@ -1621,12 +1628,14 @@ end
         LikelihoodSpec[LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta,
             nothing, nothing, _none_evidence(), :y_resp)],
         PredictorSpec[PredictorSpec(:eta, IdentityLink,
-            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+            TermSpec[TermSpec(InterceptTerm, ColumnRef[], (parameter=:a, sign=1),
                     :Intercept, :intercept),
-                TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)],
+                TermSpec(ContinuousTerm, [:x], (parameter=:b, sign=1), :x, :x_term)],
             :eta)],
-        PopulationPrior[PopulationPrior(:eta, :Intercept, 0.0, 5.0),
-            PopulationPrior(:eta, :x, 0.0, 1.0)])
+        PopulationPrior[],
+        SampledParameter[SampledParameter(:b, :normal, (arg1=0, arg2=1), nothing, :b),
+            SampledParameter(:a, :normal,
+            (arg1=0, arg2=5), nothing, :a)])
     @test _plans_equal(got, want)
     # Factor (full-rank, no intercept) + offset + literal scale.
     got = lower_rkppl(quote
@@ -1638,12 +1647,14 @@ end
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, 1.5,
             nothing, _none_evidence(), :y_resp)],
         PredictorSpec[PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term),
+            TermSpec[TermSpec(FactorTerm, [:g], (parameter=:c, sign=1), :g, :g_term),
                 TermSpec(OffsetTerm, [:o], NamedTuple(), :o, :o_off)],
             :mu)],
-        PopulationPrior[PopulationPrior(:mu, :g, 0.0, 2.0)],
+        PopulationPrior[],
         SampledParameter[], AssignmentSpec[], VectorAssignmentSpec[],
-        LevelMap[LevelMap(:mu, :g, [], :levels, Colon())])
+        LevelMap[LevelMap(:mu, :g, [], :levels, Colon())];
+        arrays = [ArrayParameter(:c, :normal, (arg1=0, arg2=2),
+            Any[:(levels(g))], nothing)])
     @test _plans_equal(got, want)
     # Weighted response (object-first HOF, Distributions.jl argument order).
     got = lower_rkppl(quote
@@ -1657,13 +1668,14 @@ end
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s,
             :w, _none_evidence(), :y_resp)],
         PredictorSpec[PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+            TermSpec[TermSpec(InterceptTerm, ColumnRef[], (parameter=:a, sign=1),
                     :Intercept, :intercept),
-                TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)],
+                TermSpec(ContinuousTerm, [:x], (parameter=:b, sign=1), :x, :x_term)],
             :mu)],
-        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :x, 0.0, 1.0)],
-        SampledParameter[SampledParameter(:s, :exponential, (arg1 = 1,),
+        PopulationPrior[],
+        SampledParameter[SampledParameter(:a, :normal, (arg1=0, arg2=1), nothing, :a),
+            SampledParameter(:b, :normal, (arg1=0, arg2=1), nothing, :b),
+            SampledParameter(:s, :exponential, (arg1 = 1,),
             nothing, :s)])
     @test _plans_equal(got, want)
     # Truncated (object form, literal bounds) and censored (column bounds).
@@ -1678,13 +1690,14 @@ end
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s,
             nothing, ResponseEvidence(:truncated, 0, 10), :y_resp)],
         PredictorSpec[PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+            TermSpec[TermSpec(InterceptTerm, ColumnRef[], (parameter=:a, sign=1),
                     :Intercept, :intercept),
-                TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)],
+                TermSpec(ContinuousTerm, [:x], (parameter=:b, sign=1), :x, :x_term)],
             :mu)],
-        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :x, 0.0, 1.0)],
-        SampledParameter[SampledParameter(:s, :exponential, (arg1 = 1,),
+        PopulationPrior[],
+        SampledParameter[SampledParameter(:a, :normal, (arg1=0, arg2=1), nothing, :a),
+            SampledParameter(:b, :normal, (arg1=0, arg2=1), nothing, :b),
+            SampledParameter(:s, :exponential, (arg1 = 1,),
             nothing, :s)])
     @test _plans_equal(got, want)
     got = lower_rkppl(quote
@@ -1799,13 +1812,14 @@ end
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s2,
             nothing, _none_evidence(), :y_resp)],
         PredictorSpec[PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+            TermSpec[TermSpec(InterceptTerm, ColumnRef[], (parameter = :a, sign = 1),
                     :Intercept, :intercept),
-                TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)],
+                TermSpec(ContinuousTerm, [:x], (parameter = :b, sign = 1), :x, :x_term)],
             :mu)],
-        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :x, 0.0, 1.0)],
-        SampledParameter[SampledParameter(:m, :normal, (arg1 = 0, arg2 = 1),
+        PopulationPrior[],
+        SampledParameter[SampledParameter(:a, :normal, (arg1 = 0, arg2 = 1), nothing, :a),
+            SampledParameter(:b, :normal, (arg1 = 0, arg2 = 1), nothing, :b),
+            SampledParameter(:m, :normal, (arg1 = 0, arg2 = 1),
                 nothing, :m),
             SampledParameter(:s, :exponential, (arg1 = :m,), nothing, :s),
             SampledParameter(:t, :flat, NamedTuple(), nothing, :t),
@@ -1817,7 +1831,7 @@ end
             AssignmentSpec(:s2, :s, :s2),
             AssignmentSpec(:k, 2, :k)])
     @test _plans_equal(got, want)
-    # Inline predictor, negated slope (sign folds into the prior location).
+    # Inline predictor: sign belongs to the read, not the declared prior.
     got = lower_rkppl(quote
         a ~ Normal(1, 2)
         b ~ Normal(3, 4)
@@ -1827,9 +1841,11 @@ end
     @test length(got.predictors) == 1
     @test got.predictors[1].name === :y_eta
     @test got.responses[1].predictor === :y_eta
-    @test got.population_priors ==
-        PopulationPrior[PopulationPrior(:y_eta, :Intercept, 1.0, 2.0),
-            PopulationPrior(:y_eta, :x, -3.0, 4.0)]
+    @test isempty(got.population_priors)
+    @test [p.args for p in got.parameters] ==
+        [(arg1=1, arg2=2), (arg1=3, arg2=4), (arg1=1,)]
+    @test [t.options for t in only(got.predictors).terms] ==
+        [(parameter=:a, sign=1), (parameter=:b, sign=-1)]
     # Shared predictor across two responses lowers once.
     got = lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -1966,11 +1982,11 @@ end
     built = build_kernel(bound)
     u = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u)
-    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    mu = nt.a .+ nt.b .* cols[:x]
     si = nt.s
     base = sum(logpdf.(Normal.(mu, si), cols[:y]))
     corr = sum(log.(cdf.(Normal.(mu, si), 4.0)))
-    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+    pr = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 2), nt.b) +
         logpdf(Exponential(1), si)
     @test _query(built.spec, bound, :posterior, u) ≈ base - corr + pr + u[3]
     _check_gradient(built.spec, bound, u)
@@ -1993,11 +2009,11 @@ end
     end, (:y, :x, :g))
     @test length(got.levelmaps) == 1 &&
         _maps_equal(got.levelmaps[1], LevelMap(:mu, :g, [], :levels, (2, :end)))
-    @test got.population_priors ==
-        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :g, 0.0, 2.0)]
+    @test isempty(got.population_priors)
+    @test only(got.parameters).name === :a
+    @test only(got.array_parameters).name === :c
     # Intercept + full cover: the identifiability gate.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    @test_throws ContractValidationError lower_rkppl(quote
         a ~ Normal(0, 1)
         c[levels(g)] .~ Normal.(0, 2)
         mu = a .+ c[g]
@@ -2012,8 +2028,8 @@ end
         @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g))
     end
     # Levels column must match the use column; levels() takes one data column.
-    for lhs in (:(c[levels(h)]), :(c[unique(g)]), :(c[sort(g)]),
-            :(c[levels()]), :(c[levels(g, 1)]), :(c[levels(x)]),
+    for lhs in (:(c[unique(g)]), :(c[sort(g)]),
+            :(c[levels()]), :(c[levels(g, 1)]),
             :(c[f(g)]), :(y[levels(g)]))
         block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
@@ -2050,10 +2066,12 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(c[levels(g)]), :(Normal(0, 2))),
         :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
-    # Non-literal broadcast args are not per-level priors.
-    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+    # An unresolved argument is validated when preparation binds data.
+    pending = lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(m, 2))),
         :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    @test_throws ContractValidationError bind_data(pending,
+        Dict(:y => [1.0, 2.0], :g => [1, 2]))
     # Levels prior on a non-factor coefficient.
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(a[levels(g)]), :(Normal.(0, 1))),
@@ -2067,7 +2085,7 @@ end
         :(mu = c[g]),
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
         :(y .~ Normal.(mu, 1.5))), (:y, :g))
-    @test only(zplan.array_parameters).name === :z
+    @test Set(p.name for p in zplan.array_parameters) == Set((:z, :c))
     # A bound levels-subset is plain metadata: it reuses the inline grammar
     # and is admitted by `=`, not by `~`.
     got = lower_rkppl(quote
@@ -2142,12 +2160,12 @@ end
     built = build_kernel(bound)
     u = [0.2, -0.1, 0.3, 0.0]
     nt = constrain(built.layout, u)
-    mu = Vector(nt.mu)[cols[:g]]
+    mu = Vector(nt.c)[cols[:g]]
     si = nt.s
     ll = sum(logpdf.(Normal.(mu, si), cols[:y]))
-    pr = sum(logpdf.(Normal(0, 2), Vector(nt.mu))) +
+    pr = sum(logpdf.(Normal(0, 2), Vector(nt.c))) +
         logpdf(Exponential(1), si)
-    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[4]
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
     _check_gradient(built.spec, bound, u)
     # Subset + intercept: reference rows ride the intercept.
     m2 = @rkppl begin
@@ -2162,14 +2180,14 @@ end
     built2 = build_kernel(bound2)
     u2 = [0.5, 0.2, -0.1, 0.0]
     nt2 = constrain(built2.layout, u2)
-    coef = Dict(1 => 0.0, 2 => nt2.mu[2], 3 => nt2.mu[3])
-    mu2 = [nt2.mu[1] + coef[g] for g in cols[:g]]
+    coef = Dict(1 => 0.0, 2 => nt2.c[1], 3 => nt2.c[2])
+    mu2 = [nt2.a + coef[g] for g in cols[:g]]
     si2 = nt2.s
     ll2 = sum(logpdf.(Normal.(mu2, si2), cols[:y]))
-    pr2 = logpdf(Normal(0, 1), nt2.mu[1]) +
-        sum(logpdf.(Normal(0, 2), Vector(nt2.mu)[2:3])) +
+    pr2 = logpdf(Normal(0, 1), nt2.a) +
+        sum(logpdf.(Normal(0, 2), Vector(nt2.c))) +
         logpdf(Exponential(1), si2)
-    @test _query(built2.spec, bound2, :posterior, u2) ≈ ll2 + pr2 + u2[4]
+    @test _query(built2.spec, bound2, :posterior, u2) ≈ ll2 + pr2 + logjac(built2.layout, u2)
     _check_gradient(built2.spec, bound2, u2)
 end
 
@@ -2188,14 +2206,15 @@ end
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s,
             nothing, _none_evidence(), :y_resp)],
         PredictorSpec[PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+            TermSpec[TermSpec(InterceptTerm, ColumnRef[], (parameter=:a, sign=1),
                     :Intercept, :intercept),
-                TermSpec(ContinuousTerm, [:z], NamedTuple(), :z, :z_term),
+                TermSpec(ContinuousTerm, [:z], (parameter=:b, sign=1), :z, :z_term),
                 TermSpec(OffsetTerm, [:lx], NamedTuple(), :lx, :lx_off)],
             :mu)],
-        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :z, 0.0, 2.0)],
-        SampledParameter[SampledParameter(:s, :exponential, (arg1 = 1,),
+        PopulationPrior[],
+        SampledParameter[SampledParameter(:a, :normal, (arg1=0, arg2=1), nothing, :a),
+            SampledParameter(:b, :normal, (arg1=0, arg2=2), nothing, :b),
+            SampledParameter(:s, :exponential, (arg1 = 1,),
             nothing, :s)],
         AssignmentSpec[],
         VectorAssignmentSpec[VectorAssignmentSpec(:lx, :(log.(e)), :lx),
@@ -2324,7 +2343,7 @@ end
     @test got.derived[1].name === :_rkppl_synth_1
     @test repr(got.derived[1].expr) == repr(:(x .* z))
     @test _terms_equal(got.predictors[1].terms[2],
-        TermSpec(ContinuousTerm, [:_rkppl_synth_1], NamedTuple(),
+        TermSpec(ContinuousTerm, [:_rkppl_synth_1], (parameter = :b, sign = 1),
             :_rkppl_synth_1, :_rkppl_synth_1_term))
     named = lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -2344,7 +2363,7 @@ end
     @test repr(got.derived[1].expr) ==
         repr(Expr(:call, :.-, :(log.(x))))
     @test got.predictors[1].terms[2].kind === OffsetTerm
-    # Non-coefficient parameters stay addressable inside derived locals.
+    # Affine scalar reads retain their ordinary declarations.
     got = lower_rkppl(quote
         a ~ Normal(0, 1)
         s ~ Exponential(1)
@@ -2352,10 +2371,13 @@ end
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
     end, (:y, :x))
-    @test _terms_equal(got.predictors[1].terms[2],
-        TermSpec(OffsetTerm, [:w], NamedTuple(), :w, :w_off))
-    @test length(got.derived) == 1 && got.derived[1].name === :w
-    @test length(got.parameters) == 1 && got.parameters[1].name === :s
+    w = only(p for p in got.predictors if p.name === :w)
+    mu = only(p for p in got.predictors if p.name === :mu)
+    @test w.terms[1].options.parameter === :s
+    @test w.terms[2].kind === OffsetTerm
+    @test only(mu.terms).kind === ComposedTerm
+    @test only(mu.terms).options.subs == [:w]
+    @test [p.name for p in got.parameters] == [:a, :s]
 end
 
 @testset "surface error paths" begin
@@ -2517,8 +2539,7 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, Dn)
-    @test any(p -> p.addressee === :x && p.location === :m,
-        hyp.population_priors)
+    @test any(p -> p.name === :b && p.args.arg1 === :m, hyp.parameters)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu1 = a .+ b .* x
         mu2 = a .+ c .* x
@@ -2536,20 +2557,23 @@ end
     end, Dn)
     @test any(p -> p.name === :b, expb.parameters)
     @test only(p for p in expb.parameters if p.name === :s).args.arg1 === :b
-    # Scalar structure that cannot identify: stray Normal names inline to
-    # a second intercept (degenerate), bare scalar parameters and staged
-    # reductions in predictors have no term slot.
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # Explicit scalar declarations remain valid through affine reads.
+    admitted = lower_rkppl(quote
+        a ~ Normal(0, 1)
         m ~ Normal(0, 1)
         w = m .+ x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
     end, Dn)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    @test Set(p.name for p in admitted.parameters) == Set((:a, :m))
+    admitted = lower_rkppl(quote
+        a ~ Normal(0, 1)
         s ~ Exponential(1)
         mu = a .+ s .+ x
         y .~ Normal.(mu, 1.0)
     end, Dn)
+    @test Set(p.name for p in admitted.parameters) == Set((:a, :s))
+    # A reduction is still outside the admitted scalar-summand grammar.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         m = mean(x)
         mu = a .+ m
@@ -2889,8 +2913,8 @@ end
         :z => [0.5, -1.0, 1.5, 0.0])
     bound = bind_data(bare, cols)
     layout = assign_layout(bound)
-    @test [e.kind for e in layout.entries] == [:coefficient, :sampled]
-    @test [e.size for e in layout.entries] == [0, 1]
+    @test [e.kind for e in layout.entries] == [:sampled]
+    @test [e.size for e in layout.entries] == [1]
     @test layout.total == 1
     # End to end: likelihood over the data affine + gradient.
     built = build_kernel(bound)
@@ -3313,9 +3337,10 @@ end
                     :(y[i] ~ Normal.(theta[i], sigma))))))
     plan = lower_rkppl(ast, (:y, :x))
     @test [p.name for p in plan.plate_parameters] == [:z]
-    @test :theta in [d.name for d in plan.derived]      # emitted, not decomposed
+    @test isempty(plan.derived)
     loc = only(plan.predictors)
-    @test loc.terms[1].kind === LatentTerm && loc.terms[1].columns == [:theta]
+    @test [t.kind for t in loc.terms] == [InterceptTerm, ContinuousTerm]
+    @test [t.options.parameter for t in loc.terms] == [:mu, :tau]
     # Value + gradient vs an independent oracle.
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
@@ -3840,7 +3865,7 @@ end
     @test _plans_equal(bp, bd)
     builtp = build_kernel(bp)
     u = [0.5]
-    @test propertynames(constrain(builtp.layout, u)) == (:mu,)
+    @test propertynames(constrain(builtp.layout, u)) == (:b,)
     @test _query(builtp.spec, bp, :posterior, u) ≈
         _query(build_kernel(bd).spec, bd, :posterior, u)
     _check_gradient(builtp.spec, bp, u)
@@ -4012,8 +4037,9 @@ _pcs(cells...) = Expr(:block,
                              :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x))
     @test _plans_equal(subn, handn)
     @test [p.name for p in subn.plate_parameters] == [:theta_z]  # namespaced local
-    @test :theta in [d.name for d in subn.derived]
-    @test only(subn.predictors).terms[1].kind === LatentTerm
+    @test isempty(subn.derived)
+    @test [t.kind for t in only(subn.predictors).terms] ==
+        [InterceptTerm, ContinuousTerm]
     # Value + gradient vs an independent Distributions.jl oracle.
     bound = bind_data(subn, cols)
     built = build_kernel(bound)
@@ -4165,7 +4191,7 @@ end
     built = build_kernel(bound)
     u = zeros(built.layout.total)
     nt = constrain(built.layout, u)
-    etas = [Vector(getproperty(nt, p)) for p in (:eta2, :eta3)]
+    etas = [[nt.a2, nt.b2], [nt.a3, nt.b3]]
     ll = 0.0
     for (i, y) in enumerate(cols[:y])
         v = [0.0, etas[1][1] + etas[1][2] * cols[:x][i],
@@ -4210,7 +4236,7 @@ end
     built = build_kernel(bound)
     u = [0.5, -0.25, 0.1, 0.3]
     nt = constrain(built.layout, u)
-    b = Vector(nt.eta)
+    b = [nt.a, nt.b]
     eta = b[1] .+ b[2] .* cols[:x]
     t = Vector(nt.y_cutpoints)
     σ(z) = 1 / (1 + exp(-z))

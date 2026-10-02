@@ -74,7 +74,7 @@ _ig_i1_cols() = Dict{Symbol,AbstractVector}(:y => copy(_IG_I1_Y),
             end, (:y, :x))
         r = only(plan.responses)
         @test (r.family, r.scale) === (InverseGaussianFam, :lam)
-        @test only(plan.parameters).family === :lognormal
+        @test only(p for p in plan.parameters if p.name === :lam).family === :lognormal
     end
     @testset "per-observation lambda column" begin
         plan = lower_rkppl(quote
@@ -107,11 +107,11 @@ end
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), 1.5)
             end, _ig_cols())
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _ig_posterior(kern, lay, q)
-        mu = exp.(q.eta[1] .+ q.eta[2] .* _IG_X)
+        mu = exp.(q.a .+ q.b .* _IG_X)
         want = sum(_ig_ref(y, m, 1.5) for (y, m) in zip(_IG_Y, mu)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "LogNormal-sampled lambda" begin
@@ -122,11 +122,11 @@ end
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lam)
             end, _ig_cols())
-        q = (eta = [0.5, -0.25], lam = 1.2)
+        q = (a = 0.5, b = -0.25, lam = 1.2)
         got = _ig_posterior(kern, lay, q)
-        mu = exp.(q.eta[1] .+ q.eta[2] .* _IG_X)
+        mu = exp.(q.a .+ q.b .* _IG_X)
         want = sum(_ig_ref(y, m, q.lam) for (y, m) in zip(_IG_Y, mu)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(LogNormal(-0.3, 1.0), q.lam) +
             logjac(lay, unconstrain(lay, q))
         @test got ≈ want rtol = 1e-12
@@ -140,12 +140,12 @@ end
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lamc)
             end, cols)
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _ig_posterior(kern, lay, q)
-        mu = exp.(q.eta[1] .+ q.eta[2] .* _IG_X)
+        mu = exp.(q.a .+ q.b .* _IG_X)
         want = sum(_ig_ref(y, m, l)
             for (y, m, l) in zip(_IG_Y, mu, cols[:lamc])) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "modeled lambda" begin
@@ -158,14 +158,14 @@ end
                 ls = c .+ d .* z
                 y .~ InverseGaussian.(exp.(eta), exp.(ls))
             end, _ig_i1_cols())
-        q = (eta = [0.5, -0.25], ls = [0.3, -0.1])
+        q = (a = 0.5, b = -0.25, c = 0.3, d = -0.1)
         got = _ig_posterior(kern, lay, q)
-        mu = exp.(q.eta[1] .+ q.eta[2] .* _IG_I1_X)
-        lam = exp.(q.ls[1] .+ q.ls[2] .* _IG_I1_Z)
+        mu = exp.(q.a .+ q.b .* _IG_I1_X)
+        lam = exp.(q.c .+ q.d .* _IG_I1_Z)
         want = sum(_ig_ref(y, m, l)
             for (y, m, l) in zip(_IG_I1_Y, mu, lam)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
-            logpdf(Normal(0, 1), q.ls[1]) + logpdf(Normal(0, 1), q.ls[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+            logpdf(Normal(0, 1), q.c) + logpdf(Normal(0, 1), q.d)
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -192,7 +192,7 @@ end
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), 1.5)
-            end, _ig_cols(), (eta = [0.5, -0.25],))
+            end, _ig_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "LogNormal-sampled lambda" begin
         _ig_enzyme_check(quote
@@ -201,7 +201,7 @@ end
                 lam ~ LogNormal(-0.3, 1.0)
                 eta = a .+ b .* x
                 y .~ InverseGaussian.(exp.(eta), lam)
-            end, _ig_cols(), (eta = [0.5, -0.25], lam = 1.2))
+            end, _ig_cols(), (a = 0.5, b = -0.25, lam = 1.2))
     end
     @testset "modeled lambda" begin
         _ig_enzyme_check(quote
@@ -212,7 +212,7 @@ end
                 eta = a .+ b .* x
                 ls = c .+ d .* z
                 y .~ InverseGaussian.(exp.(eta), exp.(ls))
-            end, _ig_i1_cols(), (eta = [0.5, -0.25], ls = [0.3, -0.1]))
+            end, _ig_i1_cols(), (a = 0.5, b = -0.25, c = 0.3, d = -0.1))
     end
 end
 
@@ -369,15 +369,15 @@ _ig_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _ig_query(prog, _ig_sb_cols())
         names = coordinate_names(lay)
-        u = _ig_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25, :lam => 0.1])
+        u = _ig_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :lam => 0.1])
         @test abs(Base.invokelatest(kern, u) - (-107.94448350852093)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _ig_sb_vec(names, [Symbol("eta.Intercept") => -5.801800479513927,
-            Symbol("eta.x") => 0.7403371085658694,
+        want = _ig_sb_vec(names, [:a => -5.801800479513927,
+            :b => 0.7403371085658694,
             :lam => 18.43769416175131])
         @test maximum(abs.(g .- want)) < 1e-10
     end
@@ -392,15 +392,15 @@ _ig_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _ig_query(prog, _ig_sb_cols())
         names = coordinate_names(lay)
-        u = _ig_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25])
+        u = _ig_sb_vec(names, [:a => 0.5,
+            :b => -0.25])
         @test abs(Base.invokelatest(kern, u) - (-102.28730407429342)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _ig_sb_vec(names, [Symbol("eta.Intercept") => -7.867384126223681,
-            Symbol("eta.x") => 0.9905368316042678])
+        want = _ig_sb_vec(names, [:a => -7.867384126223681,
+            :b => 0.9905368316042678])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end
@@ -424,17 +424,17 @@ end
     end
     bound, built, kern, lay = _ig_query(prog, _ig_i1_cols())
     names = coordinate_names(lay)
-    u = _ig_sb_vec(names, [Symbol("eta.Intercept") => 0.2,
-        Symbol("eta.x") => -0.1, Symbol("ls.Intercept") => 0.5,
-        Symbol("ls.z") => 0.1])
+    u = _ig_sb_vec(names, [:a => 0.2,
+        :b => -0.1, :c => 0.5,
+        :d => 0.1])
     @test abs(Base.invokelatest(kern, u) - (-10.804159781573498)) < 1e-12
     prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
     g = similar(u)
     sampler_value_and_gradient!(prep, g, u)
     @test all(isfinite, g)
-    want = _ig_sb_vec(names, [Symbol("eta.Intercept") => 1.4612006167004556,
-        Symbol("eta.x") => 4.193945941766732,
-        Symbol("ls.Intercept") => 1.3216386315587654,
-        Symbol("ls.z") => 0.8983364646506092])
+    want = _ig_sb_vec(names, [:a => 1.4612006167004556,
+        :b => 4.193945941766732,
+        :c => 1.3216386315587654,
+        :d => 0.8983364646506092])
     @test maximum(abs.(g .- want)) < 1e-10
 end

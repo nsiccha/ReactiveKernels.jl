@@ -126,7 +126,7 @@ end
     built = build_kernel(bound)
     u = [0.5, -0.25, 0.1]
     nt = constrain(built.layout, u)
-    ref = _ref_gaussian(bound.columns, Vector(nt.mu), nt.sigma)
+    ref = _ref_gaussian(bound.columns, [nt.a, nt.b], nt.sigma)
     @test _query(built.spec, bound, :posterior, u) ≈ ref.ll + ref.pr + u[3]
     _check_gradient(built.spec, bound, u)
 end

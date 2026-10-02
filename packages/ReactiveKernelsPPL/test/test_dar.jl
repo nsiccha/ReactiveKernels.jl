@@ -300,8 +300,7 @@ end
     reject(:(mu = dar(beta, sigmad)))
     # two dar calls in one predictor (one per predictor in v1)
     reject(:(mu = a .+ dar(beta, sigmad) .+ dar(beta, sigmad)))
-    # a dar parameter read as a computed coefficient is an ordinary
-    # parameter scaling a derived column (density: test_fallback.jl)
+    # A dar parameter also retains its ordinary affine reader.
     dplan = lower_rkppl(quote
         a ~ Normal(0, 1)
         beta ~ truncated(Normal(0.5, 0.2), 0, 1)
@@ -311,7 +310,8 @@ end
         y .~ Normal.(mu, sigma)
     end, (:x, :y))
     @test :beta in Set(p.name for p in dplan.parameters)
-    @test only(dplan.derived).expr == :(beta .* x)
+    @test only(t for t in only(dplan.predictors).terms
+        if t.kind === ContinuousTerm).options.parameter === :beta
     # bare dar-state name (splices via its call, not as a coefficient)
     reject(:(mu = a .+ dar(beta, sigmad) .+ dar_mu))
 
@@ -430,7 +430,7 @@ end
     # mu_coef(a) + beta + sigmad + sigma + z[1..4]
     @test built.layout.total == 4 + (length(ydata) - 1)
     @test coordinate_names(built.layout)[1:4] ==
-        [Symbol("mu.Intercept"), :beta, :sigmad, :sigma]
+        [:a, :beta, :sigmad, :sigma]
     for u in ([0.1, 0.3, -0.5, -0.4, 0.2, -0.1, 0.4, 0.0],
               [-0.2, 0.6, 0.1, 0.3, -0.4, 0.2, -0.3, 0.1])
         @test _query(built.spec, plan, :posterior, u) ≈ _dar_oracle(u, ydata)
@@ -476,7 +476,7 @@ _dar_normalizers(bloc, bsca, ssca) =
         built = build_kernel(plan)
         @test built.layout.total == 9
         @test coordinate_names(built.layout)[1:4] ==
-            [Symbol("mu.Intercept"), :beta, :sigmad, :s]
+            [:a, :beta, :sigmad, :s]
         post = _query(built.spec, plan, :posterior, u)
         @test post ≈ _dar_oracle(u, ydata)
         @test abs(post - (-22.57116529873909 +
@@ -505,7 +505,7 @@ _dar_normalizers(bloc, bsca, ssca) =
         built = build_kernel(plan)
         @test built.layout.total == 9
         @test coordinate_names(built.layout)[1:4] ==
-            [Symbol("mu.Intercept"), :beta, :sigmad, :s]
+            [:a, :beta, :sigmad, :s]
         post = _query(built.spec, plan, :posterior, u)
         @test post ≈ _dar_oracle(u, ydata;
             beta_prior = truncated(Normal(0.6, 0.1), 0, 1),

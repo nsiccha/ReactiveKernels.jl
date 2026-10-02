@@ -77,13 +77,13 @@ end
     bound, built = _ls_build(_LS_R2D2, cols)
     # The hcat matrix is read as a value (`var.(eachcol(X))`): bound data.
     @test bound.columns[:X] == hcat(cols[:x1], cols[:x2])
-    @test Set(coordinate_names(built.layout)) == Set([Symbol("mu.Intercept"),
+    @test Set(coordinate_names(built.layout)) == Set([:a,
         :b_R2, :b_tau, :sigma, Symbol("b_phi.1"), Symbol("b_b.1"),
         Symbol("b_b.2")])
     u = _ls_u(built)
     nt = constrain(built.layout, u)
     X = hcat(cols[:x1], cols[:x2])
-    a = only(nt.mu)
+    a = nt.a
     sd = sqrt.(nt.b_phi .* nt.b_R2 .* nt.b_tau^2 ./ var.(eachcol(X)))
     pr = logpdf(Normal(0, 1), a) + logpdf(Beta(1, 1), nt.b_R2) +
         logpdf(Dirichlet([1.0, 1.0]), nt.b_phi) +
@@ -149,7 +149,7 @@ end
         nt = constrain(built.layout, u)
         R2, phi = nt[Symbol(p, :_R2)], nt[Symbol(p, :_phi)]
         tau, b = nt[Symbol(p, :_tau)], nt[Symbol(p, :_b)]
-        a = only(nt.mu)
+        a = nt.a
         sd = sqrt.(phi .* R2 .* tau^2 ./ var.(eachcol(X)))
         pr = logpdf(Normal(0, 5), a) + logpdf(Beta(1, 1), R2) +
             logpdf(Dirichlet([1.0, 1.0]), phi) + _ls_halfnormal(1, tau) +
@@ -175,7 +175,7 @@ end
     u = _ls_u(built)
     nt = constrain(built.layout, u)
     @test length(nt.b_b) == 3 && length(nt.b_phi) == 3
-    a = only(nt.mu)
+    a = nt.a
     sd = sqrt.(nt.b_phi .* nt.b_R2 .* nt.b_tau^2 ./ var.(eachcol(X)))
     pr = logpdf(Normal(0, 1), a) + logpdf(Beta(1, 1), nt.b_R2) +
         logpdf(Dirichlet([1.0, 2.0, 3.0]), nt.b_phi) +
@@ -202,7 +202,7 @@ end
     bl, builtl = _ls_build(_LS_R2D2, cols)
     ub = _ls_u(builtb)
     v = constrain(builtb.layout, ub)
-    ul = _ls_unconstrain(builtl.layout, (; mu = v.mu[1:1], b_R2 = v.R2,
+    ul = _ls_unconstrain(builtl.layout, (; a = v.mu[1], b_R2 = v.R2,
         b_tau = v.r2d2_mu_tau_bsv, sigma = v.sigma, b_phi = v.phi,
         b_b = v.mu[2:3]))
     for want in (:prior, :likelihood, :posterior)
@@ -235,7 +235,7 @@ end
     u = _ls_u(built)
     nt = constrain(built.layout, u)
     X = hcat(cols[:x1], cols[:x2])
-    a = only(nt.mu)
+    a = nt.a
     b = nt.b_z .* nt.b_lambda .* nt.b_tau
     pr = logpdf(Normal(0, 1), a) + _ls_halfcauchy(1, nt.b_tau) +
         sum(_ls_halfcauchy.(1, nt.b_lambda)) +
@@ -270,7 +270,7 @@ end
         end, cols)
     ub = _ls_u(builtb)
     v = constrain(builtb.layout, ub)
-    ul = _ls_unconstrain(builtl.layout, (; mu = [v.horseshoe_mu_Intercept_normal],
+    ul = _ls_unconstrain(builtl.layout, (; a = v.horseshoe_mu_Intercept_normal,
         b_tau = v.horseshoe_mu_x1_tau, b_lambda = [v.horseshoe_mu_x1_lambda],
         b_z = [v.horseshoe_mu_x1_raw], sigma = v.sigma))
     @test _query(builtl.spec, bl, :likelihood, ul) ≈

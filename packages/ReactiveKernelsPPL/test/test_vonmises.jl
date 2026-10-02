@@ -76,7 +76,7 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
         r = only(plan.responses)
         @test (r.family, r.scale, r.interval) ===
             (VonMisesFam, :kappa, (-Float64(pi), Float64(pi)))
-        @test only(plan.parameters).family === :gamma
+        @test only(p for p in plan.parameters if p.name === :kappa).family === :gamma
     end
     @testset "per-observation kappa column" begin
         plan = lower_rkppl(quote
@@ -129,11 +129,11 @@ end
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, 1.7)
             end, _vm_cols())
-        q = (mu = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _vm_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _VM_X
+        mu = q.a .+ q.b .* _VM_X
         want = sum(_vm_ref(y, m, 1.7) for (y, m) in zip(_VM_Y, mu)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "Gamma-sampled kappa, circular" begin
@@ -144,12 +144,12 @@ end
                 mu = a .+ b .* x
                 y .~ CircularVonMises.(mu, kappa, -pi, pi)
             end, _vm_cols())
-        q = (mu = [0.5, -0.25], kappa = 2.0)
+        q = (a = 0.5, b = -0.25, kappa = 2.0)
         got = _vm_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _VM_X
+        mu = q.a .+ q.b .* _VM_X
         want = sum(_vm_circ_ref(y, m, q.kappa, -Float64(pi), Float64(pi))
             for (y, m) in zip(_VM_Y, mu)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2]) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(Gamma(2.0, 0.1), q.kappa) +
             logjac(lay, unconstrain(lay, q))
         @test got ≈ want rtol = 1e-12
@@ -163,12 +163,12 @@ end
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, kappac)
             end, cols)
-        q = (mu = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _vm_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _VM_X
+        mu = q.a .+ q.b .* _VM_X
         want = sum(_vm_ref(y, m, k)
             for (y, m, k) in zip(_VM_Y, mu, cols[:kappac])) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "intercept-only log-kappa submodel" begin
@@ -180,14 +180,14 @@ end
                 lk = c
                 y .~ CircularVonMises.(mu, exp.(lk), -pi, pi)
             end, _vm_cols())
-        q = (mu = [0.5, -0.25], lk = [0.3])
+        q = (a = 0.5, b = -0.25, c = 0.3)
         got = _vm_posterior(kern, lay, q)
-        mu = q.mu[1] .+ q.mu[2] .* _VM_X
-        kap = exp(q.lk[1])
+        mu = q.a .+ q.b .* _VM_X
+        kap = exp(q.c)
         want = sum(_vm_circ_ref(y, m, kap, -Float64(pi), Float64(pi))
             for (y, m) in zip(_VM_Y, mu)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2]) +
-            logpdf(Normal(0, 1), q.lk[1])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+            logpdf(Normal(0, 1), q.c)
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -214,7 +214,7 @@ end
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 y .~ VonMises.(mu, 1.7)
-            end, _vm_cols(), (mu = [0.5, -0.25],))
+            end, _vm_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "Gamma-sampled kappa, circular" begin
         _vm_enzyme_check(quote
@@ -223,7 +223,7 @@ end
                 kappa ~ Gamma(2.0, 0.1)
                 mu = a .+ b .* x
                 y .~ CircularVonMises.(mu, kappa, -pi, pi)
-            end, _vm_cols(), (mu = [0.5, -0.25], kappa = 2.0))
+            end, _vm_cols(), (a = 0.5, b = -0.25, kappa = 2.0))
     end
     @testset "intercept-only log-kappa submodel" begin
         _vm_enzyme_check(quote
@@ -233,7 +233,7 @@ end
                 mu = a .+ b .* x
                 lk = c
                 y .~ CircularVonMises.(mu, exp.(lk), -pi, pi)
-            end, _vm_cols(), (mu = [0.5, -0.25], lk = [0.3]))
+            end, _vm_cols(), (a = 0.5, b = -0.25, c = 0.3))
     end
 end
 
@@ -407,16 +407,16 @@ _vm_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
             :x => copy(_VM_SB_X))
         bound, built, kern, lay = _vm_query(prog, cols)
         names = coordinate_names(lay)
-        u = _vm_sb_vec(names, [Symbol("mu.Intercept") => 0.5,
-            Symbol("mu.x") => -0.25, Symbol("lk.Intercept") => 0.3])
+        u = _vm_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :c => 0.3])
         @test abs(Base.invokelatest(kern, u) - (-12.60537740226801)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _vm_sb_vec(names, [Symbol("mu.Intercept") => 0.4606828295664177,
-            Symbol("mu.x") => 1.0755814718931511,
-            Symbol("lk.Intercept") => -3.9533067855122037])
+        want = _vm_sb_vec(names, [:a => 0.4606828295664177,
+            :b => 1.0755814718931511,
+            :c => -3.9533067855122037])
         @test maximum(abs.(g .- want)) < 1e-10
     end
     @testset "VM2 exact + sampled kappa" begin
@@ -433,15 +433,15 @@ _vm_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
             :x => copy(_VM_SB_X))
         bound, built, kern, lay = _vm_query(prog, cols)
         names = coordinate_names(lay)
-        u = _vm_sb_vec(names, [Symbol("mu.Intercept") => 0.5,
-            Symbol("mu.x") => -0.25, :k => 0.2])
+        u = _vm_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :k => 0.2])
         @test abs(Base.invokelatest(kern, u) - (-10.932237952776804)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _vm_sb_vec(names, [Symbol("mu.Intercept") => -1.3935808349508612,
-            Symbol("mu.x") => 0.1339126643988171,
+        want = _vm_sb_vec(names, [:a => -1.3935808349508612,
+            :b => 0.1339126643988171,
             :k => -2.0129577913934957])
         @test maximum(abs.(g .- want)) < 1e-10
     end
@@ -459,15 +459,15 @@ _vm_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
             :x => copy(_VM_SB_X))
         bound, built, kern, lay = _vm_query(prog, cols)
         names = coordinate_names(lay)
-        u = _vm_sb_vec(names, [Symbol("mu.Intercept") => 1.0,
-            Symbol("mu.x") => -0.5])
+        u = _vm_sb_vec(names, [:a => 1.0,
+            :b => -0.5])
         @test abs(Base.invokelatest(kern, u) - (-7.934564762332648)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _vm_sb_vec(names, [Symbol("mu.Intercept") => -1.7708419435702396,
-            Symbol("mu.x") => 1.6892237819376545])
+        want = _vm_sb_vec(names, [:a => -1.7708419435702396,
+            :b => 1.6892237819376545])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end

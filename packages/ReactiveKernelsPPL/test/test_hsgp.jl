@@ -311,7 +311,7 @@ end
     # SB `_sb_hsgp` declaration order per basis (rho, sigma, beta),
     # appended after the slice-1 entries so peer offsets never move.
     kinds = [(e.kind, e.name, e.size, e.transform) for e in layout.entries]
-    @test kinds == [(:coefficient, :mu_coef, 1, :identity),
+    @test kinds == [(:sampled, :a, 1, :identity),
         (:sampled, :sigma, 1, :exp),
         (:sampled, :rho_h_x, 1, :floored),
         (:sampled, :sigma_h_x, 1, :exp),
@@ -336,7 +336,7 @@ end
     abound = bind_data(_hvalid_plan(; aniso = true), _hsgp_cols())
     alayout = assign_layout(abound)
     akinds = [(e.kind, e.name, e.size, e.transform) for e in alayout.entries]
-    @test akinds == [(:coefficient, :mu_coef, 1, :identity),
+    @test akinds == [(:sampled, :a, 1, :identity),
         (:sampled, :sigma, 1, :exp),
         (:sampled, :rho_h_xz_1, 1, :floored),
         (:sampled, :rho_h_xz_2, 1, :floored),
@@ -369,7 +369,7 @@ end
     twolayout = assign_layout(bind_data(two, _hsgp_cols()))
     twokinds =
         [(e.kind, e.name, e.size, e.transform) for e in twolayout.entries]
-    @test twokinds == [(:coefficient, :mu_coef, 1, :identity),
+    @test twokinds == [(:sampled, :a, 1, :identity),
         (:sampled, :rho_h_a, 1, :floored),
         (:sampled, :sigma_h_a, 1, :exp),
         (:hsgp, :beta_raw_h_a, 2, :identity),
@@ -427,7 +427,7 @@ function _hsgp_ref_posterior(bound::StructuralPlan, layout::LayoutTable,
     y = Vector{Float64}(bound.columns[:y])
     nt = constrain(layout, u)
     hsgp = ReactiveKernelsPPL._hsgp_names(hb)
-    a = only(nt.mu)
+    a = nt.a
     sig = Float64(nt.sigma)
     rhos = [Float64(getproperty(nt, r)) for r in hsgp.rhos]
     sigh = Float64(getproperty(nt, hsgp.sigma))
@@ -707,7 +707,7 @@ end
     # SB `_sb_hsgp_periodic` declaration order (rho, sigma, beta),
     # appended after the slice-1 entries like the exp-quad triple.
     kinds = [(e.kind, e.name, e.size, e.transform) for e in layout.entries]
-    @test kinds == [(:coefficient, :mu_coef, 1, :identity),
+    @test kinds == [(:sampled, :a, 1, :identity),
         (:sampled, :sigma, 1, :exp),
         (:sampled, :rho_h_p, 1, :floored),
         (:sampled, :sigma_h_p, 1, :exp),
@@ -758,7 +758,7 @@ function _hsgp_periodic_ref_posterior(bound::StructuralPlan,
     y = Vector{Float64}(bound.columns[:y])
     nt = constrain(layout, u)
     hsgp = ReactiveKernelsPPL._hsgp_names(hb)
-    a = only(nt.mu)
+    a = nt.a
     sig = Float64(nt.sigma)
     rho = Float64(only(getproperty(nt, r) for r in hsgp.rhos))
     sigh = Float64(getproperty(nt, hsgp.sigma))

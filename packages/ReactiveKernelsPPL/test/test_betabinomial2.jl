@@ -94,7 +94,7 @@ end
             end, (:c, :x, :n))
         r = only(plan.responses)
         @test (r.family, r.scale, r.trials) === (BetaBinomial2Fam, :phi, :n)
-        @test only(plan.parameters).family === :gamma
+        @test only(p for p in plan.parameters if p.name === :phi).family === :gamma
     end
     @testset "literal trials" begin
         plan = lower_rkppl(quote
@@ -157,13 +157,13 @@ end
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
             end, _bb_cols())
-        q = (mu = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _bb_posterior(kern, lay, q)
-        eta = q.mu[1] .+ q.mu[2] .* _BB_X
+        eta = q.a .+ q.b .* _BB_X
         mu = 1 ./ (1 .+ exp.(-eta))
         want = sum(_bb_ref(y, n, m, 4.0)
             for (y, n, m) in zip(_BB_C, _BB_N, mu)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "Gamma-sampled phi" begin
@@ -174,13 +174,13 @@ end
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), phi)
             end, _bb_cols())
-        q = (mu = [0.5, -0.25], phi = 4.0)
+        q = (a = 0.5, b = -0.25, phi = 4.0)
         got = _bb_posterior(kern, lay, q)
-        eta = q.mu[1] .+ q.mu[2] .* _BB_X
+        eta = q.a .+ q.b .* _BB_X
         mu = 1 ./ (1 .+ exp.(-eta))
         want = sum(_bb_ref(y, n, m, q.phi)
             for (y, n, m) in zip(_BB_C, _BB_N, mu)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2]) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(Gamma(2.0, 0.1), q.phi) +
             logjac(lay, unconstrain(lay, q))
         @test got ≈ want rtol = 1e-12
@@ -194,13 +194,13 @@ end
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(12, logistic.(mu), 4.0)
             end, cols)
-        q = (mu = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _bb_posterior(kern, lay, q)
-        eta = q.mu[1] .+ q.mu[2] .* _BB_X
+        eta = q.a .+ q.b .* _BB_X
         mu = 1 ./ (1 .+ exp.(-eta))
         want = sum(_bb_ref(y, 12, m, 4.0)
             for (y, m) in zip(cols[:c], mu)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "per-observation phi column" begin
@@ -212,27 +212,27 @@ end
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), phic)
             end, cols)
-        q = (mu = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _bb_posterior(kern, lay, q)
-        eta = q.mu[1] .+ q.mu[2] .* _BB_X
+        eta = q.a .+ q.b .* _BB_X
         mu = 1 ./ (1 .+ exp.(-eta))
         want = sum(_bb_ref(y, n, m, p)
             for (y, n, m, p) in zip(_BB_C, _BB_N, mu, cols[:phic])) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "modeled precision" begin
         _, _, kern, lay = _bb_query(_bb_p3_prog(), _bb_p3_cols())
-        q = (mu = [_BB_P3_U[1], _BB_P3_U[2]],
-            hup = [_BB_P3_U[3], _BB_P3_U[4]])
+        q = (a = _BB_P3_U[1], b = _BB_P3_U[2],
+            c = _BB_P3_U[3], d = _BB_P3_U[4])
         got = _bb_posterior(kern, lay, q)
-        eta = q.mu[1] .+ q.mu[2] .* _BB_P3_X
+        eta = q.a .+ q.b .* _BB_P3_X
         mu = 1 ./ (1 .+ exp.(-eta))
-        phi = exp.(q.hup[1] .+ q.hup[2] .* _BB_P3_Z)
+        phi = exp.(q.c .+ q.d .* _BB_P3_Z)
         want = sum(_bb_ref(y, n, m, p)
             for (y, n, m, p) in zip(_BB_P3_Y, _BB_P3_N, mu, phi)) +
-            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.mu[2]) +
-            logpdf(Normal(0, 1), q.hup[1]) + logpdf(Normal(0, 1), q.hup[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+            logpdf(Normal(0, 1), q.c) + logpdf(Normal(0, 1), q.d)
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -259,7 +259,7 @@ end
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), 4.0)
-            end, _bb_cols(), (mu = [0.5, -0.25],))
+            end, _bb_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "Gamma-sampled phi" begin
         _bb_enzyme_check(quote
@@ -268,12 +268,12 @@ end
                 phi ~ Gamma(2.0, 0.1)
                 mu = a .+ b .* x
                 c .~ BetaBinomial2.(n, logistic.(mu), phi)
-            end, _bb_cols(), (mu = [0.5, -0.25], phi = 4.0))
+            end, _bb_cols(), (a = 0.5, b = -0.25, phi = 4.0))
     end
     @testset "modeled precision" begin
         _bb_enzyme_check(_bb_p3_prog(), _bb_p3_cols(),
-            (mu = [_BB_P3_U[1], _BB_P3_U[2]],
-                hup = [_BB_P3_U[3], _BB_P3_U[4]]))
+            (a = _BB_P3_U[1], b = _BB_P3_U[2],
+                c = _BB_P3_U[3], d = _BB_P3_U[4]))
     end
 end
 
@@ -437,8 +437,8 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _bb_query(prog, _bb_sb_cols())
         names = coordinate_names(lay)
-        u = _bb_sb_vec(names, [Symbol("mu.Intercept") => 0.5,
-            Symbol("mu.x") => -0.25, :phi => log(6.0)])
+        u = _bb_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :phi => log(6.0)])
         got = Base.invokelatest(kern, u)
         @test abs(got - (-225.22160684012368)) < 1e-12
         eta = 0.5 .- 0.25 .* _BB_SB_X
@@ -452,8 +452,8 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        sb = _bb_sb_vec(names, [Symbol("mu.Intercept") => -3.6814620132469567,
-            Symbol("mu.x") => -46.90221092744033,
+        sb = _bb_sb_vec(names, [:a => -3.6814620132469567,
+            :b => -46.90221092744033,
             :phi => -61.221213644655926])
         @test maximum(abs.(g .- sb)) < 1e-11
     end
@@ -465,10 +465,10 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         # (mean.Intercept, mean.x, precision.Intercept, precision.z).
         bound, built, kern, lay = _bb_query(_bb_p3_prog(), _bb_p3_cols())
         names = coordinate_names(lay)
-        u = _bb_sb_vec(names, [Symbol("mu.Intercept") => _BB_P3_U[1],
-            Symbol("mu.x") => _BB_P3_U[2],
-            Symbol("hup.Intercept") => _BB_P3_U[3],
-            Symbol("hup.z") => _BB_P3_U[4]])
+        u = _bb_sb_vec(names, [:a => _BB_P3_U[1],
+            :b => _BB_P3_U[2],
+            :c => _BB_P3_U[3],
+            :d => _BB_P3_U[4]])
         got = Base.invokelatest(kern, u)
         # Measured 2-ulp (7.1e-15) off the SB pin: the shared
         # `beta_binomial` endpoint's lgamma/lbeta association differs
@@ -487,10 +487,10 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        sb = _bb_sb_vec(names, [Symbol("mu.Intercept") => _BB_P3_GRAD[1],
-            Symbol("mu.x") => _BB_P3_GRAD[2],
-            Symbol("hup.Intercept") => _BB_P3_GRAD[3],
-            Symbol("hup.z") => _BB_P3_GRAD[4]])
+        sb = _bb_sb_vec(names, [:a => _BB_P3_GRAD[1],
+            :b => _BB_P3_GRAD[2],
+            :c => _BB_P3_GRAD[3],
+            :d => _BB_P3_GRAD[4]])
         @test maximum(abs.(g .- sb)) < 1e-11
     end
     @testset "B2 betabinomial_mu1" begin
@@ -506,7 +506,7 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _bb_query(prog, _bb_sb_cols())
         names = coordinate_names(lay)
-        u = _bb_sb_vec(names, [Symbol("mu.Intercept") => 0.5, :phi => log(6.0)])
+        u = _bb_sb_vec(names, [:a => 0.5, :phi => log(6.0)])
         got = Base.invokelatest(kern, u)
         @test abs(got - (-237.53203421116058)) < 1e-12
         mu = 1 / (1 + exp(-0.5))
@@ -519,7 +519,7 @@ _bb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        sb = _bb_sb_vec(names, [Symbol("mu.Intercept") => -2.311523209591776,
+        sb = _bb_sb_vec(names, [:a => -2.311523209591776,
             :phi => -67.54239489971626])
         @test maximum(abs.(g .- sb)) < 1e-11
     end

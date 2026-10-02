@@ -234,9 +234,14 @@ restore_draws(built.layout, U)           # U: layout.total × draws
 
 - `:sampler` is the posterior preset; `:posterior` is the generated node's
   name, not a preset.
-- Coordinates are named after the predictor the layer reconstructs, not after
-  your parameter names: `mu.Intercept`, `mu.x`, `mu.g_1`, …. Read
-  `coordinate_names(built.layout)` and `constrain`.
+- Explicit parameter declarations keep their authored names. For
+  `a ~ Normal(0, 1); b ~ Normal(0, 2); mu = a .+ b .* x`, the coordinates
+  are `a`, `b` and the constrained values are `nt.a`, `nt.b`.
+  A level-sized declaration `c[levels(g)]` gives `c.1`, `c.2`, … and `nt.c`.
+  Adding another reader preserves those names and the single declared prior.
+  Explicit whole-predictor R2D2 and Horseshoe constructs retain their own
+  coefficient layouts. Read `coordinate_names(built.layout)` and `constrain`;
+  rebuild old prepared models and packed-draw mappings when migrating.
 - A kernel returned by `prepare_query` closes over code generated at build time.
   Call it from top level or through `Base.invokelatest`; `SamplerQuery` calls
   already carry that barrier.

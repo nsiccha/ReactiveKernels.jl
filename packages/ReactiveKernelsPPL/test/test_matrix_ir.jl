@@ -234,13 +234,12 @@ end
     t = only(only(plan.predictors).terms)
     @test t.kind === MatrixTerm
     @test t.columns == [:x1, :x2]
-    @test t.options == (matrix = :X,)
+    @test t.options == (matrix = :X, parameter = :b, sign = 1)
     @test t.addressee === :X
     @test t.label === :X_term
-    @test plan.population_priors == PopulationPrior[
-        PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-        PopulationPrior(:mu, :x1, 0.0, 1.0),
-        PopulationPrior(:mu, :x2, 0.0, 1.0)]
+    @test isempty(plan.population_priors)
+    @test only(plan.array_parameters).name === :b
+    @test only(plan.array_parameters).args == (arg1 = 0, arg2 = 1)
     # Per-element literal priors (real broadcast semantics).
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.([0, 0, 0], [1, 2, 3])
@@ -248,21 +247,18 @@ end
         mu = X * b
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1, :x2))
-    @test plan.population_priors == PopulationPrior[
-        PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-        PopulationPrior(:mu, :x1, 0.0, 2.0),
-        PopulationPrior(:mu, :x2, 0.0, 3.0)]
-    # Unstated vectors default to K× Normal(0, 1).
+    @test isempty(plan.population_priors)
+    @test repr(only(plan.array_parameters).args.arg1) == repr(:([0, 0, 0]))
+    @test repr(only(plan.array_parameters).args.arg2) == repr(:([1, 2, 3]))
+    # Sized declarations keep their ordinary array priors.
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(0, 1)
         X = hcat(1, x1)
         mu = X * b
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1))
-    @test plan.population_priors == PopulationPrior[
-        PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-        PopulationPrior(:mu, :x1, 0.0, 1.0)]
-    # Dotted subtraction negates locations, keeps scales.
+    @test isempty(plan.population_priors)
+    # Dotted subtraction changes the use, preserving the declared prior.
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(1.0, 2.0)
         a ~ Normal(0, 1)
@@ -270,9 +266,10 @@ end
         mu = a .- X * b
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1))
-    @test plan.population_priors == PopulationPrior[
-        PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-        PopulationPrior(:mu, :x1, -1.0, 2.0)]
+    @test isempty(plan.population_priors)
+    @test only(plan.parameters).name === :a
+    @test only(plan.array_parameters).args == (arg1 = 1.0, arg2 = 2.0)
+    @test only(plan.predictors).terms[2].options.sign == -1
     # Dotted negation, disjoint matrices, reuse, factor combo.
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(0, 1)
@@ -280,7 +277,7 @@ end
         mu = .-(X * b)
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1))
-    @test length(plan.population_priors) == 2
+    @test isempty(plan.population_priors)
     # Undotted negation folds the sign (affine unary-minus precedent).
     plan = lower_rkppl(quote
         b[axes(X, 2)] .~ Normal.(1.0, 2.0)
@@ -288,9 +285,9 @@ end
         mu = -(X * b)
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1))
-    @test plan.population_priors == PopulationPrior[
-        PopulationPrior(:mu, :Intercept, -1.0, 2.0),
-        PopulationPrior(:mu, :x1, -1.0, 2.0)]
+    @test isempty(plan.population_priors)
+    @test only(plan.array_parameters).args == (arg1 = 1.0, arg2 = 2.0)
+    @test only(only(plan.predictors).terms).options.sign == -1
     plan = lower_rkppl(quote
         b1[axes(X, 2)] .~ Normal.(0, 1)
         b2[axes(Y, 2)] .~ Normal.(0, 1)
@@ -300,7 +297,7 @@ end
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1, :x2))
     @test length(plan.matrices) == 2
-    @test length(plan.population_priors) == 3
+    @test isempty(plan.population_priors)
     plan = lower_rkppl(quote
         b1[axes(X, 2)] .~ Normal.(0, 1)
         b2[axes(X, 2)] .~ Normal.(0, 1)
@@ -379,18 +376,18 @@ end
         (D, "got 2", quote X = hcat(1, x1); y .~ Normal.(X * 2, 1.0) end),
         (D, "has 2 elements (sized by `S`) but matrix `X` has 3 columns", quote b[axes(S, 2)] .~ Normal.(0, 1); S = hcat(1, x1); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (D, "sized by `Z`, which is not a design matrix", quote b[axes(Z, 2)] .~ Normal.(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        (D, "column x1 has two coefficients b and c", quote X = hcat(1, x1); mu = X * b .+ c .* x1; c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
-        (D, "column Intercept has two coefficients", quote X = hcat(1, 1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
         (Dz, "shared across predictors", quote X = hcat(1, x1); mu = X * b; nu = X * b; y .~ Normal.(mu, 1.0); z .~ Normal.(nu, 1.0) end),
         (Dg, "unidentified: intercept + full-cover factor", quote b[axes(X, 2)] .~ Normal.(0, 1); c[levels(g)] .~ Normal.(0, 2); X = hcat(1, x1); mu = X * b .+ c[g]; y .~ Normal.(mu, 1.0) end),
         (D, "literal scaling of a matmul", quote X = hcat(1, x1); mu = 2 * (X * b); y .~ Normal.(mu, 1.0) end),
         (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = x2 .* (X * b); y .~ Normal.(mu, 1.0) end),
         (D, "composes a matmul outside a term", quote X = hcat(1, x1); mu = exp.(X * b); y .~ Normal.(mu, 1.0) end),
-        (D, "scales a matmul by the parameter s", quote s ~ Exponential(1); X = hcat(1, x1); mu = s .* (X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "composes a matmul outside a term", quote s ~ Exponential(1); X = hcat(1, x1); mu = s .* (X * b); y .~ Normal.(mu, 1.0) end),
     ]
     for (data, msg, ast) in cases
         err = _mx_err(ast, data)
-        @test err isa SurfaceLoweringError && occursin(msg, err.message)
+        expected = startswith(msg, "unidentified:") ?
+            ContractValidationError : SurfaceLoweringError
+        @test err isa expected && occursin(msg, sprint(showerror, err))
     end
     # Named-definition RHS violations screen at extraction.
     err = _mx_err(quote X = hcat(1, x1); mu = X * 2; y .~ Normal.(mu, 1.0) end, D)
@@ -448,14 +445,13 @@ end
     # the admitted hierarchical spelling (see "matrix hierarchical
     # prior values vs oracle" below), so the arg-gate rejection case
     # moves to an unknown hyper name.
-    cases = [
-        ("is a vector — use `.~`", quote b[axes(X, 2)] ~ Normal(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("must be a literal, a scalar parameter or assignment name, or a 2-vector of those", quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
-        ("has 2 elements for 3 columns", quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
-    ]
-    for (msg, ast) in cases
-        err = _mx_err(ast, D)
-        @test err isa SurfaceLoweringError && occursin(msg, err.message)
+    ast = quote b[axes(X, 2)] ~ Normal(0, 1); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end
+    err = _mx_err(ast, D)
+    @test err isa SurfaceLoweringError && occursin("is a vector — use `.~`", err.message)
+    for ast in (quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(1, x1); mu = X * b; y .~ Normal.(mu, 1.0) end,
+            quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(1, x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end)
+        plan = lower_rkppl(ast, D)
+        @test_throws ContractValidationError bind_data(plan, _mx_cols())
     end
 end
 
@@ -509,7 +505,7 @@ end
     X1 = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
     cols = Dict{Symbol,AbstractVector}(:y => Y, :x1 => X1)
     plan = lower_rkppl(prog, (:y, :x1))
-    @test all(p -> p.scale === :s, plan.population_priors)
+    @test only(plan.array_parameters).args.arg2 === :s
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     kern = prepare_query(built, bound, :sampler)
@@ -517,9 +513,9 @@ end
         sum(logpdf(Normal(0, s), bj) for bj in b) +
         sum(logpdf(Normal(b[1] + b[2] * x, s), y)
             for (x, y) in zip(X1, Y)) + log(s)
-    for q in ((mu = [0.5, -0.25], s = 1.3), (mu = [0.5, -0.25], s = 0.7))
+    for q in ((b = [0.5, -0.25], s = 1.3), (b = [0.5, -0.25], s = 0.7))
         @test Base.invokelatest(kern, unconstrain(built.layout, q)) ≈
-            oracle(q.mu, q.s)
+            oracle(q.b, q.s)
     end
 end
 
@@ -561,13 +557,12 @@ end
     bmat = build_kernel(pmat)
     baff = build_kernel(paff)
     @test bmat.layout.total == baff.layout.total == 3
-    u = [0.5, -0.25, 0.1]
-    @test _query(bmat.spec, pmat, :likelihood, u) ≈
-        _query(baff.spec, paff, :likelihood, u)
-    @test _query(bmat.spec, pmat, :prior, u) ≈
-        _query(baff.spec, paff, :prior, u)
-    @test _query(bmat.spec, pmat, :posterior, u) ≈
-        _query(baff.spec, paff, :posterior, u)
+    umat = unconstrain(bmat.layout, (b = [0.5, -0.25], sigma = 1.3))
+    uaff = unconstrain(baff.layout, (a = 0.5, c = -0.25, sigma = 1.3))
+    for query in (:likelihood, :prior, :posterior)
+        @test _query(bmat.spec, pmat, query, umat) ≈
+            _query(baff.spec, paff, query, uaff)
+    end
 end
 
 @testset "matrix gradient" begin
@@ -640,9 +635,10 @@ end
     bmat = build_kernel(pmat)
     baff = build_kernel(paff)
     @test bmat.layout.total == baff.layout.total == 4
-    u = [0.5, -0.25, 0.1, 0.2]
-    @test _query(bmat.spec, pmat, :posterior, u) ≈
-        _query(baff.spec, paff, :posterior, u)
+    umat = unconstrain(bmat.layout, (b = [0.5, -0.25], d = 0.1, s = [0.4, 0.6]))
+    uaff = unconstrain(baff.layout, (a = 0.5, e = -0.25, d = 0.1, s = [0.4, 0.6]))
+    @test _query(bmat.spec, pmat, :posterior, umat) ≈
+        _query(baff.spec, paff, :posterior, uaff)
 end
 
 @testset "matrix surface r2d2" begin

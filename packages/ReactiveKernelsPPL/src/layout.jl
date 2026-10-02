@@ -193,9 +193,10 @@ end
 """
     assign_layout(plan) -> LayoutTable
 
-Assign packed coordinates: coefficient blocks in `plan.predictors` order,
-then sampled parameters, plate parameters, and vector parameters in plan
-order (pinned, deterministic). Assumes `validate_plan` passed.
+Assign packed coordinates: legacy coefficient blocks in `plan.predictors`
+order, then ordinary sampled, plate, vector and array parameters in plan
+order (pinned, deterministic). Affine readers add no coordinates.
+Assumes `validate_plan` passed.
 """
 function assign_layout(plan::StructuralPlan)
     isbound(plan) || throw(ContractValidationError(
@@ -203,12 +204,14 @@ function assign_layout(plan::StructuralPlan)
     entries = LayoutEntry[]
     offset = 1
     for pred in plan.predictors
+        pred = _legacy_predictor(pred)
         # A horseshoe predictor lays out no coefficient block: every
         # coordinate derives in-graph from its triple/Normal scalar (the
         # generator binds the same block name as a local).
         isempty(_horseshoe_for(plan, pred.name)) || continue
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
+        shape.width == 0 && continue
         runs = _coefficient_runs(plan, pred, shape)
         if isempty(runs) ||
                 (length(runs) == 1 && runs[1].transform === :identity)
@@ -242,6 +245,7 @@ function assign_layout(plan::StructuralPlan)
     glm_widths = Dict{Symbol,Int}()
     for r in plan.responses
         _is_glm_family(r.family) || continue
+        _is_array_param(plan, r.glm_beta) && continue
         m = _find_matrix(plan, r.predictor)
         K = count(c -> c !== nothing, m.columns)
         if haskey(glm_widths, r.glm_beta)

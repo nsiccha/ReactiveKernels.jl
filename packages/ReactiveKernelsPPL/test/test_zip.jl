@@ -119,13 +119,13 @@ _zip_ref(y::Integer, lam::Real, zi::Real) =
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
             end, _zip_cols())
-        q = (eta = [0.5, -0.25], zeta = [0.1, 0.2])
+        q = (a = 0.5, b = -0.25, d = 0.1, e = 0.2)
         got = _zip_posterior(kern, lay, q)
-        lam = exp.(q.eta[1] .+ q.eta[2] .* _ZIP_X)
-        zi = 1 ./ (1 .+ exp.(-(q.zeta[1] .+ q.zeta[2] .* _ZIP_Z)))
+        lam = exp.(q.a .+ q.b .* _ZIP_X)
+        zi = 1 ./ (1 .+ exp.(-(q.d .+ q.e .* _ZIP_Z)))
         want = sum(_zip_ref(y, l, p) for (y, l, p) in zip(_ZIP_C, lam, zi)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
-            logpdf(Normal(0, 1), q.zeta[1]) + logpdf(Normal(0, 1), q.zeta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+            logpdf(Normal(0, 1), q.d) + logpdf(Normal(0, 1), q.e)
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -155,7 +155,7 @@ end
                 eta = a .+ b .* x
                 zeta = d .+ e .* z
                 c .~ ZeroInflatedPoisson.(exp.(eta), logistic.(zeta))
-            end, _zip_cols(), (eta = [0.5, -0.25], zeta = [0.1, 0.2]))
+            end, _zip_cols(), (a = 0.5, b = -0.25, d = 0.1, e = 0.2))
     end
 end
 
@@ -254,15 +254,15 @@ _zip_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _zip_query(prog, cols)
         names = coordinate_names(lay)
-        u = _zip_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25, :zi => -0.8472978603872036])
+        u = _zip_sb_vec(names, [:a => 0.5,
+            :b => -0.25, :zi => -0.8472978603872036])
         @test abs(Base.invokelatest(kern, u) - (-173.01711623251802)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _zip_sb_vec(names, [Symbol("eta.Intercept") => 22.4353430049188,
-            Symbol("eta.x") => 1.0374802175167286, :zi => -8.139684118497991])
+        want = _zip_sb_vec(names, [:a => 22.4353430049188,
+            :b => 1.0374802175167286, :zi => -8.139684118497991])
         @test maximum(abs.(g .- want)) < 1e-10
     end
     @testset "Z2 literal zi" begin
@@ -277,15 +277,15 @@ _zip_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _zip_query(prog, cols)
         names = coordinate_names(lay)
-        u = _zip_sb_vec(names, [Symbol("eta.Intercept") => 0.5,
-            Symbol("eta.x") => -0.25])
+        u = _zip_sb_vec(names, [:a => 0.5,
+            :b => -0.25])
         @test abs(Base.invokelatest(kern, u) - (-169.883452686203)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _zip_sb_vec(names, [Symbol("eta.Intercept") => 19.760035335326634,
-            Symbol("eta.x") => 1.5136408591772776])
+        want = _zip_sb_vec(names, [:a => 19.760035335326634,
+            :b => 1.5136408591772776])
         @test maximum(abs.(g .- want)) < 1e-10
     end
     @testset "term-nuisance Z1 modeled zi" begin
@@ -309,19 +309,19 @@ _zip_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _zip_query(prog, _zip_cols())
         names = coordinate_names(lay)
-        u = _zip_sb_vec(names, [Symbol("eta.Intercept") => 0.2,
-            Symbol("eta.x") => -0.1, Symbol("zeta.Intercept") => -0.5,
-            Symbol("zeta.z") => 0.3])
+        u = _zip_sb_vec(names, [:a => 0.2,
+            :b => -0.1, :d => -0.5,
+            :e => 0.3])
         @test abs(Base.invokelatest(kern, u) - (-12.817555472510582)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
         want = _zip_sb_vec(names,
-            [Symbol("eta.Intercept") => 1.3994279452027645,
-                Symbol("eta.x") => 2.749163921471043,
-                Symbol("zeta.Intercept") => -0.3947193742893724,
-                Symbol("zeta.z") => 0.661995785655106])
+            [:a => 1.3994279452027645,
+                :b => 2.749163921471043,
+                :d => -0.3947193742893724,
+                :e => 0.661995785655106])
         @test maximum(abs.(g .- want)) < 1e-10
     end
 end

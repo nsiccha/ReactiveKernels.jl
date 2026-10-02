@@ -41,7 +41,13 @@ _vl_probe(built) = [0.27 * sin(1.3i) for i in 1:built.layout.total]
     for (body, data, q, mu, prior) in cases
         prog = _vl_program("s ~ Exponential(1); $body")
         bound, built, kern, lay = _bare_query(prog, data)
-        @test all(t.kind === ComposedTerm for p in bound.predictors for t in p.terms)
+        if haskey(q, :m)
+            term = only(only(bound.predictors).terms)
+            @test term.kind === InterceptTerm
+            @test term.options.parameter === :m
+        else
+            @test all(t.kind === ComposedTerm for p in bound.predictors for t in p.terms)
+        end
         @test Base.invokelatest(kern, unconstrain(lay, _value_q(lay, q))) ≈
             prior + sterm + sum(D.logpdf.(D.Normal(mu, 1.3), y)) rtol = 1e-12
         _check_gradient(built.spec, bound, _vl_probe(built))
@@ -71,13 +77,13 @@ _vl_probe(built) = [0.27 * sin(1.3i) for i in 1:built.layout.total]
         _value_q(lay, (; lm = 0.4)))) ≈ lterm +
         sum(D.logpdf.(D.Normal(exp(0.4), 1), y)) +
         sum(D.logpdf.(D.Normal(exp(0.4), 1), data[:z]))
-    # Existing signed coefficient aliases retain their coefficient plan.
+    # Signed affine aliases retain their ordinary parameter declaration.
     for rhs in ("a", "-a", "+a", "alias")
         alias = rhs == "alias" ? "alias = -a; " : ""
         p = lower_rkppl(_vl_program("a ~ Normal(0,1); $alias" *
             "m = $rhs; y .~ Normal.(m,1.0)"), (:y,))
         @test only(only(p.predictors).terms).kind === InterceptTerm
-        @test isempty(p.parameters)
+        @test only(p.parameters).name === :a
     end
 end
 

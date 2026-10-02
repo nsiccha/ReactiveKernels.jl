@@ -53,14 +53,21 @@ _array_flat_name(name::Symbol, ndims::Int) =
 
 # ── dims: forms and bind-time sizes ──────────────────────────────────
 
-_is_levels_dim(d) = d isa Expr && d.head === :call && length(d.args) == 2 &&
-    d.args[1] === :levels && d.args[2] isa Symbol
+_is_levels_dim(d) = d isa Expr && d.head === :call &&
+    length(d.args) in (2, 3) && d.args[1] === :levels &&
+    d.args[2] isa Symbol && (length(d.args) == 2 || d.args[3] isa QuoteNode)
+_levels_subset(d) = length(d.args) == 2 ? Colon() : d.args[3].value
 _is_axis_dim(d) = d isa Expr && d.head === :call && length(d.args) == 3 &&
     (d.args[1] === :axes || d.args[1] === :size) && d.args[2] isa Symbol &&
     (d.args[3] === 1 || d.args[3] === 2)
 
 function _validate_array_dim(p::ArrayParameter, d)
     d isa Int && d >= 1 && return nothing
+    if _is_levels_dim(d)
+        _validate_subset_shape(LevelMap(p.name, d.args[2], [], :levels,
+            _levels_subset(d)))
+        return nothing
+    end
     (_is_levels_dim(d) || _is_axis_dim(d) || _levels_count(d) !== nothing) &&
         return nothing
     _fail(p.label, "array $(p.name) axis $(repr(d)) is not a size: axes " *
@@ -87,8 +94,11 @@ _array_axis_levels(plan::StructuralPlan, p::ArrayParameter, g::Symbol) =
 
 function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d)
     d isa Int && return d
-    _is_levels_dim(d) &&
-        return length(_array_axis_levels(plan, name, label, d.args[2]))
+    if _is_levels_dim(d)
+        levels = _array_axis_levels(plan, name, label, d.args[2])
+        return length(_apply_subset(levels,
+            LevelMap(name, d.args[2], [], :levels, _levels_subset(d))))
+    end
     cnt = _levels_count(d)
     if cnt !== nothing
         g, k = cnt
@@ -133,9 +143,9 @@ function _validate_array_arg(p::ArrayParameter, key::Symbol, a)
     if a isa Expr && a.head === :vect
         isempty(a.args) && _fail(p.label, "array $(p.name) prior $key is " *
             "an empty vector")
-        all(x -> x isa Real && isfinite(x), a.args) || _fail(p.label,
-            "array $(p.name) prior $key: literal vectors hold finite " *
-            "numbers, got $(repr(a))")
+        for x in a.args
+            _validate_array_arg(p, key, x)
+        end
         return nothing
     end
     a isa Expr && return nothing
@@ -227,6 +237,7 @@ end
 # ── data validation ──────────────────────────────────────────────────
 
 function _validate_array_parameters_data(plan::StructuralPlan)
+    known = union(Set{Symbol}(_all_names(plan)), Set{Symbol}(keys(plan.columns)))
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
         all(>=(1), dims) || _fail(p.label, "array $(p.name) has an empty " *
@@ -241,6 +252,10 @@ function _validate_array_parameters_data(plan::StructuralPlan)
             continue
         end
         _is_structured_array(p) && continue
+        for (key, arg) in pairs(p.args), name in _expr_value_symbols(arg)
+            name in known || _fail(p.label,
+                "array $(p.name) prior $key references unknown name $name")
+        end
         length(dims) == 1 || continue
         K = dims[1]
         for (k, a) in pairs(p.args)
@@ -686,6 +701,11 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
     if ex isa Symbol
         (_is_array_param(plan, ex) || ex in _union_names(plan)) &&
             return push!(refs, ex)
+        # Whole-value data have no observation axis. An array definition
+        # retained by lowering reads these as bound operands, just like a
+        # scalar assignment or an undotted module call.
+        bound && haskey(plan.columns, ex) &&
+            ex in first(_bound_model_level_inputs(plan)) && return nothing
         _is_derived(plan, ex) && _fail(label, "derived column $ex is " *
             "per-observation — it does not combine with arrays here")
         bound && haskey(plan.columns, ex) && _fail(label, "column $ex is " *
@@ -1017,7 +1037,8 @@ _array_level_index_name(g::Symbol, h::Symbol) = Symbol(:_ppl_lvx_, h, :_, g)
 
 # Rewrite every level gather `z[g]` (a `levels(h)` axis) to an integer
 # gather over the level codes; integer axes stay plain Julia indexing.
-# Records the (g, h) code vectors it needs.
+# Records the (index column, array value) code vectors it needs. The value
+# identifies its declared axes, including a selected subset of levels.
 function _array_gather_rewrite(ex, plan::StructuralPlan,
         needed::Set{Tuple{Symbol,Symbol}})
     ex isa Expr || return ex
@@ -1033,9 +1054,16 @@ function _array_gather_rewrite(ex, plan::StructuralPlan,
     if _is_gather_ref(plan, ex)
         d = _gather_axes(plan, ex.args[1])[1]
         if _is_levels_dim(d)
-            g, h = ex.args[2], d.args[2]
-            push!(needed, (g, h))
-            return Expr(:ref, ex.args[1], _array_level_index_name(g, h),
+            g, name = ex.args[2], ex.args[1]
+            push!(needed, (g, name))
+            codes = _array_level_index_name(g, name)
+            if _levels_subset(d) !== Colon()
+                zero = length(_gather_axes(plan, name)) == 1 ? 0.0 :
+                    :(zeros(1, size($name, 2)))
+                return Expr(:ref, Expr(:call, :vcat, zero, name),
+                    Expr(:call, :.+, codes, 1), ex.args[3:end]...)
+            end
+            return Expr(:ref, name, codes,
                 ex.args[3:end]...)
         end
         return ex
@@ -1045,14 +1073,19 @@ function _array_gather_rewrite(ex, plan::StructuralPlan,
 end
 
 # The level-code vectors a plan's gathers read (data-only: `bound=` folds
-# them), one per (index column, axis column).
+# them), keyed by an array value or a plate cell's levels column.
 function _array_level_index_statements(plan::StructuralPlan,
         needed::Set{Tuple{Symbol,Symbol}})
     stmts = Expr[]
-    for (g, h) in sort!(collect(needed))
-        lv = _array_axis_levels(plan, h, :plan, h)
+    for (g, name) in sort!(collect(needed))
+        axes = _gather_axes(plan, name)
+        d = axes === nothing ? Expr(:call, :levels, name) : first(axes)
+        h = d.args[2]
+        lv = _array_axis_levels(plan, name, :plan, h)
+        lv = _apply_subset(lv, LevelMap(name, h, [], :levels,
+            _levels_subset(d)))
         lvlvec = Expr(:vect, (_level_literal(l) for l in lv)...)
-        push!(stmts, :($(_array_level_index_name(g, h)) =
+        push!(stmts, :($(_array_level_index_name(g, name)) =
             _declared_codes($g, $lvlvec)))
     end
     return stmts

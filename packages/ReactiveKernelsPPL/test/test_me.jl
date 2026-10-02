@@ -56,10 +56,10 @@ end
     @test mu.terms[2].columns == [:x_true]
     @test mu.terms[2].addressee === :x_true
     # The free coefficient keeps its stated prior, addressed at the latent.
-    priors = Dict((p.predictor, p.addressee) => p for p in plan.population_priors)
-    @test priors[(:mu, :Intercept)].location == 0.0
-    @test priors[(:mu, :x_true)].location == 0.0
-    @test priors[(:mu, :x_true)].scale == 2.0
+    priors = Dict(p.name => p for p in plan.parameters)
+    @test priors[:a].args.arg1 == 0
+    @test priors[:b].args.arg1 == 0
+    @test priors[:b].args.arg2 == 2
     # loc/scale ride the plate's shared scalar args; the observation keeps
     # the established LatentTerm location path (identical math).
     pp = only(plan.plate_parameters)
@@ -103,8 +103,8 @@ end
         :(y .~ Normal.(mu, sigma)),
         :(x_obs .~ Normal.(x_true, 0.5)))
     plan = lower_rkppl(ast, (:y, :x_obs))
-    priors = Dict((p.predictor, p.addressee) => p for p in plan.population_priors)
-    @test priors[(:mu, :x_true)] == PopulationPrior(:mu, :x_true, 0.0, 1.0)
+    priors = Dict(p.name => p for p in plan.parameters)
+    @test priors[:b].args == (arg1 = 0, arg2 = 1)
 end
 
 @testset "surface me lowering: bare latent stays fail-closed" begin
@@ -118,11 +118,12 @@ end
         :(a ~ Normal(0, 1)), :(sigma ~ Exponential(1)), plate,
         :(y .~ Normal.(a .+ x_true, sigma))), Dn)
     # Two coefficients on one latent column.
-    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+    twice = lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)), :(c ~ Normal(0, 1)),
         :(sigma ~ Exponential(1)),
         :(mu = a .+ b .* x_true .+ c .* x_true), plate,
         :(y .~ Normal.(mu, sigma))), Dn)
+    @test [t.options.parameter for t in only(p for p in twice.predictors if p.name === :mu).terms] == [:a, :b, :c]
     # A latent is not a factor index: the surface screens the inline
     # spelling, and the contract screens indexing in a named derived.
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
@@ -187,7 +188,7 @@ end
     @test :eta in [d.name for d in plan.derived]
 end
 
-@testset "surface me lowering: scalar-param read stays a transform" begin
+@testset "surface me lowering: scalar-param read retains its affine declaration" begin
     # A non-coefficient sampled read (Exponential `tau`) marks a latent
     # transform even with coefficient structure elsewhere.
     ast = Expr(:block,
@@ -200,8 +201,9 @@ end
         :(y .~ Normal.(eta, sigma)),
         :(x_obs .~ Normal.(x_true, 0.5)))
     plan = lower_rkppl(ast, (:y, :x_obs))
-    yloc = only(p for p in plan.predictors if p.name === :y_loc)
-    @test only(yloc.terms).kind === LatentTerm
+    eta = only(p for p in plan.predictors if p.name === :eta)
+    @test [t.options.parameter for t in eta.terms] == [:mu, :tau]
+    @test any(p -> p.name === :tau && p.family === :exponential, plan.parameters)
 end
 
 function _me_bound_plan()
@@ -358,7 +360,7 @@ end
     @test built.layout.total == 9
     u = [0.1, -0.2, 0.3, 0.5, -0.4, 0.2, -0.1, 0.0, 0.15]
     nt = constrain(built.layout, u)
-    a, b = nt.mu[1], nt.mu[2]
+    a, b = nt.a, nt.b
     ref = _me_oracle(plan.columns, a, b, nt.sigma, Vector(nt.x_true))
     @test abs(_query(built.spec, plan, :likelihood, u) -
         (ref.ll_main + ref.ll_obs)) < 1e-12
@@ -412,7 +414,7 @@ end
     u = [0.1, -0.2, 0.3, -0.15, 0.25, 0.5, -0.4, 0.2, -0.1, 0.0, 0.15]
     @test length(u) == built.layout.total
     nt = constrain(built.layout, u)
-    ref = _me_oracle(plan.columns, nt.mu[1], nt.mu[2], nt.sigma,
+    ref = _me_oracle(plan.columns, nt.a, nt.b, nt.sigma,
         Vector(nt.x_true); loc = nt.xloc, scale = nt.xsca)
     pr_extra = logpdf(Normal(0, 1), nt.xloc) + logpdf(Exponential(1), nt.xsca)
     @test _query(built.spec, plan, :likelihood, u) ≈

@@ -29,9 +29,9 @@ _dv_value(built, bound, preset, u) =
 # Distributions oracle.
 function _dv_check_regression(bound, sd)
     built = _dv_built(bound)
-    a, b = ReactiveKernelsPPL.constrain(built.layout, _DV_U).mu
-    @test coordinate_names(built.layout) ==
-        [Symbol("mu.Intercept"), Symbol("mu.x")]
+    th = ReactiveKernelsPPL.constrain(built.layout, _DV_U)
+    a, b = th.a, th.b
+    @test coordinate_names(built.layout) == [:a, :b]
     @test _dv_value(built, bound, :likelihood, _DV_U) ≈
         sum(logpdf.(Normal.(a .+ b .* _DV_X, sd), _DV_Y))
 end
@@ -129,7 +129,8 @@ end
         bound = bind_data(plan,
             Dict{Symbol,ColumnData}(:y => _DV_Y, :x => _DV_X, :tau => tau))
         built = _dv_built(bound)
-        a, b = ReactiveKernelsPPL.constrain(built.layout, _DV_U).mu
+        nt = ReactiveKernelsPPL.constrain(built.layout, _DV_U)
+        a, b = nt.a, nt.b
         @test _dv_value(built, bound, :prior, _DV_U) ≈
             logpdf(Normal(0, 5), a) + logpdf(Normal(0, tau), b)
     end
@@ -150,7 +151,7 @@ end
     built = _dv_built(bound)
     u = [0.2, -0.4, 0.1]
     th = ReactiveKernelsPPL.constrain(built.layout, u)
-    a, b = th.mu
+    a, b = th.a, th.b
     @test _dv_value(built, bound, :prior, u) ≈ logpdf(Normal(0, 5), a) +
         logpdf(Normal(0, 2), b) + logpdf(Exponential(1.5), th.sigma)
 end

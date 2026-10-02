@@ -96,10 +96,10 @@ end
         mu = map(1:24) do i
             si, gi = cols[:s][i], cols[:g][i]
             row = (Diagonal(nt.sd[si, :]) * nt.L[:, :, si]) * nt.z[gi, :]
-            only(nt.mu) + row[1] + cols[:x][i] * row[2]
+            nt.a + row[1] + cols[:x][i] * row[2]
         end
         hn(v) = logpdf(truncated(Normal(0, 1), 0, Inf), v)
-        oracle = logpdf(Normal(0, 5), only(nt.mu)) +
+        oracle = logpdf(Normal(0, 5), nt.a) +
             logpdf(Exponential(1), nt.sigma) + sum(hn, nt.sd) +
             sum(logpdf(LKJCholesky(2, 1.0),
                 Cholesky(LowerTriangular(nt.L[:, :, k]))) for k in 1:2) +

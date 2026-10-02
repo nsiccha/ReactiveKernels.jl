@@ -122,7 +122,7 @@ end
     built = build_kernel(bound)
     u = _oe_point(built.layout.total)
     nt = constrain(built.layout, u)
-    c, b = nt.c, only(nt.eta)
+    c, b = nt.c, nt.b
     @test c isa Vector{Float64} && issorted(c)
     lik = sum(_oe_cumulative_lp(_oe_logistic, b * x, c, y)
         for (x, y) in zip(cols[:x], cols[:y]))
@@ -154,7 +154,7 @@ end
         built = build_kernel(bound)
         u = _oe_point(built.layout.total)
         nt = constrain(built.layout, u)
-        c, b = nt.c, only(nt.eta)
+        c, b = nt.c, nt.b
         @test _query(built.spec, bound, :likelihood, u) ≈
             sum(_oe_cumulative_lp(F, b * x, c, y)
                 for (x, y) in zip(cols[:x], cols[:y]))
@@ -173,7 +173,7 @@ end
     built = build_kernel(bound)
     u = _oe_point(built.layout.total)
     nt = constrain(built.layout, u)
-    t, b = nt.t, only(nt.eta)
+    t, b = nt.t, nt.b
     @test length(t) == 2
     @test _query(built.spec, bound, :likelihood, u) ≈
         sum(_oe_stopping_lp(_oe_logistic, b * x, t, y)
@@ -198,7 +198,7 @@ end
     built = build_kernel(bound)
     u = _oe_point(built.layout.total)
     nt = constrain(built.layout, u)
-    k, a = nt.k, only(nt.mu)
+    k, a = nt.k, nt.a
     @test issorted(k)
     @test _query(built.spec, bound, :posterior, u) ≈
         logpdf(Normal(0, 1), a) + sum(logpdf.(Normal(0.5, 2), k)) +
@@ -219,7 +219,7 @@ end
     built = build_kernel(bound)
     u = _oe_point(built.layout.total)
     nt = constrain(built.layout, u)
-    c, b, a = nt.c, only(nt.y_eta), only(nt.mu)
+    c, b, a = nt.c, nt.b, nt.a
     @test _query(built.spec, bound, :posterior, u) ≈
         logpdf(Normal(), a) + logpdf(Normal(), b) + sum(logpdf.(Normal(), c)) +
         log(c[2] - c[1]) +
@@ -245,9 +245,9 @@ end
     w = nt.w
     @test length(w) == 3  # g has 4 distinct values
     @test _query(built.spec, bound, :posterior, u) ≈
-        logpdf(Normal(), only(nt.mu)) + logpdf(Exponential(1), nt.sigma) +
+        logpdf(Normal(), nt.a) + logpdf(Exponential(1), nt.sigma) +
         log(nt.sigma) + sum(logpdf.(Normal(), w)) +
-        sum(logpdf.(Normal.(only(nt.mu) .+ w[3] .* cols[:x], nt.sigma),
+        sum(logpdf.(Normal.(nt.a .+ w[3] .* cols[:x], nt.sigma),
             cols[:z]))
     # `k` beyond the level count leaves an empty axis: bind refuses it.
     empty = _oe_lower(quote

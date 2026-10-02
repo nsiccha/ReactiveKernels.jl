@@ -64,7 +64,7 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
             end, (:y, :x))
         r = only(plan.responses)
         @test (r.family, r.scale) === (WeibullFam, :k)
-        @test only(plan.parameters).family === :lognormal
+        @test only(p for p in plan.parameters if p.name === :k).family === :lognormal
     end
     @testset "per-observation k column" begin
         plan = lower_rkppl(quote
@@ -96,11 +96,11 @@ end
                 eta = a .+ b .* x
                 y .~ Weibull.(2.0, exp.(eta))
             end, _wb_cols())
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _wb_posterior(kern, lay, q)
-        th = exp.(q.eta[1] .+ q.eta[2] .* _WB_X)
+        th = exp.(q.a .+ q.b .* _WB_X)
         want = sum(_wb_ref(y, 2.0, t) for (y, t) in zip(_WB_Y, th)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
     @testset "LogNormal-sampled k" begin
@@ -111,11 +111,11 @@ end
                 eta = a .+ b .* x
                 y .~ Weibull.(k, exp.(eta))
             end, _wb_cols())
-        q = (eta = [0.5, -0.25], k = 1.8)
+        q = (a = 0.5, b = -0.25, k = 1.8)
         got = _wb_posterior(kern, lay, q)
-        th = exp.(q.eta[1] .+ q.eta[2] .* _WB_X)
+        th = exp.(q.a .+ q.b .* _WB_X)
         want = sum(_wb_ref(y, q.k, t) for (y, t) in zip(_WB_Y, th)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2]) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
             logpdf(LogNormal(0.0, 0.3), q.k) +
             logjac(lay, unconstrain(lay, q))
         @test got ≈ want rtol = 1e-12
@@ -129,12 +129,12 @@ end
                 eta = a .+ b .* x
                 y .~ Weibull.(kc, exp.(eta))
             end, cols)
-        q = (eta = [0.5, -0.25],)
+        q = (a = 0.5, b = -0.25,)
         got = _wb_posterior(kern, lay, q)
-        th = exp.(q.eta[1] .+ q.eta[2] .* _WB_X)
+        th = exp.(q.a .+ q.b .* _WB_X)
         want = sum(_wb_ref(y, kk, t)
             for (y, kk, t) in zip(_WB_Y, cols[:kc], th)) +
-            logpdf(Normal(0, 1), q.eta[1]) + logpdf(Normal(0, 1), q.eta[2])
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b)
         @test got ≈ want rtol = 1e-12
     end
 end
@@ -161,7 +161,7 @@ end
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Weibull.(2.0, exp.(eta))
-            end, _wb_cols(), (eta = [0.5, -0.25],))
+            end, _wb_cols(), (a = 0.5, b = -0.25,))
     end
     @testset "LogNormal-sampled k" begin
         _wb_enzyme_check(quote
@@ -170,7 +170,7 @@ end
                 k ~ LogNormal(0.0, 0.3)
                 eta = a .+ b .* x
                 y .~ Weibull.(k, exp.(eta))
-            end, _wb_cols(), (eta = [0.5, -0.25], k = 1.8))
+            end, _wb_cols(), (a = 0.5, b = -0.25, k = 1.8))
     end
     @testset "per-observation k column" begin
         cols = _wb_cols()
@@ -180,7 +180,7 @@ end
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 y .~ Weibull.(kc, exp.(eta))
-            end, cols, (eta = [0.5, -0.25],))
+            end, cols, (a = 0.5, b = -0.25,))
     end
 end
 
@@ -350,8 +350,8 @@ _wb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         end
         bound, built, kern, lay = _wb_query(prog, _wb_sb_cols())
         names = coordinate_names(lay)
-        u = _wb_sb_vec(names, [Symbol("eta.Intercept") => 1.0,
-            Symbol("eta.x") => 2.0, :k => 0.6931471805599453])
+        u = _wb_sb_vec(names, [:a => 1.0,
+            :b => 2.0, :k => 0.6931471805599453])
         # Measured dval 2.9e-11 (rel 2e-16; the probe oracle's own
         # association noise is 5.8e-11); the pin carries ~30x headroom.
         @test abs(Base.invokelatest(kern, u) - (-143289.1664852868)) < 1e-9
@@ -359,8 +359,8 @@ _wb_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         g = similar(u)
         sampler_value_and_gradient!(prep, g, u)
         @test all(isfinite, g)
-        want = _wb_sb_vec(names, [Symbol("eta.Intercept") => 286073.3722212652,
-            Symbol("eta.x") => -769310.6965998452,
+        want = _wb_sb_vec(names, [:a => 286073.3722212652,
+            :b => -769310.6965998452,
             :k => -1.586342950116091e6])
         # Measured maxabs 2.3e-10 (rel 1.5e-16); the pin carries ~40x
         # headroom.

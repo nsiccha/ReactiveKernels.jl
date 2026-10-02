@@ -29,9 +29,7 @@ _stev_posterior(kern, lay, q::NamedTuple) =
 # takes the grouped form (one coefficient vector per predictor), with
 # coefficients in `coordinate_names` order.
 function _stev_q(lay, a, b, s)
-    coefs = Dict(Symbol("mu.Intercept") => a, Symbol("mu.x") => b)
-    muv = [coefs[n] for n in coordinate_names(lay) if startswith(string(n), "mu.")]
-    return (; mu = muv, sigma = s)
+    return (; a, b, sigma = s)
 end
 
 @testset "student evidence lowering" begin
