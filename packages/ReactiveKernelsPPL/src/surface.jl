@@ -493,7 +493,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     model_names = union(data, Set{Symbol}(nm for (nm, _) in det),
         Set{Symbol}(s.lhs for s in sample),
         Set{Symbol}(nm for (nm, _, _, _) in plate_specs),
-        Set{Symbol}(s.state for s in scans),
+        Set{Symbol}(st for s in scans for st in s.states),
         Set{Symbol}(p.contrib for p in varying_pending),
         Set{Symbol}(p.draws_lhs for p in varying_pending),
         Set{Symbol}(s.name for s in schedules),
@@ -562,9 +562,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # 0, 1)`) and scale (`HalfNormal(s)` / `truncated(Normal(0, s), 0,
     # Inf)`) — the only names a `dar()` call accepts (checked during
     # response lowering, before `_lower_parameters` runs; the contract
-    # re-checks for hand-built plans). `_lower_parameters` re-keys both to
-    # Stan-kernel overrides (`_dar_stan_override`); the spellings stay
-    # Distributions-shaped.
+    # re-checks for hand-built plans). Both keep the meaning of the
+    # statement as written: Distributions semantics, truncation
+    # normalizers included.
     dar_beta_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && _is_dar_beta_rhs(s.rhs))
     dar_sigma_names = Set{Symbol}(s.lhs for s in sample
@@ -604,7 +604,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # Model-level array values: upstream's simplexes, ordered vectors, and
     # declared array parameters (`z[1:K] .~`, `L ~ LKJCholesky`, ...).
     shape_env = _ShapeEnv(
-        union(plate_names, Set{Symbol}(s.state for s in scans), varying_names),
+        union(plate_names, Set{Symbol}(st for s in scans for st in s.states),
+            varying_names),
         union(dirichlet_names, ordered_names, array_decls))
     detshape = _def_shapes(det, data, detmap; arrays = array_decls,
         env = shape_env)
@@ -652,7 +653,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         # Inline factor references inside compositions (`sg .* z[g]`)
         # intern as synthetic sub-predictors, one per `(base, index)`,
         # exactly like the named alias `zg = z[g]`.
-        scan_states = Set{Symbol}(s.state for s in scans),
+        scan_states = Set{Symbol}(st for s in scans for st in s.states),
         scan_coefs = Set{Symbol}(),
         varying_draws = Dict{Symbol,VaryingDraws}(
             d.label => d for d in varying_draws),
@@ -3816,13 +3817,16 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         arg isa Expr || _sfail("stray literal $(repr(arg)) at model level " *
                                "(only `~`, `.~`, `=` and reserved macros lower)")
         # `@scan begin <setup>; for … end end` — a sequential-recurrence block.
-        # Parsed into a `ScanSpec` here; its carried state is claimed as a
+        # Parsed into a `ScanSpec` here; each carried array is claimed as a
         # model-level latent name.
         if arg.head === :macrocall && arg.args[1] === Symbol("@scan")
             (length(arg.args) >= 3 && arg.args[end] isa Expr) ||
                 _sfail("@scan takes a `begin … end` block")
             sp = parse_scan_block(arg.args[end])
-            _claim!(seen, seelines, sp.state, line)
+            _screen_scan(sp, data)
+            for st in sp.states
+                _claim!(seen, seelines, st, line)
+            end
             push!(scans, sp)
             continue
         end
@@ -4205,7 +4209,7 @@ function _matrix_column(nm, c, detshape, detmap, data, prior_names,
     c in plate_names && _sfail("design matrix `$nm` over the latent " *
                                "vector `$c` is not in slice D1 (the me " *
                                "mirror stays affine)")
-    any(s -> s.state === c, scans) && _sfail("design matrix `$nm` over " *
+    any(s -> c in s.states, scans) && _sfail("design matrix `$nm` over " *
                                              "scan state `$c` is not in " *
                                              "slice D1 (data/derived " *
                                              "columns only)")
@@ -7780,8 +7784,20 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         # response mean IS the carried state (no linear predictor). Admitted
         # family/link is checked in `_validate_responses` (Gaussian-identity, v1).
         # A pin over a scan state claims nothing (no predictor is built) and
-        # falls through to the unconsumed-pin error.
+        # falls through to the unconsumed-pin error. A pure alias of one
+        # (`w = u`, a latent submodel's `x = x_level` binding) is that state:
+        # naming never changes legality.
         loc in ctx.scan_states && return loc
+        target = _scan_alias_target(loc, ctx)
+        if target !== nothing
+            # The alias chain vanishes like any absorbed location.
+            nm = loc
+            while nm !== target
+                push!(ctx.absorbed, nm)
+                nm = ctx.detmap[nm]
+            end
+            return target
+        end
         if !haskey(ctx.detmap, loc)
             # A bare sampled parameter (constrained-scale, no link
             # inversion): the mixture bare-mean slots, single-family
@@ -8977,10 +8993,11 @@ end
 # trajectory as a direct beta-free summand (SB's `dar(time)` shape —
 # the formula intercept is the initial level, the `mo1` splice shape).
 # Exactly two bare sampled scalars: a truncated-`[0, 1]`-Normal
-# persistence and a positive-Normal scale, both under Stan-kernel
-# semantics once lowered (`(:interval_stan, 0, 1)` / `:positive_stan`
-# via `_dar_stan_override` — SB never renormalizes bounds). Additive
-# only; one `dar()` call per predictor in v1. The state synthesizes as
+# persistence and a positive-Normal scale, each keeping the meaning of
+# its statement as written (Distributions semantics: the truncation and
+# half-Normal normalizers stay). The library spelling is the
+# `differenced_ar1` submodel (`src/library.jl`). Additive only; one
+# `dar()` call per predictor in v1. The state synthesizes as
 # `dar_<pname>` and claims the name up front (the
 # `_implicit_vector!` precedent). Both parameters record in `dar_coefs`
 # (checked disjoint from predictor coefficients after lowering) and
@@ -9036,6 +9053,18 @@ function _classify_dar(pname, core::Expr, sign::Int, ctx)
         state, state), nothing
 end
 
+# The scan state a pure alias chain (`w = u`, `v = w`) names, or nothing.
+function _scan_alias_target(nm::Symbol, ctx)
+    seen = Set{Symbol}()
+    while haskey(ctx.detmap, nm) && !(nm in seen)
+        push!(seen, nm)
+        nxt = ctx.detmap[nm]
+        nxt isa Symbol || return nothing
+        nm = nxt
+    end
+    return nm in ctx.scan_states && !isempty(seen) ? nm : nothing
+end
+
 function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     if core in ctx.varying_contribs
         sign < 0 && _sfail("predictor $pname: varying contribution " *
@@ -9065,10 +9094,15 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     core in ctx.plate_names && _sfail(
         "predictor $pname: bare latent $core is not a term — scale it " *
         "by a coefficient (`b .* $core`, the SB `me` mirror)")
-    core in ctx.scan_states && _sfail("predictor $pname: $core is a bare " *
-        "scan state — LP use needs a sampled coefficient (`b .* $core` " *
-        "in an additive position); a bare scan state is only a direct " *
-        "response location (`y .~ Normal.($core, s)`)")
+    if core in ctx.scan_states
+        # A bare scan state is a beta-free summand: the state spliced
+        # unscaled (`mu = a .+ x`, the dar/`mo1` shape). Additive only.
+        sign > 0 || _sfail("predictor $pname negates the scan state " *
+            "$core — scan summands are additive only (write `.+ $core`)")
+        label = Symbol("scan_", pname, "_", core)
+        return TermSpec(ScanSummandTerm, ColumnRef[],
+            (scan_id = core, coef = nothing), label, label), nothing
+    end
     haskey(ctx.detmap, core) && _scalar_summand_error(pname, core)
     core in ctx.prior_names && core ∉ ctx.coef_priors &&
         _scalar_summand_error(pname, core)
@@ -10157,25 +10191,6 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
 const _HOIST_FAMILIES = union(Set{Symbol}(keys(_PARAM_FAMILIES)),
     Set{Symbol}(keys(_COEF_FAMILIES)), Set{Symbol}((:HalfNormal, :HalfCauchy)))
 
-# A `dar()` trajectory parameter rides Stan-kernel semantics: the
-# persistence's `(:interval, 0, 1)` becomes `(:interval_stan, 0, 1)`
-# and the scale's `:positive` becomes `:positive_stan` — same
-# constrained transforms, NO truncation renormalizers (SB never
-# renormalizes bounds). Keyed on actual `dar()` USE (`dar_specs`), not
-# on RHS shape: a dar-shaped `~` never consumed by `dar()` keeps
-# Distributions semantics. `_classify_dar` already gated both shapes,
-# so a mismatch here is an internal inconsistency the contract
-# rejects downstream.
-function _dar_stan_override(p::SampledParameter, specs::Vector{DarSpec})
-    for s in specs
-        p.name === s.beta && return SampledParameter(p.name, p.family,
-            p.args, (:interval_stan, 0.0, 1.0), p.label)
-        p.name === s.sigma && return SampledParameter(p.name, p.family,
-            p.args, :positive_stan, p.label)
-    end
-    return p
-end
-
 function _lower_parameters(sample, coefuse, ctx, glmuse)
     params = SampledParameter[]
     syms = Set{Symbol}()
@@ -10240,7 +10255,6 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
             continue
         end
         p = _lower_parameter(s.lhs, s.rhs, coefuse, ctx.matrices)
-        p = _dar_stan_override(p, ctx.dar_specs)
         push!(params, p)
         for v in values(p.args)
             v isa Symbol && push!(syms, v)

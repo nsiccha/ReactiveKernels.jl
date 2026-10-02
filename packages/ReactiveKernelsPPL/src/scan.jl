@@ -12,19 +12,25 @@
 # named is resolved (user chose independent+reconcile, scan-lane decision
 # `0bowtxh`); the centered primitive landed on main @ `7fd989c`.
 #
-# Grammar (v1 — one carried array, literal backward lags):
+# Grammar — one or more carried arrays (a tuple carry), literal backward lags:
 #   @scan begin
-#       h[1] ~ Normal(0, 1)               # setup: literal-index seed fills 1..m
+#       x[1] = 0.0                        # setup: every carried array is seeded at
+#       d[1] = 0.0                        #   1..m, by a deterministic `=` or a
+#       h[1] ~ Normal(0, 1)               #   sampled `~` fill
 #       for t in (m+1):T                  # the recurrence; T literal Int or a data length name
 #           h[t] ~ Normal(phi*h[t-1], s)  # centered: sample the carried array at the loop index
 #           # or, non-centered:
 #           #   eps ~ Normal(0, 1)        # per-step local innovation (fresh bare name)
-#           #   h[t] = phi*h[t-1] + s*eps # deterministic carry write
+#           #   d[t] = beta*d[t-1] + s*eps # deterministic carry writes, run in order:
+#           #   x[t] = x[t-1] + d[t]      #   `d[t]` reads the value written above
 #       end
 #   end
-# Carried-array reads in a step RHS must be a backward lag `h[t-k]` (k≥1 literal);
-# the setup depth m must be ≥ the maximum lag. The observation lives OUTSIDE the
-# block (`y .~ Normal.(h, 1)`), so it is not part of `parse_scan_block`.
+# Statements run in order, as in a Julia loop body: a step reads a carried
+# array's backward lag `a[t-k]` (k ≥ 1 literal, k ≤ m), its current value `a[t]`
+# once an earlier step of the same iteration wrote it, and locals defined by
+# earlier steps. Each carried array is written exactly once per step. The
+# observation lives OUTSIDE the block (`y .~ Normal.(h, 1)`), so it is not
+# part of `parse_scan_block`.
 
 # The `ScanSpec` / `ScanStep` / `ScanSetup` IR structs live in `contract.jl`
 # (alongside the other IR specs, so `StructuralPlan` can reference them); this
@@ -66,10 +72,10 @@ function parse_scan_block(block; label::Union{Symbol,Nothing} = nothing)
         "(setup fills come first)")
     setups_ast = stmts[1:end-1]
     isempty(setups_ast) && _scan_fail(
-        "need at least one seed fill (`state[1] ~ Dist(…)`) before the loop")
+        "need at least one seed fill (`state[1] ~ Dist(…)` or " *
+        "`state[1] = value`) before the loop")
 
-    state, setup = _parse_scan_setup(setups_ast)
-    m = length(setup)
+    states, setup, m = _parse_scan_setup(setups_ast)
     loopvar, lo, hi = _parse_scan_for_head(forx, m)
 
     body = forx.args[2]
@@ -77,33 +83,52 @@ function parse_scan_block(block; label::Union{Symbol,Nothing} = nothing)
     step = ScanStep[]
     for s in body.args
         s isa LineNumberNode && continue
-        push!(step, _parse_scan_step(s, state, loopvar))
+        push!(step, _parse_scan_step(s, states, loopvar))
     end
     isempty(step) && _scan_fail("empty recurrence body")
     any(st -> st.indexed, step) || _scan_fail(
-        "the loop never writes the carried array `$(state)[$(loopvar)]` " *
-        "(each step is a fresh local); a scan must thread the state")
+        "the loop never writes a carried array (`$(first(states))[$(loopvar)]`; " *
+        "each step is a fresh local); a scan must thread the state")
+    _scan_check_order(step, states, loopvar)
 
-    maxlag = _scan_maxlag(step, state, loopvar)
+    maxlag = _scan_maxlag(step, states, loopvar)
     maxlag >= 1 || _scan_fail(
-        "no backward lag read of `$(state)` in the body — independent cells " *
-        "are `@plate`, not `@scan`")
+        "no backward lag read of a carried array in the body — independent " *
+        "cells are `@plate`, not `@scan`")
     m >= maxlag || _scan_fail(
         "the recurrence reads a lag of $(maxlag) but only $(m) initial " *
-        "value(s) are seeded; add `$(state)[1..$(maxlag)]` fills")
-    return ScanSpec(state, loopvar, lo, hi, setup, step, maxlag,
-        something(label, state))
+        "value(s) are seeded per carried array; add fills up to index $(maxlag)")
+    return ScanSpec(states, loopvar, lo, hi, setup, step, maxlag,
+        something(label, first(states)))
 end
 
+# Seed fills: `a[k] ~ Dist(…)` (sampled) or `a[k] = value` (deterministic).
+# Each carried array's fills are contiguous `a[1], a[2], …` in order; the
+# arrays may interleave, and every array is seeded to the same depth m (the
+# loop starts at m + 1). A deterministic seed reads scalars and earlier seeds
+# (`d[1] = x[1]`), never the loop's own values.
 function _parse_scan_setup(setups_ast)
-    state = nothing
+    states = Symbol[]
     setup = ScanSetup[]
+    next = Dict{Symbol,Int}()
+    # Every array a fill seeds is carried, whichever fill comes first: a
+    # seed reading `d[1]` above `d`'s own fill reads a value not seeded yet.
+    carried = Set{Symbol}()
+    for s in setups_ast
+        lhs = s isa Expr && s.head in (:call, :(=)) ?
+            (s.head === :call ? (length(s.args) == 3 ? s.args[2] : nothing) :
+                s.args[1]) : nothing
+        (lhs isa Expr && lhs.head === :ref && !isempty(lhs.args) &&
+            lhs.args[1] isa Symbol) && push!(carried, lhs.args[1])
+    end
     for (k, s) in enumerate(setups_ast)
-        (s isa Expr && s.head === :call && length(s.args) == 3 &&
-         s.args[1] === :~) || _scan_fail(
-            "setup statement $(k) must be `state[$(k)] ~ Dist(…)`, " *
-            "got $(repr(s))")
-        lhs = s.args[2]
+        sampled = s isa Expr && s.head === :call && length(s.args) == 3 &&
+            s.args[1] === :~
+        assigned = s isa Expr && s.head === :(=) && length(s.args) == 2
+        (sampled || assigned) || _scan_fail(
+            "setup statement $(k) must be a seed fill `state[i] ~ Dist(…)` " *
+            "or `state[i] = value`, got $(repr(s))")
+        lhs = sampled ? s.args[2] : s.args[1]
         (lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2) ||
             _scan_fail("setup LHS must be `state[<integer>]`, got $(repr(lhs))")
         nm, idx = lhs.args[1], lhs.args[2]
@@ -111,21 +136,59 @@ function _parse_scan_setup(setups_ast)
         idx isa Int || _scan_fail(
             "setup index must be a literal integer, got $(repr(idx)) " *
             "(a slice `state[1:p]` is not supported yet — write the lines out)")
-        if state === nothing
-            state = nm
-        elseif nm !== state
-            _scan_fail("all setup fills must seed the same carried array " *
-                       "`$(state)` (got `$(nm)`)")
+        want = get(next, nm, 1)
+        want == 1 && push!(states, nm)
+        idx == want || _scan_fail(
+            "setup fills of `$(nm)` must be contiguous `$(nm)[1], $(nm)[2], …`; " *
+            "expected index $(want), got $(idx)")
+        if sampled
+            fam, args = _scan_parse_dist(s.args[3], "setup `$(nm)[$(idx)]`")
+            for a in args
+                _scan_check_seed_reads(a, carried, next, "setup `$(nm)[$(idx)]`")
+            end
+            push!(setup, ScanSetup(nm, idx, :sample, fam, args, nothing))
+        else
+            _scan_check_seed_reads(s.args[2], carried, next,
+                "setup `$(nm)[$(idx)]`")
+            push!(setup, ScanSetup(nm, idx, :assign, nothing, nothing,
+                s.args[2]))
         end
-        idx == k || _scan_fail(
-            "setup fills must be contiguous `state[1], state[2], …`; " *
-            "expected index $(k), got $(idx)")
-        fam, args = _scan_parse_dist(s.args[3], "setup `$(nm)[$(idx)]`")
-        push!(setup, ScanSetup(idx, fam, args))
+        next[nm] = want + 1
     end
-    return state, setup
+    depths = Dict(a => next[a] - 1 for a in states)
+    m = depths[first(states)]
+    for a in states
+        depths[a] == m || _scan_fail(
+            "every carried array is seeded to the same depth (the loop starts " *
+            "one past it): `$(first(states))` has $(m) fill(s), `$(a)` has " *
+            "$(depths[a])")
+    end
+    return states, setup, m
 end
 
+# A seed reads scalars (parameters, definitions, literals) and seeds filled
+# above it (`a[j]`, j a literal index already seeded); anything else of a
+# carried array is not a value yet.
+function _scan_check_seed_reads(ex, states, next, what)
+    if ex isa Symbol
+        ex in states && _scan_fail(
+            "$what reads the whole carried array `$(ex)`; read a seeded " *
+            "element (`$(ex)[1]`)")
+        return nothing
+    end
+    ex isa Expr || return nothing
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in states
+        j = ex.args[2]
+        (j isa Int && 1 <= j < get(next, ex.args[1], 1)) || _scan_fail(
+            "$what reads `$(ex)`, which is not seeded above it (a seed reads " *
+            "scalars and earlier seeds by literal index)")
+        return nothing
+    end
+    for a in ex.args
+        _scan_check_seed_reads(a, states, next, what)
+    end
+    return nothing
+end
 function _parse_scan_for_head(forx, m)
     (forx.args[1] isa Expr && forx.args[1].head === :(=)) ||
         _scan_fail("malformed `for` head")
@@ -145,72 +208,133 @@ function _parse_scan_for_head(forx, m)
     return loopvar, lo, hi
 end
 
-function _parse_scan_step(s, state, loopvar)
+function _parse_scan_step(s, states, loopvar)
     if s isa Expr && s.head === :call && length(s.args) == 3 && s.args[1] === :~
         lhs = s.args[2]
-        target, indexed = _scan_step_lhs(lhs, state, loopvar, "`~`")
+        target, indexed = _scan_step_lhs(lhs, states, loopvar, "`~`")
         fam, args = _scan_parse_dist(s.args[3], "step `$(_scan_lhs_show(lhs))`")
         for a in args
-            _scan_check_reads(a, state, loopvar)
+            _scan_check_reads(a, states, loopvar)
         end
         return ScanStep(:sample, target, indexed, fam, args, nothing)
     elseif s isa Expr && s.head === :(=) && length(s.args) == 2
         lhs = s.args[1]
-        target, indexed = _scan_step_lhs(lhs, state, loopvar, "`=`")
-        _scan_check_reads(s.args[2], state, loopvar)
+        target, indexed = _scan_step_lhs(lhs, states, loopvar, "`=`")
+        _scan_check_reads(s.args[2], states, loopvar)
         return ScanStep(:assign, target, indexed, nothing, nothing, s.args[2])
     elseif s isa Expr && s.head in (:for, :while)
         _scan_fail("nested loops in a `@scan` body are not supported yet")
     elseif s isa Expr && s.head in (:if, :elseif)
         _scan_fail("branches in a `@scan` body are not supported")
     else
-        _scan_fail("a `@scan` step must be `state[$(loopvar)] ~ Dist(…)`, a " *
-                   "fresh `local ~ Dist(…)`, or an assignment; got $(repr(s))")
+        _scan_fail("a `@scan` step must be `state[$(loopvar)] ~ Dist(…)`, " *
+                   "`state[$(loopvar)] = …`, a fresh `local ~ Dist(…)`, or a " *
+                   "local assignment; got $(repr(s))")
     end
 end
 
-# Classify a step LHS. Returns (target, indexed). `indexed` means the carried
+# Classify a step LHS. Returns (target, indexed). `indexed` means a carried
 # array is written at the current loop index `state[loopvar]`.
-function _scan_step_lhs(lhs, state, loopvar, what)
+function _scan_step_lhs(lhs, states, loopvar, what)
     if lhs isa Symbol
-        lhs === state && _scan_fail(
-            "cannot rebind the whole carried array `$(state)` in the loop; " *
-            "write `$(state)[$(loopvar)]`")
+        lhs in states && _scan_fail(
+            "cannot rebind the whole carried array `$(lhs)` in the loop; " *
+            "write `$(lhs)[$(loopvar)]`")
+        lhs === loopvar && _scan_fail(
+            "cannot rebind the loop variable `$(loopvar)` in the loop")
         return lhs, false                      # a fresh per-step local
     elseif lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2
         nm, idx = lhs.args[1], lhs.args[2]
-        nm === state || _scan_fail(
-            "$(what) writes `$(nm)[…]`, but v1 threads exactly one carried " *
-            "array (`$(state)`); other indexed writes are not supported yet")
+        nm in states || _scan_fail(
+            "$(what) writes `$(nm)[…]`, which no setup fill seeds; seed every " *
+            "carried array before the loop (`$(nm)[1] = …` or " *
+            "`$(nm)[1] ~ Dist(…)`)")
         idx === loopvar || _scan_fail(
-            "the carried write must be at the loop index `$(state)[$(loopvar)]`, " *
+            "the carried write must be at the loop index `$(nm)[$(loopvar)]`, " *
             "got `$(_scan_lhs_show(lhs))` (a scan writes each index once, in order)")
-        return state, true
+        return nm, true
     else
-        _scan_fail("$(what) left-hand side must be `$(state)[$(loopvar)]` or a " *
+        _scan_fail("$(what) left-hand side must be `state[$(loopvar)]` or a " *
                    "fresh local name, got $(repr(lhs))")
     end
 end
 
 _scan_lhs_show(lhs) = string(lhs)
 
-# Walk an expression rejecting illegal reads of the carried array: a bare read
-# of the whole array, a current-index read `state[loopvar]`, or a forward lag.
-# The only admitted read is a backward lag `state[loopvar - k]` (k≥1 literal).
-function _scan_check_reads(ex, state, loopvar)
+# Walk an expression rejecting illegal reads of a carried array: a bare read
+# of the whole array or a forward lag. The admitted reads are a backward lag
+# `state[loopvar - k]` (k ≥ 1 literal) and the current value `state[loopvar]`
+# (legal once an earlier step wrote it — `_scan_check_order`).
+function _scan_check_reads(ex, states, loopvar)
     if ex isa Symbol
-        ex === state && _scan_fail(
-            "bare read of the carried array `$(state)` inside its own loop; " *
-            "read a backward lag `$(state)[$(loopvar)-1]`")
+        ex in states && _scan_fail(
+            "bare read of the carried array `$(ex)` inside its own loop; read " *
+            "a backward lag `$(ex)[$(loopvar)-1]`")
         return nothing
     end
     ex isa Expr || return nothing
-    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] === state
-        _scan_lag_of(ex.args[2], state, loopvar)   # validates; result used by _scan_maxlag
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in states
+        ex.args[2] === loopvar && return nothing
+        _scan_lag_of(ex.args[2], ex.args[1], loopvar)   # validates
         return nothing
     end
     for a in ex.args
-        _scan_check_reads(a, state, loopvar)
+        _scan_check_reads(a, states, loopvar)
+    end
+    return nothing
+end
+
+# Standard-Julia order inside one iteration: a local is read only after the
+# step that defines it, a carried array's current value `a[t]` only after the
+# step that writes it, each carried array is written exactly once, and a local
+# is defined once and never shadows a carried array.
+function _scan_check_order(step, states, loopvar)
+    locals = Set{Symbol}(st.target for st in step if !st.indexed)
+    defined = Set{Symbol}()
+    written = Set{Symbol}()
+    for st in step
+        reads = st.kind === :sample ? st.args : Any[st.expr]
+        for r in reads
+            _scan_check_defined(r, states, loopvar, locals, defined, written)
+        end
+        if st.indexed
+            st.target in written && _scan_fail(
+                "`$(st.target)[$(loopvar)]` is written twice in one step; each " *
+                "carried array is written exactly once per step")
+            push!(written, st.target)
+        else
+            st.target in defined && _scan_fail(
+                "the local `$(st.target)` is defined twice in one step; give " *
+                "each step local its own name")
+            push!(defined, st.target)
+        end
+    end
+    for a in states
+        a in written || _scan_fail(
+            "the carried array `$(a)` is seeded but never written in the loop " *
+            "(write `$(a)[$(loopvar)] = …` or `$(a)[$(loopvar)] ~ …`)")
+    end
+    return nothing
+end
+
+function _scan_check_defined(ex, states, loopvar, locals, defined, written)
+    if ex isa Symbol
+        (ex in locals && !(ex in defined)) && _scan_fail(
+            "the local `$(ex)` is read before the step that defines it")
+        return nothing
+    end
+    ex isa Expr || return nothing
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in states
+        (ex.args[2] === loopvar && !(ex.args[1] in written)) && _scan_fail(
+            "`$(ex.args[1])[$(loopvar)]` reads the value being written this " *
+            "step before it is written; read a backward lag " *
+            "`$(ex.args[1])[$(loopvar)-1]`, or write `$(ex.args[1])[$(loopvar)]` " *
+            "in an earlier step")
+        return nothing
+    end
+    args = ex.head === :call ? ex.args[2:end] : ex.args
+    for a in args
+        _scan_check_defined(a, states, loopvar, locals, defined, written)
     end
     return nothing
 end
@@ -236,12 +360,16 @@ function _scan_lag_of(idx, state, loopvar)
                "got $(repr(idx))")
 end
 
-function _scan_maxlag(step, state, loopvar)
-    maxlag = 0
+# Distinct backward lags `a[loopvar - k]` read across a scan's steps, per
+# carried array (current-value reads `a[loopvar]` are not lags).
+function _scan_lags(step, states, loopvar)
+    lags = Dict{Symbol,Set{Int}}(a => Set{Int}() for a in states)
     walk(ex) = begin
         if ex isa Expr
-            if ex.head === :ref && length(ex.args) == 2 && ex.args[1] === state
-                maxlag = max(maxlag, _scan_lag_of(ex.args[2], state, loopvar))
+            if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in states
+                ex.args[2] === loopvar ||
+                    push!(lags[ex.args[1]], _scan_lag_of(ex.args[2],
+                        ex.args[1], loopvar))
             else
                 for a in ex.args
                     walk(a)
@@ -258,5 +386,109 @@ function _scan_maxlag(step, state, loopvar)
             walk(st.expr)
         end
     end
-    return maxlag
+    return lags
+end
+
+_scan_maxlag(step, states, loopvar) =
+    maximum((isempty(l) ? 0 : maximum(l) for l in values(
+        _scan_lags(step, states, loopvar))); init = 0)
+
+# Shapes the parser admits but the emitter does not build yet, as one rule
+# shared by lowering (`SurfaceLoweringError`, so a program fails where it is
+# written) and the generator (`ContractValidationError`, for hand-built
+# plans). Returns the first gap's message, or `nothing`:
+# - a centered scan (`state[t] ~ dist`) is one carried array, sampled seeds
+#   and exactly one step;
+# - a non-centered scan writes every carried array deterministically, has at
+#   least one per-step innovation, and its latents (sampled seeds,
+#   innovations) have real support;
+# - no step reads the loop index directly.
+const _SCAN_LATENT_FAMILIES = (:normal, :cauchy, :student_t, :laplace, :logistic)
+
+function _scan_shape_gap(s::ScanSpec)
+    who = "scan $(join(s.states, ", "))"
+    for st in s.step
+        reads = st.kind === :sample ? st.args : Any[st.expr]
+        any(r -> _scan_mentions(r, s.loopvar, s.states), reads) &&
+            return "$who: a " *
+            "step uses the loop index `$(s.loopvar)` directly — not supported " *
+            "yet (read carried arrays, locals and scalars)"
+    end
+    carried = [st for st in s.step if st.indexed]
+    if !_is_noncentered_scan(s)
+        length(s.states) == 1 || return "$who: a centered scan " *
+            "(`state[t] ~ dist`) carries one array; a tuple carry writes each " *
+            "array deterministically (`state[t] = …`) from sampled innovations"
+        all(f -> f.kind === :sample, s.setup) || return "$who: a centered " *
+            "scan samples its seeds (`$(only(s.states))[1] ~ dist`); a " *
+            "deterministic seed needs the non-centered form " *
+            "(`eps ~ Normal(0, 1)`, `$(only(s.states))[t] = …`)"
+        length(s.step) == 1 || return "$who: a centered recurrence is " *
+            "exactly one step (`$(only(s.states))[$(s.loopvar)] ~ dist`); " *
+            "per-step locals need the non-centered form (innovation samples " *
+            "+ deterministic carry writes)"
+        return nothing
+    end
+    for st in carried
+        st.kind === :sample && return "$who: `$(st.target)[$(s.loopvar)] ~ …` " *
+            "samples a carried array while another carried write is " *
+            "deterministic — mixing centered and non-centered carried writes " *
+            "in one scan is not supported yet"
+    end
+    real = "real support (Normal, Cauchy, StudentT, Laplace or Logistic)"
+    for f in s.setup
+        (f.kind === :sample && !(f.family in _SCAN_LATENT_FAMILIES)) &&
+            return "$who: the sampled seed `$(f.target)[$(f.index)]` of a " *
+            "non-centered scan must have $real; got :$(f.family)"
+    end
+    innov = [st for st in s.step if st.kind === :sample && !st.indexed]
+    for st in innov
+        st.family in _SCAN_LATENT_FAMILIES || return "$who: the innovation " *
+            "`$(st.target)` must have $real; got :$(st.family)"
+    end
+    isempty(innov) && return "$who: a non-centered scan needs a per-step " *
+        "innovation (`eps ~ Normal(0, 1)`); a fully deterministic recurrence " *
+        "is not supported yet"
+    return nothing
+end
+
+# Whether `ex` reads the loop index `nm` outside a carried array's index
+# (`a[t - 1]`, `a[t]` are carried reads, not loop-index reads).
+_scan_mentions(ex, nm::Symbol, states) = ex === nm ||
+    (ex isa Expr &&
+     !(ex.head === :ref && !isempty(ex.args) && ex.args[1] in states) &&
+     any(a -> _scan_mentions(a, nm, states),
+        ex.head === :call ? ex.args[2:end] : ex.args))
+
+# Lowering-time screen of a parsed scan: an emitter gap (`_scan_shape_gap`)
+# or a data read inside the recurrence fails where the program is written.
+# Seeds and steps read scalars (parameters, definitions, literals); a data
+# column read per step (`y[t]`) is not supported yet.
+function _screen_scan(s::ScanSpec, data)
+    exprs = Any[]
+    for f in s.setup
+        f.kind === :sample ? append!(exprs, f.args) : push!(exprs, f.expr)
+    end
+    for st in s.step
+        st.kind === :sample ? append!(exprs, st.args) : push!(exprs, st.expr)
+    end
+    for ex in exprs
+        d = _scan_data_read(ex, data)
+        d === nothing || _scan_fail("scan $(join(s.states, ", ")) reads the " *
+            "data column `$(d)` — data-varying seeds and steps are not " *
+            "supported yet (a scan reads carried arrays, locals and scalars)")
+    end
+    gap = _scan_shape_gap(s)
+    gap === nothing || _scan_fail(gap)
+    return nothing
+end
+
+function _scan_data_read(ex, data)
+    ex isa Symbol && return ex in data ? ex : nothing
+    ex isa Expr || return nothing
+    for a in (ex.head === :call ? ex.args[2:end] : ex.args)
+        d = _scan_data_read(a, data)
+        d === nothing || return d
+    end
+    return nothing
 end

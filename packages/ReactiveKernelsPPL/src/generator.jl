@@ -643,13 +643,15 @@ end
 
 # One scan summand's direct expression (`state .* coef`, explicit dotted
 # form): the in-graph recurrence state scaled by its sampled scalar
-# coefficient. Both names resolve from the term's options (validated
-# up front; the lookups below are loud defense in depth).
+# coefficient, or the bare state for a beta-free summand (`coef ===
+# nothing`). Both names resolve from the term's options (validated up
+# front; the lookups below are loud defense in depth).
 function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
     o = t.options
-    any(s -> s.state === o.scan_id, plan.scans) || throw(ContractValidationError(
+    any(s -> o.scan_id in s.states, plan.scans) || throw(ContractValidationError(
         "[generator] scan summand in predictor $(pred.name) addresses " *
         "unknown scan :$(o.scan_id)"))
+    o.coef === nothing && return o.scan_id
     any(p -> p.name === o.coef, plan.parameters) || throw(ContractValidationError(
         "[generator] scan summand coef :$(o.coef) is not a sampled parameter"))
     return Expr(:call, :.*, o.scan_id, o.coef)
@@ -1783,7 +1785,7 @@ _predictor(plan::StructuralPlan, name::Symbol) =
 # scan-state or per-cell (plate) latent vector fed directly (its own name —
 # the layout view), or a linear predictor's `_ppl_lp_<name>` node otherwise.
 function _location_node(r::LikelihoodSpec, plan::StructuralPlan)
-    any(s -> s.state === r.predictor, plan.scans) && return r.predictor
+    any(s -> r.predictor in s.states, plan.scans) && return r.predictor
     _is_plate_param(plan, r.predictor) && return r.predictor
     return _lp_name(_predictor(plan, r.predictor))
 end
@@ -3782,25 +3784,6 @@ end
 
 # --- Sequential-recurrence (scan) density (slice 1: CENTERED) ---
 
-# Distinct backward lags `state[loopvar-j]` read across a step's dist args.
-function _scan_step_lags(step::ScanStep, state::Symbol, loopvar::Symbol)
-    lags = Set{Int}()
-    walk(ex) = begin
-        ex isa Expr || return
-        if ex.head === :ref && length(ex.args) == 2 && ex.args[1] === state
-            idx = ex.args[2]
-            if idx isa Expr && idx.head === :call && length(idx.args) == 3 &&
-               idx.args[1] === :- && idx.args[2] === loopvar && idx.args[3] isa Int
-                push!(lags, idx.args[3])
-                return
-            end
-        end
-        foreach(walk, ex.args)
-    end
-    step.args === nothing || foreach(walk, step.args)
-    return sort!(collect(lags))
-end
-
 # Replace each `state[loopvar-j]` lag read with its aligned-slice do-var.
 function _subst_scan_lags(ex, state::Symbol, loopvar::Symbol, dovar::Dict{Int,Symbol})
     ex isa Expr || return ex
@@ -3839,147 +3822,266 @@ function _subst_syms(ex, map::Dict{Symbol,Symbol})
     return Expr(ex.head, (_subst_syms(a, map) for a in ex.args)...)
 end
 
-# --- Non-centered scan reconstruction (AR(1) slice) ---
+# --- Non-centered scan reconstruction (tuple carry) ---
 
-# v1 admission for a non-centered scan: exactly one `Normal(0, 1)` seed (the
-# first innovation), exactly two steps (one non-indexed `Normal(0, 1)`
-# innovation sample + the indexed deterministic carry write), lag 1.
-# Returns (innovation_symbol, carry_write_expr); anything else throws
-# `ContractValidationError` naming the admitted shape.
-function _scan_noncentered_form(s::ScanSpec)
-    where = "[generator] scan $(s.state)"
-    _scan_stdnormal_seed(s) || throw(ContractValidationError(
-        "$where: non-centered v1 needs exactly one `Normal(0, 1)` seed " *
-        "(the first innovation)"))
-    length(s.step) == 2 || throw(ContractValidationError(
-        "$where: non-centered v1 needs exactly one innovation sample + " *
-        "one carry write, got $(length(s.step)) steps"))
-    first, second = s.step[1], s.step[2]
-    (first.kind === :sample && !first.indexed) || throw(ContractValidationError(
-        "$where: the innovation sample must precede the carry write " *
-        "(`eps ~ Normal(0, 1)` then `$(s.state)[$(s.loopvar)] = ...`)"))
-    _is_unit_normal(first.family, first.args) || throw(ContractValidationError(
-        "$where: the innovation `$(first.target)` must be `Normal(0, 1)` in v1"))
-    (second.kind === :assign && second.indexed) || throw(ContractValidationError(
-        "$where: the second step must be the deterministic carry write " *
-        "`$(s.state)[$(s.loopvar)] = ...`"))
-    s.maxlag == 1 || throw(ContractValidationError(
-        "$where: non-centered AR(p > 1) needs a tuple carry (planned)"))
-    return first.target, second.expr
+_scan_where(s::ScanSpec) = "[generator] scan $(join(s.states, ", "))"
+
+# The innovation steps of an emittable non-centered scan, in body order; a
+# shape the emitter does not build (`_scan_shape_gap`) throws
+# `ContractValidationError` naming the gap.
+function _scan_innovations(s::ScanSpec)
+    gap = _scan_shape_gap(s)
+    gap === nothing || throw(ContractValidationError("[generator] " * gap))
+    return ScanStep[st for st in s.step if st.kind === :sample && !st.indexed]
 end
 
-_scan_stdnormal_seed(s::ScanSpec) =
-    length(s.setup) == 1 && _is_unit_normal(s.setup[1].family, s.setup[1].args)
-
-_is_unit_normal(family, args) =
-    family === :normal && length(args) == 2 &&
-    args[1] isa Real && args[1] == 0 && args[2] isa Real && args[2] == 1
-
-# Translate a v1 carry-write RHS into the `scan(...)` step body: the lag-1
-# carried read becomes the carry do-var, the bare innovation becomes the
-# step-element do-var, and every other leaf must be a scalar parameter or
-# assignment name (threaded as a `Ref`). Returns (translated_expr,
-# sorted_refs). The contract never inspects step RHSs, so these leaves are
-# the only screen for hand-built plans — everything else fails closed.
-function _scan_step_body(s::ScanSpec, eps::Symbol, ex, scalars)
-    refs = Set{Symbol}()
-    body = _scan_translate_step(ex, s, eps, :_ppl_carry, :_ppl_elem, refs,
-        scalars)
-    return body, sort!(collect(refs))
+# Positions in the latent slice: sampled seeds first (setup order), then each
+# innovation's `n = T - m` per-step block (body order). Returns
+# (seedpos::Dict{(state, index) => position}, innovation ranges).
+function _scan_latent_positions(s::ScanSpec, innov, T::Int)
+    seedpos = Dict{Tuple{Symbol,Int},Int}()
+    pos = 0
+    for f in s.setup
+        f.kind === :sample || continue
+        pos += 1
+        seedpos[(f.target, f.index)] = pos
+    end
+    n = T - (s.lo - 1)
+    ranges = UnitRange{Int}[(pos + (j - 1) * n + 1):(pos + j * n)
+        for j in eachindex(innov)]
+    return seedpos, ranges
 end
 
-function _scan_translate_step(ex, s::ScanSpec, eps::Symbol, carry::Symbol,
-        elem::Symbol, refs::Set{Symbol}, scalars)
+# In-graph name of a seed's value (`_ppl_scan_init_<state>_<k>`).
+_scan_init_name(a::Symbol, k::Int) = Symbol(:_ppl_scan_init_, a, :_, k)
+
+# Translate a seed expression: an earlier seed `a[j]` becomes its value name;
+# every other leaf must be a scalar parameter or definition.
+function _scan_translate_seed(ex, s::ScanSpec, scalars)
     if ex isa Symbol
-        ex === eps && return elem
-        ex === s.loopvar && throw(ContractValidationError(
-            "[generator] scan $(s.state): the carry write uses the loop index " *
-            "`$(s.loopvar)` directly — not supported in v1"))
-        ex === s.state && throw(ContractValidationError(
-            "[generator] scan $(s.state): bare read of the carried state — " *
-            "read the backward lag `$(s.state)[$(s.loopvar) - 1]`"))
         ex in scalars || throw(ContractValidationError(
-            "[generator] scan $(s.state): step leaf `$(ex)` is not a scalar " *
-            "parameter or assignment (data-varying steps are planned)"))
-        push!(refs, ex)
+            "$(_scan_where(s)): seed leaf `$(ex)` is not a scalar parameter " *
+            "or definition"))
         return ex
     end
     ex isa Expr || return ex
-    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] === s.state
-        _scan_assert_lag1(ex.args[2], s)
-        return carry
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in s.states &&
+            ex.args[2] isa Int
+        return _scan_init_name(ex.args[1], ex.args[2])
     end
-    if ex.head === :ref
-        throw(ContractValidationError(
-            "[generator] scan $(s.state): indexed read `$(ex.args[1])[...]` " *
-            "in the carry write — v1 threads only the carried lag-1"))
-    end
+    ex.head === :ref && throw(ContractValidationError(
+        "$(_scan_where(s)): indexed read `$(ex)` in a seed is not supported"))
     args = ex.head === :call ? ex.args[2:end] : ex.args
-    newargs = [_scan_translate_step(a, s, eps, carry, elem, refs, scalars)
-        for a in args]
+    newargs = Any[_scan_translate_seed(a, s, scalars) for a in args]
     return ex.head === :call ?
         Expr(:call, ex.args[1], newargs...) : Expr(ex.head, newargs...)
 end
 
-function _scan_assert_lag1(idx, s::ScanSpec)
-    idx isa Expr && idx.head === :call && length(idx.args) == 3 &&
-        idx.args[1] === :- && idx.args[2] === s.loopvar &&
-        idx.args[3] isa Int && idx.args[3] == 1 && return nothing
-    throw(ContractValidationError(
-        "[generator] scan $(s.state): the carry write must read exactly " *
-        "`$(s.state)[$(s.loopvar) - 1]` in v1"))
+# The carry window: each carried array read at backward lags keeps its last
+# `L` values as `<state>_lag1 … <state>_lagL` fields of a NamedTuple carry.
+_scan_lag_field(a::Symbol, k::Int) = Symbol(a, :_lag, k)
+
+function _scan_windows(s::ScanSpec)
+    lags = _scan_lags(s.step, s.states, s.loopvar)
+    return [(a, isempty(lags[a]) ? 0 : maximum(lags[a])) for a in s.states]
 end
 
-# Reconstruction statements for every non-centered scan, in plan order:
-# the seed innovation heads the state, the tail folds over the rest —
-#   `rest = scan(view(z, 2:T), Ref(params)...; init = z[1]) do ... end`
-#   `state = vcat(z[1], rest)`
-# The split is load-bearing: a uniform scan from a zero carry would scale
-# the seed (`h[1] = s*z[1]` under `phi*carry + s*eps`), contradicting the
-# declared `Normal(0, 1)` seed — while the split reproduces SB's
-# `ar1_recurse` (`u[1] = eps[1]`) under ANY step formula. Runs before
-# predictors/likelihood (both may read the state); the innovation prior
-# stays in `_scan_prior_statements` (order-free).
+# Translate a step expression into the reconstruction's do-block: a lag read
+# `a[t - k]` becomes its carry field, a current read `a[t]` the value written
+# earlier this step, a local its in-step binding, and every other leaf must be
+# a scalar parameter or definition (threaded as a `Ref` and collected into
+# `refs`). The contract never inspects step expressions, so these leaves are
+# the only screen for hand-built plans — everything else fails closed.
+function _scan_translate_step(ex, s::ScanSpec, env, refs::Set{Symbol}, scalars)
+    where = _scan_where(s)
+    if ex isa Symbol
+        haskey(env.locals, ex) && return env.locals[ex]
+        ex === s.loopvar && throw(ContractValidationError(
+            "$where: a step uses the loop index `$(s.loopvar)` directly — not " *
+            "supported yet"))
+        ex in s.states && throw(ContractValidationError(
+            "$where: bare read of the carried array `$(ex)` — read the " *
+            "backward lag `$(ex)[$(s.loopvar) - 1]`"))
+        ex in scalars || throw(ContractValidationError(
+            "$where: step leaf `$(ex)` is not a scalar parameter or " *
+            "definition (data-varying steps are planned)"))
+        push!(refs, ex)
+        return ex
+    end
+    ex isa Expr || return ex
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in s.states
+        a, idx = ex.args[1], ex.args[2]
+        if idx === s.loopvar
+            haskey(env.current, a) || throw(ContractValidationError(
+                "$where: `$(a)[$(s.loopvar)]` is read before the step that " *
+                "writes it"))
+            return env.current[a]
+        end
+        k = _scan_lag_of(idx, a, s.loopvar)
+        return Expr(:., :_ppl_carry, QuoteNode(_scan_lag_field(a, k)))
+    end
+    ex.head === :ref && throw(ContractValidationError(
+        "$where: indexed read `$(ex.args[1])[...]` in a step — a step reads " *
+        "carried arrays, locals and scalars"))
+    args = ex.head === :call ? ex.args[2:end] : ex.args
+    newargs = Any[_scan_translate_step(a, s, env, refs, scalars) for a in args]
+    return ex.head === :call ?
+        Expr(:call, ex.args[1], newargs...) : Expr(ex.head, newargs...)
+end
+
+# The do-block body of one reconstruction: the steps in order, the next carry
+# window, and `(next, <output>)`. Returns (body statements, sorted refs).
+function _scan_step_block(s::ScanSpec, innov, output::Symbol, scalars)
+    refs = Set{Symbol}()
+    env = (; locals = Dict{Symbol,Any}(), current = Dict{Symbol,Symbol}())
+    for (j, st) in enumerate(innov)
+        env.locals[st.target] = Symbol(:_ppl_e, j)
+    end
+    body = Expr[]
+    for st in s.step
+        st.kind === :sample && continue          # an innovation: bound above
+        rhs = _scan_translate_step(st.expr, s, env, refs, scalars)
+        if st.indexed
+            nm = Symbol(:_ppl_scan_n_, st.target)
+            push!(body, :($nm = $rhs))
+            env.current[st.target] = nm
+        else
+            nm = Symbol(:_ppl_scan_l_, st.target)
+            push!(body, :($nm = $rhs))
+            env.locals[st.target] = nm
+        end
+    end
+    fields = Expr[]
+    for (a, L) in _scan_windows(s)
+        for k in 1:L
+            val = k == 1 ? env.current[a] :
+                Expr(:., :_ppl_carry, QuoteNode(_scan_lag_field(a, k - 1)))
+            push!(fields, Expr(:(=), _scan_lag_field(a, k), val))
+        end
+    end
+    push!(body, :(_ppl_next = $(Expr(:tuple, fields...))))
+    push!(body, :((_ppl_next, $(env.current[output]))))
+    return body, sort!(collect(refs))
+end
+
+# Reconstruction statements for every non-centered scan, in plan order. The
+# seeds bind first (`_ppl_scan_init_<a>_<k>`: a sampled seed reads its slice
+# coordinate, a deterministic one evaluates its expression). Each carried
+# array then folds its own RK-core `scan(...)` over the innovation blocks:
+#   `rest = scan(view(z, r₁), …, Ref(params)…; init = (a_lag1 = …, …)) do
+#        _ppl_carry, _ppl_e1, …, params…   # the steps, in order
+#        (next, <a's new value>) end`
+#   `a = vcat(<a's seeds>…, rest)`
+# The carry is the tuple of every carried array's lag window, seeded from the
+# last `L` seeds. One fold per carried array keeps every per-step output a
+# scalar (the RK scan output contract under Reactant); the planner prunes a
+# carried array nothing reads. Runs before predictors/likelihood (both may
+# read a state); the latent prior stays in `_scan_prior_statements`.
 function _scan_reconstruction_statements(plan::StructuralPlan,
         layout::LayoutTable)
     stmts = Expr[]
     scalars = _union_names(plan)
     for s in plan.scans
         _is_noncentered_scan(s) || continue
-        eps, expr = _scan_noncentered_form(s)
+        innov = _scan_innovations(s)
+        T = _scan_length(plan, s)
         zname = _scan_innovation_name(s)
-        entry = only(e for e in layout.entries
-            if e.kind === :scan && e.name === zname)
-        T = entry.size
-        body, refs = _scan_step_body(s, eps, expr, scalars)
-        next = :_ppl_next
-        lambda = Expr(:->, Expr(:tuple, :_ppl_carry, :_ppl_elem, refs...),
-            Expr(:block, :($next = $body), :(($next, $next))))
-        kw = Expr(:parameters, Expr(:kw, :init, :($(zname)[1])))
-        call = Expr(:call, :scan, kw, :(view($zname, 2:$T)),
-            (:(Ref($r)) for r in refs)...)
-        rest = Symbol(:_ppl_scan_rest_, s.state)
-        push!(stmts, :($rest = $(Expr(:do, call, lambda))))
-        push!(stmts, :($(s.state) = vcat($(zname)[1], $rest)))
+        any(e -> e.kind === :scan && e.name === zname, layout.entries) ||
+            throw(ContractValidationError("$(_scan_where(s)): layout has no " *
+                "latent slice :$zname"))
+        seedpos, ranges = _scan_latent_positions(s, innov, T)
+        for f in s.setup
+            nm = _scan_init_name(f.target, f.index)
+            val = f.kind === :sample ? :($zname[$(seedpos[(f.target, f.index)])]) :
+                _scan_translate_seed(f.expr, s, scalars)
+            push!(stmts, :($nm::Float64 = $val))
+        end
+        m = s.lo - 1
+        init = Expr[]
+        for (a, L) in _scan_windows(s), k in 1:L
+            push!(init, Expr(:(=), _scan_lag_field(a, k),
+                _scan_init_name(a, m - k + 1)))
+        end
+        seqs = Any[:(view($zname, $(first(r)):$(last(r)))) for r in ranges]
+        elems = Symbol[Symbol(:_ppl_e, j) for j in eachindex(innov)]
+        for a in s.states
+            body, refs = _scan_step_block(s, innov, a, scalars)
+            lambda = Expr(:->, Expr(:tuple, :_ppl_carry, elems..., refs...),
+                Expr(:block, body...))
+            kw = Expr(:parameters, Expr(:kw, :init, Expr(:tuple, init...)))
+            call = Expr(:call, :scan, kw, seqs..., (:(Ref($r)) for r in refs)...)
+            rest = Symbol(:_ppl_scan_rest_, a)
+            push!(stmts, :($rest = $(Expr(:do, call, lambda))))
+            seeds = [_scan_init_name(a, k) for k in 1:m]
+            push!(stmts, :($a = vcat($(seeds...), $rest)))
+        end
     end
     return stmts
 end
 
-# The non-centered innovation prior: the iid `Normal(0, 1)` plate-vector
-# prior shape over the `_ppl_scan_z_<state>` slice (one cell per step, same
-# `_plate_sum_stmts` reduction the `PlateParameter` path uses), totalled
-# under the scan-flavored `_ppl_scan_<state>` node.
+# The non-centered latent prior: each sampled seed's density at its slice
+# coordinate, and each innovation's density as a plate over its per-step
+# block (the `_plate_sum_stmts` reduction the `PlateParameter` path uses;
+# scalar distribution arguments thread as plate inputs), totalled under the
+# scan-flavored `_ppl_scan_<first state>` node. Seed and innovation arguments
+# read scalars (seed arguments may read earlier seeds); a per-step argument
+# that reads a carried array, a local or the loop index is not supported yet.
 function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
-        s::ScanSpec)
-    _scan_noncentered_form(s)    # fail closed unless the v1 shape holds
+        s::ScanSpec, plan::StructuralPlan)
+    innov = _scan_innovations(s)
+    T = _scan_length(plan, s)
+    scalars = _union_names(plan)
     zname = _scan_innovation_name(s)
-    cell = _family_logpdf_expr(:normal, Any[0, 1], _dovar(1))
-    node = Symbol(:_ppl_scan_, s.state)
-    pw = Symbol(:_ppl_scan_pw_, s.state)
-    append!(stmts, _plate_sum_stmts(pw, node, Any[zname], cell))
-    push!(nodes, node)
+    seedpos, ranges = _scan_latent_positions(s, innov, T)
+    head = first(s.states)
+    terms = Any[]
+    for f in s.setup
+        f.kind === :sample || continue
+        lp = Symbol(:_ppl_scan_seedlp_, f.target, :_, f.index)
+        args = Any[_scan_translate_seed(a, s, scalars) for a in f.args]
+        push!(stmts, :($lp::Float64 = $(_family_logpdf_expr(f.family, args,
+            :($zname[$(seedpos[(f.target, f.index)])])))))
+        push!(terms, lp)
+    end
+    for (j, st) in enumerate(innov)
+        caps = Symbol[]
+        for a in st.args
+            _scan_cell_caps!(caps, a)
+        end
+        for c in caps
+            c in scalars || throw(ContractValidationError(
+                "$(_scan_where(s)): the innovation `$(st.target)` reads " *
+                "`$(c)`, which is not a scalar parameter or definition " *
+                "(per-step innovation scales are not supported yet)"))
+        end
+        for a in st.args
+            _scan_reads_carried(a, s) && throw(ContractValidationError(
+                "$(_scan_where(s)): the innovation `$(st.target)` reads a " *
+                "carried array (per-step innovation scales are not supported " *
+                "yet)"))
+        end
+        inputs = Any[:(view($zname, $(first(ranges[j])):$(last(ranges[j]))))]
+        capmap = Dict{Symbol,Symbol}()
+        for c in caps
+            push!(inputs, c)
+            capmap[c] = _dovar(length(inputs))
+        end
+        cell = _family_logpdf_expr(st.family,
+            Any[_subst_syms(a, capmap) for a in st.args], _dovar(1))
+        node = Symbol(:_ppl_scan_innov_, head, :_, j)
+        pw = Symbol(:_ppl_scan_pw_, head, :_, j)
+        append!(stmts, _plate_sum_stmts(pw, node, inputs, cell))
+        push!(terms, node)
+    end
+    total = Symbol(:_ppl_scan_, head)
+    push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms))))
+    push!(nodes, total)
     return nothing
 end
+
+_scan_reads_carried(ex, s::ScanSpec) = ex isa Expr &&
+    ((ex.head === :ref && !isempty(ex.args) && ex.args[1] in s.states) ||
+     any(a -> _scan_reads_carried(a, s), ex.args))
 
 # Prior-density statements for every scan plus the total-node names to add to
 # the prior sum. Centered: the recurrence body is exactly one indexed `~` of
@@ -3991,47 +4093,44 @@ end
 function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
     stmts = Expr[]
     nodes = Symbol[]
-    for s in plan.scans
-        if _is_noncentered_scan(s)
-            _scan_noncentered_prior!(stmts, nodes, s)
+    for sc in plan.scans
+        if _is_noncentered_scan(sc)
+            _scan_noncentered_prior!(stmts, nodes, sc, plan)
             continue
         end
-        (length(s.step) == 1 && s.step[1].kind === :sample &&
-         s.step[1].indexed && s.step[1].target === s.state) || throw(
-            ContractValidationError("[generator] scan $(s.state): only centered " *
-                "recurrences (`$(s.state)[$(s.loopvar)] ~ dist`) and v1 " *
-                "non-centered recurrences (one innovation sample + one carry " *
-                "write) emit"))
-        step = s.step[1]
+        gap = _scan_shape_gap(sc)
+        gap === nothing || throw(ContractValidationError("[generator] " * gap))
+        state = only(sc.states)
+        step = sc.step[1]
         entry = only(e for e in layout.entries
-                     if e.kind === :scan && e.name === s.state)
+                     if e.kind === :scan && e.name === state)
         T = entry.size
-        m = length(s.setup)
+        m = length(sc.setup)
         terms = Any[]
-        for (k, f) in enumerate(s.setup)
-            seed = Symbol(:_ppl_scan_seed_, s.state, :_, k)
+        for (k, f) in enumerate(sc.setup)
+            seed = Symbol(:_ppl_scan_seed_, state, :_, k)
             push!(stmts, :($seed::Float64 =
-                $(_family_logpdf_expr(f.family, f.args, :($(s.state)[$k])))))
+                $(_family_logpdf_expr(f.family, f.args, :($(state)[$k])))))
             push!(terms, seed)
         end
-        lags = _scan_step_lags(step, s.state, s.loopvar)
-        inputs = Any[:(view($(s.state), $(m + 1):$T))]     # hcur → do-var _ppl_c1
+        lags = sort!(collect(_scan_lags([step], [state], sc.loopvar)[state]))
+        inputs = Any[:(view($(state), $(m + 1):$T))]     # hcur → do-var _ppl_c1
         dovar = Dict{Int,Symbol}()
         for (i, j) in enumerate(lags)
-            push!(inputs, :(view($(s.state), $(m + 1 - j):$(T - j))))
+            push!(inputs, :(view($(state), $(m + 1 - j):$(T - j))))
             dovar[j] = _dovar(i + 1)
         end
         # Substitute the lag reads, then thread the recurrence's captured scalars
         # (params/assignments) as explicit plate inputs — RK requires a plate
         # cell's distribution args to be caller ports, not lexical captures.
-        lagargs = [_subst_scan_lags(a, s.state, s.loopvar, dovar) for a in step.args]
+        lagargs = [_subst_scan_lags(a, state, sc.loopvar, dovar) for a in step.args]
         caps = Symbol[]
         for a in lagargs
             _scan_cell_caps!(caps, a)
         end
-        s.loopvar in caps && throw(ContractValidationError(
-            "[generator] scan $(s.state): the recurrence uses the loop index " *
-            "`$(s.loopvar)` directly — not supported in slice 1"))
+        sc.loopvar in caps && throw(ContractValidationError(
+            "[generator] scan $(state): the recurrence uses the loop index " *
+            "`$(sc.loopvar)` directly — not supported in slice 1"))
         capmap = Dict{Symbol,Symbol}()
         for c in caps
             push!(inputs, c)
@@ -4039,11 +4138,11 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         end
         cellargs = [_subst_syms(a, capmap) for a in lagargs]
         cell = _family_logpdf_expr(step.family, cellargs, _dovar(1))
-        recnode = Symbol(:_ppl_scan_rec_, s.state)
-        recpw = Symbol(:_ppl_scan_pw_, s.state)
+        recnode = Symbol(:_ppl_scan_rec_, state)
+        recpw = Symbol(:_ppl_scan_pw_, state)
         append!(stmts, _plate_sum_stmts(recpw, recnode, inputs, cell))
         push!(terms, recnode)
-        total = Symbol(:_ppl_scan_, s.state)
+        total = Symbol(:_ppl_scan_, state)
         push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms))))
         push!(nodes, total)
     end
