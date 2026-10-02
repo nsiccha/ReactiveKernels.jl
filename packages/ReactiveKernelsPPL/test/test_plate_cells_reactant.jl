@@ -55,7 +55,10 @@ function _pcr_measure(built, bound, u; expected = nothing, reference = nothing,
         @test Array(nextgrad) ≈ _findiff_grad(reference, nextu) rtol = 1e-5 atol = 1e-7
     end
     if structure_ad
-        both(w) = ad_value_and_gradient(q.ad, w)
+        # SamplerQuery keeps host-side layout metadata. Trace its documented
+        # AD field directly, as compile_ad_value_and_gradient does above.
+        ad = q.ad
+        both(w) = ad_value_and_gradient(ad, w)
         adhlo = repr(Reactant.@code_hlo optimize = false both(ru))
         for m in eachmatch(r"(?:stablehlo|enzyme)\.[a-z_]+", adhlo)
             key = "ad." * m.match

@@ -81,6 +81,10 @@ function _canon(io::IO, x, depth::Int = 0)
         catch
             ()
         end
+        # Empty lexical metadata changes no existing corpus model. Nonempty
+        # scopes remain serialized and require their own reviewed goldens.
+        x isa StructuralPlan && isempty(x.submodel_scopes) &&
+            (fs = filter(!=(:submodel_scopes), fs))
         if isempty(fs)
             print(io, repr(x))
         else
@@ -167,8 +171,9 @@ end
     end
     canon(group, margins, kws = Pair{Symbol,Any}[]) =
         sprint(_canon, lower_rkppl(prog(group, margins, kws), data))
-    plain_defaults = Pair{Symbol,Any}[:eta => 1.0, :sd => :(Normal(0, 1)),
-        :centered => false]
+    # Only supported defaults participate in parity. The removed centered
+    # keyword's refusal is checked in test_varying_centered.jl.
+    plain_defaults = Pair{Symbol,Any}[:eta => 1.0, :sd => :(Normal(0, 1))]
     mm_group = :(mm(g1, g2))
     mm_spelled = :(mm(g1, g2; normalize = true))
     gr_group = :(gr(g; by = b))

@@ -48,7 +48,7 @@ export KernelPlate, LinearPKScheduleSpec, LinearPKEventLPSpec
 export EVENT_LP_NAME
 export LevelMap
 export DesignMatrix
-export StructuralPlan
+export StructuralPlan, SubmodelScope
 export ContractValidationError, validate_plan, validate_structure, validate_data
 export topological_order, isbound, bind_data, COLUMN_ROLES
 export admitted_families, admitted_terms, admitted_functions, admitted_elementwise

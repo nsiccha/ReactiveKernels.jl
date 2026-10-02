@@ -86,7 +86,7 @@ end
     @test _plans_equal(got, _merge_lower(hand))
     # The swap is observable: the tight stream brings its namespaced scale.
     @test !_plans_equal(got, _merge_lower(merge_base))
-    @test any(p -> p.name === :y_u, got.parameters)
+    @test any(p -> _test_scope_name(got, p.name) === :y_u, got.parameters)
     @test length(got.responses) == 1 && got.responses[1].response === :y
 end
 
