@@ -644,21 +644,52 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         q, y = [0.3,-0.4], [1.0 4.0;2.0 5.0;3.0 6.0]
         kernel = prepare(structured_bound_like;
                          have=(:q,:y),want=:objective,bound=(;y))
+        # Each array leaf crosses as its own operand (depth-first); the
+        # scalar leaf stays a literal of the in-body rebuild.
         external, values = ReactiveKernels._externalize_bound_arrays(kernel)
-        @test only(values).weights isa SubArray
+        @test length(values) == 3
+        @test values[1] isa SubArray && values[3] isa SubArray
+        @test values[2] == [2,1,2]
         @test external(q,values...) == kernel(q)
         unchanged, none = ReactiveKernels._externalize_bound_arrays(
             kernel;min_elements=4)
         @test unchanged === kernel && isempty(none)
         prepared = prepare_ad(kernel,TEST_AD_BACKEND,q;active=:q)
-        data = only(prepared.external_values)
-        @test data.weights isa Vector && data.nested[1] isa Vector
-        @test data.rows == [2,1,2] && data.nested[2] == 0.5
+        weights, rows, nested = prepared.external_values
+        @test weights isa Vector && nested isa Vector
+        @test weights == y[:,1] && rows == [2,1,2] && nested == y[:,2]
         g = zeros(length(q))
         value,returned = ad_value_and_gradient!(prepared,g,q)
         @test value ≈ 2q[1]^2+4q[2]^2+0.5
         @test returned === g
         @test g ≈ [4q[1],8q[2]]
+    end
+
+    @testset "a folded multi-field schedule beside a view-read parameter" begin
+        # A data-only recipe folds to a named tuple of arrays; a parameter is
+        # read through `sum(view(u, i:i))` (the PPL layout read). Crossing as
+        # one structured operand, the pair failed native static activity
+        # analysis (EnzymeRuntimeActivityError) although plain Enzyme
+        # differentiates the same math; leaf operands cross cleanly (snag
+        # `interpolated-err-41772e14`).
+        schedule_reads(sched, b) = b .* sched.a .+ sched.k
+        @kernel folded_schedule_like(u::Vector{Float64},
+                s::Vector{@NamedTuple{a::Vector{Float64},k::Vector{Int}}}) = begin
+            b::Float64 = sum(view(u, 2:2))
+            sched = only(s)
+            objective::Float64 = sum(schedule_reads(sched, b))
+        end
+        s = [(; a = [1.0, 2.0], k = [1, 2])]
+        kernel = prepare(folded_schedule_like;
+                         have = (:u, :s), want = :objective, bound = (; s))
+        u = [0.3, 0.1]
+        prepared = prepare_ad(kernel, TEST_AD_BACKEND, u; active = :u)
+        @test prepared.external_values == (s[1].a, s[1].k)
+        g = zeros(2)
+        value, _ = ad_value_and_gradient!(prepared, g, u)
+        @test value ≈ kernel(u)
+        @test g ≈ [0.0, 3.0]
+        @test s == [(; a = [1.0, 2.0], k = [1, 2])]
     end
 
     @testset "bound matrix views externalize as owning copies" begin
