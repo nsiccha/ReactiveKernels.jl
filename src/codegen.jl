@@ -455,9 +455,10 @@ end
 # `include_init = true` scan writes the carry seed and then each output into
 # one buffer one element longer than the sequences (`[init]` when empty).
 function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
-                                      offset; consumer = nothing)
-    _scan_has_history(op) &&
-        return _lower_authored_scan_history_native!(body, op, callargs, lhs, offset)
+                                      offset; consumer = nothing, recycled = nothing,
+                                      pointwise_recycled = nothing)
+    _scan_has_history(op) && return _lower_authored_scan_history_native!(
+        body, op, callargs, lhs, offset; recycled)
     step = op.kernel
     indices, index, carry, output, output_type, position = gensym.((:scan_indices,
         :scan_index, :scan_carry, :scan_output, :scan_output_type, :scan_position))
@@ -503,9 +504,11 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     if lhs !== nothing && _scan_includes_init(op)
         seed, similar_ref = callargs[1], GlobalRef(Base, :similar)
         promote_ref, length_ref = GlobalRef(Base, :promote_type), GlobalRef(Base, :length)
-        push!(initial_output.args, :($lhs = $similar_ref($xs,
-            $promote_ref($typeof_ref($seed), $typeof_ref($output)),
-            $length_ref($indices) + 1)))
+        trajectory_type = :($promote_ref($typeof_ref($seed), $typeof_ref($output)))
+        allocation = :($similar_ref($xs, $trajectory_type, $length_ref($indices) + 1))
+        push!(initial_output.args, :($lhs = $(recycled === nothing ? allocation :
+            _lane_allocation(recycled, trajectory_type,
+                :(($(GlobalRef(Base, :OneTo))($length_ref($indices) + 1),)), allocation))))
         push!(initial_output.args, :($lhs[1] = $seed))
         push!(initial_output.args, :($lhs[2] = $output))
         push!(initial_output.args, :($position = 2))
@@ -516,8 +519,10 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
             $promote_ref($typeof_ref($seed), $output_type), 1)))
         push!(empty_output.args, :($lhs[1] = $seed))
     elseif lhs !== nothing
-        push!(initial_output.args, :($lhs = $(GlobalRef(Base, :similar))(
-            $xs, $typeof_ref($output))))
+        allocation = :($(GlobalRef(Base, :similar))($xs, $typeof_ref($output)))
+        push!(initial_output.args, :($lhs = $(recycled === nothing ? allocation :
+            _lane_allocation(recycled, :($typeof_ref($output)),
+                :($(GlobalRef(Base, :axes))($xs)), allocation))))
         push!(initial_output.args, :($lhs[$index] = $output))
         # The buffer shares the sequences' axes, which `index` comes from.
         push!(loop_output.args, _inbounds_expr(:($lhs[$index] = $output)))
@@ -539,10 +544,12 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
             push!(block.args, :($plate_eltype = $cell_type))
         end
         if pointwise_lhs !== nothing
-            for block in (initial_output, empty_output)
-                push!(block.args, :($pointwise_lhs = $(GlobalRef(Base, :similar))(
-                    $xs, $plate_eltype)))
-            end
+            allocation = :($(GlobalRef(Base, :similar))($xs, $plate_eltype))
+            push!(initial_output.args, :($pointwise_lhs = $(
+                pointwise_recycled === nothing ? allocation :
+                _lane_allocation(pointwise_recycled, plate_eltype,
+                    :($(GlobalRef(Base, :axes))($xs)), allocation))))
+            push!(empty_output.args, :($pointwise_lhs = $allocation))
             push!(initial_output.args, :($pointwise_lhs[$index] = $cell_output))
             push!(loop_output.args, :($pointwise_lhs[$index] = $cell_output))
             push!(final_output.args, :($pointwise_lhs =
@@ -578,7 +585,7 @@ end
 # `h0` at and after the current one: the in-place hand loop. Its element type
 # is `typeof(h0)`; an empty sequence runs no step and yields an empty vector.
 function _lower_authored_scan_history_native!(body, op::_AuthoredScanOp, callargs,
-                                              lhs, offset)
+                                              lhs, offset; recycled = nothing)
     lhs === nothing && throw(ArgumentError(
         "a `history =` scan materializes its output vector"))
     step = op.kernel
@@ -605,7 +612,7 @@ function _lower_authored_scan_history_native!(body, op::_AuthoredScanOp, callarg
         :($lhs[$index] = $output)]
     push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
     push!(body.args, :($lhs = $(module_ref(:_scan_history_buffer))(
-        $(first(seqs)), $fill_value)))
+        $((recycled === nothing ? () : (recycled,))...), $(first(seqs)), $fill_value)))
     push!(body.args, :($earlier = $(module_ref(:_ScanHistory))($lhs)))
     nonempty = Expr(:block,
         :($carry = $(callargs[1])),
@@ -958,6 +965,17 @@ function _plate_reduction_plan(inner::Plan, inner_kernel, dependencies,
        source = AI)
 end
 
+# Fill a recycled lane buffer (`_lane_reuse`) instead of evaluating
+# `allocation` when it fits; `recycled` is a recycle argument of
+# `_lower_with_ops`.
+function _lane_allocation(recycled, eltype, output_axes, allocation)
+    buffer = gensym(:lane_buffer)
+    Expr(:block,
+        :($buffer = $(GlobalRef(@__MODULE__, :_lane_reuse))(
+            $recycled, $eltype, $output_axes)),
+        :($buffer === nothing ? $allocation : $buffer))
+end
+
 # `@inbounds` for generated code, which carries no macro calls.
 _inbounds_expr(ex) = Expr(:block, Expr(:inbounds, true), ex, Expr(:inbounds, :pop))
 function _inbounds_value(ex)
@@ -1074,7 +1092,7 @@ end
 
 function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
                                        op::_AuthoredPlateOp, callargs, callvalues,
-                                       pointwise_lhs, total_lhs)
+                                       pointwise_lhs, total_lhs; recycled = nothing)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -1307,9 +1325,10 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     end
 
     if pointwise_lhs !== nothing
-        push!(body.args,
-            :($pointwise_lhs = $(GlobalRef(@__MODULE__, :_plate_similar_output))(
-                $marker, $plate_eltype, $output_axes)))
+        allocation = :($(GlobalRef(@__MODULE__, :_plate_similar_output))(
+            $marker, $plate_eltype, $output_axes))
+        push!(body.args, Expr(:(=), pointwise_lhs, recycled === nothing ? allocation :
+            _lane_allocation(recycled, plate_eltype, output_axes, allocation)))
     end
     accumulator = total_lhs === nothing ? nothing : gensym(:plate_total)
     if accumulator !== nothing
@@ -1516,10 +1535,16 @@ function _declare_typed_output!(body::Expr, value::Value, name, declared::Set{Sy
     push!(body.args, Expr(:local, Expr(:(::), name, T)))
 end
 
+# `recycle` lists (value id => argument name) pairs, appended to the signature
+# after the HAVE ports: each argument is `nothing` or a buffer that the value's
+# authored plate or scan may fill instead of allocating its output (the
+# position driver hands back the previous position's lane buffer,
+# `_lower_replicated_with_ops`). Any other producer ignores it.
 function _lower_with_ops(p::Plan; tensorized::Bool = false,
                          inline_embedded::Bool = true,
                          declare::Bool = !tensorized && inline_embedded &&
-                                         _needs_embedded_tensorization(p))
+                                         _needs_embedded_tensorization(p),
+                         recycle::Vector{Pair{Int,Symbol}} = Pair{Int,Symbol}[])
     g = p.graph
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
@@ -1527,6 +1552,9 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     for v in p.have
         push!(argexprs, :($(nm(v))::$(valtype(v))))
     end
+    append!(argexprs, (last(pair) for pair in recycle))
+    recycled(cid) = (index = findfirst(pair -> first(pair) == cid, recycle);
+                     index === nothing ? nothing : last(recycle[index]))
     body = Expr(:block)
     runtime_ops = Any[]
     runtime_recipes = Recipe[]
@@ -1577,7 +1605,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 consumer = (r.op.kernel, callargs, positions, cell_offset,
                             pointwise_lhs, total_lhs)
                 _lower_authored_scan_native!(
-                    body, scan_recipe.op, scan_args, nothing, scan_offset; consumer)
+                    body, scan_recipe.op, scan_args, nothing, scan_offset; consumer,
+                    pointwise_recycled = recycled(pointwise_id))
             elseif tensorized
                 _lower_authored_plate_tensorized!(
                     body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
@@ -1585,7 +1614,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             else
                 _lower_authored_plate_native!(
                     body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
-                    pointwise_lhs, total_lhs)
+                    pointwise_lhs, total_lhs; recycled = recycled(pointwise_id))
             end
             continue
         end
@@ -1618,7 +1647,10 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             else
                 consumer = _authored_scan_sum_consumer(p, r)
                 if consumer === nothing
-                    _lower_authored_scan_native!(body, r.op, callargs, lhs, scan_index)
+                    output = only(r.outputs)
+                    _lower_authored_scan_native!(body, r.op, callargs, lhs, scan_index;
+                        recycled = lhs === nm(output) ?
+                            recycled(canon_id(g, output.id)) : nothing)
                 else
                     # Emit at the plate, where all its scalar inputs are ready.
                     # The reserved table slots keep both backend products equal.
@@ -1776,6 +1808,46 @@ end
 @inline _replicated_project(arg::Tuple, index) =
     map(value -> _replicated_project(value, index), arg)
 
+# A batched dense numeric array port projects every position into one lane
+# buffer of the projection's own type (`Array{T,N-1}`), so the scalar residual
+# sees exactly what `_replicated_project` gives it without allocating per
+# position. The driver copies every WANT into the stacked result before the
+# next position overwrites the lane, and a residual recipe is pure, so no
+# position's value is read after its lane is reused. Other leaves keep the
+# ordinary projection (`nothing` lane).
+_replicated_lane(arg) = nothing
+_replicated_lane(arg::Vector{<:Number}) = nothing
+_replicated_lane(arg::Array{T,N}) where {T<:Number,N} =
+    Array{T,N - 1}(undef, Base.front(size(arg)))
+_replicated_lane(arg::Union{Tuple,NamedTuple}) = map(_replicated_lane, arg)
+# A borrowed reader keeps its dense lanes between calls (`_borrowed_batch`).
+_replicated_lane!(slot, arg) = _replicated_lane(arg)
+_replicated_lane!(slot, arg::Vector{<:Number}) = nothing
+@inline function _replicated_lane!(slot, arg::Array{T,N}) where {T<:Number,N}
+    lane = slot[]
+    lane isa Array{T,N - 1} && size(lane) == Base.front(size(arg)) && return lane
+    fresh = _replicated_lane(arg)
+    slot[] = fresh
+    fresh
+end
+@inline _replicated_project!(::Nothing, arg, index) = _replicated_project(arg, index)
+@inline function _replicated_project!(lane::Array{T}, arg::Array{T,N}, index) where {T,N}
+    count = length(lane)
+    copyto!(lane, 1, arg, (index - 1) * count + 1, count)
+end
+@inline _replicated_project!(lane::Tuple, arg::Tuple, index) =
+    map((item, value) -> _replicated_project!(item, value, index), lane, arg)
+@inline _replicated_project!(lane::NamedTuple{K}, arg::NamedTuple{K}, index) where {K} =
+    map((item, value) -> _replicated_project!(item, value, index), lane, arg)
+
+# The previous call's lane buffer for a WANT declared as a dense array, kept by
+# a borrowed reader; any other WANT starts each call by allocating.
+@inline _replicated_recycled(slot, ::Type) = nothing
+@inline function _replicated_recycled(slot, ::Type{A}) where {A<:Array}
+    buffer = slot[]
+    buffer isa A ? buffer : nothing
+end
+
 @inline function _replicated_output(::Type{T}, replica_count) where {T<:Number}
     Vector{T}(undef, replica_count)
 end
@@ -1916,8 +1988,8 @@ end
 # Lower one part as `prepare` lowers a scalar kernel. Every output is declared,
 # as the position driver always did: its body is host-only by construction
 # (a traced batch calls the scalar target through `_replica`).
-_replicated_part_ast(part::Plan) =
-    _lower_with_ops(_fuse_authored_plate_chains(part); declare = true)
+_replicated_part_ast(part::Plan; recycle = Pair{Int,Symbol}[]) =
+    _lower_with_ops(_fuse_authored_plate_chains(part); declare = true, recycle)
 
 # A bound constant keeps its exact value type (a bound view stays a view).
 function _replicated_declares(p::Plan, value::Value)
@@ -1943,25 +2015,49 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
         ast, ops, _ = _replicated_part_ast(parts.prefix)
         ast, ops
     end
-    residual_ast, residual_ops, _ = _replicated_part_ast(parts.residual)
+    # A WANT whose residual producer is an authored plate or scan receives the
+    # previous position's value of that WANT as its buffer (`recycle`, see
+    # `_lower_with_ops`): it was copied into the stacked result, so the next
+    # position overwrites it instead of allocating. A borrowed reader keeps it
+    # between calls when the WANT is declared as a dense array.
+    nout, nhave = length(p.want), length(p.have)
+    recycle = Pair{Int,Symbol}[]
+    recycle_wants = Int[]
+    for (output_index, v) in enumerate(p.want)
+        cid = canon_id(g, v.id)
+        cid in have_ids && continue
+        any(pair -> first(pair) == cid, recycle) && continue
+        producer = get(parts.residual.producer, cid, nothing)
+        producer isa Recipe &&
+            producer.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} || continue
+        push!(recycle, cid => gensym(Symbol(v.name, :_recycled)))
+        push!(recycle_wants, output_index)
+    end
+    recycle_vars = Any[gensym(Symbol(p.want[k].name, :_lane)) for k in recycle_wants]
+    residual_ast, residual_ops, _ = _replicated_part_ast(parts.residual; recycle)
     residual_offset = length(prefix_ops)
+    lane_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_lane))
+                     for v in parts.residual.have if mapped(canon_id(g, v.id)))
 
-    # One per-position block: project the batched ports, then the spliced
-    # residual body binds one fresh local per WANT. `_embedded_statements`
-    # renames every residual local, so the first-position block and the loop
-    # body are independent copies of the same scalar program.
-    function position_block!(destination, replica_index, want_vars)
+    # One per-position block: project the batched ports into their lanes, then
+    # the spliced residual body binds one fresh local per WANT.
+    # `_embedded_statements` renames every residual local, so the
+    # first-position block and the loop body are independent copies of the
+    # same scalar program.
+    function position_block!(destination, replica_index, want_vars, recycled)
         callargs = Any[]
         for v in parts.residual.have
             if mapped(canon_id(g, v.id))
                 projected = gensym(Symbol(v.name, :_position))
-                push!(destination.args,
-                      :($projected = _replicated_project($(nm(v)), $replica_index)))
+                push!(destination.args, :($projected = $(GlobalRef(@__MODULE__,
+                    :_replicated_project!))($(lane_vars[canon_id(g, v.id)]),
+                    $(nm(v)), $replica_index)))
                 push!(callargs, projected)
             else
                 push!(callargs, nm(v))
             end
         end
+        append!(callargs, recycled)
         for (v, variable) in zip(p.want, want_vars)
             canon_id(g, v.id) in have_ids && continue
             _replicated_declares(p, v) &&
@@ -2024,12 +2120,32 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
             prefix_ast, Any[nm(v) for v in parts.prefix.have], lhs, 0))
     end
 
+    # Borrowed cache slots: the stacked outputs, then one lane per HAVE port,
+    # then one recycled buffer per WANT (`_borrowed_batch_slot_count`).
+    slot(index) = Expr(:ref, :__output_caches__, index)
+    for (position, v) in enumerate(p.have)
+        lane = get(lane_vars, canon_id(g, v.id), nothing)
+        lane === nothing && continue
+        allocation = reuse ?
+            Expr(:call, GlobalRef(@__MODULE__, :_replicated_lane!),
+                 slot(nout + position), nm(v)) :
+            Expr(:call, GlobalRef(@__MODULE__, :_replicated_lane), nm(v))
+        push!(body.args, Expr(:(=), lane, allocation))
+    end
+    first_recycled = Any[reuse ?
+        :($(GlobalRef(@__MODULE__, :_replicated_recycled))(
+            $(slot(nout + nhave + k)), $(valtype(p.want[k])))) :
+        nothing for k in recycle_wants]
+
     output_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_batched))
                        for v in p.want)
     first_index = gensym(:replica_index)
     first_vars = Any[gensym(Symbol(v.name, :_first)) for v in p.want]
     push!(body.args, :($first_index = 1))
-    position_block!(body, first_index, first_vars)
+    position_block!(body, first_index, first_vars, first_recycled)
+    for (lane, k) in zip(recycle_vars, recycle_wants)
+        push!(body.args, :($lane = $(first_vars[k])))
+    end
     for (output_index, v) in enumerate(p.want)
         cid = canon_id(g, v.id)
         value = first_vars[output_index]
@@ -2045,18 +2161,26 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
 
     rest_body = Expr(:block)
     rest_vars = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
-    position_block!(rest_body, :replica_index, rest_vars)
+    position_block!(rest_body, :replica_index, rest_vars, recycle_vars)
     for (output_index, v) in enumerate(p.want)
         push!(rest_body.args,
               Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
                    output_vars[canon_id(g, v.id)], :replica_index,
                    rest_vars[output_index]))
     end
+    for (lane, k) in zip(recycle_vars, recycle_wants)
+        push!(rest_body.args, :($lane = $(rest_vars[k])))
+    end
     push!(body.args, Expr(:for,
         Expr(:(=), :replica_index,
              Expr(:call, GlobalRef(Base, :OneTo), :replica_count)),
         Expr(:if, Expr(:call, GlobalRef(Base, :(==)), :replica_index, 1),
              Expr(:block, Expr(:continue)), rest_body)))
+    if reuse
+        for (lane, k) in zip(recycle_vars, recycle_wants)
+            push!(body.args, :($(slot(nout + nhave + k))[] = $lane))
+        end
+    end
     retval = length(p.want) == 1 ? only(values(output_vars)) :
              Expr(:tuple, (output_vars[canon_id(g, v.id)] for v in p.want)...)
     push!(body.args, Expr(:return, retval))
@@ -3134,27 +3258,33 @@ struct BorrowedBatchedKernel{K,F,O,C}
     caches::C
     ast::Expr
 end
-_borrowed_batch_caches(boundary) = map(_ -> Ref{Any}(nothing), boundary)
+# One slot per stacked output, then one input lane per HAVE port and one
+# recycled lane buffer per WANT (`_lower_replicated_with_ops`).
+_borrowed_batch_slot_count(target) =
+    2 * length(outputs(target)) + length(inputs(target))
+_borrowed_batch_caches(count::Int) = ntuple(_ -> Ref{Any}(nothing), count)
 function _borrowed_batch(target::GraphReplicatedKernel)
     ast, ops = _lower_replicated_with_ops(
         target.plan; batched=batched_ports(target), reuse=true)
     BorrowedBatchedKernel(target, compile(ast), ops,
-                          _borrowed_batch_caches(target.outputs), ast)
+        _borrowed_batch_caches(_borrowed_batch_slot_count(target)), ast)
 end
 
 # A new native execution instance shares the read-only computation, not the
 # buffers of an earlier call. No planning, lowering or compilation occurs.
 Base.copy(kernel::BorrowedBatchedKernel) =
     BorrowedBatchedKernel(kernel.target, kernel.native, kernel.ops,
-                         _borrowed_batch_caches(outputs(kernel)), kernel.ast)
+                         _borrowed_batch_caches(length(kernel.caches)), kernel.ast)
 
-@inline function (kernel::BorrowedBatchedKernel)(args...)
+@inline function (kernel::BorrowedBatchedKernel)(args::Vararg{Any,N}) where {N}
     length(args) == length(inputs(kernel)) || throw(MethodError(kernel, args))
     _dynamic_tensorized_marker(args) === nothing || throw(ArgumentError(
         "reuse=true borrows native output buffers; compile the owning batch instead"))
-    for slot in kernel.caches
+    for index in 1:length(outputs(kernel))
         # A caller may feed an earlier borrowed output into the next call.
         # Detach in that case so no input is modified through an output alias.
+        # The lane slots after the outputs never leave the call.
+        slot = kernel.caches[index]
         _replicated_aliases(slot[], args) && (slot[] = nothing)
     end
     kernel.native(kernel.ops, kernel.caches, args...)
