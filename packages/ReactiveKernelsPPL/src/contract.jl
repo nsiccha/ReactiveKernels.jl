@@ -3179,8 +3179,11 @@ function _expr_names!(out::Set{Symbol}, ex)
     return nothing
 end
 
-function _validate_columns(plan::StructuralPlan)
-    plan.n_obs > 0 || _fail(:plan, "n_obs must be positive, got $(plan.n_obs)")
+"""Bound columns without an observation axis of their own: `(modelvals,
+managed)` — model-level values (bind-time data definitions and raw inputs
+read only whole) carry no axis; kernel-, subject- and mi-managed columns
+carry two lengths by design and validate under their own rules."""
+function _axis_exempt_columns(plan::StructuralPlan)
     managed = Set{Symbol}()
     for kp in plan.kernel_plates
         union!(managed, _kernel_managed_columns(kp))
@@ -3196,14 +3199,145 @@ function _validate_columns(plan::StructuralPlan)
     modelvals = union(
         intersect(computed, Set{Symbol}(a.name for a in plan.assignments)),
         intersect(computed, wholedefs), inputs)
+    return modelvals, managed
+end
+
+# ── Observation axes ─────────────────────────────────────────────────
+# A statement broadcasts over the columns it reads (standard Julia), so
+# the rows one observation statement reads need not be the rows another
+# reads: `y1 .~ Normal.(b0 .* x1, s)` over 4 rows beside `y2 .~
+# Poisson.(exp.(b0 .* x2))` over 3. Responses that read a common
+# per-observation column share an axis. When every per-observation column
+# has the same rows there is one axis, `n_obs`, and nothing below runs
+# (plans bind exactly as before); otherwise each column has the rows of
+# the one axis that reads it, and `n_obs` is the total observed rows (the
+# kernel-plate precedent: total likelihood lanes).
+
+"""Plan slots a plan with several observation axes may fill. Every other
+slot reads or sizes by the one `n_obs` axis (latent plates, scans, dar
+paths, varying draws, splines, HSGP and design matrices, R2D2 and
+horseshoe priors, array parameters, kernels, event LPs); per-axis
+versions are not built, so such a plan fails closed — and a slot added
+later does too until it is listed here."""
+const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
+    :parameters, :assignments, :derived, :columns, :n_obs, :roles,
+    :levelmaps, :vector_parameters)
+
+"""Per-observation columns (of `perobs`) a response reads: the names its
+own fields hold, then — transitively — the names every predictor, derived
+column and definition among them holds."""
+function _response_reads(plan::StructuralPlan, r::LikelihoodSpec,
+        perobs::Set{Symbol})
+    nodes = Dict{Symbol,Any}()
+    for p in plan.predictors
+        nodes[p.name] = p
+    end
+    for d in plan.derived
+        nodes[d.name] = d.expr
+    end
+    for a in plan.assignments
+        nodes[a.name] = a.expr
+    end
+    cands = union(perobs, keys(nodes))
+    function held(x)
+        free = copy(cands)
+        _drop_held_names!(free, x)
+        return setdiff(cands, free)
+    end
+    reads = Set{Symbol}()
+    seen = Set{Symbol}()
+    queue = collect(held(r))
+    while !isempty(queue)
+        s = pop!(queue)
+        s in seen && continue
+        push!(seen, s)
+        s in perobs && push!(reads, s)
+        haskey(nodes, s) && append!(queue, held(nodes[s]))
+    end
+    return reads
+end
+
+"""Observation axes of a plan whose `columns` are bound: `nothing` when
+every response column has the same rows (one axis — `n_obs`; any other
+column validates against it), otherwise `(; rows, total)` with `rows`
+mapping each per-observation column to the rows of the axis that reads it
+and `total` the observed rows summed over axes. Fails when the plan fills
+a slot outside [`_MULTI_AXIS_SLOTS`](@ref), when the columns one axis
+reads differ in rows, or when no observation statement reads a column."""
+function _observation_axes(plan::StructuralPlan)
+    isempty(plan.kernel_plates) || return nothing
+    modelvals, managed = _axis_exempt_columns(plan)
+    perobs = Set{Symbol}(k for (k, v) in plan.columns
+        if k ∉ modelvals && k ∉ managed &&
+            v isa Union{AbstractVector,AbstractMatrix})
+    resps = [r.response for r in plan.responses]
+    all(in(perobs), resps) || return nothing
+    rows = Dict{Symbol,Int}(c => _column_nrows(plan.columns[c]) for c in perobs)
+    length(unique(rows[c] for c in resps)) <= 1 && return nothing
+    lens = join(sort!(unique(rows[c] for c in resps)), ", ")
+    for f in fieldnames(StructuralPlan)
+        f in _MULTI_AXIS_SLOTS && continue
+        isempty(getfield(plan, f)) || _fail(:plan, "the responses " *
+            "observe $lens rows (several observation axes), and `$f` " *
+            "reads or sizes by a single observation axis — `$f` beside " *
+            "several observation axes is not built yet")
+    end
+    for r in plan.responses
+        r.mi_jobs === nothing || _fail(r.label, "mi() missingness on " *
+            "$(r.response) beside responses of $lens rows (several " *
+            "observation axes) is not built yet")
+    end
+    reads = [_response_reads(plan, r, perobs) for r in plan.responses]
+    # Union-find: responses reading a common column share an axis.
+    link = collect(eachindex(reads))
+    root(i) = link[i] == i ? i : (link[i] = root(link[i]))
+    owner = Dict{Symbol,Int}()
+    for (i, rd) in enumerate(reads), c in rd
+        link[root(i)] = root(get!(owner, c, i))
+    end
+    axisrows = Dict{Symbol,Int}()
+    total = 0
+    for i in eachindex(reads)
+        root(i) == i || continue
+        members = [j for j in eachindex(reads) if root(j) == i]
+        resp = resps[first(members)]
+        n = rows[resp]
+        total += n
+        for j in members, c in sort!(collect(reads[j]))
+            rows[c] == n || _fail(c, "column length $(rows[c]) ≠ the $n " *
+                "rows of $resp, which an observation statement reads " *
+                "beside it (one observation axis)")
+            axisrows[c] = n
+        end
+    end
+    for c in sort!(collect(perobs))
+        haskey(axisrows, c) || _fail(c, "column $c has $(rows[c]) rows, " *
+            "but the responses observe $lens rows (several observation " *
+            "axes) and no observation statement reads $c, so it has no axis")
+    end
+    return (; rows = axisrows, total)
+end
+
+"""Rows a response observes: its own column's rows — its observation
+axis. An mi() response observes `n_obs` rows through its packed column."""
+_response_rows(plan::StructuralPlan, r::LikelihoodSpec) =
+    r.mi_jobs === nothing && haskey(plan.columns, r.response) ?
+    _column_nrows(plan.columns[r.response]) : plan.n_obs
+
+function _validate_columns(plan::StructuralPlan)
+    plan.n_obs > 0 || _fail(:plan, "n_obs must be positive, got $(plan.n_obs)")
+    modelvals, managed = _axis_exempt_columns(plan)
+    axes = _observation_axes(plan)
     for (name, col) in plan.columns
         name in modelvals && continue
         # Kernel-managed columns (slices + scalar expansions) carry two
         # lengths by design — they validate under kernel rules, not here.
+        # On several observation axes a column has its axis's rows.
+        n = axes === nothing ? plan.n_obs : get(axes.rows, name, plan.n_obs)
         if col isa AbstractMatrix
-            size(col, 1) == plan.n_obs ||
+            size(col, 1) == n ||
                 _fail(name, "matrix column has $(size(col, 1)) rows ≠ " *
-                      "n_obs $(plan.n_obs)")
+                      "n_obs $n")
             size(col, 2) >= 1 ||
                 _fail(name, "design matrix has 0 columns " *
                       "(bind ≥ 1 predictor column)")
@@ -3211,8 +3345,8 @@ function _validate_columns(plan::StructuralPlan)
                 _fail(name, "matrix column must be numeric, " *
                       "got $(eltype(col))")
         else
-            name in managed || length(col) == plan.n_obs ||
-                _fail(name, "column length $(length(col)) ≠ n_obs $(plan.n_obs)")
+            name in managed || length(col) == n ||
+                _fail(name, "column length $(length(col)) ≠ n_obs $n")
         end
         !any(ismissing, col) ||
             _fail(name, "column contains missing (slice 1 has no missingness machinery)")
@@ -8303,9 +8437,10 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     haskey(plan.columns, r.response) ||
         _fail(r.label, "response column $(r.response) missing")
     if r.range !== nothing
-        last(r.range) == plan.n_obs || _fail(r.label,
+        n = _response_rows(plan, r)
+        last(r.range) == n || _fail(r.label,
             "response range $(r.range) covers $(length(r.range)) cells " *
-            "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
+            "but n_obs is $n — ranges cover eachindex exactly")
     end
     col = _vector_column(plan.columns, r.response, r.label, "response")
     if _is_bernoulli_family(r.family)
@@ -8717,8 +8852,9 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
         (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
             _fail(r.label, "per-observation scale $s must be finite positive numerics")
     end
-    length(col) == plan.n_obs ||
-        _fail(r.label, "scale column $s length $(length(col)) ≠ n_obs $(plan.n_obs)")
+    n = _response_rows(plan, r)
+    length(col) == n ||
+        _fail(r.label, "scale column $s length $(length(col)) ≠ n_obs $n")
     return nothing
 end
 
@@ -8881,8 +9017,9 @@ function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "trials column must hold integers")
     all(>=(0), col) ||
         _fail(r.label, "trials column must be non-negative")
-    length(col) == plan.n_obs ||
-        _fail(r.label, "trials column length $(length(col)) ≠ n_obs $(plan.n_obs)")
+    n = _response_rows(plan, r)
+    length(col) == n ||
+        _fail(r.label, "trials column length $(length(col)) ≠ n_obs $n")
     all(ycol .<= col) ||
         _fail(r.label, "$what exceeds trials in some row")
     return nothing
@@ -8896,7 +9033,7 @@ function _validate_multinomial_trials(r::LikelihoodSpec, plan::StructuralPlan)
     t === nothing && _fail(r.label,
         "Multinomial response requires trials (Int column or literal)")
     counts = [r.response; r.count_columns...]
-    rowsums = zeros(Int, plan.n_obs)
+    rowsums = zeros(Int, _response_rows(plan, r))
     for c in counts
         rowsums .+= plan.columns[c]
     end
@@ -9017,7 +9154,7 @@ function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
             isinteger(bound) || _fail(r.label,
                 "$side bound literal must be integer-valued for Poisson evidence")
         end
-        return fill(Float64(bound), plan.n_obs)
+        return fill(Float64(bound), _response_rows(plan, r))
     end
     bound isa Symbol || _fail(r.label, "$side bound must be a literal or column")
     _is_derived(plan, bound) && _fail(r.label,
@@ -10407,10 +10544,12 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # NON-managed column's ROW count (length for vectors): mi packs
     # y_obs/Jobs short by design, and Dict order is not a crossing
     # contract (deriving from a packed column fails every full-length
-    # column by order luck).
+    # column by order luck). Observation columns of several lengths are
+    # several observation axes: n_obs is their total rows.
     n = if isempty(kbases)
-        _bind_nrows(columns,
-            union(_mi_managed_columns(plan), computed, inputs))
+        axes = _observation_axes(_with(plan; columns = columns))
+        axes === nothing ? _bind_nrows(columns,
+            union(_mi_managed_columns(plan), computed, inputs)) : axes.total
     else
         sum(kp -> _kernel_plate_nlanes(kp, columns), kbases)
     end
