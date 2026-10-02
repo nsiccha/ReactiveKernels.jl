@@ -3451,12 +3451,7 @@ function _observation_design_columns(plan::StructuralPlan)
         if ex.head === :call && length(ex.args) == 3 && ex.args[1] === :* &&
                 ex.args[2] isa Symbol &&
                 get(plan.columns, ex.args[2], nothing) isa AbstractMatrix
-            rhs = _value_axes(plan, ex.args[3]; data_axes = true)
-            # Opaque helper results may have unknown sizes while their
-            # model-vector role is already established by lowering.
-            ((rhs !== nothing && !isempty(rhs)) ||
-                (rhs === nothing && _model_vector_value(ex.args[3], plan))) &&
-                push!(out, ex.args[2])
+            _observation_array_operand(plan, ex.args[3]) && push!(out, ex.args[2])
         end
         foreach(visit, ex.args)
     end
@@ -3467,6 +3462,30 @@ function _observation_design_columns(plan::StructuralPlan)
         t.kind === ComposedTerm && visit(t.options.tree)
     end
     return out
+end
+
+# An opaque helper can obscure sizes without making a broadcast with a
+# known array scalar-valued. Follow definitions and elementwise operands;
+# an undotted opaque call alone proves no array shape.
+function _observation_array_operand(plan, ex, seen = Set{Symbol}())
+    a = _value_axes(plan, ex; data_axes = true)
+    a === nothing || return !isempty(a)
+    if ex isa Symbol
+        ex in seen && return false
+        push!(seen, ex)
+        defs = (plan.assignments..., plan.derived...)
+        i = findfirst(d -> d.name === ex, defs)
+        result = i !== nothing && _observation_array_operand(plan, defs[i].expr, seen)
+        delete!(seen, ex)
+        return result
+    end
+    ex isa Expr || return false
+    if _is_dotted_call(ex)
+        return any(x -> _observation_array_operand(plan, x, seen), ex.args[2].args)
+    elseif ex.head === :call && ex.args[1] in ELEMENTWISE_OPS
+        return any(x -> _observation_array_operand(plan, x, seen), ex.args[2:end])
+    end
+    return false
 end
 
 """Number of broadcast observations for a response. An mi() response
