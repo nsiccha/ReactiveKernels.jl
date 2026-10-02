@@ -8371,11 +8371,11 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     rhs = ctx.detmap[s]
     _reads_array_value(rhs, ctx) && !(_is_factor_index_def(rhs, ctx) &&
         rhs.args[1] ∉ ctx.array_decls) && return false
-    # Likewise a definition computed from data and non-coefficient scalar
-    # parameters only (`w = s .+ x`, `s ~ Exponential(1)`): it has no
-    # coefficient to compose, so it stays an offset local. Under strict
-    # declarations the intercept beside it (`mu = a .+ w`) is a declared
-    # scalar, which must not turn the sum into a composition.
+    # Likewise a parameter offset: data and non-coefficient scalar
+    # parameters combined by sums only (`w = s .+ x`, `s ~ Exponential(1)`).
+    # It has no coefficient to compose, so it stays an offset local. Under
+    # strict declarations the intercept beside it (`mu = a .+ w`) is a
+    # declared scalar, which must not turn the sum into a composition.
     _composed_param_value(s, ctx) && return false
     return true
 end
@@ -8388,31 +8388,44 @@ _composed_scalar_param(leaf::Symbol, ctx) =
     leaf ∉ ctx.varying_draws_names && leaf ∉ ctx.plate_names &&
     leaf ∉ ctx.scan_states
 
-"""Whether a definition transitively reads only data and plain scalar
-parameters (`_composed_scalar_param`), at least one of them a parameter
-(a data-only definition is `_composed_data_only`'s)."""
+"""Whether a definition is a parameter offset: data (and data-only parts
+of any shape) plus plain scalar parameters (`_composed_scalar_param`),
+combined by sums and differences only, reading at least one parameter
+(`w = s .+ x`). A product or call over a parameter (`x .* b`,
+`f.(x, c)`) is not one: the composed path owns those."""
 function _composed_param_value(s::Symbol, ctx)
-    seen = Set{Symbol}()
-    stack = Symbol[s]
-    reads_param = false
-    while !isempty(stack)
-        nm = pop!(stack)
-        nm in seen && continue
-        push!(seen, nm)
-        for leaf in _value_symbols(ctx.detmap[nm])
-            leaf === nm && continue
-            if leaf in ctx.data
-                continue
-            elseif haskey(ctx.detmap, leaf)
-                push!(stack, leaf)
-            elseif _composed_scalar_param(leaf, ctx)
-                reads_param = true
-            else
-                return false
-            end
+    ok, reads = _param_offset_expr(ctx.detmap[s], ctx, Set{Symbol}([s]))
+    return ok && reads
+end
+
+const _PARAM_OFFSET_OPS = (:+, :-, :.+, :.-)
+
+# `(admissible, reads_param)` for one node of a parameter offset.
+function _param_offset_expr(ex, ctx, seen::Set{Symbol})
+    if ex isa Symbol
+        ex in ctx.data && return (true, false)
+        if haskey(ctx.detmap, ex)
+            _composed_data_only(ex, ctx, Set{Symbol}()) && return (true, false)
+            ex in seen && return (false, false)
+            push!(seen, ex)
+            return _param_offset_expr(ctx.detmap[ex], ctx, seen)
         end
+        return _composed_scalar_param(ex, ctx) ? (true, true) : (false, false)
     end
-    return reads_param
+    ex isa Expr || return (true, false)
+    # A subexpression that reads no parameter is one data part.
+    all(l -> l in ctx.data || (haskey(ctx.detmap, l) &&
+        _composed_data_only(l, ctx, Set{Symbol}())), _value_symbols(ex)) &&
+        return (true, false)
+    ex.head === :call && !isempty(ex.args) &&
+        ex.args[1] in _PARAM_OFFSET_OPS || return (false, false)
+    reads = false
+    for a in ex.args[2:end]
+        ok, r = _param_offset_expr(a, ctx, seen)
+        ok || return (false, false)
+        reads |= r
+    end
+    return (true, reads)
 end
 
 # Whether `ex` reads a declared array value — a bare array name
