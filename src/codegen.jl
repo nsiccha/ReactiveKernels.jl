@@ -2625,10 +2625,13 @@ such constants, return the kernel itself and an empty tuple. Scalar and other
 small static constants remain in the operation table; `min_elements` lets a
 backend keep arrays below that element count in the table as well, so a small
 static dataset stays a compiler literal it can fold rather than a runtime
-operand it must read. By default every array is externalized. Tuples and named
-tuples containing arrays cross as one structured operand, preserving their
-fields without capturing the arrays in the differentiated callable. A structured
-value crosses when any of its array leaves meets `min_elements`.
+operand it must read. By default every array is externalized. A tuple or named
+tuple containing arrays crosses without capturing the arrays in the
+differentiated callable, and it crosses when any of its array leaves meets
+`min_elements`. When the compiled body reads the operation table at literal
+positions, each array leaf crosses as its own operand (depth-first order) and
+the body rebuilds the tuple where it was read, with non-array leaves as
+literals; otherwise the value crosses as one structured operand.
 
 This is a backend ABI adapter, not a different model boundary: `kernel` keeps
 its original public inputs, and `call(public_args..., values...)` is exactly
@@ -2657,15 +2660,38 @@ function _externalize_bound_array_call(f, ops;
         slot === nothing ? ops[index] :
             _ExternalBoundArraySlot{slot}()
     end
-    structured = any(index -> ops[index].value isa Union{Tuple,NamedTuple}, positions)
-    external_body = structured ? _externalize_bound_array_body(f,positions) : nothing
+    structured = any(value -> value isa Union{Tuple,NamedTuple}, values)
+    external_body = structured ?
+        _externalize_bound_array_body(f, positions, values) : nothing
     callable = external_body === nothing ? f :
         RuntimeGeneratedFunctions.drop_expr(external_body)
     call = _ExternalizedBoundArrayCall{
         typeof(callable),typeof(stripped),positions,
         external_body !== nothing}(callable, stripped)
-    call, values
+    call, external_body === nothing ? values : _bound_array_leaves(values)
 end
+
+# A rewritten body takes every array leaf of a structured bound value as its
+# own operand and rebuilds the tuple or named tuple where the table was read;
+# non-array leaves stay literals of that rebuild. A multi-field structure
+# crossing as one operand beside a view of the active input fails native
+# Enzyme's static activity analysis, while its leaves cross cleanly (snag
+# `interpolated-err-41772e14`).
+_bound_array_leaves(values::Tuple) =
+    Tuple(Iterators.flatten(map(_bound_array_leaves, values)))
+_bound_array_leaves(value::NamedTuple) = _bound_array_leaves(Tuple(value))
+_bound_array_leaves(value::AbstractArray) = (value,)
+_bound_array_leaves(value) = ()
+
+function _bound_rebuild_expr(value::NamedTuple, ports, next::Ref{Int})
+    fields = Any[_bound_rebuild_expr(v, ports, next) for v in value]
+    :(NamedTuple{$(keys(value))}(($(fields...),)))
+end
+_bound_rebuild_expr(value::Tuple, ports, next::Ref{Int}) =
+    Expr(:tuple, Any[_bound_rebuild_expr(v, ports, next) for v in value]...)
+_bound_rebuild_expr(::AbstractArray, ports, next::Ref{Int}) =
+    ports[next[] += 1]
+_bound_rebuild_expr(value, ports, next::Ref{Int}) = QuoteNode(value)
 
 # A compiled body whose operation-table accesses are literal can load hidden
 # bound operands directly. This changes only its internal argument boundary;
@@ -2673,12 +2699,19 @@ end
 # array-containing operation tuple beside an active argument can obscure its
 # activity before the tuple is optimized away. Source transforms that inspect
 # or dynamically access the table keep the reconstruction path above.
-_externalize_bound_array_body(f, positions) = nothing
+_externalize_bound_array_body(f, positions, values) = nothing
 function _externalize_bound_array_body(
         f::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction,
-                 _PrecompileWarmFunction}, positions)
+                 _PrecompileWarmFunction}, positions, values)
     ast = deepcopy(RuntimeGeneratedFunctions.get_expression(f))
-    ports = Dict(index=>gensym(:_rk_bound_operand) for index in positions)
+    operands = Symbol[]
+    loads = Dict{Int,Any}()
+    for (index, value) in zip(positions, values)
+        ports = [gensym(:_rk_bound_operand)
+                 for _ in 1:length(_bound_array_leaves(value))]
+        append!(operands, ports)
+        loads[index] = _bound_rebuild_expr(value, ports, Ref(0))
+    end
     valid = true
     function replace_load(node)
         if node === _OPS_ARG
@@ -2689,18 +2722,18 @@ function _externalize_bound_array_body(
         node.head === :quote && return node
         if node.head === :call && length(node.args) == 1
             slot = _operation_slot(node.args[1])
-            haskey(ports,slot) && return ports[slot]
+            haskey(loads,slot) && return loads[slot]
         end
         slot = _operation_slot(node)
         if slot !== nothing
-            haskey(ports,slot) && (valid = false)
+            haskey(loads,slot) && (valid = false)
             return node
         end
         Expr(node.head,map(replace_load,node.args)...)
     end
     body = replace_load(ast.args[2])
     valid || return nothing
-    append!(ast.args[1].args,[ports[index] for index in positions])
+    append!(ast.args[1].args, operands)
     ast.args[2] = body
     compile(ast)
 end
