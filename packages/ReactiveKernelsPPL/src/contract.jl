@@ -2304,6 +2304,13 @@ plus two-argument `logaddexp` for occupancy marginalization)."""
 const ELEMENTWISE_FNS =
     (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :logaddexp)
 
+"""Operand count of a built-in elementwise map (`ifelse.(c, x, y)`,
+`logaddexp.(a, b)`; every other one takes one)."""
+const ELEMENTWISE_FN_ARITY = Dict{Symbol,Int}(:ifelse => 3, :logaddexp => 2)
+_elementwise_arity(f::Symbol) = get(ELEMENTWISE_FN_ARITY, f, 1)
+_operands_phrase(n::Int) = ("one", "two", "three")[n] *
+    (n == 1 ? " operand" : " operands")
+
 """Families the thin layer can lower (ext handshake predicate)."""
 admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
@@ -5634,13 +5641,9 @@ function _collect_vector_dot!(refs, ex, plan, label, bound::Bool)
         "Julia functions are planned (no-@deffun-ceremony direction) but " *
         "need IR/contract growth",
     )
-    if f === :logaddexp
-        length(args) == 2 ||
-            _fail(label, "`logaddexp.` takes exactly two arguments")
-    else
-        length(args) == 1 ||
-            _fail(label, "`$f.` takes exactly one argument")
-    end
+    length(args) == _elementwise_arity(f) || _fail(label, "`$f.` takes " *
+        "exactly $(_elementwise_arity(f) == 2 ? "two arguments" :
+            "one argument")")
     _check_numeric_position!(args, plan, label, bound)
     for arg in args
         _collect_vector_refs!(refs, arg, plan, label, bound)
@@ -6526,9 +6529,10 @@ function _validate_composed_tree(tree, subs::Vector{Symbol},
                 "built-in math functions, `ifelse.`, or a module function)")
             Meta.isexpr(tup, :tuple) && !isempty(tup.args) || _fail(label,
                 "composed tree map $f. takes operands, got $(repr(node))")
-            f in _COMPOSED_UNARY && length(tup.args) != 1 && _fail(label,
-                "composed tree map $f. takes one operand, got " *
-                "$(repr(node))")
+            f isa Symbol && length(tup.args) != _elementwise_arity(f) &&
+                _fail(label, "composed tree map $f. takes " *
+                    "$(_operands_phrase(_elementwise_arity(f))), got " *
+                    "$(repr(node))")
             foreach(walk, tup.args)
             return nothing
         end

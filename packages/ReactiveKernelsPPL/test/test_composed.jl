@@ -301,9 +301,9 @@ _cmp_ap_scales(q) = logpdf(Exponential(1), q.s1) + logpdf(Exponential(1), q.s2)
 
 # Posterior and Enzyme gradient at the constrained probe `q` against
 # `want(q)` (likelihood + priors) plus the layout's log-Jacobian.
-function _cmp_ap_check(prog, q::NamedTuple, want)
-    plan = lower_rkppl(prog, keys(_CMP_AP_COLS))
-    bound = bind_data(plan, _CMP_AP_COLS)
+function _cmp_ap_check(prog, q::NamedTuple, want; cols = _CMP_AP_COLS)
+    plan = lower_rkppl(prog, keys(cols))
+    bound = bind_data(plan, cols)
     built = build_kernel(bound)
     lay = built.layout
     u = unconstrain(lay, merge(constrain(lay, zeros(lay.total)), q))
@@ -405,4 +405,52 @@ end
         @test count("_cmp_scaled", src) == 1
         @test only(plan.predictors[end].terms).kind === ComposedTerm
     end
+end
+
+# A reader in another response takes the location's value only once that
+# location is a predictor: its response must come first. Reading it from
+# an earlier response still takes the derived-column path, which cannot
+# recompute a location holding a coefficient.
+const _CMP_XR_COLS = merge(_CMP_AP_COLS, Dict{Symbol,AbstractVector}(
+    :z => [1.1, -0.3, 0.9, 0.4, -1.4, 0.2, 0.7, -0.1, 1.6]))
+
+@testset "composed reader in a later response" begin
+    want(q) = begin
+        mu = q.mu[1] .* _cmp_ap_x()
+        sum(logpdf.(Normal.(mu, 1.0), Vector{Float64}(_CMP_XR_COLS[:y]))) +
+            sum(logpdf.(Normal.(q.m2[1] .* _cmp_ap_x(),
+                hypot.(q.s1, mu .* q.s2)),
+                Vector{Float64}(_CMP_XR_COLS[:z]))) +
+            logpdf(Normal(0, 1), q.mu[1]) + logpdf(Normal(0, 1), q.m2[1]) +
+            _cmp_ap_scales(q)
+    end
+    plan, _, _ = _cmp_ap_check(quote
+        a ~ Normal(0.0, 1.0); b ~ Normal(0.0, 1.0)
+        s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
+        mu = a .* x
+        y .~ Normal.(mu, 1.0)
+        m2 = b .* x
+        sd = hypot.(s1, mu .* s2)
+        z .~ Normal.(m2, sd)
+    end, (mu = [0.7], m2 = [0.4], s1 = 0.5, s2 = 0.3), want;
+        cols = _CMP_XR_COLS)
+    @test only(plan.predictors[end].terms).kind === ComposedTerm
+    # The reader's response first: not built yet (residual of snag
+    # `rkppl-predictor-f40e6808`).
+    ok = try
+        bind_data(lower_rkppl(quote
+            a ~ Normal(0.0, 1.0); b ~ Normal(0.0, 1.0)
+            s1 ~ Exponential(1.0); s2 ~ Exponential(1.0)
+            mu = a .* x
+            m2 = b .* x
+            sd = hypot.(s1, mu .* s2)
+            z .~ Normal.(m2, sd)
+            y .~ Normal.(mu, 1.0)
+        end, keys(_CMP_XR_COLS)), _CMP_XR_COLS)
+        true
+    catch e
+        e isa Union{SurfaceLoweringError,ContractValidationError} || rethrow()
+        false
+    end
+    @test_broken ok
 end

@@ -8178,14 +8178,20 @@ function _composed_has_sub(node, ctx, allow_factor::Bool = false)
     return any(a -> _composed_has_sub(a, ctx, allow_factor), node.args[2:end])
 end
 
-# A sub-predictor whose value exists only as an LP node: one that holds
-# coefficients (a structural definition — its coefficients live only in
-# the predictor's block, so an extracted column cannot recompute it) or
-# one already interned as a predictor (a response location or scale,
-# absorbed — never also a named local).
+# A sub-predictor whose value exists only as an LP node: one already
+# interned as a predictor (a response location or scale, absorbed —
+# never also a named local). A definition that is not a predictor, even
+# one holding coefficient candidates, keeps the derived-column path,
+# which inlines it. A name bound to a composition reads what its tree
+# reads, since extraction inlines it (`prop = mu .* s2;
+# sd = hypot.(s1, prop)`).
 function _composed_has_lp_sub(node, ctx)
-    node isa Symbol && return (node in ctx.structural ||
-        haskey(ctx.pred_idx, node)) && _is_composed_sub(node, ctx, true)
+    if node isa Symbol
+        haskey(ctx.pred_idx, node) && return _is_composed_sub(node, ctx, true)
+        return haskey(ctx.detmap, node) && ctx.detmap[node] !== node &&
+            _composed_trigger(node, ctx) &&
+            _composed_has_lp_sub(ctx.detmap[node], ctx)
+    end
     node isa Expr || return false
     return any(a -> _composed_has_lp_sub(a, ctx), node.args)
 end
@@ -8351,8 +8357,9 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             "built-in math functions, `ifelse.`, and dotted functions " *
             "visible in the model module")
         fargs = node.args[2].args
-        f in _COMPOSED_UNARY && length(fargs) != 1 && return _sfail(
-            "$where $(repr(f)). takes one operand")
+        f isa Symbol && length(fargs) != _elementwise_arity(f) &&
+            return _sfail("$where $(repr(f)). takes " *
+                _operands_phrase(_elementwise_arity(f)))
         isempty(fargs) && return _sfail("$where $(repr(f)). takes at " *
             "least one operand")
         return Expr(:., f, Expr(:tuple, (_extract_composed_tree(pname, a,
