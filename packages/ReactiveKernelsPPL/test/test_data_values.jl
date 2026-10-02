@@ -114,6 +114,47 @@ end
     _dv_check_regression(root(; y = _DV_Y, x = _DV_X, s = 0.49), 0.7)
 end
 
+@testset "data values: a number is a prior argument, as its definition is" begin
+    # A coefficient prior takes a name (the computed-coefficient lane), so a
+    # number bound as data scales it exactly as the definition `tau = 2.0`.
+    coef = quote
+        a ~ Normal(0, 5)
+        b ~ Normal(0, tau)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
+    end
+    plan = lower_rkppl(coef,
+        Dict{Symbol,Any}(:y => _DV_Y, :x => _DV_X, :tau => 2.0))
+    for tau in (2.0, 0.5)
+        bound = bind_data(plan,
+            Dict{Symbol,ColumnData}(:y => _DV_Y, :x => _DV_X, :tau => tau))
+        built = _dv_built(bound)
+        a, b = ReactiveKernelsPPL.constrain(built.layout, _DV_U).mu
+        @test _dv_value(built, bound, :prior, _DV_U) ≈
+            logpdf(Normal(0, 5), a) + logpdf(Normal(0, tau), b)
+    end
+    defined = RKPPLModel(Expr(:block, :(tau = 2.0), coef.args...), _DV)(;
+        y = _DV_Y, x = _DV_X)
+    bound = RKPPLModel(coef, _DV)(; y = _DV_Y, x = _DV_X, tau = 2.0)
+    @test _dv_value(_dv_built(bound), bound, :prior, _DV_U) ≈
+        _dv_value(_dv_built(defined), defined, :prior, _DV_U)
+    # A scalar parameter's prior argument.
+    m = RKPPLModel(quote
+        a ~ Normal(0, 5)
+        b ~ Normal(0, 2)
+        sigma ~ Exponential(rate)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, sigma)
+    end, _DV)
+    bound = m(; y = _DV_Y, x = _DV_X, rate = 1.5)
+    built = _dv_built(bound)
+    u = [0.2, -0.4, 0.1]
+    th = ReactiveKernelsPPL.constrain(built.layout, u)
+    a, b = th.mu
+    @test _dv_value(built, bound, :prior, u) ≈ logpdf(Normal(0, 5), a) +
+        logpdf(Normal(0, 2), b) + logpdf(Exponential(1.5), th.sigma)
+end
+
 @testset "data values: a number bound to a response is one observation" begin
     m = RKPPLModel(quote
         a ~ Normal(0, 5)
