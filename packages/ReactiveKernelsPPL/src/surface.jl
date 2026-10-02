@@ -698,6 +698,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     value_arrays = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
         (s.dims !== nothing ||
             (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
+    factor_decls = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
+        s.broadcast && s.levels !== nothing && s.dims === nothing)
     # Every array-capable declaration (sized `.~`, LKJ, a `Dirichlet`
     # simplex or `Ordered` vector value): an expression that READS one by
     # index (`L[2, 1] .* x`, `tau .* z[g]`, `phi[1] .* x`) is a value, never
@@ -806,6 +808,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
         dar_specs = DarSpec[],
         array_decls = array_decls,
         value_arrays = value_arrays,
+        factor_decls = factor_decls,
         sized_decls = sized_decls)
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
@@ -7914,6 +7917,20 @@ function _is_factor_index_def(rhs, ctx)
     return idx in ctx.data
 end
 
+# A factor-coefficient alias has a per-observation value shape, but its
+# coefficient role survives naming (including chains of bare aliases).
+# Other array gathers remain value computations.
+_is_factor_coefficient_alias(ex, ctx) =
+    _is_factor_coefficient_alias(ex, ctx, Set{Symbol}())
+function _is_factor_coefficient_alias(s::Symbol, ctx, seen::Set{Symbol})
+    haskey(ctx.detmap, s) && s ∉ seen || return false
+    push!(seen, s)
+    return _is_factor_coefficient_alias(ctx.detmap[s], ctx, seen)
+end
+_is_factor_coefficient_alias(ex::Expr, ctx, seen::Set{Symbol}) =
+    _is_factor_index_def(ex, ctx) && ex.args[1] in ctx.factor_decls
+_is_factor_coefficient_alias(ex, ctx, seen::Set{Symbol}) = false
+
 function _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
     f = length(s.args) >= 1 ? s.args[1] : nothing
     targs = length(s.args) == 2 && s.args[2] isa Expr &&
@@ -8369,12 +8386,14 @@ end
 """A sub-predictor candidate: vector-shaped definition that is not data,
 a latent/scan/varying object, or a pure data combination (those keep
 today's paths — data combos merge affinely, latents keep their arms).
-Under `.*` (`allow_factor`), bare factor indexing (`th = c[g]`) qualifies
-too — scalar-shaped globally (the inlining doctrine) but an affine
-FactorTerm under analysis. Under `.+` it never qualifies, so `mu = a .+ th`
+Under `.*` (`allow_factor`), a factor-coefficient alias (`th = c[g]`)
+qualifies too — vector-shaped as a value but an affine FactorTerm under
+analysis. Under `.+` it never qualifies, so `mu = a .+ th`
 keeps the affine merge (with unstated-intercept defaults)."""
 function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     haskey(ctx.detmap, s) || return false
+    factor_alias = _is_factor_coefficient_alias(s, ctx)
+    factor_alias && !allow_factor && return false
     if get(ctx.detshape, s, :scalar) !== :vector
         # A bare alias of a varying contribution (`th = r_t`, brms
         # `theta ~ 0 + (1 | person)`) is per-observation, hence a sub.
@@ -8393,8 +8412,7 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     # `th = c[g]` over a coefficient-capable `c[levels(g)]`, which keeps
     # its composed factor-sub meaning.
     rhs = ctx.detmap[s]
-    _reads_array_value(rhs, ctx) && !(_is_factor_index_def(rhs, ctx) &&
-        rhs.args[1] ∉ ctx.array_decls) && return false
+    _reads_array_value(rhs, ctx) && !factor_alias && return false
     return true
 end
 
@@ -8848,7 +8866,8 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
         "predictor summand (`mu = a .+ dar(beta, sigma)`), not " *
         "inside definitions")
     # Array-valued definitions (`M = (sd .* L)'`) stay named values.
-    if ex in ctx.structural || ctx.detshape[ex] ∉ (:vector, :array)
+    if ex in ctx.structural || ctx.detshape[ex] ∉ (:vector, :array) ||
+            _is_factor_coefficient_alias(ex, ctx)
         ex in visited && _sfail("$where: cyclic definition through $ex")
         push!(ctx.absorbed, ex)
         push!(visited, ex)
