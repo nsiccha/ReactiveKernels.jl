@@ -236,8 +236,12 @@ end
     # unnormalized half) and Exponential (identical).
     _lv_parity("75_varying_sd_cauchy", "75_varying_sd_cauchy_lib",
         _lv_block_map(:r, :g, 1, G), _lv_halves(1))
+    # `b0` is a plain parameter in the library spelling (its `eta` lowers
+    # as one computed column) and the intercept of the composed `b`
+    # sub-predictor in the built-in.
     m85 = merge(_lv_block_map(:r_t, :person, 1, G),
-        _lv_block_map(:r_a, :item, 1, G), _lv_block_map(:r_b, :item_r_b, 1, G))
+        _lv_block_map(:r_a, :item, 1, G), _lv_block_map(:r_b, :item_r_b, 1, G),
+        Dict(:b0 => Symbol("b.Intercept")))
     _lv_parity("85_composed_varying_exp", "85_composed_varying_exp_lib", m85,
         _lv_halves(3); bernoulli = true)
     _lv_parity("87_composed_correlated_slices",
