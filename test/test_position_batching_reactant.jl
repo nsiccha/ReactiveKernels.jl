@@ -51,6 +51,21 @@ end
     @test small == large
 end
 
+@testset "nested record positions preserve compiler parity" begin
+    @kernel compiled_nested_positions(position, data) = begin
+        result = position.group.response.scale .* data .+ position.group.response.offset
+    end
+    batch = vectorize(compiled_nested_positions; batched=:position)
+    position = (; group=(; response=(; scale=[1.0, -2.0, 3.0], offset=[0.5, 1.0, -0.5])))
+    data = [0.0, 1.0, 2.0, 4.0]
+    traced = (; group=(; response=map(Reactant.to_rarray, position.group.response)))
+    traced_data = Reactant.to_rarray(data)
+    compiled = Reactant.@compile batch(traced, traced_data)
+    @test Array(compiled(traced, traced_data)) == batch(position, data)
+    @test Array(traced.group.response.scale) == position.group.response.scale
+    @test Array(traced_data) == data
+end
+
 @testset "replicated AD retains scalar semantics" begin
     @kernel compiled_batch_objective(position::Vector{Float64}, offset::Float64) = begin
         result::Float64 = sum(abs2, position) + offset
