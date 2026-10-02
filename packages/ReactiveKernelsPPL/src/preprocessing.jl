@@ -423,6 +423,7 @@ end
 # per-block mathematics as monotonic predictors, retaining Julia's
 # broadcast axes instead of assembling an hcat with forced n_obs rows.
 function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
+    _uses_structured_observation_axes(plan) && return false
     _predictor_level(plan, pred.name) === :obs || return false
     for t in pred.terms
         t.kind in (ContinuousTerm, OffsetTerm, FactorTerm, ComposedTerm) || continue
@@ -440,10 +441,10 @@ function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
         values(observations.domains))
 end
 
-"""Design row count of a predictor (obs-level: `n_obs`; subject-level:
+"""Design row count of a predictor (obs-level: its observation axis; subject-level:
 the using kernel plate's subject count — bound plans only)."""
 function _predictor_rows(plan::StructuralPlan, pname::Symbol)
-    _predictor_level(plan, pname) === :obs && return plan.n_obs
+    _predictor_level(plan, pname) === :obs && return _value_rows(plan, pname)
     users = KernelPlate[kp for kp in plan.kernel_plates
         if any(pr -> pr[1] === pname, kp.lp_args)]
     isempty(users) &&

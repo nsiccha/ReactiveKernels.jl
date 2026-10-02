@@ -86,9 +86,9 @@ const _IRT_LSAT = quote
 end
 
 const _IRT_2PL = quote
-    r_t ~ varying_effect(person, [1]; sd = Cauchy(0, 2))
-    r_a ~ varying_effect(item, [1]; sd = Cauchy(0, 2))
-    r_b ~ varying_effect(item, [1]; sd = Cauchy(0, 2))
+    r_t ~ varying_effect(person, [1]; sd = HalfCauchy(2))
+    r_a ~ varying_effect(item, [1]; sd = HalfCauchy(2))
+    r_b ~ varying_effect(item, [1]; sd = HalfCauchy(2))
     b0 ~ Normal(0, 5)
     th = r_t
     la = r_a
@@ -197,7 +197,7 @@ end
     @test t.options.tree == :(log.(th) .* be)
     # A bare varying contribution (not a sub alias) stays out of trees.
     bare = quote
-        r ~ varying_effect(g, [1]; sd = Cauchy(0, 2))
+        r ~ varying_effect(g, [1]; sd = HalfCauchy(2))
         be ~ Normal(0, 1)
         eta = be .* r
         y .~ Bernoulli.(logistic.(eta))
@@ -220,7 +220,7 @@ end
         _irt_cols((; y = _IRT_PD.y, person = _IRT_PD.person,
             item = _IRT_PD.item)))
     @test lay.total == 11
-    @test _irt_val(kern, fill(0.3, 11)) ≈ -19.77660090228615 atol = 1e-12
+    @test _irt_val(kern, fill(0.3, 11)) ≈ -19.77660090228615 + 3log(2) atol = 1e-12
     # I-hier2pl (0.3^15): correlated item draws across two predictors
     # (LKJ(4) 2x2, Exponential(10) sds = Stan exponential(0.1)).
     _, _, kern, lay = _irt_query(_IRT_HIER2PL, _irt_cols(_IRT_HD))
@@ -312,7 +312,7 @@ end
     la = exp(la_) .* za
     b = c[:b0] .+ exp(lb) .* zb
     want = logpdf(Normal(0, 5), c[:b0]) +
-        sum(logpdf(Cauchy(0, 2), exp(l)) + l for l in (lt, la_, lb)) +
+        sum(logpdf(truncated(Cauchy(0, 2),0,Inf), exp(l)) + l for l in (lt, la_, lb)) +
         sum(logpdf.(Normal(0, 1), vcat(zt, za, zb))) +
         sum(_irt_logit_lpmf(pd.y[i], exp(la[pd.item[i]]) *
             (th[pd.person[i]] - b[pd.item[i]])) for i in 1:6)

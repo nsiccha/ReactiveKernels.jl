@@ -1463,9 +1463,11 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         Set{Symbol}(d.name for d in derived), _factor_coefs(coefuse, predictors),
         plate_names)
     for m in matrices
-        m.name in ctx.matrices_used || _sfail(
+        used_axis = any(p -> any(d -> _is_axis_dim(d) && d.args[2] === m.name,
+            p.dims), arrays)
+        m.name in ctx.matrices_used || used_axis || _sfail(
             "design matrix `$(m.name)` is never used in a predictor " *
-            "matmul — drop it or add the use (`mu = $(m.name) * b`)")
+            "matmul or array axis — drop it or add the use (`mu = $(m.name) * b`)")
     end
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
@@ -2612,60 +2614,34 @@ _varying_head(rhs::Expr) = rhs.args[1]::Symbol
 # `_validate_varying_margins` proves vector shape after lowering.
 # Claims the draws label up front so user definitions can never
 # collide with in-graph names (L/tau/z).
-# A draws block's `sd=` keyword: one zero-located scale call for every
-# margin (`sd=Cauchy(0, 5)`), at any K. sd priors are Stan-kernel by
-# construction (support `nothing` — no `+log2`), so the proper-half
-# spellings are rejected with the bare form (a `HalfCauchy` prior means
-# `+log2` everywhere else; aliasing it here would lie). Per-margin
-# tuples are planned, not admitted. The default spelled out
-# (`sd=Normal(0, 1)`) lowers to the empty all-default vector, so it
-# gives the plan omitting `sd=` gives.
+# Marginal scales use explicit normalized positive priors. A bare Normal or
+# Cauchy remains full-support everywhere and cannot declare a positive scale.
 function _lower_varying_sd_prior(raw, K::Int, where)
-    raw isa Expr && raw.head === :tuple &&
-        _sfail("$where per-margin sd priors are planned — pass one " *
-              "`sd=` call for all $K margins")
-    raw isa Expr && raw.head === :vect &&
-        _sfail("$where per-margin sd priors are planned — pass one " *
-              "`sd=` call for all $K margins, not a vector")
-    raw isa Expr && raw.head === :call && !isempty(raw.args) &&
-        raw.args[1] isa Symbol || _sfail(
-            "$where `sd=` takes `Cauchy(0, σ)`, `Normal(0, σ)`, or " *
-            "`Exponential(θ)` (literal args), got $(repr(raw))")
-    fam = raw.args[1]
-    args = raw.args[2:end]
-    if fam === :HalfCauchy || fam === :HalfNormal || _sd_is_truncated(raw)
-        _sfail("$where sd priors are Stan-kernel (no `+log2`) — spell " *
-              "the bare form (`sd=Cauchy(0, σ)`), not `$(repr(raw))`")
+    raw isa Expr && raw.head in (:tuple, :vect) &&
+        _sfail("$where per-margin sd priors are planned — pass one `sd=` call for all $K margins")
+    p = _lower_parameter(:sd, raw, Dict{Symbol,Any}(), Dict{Symbol,Any}())
+    p.family in (:normal, :cauchy, :exponential) ||
+        _sfail("$where `sd=` takes `HalfNormal(s)`, `HalfCauchy(s)`, " *
+            "`truncated(Normal(0, s), 0, Inf)`, `truncated(Cauchy(0, s), 0, Inf)`, or `Exponential(s)`")
+    length(p.args) == SAMPLED_ARITY[p.family] ||
+        _sfail("$where sd prior $(p.family) takes $(SAMPLED_ARITY[p.family]) argument(s)")
+    if p.family === :exponential
+        p.support_override in (nothing, (:truncated, 0.0, Inf)) ||
+            _sfail("$where `sd=Exponential(s)` uses its natural positive support; " *
+                "bounded Exponential sd priors are not supported")
+    else
+        p.support_override in (:positive, (:truncated, 0.0, Inf)) ||
+            _sfail("$where `sd=` needs an explicit positive prior: use " *
+                "`HalfNormal(s)`, `HalfCauchy(s)`, or `truncated(D, 0, Inf)`; bare Normal/Cauchy have full support")
+        p.args.arg1 isa Real && !(p.args.arg1 isa Bool) && p.args.arg1 == 0 ||
+            _sfail("$where sd half priors require zero location")
     end
-    fam === :Cauchy || fam === :Normal || fam === :Exponential ||
-        _sfail("$where `sd=` takes `Cauchy(0, σ)`, `Normal(0, σ)`, or " *
-              "`Exponential(θ)`, got `$(repr(raw))`")
-    if fam === :Exponential
-        length(args) == 1 || _sfail("$where `sd=Exponential(θ)` takes " *
-            "one scale argument (Distributions scale convention, like " *
-            "sampled `s ~ Exponential(1)`), got $(repr(raw))")
-        th = args[1]
-        th isa Real && !(th isa Bool) && th > 0 ||
-            _sfail("$where sd Exponential scale must be a positive " *
-                  "literal, got $(repr(th))")
-        return fill(VaryingSdPrior(:exponential, Float64(th)), K)
-    end
-    length(args) == 2 || _sfail("$where `sd=$fam(0, σ)` takes a " *
-        "zero location and a scale, got $(repr(raw))")
-    loc, sc = args
-    loc isa Real && !(loc isa Bool) && loc == 0 ||
-        _sfail("$where sd $fam location must be literal 0, got " *
-              "$(repr(loc))")
-    sc isa Real && !(sc isa Bool) && sc > 0 ||
-        _sfail("$where sd $fam scale must be a positive literal, got " *
-              "$(repr(sc))")
-    fam === :Normal && sc == 1 && return VaryingSdPrior[]
-    sym = fam === :Cauchy ? :cauchy : :normal
-    return fill(VaryingSdPrior(sym, Float64(sc)), K)
+    scale = last(values(p.args))
+    scale isa Real && !(scale isa Bool) && isfinite(scale) && scale > 0 ||
+        _sfail("$where sd prior scale must be a positive finite literal")
+    p.family === :normal && scale == 1 && return VaryingSdPrior[]
+    return fill(VaryingSdPrior(p.family, Float64(scale)), K)
 end
-
-_sd_is_truncated(raw::Expr) =
-    raw.head === :call && !isempty(raw.args) && raw.args[1] === :truncated
 
 function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
         data::Set{Symbol}, detnames::Set{Symbol}, seen::Set{Symbol},
@@ -3118,7 +3094,7 @@ _is_dar_inf(b) = b === :Inf || (b isa Real && isinf(Float64(b)) && Float64(b) > 
 # declarations do work at lowering — they build IR + claim the
 # generated names — so the "bare call does nothing" rejection does not
 # apply). `sd=` states the smoothing-sd prior (SB `sd(mu, s(x)) ~ ...`,
-# `_lower_hyper_prior`; default Stan-kernel `Normal(0, 1)`). Quoted
+# `_lower_hyper_prior`; default normalized `HalfNormal(1)`). Quoted
 # id, bare raw axes (1 → :tps, 2 → :t2 when `kind` is omitted), literal `k`
 # (default 10 / (5, 5)). Lowers directly to SplineBasis IR + the fully
 # determined SplineVector set (contract `_spline_*` rules); claims the
@@ -3161,41 +3137,27 @@ function _lower_r2d2_decl(st::Expr, line::Int)
     return (predictor = pred, r2 = r2, phi = phi, tau = tau, line = line)
 end
 
-# A basis hyper-prior keyword (`hsgp_basis(...; length_scale=...,
-# sd=...)`, `spline_basis(...; sd=...)` — SB `length_scale(:, hsgp(x))
-# ~ ...` / `sd(:, s(x)) ~ ...`): one Distributions.jl call with literal
-# arguments from the admitted positive-hyperparameter families. Stan
-# kernel semantics on the positive support (no `+log2` renormalizer) for
-# the real-support families, so the proper-half spellings fail closed
-# toward the bare form; positive-support families and `Uniform` keep
-# their own density (`_hyper_support_override`).
+# The sampled-parameter grammar defines what a prior means in every slot.
+# These legacy basis slots still require literal arguments and bounds.
 function _lower_hyper_prior(raw, where, what::Symbol)
-    admitted = "LogNormal, InverseGamma, Gamma, Exponential, Normal, " *
-        "Cauchy, StudentT, Uniform (literal arguments)"
-    raw isa Expr && raw.head === :call && !isempty(raw.args) &&
-        raw.args[1] isa Symbol || _sfail(
-            "$where `$what=` takes one distribution call ($admitted), " *
-            "got $(repr(raw))")
-    fam = raw.args[1]
-    (fam === :HalfNormal || fam === :HalfCauchy || fam === :truncated) &&
-        _sfail("$where `$what=` priors are Stan-kernel on the positive " *
-              "support (no `+log2`) — spell the bare form " *
-              "(`$what=Normal(0, s)`), not `$(repr(raw))`")
-    sym = get(_PARAM_FAMILIES, fam, nothing)
-    sym !== nothing && haskey(_HYPER_PRIOR_FAMILIES, sym) || _sfail(
-        "$where `$what=` family `$fam` is not admitted ($admitted)")
-    args = _plain_args(raw, "$where `$what=$fam`")
-    length(args) in _HYPER_PRIOR_FAMILIES[sym] || _sfail(
-        "$where `$what=$fam` takes $(only(_HYPER_PRIOR_FAMILIES[sym])) " *
-        "argument(s), got $(length(args))")
-    vals = map(args) do a
-        a isa Real && !(a isa Bool) && isfinite(Float64(a)) || _sfail(
-            "$where `$what=$fam` arguments must be finite numeric " *
-            "literals, got $(repr(a))")
-        Float64(a)
+    p = _lower_parameter(what, raw, Dict{Symbol,Any}(), Dict{Symbol,Any}())
+    haskey(_HYPER_PRIOR_FAMILIES, p.family) ||
+        _sfail("$where `$what=` family $(p.family) is not admitted")
+    length(p.args) in _HYPER_PRIOR_FAMILIES[p.family] ||
+        _sfail("$where `$what=` prior $(p.family) has the wrong number of arguments")
+    all(a -> a isa Real && !(a isa Bool) && isfinite(a), values(p.args)) ||
+        _sfail("$where `$what=` prior arguments must be finite numeric literals")
+    p.support_override isa Tuple &&
+        !all(a -> a isa Real, p.support_override[2:end]) &&
+        _sfail("$where `$what=` truncation bounds must be literal")
+    if SAMPLED_SUPPORT[p.family] === :real && p.support_override === nothing
+        _sfail("$where `$what=` needs an explicit positive prior: use " *
+            "`HalfNormal(s)`, `HalfCauchy(s)`, or `truncated(D, 0, Inf)`; " *
+            "bare real-support distributions are not halves")
     end
-    return HyperPrior(sym,
-        NamedTuple{ntuple(i -> Symbol(:arg, i), length(vals))}(Tuple(vals)))
+    hp = HyperPrior(p.family, map(Float64, p.args), p.support_override)
+    _validate_hyper_prior(hp, what, "$where `$what=`")
+    return hp
 end
 
 function _lower_basis(st::Expr, line::Int, data::Set{Symbol},
@@ -5619,12 +5581,12 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
 end
 
 # The per-cell latent's size follows the plate range: a literal `1:N` rides as
-# a UnitRange (validated to cover 1:n_obs at bind); `eachindex(v)` / `axes(v,
+# a UnitRange (validated against its response axis at bind); `eachindex(v)` / `axes(v,
 # 1)` over a data column ride as the column `v` (one cell per entry, proved
-# at bind); over a definition (an observation-aligned column) ⇒ n_obs.
+# at bind); over a definition ⇒ the definition's own observation axis.
 function _plate_param_range(name::Symbol, rkind, data::Set{Symbol})
     rkind[1] === :coloncall && return _lower_lhs_range(name, rkind[2])
-    return rkind[2] in data ? rkind[2] : nothing
+    return rkind[2]
 end
 
 function _cell_lhs_error(lhs, ivar)
@@ -5953,7 +5915,7 @@ _is_axes2_call(index) =
 # (each axis `1:K`, `levels(g)`, or `axes(M, d)`). One-axis
 # `z[levels(g)]` / `z[axes(X, 2)]` have separate parse arms but the same
 # ordinary array semantics. A `levels(gg)` axis over a definition `gg`
-# (data computed at bind, `gg = vcat(g1, g2)`) uses this arm too.
+# (data computed at bind, `gg = vcat(g1, g2)`) and `axes(X, 1)` use this arm too.
 # Returns `(name, dims)` or `nothing` (not an array).
 function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol},
         detnames::Set{Symbol} = Set{Symbol}())
@@ -5962,8 +5924,10 @@ function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol},
     target isa Symbol && target ∉ data || return nothing
     idx = lhs.args[2:end]
     if length(idx) == 1
+        row_axis = _is_axis_dim(idx[1]) && idx[1].args[1] === :axes &&
+            idx[1].args[3] == 1 && idx[1].args[2] !== target
         _is_literal_range(idx[1]) || _is_def_levels_call(idx[1], data,
-            detnames) || return nothing
+            detnames) || row_axis || return nothing
     elseif length(idx) != 2
         _sfail("array $target takes one or two axes, got $(repr(lhs))")
     end
@@ -11633,9 +11597,9 @@ function _lower_horseshoe_priors(sample, coefuse, predictors,
                         (horseshoe_raw_name(pred.name, addr), :normal,
                             (arg1 = 0, arg2 = 1), nothing),
                         (horseshoe_lambda_name(pred.name, addr), :cauchy,
-                            (arg1 = 0, arg2 = ls), :positive_stan),
+                            (arg1 = 0, arg2 = ls), :positive),
                         (horseshoe_tau_name(pred.name, addr), :cauchy,
-                            (arg1 = 0, arg2 = gs), :positive_stan))
+                            (arg1 = 0, arg2 = gs), :positive))
                     nm in taken && _sfail(
                         "horseshoe over $(pred.name): synthesized $nm " *
                         "collides with a model name — rename yours")
@@ -12002,8 +11966,8 @@ end
 # A scalar coefficient prior the affine block can carry: a coefficient
 # family over positional literal/name arguments (expression arguments are
 # names by now — `_hoist_prior_args!`), literal `Uniform` bounds and
-# literal StudentT `nu`. Anything else (keyword halves such as
-# `Normal(0, s; lower=0)`, parameter bounds) is an ordinary parameter
+# literal StudentT `nu`. Anything else (half or truncated distributions,
+# parameter bounds) is an ordinary parameter
 # prior. Arity mistakes stay with the coefficient path's message.
 function _coef_prior_expressible(rhs)
     args = rhs.args[2:end]
@@ -12758,75 +12722,15 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
                "meant as a submodel, define it with " *
                "`@rkppl $fam(args...) = begin ... end` and " *
                "make it visible in the lowering module (`mod=`).")
-    if any(a -> a isa Expr && a.head === :parameters, rhs.args[2:end])
-        return _lower_stan_half_param(lhs, rhs, fam, coefuse, matrices)
-    end
+    any(a -> a isa Expr && a.head === :parameters, rhs.args[2:end]) &&
+        _sfail("parameter $lhs: `$fam` does not take support keywords; " *
+            "use `truncated($fam(args...), lo, hi)`, `HalfNormal(s)`, " *
+            "or `HalfCauchy(s)` for a normalized positive prior")
     args = _plain_args(rhs, "`$fam`")
     vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in args]
     argkeys = ntuple(i -> Symbol(:arg, i), length(vals))
     return SampledParameter(lhs, _PARAM_FAMILIES[fam],
         NamedTuple{argkeys}(Tuple(vals)), nothing, lhs)
-end
-
-# Stan-kernel halves: `s ~ Normal(0, sc; lower=0)` (and the other
-# symmetric bases) lowers to the `:positive_stan` support override — the
-# bare symmetric density on positive support with NO `+log(2)`
-# renormalizer, matching Stan's `real<lower=0>` + `~ normal()` kernel and
-# the posteriordb reference kernels. This is the complement of
-# `HalfNormal(sc)` / `truncated(Normal(0, sc), 0, Inf)`, which are the
-# PROPER (renormalized) halves. IR validation, layout, and generation
-# already cover `:positive_stan`; this is only the surface spelling.
-# Admitted narrowly: exactly `lower=0` (literal zero), symmetric base,
-# literal-zero location. Anything else fails closed naming the form.
-function _lower_stan_half_param(lhs, rhs, fam, coefuse, matrices)
-    kws = Expr[]
-    posargs = Any[]
-    for a in rhs.args[2:end]
-        if a isa Expr && a.head === :parameters
-            append!(kws, a.args)
-        else
-            push!(posargs, a)
-        end
-    end
-    for kw in kws
-        kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-            _sfail("parameter $lhs: Stan-kernel halves take exactly " *
-                   "`lower=0` (`$fam(0, s; lower=0)`), got $(repr(kw))")
-        k = kw.args[1]
-        k === :lower || _sfail(k === :upper ?
-            "parameter $lhs: `upper=` is spelled `truncated(Normal(mu, s), " *
-            "-Inf, hi)` — `; lower=0` is the only admitted prior keyword" :
-            "parameter $lhs: unknown prior keyword `$k` — the only " *
-            "admitted prior keyword is `lower=0` " *
-            "(`$fam(0, s; lower=0)`)")
-        v = kw.args[2]
-        v isa Real && v == 0 ||
-            _sfail("parameter $lhs: Stan-kernel `lower` must be literal " *
-                   "0, got $(repr(v))")
-    end
-    length(kws) == 1 ||
-        _sfail("parameter $lhs: Stan-kernel halves take exactly one " *
-               "keyword (`$fam(0, s; lower=0)`)")
-    haskey(_TRUNCATED_BASES, fam) ||
-        _sfail("parameter $lhs: `; lower=0` needs a symmetric base " *
-               "(Normal, Cauchy, StudentT, Laplace, Logistic) with " *
-               "zero location — `$fam` carries its own support " *
-               "(`HalfNormal`/`truncated` are already positive; " *
-               "`Uniform` carries its interval)")
-    arity, locpos = _TRUNCATED_BASES[fam]
-    length(posargs) == arity ||
-        _sfail("parameter $lhs: `$fam` takes $arity positional " *
-               "arguments (`$fam(0, s; lower=0)`), got " *
-               "$(length(posargs))")
-    loc = posargs[locpos]
-    loc isa Real && loc == 0 ||
-        _sfail("parameter $lhs: Stan-kernel `; lower=0` requires " *
-               "literal zero location (the half shape truncates at 0), " *
-               "got $(repr(loc))")
-    vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in posargs]
-    argkeys = ntuple(i -> Symbol(:arg, i), length(vals))
-    return SampledParameter(lhs, _PARAM_FAMILIES[fam],
-        NamedTuple{argkeys}(Tuple(vals)), :positive_stan, lhs)
 end
 
 function _lower_param_arg(lhs, a, coefuse, matrices)
@@ -12842,72 +12746,12 @@ function _lower_param_arg(lhs, a, coefuse, matrices)
 end
 
 function _lower_flat(lhs, rhs)
-    posargs = Any[]
-    kws = Expr[]
-    for a in rhs.args[2:end]
-        if a isa Expr && a.head === :parameters
-            append!(kws, a.args)
-        else
-            push!(posargs, a)
-        end
-    end
-    isempty(posargs) ||
-        _sfail("parameter $lhs: `Flat()` takes no arguments in slice 1")
-    isempty(kws) &&
-        return SampledParameter(lhs, :flat, NamedTuple(), nothing, lhs)
-    return _lower_flat_support(lhs, kws)
-end
-
-# Flat with support: `Flat(; lower=0)` (positive, Stan kernel),
-# `Flat(; upper=hi)` (upper-bounded), `Flat(; lower=lo, upper=hi)`
-# (finite interval). Improper throughout: density 0.0, Jacobian only —
-# the posteriordb flat-sigma / flat-interval shape (e.g. radon_county
-# sigmas, kidscore/wells flat sigmas). Bounds are finite literals;
-# one-sided lower at nonzero has no spelling (no :floored override in
-# slice 1) and fails closed naming the admitted forms.
-function _lower_flat_support(lhs, kws::Vector{Expr})
-    have_lower = false
-    have_upper = false
-    lower = NaN
-    upper = NaN
-    for kw in kws
-        kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-            _sfail("parameter $lhs: flat support takes `lower=`/`upper=` " *
-                   "(`Flat(; lower=0)`, `Flat(; upper=hi)`, or " *
-                   "`Flat(; lower=lo, upper=hi)`), got $(repr(kw))")
-        k, v = kw.args[1], kw.args[2]
-        k === :lower || k === :upper ||
-            _sfail("parameter $lhs: unknown flat keyword `$k` — " *
-                   "admitted: `Flat(; lower=0)`, `Flat(; upper=hi)`, " *
-                   "`Flat(; lower=lo, upper=hi)`")
-        v isa Real && isfinite(v) ||
-            _sfail("parameter $lhs: flat `$k` must be a finite " *
-                   "literal, got $(repr(v))")
-        if k === :lower
-            lower = Float64(v)
-            have_lower = true
-        else
-            upper = Float64(v)
-            have_upper = true
-        end
-    end
-    if have_lower && !have_upper
-        lower == 0 || _sfail("parameter $lhs: one-sided flat `lower` " *
-                             "must be literal 0 (`Flat(; lower=0)` for " *
-                             "positive support); a lower bound at $lower " *
-                             "needs its pair (`Flat(; lower=$lower, " *
-                             "upper=hi)` with $lower < hi)")
-        return SampledParameter(lhs, :flat, NamedTuple(),
-            :positive_stan, lhs)
-    end
-    if have_upper && !have_lower
-        return SampledParameter(lhs, :flat, NamedTuple(),
-            (:upper, upper), lhs)
-    end
-    lower < upper || _sfail("parameter $lhs: flat interval needs " *
-                            "lower < upper, got ($lower, $upper)")
-    return SampledParameter(lhs, :flat, NamedTuple(),
-        (:interval, lower, upper), lhs)
+    any(a -> a isa Expr && a.head === :parameters, rhs.args[2:end]) &&
+        _sfail("parameter $lhs: `Flat()` has no support keywords; use " *
+            "`Exponential(s)` for a positive prior, `Uniform(lo, hi)` for " *
+            "a bounded uniform, or `Flat()` for an improper real prior")
+    isempty(rhs.args[2:end]) || _sfail("parameter $lhs: `Flat()` takes no arguments")
+    return SampledParameter(lhs, :flat, NamedTuple(), nothing, lhs)
 end
 
 # `HalfNormal(s)` / `HalfCauchy(s)` lower to the `:positive` support
