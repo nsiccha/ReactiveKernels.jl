@@ -1,16 +1,19 @@
 using Reactant
 
 # Helpers and independent analytical oracles are in test_observation_shapes.jl.
-function _os_compiled_fixture(bound, x, y)
-    expected, gradient = _os_oracle(x, y, _OS_U)
+function _os_compiled_fixture(bound, x, y; expected = nothing, gradient = nothing)
+    if expected === nothing
+        expected, gradient = _os_oracle(x, y, _OS_U)
+    end
+    original = deepcopy((x, y))
     built, post, sampler = _os_check(bound, expected, gradient)
     # Generated recipes must exist before entering the compilation world.
-    return Base.invokelatest(_os_compiled_measure, sampler, x, y, expected, gradient)
+    return Base.invokelatest(_os_compiled_measure, sampler, x, y, original,
+        expected, gradient)
 end
 
-function _os_compiled_measure(sampler, x, y, expected, gradient)
+function _os_compiled_measure(sampler, x, y, original, expected, gradient)
     post, ad = sampler.kernel, sampler.ad
-    original = deepcopy((x, y))
     ru = Reactant.to_rarray(_OS_U)
     hlo = repr(Reactant.@code_hlo optimize = false post(ru))
     both(v) = ad_value_and_gradient(ad, v)
@@ -31,6 +34,26 @@ function _os_compiled_measure(sampler, x, y, expected, gradient)
     @test Array(g) ≈ gradient rtol = 1e-9 atol = 1e-10
     @test (x, y) == original
     return operations
+end
+
+@testset "compiled independent response domains" begin
+    model = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        mu = a .+ b .* x
+        y1 .~ Normal.(mu, 0.7)
+        y2 .~ Normal.(mu, 0.7)
+    end
+    counts = map((1, 2)) do scale
+        x, y1, y2 = [0.5], zeros(4scale), zeros(3scale)
+        v1, g1 = _os_oracle(x, y1, _OS_U)
+        v2, g2 = _os_oracle(x, y2, _OS_U)
+        bound = model(; x) | (; y1, y2)
+        _os_compiled_fixture(bound, x, (y1, y2);
+            expected = v1 + v2 - sum(logpdf.(Normal(), _OS_U)),
+            gradient = g1 + g2 + _OS_U)
+    end
+    @test counts[1] == counts[2]
 end
 
 @testset "compiled singleton and tensor domains retain their structure" begin
