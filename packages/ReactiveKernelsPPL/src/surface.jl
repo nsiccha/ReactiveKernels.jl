@@ -6788,7 +6788,7 @@ function _lower_categorical_logit_response(lhs, call, range, weights,
                             "K−1 non-reference etas " *
                             "(`y .~ CategoricalLogit.(eta_2, eta_3)` for K=3)")
     pnames = Symbol[_lower_location(lhs, a, IdentityLink, ctx, predictors,
-        pred_idx, coefuse; synth = Symbol(lhs, "_eta_", j))
+        pred_idx, coefuse; synth = Symbol(lhs, "_eta_", j), value = true)
         for (j, a) in enumerate(args)]
     return LikelihoodSpec(CategoricalLogitFam, LogitLink, lhs, pnames[1],
         nothing, weights, evidence, label, nothing, range;
@@ -6859,7 +6859,7 @@ function _lower_ordered_logistic_response(lhs, call, range, weights,
         "takes `y .~ OrderedLogistic.(eta, Ref(c))` with " *
         "`c ~ Ordered(Normal(0, 1), length(levels(y)) - 1)`")
     pname = _lower_location(lhs, args[1], IdentityLink, ctx, predictors,
-        pred_idx, coefuse)
+        pred_idx, coefuse; value = true)
     cut = length(args) == 2 ?
         _explicit_thresholds!(ctx, lhs, args[2], true, "`OrderedLogistic`") :
         _implicit_vector!(ctx, Symbol(lhs, :_cutpoints), :ordered_normal, lhs)
@@ -6902,7 +6902,7 @@ function _lower_ordinal_response(lhs, call, range, weights, evidence,
     linktag = _ordinal_tag(lhs, args[2],
         (:LogitLink, :ProbitLink, :CloglogLink), "link")
     pname = _lower_location(lhs, args[3], IdentityLink, ctx, predictors,
-        pred_idx, coefuse)
+        pred_idx, coefuse; value = true)
     vfam = structure === :Cumulative ? :ordered_normal : :vector_normal
     thresh = length(args) == 4 ?
         _explicit_thresholds!(ctx, lhs, args[4], structure === :Cumulative,
@@ -6974,7 +6974,7 @@ function _lower_joint_response(j::JointSampleStmt, factor_names::Set{Symbol},
         "`LKJCovarianceFactor` declaration " *
         "(`L ~ LKJCovarianceFactor(K, Exponential(1.0), eta)` in the model)")
     pnames = Symbol[_lower_location(o, m, IdentityLink, ctx, predictors,
-        pred_idx, coefuse; synth = Symbol(o, "_joint_", k))
+        pred_idx, coefuse; synth = Symbol(o, "_joint_", k), value = true)
         for (k, (o, m)) in enumerate(zip(j.outcomes, j.means))]
     scales, corr = _lkj_factor_names(j.factor)
     label = Symbol(join(j.outcomes, "_") * "_resp")
@@ -8195,10 +8195,16 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             # column as a value under the written link.
             value && !bare && _is_value_location(loc, ctx) &&
                 return _value_location!(lhs, loc, pred_link, ctx,
-                    predictors, pred_idx)
+                    predictors, pred_idx; synth)
             return _lower_location_symbol_error(lhs, loc, ctx; bare,
                 value)
         end
+        # Scalar definitions stay ordinary values, except for the already
+        # admitted signed coefficient aliases (their intercept plan stays).
+        value && !bare && _scalar_location_value(loc, ctx) &&
+            !_scalar_intercept_location(loc, ctx) &&
+            return _value_location!(lhs, loc, pred_link, ctx,
+                predictors, pred_idx; synth)
         pin = get(ctx.predictor_pins, lhs, nothing)
         if pin !== nothing && pin !== loc
             # A pin renames one response's predictor — the pinned location
@@ -8246,9 +8252,15 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         end
         terms, uses = _analyze_predictor(pname, ctx.detmap[loc], ctx, lhs)
     elseif loc isa Number
+        value && !bare && return _value_location!(lhs, loc, pred_link, ctx,
+            predictors, pred_idx; synth)
         _sfail("response $lhs location is a literal — use an intercept-only " *
                "predictor (`eta = a`)")
     else
+        value && !bare && _scalar_location_value(loc, ctx) &&
+            !_scalar_intercept_location(loc, ctx) &&
+            return _value_location!(lhs, loc, pred_link, ctx,
+                predictors, pred_idx; synth)
         # Per-cell latents classify inline like data columns: `b .* x_true`
         # is a ContinuousTerm over the latent (the SB `me` mirror); a bare
         # latent fails in `_classify_symbol`, never silently.
@@ -8309,31 +8321,122 @@ _is_value_location(loc::Symbol, ctx) = loc in ctx.data ||
         loc ∉ ctx.vector_params && loc ∉ ctx.varying_contribs &&
         loc ∉ ctx.varying_draws_names)
 
+# Scalar definitions/expressions, plus scalar sums the affine path refuses
+# (two intercepts or a literal summand). Other vector-shaped expressions
+# and declared array reads keep their established affine/composed plans.
+_scalar_location_value(loc, ctx) =
+    !_reads_array_value(loc, ctx) && _scalar_location_reads(loc, ctx) &&
+    ((_canon_shape(loc, ctx) === :scalar &&
+    !_obs_axis(loc, ctx.data, ctx.detmap, ctx.detshape, Set{Symbol}(),
+        ctx.shape_env)) || _scalar_sum_location(loc, ctx))
+
+# Require declared values: an implicit coefficient, factor reference or
+# basis/trajectory constructor belongs to the established predictor path.
+function _scalar_location_reads(loc, ctx,
+        seen::Set{Symbol} = Set{Symbol}(); allow_data::Bool = false)
+    if loc isa Symbol
+        haskey(ctx.detmap, loc) || return (allow_data && loc in ctx.data) ||
+            (loc in ctx.prior_names && loc ∉ ctx.sized_decls &&
+                loc ∉ ctx.vector_params)
+        loc in seen && return false
+        push!(seen, loc)
+        value = _scalar_location_reads(ctx.detmap[loc], ctx, seen; allow_data)
+        delete!(seen, loc)
+        return value
+    end
+    loc isa Expr || return true
+    _is_bound_value_call(loc) && return true
+    loc.head === :ref && return false
+    loc.head === :call && !isempty(loc.args) &&
+        loc.args[1] in _CONSTRUCT_VALUE_HEADS && return false
+    args = loc.head === :call ? loc.args[2:end] :
+        _is_dotted_call(loc) ? loc.args[2].args : loc.args
+    # A reduction returns a scalar from columns; an arbitrary whole-value
+    # call over columns has unknown shape and retains its existing guidance.
+    whole = allow_data || (loc.head === :call && !isempty(loc.args) &&
+        loc.args[1] in REDUCTION_FNS)
+    return all(a -> _scalar_location_reads(a, ctx, seen; allow_data = whole), args)
+end
+
+function _scalar_sum_location(loc::Symbol, ctx,
+        seen::Set{Symbol} = Set{Symbol}())
+    haskey(ctx.detmap, loc) && loc ∉ seen || return false
+    push!(seen, loc)
+    return _scalar_sum_location(ctx.detmap[loc], ctx, seen)
+end
+function _scalar_sum_location(loc::Expr, ctx,
+        seen::Set{Symbol} = Set{Symbol}())
+    return loc.head === :call && length(loc.args) >= 3 &&
+        loc.args[1] in (:+, :-, :.+, :.-) &&
+        _canon_shape(loc, ctx) in (:scalar, :vector) &&
+        !_obs_axis(loc, ctx.data, ctx.detmap, ctx.detshape, Set{Symbol}(),
+            ctx.shape_env)
+end
+_scalar_sum_location(loc, ctx, seen::Set{Symbol} = Set{Symbol}()) = false
+
+# Exactly the scalar shapes affine analysis already admits: one signed
+# coefficient (stated or implicit), behind aliases or unary +/-. Keep its
+# prior and coordinates when admitting the other scalar value shapes.
+function _scalar_intercept_location(loc::Symbol, ctx,
+        seen::Set{Symbol} = Set{Symbol}())
+    haskey(ctx.detmap, loc) || return _summand_kind(loc, ctx) === :coef
+    loc in seen && return false
+    push!(seen, loc)
+    return _scalar_intercept_location(ctx.detmap[loc], ctx, seen)
+end
+function _scalar_intercept_location(loc::Expr, ctx,
+        seen::Set{Symbol} = Set{Symbol}())
+    return loc.head === :call && length(loc.args) == 2 &&
+        loc.args[1] in (:+, :-, :.+, :.-) &&
+        _scalar_intercept_location(loc.args[2], ctx, seen)
+end
+_scalar_intercept_location(loc, ctx, seen::Set{Symbol} = Set{Symbol}()) = false
+
 # A value location (`y .~ Normal.(mu, s)`, `Poisson.(exp.(a))`,
 # `Normal.(x, s)`): as in Julia, broadcasting gives every observation the
 # value, read on the written link's scale. A data column is an offset (the
 # term its named twin `mu = x` lowers to); a scalar parameter is a one-leaf
 # composition with no coefficient — it keeps its own name and prior — which
 # the generator broadcasts over the rows.
-function _value_location!(lhs, loc::Symbol, pred_link, ctx, predictors,
-        pred_idx)
+function _value_location!(lhs, loc, pred_link, ctx, predictors,
+        pred_idx; synth::Union{Nothing,Symbol} = nothing)
+    # A previously refused scalar sum, including aliases of it, emits as
+    # ordinary scalar definitions, rather than observation columns.
+    source = loc
+    seen = Set{Symbol}()
+    while source isa Symbol && haskey(ctx.detmap, source) && source ∉ seen
+        push!(seen, source)
+        ctx.detshape[source] = :scalar
+        source = ctx.detmap[source]
+    end
     pin = get(ctx.predictor_pins, lhs, nothing)
     if pin !== nothing
+        synth === nothing || _sfail(
+            "response $lhs pins predictor $pin, but $lhs needs one " *
+            "predictor per index (multi-predictor response) — a pin " *
+            "names exactly one predictor")
         _claim_pin!(lhs, pin, ctx, pred_idx)
         pname = pin
     else
-        pname = Symbol(lhs, "_eta")
+        pname = synth === nothing ? Symbol(lhs, "_eta") : synth
         (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
             "derived predictor name $pname collides with your definition — " *
             "rename yours")
     end
-    term = if loc in ctx.data
+    term = if loc isa Symbol && loc in ctx.data
         TermSpec(OffsetTerm, ColumnRef[loc], NamedTuple(), loc,
             Symbol(loc, "_off"))
     else
         label = Symbol(pname, "_value")
+        scalars = Symbol[]
+        tree = if loc isa Symbol
+            push!(scalars, loc)
+            loc
+        else
+            _composed_scalar_leaf!(pname, loc, ctx, scalars)
+        end
         TermSpec(ComposedTerm, ColumnRef[],
-            (tree = loc, subs = Symbol[], scalars = Symbol[loc]), label,
+            (tree = tree, subs = Symbol[], scalars = scalars), label,
             label)
     end
     push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
