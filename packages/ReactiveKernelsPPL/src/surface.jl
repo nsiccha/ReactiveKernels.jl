@@ -547,12 +547,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # monotonic term accepts as its increments (checked during response
     # lowering, before `_lower_parameters` runs).
     dirichlet_names = Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data && _is_dirichlet_call(s.rhs))
+        if s.lhs ∉ data && s.slices === nothing && _is_dirichlet_call(s.rhs))
     # Ordered vectors (`c ~ Ordered(Normal(0, 1), K)`): the only names a
     # cumulative ordinal response takes as explicit cutpoints (checked
     # during response lowering, before `_lower_parameters` runs).
     ordered_names = Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data && !s.broadcast && _is_ordered_call(s.rhs))
+        if s.lhs ∉ data && !s.broadcast && s.slices === nothing &&
+            _is_ordered_call(s.rhs))
     # Covariance-factor declarations (`L ~ LKJCovarianceFactor(...)`): the
     # only stems a joint response accepts as its factor (checked during
     # joint lowering, before `_lower_parameters` runs).
@@ -3896,13 +3897,13 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                        "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
                        "object owns eta over the whole column)")
             end
-            rows = _array_rows_lhs(st.args[2], bc, tilde, data)
-            if rows !== nothing
-                rlhs, rdims = rows
+            sl = _array_slices_lhs(st.args[2], st.args[3], bc, tilde, data)
+            if sl !== nothing
+                rlhs, rdims, slices = sl
                 _claim!(seen, seelines, rlhs, line)
                 _reject_target(st.args[3], rlhs)
                 push!(sample, SampleStmt(rlhs, st.args[3], bc, nothing,
-                    nothing, nothing, rdims, true))
+                    nothing, nothing, rdims, slices))
                 continue
             end
             _reject_derived_ref_lhs(st.args[2], detnames)
@@ -4780,27 +4781,45 @@ end
 _is_literal_range(r) = r isa Expr && r.head === :call && length(r.args) == 3 &&
     r.args[1] === :(:)
 
-# Row-wise array declaration `eachrow(B[a, b]) .~ D`: Julia's `eachrow`
-# makes the rows of the two-axis array `B` the broadcast elements, and a
-# distribution broadcasts as a scalar (Distributions.jl), so every row is
-# one draw of the multivariate `D`. The axes are the two-axis array forms
-# (`1:K`, `levels(g)`, `axes(M, d)`). Returns `(name, dims)` or `nothing`
-# (not an `eachrow` LHS).
-function _array_rows_lhs(lhs, bc::Bool, tilde, data::Set{Symbol})
-    lhs isa Expr && lhs.head === :call && length(lhs.args) >= 1 &&
-        lhs.args[1] === :eachrow || return nothing
-    length(lhs.args) == 2 && lhs.args[2] isa Expr &&
-        lhs.args[2].head === :ref && length(lhs.args[2].args) == 3 &&
-        lhs.args[2].args[1] isa Symbol || _sfail("row-wise declaration " *
-            "`$(repr(lhs))` takes one two-axis array " *
-            "(`eachrow(B[levels(g), 1:K]) .~ MvNormalCholesky(mu, F)`)")
-    target = lhs.args[2].args[1]
-    target in data && _sfail("`$(repr(lhs))`: $target is data — a " *
-        "row-wise declaration declares a parameter array")
-    bc || _sfail("`$(repr(lhs))` broadcasts over the rows — use `.~`, " *
-        "not $tilde (`$(repr(lhs)) .~ MvNormalCholesky(mu, F)`)")
-    return target, Any[_array_axis(target, a, data)
-        for a in lhs.args[2].args[2:3]]
+# Multivariate slice declarations ([`ArrayParameter`](@ref) slice
+# families, `mv_slices.jl`): `eachrow(B[a, b]) .~ D` / `eachcol(B[a, b])
+# .~ D` — Julia's `eachrow` / `eachcol` make the rows / columns of the
+# two-axis array `B` the broadcast elements, and a distribution broadcasts
+# as a scalar (Distributions.jl), so every slice is one draw of the
+# multivariate `D` — and `b[ax] ~ D` with a multivariate normal `D` (the
+# vector `b` one draw). The axes are the array axis forms (`1:K`,
+# `levels(g)`, `axes(M, d)`). Returns `(name, dims, slices)` with
+# `slices` one of `:rows`, `:cols`, `:vector`, or `nothing` (not a slice
+# declaration).
+function _array_slices_lhs(lhs, rhs, bc::Bool, tilde, data::Set{Symbol})
+    if lhs isa Expr && lhs.head === :call && length(lhs.args) >= 1 &&
+            lhs.args[1] in (:eachrow, :eachcol)
+        it = lhs.args[1]
+        length(lhs.args) == 2 && lhs.args[2] isa Expr &&
+            lhs.args[2].head === :ref && length(lhs.args[2].args) == 3 &&
+            lhs.args[2].args[1] isa Symbol || _sfail("slice declaration " *
+                "`$(repr(lhs))` takes one two-axis array " *
+                "(`$it(B[levels(g), 1:K]) .~ MvNormalCholesky(mu, F)`)")
+        target = lhs.args[2].args[1]
+        target in data && _sfail("`$(repr(lhs))`: $target is data — a " *
+            "slice declaration declares a parameter array")
+        bc || _sfail("`$(repr(lhs))` broadcasts over the slices — use " *
+            "`.~`, not $tilde (`$(repr(lhs)) .~ MvNormalCholesky(mu, F)`)")
+        return target, Any[_array_axis(target, a, data)
+            for a in lhs.args[2].args[2:3]], it === :eachrow ? :rows : :cols
+    end
+    # `b[ax] ~ MvNormal(...)`: one draw of a multivariate normal.
+    _mv_vector_head(rhs) || return nothing
+    lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol &&
+        lhs.args[1] ∉ data || return nothing
+    target = lhs.args[1]
+    head = _mv_head(rhs)
+    length(lhs.args) == 2 || _sfail("`$(repr(lhs)) ~ $head(...)` draws " *
+        "one vector — a two-axis array draws its slices " *
+        "(`eachrow($(repr(lhs))) .~ $head(...)` or `eachcol(...)`)")
+    bc && _sfail("`$(repr(lhs))` is one draw of the multivariate `$head` " *
+        "— use `~`, not `.~` (`.~` would draw every element separately)")
+    return target, Any[_array_axis(target, lhs.args[2], data)], :vector
 end
 
 function _array_axis(target::Symbol, a, data::Set{Symbol})
@@ -5011,9 +5030,10 @@ column: bare LHS, `eachindex`, `axes`). `levels` carries a
 `b[axes(X, 2)]` coefficient-vector priors (`nothing` otherwise). `dims`
 carries the axes of a declared array parameter (`z[1:K] .~ ...`,
 `z[levels(g), axes(Z, 2)] .~ ...` — see [`ArrayParameter`](@ref);
-`nothing` otherwise). `rows` marks a row-wise declaration
-`eachrow(B[a, b]) .~ D` (each row of the two-axis array one draw of the
-multivariate `D`)."""
+`nothing` otherwise). `slices` marks a multivariate slice declaration
+— `:rows` for `eachrow(B[a, b]) .~ D`, `:cols` for `eachcol(B[a, b]) .~
+D`, `:vector` for `b[ax] ~ D` (each slice one draw of the multivariate
+`D`) — and is `nothing` otherwise."""
 struct SampleStmt
     lhs::Symbol
     rhs::Any
@@ -5022,10 +5042,10 @@ struct SampleStmt
     levels::Any
     matrix::Union{Nothing,Symbol}
     dims::Union{Nothing,Vector{Any}}
-    rows::Bool
+    slices::Union{Nothing,Symbol}
 end
 SampleStmt(lhs::Symbol, rhs, broadcast::Bool, range, levels, matrix, dims) =
-    SampleStmt(lhs, rhs, broadcast, range, levels, matrix, dims, false)
+    SampleStmt(lhs, rhs, broadcast, range, levels, matrix, dims, nothing)
 SampleStmt(lhs::Symbol, rhs, broadcast::Bool, range, levels, matrix) =
     SampleStmt(lhs, rhs, broadcast, range, levels, matrix, nothing)
 SampleStmt(lhs::Symbol, rhs, broadcast::Bool) =
@@ -10220,9 +10240,9 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
     arrays = ArrayParameter[]
     for s in sample
         (s.lhs in ctx.data || s.lhs in ctx.derived_responses) && continue
-        if s.rows
-            push!(arrays, _lower_array_rows(s.lhs, s.dims, s.rhs, coefuse,
-                syms))
+        if s.slices !== nothing
+            push!(arrays, _lower_array_slices(s.lhs, s.dims, s.slices, s.rhs,
+                coefuse, syms))
             continue
         end
         if s.dims !== nothing
@@ -10354,41 +10374,184 @@ function _lower_array_parameter(lhs, dims::Vector{Any}, rhs, coefuse, ctx,
     return ArrayParameter(lhs, p.family, args, dims, p.support_override, lhs)
 end
 
-# `eachrow(B[a, b]) .~ MvNormalCholesky(mu, F)`: every row of `B` is
-# one draw of the multivariate normal with mean `mu` (a K-vector) and
-# covariance `F * F'`, `F` the lower-triangular Cholesky factor of the
-# covariance (Stan's `multi_normal_cholesky`; `F = sd .* L` for scales
-# `sd` and an `LKJCholesky` correlation factor `L`). `mu` and `F` are
-# model-level values: literal vectors, `zeros(K)`, array names or
-# expressions over them.
-function _lower_array_rows(lhs, dims::Vector{Any}, rhs, coefuse,
-        syms::Set{Symbol})
+# Multivariate slice families (`mv_slices.jl`): the distribution head and
+# its family stem. An [`ArrayParameter`](@ref) slice family is
+# `<stem>_<slices>` (`:mvnormal_cholesky_rows`, `:dirichlet_cols`,
+# `:mvnormal_vector`, …).
+const _MV_SLICE_STEMS = (MvNormalCholesky = :mvnormal_cholesky,
+    MvNormal = :mvnormal, Dirichlet = :dirichlet, Ordered = :ordered_normal)
+
+# The head of a multivariate distribution `D(args...)` / `D.(args...)`
+# (`nothing` otherwise).
+function _mv_head(rhs)
+    rhs isa Expr || return nothing
+    h = rhs.head === :call && !isempty(rhs.args) ? rhs.args[1] :
+        rhs.head === :. && length(rhs.args) == 2 ? rhs.args[1] : nothing
+    h isa Symbol && haskey(_MV_SLICE_STEMS, h) || return nothing
+    return h
+end
+
+# Multivariate normals also declare one vector (`b[1:K] ~ MvNormal(...)`);
+# a simplex and an ordered vector keep their unsized declarations
+# (`phi ~ Dirichlet(alpha)`, `c ~ Ordered(Normal(0, 1), K)`).
+_mv_vector_head(rhs) = _mv_head(rhs) in (:MvNormalCholesky, :MvNormal)
+
+_is_slice_iterator(a) = a isa Expr && a.head === :call &&
+    length(a.args) == 2 && a.args[1] in (:eachrow, :eachcol)
+_is_ref_call(a) = a isa Expr && a.head === :call && length(a.args) == 2 &&
+    a.args[1] === :Ref
+
+# One argument of a slice prior, as written: shared (`Ref(x)` in a dotted
+# call, any value in an undotted one) or per slice (`eachrow(M)` /
+# `eachcol(M)`, dotted only — standard broadcasting pairs slice `g` with
+# slice `g`). Returns the stored value: the shared value itself, or the
+# `eachrow(M)` / `eachcol(M)` expression.
+function _slice_prior_arg(what, head, a, dotted::Bool)
+    a isa Expr && a.head === :parameters &&
+        _sfail("$what: `$head` takes positional arguments only (no keywords)")
+    if dotted
+        _is_ref_call(a) && return a.args[2]
+        _is_slice_iterator(a) && return a
+        a isa Real && !(a isa Bool) && return a
+        _sfail("$what: in the dotted `$head.(…)` every argument is shared " *
+            "(`Ref(x)`) or iterates slices (`eachrow(M)` / `eachcol(M)`), " *
+            "got $(repr(a)) — a bare array would broadcast over its " *
+            "elements, as in Julia")
+    end
+    _is_slice_iterator(a) && _sfail("$what: `$(repr(a))` gives one " *
+        "argument per slice, which pairs slices only in a broadcast — " *
+        "write `$head.(…)` with the shared arguments in `Ref(…)`")
+    _is_ref_call(a) && _sfail("$what: `$(repr(a))` marks a shared argument " *
+        "of a broadcast `$head.(…)`; an undotted `$head(…)` shares every " *
+        "argument already")
+    return a
+end
+
+# A vector-valued argument (a mean, a concentration): never a scalar.
+function _slice_vector_arg(what, head, role, a)
+    (a isa Real || a isa Bool) && _sfail("$what: the `$head` $role is a " *
+        "vector, got the scalar $(repr(a))" *
+        (role === "mean" ? " (a zero mean is `zeros(K)`)" : ""))
+    a isa Expr || a isa Symbol || _sfail("$what: `$head` $role " *
+        "$(repr(a)) is not a value")
+    return a
+end
+
+# A matrix argument shared by every slice (a factor, a covariance).
+function _slice_matrix_arg(what, head, role, a)
+    _is_slice_iterator(a) && _sfail("$what: the `$head` $role is one " *
+        "matrix shared by every slice — write `Ref($(repr(a.args[2])))`")
+    (a isa Real || a isa Bool) && _sfail("$what: the `$head` $role is a " *
+        "matrix, got the scalar $(repr(a))")
+    a isa Expr && a.head === :vect && _sfail("$what: the `$head` $role " *
+        "is a matrix, got the vector $(repr(a))")
+    a isa Expr || a isa Symbol || _sfail("$what: `$head` $role " *
+        "$(repr(a)) is not a value")
+    return a
+end
+
+# A scalar argument shared by every slice (an element location / scale).
+function _slice_scalar_arg(what, head, role, a)
+    a isa Bool && _sfail("$what: `$head` $role $(repr(a)) is not a value")
+    a isa Real && return isfinite(a) ? a : _sfail("$what: `$head` $role " *
+        "must be finite, got $(repr(a))")
+    a isa Expr && a.head === :vect && _sfail("$what: the `$head` $role is " *
+        "a scalar, got the vector $(repr(a))")
+    a isa Expr || a isa Symbol || _sfail("$what: `$head` $role " *
+        "$(repr(a)) is not a value")
+    return a
+end
+
+function _literal_count(what, head, n)
+    n isa Integer && !(n isa Bool) && n >= 1 || _sfail("$what: `$head` " *
+        "takes a literal length K ≥ 1, got $(repr(n))")
+    return Int(n)
+end
+
+# Family arguments (positional keys) of each multivariate head.
+function _mv_slice_args(::Val{:MvNormalCholesky}, what, args)
+    length(args) == 2 || _sfail("$what: `MvNormalCholesky` takes (mean " *
+        "vector, covariance Cholesky factor), got $(length(args)) arguments")
+    return (arg1 = _slice_vector_arg(what, :MvNormalCholesky, "mean", args[1]),
+        arg2 = _slice_matrix_arg(what, :MvNormalCholesky,
+            "covariance Cholesky factor", args[2]))
+end
+function _mv_slice_args(::Val{:MvNormal}, what, args)
+    length(args) == 2 || _sfail("$what: `MvNormal` takes (mean vector, " *
+        "covariance matrix), got $(length(args)) arguments (a zero mean " *
+        "is `zeros(K)`)")
+    return (arg1 = _slice_vector_arg(what, :MvNormal, "mean", args[1]),
+        arg2 = _slice_matrix_arg(what, :MvNormal, "covariance", args[2]))
+end
+function _mv_slice_args(::Val{:Dirichlet}, what, args)
+    if length(args) == 2
+        # Symmetric `Dirichlet(K, a)` (Distributions.jl): K copies of `a`.
+        K = _literal_count(what, :Dirichlet, args[1])
+        a = _slice_scalar_arg(what, :Dirichlet, "concentration", args[2])
+        return (arg1 = Expr(:call, :fill, a, K),)
+    end
+    length(args) == 1 || _sfail("$what: `Dirichlet` takes a concentration " *
+        "vector `Dirichlet(alpha)` or the symmetric `Dirichlet(K, a)`, got " *
+        "$(length(args)) arguments")
+    return (arg1 = _slice_vector_arg(what, :Dirichlet, "concentration",
+        args[1]),)
+end
+function _mv_slice_args(::Val{:Ordered}, what, args)
+    length(args) == 2 || _sfail("$what: `Ordered` takes (element " *
+        "distribution, length) — `Ordered(Normal(m, s), K)`")
+    d = args[1]
+    d isa Expr && d.head === :call && !isempty(d.args) &&
+        d.args[1] === :Normal && length(d.args) <= 3 || _sfail("$what: " *
+            "`Ordered` takes a `Normal(m, s)` element distribution, got " *
+            "$(repr(d))")
+    m = length(d.args) >= 2 ? d.args[2] : 0.0
+    sd = length(d.args) >= 3 ? d.args[3] : 1.0
+    return (arg1 = _slice_scalar_arg(what, :Normal, "location", m),
+        arg2 = _slice_scalar_arg(what, :Normal, "scale", sd),
+        arg3 = _literal_count(what, :Ordered, args[2]))
+end
+
+# `eachrow(B[a, b]) .~ D`, `eachcol(B[a, b]) .~ D`, `b[ax] ~ D`: every
+# slice of the declared array one draw of the multivariate `D`
+# (`mv_slices.jl`). The family is `<stem>_<slices>`; arguments are
+# model-level values — literal vectors, `zeros(K)`, array names or
+# expressions over them — shared by every slice, or per slice
+# (`eachrow(M)` / `eachcol(M)` in a dotted `D.(…)`).
+function _lower_array_slices(lhs, dims::Vector{Any}, slices::Symbol, rhs,
+        coefuse, syms::Set{Symbol})
     haskey(coefuse, lhs) && _sfail("array $lhs is used as a predictor " *
         "coefficient — read it as a value (`$lhs[g, 1]`, `$lhs[g, :] * v`)")
-    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
-        rhs.args[1] === :MvNormalCholesky || _sfail("row-wise array $lhs " *
-            "takes one multivariate distribution, " *
-            "`MvNormalCholesky(mu, F)` (each row one draw), got $(repr(rhs))")
-    args = _plain_args(rhs, "`MvNormalCholesky`")
-    length(args) == 2 || _sfail("row-wise array $lhs: " *
-        "`MvNormalCholesky` takes (mean vector, covariance Cholesky " *
-        "factor), got $(length(args)) arguments")
-    for a in args
-        a isa Bool && _sfail("row-wise array $lhs: `MvNormalCholesky` " *
-            "argument $(repr(a)) is not a value")
-        a isa Real && _sfail("row-wise array $lhs: `MvNormalCholesky` " *
-            "takes a mean VECTOR and a factor MATRIX, got the scalar " *
-            "$(repr(a)) (a zero mean is `zeros(K)`)")
-        a isa Expr || a isa Symbol || _sfail("row-wise array $lhs: " *
-            "`MvNormalCholesky` argument $(repr(a)) is not a value")
-        for r in _value_symbols(a)
+    what = slices === :vector ? "array $lhs" : "slice array $lhs"
+    noun = slices === :rows ? "row" : slices === :cols ? "column" : "draw"
+    head = _mv_head(rhs)
+    if head === nothing
+        h = rhs isa Expr && rhs.head in (:call, :.) && !isempty(rhs.args) ?
+            rhs.args[1] : nothing
+        _sfail("$what: each $noun is a vector, drawn by a multivariate " *
+            "distribution — `MvNormalCholesky(mu, F)`, `MvNormal(mu, " *
+            "Sigma)`, `Dirichlet(alpha)` or `Ordered(Normal(m, s), K)` — " *
+            "got $(repr(rhs))" * (h isa Symbol ? " (an elementwise prior " *
+            "is `$lhs[a, b] .~ $h.(…)`)" : ""))
+    end
+    dotted = rhs.head === :.
+    dotted && !(rhs.args[2] isa Expr && rhs.args[2].head === :tuple) &&
+        _sfail("$what: malformed broadcast $(repr(rhs))")
+    raw = dotted ? rhs.args[2].args : _plain_args(rhs, "`$head`")
+    # `Ordered`'s arguments (an element distribution, a length) broadcast
+    # as scalars, so `Ordered.(…)` is `Ordered(…)`.
+    head === :Ordered && (dotted = false)
+    args = Any[_slice_prior_arg(what, head, a, dotted) for a in raw]
+    fargs = _mv_slice_args(Val(head), what, args)
+    for v in values(fargs)
+        v isa Symbol || v isa Expr || continue
+        for r in _value_symbols(_is_slice_iterator(v) ? v.args[2] : v)
             haskey(coefuse, r) && _sfail("$r is a predictor coefficient " *
                 "and cannot also be a prior argument (array $lhs)")
             push!(syms, r)
         end
     end
-    return ArrayParameter(lhs, :mvnormal_cholesky_rows,
-        (arg1 = args[1], arg2 = args[2]), dims, nothing, lhs)
+    return ArrayParameter(lhs, Symbol(_MV_SLICE_STEMS[head], :_, slices),
+        fargs, dims, nothing, lhs)
 end
 
 # `Fam.(args...)` → `Fam(args...)`, recursively through the distribution

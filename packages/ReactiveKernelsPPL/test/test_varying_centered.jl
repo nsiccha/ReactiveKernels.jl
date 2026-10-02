@@ -52,8 +52,9 @@ end
     @test_throws ArgumentError ReactiveKernelsPPL._centered_correlated_logpdf(ones(2),[-1.,1.],ones(3))
 end
 
-# `eachrow(B[a, b]) .~ MvNormalCholesky(mu, F)` shares the forward
-# substitution with the centered draws above (`_lower_solve_rows_logpdf`).
+# Multivariate normal slice priors (`eachrow(B[a, b]) .~
+# MvNormalCholesky(mu, F)`, `mv_slices.jl`) share the forward substitution
+# with the centered draws above (`_lower_solve_rows_logpdf`).
 function _rows_prior_point(k, g)
     B = [.1sin(i + 3j) for i in 1:g, j in 1:k]
     mu = [.05j - .1 for j in 1:k]
@@ -62,7 +63,8 @@ function _rows_prior_point(k, g)
 end
 
 _rows_prior_value(B, mu, F) =
-    ReactiveKernelsPPL._mvnormal_cholesky_rows_logpdf(B, mu, F)
+    ReactiveKernelsPPL._mvnormal_cholesky_slices_logpdf(
+        ReactiveKernelsPPL._SliceRows(), B, mu, F)
 
 @testset "row-wise MvNormalCholesky keeps runtime row and margin loops" begin
     io = IOBuffer()
@@ -87,6 +89,16 @@ end
             (r = (i - g*k - k - 1) % k + 1; c = (i - g*k - k - 1) ÷ k + 1; r >= c)]
         @test gradient(objective, backend, q)[free] ≈
             _transit_fd_gradient(p -> oracle(unpack(p)...), q)[free] rtol=2e-6 atol=3e-8
+    end
+    # The same rows as columns, and through the full covariance.
+    for (k, g) in ((1, 3), (13, 4))
+        B, mu, F = _rows_prior_point(k, g)
+        @test ReactiveKernelsPPL._mvnormal_cholesky_slices_logpdf(
+            ReactiveKernelsPPL._SliceCols(), permutedims(B), mu, F) ≈
+            _rows_prior_value(B, mu, F) rtol=1e-14
+        @test ReactiveKernelsPPL._mvnormal_slices_logpdf(
+            ReactiveKernelsPPL._SliceRows(), B, mu, F * F') ≈
+            _rows_prior_value(B, mu, F) rtol=1e-10
     end
     B, mu, F = _rows_prior_point(2, 3)
     @test_throws DimensionMismatch _rows_prior_value(B, [0.], F)

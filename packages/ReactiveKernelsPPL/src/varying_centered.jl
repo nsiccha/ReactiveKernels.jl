@@ -39,27 +39,3 @@ end
     return _lower_solve_rows_logpdf((g,i) -> draws[(g-1)*k+i]/scales[i],
         (i,j) -> lower[i*(i-1)÷2+j], logdet, k, groups)
 end
-
-# `eachrow(B[a, b]) .~ MvNormalCholesky(mu, F)`: every row of `B` one
-# draw of `MvNormal(mu, F * F')`, `F` the lower-triangular Cholesky factor
-# of the covariance (Stan's `multi_normal_cholesky`). Native execution.
-@inline function _mvnormal_cholesky_rows_logpdf(B::AbstractMatrix, mu, F)
-    ReactiveKernels._dynamic_tensorized_marker((B,mu,F)) === nothing ||
-        throw(ArgumentError("row-wise MvNormalCholesky arrays support native execution only"))
-    groups, k = size(B)
-    length(mu) == k && size(F) == (k,k) ||
-        throw(DimensionMismatch("MvNormalCholesky rows have length $k, but the mean has " *
-            "length $(length(mu)) and the factor size $(size(F))"))
-    logdet = 0.0
-    for i in 1:k
-        F[i,i] > 0 || throw(ArgumentError("MvNormalCholesky factor has a nonpositive " *
-            "diagonal entry F[$i, $i]"))
-        for j in (i+1):k
-            iszero(F[i,j]) || throw(ArgumentError("MvNormalCholesky factor is not lower " *
-                "triangular: F[$i, $j] = $(F[i,j])"))
-        end
-        logdet += log(F[i,i])
-    end
-    return _lower_solve_rows_logpdf((g,i) -> B[g,i]-mu[i], (i,j) -> F[i,j], logdet,
-        k, groups)
-end

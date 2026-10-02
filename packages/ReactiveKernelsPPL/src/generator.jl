@@ -162,7 +162,14 @@ import .._varyingsource_pkpd_schedule_columns
 import .._varyingsource_pkpd_subject_columns
 import .._vs_pkpd_has_doses, .._vs_pkpd_placebo_times, .._vs_pkpd_csf_times
 import .._vs_gp_weights, .._vs_gp_normalizer, ..varyingsource_log_placebo
-import .._centered_correlated_logpdf, .._mvnormal_cholesky_rows_logpdf
+import .._centered_correlated_logpdf
+# Multivariate slice priors (`mv_slices.jl`): orientations, per-slice
+# arguments, simplex / ordered slice transforms and the slice densities.
+import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
+import .._mvnormal_cholesky_slices_logpdf, .._mvnormal_slices_logpdf
+import .._dirichlet_slices_logpdf, .._ordered_normal_slices_logpdf
+import .._simplex_slices_constrain, .._simplex_slices_logjac
+import .._ordered_slices_constrain, .._ordered_slices_logjac
 # Event-LP provider (one call over the flat event axis — the flat
 # `log_F` local the batched cell runner slices per subject).
 import ..linear_pk_event_log_f
