@@ -361,3 +361,61 @@ end
         :(mu = a .+ b[g, 1]), :(y .~ Normal.(mu, s))), data;
         mod = @__MODULE__); true)
 end
+
+@testset "centered correlated: library entry, oracle, built-in parity" begin
+    data = (:y, :x, :g)
+    head = (:(a ~ Normal(0, 5)), :(sigma ~ Exponential(1)))
+    tail = :(y .~ Normal.(mu, sigma))
+    prog(stmts...) = Expr(:block, head..., stmts..., tail)
+    use = :(mu = a .+ b[g, 1] .+ x .* b[g, 2])
+    lib = prog(:(b ~ varying_coefs_centered_correlated(g, 2)), use)
+    # The library call is its written-out body over the §3 row statement.
+    @test _lv_canon(lib, data) == _lv_canon(prog(
+        :(b_sd[1:2] .~ HalfNormal.(1)), :(b_L ~ LKJCholesky(2, 1.0)),
+        :(b_F = b_sd .* b_L),
+        :(eachrow(b_c[levels(g), 1:2]) .~ MvNormalCholesky(zeros(2), b_F)),
+        :(b = b_c), use), data)
+    cols = _lv_cols(data)
+    bl = bind_data(_lv_lower(lib, data), cols)
+    kl = build_kernel(bl)
+    u = _lv_point(kl.layout.total)
+    nt = constrain(kl.layout, u)
+    lv = sort(unique(cols[:g]))
+    gi = [findfirst(==(v), lv) for v in cols[:g]]
+    F = Diagonal(nt.b_sd) * nt.b_L
+    C = nt.b_c
+    mu = only(nt.mu) .+ C[gi, 1] .+ cols[:x] .* C[gi, 2]
+    @test _query(kl.spec, bl, :likelihood, u) ≈
+        sum(logpdf.(Normal.(mu, nt.sigma), cols[:y]))
+    @test _query(kl.spec, bl, :prior, u) ≈ logpdf(Normal(0, 5),
+        only(nt.mu)) + logpdf(Exponential(1), nt.sigma) +
+        sum(_lv_halfnormal, nt.b_sd) + _lv_lkj(nt.b_L, 1.0) +
+        sum(logpdf(MvNormal(zeros(2), F * F'), C[j, :]) for j in axes(C, 1))
+    _check_gradient(kl.spec, bl, u)
+    # Parity with the built-in centered geometry (`varying_draws(...;
+    # centered = true)`) under the same priors, at matching values: the
+    # written-out body with those priors gives the same likelihood, prior
+    # and log-Jacobian.
+    builtin = Expr(:block, head..., :(d ~ varying_draws(g, [1, x];
+        centered = true, eta = 1.5, sd = Exponential(2.0))),
+        :(r ~ varying_slice(d, 1:2)), :(mu = a .+ r), tail)
+    written = prog(:(d_sd[1:2] .~ Exponential.(2.0)),
+        :(d_L ~ LKJCholesky(2, 1.5)), :(d_F = d_sd .* d_L),
+        :(eachrow(d_c[levels(g), 1:2]) .~ MvNormalCholesky(zeros(2), d_F)),
+        :(mu = a .+ d_c[g, 1] .+ x .* d_c[g, 2]))
+    bb = bind_data(_lv_lower(builtin, data), cols)
+    kb = build_kernel(bb)
+    bw = bind_data(_lv_lower(written, data), cols)
+    kw = build_kernel(bw)
+    uw = _lv_point(kw.layout.total)
+    w = constrain(kw.layout, uw)
+    base = constrain(kb.layout, zeros(kb.layout.total))
+    # The built-in stores the centered rows as `b_flat_g` (K × G
+    # column-major) and exposes `b_g` as their matrix view.
+    ub = unconstrain(kb.layout, merge(base, (mu = w.mu, sigma = w.sigma,
+        tau_g = w.d_sd, L_g = w.d_L, b_flat_g = vec(permutedims(w.d_c)),
+        b_g = w.d_c)))
+    for port in (:likelihood, :prior, :log_jacobian)
+        @test _query(kw.spec, bw, port, uw) ≈ _query(kb.spec, bb, port, ub)
+    end
+end

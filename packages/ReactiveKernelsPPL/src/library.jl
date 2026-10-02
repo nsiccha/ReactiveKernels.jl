@@ -269,6 +269,36 @@ Read it like [`varying_coefs`](@ref): `b[g]`, `x .* b[g]`. Draws are
 end
 
 """
+    b ~ varying_coefs_centered_correlated(g, K)
+
+Centered correlated per-level coefficients for `K ≥ 2` margins (`K` a
+literal): every level's row is one draw of
+`MvNormal(0, (sd .* L) * (sd .* L)')`, the coefficients themselves
+sampled. Its body:
+
+```julia
+@rkppl varying_coefs_centered_correlated(g, K) = begin
+    sd[1:K] .~ HalfNormal.(1)
+    L ~ LKJCholesky(K, 1.0)
+    F = sd .* L
+    eachrow(c[levels(g), 1:K]) .~ MvNormalCholesky(zeros(K), F)
+    return c
+end
+```
+
+Read it like [`varying_coefs_correlated`](@ref): margin `k` of
+observation `i` is `b[g, k]`, so `b[g, 1] .+ x .* b[g, 2]`. Draws are
+`b_sd`, `b_L` and `b_c`.
+"""
+@rkppl varying_coefs_centered_correlated(g, K) = begin
+    sd[1:K] .~ HalfNormal.(1)
+    L ~ LKJCholesky(K, 1.0)
+    F = sd .* L
+    eachrow(c[levels(g), 1:K]) .~ MvNormalCholesky(zeros(K), F)
+    return c
+end
+
+"""
     u ~ varying_stratified(g, s)
 
 One stratified margin: each stratum (level of `s`) has its own sd, and

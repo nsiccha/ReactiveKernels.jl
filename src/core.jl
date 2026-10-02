@@ -464,6 +464,22 @@ function _scan_history_buffer(xs, fill::Number)
     buffer = similar(xs, typeof(fill))
     fill!(buffer, fill)
 end
+
+# A lane buffer handed back by the native position driver: the previous
+# position's output of the same authored plate or scan, already copied into the
+# stacked result. It is reused only when it is exactly the dense container the
+# fresh allocation would return, and is then overwritten in full; `nothing`
+# means allocate.
+@inline _lane_reuse(::Nothing, ::Type, output_axes) = nothing
+@inline _lane_reuse(buffer::Array{T,N}, ::Type{T}, output_axes::NTuple{N,Any}) where {T,N} =
+    axes(buffer) == output_axes ? buffer : nothing
+@inline _lane_reuse(buffer, ::Type, output_axes) = nothing
+
+function _scan_history_buffer(recycled, xs, fill::Number)
+    buffer = _lane_reuse(recycled, typeof(fill), axes(xs))
+    buffer === nothing ? _scan_history_buffer(xs, fill) : fill!(buffer, fill)
+end
+_scan_history_buffer(recycled, xs, fill) = _scan_history_buffer(xs, fill)
 _scan_history_buffer(xs, fill) = throw(ArgumentError(
     "a scan's `history =` value must be a number (it fills the outputs not yet " *
     "written and fixes their element type); got a $(typeof(fill))"))
@@ -671,6 +687,15 @@ Base.@propagate_inbounds (index::_PlateCellIndex)(cell) =
     end
     (true, first_index)
 end
+
+# Every cell of a plate, in coordinate order. A single axis iterates its range
+# directly: `CartesianIndices` iteration of one axis is a loop the compiler does
+# not vectorize (measured: a third of a dose-outer superposition read went to
+# its `__inc` on the seed pass), while several axes keep the Cartesian
+# iteration, which avoids converting linear positions per cell.
+@inline _plate_cells(cells::CartesianIndices{1}) =
+    Base.Generator(CartesianIndex, only(cells.indices))
+@inline _plate_cells(cells::CartesianIndices) = cells
 
 # The cell positions whose gather index `first_index + position - 1` lies in
 # `source`'s range, as `lo:hi` within `1:n` (empty when none do).

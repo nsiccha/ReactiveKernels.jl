@@ -3942,8 +3942,9 @@ Keyword/default signatures are preserved. Bound data and computation metadata
 remain shared and read-only; previous outputs are neither shared nor copied.
 One instance can serve sequential batches; it is not reentrant. Shape/type changes
 reseed buffers, and buffers aliasing this call's inputs detach. This reuses final
-outputs only: scalar recipes may still allocate intermediates. Reactant uses
-the owning surface (`reuse=false`).
+outputs and the native lane buffers (batched dense array inputs, plate and
+scan results); other scalar recipes may still allocate intermediates. Reactant
+uses the owning surface (`reuse=false`).
 
 To bind shared values, lift `prepare(spec; have, want, bound=(; shared...))` with
 `vectorize`. To retain position-dependent work across calls, build a named
