@@ -223,3 +223,11 @@ and lock the one Reactant 0.2.289 lifted:
   nest. Dirichlet priors, including live concentrations, retain native
   primal and Enzyme reverse support; compiled acceptance pins this exact
   failure until the backend fixes it. The authored transform stays intact.
+- Reverse compilation with a zero-length active vector leaves `tensor.empty`,
+  which Reactant 0.2.290 cannot export to XLA:
+  `repro_reactant_empty_gradient.jl` isolates a constant scalar loss and its
+  ordinary Enzyme gradient without ReactiveKernels. Native reverse returns
+  the correct empty gradient, and compiled primal succeeds. A zero-coordinate
+  RK-PPL sampler therefore supports native AD and compiled values; compiled
+  gradient acceptance pins this exact export error. Empty observation and
+  parameter domains with a nonempty coordinate pack pass compiled reverse.
