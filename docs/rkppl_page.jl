@@ -16,6 +16,9 @@ const _RKPPL_DATA = Dict(
     :x1 => "[0.5, -1.0, 1.5, 0.0, -0.5, 1.0]",
     :x2 => "[1.0, 0.5, -0.5, 2.0, 0.0, -1.0]",
     :g => "[1, 2, 1, 3, 2, 3]",
+    :g1 => "[1, 2, 1, 3, 2, 3]",
+    :g2 => "[2, 3, 4, 1, 4, 1]",
+    :b => "[1, 1, 1, 2, 2, 2]",
     :o => "[0.1, -0.2, 0.0, 0.3, -0.1, 0.2]",
     :t => "[0.5, 1.0, 2.0, 0.5, 1.0, 2.0]",
     :dose => "[1.0, 1.0, 1.0, 2.0, 2.0, 2.0]",
@@ -89,6 +92,20 @@ function render_rkppl_kernel_program(file::AbstractString)
         Base.remove_linenums!(kernel_expr(plan, built.layout));
         context = :limit => false)
     Markdown.MD(Any[Markdown.Code("julia", "@kernel " * program)])
+end
+
+"""Show the live varying-library definitions, including every prior."""
+function render_rkppl_varying_definitions()
+    names = (:varying_coefs, :varying_coefs_correlated,
+        :varying_coefs_centered, :varying_coefs_centered_correlated,
+        :varying_stratified, :varying_stratified_correlated)
+    definitions = map(names) do name
+        sm = getfield(ReactiveKernelsPPL, name)
+        body = Base.remove_linenums!(deepcopy(sm.body))
+        def = Expr(:(=), Expr(:call, sm.name, sm.argnames...), body)
+        "@rkppl " * sprint(Base.show_unquoted, def; context = :limit => false)
+    end
+    Markdown.MD(Any[Markdown.Code("julia", join(definitions, "\n\n"))])
 end
 
 const _RKPPL_UNDECLARED = """
