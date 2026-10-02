@@ -23,6 +23,13 @@ const _RKPPL_DATA = Dict(
     :t => "[0.5, 1.0, 2.0, 0.5, 1.0, 2.0]",
     :dose => "[1.0, 1.0, 1.0, 2.0, 2.0, 2.0]",
     :obs => "[0.5, 1.2, 2.1, 0.8, 1.5, 2.5]",
+    :subj => "[1, 1, 2, 2]",
+    :time => "[1.0, 3.0, 1.0, 3.0]",
+    :dsubj => "[1, 1, 2, 2]",
+    :dtime => "[0.0, 2.0, 0.0, 2.0]",
+    :damt => "[1.0, 2.0, 3.0, 4.0]",
+    :dv => "[0.3, 0.5, 0.2, 0.6]",
+    :age_s => "[-0.5, 0.5]",
 )
 
 """Return `(data_names, block_source)` of one corpus program."""
@@ -95,18 +102,23 @@ function render_rkppl_kernel_program(file::AbstractString)
 end
 
 """Show the live varying-library definitions, including every prior."""
-function render_rkppl_varying_definitions()
-    names = (:varying_coefs, :varying_coefs_correlated,
-        :varying_coefs_centered, :varying_coefs_centered_correlated,
-        :varying_stratified, :varying_stratified_correlated)
+function render_rkppl_library_definitions(names)
     definitions = map(names) do name
         sm = getfield(ReactiveKernelsPPL, name)
         body = Base.remove_linenums!(deepcopy(sm.body))
-        def = Expr(:(=), Expr(:call, sm.name, sm.argnames...), body)
+        args = Any[sm.argnames...]
+        isempty(sm.kwdefaults) || pushfirst!(args, Expr(:parameters,
+            (Expr(:kw, k, v) for (k, v) in sm.kwdefaults)...))
+        def = Expr(:(=), Expr(:call, sm.name, args...), body)
         "@rkppl " * sprint(Base.show_unquoted, def; context = :limit => false)
     end
     Markdown.MD(Any[Markdown.Code("julia", join(definitions, "\n\n"))])
 end
+
+render_rkppl_varying_definitions() = render_rkppl_library_definitions(
+    (:varying_coefs, :varying_coefs_correlated,
+        :varying_coefs_centered, :varying_coefs_centered_correlated,
+        :varying_stratified, :varying_stratified_correlated))
 
 const _RKPPL_UNDECLARED = """
 model = @rkppl begin
