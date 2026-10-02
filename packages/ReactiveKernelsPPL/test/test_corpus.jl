@@ -9,8 +9,8 @@ const _CORPUS_DIR = joinpath(@__DIR__, "corpus")
 const _CORPUS_GOLDEN_DIR = joinpath(_CORPUS_DIR, "golden")
 
 # Generic canonical serializer: fixed field order, sorted dict keys, no
-# line numbers, no memory addresses. New IR fields change the output, which
-# is exactly what this guard must catch.
+# line numbers, no memory addresses. New meaningful IR fields change the
+# output; empty optional metadata preserves existing snapshots.
 function _canon(io::IO, x, depth::Int = 0)
     depth > 60 && (print(io, "<depth>"); return)
     if x === nothing || x === missing
@@ -85,6 +85,8 @@ function _canon(io::IO, x, depth::Int = 0)
         # scopes remain serialized and require their own reviewed goldens.
         x isa StructuralPlan && isempty(x.submodel_scopes) &&
             (fs = filter(!=(:submodel_scopes), fs))
+        x isa LikelihoodSpec && x.threshold_effects === nothing &&
+            (fs = filter(!=(:threshold_effects), fs))
         if isempty(fs)
             print(io, repr(x))
         else
@@ -117,6 +119,19 @@ function _first_diff(a::String, b::String)
         a[i] != b[i] && return i
     end
     return n + 1
+end
+
+@testset "optional response metadata serialization" begin
+    plan = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        y .~ Normal.(a, 1)
+    end, (:y,))
+    response = only(plan.responses)
+    @test !occursin("threshold_effects=", sprint(_canon, response))
+    effects = ReactiveKernelsPPL._with(response; threshold_effects = :effects)
+    other = ReactiveKernelsPPL._with(response; threshold_effects = :other_effects)
+    @test occursin("threshold_effects=:effects", sprint(_canon, effects))
+    @test sprint(_canon, effects) != sprint(_canon, other)
 end
 
 @testset "corpus drift guard" begin
