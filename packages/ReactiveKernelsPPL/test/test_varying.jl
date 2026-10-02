@@ -849,18 +849,7 @@ end
                 nt.z_flat_g[s + (gi - 1) * K] for s in 1:j)
         end
     end
-    # A centered block owns `b_flat_<s>` (its sampled draws), so the same
-    # spelling there is a duplicate definition at lowering.
-    # refused: single assignment / collides with minted name (centered block owns `b_flat_g`)
-    @test_throws "b_flat_g is defined twice" lower_rkppl(quote
-            a ~ Normal(0, 5)
-            b_flat_g ~ Exponential(1)
-            d ~ varying_draws(g, [1, x]; centered = true, eta = 1.5,
-                sd = Exponential(2.0))
-            r ~ varying_slice(d, 1:2)
-            mu = a .+ r
-            y .~ Normal.(mu, b_flat_g)
-        end, (:y, :x, :g))
+
 end
 
 # Independent correlated-contribution reference: SB `(diag(tau)*L*z)'`

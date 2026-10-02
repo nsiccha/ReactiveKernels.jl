@@ -375,7 +375,7 @@ end
         mod = @__MODULE__); true)
 end
 
-@testset "centered correlated: library entry, oracle, built-in parity" begin
+@testset "centered correlated: library entry, oracle, explicit row priors" begin
     data = (:y, :x, :g)
     head = (:(a ~ Normal(0, 5)), :(sigma ~ Exponential(1)))
     tail = :(y .~ Normal.(mu, sigma))
@@ -405,32 +405,24 @@ end
         sum(_lv_halfnormal, nt.b_sd) + _lv_lkj(nt.b_L, 1.0) +
         sum(logpdf(MvNormal(zeros(2), F * F'), C[j, :]) for j in axes(C, 1))
     _check_gradient(kl.spec, bl, u)
-    # Parity with the built-in centered geometry (`varying_draws(...;
-    # centered = true)`) under the same priors, at matching values: the
-    # written-out body with those priors gives the same likelihood, prior
-    # and log-Jacobian.
-    builtin = Expr(:block, head..., :(d ~ varying_draws(g, [1, x];
-        centered = true, eta = 1.5, sd = Exponential(2.0))),
-        :(r ~ varying_slice(d, 1:2)), :(mu = a .+ r), tail)
+    # Different sd and LKJ priors are ordinary statements in the body.
     written = prog(:(d_sd[1:2] .~ Exponential.(2.0)),
         :(d_L ~ LKJCholesky(2, 1.5)), :(d_F = d_sd .* d_L),
         :(eachrow(d_c[levels(g), 1:2]) .~ MvNormalCholesky(zeros(2), d_F)),
         :(mu = a .+ d_c[g, 1] .+ x .* d_c[g, 2]))
-    bb = bind_data(_lv_lower(builtin, data), cols)
-    kb = build_kernel(bb)
     bw = bind_data(_lv_lower(written, data), cols)
     kw = build_kernel(bw)
     uw = _lv_point(kw.layout.total)
     w = constrain(kw.layout, uw)
-    base = constrain(kb.layout, zeros(kb.layout.total))
-    # The built-in stores the centered rows as `b_flat_g` (K × G
-    # column-major) and exposes `b_g` as their matrix view.
-    ub = unconstrain(kb.layout, merge(base, (a = w.a, sigma = w.sigma,
-        tau_g = w.d_sd, L_g = w.d_L, b_flat_g = vec(permutedims(w.d_c)),
-        b_g = w.d_c)))
-    for port in (:likelihood, :prior, :log_jacobian)
-        @test _query(kw.spec, bw, port, uw) ≈ _query(kb.spec, bb, port, ub)
-    end
+    Fw = Diagonal(w.d_sd) * w.d_L
+    muw = w.a .+ w.d_c[gi, 1] .+ cols[:x] .* w.d_c[gi, 2]
+    @test _query(kw.spec, bw, :likelihood, uw) ≈
+        sum(logpdf.(Normal.(muw, w.sigma), cols[:y]))
+    @test _query(kw.spec, bw, :prior, uw) ≈
+        logpdf(Normal(0, 5), w.a) + logpdf(Exponential(1), w.sigma) +
+        sum(logpdf.(Exponential(2.0), w.d_sd)) + _lv_lkj(w.d_L, 1.5) +
+        sum(logpdf(MvNormal(zeros(2), Fw * Fw'), w.d_c[j, :]) for j in axes(w.d_c, 1))
+    _check_gradient(kw.spec, bw, uw)
 end
 
 @testset "stratified correlated: library entry and Distributions.jl oracle" begin
