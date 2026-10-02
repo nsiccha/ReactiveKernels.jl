@@ -584,25 +584,13 @@ end
 """
     HorseshoePrior(predictor, addressee, local_scale, global_scale, sign)
 
-One per-coefficient horseshoe shrinkage prior (SB mirror: `coef ~
-Horseshoe(...)` lowers per call site to `raw ~ std_normal()`, `lambda ~
-cauchy(0, local_scale; lower=0)`, `tau ~ cauchy(0, global_scale;
-lower=0)`, `beta = raw * lambda * tau` — each scalar call owns its own
-tau; the halves ride `:positive_stan`, Stan lower-bound kernel
-semantics with NO truncation renormalizer, matching SB which never
-renormalizes bounds). `addressee` is `:Intercept` or a continuous
-column of `predictor` (factor/matrix/monotonic addressees are out of
-the flat slice). `sign`
-is the use polarity (`+1` for `.+`, `-1` for `.-`): the derived coordinate
-holds `sign * raw * lambda * tau`.
-
-A predictor with any `HorseshoePrior` carries NO
-[`PopulationPrior`](@ref) rows and NO `:coefficient` layout block:
-every design coordinate is derived in-graph — horseshoe addressees
-from their `(raw, lambda, tau)` triple, every other addressee from a
-Normal scalar — and the triple/scalar priors ride the ordinary
-[`SampledParameter`](@ref) path. Scales are finite strictly-positive
-literals (SB's formula constants); a sampled scale is a follow-up.
+One per-coefficient horseshoe prior: standard-normal raw coefficient,
+normalized HalfCauchy(local_scale) lambda, and HalfCauchy(global_scale) tau.
+Each scalar built-in call owns its own tau. For one shared global tau use
+`horseshoe_coefs(X)`. `addressee` is a predictor's intercept or continuous
+column and `sign` is its use polarity. The derived coordinate is
+`sign * raw * lambda * tau`; the latent priors use SampledParameter.
+Scales are finite strictly positive literals.
 """
 struct HorseshoePrior
     predictor::Symbol
@@ -626,27 +614,12 @@ horseshoe_normal_name(pred::Symbol, addr::Symbol) =
 """
     SupportOverride
 
-A latent's support override: `nothing` (infer from the family), the bare
-`Symbol` `:positive` (half-Normal/half-Cauchy truncation of a real-support
-family, exact +log(2) at a literal-zero location), the bare `Symbol`
-`:positive_stan` (the same exp-constrained half shape under Stan
-lower-bound kernel semantics — plain `_lpdf` plus the bare-`u` Jacobian,
-NO truncation renormalizer, matching SB which never renormalizes
-bounds), the tuple
-`(:interval, lo, hi)` (a two-sided finite truncation `truncated(Normal(mu, s),
-lo, hi)` — an affine-logistic constrained transform onto `(lo, hi)` with the
-renormalized truncated density), the tuple `(:interval_stan, lo, hi)`
-(the same affine-logistic constrained transform onto `(lo, hi)` under
-Stan two-sided-bound kernel semantics — plain `_lpdf` plus the bare-`u`
-Jacobian, NO truncation renormalizer), or the tuple `(:upper, hi)` (an
-upper-only truncation `truncated(Normal(mu, s), -Inf, hi)` — Stan's
-upper-bound kernel `x = hi - exp(u)` with the bare-`u` Jacobian and NO
-truncation renormalizer), or the tuple `(:lower, lo)` (a lower-only
-truncation `truncated(LogNormal(m, s), lo, Inf)` of a positive-support base,
-renormalized as in Distributions — `x = lo + exp(u)` with the bare-`u`
-Jacobian; `lo` a literal, or the name of a model-level data value resolved
-from the bound columns, e.g. an HSGP validity floor). Shared by scalar
-[`SampledParameter`](@ref)s and per-cell [`PlateParameter`](@ref)s.
+A latent's support override is `nothing` (infer natural support), `:positive`
+(a normalized symmetric half at literal-zero location), or
+`(:truncated, lo, hi)` (normalized base density on the intersection with its
+natural support). Bounds may be literals, data or sampled expressions.
+The older normalized `:interval`, `:upper` and `:lower` representations
+remain supported for hand-built plans. Shared by scalar and per-cell priors.
 """
 const SupportOverride =
     Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64},Tuple{Symbol,Float64},
@@ -658,16 +631,10 @@ _support_args(ov) = ov isa Tuple ? ov[2:end] : ()
 """
     SampledParameter(name, family, args, support_override, label)
 
-One non-coefficient latent (scalar, slice 1). `args` use POSITIONAL keys
-`(arg1, arg2, …)` in Distributions.jl constructor order with Distributions.jl
-semantics (`Exponential(θ)` = scale θ). Values are literals or
-[`ParamName`](@ref)s (hierarchical OK, cycles rejected). `support_override`
-is a [`SupportOverride`](@ref): `nothing` (infer from family), `:positive`
-(half-Normal/half-Cauchy), `:positive_stan` (the Stan-kernel half,
-unnormalized), `(:interval, lo, hi)` (a finite truncated
-interval), `(:interval_stan, lo, hi)` (a finite interval with Stan
-kernel semantics, unnormalized), or `(:upper, hi)` (an upper-only
-truncation with Stan kernel semantics).
+One scalar latent with positional `(arg1, arg2, …)` arguments in
+Distributions constructor order (Exponential uses scale). Arguments may read
+data, sampled parameters or ordinary definitions. Explicit support follows
+SupportOverride and its density is normalized on that support.
 """
 struct SampledParameter
     name::ParamName
@@ -745,23 +712,10 @@ end
 """
     VaryingSdPrior(family, param)
 
-One margin's marginal-scale (`tau`) prior inside a [`VaryingDraws`](@ref)
-block — the SB `brm_ranef_sd` per-margin codes in native form:
-
-- `:std_normal` — SB family 0, the unconfigured default (`tau ~ Normal(0, 1)`
-  on the positive half; `param` ignored, conventionally `1.0`).
-- `:exponential` — SB family 1 (`sd ~ Exponential(scale)` in the caller's
-  spelling): `param` is the SCALE `θ` (the `:exponential` /
-  `:positive_exponential` convention everywhere else in this contract — an
-  SB `rate` inverts once at the boundary, `θ = 1 / rate`).
-- `:normal` — SB family 2 (`sd ~ Normal(0, sd)`): `param` is the standard
-  deviation `σ`.
-- `:cauchy` — RK extension, no SB code (`sd ~ Cauchy(0, σ)`): `param` is
-  the scale `σ` (Stan-kernel, no `+log2` — the posteriordb
-  eight-schools-noncentered `tau ~ Cauchy(0, 5)` shape).
-
-An empty `sd_priors` vector (the default) is all-`:std_normal`: SB's
-unconfigured prior, emitted exactly as before.
+One margin's normalized positive-scale prior. `:std_normal` is HalfNormal(1),
+`:normal` is HalfNormal(param), `:cauchy` is HalfCauchy(param), and
+`:exponential` is Exponential(param) in the Distributions scale convention.
+An empty sd_priors vector gives the HalfNormal(1) default for every margin.
 """
 struct VaryingSdPrior
     family::Symbol
@@ -1022,15 +976,9 @@ end
 """
     SplineVector(name, family, args, support_override, width, basis, label)
 
-One free spline coefficient block (SB `_sb_s_generic`/`_sb_t2_generic`):
-flat `b_fixed`, standard-normal `b_*_raw`, Stan-kernel half-normal `sd`
-(`:normal` + `:positive_stan` — plain `_lpdf` plus the bare-`u` Jacobian,
-NO truncation renormalizer, matching SB which never renormalizes
-bounds). A stated `sd` prior from a positive-support family, or a
-bounding `Uniform`, carries no override (`_hyper_support_override`).
-`width` is static from `k`; `basis` is the owning
-[`SplineBasis`](@ref) id. Layout packs each as one contiguous block
-(plate-shaped); priors broadcast over cells.
+One free spline coefficient block: flat fixed coefficients, standard-normal
+raw coefficients, and normalized positive smoothing scales. `width` derives
+from structural `k`; `basis` is the owning basis id. Priors retain one plate.
 """
 struct SplineVector
     name::Symbol
@@ -1043,43 +991,36 @@ struct SplineVector
 end
 
 """
-    HyperPrior(family, args)
+    HyperPrior(family, args[, support_override])
 
-A literal-argument prior on a positive hyperparameter (HSGP length
-scale / marginal scale, spline smoothing sd): `family` in
-[`_HYPER_PRIOR_FAMILIES`](@ref), `args` its literal arguments as
-`(arg1 = ..., ...)` in Distributions.jl order. Stan-kernel semantics
-on the positive support: the plain `_lpdf` plus the transform
-Jacobian, no truncation normalizer (SB `length_scale(...)`/`sd(...)`
-term priors).
+A literal-argument positive hyperparameter prior with the same family,
+arguments and explicit normalized support as a sampled parameter.
 """
 struct HyperPrior
     family::Symbol
     args::NamedTuple
+    support_override::SupportOverride
 end
 
-# Admitted hyperparameter prior families (positive-support or Stan-kernel
-# halves of symmetric families) and their Distributions arities.
+HyperPrior(family::Symbol, args::NamedTuple) = HyperPrior(family, args, nothing)
+
+# Admitted base families and their Distributions arities. Real-support
+# families require an explicit half or truncation.
 const _HYPER_PRIOR_FAMILIES = Dict{Symbol,Tuple{Vararg{Int}}}(
     :lognormal => (2,), :inverse_gamma => (2,), :gamma => (2,),
     :exponential => (1,), :normal => (2,), :cauchy => (2,),
     :student_t => (3,), :uniform => (2,))
 
-# The support override a positive hyperparameter takes under a hyper
-# prior of `family`: a real-support family (Normal, Cauchy, StudentT) rides
-# the Stan-kernel half (`:positive_stan` — plain `_lpdf`, no `+log2`); a
-# positive-support family (LogNormal, InverseGamma, Gamma, Exponential)
-# and the bounding `Uniform` already live on their own support and take
-# none (their own density, Distributions.jl semantics).
-_hyper_support_override(family::Symbol) =
-    SAMPLED_SUPPORT[family] === :real ? :positive_stan : nothing
-
-# A `Uniform(lo, hi)` hyper prior BOUNDS its hyperparameter (the SB
-# prior-bound intersection with the positive support): the
-# hyperparameter rides an `(:interval, lo, hi)` transform. `nothing`
-# for every other family (positive `exp` support).
-_hyper_prior_bounds(hp::HyperPrior) = hp.family === :uniform ?
-    (Float64(hp.args.arg1), Float64(hp.args.arg2)) : nothing
+# Explicit support travels with a hyper prior, just as for a sampled prior.
+_hyper_support_override(hp::HyperPrior) = hp.support_override
+function _hyper_prior_bounds(hp::HyperPrior)
+    hp.support_override === nothing && hp.family !== :uniform && return nothing
+    transform, lo, hi = _entry_transform(hp.family, hp.support_override, hp.args)
+    transform === :interval && return (lo, hi)
+    transform === :floored && return (lo, Inf)
+    transform === :exp && return nothing
+    throw(ContractValidationError("[hyper prior] use an explicit positive distribution, got $(hp.family) with support $(hp.support_override)"))
+end
 _hyper_prior_bounds(::Nothing) = nothing
 
 function _validate_hyper_prior(hp::HyperPrior, label::Symbol, what)
@@ -1096,11 +1037,13 @@ function _validate_hyper_prior(hp::HyperPrior, label::Symbol, what)
     all(v -> v isa Real && !(v isa Bool) && isfinite(v), values(hp.args)) ||
         _fail(label, "$what prior args must be finite numeric " *
               "literals, got $(hp.args)")
-    if hp.family === :uniform
-        lo, hi = hp.args.arg1, hp.args.arg2
-        0 <= lo < hi || _fail(label, "$what prior Uniform($lo, $hi) must " *
-            "satisfy 0 <= lo < hi (it bounds a positive hyperparameter)")
-    end
+    _validate_support_override(label, hp.family, hp.support_override, hp.args)
+    _validate_uniform_args(label, hp.family, hp.args)
+    SAMPLED_SUPPORT[hp.family] === :real && hp.support_override === nothing &&
+        _fail(label, "$what needs an explicit positive prior: HalfNormal, HalfCauchy or truncated(D, 0, Inf)")
+    bounds = _hyper_prior_bounds(hp)
+    bounds === nothing || (0 <= bounds[1] < bounds[2]) ||
+        _fail(label, "$what prior must have positive support, got $bounds")
     return nothing
 end
 
@@ -1110,8 +1053,7 @@ end
 A grouped HSGP hyperparameter's log-linear hyper-predictor (SB
 `log(length_scale(hsgp(x))) ~ 1 + (1 | g)` / `~ (1 | g)`): per group
 `log h_g = beta0 + sd * z_g` (`intercept` false drops `beta0`), with the
-BRM defaults `beta0 ~ Normal(0, 1)`, `sd ~ Normal(0, 1)` on the positive
-support (Stan kernel), non-centered `z ~ Normal(0, 1)`. `group` must be
+BRM defaults `beta0 ~ Normal(0, 1)`, `sd ~ HalfNormal(1)`, non-centered `z ~ Normal(0, 1)`. `group` must be
 the basis's `by` column (one hyper level per term group). A length scale
 is floored per group at the validity floor (SB `brm_hsgp_by_hyper_S`
 `fmax(rho_g, rho_lower)`).
@@ -2054,7 +1996,7 @@ function _spline_vector_specs(id::Symbol, kind::Symbol, k,
     nsd = kind === :tps ? 1 : 3
     sdfam, sdargs = sd_prior === nothing ? (:normal, (arg1=0, arg2=1)) :
         (sd_prior.family, sd_prior.args)
-    push!(specs, (sd, sdfam, sdargs, _hyper_support_override(sdfam), nsd))
+    push!(specs, (sd, sdfam, sdargs, sd_prior === nothing ? :positive : _hyper_support_override(sd_prior), nsd))
     return specs
 end
 
@@ -2212,10 +2154,6 @@ const ASSIGNMENT_FNS = (
     :log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :tanh, :logaddexp,
     :sum, :mean, :std, :var, :minimum, :maximum, :length,
 )
-
-"""Vector-returning whole-column functions (exact-GP slice): admitted in
-derived columns and predictor locations only; always vector-shaped."""
-const VECTOR_FNS = (:gp_exp_quad_cov, :gp_periodic_cov, :gp_chol_latent)
 
 """Cell-callable functions (grouped kernels): admitted in grouped-kernel
 cell assignments ONLY, always with a declared schedule as the first
@@ -2404,7 +2342,7 @@ the BUILT-IN vocabulary. Beyond it, an `=` definition may call any function
 visible in the model's module (functions as values): a data-only call is
 evaluated once by [`bind_data`](@ref), any other runs in the generated
 kernel."""
-admitted_functions() = (ASSIGNMENT_FNS..., VECTOR_FNS...)
+admitted_functions() = ASSIGNMENT_FNS
 
 """Elementwise vocabulary the thin layer can lower in derived columns:
 `(dotted operators, dotted math functions)` (ext handshake predicate)."""
@@ -3473,15 +3411,15 @@ function _validate_splines(plan::StructuralPlan)
             # The smoothing-sd vector may carry a stated hyper prior
             # (SB `sd(mu, s(x)) ~ ...`) — same width, family/args from
             # the admitted set, support derived from the family.
-            if vname === sdname && !(v.family === vfamily && v.args == vargs)
-                hp = HyperPrior(v.family, v.args)
+            if vname === sdname && !(v.family === vfamily && v.args == vargs && v.support_override == vsupport)
+                hp = HyperPrior(v.family, v.args, v.support_override)
                 _validate_hyper_prior(hp, :plan, "spline :$(sb.id) sd")
                 _, vfamily, vargs, vsupport, _ = only(s for s in
                     _spline_vector_specs(sb.id, sb.kind, sb.k, hp)
                     if first(s) === sdname)
             end
             (v.family === vfamily && v.args == vargs &&
-             v.support_override === vsupport && v.width == vwidth) ||
+             v.support_override == vsupport && v.width == vwidth) ||
                 _fail(:plan, "spline :$(sb.id): vector :$vname must be " *
                       "$vfamily$(vargs) with support $(repr(vsupport)) " *
                       "and width $vwidth — the prior structure is part " *
@@ -4150,10 +4088,6 @@ function _collect_kernel_cell_refs!(refs, ex, kp::KernelPlate, known::Set{Symbol
             return _fail(label, "reduction `$fn` does not lower in a cell " *
                                 "(series reductions are cross-timepoint — P3)")
         end
-        if fn isa Symbol && fn in VECTOR_FNS
-            return _fail(label, "whole-column `$fn` does not lower in a " *
-                                "cell (whole-model constructs only)")
-        end
         if fn isa Symbol && fn in ASSIGNMENT_FNS
             # Undotted arithmetic is admitted syntactically here (the
             # emitter passes scalar-context user code verbatim — Ex1's
@@ -4416,10 +4350,6 @@ function _collect_grouped_cell_refs!(refs, ex, kp::KernelPlate,
             return _fail(label, "reduction `$fn` does not lower in a cell " *
                                 "(aggregate in the obs likelihood, not " *
                                 "the cell)")
-        end
-        if fn isa Symbol && fn in VECTOR_FNS
-            return _fail(label, "whole-column `$fn` does not lower in a " *
-                                "cell (whole-model constructs only)")
         end
         if fn isa Symbol && fn in CELL_FNS
             args = ex.args[2:end]
@@ -5672,12 +5602,6 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
             _collect_vector_reduction!(refs, ex, plan, label, bound)
             return nothing
         end
-        if fn isa Symbol && fn in VECTOR_FNS
-            for arg in ex.args[2:end]
-                _collect_vector_refs!(refs, arg, plan, label, bound)
-            end
-            return nothing
-        end
         if fn isa Symbol && fn in ASSIGNMENT_FNS
             for arg in ex.args[2:end]
                 _collect_assignment_refs!(refs, arg, plan, label, bound)
@@ -5826,7 +5750,7 @@ function _is_vector_valued(ex, plan::StructuralPlan)
         (_is_array_param(plan, ex.args[1]) ||
             _is_array_assignment(plan, ex.args[1])) &&
         return _array_index_kind(plan, ex) === :gather &&
-            all(i -> i isa Int, ex.args[3:end])
+            all(i -> i isa Int || _is_row_index(plan, i), ex.args[2:end])
     ex isa Number && return false
     ex isa LineNumberNode && return false
     ex isa Expr || return false
@@ -5846,7 +5770,6 @@ function _is_vector_valued(ex, plan::StructuralPlan)
             return true
         end
         fn in REDUCTION_FNS && return false
-        fn isa Symbol && fn in VECTOR_FNS && return true
         fn isa Symbol && (fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS) &&
             return any(a -> _is_vector_valued(a, plan), ex.args[2:end])
         return false
@@ -5929,8 +5852,7 @@ end
 # the exact -log(cdf(hi) - cdf(lo)) renormalization at any location.
 # `(:upper, hi)` is an upper-only truncation with a finite hi; the family must
 # be real-support (a truncated Normal), and the density is Stan's upper-bound
-# kernel (plain normal_lpdf plus the bare-`u` Jacobian — NO truncation
-# renormalizer, matching SB which never renormalizes bounds).
+# transform with its normalized upper-tail density.
 function _validate_support_override(label, family::Symbol,
         ov::SupportOverride, args::NamedTuple)
     ov === nothing && return nothing
@@ -5969,22 +5891,22 @@ function _validate_support_override(label, family::Symbol,
                 "an :upper override is a truncated Normal or an " *
                 "upper-bounded flat in slice 1 " *
                 "(`truncated(Normal(mu, s), -Inf, hi)` / " *
-                "`Flat(; upper=hi)`); got $family")
+                "`Flat()` with a hand-built upper support); got $family")
             hi = ov[2]
             isfinite(hi) || _fail(label,
                 ":upper bound must be finite; got $hi")
             return nothing
         end
         head = ov[1]
-        ((head === :interval || head === :interval_stan) &&
+        (head === :interval &&
             length(ov) == 3) || _fail(label,
             "tuple support override must be (:interval, lo, hi), " *
-            "(:interval_stan, lo, hi), or (:upper, hi); got $ov")
+            "or (:upper, hi); got $ov")
         (family === :normal || family === :flat) || _fail(label,
             "an $head override is a truncated Normal or a " *
             "flat-on-an-interval in slice 1 " *
             "(`truncated(Normal(mu, s), lo, hi)` / " *
-            "`Flat(; lower=lo, upper=hi)`); got $family")
+            "`Uniform(lo, hi)`); got $family")
         lo, hi = ov[2], ov[3]
         (isfinite(lo) && isfinite(hi)) || _fail(label,
             "$head bounds must be finite (a one-sided or half truncation " *
@@ -5993,19 +5915,10 @@ function _validate_support_override(label, family::Symbol,
             "$head lower bound must be < upper bound; got ($lo, $hi)")
         return nothing
     end
-    (ov === :positive || ov === :positive_stan) ||
-        _fail(label, "support override must be :positive or " *
-              ":positive_stan, got $ov")
-    if family === :flat
-        # Flat is improper (density 0.0, Jacobian only): only the
-        # kernel half applies — a proper :positive would renormalize a
-        # density flat does not have.
-        ov === :positive_stan || _fail(label,
-            "a flat takes :positive_stan (`Flat(; lower=0)`), not " *
-            ":positive (proper halves renormalize a density flat " *
-            "does not have)")
-        return nothing
-    end
+    ov === :positive ||
+        _fail(label, "support override must be :positive; use HalfNormal(s), HalfCauchy(s) or truncated(D, lo, hi), got $ov")
+    family === :flat && _fail(label,
+        "Flat() is an improper real prior; use Exponential(s) or Uniform(lo, hi) for explicit support")
     family in SYMMETRIC_SAMPLED_FAMILIES || _fail(label,
         "$ov override only applies to symmetric real-support families " *
         "($(join(SYMMETRIC_SAMPLED_FAMILIES, ", "))); got $family")
@@ -7147,15 +7060,15 @@ function _validate_priors(plan::StructuralPlan)
                       "vector)")
             # Interval hypers count when the whole interval is
             # non-negative (the open-interval transform keeps reads
-            # strictly inside, so the scale stays positive) — the
-            # radon_county `Flat(; lower=0, upper=100)` shape.
+            # strictly inside, so the scale stays positive), as with
+            # `Uniform(0, hi)`.
             _hyper_scale_positive(by_param[_sc]) ||
                 _fail(:plan, "prior for $key has scale hyperparameter " *
                       "$_sc — a scale hyperparameter names a " *
                       "positive-support sampled parameter " *
                       "(`Exponential`, `Gamma`, `HalfNormal`, " *
-                      "`Normal(0, s; lower=0)`, `Flat(; lower=0, " *
-                      "upper=hi)`, `Uniform(0, hi)`, ...)")
+                      "`HalfCauchy`, `truncated(Normal(0, s), 0, Inf)`, " *
+                      "`Uniform(0, hi)`, ...)")
         else
             (isfinite(_sc) && _sc > 0) ||
                 _fail(:plan, "prior for $key must be $(pr.family) " *
@@ -7351,8 +7264,7 @@ end
 # per predictor, scalar-only addressees on scalar-only predictors, use
 # polarity, finite positive scales, and triple linkage (each entry's
 # (raw, lambda, tau) sampled parameters exist with the SB geometry:
-# standard-Normal raw, Stan-kernel half-Cauchy scales agreeing with the
-# entry — no truncation renormalizer, SB never renormalizes bounds).
+# standard-Normal raw and normalized half-Cauchy scales agreeing with the entry).
 function _validate_horseshoe(plan::StructuralPlan)
     r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
     seen = Set{Tuple{Symbol,Symbol}}()
@@ -7413,12 +7325,10 @@ function _validate_horseshoe(plan::StructuralPlan)
             q = get(by_name, nm, nothing)
             q === nothing && _fail(h.predictor,
                 "horseshoe prior for $key names no $role parameter ($nm)")
-            (q.family === :cauchy && q.support_override === :positive_stan &&
+            (q.family === :cauchy && q.support_override === :positive &&
                 length(q.args) == 2 && q.args[1] == 0 &&
                 q.args[2] == sc) || _fail(h.predictor,
-                "horseshoe $role $nm must be Stan-kernel half-Cauchy " *
-                "(0, $sc) (`:positive_stan`, no renormalizer — SB " *
-                "never renormalizes bounds), got $(q.family)$(q.args) " *
+                "horseshoe $role $nm must be normalized HalfCauchy($sc), got $(q.family)$(q.args) " *
                 "with override $(repr(q.support_override))")
         end
     end
@@ -10025,12 +9935,13 @@ end
 # ── Functions as values: bind-time data definitions ───────────────────
 # A definition whose expression calls a module function and reads only
 # data (raw columns or other data-only definitions) is data: `bind_data`
-# evaluates it once, as plain Julia, and binds the value under the
-# definition's name. Every consumer then reads it exactly like a bound
+# evaluates bind-time definitions once, as plain Julia, and binds each value
+# under the definition's name. Every consumer reads it exactly like a bound
 # column — the generated kernel takes it as a data argument (bound by
 # `prepare_query`), never recomputing it. A derived column (observation
 # aligned) must come out a length-n_obs vector and validates as a column;
-# a model-level assignment may be any number, vector or matrix.
+# a model-level assignment may be any number, vector or matrix. Whole-value
+# definitions used only by parameter-dependent calls fold at preparation.
 
 # Plan names an expression reads (call heads, keyword names and function
 # values are not reads).
@@ -10059,11 +9970,14 @@ function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
     return out
 end
 
-"""Names of the bind-materialized data definitions of `plan`, given the raw
+"""Names of the data-only definitions of `plan`, given the raw
 (caller-supplied) column names: assignments and derived columns that call a
 module function and read only raw columns or other data-only definitions.
-Derived responses keep their own materialization."""
-function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol})
+Derived responses keep their own materialization. `bind_only` excludes
+definitions used only during preparation, while preserving their names
+for caller-supplied column collision checks."""
+function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
+        bind_only = false)
     nodes = Dict{Symbol,Any}()
     for a in plan.assignments
         # Literal definitions can be dependencies of a module call, such
@@ -10085,9 +9999,60 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol})
         memo[nm] = ok
         return ok
     end
-    return Set{Symbol}(nm for (nm, ex) in nodes
+    names = Set{Symbol}(nm for (nm, ex) in nodes
         if nm ∉ resps && _contains_module_call(ex) &&
             dataonly(nm, Set{Symbol}()))
+    bind_only || return names
+    onlydata = union(raw, Set{Symbol}(nm for nm in keys(nodes)
+        if dataonly(nm, Set{Symbol}())))
+    return setdiff(names, _preparation_data_names(plan, nodes, raw, onlydata, names))
+end
+
+# Whole-value data definitions consumed by a parameter-dependent module
+# call belong to preparation, whether lowering inlined them or retained
+# them as assignments (notably beside declared arrays). They may return
+# arbitrary Julia values; the generated data-only statements fold once.
+# Keep every dependency needed by bind-time consumers at bind instead.
+function _preparation_data_names(plan, nodes, raw, onlydata, names)
+    isempty(names) && return Set{Symbol}()
+    _, wholedefs = _model_level_inputs(plan, raw)
+    function dependencies!(found, nm; data_only = false)
+        nm in found && return
+        haskey(nodes, nm) || return
+        data_only && nm ∉ onlydata && return
+        push!(found, nm)
+        for dep in _expr_value_symbols(nodes[nm])
+            dependencies!(found, dep; data_only)
+        end
+    end
+    runtime = Set{Symbol}()
+    for (nm, ex) in nodes
+        nm ∈ onlydata && continue
+        _contains_module_call(ex) || continue
+        dependencies!(runtime, nm)
+    end
+    prepared = intersect(names, wholedefs, runtime)
+    isempty(prepared) && return prepared
+
+    # Any other structural slot can require a value during binding (prior
+    # arguments, array dimensions, responses, matrices, ...). Follow its
+    # dependencies as well as those of all remaining bind-time calls, so
+    # a shared helper is never evaluated both at bind and at preparation.
+    free = Set{Symbol}(keys(nodes))
+    for f in fieldnames(StructuralPlan)
+        f in (:assignments, :derived, :columns, :submodel_scopes) && continue
+        _drop_held_names!(free, getfield(plan, f))
+    end
+    # Whole-value classification exempts `axes(M, d)` from observation
+    # alignment, but resolving an array's shape still needs M at bind.
+    for p in plan.array_parameters, d in p.dims
+        _drop_held_names!(free, d)
+    end
+    needed = Set{Symbol}()
+    for nm in union(setdiff(Set{Symbol}(keys(nodes)), free), setdiff(names, prepared))
+        dependencies!(needed, nm; data_only = true)
+    end
+    return setdiff!(prepared, needed)
 end
 
 """In a bound plan: the module data definitions bound as columns."""
@@ -10115,10 +10080,10 @@ whole-context definitions (whose values may have any length too)."""
 function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
     append!(defs, Pair{Symbol,Any}[d.name => d.expr for d in plan.derived])
-    # A scalar prior's arguments and a Dirichlet concentration are whole
-    # model values. Propagate that context through their definitions just
-    # as for a module-call argument; their raw data have no observation axis.
-    for p in plan.parameters
+    # Scalar and declared-array prior arguments are whole model values.
+    # Propagate that context through their definitions just as for a
+    # module-call argument; their raw data have no observation axis.
+    for ps in (plan.parameters, plan.array_parameters), p in ps
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
             Expr(:tuple, values(p.args)..., _support_args(p.support_override)...))
     end
@@ -10145,6 +10110,11 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
             for p in plan.vector_parameters
                 delete!(free, p.name)
                 p.family === :simplex_dirichlet || _drop_held_names!(free, p.args)
+            end
+        elseif f === :array_parameters
+            for p in plan.array_parameters
+                delete!(free, p.name)
+                _drop_held_names!(free, p.dims)
             end
         else
             _drop_held_names!(free, getfield(plan, f))
@@ -10385,6 +10355,9 @@ function _materialize_module_data!(plan::StructuralPlan,
             "[bind] column $nm is computed by the model (`$nm = ...` calls " *
             "a module function on data) — drop it from bind_data"))
     end
+    names = setdiff(_module_data_names(plan, Set{Symbol}(keys(columns));
+        bind_only = true), already)
+    isempty(names) && return names
     exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
     for d in plan.derived
         exprs[d.name] = d.expr

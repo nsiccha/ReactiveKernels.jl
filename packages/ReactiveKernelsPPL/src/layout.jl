@@ -14,8 +14,7 @@
 
 Inferred unconstrained support (`:real`/`:positive`/`:unit`/`:interval`)
 for a sampled family plus an optional support override (`:positive`
-half-Normal/half-Cauchy style, `:positive_stan` Stan-kernel half style,
-`:interval`, `:interval_stan` Stan-kernel interval style, or `:upper`).
+half-Normal/half-Cauchy style, `:truncated`, `:interval`, or `:upper`).
 `:uniform` infers `:interval` from its own
 literal args and takes no override. Loud on unknown families and
 inapplicable overrides.
@@ -43,17 +42,17 @@ function support_of(family::Symbol, override::SupportOverride)
             return :upper
         end
         head = override[1]
-        ((head === :interval || head === :interval_stan) &&
+        (head === :interval &&
             length(override) == 3) ||
             throw(ContractValidationError(
                 "[layout] tuple support override must be (:interval, lo, hi), " *
-                "(:interval_stan, lo, hi), or (:upper, hi), got $override"))
+                "(:interval, lo, hi), or (:upper, hi), got $override"))
         inferred === :real || throw(ContractValidationError(
             "[layout] $head override needs a real-support family"))
         return :interval
     end
-    (override === :positive || override === :positive_stan) || throw(
-        ContractValidationError("[layout] support override must be :positive or :positive_stan, got $override"),
+    override === :positive || throw(
+        ContractValidationError("[layout] support override must be :positive, got $override"),
     )
     inferred === :real || throw(
         ContractValidationError("[layout] $override override needs a real-support family"),
@@ -429,7 +428,7 @@ function assign_layout(plan::StructuralPlan)
     # L/tau/z): the LKJ Cholesky factor (`:varying_corr` packing
     # K*(K-1)/2 thetas — K=1 packs zero and constrains to `[1.0]`),
     # the marginal-scale K-vector `tau` (`:varying` with `:exp` — the
-    # exp Jacobian is Stan's lower-bound kernel term, no renormalizer),
+    # the density uses a normalized half),
     # and the standardized `z_flat` (`:varying` identity, K*G
     # column-major; G from declared levels). Stratified draws pack
     # one L/tau pair per stratum (SB `ranef_correlated_by` order —
@@ -516,7 +515,7 @@ function assign_layout(plan::StructuralPlan)
     # HSGP bases in plan order, SB `_sb_hsgp` declaration order per basis
     # (rho, sigma, beta): length scales as `:sampled` scalars on the
     # parameterized `:floored` support (`x = lo + exp(u)`, logjac `u` —
-    # Stan lower-bound kernel semantics, no truncation normalizer), the
+    # the density normalizer is emitted separately), the
     # marginal scale as a plain `:exp` scalar, and the standardized
     # M-vector `beta_raw` as one `:hsgp` identity block (the
     # spline-vector shape). A zero floor (K=1, unbounded) routes to
@@ -565,7 +564,7 @@ function assign_layout(plan::StructuralPlan)
             names.rho_hyper === nothing || break
             if rbounds !== nothing
                 push!(entries, LayoutEntry(:sampled, nothing, rho, [rho],
-                    offset, 1, :interval, rbounds...))
+                    offset, 1, rbounds[2] == Inf ? :floored : :interval, rbounds...))
             elseif fl == 0.0
                 push!(entries, LayoutEntry(:sampled, nothing, rho, [rho],
                     offset, 1, :exp))
@@ -583,7 +582,7 @@ function assign_layout(plan::StructuralPlan)
                 LayoutEntry(:sampled, nothing, names.sigma, [names.sigma],
                     offset, 1, :exp) :
                 LayoutEntry(:sampled, nothing, names.sigma, [names.sigma],
-                    offset, 1, :interval, sbounds...))
+                    offset, 1, sbounds[2] == Inf ? :floored : :interval, sbounds...))
             offset += 1
         end
         # Grouped bases carry G*M standardized weights (column-major
@@ -1512,10 +1511,9 @@ _logjac_value(transform::Symbol, u) =
 # Symbol-keyed parameterless bijector registry (like `:identity`, it lives
 # outside it): it maps ℝ → (lo, hi) via an affine-logistic (`lo + (hi-lo)·σ(u)`)
 # with log-Jacobian `log(x-lo) + log(hi-x) - log(hi-lo)` in the CONSTRAINED
-# value. `:floored` is likewise parameterized (Stan's lower-bound kernel
-# ℝ → (lo, ∞), `lo + exp(u)`, log-Jacobian the bare `u` — no truncation
-# normalizer), as is `:upper` (Stan's upper-bound kernel ℝ → (-∞, hi),
-# `hi - exp(u)`, log-Jacobian the bare `u` — no truncation normalizer).
+# value. `:floored` is likewise parameterized (ℝ → (lo, ∞), `lo + exp(u)`,
+# log-Jacobian `u`), as is `:upper` (ℝ → (-∞, hi), `hi - exp(u)`,
+# log-Jacobian `u`). Prior density normalizers are emitted separately.
 # The in-graph interval/floored/upper edges (below) use the IDENTICAL
 # operations, so host and graph agree bit-for-bit.
 function _constrain_elt(e::LayoutEntry, u)

@@ -215,6 +215,15 @@ and lock the one Reactant 0.2.289 lifted:
   excluded by name from compiled parity and structure acceptance. Linear
   matrix gathers and positional gathers from module-produced arrays pass
   compiled primal, reverse and fixed-operation-count checks.
+- Gathering from an adjoint matrix (`reshape(u, 2, 3)'[g, 1]`) also
+  fails during Reactant 0.2.289 tracing: the backend applies the adjoint's
+  Cartesian indices to the untransposed ancestor's `LinearIndices`.
+  `repro_reactant_adjoint_axis_gather.jl` isolates the failure and a
+  passing second-axis gather from the plain reshaped matrix. RKPPL
+  preserves the authored adjoint; this shape passes native primal and
+  Enzyme reverse but is excluded by name from compiled acceptance.
+  Declared second-axis gathers, elementwise array definitions and level
+  subsets pass compiled primal, AD and operation-count checks.
 
 - A one-dimensional traced view indexed by `CartesianIndex{1}` fails in
   Reactant 0.2.290 because `Base.reindex` expects an index tuple:
