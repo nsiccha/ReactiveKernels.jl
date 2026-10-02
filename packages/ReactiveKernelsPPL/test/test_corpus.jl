@@ -5,6 +5,8 @@
 # unbound plan. Any lowering drift fails loudly; re-bless deliberately with
 # RKPPL_REBLESS=1 after review, never to make red green.
 
+import ReactiveKernelsDistributionKernels
+
 const _CORPUS_DIR = joinpath(@__DIR__, "corpus")
 const _CORPUS_GOLDEN_DIR = joinpath(_CORPUS_DIR, "golden")
 
