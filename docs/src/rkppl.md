@@ -207,9 +207,23 @@ strata does not multiply their compiled cell regions.
 A per-level row statement, `b[j, :] ~ MvNormalCholesky(zeros(2), F)` inside a
 plate over `levels(g)`, is equivalent to
 `eachrow(b[levels(g), 1:2]) .~ MvNormalCholesky(zeros(2), F)`.
-`b[j, 1:2]` and `MvNormal` also work. Per-level prior arguments are shared;
-arguments varying by level and deterministic per-level assignments are not
-built yet. In an array cell, an observation must read a named per-index output
+`b[j, 1:2]` and `MvNormal` also work; these multivariate priors use shared
+arguments. Scalar priors can vary by level, and a level cell can define
+deterministic values:
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_corpus_example("101_level_plate_values.jl", :rkppl_level_values)
+```
+
+`c[k] ~ Normal(m[k], 1)` also works with a bound Julia array `m`.
+Here `m[k]` uses the authored Julia index; a declared `z[levels(g)]` instead
+uses its level axis, so noncontiguous and string labels gather the correct
+coordinate. Deterministic outputs retain that axis for later reads such as
+`d[g]`. Each cell remains one RK plate body as the number of levels grows.
+Declared array reads inside a level cell currently take the full same level
+axis; selected subsets and different level axes are rejected.
+
+In an array cell, an observation must read a named per-index output
 (`y[i] ~ Normal(r[i], sigma)`), rather than a cell local directly.
 
 `@scan begin … end` writes a sequential recurrence, such as an AR(1) state

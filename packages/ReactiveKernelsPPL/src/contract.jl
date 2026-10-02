@@ -5442,6 +5442,8 @@ _is_plate_param(plan::StructuralPlan, name::Symbol) =
 function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
+    _is_plate_column_expr(ex) &&
+        return _collect_plate_column_refs!(refs, ex, plan, label, bound)
     # Expressions over declared array parameters (`phi[1]`, `sd .* z`,
     # `sum(z)`) follow the array-value vocabulary (`arrays.jl`).
     _mentions_array(ex, plan) &&
@@ -5651,6 +5653,15 @@ _is_plate_column_expr(ex) = ex isa Expr && ex.head === :do &&
     length(ex.args) == 2 && ex.args[1] isa Expr && ex.args[1].head === :call &&
     !isempty(ex.args[1].args) && ex.args[1].args[1] === :plate
 
+# Level plate columns are array values with a declared level axis. Keep
+# that provenance in the first input until the generator binds the axis.
+function _level_plate_axis(ex)
+    _is_plate_column_expr(ex) || return nothing
+    inp = ex.args[1].args[2]
+    return inp isa Expr && inp.head === :call && length(inp.args) == 2 &&
+        inp.args[1] === :_ppl_level_indices ? inp.args[2] : nothing
+end
+
 function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
     known = union(_union_names(plan), _vector_value_names(plan),
         Set{Symbol}(d.name for d in plan.derived),
@@ -5660,9 +5671,11 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
             bound && !haskey(plan.columns, inp) && !(inp in known) &&
                 _fail(label, "array plate column reads unknown name $inp")
             push!(refs, inp)
-        elseif inp isa Expr && inp.head === :call && length(inp.args) == 3 &&
-                inp.args[1] === :_ppl_codes
-            for c in inp.args[2:3]
+        elseif inp isa Expr && inp.head === :call &&
+                ((length(inp.args) == 3 && inp.args[1] === :_ppl_codes) ||
+                 (length(inp.args) == 2 && inp.args[1] in
+                    (:_ppl_level_indices, :_ppl_level_values)))
+            for c in inp.args[2:end]
                 c isa Symbol || _fail(label, "array plate column codes " *
                     "take data columns, got $(repr(c))")
                 bound && !haskey(plan.columns, c) && _fail(label,
@@ -10210,7 +10223,18 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
     if ex isa Symbol
         ex in raw && push!(inside ? whole : per_obs, ex)
     elseif ex isa Expr
-        if ex.head === :kw && length(ex.args) == 2
+        if _is_plate_column_call(ex) && _plate_column_axis(ex) !== nothing
+            axis = _plate_column_axis(ex)
+            for a in ex.args[3:end]
+                _classify_reads!(whole, per_obs, a, raw, a !== axis)
+            end
+        elseif _is_plate_column_expr(ex)
+            for a in ex.args[1].args[2:end]
+                shared = _is_ref_call(a)
+                _classify_reads!(whole, per_obs, shared ? a.args[2] : a,
+                    raw, inside || shared)
+            end
+        elseif ex.head === :kw && length(ex.args) == 2
             _classify_reads!(whole, per_obs, ex.args[2], raw, inside)
         elseif ex.head === :call
             inner = inside || (!isempty(ex.args) && ex.args[1] isa GlobalRef)

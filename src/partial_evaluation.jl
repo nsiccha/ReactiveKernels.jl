@@ -365,12 +365,18 @@ function _partition_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A},
     # they fix. Live arguments are gathered at run time (`_LaneGather`).
     bound = Dict{Int,Any}()
     n = nothing
+    singleton_axis = false
+    unknown_axis = false
     for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
         cid = canon_id(g, outer.id)
-        haskey(known, cid) || continue
+        if !haskey(known, cid)
+            index in A || valtype(outer) <: Number || (unknown_axis = true)
+            continue
+        end
         data = known[cid]
         if !(index in A) && data isa AbstractArray
             ndims(data) == 1 || return nothing
+            singleton_axis |= length(data) == 1
             if length(data) != 1
                 n === nothing && (n = length(data))
                 length(data) == n || return nothing
@@ -380,6 +386,10 @@ function _partition_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A},
         end
         bound[canon_id(inner.graph, input.id)] = index in A ? Ref(data) : data
     end
+    # A bound singleton is the complete domain when every other live
+    # operand is shared/scalar. Keep broadcast expansion conservative when
+    # an unbound lane array could determine a larger domain.
+    n === nothing && singleton_axis && !unknown_axis && (n = 1)
     (n === nothing || n == 0) && return nothing
 
     # The first branch recipe whose condition reads bound data only.

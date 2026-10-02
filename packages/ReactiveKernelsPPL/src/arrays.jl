@@ -439,6 +439,7 @@ function _mentions_array(ex, plan::StructuralPlan,
             _mentions_array(plan.assignments[i].expr, plan, seen)
     end
     ex isa Expr || return false
+    _level_plate_axis(ex) === nothing || return true
     return any(a -> _mentions_array(a, plan, seen), ex.args)
 end
 
@@ -479,6 +480,8 @@ function _value_axes(plan::StructuralPlan, ex,
         return r
     end
     ex isa Expr || return nothing
+    levelaxis = _level_plate_axis(ex)
+    levelaxis === nothing || return Any[:(levels($levelaxis))]
     ax(a) = _value_axes(plan, a, seen)
     head = ex.head
     head === Symbol("'") && return _adjoint_axes(ax(ex.args[1]))
@@ -737,6 +740,8 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
         return push!(refs, ex)
     end
     ex isa Expr || _fail(label, "unsupported literal $(repr(ex))")
+    _is_plate_column_expr(ex) &&
+        return _collect_plate_column_refs!(refs, ex, plan, label, bound)
     head = ex.head
     if head === :ref
         _collect_array_ref!(refs, ex, plan, label, bound;
@@ -1070,6 +1075,16 @@ function _array_gather_rewrite(ex, plan::StructuralPlan,
     # cell body indexes by those codes and is RK's to plan.
     _is_plate_column_expr(ex) && return Expr(:do,
         _array_gather_rewrite(ex.args[1], plan, needed), ex.args[2])
+    if ex.head === :call && !isempty(ex.args) &&
+            ex.args[1] in (:_ppl_level_indices, :_ppl_level_values)
+        g = ex.args[2]
+        lv = _array_axis_levels(plan, g, :plan, g)
+        if ex.args[1] === :_ppl_level_indices
+            return :(collect(1:$(length(lv))))
+        elseif ex.args[1] === :_ppl_level_values
+            return Expr(:vect, map(_level_literal, lv)...)
+        end
+    end
     if ex.head === :call && length(ex.args) == 3 && ex.args[1] === :_ppl_codes
         g, h = ex.args[2], ex.args[3]
         push!(needed, (g, h))

@@ -1908,13 +1908,17 @@ ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
         _reactant_structural_marker(Base.tail(args))
 end
 
-# A Ref contributes no broadcast axis, but its traced array still selects the
-# backend when every axis operand is bound host data. Generic Reactant broadcast
+# A Ref contributes no broadcast axis, but its traced payload still selects the
+# backend when every axis operand is bound host data. This includes shared
+# traced scalars: host broadcasting would otherwise construct one traced scalar
+# per lane, whose later promotion replicates reads and whose gathers recurse.
+# Generic Reactant broadcast
 # expands Ref payloads as scalars (broadcast_in_dim with no source dimensions),
 # which is invalid for an array payload. Ops.batch already preserves the full
 # shape of arrays captured by the callable, as in the eachcol lowering above.
 ReactiveKernels._tensorized_plate_is_marker(
-    ::Base.RefValue{<:Union{Reactant.TracedRArray,_TracedReshapedArray}}) = true
+    ::Base.RefValue{<:Union{Reactant.TracedRArray,Reactant.TracedRNumber,
+        _TracedReshapedArray}}) = true
 @inline _reactant_plate_ref_array(arg) = false
 @inline _reactant_plate_ref_array(::Base.RefValue{<:AbstractArray}) = true
 @inline _reactant_plate_broadcast_input(arg::AbstractArray) =
@@ -1953,7 +1957,8 @@ function _reactant_ref_plate_call(operation, args::Tuple)
 end
 
 function ReactiveKernels._tensorized_plate_call(
-        marker::Base.RefValue{<:Union{Reactant.TracedRArray,_TracedReshapedArray}},
+        marker::Base.RefValue{<:Union{Reactant.TracedRArray,Reactant.TracedRNumber,
+            _TracedReshapedArray}},
         operation, args::Tuple)
     structural = _reactant_structural_marker(args)
     structural === nothing ? _reactant_ref_plate_call(operation, args) :
