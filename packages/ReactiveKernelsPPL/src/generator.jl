@@ -3802,13 +3802,25 @@ const _PRIOR_ENDPOINTS = Dict{Symbol,Symbol}(
 # halves (`+log(2)`) and the `:interval` correction live in
 # `_support_correction` (the Stan-kernel `:positive_stan` /
 # `:interval_stan` / `:upper` overrides add nothing there).
-function _family_logpdf_expr(family::Symbol, a, x)
-    family === :flat && return :(0.0)
+# Distribution kernels use Float64 ports. Promote at that boundary rather
+# than redeclaring the source name: bound data and ordinary Julia helpers
+# must retain their original numeric types. The same boundary applies to
+# density and truncation endpoints, including threaded plate arguments.
+# Multiplication by a floating unit preserves the value (and signed zero)
+# through ordinary Julia numeric promotion and backend arithmetic.
+function _prior_endpoint_expr(family::Symbol, a, method::Symbol, x)
     ep = get(_PRIOR_ENDPOINTS, family, nothing)
     ep === nothing && throw(ContractValidationError(
         "[generator] prior family $family has no endpoint object"))
     args = family === :gamma ? (a[1], :(1 / $(a[2]))) : Tuple(a)
-    return :($ep($(args...)).logpdf($x))
+    args = map(v -> :(1.0 * $v), args)
+    return Expr(:call, Expr(:., Expr(:call, ep, args...), QuoteNode(method)),
+        :(1.0 * $x))
+end
+
+function _family_logpdf_expr(family::Symbol, a, x)
+    family === :flat && return :(0.0)
+    return _prior_endpoint_expr(family, a, :logpdf, x)
 end
 
 # The additive support-override correction for a prior log-density (or `nothing`
@@ -3832,11 +3844,8 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
     ov === nothing && return nothing
     if ov isa Tuple && ov[1] === :truncated
         lo, hi = ov[2], ov[3]
-        ep = _PRIOR_ENDPOINTS[family]
-        args = family === :gamma ?
-            (argvals[1], :(1 / $(argvals[2]))) : Tuple(argvals)
-        cdf(x) = :($ep($(args...)).cdf($x))
-        ccdf(x) = :($ep($(args...)).ccdf($x))
+        cdf(x) = _prior_endpoint_expr(family, argvals, :cdf, x)
+        ccdf(x) = _prior_endpoint_expr(family, argvals, :ccdf, x)
         lo == -Inf && hi == Inf && return nothing
         lo == -Inf && return :(-log($(cdf(hi))))
         hi == Inf && return :(-log($(ccdf(lo))))
@@ -3860,7 +3869,8 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
             lo = ov[2]
             lo isa Real && lo == 0 && return nothing
             m, s = argvals[1], argvals[2]
-            return :(-log(normal(-($m), $s).cdf(-log($lo))))
+            tail = _prior_endpoint_expr(:normal, Any[:(-$m), s], :cdf, :(-log($lo)))
+            return :(-log($tail))
         end
         (ov[1] === :upper || ov[1] === :interval_stan) && return nothing  # Stan kernel semantics
         ov[1] === :interval || throw(ContractValidationError(
@@ -3869,7 +3879,9 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
         family === :flat && return nothing  # improper: Jacobian only
         lo, hi = ov[2], ov[3]
         mu, s = argvals[1], argvals[2]
-        return :(-log(normal($mu, $s).cdf($hi) - normal($mu, $s).cdf($lo)))
+        upper = _prior_endpoint_expr(:normal, Any[mu, s], :cdf, hi)
+        lower = _prior_endpoint_expr(:normal, Any[mu, s], :cdf, lo)
+        return :(-log($upper - $lower))
     end
     ov === :positive || throw(ContractValidationError(
         "[generator] support override must be :positive or " *

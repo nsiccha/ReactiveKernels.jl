@@ -7,6 +7,7 @@ function _pp_backend_check(expr, data, q)
     kernel = prepare_query(built, bound, :sampler)
     return Base.invokelatest(_pp_backend_measure, built, bound, kernel, u)
 end
+
 function _pp_backend_measure(built, bound, kernel, u)
     native = kernel(u)
     sampler = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
@@ -77,4 +78,27 @@ end
         @test_broken true
     end
     isempty(structs) || @test length(structs) == 2 && structs[1] == structs[2]
+end
+
+_numeric_backend_scale(x) = 2x
+
+@testset "integer prior arguments: native and compiled reverse and structure" begin
+    for truncated in (false, true)
+        structures = Dict{String,Int}[]
+        for n in (3, 7)
+            prior = truncated ? :(truncated(Normal(0, sd), lo, hi)) : :(Normal(0, sd))
+            expr = quote
+                sd = _numeric_backend_scale(seed)
+                x ~ $prior
+                y .~ Normal.(x, 1)
+            end
+            data = Dict{Symbol,Any}(:seed=>2, :lo=>-1, :hi=>3, :y=>fill(0.2,n))
+            names = ReactiveKernelsPPL._value_symbols(expr)
+            filter!(p -> first(p) in names, data)
+            before = deepcopy(data)
+            push!(structures, _pp_backend_check(expr, data, (x=0.3,)))
+            @test data == before
+        end
+        @test structures[1] == structures[2]
+    end
 end

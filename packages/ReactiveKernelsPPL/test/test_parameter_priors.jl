@@ -1,4 +1,5 @@
 using Test, ReactiveKernelsPPL
+import ReactiveKernels
 import Distributions as D
 
 # Independent constrained-density oracle; the layout supplies only the
@@ -19,6 +20,73 @@ function _parameter_prior_check(expr, columns, q, density)
     expected = density(q) + logjac(built.layout, u)
     @test actual ≈ expected atol = 1e-12 rtol = 1e-12
     return bound, built, kernel, u
+end
+
+_numeric_prior_scale(x) = 2x
+_numeric_prior_readtype(::Integer, x) = x + 1
+_numeric_prior_readtype(::AbstractFloat, x) = x - 1
+
+@testset "numeric prior arguments preserve their source values" begin
+    for seed in (2, 2.0, Float32(2), 2//1)
+        expr = quote
+            sd = _numeric_prior_scale(seed)
+            x ~ Normal(0, sd)
+            y .~ Normal.(x, 1)
+        end
+        data = Dict{Symbol,Any}(:seed => seed, :y => [0.2, -0.4])
+        bound, built, _, _ = _parameter_prior_check(expr, data, (x=0.3,),
+            q -> D.logpdf(D.Normal(0.0, 2seed), q.x) +
+                sum(D.logpdf.(D.Normal(q.x, 1), data[:y])))
+        @test bound.columns[:sd] === 2seed
+        @test ReactiveKernels.valtype(built.spec[:sd]) === typeof(2seed)
+        @test data[:seed] === seed
+        @test data[:y] == [0.2, -0.4]
+    end
+    # A prior's floating boundary must not change dispatch in another use
+    # of the same Julia value, including a parameter-dependent helper.
+    for sd in (4, 4.0)
+        expr = quote
+            x ~ Normal(0, sd)
+            mu = _numeric_prior_readtype(sd, x)
+            y .~ Normal.(mu, 1)
+        end
+        data = Dict{Symbol,Any}(:sd => sd, :y => [0.2, -0.4])
+        _parameter_prior_check(expr, data, (x=0.3,), q ->
+            D.logpdf(D.Normal(0, sd), q.x) +
+            sum(D.logpdf.(D.Normal(_numeric_prior_readtype(sd, q.x), 1), data[:y])))
+    end
+end
+
+@testset "shared numeric boundary for scalar prior families and truncation" begin
+    families = [
+        (:(Normal(a, s)), D.Normal(2, 4), -1, 5, 0.4),
+        (:(Cauchy(a, s)), D.Cauchy(2, 4), -1, 5, 0.4),
+        (:(Exponential(s)), D.Exponential(4), 0, 5, 0.4),
+        (:(Gamma(a, s)), D.Gamma(2, 4), 0, 5, 0.4),
+        (:(LogNormal(a, s)), D.LogNormal(2, 4), 0, 5, 0.4),
+        (:(Beta(a, s)), D.Beta(2, 4), 0, 1, 0.4),
+        (:(InverseGamma(a, s)), D.InverseGamma(2, 4), 0, 5, 0.4),
+        (:(StudentT(s, a, s)), D.LocationScale(2, 4, D.TDist(4)), -1, 5, 0.4),
+        (:(Laplace(a, s)), D.Laplace(2, 4), -1, 5, 0.4),
+        (:(Logistic(a, s)), D.Logistic(2, 4), -1, 5, 0.4),
+        (:(Uniform(a, s)), D.Uniform(2, 4), 2, 3, 2.4),
+        (:(Weibull(a, s)), D.Weibull(2, 4), 0, 5, 0.4)]
+    for (ctor, dist, lo, hi, x) in families, truncated in (false, true)
+        prior = truncated ? :(truncated($ctor, lo, hi)) : ctor
+        data = Dict{Symbol,Any}(:a=>2, :s=>4, :lo=>lo, :hi=>hi, :y=>[0.2])
+        expected = truncated ? D.truncated(dist, lo, hi) : dist
+        _parameter_prior_check(quote x ~ $prior; y .~ Normal.(x, 1) end,
+            data, (x=x,), q -> D.logpdf(expected, q.x) + D.logpdf(D.Normal(q.x, 1), 0.2))
+    end
+    # Per-element integer arguments take the same boundary inside a plate.
+    data = Dict(:s => [2, 4], :y => [0.2, -0.4])
+    before = deepcopy(data)
+    _parameter_prior_check(quote
+        x[1:2] .~ Normal.(0, s)
+        y .~ Normal.(x[1], 1)
+    end, data, (x=[0.3, 0.7],), q -> sum(D.logpdf.(D.Normal.(0, data[:s]), q.x)) +
+        sum(D.logpdf.(D.Normal(q.x[1], 1), data[:y])))
+    @test data == before
 end
 
 @testset "general parameter truncation" begin
