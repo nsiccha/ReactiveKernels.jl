@@ -1725,8 +1725,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         return _obs_axis(ex, data, detmap, memo, active, env) ?
             :vector : :scalar
     end
-    head === Symbol("'") && return shape(ex.args[1]) === :array ? :array :
-        :scalar
+    head === Symbol("'") && return shape(ex.args[1]) in (:array, :matrix) ?
+        shape(ex.args[1]) : :scalar
     head === :call || return :scalar  # exotic heads: downstream rejects
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
@@ -1764,9 +1764,9 @@ end
 function _ref_shape(ex, data)
     idx = ex.args[2:end]
     isempty(idx) && return :scalar
-    if idx[1] isa Symbol && idx[1] in data
-        # Per-observation gather: one value (or row) per observation.
-        length(idx) == 2 && idx[2] === :(:) && return :matrix
+    if any(i -> i isa Symbol && i in data, idx)
+        # Per-observation gather: scalar selection or an oriented matrix.
+        any(i -> i === :(:), idx) && return :matrix
         return :vector
     end
     any(i -> i === :(:), idx) && return :array
@@ -1815,13 +1815,16 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2].args)
     elseif ex.head === :ref
-        # A gather from an array value (`z[g, 1]`, `b[g, 1]` with
-        # `b = z * M`) follows its first index, like a one-index gather.
+        # A gather from an array value follows its observation index on
+        # either axis, including definitions such as `b = z * M`.
         array_base = ex.args[1] isa Symbol && length(ex.args) >= 2 &&
             (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
                 _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
         array_base || _is_gather(ex, data, detmap, env) || return false
-        return _obs_axis(ex.args[2], data, detmap, memo, active, env)
+        return any(i -> _obs_axis(i, data, detmap, memo, active, env),
+            ex.args[2:end])
+    elseif ex.head === Symbol("'")
+        return _obs_axis(ex.args[1], data, detmap, memo, active, env)
     end
     return false
 end
@@ -6100,6 +6103,11 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
         return Int(hi)
     end
     _is_def_levels_call(a, data, detnames) && return a
+    if a isa Expr && a.head === :ref && !isempty(a.args) &&
+            _is_levels_call(a.args[1])
+        g, subset = _levels_subset_index(target, a, data)
+        return Expr(:call, :levels, g, QuoteNode(subset))
+    end
     if _is_levels_call(a)
         return Expr(:call, :levels,
             _levels_column(target, a, data, "array $target"))

@@ -149,7 +149,13 @@ at a packed point differ from the non-centered entries.
 Centered correlated coefficients use ordinary row priors:
 `eachrow(B[levels(g), 1:K]) .~ MvNormalCholesky(mu, F)`, with a K-vector
 mean `mu` and lower-triangular covariance factor `F`. Read their effects as
-`B[g, 1] .+ x .* B[g, 2]`. The legacy `varying_draws` / `varying_effect`
+`B[g, 1] .+ x .* B[g, 2]`. The column-oriented declaration
+`eachcol(B[1:K, levels(g)]) .~ MvNormalCholesky(mu, F)` uses a K×G
+array instead: read `B[1, g] .+ x .* B[2, g]`, or `B[:, g]' * v`
+for a K-vector `v`. Level lookup follows the indexed axis. On an integer
+axis, the index column contains positive integer positions. A column
+gather stays K×N until the authored adjoint turns it into N×K.
+The legacy `varying_draws` / `varying_effect`
 keywords are `eta`, `levels`, and `sd`; centered coefficients are declared
 through array priors or the centered library entries above.
 
