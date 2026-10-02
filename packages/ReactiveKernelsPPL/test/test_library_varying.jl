@@ -247,6 +247,19 @@ end
     _lv_parity("87_composed_correlated_slices",
         "87_composed_correlated_slices_lib",
         _lv_block_map(:dx, :item, 2, G), (_, _) -> 0.0; bernoulli = true)
+    # Stratified correlated (corpus 65): per stratum k its sds
+    # (`r_sd.k.j`) and LKJ factor (`r_L.p.k`); the levels of g share z.
+    m65 = Dict{Symbol,Symbol}()
+    for k in 1:2, j in 1:2
+        m65[Symbol("r_sd.", k, ".", j)] = Symbol("tau_g_s", k, ".", j)
+    end
+    for k in 1:2
+        m65[Symbol("r_L.1.", k)] = Symbol("L_g_s", k, ".1")
+    end
+    for j in 1:G, q in 1:2
+        m65[Symbol("r_z.", j, ".", q)] = Symbol("z_flat_g.", q + (j - 1) * 2)
+    end
+    _lv_parity("65_stratified", "65_stratified_lib", m65, _lv_halves(4))
 end
 
 _lv_halfnormal(s) = logpdf(truncated(Normal(0, 1), 0, Inf), s)
@@ -418,4 +431,74 @@ end
     for port in (:likelihood, :prior, :log_jacobian)
         @test _query(kw.spec, bw, port, uw) ≈ _query(kb.spec, bb, port, ub)
     end
+end
+
+@testset "stratified correlated: library entry and Distributions.jl oracle" begin
+    data = (:y, :x, :g, :s)
+    head = (:(a ~ Normal(0, 5)), :(sigma ~ Exponential(1)))
+    use = :(mu = a .+ r[:, 1] .+ x .* r[:, 2])
+    tail = :(y .~ Normal.(mu, sigma))
+    lib = Expr(:block, head..., :(r ~ varying_stratified_correlated(g, s, 2)), use, tail)
+    written = quote
+        a ~ Normal(0, 5); sigma ~ Exponential(1)
+        r_sd[levels(s), 1:2] .~ HalfNormal.(1)
+        @plate for k in levels(s)
+            r_L[k] ~ LKJCholesky(2, 1.0)
+        end
+        r_z[levels(g), 1:2] .~ Normal.(0, 1)
+        @plate for i in eachindex(g)
+            r_b[i, 1:2] = (r_sd[s[i], :] .* r_L[s[i]]) * r_z[g[i], :]
+        end
+        r = r_b
+        mu = a .+ r[:, 1] .+ x .* r[:, 2]
+        y .~ Normal.(mu, sigma)
+    end
+    @test _lv_canon(lib, data) == _lv_canon(written, data)
+    b65, k65 = _lv_build("65_stratified_lib")
+    u = _lv_point(k65.layout.total)
+    nt = constrain(k65.layout, u)
+    c = b65.columns
+    mu = map(eachindex(c[:y])) do i
+        si, gi = c[:b][i], c[:g][i]
+        row = (Diagonal(nt.r_sd[si, :]) * nt.r_L[:, :, si]) * nt.r_z[gi, :]
+        only(nt.mu) + row[1] + c[:x][i] * row[2]
+    end
+    @test _query(k65.spec, b65, :likelihood, u) ≈
+        sum(logpdf.(Normal.(mu, nt.sigma), c[:y]))
+    @test _query(k65.spec, b65, :prior, u) ≈ logpdf(Normal(0, 5),
+        only(nt.mu)) + logpdf(Exponential(1), nt.sigma) +
+        sum(_lv_halfnormal, nt.r_sd) +
+        sum(_lv_lkj(nt.r_L[:, :, k], 1.0) for k in 1:2) +
+        sum(logpdf.(Normal(0, 1), nt.r_z))
+    _check_gradient(k65.spec, b65, u)
+    # A third structural margin exercises the full stacked vine, rather than
+    # just K=2's single partial correlation. Its final margin affects y too.
+    ex3 = quote
+        a ~ Normal(0, 5); sigma ~ Exponential(1)
+        r ~ varying_stratified_correlated(g, s, 3)
+        mu = a .+ r[:, 1] .+ x .* r[:, 2] .+ r[:, 3]
+        y .~ Normal.(mu, sigma)
+    end
+    cols3 = _lv_cols(data)
+    cols3[:s] = repeat([10, 30, 20], _LV_N ÷ 3)
+    b3 = bind_data(_lv_lower(ex3, data), cols3)
+    k3 = build_kernel(b3)
+    u3 = _lv_point(k3.layout.total)
+    nt3 = constrain(k3.layout, u3)
+    @test size(nt3.r_L) == (3, 3, length(unique(cols3[:s])))
+    @test unconstrain(k3.layout, nt3) ≈ u3
+    sl = sort(unique(cols3[:s]))
+    mu3 = map(eachindex(cols3[:y])) do i
+        si, gi = findfirst(==(cols3[:s][i]), sl), cols3[:g][i]
+        row = (Diagonal(nt3.r_sd[si, :]) * nt3.r_L[:, :, si]) * nt3.r_z[gi, :]
+        only(nt3.mu) + row[1] + cols3[:x][i] * row[2] + row[3]
+    end
+    @test _query(k3.spec, b3, :likelihood, u3) ≈
+        sum(logpdf.(Normal.(mu3, nt3.sigma), cols3[:y]))
+    @test _query(k3.spec, b3, :prior, u3) ≈
+        logpdf(Normal(0, 5), only(nt3.mu)) + logpdf(Exponential(1), nt3.sigma) +
+        sum(_lv_halfnormal, nt3.r_sd) +
+        sum(_lv_lkj(nt3.r_L[:, :, k], 1.0) for k in axes(nt3.r_L, 3)) +
+        sum(logpdf.(Normal(0, 1), nt3.r_z))
+    _check_gradient(k3.spec, b3, u3)
 end
