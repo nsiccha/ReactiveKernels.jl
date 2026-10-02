@@ -204,6 +204,14 @@ K, so `b[g, 1]` gathers one margin per observation. Positional reads such as
 array follows the same rule. A data-only definition can size a declared array
 through `levels(gg)`, as in the multi-membership example above.
 
+The library's `gp_exp_quad_cov` and `gp_periodic_cov` functions build covariance
+with an RK plate over two location axes. Data-only locations cache pair
+distances during preparation; locations derived from parameters retain live
+distance calculations. The covariance matrix remains dense and diagonal jitter
+depends on position, including when two locations are equal. Dense Cholesky in
+`gp_chol_latent` remains a separate numerical leaf with native gradient support;
+compiled covariance support does not imply compiled Cholesky gradients.
+
 A single index on a multi-axis definition is linear and positional:
 `b = (z * sd)'` makes a row, and `b[g]` reads its column-major positions.
 A module function's result has no tracked level axes: `b = identity(z)`
