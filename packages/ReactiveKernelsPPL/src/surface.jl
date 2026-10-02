@@ -690,16 +690,30 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     # matrix stay coefficient-capable (`c[g]`, `X * b`), independently of
     # their whole-value array shape below. `value_arrays` are never
     # coefficients: a bare `z[g]` summand gathers them.
+    # A one-axis `z[levels(g)]` that a definition reads as a whole value
+    # (`b = sd .* z`) also takes the array role (`array_decls`,
+    # `value_arrays`): a levels coefficient is only ever consumed indexed
+    # by its group (`c[g]`), never whole.
+    whole_reads = Set{Symbol}()
+    for (_, rhs) in det
+        _whole_name_reads!(whole_reads, rhs)
+    end
+    levels_values = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
+        s.dims === nothing && s.levels !== nothing && s.lhs in whole_reads)
     hcat_defs = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
     array_decls = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
-        (s.dims !== nothing ||
+        (s.dims !== nothing || s.lhs in levels_values ||
             (s.broadcast && s.matrix !== nothing && s.matrix ∉ hcat_defs) ||
             (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
     value_arrays = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
-        (s.dims !== nothing ||
+        (s.dims !== nothing || s.lhs in levels_values ||
             (!s.broadcast && _is_lkj_cholesky_call(s.rhs))))
+    # A whole-read levels declaration (`levels_values`) is an array, never
+    # a factor coefficient an alias (`th = c[g]`) can stand for.
     factor_decls = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data &&
-        s.broadcast && s.levels !== nothing && s.dims === nothing)
+        s.broadcast && s.levels !== nothing && s.dims === nothing &&
+        s.lhs ∉ levels_values)
+    _check_definition_levels_axes(sample, det, data)
     # Every array-capable declaration (sized `.~`, LKJ, a `Dirichlet`
     # simplex or `Ordered` vector value): an expression that READS one by
     # index (`L[2, 1] .* x`, `tau .* z[g]`, `phi[1] .* x`) is a value, never
@@ -1208,7 +1222,11 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2].args)
     elseif ex.head === :ref
-        _is_gather(ex, data, detmap, env) || return false
+        # A gather from an array value (`z[g, 1]`, `b[g, 1]` with
+        # `b = z * M`) follows its first index, like a one-index gather.
+        array_base = ex.args[1] isa Symbol && length(ex.args) >= 2 &&
+            _shape_of(ex.args[1], data, detmap, memo, active, env) === :array
+        array_base || _is_gather(ex, data, detmap, env) || return false
         return _obs_axis(ex.args[2], data, detmap, memo, active, env)
     end
     return false
@@ -3964,7 +3982,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 continue
             end
             _reject_derived_ref_lhs(st.args[2], detnames)
-            arr = _array_sample_lhs(st.args[2], bc, tilde, data)
+            arr = _array_sample_lhs(st.args[2], bc, tilde, data, detnames)
             if arr !== nothing
                 alhs, adims = arr
                 _claim!(seen, seelines, alhs, line)
@@ -4955,20 +4973,89 @@ _is_axes2_call(index) =
 # (each axis `1:K`, `levels(g)`, or `axes(M, d)`). One-axis
 # `z[levels(g)]` / `z[axes(X, 2)]` keep their coefficient-prior parse:
 # they are arrays exactly when no predictor consumes them as
-# coefficients. Returns `(name, dims)` or `nothing` (not an array).
-function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol})
+# coefficients. A `levels(gg)` axis over a definition `gg` (data computed
+# at bind, `gg = vcat(g1, g2)`) is always an array axis: coefficients
+# group by raw data columns. Returns `(name, dims)` or `nothing` (not an
+# array).
+function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol},
+        detnames::Set{Symbol} = Set{Symbol}())
     lhs isa Expr && lhs.head === :ref || return nothing
     target = lhs.args[1]
     target isa Symbol && target ∉ data || return nothing
     idx = lhs.args[2:end]
     if length(idx) == 1
-        _is_literal_range(idx[1]) || return nothing
+        _is_literal_range(idx[1]) || _is_def_levels_call(idx[1], data,
+            detnames) || return nothing
     elseif length(idx) != 2
         _sfail("array $target takes one or two axes, got $(repr(lhs))")
     end
     bc || _sfail("array `$(repr(lhs))` is declared elementwise — use " *
                  "`.~`, not $tilde (`$(repr(lhs)) .~ Normal.(0, 1)`)")
-    return target, Any[_array_axis(target, a, data) for a in idx]
+    return target, Any[_array_axis(target, a, data, detnames) for a in idx]
+end
+
+# `levels(gg)` over a definition name (not data).
+_is_def_levels_call(a, data::Set{Symbol}, detnames::Set{Symbol}) =
+    _is_levels_call(a) && length(a.args) == 2 && a.args[2] isa Symbol &&
+    a.args[2] ∉ data && a.args[2] in detnames
+
+# A `levels(gg)` axis over a definition needs `gg` to be data that
+# `bind_data` computes: a definition calling a module function on data
+# only (`gg = vcat(g1, g2)`), whose distinct values the axis enumerates.
+# Runs on resolved definitions (module calls are `GlobalRef`s).
+function _check_definition_levels_axes(sample, det, data::Set{Symbol})
+    detmap = Dict{Symbol,Any}(det)
+    for s in sample
+        s.dims === nothing && continue
+        for d in s.dims
+            d isa Expr && d.head === :call && d.args[1] === :levels &&
+                d.args[2] ∉ data || continue
+            gg = d.args[2]
+            _is_bind_data_definition(gg, detmap, data, Set{Symbol}()) ||
+                _sfail("array $(s.lhs) axis `levels($gg)`: $gg must be " *
+                    "data — a raw column, or a definition that calls a " *
+                    "function on data only (`$gg = vcat(g1, g2)`), " *
+                    "computed once at bind")
+        end
+    end
+    return nothing
+end
+
+function _is_bind_data_definition(nm::Symbol, detmap, data::Set{Symbol},
+        active::Set{Symbol})
+    haskey(detmap, nm) && nm ∉ active || return false
+    rhs = detmap[nm]
+    _contains_module_call(rhs) || return false
+    push!(active, nm)
+    ok = all(v -> v in data ||
+            _is_bind_data_definition(v, detmap, data, active),
+        _expr_value_symbols(rhs))
+    delete!(active, nm)
+    return ok
+end
+
+# Names an expression reads as whole values: every Symbol except call
+# heads, dotted function names, keyword names and the base of an index
+# (`z` in `z[g]`, whose indices are still walked).
+function _whole_name_reads!(out::Set{Symbol}, ex)
+    if ex isa Symbol
+        push!(out, ex)
+    elseif ex isa Expr
+        if ex.head === :ref
+            ex.args[1] isa Symbol || _whole_name_reads!(out, ex.args[1])
+            foreach(a -> _whole_name_reads!(out, a), ex.args[2:end])
+        elseif ex.head === :call
+            foreach(a -> _whole_name_reads!(out, a), ex.args[2:end])
+        elseif ex.head === :kw
+            _whole_name_reads!(out, ex.args[2])
+        elseif ex.head === :. && length(ex.args) == 2 &&
+                ex.args[2] isa Expr && ex.args[2].head === :tuple
+            foreach(a -> _whole_name_reads!(out, a), ex.args[2].args)
+        else
+            foreach(a -> _whole_name_reads!(out, a), ex.args)
+        end
+    end
+    return out
 end
 
 _is_literal_range(r) = r isa Expr && r.head === :call && length(r.args) == 3 &&
@@ -5015,7 +5102,8 @@ function _array_slices_lhs(lhs, rhs, bc::Bool, tilde, data::Set{Symbol})
     return target, Any[_array_axis(target, lhs.args[2], data)], :vector
 end
 
-function _array_axis(target::Symbol, a, data::Set{Symbol})
+function _array_axis(target::Symbol, a, data::Set{Symbol},
+        detnames::Set{Symbol} = Set{Symbol}())
     if _is_literal_range(a)
         lo, hi = a.args[2], a.args[3]
         cnt = lo === 1 ? _levels_count(hi) : nothing
@@ -5034,6 +5122,7 @@ function _array_axis(target::Symbol, a, data::Set{Symbol})
             "K ≥ 1, or `1:length(levels(g)) - k`")
         return Int(hi)
     end
+    _is_def_levels_call(a, data, detnames) && return a
     if _is_levels_call(a)
         return Expr(:call, :levels,
             _levels_column(target, a, data, "array $target"))
@@ -8416,6 +8505,33 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     return true
 end
 
+# An array-valued DEFINITION (`b = z * (sd .* L)'`). `detshape` also
+# seeds every sized declaration as `:array` (its whole-value shape),
+# including coefficient-capable `c[levels(g)]`, whose role the
+# declaration sets (`array_decls`, `value_arrays`); so test `detmap` too.
+_is_array_def(name, ctx) = name isa Symbol && haskey(ctx.detmap, name) &&
+    get(ctx.detshape, name, :scalar) === :array
+
+# Whether `ex` reads an array that is a VALUE in every role — a value
+# array (`z` declared sized, read whole, or an LKJ factor), an
+# array-role declaration, or an array-valued definition — directly or
+# through definitions. Unlike `_reads_array_value`, an indexed read of a
+# coefficient-capable `c[levels(g)]` (`r = c[g]`, an aliased factor
+# coefficient) does not count.
+function _reads_value_array(ex, ctx, seen::Set{Symbol} = Set{Symbol}())
+    isval(nm) = nm isa Symbol && (nm in ctx.value_arrays ||
+        nm in ctx.array_decls || _is_array_def(nm, ctx))
+    if ex isa Symbol
+        isval(ex) && return true
+        haskey(ctx.detmap, ex) && ex ∉ seen || return false
+        push!(seen, ex)
+        return _reads_value_array(ctx.detmap[ex], ctx, seen)
+    end
+    ex isa Expr || return false
+    ex.head === :ref && isval(ex.args[1]) && return true
+    return any(a -> _reads_value_array(a, ctx, seen), ex.args)
+end
+
 # Whether `ex` reads a declared array value — a bare array name
 # (`B * w`), or an indexed read of any array-capable declaration
 # (`phi[1]`, `z[g]`, `L[2, 1]`) — directly, or (`follow`) through
@@ -8430,7 +8546,8 @@ function _reads_array_value(ex, ctx, seen::Set{Symbol} = Set{Symbol}();
     end
     ex isa Expr || return false
     ex.head === :ref && ex.args[1] isa Symbol &&
-        ex.args[1] in ctx.sized_decls && return true
+        (ex.args[1] in ctx.sized_decls || _is_array_def(ex.args[1], ctx)) &&
+        return true
     return any(a -> _reads_array_value(a, ctx, seen; follow), ex.args)
 end
 
@@ -8606,6 +8723,15 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             # A bound data column read elementwise in-graph (v3:
             # `(log_time .- loc) .* exp.(ls)`); it becomes a term column.
             node in datas || push!(datas, node)
+            return node
+        elseif get(ctx.detshape, node, :scalar) === :vector &&
+                _reads_value_array(ctx.detmap[node], ctx)
+            # A per-observation definition reading array values
+            # (`th = r[person]`, `b = b0 .+ r[item]`) is a sub-predictor:
+            # its array reads extract as offset columns beside any
+            # coefficients (affine, as `_lower_composed_predictor`
+            # checks).
+            node in subs || push!(subs, node)
             return node
         elseif haskey(ctx.detmap, node)
             return _sfail("$where combines $node, which is neither an " *
@@ -9597,9 +9723,11 @@ function _summand_kind(_, _)
 end
 
 function _classify_ref(pname, core::Expr, sign::Int, ctx)
-    # Reads of a declared array value (`z[g]`, `phi[1]`) are values, not
-    # factor coefficients: extracted as a per-observation column.
-    core.args[1] in ctx.value_arrays &&
+    # Reads of a declared array value (`z[g]`, `phi[1]`) or of an
+    # array-valued definition (`b[g, 1]`, `b = z * (sd .* L)'`) are
+    # values, not factor coefficients: extracted as a per-observation
+    # column.
+    (core.args[1] in ctx.value_arrays || _is_array_def(core.args[1], ctx)) &&
         return _extract_summand(pname, core, sign, ctx)
     length(core.args) == 2 || _sfail("predictor $pname: factor indexing " *
                                      "takes `coefficients[group]` exactly, " *
