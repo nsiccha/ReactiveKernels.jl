@@ -453,7 +453,7 @@ end
             mix = MixtureModel([Normal(q.mu1, q.sigma), Normal(q.mu2, q.sigma)],
                 [0.4, 0.6])
             want = sum(logpdf.(mix, cols[:y])) +
-                logpdf(Normal(-2, 0.1), (q.a1, q.b1)) +
+                logpdf(Normal(-2, 0.1), q.mu1) +
                 logpdf(Normal(2, 0.1), q.mu2) +
                 logpdf(Exponential(1.0), q.sigma) + log(q.sigma)
             @test got ≈ want rtol = 1e-12
@@ -639,7 +639,7 @@ end
         q = (mu1 = -2.0, sigma = 0.3)
         got = _mix_posterior(kern, lay, q)
         want = sum(logpdf.(Normal(q.mu1, q.sigma), cols[:y])) +
-            logpdf(Normal(-2, 0.1), (q.a1, q.b1)) +
+            logpdf(Normal(-2, 0.1), q.mu1) +
             logpdf(Exponential(1.0), q.sigma) + log(q.sigma)
         @test got ≈ want rtol = 1e-12
     end

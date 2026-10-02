@@ -2371,8 +2371,12 @@ end
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
     end, (:y, :x))
-    @test got.predictors[1].terms[2].kind === OffsetTerm
-    @test any(a -> a.name === :w, vcat(got.assignments, got.derived))
+    w = only(p for p in got.predictors if p.name === :w)
+    mu = only(p for p in got.predictors if p.name === :mu)
+    @test w.terms[1].options.parameter === :s
+    @test w.terms[2].kind === OffsetTerm
+    @test only(mu.terms).kind === ComposedTerm
+    @test only(mu.terms).options.subs == [:w]
     @test [p.name for p in got.parameters] == [:a, :s]
 end
 

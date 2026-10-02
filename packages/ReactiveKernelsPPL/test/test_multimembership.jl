@@ -638,10 +638,10 @@ end
         # SB declaration order: all L, all tau, then z.
         names = [e.name for e in lay.entries]
         @test names ==
-            [:mu_coef, :L_g_s1, :L_g_s2, :tau_g_s1, :tau_g_s2, :z_flat_g]
+            [:a, :L_g_s1, :L_g_s2, :tau_g_s1, :tau_g_s2, :z_flat_g]
         kinds = [e.kind for e in lay.entries]
         @test kinds ==
-            [:coefficient, :varying_corr, :varying_corr, :varying, :varying, :varying]
+            [:sampled, :varying_corr, :varying_corr, :varying, :varying, :varying]
         @test [e.size for e in lay.entries] == [1, 1, 1, 2, 2, 6]
         @test lay.total == 13
         @test length(coordinate_names(lay)) == 13
@@ -888,7 +888,7 @@ end
             end, cols)
         u = collect(range(-0.4, 0.4; length = lay.total))
         # constrain is fail-closed on stratified draws — slice u manually.
-        a = only(u[_mm_seg(lay, :mu)])
+        a = only(u[_mm_seg(lay, :a)])
         L1 = lkj_chol_constrain(Vector{Float64}(u[_mm_seg(lay, :L_g_s1)]), 2)
         L2 = lkj_chol_constrain(Vector{Float64}(u[_mm_seg(lay, :L_g_s2)]), 2)
         t1 = exp.(u[_mm_seg(lay, :tau_g_s1)])
@@ -927,7 +927,7 @@ end
         # a + 2 empty thetas + 2 taus + 3 z.
         @test lay.total == 6
         u = collect(range(-0.4, 0.4; length = lay.total))
-        a = only(u[_mm_seg(lay, :mu)])
+        a = only(u[_mm_seg(lay, :a)])
         t1 = exp.(u[_mm_seg(lay, :tau_g_s1)])
         t2 = exp.(u[_mm_seg(lay, :tau_g_s2)])
         zf = u[_mm_seg(lay, :z_flat_g)]
@@ -963,7 +963,7 @@ end
                 y .~ Normal.(mu, 1.0)
             end, cols)
         u = [0.4 * sin(1.3i) for i in 1:lay.total]
-        a = only(u[_mm_seg(lay, :mu)])
+        a = only(u[_mm_seg(lay, :a)])
         us = [Vector{Float64}(u[_mm_seg(lay, Symbol(:L_g_s, k))]) for k in 1:2]
         Ls = [lkj_chol_constrain(us[k], 3) for k in 1:2]
         ts = [exp.(u[_mm_seg(lay, Symbol(:tau_g_s, k))]) for k in 1:2]

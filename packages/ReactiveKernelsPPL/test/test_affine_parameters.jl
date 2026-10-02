@@ -108,6 +108,24 @@ end
         sum(logpdf.(Normal.([u[3], u[2], u[3]], exp(u[1])), y))
     @test _query(bf.spec, factor, :posterior, u) ≈ expected_factor
     _check_gradient(bf.spec, factor, u)
+
+    scaled, bscaled = _affine_model(quote
+        a ~ Normal(0, 2)
+        s ~ HalfNormal(1)
+        c[levels(g)] .~ Normal.(0, 1)
+        d = s .* c
+        mu = a .+ d[g]
+        y .~ Normal.(mu, 1.0)
+    end; g, y)
+    @test only(scaled.assignments).name === :d
+    @test coordinate_names(bscaled.layout) == [:a, :s, Symbol("c.1"), Symbol("c.2")]
+    uscaled = [0.2, log(0.7), -0.3, 0.4]
+    expected_scaled = logpdf(Normal(0, 2), uscaled[1]) +
+        logpdf(truncated(Normal(), 0, Inf), exp(uscaled[2])) + uscaled[2] +
+        sum(logpdf.(Normal(), uscaled[3:4])) +
+        sum(logpdf.(Normal.(uscaled[1] .+ exp(uscaled[2]) .* [uscaled[4], uscaled[3], uscaled[4]], 1.0), y))
+    @test _query(bscaled.spec, scaled, :posterior, uscaled) ≈ expected_scaled
+    _check_gradient(bscaled.spec, scaled, uscaled)
 end
 
 @testset "affine readers and prior arguments share a declaration" begin

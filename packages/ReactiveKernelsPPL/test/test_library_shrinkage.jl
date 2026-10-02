@@ -202,7 +202,7 @@ end
     bl, builtl = _ls_build(_LS_R2D2, cols)
     ub = _ls_u(builtb)
     v = constrain(builtb.layout, ub)
-    ul = _ls_unconstrain(builtl.layout, (; mu = v.mu[1:1], b_R2 = v.R2,
+    ul = _ls_unconstrain(builtl.layout, (; a = v.mu[1], b_R2 = v.R2,
         b_tau = v.r2d2_mu_tau_bsv, sigma = v.sigma, b_phi = v.phi,
         b_b = v.mu[2:3]))
     for want in (:prior, :likelihood, :posterior)

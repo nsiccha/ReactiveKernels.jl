@@ -318,7 +318,7 @@ _lv_lkj(L, eta) = logpdf(LKJCholesky(size(L, 1), eta),
     u = _lv_point(k72.layout.total)
     nt = constrain(k72.layout, u)
     c = b72.columns
-    mu_alpha = nt.a
+    mu_alpha = nt.mu_alpha
     mu = mu_alpha .+ nt.c_c[c[:g]]
     @test _query(k72.spec, b72, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.s), c[:y]))
@@ -425,7 +425,7 @@ end
     base = constrain(kb.layout, zeros(kb.layout.total))
     # The built-in stores the centered rows as `b_flat_g` (K × G
     # column-major) and exposes `b_g` as their matrix view.
-    ub = unconstrain(kb.layout, merge(base, (mu = w.mu, sigma = w.sigma,
+    ub = unconstrain(kb.layout, merge(base, (a = w.a, sigma = w.sigma,
         tau_g = w.d_sd, L_g = w.d_L, b_flat_g = vec(permutedims(w.d_c)),
         b_g = w.d_c)))
     for port in (:likelihood, :prior, :log_jacobian)
@@ -461,12 +461,12 @@ end
     mu = map(eachindex(c[:y])) do i
         si, gi = c[:b][i], c[:g][i]
         row = (Diagonal(nt.r_sd[si, :]) * nt.r_L[:, :, si]) * nt.r_z[gi, :]
-        only(nt.mu) + row[1] + c[:x][i] * row[2]
+        nt.a + row[1] + c[:x][i] * row[2]
     end
     @test _query(k65.spec, b65, :likelihood, u) ≈
         sum(logpdf.(Normal.(mu, nt.sigma), c[:y]))
     @test _query(k65.spec, b65, :prior, u) ≈ logpdf(Normal(0, 5),
-        only(nt.mu)) + logpdf(Exponential(1), nt.sigma) +
+        nt.a) + logpdf(Exponential(1), nt.sigma) +
         sum(_lv_halfnormal, nt.r_sd) +
         sum(_lv_lkj(nt.r_L[:, :, k], 1.0) for k in 1:2) +
         sum(logpdf.(Normal(0, 1), nt.r_z))
@@ -491,12 +491,12 @@ end
     mu3 = map(eachindex(cols3[:y])) do i
         si, gi = findfirst(==(cols3[:s][i]), sl), cols3[:g][i]
         row = (Diagonal(nt3.r_sd[si, :]) * nt3.r_L[:, :, si]) * nt3.r_z[gi, :]
-        only(nt3.mu) + row[1] + cols3[:x][i] * row[2] + row[3]
+        nt3.a + row[1] + cols3[:x][i] * row[2] + row[3]
     end
     @test _query(k3.spec, b3, :likelihood, u3) ≈
         sum(logpdf.(Normal.(mu3, nt3.sigma), cols3[:y]))
     @test _query(k3.spec, b3, :prior, u3) ≈
-        logpdf(Normal(0, 5), only(nt3.mu)) + logpdf(Exponential(1), nt3.sigma) +
+        logpdf(Normal(0, 5), nt3.a) + logpdf(Exponential(1), nt3.sigma) +
         sum(_lv_halfnormal, nt3.r_sd) +
         sum(_lv_lkj(nt3.r_L[:, :, k], 1.0) for k in axes(nt3.r_L, 3)) +
         sum(logpdf.(Normal(0, 1), nt3.r_z))

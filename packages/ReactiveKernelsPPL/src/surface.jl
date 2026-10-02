@@ -9556,6 +9556,7 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
         "predictor summand (`mu = a .+ dar(beta, sigma)`), not " *
         "inside definitions")
     # Array-valued definitions (`M = (sd .* L)'`) stay named values.
+    ctx.detshape[ex] === :array && return ex
     if ex in ctx.structural || ctx.detshape[ex] ∉ (:vector, :array) ||
             _is_factor_coefficient_alias(ex, ctx)
         ex in visited && _sfail("$where: cyclic definition through $ex")

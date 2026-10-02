@@ -1048,12 +1048,13 @@ function _array_gather_rewrite(ex, plan::StructuralPlan,
 end
 
 # The level-code vectors a plan's gathers read (data-only: `bound=` folds
-# them), one per (index column, array value).
+# them), keyed by an array value or a plate cell's levels column.
 function _array_level_index_statements(plan::StructuralPlan,
         needed::Set{Tuple{Symbol,Symbol}})
     stmts = Expr[]
     for (g, name) in sort!(collect(needed))
-        d = _gather_axes(plan, name)[1]
+        axes = _gather_axes(plan, name)
+        d = axes === nothing ? Expr(:call, :levels, name) : first(axes)
         h = d.args[2]
         lv = _array_axis_levels(plan, name, :plan, h)
         lv = _apply_subset(lv, LevelMap(name, h, [], :levels,
