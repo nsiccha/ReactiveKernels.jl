@@ -472,8 +472,7 @@ end
 end
 
 @testset "mo mixed-predictor per-block splice" begin
-    # mo + continuous + full-cover factor (no intercept: full-cover
-    # factors are unidentified with one): the mo beta sits between static
+    # mo + continuous + full-cover factor: the mo beta sits between static
     # blocks (non-contiguous static coefficients), pinning the per-block
     # coefficient coordinates including the factor slice.
     cols = _mo_cols()

@@ -6970,9 +6970,8 @@ function _grouping_levels(col::AbstractVector)
     return sort(unique(col))
 end
 
-# One map per factor term, keyed (predictor, column); duplicate keys mean
-# two factor terms over one column in one predictor (unidentified sums —
-# merge them).
+# One map per factor term, keyed (predictor, column), so a factor lookup
+# resolves to exactly one map.
 _map_key(m::LevelMap) = (m.predictor, m.column)
 
 function _validate_levelmaps(plan::StructuralPlan)
@@ -6989,28 +6988,6 @@ function _validate_levelmaps(plan::StructuralPlan)
                 "factor term over $col in predictor $(pred.name) has no " *
                 "LevelMap (surface: size it with a `c[levels($col)]` prior)")
         end
-        has_intercept = any(t -> t.kind === InterceptTerm, pred.terms)
-        if !has_intercept
-            for t in pred.terms
-                t.kind === MatrixTerm || continue
-                m = _find_matrix(plan, t.options.matrix)
-                m !== nothing && any(isnothing, m.columns) &&
-                    (has_intercept = true; break)
-            end
-        end
-        if has_intercept
-            for t in pred.terms
-                t.kind === FactorTerm || continue
-                col = only(t.columns)
-                m = _find_levelmap(plan.levelmaps, pred.name, col)
-                m === nothing && continue
-                msg = _parameter_term(t) ?
-                    _parameter_factor_unidentified(pred, t, m, plan) :
-                    _full_cover_unidentified(pred.name, col, m,
-                        plan.population_priors)
-                msg === nothing || _fail(pred.label, msg)
-            end
-        end
     end
     for m in plan.levelmaps
         m.source === :levels ||
@@ -7019,50 +6996,6 @@ function _validate_levelmaps(plan::StructuralPlan)
         _validate_subset_shape(m)
     end
     return nothing
-end
-
-function _parameter_factor_unidentified(pred, t, m, plan)
-    m.subset === Colon() || return nothing
-    p = only(p for p in plan.array_parameters
-        if p.name === t.options.parameter)
-    shape = get(_COEF_SHAPES, p.family, nothing)
-    rows = PopulationPrior[]
-    if shape !== nothing
-        _, loc, scale, _ = shape
-        vs = values(p.args)
-        l, s = vs[loc], vs[scale]
-        if (l isa Real || l isa Symbol) && (s isa Real || s isa Symbol)
-            push!(rows, PopulationPrior(pred.name, only(t.columns),
-                p.family, l, s))
-        end
-    end
-    return _full_cover_unidentified(pred.name, only(t.columns), m, rows)
-end
-
-# Intercept + full-cover factor (the surface and contract gates share this
-# rule): a hierarchical prior — a parameter or assignment scale around a
-# literal location (`c[levels(g)] .~ Normal.(0, sg)`) — identifies the
-# level offsets against the intercept, so the pair is admitted. A literal
-# or flat prior leaves an exact likelihood ridge pinned only by fixed
-# priors, and a parameter location trades off with the intercept itself;
-# both stay refused. Returns the refusal message or `nothing`.
-function _full_cover_unidentified(pred::Symbol, col::Symbol, m::LevelMap,
-        priors::Vector{PopulationPrior})
-    m.subset === Colon() || return nothing
-    i = findfirst(p -> p.predictor === pred && p.addressee === col, priors)
-    pr = i === nothing ? nothing : priors[i]
-    if pr !== nothing && pr.family !== :flat && pr.family !== :uniform &&
-            pr.scale isa Symbol
-        pr.location isa Real && return nothing
-        return "predictor $pred is unidentified: intercept + full-cover " *
-            "factor over $col whose prior location $(pr.location) is a " *
-            "parameter — the intercept and $(pr.location) trade off " *
-            "exactly (drop one, or center the factor prior at a literal)"
-    end
-    return "predictor $pred is unidentified: intercept + full-cover " *
-        "factor over $col with a fixed prior (drop the intercept, index a " *
-        "strict subset of levels, or give the factor a hierarchical scale: " *
-        "`c[levels($col)] .~ Normal.(0, s)` with `s` a parameter)"
 end
 
 function _find_levelmap(maps::Vector{LevelMap}, pred::Symbol, col::Symbol)
@@ -7601,7 +7534,7 @@ function _validate_leveled_fields(r::LikelihoodSpec, plan::StructuralPlan,
     _is_leveled_family(r.family) || return _validate_unleveled_fields(r)
     r.family === CategoricalLogitFam &&
         return _validate_categorical_fields(r, plan, used_predictors)
-    return _validate_ordered_fields(r, plan, pred, used_predictors)
+    return _validate_ordered_fields(r, plan, used_predictors)
 end
 
 function _validate_categorical_fields(r::LikelihoodSpec, plan::StructuralPlan,
@@ -7649,7 +7582,7 @@ function _validate_categorical_fields(r::LikelihoodSpec, plan::StructuralPlan,
 end
 
 function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
-        pred::PredictorSpec, used_predictors::Set{Symbol})
+        used_predictors::Set{Symbol})
     r.thresholds === nothing && _fail(r.label,
         "an ordered response requires its thresholds vector parameter")
     tp = only(p for p in plan.vector_parameters if p.name === r.thresholds)
@@ -7660,9 +7593,6 @@ function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
         r.ordinal_structure in (:cumulative, :stopping) || _fail(r.label,
             "Ordinal takes ordinal_structure :cumulative or :stopping, got " *
             "$(repr(r.ordinal_structure))")
-        any(t -> t.kind === InterceptTerm, pred.terms) && _fail(r.label,
-            "an Ordinal eta cannot include a fixed intercept — the estimated " *
-            "thresholds already supply the location")
     else
         r.ordinal_structure === nothing ||
             _fail(r.label, "OrderedLogistic takes no ordinal_structure")

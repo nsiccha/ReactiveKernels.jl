@@ -392,8 +392,7 @@ _pv_m3_oracle(a::Real, b::Real, u::Real, h::Real, s::Real) =
     _pv_interval_logjac(-1, 2, u) + log(h) + log(s)
 
 # M4: mixed predictor with a wide homogeneous factor plate (StudentT
-# levels) plus a Cauchy width-1 block (no intercept: intercept +
-# full-cover factor is unidentified).
+# levels) plus a Cauchy width-1 block.
 const _PV_M4 = quote
     c[levels(g)] .~ StudentT.(3, 0, 2)
     mu = c[g] .+ b .* x

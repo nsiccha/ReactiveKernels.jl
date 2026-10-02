@@ -10720,8 +10720,6 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                 nu))
         end
     end
-    _check_identified(PredictorSpec[_legacy_predictor(p) for p in predictors],
-        levelmaps, matrices, priors)
     return priors, levelmaps
 end
 
@@ -11058,7 +11056,6 @@ function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
         end
         push!(out, R2D2Prior(d.predictor, d.r2, d.phi, tau, overrides))
     end
-    _check_identified(r2d2preds, levelmaps, matrices)
     return out, taus
 end
 
@@ -11204,36 +11201,6 @@ function _coefficient_broadcast_prior(name, rhs, pname, col,
     end
     vals = Any[a isa Real ? Float64(a) : a for a in args]
     return fam, vals[lipos], vals[spos], npos == 0 ? NaN : vals[npos]
-end
-
-# Surface-side identifiability gate (the contract validator repeats it for
-# hand-built plans, through the same `_full_cover_unidentified`):
-# intercept + full-cover factor is unidentified unless the factor's prior
-# is hierarchical. Matrix intercepts count (any intercept position in any
-# matrix term).
-function _check_identified(predictors, levelmaps, matrices,
-        priors::Vector{PopulationPrior} = PopulationPrior[])
-    for pred in predictors
-        has_intercept = any(t -> t.kind === InterceptTerm, pred.terms)
-        if !has_intercept
-            for t in pred.terms
-                t.kind === MatrixTerm || continue
-                m = get(matrices, t.options.matrix, nothing)
-                m !== nothing && any(isnothing, m.columns) &&
-                    (has_intercept = true; break)
-            end
-        end
-        has_intercept || continue
-        for t in pred.terms
-            t.kind === FactorTerm || continue
-            col = only(t.columns)
-            m = _find_levelmap(levelmaps, pred.name, col)
-            m === nothing && continue
-            msg = _full_cover_unidentified(pred.name, col, m, priors)
-            msg === nothing || _sfail(msg)
-        end
-    end
-    return nothing
 end
 
 function _find_use(coefuse, pname, addr)
