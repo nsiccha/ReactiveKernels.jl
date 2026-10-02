@@ -11050,9 +11050,14 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     # (Design matrices never reach here as bare summands: named
     # definitions screen them at extraction, inline locations at the
     # location arm, and dotted compositions at canonicalization.)
-    (core in ctx.data || core in ctx.vecdefs) &&
+    if core in ctx.data || core in ctx.vecdefs
+        # An offset has no signed coefficient coordinate. Keep a negative
+        # summand in its value expression instead of discarding the sign.
+        sign < 0 && return _extract_summand(pname,
+            Expr(:call, :.-, core), 1, ctx)
         return TermSpec(OffsetTerm, [core], NamedTuple(),
         core, Symbol(core, "_off")), nothing
+    end
     core in ctx.plate_names && _sfail(
         "predictor $pname: bare latent $core is not a term — scale it " *
         "by a coefficient (`b .* $core`, the SB `me` mirror)")
