@@ -74,7 +74,8 @@ export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
 export RKPPLModel, RKPPLSubmodel, lower_rkppl, @rkppl, SurfaceLoweringError
-export ordered_logistic, r2d2_coefs, horseshoe_coefs
+export ordered_logistic, monotonic, differenced_ar1, r2d2_coefs,
+    horseshoe_coefs
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
 export DarSpec
 export LINEAR_EVENT_READ, LINEAR_EVENT_DOSE, LINEAR_EVENT_DOSE_SEGMENT

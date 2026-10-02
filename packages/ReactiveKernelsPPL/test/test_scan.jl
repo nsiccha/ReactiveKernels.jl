@@ -1,3 +1,4 @@
+using Distributions
 using ReactiveKernelsPPL
 using Test
 
@@ -17,6 +18,21 @@ _scan_min_plan(scans; n = 3) = StructuralPlan(
     scans = scans,
 )
 
+# A shape this file pins as not built yet: `f()` fails with an error whose
+# message contains `needle` (`@test_broken`), and a different failure is a
+# real error. When the shape starts working, `@test_broken` reports an
+# unexpected pass, so the pin turns into a positive test.
+function _scan_gap(f, needle)
+    ok = try
+        f()
+        true
+    catch e
+        occursin(needle, sprint(showerror, e)) || rethrow()
+        false
+    end
+    @test_broken ok
+end
+
 # Front-end parse tests for `@scan` (sequential recurrence). `parse_scan_block`
 # is purely syntactic — it consumes the quoted inner `begin … end` block, so
 # distribution constructors here are unevaluated AST symbols (no Distributions).
@@ -28,12 +44,14 @@ _scan_min_plan(scans; n = 3) = StructuralPlan(
             h[t] ~ Normal(phi * h[t - 1], s)
         end
     end)
-    @test sp.state === :h
+    @test sp.states == [:h]
     @test sp.loopvar === :t
     @test sp.lo == 2
     @test sp.hi === :T
     @test length(sp.setup) == 1
+    @test sp.setup[1].target === :h
     @test sp.setup[1].index == 1
+    @test sp.setup[1].kind === :sample
     @test sp.setup[1].family === :normal
     @test sp.setup[1].args == [0, 1]
     @test length(sp.step) == 1
@@ -180,7 +198,8 @@ end
             h[t - 1] ~ Normal(phi * h[t - 1], s)
         end
     end)
-    # a second carried array (v1 threads exactly one)
+    # a carried array written in the loop but never seeded (`g[1]` would
+    # be undefined)
     reject(quote
         h[1] ~ Normal(0, 1)
         for t in 2:T
@@ -222,20 +241,47 @@ end
 
     # happy path: an (as-yet unreferenced) scan latent validates structurally
     @test (validate_structure(plan([ar1])); true)
-    @test plan([ar1]).scans[1].state === :h
+    @test plan([ar1]).scans[1].states == [:h]
     @test isempty(plan(ScanSpec[]).scans)      # pre-scan compat: no scans field needed
 
     # scan-state name colliding with a parameter is rejected by the name table
-    bad_state = ScanSpec(:sigma, ar1.loopvar, ar1.lo, ar1.hi, ar1.setup,
-        ar1.step, ar1.maxlag, :sigma)
+    bad_state = parse_scan_block(quote
+        sigma[1] ~ Normal(0, 1)
+        for t in 2:T
+            sigma[t] ~ Normal(phi * sigma[t - 1], s)
+        end
+    end)
     @test_throws ContractValidationError validate_structure(plan([bad_state]))
+    # ... including a second carried array of a tuple carry
+    bad_tuple = parse_scan_block(quote
+        h[1] ~ Normal(0, 1)
+        sigma[1] = 0.0
+        for t in 2:T
+            e ~ Normal(0, 1)
+            h[t] = phi * h[t - 1] + e
+            sigma[t] = sigma[t - 1] + h[t]
+        end
+    end)
+    @test_throws ContractValidationError validate_structure(plan([bad_tuple]))
 
-    # malformed ScanSpec (loop start not one past the seeds) caught by _validate_scans
-    malformed = ScanSpec(:g, :t, 3, :T,
-        [ScanSetup(1, :normal, Any[0, 1])],
-        [ScanStep(:sample, :g, true, :normal, Any[:mu], nothing)],
-        1, :g)
-    @test_throws ContractValidationError validate_structure(plan([malformed]))
+    # malformed ScanSpecs caught by _validate_scans: loop start not one past
+    # the seeds; a carried array seeded short; a seed of a non-carried
+    # array; a carried array written twice per step
+    seed(a, k) = ScanSetup(a, k, :sample, :normal, Any[0, 1], nothing)
+    write(a) = ScanStep(:assign, a, true, nothing, nothing, :($a[t - 1]))
+    malformed = [
+        ScanSpec([:g], :t, 3, :T, [seed(:g, 1)],
+            [ScanStep(:sample, :g, true, :normal, Any[:mu], nothing)], 1, :g),
+        ScanSpec([:g, :q], :t, 3, :T, [seed(:g, 1), seed(:g, 2), seed(:q, 1)],
+            [write(:g), write(:q)], 1, :g),
+        ScanSpec([:g], :t, 2, :T, [seed(:g, 1), seed(:q, 1)],
+            [write(:g)], 1, :g),
+        ScanSpec([:g], :t, 2, :T, [seed(:g, 1)], [write(:g), write(:g)],
+            1, :g),
+    ]
+    for bad in malformed
+        @test_throws ContractValidationError validate_structure(plan([bad]))
+    end
 end
 
 @testset "scan surface: @scan lowers into the plan" begin
@@ -256,7 +302,7 @@ end
         y .~ Normal.(mu, sigma)
     end, (:x, :y))
     @test length(plan.scans) == 1
-    @test plan.scans[1].state === :h
+    @test plan.scans[1].states == [:h]
     @test plan.scans[1].maxlag == 1
     @test plan.scans[1].hi === :T
     @test plan.scans[1].label === :h          # label defaults to the state name
@@ -352,7 +398,7 @@ end
     @test r.family === GaussianFam
     @test r.scale === :sigma
     @test isempty(plan.predictors)      # no linear predictor synthesized for h
-    @test plan.scans[1].state === :h
+    @test plan.scans[1].states == [:h]
 
     # a non-Gaussian response over a scan state is rejected in slice 1
     ar1 = parse_scan_block(quote
@@ -423,6 +469,10 @@ end
 
     # hand-built IR emits (contract/generator agreement smoke)
     @test build_kernel(good).layout.total == 1 + 3 + 3
+    # a beta-free summand (`coef = nothing`) splices the bare state
+    free = _scan_ar_plan(scan; options = (scan_id = :u, coef = nothing))
+    @test (validate_structure(free); true)
+    @test build_kernel(free).layout.total == 1 + 3 + 3
 
     bad_opts = [
         ("unknown scan", (scan_id = :nope, coef = :beta_ar)),
@@ -515,7 +565,7 @@ end
     @test only(a for a in plan.assignments if a.name === :phi).expr ==
         :(tanh(phi_raw))
 
-    reject(loc) = @test_throws SurfaceLoweringError lower_rkppl(quote
+    prog(loc) = quote
         phi_raw ~ Normal(0, 1)
         beta_ar ~ Normal(0, 2)
         b ~ Normal(0, 1)
@@ -531,23 +581,28 @@ end
         phi = tanh(phi_raw)
         $(loc)
         y .~ Normal.(mu, sigma)
-    end, (:x, :y))
-    # bare scan state in a location (LP use needs `coef .* state`)
-    reject(:(mu = a .+ u))
-    # literal scaling (coefficient-free is the dar shape, not ar)
-    reject(:(mu = a .+ 2.0 .* u))
-    # data scaling (interactions are planned)
-    reject(:(mu = a .+ x .* u))
-    # computed-scalar scaling (computed coefficients are out of slice)
-    reject(:(mu = a .+ phi .* u))
-    # coefficient with no `~` statement
-    reject(:(mu = a .+ q .* u))
-    # subtracted summand (additive only)
-    reject(:(mu = a .- beta_ar .* u))
-    # nested scan read (direct `coef .* state` only)
-    reject(:(mu = a .+ beta_ar .* (u .+ x)))
-    # scan-only predictor (a summand needs a sibling coefficient)
-    reject(:(mu = beta_ar .* u))
+    end
+    # A bare scan state is a beta-free summand (the dar/`mo1` shape).
+    bare = lower_rkppl(prog(:(mu = a .+ u)), (:x, :y))
+    bt = only(bare.predictors).terms[2]
+    @test bt.kind === ScanSummandTerm
+    @test bt.options == (scan_id = :u, coef = nothing)
+    # coefficient with no `~` statement (refused: undeclared names never
+    # become parameters, decision `05oe96l`)
+    @test_throws SurfaceLoweringError lower_rkppl(prog(:(mu = a .+ q .* u)),
+        (:x, :y))
+    # Valid Julia the emitter does not build yet (a scan state is spliced
+    # bare or scaled by one sampled scalar, additively): pinned as gaps so
+    # building one fails this file instead of a silent refusal surviving.
+    gap(loc, needle) = _scan_gap(needle) do
+        lower_rkppl(prog(loc), (:x, :y))
+    end
+    gap(:(mu = a .+ 2.0 .* u), "scan coefficients are bare sampled scalars")
+    gap(:(mu = a .+ x .* u), "scales scan state")
+    gap(:(mu = a .+ phi .* u), "scan coefficients are bare sampled scalars")
+    gap(:(mu = a .- beta_ar .* u), "additive")
+    gap(:(mu = a .+ beta_ar .* (u .+ x)), "scan states lower only as direct")
+    gap(:(mu = beta_ar .* u), "no estimated coefficients")
     # One name as both a population coefficient and a scan coefficient is
     # one ordinary parameter read by both summands (test_fallback.jl).
     both = lower_rkppl(quote
@@ -597,8 +652,7 @@ end
     @test (validate_structure(dotted); true)
 end
 
-@testset "non-centered emission: fail-closed shapes" begin
-    # each model parses (the parser admits any step shape) but refuses to emit
+@testset "non-centered emission: gaps and refusals" begin
     scan_block(stmts...) = Expr(:macrocall, Symbol("@scan"),
         LineNumberNode(1), Expr(:block, stmts...))
     build_block(stmts...) = build_kernel(bind_data(
@@ -611,55 +665,270 @@ end
             scan_block(stmts...),
             :(y .~ Normal.(h, sigma))), (:y,)),
         Dict{Symbol,AbstractVector}(:y => [0.1, 0.2, 0.3])))
-    # three steps (v1: one innovation sample + one carry write)
-    @test_throws ContractValidationError build_block(
-        :(h[1] ~ Normal(0, 1)),
-        :(for t in 2:T
-            eps ~ Normal(0, 1)
-            eps2 ~ Normal(0, 1)
-            h[t] = phi * h[t - 1] + eps + eps2
-        end))
-    # non-Normal innovation
-    @test_throws ContractValidationError build_block(
-        :(h[1] ~ Normal(0, 1)),
-        :(for t in 2:T
-            eps ~ Exponential(1)
-            h[t] = phi * h[t - 1] + eps
-        end))
-    # non-Normal seed
-    @test_throws ContractValidationError build_block(
-        :(h[1] ~ Exponential(1)),
-        :(for t in 2:T
-            eps ~ Normal(0, 1)
-            h[t] = phi * h[t - 1] + eps
-        end))
-    # AR(2) lag (tuple carry planned)
-    @test_throws ContractValidationError build_block(
-        :(h[1] ~ Normal(0, 1)),
-        :(h[2] ~ Normal(0, 1)),
-        :(for t in 3:T
-            eps ~ Normal(0, 1)
-            h[t] = a * h[t - 1] + b * h[t - 2] + eps
-        end))
-    # carry write before the innovation sample
-    @test_throws ContractValidationError build_block(
+    # a carry write that reads its innovation before the step drawing it
+    # (refused: in a Julia loop body `eps` is not defined yet)
+    @test_throws SurfaceLoweringError build_block(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             h[t] = phi * h[t - 1] + eps
             eps ~ Normal(0, 1)
         end))
-    # unknown leaf in the carry write
+    # an unknown leaf in the carry write (refused: undeclared names never
+    # become parameters, decision `05oe96l`)
     @test_throws ContractValidationError build_block(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             eps ~ Normal(0, 1)
             h[t] = nosuch * h[t - 1] + eps
         end))
-    # loop-index leaf in the carry write
-    @test_throws ContractValidationError build_block(
+    # Valid recurrences the emitter does not build yet.
+    gap(needle, stmts...) = _scan_gap(() -> build_block(stmts...), needle)
+    # a positive-support innovation or seed (the latent slice is identity)
+    gap("must have real support",
+        :(h[1] ~ Normal(0, 1)),
+        :(for t in 2:T
+            eps ~ Exponential(1)
+            h[t] = phi * h[t - 1] + eps
+        end))
+    gap("must have real support",
+        :(h[1] ~ Exponential(1)),
+        :(for t in 2:T
+            eps ~ Normal(0, 1)
+            h[t] = phi * h[t - 1] + eps
+        end))
+    # the loop index read directly
+    gap("uses the loop index",
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             eps ~ Normal(0, 1)
             h[t] = phi * h[t - 1] + eps * t
         end))
+    # a fully deterministic recurrence (no per-step innovation)
+    gap("needs a per-step innovation",
+        :(h[1] ~ Normal(0, 1)),
+        :(for t in 2:T
+            h[t] = phi * h[t - 1]
+        end))
+    # centered and non-centered carried writes mixed in one scan
+    gap("mixing centered and non-centered",
+        :(h[1] ~ Normal(0, 1)),
+        :(g[1] = 0.0),
+        :(for t in 2:T
+            h[t] ~ Normal(phi * h[t - 1], s)
+            g[t] = g[t - 1] + h[t]
+        end))
+    # an innovation scale that reads a carried array (stochastic volatility)
+    gap("innovation scales",
+        :(h[1] ~ Normal(0, 1)),
+        :(for t in 2:T
+            eps ~ Normal(0, exp(h[t - 1]))
+            h[t] = phi * h[t - 1] + eps
+        end))
+    # a data column read inside the recurrence
+    gap("data-varying",
+        :(h[1] = 0.0),
+        :(for t in 2:T
+            eps ~ Normal(0, 1)
+            h[t] = phi * h[t - 1] + y[t - 1] + eps
+        end))
+end
+
+@testset "scan front-end: tuple carry and deterministic seeds" begin
+    sp = parse_scan_block(quote
+        x[1] = 0.0
+        d[1] = x0
+        for t in 2:T
+            z ~ Normal(0, 1)
+            d[t] = beta * d[t - 1] + sigma * z
+            x[t] = x[t - 1] + d[t]
+        end
+    end)
+    @test sp.states == [:x, :d]
+    @test sp.label === :x
+    @test [(f.target, f.index, f.kind) for f in sp.setup] ==
+        [(:x, 1, :assign), (:d, 1, :assign)]
+    @test sp.setup[2].expr === :x0
+    @test [(st.kind, st.target, st.indexed) for st in sp.step] ==
+        [(:sample, :z, false), (:assign, :d, true), (:assign, :x, true)]
+    @test sp.maxlag == 1
+
+    # interleaved fills, a seed reading an earlier seed, and lag 2
+    sp2 = parse_scan_block(quote
+        h[1] ~ Normal(0, 1)
+        lvl[1] = 0.0
+        h[2] ~ Normal(0, 1)
+        lvl[2] = lvl[1] + h[2]
+        for t in 3:T
+            e ~ Normal(0, 1)
+            h[t] = a * h[t - 1] + b * h[t - 2] + e
+            lvl[t] = lvl[t - 1] + h[t]
+        end
+    end)
+    @test sp2.states == [:h, :lvl]
+    @test sp2.maxlag == 2
+    @test sp2.lo == 3
+
+    reject(blk) = @test_throws SurfaceLoweringError parse_scan_block(blk)
+    # a current value read before the step that writes it
+    reject(quote
+        x[1] = 0.0
+        d[1] = 0.0
+        for t in 2:T
+            z ~ Normal(0, 1)
+            x[t] = x[t - 1] + d[t]
+            d[t] = beta * d[t - 1] + z
+        end
+    end)
+    # a carried array written twice in one step
+    reject(quote
+        x[1] = 0.0
+        for t in 2:T
+            z ~ Normal(0, 1)
+            x[t] = x[t - 1] + z
+            x[t] = x[t - 1] - z
+        end
+    end)
+    # a local read before its definition
+    reject(quote
+        x[1] = 0.0
+        for t in 2:T
+            x[t] = x[t - 1] + w
+            w ~ Normal(0, 1)
+        end
+    end)
+    # a local defined twice
+    reject(quote
+        x[1] = 0.0
+        for t in 2:T
+            w ~ Normal(0, 1)
+            w = 2 * w
+            x[t] = x[t - 1] + w
+        end
+    end)
+    # carried arrays seeded to different depths
+    reject(quote
+        x[1] = 0.0
+        x[2] = 0.0
+        d[1] = 0.0
+        for t in 3:T
+            z ~ Normal(0, 1)
+            d[t] = d[t - 1] + z
+            x[t] = x[t - 1] + d[t]
+        end
+    end)
+    # a seed reading a value not seeded above it
+    reject(quote
+        x[1] = d[1]
+        d[1] = 0.0
+        for t in 2:T
+            z ~ Normal(0, 1)
+            d[t] = d[t - 1] + z
+            x[t] = x[t - 1] + d[t]
+        end
+    end)
+    # a seeded array the loop never writes
+    reject(quote
+        x[1] = 0.0
+        d[1] = 0.0
+        for t in 2:T
+            z ~ Normal(0, 1)
+            x[t] = x[t - 1] + z
+        end
+    end)
+end
+
+# Oracle for the tuple-carry program of corpus `38_scan_tuple_carry`: an
+# AR(2) `h` with sampled seeds h[1], h[2] and one innovation per step, and
+# its running level `lvl[t] = lvl[t-1] + h[t]` from `lvl[1] = 0`,
+# `lvl[2] = h[2]`; `y ~ Normal(a + lvl, sigma)`. Layout order: a, phi1,
+# phi2, s, sigma, then the scan slice [h1, h2, eps_3..T].
+function _tuple_carry_oracle(u, y)
+    T = length(y)
+    a, phi1, phi2 = u[1], u[2], u[3]
+    s, sigma = exp(u[4]), exp(u[5])
+    z = u[6:end]
+    h = zeros(T)
+    lvl = zeros(T)
+    h[1], h[2] = z[1], z[2]
+    lvl[2] = h[2]
+    for t in 3:T
+        h[t] = phi1 * h[t - 1] + phi2 * h[t - 2] + s * z[t]
+        lvl[t] = lvl[t - 1] + h[t]
+    end
+    ll = sum(logpdf(Normal(a + lvl[t], sigma), y[t]) for t in 1:T)
+    pr = logpdf(Normal(0, 1), a) + logpdf(Normal(0, 0.5), phi1) +
+         logpdf(Normal(0, 0.5), phi2) + logpdf(Exponential(1), s) +
+         logpdf(Exponential(1), sigma) + sum(logpdf.(Normal(0, 1), z))
+    return ll + pr + u[4] + u[5]
+end
+
+@testset "scan: tuple carry end to end (lag 2, seeds, oracle + gradient)" begin
+    path = joinpath(_CORPUS_DIR, "38_scan_tuple_carry.jl")
+    ast, data = _load_corpus_case(path)
+    ydata = [0.4, -0.2, 0.9, 0.3, 1.2, 0.8]
+    plan = bind_data(lower_rkppl(ast, data),
+        Dict{Symbol,AbstractVector}(:y => ydata))
+    sc = only(plan.scans)
+    @test sc.states == [:h, :level]
+    @test only(plan.predictors).terms[2].options ==
+        (scan_id = :level, coef = nothing)
+    built = build_kernel(plan)
+    z = only(e for e in built.layout.entries if e.kind === :scan)
+    @test z.name === :_ppl_scan_z_h
+    @test z.size == length(ydata)          # 2 seeds + (T - 2) innovations
+    @test built.layout.total == 5 + length(ydata)
+    for u in (collect(range(-0.5, 0.6; length = 11)),
+              [0.2, 0.4, -0.3, -0.6, 0.1, 0.5, -0.2, 0.3, 0.0, -0.4, 0.7])
+        @test _query(built.spec, plan, :posterior, u) ≈
+            _tuple_carry_oracle(u, ydata)
+        _check_gradient(built.spec, plan, u)
+    end
+end
+
+@testset "scan: two innovations, a step local, a parameter seed" begin
+    m = @rkppl begin
+        h0 ~ Normal(0, 1)
+        phi ~ Normal(0, 0.5)
+        s1 ~ Exponential(1)
+        s2 ~ Exponential(1)
+        sigma ~ Exponential(1)
+        @scan begin
+            h[1] = h0
+            for t in 2:T
+                e1 ~ Normal(0, 1)
+                e2 ~ Cauchy(0, 1)
+                drift = phi * h[t - 1]
+                h[t] = drift + s1 * e1 + s2 * e2
+            end
+        end
+        y .~ Normal.(h, sigma)
+    end
+    ydata = [0.1, 0.5, -0.2, 0.3]
+    plan = m(; y = ydata)
+    built = build_kernel(plan)
+    T = length(ydata)
+    z = only(e for e in built.layout.entries if e.kind === :scan)
+    @test z.size == 2 * (T - 1)           # no sampled seed; e1 block, e2 block
+    function oracle(u)
+        nt = constrain(built.layout, u)
+        e1 = nt._ppl_scan_z_h[1:(T - 1)]
+        e2 = nt._ppl_scan_z_h[T:end]
+        h = zeros(T)
+        h[1] = nt.h0
+        for t in 2:T
+            h[t] = nt.phi * h[t - 1] + nt.s1 * e1[t - 1] + nt.s2 * e2[t - 1]
+        end
+        ll = sum(logpdf(Normal(h[t], nt.sigma), ydata[t]) for t in 1:T)
+        pr = logpdf(Normal(0, 1), nt.h0) + logpdf(Normal(0, 0.5), nt.phi) +
+             logpdf(Exponential(1), nt.s1) + logpdf(Exponential(1), nt.s2) +
+             logpdf(Exponential(1), nt.sigma) +
+             sum(logpdf.(Normal(0, 1), e1)) + sum(logpdf.(Cauchy(0, 1), e2))
+        return ll + pr + logjac(built.layout, u)
+    end
+    n = built.layout.total
+    for u in (collect(range(-0.4, 0.5; length = n)),
+              collect(range(0.6, -0.3; length = n)))
+        @test _query(built.spec, plan, :posterior, u) ≈ oracle(u)
+        _check_gradient(built.spec, plan, u)
+    end
 end

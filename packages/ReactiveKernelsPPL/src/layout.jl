@@ -354,20 +354,31 @@ function assign_layout(plan::StructuralPlan)
     # Sequential-recurrence latents: one identity array slice per scan. The
     # length T is the loop bound — a literal Int, or `n_obs` when the bound is a
     # data length name (the canonical observation-indexed state-space case).
-    # v1 latents have real support (identity transform ⇒ no Jacobian). A
+    # Scan latents have real support (identity transform ⇒ no Jacobian). A
     # centered slice holds the carried state itself; a non-centered slice
-    # holds the iid innovations under the `_ppl_scan_z_<state>` name while
-    # the state name binds the emitter's `scan(...)` reconstruction.
+    # (`_ppl_scan_z_<first state>`) holds the sampled seeds in setup order,
+    # then each innovation local's `T - m` per-step values in body order,
+    # while the state names bind the emitter's `scan(...)` reconstruction. A
+    # non-centered scan with no sampled seed and no innovation (a fully
+    # deterministic recurrence) has no slice.
     for s in plan.scans
-        T = s.hi isa Int ? s.hi : plan.n_obs
+        T = _scan_length(plan, s)
         T >= s.lo || throw(ContractValidationError(
-            "[layout] scan $(s.state) length $(T) < loop start $(s.lo) — " *
-            "the recurrence must run at least once"))
-        labels = Symbol[Symbol(i) for i in 1:T]
-        nm = _is_noncentered_scan(s) ? _scan_innovation_name(s) : s.state
-        push!(entries,
-            LayoutEntry(:scan, nothing, nm, labels, offset, T, :identity))
-        offset += T
+            "[layout] scan $(join(s.states, ", ")) length $(T) < loop start " *
+            "$(s.lo) — the recurrence must run at least once"))
+        if _is_noncentered_scan(s)
+            n = _scan_latent_size(s, T)
+            n == 0 && continue
+            push!(entries, LayoutEntry(:scan, nothing, _scan_innovation_name(s),
+                Symbol[Symbol(i) for i in 1:n], offset, n, :identity))
+            offset += n
+        else
+            gap = _scan_shape_gap(s)
+            gap === nothing || throw(ContractValidationError("[layout] " * gap))
+            push!(entries, LayoutEntry(:scan, nothing, only(s.states),
+                Symbol[Symbol(i) for i in 1:T], offset, T, :identity))
+            offset += T
+        end
     end
     # HSGP bases in plan order, SB `_sb_hsgp` declaration order per basis
     # (rho, sigma, beta): length scales as `:sampled` scalars on the

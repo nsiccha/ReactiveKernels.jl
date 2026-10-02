@@ -151,7 +151,8 @@ end
 as the whole linear predictor (`lp = theta`, identity design) — the
 random-effects / per-observation-latent location. `ScanSummandTerm` splices a
 sequential-recurrence state into the predictor scaled by a sampled scalar
-coefficient (`u .* beta`, SB's `ar` latent path with its free `popefs` beta).
+coefficient (`u .* beta`, SB's `ar` latent path with its free `popefs` beta), or
+unscaled when its `coef` is `nothing` (`mu = a .+ x`).
 `DarSummandTerm` splices a differenced-AR(1) trajectory state into the
 predictor UNSCALED (SB's `dar` zero-started integrated path; the formula
 intercept is the initial level, so no coefficient is identified)."""
@@ -1512,13 +1513,27 @@ end
 VectorAssignmentSpec(name::Symbol, expr::Union{Expr,Symbol}) =
     VectorAssignmentSpec(name, expr, name)
 
-"""One literal-index seed fill of a `@scan` carried array: `state[index] ~ Dist(args…)`.
-`family` is an internal family symbol (see the surface's `_PARAM_FAMILIES`); `args`
-are the positional distribution-argument expressions (literals in a seed fill)."""
+"""
+    ScanSetup(target, index, kind, family, args, expr)
+
+One literal-index seed fill of a `@scan` carried array `target`, mirroring
+[`ScanStep`](@ref):
+
+- `kind === :sample` — `target[index] ~ Dist(args…)`: a sampled seed.
+  `family` is an internal family symbol (see the surface's
+  `_PARAM_FAMILIES`), `args` the positional distribution-argument
+  expressions; `expr` is `nothing`.
+- `kind === :assign` — `target[index] = expr`: a deterministic seed (a
+  literal, or an expression over scalar parameters, definitions and earlier
+  seeds). `family`/`args` are `nothing`.
+"""
 struct ScanSetup
+    target::Symbol
     index::Int
-    family::Symbol
-    args::Vector{Any}
+    kind::Symbol
+    family::Union{Symbol,Nothing}
+    args::Union{Vector{Any},Nothing}
+    expr::Any
 end
 
 """
@@ -1526,13 +1541,17 @@ end
 
 One `@scan` recurrence-body statement.
 
-- `kind === :sample` — a `~` statement: the carried array at the loop index
-  (`indexed = true`, `target === state`, centered form) or a fresh per-step local
-  innovation (`indexed = false`, non-centered form). `family`/`args` describe the
-  distribution; `expr` is `nothing`.
-- `kind === :assign` — a `=` statement: the carried array's deterministic write
+- `kind === :sample` — a `~` statement: a carried array at the loop index
+  (`indexed = true`, `target` one of the scan's `states`, centered form) or a
+  fresh per-step local innovation (`indexed = false`, non-centered form).
+  `family`/`args` describe the distribution; `expr` is `nothing`.
+- `kind === :assign` — a `=` statement: a carried array's deterministic write
   (`indexed = true`) or a per-step deterministic local (`indexed = false`).
   `expr` is the RHS AST; `family`/`args` are `nothing`.
+
+Statements run in order, as in a Julia loop body: a step reads a carried
+array's backward lags `a[t - k]`, its current value `a[t]` once an earlier
+step wrote it, and locals defined by earlier steps.
 """
 struct ScanStep
     kind::Symbol
@@ -1544,17 +1563,19 @@ struct ScanStep
 end
 
 """
-    ScanSpec(state, loopvar, lo, hi, setup, step, maxlag, label)
+    ScanSpec(states, loopvar, lo, hi, setup, step, maxlag, label)
 
 One sequential recurrence (`@scan begin <setup>; for loopvar in lo:hi … end end`):
-the carried array `state`, the loop variable and range `lo:hi` (`hi` a literal `Int`
-or a data length `Symbol`), the ordered `setup` seed fills, the ordered recurrence
-`step`s, and the maximum backward lag read. `state` is the plan-level latent the
-recurrence produces (the value visible after the block); the per-step locals and
-`loopvar` are scoped to the recurrence and never enter the plan name table.
+the carried arrays `states` (in first-seed order; one or more — a tuple
+carry), the loop variable and range `lo:hi` (`hi` a literal `Int` or a data
+length `Symbol`), the ordered `setup` seed fills (every carried array seeded at
+`1:lo-1`), the ordered recurrence `step`s, and the maximum backward lag read.
+Each carried array is a plan-level latent the recurrence produces (the value
+visible after the block); the per-step locals and `loopvar` are scoped to the
+recurrence and never enter the plan name table.
 """
 struct ScanSpec
-    state::Symbol
+    states::Vector{Symbol}
     loopvar::Symbol
     lo::Int
     hi::Union{Symbol,Int}
@@ -1570,10 +1591,10 @@ end
 One differenced-AR(1) trajectory (SB `_sb_dar1`'s `differenced_ar1_path`):
 the zero-started integrated path `x[t+1] = x[t] + d[t]` over the AR(1)
 increments `d[t] = beta*d[t-1] + sigma*z[t]` (`d[0] = 0`, `x[1] = 0`).
-`beta`/`sigma` name the persistence (`Normal` on `(:interval_stan, 0, 1)`,
-Stan two-sided-bound kernel semantics, unnormalized) and
-innovation-scale (`Normal` on `:positive_stan`, Stan lower-bound kernel
-semantics, unnormalized) [`SampledParameter`](@ref)s;
+`beta`/`sigma` name the persistence (`Normal` truncated to `(:interval, 0,
+1)`) and innovation-scale (half-Normal, `Normal` on `:positive`)
+[`SampledParameter`](@ref)s, each with Distributions semantics (the
+truncation normalizers stay);
 the `z` innovations (length `n_obs - 1`) are owned internally under the
 reserved `_ppl_dar_z_<state>` name, like a non-centered scan's
 `_ppl_scan_z_<state>` slice. The path length is `n_obs` by construction
@@ -2266,6 +2287,13 @@ const ELEMENTWISE_COMPARISONS = (:.==, :.!=, :.<, :.>, :.<=, :.>=)
 plus two-argument `logaddexp` for occupancy marginalization)."""
 const ELEMENTWISE_FNS =
     (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :logaddexp)
+
+"""Operand count of a built-in elementwise map (`ifelse.(c, x, y)`,
+`logaddexp.(a, b)`; every other one takes one)."""
+const ELEMENTWISE_FN_ARITY = Dict{Symbol,Int}(:ifelse => 3, :logaddexp => 2)
+_elementwise_arity(f::Symbol) = get(ELEMENTWISE_FN_ARITY, f, 1)
+_operands_phrase(n::Int) = ("one", "two", "three")[n] *
+    (n == 1 ? " operand" : " operands")
 
 """Families the thin layer can lower (ext handshake predicate)."""
 admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
@@ -4967,7 +4995,7 @@ function _validate_name_tables(plan::StructuralPlan)
     assigns = [a.name for a in plan.assignments]
     deriveds = [d.name for d in plan.derived]
     plates = [p.name for p in plan.plate_parameters]
-    scanstates = [s.state for s in plan.scans]
+    scanstates = Symbol[st for s in plan.scans for st in s.states]
     darstates = [s.state for s in plan.dar_paths]
     vectors = [p.name for p in plan.vector_parameters]
     svec = [v.name for v in plan.spline_vectors]
@@ -5111,38 +5139,73 @@ function _validate_name_tables(plan::StructuralPlan)
     return nothing
 end
 
-# A scan is non-centered when a step writes the carried state deterministically
-# (`state[loopvar] = ...`): the layout slice then holds the iid innovations
-# and the emitter reconstructs the state via the RK-core `scan(...)`
-# carry-fold. Otherwise (every step samples the state) the slice holds the
-# state itself (centered form).
+# A scan is non-centered when a step writes a carried array
+# deterministically (`state[loopvar] = ...`): the layout slice then holds the
+# sampled seeds and the per-step innovations, and the emitter reconstructs
+# every carried array via the RK-core `scan(...)` carry-fold. Otherwise
+# (every carried write samples) the slice holds the state itself (centered
+# form). A scan mixing both kinds of carried write is a non-centered scan the
+# emitter refuses (not built yet).
 _is_noncentered_scan(s::ScanSpec) =
     any(st -> st.kind === :assign && st.indexed, s.step)
 
-# In-graph name of a non-centered scan's innovation slice
-# (`_ppl_scan_z_<state>`). Reserved-prefix validation guarantees no user
-# name collides with it; the state name itself binds the reconstruction.
-_scan_innovation_name(s::ScanSpec) = Symbol(:_ppl_scan_z_, s.state)
+# A scan's trajectory length T: the literal loop bound, or `n_obs` when the
+# bound is a data length name.
+_scan_length(plan::StructuralPlan, s::ScanSpec) =
+    s.hi isa Int ? s.hi : plan.n_obs
+
+# A non-centered scan's latent slice length: one coordinate per sampled seed,
+# plus `T - m` per innovation local (one per loop iteration).
+_scan_latent_size(s::ScanSpec, T::Int) =
+    count(f -> f.kind === :sample, s.setup) +
+    count(st -> st.kind === :sample && !st.indexed, s.step) * (T - (s.lo - 1))
+
+# In-graph name of a non-centered scan's latent slice
+# (`_ppl_scan_z_<first state>`). Reserved-prefix validation guarantees no
+# user name collides with it; the state names themselves bind the
+# reconstruction.
+_scan_innovation_name(s::ScanSpec) = Symbol(:_ppl_scan_z_, first(s.states))
 
 # Structural invariants of each sequential recurrence. The surface parser
 # (`parse_scan_block`) already enforces these; this is defense-in-depth for a
 # hand-built plan and the invariants the layout/emitter will rely on.
 function _validate_scans(plan::StructuralPlan)
     for s in plan.scans
-        s.lo == length(s.setup) + 1 || _fail(s.label,
-            "scan loop start $(s.lo) must be one past the $(length(s.setup)) " *
-            "seed fill(s)")
-        for (k, f) in enumerate(s.setup)
-            f.index == k || _fail(s.label,
-                "scan seed fills must be contiguous 1..$(length(s.setup)); " *
-                "entry $k has index $(f.index)")
+        isempty(s.states) && _fail(s.label, "a scan carries no array")
+        length(unique(s.states)) == length(s.states) || _fail(s.label,
+            "scan carried arrays $(s.states) repeat a name")
+        m = s.lo - 1
+        m >= 1 || _fail(s.label,
+            "scan loop start $(s.lo) leaves no seed fill (start at 2 or later)")
+        for a in s.states
+            idx = [f.index for f in s.setup if f.target === a]
+            idx == collect(1:m) || _fail(s.label,
+                "scan carried array $a must be seeded at 1..$m in order " *
+                "(the loop starts at $(s.lo)), got seed indices $idx")
+        end
+        for f in s.setup
+            f.target in s.states || _fail(s.label,
+                "scan seed fill targets $(f.target), which is not a carried " *
+                "array of the scan $(s.states)")
+            f.kind in (:sample, :assign) || _fail(s.label,
+                "scan seed fill kind must be :sample or :assign, got " *
+                "$(repr(f.kind))")
         end
         s.maxlag >= 1 || _fail(s.label,
-            "a scan must read a backward lag of its carried state (maxlag ≥ 1)")
-        length(s.setup) >= s.maxlag || _fail(s.label,
-            "scan maxlag $(s.maxlag) exceeds the $(length(s.setup)) seeded value(s)")
-        any(st -> st.indexed, s.step) || _fail(s.label,
-            "scan recurrence never writes its carried state $(s.state)")
+            "a scan must read a backward lag of a carried array (maxlag ≥ 1)")
+        m >= s.maxlag || _fail(s.label,
+            "scan maxlag $(s.maxlag) exceeds the $m seeded value(s) per array")
+        for a in s.states
+            n = count(st -> st.indexed && st.target === a, s.step)
+            n == 1 || _fail(s.label,
+                "scan recurrence must write its carried array $a exactly " *
+                "once per step, got $n write(s)")
+        end
+        for st in s.step
+            st.indexed && !(st.target in s.states) && _fail(s.label,
+                "scan step writes $(st.target)[$(s.loopvar)], which is not a " *
+                "carried array of the scan $(s.states)")
+        end
         (s.hi isa Int || s.hi isa Symbol) || _fail(s.label,
             "scan loop bound must be a literal Int or a data length Symbol, " *
             "got $(repr(s.hi))")
@@ -5157,14 +5220,14 @@ end
 _dar_innovation_name(s::DarSpec) = Symbol(:_ppl_dar_z_, s.state)
 
 # Structural invariants of each differenced-AR(1) trajectory: the
-# persistence names a `Normal` sampled parameter on exactly
-# `(:interval_stan, 0, 1)` (SB's `beta ~ normal(0.5, 0.2; lower=0,
-# upper=1)`, unnormalized — Stan never renormalizes bounds; overrides
-# ride the same spelling with new location/scale) and the scale names a
-# `Normal` sampled parameter on `:positive_stan` (SB's `sigma ~
-# normal(0, 0.2; lower=0)`, unnormalized). The `n_obs ≥ 2` length gate
-# lives in the layout (unbound surface plans carry `n_obs = 0`, like a
-# scan's symbolic `hi` — lengths resolve at bind).
+# persistence names a `Normal` sampled parameter truncated to exactly
+# `(:interval, 0, 1)` (`beta ~ truncated(Normal(0.5, 0.2), 0, 1)`; other
+# location/scale ride the same spelling) and the scale names a `Normal`
+# sampled parameter on `:positive` (`sigma ~ HalfNormal(0.2)`). Both keep
+# Distributions semantics — the truncation normalizers stay (user decision
+# `0m1j3iz`, prong `dar-kernel`). The `n_obs ≥ 2` length gate lives in the
+# layout (unbound surface plans carry `n_obs = 0`, like a scan's symbolic
+# `hi` — lengths resolve at bind).
 function _validate_dar_paths(plan::StructuralPlan)
     for s in plan.dar_paths
         s.beta === s.sigma && _fail(s.label,
@@ -5175,22 +5238,21 @@ function _validate_dar_paths(plan::StructuralPlan)
             "dar persistence :$(s.beta) must name a scalar sampled " *
             "parameter (`$(s.beta) ~ truncated(Normal(0.5, 0.2), 0, 1)`)")
         b = plan.parameters[i]
-        (b.family === :normal && b.support_override == (:interval_stan, 0.0, 1.0)) ||
+        (b.family === :normal && b.support_override == (:interval, 0.0, 1.0)) ||
             _fail(s.label,
-                "dar persistence :$(s.beta) must be Normal on exactly " *
-                "(:interval_stan, 0, 1) (SB's `beta ~ normal(0.5, 0.2; " *
-                "lower=0, upper=1)`, unnormalized), got :$(b.family) on " *
-                "$(repr(b.support_override))")
+                "dar persistence :$(s.beta) must be a Normal truncated to " *
+                "exactly (:interval, 0, 1) (`truncated(Normal(0.5, 0.2), 0, " *
+                "1)`), got :$(b.family) on $(repr(b.support_override))")
         j = findfirst(p -> p.name === s.sigma, plan.parameters)
         j === nothing && _fail(s.label,
             "dar scale :$(s.sigma) must name a scalar sampled parameter " *
             "(`$(s.sigma) ~ HalfNormal(0.2)`)")
         sg = plan.parameters[j]
-        (sg.family === :normal && sg.support_override === :positive_stan) ||
+        (sg.family === :normal && sg.support_override === :positive) ||
             _fail(s.label,
-                "dar scale :$(s.sigma) must be Normal on :positive_stan " *
-                "(SB's `sigma ~ normal(0, 0.2; lower=0)`, unnormalized), " *
-                "got :$(sg.family) on $(repr(sg.support_override))")
+                "dar scale :$(s.sigma) must be a half-Normal on :positive " *
+                "(`HalfNormal(0.2)`), got :$(sg.family) on " *
+                "$(repr(sg.support_override))")
     end
     return nothing
 end
@@ -5663,13 +5725,9 @@ function _collect_vector_dot!(refs, ex, plan, label, bound::Bool)
         "Julia functions are planned (no-@deffun-ceremony direction) but " *
         "need IR/contract growth",
     )
-    if f === :logaddexp
-        length(args) == 2 ||
-            _fail(label, "`logaddexp.` takes exactly two arguments")
-    else
-        length(args) == 1 ||
-            _fail(label, "`$f.` takes exactly one argument")
-    end
+    length(args) == _elementwise_arity(f) || _fail(label, "`$f.` takes " *
+        "exactly $(_elementwise_arity(f) == 2 ? "two arguments" :
+            "one argument")")
     _check_numeric_position!(args, plan, label, bound)
     for arg in args
         _collect_vector_refs!(refs, arg, plan, label, bound)
@@ -6216,7 +6274,7 @@ function _validate_matrices(plan::StructuralPlan)
             _is_plate_param(plan, c) && _fail(m.label,
                 "design matrix $(m.name) over the latent vector $c is not " *
                 "in slice D1 (the me mirror stays affine)")
-            any(s -> s.state === c, plan.scans) && _fail(m.label,
+            any(s -> c in s.states, plan.scans) && _fail(m.label,
                 "design matrix $(m.name) over scan state $c is not in " *
                 "slice D1 (data/derived columns only)")
             any(p -> p.name === c, plan.parameters) && _fail(m.label,
@@ -6432,12 +6490,14 @@ function _validate_hsgp_term(t::TermSpec, pred::PredictorSpec)
     return nothing
 end
 
-# A scan summand names its recurrence (`scan_id`) and its sampled scalar
-# coefficient (`coef`) in `options` and carries no columns (the state is
-# sampled, not data); its addressee is its own label (self-addressed: the
-# coefficient's prior lives on the `SampledParameter`, not a population
-# prior). v1 admits Normal coefficients only (SB's `ar` beta is a Normal
-# `popefs` coefficient); centered and non-centered states both read.
+# A scan summand names its carried array (`scan_id`) and its coefficient
+# (`coef`) in `options` and carries no columns (the state is sampled or
+# reconstructed, not data); its addressee is its own label (self-addressed:
+# the coefficient's prior lives on the `SampledParameter`, not a population
+# prior). `coef` is a sampled scalar (SB's `ar` latent path with its free
+# beta; v1 admits Normal coefficients only) or `nothing` — the state spliced
+# directly, beta-free (`mu = a .+ x`, the dar/`mo1` shape). Centered and
+# non-centered states both read.
 function _validate_scan_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
     o = t.options
     Tuple(keys(o)) == (:scan_id, :coef) ||
@@ -6446,18 +6506,19 @@ function _validate_scan_term(t::TermSpec, pred::PredictorSpec, plan::StructuralP
     o.scan_id isa Symbol ||
         _fail(t.label, "scan summand scan_id must be a Symbol, " *
               "got $(repr(o.scan_id))")
-    o.coef isa Symbol ||
-        _fail(t.label, "scan summand coef must be a Symbol, " *
-              "got $(repr(o.coef))")
+    (o.coef === nothing || o.coef isa Symbol) ||
+        _fail(t.label, "scan summand coef must be a Symbol or nothing " *
+              "(a beta-free splice), got $(repr(o.coef))")
     isempty(t.columns) ||
         _fail(t.label, "scan summand carries no columns (the state is " *
               "sampled, not data), got $(t.columns)")
     t.addressee === t.label ||
         _fail(t.label, "scan summand addressee must be its own label " *
               "(self-addressed, no population prior), got $(t.addressee)")
-    any(s -> s.state === o.scan_id, plan.scans) ||
+    any(s -> o.scan_id in s.states, plan.scans) ||
         _fail(t.label, "scan summand addresses unknown scan state " *
-              ":$(o.scan_id) (no such `@scan` block)")
+              ":$(o.scan_id) (no such `@scan` carried array)")
+    o.coef === nothing && return nothing
     i = findfirst(p -> p.name === o.coef, plan.parameters)
     i === nothing &&
         _fail(t.label, "scan summand coef :$(o.coef) must name a scalar " *
@@ -6499,16 +6560,29 @@ end
 const _COMPOSED_OPS = (:.*, :.+, :.-)
 # Elementwise unary maps admitted over a composed subtree (`exp.(la)` —
 # the IRT discrimination `a = exp(log_a)`; `logistic.(xi)` — sigmoid
-# transient/saturating curves), spelled as Julia dotted calls.
+# transient/saturating curves), spelled as Julia dotted calls. At a
+# location, one of these over ONE bare sub-predictor is a link spelling.
 const _COMPOSED_UNARY = (:exp, :logistic)
+# The other dotted operators (`mu ./ s`, `mu .^ 2`, comparisons for
+# `ifelse.`): plain broadcast math over the LP nodes.
+const _COMPOSED_MORE_OPS = Tuple(op for op in ELEMENTWISE_OPS
+    if op ∉ _COMPOSED_OPS)
+# Every elementwise map a composed tree admits: the link-shaped unary
+# maps, the dotted built-in math functions, `ifelse.`, and any dotted
+# function visible in the model module (a `GlobalRef` head after
+# resolution — functions as values: `hypot.(s1, mu .* s2)`).
+_composed_map_fn(f) = f isa GlobalRef || f === :ifelse ||
+    f in _COMPOSED_UNARY || f in ELEMENTWISE_FNS
 const _COMPOSED_AFFINE_KINDS =
     (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
 # Sub-predictors are affine plus varying-effect summands (per-level
 # random effects: the IRT person ability `theta ~ 0 + (1 | person)`).
 const _COMPOSED_SUB_KINDS = (_COMPOSED_AFFINE_KINDS..., VaryingEffectTerm)
 
-"""Recurse a composed tree: leaves must be declared subs/scalars, nodes
-dotted `.*`/`.+`/`.−` of matching arity. Returns the leaf set."""
+"""Recurse a composed tree: leaves must be declared subs/scalars/data
+columns (a literal arrives as a named scalar leaf), nodes dotted
+operators of matching arity or admitted elementwise maps
+(`_composed_map_fn`). Returns the leaf set."""
 function _validate_composed_tree(tree, subs::Vector{Symbol},
         scalars::Vector{Symbol}, label::Symbol,
         datas::Vector{Symbol} = Symbol[])
@@ -6525,22 +6599,26 @@ function _validate_composed_tree(tree, subs::Vector{Symbol},
         end
         if node isa Expr && node.head === :. && length(node.args) == 2
             f, tup = node.args
-            f in _COMPOSED_UNARY || _fail(label,
-                "composed tree map $(repr(f)). is not admitted (v2: " *
-                "$(join(string.(_COMPOSED_UNARY, "."), ", ")))")
-            Meta.isexpr(tup, :tuple, 1) || _fail(label,
-                "composed tree map $f. takes one operand, got " *
-                "$(repr(node))")
-            walk(only(tup.args))
+            _composed_map_fn(f) || _fail(label,
+                "composed tree map $(repr(f)). is not admitted (" *
+                "$(join(string.(_COMPOSED_UNARY, "."), ", ")), the dotted " *
+                "built-in math functions, `ifelse.`, or a module function)")
+            Meta.isexpr(tup, :tuple) && !isempty(tup.args) || _fail(label,
+                "composed tree map $f. takes operands, got $(repr(node))")
+            f isa Symbol && length(tup.args) != _elementwise_arity(f) &&
+                _fail(label, "composed tree map $f. takes " *
+                    "$(_operands_phrase(_elementwise_arity(f))), got " *
+                    "$(repr(node))")
+            foreach(walk, tup.args)
             return nothing
         end
         node isa Expr && node.head === :call && !isempty(node.args) &&
             node.args[1] isa Symbol || _fail(label,
                 "composed tree node $(repr(node)) is not a dotted call " *
-                "(v1: `. .*`/`.+`/`.−` over sub-predictors and scalars)")
+                "(dotted operators and maps over sub-predictors and scalars)")
         op = node.args[1]
-        op in _COMPOSED_OPS || _fail(label,
-            "composed tree op $op is not admitted (v1: `. .*`, `.+`, `.−`)")
+        op in _COMPOSED_OPS || op in _COMPOSED_MORE_OPS || _fail(label,
+            "composed tree op $op is not admitted (dotted operators only)")
         args = node.args[2:end]
         if op === :.-
             length(args) == 1 || length(args) == 2 ||
@@ -8086,7 +8164,7 @@ function _validate_responses(plan::StructuralPlan)
             "response label collides with a canonical node",
         )
     end
-    scan_states = Set{Symbol}(s.state for s in plan.scans)
+    scan_states = Set{Symbol}(st for s in plan.scans for st in s.states)
     used_predictors = Set{Symbol}()
     for r in plan.responses
         _validate_mi_structure(r, plan)
@@ -10043,8 +10121,12 @@ end
 
 # Drop from `out` every Symbol `x` holds, at any depth.
 _drop_held_names!(out::Set{Symbol}, x::Symbol) = (delete!(out, x); nothing)
+# A `GlobalRef` names a module function (a composed tree's dotted map),
+# never a model name; its binding is cyclic, so the struct walk below
+# must not enter it.
 _drop_held_names!(::Set{Symbol},
-    ::Union{Number,AbstractString,Function,Module,Type,AbstractArray{<:Number}}) =
+    ::Union{Number,AbstractString,Function,Module,Type,GlobalRef,
+        AbstractArray{<:Number}}) =
     nothing
 function _drop_held_names!(out::Set{Symbol},
         x::Union{AbstractArray,Tuple,NamedTuple,AbstractSet})
