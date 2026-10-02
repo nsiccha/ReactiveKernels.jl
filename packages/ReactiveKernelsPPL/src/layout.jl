@@ -973,6 +973,8 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, e.name => Vector{Float64}(seg))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
+        elseif e.kind === :array && _is_slice_transform(e.transform)
+            push!(pairs, e.name => _array_slices_constrain(e, seg))
         elseif e.kind === :array
             v = [_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name =>
@@ -1132,6 +1134,11 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             size(v) == Tuple(e.dims) || throw(ContractValidationError(
                 "[layout] array parameter $(e.name) has size $(size(v)), " *
                 "want $(Tuple(e.dims))"))
+            if _is_slice_transform(e.transform)
+                u[e.offset:(e.offset + e.size - 1)] .=
+                    _array_slices_unconstrain(e, v)
+                continue
+            end
             for (k, x) in enumerate(vec(v))
                 u[e.offset + k - 1] = _unconstrain_elt(e, Float64(x))
             end
@@ -1184,6 +1191,11 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             # Vector Jacobians couple coordinates (ordered sums, simplex
             # stick-breaking) — entry-level, never per-coordinate.
             total += _vector_logjac(e, seg)
+            continue
+        end
+        if e.kind === :array && _is_slice_transform(e.transform)
+            # Per slice, the same coupling (simplex / ordered slices).
+            total += _array_slices_logjac(e, seg)
             continue
         end
         if e.kind === :varying_corr || e.kind === :cholesky_corr

@@ -157,3 +157,84 @@ end
     @test occursin("scan.md", sprint(showerror, err))
     @test !occursin("issues/13", sprint(showerror, err))
 end
+
+# Multivariate slice priors (`mv_slices.jl`) under Reactant: simplex and
+# ordered slices are whole-array broadcasts and reductions, so they
+# compile with primal + compiled-gradient parity; multivariate normal
+# slices run their forward substitution as a native row loop.
+module RJSliceModels
+colsums(B) = vec(sum(B; dims = 1))
+end
+
+function _rj_slices_bound(prog)
+    plan = lower_rkppl(prog, (:y, :k); mod = RJSliceModels)
+    return bind_data(plan, Dict{Symbol,AbstractVector}(
+        :y => [0.3, -1.2, 2.1, 0.7, -0.4, 1.5, 0.2, -0.8],
+        :k => [1, 2, 3, 1, 2, 3, 1, 2]))
+end
+
+function _rj_slices_measure(built, bound, post_q, u)
+    native = post_q(u)
+    compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
+    primal = Float64(compiled(Reactant.to_rarray(u)))
+    q = prepare_sampler(built, bound, u; backend = _RJ_BACKEND)
+    g = similar(u)
+    sampler_value_and_gradient!(q, g, u)
+    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
+    rval, rgrad = cad(Reactant.to_rarray(u))
+    return (; native, primal, g, rval = Float64(rval), rgrad = Array(rgrad))
+end
+
+function _rj_slices_check(prog)
+    bound = _rj_slices_bound(prog)
+    built = build_kernel(bound)
+    post_q = prepare_query(built, bound, :sampler)
+    u = [0.37 * sin(1.3 * i) - 0.2 for i in 1:built.layout.total]
+    return Base.invokelatest(_rj_slices_measure, built, bound, post_q, u)
+end
+
+@testset "Reactant: slice priors" begin
+    for prog in (
+            :(begin
+                s ~ Exponential(1)
+                eachrow(P[levels(k), 1:3]) .~ Dirichlet([1.0, 2.0, 3.0])
+                y .~ Normal.(P[k, 1] .+ P[k, 3], s)
+            end),
+            :(begin
+                s ~ Exponential(1)
+                A[levels(k), 1:3] .~ Exponential.(1)
+                eachrow(P[levels(k), 1:3]) .~ Dirichlet.(eachrow(A))
+                y .~ Normal.(P[k, 3], s)
+            end),
+            :(begin
+                s ~ Exponential(1)
+                m ~ Normal(0, 1)
+                eachcol(C[1:3, levels(k)]) .~ Ordered(Normal(m, 2), 3)
+                v = colsums(C)
+                y .~ Normal.(v[k], s)
+            end))
+        r = _rj_slices_check(prog)
+        @test r.primal ≈ r.native rtol = 1e-9
+        @test r.rval ≈ r.native rtol = 1e-9
+        @test r.rgrad ≈ r.g rtol = 1e-9
+    end
+    # Capability gap: multivariate normal slices run natively only (their
+    # density throws under tracing) — todo
+    # ReactiveKernels/todos/2026-10-02T09-46-03-194-1318xn3.
+    compiled_mvn = try
+        r = _rj_slices_check(:(begin
+            s ~ Exponential(1)
+            L ~ LKJCholesky(2, 2.0)
+            sd[1:2] .~ Exponential.(1)
+            F = sd .* L
+            eachrow(B[levels(k), 1:2]) .~ MvNormalCholesky(zeros(2), F)
+            y .~ Normal.(B[k, 1], s)
+        end))
+        isapprox(r.primal, r.native; rtol = 1e-9)
+    catch e
+        e isa ArgumentError && occursin("native execution only",
+            sprint(showerror, e)) || rethrow()
+        false
+    end
+    @test_broken compiled_mvn
+end

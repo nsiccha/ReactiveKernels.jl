@@ -26,7 +26,24 @@ function _array_param(plan::StructuralPlan, name::Symbol)
     return plan.array_parameters[i]
 end
 
-_is_structured_array(p::ArrayParameter) = p.family === :lkj_cholesky
+# Multivariate slice families (`mv_slices.jl`): family → (stem,
+# slices). `:rows` / `:cols` slice a two-axis array, `:vector` is a
+# one-axis array drawn once; simplex and ordered slices are two-axis only
+# (their one-vector forms are `phi ~ Dirichlet(alpha)`,
+# `c ~ Ordered(Normal(m, s), K)`).
+const _MV_SLICE_FAMILIES = Dict{Symbol,Tuple{Symbol,Symbol}}(
+    Symbol(stem, :_, sl) => (stem, sl)
+    for (stem, sls) in ((:mvnormal_cholesky, (:rows, :cols, :vector)),
+        (:mvnormal, (:rows, :cols, :vector)), (:dirichlet, (:rows, :cols)),
+        (:ordered_normal, (:rows, :cols)))
+    for sl in sls)
+
+_is_slice_array(p::ArrayParameter) = haskey(_MV_SLICE_FAMILIES, p.family)
+_slice_stem(p::ArrayParameter) = _MV_SLICE_FAMILIES[p.family][1]
+_slice_kind(p::ArrayParameter) = _MV_SLICE_FAMILIES[p.family][2]
+
+_is_structured_array(p::ArrayParameter) =
+    p.family === :lkj_cholesky || _is_slice_array(p)
 
 # The flat (column-major) packed vector an elementwise array constrains
 # into: the array's own name for one axis, a hygienic local reshaped into
@@ -140,6 +157,8 @@ function _validate_array_parameters(plan::StructuralPlan)
                 "positive literal, got $(repr(eta))")
             p.support_override === nothing || _fail(p.label,
                 "LKJCholesky factor $(p.name) carries no support override")
+        elseif _is_slice_array(p)
+            _validate_array_slices(plan, p)
         else
             haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
                 "array $(p.name) family $(p.family) unknown (admitted: " *
@@ -191,6 +210,10 @@ function _validate_array_parameters_data(plan::StructuralPlan)
                 "$(p.name) is not square: $(repr(dims))")
             continue
         end
+        if _is_slice_array(p)
+            _validate_array_slices_data(plan, p, dims)
+            continue
+        end
         _is_structured_array(p) && continue
         length(dims) == 1 || continue
         K = dims[1]
@@ -218,6 +241,144 @@ function _array_arg_length(plan::StructuralPlan, a)
         col isa AbstractVector || _fail(:plan, "prior argument $a is a " *
             "matrix column (per-element arguments are vectors)")
         return length(col)
+    end
+    return nothing
+end
+
+# ── multivariate slices ──────────────────────────────────────────────
+
+# `zeros(K)` / `fill(a, K)`: a literal-length constant vector (`fill` is
+# the symmetric `Dirichlet(K, a)` concentration).
+_is_zeros_call(a) = a isa Expr && a.head === :call && length(a.args) == 2 &&
+    a.args[1] === :zeros && a.args[2] isa Int && a.args[2] >= 1
+_is_fill_call(a) = a isa Expr && a.head === :call && length(a.args) == 3 &&
+    a.args[1] === :fill && a.args[3] isa Int && a.args[3] >= 1
+
+# The family argument roles of each slice stem, in positional-key order:
+# `:vector` (a K-vector, shared or per slice), `:matrix` (a shared K×K
+# matrix), `:scalar` (a shared scalar), `:count` (the literal slice
+# length).
+_slice_roles(::Val{:mvnormal_cholesky}) = (arg1 = :vector, arg2 = :matrix)
+_slice_roles(::Val{:mvnormal}) = (arg1 = :vector, arg2 = :matrix)
+_slice_roles(::Val{:dirichlet}) = (arg1 = :vector,)
+_slice_roles(::Val{:ordered_normal}) =
+    (arg1 = :scalar, arg2 = :scalar, arg3 = :count)
+_slice_roles(p::ArrayParameter) = _slice_roles(Val(_slice_stem(p)))
+
+_slice_noun(p::ArrayParameter) = _slice_kind(p) === :rows ? "rows" :
+    _slice_kind(p) === :cols ? "columns" : "draw"
+
+# A slice array's arguments are model-level values — literal vectors,
+# `zeros(K)` / `fill(a, K)`, array names or expressions over them, a
+# per-slice `eachrow(M)` / `eachcol(M)` of one — never per-observation
+# data or gathers.
+function _validate_array_slices(plan::StructuralPlan, p::ArrayParameter)
+    want = _slice_kind(p) === :vector ? 1 : 2
+    length(p.dims) == want || _fail(p.label, "array $(p.name) " *
+        "$(_slice_noun(p)) need $want axes, got $(length(p.dims))")
+    roles = _slice_roles(p)
+    keys(p.args) == keys(roles) || _fail(p.label, "array $(p.name) " *
+        "family $(p.family) takes keys $(keys(roles)), got " *
+        "$(Tuple(keys(p.args)))")
+    p.support_override === nothing || _fail(p.label, "array $(p.name) " *
+        "carries no support override")
+    for (k, a) in pairs(p.args)
+        role = roles[k]
+        if role === :count
+            a isa Int && a >= 1 || _fail(p.label, "array $(p.name): the " *
+                "slice length is a literal ≥ 1, got $(repr(a))")
+            continue
+        end
+        if _is_slice_iterator(a)
+            role === :vector && _slice_kind(p) !== :vector || _fail(p.label,
+                "array $(p.name): argument $k is shared by every slice, " *
+                "got the per-slice $(repr(a))")
+            a = a.args[2]
+        end
+        if a isa Real || a isa Bool
+            role === :scalar && !(a isa Bool) && isfinite(a) ||
+                _fail(p.label, "array $(p.name): argument $k is a " *
+                    "$role, got the scalar $(repr(a))")
+            continue
+        end
+        if _is_zeros_call(a) || _is_fill_call(a)
+            role === :vector || _fail(p.label, "array $(p.name): " *
+                "argument $k is a $role, got the vector $(repr(a))")
+            _is_fill_call(a) && !(a.args[2] isa Real) &&
+                _collect_array_value_refs!(Symbol[], a.args[2], plan,
+                    p.label, isbound(plan))
+            continue
+        end
+        if a isa Expr && a.head === :vect
+            role === :vector || _fail(p.label, "array $(p.name): argument " *
+                "$k is a $role, got the vector $(repr(a))")
+            all(x -> x isa Real && !(x isa Bool) && isfinite(x), a.args) ||
+                _fail(p.label, "array $(p.name): a literal vector holds " *
+                    "finite numbers, got $(repr(a))")
+            continue
+        end
+        a isa Symbol && a === p.name && _fail(p.label, "array $(p.name) " *
+            "cannot parameterize its own prior")
+        _collect_array_value_refs!(Symbol[], a, plan, p.label,
+            isbound(plan))
+    end
+    if _slice_stem(p) === :dirichlet
+        alpha = p.args.arg1
+        lits = alpha isa Expr && alpha.head === :vect ? alpha.args :
+            _is_fill_call(alpha) && alpha.args[2] isa Real ? [alpha.args[2]] :
+            Any[]
+        all(x -> x > 0, lits) || _fail(p.label, "array $(p.name): Dirichlet " *
+            "concentrations are positive, got $(repr(alpha))")
+    end
+    if _slice_stem(p) === :ordered_normal
+        sd = p.args.arg2
+        sd isa Real && !(sd > 0) && _fail(p.label, "array $(p.name): the " *
+            "`Normal` scale is positive, got $(repr(sd))")
+    end
+    return nothing
+end
+
+# Statically known size of a slice argument (`nothing` when only known
+# at run time): literal vectors, `zeros(K)` / `fill(a, K)`, declared
+# arrays, bound data values.
+function _slice_arg_size(plan::StructuralPlan, a)
+    a isa Expr && a.head === :vect && return (length(a.args),)
+    _is_zeros_call(a) && return (a.args[2],)
+    _is_fill_call(a) && return (a.args[3],)
+    _is_array_param(plan, a) &&
+        return Tuple(_array_dims(plan, _array_param(plan, a)))
+    a isa Symbol && haskey(plan.columns, a) && return size(plan.columns[a])
+    return nothing
+end
+
+# Statically known shapes must agree with the slices: slice length K,
+# slice count G (`eachrow`: dims = (G, K); `eachcol`: (K, G); a vector:
+# (K,), G = 1). A shared vector argument has size (K,), a per-slice
+# `eachrow(M)` (G, K) and `eachcol(M)` (K, G), a matrix (K, K), the
+# `Ordered` length K. Computed values are checked when the density runs.
+function _validate_array_slices_data(plan::StructuralPlan, p::ArrayParameter,
+        dims::Vector{Int})
+    kind = _slice_kind(p)
+    G, K = kind === :rows ? (dims[1], dims[2]) :
+        kind === :cols ? (dims[2], dims[1]) : (1, dims[1])
+    roles = _slice_roles(p)
+    for (k, a) in pairs(p.args)
+        role = roles[k]
+        if role === :count
+            a == K || _fail(p.label, "array $(p.name) has $(_slice_noun(p)) " *
+                "of length $K, but `Ordered` declares length $a")
+            continue
+        end
+        role === :scalar && continue
+        want, b = if _is_slice_iterator(a)
+            (a.args[1] === :eachrow ? (G, K) : (K, G)), a.args[2]
+        else
+            (role === :vector ? (K,) : (K, K)), a
+        end
+        sz = _slice_arg_size(plan, b)
+        sz === nothing || sz == want || _fail(p.label, "array $(p.name) " *
+            "has $G slice(s) of length $K, so its argument $(repr(a)) has " *
+            "size $(repr(want)), but $(repr(b)) has size $(repr(sz))")
     end
     return nothing
 end
@@ -479,6 +640,18 @@ function _array_layout_entries!(entries::Vector{LayoutEntry},
             push!(entries, LayoutEntry(:cholesky_corr, nothing, p.name,
                 labels, offset, packed, :lkj))
             offset += packed
+        elseif _is_slice_array(p)
+            # Multivariate normal slices are centered: the array's entries
+            # are its coordinates. Simplex / ordered slices pack their
+            # unconstrained coordinates (K − 1 / K per slice) in the
+            # array's orientation.
+            transform = _slice_transform(Val(_slice_stem(p)), _slice_kind(p))
+            pd = _slice_packed_dims(transform, dims)
+            n = prod(pd)
+            push!(entries, LayoutEntry(:array, nothing, p.name,
+                _array_labels(p.name, pd), offset, n, transform, NaN, NaN,
+                dims))
+            offset += n
         else
             transform, lo, hi =
                 _entry_transform(p.family, p.support_override, p.args)
@@ -492,9 +665,75 @@ function _array_layout_entries!(entries::Vector{LayoutEntry},
     return offset
 end
 
+# Layout transform of a slice array: centered multivariate normals are
+# the identity; simplex / ordered slices transform along each slice.
+_slice_transform(::Val{:mvnormal_cholesky}, kind) = :identity
+_slice_transform(::Val{:mvnormal}, kind) = :identity
+_slice_transform(::Val{:dirichlet}, kind) = Symbol(:simplex_, kind)
+_slice_transform(::Val{:ordered_normal}, kind) = Symbol(:ordered_, kind)
+
+const _SLICE_TRANSFORMS = (:simplex_rows, :simplex_cols, :ordered_rows,
+    :ordered_cols)
+_is_slice_transform(t::Symbol) = t in _SLICE_TRANSFORMS
+
+# The orientation a slice transform runs along (an `mv_slices.jl` value,
+# spliced as a constructor call in the graph).
+_slice_transform_orientation(t::Symbol) =
+    t in (:simplex_rows, :ordered_rows) ? _SliceRows() : _SliceCols()
+_orientation_expr(::_SliceRows) = :(_SliceRows())
+_orientation_expr(::_SliceCols) = :(_SliceCols())
+_orientation_expr(::_SliceWhole) = :(_SliceWhole())
+
+# Packed (unconstrained) axes of a slice transform over the constrained
+# axes `dims`: a simplex slice of length K packs K − 1 coordinates.
+_slice_packed_dims(t::Symbol, dims) =
+    t === :simplex_rows ? [dims[1], dims[2] - 1] :
+    t === :simplex_cols ? [dims[1] - 1, dims[2]] : collect(dims)
+
+_slice_constrain(t::Symbol, o, U) = startswith(String(t), "simplex") ?
+    _simplex_slices_constrain(o, U) : _ordered_slices_constrain(o, U)
+_slice_unconstrain(t::Symbol, o, X) = startswith(String(t), "simplex") ?
+    _simplex_slices_unconstrain(o, X) : _ordered_slices_unconstrain(o, X)
+_slice_logjac(t::Symbol, o, U) = startswith(String(t), "simplex") ?
+    _simplex_slices_logjac(o, U) : _ordered_slices_logjac(o, U)
+_slice_function_names(t::Symbol) = startswith(String(t), "simplex") ?
+    (:_simplex_slices_constrain, :_simplex_slices_logjac) :
+    (:_ordered_slices_constrain, :_ordered_slices_logjac)
+
+# Host edges of a slice-transformed array entry (the same functions the
+# graph calls, so host and graph agree bit-for-bit).
+function _array_slices_constrain(e::LayoutEntry, seg)
+    U = reshape(Vector{Float64}(seg), _slice_packed_dims(e.transform, e.dims)...)
+    return _slice_constrain(e.transform,
+        _slice_transform_orientation(e.transform), U)
+end
+_array_slices_unconstrain(e::LayoutEntry, X) =
+    vec(_slice_unconstrain(e.transform,
+        _slice_transform_orientation(e.transform), Matrix{Float64}(X)))
+function _array_slices_logjac(e::LayoutEntry, seg)
+    U = reshape(Vector{Float64}(seg), _slice_packed_dims(e.transform, e.dims)...)
+    return _slice_logjac(e.transform,
+        _slice_transform_orientation(e.transform), U)
+end
+
+_array_slices_packed_name(name::Symbol) = Symbol(:_ppl_arru_, name)
+
 # In-graph constrain edges of an elementwise array: the plate edges over
-# its flat packed block, then (two axes) the column-major reshape.
+# its flat packed block, then (two axes) the column-major reshape. A
+# slice-transformed array reshapes its packed block and transforms every
+# slice in one call.
 function _array_transform_statements(e::LayoutEntry)
+    if _is_slice_transform(e.transform)
+        U = _array_slices_packed_name(e.name)
+        lo, hi = e.offset, e.offset + e.size - 1
+        cfn, _ = _slice_function_names(e.transform)
+        o = _orientation_expr(_slice_transform_orientation(e.transform))
+        return Expr[
+            :($U::Matrix{Float64} = reshape(Float64.(view(unconstrained,
+                $lo:$hi)), $(_slice_packed_dims(e.transform, e.dims)...))),
+            :($(e.name)::Matrix{Float64} = $cfn($o, $U)),
+        ]
+    end
     flat = _array_flat_name(e.name, length(e.dims))
     fe = LayoutEntry(:plate, nothing, flat, e.labels, e.offset, e.size,
         e.transform, e.lo, e.hi)
@@ -506,6 +745,11 @@ function _array_transform_statements(e::LayoutEntry)
 end
 
 function _array_jacobian_term(e::LayoutEntry)
+    if _is_slice_transform(e.transform)
+        _, jfn = _slice_function_names(e.transform)
+        o = _orientation_expr(_slice_transform_orientation(e.transform))
+        return :($jfn($o, $(_array_slices_packed_name(e.name))))
+    end
     flat = _array_flat_name(e.name, length(e.dims))
     return jacobian_term(LayoutEntry(:plate, nothing, flat, e.labels,
         e.offset, e.size, e.transform, e.lo, e.hi))
@@ -592,6 +836,12 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             push!(terms, node)
             continue
         end
+        if _is_slice_array(p)
+            push!(stmts, :($node::Float64 =
+                $(_slice_prior_call!(stmts, p))))
+            push!(terms, node)
+            continue
+        end
         flat = _array_flat_name(p.name, length(dims))
         args = Pair{Symbol,Any}[]
         for (i, (k, a)) in enumerate(pairs(p.args))
@@ -611,3 +861,43 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     end
     return nothing
 end
+
+# The slice density of a slice array (`mv_slices.jl`), its arguments bound
+# to hygienic locals: a shared value as itself (literal vectors and
+# `zeros(K)` / `fill(a, K)` as `Float64` vectors), a per-slice
+# `eachrow(M)` / `eachcol(M)` as a `_PerSlice` of `M`. The literal
+# `Ordered` length is structural and not passed.
+_slice_density(::Val{:mvnormal_cholesky}) = :_mvnormal_cholesky_slices_logpdf
+_slice_density(::Val{:mvnormal}) = :_mvnormal_slices_logpdf
+_slice_density(::Val{:dirichlet}) = :_dirichlet_slices_logpdf
+_slice_density(::Val{:ordered_normal}) = :_ordered_normal_slices_logpdf
+
+function _slice_prior_call!(stmts::Vector{Expr}, p::ArrayParameter)
+    roles = _slice_roles(p)
+    vals = Any[]
+    for (i, (k, a)) in enumerate(pairs(p.args))
+        roles[k] === :count && continue
+        local_name = Symbol(:_ppl_parg_, p.name, :_, i)
+        if _is_slice_iterator(a)
+            o = _orientation_expr(a.args[1] === :eachrow ? _SliceRows() :
+                _SliceCols())
+            push!(stmts, :($local_name = _PerSlice($o,
+                $(_slice_value_expr(a.args[2])))))
+            push!(vals, local_name)
+        elseif a isa Symbol
+            push!(vals, a)
+        elseif a isa Real
+            push!(vals, Float64(a))
+        else
+            push!(stmts, :($local_name = $(_slice_value_expr(a))))
+            push!(vals, local_name)
+        end
+    end
+    o = _orientation_expr(_slice_orientation(_slice_kind(p)))
+    return :($(_slice_density(Val(_slice_stem(p))))($o, $(p.name), $(vals...)))
+end
+
+_slice_value_expr(a) = a isa Expr && a.head === :vect ? :(Float64[$(a.args...)]) :
+    _is_zeros_call(a) ? :(zeros(Float64, $(a.args[2]))) :
+    _is_fill_call(a) ? :(fill($(a.args[2] isa Real ? Float64(a.args[2]) :
+        a.args[2]), $(a.args[3]))) : a

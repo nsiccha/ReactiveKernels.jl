@@ -74,7 +74,8 @@ export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
 export RKPPLModel, RKPPLSubmodel, lower_rkppl, @rkppl, SurfaceLoweringError
-export ordered_logistic, monotonic, differenced_ar1
+export ordered_logistic, monotonic, differenced_ar1, r2d2_coefs,
+    horseshoe_coefs
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
 export DarSpec
 export LINEAR_EVENT_READ, LINEAR_EVENT_DOSE, LINEAR_EVENT_DOSE_SEGMENT
@@ -122,6 +123,7 @@ include("transit_twocmt_rule.jl")
 include("pk_rectangular.jl")
 include("design.jl")
 include("bijectors.jl")
+include("mv_slices.jl")
 include("layout.jl")
 include("preprocessing.jl")
 include("generator.jl")
