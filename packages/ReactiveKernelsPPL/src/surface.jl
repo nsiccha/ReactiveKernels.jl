@@ -6500,6 +6500,10 @@ function _resolve_submodel(rhs, mod::Module)
     head = rhs.args[1]
     if head isa GlobalRef
         mod, head = head.mod, head.name
+    elseif head isa Expr && head.head === :. && length(head.args) == 2 &&
+            head.args[2] isa QuoteNode && head.args[2].value isa Symbol
+        mod = _resolve_module_path(head.args[1], mod, "submodel call")
+        head = head.args[2].value
     end
     head isa Symbol || return nothing
     isdefined(mod, head) || return nothing
