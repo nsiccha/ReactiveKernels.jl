@@ -4527,15 +4527,17 @@ end
 # the desugared `y[a:b]` form), `eachindex(v)`, `axes(v, 1)`.
 function _plate_range_kind(R)
     R isa Expr && R.head === :call && !isempty(R.args) || return _sfail(
-        "`@plate` range must be `1:N`, `eachindex(v)`, or `axes(v, 1)` — " *
-        "got $(repr(R)) (values-iteration is planned)")
+        "`@plate` range must be `1:N`, `eachindex(v)`, `axes(v, 1)`, or " *
+        "`levels(g)` — got $(repr(R)) (values-iteration is planned)")
     R.args[1] === :(:) && return (:coloncall, R)
     R.args[1] === :eachindex && length(R.args) == 2 &&
         R.args[2] isa Symbol && return (:eachindex, R.args[2])
     R.args[1] === :axes && length(R.args) == 3 && R.args[2] isa Symbol &&
         R.args[3] == 1 && return (:axes, R.args[2])
-    return _sfail("`@plate` range must be `1:N`, `eachindex(v)`, or " *
-                  "`axes(v, 1)` — got $(repr(R))")
+    R.args[1] === :levels && length(R.args) == 2 && R.args[2] isa Symbol &&
+        return (:levels, R.args[2])
+    return _sfail("`@plate` range must be `1:N`, `eachindex(v)`, " *
+                  "`axes(v, 1)`, or `levels(g)` — got $(repr(R))")
 end
 
 # One cell statement → spliced top-level statement(s). A cell means what
@@ -4564,6 +4566,8 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params,
     if _is_broadcast_sample(c)
         _sfail("cells are scalar (`~`); broadcast (`.~`) at top level")
     end
+    rkind[1] === :levels && return _desugar_levels_cell(c, ivar, rkind[2],
+        data)
     if _is_sample(c)
         return _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs,
             ctx, params, pidx)
@@ -4594,6 +4598,74 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params,
     end
     return _sfail("cells hold `~` observations and `=` assignments only")
 end
+
+# A `@plate for k in levels(g)` cell: one iteration per level of `g`. A
+# per-level declaration means what the whole-array declaration means:
+# `c[k] ~ D` is `c[levels(g)] .~ D.` (one draw per level), and a row
+# `b[k, :] ~ D` (or `b[k, 1:K]`) with a multivariate `D` is the row
+# statement `eachrow(b[levels(g), 1:K]) .~ D` (§ array slices). Arguments
+# are shared across levels. Per-level arguments, per-level factors
+# (`L[k] ~ LKJCholesky(K, eta)`) and per-level definitions are not
+# supported yet.
+function _desugar_levels_cell(c, ivar::Symbol, g::Symbol, data)
+    where = "`@plate for $ivar in levels($g)` cell `$(repr(c))`"
+    _is_sample(c) || _sfail("$where: per-level `=` definitions are not " *
+        "supported yet; a levels plate holds per-level `~` declarations")
+    lhs, obj = c.args[2], c.args[3]
+    (lhs isa Expr && lhs.head === :ref && length(lhs.args) in (2, 3) &&
+        lhs.args[1] isa Symbol && lhs.args[2] === ivar) || _sfail("$where: " *
+        "a per-level cell declares `name[$ivar]` or a row `name[$ivar, :]`")
+    col = lhs.args[1]
+    col in data && _sfail("$where: $col is data; per-level observations " *
+        "are not supported yet")
+    _expr_has_sym(obj, ivar) && _sfail("$where: per-level distribution " *
+        "arguments are not supported yet; the arguments are shared across " *
+        "levels")
+    if length(lhs.args) == 2
+        _mv_head(obj) === nothing || _sfail("$where: a multivariate " *
+            "per-level draw is a row, `$col[$ivar, :] ~ $(repr(obj))`")
+        _is_lkj_cholesky_call(obj) && _sfail("$where: one `LKJCholesky` " *
+            "factor per level is not supported yet")
+        dobj, _ = _dotify_cell(obj, ivar, Set{Symbol}(), true)
+        return Expr[Expr(:call, :.~, Expr(:ref, col, :(levels($g))), dobj)]
+    end
+    _mv_head(obj) === nothing && _sfail("$where: a row `$col[$ivar, :]` " *
+        "is one draw of a multivariate distribution (`MvNormal`, " *
+        "`MvNormalCholesky`, `Dirichlet`, `Ordered`)")
+    ax = lhs.args[3]
+    if ax === :(:)
+        K = _mv_slice_len(obj)
+        K === nothing && _sfail("$where: the row length is not readable " *
+            "from the distribution; write it, `$col[$ivar, 1:K]`")
+        ax = :(1:$K)
+    end
+    return Expr[Expr(:call, :.~, Expr(:call, :eachrow,
+        Expr(:ref, col, :(levels($g)), ax)), obj)]
+end
+
+# The slice length of a multivariate distribution call whose arguments
+# state it literally: `MvNormal(zeros(K), …)` / `MvNormalCholesky(ones(K),
+# …)` / a literal mean vector, `Dirichlet(K, a)` / a literal concentration
+# vector, `Ordered(D, K)`. `nothing` when it is not literal.
+function _mv_slice_len(obj)
+    h = _mv_head(obj)
+    (h === nothing || obj.head !== :call || length(obj.args) < 2) &&
+        return nothing
+    a = obj.args[2]
+    lit(x) = x isa Int && x >= 1 ? x : nothing
+    if h === :Ordered
+        return length(obj.args) == 3 ? lit(obj.args[3]) : nothing
+    elseif h === :Dirichlet && length(obj.args) == 3
+        return lit(a)
+    end
+    a isa Expr && a.head === :vect && return length(a.args)
+    a isa Expr && a.head === :call && length(a.args) == 2 &&
+        a.args[1] in (:zeros, :ones) && return lit(a.args[2])
+    return nothing
+end
+
+_expr_has_sym(ex, s::Symbol) = ex === s ||
+    (ex isa Expr && any(a -> _expr_has_sym(a, s), ex.args))
 
 # A cell `~` statement is EITHER a per-cell latent parameter declaration
 # (`theta[i] ~ Normal(mu, tau)` — a non-data indexed LHS, scalar undotted
