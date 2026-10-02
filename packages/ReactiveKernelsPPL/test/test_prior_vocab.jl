@@ -32,6 +32,11 @@ _pv_posterior(kern, lay, q::NamedTuple) =
 const _PV_X = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
 const _PV_Y = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
 const _PV_G = [1, 2, 1, 3, 2, 3]
+const _PV_SAMPLED_UNIFORM = quote
+    lo ~ Normal(0, 1)
+    u ~ Uniform(lo, 2)
+    y .~ Normal.(u, 1)
+end
 _pv_cols() = Dict{Symbol,AbstractVector}(:y => copy(_PV_Y), :x => copy(_PV_X))
 _pv_gcols() = Dict{Symbol,AbstractVector}(:y => copy(_PV_Y), :x => copy(_PV_X),
     :g => copy(_PV_G))
@@ -120,10 +125,8 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
             end
         end
     end
-    @testset "uniform bounds must be finite literals in order" begin
-        # Sampled bound (a known parameter name — the literal-only rule).
-        # capability: sampled Uniform bound (Uniform(lo, 2) with lo sampled); P8 admits sampled prior arguments (todo `0fkd9yk`)
-        @test_broken (lower_rkppl(quote
+    @testset "Uniform bounds retain sampled dependencies" begin
+        sampled = lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
@@ -131,7 +134,11 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                 lo ~ Normal(0, 1)
                 u ~ Uniform(lo, 2)
                 s ~ Exponential(1)
-            end, (:y, :x); conditioned = (:y, :x)); true)
+            end, (:y, :x); conditioned = (:y, :x))
+        uniform = _pv_param(sampled, :u)
+        @test uniform.family === :uniform
+        @test uniform.args == (arg1 = :lo, arg2 = 2)
+        @test uniform.support_override === nothing
         # refused: Uniform bounds out of order (malformed distribution)
         for rhs in (:(Uniform(2, -1)), :(Uniform(0, Inf)))
             # refused: battery of malformed Uniform literals (all entries P)
@@ -148,8 +155,7 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
 end
 
 @testset "prior vocab plate admission" begin
-    # Plate parameters share the sampled grammar: new families (and the
-    # uniform literal-bounds rule) ride the same tables.
+    # Plate parameters share the sampled distribution grammar.
     _plate_theta(rhs) = Expr(:block,
         :(s ~ Exponential(1)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
@@ -165,16 +171,19 @@ end
     pp = only(plate.plate_parameters)
     @test pp.family === :uniform
     @test pp.support_override === nothing
-    # Per-cell (column) uniform bounds are rejected — one plate entry
-    # shares one interval transform, so bounds stay finite literals.
-    # capability: per-index data Uniform bounds inside @plate (theta[i] ~ Uniform(lo[i], hi[i])); P8 per-index plate semantics (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(Expr(:block,
+    # Per-cell data bounds retain their column dependencies.
+    indexed = lower_rkppl(Expr(:block,
         :(s ~ Exponential(1)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block,
                     :(theta[i] ~ Uniform(lo[i], hi[i])),
-                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y, :lo, :hi); conditioned = (:y, :lo, :hi)); true)
+                    :(y[i] ~ Normal.(theta[i], 1.0)))))), (:y, :lo, :hi); conditioned = (:y, :lo, :hi))
+    theta = only(p for p in vcat(indexed.plate_parameters, indexed.array_parameters)
+        if p.name === :theta)
+    @test theta.family === :uniform
+    @test theta.args == (arg1 = :lo, arg2 = :hi)
+    @test theta.support_override === nothing
 end
 
 @testset "prior vocab truncated halves" begin
@@ -462,6 +471,18 @@ end
     _pv_enzyme_check(_PV_M4, _pv_gcols(), (c = [0.3, -0.4, 0.1], b = 0.75,))
 end
 
+@testset "sampled Uniform bounds density and gradients" begin
+    cols = Dict{Symbol,AbstractVector}(:y => [0.2, -0.4, 0.7])
+    for q in ((lo = -0.4, u = 0.3), (lo = 0.6, u = 1.2))
+        _, _, kernel, layout = _pv_query(_PV_SAMPLED_UNIFORM, cols)
+        expected = logpdf(Normal(), q.lo) + logpdf(Uniform(q.lo, 2), q.u) +
+            sum(logpdf.(Normal(q.u, 1), cols[:y])) +
+            _pv_interval_logjac(q.lo, 2, q.u)
+        @test _pv_posterior(kernel, layout, q) ≈ expected rtol = 1e-12
+        _pv_enzyme_check(_PV_SAMPLED_UNIFORM, cols, q)
+    end
+end
+
 @testset "prior vocab SB parity" begin
     # Peer literals: `BayesianRegressionModels:rk:parity-prior-vocab`
     # brief `2026-09-26T22-18-21-872-8yw5i7` (BRM `ff5e589`, SB `24578c3`,
@@ -571,6 +592,20 @@ function _pv_reactant_measure(built, bound, post_q, u)
     rval, rgrad = cad(Reactant.to_rarray(u))
     return (; lines = count(==('\n'), hlo), native, primal, val, g,
         rval = Float64(rval), rgrad = Array(rgrad))
+end
+
+@testset "sampled Uniform bounds native and compiled parity" begin
+    sizes = Int[]
+    for n in (3, 7)
+        fx = _pv_reactant(_PV_SAMPLED_UNIFORM,
+            Dict{Symbol,AbstractVector}(:y => fill(0.2, n)))
+        @test fx.primal ≈ fx.native rtol = 1e-9
+        @test fx.val ≈ fx.native rtol = 1e-12
+        @test fx.rval ≈ fx.native rtol = 1e-9
+        @test fx.rgrad ≈ fx.g rtol = 1e-8
+        push!(sizes, fx.lines)
+    end
+    @test sizes[1] == sizes[2]
 end
 
 @testset "prior vocab under Reactant" begin
@@ -1190,14 +1225,20 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
     frow = _pv_prior(fplan, :mu, :g)
     @test frow.family === :uniform
     @test (frow.location, frow.scale) == (0.0, 10.0)
+    # A sampled bound keeps the coefficient as an ordinary parameter.
+    sampled = lower_rkppl(quote
+            a ~ Flat()
+            lo ~ Normal(0, 1)
+            b ~ Uniform(lo, 3)
+            mu = a .+ b .* x
+            y .~ Normal.(mu, 1.5)
+        end, (:y, :x); conditioned = (:y, :x))
+    b = _pv_param(sampled, :b)
+    @test b.family === :uniform
+    @test b.args == (arg1 = :lo, arg2 = 3)
+    @test b.support_override === nothing
     @testset "bounds gate fails closed" begin
         scalar_cases = (
-            # A non-literal bound makes `b` an ordinary parameter (not a
-            # coefficient), whose Uniform support still needs literals.
-            ("scalar hyper bound",
-                :(Uniform(lo, 3)),
-                ContractValidationError,
-                "bounds must be finite literals"),
             ("scalar inverted",
                 :(Uniform(10, 5)),
                 ContractValidationError,
@@ -1205,7 +1246,7 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
             ("scalar infinite",
                 :(Uniform(0, Inf)),
                 ContractValidationError,
-                "bounds must be finite literals"),
+                "bounds must be finite values or declared names"),
         )
         for (label, rhs, ex, msg) in scalar_cases
             err = try
@@ -1220,15 +1261,9 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
             catch e
                 e
             end
-            if occursin("hyper bound", label)
-                # capability: sampled Uniform bounds (P8 1cmodra; todo `0fkd9yk`).
-                @test_broken (err === nothing || throw(err))
-            else
-                # refused: remaining entries violate constructor signature,
-                # strict declarations or distribution domains (P3/P6, 05oe96l).
-                @test err isa ex
-                @test occursin(msg, sprint(showerror, err))
-            end
+            # refused: malformed distribution bounds (P3/P6, 05oe96l).
+            @test err isa ex
+            @test occursin(msg, sprint(showerror, err))
         end
         broad_cases = (
             ("broadcast hyper bound",

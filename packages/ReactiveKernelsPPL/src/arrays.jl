@@ -279,6 +279,7 @@ function _array_arg_length(plan::StructuralPlan, a)
     _is_derived(plan, a) && return plan.n_obs
     if haskey(plan.columns, a)
         col = plan.columns[a]
+        col isa Real && return nothing
         col isa AbstractVector || _fail(:plan, "prior argument $a is a " *
             "matrix column (per-element arguments are vectors)")
         return length(col)
