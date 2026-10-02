@@ -448,8 +448,8 @@ end
         (D, "scale X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, X) end),
         (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); s ~ Normal(X, 1); mu = X * b; y .~ Normal.(mu, s) end),
         (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); s ~ HalfNormal(X); mu = X * b; y .~ Normal.(mu, s) end),
-        (Dm, "multinomial probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; c1 .~ Multinomial.(10, X, c2) end),
-        (D, "categorical probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Categorical.(X) end),
+        (Dm, "multinomial probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; eachrow(hcat(c1, c2)) .~ Multinomial.(10, Ref(X)) end),
+        (D, "categorical probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Categorical(X) end),
     ]
     for (data, msg, ast) in cases
         err = _mx_err(ast, data)

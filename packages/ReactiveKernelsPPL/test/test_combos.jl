@@ -31,8 +31,7 @@ const _CB_ADMITTED = (
         mu1 = a1 .+ b1 .* x1 .+ b2 .* x2
         mu2 ~ Normal(0.0, 5.0)
         sigma ~ Exponential(1.0)
-        y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)],
-            [0.3, 0.7])
+        y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([0.3, 0.7]))
     end, (; y = _CB_Y, x1 = _CB_X, x2 = _CB_X2), 9),
     ("hsgp x mixture", quote
         a1 ~ Normal(0, 1)
@@ -40,8 +39,7 @@ const _CB_ADMITTED = (
         mu1 = a1 .+ hsgp(:h)
         mu2 ~ Normal(0.0, 5.0)
         sigma ~ Exponential(1.0)
-        y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)],
-            [0.3, 0.7])
+        y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([0.3, 0.7]))
     end, (; y = _CB_Y, x = _CB_X), 11),
     ("hsgp x me", quote
         a ~ Normal(0, 1)

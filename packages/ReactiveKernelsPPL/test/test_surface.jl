@@ -4133,7 +4133,7 @@ end
     slot
 end
 @rkppl pin_simplex(sc) = begin
-    slot .~ Categorical.(sc)
+    slot .~ Categorical(sc)
     slot
 end
 @rkppl pin_latloc(sc) = begin
@@ -4536,7 +4536,7 @@ end
 # `y .~ CategoricalLogit.(eta_2, ..., eta_K)` (reference-coded multi-logit),
 # `y .~ OrderedLogistic.(eta)` (+ implicit ordered cutpoints),
 # `y .~ Ordinal.(Cumulative(), LogitLink(), eta)` (+ implicit thresholds),
-# `c1 .~ Multinomial.(N, s, c2, ..., cK)` and `y .~ Categorical.(s)` over an
+# `eachrow(hcat(c1, c2, ..., cK)) .~ Multinomial.(N, Ref(s))` and `y .~ Categorical(s)` over an
 # explicit `s ~ Dirichlet(...)` simplex.
 
 @testset "surface categorical logit" begin
@@ -4682,7 +4682,7 @@ end
 @testset "surface multinomial" begin
     ast = Expr(:block,
         :(s ~ Dirichlet([2.0, 2.0, 2.0])),
-        :(c1 .~ Multinomial.(N, s, c2, c3)))
+        :(eachrow(hcat(c1, c2, c3)) .~ Multinomial.(N, Ref(s))))
     plan = lower_rkppl(ast, (:c1, :c2, :c3, :N))
     r = only(plan.responses)
     @test r.family === MultinomialFam
@@ -4696,7 +4696,7 @@ end
     # Symmetric Dirichlet + literal trials + value roundtrip.
     lit = lower_rkppl(Expr(:block,
             :(s ~ Dirichlet(3, 1.0)),
-            :(c1 .~ Multinomial.(3, s, c2, c3))), (:c1, :c2, :c3))
+            :(eachrow(hcat(c1, c2, c3)) .~ Multinomial.(3, Ref(s)))), (:c1, :c2, :c3))
     @test only(lit.vector_parameters).args.arg1 == [1.0, 1.0, 1.0]
     @test only(lit.responses).trials === 3
     cols = Dict{Symbol,AbstractVector}(:c1 => [1, 1, 1, 0],
@@ -4711,12 +4711,12 @@ end
     # An undeclared simplex fails at plan validation (not silently).
     # refused: undeclared simplex s (P6, 05oe96l)
     @test_throws ContractValidationError lower_rkppl(Expr(:block,
-            :(c1 .~ Multinomial.(N, s, c2, c3))), (:c1, :c2, :c3, :N))
+            :(eachrow(hcat(c1, c2, c3)) .~ Multinomial.(N, Ref(s)))), (:c1, :c2, :c3, :N))
     # Non-symbol probs and missing trials fail at lowering.
     # refused: s .+ 1 does not sum to 1 (invalid probabilities)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(s ~ Dirichlet(3, 1.0)),
-            :(c1 .~ Multinomial.(N, s .+ 1, c2, c3))), (:c1, :c2, :c3, :N))
+            :(eachrow(hcat(c1, c2, c3)) .~ Multinomial.(N, Ref(s .+ 1)))), (:c1, :c2, :c3, :N))
     # refused: Multinomial without trials (malformed)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(s ~ Dirichlet(3, 1.0)),
@@ -4726,7 +4726,7 @@ end
 @testset "surface categorical simplex" begin
     ast = Expr(:block,
         :(s ~ Dirichlet(3, 1.0)),
-        :(y .~ Categorical.(s)))
+        :(y .~ Categorical(s)))
     plan = lower_rkppl(ast, (:y,))
     r = only(plan.responses)
     @test r.family === CategoricalFam
@@ -4742,7 +4742,7 @@ end
     # refused: Categorical(p, p) is malformed
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(s ~ Dirichlet(3, 1.0)),
-            :(y .~ Categorical.(s, s))), (:y,))
+            :(y .~ Categorical(s, s))), (:y,))
 end
 
 @testset "surface dirichlet failures" begin
@@ -4752,7 +4752,7 @@ end
         # refused: malformed Dirichlet (no args)
         @test_throws SurfaceLoweringError lower_rkppl(
             Expr(:block, Expr(:call, :~, :s, rhs),
-                :(y .~ Categorical.(s))), (:y,))
+                :(y .~ Categorical(s))), (:y,))
     end
     # A Dirichlet cannot shadow a predictor coefficient.
     # refused: 2-simplex s .* x against the observation vector: Julia DimensionMismatch (P3)

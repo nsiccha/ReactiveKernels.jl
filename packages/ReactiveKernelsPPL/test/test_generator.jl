@@ -1264,22 +1264,10 @@ end
         logpdf(Exponential(1), s)
     @test _query(built.spec, plan, :posterior, u) ≈ base - corr + pr + u[3]
     _check_gradient(built.spec, plan, u)
-    # Censored [0, 5] with breaches both sides.
+    # refused: out-of-bounds observed evidence (0tz0qfu evidence prong).
     yc = [-1.0, 2.0, 1.5, 9.0, 3.0, 2.0]
-    planc = _gen_evidence_plan(:censored, 0.0, 5.0, yc)
-    builtc = build_kernel(planc)
-    ntc = constrain(builtc.layout, u)
-    muc = ntc.mu[1] .+ ntc.mu[2] .* planc.columns[:x]
-    sc = ntc.sigma
-    ll = 0.0
-    for i in eachindex(yc)
-        d = Normal(muc[i], sc)
-        ll += yc[i] < 0.0 ? logcdf(d, 0.0) :
-            yc[i] > 5.0 ? logccdf(d, 5.0) : logpdf(d, yc[i])
-    end
-    prc = logpdf(Normal(0, 1), ntc.mu[1]) + logpdf(Normal(0, 2), ntc.mu[2]) +
-        logpdf(Exponential(1), sc)
-    @test _query(builtc.spec, planc, :posterior, u) ≈ ll + prc + u[3]
+    @test_throws ContractValidationError build_kernel(
+        _gen_evidence_plan(:censored, 0.0, 5.0, yc))
     # Censored [0, 5] with rows AT the bounds (SB-parity pair mod-weights
     # twin C1b): at-bound rows are censored observations (clamp law —
     # CDF mass, not density).
@@ -1346,16 +1334,17 @@ end
     # definitionally), never the emitted forms.
     _F(lam, k) = k < 0 ? 0.0 : cdf(Poisson(lam), k)
     cols, n = _gen_columns()
-    cols[:y] = [0, 1, 2, 1, 3, 2]
+    cols[:y] = [2, 2, 2, 2, 3, 2]
     cols[:lo] = [0, 1, 0, 2, 1, 0]
     u = [0.1, -0.2]
-    function _run(ev)
+    function _run(ev; response = cols[:y])
+        values = merge(cols, Dict(:y => response))
         plan = StructuralPlan(
             LikelihoodSpec[LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta,
                 nothing, nothing, ev, :y_resp)],
             PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
             _gen_priors(:eta),
-            SampledParameter[], AssignmentSpec[], cols, n)
+            SampledParameter[], AssignmentSpec[], values, n)
         built = build_kernel(plan)
         nt = constrain(built.layout, u)
         lam = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
@@ -1386,7 +1375,8 @@ end
     @test _query(built.spec, plan, :posterior, u) ≈ sum(cell) + pr
     _check_gradient(built.spec, plan, u)
     # Censored two-sided [1,2]: yv ≤ 1 takes F(1), yv ≥ 2 takes 1 - F(1).
-    built, plan, lam, pr = _run(ResponseEvidence(:censored, 1, 2))
+    built, plan, lam, pr = _run(ResponseEvidence(:censored, 1, 2); response = [1, 1, 2, 1, 2, 2])
+    y = plan.columns[:y]
     cell = ifelse.(y .<= 1, log.(_F.(lam, 1)),
         ifelse.(y .>= 2, log.(1 .- _F.(lam, 1)), logpdf.(Poisson.(lam), y)))
     @test _query(built.spec, plan, :posterior, u) ≈ sum(cell) + pr
@@ -1417,6 +1407,7 @@ end
     # contract (the response is the exclusive lower endpoint).
     built, plan, lam, pr =
         _run(ResponseEvidence(:interval_censored, nothing, 4))
+    y = plan.columns[:y]
     ival = sum(log.(_F.(lam, 4) .- _F.(lam, y)))
     @test _query(built.spec, plan, :posterior, u) ≈ ival + pr
     _check_gradient(built.spec, plan, u)

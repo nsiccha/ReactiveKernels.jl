@@ -37,8 +37,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
                 mu1 = a1 .+ b1 .* x
                 mu2 ~ Normal(0.0, 5.0)
                 sigma ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)],
-                    [0.3, 0.7])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([0.3, 0.7]))
             end, (:y, :x))
         r = only(plan.responses)
         @test r.family === MixtureFam
@@ -58,7 +57,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
         plan = lower_rkppl(quote
                 mu1 ~ Normal(0.0, 5.0)
                 sigma ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, sigma)], [1.0])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, sigma)), Ref([1.0]))
             end, (:y,))
         r = only(plan.responses)
         @test r.mixture_family === GaussianFam
@@ -70,7 +69,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
     @testset "simplex weights link the Dirichlet vector" begin
         plan = lower_rkppl(quote
                 w ~ Dirichlet([1.0, 1.0])
-                y .~ MixtureModel.([Normal.(-1.0, 0.5), Normal.(1.0, 0.5)], w)
+                y .~ MixtureModel.(vcat.(Normal.(-1.0, 0.5), Normal.(1.0, 0.5)), Ref(w))
             end, (:y,))
         r = only(plan.responses)
         @test r.mixture_weights === :w
@@ -81,8 +80,7 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
     @testset "Binomial literal trials, bare probs" begin
         plan = lower_rkppl(quote
                 p1 ~ Beta(2.0, 2.0)
-                y .~ MixtureModel.([Binomial.(10, p1), Binomial.(10, 0.2)],
-                    [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Binomial.(10, p1), Binomial.(10, 0.2)), Ref([0.5, 0.5]))
             end, (:y,))
         r = only(plan.responses)
         @test r.mixture_family === BinomialLogitFam
@@ -95,8 +93,8 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
                 d ~ Normal(0, 1)
                 ls = c .+ d .* x
                 mu1 ~ Normal(0.0, 5.0)
-                y .~ MixtureModel.([Normal.(mu1, exp.(ls)),
-                    Normal.(0.0, exp.(ls))], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, exp.(ls)),
+                    Normal.(0.0, exp.(ls))), Ref([0.5, 0.5]))
             end, (:y, :x))
         r = only(plan.responses)
         @test r.predictor === :ls # Anchor: first scale predictor.
@@ -108,8 +106,8 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
                 mu1 ~ Normal(-2.0, 0.1)
                 mu2 ~ Normal(2.0, 0.1)
                 sigma = c
-                y .~ MixtureModel.([Normal.(mu1, exp.(sigma)),
-                    Normal.(mu2, exp.(sigma))], [0.4, 0.6])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, exp.(sigma)),
+                    Normal.(mu2, exp.(sigma))), Ref([0.4, 0.6]))
             end, (:y,))
         r = only(plan.responses)
         @test r.mixture_scales == [ScalePredictorRef(:sigma, LogLink),
@@ -128,8 +126,8 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
                 mu1 ~ Normal(0, 1)
                 mu2 ~ Normal(0.0, 5.0)
                 sigma ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, sigma),
-                    Normal.(mu2, sigma)], [0.3, 0.7])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, sigma),
+                    Normal.(mu2, sigma)), Ref([0.3, 0.7]))
             end, (:y,))
         r = only(plan.responses)
         @test r.mixture_locs == [:mu1, :mu2]
@@ -144,8 +142,8 @@ _mlogaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x
                 phi ~ Exponential(1.0)
-                y .~ MixtureModel.([NegativeBinomial2Log.(mu, phi),
-                    NegativeBinomial2Log.(mu, phi)], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(NegativeBinomial2Log.(mu, phi),
+                    NegativeBinomial2Log.(mu, phi)), Ref([0.5, 0.5]))
             end, (:y, :x))
         r = only(plan.responses)
         @test r.mixture_family === NegativeBinomial2Fam
@@ -164,8 +162,7 @@ end
                 mu1 ~ Normal(0.0, 5.0)
                 lam1 ~ LogNormal(0.0, 1.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s), Poisson.(lam1)],
-                    [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s), Poisson.(lam1)), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
         # capability: per-component links (todo `1nb43fj`).
         ("heterogeneous links, same base",
@@ -176,8 +173,8 @@ end
                 d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 eta2 = c .+ d .* x
-                y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
-                    Bernoulli.(normcdf.(eta2))], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Bernoulli.(logistic.(eta)),
+                    Bernoulli.(normcdf.(eta2))), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
         # capability: probit component links (todo `1nb43fj`).
         ("probit outside v1",
@@ -188,109 +185,102 @@ end
                 d ~ Normal(0, 1)
                 eta = a .+ b .* x
                 eta2 = c .+ d .* x
-                y .~ MixtureModel.([Bernoulli.(normcdf.(eta)),
-                    Bernoulli.(normcdf.(eta2))], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Bernoulli.(normcdf.(eta)),
+                    Bernoulli.(normcdf.(eta2))), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
         # refused: empty mixture (K = 0)
         ("K = 0",
             :(begin
-                y .~ MixtureModel.([], [1.0])
+                y .~ MixtureModel.(vcat.(), Ref([1.0]))
             end), SurfaceLoweringError),
-        # refused: MixtureModel.(Normal.(...), [1.0]) broadcasts MixtureModel(::Normal, ::Float64), a Julia MethodError (P3)
+        # refused: MixtureModel.(Normal.(...), Ref([1.0])) broadcasts MixtureModel(::Normal, ::Float64), a Julia MethodError (P3)
         ("components not a vector",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.(Normal.(mu1, s), [1.0])
+                y .~ MixtureModel.(Normal.(mu1, s), Ref([1.0]))
             end), SurfaceLoweringError),
         # capability: MixtureModel(components) with its standard uniform weights (todo `1nb43fj`).
         ("bad arity",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s)])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s)))
             end), SurfaceLoweringError),
         # refused: scalar mixture prior is a Julia MethodError; weights are a probability vector (P3)
         ("scalar weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s)], 1.0)
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s)), Ref(1.0))
             end), SurfaceLoweringError),
         # refused: [0.5, x] is a Vector{Any} of a scalar and a data vector, not a probability vector (P3)
         ("non-numeric weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
-                    [0.5, x])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s), Normal.(mu1, s)), Ref([0.5, x]))
             end), SurfaceLoweringError),
         # capability: Bool numeric weights (10gzbm9 bool-values) (todo `1nb43fj`).
         ("boolean weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
-                    [true, false])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s), Normal.(mu1, s)), Ref([true, false]))
             end), SurfaceLoweringError),
         # capability: frequency-weighted mixture observations (todo `1nb43fj`).
         ("frequency weights rejected",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ weighted.(MixtureModel.([Normal.(mu1, s),
-                    Normal.(mu1, s)], [0.5, 0.5]), wt)
+                y .~ weighted.(MixtureModel.(vcat.(Normal.(mu1, s),
+                    Normal.(mu1, s)), Ref([0.5, 0.5])), wt)
             end), SurfaceLoweringError),
         # capability: truncated mixture evidence (todo `1nb43fj`).
         ("evidence rejected",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ truncated.(MixtureModel.([Normal.(mu1, s),
-                    Normal.(mu1, s)], [0.5, 0.5]), 0, 10)
+                y .~ truncated.(MixtureModel.(vcat.(Normal.(mu1, s),
+                    Normal.(mu1, s)), Ref([0.5, 0.5])), 0, 10)
             end), SurfaceLoweringError),
         # capability: a partial observation range (todo `1nb43fj`).
         ("partial range rejected",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y[1:2] .~ MixtureModel.([Normal.(mu1, s),
-                    Normal.(mu1, s)], [0.5, 0.5])
+                y[1:2] .~ MixtureModel.(vcat.(Normal.(mu1, s),
+                    Normal.(mu1, s)), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
         # capability: parameter-free observations (10gzbm9 degenerate) (todo `1nb43fj`).
         ("fully fixed",
             :(begin
-                y .~ MixtureModel.([Normal.(-1.0, 0.5), Normal.(1.0, 0.5)],
-                    [0.4, 0.6])
+                y .~ MixtureModel.(vcat.(Normal.(-1.0, 0.5), Normal.(1.0, 0.5)), Ref([0.4, 0.6]))
             end), SurfaceLoweringError),
         # refused: undeclared name (P6, 05oe96l)
         ("unknown location",
             :(begin
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(nope, s), Normal.(0.0, s)],
-                    [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Normal.(nope, s), Normal.(0.0, s)), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
         # capability: an assigned scalar component location (todo `1nb43fj`).
         ("assignment location",
             :(begin
                 m = 2.0
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(m, s), Normal.(0.0, s)],
-                    [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Normal.(m, s), Normal.(0.0, s)), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
         # capability: a data-valued component location (todo `1nb43fj`).
         ("data-column location",
             :(begin
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(x, s), Normal.(0.0, s)],
-                    [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Normal.(x, s), Normal.(0.0, s)), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
         # capability: a computed component location (P8 1cmodra) (todo `1nb43fj`).
         ("wrapped param",
             :(begin
                 lam1 ~ LogNormal(0.0, 1.0)
-                y .~ MixtureModel.([Poisson.(exp.(lam1)), Poisson.(4.0)],
-                    [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Poisson.(exp.(lam1)), Poisson.(4.0)), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
         # capability: an unconstrained component rate, with -Inf outside support (10gzbm9 support-links) (todo `1nb43fj`).
         ("bare predictor",
@@ -298,8 +288,7 @@ end
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
-                y .~ MixtureModel.([Poisson.(eta), Poisson.(4.0)],
-                    [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Poisson.(eta), Poisson.(4.0)), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
         # refused: foo is undefined (UndefVarError in Julia)
         ("unknown wrapper",
@@ -307,53 +296,47 @@ end
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
-                y .~ MixtureModel.([Bernoulli.(foo.(eta)),
-                    Bernoulli.(0.5)], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Bernoulli.(foo.(eta)),
+                    Bernoulli.(0.5)), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
         # capability: per-component trials columns (todo `1nb43fj`).
         ("split Binomial trials",
             :(begin
-                y .~ MixtureModel.([Binomial.(n1, 0.3), Binomial.(n2, 0.3)],
-                    [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Binomial.(n1, 0.3), Binomial.(n2, 0.3)), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
         # refused: weights length mismatches component count
         ("weights length",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
-                    [0.5, 0.3, 0.2])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s), Normal.(mu1, s)), Ref([0.5, 0.3, 0.2]))
             end), ContractValidationError),
         # refused: mixture probabilities do not sum to 1
         ("weights sum",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
-                    [0.5, 0.6])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s), Normal.(mu1, s)), Ref([0.5, 0.6]))
             end), ContractValidationError),
         # refused: negative mixture weight
         ("negative weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
-                    [1.5, -0.5])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s), Normal.(mu1, s)), Ref([1.5, -0.5]))
             end), ContractValidationError),
         # refused: non-finite (Inf) mixture weight
         ("non-literal weights element",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
-                    [0.5, Inf])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s), Normal.(mu1, s)), Ref([0.5, Inf]))
             end), SurfaceLoweringError),
         # refused: Dirichlet length mismatches component count
         ("concentration length",
             :(begin
                 w ~ Dirichlet([1.0, 1.0, 1.0])
-                y .~ MixtureModel.([Normal.(-1.0, 0.5), Normal.(1.0, 0.5)],
-                    w)
+                y .~ MixtureModel.(vcat.(Normal.(-1.0, 0.5), Normal.(1.0, 0.5)), Ref(w))
             end), ContractValidationError),
         # refused: Bernoulli probability 1.5 outside [0,1]
         ("Bernoulli prob domain",
@@ -361,37 +344,36 @@ end
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
-                y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
-                    Bernoulli.(1.5)], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Bernoulli.(logistic.(eta)),
+                    Bernoulli.(1.5)), Ref([0.5, 0.5]))
             end), ContractValidationError),
         # refused: negative Poisson mean
         ("Poisson mean domain",
             :(begin
                 lam1 ~ LogNormal(0.0, 1.0)
-                y .~ MixtureModel.([Poisson.(lam1), Poisson.(-1.0)],
-                    [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Poisson.(lam1), Poisson.(-1.0)), Ref([0.5, 0.5]))
             end), ContractValidationError),
         # refused: zero Gamma scale (malformed distribution)
         ("Gamma mean domain",
             :(begin
                 a1 ~ Exponential(1.0)
                 mu1 ~ Gamma(2.0, 1.0)
-                y .~ MixtureModel.([Gamma.(a1, mu1 ./ a1),
-                    Gamma.(a1, 0.0 ./ a1)], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Gamma.(a1, mu1 ./ a1),
+                    Gamma.(a1, 0.0 ./ a1)), Ref([0.5, 0.5]))
             end), ContractValidationError),
         # refused: negative Beta shape (malformed distribution)
         ("Beta mean domain",
             :(begin
                 k1 ~ Exponential(1.0)
-                y .~ MixtureModel.([Beta.(0.3 .* k1, (1 .- 0.3) .* k1),
-                    Beta.(1.5 .* k1, (1 .- 1.5) .* k1)], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Beta.(0.3 .* k1, (1 .- 0.3) .* k1),
+                    Beta.(1.5 .* k1, (1 .- 1.5) .* k1)), Ref([0.5, 0.5]))
             end), ContractValidationError),
         # refused: empty mixture weights
         ("empty weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s)], Float64[])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s)), Ref(Float64[]))
             end), SurfaceLoweringError),
         # A scalar alias over a stated prior reads like the name itself
         # (a sampled parameter — spell it bare). It never routes to the
@@ -403,8 +385,7 @@ end
                 c ~ Normal(0.0, 5.0)
                 mu1 = c
                 s ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, s), Normal.(mu1, s)],
-                    [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, s), Normal.(mu1, s)), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
     ]
     capabilities = Set(["heterogeneous links, same base", "probit outside v1", "bad arity", "boolean weights", "frequency weights rejected", "evidence rejected", "partial range rejected", "fully fixed", "assignment location", "data-column location", "wrapped param", "bare predictor", "split Binomial trials", "stated scalar loc alias"])
@@ -498,8 +479,7 @@ end
             mu1 ~ Normal(-2.0, 0.1)
             mu2 ~ Normal(2.0, 0.1)
             sigma ~ Exponential(1.0)
-            y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)],
-                [0.4, 0.6])
+            y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([0.4, 0.6]))
         end
         cols = Dict{Symbol,AbstractVector}(:y => [-2.0, -1.8, 1.9, 2.2])
         _, _, kern, lay = _mix_query(prog, cols)
@@ -523,8 +503,7 @@ end
             mu1 = a1 .+ b1 .* x
             mu2 ~ Normal(0.0, 5.0)
             sigma ~ Exponential(1.0)
-            y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)],
-                [0.3, 0.7])
+            y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([0.3, 0.7]))
         end
         x = [0.5, -1.0, 1.5, 0.0]
         cols = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 0.5, -1.0],
@@ -548,8 +527,8 @@ end
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
-                y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
-                    Bernoulli.(0.7)], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Bernoulli.(logistic.(eta)),
+                    Bernoulli.(0.7)), Ref([0.5, 0.5]))
             end
             x = [0.5, -1.0, 1.5, 0.0]
             cols = Dict{Symbol,AbstractVector}(:y => ycol, :x => x)
@@ -569,7 +548,7 @@ end
     @testset "poisson param + literal" begin
         prog = quote
             lam1 ~ LogNormal(0.0, 1.0)
-            y .~ MixtureModel.([Poisson.(lam1), Poisson.(4.0)], [0.3, 0.7])
+            y .~ MixtureModel.(vcat.(Poisson.(lam1), Poisson.(4.0)), Ref([0.3, 0.7]))
         end
         cols = Dict{Symbol,AbstractVector}(:y => [1, 0, 3, 2])
         _, _, kern, lay = _mix_query(prog, cols)
@@ -587,8 +566,8 @@ end
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             eta = a .+ b .* x
-            y .~ MixtureModel.([Binomial.(n, logistic.(eta)),
-                Binomial.(n, 0.25)], [0.6, 0.4])
+            y .~ MixtureModel.(vcat.(Binomial.(n, logistic.(eta)),
+                Binomial.(n, 0.25)), Ref([0.6, 0.4]))
         end
         x = [0.5, -1.0, 1.5, 0.0]
         cols = Dict{Symbol,AbstractVector}(:y => [3, 7, 5, 8],
@@ -613,8 +592,8 @@ end
             mu2 ~ Gamma(2.0, 1.0)
             phi1 ~ Exponential(1.0)
             phi2 ~ Exponential(1.0)
-            y .~ MixtureModel.([NegativeBinomial2.(exp.(eta), phi1),
-                NegativeBinomial2.(mu2, phi2)], [0.5, 0.5])
+            y .~ MixtureModel.(vcat.(NegativeBinomial2.(exp.(eta), phi1),
+                NegativeBinomial2.(mu2, phi2)), Ref([0.5, 0.5]))
         end
         x = [0.5, -1.0, 1.5, 0.0]
         cols = Dict{Symbol,AbstractVector}(:y => [2, 0, 4, 1], :x => x)
@@ -640,8 +619,8 @@ end
             eta = a .+ b .* x
             alpha ~ Exponential(1.0)
             mu2 ~ Gamma(2.0, 1.0)
-            y .~ MixtureModel.([Gamma.(alpha, exp.(eta) ./ alpha),
-                Gamma.(alpha, mu2 ./ alpha)], [0.5, 0.5])
+            y .~ MixtureModel.(vcat.(Gamma.(alpha, exp.(eta) ./ alpha),
+                Gamma.(alpha, mu2 ./ alpha)), Ref([0.5, 0.5]))
         end
         x = [0.5, -1.0, 1.5, 0.0]
         cols = Dict{Symbol,AbstractVector}(:y => [1.5, 0.5, 2.0, 1.0],
@@ -665,9 +644,9 @@ end
             b ~ Normal(0, 1)
             eta = a .+ b .* x
             kappa ~ Exponential(1.0)
-            y .~ MixtureModel.([Beta.(logistic.(eta) .* kappa,
+            y .~ MixtureModel.(vcat.(Beta.(logistic.(eta) .* kappa,
                     (1 .- logistic.(eta)) .* kappa),
-                Beta.(0.7 .* kappa, (1 .- 0.7) .* kappa)], [0.5, 0.5])
+                Beta.(0.7 .* kappa, (1 .- 0.7) .* kappa)), Ref([0.5, 0.5]))
         end
         x = [0.5, -1.0, 1.5, 0.0]
         cols = Dict{Symbol,AbstractVector}(:y => [0.2, 0.8, 0.4, 0.6],
@@ -689,7 +668,7 @@ end
         prog = quote
             mu1 ~ Normal(-2.0, 0.1)
             sigma ~ Exponential(1.0)
-            y .~ MixtureModel.([Normal.(mu1, sigma)], [1.0])
+            y .~ MixtureModel.(vcat.(Normal.(mu1, sigma)), Ref([1.0]))
         end
         cols = Dict{Symbol,AbstractVector}(:y => [-2.0, -1.8, 1.9, 2.2])
         _, _, kern, lay = _mix_query(prog, cols)
@@ -725,8 +704,7 @@ end
                 mu1 ~ Normal(-2.0, 0.1)
                 mu2 ~ Normal(2.0, 0.1)
                 sigma ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)],
-                    [0.4, 0.6])
+                y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([0.4, 0.6]))
             end, Dict{Symbol,AbstractVector}(:y => [-2.0, -1.8, 1.9, 2.2]),
             (mu1 = -2.0, mu2 = 2.0, sigma = 0.3))
     end
@@ -735,16 +713,15 @@ end
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
-                y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
-                    Bernoulli.(0.7)], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Bernoulli.(logistic.(eta)),
+                    Bernoulli.(0.7)), Ref([0.5, 0.5]))
             end, Dict{Symbol,AbstractVector}(:y => [0, 1, 1, 0], :x => x),
             (a = 0.2, b = -0.4,))
     end
     @testset "poisson" begin
         _mix_enzyme_check(quote
                 lam1 ~ LogNormal(0.0, 1.0)
-                y .~ MixtureModel.([Poisson.(lam1), Poisson.(4.0)],
-                    [0.3, 0.7])
+                y .~ MixtureModel.(vcat.(Poisson.(lam1), Poisson.(4.0)), Ref([0.3, 0.7]))
             end, Dict{Symbol,AbstractVector}(:y => [1, 0, 3, 2]),
             (lam1 = 1.5,))
     end
@@ -753,8 +730,8 @@ end
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
-                y .~ MixtureModel.([Binomial.(n, logistic.(eta)),
-                    Binomial.(n, 0.25)], [0.6, 0.4])
+                y .~ MixtureModel.(vcat.(Binomial.(n, logistic.(eta)),
+                    Binomial.(n, 0.25)), Ref([0.6, 0.4]))
             end, Dict{Symbol,AbstractVector}(:y => [3, 7, 5, 8], :x => x,
                 :n => [10, 10, 10, 10]), (a = 0.2, b = -0.4,))
     end
@@ -766,8 +743,8 @@ end
                 mu2 ~ Gamma(2.0, 1.0)
                 phi1 ~ Exponential(1.0)
                 phi2 ~ Exponential(1.0)
-                y .~ MixtureModel.([NegativeBinomial2.(exp.(eta), phi1),
-                    NegativeBinomial2.(mu2, phi2)], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(NegativeBinomial2.(exp.(eta), phi1),
+                    NegativeBinomial2.(mu2, phi2)), Ref([0.5, 0.5]))
             end, Dict{Symbol,AbstractVector}(:y => [2, 0, 4, 1], :x => x),
             (a = 0.3, b = 0.1, mu2 = 2.0, phi1 = 1.5, phi2 = 0.5))
     end
@@ -778,8 +755,8 @@ end
                 eta = a .+ b .* x
                 alpha ~ Exponential(1.0)
                 mu2 ~ Gamma(2.0, 1.0)
-                y .~ MixtureModel.([Gamma.(alpha, exp.(eta) ./ alpha),
-                    Gamma.(alpha, mu2 ./ alpha)], [0.5, 0.5])
+                y .~ MixtureModel.(vcat.(Gamma.(alpha, exp.(eta) ./ alpha),
+                    Gamma.(alpha, mu2 ./ alpha)), Ref([0.5, 0.5]))
             end, Dict{Symbol,AbstractVector}(:y => [1.5, 0.5, 2.0, 1.0],
                 :x => x), (a = 0.2, b = -0.1, alpha = 2.0, mu2 = 1.5))
     end
@@ -789,9 +766,9 @@ end
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
                 kappa ~ Exponential(1.0)
-                y .~ MixtureModel.([Beta.(logistic.(eta) .* kappa,
+                y .~ MixtureModel.(vcat.(Beta.(logistic.(eta) .* kappa,
                         (1 .- logistic.(eta)) .* kappa),
-                    Beta.(0.7 .* kappa, (1 .- 0.7) .* kappa)], [0.5, 0.5])
+                    Beta.(0.7 .* kappa, (1 .- 0.7) .* kappa)), Ref([0.5, 0.5]))
             end, Dict{Symbol,AbstractVector}(:y => [0.2, 0.8, 0.4, 0.6],
                 :x => x), (a = 0.2, b = -0.4, kappa = 5.0))
     end
@@ -801,8 +778,7 @@ end
                 mu1 ~ Normal(-2.0, 0.1)
                 mu2 ~ Normal(2.0, 0.1)
                 sigma ~ Exponential(1.0)
-                y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)],
-                    w)
+                y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref(w))
             end, Dict{Symbol,AbstractVector}(:y => [-2.0, -1.8, 1.9, 2.2]),
             (w = [0.4, 0.6], mu1 = -2.0, mu2 = 2.0, sigma = 0.3))
     end
@@ -827,8 +803,7 @@ end
         mu1 ~ Normal(-2.0, 0.1)
         mu2 ~ Normal(2.0, 0.1)
         sigma ~ Exponential(1.0)
-        y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)],
-            [0.4, 0.6])
+        y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([0.4, 0.6]))
     end
     h4 = _mix_statement_heads(prog,
         Dict{Symbol,AbstractVector}(:y => [-2.0, -1.8, 1.9, 2.2]))
@@ -869,19 +844,18 @@ end
             mu1 ~ Normal(-2.0, 0.1)
             mu2 ~ Normal(2.0, 0.1)
             sigma ~ Exponential(1.0)
-            y .~ MixtureModel.([Normal.(mu1, sigma), Normal.(mu2, sigma)],
-                [0.4, 0.6])
+            y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([0.4, 0.6]))
         end, Dict{Symbol,AbstractVector}(:y => [-2.0, -1.8, 1.9, 2.2])),
         ("poisson", quote
             lam1 ~ LogNormal(0.0, 1.0)
-            y .~ MixtureModel.([Poisson.(lam1), Poisson.(4.0)], [0.3, 0.7])
+            y .~ MixtureModel.(vcat.(Poisson.(lam1), Poisson.(4.0)), Ref([0.3, 0.7]))
         end, Dict{Symbol,AbstractVector}(:y => [1, 0, 3, 2])),
         ("bernoulli", quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             eta = a .+ b .* x
-            y .~ MixtureModel.([Bernoulli.(logistic.(eta)),
-                Bernoulli.(0.7)], [0.5, 0.5])
+            y .~ MixtureModel.(vcat.(Bernoulli.(logistic.(eta)),
+                Bernoulli.(0.7)), Ref([0.5, 0.5]))
         end, Dict{Symbol,AbstractVector}(:y => [0, 1, 1, 0], :x => x)),
     ]
     for (name, prog, cols) in progs
@@ -921,7 +895,7 @@ _mix_is_upstream_gap(e) =
 @testset "mixture simplex weights XLA gap is pinned upstream" begin
     prog_w = quote
         w ~ Dirichlet([1.0, 1.0])
-        y .~ MixtureModel.([Normal.(-1.0, 0.5), Normal.(1.0, 0.5)], w)
+        y .~ MixtureModel.(vcat.(Normal.(-1.0, 0.5), Normal.(1.0, 0.5)), Ref(w))
     end
     cols_w = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5])
     try
@@ -958,8 +932,8 @@ _mix_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
             mu1 ~ Normal(-2.0, 0.1)
             mu2 ~ Normal(2.0, 0.1)
             sigma = c
-            y .~ MixtureModel.([Normal.(mu1, exp.(sigma)),
-                Normal.(mu2, exp.(sigma))], [0.4, 0.6])
+            y .~ MixtureModel.(vcat.(Normal.(mu1, exp.(sigma)),
+                Normal.(mu2, exp.(sigma))), Ref([0.4, 0.6]))
         end
         bound, built, kern, lay = _mix_query(prog,
             Dict{Symbol,AbstractVector}(:y => [-2.0, -1.8, 1.9, 2.2]))
@@ -984,8 +958,7 @@ _mix_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         prog = quote
             lambda1 ~ Exponential(1.0)
             lambda2 ~ Exponential(1.0)
-            y .~ MixtureModel.([Poisson.(lambda1), Poisson.(lambda2)],
-                [0.3, 0.7])
+            y .~ MixtureModel.(vcat.(Poisson.(lambda1), Poisson.(lambda2)), Ref([0.3, 0.7]))
         end
         bound, built, kern, lay = _mix_query(prog,
             Dict{Symbol,AbstractVector}(:y => [0, 1, 3, 5, 2]))

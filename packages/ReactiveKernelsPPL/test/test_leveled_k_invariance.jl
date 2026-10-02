@@ -55,7 +55,7 @@ function _kinv_plans(K::Int)
             end, (:y, :x)), data(:y => y, :x => x)),
         "categorical_simplex" => bind_data(lower_rkppl(quote
                 s ~ Dirichlet($K, 1.0)
-                y .~ Categorical.(s)
+                y .~ Categorical(s)
             end, (:y,)), data(:y => y)),
         "monotonic" => bind_data(lower_rkppl(quote
                 a ~ Normal(0, 1)

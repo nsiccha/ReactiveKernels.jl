@@ -96,8 +96,8 @@ end
 
 @testset "student evidence values" begin
     @testset "censored incl. at-bound rows" begin
-        # y rows: below lo, at lo, interior, at hi, above hi.
-        cols = Dict{Symbol,AbstractVector}(:y => [-1.0, 0.0, 4.0, 10.0, 12.0],
+        # Observed values at both endpoints and in the interior.
+        cols = Dict{Symbol,AbstractVector}(:y => [0.0, 0.0, 4.0, 10.0, 10.0],
             :x => [0.0, 1.0, 2.0, 3.0, 4.0], :lo => fill(0.0, 5),
             :hi => fill(10.0, 5))
         _, _, kern, lay = _stev_query(Meta.parse("""begin
@@ -159,7 +159,7 @@ end
 end
 
 @testset "student evidence Enzyme-vs-findiff" begin
-    cols = Dict{Symbol,AbstractVector}(:y => [-1.0, 0.0, 4.0, 10.0, 12.0],
+    cols = Dict{Symbol,AbstractVector}(:y => [0.0, 0.0, 4.0, 10.0, 10.0],
         :x => [0.0, 1.0, 2.0, 3.0, 4.0], :lo => fill(0.0, 5),
         :hi => fill(10.0, 5))
     prog = Meta.parse("""begin
@@ -218,7 +218,7 @@ end
         y .~ censored.(StudentT.(3.0, mu, sigma), lo, hi)
     end""")
     fx = _stev_reactant(prog, Dict{Symbol,AbstractVector}(
-        :y => [-1.0, 4.0, 12.0], :x => [0.0, 1.0, 2.0],
+        :y => [0.0, 4.0, 10.0], :x => [0.0, 1.0, 2.0],
         :lo => fill(0.0, 3), :hi => fill(10.0, 3)))
     @test fx.primal ≈ fx.native rtol = 1e-9
     @test fx.rval ≈ fx.val rtol = 1e-9
@@ -232,10 +232,10 @@ end
     # hundreds of lines per row — an unrolled CF loop explodes the
     # reverse past 8 GB on 3 rows).
     small = _stev_reactant(prog, Dict{Symbol,AbstractVector}(
-        :y => [1.0, 12.0], :x => [0.0, 1.0], :lo => fill(0.0, 2),
+        :y => [0.0, 10.0], :x => [0.0, 1.0], :lo => fill(0.0, 2),
         :hi => fill(10.0, 2)))
     large = _stev_reactant(prog, Dict{Symbol,AbstractVector}(
-        :y => [-1.0, 1.0, 4.0, 10.0, 12.0, 5.0], :x => collect(0.0:5.0),
+        :y => [0.0, 0.0, 4.0, 10.0, 10.0, 5.0], :x => collect(0.0:5.0),
         :lo => fill(0.0, 6), :hi => fill(10.0, 6)))
     @test small.whiles == large.whiles
     @test small.batches == large.batches

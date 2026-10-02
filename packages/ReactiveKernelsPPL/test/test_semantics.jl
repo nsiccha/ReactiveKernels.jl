@@ -2,7 +2,7 @@ using CategoricalArrays
 using DataAPI
 using DifferentiationInterface: AutoEnzyme
 using Distributions: Normal, Bernoulli, Binomial, Poisson, TDist, censored,
-    truncated, cdf, logpdf
+    truncated, cdf, logpdf, MixtureModel, Categorical, Multinomial
 using Enzyme
 using ReactiveKernelsPPL
 using Test
@@ -22,8 +22,10 @@ function _semantics_check(ast, data, oracle; names = nothing)
         backend = AutoEnzyme(; mode = Enzyme.Reverse))
     grad = similar(u)
     value, _ = sampler_value_and_gradient!(sampler, grad, u)
-    posterior_query = prepare_query(built, bound, :sampler)
-    posterior(v) = Base.invokelatest(posterior_query, v)
+    prior_query = prepare_query(built, bound, :prior)
+    jacobian_query = prepare_query(built, bound, :log_jacobian)
+    posterior(v) = reference(v) + Base.invokelatest(prior_query, v) +
+        Base.invokelatest(jacobian_query, v)
     h = 1e-5
     fd = [begin
         hi, lo = copy(u), copy(u)
@@ -35,6 +37,65 @@ function _semantics_check(ast, data, oracle; names = nothing)
     @test grad ≈ fd rtol = 2e-5 atol = 2e-7
     @test data == original
     return (; bound, built, u)
+end
+
+@testset "Julia distribution broadcasting shapes" begin
+    x, y = [-1.0, 0.0, 0.5, 1.0], [0.2, -0.3, 0.5, 0.1]
+    data = Dict{Symbol,Any}(:x => x, :y => y)
+    mixture = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        w ~ Dirichlet([2.0, 3.0])
+        mu1 = a .+ b .* x
+        y .~ MixtureModel.(vcat.(Normal.(mu1, 1), Normal.(1, 1)), Ref(w))
+    end
+    _semantics_check(mixture, data, q -> sum(logpdf.(
+        MixtureModel.(vcat.(Normal.(q.a .+ q.b .* x, 1), Normal.(1, 1)), Ref(q.w)), y)))
+    categorical_ast = quote
+        s ~ Dirichlet([1.0, 2.0, 3.0])
+        y .~ Categorical(s)
+    end
+    cats = Dict{Symbol,Any}(:y => [1, 3, 2, 3])
+    _semantics_check(categorical_ast, cats, q -> sum(logpdf.(Categorical(q.s), cats[:y])))
+    multinomial_ast = quote
+        s ~ Dirichlet([1.0, 2.0, 3.0])
+        eachrow(hcat(c1, c2, c3)) .~ Multinomial.(N, Ref(s))
+    end
+    counts = Dict{Symbol,Any}(:c1 => [1, 2, 0, 1], :c2 => [2, 1, 1, 0],
+        :c3 => [0, 1, 2, 2], :N => [3, 4, 3, 3])
+    _semantics_check(multinomial_ast, counts, q -> sum(logpdf.(
+        Multinomial.(counts[:N], Ref(q.s)),
+        eachrow(hcat(counts[:c1], counts[:c2], counts[:c3])))))
+    # Scalar iid broadcasting constructs one distribution and shares it
+    # across the response column; current lowering already supports this.
+    iid = quote
+        a ~ Normal(0, 1)
+        y .~ Normal.(a, 1)
+    end
+    _semantics_check(iid, data, q -> sum(logpdf.(Normal(q.a, 1), y)))
+    # refused: the old spellings construct arrays of vectors, broadcast
+    # simplex elements, or pass counts as constructor arguments (0tz0qfu).
+    for (rhs, hint) in ((:(MixtureModel.([Normal.(mu, 1), Normal.(1, 1)], [0.4, 0.6])), "vcat"),
+            (:(MixtureModel.(vcat.(Normal.(mu, 1), Normal.(1, 1)), [0.4, 0.6])), "Ref(w)"))
+        err = try lower_rkppl(quote
+            a ~ Normal(0, 1)
+            mu = a .+ 0 .* x
+            y .~ $rhs
+        end, data); nothing catch e; e end
+        @test err isa SurfaceLoweringError
+        @test occursin(hint, sprint(showerror, err))
+    end
+    for (ast, values, hint) in ((quote
+            s ~ Dirichlet([1.0, 2.0, 3.0])
+            y .~ Categorical.(s)
+        end, cats, "Categorical(s)"), (quote
+            s ~ Dirichlet([1.0, 2.0, 3.0])
+            c1 .~ Multinomial.(N, s, c2, c3)
+        end, counts, "eachrow(hcat"))
+        err = try lower_rkppl(ast, values); nothing catch e; e end
+        @test err isa SurfaceLoweringError
+        @test occursin(hint, sprint(showerror, err))
+    end
 end
 
 @testset "Julia matrix intercept columns" begin
