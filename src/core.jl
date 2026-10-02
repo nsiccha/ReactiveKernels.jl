@@ -672,6 +672,15 @@ Base.@propagate_inbounds (index::_PlateCellIndex)(cell) =
     (true, first_index)
 end
 
+# Every cell of a plate, in coordinate order. A single axis iterates its range
+# directly: `CartesianIndices` iteration of one axis is a loop the compiler does
+# not vectorize (measured: a third of a dose-outer superposition read went to
+# its `__inc` on the seed pass), while several axes keep the Cartesian
+# iteration, which avoids converting linear positions per cell.
+@inline _plate_cells(cells::CartesianIndices{1}) =
+    Base.Generator(CartesianIndex, only(cells.indices))
+@inline _plate_cells(cells::CartesianIndices) = cells
+
 # The cell positions whose gather index `first_index + position - 1` lies in
 # `source`'s range, as `lo:hi` within `1:n` (empty when none do).
 @inline function _plate_gather_window(source::AbstractVector, first_index::Int,

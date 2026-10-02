@@ -1004,6 +1004,8 @@ function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
         $entry, $element, $(extra...), $(arguments(cell)...))))
     window(range, body) = Expr(:for, Expr(:(=), position, range),
         Expr(:block, Expr(:(=), cell, _inbounds_value(:($cells[$position]))), body))
+    every(body) = Expr(:for, Expr(:(=), cell,
+        :($(GlobalRef(@__MODULE__, :_plate_cells))($cells))), Expr(:block, body))
     # The index function passed to the out-of-line check (`_PlateCellIndex`).
     # Its per-cell arguments are the raw plate arguments, read at the cell:
     # each must span the plate's axes (no singleton expansion), which also
@@ -1033,9 +1035,7 @@ function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
     passes = quote
         $iterator = $parts.iterator($(select(reduction.iterator, nothing)...))
         $source = $parts.array($(select(reduction.source, nothing)...))
-        for $cell in $cells
-            $(_inbounds_expr(:($entry = $parts.init($(select(reduction.init, cell)...)))))
-        end
+        $(every(_inbounds_expr(:($entry = $parts.init($(select(reduction.init, cell)...))))))
         for $element in $iterator
             $index_of = $index_function
             ($affine, $first_index) =
@@ -1047,9 +1047,7 @@ function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
                 $(window(:($lo:$hi), step(:step_in, gathered)))
                 $(window(:(($hi + 1):$count), step(:step_out)))
             else
-                for $cell in $cells
-                    $(step(:step))
-                end
+                $(every(step(:step)))
             end
         end
     end
@@ -1061,8 +1059,7 @@ function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
     end
     if accumulator !== nothing
         # The total adds the cells in coordinate order, as the cell loop does.
-        push!(interchanged.args, Expr(:for, Expr(:(=), cell, cells),
-            Expr(:block, :($accumulator += $(_inbounds_value(entry))))))
+        push!(interchanged.args, every(:($accumulator += $(_inbounds_value(entry)))))
     end
     Expr(:if, ready, interchanged, cell_loop)
 end
