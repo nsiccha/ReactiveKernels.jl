@@ -2219,7 +2219,7 @@ _all_fields_spec() = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
     :s, :w, _none_evidence(), :y_resp, 7, 1:5, nothing, :cuts, [:p2], [:c2],
     :cumulative, 2.0, [:tc], :tco, [:y2], :fs, :fc, :ga, :gb, GaussianFam,
     Union{Symbol,Real}[:l1], Union{Nothing,Symbol,Real,ScalePredictorRef}[:s1],
-    :mw, 4.0, 0.2, :jobs, (0.0, 2pi))
+    :mw, 4.0, 0.2, :jobs, (0.0, 2pi), :teffects)
 
 @testset "field-preserving rebuilds" begin
     r = _all_fields_spec()
