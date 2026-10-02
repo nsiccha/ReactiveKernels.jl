@@ -320,3 +320,41 @@ slope `x .* u`. Draws are `u_sd` and `u_z`.
     z[levels(g)] .~ Normal.(0, 1)
     return sd[s] .* z[g]
 end
+
+"""
+    u ~ varying_stratified_correlated(g, s, K)
+
+Stratified correlated margins: each stratum (level of `s`) has its own
+`K` sds and its own `LKJCholesky(K, 1.0)` factor, the levels of `g` share
+`z`, and observation `i` reads the row
+`(sd[s[i], :] .* L[s[i]]) * z[g[i], :]`. Its body:
+
+```julia
+@rkppl varying_stratified_correlated(g, s, K) = begin
+    sd[levels(s), 1:K] .~ HalfNormal.(1)
+    @plate for k in levels(s)
+        L[k] ~ LKJCholesky(K, 1.0)
+    end
+    z[levels(g), 1:K] .~ Normal.(0, 1)
+    @plate for i in eachindex(g)
+        b[i, 1:K] = (sd[s[i], :] .* L[s[i]]) * z[g[i], :]
+    end
+    return b
+end
+```
+
+`u` has one row per observation: margin `k` is the column `u[:, k]`, so a
+correlated intercept and slope read `u[:, 1] .+ x .* u[:, 2]`. Draws are
+`u_sd`, `u_L` (`u_L[:, :, k]` stratum k's factor) and `u_z`.
+"""
+@rkppl varying_stratified_correlated(g, s, K) = begin
+    sd[levels(s), 1:K] .~ HalfNormal.(1)
+    @plate for k in levels(s)
+        L[k] ~ LKJCholesky(K, 1.0)
+    end
+    z[levels(g), 1:K] .~ Normal.(0, 1)
+    @plate for i in eachindex(g)
+        b[i, 1:K] = (sd[s[i], :] .* L[s[i]]) * z[g[i], :]
+    end
+    return b
+end

@@ -581,6 +581,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, demoted::Set{Symbol},
     sample, det, plate_ctx, plate_specs, scans, bases, vectors,
     hbases, kplates, kstmts, schedules, event_lps, r2d2decls, joints,
     varying_draws, varying_pending, glms = _partition_statements(ast, data)
+    sample, det = _rewrite_plate_rows(sample, det)
     # Functions as values: definition call heads outside the built-in
     # vocabulary resolve in the model module (submodel bodies resolved in
     # their own module during expansion). Names are gathered before the
@@ -4608,11 +4609,40 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
                 QuoteNode(rhs))
             push!(out, Expr(:(=), col, Expr(:call, :_ppl_plate_column, spec,
                 sort!(collect(deps))...)))
+        elseif lc isa Expr && lc.head === :ref && length(lc.args) == 3 &&
+                lc.args[1] isa Symbol && lc.args[2] === ivar
+            # A row per index (`b[i, 1:K] = row`): one plate column per
+            # component, read back as the columns of `b` (`b[:, k]`).
+            col = lc.args[1]
+            col in data && _sfail("cell assignment `$(repr(lc)) = ...` " *
+                "redefines bound data")
+            K = _literal_range_len(lc.args[3])
+            K === nothing && _sfail("cell `$(repr(c))`: a row per index " *
+                "states its length, `$col[$ivar, 1:K] = ...` with a literal K")
+            rowv = Symbol(:_rkppl_rowv_, col)
+            body = Expr(:block, (Expr(:(=), k, v) for (k, v) in locals)...,
+                Expr(:(=), rowv, rhs))
+            deps = Set{Symbol}()
+            for (_, v) in locals
+                _cell_free_syms!(deps, v)
+            end
+            _cell_free_syms!(deps, rhs)
+            setdiff!(deps, Set{Symbol}(first.(locals)))
+            delete!(deps, ivar)
+            parts = Symbol[]
+            for k in 1:K
+                pk = Symbol(:_rkppl_row_, col, :_, k)
+                push!(parts, pk)
+                spec = Expr(:tuple, QuoteNode(ivar), QuoteNode(body),
+                    QuoteNode(:($rowv[$k])))
+                push!(out, Expr(:(=), pk, Expr(:call, :_ppl_plate_column,
+                    spec, sort!(collect(deps))...)))
+            end
+            push!(out, Expr(:(=), col, Expr(:call, :_ppl_rows, parts...)))
         elseif lc isa Expr && lc.head === :ref
-            _sfail("cell `$(repr(c))`: a per-index output is one value per " *
-                "index (`$(lc.args[1])[$ivar] = ...`); a row per index " *
-                "(`$(repr(lc))`) is not supported yet — define one column " *
-                "per component (`r1[$ivar] = row[1]`)")
+            _sfail("cell `$(repr(c))`: a per-index output is a value " *
+                "(`$(lc.args[1])[$ivar] = ...`) or a row " *
+                "(`$(lc.args[1])[$ivar, 1:K] = ...`)")
         else
             _sfail("cell assignment LHS is a local (`t = ...`) or an " *
                 "`$ivar`-indexed column, got $(repr(lc))")
@@ -4858,6 +4888,53 @@ function _plate_column_expr(nm::Symbol, call::Expr,
     lam = Expr(:->, Expr(:tuple, lanevars..., shared...),
         Expr(:block, LineNumberNode(0, :rkppl_plate), stmts..., outx))
     return Expr(:do, Expr(:call, :plate, inputs...), lam)
+end
+
+_literal_range_len(r) = (r isa Expr && r.head === :call && length(r.args) == 3 &&
+    r.args[1] === :(:) && r.args[2] == 1 && r.args[3] isa Int &&
+    r.args[3] >= 1) ? r.args[3] : nothing
+
+# Rows per index (`b[i, 1:K] = row` in an array plate): `b` stands for the
+# matrix whose column k is the plate column `_rkppl_row_b_k`. A read of a
+# column (`b[:, k]`, also through an alias `u = b`) becomes that plate
+# column; the `_ppl_rows` definition and its aliases leave the program.
+function _rewrite_plate_rows(sample, det)
+    rows = Dict{Symbol,Vector{Symbol}}()
+    for (nm, rhs) in det
+        rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+            rhs.args[1] === :_ppl_rows && (rows[nm] = Symbol[rhs.args[2:end]...])
+    end
+    isempty(rows) && return sample, det
+    changed = true
+    while changed
+        changed = false
+        for (nm, rhs) in det
+            if rhs isa Symbol && haskey(rows, rhs) && !haskey(rows, nm)
+                rows[nm] = rows[rhs]
+                changed = true
+            end
+        end
+    end
+    function rw(ex)
+        ex isa Symbol && haskey(rows, ex) && _sfail("rows per index `$ex` " *
+            "are read by column (`$ex[:, k]`)")
+        ex isa Expr || return ex
+        if ex.head === :ref && length(ex.args) == 3 && ex.args[1] isa Symbol &&
+                haskey(rows, ex.args[1]) && ex.args[2] === :(:)
+            k = ex.args[3]
+            parts = rows[ex.args[1]]
+            k isa Int && 1 <= k <= length(parts) || _sfail("`$(repr(ex))` " *
+                "reads column $(repr(k)) of rows with $(length(parts)) " *
+                "columns (a literal 1..$(length(parts)))")
+            return parts[k]
+        end
+        return Expr(ex.head, map(rw, ex.args)...)
+    end
+    newdet = Pair{Symbol,Any}[nm => rw(rhs) for (nm, rhs) in det
+        if !haskey(rows, nm)]
+    newsample = [SampleStmt(s.lhs, rw(s.rhs), s.broadcast, s.range, s.levels,
+        s.matrix, s.dims, s.slices) for s in sample]
+    return newsample, newdet
 end
 
 _is_plate_column_call(ex) = ex isa Expr && ex.head === :call &&
