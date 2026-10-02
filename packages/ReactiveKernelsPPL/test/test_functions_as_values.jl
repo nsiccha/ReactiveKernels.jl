@@ -63,6 +63,17 @@ end
 const WIDE_NAMES = [Symbol(:b, i) for i in 1:40]
 @eval wide_reads(v, $(WIDE_NAMES...)) =
     fill(sum(v) + $(foldl((a, b) -> :($a + $b), WIDE_NAMES)), 3)
+# A one-element schedule column unwrapped by a guard whose message
+# interpolates (counted: the data-only part runs once, outside the
+# gradient), and a parameter-dependent read of the schedule.
+const UNWRAPS = Ref(0)
+function take_schedule(col)
+    UNWRAPS[] += 1
+    length(col) == 1 ||
+        throw(ArgumentError("need one schedule, got $(length(col))"))
+    return only(col)
+end
+schedule_reads(sched, b) = b .* sched.a .+ sched.k
 end
 const _FV = FunctionsAsValuesModels
 
@@ -494,6 +505,54 @@ end
     cols2 = copy(cols)
     cols2[:vx] = [1.0, 2.0]
     @test_throws ContractValidationError bind_data(plan, cols2)
+end
+
+@testset "functions as values: data-only part of a parameter-dependent call" begin
+    # A data-only definition a parameter-dependent call consumes inlines
+    # into that call at lowering. The generator emits it as its own
+    # statement, so preparation evaluates it once and the gradient never
+    # differentiates it — named or inline. Here it is a guard with an
+    # interpolated message unwrapping a multi-field schedule (snag
+    # `interpolated-err-41772e14`).
+    sched = (; a = [1.0, 2.0], k = [1, 2], f = [0.5, 0.25])
+    snapshot = deepcopy(sched)
+    cols = Dict{Symbol,AbstractVector}(:y => [0.1, 0.4, -0.2, 0.3],
+        :oi => [1, 2, 2, 1], :s => [sched])
+    named = quote
+        sigma ~ Exponential(1.0)
+        b ~ Normal(0, 1)
+        sc = take_schedule(s)
+        reads = schedule_reads(sc, b)
+        y .~ Normal.(reads[oi], sigma)
+    end
+    inline = quote
+        sigma ~ Exponential(1.0)
+        b ~ Normal(0, 1)
+        reads = schedule_reads(take_schedule(s), b)
+        y .~ Normal.(reads[oi], sigma)
+    end
+    u = [0.2, -0.3]
+    for ast in (named, inline)
+        plan, bound, built = _fv_build(ast, cols)
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        r = th.b .* sched.a .+ sched.k
+        ll = sum(logpdf(Normal(r[cols[:oi][i]], th.sigma), cols[:y][i])
+            for i in 1:4)
+        @test _fv_value(built, bound, :likelihood, u) ≈ ll
+        _FV.UNWRAPS[] = 0
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        @test _FV.UNWRAPS[] == 1               # folded once by preparation
+        g = similar(u)
+        for w in (u, [0.7, 0.1])
+            Base.invokelatest(ReactiveKernels.ad_value_and_gradient!, q.ad,
+                g, w)
+        end
+        @test _FV.UNWRAPS[] == 1               # never recomputed in-graph
+        @test isapprox(g,
+            _fv_findiff(w -> Base.invokelatest(q.kernel, w), [0.7, 0.1]);
+            rtol = 1e-5, atol = 1e-7)
+        @test only(cols[:s]) == snapshot       # bound data untouched
+    end
 end
 
 @testset "functions as values: dotted vocabulary and keywords" begin
