@@ -57,6 +57,12 @@ function decayed_events(g, t, eg, et, ea, w, scale, k)
     end
     return out
 end
+# A helper with forty positional scalar arguments after one vector, summed
+# pairwise (no splat in its own body): a call to it carries more than the 32
+# arguments Julia's inliner forwards statically.
+const WIDE_NAMES = [Symbol(:b, i) for i in 1:40]
+@eval wide_reads(v, $(WIDE_NAMES...)) =
+    fill(sum(v) + $(foldl((a, b) -> :($a + $b), WIDE_NAMES)), 3)
 end
 const _FV = FunctionsAsValuesModels
 
@@ -724,5 +730,37 @@ end
         _, dg = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
             dq.ad, similar(u), u)
         @test dg ≈ g
+    end
+end
+
+@testset "functions as values: a call wider than 32 arguments (Enzyme vs FD)" begin
+    # A parameter-dependent call with a data vector plus forty scalar
+    # parameters reaches the kernel as one fused op of 41+ inputs. Its
+    # reverse gradient used to fail with `EnzymeRuntimeActivityError` once
+    # the op had 32 inputs or more (snag `rkppl-module-cal-79cad594`): the
+    # op's entry call splatted its arguments, and past 32 that splat stays a
+    # dynamic call holding the constant data next to active parameters.
+    cols = Dict{Symbol,ColumnData}(
+        :age => [0.0, 0.1, 0.2], :oi => [1, 2, 3, 3],
+        :y => [0.1, 0.2, 0.3, 0.4])
+    names = _FV.WIDE_NAMES
+    priors = [:($b ~ Normal(0.0, 1.0)) for b in names]
+    for argument in (:age, :(c .* age), :(a .+ c .* age))
+        ast = Expr(:block,
+            :(sigma ~ Exponential(1.0)), :(a ~ Normal(0.0, 1.0)),
+            :(c ~ Normal(0.0, 1.0)), priors...,
+            :(reads = wide_reads($argument, $(names...))),
+            :(y .~ Normal.(reads[oi], sigma)))
+        _, bound, built = _fv_build(ast, cols)
+        kern = prepare_query(built, bound, :sampler)
+        n = length(coordinate_names(built.layout))
+        @test n == 43
+        u = [0.05 * (-1)^i * i / n for i in 1:n]
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        v, g = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            q.ad, similar(u), u)
+        @test v ≈ Base.invokelatest(kern, u)
+        @test isapprox(g, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
     end
 end
