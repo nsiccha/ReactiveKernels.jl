@@ -801,8 +801,8 @@ end
 # `B * w`: a per-observation matrix — a bound data matrix `B` (supplied, or
 # a data-only module value the model computes at bind), or the rows of an
 # array gathered per observation (`z[g, :]`) — times an array-valued
-# expression: one value per observation (standard Julia matrix-vector
-# product).
+# expression: one value or row per observation (standard Julia
+# matrix-vector or matrix-matrix product).
 function _is_data_matvec(ex, plan::StructuralPlan)
     ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
         ex.args[1] === :* || return false
@@ -855,7 +855,7 @@ function _collect_data_matvec!(refs, ex::Expr, plan::StructuralPlan, label,
     eltype(col) <: Real || _fail(label, "matrix $B is not numeric")
     if w isa Symbol && _is_array_param(plan, w)
         dims = _array_dims(plan, _array_param(plan, w))
-        length(dims) == 1 && dims[1] == size(col, 2) || _fail(label,
+        length(dims) in (1, 2) && dims[1] == size(col, 2) || _fail(label,
             "`$(repr(ex))`: $B has $(size(col, 2)) columns but $w has " *
             "size $(repr(Tuple(dims)))")
     end
