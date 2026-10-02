@@ -1734,8 +1734,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         return _obs_axis(ex, data, detmap, memo, active, env) ?
             :vector : :scalar
     end
-    head === Symbol("'") && return shape(ex.args[1]) === :array ? :array :
-        :scalar
+    head === Symbol("'") && return shape(ex.args[1]) in (:array, :matrix) ?
+        shape(ex.args[1]) : :scalar
     head === :call || return :scalar  # exotic heads: downstream rejects
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
@@ -1773,9 +1773,9 @@ end
 function _ref_shape(ex, data)
     idx = ex.args[2:end]
     isempty(idx) && return :scalar
-    if idx[1] isa Symbol && idx[1] in data
-        # Per-observation gather: one value (or row) per observation.
-        length(idx) == 2 && idx[2] === :(:) && return :matrix
+    if any(i -> i isa Symbol && i in data, idx)
+        # Per-observation gather: scalar selection or an oriented matrix.
+        any(i -> i === :(:), idx) && return :matrix
         return :vector
     end
     any(i -> i === :(:), idx) && return :array
@@ -1824,13 +1824,16 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2].args)
     elseif ex.head === :ref
-        # A gather from an array value (`z[g, 1]`, `b[g, 1]` with
-        # `b = z * M`) follows its first index, like a one-index gather.
+        # A gather from an array value follows its observation index on
+        # either axis, including definitions such as `b = z * M`.
         array_base = ex.args[1] isa Symbol && length(ex.args) >= 2 &&
             (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
                 _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
         array_base || _is_gather(ex, data, detmap, env) || return false
-        return _obs_axis(ex.args[2], data, detmap, memo, active, env)
+        return any(i -> _obs_axis(i, data, detmap, memo, active, env),
+            ex.args[2:end])
+    elseif ex.head === Symbol("'")
+        return _obs_axis(ex.args[1], data, detmap, memo, active, env)
     end
     return false
 end
@@ -1902,8 +1905,6 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
     elseif fn === :^ || _is_plain_comparison(fn) || fn === :ifelse ||
             fn in ASSIGNMENT_FNS
         return nvec == 0 ? :scalar : :invalid
-    elseif fn in VECTOR_FNS
-        return :vector
     end
     return nvec == 0 ? :scalar : :vector  # unknown heads: follow the args
 end
@@ -2150,7 +2151,7 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
         # (responses) with bind-to-a-name guidance.
         fn === :_ppl_plate_column && return nothing  # array-cell plate
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
-                fn ∉ VECTOR_FNS && fn !== :spline &&
+                fn !== :spline &&
                 fn !== :hsgp && fn !== :mo && fn !== :mo1 &&
                 fn !== :hcat && fn !== :dar
             startswith(string(fn), ".") && _sfail(
@@ -2220,7 +2221,7 @@ end
 const _CONSTRUCT_VALUE_HEADS = (:spline, :hsgp, :mo, :mo1, :hcat, :dar)
 
 _builtin_value_head(fn::Symbol) =
-    fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS || fn in VECTOR_FNS ||
+    fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS ||
     fn in REDUCTION_FNS || fn in _CONSTRUCT_VALUE_HEADS ||
     fn in CELL_FNS || fn in SEGMENT_CELL_FNS ||
     startswith(string(fn), ".") || fn === :treatment || fn === :ifelse ||
@@ -2371,14 +2372,18 @@ end
 # `_confirm_whole_value_data`.
 function _check_module_calls(det, detmap, data, env::_ShapeEnv;
         whole::Set{Symbol} = Set{Symbol}())
-    # Whole columns are model-level values there: still gatherable
-    # (`gx[g]` follows its index), never aligned themselves.
+    # A sampled vector (plate, scan or varying result) passes whole to an
+    # undotted module call. Its alignment outside that call does not give
+    # the call an observation axis. Raw data still obey the whole-column
+    # check: `gx[g]` follows its index, while `gx` passes whole only when
+    # no other consumer needs it per observation.
     aligned = setdiff(data, whole)
-    wenv = _ShapeEnv(env.aligned, union(env.values, whole))
+    call_env = _ShapeEnv(Set{Symbol}(), env.values)
+    wenv = _ShapeEnv(call_env.aligned, union(env.values, whole))
     memos = (Dict{Symbol,Symbol}(), Dict{Symbol,Symbol}())
     waived = Tuple{String,Set{Symbol}}[]
     for (nm, rhs) in det
-        _check_module_calls(nm, rhs, detmap, data, aligned, whole, env, wenv,
+        _check_module_calls(nm, rhs, detmap, data, aligned, whole, call_env, wenv,
             memos, waived)
     end
     return waived
@@ -4933,7 +4938,7 @@ function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool;
     # array operand to take the ordinary matrix-value route.
     fn = (ex.head === :call || _is_dotted_call(ex)) && !isempty(a) ? a[1] : nothing
     composed = fn in _MATRIX_OPERAND_HEADS || fn in ELEMENTWISE_FNS ||
-        fn in ASSIGNMENT_FNS || fn in VECTOR_FNS || fn isa GlobalRef ||
+        fn in ASSIGNMENT_FNS || fn isa GlobalRef ||
         (fn isa Expr && fn.head === :.)
     child_affine = affine && !(composed && fn ∉ (:+, :.+, :-, :.-))
     for x in a
@@ -6068,6 +6073,11 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
         return Int(hi)
     end
     _is_def_levels_call(a, data, detnames) && return a
+    if a isa Expr && a.head === :ref && !isempty(a.args) &&
+            _is_levels_call(a.args[1])
+        g, subset = _levels_subset_index(target, a, data)
+        return Expr(:call, :levels, g, QuoteNode(subset))
+    end
     if _is_levels_call(a)
         return Expr(:call, :levels,
             _levels_column(target, a, data, "array $target"))
@@ -6458,6 +6468,10 @@ function _resolve_submodel(rhs, mod::Module)
     head = rhs.args[1]
     if head isa GlobalRef
         mod, head = head.mod, head.name
+    elseif head isa Expr && head.head === :. && length(head.args) == 2 &&
+            head.args[2] isa QuoteNode && head.args[2].value isa Symbol
+        mod = _resolve_module_path(head.args[1], mod, "submodel call")
+        head = head.args[2].value
     end
     head isa Symbol || return nothing
     isdefined(mod, head) || return nothing

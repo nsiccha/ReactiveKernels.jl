@@ -34,6 +34,8 @@ using ReactiveKernels
 using ReactiveKernelsPPL
 using Reactant
 using Statistics: std
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    gp_exp_quad_cov, gp_chol_latent
 using Test
 
 function _sm_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
@@ -72,7 +74,7 @@ const _SM_GPREGR = quote
         z[i] ~ Normal(0, 1)
     end
     f = gp_chol_latent(gp_exp_quad_cov(x, sig, rho, 1e-9), z)
-    mu = b0 .+ f
+    mu = b0 .+ f[oi]
     ls ~ Normal(0, 1)
     sigma = exp(ls)
     y .~ Normal.(mu, sigma)
@@ -86,7 +88,7 @@ const _SM_GPPOIS = quote
         z[i] ~ Normal(0, 1)
     end
     f = gp_chol_latent(gp_exp_quad_cov(x, sig, rho, 1e-9), z)
-    mu = b0 .+ f
+    mu = b0 .+ f[oi]
     counts .~ Poisson.(exp.(mu))
 end
 
@@ -125,8 +127,8 @@ const _SM_ACCELSPL = quote
 end
 
 const _SM_DATA = (
-    gpregr = (; x = _SM_GX, y = [0.5, -0.3, 0.8, -0.1, 0.4, -0.6]),
-    gppois = (; x = _SM_GX, counts = [3, 1, 6, 2, 1, 4]),
+    gpregr = (; x = _SM_GX, oi = collect(eachindex(_SM_GX)), y = [0.5, -0.3, 0.8, -0.1, 0.4, -0.6]),
+    gppois = (; x = _SM_GX, oi = collect(eachindex(_SM_GX)), counts = [3, 1, 6, 2, 1, 4]),
     accelgp = (; x = _SM_AX, x2 = _SM_AX,
         y = [-1.2, -0.5, 0.3, 1.1, 0.8, -0.2, -0.9, -1.4]),
     accelspl = (; x = _SM_SX, x2 = _SM_SX,
