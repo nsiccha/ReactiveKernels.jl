@@ -1,11 +1,11 @@
 using Reactant
 
-function _event_test_compiled(plan, built)
+function _event_test_compiled(plan, built; want=:curve_sum)
     u = [0.1cos(i) for i in 1:built.layout.total]
     names = sort!(collect(keys(plan.columns)))
     bound = NamedTuple{Tuple(names)}(Tuple(plan.columns[n] for n in names))
     curve = Base.invokelatest(prepare, built.spec;
-        have=(:unconstrained, names...), bound, want=:curve_sum)
+        have=(:unconstrained, names...), bound, want)
     return Base.invokelatest(_event_test_compile_raw, curve, u)
 end
 
@@ -28,8 +28,9 @@ function _event_test_compile_raw(curve, u)
     return operations
 end
 
-@testset "event LP: compiled curve retains structure as schedules grow" begin
+@testset "event LP: compiled curve and prior retain structure as schedules grow" begin
     structures = Dict{String,Int}[]
+    prior_structures = Dict{String,Int}[]
     for (G, k) in ((2, 3), (4, 5))
         model = merge(_event_test_ast(; k), :(curve_sum = sum(log_F)))
         plan = model(; _event_test_data(G)...)
@@ -37,8 +38,10 @@ end
         println("EVENT_CURVE_COMPILED_BEGIN subjects=", G, " k=", k)
         flush(stdout)
         push!(structures, _event_test_compiled(plan, built))
+        push!(prior_structures, _event_test_compiled(plan, built; want=:prior))
         println("EVENT_CURVE_COMPILED_PASS subjects=", G, " k=", k)
         flush(stdout)
     end
     @test first(structures) == last(structures)
+    @test first(prior_structures) == last(prior_structures)
 end
