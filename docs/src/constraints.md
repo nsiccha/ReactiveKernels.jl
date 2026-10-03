@@ -114,6 +114,14 @@ including inactive branches and empty or ragged cases where supported. A small
 Julia statement count alone does not establish this: tracing can still expand
 a host loop.
 
+Compare retained control-flow regions, nonlinear work and indexing across all
+tested data sizes, and keep complete optimized operation inventories as
+diagnostics. Shape specialization may share constants, simplify scalar
+arithmetic or reshape singleton derivative tapes, so small shapes need not
+have identical raw inventories. Complete inventories must stop growing as
+data lengths increase; these bounded simplifications must preserve one
+authored loop and branch body at every size.
+
 These are required constraints, not a claim that every existing path already
 conforms. Every functional stateful method with authored control flow lowers
 through the retained control program, and host-drained observational records

@@ -34,6 +34,12 @@ function operation_inventory(hlo)
     return counts
 end
 
+function retained_work_inventory(ops)
+    simplified = ("stablehlo.constant", "stablehlo.reshape", "stablehlo.add",
+        "stablehlo.multiply", "stablehlo.subtract", "stablehlo.negate")
+    return Dict(name => count for (name, count) in ops if name ∉ simplified)
+end
+
 @testset "Reactant guarded diagonal default-reverse growth boundary" begin
     inventories = []
     for K in (2, 4, 8, 16)
@@ -57,5 +63,8 @@ end
     end
     @test inventories[3] == inventories[4]
     @test all(ops -> get(ops, "stablehlo.while", 0) > 0, inventories[3])
-    @test_broken allequal(inventories)
+    # Small-shape scalar identities may change raw counts; retained control
+    # flow, nonlinear work and indexing must agree at every dimension.
+    retained = [map(retained_work_inventory, pair) for pair in inventories]
+    @test_broken allequal(retained)
 end

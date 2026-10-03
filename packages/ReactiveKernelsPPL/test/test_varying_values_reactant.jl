@@ -22,6 +22,14 @@ function _cv_hlo_ops(hlo)
     return ops
 end
 
+function _cv_hlo_retained_work(ops)
+    # Constant sharing, scalar identities and singleton tape reshapes may
+    # specialize a shape without replicating its authored computation.
+    simplified = ("stablehlo.constant", "stablehlo.reshape", "stablehlo.add",
+        "stablehlo.multiply", "stablehlo.subtract", "stablehlo.negate")
+    return Dict(name => count for (name, count) in ops if name ∉ simplified)
+end
+
 @testset "Reactant: data-sized shared LKJ factor reverse" begin
     # Constructing one shared diagonal value avoids the raw matrix/guard
     # dominance failure isolated by the backend-only reproducer. Every prior
@@ -45,6 +53,8 @@ end
         push!(optimized, (
             _cv_hlo_ops(Reactant.@code_hlo optimize = true kernel(ru)),
             _cv_hlo_ops(Reactant.@code_hlo optimize = true both(ru))))
+        println("shared LKJ optimized inventory, (K, n, S)=", (K, n, S),
+            ": ", optimized[end])
         @test get(traced[end][1], "stablehlo.while", 0) > 0
         primal = Reactant.@compile kernel(ru)
         compiled = compile_ad_value_and_gradient(q.ad, ru)
@@ -88,9 +98,13 @@ end
     @test optimized[1] == optimized[2]
     @test optimized[4] == optimized[5]
     @test all(ops -> get(ops, "stablehlo.while", 0) > 0, optimized[4])
-    # Small data-derived K is still expanded by the backend optimizer. This
-    # is not fixed-structure acceptance; no optimizer flags are substituted.
-    @test_broken allequal(optimized)
+    # Complete inventories above must stop growing. Across every dimension,
+    # control flow, nonlinear work and indexing must keep one authored body;
+    # only the measured scalar/tape simplifications may alter raw counts.
+    retained = [map(_cv_hlo_retained_work, pair) for pair in optimized]
+    # Stock Reactant still expands small data-derived loops. Promote this
+    # named marker when the generic compiler retention fix is delivered.
+    @test_broken allequal(retained)
 end
 
 @testset "Reactant: retained LKJ prior guard is lazy" begin
