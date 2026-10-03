@@ -1436,6 +1436,24 @@ _fresh_tracers(x::Union{Reactant.TracedRArray,Reactant.TracedRNumber}) = copy(x)
 ReactiveKernels._loop_capture_traced(
         x::Union{Reactant.TracedRArray,Reactant.TracedRNumber}) = _fresh_tracers(x)
 
+# A SubArray's offsets and strides are host layout, not numeric loop state.
+# Reactant's recursive tracer cannot rebuild it with traced offset fields.
+# Carry the parent and indices separately, using the ordinary capture rules
+# for each leaf, and restore the view only where the loop reads it. This keeps
+# view dispatch and the caller's parent intact; it does not materialize a copy
+# of the viewed elements or add methods to the foreign SubArray tracer.
+struct _LoopViewCapture{P,I}
+    parent::P
+    indices::I
+end
+
+ReactiveKernels._loop_capture_traced(x::SubArray) = _LoopViewCapture(
+    ReactiveKernels._loop_capture(parent(x)),
+    ReactiveKernels._loop_capture(parentindices(x)))
+@inline ReactiveKernels._loop_open(x::_LoopViewCapture) = view(
+    ReactiveKernels._loop_open(x.parent),
+    ReactiveKernels._loop_open(x.indices)...)
+
 # A scan's `Ref(...)` operands are read by its retained loop the way an
 # authored loop reads its captures (`ReactiveKernels._loop_capture` /
 # `_loop_open`): a traced leaf enters as a fresh tracer, and an untraced leaf

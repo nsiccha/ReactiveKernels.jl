@@ -1131,13 +1131,34 @@ end
 # partial or replacing a product with a reassociated prefix recurrence.
 _lkj_array_partials(L::Symbol) = Symbol(:_ppl_lkj_partials_, L)
 _lkj_array_logjac(L::Symbol) = Symbol(:_ppl_lkj_logjac_, L)
+_lkj_array_diagonal(L::Symbol) = Symbol(:_ppl_lkj_diagonal_, L)
 
 function _lkj_array_transform_statements(e::LayoutEntry)
     L, K = e.name, e.dims[1]
     row, col = _is_upper_lkj(e.transform) ? (:i, :j) : (:j, :i)
     z, lj = _lkj_array_partials(L), _lkj_array_logjac(L)
+    diagonal = _lkj_array_diagonal(L)
     return Expr[
         :($z::Vector{Float64} = tanh.($(block_read(e.offset, e.size)))),
+        # The diagonal is part of constructing the factor. Publish it as a
+        # graph value so a guarded prior need not share the whole matrix with
+        # response products. Each diagonal entry is still computed once.
+        :($diagonal::Vector{Float64} = let
+            out = ones(Float64, $K)
+            for j in 2:$K
+                base = (j - 1) * (j - 2) ÷ 2
+                d = 1.0
+                for ip in 1:$(K - 1)
+                    d = if ip < j
+                        d * sqrt(1 - $z[base + ip]^2)
+                    else
+                        d
+                    end
+                end
+                out[j] = d
+            end
+            out
+        end),
         :($L::Matrix{Float64} = let
             out = zeros(Float64, $K, $K)
             out[1, 1] = 1.0
@@ -1161,15 +1182,7 @@ function _lkj_array_transform_statements(e::LayoutEntry)
                     end
                     out[$row, $col] = entry_value
                 end
-                d = 1.0
-                for ip in 1:$(K - 1)
-                    d = if ip < j
-                        d * sqrt(1 - $z[base + ip]^2)
-                    else
-                        d
-                    end
-                end
-                out[j, j] = d
+                out[j, j] = $diagonal[j]
             end
             out
         end),
@@ -1192,13 +1205,15 @@ end
 
 # The normalization constant is preparation-only metadata. The diagonal sum
 # remains a retained recipe loop even for a conditioned, caller-owned factor.
-function _lkj_array_prior_terms(L::Symbol, K::Int, eta::Float64)
+function _lkj_array_prior_terms(L::Symbol, K::Int, eta::Float64;
+        diagonal::Union{Nothing,Symbol} = nothing)
     c = lkj_logconst(K, eta)
-    diagonal = _lkj_prior_diagonal(:(log($L[i, i])), K, :i, eta)
+    entry = diagonal === nothing ? :($L[i, i]) : :($diagonal[i])
+    term = _lkj_prior_diagonal(:(log($entry)), K, :i, eta)
     return :(let
         total = $c
         for i in 2:$K
-            total += $diagonal
+            total += $term
         end
         total
     end)
@@ -1224,14 +1239,16 @@ function _lkj_array_normalizer_terms(K::Int, eta::Symbol)
 end
 
 function _lkj_array_diagonal_terms(L::Symbol, K::Int, eta::Symbol;
-        intrinsic_pair::Bool = false)
+        intrinsic_pair::Bool = false, diagonal::Union{Nothing,Symbol} = nothing)
+    entry = diagonal === nothing ? :($L[i, i]) : :($diagonal[i])
     # A declared literal 2 × 2 factor has one diagonal contribution. Its
     # scalar equation avoids a second retained loop reading the same factor
     # that downstream matrix products consume. A bound shape, even K = 2,
     # still uses the retained diagonal loop below.
     if intrinsic_pair
+        pair_entry = diagonal === nothing ? :($L[2, 2]) : :($diagonal[2])
         return :(if isfinite($eta) && $eta > 0
-            (2 * $eta - 2) * log($L[2, 2])
+            (2 * $eta - 2) * log($pair_entry)
         else
             0.0
         end)
@@ -1240,7 +1257,7 @@ function _lkj_array_diagonal_terms(L::Symbol, K::Int, eta::Symbol;
         let
             total = 0.0
             for i in 2:$K
-                total += ($K - i + 2 * $eta - 2) * log($L[i, i])
+                total += ($K - i + 2 * $eta - 2) * log($entry)
             end
             total
         end
@@ -1381,16 +1398,19 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             continue
         end
         if p.family === :lkj_cholesky
+            factor_diagonal = p.name in plan.conditioned ? nothing :
+                _lkj_array_diagonal(p.name)
             eta = p.args.arg1
             if eta isa Symbol
                 normalizer, diagonal = Symbol(node, :_normalizer), Symbol(node, :_diagonal)
                 push!(stmts, :($normalizer::Float64 = $(_lkj_array_normalizer_terms(dims[1], eta))),
                     :($diagonal::Float64 = $(_lkj_array_diagonal_terms(p.name, dims[1], eta;
-                        intrinsic_pair = p.dims == Any[2, 2]))),
+                        intrinsic_pair = p.dims == Any[2, 2], diagonal = factor_diagonal))),
                     :($node::Float64 = $normalizer + $diagonal))
             else
                 push!(stmts, :($node::Float64 =
-                    $(_lkj_array_prior_terms(p.name, dims[1], eta))))
+                    $(_lkj_array_prior_terms(p.name, dims[1], eta;
+                        diagonal = factor_diagonal))))
             end
             push!(terms, node)
             push!(pointwise, p.name => node)

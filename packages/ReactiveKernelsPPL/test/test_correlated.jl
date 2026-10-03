@@ -497,9 +497,9 @@ _corr_surface(extra::Expr...) =
     @test_throws ContractValidationError lower_rkppl(
         _corr_surface(:(L ~ LKJCovarianceFactor(3, Exponential(1.0), 2.0)),
             J2), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
-    # The factor stem is not a coefficient.
-    # refused: factor `L` is a matrix, not a coefficient; `L .+ b1 .* x` (P3)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # The legacy factor stem is not an authored value. Value expressions
+    # lower generically; binding rejects its undeclared assignment input.
+    stemmean = lower_rkppl(quote
             mu1 = L .+ b1 .* x
             mu2 = a2 .+ b2 .* x
             a2 ~ Normal(0, 1)
@@ -508,6 +508,8 @@ _corr_surface(extra::Expr...) =
             L ~ LKJCovarianceFactor(2, Exponential(1.0), 2.0)
             [y1, y2] ~ MvNormalCholesky([mu1, mu2], L)
         end, (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
+    @test_throws "assignment references unknown name L" bind_data(
+        stemmean, _corr_data2())
     # A user definition colliding with a derived factor piece fails.
     # refused: name collides with construct-minted factor piece `L_scales` (reserved)
     @test_throws SurfaceLoweringError lower_rkppl(
