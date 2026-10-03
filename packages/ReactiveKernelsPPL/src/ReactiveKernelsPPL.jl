@@ -119,6 +119,7 @@ export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
 
 include("contract.jl")
 include("expm_rule.jl")
+import ReactiveKernelsDistributionKernels: DistributionKernelSources
 # Owned symmetric-eigendecomposition rules: defined in
 # ReactiveKernelsDistributionKernels (beside `loggamma` / `logbeta`),
 # re-exported here with their rule graphs.

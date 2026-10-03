@@ -195,15 +195,17 @@ end
     t = only(log_map.predictors[end].terms)
     @test t.kind === ComposedTerm
     @test t.options.tree == :(log.(th) .* be)
-    # A bare varying contribution (not a sub alias) stays out of trees.
+    # Explicit varying values compose with a sampled coefficient.
     bare = quote
-        r ~ varying_effect(g, [1]; sd = HalfCauchy(2))
+        sd ~ HalfCauchy(2)
+        z[levels(g)] .~ Normal.(0, 1)
+        r = sd .* z[g]
         be ~ Normal(0, 1)
         eta = be .* r
         y .~ Bernoulli.(logistic.(eta))
     end
-    # capability: product of a coefficient with a varying_effect contribution in a composed predictor (values compose, P3/P8) (todo `1308iv0`)
-    @test_broken (lower_rkppl(bare, (:y, :g); conditioned = (:y, :g)); true)
+    @test validate_structure(lower_rkppl(bare, (:y, :g);
+        conditioned = (:y, :g))) === nothing
 end
 
 @testset "IRT SB parity: direct (LSAT, 2PL, hier2pl)" begin

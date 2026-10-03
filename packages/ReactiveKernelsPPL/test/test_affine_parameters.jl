@@ -267,10 +267,11 @@ end
     _check_gradient(bm.spec, mixed, um)
 
     # capability: a declared coefficient can also feed a scalar definition beside a Horseshoe coefficient (P8; todo `15lq8iu`).
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
-        b ~ Horseshoe()
-        mu = a .+ b .* x
+        X = hcat(x)
+        b ~ horseshoe_coefs(X)
+        mu = a .+ X * b
         y .~ Normal.(mu, 1.0)
         q = a^2
     end, (:x, :y); conditioned = (:x, :y)); true)
