@@ -320,8 +320,15 @@ Here `m[k]` uses the authored Julia index; a declared `z[levels(g)]` instead
 uses its level axis, so noncontiguous and string labels gather the correct
 coordinate. Deterministic outputs retain that axis for later reads such as
 `d[g]`. Each cell remains one RK plate body as the number of levels grows.
-Declared array reads inside a level cell currently take the full same level
-axis; selected subsets and different level axes are rejected.
+Declared array reads inside a level cell are aligned by label before entering
+the plate. With `z[levels(g)[2:end]]`, `z[k]` is zero for the omitted first
+level and reads the selected coordinate for every other level. A declaration
+on `levels(h)` also works when every loop label occurs on that full axis;
+the order and number of its coordinates can differ from `levels(g)`.
+Matrix row reads follow the same rule. Raw bound-array reads and lazy
+branches keep their authored Julia semantics.
+Reactant's remaining limitation for an invalid host-constant index inside
+an inactive live branch is recorded in the [core constraints](constraints.md).
 
 In an array cell, an observation must read a named per-index output
 (`y[i] ~ Normal(r[i], sigma)`), rather than a cell local directly.

@@ -5612,6 +5612,18 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
             bound && !haskey(plan.columns, inp) && !(inp in known) &&
                 _fail(label, "array plate column reads unknown name $inp")
             push!(refs, inp)
+        elseif inp isa Expr && inp.head === :call && length(inp.args) == 4 &&
+                inp.args[1] === :_ppl_level_gather
+            nm, g, ld = inp.args[2:end]
+            axs = _gather_axes(plan, nm)
+            axs !== nothing && ld isa Int && 1 <= ld <= length(axs) &&
+                _is_levels_dim(axs[ld]) || _fail(label,
+                    "array plate column cannot align $(repr(inp))")
+            push!(refs, nm)
+            # levels(g) includes unused categorical pool members too;
+            # validate every cell label rather than only observed g rows.
+            bound && _validate_level_gather(plan, nm, label, axs[ld], g,
+                _array_axis_levels(plan, nm, label, g))
         elseif inp isa Expr && inp.head === :call &&
                 ((length(inp.args) == 3 && inp.args[1] === :_ppl_codes) ||
                  (length(inp.args) == 2 && inp.args[1] in
@@ -5629,7 +5641,7 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
                 _fail(label, "array plate column reads unknown name $nm")
         else
             _fail(label, "array plate column input $(repr(inp)) is not a " *
-                "column, level codes or `Ref(name)`")
+                "column, aligned level values, level codes or `Ref(name)`")
         end
     end
     return nothing

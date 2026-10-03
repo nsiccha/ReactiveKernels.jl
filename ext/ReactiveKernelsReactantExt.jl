@@ -1110,7 +1110,10 @@ const _RKScalarIndex = Union{Integer,Reactant.TracedRNumber{<:Integer}}
 @inline function ReactiveKernels._tensorized_getindex(
         array::Reactant.TracedRArray{T,N},
         indices::Vararg{_RKScalarIndex,N}) where {T,N}
-    _rk_traced_index(indices) || return getindex(array, indices...)
+    # Literal cell-component reads use the same scalar gather as traced
+    # indices. Check their known bounds before lowering the backend slice.
+    _rk_traced_index(indices) || checkbounds(array,
+        Base.to_indices(array, indices)...)
     _rk_gather(array, indices)
 end
 
@@ -1852,7 +1855,8 @@ function _reactant_authored_plate_call(marker, operation, args::Tuple)
 end
 
 function ReactiveKernels._tensorized_plate_call(
-        marker::ReactiveKernels._TensorizedEachcol{<:Reactant.TracedRArray},
+        marker::ReactiveKernels._TensorizedEachcol{<:Union{
+            Reactant.TracedRArray,_TracedReshapedArray}},
         operation, args::Tuple)
     _reactant_authored_plate_call(marker, operation, args)
 end
@@ -1897,8 +1901,10 @@ ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
 # handles both operand kinds, so a structural marker among the operands takes
 # precedence over the plain-vector one.
 @inline _reactant_is_structural_marker(arg) = false
+# eachcol of a Base reshape view carries the same traced parent values.
 @inline _reactant_is_structural_marker(
-    ::ReactiveKernels._TensorizedEachcol{<:Reactant.TracedRArray}) = true
+    ::ReactiveKernels._TensorizedEachcol{<:Union{
+        Reactant.TracedRArray,_TracedReshapedArray}}) = true
 @inline _reactant_is_structural_marker(
     ::ReactiveKernels._TensorizedPlateBatch{<:Reactant.TracedRArray}) = true
 @inline _reactant_structural_marker(::Tuple{}) = nothing

@@ -5378,7 +5378,9 @@ end
 # Lanes are the per-index inputs: a data column read at the loop index
 # (`x[i]`), or the level codes of a column that indexes an array's levels
 # axis (`sd[s[i], :]`, `z[g[i], :]`, a per-level factor `L[s[i]]` —
-# `_ppl_codes(s, h)`, the codes of `s` on `levels(h)`). Every other name
+# `_ppl_codes(s, h)`, the codes of `s` on `levels(h)`). Level cells align
+# selected or different declared axes through `_ppl_level_gather` inputs.
+# Every other name
 # the cell reads (arrays, parameters, definitions) is passed whole with
 # `Ref`. Inside the cell those reads are ordinary integer indexing
 # (`sd[c, :]`, `L[:, :, c]`); RK generates the loop.
@@ -5417,12 +5419,21 @@ function _plate_column_expr(nm::Symbol, call::Expr,
             if axis !== nothing && d !== nothing && idx[1] === ivar
                 dim = length(d) == 3 && length(idx) == 1 ? d[3] : d[1]
                 _is_levels_dim(dim) || return Expr(:ref, X, map(rw, idx)...)
-                _levels_subset(dim) === Colon() || _sfail("$where reads " *
-                    "a selected level axis of $X; per-level cells currently " *
-                    "take full level axes")
                 h = dim.args[2]
-                h === axis || _sfail("$where reads $X on levels($h); " *
-                    "per-level cells currently take the same level axis")
+                if _levels_subset(dim) !== Colon() || h !== axis
+                    # Align values by their declared labels before entering
+                    # the cell. A parameter can be a view; indexing that view
+                    # at a traced lane code is not supported by Reactant.
+                    ld = length(d) == 3 && length(idx) == 1 ? 3 : 1
+                    value = lane(Expr(:call, :_ppl_level_gather, X, axis, ld),
+                        Symbol(:_ppl_pv_, X))
+                    length(d) == 1 && return value
+                    ld == 3 && return Expr(:call, :reshape, value, d[1], d[2])
+                    length(idx) == length(d) || _sfail("$where reads $X " *
+                        "on a selected or different level axis; give one " *
+                        "index per axis")
+                    return Expr(:ref, value, map(rw, idx[2:end])...)
+                end
                 # The same scalar level axis is already aligned with
                 # the plate lanes. Passing it directly also avoids an
                 # unnecessary dynamic gather from a parameter view.
@@ -6091,7 +6102,8 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
         return Expr(:call, :axes, a.args[2], a.args[3])
     end
     return _sfail("array $target axis $(repr(a)) must be a literal `1:K`, " *
-                  "`levels(g)`, or `axes(M, d)` of a matrix `M`")
+                  "`levels(g)` (optionally selected), or `axes(M, d)` " *
+                  "of a matrix `M`")
 end
 
 # Joint-response statement: `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`
