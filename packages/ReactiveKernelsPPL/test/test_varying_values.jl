@@ -105,15 +105,18 @@ end
 # The same membership math with a factor dimension derived from bound data.
 # That dimension must keep its prior reduction; the literal-pair scalar
 # equation must not specialize it merely because the resolved size is two.
-function _cv_data_width_build()
-    _, data = _cv_program(:membership, 7, 2)
+function _cv_data_width_build(n = 7, S = 2; K = 2)
+    _, data = _cv_program(:membership, n, S)
+    # Keep the original K=2 regression's authored scale/coefficient axes;
+    # larger growth cases extend them to the bound matrix width.
+    width = K == 2 ? :(1:2) : :(axes(M, 1))
     ast = quote
         eta ~ Exponential(1)
         a ~ Normal(0, 1)
         gg = vcat(g, h)
-        sd[1:2] .~ Gamma.(2, 1)
+        sd[$width] .~ Gamma.(2, 1)
         L ~ LKJCholesky(size(M, 1), eta)
-        z[levels(gg), 1:2] .~ Normal.(0, 1)
+        z[levels(gg), $width] .~ Normal.(0, 1)
         d = z * (sd .* L)'
         r1 = (w1 .* d[g, 1] .+ w2 .* d[h, 1]) ./ (w1 .+ w2)
         r2 = (w1 .* d[g, 2] .+ w2 .* d[h, 2]) ./ (w1 .+ w2)
@@ -123,7 +126,7 @@ function _cv_data_width_build()
         y .~ Normal.(mu, 0.7)
         y2 .~ Normal.(nu, 1.1)
     end
-    data[:M] = zeros(2, 1)
+    data[:M] = zeros(K, 1)
     bound = bind_data(lower_rkppl(ast, data; conditioned = (:y, :y2)), data)
     return bound, build_kernel(bound)
 end
@@ -137,7 +140,7 @@ function _cv_oracle(bound, nt, kind)
     prior = logpdf(Exponential(1), nt.eta) + logpdf(Normal(), nt.a) +
         sdprior + sum(logpdf.(Normal(), nt.d.z))
     if kind in (:membership, :distinct, :single)
-        prior += logpdf(LKJCholesky(2, nt.eta), Cholesky(LowerTriangular(nt.d.L)))
+        prior += logpdf(LKJCholesky(size(nt.d.L, 1), nt.eta), Cholesky(LowerTriangular(nt.d.L)))
         B = nt.d.z * (Diagonal(sd) * nt.d.L)'
         R = kind === :single ? B[c[:g], :] :
             (c[:w1] .* B[c[:g], :] .+ c[:w2] .* B[c[:h], :]) ./ (c[:w1] .+ c[:w2])
@@ -158,6 +161,29 @@ function _cv_oracle(bound, nt, kind)
     return prior, likelihood
 end
 
+function _cv_data_width_reference(built, bound, u)
+    nt = constrain(built.layout, u)
+    reference = (; nt.eta, nt.a, d = (; nt.sd, nt.L, nt.z))
+    prior, likelihood = _cv_oracle(bound, reference, :membership)
+    return prior + likelihood + logjac(built.layout, u)
+end
+
+# Exercise the emitted prior's live guard with an invalid inactive logarithm.
+# The factor construction is tested separately; these ports let the prior see
+# entries outside the factor's valid support so eager evaluation is observable.
+function _cv_lkj_diagonal_guard(K)
+    terms = ReactiveKernelsPPL._lkj_array_diagonal_terms(:L, K, :eta;
+        diagonal = :diagonal)
+    def = :(_cv_guard(unconstrained::Vector{Float64}) = begin
+        eta::Float64 = sum(unconstrained[1:1])
+        diagonal::Vector{Float64} = unconstrained[2:$(K + 1)]
+        value::Float64 = $terms
+        return value
+    end)
+    spec = ReactiveKernelsPPL._eval_kernel_def(def)
+    return Base.invokelatest(prepare, spec; have = :unconstrained, want = :value)
+end
+
 @testset "Varying values: explicit membership and stratified bodies" begin
     for kind in (:membership, :distinct, :stratified, :single, :both), (n, S) in ((7, 2), (19, 4))
         bound, built = _cv_build(kind, n, S)
@@ -175,13 +201,32 @@ end
 end
 
 @testset "Varying values: data-sized shared factor" begin
-    bound, built = _cv_data_width_build()
-    u = [0.2 * sin(i) for i in 1:built.layout.total]
-    nt = constrain(built.layout, u)
-    reference = (; nt.eta, nt.a, d = (; nt.sd, nt.L, nt.z))
-    prior, likelihood = _cv_oracle(bound, reference, :membership)
-    @test _query(built.spec, bound, :prior, u) ≈ prior atol = 1e-10
-    @test _query(built.spec, bound, :likelihood, u) ≈ likelihood atol = 1e-10
-    @test unconstrain(built.layout, nt) ≈ u
-    _check_gradient(built.spec, bound, u)
+    for (K, n, S) in ((2, 7, 2), (4, 19, 4))
+        bound, built = _cv_data_width_build(n, S; K)
+        u = [0.2 * sin(i) for i in 1:built.layout.total]
+        nt = constrain(built.layout, u)
+        reference = (; nt.eta, nt.a, d = (; nt.sd, nt.L, nt.z))
+        prior, likelihood = _cv_oracle(bound, reference, :membership)
+        @test _query(built.spec, bound, :prior, u) ≈ prior atol = 1e-10
+        @test _query(built.spec, bound, :likelihood, u) ≈ likelihood atol = 1e-10
+        @test unconstrain(built.layout, nt) ≈ u
+        _check_model_math(built, bound, u,
+            w -> _cv_data_width_reference(built, bound, w))
+    end
+end
+
+@testset "Varying values: retained LKJ prior guard is lazy" begin
+    kernel = _cv_lkj_diagonal_guard(4)
+    invalid = [-1.0, 1.0, -0.2, -0.3, -0.4]
+    ad = prepare_ad(kernel, _GEN_BACKEND, invalid; active = :unconstrained)
+    for eta in (-1.0, 0.0, Inf, NaN)
+        u = copy(invalid)
+        u[1] = eta
+        value, grad = ad_value_and_gradient!(ad, similar(u), u)
+        @test value == 0.0
+        @test grad == zeros(length(u))
+        @test isequal(u, [eta; invalid[2:end]])
+    end
+    invalid[1] = 1.5
+    @test_throws DomainError Base.invokelatest(kernel, invalid)
 end

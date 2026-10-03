@@ -179,11 +179,18 @@ and lock the one Reactant 0.2.289 lifted:
   MLIR dominance error when its matrix also feeds shared response expressions:
   `repro_reactant_shared_matrix_loop_reverse.jl` reproduces this on Reactant
   0.2.290 with plain matrix products, weighted gathers and a retained diagonal
-  loop. Native PPL primal/reverse and compiled primal pass. The named PPL
-  acceptance case uses `LKJCholesky(size(M, 1), eta)` with a sampled shape;
-  its data-derived transform and prior loops remain retained. A declared
-  literal two-dimensional factor uses its one scalar diagonal-prior equation
-  and passes compiled reverse, while its transform still retains its loops.
+  loop. PPL constructs the diagonal as one graph value, reuses those entries
+  in the factor, and reads that value in its guarded prior. The named
+  `LKJCholesky(size(M, 1), eta)` shared-response case now passes ordinary
+  compiled reverse at K = 2, 4, 8 and 16, including reused coordinates and
+  invalid inactive logarithms. Its emitted transform and prior retain loops;
+  default optimized primal and reverse have identical operation inventories
+  at K = 8 and 16 as observation and group counts grow. The backend still
+  expands small data-derived K = 2 and 4, so full fixed-structure acceptance
+  remains unmet. `repro_reactant_guarded_diagonal_growth.jl` isolates this
+  optimizer boundary with the backend alone. No flag change is acceptance.
+  A declared literal two-dimensional factor keeps its one scalar diagonal
+  prior equation.
 - Native Enzyme reverse mode aborts the process (an LLVM assertion in its
   shadow-allocation caching, reached while it differentiates SpecialFunctions'
   `logabsgamma` port) when lazily evaluated branches around
