@@ -251,10 +251,8 @@ end
 end
 
 @testset "library horseshoe_coefs matches Horseshoe() at one coefficient" begin
-    # The built-in mints one (raw, lambda, tau) triple per coefficient with
-    # unnormalized Stan-kernel Cauchy halves; the library's two halves are
-    # normalized, so its density is higher by 2 log 2. With one column the
-    # global and local scales coincide with the built-in's.
+    # With one column, built-in and library scales coincide; both use
+    # normalized HalfCauchy priors.
     cols = _ls_cols()
     bb, builtb = _ls_build(quote
             a ~ Normal(0, 1)
@@ -280,7 +278,7 @@ end
         _query(builtb.spec, bb, :likelihood, ub)
     for want in (:prior, :posterior)
         @test _query(builtl.spec, bl, want, ul) ≈
-            _query(builtb.spec, bb, want, ub) + 2 * log(2)
+            _query(builtb.spec, bb, want, ub)
     end
 end
 

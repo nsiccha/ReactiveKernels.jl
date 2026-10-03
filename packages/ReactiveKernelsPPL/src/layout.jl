@@ -14,8 +14,7 @@
 
 Inferred unconstrained support (`:real`/`:positive`/`:unit`/`:interval`)
 for a sampled family plus an optional support override (`:positive`
-half-Normal/half-Cauchy style, `:positive_stan` Stan-kernel half style,
-`:interval`, `:interval_stan` Stan-kernel interval style, or `:upper`).
+half-Normal/half-Cauchy style, `:truncated`, `:interval`, or `:upper`).
 `:uniform` infers `:interval` from its own
 literal args and takes no override. Loud on unknown families and
 inapplicable overrides.
@@ -43,17 +42,17 @@ function support_of(family::Symbol, override::SupportOverride)
             return :upper
         end
         head = override[1]
-        ((head === :interval || head === :interval_stan) &&
+        (head === :interval &&
             length(override) == 3) ||
             throw(ContractValidationError(
                 "[layout] tuple support override must be (:interval, lo, hi), " *
-                "(:interval_stan, lo, hi), or (:upper, hi), got $override"))
+                "(:interval, lo, hi), or (:upper, hi), got $override"))
         inferred === :real || throw(ContractValidationError(
             "[layout] $head override needs a real-support family"))
         return :interval
     end
-    (override === :positive || override === :positive_stan) || throw(
-        ContractValidationError("[layout] support override must be :positive or :positive_stan, got $override"),
+    override === :positive || throw(
+        ContractValidationError("[layout] support override must be :positive, got $override"),
     )
     inferred === :real || throw(
         ContractValidationError("[layout] $override override needs a real-support family"),
@@ -147,7 +146,8 @@ coefficient-vector block (`beta_raw`), or an elementwise array parameter
 (`:array`, column-major over `dims`). `lo` is the constrained lower
 bound of an `:interval`/`:floored` transform (`:interval` also sets
 `hi`; an `:upper` transform sets `hi` only; `NaN` otherwise). `dims` is
-the axis lengths of an `:array` entry (empty for every other kind)."""
+the axes of a declared array, including an LKJ factor (empty for legacy
+scalar/block entries)."""
 struct LayoutEntry
     kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :varying | :varying_corr | :cholesky_corr | :hsgp | :glm | :array
     predictor::Union{Nothing,Symbol}
@@ -158,9 +158,9 @@ struct LayoutEntry
     transform::Symbol # :identity | :exp | :logistic | :interval | :floored | :upper | :ordered | :simplex | :lkj
     lo::Union{Float64,Symbol,Expr} # constrained lower bound (else NaN)
     hi::Union{Float64,Symbol,Expr} # constrained upper bound (else NaN)
-    dims::Vector{Int} # :array axis lengths (else empty)
+    dims::Vector{Int} # declared-array axes, including :cholesky_corr (else empty)
 end
-# Entries other than arrays carry no axes.
+# Legacy scalar/block entries carry no axes.
 LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
     labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol,
     lo, hi) =
@@ -373,8 +373,8 @@ function assign_layout(plan::StructuralPlan)
         transform, lo, hi =
             _entry_transform(p.family, _bound_override(plan, p.support_override),
                 p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
-        # An `eachindex(v)` plate is proved at bind to have n_obs cells.
-        size = p.range isa UnitRange ? length(p.range) : plan.n_obs
+        # An `eachindex(v)` plate has the rows of its authored range.
+        size = _plate_rows(plan, p)
         push!(entries,
             LayoutEntry(:plate, nothing, p.name, [p.name], offset, size, transform,
                 lo, hi))
@@ -429,7 +429,7 @@ function assign_layout(plan::StructuralPlan)
     # L/tau/z): the LKJ Cholesky factor (`:varying_corr` packing
     # K*(K-1)/2 thetas — K=1 packs zero and constrains to `[1.0]`),
     # the marginal-scale K-vector `tau` (`:varying` with `:exp` — the
-    # exp Jacobian is Stan's lower-bound kernel term, no renormalizer),
+    # the density uses a normalized half),
     # and the standardized `z_flat` (`:varying` identity, K*G
     # column-major; G from declared levels). Stratified draws pack
     # one L/tau pair per stratum (SB `ranef_correlated_by` order —
@@ -516,7 +516,7 @@ function assign_layout(plan::StructuralPlan)
     # HSGP bases in plan order, SB `_sb_hsgp` declaration order per basis
     # (rho, sigma, beta): length scales as `:sampled` scalars on the
     # parameterized `:floored` support (`x = lo + exp(u)`, logjac `u` —
-    # Stan lower-bound kernel semantics, no truncation normalizer), the
+    # the density normalizer is emitted separately), the
     # marginal scale as a plain `:exp` scalar, and the standardized
     # M-vector `beta_raw` as one `:hsgp` identity block (the
     # spline-vector shape). A zero floor (K=1, unbounded) routes to
@@ -565,7 +565,7 @@ function assign_layout(plan::StructuralPlan)
             names.rho_hyper === nothing || break
             if rbounds !== nothing
                 push!(entries, LayoutEntry(:sampled, nothing, rho, [rho],
-                    offset, 1, :interval, rbounds...))
+                    offset, 1, rbounds[2] == Inf ? :floored : :interval, rbounds...))
             elseif fl == 0.0
                 push!(entries, LayoutEntry(:sampled, nothing, rho, [rho],
                     offset, 1, :exp))
@@ -583,7 +583,7 @@ function assign_layout(plan::StructuralPlan)
                 LayoutEntry(:sampled, nothing, names.sigma, [names.sigma],
                     offset, 1, :exp) :
                 LayoutEntry(:sampled, nothing, names.sigma, [names.sigma],
-                    offset, 1, :interval, sbounds...))
+                    offset, 1, sbounds[2] == Inf ? :floored : :interval, sbounds...))
             offset += 1
         end
         # Grouped bases carry G*M standardized weights (column-major
@@ -598,13 +598,13 @@ function assign_layout(plan::StructuralPlan)
     # (the non-centered-scan innovation-slice shape, so the `:scan` kind's
     # constrain/unconstrain/coordinate machinery applies untouched); the
     # state name binds the emitter's `scan(...)` reconstruction. The path
-    # length is `n_obs` by construction (the LP adds elementwise), so a
+    # length is its consuming response's rows (the LP adds elementwise), so a
     # single observation leaves no innovation — fail closed.
     for s in plan.dar_paths
-        T = plan.n_obs
+        T = _value_rows(plan, s.state)
         T >= 2 || throw(ContractValidationError(
-            "[layout] dar $(s.state) needs n_obs ≥ 2 (the innovations " *
-            "are length `n_obs - 1`), got n_obs = $(T)"))
+            "[layout] dar $(s.state) needs at least 2 rows on its axis " *
+            "(one fewer innovation than rows), got $T"))
         nm = _dar_innovation_name(s)
         labels = Symbol[Symbol(i) for i in 1:(T - 1)]
         push!(entries,
@@ -1234,7 +1234,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         elseif e.kind === :array && _is_slice_transform(e.transform)
             push!(pairs, e.name => _array_slices_constrain(e, seg))
         elseif e.kind === :array
-            v = [_constrain_elt(e, Float64(x)) for x in seg]
+            v = Float64[_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name =>
                 (length(e.dims) == 1 ? v : reshape(v, e.dims...)))
         elseif e.kind === :varying_corr || e.kind === :cholesky_corr
@@ -1512,10 +1512,9 @@ _logjac_value(transform::Symbol, u) =
 # Symbol-keyed parameterless bijector registry (like `:identity`, it lives
 # outside it): it maps ℝ → (lo, hi) via an affine-logistic (`lo + (hi-lo)·σ(u)`)
 # with log-Jacobian `log(x-lo) + log(hi-x) - log(hi-lo)` in the CONSTRAINED
-# value. `:floored` is likewise parameterized (Stan's lower-bound kernel
-# ℝ → (lo, ∞), `lo + exp(u)`, log-Jacobian the bare `u` — no truncation
-# normalizer), as is `:upper` (Stan's upper-bound kernel ℝ → (-∞, hi),
-# `hi - exp(u)`, log-Jacobian the bare `u` — no truncation normalizer).
+# value. `:floored` is likewise parameterized (ℝ → (lo, ∞), `lo + exp(u)`,
+# log-Jacobian `u`), as is `:upper` (ℝ → (-∞, hi), `hi - exp(u)`,
+# log-Jacobian `u`). Prior density normalizers are emitted separately.
 # The in-graph interval/floored/upper edges (below) use the IDENTICAL
 # operations, so host and graph agree bit-for-bit.
 function _constrain_elt(e::LayoutEntry, u)
@@ -1612,8 +1611,9 @@ function transform_statements(e::LayoutEntry)
     end
     e.kind === :array && return _array_transform_statements(e)
     if e.kind === :varying_corr || e.kind === :cholesky_corr
-        # Both LKJ-factor kinds share the scalar-unrolled vine twin
-        # (name/size-keyed `_ppl_rl_` temps — kind-agnostic).
+        isempty(e.dims) || return _lkj_array_transform_statements(e)
+        # Legacy structural-margin blocks still read named scalar edges.
+        # Declared arrays above retain their triangular iteration for every K.
         return _lkj_corr_transform_statements(e)
     end
     o = e.offset
@@ -1875,7 +1875,7 @@ function _lkj_vine_logjac(L::Symbol, K::Int; stacked::Bool = false)
 end
 
 """
-    jacobian_term(entry) -> Union{Nothing,Expr}
+    jacobian_term(entry) -> Union{Nothing,Expr,Symbol}
 
 This entry's log-Jacobian contribution (`nothing` for identity). A scalar
 constrained support splices the bijector's `logjac` endpoint over the same
@@ -1883,8 +1883,8 @@ coordinate the `constrain` edge reads (shared via structural CSE); a per-cell
 latent (plate) block sums its companion `logjac` plate (`_plate_logjac_name`);
 a leveled vector entry sums its unrolled twin of the host
 `ordered_logjac`/`simplex_logjac` (shared coordinates via CSE); an LKJ
-entry sums its unrolled twin of the host `lkj_chol_logjac` (named
-partial temps, shared with the constrain edges).
+declared LKJ entry reads the retained sum over the partials shared with its
+transform. Legacy structural-margin LKJ blocks sum their named scalar edges.
 """
 function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing
@@ -1900,6 +1900,7 @@ function jacobian_term(e::LayoutEntry)
                      log($bhi - $blo)))
     end
     if e.kind === :varying_corr || e.kind === :cholesky_corr
+        isempty(e.dims) || return _lkj_array_logjac(e.name)
         return _lkj_vine_logjac(e.name, _lkj_dim(e.size))
     end
     e.kind === :array && return _array_jacobian_term(e)

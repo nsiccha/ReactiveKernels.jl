@@ -149,6 +149,14 @@ and lock the one Reactant 0.2.289 lifted:
   side is a `DerivativeRule` (the rule constraint above): the augmented
   system's vector-Jacobian products are the rule's authored reverse cut,
   evaluated inside the retained loop, so nothing differentiates anything.
+- A live branch with an out-of-bounds read of a host constant in its inactive
+  arm fails while Reactant traces that arm, before compilation:
+  `repro_reactant_inactive_constant_index.jl`. Native primal and Enzyme AD
+  retain the branch. Data-bound conditions split away the inactive arm, and
+  live branches around traced undefined arithmetic retain compiled primal
+  and AD parity. The invalid host-constant indexing shape remains unsupported;
+  its named acceptance case is excluded from compiled parity, with the exact
+  `BoundsError` pinned. No index clamping or dummy buffer is introduced.
 - Native Enzyme reverse mode aborts the process (an LLVM assertion in its
   shadow-allocation caching, reached while it differentiates SpecialFunctions'
   `logabsgamma` port) when lazily evaluated branches around
@@ -216,6 +224,15 @@ and lock the one Reactant 0.2.289 lifted:
   excluded by name from compiled parity and structure acceptance. Linear
   matrix gathers and positional gathers from module-produced arrays pass
   compiled primal, reverse and fixed-operation-count checks.
+- Gathering from an adjoint matrix (`reshape(u, 2, 3)'[g, 1]`) also
+  fails during Reactant 0.2.289 tracing: the backend applies the adjoint's
+  Cartesian indices to the untransposed ancestor's `LinearIndices`.
+  `repro_reactant_adjoint_axis_gather.jl` isolates the failure and a
+  passing second-axis gather from the plain reshaped matrix. RKPPL
+  preserves the authored adjoint; this shape passes native primal and
+  Enzyme reverse but is excluded by name from compiled acceptance.
+  Declared second-axis gathers, elementwise array definitions and level
+  subsets pass compiled primal, AD and operation-count checks.
 
 - A one-dimensional traced view indexed by `CartesianIndex{1}` fails in
   Reactant 0.2.290 because `Base.reindex` expects an index tuple:
@@ -224,3 +241,11 @@ and lock the one Reactant 0.2.289 lifted:
   nest. Dirichlet priors, including live concentrations, retain native
   primal and Enzyme reverse support; compiled acceptance pins this exact
   failure until the backend fixes it. The authored transform stays intact.
+- Reverse compilation with a zero-length active vector leaves `tensor.empty`,
+  which Reactant 0.2.290 cannot export to XLA:
+  `repro_reactant_empty_gradient.jl` isolates a constant scalar loss and its
+  ordinary Enzyme gradient without ReactiveKernels. Native reverse returns
+  the correct empty gradient, and compiled primal succeeds. A zero-coordinate
+  RK-PPL sampler therefore supports native AD and compiled values; compiled
+  gradient acceptance pins this exact export error. Empty observation and
+  parameter domains with a nonempty coordinate pack pass compiled reverse.

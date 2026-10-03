@@ -739,15 +739,15 @@ end
             _none_evidence(), :y_resp)
     # refused: location predictor reused as p_zero under a log link — fails the logit-only probability gate (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
-    # Hurdle response must be non-negative integers (Bool excluded).
+    # Hurdle response must be non-negative integers, including Bool.
     bad = _hurdle_plan()
     bad.columns[:y] = [0, 1, -1, 2, 0, 1, 3, 0, 2]
     # refused: negative count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _hurdle_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (validate_plan(bad); true)
+    # admitted: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test (validate_plan(bad); true)
     bad = _hurdle_plan()
     bad.columns[:y] = collect(1.0:9.0)
     # refused: non-integer count response (wrong data)
@@ -821,15 +821,15 @@ end
         # refused: probability slot (NB1 p) fed through a non-logit link (IR contract: probability slot is logit-only)
         @test_throws ContractValidationError validate_plan(bad)
     end
-    # NB1 response must be non-negative integers (Bool excluded).
+    # NB1 response must be non-negative integers (including numeric Bool).
     bad = _nb1_plan()
     bad.columns[:y] = [0, 1, -1, 2, 0, 1, 3, 0, 2]
     # refused: negative count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _nb1_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (validate_plan(bad); true)
+    # admitted: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test (validate_plan(bad); true)
     bad = _nb1_plan()
     bad.columns[:y] = collect(1.0:9.0)
     # refused: non-integer count response (wrong data)
@@ -1030,7 +1030,7 @@ end
             _none_evidence(), :y_resp)
     # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
     @test_broken (validate_plan(bad); true)
-    # InverseGaussian response must be strictly positive (Bool excluded).
+    # InverseGaussian response must be strictly positive (including numeric Bool).
     bad = _ig_plan()
     bad.columns[:y] = [0.7, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
     # refused: InverseGaussian response not strictly positive (wrong data)
@@ -1041,8 +1041,12 @@ end
     @test_throws ContractValidationError validate_plan(bad)
     bad = _ig_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (validate_plan(bad); true)
+    # refused: false is zero, outside this response's strictly positive data domain.
+    @test_throws ContractValidationError validate_plan(bad)
+    good = _ig_plan()
+    good.columns[:y] = trues(9)
+    # admitted: true has numeric value one (10gzbm9 bool-values; todo `139j2uo`).
+    @test validate_plan(good) === nothing
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _ig_plan()
     bad.responses[1] =
@@ -1103,7 +1107,7 @@ end
         # capability: predictor-fed Weibull shape k (todo `05fuzch`)
         @test_broken (validate_plan(bad); true)
     end
-    # Weibull response must be strictly positive (Bool excluded).
+    # Weibull response must be strictly positive (including numeric Bool).
     bad = _weibull_plan()
     bad.columns[:y] = [0.7, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
     # refused: Weibull response not strictly positive (wrong data)
@@ -1114,8 +1118,12 @@ end
     @test_throws ContractValidationError validate_plan(bad)
     bad = _weibull_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (validate_plan(bad); true)
+    # refused: false is zero, outside this response's strictly positive data domain.
+    @test_throws ContractValidationError validate_plan(bad)
+    good = _weibull_plan()
+    good.columns[:y] = trues(9)
+    # admitted: true has numeric value one (10gzbm9 bool-values; todo `139j2uo`).
+    @test validate_plan(good) === nothing
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _weibull_plan()
     bad.responses[1] =
@@ -1221,15 +1229,15 @@ end
     bad.columns[:n] = fill(1, 9)
     # refused: response exceeds trials row-wise (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
-    # BetaBinomial2 response must be non-negative integers (Bool excluded).
+    # BetaBinomial2 response must be non-negative integers (including numeric Bool).
     bad = _betabinomial2_plan()
     bad.columns[:y] = [0, 1, -1, 2, 0, 1, 3, 0, 2]
     # refused: negative count response (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
     bad = _betabinomial2_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (validate_plan(bad); true)
+    # admitted: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test (validate_plan(bad); true)
     bad = _betabinomial2_plan()
     bad.columns[:y] = collect(1.0:9.0)
     # refused: non-integer count response (wrong data)
@@ -1337,7 +1345,7 @@ end
             interval = (-Float64(pi), Float64(pi)))
     # refused: interval slot on a non-VonMises family (IR contract)
     @test_throws ContractValidationError validate_plan(bad)
-    # Exact response must be finite numerics (Bool excluded).
+    # Exact response must be finite numerics (including numeric Bool).
     bad = _vm_plan()
     bad.columns[:y] = [0.3, -1.1, 2.0, -2.8, 0.5, 1.1, -0.4, 2.9, Inf]
     # refused: non-finite response (wrong data)
@@ -1348,8 +1356,8 @@ end
     @test_throws ContractValidationError validate_plan(bad)
     bad = _vm_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (validate_plan(bad); true)
+    # admitted: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test (validate_plan(bad); true)
     # Circular response honors the half-open [lo, hi).
     bad = _vm_plan(; interval = (-Float64(pi), Float64(pi)))
     bad.columns[:y] = [0.3, -1.1, 2.0, -2.8, 0.5, 1.1, -0.4, 2.9, Float64(pi)]
@@ -1394,7 +1402,7 @@ end
         # refused: scale slot on Exponential, which has no scale auxiliary (IR contract)
         @test_throws ContractValidationError validate_plan(bad)
     end
-    # Exponential response must be non-negative numerics (Bool excluded);
+    # Exponential response must be non-negative numerics (including numeric Bool);
     # exactly 0 is valid (finite log-density).
     good = _exp_plan()
     good.columns[:y] = [0.0, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, 2.2]
@@ -1405,12 +1413,12 @@ end
     @test_throws ContractValidationError validate_plan(bad)
     bad = _exp_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (validate_plan(bad); true)
+    # admitted: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test (validate_plan(bad); true)
     bad = _exp_plan()
     bad.columns[:y] = trues(9)
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (validate_plan(bad); true)
+    # admitted: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test (validate_plan(bad); true)
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _exp_plan()
     bad.responses[1] =
@@ -1457,7 +1465,7 @@ end
         # capability: predictor-fed LogNormal sigma (todo `05fuzch`)
         @test_broken (validate_plan(bad); true)
     end
-    # LogNormal response must be strictly positive (Bool excluded).
+    # LogNormal response must be strictly positive (including numeric Bool).
     bad = _ln_plan()
     bad.columns[:y] = [0.7, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
     # refused: LogNormal response not strictly positive (wrong data)
@@ -1468,8 +1476,12 @@ end
     @test_throws ContractValidationError validate_plan(bad)
     bad = _ln_plan()
     bad.columns[:y] = repeat([false, true], outer = 5)[1:9]
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (validate_plan(bad); true)
+    # refused: false is zero, outside this response's strictly positive data domain.
+    @test_throws ContractValidationError validate_plan(bad)
+    good = _ln_plan()
+    good.columns[:y] = trues(9)
+    # admitted: true has numeric value one (10gzbm9 bool-values; todo `139j2uo`).
+    @test validate_plan(good) === nothing
     # Evidence wrappers stay Gaussian/Poisson-only.
     bad = _ln_plan()
     bad.responses[1] =
@@ -1556,11 +1568,11 @@ end
     bad.columns[:y] = fill(9, 9)
     # refused: response exceeds trials (wrong data)
     @test_throws ContractValidationError validate_plan(bad)
-    # Bool is not a count column.
+    # Bool values are zero/one counts.
     bad = _binomial_plan()
     bad.columns[:y] = fill(true, 9)
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (validate_plan(bad); true)
+    # admitted: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
+    @test (validate_plan(bad); true)
     # NB2/Gamma require their auxiliary.
     bad = _nb2_plan()
     bad.responses[1] =
@@ -1663,7 +1675,7 @@ end
     bad = _gaussian_plan()
     bad.parameters[1] =
         SampledParameter(:tau, :flat, (;), :positive, :tau)
-    # refused: :positive (renormalized half) on an improper flat; flat takes :positive_stan (IR contract: support-override rule)
+    # refused: :positive (renormalized half) on an improper flat; Flat() has real support (IR contract: support-override rule)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -2219,7 +2231,7 @@ _all_fields_spec() = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
     :s, :w, _none_evidence(), :y_resp, 7, 1:5, nothing, :cuts, [:p2], [:c2],
     :cumulative, 2.0, [:tc], :tco, [:y2], :fs, :fc, :ga, :gb, GaussianFam,
     Union{Symbol,Real}[:l1], Union{Nothing,Symbol,Real,ScalePredictorRef}[:s1],
-    :mw, 4.0, 0.2, :jobs, (0.0, 2pi), :teffects)
+    :mw, Union{Int,Symbol}[:n2], 4.0, 0.2, :jobs, (0.0, 2pi), :teffects)
 
 @testset "field-preserving rebuilds" begin
     r = _all_fields_spec()
