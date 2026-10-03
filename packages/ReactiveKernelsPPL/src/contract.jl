@@ -912,7 +912,12 @@ struct VectorParameter
     args::NamedTuple
     size::Union{Nothing,Int,Expr}
     label::Symbol
+    # Retain whole-value sizing dependencies after `size` resolves at bind.
+    extent_expr::Union{Nothing,Expr}
 end
+VectorParameter(name::ParamName, family::Symbol, args::NamedTuple,
+    size::Union{Nothing,Int,Expr}, label::Symbol) =
+    VectorParameter(name, family, args, size, label, size isa Expr ? size : nothing)
 """Provenance defaults to the parameter's own name."""
 VectorParameter(name::ParamName, family::Symbol, args::NamedTuple,
     size::Union{Nothing,Int,Expr}) =
@@ -10537,7 +10542,7 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         _is_levels_dim(d) && push!(required, d.args[2])
     end
     for p in plan.vector_parameters
-        p.size isa Expr && union!(required, _expr_value_symbols(p.size))
+        p.extent_expr === nothing || union!(required, _expr_value_symbols(p.extent_expr))
     end
     nodes = Dict{Symbol,Any}()
     for a in plan.assignments
@@ -10698,8 +10703,8 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     for p in plan.vector_parameters
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
             Expr(:tuple, values(p.args)...))
-        p.size isa Expr && push!(defs, Symbol(:_ppl_extent_input_, p.name) =>
-            p.size)
+        p.extent_expr === nothing || push!(defs, Symbol(:_ppl_extent_input_, p.name) =>
+            p.extent_expr)
     end
     for s in plan.scans
         exprs = Any[s.hi]

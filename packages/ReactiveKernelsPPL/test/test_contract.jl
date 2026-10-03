@@ -2197,11 +2197,10 @@ end
     # refused: OrderedLogistic without its thresholds (IR contract)
     @test_throws ContractValidationError _ordered_plan(;
         resp = r, vecs = VectorParameter[])
-    # Thresholds must be ordered_normal for OrderedLogistic.
-    # refused: cumulative cutpoints not an ordered vector (vector_normal) (malformed distribution)
-    @test_throws ContractValidationError _ordered_plan(;
-        vecfam = :vector_normal)
-    # refused: cumulative cutpoints not an ordered vector (simplex) (malformed distribution)
+    # The response reads the authored real-support vector prior. Density,
+    # native AD and compiled support guards are checked by the later audit.
+    @test (validate_plan(_ordered_plan(; vecfam = :vector_normal)); true)
+    # refused: simplex cutpoints do not have a real-support element prior.
     @test_throws ContractValidationError _ordered_plan(;
         vecfam = :simplex_dirichlet)
     # A declared threshold extent states support, including unobserved levels
@@ -2336,13 +2335,11 @@ end
         thresholds = :y_thresholds, ordinal_structure = :bogus)
     # refused: unknown ordinal_structure (IR contract)
     @test_throws ContractValidationError _ordinal_plan(; resp = r)
-    # Threshold family must match the structure.
-    # refused: threshold family does not match the structure (stopping takes vector_normal) (IR contract)
-    @test_throws ContractValidationError _ordinal_plan(;
-        structure = :stopping, vecfam = :ordered_normal)
-    # refused: cumulative thresholds not ordered (malformed distribution)
-    @test_throws ContractValidationError _ordinal_plan(;
-        structure = :cumulative, vecfam = :vector_normal)
+    # Either structure retains the declaration's prior and support.
+    @test (validate_plan(_ordinal_plan(;
+        structure = :stopping, vecfam = :ordered_normal)); true)
+    @test (validate_plan(_ordinal_plan(;
+        structure = :cumulative, vecfam = :vector_normal)); true)
     # An intercept is legal alongside thresholds for either structure.
     for (structure, vfam) in
             ((:cumulative, :ordered_normal), (:stopping, :vector_normal))

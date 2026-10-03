@@ -355,7 +355,7 @@ end
         :(_ppl_vlr_s::AbstractVector{Float64} = cumsum(vcat(0.0, _ppl_vl_s))),
         :(s::AbstractVector{Float64} = exp.(_ppl_vlr_s) .* vcat(_ppl_vz_s, ones(1))),
     ]
-    @test jacobian_term(sentry) == :(sum(view(_ppl_vlr_s, 1:2) .+
+    @test jacobian_term(sentry) == :(sum(_ppl_vlr_s[1:2] .+
         log.(_ppl_vz_s) .+ _ppl_vl_s))
     # A 1-simplex emits its constant; an empty ordered/identity pack emits
     # nothing.
