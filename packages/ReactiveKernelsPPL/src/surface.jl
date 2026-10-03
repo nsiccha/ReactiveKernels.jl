@@ -904,7 +904,7 @@ function _ordinary_sampling(s)
     rhs = s.rhs
     return rhs isa Expr && rhs.head === :call &&
         rhs.args[1] in union(keys(_PARAM_FAMILIES),
-            (:HalfNormal, :HalfCauchy, :Flat, :truncated))
+            (:HalfNormal, :HalfCauchy, :Flat, :truncated, :restricted))
 end
 
 function _bind_parameter_terms!(predictors, structured)
@@ -6181,7 +6181,7 @@ end
 # Wrappers and constructors an observation object broadcasts even over
 # scalar-only arguments (one draw per index): distribution constructors
 # (capitalized) and the response wrappers.
-const _CELL_OBJECT_WRAPPERS = (:truncated, :censored, :interval_censored,
+const _CELL_OBJECT_WRAPPERS = (:truncated, :restricted, :censored, :interval_censored,
     :weighted)
 _cell_object_call(f::Symbol) =
     isuppercase(first(string(f))) || f in _CELL_OBJECT_WRAPPERS
@@ -12765,11 +12765,11 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
             inner = hoist_call(lhs, rhs.args[2])
             return Expr(:call, :Ordered, inner, rhs.args[3])
         end
-        if rhs.args[1] === :truncated && length(rhs.args) == 4
+        if rhs.args[1] in (:truncated, :restricted) && length(rhs.args) == 4
             inner = hoist_call(lhs, rhs.args[2])
             bounds = hoist_args(lhs, rhs.args[3:end])
             inner === rhs.args[2] && bounds == rhs.args[3:end] && return rhs
-            return Expr(:call, :truncated, inner, bounds...)
+            return Expr(:call, rhs.args[1], inner, bounds...)
         end
         rhs.args[1] in _HOIST_FAMILIES || return rhs
         args = rhs.args[2:end]
@@ -13211,8 +13211,8 @@ function _hold_array_args(lhs, call::Expr, held::Dict{Symbol,Any})
         if a isa Expr && a.head === :call && !isempty(a.args) &&
                 a.args[1] isa Symbol && haskey(_PARAM_FAMILIES, a.args[1])
             push!(out, _hold_array_args(lhs, a, held))
-        elseif call.args[1] === :truncated
-            push!(out, a)  # truncation bounds keep the scalar grammar
+        elseif call.args[1] in (:truncated, :restricted)
+            push!(out, a)  # support bounds keep the shared scalar grammar
         elseif a isa Expr && a.head !== :parameters
             ph = Symbol("#arrayarg#", length(held) + 1)
             held[ph] = a
@@ -13422,6 +13422,8 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
                             "improper uniform), not Stan-style `flat()`")
     fam === :truncated && return _lower_truncated_param(lhs, rhs, coefuse,
         matrices)
+    fam === :restricted && return _lower_bounded_param(lhs, rhs, coefuse,
+        matrices, :restricted)
     fam in (:HalfNormal, :HalfCauchy) &&
         return _lower_half_param(lhs, rhs, fam, coefuse, matrices)
     fam === :positive && _sfail("parameter $lhs: write `HalfNormal(s)` " *
@@ -13438,7 +13440,7 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
                "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
                "Beta, InverseGamma, StudentT, TDist, Laplace, Logistic, Uniform, Weibull, " *
                "HalfNormal, HalfCauchy, Flat, " *
-               "Dirichlet, LKJCovarianceFactor, truncated). If `$fam` is " *
+               "Dirichlet, LKJCovarianceFactor, truncated, restricted). If `$fam` is " *
                "meant as a submodel, define it with " *
                "`@rkppl $fam(args...) = begin ... end` and " *
                "make it visible in the lowering module (`mod=`).")
@@ -13514,14 +13516,20 @@ const _TRUNCATED_BASES = Dict{Symbol,Tuple{Int,Int}}(
 # layout intersects them with the base support; the prior subtracts the
 # probability of precisely that interval (Distributions semantics).
 function _lower_truncated_param(lhs, rhs, coefuse, matrices)
-    args = _plain_args(rhs, "`truncated`")
+    return _lower_bounded_param(lhs, rhs, coefuse, matrices, :truncated)
+end
+
+# Both forms share exactly the same support/transform lowering. Only
+# `truncated` subtracts the interval mass from the authored family density.
+function _lower_bounded_param(lhs, rhs, coefuse, matrices, mode)
+    args = _plain_args(rhs, "`$mode`")
     length(args) == 3 || _sfail("parameter $lhs: use " *
-        "`truncated(D(args...), lo, hi)`")
+        "`$mode(D(args...), lo, hi)`")
     obj, lower, upper = args
     obj isa Expr && obj.head === :call || _sfail("parameter $lhs: " *
-        "`truncated` wraps a distribution object, got $(repr(obj))")
+        "`$mode` wraps a distribution object, got $(repr(obj))")
     base = _lower_parameter(lhs, obj, coefuse, matrices)
-    base.family === :flat && _sfail("parameter $lhs: `truncated` needs a " *
+    mode === :truncated && base.family === :flat && _sfail("parameter $lhs: `truncated` needs a " *
         "proper distribution; bound an improper prior with `Flat` instead")
     base.support_override in (nothing, :positive) || _sfail("parameter " *
         "$lhs: nested truncations are not yet supported")
@@ -13532,11 +13540,13 @@ function _lower_truncated_param(lhs, rhs, coefuse, matrices)
         lo < hi || _sfail("parameter $lhs: truncation needs lower < upper, " *
             "got ($lo, $hi)")
     end
-    # Truncating a half is the same normalized base on the intersection.
+    # Both forms intersect a half's support with the nonnegative half-line.
     base.support_override === :positive &&
         (lo = lo isa Real ? max(0.0, lo) : Expr(:call, :max, 0.0, lo))
+    tag = mode === :restricted && base.support_override === :positive ?
+        :restricted_half : mode
     return SampledParameter(lhs, base.family, base.args,
-        (:truncated, lo, hi), lhs)
+        (tag, lo, hi), lhs)
 end
 
 function _lower_assignment(nm, rhs, coefuse)

@@ -643,7 +643,10 @@ horseshoe_normal_name(pred::Symbol, addr::Symbol) =
 A latent's support override is `nothing` (infer natural support), `:positive`
 (a normalized symmetric half at literal-zero location), or
 `(:truncated, lo, hi)` (normalized base density on the intersection with its
-natural support). Bounds may be literals, data or sampled expressions.
+natural support). `(:restricted, lo, hi)` intersects the support without
+renormalizing the original density; `(:restricted_half, lo, hi)` retains a wrapped
+HalfNormal/HalfCauchy's original log(2) normalization. Bounds may be literals,
+data or sampled expressions.
 The older normalized `:interval`, `:upper` and `:lower` representations
 remain supported for hand-built plans. Shared by scalar and per-cell priors.
 """
@@ -653,6 +656,8 @@ const SupportOverride =
         Tuple{Symbol,Union{Float64,Symbol,Expr},Union{Float64,Symbol,Expr}}}
 
 _support_args(ov) = ov isa Tuple ? ov[2:end] : ()
+_has_interval_bounds(ov) = ov isa Tuple &&
+    ov[1] in (:truncated, :restricted, :restricted_half)
 
 """
     SampledParameter(name, family, args, support_override, label)
@@ -660,7 +665,7 @@ _support_args(ov) = ov isa Tuple ? ov[2:end] : ()
 One scalar latent with positional `(arg1, arg2, …)` arguments in
 Distributions constructor order (Exponential uses scale). Arguments may read
 data, sampled parameters or ordinary definitions. Explicit support follows
-SupportOverride and its density is normalized on that support.
+SupportOverride; truncation normalizes and restriction preserves the density.
 """
 struct SampledParameter
     name::ParamName
@@ -6436,8 +6441,13 @@ end
 function _validate_support_override(label, family::Symbol,
         ov::SupportOverride, args::NamedTuple)
     ov === nothing && return nothing
-    if ov isa Tuple && ov[1] === :truncated
-        family === :flat && _fail(label, "truncation requires a proper univariate distribution")
+    if _has_interval_bounds(ov)
+        ov[1] === :truncated && family === :flat &&
+            _fail(label, "truncation requires a proper univariate distribution")
+        if ov[1] === :restricted_half
+            family in (:normal, :cauchy) && args.arg1 == 0 ||
+                _fail(label, "restricted half support requires a zero-location Normal or Cauchy")
+        end
         length(ov) == 3 || _fail(label, "truncated support takes (lo, hi)")
         for x in ov[2:end]
             x isa Symbol || x isa Expr || (x isa Real && !isnan(x)) ||
