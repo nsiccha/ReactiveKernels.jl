@@ -1734,9 +1734,8 @@ end
         eta = a .+ b .* x
         y .~ Bernoulli.(foo.(eta))
     end, Dn2; conditioned = Dn2)
-    # Inline cloglog is not a recognized wrapper (surv_disc shape stays out).
-    # capability: inline expression probability 1 .- exp.(-exp.(eta)) (todo `1308iv0`)
-    @test_broken (lower_rkppl(quote
+    # Inline probability arithmetic uses the ordinary value graph.
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
