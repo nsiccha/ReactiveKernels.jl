@@ -138,11 +138,11 @@ _pl_pk_chain(obs...) = Expr(:block, _pl_pk_head().args...,
     legacy, lb = _pl_bind(_pl_pk_legacy(:(dv .~ Normal.(mu, sigma))),
         _PL_PK_DATA, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
     for obs in (:(dv .~ Normal.(conc, sigma)),
-            _pl_plate(:(eachindex(dv)), :(dv[i] ~ Normal(conc[i], sigma))),
-            _pl_plate(:(axes(dv, 1)), :(dv[i] ~ Normal(conc[i], sigma))),
             :(dv[eachindex(dv)] .~ Normal.(conc, sigma)),
             :(dv[axes(dv, 1)] .~ Normal.(conc, sigma)),
-            :(dv[:] .~ Normal.(conc, sigma)))
+            :(dv[:] .~ Normal.(conc, sigma)),
+            _pl_plate(:(eachindex(dv)), :(dv[i] ~ Normal(conc[i], sigma))),
+            _pl_plate(:(axes(dv, 1)), :(dv[i] ~ Normal(conc[i], sigma))))
         plan = lower_rkppl(_pl_pk_chain(obs), _PL_PK_DATA; conditioned = _PL_PK_DATA)
         kp = only(plan.kernel_plates)
         @test isempty(plan.responses)
@@ -170,40 +170,66 @@ _pl_pk_chain(obs...) = Expr(:block, _pl_pk_head().args...,
     end
 end
 
+@testset "schedule extraction preserves selected-domain boundaries" begin
+    # These are valid Julia selections, but carrying their indices through
+    # the grouped schedule cell is an existing capability gap. An extraction
+    # that silently drops the selection must not appear to support them.
+    for obs in (:(dv[eachindex(time)] .~ Normal.(conc, sigma)),
+            :(dv[axes(time, 1)] .~ Normal.(conc, sigma)),
+            :(dv[axes(dv, 2)] .~ Normal.(conc, sigma)),
+            :(dv[1:4] .~ Normal.(conc, sigma)),
+            _pl_plate(:(axes(dv, 2)), :(dv[i] ~ Normal(conc[i], sigma))))
+        supported = try
+            lower_rkppl(_pl_pk_chain(obs), _PL_PK_DATA;
+                conditioned = _PL_PK_DATA)
+            true
+        catch err
+            err isa SurfaceLoweringError || rethrow()
+            @test occursin("explicitly sized or selected domain", sprint(showerror, err))
+            false
+        end
+        @test_broken supported
+    end
+end
+
 @testset "schedule chain with two observations is one kernel" begin
     cols = _pl_pk_cols()
-    two = _pl_pk_chain(
-        _pl_plate(:(eachindex(dv)), :(dv[i] ~ Normal(conc[i], sigma))),
-        _pl_plate(:(eachindex(cc)), :(lam = exp(conc[i])),
-            :(cc[i] ~ Poisson(lam))))
-    plan = lower_rkppl(two, _PL_PK_DATA; conditioned = _PL_PK_DATA)
-    kp = only(plan.kernel_plates)
-    @test length(kp.obs) == 2
-    @test kp.result === :conc
-    @test [nm for (nm, _) in kp.assignments] == [:read_locs, :conc, :lam]
-    bound, built = _pl_bind(two, _PL_PK_DATA, cols)
-    # Each observation alone, in the legacy form, at the same draws: the
-    # joint likelihood is their sum (shared chain, two response axes).
-    gauss, gb = _pl_bind(_pl_pk_legacy(:(dv .~ Normal.(mu, sigma))),
-        _PL_PK_DATA, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
-    pois, pb = _pl_bind(_pl_pk_legacy(:(lam = exp.(mu)), :(cc .~ Poisson.(lam))),
-        _PL_PK_DATA, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
-    names = coordinate_names(built.layout)
-    @test names == coordinate_names(gb.layout)
-    u = 0.03 .* (1:length(names)) .- 0.05
-    pnames = coordinate_names(pb.layout)
-    up = [u[findfirst(==(n), names)] for n in pnames]
-    @test _pl_q(built, bound, :likelihood, u) ≈
-        _pl_q(gb, gauss, :likelihood, u) + _pl_q(pb, pois, :likelihood, up) rtol = 1e-12
-    # A chain value is a cell value, never a sampled name or a response.
-    # refused: `conc` bound by `=` then sampled with `.~` (single assignment)
-    @test_throws "schedule-chain value" lower_rkppl(_pl_pk_chain(
-        :(dv .~ Normal.(conc, sigma)), :(conc .~ Normal.(0.0, 1.0))),
-        _PL_PK_DATA; conditioned = _PL_PK_DATA)
-    # capability: schedule chain that feeds no observation (unused deterministic value) (todo `1qlbn5b`)
-    free_chain = lower_rkppl(_pl_pk_chain(), _PL_PK_DATA; conditioned = _PL_PK_DATA)
-    @test isempty(only(free_chain.kernel_plates).obs)
-    @test isempty(free_chain.responses)
+    for axis in (:eachindex, :axes)
+        dv_indices = axis === :eachindex ? :(eachindex(dv)) : :(axes(dv, 1))
+        cc_indices = axis === :eachindex ? :(eachindex(cc)) : :(axes(cc, 1))
+        two = _pl_pk_chain(
+            _pl_plate(dv_indices, :(dv[i] ~ Normal(conc[i], sigma))),
+            _pl_plate(cc_indices, :(lam = exp(conc[i])),
+                :(cc[i] ~ Poisson(lam))))
+        plan = lower_rkppl(two, _PL_PK_DATA; conditioned = _PL_PK_DATA)
+        kp = only(plan.kernel_plates)
+        @test length(kp.obs) == 2
+        @test kp.result === :conc
+        @test [nm for (nm, _) in kp.assignments] == [:read_locs, :conc, :lam]
+        bound, built = _pl_bind(two, _PL_PK_DATA, cols)
+        # Each observation alone, in the legacy form, at the same draws: the
+        # joint likelihood is their sum (shared chain, two response axes).
+        gauss, gb = _pl_bind(_pl_pk_legacy(:(dv .~ Normal.(mu, sigma))),
+            _PL_PK_DATA, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
+        pois, pb = _pl_bind(_pl_pk_legacy(:(lam = exp.(mu)), :(cc .~ Poisson.(lam))),
+            _PL_PK_DATA, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
+        names = coordinate_names(built.layout)
+        @test names == coordinate_names(gb.layout)
+        u = 0.03 .* (1:length(names)) .- 0.05
+        pnames = coordinate_names(pb.layout)
+        up = [u[findfirst(==(n), names)] for n in pnames]
+        @test _pl_q(built, bound, :likelihood, u) ≈
+            _pl_q(gb, gauss, :likelihood, u) + _pl_q(pb, pois, :likelihood, up) rtol = 1e-12
+        # A chain value is a cell value, never a sampled name or a response.
+        # refused: `conc` bound by `=` then sampled with `.~` (single assignment)
+        @test_throws "schedule-chain value" lower_rkppl(_pl_pk_chain(
+            :(dv .~ Normal.(conc, sigma)), :(conc .~ Normal.(0.0, 1.0))),
+            _PL_PK_DATA; conditioned = _PL_PK_DATA)
+        # capability: schedule chain that feeds no observation (unused deterministic value) (todo `1qlbn5b`)
+        free_chain = lower_rkppl(_pl_pk_chain(), _PL_PK_DATA; conditioned = _PL_PK_DATA)
+        @test isempty(only(free_chain.kernel_plates).obs)
+        @test isempty(free_chain.responses)
+    end
 end
 
 # --- The 99_plate_* corpus re-spellings against the forms they replace ----

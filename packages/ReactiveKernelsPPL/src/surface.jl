@@ -4259,8 +4259,8 @@ function _extract_kernel_cells(sample::Vector, det::Vector{Pair{Symbol,Any}},
             s.matrix === nothing || _sfail("$where: `$(s.lhs)` reads a " *
             "schedule-chain value; only `.~` observations of data columns " *
             "read one (`$(s.lhs) .~ Normal.(conc, sigma)`)")
-        _self_covering_response_range(s.range, s.lhs) || _sfail("$where: `$(s.lhs)[...]` observes a " *
-            "literal range; a schedule chain observes whole columns " *
+        _self_covering_response_range(s.range, s.lhs) || _sfail("$where: `$(s.lhs)[...]` observes an " *
+            "explicitly sized or selected domain; a schedule chain observes whole columns " *
             "(`@plate for i in eachindex($(s.lhs))` or `$(s.lhs) .~ ...`)")
         push!(obs, s)
     end
@@ -6551,8 +6551,9 @@ function _lower_lhs_range(col::Symbol, r)
 end
 
 """One `~` / `.~` statement: scalar (`~`) or elementwise (`.~`) density.
-`range` carries a literal `y[1:N]` response range (`nothing` = whole
-column: bare LHS, `eachindex`, `axes`). `levels` carries a
+`range` carries a literal `y[1:N]` response range or an indexed response
+expression for `eachindex`, `axes` or `:` (`nothing` = bare whole-column
+LHS). `levels` carries a
 `(grouping column, subset)` pair for `c[levels(g)]` broadcast priors
 (`nothing` otherwise). `matrix` carries the sizing design matrix for
 `b[axes(X, 2)]` coefficient-vector priors (`nothing` otherwise). `dims`
