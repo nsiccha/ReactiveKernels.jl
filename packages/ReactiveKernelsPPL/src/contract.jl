@@ -444,6 +444,10 @@ struct LikelihoodSpec
     interval::Union{Nothing,Tuple{Float64,Float64}}
     threshold_effects::Union{Nothing,Symbol}
 end
+# Preserve the all-fields constructor predating per-component trials.
+LikelihoodSpec(args::Vararg{Any,32}) = LikelihoodSpec(args[1:27]...,
+    Union{ColumnRef,Int}[], args[28:32]...)
+
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
     LikelihoodSpec(family, link, response, predictor, scale, weights,

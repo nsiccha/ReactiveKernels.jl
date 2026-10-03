@@ -89,6 +89,8 @@ function _canon(io::IO, x, depth::Int = 0)
             (fs = filter(!=(:submodel_scopes), fs))
         x isa LikelihoodSpec && x.threshold_effects === nothing &&
             (fs = filter(!=(:threshold_effects), fs))
+        x isa LikelihoodSpec && isempty(x.mixture_trials) &&
+            (fs = filter(!=(:mixture_trials), fs))
         x isa StructuralPlan && isempty(x.conditioned) &&
             (fs = filter(!=(:conditioned), fs))
         # Canonical mathematical plans compare loop/broadcast spellings.
