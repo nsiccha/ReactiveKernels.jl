@@ -105,7 +105,11 @@ Reactant [scan](scan.md) lowering retains one `while` loop for every
 iterated-sequence shape, including bound host sequences.
 
 Grouped PK recurrences expose a subject plate containing retained event scans.
-Their full Reactant path currently fails at fixed-size system-matrix batching.
+Their fixed-size matrix and named carry intermediates batch as typed leaves,
+with their authored wrappers restored inside each cell. Their full Reactant
+path still fails in the ordinary StaticArrays matrix exponential: its branch
+condition is a traced Boolean. This is a dependency capability boundary,
+isolated by `benchmark/repro_reactant_static_matrix_exp.jl`.
 Eager branches, parameter-dependent host propagation, and data-derived
 unrolling are not acceptable fixes. See the [scan limitations](scan.md).
 
@@ -141,6 +145,12 @@ and lock the one Reactant 0.2.289 lifted:
   unrolled per lane, succeeded). The boundary concerned only branches whose
   condition reads a live value: a condition on bound data is split away
   during preparation and never reaches the backend.
+  Default optimized reverse still expands small lazy batches into one branch
+  region per lane instead of retaining the batch loop:
+  `repro_reactant_lazy_batch_growth.jl` has correct values and gradients at
+  two and five lanes, but different operation inventories. The fixed-structure
+  requirement remains unmet for that shape; changing optimizer flags is not
+  acceptance of the ordinary path.
 - Reverse compilation through a retained `while` loop whose exit is data
   dependent (the adaptive ODE solver's `(n < maxiters) & (t < t1)`) fails
   because the loop has no statically known iteration count:
