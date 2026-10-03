@@ -117,10 +117,17 @@ a host loop.
 Compare retained control-flow regions, nonlinear work and indexing across all
 tested data sizes, and keep complete optimized operation inventories as
 diagnostics. Shape specialization may share constants, simplify scalar
-arithmetic or reshape singleton derivative tapes, so small shapes need not
+arithmetic or simplify singleton derivative tapes, including an identity
+broadcast of one scalar tape index, so small shapes need not
 have identical raw inventories. Complete inventories must stop growing as
 data lengths increase; these bounded simplifications must preserve one
 authored loop and branch body at every size.
+
+For compiled acceptance inspect both optimized MLIR and the HLO of the actual
+default executable. XLA may remove singleton loops, turn pure lazy branches
+into eager selections, or move invariant work out of a zero-trip body after
+MLIR checks pass. Verify retained executable regions and inactive arithmetic
+as well as operation-growth diagnostics.
 
 These are required constraints, not a claim that every existing path already
 conforms. Every functional stateful method with authored control flow lowers

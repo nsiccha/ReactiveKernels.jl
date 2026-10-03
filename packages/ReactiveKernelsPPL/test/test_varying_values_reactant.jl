@@ -24,9 +24,11 @@ end
 
 function _cv_hlo_retained_work(ops)
     # Constant sharing, scalar identities and singleton tape reshapes may
-    # specialize a shape without replicating its authored computation.
+    # specialize a shape without replicating its authored computation. An
+    # integer index broadcast to a 1x1 tape also folds to a reshape at K=2.
     simplified = ("stablehlo.constant", "stablehlo.reshape", "stablehlo.add",
-        "stablehlo.multiply", "stablehlo.subtract", "stablehlo.negate")
+        "stablehlo.multiply", "stablehlo.subtract", "stablehlo.negate",
+        "stablehlo.broadcast_in_dim")
     return Dict(name => count for (name, count) in ops if name ∉ simplified)
 end
 
