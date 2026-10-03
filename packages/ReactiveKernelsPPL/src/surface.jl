@@ -2474,8 +2474,11 @@ function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ();
     for st in ast.args
         st isa LineNumberNode && continue
         st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
+        # Only the indexed spelling puts the loop in argument 3. Legacy
+        # `@plate result for ...` keeps its conservative whole-statement reads.
         if st isa Expr && st.head === :macrocall &&
-                st.args[1] === Symbol("@plate")
+                st.args[1] === Symbol("@plate") &&
+                length(st.args) == 3 && Meta.isexpr(st.args[3], :for)
             loop = st.args[3]
             ivar = loop.args[1].args[1]
             _all_symbols!(out, loop.args[1].args[2])
