@@ -129,6 +129,12 @@ into eager selections, or move invariant work out of a zero-trip body after
 MLIR checks pass. Verify retained executable regions and inactive arithmetic
 as well as operation-growth diagnostics.
 
+Default XLA vector reductions can add reduction stages as array lengths grow
+even when optimized MLIR retains one reduction body. This separate
+complete-inventory growth limit is isolated by
+`benchmark/repro_reactant_vector_reduction_growth.jl`; retaining scalar loops
+and lazy branches alone does not satisfy it.
+
 These are required constraints, not a claim that every existing path already
 conforms. Every functional stateful method with authored control flow lowers
 through the retained control program, and host-drained observational records
