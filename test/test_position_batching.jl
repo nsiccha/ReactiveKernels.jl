@@ -231,6 +231,10 @@ end
 end
 _nested_position_bytes(kernel, args...) =
     (kernel(args...); minimum(@allocated(kernel(args...)) for _ in 1:5))
+_nested_position_lane(position, xs) = Vector{Float64}(undef, length(xs) + 1)
+_nested_position_output(position, xs) =
+    Matrix{Float64}(undef, length(xs) + 1, length(position.group.response.seed))
+_nested_position_copy(kernel, position, xs) = copy(view(kernel(position, xs), :, 1))
 
 @testset "nested record positions retain concrete loop arithmetic" begin
     position = (; group=(; response=(; seed=[1.0, 2.0, 3.0], rate=[0.5, -0.5, 2.0]),
@@ -240,6 +244,15 @@ _nested_position_bytes(kernel, args...) =
     expected(xs) = hcat([position.group.response.seed[i] .+
                         position.group.response.rate[i] .* (0:length(xs))
                         for i in 1:3]...)
+    # Match the two intended allocations: the first scan lane and the owned
+    # output stack. @allocated counts usable allocator blocks, which can grow
+    # by more than sizeof's payload on macOS. Keep the fixed allowance small;
+    # an additional length-dependent allocation must still fail the guard.
+    lane_growth = _nested_position_bytes(_nested_position_lane, position, long) -
+                  _nested_position_bytes(_nested_position_lane, position, short)
+    output_growth = _nested_position_bytes(_nested_position_output, position, long) -
+                    _nested_position_bytes(_nested_position_output, position, short)
+    accounting_slack = 4096
     for reuse in (false, true)
         batch = vectorize(nested_position_scan; batched=:position, reuse)
         @test batch(position, short) == expected(short)
@@ -253,11 +266,17 @@ _nested_position_bytes(kernel, args...) =
                                    argtypes))) === Matrix{Float64}
         short_bytes = _nested_position_bytes(batch, position, short)
         long_bytes = _nested_position_bytes(batch, position, long)
-        # Owning execution also constructs one first-position scratch lane.
-        output_growth = reuse ? 0 :
-            sizeof(expected(long)) - sizeof(expected(short)) +
-            sizeof(Float64) * (length(long) - length(short))
-        @test long_bytes - short_bytes <= output_growth + 4096
+        storage_growth = reuse ? 0 : output_growth + lane_growth
+        @test long_bytes - short_bytes <= storage_growth + accounting_slack
+        # Negative control: even one extra lane copy from the same reader
+        # must violate the guard in both ownership modes.
+        short_copy = _nested_position_bytes(_nested_position_copy, batch, position, short)
+        long_copy = _nested_position_bytes(_nested_position_copy, batch, position, long)
+        @test long_copy - short_copy > storage_growth + accounting_slack
+        println("NESTED_SCAN_ALLOC reuse=", reuse, " short=", short_bytes,
+                " long=", long_bytes, " lane_growth=", lane_growth,
+                " output_growth=", output_growth, " copy_growth=", long_copy - short_copy,
+                " accounting_slack=", accounting_slack)
         @test batch(position, Float64[]) == reshape(position.group.response.seed, 1, :)
         @test position == before
         bad = (; group=(; response=(; seed=[1.0], rate=[0.5, -0.5, 2.0]),

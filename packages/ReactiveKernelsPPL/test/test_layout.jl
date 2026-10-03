@@ -349,8 +349,8 @@ end
     # break Jacobian (K=3 here).
     sentry = LayoutEntry(:vector, nothing, :s, [:s_1, :s_2], 6, 2, :simplex)
     @test transform_statements(sentry) == Expr[
-        :(_ppl_vz_s::AbstractVector{Float64} = 1.0 ./ (1.0 .+ exp.(-(Float64.(
-            view(unconstrained, 6:7)) .+ log.(3 .- (1:2)))))),
+        :(_ppl_vz_s::AbstractVector{Float64} = 1.0 ./ (1.0 .+ exp.(-(
+            unconstrained[6:7] .+ log.(3 .- (1:2)))))),
         :(_ppl_vl_s::AbstractVector{Float64} = log1p.(-_ppl_vz_s)),
         :(_ppl_vlr_s::AbstractVector{Float64} = cumsum(vcat(0.0, _ppl_vl_s))),
         :(s::AbstractVector{Float64} = exp.(_ppl_vlr_s) .* vcat(_ppl_vz_s, ones(1))),

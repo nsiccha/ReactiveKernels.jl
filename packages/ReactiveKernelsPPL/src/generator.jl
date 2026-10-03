@@ -274,6 +274,8 @@ import .._pk_subject_plan, .._pk_event_scan, .._pk_event_scan_auc, .._pk_pack_su
 import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
 import .._mvnormal_cholesky_slices_logpdf, .._mvnormal_slices_logpdf
 import .._dirichlet_slices_logpdf, .._ordered_normal_slices_logpdf
+import .._mvnormal_cholesky_slices_pointwise, .._mvnormal_slices_pointwise
+import .._dirichlet_slices_pointwise, .._ordered_normal_slices_pointwise
 import .._simplex_slices_constrain, .._simplex_slices_logjac
 import .._ordered_slices_constrain, .._ordered_slices_logjac
 # Event-LP provider (one call over the flat event axis — the flat
@@ -1245,39 +1247,87 @@ _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
 function _likelihood_statements(plan::StructuralPlan, layout; gathers)
     stmts = Expr[]
     terms = Any[]
+    points = Pair{Symbol,Any}[]
     for r in plan.responses
         append!(stmts, _response_likelihood_stmts(r, plan))
         push!(terms, _lik_name(r.label))
+        pw = _pw_name(r.label)
+        if r.family === OrdinalFam && r.ordinal_structure === :stopping && r.n_levels > 1 && _response_rows(plan, r) > 0
+            # Stopping-ratio emits one lane per visited stage. Gather the
+            # prefix sum at each observation's last stage, then difference.
+            ends = Symbol(pw, :_ends)
+            cumulative = Symbol(pw, :_cumulative)
+            values = Symbol(pw, :_observations)
+            observed = r.range isa Expr ? Symbol(:_ppl_range_response_, r.label) : r.response
+            push!(stmts, :($ends = cumsum(min.($observed, $(r.n_levels-1)))),
+                :($cumulative = cumsum($pw)[$ends]),
+                :($values = $cumulative .- vcat(0.0, $cumulative[1:end-1])))
+            pw = values
+        end
+        push!(points, r.response => pw)
     end
     for kp in plan.kernel_plates
-        kstmts, kterm = _kernel_plate_likelihood(kp, plan)
+        kstmts, kterm = _kernel_plate_likelihood(kp, plan; pointwise = points)
         append!(stmts, kstmts)
         push!(terms, kterm)
     end
     observed = _density_selection(plan, n -> n in plan.conditioned)
-    _parameter_prior_statements!(stmts, terms, observed, layout; prefix = :_ppl_condition_)
+    _parameter_prior_statements!(stmts, terms, observed, layout;
+        prefix = :_ppl_condition_, group_scalars = false)
+    for p in observed.parameters
+        push!(points, p.name => Symbol(:_ppl_prior_, p.name))
+    end
     for p in observed.vector_parameters
         _vector_parameter_prior_stmts!(stmts, terms, p)
+        value = p.family === :vector_normal ?
+            (p.size == 0 ? :(zeros(0)) : Symbol(:_ppl_pw_prior_, p.name)) :
+            Symbol(:_ppl_prior_, p.name)
+        push!(points, p.name => value)
     end
     for p in observed.plate_parameters
         _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
-            p.support_override; conditioned = true)
+            p.support_override; conditioned = true, rows = _plate_rows(plan, p))
+        push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
     end
-    _array_prior_stmts!(stmts, terms, observed, gathers; context = plan)
+    _array_prior_stmts!(stmts, terms, observed, gathers; context = plan, pointwise = points)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
     push!(stmts, :(likelihood::Float64 = $joint))
+    names = first.(points)
+    length(unique(names)) == length(names) || throw(ContractValidationError(
+        "[query] pointwise observation names must be unique, got $names"))
+    values = isempty(points) ? :(NamedTuple()) :
+        Expr(:tuple, (Expr(:(=), name, value) for (name, value) in points)...)
+    push!(stmts, Expr(:(=), :pointwise, values))
     return stmts
 end
 
-# Panel-kernel likelihood (flat codegen): panel-v1 cell bodies are
-# elementwise, so the subject map dissolves into flat vector ops over the
-# `n_sub*T` block (numerically identical to a per-subject loop for the
-# admitted subset): slice params rewrite to flat column refs (scalar
-# slices to their bind-time T-block expansions), cell assignments emit as
-# flat statements, and the single Gaussian obs lowers as a flat plate
-# reusing the plate-sum machinery. The collected name aliases its flat
-# value (future generated quantities read it).
-function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
+# Panel likelihoods use flat T-blocked arrays for elementwise operations
+# and T-by-subject frames for reductions. Scalar slices repeat per subject;
+# collected scalars return one entry per subject. The optional observation
+# uses the scalar-family plate-sum machinery.
+_panel_frame(x::Number, T::Int, subjects::Int) = fill(x, T, subjects)
+_panel_frame(x::AbstractVector, T::Int, subjects::Int) = reshape(x, T, subjects)
+_panel_subject_values(x::Number, T::Int, subjects::Int) = fill(x, subjects)
+_panel_subject_values(x::AbstractVector, T::Int, subjects::Int) = x[1:T:end]
+
+function _rewrite_panel_value(ex, kp::KernelPlate, flatmap, shapes)
+    ex isa Expr || return _rewrite_kernel_refs(ex, flatmap)
+    if ex.head === :call && !isempty(ex.args) && ex.args[1] in REDUCTION_FNS
+        fn, arg = ex.args
+        _, kind = _canonicalize_kernel_cell(arg, kp, shapes)
+        value = _rewrite_panel_value(arg, kp, flatmap, shapes)
+        T = something(kp.timepoints, 1)
+        frame = Expr(:call, GlobalRef(@__MODULE__, :_panel_frame), value, T, kp.subjects)
+        kind === :scalar && (frame = :($frame[1:1, :]))
+        reduced = fn === :length ? :(fill(size($frame, 1), 1, $(kp.subjects))) :
+            Expr(:call, fn, Expr(:parameters, Expr(:kw, :dims, 1)), frame)
+        return :(repeat(vec($reduced); inner=$T))
+    end
+    return _rewrite_kernel_refs(Expr(ex.head,
+        (_rewrite_panel_value(a, kp, flatmap, shapes) for a in ex.args)...), flatmap)
+end
+
+function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan; pointwise = Pair{Symbol,Any}[])
     isbound(plan) ||
         throw(ContractValidationError("[generator] kernel plates lower " *
               "from a bound plan (bind_data first)"))
@@ -1286,20 +1336,28 @@ function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
               "`$(kp.result)` subjects unresolved (bind_data with dims first)"))
     flatmap = _kernel_flatmap(kp)
     stmts = Expr[]
-    for (nm, ex) in _canonicalize_kernel_assignments(kp)
-        push!(stmts, :($nm = $(_rewrite_kernel_refs(ex, flatmap))))
+    shapes = _kernel_cell_shapes(kp)
+    for (nm, ex) in kp.assignments
+        canon, kind = _canonicalize_kernel_cell(ex, kp, shapes)
+        push!(stmts, :($nm = $(_rewrite_panel_value(canon, kp, flatmap, shapes))))
+        shapes[nm] = kind
     end
-    obs = only(kp.obs)
-    obs.family in _KERNEL_SCALAR_FAMS ||
-        throw(ContractValidationError("[generator] kernel plate " *
-              "`$(kp.result)` obs family $(obs.family) has no panel " *
-              "emitter (admitted: Normal, Bernoulli, Poisson, " *
-              "NegativeBinomial2, Gamma, Beta, StudentT)"))
     klabel = Symbol(:kernel_, kp.result)
-    rcol = _kernel_obs_rcol(kp, obs, flatmap[obs.response], plan)
-    append!(stmts, _kernel_scalar_obs_stmts(obs, rcol,
-        flatmap, plan, klabel, _pw_name(klabel), _lik_name(klabel)))
+    if isempty(kp.obs)
+        push!(stmts, :($(_lik_name(klabel))::Float64 = 0.0))
+    else
+        obs = only(kp.obs)
+        rcol = _kernel_obs_rcol(kp, obs, flatmap[obs.response], plan)
+        append!(stmts, _kernel_scalar_obs_stmts(obs, rcol,
+            flatmap, plan, klabel, _pw_name(klabel), _lik_name(klabel)))
+        col = only(c for (c, p, _) in kp.slices if p === obs.response)
+        push!(pointwise, col => _pw_name(klabel))
+    end
     collected = haskey(flatmap, kp.collected) ? flatmap[kp.collected] : kp.collected
+    if get(shapes, kp.collected, :vector) === :scalar
+        T = something(kp.timepoints, 1)
+        collected = Expr(:call, GlobalRef(@__MODULE__, :_panel_subject_values), collected, T, kp.subjects)
+    end
     collected === kp.result ||
         push!(stmts, :($(kp.result) = $collected))
     return stmts, _lik_name(klabel)
@@ -1329,6 +1387,17 @@ function _kernel_scalar_obs_stmts(obs::KernelObs, rcol::Symbol,
         locv = _thread_ref!(inputs, loc)
         sref = _thread_ref!(inputs, scale)
         :(normal($locv, $sref).logpdf($rv))
+    elseif fam === CauchyFam
+        locv = _thread_ref!(inputs, loc)
+        sref = _thread_ref!(inputs, scale)
+        :(cauchy($locv, $sref).logpdf($rv))
+    elseif fam === BinomialProbFam
+        counts = Symbol(:_ppl_counts_, label)
+        push!(pre, :($counts = Int.($rcol)))
+        inputs[1] = counts
+        nv = _thread_ref!(inputs, loc, true)
+        pv = _thread_ref!(inputs, scale)
+        :(binomial(Int($nv), $pv).logpdf($rv))
     elseif fam === BernoulliLogitFam
         pv = _thread_ref!(inputs, loc)
         :(bernoulli($pv).logpdf($rv))
@@ -1511,7 +1580,7 @@ end
 _grouped_flatmap(kp::KernelPlate) =
     Dict{Symbol,Symbol}(p => c for (c, p, _) in kp.slices)
 
-function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
+function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan; pointwise = Pair{Symbol,Any}[])
     isbound(plan) ||
         throw(ContractValidationError("[generator] kernel plates lower " *
               "from a bound plan (bind_data first)"))
@@ -1541,6 +1610,8 @@ function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan)
             _grouped_obs_likelihood_stmts(kp, obs, rcol, olabel, plan)
         append!(stmts, ostmts)
         push!(oterms, oterm)
+        # All in-cell observation builders end in a sum of their lanes.
+        push!(pointwise, rcol => last(ostmts).args[2].args[2])
     end
     joint = foldl((a, b) -> :($a + $b), oterms; init = :(0.0))
     push!(stmts, :($(_lik_name(klabel))::Float64 = $joint))
@@ -1614,9 +1685,9 @@ function _grouped_obs_likelihood_stmts(kp::KernelPlate, obs::KernelObs,
           "CensoredAddpropnormal, TgiCategory, TgiResponse, TgiCensored)"))
 end
 
-function _kernel_plate_likelihood(kp::KernelPlate, plan::StructuralPlan)
-    _is_grouped_kernel(kp) && return _grouped_kernel_likelihood(kp, plan)
-    return _panel_kernel_likelihood(kp, plan)
+function _kernel_plate_likelihood(kp::KernelPlate, plan::StructuralPlan; pointwise = Pair{Symbol,Any}[])
+    _is_grouped_kernel(kp) && return _grouped_kernel_likelihood(kp, plan; pointwise)
+    return _panel_kernel_likelihood(kp, plan; pointwise)
 end
 
 # Slice params to flat refs: vector slices ride their flat T-blocked
@@ -1644,6 +1715,13 @@ _kernel_obs_ref(ref, flatmap::Dict{Symbol,Symbol}) =
 function _rewrite_kernel_refs(ex, flatmap::Dict{Symbol,Symbol})
     ex isa Symbol && return get(flatmap, ex, ex)
     ex isa Expr || return ex
+    if ex.head === :call && !isempty(ex.args) && ex.args[1] === :logistic
+        return Expr(:call, :_ppl_logistic,
+            (_rewrite_kernel_refs(a, flatmap) for a in ex.args[2:end])...)
+    elseif ex.head === :. && length(ex.args) == 2 && ex.args[1] === :logistic &&
+            ex.args[2] isa Expr && ex.args[2].head === :tuple
+        return Expr(:., :_ppl_logistic, _rewrite_kernel_refs(ex.args[2], flatmap))
+    end
     return Expr(ex.head, (_rewrite_kernel_refs(a, flatmap) for a in ex.args)...)
 end
 
@@ -1652,6 +1730,51 @@ end
 _mi_row_value(x::Number, i) = x
 @traceable _mi_row_value(x::AbstractVector, i) = x[i]
 
+_ppl_range_values(x::Number, indices) = x
+_ppl_range_values(x::AbstractArray, indices) = x[indices]
+
+function _ranged_response_stmts(r, plan, stmts)
+    idx = Symbol(:_ppl_range_indices_, r.label)
+    selected = Symbol(:_ppl_range_response_, r.label)
+    index = r.range.args[2]
+    index === :(:) && (index = Expr(:call, :eachindex, r.response))
+    pre = Expr[:($idx = collect($index))]
+    if _response_rows(plan, r) == 0 && r.response in plan.indexed_observations
+        push!(pre, :($selected = zeros(0)))
+    else
+        push!(pre, Expr(:(=), selected, Expr(:ref, r.response, idx, r.range.args[3:end]...)))
+    end
+    aliases = Dict{Symbol,Symbol}(r.response => selected)
+    if r.response in plan.indexed_observations
+        rows = Set{Symbol}()
+        # Select ordinary row values before family-specific conversions or
+        # ordinal stage expansion. Simplexes and covariance factors stay whole.
+        if r.family ∉ (CategoricalFam, MultinomialFam)
+            push!(rows, _location_node(r, plan))
+            foreach(p -> push!(rows, _lp_name(_predictor(plan, p))), r.extra_predictors)
+        end
+        for slot in (r.scale, r.nu, r.zi, r.discrimination, r.weights, r.trials,
+                r.evidence.lower, r.evidence.upper, r.threshold_columns...,
+                r.count_columns..., r.extra_responses...)
+            if slot isa ScalePredictorRef
+                push!(rows, _lp_name(_predictor(plan, slot.predictor)))
+            elseif slot isa Symbol
+                pred = findfirst(p -> p.name === slot, plan.predictors)
+                push!(rows, pred === nothing ? slot : _lp_name(plan.predictors[pred]))
+            end
+        end
+        for (i, value) in enumerate(sort!(collect(rows)))
+            value === r.response && continue
+            alias = Symbol(:_ppl_range_operand_, r.label, :_, i)
+            getter = GlobalRef(@__MODULE__, :_ppl_range_values)
+            push!(pre, :($alias = $getter($value, $idx)))
+            aliases[value] = alias
+        end
+    end
+    stmts = Expr[_hsubst(st, aliases, Dict()) for st in stmts]
+    return Expr[pre..., stmts...]
+end
+
 # Pure scalar math keeps the CDF inside the selected censoring arm; endpoint
 # expansion currently cannot splice the normal CDF's multi-recipe graph there.
 _mixture_normal_cdf(x, mu, sigma) = 0.5 * erfc((mu - x) / (sqrt(2.0) * sigma))
@@ -1659,9 +1782,13 @@ _mixture_normal_cdf(x, mu, sigma) = 0.5 * erfc((mu - x) / (sqrt(2.0) * sigma))
 function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     # No cell is evaluated on an empty bound observation domain. Its sum is
     # the additive identity, independently of the response family.
-    _response_rows(plan, r) == 0 && return Expr[:($(_lik_name(r.label))::Float64 = 0.0)]
+    _response_rows(plan, r) == 0 && return Expr[
+        :($(_pw_name(r.label)) = zeros($(r.range isa Expr ? size(_selected_response_column(plan, r)) : size(plan.columns[r.response])))),
+        :($(_lik_name(r.label))::Float64 = 0.0)]
     stmts = _response_likelihood_stmts_full(r, plan)
+    r.range isa Expr && return _ranged_response_stmts(r, plan, stmts)
     r.mi_jobs === nothing && return stmts
+    _is_glm_family(r.family) && return stmts # its data-only design selects Jobs before eta
     pre = Expr[]
     jobs = r.mi_jobs
     packed = nothing
@@ -1681,13 +1808,14 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     let st = stmts[obsidx]
         call = st.args[2].args[1]
         call.args[1] === :plate || throw(ContractValidationError(
-            "[generator] mi response $(r.label) needs a scalar observation plate"))
+            "[generator] mi response $(r.label) needs an observation plate"))
         for i in 2:length(call.args)
             ref = call.args[i]
             # Ref inputs are whole model values (e.g. a simplex), never rows.
             ref isa Symbol || continue
-            i == 2 && packed === nothing && continue
-            rows = i == 2 ? packed : jobs
+            ispacked = i == 2 || ref in _mi_packed_columns(r)
+            ispacked && packed === nothing && continue
+            rows = ispacked ? packed : jobs
             call.args[i] = _mi_gather_node!(pre, rows, ref, r.label)
         end
     end
@@ -1744,9 +1872,9 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
         return _nb2_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomialFam
         return _nb1_plate_stmts(r, plan, node, pw)
-    elseif r.family === WeibullFam
+    elseif r.family === WeibullFam || r.family === WeibullValueFam
         return _weibull_plate_stmts(r, plan, node, pw)
-    elseif r.family === GammaLogFam
+    elseif r.family === GammaLogFam || r.family === GammaValueFam
         return _gamma_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliProbitFam
         return _bernoulli_probit_plate_stmts(r, plan, node, pw)
@@ -2000,9 +2128,11 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     call = r.family === NormalIDGLMFam ?
         :($obj($xaug, $bfull, $s).pointwise($yf)) :
         :($obj($xaug, $bfull).pointwise($yf))
+    design = r.mi_jobs === nothing ? X : Expr(:ref, X, r.mi_jobs, :(:))
+    n = r.mi_jobs === nothing ? _response_rows(plan, r) : Expr(:call, :length, r.mi_jobs)
     return Expr[
         :($yf = $yconv.($y)),
-        :($xaug = hcat(ones($(_response_rows(plan, r))), $X)),
+        :($xaug = hcat(ones($n), $design)),
         :($bfull = [$(r.glm_alpha); $(r.glm_beta)]),
         :($pw = $call),
         :($node::Float64 = sum($pw)),
@@ -2305,6 +2435,7 @@ function _bernoulli_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node
     lp = _location_node(r, plan)
     yf = _yfloat_name(r.label)
     return Expr[
+        _bernoulli_plate_stmts(r, plan, node, _pw_name(r.label))[1:end-1]...,
         :($yf = Float64.($y)),
         :($node::Float64 = dot($yf, $lp) - sum(log1pexp, $lp)),
     ]
@@ -2317,6 +2448,7 @@ function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::
     cterm = sum(SpecialFunctions.loggamma(Float64(v) + 1.0) for v in ycol)
     yf = _yfloat_name(r.label)
     return Expr[
+        _poisson_plate_stmts(r, plan, node, _pw_name(r.label))[1:end-1]...,
         :($yf = Float64.($y)),
         :($node::Float64 = dot($yf, $lp) - sum(exp, $lp) - $cterm),
     ]
@@ -2605,7 +2737,8 @@ function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, nod
     inputs = Any[yin]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
-    pref = _thread_ref!(inputs, r.predictor)
+    pref = _thread_ref!(inputs, any(p -> p.name === r.predictor, plan.predictors) ?
+        _lp_name(_predictor(plan, r.predictor)) : r.predictor)
     cell = :(binomial($nref, $pref).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
@@ -2625,7 +2758,8 @@ function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     inputs = Any[yin]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
-    pref = _thread_ref!(inputs, r.predictor)
+    pref = _thread_ref!(inputs, any(p -> p.name === r.predictor, plan.predictors) ?
+        _lp_name(_predictor(plan, r.predictor)) : r.predictor)
     ziref = _thread_ref!(inputs, r.zi)
     cell = :(zero_inflated_binomial($nref, $pref, $ziref).logpdf($yv))
     if r.weights !== nothing
@@ -2702,7 +2836,9 @@ function _weibull_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     kref = _thread_ref!(inputs, sarg)
     # All-keyword: the object constructor cannot mix positional and named
     # owner bindings (the ZIP precedent).
-    cell = :(weibull(; k = $kref, log_theta = $etav).logpdf($yv))
+    cell = r.family === WeibullValueFam ?
+        :(weibull($kref, $etav).logpdf($yv)) :
+        :(weibull(; k = $kref, log_theta = $etav).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
@@ -2719,7 +2855,8 @@ function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbo
     # takes rate, so the boundary inverts (same as the sampled-gamma prior).
     av = sarg isa Symbol ? sarg : Float64(sarg)
     rate = _rate_name(r.label)
-    push!(pre, :($rate = $av ./ exp.($lp)))
+    push!(pre, r.family === GammaValueFam ? :($rate = 1.0 ./ $lp) :
+        :($rate = $av ./ exp.($lp)))
     inputs = Any[y, rate]
     yv, ratev = _dovar(1), _dovar(2)
     aref = _thread_ref!(inputs, sarg)
@@ -3146,8 +3283,8 @@ end
 # Shared-simplex multinomial (SB `brm_multinomial` vector[K] method): the
 # count matrix crosses as K raw columns — program structure (the count
 # columns the model names), not a data-inferred size — and the level
-# log-probabilities `log.(p)` thread as one shared vector the cell reads
-# per column. The cell is Stan's `multinomial_lpmf` in scalar form —
+# probabilities thread as one shared vector the cell reads per column.
+# The cell is Stan's `multinomial_lpmf` in scalar form —
 # `lgamma(N+1) − Σ lgamma(c+1) + Σ c*log(p)` — with the `0*log(0) = 0`
 # convention guarded per term (Stan treats a zero count at a zero
 # probability as 0, not NaN). A literal N folds its `lgamma(N+1)`
@@ -3158,21 +3295,28 @@ function _multinomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node:
     inputs = Any[counts...]
     cvs = [_dovar(i) for i in 1:K]
     nref = _thread_ref!(inputs, r.trials, true)
-    logp = _logp_name(r.label)
-    push!(inputs, :(Ref($logp)))
-    lv = _dovar(length(inputs))
+    push!(inputs, :(Ref($(r.predictor))))
+    pv = _dovar(length(inputs))
     lfact = r.trials isa Int ? loggamma(r.trials + 1.0) : :(loggamma($nref + 1.0))
     cell = :($lfact)
+    stmts = Expr[]
     for (i, cv) in enumerate(cvs)
-        cell = :($cell - loggamma($cv + 1.0) +
-            ifelse($cv == 0, 0.0, $cv * $lv[$i]))
+        term = Symbol(:_ppl_multinomial_term_, r.label, :_, i)
+        # Bound zero counts take the constant arm during plate preparation.
+        # Their logarithm and its derivative must never be evaluated.
+        push!(stmts, :($term = if $cv == 0
+            0.0
+        else
+            $cv * log($pv[$i])
+        end))
+        cell = :($cell - loggamma($cv + 1.0) + $term)
     end
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[:($logp::AbstractVector{Float64} = log.($(r.predictor))),
-        _plate_sum_stmts(pw, node, inputs, cell)...]
+    push!(stmts, cell)
+    return _plate_sum_stmts(pw, node, inputs, stmts)
 end
 
 # Plain categorical over shared-simplex probabilities (Stan
@@ -3523,9 +3667,10 @@ function _parameter_prior_input(ps, plan, layout)
     return view === nothing ? :([$(names...)]) : view
 end
 
-function _parameter_prior_statements!(stmts, terms, plan, layout; prefix = :_ppl_prior_)
+function _parameter_prior_statements!(stmts, terms, plan, layout;
+        prefix = :_ppl_prior_, group_scalars = true)
     grouped = Set{Symbol}()
-    for ps in _parameter_prior_groups(plan)
+    for ps in (group_scalars ? _parameter_prior_groups(plan) : Vector{SampledParameter}[])
         family = first(ps).family
         _, li, si, ni = _COEF_SHAPES[family]
         args = [collect(values(p.args)) for p in ps]
@@ -3647,7 +3792,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
     # threaded.
     for p in plan.plate_parameters
         _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
-            p.support_override)
+            p.support_override; rows = _plate_rows(plan, p))
     end
     # Spline coefficient vectors: the same plate-prior shape (broadcast the
     # shared prior over cells). `b_fixed` is flat — a 0.0 node, mirroring a
@@ -3760,16 +3905,16 @@ end
 # (one entry per stratum), so the constant counts S times and each `log`
 # term sums its vector.
 function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64;
-        nstack::Union{Nothing,Int} = nothing)
-    K == 1 && return :(0.0)
+        nstack::Union{Nothing,Int} = nothing, pointwise = false)
+    K == 1 && return pointwise ? :(zeros($nstack)) : :(0.0)
     c = lkj_logconst(K, eta)
-    terms = Any[nstack === nothing ? c : nstack * c]
+    terms = Any[pointwise ? :(fill($c, $nstack)) : nstack === nothing ? c : nstack * c]
     lg(i) = nstack === nothing ? :(log($(_rl_name(L, i, i)))) :
-        :(sum(log.($(_rl_name(L, i, i)))))
+        pointwise ? :(log.($(_rl_name(L, i, i)))) : :(sum(log.($(_rl_name(L, i, i)))))
     for i in 2:K
         push!(terms, _lkj_prior_diagonal(lg(i), K, i, eta))
     end
-    return foldl((a, c) -> :($a + $c), terms)
+    return foldl((a, c) -> pointwise ? :($a .+ $c) : :($a + $c), terms)
 end
 
 function _lkj_prior_diagonal(ld, K, i, eta)
@@ -3863,9 +4008,16 @@ end
 # expander, exactly as the Gaussian-likelihood scale is threaded.
 function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         name::Symbol, family::Symbol, args::NamedTuple,
-        support::SupportOverride; conditioned = false)
+        support::SupportOverride; conditioned = false, rows = nothing)
     node = Symbol(:_ppl_prior_, name)
     pw = Symbol(:_ppl_pw_prior_, name)
+    if rows === 0
+        # An empty authored loop evaluates no prior arguments or cell body.
+        # Keep its pointwise identity so conditioned declarations retain shape.
+        push!(stmts, :($pw = zeros(0)), :($node::Float64 = 0.0))
+        push!(terms, node)
+        return nothing
+    end
     inputs = Any[name]
     tv = _dovar(1)
     argvals = Any[_thread_ref!(inputs, v) for v in values(args)]
