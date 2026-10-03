@@ -48,7 +48,7 @@ function _cgi_source(kind)
     return Expr(:block, flat...)
 end
 
-function _cgi_build(kind, G, n)
+function _cgi_build(kind, G, n; unbound=nothing)
     g = [mod1(3i + div(i, max(G, 1)), G) for i in 1:n]
     # Cover the entire declared positional axis, preserving repeats and order.
     n >= G && G > 0 && (g[1:G] = reverse(1:G))
@@ -56,8 +56,10 @@ function _cgi_build(kind, G, n)
         :y => [cos(0.7i) / 3 for i in 1:n])
     kind === :levels && (data[:h] = string.(g))
     source = _cgi_source(kind)
-    unbound = lower_rkppl(source, Tuple(keys(data));
-        mod=ComputedGatherModels, conditioned=(:y,))
+    if unbound === nothing
+        unbound = lower_rkppl(source, Tuple(keys(data));
+            mod=ComputedGatherModels, conditioned=(:y,))
+    end
     before = ComputedGatherModels.calls[]
     bound = bind_data(unbound, data)
     calls = ComputedGatherModels.calls[] - before
