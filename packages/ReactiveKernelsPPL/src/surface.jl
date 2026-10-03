@@ -2642,9 +2642,10 @@ end
 function _confirm_whole_value_data(plan::StructuralPlan, data::Set{Symbol};
         whole::Set{Symbol} = Set{Symbol}())
     isempty(whole) && return nothing
-    inputs, _ = _model_level_inputs(plan, data)
-    whole ⊆ inputs || _sfail("whole-value data also read per observation: " *
-        join(sort!(collect(setdiff(whole, inputs))), ", "))
+    inputs, definitions = _model_level_inputs(plan, data)
+    values = union(inputs, definitions)
+    whole ⊆ values || _sfail("whole-value data also read per observation: " *
+        join(sort!(collect(setdiff(whole, values))), ", "))
     return nothing
 end
 
