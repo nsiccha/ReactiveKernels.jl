@@ -1481,8 +1481,7 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
     # bare invariant array met the lane axis in `combine_axes` and the whole
     # plate failed with `DimensionMismatch` under Reactant while the native
     # kernel was correct (snag `plate-cell-gathe-94d4a929`). The distinguished
-    # result is never treated as invariant, so a degenerate constant cell keeps
-    # its former lowering.
+    # result retains the whole plate domain, even when it reads no lane input.
     root_positions = Dict(
         canon_id(inner.graph, input.id) => position
         for (position, input) in enumerate(inner.have))
@@ -1523,6 +1522,18 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
             continue
         end
         args = Any[locals[canon_id(inner.graph, input.id)] for input in recipe.inputs]
+        if output_cid == result_cid &&
+           all(invariant_root, dependencies.recipes[recipe_index])
+            # The terminal recipe can read only shared values while unused
+            # lane arguments still determine its broadcast domain. Retain
+            # every lane axis through ignored arguments; no cell is unrolled.
+            for index in eachindex(inner.have)
+                index in atomic && continue
+                valtype(callvalues[index]) <: Number && continue
+                operation = Expr(:call, GlobalRef(@__MODULE__, :_LaneAnchored), operation)
+                pushfirst!(args, callargs[index])
+            end
+        end
         call = Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_call),
                     operation, args...)
         push!(body.args, Expr(:(=), out, call))

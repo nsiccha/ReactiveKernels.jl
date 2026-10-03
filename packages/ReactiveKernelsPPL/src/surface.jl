@@ -1911,14 +1911,17 @@ function _model_valued(ex, detmap, env, active::Set{Symbol})
     ex isa GlobalRef && return true
     if ex isa Symbol
         ex in env.values && return true
-        (haskey(detmap, ex) && !(ex in active)) || return false
+        haskey(detmap, ex) || return false
+        ex in active && _sfail("cyclic definition through $ex")
         push!(active, ex)
         r = _model_valued(detmap[ex], detmap, env, active)
         delete!(active, ex)
         return r
     end
     ex isa Expr || return false
-    return any(a -> _model_valued(a, detmap, env, active), ex.args)
+    # Walk every dependency even when the callable head already proves
+    # this is a value, so retaining names still rejects cyclic definitions.
+    return any(map(a -> _model_valued(a, detmap, env, active), ex.args))
 end
 
 # Single rule table for undotted `:call` shapes over argument shapes.
@@ -2397,9 +2400,21 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
     ex in (:pi, :π) && ex ∉ names && return Float64(pi)
     ex isa Expr || return ex
     ex.head === :quote && return ex
-    # An array-cell plate column: its cell runs inside an RK plate, in
-    # the generated kernel (the cell body is quoted, not resolved here).
-    _is_plate_column_call(ex) && return ex
+    # The quoted cell becomes executable in the generated kernel's module.
+    # Resolve its callable heads here, retaining lexical cell-local names.
+    if _is_plate_column_call(ex)
+        spec = ex.args[2]
+        body = spec.args[2].value
+        locals = Set{Symbol}(st.args[1] for st in body.args
+            if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol)
+        cell_names = union(names, locals, Set([spec.args[1].value]))
+        resolved = copy(spec.args)
+        for i in (2, 3)
+            resolved[i] = QuoteNode(_resolve_module_calls(spec.args[i].value,
+                mod, cell_names, where))
+        end
+        return Expr(:call, ex.args[1], Expr(:tuple, resolved...), ex.args[3:end]...)
+    end
     if ex.head === :call && !isempty(ex.args)
         head = _resolve_call_head(ex.args[1], mod, names, where)
         args = Any[_resolve_module_calls(a, mod, names, where)
@@ -5459,12 +5474,13 @@ function _cell_index_values(ex::Expr, ivar, name)
         (_cell_index_values(a, ivar, name) for a in ex.args[start:end])...)
 end
 
-# A plate whose definitions hold arrays: some definition reads a whole
-# axis (`sd[s[i], :]`, `z[g[i], :]`). Such cells cannot be vectorized by
-# broadcasting their operators; they lower as RK plates (below).
+# An authored row output states that the cell holds an array even when
+# its value comes from an opaque Julia callable. Whole-axis and crossed
+# reads also require the retained RK cell rather than scalar broadcasting.
 _plate_has_array_cells(cells) = any(c -> c isa Expr && c.head === :(=) &&
     length(c.args) == 2 &&
-    (_has_colon_index(c.args[2]) || _has_crossed_cell_index(c.args[2])), cells)
+    ((Meta.isexpr(c.args[1], :ref) && length(c.args[1].args) > 2) ||
+     _has_colon_index(c.args[2]) || _has_crossed_cell_index(c.args[2])), cells)
 _has_colon_index(ex) = ex isa Expr && ((ex.head === :ref &&
     any(a -> a === :(:), ex.args[2:end])) || any(_has_colon_index, ex.args))
 _has_crossed_cell_index(ex) = ex isa Expr &&
@@ -5482,6 +5498,14 @@ _has_crossed_cell_index(ex) = ex isa Expr &&
 function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
         plate_defs::Set{Symbol})
     axis = rkind[1] === :levels ? rkind[2] : nothing
+    indices = if axis === nothing
+        iterator = rkind[1] === :coloncall ? rkind[2] :
+            rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
+            Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
+        Expr(:call, GlobalRef(Base, :collect), iterator)
+    else
+        nothing
+    end
     locals = Pair{Symbol,Any}[]
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
@@ -5507,7 +5531,7 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
             col in data && _sfail("cell assignment `$col[$ivar] = ...` " *
                 "redefines bound data")
             push!(out, Expr(:(=), col,
-                _plate_column_call(ivar, locals, rhs, axis)))
+                _plate_column_call(ivar, locals, rhs, axis; indices)))
         elseif lc isa Expr && lc.head === :ref && length(lc.args) == 3 &&
                 lc.args[1] isa Symbol && lc.args[2] === ivar
             # A row per index (`b[i, 1:K] = row`): one plate column per
@@ -5525,7 +5549,7 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
                 pk = Symbol(:_rkppl_row_, col, :_, k)
                 push!(parts, pk)
                 push!(out, Expr(:(=), pk,
-                    _plate_column_call(ivar, rowlocals, :($rowv[$k]), axis)))
+                    _plate_column_call(ivar, rowlocals, :($rowv[$k]), axis; indices)))
             end
             push!(out, Expr(:(=), col, Expr(:call, :_ppl_rows, parts...)))
         elseif lc isa Expr && lc.head === :ref
@@ -5895,46 +5919,16 @@ _literal_range_len(r) = (r isa Expr && r.head === :call && length(r.args) == 3 &
     _static_count(r.args[3]) : nothing
 
 # Rows per index (`b[i, 1:K] = row` in an array plate): `b` stands for the
-# matrix whose column k is the plate column `_rkppl_row_b_k`. A read of a
-# column (`b[:, k]`, also through an alias `u = b`) becomes that plate
-# column; the `_ppl_rows` definition and its aliases leave the program.
+# matrix whose column k is the plate column `_rkppl_row_b_k`. Materialize
+# that matrix as an ordinary Julia value, so aliases, indexing and whole
+# consumers share one shape and the normal value-lowering machinery.
 function _rewrite_plate_rows(sample, det)
-    rows = Dict{Symbol,Vector{Symbol}}()
-    for (nm, rhs) in det
-        rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
-            rhs.args[1] === :_ppl_rows && (rows[nm] = Symbol[rhs.args[2:end]...])
-    end
-    isempty(rows) && return sample, det
-    changed = true
-    while changed
-        changed = false
-        for (nm, rhs) in det
-            if rhs isa Symbol && haskey(rows, rhs) && !haskey(rows, nm)
-                rows[nm] = rows[rhs]
-                changed = true
-            end
-        end
-    end
-    function rw(ex)
-        ex isa Symbol && haskey(rows, ex) && _sfail("rows per index `$ex` " *
-            "are read by column (`$ex[:, k]`)")
-        ex isa Expr || return ex
-        if ex.head === :ref && length(ex.args) == 3 && ex.args[1] isa Symbol &&
-                haskey(rows, ex.args[1]) && ex.args[2] === :(:)
-            k = ex.args[3]
-            parts = rows[ex.args[1]]
-            k isa Int && 1 <= k <= length(parts) || _sfail("`$(repr(ex))` " *
-                "reads column $(repr(k)) of rows with $(length(parts)) " *
-                "columns (a literal 1..$(length(parts)))")
-            return parts[k]
-        end
-        return Expr(ex.head, map(rw, ex.args)...)
-    end
-    newdet = Pair{Symbol,Any}[nm => rw(rhs) for (nm, rhs) in det
-        if !haskey(rows, nm)]
-    newsample = [SampleStmt(s.lhs, rw(s.rhs), s.broadcast, s.range, s.levels,
-        s.matrix, s.dims, s.slices, s.count_columns) for s in sample]
-    return newsample, newdet
+    newdet = Pair{Symbol,Any}[nm =>
+        (rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
+         rhs.args[1] === :_ppl_rows ?
+            Expr(:call, GlobalRef(Base, :hcat), rhs.args[2:end]...) : rhs)
+        for (nm, rhs) in det]
+    return sample, newdet
 end
 
 _is_plate_column_call(ex) = ex isa Expr && ex.head === :call &&
@@ -7736,8 +7730,23 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
 end
 
 function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol})
-    (st isa Expr && st.head === :(=) && length(st.args) == 2 &&
-        st.args[1] isa Symbol) || return st
+    st isa Expr || return st
+    # Plate cell definitions execute in the submodel's defining module too.
+    # Visit statement positions only: sampling heads and loop binders retain
+    # their DSL spelling until the ordinary surface passes lower them.
+    if st.head === :block
+        return Expr(:block, (_resolve_submodel_stmt(a, sm, names)
+            for a in st.args)...)
+    elseif st.head === :macrocall && !isempty(st.args) &&
+            st.args[1] === Symbol("@plate")
+        return Expr(:macrocall, st.args[1:end-1]...,
+            _resolve_submodel_stmt(st.args[end], sm, names))
+    elseif st.head === :for && length(st.args) == 2
+        return Expr(:for, st.args[1],
+            _resolve_submodel_stmt(st.args[2], sm, names))
+    end
+    (st.head === :(=) && length(st.args) == 2 &&
+        (st.args[1] isa Symbol || Meta.isexpr(st.args[1], :ref))) || return st
     rhs = st.args[2]
     (_is_schedule_decl_rhs(rhs) ||
         _is_levels_binding_rhs(rhs)) && return st
@@ -10537,12 +10546,11 @@ end
 _is_array_def(name, ctx) = name isa Symbol && haskey(ctx.detmap, name) &&
     get(ctx.detshape, name, :scalar) === :array
 
-# An opaque module result computed from an array value has unknown shape.
-# Keep its name under indexing so contract validation can follow the
-# array dependencies. Other function values retain their existing inlining
-# and gather validation.
+# A model-level result has its own Julia shape, including an opaque call
+# that collects plate outputs. Keep its name under indexing rather than
+# inlining its producer into the predictor's factor-coefficient grammar.
 _is_model_value_def(name, ctx) = name isa Symbol &&
-    haskey(ctx.detmap, name) && _reads_array_value(ctx.detmap[name], ctx) &&
+    haskey(ctx.detmap, name) &&
     _model_valued(name, ctx.detmap,
         ctx.shape_env, Set{Symbol}())
 
@@ -11642,10 +11650,12 @@ function _extract_summand(pname, core, sign::Int, ctx)
         return TermSpec(ComposedTerm, ColumnRef[],
             (tree = leaf, subs = Symbol[], scalars = [leaf]), label, label), nothing
     end
-    if core isa Number || _canon_shape(core, ctx) === :scalar
+    shape = _canon_shape(core, ctx)
+    if core isa Number || shape in (:scalar, :array)
         e = sign < 0 ? Expr(:call, :-, core) : core
         nm = _composed_scalar_leaf!(pname, e, ctx, Symbol[])
-        if _contains_module_call(core) && !_is_bound_value_call(core)
+        if shape === :array ||
+                (_contains_module_call(core) && !_is_bound_value_call(core))
             return TermSpec(ComposedTerm, ColumnRef[],
                 (tree = nm, subs = Symbol[], scalars = [nm]), nm, nm), nothing
         end
