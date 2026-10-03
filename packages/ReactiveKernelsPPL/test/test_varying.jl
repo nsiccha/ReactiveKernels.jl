@@ -1193,21 +1193,23 @@ end
             mu = a .+ w .+ r[g] .* w
             y .~ Normal.(mu, sigma)
         end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
-    # `dummy` needs a raw column (level membership needs bound values).
+    # Library varying values accept derived grouping data.
     # capability: grouping/dummy coding over a derived data value (ordinary function composition, P8 1cmodra) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
             w = x .* z
-            r ~ varying_effect(g, [dummy(w, 1)])
+            v ~ varying_coefs(g)
+            r = (w .== 1) .* v[g]
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :z, :g); conditioned = (:y, :x, :z, :g)); true)
-    # Grouping columns stay raw.
+    # Grouping values may come from a data-only definition.
     # capability: grouping/dummy coding over a derived data value (ordinary function composition, P8 1cmodra) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
             w = x .* z
-            r ~ varying_effect(w, [1])
+            v ~ varying_coefs(w)
+            r = v[w]
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :z, :g); conditioned = (:y, :x, :z, :g)); true)

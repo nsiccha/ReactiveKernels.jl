@@ -487,8 +487,9 @@ end
         y .~ Normal.(z[1], 1.0)
     end), (:y,); conditioned = (:y,))
     # A bare array combined with per-observation data.
-    # capability: array parameter broadcast with observation data z .+ x (valid Julia when lengths agree; refused shape-blind at lowering) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(:(begin
+    # capability: array parameters broadcast with observation data using
+    # ordinary Julia dimensions (todo `15lq8iu`).
+    @test (lower_rkppl(:(begin
         z[1:3] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
         w = z .+ x

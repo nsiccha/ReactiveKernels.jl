@@ -70,7 +70,7 @@ Recipe(id, inputs, outputs, op, cost, cse_key, effectful) =
     Recipe(id, inputs, outputs, op, cost, cse_key, effectful, _NO_KERNEL_SOURCE)
 
 """
-    _KernelSourceOp{DefToken,Form,F,TF}
+    _KernelSourceOp{DefToken,Form,F,TF,IG}
 
 An immutable wrapper marking a recipe operation SYNTHESIZED from captured `@kernel` source as
 COMPILER-OWNED provenance (RK 07:21). Authoring wraps ONLY the anonymous-closure path of
@@ -85,17 +85,20 @@ distinguishes a `:portcall` — a call THROUGH A PORT, `callable(args…)`, whos
 source and the rest are ordered args — from a general `:fused` expression, so a prepared handle can
 self-derive the DESTINATION contract (a port-call with one owned buffer + one owned scalar output →
 `f(dest, args…)::scalar`) from source SHAPE + typed slot roles, never from a name/Recipe id/inspection.
+`IG` holds the captured source's throw-stripped twin, selected only by an
+explicit `on_error = :ignore` preparation; older internal fixtures use `nothing`.
 The call forwards INLINE. A RAW anonymous closure inserted into a Graph carries no wrapper and is
 rejected as opaque when captured into a prepared handle.
 """
-struct _KernelSourceOp{DefToken,Form,F,TF}
+struct _KernelSourceOp{DefToken,Form,F,TF,IG}
     f::F
     tensor_f::TF
+    ignored_throws::IG
 end
 
-_KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF) where
-        {DefToken,Form,F,TF} =
-    _KernelSourceOp{DefToken,Form,F,TF}(f, tensor_f)
+_KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF,
+                ignored_throws::IG = nothing) where {DefToken,Form,F,TF,IG} =
+    _KernelSourceOp{DefToken,Form,F,TF,IG}(f, tensor_f, ignored_throws)
 # Preserve the established internal constructor for compiler fixtures and
 # already-authored handles; without an alternate body it uses the same callable
 # in both modes.

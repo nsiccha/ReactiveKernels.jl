@@ -323,7 +323,7 @@ function _assignment_statements(plan::StructuralPlan;
     stmts = Expr[]
     for name in topological_order(plan)
         (haskey(by_name, name) && name ∉ computed) || continue
-        ex = _array_gather_rewrite(by_name[name].expr, plan, gathers)
+        ex = _value_math_rewrite(_array_gather_rewrite(by_name[name].expr, plan, gathers))
         ex = _split_gp_cov_calls!(stmts, name, ex, plan)
         if _expr_value_symbols(ex) ⊆ dataonly
             push!(dataonly, name)
@@ -333,6 +333,17 @@ function _assignment_statements(plan::StructuralPlan;
         push!(stmts, :($(name) = $(ex)))
     end
     return stmts
+end
+
+# The generated scope's `logistic` names a distribution kernel. Values
+# use the inverse-logit function, including inside reductions.
+_value_math_rewrite(ex) = ex
+function _value_math_rewrite(ex::Expr)
+    args = map(_value_math_rewrite, ex.args)
+    if ex.head in (:call, :.) && !isempty(args) && args[1] === :logistic
+        args[1] = :_ppl_logistic
+    end
+    return Expr(ex.head, args...)
 end
 
 # Resolve the callable, rather than its spelling: module-qualified calls and

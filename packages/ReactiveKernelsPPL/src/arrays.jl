@@ -495,6 +495,7 @@ _is_array_assignment(plan::StructuralPlan, name) =
 function _value_axes(plan::StructuralPlan, ex,
         seen::Set{Symbol} = Set{Symbol}(); data_axes::Bool = false)
     ex isa Number && return Any[]
+    _is_bound_value_call(ex) && !_is_bound_array_value_call(ex) && return Any[]
     if ex isa Symbol
         if data_axes && haskey(plan.columns, ex)
             value = plan.columns[ex]
@@ -666,9 +667,8 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
             "$(length(idx)) indices. Give one index per axis or one " *
             "linear index")
         g = ex.args[1 + _gather_index_axis(plan, ex)]
-        _is_derived(plan, g) && _fail(label, "`$(repr(ex))` gathers by " *
-            "the derived column $g. Gathers by derived columns are not " *
-            "supported yet; gather by a raw data column")
+        _reads_data_only(plan, g, Set{Symbol}(_all_names(plan)), Set{Symbol}()) ||
+            _fail(label, "`$(repr(ex))` gather index $g must be data")
         push!(refs, base)
         if bound
             d = _gather_axis(plan, ex)
@@ -703,8 +703,8 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
             "`$(repr(ex))` gathers from the LKJCholesky factor $(base)")
         axis = _gather_index_axis(plan, ex)
         g = ex.args[1 + axis]
-        _is_derived(plan, g) && _fail(label, "`$(repr(ex))` gathers by the " *
-            "derived column $g — gathers read raw data columns")
+        _reads_data_only(plan, g, Set{Symbol}(_all_names(plan)), Set{Symbol}()) ||
+            _fail(label, "`$(repr(ex))` gather index $g must be data")
         bound && _validate_gather_axis(plan, p.name, label, p.dims[axis], g)
     elseif bound
         dims = _array_dims(plan, p)

@@ -2278,9 +2278,9 @@ end
                 Expr(:call, :(:), 2, :end)),
             :(Normal.(0, 2))),
         :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g))
-    # Non-dotted prior object over a levels ref: broadcast it.
+    # A shared scalar prior object broadcasts over a levels declaration.
     # capability: undotted scalar distribution under .~ (Distributions broadcastable: c .~ Normal(0, 2)) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(Expr(:block,
+    @test (lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(c[levels(g)]), :(Normal(0, 2))),
         :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g)); true)
     # Non-literal broadcast args are not per-level priors.
@@ -2295,13 +2295,13 @@ end
     # refused: m has no declaration or bound value (strict names, P6).
     @test_throws ContractValidationError bind_data(pending,
         Dict(:y => [1.0, 2.0], :g => [1, 2]))
-    # Levels prior on a non-factor coefficient.
-    # refused: levels-sized a broadcast against the observation vector (a .+ c[g]): Julia DimensionMismatch (P3)
-    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+    # A whole array and a gather may broadcast when their actual sizes agree.
+    # Numeric and gradient acceptance is in test_values_compose.jl.
+    @test (lower_rkppl(Expr(:block,
         Expr(:call, :.~, :(a[levels(g)]), :(Normal.(0, 1))),
         :(mu = a .+ c[g]),
         Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
-        :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g))
+        :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g)); true)
     # A levels declaration no predictor consumes is a declared array
     # parameter (test_array_values.jl), not a refused coefficient prior.
     zplan = lower_rkppl(Expr(:block,
@@ -2473,9 +2473,9 @@ end
     end, (:y, :x); conditioned = (:y, :x))
     @test Set(a.name for a in got.assignments) == Set([:m, :t, :u])
     @test Set(d.name for d in got.derived) == Set([:lx, :w, :v])
-    # Nested reductions must stage (contract owns nesting).
-    # capability: nested reduction mean(log.(x)) in a data-only definition (P8) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    # Admitted: nested reduction mean(log.(x)) is an ordinary scalar
+    # value (P3/P8, todo `15lq8iu`).
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         z = mean(log.(x))
@@ -2490,9 +2490,9 @@ end
     end
     # refused: undotted log over a vector is a Julia MethodError (P3)
     @test_throws SurfaceLoweringError (m(; x = [2.0]) | (; y = [1.0]))
-    # Factors, weights, and evidence take raw columns only.
+    # Factor and weight definitions may depend on supplied data.
     # capability: a computed factor column c[z], z = x .+ 1 (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         sg ~ Exponential(1)
         c[levels(z)] .~ Normal.(0, sg)
@@ -2501,7 +2501,7 @@ end
         z = x .+ 1
     end, (:y, :x); conditioned = (:y, :x)); true)
     # capability: derived weights column (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
@@ -2759,8 +2759,9 @@ end
         mu = a .+ b .* d
         y .~ Normal.(mu, 1.0)
     end, Dn; conditioned = Dn)
-    # capability: literal constant term in a predictor (1.5 .+ b .* x) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    # Admitted: a literal predictor offset broadcasts with no coordinate
+    # (P3/10a, todo `15lq8iu`).
+    @test (lower_rkppl(quote
         b ~ Normal(0, 1)
         mu = 1.5 .+ b .* x
         y .~ Normal.(mu, 1.0)
@@ -2939,25 +2940,25 @@ end
         y .~ Normal.(mu, x)
     end, Dn; conditioned = Dn)
     @test only(got_obs_scale.responses).scale === :x
-    # A DERIVED-column scale still needs shape metadata (planned): rejected.
-    # capability: derived-column per-observation scale (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    # Admitted: a derived per-observation scale computes its stated value
+    # (P3/P8, todo `15lq8iu`).
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         w = x .+ 1
         mu = a .+ b .* x
         y .~ Normal.(mu, w)
     end, Dn; conditioned = Dn); true)
-    # N-ary undotted products with a vector operand do not lower.
-    # capability: n-ary undotted scalar product 2 * 3 * x (valid Julia, P3) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    # Admitted: n-ary scalar-vector products follow Julia order (P3,
+    # todo `15lq8iu`).
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         mu = a .+ 2 * 3 * x
         y .~ Normal.(mu, 1.0)
     end, Dn; conditioned = Dn); true)
-    # Distributions and response-only wrappers are not values.
+    # An unused distribution constructor is still an ordinary value.
     # capability: distribution-valued definition m = Normal(0, 1) (P10a) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         m = Normal(0, 1)

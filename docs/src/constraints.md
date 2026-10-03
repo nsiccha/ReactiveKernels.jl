@@ -260,11 +260,14 @@ and lock the one Reactant 0.2.289 lifted:
   Declared second-axis gathers, elementwise array definitions and level
   subsets pass compiled primal, AD and operation-count checks.
 
-- Reverse compilation with a zero-length active vector leaves `tensor.empty`,
+- Reverse compilation with an empty active array leaves `tensor.empty`,
   which Reactant 0.2.290 cannot export to XLA:
   `repro_reactant_empty_gradient.jl` isolates a constant scalar loss and its
-  ordinary Enzyme gradient without ReactiveKernels. Native reverse returns
-  the correct empty gradient, and compiled primal succeeds. A zero-coordinate
+  ordinary Enzyme gradient, plus an empty multivariate batch beside a nonempty
+  factor, without ReactiveKernels. Native reverse returns the correct empty/zero
+  gradients, and compiled primal succeeds. Empty multivariate slice batches
+  return zero natively and in compiled primal execution. A zero-coordinate
   RK-PPL sampler therefore supports native AD and compiled values; compiled
   gradient acceptance pins this exact export error. Empty observation and
   parameter domains with a nonempty coordinate pack pass compiled reverse.
+  No dummy batch or handwritten derivative substitutes for the empty case.
