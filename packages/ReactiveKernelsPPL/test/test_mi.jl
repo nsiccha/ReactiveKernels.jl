@@ -137,7 +137,7 @@ end
         # capability: (IR-level) Case-A mi (obs-only rows) for families beyond Gaussian/Gamma/Beta; entries also use IdentityLink/no scale, so link/scale gates may fire first (todo `1308iv0`)
         @test_broken (validate_plan(plan); true)
     end
-    # mi is uncomposed in v1: weights/evidence/range/trials fail closed.
+    # Packed observations compose with row-specific likelihood inputs.
     struct_args = (GaussianFam, IdentityLink, :y, :mu, :sigma)
     let r = LikelihoodSpec(struct_args..., :w, _mi_none_evidence(), :y_resp,
             nothing, nothing; mi_jobs = :Jobs_y)
@@ -146,12 +146,11 @@ end
             _mi_priors(:mu),
             SampledParameter[SampledParameter(:sigma, :exponential,
                 (arg1 = 1.0,), nothing, :sigma)],
-            AssignmentSpec[], cols, n)
-        # capability: mi composed with weights (uncomposed in v1) (todo `1nb43fj`)
-        @test_broken (validate_plan(plan); true)
+            AssignmentSpec[], merge(cols, Dict(:w => ones(n))), n)
+        @test validate_plan(plan) === nothing
     end
     let r = LikelihoodSpec(struct_args..., nothing,
-            ResponseEvidence(:truncated, 0.0, nothing), :y_resp, nothing,
+            ResponseEvidence(:truncated, -1.0, nothing), :y_resp, nothing,
             nothing; mi_jobs = :Jobs_y)
         plan = StructuralPlan([r],
             PredictorSpec[PredictorSpec(:mu, IdentityLink, _mi_terms(), :mu)],
@@ -159,8 +158,7 @@ end
             SampledParameter[SampledParameter(:sigma, :exponential,
                 (arg1 = 1.0,), nothing, :sigma)],
             AssignmentSpec[], cols, n)
-        # capability: mi composed with truncation evidence (uncomposed in v1) (todo `0ze68k8`)
-        @test_broken (validate_plan(plan); true)
+        @test validate_plan(plan) === nothing
     end
     let r = LikelihoodSpec(struct_args..., nothing, _mi_none_evidence(),
             :y_resp, nothing, 1:4; mi_jobs = :Jobs_y)
@@ -170,11 +168,9 @@ end
             SampledParameter[SampledParameter(:sigma, :exponential,
                 (arg1 = 1.0,), nothing, :sigma)],
             AssignmentSpec[], cols, n)
-        # capability: mi composed with a row range (uncomposed in v1) (todo `1nb43fj`)
-        @test_broken (validate_plan(plan); true)
+        @test validate_plan(plan) === nothing
     end
-    # mi + intercept-only location: nothing full-length would cross,
-    # so n is underivable (deferred, fails closed with attribution).
+    # Hand-authored IR supplies its full row extent explicitly.
     let pred = PredictorSpec(:mu, IdentityLink,
             TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
                 :Intercept, :intercept)], :mu),
@@ -185,8 +181,7 @@ end
             SampledParameter[SampledParameter(:sigma, :exponential,
                 (arg1 = 1.0,), nothing, :sigma)],
             AssignmentSpec[], cols, n)
-        # capability: mi with an intercept-only location (n underivable; deferred) (todo `1nb43fj`)
-        @test_broken (validate_plan(plan); true)
+        @test validate_plan(plan) === nothing
     end
     # mi_jobs naming its own response is not an index column.
     let r = LikelihoodSpec(struct_args..., nothing, _mi_none_evidence(),
@@ -216,8 +211,8 @@ end
     end
     # Happy path binds (packed y_obs + Jobs ride the managed exemption).
     validate_plan(_mi_data_plan(cols))
-    # Jobs must exist, be an integer vector, and select a strict nonempty
-    # subset of 1:n_obs, sorted ascending without duplicates.
+    # Jobs must be a nonempty sorted integer selection in 1:n_obs,
+    # without duplicates, and align with the packed response.
     for bad_jobs in (nothing, [1.0, 3.0], [true, false, true, false],
             Int[], [1, 2, 3, 4], [0, 3], [1, 5], [1, 1], [3, 1])
         bad = copy(cols)
