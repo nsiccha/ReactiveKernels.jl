@@ -1625,7 +1625,8 @@ _recurrence_trace(x::Reactant.TracedRNumber) = _fresh_tracers(x)
 # scalar or dense numeric `Array` becomes a traced value of the same element
 # type, a traced value a fresh tracer (`_fresh_tracers`: the loop's in-place
 # carry update never reaches another binding of the same tracer), and tuples
-# recurse.  Every other value — a `Diagonal` metric, a Cholesky or triangular
+# and immutable arrays with fixed tuple storage recurse while preserving their
+# wrappers. Every other value — a `Diagonal` metric, a Cholesky or triangular
 # wrapper, a struct — keeps its exact type: the carry's type is part of the
 # compiled contract of the code around the loop, and `_recurrence_trace`'s
 # wrapper-to-backing-array normalization belongs to the ext's own loops, which
@@ -1642,6 +1643,12 @@ ReactiveKernels._loop_seed_traced(x::Tuple) =
     map(ReactiveKernels._loop_seed_traced, x)
 ReactiveKernels._loop_seed_traced(x::NamedTuple) =
     map(ReactiveKernels._loop_seed_traced, x)
+function ReactiveKernels._loop_seed_traced(x::AbstractArray)
+    T = typeof(x)
+    fixed = !ismutabletype(T) && fieldcount(T) == 1 &&
+        fieldtype(T, 1) <: NTuple{length(x),Any}
+    fixed ? map(ReactiveKernels._loop_seed_traced, x) : x
+end
 
 function ReactiveKernels._rectangular_fold_impl(
         marker::Reactant.TracedType, step, init, columns, shared, n)

@@ -162,8 +162,12 @@ and lock the one Reactant 0.2.289 lifted:
 - Reverse compilation through a retained `while` loop whose exit is data
   dependent (the adaptive ODE solver's `(n < maxiters) & (t < t1)`) fails
   because the loop has no statically known iteration count:
-  `repro_reactant_adaptive_while_reverse.jl`. The solver keeps the retained
-  loop; its supported gradient is the backsolve adjoint, whose right-hand
+  `repro_reactant_adaptive_while_reverse.jl`. Generic matrix binary power
+  shape has the same default reverse failure on Reactant 0.2.290:
+  `repro_reactant_matrix_power_reverse.jl` checks its native and compiled primal,
+  retained integer loop and lazy branch, and native ordinary Enzyme gradient.
+  Compiled reverse remains unsupported for that shape. The solver keeps the
+  retained loop; its supported gradient is the backsolve adjoint, whose right-hand
   side is a `DerivativeRule` (the rule constraint above): the augmented
   system's vector-Jacobian products are the rule's authored reverse cut,
   evaluated inside the retained loop, so nothing differentiates anything.
@@ -201,6 +205,18 @@ and lock the one Reactant 0.2.289 lifted:
   rules generated from their pure-math graphs (the rule constraint above),
   which makes them primitives for Enzyme, so the failing body is never
   differentiated.
+- Native Enzyme 0.13.209 reverse differentiation of
+  `LogExpFunctions.logistic` returns `NaN` at `1000.0` and `1000.0f0`,
+  despite finite primal values. It also loses representable tail derivatives,
+  such as the Float64 derivative at `40.0`. This reproduces without
+  ReactiveKernels on Julia 1.10.12 with LogExpFunctions 0.3.29 and 1.0.1:
+  `repro_enzyme_logistic_reverse.jl`. The equivalent ordinary primal
+  `exp(-log1pexp(-x))` passes native reverse checks against a high-precision
+  oracle in both precisions, including `-1000`, `0`, `1000` and saturated
+  tails. This is native evidence; it does not establish compiled acceptance.
+  [Enzyme issue #3583](https://github.com/EnzymeAD/Enzyme.jl/issues/3583)
+  and [PR #3595](https://github.com/EnzymeAD/Enzyme.jl/pull/3595) track the
+  dependency boundary. No local rule is attached to the foreign function.
 - Native Enzyme reverse mode fails static activity analysis
   (`EnzymeRuntimeActivityError`) when a non-inlined function returns a
   `Float64` array read from constant data, bare or inside a tuple, named

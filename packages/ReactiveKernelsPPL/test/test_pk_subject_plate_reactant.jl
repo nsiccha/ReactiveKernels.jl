@@ -1,6 +1,35 @@
 module PKSubjectPlateReactantTests
 using ReactiveKernels, ReactiveKernelsPPL, Reactant, StaticArrays, Test
 using DifferentiationInterface, Enzyme
+using ReactiveKernelsPPL: _pk_smat_pow4
+
+@kernel integer_power_loss(q, n) = begin
+    B = SMatrix{4,4}(q[1], 0.0, 0.0, 0.0, 0.2, q[2], 0.0, 0.0,
+        0.0, 0.3, 0.8, 0.0, 0.0, 0.0, 0.1, 1.0)
+    Q = _pk_smat_pow4(B, n)
+    # Reading the caller's matrix after the helper also checks that the
+    # retained loop updates fresh tracer handles rather than aliasing B.
+    total = sum(Q) + sum(B)
+    return total
+end
+
+@kernel integer_power_entries(n) = begin
+    # This involution distinguishes adjacent integer counts beyond Float64's
+    # exact range; a floating count/carry would silently lose the low bit.
+    B = SMatrix{4,4}(0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    Q = _pk_smat_pow4(B, n)
+    entry = Q[1]
+    return entry
+end
+
+@kernel integer_regular_doses(q, n) = begin
+    A = linear_pk_system_3(q[1], q[2], q[3], q[4], q[5])
+    state = SVector(0.4, 0.2, 0.1)
+    result = linear_pk_add_regular_doses_3(A, state, 2.3, 0.7, n)
+    total = sum(result)
+    return total
+end
 
 @kernel matrix_seed_chain(q::Vector{Float64}, xs::Vector{Float64},
         tags::Vector{Int64}) = begin
@@ -45,6 +74,65 @@ function operations(hlo)
         counts[m.match] = get(counts, m.match, 0) + 1
     end
     counts
+end
+
+@testset "PK traced integer power reuse and retained default structure" begin
+    k = prepare(integer_power_loss)
+    q = [0.7, 0.9]
+    rq = Reactant.to_rarray(q)
+    for T in (Int32, Int64)
+        rn = Reactant.to_rarray(T(3); track_numbers=true)
+        compiled = Reactant.@compile k(rq, rn)
+        inventories = Dict{String,Int}[]
+        for n in (0, 1, 3, 9, 17)
+            input = Reactant.to_rarray(T(n); track_numbers=true)
+            for point in (q, [0.6, 0.85])
+                @test Float64(compiled(Reactant.to_rarray(point), input)) ≈ k(point, T(n))
+            end
+            push!(inventories, operations(repr(Reactant.@code_hlo optimize=true k(rq, input))))
+        end
+        @test all(==(first(inventories)), inventories)
+        @test get(first(inventories), "stablehlo.while", 0) == 1
+        @test get(first(inventories), "stablehlo.if", 0) == 1
+        println("PK integer-power default inventory $T: ", first(inventories))
+        ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), q, T(3); active=:q)
+        h = 1e-6
+        finite_gradient = [(e = zeros(2); e[i] = h;
+            (k(q + e, T(3)) - k(q - e, T(3))) / (2h)) for i in 1:2]
+        @test ad_gradient(ad, q, T(3)) ≈ finite_gradient rtol=1e-8
+    end
+    parity = prepare(integer_power_entries)
+    rn = Reactant.to_rarray(Int64(3); track_numbers=true)
+    compiled = Reactant.@compile parity(rn)
+    for n in (Int64(1) << 54, (Int64(1) << 54) + 1)
+        @test Float64(compiled(Reactant.to_rarray(n; track_numbers=true))) == (iseven(n) ? 1.0 : 0.0)
+    end
+    # Refused: a floating count violates the existing integer input contract.
+    floating_count = Reactant.to_rarray(3.0; track_numbers=true)
+    @test_throws ArgumentError Reactant.@compile k(rq, floating_count)
+end
+
+@testset "traced regular-dose count reaches the existing exponential boundary" begin
+    # The traced integer must pass the public entry point. Released Reactant
+    # still rejects the ordinary StaticArrays exp inside the repeated arm.
+    k = prepare(integer_regular_doses)
+    q = log.([1.0, 10.0, 2.0, 20.0, 0.5])
+    rq = Reactant.to_rarray(q)
+    count = Reactant.to_rarray(Int64(3); track_numbers=true)
+    result = try
+        compiled = Reactant.@compile k(rq, count)
+        Float64(compiled(rq, count))
+    catch err
+        @test err isa TypeError
+        description = sprint(showerror, err)
+        @test occursin("non-boolean", description) && occursin("TracedRNumber{Bool}", description)
+        @test any(frame -> frame.func === :_exp &&
+            endswith(string(frame.file), "expm.jl"), stacktrace(catch_backtrace()))
+        nothing
+    end
+    @test_broken result !== nothing && isapprox(result, k(q, 3); rtol=1e-9)
+    @test_throws ArgumentError Reactant.@compile k(rq,
+        Reactant.to_rarray(3.0; track_numbers=true))
 end
 
 @testset "fixed matrix and typed seed plate batching" begin

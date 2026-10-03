@@ -549,8 +549,39 @@ function linear_pk_add_dose_3(state::SVector{3}, amount)
     return SVector(state[1] + amount, state[2], state[3])
 end
 
-@traceable function linear_pk_add_regular_doses_3(A::SMatrix{3,3}, state::SVector{3},
-        amount, interval, count::Integer)
+# Native dispatch keeps the integer contract. RK's scalar element-type trait
+# sees the represented type beneath a tracing wrapper, unlike Base.eltype.
+@inline function _pk_traced_integer(n)
+    ndims(n) == 0 && ReactiveKernels._tensorized_vect_eltype(n) <: Integer ||
+        throw(ArgumentError("PK dose counts and matrix powers require integer scalars"))
+    n
+end
+
+# Binary exponentiation for the 4x4 augmented dose transition (Stan's
+# matrix_power with a data-only integer exponent). Both paths use this body.
+@traceable function _pk_smat_pow4_body(B::SMatrix{4,4}, n)
+    R = SMatrix{4,4}(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    e = n
+    while e > 0
+        R = if e & 1 == 1
+            R * B
+        else
+            R
+        end
+        B = B * B
+        # e is positive here: integer division is the same binary-power step.
+        e = div(e, 2)
+    end
+    return R
+end
+@inline _pk_smat_pow4(B::SMatrix{4,4}, n::Integer) = _pk_smat_pow4_body(B, Int(n))
+@inline ReactiveKernels.traced(::typeof(_pk_smat_pow4), B::SMatrix{4,4}, n) =
+    ReactiveKernels.traced(_pk_smat_pow4_body, B,
+        ReactiveKernels._tensorized_trunc(Int, _pk_traced_integer(n)))
+
+@traceable function _pk_add_regular_doses_3_body(A::SMatrix{3,3}, state::SVector{3},
+        amount, interval, count)
     after_first = linear_pk_add_dose_3(state, amount)
     if count > 1
         Q = _pk_smat_pow4(_pk_dose_affine(A, amount, interval), count - 1)
@@ -560,6 +591,13 @@ end
         after_first
     end
 end
+@inline linear_pk_add_regular_doses_3(A::SMatrix{3,3}, state::SVector{3},
+        amount, interval, count::Integer) =
+    _pk_add_regular_doses_3_body(A, state, amount, interval, count)
+@inline ReactiveKernels.traced(::typeof(linear_pk_add_regular_doses_3),
+        A::SMatrix{3,3}, state::SVector{3}, amount, interval, count) =
+    ReactiveKernels.traced(_pk_add_regular_doses_3_body, A, state, amount,
+        interval, _pk_traced_integer(count))
 @doc """
     linear_pk_add_regular_doses_3(A, state, amount, interval, count) -> SVector{3}
 
@@ -574,22 +612,6 @@ and `b = [amount, 0, 0]`).
     P = exp(A * interval)
     return SMatrix{4,4}(P[1], P[2], P[3], 0.0, P[4], P[5], P[6], 0.0,
         P[7], P[8], P[9], 0.0, amount, 0.0, 0.0, 1.0)
-end
-
-# Binary exponentiation for the 4x4 augmented dose transition (Stan's
-# `matrix_power` with a data-only integer exponent — same math).
-@traceable function _pk_smat_pow4(B::SMatrix{4,4}, n::Integer)
-    R = SMatrix{4,4}(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
-    e = Int(n)
-    while e > 0
-        if e & 1 == 1
-            R = R * B
-        end
-        B = B * B
-        e >>= 1
-    end
-    return R
 end
 
 """`sqrt(2π)` verbatim from SB `brm_hsgp_sqrt_spd` (the event-LP

@@ -55,6 +55,7 @@ mktempdir() do env
         PackageSpec(name = "LambertW"),
         PackageSpec(name = "LogExpFunctions"),
         PackageSpec(name = "DifferentiationInterface"),
+        PackageSpec(name = "StaticArrays"),
     ])
     Pkg.instantiate()
 
