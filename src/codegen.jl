@@ -526,8 +526,10 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         push!(initial_output.args, :($lhs[$index] = $output))
         # The buffer shares the sequences' axes, which `index` comes from.
         push!(loop_output.args, _inbounds_expr(:($lhs[$index] = $output)))
-        push!(empty_output.args, :($lhs = $(GlobalRef(Base, :similar))(
-            $xs, $output_type)))
+        empty_allocation = :($(GlobalRef(Base, :similar))($xs, $output_type))
+        push!(empty_output.args, :($lhs = $(recycled === nothing ? empty_allocation :
+            _lane_allocation(recycled, output_type,
+                :($(GlobalRef(Base, :axes))($xs)), empty_allocation))))
     end
     if consumer !== nothing
         cell, args, positions, cell_offset, pointwise_lhs, total_lhs = consumer
@@ -3581,12 +3583,12 @@ end
     _nonallocating_call(k, args, Val(N))
 end
 
-function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply)
+function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply; have_types=nothing)
     for r in p.recipes
         length(r.outputs) == 1 || throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
-    rewritten, ops, caches = _nonallocating_program(p, ast)
+    rewritten, ops, caches = _nonallocating_program(p, ast; have_types)
     # Compile with the operation and cache tuples bound as constants inside the
     # body. Passing them as call arguments re-tuples the non-isbits operation
     # table on every invocation at the runtime-generated call boundary — a

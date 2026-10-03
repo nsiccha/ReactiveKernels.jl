@@ -151,11 +151,11 @@ function _ad_native_ops(kernel::PreparedKernel)
     ast = RuntimeGeneratedFunctions.get_expression(native)
     used = Set{Int}()
     _ad_operation_slots!(used, ast.args[2]) || return ops
-    # Native scan steps are inlined, but the shared operation table also holds
-    # the tensorized scan's complete prepared kernel. Rebuilding a bound-array
-    # table with that unused graph metadata defeats readonly analysis on Julia
-    # 1.13. Keep every live slot and the original positional ABI; remove only
-    # unused scan metadata from this internal native call. A source transform
+    # Native plate/scan bodies are inlined, but the shared operation table also
+    # holds their complete prepared kernels for tensorized execution. Rebuilding
+    # a bound-array table with unused graph metadata defeats Enzyme's readonly
+    # analysis. Keep every live slot and the original positional ABI; remove
+    # only unused plate/scan metadata from this internal native call. A transform
     # that accesses the table dynamically conservatively retains the whole table.
     ntuple(length(ops)) do index
         op = ops[index]

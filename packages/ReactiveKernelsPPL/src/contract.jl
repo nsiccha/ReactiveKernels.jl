@@ -1273,8 +1273,8 @@ function _sched_raw_columns(s::LinearPKScheduleSpec)
 end
 _sched_ends_field(::LinearPKScheduleSpec) = :op_ends
 
-"""The fixed event-LP provider name (the SB seam name — the
-per-subject expansion slices the call arg by this NAME)."""
+"""The conventional event-LP name used by legacy serialized plans.
+Ordinary cell calls derive the event axis from argument position."""
 const EVENT_LP_NAME = :log_F
 
 """
@@ -1356,8 +1356,7 @@ top-level schedule-chain form, see `_extract_kernel_cells`) takes the
 subject count from named data at bind — the schedule's subject column —
 and consumes no dims key. The cell vocabulary is calls to
 [`CELL_FNS`](@ref), schedule-map gathers, and arithmetic (no flat
-dotify — the generator emits one subject-batched `_over_subjects`
-statement per assignment).
+dotify — each PK call emits an RK subject plate containing event scans).
 """
 struct KernelPlate
     result::Symbol
@@ -2219,9 +2218,8 @@ const VECTOR_FNS = (:gp_exp_quad_cov, :gp_periodic_cov, :gp_chol_latent)
 
 """Cell-callable functions (grouped kernels): admitted in grouped-kernel
 cell assignments ONLY, always with a declared schedule as the first
-argument. The generator emits ONE subject-batched call per assignment
-(`<fn>_over_subjects` over the bound op columns + `op_ends`, pkcells.jl);
-the function itself is the per-subject cell + host-side oracle path."""
+argument. Each call exposes an RK subject plate containing retained event
+scans. Standalone and grouped entry points use the same authored step graph."""
 const CELL_FNS = (:linear_pk_read_locs, :linear_pk_read_locs_auc)
 
 """Arity (argument count) of each [`CELL_FNS`](@ref) entry, schedule first."""
@@ -4075,10 +4073,10 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
         end
     end
     # Cell assignments in order: slice params + LP cell params + earlier
-    # locals + model-scope scalars (schedule handles are compile-time and
+    # locals + model-scope values (schedule handles are compile-time and
     # enter only as call first-args / gather roots — never as values).
     known = union(Set{Symbol}(params),
-        Set{Symbol}(c for (_, c) in kp.lp_args), _union_names(plan))
+        Set{Symbol}(c for (_, c) in kp.lp_args), _all_names(plan))
     schednames = Set{Symbol}(s.name for s in kp.schedules)
     cell_locals = Set{Symbol}()
     scalar_names = Set{Symbol}(p.name for p in plan.parameters)
@@ -4426,10 +4424,9 @@ function _collect_grouped_cell_refs!(refs, ex, kp::KernelPlate,
                 _fail(label, "cell call `$fn` takes $want arguments " *
                       "(a schedule plus $(want - 1) cell/model names)" *
                       (fn === :linear_pk_read_locs ?
-                       " or $(want + 1) with the event-LP " *
-                       "`$(EVENT_LP_NAME)` second" :
+                       " or $(want + 1) with an event vector second" :
                        fn === :linear_pk_read_locs_auc ?
-                       " with the event-LP `$(EVENT_LP_NAME)` second" : "") *
+                       " with an event vector second" : "") *
                       ", got $(length(args))")
             s = args[1]
             s isa Symbol && s in schednames ||
@@ -4438,18 +4435,12 @@ function _collect_grouped_cell_refs!(refs, ex, kp::KernelPlate,
                       "$(sort!(collect(schednames))))")
             rest = args[2:end]
             if (fn === :linear_pk_read_locs && seven) || fn === :linear_pk_read_locs_auc
-                # The event-LP second arg is the provider's flat
-                # vector: the fixed seam name only — structure
-                # verifies the NAME and skips collection (the
-                # provider output is a generated local, not a plan
-                # parameter/assignment, so it is not cell-known).
-                # Lowering derives its event axis from this argument
-                # position and passes the value explicitly to each scan.
-                args[2] === EVENT_LP_NAME ||
+                # An ordinary declared value supplies the event vector.
+                # Its axis follows this position, independent of its name.
+                args[2] isa Symbol && args[2] in known ||
                     _fail(label, "cell call `$fn` second argument must " *
-                          "be the event-LP `$(EVENT_LP_NAME)` (got " *
-                          "$(repr(args[2])) — the 7-arg form is " *
-                          "`$fn(sched, log_F, lp...)`)")
+                          "name a declared event vector (got $(repr(args[2])))")
+                push!(refs, args[2])
                 rest = args[3:end]
             end
             # Direct call args: the one verbatim position (besides
@@ -9404,8 +9395,8 @@ const CELL_FN_RESULT_SPACE = Dict{Symbol,Symbol}(
 # obs/read operands fail closed (write the dotted form — the panel
 # precedent); dotted ops over mismatched axis lengths fail closed
 # naming the axes. Assignments pass through UNCHANGED (no flat dotify
-# — the generator emits one subject-batched `_over_subjects` statement
-# per assignment); this pass only proves shapes.
+# — each PK call emits a subject plate containing scans); this pass only proves
+# shapes.
 function _grouped_cell_shapes(kp::KernelPlate,
         slices::Vector{Tuple{Symbol,Symbol,Symbol}},
         columns::Dict{Symbol,ColumnData})
