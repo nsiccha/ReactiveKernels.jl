@@ -260,7 +260,12 @@ and lock the one Reactant 0.2.289 lifted:
   and array-bearing prepared-input readers keep their authored primal and
   remain native reverse capability gaps in `test_native_generator_capture.jl`.
   No consumer function, activity configuration or derivative rule is replaced.
-  The original-source repair belongs in the backend compiler; related
+  A six-line isolated Enzyme compiler prototype marks
+  `Base.collect(::Generator)` for inlining before activity analysis and makes
+  the byte-unchanged ordinary and prepared readers pass standard reverse,
+  with runtime activity disabled. That prototype is not in released Enzyme
+  and still needs broader compiler validation. The repair belongs in the
+  backend compiler; related
   [Enzyme issue #2386](https://github.com/EnzymeAD/Enzyme.jl/issues/2386)
   tracks comprehension activity analysis. This evidence and boundary note are
   interim tracking, not completion of that capability.
