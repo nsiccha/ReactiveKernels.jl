@@ -15,6 +15,7 @@ scale_for(x) = 2x
     s ~ Normal(center, sd)
     return s
 end
+
 end
 const _EVENT_KEYWORD_DRAW = EventKeywordDefaults.draw
 
@@ -165,4 +166,34 @@ end
         event_lps=[LinearPKEventLPSpec(:retired, :s, 5, 1.5, nothing, :legacy)])
     # Refused: old hand plans must not bypass explicit priors (10ldrvz).
     @test_throws ContractValidationError validate_structure(legacy)
+end
+
+@testset "PK event axis follows position, independent of value name" begin
+    data = _event_test_data(2)
+    original = _event_test_ast()
+    source = read(joinpath(@__DIR__, "corpus", "99_plate_50_grouped_pk_logf.jl"), String)
+    renamed = RKPPLModel(Meta.parse(replace(source, r"\blog_F\b" => "bioavailability")),
+        @__MODULE__)
+    plans = map(m -> _event_test_bound(m, data), (original, renamed))
+    built = map(build_kernel, plans)
+    names = map(b -> coordinate_names(b.layout), built)
+    lookup = Dict(n => i for (i, n) in enumerate(first(names)))
+    positions = [lookup[Symbol(replace(string(n), "bioavailability." => "log_F."))]
+        for n in last(names)]
+    u = [0.1cos(i) for i in eachindex(first(names))]
+    qs = map((b, p) -> prepare_query(b, p, :sampler), built, plans)
+    @test Base.invokelatest(last(qs), u[positions]) ≈ Base.invokelatest(first(qs), u)
+    @test Symbol("bioavailability.slope") in last(names)
+    sampler = prepare_sampler(last(built), last(plans), u[positions];
+        backend=AutoEnzyme(; mode=Enzyme.Reverse))
+    value, grad = sampler_value_and_gradient!(sampler, similar(u), u[positions])
+    h = cbrt(eps(Float64))
+    fd = map(eachindex(u)) do i
+        up, down = copy(u[positions]), copy(u[positions])
+        up[i] += h
+        down[i] -= h
+        (Base.invokelatest(last(qs), up) - Base.invokelatest(last(qs), down)) / (2h)
+    end
+    @test isfinite(value)
+    @test grad ≈ fd rtol=1e-5 atol=1e-7
 end

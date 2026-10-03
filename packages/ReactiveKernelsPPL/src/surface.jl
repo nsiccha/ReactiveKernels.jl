@@ -1505,7 +1505,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
-        array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned)
+        array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned,
+        indexed_observations = intersect(Set{Symbol}(first(c) for c in plate_ctx),
+            Set{Symbol}(r.response for r in responses)))
     _confirm_whole_value_data(plan, rawdata, waived; whole)
     validate_structure(plan)
     return plan
@@ -2472,9 +2474,12 @@ function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ();
     for st in ast.args
         st isa LineNumberNode && continue
         st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
+        # Only the indexed spelling puts the loop in argument 3. Legacy
+        # `@plate result for ...` keeps its conservative whole-statement reads.
         if st isa Expr && st.head === :macrocall &&
-                st.args[1] === Symbol("@plate")
-            loop = st.args[end]
+                st.args[1] === Symbol("@plate") &&
+                length(st.args) == 3 && Meta.isexpr(st.args[3], :for)
+            loop = st.args[3]
             ivar = loop.args[1].args[1]
             _all_symbols!(out, loop.args[1].args[2])
             for c in loop.args[2].args

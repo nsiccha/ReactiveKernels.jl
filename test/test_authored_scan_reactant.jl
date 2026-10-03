@@ -1,4 +1,5 @@
 using ReactiveKernels, Reactant, Test
+include("test_scan_plate_reactant.jl")
 import Enzyme
 using DifferentiationInterface: AutoEnzyme
 

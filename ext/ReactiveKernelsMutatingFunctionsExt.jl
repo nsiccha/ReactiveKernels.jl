@@ -3,6 +3,58 @@ module ReactiveKernelsMutatingFunctionsExt
 using ReactiveKernels
 import MutatingFunctions
 
+mutable struct _NestedPlateCache{K,R}
+    kernel::K
+    result::R
+end
+
+function ReactiveKernels._nested_plate_cache(op::ReactiveKernels._AuthoredPlateOp{K,A},
+        argtypes, ::Type{T}, N) where {K,A,T<:AbstractArray}
+    isconcretetype(T) && N !== nothing || return nothing
+    celltypes = Tuple((i in A || argtypes[i] <: Number) ? argtypes[i] :
+        eltype(argtypes[i]) for i in eachindex(argtypes))
+    all(isconcretetype, celltypes) || return nothing
+    p = op.kernel.plan
+    all(r -> length(r.outputs) == 1, p.recipes) || return nothing
+    cell = ReactiveKernels._prepare_nonallocating(p, ReactiveKernels._lower_unembedded(p),
+        cache_apply!; have_types=celltypes)
+    result = Array{T,N}(undef, ntuple(_ -> 0, N)...)
+    Ref(_NestedPlateCache(cell, result))
+end
+
+@generated function cache_apply!(slot::Base.RefValue{C},
+        op::ReactiveKernels._AuthoredPlateOp{K,A}, args::Vararg{Any,N}) where {C<:_NestedPlateCache,K,A,N}
+    wrapped = gensym.([Symbol(:plate_operand_, i) for i in 1:N])
+    bindings = [:($(wrapped[i]) = args[$i]) for i in 1:N]
+    # Ref operands have no broadcast axes and enter the cell unchanged.
+    # Fold the remaining axes explicitly: a wide varargs combine_axes call
+    # loses inference on Julia 1.10 and makes those temporary Refs escape.
+    combined = foldl((ax, i) -> :(Base.Broadcast.broadcast_shape(
+        $ax, Base.axes($(wrapped[i])))), (i for i in 1:N if !(i in A)); init=:(()))
+    index = gensym(:plate_index)
+    cellargs = [i in A ? wrapped[i] :
+        :(Base.Broadcast._broadcast_getindex($(wrapped[i]), $index)) for i in 1:N]
+    quote
+        $(Expr(:meta, :inline))
+        $(bindings...)
+        cache = slot[]
+        combined_axes = $combined
+        isempty(combined_axes) && throw(ArgumentError(
+            "an authored plate requires at least one non-Ref batched argument"))
+        result = _authored_plate_array_cache(cache.result, combined_axes)
+        for $index in CartesianIndices(combined_axes)
+            value = cache.kernel.f($(cellargs...))
+            if isassigned(result, $index) && axes(result[$index]) == axes(value)
+                copyto!(result[$index], value)
+            else
+                result[$index] = copy(value)
+            end
+        end
+        cache.result = result
+        result
+    end
+end
+
 @inline function cache_apply!(slot::Base.RefValue, op, args...)
     slot[] = MutatingFunctions.apply!!(slot[], op, args...)
 end

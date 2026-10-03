@@ -19,20 +19,17 @@
 #    `linear_pk_read_locs_cell` dose branch verbatim), evaluated by
 #    `linear_pk_event_log_f` over the `linear_pk_op_log_dose` event
 #    axis. One recurrence loop serves both (the 6-column method is a
-#    thin zeros wrapper — dev §4, bit-identical `exp(0) == 1`).
+#    thin zeros wrapper — bit-identical `exp(0) == 1`).
 # Everything else (op codes, token order, read-before-dose, segment
 # compression, recurrence op order) mirrors SB exactly.
 #
-# The recurrence runs as PLAIN JULIA called from generated code (the
-# `gp_chol_latent` native+Enzyme precedent): the generator emits one
-# `linear_pk_read_locs` call per subject over bound op-column slices plus
-# traced LP scalars, then a vectorized `flat[obs_map]` gather
-# (`reactivekernels-use` §7d shape) and the Gaussian plate. All
-# intermediate 3- and 4-dimensional storage is static
-# (`SMatrix`/`SVector`: stack-allocated, immutable): a concrete
-# `Matrix{Float64}`/`Vector{Float64}` rejects traced stores
-# (`convert(Float64, ::TracedRNumber)` has no method — the pkcell
-# slice's measured Reactant failure). The matrix exponential is the
+# Grouped execution exposes an RK subject plate and scalar-output event
+# scans (pk_rectangular.jl). The graph builds the parameter-dependent
+# system, carries compartment amounts and accumulated dose, and gathers
+# each subject's reads before the observation-space gather. Host schedule
+# preprocessing only builds padded event indices and packing positions.
+# Intermediate 3- and 4-dimensional storage uses immutable SMatrix/SVector.
+# The matrix exponential is the
 # StaticArrays built-in `exp` on `SMatrix{3,3}` (Higham-2008 Padé,
 # no LAPACK balancing — faster and at least as accurate as Stan's
 # `matrix_exp_pade` on the PK range, measured 2026-09-25; the former
@@ -51,11 +48,9 @@ const LINEAR_EVENT_DOSE_SEGMENT = 3
 # so under Reactant it arrives as a `TracedRArray` — or a `view` of one — and
 # a plain `log_F[j]` is the scalar read the tracer refuses (`Scalar indexing
 # is disallowed`, measured on Reactant 0.2.285 compiling the joint fixture;
-# `test_reactant_joint.jl` pins the fix).  The cell is opaque Julia called
-# from generated code, so RK's `@kernel` tensorized rewrite cannot reach this
-# read and no Reactant-extension method can intercept `getindex` on a Base
-# `SubArray` without piracy; the read itself routes through RK's
-# tensorized-gather hook instead.  Natively that hook IS `Base.getindex`
+# `test_reactant_joint.jl` pins the fix). Standalone cell calls route reads
+# through RK's tensorized-gather hook; grouped scan bodies use the ordinary
+# @kernel indexing rewrite. Natively that hook IS `Base.getindex`
 # (bit-identical, zero overhead); the RK Reactant extension lowers the
 # concrete-index read on a traced vector/view to a 1-element slice.  The op
 # columns (`op_type`, `op_dt`, `op_amount`, …) are bound data and keep plain
@@ -64,14 +59,11 @@ const _traced_op_read = ReactiveKernels._tensorized_getindex
 
 # --- subject-batched cell runner --------------------------------------------
 #
-# The generator emits ONE statement per grouped cell assignment, whatever
-# the subject count: `<cell>_over_subjects(op_ends, opcols..., args...)`
-# loops over subjects at RUNTIME with `view(col, lo:hi)` slices from the
-# bound `op_ends` (the statement count of the generated program is O(1)
-# in the data; only layout, bound data and loop trip counts scale).  Each
-# extra argument carries its per-subject access mode explicitly:
+# Generated grouped assignments contain an RK plate, not a subject loop
+# hidden behind a runner call. The direct grouped API prepares the same
+# graph once. Each extra argument declares its axis explicitly:
 #
-#   `SubjectSlice(v)`  — `view(v, lo:hi)` over the subject's op range (the
+#   `SubjectSlice(v)`  — event-index gathers over the subject's op range (the
 #                        flat event-frame vectors such as the W2 `log_F`
 #                        provider output);
 #   `SubjectScalar(v)` — the subject's entry `v[s]` (per-subject LP
@@ -80,16 +72,13 @@ const _traced_op_read = ReactiveKernels._tensorized_getindex
 #   anything else      — passed verbatim to every subject (model scalars,
 #                        literals).
 #
-# Natively this is exactly the former per-subject unroll (same slices,
-# same scalars, `reduce(vcat, parts)` == the former `vcat(s1, s2, …)`);
-# the experimental Reactant path in pk_rectangular.jl promotes bound columns
-# to traced constants and combines subject and operation traversal in one
-# fixed-trip loop. It requires an explicit benchmark opt-in below.
+# Padded event indices keep the cell output rectangular; schedule-only
+# packing restores ragged subject order. Each subject starts from zero.
 """
     SubjectSlice(v)
 
 Marks a flat op-ordered vector argument of a subject-batched cell call:
-subject `s` receives `view(v, lo:hi)` over its op range (see
+subject `s` reads its event entries through the schedule indices (see
 [`linear_pk_read_locs_auc_over_subjects`](@ref)).
 """
 struct SubjectSlice{V}
@@ -107,50 +96,9 @@ struct SubjectScalar{V}
     v::V
 end
 
-@inline _subject_arg(a::SubjectSlice, rng, s) = view(a.v, rng)
-@inline _subject_arg(a::SubjectScalar, rng, s) = _traced_op_read(a.v, s)
-@inline _subject_arg(a, rng, s) = a
-@inline _subject_args(args::Tuple, rng, s) =
-    map(a -> _subject_arg(a, rng, s), args)
-@inline _subject_views(cols::Tuple, rng) = map(c -> view(c, rng), cols)
-
-# Experimental until Enzyme/MLIR can reverse the PK recurrence. The benchmark
-# opts in explicitly; compiled callers fail explicitly while it is disabled.
-# Native callers retain ordinary subject and operation iteration.
-const _rectangular_pk_enabled = Ref(false)
-
-function _pk_compiled_cell(cell, ends, opcols, args, marker)
-    _rectangular_pk_enabled[] || throw(ArgumentError(
-        "compiled PK recurrences are disabled: PK reverse compilation " *
-        "currently fails tracing the rectangular path's StaticArrays matrix " *
-        "exponential (see docs/src/scan.md, PK adapter note); " *
-        "data-derived loop unrolling is not a supported fallback"))
-    ReactiveKernels._dynamic_tensorized_marker(opcols) === nothing ||
-        throw(ArgumentError("rectangular PK requires bound operation columns"))
-    _pk_rectangular(cell, ends, opcols, args, marker)
-end
-
-function _cell_over_subjects(cell::F, op_ends::AbstractVector{<:Integer},
-        opcols::Tuple, args::Tuple) where {F}
-    marker = ReactiveKernels._dynamic_tensorized_marker((opcols..., map(_subject_value, args)...))
-    marker === nothing || return _pk_compiled_cell(cell, op_ends, opcols, args, marker)
-    n_sub = length(op_ends)
-    n_sub >= 1 || throw(ArgumentError(
-        "subject-batched cell call needs at least one subject (empty op_ends)"))
-    hi = Int(op_ends[1])
-    rng = 1:hi
-    first = cell(_subject_views(opcols, rng)..., _subject_args(args, rng, 1)...)
-    parts = [first]
-    prev = hi
-    for s in 2:n_sub
-        hi = Int(op_ends[s])
-        rng = (prev + 1):hi
-        push!(parts, cell(_subject_views(opcols, rng)...,
-            _subject_args(args, rng, s)...))
-        prev = hi
-    end
-    return reduce(vcat, parts)
-end
+# All grouped calls share the RK subject plate and retained event recipe.
+_cell_over_subjects(cell, op_ends, opcols::Tuple, args::Tuple) =
+    _pk_subject_call(cell, op_ends, opcols, args)
 
 """
     linear_pk_read_locs_over_subjects(op_ends, op_type, op_dt, op_amount,
@@ -158,15 +106,14 @@ end
     linear_pk_read_locs_auc_over_subjects(op_ends, op_type, op_dt, op_amount,
         op_interval, op_count, op_read_idx, args...)
 
-Run [`linear_pk_read_locs`](@ref) / [`linear_pk_read_locs_auc`](@ref) once
-per subject over the bound op columns and concatenate the per-subject
-results in subject order: subject `s` sees the op range
+Evaluate an RK subject plate of retained event scans over the bound op
+columns and concatenate the per-subject results in subject order:
+subject `s` sees the op range
 `op_ends[s-1]+1:op_ends[s]` (`view`s of the six op columns), and each
 extra argument by its marker — [`SubjectSlice`](@ref) (a `view` over the
 same range), [`SubjectScalar`](@ref) (entry `s`), or verbatim.  This is
-the generated-code spelling of a grouped cell assignment (one statement
-per assignment, independent of the subject count); the result equals
-`vcat` of the per-subject cell calls.
+the direct API for the same graph emitted by grouped model assignments;
+the result equals `vcat` of the per-subject cell calls.
 """
 linear_pk_read_locs_over_subjects(op_ends::AbstractVector{<:Integer},
         op_type, op_dt, op_amount, op_interval, op_count, op_read_idx,
@@ -574,19 +521,20 @@ function linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
         -k21)
 end
 
-"""
+@traceable function linear_pk_propagate_3(A::SMatrix{3,3}, state::SVector{3}, dt)
+    if dt > 0
+        _pk_propagate_positive(A, state, dt)
+    else
+        state
+    end
+end
+@doc """
     linear_pk_propagate_3(A, state, dt) -> SVector{3}
 
 Propagate a three-state linear PK system across one interval (SB
 `linear_pk_propagate`: identity at `dt <= 0`, else `exp(A*dt)*state`
 — the exponential is the StaticArrays built-in).
-"""
-function linear_pk_propagate_3(A::SMatrix{3,3}, state::SVector{3}, dt)
-    if dt > 0
-        return _pk_propagate_positive(A, state, dt)
-    end
-    return state
-end
+""" linear_pk_propagate_3
 
 @inline function _pk_propagate_positive(A, state, dt)
     exp(A * dt) * state
@@ -601,22 +549,25 @@ function linear_pk_add_dose_3(state::SVector{3}, amount)
     return SVector(state[1] + amount, state[2], state[3])
 end
 
-"""
+@traceable function linear_pk_add_regular_doses_3(A::SMatrix{3,3}, state::SVector{3},
+        amount, interval, count::Integer)
+    after_first = linear_pk_add_dose_3(state, amount)
+    if count > 1
+        Q = _pk_smat_pow4(_pk_dose_affine(A, amount, interval), count - 1)
+        q = Q * SVector(after_first[1], after_first[2], after_first[3], 1.0)
+        SVector(q[1], q[2], q[3])
+    else
+        after_first
+    end
+end
+@doc """
     linear_pk_add_regular_doses_3(A, state, amount, interval, count) -> SVector{3}
 
 `count` equal oral doses at a fixed interval, beginning now (SB
 `linear_pk_add_regular_doses`: immediate first jump, then the augmented
 affine transition `[P b; 0 1]^(count-1)` with `P = exp(A*interval)`
 and `b = [amount, 0, 0]`).
-"""
-function linear_pk_add_regular_doses_3(A::SMatrix{3,3}, state::SVector{3},
-        amount, interval, count::Integer)
-    after_first = linear_pk_add_dose_3(state, amount)
-    count > 1 || return after_first
-    Q = _pk_smat_pow4(_pk_dose_affine(A, amount, interval), count - 1)
-    q = Q * SVector(after_first[1], after_first[2], after_first[3], 1.0)
-    return SVector(q[1], q[2], q[3])
-end
+""" linear_pk_add_regular_doses_3
 
 # The dose-interval affine map from exp(A*interval): propagate, then add a dose.
 @inline function _pk_dose_affine(A, amount, interval)
@@ -627,7 +578,7 @@ end
 
 # Binary exponentiation for the 4x4 augmented dose transition (Stan's
 # `matrix_power` with a data-only integer exponent — same math).
-function _pk_smat_pow4(B::SMatrix{4,4}, n::Integer)
+@traceable function _pk_smat_pow4(B::SMatrix{4,4}, n::Integer)
     R = SMatrix{4,4}(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
     e = Int(n)
@@ -726,19 +677,16 @@ branch verbatim), fed by [`linear_pk_event_log_f`](@ref)'s flat
 vector. The v1 6-op-column method (no `log_F`) is preserved exactly
 (F ≡ 1) as a thin zeros wrapper — bit-identical `exp(0) == 1`.
 
-Called from generated grouped-kernel code (one call per subject over
-bound op-column slices plus traced LP scalars — the `gp_chol_latent`
-native+Enzyme precedent) and from the host-side oracle path; the
-same function on both paths keeps spec and graph bit-identical by
-construction.
+Standalone and grouped calls execute the same RK subject-plate graph.
+Each cell starts with zero compartment amounts and accumulated dose, then
+scans its padded event-index column with lazy READ, DOSE, and repeated-dose
+branches. The scalar scan output is gathered at schedule-defined READ slots;
+padded entries do not enter the returned vector. Generated models expose this
+plate and its scans directly to RK preparation and differentiation.
 
-Native reads accumulate with `push!` in encounter order (`op_read_idx` is
-the per-op cumsum of READs), matching SB's counter-write. Traced calls never
-execute this host loop: compiled PK recurrences are explicitly unsupported
-(PK reverse compilation currently fails tracing the rectangular path's
-StaticArrays matrix exponential — see the [scan](scan.md) PK adapter note).
-The experimental rectangular adapter uses a retained loop and a fixed output
-buffer; its private diagnostic opt-in does not enable a supported sampler path.
+Native primal and default Enzyme reverse are supported. Full PK Reactant
+compilation currently fails when batching the fixed-size system matrix;
+see the [scan](scan.md) limitations.
 """
 function linear_pk_read_locs(op_type::AbstractVector,
         op_dt::AbstractVector, op_amount::AbstractVector,
@@ -747,44 +695,7 @@ function linear_pk_read_locs(op_type::AbstractVector,
         log_k12, log_k21, log_ka)
     cols = (op_type, op_dt, op_amount, op_interval, op_count, op_read_idx)
     args = (SubjectSlice(log_F), log_Vc, log_k10, log_k12, log_k21, log_ka)
-    marker = ReactiveKernels._dynamic_tensorized_marker((cols..., map(_subject_value, args)...))
-    marker === nothing || return _pk_compiled_cell(linear_pk_read_locs,
-        [length(op_type)], cols, args, marker)
-    n_ops = length(op_type)
-    (length(op_dt) == n_ops && length(op_amount) == n_ops &&
-     length(op_interval) == n_ops && length(op_count) == n_ops &&
-     length(op_read_idx) == n_ops && length(log_F) == n_ops) ||
-        throw(ArgumentError("linear_pk_read_locs op columns disagree " *
-                            "in length (all seven must match)"))
-    n_ops >= 1 ||
-        throw(ArgumentError("linear_pk_read_locs needs at least one op"))
-    log_CL = log_Vc + log_k10
-    log_Q = log_Vc + log_k12
-    log_Vp = log_Vc + log_k12 - log_k21
-    A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
-    Vc = exp(log_Vc)
-    state = SVector(0.0, 0.0, 0.0)
-    read_locs = zeros(typeof(Vc / Vc), 0)
-    for j in 1:n_ops
-        state = linear_pk_propagate_3(A, state, op_dt[j])
-        if op_type[j] == LINEAR_EVENT_READ
-            # Encounter order is read order (see docstring): append.
-            push!(read_locs, state[2] / Vc)
-        else
-            effective_amount = op_amount[j] * exp(_traced_op_read(log_F, j))
-            if op_type[j] == LINEAR_EVENT_DOSE
-                state = linear_pk_add_dose_3(state, effective_amount)
-            else
-                op_type[j] == LINEAR_EVENT_DOSE_SEGMENT ||
-                    throw(ArgumentError("linear PK kernel event stream " *
-                                        "has an unknown operation type " *
-                                        "$(op_type[j]) (SB @stan_assert mirror)"))
-                state = linear_pk_add_regular_doses_3(A, state,
-                    effective_amount, op_interval[j], op_count[j])
-            end
-        end
-    end
-    return read_locs
+    _pk_subject_call(linear_pk_read_locs, [length(op_type)], cols, args)
 end
 
 """
@@ -814,7 +725,7 @@ end
 # read numbering, per the file header). Unlike the v1 base, this
 # variant takes the SB `log_F` per-op vector (SB position, after
 # `op_read_idx`): the event-LP provider (W2 lane) emits it flat and the
-# grouped expansion slices per-subject views.
+# subject plate passes the flat vector explicitly to each event scan.
 function linear_pk_read_locs_auc(op_type::AbstractVector,
         op_dt::AbstractVector, op_amount::AbstractVector,
         op_interval::AbstractVector, op_count::AbstractVector,
@@ -822,248 +733,13 @@ function linear_pk_read_locs_auc(op_type::AbstractVector,
         log_Vc, log_k10, log_k12, log_k21, log_ka)
     cols = (op_type, op_dt, op_amount, op_interval, op_count, op_read_idx)
     args = (SubjectSlice(log_F), log_Vc, log_k10, log_k12, log_k21, log_ka)
-    marker = ReactiveKernels._dynamic_tensorized_marker((cols..., map(_subject_value, args)...))
-    marker === nothing || return _pk_compiled_cell(linear_pk_read_locs_auc,
-        [length(op_type)], cols, args, marker)
-    n_ops = length(op_type)
-    (length(op_dt) == n_ops && length(op_amount) == n_ops &&
-     length(op_interval) == n_ops && length(op_count) == n_ops &&
-     length(op_read_idx) == n_ops && length(log_F) == n_ops) ||
-        throw(ArgumentError("linear_pk_read_locs_auc op columns disagree " *
-                            "in length (all seven must match)"))
-    n_ops >= 1 ||
-        throw(ArgumentError("linear_pk_read_locs_auc needs at least one op"))
-    log_CL = log_Vc + log_k10
-    log_Q = log_Vc + log_k12
-    log_Vp = log_Vc + log_k12 - log_k21
-    A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
-    Vc = exp(log_Vc)
-    CL = exp(log_CL)
-    state = SVector(0.0, 0.0, 0.0)
-    given = 0.0
-    conc = zeros(typeof(Vc / Vc), 0)
-    auc = zeros(typeof(Vc / Vc), 0)
-    for j in 1:n_ops
-        state = linear_pk_propagate_3(A, state, op_dt[j])
-        if op_type[j] == LINEAR_EVENT_READ
-            push!(conc, state[2] / Vc)
-            push!(auc, (given - (state[1] + state[2] + state[3])) / CL)
-        else
-            effective_amount = op_amount[j] * exp(_traced_op_read(log_F, j))
-            if op_type[j] == LINEAR_EVENT_DOSE
-                state = linear_pk_add_dose_3(state, effective_amount)
-                given += effective_amount
-            else
-                op_type[j] == LINEAR_EVENT_DOSE_SEGMENT ||
-                    throw(ArgumentError("linear PK kernel event stream " *
-                                        "has an unknown operation type " *
-                                        "$(op_type[j]) (SB @stan_assert mirror)"))
-                state = linear_pk_add_regular_doses_3(A, state,
-                    effective_amount, op_interval[j], op_count[j])
-                given += op_count[j] * effective_amount
-            end
-        end
-    end
-    return vcat(conc, auc)
+    _pk_subject_call(linear_pk_read_locs_auc, [length(op_type)], cols, args)
 end
 
-# --- destination-passing cell variants (non-allocating execution) -----------
-#
-# `linear_pk_read_locs!`, `linear_pk_read_locs_auc!` and `linear_pk_event_log_f!`
-# run the same recurrences as their allocating twins, writing into a caller-owned
-# `out` vector instead of `push!`ing into fresh vectors. The MutatingFunctions
-# extension calls them from its `apply!!` methods, so a warmed non-allocating
-# kernel reuses one result buffer per grouped assignment instead of reallocating
-# it on every call.
-#
-# Native-only: unlike the twins, these skip the tensorized-marker check — the
-# extension's `apply!!` performs it once per call and falls back to the allocating
-# twin (which routes to the compiled path or throws the documented error) when
-# traced values are present. Do not call these with traced operands directly.
-#
-# Bit-exactness: the recurrence bodies mirror the allocating twins
-# statement-for-statement (same op order, same encounter order, same expressions);
-# only the sink changes (`out[off + k]` for the k-th READ op instead of `push!`).
-# The v1 `linear_pk_read_locs!` spelling (no `log_F`) uses `op_amount[j]` directly:
-# the twin computes `op_amount[j] * exp(0)`, and `x * 1.0 === x` in IEEE, so the
-# two agree bit-for-bit. `linear_pk_event_log_f!` fuses the PHI/S/w temporaries
-# into one accumulation with the same per-read summation order as the allocating
-# form's `PHI * w` plus `slope .* d .+ smooth` association, so the two agree to
-# floating-point summation association (a few ulp; the joint parity test holds the
-# non-allocating path to ≤ 1e-14 relative against the allocating path).
-
-# Native-execution gate for the MutatingFunctions extension: true when no
-# argument carries a traced (tensorized) marker, i.e. the destination-passing
-# `!` variants below may run. Traced calls fall back to the allocating twin
-# (which routes to the compiled path or throws the documented error).
+# Native gate for the legacy event-LP destination helper. PK recurrences
+# themselves use the authored graph and RK's ordinary plate/scan caches.
 function _pk_no_traced_marker(fixed::Tuple, extra::Tuple)
     ReactiveKernels._dynamic_tensorized_marker((fixed..., extra...)) === nothing
-end
-
-function _pk_count_reads(op_type::AbstractVector, lo::Integer, hi::Integer)
-    n = 0
-    for j in lo:hi
-        op_type[j] == LINEAR_EVENT_READ && (n += 1)
-    end
-    n
-end
-
-"""
-    linear_pk_read_locs!(out, off, op_type, op_dt, op_amount, op_interval,
-                         op_count, op_read_idx, log_F, log_Vc, log_k10, log_k12,
-                         log_k21, log_ka)
-    linear_pk_read_locs!(out, off, op_type, op_dt, op_amount, op_interval,
-                         op_count, op_read_idx, log_Vc, log_k10, log_k12, log_k21,
-                         log_ka)
-
-Destination-passing [`linear_pk_read_locs`](@ref): write the subject's READ
-locations into `out` at `off + 1:off + R` (`R` = number of READ ops) and return
-`out`. The second method is the v1 spelling (bioavailability identically 1).
-Validations mirror the allocating twin; `out` must have room for the `R` reads.
-"""
-function linear_pk_read_locs!(out::AbstractVector, off::Integer,
-        op_type::AbstractVector,
-        op_dt::AbstractVector, op_amount::AbstractVector,
-        op_interval::AbstractVector, op_count::AbstractVector,
-        op_read_idx::AbstractVector, log_F::AbstractVector, log_Vc, log_k10,
-        log_k12, log_k21, log_ka)
-    n_ops = length(op_type)
-    (length(op_dt) == n_ops && length(op_amount) == n_ops &&
-     length(op_interval) == n_ops && length(op_count) == n_ops &&
-     length(op_read_idx) == n_ops && length(log_F) == n_ops) ||
-        throw(ArgumentError("linear_pk_read_locs op columns disagree " *
-                            "in length (all seven must match)"))
-    n_ops >= 1 ||
-        throw(ArgumentError("linear_pk_read_locs needs at least one op"))
-    log_CL = log_Vc + log_k10
-    log_Q = log_Vc + log_k12
-    log_Vp = log_Vc + log_k12 - log_k21
-    A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
-    Vc = exp(log_Vc)
-    state = SVector(0.0, 0.0, 0.0)
-    k = 0
-    for j in 1:n_ops
-        state = linear_pk_propagate_3(A, state, op_dt[j])
-        if op_type[j] == LINEAR_EVENT_READ
-            k += 1
-            out[off + k] = state[2] / Vc
-        else
-            effective_amount = op_amount[j] * exp(_traced_op_read(log_F, j))
-            if op_type[j] == LINEAR_EVENT_DOSE
-                state = linear_pk_add_dose_3(state, effective_amount)
-            else
-                op_type[j] == LINEAR_EVENT_DOSE_SEGMENT ||
-                    throw(ArgumentError("linear PK kernel event stream " *
-                                        "has an unknown operation type " *
-                                        "$(op_type[j]) (SB @stan_assert mirror)"))
-                state = linear_pk_add_regular_doses_3(A, state,
-                    effective_amount, op_interval[j], op_count[j])
-            end
-        end
-    end
-    return out
-end
-
-function linear_pk_read_locs!(out::AbstractVector, off::Integer,
-        op_type::AbstractVector,
-        op_dt::AbstractVector, op_amount::AbstractVector,
-        op_interval::AbstractVector, op_count::AbstractVector,
-        op_read_idx::AbstractVector, log_Vc, log_k10, log_k12, log_k21,
-        log_ka)
-    n_ops = length(op_type)
-    (length(op_dt) == n_ops && length(op_amount) == n_ops &&
-     length(op_interval) == n_ops && length(op_count) == n_ops &&
-     length(op_read_idx) == n_ops) ||
-        throw(ArgumentError("linear_pk_read_locs op columns disagree " *
-                            "in length (all six must match)"))
-    n_ops >= 1 ||
-        throw(ArgumentError("linear_pk_read_locs needs at least one op"))
-    log_CL = log_Vc + log_k10
-    log_Q = log_Vc + log_k12
-    log_Vp = log_Vc + log_k12 - log_k21
-    A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
-    Vc = exp(log_Vc)
-    state = SVector(0.0, 0.0, 0.0)
-    k = 0
-    for j in 1:n_ops
-        state = linear_pk_propagate_3(A, state, op_dt[j])
-        if op_type[j] == LINEAR_EVENT_READ
-            k += 1
-            out[off + k] = state[2] / Vc
-        else
-            effective_amount = op_amount[j]
-            if op_type[j] == LINEAR_EVENT_DOSE
-                state = linear_pk_add_dose_3(state, effective_amount)
-            else
-                op_type[j] == LINEAR_EVENT_DOSE_SEGMENT ||
-                    throw(ArgumentError("linear PK kernel event stream " *
-                                        "has an unknown operation type " *
-                                        "$(op_type[j]) (SB @stan_assert mirror)"))
-                state = linear_pk_add_regular_doses_3(A, state,
-                    effective_amount, op_interval[j], op_count[j])
-            end
-        end
-    end
-    return out
-end
-
-"""
-    linear_pk_read_locs_auc!(out, off, op_type, op_dt, op_amount, op_interval,
-                             op_count, op_read_idx, log_F, log_Vc, log_k10,
-                             log_k12, log_k21, log_ka)
-
-Destination-passing [`linear_pk_read_locs_auc`](@ref): write the subject's
-`[conc; auc]` reads vector into `out` at `off + 1:off + 2R` (`R` = number of
-READ ops) and return `out`. Validations mirror the allocating twin; `out` must
-have room for the `2R` reads.
-"""
-function linear_pk_read_locs_auc!(out::AbstractVector, off::Integer,
-        op_type::AbstractVector,
-        op_dt::AbstractVector, op_amount::AbstractVector,
-        op_interval::AbstractVector, op_count::AbstractVector,
-        op_read_idx::AbstractVector, log_F::AbstractVector,
-        log_Vc, log_k10, log_k12, log_k21, log_ka)
-    n_ops = length(op_type)
-    (length(op_dt) == n_ops && length(op_amount) == n_ops &&
-     length(op_interval) == n_ops && length(op_count) == n_ops &&
-     length(op_read_idx) == n_ops && length(log_F) == n_ops) ||
-        throw(ArgumentError("linear_pk_read_locs_auc op columns disagree " *
-                            "in length (all seven must match)"))
-    n_ops >= 1 ||
-        throw(ArgumentError("linear_pk_read_locs_auc needs at least one op"))
-    log_CL = log_Vc + log_k10
-    log_Q = log_Vc + log_k12
-    log_Vp = log_Vc + log_k12 - log_k21
-    A = linear_pk_system_3(log_CL, log_Vc, log_Q, log_Vp, log_ka)
-    Vc = exp(log_Vc)
-    CL = exp(log_CL)
-    state = SVector(0.0, 0.0, 0.0)
-    given = 0.0
-    n_reads = _pk_count_reads(op_type, 1, n_ops)
-    k = 0
-    for j in 1:n_ops
-        state = linear_pk_propagate_3(A, state, op_dt[j])
-        if op_type[j] == LINEAR_EVENT_READ
-            k += 1
-            out[off + k] = state[2] / Vc
-            out[off + n_reads + k] = (given - (state[1] + state[2] + state[3])) / CL
-        else
-            effective_amount = op_amount[j] * exp(_traced_op_read(log_F, j))
-            if op_type[j] == LINEAR_EVENT_DOSE
-                state = linear_pk_add_dose_3(state, effective_amount)
-                given += effective_amount
-            else
-                op_type[j] == LINEAR_EVENT_DOSE_SEGMENT ||
-                    throw(ArgumentError("linear PK kernel event stream " *
-                                        "has an unknown operation type " *
-                                        "$(op_type[j]) (SB @stan_assert mirror)"))
-                state = linear_pk_add_regular_doses_3(A, state,
-                    effective_amount, op_interval[j], op_count[j])
-                given += op_count[j] * effective_amount
-            end
-        end
-    end
-    return out
 end
 
 """

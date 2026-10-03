@@ -127,6 +127,7 @@ const _NONALLOC_LAZY_CALLEES = (
     view, reshape, transpose, adjoint, vec, eachcol, eachrow, identity,
 )
 _nonalloc_is_lazy(f) = any(l -> l === f, _NONALLOC_LAZY_CALLEES)
+_nonalloc_is_lazy(::_BoundConstant) = true
 
 function _nonalloc_resolve_const(mod::Module, s::Symbol)
     isdefined(mod, s) || return nothing
@@ -514,10 +515,24 @@ end
 function _plate_broadcast_rank(::Val{A}, argtypes) where {A}
     all(t -> t isa Type && isconcretetype(t), argtypes) || return nothing
     BT = _static_type(_authored_plate_broadcast, Val{A}, argtypes...)
-    BT <: Base.Broadcast.Broadcasted && isconcretetype(BT) || return nothing
-    axes_type = BT.parameters[2]
-    axes_type <: Tuple || return nothing
-    length(axes_type.parameters)
+    if BT <: Base.Broadcast.Broadcasted && isconcretetype(BT)
+        axes_type = BT.parameters[2]
+        axes_type <: Tuple && return length(axes_type.parameters)
+    end
+    # Wide tuples of operands can defeat inference of Broadcasted itself.
+    # Dense array, tuple and scalar types still prove Julia's result rank.
+    ranks = Int[]
+    for (i, T) in enumerate(argtypes)
+        (i in A || T <: Number) && continue
+        if T <: AbstractArray
+            push!(ranks, ndims(T))
+        elseif T <: Tuple
+            push!(ranks, 1)
+        else
+            return nothing
+        end
+    end
+    maximum(ranks; init=0)
 end
 
 # The cache slot and recorded result type use the inferred concrete element
@@ -525,15 +540,63 @@ end
 # unannotated body, so an untyped plate materializes a typed buffer here exactly
 # as the ordinary native lowering now does — no boxed `Vector{Any}`, and both
 # execution paths agree bit-for-bit on the materialized pointwise vector.
-function _plate_cache_slot(op::_AuthoredPlateOp{K,A}, argtypes) where {K,A}
+_nested_plate_cache(op, argtypes, T, N) = nothing
+function _nonalloc_plan_result_types(kernel, argument_types)
+    p = kernel.plan
+    types = Dict(canon_id(p.graph, v.id) => T for (v, T) in zip(p.have, argument_types))
+    for recipe in p.recipes
+        inputs = [get(types, canon_id(p.graph, v.id), Any) for v in recipe.inputs]
+        T = _nonalloc_recipe_type(recipe.op, inputs)
+        for (index, output) in enumerate(recipe.outputs)
+            types[canon_id(p.graph, output.id)] = length(recipe.outputs) == 1 ? T :
+                T isa DataType && T <: Tuple ? fieldtype(T, index) : Any
+        end
+    end
+    Tuple(get(types, canon_id(p.graph, v.id), Any) for v in p.want)
+end
+_nonalloc_recipe_type(op, types) = _static_type(op, types...)
+function _nonalloc_recipe_type(op::_AuthoredScanOp{K,A,I,H}, types) where {K,A,I,H}
+    H && return _static_type(op, types...)
+    iterated = [i for i in 2:length(types) if !(i in A)]
+    shared = [i for i in 2:length(types) if i in A]
+    step_types = Any[types[1], [eltype(types[i]) for i in iterated]..., types[shared]...]
+    output = last(_nonalloc_plan_result_types(op.kernel, step_types))
+    I && (output = promote_type(types[1], output))
+    Vector{output}
+end
+
+function _nonalloc_rewrite_recipe!(body, prog::_StepProgram, r::Recipe,
+        types::Dict{Symbol,Any}, lhs, args, ::Val{:scan})
+    T = _nonalloc_recipe_type(r.op, _nonalloc_argument_types(types, args))
+    slot = _step!(prog, identity, _nonalloc_slot(T))
+    offset = length(prog.ops)
+    for op in r.op.kernel.ops
+        _step!(prog, op, nothing)
+    end
+    cache = Expr(:ref, Expr(:ref, _CACHES_ARG, slot))
+    _lower_authored_scan_native!(body, r.op, args, lhs, offset; recycled=cache)
+    push!(body.args, Expr(:(=), cache, lhs))
+    lhs isa Symbol && (types[lhs] = T)
+    nothing
+end
+function _nonalloc_plate_eltype(op::_AuthoredPlateOp{K,A}, argtypes) where {K,A}
     T = _authored_plate_result_eltype(op, argtypes)
+    isconcretetype(T) && return T
+    elements = [(i in A || argtypes[i] <: Number) ? argtypes[i] : eltype(argtypes[i])
+        for i in eachindex(argtypes)]
+    only(_nonalloc_plan_result_types(op.kernel, elements))
+end
+function _plate_cache_slot(op::_AuthoredPlateOp{K,A}, argtypes) where {K,A}
+    T = _nonalloc_plate_eltype(op, argtypes)
     N = _plate_broadcast_rank(Val(A), argtypes)
+    nested = _nested_plate_cache(op, argtypes, T, N)
+    nested === nothing || return nested
     N === nothing && return Ref{Array{T}}(Vector{T}())
     Ref{Array{T,N}}(Array{T,N}(undef, ntuple(_ -> 0, N)...))
 end
 
 function _plate_result_type(op::_AuthoredPlateOp{K,A}, argtypes) where {K,A}
-    T = _authored_plate_result_eltype(op, argtypes)
+    T = _nonalloc_plate_eltype(op, argtypes)
     N = _plate_broadcast_rank(Val(A), argtypes)
     N === nothing ? Array{T} : Array{T,N}
 end
@@ -551,6 +614,10 @@ function _nonalloc_rewrite_recipe!(newbody, prog::_StepProgram, r::Recipe,
     record!(T) = lhs isa Symbol && (types[lhs] = T)
     op = r.op
     if !r.effectful
+        if op isa _AuthoredScanOp
+            _nonalloc_rewrite_recipe!(newbody, prog, r, types, lhs, callargs, Val(:scan))
+            return
+        end
         if op isa _AuthoredPlateOp
             j = _step!(prog, op, _plate_cache_slot(op, argtypes))
             push!(newbody.args,
@@ -625,7 +692,7 @@ per-step operations and typed persistent caches, with fused captured sources
 decomposed into destination-passing steps where the grammar allows, and the
 previous whole-recipe cache step as the universal fallback.
 """
-function _nonallocating_program(p::Plan, ast::Expr)
+function _nonallocating_program(p::Plan, ast::Expr; have_types=nothing)
     ast.head === :function ||
         throw(ArgumentError("non-allocating preparation requires a function Expr"))
     signature = ast.args[1]
@@ -635,10 +702,10 @@ function _nonallocating_program(p::Plan, ast::Expr)
 
     prog = _StepProgram(Any[], Any[])
     types = Dict{Symbol,Any}()
-    for (v, argexpr) in zip(p.have, signature.args[2:end])
+    for (index, (v, argexpr)) in enumerate(zip(p.have, signature.args[2:end]))
         name = argexpr isa Expr && argexpr.head === :(::) ?
                argexpr.args[1] : argexpr
-        name isa Symbol && (types[name] = valtype(v))
+        name isa Symbol && (types[name] = have_types === nothing ? valtype(v) : have_types[index])
     end
 
     body = ast.args[2]

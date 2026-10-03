@@ -526,8 +526,10 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         push!(initial_output.args, :($lhs[$index] = $output))
         # The buffer shares the sequences' axes, which `index` comes from.
         push!(loop_output.args, _inbounds_expr(:($lhs[$index] = $output)))
-        push!(empty_output.args, :($lhs = $(GlobalRef(Base, :similar))(
-            $xs, $output_type)))
+        empty_allocation = :($(GlobalRef(Base, :similar))($xs, $output_type))
+        push!(empty_output.args, :($lhs = $(recycled === nothing ? empty_allocation :
+            _lane_allocation(recycled, output_type,
+                :($(GlobalRef(Base, :axes))($xs)), empty_allocation))))
     end
     if consumer !== nothing
         cell, args, positions, cell_offset, pointwise_lhs, total_lhs = consumer
@@ -1090,6 +1092,27 @@ function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
     Expr(:if, ready, interchanged, cell_loop)
 end
 
+function _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
+    offsets = Dict{Int,Int}()
+    for (index, recipe) in enumerate(inner.recipes)
+        recipe.op isa _AuthoredScanOp || continue
+        step = recipe.op.kernel
+        offsets[index] = length(runtime_ops)
+        append!(runtime_ops, step.ops)
+        append!(runtime_recipes, step.lowered_recipes)
+    end
+    offsets
+end
+
+function _lower_plate_recipe_native!(body, recipe, args, out, operation, offset)
+    if recipe.op isa _AuthoredScanOp
+        _lower_authored_scan_native!(body, recipe.op, args, out, offset)
+    else
+        push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
+    end
+    body
+end
+
 function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
                                        op::_AuthoredPlateOp, callargs, callvalues,
                                        pointwise_lhs, total_lhs; recycled = nothing)
@@ -1258,6 +1281,7 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     op_offset = length(runtime_ops)
     append!(runtime_ops, inner_kernel.ops)
     append!(runtime_recipes, inner_kernel.lowered_recipes)
+    scan_offsets = _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
     # Bind the concrete pointwise element type by propagating inferred types
     # through the plate body's scalar recipe DAG. Each individual `__ops__`
     # recipe op is an ordinary callable (a `_KernelSourceOp`, not the opaque
@@ -1284,8 +1308,22 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
             get(plate_type_exprs, canon_id(inner.graph, input.id),
                 GlobalRef(Core, :Any)) for input in recipe.inputs]
         output_cid = canon_id(inner.graph, only(recipe.outputs).id)
-        plate_type_exprs[output_cid] = Expr(:call, GlobalRef(Base, :promote_op),
-            Expr(:ref, _OPS_ARG, op_offset + recipe_index), input_type_exprs...)
+        scan_type = nothing
+        if recipe.op isa _AuthoredScanOp
+            scan_atomic = typeof(recipe.op).parameters[2]
+            iterated = [i for i in 2:length(input_type_exprs) if !(i in scan_atomic)]
+            shared = [i for i in 2:length(input_type_exprs) if i in scan_atomic]
+            step_types = Any[input_type_exprs[1],
+                [Expr(:call, GlobalRef(Base, :eltype), input_type_exprs[i])
+                    for i in iterated]..., input_type_exprs[shared]...]
+            element = _authored_scan_step_output_type(recipe.op.kernel,
+                step_types, scan_offsets[recipe_index])
+            element === nothing || (scan_type = Expr(:curly,
+                GlobalRef(Base, :Vector), element))
+        end
+        plate_type_exprs[output_cid] = scan_type === nothing ?
+            Expr(:call, GlobalRef(Base, :promote_op),
+                Expr(:ref, _OPS_ARG, op_offset + recipe_index), input_type_exprs...) : scan_type
     end
     push!(body.args, Expr(:(=), plate_eltype,
         get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
@@ -1314,9 +1352,9 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
             args = Any[_authored_plate_scalar_ref(
                 inner, locals, callargs, callvalues, prepared_arguments, atomic,
                 input, index, false) for input in recipe.inputs]
-            call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index),
-                        args...)
-            push!(assignments.args, Expr(:(=), out, call))
+            _lower_plate_recipe_native!(assignments, recipe, args, out,
+                Expr(:ref, _OPS_ARG, op_offset + recipe_index),
+                get(scan_offsets, recipe_index, 0))
         end
         condition = _authored_plate_condition(
             callargs, roots, root_positions, atomic)
@@ -1352,9 +1390,9 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
             args = Any[_authored_plate_scalar_ref(
                 inner, locals, callargs, callvalues, prepared_arguments, atomic,
                 input, index, true) for input in recipe.inputs]
-            call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index),
-                        args...)
-            push!(assignments.args, Expr(:(=), out, call))
+            _lower_plate_recipe_native!(assignments, recipe, args, out,
+                Expr(:ref, _OPS_ARG, op_offset + recipe_index),
+                get(scan_offsets, recipe_index, 0))
         end
         if _authored_plate_unconditional_group(
                 roots, root_positions, atomic, callvalues)
@@ -1467,6 +1505,7 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
     op_offset = length(runtime_ops)
     append!(runtime_ops, inner_kernel.ops)
     append!(runtime_recipes, inner_kernel.lowered_recipes)
+    _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
     for (recipe_index, recipe) in enumerate(inner.recipes)
         length(recipe.outputs) == 1 || throw(ArgumentError(
             "an authored plate currently requires single-output scalar recipes"))
@@ -3544,12 +3583,12 @@ end
     _nonallocating_call(k, args, Val(N))
 end
 
-function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply)
+function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply; have_types=nothing)
     for r in p.recipes
         length(r.outputs) == 1 || throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
-    rewritten, ops, caches = _nonallocating_program(p, ast)
+    rewritten, ops, caches = _nonallocating_program(p, ast; have_types)
     # Compile with the operation and cache tuples bound as constants inside the
     # body. Passing them as call arguments re-tuples the non-isbits operation
     # table on every invocation at the runtime-generated call boundary — a
