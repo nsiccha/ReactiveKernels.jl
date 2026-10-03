@@ -11,7 +11,7 @@
 # compile-time constants — exactly the brm_hsgp.jl basis pattern.
 # Assumes `validate_plan` passed.
 
-using LinearAlgebra: Diagonal, Symmetric, eigen, norm, nullspace
+using LinearAlgebra: Diagonal, Symmetric, eigen, norm, nullspace, rank
 
 # Spline fits (verbatim port of BRM `src/preparation_basis.jl`, `_brm_` →
 # `_rk_` + `ContractValidationError`, plus the canonical column signs of
@@ -64,15 +64,23 @@ function _rk_fit_spline(x::AbstractVector{<:Real}; k::Int=10)
     shift = sum(xs) / length(xs)
     centers = xs .- shift
     E = _rk_tps_kernel(centers, centers)
+    T = hcat(ones(Float64, length(xs)), centers)
+    range_projection = _rk_tps_projection(E, T, k)
+    (; shift, centers, range_projection, k)
+end
+
+# Shared low-rank TPS construction: truncate the radial kernel, project
+# away its polynomial null space, then whiten the remaining penalty.
+function _rk_tps_projection(E, T, k)
+    q = size(T, 2)
     eig_E = eigen(Symmetric(E))
     keep = sortperm(abs.(eig_E.values); rev=true)[1:k]
     U = eig_E.vectors[:, keep]
     D = eig_E.values[keep]
 
-    T = hcat(ones(Float64, length(xs)), centers)
     Z = nullspace(transpose(T) * U)
-    size(Z, 2) == k - 2 || _rk_spline_fail(
-        "`s(x)` could not isolate the two-dimensional TPS null space")
+    size(Z, 2) == k - q || _rk_spline_fail(
+        "could not isolate the $q-dimensional TPS null space")
 
     S = Symmetric(transpose(Z) * Diagonal(D) * Z)
     eig_S = eigen(S)
@@ -85,7 +93,7 @@ function _rk_fit_spline(x::AbstractVector{<:Real}; k::Int=10)
     penalty_whitener = eig_S.vectors * Diagonal(inv.(sqrt.(penalty_values)))
     range_projection = _rk_canonical_column_signs(U * Z * penalty_whitener)
 
-    (; shift, centers, range_projection, k)
+    return range_projection
 end
 
 # The unpenalized block is the centered linear column alone. BRM/SB keep
@@ -238,32 +246,38 @@ function _rk_row_tensor(A::AbstractMatrix, B::AbstractMatrix)
     out
 end
 
-function _rk_t2_raw_blocks(margins, x, z)
-    N1, R1 = _rk_apply_cr_spline(margins[1], x)
-    N2, R2 = _rk_apply_cr_spline(margins[2], z)
-    NN = _rk_row_tensor(N1, N2)
-    (fixed=Matrix(NN[:, 2:end]), rr=_rk_row_tensor(R1, R2),
-     rn=_rk_row_tensor(R1, N2), nr=_rk_row_tensor(N1, R2))
+function _rk_t2_raw_blocks(margins, axes_...)
+    d = length(axes_)
+    parts = map(_rk_apply_cr_spline, margins, axes_)
+    NN = reduce(_rk_row_tensor, first.(parts))
+    # Range before null, with the last margin varying fastest. At d=2
+    # this is exactly the historical rr, rn, nr ordering.
+    blocks = map((2^d - 1):-1:1) do mask
+        selected = map(1:d) do j
+            parts[j][iszero(mask & (1 << (d - j))) ? 1 : 2]
+        end
+        reduce(_rk_row_tensor, selected)
+    end
+    return (Matrix(NN[:, 2:end]), blocks...)
 end
 
 _rk_block_center(A::AbstractMatrix) = vec(sum(A; dims=1)) ./ size(A, 1)
 _rk_center_block(A::AbstractMatrix, center) = A .- reshape(center, 1, :)
 
-function _rk_fit_t2(x::AbstractVector{<:Real}, z::AbstractVector{<:Real};
-                    k::Tuple{Int,Int}=(5, 5))
-    length(x) == length(z) || _rk_spline_fail(
-        "`t2(x, z)` margins must have equal lengths ($(length(x)) vs $(length(z)))")
-    margins = (_rk_fit_cr_spline(x; k=k[1]), _rk_fit_cr_spline(z; k=k[2]))
-    raw = _rk_t2_raw_blocks(margins, x, z)
-    fixed_center = _rk_block_center(raw.fixed)
+function _rk_fit_t2(axes_::AbstractVector{<:Real}...;
+                    k::Tuple=ntuple(_ -> 5, length(axes_)))
+    length(k) == length(axes_) || _rk_spline_fail("one k per tensor margin is required")
+    all(x -> length(x) == length(first(axes_)), axes_) ||
+        _rk_spline_fail("tensor margins must have equal lengths")
+    margins = map((x, kk) -> _rk_fit_cr_spline(x; k=kk), axes_, k)
+    raw = _rk_t2_raw_blocks(margins, axes_...)
+    fixed_center = _rk_block_center(first(raw))
     (; margins, fixed_center, k)
 end
 
-function _rk_apply_t2(fit, x::AbstractVector{<:Real}, z::AbstractVector{<:Real})
-    length(x) == length(z) || _rk_spline_fail(
-        "`t2(x, z)` margins must have equal lengths ($(length(x)) vs $(length(z)))")
-    raw = _rk_t2_raw_blocks(fit.margins, x, z)
-    (_rk_center_block(raw.fixed, fit.fixed_center), raw.rr, raw.rn, raw.nr)
+function _rk_apply_t2(fit, axes_::AbstractVector{<:Real}...)
+    raw = _rk_t2_raw_blocks(fit.margins, axes_...)
+    (_rk_center_block(first(raw), fit.fixed_center), Base.tail(raw)...)
 end
 
 """Design-matrix recipe name for a predictor (`mu` → `_ppl_design_mu`)."""

@@ -176,36 +176,40 @@ end
             y .~ Normal.(mu, 1.0)
             hsgp_basis(:h_x, x)
         end, (:y, :x); conditioned = (:y, :x))
-    # capability: hsgp summand value reuse: same basis twice in one predictor (values compose, P3/P8) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+    # supported via the explicit library: hsgp summand value reuse: same basis twice in one predictor (values compose, P3/P8) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (P,lam) = hsgp_basis(x;k=4)
+            f ~ hsgp_effect(P,lam)
             a ~ Normal(0, 1)
-            mu = a .+ hsgp(:h_x) .+ hsgp(:h_x)
+            mu = a .+ f .+ f
             y .~ Normal.(mu, 1.0)
-            hsgp_basis(:h_x, x)
-        end, (:y, :x); conditioned = (:y, :x)); true)
-    # capability: negated hsgp summand (`a .- hsgp(:h)`) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
+    # supported via the explicit library: negated hsgp summand (`a .- hsgp(:h)`) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (P,lam) = hsgp_basis(x;k=4)
+            f ~ hsgp_effect(P,lam)
             a ~ Normal(0, 1)
-            mu = a .- hsgp(:h_x)
+            mu = a .- f
             y .~ Normal.(mu, 1.0)
-            hsgp_basis(:h_x, x)
-        end, (:y, :x); conditioned = (:y, :x)); true)
-    # capability: literal-scaled hsgp summand (`2.0 .* hsgp(:h)`) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
+    # supported via the explicit library: literal-scaled hsgp summand (`2.0 .* hsgp(:h)`) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (P,lam) = hsgp_basis(x;k=4)
+            f ~ hsgp_effect(P,lam)
             a ~ Normal(0, 1)
-            mu = a .+ 2.0 .* hsgp(:h_x)
+            mu = a .+ 2.0 .* f
             y .~ Normal.(mu, 1.0)
-            hsgp_basis(:h_x, x)
-        end, (:y, :x); conditioned = (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
     # Never inside definitions; never redefined or sampled.
-    # capability: hsgp value bound in a definition (`h = hsgp(:h)`; values compose, P3/P8) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+    # supported via the explicit library: hsgp value bound in a definition (`h = hsgp(:h)`; values compose, P3/P8) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (P,lam) = hsgp_basis(x;k=4)
+            f ~ hsgp_effect(P,lam)
             a ~ Normal(0, 1)
-            h = hsgp(:h_x)
+            h = f
             mu = a .+ h
             y .~ Normal.(mu, 1.0)
-            hsgp_basis(:h_x, x)
-        end, (:y, :x); conditioned = (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
     # refused: reserved-name collision `hsgp` (then calls a Float64)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp = 1.0
@@ -620,13 +624,17 @@ end
 
 @testset "hsgp periodic surface fail-closed" begin
     # cov spelling.
-    # capability: Matern-covariance HSGP (cov = :matern; nu should be explicit, e.g. :matern32/:matern52) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+    # supported via the explicit library: Matern-covariance HSGP (cov = :matern; nu should be explicit, e.g. :matern32/:matern52) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (P,lam) = hsgp_basis(x;k=4)
+            rho ~ LogNormal(0,1)
+            sigma_f ~ LogNormal(0,1)
+            raw[axes(P,2)] .~ Normal.(0,1)
+            f = P * (hsgp_matern_sqrt_spd(lam,sigma_f,rho,1.5) .* raw)
             a ~ Normal(0, 1)
-            hsgp_basis(:h_p, x; k = 4, cov = :matern, period = 2.0)
-            mu = a .+ hsgp(:h_p)
+            mu = a .+ f
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x); conditioned = (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
     # refused: bare `periodic` is an undeclared name (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             hsgp_basis(:h_p, x; k = 4, cov = periodic, period = 2.0)
@@ -661,21 +669,22 @@ end
             end, (:y, :x); conditioned = (:y, :x))
     end
     # One isotropic axis (SB "periodic hsgp requires one isotropic axis").
-    # capability: multi-axis periodic HSGP (the SB one-axis limit is not a principle, P10) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+    # supported via the explicit library: multi-axis periodic HSGP (the SB one-axis limit is not a principle, P10) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (P,harmonics) = hsgp_periodic_basis(x,z;k=(4,3),period=2.0)
+            f ~ hsgp_periodic_effect(P,harmonics)
             a ~ Normal(0, 1)
-            hsgp_basis(:h_p, x, z; k = (4, 3), cov = :periodic, period = 2.0)
-            mu = a .+ hsgp(:h_p)
+            mu = a .+ f
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
-    # capability: anisotropic (iso=false) periodic HSGP (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+        end, (:y, :x, :z); conditioned = (:y, :x, :z))) === nothing
+    # supported via the explicit library: anisotropic (iso=false) periodic HSGP (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (P,harmonics) = hsgp_periodic_basis(x;k=4,period=2.0)
+            f ~ hsgp_periodic_effect(P,harmonics)
             a ~ Normal(0, 1)
-            hsgp_basis(:h_p, x; k = 4, cov = :periodic, period = 2.0,
-                iso = false)
-            mu = a .+ hsgp(:h_p)
+            mu = a .+ f
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x); conditioned = (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
     # Periodic claims the same names (collision still loud).
     # refused: single assignment, user definition collides with basis-claimed `rho_h_p`
     @test_throws SurfaceLoweringError lower_rkppl(quote

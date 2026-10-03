@@ -10052,7 +10052,7 @@ Derived responses keep their own materialization. `bind_only` excludes
 definitions used only during preparation, while preserving their names
 for caller-supplied column collision checks."""
 function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
-        bind_only = false)
+        bind_only = false, unbound::Bool=false)
     nodes = Dict{Symbol,Any}()
     for a in plan.assignments
         # Literal definitions can be dependencies of a module call, such
@@ -10063,12 +10063,14 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         d.expr isa Expr && (nodes[d.name] = d.expr)
     end
     resps = Set{Symbol}(r.response for r in plan.responses)
+    known = _all_names(plan)
     memo = Dict{Symbol,Bool}()
     function dataonly(nm, active)
         haskey(memo, nm) && return memo[nm]
         nm in active && return false
         push!(active, nm)
-        ok = all(s -> s in raw || (haskey(nodes, s) && dataonly(s, active)),
+        ok = all(s -> s in raw || (unbound && s ∉ known) ||
+                (haskey(nodes, s) && dataonly(s, active)),
             _expr_value_symbols(nodes[nm]))
         delete!(active, nm)
         memo[nm] = ok
@@ -10130,12 +10132,16 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names)
     return setdiff!(prepared, needed)
 end
 
-"""In a bound plan: the module data definitions bound as columns."""
-function _bound_module_data_names(plan::StructuralPlan)
+function _module_data_names(plan::StructuralPlan; unbound::Bool=false)
     nodes = union(Set{Symbol}(a.name for a in plan.assignments),
         Set{Symbol}(d.name for d in plan.derived))
     raw = Set{Symbol}(k for k in keys(plan.columns) if k ∉ nodes)
-    return Set{Symbol}(n for n in _module_data_names(plan, raw)
+    return _module_data_names(plan, raw; unbound)
+end
+
+"""In a bound plan: the module data definitions bound as columns."""
+function _bound_module_data_names(plan::StructuralPlan)
+    return Set{Symbol}(n for n in _module_data_names(plan)
         if haskey(plan.columns, n))
 end
 

@@ -109,15 +109,16 @@ end
         end, (:y, :c, :z); conditioned = (:y, :c, :z))
     @test [t.kind for t in mixed.predictors[1].terms] ==
         [OffsetTerm, MonotonicSummandTerm]
-    # A spline summand keeps the coefficient requirement (the mo1
-    # exception covers only offset/mo1 shapes).
-    # capability: coefficient-free predictor mixing spline and mo1 summands (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
-            s ~ Dirichlet(2, 1.0)
-            mu = spline(:s_x) .+ mo1(c, s)
+    # Supported: library values compose without an extra coefficient
+    # (P3/P8; todo `0bfiemp`; native/AD oracle in test_smooth_capabilities).
+    @test validate_structure(lower_rkppl(quote
+            (X,Z) = tps_basis(x;k=4)
+            f ~ penalized_smooth(X,Z)
+            s ~ Dirichlet([1.0,1.0])
+            m ~ monotonic(c,s)
+            mu = f .+ m
             y .~ Normal.(mu, 1.0)
-            spline_basis(:s_x, x; k = 4)
-        end, (:y, :c, :x); conditioned = (:y, :c, :x)); true)
+        end, (:y, :c, :x); conditioned = (:y, :c, :x))) === nothing
 end
 
 @testset "mo surface fail-closed" begin

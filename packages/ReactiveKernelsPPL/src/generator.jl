@@ -321,7 +321,7 @@ function _assignment_statements(plan::StructuralPlan;
     for name in topological_order(plan)
         (haskey(by_name, name) && name ∉ computed) || continue
         ex = _array_gather_rewrite(by_name[name].expr, plan, gathers)
-        ex = _split_gp_cov_calls!(stmts, name, ex)
+        ex = _split_gp_cov_calls!(stmts, name, ex, plan)
         if _expr_value_symbols(ex) ⊆ dataonly
             push!(dataonly, name)
         else
@@ -348,7 +348,8 @@ end
 # Lift a covariance nested in a value call before the ordinary KernelSpec
 # splicer attaches its pair plate. Untyped aliases match the graph's ports.
 # Lazy branches, closures and generators keep their local evaluation.
-function _split_gp_cov_calls!(stmts::Vector{Expr}, name::Symbol, ex)
+function _split_gp_cov_calls!(stmts::Vector{Expr}, name::Symbol, ex,
+        plan::StructuralPlan)
     count = 0
     function walk(node)
         node isa Expr || return node
@@ -368,6 +369,13 @@ function _split_gp_cov_calls!(stmts::Vector{Expr}, name::Symbol, ex)
         nargs = graph === :_ppl_gp_exp_quad_cov ? 4 : 5
         length(args) == nargs && all(a -> !Meta.isexpr(a, :parameters) &&
             !Meta.isexpr(a, :(...)), args) || return Expr(:call, callee, args...)
+        # The registered pair graphs implement vector locations. A bound
+        # matrix selects the ordinary Julia matrix method instead; routing
+        # it through a vector graph would change the location semantics.
+        locations = first(args)
+        locations isa Symbol && haskey(plan.columns, locations) &&
+            plan.columns[locations] isa AbstractMatrix &&
+            return Expr(:call, callee, args...)
         count += 1
         prefix = Symbol(:_ppl_gp_, name, :_, count)
         inputs = Symbol[]
